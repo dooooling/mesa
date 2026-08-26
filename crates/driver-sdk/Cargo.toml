@@ -1,0 +1,14 @@
+[package]
+name = "forgelink-driver-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forgelink-core-types = { workspace = true }
+forgelink-driver-protocol = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

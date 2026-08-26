@@ -1,0 +1,22 @@
+[package]
+name = "forgelink-driver-simulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "forgelink_driver_simulator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "forgelink-driver-simulator"
+path = "src/main.rs"
+
+[dependencies]
+forgelink-core-types = { workspace = true }
+forgelink-driver-sdk = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

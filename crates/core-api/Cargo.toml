@@ -1,0 +1,15 @@
+[package]
+name = "forgelink-core-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forgelink-core-types = { workspace = true }
+forgelink-driver-manager = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }

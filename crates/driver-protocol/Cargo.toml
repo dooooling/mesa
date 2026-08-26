@@ -1,0 +1,19 @@
+[package]
+name = "forgelink-driver-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forgelink-core-types = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+prost-build = "0.13"
+# Windows CI/开发机通常未安装 protoc，使用 vendored 二进制保证 build.rs 开箱即用
+protoc-bin-vendored = "3"

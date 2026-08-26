@@ -1,0 +1,249 @@
+// ForgeLink Driver IPC V1（方案 §14）。
+//
+// 传输形态为 127.0.0.1 TCP + Length-prefixed Protobuf；本文件是 Core 与 Driver 的
+// 消息契约真值来源。演进规则：同 Major 内新增消息/字段必须保持向后兼容；
+// Major 不一致时握手直接拒绝（IncompatibleProtocol）。
+//
+// 方向约定：
+//   - Hello/PointDescriptorsReport/DataBatchMsg/ConnectionStateChanged/DriverErrorReport/Pong 由 Driver 发出
+//   - 其余控制消息由 Core 发出
+//   - *Ack 为对应请求的响应，GenericResult.ok=false 时 error 必填
+
+syntax = "proto3";
+
+package forgelink.driver.v1;
+
+message Envelope {
+  // 关联 ID：请求方生成、响应原样带回。用于日志排障，不作为多路复用的路由键
+  // （M0 阶段同一 Driver 上除心跳外均为顺序请求-响应）。
+  uint64 msg_id = 1;
+
+  oneof body {
+    Hello hello = 10;
+    Welcome welcome = 11;
+    GetMetadata get_metadata = 12;
+    MetadataReport metadata_report = 13;
+
+    OpenConnection open_connection = 14;
+    OpenConnectionAck open_connection_ack = 15;
+    CloseConnection close_connection = 16;
+    CloseConnectionAck close_connection_ack = 17;
+
+    ConfigureTasks configure_tasks = 18;
+    PointDescriptorsReport point_descriptors = 19;
+    ApplyPointMap apply_point_map = 20;
+    ConfigApplied config_applied = 21;
+
+    StartConnection start_connection = 22;
+    StartConnectionAck start_connection_ack = 23;
+    StopConnection stop_connection = 24;
+    StopConnectionAck stop_connection_ack = 25;
+
+    ConnectionStateChanged connection_state_changed = 26;
+    DataBatchMsg data_batch = 27;
+    DriverErrorReport driver_error = 28;
+
+    Ping ping = 29;
+    Pong pong = 30;
+    Shutdown shutdown = 31;
+  }
+}
+
+// 握手请求（Driver -> Core 连接后第一条消息）。session_token 经 stdin 注入，
+// 校验通过前 Core 不接受任何控制消息（§14.2 本机认证）。
+message Hello {
+  string driver_id = 1;
+  string driver_version = 2;
+  uint32 protocol_major = 3;
+  uint32 protocol_minor = 4;
+  string sdk_version = 5;
+  string platform = 6;
+  string instance_id = 7;
+  string session_token = 8;
+}
+
+// 握手响应。accepted_* 为协商结果（Major 必须相等，Minor 取双方较小值）。
+message Welcome {
+  string core_version = 1;
+  uint32 accepted_protocol_major = 2;
+  uint32 accepted_protocol_minor = 3;
+}
+
+message GetMetadata {}
+
+message MetadataReport {
+  string driver_id = 1;
+  string name = 2;
+  string version = 3;
+}
+
+message GenericResult {
+  bool ok = 1;
+  ErrorDetail error = 2;
+}
+
+// 统一错误类别 kind 取 core_types::ErrorKind::as_str()；
+// code 为协议原生或 ForgeLink 原因码（如 DUPLICATE_POINT_KEY），可为空。
+message ErrorDetail {
+  string kind = 1;
+  string code = 2;
+  string message = 3;
+}
+
+// connection_handle 为 Core 分配的会话内临时 u32，仅用于紧凑 IPC，非持久标识。
+message OpenConnection {
+  uint32 connection_handle = 1;
+  string endpoint_id = 2;
+  // Endpoint.connection 的 JSON 序列化；语义由 Driver 解释。
+  string config_json = 3;
+}
+
+message OpenConnectionAck {
+  uint32 connection_handle = 1;
+  GenericResult result = 2;
+}
+
+message CloseConnection {
+  uint32 connection_handle = 1;
+}
+
+message CloseConnectionAck {
+  uint32 connection_handle = 1;
+  GenericResult result = 2;
+}
+
+// 全量快照替换（不做增量 Patch）。revision 用于原子切换与失败回退。
+message ConfigureTasks {
+  uint32 connection_handle = 1;
+  uint64 revision = 2;
+  repeated AcquisitionTaskProto tasks = 3;
+}
+
+message AcquisitionTaskProto {
+  string id = 1;
+  // "poll" | "subscribe"
+  string mode = 2;
+  optional uint64 interval_ms = 3;
+  string binding_kind = 4;
+  string binding_config_json = 5;
+}
+
+// ConfigureTasks 的响应由 Driver 主动上报（而非 Ack 形态）：描述构建成功即返回；
+// 构建失败则以 DriverErrorReport(kind=ConfigurationError) 回应。
+message PointDescriptorsReport {
+  uint32 connection_handle = 1;
+  uint64 revision = 2;
+  repeated PointDescriptorProto descriptors = 3;
+}
+
+message PointDescriptorProto {
+  string point_key = 1;
+  // core_types::DataType::as_str()
+  string data_type = 2;
+  optional string unit = 3;
+}
+
+// point_key -> point_id 稳定映射。point_id 由 Core 分配并持久化（tombstone 保证不复用）。
+message ApplyPointMap {
+  uint32 connection_handle = 1;
+  uint64 revision = 2;
+  map<string, uint32> key_to_point_id = 3;
+}
+
+message ConfigApplied {
+  uint32 connection_handle = 1;
+  uint64 revision = 2;
+  GenericResult result = 3;
+}
+
+// stream_epoch 每次启动/重开由 Core 生成新随机值，Driver 在后续 DataBatch 中原样带回。
+message StartConnection {
+  uint32 connection_handle = 1;
+  uint64 stream_epoch = 2;
+}
+
+message StartConnectionAck {
+  uint32 connection_handle = 1;
+  GenericResult result = 2;
+}
+
+message StopConnection {
+  uint32 connection_handle = 1;
+}
+
+message StopConnectionAck {
+  uint32 connection_handle = 1;
+  GenericResult result = 2;
+}
+
+message ConnectionStateChanged {
+  uint32 connection_handle = 1;
+  // core_types::ConnectionState::as_str()
+  string state = 2;
+  string detail = 3;
+}
+
+message DataBatchMsg {
+  uint32 connection_handle = 1;
+  uint64 stream_epoch = 2;
+  uint64 sequence = 3;
+  // Driver 完成本批采集/收到 Notification 的 UTC Unix ns。
+  int64 timestamp_ns = 4;
+  repeated PointValueMsg values = 5;
+}
+
+message PointValueMsg {
+  uint32 point_id = 1;
+  ValueMsg value = 2;
+  // 缺省 "" 视为 GOOD；取值 GOOD/UNCERTAIN/BAD。
+  string quality = 3;
+  optional sint32 quality_code = 4;
+  optional int64 source_timestamp_ns = 5;
+}
+
+message ValueMsg {
+  oneof kind {
+    bool bool_v = 1;
+    sint32 i32_v = 2;
+    uint32 u32_v = 3;
+    sint64 i64_v = 4;
+    uint64 u64_v = 5;
+    float f32_v = 6;
+    double f64_v = 7;
+    string string_v = 8;
+    bytes bytes_v = 9;
+    // UTC Unix ns
+    int64 datetime_ns_v = 10;
+
+    BoolArrayV bool_array_v = 20;
+    I32ArrayV i32_array_v = 21;
+    U32ArrayV u32_array_v = 22;
+    I64ArrayV i64_array_v = 23;
+    U64ArrayV u64_array_v = 24;
+    F32ArrayV f32_array_v = 25;
+    F64ArrayV f64_array_v = 26;
+    StringArrayV string_array_v = 27;
+    DateTimeArrayV datetime_array_v = 28;
+  }
+}
+
+// proto3 oneof 不能直接放 repeated，数组统一包一层包装消息。
+message BoolArrayV { repeated bool v = 1; }
+message I32ArrayV { repeated sint32 v = 1; }
+message U32ArrayV { repeated uint32 v = 1; }
+message I64ArrayV { repeated sint64 v = 1; }
+message U64ArrayV { repeated uint64 v = 1; }
+message F32ArrayV { repeated float v = 1; }
+message F64ArrayV { repeated double v = 1; }
+message StringArrayV { repeated string v = 1; }
+message DateTimeArrayV { repeated int64 v = 1; }
+
+message DriverErrorReport {
+  // 与 Connection 无关的驱动级错误可不填 handle。
+  optional uint32 connection_handle = 1;
+  ErrorDetail detail = 2;
+}
+
+message Ping {}
+message Pong {}
+message Shutdown {}
