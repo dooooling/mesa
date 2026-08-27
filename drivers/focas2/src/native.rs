@@ -170,118 +170,129 @@ impl FocasRet {
 }
 
 // ---------------------------------------------------------------------------
-// 关键结构体（简化，仅覆盖 Phase B 所需字段，按 Pack=4 对齐）
+// 关键结构体（按 Pack=4 对齐，与 fwlib.cs StructLayout(Pack=4) 一致）
+// 手册：FOCAS1/Ethernet B-64304EN 附录；结构体来源 fwlib.cs 对应类
 // ---------------------------------------------------------------------------
 
+/// `cnc_statinfo` 返回：`ODBST`，`fwlib.cs:3372` `collectors/StateData`
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct OdbSt {
-    pub dummy: [c_short; 2],
-    pub tctype: c_short,
-    pub dtype: c_short,
-    pub mctype: c_short,
-    pub utime: c_int,
+    pub dummy: [c_short; 2], // 保留
+    pub tctype: c_short,     // 机床类型（车/铣）
+    pub dtype: c_short,      // 数据类型
+    pub mctype: c_short,     // 加工中心类型：0=MDI 1=AUTO 等（165 实测 1）
+    pub utime: c_int,        // 加工时间（分）
 }
 
+/// `cnc_acts` 返回：`ODBACT`，`fwlib.cs:113` `platform/Acts.cs`
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct OdbActs {
-    pub dummy: [c_short; 2],
-    pub data: c_int,
+    pub dummy: [c_short; 2], // 保留
+    pub data: c_int,         // 实际主轴转速/进给（rpm 或 mm/min），`165` 主轴 0 表示停转
 }
 
+/// 全轴位置：`FAXIS` 8 轴定点（0.001mm），`fwlib.cs:152`
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Faxis {
-    pub absolute: [c_int; 8],
-    pub machine: [c_int; 8],
-    pub relative: [c_int; 8],
-    pub distance: [c_int; 8],
+    pub absolute: [c_int; 8], // 绝对坐标
+    pub machine: [c_int; 8],  // 机械坐标
+    pub relative: [c_int; 8], // 相对坐标
+    pub distance: [c_int; 8], // 剩余移动量
 }
 
+/// 单轴位置：`OAXIS` 用于 `ODBDY2_2`，`fwlib.cs:165`
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Oaxis {
-    pub absolute: c_int,
-    pub machine: c_int,
-    pub relative: c_int,
-    pub distance: c_int,
+    pub absolute: c_int, // 绝对
+    pub machine: c_int,  // 机械
+    pub relative: c_int, // 相对
+    pub distance: c_int, // 剩余
 }
 
+/// `ODBDY_1` 全量动态（8轴），`fwlib.cs:174`，已弃用，保留作多轴扩展参考
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct OdbDy1 {
-    pub dummy: c_short,
-    pub axis: c_short,
-    pub alarm: c_short,
-    pub prgnum: c_short,
-    pub prgmnum: c_short,
-    pub seqnum: c_int,
-    pub actf: c_int,
-    pub acts: c_int,
-    pub pos: Faxis,
+    pub dummy: c_short,  // 保留
+    pub axis: c_short,   // 轴数
+    pub alarm: c_short,  // 报警状态（0 无）
+    pub prgnum: c_short, // 运行程序号（0i 16位，30i 32位差异在 DY2）
+    pub prgmnum: c_short,// 主程序号
+    pub seqnum: c_int,   // 顺序号
+    pub actf: c_int,     // 实际进给 `F`（`165` 4000）
+    pub acts: c_int,     // 实际主轴 `S`
+    pub pos: Faxis,      // 8 轴全量位置
 }
 
-/// ODBDY2_2：对应 fanuc-driver RdDynamic2 axis=1 length=44（单轴），Pack=4 时正好 44 字节
+/// `ODBDY2_2` 单轴动态：`fanuc-driver RdDynamic2 axis=1 len=44`，`Pack=4` 44 字节，`fwlib.cs:246`
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct OdbDy2 {
-    pub dummy: c_short,
-    pub axis: c_short,
-    pub alarm: c_int,
-    pub prgnum: c_int,
-    pub prgmnum: c_int,
-    pub seqnum: c_int,
-    pub actf: c_int,
-    pub acts: c_int,
-    pub pos: Oaxis,
+    pub dummy: c_short, // 保留
+    pub axis: c_short,  // 轴数（1）
+    pub alarm: c_int,   // 报警（32位，0i 16位已在 DY2_2 扩展）
+    pub prgnum: c_int,  // 运行程序号（32位）
+    pub prgmnum: c_int, // 主程序号
+    pub seqnum: c_int,  // 顺序号
+    pub actf: c_int,    // 实际进给
+    pub acts: c_int,    // 实际主轴转速
+    pub pos: Oaxis,     // 单轴位置（`axis=1` 的四坐标）
 }
 
+/// `cnc_absolute` 返回：`ODBAXIS`，`fwlib.cs:8005`
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct OdbAxis {
-    pub dummy: c_short,
-    pub type_: c_short,
-    pub data: [c_int; 8],
+    pub dummy: c_short,   // 保留
+    pub type_: c_short,   // 轴类型
+    pub data: [c_int; 8], // 8 轴位置（0i-F 3轴、30i 10轴均取前 N 位）
 }
 
+/// `cnc_rdmacro` 返回：`ODBM`，`fwlib.cs:1439` `collectors/Macro.cs:100`
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Odbm {
-    pub datano: c_short,
-    pub dummy: c_short,
-    pub mcr_val: c_int,
-    pub dec_val: c_short,
+    pub datano: c_short, // 变量号（如 100、730）
+    pub dummy: c_short,  // 保留
+    pub mcr_val: c_int,  // 定点整数
+    pub dec_val: c_short,// 小数位 `value = mcr_val * 10^-dec_val`
 }
 
+/// `pmc_rdpmcrng` 返回：`IODBPMC0` 位/字节，`fwlib.cs:7132` `collectors/Pmc.cs: bit/byte`
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IodbPmc0 {
-    pub type_a: c_short,
-    pub type_d: c_short,
-    pub datano_s: c_short,
-    pub datano_e: c_short,
-    pub cdata: [u8; 8],
+    pub type_a: c_short, // PMC 类型 G/X/Y/F/R/D 等（0-12）
+    pub type_d: c_short, // 数据类型 0=bit/byte
+    pub datano_s: c_short, // 起始地址
+    pub datano_e: c_short, // 结束地址
+    pub cdata: [u8; 8],  // 字节数据（位时取 cdata[0]>>bit）
 }
 
+/// `pmc_rdpmcrng` 返回：`IODBPMC1` 字，`fwlib.cs:7148` `collectors/Pmc.cs: word`
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IodbPmc1 {
-    pub type_a: c_short,
-    pub type_d: c_short,
-    pub datano_s: c_short,
-    pub datano_e: c_short,
-    pub idata: [c_short; 8],
+    pub type_a: c_short, // PMC 类型
+    pub type_d: c_short, // 1=word
+    pub datano_s: c_short, // 起始
+    pub datano_e: c_short, // 结束（+1）
+    pub idata: [c_short; 8], // 字数据
 }
 
+/// `pmc_rdpmcrng` 返回：`IODBPMC2` 双字，`fwlib.cs:7163` `collectors/Pmc.cs: long/float32`
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IodbPmc2 {
-    pub type_a: c_short,
-    pub type_d: c_short,
-    pub datano_s: c_short,
-    pub datano_e: c_short,
-    pub ldata: [c_int; 8],
+    pub type_a: c_short, // PMC 类型
+    pub type_d: c_short, // 2=dword
+    pub datano_s: c_short, // 起始
+    pub datano_e: c_short, // 结束（+3）
+    pub ldata: [c_int; 8], // 双字数据（float32 需 BitConverter 转换，当前直接 I32）
 }
 
 // ---------------------------------------------------------------------------
