@@ -119,26 +119,199 @@ impl OpcUaApi for FakeOpcUaApi {
 }
 
 // ---------------------------------------------------------------------------
-// Native 占位（Phase 2 实现）
+// Native 实现（async-opcua 0.19 Client，Phase 2 真连）
 // ---------------------------------------------------------------------------
 
-pub struct NativeOpcUaApi;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
+
+use opcua_client::{ClientBuilder, IdentityToken, Session};
+use opcua_types::{
+    ByteString, Guid, NodeId as OpcNodeId, UAString, Variant, DataValue, ReadValueId,
+    TimestampsToReturn, StatusCode,
+};
+
+fn to_opc_node_id(addr: &OpcUaAddress) -> Result<OpcNodeId, String> {
+    match &addr.identifier {
+        crate::address::Identifier::Numeric(n) => Ok(OpcNodeId::new(addr.namespace, *n)),
+        crate::address::Identifier::String(s) => Ok(OpcNodeId::new(addr.namespace, UAString::from(s.as_str()))),
+        crate::address::Identifier::Guid(g) => {
+            let guid = g.parse::<Guid>().map_err(|e| format!("GUID 解析失败 {g}: {e:?}"))?;
+            Ok(OpcNodeId::new(addr.namespace, guid))
+        }
+        crate::address::Identifier::Opaque(b64) => {
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| format!("Opaque Base64 解码失败 {b64}: {e}"))?;
+            Ok(OpcNodeId::new(addr.namespace, ByteString::from(bytes)))
+        }
+    }
+}
+
+fn variant_to_value(v: &Variant) -> Option<Value> {
+    match v {
+        Variant::Empty => None,
+        Variant::Boolean(b) => Some(Value::Bool(*b)),
+        Variant::SByte(n) => Some(Value::I32(*n as i32)),
+        Variant::Byte(n) => Some(Value::U32(*n as u32)),
+        Variant::Int16(n) => Some(Value::I32(*n as i32)),
+        Variant::UInt16(n) => Some(Value::U32(*n as u32)),
+        Variant::Int32(n) => Some(Value::I32(*n)),
+        Variant::UInt32(n) => Some(Value::U32(*n)),
+        Variant::Int64(n) => Some(Value::I64(*n)),
+        Variant::UInt64(n) => Some(Value::U64(*n)),
+        Variant::Float(n) => Some(Value::F32(*n)),
+        Variant::Double(n) => Some(Value::F64(*n)),
+        Variant::String(s) => {
+            let str_val = s.as_ref().to_string();
+            Some(Value::String(str_val))
+        }
+        Variant::ByteString(bs) => {
+            if let Some(bytes) = &bs.value {
+                Some(Value::Bytes(bytes.clone()))
+            } else {
+                Some(Value::Bytes(vec![]))
+            }
+        }
+        Variant::Guid(g) => Some(Value::String(g.to_string())),
+        Variant::DateTime(dt) => Some(Value::String(format!("{:?}", dt))),
+        Variant::LocalizedText(t) => {
+            let txt = t.text.as_ref().to_string();
+            if txt.is_empty() {
+                Some(Value::String(format!("{:?}", t)))
+            } else {
+                Some(Value::String(txt))
+            }
+        }
+        Variant::Array(arr) => Some(Value::String(format!("{:?}", arr))),
+        Variant::StatusCode(sc) => Some(Value::String(format!("{:?}", sc))),
+        _ => Some(Value::String(format!("{:?}", v))),
+    }
+}
+
+struct NativeInner {
+    endpoint_url: String,
+    session: Option<Arc<Session>>,
+    _handle: Option<tokio::task::JoinHandle<opcua_types::StatusCode>>,
+}
+
+pub struct NativeOpcUaApi {
+    inner: Arc<AsyncMutex<Option<NativeInner>>>,
+}
 
 impl NativeOpcUaApi {
     pub fn new() -> Self {
-        Self
+        Self { inner: Arc::new(AsyncMutex::new(None)) }
+    }
+
+    async fn ensure_connected(&self, endpoint_url: &str, timeout_ms: u64) -> Result<Arc<Session>, String> {
+        {
+            let guard = self.inner.lock().await;
+            if let Some(inner) = guard.as_ref() {
+                if inner.endpoint_url == endpoint_url {
+                    if let Some(sess) = &inner.session {
+                        return Ok(sess.clone());
+                    }
+                }
+            }
+        }
+        self.connect_inner(endpoint_url, timeout_ms).await
+    }
+
+    async fn connect_inner(&self, endpoint_url: &str, timeout_ms: u64) -> Result<Arc<Session>, String> {
+        let timeout = Duration::from_millis(timeout_ms);
+        let mut client = ClientBuilder::new()
+            .application_name("ForgeLink OPC UA")
+            .application_uri("urn:forgelink:opcua")
+            .trust_server_certs(true)
+            .create_sample_keypair(false)
+            .session_retry_limit(1)
+            .client()
+            .map_err(|e| format!("ClientBuilder 失败: {e:?}"))?;
+
+        use opcua_types::{EndpointDescription, MessageSecurityMode, UserTokenPolicy};
+        let endpoint: EndpointDescription = (
+            endpoint_url,
+            "None",
+            MessageSecurityMode::None,
+            UserTokenPolicy::anonymous(),
+        )
+            .into();
+
+        let connect_fut = client.connect_to_matching_endpoint(endpoint, IdentityToken::Anonymous);
+        let (session, event_loop) = tokio::time::timeout(timeout, connect_fut)
+            .await
+            .map_err(|_| format!("连接超时 {timeout_ms}ms {endpoint_url}"))?
+            .map_err(|e| format!("连接失败 {endpoint_url}: {e:?}"))?;
+
+        let handle = event_loop.spawn();
+        let wait_fut = session.wait_for_connection();
+        tokio::time::timeout(timeout, wait_fut)
+            .await
+            .map_err(|_| format!("等待连接超时 {endpoint_url}"))?;
+
+        let sess_clone = session.clone();
+        let mut guard = self.inner.lock().await;
+        *guard = Some(NativeInner {
+            endpoint_url: endpoint_url.to_string(),
+            session: Some(session.clone()),
+            _handle: Some(handle),
+        });
+        Ok(sess_clone)
     }
 }
 
 #[async_trait]
 impl OpcUaApi for NativeOpcUaApi {
-    async fn connect(&self, _endpoint_url: &str, _timeout_ms: u64) -> Result<(), String> {
-        // TODO: Phase 2 接 opcua crate Session
-        Err("NOT_IMPLEMENTED: Native OPC UA 尚未实现，Phase 2 接入 opcua crate".into())
+    async fn connect(&self, endpoint_url: &str, timeout_ms: u64) -> Result<(), String> {
+        self.ensure_connected(endpoint_url, timeout_ms).await.map(|_| ())
     }
 
-    async fn read_batch(&self, _addrs: &[OpcUaAddress]) -> Result<Vec<Value>, String> {
-        Err("NOT_IMPLEMENTED".into())
+    async fn read_batch(&self, addrs: &[OpcUaAddress]) -> Result<Vec<Value>, String> {
+        let session = {
+            let guard = self.inner.lock().await;
+            guard
+                .as_ref()
+                .and_then(|i| i.session.clone())
+                .ok_or_else(|| "尚未连接，请先 connect".to_string())?
+        };
+        let mut nodes_to_read = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            let nid = to_opc_node_id(addr)?;
+            nodes_to_read.push(ReadValueId::from(nid));
+        }
+        let data_values: Vec<DataValue> = session
+            .read(&nodes_to_read, TimestampsToReturn::Both, 0.0)
+            .await
+            .map_err(|e| format!("read 失败: {e:?}"))?;
+
+        let mut out = Vec::with_capacity(data_values.len());
+        for dv in data_values {
+            if let Some(status) = dv.status {
+                if status != StatusCode::Good {
+                    out.push(Value::String(format!("ERR:{:?}", status)));
+                    continue;
+                }
+            }
+            if let Some(variant) = dv.value {
+                if let Some(val) = variant_to_value(&variant) {
+                    out.push(val);
+                } else {
+                    out.push(Value::String(format!("ERR:BadNoValue {:?}", dv.status)));
+                }
+            } else {
+                out.push(Value::String(format!("ERR:BadNoValue {:?}", dv.status)));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn disconnect(&self) -> Result<(), String> {
+        let mut guard = self.inner.lock().await;
+        *guard = None;
+        Ok(())
     }
 }
 

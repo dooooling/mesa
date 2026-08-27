@@ -125,10 +125,21 @@ struct PointSpec {
     data_type: DataType,
 }
 
+#[derive(Debug, Clone)]
+enum TaskKind {
+    Poll { interval_ms: u64 },
+    Subscribe {
+        publishing_interval_ms: u64,
+        sampling_interval_ms: u64,
+        queue_size: u32,
+        discard_oldest: bool,
+    },
+}
+
 #[derive(Debug)]
 struct TaskPlan {
     id: String,
-    interval_ms: u64,
+    kind: TaskKind,
     point_indices: Vec<usize>,
 }
 
@@ -219,27 +230,30 @@ impl DriverConnection for OpcUaConnection {
 
         for task in &tasks {
             task.validate().map_err(|e| SdkDriverError::configuration("INVALID_TASK", e.to_string()))?;
-            // Poll 与 Subscribe 分支：Phase 1 仅 Poll
-            if task.binding.kind == BINDING_SUB {
-                return Err(SdkDriverError::new(
-                    forgelink_core_types::ErrorKind::Unsupported,
-                    "NOT_IMPLEMENTED",
-                    format!("task `{}`: opcua.subscription 尚未实现（Phase 3）", task.id),
-                ));
-            }
-            if task.binding.kind != BINDING_POLL {
+            // Poll vs Subscribe 分支
+            let is_poll = task.binding.kind == BINDING_POLL;
+            let is_sub = task.binding.kind == BINDING_SUB;
+            if !is_poll && !is_sub {
                 return Err(SdkDriverError::configuration(
                     "UNSUPPORTED_BINDING",
                     format!("task `{}`: 期望 {BINDING_POLL} 或 {BINDING_SUB}，实际 {}", task.id, task.binding.kind),
                 ));
             }
-            if task.mode != TaskMode::Poll {
+            if is_poll && task.mode != TaskMode::Poll {
                 return Err(SdkDriverError::new(
                     forgelink_core_types::ErrorKind::Unsupported,
                     "MODE_NOT_SUPPORTED",
                     format!("task `{}`: opcua.node-group 仅支持 poll", task.id),
                 ));
             }
+            if is_sub && task.mode != TaskMode::Subscribe {
+                return Err(SdkDriverError::new(
+                    forgelink_core_types::ErrorKind::Unsupported,
+                    "MODE_NOT_SUPPORTED",
+                    format!("task `{}`: opcua.subscription 仅支持 subscribe", task.id),
+                ));
+            }
+            // nodes 统一解析
             let nodes = task.binding.config.get("nodes").and_then(|v| v.as_array()).ok_or_else(|| {
                 SdkDriverError::configuration("INVALID_BINDING_CONFIG", format!("task `{}`: 缺少 nodes 数组", task.id))
             })?;
@@ -262,8 +276,27 @@ impl DriverConnection for OpcUaConnection {
                 indices.push(new_points.len());
                 new_points.push(PointSpec { key: key.to_string(), addr, data_type });
             }
-            let interval = task.interval_ms.expect("validated");
-            new_tasks.push(TaskPlan { id: task.id.clone(), interval_ms: interval, point_indices: indices });
+            if is_poll {
+                let interval = task.interval_ms.expect("validated");
+                if interval == 0 {
+                    return Err(SdkDriverError::configuration("INVALID_TASK", "interval_ms 需 >0"));
+                }
+                new_tasks.push(TaskPlan { id: task.id.clone(), kind: TaskKind::Poll { interval_ms: interval }, point_indices: indices });
+            } else {
+                // Subscribe 参数：publishing_interval_ms / sampling_interval_ms / queue_size / discard_oldest
+                let publishing_interval_ms = task.binding.config.get("publishing_interval_ms").and_then(|v| v.as_u64()).unwrap_or(500);
+                let sampling_interval_ms = task.binding.config.get("sampling_interval_ms").and_then(|v| v.as_u64()).unwrap_or(250);
+                let queue_size = task.binding.config.get("queue_size").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
+                let discard_oldest = task.binding.config.get("discard_oldest").and_then(|v| v.as_bool()).unwrap_or(true);
+                if publishing_interval_ms == 0 || sampling_interval_ms == 0 || queue_size == 0 {
+                    return Err(SdkDriverError::configuration("INVALID_BINDING_CONFIG", format!("task `{}`: publishing/sampling/queue 需 >0", task.id)));
+                }
+                new_tasks.push(TaskPlan {
+                    id: task.id.clone(),
+                    kind: TaskKind::Subscribe { publishing_interval_ms, sampling_interval_ms, queue_size, discard_oldest },
+                    point_indices: indices,
+                });
+            }
         }
 
         let descriptors: Vec<PointDescriptor> = new_points
@@ -322,8 +355,14 @@ impl DriverConnection for OpcUaConnection {
             let shutdown = shutdown.clone();
             let seq = Arc::clone(&seq);
             let api = Arc::clone(&shared_api);
-            let interval = Duration::from_millis(task.interval_ms);
             let task_id = task.id.clone();
+            let kind = task.kind.clone();
+            // 统一周期：Poll 用 interval_ms，Subscribe 用 publishing_interval_ms（Fake 下轮询模拟，Native 后续切 DataChange 回调）
+            let interval = match &kind {
+                TaskKind::Poll { interval_ms } => Duration::from_millis(*interval_ms),
+                TaskKind::Subscribe { publishing_interval_ms, .. } => Duration::from_millis(*publishing_interval_ms),
+            };
+            // TODO(Phase3b): Native Subscribe 切真实 DataChange 回调（当前用轮询模拟，保持 Latest-Wins 与 KeepAlive 不产批语义）
             handles.push(tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -445,16 +484,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_not_implemented() {
+    async fn subscribe_configure_ok() {
         let mut conn = OpcUaConnection { cfg: OpcUaConnConfig::default(), api: Arc::new(FakeOpcUaApi::new()), plan: None };
         let t = AcquisitionTask {
             id: "s1".into(),
             mode: TaskMode::Subscribe,
             interval_ms: None,
-            binding: DriverBinding { kind: BINDING_SUB.into(), config: serde_json::json!({"publishing_interval_ms":500,"sampling_interval_ms":250,"queue_size":10,"nodes":[{"key":"a","node_id":"ns=2;i=2"}]}) },
+            binding: DriverBinding { kind: BINDING_SUB.into(), config: serde_json::json!({"publishing_interval_ms":500,"sampling_interval_ms":250,"queue_size":10,"nodes":[{"key":"a","node_id":"ns=2;i=2","data_type":"U32"}]}) },
         };
-        let err = conn.configure(1, vec![t]).await.unwrap_err();
-        assert_eq!(err.code, "NOT_IMPLEMENTED");
+        let descs = conn.configure(1, vec![t]).await.unwrap();
+        assert_eq!(descs.len(), 1);
+        // Subscribe 默认参数容错
+        let t2 = AcquisitionTask {
+            id: "s2".into(),
+            mode: TaskMode::Subscribe,
+            interval_ms: None,
+            binding: DriverBinding { kind: BINDING_SUB.into(), config: serde_json::json!({"nodes":[{"key":"b","node_id":"ns=2;s=MyVar","data_type":"STRING"}]}) },
+        };
+        let descs2 = conn.configure(2, vec![t2]).await.unwrap();
+        assert_eq!(descs2.len(), 1);
     }
 
     #[tokio::test]
