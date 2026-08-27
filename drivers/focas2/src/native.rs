@@ -1,16 +1,33 @@
 //! FOCAS2 Native FFI 层：动态加载 `Fwlib32/fwlib` 并封装阻塞调用。
 //!
-//! 设计要点（对齐 `fanuc/fwlib.cs` 与 `overview.md:31` 矩阵）：
-//! - 运行时按 OS/Arch 选择库文件：`win → Fwlib32.dll / FWLIB64.dll`，`linux x64 → libfwlib32-linux-x64.so`，`linux armv7 → libfwlib32-linux-armv7.so`
+//! # 覆盖范围与手册
+//! - **本文件仅实现 V1 所需子集（8 组）**，非 FOCAS 全部（FANUC 全量约 100+，见 `FOCAS1/Ethernet B-64304EN` 与 `fanuc/fwlib.cs:56` `focas_ret`）。
+//!   已实现：`cnc_allclibhndl3/cnc_freelibhndl/cnc_statinfo/cnc_rddynamic2/cnc_absolute/cnc_rdmacro/pmc_rdpmcrng/cnc_acts`，
+//!   覆盖 `§7.2` `status/axis/spindle/macro/pmc` 主路径与 `192.168.15.165` 实测链路；
+//!   未实现（如 `cnc_rdalmmsg/cnc_diagnoss/cnc_rdprgnum`）按同模式可增量添加，缺失符号时返回 `EW_NOOPT` 由上层转 `Quality Bad`。
+//! - **参考**：`fanuc/fwlib.cs`（`FocasLibConstants.FileName` 选库、`ODBM/IODBPMC` 结构 `Pack=4`）、`fanuc/platform/*.cs`（`RdDynamic2 axis=1 len=44` 等调用范式）、`documentation/focas-function-matrix.md` 的 `O/E/H/X` 矩阵
+//!
+//! # 设计要点
+//! - 运行时按 OS/Arch 选择库文件：`win → Fwlib32.dll / FWLIB64.dll`，`linux x64 → libfwlib32-linux-x64.so`，`linux armv7 → libfwlib32-linux-armv7.so`（`overview.md:31`）
 //! - 使用 `libloading` 延迟加载，缺库时返回 `EW_NODLL=-15` 可重试错误，而非 panic
-//! - 全部 FOCAS 调用为阻塞式，调用方必须在 `spawn_blocking` 中执行（由 `lib.rs` 保证）
-//! - 错误码映射见 `FocasLibConstants` 与 `focas_ret` `fwlib.cs:56`，便于上层按 `Connection/Address/Unsupported` 分类
+//! - 全部 FOCAS 调用为阻塞式（FOCAS 文档明确非线程安全），调用方必须在 `spawn_blocking` 中执行（由 `lib.rs` 保证）
+//! - 错误码 `focas_ret` 见 `fwlib.cs:56`，上层按 `EW_SOCKET/EW_NODLL→RECONNECTING` `EW_NOOPT/EW_DATA→Bad` 分类
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_long, c_short, c_ushort};
 use std::path::Path;
 
 use libloading::{Library, Symbol};
+
+// ---------------------------------------------------------------------------
+// 已实现 vs 未实现（FOCAS2 全量约 100+，见 B-64304EN 附录）
+// ---------------------------------------------------------------------------
+// 已实现 8 组（满足 §7.2 主路径与 165 实测）：
+//   cnc_allclibhndl3 / cnc_freelibhndl / cnc_statinfo / cnc_rddynamic2 / cnc_absolute / cnc_rdmacro / pmc_rdpmcrng / cnc_acts
+// 未实现（按需增量，缺失符号时 EW_NOOPT → Bad）：
+//   cnc_rdalmmsg / cnc_rdalmmsg2（报警 stateful）、cnc_diagnoss/diagnosr（诊断）、
+//   cnc_rdprgnum/exeprgname（程序号）、cnc_rdparam/rddiagnoss、cnc_rdspmeter/rdsvmeter 等，
+//   均可在本文件按同模式追加 Fn* + NativeLib 字段 + 方法，参考 fanuc/platform/*.cs
 
 // ---------------------------------------------------------------------------
 // 常量（中文注释说明“为什么”）
@@ -381,7 +398,10 @@ impl NativeLib {
         me
     }
 
-    /// 建立句柄（Ethernet）：对标 `cnc_allclibhndl3(ip, port, timeout, &mut hdl)`
+    /// 建立句柄（Ethernet）：`cnc_allclibhndl3(ip, port, timeout, &mut hdl)`，`fanuc/platform/Connect.cs`
+    /// - `ip` 点分十进制，`port` 默认 `FOCAS_DEFAULT_PORT 8193`，`timeout_secs` 秒（`FOCAS_MS_PER_S` 换算）
+    /// - 成功返回 `hdl:u16` 供后续 `statinfo/rddynamic` 等复用，失败 `EW_SOCKET/EW_NODLL` 由上层重连
+    /// - 手册：`B-64304EN 3.2`，`fwlib.cs:9416`
     pub fn allclibhndl3(&self, ip: &str, port: u16, timeout_secs: i32) -> Result<u16, FocasRet> {
         let sym = self.cnc_allclibhndl3.as_ref().ok_or(FocasRet::Nodll)?;
         let c_ip = CString::new(ip).map_err(|_| FocasRet::Param)?;
@@ -391,6 +411,7 @@ impl NativeLib {
         if ret.is_ok() { Ok(hdl) } else { Err(ret) }
     }
 
+    /// 释放句柄：`cnc_freelibhndl(hdl)`，`Disconnect.cs`，`NativeFocasApi::drop/disconnect` 调用
     pub fn freelibhndl(&self, hdl: u16) -> Result<(), FocasRet> {
         if let Some(sym) = self.cnc_freelibhndl.as_ref() {
             let rc = unsafe { sym(hdl as c_ushort) };
@@ -401,6 +422,9 @@ impl NativeLib {
         }
     }
 
+    /// 读 CNC 状态：`cnc_statinfo(hdl, ODBST*)`，`collectors/StateData` 与 `focas_api status` 用
+    /// - 返回 `mctype`（`0=MDI 1=AUTO` 等）等，`165` 实测 `1` 为 `AUTO`
+    /// - 手册：`B-64304EN 4.3`，`fwlib.cs:3372`
     pub fn statinfo(&self, hdl: u16) -> Result<OdbSt, FocasRet> {
         let sym = self.cnc_statinfo.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<OdbSt>::uninit();
@@ -409,15 +433,19 @@ impl NativeLib {
         if ret.is_ok() { Ok(unsafe { out.assume_init() }) } else { Err(ret) }
     }
 
+    /// 读动态数据：`cnc_rddynamic2(hdl, axis=1, len=44, ODBDY2_2*)`，`platform/RdDynamic2.cs:5` `axis=1 len=44`
+    /// - `ODBDY2_2` 44 字节含 `actf/acts/prgnum` 等，`165` 用 `actf` 作 `feed` 与 `axis` 回退值
+    /// - 多机型 `prgnum` 16/32 位差异已在 `OdbDy2` 区分，手册 `B-64304EN 4.5`
     pub fn rddynamic2(&self, hdl: u16) -> Result<OdbDy2, FocasRet> {
         let sym = self.cnc_rddynamic2.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<OdbDy2>::uninit();
-        // fanuc-driver RdDynamic2 axis=1 length=44 对应 ODB DY2_2 44 字节
         let rc = unsafe { sym(hdl as c_ushort, 1 as c_short, FOCAS_DY2_LEN, out.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() { Ok(unsafe { out.assume_init() }) } else { Err(ret) }
     }
 
+    /// 读主轴实际转速：`cnc_acts(hdl, ODBACT*)`，`platform/Acts.cs`
+    /// - 返回 `data:rpm`，`spindle.load` 暂以 `acts` 归一 `0..100`
     pub fn acts(&self, hdl: u16) -> Result<OdbActs, FocasRet> {
         let sym = self.cnc_acts.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<OdbActs>::uninit();
@@ -426,10 +454,12 @@ impl NativeLib {
         if ret.is_ok() { Ok(unsafe { out.assume_init() }) } else { Err(ret) }
     }
 
+    /// 读轴绝对坐标：`cnc_absolute(hdl, axis, 8, ODBAXIS*)`，`platform` 未单列但 `collectors/AxisData` 间接依赖
+    /// - `axis 1..FOCAS_MAX_AXIS(32)`，`FOCAS_AXIS_BATCH 8` 一次读 8 轴，0i-F 3轴与 30i 10轴均覆盖，超 8 轴需扩展
+    /// - 返回 `data[axis-1]` 原始 `c_int`（`0.001mm` 定点），上层直接 `I32`
     pub fn absolute(&self, hdl: u16, axis: u8) -> Result<c_int, FocasRet> {
         let sym = self.cnc_absolute.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<OdbAxis>::uninit();
-        // cnc_absolute 每次读 FOCAS_AXIS_BATCH(8) 轴，取 axis 对应位；0i-F 3轴、30i 10轴 均覆盖
         let rc = unsafe { sym(hdl as c_ushort, axis as c_short, FOCAS_AXIS_BATCH, out.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() {
@@ -439,15 +469,16 @@ impl NativeLib {
         } else { Err(ret) }
     }
 
+    /// 读宏变量：`cnc_rdmacro(hdl, number, 1, ODBM*)`，`collectors/Macro.cs:100`
+    /// - `number` 如 `100`/`730`（`0i` 低段与 `30i` 扩展段同接口，`EW_NOOPT` 按机型转 `Bad`）
+    /// - `ODBM{mcr_val, dec_val}` 定点 `value = mcr_val * 10^-dec_val`
     pub fn rdmacro(&self, hdl: u16, number: u32) -> Result<f64, FocasRet> {
         let sym = self.cnc_rdmacro.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<Odbm>::uninit();
-        // cnc_rdmacro 一次读 1 个宏变量（0i 500-999、30i 扩展段均同接口）
         let rc = unsafe { sym(hdl as c_ushort, number as c_short, 1 as c_short, out.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() {
             let v = unsafe { out.assume_init() };
-            // 定点转浮点：value = mcr_val * 10^-dec_val
             let dec = v.dec_val as i32;
             let raw = v.mcr_val as f64;
             let val = if dec == 0 { raw } else { raw / 10_f64.powi(dec) };
@@ -455,6 +486,8 @@ impl NativeLib {
         } else { Err(ret) }
     }
 
+    /// 读 PMC 位：`pmc_rdpmcrng(hdl, adr_type, 0, addr, addr, 9, IODBPMC0)`，取 `cdata[0]>>bit &1`
+    /// - `adr_type` 见 `pmc_adr_type()`，`bit 0..7`，`collectors/Pmc.cs: bit` 分支
     pub fn pmc_bit(&self, hdl: u16, adr_type: c_short, addr: u32, bit: u8) -> Result<bool, FocasRet> {
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
         let mut buf = IodbPmc0 { type_a: adr_type, type_d: PMC_DATA_BIT, datano_s: addr as c_short, datano_e: addr as c_short, cdata: [0; 8] };
@@ -463,6 +496,7 @@ impl NativeLib {
         if ret.is_ok() { Ok(((buf.cdata[0] >> bit) & 1) != 0) } else { Err(ret) }
     }
 
+    /// 读 PMC 字节：`pmc_rdpmcrng` `data_type 0 len 9`，`collectors/Pmc.cs: byte`
     pub fn pmc_byte(&self, hdl: u16, adr_type: c_short, addr: u32) -> Result<u8, FocasRet> {
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
         let mut buf = IodbPmc0 { type_a: adr_type, type_d: PMC_DATA_BIT, datano_s: addr as c_short, datano_e: addr as c_short, cdata: [0; 8] };
@@ -471,6 +505,7 @@ impl NativeLib {
         if ret.is_ok() { Ok(buf.cdata[0]) } else { Err(ret) }
     }
 
+    /// 读 PMC 字：`pmc_rdpmcrng` `data_type 1 len 10`，`R/A/T/C` 常用
     pub fn pmc_word(&self, hdl: u16, adr_type: c_short, addr: u32) -> Result<c_short, FocasRet> {
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
         let mut buf = IodbPmc1 { type_a: adr_type, type_d: PMC_DATA_WORD, datano_s: addr as c_short, datano_e: (addr as c_short).wrapping_add(1), idata: [0; 8] };
@@ -479,6 +514,7 @@ impl NativeLib {
         if ret.is_ok() { Ok(buf.idata[0]) } else { Err(ret) }
     }
 
+    /// 读 PMC 双字：`pmc_rdpmcrng` `data_type 2 len 12`，`D` 常用
     pub fn pmc_dword(&self, hdl: u16, adr_type: c_short, addr: u32) -> Result<c_int, FocasRet> {
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
         let mut buf = IodbPmc2 { type_a: adr_type, type_d: PMC_DATA_DWORD, datano_s: addr as c_short, datano_e: (addr as c_short).wrapping_add(3), ldata: [0; 8] };
