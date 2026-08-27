@@ -183,7 +183,7 @@ impl FocasApi for NativeFocasApi {
             let lib = match r { Ok(l) => l, Err(e) => return Err(e.clone()) };
             // 毫秒向上取整为秒：FOCAS 以秒为单位，999 保证 1ms 也算 1s
             let timeout_secs = ((timeout_ms + FOCAS_MS_PER_S - 1) / FOCAS_MS_PER_S) as i32;
-            let hdl = lib.allclibhndl3(&host_s, port, timeout_secs).map_err(Self::map_ret_err)?;
+            let hdl = lib.cnc_allclibhndl3(&host_s, port, timeout_secs).map_err(Self::map_ret_err)?;
             *handle_arc.lock().unwrap() = Some(hdl);
             tracing::info!(host=%host_s, port, hdl, "FOCAS Native 连接建立");
             Ok::<(), String>(())
@@ -226,7 +226,7 @@ impl FocasApi for NativeFocasApi {
             let lib_arc = std::sync::Arc::clone(&self.lib);
             let _ = tokio::task::spawn_blocking(move || {
                 if let Some(Ok(lib)) = lib_arc.get().map(|r| r.as_ref()) {
-                    let _ = lib.freelibhndl(hdl);
+                    let _ = lib.cnc_freelibhndl(hdl);
                     tracing::info!(hdl, "FOCAS 句柄已释放");
                 }
             }).await;
@@ -238,7 +238,7 @@ impl NativeFocasApi {
     fn read_one_blocking(lib: &NativeLib, hdl: u16, addr: &FocasAddress) -> Result<Value, String> {
         match addr {
             FocasAddress::Status => {
-                let st = lib.statinfo(hdl).map_err(Self::map_ret_err)?;
+                let st = lib.cnc_statinfo(hdl).map_err(Self::map_ret_err)?;
                 Ok(Value::U32(st.mctype as u32))
             }
             FocasAddress::Alarm => {
@@ -248,7 +248,7 @@ impl NativeFocasApi {
             }
             FocasAddress::ProgramNumber | FocasAddress::ProgramMain => {
                 // 暂以 rddynamic2 的 prgnum 代理，同一方法跨机型 prgnum 位宽不同（0i 16bit vs 30i 32bit）已在 OdbDy2 区分
-                let dy = lib.rddynamic2(hdl).map_err(Self::map_ret_err)?;
+                let dy = lib.cnc_rddynamic2(hdl).map_err(Self::map_ret_err)?;
                 Ok(Value::U32(dy.prgnum as u32))
             }
             FocasAddress::ProgramName => {
@@ -257,10 +257,10 @@ impl NativeFocasApi {
             FocasAddress::Axis { axis, kind } => {
                 // 多机型 MAX_AXIS 差异：0i 8轴 30i 10/24轴，当前 OdbAxis 以 8 轴覆盖 0i-F 基准，真机 30i 超 8 轴时需扩展
                 // 优先用 cnc_absolute 精确单轴，fallback 到 rddynamic2
-                match lib.absolute(hdl, *axis) {
+                match lib.cnc_absolute(hdl, *axis) {
                     Ok(v) => Ok(Value::I32(v)),
                     Err(e) if e == crate::native::FocasRet::Noopt || e == crate::native::FocasRet::Param => {
-                        let dy = lib.rddynamic2(hdl).map_err(Self::map_ret_err)?;
+                        let dy = lib.cnc_rddynamic2(hdl).map_err(Self::map_ret_err)?;
                         // 按 kind 仍以 actf 代理，保证 0i/30i 均可通
                         let _ = kind;
                         Ok(Value::I32(dy.actf))
@@ -269,29 +269,29 @@ impl NativeFocasApi {
                 }
             }
             FocasAddress::Feed => {
-                let dy = lib.rddynamic2(hdl).map_err(Self::map_ret_err)?;
+                let dy = lib.cnc_rddynamic2(hdl).map_err(Self::map_ret_err)?;
                 Ok(Value::U32(dy.actf as u32))
             }
             FocasAddress::Spindle { spindle: _, kind } => {
                 match kind {
                     SpindleKind::Speed => {
-                        let v = lib.acts(hdl).map_err(Self::map_ret_err)?;
+                        let v = lib.cnc_acts(hdl).map_err(Self::map_ret_err)?;
                         Ok(Value::I32(v.data))
                     }
                     SpindleKind::Load => {
-                        let v = lib.acts(hdl).map_err(Self::map_ret_err)?;
+                        let v = lib.cnc_acts(hdl).map_err(Self::map_ret_err)?;
                         Ok(Value::U32((v.data.abs() % 101) as u32))
                     }
                 }
             }
             FocasAddress::ServoLoad { axis } => {
-                // 暂复用 acts 代理，待 cnc_rdsvmeter 补齐前保证跨机型不整批失败
-                let v = lib.acts(hdl).map_err(Self::map_ret_err)?;
+                // 暂复用 cnc_acts 代理，待 cnc_rdsvmeter 补齐前保证跨机型不整批失败
+                let v = lib.cnc_acts(hdl).map_err(Self::map_ret_err)?;
                 let _ = axis;
                 Ok(Value::U32((v.data.abs() % 101) as u32))
             }
             FocasAddress::MacroVar { number } => {
-                match lib.rdmacro(hdl, *number) {
+                match lib.cnc_rdmacro(hdl, *number) {
                     Ok(v) => Ok(Value::F64(v)),
                     Err(e) if e == crate::native::FocasRet::Noopt => {
                         // 0i 低段宏 500-999 与 30i 高段差异，EW_NOOPT 时返回 Bad 占位而非整批失败
@@ -303,7 +303,7 @@ impl NativeFocasApi {
             FocasAddress::Pmc { kind, addr, bit } => {
                 let adr_type = crate::native::NativeLib::pmc_adr_type(*kind);
                 if let Some(b) = bit {
-                    let v = lib.pmc_bit(hdl, adr_type, *addr, *b).map_err(Self::map_ret_err)?;
+                    let v = lib.pmc_rdpmcrng_bit(hdl, adr_type, *addr, *b).map_err(Self::map_ret_err)?;
                     Ok(Value::Bool(v))
                 } else {
                     // 无 bit 时：0i/30i 对 R/D 的字长差异，G/X/Y/F 为 byte，R 为 word，D 为 dword
@@ -311,27 +311,27 @@ impl NativeFocasApi {
                     let kind_up = kind.to_ascii_uppercase();
                     if kind_up == 'D' {
                         // D 尝试 dword -> word
-                        match lib.pmc_dword(hdl, adr_type, *addr) {
+                        match lib.pmc_rdpmcrng_dword(hdl, adr_type, *addr) {
                             Ok(v) => Ok(Value::I32(v)),
                             Err(e) if matches!(e, crate::native::FocasRet::Param | crate::native::FocasRet::Length | crate::native::FocasRet::Noopt) => {
-                                let w = lib.pmc_word(hdl, adr_type, *addr).map_err(Self::map_ret_err)?;
+                                let w = lib.pmc_rdpmcrng_word(hdl, adr_type, *addr).map_err(Self::map_ret_err)?;
                                 Ok(Value::I32(w as i32))
                             }
                             Err(e) => Err(Self::map_ret_err(e)),
                         }
                     } else if kind_up == 'R' || kind_up == 'A' || kind_up == 'T' || kind_up == 'C' {
                         // R/A/T/C 常见为 word
-                        match lib.pmc_word(hdl, adr_type, *addr) {
+                        match lib.pmc_rdpmcrng_word(hdl, adr_type, *addr) {
                             Ok(v) => Ok(Value::I32(v as i32)),
                             Err(e) if matches!(e, crate::native::FocasRet::Param | crate::native::FocasRet::Length | crate::native::FocasRet::Noopt) => {
-                                let b = lib.pmc_byte(hdl, adr_type, *addr).map_err(Self::map_ret_err)?;
+                                let b = lib.pmc_rdpmcrng_byte(hdl, adr_type, *addr).map_err(Self::map_ret_err)?;
                                 Ok(Value::U32(b as u32))
                             }
                             Err(e) => Err(Self::map_ret_err(e)),
                         }
                     } else {
                         // G/X/Y/F 等单字节
-                        let b = lib.pmc_byte(hdl, adr_type, *addr).map_err(Self::map_ret_err)?;
+                        let b = lib.pmc_rdpmcrng_byte(hdl, adr_type, *addr).map_err(Self::map_ret_err)?;
                         Ok(Value::U32(b as u32))
                     }
                 }
@@ -351,7 +351,7 @@ impl Drop for NativeFocasApi {
         if std::sync::Arc::strong_count(&self.handle) == 1 {
             if let Some(hdl) = self.handle.lock().unwrap().take() {
                 if let Some(Ok(lib)) = self.lib.get().map(|r| r.as_ref()) {
-                    let _ = lib.freelibhndl(hdl);
+                    let _ = lib.cnc_freelibhndl(hdl);
                 }
             }
         }
