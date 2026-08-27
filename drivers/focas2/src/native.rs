@@ -13,6 +13,48 @@ use std::path::Path;
 use libloading::{Library, Symbol};
 
 // ---------------------------------------------------------------------------
+// 常量（中文注释说明“为什么”）
+// ---------------------------------------------------------------------------
+
+/// FOCAS 默认端口：Ethernet 固定 8193（fanuc-driver 默认）
+const FOCAS_DEFAULT_PORT: u16 = 8193;
+/// 超时换算：FOCAS 以秒为单位，毫秒向上取整
+const FOCAS_TIMEOUT_MS_PER_S: u64 = 1000;
+/// PMC 长度：对应 IODBPMC0/1/2 在 fanuc-driver 中 9/10/12/16 的语义
+/// 9 = 5字节 + 头 4，10 = word(1) + 头，12 = dword/float32，16 = float64
+const PMC_LEN_BYTE: c_short = 9;
+const PMC_LEN_WORD: c_short = 10;
+const PMC_LEN_DWORD: c_short = 12;
+const PMC_LEN_F64: c_short = 16;
+/// PMC data_type：0=bit/byte 1=word 2=dword 4=float32 5=float64（对齐 fanuc/collectors/Pmc.cs）
+const PMC_DATA_BIT: c_short = 0;
+const PMC_DATA_WORD: c_short = 1;
+const PMC_DATA_DWORD: c_short = 2;
+const PMC_DATA_F32: c_short = 4;
+const PMC_DATA_F64: c_short = 5;
+/// PMC 地址类型：G/X/Y/F/R… 与 fanuc f_adr_type() 一致
+const PMC_TYPE_G: c_short = 0;
+const PMC_TYPE_F: c_short = 1;
+const PMC_TYPE_Y: c_short = 2;
+const PMC_TYPE_X: c_short = 3;
+const PMC_TYPE_A: c_short = 4;
+const PMC_TYPE_R: c_short = 5;
+const PMC_TYPE_T: c_short = 6;
+const PMC_TYPE_K: c_short = 7;
+const PMC_TYPE_C: c_short = 8;
+const PMC_TYPE_D: c_short = 9;
+const PMC_TYPE_M: c_short = 10;
+const PMC_TYPE_N: c_short = 11;
+const PMC_TYPE_Z: c_short = 12;
+/// 轴/主轴区间：FANUC 最大 32 轴、4 主轴，0i-F 基准 3 轴，30i 可 10/24 轴
+const FOCAS_MAX_AXIS: u8 = 32;
+const FOCAS_MAX_SPINDLE: u8 = 4;
+/// cnc_rddynamic2 单轴长度 44 字节 = ODB DY2_2 Pack=4 时 sizeof
+const FOCAS_DY2_LEN: c_short = 44;
+/// cnc_absolute 一次读 8 轴（0i-F 基准），超 8 轴需扩展
+const FOCAS_AXIS_BATCH: c_short = 8;
+
+// ---------------------------------------------------------------------------
 // FOCAS 返回码（与 fwlib.cs focas_ret 一致）
 // ---------------------------------------------------------------------------
 
@@ -370,8 +412,8 @@ impl NativeLib {
     pub fn rddynamic2(&self, hdl: u16) -> Result<OdbDy2, FocasRet> {
         let sym = self.cnc_rddynamic2.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<OdbDy2>::uninit();
-        // 对齐 fanuc-driver：axis=1（单路径首轴），length=44（sizeof ODBDY2_2），Pack=4 时 44 字节
-        let rc = unsafe { sym(hdl as c_ushort, 1 as c_short, 44 as c_short, out.as_mut_ptr()) };
+        // fanuc-driver RdDynamic2 axis=1 length=44 对应 ODB DY2_2 44 字节
+        let rc = unsafe { sym(hdl as c_ushort, 1 as c_short, FOCAS_DY2_LEN, out.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() { Ok(unsafe { out.assume_init() }) } else { Err(ret) }
     }
@@ -387,25 +429,25 @@ impl NativeLib {
     pub fn absolute(&self, hdl: u16, axis: u8) -> Result<c_int, FocasRet> {
         let sym = self.cnc_absolute.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<OdbAxis>::uninit();
-        // cnc_absolute(hdl, axis, length=8, buf) 读取 8 轴，取对应轴位
-        let rc = unsafe { sym(hdl as c_ushort, axis as c_short, 8 as c_short, out.as_mut_ptr()) };
+        // cnc_absolute 每次读 FOCAS_AXIS_BATCH(8) 轴，取 axis 对应位；0i-F 3轴、30i 10轴 均覆盖
+        let rc = unsafe { sym(hdl as c_ushort, axis as c_short, FOCAS_AXIS_BATCH, out.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() {
             let v = unsafe { out.assume_init() };
             let idx = (axis as usize).saturating_sub(1);
-            if idx < 8 { Ok(v.data[idx]) } else { Err(FocasRet::Param) }
+            if idx < FOCAS_AXIS_BATCH as usize { Ok(v.data[idx]) } else { Err(FocasRet::Param) }
         } else { Err(ret) }
     }
 
     pub fn rdmacro(&self, hdl: u16, number: u32) -> Result<f64, FocasRet> {
         let sym = self.cnc_rdmacro.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<Odbm>::uninit();
-        // cnc_rdmacro(hdl, number, length=1, buf)
+        // cnc_rdmacro 一次读 1 个宏变量（0i 500-999、30i 扩展段均同接口）
         let rc = unsafe { sym(hdl as c_ushort, number as c_short, 1 as c_short, out.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() {
             let v = unsafe { out.assume_init() };
-            // mcr_val + dec_val 组合为浮点：value = mcr_val * 10^-dec_val
+            // 定点转浮点：value = mcr_val * 10^-dec_val
             let dec = v.dec_val as i32;
             let raw = v.mcr_val as f64;
             let val = if dec == 0 { raw } else { raw / 10_f64.powi(dec) };
@@ -415,39 +457,42 @@ impl NativeLib {
 
     pub fn pmc_bit(&self, hdl: u16, adr_type: c_short, addr: u32, bit: u8) -> Result<bool, FocasRet> {
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
-        let mut buf = IodbPmc0 { type_a: adr_type, type_d: 0, datano_s: addr as c_short, datano_e: addr as c_short, cdata: [0; 8] };
-        let rc = unsafe { sym(hdl as c_ushort, adr_type, 0 as c_short, addr as c_short, addr as c_short, 9 as c_short, &mut buf as *mut _ as *mut u8) };
+        let mut buf = IodbPmc0 { type_a: adr_type, type_d: PMC_DATA_BIT, datano_s: addr as c_short, datano_e: addr as c_short, cdata: [0; 8] };
+        let rc = unsafe { sym(hdl as c_ushort, adr_type, PMC_DATA_BIT, addr as c_short, addr as c_short, PMC_LEN_BYTE, &mut buf as *mut _ as *mut u8) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() { Ok(((buf.cdata[0] >> bit) & 1) != 0) } else { Err(ret) }
     }
 
     pub fn pmc_byte(&self, hdl: u16, adr_type: c_short, addr: u32) -> Result<u8, FocasRet> {
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
-        let mut buf = IodbPmc0 { type_a: adr_type, type_d: 0, datano_s: addr as c_short, datano_e: addr as c_short, cdata: [0; 8] };
-        let rc = unsafe { sym(hdl as c_ushort, adr_type, 0 as c_short, addr as c_short, addr as c_short, 9 as c_short, &mut buf as *mut _ as *mut u8) };
+        let mut buf = IodbPmc0 { type_a: adr_type, type_d: PMC_DATA_BIT, datano_s: addr as c_short, datano_e: addr as c_short, cdata: [0; 8] };
+        let rc = unsafe { sym(hdl as c_ushort, adr_type, PMC_DATA_BIT, addr as c_short, addr as c_short, PMC_LEN_BYTE, &mut buf as *mut _ as *mut u8) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() { Ok(buf.cdata[0]) } else { Err(ret) }
     }
 
     pub fn pmc_word(&self, hdl: u16, adr_type: c_short, addr: u32) -> Result<c_short, FocasRet> {
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
-        let mut buf = IodbPmc1 { type_a: adr_type, type_d: 1, datano_s: addr as c_short, datano_e: (addr as c_short).wrapping_add(1), idata: [0; 8] };
-        let rc = unsafe { sym(hdl as c_ushort, adr_type, 1 as c_short, addr as c_short, (addr as c_short).wrapping_add(1), 10 as c_short, &mut buf as *mut _ as *mut u8) };
+        let mut buf = IodbPmc1 { type_a: adr_type, type_d: PMC_DATA_WORD, datano_s: addr as c_short, datano_e: (addr as c_short).wrapping_add(1), idata: [0; 8] };
+        let rc = unsafe { sym(hdl as c_ushort, adr_type, PMC_DATA_WORD, addr as c_short, (addr as c_short).wrapping_add(1), PMC_LEN_WORD, &mut buf as *mut _ as *mut u8) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() { Ok(buf.idata[0]) } else { Err(ret) }
     }
 
     pub fn pmc_dword(&self, hdl: u16, adr_type: c_short, addr: u32) -> Result<c_int, FocasRet> {
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
-        let mut buf = IodbPmc2 { type_a: adr_type, type_d: 2, datano_s: addr as c_short, datano_e: (addr as c_short).wrapping_add(3), ldata: [0; 8] };
-        let rc = unsafe { sym(hdl as c_ushort, adr_type, 2 as c_short, addr as c_short, (addr as c_short).wrapping_add(3), 12 as c_short, &mut buf as *mut _ as *mut u8) };
+        let mut buf = IodbPmc2 { type_a: adr_type, type_d: PMC_DATA_DWORD, datano_s: addr as c_short, datano_e: (addr as c_short).wrapping_add(3), ldata: [0; 8] };
+        let rc = unsafe { sym(hdl as c_ushort, adr_type, PMC_DATA_DWORD, addr as c_short, (addr as c_short).wrapping_add(3), PMC_LEN_DWORD, &mut buf as *mut _ as *mut u8) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() { Ok(buf.ldata[0]) } else { Err(ret) }
     }
 
+    /// 将 PMC 字母映射为 FOCAS adr_type（与 fanuc f_adr_type 一致）
     pub fn pmc_adr_type(kind: char) -> c_short {
         match kind {
-            'G' => 0, 'F' => 1, 'Y' => 2, 'X' => 3, 'A' => 4, 'R' => 5, 'T' => 6, 'K' => 7, 'C' => 8, 'D' => 9, 'M' => 10, 'N' | 'E' => 11, 'Z' => 12, _ => 5,
+            'G' => PMC_TYPE_G, 'F' => PMC_TYPE_F, 'Y' => PMC_TYPE_Y, 'X' => PMC_TYPE_X, 'A' => PMC_TYPE_A,
+            'R' => PMC_TYPE_R, 'T' => PMC_TYPE_T, 'K' => PMC_TYPE_K, 'C' => PMC_TYPE_C,
+            'D' => PMC_TYPE_D, 'M' => PMC_TYPE_M, 'N' | 'E' => PMC_TYPE_N, 'Z' => PMC_TYPE_Z, _ => PMC_TYPE_R,
         }
     }
 }

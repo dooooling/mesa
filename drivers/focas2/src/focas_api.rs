@@ -9,6 +9,17 @@ use forgelink_core_types::Value;
 
 use crate::address::{AxisKind, FocasAddress, SpindleKind};
 
+// ---------------------------------------------------------------------------
+// 常量：FOCAS 语义边界
+// ---------------------------------------------------------------------------
+/// FOCAS 默认超时：5 秒，太短易因 CNC 扫描周期误判 EW_SOCKET
+const FOCAS_DEFAULT_TIMEOUT_MS: u64 = 5000;
+/// 毫秒转秒向上取整：timeout_s = (ms+999)/1000，FOCAS 以秒为单位
+const FOCAS_MS_PER_S: u64 = 1000;
+/// Fake 随机：xorshift 乘子与扰动常量（取自 splitmix64 经验值，保证分散性）
+const FAKE_RAND_MULT: u64 = 6364136223846793005;
+const FAKE_RAND_XOR: u32 = 0x2545F491;
+
 /// FOCAS2 访问抽象，所有阻塞调用应在 `spawn_blocking` 中执行（由调用方保证）。
 #[async_trait::async_trait]
 pub trait FocasApi: Send + Sync {
@@ -170,7 +181,8 @@ impl FocasApi for NativeFocasApi {
         let res = tokio::task::spawn_blocking(move || {
             let r = lib_arc.get_or_init(|| NativeLib::load());
             let lib = match r { Ok(l) => l, Err(e) => return Err(e.clone()) };
-            let timeout_secs = ((timeout_ms + 999) / 1000) as i32;
+            // 毫秒向上取整为秒：FOCAS 以秒为单位，999 保证 1ms 也算 1s
+            let timeout_secs = ((timeout_ms + FOCAS_MS_PER_S - 1) / FOCAS_MS_PER_S) as i32;
             let hdl = lib.allclibhndl3(&host_s, port, timeout_secs).map_err(Self::map_ret_err)?;
             *handle_arc.lock().unwrap() = Some(hdl);
             tracing::info!(host=%host_s, port, hdl, "FOCAS Native 连接建立");

@@ -21,16 +21,19 @@ pub enum S7Kind {
     String, // S7 STRING（首字节 max、次字节 len）
 }
 
+// V1 取 32 字节覆盖常规 S7 STRING（max_len 32），避免 DB 越界
+const S7_STRING_READ_LEN: usize = 32;
+
 impl S7Kind {
     /// 请求字节数（不含 S7 STRING 的变长头——调用方需按需扩大）。
     pub fn byte_len(self) -> usize {
         match self {
-            S7Kind::Bool => 1, // BIT 传输仍以 1 字节回传（实际按 BYTE 读后取位）
+            S7Kind::Bool => 1, // BIT 传输仍以 1 字节回传（实际按 BYTE 读后取位避免 BIT 兼容差异）
             S7Kind::Byte => 1,
             S7Kind::Word | S7Kind::Int => 2,
             S7Kind::Dword | S7Kind::Dint | S7Kind::Real => 4,
             S7Kind::Lreal => 8,
-            S7Kind::String => 32, // V1 取 32 足够覆盖常规 S7 STRING，避免越界
+            S7Kind::String => S7_STRING_READ_LEN,
         }
     }
 

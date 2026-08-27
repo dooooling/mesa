@@ -14,6 +14,16 @@
 
 use thiserror::Error;
 
+// ---------------------------------------------------------------------------
+// 常量：FOCAS 地址边界（中文解释“为什么”）
+// ---------------------------------------------------------------------------
+/// FANUC 最大 32 轴（0i-F 3轴、30i 10/24轴均在此内），超出需扩展 OdbAxis
+const FOCAS_MAX_AXIS: u8 = 32;
+/// FANUC 最大 4 主轴（双主轴常见，4 为上位机兼容上限）
+const FOCAS_MAX_SPINDLE: u8 = 4;
+/// 位偏移固定 0..7（1 字节内 8 位）
+const FOCAS_MAX_BIT: u8 = 7;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FocasAddress {
     /// `cnc_statinfo` 报警等
@@ -141,14 +151,14 @@ fn parse_axis(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
     match parts.as_slice() {
         [kind, num] => {
             let k = AxisKind::from_str(kind).ok_or_else(|| AddressError::Invalid { input: raw.to_string(), reason: format!("轴类型 `{kind}` 非法，期望 abs/machine/relative/distance") })?;
-            let n: u8 = num.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("轴号 `{num}` 非法 1..32") })?;
-            if n == 0 || n > 32 { return Err(AddressError::Invalid { input: raw.to_string(), reason: "轴号必须 1..32".into() }); }
+            let n: u8 = num.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("轴号 `{num}` 非法 1..{FOCAS_MAX_AXIS}") })?;
+            if n == 0 || n > FOCAS_MAX_AXIS { return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("轴号必须 1..{FOCAS_MAX_AXIS}") }); }
             Ok(FocasAddress::Axis { axis: n, kind: k })
         }
         [num] => {
             // axis.1 视为 axis.abs.1
             let n: u8 = num.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("轴号 `{num}` 非法") })?;
-            if n == 0 || n > 32 { return Err(AddressError::Invalid { input: raw.to_string(), reason: "轴号必须 1..32".into() }); }
+            if n == 0 || n > FOCAS_MAX_AXIS { return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("轴号必须 1..{FOCAS_MAX_AXIS}") }); }
             Ok(FocasAddress::Axis { axis: n, kind: AxisKind::Absolute })
         }
         _ => Err(AddressError::Invalid { input: raw.to_string(), reason: "轴地址形如 axis.abs.1 / axis.machine.2 / axis.1".into() }),
@@ -165,8 +175,8 @@ fn parse_spindle(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
                 "load" | "spmeter" => SpindleKind::Load,
                 _ => return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("主轴类型 `{kind}` 非法，期望 speed/load") }),
             };
-            let n: u8 = num.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("主轴号 `{num}` 非法 1..4") })?;
-            if n == 0 || n > 4 { return Err(AddressError::Invalid { input: raw.to_string(), reason: "主轴号必须 1..4".into() }); }
+            let n: u8 = num.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("主轴号 `{num}` 非法 1..{FOCAS_MAX_SPINDLE}") })?;
+            if n == 0 || n > FOCAS_MAX_SPINDLE { return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("主轴号必须 1..{FOCAS_MAX_SPINDLE}") }); }
             Ok(FocasAddress::Spindle { spindle: n, kind: k })
         }
         [kind] => {
@@ -184,8 +194,8 @@ fn parse_spindle(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
 fn parse_servo(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
     let prefix_len = if s.starts_with("servoload.") { "servoload.".len() } else { "servo.".len() };
     let rest = &s[prefix_len..];
-    let n: u8 = rest.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("伺服轴号 `{rest}` 非法 1..32") })?;
-    if n == 0 || n > 32 { return Err(AddressError::Invalid { input: raw.to_string(), reason: "伺服轴号必须 1..32".into() }); }
+    let n: u8 = rest.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("伺服轴号 `{rest}` 非法 1..{FOCAS_MAX_AXIS}") })?;
+    if n == 0 || n > FOCAS_MAX_AXIS { return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("伺服轴号必须 1..{FOCAS_MAX_AXIS}") }); }
     Ok(FocasAddress::ServoLoad { axis: n })
 }
 
@@ -207,8 +217,8 @@ fn parse_pmc(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
     let (num_s, bit_opt) = if let Some((a, b)) = tail.split_once('.') { (a, Some(b)) } else { (tail, None) };
     let addr: u32 = num_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("PMC 地址 `{num_s}` 非法") })?;
     let bit = if let Some(b) = bit_opt {
-        let v: u8 = b.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("位 `{b}` 非法 0..7") })?;
-        if v > 7 { return Err(AddressError::Invalid { input: raw.to_string(), reason: "PMC 位必须 0..7".into() }); }
+        let v: u8 = b.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("位 `{b}` 非法 0..{FOCAS_MAX_BIT}") })?;
+        if v > FOCAS_MAX_BIT { return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("PMC 位必须 0..{FOCAS_MAX_BIT}") }); }
         Some(v)
     } else { None };
     Ok(FocasAddress::Pmc { kind, addr, bit })

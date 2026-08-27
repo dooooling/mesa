@@ -13,6 +13,52 @@ use crate::codec::S7Kind;
 use forgelink_driver_sdk::SdkDriverError;
 use forgelink_core_types::ErrorKind;
 
+// ---------------------------------------------------------------------------
+// 协议常量（中文注释解释“为什么”）
+// ---------------------------------------------------------------------------
+
+/// S7 默认端口：ISO-on-TCP 固定 102
+const S7_DEFAULT_PORT: u16 = 102;
+/// COTP/TSAP 基址：0x0100 为 S7 侧固定前缀，rack/slot 在此基础上编码
+const S7_TSAP_BASE: u16 = 0x0100;
+/// TSAP 中 rack 占 3 位，左移 5 位后与 slot 合并（与 snap7/TIA 兼容）
+const S7_TSAP_RACK_SHIFT: u16 = 5;
+/// 硬件限制：S7-300/400 rack 0..7，slot 0..31
+const S7_MAX_RACK: u8 = 7;
+const S7_MAX_SLOT: u8 = 31;
+/// 超时下限：避免过小导致局域网抖动误超时
+const S7_MIN_TIMEOUT_MS: u64 = 500;
+/// PDU 协商区间：240 为最小可用，960 为上位机常用上限，480 为兼容默认值
+const S7_PDU_MIN: u16 = 240;
+const S7_PDU_MAX: u16 = 960;
+const S7_PDU_DEFAULT: u16 = 480;
+/// TPKT 固定：版本 0x03、长度校验上下限
+const TPKT_VERSION: u8 = 0x03;
+const TPKT_MIN_LEN: usize = 4;
+const TPKT_MAX_LEN: usize = 8192;
+/// COTP：CR 0xE0 / CC 0xD0，DT 0xF0
+const COTP_CR: u8 = 0xE0;
+const COTP_CC: u8 = 0xD0;
+const COTP_DT: u8 = 0xF0;
+/// S7：ROSCTR 0x01=Job 0x03=Ack，功能码 0x04=ReadVar
+const S7_ROSCTR_JOB: u8 = 0x01;
+const S7_ROSCTR_ACK: u8 = 0x03;
+const S7_FUNC_READ: u8 = 0x04;
+/// S7 单次 PDU 可携带 item 上限，受 480 字节 PDU 限制（12字节/item + 头），经验值 19
+const S7_MAX_ITEMS_PER_PDU: usize = 19;
+/// S7 错误码（CPU 侧返回，见 §7.1 诊断要求）
+const S7_ERR_ADDRESS: u8 = 0x05;
+const S7_ERR_CONTEXT: u8 = 0x04;
+const S7_ERR_ACCESS: u8 = 0x03;
+const S7_ERR_TYPE_MISMATCH: u8 = 0x06;
+const S7_ITEM_OK: u8 = 0xFF;
+/// S7 传输层：0x04=Byte 0x03=Bit 0x10=S7 变量规范
+const S7_TRANSPORT_BYTE: u8 = 0x04;
+const S7_TRANSPORT_BIT: u8 = 0x03;
+const S7_VAR_SPEC: u8 = 0x12;
+const S7_VAR_SPEC_LEN: u8 = 0x0A;
+const S7_SYNTAX_ID_S7ANY: u8 = 0x10;
+
 /// 连接参数（来自 Endpoint.connection JSON）。
 #[derive(Debug, Clone)]
 pub struct S7ConnConfig {
@@ -26,7 +72,7 @@ pub struct S7ConnConfig {
 
 impl Default for S7ConnConfig {
     fn default() -> Self {
-        Self { host: "127.0.0.1".into(), port: 102, rack: 0, slot: 1, timeout_ms: 3000, pdu_length: 480 }
+        Self { host: "127.0.0.1".into(), port: S7_DEFAULT_PORT, rack: 0, slot: 1, timeout_ms: 3000, pdu_length: S7_PDU_DEFAULT }
     }
 }
 
@@ -44,18 +90,18 @@ impl S7ConnConfig {
             cfg.port = p as u16;
         }
         if let Some(r) = v.get("rack").and_then(|x| x.as_u64()) {
-            if r > 7 { return Err(SdkDriverError::configuration("BAD_CONFIG", format!("rack {} 非法", r))); }
+            if r > S7_MAX_RACK as u64 { return Err(SdkDriverError::configuration("BAD_CONFIG", format!("rack {} 非法，允许 0..{}", r, S7_MAX_RACK))); }
             cfg.rack = r as u8;
         }
         if let Some(s) = v.get("slot").and_then(|x| x.as_u64()) {
-            if s > 31 { return Err(SdkDriverError::configuration("BAD_CONFIG", format!("slot {} 非法", s))); }
+            if s > S7_MAX_SLOT as u64 { return Err(SdkDriverError::configuration("BAD_CONFIG", format!("slot {} 非法，允许 0..{}", s, S7_MAX_SLOT))); }
             cfg.slot = s as u8;
         }
         if let Some(t) = v.get("timeout_ms").and_then(|x| x.as_u64()) {
-            cfg.timeout_ms = t.max(500);
+            cfg.timeout_ms = t.max(S7_MIN_TIMEOUT_MS);
         }
         if let Some(pdu) = v.get("pdu_length").and_then(|x| x.as_u64()) {
-            cfg.pdu_length = (pdu as u16).clamp(240, 960);
+            cfg.pdu_length = (pdu as u16).clamp(S7_PDU_MIN, S7_PDU_MAX);
         }
         // 兼容 tsap 直接指定（可选）
         if let Some(tsap) = v.get("remote_tsap").and_then(|x| x.as_u64()) {
@@ -103,9 +149,9 @@ impl S7Client {
     }
 
     async fn iso_connect(&mut self) -> Result<(), SdkDriverError> {
-        let src_tsap = 0x0100u16;
-        // 经典推导：dst = 0x0100 | (rack<<5 | slot)，与 snap7 兼容
-        let dst_tsap = 0x0100u16 | ((self.cfg.rack as u16) << 5) | (self.cfg.slot as u16);
+        let src_tsap = S7_TSAP_BASE;
+        // 经典推导：dst = 0x0100 | (rack<<5 | slot)，与 snap7/TIA Portal 兼容
+        let dst_tsap = S7_TSAP_BASE | ((self.cfg.rack as u16) << S7_TSAP_RACK_SHIFT) | (self.cfg.slot as u16);
         let pkt = build_cotp_cr(src_tsap, dst_tsap);
         timeout(self.cfg.timeout(), self.send_raw(&pkt)).await
             .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "COTP_TIMEOUT", "COTP CR 超时"))?
@@ -113,8 +159,8 @@ impl S7Client {
         let resp = timeout(self.cfg.timeout(), self.recv_packet()).await
             .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "COTP_TIMEOUT", "COTP CC 超时"))?
             .map_err(|e| SdkDriverError::new(ErrorKind::Connection, "COTP_RECV_FAIL", e.to_string()))?;
-        // COTP CC PDU type 0xD0
-        if resp.len() < 6 || resp[5] != 0xD0 {
+        // COTP CC 期望 0xD0（Connection Confirm）
+        if resp.len() < 6 || resp[5] != COTP_CC {
             return Err(SdkDriverError::new(
                 ErrorKind::Connection,
                 "COTP_REJECTED",
@@ -138,8 +184,8 @@ impl S7Client {
         if payload.len() < 12 {
             return Err(SdkDriverError::new(ErrorKind::Protocol, "S7_SETUP_SHORT", format!("Setup 响应过短 {}", payload.len())));
         }
-        // rosctr 0x03 = Ack
-        if payload[1] != 0x03 {
+        // S7 ROSCTR 0x03 = Ack（0x01 为 Job）
+        if payload[1] != S7_ROSCTR_ACK {
             let err = payload.get(17).copied().unwrap_or(0);
             return Err(map_s7_error(err, "S7 Setup 被拒绝"));
         }
@@ -159,9 +205,9 @@ impl S7Client {
         if items.is_empty() {
             return Ok(vec![]);
         }
-        // S7 PDU 对单次 item 数的限制约为 19，超出需分批
+        // PDU 480 字节时单次最多约 19 项（12字节/item），超出分批
         let mut all: Vec<Vec<u8>> = Vec::with_capacity(items.len());
-        for chunk in items.chunks(19) {
+        for chunk in items.chunks(S7_MAX_ITEMS_PER_PDU) {
             let pkt = build_read_req(self.pdu_ref, chunk);
             self.pdu_ref = self.pdu_ref.wrapping_add(1).max(1);
             timeout(self.cfg.timeout(), self.send_raw(&pkt)).await
@@ -181,16 +227,16 @@ impl S7Client {
         self.stream.flush().await
     }
 
-    /// 读取一个完整 TPKT 包。
+    /// 读取一个完整 TPKT 包（ISO 8073）。
     async fn recv_packet(&mut self) -> std::io::Result<Vec<u8>> {
         let mut hdr = [0u8; 4];
         self.stream.read_exact(&mut hdr).await?;
-        if hdr[0] != 0x03 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("TPKT 版本异常 {:02x}", hdr[0])));
+        if hdr[0] != TPKT_VERSION {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("TPKT 版本异常 {:02x}，期望 {:02x}", hdr[0], TPKT_VERSION)));
         }
         let len = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
-        if len < 4 || len > 8192 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("TPKT 长度非法 {}", len)));
+        if len < TPKT_MIN_LEN || len > TPKT_MAX_LEN {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("TPKT 长度非法 {}，允许 {}..{}", len, TPKT_MIN_LEN, TPKT_MAX_LEN)));
         }
         let mut buf = vec![0u8; len];
         buf[0..4].copy_from_slice(&hdr);
@@ -200,40 +246,40 @@ impl S7Client {
 }
 
 fn build_cotp_cr(src: u16, dst: u16) -> Vec<u8> {
-    // 固定 COTP CR：TPDU size 0x0A (1024)，src/dst TSAP
+    // COTP CR：LI 0x11 / PDU type CR 0xE0 / TPDU size 0x0A=1024 / src/dst TSAP
     let mut cotp = vec![
-        0x11, 0xE0, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x11, COTP_CR, 0x00, 0x00, 0x00, 0x01, 0x00,
         0xC0, 0x01, 0x0A,
         0xC1, 0x02, ((src >> 8) as u8), (src as u8),
         0xC2, 0x02, ((dst >> 8) as u8), (dst as u8),
     ];
     let tpkt_len = (4 + cotp.len()) as u16;
-    let mut pkt = vec![0x03, 0x00, (tpkt_len >> 8) as u8, (tpkt_len & 0xFF) as u8];
+    let mut pkt = vec![TPKT_VERSION, 0x00, (tpkt_len >> 8) as u8, (tpkt_len & 0xFF) as u8];
     pkt.append(&mut cotp);
     pkt
 }
 
 fn build_s7_setup(pdu_ref: u16, pdu_len: u16) -> Vec<u8> {
-    // S7: header 12 + param 8
+    // S7 Setup：固定头 0x32 / ROSCTR Job 0x01 / 保留 / PDU ref / param len 8 / data len 0 / F0 功能组
     let mut s7 = Vec::with_capacity(20);
-    s7.extend_from_slice(&[0x32, 0x01, 0x00, 0x00]);
+    s7.extend_from_slice(&[0x32, S7_ROSCTR_JOB, 0x00, 0x00]);
     s7.extend_from_slice(&pdu_ref.to_be_bytes());
-    s7.extend_from_slice(&[0x00, 0x08, 0x00, 0x00]); // param len 8, data len 0
+    s7.extend_from_slice(&[0x00, 0x08, 0x00, 0x00]);
     s7.extend_from_slice(&[0xF0, 0x00, 0x00, 0x01, 0x00, 0x01]);
     s7.extend_from_slice(&pdu_len.to_be_bytes());
-    // COTP DT
-    let cotp = [0x02, 0xF0, 0x80];
+    // COTP Data
+    let cotp = [0x02, COTP_DT, 0x80];
     let tpkt_len = (4 + cotp.len() + s7.len()) as u16;
-    let mut pkt = vec![0x03, 0x00, (tpkt_len >> 8) as u8, (tpkt_len & 0xFF) as u8];
+    let mut pkt = vec![TPKT_VERSION, 0x00, (tpkt_len >> 8) as u8, (tpkt_len & 0xFF) as u8];
     pkt.extend_from_slice(&cotp);
     pkt.extend_from_slice(&s7);
     pkt
 }
 
 fn build_read_req(pdu_ref: u16, items: &[ReadItem]) -> Vec<u8> {
-    // Param: 0x04 + num_items + N * 12 byte item
+    // S7 ReadVar 参数：功能码 0x04 + item数 + N×12字节 ANY 结构（0x12 0x0A 0x10 + transport + len + db + area + bit_addr）
     let mut param = Vec::with_capacity(2 + items.len() * 12);
-    param.push(0x04);
+    param.push(S7_FUNC_READ);
     param.push(items.len() as u8);
     for it in items {
         let area = it.addr.area.code();
@@ -241,7 +287,7 @@ fn build_read_req(pdu_ref: u16, items: &[ReadItem]) -> Vec<u8> {
         let bit_addr = it.addr.bit_address();
         let transport = it.kind.transport_size();
         let req_len = it.kind.request_len();
-        param.extend_from_slice(&[0x12, 0x0A, 0x10, transport]);
+        param.extend_from_slice(&[S7_VAR_SPEC, S7_VAR_SPEC_LEN, S7_SYNTAX_ID_S7ANY, transport]);
         param.extend_from_slice(&req_len.to_be_bytes());
         param.extend_from_slice(&db.to_be_bytes());
         param.push(area);
@@ -251,14 +297,14 @@ fn build_read_req(pdu_ref: u16, items: &[ReadItem]) -> Vec<u8> {
     }
     let param_len = param.len() as u16;
     let mut s7 = Vec::with_capacity(12 + param.len());
-    s7.extend_from_slice(&[0x32, 0x01, 0x00, 0x00]);
+    s7.extend_from_slice(&[0x32, S7_ROSCTR_JOB, 0x00, 0x00]);
     s7.extend_from_slice(&pdu_ref.to_be_bytes());
     s7.extend_from_slice(&param_len.to_be_bytes());
     s7.extend_from_slice(&[0x00, 0x00]);
     s7.extend_from_slice(&param);
-    let cotp = [0x02, 0xF0, 0x80];
+    let cotp = [0x02, COTP_DT, 0x80];
     let tpkt_len = (4 + cotp.len() + s7.len()) as u16;
-    let mut pkt = vec![0x03, 0x00, (tpkt_len >> 8) as u8, (tpkt_len & 0xFF) as u8];
+    let mut pkt = vec![TPKT_VERSION, 0x00, (tpkt_len >> 8) as u8, (tpkt_len & 0xFF) as u8];
     pkt.extend_from_slice(&cotp);
     pkt.extend_from_slice(&s7);
     pkt
@@ -273,11 +319,9 @@ fn parse_read_resp(resp: &[u8], sent_items: &[ReadItem]) -> Result<Vec<Vec<u8>>,
         return Err(SdkDriverError::new(ErrorKind::Protocol, "S7_SHORT", "S7 头部缺失"));
     }
     let rosctr = s7[1];
-    if rosctr != 0x03 {
-        // 0x02 = Ack Data should also be 0x03 for read
-        // 检查 S7 错误类
+    if rosctr != S7_ROSCTR_ACK {
         let err_class = s7.get(17).copied().unwrap_or(0);
-        return Err(map_s7_error(err_class, &format!("Read 被拒绝 rosctr={:02x}", rosctr)));
+        return Err(map_s7_error(err_class, &format!("Read 被拒绝 rosctr={:02x} 期望 {:02x}", rosctr, S7_ROSCTR_ACK)));
     }
     let param_len = u16::from_be_bytes([s7[6], s7[7]]) as usize;
     let data_len = u16::from_be_bytes([s7[8], s7[9]]) as usize;
@@ -297,25 +341,24 @@ fn parse_read_resp(resp: &[u8], sent_items: &[ReadItem]) -> Result<Vec<Vec<u8>>,
         let transport = data[off + 1];
         let len_bits = u16::from_be_bytes([data[off + 2], data[off + 3]]) as usize;
         off += 4;
-        if ret != 0xFF {
+        if ret != S7_ITEM_OK {
             let msg = match ret {
-                0x05 => format!("地址不存在或越界（S7 0x05）——检查 DB{} 是否为标准访问、地址 {} 是否正确", it.addr.db_number, format_addr(&it.addr)),
-                0x04 => "上下文不支持（S7 0x04）——S7-1200/1500 请在 PLC 硬件组态中启用 PUT/GET 通信访问许可".to_string(),
-                0x03 => "拒绝访问（S7 0x03）——CPU 保护/安全等级禁止外部读".to_string(),
-                0x06 => "数据类型不匹配（S7 0x06）".to_string(),
+                S7_ERR_ADDRESS => format!("地址不存在或越界（S7 0x05）——检查 DB{} 是否为标准访问、地址 {} 是否正确", it.addr.db_number, format_addr(&it.addr)),
+                S7_ERR_CONTEXT => "上下文不支持（S7 0x04）——S7-1200/1500 请在 PLC 硬件组态中启用 PUT/GET 通信访问许可".to_string(),
+                S7_ERR_ACCESS => "拒绝访问（S7 0x03）——CPU 保护/安全等级禁止外部读".to_string(),
+                S7_ERR_TYPE_MISMATCH => "数据类型不匹配（S7 0x06）".to_string(),
                 _ => format!("S7 item 错误 0x{ret:02x}"),
             };
             let kind = match ret {
-                0x05 => ErrorKind::Address,
-                0x04 => ErrorKind::Configuration,
-                0x03 => ErrorKind::Configuration,
+                S7_ERR_ADDRESS => ErrorKind::Address,
+                S7_ERR_CONTEXT => ErrorKind::Configuration,
+                S7_ERR_ACCESS => ErrorKind::Configuration,
                 _ => ErrorKind::Device,
             };
             return Err(SdkDriverError::new(kind, format!("S7_ITEM_0x{ret:02X}"), format!("{msg}（data_type 期望 {kind:?}）")));
         }
-        // 数据字节数：若 transport 表明 BIT，则长度为 bits；BYTE 时长度亦为 bits（需 /8）
-        let byte_len = if transport == 0x03 || it.kind == S7Kind::Bool {
-            // BIT: 1 bit => 1 byte
+        // S7 返回长度单位为 bit，需转字节；BIT 固定 1 bit→1 byte
+        let byte_len = if transport == S7_TRANSPORT_BIT || it.kind == S7Kind::Bool {
             1
         } else {
             (len_bits + 7) / 8
@@ -395,9 +438,9 @@ fn map_connect_error(e: std::io::Error, addr: &str, cfg: &S7ConnConfig) -> SdkDr
 
 fn map_s7_error(code: u8, ctx: &str) -> SdkDriverError {
     let (kind, help) = match code {
-        0x04 => (ErrorKind::Configuration, "（0x04 上下文不支持）S7-1200/1500 请在 TIA Portal 硬件组态 CPU 属性 -> 防护与安全 -> 连接机制 中勾选“允许来自远程对象的 PUT/GET 通信访问”"),
-        0x05 => (ErrorKind::Address, "（0x05 地址错误）检查 DB 是否存在且为标准访问（非优化块），地址是否越界"),
-        0x03 => (ErrorKind::Configuration, "（0x03 拒绝）CPU 保护等级或安全策略禁止外部访问"),
+        S7_ERR_CONTEXT => (ErrorKind::Configuration, "（0x04 上下文不支持）S7-1200/1500 请在 TIA Portal 硬件组态 CPU 属性 -> 防护与安全 -> 连接机制 中勾选“允许来自远程对象的 PUT/GET 通信访问”"),
+        S7_ERR_ADDRESS => (ErrorKind::Address, "（0x05 地址错误）检查 DB 是否存在且为标准访问（非优化块），地址是否越界"),
+        S7_ERR_ACCESS => (ErrorKind::Configuration, "（0x03 拒绝）CPU 保护等级或安全策略禁止外部访问"),
         _ => (ErrorKind::Protocol, ""),
     };
     SdkDriverError::new(kind, format!("S7_0x{code:02X}"), format!("{ctx}: S7 错误 0x{code:02X} {help}"))

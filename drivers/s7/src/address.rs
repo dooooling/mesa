@@ -10,6 +10,19 @@
 
 use thiserror::Error;
 
+// ---------------------------------------------------------------------------
+// 常量：S7 区域与位边界（中文解释“为什么”）
+// ---------------------------------------------------------------------------
+/// S7 ANY 结构的 area 字段：DB 0x84 / M 0x83 / I 0x81 / Q 0x82（S7Comm 固定）
+const S7_AREA_DB: u8 = 0x84;
+const S7_AREA_MERKER: u8 = 0x83;
+const S7_AREA_INPUT: u8 = 0x81;
+const S7_AREA_OUTPUT: u8 = 0x82;
+/// 1 字节内位偏移上限 0..7
+const S7_MAX_BIT: u8 = 7;
+/// 字节到位换算：S7 ANY 中位地址 = byte*8 + bit
+const S7_BITS_PER_BYTE: u32 = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Area {
     Db,
@@ -22,10 +35,10 @@ impl Area {
     /// S7 协议的 area code（ANY 结构的 area 字段）。
     pub fn code(self) -> u8 {
         match self {
-            Area::Db => 0x84,
-            Area::Merker => 0x83,
-            Area::Input => 0x81,
-            Area::Output => 0x82,
+            Area::Db => S7_AREA_DB,
+            Area::Merker => S7_AREA_MERKER,
+            Area::Input => S7_AREA_INPUT,
+            Area::Output => S7_AREA_OUTPUT,
         }
     }
 }
@@ -53,7 +66,7 @@ pub enum AddressError {
 impl S7Address {
     /// 将地址编码为 S7 ANY 结构中的 3 字节位偏移（byte_offset*8+bit）。
     pub fn bit_address(&self) -> u32 {
-        self.byte_offset * 8 + self.bit_offset.unwrap_or(0) as u32
+        self.byte_offset * S7_BITS_PER_BYTE + self.bit_offset.unwrap_or(0) as u32
     }
 }
 
@@ -89,8 +102,8 @@ fn parse_db(s: &str, raw: &str) -> Result<S7Address, AddressError> {
         let (byte_s, bit_s) = split_byte_bit(stripped, raw)?;
         let byte_offset: u32 = byte_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("字节偏移 `{byte_s}` 非法") })?;
         let bit: u8 = bit_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移 `{bit_s}` 非法") })?;
-        if bit > 7 {
-            return Err(AddressError::Invalid { input: raw.to_string(), reason: "位偏移必须 0-7".into() });
+        if bit > S7_MAX_BIT {
+            return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移必须 0..{S7_MAX_BIT}") });
         }
         Ok(S7Address { area: Area::Db, db_number, byte_offset, bit_offset: Some(bit) })
     } else if let Some(stripped) = rest.strip_prefix("DBB") {
@@ -115,8 +128,8 @@ fn parse_db(s: &str, raw: &str) -> Result<S7Address, AddressError> {
         let byte_offset: u32 = byte_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("字节偏移 `{byte_s}` 非法") })?;
         if let Some(bit_s) = bit_opt {
             let bit: u8 = bit_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移 `{bit_s}` 非法") })?;
-            if bit > 7 {
-                return Err(AddressError::Invalid { input: raw.to_string(), reason: "位偏移必须 0-7".into() });
+            if bit > S7_MAX_BIT {
+                return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移必须 0..{S7_MAX_BIT}") });
             }
             Ok(S7Address { area: Area::Db, db_number, byte_offset, bit_offset: Some(bit) })
         } else {
@@ -152,8 +165,8 @@ fn parse_miq(s: &str, raw: &str) -> Result<S7Address, AddressError> {
         let byte_offset: u32 = byte_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("字节偏移 `{byte_s}` 非法") })?;
         if let Some(bit_s) = bit_opt {
             let bit: u8 = bit_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移 `{bit_s}` 非法") })?;
-            if bit > 7 {
-                return Err(AddressError::Invalid { input: raw.to_string(), reason: "位偏移必须 0-7".into() });
+            if bit > S7_MAX_BIT {
+                return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移必须 0..{S7_MAX_BIT}") });
             }
             Ok(S7Address { area, db_number: 0, byte_offset, bit_offset: Some(bit) })
         } else {
@@ -169,8 +182,8 @@ fn parse_miq(s: &str, raw: &str) -> Result<S7Address, AddressError> {
         let byte_offset: u32 = byte_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("字节偏移 `{byte_s}` 非法") })?;
         if let Some(bit_s) = bit_opt {
             let bit: u8 = bit_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移 `{bit_s}` 非法") })?;
-            if bit > 7 {
-                return Err(AddressError::Invalid { input: raw.to_string(), reason: "位偏移必须 0-7".into() });
+            if bit > S7_MAX_BIT {
+                return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移必须 0..{S7_MAX_BIT}") });
             }
             Ok(S7Address { area, db_number: 0, byte_offset, bit_offset: Some(bit) })
         } else {
