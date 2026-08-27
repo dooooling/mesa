@@ -1,0 +1,25 @@
+[package]
+name = "forgelink-driver-focas2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "forgelink_driver_focas2"
+path = "src/lib.rs"
+
+[[bin]]
+name = "forgelink-driver-focas2"
+path = "src/main.rs"
+
+[dependencies]
+forgelink-core-types = { workspace = true }
+forgelink-driver-sdk = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+getrandom = { workspace = true }

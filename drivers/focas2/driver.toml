@@ -1,0 +1,8 @@
+# FANUC FOCAS2 Driver — 方案 §7.2 资源型
+id = "focas2"
+name = "FANUC FOCAS2"
+version = "0.1.0"
+executable = "forgelink-driver-focas2"
+protocol_major = 1
+protocol_minor = 0
+sdk = "rust"

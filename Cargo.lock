@@ -230,6 +230,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "forgelink-driver-focas2"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "forgelink-core-types",
+ "forgelink-driver-sdk",
+ "getrandom 0.2.17",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "forgelink-driver-manager"
 version = "0.1.0"
 dependencies = [

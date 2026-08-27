@@ -10,6 +10,7 @@ members = [
     "apps/forgelinkd",
     "drivers/simulator",
     "drivers/s7",
+    "drivers/focas2",
     "tests/driver-contract",
 ]
 
