@@ -15,7 +15,8 @@
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_long, c_short, c_ushort};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use libloading::{Library, Symbol};
 
@@ -328,6 +329,20 @@ pub struct NativeLib {
 impl NativeLib {
     /// 按当前 OS/Arch 探测并加载库，失败返回明确错误（用于上层转 `CONNECT_FAILED`/`EW_NODLL`）
     pub fn load() -> Result<Self, String> {
+        // Windows：FOCAS 依赖同目录的 fwlibe1 等子 DLL，需将目录加入 PATH 供隐式依赖搜索
+        #[cfg(target_os = "windows")]
+        {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            for d in [cwd.join("drivers/focas2/libs/win"), cwd.join("drivers/focas2/libs"), std::env::temp_dir().join("forgelink_focas_embed")] {
+                if d.is_dir() {
+                    let cur = std::env::var("PATH").unwrap_or_default();
+                    let s = d.to_string_lossy().to_string();
+                    if !cur.contains(&s) {
+                        std::env::set_var("PATH", format!("{};{}", s, cur));
+                    }
+                }
+            }
+        }
         let candidates = Self::candidate_paths();
         let mut last_err = String::new();
         for p in candidates {
@@ -341,24 +356,42 @@ impl NativeLib {
                 format!("libs/{}", fname),
             ];
             for tp in try_paths {
-                match unsafe { Library::new(&tp) } {
-                    Ok(lib) => {
-                        tracing::info!(lib=%tp, "FOCAS Native 库加载成功");
-                        return Ok(Self::from_library(lib));
-                    }
-                    Err(e) => {
-                        last_err = format!("{tp}: {e}");
-                        continue;
+                let tp_abs = if std::path::Path::new(&tp).is_absolute() {
+                    tp.clone()
+                } else {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")).join(&tp).to_string_lossy().to_string()
+                };
+                for cand in [tp_abs.clone(), tp.clone()] {
+                    match unsafe { Library::new(&cand) } {
+                        Ok(lib) => {
+                            tracing::info!(lib=%cand, "FOCAS Native 库加载成功");
+                            return Ok(Self::from_library(lib));
+                        }
+                        Err(e) => {
+                            last_err = format!("{cand}: {e}");
+                            continue;
+                        }
                     }
                 }
             }
-            // 也尝试系统路径直接加载（如已安装到 PATH/LD_LIBRARY_PATH）
             let name = Path::new(&p).file_name().unwrap().to_string_lossy().to_string();
             if let Ok(lib) = unsafe { Library::new(&name) } {
                 tracing::info!(lib=%name, "FOCAS Native 库从系统路径加载成功");
                 return Ok(Self::from_library(lib));
             }
             last_err = format!("{}: not found, last: {}", p, last_err);
+        }
+        // 单文件兜底：从嵌入字节解压的临时目录加载（首次 10ms，后续缓存）
+        if let Some(dir) = Self::embedded_dir() {
+            for p in Self::candidate_paths() {
+                let fname = Path::new(&p).file_name().unwrap().to_string_lossy().to_string();
+                let tp = dir.join(&fname);
+                if let Ok(lib) = unsafe { Library::new(&tp) } {
+                    tracing::info!(lib=%tp.display(), "FOCAS Native 库从嵌入临时目录加载成功");
+                    return Ok(Self::from_library(lib));
+                }
+            }
+            last_err = format!("{} | embedded_dir {} 已试", last_err, dir.display());
         }
         Err(format!("EW_NODLL 无法加载 FOCAS 库（{}），请将对应平台库置于 drivers/focas2/libs/ 或系统库路径", last_err))
     }
@@ -381,6 +414,70 @@ impl NativeLib {
         } else {
             vec!["Fwlib32.dll".into()]
         }
+    }
+
+    /// 单文件嵌入的 FOCAS 库解压到临时目录（带 OnceLock 缓存，10ms 级一次）
+    /// - 将 `libs/win/*.dll` 与 `libs/linux/*.so` 以 `include_bytes!` 编进二进制，分发时单 `exe` 即可
+    /// - 运行时首次 `load()` 时解压至 `%TEMP%/forgelink_focas_<hash>` 并缓存 `PathBuf`，后续 `Library::new` 直连
+    /// - 无性能损失：解压后 `libloading` 同外置文件一致，后续 `cnc_*` 调用无代理
+    fn embedded_dir() -> Option<PathBuf> {
+        static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+        CACHE.get_or_init(|| Self::extract_embedded()).clone()
+    }
+
+    fn extract_embedded() -> Option<PathBuf> {
+        // 按 OS 选择嵌入清单
+        #[cfg(target_os = "windows")]
+        const EMBEDDED: &[(&str, &[u8])] = &[
+            ("FWLIB64.dll", include_bytes!("../libs/win/FWLIB64.dll")),
+            ("Fwlib32.dll", include_bytes!("../libs/win/Fwlib32.dll")),
+            ("fwlib0DN.dll", include_bytes!("../libs/win/fwlib0DN.dll")),
+            ("fwlib0DN64.dll", include_bytes!("../libs/win/fwlib0DN64.dll")),
+            ("Fwlib0i.dll", include_bytes!("../libs/win/Fwlib0i.dll")),
+            ("Fwlib0iB.dll", include_bytes!("../libs/win/Fwlib0iB.dll")),
+            ("fwlib0iD.dll", include_bytes!("../libs/win/fwlib0iD.dll")),
+            ("fwlib0iD64.dll", include_bytes!("../libs/win/fwlib0iD64.dll")),
+            ("Fwlib150.dll", include_bytes!("../libs/win/Fwlib150.dll")),
+            ("Fwlib15i.dll", include_bytes!("../libs/win/Fwlib15i.dll")),
+            ("Fwlib160.dll", include_bytes!("../libs/win/Fwlib160.dll")),
+            ("Fwlib16W.dll", include_bytes!("../libs/win/Fwlib16W.dll")),
+            ("fwlib30i.dll", include_bytes!("../libs/win/fwlib30i.dll")),
+            ("fwlib30i64.dll", include_bytes!("../libs/win/fwlib30i64.dll")),
+            ("fwlibe1.dll", include_bytes!("../libs/win/fwlibe1.dll")),
+            ("fwlibe64.dll", include_bytes!("../libs/win/fwlibe64.dll")),
+            ("fwlibNCG.dll", include_bytes!("../libs/win/fwlibNCG.dll")),
+            ("fwlibNCG64.dll", include_bytes!("../libs/win/fwlibNCG64.dll")),
+            ("Fwlibpm.dll", include_bytes!("../libs/win/Fwlibpm.dll")),
+            ("Fwlibpmi.dll", include_bytes!("../libs/win/Fwlibpmi.dll")),
+        ];
+        #[cfg(target_os = "linux")]
+        const EMBEDDED: &[(&str, &[u8])] = &[
+            ("libfwlib32-linux-x64.so.1.0.5", include_bytes!("../libs/linux/libfwlib32-linux-x64.so.1.0.5")),
+            ("libfwlib32-linux-armv7.so.1.0.5", include_bytes!("../libs/linux/libfwlib32-linux-armv7.so.1.0.5")),
+            ("libfwlib32-linux-x86.so.1.0.5", include_bytes!("../libs/linux/libfwlib32-linux-x86.so.1.0.5")),
+            ("libfwlib32-linux-x86.so.1.0.0", include_bytes!("../libs/linux/libfwlib32-linux-x86.so.1.0.0")),
+        ];
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        const EMBEDDED: &[(&str, &[u8])] = &[];
+
+        if EMBEDDED.is_empty() { return None; }
+        let dir = std::env::temp_dir().join("forgelink_focas_embed");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(%e, "创建嵌入临时目录失败");
+            return None;
+        }
+        for (name, bytes) in EMBEDDED {
+            let path = dir.join(name);
+            // 已存在且大小一致则跳过覆写（缓存命中）
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.len() == bytes.len() as u64 { continue; }
+            }
+            if let Err(e) = std::fs::write(&path, bytes) {
+                tracing::warn!(name=%name, %e, "写入嵌入库失败");
+                continue;
+            }
+        }
+        Some(dir)
     }
 
     fn from_library(lib: Library) -> Self {

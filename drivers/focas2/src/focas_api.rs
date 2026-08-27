@@ -181,7 +181,6 @@ impl FocasApi for NativeFocasApi {
         let res = tokio::task::spawn_blocking(move || {
             let r = lib_arc.get_or_init(|| NativeLib::load());
             let lib = match r { Ok(l) => l, Err(e) => return Err(e.clone()) };
-            // 毫秒向上取整为秒：FOCAS 以秒为单位，999 保证 1ms 也算 1s
             let timeout_secs = ((timeout_ms + FOCAS_MS_PER_S - 1) / FOCAS_MS_PER_S) as i32;
             let hdl = lib.cnc_allclibhndl3(&host_s, port, timeout_secs).map_err(Self::map_ret_err)?;
             *handle_arc.lock().unwrap() = Some(hdl);
