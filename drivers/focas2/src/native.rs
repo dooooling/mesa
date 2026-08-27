@@ -133,6 +133,24 @@ pub struct OdbActs {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+pub struct Faxis {
+    pub absolute: [c_int; 8],
+    pub machine: [c_int; 8],
+    pub relative: [c_int; 8],
+    pub distance: [c_int; 8],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Oaxis {
+    pub absolute: c_int,
+    pub machine: c_int,
+    pub relative: c_int,
+    pub distance: c_int,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct OdbDy1 {
     pub dummy: c_short,
     pub axis: c_short,
@@ -142,7 +160,22 @@ pub struct OdbDy1 {
     pub seqnum: c_int,
     pub actf: c_int,
     pub acts: c_int,
-    // pos 字段在 Native 中为变长 FAXIS，按需单独读取，此处仅占位
+    pub pos: Faxis,
+}
+
+/// ODBDY2_2：对应 fanuc-driver RdDynamic2 axis=1 length=44（单轴），Pack=4 时正好 44 字节
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OdbDy2 {
+    pub dummy: c_short,
+    pub axis: c_short,
+    pub alarm: c_int,
+    pub prgnum: c_int,
+    pub prgmnum: c_int,
+    pub seqnum: c_int,
+    pub actf: c_int,
+    pub acts: c_int,
+    pub pos: Oaxis,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +185,7 @@ pub struct OdbDy1 {
 type FnAllClibHndl3 = unsafe extern "C" fn(*const c_char, c_ushort, c_long, *mut c_ushort) -> c_short;
 type FnFreelibHndl = unsafe extern "C" fn(c_ushort) -> c_short;
 type FnStatInfo = unsafe extern "C" fn(c_ushort, *mut OdbSt) -> c_short;
-type FnRdDynamic2 = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OdbDy1) -> c_short;
+type FnRdDynamic2 = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OdbDy2) -> c_short;
 type FnRdPosition = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OdbDy1) -> c_short; // 简化复用
 type FnCncActs = unsafe extern "C" fn(c_ushort, *mut OdbActs) -> c_short;
 type FnCncActs2 = unsafe extern "C" fn(c_ushort, c_short, *mut OdbActs) -> c_short;
@@ -279,11 +312,11 @@ impl NativeLib {
         if ret.is_ok() { Ok(unsafe { out.assume_init() }) } else { Err(ret) }
     }
 
-    pub fn rddynamic2(&self, hdl: u16) -> Result<OdbDy1, FocasRet> {
+    pub fn rddynamic2(&self, hdl: u16) -> Result<OdbDy2, FocasRet> {
         let sym = self.cnc_rddynamic2.as_ref().ok_or(FocasRet::Nodll)?;
-        let mut out = std::mem::MaybeUninit::<OdbDy1>::uninit();
-        // cnc_rddynamic2(hdl, axis=-1 all, len=sizeof)
-        let rc = unsafe { sym(hdl as c_ushort, -1 as c_short, std::mem::size_of::<OdbDy1>() as c_short, out.as_mut_ptr()) };
+        let mut out = std::mem::MaybeUninit::<OdbDy2>::uninit();
+        // 对齐 fanuc-driver：axis=1（单路径首轴），length=44（sizeof ODBDY2_2），Pack=4 时 44 字节
+        let rc = unsafe { sym(hdl as c_ushort, 1 as c_short, 44 as c_short, out.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() { Ok(unsafe { out.assume_init() }) } else { Err(ret) }
     }

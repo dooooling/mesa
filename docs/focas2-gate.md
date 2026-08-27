@@ -48,15 +48,18 @@
 
 ## 5. 真机可连性
 
-- **当前**：无 FANUC 真机在网，`NativeFocasApi` 以 `Fake` 为默认，`use_native=true` 时若库缺失或网络不可达返回 `EW_NODLL/EW_SOCKET` 由 `DriverManager` 按 §11 退避重连，进入 `RECONNECTING` 而非 `FAILED`
-- **后续**：落实至少一台 `0i-F` 或 `30i-B` Ethernet 真机，验证 `cnc_allclibhndl3(ip,port,timeout)` 建连、超时、断线重连；`FakeFocasApi` 仅用于 CI，最终兼容性以真机为准 `§20`
+- **2026-08-27 实测**：
+  - `192.168.15.60:8193` `ping 1-2ms` 但 `cnc_allclibhndl3` 返 `EW_SOCKET`，`Test-NetConnection 8193 False`，判定该机 `FOCAS2/Ethernet` 未启用或防火墙未放行（需查 `MD 0020/900系列`）
+  - `192.168.15.165:8193` `ping 1ms` `TcpTestSucceeded True`，`test_native -- 192.168.15.165` 直连 `connect OK`，`status U32(1) / axis.abs.1 I32(4000) / spindle.load U32(0)` 回传成功；`forgelinkd 8139` `real-focas RUNNING 4点` `GET /points/latest` 9 点（4 真机 +5 sim）已验证 `cnc_statinfo/cnc_rddynamic2(44)/cnc_acts` 链路
+  - `FOCAS` 句柄 `cnc_allclibhndl3(ip,port,timeout_s)` 正确，`timeout_ms 5000→5s`，`NativeFocasApi` `spawn_blocking` 隔离 + `EW_SOCKET/EW_NODLL` 退避 `RECONNECTING` 正常
+- **后续**：`192.168.15.165` 已可作为 0i-F/30i 基准真机，继续补 `cnc_rdalmmsg/cnc_rdmacro/pmc_rdpmcrng` 等余下地址并做断线重连 Soak；`FakeFocasApi` 仍用于 CI
 
 ## 6. 发布 Gate
 
 - [x] SDK 来源与版本留痕
 - [x] 再分发策略明确（不随二进制分发）
-- [x] 平台库清单与加载路径验证
+- [x] 平台库清单与加载路径验证（含 `drivers/focas2/libs/win/*.dll 20文件` 已补全）
 - [x] 函数矩阵与 Phase B 已实现/预留标注
-- [ ] 真机联调（待客户提供 CNC）
+- [x] 真机联调（`192.168.15.165` 已通，`192.168.15.60` 待开通）
 
-> 本文档即 Gate 凭证，随 `61f1111` 之后提交入仓，未完成真机项前 FOCAS2 仅以 Fake 模式对外演示。
+> 本文档即 Gate 凭证，随 `61f1111` 之后提交入仓，`192.168.15.165` 已满足 `§19.2` 真机要求。
