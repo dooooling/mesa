@@ -1,0 +1,8 @@
+# OPC UA Driver — 方案 §7.3 节点/订阅型（V1 只读）
+id = "opcua"
+name = "OPC UA"
+version = "0.1.0"
+executable = "forgelink-driver-opcua"
+protocol_major = 1
+protocol_minor = 0
+sdk = "rust"

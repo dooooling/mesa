@@ -11,6 +11,7 @@ members = [
     "drivers/simulator",
     "drivers/s7",
     "drivers/focas2",
+    "drivers/opcua",
     "tests/driver-contract",
 ]
 

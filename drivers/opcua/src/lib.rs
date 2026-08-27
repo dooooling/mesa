@@ -1,0 +1,471 @@
+//! OPC UA Driver — 方案 §7.3 节点/订阅型（V1 只读）。
+//!
+//! - Poll 绑定：`opcua.node-group`
+//!   ```json
+//!   { "nodes": [
+//!       { "key": "counter", "node_id": "ns=2;s=Counter", "data_type": "U32" },
+//!       { "key": "sine",    "node_id": "ns=2;i=2",        "data_type": "DOUBLE" }
+//!   ]}
+//!   ```
+//! - Subscribe 绑定：`opcua.subscription`（Phase 3 实现，当前仅校验拒绝）
+//!   ```json
+//!   { "publishing_interval_ms": 500, "sampling_interval_ms": 250, "queue_size": 10,
+//!     "discard_oldest": true, "nodes": [ {"key":"k","node_id":"ns=2;i=2"} ] }
+//!   ```
+//! - NodeId 解析见 `address::parse_address`；Core 不触及此文件（硬约束）。
+
+mod address;
+mod opcua_api;
+
+pub use address::{parse_address, AddressError, Identifier, OpcUaAddress};
+pub use opcua_api::{FakeOpcUaApi, NativeOpcUaApi, OpcUaApi, DEFAULT_OPCUA_PORT};
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use forgelink_core_types::{
+    ensure_unique_point_keys, AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey,
+    PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, now_unix_ns,
+};
+use forgelink_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
+use tokio_util::sync::CancellationToken;
+
+pub const BINDING_POLL: &str = "opcua.node-group";
+pub const BINDING_SUB: &str = "opcua.subscription";
+
+use opcua_api::OpcUaApi as OpcUaApiTrait;
+
+// ---------------------------------------------------------------------------
+// 驱动入口
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+pub struct OpcUaDriver;
+
+#[async_trait::async_trait]
+impl Driver for OpcUaDriver {
+    fn metadata(&self) -> DriverMetadata {
+        DriverMetadata {
+            driver_id: "opcua".into(),
+            name: "OPC UA".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            protocol_major: 1,
+            protocol_minor: 0,
+        }
+    }
+
+    async fn open_connection(
+        &self,
+        _endpoint_id: &str,
+        config_json: &str,
+    ) -> Result<Box<dyn DriverConnection>, SdkDriverError> {
+        let v: serde_json::Value = serde_json::from_str(config_json)
+            .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", format!("connection JSON 非法: {e}")))?;
+        let cfg = OpcUaConnConfig::from_json(&v)?;
+        // Phase 1 固定 Fake；若显式 use_native=true 则切 Native（当前 NOT_IMPLEMENTED，交由 Manager 以 Failed 呈现）
+        let use_native = v.get("use_native").and_then(|x| x.as_bool()).unwrap_or(false);
+        let api: Arc<dyn OpcUaApiTrait> = if use_native {
+            Arc::new(NativeOpcUaApi::new())
+        } else {
+            Arc::new(FakeOpcUaApi::new())
+        };
+        Ok(Box::new(OpcUaConnection { cfg, api, plan: None }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 连接配置
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct OpcUaConnConfig {
+    endpoint_url: String,
+    timeout_ms: u64,
+}
+
+impl Default for OpcUaConnConfig {
+    fn default() -> Self {
+        Self { endpoint_url: "opc.tcp://127.0.0.1:4840".into(), timeout_ms: 5000 }
+    }
+}
+
+impl OpcUaConnConfig {
+    fn from_json(v: &serde_json::Value) -> Result<Self, SdkDriverError> {
+        // 兼容多种写法：endpoint_url / endpoint / url / host+port
+        let endpoint_url = if let Some(s) = v.get("endpoint_url").or_else(|| v.get("endpoint")).or_else(|| v.get("url")).and_then(|x| x.as_str()) {
+            s.to_string()
+        } else if let Some(host) = v.get("host").and_then(|x| x.as_str()) {
+            let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(DEFAULT_OPCUA_PORT as u64) as u16;
+            format!("opc.tcp://{host}:{port}")
+        } else {
+            "opc.tcp://127.0.0.1:4840".to_string()
+        };
+        let timeout_ms = v.get("timeout_ms").or_else(|| v.get("timeout")).and_then(|x| x.as_u64()).unwrap_or(5000);
+        if endpoint_url.trim().is_empty() {
+            return Err(SdkDriverError::configuration("BAD_CONFIG", "endpoint_url 不能为空"));
+        }
+        if !endpoint_url.starts_with("opc.tcp://") {
+            return Err(SdkDriverError::configuration("BAD_CONFIG", format!("endpoint_url `{endpoint_url}` 非法，需 opc.tcp://host:port")));
+        }
+        if timeout_ms == 0 {
+            return Err(SdkDriverError::configuration("BAD_CONFIG", "timeout_ms 需 >0"));
+        }
+        Ok(Self { endpoint_url, timeout_ms })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 采集计划
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct PointSpec {
+    key: String,
+    addr: OpcUaAddress,
+    data_type: DataType,
+}
+
+#[derive(Debug)]
+struct TaskPlan {
+    id: String,
+    interval_ms: u64,
+    point_indices: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct PlanSnapshot {
+    revision: u64,
+    points: Vec<PointSpec>,
+    tasks: Vec<TaskPlan>,
+    map: Option<PointMap>,
+}
+
+struct OpcUaConnection {
+    cfg: OpcUaConnConfig,
+    api: Arc<dyn OpcUaApiTrait>,
+    plan: Option<PlanSnapshot>,
+}
+
+impl std::fmt::Debug for OpcUaConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpcUaConnection").field("cfg", &self.cfg).field("has_plan", &self.plan.is_some()).finish()
+    }
+}
+
+fn parse_data_type(s: &str) -> Result<DataType, SdkDriverError> {
+    match s.trim().to_ascii_uppercase().as_str() {
+        "BOOL" | "BOOLEAN" => Ok(DataType::Bool),
+        "I32" | "INT32" | "INT" => Ok(DataType::I32),
+        "U32" | "UINT32" | "DWORD" => Ok(DataType::U32),
+        "I64" | "INT64" => Ok(DataType::I64),
+        "U64" | "UINT64" => Ok(DataType::U64),
+        "F32" | "FLOAT" | "REAL" => Ok(DataType::F32),
+        "F64" | "DOUBLE" | "LREAL" => Ok(DataType::F64),
+        "STRING" | "STR" => Ok(DataType::String),
+        // OPC UA 扩展：Bytes/DateTime 按 String 兼容，前置校验放宽
+        "BYTES" => Ok(DataType::Bytes),
+        "DATETIME" => Ok(DataType::DateTime),
+        _ => Err(SdkDriverError::configuration("INVALID_DATA_TYPE", format!("data_type `{s}` 非法，期望 BOOL/I32/U32/I64/U64/F32/F64/STRING/BYTES/DATETIME"))),
+    }
+}
+
+fn value_fits_data_type(v: &Value, dt: DataType) -> bool {
+    match (v, dt) {
+        (Value::Bool(_), DataType::Bool) => true,
+        (Value::I32(_), DataType::I32) => true,
+        (Value::U32(_), DataType::U32) => true,
+        (Value::I64(_), DataType::I64) => true,
+        (Value::U64(_), DataType::U64) => true,
+        (Value::F32(_), DataType::F32) => true,
+        (Value::F64(_), DataType::F64) => true,
+        (Value::String(_), DataType::String) => true,
+        (Value::Bytes(_), DataType::Bytes) => true,
+        // 宽容：U32/I32 互通，F32/F64 互通，I32→I64、U32→U64
+        (Value::U32(_), DataType::I32) => true,
+        (Value::I32(_), DataType::U32) => true,
+        (Value::F32(_), DataType::F64) => true,
+        (Value::F64(_), DataType::F32) => true,
+        (Value::I32(_), DataType::I64) => true,
+        (Value::U32(_), DataType::U64) => true,
+        _ => false,
+    }
+}
+
+fn coerce_value(v: Value, dt: DataType) -> Value {
+    match (v, dt) {
+        (Value::U32(x), DataType::I32) => Value::I32(x as i32),
+        (Value::I32(x), DataType::U32) => Value::U32(x as u32),
+        (Value::U32(x), DataType::F64) => Value::F64(x as f64),
+        (Value::I32(x), DataType::F64) => Value::F64(x as f64),
+        (Value::U32(x), DataType::F32) => Value::F32(x as f32),
+        (Value::I32(x), DataType::F32) => Value::F32(x as f32),
+        (Value::F32(x), DataType::F64) => Value::F64(x as f64),
+        (Value::F64(x), DataType::F32) => Value::F32(x as f32),
+        (Value::I32(x), DataType::I64) => Value::I64(x as i64),
+        (Value::U32(x), DataType::U64) => Value::U64(x as u64),
+        (other, _) => other,
+    }
+}
+
+#[async_trait::async_trait]
+impl DriverConnection for OpcUaConnection {
+    async fn configure(
+        &mut self,
+        revision: u64,
+        tasks: Vec<AcquisitionTask>,
+    ) -> Result<Vec<PointDescriptor>, SdkDriverError> {
+        let mut new_points: Vec<PointSpec> = Vec::new();
+        let mut new_tasks: Vec<TaskPlan> = Vec::new();
+
+        for task in &tasks {
+            task.validate().map_err(|e| SdkDriverError::configuration("INVALID_TASK", e.to_string()))?;
+            // Poll 与 Subscribe 分支：Phase 1 仅 Poll
+            if task.binding.kind == BINDING_SUB {
+                return Err(SdkDriverError::new(
+                    forgelink_core_types::ErrorKind::Unsupported,
+                    "NOT_IMPLEMENTED",
+                    format!("task `{}`: opcua.subscription 尚未实现（Phase 3）", task.id),
+                ));
+            }
+            if task.binding.kind != BINDING_POLL {
+                return Err(SdkDriverError::configuration(
+                    "UNSUPPORTED_BINDING",
+                    format!("task `{}`: 期望 {BINDING_POLL} 或 {BINDING_SUB}，实际 {}", task.id, task.binding.kind),
+                ));
+            }
+            if task.mode != TaskMode::Poll {
+                return Err(SdkDriverError::new(
+                    forgelink_core_types::ErrorKind::Unsupported,
+                    "MODE_NOT_SUPPORTED",
+                    format!("task `{}`: opcua.node-group 仅支持 poll", task.id),
+                ));
+            }
+            let nodes = task.binding.config.get("nodes").and_then(|v| v.as_array()).ok_or_else(|| {
+                SdkDriverError::configuration("INVALID_BINDING_CONFIG", format!("task `{}`: 缺少 nodes 数组", task.id))
+            })?;
+            if nodes.is_empty() {
+                return Err(SdkDriverError::configuration("INVALID_BINDING_CONFIG", format!("task `{}`: nodes 不能为空", task.id)));
+            }
+            let mut indices = Vec::with_capacity(nodes.len());
+            for node in nodes {
+                let key = node.get("key").and_then(|v| v.as_str()).ok_or_else(|| SdkDriverError::configuration("INVALID_POINT", format!("task `{}`: node 缺少 key", task.id)))?;
+                if key.trim().is_empty() {
+                    return Err(SdkDriverError::configuration("INVALID_POINT", "key 不能为空"));
+                }
+                let node_id = node.get("node_id").or_else(|| node.get("nodeId")).or_else(|| node.get("address")).and_then(|v| v.as_str()).ok_or_else(|| SdkDriverError::configuration("INVALID_POINT", format!("point `{key}` 缺少 node_id")))?;
+                let dt_str = node.get("data_type").or_else(|| node.get("dataType")).and_then(|v| v.as_str()).ok_or_else(|| SdkDriverError::configuration("INVALID_POINT", format!("point `{key}` 缺少 data_type")))?;
+                let addr = parse_address(node_id).map_err(|e| match e {
+                    AddressError::Empty => SdkDriverError::configuration("INVALID_ADDRESS", format!("point `{key}` node_id 为空")),
+                    AddressError::Invalid { reason, .. } => SdkDriverError::new(forgelink_core_types::ErrorKind::Address, "INVALID_ADDRESS", format!("point `{key}` node_id `{node_id}` 非法: {reason}")),
+                })?;
+                let data_type = parse_data_type(dt_str)?;
+                indices.push(new_points.len());
+                new_points.push(PointSpec { key: key.to_string(), addr, data_type });
+            }
+            let interval = task.interval_ms.expect("validated");
+            new_tasks.push(TaskPlan { id: task.id.clone(), interval_ms: interval, point_indices: indices });
+        }
+
+        let descriptors: Vec<PointDescriptor> = new_points
+            .iter()
+            .map(|p| PointDescriptor { point_key: p.key.clone(), data_type: p.data_type, unit: None })
+            .collect();
+        ensure_unique_point_keys(&descriptors).map_err(|DuplicatePointKey(k)| {
+            SdkDriverError::configuration("DUPLICATE_POINT_KEY", format!("`{k}` 重复"))
+        })?;
+
+        tracing::info!(revision, points = new_points.len(), tasks = new_tasks.len(), "OPC UA 采集计划构建完成");
+        self.plan = Some(PlanSnapshot { revision, points: new_points, tasks: new_tasks, map: None });
+        Ok(descriptors)
+    }
+
+    async fn apply_point_map(&mut self, map: PointMap) -> Result<(), SdkDriverError> {
+        let snap = self.plan.as_mut().ok_or_else(|| SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "NOT_CONFIGURED", "apply 在 configure 之前"))?;
+        for p in &snap.points {
+            if !map.contains_key(&p.key) {
+                return Err(SdkDriverError::configuration("MISSING_POINT_ID", format!("point `{}` 缺少映射", p.key)));
+            }
+        }
+        snap.map = Some(map);
+        Ok(())
+    }
+
+    async fn run(
+        &mut self,
+        sink: DataSink,
+        shutdown: CancellationToken,
+    ) -> Result<(), SdkDriverError> {
+        let snap = self.plan.as_ref().ok_or_else(|| SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "NO_PLAN", "run 前未 configure+apply"))?;
+        let map = snap.map.as_ref().ok_or_else(|| SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "NO_POINT_MAP", "run 前未 apply_point_map"))?;
+
+        // 建会话：Fake 即时成功；Native 失败则由 Manager 退避
+        if let Err(e) = self.api.connect(&self.cfg.endpoint_url, self.cfg.timeout_ms).await {
+            if e.contains("NOT_IMPLEMENTED") || e.contains("未实现") {
+                return Err(SdkDriverError::configuration("NOT_IMPLEMENTED", e));
+            } else {
+                return Err(SdkDriverError::new(forgelink_core_types::ErrorKind::Connection, "CONNECT_FAILED", e));
+            }
+        }
+
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let seq = Arc::new(AtomicU64::new(1));
+        let shared_api = Arc::clone(&self.api);
+        let mut handles = Vec::with_capacity(snap.tasks.len());
+        for task in &snap.tasks {
+            let indices = task.point_indices.clone();
+            let points: Vec<(PointSpec, u32)> = indices.iter().map(|&i| {
+                let p = snap.points[i].clone();
+                let pid = map[&p.key];
+                (p, pid)
+            }).collect();
+            let sink = sink.clone();
+            let shutdown = shutdown.clone();
+            let seq = Arc::clone(&seq);
+            let api = Arc::clone(&shared_api);
+            let interval = Duration::from_millis(task.interval_ms);
+            let task_id = task.id.clone();
+            handles.push(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {},
+                        _ = shutdown.cancelled() => break,
+                    }
+                    let addrs: Vec<OpcUaAddress> = points.iter().map(|(s, _)| s.addr.clone()).collect();
+                    let values = match api.read_batch(&addrs).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!(task=%task_id, error=%e, "OPC UA 读失败");
+                            return Err(SdkDriverError::new(forgelink_core_types::ErrorKind::Connection, "READ_FAILED", e));
+                        }
+                    };
+                    if values.len() != points.len() {
+                        tracing::warn!(task=%task_id, got=values.len(), expected=points.len(), "OPC UA 返回数量不一致");
+                        continue;
+                    }
+                    let mut batch_vals = Vec::with_capacity(points.len());
+                    for ((spec, pid), raw_val) in points.iter().zip(values) {
+                        if let Value::String(s) = &raw_val {
+                            if s.starts_with("ERR:") {
+                                tracing::warn!(key=%spec.key, error=%s, "单点 Bad，不影响同批其他点");
+                                batch_vals.push(PointValue {
+                                    point_id: *pid,
+                                    value: raw_val,
+                                    quality: Quality::Bad,
+                                    quality_code: Some(1),
+                                    source_timestamp_ns: None,
+                                });
+                                continue;
+                            }
+                        }
+                        let coerced = coerce_value(raw_val, spec.data_type);
+                        if !value_fits_data_type(&coerced, spec.data_type) {
+                            tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配跳过");
+                            continue;
+                        }
+                        batch_vals.push(PointValue::good(*pid, coerced));
+                    }
+                    if batch_vals.is_empty() { continue; }
+                    sink.publish(DataBatch {
+                        connection_handle: 0,
+                        stream_epoch: 0,
+                        sequence: seq.fetch_add(1, Ordering::Relaxed),
+                        timestamp_ns: now_unix_ns(),
+                        values: batch_vals,
+                    }).await;
+                }
+                Ok::<(), SdkDriverError>(())
+            }));
+        }
+
+        let mut final_err: Option<SdkDriverError> = None;
+        for h in handles {
+            match h.await {
+                Ok(Ok(())) => {},
+                Ok(Err(e)) => {
+                    if final_err.is_none() { final_err = Some(e); }
+                },
+                Err(join_err) => {
+                    tracing::error!(%join_err, "OPC UA 任务 panic");
+                    if final_err.is_none() {
+                        final_err = Some(SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "TASK_PANIC", join_err.to_string()));
+                    }
+                }
+            }
+            if final_err.is_some() {
+                shutdown.cancel();
+            }
+        }
+        if let Some(e) = final_err {
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forgelink_core_types::{AcquisitionTask, DriverBinding, TaskMode};
+
+    fn task_with_nodes(nodes: serde_json::Value) -> AcquisitionTask {
+        AcquisitionTask {
+            id: "t1".into(),
+            mode: TaskMode::Poll,
+            interval_ms: Some(100),
+            binding: DriverBinding { kind: BINDING_POLL.into(), config: serde_json::json!({"nodes": nodes}) },
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_ok_and_duplicate_rejected() {
+        let mut conn = OpcUaConnection { cfg: OpcUaConnConfig::default(), api: Arc::new(FakeOpcUaApi::new()), plan: None };
+        let nodes = serde_json::json!([
+            {"key":"a","node_id":"ns=2;i=2","data_type":"U32"},
+            {"key":"b","node_id":"ns=2;s=Motor.Speed","data_type":"F64"}
+        ]);
+        let t = task_with_nodes(nodes);
+        let descs = conn.configure(1, vec![t]).await.unwrap();
+        assert_eq!(descs.len(), 2);
+        let dup = serde_json::json!([
+            {"key":"a","node_id":"ns=2;i=2","data_type":"U32"},
+            {"key":"a","node_id":"ns=2;i=3","data_type":"U32"}
+        ]);
+        let err = conn.configure(2, vec![task_with_nodes(dup)]).await.unwrap_err();
+        assert_eq!(err.code, "DUPLICATE_POINT_KEY");
+    }
+
+    #[tokio::test]
+    async fn invalid_node_id_rejected() {
+        let mut conn = OpcUaConnection { cfg: OpcUaConnConfig::default(), api: Arc::new(FakeOpcUaApi::new()), plan: None };
+        let nodes = serde_json::json!([{"key":"a","node_id":"ns=2;x=1","data_type":"U32"}]);
+        let err = conn.configure(1, vec![task_with_nodes(nodes)]).await.unwrap_err();
+        assert_eq!(err.code, "INVALID_ADDRESS");
+    }
+
+    #[tokio::test]
+    async fn subscribe_not_implemented() {
+        let mut conn = OpcUaConnection { cfg: OpcUaConnConfig::default(), api: Arc::new(FakeOpcUaApi::new()), plan: None };
+        let t = AcquisitionTask {
+            id: "s1".into(),
+            mode: TaskMode::Subscribe,
+            interval_ms: None,
+            binding: DriverBinding { kind: BINDING_SUB.into(), config: serde_json::json!({"publishing_interval_ms":500,"sampling_interval_ms":250,"queue_size":10,"nodes":[{"key":"a","node_id":"ns=2;i=2"}]}) },
+        };
+        let err = conn.configure(1, vec![t]).await.unwrap_err();
+        assert_eq!(err.code, "NOT_IMPLEMENTED");
+    }
+
+    #[tokio::test]
+    async fn configure_apply_ok() {
+        let mut conn = OpcUaConnection { cfg: OpcUaConnConfig::default(), api: Arc::new(FakeOpcUaApi::new()), plan: None };
+        let nodes = serde_json::json!([{"key":"a","node_id":"ns=2;s=Counter","data_type":"U32"}]);
+        let t = task_with_nodes(nodes);
+        let descs = conn.configure(1, vec![t]).await.unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(descs[0].point_key.clone(), 1u32);
+        conn.apply_point_map(map).await.unwrap();
+        // 能走到 apply 即代表 Poll 快照构建正确；run 的 DataSink 发布由集成测试覆盖
+    }
+}
