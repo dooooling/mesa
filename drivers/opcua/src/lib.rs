@@ -81,11 +81,15 @@ impl Driver for OpcUaDriver {
 struct OpcUaConnConfig {
     endpoint_url: String,
     timeout_ms: u64,
+    /// SecurityPolicy，如 "None" / "Basic256Sha256"（§19.3）
+    security_policy: String,
+    /// MessageSecurityMode，如 "None" / "Sign" / "SignAndEncrypt"
+    security_mode: String,
 }
 
 impl Default for OpcUaConnConfig {
     fn default() -> Self {
-        Self { endpoint_url: "opc.tcp://127.0.0.1:4840".into(), timeout_ms: 5000 }
+        Self { endpoint_url: "opc.tcp://127.0.0.1:4840".into(), timeout_ms: 5000, security_policy: "None".into(), security_mode: "None".into() }
     }
 }
 
@@ -101,6 +105,8 @@ impl OpcUaConnConfig {
             "opc.tcp://127.0.0.1:4840".to_string()
         };
         let timeout_ms = v.get("timeout_ms").or_else(|| v.get("timeout")).and_then(|x| x.as_u64()).unwrap_or(5000);
+        let security_policy = v.get("security_policy").and_then(|x| x.as_str()).unwrap_or("None").to_string();
+        let security_mode = v.get("security_mode").and_then(|x| x.as_str()).unwrap_or("None").to_string();
         if endpoint_url.trim().is_empty() {
             return Err(SdkDriverError::configuration("BAD_CONFIG", "endpoint_url 不能为空"));
         }
@@ -110,7 +116,17 @@ impl OpcUaConnConfig {
         if timeout_ms == 0 {
             return Err(SdkDriverError::configuration("BAD_CONFIG", "timeout_ms 需 >0"));
         }
-        Ok(Self { endpoint_url, timeout_ms })
+        // 校验 SecurityPolicy
+        let valid_policies = ["None", "Basic128Rsa15", "Basic256", "Basic256Sha256", "Aes128_Sha256_RsaOaep", "Aes256_Sha256_RsaPss"];
+        if !valid_policies.contains(&security_policy.as_str()) {
+            return Err(SdkDriverError::configuration("BAD_CONFIG", format!("security_policy `{security_policy}` 非法，期望 {:?}", valid_policies)));
+        }
+        let valid_modes = ["None", "Sign", "SignAndEncrypt"];
+        if !valid_modes.contains(&security_mode.as_str()) {
+            return Err(SdkDriverError::configuration("BAD_CONFIG", format!("security_mode `{security_mode}` 非法，期望 {:?}", valid_modes)));
+        }
+        // 禁止生产默认忽略校验：若 policy/mode 为 None 则 trust_server_certs 需显式，但此处仅校验，实际连接由证书目录决定
+        Ok(Self { endpoint_url, timeout_ms, security_policy, security_mode })
     }
 }
 

@@ -17,6 +17,9 @@ use forgelink_driver_manager::{ForgeLinkManager, Snapshot};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+pub mod certificates;
+use certificates::CertStore;
+
 // ---------------------------------------------------------------------------
 // 共享状态
 // ---------------------------------------------------------------------------
@@ -28,6 +31,7 @@ pub struct AppState {
     /// 驱动目录（供 rescan 使用）。
     pub drivers_dir: String,
     pub start_time: Instant,
+    pub cert_store: Arc<CertStore>,
 }
 
 impl AppState {
@@ -36,13 +40,31 @@ impl AppState {
         store: Arc<ConfigStore>,
         drivers_dir: String,
     ) -> Arc<Self> {
+        Self::new_with_cert_dir(manager, store, drivers_dir, CertStore::default_path())
+    }
+
+    pub fn new_with_cert_dir(
+        manager: Arc<ForgeLinkManager>,
+        store: Arc<ConfigStore>,
+        drivers_dir: String,
+        cert_dir: std::path::PathBuf,
+    ) -> Arc<Self> {
         let snapshot = manager.snapshot();
+        let cert_store = Arc::new(CertStore::new(cert_dir));
+        // 确保目录并生成 own 证书（忽略错误，仅日志）
+        if let Err(e) = cert_store.ensure_dirs() {
+            tracing::warn!(error=%e, "证书目录创建失败");
+        }
+        if let Err(e) = cert_store.ensure_own_cert() {
+            tracing::warn!(error=%e, "own 证书生成失败");
+        }
         Arc::new(Self {
             snapshot,
             manager,
             store,
             drivers_dir,
             start_time: Instant::now(),
+            cert_store,
         })
     }
 }
@@ -131,6 +153,7 @@ async fn diagnostics(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
         "drivers": { "count": drivers.len() },
         "endpoints": { "stored": stored_eps, "runtime": endpoints.len(), "states": endpoints },
         "devices": { "stored": stored_devs },
+        "certificates": state.cert_store.diagnostics(),
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }
@@ -457,6 +480,93 @@ async fn rescan_drivers(State(state): State<Arc<AppState>>) -> Json<serde_json::
 }
 
 // ---------------------------------------------------------------------------
+// 证书管理（§19.3）
+// ---------------------------------------------------------------------------
+
+async fn list_cert_store(
+    State(state): State<Arc<AppState>>,
+    Path(store): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let valid = ["own", "trusted", "issuers", "rejected"];
+    if !valid.contains(&store.as_str()) {
+        return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", "store 需为 own/trusted/issuers/rejected")));
+    }
+    match state.cert_store.list(&store) {
+        Ok(list) => (StatusCode::OK, Json(serde_json::json!({ "store": store, "count": list.len(), "certs": list }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &e))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AddTrustedReq {
+    pem: String,
+}
+
+async fn add_trusted_cert(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AddTrustedReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if body.pem.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", "pem 不能为空")));
+    }
+    match state.cert_store.add_trusted(&body.pem) {
+        Ok(tp) => (StatusCode::CREATED, Json(serde_json::json!({ "thumbprint": tp }))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json_error("INVALID_CERT", &e))),
+    }
+}
+
+async fn remove_trusted_cert(
+    State(state): State<Arc<AppState>>,
+    Path(thumbprint): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.cert_store.remove_trusted(&thumbprint) {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "deleted": thumbprint }))),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &format!("证书 {thumbprint} 不存在")))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &e))),
+    }
+}
+
+async fn trust_rejected_cert(
+    State(state): State<Arc<AppState>>,
+    Path(thumbprint): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.cert_store.trust_rejected(&thumbprint) {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "trusted": thumbprint }))),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &format!("rejected 证书 {thumbprint} 不存在")))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &e))),
+    }
+}
+
+async fn cert_diagnostics(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(state.cert_store.diagnostics())
+}
+
+async fn list_own(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+    match state.cert_store.list("own") {
+        Ok(list) => (StatusCode::OK, Json(serde_json::json!({ "store": "own", "count": list.len(), "certs": list }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &e))),
+    }
+}
+async fn list_trusted(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+    match state.cert_store.list("trusted") {
+        Ok(list) => (StatusCode::OK, Json(serde_json::json!({ "store": "trusted", "count": list.len(), "certs": list }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &e))),
+    }
+}
+async fn list_issuers(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+    match state.cert_store.list("issuers") {
+        Ok(list) => (StatusCode::OK, Json(serde_json::json!({ "store": "issuers", "count": list.len(), "certs": list }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &e))),
+    }
+}
+async fn list_rejected(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+    match state.cert_store.list("rejected") {
+        Ok(list) => (StatusCode::OK, Json(serde_json::json!({ "store": "rejected", "count": list.len(), "certs": list }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &e))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 路由装配
 // ---------------------------------------------------------------------------
 
@@ -480,6 +590,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/tasks", get(list_tasks).post(replace_tasks))
         .route("/api/v1/tasks/{endpoint_id}", put(put_tasks_for_endpoint))
         .route("/api/v1/tasks/{endpoint_id}/{task_id}", delete(delete_task))
+        // 证书管理 §19.3（显式路由避免 Axum 参数与静态路径 405 冲突）
+        .route("/api/v1/certificates/opcua/diagnostics", get(cert_diagnostics))
+        .route("/api/v1/certificates/opcua/own", get(list_own))
+        .route("/api/v1/certificates/opcua/trusted", get(list_trusted).post(add_trusted_cert))
+        .route("/api/v1/certificates/opcua/issuers", get(list_issuers))
+        .route("/api/v1/certificates/opcua/rejected", get(list_rejected))
+        .route("/api/v1/certificates/opcua/trusted/{thumbprint}", delete(remove_trusted_cert))
+        .route("/api/v1/certificates/opcua/rejected/{thumbprint}/trust", post(trust_rejected_cert))
+        // 兼容参数路由（保留）
+        .route("/api/v1/certificates/opcua/{store}", get(list_cert_store))
         // 健康探针
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
