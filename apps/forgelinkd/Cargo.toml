@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 forgelink-core-types = { workspace = true }
 forgelink-driver-manager = { workspace = true }
+forgelink-config-store = { workspace = true }
 forgelink-core-api = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

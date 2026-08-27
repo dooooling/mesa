@@ -80,6 +80,9 @@ pub struct EndpointStatus {
     pub revision: u64,
     /// 当前快照注册的点数。
     pub points: usize,
+    /// 最近一次成功 Start 的 stream_epoch；0 表示尚未运行过。
+    /// Driver 重启恢复后必然变化，是"新数据流已建立"的判据（§10/§17）。
+    pub epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

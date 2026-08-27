@@ -94,7 +94,12 @@ pub trait Driver: Send + Sync + 'static {
 ///
 /// 配置流程严格遵循方案 §6.2：
 /// `configure` 返回描述符 -> Core 回填 point_id -> `apply_point_map` 下发映射 ->
-/// 之后才允许 `run`。`run` 以 Box 消耗 self，退出后该连接不可复用。
+/// 之后才允许 `run`。
+///
+/// 生命周期语义（§21 Start/Stop 与 Runtime Reconfigure 行）：连接对象在
+/// run 结束后归还给会话，**同一连接可反复 Stop → Configure → Start**；
+/// 驱动应在 run 内部响应 shutdown 并保证设备资源不随单次运行泄漏
+/// （跨运行持有的资源由进程退出统一回收）。
 #[async_trait::async_trait]
 pub trait DriverConnection: Send {
     /// 校验任务合法性（含跨任务 point_key 唯一性），构建采集计划并上报点描述。
@@ -107,10 +112,10 @@ pub trait DriverConnection: Send {
 
     async fn apply_point_map(&mut self, map: PointMap) -> Result<(), SdkDriverError>;
 
-    /// 采集主循环。实现方必须响应 shutdown 并保证退出时释放设备资源；
+    /// 采集主循环。实现方必须响应 shutdown 并保证退出时释放本次运行占用的资源；
     /// 数据一律经 sink 发布，不得自行写 IPC。
     async fn run(
-        self: Box<Self>,
+        &mut self,
         sink: DataSink,
         shutdown: CancellationToken,
     ) -> Result<(), SdkDriverError>;
@@ -128,6 +133,16 @@ enum OutboundMsg {
     Control(pb::Envelope),
     /// 数据批次：允许被合并/丢弃。
     Data(DataBatch),
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for OutboundMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutboundMsg::Control(_) => f.write_str("Control"),
+            OutboundMsg::Data(b) => write!(f, "Data(seq={})", b.sequence),
+        }
+    }
 }
 
 struct CoalescerState {
@@ -298,6 +313,33 @@ pub fn spawn_parent_liveness_guard() {
 }
 
 // ---------------------------------------------------------------------------
+// 故障注入钩子（方案附录 A.3，仅供测试路径使用）
+// ---------------------------------------------------------------------------
+
+/// 驱动进程故障注入开关。生产入口 `serve()` 恒为禁用；
+/// 合同测试通过 [`serve_with_faults`] 注入 hang 等故障模拟驱动异常。
+#[derive(Clone, Default)]
+pub struct SdkFaults {
+    hang: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SdkFaults {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 置位后请求循环停止处理任何入站帧：不回 Pong、不响应控制消息——
+    /// 模拟驱动主循环死锁。数据面 writer 不受影响，批次仍会继续外发。
+    pub fn set_hang(&self, on: bool) {
+        self.hang.store(on, Ordering::Relaxed);
+    }
+
+    fn hanging(&self) -> bool {
+        self.hang.load(Ordering::Relaxed)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Server：握手认证 + 请求循环
 // ---------------------------------------------------------------------------
 
@@ -328,7 +370,8 @@ struct ConnEntry {
 struct Session {
     driver: Box<dyn Driver>,
     sink: DataSink,
-    entries: Mutex<HashMap<u32, ConnEntry>>,
+    /// Arc 化以便 run 任务结束时把连接对象归还回表（Stop→Start 可重复）。
+    entries: Arc<Mutex<HashMap<u32, ConnEntry>>>,
     msg_ids: AtomicU64,
 }
 
@@ -361,16 +404,27 @@ impl Session {
     }
 }
 
-/// 启动 Driver 服务并阻塞至连接结束或 shutdown 触发。
-///
-/// 握手方向遵循方案 §14.3：Driver 监听并接受 Core 的唯一一条连接，
-/// **先发送携带 session_token 的 Hello**，Core 校验通过后回 Welcome。
-/// `session_token` 来自 [`read_session_token_from_stdin`]（生产）或静态值（测试）。
+/// 启动 Driver 服务并阻塞至连接结束或 shutdown 触发（无故障注入）。
 pub async fn serve<D: Driver>(
     driver: D,
     listener: TcpListener,
     session_token: String,
     shutdown: CancellationToken,
+) -> Result<(), SdkServerError> {
+    serve_with_faults(driver, listener, session_token, shutdown, None).await
+}
+
+/// [`serve`] 的故障注入变体：`faults` 为 None 时行为与 [`serve`] 完全一致。
+///
+/// 握手方向遵循方案 §14.3：Driver 监听并接受 Core 的唯一一条连接，
+/// **先发送携带 session_token 的 Hello**，Core 校验通过后回 Welcome。
+/// `session_token` 来自 [`read_session_token_from_stdin`]（生产）或静态值（测试）。
+pub async fn serve_with_faults<D: Driver>(
+    driver: D,
+    listener: TcpListener,
+    session_token: String,
+    shutdown: CancellationToken,
+    faults: Option<SdkFaults>,
 ) -> Result<(), SdkServerError> {
     let meta = driver.metadata();
     // 每个 Driver Process 默认只接受一个 Core 管理连接（§14.2）：accept 一次
@@ -439,7 +493,7 @@ pub async fn serve<D: Driver>(
     let session = Session {
         driver: Box::new(driver),
         sink,
-        entries: Mutex::new(HashMap::new()),
+        entries: Arc::new(Mutex::new(HashMap::new())),
         msg_ids: AtomicU64::new(2),
     };
 
@@ -447,7 +501,7 @@ pub async fn serve<D: Driver>(
     let writer_shutdown = shutdown.child_token();
     let writer = tokio::spawn(writer_loop(wr, rx, session.sink.clone(), writer_shutdown));
 
-    let result = request_loop(&session, rd, &shutdown).await;
+    let result = request_loop(&session, rd, &shutdown, faults.as_ref()).await;
 
     // 会话结束：取消全部采集循环并等待 writer 排空退出
     shutdown.cancel();
@@ -501,6 +555,7 @@ async fn request_loop(
     session: &Session,
     mut rd: OwnedReadHalf,
     shutdown: &CancellationToken,
+    faults: Option<&SdkFaults>,
 ) -> Result<(), SdkServerError> {
     loop {
         let env = tokio::select! {
@@ -519,6 +574,12 @@ async fn request_loop(
             },
             _ = shutdown.cancelled() => return Ok(()),
         };
+
+        // 故障注入：hang 期间继续读帧（维持 TCP 层不堆积）但不做任何处理，
+        // 使 Core 心跳超时判死（§14.4）
+        if faults.map(|f| f.hanging()).unwrap_or(false) {
+            continue;
+        }
 
         match env.body {
             Some(pb::envelope::Body::Ping(_)) => {
@@ -611,10 +672,14 @@ async fn on_configure(session: &Session, req: pb::ConfigureTasks, msg_id: u64) {
 
     let Some(mut conn) = taken else {
         session
-            .send_driver_error(
-                Some(req.connection_handle),
-                &SdkDriverError::new(ErrorKind::Internal, "NO_CONNECTION", "connection not open"),
-            )
+            .sink
+            .send_control(pb::Envelope {
+                msg_id,
+                body: Some(pb::envelope::Body::DriverError(pb::DriverErrorReport {
+                    connection_handle: Some(req.connection_handle),
+                    detail: Some(error_detail(ErrorKind::Internal, "NO_CONNECTION", "connection not open".to_string())),
+                })),
+            })
             .await;
         return;
     };
@@ -651,7 +716,16 @@ async fn on_configure(session: &Session, req: pb::ConfigureTasks, msg_id: u64) {
                 session.entries.lock().unwrap().get_mut(&req.connection_handle).map(|e| {
                     e.conn = Some(conn);
                 });
-                session.send_driver_error(Some(req.connection_handle), &err).await;
+                session
+                    .sink
+                    .send_control(pb::Envelope {
+                        msg_id,
+                        body: Some(pb::envelope::Body::DriverError(pb::DriverErrorReport {
+                            connection_handle: Some(req.connection_handle),
+                            detail: Some(error_detail(err.kind, &err.code, err.message)),
+                        })),
+                    })
+                    .await;
             }
         },
         Err(e) => {
@@ -659,7 +733,16 @@ async fn on_configure(session: &Session, req: pb::ConfigureTasks, msg_id: u64) {
             session.entries.lock().unwrap().get_mut(&req.connection_handle).map(|e| {
                 e.conn = Some(conn);
             });
-            session.send_driver_error(Some(req.connection_handle), &err).await;
+            session
+                .sink
+                .send_control(pb::Envelope {
+                    msg_id,
+                    body: Some(pb::envelope::Body::DriverError(pb::DriverErrorReport {
+                        connection_handle: Some(req.connection_handle),
+                        detail: Some(error_detail(err.kind, &err.code, err.message)),
+                    })),
+                })
+                .await;
         }
     }
 }
@@ -674,10 +757,14 @@ async fn on_apply_point_map(session: &Session, req: pb::ApplyPointMap, msg_id: u
 
     let Some(mut conn) = taken else {
         session
-            .send_driver_error(
-                Some(req.connection_handle),
-                &SdkDriverError::new(ErrorKind::Internal, "NO_CONNECTION", "connection not open"),
-            )
+            .sink
+            .send_control(pb::Envelope {
+                msg_id,
+                body: Some(pb::envelope::Body::DriverError(pb::DriverErrorReport {
+                    connection_handle: Some(req.connection_handle),
+                    detail: Some(error_detail(ErrorKind::Internal, "NO_CONNECTION", "connection not open".to_string())),
+                })),
+            })
             .await;
         return;
     };
@@ -720,8 +807,9 @@ async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
     };
 
     let Some(conn) = ready else {
+        // NOTE: 拒绝路径也必须回显请求 msg_id，否则 Core 侧请求无法关联回复
         session
-            .send_control_ack_start(req.connection_handle, false, "missing connection or already running")
+            .send_control_ack_start(msg_id, req.connection_handle, false, "missing connection or already running")
             .await;
         return;
     };
@@ -731,10 +819,17 @@ async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
     // 每个连接独立 sink：合并缓冲隔离 + 自动盖 handle/epoch 戳
     let sink_for_run = session.sink.for_connection(req.connection_handle, req.stream_epoch);
     let handle = req.connection_handle;
+    let entries = Arc::clone(&session.entries);
+    let mut conn = conn; // &mut 调用需要可变绑定
 
-    // 采集任务独立于请求循环运行；结束（含出错）时上报终态。
+    // 采集任务独立于请求循环运行；结束（含出错）时上报终态，
+    // 并把连接对象归还回表，使该连接可被再次 Configure/Start（§21 可重复启停）。
     let join = tokio::spawn(async move {
         let outcome = conn.run(sink_for_run.clone(), task_cancel).await;
+        // 先归还再上报：保证 Stop ack 返回时连接已可复用
+        if let Some(entry) = entries.lock().unwrap().get_mut(&handle) {
+            entry.conn = Some(conn);
+        }
         let (final_state, detail) = match &outcome {
             Ok(()) => (ConnectionState::Stopped, String::new()),
             Err(err) => {
@@ -796,7 +891,7 @@ async fn on_close(session: &Session, req: pb::CloseConnection, msg_id: u64) {
 }
 
 impl Session {
-    async fn send_control_ack_start(&self, handle: u32, ok: bool, why: &str) {
+    async fn send_control_ack_start(&self, msg_id: u64, handle: u32, ok: bool, why: &str) {
         let result = if ok {
             ok_result()
         } else {
@@ -804,7 +899,8 @@ impl Session {
         };
         self.sink
             .send_control(pb::Envelope {
-                msg_id: self.next_msg_id(),
+                // 响应必须回显请求的 msg_id（§14 请求/响应关联规则）
+                msg_id,
                 body: Some(pb::envelope::Body::StartConnectionAck(pb::StartConnectionAck {
                     connection_handle: handle,
                     result: Some(result),
@@ -825,4 +921,61 @@ async fn send_state_direct(sink: &DataSink, handle: u32, state: ConnectionState,
         })),
     })
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batch(seq: u64, value: f64) -> DataBatch {
+        DataBatch {
+            connection_handle: 0,
+            stream_epoch: 0,
+            sequence: seq,
+            timestamp_ns: forgelink_core_types::now_unix_ns(),
+            values: vec![forgelink_core_types::PointValue::good(
+                1,
+                forgelink_core_types::Value::F64(value),
+            )],
+        }
+    }
+
+    /// 背压语义（§12 / §21 Backpressure 行）的确定性验证：
+    /// 通道满载时同点批次合并为最新值，coalesced 计数可观测，
+    /// 腾出空间后积压的"最新值"最终可达。
+    #[tokio::test]
+    async fn sink_coalesces_latest_wins_when_full() {
+        let (tx, mut rx) = mpsc::channel::<OutboundMsg>(1);
+        let session_sink = DataSink::new(tx);
+        let sink = session_sink.for_connection(7, 99);
+
+        // 第一批直接入队（占满容量 1）
+        sink.publish(batch(1, 1.0)).await;
+        // 后续批次通道满：第一批溢出的成为合并基底（不计入 coalesced），
+        // 其余 48 批被合并覆盖
+        for seq in 2..=50u64 {
+            sink.publish(batch(seq, seq as f64)).await;
+        }
+        assert!(
+            sink.coalesced_points() >= 48,
+            "overflow batches must be accounted as coalesced, got {}",
+            sink.coalesced_points()
+        );
+
+        // 消费者取走第一批后模拟 writer 出帧成功的补发路径
+        match rx.recv().await {
+            Some(OutboundMsg::Data(b)) => assert_eq!(b.sequence, 1),
+            other => panic!("expected first batch, got {other:?}"),
+        }
+        sink.flush_pending();
+        match rx.recv().await {
+            Some(OutboundMsg::Data(b)) => {
+                // Latest-Wins：只剩最新一批，值为该批的值
+                assert_eq!(b.sequence, 50);
+                assert_eq!(b.values.len(), 1);
+                assert_eq!(b.values[0].value, forgelink_core_types::Value::F64(50.0));
+            }
+            other => panic!("expected merged latest batch, got {other:?}"),
+        }
+    }
 }

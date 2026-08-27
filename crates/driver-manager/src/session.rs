@@ -24,10 +24,24 @@ use tokio_util::sync::CancellationToken;
 /// 应拆分流程而非调大超时。
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 心跳参数（§14.4 默认值，允许配置覆盖——M0 使用常量）。
+/// 心跳默认参数（§14.4）。
 const PING_PERIOD: Duration = Duration::from_secs(5);
 const PONG_DEADLINE: Duration = Duration::from_secs(3);
 const MAX_MISSED_PONGS: u32 = 3;
+
+/// 心跳参数（§14.4 允许配置覆盖——生产当前使用默认；合同测试用短周期加速判死）。
+#[derive(Debug, Clone, Copy)]
+pub struct HeartbeatParams {
+    pub ping_period: Duration,
+    pub pong_deadline: Duration,
+    pub max_missed: u32,
+}
+
+impl Default for HeartbeatParams {
+    fn default() -> Self {
+        Self { ping_period: PING_PERIOD, pong_deadline: PONG_DEADLINE, max_missed: MAX_MISSED_PONGS }
+    }
+}
 
 /// 上行事件容量。控制类事件不允许静默丢弃，消费端必须活跃；
 /// 容量仅作瞬时洪峰缓冲，溢出计入诊断计数。
@@ -109,16 +123,26 @@ impl Session {
         Err(last.unwrap_or(SessionError::Timeout))
     }
 
-    /// 建立到 Driver IPC 端口的连接并完成握手。
+    /// 建立到 Driver IPC 端口的连接并完成握手（默认心跳参数）。
+    pub async fn connect(
+        port: u16,
+        expected_token: &str,
+    ) -> Result<(Self, mpsc::Receiver<SessionEvent>, Arc<AtomicBool>), SessionError> {
+        Self::connect_with_heartbeat(port, expected_token, HeartbeatParams::default()).await
+    }
+
+    /// [`Session::connect`] 的心跳参数覆盖变体：合同测试以短周期验证判死路径，
+    /// 避免真实 5s×3 的等待。
     ///
     /// 握手方向（§14.3）：Driver 先发 Hello 携带 token；本端校验通过后回 Welcome。
     /// token 不匹配或 Major 不兼容立即断开。
     ///
     /// 返回会话句柄与上行事件流。事件通道随会话废弃而关闭（recv 返回 None），
     /// Endpoint 运行时以此感知断连。
-    pub async fn connect(
+    pub async fn connect_with_heartbeat(
         port: u16,
         expected_token: &str,
+        hb: HeartbeatParams,
     ) -> Result<(Self, mpsc::Receiver<SessionEvent>, Arc<AtomicBool>), SessionError> {
         let stream = tokio::time::timeout(
             Duration::from_secs(3),
@@ -191,7 +215,7 @@ impl Session {
             static HB_ID: AtomicU64 = AtomicU64::new(u64::MAX - 1_000_000);
             let mut misses = 0u32;
             loop {
-                tokio::time::sleep(PING_PERIOD).await;
+                tokio::time::sleep(hb.ping_period).await;
                 if hb_cancel.is_cancelled() {
                     break;
                 }
@@ -204,15 +228,15 @@ impl Session {
                     let mut w = hb_shared.writer.lock().await;
                     write_envelope(&mut *w, &env).await.is_ok()
                 };
-                if wrote && tokio::time::timeout(PONG_DEADLINE, rx).await.is_ok() {
+                if wrote && tokio::time::timeout(hb.pong_deadline, rx).await.is_ok() {
                     misses = 0;
                     continue;
                 }
                 hb_shared.unregister(id);
                 misses += 1;
                 tracing::warn!(misses, "pong missed");
-                if misses >= MAX_MISSED_PONGS {
-                    tracing::error!("driver unresponsive (no pong x{MAX_MISSED_PONGS})");
+                if misses >= hb.max_missed {
+                    tracing::error!("driver unresponsive (no pong x{})", hb.max_missed);
                     hb_shared.unresponsive.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -291,10 +315,24 @@ async fn reader_loop(mut rd: OwnedReadHalf, shared: Arc<Shared>, cancel: Cancell
         };
 
         // 1) 已登记请求的响应原路返回（Pong 也经此路径回到心跳任务）
+        // DriverError 需同时作为事件可见：contract test 通过事件断言，而 manager 通过 call 返回值断言——两者都需满足
         if env.msg_id != 0 && shared.pending.lock().unwrap().contains_key(&env.msg_id) {
+            let is_driver_error = matches!(env.body, Some(Body::DriverError(_)));
             let sender = shared.pending.lock().unwrap().remove(&env.msg_id);
             if let Some(tx) = sender {
                 let _ = tx.send(env.clone());
+            }
+            if is_driver_error {
+                if let Some(Body::DriverError(e)) = env.body {
+                    let d = e.detail.unwrap_or_default();
+                    let ev = SessionEvent::DriverError {
+                        handle: e.connection_handle,
+                        kind: d.kind,
+                        code: d.code,
+                        message: d.message,
+                    };
+                    let _ = shared.events_tx.try_send(ev);
+                }
             }
             continue;
         }

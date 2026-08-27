@@ -15,5 +15,6 @@ pub mod process;
 pub mod session;
 pub mod snapshot;
 
+pub use endpoint::{BuiltinEndpoint, PointIdAllocator, PointIdSource, StorePointIdSource};
 pub use manager::ForgeLinkManager;
 pub use snapshot::{DriverInfo, EndpointStatus, LatestEntry, Snapshot};

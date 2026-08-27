@@ -16,17 +16,25 @@
 //! ] }
 //! ```
 //!
-//! TODO: 附录 A 其余能力（delay/jitter/burst/silent_interval/disconnect/hang/crash 注入）
-//! 在 Phase 3 补齐，用于覆盖全量 Contract Test。
+//! 质量与故障注入（附录 A.3/A.4，Contract Test 用）：
+//!
+//! - 点级 `"quality": "BAD"|"UNCERTAIN"` 静态质量覆盖；
+//! - 点级 `"bad_after_batches": N` / `"good_again_after": M` 实现 GOOD→BAD→GOOD 转换；
+//! - connection 配置 `"faults": {"fail_after_batches": N}` 在第 N 批后连接报
+//!   SIMULATED_DISCONNECT（验证 Core 重连语义）；
+//! - `"faults": {"crash_after_batches": N}` 直接退出进程（仅子进程模式有意义，
+//!   进程内使用会终止测试进程），验证 Driver Crash Restore。
+//!
+//! TODO: 附录 A 其余能力（delay/jitter/burst/silent_interval）待性能预算阶段（§22）
+//! 按压测需要补齐。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use forgelink_core_types::{
-    ensure_unique_point_keys, AcquisitionTask, DataBatch, DataType, DriverMetadata,
-    DuplicatePointKey, ErrorKind, PointDescriptor, PointMap, PointValue, TaskMode, Value,
-    now_unix_ns,
+    ensure_unique_point_keys, AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey,
+    ErrorKind, PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, now_unix_ns,
 };
 use forgelink_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio_util::sync::CancellationToken;
@@ -55,10 +63,11 @@ impl Driver for SimulatorDriver {
         _endpoint_id: &str,
         config_json: &str,
     ) -> Result<Box<dyn DriverConnection>, SdkDriverError> {
-        // connection 配置当前无必填项；解析仅校验 JSON 合法性
-        let _: serde_json::Value = serde_json::from_str(config_json)
+        // connection 配置仅含可选 faults 注入项；整体必须为合法 JSON
+        let cfg: serde_json::Value = serde_json::from_str(config_json)
             .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.to_string()))?;
-        Ok(Box::new(SimConnection { plan: None }))
+        let faults = parse_conn_faults(&cfg)?;
+        Ok(Box::new(SimConnection { plan: None, faults }))
     }
 }
 
@@ -71,6 +80,68 @@ impl Driver for SimulatorDriver {
 struct PointSpec {
     key: String,
     source: SourceSpec,
+    quality: QualitySpec,
+}
+
+/// 质量注入规格（附录 A.4）：静态覆盖 + 按批次数的 GOOD→BAD→GOOD 转换。
+#[derive(Debug, Clone, PartialEq)]
+struct QualitySpec {
+    /// 缺省质量；未配置任何转换时恒定输出。
+    base: Quality,
+    /// 第 N 批（1 起）起转为 BAD。
+    bad_after_batches: Option<u64>,
+    /// 第 M 批起恢复 GOOD（须大于 bad_after_batches 才有转换窗口）。
+    good_again_after: Option<u64>,
+}
+
+impl Default for QualitySpec {
+    fn default() -> Self {
+        Self { base: Quality::Good, bad_after_batches: None, good_again_after: None }
+    }
+}
+
+impl QualitySpec {
+    fn from_json(v: &serde_json::Value) -> Result<Self, SdkDriverError> {
+        let mut spec = Self::default();
+        if let Some(q) = v.get("quality").and_then(|q| q.as_str()) {
+            spec.base = match q.to_ascii_uppercase().as_str() {
+                "GOOD" => Quality::Good,
+                "UNCERTAIN" => Quality::Uncertain,
+                "BAD" => Quality::Bad,
+                other => {
+                    return Err(bad_point("<quality>", &format!("unknown quality `{other}`")))
+                }
+            };
+        }
+        spec.bad_after_batches = parse_batch_threshold(v, "bad_after_batches")?;
+        spec.good_again_after = parse_batch_threshold(v, "good_again_after")?;
+        Ok(spec)
+    }
+
+    /// 计算第 `batch_no` 批（1 起）应输出的质量。
+    fn at(&self, batch_no: u64) -> Quality {
+        if let Some(bad_from) = self.bad_after_batches {
+            if batch_no >= bad_from {
+                return match self.good_again_after {
+                    Some(good_from) if batch_no >= good_from => Quality::Good,
+                    _ => Quality::Bad,
+                };
+            }
+        }
+        self.base
+    }
+}
+
+fn parse_batch_threshold(
+    v: &serde_json::Value,
+    field: &str,
+) -> Result<Option<u64>, SdkDriverError> {
+    match v.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(x) => x.as_u64().map(Some).ok_or_else(|| {
+            bad_point(field, &format!("`{field}` must be a positive integer batch count"))
+        }),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,7 +197,8 @@ impl SourceSpec {
                 ))
             }
         };
-        Ok(PointSpec { key: key.to_string(), source })
+        let quality = QualitySpec::from_json(v)?;
+        Ok(PointSpec { key: key.to_string(), source, quality })
     }
 
     fn data_type(&self) -> DataType {
@@ -140,6 +212,35 @@ impl SourceSpec {
 
 fn bad_point(key: &str, why: &str) -> SdkDriverError {
     SdkDriverError::configuration("INVALID_POINT_SPEC", format!("point `{key}`: {why}"))
+}
+
+/// 连接级故障注入（附录 A.3）。从 connection 配置的 `faults` 对象解析。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct ConnFaults {
+    /// 第 N 批发布后连接以 ConnectionError/SIMULATED_DISCONNECT 结束，
+    /// 驱动进程存活——用于验证 Core 侧重连与断线数据语义。
+    fail_after_batches: Option<u64>,
+    /// 第 N 批发布后进程直接退出（exit code 101）。仅子进程模式可观测，
+    /// 用于端到端验证 Driver Crash Restore。
+    crash_after_batches: Option<u64>,
+}
+
+fn parse_conn_faults(cfg: &serde_json::Value) -> Result<ConnFaults, SdkDriverError> {
+    let mut f = ConnFaults::default();
+    let Some(faults) = cfg.get("faults") else {
+        return Ok(f);
+    };
+    if !faults.is_object() {
+        return Err(SdkDriverError::configuration(
+            "BAD_CONFIG",
+            "`faults` must be an object".to_string(),
+        ));
+    }
+    f.fail_after_batches = parse_batch_threshold(faults, "fail_after_batches")
+        .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?;
+    f.crash_after_batches = parse_batch_threshold(faults, "crash_after_batches")
+        .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?;
+    Ok(f)
 }
 
 /// 运行期可变状态。与点位一一对应，由各任务循环独占持有，无跨任务共享。
@@ -215,6 +316,9 @@ struct TaskPlan {
     interval_ms: u64,
     /// 指向快照内 points 数组的下标集合。
     point_indices: Vec<usize>,
+    /// 每次 tick 连续发布的批次数（附录 A.2 burst）。Windows 定时器精度约
+    /// 15.6ms，小间隔 tick 不可靠；压测/背压场景以 burst 保证产出速率。
+    burst: u64,
 }
 
 /// configure 成功后的完整采集计划快照（§6.2 全量替换的原子单元）。
@@ -230,6 +334,7 @@ struct PlanSnapshot {
 #[derive(Debug, Default)]
 struct SimConnection {
     plan: Option<PlanSnapshot>,
+    faults: ConnFaults,
 }
 
 #[async_trait::async_trait]
@@ -288,6 +393,7 @@ impl DriverConnection for SimConnection {
                 id: task.id.clone(),
                 interval_ms: task.interval_ms.expect("validated above"),
                 point_indices: indices,
+                burst: task.binding.config.get("burst").and_then(|b| b.as_u64()).unwrap_or(1).max(1),
             });
         }
 
@@ -329,7 +435,7 @@ impl DriverConnection for SimConnection {
     }
 
     async fn run(
-        self: Box<Self>,
+        &mut self,
         sink: DataSink,
         shutdown: CancellationToken,
     ) -> Result<(), SdkDriverError> {
@@ -360,6 +466,8 @@ impl DriverConnection for SimConnection {
 
         // sequence 按 (connection, epoch) 从 1 递增（§10）；原子计数保证多任务唯一
         let seq = Arc::new(AtomicU64::new(1));
+        // 连接级已发布批次数：故障注入（fail/crash_after_batches）的触发依据
+        let published = Arc::new(AtomicU64::new(0));
         let started = std::time::Instant::now();
 
         let mut handles = Vec::with_capacity(snapshot.tasks.len());
@@ -368,31 +476,69 @@ impl DriverConnection for SimConnection {
             let sink = sink.clone();
             let shutdown = shutdown.clone();
             let seq = Arc::clone(&seq);
+            let published = Arc::clone(&published);
+            let faults = self.faults;
             let interval = Duration::from_millis(plan.interval_ms);
+            let plan_burst = plan.burst;
             handles.push(tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(interval);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! {
-                        _ = ticker.tick() => {}
-                        _ = shutdown.cancelled() => return,
+                // 本任务循环自身的批次序号：质量转换按"该任务第几批"计。
+                // 闭包返回 Result 以承载 SIMULATED_DISCONNECT 故障路径。
+                let run: Result<(), SdkDriverError> = async {
+                    let mut batch_no: u64 = 0;
+                    let mut ticker = tokio::time::interval(interval);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            _ = ticker.tick() => {}
+                            _ = shutdown.cancelled() => return Ok(()),
+                        }
+                        let t_ms = started.elapsed().as_millis() as u64;
+                        // burst：单次 tick 连续发布多批，绕开 Windows 定时器精度限制
+                        for _ in 0..plan_burst {
+                            batch_no += 1;
+                            let values: Vec<PointValue> = runtime
+                                .iter_mut()
+                                .map(|rp| {
+                                    let mut pv = PointValue::good(
+                                        rp.point_id,
+                                        rp.state.sample(&rp.spec.source, t_ms),
+                                    );
+                                    pv.quality = rp.spec.quality.at(batch_no);
+                                    pv
+                                })
+                                .collect();
+                            // NOTE: publish 内部做 Latest-Wins 合并，sequence 可能产生缺口（§12）
+                            sink.publish(DataBatch {
+                                // handle/epoch 由 SDK 盖戳，驱动侧无需感知分配细节
+                                connection_handle: 0,
+                                stream_epoch: 0,
+                                sequence: seq.fetch_add(1, Ordering::Relaxed),
+                                timestamp_ns: now_unix_ns(),
+                                values,
+                            })
+                            .await;
+
+                            if !faults_eq_default(faults) {
+                                let n = published.fetch_add(1, Ordering::Relaxed) + 1;
+                                if faults.crash_after_batches == Some(n) {
+                                    eprintln!(
+                                        "simulator: fault injection crash_after_batches={n}, exiting"
+                                    );
+                                    std::process::exit(101);
+                                }
+                                if faults.fail_after_batches == Some(n) {
+                                    return Err(SdkDriverError::new(
+                                        ErrorKind::Connection,
+                                        "SIMULATED_DISCONNECT",
+                                        format!("fault injection: disconnected after {n} batches"),
+                                    ));
+                                }
+                            }
+                        }
                     }
-                    let t_ms = started.elapsed().as_millis() as u64;
-                    let values: Vec<PointValue> = runtime
-                        .iter_mut()
-                        .map(|rp| PointValue::good(rp.point_id, rp.state.sample(&rp.spec.source, t_ms)))
-                        .collect();
-                    // NOTE: publish 内部做 Latest-Wins 合并，sequence 可能产生缺口（§12）
-                    sink.publish(DataBatch {
-                        // handle/epoch 由 SDK 盖戳，驱动侧无需感知分配细节
-                        connection_handle: 0,
-                        stream_epoch: 0,
-                        sequence: seq.fetch_add(1, Ordering::Relaxed),
-                        timestamp_ns: now_unix_ns(),
-                        values,
-                    })
-                    .await;
                 }
+                .await;
+                run
             }));
         }
         for h in handles {
@@ -400,6 +546,11 @@ impl DriverConnection for SimConnection {
         }
         Ok(())
     }
+}
+
+/// 仅在有注入项时才走计数路径，避免正常采集承担原子开销。
+fn faults_eq_default(f: ConnFaults) -> bool {
+    f == ConnFaults::default()
 }
 
 #[cfg(test)]
@@ -471,6 +622,66 @@ mod tests {
                 panic!("random must produce F64");
             }
         }
+    }
+
+    #[test]
+    fn quality_spec_static_and_transitions() {
+        // 静态 BAD：恒定输出
+        let q = QualitySpec::from_json(&serde_json::json!({"quality": "BAD"})).unwrap();
+        assert_eq!(q.at(1), Quality::Bad);
+        assert_eq!(q.at(100), Quality::Bad);
+
+        // GOOD→BAD→GOOD 转换窗口：第 3 批起坏，第 5 批起恢复
+        let q = QualitySpec::from_json(
+            &serde_json::json!({"bad_after_batches": 3, "good_again_after": 5}),
+        )
+        .unwrap();
+        assert_eq!(q.at(1), Quality::Good);
+        assert_eq!(q.at(2), Quality::Good);
+        assert_eq!(q.at(3), Quality::Bad);
+        assert_eq!(q.at(4), Quality::Bad);
+        assert_eq!(q.at(5), Quality::Good);
+        assert_eq!(q.at(9), Quality::Good);
+
+        // 只有 bad_after、无恢复点：持续 BAD
+        let q = QualitySpec::from_json(&serde_json::json!({"bad_after_batches": 2})).unwrap();
+        assert_eq!(q.at(1), Quality::Good);
+        assert_eq!(q.at(2), Quality::Bad);
+        assert_eq!(q.at(50), Quality::Bad);
+
+        // 非法质量名与非法阈值必须被拒绝
+        assert!(QualitySpec::from_json(&serde_json::json!({"quality": "PERFECT"})).is_err());
+        assert!(QualitySpec::from_json(&serde_json::json!({"bad_after_batches": -1})).is_err());
+    }
+
+    #[tokio::test]
+    async fn conn_faults_parse_and_default_config_ok() {
+        // 无 faults 字段的空配置照常工作（M0 兼容）
+        let conn = SimulatorDriver.open_connection("e", "{}").await.unwrap();
+        let _ = conn;
+
+        let f = parse_conn_faults(
+            &serde_json::json!({"faults": {"fail_after_batches": 4, "crash_after_batches": 10}}),
+        )
+        .unwrap();
+        assert_eq!(f.fail_after_batches, Some(4));
+        assert_eq!(f.crash_after_batches, Some(10));
+
+        // faults 非对象 / 阈值非法 → 结构化配置错误
+        // （Box<dyn DriverConnection> 非 Debug，不能用 unwrap_err，需手动匹配）
+        let err = match SimulatorDriver.open_connection("e", "{\"faults\": []}").await {
+            Err(e) => e,
+            Ok(_) => panic!("non-object faults must be rejected"),
+        };
+        assert_eq!(err.code, "BAD_CONFIG");
+        let err = match SimulatorDriver
+            .open_connection("e", "{\"faults\": {\"crash_after_batches\": \"x\"}}")
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("invalid fault threshold must be rejected"),
+        };
+        assert_eq!(err.code, "BAD_CONFIG");
     }
 
     /// 高价值路径：configure -> apply -> 单次采样产出带正确 point_id 的值。

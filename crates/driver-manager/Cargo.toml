@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 forgelink-core-types = { workspace = true }
 forgelink-driver-protocol = { workspace = true }
+forgelink-config-store = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 toml = { workspace = true }

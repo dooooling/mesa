@@ -5,14 +5,15 @@
 //!   -> Start(new epoch) -> 事件循环`；
 //! 断连/无响应时按退避序列自动重建；配置类错误直接 FAILED 不自动重试。
 //!
-//! TODO(Phase 4): 恢复阈值可配置化、CIRCUIT_OPEN 熔断、Point ID tombstone 持久化。
+//! Point ID 分配通过 [`PointIdSource`] 抽象：内存版用于 Contract Test，
+//! 持久版 [`StorePointIdSource`] 委托 `ConfigStore`（带墓碑语义）。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use forgelink_core_types::{ensure_unique_point_keys, ConnectionState, DataBatch, PointDefinition};
+use forgelink_core_types::{ensure_unique_point_keys, ConnectionState, DataBatch, PointDefinition, PointDescriptor};
 use forgelink_driver_protocol::pb;
 use tokio_util::sync::CancellationToken;
 
@@ -24,7 +25,7 @@ use crate::snapshot::{EndpointStatus, Snapshot};
 /// 连接级退避序列（§11.1 默认值）。M0 不做上限熔断，成功后归零。
 const RECONNECT_BACKOFF_SECS: [u64; 5] = [1, 2, 5, 10, 30];
 
-/// 内置端点配置：M0 由 forgelinkd 硬编码注入，替代尚未实现的 REST/ConfigStore。
+/// 内置端点配置：M0 由 forgelinkd 硬编码注入，Phase B 后由 ConfigStore 构造。
 #[derive(Debug, Clone)]
 pub struct BuiltinEndpoint {
     pub endpoint_id: String,
@@ -34,56 +35,161 @@ pub struct BuiltinEndpoint {
     pub tasks: Vec<forgelink_core_types::AcquisitionTask>,
 }
 
-/// point_id 分配器：进程内稳定。同 key 复用既有 id——Driver 重启不改变映射，
-/// 与"分配后不复用"的 tombstone 规则兼容（tombstone 落库在 Phase 1）。
+// ---------------------------------------------------------------------------
+// PointIdSource 抽象
+// ---------------------------------------------------------------------------
+
+/// Point ID 分配与 revision 供给的抽象。Core 负责稳定分配，Driver 只透传 id。
+pub trait PointIdSource: Send + Sync {
+    /// 为一批 descriptor 分配稳定 id（按序返回）。实现负责持久化与墓碑复用。
+    fn assign(&self, endpoint_id: &str, descriptors: &[PointDescriptor]) -> Result<Vec<u32>, String>;
+    /// 已知映射（重启恢复时预填）。
+    fn known_map(&self, endpoint_id: &str) -> HashMap<String, u32>;
+    /// 当前 revision（全量快照版本号），用于 Configure/Apply 的原子性标记。
+    fn revision(&self, endpoint_id: &str) -> u64;
+}
+
+/// 内存版分配器：进程内稳定，同 key 复用既有 id。用于 Contract Test 与无库场景。
 #[derive(Default)]
 pub struct PointIdAllocator {
     next: AtomicU64,
+    /// endpoint_id -> (point_key -> point_id)
+    maps: Mutex<HashMap<String, HashMap<String, u32>>>,
+    /// endpoint_id -> revision（内存版恒为 1，满足测试对 revision 的最小需求）
+    revisions: Mutex<HashMap<String, u64>>,
 }
 
 impl PointIdAllocator {
-    fn assign(&self, used: &mut HashMap<String, u32>, keys: &[String]) -> Vec<u32> {
+    /// 兼容旧调用点的辅助：直接对 keys 分配（不经过 descriptor 校验）。
+    /// 保留仅为向后兼容，新代码应使用 [`PointIdSource::assign`]。
+    #[allow(dead_code)]
+    fn assign_keys(&self, used: &mut HashMap<String, u32>, keys: &[String]) -> Vec<u32> {
         keys.iter()
             .map(|k| {
                 *used.entry(k.clone()).or_insert_with(|| {
-                    self.next.fetch_add(1, Ordering::Relaxed) as u32 + 1 // 从 1 起
+                    self.next.fetch_add(1, Ordering::Relaxed) as u32 + 1
                 })
             })
             .collect()
     }
 }
 
+impl PointIdSource for PointIdAllocator {
+    fn assign(&self, endpoint_id: &str, descriptors: &[PointDescriptor]) -> Result<Vec<u32>, String> {
+        ensure_unique_point_keys(descriptors).map_err(|e| e.to_string())?;
+        let mut maps = self.maps.lock().unwrap();
+        let map = maps.entry(endpoint_id.to_string()).or_default();
+        let mut out = Vec::with_capacity(descriptors.len());
+        for d in descriptors {
+            let id = *map.entry(d.point_key.clone()).or_insert_with(|| {
+                self.next.fetch_add(1, Ordering::Relaxed) as u32 + 1
+            });
+            out.push(id);
+        }
+        // 内存版 revision：首次 assign 后记为 1，后续保持
+        {
+            let mut revs = self.revisions.lock().unwrap();
+            revs.entry(endpoint_id.to_string()).or_insert(1);
+        }
+        Ok(out)
+    }
+
+    fn known_map(&self, endpoint_id: &str) -> HashMap<String, u32> {
+        self.maps.lock().unwrap().get(endpoint_id).cloned().unwrap_or_default()
+    }
+
+    fn revision(&self, endpoint_id: &str) -> u64 {
+        *self.revisions.lock().unwrap().get(endpoint_id).unwrap_or(&1)
+    }
+}
+
+/// 持久版分配器：委托 `ConfigStore`（含 tombstone 语义）。
+pub struct StorePointIdSource {
+    store: Arc<forgelink_config_store::ConfigStore>,
+}
+
+impl StorePointIdSource {
+    pub fn new(store: Arc<forgelink_config_store::ConfigStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl PointIdSource for StorePointIdSource {
+    fn assign(&self, endpoint_id: &str, descriptors: &[PointDescriptor]) -> Result<Vec<u32>, String> {
+        let defs = self
+            .store
+            .assign_point_ids(endpoint_id, descriptors)
+            .map_err(|e| e.to_string())?;
+        // 保持输入顺序返回
+        let by_key: HashMap<&str, u32> = defs.iter().map(|d| (d.point_key.as_str(), d.point_id)).collect();
+        Ok(descriptors.iter().map(|d| by_key[d.point_key.as_str()]).collect())
+    }
+
+    fn known_map(&self, endpoint_id: &str) -> HashMap<String, u32> {
+        self.store.point_map(endpoint_id).unwrap_or_default()
+    }
+
+    fn revision(&self, endpoint_id: &str) -> u64 {
+        self.store.current_revision(endpoint_id).unwrap_or(0).max(1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 运行时
+// ---------------------------------------------------------------------------
+
 /// 单个 Endpoint 的运行任务。返回即表示该 Endpoint 已停止且不再重试。
 pub async fn run_endpoint(
     disc: DiscoveredDriver,
     cfg: BuiltinEndpoint,
     snapshot: Arc<Snapshot>,
-    allocator: Arc<PointIdAllocator>,
+    source: Arc<dyn PointIdSource>,
     shutdown: CancellationToken,
 ) {
     let mut backoff_idx = 0usize;
-    let mut id_map: HashMap<String, u32> = HashMap::new();
+    let mut id_map: HashMap<String, u32> = source.known_map(&cfg.endpoint_id);
+    let mut last_epoch: u64 = 0;
 
-    set_status(&snapshot, &cfg, ConnectionState::Connecting, "", id_map.len());
+    set_status(&snapshot, &cfg, ConnectionState::Connecting, "", id_map.len(), last_epoch, source.revision(&cfg.endpoint_id));
 
     loop {
         if shutdown.is_cancelled() {
+            set_status(&snapshot, &cfg, ConnectionState::Stopped, "stopped", id_map.len(), last_epoch, source.revision(&cfg.endpoint_id));
             return;
         }
 
-        match attempt_session(&disc, &cfg, &snapshot, &allocator, &mut id_map, &shutdown).await {
-            AttemptOutcome::Shutdown => return,
+        match attempt_session(
+            &disc,
+            &cfg,
+            &snapshot,
+            &source,
+            &mut id_map,
+            &mut last_epoch,
+            &shutdown,
+        )
+        .await
+        {
+            AttemptOutcome::Shutdown => {
+                set_status(&snapshot, &cfg, ConnectionState::Stopped, "stopped", id_map.len(), last_epoch, source.revision(&cfg.endpoint_id));
+                return;
+            }
             AttemptOutcome::ConfigurationFailed(detail) => {
-                // 非重试错误（§11.1）：保持 FAILED 直到配置 Revision 变化或显式 Start
                 tracing::error!(endpoint = %cfg.endpoint_id, %detail, "configuration error, no retry");
-                set_status(&snapshot, &cfg, ConnectionState::Failed, &detail, id_map.len());
+                set_status(&snapshot, &cfg, ConnectionState::Failed, &detail, id_map.len(), last_epoch, source.revision(&cfg.endpoint_id));
                 return;
             }
             AttemptOutcome::Lost(reason) => {
-                // 断线语义（§11）：已知点全部转 BAD，值与时间戳保持原样
                 tracing::warn!(endpoint = %cfg.endpoint_id, %reason, "connection lost");
                 snapshot.mark_communication_lost(&cfg.endpoint_id);
-                set_status(&snapshot, &cfg, ConnectionState::Reconnecting, &reason, id_map.len());
+                set_status(
+                    &snapshot,
+                    &cfg,
+                    ConnectionState::Reconnecting,
+                    &reason,
+                    id_map.len(),
+                    last_epoch,
+                    source.revision(&cfg.endpoint_id),
+                );
             }
         }
 
@@ -95,7 +201,7 @@ pub async fn run_endpoint(
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = shutdown.cancelled() => {
-                set_status(&snapshot, &cfg, ConnectionState::Stopped, "core shutdown", id_map.len());
+                set_status(&snapshot, &cfg, ConnectionState::Stopped, "core shutdown", id_map.len(), last_epoch, source.revision(&cfg.endpoint_id));
                 return;
             }
         }
@@ -108,14 +214,23 @@ enum AttemptOutcome {
     Lost(String),
 }
 
-fn set_status(snapshot: &Snapshot, cfg: &BuiltinEndpoint, state: ConnectionState, detail: &str, points: usize) {
+fn set_status(
+    snapshot: &Snapshot,
+    cfg: &BuiltinEndpoint,
+    state: ConnectionState,
+    detail: &str,
+    points: usize,
+    epoch: u64,
+    revision: u64,
+) {
     snapshot.upsert_endpoint(EndpointStatus {
         endpoint_id: cfg.endpoint_id.clone(),
         driver_id: cfg.driver_id.clone(),
         state: state.as_str().to_string(),
         detail: detail.to_string(),
-        revision: 0, // TODO(Phase 1): 接入 ConfigStore revision
+        revision,
         points,
+        epoch,
     });
 }
 
@@ -124,8 +239,9 @@ async fn attempt_session(
     disc: &DiscoveredDriver,
     cfg: &BuiltinEndpoint,
     snapshot: &Arc<Snapshot>,
-    allocator: &Arc<PointIdAllocator>,
+    source: &Arc<dyn PointIdSource>,
     id_map: &mut HashMap<String, u32>,
+    last_epoch: &mut u64,
     shutdown: &CancellationToken,
 ) -> AttemptOutcome {
     let mut process = match DriverProcess::spawn(disc).await {
@@ -141,9 +257,9 @@ async fn attempt_session(
                 return AttemptOutcome::Lost(format!("connect failed: {e}"));
             }
         };
-    let mut session = session; // invalidate(&mut) 需要
+    let mut session = session;
 
-    match run_config_flow(&session, cfg, allocator, id_map, snapshot).await {
+    match run_config_flow(&session, cfg, source, id_map, snapshot, last_epoch).await {
         Ok(()) => {}
         Err(outcome) => {
             session.invalidate();
@@ -152,15 +268,14 @@ async fn attempt_session(
         }
     }
 
-    set_status(snapshot, cfg, ConnectionState::Running, "", id_map.len());
+    set_status(snapshot, cfg, ConnectionState::Running, "", id_map.len(), *last_epoch, source.revision(&cfg.endpoint_id));
 
     let outcome =
         event_loop(cfg, snapshot, &session, unresponsive_flag.as_ref(), &mut events, shutdown).await;
 
-    // 收尾：先发 Shutdown 消息再终止进程；EOF 防护作为兜底第二信号
     if !session.is_unresponsive() {
         let _ = session.post(pb_shutdown_body()).await;
-        tokio::time::sleep(Duration::from_millis(50)).await; // 给 Driver 一个出帧窗口
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     session.invalidate();
     drop(events);
@@ -176,13 +291,14 @@ fn pb_shutdown_body() -> pb::envelope::Body {
 async fn run_config_flow(
     session: &Session,
     cfg: &BuiltinEndpoint,
-    allocator: &Arc<PointIdAllocator>,
+    source: &Arc<dyn PointIdSource>,
     id_map: &mut HashMap<String, u32>,
     snapshot: &Arc<Snapshot>,
+    last_epoch: &mut u64,
 ) -> Result<(), AttemptOutcome> {
     use pb::envelope::Body;
 
-    const HANDLE: u32 = 1; // M0 每驱动进程单连接，handle 固定为 1
+    const HANDLE: u32 = 1;
 
     // OpenConnection
     let reply = session
@@ -196,17 +312,17 @@ async fn run_config_flow(
     let result = expect_ack(reply.body).ok_or_else(|| lost("OpenConnection"))?;
     config_gate(result, "OpenConnection")?;
 
-    // ConfigureTasks(revision=1 全量快照)
+    // ConfigureTasks：revision 来自持久源
+    let revision = source.revision(&cfg.endpoint_id);
     let tasks_pb = tasks_to_pb_checked(cfg)?;
     let reply = session
         .call(Body::ConfigureTasks(pb::ConfigureTasks {
             connection_handle: HANDLE,
-            revision: 1,
+            revision,
             tasks: tasks_pb,
         }))
         .await
         .map_err(|e| AttemptOutcome::Lost(format!("configure rpc: {e}")))?;
-    // configure 的响应是主动上报的 PointDescriptors 或错误帧
     let descriptors_pb = match reply.body {
         Some(Body::PointDescriptors(rep)) => rep.descriptors,
         Some(Body::DriverError(err)) => {
@@ -216,17 +332,21 @@ async fn run_config_flow(
         other => return Err(lost(format!("unexpected configure reply: {other:?}"))),
     };
 
-    // Core 侧二次校验（§6.2 双重保护之 Core 侧）
-    let parsed: Vec<forgelink_core_types::PointDescriptor> = descriptors_pb
+    let parsed: Vec<PointDescriptor> = descriptors_pb
         .into_iter()
         .map(forgelink_driver_protocol::descriptor_from_pb)
         .collect::<Result<_, _>>()
         .map_err(|e| AttemptOutcome::ConfigurationFailed(e.to_string()))?;
     ensure_unique_point_keys(&parsed).map_err(|e| AttemptOutcome::ConfigurationFailed(e.to_string()))?;
 
-    // 分配稳定 point_id + 登记点元数据
-    let keys: Vec<String> = parsed.iter().map(|d| d.point_key.clone()).collect();
-    let ids = allocator.assign(id_map, &keys);
+    // 分配稳定 point_id（持久化或内存）
+    let ids = source
+        .assign(&cfg.endpoint_id, &parsed)
+        .map_err(AttemptOutcome::ConfigurationFailed)?;
+    // 同步本地 id_map（用于状态展示与断线前计数）
+    for (d, &id) in parsed.iter().zip(ids.iter()) {
+        id_map.insert(d.point_key.clone(), id);
+    }
     let defs: Vec<PointDefinition> = parsed
         .iter()
         .zip(&ids)
@@ -239,7 +359,7 @@ async fn run_config_flow(
     let reply = session
         .call(Body::ApplyPointMap(pb::ApplyPointMap {
             connection_handle: HANDLE,
-            revision: 1,
+            revision,
             key_to_point_id: map,
         }))
         .await
@@ -255,6 +375,7 @@ async fn run_config_flow(
         .map_err(|e| AttemptOutcome::Lost(format!("start rpc: {e}")))?;
     let result = expect_ack(reply.body).ok_or_else(|| lost("StartConnection"))?;
     config_gate(result, "StartConnection")?;
+    *last_epoch = epoch;
     tracing::info!(endpoint = %cfg.endpoint_id, epoch, points = defs.len(), "connection started");
 
     Ok(())
@@ -270,7 +391,7 @@ async fn event_loop(
 ) -> AttemptOutcome {
     const WATCHDOG_TICK: Duration = Duration::from_secs(2);
     let mut watchdog = tokio::time::interval(WATCHDOG_TICK);
-    watchdog.tick().await; // interval 首个 tick 立即完成，跳过
+    watchdog.tick().await;
 
     loop {
         tokio::select! {
@@ -315,7 +436,6 @@ fn apply_batch_logged(snapshot: &Arc<Snapshot>, cfg: &BuiltinEndpoint, batch: Da
     tracing::trace!(endpoint=%cfg.endpoint_id, seq=batch.sequence, values=n, "batch");
 }
 
-/// Ack 类响应统一解包为 GenericResult。
 fn expect_ack(body: Option<pb::envelope::Body>) -> Option<pb::GenericResult> {
     use pb::envelope::Body as B;
     match body {
@@ -326,7 +446,6 @@ fn expect_ack(body: Option<pb::envelope::Body>) -> Option<pb::GenericResult> {
     }
 }
 
-/// ok 直通；ConfigurationError 归入非重试分支，其余按连接丢失处理。
 fn config_gate(result: pb::GenericResult, what: &'static str) -> Result<(), AttemptOutcome> {
     if result.ok {
         return Ok(());
@@ -349,8 +468,6 @@ fn lost(reason: impl Into<String>) -> AttemptOutcome {
     AttemptOutcome::Lost(reason.into())
 }
 
-/// stream_epoch：时间+pid+自增混合。单机单 Core 下碰撞概率可忽略，
-/// M0 不为此引入额外随机依赖。
 static EPOCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn new_stream_epoch() -> u64 {
     let n = forgelink_core_types::now_unix_ns() as u64;

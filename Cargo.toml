@@ -5,9 +5,11 @@ members = [
     "crates/driver-protocol",
     "crates/driver-sdk",
     "crates/driver-manager",
+    "crates/config-store",
     "crates/core-api",
     "apps/forgelinkd",
     "drivers/simulator",
+    "drivers/s7",
     "tests/driver-contract",
 ]
 
@@ -21,7 +23,10 @@ forgelink-core-types = { path = "crates/core-types" }
 forgelink-driver-protocol = { path = "crates/driver-protocol" }
 forgelink-driver-sdk = { path = "crates/driver-sdk" }
 forgelink-driver-manager = { path = "crates/driver-manager" }
+forgelink-config-store = { path = "crates/config-store" }
 forgelink-core-api = { path = "crates/core-api" }
+
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"

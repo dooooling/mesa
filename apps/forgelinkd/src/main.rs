@@ -1,16 +1,21 @@
 //! forgelinkd：ForgeLink Core 的唯一运行入口（方案 §25）。
 //!
-//! M0 装配：扫描 drivers/ -> 注入内置默认 Endpoint（simulator）-> 启动 REST。
-//! 配置持久化与 CRUD 在 Phase 1 接入 ConfigStore 后替换内置注入路径。
+//! Phase B：SQLite 配置持久化 + REST CRUD + 开机恢复。`sim-001` 仅在空库时作为演示种子写入库，
+//! 后续以库为准（配置真值只在 Core）。
 
+use std::sync::Arc;
+
+use forgelink_config_store::{ConfigStore, DeviceRecord, EndpointRecord};
 use forgelink_core_types::{AcquisitionTask, DriverBinding, TaskMode};
+use forgelink_driver_manager::StorePointIdSource;
 
 /// 默认 HTTP 端口。仅 loopback 可见（§4.2）。
 const DEFAULT_HTTP_PORT: u16 = 8132;
+/// 默认库路径（workspace 根下）。
+const DEFAULT_DB_PATH: &str = "forgelink.db";
 
 #[tokio::main]
 async fn main() {
-    // 日志级别可用 RUST_LOG 覆盖，默认 info
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -20,30 +25,63 @@ async fn main() {
 
     let args = parse_args();
     let drivers_dir = std::path::PathBuf::from(&args.drivers_dir);
-    tracing::info!(dir = %drivers_dir.display(), "scanning driver manifests");
+    let db_path = std::path::PathBuf::from(&args.db_path);
+    tracing::info!(dir = %drivers_dir.display(), db = %db_path.display(), "starting forgelinkd");
 
-    let manager = forgelink_driver_manager::ForgeLinkManager::discover(&drivers_dir);
-
-    // ---- M0 内置默认配置：一个 simulator Endpoint（替代 Phase 1 前的 ConfigStore）----
-    let builtin = builtin_endpoint();
-    match manager.start_builtin_endpoint(builtin) {
-        Ok(()) => tracing::info!("builtin endpoint `sim-001` scheduled"),
+    // ---- ConfigStore ----
+    let store = match ConfigStore::open(&db_path) {
+        Ok(s) => Arc::new(s),
         Err(e) => {
-            tracing::error!("{e}");
-            tracing::error!("hint: run `cargo build` first, then start forgelinkd from the workspace root");
+            tracing::error!("open db {}: {e}", db_path.display());
+            std::process::exit(1);
+        }
+    };
+
+    // 空库时写入演示种子（仅一次，保持开箱可用；后续以 REST 为准）
+    if let Err(e) = maybe_seed_demo(&store) {
+        tracing::warn!("seed demo failed: {e}");
+    }
+
+    // ---- DriverManager（持久版 ID 源）----
+    let source = Arc::new(StorePointIdSource::new(store.clone()));
+    let manager = Arc::new(forgelink_driver_manager::ForgeLinkManager::with_source(
+        &drivers_dir,
+        source,
+    ));
+
+    // ---- 恢复期望运行的 Endpoint ----
+    let stored_eps = store.list_endpoints().unwrap_or_default();
+    if stored_eps.is_empty() {
+        tracing::warn!("no endpoints in store; create one via REST POST /api/v1/endpoints");
+    }
+    for rec in &stored_eps {
+        if !rec.desired_running {
+            continue;
+        }
+        let tasks = store.list_tasks(&rec.id).unwrap_or_default();
+        let cfg = forgelink_driver_manager::endpoint::BuiltinEndpoint {
+            endpoint_id: rec.id.clone(),
+            driver_id: rec.driver_id.clone(),
+            connection_json: rec.connection_json.clone(),
+            tasks,
+        };
+        match manager.start_endpoint(cfg) {
+            Ok(()) => tracing::info!(endpoint = %rec.id, "restored endpoint (desired=running)"),
+            Err(e) => tracing::error!(endpoint = %rec.id, "{e}"),
         }
     }
 
     // ---- REST 服务 ----
+    let app_state = forgelink_core_api::AppState::new(manager.clone(), store.clone(), args.drivers_dir.clone());
     let api_shutdown = manager.shutdown_token().child_token();
-    let api = tokio::spawn(forgelink_core_api::serve(manager.snapshot(), args.http_port, api_shutdown));
+    let api = tokio::spawn(forgelink_core_api::serve(app_state, args.http_port, api_shutdown));
 
-    print_banner(args.http_port);
+    print_banner(args.http_port, &args.db_path);
 
-    // ---- 优雅停机：Ctrl-C / 服务停止信号 → 取消全部运行时 → 收尾 ----
+    // ---- 优雅停机 ----
     wait_for_interrupt().await;
     tracing::info!("shutdown signal received, stopping...");
-    manager.shutdown().await;
+    manager.shutdown_all().await;
     api.abort();
     tracing::info!("bye");
 }
@@ -51,10 +89,15 @@ async fn main() {
 struct Args {
     drivers_dir: String,
     http_port: u16,
+    db_path: String,
 }
 
 fn parse_args() -> Args {
-    let mut out = Args { drivers_dir: "drivers".into(), http_port: DEFAULT_HTTP_PORT };
+    let mut out = Args {
+        drivers_dir: "drivers".into(),
+        http_port: DEFAULT_HTTP_PORT,
+        db_path: DEFAULT_DB_PATH.into(),
+    };
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < argv.len() {
@@ -69,8 +112,12 @@ fn parse_args() -> Args {
                 }
                 i += 2;
             }
+            "--db" => {
+                out.db_path = argv.get(i + 1).cloned().unwrap_or(out.db_path);
+                i += 2;
+            }
             other => {
-                eprintln!("unknown arg: {other}");
+                eprintln!("unknown arg: {other} (supported: --drivers-dir --http-port --db)");
                 i += 1;
             }
         }
@@ -78,12 +125,14 @@ fn parse_args() -> Args {
     out
 }
 
-fn print_banner(http_port: u16) {
+fn print_banner(http_port: u16, db_path: &str) {
     eprintln!();
-    eprintln!("  ForgeLink Core (M0) is running");
+    eprintln!("  ForgeLink Core (Phase B) is running");
     eprintln!("  REST  : http://127.0.0.1:{http_port}/api/v1/drivers");
     eprintln!("          http://127.0.0.1:{http_port}/api/v1/endpoints");
     eprintln!("          http://127.0.0.1:{http_port}/api/v1/points/latest");
+    eprintln!("          http://127.0.0.1:{http_port}/api/v1/diagnostics");
+    eprintln!("  DB    : {db_path}");
     eprintln!("  Stop  : Ctrl+C");
     eprintln!();
 }
@@ -103,9 +152,38 @@ async fn wait_for_interrupt() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// M0 内置端点定义。字段语义与 §5.3/§5.5 一致；binding 由 simulator 解释。
-fn builtin_endpoint() -> forgelink_driver_manager::endpoint::BuiltinEndpoint {
-    let tasks = vec![AcquisitionTask {
+/// 空库时写入演示种子：device + endpoint + tasks，desired_running=true。
+/// 若库已有任意 endpoint 则不操作。
+fn maybe_seed_demo(store: &ConfigStore) -> Result<bool, String> {
+    let eps = store.list_endpoints().map_err(|e| e.to_string())?;
+    if !eps.is_empty() {
+        return Ok(false);
+    }
+    // 幂等：device 已存在则复用
+    let dev = DeviceRecord { id: "sim-device".into(), name: "Simulator Device".into(), profile: None };
+    let _ = store.create_device(&dev);
+    let rec = EndpointRecord {
+        id: "sim-001".into(),
+        device_id: "sim-device".into(),
+        driver_id: "simulator".into(),
+        connection_json: "{}".into(),
+        desired_running: true,
+        updated_at_ns: forgelink_core_types::now_unix_ns(),
+    };
+    match store.create_endpoint(&rec) {
+        Ok(()) => {}
+        Err(e) if e.to_string().contains("已存在") => return Ok(false),
+        Err(e) => return Err(e.to_string()),
+    }
+    store
+        .replace_tasks("sim-001", &demo_tasks())
+        .map_err(|e| e.to_string())?;
+    tracing::info!("seeded demo endpoint `sim-001` (first run only)");
+    Ok(true)
+}
+
+fn demo_tasks() -> Vec<AcquisitionTask> {
+    vec![AcquisitionTask {
         id: "default".into(),
         mode: TaskMode::Poll,
         interval_ms: Some(200),
@@ -121,11 +199,5 @@ fn builtin_endpoint() -> forgelink_driver_manager::endpoint::BuiltinEndpoint {
                 ]
             }),
         },
-    }];
-    forgelink_driver_manager::endpoint::BuiltinEndpoint {
-        endpoint_id: "sim-001".into(),
-        driver_id: "simulator".into(),
-        connection_json: "{}".into(),
-        tasks,
-    }
+    }]
 }

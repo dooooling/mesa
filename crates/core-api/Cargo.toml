@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 forgelink-core-types = { workspace = true }
 forgelink-driver-manager = { workspace = true }
+forgelink-config-store = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

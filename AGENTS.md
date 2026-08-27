@@ -11,17 +11,22 @@
 ## 常用命令（M0 已验证）
 
 ```bash
-cargo build --release -p forgelinkd -p forgelink-driver-simulator   # 构建
-cargo test --workspace                                              # 全部测试（当前 21 个）
+cargo build --workspace                                             # 构建（含全部驱动 bin）
+cargo test --workspace                                              # 全部测试（当前 42 个，含 §21 全量 Contract Test）
 ./target/release/forgelinkd                                         # 从 workspace 根启动（默认 drivers/ 目录 + 端口 8132）
 ```
+
+注意：`cargo test -p forgelink-contract-tests` 只构建依赖包 lib，不重编驱动 bin；
+改过驱动代码后跑子进程类合同测试前，先 `cargo build --workspace`，否则旧二进制会让故障注入静默失效。
 
 验收入口：
 - `http://127.0.0.1:8132/api/v1/drivers` — 驱动清单
 - `http://127.0.0.1:8132/api/v1/endpoints` — 端点状态
 - `http://127.0.0.1:8132/api/v1/points/latest` — 最新值
 
-注意：Windows 控制台中文输出乱码属 chcp 编码问题，与程序无关。
+Contract Test 基线（§21 全部 20 项）位于 `tests/driver-contract/tests/`：
+`smoke.rs` / `protocol_negotiation.rs` / `session_lifecycle.rs` / `data_plane.rs` /
+`fault_tolerance.rs` / `subprocess_recovery.rs`。任何新 Driver 必须全过该基线。
 
 ## 项目是什么
 
