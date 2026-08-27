@@ -52,6 +52,7 @@
   - `192.168.15.60:8193` `ping 1-2ms` 但 `cnc_allclibhndl3` 返 `EW_SOCKET`，`Test-NetConnection 8193 False`，判定该机 `FOCAS2/Ethernet` 未启用或防火墙未放行（需查 `MD 0020/900系列`）
   - `192.168.15.165:8193` `ping 1ms` `TcpTestSucceeded True`，`test_native -- 192.168.15.165` 直连 `connect OK`，`status U32(1) / axis.abs.1 I32(4000) / spindle.load U32(0)` 回传成功；`forgelinkd 8139` `real-focas RUNNING 4点` `GET /points/latest` 9 点（4 真机 +5 sim）已验证 `cnc_statinfo/cnc_rddynamic2(44)/cnc_acts` 链路
   - `FOCAS` 句柄 `cnc_allclibhndl3(ip,port,timeout_s)` 正确，`timeout_ms 5000→5s`，`NativeFocasApi` `spawn_blocking` 隔离 + `EW_SOCKET/EW_NODLL` 退避 `RECONNECTING` 正常
+  - **Windows 依赖路径修复 `9514443`**：`FWLIB64.dll` 隐式依赖 `fwlibe1.dll` 需同目录，`LoadLibrary` 相对路径不搜 `libs/win`；`native.rs:331 load() prepend PATH(cwd/drivers/focas2/libs/win+TEMP) + 绝对路径双候选` 后 `cnc_allclibhndl3 host=192.168.15.165 ret Ok(32769) Status1 Axis -68050..79986`，`60` 保持 `EW_SOCKET -16` 隔离；单文件分发 `26.5MB` `include_bytes!→NamedTempFile→Library::new` `%TEMP%/forgelink_focas_embed`
 - **后续**：`192.168.15.165` 已可作为 0i-F/30i 基准真机，继续补 `cnc_rdalmmsg/cnc_rdmacro/pmc_rdpmcrng` 等余下地址并做断线重连 Soak；`FakeFocasApi` 仍用于 CI
 
 ## 6. 发布 Gate

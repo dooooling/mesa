@@ -23,22 +23,27 @@ ForgeLink 统一流程（控制台可读）
     Manager::start_endpoint()
       -> Command::new(driver.binary) --port <ephemeral> + stdin 32B token
       -> Session Hello{protocol 1.0,token} <-> Welcome 握手
-      -> OpenConnection{connection_json}
-           S7  : COTP CR/CC -> S7 Setup PDU480 -> S7Client
-           FOCAS Fake  : FakeFocasApi 随机值
-           FOCAS Native: NativeLib::load() FWLIB64.dll -> cnc_allclibhndl3(ip,port,timeout) -> hdl:u16
-      -> ConfigureTasks{revision,tasks} -> 驱动 parse_address()
-           S7  : DB10.DBD20 / MB10 / BOOL位校验 -> S7Address + S7Kind
-           FOCAS: status / axis.abs.1 / spindle.load.1 -> FocasAddress
-           -> 返回 PointDescriptor[] -> Core 落库 point_registry
+       -> OpenConnection{connection_json}
+            S7  : COTP CR/CC -> S7 Setup PDU480 -> S7Client
+            FOCAS Fake  : FakeFocasApi 随机值
+            FOCAS Native: NativeLib::load() FWLIB64.dll -> cnc_allclibhndl3(ip,port,timeout) -> hdl:u16
+            OPC UA Fake : FakeOpcUaApi mpsc KeepAlive空跳
+            OPC UA Native: NativeOpcUaApi ClientBuilder pki_dir trust false -> Session + DataChangeCallback
+       -> ConfigureTasks{revision,tasks} -> 驱动 parse_address()
+            S7  : DB10.DBD20 / MB10 / BOOL位校验 -> S7Address + S7Kind
+            FOCAS: status / axis.abs.1 / spindle.load.1 -> FocasAddress
+            OPC UA: ns=2;i=1 / s=Sine / g=GUID -> OpcUaAddress (poll/subscription)
+            -> 返回 PointDescriptor[] -> Core 落库 point_registry
       -> ApplyPointMap{map: key->point_id}
       -> Start{stream_epoch:u64} -> 驱动 run(sink, shutdown)
 
 [5] 运行时 (Driver::run)
-    per Task: tokio::interval(500ms) MissedTickBehavior::Skip
-      loop { ticker.tick() | shutdown.cancelled() }
-        S7  : items=[ReadItem] BOOL按BYTE读后取位 -> client.read_vars() -> decode_value()大端 -> Value
-        FOCAS: addrs=[FocasAddress] -> spawn_blocking -> lib.statinfo / rddynamic2(1,44) / acts -> Value
+     per Task: Poll=interval Skip / Subscribe=DataChange mpsc
+       loop { Poll: ticker.tick() | Subscribe: rx.recv() | shutdown.cancelled() }
+         S7  : items=[ReadItem] BOOL按BYTE读后取位 -> client.read_vars() -> decode_value()大端 -> Value
+         FOCAS: addrs=[FocasAddress] -> spawn_blocking -> lib.statinfo / rddynamic2(1,44) / acts -> Value
+         OPC UA Poll: Session.read -> Variant->Value
+         OPC UA Subscribe: DataChangeCallback try_send -> mpsc 256 -> batch 64 KeepAlive不产批
         -> DataSink.publish(DataBatch{
              connection_handle:0, stream_epoch, sequence:AtomicU64,
              timestamp_ns: now_unix_ns() UTC, values:[PointValue{point_id,Value,Quality:GOOD}]})
