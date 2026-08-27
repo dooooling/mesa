@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use forgelink_core_types::{
     ensure_unique_point_keys, AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey,
-    PointDescriptor, PointMap, PointValue, TaskMode, Value, now_unix_ns,
+    PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, now_unix_ns,
 };
 use forgelink_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio_util::sync::CancellationToken;
@@ -312,7 +312,20 @@ impl DriverConnection for FocasConnection {
                     }
                     let mut batch_vals = Vec::with_capacity(points.len());
                     for ((spec, pid), raw_val) in points.iter().zip(values) {
-                        // 类型适配：若声明为 F32/F64 而返回为 I32/U32 则做数值转换
+                        // 多机型单点不支持：Native 以 "ERR:EW_*" 字符串占位，转 Quality::Bad 而非丢整批
+                        if let Value::String(s) = &raw_val {
+                            if s.starts_with("ERR:") {
+                                tracing::warn!(key=%spec.key, error=%s, "单点 Bad，不影响同批其他点");
+                                batch_vals.push(PointValue {
+                                    point_id: *pid,
+                                    value: raw_val,
+                                    quality: Quality::Bad,
+                                    quality_code: Some(1),
+                                    source_timestamp_ns: None,
+                                });
+                                continue;
+                            }
+                        }
                         let coerced = coerce_value(raw_val, spec.data_type);
                         if !value_fits_data_type(&coerced, spec.data_type) {
                             tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配跳过");

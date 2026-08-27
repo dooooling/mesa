@@ -1,0 +1,56 @@
+ForgeLink Unified Flow (S7 / FOCAS2) - Console Friendly
+
+[1] Startup
+    forgelinkd --db forgelink_real.db --http-port 8139
+      -> DriverManager::discover drivers/*/driver.toml (s7/focas2/sim)
+      -> ConfigStore SQLite create tables + restore desired_running
+
+[2] Modeling (REST)
+    POST /devices {id:"real-device"}
+    POST /endpoints {id:"focas-165", driver_id:"focas2", connection:{host:"192.168.15.165",port:8193,use_native:true}}
+    POST /endpoints {id:"s7-demo", driver_id:"s7", connection:{host:"192.0.0.1",rack:0,slot:1}}
+      * Core stores JSON only, no address parsing
+
+[3] Task Deploy (full snapshot, revision++)
+    POST /tasks {endpoint_id, tasks:[{id:"t1",mode:"poll",interval_ms:500,
+      binding:{kind:"focas.data-block", config:{items:[
+        {key:"cnc.status",address:"status",data_type:"U32"},
+        {key:"axis.x",address:"axis.abs.1",data_type:"I32"}]}}}]}
+      -> validate() -> revision++ -> assign_point_ids() (tombstone reuse)
+      -> ensure_unique_point_keys()
+
+[4] Start Driver (POST /endpoints/{id}/start)
+    Manager::start_endpoint()
+      -> Command::new(driver.binary) --port <ephemeral> + stdin 32B token
+      -> Session Hello{protocol 1.0,token} <-> Welcome
+      -> OpenConnection{connection_json}
+           S7  : COTP CR/CC -> S7 Setup PDU480 -> S7Client
+           FOCAS Fake  : FakeFocasApi random
+           FOCAS Native: NativeLib::load() FWLIB64.dll -> cnc_allclibhndl3(ip,port,timeout) -> hdl:u16
+      -> ConfigureTasks{revision,tasks} -> driver parse_address()
+           S7  : DB10.DBD20 / MB10 / BOOL bit check -> S7Address + S7Kind
+           FOCAS: status / axis.abs.1 / spindle.load.1 -> FocasAddress
+           -> return PointDescriptor[] -> Core persist point_registry
+      -> ApplyPointMap{map: key->point_id}
+      -> Start{stream_epoch:u64} -> driver run(sink, shutdown)
+
+[5] Runtime (Driver::run per Task)
+    per Task: tokio::interval(500ms) MissedTick Skip
+      loop { ticker.tick() | shutdown.cancelled() }
+        S7  : items=[ReadItem] BOOL->BYTE then bit extract -> client.read_vars() -> decode_value() big-endian -> Value
+        FOCAS: addrs=[FocasAddress] -> spawn_blocking -> lib.statinfo / rddynamic2(1,44) / acts -> Value
+        -> DataSink.publish(DataBatch{
+             connection_handle:0, stream_epoch, sequence:AtomicU64,
+             timestamp_ns: now_unix_ns() UTC, values:[PointValue{point_id,Value,Quality:GOOD}]})
+             bounded Latest-Wins coalescing
+
+    Session writer (Protobuf Envelope) -> Core latest table
+      -> GET /points/latest  {endpoint_id,key,point_id,quality,value,timestamp_ns,type}
+      -> GET /endpoints {state: RUNNING|RECONNECTING|FAILED, detail, epoch, points}
+
+[6] Fault Tolerance
+    heartbeat PING/PONG 3 misses -> RECONNECTING exponential backoff -> OpenConnection...
+    EW_SOCKET/EW_NODLL -> RECONNECTING (e.g. 60) vs FAILED (config error)
+    Stop -> Configure -> Apply -> Start new epoch, no hot Apply
+
+[Unified] Core ends at PointMap/DataBatch, new driver only needs to impl Driver trait, no Core change

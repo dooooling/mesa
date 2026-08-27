@@ -1,0 +1,56 @@
+ForgeLink 统一流程（控制台可读）
+
+[1] 启动
+    forgelinkd --db forgelink_real.db --http-port 8139
+      -> DriverManager::discover 扫 drivers/*/driver.toml (s7/focas2/sim)
+      -> ConfigStore SQLite 建表 + 恢复 desired_running
+
+[2] 建模 (REST)
+    POST /devices {id:"real-device"}
+    POST /endpoints {id:"focas-165", driver_id:"focas2", connection:{host:"192.168.15.165",port:8193,use_native:true}}
+    POST /endpoints {id:"s7-demo", driver_id:"s7", connection:{host:"192.0.0.1",rack:0,slot:1}}
+      * Core 仅存 JSON，不解析地址
+
+[3] 下发采集 (全量快照 §6)
+    POST /tasks {endpoint_id, tasks:[{id:"t1",mode:"poll",interval_ms:500,
+      binding:{kind:"focas.data-block", config:{items:[
+        {key:"cnc.status",address:"status",data_type:"U32"},
+        {key:"axis.x",address:"axis.abs.1",data_type:"I32"}]}}}]}
+      -> validate() -> revision++ -> assign_point_ids() (tombstone复用)
+      -> ensure_unique_point_keys() 判重
+
+[4] 起驱动 (POST /endpoints/{id}/start)
+    Manager::start_endpoint()
+      -> Command::new(driver.binary) --port <ephemeral> + stdin 32B token
+      -> Session Hello{protocol 1.0,token} <-> Welcome 握手
+      -> OpenConnection{connection_json}
+           S7  : COTP CR/CC -> S7 Setup PDU480 -> S7Client
+           FOCAS Fake  : FakeFocasApi 随机值
+           FOCAS Native: NativeLib::load() FWLIB64.dll -> cnc_allclibhndl3(ip,port,timeout) -> hdl:u16
+      -> ConfigureTasks{revision,tasks} -> 驱动 parse_address()
+           S7  : DB10.DBD20 / MB10 / BOOL位校验 -> S7Address + S7Kind
+           FOCAS: status / axis.abs.1 / spindle.load.1 -> FocasAddress
+           -> 返回 PointDescriptor[] -> Core 落库 point_registry
+      -> ApplyPointMap{map: key->point_id}
+      -> Start{stream_epoch:u64} -> 驱动 run(sink, shutdown)
+
+[5] 运行时 (Driver::run)
+    per Task: tokio::interval(500ms) MissedTickBehavior::Skip
+      loop { ticker.tick() | shutdown.cancelled() }
+        S7  : items=[ReadItem] BOOL按BYTE读后取位 -> client.read_vars() -> decode_value()大端 -> Value
+        FOCAS: addrs=[FocasAddress] -> spawn_blocking -> lib.statinfo / rddynamic2(1,44) / acts -> Value
+        -> DataSink.publish(DataBatch{
+             connection_handle:0, stream_epoch, sequence:AtomicU64,
+             timestamp_ns: now_unix_ns() UTC, values:[PointValue{point_id,Value,Quality:GOOD}]})
+             有界 Latest-Wins 合并
+
+    Session writer (Protobuf Envelope) -> Core 最新值表
+      -> GET /points/latest  {endpoint_id,key,point_id,quality,value,timestamp_ns,type}
+      -> GET /endpoints {state: RUNNING|RECONNECTING|FAILED, detail, epoch, points}
+
+[6] 容错
+    心跳 PING/PONG 3次miss -> RECONNECTING 指数退避 -> 重走 OpenConnection...
+    EW_SOCKET/EW_NODLL -> RECONNECTING (60) vs FAILED (配置错)
+    Stop -> Configure -> Apply -> Start 新 epoch §6 禁热改
+
+[统一点] Core 止于 PointMap/DataBatch，新增驱动实现 Driver trait 即可，无需改 Core
