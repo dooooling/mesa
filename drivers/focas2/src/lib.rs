@@ -14,6 +14,7 @@
 
 mod address;
 mod focas_api;
+mod native;
 
 pub use address::{parse_address, AddressError, FocasAddress};
 pub use focas_api::{FakeFocasApi, FocasApi, NativeFocasApi};
@@ -62,7 +63,7 @@ impl Driver for FocasDriver {
         // Phase A 固定使用 Fake（多协议验证）；若 config 显式指定 use_native=true 则尝试 Native（当前会 Failed）
         let use_native = v.get("use_native").and_then(|x| x.as_bool()).unwrap_or(false);
         let api: Arc<dyn FocasApiTrait> = if use_native {
-            Arc::new(NativeFocasApi)
+            Arc::new(NativeFocasApi::new())
         } else {
             Arc::new(FakeFocasApi::new())
         };

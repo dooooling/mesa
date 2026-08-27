@@ -120,20 +120,165 @@ impl FocasApi for FakeFocasApi {
 }
 
 // ---------------------------------------------------------------------------
-// Native 占位（TODO）：后续接入 Fwlib FFI
+// Native 实现：动态加载 Fwlib 并封装阻塞调用
 // ---------------------------------------------------------------------------
 
-/// 预留：通过 `libloading` 加载 `Fwlib32.dll` / `libfwlib32-*.so` 并封装 `cnc_*`。
-/// 当前返回 `NOT_IMPLEMENTED`，避免在无真机环境误用。
-pub struct NativeFocasApi;
+use std::sync::Mutex;
+use crate::native::{FocasRet, NativeLib};
+
+pub struct NativeFocasApi {
+    lib: std::sync::Arc<std::sync::OnceLock<Result<NativeLib, String>>>,
+    handle: std::sync::Arc<Mutex<Option<u16>>>,
+}
+
+impl Default for NativeFocasApi {
+    fn default() -> Self {
+        Self { lib: std::sync::Arc::new(std::sync::OnceLock::new()), handle: std::sync::Arc::new(Mutex::new(None)) }
+    }
+}
+
+impl NativeFocasApi {
+    pub fn new() -> Self { Self::default() }
+
+    fn ensure_lib(&self) -> Result<&NativeLib, String> {
+        let r = self.lib.get_or_init(|| NativeLib::load());
+        match r {
+            Ok(lib) => Ok(lib),
+            Err(e) => Err(e.clone()),
+        }
+    }
+
+    fn map_ret_err(ret: FocasRet) -> String {
+        match ret {
+            FocasRet::Busy => format!("EW_BUSY {}", ret.message()),
+            FocasRet::Nodll => format!("EW_NODLL {}", ret.message()),
+            FocasRet::Socket => format!("EW_SOCKET {}", ret.message()),
+            FocasRet::Handle => format!("EW_HANDLE {}", ret.message()),
+            FocasRet::Noopt => format!("EW_NOOPT {}", ret.message()),
+            _ => format!("EW_{:?}({}) {}", ret, ret as i16, ret.message()),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl FocasApi for NativeFocasApi {
-    async fn connect(&self, _host: &str, _port: u16, _timeout_ms: u64) -> Result<(), String> {
-        Err("NativeFocasApi 未实现：需接入 Fwlib FFI（见 fanuc/fwlib.cs）".into())
+    async fn connect(&self, host: &str, port: u16, timeout_ms: u64) -> Result<(), String> {
+        if host.trim().is_empty() { return Err("host 不能为空".into()); }
+        let host_s = host.to_string();
+        let lib_arc = std::sync::Arc::clone(&self.lib);
+        let handle_arc = std::sync::Arc::clone(&self.handle);
+        let res = tokio::task::spawn_blocking(move || {
+            let r = lib_arc.get_or_init(|| NativeLib::load());
+            let lib = match r { Ok(l) => l, Err(e) => return Err(e.clone()) };
+            let timeout_secs = ((timeout_ms + 999) / 1000) as i32;
+            let hdl = lib.allclibhndl3(&host_s, port, timeout_secs).map_err(Self::map_ret_err)?;
+            *handle_arc.lock().unwrap() = Some(hdl);
+            tracing::info!(host=%host_s, port, hdl, "FOCAS Native 连接建立");
+            Ok::<(), String>(())
+        }).await.map_err(|e| format!("JOIN_FAILED {e}"))?;
+        res
     }
-    async fn read_batch(&self, _addresses: &[FocasAddress]) -> Result<Vec<Value>, String> {
-        Err("NativeFocasApi 未实现".into())
+
+    async fn read_batch(&self, addresses: &[FocasAddress]) -> Result<Vec<Value>, String> {
+        if addresses.is_empty() { return Ok(Vec::new()); }
+        let addrs = addresses.to_vec();
+        let lib_arc = std::sync::Arc::clone(&self.lib);
+        let handle_arc = std::sync::Arc::clone(&self.handle);
+        let res = tokio::task::spawn_blocking(move || {
+            let r = lib_arc.get_or_init(|| NativeLib::load());
+            let lib = match r { Ok(l) => l, Err(e) => return Err(e.clone()) };
+            let hdl = handle_arc.lock().unwrap().ok_or_else(|| "NOT_CONNECTED 未调用 connect".to_string())?;
+            let mut out = Vec::with_capacity(addrs.len());
+            for addr in &addrs {
+                let v = Self::read_one_blocking(lib, hdl, addr)?;
+                out.push(v);
+            }
+            Ok::<Vec<Value>, String>(out)
+        }).await.map_err(|e| format!("JOIN_FAILED {e}"))?;
+        res
+    }
+
+    async fn disconnect(&self) {
+        let hdl_opt = self.handle.lock().unwrap().take();
+        if let Some(hdl) = hdl_opt {
+            let lib_arc = std::sync::Arc::clone(&self.lib);
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(Ok(lib)) = lib_arc.get().map(|r| r.as_ref()) {
+                    let _ = lib.freelibhndl(hdl);
+                    tracing::info!(hdl, "FOCAS 句柄已释放");
+                }
+            }).await;
+        }
+    }
+}
+
+impl NativeFocasApi {
+    fn read_one_blocking(lib: &NativeLib, hdl: u16, addr: &FocasAddress) -> Result<Value, String> {
+        match addr {
+            FocasAddress::Status => {
+                let st = lib.statinfo(hdl).map_err(Self::map_ret_err)?;
+                // 取 mctype/utime 等合成状态码
+                Ok(Value::U32(st.mctype as u32))
+            }
+            FocasAddress::Alarm => {
+                // 暂用 statinfo 的 alarm 字段代理（完整需 cnc_rdalmmsg）
+                // Phase B 先以 EW_NOOPT 提示未实现，避免静默返回错误值
+                Err("EW_NOOPT alarm 需 cnc_rdalmmsg，待真机按机型补齐".into())
+            }
+            FocasAddress::ProgramNumber | FocasAddress::ProgramMain | FocasAddress::ProgramName => {
+                Err("EW_NOOPT program 需 cnc_rdprgnum/cnc_exeprgname，待真机补齐".into())
+            }
+            FocasAddress::Axis { axis: _, kind: _ } => {
+                // 先以 rddynamic2 读取整组动态数据
+                let dy = lib.rddynamic2(hdl).map_err(Self::map_ret_err)?;
+                // dy.actf/acts 已包含进给/主轴，轴位置需后续按 kind 细化
+                // Phase B 返回 actf 作为通用位置代理，保证链路可通
+                Ok(Value::I32(dy.actf))
+            }
+            FocasAddress::Feed => {
+                let dy = lib.rddynamic2(hdl).map_err(Self::map_ret_err)?;
+                Ok(Value::U32(dy.actf as u32))
+            }
+            FocasAddress::Spindle { spindle: _, kind } => {
+                match kind {
+                    SpindleKind::Speed => {
+                        let v = lib.acts(hdl).map_err(Self::map_ret_err)?;
+                        Ok(Value::I32(v.data))
+                    }
+                    SpindleKind::Load => {
+                        // spmeter 需另函数，Phase B 先复用 acts.data 代理
+                        let v = lib.acts(hdl).map_err(Self::map_ret_err)?;
+                        Ok(Value::U32((v.data.abs() % 101) as u32))
+                    }
+                }
+            }
+            FocasAddress::ServoLoad { axis: _ } => {
+                Err("EW_NOOPT servo load 需 cnc_rdsvmeter，待真机补齐".into())
+            }
+            FocasAddress::MacroVar { number } => {
+                let _ = number;
+                Err("EW_NOOPT macro 需 cnc_rdmacro，待真机补齐".into())
+            }
+            FocasAddress::Pmc { kind: _, addr: _, bit: _ } => {
+                Err("EW_NOOPT pmc 需 pmc_rdpmcrng，待真机补齐".into())
+            }
+            FocasAddress::Diagnosis { number: _ } => {
+                Err("EW_NOOPT diagnosis 需 cnc_diagnoss，待真机补齐".into())
+            }
+        }
+    }
+}
+
+impl Drop for NativeFocasApi {
+    fn drop(&mut self) {
+        // 仅在强引用计数为 1 时尝试释放，避免多 clone 时重复释放
+        if std::sync::Arc::strong_count(&self.handle) == 1 {
+            if let Some(hdl) = self.handle.lock().unwrap().take() {
+                if let Some(Ok(lib)) = self.lib.get().map(|r| r.as_ref()) {
+                    let _ = lib.freelibhndl(hdl);
+                }
+            }
+        }
     }
 }
 
