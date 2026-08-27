@@ -81,6 +81,7 @@ impl Driver for OpcUaDriver {
 // 连接配置
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct OpcUaConnConfig {
     endpoint_url: String,
@@ -154,6 +155,7 @@ struct PointSpec {
     data_type: DataType,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum TaskKind {
     Poll { interval_ms: u64 },
@@ -172,6 +174,7 @@ struct TaskPlan {
     point_indices: Vec<usize>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct PlanSnapshot {
     revision: u64,
