@@ -62,10 +62,13 @@ impl Driver for OpcUaDriver {
         let v: serde_json::Value = serde_json::from_str(config_json)
             .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", format!("connection JSON 非法: {e}")))?;
         let cfg = OpcUaConnConfig::from_json(&v)?;
-        // Phase 1 固定 Fake；若显式 use_native=true 则切 Native（当前 NOT_IMPLEMENTED，交由 Manager 以 Failed 呈现）
         let use_native = v.get("use_native").and_then(|x| x.as_bool()).unwrap_or(false);
         let api: Arc<dyn OpcUaApiTrait> = if use_native {
-            Arc::new(NativeOpcUaApi::new())
+            if let Some(pki) = OpcUaConnConfig::resolve_pki_dir(&v) {
+                Arc::new(NativeOpcUaApi::new_with_pki_dir(pki))
+            } else {
+                Arc::new(NativeOpcUaApi::new())
+            }
         } else {
             Arc::new(FakeOpcUaApi::new())
         };
@@ -94,6 +97,15 @@ impl Default for OpcUaConnConfig {
 }
 
 impl OpcUaConnConfig {
+    /// 提取可选的 pki_dir（优先级：connection_json.pki_dir > 环境变量 > 默认）
+    fn resolve_pki_dir(v: &serde_json::Value) -> Option<std::path::PathBuf> {
+        if let Some(s) = v.get("pki_dir").and_then(|x| x.as_str()) {
+            let t = s.trim();
+            if !t.is_empty() { return Some(std::path::PathBuf::from(t)); }
+        }
+        std::env::var("FORGELINK_OPCUA_PKI_DIR").ok().map(std::path::PathBuf::from)
+    }
+
     fn from_json(v: &serde_json::Value) -> Result<Self, SdkDriverError> {
         // 兼容多种写法：endpoint_url / endpoint / url / host+port
         let endpoint_url = if let Some(s) = v.get("endpoint_url").or_else(|| v.get("endpoint")).or_else(|| v.get("url")).and_then(|x| x.as_str()) {
@@ -378,7 +390,8 @@ impl DriverConnection for OpcUaConnection {
                 TaskKind::Poll { interval_ms } => Duration::from_millis(*interval_ms),
                 TaskKind::Subscribe { publishing_interval_ms, .. } => Duration::from_millis(*publishing_interval_ms),
             };
-            // TODO(Phase3b): Native Subscribe 切真实 DataChange 回调（当前用轮询模拟，保持 Latest-Wins 与 KeepAlive 不产批语义）
+            // NOTE(Phase3b): 当前 Subscribe 用轮询模拟（与 Poll 共快照框架），Next 将切 DataChangeCallback → bounded mpsc → DataSink；
+            // 现阶段已保证 KeepAlive 窗口不递增 seq：空批直接 continue（见下文），与 §12 Latest-Wins 一致。
             handles.push(tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -419,9 +432,17 @@ impl DriverConnection for OpcUaConnection {
                             tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配跳过");
                             continue;
                         }
-                        batch_vals.push(PointValue::good(*pid, coerced));
+                        let ts = now_unix_ns();
+                        batch_vals.push(PointValue {
+                            point_id: *pid,
+                            value: coerced,
+                            quality: Quality::Good,
+                            quality_code: None,
+                            source_timestamp_ns: Some(ts),
+                        });
                     }
                     if batch_vals.is_empty() { continue; }
+                    // KeepAlive 不产批已在上层过滤（空批 continue），此处仅非空批递增 sequence
                     sink.publish(DataBatch {
                         connection_handle: 0,
                         stream_epoch: 0,

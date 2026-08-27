@@ -34,6 +34,9 @@ pub trait OpcUaApi: Send + Sync {
     async fn disconnect(&self) -> Result<(), String> {
         Ok(())
     }
+    // NOTE: 订阅真回调预留（Phase 3b）。当前 Subscribe 仍用轮询模拟以保持与 S7/FOCAS 同快照框架；
+    // 下一步将实现 create_subscription / create_monitored_items(DataChangeCallback → mpsc → DataSink)，
+    // 届时 KeepAlive 自然不触发 DataChangeCallback，无需额外 seq 递增。
 }
 
 // ---------------------------------------------------------------------------
@@ -199,11 +202,35 @@ struct NativeInner {
 
 pub struct NativeOpcUaApi {
     inner: Arc<AsyncMutex<Option<NativeInner>>>,
+    pki_dir: std::path::PathBuf,
 }
 
 impl NativeOpcUaApi {
     pub fn new() -> Self {
-        Self { inner: Arc::new(AsyncMutex::new(None)) }
+        Self::new_with_pki_dir(Self::default_pki_dir())
+    }
+
+    pub fn new_with_pki_dir(p: impl Into<std::path::PathBuf>) -> Self {
+        Self { inner: Arc::new(AsyncMutex::new(None)), pki_dir: p.into() }
+    }
+
+    fn default_pki_dir() -> std::path::PathBuf {
+        std::env::var("FORGELINK_OPCUA_PKI_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("data/certificates/opcua"))
+    }
+
+    fn resolve_pki_dir(&self) -> std::path::PathBuf {
+        // 若 self.pki_dir 为默认占位且环境变量已设置，优先环境变量（便于 forgelinkd 透传）
+        if let Ok(env) = std::env::var("FORGELINK_OPCUA_PKI_DIR") {
+            let env_p = std::path::PathBuf::from(env);
+            // 若实例 pki_dir 非默认（显式传入），保持显式；否则用环境变量
+            let def = std::path::PathBuf::from("data/certificates/opcua");
+            if self.pki_dir == def {
+                return env_p;
+            }
+        }
+        self.pki_dir.clone()
     }
 
     async fn ensure_connected(&self, endpoint_url: &str, timeout_ms: u64) -> Result<Arc<Session>, String> {
@@ -222,10 +249,16 @@ impl NativeOpcUaApi {
 
     async fn connect_inner(&self, endpoint_url: &str, timeout_ms: u64) -> Result<Arc<Session>, String> {
         let timeout = Duration::from_millis(timeout_ms);
+        // pki_dir：优先环境变量 FORGELINK_OPCUA_PKI_DIR（与 Core CertStore 同值），否则 data/certificates/opcua；显式 pki_dir 由上层通过 NativeOpcUaApi::new_with_pki_dir 注入
+        let pki_dir = self.resolve_pki_dir();
         let mut client = ClientBuilder::new()
             .application_name("ForgeLink OPC UA")
             .application_uri("urn:forgelink:opcua")
-            .trust_server_certs(true)
+            .pki_dir(pki_dir)
+            .certificate_path("own/own.der")
+            .private_key_path("own/own.key")
+            .trust_server_certs(false)
+            .verify_server_certs(true)
             .create_sample_keypair(false)
             .session_retry_limit(1)
             .client()

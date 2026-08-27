@@ -56,7 +56,7 @@ impl CertStore {
     }
 
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
-        for sub in &["own", "trusted", "issuers", "rejected"] {
+        for sub in &["own", "trusted", "issuers", "rejected", "private"] {
             let p = self.base.join(sub);
             fs::create_dir_all(&p)?;
         }
@@ -218,13 +218,17 @@ impl CertStore {
         Ok(false)
     }
 
-    /// 生成自签名 own 证书（若已存在则跳过）
+    /// 生成自签名 own 证书（若已存在则跳过），同时兼容 async-opcua 的 pki 布局
     pub fn ensure_own_cert(&self) -> Result<bool, String> {
         self.ensure_dirs().map_err(|e| e.to_string())?;
         let own_dir = self.store_path("own");
         let cert_path = own_dir.join("own.der");
         let key_path = own_dir.join("own.key");
-        if cert_path.exists() && key_path.exists() {
+        // 兼容 async-opcua 期望的路径：pki/own/cert.der + pki/private/private.pem
+        let alt_cert_path = own_dir.join("cert.der");
+        let private_dir = self.base.join("private");
+        let alt_key_path = private_dir.join("private.pem");
+        if cert_path.exists() && key_path.exists() && alt_cert_path.exists() && alt_key_path.exists() {
             return Ok(false);
         }
         // 使用 rcgen 生成（0.13 API）
@@ -233,8 +237,12 @@ impl CertStore {
         let key_pem = certified.key_pair.serialize_pem();
         let der = certified.cert.der().to_vec();
         fs::write(&cert_path, &der).map_err(|e| e.to_string())?;
-        fs::write(own_dir.join("own.pem"), pem).map_err(|e| e.to_string())?;
-        fs::write(&key_path, key_pem).map_err(|e| e.to_string())?;
+        fs::write(own_dir.join("own.pem"), pem.clone()).map_err(|e| e.to_string())?;
+        fs::write(&key_path, &key_pem).map_err(|e| e.to_string())?;
+        // 双写兼容路径
+        fs::write(&alt_cert_path, &der).map_err(|e| e.to_string())?;
+        let _ = fs::create_dir_all(&private_dir);
+        fs::write(&alt_key_path, &key_pem).map_err(|e| e.to_string())?;
         // 限制私钥权限（Unix）
         #[cfg(unix)]
         {

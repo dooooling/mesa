@@ -72,6 +72,14 @@ async fn main() {
     }
 
     // ---- REST 服务 ----
+    // 注入 OPC UA pki_dir 环境（优先级：已有 env > 默认），供 Native 驱动子进程继承
+    if std::env::var("FORGELINK_OPCUA_PKI_DIR").is_err() {
+        let pki = forgelink_core_api::certificates::CertStore::default_path();
+        // SAFETY: 早期启动，单线程
+        unsafe { std::env::set_var("FORGELINK_OPCUA_PKI_DIR", &pki); }
+        tracing::info!(pki=%pki.display(), "set FORGELINK_OPCUA_PKI_DIR");
+    }
+
     let app_state = forgelink_core_api::AppState::new(manager.clone(), store.clone(), args.drivers_dir.clone());
     let api_shutdown = manager.shutdown_token().child_token();
     let api = tokio::spawn(forgelink_core_api::serve(app_state, args.http_port, api_shutdown));
