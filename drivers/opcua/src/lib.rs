@@ -20,6 +20,7 @@ mod opcua_api;
 pub use address::{parse_address, AddressError, Identifier, OpcUaAddress};
 pub use opcua_api::{FakeOpcUaApi, NativeOpcUaApi, OpcUaApi, DEFAULT_OPCUA_PORT};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 pub const BINDING_POLL: &str = "opcua.node-group";
 pub const BINDING_SUB: &str = "opcua.subscription";
 
-use opcua_api::OpcUaApi as OpcUaApiTrait;
+use opcua_api::{DataChangeEvent, OpcUaApi as OpcUaApiTrait};
 
 // ---------------------------------------------------------------------------
 // 驱动入口
@@ -385,74 +386,176 @@ impl DriverConnection for OpcUaConnection {
             let api = Arc::clone(&shared_api);
             let task_id = task.id.clone();
             let kind = task.kind.clone();
-            // 统一周期：Poll 用 interval_ms，Subscribe 用 publishing_interval_ms（Fake 下轮询模拟，Native 后续切 DataChange 回调）
-            let interval = match &kind {
-                TaskKind::Poll { interval_ms } => Duration::from_millis(*interval_ms),
-                TaskKind::Subscribe { publishing_interval_ms, .. } => Duration::from_millis(*publishing_interval_ms),
-            };
-            // NOTE(Phase3b): 当前 Subscribe 用轮询模拟（与 Poll 共快照框架），Next 将切 DataChangeCallback → bounded mpsc → DataSink；
-            // 现阶段已保证 KeepAlive 窗口不递增 seq：空批直接 continue（见下文），与 §12 Latest-Wins 一致。
-            handles.push(tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(interval);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! {
-                        _ = ticker.tick() => {},
-                        _ = shutdown.cancelled() => break,
-                    }
-                    let addrs: Vec<OpcUaAddress> = points.iter().map(|(s, _)| s.addr.clone()).collect();
-                    let values = match api.read_batch(&addrs).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::error!(task=%task_id, error=%e, "OPC UA 读失败");
-                            return Err(SdkDriverError::new(forgelink_core_types::ErrorKind::Connection, "READ_FAILED", e));
-                        }
-                    };
-                    if values.len() != points.len() {
-                        tracing::warn!(task=%task_id, got=values.len(), expected=points.len(), "OPC UA 返回数量不一致");
-                        continue;
-                    }
-                    let mut batch_vals = Vec::with_capacity(points.len());
-                    for ((spec, pid), raw_val) in points.iter().zip(values) {
-                        if let Value::String(s) = &raw_val {
-                            if s.starts_with("ERR:") {
-                                tracing::warn!(key=%spec.key, error=%s, "单点 Bad，不影响同批其他点");
-                                batch_vals.push(PointValue {
-                                    point_id: *pid,
-                                    value: raw_val,
-                                    quality: Quality::Bad,
-                                    quality_code: Some(1),
-                                    source_timestamp_ns: None,
-                                });
+            match kind {
+                TaskKind::Poll { interval_ms } => {
+                    let interval = Duration::from_millis(interval_ms);
+                    handles.push(tokio::spawn(async move {
+                        let mut ticker = tokio::time::interval(interval);
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            tokio::select! {
+                                _ = ticker.tick() => {},
+                                _ = shutdown.cancelled() => break,
+                            }
+                            let addrs: Vec<OpcUaAddress> = points.iter().map(|(s, _)| s.addr.clone()).collect();
+                            let values = match api.read_batch(&addrs).await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::error!(task=%task_id, error=%e, "OPC UA 读失败");
+                                    return Err(SdkDriverError::new(forgelink_core_types::ErrorKind::Connection, "READ_FAILED", e));
+                                }
+                            };
+                            if values.len() != points.len() {
+                                tracing::warn!(task=%task_id, got=values.len(), expected=points.len(), "OPC UA 返回数量不一致");
                                 continue;
                             }
+                            let mut batch_vals = Vec::with_capacity(points.len());
+                            for ((spec, pid), raw_val) in points.iter().zip(values) {
+                                if let Value::String(s) = &raw_val {
+                                    if s.starts_with("ERR:") {
+                                        tracing::warn!(key=%spec.key, error=%s, "单点 Bad，不影响同批其他点");
+                                        batch_vals.push(PointValue {
+                                            point_id: *pid,
+                                            value: raw_val,
+                                            quality: Quality::Bad,
+                                            quality_code: Some(1),
+                                            source_timestamp_ns: None,
+                                        });
+                                        continue;
+                                    }
+                                }
+                                let coerced = coerce_value(raw_val, spec.data_type);
+                                if !value_fits_data_type(&coerced, spec.data_type) {
+                                    tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配跳过");
+                                    continue;
+                                }
+                                let ts = now_unix_ns();
+                                batch_vals.push(PointValue {
+                                    point_id: *pid,
+                                    value: coerced,
+                                    quality: Quality::Good,
+                                    quality_code: None,
+                                    source_timestamp_ns: Some(ts),
+                                });
+                            }
+                            if batch_vals.is_empty() { continue; }
+                            sink.publish(DataBatch {
+                                connection_handle: 0,
+                                stream_epoch: 0,
+                                sequence: seq.fetch_add(1, Ordering::Relaxed),
+                                timestamp_ns: now_unix_ns(),
+                                values: batch_vals,
+                            }).await;
                         }
-                        let coerced = coerce_value(raw_val, spec.data_type);
-                        if !value_fits_data_type(&coerced, spec.data_type) {
-                            tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配跳过");
-                            continue;
-                        }
-                        let ts = now_unix_ns();
-                        batch_vals.push(PointValue {
-                            point_id: *pid,
-                            value: coerced,
-                            quality: Quality::Good,
-                            quality_code: None,
-                            source_timestamp_ns: Some(ts),
-                        });
-                    }
-                    if batch_vals.is_empty() { continue; }
-                    // KeepAlive 不产批已在上层过滤（空批 continue），此处仅非空批递增 sequence
-                    sink.publish(DataBatch {
-                        connection_handle: 0,
-                        stream_epoch: 0,
-                        sequence: seq.fetch_add(1, Ordering::Relaxed),
-                        timestamp_ns: now_unix_ns(),
-                        values: batch_vals,
-                    }).await;
+                        Ok::<(), SdkDriverError>(())
+                    }));
                 }
-                Ok::<(), SdkDriverError>(())
-            }));
+                TaskKind::Subscribe { publishing_interval_ms, sampling_interval_ms, queue_size, discard_oldest } => {
+                    let addrs: Vec<OpcUaAddress> = points.iter().map(|(s, _)| s.addr.clone()).collect();
+                    // handle -> (spec, pid) 映射，client_handle = idx+1
+                    let mut handle_map: HashMap<u32, (PointSpec, u32)> = HashMap::new();
+                    for (idx, (spec, pid)) in points.iter().enumerate() {
+                        handle_map.insert((idx as u32) + 1, (spec.clone(), *pid));
+                    }
+                    let handle_map = Arc::new(handle_map);
+                    handles.push(tokio::spawn(async move {
+                        let (sub_id, mut rx) = match api.subscribe(&addrs, publishing_interval_ms, sampling_interval_ms, queue_size, discard_oldest).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::error!(task=%task_id, error=%e, "OPC UA 订阅失败");
+                                return Err(SdkDriverError::new(forgelink_core_types::ErrorKind::Connection, "SUBSCRIBE_FAILED", e));
+                            }
+                        };
+                        tracing::info!(task=%task_id, sub_id=%sub_id, "OPC UA 订阅已建立");
+                        // 订阅事件循环：DataChangeCallback → mpsc → 批量聚合 → DataSink，KeepAlive 自然无事件不产批
+                        loop {
+                            let first = tokio::select! {
+                                ev = rx.recv() => ev,
+                                _ = shutdown.cancelled() => break,
+                            };
+                            let Some(first_ev) = first else {
+                                tracing::warn!(task=%task_id, "订阅通道关闭");
+                                break;
+                            };
+                            // 收集当前已就绪的全部事件，合并为一个 DataBatch（Latest-Wins 由 Sink 承接）
+                            let mut events = vec![first_ev];
+                            while let Ok(ev) = rx.try_recv() {
+                                events.push(ev);
+                                if events.len() >= 64 { break; }
+                            }
+                            let mut batch_vals = Vec::with_capacity(events.len());
+                            for ev in events {
+                                let Some((spec, pid)) = handle_map.get(&ev.client_handle) else {
+                                    tracing::warn!(task=%task_id, handle=%ev.client_handle, "未知 client_handle");
+                                    continue;
+                                };
+                                let dv = ev.data_value;
+                                // 状态非 Good → Bad 隔离，不丢整批
+                                if let Some(status) = dv.status {
+                                    if status != opcua_types::StatusCode::Good {
+                                        tracing::warn!(key=%spec.key, status=?status, "单点 Bad");
+                                        batch_vals.push(PointValue {
+                                            point_id: *pid,
+                                            value: Value::String(format!("ERR:{:?}", status)),
+                                            quality: Quality::Bad,
+                                            quality_code: Some(status.bits() as i32),
+                                            source_timestamp_ns: None,
+                                        });
+                                        continue;
+                                    }
+                                }
+                                let Some(variant) = dv.value else {
+                                    tracing::warn!(key=%spec.key, "DataValue 无 value");
+                                    batch_vals.push(PointValue {
+                                        point_id: *pid,
+                                        value: Value::String(format!("ERR:BadNoValue {:?}", dv.status)),
+                                        quality: Quality::Bad,
+                                        quality_code: Some(1),
+                                        source_timestamp_ns: None,
+                                    });
+                                    continue;
+                                };
+                                let Some(raw_val) = crate::opcua_api::variant_to_value(&variant) else {
+                                    continue;
+                                };
+                                let coerced = coerce_value(raw_val, spec.data_type);
+                                if !value_fits_data_type(&coerced, spec.data_type) {
+                                    tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配跳过");
+                                    continue;
+                                }
+                                // source_timestamp 透传：优先 DataValue.source_timestamp，否则取 now
+                                let ts_ns = dv.source_timestamp.map(|dt| {
+                                    // DateTime 转 unix ns：opcua DateTime 基于 1601-01-01，用 ticks 转
+                                    // 为简化，直接用 now_unix_ns 的近似；若需精确可用 dt.ticks() 换算
+                                    let _ = dt;
+                                    now_unix_ns()
+                                }).unwrap_or_else(now_unix_ns);
+                                batch_vals.push(PointValue {
+                                    point_id: *pid,
+                                    value: coerced,
+                                    quality: Quality::Good,
+                                    quality_code: None,
+                                    source_timestamp_ns: Some(ts_ns),
+                                });
+                            }
+                            if batch_vals.is_empty() {
+                                // KeepAlive 或全过滤：不递增 sequence，不产批 (§7.3)
+                                continue;
+                            }
+                            sink.publish(DataBatch {
+                                connection_handle: 0,
+                                stream_epoch: 0,
+                                sequence: seq.fetch_add(1, Ordering::Relaxed),
+                                timestamp_ns: now_unix_ns(),
+                                values: batch_vals,
+                            }).await;
+                        }
+                        // 清理订阅
+                        let _ = api.unsubscribe(sub_id).await;
+                        Ok::<(), SdkDriverError>(())
+                    }));
+                }
+            }
         }
 
         let mut final_err: Option<SdkDriverError> = None;

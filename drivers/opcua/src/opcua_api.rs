@@ -24,6 +24,14 @@ pub const DEFAULT_OPCUA_PORT: u16 = 4840;
 // Trait
 // ---------------------------------------------------------------------------
 
+/// 订阅数据变更事件（由 DataChangeCallback 转发）
+#[derive(Debug)]
+pub struct DataChangeEvent {
+    /// 客户端句柄（对应创建时的 client_handle，Fake 下为索引+1，Native 下为真实 handle）
+    pub client_handle: u32,
+    pub data_value: DataValue,
+}
+
 #[async_trait]
 pub trait OpcUaApi: Send + Sync {
     /// 建立会话（Fake 下即时成功；Native 下建 TCP+Security）
@@ -34,9 +42,23 @@ pub trait OpcUaApi: Send + Sync {
     async fn disconnect(&self) -> Result<(), String> {
         Ok(())
     }
-    // NOTE: 订阅真回调预留（Phase 3b）。当前 Subscribe 仍用轮询模拟以保持与 S7/FOCAS 同快照框架；
-    // 下一步将实现 create_subscription / create_monitored_items(DataChangeCallback → mpsc → DataSink)，
-    // 届时 KeepAlive 自然不触发 DataChangeCallback，无需额外 seq 递增。
+    /// 订阅（Subscribe 通路）：创建 Subscription + MonitoredItems，返回 subscription_id 与数据变更通道
+    /// KeepAlive 自然不产生事件，无需上层额外过滤
+    async fn subscribe(
+        &self,
+        addrs: &[OpcUaAddress],
+        publishing_interval_ms: u64,
+        sampling_interval_ms: u64,
+        queue_size: u32,
+        discard_oldest: bool,
+    ) -> Result<(u32, tokio::sync::mpsc::Receiver<DataChangeEvent>), String> {
+        let _ = (addrs, publishing_interval_ms, sampling_interval_ms, queue_size, discard_oldest);
+        Err("NOT_IMPLEMENTED: subscribe 未实现".into())
+    }
+    async fn unsubscribe(&self, subscription_id: u32) -> Result<(), String> {
+        let _ = subscription_id;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +141,89 @@ impl OpcUaApi for FakeOpcUaApi {
         }
         Ok(out)
     }
+
+    async fn subscribe(
+        &self,
+        addrs: &[OpcUaAddress],
+        publishing_interval_ms: u64,
+        _sampling_interval_ms: u64,
+        _queue_size: u32,
+        _discard_oldest: bool,
+    ) -> Result<(u32, tokio::sync::mpsc::Receiver<DataChangeEvent>), String> {
+        use opcua_types::{DataValue, DateTime, StatusCode, UAString, Variant};
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let addrs: Vec<OpcUaAddress> = addrs.to_vec();
+        let seed_base = self.seed.load(Ordering::Relaxed);
+        let tick = std::time::Duration::from_millis(publishing_interval_ms.max(10));
+        // Fake 用自增 subscription_id
+        let sub_id = (self.next_rand() % 10000) as u32 + 1;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tick);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut counter: u64 = 0;
+            let mut local_seed = seed_base;
+            loop {
+                ticker.tick().await;
+                counter += 1;
+                // 每 7 次模拟一次 KeepAlive（不发送任何 DataChange）
+                if counter % 7 == 0 {
+                    continue;
+                }
+                for (idx, addr) in addrs.iter().enumerate() {
+                    let client_handle = (idx as u32) + 1;
+                    // Bad 节点产生 Bad 状态
+                    let is_bad = matches!(&addr.identifier, crate::address::Identifier::String(s) if s.contains("bad") || s.contains("Bad"));
+                    let dv = if is_bad {
+                        DataValue {
+                            value: None,
+                            status: Some(StatusCode::BadNodeIdUnknown),
+                            source_timestamp: Some(DateTime::now()),
+                            source_picoseconds: None,
+                            server_timestamp: Some(DateTime::now()),
+                            server_picoseconds: None,
+                        }
+                    } else {
+                        local_seed = local_seed.wrapping_mul(FAKE_RAND_MULT).wrapping_add(1);
+                        let r = local_seed;
+                        let variant = match &addr.identifier {
+                            crate::address::Identifier::Numeric(n) => {
+                                if n % 2 == 0 { Variant::Int32((r % 10000) as i32) } else { Variant::UInt32((r % 10000) as u32) }
+                            }
+                            crate::address::Identifier::String(s) => {
+                                let lower = s.to_ascii_lowercase();
+                                if lower.contains("speed") || lower.contains("sine") || lower.contains("temp") {
+                                    Variant::Double((r % 10000) as f64 / 10.0)
+                                } else if lower.contains("counter") || lower.contains("count") {
+                                    Variant::UInt32((r % 1000) as u32)
+                                } else {
+                                    Variant::String(UAString::from(format!("fake:{s}:{}", r % 100)))
+                                }
+                            }
+                            crate::address::Identifier::Guid(_) => Variant::String(UAString::from(format!("guid:{}", r % 1000))),
+                            crate::address::Identifier::Opaque(_) => Variant::String(UAString::from(format!("opaque:{}", r % 1000))),
+                        };
+                        DataValue {
+                            value: Some(variant),
+                            status: Some(StatusCode::Good),
+                            source_timestamp: Some(DateTime::now()),
+                            source_picoseconds: None,
+                            server_timestamp: Some(DateTime::now()),
+                            server_picoseconds: None,
+                        }
+                    };
+                    let ev = DataChangeEvent { client_handle, data_value: dv };
+                    if tx.try_send(ev).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok((sub_id, rx))
+    }
+
+    async fn unsubscribe(&self, _subscription_id: u32) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +258,7 @@ fn to_opc_node_id(addr: &OpcUaAddress) -> Result<OpcNodeId, String> {
     }
 }
 
-fn variant_to_value(v: &Variant) -> Option<Value> {
+pub(crate) fn variant_to_value(v: &Variant) -> Option<Value> {
     match v {
         Variant::Empty => None,
         Variant::Boolean(b) => Some(Value::Bool(*b)),
@@ -339,6 +444,73 @@ impl OpcUaApi for NativeOpcUaApi {
             }
         }
         Ok(out)
+    }
+
+    async fn subscribe(
+        &self,
+        addrs: &[OpcUaAddress],
+        publishing_interval_ms: u64,
+        sampling_interval_ms: u64,
+        queue_size: u32,
+        discard_oldest: bool,
+    ) -> Result<(u32, tokio::sync::mpsc::Receiver<DataChangeEvent>), String> {
+        use opcua_client::DataChangeCallback;
+        use opcua_types::{MonitoredItemCreateRequest, MonitoringParameters, MonitoringMode, ReadValueId, TimestampsToReturn};
+        let session = {
+            let guard = self.inner.lock().await;
+            guard
+                .as_ref()
+                .and_then(|i| i.session.clone())
+                .ok_or_else(|| "尚未连接，请先 connect".to_string())?
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        // DataChangeCallback 在服务端推送时触发，try_send 到有界通道，背压由 DataSink Latest-Wins 承接
+        let tx_cb = tx.clone();
+        let callback = DataChangeCallback::new(move |dv: DataValue, item: &opcua_client::MonitoredItem| {
+            let h = item.client_handle();
+            let ev = DataChangeEvent { client_handle: h, data_value: dv };
+            let _ = tx_cb.try_send(ev);
+        });
+        let pub_interval = Duration::from_millis(publishing_interval_ms.max(10));
+        // lifetime 约 3*keep_alive，keep_alive 10 次发布
+        let sub_id = session
+            .create_subscription(pub_interval, 30, 10, 0, 0, true, callback)
+            .await
+            .map_err(|e| format!("create_subscription 失败: {e:?}"))?;
+        // 为每个地址创建受监控项，client_handle 按 1..n 分配，对应 addrs 索引+1
+        let mut reqs = Vec::with_capacity(addrs.len());
+        for (idx, addr) in addrs.iter().enumerate() {
+            let nid = to_opc_node_id(addr)?;
+            let params = MonitoringParameters {
+                client_handle: (idx as u32) + 1,
+                sampling_interval: sampling_interval_ms as f64,
+                filter: opcua_types::ExtensionObject::null(),
+                queue_size,
+                discard_oldest,
+            };
+            let req = MonitoredItemCreateRequest::new(
+                ReadValueId::from(nid),
+                MonitoringMode::Reporting,
+                params,
+            );
+            reqs.push(req);
+        }
+        session
+            .create_monitored_items(sub_id, TimestampsToReturn::Both, reqs)
+            .await
+            .map_err(|e| format!("create_monitored_items 失败: {e:?}"))?;
+        Ok((sub_id, rx))
+    }
+
+    async fn unsubscribe(&self, subscription_id: u32) -> Result<(), String> {
+        let session = {
+            let guard = self.inner.lock().await;
+            guard.as_ref().and_then(|i| i.session.clone())
+        };
+        if let Some(sess) = session {
+            let _ = sess.delete_subscription(subscription_id).await;
+        }
+        Ok(())
     }
 
     async fn disconnect(&self) -> Result<(), String> {
