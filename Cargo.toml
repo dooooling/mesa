@@ -13,6 +13,7 @@ members = [
     "drivers/focas2",
     "drivers/opcua",
     "tests/driver-contract",
+    "tests/performance",
 ]
 
 [workspace.package]
