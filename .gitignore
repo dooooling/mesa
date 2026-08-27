@@ -14,3 +14,7 @@ forgelink*.db-wal
 forgelink*.db-shm
 *.db-wal
 *.db-shm
+
+# OPC UA 证书（本地生成）
+/data/
+/certificates/
