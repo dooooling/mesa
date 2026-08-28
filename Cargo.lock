@@ -743,6 +743,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "forgelink-performance-tests"
+version = "0.1.0"
+dependencies = [
+ "forgelink-config-store",
+ "forgelink-core-api",
+ "forgelink-core-types",
+ "forgelink-driver-manager",
+ "forgelink-driver-sdk",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "forgelinkd"
 version = "0.1.0"
 dependencies = [

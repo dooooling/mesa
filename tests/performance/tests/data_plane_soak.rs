@@ -12,8 +12,9 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn data_plane_50k_10s_ci() {
-    let long = std::env::args().any(|a| a == "--long");
-    let dur = if long { Duration::from_secs(600) } else { Duration::from_secs(10) };
+    let long_3000 = std::env::var("PERF_3000").is_ok();
+    let long = std::env::var("PERF_LONG").is_ok() || std::env::args().any(|a| a == "--long");
+    let dur = if long_3000 { Duration::from_secs(3000) } else if long { Duration::from_secs(600) } else { Duration::from_secs(10) };
     // 使用内存库 + Simulator 4 Tasks *5 points=20/batch burst 125 20ms => 125k/s 远超 50k
     let store = Arc::new(ConfigStore::open(std::path::Path::new(":memory:")).unwrap());
     let source = Arc::new(StorePointIdSource::new(store.clone()));
