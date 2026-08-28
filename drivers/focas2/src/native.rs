@@ -454,8 +454,6 @@ impl NativeLib {
         const EMBEDDED: &[(&str, &[u8])] = &[
             ("libfwlib32-linux-x64.so.1.0.5", include_bytes!("../libs/linux/libfwlib32-linux-x64.so.1.0.5")),
             ("libfwlib32-linux-armv7.so.1.0.5", include_bytes!("../libs/linux/libfwlib32-linux-armv7.so.1.0.5")),
-            ("libfwlib32-linux-x86.so.1.0.5", include_bytes!("../libs/linux/libfwlib32-linux-x86.so.1.0.5")),
-            ("libfwlib32-linux-x86.so.1.0.0", include_bytes!("../libs/linux/libfwlib32-linux-x86.so.1.0.0")),
         ];
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         const EMBEDDED: &[(&str, &[u8])] = &[];

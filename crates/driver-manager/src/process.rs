@@ -137,6 +137,7 @@ mod job {
     use std::sync::OnceLock;
 
     /// Core 进程级唯一 Job Object：Core 终止后 OS 自动清理全部成员进程。
+    #[cfg(windows)]
     static CORE_JOB: OnceLock<Result<JobHandle, u32>> = OnceLock::new();
 
     /// 表示"该子进程已被纳入 Core Job"。非 Windows 平台为空实现。
@@ -232,7 +233,7 @@ mod job {
     }
 
     #[cfg(not(windows))]
-    fn create_core_job() -> Result<JobHandle, u32> {
+    fn create_core_job() -> Result<(), u32> {
         unreachable!("non-windows has no core job")
     }
 }
