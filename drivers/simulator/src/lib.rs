@@ -3,7 +3,7 @@
 //! 定位：Driver Framework 的参考实现与 Contract/Performance Test 基线，
 //! 不属于正式设备协议范围。行为配置属于测试配置，不进入生产 DeviceProfile。
 //!
-//! M0 实现的数据源（附录 A.1 子集）：Constant / Counter / Sine / Toggle / Random。
+//! 已实现数据源（附录 A.1 子集）：Constant / Counter / Sine / Toggle / Random。
 //! binding 形如：
 //!
 //! ```json
@@ -656,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn conn_faults_parse_and_default_config_ok() {
-        // 无 faults 字段的空配置照常工作（M0 兼容）
+        // 无 faults 字段的空配置照常工作（兼容空配置）
         let conn = SimulatorDriver.open_connection("e", "{}").await.unwrap();
         let _ = conn;
 

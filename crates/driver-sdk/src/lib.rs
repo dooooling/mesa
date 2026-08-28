@@ -25,13 +25,13 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// 出站队列容量。M0 取保守值；性能预算阶段（§22）按 50K updates/s 压测结果调整。
+/// 出站队列容量。当前取保守值 256；性能预算阶段（§22）按 50K updates/s 压测结果调整。
 const OUTBOUND_CAPACITY: usize = 256;
 
 /// 握手阶段读超时。超时视为对端异常，直接断开。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Stop 时等待采集循环收尾的宽限。M0 阶段采集循环只做 tick 级清理，50ms 足够；
+/// Stop 时等待采集循环收尾的宽限。当前采集循环仅做 tick 级清理，50ms 足够；
 /// 真实协议驱动若需关闭 socket/session，应在其 run() 内响应取消并自行限时。
 const RUN_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
@@ -452,7 +452,7 @@ pub async fn serve_with_faults<D: Driver>(
             driver_version: meta.version.clone(),
             protocol_major: PROTOCOL_MAJOR,
             protocol_minor: PROTOCOL_MINOR,
-            // NOTE: sdk_version 与 core_version 共用 workspace 版本，M0 足够定位
+            // NOTE: sdk_version 与 core_version 共用 workspace 版本，当前足以定位；TODO: 后续区分 SDK/Core 版本追踪
             sdk_version: format!("rust-sdk v{}", env!("CARGO_PKG_VERSION")),
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             instance_id,

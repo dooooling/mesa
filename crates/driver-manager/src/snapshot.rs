@@ -1,7 +1,6 @@
 //! Core 进程内共享状态：驱动清单、Endpoint 状态与最新值缓存。
 //!
-//! M0 阶段全部驻留内存；SQLite 持久化（ConfigStore）在 Phase 1 引入，
-//! 届时 LatestValueCache 仍保持内存形态——热路径不落盘。
+//! 全部驻留内存，不落盘——热路径最新值仅内存可达，持久化由 ConfigStore 负责。
 
 use std::collections::HashMap;
 use std::sync::Mutex;

@@ -2,7 +2,7 @@
 //!
 //! V1 只读，为便于 CI 与真机对比，采用 `trait OpcUaApi + Fake/Native` 分层：
 //! - `FakeOpcUaApi`：纯内存、确定性随机，不依赖任何 Server，覆盖 Poll/Subscribe 语义与故障注入
-//! - `NativeOpcUaApi`：Phase 2 接 `opcua` crate 直连真实 Server（预留，未实现时返回 NOT_IMPLEMENTED）
+//! - `NativeOpcUaApi`：基于 `async-opcua` 直连真实 Server
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -227,7 +227,7 @@ impl OpcUaApi for FakeOpcUaApi {
 }
 
 // ---------------------------------------------------------------------------
-// Native 实现（async-opcua 0.19 Client，Phase 2 真连）
+// Native 实现（async-opcua 0.19 Client 直连）
 // ---------------------------------------------------------------------------
 
 use std::sync::Arc;

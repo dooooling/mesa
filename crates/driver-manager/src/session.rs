@@ -3,8 +3,8 @@
 //! 职责：完成 Hello 校验与 Welcome 应答（§14.3）、请求/响应按 msg_id 多路分发、
 //! 数据面事件上行、心跳判死（§14.4）。
 //!
-//! NOTE(M0)：同一会话上除心跳外均为顺序请求——Runtime 的配置流程严格串行，
-//! 并发请求复用同一 pending 表在语义上也正确，但 M0 未做并发压测。
+//! NOTE：同一会话上除心跳外均为顺序请求——Runtime 的配置流程严格串行，
+//! 并发请求复用同一 pending 表在语义上也正确，当前未做并发压测。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,7 +20,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-/// 单次请求的响应超时。M0 驱动均为内存操作；真实协议驱动若接近该阈值，
+/// 单次请求的响应超时。当前驱动均为内存操作；真实协议驱动若接近该阈值，
 /// 应拆分流程而非调大超时。
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 

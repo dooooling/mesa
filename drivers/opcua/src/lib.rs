@@ -7,11 +7,11 @@
 //!       { "key": "sine",    "node_id": "ns=2;i=2",        "data_type": "DOUBLE" }
 //!   ]}
 //!   ```
-//! - Subscribe 绑定：`opcua.subscription`（Phase 3 实现，当前仅校验拒绝）
-//!   ```json
-//!   { "publishing_interval_ms": 500, "sampling_interval_ms": 250, "queue_size": 10,
-//!     "discard_oldest": true, "nodes": [ {"key":"k","node_id":"ns=2;i=2"} ] }
-//!   ```
+//! - Subscribe 绑定：`opcua.subscription`（需校验 publishing/sampling/queue，详见 §7.3）
+ //!   ```json
+ //!   { "publishing_interval_ms": 500, "sampling_interval_ms": 250, "queue_size": 10,
+ //!     "discard_oldest": true, "nodes": [ {"key":"k","node_id":"ns=2;i=2"} ] }
+ //!   ```
 //! - NodeId 解析见 `address::parse_address`；Core 不触及此文件（硬约束）。
 
 mod address;
@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 pub const BINDING_POLL: &str = "opcua.node-group";
 pub const BINDING_SUB: &str = "opcua.subscription";
 
-use opcua_api::{DataChangeEvent, OpcUaApi as OpcUaApiTrait};
+use opcua_api::OpcUaApi as OpcUaApiTrait;
 
 // ---------------------------------------------------------------------------
 // 驱动入口

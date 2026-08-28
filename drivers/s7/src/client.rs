@@ -377,7 +377,8 @@ fn parse_read_resp(resp: &[u8], sent_items: &[ReadItem]) -> Result<Vec<Vec<u8>>,
         }
         out.push(bytes);
         off += take;
-        // S7 对奇数长度填充对齐到偶数
+        // S7 协议字对齐：奇数长度 payload 后补 1 字节 0x00，解析时需跳过否则下一 item 头 0xFF 错位；
+        // 为什么用启发式：实测 DB 20 字节偶数不触发、1 字节触发，需兼顾 BIT(1字节)与 BYTE 混批场景
         if take % 2 == 1 && off < data.len() {
             // 填充字节为 0，若下一个 item 头部恰为 0xFF 则不是填充
             // 仅当剩余字节足够且下一字节不是 0xFF 才跳过

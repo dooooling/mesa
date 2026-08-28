@@ -60,7 +60,7 @@ impl Driver for FocasDriver {
         let v: serde_json::Value = serde_json::from_str(config_json)
             .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", format!("connection JSON 非法: {e}")))?;
         let cfg = FocasConnConfig::from_json(&v)?;
-        // Phase A 固定使用 Fake（多协议验证）；若 config 显式指定 use_native=true 则尝试 Native（当前会 Failed）
+        // NOTE: 当前固定 Fake 以验证多协议骨架；TODO: 真机 Gate 闭环后由配置开关 use_native=true 切 Native
         let use_native = v.get("use_native").and_then(|x| x.as_bool()).unwrap_or(false);
         let api: Arc<dyn FocasApiTrait> = if use_native {
             Arc::new(NativeFocasApi::new())
@@ -259,7 +259,7 @@ impl DriverConnection for FocasConnection {
         let map = snap.map.as_ref().ok_or_else(|| SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "NO_POINT_MAP", "run 前未 apply_point_map"))?;
 
         // 连接（Fake 下即时成功；Native 下可能失败并由 Manager 退避重连）
-        // Phase A Fake 为纯异步，直接 await；Native 阶段再切 spawn_blocking（Fwlib 阻塞）
+        // NOTE: 当前 Fake 为纯异步直接 await；TODO: Native 切 spawn_blocking 隔离 Fwlib 阻塞
         let connect_result = self.api.connect(&self.cfg.host, self.cfg.port, self.cfg.timeout_ms).await;
         if let Err(e) = connect_result {
             let msg = e.to_string();

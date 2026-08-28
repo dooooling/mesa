@@ -1,7 +1,7 @@
 //! ForgeLink REST API（方案 §4.1）。
 //!
 //! 安全边界（§4.2）：仅绑定 loopback，不提供任何远程管理能力。
-//! Phase B 补齐：Device/Endpoint/Task CRUD + 启停 + rescan + diagnostics（§4.1 最小集）。
+//! Device/Endpoint/Task CRUD + 启停 + rescan + diagnostics 已实现（§4.1 最小集）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -89,7 +89,7 @@ fn store_err_to_response(e: StoreError) -> (StatusCode, Json<serde_json::Value>)
 }
 
 // ---------------------------------------------------------------------------
-// 只读查询（沿用 M0）
+// 只读查询：驱动/端点/点位 基础查询
 // ---------------------------------------------------------------------------
 
 async fn list_drivers(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {

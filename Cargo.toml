@@ -47,4 +47,4 @@ toml = "0.8"
 getrandom = "0.2"
 
 [profile.release]
-# M0 保持默认优化即可，性能调优留到 Phase 8
+# NOTE: 当前保持默认优化；TODO: Phase 8 按 §22 50K/s 压测调优

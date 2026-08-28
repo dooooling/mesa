@@ -1,6 +1,6 @@
 //! forgelinkd：ForgeLink Core 的唯一运行入口（方案 §25）。
 //!
-//! Phase B：SQLite 配置持久化 + REST CRUD + 开机恢复。`sim-001` 仅在空库时作为演示种子写入库，
+//! SQLite 配置持久化 + REST CRUD + 开机恢复（配置真值只在 Core）。`sim-001` 仅在空库时作为演示种子
 //! 后续以库为准（配置真值只在 Core）。
 
 use std::sync::Arc;
@@ -75,7 +75,7 @@ async fn main() {
     // 注入 OPC UA pki_dir 环境（优先级：已有 env > 默认），供 Native 驱动子进程继承
     if std::env::var("FORGELINK_OPCUA_PKI_DIR").is_err() {
         let pki = forgelink_core_api::certificates::CertStore::default_path();
-        // SAFETY: 早期启动，单线程
+        // 安全性：早期启动单线程，环境变量写入无数据竞争
         unsafe { std::env::set_var("FORGELINK_OPCUA_PKI_DIR", &pki); }
         tracing::info!(pki=%pki.display(), "set FORGELINK_OPCUA_PKI_DIR");
     }
@@ -135,7 +135,7 @@ fn parse_args() -> Args {
 
 fn print_banner(http_port: u16, db_path: &str) {
     eprintln!();
-    eprintln!("  ForgeLink Core (Phase B) is running");
+    eprintln!("  ForgeLink Core is running");
     eprintln!("  REST  : http://127.0.0.1:{http_port}/api/v1/drivers");
     eprintln!("          http://127.0.0.1:{http_port}/api/v1/endpoints");
     eprintln!("          http://127.0.0.1:{http_port}/api/v1/points/latest");

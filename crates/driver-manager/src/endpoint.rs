@@ -1,6 +1,6 @@
 //! Endpoint 运行时（Core 侧）：配置闭环 + 数据消费 + 故障处置。
 //!
-//! 完整实现方案 §6.2 配置流程与 §11.1 重连语义的 M0 子集：
+//! 完整实现方案 §6.2 配置流程与 §11.1 重连语义：
 //! `spawn -> handshake -> Open -> Configure -> PointDescriptors -> ApplyPointMap
 //!   -> Start(new epoch) -> 事件循环`；
 //! 断连/无响应时按退避序列自动重建；配置类错误直接 FAILED 不自动重试。
@@ -22,10 +22,10 @@ use crate::process::DriverProcess;
 use crate::session::{Session, SessionEvent};
 use crate::snapshot::{EndpointStatus, Snapshot};
 
-/// 连接级退避序列（§11.1 默认值）。M0 不做上限熔断，成功后归零。
+/// 连接级退避序列（§11.1 默认值）。当前不做上限熔断，成功后归零。
 const RECONNECT_BACKOFF_SECS: [u64; 5] = [1, 2, 5, 10, 30];
 
-/// 内置端点配置：M0 由 forgelinkd 硬编码注入，Phase B 后由 ConfigStore 构造。
+/// 内置端点配置：空库演示时由 forgelinkd 硬编码注入，当前优先 ConfigStore 构造；硬编码仅用于空库演示
 #[derive(Debug, Clone)]
 pub struct BuiltinEndpoint {
     pub endpoint_id: String,
