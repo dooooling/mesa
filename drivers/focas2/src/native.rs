@@ -338,7 +338,7 @@ impl NativeLib {
                     let cur = std::env::var("PATH").unwrap_or_default();
                     let s = d.to_string_lossy().to_string();
                     if !cur.contains(&s) {
-                        std::env::set_var("PATH", format!("{};{}", s, cur));
+                        unsafe { std::env::set_var("PATH", format!("{};{}", s, cur)); }
                     }
                 }
             }
