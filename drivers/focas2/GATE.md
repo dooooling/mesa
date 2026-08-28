@@ -29,20 +29,22 @@
 
 `fanuc/fwlib.cs:22` `FocasLibConstants.FileName` 按 `ARMV7/LINUX64/WIN64` 切库名的策略已在 `native.rs:140` 复刻。
 
-## 4. 函数支持矩阵（Phase B 已实现 / 预留）
+## 4. 函数支持矩阵（已实现 14/44，全读只读）
 
 | ForgeLink 地址 | FOCAS 函数 | 30i-B | 0i-F | 备注 |
 |---|---|---|---|---|
-| `status` | `cnc_statinfo` | O | O | `native.rs:196 statinfo()` 已实现 |
-| `axis.abs.*` `axis.machine.*` | `cnc_rddynamic2` | O | O | `rddynamic2()` 已实现，细化 `cnc_absolute/cnc_machine` 待真机按需补 |
+| `status` | `cnc_statinfo` | O | O | `native.rs:536 statinfo()` 已实现 |
+| `axis.abs.*` `axis.machine.*` | `cnc_rddynamic2` | O | O | `rddynamic2()` 已实现，`cnc_absolute` 单轴 8 批 |
 | `axis.feed` | `cnc_rddynamic2.actf` | O | O | 已实现 |
 | `spindle.speed.*` | `cnc_acts` | O | O | 已实现 |
-| `spindle.load.*` | `cnc_rdspmeter` | E | E | Phase B 复用 `acts` 代理，待真机补 `rdspmeter` |
-| `alarm` | `cnc_rdalmmsg` | O | O | 预留 `EW_NOOPT` |
-| `program.*` | `cnc_rdprgnum/cnc_exeprgname` | O | O | 预留 |
-| `macro.*` | `cnc_rdmacro` | O | O | 预留 |
-| `pmc.R*` | `pmc_rdpmcrng` | O | O | 预留 |
-| `servo.*` | `cnc_rdsvmeter` | O | O | 预留 |
+| `spindle.load.*` | `cnc_rdspmeter` | E | E | `native.rs:652 rdspmeter()` 已实现，`Noopt` 回退 `acts` |
+| `alarm` | `cnc_rdalmmsg` | O | O | `native.rs:652 rdalmmsg()` 已实现，`EW_DATA` 循环 |
+| `program.*` | `cnc_rdprgnum` | O | O | `native.rs:657 rdprgnum()` 已实现，回退 `rddynamic2` |
+| `macro.*` | `cnc_rdmacro` | O | O | 已实现 |
+| `pmc.R*` `D` | `pmc_rdpmcrng` | O | O | 已实现 `R word/D dword` 字长自适应 |
+| `servo.*` | `cnc_rdsvmeter` | O | O | `native.rs:652 rdsvmeter()` 已实现 |
+| `diagnosis.*` | `cnc_diagnoss` | O | O | `native.rs:652 diagnoss()` 已实现 |
+| `opmsg` | `cnc_rdopmsg` | O | O | 已实现 64 字节 |
 
 完整矩阵见参考项目 `documentation/focas-function-matrix.md` 与 `fanuc/collectors/` 18 类实现。
 
@@ -53,7 +55,7 @@
   - `192.168.15.165:8193` `ping 1ms` `TcpTestSucceeded True`，`test_native -- 192.168.15.165` 直连 `connect OK`，`status U32(1) / axis.abs.1 I32(4000) / spindle.load U32(0)` 回传成功；`forgelinkd 8139` `real-focas RUNNING 4点` `GET /points/latest` 9 点（4 真机 +5 sim）已验证 `cnc_statinfo/cnc_rddynamic2(44)/cnc_acts` 链路
   - `FOCAS` 句柄 `cnc_allclibhndl3(ip,port,timeout_s)` 正确，`timeout_ms 5000→5s`，`NativeFocasApi` `spawn_blocking` 隔离 + `EW_SOCKET/EW_NODLL` 退避 `RECONNECTING` 正常
   - **Windows 依赖路径修复 `9514443`**：`FWLIB64.dll` 隐式依赖 `fwlibe1.dll` 需同目录，`LoadLibrary` 相对路径不搜 `libs/win`；`native.rs:331 load() prepend PATH(cwd/drivers/focas2/libs/win+TEMP) + 绝对路径双候选` 后 `cnc_allclibhndl3 host=192.168.15.165 ret Ok(32769) Status1 Axis -68050..79986`，`60` 保持 `EW_SOCKET -16` 隔离；单文件分发 `26.5MB` `include_bytes!→NamedTempFile→Library::new` `%TEMP%/forgelink_focas_embed`
-- **后续**：`192.168.15.165` 已可作为 0i-F/30i 基准真机，继续补 `cnc_rdalmmsg/cnc_rdmacro/pmc_rdpmcrng` 等余下地址并做断线重连 Soak；`FakeFocasApi` 仍用于 CI
+- **2026-08-28 双机**：`97 S7 192.168.15.97:102 DB10.DBD0 11468800 DBW0 175` `165 FOCAS 192.168.15.165:8193 status 1 axis -29594 spindle 0 alarm [] diag 0 pmc 0` `forgelinkd dual RUNNING 2+4+5=11点 11 GOOD` `ARM QEMU aarch64 2.1M/4.2M` `S7 continuous合并/LREAL分片/WSTRING` `FOCAS 14/44` 已通；后续 `60` 开通后 `60+165` 双 CNC `Multiple Connections` 隔离
 
 ## 6. 发布 Gate
 

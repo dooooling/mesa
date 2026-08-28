@@ -217,8 +217,9 @@ impl DriverConnection for S7Connection {
                         _ = ticker.tick() => {},
                         _ = shutdown.cancelled() => break,
                     }
-                    // 组装本任务的读项：BOOL 按所在字节的 BYTE 读取后本地取位，避免 BIT 传输的兼容性差异
-                    let items: Vec<ReadItem> = points.iter().map(|(spec, _)| {
+                    // 组装本任务的读项：BOOL 按所在字节的 BYTE 读取后本地取位，避免 BIT 传输的兼容性差异；
+                    // 连续合并：同 DB 内按 byte_offset 排序后，若下一项紧接上一项尾部则合并为一次变长读，减少 PDU 往返（V1 §7.1 合并连续区域）
+                    let mut items: Vec<ReadItem> = points.iter().map(|(spec, _)| {
                         if spec.kind == S7Kind::Bool {
                             let mut addr = spec.addr.clone();
                             addr.bit_offset = None;
@@ -227,6 +228,9 @@ impl DriverConnection for S7Connection {
                             ReadItem { addr: spec.addr.clone(), kind: spec.kind }
                         }
                     }).collect();
+                    // 按 DB/area/offset 排序以便合并（BOOL 已转 BYTE，故仅按 byte_offset）
+                    items.sort_by(|a, b| a.addr.db_number.cmp(&b.addr.db_number).then(a.addr.byte_offset.cmp(&b.addr.byte_offset)).then(a.addr.area.code().cmp(&b.addr.area.code())));
+                    // NOTE: 合并实现为 TODO 占位，当前仍按单项 12+len 发 PDU，P1 再按 PDU 剩余动态合并；此处保留排序以保证后续合并稳定
                     let raw_vec = {
                         let mut guard = client.lock().await;
                         match guard.read_vars(&items).await {

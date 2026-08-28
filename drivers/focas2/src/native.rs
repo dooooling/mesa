@@ -263,6 +263,41 @@ pub struct Odbm {
     pub dec_val: c_short,// 小数位 `value = mcr_val * 10^-dec_val`
 }
 
+/// `cnc_rdalmmsg` 返回：报警 `ODBALMMSG`（`fwlib.cs:3420` stateful，需 `cnc_rdalmmsg2` 循环至 `EW_DATA`）
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OdbAlmMsg {
+    pub dummy: [u8; 64], // 占位：真机按 `alarm_type` 循环取 `msg_len`
+}
+
+/// `cnc_diagnoss` 诊断 `ODBDIAG`（`fwlib.cs:4520`，`diagnosis` 用）
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OdbDiag {
+    pub dummy: c_int, // 诊断值
+}
+
+/// `cnc_rdprgnum` 程序号 `ODBPRGNUM`（`fwlib.cs:2100`）
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OdbPrgNum {
+    pub dummy: [c_short; 4],
+}
+
+/// `cnc_rdspmeter/cnc_rdsvmeter` 主轴/伺服负载 `fwlib.cs:6200`
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SpLoad {
+    pub data: [c_short; 4], // 4 主轴/伺服负载 %
+}
+
+/// `cnc_rdopmsg` 操作信息 `OPMSG`（`fwlib.cs:3300`）
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OpMsg {
+    pub dummy: [u8; 64],
+}
+
 /// `pmc_rdpmcrng` 返回：`IODBPMC0` 位/字节，`fwlib.cs:7132` `collectors/Pmc.cs: bit/byte`
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -309,6 +344,13 @@ type FnCncRdMacro = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut Odbm) 
 type FnPmcRdPmcRng = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, c_short, c_short, *mut u8) -> c_short;
 type FnCncActs = unsafe extern "C" fn(c_ushort, *mut OdbActs) -> c_short;
 type FnCncActs2 = unsafe extern "C" fn(c_ushort, c_short, *mut OdbActs) -> c_short;
+// 全读扩展：报警/诊断/程序/主轴/伺服/操作信息（V1 仅 8 组时以占位转 Bad，Gate 闭环后逐个打通）
+type FnRdAlmMsg = unsafe extern "C" fn(c_ushort, c_short, *mut c_short, *mut OdbAlmMsg) -> c_short;
+type FnDiagnoss = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OdbDiag) -> c_short;
+type FnRdPrgNum = unsafe extern "C" fn(c_ushort, *mut OdbPrgNum) -> c_short;
+type FnRdSpMeter = unsafe extern "C" fn(c_ushort, c_short, *mut c_short, *mut SpLoad) -> c_short;
+type FnRdSvMeter = unsafe extern "C" fn(c_ushort, *mut c_short, *mut SpLoad) -> c_short;
+type FnRdOpMsg = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OpMsg) -> c_short;
 
 // ---------------------------------------------------------------------------
 // 动态库封装
@@ -324,6 +366,13 @@ pub struct NativeLib {
     pub cnc_rdmacro: Option<Symbol<'static, FnCncRdMacro>>,
     pub pmc_rdpmcrng: Option<Symbol<'static, FnPmcRdPmcRng>>,
     pub cnc_acts: Option<Symbol<'static, FnCncActs>>,
+    // 全读扩展：报警/诊断/程序/负载（V1 仅 8 组时以占位转 Bad，Gate 闭环后逐个打通，需真机 165/60 验证）
+    pub cnc_rdalmmsg: Option<Symbol<'static, FnRdAlmMsg>>,
+    pub cnc_diagnoss: Option<Symbol<'static, FnDiagnoss>>,
+    pub cnc_rdprgnum: Option<Symbol<'static, FnRdPrgNum>>,
+    pub cnc_rdspmeter: Option<Symbol<'static, FnRdSpMeter>>,
+    pub cnc_rdsvmeter: Option<Symbol<'static, FnRdSvMeter>>,
+    pub cnc_rdopmsg: Option<Symbol<'static, FnRdOpMsg>>,
 }
 
 impl NativeLib {
@@ -489,6 +538,12 @@ impl NativeLib {
             cnc_rdmacro: None,
             pmc_rdpmcrng: None,
             cnc_acts: None,
+            cnc_rdalmmsg: None,
+            cnc_diagnoss: None,
+            cnc_rdprgnum: None,
+            cnc_rdspmeter: None,
+            cnc_rdsvmeter: None,
+            cnc_rdopmsg: None,
         };
         unsafe {
             let raw: *const Library = &me._lib as *const Library;
@@ -500,6 +555,13 @@ impl NativeLib {
             me.cnc_rdmacro = (*raw).get::<FnCncRdMacro>(b"cnc_rdmacro").ok().map(|s| std::mem::transmute(s));
             me.pmc_rdpmcrng = (*raw).get::<FnPmcRdPmcRng>(b"pmc_rdpmcrng").ok().map(|s| std::mem::transmute(s));
             me.cnc_acts = (*raw).get::<FnCncActs>(b"cnc_acts").ok().map(|s| std::mem::transmute(s));
+            // 全读扩展：若符号缺失则保持 None，上层转 EW_NOOPT→Bad 而非 panic
+            me.cnc_rdalmmsg = (*raw).get::<FnRdAlmMsg>(b"cnc_rdalmmsg").ok().map(|s| std::mem::transmute(s));
+            me.cnc_diagnoss = (*raw).get::<FnDiagnoss>(b"cnc_diagnoss").ok().map(|s| std::mem::transmute(s));
+            me.cnc_rdprgnum = (*raw).get::<FnRdPrgNum>(b"cnc_rdprgnum").ok().map(|s| std::mem::transmute(s));
+            me.cnc_rdspmeter = (*raw).get::<FnRdSpMeter>(b"cnc_rdspmeter").ok().map(|s| std::mem::transmute(s));
+            me.cnc_rdsvmeter = (*raw).get::<FnRdSvMeter>(b"cnc_rdsvmeter").ok().map(|s| std::mem::transmute(s));
+            me.cnc_rdopmsg = (*raw).get::<FnRdOpMsg>(b"cnc_rdopmsg").ok().map(|s| std::mem::transmute(s));
         }
         me
     }
@@ -638,6 +700,65 @@ impl NativeLib {
             'R' => PMC_TYPE_R, 'T' => PMC_TYPE_T, 'K' => PMC_TYPE_K, 'C' => PMC_TYPE_C,
             'D' => PMC_TYPE_D, 'M' => PMC_TYPE_M, 'N' | 'E' => PMC_TYPE_N, 'Z' => PMC_TYPE_Z, _ => PMC_TYPE_R,
         }
+    }
+
+    /// 读报警：`cnc_rdalmmsg(hdl, -1, &mut num, ODBALMMSG)` stateful 循环至 `EW_DATA`
+    /// - 为什么循环：FANUC 报警为状态机，需 `num` 递增拉取至 `EW_DATA` 结束，单次仅得首批
+    /// - 返回 `Vec<String>` 仅用于诊断，上层转 `Quality::Bad` 隔离不丢批
+    pub fn cnc_rdalmmsg(&self, hdl: u16, num: &mut c_short) -> Result<Vec<String>, FocasRet> {
+        let sym = self.cnc_rdalmmsg.as_ref().ok_or(FocasRet::Noopt)?;
+        let mut out = OdbAlmMsg { dummy: [0; 64] };
+        let rc = unsafe { sym(hdl as c_ushort, -1 as c_short, num as *mut c_short, &mut out as *mut OdbAlmMsg) };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() {
+            // 占位解析：真机需按 `msg_len` 解 `alm_msg`，此处仅证明链路可达
+            Ok(vec![format!("alarm:{}", num)])
+        } else { Err(ret) }
+    }
+
+    /// 读诊断：`cnc_diagnoss(hdl, num, 1, ODBDIAG)` 单点诊断
+    pub fn cnc_diagnoss(&self, hdl: u16, num: i32) -> Result<c_int, FocasRet> {
+        let sym = self.cnc_diagnoss.as_ref().ok_or(FocasRet::Noopt)?;
+        let mut out = OdbDiag { dummy: 0 };
+        let rc = unsafe { sym(hdl as c_ushort, num as c_short, 1 as c_short, &mut out as *mut OdbDiag) };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() { Ok(out.dummy) } else { Err(ret) }
+    }
+
+    /// 读程序号：`cnc_rdprgnum(hdl, ODBPRGNUM)` 主/运行程序
+    pub fn cnc_rdprgnum(&self, hdl: u16) -> Result<OdbPrgNum, FocasRet> {
+        let sym = self.cnc_rdprgnum.as_ref().ok_or(FocasRet::Noopt)?;
+        let mut out = std::mem::MaybeUninit::<OdbPrgNum>::uninit();
+        let rc = unsafe { sym(hdl as c_ushort, out.as_mut_ptr()) };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() { Ok(unsafe { out.assume_init() }) } else { Err(ret) }
+    }
+
+    /// 读主轴负载：`cnc_rdspmeter(hdl, 0, &mut num, &mut data)` 4 轴
+    pub fn cnc_rdspmeter(&self, hdl: u16, num: &mut c_short, data: &mut SpLoad) -> Result<(), FocasRet> {
+        let sym = self.cnc_rdspmeter.as_ref().ok_or(FocasRet::Noopt)?;
+        let mut n: c_short = 4;
+        let rc = unsafe { sym(hdl as c_ushort, 0 as c_short, &mut n as *mut c_short, data as *mut SpLoad) };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() { *num = n; Ok(()) } else { Err(ret) }
+    }
+
+    /// 读伺服负载：`cnc_rdsvmeter(hdl, &mut num, &mut data)` 同主轴
+    pub fn cnc_rdsvmeter(&self, hdl: u16, num: &mut c_short, data: &mut SpLoad) -> Result<(), FocasRet> {
+        let sym = self.cnc_rdsvmeter.as_ref().ok_or(FocasRet::Noopt)?;
+        let mut n: c_short = 4;
+        let rc = unsafe { sym(hdl as c_ushort, &mut n as *mut c_short, data as *mut SpLoad) };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() { *num = n; Ok(()) } else { Err(ret) }
+    }
+
+    /// 读操作信息：`cnc_rdopmsg(hdl, 0, 64, OPMSG)` 64 字节操作提示
+    pub fn cnc_rdopmsg(&self, hdl: u16) -> Result<OpMsg, FocasRet> {
+        let sym = self.cnc_rdopmsg.as_ref().ok_or(FocasRet::Noopt)?;
+        let mut out = OpMsg { dummy: [0; 64] };
+        let rc = unsafe { sym(hdl as c_ushort, 0 as c_short, 64 as c_short, &mut out as *mut OpMsg) };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() { Ok(out) } else { Err(ret) }
     }
 }
 

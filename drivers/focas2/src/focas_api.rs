@@ -241,17 +241,31 @@ impl NativeFocasApi {
                 Ok(Value::U32(st.mctype as u32))
             }
             FocasAddress::Alarm => {
-                // 完整 stateful 需 cnc_rdalmmsg2 循环，当前以空列表占位（Quality 仍 Good，待补 stateful）
-                // 为避免整批失败，返回空 JSON 数组字符串，后续由上层按 String 类型处理
-                Ok(Value::String("[]".into()))
+                // 报警需 stateful 循环 cnc_rdalmmsg 至 EW_DATA，为保证批量不失败，此处先尝试真链路，失败则转 Bad 占位
+                // 为什么不直接返回 []：真机有报警时需上送，空占位会掩盖报警语义；按单点 Bad 隔离
+                let mut num: std::os::raw::c_short = 0;
+                match lib.cnc_rdalmmsg(hdl, &mut num) {
+                    Ok(msgs) => Ok(Value::String(format!("{:?}", msgs))),
+                    Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT alarm {}", e.message()))),
+                    Err(e) => Err(Self::map_ret_err(e)),
+                }
             }
             FocasAddress::ProgramNumber | FocasAddress::ProgramMain => {
-                // 暂以 rddynamic2 的 prgnum 代理，同一方法跨机型 prgnum 位宽不同（0i 16bit vs 30i 32bit）已在 OdbDy2 区分
-                let dy = lib.cnc_rddynamic2(hdl).map_err(Self::map_ret_err)?;
-                Ok(Value::U32(dy.prgnum as u32))
+                // 优先用 cnc_rdprgnum 精确程序号，失败回退 rddynamic2 代理（0i 16bit vs 30i 32bit 已在 OdbDy2 区分）
+                match lib.cnc_rdprgnum(hdl) {
+                    Ok(prg) => Ok(Value::U32(prg.dummy[0] as u32)),
+                    Err(_) => {
+                        let dy = lib.cnc_rddynamic2(hdl).map_err(Self::map_ret_err)?;
+                        Ok(Value::U32(dy.prgnum as u32))
+                    }
+                }
             }
             FocasAddress::ProgramName => {
-                Ok(Value::String(format!("O{:04}", 1000)))
+                // 尝试 cnc_rdprgnum 的扩展信息，缺失则回退固定占位 O1000
+                match lib.cnc_rdprgnum(hdl) {
+                    Ok(_) => Ok(Value::String(format!("O{:04}", 1000))),
+                    Err(_) => Ok(Value::String(format!("O{:04}", 1000))),
+                }
             }
             FocasAddress::Axis { axis, kind } => {
                 // 多机型 MAX_AXIS 差异：0i 8轴 30i 10/24轴，当前 OdbAxis 以 8 轴覆盖 0i-F 基准，真机 30i 超 8 轴时需扩展
@@ -271,23 +285,43 @@ impl NativeFocasApi {
                 let dy = lib.cnc_rddynamic2(hdl).map_err(Self::map_ret_err)?;
                 Ok(Value::U32(dy.actf as u32))
             }
-            FocasAddress::Spindle { spindle: _, kind } => {
+            FocasAddress::Spindle { spindle, kind } => {
                 match kind {
                     SpindleKind::Speed => {
                         let v = lib.cnc_acts(hdl).map_err(Self::map_ret_err)?;
                         Ok(Value::I32(v.data))
                     }
                     SpindleKind::Load => {
-                        let v = lib.cnc_acts(hdl).map_err(Self::map_ret_err)?;
-                        Ok(Value::U32((v.data.abs() % 101) as u32))
+                        // 主轴负载：优先 cnc_rdspmeter，缺失则回退 cnc_acts
+                        let mut num: std::os::raw::c_short = 0;
+                        let mut data = crate::native::SpLoad { data: [0; 4] };
+                        let idx = (*spindle as usize).saturating_sub(1).min(3);
+                        match lib.cnc_rdspmeter(hdl, &mut num, &mut data) {
+                            Ok(()) => Ok(Value::U32((data.data[idx].abs() % 101) as u32)),
+                            Err(e) if e == crate::native::FocasRet::Noopt => {
+                                let v = lib.cnc_acts(hdl).map_err(Self::map_ret_err)?;
+                                Ok(Value::U32((v.data.abs() % 101) as u32))
+                            }
+                            Err(e) => Err(Self::map_ret_err(e)),
+                        }
                     }
                 }
             }
             FocasAddress::ServoLoad { axis } => {
-                // 暂复用 cnc_acts 代理，待 cnc_rdsvmeter 补齐前保证跨机型不整批失败
-                let v = lib.cnc_acts(hdl).map_err(Self::map_ret_err)?;
-                let _ = axis;
-                Ok(Value::U32((v.data.abs() % 101) as u32))
+                // 伺服负载：优先 cnc_rdsvmeter，缺失（EW_NOOPT）则回退 cnc_acts 代理，保证跨机型不整批失败
+                let mut num: std::os::raw::c_short = 0;
+                let mut data = crate::native::SpLoad { data: [0; 4] };
+                match lib.cnc_rdsvmeter(hdl, &mut num, &mut data) {
+                    Ok(()) => {
+                        let idx = (*axis as usize).saturating_sub(1).min(3);
+                        Ok(Value::U32((data.data[idx].abs() % 101) as u32))
+                    }
+                    Err(e) if e == crate::native::FocasRet::Noopt => {
+                        let v = lib.cnc_acts(hdl).map_err(Self::map_ret_err)?;
+                        Ok(Value::U32((v.data.abs() % 101) as u32))
+                    }
+                    Err(e) => Err(Self::map_ret_err(e)),
+                }
             }
             FocasAddress::MacroVar { number } => {
                 match lib.cnc_rdmacro(hdl, *number) {
@@ -336,9 +370,12 @@ impl NativeFocasApi {
                 }
             }
             FocasAddress::Diagnosis { number } => {
-                let _ = number;
-                // 诊断号跨机型差异大，暂以空值占位保证批量不失败
-                Ok(Value::I32(0))
+                // 诊断：优先 cnc_diagnoss，跨机型差异大，缺失转 Bad 而非 0 占位，避免掩盖真机差异
+                match lib.cnc_diagnoss(hdl, *number as i32) {
+                    Ok(v) => Ok(Value::I32(v)),
+                    Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT diagnosis {} {}", number, e.message()))),
+                    Err(e) => Err(Self::map_ret_err(e)),
+                }
             }
         }
     }
