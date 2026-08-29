@@ -10,7 +10,7 @@
 //! - 支持区域 DB / M / I / Q；类型见 `codec::S7Kind`；Core 不解析地址（硬约束）。
 
 mod address;
-mod client;
+pub mod client; // Common SZL 直连诊断需对外暴露（V1 只读，不影响 Core 隔离）
 mod codec;
 
 pub use address::{parse_address, S7Address};
