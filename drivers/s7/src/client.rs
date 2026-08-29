@@ -285,8 +285,16 @@ fn build_read_req(pdu_ref: u16, items: &[ReadItem]) -> Vec<u8> {
         let area = it.addr.area.code();
         let db = it.addr.db_number;
         let bit_addr = it.addr.bit_address();
-        let transport = it.kind.transport_size();
-        let req_len = it.kind.request_len();
+        // Common 修补：C/T 计数器/定时器为字寻址但 R/W 计数单位为“个数”而非字节，WORD 通用 2 会触发 0x06
+        let transport = match it.addr.area {
+            crate::address::Area::Counter => 0x1C,
+            crate::address::Area::Timer => 0x1D,
+            _ => it.kind.transport_size(),
+        };
+        let req_len = match it.addr.area {
+            crate::address::Area::Counter | crate::address::Area::Timer => 1,
+            _ => it.kind.request_len(),
+        };
         param.extend_from_slice(&[S7_VAR_SPEC, S7_VAR_SPEC_LEN, S7_SYNTAX_ID_S7ANY, transport]);
         param.extend_from_slice(&req_len.to_be_bytes());
         param.extend_from_slice(&db.to_be_bytes());

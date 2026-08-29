@@ -219,17 +219,19 @@ impl DriverConnection for S7Connection {
                     }
                     // 组装本任务的读项：BOOL 按所在字节的 BYTE 读取后本地取位，避免 BIT 传输的兼容性差异；
                     // 连续合并：同 DB 内按 byte_offset 排序后，若下一项紧接上一项尾部则合并为一次变长读，减少 PDU 往返（V1 §7.1 合并连续区域）
-                    let mut items: Vec<ReadItem> = points.iter().map(|(spec, _)| {
-                        if spec.kind == S7Kind::Bool {
+                    // 保持 point 与 ReadItem 同序排序，避免排序后 zip 错位
+                    let mut paired: Vec<((PointSpec, u32), ReadItem)> = points.iter().map(|(spec, pid)| {
+                        let item = if spec.kind == S7Kind::Bool {
                             let mut addr = spec.addr.clone();
                             addr.bit_offset = None;
                             ReadItem { addr, kind: S7Kind::Byte }
                         } else {
                             ReadItem { addr: spec.addr.clone(), kind: spec.kind }
-                        }
+                        };
+                        ((spec.clone(), *pid), item)
                     }).collect();
-                    // 按 DB/area/offset 排序以便合并（BOOL 已转 BYTE，故仅按 byte_offset）
-                    items.sort_by(|a, b| a.addr.db_number.cmp(&b.addr.db_number).then(a.addr.byte_offset.cmp(&b.addr.byte_offset)).then(a.addr.area.code().cmp(&b.addr.area.code())));
+                    paired.sort_by(|a, b| a.1.addr.db_number.cmp(&b.1.addr.db_number).then(a.1.addr.byte_offset.cmp(&b.1.addr.byte_offset)).then(a.1.addr.area.code().cmp(&b.1.addr.area.code())));
+                    let items: Vec<ReadItem> = paired.iter().map(|(_, it)| it.clone()).collect();
                     // NOTE: 合并实现为 TODO 占位，当前仍按单项 12+len 发 PDU，P1 再按 PDU 剩余动态合并；此处保留排序以保证后续合并稳定
                     let raw_vec = {
                         let mut guard = client.lock().await;
@@ -241,8 +243,8 @@ impl DriverConnection for S7Connection {
                             }
                         }
                     };
-                    // 解码并发布：BOOL 需按位提取
-                    let values: Vec<PointValue> = points.iter().zip(raw_vec).filter_map(|((spec, pid), raw)| {
+                    // 解码并发布：BOOL 需按位提取（paired 与 raw_vec 同序）
+                    let values: Vec<PointValue> = paired.iter().zip(raw_vec).filter_map(|(((spec, pid), _), raw)| {
                         let vt = if spec.kind == S7Kind::Bool {
                             let bit = spec.addr.bit_offset.unwrap_or(0) as usize;
                             let b = raw.first().copied().unwrap_or(0);
