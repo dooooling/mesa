@@ -13,11 +13,14 @@ use thiserror::Error;
 // ---------------------------------------------------------------------------
 // 常量：S7 区域与位边界（中文解释“为什么”）
 // ---------------------------------------------------------------------------
-/// S7 ANY 结构的 area 字段：DB 0x84 / M 0x83 / I 0x81 / Q 0x82（S7Comm 固定）
+/// S7 ANY 结构的 area 字段：DB 0x84 / M 0x83 / I 0x81 / Q 0x82 / C 0x1C / T 0x1D（S7Comm 固定）
 const S7_AREA_DB: u8 = 0x84;
 const S7_AREA_MERKER: u8 = 0x83;
 const S7_AREA_INPUT: u8 = 0x81;
 const S7_AREA_OUTPUT: u8 = 0x82;
+const S7_AREA_COUNTER: u8 = 0x1C;
+const S7_AREA_TIMER: u8 = 0x1D;
+const S7_AREA_PERIPHERAL: u8 = 0x80; // PI/PE/PQ/PA：V1 统一按外设区 0x80，兼容 PIW/PQW/PEW
 /// 1 字节内位偏移上限 0..7
 const S7_MAX_BIT: u8 = 7;
 /// 字节到位换算：S7 ANY 中位地址 = byte*8 + bit
@@ -29,6 +32,10 @@ pub enum Area {
     Merker,
     Input,
     Output,
+    Counter,
+    Timer,
+    PeripheralInput,
+    PeripheralOutput,
 }
 
 impl Area {
@@ -39,7 +46,16 @@ impl Area {
             Area::Merker => S7_AREA_MERKER,
             Area::Input => S7_AREA_INPUT,
             Area::Output => S7_AREA_OUTPUT,
+            Area::Counter => S7_AREA_COUNTER,
+            Area::Timer => S7_AREA_TIMER,
+            Area::PeripheralInput => S7_AREA_PERIPHERAL,
+            Area::PeripheralOutput => S7_AREA_PERIPHERAL,
         }
+    }
+
+    /// 是否为外设区（PI/PQ），解析时需要区分 Input/Output 语义但线缆 code 同为 0x80。
+    pub fn is_peripheral(self) -> bool {
+        matches!(self, Area::PeripheralInput | Area::PeripheralOutput)
     }
 }
 
@@ -65,12 +81,18 @@ pub enum AddressError {
 
 impl S7Address {
     /// 将地址编码为 S7 ANY 结构中的 3 字节位偏移（byte_offset*8+bit）。
+    /// Counter/Timer 例外：线缆上传递的是编号本身，不乘 8。
     pub fn bit_address(&self) -> u32 {
-        self.byte_offset * S7_BITS_PER_BYTE + self.bit_offset.unwrap_or(0) as u32
+        match self.area {
+            Area::Counter | Area::Timer => self.byte_offset,
+            _ => self.byte_offset * S7_BITS_PER_BYTE + self.bit_offset.unwrap_or(0) as u32,
+        }
     }
 }
 
 /// 解析用户提供的地址字符串（大小写不敏感，允许空格）。
+///
+/// Common 扩展：`C`/`T` 计数器/定时器、`PI`/`PQ`/`PE`/`PA` 外设、`CLOCK`/`SZL` 系统区。
 pub fn parse_address(input: &str) -> Result<S7Address, AddressError> {
     let raw = input.trim();
     if raw.is_empty() {
@@ -81,10 +103,19 @@ pub fn parse_address(input: &str) -> Result<S7Address, AddressError> {
     let s = s.replace(' ', "");
     if s.starts_with("DB") {
         parse_db(&s, raw)
+    } else if s.starts_with("PI") || s.starts_with("PE") || s.starts_with("PQ") || s.starts_with("PA") {
+        parse_peripheral(&s, raw)
+    } else if s.starts_with('C') && !s.starts_with("CLOCK") {
+        parse_counter(&s, raw)
+    } else if s.starts_with('T') {
+        parse_timer(&s, raw)
     } else if s.starts_with('M') || s.starts_with('I') || s.starts_with('Q') {
         parse_miq(&s, raw)
+    } else if s == "CLOCK" || s.starts_with("SZL") {
+        // CLOCK/SZL 为系统功能，V1 映射为 DB0 占位，调用方走 SZL 诊断分支；保留解析兼容
+        Err(AddressError::Invalid { input: raw.to_string(), reason: "CLOCK/SZL 请通过诊断接口读取，非点位地址".into() })
     } else {
-        Err(AddressError::Invalid { input: raw.to_string(), reason: "必须以 DB/M/I/Q 开头".into() })
+        Err(AddressError::Invalid { input: raw.to_string(), reason: "必须以 DB/M/I/Q/C/T/PI/PQ 开头".into() })
     }
 }
 
@@ -192,6 +223,38 @@ fn parse_miq(s: &str, raw: &str) -> Result<S7Address, AddressError> {
     }
 }
 
+fn parse_peripheral(s: &str, raw: &str) -> Result<S7Address, AddressError> {
+    // PIW0 / PQW0 / PEW0 / PAW0 / PIB0 / PEB0 / PI0 / PQ0 支持，V1 统一按字/字节寻址
+    let is_input = s.starts_with("PI") || s.starts_with("PE");
+    let area = if is_input { Area::PeripheralInput } else { Area::PeripheralOutput };
+    let rest = if s.starts_with("PI") || s.starts_with("PQ") || s.starts_with("PE") || s.starts_with("PA") { &s[2..] } else { s };
+    if rest.is_empty() { return Err(AddressError::Invalid { input: raw.to_string(), reason: "外设偏移缺失".into() }); }
+    let after = if rest.starts_with('B') || rest.starts_with('W') || rest.starts_with('D') { &rest[1..] } else { rest };
+    if after.is_empty() { return Err(AddressError::Invalid { input: raw.to_string(), reason: "外设偏移缺失".into() }); }
+    // 兼容 PIW0 / PI0.0 混写，去掉可能的位后缀
+    let byte_s = after.split('.').next().unwrap_or(after);
+    let byte_offset: u32 = byte_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("字节偏移 `{byte_s}` 非法") })?;
+    Ok(S7Address { area, db_number: 0, byte_offset, bit_offset: None })
+}
+
+fn parse_counter(s: &str, raw: &str) -> Result<S7Address, AddressError> {
+    // C0 / C10 / CW0 兼容，S7 计数器为字寻址（0..2047）
+    let rest = s[1..].trim_start_matches(|c| c == 'W' || c == 'B' || c == 'D');
+    if rest.is_empty() { return Err(AddressError::Invalid { input: raw.to_string(), reason: "计数器号缺失".into() }); }
+    let num: u32 = rest.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("计数器 `{rest}` 非法") })?;
+    if num > 2047 { return Err(AddressError::Invalid { input: raw.to_string(), reason: "计数器号超出 0..2047".into() }); }
+    Ok(S7Address { area: Area::Counter, db_number: 0, byte_offset: num, bit_offset: None })
+}
+
+fn parse_timer(s: &str, raw: &str) -> Result<S7Address, AddressError> {
+    // T0 / T10 / TW0 兼容，定时器同计数器范围
+    let rest = s[1..].trim_start_matches(|c| c == 'W' || c == 'B' || c == 'D');
+    if rest.is_empty() { return Err(AddressError::Invalid { input: raw.to_string(), reason: "定时器号缺失".into() }); }
+    let num: u32 = rest.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("定时器 `{rest}` 非法") })?;
+    if num > 2047 { return Err(AddressError::Invalid { input: raw.to_string(), reason: "定时器号超出 0..2047".into() }); }
+    Ok(S7Address { area: Area::Timer, db_number: 0, byte_offset: num, bit_offset: None })
+}
+
 fn split_byte_bit<'a>(s: &'a str, raw: &'a str) -> Result<(&'a str, &'a str), AddressError> {
     let (b, bit) = s.split_once('.').ok_or_else(|| AddressError::Invalid { input: raw.to_string(), reason: "DBX 必须带位偏移如 DBX0.0".into() })?;
     if b.is_empty() || bit.is_empty() {
@@ -238,6 +301,23 @@ mod tests {
         ok("I0.0", Area::Input, 0, 0, Some(0));
         ok("IB0", Area::Input, 0, 0, None);
         ok("Q0.0", Area::Output, 0, 0, Some(0));
+    }
+
+    #[test]
+    fn counter_timer() {
+        ok("C0", Area::Counter, 0, 0, None);
+        ok("C10", Area::Counter, 0, 10, None);
+        ok("T5", Area::Timer, 0, 5, None);
+        assert_eq!(parse_address("C10").unwrap().bit_address(), 10);
+        assert_eq!(parse_address("T7").unwrap().bit_address(), 7);
+    }
+
+    #[test]
+    fn peripheral() {
+        ok("PIW0", Area::PeripheralInput, 0, 0, None);
+        ok("PQW0", Area::PeripheralOutput, 0, 0, None);
+        ok("PIW256", Area::PeripheralInput, 0, 256, None);
+        ok("PEW0", Area::PeripheralInput, 0, 0, None);
     }
 
     #[test]

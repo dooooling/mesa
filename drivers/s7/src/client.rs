@@ -406,6 +406,54 @@ fn parse_read_resp(resp: &[u8], sent_items: &[ReadItem]) -> Result<Vec<Vec<u8>>,
     Ok(out)
 }
 
+/// SZL 读取（Common 诊断）：S7 功能 0x07 SZL，返回原始 SZL 负载（已去 TPKT/COTP/S7 头）。
+/// 用于 `SZL 0x0011` CPU 诊断、`0x0131` 模块标识等只读诊断，不走点位批次。
+impl S7Client {
+    pub async fn read_szl(&mut self, szl_id: u16, szl_index: u16) -> Result<Vec<u8>, SdkDriverError> {
+        let pkt = build_szl_req(self.pdu_ref, szl_id, szl_index);
+        self.pdu_ref = self.pdu_ref.wrapping_add(1).max(1);
+        timeout(self.cfg.timeout(), self.send_raw(&pkt)).await
+            .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "SZL_TIMEOUT", format!("SZL 0x{szl_id:04X} 请求超时")))?
+            .map_err(|e| SdkDriverError::new(ErrorKind::Connection, "SZL_SEND_FAIL", e.to_string()))?;
+        let resp = timeout(self.cfg.timeout(), self.recv_packet()).await
+            .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "SZL_TIMEOUT", format!("SZL 0x{szl_id:04X} 响应超时")))?
+            .map_err(|e| SdkDriverError::new(ErrorKind::Connection, "SZL_RECV_FAIL", e.to_string()))?;
+        parse_szl_resp(&resp, szl_id)
+    }
+}
+
+fn build_szl_req(pdu_ref: u16, szl_id: u16, szl_index: u16) -> Vec<u8> {
+    // S7 SZL (0x07 UserData) 请求模板，基于 snap7 抓包提炼：
+    // TPKT 4 + COTP 3 + S7 32 07 00 00 + pdu_ref + 00 08/00 04 + UserData 固定 + SZL ID/Index
+    let mut s7 = Vec::with_capacity(32);
+    s7.extend_from_slice(&[0x32, 0x07, 0x00, 0x00]);
+    s7.extend_from_slice(&pdu_ref.to_be_bytes());
+    s7.extend_from_slice(&[0x00, 0x08, 0x00, 0x04]);
+    // UserData 头：0x00 0x01 0x12 0x04 0x11 0x44 0x01 0x00 0xFF 0x09 0x00 0x04
+    s7.extend_from_slice(&[0x00, 0x01, 0x12, 0x04, 0x11, 0x44, 0x01, 0x00, 0xFF, 0x09, 0x00, 0x04]);
+    s7.extend_from_slice(&szl_id.to_be_bytes());
+    s7.extend_from_slice(&szl_index.to_be_bytes());
+    let cotp = [0x02, COTP_DT, 0x80];
+    let tpkt_len = (4 + cotp.len() + s7.len()) as u16;
+    let mut pkt = vec![TPKT_VERSION, 0x00, (tpkt_len >> 8) as u8, (tpkt_len & 0xFF) as u8];
+    pkt.extend_from_slice(&cotp);
+    pkt.extend_from_slice(&s7);
+    pkt
+}
+
+fn parse_szl_resp(resp: &[u8], szl_id: u16) -> Result<Vec<u8>, SdkDriverError> {
+    if resp.len() < 7 + 12 {
+        return Err(SdkDriverError::new(ErrorKind::Protocol, "SZL_SHORT", format!("SZL 0x{szl_id:04X} 响应过短 {}", resp.len())));
+    }
+    let s7 = &resp[7..];
+    if s7.len() < 12 { return Err(SdkDriverError::new(ErrorKind::Protocol, "SZL_S7_SHORT", "SZL S7 头缺失")); }
+    if s7[1] != S7_ROSCTR_ACK && s7[1] != 0x07 {
+        return Err(map_s7_error(s7[17], &format!("SZL 0x{szl_id:04X} 被拒绝")));
+    }
+    // 剩余为 UserData，透传给上层诊断做二次解析
+    Ok(s7[12..].to_vec())
+}
+
 fn format_addr(a: &S7Address) -> String {
     match a.area {
         Area::Db => {
@@ -424,6 +472,10 @@ fn format_addr(a: &S7Address) -> String {
         Area::Output => {
             if let Some(bit) = a.bit_offset { format!("Q{}.{}", a.byte_offset, bit) } else { format!("QB{}", a.byte_offset) }
         }
+        Area::Counter => format!("C{}", a.byte_offset),
+        Area::Timer => format!("T{}", a.byte_offset),
+        Area::PeripheralInput => format!("PIW{}", a.byte_offset),
+        Area::PeripheralOutput => format!("PQW{}", a.byte_offset),
     }
 }
 

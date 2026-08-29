@@ -97,10 +97,11 @@ pub fn parse_data_type(s: &str) -> Result<(DataType, S7Kind), SdkDriverError> {
         "lreal" | "f64" | "double" => (DataType::F64, S7Kind::Lreal),
         "string" => (DataType::String, S7Kind::String),
         "wstring" | "wchar[]" => (DataType::String, S7Kind::WString),
-        "s5time" => (DataType::U32, S7Kind::S5Time),
+        "s5time" | "timer" | "s5_time" => (DataType::U32, S7Kind::S5Time),
         "time" | "tod" => (DataType::U32, S7Kind::Time),
         "date" => (DataType::U32, S7Kind::Date),
         "dt" | "date_and_time" => (DataType::F64, S7Kind::Dt),
+        "counter" | "counter_word" => (DataType::U32, S7Kind::Word),
         "bytes" => (DataType::Bytes, S7Kind::Dword), // 兜底，按字节串处理
         // Core 原生风格兜底
         "i32" => (DataType::I32, S7Kind::Dint),
