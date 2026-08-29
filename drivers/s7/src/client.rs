@@ -200,13 +200,13 @@ impl S7Client {
         Ok(())
     }
 
-    /// 批量读取。返回与 items 等长的原始字节向量（按 S7Kind 截好）。任一 item 的 S7 返回码非 0xFF 即视为错误并返回整体失败（由调用方决定重连或标记 BAD）。
-    pub async fn read_vars(&mut self, items: &[ReadItem]) -> Result<Vec<Vec<u8>>, SdkDriverError> {
+    /// 批量读取。返回与 items 等长的 `Option<原始字节>`，`None` 表示该 item 的 S7 返回码非 0xFF（按项 BAD 隔离，不整体失败）。
+    pub async fn read_vars(&mut self, items: &[ReadItem]) -> Result<Vec<Option<Vec<u8>>>, SdkDriverError> {
         if items.is_empty() {
             return Ok(vec![]);
         }
         // PDU 480 字节时单次最多约 19 项（12字节/item），超出分批
-        let mut all: Vec<Vec<u8>> = Vec::with_capacity(items.len());
+        let mut all: Vec<Option<Vec<u8>>> = Vec::with_capacity(items.len());
         for chunk in items.chunks(S7_MAX_ITEMS_PER_PDU) {
             let pkt = build_read_req(self.pdu_ref, chunk);
             self.pdu_ref = self.pdu_ref.wrapping_add(1).max(1);
@@ -318,7 +318,7 @@ fn build_read_req(pdu_ref: u16, items: &[ReadItem]) -> Vec<u8> {
     pkt
 }
 
-fn parse_read_resp(resp: &[u8], sent_items: &[ReadItem]) -> Result<Vec<Vec<u8>>, SdkDriverError> {
+fn parse_read_resp(resp: &[u8], sent_items: &[ReadItem]) -> Result<Vec<Option<Vec<u8>>>, SdkDriverError> {
     if resp.len() < 7 + 12 {
         return Err(SdkDriverError::new(ErrorKind::Protocol, "READ_SHORT", format!("响应过短 {}", resp.len())));
     }
@@ -338,8 +338,8 @@ fn parse_read_resp(resp: &[u8], sent_items: &[ReadItem]) -> Result<Vec<Vec<u8>>,
     }
     let data = &s7[12 + param_len.. 12 + param_len + data_len];
     // param 预期 0x04 00? 对于成功读取，param 首字节 0x04，次字节 item 数
-    // data 结构：每 item 4 字节头 + 数据（若奇数长度则填充 1 字节）
-    let mut out = Vec::with_capacity(sent_items.len());
+    // data 结构：每 item 4 字节头 + 数据（若奇数长度则填充 1 字节）— 按项 BAD 隔离
+    let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(sent_items.len());
     let mut off = 0;
     for (idx, it) in sent_items.iter().enumerate() {
         if off + 4 > data.len() {
@@ -350,20 +350,17 @@ fn parse_read_resp(resp: &[u8], sent_items: &[ReadItem]) -> Result<Vec<Vec<u8>>,
         let len_bits = u16::from_be_bytes([data[off + 2], data[off + 3]]) as usize;
         off += 4;
         if ret != S7_ITEM_OK {
-            let msg = match ret {
-                S7_ERR_ADDRESS => format!("地址不存在或越界（S7 0x05）——检查 DB{} 是否为标准访问、地址 {} 是否正确", it.addr.db_number, format_addr(&it.addr)),
-                S7_ERR_CONTEXT => "上下文不支持（S7 0x04）——S7-1200/1500 请在 PLC 硬件组态中启用 PUT/GET 通信访问许可".to_string(),
-                S7_ERR_ACCESS => "拒绝访问（S7 0x03）——CPU 保护/安全等级禁止外部读".to_string(),
-                S7_ERR_TYPE_MISMATCH => "数据类型不匹配（S7 0x06）".to_string(),
-                _ => format!("S7 item 错误 0x{ret:02x}"),
-            };
-            let kind = match ret {
-                S7_ERR_ADDRESS => ErrorKind::Address,
-                S7_ERR_CONTEXT => ErrorKind::Configuration,
-                S7_ERR_ACCESS => ErrorKind::Configuration,
-                _ => ErrorKind::Device,
-            };
-            return Err(SdkDriverError::new(kind, format!("S7_ITEM_0x{ret:02X}"), format!("{msg}（data_type 期望 {kind:?}）")));
+            // 按项 BAD：记录日志但不整体失败，调用方将该点发 BAD
+            tracing::warn!(addr=%format_addr(&it.addr), ret=ret, "S7 item 0x{:02X} 按项 BAD", ret);
+            // 仍需跳过该 item 的数据区（若有）以对齐下一项
+            let byte_len = (len_bits + 7) / 8;
+            // S7 在错误时 len_bits 可能为 0，仍按 0 处理，不消费数据
+            if byte_len > 0 && off + byte_len <= data.len() {
+                off += byte_len;
+                if byte_len % 2 == 1 && off < data.len() && data[off] == 0x00 && idx + 1 < sent_items.len() { off += 1; }
+            }
+            out.push(None);
+            continue;
         }
         // S7 返回长度单位为 bit，需转字节；BIT 固定 1 bit→1 byte
         let byte_len = if transport == S7_TRANSPORT_BIT || it.kind == S7Kind::Bool {
@@ -383,7 +380,7 @@ fn parse_read_resp(resp: &[u8], sent_items: &[ReadItem]) -> Result<Vec<Vec<u8>>,
             // snap7 行为：BIT 读取返回 1 字节，值为 0x00/0x01
             bytes = vec![if bytes[0] != 0 { 1 } else { 0 }];
         }
-        out.push(bytes);
+        out.push(Some(bytes));
         off += take;
         // S7 协议字对齐：奇数长度 payload 后补 1 字节 0x00，解析时需跳过否则下一 item 头 0xFF 错位；
         // 为什么用启发式：实测 DB 20 字节偶数不触发、1 字节触发，需兼顾 BIT(1字节)与 BYTE 混批场景

@@ -243,8 +243,9 @@ impl DriverConnection for S7Connection {
                             }
                         }
                     };
-                    // 解码并发布：BOOL 需按位提取（paired 与 raw_vec 同序）
-                    let values: Vec<PointValue> = paired.iter().zip(raw_vec).filter_map(|(((spec, pid), _), raw)| {
+                    // 解码并发布：按项 BAD 隔离，None 表示该项 S7 0x05/0x06，直接跳过，GOOD 项仍发布
+                    let values: Vec<PointValue> = paired.iter().zip(raw_vec).filter_map(|(((spec, pid), _), raw_opt)| {
+                        let raw = match raw_opt { Some(v) => v, None => return None };
                         let vt = if spec.kind == S7Kind::Bool {
                             let bit = spec.addr.bit_offset.unwrap_or(0) as usize;
                             let b = raw.first().copied().unwrap_or(0);
