@@ -124,9 +124,9 @@ pub fn parse_address(input: &str) -> Result<FocasAddress, AddressError> {
     match s.as_str() {
         "status" | "stat" | "state" => return Ok(FocasAddress::Status),
         "alarm" | "alarmmessage" => return Ok(FocasAddress::Alarm),
-        "programnumber" | "prgnum" => return Ok(FocasAddress::ProgramNumber),
-        "programmain" | "prgmain" => return Ok(FocasAddress::ProgramMain),
-        "programname" | "prgname" => return Ok(FocasAddress::ProgramName),
+        "programnumber" | "program.number" | "prgnum" => return Ok(FocasAddress::ProgramNumber),
+        "programmain" | "program.main" | "prgmain" => return Ok(FocasAddress::ProgramMain),
+        "programname" | "program.name" | "prgname" => return Ok(FocasAddress::ProgramName),
         "feed" | "actf" | "axisfeed" => return Ok(FocasAddress::Feed),
         _ => {},
     }
