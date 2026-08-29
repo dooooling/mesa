@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use forgelink_core_types::Value;
 
-use crate::address::{AxisKind, FocasAddress, SpindleKind};
+use crate::address::{AxisKind, FocasAddress, SpindleKind, ToolKind};
 
 // ---------------------------------------------------------------------------
 // 常量：FOCAS 语义边界
@@ -105,6 +105,10 @@ impl FakeFocasApi {
                 }
             }
             FocasAddress::Diagnosis { number: _ } => Value::I32((r % 2001) as i32 - 1000),
+            FocasAddress::Tool { kind: _, number } => {
+                let _ = number;
+                Value::F64((r as f64) / 100.0)
+            }
         }
     }
 }
@@ -375,6 +379,26 @@ impl NativeFocasApi {
                     Ok(v) => Ok(Value::I32(v)),
                     Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT diagnosis {} {}", number, e.message()))),
                     Err(e) => Err(Self::map_ret_err(e)),
+                }
+            }
+            FocasAddress::Tool { kind, number } => {
+                match kind {
+                    crate::address::ToolKind::Number => Ok(Value::U32(1)),
+                    crate::address::ToolKind::Offset => match lib.cnc_rdtofsr(hdl, *number) {
+                        Ok(v) => Ok(Value::F64(v)),
+                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT tool.offset {} {}", number, e.message()))),
+                        Err(e) => Err(Self::map_ret_err(e)),
+                    },
+                    crate::address::ToolKind::Zofs => match lib.cnc_rdzofs(hdl, *number) {
+                        Ok(v) => Ok(Value::F64(v)),
+                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT tool.zofs {} {}", number, e.message()))),
+                        Err(e) => Err(Self::map_ret_err(e)),
+                    },
+                    crate::address::ToolKind::Length => match lib.cnc_rdtofsr(hdl, *number) {
+                        Ok(v) => Ok(Value::F64(v)),
+                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT tool.length {} {}", number, e.message()))),
+                        Err(e) => Err(Self::map_ret_err(e)),
+                    },
                 }
             }
         }

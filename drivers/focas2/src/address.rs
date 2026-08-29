@@ -63,6 +63,11 @@ pub enum FocasAddress {
     Diagnosis {
         number: u32,
     },
+    /// 刀具（TOOL 8：number/offset/zofs）
+    Tool {
+        kind: ToolKind,
+        number: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +82,14 @@ pub enum AxisKind {
 pub enum SpindleKind {
     Speed,
     Load,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolKind {
+    Number,
+    Offset,
+    Zofs,
+    Length,
 }
 
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -126,6 +139,9 @@ pub fn parse_address(input: &str) -> Result<FocasAddress, AddressError> {
     }
     if s.starts_with("servoload.") || s.starts_with("servo.") {
         return parse_servo(&s, raw);
+    }
+    if s.starts_with("tool.") {
+        return parse_tool(&s, raw);
     }
     if s.starts_with("macro.") || s.starts_with("variable.") || s.starts_with("var.") {
         return parse_macro(&s, raw);
@@ -199,6 +215,30 @@ fn parse_servo(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
     Ok(FocasAddress::ServoLoad { axis: n })
 }
 
+fn parse_tool(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
+    let rest = &s["tool.".len()..];
+    if rest == "number" || rest == "num" {
+        return Ok(FocasAddress::Tool { kind: ToolKind::Number, number: 0 });
+    }
+    if let Some(num) = rest.strip_prefix("offset.") {
+        let n: u32 = num.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("刀补号 `{num}` 非法") })?;
+        return Ok(FocasAddress::Tool { kind: ToolKind::Offset, number: n });
+    }
+    if let Some(num) = rest.strip_prefix("zofs.") {
+        let n: u32 = num.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("工件零点 `{num}` 非法") })?;
+        return Ok(FocasAddress::Tool { kind: ToolKind::Zofs, number: n });
+    }
+    if let Some(num) = rest.strip_prefix("length.") {
+        let n: u32 = num.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("刀长 `{num}` 非法") })?;
+        return Ok(FocasAddress::Tool { kind: ToolKind::Length, number: n });
+    }
+    // 兼容 tool.1 视为 offset.1
+    if let Ok(n) = rest.parse::<u32>() {
+        return Ok(FocasAddress::Tool { kind: ToolKind::Offset, number: n });
+    }
+    Err(AddressError::Invalid { input: raw.to_string(), reason: "tool 地址形如 tool.number / tool.offset.1 / tool.zofs.1 / tool.length.1".into() })
+}
+
 fn parse_macro(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
     let rest = if s.starts_with("macro.") { &s["macro.".len()..] } else if s.starts_with("variable.") { &s["variable.".len()..] } else { &s["var.".len()..] };
     let n: u32 = rest.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("宏变量号 `{rest}` 非法") })?;
@@ -269,6 +309,16 @@ mod tests {
         ok("macro.100", FocasAddress::MacroVar { number: 100 });
         ok("pmc.R100", FocasAddress::Pmc { kind: 'R', addr: 100, bit: None });
         ok("pmc.R100.0", FocasAddress::Pmc { kind: 'R', addr: 100, bit: Some(0) });
+    }
+
+    #[test]
+    fn tool_forms() {
+        ok("tool.number", FocasAddress::Tool { kind: crate::address::ToolKind::Number, number: 0 });
+        ok("tool.offset.1", FocasAddress::Tool { kind: crate::address::ToolKind::Offset, number: 1 });
+        ok("tool.zofs.2", FocasAddress::Tool { kind: crate::address::ToolKind::Zofs, number: 2 });
+        ok("variable.100", FocasAddress::MacroVar { number: 100 });
+        ok("axis.pos.1", FocasAddress::Axis { axis: 1, kind: AxisKind::Absolute });
+        ok("pmc.Z0", FocasAddress::Pmc { kind: 'Z', addr: 0, bit: None });
     }
 
     #[test]

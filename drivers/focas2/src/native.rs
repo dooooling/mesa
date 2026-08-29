@@ -351,6 +351,8 @@ type FnRdPrgNum = unsafe extern "C" fn(c_ushort, *mut OdbPrgNum) -> c_short;
 type FnRdSpMeter = unsafe extern "C" fn(c_ushort, c_short, *mut c_short, *mut SpLoad) -> c_short;
 type FnRdSvMeter = unsafe extern "C" fn(c_ushort, *mut c_short, *mut SpLoad) -> c_short;
 type FnRdOpMsg = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OpMsg) -> c_short;
+type FnRdTofsr = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, *mut u8) -> c_short;
+type FnRdZofs = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut u8) -> c_short;
 
 // ---------------------------------------------------------------------------
 // 动态库封装
@@ -373,6 +375,8 @@ pub struct NativeLib {
     pub cnc_rdspmeter: Option<Symbol<'static, FnRdSpMeter>>,
     pub cnc_rdsvmeter: Option<Symbol<'static, FnRdSvMeter>>,
     pub cnc_rdopmsg: Option<Symbol<'static, FnRdOpMsg>>,
+    pub cnc_rdtofsr: Option<Symbol<'static, FnRdTofsr>>,
+    pub cnc_rdzofs: Option<Symbol<'static, FnRdZofs>>,
 }
 
 impl NativeLib {
@@ -544,6 +548,8 @@ impl NativeLib {
             cnc_rdspmeter: None,
             cnc_rdsvmeter: None,
             cnc_rdopmsg: None,
+            cnc_rdtofsr: None,
+            cnc_rdzofs: None,
         };
         unsafe {
             let raw: *const Library = &me._lib as *const Library;
@@ -562,6 +568,8 @@ impl NativeLib {
             me.cnc_rdspmeter = (*raw).get::<FnRdSpMeter>(b"cnc_rdspmeter").ok().map(|s| std::mem::transmute(s));
             me.cnc_rdsvmeter = (*raw).get::<FnRdSvMeter>(b"cnc_rdsvmeter").ok().map(|s| std::mem::transmute(s));
             me.cnc_rdopmsg = (*raw).get::<FnRdOpMsg>(b"cnc_rdopmsg").ok().map(|s| std::mem::transmute(s));
+            me.cnc_rdtofsr = (*raw).get::<FnRdTofsr>(b"cnc_rdtofsr").ok().map(|s| std::mem::transmute(s));
+            me.cnc_rdzofs = (*raw).get::<FnRdZofs>(b"cnc_rdzofs").ok().map(|s| std::mem::transmute(s));
         }
         me
     }
@@ -759,6 +767,24 @@ impl NativeLib {
         let rc = unsafe { sym(hdl as c_ushort, 0 as c_short, 64 as c_short, &mut out as *mut OpMsg) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() { Ok(out) } else { Err(ret) }
+    }
+
+    /// 读刀补：`cnc_rdtofsr(hdl, 0, 1, 1, buf)` 占位，TOOL 8 用，缺符号时 Noopt→Bad
+    pub fn cnc_rdtofsr(&self, hdl: u16, num: u32) -> Result<f64, FocasRet> {
+        let sym = self.cnc_rdtofsr.as_ref().ok_or(FocasRet::Noopt)?;
+        let mut buf = [0u8; 64];
+        let rc = unsafe { sym(hdl as c_ushort, 0 as c_short, num as c_short, 1 as c_short, buf.as_mut_ptr()) };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() { Ok(0.0) } else { Err(ret) }
+    }
+
+    /// 读工件零点：`cnc_rdzofs(hdl, 0, num, buf)` 占位
+    pub fn cnc_rdzofs(&self, hdl: u16, num: u32) -> Result<f64, FocasRet> {
+        let sym = self.cnc_rdzofs.as_ref().ok_or(FocasRet::Noopt)?;
+        let mut buf = [0u8; 64];
+        let rc = unsafe { sym(hdl as c_ushort, 0 as c_short, num as c_short, buf.as_mut_ptr()) };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() { Ok(0.0) } else { Err(ret) }
     }
 }
 
