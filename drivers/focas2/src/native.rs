@@ -698,7 +698,7 @@ impl NativeLib {
         match kind {
             'G' => PMC_TYPE_G, 'F' => PMC_TYPE_F, 'Y' => PMC_TYPE_Y, 'X' => PMC_TYPE_X, 'A' => PMC_TYPE_A,
             'R' => PMC_TYPE_R, 'T' => PMC_TYPE_T, 'K' => PMC_TYPE_K, 'C' => PMC_TYPE_C,
-            'D' => PMC_TYPE_D, 'M' => PMC_TYPE_M, 'N' | 'E' => PMC_TYPE_N, 'Z' => PMC_TYPE_Z, _ => PMC_TYPE_R,
+            'D' => PMC_TYPE_D, 'M' => PMC_TYPE_M, 'N' | 'E' => PMC_TYPE_N, 'Z' => PMC_TYPE_Z, 'B' => PMC_TYPE_R, _ => PMC_TYPE_R,
         }
     }
 

@@ -90,7 +90,7 @@ pub enum AddressError {
 impl AxisKind {
     fn from_str(s: &str) -> Option<Self> {
         match s {
-            "abs" | "absolute" => Some(Self::Absolute),
+            "abs" | "absolute" | "pos" | "position" => Some(Self::Absolute),
             "machine" | "mach" => Some(Self::Machine),
             "relative" | "rel" => Some(Self::Relative),
             "distance" | "dist" => Some(Self::Distance),
@@ -127,7 +127,7 @@ pub fn parse_address(input: &str) -> Result<FocasAddress, AddressError> {
     if s.starts_with("servoload.") || s.starts_with("servo.") {
         return parse_servo(&s, raw);
     }
-    if s.starts_with("macro.") {
+    if s.starts_with("macro.") || s.starts_with("variable.") || s.starts_with("var.") {
         return parse_macro(&s, raw);
     }
     if s.starts_with("pmc.") {
@@ -171,8 +171,8 @@ fn parse_spindle(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
     match parts.as_slice() {
         [kind, num] => {
             let k = match *kind {
-                "speed" | "acts" => SpindleKind::Speed,
-                "load" | "spmeter" => SpindleKind::Load,
+                "speed" | "acts" | "rpm" | "s" => SpindleKind::Speed,
+                "load" | "spmeter" | "ld" => SpindleKind::Load,
                 _ => return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("主轴类型 `{kind}` 非法，期望 speed/load") }),
             };
             let n: u8 = num.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("主轴号 `{num}` 非法 1..{FOCAS_MAX_SPINDLE}") })?;
@@ -181,8 +181,8 @@ fn parse_spindle(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
         }
         [kind] => {
             let k = match *kind {
-                "speed" | "acts" => SpindleKind::Speed,
-                "load" | "spmeter" => SpindleKind::Load,
+                "speed" | "acts" | "rpm" | "s" => SpindleKind::Speed,
+                "load" | "spmeter" | "ld" => SpindleKind::Load,
                 _ => return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("主轴类型 `{kind}` 非法") }),
             };
             Ok(FocasAddress::Spindle { spindle: 1, kind: k })
@@ -200,7 +200,7 @@ fn parse_servo(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
 }
 
 fn parse_macro(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
-    let rest = &s["macro.".len()..];
+    let rest = if s.starts_with("macro.") { &s["macro.".len()..] } else if s.starts_with("variable.") { &s["variable.".len()..] } else { &s["var.".len()..] };
     let n: u32 = rest.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("宏变量号 `{rest}` 非法") })?;
     Ok(FocasAddress::MacroVar { number: n })
 }
@@ -209,7 +209,7 @@ fn parse_pmc(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
     let rest = &s["pmc.".len()..].to_ascii_uppercase();
     if rest.is_empty() { return Err(AddressError::Invalid { input: raw.to_string(), reason: "PMC 地址缺失，如 pmc.R100".into() }); }
     let kind = rest.chars().next().unwrap();
-    if !matches!(kind, 'R' | 'D' | 'G' | 'X' | 'Y' | 'F' | 'A' | 'C' | 'K' | 'T' | 'M' | 'N' | 'E') {
+    if !matches!(kind, 'R' | 'D' | 'G' | 'X' | 'Y' | 'F' | 'A' | 'C' | 'K' | 'T' | 'M' | 'N' | 'E' | 'Z' | 'B') {
         return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("PMC 类型 `{kind}` 非法") });
     }
     let tail = &rest[1..];
