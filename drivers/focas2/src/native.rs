@@ -353,6 +353,7 @@ type FnRdSvMeter = unsafe extern "C" fn(c_ushort, *mut c_short, *mut SpLoad) -> 
 type FnRdOpMsg = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OpMsg) -> c_short;
 type FnRdTofsr = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, *mut u8) -> c_short;
 type FnRdZofs = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut u8) -> c_short;
+type FnRdParam = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, *mut u8) -> c_short;
 
 // ---------------------------------------------------------------------------
 // 动态库封装
@@ -377,6 +378,7 @@ pub struct NativeLib {
     pub cnc_rdopmsg: Option<Symbol<'static, FnRdOpMsg>>,
     pub cnc_rdtofsr: Option<Symbol<'static, FnRdTofsr>>,
     pub cnc_rdzofs: Option<Symbol<'static, FnRdZofs>>,
+    pub cnc_rdparam: Option<Symbol<'static, FnRdParam>>,
 }
 
 impl NativeLib {
@@ -550,6 +552,7 @@ impl NativeLib {
             cnc_rdopmsg: None,
             cnc_rdtofsr: None,
             cnc_rdzofs: None,
+            cnc_rdparam: None,
         };
         unsafe {
             let raw: *const Library = &me._lib as *const Library;
@@ -570,6 +573,7 @@ impl NativeLib {
             me.cnc_rdopmsg = (*raw).get::<FnRdOpMsg>(b"cnc_rdopmsg").ok().map(|s| std::mem::transmute(s));
             me.cnc_rdtofsr = (*raw).get::<FnRdTofsr>(b"cnc_rdtofsr").ok().map(|s| std::mem::transmute(s));
             me.cnc_rdzofs = (*raw).get::<FnRdZofs>(b"cnc_rdzofs").ok().map(|s| std::mem::transmute(s));
+            me.cnc_rdparam = (*raw).get::<FnRdParam>(b"cnc_rdparam").ok().map(|s| std::mem::transmute(s));
         }
         me
     }
@@ -785,6 +789,15 @@ impl NativeLib {
         let rc = unsafe { sym(hdl as c_ushort, 0 as c_short, num as c_short, buf.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() { Ok(0.0) } else { Err(ret) }
+    }
+
+    /// 读参数：`cnc_rdparam(hdl, num, 0, 8, buf)` 占位，PARAM 2 用，缺符号 Noopt→Bad
+    pub fn cnc_rdparam(&self, hdl: u16, num: u32) -> Result<i32, FocasRet> {
+        let sym = self.cnc_rdparam.as_ref().ok_or(FocasRet::Noopt)?;
+        let mut buf = [0u8; 64];
+        let rc = unsafe { sym(hdl as c_ushort, num as c_short, 0 as c_short, 8 as c_short, buf.as_mut_ptr()) };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() { Ok(0) } else { Err(ret) }
     }
 }
 

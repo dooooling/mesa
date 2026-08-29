@@ -105,6 +105,7 @@ impl FakeFocasApi {
                 }
             }
             FocasAddress::Diagnosis { number: _ } => Value::I32((r % 2001) as i32 - 1000),
+            FocasAddress::Param { number: _ } => Value::I32((r % 1000) as i32),
             FocasAddress::Tool { kind: _, number } => {
                 let _ = number;
                 Value::F64((r as f64) / 100.0)
@@ -381,6 +382,11 @@ impl NativeFocasApi {
                     Err(e) => Err(Self::map_ret_err(e)),
                 }
             }
+            FocasAddress::Param { number } => match lib.cnc_rdparam(hdl, *number) {
+                Ok(v) => Ok(Value::I32(v)),
+                Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT param {} {}", number, e.message()))),
+                Err(e) => Err(Self::map_ret_err(e)),
+            },
             FocasAddress::Tool { kind, number } => {
                 match kind {
                     crate::address::ToolKind::Number => Ok(Value::U32(1)),

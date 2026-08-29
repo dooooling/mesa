@@ -68,6 +68,10 @@ pub enum FocasAddress {
         kind: ToolKind,
         number: u32,
     },
+    /// 参数
+    Param {
+        number: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +143,9 @@ pub fn parse_address(input: &str) -> Result<FocasAddress, AddressError> {
     }
     if s.starts_with("servoload.") || s.starts_with("servo.") {
         return parse_servo(&s, raw);
+    }
+    if s.starts_with("param.") || s.starts_with("parameter.") {
+        return parse_param(&s, raw);
     }
     if s.starts_with("tool.") {
         return parse_tool(&s, raw);
@@ -237,6 +244,12 @@ fn parse_tool(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
         return Ok(FocasAddress::Tool { kind: ToolKind::Offset, number: n });
     }
     Err(AddressError::Invalid { input: raw.to_string(), reason: "tool 地址形如 tool.number / tool.offset.1 / tool.zofs.1 / tool.length.1".into() })
+}
+
+fn parse_param(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
+    let rest = if s.starts_with("param.") { &s["param.".len()..] } else { &s["parameter.".len()..] };
+    let n: u32 = rest.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("参数号 `{rest}` 非法") })?;
+    Ok(FocasAddress::Param { number: n })
 }
 
 fn parse_macro(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
