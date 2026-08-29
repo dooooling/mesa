@@ -82,6 +82,9 @@ pub enum AxisKind {
     Machine,
     Relative,
     Distance,
+    Data,
+    SrvDelay,
+    AccDecDly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +116,9 @@ impl AxisKind {
             "machine" | "mach" => Some(Self::Machine),
             "relative" | "rel" => Some(Self::Relative),
             "distance" | "dist" => Some(Self::Distance),
+            "data" | "axisdata" => Some(Self::Data),
+            "srvdelay" | "srv" => Some(Self::SrvDelay),
+            "accdecdly" | "acc" => Some(Self::AccDecDly),
             _ => None,
         }
     }

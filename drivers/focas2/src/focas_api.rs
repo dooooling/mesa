@@ -75,7 +75,7 @@ impl FakeFocasApi {
                 // 模拟位置：-10000..10000 带小数（以 0.001 为单位存储为 I32）
                 let base = (r % 20001) as i32 - 10000;
                 match kind {
-                    AxisKind::Absolute | AxisKind::Machine | AxisKind::Relative | AxisKind::Distance => {
+                    AxisKind::Absolute | AxisKind::Machine | AxisKind::Relative | AxisKind::Distance | AxisKind::Data | AxisKind::SrvDelay | AxisKind::AccDecDly => {
                         // 返回 I32 位置（单位 0.001mm），上层直接取 Value::I32
                         Value::I32(base * 100)
                     }
