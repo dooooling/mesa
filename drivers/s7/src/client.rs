@@ -484,6 +484,9 @@ fn format_addr(a: &S7Address) -> String {
         Area::Timer => format!("T{}", a.byte_offset),
         Area::PeripheralInput => format!("PIW{}", a.byte_offset),
         Area::PeripheralOutput => format!("PQW{}", a.byte_offset),
+        Area::Local => {
+            if let Some(bit) = a.bit_offset { format!("L{}.{}", a.byte_offset, bit) } else { format!("LB{}", a.byte_offset) }
+        }
     }
 }
 

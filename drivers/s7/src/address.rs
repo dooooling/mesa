@@ -13,14 +13,15 @@ use thiserror::Error;
 // ---------------------------------------------------------------------------
 // 常量：S7 区域与位边界（中文解释“为什么”）
 // ---------------------------------------------------------------------------
-/// S7 ANY 结构的 area 字段：DB 0x84 / M 0x83 / I 0x81 / Q 0x82 / C 0x1C / T 0x1D（S7Comm 固定）
+/// S7 ANY 结构的 area 字段：DB 0x84 / M 0x83 / I 0x81 / Q 0x82 / C 0x1C / T 0x1D / L 0x86（S7Comm 固定）
 const S7_AREA_DB: u8 = 0x84;
 const S7_AREA_MERKER: u8 = 0x83;
 const S7_AREA_INPUT: u8 = 0x81;
 const S7_AREA_OUTPUT: u8 = 0x82;
 const S7_AREA_COUNTER: u8 = 0x1C;
 const S7_AREA_TIMER: u8 = 0x1D;
-const S7_AREA_PERIPHERAL: u8 = 0x80; // PI/PE/PQ/PA：V1 统一按外设区 0x80，兼容 PIW/PQW/PEW
+const S7_AREA_PERIPHERAL: u8 = 0x80; // PI/PE/PQ/PA/AI/AQ：V1 统一按外设区 0x80，兼容 PIW/PQW/PEW/AIW
+const S7_AREA_LOCAL: u8 = 0x86; // L 局部栈（S7-200/300 L 栈）
 /// 1 字节内位偏移上限 0..7
 const S7_MAX_BIT: u8 = 7;
 /// 字节到位换算：S7 ANY 中位地址 = byte*8 + bit
@@ -36,6 +37,7 @@ pub enum Area {
     Timer,
     PeripheralInput,
     PeripheralOutput,
+    Local,
 }
 
 impl Area {
@@ -50,6 +52,7 @@ impl Area {
             Area::Timer => S7_AREA_TIMER,
             Area::PeripheralInput => S7_AREA_PERIPHERAL,
             Area::PeripheralOutput => S7_AREA_PERIPHERAL,
+            Area::Local => S7_AREA_LOCAL,
         }
     }
 
@@ -92,7 +95,7 @@ impl S7Address {
 
 /// 解析用户提供的地址字符串（大小写不敏感，允许空格）。
 ///
-/// Common 扩展：`C`/`T` 计数器/定时器、`PI`/`PQ`/`PE`/`PA` 外设、`CLOCK`/`SZL` 系统区。
+/// Common 全量：`DB/M/I/Q/C/T` + `V→DB1` + `SM→M` + `AI/AQ→PI/PQ` + `L` 局部 + `PI/PQ/PE/PA`。
 pub fn parse_address(input: &str) -> Result<S7Address, AddressError> {
     let raw = input.trim();
     if raw.is_empty() {
@@ -103,19 +106,27 @@ pub fn parse_address(input: &str) -> Result<S7Address, AddressError> {
     let s = s.replace(' ', "");
     if s.starts_with("DB") {
         parse_db(&s, raw)
+    } else if s.starts_with("AI") || s.starts_with("AQ") {
+        parse_ai_aq(&s, raw)
     } else if s.starts_with("PI") || s.starts_with("PE") || s.starts_with("PQ") || s.starts_with("PA") {
         parse_peripheral(&s, raw)
+    } else if s.starts_with('V') {
+        parse_v(&s, raw)
+    } else if s.starts_with("SM") {
+        parse_sm(&s, raw)
     } else if s.starts_with('C') && !s.starts_with("CLOCK") {
         parse_counter(&s, raw)
     } else if s.starts_with('T') {
         parse_timer(&s, raw)
+    } else if s.starts_with('L') {
+        parse_local(&s, raw)
     } else if s.starts_with('M') || s.starts_with('I') || s.starts_with('Q') {
         parse_miq(&s, raw)
     } else if s == "CLOCK" || s.starts_with("SZL") {
         // CLOCK/SZL 为系统功能，V1 映射为 DB0 占位，调用方走 SZL 诊断分支；保留解析兼容
         Err(AddressError::Invalid { input: raw.to_string(), reason: "CLOCK/SZL 请通过诊断接口读取，非点位地址".into() })
     } else {
-        Err(AddressError::Invalid { input: raw.to_string(), reason: "必须以 DB/M/I/Q/C/T/PI/PQ 开头".into() })
+        Err(AddressError::Invalid { input: raw.to_string(), reason: "必须以 DB/M/I/Q/C/T/V/SM/AI/AQ/L/PI/PQ 开头".into() })
     }
 }
 
@@ -255,6 +266,64 @@ fn parse_timer(s: &str, raw: &str) -> Result<S7Address, AddressError> {
     Ok(S7Address { area: Area::Timer, db_number: 0, byte_offset: num, bit_offset: None })
 }
 
+fn parse_v(s: &str, raw: &str) -> Result<S7Address, AddressError> {
+    // V / VB / VW / VD 均映射为 DB1（S7-200 V 变量区 ≡ DB1），兼容 V0.0 / VB0 / VW0
+    let rest = s[1..].trim_start_matches(|c| c == 'B' || c == 'W' || c == 'D');
+    if rest.is_empty() { return Err(AddressError::Invalid { input: raw.to_string(), reason: "V 偏移缺失".into() }); }
+    let (byte_s, bit_opt) = if let Some((b, bit)) = rest.split_once('.') { (b, Some(bit)) } else { (rest, None) };
+    let byte_offset: u32 = byte_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("字节偏移 `{byte_s}` 非法") })?;
+    if let Some(bit_s) = bit_opt {
+        let bit: u8 = bit_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移 `{bit_s}` 非法") })?;
+        if bit > S7_MAX_BIT { return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移必须 0..{S7_MAX_BIT}") }); }
+        Ok(S7Address { area: Area::Db, db_number: 1, byte_offset, bit_offset: Some(bit) })
+    } else {
+        Ok(S7Address { area: Area::Db, db_number: 1, byte_offset, bit_offset: None })
+    }
+}
+
+fn parse_sm(s: &str, raw: &str) -> Result<S7Address, AddressError> {
+    // SM / SMB / SMW / SMD 映射为 Merker 0x83（SM0.0 特殊位同 M 寻址）
+    let rest = s[2..].trim_start_matches(|c| c == 'B' || c == 'W' || c == 'D');
+    if rest.is_empty() { return Err(AddressError::Invalid { input: raw.to_string(), reason: "SM 偏移缺失".into() }); }
+    let (byte_s, bit_opt) = if let Some((b, bit)) = rest.split_once('.') { (b, Some(bit)) } else { (rest, None) };
+    let byte_offset: u32 = byte_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("字节偏移 `{byte_s}` 非法") })?;
+    if let Some(bit_s) = bit_opt {
+        let bit: u8 = bit_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移 `{bit_s}` 非法") })?;
+        if bit > S7_MAX_BIT { return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移必须 0..{S7_MAX_BIT}") }); }
+        Ok(S7Address { area: Area::Merker, db_number: 0, byte_offset, bit_offset: Some(bit) })
+    } else {
+        Ok(S7Address { area: Area::Merker, db_number: 0, byte_offset, bit_offset: None })
+    }
+}
+
+fn parse_ai_aq(s: &str, raw: &str) -> Result<S7Address, AddressError> {
+    // AIW0 / AI0 / AQW0 / AQB0 统一按外设 0x80，AI→Input AQ→Output
+    let is_input = s.starts_with("AI");
+    let area = if is_input { Area::PeripheralInput } else { Area::PeripheralOutput };
+    let rest = &s[2..];
+    if rest.is_empty() { return Err(AddressError::Invalid { input: raw.to_string(), reason: "AI/AQ 偏移缺失".into() }); }
+    let after = rest.trim_start_matches(|c| c == 'B' || c == 'W' || c == 'D');
+    if after.is_empty() { return Err(AddressError::Invalid { input: raw.to_string(), reason: "AI/AQ 偏移缺失".into() }); }
+    let byte_s = after.split('.').next().unwrap_or(after);
+    let byte_offset: u32 = byte_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("字节偏移 `{byte_s}` 非法") })?;
+    Ok(S7Address { area, db_number: 0, byte_offset, bit_offset: None })
+}
+
+fn parse_local(s: &str, raw: &str) -> Result<S7Address, AddressError> {
+    // L / LB / LW / LD 局部栈 0x86，S7-200/300 L 区
+    let rest = s[1..].trim_start_matches(|c| c == 'B' || c == 'W' || c == 'D');
+    if rest.is_empty() { return Err(AddressError::Invalid { input: raw.to_string(), reason: "L 偏移缺失".into() }); }
+    let (byte_s, bit_opt) = if let Some((b, bit)) = rest.split_once('.') { (b, Some(bit)) } else { (rest, None) };
+    let byte_offset: u32 = byte_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("字节偏移 `{byte_s}` 非法") })?;
+    if let Some(bit_s) = bit_opt {
+        let bit: u8 = bit_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移 `{bit_s}` 非法") })?;
+        if bit > S7_MAX_BIT { return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移必须 0..{S7_MAX_BIT}") }); }
+        Ok(S7Address { area: Area::Local, db_number: 0, byte_offset, bit_offset: Some(bit) })
+    } else {
+        Ok(S7Address { area: Area::Local, db_number: 0, byte_offset, bit_offset: None })
+    }
+}
+
 fn split_byte_bit<'a>(s: &'a str, raw: &'a str) -> Result<(&'a str, &'a str), AddressError> {
     let (b, bit) = s.split_once('.').ok_or_else(|| AddressError::Invalid { input: raw.to_string(), reason: "DBX 必须带位偏移如 DBX0.0".into() })?;
     if b.is_empty() || bit.is_empty() {
@@ -318,6 +387,19 @@ mod tests {
         ok("PQW0", Area::PeripheralOutput, 0, 0, None);
         ok("PIW256", Area::PeripheralInput, 0, 256, None);
         ok("PEW0", Area::PeripheralInput, 0, 0, None);
+    }
+
+    #[test]
+    fn v_sm_ai_aq_l() {
+        ok("VB0", Area::Db, 1, 0, None);
+        ok("VW10", Area::Db, 1, 10, None);
+        ok("V0.0", Area::Db, 1, 0, Some(0));
+        ok("SM0.0", Area::Merker, 0, 0, Some(0));
+        ok("SMB0", Area::Merker, 0, 0, None);
+        ok("AIW0", Area::PeripheralInput, 0, 0, None);
+        ok("AQW0", Area::PeripheralOutput, 0, 0, None);
+        ok("L0.0", Area::Local, 0, 0, Some(0));
+        ok("LB10", Area::Local, 0, 10, None);
     }
 
     #[test]
