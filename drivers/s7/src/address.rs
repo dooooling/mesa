@@ -106,6 +106,10 @@ pub fn parse_address(input: &str) -> Result<S7Address, AddressError> {
     let s = s.replace(' ', "");
     if s.starts_with("DB") {
         parse_db(&s, raw)
+    } else if s.starts_with("AC") {
+        parse_ac(&s, raw)
+    } else if s.starts_with("HC") {
+        parse_hc(&s, raw)
     } else if s.starts_with("AI") || s.starts_with("AQ") {
         parse_ai_aq(&s, raw)
     } else if s.starts_with("PI") || s.starts_with("PE") || s.starts_with("PQ") || s.starts_with("PA") {
@@ -120,6 +124,8 @@ pub fn parse_address(input: &str) -> Result<S7Address, AddressError> {
         parse_timer(&s, raw)
     } else if s.starts_with('L') {
         parse_local(&s, raw)
+    } else if s.starts_with('S') && !s.starts_with("SM") {
+        parse_s(&s, raw)
     } else if s.starts_with('M') || s.starts_with('I') || s.starts_with('Q') {
         parse_miq(&s, raw)
     } else if s == "CLOCK" || s.starts_with("SZL") {
@@ -324,6 +330,40 @@ fn parse_local(s: &str, raw: &str) -> Result<S7Address, AddressError> {
     }
 }
 
+fn parse_ac(s: &str, raw: &str) -> Result<S7Address, AddressError> {
+    // AC0-AC3 累加器（S7-200），映射为 Merker 0x83 兼容，S7-200 专属
+    let rest = s[2..].trim_start_matches(|c| c == 'B' || c == 'W' || c == 'D');
+    if rest.is_empty() { return Ok(S7Address { area: Area::Merker, db_number: 0, byte_offset: 0, bit_offset: None }); }
+    let byte_s = rest.split('.').next().unwrap_or(rest);
+    let byte_offset: u32 = byte_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("AC `{rest}` 非法") })?;
+    if byte_offset > 3 { return Err(AddressError::Invalid { input: raw.to_string(), reason: "AC 仅 0..3".into() }); }
+    Ok(S7Address { area: Area::Merker, db_number: 0, byte_offset: byte_offset * 4, bit_offset: None })
+}
+
+fn parse_hc(s: &str, raw: &str) -> Result<S7Address, AddressError> {
+    // HC0-HC5 高速计数器（S7-200），映射为 Counter 0x1C
+    let rest = s[2..].trim_start_matches(|c| c == 'B' || c == 'W' || c == 'D');
+    if rest.is_empty() { return Err(AddressError::Invalid { input: raw.to_string(), reason: "HC 号缺失".into() }); }
+    let num: u32 = rest.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("HC `{rest}` 非法") })?;
+    if num > 5 { return Err(AddressError::Invalid { input: raw.to_string(), reason: "HC 仅 0..5".into() }); }
+    Ok(S7Address { area: Area::Counter, db_number: 0, byte_offset: num, bit_offset: None })
+}
+
+fn parse_s(s: &str, raw: &str) -> Result<S7Address, AddressError> {
+    // S0.0 / S0 / SB0 顺控继电器（S7-200 SCR），映射为 Merker 0x83
+    let rest = s[1..].trim_start_matches(|c| c == 'B' || c == 'W' || c == 'D');
+    if rest.is_empty() { return Err(AddressError::Invalid { input: raw.to_string(), reason: "S 偏移缺失".into() }); }
+    let (byte_s, bit_opt) = if let Some((b, bit)) = rest.split_once('.') { (b, Some(bit)) } else { (rest, None) };
+    let byte_offset: u32 = byte_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("字节偏移 `{byte_s}` 非法") })?;
+    if let Some(bit_s) = bit_opt {
+        let bit: u8 = bit_s.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移 `{bit_s}` 非法") })?;
+        if bit > S7_MAX_BIT { return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("位偏移必须 0..{S7_MAX_BIT}") }); }
+        Ok(S7Address { area: Area::Merker, db_number: 0, byte_offset, bit_offset: Some(bit) })
+    } else {
+        Ok(S7Address { area: Area::Merker, db_number: 0, byte_offset, bit_offset: None })
+    }
+}
+
 fn split_byte_bit<'a>(s: &'a str, raw: &'a str) -> Result<(&'a str, &'a str), AddressError> {
     let (b, bit) = s.split_once('.').ok_or_else(|| AddressError::Invalid { input: raw.to_string(), reason: "DBX 必须带位偏移如 DBX0.0".into() })?;
     if b.is_empty() || bit.is_empty() {
@@ -400,6 +440,16 @@ mod tests {
         ok("AQW0", Area::PeripheralOutput, 0, 0, None);
         ok("L0.0", Area::Local, 0, 0, Some(0));
         ok("LB10", Area::Local, 0, 10, None);
+    }
+
+    #[test]
+    fn ac_hc_s() {
+        ok("AC0", Area::Merker, 0, 0, None);
+        ok("AC1", Area::Merker, 0, 4, None);
+        ok("HC0", Area::Counter, 0, 0, None);
+        ok("HC5", Area::Counter, 0, 5, None);
+        ok("S0.0", Area::Merker, 0, 0, Some(0));
+        ok("SB0", Area::Merker, 0, 0, None);
     }
 
     #[test]
