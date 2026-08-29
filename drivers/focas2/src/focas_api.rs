@@ -106,6 +106,8 @@ impl FakeFocasApi {
             }
             FocasAddress::Diagnosis { number: _ } => Value::I32((r % 2001) as i32 - 1000),
             FocasAddress::Param { number: _ } => Value::I32((r % 1000) as i32),
+            FocasAddress::ProgramDir => Value::String(format!("DIR{}", r % 10)),
+            FocasAddress::ProgramInfo => Value::String(format!("INFO{}", r % 10)),
             FocasAddress::Tool { kind: _, number } => {
                 let _ = number;
                 Value::F64((r as f64) / 100.0)
@@ -385,6 +387,16 @@ impl NativeFocasApi {
             FocasAddress::Param { number } => match lib.cnc_rdparam(hdl, *number) {
                 Ok(v) => Ok(Value::I32(v)),
                 Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT param {} {}", number, e.message()))),
+                Err(e) => Err(Self::map_ret_err(e)),
+            },
+            FocasAddress::ProgramDir => match lib.cnc_rdprogdir(hdl) {
+                Ok(v) => Ok(Value::String(v)),
+                Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT progdir {}", e.message()))),
+                Err(e) => Err(Self::map_ret_err(e)),
+            },
+            FocasAddress::ProgramInfo => match lib.cnc_rdproginfo(hdl) {
+                Ok(v) => Ok(Value::String(v)),
+                Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT proginfo {}", e.message()))),
                 Err(e) => Err(Self::map_ret_err(e)),
             },
             FocasAddress::Tool { kind, number } => {

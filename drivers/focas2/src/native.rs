@@ -354,6 +354,8 @@ type FnRdOpMsg = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OpMsg) ->
 type FnRdTofsr = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, *mut u8) -> c_short;
 type FnRdZofs = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut u8) -> c_short;
 type FnRdParam = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, *mut u8) -> c_short;
+type FnRdProgDir = unsafe extern "C" fn(c_ushort, c_short, *mut u8) -> c_short;
+type FnRdProgInfo = unsafe extern "C" fn(c_ushort, c_short, *mut u8) -> c_short;
 
 // ---------------------------------------------------------------------------
 // 动态库封装
@@ -379,6 +381,8 @@ pub struct NativeLib {
     pub cnc_rdtofsr: Option<Symbol<'static, FnRdTofsr>>,
     pub cnc_rdzofs: Option<Symbol<'static, FnRdZofs>>,
     pub cnc_rdparam: Option<Symbol<'static, FnRdParam>>,
+    pub cnc_rdprogdir: Option<Symbol<'static, FnRdProgDir>>,
+    pub cnc_rdproginfo: Option<Symbol<'static, FnRdProgInfo>>,
 }
 
 impl NativeLib {
@@ -553,6 +557,8 @@ impl NativeLib {
             cnc_rdtofsr: None,
             cnc_rdzofs: None,
             cnc_rdparam: None,
+            cnc_rdprogdir: None,
+            cnc_rdproginfo: None,
         };
         unsafe {
             let raw: *const Library = &me._lib as *const Library;
@@ -574,6 +580,8 @@ impl NativeLib {
             me.cnc_rdtofsr = (*raw).get::<FnRdTofsr>(b"cnc_rdtofsr").ok().map(|s| std::mem::transmute(s));
             me.cnc_rdzofs = (*raw).get::<FnRdZofs>(b"cnc_rdzofs").ok().map(|s| std::mem::transmute(s));
             me.cnc_rdparam = (*raw).get::<FnRdParam>(b"cnc_rdparam").ok().map(|s| std::mem::transmute(s));
+            me.cnc_rdprogdir = (*raw).get::<FnRdProgDir>(b"cnc_rdprogdir").ok().map(|s| std::mem::transmute(s));
+            me.cnc_rdproginfo = (*raw).get::<FnRdProgInfo>(b"cnc_rdproginfo").ok().map(|s| std::mem::transmute(s));
         }
         me
     }
@@ -798,6 +806,24 @@ impl NativeLib {
         let rc = unsafe { sym(hdl as c_ushort, num as c_short, 0 as c_short, 8 as c_short, buf.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() { Ok(0) } else { Err(ret) }
+    }
+
+    /// 读程序目录：`cnc_rdprogdir(hdl, 0, buf)` 占位，PROGRAM 3 用
+    pub fn cnc_rdprogdir(&self, hdl: u16) -> Result<String, FocasRet> {
+        let sym = self.cnc_rdprogdir.as_ref().ok_or(FocasRet::Noopt)?;
+        let mut buf = [0u8; 256];
+        let rc = unsafe { sym(hdl as c_ushort, 0 as c_short, buf.as_mut_ptr()) };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() { Ok(String::from_utf8_lossy(&buf).trim_end_matches('\0').to_string()) } else { Err(ret) }
+    }
+
+    /// 读程序信息：`cnc_rdproginfo(hdl, 0, buf)` 占位
+    pub fn cnc_rdproginfo(&self, hdl: u16) -> Result<String, FocasRet> {
+        let sym = self.cnc_rdproginfo.as_ref().ok_or(FocasRet::Noopt)?;
+        let mut buf = [0u8; 256];
+        let rc = unsafe { sym(hdl as c_ushort, 0 as c_short, buf.as_mut_ptr()) };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() { Ok(String::from_utf8_lossy(&buf).trim_end_matches('\0').to_string()) } else { Err(ret) }
     }
 }
 

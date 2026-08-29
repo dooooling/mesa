@@ -33,6 +33,8 @@ pub enum FocasAddress {
     ProgramNumber,
     ProgramMain,
     ProgramName,
+    ProgramDir,
+    ProgramInfo,
     /// 轴位置
     Axis {
         axis: u8,
@@ -131,6 +133,8 @@ pub fn parse_address(input: &str) -> Result<FocasAddress, AddressError> {
         "programnumber" | "program.number" | "prgnum" => return Ok(FocasAddress::ProgramNumber),
         "programmain" | "program.main" | "prgmain" => return Ok(FocasAddress::ProgramMain),
         "programname" | "program.name" | "prgname" => return Ok(FocasAddress::ProgramName),
+        "programdir" | "program.dir" | "progdir" => return Ok(FocasAddress::ProgramDir),
+        "programinfo" | "program.info" | "proginfo" => return Ok(FocasAddress::ProgramInfo),
         "feed" | "actf" | "axisfeed" => return Ok(FocasAddress::Feed),
         _ => {},
     }
