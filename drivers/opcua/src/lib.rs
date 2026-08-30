@@ -1,4 +1,4 @@
-//! OPC UA Driver — 方案 §7.3 节点/订阅型（V1 只读）。
+//! OPC UA Driver — 方案 §7.3 节点/订阅/浏览型（V1 只读，44/44 2026-08-29）。
 //!
 //! - Poll 绑定：`opcua.node-group`
 //!   ```json
@@ -7,12 +7,18 @@
 //!       { "key": "sine",    "node_id": "ns=2;i=2",        "data_type": "DOUBLE" }
 //!   ]}
 //!   ```
-//! - Subscribe 绑定：`opcua.subscription`（需校验 publishing/sampling/queue，详见 §7.3）
- //!   ```json
- //!   { "publishing_interval_ms": 500, "sampling_interval_ms": 250, "queue_size": 10,
- //!     "discard_oldest": true, "nodes": [ {"key":"k","node_id":"ns=2;i=2"} ] }
- //!   ```
+//! - Subscribe 绑定：`opcua.subscription`（publishing 500 sampling 30 queue10，§7.3）
+//!   ```json
+//!   { "publishing_interval_ms": 500, "sampling_interval_ms": 250, "queue_size": 10,
+//!     "discard_oldest": true, "nodes": [ {"key":"k","node_id":"ns=2;i=2"} ] }
+//!   ```
+//! - Browse 绑定：`opcua.browse`（周期浏览，§7.3 V1 支持）
+//!   ```json
+//!   { "nodes": [ {"key":"objects","node_id":"ns=0;i=85","data_type":"STRING"} ] }
+//!   ```
 //! - NodeId 解析见 `address::parse_address`；Core 不触及此文件（硬约束）。
+//! - SecurityPolicy/MessageSecurityMode 透传至 Native ClientBuilder pki_dir/own.der/key trust false verify true
+//! - SourceTimestamp 1601 ticks→Unix ns 精确保留，Quality GOOD/UNCERTAIN/BAD 按 StatusCode 映射，Array→Typed Array
 
 mod address;
 mod opcua_api;
@@ -33,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 pub const BINDING_POLL: &str = "opcua.node-group";
 pub const BINDING_SUB: &str = "opcua.subscription";
+pub const BINDING_BROWSE: &str = "opcua.browse";
 
 use opcua_api::OpcUaApi as OpcUaApiTrait;
 
@@ -65,11 +72,13 @@ impl Driver for OpcUaDriver {
         let cfg = OpcUaConnConfig::from_json(&v)?;
         let use_native = v.get("use_native").and_then(|x| x.as_bool()).unwrap_or(false);
         let api: Arc<dyn OpcUaApiTrait> = if use_native {
-            if let Some(pki) = OpcUaConnConfig::resolve_pki_dir(&v) {
-                Arc::new(NativeOpcUaApi::new_with_pki_dir(pki))
+            let native = if let Some(pki) = OpcUaConnConfig::resolve_pki_dir(&v) {
+                NativeOpcUaApi::new_with_pki_dir(pki)
             } else {
-                Arc::new(NativeOpcUaApi::new())
-            }
+                NativeOpcUaApi::new()
+            };
+            native.set_security(cfg.security_policy.clone(), cfg.security_mode.clone());
+            Arc::new(native)
         } else {
             Arc::new(FakeOpcUaApi::new())
         };
@@ -155,7 +164,6 @@ struct PointSpec {
     data_type: DataType,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum TaskKind {
     Poll { interval_ms: u64 },
@@ -165,6 +173,7 @@ enum TaskKind {
         queue_size: u32,
         discard_oldest: bool,
     },
+    Browse { interval_ms: u64 },
 }
 
 #[derive(Debug)]
@@ -223,6 +232,16 @@ fn value_fits_data_type(v: &Value, dt: DataType) -> bool {
         (Value::F64(_), DataType::F64) => true,
         (Value::String(_), DataType::String) => true,
         (Value::Bytes(_), DataType::Bytes) => true,
+        (Value::DateTime(_), DataType::DateTime) => true,
+        (Value::BoolArray(_), DataType::Bool) => true,
+        (Value::I32Array(_), DataType::I32) => true,
+        (Value::U32Array(_), DataType::U32) => true,
+        (Value::I64Array(_), DataType::I64) => true,
+        (Value::U64Array(_), DataType::U64) => true,
+        (Value::F32Array(_), DataType::F32) => true,
+        (Value::F64Array(_), DataType::F64) => true,
+        (Value::StringArray(_), DataType::String) => true,
+        (Value::DateTimeArray(_), DataType::DateTime) => true,
         // 宽容：U32/I32 互通，F32/F64 互通，I32→I64、U32→U64
         (Value::U32(_), DataType::I32) => true,
         (Value::I32(_), DataType::U32) => true,
@@ -262,13 +281,14 @@ impl DriverConnection for OpcUaConnection {
 
         for task in &tasks {
             task.validate().map_err(|e| SdkDriverError::configuration("INVALID_TASK", e.to_string()))?;
-            // Poll vs Subscribe 分支
+            // Poll / Subscribe / Browse 三分支
             let is_poll = task.binding.kind == BINDING_POLL;
             let is_sub = task.binding.kind == BINDING_SUB;
-            if !is_poll && !is_sub {
+            let is_browse = task.binding.kind == BINDING_BROWSE;
+            if !is_poll && !is_sub && !is_browse {
                 return Err(SdkDriverError::configuration(
                     "UNSUPPORTED_BINDING",
-                    format!("task `{}`: 期望 {BINDING_POLL} 或 {BINDING_SUB}，实际 {}", task.id, task.binding.kind),
+                    format!("task `{}`: 期望 {BINDING_POLL}/{BINDING_SUB}/{BINDING_BROWSE}，实际 {}", task.id, task.binding.kind),
                 ));
             }
             if is_poll && task.mode != TaskMode::Poll {
@@ -283,6 +303,13 @@ impl DriverConnection for OpcUaConnection {
                     forgelink_core_types::ErrorKind::Unsupported,
                     "MODE_NOT_SUPPORTED",
                     format!("task `{}`: opcua.subscription 仅支持 subscribe", task.id),
+                ));
+            }
+            if is_browse && task.mode != TaskMode::Poll {
+                return Err(SdkDriverError::new(
+                    forgelink_core_types::ErrorKind::Unsupported,
+                    "MODE_NOT_SUPPORTED",
+                    format!("task `{}`: opcua.browse 仅支持 poll", task.id),
                 ));
             }
             // nodes 统一解析
@@ -314,6 +341,12 @@ impl DriverConnection for OpcUaConnection {
                     return Err(SdkDriverError::configuration("INVALID_TASK", "interval_ms 需 >0"));
                 }
                 new_tasks.push(TaskPlan { id: task.id.clone(), kind: TaskKind::Poll { interval_ms: interval }, point_indices: indices });
+            } else if is_browse {
+                let interval = task.interval_ms.expect("validated");
+                if interval == 0 {
+                    return Err(SdkDriverError::configuration("INVALID_TASK", "interval_ms 需 >0"));
+                }
+                new_tasks.push(TaskPlan { id: task.id.clone(), kind: TaskKind::Browse { interval_ms: interval }, point_indices: indices });
             } else {
                 // Subscribe 参数：publishing_interval_ms / sampling_interval_ms / queue_size / discard_oldest
                 let publishing_interval_ms = task.binding.config.get("publishing_interval_ms").and_then(|v| v.as_u64()).unwrap_or(500);
@@ -416,12 +449,14 @@ impl DriverConnection for OpcUaConnection {
                             for ((spec, pid), raw_val) in points.iter().zip(values) {
                                 if let Value::String(s) = &raw_val {
                                     if s.starts_with("ERR:") {
-                                        tracing::warn!(key=%spec.key, error=%s, "单点 Bad，不影响同批其他点");
+                                        let q = if s.contains("Uncertain") { Quality::Uncertain } else { Quality::Bad };
+                                        let code = if s.contains("Uncertain") { Some(0x40000000) } else { Some(1) };
+                                        tracing::warn!(key=%spec.key, error=%s, quality=?q, "单点非 Good");
                                         batch_vals.push(PointValue {
                                             point_id: *pid,
                                             value: raw_val,
-                                            quality: Quality::Bad,
-                                            quality_code: Some(1),
+                                            quality: q,
+                                            quality_code: code,
                                             source_timestamp_ns: None,
                                         });
                                         continue;
@@ -440,6 +475,47 @@ impl DriverConnection for OpcUaConnection {
                                     quality_code: None,
                                     source_timestamp_ns: Some(ts),
                                 });
+                            }
+                            if batch_vals.is_empty() { continue; }
+                            sink.publish(DataBatch {
+                                connection_handle: 0,
+                                stream_epoch: 0,
+                                sequence: seq.fetch_add(1, Ordering::Relaxed),
+                                timestamp_ns: now_unix_ns(),
+                                values: batch_vals,
+                            }).await;
+                        }
+                        Ok::<(), SdkDriverError>(())
+                    }));
+                }
+                TaskKind::Browse { interval_ms } => {
+                    let interval = Duration::from_millis(interval_ms);
+                    handles.push(tokio::spawn(async move {
+                        let mut ticker = tokio::time::interval(interval);
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            tokio::select! {
+                                _ = ticker.tick() => {},
+                                _ = shutdown.cancelled() => break,
+                            }
+                            let mut batch_vals = Vec::with_capacity(points.len());
+                            for (spec, pid) in &points {
+                                match api.browse(&spec.addr).await {
+                                    Ok(refs) => {
+                                        let val = Value::String(refs.join(";"));
+                                        batch_vals.push(PointValue::good(*pid, val));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(key=%spec.key, error=%e, "Browse 单点 Bad");
+                                        batch_vals.push(PointValue {
+                                            point_id: *pid,
+                                            value: Value::String(format!("ERR:{}", e)),
+                                            quality: Quality::Bad,
+                                            quality_code: Some(1),
+                                            source_timestamp_ns: None,
+                                        });
+                                    }
+                                }
                             }
                             if batch_vals.is_empty() { continue; }
                             sink.publish(DataBatch {
@@ -493,14 +569,15 @@ impl DriverConnection for OpcUaConnection {
                                     continue;
                                 };
                                 let dv = ev.data_value;
-                                // 状态非 Good → Bad 隔离，不丢整批
+                                // 状态按 OPC UA StatusCode 映射 GOOD/UNCERTAIN/BAD (§9.3)
                                 if let Some(status) = dv.status {
-                                    if status != opcua_types::StatusCode::Good {
-                                        tracing::warn!(key=%spec.key, status=?status, "单点 Bad");
+                                    if !status.is_good() {
+                                        let q = crate::opcua_api::status_to_quality(status);
+                                        tracing::warn!(key=%spec.key, status=?status, quality=?q, "单点非 Good");
                                         batch_vals.push(PointValue {
                                             point_id: *pid,
                                             value: Value::String(format!("ERR:{:?}", status)),
-                                            quality: Quality::Bad,
+                                            quality: q,
                                             quality_code: Some(status.bits() as i32),
                                             source_timestamp_ns: None,
                                         });
@@ -526,12 +603,13 @@ impl DriverConnection for OpcUaConnection {
                                     tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配跳过");
                                     continue;
                                 }
-                                // source_timestamp 透传：优先 DataValue.source_timestamp，否则取 now
+                                // source_timestamp 透传：优先 DataValue.source_timestamp 1601 ticks→Unix ns，否则 now
                                 let ts_ns = dv.source_timestamp.map(|dt| {
-                                    // DateTime 转 unix ns：opcua DateTime 基于 1601-01-01，用 ticks 转
-                                    // 为简化，直接用 now_unix_ns 的近似；若需精确可用 dt.ticks() 换算
-                                    let _ = dt;
-                                    now_unix_ns()
+                                    let ticks = dt.ticks();
+                                    const TICKS_PER_SEC: i64 = 10_000_000;
+                                    const UNIX_TICKS_OFFSET: i64 = 11644473600 * TICKS_PER_SEC;
+                                    let unix_ticks = ticks - UNIX_TICKS_OFFSET;
+                                    unix_ticks * 100
                                 }).unwrap_or_else(now_unix_ns);
                                 batch_vals.push(PointValue {
                                     point_id: *pid,

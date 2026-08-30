@@ -59,6 +59,11 @@ pub trait OpcUaApi: Send + Sync {
         let _ = subscription_id;
         Ok(())
     }
+    /// 浏览节点（§7.3 Browse）：返回引用描述
+    async fn browse(&self, node: &OpcUaAddress) -> Result<Vec<String>, String> {
+        let _ = node;
+        Err("NOT_IMPLEMENTED: browse 未实现".into())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +229,15 @@ impl OpcUaApi for FakeOpcUaApi {
     async fn unsubscribe(&self, _subscription_id: u32) -> Result<(), String> {
         Ok(())
     }
+    async fn browse(&self, node: &OpcUaAddress) -> Result<Vec<String>, String> {
+        // Fake 浏览：基于 node 生成 2-3 个子节点名
+        let base = match &node.identifier {
+            crate::address::Identifier::String(s) => s.clone(),
+            crate::address::Identifier::Numeric(n) => format!("i={n}"),
+            _ => "node".into(),
+        };
+        Ok(vec![format!("{base}.Child1"), format!("{base}.Child2")])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +298,16 @@ pub(crate) fn variant_to_value(v: &Variant) -> Option<Value> {
             }
         }
         Variant::Guid(g) => Some(Value::String(g.to_string())),
-        Variant::DateTime(dt) => Some(Value::String(format!("{:?}", dt))),
+        Variant::DateTime(dt) => {
+            // OPC UA DateTime ticks 1601-01-01 转 Unix ns，精确保留 SourceTimestamp (§7.3)
+            // 1 tick = 100ns，Unix epoch 1970-01-01 与 1601-01-01 差 11644473600s
+            let ticks = dt.ticks();
+            const TICKS_PER_SEC: i64 = 10_000_000;
+            const UNIX_TICKS_OFFSET: i64 = 11644473600 * TICKS_PER_SEC;
+            let unix_ticks = ticks - UNIX_TICKS_OFFSET;
+            let unix_ns = unix_ticks * 100;
+            Some(Value::DateTime(unix_ns))
+        }
         Variant::LocalizedText(t) => {
             let txt = t.text.as_ref().to_string();
             if txt.is_empty() {
@@ -293,10 +316,34 @@ pub(crate) fn variant_to_value(v: &Variant) -> Option<Value> {
                 Some(Value::String(txt))
             }
         }
-        Variant::Array(arr) => Some(Value::String(format!("{:?}", arr))),
+        Variant::Array(arr) => {
+            // 保留 Typed Array (§9.2)，按元素类型转对应 Array Value
+            use opcua_types::Variant as V;
+            let vals: Vec<Value> = arr.values.iter().filter_map(|e| variant_to_value(e)).collect();
+            if vals.is_empty() { return Some(Value::String(format!("{:?}", arr))); }
+            // 推断首元素类型
+            match &vals[0] {
+                Value::Bool(_) => Some(Value::BoolArray(vals.into_iter().filter_map(|v| if let Value::Bool(b)=v {Some(b)} else {None}).collect())),
+                Value::I32(_) => Some(Value::I32Array(vals.into_iter().filter_map(|v| if let Value::I32(i)=v {Some(i)} else {None}).collect())),
+                Value::U32(_) => Some(Value::U32Array(vals.into_iter().filter_map(|v| if let Value::U32(u)=v {Some(u)} else {None}).collect())),
+                Value::I64(_) => Some(Value::I64Array(vals.into_iter().filter_map(|v| if let Value::I64(i)=v {Some(i)} else {None}).collect())),
+                Value::U64(_) => Some(Value::U64Array(vals.into_iter().filter_map(|v| if let Value::U64(u)=v {Some(u)} else {None}).collect())),
+                Value::F32(_) => Some(Value::F32Array(vals.into_iter().filter_map(|v| if let Value::F32(f)=v {Some(f)} else {None}).collect())),
+                Value::F64(_) => Some(Value::F64Array(vals.into_iter().filter_map(|v| if let Value::F64(f)=v {Some(f)} else {None}).collect())),
+                Value::String(_) => Some(Value::StringArray(vals.into_iter().filter_map(|v| if let Value::String(s)=v {Some(s)} else {None}).collect())),
+                Value::DateTime(_) => Some(Value::DateTimeArray(vals.into_iter().filter_map(|v| if let Value::DateTime(t)=v {Some(t)} else {None}).collect())),
+                _ => Some(Value::String(format!("{:?}", arr))),
+            }
+        }
         Variant::StatusCode(sc) => Some(Value::String(format!("{:?}", sc))),
         _ => Some(Value::String(format!("{:?}", v))),
     }
+}
+pub(crate) fn status_to_quality(sc: opcua_types::StatusCode) -> forgelink_core_types::Quality {
+    use forgelink_core_types::Quality;
+    if sc.is_good() { Quality::Good }
+    else if sc.is_uncertain() { Quality::Uncertain }
+    else { Quality::Bad }
 }
 
 struct NativeInner {
@@ -308,15 +355,21 @@ struct NativeInner {
 pub struct NativeOpcUaApi {
     inner: Arc<AsyncMutex<Option<NativeInner>>>,
     pki_dir: std::path::PathBuf,
+    security_policy: std::sync::Mutex<String>,
+    security_mode: std::sync::Mutex<String>,
 }
 
 impl NativeOpcUaApi {
     pub fn new() -> Self {
-        Self::new_with_pki_dir(Self::default_pki_dir())
+        Self { inner: Arc::new(AsyncMutex::new(None)), pki_dir: Self::default_pki_dir(), security_policy: std::sync::Mutex::new("None".into()), security_mode: std::sync::Mutex::new("None".into()) }
     }
 
     pub fn new_with_pki_dir(p: impl Into<std::path::PathBuf>) -> Self {
-        Self { inner: Arc::new(AsyncMutex::new(None)), pki_dir: p.into() }
+        Self { inner: Arc::new(AsyncMutex::new(None)), pki_dir: p.into(), security_policy: std::sync::Mutex::new("None".into()), security_mode: std::sync::Mutex::new("None".into()) }
+    }
+    pub fn set_security(&self, policy: String, mode: String) {
+        *self.security_policy.lock().unwrap() = policy;
+        *self.security_mode.lock().unwrap() = mode;
     }
 
     fn default_pki_dir() -> std::path::PathBuf {
@@ -370,10 +423,17 @@ impl NativeOpcUaApi {
             .map_err(|e| format!("ClientBuilder 失败: {e:?}"))?;
 
         use opcua_types::{EndpointDescription, MessageSecurityMode, UserTokenPolicy};
+        let policy = self.security_policy.lock().unwrap().clone();
+        let mode_str = self.security_mode.lock().unwrap().clone();
+        let mode = match mode_str.as_str() {
+            "Sign" => MessageSecurityMode::Sign,
+            "SignAndEncrypt" => MessageSecurityMode::SignAndEncrypt,
+            _ => MessageSecurityMode::None,
+        };
         let endpoint: EndpointDescription = (
             endpoint_url,
-            "None",
-            MessageSecurityMode::None,
+            policy.as_str(),
+            mode,
             UserTokenPolicy::anonymous(),
         )
             .into();
@@ -511,6 +571,35 @@ impl OpcUaApi for NativeOpcUaApi {
             let _ = sess.delete_subscription(subscription_id).await;
         }
         Ok(())
+    }
+    async fn browse(&self, node: &OpcUaAddress) -> Result<Vec<String>, String> {
+        let session = {
+            let guard = self.inner.lock().await;
+            guard.as_ref().and_then(|i| i.session.clone()).ok_or_else(|| "尚未连接".to_string())?
+        };
+        let nid = to_opc_node_id(node)?;
+        use opcua_types::{BrowseDescription, BrowseDirection};
+        let bd = BrowseDescription {
+            node_id: nid,
+            browse_direction: BrowseDirection::Forward,
+            reference_type_id: opcua_types::ReferenceTypeId::HierarchicalReferences.into(),
+            include_subtypes: true,
+            node_class_mask: 0,
+            result_mask: 0x3F,
+        };
+        let results = session.browse(&[bd], 0, None).await.map_err(|e| format!("browse 失败: {e:?}"))?;
+        let mut out = Vec::new();
+        for r in results {
+            if let Some(refs) = r.references {
+                for rf in refs {
+                    let name = rf.browse_name.name.as_ref().to_string();
+                    let nid_str = format!("{:?}", rf.node_id.node_id);
+                    out.push(format!("{} {}", name, nid_str));
+                }
+            }
+        }
+        if out.is_empty() { out.push("empty".into()); }
+        Ok(out)
     }
 
     async fn disconnect(&self) -> Result<(), String> {

@@ -1,14 +1,13 @@
-//! FOCAS2 地址解析（方案 §7.2 资源型）。
+//! FOCAS2 地址解析（方案 §7.2 资源型，P0 44 清单已冻结）。
 //!
-//! V1 支持的地址族（全部只读，Core 不触及此文件硬约束）：
-//! - `status` / `cnc.status` / `stat` → `cnc_statinfo` 报警/运行状态
-//! - `alarm` / `alarm.message` → `cnc_rdalmmsg`
-//! - `program.number` / `program.main` / `program.name` → `cnc_rdprgnum`/`cnc_exeprgname`
-//! - `axis.abs.<n>` / `axis.machine.<n>` / `axis.relative.<n>` / `axis.distance.<n>` → `cnc_absolute/cnc_machine` 等（n=1..32）
-//! - `axis.feed` → `cnc_actf`，`spindle.speed.<n>` / `spindle.load.<n>` → `cnc_acts/cnc_rdspmeter`
-//! - `macro.<num>` → `cnc_rdmacro`（如 macro.100）
-//! - `pmc.R100` / `pmc.D100` 等 → `pmc_rdpmcrng`（预留，Fake 阶段返回随机）
-//! - `diagnosis` → `cnc_diagnoss`（预留）
+//! V1 44 点全量（全部只读，Core 不触及此文件硬约束，2026-08-29 冻结）：
+//! - `status` / `cnc.status` / `stat` → `cnc_statinfo`
+//! - `alarm` → `cnc_rdalmmsg` `program.number/main/name/dir/info/upload` → `cnc_rdprgnum/dir/info/upload3`
+//! - `axis.abs./machine./relative./distance./data./srvdelay./accdecdly <n>` n=1..32 → `cnc_absolute/cnc_rddynamic2`
+//! - `axis.feed` `spindle.speed./load./gear./maxrpm <n>` `servo.<n>` → `cnc_acts/rdspmeter/svmeter/spgear/maxrpm`
+//! - `tool.number/offset./zofs./length. <n>` → `cnc_rdtofs/r/tofsr/rdzofs` `IODBTO_1_1/1_2/1_3 Pack=4`
+//! - `param.<num>` `param.axis <num>.<axis>` REAL → `cnc_rdparam IODBPSD_1/2/3 Pack=4`
+//! - `macro.<num>` → `cnc_rdmacro` `pmc.G/X/Y/F/R/D...[.bit]` → `pmc_rdpmcrng` `diagnosis.<num>` `opmsg`
 //!
 //! 解析只做语法与边界校验，大小写不敏感，允许空格与下划线/连字符变体。
 
@@ -35,6 +34,7 @@ pub enum FocasAddress {
     ProgramName,
     ProgramDir,
     ProgramInfo,
+    ProgramUpload,
     /// 轴位置
     Axis {
         axis: u8,
@@ -74,6 +74,8 @@ pub enum FocasAddress {
     Param {
         number: u32,
     },
+    /// 操作信息 `cnc_rdopmsg` 64B
+    OpMsg,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +93,8 @@ pub enum AxisKind {
 pub enum SpindleKind {
     Speed,
     Load,
+    Gear,
+    MaxRpm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +145,7 @@ pub fn parse_address(input: &str) -> Result<FocasAddress, AddressError> {
         "programname" | "program.name" | "prgname" => return Ok(FocasAddress::ProgramName),
         "programdir" | "program.dir" | "progdir" => return Ok(FocasAddress::ProgramDir),
         "programinfo" | "program.info" | "proginfo" => return Ok(FocasAddress::ProgramInfo),
+        "programupload" | "program.upload" | "upload" => return Ok(FocasAddress::ProgramUpload),
         "feed" | "actf" | "axisfeed" => return Ok(FocasAddress::Feed),
         _ => {},
     }
@@ -168,6 +173,9 @@ pub fn parse_address(input: &str) -> Result<FocasAddress, AddressError> {
     }
     if s.starts_with("diagnosis.") || s.starts_with("diagnosis") {
         return parse_diagnosis(&s, raw);
+    }
+    if s == "opmsg" || s == "opmessage" || s == "op" {
+        return Ok(FocasAddress::OpMsg);
     }
     // 兼容简写：abs.1 等直接视为 axis.abs.1
     if s.starts_with("abs.") || s.starts_with("machine.") || s.starts_with("relative.") || s.starts_with("distance.") {
@@ -206,7 +214,9 @@ fn parse_spindle(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
             let k = match *kind {
                 "speed" | "acts" | "rpm" | "s" => SpindleKind::Speed,
                 "load" | "spmeter" | "ld" => SpindleKind::Load,
-                _ => return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("主轴类型 `{kind}` 非法，期望 speed/load") }),
+                "gear" | "spgear" => SpindleKind::Gear,
+                "maxrpm" | "spmaxrpm" => SpindleKind::MaxRpm,
+                _ => return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("主轴类型 `{kind}` 非法，期望 speed/load/gear/maxrpm") }),
             };
             let n: u8 = num.parse().map_err(|_| AddressError::Invalid { input: raw.to_string(), reason: format!("主轴号 `{num}` 非法 1..{FOCAS_MAX_SPINDLE}") })?;
             if n == 0 || n > FOCAS_MAX_SPINDLE { return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("主轴号必须 1..{FOCAS_MAX_SPINDLE}") }); }
@@ -216,6 +226,8 @@ fn parse_spindle(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
             let k = match *kind {
                 "speed" | "acts" | "rpm" | "s" => SpindleKind::Speed,
                 "load" | "spmeter" | "ld" => SpindleKind::Load,
+                "gear" | "spgear" => SpindleKind::Gear,
+                "maxrpm" | "spmaxrpm" => SpindleKind::MaxRpm,
                 _ => return Err(AddressError::Invalid { input: raw.to_string(), reason: format!("主轴类型 `{kind}` 非法") }),
             };
             Ok(FocasAddress::Spindle { spindle: 1, kind: k })

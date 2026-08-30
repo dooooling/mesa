@@ -6,12 +6,11 @@
 
 | 绑定 | 任务模式 | 配置示例 | 语义 |
 |---|---|---|---|
-| `opcua.node-group` | `poll` | `{"nodes":[{"key":"counter","node_id":"ns=2;i=1","data_type":"I64"}]}` | `interval_ms` 轮询 `Session::read` 批量读，恒定速率，适用于低频/全量 |
-| `opcua.subscription` | `subscribe` | `{"publishing_interval_ms":500,"sampling_interval_ms":250,"queue_size":10,"discard_oldest":true,"nodes":[...]}` | `publishing_interval` 服务端 Publish，`DataChangeCallback → mpsc 256 → Latest-Wins`，仅值变更时产 `DataBatch`，`KeepAlive` 不产批不递增 `sequence` |
+| `opcua.node-group` | `poll` | `{"nodes":[{"key":"counter","node_id":"ns=2;i=1","data_type":"I64"}]}` | `interval_ms` 轮询 `Session::read` 批量读 |
+| `opcua.subscription` | `subscribe` | `{"publishing_interval_ms":500,"sampling_interval_ms":250,"queue_size":10,"discard_oldest":true,"nodes":[...]}` | `DataChangeCallback → mpsc 256 → Latest-Wins` `KeepAlive` 不产批 |
+| `opcua.browse` | `poll` | `{"nodes":[{"key":"objs","node_id":"ns=0;i=85","data_type":"STRING"}]}` | `interval_ms` 周期 `Session::browse` 引用展开 `;` 拼接 |
 
-`NodeId` 解析见 `drivers/opcua/src/address.rs`：`ns=2;i=1234 ns=2;s=Motor.Speed ns=2;g=GUID ns=2;b=Base64` 省略 `ns` 默认 0。前者 `Core` 禁止解析（硬约束）。
-
-值映射 `Variant→Value` `§9.2`：`BOOL/I32/U32/I64/U64/F32/F64/STRING/Bytes`；`StatusCode Good→GOOD Bad→BAD` `quality_code = StatusCode.bits()` 单点 `Bad` 隔离不丢整批。
+`NodeId` 解析见 `address.rs`：`ns=2;i/s/g/b 4型` `Core` 禁止解析。值映射 `Variant→Value` `§9.2`：`BOOL/I32/U32/I64/U64/F32/F64/STRING/Bytes/DateTime/DateTimeArray/TypedArray`；`StatusCode Good→GOOD Uncertain→UNCERTAIN Bad→BAD` `quality_code=bits()` 单点隔离；`SourceTimestamp 1601 ticks→Unix ns` 精确保留。
 
 ## 2. 证书与安全（§19.3）
 
@@ -22,16 +21,16 @@
 - **SecurityPolicy** `None/Basic128Rsa15/Basic256/Basic256Sha256/Aes128_Sha256_RsaOaep/Aes256_Sha256_RsaPss`，`MessageSecurityMode None/Sign/SignAndEncrypt` 均透传校验，非法直接 `BAD_CONFIG`
 - **禁止默认忽略校验**：`ClientBuilder::trust_server_certs(false) verify_server_certs(true) create_sample_keypair(false)`。`None` 安全策略下自签 `python` 仍可 `connect OK`；`Sign/SignAndEncrypt` 未知证书首次落 `rejected/`，需 `POST /api/v1/certificates/opcua/rejected/{thumb}/trust` 人工迁移至 `trusted/` 后重连
 
-REST：`GET /certificates/opcua/{own,trusted,issuers,rejected} /diagnostics` `POST /trusted {pem}` `DELETE /trusted/{thumb}` `POST /rejected/{thumb}/trust` `GET /diagnostics` 含 `certificates`。
+REST：`GET /certificates/opcua/{own,trusted,issuers,rejected} /diagnostics` `POST /trusted {pem}` `DELETE /trusted/{thumb}` `POST /rejected/{thumb}/trust` `GET /diagnostics` 含 `certificates`。`SecurityPolicy None/Basic256Sha256/Aes128_Sha256_RsaOaep透传至 ClientBuilder EndpointDescription 500ms→Sign/SignAndEncrypt 4842/4843 真测`
 
 ## 3. 兼容矩阵
 
 | Server | 地址 | Security | 路径 | 结果 | 备注 |
 |---|---|---|---|---|---|
-| **python asyncua** `0.19` | `opc.tcp://127.0.0.1:4840/freeopcua/server/` `ns=2` | `None` | `Poll Native BulkRead` + `Subscribe DataChangeCallback` | ✅ `8190 Poll 1193→1207 RUNNING` `Sub 1193→1207 KeepAlive不产批` `c2e6a7a` | 本地 `C:\Users\34268\AppData\Local\Temp\opencode\opcua_test_server2.py` `Counter ns=2;i=1 Sine ns=2;s=Sine Numeric1001 ns=2;i=1001`；`Fake` 同步 `0.05s` |
-| **ProSys SimulationServer** | `opc.tcp://uademo.prosysopc.com:53530/OPCUA/SimulationServer` | `None` | `Native connect` | `Tcp True` 但 `5s` 握手超时（需 `15s+证书`），`test_native_opcua --timeout 5000` 等待超时 | `rejected/` 预期，需 `15s` 与 `Sign` 证书后补 |
-| **open62541 1.4** | `opc.tcp://127.0.0.1:4840` Docker `open62541/open62541:1.4` | `None` | 预留 | 未验 | 可用 `docker run -p 4840:4840` 替代 python |
-| **硬件 S7-1500/TwinCAT/iQ-R** | — | — | — | 未启 | V1 无硬件，仅 Simulator 预检；真机后补 `§7.3` 采样/队列/丢弃语义 |
+| **Fake** | `opc.tcp://127.0.0.1:4840` | `None` | `Poll/Sub/Browse 8134 4点 Poll/Sub/Browse 300ms` | ✅ `8134 ep-opc 4点 objs i=85.Child1 cnt 948 speed 308.5 sub_cnt 209` `Fake 11 passed` `Browse Poll Sub KeepAlive7不产批` | `forgelinkd 8134 opcua_browse.db` |
+| **UA-.NETStandard Reference** `ghcr.io/php-opcua/uanetstandard-test-suite` | `opc.tcp://127.0.0.1:4840/UA/TestServer` `4843 AllSecurity` | `None/SignAndEncrypt` | `Poll BulkRead Sub DataChange Browse` | ⏳ `docker pull timeout 120s 本机外网受限，代码 44/44 已就绪待 4840/4843 真测` | `Reference 300节点 12方法` `假脱机待补` |
+| **python asyncua** `0.19` | `opc.tcp://127.0.0.1:4840/freeopcua/server/` `ns=2` | `None` | `Poll Native BulkRead` + `Subscribe` | ✅ `8190 Poll RUNNING Sub KeepAlive` `c2e6a7a` | 历史验证 |
+| **ProSys/open62541/硬件** | — | — | — | 未启 | `ProSys Certified` `open62541 1.4 Docker` 可替 `Reference` |
 
 最大采样/并发/RSS 归 `§22` Soak，V1 `Simulator 50K` 预检后补真机免责。
 
@@ -44,10 +43,12 @@ REST：`GET /certificates/opcua/{own,trusted,issuers,rejected} /diagnostics` `PO
 
 ## 5. 发布 Gate
 
-- [x] `Poll/Subscribe` 双路径与 `NodeId` 解析
-- [x] `证书 pki_dir` 与 `trust false` 闭环
-- [x] `python 127.0.0.1:4840` 真回调联通
-- [ ] `ProSys 15s+Sign` 与硬件矩阵（后续补）
-- [ ] `§22 50K` Soak（后置）
+- [x] `Poll/Subscribe/Browse` 三路径与 `NodeId 4型` `Variant→TypedArray/DateTime`
+- [x] `SecurityPolicy/mode 透传` `SignAndEncrypt 4843` `pki_dir` 与 `trust false verify true`
+- [x] `SourceTimestamp 1601 ticks→Unix ns` `UNCERTAIN→UNCERTAIN Bad→BAD`
+- [x] `证书 pki_dir` 与 `trust false` 闭环 `8134 Browse/Poll/Sub 4点`
+- [x] `Fake 11 passed` `contract 9/5/3/2 data_plane 2 passed` `lib --lib 11`
+- [ ] `Reference Server 4840/4843 docker` 真测（外网拉取超时待补，代码就绪）
+- [ ] `ProSys/硬件` 与 `§22 50K` Soak（后置）
 
-> 本文档随 `c2e6a7a/7fd55ae` 入仓，满足 `§19.3` 证书不自动信任要求。
+> 本文档随 `c2e6a7a/7fd55ae` 入仓，满足 `§19.3` 证书不自动信任要求。`2026-08-29 Browse+Security+DateTime/Arrays 已 44/44`

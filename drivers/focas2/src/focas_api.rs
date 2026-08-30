@@ -88,6 +88,8 @@ impl FakeFocasApi {
             FocasAddress::Spindle { spindle: _, kind } => match kind {
                 SpindleKind::Speed => Value::I32((r % 3000) as i32),
                 SpindleKind::Load => Value::U32(r % 101), // 0..100%
+                SpindleKind::Gear => Value::U32((r % 4) + 1),
+                SpindleKind::MaxRpm => Value::U32(6000 + (r % 4000)),
             },
             FocasAddress::ServoLoad { axis: _ } => Value::U32(r % 101),
             FocasAddress::MacroVar { number: _ } => {
@@ -107,11 +109,13 @@ impl FakeFocasApi {
             FocasAddress::Diagnosis { number: _ } => Value::I32((r % 2001) as i32 - 1000),
             FocasAddress::Param { number: _ } => Value::I32((r % 1000) as i32),
             FocasAddress::ProgramDir => Value::String(format!("DIR{}", r % 10)),
+            FocasAddress::ProgramUpload => Value::String(format!("UP{}", r % 10)),
             FocasAddress::ProgramInfo => Value::String(format!("INFO{}", r % 10)),
             FocasAddress::Tool { kind: _, number } => {
                 let _ = number;
                 Value::F64((r as f64) / 100.0)
             }
+            FocasAddress::OpMsg => Value::String(format!("OP{}", r % 10)),
         }
     }
 }
@@ -212,7 +216,7 @@ impl FocasApi for NativeFocasApi {
                     Ok(v) => out.push(v),
                     Err(e) => {
                         let low = e.to_ascii_lowercase();
-                        if low.contains("ew_noopt") || low.contains("ew_data") || low.contains("ew_range") || low.contains("ew_attrib") || low.contains("ew_length") || low.contains("ew_number") || low.contains("ew_param") {
+                        if low.contains("ew_noopt") || low.contains("ew_data") || low.contains("ew_range") || low.contains("ew_attrib") || low.contains("ew_length") || low.contains("ew_number") || low.contains("ew_param") || low.contains("ew_func") {
                             tracing::warn!(?addr, error=%e, "FOCAS 单点不支持，转 Bad");
                             out.push(Value::String(format!("ERR:{}", e)));
                         } else {
@@ -312,6 +316,16 @@ impl NativeFocasApi {
                             Err(e) => Err(Self::map_ret_err(e)),
                         }
                     }
+                    SpindleKind::Gear => match lib.cnc_rdspgear(hdl, *spindle) {
+                        Ok(v) => Ok(Value::I32(v as i32)),
+                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT gear {} {}", spindle, e.message()))),
+                        Err(e) => Err(Self::map_ret_err(e)),
+                    },
+                    SpindleKind::MaxRpm => match lib.cnc_rdspmaxrpm(hdl, *spindle) {
+                        Ok(v) => Ok(Value::I32(v as i32)),
+                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT maxrpm {} {}", spindle, e.message()))),
+                        Err(e) => Err(Self::map_ret_err(e)),
+                    },
                 }
             }
             FocasAddress::ServoLoad { axis } => {
@@ -399,10 +413,15 @@ impl NativeFocasApi {
                 Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT proginfo {}", e.message()))),
                 Err(e) => Err(Self::map_ret_err(e)),
             },
+            FocasAddress::ProgramUpload => match lib.cnc_upload(hdl) {
+                Ok(v) => Ok(Value::String(v)),
+                Err(e) if e == crate::native::FocasRet::Noopt || e == crate::native::FocasRet::Func => Ok(Value::String(format!("ERR:EW_FUNC upload {}", e.message()))),
+                Err(e) => Err(Self::map_ret_err(e)),
+            },
             FocasAddress::Tool { kind, number } => {
                 match kind {
                     crate::address::ToolKind::Number => Ok(Value::U32(1)),
-                    crate::address::ToolKind::Offset => match lib.cnc_rdtofsr(hdl, *number) {
+                    crate::address::ToolKind::Offset => match lib.cnc_rdtofs(hdl, *number) {
                         Ok(v) => Ok(Value::F64(v)),
                         Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT tool.offset {} {}", number, e.message()))),
                         Err(e) => Err(Self::map_ret_err(e)),
@@ -412,13 +431,21 @@ impl NativeFocasApi {
                         Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT tool.zofs {} {}", number, e.message()))),
                         Err(e) => Err(Self::map_ret_err(e)),
                     },
-                    crate::address::ToolKind::Length => match lib.cnc_rdtofsr(hdl, *number) {
+                    crate::address::ToolKind::Length => match lib.cnc_rdtofs(hdl, *number) {
                         Ok(v) => Ok(Value::F64(v)),
                         Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT tool.length {} {}", number, e.message()))),
                         Err(e) => Err(Self::map_ret_err(e)),
                     },
                 }
             }
+            FocasAddress::OpMsg => match lib.cnc_rdopmsg(hdl) {
+                Ok(op) => {
+                    let s = String::from_utf8_lossy(&op.dummy).trim_matches('\0').trim().to_string();
+                    if s.is_empty() { Ok(Value::String("OP:empty".into())) } else { Ok(Value::String(s)) }
+                }
+                Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT opmsg {}", e.message()))),
+                Err(e) => Err(Self::map_ret_err(e)),
+            },
         }
     }
 }

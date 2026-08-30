@@ -150,6 +150,7 @@ async fn driver_crash_restore_via_endpoint_runtime() {
     })
     .await;
     let epoch1 = snapshot.endpoint("ct-crash").unwrap().epoch;
+    wait_until(10, || snapshot.latest_all().len() == 2).await;
     let points_before: Vec<u32> =
         snapshot.latest_all().iter().map(|e| e.point_id).collect();
     assert_eq!(points_before.len(), 2, "two points registered");

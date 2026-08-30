@@ -23,7 +23,14 @@ use crate::session::{Session, SessionEvent};
 use crate::snapshot::{EndpointStatus, Snapshot};
 
 /// 连接级退避序列（§11.1 默认值）。当前不做上限熔断，成功后归零。
-const RECONNECT_BACKOFF_SECS: [u64; 5] = [1, 2, 5, 10, 30];
+/// 测试时 `FORGELINK_RECONNECT_FAST=1` 缩短为 1s 固定，避免 30s/60s 阻塞。
+fn reconnect_backoff_secs(idx: usize) -> u64 {
+    if std::env::var("FORGELINK_RECONNECT_FAST").ok().as_deref() == Some("1") {
+        return 1;
+    }
+    const RECONNECT_BACKOFF_SECS: [u64; 5] = [1, 2, 5, 10, 30];
+    RECONNECT_BACKOFF_SECS[idx.min(RECONNECT_BACKOFF_SECS.len() - 1)]
+}
 
 /// 内置端点配置：空库演示时由 forgelinkd 硬编码注入，当前优先 ConfigStore 构造；硬编码仅用于空库演示
 #[derive(Debug, Clone)]
@@ -193,9 +200,7 @@ pub async fn run_endpoint(
             }
         }
 
-        let delay = Duration::from_secs(
-            RECONNECT_BACKOFF_SECS[backoff_idx.min(RECONNECT_BACKOFF_SECS.len() - 1)],
-        );
+        let delay = Duration::from_secs(reconnect_backoff_secs(backoff_idx));
         backoff_idx += 1;
         tracing::info!(endpoint = %cfg.endpoint_id, retry_in_secs = delay.as_secs(), "reconnecting");
         tokio::select! {

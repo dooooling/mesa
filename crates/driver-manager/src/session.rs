@@ -39,6 +39,9 @@ pub struct HeartbeatParams {
 
 impl Default for HeartbeatParams {
     fn default() -> Self {
+        if std::env::var("FORGELINK_HEARTBEAT_FAST").ok().as_deref() == Some("1") {
+            return Self { ping_period: Duration::from_secs(1), pong_deadline: Duration::from_secs(1), max_missed: 2 };
+        }
         Self { ping_period: PING_PERIOD, pong_deadline: PONG_DEADLINE, max_missed: MAX_MISSED_PONGS }
     }
 }

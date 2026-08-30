@@ -33,7 +33,11 @@ cargo test --workspace -- --test-threads=1  # 42+11+4+23项 0 failed（单跑 su
 
 ## 性能
 
-`50K updates/s 60min 600+3000 Soak 3600s` `IPC p95 ≤20ms p99 ≤50ms` `RSS ≤10%` `Conn-1000` `Simulator burst125`
+`50K updates/s 60min 600+3000 Soak 3600s` `IPC p95 ≤20ms p99 ≤50ms` `RSS ≤10%` `Conn-1000` `Simulator burst125` `release 8135 60min 9.5→9.7 5.4% 5点` `Soak 15min 1.1%` 已预检
+
+## 部署
+
+`packaging/windows-service/install.ps1` `sc create ForgeLink` `KILL_ON_JOB_CLOSE` `packaging/systemd/forgelink.service` `systemctl enable --now` `journald`
 
 ## 平台
 

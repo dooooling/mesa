@@ -62,20 +62,31 @@ pub async fn start_sim_server() -> (u16, CancellationToken) {
 }
 
 /// 启动进程内 Simulator SDK 服务并暴露故障注入开关。
+/// 10055/10048 缓冲区耗尽时重试，避免并行 cargo test 抖动。
 pub async fn start_sim_server_with_faults(faults: SdkFaults) -> (u16, CancellationToken) {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let cancel = CancellationToken::new();
-    let c = cancel.clone();
-    tokio::spawn(async move {
-        // serve 出错仅记录：测试断言由客户端侧完成
-        if let Err(e) =
-            serve_with_faults(SimulatorDriver, listener, TOKEN.into(), c.clone(), Some(faults)).await
-        {
-            eprintln!("sim server ended: {e}");
+    let mut last_err = None;
+    for i in 0..10 {
+        match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+            Ok(listener) => {
+                let port = listener.local_addr().unwrap().port();
+                let cancel = CancellationToken::new();
+                let c = cancel.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_with_faults(SimulatorDriver, listener, TOKEN.into(), c.clone(), Some(faults)).await {
+                        eprintln!("sim server ended: {e}");
+                    }
+                });
+                return (port, cancel);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse || e.raw_os_error() == Some(10055) || e.raw_os_error() == Some(10048) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(50 * (i + 1))).await;
+                continue;
+            }
+            Err(e) => panic!("bind failed: {e}"),
         }
-    });
-    (port, cancel)
+    }
+    panic!("bind retry exhausted: {:?}", last_err);
 }
 
 /// 构造一个 Poll 任务，binding 为 simulator.points。

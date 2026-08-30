@@ -1,0 +1,18 @@
+[Unit]
+Description=ForgeLink Driver MVP
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/forgelink/forgelinkd --db /var/lib/forgelink/forgelink.db --http-port 8132 --drivers-dir /opt/forgelink/drivers
+Restart=on-failure
+RestartSec=5
+# 日志由 journald 接管，禁止无限文件（§25）
+StandardOutput=journal
+StandardError=journal
+# 资源限制示例（§22 预留）
+# MemoryMax=1G
+# CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target
