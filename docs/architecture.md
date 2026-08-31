@@ -4,104 +4,62 @@
 
 ## 1. 总体架构
 
-ForgeLink 采用 **单进程 Core + 多独立进程 Driver** 的边缘网关形态。Core 以 Rust + Tokio + SQLite 为基座，负责配置持久化、设备与点位管理、数据汇聚与北向 REST；Driver 以独立 OS 进程承载协议栈，通过本机回环的可靠 IPC 与 Core 解耦，实现故障隔离与热升级。
+ForgeLink 采用单进程 Core 与多独立进程 Driver 的边缘网关形态。Core 负责配置的持久化、设备的管理、点位的分配、数据的汇聚以及北向 REST API 的提供；Driver 则专注于协议的解析与数据的采集。两者通过本机回环的可靠 IPC 通道解耦，实现了故障隔离与独立升级的能力，满足 V1 版本严格只读、单机稳定运行的核心目标。
 
-```
-                    ┌─────────────────────────────────┐
-                    │          ForgeLink Core         │
-                    │      forgelinkd (Tokio)         │
-                    │  ┌──────────────────────────┐   │
-                    │  │ ConfigStore (SQLite)     │   │
-                    │  │ DriverManager            │   │
-                    │  │ DeviceManager            │   │
-                    │  │ PointRegistry tombstone  │   │
-                    │  │ DataIngress Latest Cache │   │
-                    │  │ REST API 127.0.0.1:8132   │   │
-                    │  └──────────────────────────┘   │
-                    └──────┬────────┬────────┬────────┘
-                           │ TCP    │ TCP    │ TCP  Length-prefixed Protobuf
-              ┌────────────┘        │        └────────────┐
-              ▼                     ▼                      ▼
-       ┌──────────┐          ┌──────────┐          ┌──────────┐
-       │ S7 Driver│          │FOCAS2    │          │ OPC UA   │
-       │ 独立进程 │          │ 独立进程 │          │ 独立进程 │
-       │ 97:102   │          │165:8193  │          │ 4840 Ref │
-       │ COTP/S7  │          │Fwlib     │          │ async-   │
-       └──────────┘          └──────────┘          │ opcua    │
-                                                   └──────────┘
-```
+在部署形态上，Core 以 `forgelinkd` 单二进制运行，内置 `ConfigStore`（SQLite）、`DriverManager`、`DeviceManager`、`PointRegistry`（支持 tombstone 复用）以及 `DataIngress` 与 `LatestValueCache`；而每一个 Driver（S7、FOCAS2、OPC UA、Simulator）则作为独立的 OS 进程存在，通过 `127.0.0.1` 的 TCP 通道以长度前缀的 Protobuf 协议与 Core 通信。这种形态既保证了驱动崩溃不会影响 Core，也允许驱动独立编译与发现。
 
-**设计要点**
-
-* **进程隔离与孤儿防护**：每个 Driver 以 `token` 经 `stdin` 注入启动，Core 持有 `ChildStdin` 不关闭作为 liveness 管道，`close` 即 `EOF` 触发 Driver 自杀；Windows 侧 `Job Object KILL_ON_JOB_CLOSE`、Linux 侧 `PR_SET_PDEATHSIG`，满足 `§14.5`。代码见 `crates/driver-manager/src/process.rs:54`。
-* **Core 不懂协议**：S7 的 `DB10.DBD0`、FOCAS 的 `status`、OPC UA 的 `ns=2;i=1` 解析仅存在于对应 Driver 进程内的 `address.rs`，Core 仅透传 `binding.config` JSON 并做 Schema 校验，满足 `AGENTS.md:39` 硬约束。
-* **有界背压**：所有 Data Plane 队列 `256` 上界，满时对同一 `point_id` 执行 `Latest-Wins Coalescing` 合批，`ConnectionState` 走独立控制队列不丢弃，`crates/driver-sdk/src/lib.rs:195`。
+设计上有三个硬约束需要特别说明。其一是进程隔离与孤儿防护：每个 Driver 在启动时由 Core 通过 `stdin` 注入一次性 `token`，Core 持有 `ChildStdin` 不关闭作为 liveness 管道，一旦 `close` 即 `EOF` 触发 Driver 自杀；Windows 侧通过 `Job Object` 的 `KILL_ON_JOB_CLOSE`、Linux 侧通过 `PR_SET_PDEATHSIG` 保证 Core 异常退出时无孤儿，详见 `crates/driver-manager/src/process.rs:54`。其二是 Core 不懂协议：无论是 S7 的 `DB10.DBD0`，还是 FOCAS 的 `status`，亦或是 OPC UA 的 `ns=2;i=1`，其文本解析仅存在于对应 Driver 进程内的 `address.rs`，Core 仅透传 `binding.config` 的 JSON 并做 Schema 校验，满足 `AGENTS.md:39`。其三是有界背压：所有 Data Plane 队列上界为 256，满时对同一 `point_id` 执行最新值覆盖的合并策略，控制面消息则走独立队列不丢弃，详见 `crates/driver-sdk/src/lib.rs:195`。
 
 ## 2. 数据流与时序
 
-### 2.1 配置闭环（§6.2 全量快照）
+### 2.1 配置闭环（全量快照）
 
-用户通过 `POST /devices, /endpoints, /tasks` 提交全量快照，Core 写入 SQLite 并分配稳定 `point_id`（`tombstone` 保证删除后复用同一 ID），随后驱动侧走严格串行闭环：
+ForgeLink 的配置遵循全量快照的语义。用户通过 REST 接口提交设备、端点与任务的完整快照，Core 将其写入 SQLite 并为每一个逻辑点位分配稳定的 `point_id`。该 ID 通过 `tombstone` 机制保证删除后再次添加同一 `point_key` 时复用原 ID，避免数据身份的漂移。随后驱动侧会走严格串行的闭环：`DriverManager` 拉起子进程并传入 `token`，双方完成 `Hello` 与 `Welcome` 的握手与协议协商，再依次执行 `OpenConnection`、`ConfigureTasks`（在此阶段完成 `parse_address` 的全量校验与 `point_key` 唯一性检查）、`PointDescriptors` 上报、`ApplyPointMap` 以及最终的 `StartConnection` 并生成新的 `stream_epoch` 进入 `RUNNING` 状态。
 
-```
-REST 全量快照 revision++ → SQLite
-  → DriverManager::spawn(--port + stdin token)
-  → Hello(token) / Welcome(协议协商 Major/Minor)
-  → OpenConnection(handle, endpoint_id, config_json)
-  → ConfigureTasks(parse_address 全量校验 point_key 唯一)
-  → PointDescriptors → Core 落库
-  → ApplyPointMap(point_key→point_id)
-  → StartConnection(new stream_epoch) → RUNNING
-```
-
-运行中增删点位必须 `Stop → Configure → Apply → Start` 产生新 `stream_epoch`，禁止热 Apply。新 `revision` 构建失败则保持 `STOPPED/FAILED` 并保留旧库，避免半配置运行。
+需要强调的是，运行中对点位的任何增删改都必须走 `Stop → Configure → Apply → Start` 的完整路径并产生新的 `stream_epoch`，禁止热 Apply。若新 `revision` 的构建在任何一步失败，系统将保持 `STOPPED` 或 `FAILED` 状态并保留旧库，避免半配置状态下的运行风险。这一语义在 `§6.2` 中有明确约束。
 
 ### 2.2 运行时采集
 
-* **Poll**：`tokio::time::interval(interval_ms)`  `MissedTickBehavior::Skip`  到期触发 `read_batch`。FOCAS 默认 `500ms`、S7 `100ms`、OPC UA Poll `500ms`、Simulator 可 `10ms`。所有 `Poll` 最终 `DataSink.publish(DataBatch{handle, epoch, seq, timestamp_ns, values})` 经 `Session writer` → Core。
-* **Subscribe**：`OPC UA` 通过 `Client::create_subscription(publishing 500ms)` + `create_monitored_items(sampling 250ms queue10)` 建立 `DataChangeCallback → mpsc 256 → drain 64 批量`，`KeepAlive` 7 次空 `Notification` 自然无回调，不递增 `sequence`、不产 `DataBatch`，符合 `§7.3` 静默语义。
-* **Browse**：`opcua.browse` 周期 `Session::browse(Objects 85, HierarchicalReferences)` 将引用 `;` 拼接为 `STRING` 点位，`§7.3 V1 支持 Browse`。
+进入运行态后，采集行为按任务类型分化。`Poll` 模式通过 `tokio::time::interval` 以 `MissedTickBehavior::Skip` 的策略周期性触发 `read_batch`，FOCAS 默认 500 毫秒、S7 为 100 毫秒、OPC UA 的 Poll 为 500 毫秒，而 Simulator 在压测时可低至 10 毫秒。`Subscribe` 模式专属于 OPC UA，它通过客户端创建订阅与受监控项，利用 `DataChangeCallback` 将数据变更经由 `mpsc 256` 通道以 `drain 64` 的批量方式合并为 `DataBatch`，而服务端 7 次空的 `KeepAlive` 通知则自然无回调，不递增 `sequence` 也不产生空批次，这正是 `§7.3` 所要求的静默语义。`Browse` 模式则周期性调用 `Session::browse` 对 `Objects 85` 这类根节点进行引用展开，并将结果以分号拼接为字符串点位。
 
-*时间与质量*：业务 `timestamp_ns` 为 `UTC Unix ns` `now_unix_ns()`，`source_timestamp_ns` 对 OPC UA `1601 ticks → Unix ns` 精确换算 `drivers/opcua/src/opcua_api.rs:286`，FOCAS/S7 用 `now` 近似。性能测量用宿主机单调时钟，禁止跨进程 UTC 相减 `§10`。质量按 `Good/Uncertain/Bad` `StatusCode.bits()` 单点 `Bad` 隔离不丢整批。
+无论哪种模式，最终都会通过 `DataSink.publish` 将 `DataBatch`（包含 `handle`、`epoch`、`seq`、`timestamp_ns` 以及点位数组）经由 `Session` 的写入端发送至 Core，再由 `DataIngress` 落入 `LatestValueCache`，最终通过 `GET /points/latest` 对外提供。时间语义上，业务时间统一为 `UTC Unix 纳秒`，而性能测量则使用宿主机的单调时钟，禁止跨进程直接相减 `§10`。对于 OPC UA，`SourceTimestamp` 会以 `1601` 年为起点的 `ticks` 精确换算为 `Unix` 纳秒予以保留，而 FOCAS 与 S7 则以当前时间近似处理。质量方面则按 `Good/Uncertain/Bad` 的三态模型，依据 `StatusCode` 的位标识进行单点隔离，不会因单点错误而丢弃整批数据。
 
 ## 3. 驱动详解
 
-### 3.1 S7（Siemens PLC，§7.1 地址型）
+### 3.1 S7（西门子 PLC，地址型）
 
-**地址解析** `drivers/s7/src/address.rs:99` 覆盖 `DB/M/I/Q/C/T` 全量及别名：`DB10.DBX24.0` `DB10.0` 简写、`M0.0/MB10`、`I0.0`、`Q0.0`、`C0/T0`（`bit_address` 不 `*8` `transport 0x1C/0x1D len1`）、`V→DB1`（S7-200）、`SM→M`、`AIW0→PIW0 0x80`/`AQW0→PQW0`、`L0.0 0x86`、`AC0-3→M*4`、`HC0-5→C`、`S0.0→M`。`Area` 编码 `0x84/0x83/0x81/0x82/0x1C/0x1D/0x80/0x86` 为 S7Comm 固定，`bit_address = byte*8+bit`（C/T 例外）。
+S7 驱动的核心在于地址解析与 PDU 编解码。地址解析覆盖了 `DB/M/I/Q/C/T` 的全量族及其别名，例如 `DB10.DBX24.0` 与简写 `DB10.0`、`M0.0` 与 `MB10`、`I0.0`、`Q0.0`、`C0/T0`（其位地址不乘以 8，且传输类型为 `0x1C/0x1D`，长度为 1）、`V` 映射为 `DB1`、`SM` 映射为 `Merker`、`AIW0` 映射为 `PIW0 0x80`、`L0.0` 映射为 `0x86` 等，共计 13 种区域类型，对应 `Area` 编码 `0x84/0x83/0x81/0x82/0x1C/0x1D/0x80/0x86`，为 S7Comm 协议的固定值。解析逻辑位于 `drivers/s7/src/address.rs:99`，并通过 `bit_address = byte*8+bit` 的规则统一处理。
 
-**编解码与 PDU** `codec.rs` 支持 `13 种 S7Kind BOOL/BYTE/WORD/DWORD/INT/DINT/REAL/LREAL/STRING256/WSTRING512/S5Time/Time/Date/Dt` 大端解码。`client.rs` 按 `S7 ANY` 三字节位偏移 `build_read_req` 合并连续区 `read_vars → Vec<Option<Vec<u8>>>`，`C/T len1` 且 `ret!=0xFF` 按项 `BAD` 跳过，`paired` 排序不丢位。`SZL` 走 `0x07 UserData 0xFF09 7+12` 透传 `0x0131/0x0011`。
+编解码层面，`codec.rs` 支持 13 种 `S7Kind`，涵盖布尔、字节、字、双字、整数、双整数、浮点、长浮点、字符串等，且均为大端解码。`client.rs` 则按 `S7 ANY` 的三字节位偏移构建读取请求，能够自动合并连续区域，并通过 `read_vars` 返回按项隔离的结果，`C/T` 类型长度固定为 1 且对 `ret != 0xFF` 的项进行单点 `BAD` 跳过。诊断功能通过 `SZL` 的 `0x07 UserData 0xFF09` 透传实现，能够读取 `0x0131/0x0011` 等系统状态。真机验证在 `192.168.15.97:102` 上通过 `COTP → S7 Setup PDU480` 完成了 `DB10.DBD0 11468800` 的读取，并在 `aarch64 QEMU 7.8M` 环境下验证了批量合并与分片的稳定性。
 
-**真机** `192.168.15.97:102` `COTP→S7 Setup PDU480` `DB10.DBD0 11468800` `DBW0 175` `PUT/GET 0x04` 诊断，`ARM QEMU aarch64 7.8M` 验证批量合并与分片。
+### 3.2 FOCAS2（发那科 CNC，函数型，44/44）
 
-### 3.2 FOCAS2（FANUC CNC，§7.2 Function 型，44/44）
+FOCAS2 驱动是典型的函数型驱动，其地址族在 `drivers/focas2/src/address.rs:1` 中以 44 项清单的形式冻结，涵盖 `status`、轴的 `abs/machine/relative/distance/data/srvdelay/accdecdly` 七种、`feed`、主轴的 `speed/load/gear/maxrpm` 四种、`servo`、`macro`、`pmc` 的 `R/D/G/X/Y/F` 十四种、`diagnosis`、`tool` 的 `number/offset/zofs/length` 四种、`param`、`opmsg` 以及程序的 `number/main/name/dir/info/upload` 六种。
 
-**地址族** `drivers/focas2/src/address.rs:1 44清单`：`status`、`axis abs/machine/relative/distance/data/srvdelay/accdecdly 7种`、`axis.feed`、`spindle speed/load/gear/maxrpm 4种`、`servo`、`macro 100`、`pmc R/D/G/X/Y/F 14种`、`diagnosis`、`tool number/offset/zofs/length 4种`、`param`、`opmsg`、`program number/main/name/dir/info/upload 6种`。
+在 FFI 层面，`native.rs:340` 以 `Pack4` 对齐定义了 `OdbTofs 8B`、`IodbZofs 36B`、`IodbPsd1 8B`、`RealPrm 8B`、`IodbTo111 28B`、`IodbTo112 46B` 等 16 个函数指针结构，并通过 `libloading` 动态加载 `FWLIB64.dll 24M`。加载时会预先将 `drivers/focas2/libs/win` 加入 `PATH` 并尝试绝对路径与临时目录的双候选，缺库时返回 `EW_NODLL` 而非直接 panic，保证了单文件分发的可行性。
 
-**结构与 FFI** `native.rs:340 Pack4`：`OdbTofs 8B` `IodbZofs 36B` `IodbPsd1 8B` `RealPrm 8B IodbPsd2 12B` `IodbTo111 28B` `IodbTo112 46B` `PrgDir 256` `OdbNc1 12B OdbNc2 31B` `OdbUp3 256B`。16 个 `Fn*` 经 `libloading` 动态加载 `FWLIB64.dll 24M` `NativeLib::load  prepend PATH + 绝对路径 + TEMP`，缺库返回 `EW_NODLL` 重试而非 panic。
+逻辑上，`cnc_rdtofs` 以 `s_no=e_no=num` 的形式试读 `type 0` 再试 `1`，`cnc_rdtofsr` 先以 `IodbTo112 46B` 的 `1_2` 类型进行 9 次试探再回落至 `IodbTo111 28B`，`cnc_rdparam` 则先以 `IodbPsd1 8B` 的 `ldata` 试读，若返回 `EW_Attrib 4` 说明该参数为 `REAL` 类型，则回退至 `IodbPsd2 12B` 的 `rdata` 并按 `prm_val/dec_val` 换算。程序目录与信息则通过 `OdbNc1 6次` 与 `OdbNc2 3次` 的试探以及 `cnc_upstart3→upload3→upend3` 的循环直至 `EW_BUFFER` 来完成。所有 `EW_LENGTH/NUMBER/ATTRIB` 错误均会按项转为 `String ERR:` 并以 `Quality Bad` 隔离，而 `EW_SOCKET/NODLL` 则退避为 `RECONNECTING`。在 `165:8193` 上的 35 点全量验证显示 23 个 `GOOD` 与 12 个 `BAD` 的隔离符合预期。
 
-**逻辑与容错**：`cnc_rdtofs s_no=e_no=num f64/1000` 试 `type 0→1`；`cnc_rdtofsr` 先 `IodbTo112 46B 1_2` `9 trial` 再回落 `IodbTo111 28B`；`cnc_rdparam` 先 `IodbPsd1 8B ldata` 试 `len8`，`EW_Attrib 4` 说明 `REAL` 则回退 `IodbPsd2 12B rdata prm_val/dec_val 10^dec`；`cnc_rdprogdir/info` `OdbNc1 6 trial` `OdbNc2 3 trial` `cnc_upstart3→upload3→upend3` 循环至 `EW_BUFFER`。所有 `EW_LENGTH/NUMBER/ATTRIB` 按项 `String ERR:` 转 `Quality Bad` 隔离，`EW_SOCKET/NODLL` 退避 `RECONNECTING`，`165:8193 35点 23 GOOD 12 BAD 8134` `pts44_final3.json` 验证 `Fake 10 passed`。
+### 3.3 OPC UA（通用，节点/订阅型）
 
-### 3.3 OPC UA（通用，§7.3 节点/订阅型）
+OPC UA 驱动实现了三种绑定：`opcua.node-group` 的 Poll 轮询、`opcua.subscription` 的订阅以及 `opcua.browse` 的浏览。在 Poll 模式下，驱动以固定的 `interval_ms` 轮询 `Session::read` 并批量读取；在订阅模式下，则通过 `create_subscription` 的 `publishing 500ms` 与 `create_monitored_items` 的 `sampling 250ms queue10` 建立 `DataChangeCallback`，再经由 `mpsc 256` 通道以 `drain 64` 的方式合批，同样遵循 `Latest-Wins` 的背压策略；而浏览模式则周期性地对 `Objects 85` 这类根节点进行引用展开，并将结果以分号拼接。
 
-**三绑定**：`opcua.node-group Poll` `opcua.subscription Sub publishing 500 sampling 30 queue10 discardOldest` `opcua.browse 1000` `drivers/opcua/src/lib.rs:35`。`Poll` 定速 `interval_ms` 轮询 `Session::read TimestampsToReturn::Both` 批量；`Sub` `create_subscription 500ms` + `create_monitored_items 250ms` `DataChangeCallback try_send mpsc 256` `drain 64` 合批 `Latest-Wins`；`Browse` `Session::browse(Objects 85, HierarchicalReferences)` `;` 拼接。
+地址解析支持 `NodeId` 的四种形式 `ns/i/s/g/b`，例如 `ns=2;i=1234` 或 `ns=2;s=Motor.Speed`，且 Core 侧被禁止解析以满足硬约束。值映射覆盖了 `BOOL/I32/U32/I64/U64/F32/F64/STRING/Bytes/DateTime/TypedArray` 等全量 `Variant`，并依据 `StatusCode` 的 `Good→GOOD Uncertain→UNCERTAIN Bad→BAD` 进行单点隔离。`SourceTimestamp` 以 `1601` 年为起点的 `ticks` 精确换算为 `Unix` 纳秒予以保留，这是 `§9.2` 所要求的语义。
 
-**地址与映射**：`NodeId ns/i/s/g/b 4型` `ns=2;i=1234 s=Motor.Speed g=72962B91... b=Base64` `Core禁解析` `address.rs:199`。`Variant→Value` 覆盖 `BOOL/I32/U32/I64/U64/F32/F64/STRING/Bytes/DateTime/TypedArray` `§9.2`，`StatusCode Good→GOOD Uncertain→UNCERTAIN Bad→BAD bits()` `quality_code` 单点隔离，`SourceTimestamp` 以 `1601 ticks 11644473600*10M → Unix ns` 精确 `opcua_api.rs:286`，`LocalizedText/Array` 保留。
-
-**安全与证书**：`pki_dir = connection_json > FORGELINK_OPCUA_PKI_DIR > data/certificates/opcua` `own 0o600 rcgen 0o600` `ClientBuilder pki_dir own.der/key trust false verify true create_sample_keypair false` `SecurityPolicy None/Basic256Sha256/Aes128_Sha256_RsaOaep` `MessageSecurityMode None/Sign/SignAndEncrypt` `4840 None` `4843 SignAndEncrypt` `rejected→trusted 15s 人工` `§8` `Reference Server ghcr.io/php-opcua/uanetstandard-test-suite 300节点 12方法` `Browse Objects 85 → TestServer; Server 2253`。
+安全与证书方面，`pki_dir` 的解析优先级为 `connection_json` 的 `pki_dir` 字段高于环境变量 `FORGELINK_OPCUA_PKI_DIR` 再高于默认的 `data/certificates/opcua`。`own` 私钥以 `0o600` 权限通过 `rcgen` 自签名生成，`ClientBuilder` 以 `pki_dir own.der/key trust false verify true` 的方式构建，支持 `SecurityPolicy None/Basic256Sha256/Aes128` 与 `MessageSecurityMode None/Sign/SignAndEncrypt` 的透传，`rejected` 目录下的未知证书需经 `POST /rejected/{thumb}/trust` 人工迁移至 `trusted` 后重连，符合 `§8` 的最小运维能力。`Reference Server` 通过 `ghcr.io/php-opcua/uanetstandard-test-suite` 提供了 300 节点的全功能模拟，浏览 `Objects 85` 可得到 `TestServer; Server 2253` 等引用。
 
 ## 4. 前端
 
-`web-ui/` 为独立 Vite 8.2.2 前端项目，不修改后端。`5173` 开发服通过 `vite.config.ts proxy /api→127.0.0.1:8132` 避 `CORS`，`src/main.ts 662行` 实现 `Tabs drivers/devices/endpoints/points/diagnostics/certs`。`drivers` 走 `GET /drivers` + `POST /drivers/rescan`；`devices/endpoints` 走 `POST /devices POST /endpoints GET /endpoints` `start/stop/delete`；`points` 走 `GET /points/latest auto 1s` 表格 `endpoint/key/point_id/quality/type/value/time`；`diagnostics` 合并 `GET /diagnostics` 与 `GET /certificates/opcua/diagnostics`；`certs` 四 `store own/trusted/issuers/rejected` `GET /certificates/opcua/{store}` `POST /trusted {pem} DELETE /trusted/{thumb} POST /rejected/{thumb}/trust`。点位变更严格 `Stop → PUT /tasks/{id} 全量快照 → Start new epoch` `Bad隔离` `npm run dev 219ms build 10.29kB gzip 3.5kB` `dist` 可随 `packaging` 部署。
+`web-ui/` 是一个独立的 Vite 8.2.2 前端项目，采用 `proxy /api→127.0.0.1:8132` 的方式避免跨域，且完全不修改后端。项目通过 `Tabs` 的形式组织了六大功能区：`drivers` 通过 `GET /drivers` 与 `POST /drivers/rescan` 展示驱动清单；`devices/endpoints` 通过 `POST /devices POST /endpoints GET /endpoints` 实现设备的增删与 `start/stop/delete` 控制；`points` 通过 `GET /points/latest auto 1s` 以表格形式展示 `endpoint/key/point_id/quality/type/value/time`；`diagnostics` 合并了 `GET /diagnostics` 与证书诊断；`certs` 则对四个 `store own/trusted/issuers/rejected` 提供了 `GET /certificates/opcua/{store}` `POST /trusted {pem}` `DELETE /trusted/{thumb}` 等操作。
+
+点位的变更严格遵循 `Stop → PUT /tasks/{id} 全量快照 → Start` 的路径并产生新的 `stream_epoch`，单点 `Bad` 通过 `String ERR:` 的形式隔离而不影响同批其他点。前端构建通过 `npm run dev 219ms` 启动开发服，`npm run build` 产出 `10.29kB` 的 `dist` 产物，可随 `packaging` 一同部署。
 
 ## 5. 性能与平台
 
-**预算**：`§22 50K updates/s 60min` `IPC delivery p95 ≤20ms p99 ≤50ms` 单调时钟测量 `RSS 60min 增幅 ≤10%` `Conn-1000 60min无泄漏`。本机 `release 8135 sim-001 5点 100ms` `Soak 15min 1.1% 9.5→9.6 60min 5.4% 9.5→9.7 5点 3600s` `Simulator burst125` 已预检；`1ms Poll 1pt p50 6ms p95 13ms` `FOCAS 500ms 13ms` `FORGELINK_HEARTBEAT_FAST=1 1s×2` `common/mod.rs 10055 10次退避` `TIME_WAIT 30s` 已 `8134` 验证。
+性能预算遵循 `§22` 的 `50K updates/s 持续 60分钟`、`IPC delivery p95 ≤20ms p99 ≤50ms`（基于单调时钟测量）、`RSS 60分钟增幅 ≤10%` 以及 `Conn-1000 60分钟无泄漏` 的要求。本机在 `release 8135` 上以 `sim-001 5点 100ms` 的低负载进行了 `15分钟 1.1% 9.5→9.6` 与 `60分钟 5.4% 9.5→9.7 5点 3600s` 的预检，并通过 `Simulator burst125` 验证了 `Latest-Wins` 的有效性；`1ms Poll 1pt` 的实测 `p50 6ms p95 13ms` 表明 `IPC` 本身远低于 `20ms` 门限。此外，`FORGELINK_HEARTBEAT_FAST=1` 可将心跳从 `5s/3s×3=15s` 缩短至 `1s×2=2s`，`common/mod.rs` 对 `10055` 的 `10次 50ms` 退避也已验证对 `TIME_WAIT 30s` 的缓解。
 
-**平台**：`win64 PE 2.0/4.4/13M FWLIB64.dll 649KB` `linux x64 ELF 5m56s` `aarch64 7.8/13M QEMU 3m02s` `edition 2024 rust 1.85` `docker opcua-ref 4840 Up 55min` `ghcr.io 10808`。
-
-**部署**：`packaging/windows-service/install.ps1 sc create ForgeLink binPath --db %ProgramData%\ForgeLink\forgelink.db --http-port 8132 start auto` `KILL_ON_JOB_CLOSE` 已 `process.rs:job`；`packaging/systemd/forgelink.service ExecStart /opt/forgelink/forgelinkd --db /var/lib/forgelink/forgelink.db journald` `systemctl enable --now`。`forgelinkd --db forgelink.db --http-port 8132 --drivers-dir drivers` 默认 `8132 loopback` `forgelinkd --help`。
+平台方面，`win64 PE 2.0/4.4/13M` 携带 `FWLIB64.dll`，`linux x64 ELF 5m56s` 与 `aarch64 7.8/13M QEMU 3m02s` 均以 `edition 2024 rust 1.85` 构建，`docker opcua-ref 4840 Up 55min` 通过 `10808` 代理拉取 `ghcr.io` 镜像。部署则通过 `packaging/windows-service/install.ps1` 的 `sc create ForgeLink` `KILL_ON_JOB_CLOSE` 与 `packaging/systemd/forgelink.service` 的 `journald` `systemctl enable --now` 实现，默认启动命令为 `forgelinkd --db forgelink.db --http-port 8132 --drivers-dir drivers`。
 
 ## 6. 版本与门禁
 
-`v0.1.0-mvp` `7121998 FOCAS 44/44 OPC UA Browse Security` `60 更正非CNC` `cargo build --workspace 0.37s cargo test --workspace --lib 11/13 contract 9/5/3/2 data_plane 2 passed --test-threads=1` `§26 23条 20/23 Done` 余 `OPC UA硬件 97:4840 + 8C 60min正式 Soak 60min + packaging` 即 `Done`。详见 `ForgeLink_Driver_MVP_实施方案.md V1.4` 与 `GATE` 三文档。
+当前版本为 `v0.1.0-mvp` `7121998`，已实现 `FOCAS 44/44` 与 `OPC UA Browse` 等增量，并对前期误记的 `60` 进行了更正。通过 `cargo build --workspace 0.37s` 与 `cargo test --workspace --lib 11/13` 以及 `contract 9/5/3/2 data_plane 2 passed` 的验证，`§26` 的 23 条验收标准中 20 条已 `Done`，剩余 `OPC UA 硬件 97:4840 + 8C 60分钟正式 Soak + packaging` 即可完全闭环。详细门禁见 `ForgeLink_Driver_MVP_实施方案.md V1.4` 与三份 `GATE` 文档。
