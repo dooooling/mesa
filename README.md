@@ -21,28 +21,12 @@ cargo test --workspace -- --test-threads=1  # 42+11+4+23项 0 failed（单跑 su
 - **孤儿防护**：`stdin token` + `KILL_ON_JOB_CLOSE / PR_SET_PDEATHSIG`，`token` 经 `stdin` 注入
 - **多连接**：单 Driver 进程多 `handle` 复用 `HashMap<u32,ConnEntry>` `DataSink for_connection` 隔离
 
-## 驱动
+详见 `docs/architecture.md` 与 `ForgeLink_Driver_MVP_实施方案.md` V1.4
 
-- **S7** `s7.address-group` `DB/M/I/Q` `COTP→S7 Setup PDU480` `READ 19` `PUT/GET 0x04` 诊断
-- **FOCAS2** `focas.data-block` `status/axis/spindle/macro/pmc` `Fake/Native libloading FWLIB64 24M` `cnc_statinfo/rddynamic2 44`
-- **OPC UA** `opcua.node-group Poll` `opcua.subscription Subscribe` `NodeId ns/i/s/g/b` `Variant→Value` `pki_dir 10808` `trust false`
+## 前端
 
-## 证书
-
-`data/certificates/opcua/{own,trusted,issuers,rejected,private}` `own 0o600` `pki_dir = connection_json > FORGELINK_OPCUA_PKI_DIR > 默认` `POST /rejected/{thumb}/trust`
-
-## 性能
-
-`50K updates/s 60min 600+3000 Soak 3600s` `IPC p95 ≤20ms p99 ≤50ms` `RSS ≤10%` `Conn-1000` `Simulator burst125` `release 8135 60min 9.5→9.7 5.4% 5点` `Soak 15min 1.1%` 已预检
-
-## 部署
-
-`packaging/windows-service/install.ps1` `sc create ForgeLink` `KILL_ON_JOB_CLOSE` `packaging/systemd/forgelink.service` `systemctl enable --now` `journald`
-
-## 平台
-
-`win64 PE 2.0/4.4/13M` `linux x64 ELF 5m56s` `aarch64 7.8/13M QEMU 3m` `edition 2024`
+`web-ui/` `Vite 5173 proxy /api→8132` `npm run dev/build` 不改后端
 
 ## 版本
 
-`v0.1.0-mvp` `1e84b1f` 前 `df7955b` 注释整理，`tag` 本地
+`v0.1.0-mvp` `7121998` `FOCAS 44/44` `Soak 60min 5.4%`
