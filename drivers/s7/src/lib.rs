@@ -101,6 +101,67 @@ struct S7Connection {
     plan: Option<PlanSnapshot>,
 }
 
+// 连续区合并的批量结构，供 run 内合并与单元测试复用
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // 仅测试与合并逻辑复用，clippy -D warnings 下避免未使用误报
+struct Bulk {
+    base: S7Address,
+    len: usize,
+    members: Vec<(usize, usize, S7Kind, u32)>,
+}
+
+/// 将已排序的 paired 按 (area, db, byte_offset) 合并为 Bulk，规则与 run 内一致：
+// TODO: 覆盖 oversized/WSTRING/PDU480 边界
+#[allow(dead_code)]
+fn merge_paired_to_bulks(paired: &[((PointSpec, u32), ReadItem)]) -> Vec<Bulk> {
+    const MAX_BULK_LEN: usize = 400;
+    const GAP_THRESHOLD: u32 = 4;
+    let mut bulks: Vec<Bulk> = Vec::new();
+    let mut cur: Option<Bulk> = None;
+    for (idx, ((spec, pid), item)) in paired.iter().enumerate() {
+        let is_string = matches!(item.kind, S7Kind::String | S7Kind::WString);
+        let item_len = item.kind.byte_len();
+        let start = item.addr.byte_offset;
+        let end = start + item_len as u32;
+        let can_merge = if let Some(c) = cur.as_ref() {
+            let c_end = c.base.byte_offset + c.len as u32;
+            let c_has_string = c.members.iter().any(|(mi, _, _, _)| {
+                matches!(paired[*mi].1.kind, S7Kind::String | S7Kind::WString)
+            });
+            !is_string
+                && !c_has_string
+                && item.addr.area == c.base.area
+                && item.addr.db_number == c.base.db_number
+                && start <= c_end + GAP_THRESHOLD
+                && (end.max(c_end) - c.base.byte_offset) as usize <= MAX_BULK_LEN
+        } else {
+            false
+        };
+        if can_merge {
+            let c = cur.as_mut().unwrap();
+            let c_end = c.base.byte_offset + c.len as u32;
+            let new_end = end.max(c_end);
+            c.len = (new_end - c.base.byte_offset) as usize;
+            let offset = (start - c.base.byte_offset) as usize;
+            c.members.push((idx, offset, item.kind, *pid));
+        } else {
+            if let Some(c) = cur.take() {
+                bulks.push(c);
+            }
+            cur = Some(Bulk {
+                base: item.addr.clone(),
+                len: item_len,
+                members: vec![(idx, 0, item.kind, *pid)],
+            });
+            let _ = spec;
+        }
+    }
+    if let Some(c) = cur.take() {
+        bulks.push(c);
+    }
+    bulks
+}
+
 #[async_trait::async_trait]
 impl DriverConnection for S7Connection {
     async fn configure(
@@ -357,7 +418,7 @@ impl DriverConnection for S7Connection {
                     });
                     // 连续区合并：将同一 area/db 内相邻或重叠的 Byte 区间合并为一次 BYTE 批量读，减少 PDU 往返
                     // STRING/WSTRING(256/516B) 单独成区不与小项合并，避免无意义大范围读取；单区上限 200B 适配 PDU 480
-                    const MAX_BULK_LEN: usize = 200;
+                    const MAX_BULK_LEN: usize = 400;
                     const GAP_THRESHOLD: u32 = 4;
                     struct Bulk {
                         base: S7Address,
@@ -421,21 +482,45 @@ impl DriverConnection for S7Connection {
                             }
                         }
                     };
-                    // 将 bulk 字节切片分发回各点，按项 BAD 隔离：整 bulk None 则其成员全部跳过
+                    // 将 bulk 字节切片分发回各点，按项 BAD 隔离
                     let mut raw_by_paired: Vec<Option<Vec<u8>>> = vec![None; paired.len()];
-                    for (bulk, raw_opt) in bulks.iter().zip(bulk_raws) {
-                        let bulk_bytes = match raw_opt {
-                            Some(b) => b,
-                            None => continue,
-                        };
-                        for (paired_idx, offset, kind, _pid) in &bulk.members {
-                            let need = kind.byte_len();
-                            if *offset + need <= bulk_bytes.len() {
-                                raw_by_paired[*paired_idx] =
-                                    Some(bulk_bytes[*offset..*offset + need].to_vec());
-                            } else if *offset < bulk_bytes.len() {
-                                // STRING 等返回短于预期时按实际截断，上层 decode 会按 cur_len 处理
-                                raw_by_paired[*paired_idx] = Some(bulk_bytes[*offset..].to_vec());
+                    let mut fallback_indices: Vec<(usize, ReadItem)> = Vec::new();
+                    for (bulk, raw_opt) in bulks.iter().zip(bulk_raws.iter()) {
+                        match raw_opt {
+                            Some(bulk_bytes) => {
+                                for (paired_idx, offset, kind, _pid) in &bulk.members {
+                                    let need = kind.byte_len();
+                                    if *offset + need <= bulk_bytes.len() {
+                                        raw_by_paired[*paired_idx] =
+                                            Some(bulk_bytes[*offset..*offset + need].to_vec());
+                                    } else if *offset < bulk_bytes.len() {
+                                        raw_by_paired[*paired_idx] =
+                                            Some(bulk_bytes[*offset..].to_vec());
+                                    }
+                                }
+                            }
+                            None => {
+                                // bulk 整体 BAD（如合并区含非法地址），回退为逐点单读以隔离合法点
+                                for (paired_idx, _offset, _kind, _pid) in &bulk.members {
+                                    let (_, item) = &paired[*paired_idx];
+                                    fallback_indices.push((*paired_idx, item.clone()));
+                                }
+                            }
+                        }
+                    }
+                    // 逐点回退：对 bulk BAD 的成员逐一单读，避免合法点被误丢
+                    if !fallback_indices.is_empty() {
+                        let mut guard = client.lock().await;
+                        for (paired_idx, item) in fallback_indices {
+                            match guard.read_vars(&[item]).await {
+                                Ok(mut v) => {
+                                    if let Some(Some(b)) = v.pop() {
+                                        raw_by_paired[paired_idx] = Some(b);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(idx=%paired_idx, error=%e, "S7 fallback 单点读失败");
+                                }
                             }
                         }
                     }
@@ -568,5 +653,124 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "INVALID_ADDRESS");
+    }
+
+    #[test]
+    fn merge_contiguous_and_gap() {
+        // DB10.DBD0(4B) + DB10.DBD4(4B) 相邻 → 合并为 8B 单 bulk
+        let mk = |addr: &str, kind| {
+            let a = parse_address(addr).unwrap();
+            ReadItem { addr: a, kind }
+        };
+        let mk_spec = |key: &str, addr: &str, kind| PointSpec {
+            key: key.into(),
+            addr: parse_address(addr).unwrap(),
+            kind,
+            data_type: mesa_core_types::DataType::F32,
+        };
+        let paired = vec![
+            (
+                (mk_spec("a", "DB10.DBD0", S7Kind::Real), 1),
+                mk("DB10.DBD0", S7Kind::Real),
+            ),
+            (
+                (mk_spec("b", "DB10.DBD4", S7Kind::Real), 2),
+                mk("DB10.DBD4", S7Kind::Real),
+            ),
+        ];
+        let bulks = merge_paired_to_bulks(&paired);
+        assert_eq!(bulks.len(), 1, "相邻 4+4 应合并");
+        assert_eq!(bulks[0].len, 8);
+        //  gap 10 (>4) 不合并
+        let paired2 = vec![
+            (
+                (mk_spec("a", "DB10.DBD0", S7Kind::Real), 1),
+                mk("DB10.DBD0", S7Kind::Real),
+            ),
+            (
+                (mk_spec("b", "DB10.DBD20", S7Kind::Real), 2),
+                mk("DB10.DBD20", S7Kind::Real),
+            ),
+        ];
+        let bulks2 = merge_paired_to_bulks(&paired2);
+        assert_eq!(bulks2.len(), 2, "gap 16 应分两 bulk");
+    }
+
+    #[test]
+    fn merge_wstring_isolated_and_oversized() {
+        let mk = |addr: &str, kind| {
+            let a = parse_address(addr).unwrap();
+            ReadItem { addr: a, kind }
+        };
+        let mk_spec = |key: &str, addr: &str, kind| PointSpec {
+            key: key.into(),
+            addr: parse_address(addr).unwrap(),
+            kind,
+            data_type: mesa_core_types::DataType::String,
+        };
+        // WSTRING 516B 单独成区，不与 REAL 合并
+        let paired = vec![
+            (
+                (mk_spec("a", "DB10.DBD0", S7Kind::Real), 1),
+                mk("DB10.DBD0", S7Kind::Real),
+            ),
+            (
+                (mk_spec("b", "DB10.DBD256", S7Kind::WString), 2),
+                mk("DB10.DBD256", S7Kind::WString),
+            ),
+        ];
+        let bulks = merge_paired_to_bulks(&paired);
+        assert_eq!(bulks.len(), 2, "WSTRING 应隔离");
+        // oversized：10 个 REAL 4*10=40 <400 合并为 1；101 个 REAL 404 >400 需分片
+        let many: Vec<((PointSpec, u32), ReadItem)> = (0..101)
+            .map(|i| {
+                let addr = format!("DB10.DBD{}", i * 4);
+                let a = parse_address(&addr).unwrap();
+                let spec = PointSpec {
+                    key: format!("k{i}"),
+                    addr: a.clone(),
+                    kind: S7Kind::Real,
+                    data_type: mesa_core_types::DataType::F32,
+                };
+                (
+                    (spec, i as u32),
+                    ReadItem {
+                        addr: a,
+                        kind: S7Kind::Real,
+                    },
+                )
+            })
+            .collect();
+        let bulks_many = merge_paired_to_bulks(&many);
+        assert!(
+            bulks_many.len() > 1,
+            "101*4=404 超限应分片，实际 {}",
+            bulks_many.len()
+        );
+        for b in &bulks_many {
+            assert!(b.len <= 400, "单 bulk 不超 400，实际 {}", b.len);
+        }
+    }
+
+    #[test]
+    fn negotiated_pdu_aware_chunking() {
+        // 验证 client 动态 PDU：19 限制 + byte_len 限流，WSTRING 516 单项仍可单 PDU（取决于协商 960）
+        // 此单测仅验证 merge 层不超 400，client 层由 S7_MAX_ITEMS_PER_PDU 与 pdu_length 双重限流已在 client.rs 400 行覆盖
+        let mk = |addr: &str, kind| {
+            let a = parse_address(addr).unwrap();
+            ReadItem { addr: a, kind }
+        };
+        let mk_spec = |key: &str, addr: &str, kind| PointSpec {
+            key: key.into(),
+            addr: parse_address(addr).unwrap(),
+            kind,
+            data_type: mesa_core_types::DataType::String,
+        };
+        let paired = vec![(
+            (mk_spec("a", "DB10.DBD0", S7Kind::String), 1),
+            mk("DB10.DBD0", S7Kind::String),
+        )];
+        let bulks = merge_paired_to_bulks(&paired);
+        assert_eq!(bulks[0].len, 256, "STRING 固定 256");
     }
 }

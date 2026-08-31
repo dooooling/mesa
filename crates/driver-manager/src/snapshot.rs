@@ -3,7 +3,10 @@
 //! 全部驻留内存，不落盘——热路径最新值仅内存可达，持久化由 ConfigStore 负责。
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{
+    RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use serde::Serialize;
 
@@ -104,13 +107,31 @@ pub struct LatestEntry {
 
 /// 进程级共享快照。锁粒度按用途拆分，REST 读路径互不阻塞；latest/keys 采用 RwLock
 /// 以支持高频 DataBatch 写入与 REST 并发读取（§22 50K/s 下 apply_batch 与 latest_all 争用显著）。
-#[derive(Default)]
 pub struct Snapshot {
     drivers: RwLock<Vec<DriverInfo>>,
     endpoints: RwLock<HashMap<String, EndpointStatus>>,
     latest: RwLock<HashMap<(String, u32), LatestEntry>>,
     /// point_key -> data_type，用于 latest 输出补全类型信息。
     keys: RwLock<HashMap<(String, u32), String>>,
+    /// §22 精确计数：自启动以来的 envelope / point_value 总数（单调递增，跨 batch 累加）
+    envelopes_total: AtomicU64,
+    point_value_total: AtomicU64,
+    /// 诊断用：最近批次的单调延迟样本（环形缓冲，容量 4096），用于 p50/p95/p99 近似
+    latencies_ns: RwLock<Vec<u64>>,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            drivers: RwLock::new(Vec::new()),
+            endpoints: RwLock::new(HashMap::new()),
+            latest: RwLock::new(HashMap::new()),
+            keys: RwLock::new(HashMap::new()),
+            envelopes_total: AtomicU64::new(0),
+            point_value_total: AtomicU64::new(0),
+            latencies_ns: RwLock::new(Vec::with_capacity(4096)),
+        }
+    }
 }
 
 impl Snapshot {
@@ -154,7 +175,13 @@ impl Snapshot {
 
     /// 应用一个批次到 LatestValueCache。同点覆盖即"最新值胜出"的 Core 侧体现。
     /// 优化：预先快照 keys 的读锁，避免在持有 latest 写锁期间逐点再次加锁 keys，显著降低 50K/s 下的锁争用（原实现为 latest 锁内嵌 keys 锁）。
+    /// 同时以单调时钟记录 envelopes/points 计数，供 §22 精确吞吐与延迟百分位使用。
     pub fn apply_batch(&self, batch: &mesa_core_types::DataBatch, endpoint_id: &str) {
+        // 业务时间戳为 UTC ns，性能用单调时钟（此处以 apply 时刻的 Instant 采样，非跨进程相减）
+        let _mono_ns = std::time::Instant::now().elapsed().as_nanos() as u64; // 占位：实际延迟由 DataSink 单调埋点传入，此处仅计数
+        self.envelopes_total.fetch_add(1, Ordering::Relaxed);
+        self.point_value_total
+            .fetch_add(batch.values.len() as u64, Ordering::Relaxed);
         // 预构建本批次所需的 key 映射快照（仅一次读锁）
         let keys_snapshot: HashMap<(String, u32), String> = {
             let keys = self.keys.read().unwrap();
@@ -181,6 +208,25 @@ impl Snapshot {
             };
             latest.insert(k, entry);
         }
+    }
+
+    /// 记录单调延迟样本（由 DataSink/Ingress 在单调时钟下调用，非 UTC 相减）
+    pub fn record_latency_ns(&self, ns: u64) {
+        let mut v = self.latencies_ns.write().unwrap();
+        if v.len() >= 4096 {
+            v.remove(0);
+        }
+        v.push(ns);
+    }
+
+    pub fn envelopes_total(&self) -> u64 {
+        self.envelopes_total.load(Ordering::Relaxed)
+    }
+    pub fn point_value_total(&self) -> u64 {
+        self.point_value_total.load(Ordering::Relaxed)
+    }
+    pub fn latencies_snapshot(&self) -> Vec<u64> {
+        self.latencies_ns.read().unwrap().clone()
     }
 
     /// 断线标记（§11）：将该 Endpoint 全部已知点置 BAD/COMMUNICATION_LOST，

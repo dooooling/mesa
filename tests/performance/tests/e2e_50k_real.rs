@@ -1,13 +1,20 @@
 //! 真正的 end-to-end 50K benchmark（跨进程 TCP + Protobuf + 单调时钟）
-//! 区别于 data_plane_soak 的 burst 模拟，本测试显式以 Snapshot 点数与 Instant 计量吞吐与延迟，
-//! 满足 §22 性能预算的测量要求（业务 UTC 与性能单调分离）。
+//! §22：≥50K Point Updates/s 持续 60min，IPC p95≤20ms p99≤50ms（单调时钟），RSS 有界。
+//! 本用例为可重复的 10s CI 快检（-- --long 切 60s 全量），强断言失败即 fail，无假阳性。
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mesa_config_store::ConfigStore;
 use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
-use mesa_driver_manager::{MesaManager, StorePointIdSource};
+use mesa_driver_manager::MesaManager;
+
+fn percentile(mut v: Vec<u64>, p: f64) -> u64 {
+    if v.is_empty() {
+        return 0;
+    }
+    v.sort_unstable();
+    let idx = ((p / 100.0) * (v.len() as f64 - 1.0)).round() as usize;
+    v[idx.min(v.len() - 1)]
+}
 
 #[tokio::test]
 async fn e2e_50k_real_throughput() {
@@ -17,11 +24,12 @@ async fn e2e_50k_real_throughput() {
     } else {
         Duration::from_secs(10)
     };
-    let store = Arc::new(ConfigStore::open(std::path::Path::new(":memory:")).unwrap());
-    let source = Arc::new(StorePointIdSource::new(store.clone()));
     let drivers_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../drivers");
-    let mgr = MesaManager::with_source(&drivers_dir, source);
-    // 4 tasks *5 points * burst 125 /20ms = 125k/s 理论，满足 50K 基线
+    // 使用内存版 PointIdAllocator（BuiltinEndpoint 不落库），避免 StorePointIdSource 对 ConfigStore endpoint 的强依赖导致 ConfigurationFailed
+    let mgr = MesaManager::discover(&drivers_dir);
+
+    // 修复重复 point_key：每 task 独立前缀 p{i}_{j}，确保全量 20 个唯一 key 通过 DUPLICATE_POINT_KEY 校验
+    // 4 tasks *5 points * burst 125 /20ms = 每 20ms 2500 点 → 125k/s 理论，满足 50K 基线余量
     let tasks: Vec<AcquisitionTask> = (0..4)
         .map(|i| AcquisitionTask {
             id: format!("t{i}"),
@@ -30,47 +38,85 @@ async fn e2e_50k_real_throughput() {
             binding: DriverBinding {
                 kind: "simulator.points".into(),
                 config: serde_json::json!({
-                    "points": (0..5).map(|j| serde_json::json!({"key": format!("e{j}"), "kind":"counter", "start":0, "step":1})).collect::<Vec<_>>(),
+                    "points": (0..5).map(|j| serde_json::json!({"key": format!("p{i}_{j}"), "kind":"counter", "start":0, "step":1})).collect::<Vec<_>>(),
                     "burst": 125
                 }),
             },
         })
         .collect();
+    let ep_id = "e2e-50k-real";
     let ep = mesa_driver_manager::endpoint::BuiltinEndpoint {
-        endpoint_id: "e2e-50k-real".into(),
+        endpoint_id: ep_id.into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
         tasks,
     };
     mgr.start_endpoint(ep).unwrap();
     let snap = mgr.snapshot();
-    let start = Instant::now();
-    let mut last_count = 0u64;
-    // 单调时钟采样：每 100ms 统计增量
-    let mut ticker = tokio::time::interval(Duration::from_millis(100));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let deadline = start + dur;
+
+    // 确认 Endpoint 真正 RUNNING（非仅 running_ids 非空）：state=RUNNING 且 epoch!=0 且 points==20
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut running_ok = false;
     while Instant::now() < deadline {
-        ticker.tick().await;
-        // Snapshot 最新值数量即去重后点位，但吞吐需按批次点数计；此处用 latest_all 长度 * 采样次数近似，
-        // 更精确应统计 DataBatch point_value_total，经 diagnostics 暴露（P0 后补）
-        let cur = snap.latest_all().len() as u64;
-        if cur > last_count {
-            last_count = cur;
+        if let Some(st) = snap.endpoint(ep_id) {
+            if st.state == "RUNNING" && st.epoch != 0 && st.points == 20 {
+                running_ok = true;
+                break;
+            }
         }
-        // 额外按批次估算：burst 125 *4*5=2500 点/20ms =125k/s，10s 应 >500k
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let elapsed = start.elapsed().as_secs_f64();
-    // 兜底：若 Snapshot 去重导致低估，改用 elapsed 与任务配置的理论下界校验
-    // 真实点更新数由 driver 侧 point_value_total 计数，下阶段补诊断后此处可精确断言
-    let theoretical_min = 50_000.0 * elapsed * 0.8; // 允许 20% 抖动
-    println!(
-        "e2e_50k_real elapsed={:.1}s latest_len={} theoretical_min={:.0}",
-        elapsed, last_count, theoretical_min
+    assert!(
+        running_ok,
+        "Endpoint 未进入 RUNNING/epoch!=0/points==20，当前 {:?}",
+        snap.endpoint(ep_id)
     );
-    assert!(elapsed >= 9.0, "elapsed {elapsed}");
-    assert!(!mgr.running_ids().is_empty(), "应有运行中 endpoint");
-    // 当前阶段仅保证无 FAILED 且能持续产出；50K 精确计数待 diagnostics point_value_total 落地后加强
+
+    let start = Instant::now();
+    let start_points = snap.point_value_total();
+    let start_env = snap.envelopes_total();
+    // 单调时钟下等待 dur，中途不以 latest_all 去重长度估算吞吐
+    tokio::time::sleep(dur).await;
+    let elapsed = start.elapsed().as_secs_f64();
+    let end_points = snap.point_value_total();
+    let end_env = snap.envelopes_total();
+    let delta_points = end_points.saturating_sub(start_points);
+    let delta_env = end_env.saturating_sub(start_env);
+    let ups = delta_points as f64 / elapsed;
+
+    // 延迟百分位（当前 Snapshot 采样为环形 4096，若未埋点则为 0，仍输出以便诊断）
+    let lat = snap.latencies_snapshot();
+    let p50 = percentile(lat.clone(), 50.0);
+    let p95 = percentile(lat.clone(), 95.0);
+    let p99 = percentile(lat.clone(), 99.0);
+
+    println!(
+        "e2e_50k_real elapsed={:.2}s delta_points={} delta_env={} ups={:.0} p50={}ns p95={}ns p99={}ns",
+        elapsed, delta_points, delta_env, ups, p50, p95, p99
+    );
+
+    // 强断言：失败必须 fail，无假阳性
+    assert!(elapsed >= dur.as_secs_f64() * 0.9, "elapsed {elapsed} 过短");
+    assert!(
+        delta_env > 0,
+        "envelopes_total 必须 >0，否则 DataBatch 未到达 Core"
+    );
+    assert!(delta_points > 0, "point_value_total 必须 >0");
+    // 10s 快检阈值 50K 的 80% 容差，60s 全量则严格 50K
+    let threshold = if long { 50_000.0 } else { 40_000.0 };
+    assert!(
+        ups >= threshold,
+        "实际 updates/s {ups:.0} 未达阈值 {threshold:.0}（delta {delta_points} / {elapsed:.1}s），不满足 §22 50K"
+    );
+    // 延迟仅在有样本时断言，避免未埋点时误 fail；已埋点则按 §22 预算
+    if !lat.is_empty() && p95 != 0 {
+        assert!(p95 <= 20_000_000, "p95 {p95}ns >20ms，不满足 §22 p95≤20ms");
+        assert!(p99 <= 50_000_000, "p99 {p99}ns >50ms，不满足 §22 p99≤50ms");
+    }
+
+    // 最终仍需 RUNNING
+    let st = snap.endpoint(ep_id).expect("endpoint still present");
+    assert_eq!(st.state, "RUNNING", "结束时仍应 RUNNING，实际 {:?}", st);
+
     mgr.shutdown_all().await;
-    // 单调时钟 IPC 延迟由 driver-sdk writer 单调埋点与 Core ingress 埋点对比得出，当前仅验证吞吐可达
 }

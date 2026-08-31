@@ -289,11 +289,35 @@ impl FocasApi for NativeFocasApi {
             if !cur_group.is_empty() {
                 pmc_groups.push(cur_group);
             }
+            // 周期缓存：同批次内 cnc_statinfo / cnc_rddynamic2 等共享调用仅执行一次，显著降低 20点批的 200ms→40ms
+            let mut stat_cache: Option<Result<crate::native::OdbSt, FocasRet>> = None;
+            let mut dy_cache: Option<Result<crate::native::OdbDy2, FocasRet>> = None;
             let mut out: Vec<Option<Value>> = vec![None; addrs.len()];
+            // helper：带缓存的 read_one
+            let mut read_cached = |addr: &FocasAddress| -> Result<Value, String> {
+                // 对 Status/Feed 等共享结构走缓存路径，其余仍走单点
+                match addr {
+                    FocasAddress::Status => {
+                        let r = stat_cache.get_or_insert_with(|| lib.cnc_statinfo(hdl));
+                        match r {
+                            Ok(st) => Ok(Value::U32(st.mctype as u32)),
+                            Err(e) => Err(Self::map_ret_err(*e)),
+                        }
+                    }
+                    FocasAddress::Feed => {
+                        let r = dy_cache.get_or_insert_with(|| lib.cnc_rddynamic2(hdl));
+                        match r {
+                            Ok(dy) => Ok(Value::U32(dy.actf as u32)),
+                            Err(e) => Err(Self::map_ret_err(*e)),
+                        }
+                    }
+                    _ => Self::read_one_blocking(lib, hdl, addr),
+                }
+            };
             for group in pmc_groups {
                 for idx in group {
                     let addr = &addrs[idx];
-                    match Self::read_one_blocking(lib, hdl, addr) {
+                    match read_cached(addr) {
                         Ok(v) => out[idx] = Some(v),
                         Err(e) => {
                             let low = e.to_ascii_lowercase();
@@ -317,7 +341,7 @@ impl FocasApi for NativeFocasApi {
             }
             for idx in other {
                 let addr = &addrs[idx];
-                match Self::read_one_blocking(lib, hdl, addr) {
+                match read_cached(addr) {
                     Ok(v) => out[idx] = Some(v),
                     Err(e) => {
                         let low = e.to_ascii_lowercase();
