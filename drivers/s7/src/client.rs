@@ -439,12 +439,18 @@ pub(crate) fn fragment_ranges(
     (physical, logical_to_physical)
 }
 
-/// 将物理结果重组回 logical（任一物理 BAD 则 logical BAD），并按期望长度截断
+/// 将物理结果重组回 logical（任一物理 BAD 则 logical BAD）
+/// 复杂度 O(total logical bytes)（需复制所有 fragment 字节，256/516B 量级可忽略）
 pub(crate) fn reassemble_ranges(
     logical_to_physical: &[Vec<usize>],
     physical_results: &[Option<Vec<u8>>],
     ranges_len: usize,
 ) -> Vec<Option<Vec<u8>>> {
+    debug_assert_eq!(
+        logical_to_physical.len(),
+        ranges_len,
+        "调用方需保证 logical_to_physical 与 ranges 同长"
+    );
     let mut out = Vec::with_capacity(ranges_len);
     for pis in logical_to_physical {
         if pis.is_empty() {
