@@ -1,36 +1,44 @@
-# Mesa Driver Descriptor / Resource / Control 可验收契约与完整开发实施方案 V2
+# Mesa Driver Descriptor / Resource / Control 可验收契约与完整开发实施方案 V2.1
 
 > 仓库：`dooooling/mesa`  
 > 基线：当前 `master`  
 > 文档性质：**施工契约 + 测试契约 + 验收契约**  
-> 核心原则：不推翻现有 Runtime/Data Plane；先冻结契约，再实现 Descriptor、动态 UI、Profile、Discovery 和 Control Plane。
+> 核心原则：不推翻现有 Runtime / Data Plane；先冻结契约，再实现 Descriptor、动态 UI、Profile、Discovery 和 Control Plane。
 
 ---
 
 # 0. 文档目的
 
-上一版已经确定了总体方向：
+本方案用于把 Mesa 下一阶段从“架构方向”落实成**可以直接写代码、测试断言、DDL、错误码、性能 Gate、迁移工具和 Release Artifact 的工程契约**。
 
-- Driver 自描述；
-- UI 不理解具体协议；
-- Core 不理解具体协议；
-- Resource 与 Physical Operation 分离；
-- Profile 降低用户心智负担；
-- Write / Command 分离；
-- Descriptor 不进入 Data Plane 热路径。
+核心目标：
 
-但要真正进入施工，还必须把上述方向冻结为**可以直接写测试断言、DDL、错误码、性能 Gate 和迁移脚本的契约**。
+```text
+简单 Driver 仍然简单
+复杂 Driver 有足够表达能力
+Core 不理解具体工业协议
+UI 不理解具体工业协议
+协议优化留在 Driver
+Descriptor 不进入采集热路径
+新增 Driver 尽量不修改 Core / UI
+V1 严格只读不会因为 Control 设计提前被破坏
+```
 
-本版重点补齐：
+本版重点冻结：
 
-1. Data Plane 精确语义；
-2. Descriptor / IPC / Driver 三类版本兼容规则；
+1. Data Plane / Point / Quality / Timestamp / Tombstone / Backpressure；
+2. Driver / Descriptor / IPC 三套版本兼容规则；
 3. Secret / Certificate / Control 安全边界；
-4. ConfigStore V1 → V2 增量迁移；
-5. Management / Data Plane 队列隔离和性能预算；
-6. Diagnostics / Runbook；
-7. DeviceProfile 匹配、Preset 展开、i18n、ImportIssue；
-8. 每个阶段明确的 Definition of Done。
+4. ConfigStore V1 → V2 Migration；
+5. Data / Management / Control Queue 隔离；
+6. Configure / Runtime 性能预算；
+7. Diagnostics / Runbook；
+8. DeviceProfile / Preset / i18n / ImportIssue；
+9. Driver 子进程防孤儿；
+10. V1 Read-Only → Future Control 的过渡规则；
+11. Descriptor Proto / REST 错误码；
+12. Tombstone GC；
+13. `release-validation.json` Schema 与示例文件。
 
 ---
 
@@ -89,10 +97,9 @@ PointDefinition
 PointMap
 ```
 
-当前：
+当前 Quality：
 
 ```text
-Quality:
 GOOD
 UNCERTAIN
 BAD
@@ -110,7 +117,7 @@ UTC Unix ns
 host_mono_ns()
 ```
 
-仅用于：
+只用于：
 
 ```text
 IPC / E2E latency
@@ -120,7 +127,7 @@ IPC / E2E latency
 
 ## 1.3 当前 DriverBinding
 
-当前核心原则继续冻结：
+继续冻结：
 
 ```text
 Core 只保存 DriverBinding.kind + config
@@ -128,11 +135,11 @@ Core 不解释协议语义
 Driver 自己解释配置
 ```
 
-后续 Descriptor / ResourceSelection 不能破坏这一边界。
+Descriptor / ResourceSelection 不得破坏这一边界。
 
 ## 1.4 当前 Point Registry
 
-ConfigStore 当前已经实现：
+ConfigStore 已经实现：
 
 ```text
 point_key -> stable point_id
@@ -144,7 +151,7 @@ point_key -> stable point_id
 (endpoint_id, point_key)
 ```
 
-删除点位：
+删除：
 
 ```text
 deleted = 1
@@ -182,7 +189,7 @@ ROLLBACK
 revision 不变化
 ```
 
-这一语义继续冻结。
+该语义继续冻结。
 
 ## 1.6 当前 Driver Runtime
 
@@ -224,6 +231,54 @@ Snapshot
 
 后续动态管理面不得破坏这些能力。
 
+### 1.6.1 Driver 进程防孤儿冻结契约
+
+每个 Driver Process 必须同时具备以下防护：
+
+1. Session token 通过 stdin 首行注入，不允许出现在命令行参数；
+2. Driver 必须持续监控 stdin；Core 正常关闭或异常死亡导致 EOF 后，Driver 必须主动退出；
+3. Linux Driver 必须设置 `PR_SET_PDEATHSIG`，作为 stdin EOF 之外的第二层父进程死亡防护；
+4. Windows 子进程必须加入启用 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object；
+5. `kill_on_drop` 只能作为兜底，不得成为唯一孤儿防护。
+
+可测断言：
+
+```text
+wrong token
+→ handshake rejected
+
+stdin EOF
+→ child exits before TERMINATE_GRACE
+
+Linux helper parent abnormal exit
+→ Driver PID disappears within bounded timeout
+
+Windows helper Core process exit / Job close
+→ Driver PID disappears within bounded timeout
+```
+
+测试策略：
+
+```text
+外层测试进程
+  ↓
+spawn helper Core
+  ↓
+helper Core spawn Driver
+  ↓
+强制结束 helper Core
+  ↓
+外层测试观察 Driver PID
+```
+
+这样可以自动验证 Job Object / PDEATHSIG，而不是依赖被测 Core 自己退出后继续执行断言。
+
+目标测试：
+
+```text
+tests/driver-contract/tests/subprocess_orphan_guard.rs
+```
+
 ## 1.7 当前 Driver SDK
 
 当前 Driver 开发者主要实现：
@@ -258,9 +313,9 @@ trait DriverConnection {
 
 ---
 
-# 2. 开工 Gate 与优先级
+# 2. 开工 Gate、优先级与 V1 Read-Only 边界
 
-任何 Descriptor / Generic UI 大规模开发之前，必须依次完成：
+任何 Descriptor / Generic UI 大规模开发之前，必须依次完成以下 Gate。
 
 ## P0 — 阻塞施工
 
@@ -291,19 +346,72 @@ P1.3 Configure / Runtime 性能预算
 ```text
 P2.1 Diagnostics / Runbook
 P2.2 DeviceProfile / Preset / i18n / ImportIssue
+P2.3 Release Validation Artifact Schema
 ```
+
+## 2.1 V1 Strict Read-Only Compatibility Gate
+
+当前 Mesa V1 继续保持**严格只读**。
+
+Descriptor / Resource / Profile / Browse / Import 的引入不得改变现有只读 Runtime。
+
+在 Control Milestone 之前：
+
+```text
+OutputDescriptor.access
+→ 仅允许 Read
+
+DriverConnection::write()
+→ 不存在，或统一返回 Unsupported
+
+DriverConnection::command()
+→ 不存在，或统一返回 Unsupported
+```
+
+Control Plane 只有进入 Milestone J 后才允许正式启用。
+
+即使 Control Plane 已经编译进二进制：
+
+```text
+默认仍为 disabled
+```
+
+必须通过：
+
+```bash
+mesad --enable-control
+```
+
+显式开启。
+
+未开启时：
+
+```text
+Write / Command API
+→ CONTROL_DISABLED
+```
+
+因此正式冻结：
+
+```text
+Descriptor Contract Ready
+≠
+设备写能力已经开放
+```
+
+这一规则防止开发者因为 Descriptor 中提前存在 `access` / `controls` 字段而错误地在 V1 提前实现真实设备写路径。
 
 ---
 
 # 3. P0.1：Point / Data Plane 冻结契约
 
-这是后续所有 Descriptor Output、Resource 和控制逻辑的基础。
+这是后续所有 Descriptor Output、Resource 和 Control 逻辑的基础。
 
 ## 3.1 DataType
 
 继续使用现有 `DataType`。
 
-V1 冻结：
+冻结：
 
 ```text
 bool
@@ -330,15 +438,15 @@ datetime[]
 
 Descriptor Output 的 `data_type` 必须来自这一枚举。
 
-禁止 Driver Descriptor 自定义任意数据类型字符串。
+禁止 Driver Descriptor 自定义任意类型字符串。
 
-未来新增 DataType 必须同时触发：
+未来新增类型必须同时触发：
 
 ```text
 Core DataType review
 IPC compatibility review
 Descriptor contract review
-REST/Frontend rendering review
+REST / Frontend rendering review
 ```
 
 ## 3.2 OutputDescriptor
@@ -349,13 +457,9 @@ Resource Output 最小契约：
 pub struct OutputDescriptor {
     pub id: String,
     pub label: LocalizedText,
-
     pub data_type: DataType,
     pub unit: Option<String>,
-
     pub access: AccessMode,
-
-    /// 仅用于诊断/UI 说明，不作为运行期表达式。
     pub quality_codes: Vec<QualityCodeDescriptor>,
 }
 ```
@@ -368,16 +472,22 @@ Write
 ReadWrite
 ```
 
+但根据 §2.1：
+
+```text
+V1 Read-Only 阶段只接受 Read
+```
+
 Command 不通过 AccessMode 表达。
 
 ## 3.3 不引入任意 Quality DSL
 
-不允许：
+禁止：
 
 ```text
 JavaScript quality rule
 自定义表达式脚本
-复杂 DSL
+复杂 Quality DSL
 ```
 
 Quality 使用 Mesa 全局契约：
@@ -388,10 +498,10 @@ UNCERTAIN
 BAD
 ```
 
-Driver 只负责：
+Driver 负责：
 
 ```text
-Protocol status
+Protocol Status
 → Mesa Quality + quality_code
 ```
 
@@ -409,13 +519,13 @@ value 具有当前业务有效性
 
 ```text
 Output = I32
-GOOD + I32(100)       ✅
-GOOD + String("100") ❌ Contract Violation
+GOOD + I32(100)        ✅
+GOOD + String("100")  ❌ Contract Violation
 ```
 
 ## 3.5 UNCERTAIN
 
-只允许在协议原生语义明确提供 uncertain 时使用。
+只允许在协议原生质量语义明确提供 uncertain 时使用。
 
 Driver 不允许因为：
 
@@ -435,7 +545,7 @@ BAD 表示：
 当前 Point 不可作为有效当前测量值使用
 ```
 
-但是为了保持 TypedValue 契约：
+为了保持 TypedValue 契约：
 
 ```text
 BAD Point 仍必须携带与 data_type 匹配的 Value
@@ -444,7 +554,7 @@ BAD Point 仍必须携带与 data_type 匹配的 Value
 规则：
 
 1. 优先保留该 Point 的 last-known typed value；
-2. 没有 last-known value 时，允许使用 type-compatible neutral value；
+2. 没有 last-known value 时允许使用 type-compatible neutral value；
 3. `quality=BAD` 时消费者不得把 `value` 当有效当前测量；
 4. UI 应显示 `--` / Error 状态，而不是 neutral value；
 5. `quality_code` 必须表达错误原因。
@@ -489,7 +599,7 @@ Modbus exception
 S7 error
 ```
 
-可以映射为：
+可映射为：
 
 ```text
 quality = BAD
@@ -588,7 +698,7 @@ point_key unique within endpoint_id
 
 不同 Endpoint 允许拥有相同 point_key。
 
-## 3.10 Point ID 稳定性
+## 3.10 Point ID 稳定性与 Tombstone
 
 冻结当前行为：
 
@@ -616,6 +726,54 @@ deleted = 1
 same point_key
 → restore original point_id
 ```
+
+### 3.10.1 Tombstone GC 契约
+
+默认策略：
+
+```text
+Tombstone 永不自动物理删除
+```
+
+原因：
+
+```text
+point_id 必须长期稳定
+历史数据可能引用旧 point_id
+外部系统可能保存旧 point_id
+诊断 / 审计可能引用旧 point_id
+自动清理可能诱发 ID reuse
+```
+
+运行中的 Core 不提供自动 GC。
+
+未来如确有容量维护需求，只允许离线工具：
+
+```bash
+mesa point-registry gc --dry-run
+mesa point-registry gc --apply
+```
+
+执行前必须：
+
+```text
+Endpoint 停止
+SQLite Backup 完成
+列出受影响 point_key / point_id
+显示历史引用风险
+```
+
+最重要的冻结规则：
+
+```text
+物理删除 tombstone
+≠
+允许重新使用旧 point_id
+```
+
+即使未来离线 GC 删除墓碑记录，也必须通过独立的 high-watermark / allocator state 保证已使用过的 `point_id` 永不重新分配。
+
+未经单独 ADR，不允许引入任何自动 Tombstone 清理策略。
 
 ## 3.11 断线语义
 
@@ -649,7 +807,7 @@ quality_code = COMMUNICATION_LOST
 
 ### 当前代码阻塞项
 
-当前 `Snapshot::mark_communication_lost()` 实际会将 value 改成 `null`。
+当前 `Snapshot::mark_communication_lost()` 会将 value 改成 `null`。
 
 必须修正为：
 
@@ -678,16 +836,17 @@ FOCAS Dynamic
 └── Position GOOD
 ```
 
-这是允许且推荐的。
+允许且推荐。
 
-契约：
+冻结：
 
 ```text
 一个 Output BAD
-≠ 整个 Operation BAD
+≠
+整个 Operation BAD
 ```
 
-只有底层 Operation 完全失败且无法提取任何有效结果时，才允许全部 outputs BAD。
+只有底层 Operation 完全失败且无法提取任何有效结果时，才允许全部 Outputs BAD。
 
 ## 3.13 Backpressure
 
@@ -741,6 +900,7 @@ disconnect preserves typed last value
 disconnect keeps original timestamp
 disconnect sets BAD/COMMUNICATION_LOST
 one output BAD does not poison sibling outputs
+automatic tombstone GC does not exist
 ```
 
 ---
@@ -755,7 +915,7 @@ Descriptor Contract Version
 Driver IPC Protocol Version
 ```
 
-禁止混为一个版本。
+禁止混用。
 
 ## 4.1 Driver Package Version
 
@@ -771,12 +931,12 @@ SemVer：
 MAJOR.MINOR.PATCH
 ```
 
-Driver 二进制、Descriptor、Profile 发生正式对外行为变化时必须 bump version。
+Driver 二进制、Descriptor 或 Profile 发生正式对外行为变化时必须更新 Driver Version。
 
 正式发布禁止：
 
 ```text
-同 version 替换为不同 descriptor 语义
+同 version 替换不同 Descriptor 语义
 ```
 
 ## 4.2 Descriptor Contract
@@ -787,8 +947,6 @@ contract_minor
 ```
 
 ### Major 必须增加
-
-以下任意变化：
 
 ```text
 删除已有 Field
@@ -806,7 +964,7 @@ Optional -> Required
 修改已有 Output ID 的含义
 修改已有 Command ID 的含义
 
-修改 ResourceSelection 解释后导致旧配置产生不同 Point
+修改 ResourceSelection 的解释方式导致旧配置产生不同 Point
 ```
 
 ### Minor 可以增加
@@ -826,7 +984,25 @@ Optional -> Required
 
 ## 4.3 IPC Protocol
 
-沿用当前规则：
+协议契约真值文件：
+
+```text
+proto/driver.proto
+```
+
+Rust 代码生成入口：
+
+```text
+crates/driver-protocol/build.rs
+```
+
+生成 crate：
+
+```text
+crates/driver-protocol
+```
+
+沿用当前版本规则：
 
 ```text
 protocol_major 不一致
@@ -836,17 +1012,37 @@ protocol_major 不一致
 同 Major：
 
 ```text
-新增 optional field / message
+新增 optional field / 新增向后兼容 message
 → protocol_minor 演进
 ```
 
-旧端无法安全解释新行为时：
+旧端无法安全解释新行为：
 
 ```text
 必须提升 protocol_major
 ```
 
-## 4.4 GetDescriptor 契约
+## 4.4 GetDescriptor Proto / REST 契约
+
+新增协议消息的位置必须是：
+
+```text
+proto/driver.proto
+```
+
+不是 Driver 自己维护的私有 proto。
+
+建议消息：
+
+```protobuf
+message GetDescriptor {}
+
+message DescriptorReport {
+  uint32 contract_major = 1;
+  uint32 contract_minor = 2;
+  string descriptor_json = 3;
+}
+```
 
 流程：
 
@@ -865,23 +1061,42 @@ timeout = 5s
 max descriptor_json = 256 KiB UTF-8
 ```
 
-失败码：
+REST 失败统一使用：
 
 ```text
-DRIVER_DESCRIPTOR_TIMEOUT
-DRIVER_DESCRIPTOR_TOO_LARGE
-DRIVER_DESCRIPTOR_INVALID_JSON
-DESCRIPTOR_CONTRACT_UNSUPPORTED
-DRIVER_DESCRIPTOR_VALIDATION_FAILED
+HTTP 503 Service Unavailable
 ```
 
-Management API：
+### Descriptor 错误码枚举
 
-```text
-HTTP 503 DriverUnavailable
+| code | HTTP | 含义 |
+|---|---:|---|
+| `DRIVER_DESCRIPTOR_TIMEOUT` | 503 | Driver 未在 5 秒内返回 Descriptor |
+| `DRIVER_DESCRIPTOR_TOO_LARGE` | 503 | `descriptor_json` 超过 256 KiB |
+| `DRIVER_DESCRIPTOR_INVALID_JSON` | 503 | JSON 无法解析 |
+| `DESCRIPTOR_CONTRACT_UNSUPPORTED` | 503 | Descriptor Major 不受 Core 支持 |
+| `DRIVER_DESCRIPTOR_VALIDATION_FAILED` | 503 | Descriptor 内容违反 Contract |
+| `DRIVER_UNAVAILABLE` | 503 | Driver 无法启动、握手失败或执行文件不可用 |
+
+统一 REST 错误形态：
+
+```json
+{
+  "error": {
+    "code": "DRIVER_DESCRIPTOR_VALIDATION_FAILED",
+    "message": "driver descriptor is invalid",
+    "issues": [
+      {
+        "path": "resources[2].outputs[0].data_type",
+        "code": "UNKNOWN_DATA_TYPE",
+        "message": "unsupported data type"
+      }
+    ]
+  }
+}
 ```
 
-并返回结构化 DriverIssue / ValidationIssue。
+`descriptor_contract.rs` 与 Core API Test 必须直接按 `error.code` 断言，禁止仅断言错误文本包含某个字符串。
 
 ## 4.5 Descriptor Cache
 
@@ -907,7 +1122,7 @@ Cache Key：
 4. 同 version 本地二进制被替换：必须 rescan；
 5. 正式发布禁止同 version 修改 Descriptor。
 
-因此 V2 初期不增加：
+V2 初期不增加：
 
 ```text
 descriptor_cache SQLite table
@@ -915,13 +1130,13 @@ descriptor_cache SQLite table
 
 避免 Derived State 与 Package State 形成双真值。
 
-未来如果确有：
+未来确有：
 
 ```text
-Driver 不可启动时仍显示 last-known Descriptor
+Driver 不可启动时仍展示 last-known Descriptor
 ```
 
-再单独设计 persistent stale cache。
+需求时，再单独设计 persistent stale cache。
 
 ## 4.6 Legacy Binding 兼容
 
@@ -939,7 +1154,7 @@ mesa.resources.v1
 
 Driver 内部负责 Legacy Parser。
 
-迁移方式：
+迁移：
 
 ```text
 Legacy Binding
@@ -949,7 +1164,7 @@ normalize
 internal ResourceSelection / Plan representation
 ```
 
-Core 禁止理解 FOCAS/S7 Legacy 语义。
+Core 禁止理解 FOCAS/S7 Legacy 地址语义。
 
 ## 4.7 Binding Migration Tool
 
@@ -979,15 +1194,13 @@ data_type 是否变化
 warnings
 ```
 
-如果：
+以下情况默认拒绝自动 Apply：
 
 ```text
 point_key 变化
 data_type 变化
 resource 无法确定
 ```
-
-默认拒绝自动 Apply。
 
 ## 4.8 P0.2 自动化测试
 
@@ -1000,6 +1213,7 @@ GetDescriptor timeout
 GetDescriptor >256KiB
 invalid JSON
 invalid field reference
+REST 503 exact code assertions
 rescan cache invalidation
 driver version cache invalidation
 legacy binding normalize
@@ -1011,7 +1225,7 @@ migration failed apply rollback
 
 # 5. P0.3：Secret / Certificate / Control 安全契约
 
-当前 REST 绑定 loopback 是重要安全边界，但不能因此允许 Secret 明文持久化或设备控制无审计。
+当前 REST 默认绑定 loopback 是重要安全边界，但不能因此允许 Secret 明文持久化或设备控制无审计。
 
 ## 5.1 Secret Field
 
@@ -1052,7 +1266,7 @@ SecretRef
 
 ## 5.3 Secret 加密要求
 
-契约不强绑某个密码库名称。
+安全契约不强绑某个库名。
 
 必须满足：
 
@@ -1060,7 +1274,7 @@ SecretRef
 AEAD encryption at rest
 unique nonce per secret
 master key not stored in same DB row
-master key filesystem/OS permission protected
+master key filesystem / OS permission protected
 key_id recorded
 support future key rotation
 ```
@@ -1074,9 +1288,9 @@ AES-256-GCM
 
 ## 5.4 Secret REST 规则
 
-REST GET 永远不得返回明文。
+GET 永远不得返回明文。
 
-返回示例：
+返回：
 
 ```json
 {
@@ -1086,15 +1300,15 @@ REST GET 永远不得返回明文。
 }
 ```
 
-禁止使用：
+禁止把：
 
 ```text
 "******"
 ```
 
-作为持久化 sentinel。
+作为数据库中的 sentinel。
 
-Update 规则：
+Update：
 
 ```text
 字段缺失
@@ -1121,22 +1335,18 @@ temporary in-memory runtime config
 OpenConnection IPC
 ```
 
-Driver 可以在本地子进程内使用连接凭据。
-
 禁止：
 
 ```text
-日志打印
-REST 回显
-Diagnostics 返回
-Audit 明文记录
+日志打印 Secret
+REST 回显 Secret
+Diagnostics 返回 Secret
+Audit 写入 Secret 明文
 ```
 
 ## 5.6 CertificateRef
 
-当前 OPC UA CertStore 为共享 PKI，而非 endpoint 私有目录。
-
-因此 V1：
+当前 OPC UA 使用共享 PKI Store，因此：
 
 ```text
 CertificateRef = opaque certificate ID / thumbprint
@@ -1157,7 +1367,7 @@ delete
 diagnostics
 ```
 
-证书被 Endpoint/Profile 引用时：
+Certificate 被 Endpoint/Profile 引用：
 
 ```text
 delete -> CONFLICT
@@ -1175,16 +1385,16 @@ delete -> CONFLICT
 scope = control:execute
 ```
 
-V1 本地实现：
+V1 / 初期 Control 实现：
 
 ```text
-API 仅 loopback
+REST 默认 loopback
 Control 默认 disabled
-启动时显式 --enable-control
-本地 PolicyProvider 授予 control:execute
+--enable-control 显式打开
+PolicyProvider 授予 control:execute
 ```
 
-未来加入用户系统时替换 PolicyProvider，不修改 Driver Control Contract。
+未来用户系统只替换 PolicyProvider，不修改 Driver Control Contract。
 
 ## 5.9 Actor
 
@@ -1228,11 +1438,9 @@ control audit always contains actor
 
 # 6. P1.1：ConfigStore Migration V2
 
-当前已有 `SCHEMA_VERSION=1` 和 `meta.schema_version`，但下一阶段需要真正的增量 migration runner。
+下一阶段必须建立真正的增量 Migration Runner。
 
 ## 6.1 Migration 目录
-
-新增：
 
 ```text
 crates/config-store/migrations/
@@ -1252,8 +1460,6 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 ```
 
 ## 6.3 Migration 原子性
-
-每个 Migration：
 
 ```text
 BEGIN IMMEDIATE
@@ -1350,11 +1556,7 @@ CREATE INDEX idx_control_audit_status_time
 ON control_audit(status, started_at_ns DESC);
 ```
 
-`control_audit` 不使用：
-
-```text
-ON DELETE CASCADE endpoint
-```
+Audit 不使用 Endpoint `ON DELETE CASCADE`。
 
 原因：
 
@@ -1364,7 +1566,7 @@ Endpoint 删除后历史控制审计仍然必须保留
 
 ## 6.7 DeviceProfile 不进 V2 DB
 
-V1 Profile 继续作为 Driver Package 资产：
+V1 Profile 作为 Driver Package 版本化资产：
 
 ```text
 drivers/<driver>/profiles/*.json
@@ -1376,8 +1578,6 @@ Device 只保存：
 profile_id
 ```
 
-现有 `devices.profile` 可继续使用。
-
 ## 6.8 Descriptor Cache 不进 V2 DB
 
 Milestone A 使用 in-memory derived cache。
@@ -1388,7 +1588,7 @@ Milestone A 使用 in-memory derived cache。
 descriptor_cache
 ```
 
-避免 stale derived state 成为第二真值。
+避免第二真值。
 
 ## 6.9 Migration CLI
 
@@ -1396,7 +1596,7 @@ descriptor_cache
 mesa migrate --db mesa.db --dry-run
 ```
 
-必须输出：
+输出：
 
 ```text
 current schema
@@ -1406,57 +1606,34 @@ checksum
 backup plan
 ```
 
-`--dry-run` 不允许修改业务数据。
+`--dry-run` 不得修改业务数据。
 
 ---
 
 # 7. P1.2：IPC Queue 与运行时隔离契约
 
-当前 Driver SDK：
-
-```text
-单 outbound queue
-capacity = 256
-```
-
-Data：
-
-```text
-try_send + Latest-Wins
-```
-
-Control：
-
-```text
-reliable send
-```
-
-未来加入真实 Write / Command 前，需要防止 Control 被 Data backlog 延迟。
+当前 Data Plane 已验证的 outbound capacity 是 256，因此未来拆队列时保持该值作为 baseline。
 
 ## 7.1 队列分离
 
 目标：
 
 ```text
-Control Queue
+Control / Management Queue
 capacity = 32
 
 Data Queue
 capacity = 256
 ```
 
-保留当前 Data Capacity 256 作为性能 baseline。
-
-不要未经 benchmark 直接改为 1024。
+不要未经 benchmark 直接把 Data Queue 增大到 1024 或无界。
 
 ## 7.2 Writer 优先级
-
-Writer：
 
 ```text
 biased select
 
-Control Queue
+Control / Management Queue
 优先于
 Data Queue
 ```
@@ -1467,7 +1644,7 @@ Control：
 永不 Latest-Wins
 永不静默丢弃
 队列满时等待
-达到 timeout 后明确返回失败
+timeout 后明确失败
 ```
 
 Data：
@@ -1494,20 +1671,23 @@ data_coalesced_batches_total
 
 ## 7.4 Management RPC
 
-`GetDescriptor`、Probe、Browse、Write、Command 属于可靠控制/管理 RPC。
-
-`GetDescriptor`：
+以下都属于可靠 Management / Control RPC：
 
 ```text
-5s timeout
-256KiB response cap
+GetDescriptor
+Probe
+Browse
+Write
+Command
 ```
+
+不得通过 DataSink Latest-Wins 通道实现。
 
 ---
 
 # 8. P1.3：性能预算
 
-所有绝对性能门槛必须记录测试机器信息。
+所有绝对性能门槛必须记录测试机器。
 
 Benchmark 输出必须包含：
 
@@ -1550,17 +1730,13 @@ AcquisitionPlan
 
 ## 8.2 Configure Memory Budget
 
-50K point compile 完成：
+50K point compile：
 
 ```text
 Driver process RSS delta <= 256 MiB
 ```
 
-若某协议由于超大 Symbol/Node metadata 合理超出：
-
-```text
-必须单独提交 Performance ADR
-```
+超出必须提供单独 Performance ADR。
 
 ## 8.3 Runtime Budget
 
@@ -1591,22 +1767,10 @@ Performance Review Required
 
 ## 8.4 Descriptor Budget
 
-Descriptor parser/validator：
-
 ```text
-warm p95 <= 50 ms
-```
-
-Cold fetch：
-
-```text
-总 RPC timeout = 5s
-```
-
-Descriptor JSON：
-
-```text
-<= 256 KiB
+Descriptor validation warm p95 <= 50 ms
+Cold GetDescriptor total timeout = 5 s
+Descriptor JSON <= 256 KiB
 ```
 
 ---
@@ -1669,7 +1833,7 @@ Error
 Unsupported
 ```
 
-未来引入 persistent stale cache 后才考虑：
+未来 persistent stale cache 才考虑：
 
 ```text
 Stale
@@ -1685,7 +1849,7 @@ Invalid
 Mismatch
 ```
 
-UI 必须可以区分：
+UI 必须能区分：
 
 ```text
 Driver Error
@@ -1714,8 +1878,6 @@ limit/cursor
 
 ## 9.4 Runbook
 
-新增：
-
 ```text
 docs/runbook/
 ├── driver-unavailable.md
@@ -1728,13 +1890,13 @@ docs/runbook/
 └── database-migration-failed.md
 ```
 
-每篇包含：
+每篇必须包含：
 
 ```text
 现象
 Diagnostics 字段
 可能原因
-排查命令/API
+排查命令 / API
 恢复步骤
 是否影响其它 Endpoint
 ```
@@ -1750,16 +1912,12 @@ Profile 不允许任意脚本。
 ```json
 {
   "profile_version": 1,
-
   "id": "fanuc-0i-f-plus",
   "version": "1.0.0",
-
   "vendor": "FANUC",
   "family": "0i",
   "model": "0i-F Plus",
-
   "driver_id": "focas2",
-
   "match_rules": [
     {
       "field": "driver_id",
@@ -1772,18 +1930,15 @@ Profile 不允许任意脚本。
       "value": "0i-F Plus"
     }
   ],
-
   "connection_defaults": {
     "port": 8193,
     "timeout_ms": 3000
   },
-
   "rate_classes": {
     "realtime": 100,
     "normal": 1000,
     "slow": 10000
   },
-
   "presets": [
     {
       "id": "basic",
@@ -1851,35 +2006,29 @@ regex
 Profile matched
 ```
 
-多个 Profile 匹配：
+多个匹配：
 
 1. model 精确匹配优先；
-2. family 匹配次之；
-3. 仍并列时返回候选，不自动偷偷选择。
+2. family 次之；
+3. 仍并列时返回候选，要求用户选择。
+
+禁止静默猜测 Profile。
 
 ## 10.4 Preset 展开
 
-Preset：
-
 ```text
+Preset
+↓
 Selection[]
-```
-
-展开为：
-
-```text
+↓
 ResourceSelection[]
+↓
+按 (mode, interval_ms) 稳定分组
+↓
+AcquisitionTask[]
 ```
 
-再根据：
-
-```text
-(mode, interval_ms)
-```
-
-稳定分组为 AcquisitionTask。
-
-默认自动 Task ID：
+默认 Task ID：
 
 ```text
 auto-poll-100
@@ -1893,15 +2042,15 @@ auto-poll-10000
 只生成一个 auto Task
 ```
 
-手工 Task 不与 auto Task 隐式合并。
+用户手工 Task 不和 auto Task 隐式合并。
 
 ## 10.5 Point Key 稳定
 
-Preset 中必须明确 `point_key`。
+Preset 必须明确 `point_key`。
 
 Profile 升级不得无故修改已有 Point Key。
 
-修改 Point Key：
+如修改：
 
 ```text
 Profile MAJOR version change
@@ -1918,7 +2067,7 @@ feed
 machine.feed
 ```
 
-展示文本：
+展示文本使用：
 
 ```text
 LocalizedText
@@ -1945,37 +2094,28 @@ stable id
 
 ## 10.7 Unit
 
-V1 Unit 由：
+V1 Unit 由 `OutputDescriptor` 定义。
 
-```text
-OutputDescriptor
-```
+Profile 不允许通过改 unit 字符串完成物理单位换算。
 
-定义。
-
-Profile 不允许随意修改物理单位。
-
-未来如果需要：
+未来：
 
 ```text
 mm -> inch
 °C -> °F
 ```
 
-必须新增显式 presentation transform，不通过改字符串单位实现。
+必须通过显式 presentation transform。
 
 ---
 
 # 11. ImportIssue 契约
-
-Importer 统一返回：
 
 ```rust
 pub struct ImportIssue {
     pub severity: IssueSeverity,
     pub code: String,
     pub message: String,
-
     pub path: Option<String>,
     pub line: Option<u32>,
     pub column: Option<u32>,
@@ -2056,31 +2196,16 @@ condition.field 必须引用同一 Schema 已存在字段
 pub struct DriverDescriptor {
     pub contract_major: u32,
     pub contract_minor: u32,
-
     pub identity: DriverIdentity,
-
     pub connection: SchemaDescriptor,
-
     pub resources: Vec<ResourceDescriptor>,
-
     pub controls: ControlCatalog,
-
     pub discovery: DiscoveryCapabilities,
-
     pub capabilities: DriverCapabilities,
 }
 ```
 
 ## 13.1 Driver SDK 修改
-
-当前：
-
-```rust
-trait Driver {
-    fn metadata(&self) -> DriverMetadata;
-    async fn open_connection(...);
-}
-```
 
 增加：
 
@@ -2107,10 +2232,10 @@ pub struct ResourceDescriptor {
 Resource 表示：
 
 ```text
-用户/管理面的逻辑数据能力
+用户 / 管理面的逻辑数据能力
 ```
 
-不是物理协议 Function。
+不是 Physical Protocol Function。
 
 ---
 
@@ -2145,13 +2270,13 @@ point_key endpoint unique
 mesa.resources.v1
 ```
 
-现有 Legacy Binding 至少保留一个 Major Release。
+Legacy Binding 至少保留一个 Major Release。
 
 ---
 
 # 16. AcquisitionPlan 边界
 
-AcquisitionPlan 必须：
+AcquisitionPlan：
 
 ```text
 只存在于 Driver 内部
@@ -2164,17 +2289,25 @@ GenericPhysicalOperation
 UniversalIndustrialPlanner
 ```
 
-Driver `configure()` 负责把 ResourceSelection / Legacy Binding 编译成内部不可变 Plan。
+Driver `configure()`：
+
+```text
+ResourceSelection / Legacy Binding
+        ↓
+compile once
+        ↓
+immutable AcquisitionPlan
+```
 
 运行时：
 
 ```text
 tick
 ↓
-execute precompiled plan
+execute plan
 ```
 
-而不是每 Tick 重新解析 Schema/Resource。
+禁止每 Tick 重新解析 Descriptor / Schema / Resource。
 
 ---
 
@@ -2199,7 +2332,7 @@ position.absolute
 4 Logical Points
 ```
 
-configure 后：
+configure：
 
 ```text
 1 FocasOperation::Dynamic
@@ -2218,16 +2351,14 @@ physical_call_count == 1
 point_count == 4
 ```
 
-一个 output decode fail：
+一个 Output decode fail：
 
 ```text
 1 BAD
 3 GOOD
 ```
 
-## 17.1 FOCAS PMC
-
-例如：
+## 17.1 PMC
 
 ```text
 R100
@@ -2236,13 +2367,13 @@ R102
 R118
 ```
 
-WORD range：
+WORD Range：
 
 ```text
 range call == 1
 ```
 
-Range 失败：
+Range semantic error：
 
 ```text
 range_calls == 1
@@ -2259,7 +2390,7 @@ Value::String("ERR:...")
 
 替代声明的数值类型。
 
-必须统一为：
+必须：
 
 ```text
 Typed Value
@@ -2285,7 +2416,7 @@ DB1.DBW2
 DB1.DBD4
 ```
 
-继续使用当前 Planner：
+继续现有 Planner：
 
 ```text
 sort
@@ -2305,12 +2436,12 @@ fan-out
 
 ```text
 Descriptor/Resource 引入后
-现有物理 range count 不增加
-现有 fragmentation 不退化
-现有 BAD fallback 不退化
+现有 physical range count 不增加
+fragmentation 不退化
+BAD fallback 不退化
 ```
 
-禁止为了 FOCAS 统一而重写 S7 为 Generic Planner。
+禁止为统一 FOCAS 而重写 S7 为 Generic Planner。
 
 ---
 
@@ -2330,7 +2461,7 @@ Subscribe
 Browse
 ```
 
-Browse 必须：
+Browse：
 
 ```text
 分页
@@ -2344,7 +2475,7 @@ Browse 必须：
 100 logical points
 ```
 
-不允许新增：
+不允许增加：
 
 ```text
 OPCUA-specific frontend component
@@ -2354,15 +2485,13 @@ OPCUA-specific frontend component
 
 # 20. Discovery / Browse / Import
 
-工业设备配置至少存在：
+必须同时支持：
 
 ```text
 Manual
 Browse
 Import
 ```
-
-三者必须并存。
 
 ## 20.1 DiscoveryCapabilities
 
@@ -2443,7 +2572,7 @@ TypeScript
 Vite
 ```
 
-初期不需要：
+初期不引入：
 
 ```text
 Next.js
@@ -2454,8 +2583,6 @@ Electron
 ```
 
 ## 21.1 通用组件
-
-只允许通用组件：
 
 ```text
 SchemaForm
@@ -2503,8 +2630,6 @@ Save
 
 ## 21.3 Update Rate
 
-普通用户看到：
-
 ```text
 Realtime  100 ms
 Normal    1 s
@@ -2512,7 +2637,7 @@ Slow      10 s
 Custom
 ```
 
-内部生成/归并 AcquisitionTask。
+内部自动归并 AcquisitionTask。
 
 ## 21.4 Generic UI 零修改契约
 
@@ -2526,21 +2651,21 @@ Fixture Driver 增加：
 新 optional Command
 ```
 
-如果均属于 Contract V1：
+如果都属于 Contract V1：
 
 ```text
 mesa-web source diff == 0
 ```
 
-自动化 E2E 必须证明页面自动出现新字段、资源和命令。
-
-这是整个 Descriptor/UI 架构的核心 KPI。
+E2E 必须证明页面自动出现新字段、资源和命令。
 
 ---
 
 # 22. Control Plane 契约
 
-Mesa V1 只定义：
+根据 §2.1，以下能力属于**未来 Control Milestone**，不是当前 V1 必须立即实现的能力。
+
+Mesa Control V1 只定义：
 
 ```text
 Write
@@ -2604,7 +2729,7 @@ Change Mode
 
 ## 22.3 DriverConnection 扩展
 
-保持一个 Trait：
+未来保持一个 Trait：
 
 ```rust
 trait DriverConnection {
@@ -2626,9 +2751,9 @@ trait DriverConnection {
 }
 ```
 
-## 22.4 CommandResult
+V1 Read-Only 阶段不要求真实实现 Write / Command。
 
-至少：
+## 22.4 CommandResult
 
 ```text
 request_id
@@ -2676,9 +2801,9 @@ CommandResult
 Audit COMPLETED / FAILED
 ```
 
-前端按钮状态不能成为安全边界。
+UI 按钮禁用不能成为安全边界。
 
-## 22.6 FOCAS 控制
+## 22.6 FOCAS Control
 
 初期：
 
@@ -2686,7 +2811,7 @@ Audit COMPLETED / FAILED
 controls = []
 ```
 
-Control Contract + Simulator 完成后，再逐项启用：
+Control Contract + Simulator 完整通过后再逐项启用：
 
 ```text
 Reset Alarm
@@ -2695,19 +2820,17 @@ Start Program
 Stop Program
 ```
 
-禁止直接暴露：
+禁止把 CNC 控制降级成：
 
 ```text
 generic write(address, value)
 ```
 
-作为 CNC 控制模型。
-
 ---
 
 # 23. Management API
 
-基于现有 `core-api` 扩展，不增加 Node BFF。
+基于现有 `core-api` 扩展，不新增 Node BFF。
 
 ## 23.1 Driver API
 
@@ -2742,7 +2865,7 @@ Driver config parse
 POST /api/v1/drivers/{id}/probe
 ```
 
-访问真实设备。
+允许访问真实设备。
 
 返回：
 
@@ -2789,7 +2912,7 @@ Generic UI 根据 `path` 显示字段错误。
 目的：
 
 ```text
-防止 Mesa 逐步退化成“只适合 PLC 地址型协议”
+防止 Mesa 逐步退化成只适合 PLC 地址型协议
 ```
 
 ---
@@ -2805,6 +2928,7 @@ release-validation.json
 至少包含：
 
 ```text
+schema_version
 git_sha
 rust_version
 os
@@ -2843,6 +2967,115 @@ real_device_matrix
 
 必须有机器可读结果。
 
+## 25.1 Schema 文件
+
+新增占位：
+
+```text
+schemas/release-validation.schema.json
+examples/release-validation.example.json
+```
+
+`release-validation.json` 必须通过 Schema 校验后才能成为 Release Artifact。
+
+## 25.2 JSON Schema 最小契约
+
+首版建议使用 JSON Schema Draft 2020-12：
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mesa.local/schemas/release-validation.schema.json",
+  "title": "Mesa Release Validation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "git_sha",
+    "environment",
+    "contract_tests",
+    "performance"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "git_sha": {
+      "type": "string",
+      "minLength": 7
+    },
+    "environment": {
+      "type": "object",
+      "required": [
+        "os",
+        "cpu",
+        "ram_mb",
+        "rust_version",
+        "build_profile"
+      ],
+      "properties": {
+        "os": { "type": "string" },
+        "cpu": { "type": "string" },
+        "logical_cores": { "type": "integer", "minimum": 1 },
+        "ram_mb": { "type": "integer", "minimum": 1 },
+        "rust_version": { "type": "string" },
+        "build_profile": { "type": "string" }
+      }
+    },
+    "contract_tests": {
+      "type": "object"
+    },
+    "performance": {
+      "type": "object",
+      "required": [
+        "throughput_updates_s",
+        "ipc_p95_ms",
+        "ipc_p99_ms"
+      ],
+      "properties": {
+        "throughput_updates_s": { "type": "number", "minimum": 0 },
+        "ipc_p95_ms": { "type": "number", "minimum": 0 },
+        "ipc_p99_ms": { "type": "number", "minimum": 0 },
+        "configure_1k_p95_ms": { "type": "number", "minimum": 0 },
+        "configure_10k_p95_ms": { "type": "number", "minimum": 0 },
+        "configure_50k_p95_ms": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}
+```
+
+完整 Schema 在真正实现 Release Artifact 时再扩充：
+
+```text
+soak
+migration
+real_device_matrix
+RSS
+snapshot_apply
+CI provenance
+```
+
+但字段删除 / 改义必须遵循 Artifact 自身 `schema_version` 演进规则。
+
+## 25.3 Example 文件
+
+`examples/release-validation.example.json` 至少包含一份可被 Schema 校验通过的完整样例。
+
+CI：
+
+```text
+generate release-validation.json
+        ↓
+validate against schemas/release-validation.schema.json
+        ↓
+PASS
+        ↓
+upload artifact
+```
+
+禁止只生成 JSON 而不验证 Schema。
+
 ---
 
 # 26. 阶段化实施计划
@@ -2855,6 +3088,7 @@ real_device_matrix
 core-types
 snapshot
 config-store tests
+driver process tests
 docs
 ```
 
@@ -2866,7 +3100,10 @@ Quality
 timestamps
 disconnect semantics
 point registry semantics
+Tombstone no-auto-GC
 revision semantics
+orphan-process contract
+V1 read-only boundary
 ```
 
 ### Gate
@@ -2876,6 +3113,8 @@ data_semantics.rs 全过
 snapshot disconnect typed-value bug 修复
 FOCAS BAD typed-value 修复
 host_mono_ns 文档修正
+stdin EOF orphan test 通过
+Linux / Windows helper orphan test 有明确实现计划或完成
 ```
 
 ---
@@ -2895,6 +3134,7 @@ driver-protocol
 driver-manager
 core-api
 
+proto/driver.proto
 simulator
 ```
 
@@ -2915,6 +3155,7 @@ REST API
 ```text
 GetDescriptor <= 256 KiB
 GetDescriptor timeout 5s
+REST 503 exact error-code contract
 Descriptor contract tests
 Simulator Descriptor
 旧 Data Plane regression
@@ -3108,6 +3349,8 @@ Siemens profile
 
 ## Milestone J — Control Plane
 
+此阶段才正式解除 §2.1 的 V1 Strict Read-Only 限制。
+
 ### 完成
 
 ```text
@@ -3117,12 +3360,14 @@ Command
 PolicyProvider
 Audit
 Simulator Control
+--enable-control
 ```
 
 ### Gate
 
 ```text
 control disabled default
+CONTROL_DISABLED exact error code
 scope enforced
 actor recorded
 all error paths covered
@@ -3158,6 +3403,7 @@ tests/
 │   ├── data_semantics.rs
 │   ├── fault_tolerance.rs
 │   ├── subprocess_recovery.rs
+│   ├── subprocess_orphan_guard.rs
 │   ├── descriptor_contract.rs
 │   ├── resource_contract.rs
 │   ├── discovery_contract.rs
@@ -3181,6 +3427,13 @@ tests/
     ├── browse.spec.ts
     ├── profile.spec.ts
     └── control.spec.ts
+```
+
+Release validation：
+
+```text
+schemas/release-validation.schema.json
+examples/release-validation.example.json
 ```
 
 ---
@@ -3213,6 +3466,14 @@ Migration Tests（涉及 Store 时）
 Simulator E2E
 ```
 
+涉及 Release Artifact 的 CI：
+
+```text
+release-validation.json
+→ JSON Schema validation
+→ PASS
+```
+
 ---
 
 # 29. Release Gate
@@ -3227,14 +3488,16 @@ Linux
 Configure Benchmark
 
 Migration dry-run
-Migration apply/rollback
+Migration apply / rollback
 
 24h Soak
 
 Real Device Matrix
+
+release-validation.json schema PASS
 ```
 
-控制功能 Release：
+Control 功能 Release：
 
 ```text
 必须额外完成对应设备的 real-device control validation
@@ -3290,7 +3553,7 @@ Point ID 稳定
 Revision 稳定
 Endpoint State 正确
 Reconnect 可恢复
-UI/Descriptor 不影响采集
+UI / Descriptor 不影响采集
 ```
 
 ---
@@ -3379,6 +3642,19 @@ Windows QPC 注释统一修改为：
 不代表 UTC 或业务时间
 ```
 
+## P0-D 进程防孤儿测试闭环
+
+现有 token + stdin EOF 测试继续保留。
+
+补充：
+
+```text
+Linux PR_SET_PDEATHSIG helper-process E2E
+Windows KILL_ON_JOB_CLOSE helper-process E2E
+```
+
+不得长期只保留人工验证说明。
+
 ---
 
 # 33. Driver 开发者体验标准
@@ -3401,7 +3677,11 @@ write
 command
 ```
 
-不要强迫一个简单温度传感器 Driver 实现它不需要的复杂能力。
+V1 严格只读阶段：
+
+```text
+write / command 不属于必实现项
+```
 
 SDK 可以提供：
 
@@ -3450,6 +3730,7 @@ Profile 参与底层协议逻辑
 Core 判断具体 Driver 类型
 任意 Profile Script
 任意 Quality DSL
+自动 Tombstone GC
 ```
 
 ---
@@ -3490,7 +3771,8 @@ Point
 
 Write / Command
 负责：
-统一控制入口，但不统一协议控制语义。
+统一控制入口，但不统一协议控制语义；
+且只有 Control Milestone 后才能启用。
 
 Core
 负责：
@@ -3527,27 +3809,47 @@ FOCAS 一个 API 多输出
 → Physical Call 不增加
 
 S7 Descriptor 接入
-→ Range/PDU Planner 不退化
+→ Range / PDU Planner 不退化
 
 设备断线
 → Point 统一 BAD
-→ last value/timestamp 语义稳定
+→ last value / timestamp 语义稳定
 
 Point 删除重加
 → point_id 不变化
 
-Driver 升级/回滚
+Tombstone
+→ 不自动清理
+→ 不导致 ID reuse
+
+Driver 升级 / 回滚
 → Descriptor cache 行为确定
 
 Secret
 → 不落明文、不回显
 
-Command
-→ 可靠队列、权限检查、actor 审计
+V1
+→ 严格只读
+
+Control
+→ 默认 disabled
+→ --enable-control 显式启用
+→ 可靠队列
+→ 权限检查
+→ actor 审计
+
+Core 异常退出
+→ Driver 不成为孤儿进程
+
+GetDescriptor
+→ 5s / 256KiB / 精确错误码
+
+Release Artifact
+→ JSON Schema 校验通过
 
 50K Data Plane
 → throughput 不低于基线
 → Descriptor 开销不进入 hot path
 ```
 
-只有这些断言长期成立，Mesa 的 Driver 自描述、动态管理和控制架构才算真正建立完成。
+只有这些断言长期成立，Mesa 的 Driver 自描述、动态管理和未来控制架构才算真正建立完成。
