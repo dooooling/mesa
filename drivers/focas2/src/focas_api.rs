@@ -289,9 +289,10 @@ impl FocasApi for NativeFocasApi {
             if !cur_group.is_empty() {
                 pmc_groups.push(cur_group);
             }
-            // 周期缓存：同批次内 cnc_statinfo / cnc_rddynamic2 / cnc_absolute 等共享调用仅执行一次，显著降低 20点批的 200ms→40ms
+            // 周期缓存：同批次内 cnc_statinfo / cnc_rddynamic2 / cnc_absolute / cnc_acts 等共享调用仅执行一次
             let mut stat_cache: Option<Result<crate::native::OdbSt, FocasRet>> = None;
             let mut dy_cache: Option<Result<crate::native::OdbDy2, FocasRet>> = None;
+            let mut acts_cache: Option<Result<crate::native::OdbActs, FocasRet>> = None;
             let mut axis_cache: std::collections::HashMap<u8, Result<i32, FocasRet>> =
                 std::collections::HashMap::new();
             let mut out: Vec<Option<Value>> = vec![None; addrs.len()];
@@ -313,12 +314,40 @@ impl FocasApi for NativeFocasApi {
                             Err(e) => Err(Self::map_ret_err(*e)),
                         }
                     }
-                    FocasAddress::Axis { axis, .. } => {
-                        let r = axis_cache
-                            .entry(*axis)
-                            .or_insert_with(|| lib.cnc_absolute(hdl, *axis));
+                    FocasAddress::Axis { axis, kind } => {
+                        // 修复回归：与 read_one_blocking 保持一致，absolute 失败时回退 rddynamic2，并复用 dy_cache
+                        let r = axis_cache.entry(*axis).or_insert_with(|| {
+                            match lib.cnc_absolute(hdl, *axis) {
+                                Ok(v) => Ok(v),
+                                Err(e)
+                                    if e == crate::native::FocasRet::Noopt
+                                        || e == crate::native::FocasRet::Param =>
+                                {
+                                    let dy =
+                                        dy_cache.get_or_insert_with(|| lib.cnc_rddynamic2(hdl));
+                                    match dy {
+                                        Ok(dy) => Ok(dy.actf),
+                                        Err(ee) => Err(*ee),
+                                    }
+                                }
+                                Err(e) => Err(e),
+                            }
+                        });
                         match r {
-                            Ok(v) => Ok(Value::I32(*v)),
+                            Ok(v) => {
+                                let _ = kind;
+                                Ok(Value::I32(*v))
+                            }
+                            Err(e) => Err(Self::map_ret_err(*e)),
+                        }
+                    }
+                    FocasAddress::Spindle {
+                        kind: crate::address::SpindleKind::Speed,
+                        ..
+                    } => {
+                        let r = acts_cache.get_or_insert_with(|| lib.cnc_acts(hdl));
+                        match r {
+                            Ok(v) => Ok(Value::I32(v.data)),
                             Err(e) => Err(Self::map_ret_err(*e)),
                         }
                     }
