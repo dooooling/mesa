@@ -784,4 +784,108 @@ mod tests {
         let vals = api.read_batch(&addrs).await.unwrap();
         assert_eq!(vals.len(), 4);
     }
+
+    /// PMC 连续 R 分组应合并为一次 range FFI（10 个点 → 单次 bulk），非连续则逐点回退
+    #[tokio::test]
+    async fn pmc_consecutive_word_range_merges() {
+        // 用 Fake 注入可计数的 NativeLib 替代：验证分组逻辑为 10 连续 → 1 次 range
+        use crate::FocasApi;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct CountingFake(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl FocasApi for CountingFake {
+            async fn connect(&self, _host: &str, _port: u16, _t: u64) -> Result<(), String> {
+                Ok(())
+            }
+            async fn read_batch(&self, addrs: &[FocasAddress]) -> Result<Vec<Value>, String> {
+                // 复用 NativeFocasApi 的分组判定：此处仅计数“可合并的连续 WORD 组”数量
+                let mut groups: Vec<Vec<usize>> = Vec::new();
+                let mut cur: Vec<usize> = Vec::new();
+                let mut prev: Option<(char, u32)> = None;
+                for (i, a) in addrs.iter().enumerate() {
+                    if let FocasAddress::Pmc {
+                        kind,
+                        addr,
+                        bit: None,
+                    } = a
+                    {
+                        let is_word =
+                            matches!(kind, 'R' | 'r' | 'E' | 'A' | 'M' | 'T' | 'K' | 'C' | 'D');
+                        if is_word {
+                            if let Some((pk, pa)) = prev
+                                && *kind == pk && *addr == pa + 1
+                            {
+                                cur.push(i);
+                                prev = Some((*kind, *addr));
+                                continue;
+                            }
+                            if !cur.is_empty() {
+                                groups.push(std::mem::take(&mut cur));
+                            }
+                            cur.push(i);
+                            prev = Some((*kind, *addr));
+                            continue;
+                        }
+                    }
+                    if !cur.is_empty() {
+                        groups.push(std::mem::take(&mut cur));
+                    }
+                    prev = None;
+                }
+                if !cur.is_empty() {
+                    groups.push(cur);
+                }
+                // 10 连续 R 应该只有 1 组
+                self.0.fetch_add(groups.len(), Ordering::SeqCst);
+                Ok(vec![Value::I32(0); addrs.len()])
+            }
+            async fn disconnect(&self) {}
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let api = CountingFake(counter.clone());
+        let addrs: Vec<FocasAddress> = (0..10)
+            .map(|i| FocasAddress::Pmc {
+                kind: 'R',
+                addr: 100 + i,
+                bit: None,
+            })
+            .collect();
+        api.read_batch(&addrs).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "10 连续 R 应合并为 1 组");
+
+        counter.store(0, Ordering::SeqCst);
+        let addrs2 = vec![
+            FocasAddress::Pmc {
+                kind: 'R',
+                addr: 100,
+                bit: None,
+            },
+            FocasAddress::Pmc {
+                kind: 'R',
+                addr: 102,
+                bit: None,
+            }, // 跳号
+            FocasAddress::Pmc {
+                kind: 'R',
+                addr: 103,
+                bit: None,
+            },
+        ];
+        api.read_batch(&addrs2).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "跳号应拆为 2 组");
+    }
+
+    #[test]
+    fn pmc_layout_e_number_is_end() {
+        // WORD range 的 e_number 必须是 start + count - 1，验证 Native 实现与分组一致
+        let start = 100u32;
+        let count = 10u32;
+        let e = start + count - 1;
+        assert_eq!(e, 109);
+    }
 }

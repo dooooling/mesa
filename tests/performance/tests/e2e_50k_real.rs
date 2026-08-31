@@ -115,7 +115,10 @@ async fn e2e_50k_real_throughput() {
     assert!(p95 != 0, "snapshot_apply p95 must >0");
     assert!(p95 <= 20_000_000, "snapshot_apply_p95 {p95}ns >20ms");
     assert!(p99 <= 50_000_000, "snapshot_apply_p99 {p99}ns >50ms");
-    assert!(!ipc_lat.is_empty(), "ipc samples must >0 (mono_ns 未埋点或跨进程时钟不可比)");
+    assert!(
+        !ipc_lat.is_empty(),
+        "ipc samples must >0 (mono_ns 未埋点或跨进程时钟不可比)"
+    );
     assert!(ipc_p95 != 0, "ipc p95 must >0");
     assert!(ipc_p95 <= 20_000_000, "ipc_p95 {ipc_p95}ns >20ms");
     assert!(ipc_p99 <= 50_000_000, "ipc_p99 {ipc_p99}ns >50ms");
