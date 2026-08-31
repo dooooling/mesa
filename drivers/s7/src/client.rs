@@ -324,34 +324,7 @@ impl S7Client {
         if ranges.is_empty() {
             return Ok(vec![]);
         }
-        // 1) 将 oversized 的单 logical range 按 PDU 分片为多个物理 range，并记录归属
-        let max_single = (self.pdu_length as usize).saturating_sub(48).max(64);
-        let mut physical: Vec<(S7Address, usize)> = Vec::new();
-        let mut logical_to_physical: Vec<Vec<usize>> = vec![Vec::new(); ranges.len()];
-        for (li, (addr, len)) in ranges.iter().enumerate() {
-            if *len <= max_single {
-                let pi = physical.len();
-                physical.push((addr.clone(), *len));
-                logical_to_physical[li].push(pi);
-            } else {
-                let mut remaining = *len;
-                let mut off = 0u32;
-                while remaining > 0 {
-                    let chunk_len = remaining.min(max_single);
-                    let chunk_addr = S7Address {
-                        area: addr.area,
-                        db_number: addr.db_number,
-                        byte_offset: addr.byte_offset + off,
-                        bit_offset: None,
-                    };
-                    let pi = physical.len();
-                    physical.push((chunk_addr, chunk_len));
-                    logical_to_physical[li].push(pi);
-                    off += chunk_len as u32;
-                    remaining = remaining.saturating_sub(chunk_len);
-                }
-            }
-        }
+        let (physical, logical_to_physical) = fragment_ranges(ranges, self.pdu_length);
         // 2) 按 PDU 同时对物理 range 做 multi-item 打包
         let mut physical_results: Vec<Option<Vec<u8>>> = vec![None; physical.len()];
         let mut start = 0;
@@ -391,33 +364,11 @@ impl S7Client {
             }
             start = end;
         }
-        // 3) 重组回 logical：多物理 chunk 拼接，任一 chunk BAD 则 logical BAD
-        let mut out = Vec::with_capacity(ranges.len());
-        for (li, pis) in logical_to_physical.iter().enumerate() {
-            if pis.is_empty() {
-                out.push(None);
-                continue;
-            }
-            let mut buf = Vec::with_capacity(ranges[li].1);
-            let mut ok = true;
-            for &pi in pis {
-                match &physical_results[pi] {
-                    Some(b) => buf.extend_from_slice(b),
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if ok {
-                // 截断/补齐至期望 len（WSTRING 头等）
-                buf.truncate(ranges[li].1);
-                out.push(Some(buf));
-            } else {
-                out.push(None);
-            }
-        }
-        Ok(out)
+        Ok(reassemble_ranges(
+            &logical_to_physical,
+            &physical_results,
+            ranges.len(),
+        ))
     }
 
     async fn send_raw(&mut self, data: &[u8]) -> std::io::Result<()> {
@@ -450,6 +401,74 @@ impl S7Client {
         self.stream.read_exact(&mut buf[4..]).await?;
         Ok(buf)
     }
+}
+
+/// 将 logical ranges 按 PDU 分片为物理 ranges，返回 (physical, logical_to_physical)
+/// 纯函数便于单测覆盖 STRING/WSTRING 跨 PDU 的分片与重组
+pub(crate) fn fragment_ranges(
+    ranges: &[(S7Address, usize)],
+    pdu_len: u16,
+) -> (Vec<(S7Address, usize)>, Vec<Vec<usize>>) {
+    let max_single = (pdu_len as usize).saturating_sub(48).max(64);
+    let mut physical: Vec<(S7Address, usize)> = Vec::new();
+    let mut logical_to_physical: Vec<Vec<usize>> = vec![Vec::new(); ranges.len()];
+    for (li, (addr, len)) in ranges.iter().enumerate() {
+        if *len <= max_single {
+            let pi = physical.len();
+            physical.push((addr.clone(), *len));
+            logical_to_physical[li].push(pi);
+        } else {
+            let mut remaining = *len;
+            let mut off = 0u32;
+            while remaining > 0 {
+                let chunk_len = remaining.min(max_single);
+                let chunk_addr = S7Address {
+                    area: addr.area,
+                    db_number: addr.db_number,
+                    byte_offset: addr.byte_offset + off,
+                    bit_offset: None,
+                };
+                let pi = physical.len();
+                physical.push((chunk_addr, chunk_len));
+                logical_to_physical[li].push(pi);
+                off += chunk_len as u32;
+                remaining = remaining.saturating_sub(chunk_len);
+            }
+        }
+    }
+    (physical, logical_to_physical)
+}
+
+/// 将物理结果重组回 logical（任一物理 BAD 则 logical BAD），并按期望长度截断
+pub(crate) fn reassemble_ranges(
+    logical_to_physical: &[Vec<usize>],
+    physical_results: &[Option<Vec<u8>>],
+    ranges_len: usize,
+) -> Vec<Option<Vec<u8>>> {
+    let mut out = Vec::with_capacity(ranges_len);
+    for pis in logical_to_physical {
+        if pis.is_empty() {
+            out.push(None);
+            continue;
+        }
+        let mut buf = Vec::new();
+        let mut ok = true;
+        for &pi in pis {
+            match &physical_results[pi] {
+                Some(b) => buf.extend_from_slice(b),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            out.push(Some(buf));
+        } else {
+            out.push(None);
+        }
+    }
+    out
 }
 
 fn build_cotp_cr(src: u16, dst: u16) -> Vec<u8> {
@@ -977,4 +996,63 @@ fn map_s7_error(code: u8, ctx: &str) -> SdkDriverError {
         format!("S7_0x{code:02X}"),
         format!("{ctx}: S7 错误 0x{code:02X} {help}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::parse_address;
+
+    fn addr(s: &str) -> S7Address {
+        parse_address(s).unwrap()
+    }
+
+    #[test]
+    fn fragment_string_256_pdu240() {
+        let ranges = vec![(addr("DB10.DBD0"), 256)];
+        let (phys, map) = fragment_ranges(&ranges, 240);
+        assert_eq!(phys.len(), 2, "256>192 应分2片");
+        assert_eq!(phys[0].1, 192);
+        assert_eq!(phys[1].1, 64);
+        assert_eq!(map[0].len(), 2);
+        // 模拟两物理 GOOD 重组
+        let phys_res = vec![Some(vec![0xAA; 192]), Some(vec![0xBB; 64])];
+        let reass = reassemble_ranges(&map, &phys_res, ranges.len());
+        assert_eq!(reass[0].as_ref().unwrap().len(), 256);
+        assert!(reass[0].as_ref().unwrap()[..192].iter().all(|&b| b == 0xAA));
+        assert!(reass[0].as_ref().unwrap()[192..].iter().all(|&b| b == 0xBB));
+    }
+
+    #[test]
+    fn fragment_wstring_516_pdu480() {
+        let ranges = vec![(addr("DB10.DBD0"), 516)];
+        let (phys, map) = fragment_ranges(&ranges, 480);
+        // PDU480 max 432 → 516→432+84
+        assert_eq!(phys.len(), 2);
+        assert_eq!(phys[0].1, 432);
+        assert_eq!(phys[1].1, 84);
+        let phys_res = vec![Some(vec![1; 432]), Some(vec![2; 84])];
+        let reass = reassemble_ranges(&map, &phys_res, ranges.len());
+        assert_eq!(reass[0].as_ref().unwrap().len(), 516);
+    }
+
+    #[test]
+    fn fragment_wstring_516_pdu240() {
+        let ranges = vec![(addr("DB10.DBD0"), 516)];
+        let (phys, _map) = fragment_ranges(&ranges, 240);
+        // 240→192 per chunk → 192*2+132
+        assert_eq!(phys.len(), 3);
+        assert_eq!(phys[0].1, 192);
+        assert_eq!(phys[1].1, 192);
+        assert_eq!(phys[2].1, 132);
+    }
+
+    #[test]
+    fn fragment_reassemble_one_bad_all_bad() {
+        let ranges = vec![(addr("DB10.DBD0"), 256)];
+        let (_phys, map) = fragment_ranges(&ranges, 240);
+        let phys_res = vec![Some(vec![0; 192]), None];
+        let reass = reassemble_ranges(&map, &phys_res, ranges.len());
+        assert!(reass[0].is_none(), "任一物理 BAD 则 logical BAD");
+    }
 }

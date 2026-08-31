@@ -1,6 +1,7 @@
-//! 真正的 end-to-end 50K benchmark（跨进程 TCP + Protobuf + 单调时钟）
-//! §22：≥50K Point Updates/s 持续 60min，IPC p95≤20ms p99≤50ms（单调时钟），RSS 有界。
-//! 本用例为可重复的 10s CI 快检（-- --long 切 60s 全量），强断言失败即 fail，无假阳性。
+//! 真正的 end-to-end 50K throughput benchmark（跨进程 TCP + Protobuf + 单调时钟）
+//! 本用例验证：跨进程 TCP + Protobuf 的实际 point throughput + Core Snapshot apply latency
+//! 不验证：Driver→Core IPC E2E latency（需 proto 单调戳，P1）
+//! §22 完整预算：≥50K Point Updates/s 持续 60min，IPC p95≤20ms p99≤50ms（单调时钟），RSS 有界
 
 use std::time::{Duration, Instant};
 
