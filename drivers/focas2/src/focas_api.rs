@@ -289,9 +289,11 @@ impl FocasApi for NativeFocasApi {
             if !cur_group.is_empty() {
                 pmc_groups.push(cur_group);
             }
-            // 周期缓存：同批次内 cnc_statinfo / cnc_rddynamic2 等共享调用仅执行一次，显著降低 20点批的 200ms→40ms
+            // 周期缓存：同批次内 cnc_statinfo / cnc_rddynamic2 / cnc_absolute 等共享调用仅执行一次，显著降低 20点批的 200ms→40ms
             let mut stat_cache: Option<Result<crate::native::OdbSt, FocasRet>> = None;
             let mut dy_cache: Option<Result<crate::native::OdbDy2, FocasRet>> = None;
+            let mut axis_cache: std::collections::HashMap<u8, Result<i32, FocasRet>> =
+                std::collections::HashMap::new();
             let mut out: Vec<Option<Value>> = vec![None; addrs.len()];
             // helper：带缓存的 read_one
             let mut read_cached = |addr: &FocasAddress| -> Result<Value, String> {
@@ -308,6 +310,15 @@ impl FocasApi for NativeFocasApi {
                         let r = dy_cache.get_or_insert_with(|| lib.cnc_rddynamic2(hdl));
                         match r {
                             Ok(dy) => Ok(Value::U32(dy.actf as u32)),
+                            Err(e) => Err(Self::map_ret_err(*e)),
+                        }
+                    }
+                    FocasAddress::Axis { axis, .. } => {
+                        let r = axis_cache
+                            .entry(*axis)
+                            .or_insert_with(|| lib.cnc_absolute(hdl, *axis));
+                        match r {
+                            Ok(v) => Ok(Value::I32(*v)),
                             Err(e) => Err(Self::map_ret_err(*e)),
                         }
                     }

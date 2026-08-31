@@ -2,7 +2,7 @@
 //!
 //! 全部驻留内存，不落盘——热路径最新值仅内存可达，持久化由 ConfigStore 负责。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     RwLock,
     atomic::{AtomicU64, Ordering},
@@ -116,8 +116,8 @@ pub struct Snapshot {
     /// §22 精确计数：自启动以来的 envelope / point_value 总数（单调递增，跨 batch 累加）
     envelopes_total: AtomicU64,
     point_value_total: AtomicU64,
-    /// 诊断用：最近批次的单调延迟样本（环形缓冲，容量 4096），用于 p50/p95/p99 近似
-    latencies_ns: RwLock<Vec<u64>>,
+    /// 诊断用：最近批次的单调延迟样本（环形缓冲，容量 4096，O(1) push/pop），用于 p50/p95/p99 近似
+    latencies_ns: RwLock<VecDeque<u64>>,
 }
 
 impl Default for Snapshot {
@@ -129,7 +129,7 @@ impl Default for Snapshot {
             keys: RwLock::new(HashMap::new()),
             envelopes_total: AtomicU64::new(0),
             point_value_total: AtomicU64::new(0),
-            latencies_ns: RwLock::new(Vec::with_capacity(4096)),
+            latencies_ns: RwLock::new(VecDeque::with_capacity(4096)),
         }
     }
 }
@@ -210,13 +210,13 @@ impl Snapshot {
         }
     }
 
-    /// 记录单调延迟样本（由 DataSink/Ingress 在单调时钟下调用，非 UTC 相减）
+    /// 记录单调延迟样本（由 DataSink/Ingress 在单调时钟下调用，非 UTC 相减），O(1)
     pub fn record_latency_ns(&self, ns: u64) {
         let mut v = self.latencies_ns.write().unwrap();
         if v.len() >= 4096 {
-            v.remove(0);
+            v.pop_front();
         }
-        v.push(ns);
+        v.push_back(ns);
     }
 
     pub fn envelopes_total(&self) -> u64 {
@@ -226,7 +226,7 @@ impl Snapshot {
         self.point_value_total.load(Ordering::Relaxed)
     }
     pub fn latencies_snapshot(&self) -> Vec<u64> {
-        self.latencies_ns.read().unwrap().clone()
+        self.latencies_ns.read().unwrap().iter().copied().collect()
     }
 
     /// 断线标记（§11）：将该 Endpoint 全部已知点置 BAD/COMMUNICATION_LOST，

@@ -528,8 +528,11 @@ fn tasks_to_pb_checked(
 
 fn apply_batch_logged(snapshot: &Arc<Snapshot>, cfg: &BuiltinEndpoint, batch: DataBatch) {
     let n = batch.values.len();
+    let start = std::time::Instant::now();
     snapshot.apply_batch(&batch, &cfg.endpoint_id);
-    tracing::trace!(endpoint=%cfg.endpoint_id, seq=batch.sequence, values=n, "batch");
+    let ns = start.elapsed().as_nanos() as u64;
+    snapshot.record_latency_ns(ns);
+    tracing::trace!(endpoint=%cfg.endpoint_id, seq=batch.sequence, values=n, latency_ns=ns, "batch");
 }
 
 fn expect_ack(body: Option<pb::envelope::Body>) -> Option<pb::GenericResult> {

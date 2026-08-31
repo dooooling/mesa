@@ -160,6 +160,10 @@ pub struct S7Client {
 }
 
 impl S7Client {
+    pub fn pdu_length(&self) -> u16 {
+        self.pdu_length
+    }
+
     /// 建立连接并完成握手。失败返回带诊断的 SdkDriverError。
     pub async fn connect(cfg: S7ConnConfig) -> Result<Self, SdkDriverError> {
         let addr = format!("{}:{}", cfg.host, cfg.port);

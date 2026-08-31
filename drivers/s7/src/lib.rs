@@ -103,7 +103,6 @@ struct S7Connection {
 
 // 连续区合并的批量结构，供 run 内合并与单元测试复用
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // 仅测试与合并逻辑复用，clippy -D warnings 下避免未使用误报
 struct Bulk {
     base: S7Address,
     len: usize,
@@ -111,10 +110,17 @@ struct Bulk {
 }
 
 /// 将已排序的 paired 按 (area, db, byte_offset) 合并为 Bulk，规则与 run 内一致：
-// TODO: 覆盖 oversized/WSTRING/PDU480 边界
+/// 单区上限由 negotiated PDU 决定（400 适配 480，900 适配 960），STRING/WSTRING 隔离，oversized 按 PDU 分片
 #[allow(dead_code)]
 fn merge_paired_to_bulks(paired: &[((PointSpec, u32), ReadItem)]) -> Vec<Bulk> {
-    const MAX_BULK_LEN: usize = 400;
+    merge_paired_to_bulks_with_max(paired, 900)
+}
+
+/// 支持指定 max 的合并，用于 PDU240/480/960 单测
+fn merge_paired_to_bulks_with_max(
+    paired: &[((PointSpec, u32), ReadItem)],
+    max_bulk_len: usize,
+) -> Vec<Bulk> {
     const GAP_THRESHOLD: u32 = 4;
     let mut bulks: Vec<Bulk> = Vec::new();
     let mut cur: Option<Bulk> = None;
@@ -133,7 +139,7 @@ fn merge_paired_to_bulks(paired: &[((PointSpec, u32), ReadItem)]) -> Vec<Bulk> {
                 && item.addr.area == c.base.area
                 && item.addr.db_number == c.base.db_number
                 && start <= c_end + GAP_THRESHOLD
-                && (end.max(c_end) - c.base.byte_offset) as usize <= MAX_BULK_LEN
+                && (end.max(c_end) - c.base.byte_offset) as usize <= max_bulk_len
         } else {
             false
         };
@@ -416,59 +422,12 @@ impl DriverConnection for S7Connection {
                             .then(a.1.addr.db_number.cmp(&b.1.addr.db_number))
                             .then(a.1.addr.byte_offset.cmp(&b.1.addr.byte_offset))
                     });
-                    // 连续区合并：将同一 area/db 内相邻或重叠的 Byte 区间合并为一次 BYTE 批量读，减少 PDU 往返
-                    // STRING/WSTRING(256/516B) 单独成区不与小项合并，避免无意义大范围读取；单区上限 200B 适配 PDU 480
-                    const MAX_BULK_LEN: usize = 400;
-                    const GAP_THRESHOLD: u32 = 4;
-                    struct Bulk {
-                        base: S7Address,
-                        len: usize,
-                        members: Vec<(usize, usize, S7Kind, u32)>, // (paired_idx, offset_in_bulk, kind, pid)
-                    }
-                    let mut bulks: Vec<Bulk> = Vec::new();
-                    let mut cur: Option<Bulk> = None;
-                    for (idx, ((spec, pid), item)) in paired.iter().enumerate() {
-                        let is_string = matches!(item.kind, S7Kind::String | S7Kind::WString);
-                        let item_len = item.kind.byte_len();
-                        let start = item.addr.byte_offset;
-                        let end = start + item_len as u32;
-                        let can_merge = if let Some(c) = cur.as_ref() {
-                            let c_end = c.base.byte_offset + c.len as u32;
-                            let c_has_string = c.members.iter().any(|(mi, _, _, _)| {
-                                matches!(paired[*mi].1.kind, S7Kind::String | S7Kind::WString)
-                            });
-                            !is_string
-                                && !c_has_string
-                                && item.addr.area == c.base.area
-                                && item.addr.db_number == c.base.db_number
-                                && start <= c_end + GAP_THRESHOLD
-                                && (end.max(c_end) - c.base.byte_offset) as usize <= MAX_BULK_LEN
-                        } else {
-                            false
-                        };
-                        if can_merge {
-                            let c = cur.as_mut().unwrap();
-                            let c_end = c.base.byte_offset + c.len as u32;
-                            let new_end = end.max(c_end);
-                            c.len = (new_end - c.base.byte_offset) as usize;
-                            let offset = (start - c.base.byte_offset) as usize;
-                            c.members.push((idx, offset, item.kind, *pid));
-                        } else {
-                            if let Some(c) = cur.take() {
-                                bulks.push(c);
-                            }
-                            cur = Some(Bulk {
-                                base: item.addr.clone(),
-                                len: item_len,
-                                members: vec![(idx, 0, item.kind, *pid)],
-                            });
-                            // 兼容 spec.kind 仅用于后续 BOOL 取位时需保留原 bit 信息，已在 spec 中
-                            let _ = spec;
-                        }
-                    }
-                    if let Some(c) = cur.take() {
-                        bulks.push(c);
-                    }
+                    // 生产代码复用 merge_paired_to_bulks_with_max，按 negotiated PDU 分片（240/480/960）
+                    let pdu_max = {
+                        let g = client.lock().await;
+                        (g.pdu_length() as usize).saturating_sub(32).clamp(200, 900)
+                    };
+                    let bulks = merge_paired_to_bulks_with_max(&paired, pdu_max);
                     // 按 bulk 发起批量 BYTE 读，client 内部再按 PDU 剩余动态分批
                     let ranges: Vec<(S7Address, usize)> =
                         bulks.iter().map(|b| (b.base.clone(), b.len)).collect();
@@ -741,7 +700,7 @@ mod tests {
                 )
             })
             .collect();
-        let bulks_many = merge_paired_to_bulks(&many);
+        let bulks_many = merge_paired_to_bulks_with_max(&many, 400);
         assert!(
             bulks_many.len() > 1,
             "101*4=404 超限应分片，实际 {}",
@@ -750,6 +709,17 @@ mod tests {
         for b in &bulks_many {
             assert!(b.len <= 400, "单 bulk 不超 400，实际 {}", b.len);
         }
+        // 真正 PDU240/480/960：同一 101 项在不同 max 下分片数不同
+        let b240 = merge_paired_to_bulks_with_max(&many, 240 - 32);
+        let b480 = merge_paired_to_bulks_with_max(&many, 480 - 32);
+        let b960 = merge_paired_to_bulks_with_max(&many, 960 - 32);
+        assert!(
+            b240.len() >= b480.len() && b480.len() >= b960.len(),
+            "小 PDU 应分更多片 240:{} 480:{} 960:{}",
+            b240.len(),
+            b480.len(),
+            b960.len()
+        );
     }
 
     #[test]
