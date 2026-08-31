@@ -101,7 +101,11 @@ pub struct LatestEntry {
     #[serde(flatten)]
     pub value: ValueJson,
     pub quality: String,
-    /// 批次时间戳（UTC Unix ns）；断线置 BAD 后保留最后值的旧时间戳。
+    /// 协议/ Mesa 原因码（§3.7）：GOOD 时 None；BAD 时如 `COMMUNICATION_LOST` / `EW_*`。
+    /// 断线场景固定为 `COMMUNICATION_LOST`，保持可测契约。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality_code: Option<String>,
+    /// 批次时间戳（UTC Unix ns）；断线置 BAD 后保留最后值的旧时间戳，不生成虚假采样。
     pub timestamp_ns: i64,
 }
 
@@ -207,6 +211,13 @@ impl Snapshot {
                 key: keys_snapshot.get(&k).cloned().unwrap_or_default(),
                 value: value_to_json(&pv.value),
                 quality: pv.quality.as_str().to_string(),
+                quality_code: pv.quality_code.map(|c| c.to_string()).or_else(|| {
+                    if pv.quality == mesa_core_types::Quality::Bad {
+                        Some("DEVICE_ERROR".into())
+                    } else {
+                        None
+                    }
+                }),
                 timestamp_ns: batch.timestamp_ns,
             };
             latest.insert(k, entry);
@@ -265,14 +276,15 @@ impl Snapshot {
         self.snapshot_apply_latencies_snapshot()
     }
 
-    /// 断线标记（§11）：将该 Endpoint 全部已知点置 BAD/COMMUNICATION_LOST，
-    /// 不生成虚假采样、不改动原值。
+    /// 断线标记（§3.11 / §11）：将该 Endpoint 全部已知点置 BAD/COMMUNICATION_LOST，
+    /// 保留最后一个 typed value 与原 timestamp，不生成虚假采样（P0-A 冻结契约）。
     pub fn mark_communication_lost(&self, endpoint_id: &str) {
         let mut latest = self.latest.write().unwrap();
         for ((ep, _pid), entry) in latest.iter_mut() {
             if ep == endpoint_id && entry.quality != "BAD" {
                 entry.quality = "BAD".into();
-                entry.value.value = serde_json::Value::Null;
+                entry.quality_code = Some("COMMUNICATION_LOST".into());
+                // 保留 entry.value（typed last value）与 timestamp_ns 不变，不置 Null
             }
         }
     }

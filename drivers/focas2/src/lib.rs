@@ -445,22 +445,35 @@ impl DriverConnection for FocasConnection {
                     }
                     let mut batch_vals = Vec::with_capacity(points.len());
                     for ((spec, pid), raw_val) in points.iter().zip(values) {
-                        // 多机型单点不支持：Native 以 "ERR:EW_*" 字符串占位，转 Quality::Bad 而非丢整批
+                        // 多机型单点不支持：Native 以 "ERR:EW_*" 字符串占位，转 typed BAD（§3.6 禁 String 冒充数值类型）
                         if let Value::String(s) = &raw_val
                             && s.starts_with("ERR:") {
                                 tracing::warn!(key=%spec.key, error=%s, "单点 Bad，不影响同批其他点");
+                                // P0-B：BAD 仍必须携带与 data_type 匹配的 typed 值，quality_code 保留协议原因
+                                let neutral = neutral_value_for(spec.data_type);
+                                // 尝试提取 EW_* 尾缀作为可读码，暂以 1 为兜底整数码
+                                #[allow(clippy::if_same_then_else)]
+                                let code = if s.contains("EW_") { 1 } else { 1 };
                                 batch_vals.push(PointValue {
                                     point_id: *pid,
-                                    value: raw_val,
+                                    value: neutral,
                                     quality: Quality::Bad,
-                                    quality_code: Some(1),
+                                    quality_code: Some(code),
                                     source_timestamp_ns: None,
                                 });
                                 continue;
                             }
                         let coerced = coerce_value(raw_val, spec.data_type);
                         if !value_fits_data_type(&coerced, spec.data_type) {
-                            tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配跳过");
+                            // §3.12：单 output 解码失败不丢整批，改为该点 BAD（typed neutral）
+                            tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配→单点 BAD");
+                            batch_vals.push(PointValue {
+                                point_id: *pid,
+                                value: neutral_value_for(spec.data_type),
+                                quality: Quality::Bad,
+                                quality_code: Some(1),
+                                source_timestamp_ns: None,
+                            });
                             continue;
                         }
                         batch_vals.push(PointValue::good(*pid, coerced));
@@ -507,6 +520,31 @@ impl DriverConnection for FocasConnection {
             return Err(e);
         }
         Ok(())
+    }
+}
+
+/// §3.6：BAD 时的 type-compatible neutral value（无 last-known 时兜底）
+fn neutral_value_for(dt: DataType) -> Value {
+    match dt {
+        DataType::Bool => Value::Bool(false),
+        DataType::I32 => Value::I32(0),
+        DataType::U32 => Value::U32(0),
+        DataType::I64 => Value::I64(0),
+        DataType::U64 => Value::U64(0),
+        DataType::F32 => Value::F32(0.0),
+        DataType::F64 => Value::F64(0.0),
+        DataType::String => Value::String(String::new()),
+        DataType::Bytes => Value::Bytes(Vec::new()),
+        DataType::DateTime => Value::DateTime(0),
+        DataType::BoolArray => Value::BoolArray(Vec::new()),
+        DataType::I32Array => Value::I32Array(Vec::new()),
+        DataType::U32Array => Value::U32Array(Vec::new()),
+        DataType::I64Array => Value::I64Array(Vec::new()),
+        DataType::U64Array => Value::U64Array(Vec::new()),
+        DataType::F32Array => Value::F32Array(Vec::new()),
+        DataType::F64Array => Value::F64Array(Vec::new()),
+        DataType::StringArray => Value::StringArray(Vec::new()),
+        DataType::DateTimeArray => Value::DateTimeArray(Vec::new()),
     }
 }
 

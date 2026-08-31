@@ -1127,6 +1127,8 @@ dependencies = [
 name = "mesa-contract-tests"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "mesa-config-store",
  "mesa-core-types",
  "mesa-driver-manager",
  "mesa-driver-protocol",
@@ -1137,6 +1139,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

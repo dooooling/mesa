@@ -20,7 +20,7 @@ pub fn now_unix_ns() -> TimestampNs {
 
 /// 宿主机单调时钟（CLOCK_MONOTONIC），用于 IPC/E2E p95/p99 测量，禁止两进程 UTC 相减。
 /// Linux 用 `clock_gettime(CLOCK_MONOTONIC)`，Windows 用 `QueryPerformanceCounter` 绝对计数（跨进程同频，可比）。
-/// 返回绝对 QPC 换算的纳秒数（自系统启动起），同宿主所有进程零点一致，可直接相减得 IPC latency。
+/// 返回绝对 QPC 换算的纳秒数（自系统启动起），同宿主所有进程共享同一 QPC counter domain，仅用于同宿主差值计算，不代表 UTC 或业务时间，可直接相减得 IPC latency（§3.8 P0-C）。
 pub fn host_mono_ns() -> u64 {
     #[cfg(unix)]
     {

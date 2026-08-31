@@ -13,11 +13,14 @@ mesa-driver-protocol = { workspace = true }
 mesa-driver-sdk = { workspace = true }
 mesa-driver-simulator = { path = "../../drivers/simulator" }
 mesa-driver-manager = { workspace = true }
+mesa-config-store = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+windows-sys = { workspace = true }
+libc = { workspace = true }
 
 # TODO: Contract Test 目前仅有 M0 冒烟子集（Handshake 认证 / DataBatch 语义），
 # 全量 20 项基线（§21）在 Phase 3 补齐，Simulator 必须第一个全过。
