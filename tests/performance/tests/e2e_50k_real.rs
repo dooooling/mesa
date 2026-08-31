@@ -84,14 +84,14 @@ async fn e2e_50k_real_throughput() {
     let delta_env = end_env.saturating_sub(start_env);
     let ups = delta_points as f64 / elapsed;
 
-    // 延迟百分位（当前 Snapshot 采样为环形 4096，若未埋点则为 0，仍输出以便诊断）
-    let lat = snap.latencies_snapshot();
+    // Snapshot apply 延迟百分位（非 IPC/E2E，真 E2E 需 proto 单调戳，列为 P1）
+    let lat = snap.snapshot_apply_latencies_snapshot();
     let p50 = percentile(lat.clone(), 50.0);
     let p95 = percentile(lat.clone(), 95.0);
     let p99 = percentile(lat.clone(), 99.0);
 
     println!(
-        "e2e_50k_real elapsed={:.2}s delta_points={} delta_env={} ups={:.0} p50={}ns p95={}ns p99={}ns",
+        "e2e_50k_real elapsed={:.2}s delta_points={} delta_env={} ups={:.0} snapshot_apply_p50={}ns p95={}ns p99={}ns",
         elapsed, delta_points, delta_env, ups, p50, p95, p99
     );
 
@@ -108,10 +108,10 @@ async fn e2e_50k_real_throughput() {
         ups >= threshold,
         "实际 updates/s {ups:.0} 未达阈值 {threshold:.0}（delta {delta_points} / {elapsed:.1}s），不满足 §22 50K"
     );
-    // 延迟仅在有样本时断言，避免未埋点时误 fail；已埋点则按 §22 预算
+    // Snapshot apply 延迟（非 IPC/E2E，真 E2E 需 proto 单调戳，列 P1）
     if !lat.is_empty() && p95 != 0 {
-        assert!(p95 <= 20_000_000, "p95 {p95}ns >20ms，不满足 §22 p95≤20ms");
-        assert!(p99 <= 50_000_000, "p99 {p99}ns >50ms，不满足 §22 p99≤50ms");
+        assert!(p95 <= 20_000_000, "snapshot_apply_p95 {p95}ns >20ms");
+        assert!(p99 <= 50_000_000, "snapshot_apply_p99 {p99}ns >50ms");
     }
 
     // 最终仍需 RUNNING

@@ -116,8 +116,9 @@ pub struct Snapshot {
     /// §22 精确计数：自启动以来的 envelope / point_value 总数（单调递增，跨 batch 累加）
     envelopes_total: AtomicU64,
     point_value_total: AtomicU64,
-    /// 诊断用：最近批次的单调延迟样本（环形缓冲，容量 4096，O(1) push/pop），用于 p50/p95/p99 近似
-    latencies_ns: RwLock<VecDeque<u64>>,
+    /// 诊断用：Snapshot apply 阶段的单调延迟样本（环形缓冲 4096，O(1)），用于 p50/p95/p99
+    /// 注意：此为 Core 内 apply_batch 耗时，非跨进程 IPC/E2E 延迟；真正 IPC E2E 需 proto 单调时间戳（P1）
+    snapshot_apply_latencies_ns: RwLock<VecDeque<u64>>,
 }
 
 impl Default for Snapshot {
@@ -129,7 +130,7 @@ impl Default for Snapshot {
             keys: RwLock::new(HashMap::new()),
             envelopes_total: AtomicU64::new(0),
             point_value_total: AtomicU64::new(0),
-            latencies_ns: RwLock::new(VecDeque::with_capacity(4096)),
+            snapshot_apply_latencies_ns: RwLock::new(VecDeque::with_capacity(4096)),
         }
     }
 }
@@ -210,13 +211,18 @@ impl Snapshot {
         }
     }
 
-    /// 记录单调延迟样本（由 DataSink/Ingress 在单调时钟下调用，非 UTC 相减），O(1)
-    pub fn record_latency_ns(&self, ns: u64) {
-        let mut v = self.latencies_ns.write().unwrap();
+    /// 记录 Snapshot apply 单调延迟样本，O(1)
+    pub fn record_snapshot_apply_latency_ns(&self, ns: u64) {
+        let mut v = self.snapshot_apply_latencies_ns.write().unwrap();
         if v.len() >= 4096 {
             v.pop_front();
         }
         v.push_back(ns);
+    }
+
+    /// 兼容旧命名，实际为 snapshot_apply
+    pub fn record_latency_ns(&self, ns: u64) {
+        self.record_snapshot_apply_latency_ns(ns)
     }
 
     pub fn envelopes_total(&self) -> u64 {
@@ -225,8 +231,18 @@ impl Snapshot {
     pub fn point_value_total(&self) -> u64 {
         self.point_value_total.load(Ordering::Relaxed)
     }
+    pub fn snapshot_apply_latencies_snapshot(&self) -> Vec<u64> {
+        self.snapshot_apply_latencies_ns
+            .read()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// 兼容旧命名
     pub fn latencies_snapshot(&self) -> Vec<u64> {
-        self.latencies_ns.read().unwrap().iter().copied().collect()
+        self.snapshot_apply_latencies_snapshot()
     }
 
     /// 断线标记（§11）：将该 Endpoint 全部已知点置 BAD/COMMUNICATION_LOST，

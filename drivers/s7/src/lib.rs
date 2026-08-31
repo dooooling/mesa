@@ -165,50 +165,8 @@ fn merge_paired_to_bulks_with_max(
     if let Some(c) = cur.take() {
         bulks.push(c);
     }
-    // 单 logical range 物理分片：仅对多成员的超长合并区按 max 切分；单成员大 String/WString 保持单 Range（依赖 PDU 960，240/480 下将按项 BAD）
-    let mut fragmented: Vec<Bulk> = Vec::with_capacity(bulks.len() * 2);
-    for bulk in bulks {
-        if bulk.len <= max_bulk_len {
-            fragmented.push(bulk);
-            continue;
-        }
-        if bulk.members.len() == 1 {
-            // 单成员超长（如 WSTRING 516 @ PDU240/480）：保持单 Range，不强行分片，避免跨 chunk 拼接破坏 STRING 头
-            fragmented.push(bulk);
-            continue;
-        }
-        let mut offset = 0usize;
-        let mut remaining = bulk.len;
-        let base_byte = bulk.base.byte_offset;
-        while remaining > 0 {
-            let chunk_len = remaining.min(max_bulk_len);
-            let chunk_base = S7Address {
-                area: bulk.base.area,
-                db_number: bulk.base.db_number,
-                byte_offset: base_byte + offset as u32,
-                bit_offset: None,
-            };
-            let mut chunk_members = Vec::new();
-            for (idx, off, kind, pid) in &bulk.members {
-                let member_start = *off;
-                let member_end = member_start + kind.byte_len();
-                let chunk_start = offset;
-                let chunk_end = offset + chunk_len;
-                if member_start < chunk_end && member_end > chunk_start {
-                    let rel_off = off.saturating_sub(offset);
-                    chunk_members.push((*idx, rel_off, *kind, *pid));
-                }
-            }
-            fragmented.push(Bulk {
-                base: chunk_base,
-                len: chunk_len,
-                members: chunk_members,
-            });
-            offset += chunk_len;
-            remaining = remaining.saturating_sub(chunk_len);
-        }
-    }
-    fragmented
+    // 物理分片下沉至 S7Client::read_byte_ranges，planner 仅做逻辑合并，不做物理分片，避免头污染与成员跨 chunk 覆盖
+    bulks
 }
 
 #[async_trait::async_trait]

@@ -314,8 +314,9 @@ impl S7Client {
         Ok(all)
     }
 
-    /// 连续区合并后的批量 BYTE 读：每个 range 为 (起始地址, 字节长度) 的连续内存区，单次 PDU 同时按项数与总字节数限流。
-    /// 用于 S7 continuous-range merge，减少 PDU 往返（§7.1 合并连续区域）。
+    /// 连续区合并后的批量 BYTE 读：每个 range 为 (起始地址, 字节长度) 的连续内存区。
+    /// 单 logical range 若超过 negotiated PDU 可承载（STRING 256 @ PDU240 / WSTRING 516 @ PDU480），
+    /// 在此层按 PDU 自动分片为多个物理读并重组，避免上层 planner 头污染与跨 chunk 覆盖。
     pub async fn read_byte_ranges(
         &mut self,
         ranges: &[(S7Address, usize)],
@@ -323,20 +324,49 @@ impl S7Client {
         if ranges.is_empty() {
             return Ok(vec![]);
         }
-        let mut all = Vec::with_capacity(ranges.len());
+        // 1) 将 oversized 的单 logical range 按 PDU 分片为多个物理 range，并记录归属
+        let max_single = (self.pdu_length as usize).saturating_sub(48).max(64);
+        let mut physical: Vec<(S7Address, usize)> = Vec::new();
+        let mut logical_to_physical: Vec<Vec<usize>> = vec![Vec::new(); ranges.len()];
+        for (li, (addr, len)) in ranges.iter().enumerate() {
+            if *len <= max_single {
+                let pi = physical.len();
+                physical.push((addr.clone(), *len));
+                logical_to_physical[li].push(pi);
+            } else {
+                let mut remaining = *len;
+                let mut off = 0u32;
+                while remaining > 0 {
+                    let chunk_len = remaining.min(max_single);
+                    let chunk_addr = S7Address {
+                        area: addr.area,
+                        db_number: addr.db_number,
+                        byte_offset: addr.byte_offset + off,
+                        bit_offset: None,
+                    };
+                    let pi = physical.len();
+                    physical.push((chunk_addr, chunk_len));
+                    logical_to_physical[li].push(pi);
+                    off += chunk_len as u32;
+                    remaining = remaining.saturating_sub(chunk_len);
+                }
+            }
+        }
+        // 2) 按 PDU 同时对物理 range 做 multi-item 打包
+        let mut physical_results: Vec<Option<Vec<u8>>> = vec![None; physical.len()];
         let mut start = 0;
-        while start < ranges.len() {
+        while start < physical.len() {
             let mut end = start + 1;
-            let mut bytes = ranges[start].1 + 12 + 4;
-            while end < ranges.len() && end - start < S7_MAX_ITEMS_PER_PDU {
-                let next_len = ranges[end].1 + 12 + 4;
+            let mut bytes = physical[start].1 + 12 + 4;
+            while end < physical.len() && end - start < S7_MAX_ITEMS_PER_PDU {
+                let next_len = physical[end].1 + 12 + 4;
                 if bytes + next_len > self.pdu_length as usize - 32 {
                     break;
                 }
                 bytes += next_len;
                 end += 1;
             }
-            let chunk = &ranges[start..end];
+            let chunk = &physical[start..end];
             let pkt = build_bulk_read_req(self.pdu_ref, chunk);
             self.pdu_ref = self.pdu_ref.wrapping_add(1).max(1);
             timeout(self.cfg.timeout(), self.send_raw(&pkt))
@@ -356,10 +386,38 @@ impl S7Client {
                     SdkDriverError::new(ErrorKind::Connection, "READ_RECV_FAIL", e.to_string())
                 })?;
             let part = parse_bulk_resp(&resp, chunk)?;
-            all.extend(part);
+            for (i, v) in part.into_iter().enumerate() {
+                physical_results[start + i] = v;
+            }
             start = end;
         }
-        Ok(all)
+        // 3) 重组回 logical：多物理 chunk 拼接，任一 chunk BAD 则 logical BAD
+        let mut out = Vec::with_capacity(ranges.len());
+        for (li, pis) in logical_to_physical.iter().enumerate() {
+            if pis.is_empty() {
+                out.push(None);
+                continue;
+            }
+            let mut buf = Vec::with_capacity(ranges[li].1);
+            let mut ok = true;
+            for &pi in pis {
+                match &physical_results[pi] {
+                    Some(b) => buf.extend_from_slice(b),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                // 截断/补齐至期望 len（WSTRING 头等）
+                buf.truncate(ranges[li].1);
+                out.push(Some(buf));
+            } else {
+                out.push(None);
+            }
+        }
+        Ok(out)
     }
 
     async fn send_raw(&mut self, data: &[u8]) -> std::io::Result<()> {
