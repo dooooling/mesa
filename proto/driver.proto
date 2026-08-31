@@ -46,6 +46,10 @@ message Envelope {
     Ping ping = 29;
     Pong pong = 30;
     Shutdown shutdown = 31;
+
+    // Management Plane: Descriptor 自描述（§4.4 V2.1）低频 JSON，不污染 DataBatch 热路径
+    GetDescriptor get_descriptor = 32;
+    DescriptorReport descriptor_report = 33;
   }
 }
 
@@ -251,3 +255,11 @@ message DriverErrorReport {
 message Ping {}
 message Pong {}
 message Shutdown {}
+
+message GetDescriptor {}
+
+message DescriptorReport {
+  uint32 contract_major = 1;
+  uint32 contract_minor = 2;
+  string descriptor_json = 3;
+}

@@ -59,6 +59,109 @@ impl Driver for SimulatorDriver {
         }
     }
 
+    fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
+        use mesa_core_types::{
+            AccessMode, DataType, DiscoveryCapabilities, DriverCapabilities, DriverDescriptor,
+            DriverIdentity, FieldDescriptor, FieldType, LocalizedText, OutputDescriptor,
+            ResourceDescriptor, SchemaDescriptor,
+        };
+        let m = self.metadata();
+        DriverDescriptor {
+            contract_major: 1,
+            contract_minor: 0,
+            identity: DriverIdentity {
+                driver_id: m.driver_id,
+                name: m.name,
+                version: m.version,
+            },
+            connection: SchemaDescriptor {
+                fields: vec![
+                    FieldDescriptor::new("seed", "Seed", FieldType::Integer)
+                        .required(false)
+                        .default_value(serde_json::json!(0)),
+                ],
+            },
+            resources: vec![
+                ResourceDescriptor {
+                    id: "counter".into(),
+                    label: LocalizedText::new("Counter"),
+                    parameters: SchemaDescriptor::default(),
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Value"),
+                        data_type: DataType::F64,
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
+                    id: "sine".into(),
+                    label: LocalizedText::new("Sine"),
+                    parameters: SchemaDescriptor {
+                        fields: vec![
+                            FieldDescriptor::new("amplitude", "Amplitude", FieldType::Number)
+                                .required(false)
+                                .default_value(serde_json::json!(100.0)),
+                            FieldDescriptor::new("period_ms", "Period ms", FieldType::Integer)
+                                .required(false)
+                                .default_value(serde_json::json!(5000)),
+                        ],
+                    },
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Value"),
+                        data_type: DataType::F64,
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
+                    id: "random".into(),
+                    label: LocalizedText::new("Random"),
+                    parameters: SchemaDescriptor::default(),
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Value"),
+                        data_type: DataType::F64,
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
+                    id: "constant".into(),
+                    label: LocalizedText::new("Constant"),
+                    parameters: SchemaDescriptor {
+                        fields: vec![
+                            FieldDescriptor::new("value", "Value", FieldType::Number)
+                                .required(true),
+                        ],
+                    },
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Value"),
+                        data_type: DataType::F64,
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+            ],
+            controls: mesa_core_types::ControlCatalog::default(),
+            discovery: DiscoveryCapabilities {
+                manual: true,
+                browse: false,
+                import: false,
+            },
+            capabilities: DriverCapabilities {
+                poll: true,
+                ..Default::default()
+            },
+        }
+    }
+
     async fn open_connection(
         &self,
         _endpoint_id: &str,

@@ -105,6 +105,49 @@ async fn list_drivers(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
     Json(serde_json::json!({ "drivers": state.snapshot.drivers() }))
 }
 
+async fn get_driver(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let drivers = state.snapshot.drivers();
+    if let Some(d) = drivers.into_iter().find(|x| x.id == id) {
+        (StatusCode::OK, Json(serde_json::to_value(d).unwrap()))
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("driver `{id}` not found"))),
+        )
+    }
+}
+
+async fn get_driver_descriptor(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.manager.get_descriptor(&id).await {
+        Ok(desc) => (StatusCode::OK, Json(serde_json::to_value(&desc).unwrap())),
+        Err(e) => {
+            // §4.4 统一 503，code 精确可断言
+            let status = StatusCode::SERVICE_UNAVAILABLE;
+            // 尝试提取 issues（validation 失败时）
+            if e.code == "DRIVER_DESCRIPTOR_VALIDATION_FAILED" {
+                // 尝试解析 issues 详情，当前 Manager 仅返回 message，此处包装
+                (
+                    status,
+                    Json(serde_json::json!({
+                        "error": { "code": e.code, "message": e.message, "issues": [] }
+                    })),
+                )
+            } else {
+                (
+                    status,
+                    Json(serde_json::json!({ "error": { "code": e.code, "message": e.message } })),
+                )
+            }
+        }
+    }
+}
+
 async fn endpoint_state(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -801,6 +844,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         // 只读 / 诊断
         .route("/api/v1/drivers", get(list_drivers))
         .route("/api/v1/drivers/rescan", post(rescan_drivers))
+        .route("/api/v1/drivers/{id}", get(get_driver))
+        .route(
+            "/api/v1/drivers/{id}/descriptor",
+            get(get_driver_descriptor),
+        )
         .route(
             "/api/v1/endpoints",
             get(list_endpoints).post(create_endpoint),

@@ -85,6 +85,29 @@ impl From<ConvertError> for SdkDriverError {
 pub trait Driver: Send + Sync + 'static {
     fn metadata(&self) -> DriverMetadata;
 
+    /// 驱动自描述（V2.1 §13）：连接参数、资源目录、控制目录等。
+    /// 默认实现基于 metadata 生成最小可用描述符，避免简单 Driver 被迫实现复杂契约。
+    fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
+        let m = self.metadata();
+        mesa_core_types::DriverDescriptor {
+            contract_major: 1,
+            contract_minor: 0,
+            identity: mesa_core_types::DriverIdentity {
+                driver_id: m.driver_id,
+                name: m.name,
+                version: m.version,
+            },
+            connection: mesa_core_types::SchemaDescriptor::default(),
+            resources: vec![],
+            controls: mesa_core_types::ControlCatalog::default(),
+            discovery: mesa_core_types::DiscoveryCapabilities {
+                manual: true,
+                ..Default::default()
+            },
+            capabilities: mesa_core_types::DriverCapabilities::default(),
+        }
+    }
+
     /// 打开一个运行时连接实例。`config_json` 是 Endpoint.connection 的 JSON，
     /// 语义完全由 Driver 解释（Core 不懂协议）。
     async fn open_connection(
@@ -641,6 +664,25 @@ async fn request_loop(
                             driver_id: m.driver_id,
                             name: m.name,
                             version: m.version,
+                        })),
+                    })
+                    .await;
+            }
+            Some(pb::envelope::Body::GetDescriptor(_)) => {
+                let d = session.driver.descriptor();
+                // 契约校验失败则视为驱动实现错误，仍以 JSON 透出并由 Core 侧校验
+                let json = serde_json::to_string(&d).unwrap_or_else(|e| {
+                    format!(r#"{{"error":"descriptor serialize failed: {e}"}}"#)
+                });
+                // 256 KiB 上限由 Core 侧强制，此处仅透传
+                session
+                    .sink
+                    .send_control(pb::Envelope {
+                        msg_id: env.msg_id,
+                        body: Some(pb::envelope::Body::DescriptorReport(pb::DescriptorReport {
+                            contract_major: d.contract_major,
+                            contract_minor: d.contract_minor,
+                            descriptor_json: json,
                         })),
                     })
                     .await;

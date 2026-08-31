@@ -5,6 +5,19 @@
 //! 可选扩展方式进行。Core 侧与 Driver 侧均依赖本 crate，但协议细节（S7 地址 / FOCAS
 //! Function / OPC UA NodeId）绝不在此出现。
 
+pub mod capability;
+pub mod descriptor;
+pub mod resource;
+pub mod schema;
+
+pub use capability::{ControlCatalog, DiscoveryCapabilities, DriverCapabilities};
+pub use descriptor::{DriverDescriptor, DriverIdentity};
+pub use resource::{AccessMode, OutputDescriptor, ResourceDescriptor};
+pub use schema::{
+    Condition, ConditionOp, FieldDescriptor, FieldType, FieldValidation, LocalizedText,
+    SchemaDescriptor, UiHints,
+};
+
 use serde::{Deserialize, Serialize};
 
 /// 业务时间戳统一为 UTC Unix 纳秒（方案 §10）。禁止使用本地时区或其他单位。

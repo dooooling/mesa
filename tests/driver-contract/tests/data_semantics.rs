@@ -205,9 +205,13 @@ fn revision_success_plus_one() {
         },
     };
     let r0 = store.current_revision("ep1").unwrap();
-    let r1 = store.replace_tasks("ep1", std::slice::from_ref(&t)).unwrap();
+    let r1 = store
+        .replace_tasks("ep1", std::slice::from_ref(&t))
+        .unwrap();
     assert_eq!(r1, r0 + 1);
-    let r2 = store.replace_tasks("ep1", std::slice::from_ref(&t)).unwrap();
+    let r2 = store
+        .replace_tasks("ep1", std::slice::from_ref(&t))
+        .unwrap();
     assert_eq!(r2, r1 + 1);
 }
 

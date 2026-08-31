@@ -297,6 +297,39 @@ impl Session {
         }
     }
 
+    /// GetDescriptor（§4.4）：5s 超时、256KiB 上限，返回 (major, minor, json)。
+    pub async fn get_descriptor(&self) -> Result<(u32, u32, String), SessionError> {
+        // 使用独立超时 5s（§4.4），而非通用的 10s
+        let id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
+        let rx = self.shared.register(id);
+        let env = pb::Envelope {
+            msg_id: id,
+            body: Some(pb::envelope::Body::GetDescriptor(pb::GetDescriptor {})),
+        };
+        {
+            let mut wr = self.shared.writer.lock().await;
+            write_envelope(&mut *wr, &env).await?;
+        }
+        let reply = match tokio::time::timeout(Duration::from_secs(5), rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => return Err(SessionError::Closed),
+            Err(_) => {
+                self.shared.unregister(id);
+                return Err(SessionError::Timeout);
+            }
+        };
+        match reply.body {
+            Some(pb::envelope::Body::DescriptorReport(d)) => {
+                if d.descriptor_json.len() > 256 * 1024 {
+                    return Err(SessionError::Handshake("descriptor too large".into()));
+                }
+                // 校验 JSON 可解析性由调用方完成，此处仅透传
+                Ok((d.contract_major, d.contract_minor, d.descriptor_json))
+            }
+            _ => Err(SessionError::Closed),
+        }
+    }
+
     /// 发送一帧并等待同 msg_id 的响应帧。超时即清理登记项，防止泄漏。
     pub async fn call(&self, body: pb::envelope::Body) -> Result<pb::Envelope, SessionError> {
         let id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
