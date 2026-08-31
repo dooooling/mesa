@@ -389,7 +389,7 @@ impl FocasApi for NativeFocasApi {
                             {
                                 Ok(vals) => {
                                     for (i, idx) in group.iter().enumerate() {
-                                        out[*idx] = Some(Value::U32(vals[i] as u32));
+                                        out[*idx] = Some(Value::I32(vals[i]));
                                     }
                                     continue;
                                 }

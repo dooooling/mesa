@@ -72,7 +72,8 @@ const PMC_TYPE_C: c_short = 8;
 const PMC_TYPE_D: c_short = 9;
 const PMC_TYPE_M: c_short = 10;
 const PMC_TYPE_N: c_short = 11;
-const PMC_TYPE_Z: c_short = 12;
+const PMC_TYPE_E: c_short = 12;
+const PMC_TYPE_Z: c_short = 13;
 /// 轴/主轴区间：FANUC 最大 32 轴、4 主轴，0i-F 基准 3 轴，30i 可 10/24 轴
 // TODO: 最大轴/主轴数预留，用于校验与批量扩展，V1 固定 8 轴批但需保留上限
 #[allow(dead_code)]
@@ -1196,22 +1197,20 @@ impl NativeLib {
     }
 
     /// 批量读 PMC 字 range：一次 FFI 读 count 个连续字，用于 PMC true range 合并（P1）
+    /// 返回 I32 统一 single/range 类型（single c_short→I32，range Vec<c_short>→Vec<I32>）
     pub fn pmc_read_word_range(
         &self,
         hdl: u16,
         adr_type: c_short,
         start: u32,
         count: u32,
-    ) -> Result<Vec<c_short>, FocasRet> {
+    ) -> Result<Vec<i32>, FocasRet> {
         if count == 0 || count > 32 {
             return Err(FocasRet::Param);
         }
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
-        // 动态缓冲：8 字节头 + count*2
         let len = 8 + (count as usize) * 2;
         let mut buf = vec![0u8; len];
-        // 填充头：type_a, type_d, datano_s, datano_e
-        // 使用 transmute 写入前 8 字节
         let header = IodbPmc1 {
             type_a: adr_type,
             type_d: PMC_DATA_WORD,
@@ -1219,7 +1218,6 @@ impl NativeLib {
             datano_e: (start + count - 1) as c_short,
             idata: [0; 8],
         };
-        // 将 header 前 8 字节拷入 buf
         let hdr_bytes = unsafe { std::slice::from_raw_parts(&header as *const _ as *const u8, 8) };
         buf[..8].copy_from_slice(hdr_bytes);
         let rc = unsafe {
@@ -1237,7 +1235,7 @@ impl NativeLib {
         if ret.is_ok() {
             let mut out = Vec::with_capacity(count as usize);
             for i in 0..count as usize {
-                let v = i16::from_le_bytes([buf[8 + i * 2], buf[8 + i * 2 + 1]]);
+                let v = i16::from_le_bytes([buf[8 + i * 2], buf[8 + i * 2 + 1]]) as i32;
                 out.push(v);
             }
             Ok(out)
@@ -1294,7 +1292,8 @@ impl NativeLib {
             'C' => PMC_TYPE_C,
             'D' => PMC_TYPE_D,
             'M' => PMC_TYPE_M,
-            'N' | 'E' => PMC_TYPE_N,
+            'N' => PMC_TYPE_N,
+            'E' => PMC_TYPE_E,
             'Z' => PMC_TYPE_Z,
             'B' => PMC_TYPE_R,
             _ => PMC_TYPE_R,

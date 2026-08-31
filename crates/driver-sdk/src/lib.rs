@@ -210,9 +210,9 @@ impl DataSink {
             batch.connection_handle = self.handle;
             batch.stream_epoch = self.epoch;
         }
-        // 单调埋点：若 Driver 未填则由 SDK 统一填入 wall 时间（P1 后可换 CLOCK_MONOTONIC）
+        // 单调埋点：若 Driver 未填则由 SDK 统一填入宿主机单调时钟（同宿主可比）
         if batch.mono_ns.is_none() {
-            batch.mono_ns = Some(mesa_core_types::now_unix_ns() as u64);
+            batch.mono_ns = Some(mesa_core_types::host_mono_ns());
         }
         // 非阻塞发送：成功则零拷贝直接入队，仅在 Full 时才进入合并路径，避免热路径无条件 clone
         match self.tx.try_send(OutboundMsg::Data(batch)) {
@@ -236,6 +236,13 @@ impl DataSink {
                         if batch.timestamp_ns > pending.timestamp_ns {
                             pending.timestamp_ns = batch.timestamp_ns;
                         }
+                        // coalesce 后 mono_ns 取最新（max），保证 Latest-Wins 的延迟样本反映最新 publish 时刻
+                        pending.mono_ns = match (pending.mono_ns, batch.mono_ns) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => None,
+                        };
                         pending.values = merged.into_values().collect();
                         // 稳定输出顺序，便于测试与排查
                         pending.values.sort_by_key(|pv| pv.point_id);

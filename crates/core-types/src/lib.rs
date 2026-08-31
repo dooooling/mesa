@@ -18,6 +18,39 @@ pub fn now_unix_ns() -> TimestampNs {
         .unwrap_or(0)
 }
 
+/// 宿主机单调时钟（CLOCK_MONOTONIC），用于 IPC/E2E p95/p99 测量，禁止两进程 UTC 相减。
+/// Linux 用 clock_gettime，Windows 用 OnceLock<Instant> 锚点（进程内单调，跨进程差值为进程启动差，需同宿主 QPC 时再换 winapi）。
+/// 返回值自锚点起的纳秒数，10s 内跨进程差值误差 < 进程启动差（通常 <100ms），满足 p95/p99 量级判断。
+pub fn host_mono_ns() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
+        let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        if ret == 0 {
+            return (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64);
+        }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static START: OnceLock<Instant> = OnceLock::new();
+        let s = START.get_or_init(Instant::now);
+        Instant::now().duration_since(*s).as_nanos() as u64
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+}
+
 /// 点位数据类型。字符串形式用于 binding 配置、Descriptor 上报与 REST 展示。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DataType {

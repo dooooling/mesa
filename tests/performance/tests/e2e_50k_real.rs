@@ -111,14 +111,14 @@ async fn e2e_50k_real_throughput() {
         ups >= threshold,
         "实际 updates/s {ups:.0} 未达阈值 {threshold:.0}（delta {delta_points} / {elapsed:.1}s），不满足 §22 50K"
     );
-    if !lat.is_empty() && p95 != 0 {
-        assert!(p95 <= 20_000_000, "snapshot_apply_p95 {p95}ns >20ms");
-        assert!(p99 <= 50_000_000, "snapshot_apply_p99 {p99}ns >50ms");
-    }
-    if !ipc_lat.is_empty() && ipc_p95 != 0 {
-        assert!(ipc_p95 <= 20_000_000, "ipc_p95 {ipc_p95}ns >20ms");
-        assert!(ipc_p99 <= 50_000_000, "ipc_p99 {ipc_p99}ns >50ms");
-    }
+    assert!(!lat.is_empty(), "snapshot_apply samples must >0");
+    assert!(p95 != 0, "snapshot_apply p95 must >0");
+    assert!(p95 <= 20_000_000, "snapshot_apply_p95 {p95}ns >20ms");
+    assert!(p99 <= 50_000_000, "snapshot_apply_p99 {p99}ns >50ms");
+    assert!(!ipc_lat.is_empty(), "ipc samples must >0 (mono_ns 未埋点或跨进程时钟不可比)");
+    assert!(ipc_p95 != 0, "ipc p95 must >0");
+    assert!(ipc_p95 <= 20_000_000, "ipc_p95 {ipc_p95}ns >20ms");
+    assert!(ipc_p99 <= 50_000_000, "ipc_p99 {ipc_p99}ns >50ms");
 
     // 最终仍需 RUNNING
     let st = snap.endpoint(ep_id).expect("endpoint still present");
