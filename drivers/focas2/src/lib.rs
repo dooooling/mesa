@@ -22,11 +22,11 @@ pub use focas_api::{FakeFocasApi, FocasApi, NativeFocasApi};
 use std::sync::Arc;
 use std::time::Duration;
 
-use forgelink_core_types::{
+use mesa_core_types::{
     ensure_unique_point_keys, AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey,
     PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, now_unix_ns,
 };
-use forgelink_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
+use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio_util::sync::CancellationToken;
 
 pub const BINDING_KIND: &str = "focas.data-block";
@@ -187,7 +187,7 @@ impl DriverConnection for FocasConnection {
                 .map_err(|e| SdkDriverError::configuration("INVALID_TASK", e.to_string()))?;
             if task.mode != TaskMode::Poll {
                 return Err(SdkDriverError::new(
-                    forgelink_core_types::ErrorKind::Unsupported,
+                    mesa_core_types::ErrorKind::Unsupported,
                     "MODE_NOT_SUPPORTED",
                     format!("task `{}`: focas2 仅支持 poll", task.id),
                 ));
@@ -214,7 +214,7 @@ impl DriverConnection for FocasConnection {
                 let dt_str = item.get("data_type").and_then(|v| v.as_str()).ok_or_else(|| SdkDriverError::configuration("INVALID_POINT", format!("point `{key}` 缺少 data_type")))?;
                 let addr = parse_address(addr_str).map_err(|e| match e {
                     AddressError::Empty => SdkDriverError::configuration("INVALID_ADDRESS", format!("point `{key}` 地址为空")),
-                    AddressError::Invalid { reason, .. } => SdkDriverError::new(forgelink_core_types::ErrorKind::Address, "INVALID_ADDRESS", format!("point `{key}` 地址 `{addr_str}` 非法: {reason}")),
+                    AddressError::Invalid { reason, .. } => SdkDriverError::new(mesa_core_types::ErrorKind::Address, "INVALID_ADDRESS", format!("point `{key}` 地址 `{addr_str}` 非法: {reason}")),
                 })?;
                 let data_type = parse_data_type(dt_str)?;
                 // 预校验：Fake 下各地址的默认 Value 需匹配声明类型
@@ -240,7 +240,7 @@ impl DriverConnection for FocasConnection {
     }
 
     async fn apply_point_map(&mut self, map: PointMap) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_mut().ok_or_else(|| SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "NOT_CONFIGURED", "apply 在 configure 之前"))?;
+        let snap = self.plan.as_mut().ok_or_else(|| SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "NOT_CONFIGURED", "apply 在 configure 之前"))?;
         for p in &snap.points {
             if !map.contains_key(&p.key) {
                 return Err(SdkDriverError::configuration("MISSING_POINT_ID", format!("point `{}` 缺少映射", p.key)));
@@ -255,8 +255,8 @@ impl DriverConnection for FocasConnection {
         sink: DataSink,
         shutdown: CancellationToken,
     ) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_ref().ok_or_else(|| SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "NO_PLAN", "run 前未 configure+apply"))?;
-        let map = snap.map.as_ref().ok_or_else(|| SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "NO_POINT_MAP", "run 前未 apply_point_map"))?;
+        let snap = self.plan.as_ref().ok_or_else(|| SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "NO_PLAN", "run 前未 configure+apply"))?;
+        let map = snap.map.as_ref().ok_or_else(|| SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "NO_POINT_MAP", "run 前未 apply_point_map"))?;
 
         // 连接（Fake 下即时成功；Native 下可能失败并由 Manager 退避重连）
         // NOTE: 当前 Fake 为纯异步直接 await；TODO: Native 切 spawn_blocking 隔离 Fwlib 阻塞
@@ -266,7 +266,7 @@ impl DriverConnection for FocasConnection {
             if msg.contains("未实现") || msg.contains("NOT_IMPLEMENTED") {
                 return Err(SdkDriverError::configuration("NOT_IMPLEMENTED", msg));
             } else {
-                return Err(SdkDriverError::new(forgelink_core_types::ErrorKind::Connection, "CONNECT_FAILED", msg));
+                return Err(SdkDriverError::new(mesa_core_types::ErrorKind::Connection, "CONNECT_FAILED", msg));
             }
         }
 
@@ -303,7 +303,7 @@ impl DriverConnection for FocasConnection {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::error!(task=%task_id, error=%e, "FOCAS2 读失败");
-                            return Err(SdkDriverError::new(forgelink_core_types::ErrorKind::Connection, "READ_FAILED", e));
+                            return Err(SdkDriverError::new(mesa_core_types::ErrorKind::Connection, "READ_FAILED", e));
                         }
                     };
                     if values.len() != points.len() {
@@ -356,7 +356,7 @@ impl DriverConnection for FocasConnection {
                 Err(join_err) => {
                     tracing::error!(%join_err, "FOCAS2 任务 panic");
                     if final_err.is_none() {
-                        final_err = Some(SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "TASK_PANIC", join_err.to_string()));
+                        final_err = Some(SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "TASK_PANIC", join_err.to_string()));
                     }
                 }
             }
@@ -388,7 +388,7 @@ fn coerce_value(v: Value, dt: DataType) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forgelink_core_types::{AcquisitionTask, DriverBinding, TaskMode};
+    use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
 
     fn task_with_items(items: serde_json::Value) -> AcquisitionTask {
         AcquisitionTask {

@@ -1,4 +1,4 @@
-//! ForgeLink Driver SDK（方案 §16）。
+//! Mesa Driver SDK（方案 §16）。
 //!
 //! SDK 承担 Driver 进程的全部通用职责：IPC、session token 认证、心跳应答、
 //! DataBatch 序列化与背压合并、Shutdown、父进程 liveness 防护。协议开发者只需
@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use forgelink_core_types::{
+use mesa_core_types::{
     ConnectionState, DataBatch, DriverMetadata, ErrorKind, PointDescriptor, PointMap,
 };
-use forgelink_driver_protocol::{
+use mesa_driver_protocol::{
     batch_to_pb, err_result, error_detail, ok_result, pb, read_envelope, tasks_from_pb,
     write_envelope, ConvertError, ProtocolError, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
@@ -122,7 +122,7 @@ pub trait DriverConnection: Send {
 }
 
 // 别名：AcquisitionTask 仅在 trait 签名中出现，保持与方案 §16 一致的命名可见性
-pub use forgelink_core_types::AcquisitionTask;
+pub use mesa_core_types::AcquisitionTask;
 
 // ---------------------------------------------------------------------------
 // DataSink：带 Latest-Wins 合并的发布端
@@ -301,7 +301,7 @@ pub fn spawn_parent_liveness_guard() {
                     Ok(_) => {}
                 }
             }
-            eprintln!("forgelink driver: parent liveness lost (stdin EOF), exiting");
+            eprintln!("Mesa driver: parent liveness lost (stdin EOF), exiting");
             std::process::exit(0);
         });
     if result.is_err() {
@@ -443,7 +443,7 @@ pub async fn serve_with_faults<D: Driver>(
     let instance_id = format!(
         "{}-{}",
         std::process::id(),
-        forgelink_core_types::now_unix_ns()
+        mesa_core_types::now_unix_ns()
     );
     let hello = pb::Envelope {
         msg_id: 1,
@@ -932,10 +932,10 @@ mod tests {
             connection_handle: 0,
             stream_epoch: 0,
             sequence: seq,
-            timestamp_ns: forgelink_core_types::now_unix_ns(),
-            values: vec![forgelink_core_types::PointValue::good(
+            timestamp_ns: mesa_core_types::now_unix_ns(),
+            values: vec![mesa_core_types::PointValue::good(
                 1,
-                forgelink_core_types::Value::F64(value),
+                mesa_core_types::Value::F64(value),
             )],
         }
     }
@@ -973,7 +973,7 @@ mod tests {
                 // Latest-Wins：只剩最新一批，值为该批的值
                 assert_eq!(b.sequence, 50);
                 assert_eq!(b.values.len(), 1);
-                assert_eq!(b.values[0].value, forgelink_core_types::Value::F64(50.0));
+                assert_eq!(b.values[0].value, mesa_core_types::Value::F64(50.0));
             }
             other => panic!("expected merged latest batch, got {other:?}"),
         }

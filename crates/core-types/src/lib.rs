@@ -1,4 +1,4 @@
-//! ForgeLink 核心数据类型。
+//! Mesa 核心数据类型。
 //!
 //! 本 crate 承载方案（§9–§11）中冻结的第一版 schema：ID、时间、Quality、Value、Task 模型。
 //! 这些类型是 Core 与所有 Driver 的共同契约，一经发布不得随意改动；演进必须以向后兼容的
@@ -202,7 +202,7 @@ pub struct PointValue {
     pub value: Value,
     #[serde(default = "default_quality")]
     pub quality: Quality,
-    /// 协议原生或 ForgeLink 原因码，无则 None。
+    /// 协议原生或 Mesa 原因码，无则 None。
     pub quality_code: Option<i32>,
     /// 设备/协议提供的原始时间戳；协议未提供则 None（消费方回退到 Batch 时间戳）。
     pub source_timestamp_ns: Option<TimestampNs>,

@@ -4,10 +4,10 @@
 
 use std::time::{Duration, Instant};
 
-use forgelink_core_types::{AcquisitionTask, DriverBinding, TaskMode};
-use forgelink_driver_manager::ForgeLinkManager;
-use forgelink_config_store::ConfigStore;
-use forgelink_driver_manager::StorePointIdSource;
+use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
+use mesa_driver_manager::MesaManager;
+use mesa_config_store::ConfigStore;
+use mesa_driver_manager::StorePointIdSource;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -19,7 +19,7 @@ async fn data_plane_50k_10s_ci() {
     let store = Arc::new(ConfigStore::open(std::path::Path::new(":memory:")).unwrap());
     let source = Arc::new(StorePointIdSource::new(store.clone()));
     let drivers_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../drivers");
-    let mgr = ForgeLinkManager::with_source(&drivers_dir, source);
+    let mgr = MesaManager::with_source(&drivers_dir, source);
     // 注册一个高吞吐 endpoint：Simulator burst 模拟
     let tasks: Vec<AcquisitionTask> = (0..4).map(|i| AcquisitionTask {
         id: format!("t{i}"),
@@ -33,7 +33,7 @@ async fn data_plane_50k_10s_ci() {
             }),
         },
     }).collect();
-    let ep = forgelink_driver_manager::endpoint::BuiltinEndpoint {
+    let ep = mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: "perf-50k".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),

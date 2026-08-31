@@ -1,4 +1,4 @@
-use forgelink_driver_opcua::{parse_address, NativeOpcUaApi, OpcUaApi};
+use mesa_driver_opcua::{parse_address, NativeOpcUaApi, OpcUaApi};
 
 #[tokio::main]
 async fn main() {

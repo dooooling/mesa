@@ -1,4 +1,4 @@
-param([string]$svcName="ForgeLink")
+param([string]$svcName="Mesa")
 if (Get-Service $svcName -ErrorAction SilentlyContinue) {
   Stop-Service $svcName -Force -ErrorAction SilentlyContinue
   sc.exe delete $svcName | Out-Null

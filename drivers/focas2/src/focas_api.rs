@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use forgelink_core_types::Value;
+use mesa_core_types::Value;
 
 use crate::address::{AxisKind, FocasAddress, SpindleKind, ToolKind};
 

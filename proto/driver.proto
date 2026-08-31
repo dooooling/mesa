@@ -1,4 +1,4 @@
-// ForgeLink Driver IPC V1（方案 §14）。
+// Mesa Driver IPC V1（方案 §14）。
 //
 // 传输形态为 127.0.0.1 TCP + Length-prefixed Protobuf；本文件是 Core 与 Driver 的
 // 消息契约真值来源。演进规则：同 Major 内新增消息/字段必须保持向后兼容；
@@ -11,7 +11,7 @@
 
 syntax = "proto3";
 
-package forgelink.driver.v1;
+package Mesa.driver.v1;
 
 message Envelope {
   // 关联 ID：请求方生成、响应原样带回。用于日志排障，不作为多路复用的路由键
@@ -83,7 +83,7 @@ message GenericResult {
 }
 
 // 统一错误类别 kind 取 core_types::ErrorKind::as_str()；
-// code 为协议原生或 ForgeLink 原因码（如 DUPLICATE_POINT_KEY），可为空。
+// code 为协议原生或 Mesa 原因码（如 DUPLICATE_POINT_KEY），可为空。
 message ErrorDetail {
   string kind = 1;
   string code = 2;

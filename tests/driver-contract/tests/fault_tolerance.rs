@@ -6,8 +6,8 @@ mod common;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use forgelink_driver_manager::session::{HeartbeatParams, Session};
-use forgelink_driver_sdk::SdkFaults;
+use mesa_driver_manager::session::{HeartbeatParams, Session};
+use mesa_driver_sdk::SdkFaults;
 
 use common::*;
 
@@ -52,8 +52,8 @@ async fn shutdown_message_ends_server_cleanly() {
     let cancel = tokio_util::sync::CancellationToken::new();
     let c = cancel.clone();
     let server = tokio::spawn(async move {
-        forgelink_driver_sdk::serve(
-            forgelink_driver_simulator::SimulatorDriver,
+        mesa_driver_sdk::serve(
+            mesa_driver_simulator::SimulatorDriver,
             listener,
             TOKEN.into(),
             c,
@@ -66,8 +66,8 @@ async fn shutdown_message_ends_server_cleanly() {
     // 会话可用性预检
     let _ = session.metadata().await.expect("metadata before shutdown");
 
-    use forgelink_driver_protocol::pb::envelope::Body;
-    session.post(Body::Shutdown(forgelink_driver_protocol::pb::Shutdown {})).await.unwrap();
+    use mesa_driver_protocol::pb::envelope::Body;
+    session.post(Body::Shutdown(mesa_driver_protocol::pb::Shutdown {})).await.unwrap();
 
     // serve 必须在宽限内干净返回
     let result = tokio::time::timeout(std::time::Duration::from_secs(3), server)

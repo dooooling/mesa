@@ -1,6 +1,6 @@
 [env]
-FORGELINK_HEARTBEAT_FAST = "1"
-FORGELINK_RECONNECT_FAST = "1"
+MESA_HEARTBEAT_FAST = "1"
+MESA_RECONNECT_FAST = "1"
 
 [alias]
-test-contract = "test -p forgelink-contract-tests -- --test-threads=1"
+test-contract = "test -p mesa-contract-tests -- --test-threads=1"

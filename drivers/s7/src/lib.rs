@@ -19,11 +19,11 @@ pub use codec::{decode_value, parse_data_type};
 use std::sync::Arc;
 use std::time::Duration;
 
-use forgelink_core_types::{
+use mesa_core_types::{
     ensure_unique_point_keys, AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey,
     PointDescriptor, PointMap, PointValue, TaskMode, Value, now_unix_ns,
 };
-use forgelink_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
+use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -108,7 +108,7 @@ impl DriverConnection for S7Connection {
                 .map_err(|e| SdkDriverError::configuration("INVALID_TASK", e.to_string()))?;
             if task.mode != TaskMode::Poll {
                 return Err(SdkDriverError::new(
-                    forgelink_core_types::ErrorKind::Unsupported,
+                    mesa_core_types::ErrorKind::Unsupported,
                     "MODE_NOT_SUPPORTED",
                     format!("task `{}`: s7 仅支持 poll", task.id),
                 ));
@@ -135,7 +135,7 @@ impl DriverConnection for S7Connection {
                 let dt_str = item.get("data_type").and_then(|v| v.as_str()).ok_or_else(|| SdkDriverError::configuration("INVALID_POINT", format!("point `{key}` 缺少 data_type")))?;
                 let addr = parse_address(addr_str).map_err(|e| match e {
                     AddressError::Empty => SdkDriverError::configuration("INVALID_ADDRESS", format!("point `{key}` 地址为空")),
-                    AddressError::Invalid { reason, .. } => SdkDriverError::new(forgelink_core_types::ErrorKind::Address, "INVALID_ADDRESS", format!("point `{key}` 地址 `{addr_str}` 非法: {reason}")),
+                    AddressError::Invalid { reason, .. } => SdkDriverError::new(mesa_core_types::ErrorKind::Address, "INVALID_ADDRESS", format!("point `{key}` 地址 `{addr_str}` 非法: {reason}")),
                 })?;
                 let (data_type, kind) = parse_data_type(dt_str)?;
                 // BOOL 必须带位
@@ -166,7 +166,7 @@ impl DriverConnection for S7Connection {
     }
 
     async fn apply_point_map(&mut self, map: PointMap) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_mut().ok_or_else(|| SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "NOT_CONFIGURED", "apply 在 configure 之前"))?;
+        let snap = self.plan.as_mut().ok_or_else(|| SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "NOT_CONFIGURED", "apply 在 configure 之前"))?;
         for p in &snap.points {
             if !map.contains_key(&p.key) {
                 return Err(SdkDriverError::configuration("MISSING_POINT_ID", format!("point `{}` 缺少映射", p.key)));
@@ -181,8 +181,8 @@ impl DriverConnection for S7Connection {
         sink: DataSink,
         shutdown: CancellationToken,
     ) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_ref().ok_or_else(|| SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "NO_PLAN", "run 前未 configure+apply"))?;
-        let map = snap.map.as_ref().ok_or_else(|| SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "NO_POINT_MAP", "run 前未 apply_point_map"))?;
+        let snap = self.plan.as_ref().ok_or_else(|| SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "NO_PLAN", "run 前未 configure+apply"))?;
+        let map = snap.map.as_ref().ok_or_else(|| SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "NO_POINT_MAP", "run 前未 apply_point_map"))?;
 
         // 建立 S7 会话（若失败则直接返回，由 Manager 按 §11.1 退避重连；PUT/GET 未启用等配置类错误直接 Failed）
         let mut client = S7Client::connect(self.cfg.clone()).await.map_err(|e| {
@@ -285,7 +285,7 @@ impl DriverConnection for S7Connection {
                 Err(join_err) => {
                     tracing::error!(%join_err, "S7 任务 panic");
                     if final_err.is_none() {
-                        final_err = Some(SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "TASK_PANIC", join_err.to_string()));
+                        final_err = Some(SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "TASK_PANIC", join_err.to_string()));
                     }
                 }
             }
@@ -304,7 +304,7 @@ impl DriverConnection for S7Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forgelink_core_types::{AcquisitionTask, DriverBinding, TaskMode};
+    use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
 
     fn task_with_items(items: serde_json::Value) -> AcquisitionTask {
         AcquisitionTask {
@@ -325,7 +325,7 @@ mod tests {
         let t = task_with_items(items);
         let descs = conn.configure(1, vec![t]).await.unwrap();
         assert_eq!(descs.len(), 2);
-        assert_eq!(descs[0].data_type, forgelink_core_types::DataType::F32);
+        assert_eq!(descs[0].data_type, mesa_core_types::DataType::F32);
         // 重复 key
         let dup = serde_json::json!([
             {"key":"a","address":"DB10.DBD0","data_type":"REAL"},

@@ -6,9 +6,9 @@ mod common;
 
 use std::collections::HashMap;
 
-use forgelink_core_types::{AcquisitionTask, PointDescriptor, TaskMode};
-use forgelink_driver_manager::session::Session;
-use forgelink_driver_protocol::pb;
+use mesa_core_types::{AcquisitionTask, PointDescriptor, TaskMode};
+use mesa_driver_manager::session::Session;
+use mesa_driver_protocol::pb;
 
 use common::*;
 
@@ -75,7 +75,7 @@ async fn invalid_config_returns_structured_error() {
         id: "t".into(),
         mode: TaskMode::Poll,
         interval_ms: Some(50),
-        binding: forgelink_core_types::DriverBinding {
+        binding: mesa_core_types::DriverBinding {
             kind: "s7.address-group".into(), // simulator 不支持
             config: serde_json::json!({}),
         },
@@ -91,8 +91,8 @@ async fn invalid_config_returns_structured_error() {
         id: "t".into(),
         mode: TaskMode::Subscribe,
         interval_ms: None,
-        binding: forgelink_core_types::DriverBinding {
-            kind: forgelink_driver_simulator::BINDING_KIND.into(),
+        binding: mesa_core_types::DriverBinding {
+            kind: mesa_driver_simulator::BINDING_KIND.into(),
             config: serde_json::json!({"points": [{"key":"x","kind":"constant","value":1}]}),
         },
     }];
@@ -111,11 +111,11 @@ async fn invalid_config_returns_structured_error() {
 
 async fn configure_tasks_expect_error(
     session: &mut Session,
-    events: &mut tokio::sync::mpsc::Receiver<forgelink_driver_manager::session::SessionEvent>,
-    tasks: &[forgelink_core_types::AcquisitionTask],
+    events: &mut tokio::sync::mpsc::Receiver<mesa_driver_manager::session::SessionEvent>,
+    tasks: &[mesa_core_types::AcquisitionTask],
     expected_code: &str,
 ) {
-    let tasks_pb = forgelink_driver_protocol::tasks_to_pb(tasks).unwrap();
+    let tasks_pb = mesa_driver_protocol::tasks_to_pb(tasks).unwrap();
     // 错误路径的响应是 DriverError 事件而非 PointDescriptors 帧
     let _ = session
         .call(pb::envelope::Body::ConfigureTasks(pb::ConfigureTasks {
@@ -131,12 +131,12 @@ async fn configure_tasks_expect_error(
 
 async fn expect_driver_error_with(
     _session: &Session,
-    events: &mut tokio::sync::mpsc::Receiver<forgelink_driver_manager::session::SessionEvent>,
+    events: &mut tokio::sync::mpsc::Receiver<mesa_driver_manager::session::SessionEvent>,
     _code: &str,
 ) -> (String, String, String) {
     for _ in 0..20 {
         match tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await {
-            Ok(Some(forgelink_driver_manager::session::SessionEvent::DriverError {
+            Ok(Some(mesa_driver_manager::session::SessionEvent::DriverError {
                 kind,
                 code,
                 message,
@@ -161,7 +161,7 @@ async fn duplicate_point_key_rejected_over_ipc() {
         poll_task("t1", 100, serde_json::json!({"points":[{"key":"same.key","kind":"counter"}]})),
         poll_task("t2", 100, serde_json::json!({"points":[{"key":"same.key","kind":"counter"}]})),
     ];
-    let tasks_pb = forgelink_driver_protocol::tasks_to_pb(&dup).unwrap();
+    let tasks_pb = mesa_driver_protocol::tasks_to_pb(&dup).unwrap();
     let _ = session
         .call(pb::envelope::Body::ConfigureTasks(pb::ConfigureTasks {
             connection_handle: H,
@@ -195,7 +195,7 @@ async fn failed_reconfigure_keeps_previous_snapshot() {
         40,
         serde_json::json!({"points":[{"key":"b.x","kind":"black_hole"}]}),
     )];
-    let tasks_pb = forgelink_driver_protocol::tasks_to_pb(&broken).unwrap();
+    let tasks_pb = mesa_driver_protocol::tasks_to_pb(&broken).unwrap();
     let _ = session
         .call(pb::envelope::Body::ConfigureTasks(pb::ConfigureTasks {
             connection_handle: H,
@@ -336,7 +336,7 @@ async fn multiple_connections_and_partial_failure_isolation() {
         50,
         serde_json::json!({"points":[{"key":"z","kind":"nope"}]}),
     )];
-    let tasks_pb = forgelink_driver_protocol::tasks_to_pb(&broken).unwrap();
+    let tasks_pb = mesa_driver_protocol::tasks_to_pb(&broken).unwrap();
     let _ = session
         .call(pb::envelope::Body::ConfigureTasks(pb::ConfigureTasks {
             connection_handle: HB,
@@ -403,14 +403,14 @@ async fn runtime_reconfigure_swaps_epoch_and_points() {
 
 /// 断言窗口期内没有任何批次到达。
 pub async fn assert_no_batches_for(
-    events: &mut tokio::sync::mpsc::Receiver<forgelink_driver_manager::session::SessionEvent>,
+    events: &mut tokio::sync::mpsc::Receiver<mesa_driver_manager::session::SessionEvent>,
     ms: u64,
 ) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout_at(deadline, events.recv()).await {
             Err(_) => return, // 超时即窗口内无事件
-            Ok(Some(forgelink_driver_manager::session::SessionEvent::Batch(b))) => {
+            Ok(Some(mesa_driver_manager::session::SessionEvent::Batch(b))) => {
                 panic!("expected quiet window, got batch seq {}", b.sequence)
             }
             Ok(Some(_)) => continue,

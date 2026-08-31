@@ -4,8 +4,8 @@
 
 ## 仓库现状（先读这个）
 
-- 设计文档：`ForgeLink_Driver_MVP_实施方案.md`（V1.4）是唯一事实来源，写任何代码前必须先读
-- **M0 最小可运行版本已落地**：workspace 骨架 + core-types + driver-protocol + driver-sdk + driver-manager + core-api + apps/forgelinkd + drivers/simulator
+- 设计文档：`Mesa_Driver_MVP_实施方案.md`（V1.4）是唯一事实来源，写任何代码前必须先读
+- **M0 最小可运行版本已落地**：workspace 骨架 + core-types + driver-protocol + driver-sdk + driver-manager + core-api + apps/mesad + drivers/simulator
 - 尚未 `git init`，无版本历史
 
 ## 常用命令（M0 已验证）
@@ -13,10 +13,10 @@
 ```bash
 cargo build --workspace                                             # 构建（含全部驱动 bin）
 cargo test --workspace                                              # 全部测试（当前 42 个，含 §21 全量 Contract Test）
-./target/release/forgelinkd                                         # 从 workspace 根启动（默认 drivers/ 目录 + 端口 8132）
+./target/release/mesad                                         # 从 workspace 根启动（默认 drivers/ 目录 + 端口 8132）
 ```
 
-注意：`cargo test -p forgelink-contract-tests` 只构建依赖包 lib，不重编驱动 bin；
+注意：`cargo test -p mesa-contract-tests` 只构建依赖包 lib，不重编驱动 bin；
 改过驱动代码后跑子进程类合同测试前，先 `cargo build --workspace`，否则旧二进制会让故障注入静默失效。
 
 验收入口：
@@ -30,9 +30,9 @@ Contract Test 基线（§21 全部 20 项）位于 `tests/driver-contract/tests/
 
 ## 项目是什么
 
-ForgeLink：工业设备统一采集平台 Driver MVP。Rust + Tokio + Protobuf IPC + SQLite。三类独立进程 Driver：S7（Siemens PLC）、FOCAS2（FANUC CNC）、OPC UA。
+Mesa：工业设备统一采集平台 Driver MVP。Rust + Tokio + Protobuf IPC + SQLite。三类独立进程 Driver：S7（Siemens PLC）、FOCAS2（FANUC CNC）、OPC UA。
 
-计划目录结构见文档 §23（10 个 crate 的 cargo workspace + `drivers/` + `apps/forgelinkd`）。
+计划目录结构见文档 §23（10 个 crate 的 cargo workspace + `drivers/` + `apps/mesad`）。
 
 ## 硬性设计约束（多轮评审的结论，违反即为架构错误）
 

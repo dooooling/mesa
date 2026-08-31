@@ -1,4 +1,4 @@
-//! ForgeLink Simulator Driver（方案附录 A）。
+//! Mesa Simulator Driver（方案附录 A）。
 //!
 //! 定位：Driver Framework 的参考实现与 Contract/Performance Test 基线，
 //! 不属于正式设备协议范围。行为配置属于测试配置，不进入生产 DeviceProfile。
@@ -32,11 +32,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use forgelink_core_types::{
+use mesa_core_types::{
     ensure_unique_point_keys, AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey,
     ErrorKind, PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, now_unix_ns,
 };
-use forgelink_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
+use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio_util::sync::CancellationToken;
 
 pub const BINDING_KIND: &str = "simulator.points";
@@ -50,7 +50,7 @@ impl Driver for SimulatorDriver {
     fn metadata(&self) -> DriverMetadata {
         DriverMetadata {
             driver_id: "simulator".into(),
-            name: "ForgeLink Simulator".into(),
+            name: "Mesa Simulator".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             // 与 drivers/simulator/driver.toml 保持一致
             protocol_major: 1,
@@ -556,7 +556,7 @@ fn faults_eq_default(f: ConnFaults) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forgelink_core_types::{AcquisitionTask, DriverBinding};
+    use mesa_core_types::{AcquisitionTask, DriverBinding};
 
     fn poll_task(id: &str, interval: u64, points: serde_json::Value) -> AcquisitionTask {
         AcquisitionTask {

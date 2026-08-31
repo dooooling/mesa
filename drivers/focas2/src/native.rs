@@ -547,7 +547,7 @@ impl NativeLib {
         #[cfg(target_os = "windows")]
         {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            for d in [cwd.join("drivers/focas2/libs/win"), cwd.join("drivers/focas2/libs"), std::env::temp_dir().join("forgelink_focas_embed")] {
+            for d in [cwd.join("drivers/focas2/libs/win"), cwd.join("drivers/focas2/libs"), std::env::temp_dir().join("mesa_focas_embed")] {
                 if d.is_dir() {
                     let cur = std::env::var("PATH").unwrap_or_default();
                     let s = d.to_string_lossy().to_string();
@@ -632,7 +632,7 @@ impl NativeLib {
 
     /// 单文件嵌入的 FOCAS 库解压到临时目录（带 OnceLock 缓存，10ms 级一次）
     /// - 将 `libs/win/*.dll` 与 `libs/linux/*.so` 以 `include_bytes!` 编进二进制，分发时单 `exe` 即可
-    /// - 运行时首次 `load()` 时解压至 `%TEMP%/forgelink_focas_<hash>` 并缓存 `PathBuf`，后续 `Library::new` 直连
+    /// - 运行时首次 `load()` 时解压至 `%TEMP%/mesa_focas_<hash>` 并缓存 `PathBuf`，后续 `Library::new` 直连
     /// - 无性能损失：解压后 `libloading` 同外置文件一致，后续 `cnc_*` 调用无代理
     fn embedded_dir() -> Option<PathBuf> {
         static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -673,7 +673,7 @@ impl NativeLib {
         const EMBEDDED: &[(&str, &[u8])] = &[];
 
         if EMBEDDED.is_empty() { return None; }
-        let dir = std::env::temp_dir().join("forgelink_focas_embed");
+        let dir = std::env::temp_dir().join("mesa_focas_embed");
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::warn!(%e, "创建嵌入临时目录失败");
             return None;

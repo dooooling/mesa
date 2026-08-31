@@ -1,7 +1,7 @@
-ForgeLink 统一流程（控制台可读）
+Mesa 统一流程（控制台可读）
 
 [1] 启动
-    forgelinkd --db forgelink_real.db --http-port 8139
+    Mesad --db mesa_real.db --http-port 8139
       -> DriverManager::discover 扫 drivers/*/driver.toml (s7/focas2/sim)
       -> ConfigStore SQLite 建表 + 恢复 desired_running
 

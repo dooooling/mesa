@@ -3,9 +3,9 @@
 //! - Core `DataType` 是对外契约；S7 侧 `S7Kind` 决定线缆字节长度与解码方式。
 //! - 字符串 `"REAL"/"REAL[]"` 等大小写不敏感；同时兼容 Core 已有的 `f32`/`f64` 写法。
 
-use forgelink_core_types::{DataType, Value};
-use forgelink_driver_sdk::SdkDriverError;
-use forgelink_core_types::ErrorKind;
+use mesa_core_types::{DataType, Value};
+use mesa_driver_sdk::SdkDriverError;
+use mesa_core_types::ErrorKind;
 
 /// S7 侧的细分类型（决定字节长度与字节序）。
 ///

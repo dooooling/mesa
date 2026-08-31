@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use forgelink_core_types::Value;
+use mesa_core_types::Value;
 
 use crate::address::OpcUaAddress;
 
@@ -339,8 +339,8 @@ pub(crate) fn variant_to_value(v: &Variant) -> Option<Value> {
         _ => Some(Value::String(format!("{:?}", v))),
     }
 }
-pub(crate) fn status_to_quality(sc: opcua_types::StatusCode) -> forgelink_core_types::Quality {
-    use forgelink_core_types::Quality;
+pub(crate) fn status_to_quality(sc: opcua_types::StatusCode) -> mesa_core_types::Quality {
+    use mesa_core_types::Quality;
     if sc.is_good() { Quality::Good }
     else if sc.is_uncertain() { Quality::Uncertain }
     else { Quality::Bad }
@@ -373,14 +373,14 @@ impl NativeOpcUaApi {
     }
 
     fn default_pki_dir() -> std::path::PathBuf {
-        std::env::var("FORGELINK_OPCUA_PKI_DIR")
+        std::env::var("MESA_OPCUA_PKI_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("data/certificates/opcua"))
     }
 
     fn resolve_pki_dir(&self) -> std::path::PathBuf {
-        // 若 self.pki_dir 为默认占位且环境变量已设置，优先环境变量（便于 forgelinkd 透传）
-        if let Ok(env) = std::env::var("FORGELINK_OPCUA_PKI_DIR") {
+        // 若 self.pki_dir 为默认占位且环境变量已设置，优先环境变量（便于 Mesad 透传）
+        if let Ok(env) = std::env::var("MESA_OPCUA_PKI_DIR") {
             let env_p = std::path::PathBuf::from(env);
             // 若实例 pki_dir 非默认（显式传入），保持显式；否则用环境变量
             let def = std::path::PathBuf::from("data/certificates/opcua");
@@ -407,11 +407,11 @@ impl NativeOpcUaApi {
 
     async fn connect_inner(&self, endpoint_url: &str, timeout_ms: u64) -> Result<Arc<Session>, String> {
         let timeout = Duration::from_millis(timeout_ms);
-        // pki_dir：优先环境变量 FORGELINK_OPCUA_PKI_DIR（与 Core CertStore 同值），否则 data/certificates/opcua；显式 pki_dir 由上层通过 NativeOpcUaApi::new_with_pki_dir 注入
+        // pki_dir：优先环境变量 MESA_OPCUA_PKI_DIR（与 Core CertStore 同值），否则 data/certificates/opcua；显式 pki_dir 由上层通过 NativeOpcUaApi::new_with_pki_dir 注入
         let pki_dir = self.resolve_pki_dir();
         let mut client = ClientBuilder::new()
-            .application_name("ForgeLink OPC UA")
-            .application_uri("urn:forgelink:opcua")
+            .application_name("Mesa OPC UA")
+            .application_uri("urn:Mesa:opcua")
             .pki_dir(pki_dir)
             .certificate_path("own/own.der")
             .private_key_path("own/own.key")

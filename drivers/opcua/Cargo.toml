@@ -1,20 +1,20 @@
 [package]
-name = "forgelink-driver-opcua"
+name = "mesa-driver-opcua"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "forgelink_driver_opcua"
+name = "mesa_driver_opcua"
 path = "src/lib.rs"
 
 [[bin]]
-name = "forgelink-driver-opcua"
+name = "mesa-driver-opcua"
 path = "src/main.rs"
 
 [dependencies]
-forgelink-core-types = { workspace = true }
-forgelink-driver-sdk = { workspace = true }
+mesa-core-types = { workspace = true }
+mesa-driver-sdk = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

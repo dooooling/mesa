@@ -92,12 +92,12 @@ pub fn scan_drivers(root: &Path) -> Vec<DiscoveredDriver> {
             tracing::warn!(id = %manifest.id, v = %manifest.version, "version is not x.y.z, skipped");
             continue;
         }
-        let protocol_ok = manifest.protocol_major == forgelink_driver_protocol::PROTOCOL_MAJOR;
+        let protocol_ok = manifest.protocol_major == mesa_driver_protocol::PROTOCOL_MAJOR;
         if !protocol_ok {
             tracing::warn!(
                 id = %manifest.id,
                 declared = manifest.protocol_major,
-                expected = forgelink_driver_protocol::PROTOCOL_MAJOR,
+                expected = mesa_driver_protocol::PROTOCOL_MAJOR,
                 "protocol major mismatch"
             );
         }
@@ -198,7 +198,7 @@ protocol_minor = 0
 os = ["{}"]
 arch = ["{}"]
 "#,
-                forgelink_driver_protocol::PROTOCOL_MAJOR,
+                mesa_driver_protocol::PROTOCOL_MAJOR,
                 std::env::consts::OS,
                 std::env::consts::ARCH
             ),

@@ -1,4 +1,4 @@
-//! ForgeLink Driver IPC 协议层（方案 §14）。
+//! Mesa Driver IPC 协议层（方案 §14）。
 //!
 //! 职责：proto 生成的消息类型、Length-prefixed framing、协议版本协商、
 //! 以及 core-types 与 protobuf 消息之间的双向转换。Core 与 SDK 共用本 crate，
@@ -6,11 +6,11 @@
 
 /// prost 生成的类型。字段命名与 proto/driver.proto 一一对应。
 pub mod pb {
-    include!(concat!(env!("OUT_DIR"), "/forgelink.driver.v1.rs"));
+    include!(concat!(env!("OUT_DIR"), "/Mesa.driver.v1.rs"));
 }
 
 use bytes::{BufMut, BytesMut};
-use forgelink_core_types::{
+use mesa_core_types::{
     AcquisitionTask, ConnectionState, DataBatch, DataType, DriverBinding, ErrorKind,
     PointDescriptor, PointValue, Quality, TaskMode, UnknownDataType, Value,
 };

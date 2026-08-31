@@ -1,11 +1,11 @@
-# ForgeLink 统一流程图（S7 / FOCAS2 / OPC UA）
+# Mesa 统一流程图（S7 / FOCAS2 / OPC UA）
 
 > VS Code 安装 `Markdown Preview Mermaid Support` 后可直接预览；或在 https://mermaid.live 粘贴查看。
 > 控制台请看下方 ASCII 或 `docs/flowchart.txt`
 
 ```mermaid
 flowchart TD
-  A[forgelinkd 启动] --> B[DriverManager discover<br/>drivers/*.toml]
+  A[Mesad 启动] --> B[DriverManager discover<br/>drivers/*.toml]
   B --> C[ConfigStore SQLite 恢复 desired_running]
   C --> D[REST POST /devices /endpoints]
   D --> E[POST /tasks 全量快照 revision++ point_id 分配]

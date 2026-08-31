@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use forgelink_core_types::{ensure_unique_point_keys, ConnectionState, DataBatch, PointDefinition, PointDescriptor};
-use forgelink_driver_protocol::pb;
+use mesa_core_types::{ensure_unique_point_keys, ConnectionState, DataBatch, PointDefinition, PointDescriptor};
+use mesa_driver_protocol::pb;
 use tokio_util::sync::CancellationToken;
 
 use crate::manifest::DiscoveredDriver;
@@ -23,23 +23,23 @@ use crate::session::{Session, SessionEvent};
 use crate::snapshot::{EndpointStatus, Snapshot};
 
 /// 连接级退避序列（§11.1 默认值）。当前不做上限熔断，成功后归零。
-/// 测试时 `FORGELINK_RECONNECT_FAST=1` 缩短为 1s 固定，避免 30s/60s 阻塞。
+/// 测试时 `MESA_RECONNECT_FAST=1` 缩短为 1s 固定，避免 30s/60s 阻塞。
 fn reconnect_backoff_secs(idx: usize) -> u64 {
-    if std::env::var("FORGELINK_RECONNECT_FAST").ok().as_deref() == Some("1") {
+    if std::env::var("MESA_RECONNECT_FAST").ok().as_deref() == Some("1") {
         return 1;
     }
     const RECONNECT_BACKOFF_SECS: [u64; 5] = [1, 2, 5, 10, 30];
     RECONNECT_BACKOFF_SECS[idx.min(RECONNECT_BACKOFF_SECS.len() - 1)]
 }
 
-/// 内置端点配置：空库演示时由 forgelinkd 硬编码注入，当前优先 ConfigStore 构造；硬编码仅用于空库演示
+/// 内置端点配置：空库演示时由 Mesad 硬编码注入，当前优先 ConfigStore 构造；硬编码仅用于空库演示
 #[derive(Debug, Clone)]
 pub struct BuiltinEndpoint {
     pub endpoint_id: String,
     pub driver_id: String,
     /// Endpoint.connection 的 JSON 序列化，语义由 Driver 解释。
     pub connection_json: String,
-    pub tasks: Vec<forgelink_core_types::AcquisitionTask>,
+    pub tasks: Vec<mesa_core_types::AcquisitionTask>,
 }
 
 // ---------------------------------------------------------------------------
@@ -112,11 +112,11 @@ impl PointIdSource for PointIdAllocator {
 
 /// 持久版分配器：委托 `ConfigStore`（含 tombstone 语义）。
 pub struct StorePointIdSource {
-    store: Arc<forgelink_config_store::ConfigStore>,
+    store: Arc<mesa_config_store::ConfigStore>,
 }
 
 impl StorePointIdSource {
-    pub fn new(store: Arc<forgelink_config_store::ConfigStore>) -> Self {
+    pub fn new(store: Arc<mesa_config_store::ConfigStore>) -> Self {
         Self { store }
     }
 }
@@ -339,7 +339,7 @@ async fn run_config_flow(
 
     let parsed: Vec<PointDescriptor> = descriptors_pb
         .into_iter()
-        .map(forgelink_driver_protocol::descriptor_from_pb)
+        .map(mesa_driver_protocol::descriptor_from_pb)
         .collect::<Result<_, _>>()
         .map_err(|e| AttemptOutcome::ConfigurationFailed(e.to_string()))?;
     ensure_unique_point_keys(&parsed).map_err(|e| AttemptOutcome::ConfigurationFailed(e.to_string()))?;
@@ -431,7 +431,7 @@ async fn event_loop(
 // ---- 小工具 ----
 
 fn tasks_to_pb_checked(cfg: &BuiltinEndpoint) -> Result<Vec<pb::AcquisitionTaskProto>, AttemptOutcome> {
-    forgelink_driver_protocol::tasks_to_pb(&cfg.tasks)
+    mesa_driver_protocol::tasks_to_pb(&cfg.tasks)
         .map_err(|e| AttemptOutcome::ConfigurationFailed(e.to_string()))
 }
 
@@ -475,7 +475,7 @@ fn lost(reason: impl Into<String>) -> AttemptOutcome {
 
 static EPOCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn new_stream_epoch() -> u64 {
-    let n = forgelink_core_types::now_unix_ns() as u64;
+    let n = mesa_core_types::now_unix_ns() as u64;
     let pid = std::process::id() as u64;
     let c = EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed);
     n ^ (pid << 32) ^ c.wrapping_mul(0x9E37_79B9_7F4A_7C15)

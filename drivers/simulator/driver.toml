@@ -1,8 +1,8 @@
 # Simulator 是 Contract/Performance Test 的基线驱动，不属于正式设备协议范围（方案附录 A）。
 id = "simulator"
-name = "ForgeLink Simulator"
+name = "Mesa Simulator"
 version = "0.1.0"
-executable = "forgelink-driver-simulator"
+executable = "Mesa-driver-simulator"
 protocol_major = 1
 protocol_minor = 0
 sdk = "rust"

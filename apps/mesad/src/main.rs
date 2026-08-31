@@ -1,18 +1,18 @@
-//! forgelinkd：ForgeLink Core 的唯一运行入口（方案 §25）。
+//! Mesad：Mesa Core 的唯一运行入口（方案 §25）。
 //!
 //! SQLite 配置持久化 + REST CRUD + 开机恢复（配置真值只在 Core）。`sim-001` 仅在空库时作为演示种子
 //! 后续以库为准（配置真值只在 Core）。
 
 use std::sync::Arc;
 
-use forgelink_config_store::{ConfigStore, DeviceRecord, EndpointRecord};
-use forgelink_core_types::{AcquisitionTask, DriverBinding, TaskMode};
-use forgelink_driver_manager::StorePointIdSource;
+use mesa_config_store::{ConfigStore, DeviceRecord, EndpointRecord};
+use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
+use mesa_driver_manager::StorePointIdSource;
 
 /// 默认 HTTP 端口。仅 loopback 可见（§4.2）。
 const DEFAULT_HTTP_PORT: u16 = 8132;
 /// 默认库路径（workspace 根下）。
-const DEFAULT_DB_PATH: &str = "forgelink.db";
+const DEFAULT_DB_PATH: &str = "mesa.db";
 
 #[tokio::main]
 async fn main() {
@@ -26,7 +26,7 @@ async fn main() {
     let args = parse_args();
     let drivers_dir = std::path::PathBuf::from(&args.drivers_dir);
     let db_path = std::path::PathBuf::from(&args.db_path);
-    tracing::info!(dir = %drivers_dir.display(), db = %db_path.display(), "starting forgelinkd");
+    tracing::info!(dir = %drivers_dir.display(), db = %db_path.display(), "starting mesad");
 
     // ---- ConfigStore ----
     let store = match ConfigStore::open(&db_path) {
@@ -44,7 +44,7 @@ async fn main() {
 
     // ---- DriverManager（持久版 ID 源）----
     let source = Arc::new(StorePointIdSource::new(store.clone()));
-    let manager = Arc::new(forgelink_driver_manager::ForgeLinkManager::with_source(
+    let manager = Arc::new(mesa_driver_manager::MesaManager::with_source(
         &drivers_dir,
         source,
     ));
@@ -59,7 +59,7 @@ async fn main() {
             continue;
         }
         let tasks = store.list_tasks(&rec.id).unwrap_or_default();
-        let cfg = forgelink_driver_manager::endpoint::BuiltinEndpoint {
+        let cfg = mesa_driver_manager::endpoint::BuiltinEndpoint {
             endpoint_id: rec.id.clone(),
             driver_id: rec.driver_id.clone(),
             connection_json: rec.connection_json.clone(),
@@ -73,16 +73,16 @@ async fn main() {
 
     // ---- REST 服务 ----
     // 注入 OPC UA pki_dir 环境（优先级：已有 env > 默认），供 Native 驱动子进程继承
-    if std::env::var("FORGELINK_OPCUA_PKI_DIR").is_err() {
-        let pki = forgelink_core_api::certificates::CertStore::default_path();
+    if std::env::var("MESA_OPCUA_PKI_DIR").is_err() {
+        let pki = mesa_core_api::certificates::CertStore::default_path();
         // 安全性：早期启动单线程，环境变量写入无数据竞争
-        unsafe { std::env::set_var("FORGELINK_OPCUA_PKI_DIR", &pki); }
-        tracing::info!(pki=%pki.display(), "set FORGELINK_OPCUA_PKI_DIR");
+        unsafe { std::env::set_var("MESA_OPCUA_PKI_DIR", &pki); }
+        tracing::info!(pki=%pki.display(), "set MESA_OPCUA_PKI_DIR");
     }
 
-    let app_state = forgelink_core_api::AppState::new(manager.clone(), store.clone(), args.drivers_dir.clone());
+    let app_state = mesa_core_api::AppState::new(manager.clone(), store.clone(), args.drivers_dir.clone());
     let api_shutdown = manager.shutdown_token().child_token();
-    let api = tokio::spawn(forgelink_core_api::serve(app_state, args.http_port, api_shutdown));
+    let api = tokio::spawn(mesa_core_api::serve(app_state, args.http_port, api_shutdown));
 
     print_banner(args.http_port, &args.db_path);
 
@@ -135,7 +135,7 @@ fn parse_args() -> Args {
 
 fn print_banner(http_port: u16, db_path: &str) {
     eprintln!();
-    eprintln!("  ForgeLink Core is running");
+    eprintln!("  Mesa Core is running");
     eprintln!("  REST  : http://127.0.0.1:{http_port}/api/v1/drivers");
     eprintln!("          http://127.0.0.1:{http_port}/api/v1/endpoints");
     eprintln!("          http://127.0.0.1:{http_port}/api/v1/points/latest");
@@ -176,7 +176,7 @@ fn maybe_seed_demo(store: &ConfigStore) -> Result<bool, String> {
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
         desired_running: true,
-        updated_at_ns: forgelink_core_types::now_unix_ns(),
+        updated_at_ns: mesa_core_types::now_unix_ns(),
     };
     match store.create_endpoint(&rec) {
         Ok(()) => {}

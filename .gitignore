@@ -9,9 +9,9 @@
 .vscode/
 
 # 本地运行时数据库（ConfigStore/SQLite）
-forgelink*.db
-forgelink*.db-wal
-forgelink*.db-shm
+mesa*.db
+mesa*.db-wal
+mesa*.db-shm
 *.db-wal
 *.db-shm
 
@@ -20,7 +20,7 @@ forgelink*.db-shm
 /certificates/
 
 # Driver 构建产物（cargo build 产于 target，drivers/ 下为 QEMU/本地调试拷贝，勿入仓）
-drivers/*/forgelink-driver-*
+drivers/*/mesa-driver-*
 drivers/simulator/*.d
 drivers/s7/*.d
 drivers/focas2/*.d
@@ -28,6 +28,6 @@ drivers/opcua/*.d
 
 # 临时 ARM/性能产物
 /target
-/aarch64-forgelinkd
+/aarch64-mesad
 /arm_test.sh
 /arm_s7*.sh

@@ -1,6 +1,6 @@
 # OPC UA Gate 闭环文档（§19.3 §7.3）
 
-> 依据 `ForgeLink_Driver_MVP_实施方案.md §19.3 §7.3`，OPC UA 生产发布前必须闭环证书信任、SecurityPolicy、Poll/Subscribe 双路径与真机兼容矩阵。V1 严格只读，不引入写路径。
+> 依据 `mesa_Driver_MVP_实施方案.md §19.3 §7.3`，OPC UA 生产发布前必须闭环证书信任、SecurityPolicy、Poll/Subscribe 双路径与真机兼容矩阵。V1 严格只读，不引入写路径。
 
 ## 1. 访问范式
 
@@ -17,7 +17,7 @@
 - **目录** `data/certificates/opcua/{own,trusted,issuers,rejected,private}` 与 `async-opcua pki_dir` 兼容：
   - `own/own.der + own.pem + own.key` 双写 `own/cert.der + private/private.pem` 供 `ClientBuilder::certificate_path/private_key_path` 复用
   - `own.key 0o600`
-- **pki_dir 解析** `connection_json.pki_dir > env FORGELINK_OPCUA_PKI_DIR > data/certificates/opcua`，`forgelinkd` 启动时若 env 未设则注入默认（子进程继承）
+- **pki_dir 解析** `connection_json.pki_dir > env MESA_OPCUA_PKI_DIR > data/certificates/opcua`，`Mesad` 启动时若 env 未设则注入默认（子进程继承）
 - **SecurityPolicy** `None/Basic128Rsa15/Basic256/Basic256Sha256/Aes128_Sha256_RsaOaep/Aes256_Sha256_RsaPss`，`MessageSecurityMode None/Sign/SignAndEncrypt` 均透传校验，非法直接 `BAD_CONFIG`
 - **禁止默认忽略校验**：`ClientBuilder::trust_server_certs(false) verify_server_certs(true) create_sample_keypair(false)`。`None` 安全策略下自签 `python` 仍可 `connect OK`；`Sign/SignAndEncrypt` 未知证书首次落 `rejected/`，需 `POST /api/v1/certificates/opcua/rejected/{thumb}/trust` 人工迁移至 `trusted/` 后重连
 
@@ -27,7 +27,7 @@ REST：`GET /certificates/opcua/{own,trusted,issuers,rejected} /diagnostics` `PO
 
 | Server | 地址 | Security | 路径 | 结果 | 备注 |
 |---|---|---|---|---|---|
-| **Fake** | `opc.tcp://127.0.0.1:4840` | `None` | `Poll/Sub/Browse 8134 4点 Poll/Sub/Browse 300ms` | ✅ `8134 ep-opc 4点 objs i=85.Child1 cnt 948 speed 308.5 sub_cnt 209` `Fake 11 passed` `Browse Poll Sub KeepAlive7不产批` | `forgelinkd 8134 opcua_browse.db` |
+| **Fake** | `opc.tcp://127.0.0.1:4840` | `None` | `Poll/Sub/Browse 8134 4点 Poll/Sub/Browse 300ms` | ✅ `8134 ep-opc 4点 objs i=85.Child1 cnt 948 speed 308.5 sub_cnt 209` `Fake 11 passed` `Browse Poll Sub KeepAlive7不产批` | `Mesad 8134 opcua_browse.db` |
 | **UA-.NETStandard Reference** `ghcr.io/php-opcua/uanetstandard-test-suite` | `opc.tcp://127.0.0.1:4840/UA/TestServer` `4843 AllSecurity` | `None/SignAndEncrypt` | `Poll BulkRead Sub DataChange Browse` | ⏳ `docker pull timeout 120s 本机外网受限，代码 44/44 已就绪待 4840/4843 真测` | `Reference 300节点 12方法` `假脱机待补` |
 | **python asyncua** `0.19` | `opc.tcp://127.0.0.1:4840/freeopcua/server/` `ns=2` | `None` | `Poll Native BulkRead` + `Subscribe` | ✅ `8190 Poll RUNNING Sub KeepAlive` `c2e6a7a` | 历史验证 |
 | **ProSys/open62541/硬件** | — | — | — | 未启 | `ProSys Certified` `open62541 1.4 Docker` 可替 `Reference` |

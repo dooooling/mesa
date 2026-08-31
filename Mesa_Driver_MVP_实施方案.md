@@ -1,11 +1,11 @@
-# ForgeLink 统一工业设备采集平台 Driver MVP 开发实施方案
+# Mesa 统一工业设备采集平台 Driver MVP 开发实施方案
 
 **版本：V1.4**  
 **范围：S7 / FOCAS2 / OPC UA**
 
 ## 1. 目标与边界
 
-ForgeLink V1 只解决一个问题：
+Mesa V1 只解决一个问题：
 
 > **通过统一驱动框架接入多品牌、多型号、多设备，并持续、稳定地获得实时设备数据。**
 
@@ -48,7 +48,7 @@ V1 定位为**实时状态采集**，不承诺每一次采样均无损保存。M
                        REST API / CLI
                               │
 ┌──────────────────────────────────────────────────────────┐
-│                     ForgeLink Core                       │
+│                     Mesa Core                       │
 │                                                          │
 │ ConfigStore(SQLite)    DeviceManager                     │
 │ DriverManager          EndpointManager                   │
@@ -520,7 +520,7 @@ UNCERTAIN
 BAD
 ```
 
-同时允许附加可选 `quality_code` 保存协议原生或 ForgeLink 原因码。
+同时允许附加可选 `quality_code` 保存协议原生或 Mesa 原因码。
 
 默认映射：
 
@@ -775,7 +775,7 @@ V1 必须同时实现两层保护：
 ```text
 drivers/s7/
 ├── driver.toml
-└── forgelink-driver-s7[.exe]
+└── Mesa-driver-s7[.exe]
 ```
 
 最小 `driver.toml`：
@@ -784,7 +784,7 @@ drivers/s7/
 id = "s7"
 name = "Siemens S7"
 version = "0.1.0"
-executable = "forgelink-driver-s7"
+executable = "Mesa-driver-s7"
 protocol_major = 1
 protocol_minor = 0
 sdk = "rust"
@@ -1028,7 +1028,7 @@ Simulator Driver 必须首先完整通过 Contract Test，后续 S7/FOCAS2/OPC U
 ## 23. 项目目录
 
 ```text
-forgelink/
+Mesa/
 ├── crates/
 │   ├── core-types/
 │   ├── driver-protocol/
@@ -1053,8 +1053,8 @@ forgelink/
 │   └── opcua/
 │
 ├── apps/
-│   ├── forgelinkd/        # console/service entry
-│   └── forgelink-cli/
+│   ├── Mesad/        # console/service entry
+│   └── Mesa-cli/
 │
 ├── packaging/
 │   ├── windows-service/
@@ -1087,13 +1087,13 @@ forgelink/
 
 ## 25. 部署与服务化预留
 
-V1 运行入口统一为 `apps/forgelinkd`。
+V1 运行入口统一为 `apps/Mesad`。
 
 部署目标：
 
 - Windows：支持作为 Windows Service 运行，预留 install/start/stop/uninstall 包装脚本或 service wrapper；所有 Driver 加入启用 `KILL_ON_JOB_CLOSE` 的 Job Object；
 - Linux：提供对应 systemd unit；Driver 启动时设置 `PR_SET_PDEATHSIG`；
-- Driver 子进程必须由 `forgelinkd` 创建并纳入同一生命周期管理，同时持续监控父进程 liveness pipe；Core 优雅退出、崩溃或被强杀均不得遗留孤儿 Driver；
+- Driver 子进程必须由 `Mesad` 创建并纳入同一生命周期管理，同时持续监控父进程 liveness pipe；Core 优雅退出、崩溃或被强杀均不得遗留孤儿 Driver；
 - 日志默认写 stdout/stderr，由部署层负责轮转：Linux 优先使用 journald/systemd 的保留策略；Windows Service 如落文件必须启用大小/数量受限的 rolling log，禁止无限增长单一日志文件。
 
 V1 不要求远程编排、容器化或集群部署，但服务化运行、孤儿进程清理和日志有界增长必须纳入安装包与 Soak Test。
@@ -1120,7 +1120,7 @@ V1 不要求远程编排、容器化或集群部署，但服务化运行、孤�
 16. 运行中 Task 变更必须走 Stop->Configure->ApplyPointMap->Start，并生成新 `stream_epoch`。
 17. OPC UA KeepAlive 能刷新连接健康度但不产生空 DataBatch。
 18. 在 **Driver Protocol 主版本兼容且新增能力为可选扩展** 的前提下，新增 Driver 不需要修改或重新编译 Core。
-19. `forgelinkd` 可作为 Windows Service/Linux systemd 服务运行；无论优雅退出还是 Core 被强杀，Driver 均不得成为孤儿进程或继续持有设备连接。
+19. `Mesad` 可作为 Windows Service/Linux systemd 服务运行；无论优雅退出还是 Core 被强杀，Driver 均不得成为孤儿进程或继续持有设备连接。
 20. OPC UA Trusted/Rejected Certificate 的最小查看、导入、删除、信任操作可通过 Core REST API/CLI 完成。
 21. Driver Manifest 可选 `os/arch` 能阻止不匹配平台的二进制被启动；Driver rescan 能刷新发现目录但不得热替换运行中进程。
 22. Driver Crash Restore Contract Test 通过：Point ID 稳定、配置恢复完整、恢复后使用新 `stream_epoch`。
@@ -1167,14 +1167,14 @@ OPC UA Node / Notification
         ↓
 Stable Point ID + Typed Value + Quality + Timestamp
         ↓
-    ForgeLink Core
+    Mesa Core
 ```
 
 ---
 
 ## 28. 关键工程结论
 
-ForgeLink V1 不追求协议数量，而是用三类访问范式验证驱动框架：
+Mesa V1 不追求协议数量，而是用三类访问范式验证驱动框架：
 
 ```text
 S7      -> Address / Memory

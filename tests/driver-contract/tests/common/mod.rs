@@ -11,11 +11,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use forgelink_core_types::{AcquisitionTask, DriverBinding, PointDescriptor, TaskMode};
-use forgelink_driver_manager::session::{Session, SessionEvent, SessionError};
-use forgelink_driver_protocol::pb;
-use forgelink_driver_sdk::{SdkFaults, serve_with_faults};
-use forgelink_driver_simulator::SimulatorDriver;
+use mesa_core_types::{AcquisitionTask, DriverBinding, PointDescriptor, TaskMode};
+use mesa_driver_manager::session::{Session, SessionEvent, SessionError};
+use mesa_driver_protocol::pb;
+use mesa_driver_sdk::{SdkFaults, serve_with_faults};
+use mesa_driver_simulator::SimulatorDriver;
 use tokio_util::sync::CancellationToken;
 
 pub const TOKEN: &str = "contract-test-token";
@@ -39,14 +39,14 @@ pub fn repo_root() -> PathBuf {
 
 /// 已构建的 simulator 可执行文件路径。
 ///
-/// NOTE(cargo 行为): `cargo test -p forgelink-contract-tests` 只构建依赖包的 lib，
+/// NOTE(cargo 行为): `cargo test -p mesa-contract-tests` 只构建依赖包的 lib，
 /// **不会**重编 simulator 的 bin。子进程类测试前若改过驱动代码，
-/// 必须先 `cargo build -p forgelink-driver-simulator`（或 `--workspace`），
+/// 必须先 `cargo build -p Mesa-driver-simulator`（或 `--workspace`），
 /// 否则拉起的是旧二进制、故障注入不生效。
 pub fn sim_exe() -> PathBuf {
     let target = repo_root().join("target");
     for profile in ["debug", "release"] {
-        for name in ["forgelink-driver-simulator.exe", "forgelink-driver-simulator"] {
+        for name in ["Mesa-driver-simulator.exe", "Mesa-driver-simulator"] {
             let p = target.join(profile).join(&name);
             if p.is_file() {
                 return p;
@@ -96,7 +96,7 @@ pub fn poll_task(id: &str, interval_ms: u64, points: serde_json::Value) -> Acqui
         mode: TaskMode::Poll,
         interval_ms: Some(interval_ms),
         binding: DriverBinding {
-            kind: forgelink_driver_simulator::BINDING_KIND.into(),
+            kind: mesa_driver_simulator::BINDING_KIND.into(),
             config: points,
         },
     }
@@ -129,7 +129,7 @@ pub async fn configure_tasks(
     revision: u64,
     tasks: &[AcquisitionTask],
 ) -> Vec<PointDescriptor> {
-    let tasks_pb = forgelink_driver_protocol::tasks_to_pb(tasks).expect("tasks to pb");
+    let tasks_pb = mesa_driver_protocol::tasks_to_pb(tasks).expect("tasks to pb");
     let reply = session
         .call(pb::envelope::Body::ConfigureTasks(pb::ConfigureTasks {
             connection_handle: handle,
@@ -244,7 +244,7 @@ pub async fn configure_and_start(
 /// 在 deadline 内收取一个批次；超时 panic。
 /// State/DriverError 事件被静默跳过——断言错误事件用 [`expect_driver_error`]，
 /// 这里只关心数据面。
-pub async fn recv_batch(events: &mut tokio::sync::mpsc::Receiver<SessionEvent>, secs: u64) -> forgelink_core_types::DataBatch {
+pub async fn recv_batch(events: &mut tokio::sync::mpsc::Receiver<SessionEvent>, secs: u64) -> mesa_core_types::DataBatch {
     let deadline = std::time::Instant::now() + Duration::from_secs(secs);
     loop {
         let remain = deadline.saturating_duration_since(std::time::Instant::now());

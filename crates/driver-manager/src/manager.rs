@@ -15,7 +15,7 @@ struct RunningEntry {
     handle: tokio::task::JoinHandle<()>,
 }
 
-pub struct ForgeLinkManager {
+pub struct MesaManager {
     drivers: RwLock<Vec<DiscoveredDriver>>,
     snapshot: Arc<Snapshot>,
     source: Arc<dyn PointIdSource>,
@@ -23,13 +23,13 @@ pub struct ForgeLinkManager {
     shutdown: CancellationToken,
 }
 
-impl ForgeLinkManager {
+impl MesaManager {
     /// 扫描驱动目录并填充快照中的驱动清单（使用内存版 ID 源，兼容 M0/Contract Test）。
     pub fn discover(drivers_dir: &Path) -> Self {
         Self::with_source(drivers_dir, Arc::new(PointIdAllocator::default()))
     }
 
-    /// 使用指定 [`PointIdSource`] 创建 Manager（forgelinkd 传入持久版）。
+    /// 使用指定 [`PointIdSource`] 创建 Manager（Mesad 传入持久版）。
     pub fn with_source(drivers_dir: &Path, source: Arc<dyn PointIdSource>) -> Self {
         let drivers = scan_drivers(drivers_dir);
         let snapshot = Arc::new(Snapshot::new());

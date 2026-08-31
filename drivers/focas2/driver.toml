@@ -2,7 +2,7 @@
 id = "focas2"
 name = "FANUC FOCAS2"
 version = "0.1.0"
-executable = "forgelink-driver-focas2"
+executable = "Mesa-driver-focas2"
 protocol_major = 1
 protocol_minor = 0
 sdk = "rust"

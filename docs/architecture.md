@@ -1,12 +1,12 @@
-# ForgeLink 架构设计（V1 MVP 实现）
+# Mesa 架构设计（V1 MVP 实现）
 
-> 本文档为 `README` 的详细展开，同步自 `ForgeLink_Driver_MVP_实施方案.md` V1.4 与 `docs/flowchart.md`。`README` 仅保留快速开始，本文件承载完整设计、数据流、驱动实现、前端、性能与部署的段落式说明，避免关键字堆砌。
+> 本文档为 `README` 的详细展开，同步自 `mesa_Driver_MVP_实施方案.md` V1.4 与 `docs/flowchart.md`。`README` 仅保留快速开始，本文件承载完整设计、数据流、驱动实现、前端、性能与部署的段落式说明，避免关键字堆砌。
 
 ## 1. 总体架构
 
-ForgeLink 采用单进程 Core 与多独立进程 Driver 的边缘网关形态。Core 负责配置的持久化、设备的管理、点位的分配、数据的汇聚以及北向 REST API 的提供；Driver 则专注于协议的解析与数据的采集。两者通过本机回环的可靠 IPC 通道解耦，实现了故障隔离与独立升级的能力，满足 V1 版本严格只读、单机稳定运行的核心目标。
+Mesa 采用单进程 Core 与多独立进程 Driver 的边缘网关形态。Core 负责配置的持久化、设备的管理、点位的分配、数据的汇聚以及北向 REST API 的提供；Driver 则专注于协议的解析与数据的采集。两者通过本机回环的可靠 IPC 通道解耦，实现了故障隔离与独立升级的能力，满足 V1 版本严格只读、单机稳定运行的核心目标。
 
-在部署形态上，Core 以 `forgelinkd` 单二进制运行，内置 `ConfigStore`（SQLite）、`DriverManager`、`DeviceManager`、`PointRegistry`（支持 tombstone 复用）以及 `DataIngress` 与 `LatestValueCache`；而每一个 Driver（S7、FOCAS2、OPC UA、Simulator）则作为独立的 OS 进程存在，通过 `127.0.0.1` 的 TCP 通道以长度前缀的 Protobuf 协议与 Core 通信。这种形态既保证了驱动崩溃不会影响 Core，也允许驱动独立编译与发现。
+在部署形态上，Core 以 `Mesad` 单二进制运行，内置 `ConfigStore`（SQLite）、`DriverManager`、`DeviceManager`、`PointRegistry`（支持 tombstone 复用）以及 `DataIngress` 与 `LatestValueCache`；而每一个 Driver（S7、FOCAS2、OPC UA、Simulator）则作为独立的 OS 进程存在，通过 `127.0.0.1` 的 TCP 通道以长度前缀的 Protobuf 协议与 Core 通信。这种形态既保证了驱动崩溃不会影响 Core，也允许驱动独立编译与发现。
 
 设计上有三个硬约束需要特别说明。其一是进程隔离与孤儿防护：每个 Driver 在启动时由 Core 通过 `stdin` 注入一次性 `token`，Core 持有 `ChildStdin` 不关闭作为 liveness 管道，一旦 `close` 即 `EOF` 触发 Driver 自杀；Windows 侧通过 `Job Object` 的 `KILL_ON_JOB_CLOSE`、Linux 侧通过 `PR_SET_PDEATHSIG` 保证 Core 异常退出时无孤儿，详见 `crates/driver-manager/src/process.rs:54`。其二是 Core 不懂协议：无论是 S7 的 `DB10.DBD0`，还是 FOCAS 的 `status`，亦或是 OPC UA 的 `ns=2;i=1`，其文本解析仅存在于对应 Driver 进程内的 `address.rs`，Core 仅透传 `binding.config` 的 JSON 并做 Schema 校验，满足 `AGENTS.md:39`。其三是有界背压：所有 Data Plane 队列上界为 256，满时对同一 `point_id` 执行最新值覆盖的合并策略，控制面消息则走独立队列不丢弃，详见 `crates/driver-sdk/src/lib.rs:195`。
 
@@ -14,7 +14,7 @@ ForgeLink 采用单进程 Core 与多独立进程 Driver 的边缘网关形态�
 
 ### 2.1 配置闭环（全量快照）
 
-ForgeLink 的配置遵循全量快照的语义。用户通过 REST 接口提交设备、端点与任务的完整快照，Core 将其写入 SQLite 并为每一个逻辑点位分配稳定的 `point_id`。该 ID 通过 `tombstone` 机制保证删除后再次添加同一 `point_key` 时复用原 ID，避免数据身份的漂移。随后驱动侧会走严格串行的闭环：`DriverManager` 拉起子进程并传入 `token`，双方完成 `Hello` 与 `Welcome` 的握手与协议协商，再依次执行 `OpenConnection`、`ConfigureTasks`（在此阶段完成 `parse_address` 的全量校验与 `point_key` 唯一性检查）、`PointDescriptors` 上报、`ApplyPointMap` 以及最终的 `StartConnection` 并生成新的 `stream_epoch` 进入 `RUNNING` 状态。
+Mesa 的配置遵循全量快照的语义。用户通过 REST 接口提交设备、端点与任务的完整快照，Core 将其写入 SQLite 并为每一个逻辑点位分配稳定的 `point_id`。该 ID 通过 `tombstone` 机制保证删除后再次添加同一 `point_key` 时复用原 ID，避免数据身份的漂移。随后驱动侧会走严格串行的闭环：`DriverManager` 拉起子进程并传入 `token`，双方完成 `Hello` 与 `Welcome` 的握手与协议协商，再依次执行 `OpenConnection`、`ConfigureTasks`（在此阶段完成 `parse_address` 的全量校验与 `point_key` 唯一性检查）、`PointDescriptors` 上报、`ApplyPointMap` 以及最终的 `StartConnection` 并生成新的 `stream_epoch` 进入 `RUNNING` 状态。
 
 需要强调的是，运行中对点位的任何增删改都必须走 `Stop → Configure → Apply → Start` 的完整路径并产生新的 `stream_epoch`，禁止热 Apply。若新 `revision` 的构建在任何一步失败，系统将保持 `STOPPED` 或 `FAILED` 状态并保留旧库，避免半配置状态下的运行风险。这一语义在 `§6.2` 中有明确约束。
 
@@ -46,7 +46,7 @@ OPC UA 驱动实现了三种绑定：`opcua.node-group` 的 Poll 轮询、`opcua
 
 地址解析支持 `NodeId` 的四种形式 `ns/i/s/g/b`，例如 `ns=2;i=1234` 或 `ns=2;s=Motor.Speed`，且 Core 侧被禁止解析以满足硬约束。值映射覆盖了 `BOOL/I32/U32/I64/U64/F32/F64/STRING/Bytes/DateTime/TypedArray` 等全量 `Variant`，并依据 `StatusCode` 的 `Good→GOOD Uncertain→UNCERTAIN Bad→BAD` 进行单点隔离。`SourceTimestamp` 以 `1601` 年为起点的 `ticks` 精确换算为 `Unix` 纳秒予以保留，这是 `§9.2` 所要求的语义。
 
-安全与证书方面，`pki_dir` 的解析优先级为 `connection_json` 的 `pki_dir` 字段高于环境变量 `FORGELINK_OPCUA_PKI_DIR` 再高于默认的 `data/certificates/opcua`。`own` 私钥以 `0o600` 权限通过 `rcgen` 自签名生成，`ClientBuilder` 以 `pki_dir own.der/key trust false verify true` 的方式构建，支持 `SecurityPolicy None/Basic256Sha256/Aes128` 与 `MessageSecurityMode None/Sign/SignAndEncrypt` 的透传，`rejected` 目录下的未知证书需经 `POST /rejected/{thumb}/trust` 人工迁移至 `trusted` 后重连，符合 `§8` 的最小运维能力。`Reference Server` 通过 `ghcr.io/php-opcua/uanetstandard-test-suite` 提供了 300 节点的全功能模拟，浏览 `Objects 85` 可得到 `TestServer; Server 2253` 等引用。
+安全与证书方面，`pki_dir` 的解析优先级为 `connection_json` 的 `pki_dir` 字段高于环境变量 `MESA_OPCUA_PKI_DIR` 再高于默认的 `data/certificates/opcua`。`own` 私钥以 `0o600` 权限通过 `rcgen` 自签名生成，`ClientBuilder` 以 `pki_dir own.der/key trust false verify true` 的方式构建，支持 `SecurityPolicy None/Basic256Sha256/Aes128` 与 `MessageSecurityMode None/Sign/SignAndEncrypt` 的透传，`rejected` 目录下的未知证书需经 `POST /rejected/{thumb}/trust` 人工迁移至 `trusted` 后重连，符合 `§8` 的最小运维能力。`Reference Server` 通过 `ghcr.io/php-opcua/uanetstandard-test-suite` 提供了 300 节点的全功能模拟，浏览 `Objects 85` 可得到 `TestServer; Server 2253` 等引用。
 
 ## 4. 前端
 
@@ -56,10 +56,10 @@ OPC UA 驱动实现了三种绑定：`opcua.node-group` 的 Poll 轮询、`opcua
 
 ## 5. 性能与平台
 
-性能预算遵循 `§22` 的 `50K updates/s 持续 60分钟`、`IPC delivery p95 ≤20ms p99 ≤50ms`（基于单调时钟测量）、`RSS 60分钟增幅 ≤10%` 以及 `Conn-1000 60分钟无泄漏` 的要求。本机在 `release 8135` 上以 `sim-001 5点 100ms` 的低负载进行了 `15分钟 1.1% 9.5→9.6` 与 `60分钟 5.4% 9.5→9.7 5点 3600s` 的预检，并通过 `Simulator burst125` 验证了 `Latest-Wins` 的有效性；`1ms Poll 1pt` 的实测 `p50 6ms p95 13ms` 表明 `IPC` 本身远低于 `20ms` 门限。此外，`FORGELINK_HEARTBEAT_FAST=1` 可将心跳从 `5s/3s×3=15s` 缩短至 `1s×2=2s`，`common/mod.rs` 对 `10055` 的 `10次 50ms` 退避也已验证对 `TIME_WAIT 30s` 的缓解。
+性能预算遵循 `§22` 的 `50K updates/s 持续 60分钟`、`IPC delivery p95 ≤20ms p99 ≤50ms`（基于单调时钟测量）、`RSS 60分钟增幅 ≤10%` 以及 `Conn-1000 60分钟无泄漏` 的要求。本机在 `release 8135` 上以 `sim-001 5点 100ms` 的低负载进行了 `15分钟 1.1% 9.5→9.6` 与 `60分钟 5.4% 9.5→9.7 5点 3600s` 的预检，并通过 `Simulator burst125` 验证了 `Latest-Wins` 的有效性；`1ms Poll 1pt` 的实测 `p50 6ms p95 13ms` 表明 `IPC` 本身远低于 `20ms` 门限。此外，`MESA_HEARTBEAT_FAST=1` 可将心跳从 `5s/3s×3=15s` 缩短至 `1s×2=2s`，`common/mod.rs` 对 `10055` 的 `10次 50ms` 退避也已验证对 `TIME_WAIT 30s` 的缓解。
 
-平台方面，`win64 PE 2.0/4.4/13M` 携带 `FWLIB64.dll`，`linux x64 ELF 5m56s` 与 `aarch64 7.8/13M QEMU 3m02s` 均以 `edition 2024 rust 1.85` 构建，`docker opcua-ref 4840 Up 55min` 通过 `10808` 代理拉取 `ghcr.io` 镜像。部署则通过 `packaging/windows-service/install.ps1` 的 `sc create ForgeLink` `KILL_ON_JOB_CLOSE` 与 `packaging/systemd/forgelink.service` 的 `journald` `systemctl enable --now` 实现，默认启动命令为 `forgelinkd --db forgelink.db --http-port 8132 --drivers-dir drivers`。
+平台方面，`win64 PE 2.0/4.4/13M` 携带 `FWLIB64.dll`，`linux x64 ELF 5m56s` 与 `aarch64 7.8/13M QEMU 3m02s` 均以 `edition 2024 rust 1.85` 构建，`docker opcua-ref 4840 Up 55min` 通过 `10808` 代理拉取 `ghcr.io` 镜像。部署则通过 `packaging/windows-service/install.ps1` 的 `sc create Mesa` `KILL_ON_JOB_CLOSE` 与 `packaging/systemd/Mesa.service` 的 `journald` `systemctl enable --now` 实现，默认启动命令为 `Mesad --db Mesa.db --http-port 8132 --drivers-dir drivers`。
 
 ## 6. 版本与门禁
 
-当前版本为 `v0.1.0-mvp` `7121998`，已实现 `FOCAS 44/44` 与 `OPC UA Browse` 等增量，并对前期误记的 `60` 进行了更正。通过 `cargo build --workspace 0.37s` 与 `cargo test --workspace --lib 11/13` 以及 `contract 9/5/3/2 data_plane 2 passed` 的验证，`§26` 的 23 条验收标准中 20 条已 `Done`，剩余 `OPC UA 硬件 97:4840 + 8C 60分钟正式 Soak + packaging` 即可完全闭环。详细门禁见 `ForgeLink_Driver_MVP_实施方案.md V1.4` 与三份 `GATE` 文档。
+当前版本为 `v0.1.0-mvp` `7121998`，已实现 `FOCAS 44/44` 与 `OPC UA Browse` 等增量，并对前期误记的 `60` 进行了更正。通过 `cargo build --workspace 0.37s` 与 `cargo test --workspace --lib 11/13` 以及 `contract 9/5/3/2 data_plane 2 passed` 的验证，`§26` 的 23 条验收标准中 20 条已 `Done`，剩余 `OPC UA 硬件 97:4840 + 8C 60分钟正式 Soak + packaging` 即可完全闭环。详细门禁见 `mesa_Driver_MVP_实施方案.md V1.4` 与三份 `GATE` 文档。

@@ -5,11 +5,11 @@
 fn main() {
     let port: u16 = match std::env::args().nth(2).or_else(|| std::env::args().nth(1)) {
         Some(arg) => arg.parse().unwrap_or_else(|_| panic!("invalid --port value {arg}")),
-        None => panic!("usage: forgelink-driver-focas2 --port <u16>"),
+        None => panic!("usage: Mesa-driver-focas2 --port <u16>"),
     };
 
-    let session_token = forgelink_driver_sdk::read_session_token_from_stdin();
-    forgelink_driver_sdk::spawn_parent_liveness_guard();
+    let session_token = mesa_driver_sdk::read_session_token_from_stdin();
+    mesa_driver_sdk::spawn_parent_liveness_guard();
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("build tokio runtime");
 
@@ -28,7 +28,7 @@ fn main() {
         }
 
         if let Err(e) =
-            forgelink_driver_sdk::serve(forgelink_driver_focas2::FocasDriver, listener, session_token, shutdown).await
+            mesa_driver_sdk::serve(mesa_driver_focas2::FocasDriver, listener, session_token, shutdown).await
         {
             eprintln!("focas2 driver exited with error: {e}");
             std::process::exit(1);

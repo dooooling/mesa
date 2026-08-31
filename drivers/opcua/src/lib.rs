@@ -30,11 +30,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use forgelink_core_types::{
+use mesa_core_types::{
     ensure_unique_point_keys, AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey,
     PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, now_unix_ns,
 };
-use forgelink_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
+use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio_util::sync::CancellationToken;
 
 pub const BINDING_POLL: &str = "opcua.node-group";
@@ -114,7 +114,7 @@ impl OpcUaConnConfig {
             let t = s.trim();
             if !t.is_empty() { return Some(std::path::PathBuf::from(t)); }
         }
-        std::env::var("FORGELINK_OPCUA_PKI_DIR").ok().map(std::path::PathBuf::from)
+        std::env::var("MESA_OPCUA_PKI_DIR").ok().map(std::path::PathBuf::from)
     }
 
     fn from_json(v: &serde_json::Value) -> Result<Self, SdkDriverError> {
@@ -293,21 +293,21 @@ impl DriverConnection for OpcUaConnection {
             }
             if is_poll && task.mode != TaskMode::Poll {
                 return Err(SdkDriverError::new(
-                    forgelink_core_types::ErrorKind::Unsupported,
+                    mesa_core_types::ErrorKind::Unsupported,
                     "MODE_NOT_SUPPORTED",
                     format!("task `{}`: opcua.node-group 仅支持 poll", task.id),
                 ));
             }
             if is_sub && task.mode != TaskMode::Subscribe {
                 return Err(SdkDriverError::new(
-                    forgelink_core_types::ErrorKind::Unsupported,
+                    mesa_core_types::ErrorKind::Unsupported,
                     "MODE_NOT_SUPPORTED",
                     format!("task `{}`: opcua.subscription 仅支持 subscribe", task.id),
                 ));
             }
             if is_browse && task.mode != TaskMode::Poll {
                 return Err(SdkDriverError::new(
-                    forgelink_core_types::ErrorKind::Unsupported,
+                    mesa_core_types::ErrorKind::Unsupported,
                     "MODE_NOT_SUPPORTED",
                     format!("task `{}`: opcua.browse 仅支持 poll", task.id),
                 ));
@@ -329,7 +329,7 @@ impl DriverConnection for OpcUaConnection {
                 let dt_str = node.get("data_type").or_else(|| node.get("dataType")).and_then(|v| v.as_str()).ok_or_else(|| SdkDriverError::configuration("INVALID_POINT", format!("point `{key}` 缺少 data_type")))?;
                 let addr = parse_address(node_id).map_err(|e| match e {
                     AddressError::Empty => SdkDriverError::configuration("INVALID_ADDRESS", format!("point `{key}` node_id 为空")),
-                    AddressError::Invalid { reason, .. } => SdkDriverError::new(forgelink_core_types::ErrorKind::Address, "INVALID_ADDRESS", format!("point `{key}` node_id `{node_id}` 非法: {reason}")),
+                    AddressError::Invalid { reason, .. } => SdkDriverError::new(mesa_core_types::ErrorKind::Address, "INVALID_ADDRESS", format!("point `{key}` node_id `{node_id}` 非法: {reason}")),
                 })?;
                 let data_type = parse_data_type(dt_str)?;
                 indices.push(new_points.len());
@@ -378,7 +378,7 @@ impl DriverConnection for OpcUaConnection {
     }
 
     async fn apply_point_map(&mut self, map: PointMap) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_mut().ok_or_else(|| SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "NOT_CONFIGURED", "apply 在 configure 之前"))?;
+        let snap = self.plan.as_mut().ok_or_else(|| SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "NOT_CONFIGURED", "apply 在 configure 之前"))?;
         for p in &snap.points {
             if !map.contains_key(&p.key) {
                 return Err(SdkDriverError::configuration("MISSING_POINT_ID", format!("point `{}` 缺少映射", p.key)));
@@ -393,15 +393,15 @@ impl DriverConnection for OpcUaConnection {
         sink: DataSink,
         shutdown: CancellationToken,
     ) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_ref().ok_or_else(|| SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "NO_PLAN", "run 前未 configure+apply"))?;
-        let map = snap.map.as_ref().ok_or_else(|| SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "NO_POINT_MAP", "run 前未 apply_point_map"))?;
+        let snap = self.plan.as_ref().ok_or_else(|| SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "NO_PLAN", "run 前未 configure+apply"))?;
+        let map = snap.map.as_ref().ok_or_else(|| SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "NO_POINT_MAP", "run 前未 apply_point_map"))?;
 
         // 建会话：Fake 即时成功；Native 失败则由 Manager 退避
         if let Err(e) = self.api.connect(&self.cfg.endpoint_url, self.cfg.timeout_ms).await {
             if e.contains("NOT_IMPLEMENTED") || e.contains("未实现") {
                 return Err(SdkDriverError::configuration("NOT_IMPLEMENTED", e));
             } else {
-                return Err(SdkDriverError::new(forgelink_core_types::ErrorKind::Connection, "CONNECT_FAILED", e));
+                return Err(SdkDriverError::new(mesa_core_types::ErrorKind::Connection, "CONNECT_FAILED", e));
             }
         }
 
@@ -438,7 +438,7 @@ impl DriverConnection for OpcUaConnection {
                                 Ok(v) => v,
                                 Err(e) => {
                                     tracing::error!(task=%task_id, error=%e, "OPC UA 读失败");
-                                    return Err(SdkDriverError::new(forgelink_core_types::ErrorKind::Connection, "READ_FAILED", e));
+                                    return Err(SdkDriverError::new(mesa_core_types::ErrorKind::Connection, "READ_FAILED", e));
                                 }
                             };
                             if values.len() != points.len() {
@@ -542,7 +542,7 @@ impl DriverConnection for OpcUaConnection {
                             Ok(v) => v,
                             Err(e) => {
                                 tracing::error!(task=%task_id, error=%e, "OPC UA 订阅失败");
-                                return Err(SdkDriverError::new(forgelink_core_types::ErrorKind::Connection, "SUBSCRIBE_FAILED", e));
+                                return Err(SdkDriverError::new(mesa_core_types::ErrorKind::Connection, "SUBSCRIBE_FAILED", e));
                             }
                         };
                         tracing::info!(task=%task_id, sub_id=%sub_id, "OPC UA 订阅已建立");
@@ -649,7 +649,7 @@ impl DriverConnection for OpcUaConnection {
                 Err(join_err) => {
                     tracing::error!(%join_err, "OPC UA 任务 panic");
                     if final_err.is_none() {
-                        final_err = Some(SdkDriverError::new(forgelink_core_types::ErrorKind::Internal, "TASK_PANIC", join_err.to_string()));
+                        final_err = Some(SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "TASK_PANIC", join_err.to_string()));
                     }
                 }
             }
@@ -667,7 +667,7 @@ impl DriverConnection for OpcUaConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forgelink_core_types::{AcquisitionTask, DriverBinding, TaskMode};
+    use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
 
     fn task_with_nodes(nodes: serde_json::Value) -> AcquisitionTask {
         AcquisitionTask {

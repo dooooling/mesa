@@ -1,4 +1,4 @@
-//! ForgeLink DriverManager（Core 侧）。
+//! Mesa DriverManager（Core 侧）。
 //!
 //! 模块划分：
 //! - [`manifest`]：driver.toml 解析与发现（§15）
@@ -16,5 +16,5 @@ pub mod session;
 pub mod snapshot;
 
 pub use endpoint::{BuiltinEndpoint, PointIdAllocator, PointIdSource, StorePointIdSource};
-pub use manager::ForgeLinkManager;
+pub use manager::MesaManager;
 pub use snapshot::{DriverInfo, EndpointStatus, LatestEntry, Snapshot};

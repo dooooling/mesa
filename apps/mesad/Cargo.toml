@@ -1,18 +1,18 @@
 [package]
-name = "forgelinkd"
+name = "mesad"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "forgelinkd"
+name = "mesad"
 path = "src/main.rs"
 
 [dependencies]
-forgelink-core-types = { workspace = true }
-forgelink-driver-manager = { workspace = true }
-forgelink-config-store = { workspace = true }
-forgelink-core-api = { workspace = true }
+mesa-core-types = { workspace = true }
+mesa-driver-manager = { workspace = true }
+mesa-config-store = { workspace = true }
+mesa-core-api = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

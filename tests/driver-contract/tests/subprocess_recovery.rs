@@ -9,12 +9,12 @@ mod common;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use forgelink_core_types::ConnectionState;
-use forgelink_driver_manager::endpoint::{run_endpoint, BuiltinEndpoint, PointIdAllocator, PointIdSource};
-use forgelink_driver_manager::manifest::{scan_drivers, DiscoveredDriver};
-use forgelink_driver_manager::process::TERMINATE_GRACE;
-use forgelink_driver_manager::session::Session;
-use forgelink_driver_manager::snapshot::Snapshot;
+use mesa_core_types::ConnectionState;
+use mesa_driver_manager::endpoint::{run_endpoint, BuiltinEndpoint, PointIdAllocator, PointIdSource};
+use mesa_driver_manager::manifest::{scan_drivers, DiscoveredDriver};
+use mesa_driver_manager::process::TERMINATE_GRACE;
+use mesa_driver_manager::session::Session;
+use mesa_driver_manager::snapshot::Snapshot;
 use tokio_util::sync::CancellationToken;
 
 use common::*;
@@ -29,7 +29,7 @@ fn manifest_discovery_finds_simulator() {
         .iter()
         .find(|d| d.manifest.id == "simulator")
         .expect("simulator must be discovered");
-    assert_eq!(sim.manifest.name, "ForgeLink Simulator");
+    assert_eq!(sim.manifest.name, "Mesa Simulator");
     assert!(
         sim.manifest.version.split('.').count() == 3,
         "version must be x.y.z shaped"
@@ -43,13 +43,13 @@ fn manifest_discovery_finds_simulator() {
 fn sim_discovered() -> DiscoveredDriver {
     let exe = sim_exe();
     DiscoveredDriver {
-        manifest: forgelink_driver_manager::manifest::DriverManifest {
+        manifest: mesa_driver_manager::manifest::DriverManifest {
             id: "simulator".into(),
-            name: "ForgeLink Simulator".into(),
+            name: "Mesa Simulator".into(),
             version: "0.0.0".into(), // 测试桩版本，仅用于 Hello 展示
             executable: exe.file_name().unwrap().to_string_lossy().to_string(),
-            protocol_major: forgelink_driver_protocol::PROTOCOL_MAJOR,
-            protocol_minor: forgelink_driver_protocol::PROTOCOL_MINOR,
+            protocol_major: mesa_driver_protocol::PROTOCOL_MAJOR,
+            protocol_minor: mesa_driver_protocol::PROTOCOL_MINOR,
             sdk: None,
             os: None,
             arch: None,
@@ -66,7 +66,7 @@ fn sim_discovered() -> DiscoveredDriver {
 /// 进程必须在远小于强杀宽限的时间内自然退出——否则说明 EOF 防护失效。
 #[tokio::test]
 async fn orphan_guard_stdin_eof_exits_child_quickly() {
-    let process = forgelink_driver_manager::process::DriverProcess::spawn(&sim_discovered())
+    let process = mesa_driver_manager::process::DriverProcess::spawn(&sim_discovered())
         .await
         .expect("spawn simulator");
     let mut process = process;
@@ -86,7 +86,7 @@ async fn orphan_guard_stdin_eof_exits_child_quickly() {
 #[tokio::test]
 async fn subprocess_token_handshake_paths() {
     // 错误 token：握手必须失败且为握手层错误
-    let mut p = forgelink_driver_manager::process::DriverProcess::spawn(&sim_discovered())
+    let mut p = mesa_driver_manager::process::DriverProcess::spawn(&sim_discovered())
         .await
         .expect("spawn");
     let port = p.port;
@@ -98,7 +98,7 @@ async fn subprocess_token_handshake_paths() {
     p.terminate().await;
 
     // 正确 token：完整会话可用
-    let mut p = forgelink_driver_manager::process::DriverProcess::spawn(&sim_discovered())
+    let mut p = mesa_driver_manager::process::DriverProcess::spawn(&sim_discovered())
         .await
         .expect("spawn");
     let (mut session, _events, _) =
@@ -196,13 +196,13 @@ async fn driver_crash_restore_via_endpoint_runtime() {
 /// 子进程 Graceful Shutdown（§21 行 20）：Shutdown 消息后进程在宽限内自然退出。
 #[tokio::test]
 async fn graceful_shutdown_terminates_subprocess_promptly() {
-    let mut p = forgelink_driver_manager::process::DriverProcess::spawn(&sim_discovered())
+    let mut p = mesa_driver_manager::process::DriverProcess::spawn(&sim_discovered())
         .await
         .expect("spawn");
     let (session, _events, _) = Session::connect_retry(p.port, &p.token).await.unwrap();
 
-    use forgelink_driver_protocol::pb::envelope::Body;
-    session.post(Body::Shutdown(forgelink_driver_protocol::pb::Shutdown {})).await.unwrap();
+    use mesa_driver_protocol::pb::envelope::Body;
+    session.post(Body::Shutdown(mesa_driver_protocol::pb::Shutdown {})).await.unwrap();
     drop(session);
 
     let started = Instant::now();

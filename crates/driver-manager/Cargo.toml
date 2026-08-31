@@ -1,13 +1,13 @@
 [package]
-name = "forgelink-driver-manager"
+name = "mesa-driver-manager"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-forgelink-core-types = { workspace = true }
-forgelink-driver-protocol = { workspace = true }
-forgelink-config-store = { workspace = true }
+mesa-core-types = { workspace = true }
+mesa-driver-protocol = { workspace = true }
+mesa-config-store = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 toml = { workspace = true }

@@ -5,8 +5,8 @@ mod common;
 
 use std::time::Duration;
 
-use forgelink_core_types::Quality;
-use forgelink_driver_manager::session::{Session, SessionError};
+use mesa_core_types::Quality;
+use mesa_driver_manager::session::{Session, SessionError};
 
 use common::*;
 
@@ -32,7 +32,7 @@ async fn handshake_and_metadata_roundtrip() {
 
     let (driver_id, name, version) = session.metadata().await.expect("metadata");
     assert_eq!(driver_id, "simulator");
-    assert_eq!(name, "ForgeLink Simulator");
+    assert_eq!(name, "Mesa Simulator");
     assert!(!version.is_empty());
 
     teardown(&mut session_drop_guard(session), Some(cancel));
@@ -73,10 +73,10 @@ async fn databatch_epoch_sequence_semantics() {
     .await;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    let mut batches: Vec<forgelink_core_types::DataBatch> = Vec::new();
+    let mut batches: Vec<mesa_core_types::DataBatch> = Vec::new();
     while batches.len() < 5 && std::time::Instant::now() < deadline {
         match tokio::time::timeout_at(deadline.into(), events.recv()).await {
-            Ok(Some(forgelink_driver_manager::session::SessionEvent::Batch(b))) => batches.push(b),
+            Ok(Some(mesa_driver_manager::session::SessionEvent::Batch(b))) => batches.push(b),
             Ok(other) => panic!("unexpected event: {other:?}"),
             Err(_) => break,
         }

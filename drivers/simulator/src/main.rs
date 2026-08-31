@@ -10,12 +10,12 @@ fn main() {
         Some(arg) => arg
             .parse()
             .unwrap_or_else(|_| panic!("invalid --port value")),
-        None => panic!("usage: forgelink-driver-simulator --port <u16>"),
+        None => panic!("usage: Mesa-driver-simulator --port <u16>"),
     };
 
     // token 必须先于 liveness 守护读取：守护线程会消费 stdin 剩余字节直到 EOF
-    let session_token = forgelink_driver_sdk::read_session_token_from_stdin();
-    forgelink_driver_sdk::spawn_parent_liveness_guard();
+    let session_token = mesa_driver_sdk::read_session_token_from_stdin();
+    mesa_driver_sdk::spawn_parent_liveness_guard();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -39,7 +39,7 @@ fn main() {
         }
 
         if let Err(e) =
-            forgelink_driver_sdk::serve(forgelink_driver_simulator::SimulatorDriver, listener, session_token, shutdown)
+            mesa_driver_sdk::serve(mesa_driver_simulator::SimulatorDriver, listener, session_token, shutdown)
                 .await
         {
             eprintln!("simulator driver exited with error: {e}");

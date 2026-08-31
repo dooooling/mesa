@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use forgelink_core_types::{ConnectionState as CoreState, DataBatch};
-use forgelink_driver_protocol::{
+use mesa_core_types::{ConnectionState as CoreState, DataBatch};
+use mesa_driver_protocol::{
     batch_from_pb, connection_state_from_pb, negotiate, pb, read_envelope, write_envelope,
     ProtocolError,
 };
@@ -39,7 +39,7 @@ pub struct HeartbeatParams {
 
 impl Default for HeartbeatParams {
     fn default() -> Self {
-        if std::env::var("FORGELINK_HEARTBEAT_FAST").ok().as_deref() == Some("1") {
+        if std::env::var("MESA_HEARTBEAT_FAST").ok().as_deref() == Some("1") {
             return Self { ping_period: Duration::from_secs(1), pong_deadline: Duration::from_secs(1), max_missed: 2 };
         }
         Self { ping_period: PING_PERIOD, pong_deadline: PONG_DEADLINE, max_missed: MAX_MISSED_PONGS }
@@ -172,8 +172,8 @@ impl Session {
         negotiate(
             (hello.protocol_major, hello.protocol_minor),
             (
-                forgelink_driver_protocol::PROTOCOL_MAJOR,
-                forgelink_driver_protocol::PROTOCOL_MINOR,
+                mesa_driver_protocol::PROTOCOL_MAJOR,
+                mesa_driver_protocol::PROTOCOL_MINOR,
             ),
         )
         .map_err(|e| SessionError::Handshake(e.to_string()))?;
@@ -182,9 +182,9 @@ impl Session {
         let welcome = pb::Envelope {
             msg_id: hello_env.msg_id,
             body: Some(pb::envelope::Body::Welcome(pb::Welcome {
-                core_version: format!("forgelinkd v{}", env!("CARGO_PKG_VERSION")),
-                accepted_protocol_major: forgelink_driver_protocol::PROTOCOL_MAJOR,
-                accepted_protocol_minor: forgelink_driver_protocol::PROTOCOL_MINOR
+                core_version: format!("Mesad v{}", env!("CARGO_PKG_VERSION")),
+                accepted_protocol_major: mesa_driver_protocol::PROTOCOL_MAJOR,
+                accepted_protocol_minor: mesa_driver_protocol::PROTOCOL_MINOR
                     .min(hello.protocol_minor),
             })),
         };

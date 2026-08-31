@@ -1,5 +1,5 @@
 [package]
-name = "forgelink-contract-tests"
+name = "mesa-contract-tests"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,11 +8,11 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-forgelink-core-types = { workspace = true }
-forgelink-driver-protocol = { workspace = true }
-forgelink-driver-sdk = { workspace = true }
-forgelink-driver-simulator = { path = "../../drivers/simulator" }
-forgelink-driver-manager = { workspace = true }
+mesa-core-types = { workspace = true }
+mesa-driver-protocol = { workspace = true }
+mesa-driver-sdk = { workspace = true }
+mesa-driver-simulator = { path = "../../drivers/simulator" }
+mesa-driver-manager = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde_json = { workspace = true }

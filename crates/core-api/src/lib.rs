@@ -1,4 +1,4 @@
-//! ForgeLink REST API（方案 §4.1）。
+//! Mesa REST API（方案 §4.1）。
 //!
 //! 安全边界（§4.2）：仅绑定 loopback，不提供任何远程管理能力。
 //! Device/Endpoint/Task CRUD + 启停 + rescan + diagnostics 已实现（§4.1 最小集）。
@@ -11,9 +11,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use forgelink_config_store::{ConfigStore, DeviceRecord, EndpointRecord, StoreError};
-use forgelink_core_types::AcquisitionTask;
-use forgelink_driver_manager::{ForgeLinkManager, Snapshot};
+use mesa_config_store::{ConfigStore, DeviceRecord, EndpointRecord, StoreError};
+use mesa_core_types::AcquisitionTask;
+use mesa_driver_manager::{MesaManager, Snapshot};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
@@ -26,7 +26,7 @@ use certificates::CertStore;
 
 pub struct AppState {
     pub snapshot: Arc<Snapshot>,
-    pub manager: Arc<ForgeLinkManager>,
+    pub manager: Arc<MesaManager>,
     pub store: Arc<ConfigStore>,
     /// 驱动目录（供 rescan 使用）。
     pub drivers_dir: String,
@@ -36,7 +36,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(
-        manager: Arc<ForgeLinkManager>,
+        manager: Arc<MesaManager>,
         store: Arc<ConfigStore>,
         drivers_dir: String,
     ) -> Arc<Self> {
@@ -44,7 +44,7 @@ impl AppState {
     }
 
     pub fn new_with_cert_dir(
-        manager: Arc<ForgeLinkManager>,
+        manager: Arc<MesaManager>,
         store: Arc<ConfigStore>,
         drivers_dir: String,
         cert_dir: std::path::PathBuf,
@@ -282,7 +282,7 @@ async fn create_endpoint(
         driver_id: body.driver_id,
         connection_json: serde_json::to_string(&body.connection).unwrap(),
         desired_running: false,
-        updated_at_ns: forgelink_core_types::now_unix_ns(),
+        updated_at_ns: mesa_core_types::now_unix_ns(),
     };
     match state.store.create_endpoint(&rec) {
         Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({ "id": rec.id }))),
@@ -308,7 +308,7 @@ async fn update_endpoint(
     rec.device_id = body.device_id;
     rec.driver_id = body.driver_id;
     rec.connection_json = serde_json::to_string(&body.connection).unwrap();
-    rec.updated_at_ns = forgelink_core_types::now_unix_ns();
+    rec.updated_at_ns = mesa_core_types::now_unix_ns();
     match state.store.update_endpoint(&rec) {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "updated": id }))),
         Ok(false) => (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &format!("endpoint `{id}`")))),
@@ -344,7 +344,7 @@ async fn start_endpoint(
     }
     // 构造 BuiltinEndpoint
     let tasks = match state.store.list_tasks(&id) { Ok(v) => v, Err(e) => return store_err_to_response(e) };
-    let cfg = forgelink_driver_manager::endpoint::BuiltinEndpoint {
+    let cfg = mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: rec.id.clone(),
         driver_id: rec.driver_id.clone(),
         connection_json: rec.connection_json.clone(),
@@ -640,7 +640,7 @@ pub async fn serve(
         .await
 }
 
-/// 旧签名兼容：直接以 AppState 构造并启动（forgelinkd 使用新签名，保留此函数避免孤立调用）。
+/// 旧签名兼容：直接以 AppState 构造并启动（Mesad 使用新签名，保留此函数避免孤立调用）。
 pub async fn serve_snapshot(
     snapshot: Arc<Snapshot>,
     port: u16,

@@ -1,5 +1,5 @@
 [package]
-name = "forgelink-core-types"
+name = "mesa-core-types"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

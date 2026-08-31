@@ -1,9 +1,9 @@
 //! Conn-1000 无 Task/Handle 泄漏预检（Simulator only）
 //! 单 Driver 进程 1000 Handles 低速 100ms，断言无泄漏
 
-use forgelink_core_types::{AcquisitionTask, DriverBinding, TaskMode};
-use forgelink_config_store::ConfigStore;
-use forgelink_driver_manager::{ForgeLinkManager, StorePointIdSource};
+use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
+use mesa_config_store::ConfigStore;
+use mesa_driver_manager::{MesaManager, StorePointIdSource};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -11,11 +11,11 @@ async fn conn_1000_no_leak() {
     let store = Arc::new(ConfigStore::open(std::path::Path::new(":memory:")).unwrap());
     let source = Arc::new(StorePointIdSource::new(store.clone()));
     let drivers_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../drivers");
-    let mgr = ForgeLinkManager::with_source(&drivers_dir, source);
+    let mgr = MesaManager::with_source(&drivers_dir, source);
     // 20 个 endpoint 快检（CI），全量 1000 需 --long
     let n = 20;
     for i in 0..n {
-        let ep = forgelink_driver_manager::endpoint::BuiltinEndpoint {
+        let ep = mesa_driver_manager::endpoint::BuiltinEndpoint {
             endpoint_id: format!("perf-conn-{i}"),
             driver_id: "simulator".into(),
             connection_json: "{}".into(),

@@ -1,13 +1,13 @@
 [package]
-name = "forgelink-core-api"
+name = "mesa-core-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-forgelink-core-types = { workspace = true }
-forgelink-driver-manager = { workspace = true }
-forgelink-config-store = { workspace = true }
+mesa-core-types = { workspace = true }
+mesa-driver-manager = { workspace = true }
+mesa-config-store = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

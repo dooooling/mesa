@@ -2,7 +2,7 @@
 id = "opcua"
 name = "OPC UA"
 version = "0.1.0"
-executable = "forgelink-driver-opcua"
+executable = "Mesa-driver-opcua"
 protocol_major = 1
 protocol_minor = 0
 sdk = "rust"

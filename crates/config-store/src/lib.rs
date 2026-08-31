@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
-use forgelink_core_types::{
+use mesa_core_types::{
     ensure_unique_point_keys, AcquisitionTask, DataType, PointDefinition, PointDescriptor,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -163,7 +163,7 @@ impl ConfigStore {
     // ---- helpers ----
 
     fn now_ns() -> i64 {
-        forgelink_core_types::now_unix_ns()
+        mesa_core_types::now_unix_ns()
     }
 
     // ---- Device ----
@@ -425,9 +425,9 @@ impl ConfigStore {
         let rows = stmt.query_map(params![endpoint_id], |r| {
             let mode_s: String = r.get(1)?;
             let mode = match mode_s.as_str() {
-                "poll" => forgelink_core_types::TaskMode::Poll,
-                "subscribe" => forgelink_core_types::TaskMode::Subscribe,
-                _ => forgelink_core_types::TaskMode::Poll,
+                "poll" => mesa_core_types::TaskMode::Poll,
+                "subscribe" => mesa_core_types::TaskMode::Subscribe,
+                _ => mesa_core_types::TaskMode::Poll,
             };
             let binding_config_json: String = r.get(4)?;
             let cfg: serde_json::Value = serde_json::from_str(&binding_config_json).unwrap_or(serde_json::json!({}));
@@ -435,7 +435,7 @@ impl ConfigStore {
                 id: r.get(0)?,
                 mode,
                 interval_ms: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
-                binding: forgelink_core_types::DriverBinding {
+                binding: mesa_core_types::DriverBinding {
                     kind: r.get(3)?,
                     config: cfg,
                 },
@@ -601,7 +601,7 @@ pub fn validate_connection_json(s: &str) -> Result<serde_json::Value, StoreError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forgelink_core_types::{DriverBinding, TaskMode};
+    use mesa_core_types::{DriverBinding, TaskMode};
 
     fn mem() -> ConfigStore {
         ConfigStore::open_in_memory().unwrap()

@@ -1,11 +1,11 @@
 [package]
-name = "forgelink-driver-protocol"
+name = "mesa-driver-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-forgelink-core-types = { workspace = true }
+mesa-core-types = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "rt"] }

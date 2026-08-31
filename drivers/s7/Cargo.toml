@@ -1,20 +1,20 @@
 [package]
-name = "forgelink-driver-s7"
+name = "mesa-driver-s7"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "forgelink_driver_s7"
+name = "mesa_driver_s7"
 path = "src/lib.rs"
 
 [[bin]]
-name = "forgelink-driver-s7"
+name = "mesa-driver-s7"
 path = "src/main.rs"
 
 [dependencies]
-forgelink-core-types = { workspace = true }
-forgelink-driver-sdk = { workspace = true }
+mesa-core-types = { workspace = true }
+mesa-driver-sdk = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

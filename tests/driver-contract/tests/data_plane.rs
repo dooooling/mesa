@@ -4,8 +4,8 @@ mod common;
 
 use std::time::Duration;
 
-use forgelink_core_types::Quality;
-use forgelink_driver_manager::session::Session;
+use mesa_core_types::Quality;
+use mesa_driver_manager::session::Session;
 
 use common::*;
 

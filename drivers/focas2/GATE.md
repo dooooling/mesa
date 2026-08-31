@@ -1,6 +1,6 @@
 # FOCAS2 Gate 闭环文档（§19.2）
 
-> 依据 `ForgeLink_Driver_MVP_实施方案.md §19.2`，FOCAS2 生产发布前必须书面闭环 SDK 合法获取/许可/平台/函数支持，否则仅允许 Fake 演示。
+> 依据 `mesa_Driver_MVP_实施方案.md §19.2`，FOCAS2 生产发布前必须书面闭环 SDK 合法获取/许可/平台/函数支持，否则仅允许 Fake 演示。
 
 ## 1. SDK 来源
 
@@ -14,7 +14,7 @@
 ## 2. 许可与再分发
 
 - `fanuc-driver/license.md` 为 MIT，但 FANUC Fwlib 本体版权归 FANUC CORPORATION，`fwlib.cs:9` 声明 `Copyright (C) 2002-2011 by FANUC CORPORATION`
-- **结论**：FOCAS2 生产版不随 `forgelink-driver-focas2` 二进制直接分发 Fwlib，需文档引导客户自行从 FANUC 官方获取或从已采购 CNC 配套光盘提取后置于 `drivers/focas2/libs/` 或系统库路径；CI/Fake 演示使用随仓拷贝的库仅用于验证，不作为发布件
+- **结论**：FOCAS2 生产版不随 `Mesa-driver-focas2` 二进制直接分发 Fwlib，需文档引导客户自行从 FANUC 官方获取或从已采购 CNC 配套光盘提取后置于 `drivers/focas2/libs/` 或系统库路径；CI/Fake 演示使用随仓拷贝的库仅用于验证，不作为发布件
 - 已在 `drivers/focas2/src/native.rs:120` 实现运行时动态加载，缺库时返回 `EW_NODLL` 可重试错误，而非静态链接
 
 ## 3. 平台与架构
@@ -31,7 +31,7 @@
 
 ## 4. 函数支持矩阵（已实现 44/44，全读只读，2026-08-29 冻结）
 
-| ForgeLink 地址 | FOCAS 函数 | 30i-B | 0i-F | 备注 |
+| Mesa 地址 | FOCAS 函数 | 30i-B | 0i-F | 备注 |
 |---|---|---|---|---|
 | `status` | `cnc_statinfo` | O | O | `native.rs:630 statinfo()` `2026-08-29` 165 0 GOOD |
 | `axis.abs/machine/relative/distance/data/srvdelay/accdecdly.*` | `cnc_rddynamic2/cnc_absolute` | O | O | `rddynamic2 44B` `absolute 8批` `axis.abs.1 3186 axis.abs.2 32758` 165 GOOD `srv/acc EW_Length BAD隔离` |
@@ -53,14 +53,14 @@
 ## 5. 真机可连性
 
 - **2026-08-27 实测**：
-  - `192.168.15.165:8193` `ping 1ms` `TcpTestSucceeded True`，`test_native -- 192.168.15.165` 直连 `connect OK`，`status U32(1) / axis.abs.1 I32(4000) / spindle.load U32(0)` 回传成功；`forgelinkd 8139` `real-focas RUNNING 4点` `GET /points/latest` 9 点（4 真机 +5 sim）已验证 `cnc_statinfo/cnc_rddynamic2(44)/cnc_acts` 链路
+  - `192.168.15.165:8193` `ping 1ms` `TcpTestSucceeded True`，`test_native -- 192.168.15.165` 直连 `connect OK`，`status U32(1) / axis.abs.1 I32(4000) / spindle.load U32(0)` 回传成功；`Mesad 8139` `real-focas RUNNING 4点` `GET /points/latest` 9 点（4 真机 +5 sim）已验证 `cnc_statinfo/cnc_rddynamic2(44)/cnc_acts` 链路
   - `FOCAS` 句柄 `cnc_allclibhndl3(ip,port,timeout_s)` 正确，`timeout_ms 5000→5s`，`NativeFocasApi` `spawn_blocking` 隔离 + `EW_SOCKET/EW_NODLL` 退避 `RECONNECTING` 正常
-  - **Windows 依赖路径修复 `9514443`**：`FWLIB64.dll` 隐式依赖 `fwlibe1.dll` 需同目录，`LoadLibrary` 相对路径不搜 `libs/win`；`native.rs:331 load() prepend PATH(cwd/drivers/focas2/libs/win+TEMP) + 绝对路径双候选` 后 `cnc_allclibhndl3 host=192.168.15.165 ret Ok(32769) Status1 Axis -68050..79986`；单文件分发 `26.5MB` `include_bytes!→NamedTempFile→Library::new` `%TEMP%/forgelink_focas_embed`
-- **2026-08-28 双机**：`97 S7 192.168.15.97:102 DB10.DBD0 11468800 DBW0 175` `165 FOCAS 192.168.15.165:8193 status 1 axis -29594 spindle 0 alarm [] diag 0 pmc 0` `forgelinkd dual RUNNING 2+4+5=11点 11 GOOD` `ARM QEMU aarch64 2.1M/4.2M` `S7 continuous合并/LREAL分片/WSTRING` `FOCAS 14/44` 已通；`192.168.15.60` 非 CNC（前期笔误已更正，非 FOCAS 目标）
+  - **Windows 依赖路径修复 `9514443`**：`FWLIB64.dll` 隐式依赖 `fwlibe1.dll` 需同目录，`LoadLibrary` 相对路径不搜 `libs/win`；`native.rs:331 load() prepend PATH(cwd/drivers/focas2/libs/win+TEMP) + 绝对路径双候选` 后 `cnc_allclibhndl3 host=192.168.15.165 ret Ok(32769) Status1 Axis -68050..79986`；单文件分发 `26.5MB` `include_bytes!→NamedTempFile→Library::new` `%TEMP%/mesa_focas_embed`
+- **2026-08-28 双机**：`97 S7 192.168.15.97:102 DB10.DBD0 11468800 DBW0 175` `165 FOCAS 192.168.15.165:8193 status 1 axis -29594 spindle 0 alarm [] diag 0 pmc 0` `Mesad dual RUNNING 2+4+5=11点 11 GOOD` `ARM QEMU aarch64 2.1M/4.2M` `S7 continuous合并/LREAL分片/WSTRING` `FOCAS 14/44` 已通；`192.168.15.60` 非 CNC（前期笔误已更正，非 FOCAS 目标）
 - **2026-08-29 增量**：`SPINDLE 2 gear/maxrpm 8133 Fake 8点 8 GOOD (gear 1/3 maxrpm 6875/9687) + Native ep-native165 4点 4 GOOD (gear 1 maxrpm 1 status 0 axis 3186)`；`PROGRAM 3 dir/info/upload EW_LENGTH→BAD隔离` `AXIS 5 data/srvdelay 3186` `TOOL 8 PARAM 2` 均 `按项BAD隔离`，`NativeLib cnc_rdspgear/rdspmaxrpm 动态加载` 验证；`GATE 24/44`
 - **2026-08-29 真结构**：`native.rs:340 OdbTofs(8B)/IodbZofs(36B)/IodbPsd1(8B) Pack=4` `cnc_rdtofs(s_no=e_no=num,type0)` `cnc_rdzofs(s_no=e_no=num)` `cnc_rdparam(num,0,1)` `FnRdTofs 3 shorts` 修正；`165 Native ep-tool 5点 2 GOOD(status/axis 3186) 3 BAD(off1/zofs1/param100 EW_Length)` 单点隔离正确，`Fake 10 passed cargo build 4.02s`
 - **2026-08-29 44冻结**：`address.rs 44清单 Pack4` `native.rs:390 IodbTo112 46B Ofs2` `FnRdTofsr 5参 +FnRdTofsr112` `cnc_rdtofsr 1_2→1_1` `OdbNc1 6 trial+OdbNc2 3 trial upstart3→upload3→upend3` `ep-mini 14点 11 GOOD(status 0 axis 3186/32758 feed 0 sp 0/0/1/1 pmc0 servo0 param0) 3 BAD` `pts_mini_fixed.json`
-- **2026-08-29 35点全量**：`8134 ep-44 35点 40点（含sim 5） 23 GOOD 12 BAD RUNNING` `pts44_final3.json:1` `status 0 prognum 4294953424 progdir "%" abs1/mach1/rel1/dist1/data1/srv1/acc1 3186 feed 0 sp 0/0/1/1 servo0 pmc_R100 0 pmc_D100 0 pmc_G0 0 pmc_X0 0 tool_num 1.0 param100 0` `BAD alarm/proginfo/progup/macro100/500 diag0/300 opmsg tool_off1/ zofs/len param1850 EW_Length/Number/Attrib/FUNC` 按项 `BAD` `8134 full44_tasks.json u8→U32 修正 prognum U32` `forgelink165_44final2.db` `cargo test --workspace --lib 11/13 passed contract 9/5/3/2 passed data_plane 2 passed`
+- **2026-08-29 35点全量**：`8134 ep-44 35点 40点（含sim 5） 23 GOOD 12 BAD RUNNING` `pts44_final3.json:1` `status 0 prognum 4294953424 progdir "%" abs1/mach1/rel1/dist1/data1/srv1/acc1 3186 feed 0 sp 0/0/1/1 servo0 pmc_R100 0 pmc_D100 0 pmc_G0 0 pmc_X0 0 tool_num 1.0 param100 0` `BAD alarm/proginfo/progup/macro100/500 diag0/300 opmsg tool_off1/ zofs/len param1850 EW_Length/Number/Attrib/FUNC` 按项 `BAD` `8134 full44_tasks.json u8→U32 修正 prognum U32` `Mesa165_44final2.db` `cargo test --workspace --lib 11/13 passed contract 9/5/3/2 passed data_plane 2 passed`
 
 ## 6. 发布 Gate
 

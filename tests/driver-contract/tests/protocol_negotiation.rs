@@ -6,8 +6,8 @@ mod common;
 
 use std::time::Duration;
 
-use forgelink_driver_protocol::{pb, read_envelope, write_envelope, PROTOCOL_MAJOR, PROTOCOL_MINOR};
-use forgelink_driver_manager::session::Session;
+use mesa_driver_protocol::{pb, read_envelope, write_envelope, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+use mesa_driver_manager::session::Session;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -53,8 +53,8 @@ async fn driver_rejects_core_major_downgrade() {
     let cancel = CancellationToken::new();
     let c = cancel.clone();
     let server = tokio::spawn(async move {
-        forgelink_driver_sdk::serve(
-            forgelink_driver_simulator::SimulatorDriver,
+        mesa_driver_sdk::serve(
+            mesa_driver_simulator::SimulatorDriver,
             sim_listener,
             TOKEN.into(),
             c,

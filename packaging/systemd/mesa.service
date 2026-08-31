@@ -1,10 +1,10 @@
 [Unit]
-Description=ForgeLink Driver MVP
+Description=Mesa Driver MVP
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/opt/forgelink/forgelinkd --db /var/lib/forgelink/forgelink.db --http-port 8132 --drivers-dir /opt/forgelink/drivers
+ExecStart=/opt/mesa/mesad --db /var/lib/mesa/mesa.db --http-port 8132 --drivers-dir /opt/mesa/drivers
 Restart=on-failure
 RestartSec=5
 # 日志由 journald 接管，禁止无限文件（§25）

@@ -232,7 +232,7 @@ impl CertStore {
             return Ok(false);
         }
         // 使用 rcgen 生成（0.13 API）
-        let certified = rcgen::generate_simple_self_signed(vec!["forgelink-opcua".to_string()]).map_err(|e| e.to_string())?;
+        let certified = rcgen::generate_simple_self_signed(vec!["Mesa-opcua".to_string()]).map_err(|e| e.to_string())?;
         let pem = certified.cert.pem();
         let key_pem = certified.key_pair.serialize_pem();
         let der = certified.cert.der().to_vec();

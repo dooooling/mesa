@@ -10,8 +10,8 @@ use tokio::time::{timeout, Duration};
 
 use crate::address::{Area, S7Address};
 use crate::codec::S7Kind;
-use forgelink_driver_sdk::SdkDriverError;
-use forgelink_core_types::ErrorKind;
+use mesa_driver_sdk::SdkDriverError;
+use mesa_core_types::ErrorKind;
 
 // ---------------------------------------------------------------------------
 // 协议常量（中文注释解释“为什么”）

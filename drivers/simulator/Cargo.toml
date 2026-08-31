@@ -1,20 +1,20 @@
 [package]
-name = "forgelink-driver-simulator"
+name = "mesa-driver-simulator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "forgelink_driver_simulator"
+name = "mesa_driver_simulator"
 path = "src/lib.rs"
 
 [[bin]]
-name = "forgelink-driver-simulator"
+name = "mesa-driver-simulator"
 path = "src/main.rs"
 
 [dependencies]
-forgelink-core-types = { workspace = true }
-forgelink-driver-sdk = { workspace = true }
+mesa-core-types = { workspace = true }
+mesa-driver-sdk = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

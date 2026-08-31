@@ -15,8 +15,8 @@ pub struct ValueJson {
     pub value: serde_json::Value,
 }
 
-fn value_to_json(v: &forgelink_core_types::Value) -> ValueJson {
-    use forgelink_core_types::Value as V;
+fn value_to_json(v: &mesa_core_types::Value) -> ValueJson {
+    use mesa_core_types::Value as V;
     let (type_name, value) = match v {
         V::Bool(b) => ("bool", serde_json::json!(b)),
         V::I32(x) => ("i32", serde_json::json!(x)),
@@ -39,7 +39,7 @@ fn value_to_json(v: &forgelink_core_types::Value) -> ValueJson {
         | V::StringArray(_)
         | V::DateTimeArray(_)) =>
         {
-            use forgelink_core_types::Value::*;
+            use mesa_core_types::Value::*;
             let (name, arr): (&str, Vec<serde_json::Value>) = match arrays {
                 BoolArray(xs) => ("bool[]", xs.iter().map(|b| serde_json::json!(b)).collect()),
                 I32Array(xs) => ("i32[]", xs.iter().map(|b| serde_json::json!(b)).collect()),
@@ -138,7 +138,7 @@ impl Snapshot {
     pub fn register_points(
         &self,
         endpoint_id: &str,
-        defs: &[forgelink_core_types::PointDefinition],
+        defs: &[mesa_core_types::PointDefinition],
     ) {
         let mut keys = self.keys.lock().unwrap();
         for d in defs {
@@ -147,7 +147,7 @@ impl Snapshot {
     }
 
     /// 应用一个批次到 LatestValueCache。同点覆盖即"最新值胜出"的 Core 侧体现。
-    pub fn apply_batch(&self, batch: &forgelink_core_types::DataBatch, endpoint_id: &str) {
+    pub fn apply_batch(&self, batch: &mesa_core_types::DataBatch, endpoint_id: &str) {
         let mut latest = self.latest.lock().unwrap();
         for pv in &batch.values {
             let entry = LatestEntry {
