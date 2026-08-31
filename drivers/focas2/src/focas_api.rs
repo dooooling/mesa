@@ -241,6 +241,8 @@ impl FocasApi for NativeFocasApi {
         let lib_arc = std::sync::Arc::clone(&self.lib);
         let handle_arc = std::sync::Arc::clone(&self.handle);
 
+        // 语义批处理：PMC 连续区合并为范围读，减少 FOCAS 调用次数（P0）；其余资源仍按单点隔离，但同处一次 spawn_blocking 避免多次线程切换
+        // TODO: PMC 范围读需 Native 侧 pmc_rdpmcrng_range 支持（s..e 一次返回多字），当前先按组并发复用句柄锁，后续补 bulk FFI
         tokio::task::spawn_blocking(move || {
             let r = lib_arc.get_or_init(NativeLib::load);
             let lib = match r {
@@ -251,10 +253,72 @@ impl FocasApi for NativeFocasApi {
                 .lock()
                 .unwrap()
                 .ok_or_else(|| "NOT_CONNECTED 未调用 connect".to_string())?;
-            let mut out = Vec::with_capacity(addrs.len());
-            for addr in &addrs {
+            // PMC 分组：同 kind 且无位、地址连续的合并为一组，后续可转范围读
+            let mut pmc_groups: Vec<Vec<usize>> = Vec::new();
+            let mut other: Vec<usize> = Vec::new();
+            let mut cur_group: Vec<usize> = Vec::new();
+            let mut cur_kind: Option<char> = None;
+            let mut cur_next: Option<u32> = None;
+            for (idx, addr) in addrs.iter().enumerate() {
+                if let FocasAddress::Pmc { kind, addr: a, bit } = addr
+                    && bit.is_none()
+                {
+                    let can_merge =
+                        cur_kind == Some(*kind) && cur_next == Some(*a) && cur_group.len() < 10;
+                    if can_merge {
+                        cur_group.push(idx);
+                        cur_next = Some(a + 1);
+                        continue;
+                    } else {
+                        if !cur_group.is_empty() {
+                            pmc_groups.push(std::mem::take(&mut cur_group));
+                        }
+                        cur_group.push(idx);
+                        cur_kind = Some(*kind);
+                        cur_next = Some(a + 1);
+                        continue;
+                    }
+                }
+                if !cur_group.is_empty() {
+                    pmc_groups.push(std::mem::take(&mut cur_group));
+                    cur_kind = None;
+                    cur_next = None;
+                }
+                other.push(idx);
+            }
+            if !cur_group.is_empty() {
+                pmc_groups.push(cur_group);
+            }
+            let mut out: Vec<Option<Value>> = vec![None; addrs.len()];
+            for group in pmc_groups {
+                for idx in group {
+                    let addr = &addrs[idx];
+                    match Self::read_one_blocking(lib, hdl, addr) {
+                        Ok(v) => out[idx] = Some(v),
+                        Err(e) => {
+                            let low = e.to_ascii_lowercase();
+                            if low.contains("ew_noopt")
+                                || low.contains("ew_data")
+                                || low.contains("ew_range")
+                                || low.contains("ew_attrib")
+                                || low.contains("ew_length")
+                                || low.contains("ew_number")
+                                || low.contains("ew_param")
+                                || low.contains("ew_func")
+                            {
+                                tracing::warn!(?addr, error=%e, "FOCAS 单点不支持，转 Bad");
+                                out[idx] = Some(Value::String(format!("ERR:{}", e)));
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+            }
+            for idx in other {
+                let addr = &addrs[idx];
                 match Self::read_one_blocking(lib, hdl, addr) {
-                    Ok(v) => out.push(v),
+                    Ok(v) => out[idx] = Some(v),
                     Err(e) => {
                         let low = e.to_ascii_lowercase();
                         if low.contains("ew_noopt")
@@ -267,13 +331,17 @@ impl FocasApi for NativeFocasApi {
                             || low.contains("ew_func")
                         {
                             tracing::warn!(?addr, error=%e, "FOCAS 单点不支持，转 Bad");
-                            out.push(Value::String(format!("ERR:{}", e)));
+                            out[idx] = Some(Value::String(format!("ERR:{}", e)));
                         } else {
                             return Err(e);
                         }
                     }
                 }
             }
+            let out = out
+                .into_iter()
+                .map(|o| o.unwrap_or(Value::String("ERR:missing".into())))
+                .collect();
             Ok::<Vec<Value>, String>(out)
         })
         .await

@@ -270,9 +270,21 @@ impl S7Client {
         if items.is_empty() {
             return Ok(vec![]);
         }
-        // PDU 480 字节时单次最多约 19 项（12字节/item），超出分批
+        // PDU 480 字节时单次最多约 19 项（12字节/item），超出分批；同时按字节长度动态限流，避免 LREAL/STRING 大项撑爆 PDU
         let mut all: Vec<Option<Vec<u8>>> = Vec::with_capacity(items.len());
-        for chunk in items.chunks(S7_MAX_ITEMS_PER_PDU) {
+        let mut start = 0;
+        while start < items.len() {
+            let mut end = start + 1;
+            let mut bytes = items[start].kind.byte_len() + 12;
+            while end < items.len() && end - start < S7_MAX_ITEMS_PER_PDU {
+                let next_len = items[end].kind.byte_len() + 12 + 4; // 12 请求头 + 4 返回头
+                if bytes + next_len > self.pdu_length as usize - 32 {
+                    break;
+                }
+                bytes += next_len;
+                end += 1;
+            }
+            let chunk = &items[start..end];
             let pkt = build_read_req(self.pdu_ref, chunk);
             self.pdu_ref = self.pdu_ref.wrapping_add(1).max(1);
             timeout(self.cfg.timeout(), self.send_raw(&pkt))
@@ -293,6 +305,55 @@ impl S7Client {
                 })?;
             let mut part = parse_read_resp(&resp, chunk)?;
             all.append(&mut part);
+            start = end;
+        }
+        Ok(all)
+    }
+
+    /// 连续区合并后的批量 BYTE 读：每个 range 为 (起始地址, 字节长度) 的连续内存区，单次 PDU 同时按项数与总字节数限流。
+    /// 用于 S7 continuous-range merge，减少 PDU 往返（§7.1 合并连续区域）。
+    pub async fn read_byte_ranges(
+        &mut self,
+        ranges: &[(S7Address, usize)],
+    ) -> Result<Vec<Option<Vec<u8>>>, SdkDriverError> {
+        if ranges.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut all = Vec::with_capacity(ranges.len());
+        let mut start = 0;
+        while start < ranges.len() {
+            let mut end = start + 1;
+            let mut bytes = ranges[start].1 + 12 + 4;
+            while end < ranges.len() && end - start < S7_MAX_ITEMS_PER_PDU {
+                let next_len = ranges[end].1 + 12 + 4;
+                if bytes + next_len > self.pdu_length as usize - 32 {
+                    break;
+                }
+                bytes += next_len;
+                end += 1;
+            }
+            let chunk = &ranges[start..end];
+            let pkt = build_bulk_read_req(self.pdu_ref, chunk);
+            self.pdu_ref = self.pdu_ref.wrapping_add(1).max(1);
+            timeout(self.cfg.timeout(), self.send_raw(&pkt))
+                .await
+                .map_err(|_| {
+                    SdkDriverError::new(ErrorKind::Timeout, "READ_TIMEOUT", "Bulk Read 请求超时")
+                })?
+                .map_err(|e| {
+                    SdkDriverError::new(ErrorKind::Connection, "READ_SEND_FAIL", e.to_string())
+                })?;
+            let resp = timeout(self.cfg.timeout(), self.recv_packet())
+                .await
+                .map_err(|_| {
+                    SdkDriverError::new(ErrorKind::Timeout, "READ_TIMEOUT", "Bulk Read 响应超时")
+                })?
+                .map_err(|e| {
+                    SdkDriverError::new(ErrorKind::Connection, "READ_RECV_FAIL", e.to_string())
+                })?;
+            let part = parse_bulk_resp(&resp, chunk)?;
+            all.extend(part);
+            start = end;
         }
         Ok(all)
     }
@@ -429,6 +490,137 @@ fn build_read_req(pdu_ref: u16, items: &[ReadItem]) -> Vec<u8> {
     pkt.extend_from_slice(&cotp);
     pkt.extend_from_slice(&s7);
     pkt
+}
+
+fn build_bulk_read_req(pdu_ref: u16, ranges: &[(S7Address, usize)]) -> Vec<u8> {
+    // 连续区合并后：每 range 作为一次 BYTE 批量读，transport 固定 BYTE(0x02)，length 为 range 字节数
+    let mut param = Vec::with_capacity(2 + ranges.len() * 12);
+    param.push(S7_FUNC_READ);
+    param.push(ranges.len() as u8);
+    for (addr, len) in ranges {
+        let area = addr.area.code();
+        let db = addr.db_number;
+        let bit_addr = addr.bit_address();
+        let transport = match addr.area {
+            crate::address::Area::Counter => 0x1C,
+            crate::address::Area::Timer => 0x1D,
+            _ => 0x02, // BYTE 批量
+        };
+        let req_len = match addr.area {
+            crate::address::Area::Counter | crate::address::Area::Timer => 1,
+            _ => *len as u16,
+        };
+        param.extend_from_slice(&[S7_VAR_SPEC, S7_VAR_SPEC_LEN, S7_SYNTAX_ID_S7ANY, transport]);
+        param.extend_from_slice(&req_len.to_be_bytes());
+        param.extend_from_slice(&db.to_be_bytes());
+        param.push(area);
+        param.push(((bit_addr >> 16) & 0xFF) as u8);
+        param.push(((bit_addr >> 8) & 0xFF) as u8);
+        param.push((bit_addr & 0xFF) as u8);
+    }
+    let param_len = param.len() as u16;
+    let mut s7 = Vec::with_capacity(12 + param.len());
+    s7.extend_from_slice(&[0x32, S7_ROSCTR_JOB, 0x00, 0x00]);
+    s7.extend_from_slice(&pdu_ref.to_be_bytes());
+    s7.extend_from_slice(&param_len.to_be_bytes());
+    s7.extend_from_slice(&[0x00, 0x00]);
+    s7.extend_from_slice(&param);
+    let cotp = [0x02, COTP_DT, 0x80];
+    let tpkt_len = (4 + cotp.len() + s7.len()) as u16;
+    let mut pkt = vec![
+        TPKT_VERSION,
+        0x00,
+        (tpkt_len >> 8) as u8,
+        (tpkt_len & 0xFF) as u8,
+    ];
+    pkt.extend_from_slice(&cotp);
+    pkt.extend_from_slice(&s7);
+    pkt
+}
+
+fn parse_bulk_resp(
+    resp: &[u8],
+    ranges: &[(S7Address, usize)],
+) -> Result<Vec<Option<Vec<u8>>>, SdkDriverError> {
+    if resp.len() < 7 + 12 {
+        return Err(SdkDriverError::new(
+            ErrorKind::Protocol,
+            "READ_SHORT",
+            format!("Bulk 响应过短 {}", resp.len()),
+        ));
+    }
+    let s7 = &resp[7..];
+    if s7.len() < 12 {
+        return Err(SdkDriverError::new(
+            ErrorKind::Protocol,
+            "S7_SHORT",
+            "S7 头部缺失",
+        ));
+    }
+    let rosctr = s7[1];
+    if rosctr != S7_ROSCTR_ACK {
+        let err_class = s7.get(17).copied().unwrap_or(0);
+        return Err(map_s7_error(
+            err_class,
+            &format!("Bulk Read 被拒绝 rosctr={:02x}", rosctr),
+        ));
+    }
+    let param_len = u16::from_be_bytes([s7[6], s7[7]]) as usize;
+    let data_len = u16::from_be_bytes([s7[8], s7[9]]) as usize;
+    if s7.len() < 12 + param_len + data_len {
+        return Err(SdkDriverError::new(
+            ErrorKind::Protocol,
+            "S7_LEN_MISMATCH",
+            "S7 长度与实际不符",
+        ));
+    }
+    let data = &s7[12 + param_len..12 + param_len + data_len];
+    let mut out = Vec::with_capacity(ranges.len());
+    let mut off = 0;
+    for (idx, (_, expect_len)) in ranges.iter().enumerate() {
+        if off + 4 > data.len() {
+            return Err(SdkDriverError::new(
+                ErrorKind::Protocol,
+                "READ_ITEM_SHORT",
+                format!("bulk {idx} 头部缺失"),
+            ));
+        }
+        let ret = data[off];
+        let _transport = data[off + 1];
+        let len_bits = u16::from_be_bytes([data[off + 2], data[off + 3]]) as usize;
+        off += 4;
+        if ret != S7_ITEM_OK {
+            tracing::warn!(idx, ret, "Bulk item BAD");
+            let byte_len = len_bits.div_ceil(8);
+            if byte_len > 0 && off + byte_len <= data.len() {
+                off += byte_len;
+                if byte_len % 2 == 1 && off < data.len() && idx + 1 < ranges.len() {
+                    // 字对齐填充
+                    if data[off] == 0x00 {
+                        off += 1;
+                    }
+                }
+            }
+            out.push(None);
+            continue;
+        }
+        let byte_len = len_bits.div_ceil(8);
+        // 期望长度与实际返回长度取小，避免 STRING 等短回
+        let take = (*expect_len).min(byte_len).max(1);
+        if off + take > data.len() {
+            return Err(SdkDriverError::new(
+                ErrorKind::Protocol,
+                "READ_DATA_SHORT",
+                format!("bulk {idx} 数据缺失"),
+            ));
+        }
+        out.push(Some(data[off..off + take].to_vec()));
+        off += byte_len;
+        if byte_len % 2 == 1 && off < data.len() && idx + 1 < ranges.len() && data[off] == 0x00 {
+            off += 1;
+        }
+    }
+    Ok(out)
 }
 
 fn parse_read_resp(

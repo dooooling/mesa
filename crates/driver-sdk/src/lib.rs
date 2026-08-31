@@ -210,9 +210,10 @@ impl DataSink {
             batch.connection_handle = self.handle;
             batch.stream_epoch = self.epoch;
         }
-        match self.tx.try_send(OutboundMsg::Data(batch.clone())) {
+        // 非阻塞发送：成功则零拷贝直接入队，仅在 Full 时才进入合并路径，避免热路径无条件 clone
+        match self.tx.try_send(OutboundMsg::Data(batch)) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(mpsc::error::TrySendError::Full(OutboundMsg::Data(batch))) => {
                 let mut st = self.state.lock().unwrap();
                 // 先 take 再合并，避免对 state 的双重可变借用
                 let mut coalesced = 0u64;
@@ -240,6 +241,10 @@ impl DataSink {
                 };
                 st.coalesced_points += coalesced;
                 st.pending = Some(new_pending);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // 控制帧 Full 理论上不发生（Control 永不合并），静默丢弃以保活
+                tracing::warn!("控制通道满，丢弃非数据帧");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 // Core 连接已断开：静默丢弃即可，进程级退出由 server 循环处理

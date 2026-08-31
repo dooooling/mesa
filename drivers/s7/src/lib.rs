@@ -326,6 +326,7 @@ impl DriverConnection for S7Connection {
                     // 组装本任务的读项：BOOL 按所在字节的 BYTE 读取后本地取位，避免 BIT 传输的兼容性差异；
                     // 连续合并：同 DB 内按 byte_offset 排序后，若下一项紧接上一项尾部则合并为一次变长读，减少 PDU 往返（V1 §7.1 合并连续区域）
                     // 保持 point 与 ReadItem 同序排序，避免排序后 zip 错位
+                    // 组装本任务的读项：BOOL 按所在字节的 BYTE 读取后本地取位，避免 BIT 传输的兼容性差异
                     let mut paired: Vec<((PointSpec, u32), ReadItem)> = points
                         .iter()
                         .map(|(spec, pid)| {
@@ -345,31 +346,105 @@ impl DriverConnection for S7Connection {
                             ((spec.clone(), *pid), item)
                         })
                         .collect();
+                    // 按 (area, db, byte_offset) 排序，为连续合并做准备
                     paired.sort_by(|a, b| {
                         a.1.addr
-                            .db_number
-                            .cmp(&b.1.addr.db_number)
+                            .area
+                            .code()
+                            .cmp(&b.1.addr.area.code())
+                            .then(a.1.addr.db_number.cmp(&b.1.addr.db_number))
                             .then(a.1.addr.byte_offset.cmp(&b.1.addr.byte_offset))
-                            .then(a.1.addr.area.code().cmp(&b.1.addr.area.code()))
                     });
-                    let items: Vec<ReadItem> = paired.iter().map(|(_, it)| it.clone()).collect();
-                    // NOTE: 合并实现为 TODO 占位，当前仍按单项 12+len 发 PDU，P1 再按 PDU 剩余动态合并；此处保留排序以保证后续合并稳定
-                    let raw_vec = {
+                    // 连续区合并：将同一 area/db 内相邻或重叠的 Byte 区间合并为一次 BYTE 批量读，减少 PDU 往返
+                    // STRING/WSTRING(256/516B) 单独成区不与小项合并，避免无意义大范围读取；单区上限 200B 适配 PDU 480
+                    const MAX_BULK_LEN: usize = 200;
+                    const GAP_THRESHOLD: u32 = 4;
+                    struct Bulk {
+                        base: S7Address,
+                        len: usize,
+                        members: Vec<(usize, usize, S7Kind, u32)>, // (paired_idx, offset_in_bulk, kind, pid)
+                    }
+                    let mut bulks: Vec<Bulk> = Vec::new();
+                    let mut cur: Option<Bulk> = None;
+                    for (idx, ((spec, pid), item)) in paired.iter().enumerate() {
+                        let is_string = matches!(item.kind, S7Kind::String | S7Kind::WString);
+                        let item_len = item.kind.byte_len();
+                        let start = item.addr.byte_offset;
+                        let end = start + item_len as u32;
+                        let can_merge = if let Some(c) = cur.as_ref() {
+                            let c_end = c.base.byte_offset + c.len as u32;
+                            let c_has_string = c.members.iter().any(|(mi, _, _, _)| {
+                                matches!(paired[*mi].1.kind, S7Kind::String | S7Kind::WString)
+                            });
+                            !is_string
+                                && !c_has_string
+                                && item.addr.area == c.base.area
+                                && item.addr.db_number == c.base.db_number
+                                && start <= c_end + GAP_THRESHOLD
+                                && (end.max(c_end) - c.base.byte_offset) as usize <= MAX_BULK_LEN
+                        } else {
+                            false
+                        };
+                        if can_merge {
+                            let c = cur.as_mut().unwrap();
+                            let c_end = c.base.byte_offset + c.len as u32;
+                            let new_end = end.max(c_end);
+                            c.len = (new_end - c.base.byte_offset) as usize;
+                            let offset = (start - c.base.byte_offset) as usize;
+                            c.members.push((idx, offset, item.kind, *pid));
+                        } else {
+                            if let Some(c) = cur.take() {
+                                bulks.push(c);
+                            }
+                            cur = Some(Bulk {
+                                base: item.addr.clone(),
+                                len: item_len,
+                                members: vec![(idx, 0, item.kind, *pid)],
+                            });
+                            // 兼容 spec.kind 仅用于后续 BOOL 取位时需保留原 bit 信息，已在 spec 中
+                            let _ = spec;
+                        }
+                    }
+                    if let Some(c) = cur.take() {
+                        bulks.push(c);
+                    }
+                    // 按 bulk 发起批量 BYTE 读，client 内部再按 PDU 剩余动态分批
+                    let ranges: Vec<(S7Address, usize)> =
+                        bulks.iter().map(|b| (b.base.clone(), b.len)).collect();
+                    let bulk_raws: Vec<Option<Vec<u8>>> = {
                         let mut guard = client.lock().await;
-                        match guard.read_vars(&items).await {
+                        match guard.read_byte_ranges(&ranges).await {
                             Ok(v) => v,
                             Err(e) => {
-                                tracing::error!(task=%task_id, error=%e, "S7 读失败");
+                                tracing::error!(task=%task_id, error=%e, "S7 bulk 读失败");
                                 return Err(e);
                             }
                         }
                     };
-                    // 解码并发布：按项 BAD 隔离，None 表示该项 S7 0x05/0x06，直接跳过，GOOD 项仍发布
+                    // 将 bulk 字节切片分发回各点，按项 BAD 隔离：整 bulk None 则其成员全部跳过
+                    let mut raw_by_paired: Vec<Option<Vec<u8>>> = vec![None; paired.len()];
+                    for (bulk, raw_opt) in bulks.iter().zip(bulk_raws) {
+                        let bulk_bytes = match raw_opt {
+                            Some(b) => b,
+                            None => continue,
+                        };
+                        for (paired_idx, offset, kind, _pid) in &bulk.members {
+                            let need = kind.byte_len();
+                            if *offset + need <= bulk_bytes.len() {
+                                raw_by_paired[*paired_idx] =
+                                    Some(bulk_bytes[*offset..*offset + need].to_vec());
+                            } else if *offset < bulk_bytes.len() {
+                                // STRING 等返回短于预期时按实际截断，上层 decode 会按 cur_len 处理
+                                raw_by_paired[*paired_idx] = Some(bulk_bytes[*offset..].to_vec());
+                            }
+                        }
+                    }
+                    // 解码并发布
                     let values: Vec<PointValue> = paired
                         .iter()
-                        .zip(raw_vec)
-                        .filter_map(|(((spec, pid), _), raw_opt)| {
-                            let raw = match raw_opt {
+                        .enumerate()
+                        .filter_map(|(idx, ((spec, pid), _))| {
+                            let raw = match &raw_by_paired[idx] {
                                 Some(v) => v,
                                 None => return None,
                             };
@@ -378,7 +453,7 @@ impl DriverConnection for S7Connection {
                                 let b = raw.first().copied().unwrap_or(0);
                                 Ok(Value::Bool(((b >> bit) & 1) != 0))
                             } else {
-                                decode_value(&raw, spec.kind)
+                                decode_value(raw, spec.kind)
                             };
                             match vt {
                                 Ok(v) => Some(PointValue::good(*pid, v)),
