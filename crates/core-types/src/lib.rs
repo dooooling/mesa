@@ -19,8 +19,8 @@ pub fn now_unix_ns() -> TimestampNs {
 }
 
 /// 宿主机单调时钟（CLOCK_MONOTONIC），用于 IPC/E2E p95/p99 测量，禁止两进程 UTC 相减。
-/// Linux 用 clock_gettime，Windows 用 OnceLock<Instant> 锚点（进程内单调，跨进程差值为进程启动差，需同宿主 QPC 时再换 winapi）。
-/// 返回值自锚点起的纳秒数，10s 内跨进程差值误差 < 进程启动差（通常 <100ms），满足 p95/p99 量级判断。
+/// Linux 用 `clock_gettime(CLOCK_MONOTONIC)`，Windows 用 `QueryPerformanceCounter` 绝对计数（跨进程同频，可比）。
+/// 返回绝对 QPC 换算的纳秒数（自系统启动起），同宿主所有进程零点一致，可直接相减得 IPC latency。
 pub fn host_mono_ns() -> u64 {
     #[cfg(unix)]
     {
@@ -36,11 +36,21 @@ pub fn host_mono_ns() -> u64 {
     }
     #[cfg(windows)]
     {
-        use std::sync::OnceLock;
-        use std::time::Instant;
-        static START: OnceLock<Instant> = OnceLock::new();
-        let s = START.get_or_init(Instant::now);
-        Instant::now().duration_since(*s).as_nanos() as u64
+        // QPC 绝对计数：counter * 1e9 / frequency，跨进程同频可比，无需 per-process START 锚点
+        unsafe {
+            let mut freq: i64 = 0;
+            let mut cnt: i64 = 0;
+            // SAFETY: windows-sys 声明为 unsafe extern "system"
+            let fr = windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut freq);
+            if fr == 0 || freq <= 0 {
+                return 0;
+            }
+            let cr = windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut cnt);
+            if cr == 0 {
+                return 0;
+            }
+            ((cnt as u128 * 1_000_000_000u128) / (freq as u128)) as u64
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {

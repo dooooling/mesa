@@ -38,6 +38,7 @@ async-trait = "0.1"
 prost = "0.13"
 bytes = "1"
 libc = "0.2"
+windows-sys = { version = "0.59", features = ["Win32_System_Performance"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

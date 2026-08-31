@@ -1196,8 +1196,22 @@ impl NativeLib {
         }
     }
 
+    /// PMC 统一布局：single/range 共用，解决 single M/K/E=BYTE 与 range WORD 的自相矛盾
+    /// 返回 (data_type, width_bytes, base_len)，width 为地址步距（BYTE=1, WORD=2, DWORD=4）
+    pub fn pmc_layout(kind: char, bit: Option<u8>) -> (c_short, usize, c_short) {
+        if bit.is_some() {
+            return (PMC_DATA_BIT, 1, PMC_LEN_BYTE);
+        }
+        match kind.to_ascii_uppercase() {
+            'D' => (PMC_DATA_DWORD, 4, PMC_LEN_DWORD),
+            'R' | 'A' | 'T' | 'C' => (PMC_DATA_WORD, 2, PMC_LEN_WORD),
+            _ => (PMC_DATA_BIT, 1, PMC_LEN_BYTE), // G/X/Y/F/M/K/N/E/Z/B 等均为 BYTE
+        }
+    }
+
     /// 批量读 PMC 字 range：一次 FFI 读 count 个连续字，用于 PMC true range 合并（P1）
     /// 返回 I32 统一 single/range 类型（single c_short→I32，range Vec<c_short>→Vec<I32>）
+    /// 注意 WORD width=2，故 e_number = start + count*2 -1，buf_len = 8 + count*2
     pub fn pmc_read_word_range(
         &self,
         hdl: u16,
@@ -1205,17 +1219,23 @@ impl NativeLib {
         start: u32,
         count: u32,
     ) -> Result<Vec<i32>, FocasRet> {
-        if count == 0 || count > 32 {
+        if count == 0 || count > 16 {
+            // WORD 16 个以内（32 字节以内），避免单次 FFI 长度超出
             return Err(FocasRet::Param);
         }
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
+        // 校验布局：仅 WORD 类型允许走此路径，其他应走 byte/dword
+        let (dt, width, _) = Self::pmc_layout('R', None);
+        debug_assert_eq!(dt, PMC_DATA_WORD);
+        debug_assert_eq!(width, 2);
+        let end = start + count * 2 - 1;
         let len = 8 + (count as usize) * 2;
         let mut buf = vec![0u8; len];
         let header = IodbPmc1 {
             type_a: adr_type,
             type_d: PMC_DATA_WORD,
             datano_s: start as c_short,
-            datano_e: (start + count - 1) as c_short,
+            datano_e: end as c_short,
             idata: [0; 8],
         };
         let hdr_bytes = unsafe { std::slice::from_raw_parts(&header as *const _ as *const u8, 8) };
@@ -1226,7 +1246,7 @@ impl NativeLib {
                 adr_type,
                 PMC_DATA_WORD,
                 start as c_short,
-                (start + count - 1) as c_short,
+                end as c_short,
                 len as c_short,
                 buf.as_mut_ptr(),
             )

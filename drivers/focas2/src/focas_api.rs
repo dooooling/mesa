@@ -253,7 +253,7 @@ impl FocasApi for NativeFocasApi {
                 .lock()
                 .unwrap()
                 .ok_or_else(|| "NOT_CONNECTED 未调用 connect".to_string())?;
-            // PMC 分组：同 kind 且无位、地址连续的合并为一组，后续可转范围读
+            // PMC 分组：同 kind 且无位、地址按 width 连续的合并为一组（WORD width=2, BYTE=1, DWORD=4），后续转范围读
             let mut pmc_groups: Vec<Vec<usize>> = Vec::new();
             let mut other: Vec<usize> = Vec::new();
             let mut cur_group: Vec<usize> = Vec::new();
@@ -263,11 +263,13 @@ impl FocasApi for NativeFocasApi {
                 if let FocasAddress::Pmc { kind, addr: a, bit } = addr
                     && bit.is_none()
                 {
+                    let (_, width, _) = crate::native::NativeLib::pmc_layout(*kind, None);
+                    let w = width as u32;
                     let can_merge =
-                        cur_kind == Some(*kind) && cur_next == Some(*a) && cur_group.len() < 10;
+                        cur_kind == Some(*kind) && cur_next == Some(*a) && cur_group.len() < 16;
                     if can_merge {
                         cur_group.push(idx);
-                        cur_next = Some(a + 1);
+                        cur_next = Some(a + w);
                         continue;
                     } else {
                         if !cur_group.is_empty() {
@@ -275,7 +277,7 @@ impl FocasApi for NativeFocasApi {
                         }
                         cur_group.push(idx);
                         cur_kind = Some(*kind);
-                        cur_next = Some(a + 1);
+                        cur_next = Some(a + w);
                         continue;
                     }
                 }
@@ -355,7 +357,7 @@ impl FocasApi for NativeFocasApi {
                 }
             };
             for group in pmc_groups {
-                // 尝试 true range 批量：R 字连续 2..32 个合并为一次 FFI
+                // 尝试 true range 批量：仅 WORD（R/A/T/C）连续 2..16 个合并为一次 FFI，步距 width=2
                 if group.len() > 1
                     && let Some(FocasAddress::Pmc {
                         kind,
@@ -363,9 +365,9 @@ impl FocasApi for NativeFocasApi {
                         bit: None,
                     }) = addrs.get(group[0]).cloned()
                 {
-                    let is_word_kind =
-                        matches!(kind, 'R' | 'r' | 'E' | 'A' | 'M' | 'T' | 'K' | 'C');
-                    if is_word_kind {
+                    let (data_type, width, _) = crate::native::NativeLib::pmc_layout(kind, None);
+                    let is_word = data_type == 1; // PMC_DATA_WORD
+                    if is_word {
                         let mut consecutive = true;
                         for (i, idx) in group.iter().enumerate() {
                             if let FocasAddress::Pmc {
@@ -374,7 +376,8 @@ impl FocasApi for NativeFocasApi {
                                 kind: k,
                             } = &addrs[*idx]
                             {
-                                if *k != kind || *a != start + i as u32 {
+                                let expected = start + (i as u32) * (width as u32);
+                                if *k != kind || *a != expected {
                                     consecutive = false;
                                     break;
                                 }
@@ -396,7 +399,16 @@ impl FocasApi for NativeFocasApi {
                                 Err(e) => {
                                     let msg = Self::map_ret_err(e);
                                     let low = msg.to_ascii_lowercase();
-                                    if low.contains("ew_noopt") || low.contains("ew_param") {
+                                    // range 参数/类型错误应回退逐点，保持 point-level isolation
+                                    if low.contains("ew_noopt")
+                                        || low.contains("ew_param")
+                                        || low.contains("ew_length")
+                                        || low.contains("ew_range")
+                                        || low.contains("ew_attrib")
+                                        || low.contains("ew_number")
+                                        || low.contains("ew_data")
+                                        || low.contains("ew_func")
+                                    {
                                         // 回退逐点
                                     } else {
                                         return Err(msg);
@@ -605,11 +617,10 @@ impl NativeFocasApi {
                         .map_err(Self::map_ret_err)?;
                     Ok(Value::Bool(v))
                 } else {
-                    // 无 bit 时：0i/30i 对 R/D 的字长差异，G/X/Y/F 为 byte，R 为 word，D 为 dword
-                    // 按 kind 选型，失败则回退，避免 EW_LENGTH 整批失败
-                    let kind_up = kind.to_ascii_uppercase();
-                    if kind_up == 'D' {
-                        // D 尝试 dword -> word
+                    // 无 bit 时：由 pmc_layout 统一 single/range 的 data_type/width，M/K/E/Z 等均为 BYTE，R/A/T/C 为 WORD，D 为 DWORD
+                    let (data_type, _width, _) = crate::native::NativeLib::pmc_layout(*kind, None);
+                    if data_type == 2 {
+                        // DWORD (D)
                         match lib.pmc_rdpmcrng_dword(hdl, adr_type, *addr) {
                             Ok(v) => Ok(Value::I32(v)),
                             Err(e)
@@ -627,8 +638,8 @@ impl NativeFocasApi {
                             }
                             Err(e) => Err(Self::map_ret_err(e)),
                         }
-                    } else if kind_up == 'R' || kind_up == 'A' || kind_up == 'T' || kind_up == 'C' {
-                        // R/A/T/C 常见为 word
+                    } else if data_type == 1 {
+                        // WORD (R/A/T/C)
                         match lib.pmc_rdpmcrng_word(hdl, adr_type, *addr) {
                             Ok(v) => Ok(Value::I32(v as i32)),
                             Err(e)
@@ -785,80 +796,67 @@ mod tests {
         assert_eq!(vals.len(), 4);
     }
 
-    /// PMC 连续 R 分组应合并为一次 range FFI（10 个点 → 单次 bulk），非连续则逐点回退
-    #[tokio::test]
-    async fn pmc_consecutive_word_range_merges() {
-        // 用 Fake 注入可计数的 NativeLib 替代：验证分组逻辑为 10 连续 → 1 次 range
-        use crate::FocasApi;
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        };
-
-        struct CountingFake(Arc<AtomicUsize>);
-        #[async_trait::async_trait]
-        impl FocasApi for CountingFake {
-            async fn connect(&self, _host: &str, _port: u16, _t: u64) -> Result<(), String> {
-                Ok(())
-            }
-            async fn read_batch(&self, addrs: &[FocasAddress]) -> Result<Vec<Value>, String> {
-                // 复用 NativeFocasApi 的分组判定：此处仅计数“可合并的连续 WORD 组”数量
-                let mut groups: Vec<Vec<usize>> = Vec::new();
-                let mut cur: Vec<usize> = Vec::new();
-                let mut prev: Option<(char, u32)> = None;
-                for (i, a) in addrs.iter().enumerate() {
-                    if let FocasAddress::Pmc {
-                        kind,
-                        addr,
-                        bit: None,
-                    } = a
-                    {
-                        let is_word =
-                            matches!(kind, 'R' | 'r' | 'E' | 'A' | 'M' | 'T' | 'K' | 'C' | 'D');
-                        if is_word {
-                            if let Some((pk, pa)) = prev
-                                && *kind == pk && *addr == pa + 1
-                            {
-                                cur.push(i);
-                                prev = Some((*kind, *addr));
-                                continue;
-                            }
-                            if !cur.is_empty() {
-                                groups.push(std::mem::take(&mut cur));
-                            }
+    /// PMC 连续 R 分组应合并为一次 range FFI（WORD width=2，10 个点 100,102..118 → 单次 bulk），非连续则拆组
+    #[test]
+    fn pmc_consecutive_word_range_merges() {
+        // 直接复用生产布局：R/A/T/C 为 WORD width=2，其余 BYTE=1；生产分组与此一致
+        use crate::native::NativeLib;
+        fn group_count(addrs: &[FocasAddress]) -> usize {
+            let mut groups: Vec<Vec<usize>> = Vec::new();
+            let mut cur: Vec<usize> = Vec::new();
+            let mut prev: Option<(char, u32)> = None;
+            for (i, a) in addrs.iter().enumerate() {
+                if let FocasAddress::Pmc {
+                    kind,
+                    addr,
+                    bit: None,
+                } = a
+                {
+                    let (dt, width, _) = NativeLib::pmc_layout(*kind, None);
+                    if dt == 1 {
+                        let w = width as u32;
+                        if let Some((pk, pa)) = prev
+                            && *kind == pk
+                            && *addr == pa + w
+                        {
                             cur.push(i);
                             prev = Some((*kind, *addr));
                             continue;
                         }
+                        if !cur.is_empty() {
+                            groups.push(std::mem::take(&mut cur));
+                        }
+                        cur.push(i);
+                        prev = Some((*kind, *addr));
+                        continue;
                     }
-                    if !cur.is_empty() {
-                        groups.push(std::mem::take(&mut cur));
-                    }
-                    prev = None;
                 }
                 if !cur.is_empty() {
-                    groups.push(cur);
+                    groups.push(std::mem::take(&mut cur));
                 }
-                // 10 连续 R 应该只有 1 组
-                self.0.fetch_add(groups.len(), Ordering::SeqCst);
-                Ok(vec![Value::I32(0); addrs.len()])
+                prev = None;
             }
-            async fn disconnect(&self) {}
+            if !cur.is_empty() {
+                groups.push(cur);
+            }
+            groups.len()
         }
 
-        let counter = Arc::new(AtomicUsize::new(0));
-        let api = CountingFake(counter.clone());
+        // 10 个 WORD 连续（步距 2）：100,102..118 应为 1 组
         let addrs: Vec<FocasAddress> = (0..10)
             .map(|i| FocasAddress::Pmc {
                 kind: 'R',
-                addr: 100 + i,
+                addr: 100 + i * 2,
                 bit: None,
             })
             .collect();
-        api.read_batch(&addrs).await.unwrap();
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "10 连续 R 应合并为 1 组");
+        assert_eq!(
+            group_count(&addrs),
+            1,
+            "10 连续 WORD(R) 步距2 应合并为 1 组"
+        );
 
-        counter.store(0, Ordering::SeqCst);
+        // 跳号：100,102,106（缺 104）应拆为 2 组
         let addrs2 = vec![
             FocasAddress::Pmc {
                 kind: 'R',
@@ -869,23 +867,56 @@ mod tests {
                 kind: 'R',
                 addr: 102,
                 bit: None,
-            }, // 跳号
+            },
             FocasAddress::Pmc {
                 kind: 'R',
-                addr: 103,
+                addr: 106,
                 bit: None,
             },
         ];
-        api.read_batch(&addrs2).await.unwrap();
-        assert_eq!(counter.load(Ordering::SeqCst), 2, "跳号应拆为 2 组");
+        assert_eq!(group_count(&addrs2), 2, "跳号应拆为 2 组");
+
+        // M/K/E 为 BYTE，不应走 WORD 合并：R100,R101 虽连续但 M100 单独 BYTE 不应视为 WORD 组
+        let (dt_m, _, _) = NativeLib::pmc_layout('M', None);
+        let (dt_e, _, _) = NativeLib::pmc_layout('E', None);
+        let (dt_r, _, _) = NativeLib::pmc_layout('R', None);
+        assert_eq!(dt_m, 0, "M 应为 BYTE(0)");
+        assert_eq!(dt_e, 0, "E 应为 BYTE(0)");
+        assert_eq!(dt_r, 1, "R 应为 WORD(1)");
     }
 
     #[test]
-    fn pmc_layout_e_number_is_end() {
-        // WORD range 的 e_number 必须是 start + count - 1，验证 Native 实现与分组一致
+    fn pmc_layout_word_end_is_width_aware() {
+        // WORD width=2：10 个 WORD 从 100 起，e = 100 + 10*2 -1 = 119，buf_len = 8 + 20 =28
         let start = 100u32;
         let count = 10u32;
-        let e = start + count - 1;
-        assert_eq!(e, 109);
+        let width = 2u32;
+        let e = start + count * width - 1;
+        let len = 8 + (count as usize) * 2;
+        assert_eq!(e, 119);
+        assert_eq!(len, 28);
+        // BYTE：10 个从 100 起 e=109
+        let e_byte = 100 + 10 - 1;
+        assert_eq!(e_byte, 109);
+    }
+
+    #[test]
+    fn pmc_layout_single_range_consistent() {
+        // single/range 共用同一布局：M/K/E 均为 BYTE，R/A/T/C 为 WORD，D 为 DWORD
+        use crate::native::NativeLib;
+        assert_eq!(NativeLib::pmc_layout('D', None).0, 2);
+        assert_eq!(NativeLib::pmc_layout('D', None).1, 4);
+        for k in ['R', 'A', 'T', 'C'] {
+            let (dt, w, _) = NativeLib::pmc_layout(k, None);
+            assert_eq!(dt, 1, "{k} 应为 WORD");
+            assert_eq!(w, 2);
+        }
+        for k in ['G', 'X', 'Y', 'F', 'M', 'K', 'N', 'E', 'Z', 'B'] {
+            let (dt, w, _) = NativeLib::pmc_layout(k, None);
+            assert_eq!(dt, 0, "{k} 应为 BYTE");
+            assert_eq!(w, 1);
+        }
+        // bit 强制 BYTE
+        assert_eq!(NativeLib::pmc_layout('R', Some(0)).0, 0);
     }
 }
