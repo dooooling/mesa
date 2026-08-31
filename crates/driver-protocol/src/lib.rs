@@ -206,6 +206,7 @@ pub fn batch_to_pb(b: &DataBatch) -> pb::DataBatchMsg {
         sequence: b.sequence,
         timestamp_ns: b.timestamp_ns,
         values: b.values.iter().map(point_value_to_pb).collect(),
+        mono_ns: b.mono_ns,
     }
 }
 
@@ -221,6 +222,7 @@ pub fn batch_from_pb(b: pb::DataBatchMsg) -> Result<DataBatch, ConvertError> {
         sequence: b.sequence,
         timestamp_ns: b.timestamp_ns,
         values,
+        mono_ns: b.mono_ns,
     })
 }
 

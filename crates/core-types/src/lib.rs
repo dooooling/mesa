@@ -236,6 +236,10 @@ pub struct DataBatch {
     pub sequence: u64,
     pub timestamp_ns: TimestampNs,
     pub values: Vec<PointValue>,
+    /// 单调时钟埋点（Driver 侧 publish 时的 Instant 采样，单位 ns），用于 IPC/E2E p95/p99。
+    /// 0/None 表示未埋点（旧 Driver 兼容）。
+    #[serde(default)]
+    pub mono_ns: Option<u64>,
 }
 
 /// 任务执行模式（方案 §5.5）：Poll 周期轮询；Subscribe 由服务端推送（OPC UA）。

@@ -1,6 +1,5 @@
 //! 真正的 end-to-end 50K throughput benchmark（跨进程 TCP + Protobuf + 单调时钟）
-//! 本用例验证：跨进程 TCP + Protobuf 的实际 point throughput + Core Snapshot apply latency
-//! 不验证：Driver→Core IPC E2E latency（需 proto 单调戳，P1）
+//! 本用例验证：跨进程 TCP + Protobuf 的实际 point throughput + Core Snapshot apply latency + IPC E2E latency（mono_ns）
 //! §22 完整预算：≥50K Point Updates/s 持续 60min，IPC p95≤20ms p99≤50ms（单调时钟），RSS 有界
 
 use std::time::{Duration, Instant};
@@ -85,15 +84,18 @@ async fn e2e_50k_real_throughput() {
     let delta_env = end_env.saturating_sub(start_env);
     let ups = delta_points as f64 / elapsed;
 
-    // Snapshot apply 延迟百分位（非 IPC/E2E，真 E2E 需 proto 单调戳，列为 P1）
     let lat = snap.snapshot_apply_latencies_snapshot();
     let p50 = percentile(lat.clone(), 50.0);
     let p95 = percentile(lat.clone(), 95.0);
     let p99 = percentile(lat.clone(), 99.0);
+    let ipc_lat = snap.ipc_latencies_snapshot();
+    let ipc_p50 = percentile(ipc_lat.clone(), 50.0);
+    let ipc_p95 = percentile(ipc_lat.clone(), 95.0);
+    let ipc_p99 = percentile(ipc_lat.clone(), 99.0);
 
     println!(
-        "e2e_50k_real elapsed={:.2}s delta_points={} delta_env={} ups={:.0} snapshot_apply_p50={}ns p95={}ns p99={}ns",
-        elapsed, delta_points, delta_env, ups, p50, p95, p99
+        "e2e_50k_real elapsed={:.2}s delta_points={} delta_env={} ups={:.0} snapshot_apply_p50={}ns p95={}ns p99={}ns ipc_p50={}ns p95={}ns p99={}ns",
+        elapsed, delta_points, delta_env, ups, p50, p95, p99, ipc_p50, ipc_p95, ipc_p99
     );
 
     // 强断言：失败必须 fail，无假阳性
@@ -109,10 +111,13 @@ async fn e2e_50k_real_throughput() {
         ups >= threshold,
         "实际 updates/s {ups:.0} 未达阈值 {threshold:.0}（delta {delta_points} / {elapsed:.1}s），不满足 §22 50K"
     );
-    // Snapshot apply 延迟（非 IPC/E2E，真 E2E 需 proto 单调戳，列 P1）
     if !lat.is_empty() && p95 != 0 {
         assert!(p95 <= 20_000_000, "snapshot_apply_p95 {p95}ns >20ms");
         assert!(p99 <= 50_000_000, "snapshot_apply_p99 {p99}ns >50ms");
+    }
+    if !ipc_lat.is_empty() && ipc_p95 != 0 {
+        assert!(ipc_p95 <= 20_000_000, "ipc_p95 {ipc_p95}ns >20ms");
+        assert!(ipc_p99 <= 50_000_000, "ipc_p99 {ipc_p99}ns >50ms");
     }
 
     // 最终仍需 RUNNING

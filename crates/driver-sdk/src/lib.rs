@@ -210,6 +210,10 @@ impl DataSink {
             batch.connection_handle = self.handle;
             batch.stream_epoch = self.epoch;
         }
+        // 单调埋点：若 Driver 未填则由 SDK 统一填入 wall 时间（P1 后可换 CLOCK_MONOTONIC）
+        if batch.mono_ns.is_none() {
+            batch.mono_ns = Some(mesa_core_types::now_unix_ns() as u64);
+        }
         // 非阻塞发送：成功则零拷贝直接入队，仅在 Full 时才进入合并路径，避免热路径无条件 clone
         match self.tx.try_send(OutboundMsg::Data(batch)) {
             Ok(()) => {}
@@ -1037,6 +1041,7 @@ mod tests {
                 1,
                 mesa_core_types::Value::F64(value),
             )],
+            mono_ns: None,
         }
     }
 

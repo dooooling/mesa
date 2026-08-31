@@ -1195,6 +1195,57 @@ impl NativeLib {
         }
     }
 
+    /// 批量读 PMC 字 range：一次 FFI 读 count 个连续字，用于 PMC true range 合并（P1）
+    pub fn pmc_read_word_range(
+        &self,
+        hdl: u16,
+        adr_type: c_short,
+        start: u32,
+        count: u32,
+    ) -> Result<Vec<c_short>, FocasRet> {
+        if count == 0 || count > 32 {
+            return Err(FocasRet::Param);
+        }
+        let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
+        // 动态缓冲：8 字节头 + count*2
+        let len = 8 + (count as usize) * 2;
+        let mut buf = vec![0u8; len];
+        // 填充头：type_a, type_d, datano_s, datano_e
+        // 使用 transmute 写入前 8 字节
+        let header = IodbPmc1 {
+            type_a: adr_type,
+            type_d: PMC_DATA_WORD,
+            datano_s: start as c_short,
+            datano_e: (start + count - 1) as c_short,
+            idata: [0; 8],
+        };
+        // 将 header 前 8 字节拷入 buf
+        let hdr_bytes = unsafe { std::slice::from_raw_parts(&header as *const _ as *const u8, 8) };
+        buf[..8].copy_from_slice(hdr_bytes);
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                adr_type,
+                PMC_DATA_WORD,
+                start as c_short,
+                (start + count - 1) as c_short,
+                len as c_short,
+                buf.as_mut_ptr(),
+            )
+        };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() {
+            let mut out = Vec::with_capacity(count as usize);
+            for i in 0..count as usize {
+                let v = i16::from_le_bytes([buf[8 + i * 2], buf[8 + i * 2 + 1]]);
+                out.push(v);
+            }
+            Ok(out)
+        } else {
+            Err(ret)
+        }
+    }
+
     /// 读 PMC 双字：`pmc_rdpmcrng` `data_type 2 len 12`，`D` 常用
     pub fn pmc_rdpmcrng_dword(
         &self,

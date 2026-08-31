@@ -355,6 +355,57 @@ impl FocasApi for NativeFocasApi {
                 }
             };
             for group in pmc_groups {
+                // 尝试 true range 批量：R 字连续 2..32 个合并为一次 FFI
+                if group.len() > 1
+                    && let Some(FocasAddress::Pmc {
+                        kind,
+                        addr: start,
+                        bit: None,
+                    }) = addrs.get(group[0]).cloned()
+                {
+                    let is_word_kind =
+                        matches!(kind, 'R' | 'r' | 'E' | 'A' | 'M' | 'T' | 'K' | 'C');
+                    if is_word_kind {
+                        let mut consecutive = true;
+                        for (i, idx) in group.iter().enumerate() {
+                            if let FocasAddress::Pmc {
+                                addr: a,
+                                bit: None,
+                                kind: k,
+                            } = &addrs[*idx]
+                            {
+                                if *k != kind || *a != start + i as u32 {
+                                    consecutive = false;
+                                    break;
+                                }
+                            } else {
+                                consecutive = false;
+                                break;
+                            }
+                        }
+                        if consecutive {
+                            let adr_type = crate::native::NativeLib::pmc_adr_type(kind);
+                            match lib.pmc_read_word_range(hdl, adr_type, start, group.len() as u32)
+                            {
+                                Ok(vals) => {
+                                    for (i, idx) in group.iter().enumerate() {
+                                        out[*idx] = Some(Value::U32(vals[i] as u32));
+                                    }
+                                    continue;
+                                }
+                                Err(e) => {
+                                    let msg = Self::map_ret_err(e);
+                                    let low = msg.to_ascii_lowercase();
+                                    if low.contains("ew_noopt") || low.contains("ew_param") {
+                                        // 回退逐点
+                                    } else {
+                                        return Err(msg);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 for idx in group {
                     let addr = &addrs[idx];
                     match read_cached(addr) {

@@ -518,7 +518,8 @@ impl DriverConnection for S7Connection {
                         sequence: seq.fetch_add(1, Ordering::Relaxed),
                         timestamp_ns: now_unix_ns(),
                         values,
-                    })
+                                mono_ns: None,
+        })
                     .await;
                 }
                 Ok::<(), SdkDriverError>(())

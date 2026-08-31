@@ -472,7 +472,8 @@ impl DriverConnection for FocasConnection {
                         sequence: seq.fetch_add(1, Ordering::Relaxed),
                         timestamp_ns: now_unix_ns(),
                         values: batch_vals,
-                    }).await;
+                                mono_ns: None,
+        }).await;
                 }
                 Ok::<(), SdkDriverError>(())
             }));

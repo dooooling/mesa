@@ -709,7 +709,8 @@ impl DriverConnection for OpcUaConnection {
                                 sequence: seq.fetch_add(1, Ordering::Relaxed),
                                 timestamp_ns: now_unix_ns(),
                                 values: batch_vals,
-                            }).await;
+                                        mono_ns: None,
+        }).await;
                         }
                         Ok::<(), SdkDriverError>(())
                     }));
@@ -752,6 +753,7 @@ impl DriverConnection for OpcUaConnection {
                                 sequence: seq.fetch_add(1, Ordering::Relaxed),
                                 timestamp_ns: now_unix_ns(),
                                 values: batch_vals,
+                                mono_ns: None,
                             })
                             .await;
                         }
@@ -863,7 +865,8 @@ impl DriverConnection for OpcUaConnection {
                                 sequence: seq.fetch_add(1, Ordering::Relaxed),
                                 timestamp_ns: now_unix_ns(),
                                 values: batch_vals,
-                            }).await;
+                                        mono_ns: None,
+        }).await;
                         }
                         // 清理订阅
                         let _ = api.unsubscribe(sub_id).await;

@@ -190,6 +190,10 @@ message DataBatchMsg {
   // Driver 完成本批采集/收到 Notification 的 UTC Unix ns。
   int64 timestamp_ns = 4;
   repeated PointValueMsg values = 5;
+  // 单调时钟埋点（Driver 侧 publish 时的 Instant 采样，单位 ns，自进程启动起的单调值）。
+  // 用于 IPC/E2E p95/p99 测量，0 表示未埋点（旧 Driver 兼容）。Core 侧用同宿主单调时钟相减，
+  // 若差值 >10s 视为时钟不可比则丢弃该样本（P1）。
+  optional uint64 mono_ns = 6;
 }
 
 message PointValueMsg {

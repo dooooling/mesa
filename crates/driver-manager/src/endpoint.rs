@@ -528,6 +528,16 @@ fn tasks_to_pb_checked(
 
 fn apply_batch_logged(snapshot: &Arc<Snapshot>, cfg: &BuiltinEndpoint, batch: DataBatch) {
     let n = batch.values.len();
+    // IPC/E2E 单调延迟：Driver mono_ns → Core 收到时的差值（wall，>10s 丢弃）
+    if let Some(mono) = batch.mono_ns {
+        let now = mesa_core_types::now_unix_ns() as u64;
+        if now >= mono {
+            let delta = now - mono;
+            if delta < 10_000_000_000 {
+                snapshot.record_ipc_latency_ns(delta);
+            }
+        }
+    }
     let start = std::time::Instant::now();
     snapshot.apply_batch(&batch, &cfg.endpoint_id);
     let ns = start.elapsed().as_nanos() as u64;
