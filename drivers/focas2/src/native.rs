@@ -35,20 +35,29 @@ use libloading::{Library, Symbol};
 // ---------------------------------------------------------------------------
 
 /// FOCAS 默认端口：Ethernet 固定 8193（fanuc-driver 默认）
+// TODO: 默认端口预留，V1 由 connection JSON 配置，未硬编码但需保留默认值
+#[allow(dead_code)]
 const FOCAS_DEFAULT_PORT: u16 = 8193;
 /// 超时换算：FOCAS 以秒为单位，毫秒向上取整
+// TODO: 超时换算常量预留，已在 focas_api 中由 FOCAS_MS_PER_S 覆盖，保留以备 Native 侧复用
+#[allow(dead_code)]
 const FOCAS_TIMEOUT_MS_PER_S: u64 = 1000;
 /// PMC 长度：对应 IODBPMC0/1/2 在 fanuc-driver 中 9/10/12/16 的语义
 /// 9 = 5字节 + 头 4，10 = word(1) + 头，12 = dword/float32，16 = float64
 const PMC_LEN_BYTE: c_short = 9;
 const PMC_LEN_WORD: c_short = 10;
 const PMC_LEN_DWORD: c_short = 12;
+// TODO: PMC F64 长度预留，当前仅用 BYTE/WORD/DWORD，需保留以备 float64 通道
+#[allow(dead_code)]
 const PMC_LEN_F64: c_short = 16;
 /// PMC data_type：0=bit/byte 1=word 2=dword 4=float32 5=float64（对齐 fanuc/collectors/Pmc.cs）
 const PMC_DATA_BIT: c_short = 0;
 const PMC_DATA_WORD: c_short = 1;
 const PMC_DATA_DWORD: c_short = 2;
+// TODO: PMC Float 类型预留，V1 仅整型通道，保留以备后续浮点 PMC
+#[allow(dead_code)]
 const PMC_DATA_F32: c_short = 4;
+#[allow(dead_code)]
 const PMC_DATA_F64: c_short = 5;
 /// PMC 地址类型：G/X/Y/F/R… 与 fanuc f_adr_type() 一致
 const PMC_TYPE_G: c_short = 0;
@@ -65,7 +74,10 @@ const PMC_TYPE_M: c_short = 10;
 const PMC_TYPE_N: c_short = 11;
 const PMC_TYPE_Z: c_short = 12;
 /// 轴/主轴区间：FANUC 最大 32 轴、4 主轴，0i-F 基准 3 轴，30i 可 10/24 轴
+// TODO: 最大轴/主轴数预留，用于校验与批量扩展，V1 固定 8 轴批但需保留上限
+#[allow(dead_code)]
 const FOCAS_MAX_AXIS: u8 = 32;
+#[allow(dead_code)]
 const FOCAS_MAX_SPINDLE: u8 = 4;
 /// cnc_rddynamic2 单轴长度 44 字节 = ODB DY2_2 Pack=4 时 sizeof
 const FOCAS_DY2_LEN: c_short = 44;
@@ -110,6 +122,8 @@ pub enum FocasRet {
     Dtsvr = 14,
     Alarm = 15,
     Stop = 16,
+    // TODO: B-64304EN 全量封装预留，Passwd(17) 为鉴权类返回码，V1 未触发但需保留以完整映射 fwlib.cs
+    #[allow(dead_code)]
     Passwd = 17,
 }
 
@@ -151,8 +165,14 @@ impl FocasRet {
         }
     }
 
-    pub fn is_ok(self) -> bool { self == Self::Ok }
-    pub fn is_busy(self) -> bool { self == Self::Busy }
+    pub fn is_ok(self) -> bool {
+        self == Self::Ok
+    }
+    // TODO: B-64304EN 预留，Busy(-1) 用于区分 EW_BUSY 重试与 EW_SOCKET 断线，V1 未单独分支但需保留
+    #[allow(dead_code)]
+    pub fn is_busy(self) -> bool {
+        self == Self::Busy
+    }
     pub fn message(self) -> &'static str {
         match self {
             Self::Ok => "EW_OK",
@@ -195,6 +215,8 @@ pub struct OdbActs {
 }
 
 /// 全轴位置：`FAXIS` 8 轴定点（0.001mm），`fwlib.cs:152`
+// TODO: B-64304EN 全量封装预留，FAXIS 为 OdbDy1 全量位置子结构，V1 已由 OdbDy2/Oaxis 替代但需保留作多轴扩展参考
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Faxis {
@@ -215,18 +237,20 @@ pub struct Oaxis {
 }
 
 /// `ODBDY_1` 全量动态（8轴），`fwlib.cs:174`，已弃用，保留作多轴扩展参考
+// TODO: B-64304EN 全量封装预留，已弃用但手册仍列出，保留以便 30i 多轴扩展对照
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct OdbDy1 {
-    pub dummy: c_short,  // 保留
-    pub axis: c_short,   // 轴数
-    pub alarm: c_short,  // 报警状态（0 无）
-    pub prgnum: c_short, // 运行程序号（0i 16位，30i 32位差异在 DY2）
-    pub prgmnum: c_short,// 主程序号
-    pub seqnum: c_int,   // 顺序号
-    pub actf: c_int,     // 实际进给 `F`（`165` 4000）
-    pub acts: c_int,     // 实际主轴 `S`
-    pub pos: Faxis,      // 8 轴全量位置
+    pub dummy: c_short,   // 保留
+    pub axis: c_short,    // 轴数
+    pub alarm: c_short,   // 报警状态（0 无）
+    pub prgnum: c_short,  // 运行程序号（0i 16位，30i 32位差异在 DY2）
+    pub prgmnum: c_short, // 主程序号
+    pub seqnum: c_int,    // 顺序号
+    pub actf: c_int,      // 实际进给 `F`（`165` 4000）
+    pub acts: c_int,      // 实际主轴 `S`
+    pub pos: Faxis,       // 8 轴全量位置
 }
 
 /// `ODBDY2_2` 单轴动态：`fanuc-driver RdDynamic2 axis=1 len=44`，`Pack=4` 44 字节，`fwlib.cs:246`
@@ -257,10 +281,10 @@ pub struct OdbAxis {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Odbm {
-    pub datano: c_short, // 变量号（如 100、730）
-    pub dummy: c_short,  // 保留
-    pub mcr_val: c_int,  // 定点整数
-    pub dec_val: c_short,// 小数位 `value = mcr_val * 10^-dec_val`
+    pub datano: c_short,  // 变量号（如 100、730）
+    pub dummy: c_short,   // 保留
+    pub mcr_val: c_int,   // 定点整数
+    pub dec_val: c_short, // 小数位 `value = mcr_val * 10^-dec_val`
 }
 
 /// `cnc_rdalmmsg` 返回：报警 `ODBALMMSG`（`fwlib.cs:3420` stateful，需 `cnc_rdalmmsg2` 循环至 `EW_DATA`）
@@ -302,21 +326,21 @@ pub struct OpMsg {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IodbPmc0 {
-    pub type_a: c_short, // PMC 类型 G/X/Y/F/R/D 等（0-12）
-    pub type_d: c_short, // 数据类型 0=bit/byte
+    pub type_a: c_short,   // PMC 类型 G/X/Y/F/R/D 等（0-12）
+    pub type_d: c_short,   // 数据类型 0=bit/byte
     pub datano_s: c_short, // 起始地址
     pub datano_e: c_short, // 结束地址
-    pub cdata: [u8; 8],  // 字节数据（位时取 cdata[0]>>bit）
+    pub cdata: [u8; 8],    // 字节数据（位时取 cdata[0]>>bit）
 }
 
 /// `pmc_rdpmcrng` 返回：`IODBPMC1` 字，`fwlib.cs:7148` `collectors/Pmc.cs: word`
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IodbPmc1 {
-    pub type_a: c_short, // PMC 类型
-    pub type_d: c_short, // 1=word
-    pub datano_s: c_short, // 起始
-    pub datano_e: c_short, // 结束（+1）
+    pub type_a: c_short,     // PMC 类型
+    pub type_d: c_short,     // 1=word
+    pub datano_s: c_short,   // 起始
+    pub datano_e: c_short,   // 结束（+1）
     pub idata: [c_short; 8], // 字数据
 }
 
@@ -324,8 +348,8 @@ pub struct IodbPmc1 {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IodbPmc2 {
-    pub type_a: c_short, // PMC 类型
-    pub type_d: c_short, // 2=dword
+    pub type_a: c_short,   // PMC 类型
+    pub type_d: c_short,   // 2=dword
     pub datano_s: c_short, // 起始
     pub datano_e: c_short, // 结束（+3）
     pub ldata: [c_int; 8], // 双字数据（float32 需 BitConverter 转换，当前直接 I32）
@@ -344,8 +368,8 @@ pub struct OdbTofs {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IodbZofs {
-    pub datano: c_short, // 工件系号（1=G54 等）
-    pub type_: c_short,  // 轴数
+    pub datano: c_short,  // 工件系号（1=G54 等）
+    pub type_: c_short,   // 轴数
     pub data: [c_int; 8], // 8 轴零点值（0i-F 3轴，其余 0）
 }
 
@@ -467,14 +491,18 @@ pub struct OdbUp3 {
 // FFI 函数指针类型
 // ---------------------------------------------------------------------------
 
-type FnAllClibHndl3 = unsafe extern "C" fn(*const c_char, c_ushort, c_long, *mut c_ushort) -> c_short;
+type FnAllClibHndl3 =
+    unsafe extern "C" fn(*const c_char, c_ushort, c_long, *mut c_ushort) -> c_short;
 type FnFreelibHndl = unsafe extern "C" fn(c_ushort) -> c_short;
 type FnStatInfo = unsafe extern "C" fn(c_ushort, *mut OdbSt) -> c_short;
 type FnRdDynamic2 = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OdbDy2) -> c_short;
 type FnCncAbsolute = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OdbAxis) -> c_short;
 type FnCncRdMacro = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut Odbm) -> c_short;
-type FnPmcRdPmcRng = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, c_short, c_short, *mut u8) -> c_short;
+type FnPmcRdPmcRng =
+    unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, c_short, c_short, *mut u8) -> c_short;
 type FnCncActs = unsafe extern "C" fn(c_ushort, *mut OdbActs) -> c_short;
+// TODO: B-64304EN 全量封装预留，cnc_acts2 为多主轴扩展签名，V1 仅用 cnc_acts 代理
+#[allow(dead_code)]
 type FnCncActs2 = unsafe extern "C" fn(c_ushort, c_short, *mut OdbActs) -> c_short;
 // 全读扩展：报警/诊断/程序/主轴/伺服/操作信息（V1 仅 8 组时以占位转 Bad，Gate 闭环后逐个打通）
 type FnRdAlmMsg = unsafe extern "C" fn(c_ushort, c_short, *mut c_short, *mut OdbAlmMsg) -> c_short;
@@ -486,13 +514,20 @@ type FnRdOpMsg = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OpMsg) ->
 type FnRdSpGear = unsafe extern "C" fn(c_ushort, c_ushort, *mut c_short) -> c_short;
 type FnRdSpMaxRpm = unsafe extern "C" fn(c_ushort, c_ushort, *mut c_short) -> c_short;
 type FnRdTofs = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, *mut OdbTofs) -> c_short;
-type FnRdTofsr = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, c_short, *mut IodbTo111) -> c_short;
-type FnRdTofsr112 = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, c_short, *mut IodbTo112) -> c_short;
+type FnRdTofsr =
+    unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, c_short, *mut IodbTo111) -> c_short;
+type FnRdTofsr112 =
+    unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, c_short, *mut IodbTo112) -> c_short;
 #[allow(dead_code)]
-type FnRdTofsr113 = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, c_short, *mut IodbTo113) -> c_short;
+type FnRdTofsr113 =
+    unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, c_short, *mut IodbTo113) -> c_short;
 type FnRdZofs = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, *mut IodbZofs) -> c_short;
-type FnRdParam = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, *mut IodbPsd1) -> c_short;
-type FnRdProgDir = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, c_ushort, *mut PrgDir) -> c_short;
+type FnRdParam =
+    unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, *mut IodbPsd1) -> c_short;
+type FnRdProgDir =
+    unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, c_ushort, *mut PrgDir) -> c_short;
+// TODO: B-64304EN 全量封装预留，cnc_rdprogdir2 为短签名版本，V1 统一用 cnc_rdprogdir
+#[allow(dead_code)]
 type FnRdProgDir2 = unsafe extern "C" fn(c_ushort, c_short, *mut c_short, *mut PrgDir) -> c_short;
 type FnRdProgInfo = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OdbNc1) -> c_short;
 type FnRdProgInfo2 = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OdbNc2) -> c_short;
@@ -547,12 +582,18 @@ impl NativeLib {
         #[cfg(target_os = "windows")]
         {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            for d in [cwd.join("drivers/focas2/libs/win"), cwd.join("drivers/focas2/libs"), std::env::temp_dir().join("mesa_focas_embed")] {
+            for d in [
+                cwd.join("drivers/focas2/libs/win"),
+                cwd.join("drivers/focas2/libs"),
+                std::env::temp_dir().join("mesa_focas_embed"),
+            ] {
                 if d.is_dir() {
                     let cur = std::env::var("PATH").unwrap_or_default();
                     let s = d.to_string_lossy().to_string();
                     if !cur.contains(&s) {
-                        unsafe { std::env::set_var("PATH", format!("{};{}", s, cur)); }
+                        unsafe {
+                            std::env::set_var("PATH", format!("{};{}", s, cur));
+                        }
                     }
                 }
             }
@@ -560,7 +601,11 @@ impl NativeLib {
         let candidates = Self::candidate_paths();
         let mut last_err = String::new();
         for p in candidates {
-            let fname = Path::new(&p).file_name().unwrap().to_string_lossy().to_string();
+            let fname = Path::new(&p)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
             // 优先尝试相对路径，其次尝试本仓 libs/win 与 libs/linux 子目录
             let try_paths = vec![
                 p.clone(),
@@ -573,7 +618,11 @@ impl NativeLib {
                 let tp_abs = if std::path::Path::new(&tp).is_absolute() {
                     tp.clone()
                 } else {
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")).join(&tp).to_string_lossy().to_string()
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        .join(&tp)
+                        .to_string_lossy()
+                        .to_string()
                 };
                 for cand in [tp_abs.clone(), tp.clone()] {
                     match unsafe { Library::new(&cand) } {
@@ -588,7 +637,11 @@ impl NativeLib {
                     }
                 }
             }
-            let name = Path::new(&p).file_name().unwrap().to_string_lossy().to_string();
+            let name = Path::new(&p)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
             if let Ok(lib) = unsafe { Library::new(&name) } {
                 tracing::info!(lib=%name, "FOCAS Native 库从系统路径加载成功");
                 return Ok(Self::from_library(lib));
@@ -598,7 +651,11 @@ impl NativeLib {
         // 单文件兜底：从嵌入字节解压的临时目录加载（首次 10ms，后续缓存）
         if let Some(dir) = Self::embedded_dir() {
             for p in Self::candidate_paths() {
-                let fname = Path::new(&p).file_name().unwrap().to_string_lossy().to_string();
+                let fname = Path::new(&p)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
                 let tp = dir.join(&fname);
                 if let Ok(lib) = unsafe { Library::new(&tp) } {
                     tracing::info!(lib=%tp.display(), "FOCAS Native 库从嵌入临时目录加载成功");
@@ -607,23 +664,36 @@ impl NativeLib {
             }
             last_err = format!("{} | embedded_dir {} 已试", last_err, dir.display());
         }
-        Err(format!("EW_NODLL 无法加载 FOCAS 库（{}），请将对应平台库置于 drivers/focas2/libs/ 或系统库路径", last_err))
+        Err(format!(
+            "EW_NODLL 无法加载 FOCAS 库（{}），请将对应平台库置于 drivers/focas2/libs/ 或系统库路径",
+            last_err
+        ))
     }
 
     fn candidate_paths() -> Vec<String> {
         if cfg!(target_os = "windows") {
             if cfg!(target_pointer_width = "64") {
-                vec!["FWLIB64.dll".into(), "Fwlib32.dll".into(), "fwlib32.dll".into()]
+                vec![
+                    "FWLIB64.dll".into(),
+                    "Fwlib32.dll".into(),
+                    "fwlib32.dll".into(),
+                ]
             } else {
                 vec!["Fwlib32.dll".into(), "FWLIB32.dll".into()]
             }
         } else if cfg!(target_os = "linux") {
             if cfg!(target_arch = "arm") || cfg!(target_arch = "aarch64") {
-                vec!["libfwlib32-linux-armv7.so.1.0.5".into(), "libfwlib32-linux-armv7.so.1.0.1".into()]
+                vec![
+                    "libfwlib32-linux-armv7.so.1.0.5".into(),
+                    "libfwlib32-linux-armv7.so.1.0.1".into(),
+                ]
             } else if cfg!(target_pointer_width = "64") {
                 vec!["libfwlib32-linux-x64.so.1.0.5".into()]
             } else {
-                vec!["libfwlib32-linux-x86.so.1.0.5".into(), "libfwlib32-linux-x86.so.1.0.0".into()]
+                vec![
+                    "libfwlib32-linux-x86.so.1.0.5".into(),
+                    "libfwlib32-linux-x86.so.1.0.0".into(),
+                ]
             }
         } else {
             vec!["Fwlib32.dll".into()]
@@ -636,7 +706,7 @@ impl NativeLib {
     /// - 无性能损失：解压后 `libloading` 同外置文件一致，后续 `cnc_*` 调用无代理
     fn embedded_dir() -> Option<PathBuf> {
         static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
-        CACHE.get_or_init(|| Self::extract_embedded()).clone()
+        CACHE.get_or_init(Self::extract_embedded).clone()
     }
 
     fn extract_embedded() -> Option<PathBuf> {
@@ -646,33 +716,53 @@ impl NativeLib {
             ("FWLIB64.dll", include_bytes!("../libs/win/FWLIB64.dll")),
             ("Fwlib32.dll", include_bytes!("../libs/win/Fwlib32.dll")),
             ("fwlib0DN.dll", include_bytes!("../libs/win/fwlib0DN.dll")),
-            ("fwlib0DN64.dll", include_bytes!("../libs/win/fwlib0DN64.dll")),
+            (
+                "fwlib0DN64.dll",
+                include_bytes!("../libs/win/fwlib0DN64.dll"),
+            ),
             ("Fwlib0i.dll", include_bytes!("../libs/win/Fwlib0i.dll")),
             ("Fwlib0iB.dll", include_bytes!("../libs/win/Fwlib0iB.dll")),
             ("fwlib0iD.dll", include_bytes!("../libs/win/fwlib0iD.dll")),
-            ("fwlib0iD64.dll", include_bytes!("../libs/win/fwlib0iD64.dll")),
+            (
+                "fwlib0iD64.dll",
+                include_bytes!("../libs/win/fwlib0iD64.dll"),
+            ),
             ("Fwlib150.dll", include_bytes!("../libs/win/Fwlib150.dll")),
             ("Fwlib15i.dll", include_bytes!("../libs/win/Fwlib15i.dll")),
             ("Fwlib160.dll", include_bytes!("../libs/win/Fwlib160.dll")),
             ("Fwlib16W.dll", include_bytes!("../libs/win/Fwlib16W.dll")),
             ("fwlib30i.dll", include_bytes!("../libs/win/fwlib30i.dll")),
-            ("fwlib30i64.dll", include_bytes!("../libs/win/fwlib30i64.dll")),
+            (
+                "fwlib30i64.dll",
+                include_bytes!("../libs/win/fwlib30i64.dll"),
+            ),
             ("fwlibe1.dll", include_bytes!("../libs/win/fwlibe1.dll")),
             ("fwlibe64.dll", include_bytes!("../libs/win/fwlibe64.dll")),
             ("fwlibNCG.dll", include_bytes!("../libs/win/fwlibNCG.dll")),
-            ("fwlibNCG64.dll", include_bytes!("../libs/win/fwlibNCG64.dll")),
+            (
+                "fwlibNCG64.dll",
+                include_bytes!("../libs/win/fwlibNCG64.dll"),
+            ),
             ("Fwlibpm.dll", include_bytes!("../libs/win/Fwlibpm.dll")),
             ("Fwlibpmi.dll", include_bytes!("../libs/win/Fwlibpmi.dll")),
         ];
         #[cfg(target_os = "linux")]
         const EMBEDDED: &[(&str, &[u8])] = &[
-            ("libfwlib32-linux-x64.so.1.0.5", include_bytes!("../libs/linux/libfwlib32-linux-x64.so.1.0.5")),
-            ("libfwlib32-linux-armv7.so.1.0.5", include_bytes!("../libs/linux/libfwlib32-linux-armv7.so.1.0.5")),
+            (
+                "libfwlib32-linux-x64.so.1.0.5",
+                include_bytes!("../libs/linux/libfwlib32-linux-x64.so.1.0.5"),
+            ),
+            (
+                "libfwlib32-linux-armv7.so.1.0.5",
+                include_bytes!("../libs/linux/libfwlib32-linux-armv7.so.1.0.5"),
+            ),
         ];
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         const EMBEDDED: &[(&str, &[u8])] = &[];
 
-        if EMBEDDED.is_empty() { return None; }
+        if EMBEDDED.is_empty() {
+            return None;
+        }
         let dir = std::env::temp_dir().join("mesa_focas_embed");
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::warn!(%e, "创建嵌入临时目录失败");
@@ -681,8 +771,10 @@ impl NativeLib {
         for (name, bytes) in EMBEDDED {
             let path = dir.join(name);
             // 已存在且大小一致则跳过覆写（缓存命中）
-            if let Ok(meta) = std::fs::metadata(&path) {
-                if meta.len() == bytes.len() as u64 { continue; }
+            if let Ok(meta) = std::fs::metadata(&path)
+                && meta.len() == bytes.len() as u64
+            {
+                continue;
             }
             if let Err(e) = std::fs::write(&path, bytes) {
                 tracing::warn!(name=%name, %e, "写入嵌入库失败");
@@ -692,7 +784,7 @@ impl NativeLib {
         Some(dir)
     }
 
-     fn from_library(lib: Library) -> Self {
+    fn from_library(lib: Library) -> Self {
         let mut me = Self {
             _lib: lib,
             cnc_allclibhndl3: None,
@@ -727,39 +819,126 @@ impl NativeLib {
         };
         unsafe {
             let raw: *const Library = &me._lib as *const Library;
-            me.cnc_allclibhndl3 = (*raw).get::<FnAllClibHndl3>(b"cnc_allclibhndl3").ok().map(|s| std::mem::transmute(s));
-            me.cnc_freelibhndl = (*raw).get::<FnFreelibHndl>(b"cnc_freelibhndl").ok().map(|s| std::mem::transmute(s));
-            me.cnc_statinfo = (*raw).get::<FnStatInfo>(b"cnc_statinfo").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rddynamic2 = (*raw).get::<FnRdDynamic2>(b"cnc_rddynamic2").ok().map(|s| std::mem::transmute(s));
-            me.cnc_absolute = (*raw).get::<FnCncAbsolute>(b"cnc_absolute").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rdmacro = (*raw).get::<FnCncRdMacro>(b"cnc_rdmacro").ok().map(|s| std::mem::transmute(s));
-            me.pmc_rdpmcrng = (*raw).get::<FnPmcRdPmcRng>(b"pmc_rdpmcrng").ok().map(|s| std::mem::transmute(s));
-            me.cnc_acts = (*raw).get::<FnCncActs>(b"cnc_acts").ok().map(|s| std::mem::transmute(s));
+            me.cnc_allclibhndl3 = (*raw)
+                .get::<FnAllClibHndl3>(b"cnc_allclibhndl3")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_freelibhndl = (*raw)
+                .get::<FnFreelibHndl>(b"cnc_freelibhndl")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_statinfo = (*raw)
+                .get::<FnStatInfo>(b"cnc_statinfo")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rddynamic2 = (*raw)
+                .get::<FnRdDynamic2>(b"cnc_rddynamic2")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_absolute = (*raw)
+                .get::<FnCncAbsolute>(b"cnc_absolute")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rdmacro = (*raw)
+                .get::<FnCncRdMacro>(b"cnc_rdmacro")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.pmc_rdpmcrng = (*raw)
+                .get::<FnPmcRdPmcRng>(b"pmc_rdpmcrng")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_acts = (*raw)
+                .get::<FnCncActs>(b"cnc_acts")
+                .ok()
+                .map(|s| std::mem::transmute(s));
             // 全读扩展：若符号缺失则保持 None，上层转 EW_NOOPT→Bad 而非 panic
-            me.cnc_rdalmmsg = (*raw).get::<FnRdAlmMsg>(b"cnc_rdalmmsg").ok().map(|s| std::mem::transmute(s));
-            me.cnc_diagnoss = (*raw).get::<FnDiagnoss>(b"cnc_diagnoss").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rdprgnum = (*raw).get::<FnRdPrgNum>(b"cnc_rdprgnum").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rdspmeter = (*raw).get::<FnRdSpMeter>(b"cnc_rdspmeter").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rdsvmeter = (*raw).get::<FnRdSvMeter>(b"cnc_rdsvmeter").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rdopmsg = (*raw).get::<FnRdOpMsg>(b"cnc_rdopmsg").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rdspgear = (*raw).get::<FnRdSpGear>(b"cnc_rdspgear").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rdspmaxrpm = (*raw).get::<FnRdSpMaxRpm>(b"cnc_rdspmaxrpm").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rdtofs = (*raw).get::<FnRdTofs>(b"cnc_rdtofs").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rdtofsr = (*raw).get::<FnRdTofsr>(b"cnc_rdtofsr").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rdtofsr112 = (*raw).get::<FnRdTofsr112>(b"cnc_rdtofsr").ok().map(|s| std::mem::transmute(s));
+            me.cnc_rdalmmsg = (*raw)
+                .get::<FnRdAlmMsg>(b"cnc_rdalmmsg")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_diagnoss = (*raw)
+                .get::<FnDiagnoss>(b"cnc_diagnoss")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rdprgnum = (*raw)
+                .get::<FnRdPrgNum>(b"cnc_rdprgnum")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rdspmeter = (*raw)
+                .get::<FnRdSpMeter>(b"cnc_rdspmeter")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rdsvmeter = (*raw)
+                .get::<FnRdSvMeter>(b"cnc_rdsvmeter")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rdopmsg = (*raw)
+                .get::<FnRdOpMsg>(b"cnc_rdopmsg")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rdspgear = (*raw)
+                .get::<FnRdSpGear>(b"cnc_rdspgear")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rdspmaxrpm = (*raw)
+                .get::<FnRdSpMaxRpm>(b"cnc_rdspmaxrpm")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rdtofs = (*raw)
+                .get::<FnRdTofs>(b"cnc_rdtofs")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rdtofsr = (*raw)
+                .get::<FnRdTofsr>(b"cnc_rdtofsr")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rdtofsr112 = (*raw)
+                .get::<FnRdTofsr112>(b"cnc_rdtofsr")
+                .ok()
+                .map(|s| std::mem::transmute(s));
             // IODBTO_1_3 预留：复用 cnc_rdtofsr 入口，当前不加载以避 hello timeout 期间并发
-            me.cnc_rdzofs = (*raw).get::<FnRdZofs>(b"cnc_rdzofs").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rdparam = (*raw).get::<FnRdParam>(b"cnc_rdparam").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rdprogdir = (*raw).get::<FnRdProgDir>(b"cnc_rdprogdir").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rdproginfo = (*raw).get::<FnRdProgInfo>(b"cnc_rdproginfo").ok().map(|s| std::mem::transmute(s));
-            me.cnc_rdproginfo2 = (*raw).get::<FnRdProgInfo2>(b"cnc_rdproginfo").ok().map(|s| std::mem::transmute(s));
-            me.cnc_upload = (*raw).get::<FnUpload>(b"cnc_upload").ok().map(|s| std::mem::transmute(s));
-            me.cnc_upload3 = (*raw).get::<FnUpload3>(b"cnc_upload3").ok().map(|s| std::mem::transmute(s));
-            me.cnc_upstart3 = (*raw).get::<FnUpStart3>(b"cnc_upstart3").ok().map(|s| std::mem::transmute(s));
-            me.cnc_upend3 = (*raw).get::<FnUpEnd3>(b"cnc_upend3").ok().map(|s| std::mem::transmute(s));
+            me.cnc_rdzofs = (*raw)
+                .get::<FnRdZofs>(b"cnc_rdzofs")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rdparam = (*raw)
+                .get::<FnRdParam>(b"cnc_rdparam")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rdprogdir = (*raw)
+                .get::<FnRdProgDir>(b"cnc_rdprogdir")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rdproginfo = (*raw)
+                .get::<FnRdProgInfo>(b"cnc_rdproginfo")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_rdproginfo2 = (*raw)
+                .get::<FnRdProgInfo2>(b"cnc_rdproginfo")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_upload = (*raw)
+                .get::<FnUpload>(b"cnc_upload")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_upload3 = (*raw)
+                .get::<FnUpload3>(b"cnc_upload3")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_upstart3 = (*raw)
+                .get::<FnUpStart3>(b"cnc_upstart3")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_upend3 = (*raw)
+                .get::<FnUpEnd3>(b"cnc_upend3")
+                .ok()
+                .map(|s| std::mem::transmute(s));
             // 兼容旧符号：部分库仅导出 cnc_rdprogdir2（不影响 PRGDIR 5参版）
             if me.cnc_rdprogdir.is_none() {
-                me.cnc_rdprogdir = (*raw).get::<FnRdProgDir>(b"cnc_rdprogdir2").ok().map(|s| std::mem::transmute(s));
+                me.cnc_rdprogdir = (*raw)
+                    .get::<FnRdProgDir>(b"cnc_rdprogdir2")
+                    .ok()
+                    .map(|s| std::mem::transmute(s));
             }
         }
         me
@@ -770,11 +949,23 @@ impl NativeLib {
     /// - 成功返回 `hdl:u16` 供后续 `cnc_statinfo/cnc_rddynamic` 等复用，失败 `EW_SOCKET/EW_NODLL` 由上层重连
     /// - 手册：`B-64304EN 3.2`，`fwlib.cs:9416`
     /// - 命名保留 `cnc_` 前缀以与 FANUC 原生 `cnc_allclibhndl3` 一致，便于对照手册与 `fwlib.cs`
-    pub fn cnc_allclibhndl3(&self, ip: &str, port: u16, timeout_secs: i32) -> Result<u16, FocasRet> {
+    pub fn cnc_allclibhndl3(
+        &self,
+        ip: &str,
+        port: u16,
+        timeout_secs: i32,
+    ) -> Result<u16, FocasRet> {
         let sym = self.cnc_allclibhndl3.as_ref().ok_or(FocasRet::Nodll)?;
         let c_ip = CString::new(ip).map_err(|_| FocasRet::Param)?;
         let mut hdl: c_ushort = 0;
-        let rc = unsafe { sym(c_ip.as_ptr(), port as c_ushort, timeout_secs as c_long, &mut hdl) };
+        let rc = unsafe {
+            sym(
+                c_ip.as_ptr(),
+                port as c_ushort,
+                timeout_secs as c_long,
+                &mut hdl,
+            )
+        };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() { Ok(hdl) } else { Err(ret) }
     }
@@ -799,7 +990,11 @@ impl NativeLib {
         let mut out = std::mem::MaybeUninit::<OdbSt>::uninit();
         let rc = unsafe { sym(hdl as c_ushort, out.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() { Ok(unsafe { out.assume_init() }) } else { Err(ret) }
+        if ret.is_ok() {
+            Ok(unsafe { out.assume_init() })
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读动态数据：`cnc_rddynamic2(hdl, axis=1, len=44, ODBDY2_2*)`，`platform/RdDynamic2.cs:5` `axis=1 len=44`
@@ -808,9 +1003,20 @@ impl NativeLib {
     pub fn cnc_rddynamic2(&self, hdl: u16) -> Result<OdbDy2, FocasRet> {
         let sym = self.cnc_rddynamic2.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<OdbDy2>::uninit();
-        let rc = unsafe { sym(hdl as c_ushort, 1 as c_short, FOCAS_DY2_LEN, out.as_mut_ptr()) };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                1 as c_short,
+                FOCAS_DY2_LEN,
+                out.as_mut_ptr(),
+            )
+        };
         let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() { Ok(unsafe { out.assume_init() }) } else { Err(ret) }
+        if ret.is_ok() {
+            Ok(unsafe { out.assume_init() })
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读主轴实际转速：`cnc_acts(hdl, ODBACT*)`，`platform/Acts.cs`
@@ -820,7 +1026,11 @@ impl NativeLib {
         let mut out = std::mem::MaybeUninit::<OdbActs>::uninit();
         let rc = unsafe { sym(hdl as c_ushort, out.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() { Ok(unsafe { out.assume_init() }) } else { Err(ret) }
+        if ret.is_ok() {
+            Ok(unsafe { out.assume_init() })
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读轴绝对坐标：`cnc_absolute(hdl, axis, 8, ODBAXIS*)`，`platform` 未单列但 `collectors/AxisData` 间接依赖
@@ -829,13 +1039,26 @@ impl NativeLib {
     pub fn cnc_absolute(&self, hdl: u16, axis: u8) -> Result<c_int, FocasRet> {
         let sym = self.cnc_absolute.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<OdbAxis>::uninit();
-        let rc = unsafe { sym(hdl as c_ushort, axis as c_short, FOCAS_AXIS_BATCH, out.as_mut_ptr()) };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                axis as c_short,
+                FOCAS_AXIS_BATCH,
+                out.as_mut_ptr(),
+            )
+        };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() {
             let v = unsafe { out.assume_init() };
             let idx = (axis as usize).saturating_sub(1);
-            if idx < FOCAS_AXIS_BATCH as usize { Ok(v.data[idx]) } else { Err(FocasRet::Param) }
-        } else { Err(ret) }
+            if idx < FOCAS_AXIS_BATCH as usize {
+                Ok(v.data[idx])
+            } else {
+                Err(FocasRet::Param)
+            }
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读宏变量：`cnc_rdmacro(hdl, number, 1, ODBM*)`，`collectors/Macro.cs:100`
@@ -844,60 +1067,186 @@ impl NativeLib {
     pub fn cnc_rdmacro(&self, hdl: u16, number: u32) -> Result<f64, FocasRet> {
         let sym = self.cnc_rdmacro.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<Odbm>::uninit();
-        let rc = unsafe { sym(hdl as c_ushort, number as c_short, 1 as c_short, out.as_mut_ptr()) };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                number as c_short,
+                1 as c_short,
+                out.as_mut_ptr(),
+            )
+        };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() {
             let v = unsafe { out.assume_init() };
             let dec = v.dec_val as i32;
             let raw = v.mcr_val as f64;
-            let val = if dec == 0 { raw } else { raw / 10_f64.powi(dec) };
+            let val = if dec == 0 {
+                raw
+            } else {
+                raw / 10_f64.powi(dec)
+            };
             Ok(val)
-        } else { Err(ret) }
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读 PMC 位：`pmc_rdpmcrng(hdl, adr_type, 0, addr, addr, 9, IODBPMC0)`，取 `cdata[0]>>bit &1`
     /// - `adr_type` 见 `pmc_adr_type()`，`bit 0..7`，`collectors/Pmc.cs: bit` 分支
-    pub fn pmc_rdpmcrng_bit(&self, hdl: u16, adr_type: c_short, addr: u32, bit: u8) -> Result<bool, FocasRet> {
+    pub fn pmc_rdpmcrng_bit(
+        &self,
+        hdl: u16,
+        adr_type: c_short,
+        addr: u32,
+        bit: u8,
+    ) -> Result<bool, FocasRet> {
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
-        let mut buf = IodbPmc0 { type_a: adr_type, type_d: PMC_DATA_BIT, datano_s: addr as c_short, datano_e: addr as c_short, cdata: [0; 8] };
-        let rc = unsafe { sym(hdl as c_ushort, adr_type, PMC_DATA_BIT, addr as c_short, addr as c_short, PMC_LEN_BYTE, &mut buf as *mut _ as *mut u8) };
+        let mut buf = IodbPmc0 {
+            type_a: adr_type,
+            type_d: PMC_DATA_BIT,
+            datano_s: addr as c_short,
+            datano_e: addr as c_short,
+            cdata: [0; 8],
+        };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                adr_type,
+                PMC_DATA_BIT,
+                addr as c_short,
+                addr as c_short,
+                PMC_LEN_BYTE,
+                &mut buf as *mut _ as *mut u8,
+            )
+        };
         let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() { Ok(((buf.cdata[0] >> bit) & 1) != 0) } else { Err(ret) }
+        if ret.is_ok() {
+            Ok(((buf.cdata[0] >> bit) & 1) != 0)
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读 PMC 字节：`pmc_rdpmcrng` `data_type 0 len 9`，`collectors/Pmc.cs: byte`
-    pub fn pmc_rdpmcrng_byte(&self, hdl: u16, adr_type: c_short, addr: u32) -> Result<u8, FocasRet> {
+    pub fn pmc_rdpmcrng_byte(
+        &self,
+        hdl: u16,
+        adr_type: c_short,
+        addr: u32,
+    ) -> Result<u8, FocasRet> {
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
-        let mut buf = IodbPmc0 { type_a: adr_type, type_d: PMC_DATA_BIT, datano_s: addr as c_short, datano_e: addr as c_short, cdata: [0; 8] };
-        let rc = unsafe { sym(hdl as c_ushort, adr_type, PMC_DATA_BIT, addr as c_short, addr as c_short, PMC_LEN_BYTE, &mut buf as *mut _ as *mut u8) };
+        let mut buf = IodbPmc0 {
+            type_a: adr_type,
+            type_d: PMC_DATA_BIT,
+            datano_s: addr as c_short,
+            datano_e: addr as c_short,
+            cdata: [0; 8],
+        };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                adr_type,
+                PMC_DATA_BIT,
+                addr as c_short,
+                addr as c_short,
+                PMC_LEN_BYTE,
+                &mut buf as *mut _ as *mut u8,
+            )
+        };
         let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() { Ok(buf.cdata[0]) } else { Err(ret) }
+        if ret.is_ok() {
+            Ok(buf.cdata[0])
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读 PMC 字：`pmc_rdpmcrng` `data_type 1 len 10`，`R/A/T/C` 常用
-    pub fn pmc_rdpmcrng_word(&self, hdl: u16, adr_type: c_short, addr: u32) -> Result<c_short, FocasRet> {
+    pub fn pmc_rdpmcrng_word(
+        &self,
+        hdl: u16,
+        adr_type: c_short,
+        addr: u32,
+    ) -> Result<c_short, FocasRet> {
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
-        let mut buf = IodbPmc1 { type_a: adr_type, type_d: PMC_DATA_WORD, datano_s: addr as c_short, datano_e: (addr as c_short).wrapping_add(1), idata: [0; 8] };
-        let rc = unsafe { sym(hdl as c_ushort, adr_type, PMC_DATA_WORD, addr as c_short, (addr as c_short).wrapping_add(1), PMC_LEN_WORD, &mut buf as *mut _ as *mut u8) };
+        let mut buf = IodbPmc1 {
+            type_a: adr_type,
+            type_d: PMC_DATA_WORD,
+            datano_s: addr as c_short,
+            datano_e: (addr as c_short).wrapping_add(1),
+            idata: [0; 8],
+        };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                adr_type,
+                PMC_DATA_WORD,
+                addr as c_short,
+                (addr as c_short).wrapping_add(1),
+                PMC_LEN_WORD,
+                &mut buf as *mut _ as *mut u8,
+            )
+        };
         let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() { Ok(buf.idata[0]) } else { Err(ret) }
+        if ret.is_ok() {
+            Ok(buf.idata[0])
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读 PMC 双字：`pmc_rdpmcrng` `data_type 2 len 12`，`D` 常用
-    pub fn pmc_rdpmcrng_dword(&self, hdl: u16, adr_type: c_short, addr: u32) -> Result<c_int, FocasRet> {
+    pub fn pmc_rdpmcrng_dword(
+        &self,
+        hdl: u16,
+        adr_type: c_short,
+        addr: u32,
+    ) -> Result<c_int, FocasRet> {
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
-        let mut buf = IodbPmc2 { type_a: adr_type, type_d: PMC_DATA_DWORD, datano_s: addr as c_short, datano_e: (addr as c_short).wrapping_add(3), ldata: [0; 8] };
-        let rc = unsafe { sym(hdl as c_ushort, adr_type, PMC_DATA_DWORD, addr as c_short, (addr as c_short).wrapping_add(3), PMC_LEN_DWORD, &mut buf as *mut _ as *mut u8) };
+        let mut buf = IodbPmc2 {
+            type_a: adr_type,
+            type_d: PMC_DATA_DWORD,
+            datano_s: addr as c_short,
+            datano_e: (addr as c_short).wrapping_add(3),
+            ldata: [0; 8],
+        };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                adr_type,
+                PMC_DATA_DWORD,
+                addr as c_short,
+                (addr as c_short).wrapping_add(3),
+                PMC_LEN_DWORD,
+                &mut buf as *mut _ as *mut u8,
+            )
+        };
         let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() { Ok(buf.ldata[0]) } else { Err(ret) }
+        if ret.is_ok() {
+            Ok(buf.ldata[0])
+        } else {
+            Err(ret)
+        }
     }
 
     /// 将 PMC 字母映射为 FOCAS adr_type（与 fanuc f_adr_type 一致）
     pub fn pmc_adr_type(kind: char) -> c_short {
         match kind {
-            'G' => PMC_TYPE_G, 'F' => PMC_TYPE_F, 'Y' => PMC_TYPE_Y, 'X' => PMC_TYPE_X, 'A' => PMC_TYPE_A,
-            'R' => PMC_TYPE_R, 'T' => PMC_TYPE_T, 'K' => PMC_TYPE_K, 'C' => PMC_TYPE_C,
-            'D' => PMC_TYPE_D, 'M' => PMC_TYPE_M, 'N' | 'E' => PMC_TYPE_N, 'Z' => PMC_TYPE_Z, 'B' => PMC_TYPE_R, _ => PMC_TYPE_R,
+            'G' => PMC_TYPE_G,
+            'F' => PMC_TYPE_F,
+            'Y' => PMC_TYPE_Y,
+            'X' => PMC_TYPE_X,
+            'A' => PMC_TYPE_A,
+            'R' => PMC_TYPE_R,
+            'T' => PMC_TYPE_T,
+            'K' => PMC_TYPE_K,
+            'C' => PMC_TYPE_C,
+            'D' => PMC_TYPE_D,
+            'M' => PMC_TYPE_M,
+            'N' | 'E' => PMC_TYPE_N,
+            'Z' => PMC_TYPE_Z,
+            'B' => PMC_TYPE_R,
+            _ => PMC_TYPE_R,
         }
     }
 
@@ -907,19 +1256,35 @@ impl NativeLib {
     pub fn cnc_rdalmmsg(&self, hdl: u16, num: &mut c_short) -> Result<Vec<String>, FocasRet> {
         let sym = self.cnc_rdalmmsg.as_ref().ok_or(FocasRet::Noopt)?;
         let mut out = OdbAlmMsg { dummy: [0; 64] };
-        let rc = unsafe { sym(hdl as c_ushort, -1 as c_short, num as *mut c_short, &mut out as *mut OdbAlmMsg) };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                -1 as c_short,
+                num as *mut c_short,
+                &mut out as *mut OdbAlmMsg,
+            )
+        };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() {
             // 占位解析：真机需按 `msg_len` 解 `alm_msg`，此处仅证明链路可达
             Ok(vec![format!("alarm:{}", num)])
-        } else { Err(ret) }
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读诊断：`cnc_diagnoss(hdl, num, 1, ODBDIAG)` 单点诊断
     pub fn cnc_diagnoss(&self, hdl: u16, num: i32) -> Result<c_int, FocasRet> {
         let sym = self.cnc_diagnoss.as_ref().ok_or(FocasRet::Noopt)?;
         let mut out = OdbDiag { dummy: 0 };
-        let rc = unsafe { sym(hdl as c_ushort, num as c_short, 1 as c_short, &mut out as *mut OdbDiag) };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                num as c_short,
+                1 as c_short,
+                &mut out as *mut OdbDiag,
+            )
+        };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() { Ok(out.dummy) } else { Err(ret) }
     }
@@ -930,32 +1295,70 @@ impl NativeLib {
         let mut out = std::mem::MaybeUninit::<OdbPrgNum>::uninit();
         let rc = unsafe { sym(hdl as c_ushort, out.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() { Ok(unsafe { out.assume_init() }) } else { Err(ret) }
+        if ret.is_ok() {
+            Ok(unsafe { out.assume_init() })
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读主轴负载：`cnc_rdspmeter(hdl, 0, &mut num, &mut data)` 4 轴
-    pub fn cnc_rdspmeter(&self, hdl: u16, num: &mut c_short, data: &mut SpLoad) -> Result<(), FocasRet> {
+    pub fn cnc_rdspmeter(
+        &self,
+        hdl: u16,
+        num: &mut c_short,
+        data: &mut SpLoad,
+    ) -> Result<(), FocasRet> {
         let sym = self.cnc_rdspmeter.as_ref().ok_or(FocasRet::Noopt)?;
         let mut n: c_short = 4;
-        let rc = unsafe { sym(hdl as c_ushort, 0 as c_short, &mut n as *mut c_short, data as *mut SpLoad) };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                0 as c_short,
+                &mut n as *mut c_short,
+                data as *mut SpLoad,
+            )
+        };
         let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() { *num = n; Ok(()) } else { Err(ret) }
+        if ret.is_ok() {
+            *num = n;
+            Ok(())
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读伺服负载：`cnc_rdsvmeter(hdl, &mut num, &mut data)` 同主轴
-    pub fn cnc_rdsvmeter(&self, hdl: u16, num: &mut c_short, data: &mut SpLoad) -> Result<(), FocasRet> {
+    pub fn cnc_rdsvmeter(
+        &self,
+        hdl: u16,
+        num: &mut c_short,
+        data: &mut SpLoad,
+    ) -> Result<(), FocasRet> {
         let sym = self.cnc_rdsvmeter.as_ref().ok_or(FocasRet::Noopt)?;
         let mut n: c_short = 4;
         let rc = unsafe { sym(hdl as c_ushort, &mut n as *mut c_short, data as *mut SpLoad) };
         let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() { *num = n; Ok(()) } else { Err(ret) }
+        if ret.is_ok() {
+            *num = n;
+            Ok(())
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读操作信息：`cnc_rdopmsg(hdl, 0, 64, OPMSG)` 64 字节操作提示
     pub fn cnc_rdopmsg(&self, hdl: u16) -> Result<OpMsg, FocasRet> {
         let sym = self.cnc_rdopmsg.as_ref().ok_or(FocasRet::Noopt)?;
         let mut out = OpMsg { dummy: [0; 64] };
-        let rc = unsafe { sym(hdl as c_ushort, 0 as c_short, 64 as c_short, &mut out as *mut OpMsg) };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                0 as c_short,
+                64 as c_short,
+                &mut out as *mut OpMsg,
+            )
+        };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() { Ok(out) } else { Err(ret) }
     }
@@ -964,18 +1367,38 @@ impl NativeLib {
     pub fn cnc_rdspgear(&self, hdl: u16, spindle: u8) -> Result<i16, FocasRet> {
         let sym = self.cnc_rdspgear.as_ref().ok_or(FocasRet::Noopt)?;
         let mut gear: c_short = 0;
-        let rc = unsafe { sym(hdl as c_ushort, spindle as c_ushort, &mut gear as *mut c_short) };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                spindle as c_ushort,
+                &mut gear as *mut c_short,
+            )
+        };
         let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() { Ok(gear as i16) } else { Err(ret) }
+        if ret.is_ok() {
+            Ok(gear as i16)
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读主轴最大转速：`cnc_rdspmaxrpm(hdl, spindle, &mut rpm)` 占位
     pub fn cnc_rdspmaxrpm(&self, hdl: u16, spindle: u8) -> Result<i16, FocasRet> {
         let sym = self.cnc_rdspmaxrpm.as_ref().ok_or(FocasRet::Noopt)?;
         let mut rpm: c_short = 0;
-        let rc = unsafe { sym(hdl as c_ushort, spindle as c_ushort, &mut rpm as *mut c_short) };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                spindle as c_ushort,
+                &mut rpm as *mut c_short,
+            )
+        };
         let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() { Ok(rpm as i16) } else { Err(ret) }
+        if ret.is_ok() {
+            Ok(rpm as i16)
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读刀补单点：`cnc_rdtofs(hdl, s_no, e_no, type, &mut OdbTofs)` 真结构 Pack=4，`fwlib.cs:8624`
@@ -985,12 +1408,23 @@ impl NativeLib {
         if let Some(sym) = self.cnc_rdtofs.as_ref() {
             for t in [0 as c_short, 1 as c_short] {
                 let mut out = std::mem::MaybeUninit::<OdbTofs>::uninit();
-                let rc = unsafe { sym(hdl as c_ushort, num as c_short, num as c_short, t, out.as_mut_ptr()) };
+                let rc = unsafe {
+                    sym(
+                        hdl as c_ushort,
+                        num as c_short,
+                        num as c_short,
+                        t,
+                        out.as_mut_ptr(),
+                    )
+                };
                 let ret = FocasRet::from_raw(rc);
                 if ret.is_ok() {
                     let v = unsafe { out.assume_init() };
                     return Ok(v.data as f64 / 1000.0);
-                } else if ret == FocasRet::Length || ret == FocasRet::Number || ret == FocasRet::Data {
+                } else if ret == FocasRet::Length
+                    || ret == FocasRet::Number
+                    || ret == FocasRet::Data
+                {
                     continue;
                 } else {
                     return Err(ret);
@@ -1017,7 +1451,8 @@ impl NativeLib {
                     if ret.is_ok() {
                         let v = unsafe { out.assume_init() };
                         return Ok(v.ofs.m_ofs_b[0] as f64 / 1000.0);
-                    } else if matches!(ret, FocasRet::Length | FocasRet::Number | FocasRet::Attrib) {
+                    } else if matches!(ret, FocasRet::Length | FocasRet::Number | FocasRet::Attrib)
+                    {
                         continue;
                     } else if ret == FocasRet::Noopt {
                         break;
@@ -1057,7 +1492,15 @@ impl NativeLib {
         let sym = self.cnc_rdzofs.as_ref().ok_or(FocasRet::Noopt)?;
         for t in [0 as c_short, 1 as c_short] {
             let mut out = std::mem::MaybeUninit::<IodbZofs>::uninit();
-            let rc = unsafe { sym(hdl as c_ushort, num as c_short, num as c_short, t, out.as_mut_ptr()) };
+            let rc = unsafe {
+                sym(
+                    hdl as c_ushort,
+                    num as c_short,
+                    num as c_short,
+                    t,
+                    out.as_mut_ptr(),
+                )
+            };
             let ret = FocasRet::from_raw(rc);
             if ret.is_ok() {
                 let v = unsafe { out.assume_init() };
@@ -1079,7 +1522,15 @@ impl NativeLib {
         // 先试 dword/word/byte 共用 IODBPSD_1
         for len in [1 as c_short, 8 as c_short, 6 as c_short] {
             let mut out = std::mem::MaybeUninit::<IodbPsd1>::uninit();
-            let rc = unsafe { sym(hdl as c_ushort, num as c_short, 0 as c_short, len, out.as_mut_ptr()) };
+            let rc = unsafe {
+                sym(
+                    hdl as c_ushort,
+                    num as c_short,
+                    0 as c_short,
+                    len,
+                    out.as_mut_ptr(),
+                )
+            };
             let ret = FocasRet::from_raw(rc);
             if ret.is_ok() {
                 let v = unsafe { out.assume_init() };
@@ -1096,17 +1547,34 @@ impl NativeLib {
         // 回退 REAL：需以 IODBPSD_2 结构读，取 prm_val
         unsafe {
             let raw: *const Library = &self._lib as *const Library;
-            if let Ok(sym2) = (*raw).get::<unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, *mut IodbPsd2) -> c_short>(b"cnc_rdparam") {
+            if let Ok(sym2) = (*raw).get::<unsafe extern "C" fn(
+                c_ushort,
+                c_short,
+                c_short,
+                c_short,
+                *mut IodbPsd2,
+            ) -> c_short>(b"cnc_rdparam")
+            {
                 for len in [12 as c_short, 1 as c_short] {
                     let mut out2 = std::mem::MaybeUninit::<IodbPsd2>::uninit();
-                    let rc = sym2(hdl as c_ushort, num as c_short, 0 as c_short, len, out2.as_mut_ptr());
+                    let rc = sym2(
+                        hdl as c_ushort,
+                        num as c_short,
+                        0 as c_short,
+                        len,
+                        out2.as_mut_ptr(),
+                    );
                     let ret = FocasRet::from_raw(rc);
                     if ret.is_ok() {
                         let v = out2.assume_init();
                         // REAL 转 I32：prm_val *10^-dec_val 近似取整
-                        let dec = v.rdata.dec_val as i32;
+                        let dec = v.rdata.dec_val;
                         let raw = v.rdata.prm_val as f64;
-                        let val = if dec == 0 { raw } else { raw / 10_f64.powi(dec) };
+                        let val = if dec == 0 {
+                            raw
+                        } else {
+                            raw / 10_f64.powi(dec)
+                        };
                         return Ok(val as i32);
                     } else if matches!(ret, FocasRet::Length | FocasRet::Attrib) {
                         continue;
@@ -1123,16 +1591,27 @@ impl NativeLib {
     pub fn cnc_rdprogdir(&self, hdl: u16) -> Result<String, FocasRet> {
         let sym = self.cnc_rdprogdir.as_ref().ok_or(FocasRet::Noopt)?;
         // 0i-F 常用 top=0 num=10 len=256，失败则试 top=1
-        for (a, b, c, d) in [(0 as c_short, 0 as c_short, 0 as c_short, 256 as c_ushort), (0 as c_short, 1 as c_short, 10 as c_short, 256 as c_ushort)] {
-            let mut out = PrgDir { prg_data: [0u8; 256] };
+        for (a, b, c, d) in [
+            (0 as c_short, 0 as c_short, 0 as c_short, 256 as c_ushort),
+            (0 as c_short, 1 as c_short, 10 as c_short, 256 as c_ushort),
+        ] {
+            let mut out = PrgDir {
+                prg_data: [0u8; 256],
+            };
             let rc = unsafe { sym(hdl as c_ushort, a, b, c, d, &mut out as *mut PrgDir) };
             let ret = FocasRet::from_raw(rc);
             if ret.is_ok() {
                 let raw = &out.prg_data;
                 // 过滤至可打印 ASCII，保留 % O 0-9 及空格
-                let s: String = raw.iter().filter(|&&b| b >= 32 && b < 127).map(|&b| b as char).collect();
+                let s: String = raw
+                    .iter()
+                    .filter(|&&b| (32..127).contains(&b))
+                    .map(|&b| b as char)
+                    .collect();
                 let t = s.trim().to_string();
-                if t.is_empty() { return Ok("PRG:empty".into()); }
+                if t.is_empty() {
+                    return Ok("PRG:empty".into());
+                }
                 // 截断至 80 字符防溢出
                 return Ok(t.chars().take(80).collect());
             } else if matches!(ret, FocasRet::Length | FocasRet::Number) {
@@ -1149,13 +1628,31 @@ impl NativeLib {
     /// - 回退 `ODBNC_2 31B` 再试 3 型，仍 `EW_Length` 则属机床未组态真诊断 `BAD` 隔离
     pub fn cnc_rdproginfo(&self, hdl: u16) -> Result<String, FocasRet> {
         if let Some(sym) = self.cnc_rdproginfo.as_ref() {
-            for (a, b) in [(0 as c_short, 0 as c_short), (0 as c_short, 10 as c_short), (1 as c_short, 0 as c_short), (0 as c_short, 1 as c_short), (10 as c_short, 0 as c_short), (1 as c_short, 10 as c_short)] {
-                let mut out = OdbNc1 { reg_prg: 0, unreg_prg: 0, used_mem: 0, unused_mem: 0 };
+            for (a, b) in [
+                (0 as c_short, 0 as c_short),
+                (0 as c_short, 10 as c_short),
+                (1 as c_short, 0 as c_short),
+                (0 as c_short, 1 as c_short),
+                (10 as c_short, 0 as c_short),
+                (1 as c_short, 10 as c_short),
+            ] {
+                let mut out = OdbNc1 {
+                    reg_prg: 0,
+                    unreg_prg: 0,
+                    used_mem: 0,
+                    unused_mem: 0,
+                };
                 let rc = unsafe { sym(hdl as c_ushort, a, b, &mut out as *mut OdbNc1) };
                 let ret = FocasRet::from_raw(rc);
                 if ret.is_ok() {
-                    return Ok(format!("reg:{} unreg:{} used:{} free:{}", out.reg_prg, out.unreg_prg, out.used_mem, out.unused_mem));
-                } else if matches!(ret, FocasRet::Length | FocasRet::Number | FocasRet::Attrib | FocasRet::Data) {
+                    return Ok(format!(
+                        "reg:{} unreg:{} used:{} free:{}",
+                        out.reg_prg, out.unreg_prg, out.used_mem, out.unused_mem
+                    ));
+                } else if matches!(
+                    ret,
+                    FocasRet::Length | FocasRet::Number | FocasRet::Attrib | FocasRet::Data
+                ) {
                     continue;
                 } else if ret == FocasRet::Noopt {
                     break;
@@ -1165,15 +1662,27 @@ impl NativeLib {
             }
         }
         if let Some(sym2) = self.cnc_rdproginfo2.as_ref() {
-            for (a, b) in [(0 as c_short, 0 as c_short), (1 as c_short, 10 as c_short), (0 as c_short, 1 as c_short)] {
+            for (a, b) in [
+                (0 as c_short, 0 as c_short),
+                (1 as c_short, 10 as c_short),
+                (0 as c_short, 1 as c_short),
+            ] {
                 let mut out2 = OdbNc2 { asc: [0u8; 31] };
                 let rc = unsafe { sym2(hdl as c_ushort, a, b, &mut out2 as *mut OdbNc2) };
                 let ret = FocasRet::from_raw(rc);
                 if ret.is_ok() {
-                    let s = String::from_utf8_lossy(&out2.asc).trim_matches('\0').trim().to_string();
-                    if s.is_empty() { return Ok("PRGINFO:empty".into()); }
+                    let s = String::from_utf8_lossy(&out2.asc)
+                        .trim_matches('\0')
+                        .trim()
+                        .to_string();
+                    if s.is_empty() {
+                        return Ok("PRGINFO:empty".into());
+                    }
                     return Ok(s.chars().take(31).collect());
-                } else if matches!(ret, FocasRet::Length | FocasRet::Number | FocasRet::Attrib | FocasRet::Data) {
+                } else if matches!(
+                    ret,
+                    FocasRet::Length | FocasRet::Number | FocasRet::Attrib | FocasRet::Data
+                ) {
                     continue;
                 } else {
                     return Err(ret);
@@ -1187,7 +1696,11 @@ impl NativeLib {
     /// - `upstart3(hdl,0,0,0)` 起传，`upload3` 循环至 `EW_BUFFER(10)`，`upend3` 结束，`len` 入 256
     pub fn cnc_upload(&self, hdl: u16) -> Result<String, FocasRet> {
         // 优先 3 代序列（需 upstart）
-        if let (Some(start3), Some(up3), Some(end3)) = (self.cnc_upstart3.as_ref(), self.cnc_upload3.as_ref(), self.cnc_upend3.as_ref()) {
+        if let (Some(start3), Some(up3), Some(end3)) = (
+            self.cnc_upstart3.as_ref(),
+            self.cnc_upload3.as_ref(),
+            self.cnc_upend3.as_ref(),
+        ) {
             let rc0 = unsafe { start3(hdl as c_ushort, 0 as c_short, 0 as c_int, 0 as c_int) };
             let ret0 = FocasRet::from_raw(rc0);
             if ret0.is_ok() || ret0 == FocasRet::Buffer {
@@ -1195,12 +1708,20 @@ impl NativeLib {
                 loop {
                     let mut len: c_int = 256;
                     let mut out = OdbUp3 { data: [0u8; 256] };
-                    let rc = unsafe { up3(hdl as c_ushort, &mut len as *mut c_int, &mut out as *mut OdbUp3) };
+                    let rc = unsafe {
+                        up3(
+                            hdl as c_ushort,
+                            &mut len as *mut c_int,
+                            &mut out as *mut OdbUp3,
+                        )
+                    };
                     let ret = FocasRet::from_raw(rc);
                     if ret.is_ok() {
                         let n = (len as usize).min(256);
                         all.extend_from_slice(&out.data[..n]);
-                        if n < 256 { break; }
+                        if n < 256 {
+                            break;
+                        }
                     } else if ret == FocasRet::Buffer {
                         break;
                     } else {
@@ -1209,8 +1730,13 @@ impl NativeLib {
                     }
                 }
                 let _ = unsafe { end3(hdl as c_ushort) };
-                let s = String::from_utf8_lossy(&all).trim_matches('\0').trim().to_string();
-                if s.is_empty() { return Ok("UP:empty".into()); }
+                let s = String::from_utf8_lossy(&all)
+                    .trim_matches('\0')
+                    .trim()
+                    .to_string();
+                if s.is_empty() {
+                    return Ok("UP:empty".into());
+                }
                 return Ok(s.chars().take(80).collect());
             } else if ret0 != FocasRet::Noopt {
                 // 回退旧版单次
@@ -1221,12 +1747,23 @@ impl NativeLib {
         if let Some(sym3) = self.cnc_upload3.as_ref() {
             let mut len: c_int = 256;
             let mut out = OdbUp3 { data: [0u8; 256] };
-            let rc = unsafe { sym3(hdl as c_ushort, &mut len as *mut c_int, &mut out as *mut OdbUp3) };
+            let rc = unsafe {
+                sym3(
+                    hdl as c_ushort,
+                    &mut len as *mut c_int,
+                    &mut out as *mut OdbUp3,
+                )
+            };
             let ret = FocasRet::from_raw(rc);
             if ret.is_ok() {
                 let n = (len as usize).min(256);
-                let s = String::from_utf8_lossy(&out.data[..n]).trim_matches('\0').trim().to_string();
-                if s.is_empty() { return Ok("UP:empty".into()); }
+                let s = String::from_utf8_lossy(&out.data[..n])
+                    .trim_matches('\0')
+                    .trim()
+                    .to_string();
+                if s.is_empty() {
+                    return Ok("UP:empty".into());
+                }
                 return Ok(s.chars().take(80).collect());
             } else if ret != FocasRet::Noopt {
                 // 回退旧版
@@ -1235,15 +1772,33 @@ impl NativeLib {
             }
         }
         let sym = self.cnc_upload.as_ref().ok_or(FocasRet::Noopt)?;
-        let mut out = OdbUp { dummy: [0; 2], data: [0u8; 256] };
+        let mut out = OdbUp {
+            dummy: [0; 2],
+            data: [0u8; 256],
+        };
         let mut len: c_ushort = 256;
-        let rc = unsafe { sym(hdl as c_ushort, &mut out as *mut OdbUp, &mut len as *mut c_ushort) };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                &mut out as *mut OdbUp,
+                &mut len as *mut c_ushort,
+            )
+        };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() {
             let n = (len as usize).min(256);
-            let s = String::from_utf8_lossy(&out.data[..n]).trim_matches('\0').trim().to_string();
-            if s.is_empty() { Ok("UP:empty".into()) } else { Ok(s.chars().take(80).collect()) }
-        } else { Err(ret) }
+            let s = String::from_utf8_lossy(&out.data[..n])
+                .trim_matches('\0')
+                .trim()
+                .to_string();
+            if s.is_empty() {
+                Ok("UP:empty".into())
+            } else {
+                Ok(s.chars().take(80).collect())
+            }
+        } else {
+            Err(ret)
+        }
     }
 }
 

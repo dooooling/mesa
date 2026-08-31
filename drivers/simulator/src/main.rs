@@ -38,9 +38,13 @@ fn main() {
             });
         }
 
-        if let Err(e) =
-            mesa_driver_sdk::serve(mesa_driver_simulator::SimulatorDriver, listener, session_token, shutdown)
-                .await
+        if let Err(e) = mesa_driver_sdk::serve(
+            mesa_driver_simulator::SimulatorDriver,
+            listener,
+            session_token,
+            shutdown,
+        )
+        .await
         {
             eprintln!("simulator driver exited with error: {e}");
             std::process::exit(1);

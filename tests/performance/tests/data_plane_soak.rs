@@ -4,9 +4,9 @@
 
 use std::time::{Duration, Instant};
 
+use mesa_config_store::ConfigStore;
 use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
 use mesa_driver_manager::MesaManager;
-use mesa_config_store::ConfigStore;
 use mesa_driver_manager::StorePointIdSource;
 use std::sync::Arc;
 
@@ -14,7 +14,13 @@ use std::sync::Arc;
 async fn data_plane_50k_10s_ci() {
     let long_3000 = std::env::var("PERF_3000").is_ok();
     let long = std::env::var("PERF_LONG").is_ok() || std::env::args().any(|a| a == "--long");
-    let dur = if long_3000 { Duration::from_secs(3000) } else if long { Duration::from_secs(600) } else { Duration::from_secs(10) };
+    let dur = if long_3000 {
+        Duration::from_secs(3000)
+    } else if long {
+        Duration::from_secs(600)
+    } else {
+        Duration::from_secs(10)
+    };
     // 使用内存库 + Simulator 4 Tasks *5 points=20/batch burst 125 20ms => 125k/s 远超 50k
     let store = Arc::new(ConfigStore::open(std::path::Path::new(":memory:")).unwrap());
     let source = Arc::new(StorePointIdSource::new(store.clone()));
@@ -47,5 +53,8 @@ async fn data_plane_50k_10s_ci() {
     assert!(elapsed >= 9.0, "elapsed {elapsed}");
     assert!(!ids.is_empty(), "应有运行中 endpoint");
     mgr.shutdown_all().await;
-    println!("data_plane_50k_10s_ci elapsed={elapsed:.1}s running={:?}", ids);
+    println!(
+        "data_plane_50k_10s_ci elapsed={elapsed:.1}s running={:?}",
+        ids
+    );
 }

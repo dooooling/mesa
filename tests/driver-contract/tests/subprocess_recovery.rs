@@ -10,8 +10,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use mesa_core_types::ConnectionState;
-use mesa_driver_manager::endpoint::{run_endpoint, BuiltinEndpoint, PointIdAllocator, PointIdSource};
-use mesa_driver_manager::manifest::{scan_drivers, DiscoveredDriver};
+use mesa_driver_manager::endpoint::{
+    BuiltinEndpoint, PointIdAllocator, PointIdSource, run_endpoint,
+};
+use mesa_driver_manager::manifest::{DiscoveredDriver, scan_drivers};
 use mesa_driver_manager::process::TERMINATE_GRACE;
 use mesa_driver_manager::session::Session;
 use mesa_driver_manager::snapshot::Snapshot;
@@ -35,8 +37,14 @@ fn manifest_discovery_finds_simulator() {
         "version must be x.y.z shaped"
     );
     assert!(sim.protocol_ok, "protocol major must match core");
-    assert!(sim.platform_ok, "host platform must match manifest constraints");
-    assert!(sim.launchable(), "simulator binary must resolve after build");
+    assert!(
+        sim.platform_ok,
+        "host platform must match manifest constraints"
+    );
+    assert!(
+        sim.launchable(),
+        "simulator binary must resolve after build"
+    );
 }
 
 /// 手工构造指向已构建二进制的 DiscoveredDriver（跳过目录扫描，聚焦行为本身）。
@@ -101,8 +109,9 @@ async fn subprocess_token_handshake_paths() {
     let mut p = mesa_driver_manager::process::DriverProcess::spawn(&sim_discovered())
         .await
         .expect("spawn");
-    let (mut session, _events, _) =
-        Session::connect_retry(p.port, &p.token).await.expect("handshake with injected token");
+    let (mut session, _events, _) = Session::connect_retry(p.port, &p.token)
+        .await
+        .expect("handshake with injected token");
     let (driver_id, _, _) = session.metadata().await.expect("metadata");
     assert_eq!(driver_id, "simulator");
     teardown(&mut session, None);
@@ -139,7 +148,13 @@ async fn driver_crash_restore_via_endpoint_runtime() {
 
     let disc = sim_discovered();
     let snap = snapshot.clone();
-    let rt = tokio::spawn(run_endpoint(disc, cfg.clone(), snap, allocator, shutdown.clone()));
+    let rt = tokio::spawn(run_endpoint(
+        disc,
+        cfg.clone(),
+        snap,
+        allocator,
+        shutdown.clone(),
+    ));
 
     // 第一次运行：RUNNING 且 epoch != 0，记录点集与 epoch
     wait_until(10, || {
@@ -151,8 +166,7 @@ async fn driver_crash_restore_via_endpoint_runtime() {
     .await;
     let epoch1 = snapshot.endpoint("ct-crash").unwrap().epoch;
     wait_until(10, || snapshot.latest_all().len() == 2).await;
-    let points_before: Vec<u32> =
-        snapshot.latest_all().iter().map(|e| e.point_id).collect();
+    let points_before: Vec<u32> = snapshot.latest_all().iter().map(|e| e.point_id).collect();
     assert_eq!(points_before.len(), 2, "two points registered");
     let ts_before = snapshot
         .latest_all()
@@ -172,14 +186,23 @@ async fn driver_crash_restore_via_endpoint_runtime() {
     assert_ne!(epoch1, epoch2, "restore must establish a new stream_epoch");
 
     // Point ID 稳定性：重启后仍是同一组 id，且数据在更新（时间戳前进）
-    let points_after: Vec<u32> =
-        snapshot.latest_all().iter().map(|e| e.point_id).collect();
-    assert_eq!(points_before, points_after, "point ids must survive driver restart");
+    let points_after: Vec<u32> = snapshot.latest_all().iter().map(|e| e.point_id).collect();
+    assert_eq!(
+        points_before, points_after,
+        "point ids must survive driver restart"
+    );
 
     let ts_stable_start = Instant::now();
     wait_until(10, || {
-        snapshot.latest_all().iter().any(|e| e.timestamp_ns > ts_before[0])
-            || snapshot.latest_all().iter().enumerate().any(|(i, e)| e.timestamp_ns > ts_before[i])
+        snapshot
+            .latest_all()
+            .iter()
+            .any(|e| e.timestamp_ns > ts_before[0])
+            || snapshot
+                .latest_all()
+                .iter()
+                .enumerate()
+                .any(|(i, e)| e.timestamp_ns > ts_before[i])
     })
     .await;
     assert!(
@@ -187,7 +210,10 @@ async fn driver_crash_restore_via_endpoint_runtime() {
         "data must resume flowing after restore"
     );
     // 恢复后质量回到 GOOD（断线窗口曾被置 BAD）
-    wait_until(5, || snapshot.latest_all().iter().all(|e| e.quality == "GOOD")).await;
+    wait_until(5, || {
+        snapshot.latest_all().iter().all(|e| e.quality == "GOOD")
+    })
+    .await;
 
     shutdown.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(35), rt).await; // 退避 sleep 最长 30s
@@ -202,7 +228,10 @@ async fn graceful_shutdown_terminates_subprocess_promptly() {
     let (session, _events, _) = Session::connect_retry(p.port, &p.token).await.unwrap();
 
     use mesa_driver_protocol::pb::envelope::Body;
-    session.post(Body::Shutdown(mesa_driver_protocol::pb::Shutdown {})).await.unwrap();
+    session
+        .post(Body::Shutdown(mesa_driver_protocol::pb::Shutdown {}))
+        .await
+        .unwrap();
     drop(session);
 
     let started = Instant::now();

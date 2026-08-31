@@ -6,8 +6,8 @@ mod common;
 
 use std::time::Duration;
 
-use mesa_driver_protocol::{pb, read_envelope, write_envelope, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use mesa_driver_manager::session::Session;
+use mesa_driver_protocol::{PROTOCOL_MAJOR, PROTOCOL_MINOR, pb, read_envelope, write_envelope};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -28,8 +28,10 @@ async fn core_rejects_incompatible_driver_major() {
                 _ => return,
             };
             h.protocol_major += 1; // 制造 Major 不兼容
-            let env =
-                pb::Envelope { msg_id: hello.msg_id, body: Some(pb::envelope::Body::Hello(h)) };
+            let env = pb::Envelope {
+                msg_id: hello.msg_id,
+                body: Some(pb::envelope::Body::Hello(h)),
+            };
             let _ = write_envelope(&mut wr, &env).await;
             // 保持连接片刻，观察 Core 是否主动断开
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -63,7 +65,9 @@ async fn driver_rejects_core_major_downgrade() {
     });
 
     // 裸 Core 客户端：读 Hello 后回一个 Major 不一致的 Welcome
-    let sock = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     let (mut rd, mut wr) = sock.into_split();
     let hello = read_envelope(&mut rd).await.expect("sim sends hello first");
     let welcome = pb::Envelope {
@@ -76,8 +80,9 @@ async fn driver_rejects_core_major_downgrade() {
     };
     write_envelope(&mut wr, &welcome).await.unwrap();
 
-    let joined =
-        tokio::time::timeout(Duration::from_secs(5), server).await.expect("serve must finish");
+    let joined = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("serve must finish");
     let result = joined.expect("join serve task");
     let err = result.expect_err("serve must return Err on incompatible major");
     let msg = err.to_string();

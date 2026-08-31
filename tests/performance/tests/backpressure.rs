@@ -16,7 +16,9 @@ async fn backpressure_25_percent_coalesces() {
     let handle = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let mut drained = 0;
-        while rx.try_recv().is_ok() { drained += 1; }
+        while rx.try_recv().is_ok() {
+            drained += 1;
+        }
         drained
     });
     tokio::time::sleep(Duration::from_millis(10)).await;

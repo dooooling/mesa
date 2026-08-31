@@ -52,7 +52,13 @@ pub trait OpcUaApi: Send + Sync {
         queue_size: u32,
         discard_oldest: bool,
     ) -> Result<(u32, tokio::sync::mpsc::Receiver<DataChangeEvent>), String> {
-        let _ = (addrs, publishing_interval_ms, sampling_interval_ms, queue_size, discard_oldest);
+        let _ = (
+            addrs,
+            publishing_interval_ms,
+            sampling_interval_ms,
+            queue_size,
+            discard_oldest,
+        );
         Err("NOT_IMPLEMENTED: subscribe 未实现".into())
     }
     async fn unsubscribe(&self, subscription_id: u32) -> Result<(), String> {
@@ -83,7 +89,9 @@ impl Default for FakeOpcUaApi {
 
 impl FakeOpcUaApi {
     pub fn new() -> Self {
-        Self { seed: AtomicU64::new(0x1234_5678_9ABC_DEF0) }
+        Self {
+            seed: AtomicU64::new(0x1234_5678_9ABC_DEF0),
+        }
     }
 
     fn next_rand(&self) -> u64 {
@@ -99,7 +107,11 @@ impl FakeOpcUaApi {
         match &addr.identifier {
             crate::address::Identifier::Numeric(n) => {
                 // 数值型节点：按 n 奇偶返回 I32/U32，便于类型覆盖
-                if n % 2 == 0 { Value::I32((r % 10000) as i32) } else { Value::U32((r % 10000) as u32) }
+                if n % 2 == 0 {
+                    Value::I32((r % 10000) as i32)
+                } else {
+                    Value::U32((r % 10000) as u32)
+                }
             }
             crate::address::Identifier::String(s) => {
                 // 字符串型：若含 Speed/Temp 等关键字返回 F64，否则 String
@@ -127,7 +139,9 @@ impl OpcUaApi for FakeOpcUaApi {
             return Err("endpoint_url 不能为空".into());
         }
         if !endpoint_url.starts_with("opc.tcp://") {
-            return Err(format!("endpoint_url `{endpoint_url}` 非法，需 opc.tcp://host:port"));
+            return Err(format!(
+                "endpoint_url `{endpoint_url}` 非法，需 opc.tcp://host:port"
+            ));
         }
         Ok(())
     }
@@ -136,11 +150,11 @@ impl OpcUaApi for FakeOpcUaApi {
         let mut out = Vec::with_capacity(addrs.len());
         for addr in addrs {
             // 模拟单点不支持：特定字符串触发 Bad（用于测试 Bad 隔离）
-            if let crate::address::Identifier::String(s) = &addr.identifier {
-                if s.contains("bad") || s.contains("Bad") {
-                    out.push(Value::String("ERR:BadNodeIdUnknown".into()));
-                    continue;
-                }
+            if let crate::address::Identifier::String(s) = &addr.identifier
+                && (s.contains("bad") || s.contains("Bad"))
+            {
+                out.push(Value::String("ERR:BadNodeIdUnknown".into()));
+                continue;
             }
             out.push(self.fake_value_for(addr));
         }
@@ -171,7 +185,7 @@ impl OpcUaApi for FakeOpcUaApi {
                 ticker.tick().await;
                 counter += 1;
                 // 每 7 次模拟一次 KeepAlive（不发送任何 DataChange）
-                if counter % 7 == 0 {
+                if counter.is_multiple_of(7) {
                     continue;
                 }
                 for (idx, addr) in addrs.iter().enumerate() {
@@ -192,11 +206,18 @@ impl OpcUaApi for FakeOpcUaApi {
                         let r = local_seed;
                         let variant = match &addr.identifier {
                             crate::address::Identifier::Numeric(n) => {
-                                if n % 2 == 0 { Variant::Int32((r % 10000) as i32) } else { Variant::UInt32((r % 10000) as u32) }
+                                if n % 2 == 0 {
+                                    Variant::Int32((r % 10000) as i32)
+                                } else {
+                                    Variant::UInt32((r % 10000) as u32)
+                                }
                             }
                             crate::address::Identifier::String(s) => {
                                 let lower = s.to_ascii_lowercase();
-                                if lower.contains("speed") || lower.contains("sine") || lower.contains("temp") {
+                                if lower.contains("speed")
+                                    || lower.contains("sine")
+                                    || lower.contains("temp")
+                                {
                                     Variant::Double((r % 10000) as f64 / 10.0)
                                 } else if lower.contains("counter") || lower.contains("count") {
                                     Variant::UInt32((r % 1000) as u32)
@@ -204,8 +225,12 @@ impl OpcUaApi for FakeOpcUaApi {
                                     Variant::String(UAString::from(format!("fake:{s}:{}", r % 100)))
                                 }
                             }
-                            crate::address::Identifier::Guid(_) => Variant::String(UAString::from(format!("guid:{}", r % 1000))),
-                            crate::address::Identifier::Opaque(_) => Variant::String(UAString::from(format!("opaque:{}", r % 1000))),
+                            crate::address::Identifier::Guid(_) => {
+                                Variant::String(UAString::from(format!("guid:{}", r % 1000)))
+                            }
+                            crate::address::Identifier::Opaque(_) => {
+                                Variant::String(UAString::from(format!("opaque:{}", r % 1000)))
+                            }
                         };
                         DataValue {
                             value: Some(variant),
@@ -216,7 +241,10 @@ impl OpcUaApi for FakeOpcUaApi {
                             server_picoseconds: None,
                         }
                     };
-                    let ev = DataChangeEvent { client_handle, data_value: dv };
+                    let ev = DataChangeEvent {
+                        client_handle,
+                        data_value: dv,
+                    };
                     if tx.try_send(ev).is_err() {
                         return;
                     }
@@ -250,16 +278,20 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use opcua_client::{ClientBuilder, IdentityToken, Session};
 use opcua_types::{
-    ByteString, Guid, NodeId as OpcNodeId, UAString, Variant, DataValue, ReadValueId,
-    TimestampsToReturn, StatusCode,
+    ByteString, DataValue, Guid, NodeId as OpcNodeId, ReadValueId, StatusCode, TimestampsToReturn,
+    UAString, Variant,
 };
 
 fn to_opc_node_id(addr: &OpcUaAddress) -> Result<OpcNodeId, String> {
     match &addr.identifier {
         crate::address::Identifier::Numeric(n) => Ok(OpcNodeId::new(addr.namespace, *n)),
-        crate::address::Identifier::String(s) => Ok(OpcNodeId::new(addr.namespace, UAString::from(s.as_str()))),
+        crate::address::Identifier::String(s) => {
+            Ok(OpcNodeId::new(addr.namespace, UAString::from(s.as_str())))
+        }
         crate::address::Identifier::Guid(g) => {
-            let guid = g.parse::<Guid>().map_err(|e| format!("GUID 解析失败 {g}: {e:?}"))?;
+            let guid = g
+                .parse::<Guid>()
+                .map_err(|e| format!("GUID 解析失败 {g}: {e:?}"))?;
             Ok(OpcNodeId::new(addr.namespace, guid))
         }
         crate::address::Identifier::Opaque(b64) => {
@@ -318,20 +350,75 @@ pub(crate) fn variant_to_value(v: &Variant) -> Option<Value> {
         }
         Variant::Array(arr) => {
             // 保留 Typed Array (§9.2)，按元素类型转对应 Array Value
-            use opcua_types::Variant as V;
-            let vals: Vec<Value> = arr.values.iter().filter_map(|e| variant_to_value(e)).collect();
-            if vals.is_empty() { return Some(Value::String(format!("{:?}", arr))); }
+            let vals: Vec<Value> = arr.values.iter().filter_map(variant_to_value).collect();
+            if vals.is_empty() {
+                return Some(Value::String(format!("{:?}", arr)));
+            }
             // 推断首元素类型
             match &vals[0] {
-                Value::Bool(_) => Some(Value::BoolArray(vals.into_iter().filter_map(|v| if let Value::Bool(b)=v {Some(b)} else {None}).collect())),
-                Value::I32(_) => Some(Value::I32Array(vals.into_iter().filter_map(|v| if let Value::I32(i)=v {Some(i)} else {None}).collect())),
-                Value::U32(_) => Some(Value::U32Array(vals.into_iter().filter_map(|v| if let Value::U32(u)=v {Some(u)} else {None}).collect())),
-                Value::I64(_) => Some(Value::I64Array(vals.into_iter().filter_map(|v| if let Value::I64(i)=v {Some(i)} else {None}).collect())),
-                Value::U64(_) => Some(Value::U64Array(vals.into_iter().filter_map(|v| if let Value::U64(u)=v {Some(u)} else {None}).collect())),
-                Value::F32(_) => Some(Value::F32Array(vals.into_iter().filter_map(|v| if let Value::F32(f)=v {Some(f)} else {None}).collect())),
-                Value::F64(_) => Some(Value::F64Array(vals.into_iter().filter_map(|v| if let Value::F64(f)=v {Some(f)} else {None}).collect())),
-                Value::String(_) => Some(Value::StringArray(vals.into_iter().filter_map(|v| if let Value::String(s)=v {Some(s)} else {None}).collect())),
-                Value::DateTime(_) => Some(Value::DateTimeArray(vals.into_iter().filter_map(|v| if let Value::DateTime(t)=v {Some(t)} else {None}).collect())),
+                Value::Bool(_) => Some(Value::BoolArray(
+                    vals.into_iter()
+                        .filter_map(|v| {
+                            if let Value::Bool(b) = v {
+                                Some(b)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )),
+                Value::I32(_) => Some(Value::I32Array(
+                    vals.into_iter()
+                        .filter_map(|v| if let Value::I32(i) = v { Some(i) } else { None })
+                        .collect(),
+                )),
+                Value::U32(_) => Some(Value::U32Array(
+                    vals.into_iter()
+                        .filter_map(|v| if let Value::U32(u) = v { Some(u) } else { None })
+                        .collect(),
+                )),
+                Value::I64(_) => Some(Value::I64Array(
+                    vals.into_iter()
+                        .filter_map(|v| if let Value::I64(i) = v { Some(i) } else { None })
+                        .collect(),
+                )),
+                Value::U64(_) => Some(Value::U64Array(
+                    vals.into_iter()
+                        .filter_map(|v| if let Value::U64(u) = v { Some(u) } else { None })
+                        .collect(),
+                )),
+                Value::F32(_) => Some(Value::F32Array(
+                    vals.into_iter()
+                        .filter_map(|v| if let Value::F32(f) = v { Some(f) } else { None })
+                        .collect(),
+                )),
+                Value::F64(_) => Some(Value::F64Array(
+                    vals.into_iter()
+                        .filter_map(|v| if let Value::F64(f) = v { Some(f) } else { None })
+                        .collect(),
+                )),
+                Value::String(_) => Some(Value::StringArray(
+                    vals.into_iter()
+                        .filter_map(|v| {
+                            if let Value::String(s) = v {
+                                Some(s)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )),
+                Value::DateTime(_) => Some(Value::DateTimeArray(
+                    vals.into_iter()
+                        .filter_map(|v| {
+                            if let Value::DateTime(t) = v {
+                                Some(t)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )),
                 _ => Some(Value::String(format!("{:?}", arr))),
             }
         }
@@ -341,9 +428,13 @@ pub(crate) fn variant_to_value(v: &Variant) -> Option<Value> {
 }
 pub(crate) fn status_to_quality(sc: opcua_types::StatusCode) -> mesa_core_types::Quality {
     use mesa_core_types::Quality;
-    if sc.is_good() { Quality::Good }
-    else if sc.is_uncertain() { Quality::Uncertain }
-    else { Quality::Bad }
+    if sc.is_good() {
+        Quality::Good
+    } else if sc.is_uncertain() {
+        Quality::Uncertain
+    } else {
+        Quality::Bad
+    }
 }
 
 struct NativeInner {
@@ -359,13 +450,29 @@ pub struct NativeOpcUaApi {
     security_mode: std::sync::Mutex<String>,
 }
 
+impl Default for NativeOpcUaApi {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NativeOpcUaApi {
     pub fn new() -> Self {
-        Self { inner: Arc::new(AsyncMutex::new(None)), pki_dir: Self::default_pki_dir(), security_policy: std::sync::Mutex::new("None".into()), security_mode: std::sync::Mutex::new("None".into()) }
+        Self {
+            inner: Arc::new(AsyncMutex::new(None)),
+            pki_dir: Self::default_pki_dir(),
+            security_policy: std::sync::Mutex::new("None".into()),
+            security_mode: std::sync::Mutex::new("None".into()),
+        }
     }
 
     pub fn new_with_pki_dir(p: impl Into<std::path::PathBuf>) -> Self {
-        Self { inner: Arc::new(AsyncMutex::new(None)), pki_dir: p.into(), security_policy: std::sync::Mutex::new("None".into()), security_mode: std::sync::Mutex::new("None".into()) }
+        Self {
+            inner: Arc::new(AsyncMutex::new(None)),
+            pki_dir: p.into(),
+            security_policy: std::sync::Mutex::new("None".into()),
+            security_mode: std::sync::Mutex::new("None".into()),
+        }
     }
     pub fn set_security(&self, policy: String, mode: String) {
         *self.security_policy.lock().unwrap() = policy;
@@ -391,21 +498,28 @@ impl NativeOpcUaApi {
         self.pki_dir.clone()
     }
 
-    async fn ensure_connected(&self, endpoint_url: &str, timeout_ms: u64) -> Result<Arc<Session>, String> {
+    async fn ensure_connected(
+        &self,
+        endpoint_url: &str,
+        timeout_ms: u64,
+    ) -> Result<Arc<Session>, String> {
         {
             let guard = self.inner.lock().await;
-            if let Some(inner) = guard.as_ref() {
-                if inner.endpoint_url == endpoint_url {
-                    if let Some(sess) = &inner.session {
-                        return Ok(sess.clone());
-                    }
-                }
+            if let Some(inner) = guard.as_ref()
+                && inner.endpoint_url == endpoint_url
+                && let Some(sess) = &inner.session
+            {
+                return Ok(sess.clone());
             }
         }
         self.connect_inner(endpoint_url, timeout_ms).await
     }
 
-    async fn connect_inner(&self, endpoint_url: &str, timeout_ms: u64) -> Result<Arc<Session>, String> {
+    async fn connect_inner(
+        &self,
+        endpoint_url: &str,
+        timeout_ms: u64,
+    ) -> Result<Arc<Session>, String> {
         let timeout = Duration::from_millis(timeout_ms);
         // pki_dir：优先环境变量 MESA_OPCUA_PKI_DIR（与 Core CertStore 同值），否则 data/certificates/opcua；显式 pki_dir 由上层通过 NativeOpcUaApi::new_with_pki_dir 注入
         let pki_dir = self.resolve_pki_dir();
@@ -464,7 +578,9 @@ impl NativeOpcUaApi {
 #[async_trait]
 impl OpcUaApi for NativeOpcUaApi {
     async fn connect(&self, endpoint_url: &str, timeout_ms: u64) -> Result<(), String> {
-        self.ensure_connected(endpoint_url, timeout_ms).await.map(|_| ())
+        self.ensure_connected(endpoint_url, timeout_ms)
+            .await
+            .map(|_| ())
     }
 
     async fn read_batch(&self, addrs: &[OpcUaAddress]) -> Result<Vec<Value>, String> {
@@ -487,11 +603,11 @@ impl OpcUaApi for NativeOpcUaApi {
 
         let mut out = Vec::with_capacity(data_values.len());
         for dv in data_values {
-            if let Some(status) = dv.status {
-                if status != StatusCode::Good {
-                    out.push(Value::String(format!("ERR:{:?}", status)));
-                    continue;
-                }
+            if let Some(status) = dv.status
+                && status != StatusCode::Good
+            {
+                out.push(Value::String(format!("ERR:{:?}", status)));
+                continue;
             }
             if let Some(variant) = dv.value {
                 if let Some(val) = variant_to_value(&variant) {
@@ -515,7 +631,10 @@ impl OpcUaApi for NativeOpcUaApi {
         discard_oldest: bool,
     ) -> Result<(u32, tokio::sync::mpsc::Receiver<DataChangeEvent>), String> {
         use opcua_client::DataChangeCallback;
-        use opcua_types::{MonitoredItemCreateRequest, MonitoringParameters, MonitoringMode, ReadValueId, TimestampsToReturn};
+        use opcua_types::{
+            MonitoredItemCreateRequest, MonitoringMode, MonitoringParameters, ReadValueId,
+            TimestampsToReturn,
+        };
         let session = {
             let guard = self.inner.lock().await;
             guard
@@ -526,11 +645,15 @@ impl OpcUaApi for NativeOpcUaApi {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         // DataChangeCallback 在服务端推送时触发，try_send 到有界通道，背压由 DataSink Latest-Wins 承接
         let tx_cb = tx.clone();
-        let callback = DataChangeCallback::new(move |dv: DataValue, item: &opcua_client::MonitoredItem| {
-            let h = item.client_handle();
-            let ev = DataChangeEvent { client_handle: h, data_value: dv };
-            let _ = tx_cb.try_send(ev);
-        });
+        let callback =
+            DataChangeCallback::new(move |dv: DataValue, item: &opcua_client::MonitoredItem| {
+                let h = item.client_handle();
+                let ev = DataChangeEvent {
+                    client_handle: h,
+                    data_value: dv,
+                };
+                let _ = tx_cb.try_send(ev);
+            });
         let pub_interval = Duration::from_millis(publishing_interval_ms.max(10));
         // lifetime 约 3*keep_alive，keep_alive 10 次发布
         let sub_id = session
@@ -575,7 +698,10 @@ impl OpcUaApi for NativeOpcUaApi {
     async fn browse(&self, node: &OpcUaAddress) -> Result<Vec<String>, String> {
         let session = {
             let guard = self.inner.lock().await;
-            guard.as_ref().and_then(|i| i.session.clone()).ok_or_else(|| "尚未连接".to_string())?
+            guard
+                .as_ref()
+                .and_then(|i| i.session.clone())
+                .ok_or_else(|| "尚未连接".to_string())?
         };
         let nid = to_opc_node_id(node)?;
         use opcua_types::{BrowseDescription, BrowseDirection};
@@ -587,7 +713,10 @@ impl OpcUaApi for NativeOpcUaApi {
             node_class_mask: 0,
             result_mask: 0x3F,
         };
-        let results = session.browse(&[bd], 0, None).await.map_err(|e| format!("browse 失败: {e:?}"))?;
+        let results = session
+            .browse(&[bd], 0, None)
+            .await
+            .map_err(|e| format!("browse 失败: {e:?}"))?;
         let mut out = Vec::new();
         for r in results {
             if let Some(refs) = r.references {
@@ -598,7 +727,9 @@ impl OpcUaApi for NativeOpcUaApi {
                 }
             }
         }
-        if out.is_empty() { out.push("empty".into()); }
+        if out.is_empty() {
+            out.push("empty".into());
+        }
         Ok(out)
     }
 
@@ -620,7 +751,10 @@ mod tests {
         api.connect("opc.tcp://127.0.0.1:4840", 3000).await.unwrap();
         let err = api.connect("", 3000).await.unwrap_err();
         assert!(err.contains("不能为空"));
-        let err2 = api.connect("http://127.0.0.1:4840", 3000).await.unwrap_err();
+        let err2 = api
+            .connect("http://127.0.0.1:4840", 3000)
+            .await
+            .unwrap_err();
         assert!(err2.contains("opc.tcp"));
     }
 

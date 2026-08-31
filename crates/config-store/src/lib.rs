@@ -10,10 +10,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
+#[allow(unused_imports)]
 use mesa_core_types::{
-    ensure_unique_point_keys, AcquisitionTask, DataType, PointDefinition, PointDescriptor,
+    AcquisitionTask, DataType, PointDefinition, PointDescriptor, ensure_unique_point_keys,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// 当前 schema 版本。增量迁移时递增并在 `meta` 中持久化。
 const SCHEMA_VERSION: i64 = 1;
@@ -76,15 +77,17 @@ impl ConfigStore {
     /// 打开（不存在则创建）并执行迁移。
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         // 父目录不存在时显式创建，避免 rusqlite 报错信息不直观
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    StoreError::Sqlite(rusqlite::Error::InvalidParameterName(e.to_string()))
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                StoreError::Sqlite(rusqlite::Error::InvalidParameterName(e.to_string()))
+            })?;
         }
         let conn = Connection::open(path)?;
-        let s = Self { conn: Mutex::new(conn) };
+        let s = Self {
+            conn: Mutex::new(conn),
+        };
         s.migrate()?;
         Ok(s)
     }
@@ -92,7 +95,9 @@ impl ConfigStore {
     /// 内存库（单测/临时使用）。
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
-        let s = Self { conn: Mutex::new(conn) };
+        let s = Self {
+            conn: Mutex::new(conn),
+        };
         s.migrate()?;
         Ok(s)
     }
@@ -149,7 +154,11 @@ impl ConfigStore {
         )?;
         // 版本标记
         let cur: Option<String> = conn
-            .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
             .optional()?;
         if cur.is_none() {
             conn.execute(
@@ -180,7 +189,9 @@ impl ConfigStore {
         );
         match n {
             Ok(_) => Ok(()),
-            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
                 Err(StoreError::Duplicate(format!("device `{}` 已存在", rec.id)))
             }
             Err(e) => Err(e.into()),
@@ -191,16 +202,28 @@ impl ConfigStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id,name,profile FROM devices ORDER BY id")?;
         let rows = stmt.query_map([], |r| {
-            Ok(DeviceRecord { id: r.get(0)?, name: r.get(1)?, profile: r.get(2)? })
+            Ok(DeviceRecord {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                profile: r.get(2)?,
+            })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn get_device(&self, id: &str) -> Result<Option<DeviceRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT id,name,profile FROM devices WHERE id=?1", params![id], |r| {
-            Ok(DeviceRecord { id: r.get(0)?, name: r.get(1)?, profile: r.get(2)? })
-        })
+        conn.query_row(
+            "SELECT id,name,profile FROM devices WHERE id=?1",
+            params![id],
+            |r| {
+                Ok(DeviceRecord {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    profile: r.get(2)?,
+                })
+            },
+        )
         .optional()
         .map_err(Into::into)
     }
@@ -248,12 +271,16 @@ impl ConfigStore {
         }
         let conn = self.conn.lock().unwrap();
         // 确认 device 存在
-        let dev_exists: bool = conn
-            .query_row("SELECT EXISTS(SELECT 1 FROM devices WHERE id=?1)", params![rec.device_id], |r| {
-                r.get(0)
-            })?;
+        let dev_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM devices WHERE id=?1)",
+            params![rec.device_id],
+            |r| r.get(0),
+        )?;
         if !dev_exists {
-            return Err(StoreError::NotFound(format!("device `{}` 不存在", rec.device_id)));
+            return Err(StoreError::NotFound(format!(
+                "device `{}` 不存在",
+                rec.device_id
+            )));
         }
         let n = conn.execute(
             "INSERT INTO endpoints(id,device_id,driver_id,connection_json,desired_running,updated_at_ns)
@@ -268,8 +295,13 @@ impl ConfigStore {
                 )?;
                 Ok(())
             }
-            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
-                Err(StoreError::Duplicate(format!("endpoint `{}` 已存在", rec.id)))
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Err(StoreError::Duplicate(format!(
+                    "endpoint `{}` 已存在",
+                    rec.id
+                )))
             }
             Err(e) => Err(e.into()),
         }
@@ -333,7 +365,11 @@ impl ConfigStore {
         Ok(n > 0)
     }
 
-    pub fn set_desired_running(&self, endpoint_id: &str, running: bool) -> Result<bool, StoreError> {
+    pub fn set_desired_running(
+        &self,
+        endpoint_id: &str,
+        running: bool,
+    ) -> Result<bool, StoreError> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "UPDATE endpoints SET desired_running=?1, updated_at_ns=?2 WHERE id=?3",
@@ -353,35 +389,44 @@ impl ConfigStore {
     ) -> Result<u64, StoreError> {
         // 结构级校验
         for t in tasks {
-            t.validate().map_err(|e| StoreError::Validation(e.to_string()))?;
+            t.validate()
+                .map_err(|e| StoreError::Validation(e.to_string()))?;
         }
         // 同 endpoint 内 task id 唯一
         {
             let mut seen = HashSet::new();
             for t in tasks {
                 if !seen.insert(&t.id) {
-                    return Err(StoreError::Validation(format!("duplicate task id `{}`", t.id)));
+                    return Err(StoreError::Validation(format!(
+                        "duplicate task id `{}`",
+                        t.id
+                    )));
                 }
             }
         }
 
         let mut conn = self.conn.lock().unwrap();
         // 确认 endpoint 存在
-        let exists: bool = conn
-            .query_row("SELECT EXISTS(SELECT 1 FROM endpoints WHERE id=?1)", params![endpoint_id], |r| {
-                r.get(0)
-            })?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM endpoints WHERE id=?1)",
+            params![endpoint_id],
+            |r| r.get(0),
+        )?;
         if !exists {
-            return Err(StoreError::NotFound(format!("endpoint `{endpoint_id}` 不存在")));
+            return Err(StoreError::NotFound(format!(
+                "endpoint `{endpoint_id}` 不存在"
+            )));
         }
 
         let tx = conn.transaction()?;
         Self::replace_tasks_in_tx(&tx, endpoint_id, tasks)?;
         // bump revision
         let cur: i64 = tx
-            .query_row("SELECT revision FROM config_revision WHERE endpoint_id=?1", params![endpoint_id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT revision FROM config_revision WHERE endpoint_id=?1",
+                params![endpoint_id],
+                |r| r.get(0),
+            )
             .optional()?
             .unwrap_or(0);
         let next = (cur + 1) as u64;
@@ -398,8 +443,15 @@ impl ConfigStore {
         Ok(next)
     }
 
-    fn replace_tasks_in_tx(tx: &Transaction<'_>, endpoint_id: &str, tasks: &[AcquisitionTask]) -> Result<(), StoreError> {
-        tx.execute("DELETE FROM tasks WHERE endpoint_id=?1", params![endpoint_id])?;
+    fn replace_tasks_in_tx(
+        tx: &Transaction<'_>,
+        endpoint_id: &str,
+        tasks: &[AcquisitionTask],
+    ) -> Result<(), StoreError> {
+        tx.execute(
+            "DELETE FROM tasks WHERE endpoint_id=?1",
+            params![endpoint_id],
+        )?;
         for t in tasks {
             tx.execute(
                 "INSERT INTO tasks(endpoint_id,id,mode,interval_ms,binding_kind,binding_config_json)
@@ -430,7 +482,8 @@ impl ConfigStore {
                 _ => mesa_core_types::TaskMode::Poll,
             };
             let binding_config_json: String = r.get(4)?;
-            let cfg: serde_json::Value = serde_json::from_str(&binding_config_json).unwrap_or(serde_json::json!({}));
+            let cfg: serde_json::Value =
+                serde_json::from_str(&binding_config_json).unwrap_or(serde_json::json!({}));
             Ok(AcquisitionTask {
                 id: r.get(0)?,
                 mode,
@@ -447,9 +500,11 @@ impl ConfigStore {
     pub fn current_revision(&self, endpoint_id: &str) -> Result<u64, StoreError> {
         let conn = self.conn.lock().unwrap();
         let v: Option<i64> = conn
-            .query_row("SELECT revision FROM config_revision WHERE endpoint_id=?1", params![endpoint_id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT revision FROM config_revision WHERE endpoint_id=?1",
+                params![endpoint_id],
+                |r| r.get(0),
+            )
             .optional()?;
         Ok(v.unwrap_or(0) as u64)
     }
@@ -464,16 +519,18 @@ impl ConfigStore {
         endpoint_id: &str,
         descriptors: &[PointDescriptor],
     ) -> Result<Vec<PointDefinition>, StoreError> {
-        ensure_unique_point_keys(descriptors)
-            .map_err(|e| StoreError::Validation(e.to_string()))?;
+        ensure_unique_point_keys(descriptors).map_err(|e| StoreError::Validation(e.to_string()))?;
 
         let mut conn = self.conn.lock().unwrap();
-        let exists: bool = conn
-            .query_row("SELECT EXISTS(SELECT 1 FROM endpoints WHERE id=?1)", params![endpoint_id], |r| {
-                r.get(0)
-            })?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM endpoints WHERE id=?1)",
+            params![endpoint_id],
+            |r| r.get(0),
+        )?;
         if !exists {
-            return Err(StoreError::NotFound(format!("endpoint `{endpoint_id}` 不存在")));
+            return Err(StoreError::NotFound(format!(
+                "endpoint `{endpoint_id}` 不存在"
+            )));
         }
 
         let tx = conn.transaction()?;
@@ -485,7 +542,11 @@ impl ConfigStore {
                 "SELECT point_key, point_id, deleted FROM point_registry WHERE endpoint_id=?1",
             )?;
             let rows = stmt.query_map(params![endpoint_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32, r.get::<_, i32>(2)? != 0))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u32,
+                    r.get::<_, i32>(2)? != 0,
+                ))
             })?;
             for r in rows {
                 let (k, id, del) = r?;
@@ -496,7 +557,8 @@ impl ConfigStore {
         let mut next_id = max_id + 1;
 
         // 标记本轮出现的 key，用于后续 tombstone 处理（删除的 key 保持墓碑，不复用 id）
-        let incoming_keys: HashSet<&str> = descriptors.iter().map(|d| d.point_key.as_str()).collect();
+        let incoming_keys: HashSet<&str> =
+            descriptors.iter().map(|d| d.point_key.as_str()).collect();
 
         let mut out = Vec::with_capacity(descriptors.len());
         for d in descriptors {
@@ -514,7 +576,13 @@ impl ConfigStore {
                  ON CONFLICT(endpoint_id,point_key) DO UPDATE SET
                     point_id=excluded.point_id, data_type=excluded.data_type,
                     unit=excluded.unit, deleted=0",
-                params![endpoint_id, d.point_key, pid as i64, d.data_type.as_str(), d.unit],
+                params![
+                    endpoint_id,
+                    d.point_key,
+                    pid as i64,
+                    d.data_type.as_str(),
+                    d.unit
+                ],
             )?;
             out.push(PointDefinition {
                 point_id: pid,
@@ -552,7 +620,9 @@ impl ConfigStore {
         let mut stmt = conn.prepare(
             "SELECT point_key, point_id FROM point_registry WHERE endpoint_id=?1 AND deleted=0",
         )?;
-        let rows = stmt.query_map(params![endpoint_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32)))?;
+        let rows = stmt.query_map(params![endpoint_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
+        })?;
         let mut m = HashMap::new();
         for r in rows {
             let (k, id) = r?;
@@ -562,13 +632,21 @@ impl ConfigStore {
     }
 
     /// 全部（含墓碑），供诊断。
-    pub fn point_registry_all(&self, endpoint_id: &str) -> Result<Vec<(String, u32, String, bool)>, StoreError> {
+    pub fn point_registry_all(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<Vec<(String, u32, String, bool)>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT point_key, point_id, data_type, deleted FROM point_registry WHERE endpoint_id=?1 ORDER BY point_id",
         )?;
         let rows = stmt.query_map(params![endpoint_id], |r| {
-            Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get::<_, String>(2)?, r.get::<_, i32>(3)? != 0))
+            Ok((
+                r.get(0)?,
+                r.get::<_, i64>(1)? as u32,
+                r.get::<_, String>(2)?,
+                r.get::<_, i32>(3)? != 0,
+            ))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -608,7 +686,11 @@ mod tests {
     }
 
     fn dev(id: &str) -> DeviceRecord {
-        DeviceRecord { id: id.into(), name: format!("{id}-name"), profile: None }
+        DeviceRecord {
+            id: id.into(),
+            name: format!("{id}-name"),
+            profile: None,
+        }
     }
 
     fn ep(id: &str, device: &str) -> EndpointRecord {
@@ -627,12 +709,19 @@ mod tests {
             id: id.into(),
             mode: TaskMode::Poll,
             interval_ms: Some(interval),
-            binding: DriverBinding { kind: "simulator.points".into(), config: serde_json::json!({}) },
+            binding: DriverBinding {
+                kind: "simulator.points".into(),
+                config: serde_json::json!({}),
+            },
         }
     }
 
     fn desc(key: &str, ty: DataType) -> PointDescriptor {
-        PointDescriptor { point_key: key.into(), data_type: ty, unit: None }
+        PointDescriptor {
+            point_key: key.into(),
+            data_type: ty,
+            unit: None,
+        }
     }
 
     #[test]
@@ -640,7 +729,10 @@ mod tests {
         let s = mem();
         assert!(s.get_device("d1").unwrap().is_none());
         s.create_device(&dev("d1")).unwrap();
-        assert!(matches!(s.create_device(&dev("d1")), Err(StoreError::Duplicate(_))));
+        assert!(matches!(
+            s.create_device(&dev("d1")),
+            Err(StoreError::Duplicate(_))
+        ));
         let list = s.list_devices().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "d1");
@@ -659,7 +751,10 @@ mod tests {
         let s = mem();
         s.create_device(&dev("plc001")).unwrap();
         s.create_endpoint(&ep("ep1", "plc001")).unwrap();
-        assert!(matches!(s.delete_device("plc001"), Err(StoreError::Conflict(_))));
+        assert!(matches!(
+            s.delete_device("plc001"),
+            Err(StoreError::Conflict(_))
+        ));
         s.delete_endpoint("ep1").unwrap();
         assert!(s.delete_device("plc001").unwrap());
     }
@@ -669,7 +764,10 @@ mod tests {
         let s = mem();
         s.create_device(&dev("d1")).unwrap();
         s.create_endpoint(&ep("e1", "d1")).unwrap();
-        assert!(matches!(s.create_endpoint(&ep("e1", "d1")), Err(StoreError::Duplicate(_))));
+        assert!(matches!(
+            s.create_endpoint(&ep("e1", "d1")),
+            Err(StoreError::Duplicate(_))
+        ));
         // 非法 connection
         let mut bad = ep("e2", "d1");
         bad.connection_json = "not json".into();
@@ -692,7 +790,9 @@ mod tests {
         assert_eq!(s.current_revision("e1").unwrap(), 1);
         assert_eq!(s.list_tasks("e1").unwrap().len(), 1);
         // 全量替换：旧任务消失
-        let r2 = s.replace_tasks("e1", &[task("t2", 200), task("t3", 300)]).unwrap();
+        let r2 = s
+            .replace_tasks("e1", &[task("t2", 200), task("t3", 300)])
+            .unwrap();
         assert_eq!(r2, 2);
         let tasks = s.list_tasks("e1").unwrap();
         assert_eq!(tasks.len(), 2);
@@ -713,9 +813,15 @@ mod tests {
             id: "t1".into(),
             mode: TaskMode::Poll,
             interval_ms: None,
-            binding: DriverBinding { kind: "k".into(), config: serde_json::json!({}) },
+            binding: DriverBinding {
+                kind: "k".into(),
+                config: serde_json::json!({}),
+            },
         };
-        assert!(matches!(s.replace_tasks("e1", &[bad]), Err(StoreError::Validation(_))));
+        assert!(matches!(
+            s.replace_tasks("e1", &[bad]),
+            Err(StoreError::Validation(_))
+        ));
         // 事务回滚：失败后 revision 不变
         assert_eq!(s.current_revision("e1").unwrap(), 0);
         // 重复 id
@@ -731,27 +837,54 @@ mod tests {
         s.create_device(&dev("d1")).unwrap();
         s.create_endpoint(&ep("e1", "d1")).unwrap();
         // 首轮分配
-        let defs1 = s.assign_point_ids("e1", &[desc("a", DataType::F64), desc("b", DataType::Bool)]).unwrap();
+        let defs1 = s
+            .assign_point_ids("e1", &[desc("a", DataType::F64), desc("b", DataType::Bool)])
+            .unwrap();
         let id_a1 = defs1.iter().find(|d| d.point_key == "a").unwrap().point_id;
         let id_b1 = defs1.iter().find(|d| d.point_key == "b").unwrap().point_id;
         assert_ne!(id_a1, id_b1);
         // 增量加入 c，a/b 复用
         let defs2 = s
-            .assign_point_ids("e1", &[desc("a", DataType::F64), desc("b", DataType::Bool), desc("c", DataType::I32)])
+            .assign_point_ids(
+                "e1",
+                &[
+                    desc("a", DataType::F64),
+                    desc("b", DataType::Bool),
+                    desc("c", DataType::I32),
+                ],
+            )
             .unwrap();
-        assert_eq!(defs2.iter().find(|d| d.point_key == "a").unwrap().point_id, id_a1);
-        assert_eq!(defs2.iter().find(|d| d.point_key == "b").unwrap().point_id, id_b1);
+        assert_eq!(
+            defs2.iter().find(|d| d.point_key == "a").unwrap().point_id,
+            id_a1
+        );
+        assert_eq!(
+            defs2.iter().find(|d| d.point_key == "b").unwrap().point_id,
+            id_b1
+        );
         let id_c = defs2.iter().find(|d| d.point_key == "c").unwrap().point_id;
         // 删除 b（墓碑），再缩容到仅 a+c
-        s.assign_point_ids("e1", &[desc("a", DataType::F64), desc("c", DataType::I32)]).unwrap();
+        s.assign_point_ids("e1", &[desc("a", DataType::F64), desc("c", DataType::I32)])
+            .unwrap();
         let all = s.point_registry_all("e1").unwrap();
         let b_entry = all.iter().find(|(k, _, _, _)| k == "b").unwrap();
         assert!(b_entry.3, "b 应为墓碑");
         // 重新加入 b，必须复用原 id，且不复用已删 id 给新 key
         let defs3 = s
-            .assign_point_ids("e1", &[desc("a", DataType::F64), desc("b", DataType::Bool), desc("c", DataType::I32), desc("d", DataType::String)])
+            .assign_point_ids(
+                "e1",
+                &[
+                    desc("a", DataType::F64),
+                    desc("b", DataType::Bool),
+                    desc("c", DataType::I32),
+                    desc("d", DataType::String),
+                ],
+            )
             .unwrap();
-        assert_eq!(defs3.iter().find(|d| d.point_key == "b").unwrap().point_id, id_b1);
+        assert_eq!(
+            defs3.iter().find(|d| d.point_key == "b").unwrap().point_id,
+            id_b1
+        );
         let id_d = defs3.iter().find(|d| d.point_key == "d").unwrap().point_id;
         assert!(id_d > id_c && id_d != id_b1, "新 key 不得复用墓碑 id");
         // 活跃映射：本轮 a,b,c,d 均已恢复/存在
@@ -764,7 +897,9 @@ mod tests {
         let s = mem();
         s.create_device(&dev("d1")).unwrap();
         s.create_endpoint(&ep("e1", "d1")).unwrap();
-        let err = s.assign_point_ids("e1", &[desc("a", DataType::F64), desc("a", DataType::Bool)]).unwrap_err();
+        let err = s
+            .assign_point_ids("e1", &[desc("a", DataType::F64), desc("a", DataType::Bool)])
+            .unwrap_err();
         assert!(matches!(err, StoreError::Validation(_)));
     }
 
@@ -774,8 +909,12 @@ mod tests {
         s.create_device(&dev("d1")).unwrap();
         s.create_endpoint(&ep("e1", "d1")).unwrap();
         s.create_endpoint(&ep("e2", "d1")).unwrap();
-        let d1 = s.assign_point_ids("e1", &[desc("x", DataType::F64)]).unwrap();
-        let d2 = s.assign_point_ids("e2", &[desc("x", DataType::F64)]).unwrap();
+        let d1 = s
+            .assign_point_ids("e1", &[desc("x", DataType::F64)])
+            .unwrap();
+        let d2 = s
+            .assign_point_ids("e2", &[desc("x", DataType::F64)])
+            .unwrap();
         // 同 key 跨 endpoint 独立分配，均从 1 起
         assert_eq!(d1[0].point_id, 1);
         assert_eq!(d2[0].point_id, 1);

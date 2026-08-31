@@ -72,8 +72,10 @@ impl DriverProcess {
         let job = job::attach_current_child(pid, None)?;
 
         // 写半部必须在结构体中持续持有：一旦关闭，Driver 侧 EOF 防护会立刻退出
-        let mut stdin =
-            child.stdin.take().ok_or(SpawnError::Io(std::io::Error::new(
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or(SpawnError::Io(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "child stdin not piped",
             )))?;
@@ -83,7 +85,14 @@ impl DriverProcess {
 
         // NOTE: 不做 TCP 探活——SDK 只 accept 一条管理连接，任何探测性连接
         // 都会抢占该名额导致握手永远失败。端口未就绪由 Session::connect_retry 处理。
-        Ok(Self { port, pid, token, child, stdin: Some(stdin), _job: job })
+        Ok(Self {
+            port,
+            pid,
+            token,
+            child,
+            stdin: Some(stdin),
+            _job: job,
+        })
     }
 
     /// 兜底强杀（正常路径应先经 Session 发送 Shutdown 消息）。
@@ -157,7 +166,10 @@ mod job {
         raw_handle: Option<std::os::windows::io::RawHandle>,
     ) -> Result<JobAttachment, super::SpawnError> {
         use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
-        let job = CORE_JOB.get_or_init(create_core_job).as_ref().map_err(|&code| super::SpawnError::Job(code))?;
+        let job = CORE_JOB
+            .get_or_init(create_core_job)
+            .as_ref()
+            .map_err(|&code| super::SpawnError::Job(code))?;
         if let Some(h) = raw_handle {
             // RawHandle 与 HANDLE 同为 *mut c_void
             let proc_handle: HANDLE = h;
@@ -207,8 +219,9 @@ mod job {
     fn create_core_job() -> Result<JobHandle, u32> {
         use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
         use windows_sys::Win32::System::JobObjects::{
-            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
         };
         unsafe {
             let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());

@@ -3,9 +3,9 @@
 //! - Core `DataType` 是对外契约；S7 侧 `S7Kind` 决定线缆字节长度与解码方式。
 //! - 字符串 `"REAL"/"REAL[]"` 等大小写不敏感；同时兼容 Core 已有的 `f32`/`f64` 写法。
 
+use mesa_core_types::ErrorKind;
 use mesa_core_types::{DataType, Value};
 use mesa_driver_sdk::SdkDriverError;
-use mesa_core_types::ErrorKind;
 
 /// S7 侧的细分类型（决定字节长度与字节序）。
 ///
@@ -55,7 +55,12 @@ impl S7Kind {
     pub fn core_type(self) -> DataType {
         match self {
             S7Kind::Bool => DataType::Bool,
-            S7Kind::Byte | S7Kind::Word | S7Kind::Dword | S7Kind::S5Time | S7Kind::Time | S7Kind::Date => DataType::U32,
+            S7Kind::Byte
+            | S7Kind::Word
+            | S7Kind::Dword
+            | S7Kind::S5Time
+            | S7Kind::Time
+            | S7Kind::Date => DataType::U32,
             S7Kind::Int | S7Kind::Dint => DataType::I32,
             S7Kind::Real => DataType::F32,
             S7Kind::Lreal | S7Kind::Dt => DataType::F64,
@@ -117,7 +122,9 @@ pub fn parse_data_type(s: &str) -> Result<(DataType, S7Kind), SdkDriverError> {
             }
             return Err(SdkDriverError::configuration(
                 "UNSUPPORTED_DATA_TYPE",
-                format!("不支持的 data_type `{s}`，期望 BOOL/BYTE/WORD/DWORD/INT/DINT/REAL/LREAL/STRING/WSTRING/S5TIME/TIME/DATE/DT"),
+                format!(
+                    "不支持的 data_type `{s}`，期望 BOOL/BYTE/WORD/DWORD/INT/DINT/REAL/LREAL/STRING/WSTRING/S5TIME/TIME/DATE/DT"
+                ),
             ));
         }
     };
@@ -132,7 +139,12 @@ pub fn decode_value(raw: &[u8], kind: S7Kind) -> Result<Value, SdkDriverError> {
         return Err(SdkDriverError::new(
             ErrorKind::Decode,
             "SHORT_DATA",
-            format!("kind {:?} 需要 {} 字节，实际 {}", kind, kind.byte_len(), raw.len()),
+            format!(
+                "kind {:?} 需要 {} 字节，实际 {}",
+                kind,
+                kind.byte_len(),
+                raw.len()
+            ),
         ));
     }
     let v = match kind {
@@ -183,19 +195,27 @@ pub fn decode_value(raw: &[u8], kind: S7Kind) -> Result<Value, SdkDriverError> {
                 return Ok(Value::String(String::new()));
             }
             let cur = u16::from_be_bytes([raw[2], raw[3]]) as usize;
-            let chars = raw[4..].chunks_exact(2).take(cur).map(|c| u16::from_be_bytes([c[0], c[1]])).collect::<Vec<u16>>();
+            let chars = raw[4..]
+                .chunks_exact(2)
+                .take(cur)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect::<Vec<u16>>();
             Value::String(String::from_utf16_lossy(&chars))
         }
         S7Kind::S5Time => {
             // S5TIME 2 字节 BCD：映射为毫秒数便于时序分析（只读）
-            if raw.len() < 2 { return Ok(Value::U32(0)); }
+            if raw.len() < 2 {
+                return Ok(Value::U32(0));
+            }
             Value::U32(u16::from_be_bytes([raw[0], raw[1]]) as u32)
         }
         S7Kind::Time => Value::U32(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])),
         S7Kind::Date => Value::U32(u16::from_be_bytes([raw[0], raw[1]]) as u32),
         S7Kind::Dt => {
             // DATE_AND_TIME 8 字节 BCD，直接以 F64 数值暴露（只读诊断用）
-            Value::F64(f64::from_be_bytes([raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]]))
+            Value::F64(f64::from_be_bytes([
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+            ]))
         }
     };
     Ok(v)
@@ -228,7 +248,10 @@ mod tests {
         assert_eq!(dec(S7Kind::Int, &[0xFF, 0xFF]), Value::I32(-1));
         assert_eq!(dec(S7Kind::Word, &[0x00, 0x7B]), Value::U32(123));
         assert_eq!(dec(S7Kind::Dint, &[0xFF, 0xFF, 0xFF, 0xFE]), Value::I32(-2));
-        assert_eq!(dec(S7Kind::Real, &[0x3F, 0x80, 0x00, 0x00]), Value::F32(1.0));
+        assert_eq!(
+            dec(S7Kind::Real, &[0x3F, 0x80, 0x00, 0x00]),
+            Value::F32(1.0)
+        );
         assert_eq!(dec(S7Kind::Byte, &[0xBF]), Value::U32(0xBF));
     }
 
@@ -236,6 +259,9 @@ mod tests {
     fn decode_string() {
         // max 20, cur 5, "Hello"
         let raw = [20, 5, b'H', b'e', b'l', b'l', b'o', 0, 0];
-        assert_eq!(dec(S7Kind::String, &raw), Value::String("Hello".to_string()));
+        assert_eq!(
+            dec(S7Kind::String, &raw),
+            Value::String("Hello".to_string())
+        );
     }
 }

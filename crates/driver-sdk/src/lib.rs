@@ -17,11 +17,11 @@ use mesa_core_types::{
     ConnectionState, DataBatch, DriverMetadata, ErrorKind, PointDescriptor, PointMap,
 };
 use mesa_driver_protocol::{
-    batch_to_pb, err_result, error_detail, ok_result, pb, read_envelope, tasks_from_pb,
-    write_envelope, ConvertError, ProtocolError, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    ConvertError, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolError, batch_to_pb, err_result,
+    error_detail, ok_result, pb, read_envelope, tasks_from_pb, write_envelope,
 };
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpListener;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -49,7 +49,11 @@ pub struct SdkDriverError {
 
 impl SdkDriverError {
     pub fn new(kind: ErrorKind, code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { kind, code: code.into(), message: message.into() }
+        Self {
+            kind,
+            code: code.into(),
+            message: message.into(),
+        }
     }
 
     pub fn configuration(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -171,7 +175,10 @@ impl DataSink {
     fn new(tx: mpsc::Sender<OutboundMsg>) -> Self {
         Self {
             tx,
-            state: Arc::new(Mutex::new(CoalescerState { pending: None, coalesced_points: 0 })),
+            state: Arc::new(Mutex::new(CoalescerState {
+                pending: None,
+                coalesced_points: 0,
+            })),
             handle: 0,
             epoch: 0,
         }
@@ -183,7 +190,10 @@ impl DataSink {
     pub fn for_connection(&self, handle: u32, stream_epoch: u64) -> Self {
         Self {
             tx: self.tx.clone(),
-            state: Arc::new(Mutex::new(CoalescerState { pending: None, coalesced_points: 0 })),
+            state: Arc::new(Mutex::new(CoalescerState {
+                pending: None,
+                coalesced_points: 0,
+            })),
             handle,
             epoch: stream_epoch,
         }
@@ -245,7 +255,8 @@ impl DataSink {
             match self.tx.try_send(OutboundMsg::Data(batch)) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(OutboundMsg::Data(b))) => st.pending = Some(b),
-                Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Err(mpsc::error::TrySendError::Full(_))
+                | Err(mpsc::error::TrySendError::Closed(_)) => {}
             }
         }
     }
@@ -372,14 +383,20 @@ struct Session {
     sink: DataSink,
     /// Arc 化以便 run 任务结束时把连接对象归还回表（Stop→Start 可重复）。
     entries: Arc<Mutex<HashMap<u32, ConnEntry>>>,
+    // TODO: PlanSnapshot 冻结字段，msg_ids 为 IPC 信封递增 ID，V1 Control 面预留，当前 Data 面未单独递增但需保留以备全量序列追踪
+    #[allow(dead_code)]
     msg_ids: AtomicU64,
 }
 
 impl Session {
+    // TODO: PlanSnapshot 冻结字段，msg_ids 递增器，V1 暂由 sink 内部序列保证，保留以备 Control 面独立序列
+    #[allow(dead_code)]
     fn next_msg_id(&self) -> u64 {
         self.msg_ids.fetch_add(1, Ordering::Relaxed)
     }
 
+    // TODO: 冻结字段，结构化 DriverError 上报路径，V1 已走 DataSink 控制通道，保留以备独立错误帧演进
+    #[allow(dead_code)]
     async fn send_driver_error(&self, handle: Option<u32>, err: &SdkDriverError) {
         self.sink
             .send_control(pb::Envelope {
@@ -394,10 +411,18 @@ impl Session {
 
     /// 取消运行中的采集并等待其退出；超时则放弃等待（进程退出兜底）。
     async fn stop_run(&self, handle: u32) {
-        let rh = self.entries.lock().unwrap().get_mut(&handle).and_then(|e| e.run.take());
+        let rh = self
+            .entries
+            .lock()
+            .unwrap()
+            .get_mut(&handle)
+            .and_then(|e| e.run.take());
         if let Some(rh) = rh {
             rh.cancel.cancel();
-            if tokio::time::timeout(RUN_DRAIN_GRACE, rh.join).await.is_err() {
+            if tokio::time::timeout(RUN_DRAIN_GRACE, rh.join)
+                .await
+                .is_err()
+            {
                 tracing::warn!(handle, "run task did not drain in time");
             }
         }
@@ -440,11 +465,7 @@ pub async fn serve_with_faults<D: Driver>(
 
     // ---- 握手：先发 Hello 再等 Welcome（§14.3）。握手期 writer 尚未启动，
     // 直接使用写半部，避免与请求循环的出站路径产生交错。----
-    let instance_id = format!(
-        "{}-{}",
-        std::process::id(),
-        mesa_core_types::now_unix_ns()
-    );
+    let instance_id = format!("{}-{}", std::process::id(), mesa_core_types::now_unix_ns());
     let hello = pb::Envelope {
         msg_id: 1,
         body: Some(pb::envelope::Body::Hello(pb::Hello {
@@ -485,7 +506,10 @@ pub async fn serve_with_faults<D: Driver>(
         // Core 校验 token 失败等场景会直接断开或回错误帧
         Some(pb::envelope::Body::DriverError(err)) => {
             let d = err.detail.unwrap_or_default();
-            return Err(SdkServerError::Handshake(format!("rejected: {}/{}: {}", d.kind, d.code, d.message)));
+            return Err(SdkServerError::Handshake(format!(
+                "rejected: {}/{}: {}",
+                d.kind, d.code, d.message
+            )));
         }
         _ => return Err(SdkServerError::Handshake("expected Welcome".into())),
     }
@@ -608,13 +632,21 @@ async fn request_loop(
             Some(pb::envelope::Body::OpenConnection(req)) => {
                 on_open_connection(session, req, env.msg_id).await;
             }
-            Some(pb::envelope::Body::ConfigureTasks(req)) => on_configure(session, req, env.msg_id).await,
+            Some(pb::envelope::Body::ConfigureTasks(req)) => {
+                on_configure(session, req, env.msg_id).await
+            }
             Some(pb::envelope::Body::ApplyPointMap(req)) => {
                 on_apply_point_map(session, req, env.msg_id).await;
             }
-            Some(pb::envelope::Body::StartConnection(req)) => on_start(session, req, env.msg_id).await,
-            Some(pb::envelope::Body::StopConnection(req)) => on_stop(session, req, env.msg_id).await,
-            Some(pb::envelope::Body::CloseConnection(req)) => on_close(session, req, env.msg_id).await,
+            Some(pb::envelope::Body::StartConnection(req)) => {
+                on_start(session, req, env.msg_id).await
+            }
+            Some(pb::envelope::Body::StopConnection(req)) => {
+                on_stop(session, req, env.msg_id).await
+            }
+            Some(pb::envelope::Body::CloseConnection(req)) => {
+                on_close(session, req, env.msg_id).await
+            }
             Some(pb::envelope::Body::Shutdown(_)) => {
                 tracing::info!("shutdown requested by core");
                 return Ok(());
@@ -638,11 +670,20 @@ async fn on_open_connection(session: &Session, req: pb::OpenConnection, msg_id: 
             format!("handle {} already open", req.connection_handle),
         )
     } else {
-        match session.driver.open_connection(&req.endpoint_id, &req.config_json).await {
+        match session
+            .driver
+            .open_connection(&req.endpoint_id, &req.config_json)
+            .await
+        {
             Ok(conn) => {
                 session.entries.lock().unwrap().insert(
                     req.connection_handle,
-                    ConnEntry { conn: Some(conn), run: None, revision: 0, epoch: 0 },
+                    ConnEntry {
+                        conn: Some(conn),
+                        run: None,
+                        revision: 0,
+                        epoch: 0,
+                    },
                 );
                 ok_result()
             }
@@ -653,10 +694,12 @@ async fn on_open_connection(session: &Session, req: pb::OpenConnection, msg_id: 
         .sink
         .send_control(pb::Envelope {
             msg_id,
-            body: Some(pb::envelope::Body::OpenConnectionAck(pb::OpenConnectionAck {
-                connection_handle: req.connection_handle,
-                result: Some(result),
-            })),
+            body: Some(pb::envelope::Body::OpenConnectionAck(
+                pb::OpenConnectionAck {
+                    connection_handle: req.connection_handle,
+                    result: Some(result),
+                },
+            )),
         })
         .await;
 }
@@ -677,7 +720,11 @@ async fn on_configure(session: &Session, req: pb::ConfigureTasks, msg_id: u64) {
                 msg_id,
                 body: Some(pb::envelope::Body::DriverError(pb::DriverErrorReport {
                     connection_handle: Some(req.connection_handle),
-                    detail: Some(error_detail(ErrorKind::Internal, "NO_CONNECTION", "connection not open".to_string())),
+                    detail: Some(error_detail(
+                        ErrorKind::Internal,
+                        "NO_CONNECTION",
+                        "connection not open".to_string(),
+                    )),
                 })),
             })
             .await;
@@ -687,10 +734,15 @@ async fn on_configure(session: &Session, req: pb::ConfigureTasks, msg_id: u64) {
     match tasks_from_pb(req.tasks) {
         Ok(tasks) => match conn.configure(req.revision, tasks).await {
             Ok(descriptors) => {
-                session.entries.lock().unwrap().get_mut(&req.connection_handle).map(|e| {
+                if let Some(e) = session
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .get_mut(&req.connection_handle)
+                {
                     e.conn = Some(conn);
                     e.revision = req.revision;
-                });
+                }
                 session
                     .sink
                     .send_control(pb::Envelope {
@@ -713,9 +765,14 @@ async fn on_configure(session: &Session, req: pb::ConfigureTasks, msg_id: u64) {
                     .await;
             }
             Err(err) => {
-                session.entries.lock().unwrap().get_mut(&req.connection_handle).map(|e| {
+                if let Some(e) = session
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .get_mut(&req.connection_handle)
+                {
                     e.conn = Some(conn);
-                });
+                }
                 session
                     .sink
                     .send_control(pb::Envelope {
@@ -730,9 +787,14 @@ async fn on_configure(session: &Session, req: pb::ConfigureTasks, msg_id: u64) {
         },
         Err(e) => {
             let err: SdkDriverError = e.into();
-            session.entries.lock().unwrap().get_mut(&req.connection_handle).map(|e| {
+            if let Some(e) = session
+                .entries
+                .lock()
+                .unwrap()
+                .get_mut(&req.connection_handle)
+            {
                 e.conn = Some(conn);
-            });
+            }
             session
                 .sink
                 .send_control(pb::Envelope {
@@ -762,7 +824,11 @@ async fn on_apply_point_map(session: &Session, req: pb::ApplyPointMap, msg_id: u
                 msg_id,
                 body: Some(pb::envelope::Body::DriverError(pb::DriverErrorReport {
                     connection_handle: Some(req.connection_handle),
-                    detail: Some(error_detail(ErrorKind::Internal, "NO_CONNECTION", "connection not open".to_string())),
+                    detail: Some(error_detail(
+                        ErrorKind::Internal,
+                        "NO_CONNECTION",
+                        "connection not open".to_string(),
+                    )),
                 })),
             })
             .await;
@@ -770,9 +836,14 @@ async fn on_apply_point_map(session: &Session, req: pb::ApplyPointMap, msg_id: u
     };
 
     let res = conn.apply_point_map(req.key_to_point_id).await;
-    session.entries.lock().unwrap().get_mut(&req.connection_handle).map(|e| {
+    if let Some(e) = session
+        .entries
+        .lock()
+        .unwrap()
+        .get_mut(&req.connection_handle)
+    {
         e.conn = Some(conn);
-    });
+    }
     let result = match res {
         Ok(()) => ok_result(),
         Err(err) => err_result(err.kind, &err.code, err.message),
@@ -809,7 +880,12 @@ async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
     let Some(conn) = ready else {
         // NOTE: 拒绝路径也必须回显请求 msg_id，否则 Core 侧请求无法关联回复
         session
-            .send_control_ack_start(msg_id, req.connection_handle, false, "missing connection or already running")
+            .send_control_ack_start(
+                msg_id,
+                req.connection_handle,
+                false,
+                "missing connection or already running",
+            )
             .await;
         return;
     };
@@ -817,7 +893,9 @@ async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
     let run_cancel = CancellationToken::new();
     let task_cancel = run_cancel.clone();
     // 每个连接独立 sink：合并缓冲隔离 + 自动盖 handle/epoch 戳
-    let sink_for_run = session.sink.for_connection(req.connection_handle, req.stream_epoch);
+    let sink_for_run = session
+        .sink
+        .for_connection(req.connection_handle, req.stream_epoch);
     let handle = req.connection_handle;
     let entries = Arc::clone(&session.entries);
     let mut conn = conn; // &mut 调用需要可变绑定
@@ -844,7 +922,10 @@ async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
         let mut m = session.entries.lock().unwrap();
         if let Some(entry) = m.get_mut(&req.connection_handle) {
             entry.epoch = req.stream_epoch;
-            entry.run = Some(RunHandle { cancel: run_cancel, join });
+            entry.run = Some(RunHandle {
+                cancel: run_cancel,
+                join,
+            });
         }
     }
 
@@ -853,10 +934,12 @@ async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
         .sink
         .send_control(pb::Envelope {
             msg_id,
-            body: Some(pb::envelope::Body::StartConnectionAck(pb::StartConnectionAck {
-                connection_handle: req.connection_handle,
-                result: Some(ok_result()),
-            })),
+            body: Some(pb::envelope::Body::StartConnectionAck(
+                pb::StartConnectionAck {
+                    connection_handle: req.connection_handle,
+                    result: Some(ok_result()),
+                },
+            )),
         })
         .await;
 }
@@ -867,25 +950,33 @@ async fn on_stop(session: &Session, req: pb::StopConnection, msg_id: u64) {
         .sink
         .send_control(pb::Envelope {
             msg_id,
-            body: Some(pb::envelope::Body::StopConnectionAck(pb::StopConnectionAck {
-                connection_handle: req.connection_handle,
-                result: Some(ok_result()),
-            })),
+            body: Some(pb::envelope::Body::StopConnectionAck(
+                pb::StopConnectionAck {
+                    connection_handle: req.connection_handle,
+                    result: Some(ok_result()),
+                },
+            )),
         })
         .await;
 }
 
 async fn on_close(session: &Session, req: pb::CloseConnection, msg_id: u64) {
     session.stop_run(req.connection_handle).await;
-    session.entries.lock().unwrap().remove(&req.connection_handle);
+    session
+        .entries
+        .lock()
+        .unwrap()
+        .remove(&req.connection_handle);
     session
         .sink
         .send_control(pb::Envelope {
             msg_id,
-            body: Some(pb::envelope::Body::CloseConnectionAck(pb::CloseConnectionAck {
-                connection_handle: req.connection_handle,
-                result: Some(ok_result()),
-            })),
+            body: Some(pb::envelope::Body::CloseConnectionAck(
+                pb::CloseConnectionAck {
+                    connection_handle: req.connection_handle,
+                    result: Some(ok_result()),
+                },
+            )),
         })
         .await;
 }
@@ -901,10 +992,12 @@ impl Session {
             .send_control(pb::Envelope {
                 // 响应必须回显请求的 msg_id（§14 请求/响应关联规则）
                 msg_id,
-                body: Some(pb::envelope::Body::StartConnectionAck(pb::StartConnectionAck {
-                    connection_handle: handle,
-                    result: Some(result),
-                })),
+                body: Some(pb::envelope::Body::StartConnectionAck(
+                    pb::StartConnectionAck {
+                        connection_handle: handle,
+                        result: Some(result),
+                    },
+                )),
             })
             .await;
     }
@@ -914,11 +1007,13 @@ impl Session {
 async fn send_state_direct(sink: &DataSink, handle: u32, state: ConnectionState, detail: &str) {
     sink.send_control(pb::Envelope {
         msg_id: 0,
-        body: Some(pb::envelope::Body::ConnectionStateChanged(pb::ConnectionStateChanged {
-            connection_handle: handle,
-            state: state.as_str().to_string(),
-            detail: detail.to_string(),
-        })),
+        body: Some(pb::envelope::Body::ConnectionStateChanged(
+            pb::ConnectionStateChanged {
+                connection_handle: handle,
+                state: state.as_str().to_string(),
+                detail: detail.to_string(),
+            },
+        )),
     })
     .await;
 }

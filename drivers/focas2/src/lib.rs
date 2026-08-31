@@ -16,15 +16,15 @@ mod address;
 mod focas_api;
 mod native;
 
-pub use address::{parse_address, AddressError, FocasAddress};
+pub use address::{AddressError, FocasAddress, parse_address};
 pub use focas_api::{FakeFocasApi, FocasApi, NativeFocasApi};
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use mesa_core_types::{
-    ensure_unique_point_keys, AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey,
-    PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, now_unix_ns,
+    AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, PointDescriptor,
+    PointMap, PointValue, Quality, TaskMode, Value, ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio_util::sync::CancellationToken;
@@ -57,17 +57,25 @@ impl Driver for FocasDriver {
         _endpoint_id: &str,
         config_json: &str,
     ) -> Result<Box<dyn DriverConnection>, SdkDriverError> {
-        let v: serde_json::Value = serde_json::from_str(config_json)
-            .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", format!("connection JSON 非法: {e}")))?;
+        let v: serde_json::Value = serde_json::from_str(config_json).map_err(|e| {
+            SdkDriverError::configuration("BAD_CONFIG", format!("connection JSON 非法: {e}"))
+        })?;
         let cfg = FocasConnConfig::from_json(&v)?;
         // 已支持 use_native=true 切 Native（44/44 2026-08-29 165 11 GOOD），默认 Fake 用于 CI
-        let use_native = v.get("use_native").and_then(|x| x.as_bool()).unwrap_or(false);
+        let use_native = v
+            .get("use_native")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
         let api: Arc<dyn FocasApiTrait> = if use_native {
             Arc::new(NativeFocasApi::new())
         } else {
             Arc::new(FakeFocasApi::new())
         };
-        Ok(Box::new(FocasConnection { cfg, api, plan: None }))
+        Ok(Box::new(FocasConnection {
+            cfg,
+            api,
+            plan: None,
+        }))
     }
 }
 
@@ -84,23 +92,40 @@ struct FocasConnConfig {
 
 impl Default for FocasConnConfig {
     fn default() -> Self {
-        Self { host: "127.0.0.1".into(), port: 8193, timeout_ms: 3000 }
+        Self {
+            host: "127.0.0.1".into(),
+            port: 8193,
+            timeout_ms: 3000,
+        }
     }
 }
 
 impl FocasConnConfig {
     fn from_json(v: &serde_json::Value) -> Result<Self, SdkDriverError> {
         // 兼容两种写法：{host,port,timeout_ms} 或 {ip,port}
-        let host = v.get("host").or_else(|| v.get("ip")).and_then(|x| x.as_str()).unwrap_or("127.0.0.1").to_string();
+        let host = v
+            .get("host")
+            .or_else(|| v.get("ip"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("127.0.0.1")
+            .to_string();
         let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(8193) as u16;
-        let timeout_ms = v.get("timeout_ms").or_else(|| v.get("timeout")).and_then(|x| x.as_u64()).unwrap_or(3000);
+        let timeout_ms = v
+            .get("timeout_ms")
+            .or_else(|| v.get("timeout"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(3000);
         if host.trim().is_empty() {
             return Err(SdkDriverError::configuration("BAD_CONFIG", "host 不能为空"));
         }
         if port == 0 {
             return Err(SdkDriverError::configuration("BAD_CONFIG", "port 非法"));
         }
-        Ok(Self { host, port, timeout_ms })
+        Ok(Self {
+            host,
+            port,
+            timeout_ms,
+        })
     }
 }
 
@@ -117,6 +142,8 @@ struct PointSpec {
 
 #[derive(Debug)]
 struct TaskPlan {
+    // TODO: PlanSnapshot 冻结字段，task id 用于诊断与多任务追踪，V1 仅内存使用但需保留
+    #[allow(dead_code)]
     id: String,
     interval_ms: u64,
     point_indices: Vec<usize>,
@@ -124,6 +151,8 @@ struct TaskPlan {
 
 #[derive(Debug)]
 struct PlanSnapshot {
+    // TODO: PlanSnapshot 冻结字段，revision 为 §6.2 全量快照版本号，需保留以备 Driver 侧原子校验与回放
+    #[allow(dead_code)]
     revision: u64,
     points: Vec<PointSpec>,
     tasks: Vec<TaskPlan>,
@@ -138,7 +167,10 @@ struct FocasConnection {
 
 impl std::fmt::Debug for FocasConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FocasConnection").field("cfg", &self.cfg).field("has_plan", &self.plan.is_some()).finish()
+        f.debug_struct("FocasConnection")
+            .field("cfg", &self.cfg)
+            .field("has_plan", &self.plan.is_some())
+            .finish()
     }
 }
 
@@ -168,7 +200,10 @@ fn parse_data_type(s: &str) -> Result<DataType, SdkDriverError> {
         "F32" | "FLOAT" | "REAL" => Ok(DataType::F32),
         "F64" | "DOUBLE" | "LREAL" => Ok(DataType::F64),
         "STRING" | "STR" => Ok(DataType::String),
-        _ => Err(SdkDriverError::configuration("INVALID_DATA_TYPE", format!("data_type `{s}` 非法，期望 BOOL/U32/I32/F32/F64/STRING"))),
+        _ => Err(SdkDriverError::configuration(
+            "INVALID_DATA_TYPE",
+            format!("data_type `{s}` 非法，期望 BOOL/U32/I32/F32/F64/STRING"),
+        )),
     }
 }
 
@@ -195,55 +230,131 @@ impl DriverConnection for FocasConnection {
             if task.binding.kind != BINDING_KIND {
                 return Err(SdkDriverError::configuration(
                     "UNSUPPORTED_BINDING",
-                    format!("task `{}`: 期望 {BINDING_KIND}，实际 {}", task.id, task.binding.kind),
+                    format!(
+                        "task `{}`: 期望 {BINDING_KIND}，实际 {}",
+                        task.id, task.binding.kind
+                    ),
                 ));
             }
-            let items = task.binding.config.get("items").and_then(|v| v.as_array()).ok_or_else(|| {
-                SdkDriverError::configuration("INVALID_BINDING_CONFIG", format!("task `{}`: 缺少 items 数组", task.id))
-            })?;
+            let items = task
+                .binding
+                .config
+                .get("items")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    SdkDriverError::configuration(
+                        "INVALID_BINDING_CONFIG",
+                        format!("task `{}`: 缺少 items 数组", task.id),
+                    )
+                })?;
             if items.is_empty() {
-                return Err(SdkDriverError::configuration("INVALID_BINDING_CONFIG", format!("task `{}`: items 不能为空", task.id)));
+                return Err(SdkDriverError::configuration(
+                    "INVALID_BINDING_CONFIG",
+                    format!("task `{}`: items 不能为空", task.id),
+                ));
             }
             let mut indices = Vec::with_capacity(items.len());
             for item in items {
-                let key = item.get("key").and_then(|v| v.as_str()).ok_or_else(|| SdkDriverError::configuration("INVALID_POINT", format!("task `{}`: point 缺少 key", task.id)))?;
+                let key = item.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+                    SdkDriverError::configuration(
+                        "INVALID_POINT",
+                        format!("task `{}`: point 缺少 key", task.id),
+                    )
+                })?;
                 if key.trim().is_empty() {
-                    return Err(SdkDriverError::configuration("INVALID_POINT", "key 不能为空"));
+                    return Err(SdkDriverError::configuration(
+                        "INVALID_POINT",
+                        "key 不能为空",
+                    ));
                 }
-                let addr_str = item.get("address").and_then(|v| v.as_str()).ok_or_else(|| SdkDriverError::configuration("INVALID_POINT", format!("point `{key}` 缺少 address")))?;
-                let dt_str = item.get("data_type").and_then(|v| v.as_str()).ok_or_else(|| SdkDriverError::configuration("INVALID_POINT", format!("point `{key}` 缺少 data_type")))?;
+                let addr_str = item
+                    .get("address")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        SdkDriverError::configuration(
+                            "INVALID_POINT",
+                            format!("point `{key}` 缺少 address"),
+                        )
+                    })?;
+                let dt_str = item
+                    .get("data_type")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        SdkDriverError::configuration(
+                            "INVALID_POINT",
+                            format!("point `{key}` 缺少 data_type"),
+                        )
+                    })?;
                 let addr = parse_address(addr_str).map_err(|e| match e {
-                    AddressError::Empty => SdkDriverError::configuration("INVALID_ADDRESS", format!("point `{key}` 地址为空")),
-                    AddressError::Invalid { reason, .. } => SdkDriverError::new(mesa_core_types::ErrorKind::Address, "INVALID_ADDRESS", format!("point `{key}` 地址 `{addr_str}` 非法: {reason}")),
+                    AddressError::Empty => SdkDriverError::configuration(
+                        "INVALID_ADDRESS",
+                        format!("point `{key}` 地址为空"),
+                    ),
+                    AddressError::Invalid { reason, .. } => SdkDriverError::new(
+                        mesa_core_types::ErrorKind::Address,
+                        "INVALID_ADDRESS",
+                        format!("point `{key}` 地址 `{addr_str}` 非法: {reason}"),
+                    ),
                 })?;
                 let data_type = parse_data_type(dt_str)?;
                 // 预校验：Fake 下各地址的默认 Value 需匹配声明类型
                 // 仅在非严格场景跳过，避免过度约束用户
                 indices.push(new_points.len());
-                new_points.push(PointSpec { key: key.to_string(), addr, data_type });
+                new_points.push(PointSpec {
+                    key: key.to_string(),
+                    addr,
+                    data_type,
+                });
             }
             let interval = task.interval_ms.expect("validated");
-            new_tasks.push(TaskPlan { id: task.id.clone(), interval_ms: interval, point_indices: indices });
+            new_tasks.push(TaskPlan {
+                id: task.id.clone(),
+                interval_ms: interval,
+                point_indices: indices,
+            });
         }
 
         let descriptors: Vec<PointDescriptor> = new_points
             .iter()
-            .map(|p| PointDescriptor { point_key: p.key.clone(), data_type: p.data_type, unit: None })
+            .map(|p| PointDescriptor {
+                point_key: p.key.clone(),
+                data_type: p.data_type,
+                unit: None,
+            })
             .collect();
         ensure_unique_point_keys(&descriptors).map_err(|DuplicatePointKey(k)| {
             SdkDriverError::configuration("DUPLICATE_POINT_KEY", format!("`{k}` 重复"))
         })?;
 
-        tracing::info!(revision, points = new_points.len(), tasks = new_tasks.len(), "FOCAS2 采集计划构建完成");
-        self.plan = Some(PlanSnapshot { revision, points: new_points, tasks: new_tasks, map: None });
+        tracing::info!(
+            revision,
+            points = new_points.len(),
+            tasks = new_tasks.len(),
+            "FOCAS2 采集计划构建完成"
+        );
+        self.plan = Some(PlanSnapshot {
+            revision,
+            points: new_points,
+            tasks: new_tasks,
+            map: None,
+        });
         Ok(descriptors)
     }
 
     async fn apply_point_map(&mut self, map: PointMap) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_mut().ok_or_else(|| SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "NOT_CONFIGURED", "apply 在 configure 之前"))?;
+        let snap = self.plan.as_mut().ok_or_else(|| {
+            SdkDriverError::new(
+                mesa_core_types::ErrorKind::Internal,
+                "NOT_CONFIGURED",
+                "apply 在 configure 之前",
+            )
+        })?;
         for p in &snap.points {
             if !map.contains_key(&p.key) {
-                return Err(SdkDriverError::configuration("MISSING_POINT_ID", format!("point `{}` 缺少映射", p.key)));
+                return Err(SdkDriverError::configuration(
+                    "MISSING_POINT_ID",
+                    format!("point `{}` 缺少映射", p.key),
+                ));
             }
         }
         snap.map = Some(map);
@@ -255,18 +366,37 @@ impl DriverConnection for FocasConnection {
         sink: DataSink,
         shutdown: CancellationToken,
     ) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_ref().ok_or_else(|| SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "NO_PLAN", "run 前未 configure+apply"))?;
-        let map = snap.map.as_ref().ok_or_else(|| SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "NO_POINT_MAP", "run 前未 apply_point_map"))?;
+        let snap = self.plan.as_ref().ok_or_else(|| {
+            SdkDriverError::new(
+                mesa_core_types::ErrorKind::Internal,
+                "NO_PLAN",
+                "run 前未 configure+apply",
+            )
+        })?;
+        let map = snap.map.as_ref().ok_or_else(|| {
+            SdkDriverError::new(
+                mesa_core_types::ErrorKind::Internal,
+                "NO_POINT_MAP",
+                "run 前未 apply_point_map",
+            )
+        })?;
 
         // 连接（Fake 下即时成功；Native 下可能失败并由 Manager 退避重连）
         // NOTE: 当前 Fake 为纯异步直接 await；TODO: Native 切 spawn_blocking 隔离 Fwlib 阻塞
-        let connect_result = self.api.connect(&self.cfg.host, self.cfg.port, self.cfg.timeout_ms).await;
+        let connect_result = self
+            .api
+            .connect(&self.cfg.host, self.cfg.port, self.cfg.timeout_ms)
+            .await;
         if let Err(e) = connect_result {
             let msg = e.to_string();
             if msg.contains("未实现") || msg.contains("NOT_IMPLEMENTED") {
                 return Err(SdkDriverError::configuration("NOT_IMPLEMENTED", msg));
             } else {
-                return Err(SdkDriverError::new(mesa_core_types::ErrorKind::Connection, "CONNECT_FAILED", msg));
+                return Err(SdkDriverError::new(
+                    mesa_core_types::ErrorKind::Connection,
+                    "CONNECT_FAILED",
+                    msg,
+                ));
             }
         }
 
@@ -278,11 +408,14 @@ impl DriverConnection for FocasConnection {
         let mut handles = Vec::with_capacity(snap.tasks.len());
         for task in &snap.tasks {
             let indices = task.point_indices.clone();
-            let points: Vec<(PointSpec, u32)> = indices.iter().map(|&i| {
-                let p = snap.points[i].clone();
-                let pid = map[&p.key];
-                (p, pid)
-            }).collect();
+            let points: Vec<(PointSpec, u32)> = indices
+                .iter()
+                .map(|&i| {
+                    let p = snap.points[i].clone();
+                    let pid = map[&p.key];
+                    (p, pid)
+                })
+                .collect();
             let sink = sink.clone();
             let shutdown = shutdown.clone();
             let seq = Arc::clone(&seq);
@@ -313,8 +446,8 @@ impl DriverConnection for FocasConnection {
                     let mut batch_vals = Vec::with_capacity(points.len());
                     for ((spec, pid), raw_val) in points.iter().zip(values) {
                         // 多机型单点不支持：Native 以 "ERR:EW_*" 字符串占位，转 Quality::Bad 而非丢整批
-                        if let Value::String(s) = &raw_val {
-                            if s.starts_with("ERR:") {
+                        if let Value::String(s) = &raw_val
+                            && s.starts_with("ERR:") {
                                 tracing::warn!(key=%spec.key, error=%s, "单点 Bad，不影响同批其他点");
                                 batch_vals.push(PointValue {
                                     point_id: *pid,
@@ -325,7 +458,6 @@ impl DriverConnection for FocasConnection {
                                 });
                                 continue;
                             }
-                        }
                         let coerced = coerce_value(raw_val, spec.data_type);
                         if !value_fits_data_type(&coerced, spec.data_type) {
                             tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配跳过");
@@ -349,14 +481,20 @@ impl DriverConnection for FocasConnection {
         let mut final_err: Option<SdkDriverError> = None;
         for h in handles {
             match h.await {
-                Ok(Ok(())) => {},
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    if final_err.is_none() { final_err = Some(e); }
-                },
+                    if final_err.is_none() {
+                        final_err = Some(e);
+                    }
+                }
                 Err(join_err) => {
                     tracing::error!(%join_err, "FOCAS2 任务 panic");
                     if final_err.is_none() {
-                        final_err = Some(SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "TASK_PANIC", join_err.to_string()));
+                        final_err = Some(SdkDriverError::new(
+                            mesa_core_types::ErrorKind::Internal,
+                            "TASK_PANIC",
+                            join_err.to_string(),
+                        ));
                     }
                 }
             }
@@ -395,13 +533,20 @@ mod tests {
             id: "t1".into(),
             mode: TaskMode::Poll,
             interval_ms: Some(100),
-            binding: DriverBinding { kind: BINDING_KIND.into(), config: serde_json::json!({"items": items}) },
+            binding: DriverBinding {
+                kind: BINDING_KIND.into(),
+                config: serde_json::json!({"items": items}),
+            },
         }
     }
 
     #[tokio::test]
     async fn configure_ok_and_duplicate_rejected() {
-        let mut conn = FocasConnection { cfg: FocasConnConfig::default(), api: Arc::new(FakeFocasApi::new()), plan: None };
+        let mut conn = FocasConnection {
+            cfg: FocasConnConfig::default(),
+            api: Arc::new(FakeFocasApi::new()),
+            plan: None,
+        };
         let items = serde_json::json!([
             {"key":"a","address":"status","data_type":"U32"},
             {"key":"b","address":"axis.abs.1","data_type":"I32"}
@@ -413,15 +558,25 @@ mod tests {
             {"key":"a","address":"status","data_type":"U32"},
             {"key":"a","address":"axis.abs.2","data_type":"I32"}
         ]);
-        let err = conn.configure(2, vec![task_with_items(dup)]).await.unwrap_err();
+        let err = conn
+            .configure(2, vec![task_with_items(dup)])
+            .await
+            .unwrap_err();
         assert_eq!(err.code, "DUPLICATE_POINT_KEY");
     }
 
     #[tokio::test]
     async fn invalid_address_rejected() {
-        let mut conn = FocasConnection { cfg: FocasConnConfig::default(), api: Arc::new(FakeFocasApi::new()), plan: None };
+        let mut conn = FocasConnection {
+            cfg: FocasConnConfig::default(),
+            api: Arc::new(FakeFocasApi::new()),
+            plan: None,
+        };
         let items = serde_json::json!([{"key":"a","address":"axis.abs.0","data_type":"I32"}]);
-        let err = conn.configure(1, vec![task_with_items(items)]).await.unwrap_err();
+        let err = conn
+            .configure(1, vec![task_with_items(items)])
+            .await
+            .unwrap_err();
         assert_eq!(err.code, "INVALID_ADDRESS");
     }
 

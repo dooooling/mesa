@@ -28,13 +28,14 @@
 //! TODO: 附录 A 其余能力（delay/jitter/burst/silent_interval）待性能预算阶段（§22）
 //! 按压测需要补齐。
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use mesa_core_types::{
-    ensure_unique_point_keys, AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey,
-    ErrorKind, PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, now_unix_ns,
+    AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, ErrorKind,
+    PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, ensure_unique_point_keys,
+    now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio_util::sync::CancellationToken;
@@ -96,7 +97,11 @@ struct QualitySpec {
 
 impl Default for QualitySpec {
     fn default() -> Self {
-        Self { base: Quality::Good, bad_after_batches: None, good_again_after: None }
+        Self {
+            base: Quality::Good,
+            bad_after_batches: None,
+            good_again_after: None,
+        }
     }
 }
 
@@ -109,7 +114,10 @@ impl QualitySpec {
                 "UNCERTAIN" => Quality::Uncertain,
                 "BAD" => Quality::Bad,
                 other => {
-                    return Err(bad_point("<quality>", &format!("unknown quality `{other}`")))
+                    return Err(bad_point(
+                        "<quality>",
+                        &format!("unknown quality `{other}`"),
+                    ));
                 }
             };
         }
@@ -120,13 +128,13 @@ impl QualitySpec {
 
     /// 计算第 `batch_no` 批（1 起）应输出的质量。
     fn at(&self, batch_no: u64) -> Quality {
-        if let Some(bad_from) = self.bad_after_batches {
-            if batch_no >= bad_from {
-                return match self.good_again_after {
-                    Some(good_from) if batch_no >= good_from => Quality::Good,
-                    _ => Quality::Bad,
-                };
-            }
+        if let Some(bad_from) = self.bad_after_batches
+            && batch_no >= bad_from
+        {
+            return match self.good_again_after {
+                Some(good_from) if batch_no >= good_from => Quality::Good,
+                _ => Quality::Bad,
+            };
         }
         self.base
     }
@@ -139,18 +147,37 @@ fn parse_batch_threshold(
     match v.get(field) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(x) => x.as_u64().map(Some).ok_or_else(|| {
-            bad_point(field, &format!("`{field}` must be a positive integer batch count"))
+            bad_point(
+                field,
+                &format!("`{field}` must be a positive integer batch count"),
+            )
         }),
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum SourceSpec {
-    Counter { start: f64, step: f64, wrap: Option<f64> },
-    Sine { amplitude: f64, period_ms: u64, offset: f64 },
-    Toggle { initial: bool },
-    Constant { value: Value },
-    Random { min: f64, max: f64, seed: Option<u64> },
+    Counter {
+        start: f64,
+        step: f64,
+        wrap: Option<f64>,
+    },
+    Sine {
+        amplitude: f64,
+        period_ms: u64,
+        offset: f64,
+    },
+    Toggle {
+        initial: bool,
+    },
+    Constant {
+        value: Value,
+    },
+    Random {
+        min: f64,
+        max: f64,
+        seed: Option<u64>,
+    },
 }
 
 impl SourceSpec {
@@ -194,11 +221,15 @@ impl SourceSpec {
                 return Err(SdkDriverError::configuration(
                     "UNSUPPORTED_SOURCE_KIND",
                     format!("point `{key}`: unknown kind `{other}`"),
-                ))
+                ));
             }
         };
         let quality = QualitySpec::from_json(v)?;
-        Ok(PointSpec { key: key.to_string(), source, quality })
+        Ok(PointSpec {
+            key: key.to_string(),
+            source,
+            quality,
+        })
     }
 
     fn data_type(&self) -> DataType {
@@ -274,15 +305,19 @@ impl SourceState {
         match spec {
             SourceSpec::Counter { step, wrap, .. } => {
                 self.counter += *step;
-                if let Some(w) = wrap {
-                    if self.counter > *w {
-                        // 简单回绕到 0：满足附录 A "Counter 可配置回绕"
-                        self.counter = 0.0;
-                    }
+                if let Some(w) = wrap
+                    && self.counter > *w
+                {
+                    // 简单回绕到 0：满足附录 A "Counter 可配置回绕"
+                    self.counter = 0.0;
                 }
                 Value::F64(self.counter)
             }
-            SourceSpec::Sine { amplitude, period_ms, offset } => {
+            SourceSpec::Sine {
+                amplitude,
+                period_ms,
+                offset,
+            } => {
                 let phase = (t_ms % period_ms) as f64 / *period_ms as f64;
                 Value::F64(offset + amplitude * (std::f64::consts::TAU * phase).sin())
             }
@@ -312,6 +347,8 @@ impl SourceState {
 
 #[derive(Debug)]
 struct TaskPlan {
+    // TODO: PlanSnapshot 冻结字段，task id 用于诊断与任务级追踪，V1 仅内存使用未序列化但需保留
+    #[allow(dead_code)]
     id: String,
     interval_ms: u64,
     /// 指向快照内 points 数组的下标集合。
@@ -324,6 +361,8 @@ struct TaskPlan {
 /// configure 成功后的完整采集计划快照（§6.2 全量替换的原子单元）。
 #[derive(Debug)]
 struct PlanSnapshot {
+    // TODO: PlanSnapshot 冻结字段，revision 为 §6.2 全量快照版本号，当前仅内存校验未持久化到 Driver 但需保留以备回放校验
+    #[allow(dead_code)]
     revision: u64,
     points: Vec<PointSpec>,
     tasks: Vec<TaskPlan>,
@@ -393,7 +432,13 @@ impl DriverConnection for SimConnection {
                 id: task.id.clone(),
                 interval_ms: task.interval_ms.expect("validated above"),
                 point_indices: indices,
-                burst: task.binding.config.get("burst").and_then(|b| b.as_u64()).unwrap_or(1).max(1),
+                burst: task
+                    .binding
+                    .config
+                    .get("burst")
+                    .and_then(|b| b.as_u64())
+                    .unwrap_or(1)
+                    .max(1),
             });
         }
 
@@ -412,14 +457,28 @@ impl DriverConnection for SimConnection {
             )
         })?;
 
-        tracing::info!(revision, points = new_points.len(), tasks = new_tasks.len(), "plan built");
-        self.plan = Some(PlanSnapshot { revision, points: new_points, tasks: new_tasks, map: None });
+        tracing::info!(
+            revision,
+            points = new_points.len(),
+            tasks = new_tasks.len(),
+            "plan built"
+        );
+        self.plan = Some(PlanSnapshot {
+            revision,
+            points: new_points,
+            tasks: new_tasks,
+            map: None,
+        });
         Ok(descriptors)
     }
 
     async fn apply_point_map(&mut self, map: PointMap) -> Result<(), SdkDriverError> {
         let snapshot = self.plan.as_mut().ok_or_else(|| {
-            SdkDriverError::new(ErrorKind::Internal, "NOT_CONFIGURED", "apply before configure")
+            SdkDriverError::new(
+                ErrorKind::Internal,
+                "NOT_CONFIGURED",
+                "apply before configure",
+            )
         })?;
         // 映射必须覆盖全部已注册点，否则该点将永远无 ID 可发
         for p in &snapshot.points {
@@ -443,7 +502,11 @@ impl DriverConnection for SimConnection {
             SdkDriverError::new(ErrorKind::Internal, "NO_PLAN", "run before configure+apply")
         })?;
         let map = snapshot.map.as_ref().ok_or_else(|| {
-            SdkDriverError::new(ErrorKind::Internal, "NO_POINT_MAP", "run before apply_point_map")
+            SdkDriverError::new(
+                ErrorKind::Internal,
+                "NO_POINT_MAP",
+                "run before apply_point_map",
+            )
         })?;
 
         /// 组装某任务循环的 owned 运行单元（id + 规格 + 状态），不借用连接对象。
@@ -459,7 +522,11 @@ impl DriverConnection for SimConnection {
                 .map(|(local, &idx)| {
                     let spec = snapshot.points[idx].clone();
                     let point_id = map[&spec.key];
-                    RuntimePoint { point_id, state: SourceState::new(&spec.source, local as u64), spec }
+                    RuntimePoint {
+                        point_id,
+                        state: SourceState::new(&spec.source, local as u64),
+                        spec,
+                    }
                 })
                 .collect()
         };
@@ -563,25 +630,36 @@ mod tests {
             id: id.into(),
             mode: TaskMode::Poll,
             interval_ms: Some(interval),
-            binding: DriverBinding { kind: BINDING_KIND.into(), config: points },
+            binding: DriverBinding {
+                kind: BINDING_KIND.into(),
+                config: points,
+            },
         }
     }
 
     #[tokio::test]
     async fn configure_rejects_duplicate_and_unknown_sources() {
         let mut conn = SimConnection::default();
-        let dup = poll_task("t", 100, serde_json::json!({
-            "points": [
-                {"key":"a","kind":"counter"},
-                {"key":"a","kind":"counter"}
-            ]
-        }));
+        let dup = poll_task(
+            "t",
+            100,
+            serde_json::json!({
+                "points": [
+                    {"key":"a","kind":"counter"},
+                    {"key":"a","kind":"counter"}
+                ]
+            }),
+        );
         let err = conn.configure(1, vec![dup]).await.unwrap_err();
         assert_eq!(err.code, "DUPLICATE_POINT_KEY");
 
-        let unknown = poll_task("t", 100, serde_json::json!({
-            "points": [{"key":"a","kind":"quantum_flux"}]
-        }));
+        let unknown = poll_task(
+            "t",
+            100,
+            serde_json::json!({
+                "points": [{"key":"a","kind":"quantum_flux"}]
+            }),
+        );
         let err = conn.configure(1, vec![unknown]).await.unwrap_err();
         assert_eq!(err.code, "UNSUPPORTED_SOURCE_KIND");
     }
@@ -589,7 +667,11 @@ mod tests {
     #[test]
     fn counter_advances_and_wraps() {
         // 语义：本次累加后超过 wrap 上限，则该次采样直接输出回绕后的 0
-        let spec = SourceSpec::Counter { start: 8.0, step: 3.0, wrap: Some(10.0) };
+        let spec = SourceSpec::Counter {
+            start: 8.0,
+            step: 3.0,
+            wrap: Some(10.0),
+        };
         let mut st = SourceState::new(&spec, 0);
         assert_eq!(st.sample(&spec, 0), Value::F64(0.0)); // 8+3=11 > 10 → 回绕
         assert_eq!(st.sample(&spec, 0), Value::F64(3.0)); // 从 0 继续累加
@@ -597,7 +679,11 @@ mod tests {
 
     #[test]
     fn sine_hits_extremes_at_quarter_periods() {
-        let spec = SourceSpec::Sine { amplitude: 10.0, period_ms: 400, offset: 5.0 };
+        let spec = SourceSpec::Sine {
+            amplitude: 10.0,
+            period_ms: 400,
+            offset: 5.0,
+        };
         let mut st = SourceState::new(&spec, 0);
         assert_eq!(st.sample(&spec, 100), Value::F64(15.0)); // T*1/4 → 峰值
         assert_eq!(st.sample(&spec, 300), Value::F64(-5.0)); // T*3/4 → 谷值
@@ -606,7 +692,11 @@ mod tests {
     #[test]
     fn random_with_fixed_seed_is_deterministic_and_in_range() {
         let mk = || {
-            let spec = SourceSpec::Random { min: -1.0, max: 1.0, seed: Some(42) };
+            let spec = SourceSpec::Random {
+                min: -1.0,
+                max: 1.0,
+                seed: Some(42),
+            };
             let state = SourceState::new(&spec, 0);
             (spec, state)
         };
@@ -669,7 +759,10 @@ mod tests {
 
         // faults 非对象 / 阈值非法 → 结构化配置错误
         // （Box<dyn DriverConnection> 非 Debug，不能用 unwrap_err，需手动匹配）
-        let err = match SimulatorDriver.open_connection("e", "{\"faults\": []}").await {
+        let err = match SimulatorDriver
+            .open_connection("e", "{\"faults\": []}")
+            .await
+        {
             Err(e) => e,
             Ok(_) => panic!("non-object faults must be rejected"),
         };
@@ -688,20 +781,27 @@ mod tests {
     #[tokio::test]
     async fn full_plan_produces_mapped_point_ids() {
         let mut conn = SimConnection::default();
-        let task = poll_task("t", 100, serde_json::json!({
-            "points": [
-                {"key":"k.a","kind":"constant","value":7},
-                {"key":"k.b","kind":"toggle","initial":false}
-            ]
-        }));
+        let task = poll_task(
+            "t",
+            100,
+            serde_json::json!({
+                "points": [
+                    {"key":"k.a","kind":"constant","value":7},
+                    {"key":"k.b","kind":"toggle","initial":false}
+                ]
+            }),
+        );
         let descriptors = conn.configure(3, vec![task]).await.unwrap();
         assert_eq!(descriptors.len(), 2);
         assert_eq!(descriptors[0].data_type, DataType::F64);
         assert_eq!(descriptors[1].data_type, DataType::Bool);
 
-        conn.apply_point_map(PointMap::from([("k.a".to_string(), 11), ("k.b".to_string(), 22)]))
-            .await
-            .unwrap();
+        conn.apply_point_map(PointMap::from([
+            ("k.a".to_string(), 11),
+            ("k.b".to_string(), 22),
+        ]))
+        .await
+        .unwrap();
 
         // 直接驱动内部状态机验证映射结果（不起 IPC）
         let snapshot = conn.plan.as_ref().unwrap();
@@ -710,7 +810,11 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                (snapshot.map.as_ref().unwrap()[&p.key], p.source.clone(), SourceState::new(&p.source, i as u64))
+                (
+                    snapshot.map.as_ref().unwrap()[&p.key],
+                    p.source.clone(),
+                    SourceState::new(&p.source, i as u64),
+                )
             })
             .collect();
         let vals: Vec<(u32, Value)> = states

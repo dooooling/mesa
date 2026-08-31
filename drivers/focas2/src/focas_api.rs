@@ -3,21 +3,27 @@
 //! - `FakeFocasApi` 用于 CI 与多协议共存演示：按地址类型生成随机动态值，无需真机或 Fwlib。
 //! - `NativeFocasApi` 预留，后续通过 `libloading` 动态加载 `Fwlib32/fwlib`（`C:\Users\34268\Downloads\fanuc-driver\fanuc\fwlib.cs`）。
 
+#![allow(clippy::redundant_guards)] // 保留 Err(e) if e==Noopt 形态以复用 e.message()，语义清晰于直接匹配字面量
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mesa_core_types::Value;
 
-use crate::address::{AxisKind, FocasAddress, SpindleKind, ToolKind};
+use crate::address::{AxisKind, FocasAddress, SpindleKind};
 
 // ---------------------------------------------------------------------------
 // 常量：FOCAS 语义边界
 // ---------------------------------------------------------------------------
 /// FOCAS 默认超时：5 秒，太短易因 CNC 扫描周期误判 EW_SOCKET
+// TODO: 超时常量预留，V1 由 Endpoint 配置透传，未在 Fake 中硬编码但需保留默认值
+#[allow(dead_code)]
 const FOCAS_DEFAULT_TIMEOUT_MS: u64 = 5000;
 /// 毫秒转秒向上取整：timeout_s = (ms+999)/1000，FOCAS 以秒为单位
 const FOCAS_MS_PER_S: u64 = 1000;
 /// Fake 随机：xorshift 乘子与扰动常量（取自 splitmix64 经验值，保证分散性）
+// TODO: Fake 随机常量预留，当前 FakeFocasApi 内联实现已用字面量，保留以备抽公共随机
+#[allow(dead_code)]
 const FAKE_RAND_MULT: u64 = 6364136223846793005;
+#[allow(dead_code)]
 const FAKE_RAND_XOR: u32 = 0x2545F491;
 
 /// FOCAS2 访问抽象，所有阻塞调用应在 `spawn_blocking` 中执行（由调用方保证）。
@@ -41,12 +47,16 @@ pub struct FakeFocasApi {
 
 impl Default for FakeFocasApi {
     fn default() -> Self {
-        Self { seq: AtomicU64::new(1) }
+        Self {
+            seq: AtomicU64::new(1),
+        }
     }
 }
 
 impl FakeFocasApi {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     fn next_u32(&self) -> u32 {
         // 轻量 xorshift 伪随机（无需外部依赖）
@@ -75,7 +85,13 @@ impl FakeFocasApi {
                 // 模拟位置：-10000..10000 带小数（以 0.001 为单位存储为 I32）
                 let base = (r % 20001) as i32 - 10000;
                 match kind {
-                    AxisKind::Absolute | AxisKind::Machine | AxisKind::Relative | AxisKind::Distance | AxisKind::Data | AxisKind::SrvDelay | AxisKind::AccDecDly => {
+                    AxisKind::Absolute
+                    | AxisKind::Machine
+                    | AxisKind::Relative
+                    | AxisKind::Distance
+                    | AxisKind::Data
+                    | AxisKind::SrvDelay
+                    | AxisKind::AccDecDly => {
                         // 返回 I32 位置（单位 0.001mm），上层直接取 Value::I32
                         Value::I32(base * 100)
                     }
@@ -145,8 +161,8 @@ impl FocasApi for FakeFocasApi {
 // Native 实现：动态加载 Fwlib 并封装阻塞调用
 // ---------------------------------------------------------------------------
 
-use std::sync::Mutex;
 use crate::native::{FocasRet, NativeLib};
+use std::sync::Mutex;
 
 pub struct NativeFocasApi {
     lib: std::sync::Arc<std::sync::OnceLock<Result<NativeLib, String>>>,
@@ -155,15 +171,22 @@ pub struct NativeFocasApi {
 
 impl Default for NativeFocasApi {
     fn default() -> Self {
-        Self { lib: std::sync::Arc::new(std::sync::OnceLock::new()), handle: std::sync::Arc::new(Mutex::new(None)) }
+        Self {
+            lib: std::sync::Arc::new(std::sync::OnceLock::new()),
+            handle: std::sync::Arc::new(Mutex::new(None)),
+        }
     }
 }
 
 impl NativeFocasApi {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
+    // TODO: Native 库预检预留，V1 改为 get_or_init 懒加载后未单独调用，保留以备显式预检路径
+    #[allow(dead_code)]
     fn ensure_lib(&self) -> Result<&NativeLib, String> {
-        let r = self.lib.get_or_init(|| NativeLib::load());
+        let r = self.lib.get_or_init(NativeLib::load);
         match r {
             Ok(lib) => Ok(lib),
             Err(e) => Err(e.clone()),
@@ -185,38 +208,64 @@ impl NativeFocasApi {
 #[async_trait::async_trait]
 impl FocasApi for NativeFocasApi {
     async fn connect(&self, host: &str, port: u16, timeout_ms: u64) -> Result<(), String> {
-        if host.trim().is_empty() { return Err("host 不能为空".into()); }
+        if host.trim().is_empty() {
+            return Err("host 不能为空".into());
+        }
         let host_s = host.to_string();
         let lib_arc = std::sync::Arc::clone(&self.lib);
         let handle_arc = std::sync::Arc::clone(&self.handle);
-        let res = tokio::task::spawn_blocking(move || {
-            let r = lib_arc.get_or_init(|| NativeLib::load());
-            let lib = match r { Ok(l) => l, Err(e) => return Err(e.clone()) };
-            let timeout_secs = ((timeout_ms + FOCAS_MS_PER_S - 1) / FOCAS_MS_PER_S) as i32;
-            let hdl = lib.cnc_allclibhndl3(&host_s, port, timeout_secs).map_err(Self::map_ret_err)?;
+
+        tokio::task::spawn_blocking(move || {
+            let r = lib_arc.get_or_init(NativeLib::load);
+            let lib = match r {
+                Ok(l) => l,
+                Err(e) => return Err(e.clone()),
+            };
+            let timeout_secs = timeout_ms.div_ceil(FOCAS_MS_PER_S) as i32;
+            let hdl = lib
+                .cnc_allclibhndl3(&host_s, port, timeout_secs)
+                .map_err(Self::map_ret_err)?;
             *handle_arc.lock().unwrap() = Some(hdl);
             tracing::info!(host=%host_s, port, hdl, "FOCAS Native 连接建立");
             Ok::<(), String>(())
-        }).await.map_err(|e| format!("JOIN_FAILED {e}"))?;
-        res
+        })
+        .await
+        .map_err(|e| format!("JOIN_FAILED {e}"))?
     }
 
     async fn read_batch(&self, addresses: &[FocasAddress]) -> Result<Vec<Value>, String> {
-        if addresses.is_empty() { return Ok(Vec::new()); }
+        if addresses.is_empty() {
+            return Ok(Vec::new());
+        }
         let addrs = addresses.to_vec();
         let lib_arc = std::sync::Arc::clone(&self.lib);
         let handle_arc = std::sync::Arc::clone(&self.handle);
-        let res = tokio::task::spawn_blocking(move || {
-            let r = lib_arc.get_or_init(|| NativeLib::load());
-            let lib = match r { Ok(l) => l, Err(e) => return Err(e.clone()) };
-            let hdl = handle_arc.lock().unwrap().ok_or_else(|| "NOT_CONNECTED 未调用 connect".to_string())?;
+
+        tokio::task::spawn_blocking(move || {
+            let r = lib_arc.get_or_init(NativeLib::load);
+            let lib = match r {
+                Ok(l) => l,
+                Err(e) => return Err(e.clone()),
+            };
+            let hdl = handle_arc
+                .lock()
+                .unwrap()
+                .ok_or_else(|| "NOT_CONNECTED 未调用 connect".to_string())?;
             let mut out = Vec::with_capacity(addrs.len());
             for addr in &addrs {
                 match Self::read_one_blocking(lib, hdl, addr) {
                     Ok(v) => out.push(v),
                     Err(e) => {
                         let low = e.to_ascii_lowercase();
-                        if low.contains("ew_noopt") || low.contains("ew_data") || low.contains("ew_range") || low.contains("ew_attrib") || low.contains("ew_length") || low.contains("ew_number") || low.contains("ew_param") || low.contains("ew_func") {
+                        if low.contains("ew_noopt")
+                            || low.contains("ew_data")
+                            || low.contains("ew_range")
+                            || low.contains("ew_attrib")
+                            || low.contains("ew_length")
+                            || low.contains("ew_number")
+                            || low.contains("ew_param")
+                            || low.contains("ew_func")
+                        {
                             tracing::warn!(?addr, error=%e, "FOCAS 单点不支持，转 Bad");
                             out.push(Value::String(format!("ERR:{}", e)));
                         } else {
@@ -226,8 +275,9 @@ impl FocasApi for NativeFocasApi {
                 }
             }
             Ok::<Vec<Value>, String>(out)
-        }).await.map_err(|e| format!("JOIN_FAILED {e}"))?;
-        res
+        })
+        .await
+        .map_err(|e| format!("JOIN_FAILED {e}"))?
     }
 
     async fn disconnect(&self) {
@@ -239,7 +289,8 @@ impl FocasApi for NativeFocasApi {
                     let _ = lib.cnc_freelibhndl(hdl);
                     tracing::info!(hdl, "FOCAS 句柄已释放");
                 }
-            }).await;
+            })
+            .await;
         }
     }
 }
@@ -257,7 +308,9 @@ impl NativeFocasApi {
                 let mut num: std::os::raw::c_short = 0;
                 match lib.cnc_rdalmmsg(hdl, &mut num) {
                     Ok(msgs) => Ok(Value::String(format!("{:?}", msgs))),
-                    Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT alarm {}", e.message()))),
+                    Err(e) if e == crate::native::FocasRet::Noopt => {
+                        Ok(Value::String(format!("ERR:EW_NOOPT alarm {}", e.message())))
+                    }
                     Err(e) => Err(Self::map_ret_err(e)),
                 }
             }
@@ -283,7 +336,10 @@ impl NativeFocasApi {
                 // 优先用 cnc_absolute 精确单轴，fallback 到 rddynamic2
                 match lib.cnc_absolute(hdl, *axis) {
                     Ok(v) => Ok(Value::I32(v)),
-                    Err(e) if e == crate::native::FocasRet::Noopt || e == crate::native::FocasRet::Param => {
+                    Err(e)
+                        if e == crate::native::FocasRet::Noopt
+                            || e == crate::native::FocasRet::Param =>
+                    {
                         let dy = lib.cnc_rddynamic2(hdl).map_err(Self::map_ret_err)?;
                         // 按 kind 仍以 actf 代理，保证 0i/30i 均可通
                         let _ = kind;
@@ -318,12 +374,16 @@ impl NativeFocasApi {
                     }
                     SpindleKind::Gear => match lib.cnc_rdspgear(hdl, *spindle) {
                         Ok(v) => Ok(Value::I32(v as i32)),
-                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT gear {} {}", spindle, e.message()))),
+                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(
+                            format!("ERR:EW_NOOPT gear {} {}", spindle, e.message()),
+                        )),
                         Err(e) => Err(Self::map_ret_err(e)),
                     },
                     SpindleKind::MaxRpm => match lib.cnc_rdspmaxrpm(hdl, *spindle) {
                         Ok(v) => Ok(Value::I32(v as i32)),
-                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT maxrpm {} {}", spindle, e.message()))),
+                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(
+                            format!("ERR:EW_NOOPT maxrpm {} {}", spindle, e.message()),
+                        )),
                         Err(e) => Err(Self::map_ret_err(e)),
                     },
                 }
@@ -357,7 +417,9 @@ impl NativeFocasApi {
             FocasAddress::Pmc { kind, addr, bit } => {
                 let adr_type = crate::native::NativeLib::pmc_adr_type(*kind);
                 if let Some(b) = bit {
-                    let v = lib.pmc_rdpmcrng_bit(hdl, adr_type, *addr, *b).map_err(Self::map_ret_err)?;
+                    let v = lib
+                        .pmc_rdpmcrng_bit(hdl, adr_type, *addr, *b)
+                        .map_err(Self::map_ret_err)?;
                     Ok(Value::Bool(v))
                 } else {
                     // 无 bit 时：0i/30i 对 R/D 的字长差异，G/X/Y/F 为 byte，R 为 word，D 为 dword
@@ -367,8 +429,17 @@ impl NativeFocasApi {
                         // D 尝试 dword -> word
                         match lib.pmc_rdpmcrng_dword(hdl, adr_type, *addr) {
                             Ok(v) => Ok(Value::I32(v)),
-                            Err(e) if matches!(e, crate::native::FocasRet::Param | crate::native::FocasRet::Length | crate::native::FocasRet::Noopt) => {
-                                let w = lib.pmc_rdpmcrng_word(hdl, adr_type, *addr).map_err(Self::map_ret_err)?;
+                            Err(e)
+                                if matches!(
+                                    e,
+                                    crate::native::FocasRet::Param
+                                        | crate::native::FocasRet::Length
+                                        | crate::native::FocasRet::Noopt
+                                ) =>
+                            {
+                                let w = lib
+                                    .pmc_rdpmcrng_word(hdl, adr_type, *addr)
+                                    .map_err(Self::map_ret_err)?;
                                 Ok(Value::I32(w as i32))
                             }
                             Err(e) => Err(Self::map_ret_err(e)),
@@ -377,15 +448,26 @@ impl NativeFocasApi {
                         // R/A/T/C 常见为 word
                         match lib.pmc_rdpmcrng_word(hdl, adr_type, *addr) {
                             Ok(v) => Ok(Value::I32(v as i32)),
-                            Err(e) if matches!(e, crate::native::FocasRet::Param | crate::native::FocasRet::Length | crate::native::FocasRet::Noopt) => {
-                                let b = lib.pmc_rdpmcrng_byte(hdl, adr_type, *addr).map_err(Self::map_ret_err)?;
+                            Err(e)
+                                if matches!(
+                                    e,
+                                    crate::native::FocasRet::Param
+                                        | crate::native::FocasRet::Length
+                                        | crate::native::FocasRet::Noopt
+                                ) =>
+                            {
+                                let b = lib
+                                    .pmc_rdpmcrng_byte(hdl, adr_type, *addr)
+                                    .map_err(Self::map_ret_err)?;
                                 Ok(Value::U32(b as u32))
                             }
                             Err(e) => Err(Self::map_ret_err(e)),
                         }
                     } else {
                         // G/X/Y/F 等单字节
-                        let b = lib.pmc_rdpmcrng_byte(hdl, adr_type, *addr).map_err(Self::map_ret_err)?;
+                        let b = lib
+                            .pmc_rdpmcrng_byte(hdl, adr_type, *addr)
+                            .map_err(Self::map_ret_err)?;
                         Ok(Value::U32(b as u32))
                     }
                 }
@@ -394,28 +476,47 @@ impl NativeFocasApi {
                 // 诊断：优先 cnc_diagnoss，跨机型差异大，缺失转 Bad 而非 0 占位，避免掩盖真机差异
                 match lib.cnc_diagnoss(hdl, *number as i32) {
                     Ok(v) => Ok(Value::I32(v)),
-                    Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT diagnosis {} {}", number, e.message()))),
+                    Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!(
+                        "ERR:EW_NOOPT diagnosis {} {}",
+                        number,
+                        e.message()
+                    ))),
                     Err(e) => Err(Self::map_ret_err(e)),
                 }
             }
             FocasAddress::Param { number } => match lib.cnc_rdparam(hdl, *number) {
                 Ok(v) => Ok(Value::I32(v)),
-                Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT param {} {}", number, e.message()))),
+                Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!(
+                    "ERR:EW_NOOPT param {} {}",
+                    number,
+                    e.message()
+                ))),
                 Err(e) => Err(Self::map_ret_err(e)),
             },
             FocasAddress::ProgramDir => match lib.cnc_rdprogdir(hdl) {
                 Ok(v) => Ok(Value::String(v)),
-                Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT progdir {}", e.message()))),
+                Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!(
+                    "ERR:EW_NOOPT progdir {}",
+                    e.message()
+                ))),
                 Err(e) => Err(Self::map_ret_err(e)),
             },
             FocasAddress::ProgramInfo => match lib.cnc_rdproginfo(hdl) {
                 Ok(v) => Ok(Value::String(v)),
-                Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT proginfo {}", e.message()))),
+                Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!(
+                    "ERR:EW_NOOPT proginfo {}",
+                    e.message()
+                ))),
                 Err(e) => Err(Self::map_ret_err(e)),
             },
             FocasAddress::ProgramUpload => match lib.cnc_upload(hdl) {
                 Ok(v) => Ok(Value::String(v)),
-                Err(e) if e == crate::native::FocasRet::Noopt || e == crate::native::FocasRet::Func => Ok(Value::String(format!("ERR:EW_FUNC upload {}", e.message()))),
+                Err(e)
+                    if e == crate::native::FocasRet::Noopt
+                        || e == crate::native::FocasRet::Func =>
+                {
+                    Ok(Value::String(format!("ERR:EW_FUNC upload {}", e.message())))
+                }
                 Err(e) => Err(Self::map_ret_err(e)),
             },
             FocasAddress::Tool { kind, number } => {
@@ -423,27 +524,42 @@ impl NativeFocasApi {
                     crate::address::ToolKind::Number => Ok(Value::U32(1)),
                     crate::address::ToolKind::Offset => match lib.cnc_rdtofs(hdl, *number) {
                         Ok(v) => Ok(Value::F64(v)),
-                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT tool.offset {} {}", number, e.message()))),
+                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(
+                            format!("ERR:EW_NOOPT tool.offset {} {}", number, e.message()),
+                        )),
                         Err(e) => Err(Self::map_ret_err(e)),
                     },
                     crate::address::ToolKind::Zofs => match lib.cnc_rdzofs(hdl, *number) {
                         Ok(v) => Ok(Value::F64(v)),
-                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT tool.zofs {} {}", number, e.message()))),
+                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(
+                            format!("ERR:EW_NOOPT tool.zofs {} {}", number, e.message()),
+                        )),
                         Err(e) => Err(Self::map_ret_err(e)),
                     },
                     crate::address::ToolKind::Length => match lib.cnc_rdtofs(hdl, *number) {
                         Ok(v) => Ok(Value::F64(v)),
-                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT tool.length {} {}", number, e.message()))),
+                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(
+                            format!("ERR:EW_NOOPT tool.length {} {}", number, e.message()),
+                        )),
                         Err(e) => Err(Self::map_ret_err(e)),
                     },
                 }
             }
             FocasAddress::OpMsg => match lib.cnc_rdopmsg(hdl) {
                 Ok(op) => {
-                    let s = String::from_utf8_lossy(&op.dummy).trim_matches('\0').trim().to_string();
-                    if s.is_empty() { Ok(Value::String("OP:empty".into())) } else { Ok(Value::String(s)) }
+                    let s = String::from_utf8_lossy(&op.dummy)
+                        .trim_matches('\0')
+                        .trim()
+                        .to_string();
+                    if s.is_empty() {
+                        Ok(Value::String("OP:empty".into()))
+                    } else {
+                        Ok(Value::String(s))
+                    }
                 }
-                Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!("ERR:EW_NOOPT opmsg {}", e.message()))),
+                Err(e) if e == crate::native::FocasRet::Noopt => {
+                    Ok(Value::String(format!("ERR:EW_NOOPT opmsg {}", e.message())))
+                }
                 Err(e) => Err(Self::map_ret_err(e)),
             },
         }
@@ -453,12 +569,11 @@ impl NativeFocasApi {
 impl Drop for NativeFocasApi {
     fn drop(&mut self) {
         // 仅在强引用计数为 1 时尝试释放，避免多 clone 时重复释放
-        if std::sync::Arc::strong_count(&self.handle) == 1 {
-            if let Some(hdl) = self.handle.lock().unwrap().take() {
-                if let Some(Ok(lib)) = self.lib.get().map(|r| r.as_ref()) {
-                    let _ = lib.cnc_freelibhndl(hdl);
-                }
-            }
+        if std::sync::Arc::strong_count(&self.handle) == 1
+            && let Some(hdl) = self.handle.lock().unwrap().take()
+            && let Some(Ok(lib)) = self.lib.get().map(|r| r.as_ref())
+        {
+            let _ = lib.cnc_freelibhndl(hdl);
         }
     }
 }
@@ -473,8 +588,14 @@ mod tests {
         api.connect("127.0.0.1", 8193, 3000).await.unwrap();
         let addrs = vec![
             FocasAddress::Status,
-            FocasAddress::Axis { axis: 1, kind: AxisKind::Absolute },
-            FocasAddress::Spindle { spindle: 1, kind: SpindleKind::Load },
+            FocasAddress::Axis {
+                axis: 1,
+                kind: AxisKind::Absolute,
+            },
+            FocasAddress::Spindle {
+                spindle: 1,
+                kind: SpindleKind::Load,
+            },
             FocasAddress::MacroVar { number: 100 },
         ];
         let vals = api.read_batch(&addrs).await.unwrap();

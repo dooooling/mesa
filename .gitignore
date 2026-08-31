@@ -20,11 +20,16 @@ mesa*.db-shm
 /certificates/
 
 # Driver 构建产物（cargo build 产于 target，drivers/ 下为 QEMU/本地调试拷贝，勿入仓）
+# 注：driver.toml 中 executable 为 "Mesa-driver-*"（大写 M），而 cargo bin 为 "mesa-driver-*"（小写），
+# Windows 不区分大小写但 Linux 区分，故同时忽略两种大小写；forgelink 为历史命名遗留
 drivers/*/mesa-driver-*
+drivers/*/Mesa-driver-*
+drivers/*/forgelink-driver-*
 drivers/simulator/*.d
 drivers/s7/*.d
 drivers/focas2/*.d
 drivers/opcua/*.d
+forgelink*.db
 
 # 临时 ARM/性能产物
 /target

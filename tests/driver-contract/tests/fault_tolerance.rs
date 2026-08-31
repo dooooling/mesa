@@ -32,11 +32,14 @@ async fn heartbeat_flags_unresponsive_driver() {
 
     // 正常阶段不应误判
     tokio::time::sleep(Duration::from_millis(250)).await;
-    assert!(!unresponsive.load(Ordering::Relaxed), "healthy driver must not be flagged");
+    assert!(
+        !unresponsive.load(Ordering::Relaxed),
+        "healthy driver must not be flagged"
+    );
 
     // 注入 hang：请求循环停止处理任何入站帧（不回 Pong）
     faults.set_hang(true);
-    wait_until(5, || unresponsive.load(Ordering::Relaxed));
+    wait_until(5, || unresponsive.load(Ordering::Relaxed)).await;
 
     session.invalidate();
     cancel.cancel();
@@ -47,7 +50,9 @@ async fn heartbeat_flags_unresponsive_driver() {
 /// 事件发送端直至其 5s 周期结束，通道关闭滞后于 serve 实际退出。
 #[tokio::test]
 async fn shutdown_message_ends_server_cleanly() {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let port = listener.local_addr().unwrap().port();
     let cancel = tokio_util::sync::CancellationToken::new();
     let c = cancel.clone();
@@ -61,13 +66,15 @@ async fn shutdown_message_ends_server_cleanly() {
         .await
     });
 
-    let (mut session, _events, _) =
-        Session::connect(port, TOKEN).await.unwrap();
+    let (mut session, _events, _) = Session::connect(port, TOKEN).await.unwrap();
     // 会话可用性预检
     let _ = session.metadata().await.expect("metadata before shutdown");
 
     use mesa_driver_protocol::pb::envelope::Body;
-    session.post(Body::Shutdown(mesa_driver_protocol::pb::Shutdown {})).await.unwrap();
+    session
+        .post(Body::Shutdown(mesa_driver_protocol::pb::Shutdown {}))
+        .await
+        .unwrap();
 
     // serve 必须在宽限内干净返回
     let result = tokio::time::timeout(std::time::Duration::from_secs(3), server)

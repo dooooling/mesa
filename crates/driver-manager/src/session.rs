@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use mesa_core_types::{ConnectionState as CoreState, DataBatch};
 use mesa_driver_protocol::{
-    batch_from_pb, connection_state_from_pb, negotiate, pb, read_envelope, write_envelope,
-    ProtocolError,
+    ProtocolError, batch_from_pb, connection_state_from_pb, negotiate, pb, read_envelope,
+    write_envelope,
 };
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
@@ -40,9 +40,17 @@ pub struct HeartbeatParams {
 impl Default for HeartbeatParams {
     fn default() -> Self {
         if std::env::var("MESA_HEARTBEAT_FAST").ok().as_deref() == Some("1") {
-            return Self { ping_period: Duration::from_secs(1), pong_deadline: Duration::from_secs(1), max_missed: 2 };
+            return Self {
+                ping_period: Duration::from_secs(1),
+                pong_deadline: Duration::from_secs(1),
+                max_missed: 2,
+            };
         }
-        Self { ping_period: PING_PERIOD, pong_deadline: PONG_DEADLINE, max_missed: MAX_MISSED_PONGS }
+        Self {
+            ping_period: PING_PERIOD,
+            pong_deadline: PONG_DEADLINE,
+            max_missed: MAX_MISSED_PONGS,
+        }
     }
 }
 
@@ -53,8 +61,17 @@ pub const EVENT_CAPACITY: usize = 1024;
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Batch(DataBatch),
-    State { handle: u32, state: CoreState, detail: String },
-    DriverError { handle: Option<u32>, kind: String, code: String, message: String },
+    State {
+        handle: u32,
+        state: CoreState,
+        detail: String,
+    },
+    DriverError {
+        handle: Option<u32>,
+        kind: String,
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -184,8 +201,7 @@ impl Session {
             body: Some(pb::envelope::Body::Welcome(pb::Welcome {
                 core_version: format!("Mesad v{}", env!("CARGO_PKG_VERSION")),
                 accepted_protocol_major: mesa_driver_protocol::PROTOCOL_MAJOR,
-                accepted_protocol_minor: mesa_driver_protocol::PROTOCOL_MINOR
-                    .min(hello.protocol_minor),
+                accepted_protocol_minor: mesa_driver_protocol::PROTOCOL_MINOR,
             })),
         };
         write_envelope(&mut wr, &welcome).await?;
@@ -225,8 +241,10 @@ impl Session {
                 // 心跳 id 使用独立高位段，不与请求计数器交互
                 let id = HB_ID.fetch_sub(1, Ordering::Relaxed);
                 let rx = hb_shared.register(id);
-                let env =
-                    pb::Envelope { msg_id: id, body: Some(pb::envelope::Body::Ping(pb::Ping {})) };
+                let env = pb::Envelope {
+                    msg_id: id,
+                    body: Some(pb::envelope::Body::Ping(pb::Ping {})),
+                };
                 let wrote = {
                     let mut w = hb_shared.writer.lock().await;
                     write_envelope(&mut *w, &env).await.is_ok()
@@ -247,7 +265,12 @@ impl Session {
         });
 
         Ok((
-            Self { port, shared, next_msg_id: AtomicU64::new(100), reader_cancel },
+            Self {
+                port,
+                shared,
+                next_msg_id: AtomicU64::new(100),
+                reader_cancel,
+            },
             events_rx,
             unresponsive_flag,
         ))
@@ -265,7 +288,9 @@ impl Session {
 
     /// GetMetadata：返回 (driver_id, name, version)。
     pub async fn metadata(&self) -> Result<(String, String, String), SessionError> {
-        let reply = self.call(pb::envelope::Body::GetMetadata(pb::GetMetadata {})).await?;
+        let reply = self
+            .call(pb::envelope::Body::GetMetadata(pb::GetMetadata {}))
+            .await?;
         match reply.body {
             Some(pb::envelope::Body::MetadataReport(m)) => Ok((m.driver_id, m.name, m.version)),
             _ => Err(SessionError::Closed),
@@ -276,7 +301,10 @@ impl Session {
     pub async fn call(&self, body: pb::envelope::Body) -> Result<pb::Envelope, SessionError> {
         let id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
         let rx = self.shared.register(id);
-        let env = pb::Envelope { msg_id: id, body: Some(body) };
+        let env = pb::Envelope {
+            msg_id: id,
+            body: Some(body),
+        };
         {
             let mut wr = self.shared.writer.lock().await;
             write_envelope(&mut *wr, &env).await?;
@@ -294,7 +322,10 @@ impl Session {
     /// 发送后不等响应（主动断开前的通知类消息）。
     pub async fn post(&self, body: pb::envelope::Body) -> Result<(), SessionError> {
         let id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
-        let env = pb::Envelope { msg_id: id, body: Some(body) };
+        let env = pb::Envelope {
+            msg_id: id,
+            body: Some(body),
+        };
         let mut wr = self.shared.writer.lock().await;
         write_envelope(&mut *wr, &env).await?;
         Ok(())
@@ -325,51 +356,50 @@ async fn reader_loop(mut rd: OwnedReadHalf, shared: Arc<Shared>, cancel: Cancell
             if let Some(tx) = sender {
                 let _ = tx.send(env.clone());
             }
-            if is_driver_error {
-                if let Some(Body::DriverError(e)) = env.body {
-                    let d = e.detail.unwrap_or_default();
-                    let ev = SessionEvent::DriverError {
-                        handle: e.connection_handle,
-                        kind: d.kind,
-                        code: d.code,
-                        message: d.message,
-                    };
-                    let _ = shared.events_tx.try_send(ev);
-                }
-            }
-            continue;
-        }
-        // 2) 其余帧转为上行事件
-        let ev = match env.body {
-            Some(Body::DataBatch(b)) => batch_from_pb(b).ok().map(SessionEvent::Batch),
-            Some(Body::ConnectionStateChanged(s)) => connection_state_from_pb(&s.state)
-                .ok()
-                .map(|state| SessionEvent::State {
-                    handle: s.connection_handle,
-                    state,
-                    detail: s.detail,
-                }),
-            Some(Body::DriverError(e)) => {
+            if is_driver_error && let Some(Body::DriverError(e)) = env.body {
                 let d = e.detail.unwrap_or_default();
-                Some(SessionEvent::DriverError {
+                let ev = SessionEvent::DriverError {
                     handle: e.connection_handle,
                     kind: d.kind,
                     code: d.code,
                     message: d.message,
-                })
+                };
+                let _ = shared.events_tx.try_send(ev);
             }
-            other => {
-                tracing::debug!(?other, "unsolicited envelope ignored");
-                None
-            }
-        };
-        if let Some(ev) = ev {
-            if shared.events_tx.try_send(ev).is_err() {
-                // 洪峰丢弃计数：诊断可见（§17），绝不阻塞 reader
-                let n = shared.dropped_events.fetch_add(1, Ordering::Relaxed) + 1;
-                if n % 1000 == 1 {
-                    tracing::warn!(dropped = n, "event queue overflow");
+            continue;
+        }
+        // 2) 其余帧转为上行事件
+        let ev =
+            match env.body {
+                Some(Body::DataBatch(b)) => batch_from_pb(b).ok().map(SessionEvent::Batch),
+                Some(Body::ConnectionStateChanged(s)) => connection_state_from_pb(&s.state)
+                    .ok()
+                    .map(|state| SessionEvent::State {
+                        handle: s.connection_handle,
+                        state,
+                        detail: s.detail,
+                    }),
+                Some(Body::DriverError(e)) => {
+                    let d = e.detail.unwrap_or_default();
+                    Some(SessionEvent::DriverError {
+                        handle: e.connection_handle,
+                        kind: d.kind,
+                        code: d.code,
+                        message: d.message,
+                    })
                 }
+                other => {
+                    tracing::debug!(?other, "unsolicited envelope ignored");
+                    None
+                }
+            };
+        if let Some(ev) = ev
+            && shared.events_tx.try_send(ev).is_err()
+        {
+            // 洪峰丢弃计数：诊断可见（§17），绝不阻塞 reader
+            let n = shared.dropped_events.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 1000 == 1 {
+                tracing::warn!(dropped = n, "event queue overflow");
             }
         }
     }

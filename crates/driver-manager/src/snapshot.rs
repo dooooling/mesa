@@ -37,8 +37,7 @@ fn value_to_json(v: &mesa_core_types::Value) -> ValueJson {
         | V::F32Array(_)
         | V::F64Array(_)
         | V::StringArray(_)
-        | V::DateTimeArray(_)) =>
-        {
+        | V::DateTimeArray(_)) => {
             use mesa_core_types::Value::*;
             let (name, arr): (&str, Vec<serde_json::Value>) = match arrays {
                 BoolArray(xs) => ("bool[]", xs.iter().map(|b| serde_json::json!(b)).collect()),
@@ -48,16 +47,23 @@ fn value_to_json(v: &mesa_core_types::Value) -> ValueJson {
                 U64Array(xs) => ("u64[]", xs.iter().map(|b| serde_json::json!(b)).collect()),
                 F32Array(xs) => ("f32[]", xs.iter().map(|b| serde_json::json!(b)).collect()),
                 F64Array(xs) => ("f64[]", xs.iter().map(|b| serde_json::json!(b)).collect()),
-                StringArray(xs) => ("string[]", xs.iter().map(|b| serde_json::json!(b)).collect()),
-                DateTimeArray(xs) => {
-                    ("datetime_ns[]", xs.iter().map(|b| serde_json::json!(b)).collect())
-                }
+                StringArray(xs) => (
+                    "string[]",
+                    xs.iter().map(|b| serde_json::json!(b)).collect(),
+                ),
+                DateTimeArray(xs) => (
+                    "datetime_ns[]",
+                    xs.iter().map(|b| serde_json::json!(b)).collect(),
+                ),
                 _ => unreachable!("matched above"),
             };
             (name, serde_json::Value::Array(arr))
         }
     };
-    ValueJson { type_name: type_name.into(), value }
+    ValueJson {
+        type_name: type_name.into(),
+        value,
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,7 +126,10 @@ impl Snapshot {
     }
 
     pub fn upsert_endpoint(&self, status: EndpointStatus) {
-        self.endpoints.lock().unwrap().insert(status.endpoint_id.clone(), status);
+        self.endpoints
+            .lock()
+            .unwrap()
+            .insert(status.endpoint_id.clone(), status);
     }
 
     pub fn endpoints(&self) -> Vec<EndpointStatus> {
@@ -135,11 +144,7 @@ impl Snapshot {
 
     /// 记录点元数据（ApplyPointMap 时）：point_id -> point_key，
     /// 供 latest 输出回填可读键名；数据类型由值本身携带（ValueJson.type）。
-    pub fn register_points(
-        &self,
-        endpoint_id: &str,
-        defs: &[mesa_core_types::PointDefinition],
-    ) {
+    pub fn register_points(&self, endpoint_id: &str, defs: &[mesa_core_types::PointDefinition]) {
         let mut keys = self.keys.lock().unwrap();
         for d in defs {
             keys.insert((endpoint_id.to_string(), d.point_id), d.point_key.clone());
@@ -183,7 +188,9 @@ impl Snapshot {
     pub fn latest_all(&self) -> Vec<LatestEntry> {
         let mut v: Vec<_> = self.latest.lock().unwrap().values().cloned().collect();
         v.sort_by(|a, b| {
-            a.endpoint_id.cmp(&b.endpoint_id).then(a.point_id.cmp(&b.point_id))
+            a.endpoint_id
+                .cmp(&b.endpoint_id)
+                .then(a.point_id.cmp(&b.point_id))
         });
         v
     }

@@ -13,19 +13,28 @@ async fn ipc_latency_p95_p99() {
         for _ in 0..2000 {
             ticker.tick().await;
             // 用 send().await 避免 try_send 丢包导致接收端永久等待
-            if tx.send(Instant::now()).await.is_err() { break; }
+            if tx.send(Instant::now()).await.is_err() {
+                break;
+            }
         }
     });
     let mut latencies: Vec<Duration> = Vec::with_capacity(2000);
     while let Some(sent) = rx.recv().await {
         latencies.push(sent.elapsed());
-        if latencies.len() >= 2000 { break; }
+        if latencies.len() >= 2000 {
+            break;
+        }
     }
     let _ = send_task.await;
     latencies.sort();
-    let p95 = latencies[ (latencies.len() as f64 * 0.95) as usize ];
-    let p99 = latencies[ (latencies.len() as f64 * 0.99) as usize ];
-    println!("ipc p95={:?} p99={:?} samples={}", p95, p99, latencies.len());
+    let p95 = latencies[(latencies.len() as f64 * 0.95) as usize];
+    let p99 = latencies[(latencies.len() as f64 * 0.99) as usize];
+    println!(
+        "ipc p95={:?} p99={:?} samples={}",
+        p95,
+        p99,
+        latencies.len()
+    );
     // 同机回环阈值（§22 p95≤20ms p99≤50ms，含队列合并时应更低）
     assert!(p95 <= Duration::from_millis(20), "p95 {p95:?} >20ms");
     assert!(p99 <= Duration::from_millis(50), "p99 {p99:?} >50ms");

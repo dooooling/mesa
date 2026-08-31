@@ -4,14 +4,19 @@
 
 fn main() {
     let port: u16 = match std::env::args().nth(2).or_else(|| std::env::args().nth(1)) {
-        Some(arg) => arg.parse().unwrap_or_else(|_| panic!("invalid --port value {arg}")),
+        Some(arg) => arg
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid --port value {arg}")),
         None => panic!("usage: Mesa-driver-s7 --port <u16>"),
     };
 
     let session_token = mesa_driver_sdk::read_session_token_from_stdin();
     mesa_driver_sdk::spawn_parent_liveness_guard();
 
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("build tokio runtime");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
 
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
@@ -28,7 +33,8 @@ fn main() {
         }
 
         if let Err(e) =
-            mesa_driver_sdk::serve(mesa_driver_s7::S7Driver, listener, session_token, shutdown).await
+            mesa_driver_sdk::serve(mesa_driver_s7::S7Driver, listener, session_token, shutdown)
+                .await
         {
             eprintln!("s7 driver exited with error: {e}");
             std::process::exit(1);

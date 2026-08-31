@@ -57,97 +57,158 @@ pub fn parse_address(input: &str) -> Result<OpcUaAddress, AddressError> {
     }
     let parts: Vec<&str> = s.split(';').filter(|p| !p.is_empty()).collect();
     if parts.is_empty() {
-        return Err(AddressError::Invalid { input: raw_input.to_string(), reason: "格式需如 ns=2;i=1234 或 ns=2;s=MyVar".into() });
+        return Err(AddressError::Invalid {
+            input: raw_input.to_string(),
+            reason: "格式需如 ns=2;i=1234 或 ns=2;s=MyVar".into(),
+        });
     }
 
     let mut namespace: Option<u16> = None;
     let mut identifier: Option<Identifier> = None;
 
     for part in parts {
-        let (k, v) = part.split_once('=').ok_or_else(|| AddressError::Invalid { input: raw_input.to_string(), reason: format!("分段 `{part}` 需含 =，如 ns=2 或 i=42") })?;
+        let (k, v) = part.split_once('=').ok_or_else(|| AddressError::Invalid {
+            input: raw_input.to_string(),
+            reason: format!("分段 `{part}` 需含 =，如 ns=2 或 i=42"),
+        })?;
         let key = k.trim().to_ascii_lowercase();
         let val = v.trim();
         if val.is_empty() {
-            return Err(AddressError::Invalid { input: raw_input.to_string(), reason: format!("`{key}` 的值不能为空") });
+            return Err(AddressError::Invalid {
+                input: raw_input.to_string(),
+                reason: format!("`{key}` 的值不能为空"),
+            });
         }
         match key.as_str() {
             "ns" => {
                 if namespace.is_some() {
-                    return Err(AddressError::Invalid { input: raw_input.to_string(), reason: "ns 重复".into() });
+                    return Err(AddressError::Invalid {
+                        input: raw_input.to_string(),
+                        reason: "ns 重复".into(),
+                    });
                 }
-                let n: u32 = val.parse().map_err(|_| AddressError::Invalid { input: raw_input.to_string(), reason: format!("ns `{val}` 非法，需 0..{MAX_NAMESPACE}") })?;
+                let n: u32 = val.parse().map_err(|_| AddressError::Invalid {
+                    input: raw_input.to_string(),
+                    reason: format!("ns `{val}` 非法，需 0..{MAX_NAMESPACE}"),
+                })?;
                 if n > MAX_NAMESPACE {
-                    return Err(AddressError::Invalid { input: raw_input.to_string(), reason: format!("ns 必须 0..{MAX_NAMESPACE}") });
+                    return Err(AddressError::Invalid {
+                        input: raw_input.to_string(),
+                        reason: format!("ns 必须 0..{MAX_NAMESPACE}"),
+                    });
                 }
                 namespace = Some(n as u16);
             }
             "i" => {
                 if identifier.is_some() {
-                    return Err(AddressError::Invalid { input: raw_input.to_string(), reason: "标识符重复（i/s/g/b 只能选一）".into() });
+                    return Err(AddressError::Invalid {
+                        input: raw_input.to_string(),
+                        reason: "标识符重复（i/s/g/b 只能选一）".into(),
+                    });
                 }
                 // Numeric 允许 u32，无符号
-                let n: u32 = val.parse().map_err(|_| AddressError::Invalid { input: raw_input.to_string(), reason: format!("i `{val}` 非法，需无符号整数") })?;
+                let n: u32 = val.parse().map_err(|_| AddressError::Invalid {
+                    input: raw_input.to_string(),
+                    reason: format!("i `{val}` 非法，需无符号整数"),
+                })?;
                 identifier = Some(Identifier::Numeric(n));
             }
             "s" => {
                 if identifier.is_some() {
-                    return Err(AddressError::Invalid { input: raw_input.to_string(), reason: "标识符重复（i/s/g/b 只能选一）".into() });
+                    return Err(AddressError::Invalid {
+                        input: raw_input.to_string(),
+                        reason: "标识符重复（i/s/g/b 只能选一）".into(),
+                    });
                 }
                 // String 标识符：保留原大小写（已去空格），但 OPC UA 字符串区分大小写
                 // 这里 v 来自去空格后的 s，若用户原始含空格已归一化，属容忍行为
                 if val.is_empty() {
-                    return Err(AddressError::Invalid { input: raw_input.to_string(), reason: "s 字符串标识符不能为空".into() });
+                    return Err(AddressError::Invalid {
+                        input: raw_input.to_string(),
+                        reason: "s 字符串标识符不能为空".into(),
+                    });
                 }
                 identifier = Some(Identifier::String(val.to_string()));
             }
             "g" => {
                 if identifier.is_some() {
-                    return Err(AddressError::Invalid { input: raw_input.to_string(), reason: "标识符重复（i/s/g/b 只能选一）".into() });
+                    return Err(AddressError::Invalid {
+                        input: raw_input.to_string(),
+                        reason: "标识符重复（i/s/g/b 只能选一）".into(),
+                    });
                 }
                 // GUID 校验：形如 72962B91-FA75-4A99-8A64-03D6D025A2DA（8-4-4-4-12 十六进制）
                 if !is_valid_guid(val) {
-                    return Err(AddressError::Invalid { input: raw_input.to_string(), reason: format!("g GUID `{val}` 非法，需 8-4-4-4-12 十六进制") });
+                    return Err(AddressError::Invalid {
+                        input: raw_input.to_string(),
+                        reason: format!("g GUID `{val}` 非法，需 8-4-4-4-12 十六进制"),
+                    });
                 }
                 identifier = Some(Identifier::Guid(val.to_string()));
             }
             "b" => {
                 if identifier.is_some() {
-                    return Err(AddressError::Invalid { input: raw_input.to_string(), reason: "标识符重复（i/s/g/b 只能选一）".into() });
+                    return Err(AddressError::Invalid {
+                        input: raw_input.to_string(),
+                        reason: "标识符重复（i/s/g/b 只能选一）".into(),
+                    });
                 }
                 // Opaque：要求 Base64 字符集，长度不限但不能为空
                 if !is_valid_base64(val) {
-                    return Err(AddressError::Invalid { input: raw_input.to_string(), reason: format!("b Opaque `{val}` 非法，需 Base64 字符") });
+                    return Err(AddressError::Invalid {
+                        input: raw_input.to_string(),
+                        reason: format!("b Opaque `{val}` 非法，需 Base64 字符"),
+                    });
                 }
                 identifier = Some(Identifier::Opaque(val.to_string()));
             }
             _ => {
-                return Err(AddressError::Invalid { input: raw_input.to_string(), reason: format!("未知分段 `{key}`，期望 ns/i/s/g/b") });
+                return Err(AddressError::Invalid {
+                    input: raw_input.to_string(),
+                    reason: format!("未知分段 `{key}`，期望 ns/i/s/g/b"),
+                });
             }
         }
     }
 
-    let ident = identifier.ok_or_else(|| AddressError::Invalid { input: raw_input.to_string(), reason: "缺少标识符（i/s/g/b 需选其一），如 ns=2;i=1234".into() })?;
+    let ident = identifier.ok_or_else(|| AddressError::Invalid {
+        input: raw_input.to_string(),
+        reason: "缺少标识符（i/s/g/b 需选其一），如 ns=2;i=1234".into(),
+    })?;
     let ns = namespace.unwrap_or(0);
 
-    Ok(OpcUaAddress { namespace: ns, identifier: ident, raw: raw_input.to_string() })
+    Ok(OpcUaAddress {
+        namespace: ns,
+        identifier: ident,
+        raw: raw_input.to_string(),
+    })
 }
 
 fn is_valid_guid(s: &str) -> bool {
     // 8-4-4-4-12 且均为 hex
     let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 5 { return false; }
+    if parts.len() != 5 {
+        return false;
+    }
     let lens = [8, 4, 4, 4, 12];
     for (p, &exp) in parts.iter().zip(lens.iter()) {
-        if p.len() != exp { return false; }
-        if !p.chars().all(|c| c.is_ascii_hexdigit()) { return false; }
+        if p.len() != exp {
+            return false;
+        }
+        if !p.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
     }
     true
 }
 
 fn is_valid_base64(s: &str) -> bool {
-    if s.is_empty() { return false; }
+    if s.is_empty() {
+        return false;
+    }
     // 允许 A-Za-z0-9+/= 填充
-    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
 }
 
 #[cfg(test)]
@@ -171,15 +232,31 @@ mod tests {
 
     #[test]
     fn string_forms() {
-        ok("ns=2;s=Motor.Speed", 2, Identifier::String("Motor.Speed".into()));
-        ok("ns=2;s=HelloWorld", 2, Identifier::String("HelloWorld".into()));
+        ok(
+            "ns=2;s=Motor.Speed",
+            2,
+            Identifier::String("Motor.Speed".into()),
+        );
+        ok(
+            "ns=2;s=HelloWorld",
+            2,
+            Identifier::String("HelloWorld".into()),
+        );
         ok("s=MyVar", 0, Identifier::String("MyVar".into()));
     }
 
     #[test]
     fn guid_and_opaque() {
-        ok("ns=2;g=72962B91-FA75-4A99-8A64-03D6D025A2DA", 2, Identifier::Guid("72962B91-FA75-4A99-8A64-03D6D025A2DA".into()));
-        ok("ns=1;b=M/RbKBsRVkePCePcx24oRA==", 1, Identifier::Opaque("M/RbKBsRVkePCePcx24oRA==".into()));
+        ok(
+            "ns=2;g=72962B91-FA75-4A99-8A64-03D6D025A2DA",
+            2,
+            Identifier::Guid("72962B91-FA75-4A99-8A64-03D6D025A2DA".into()),
+        );
+        ok(
+            "ns=1;b=M/RbKBsRVkePCePcx24oRA==",
+            1,
+            Identifier::Opaque("M/RbKBsRVkePCePcx24oRA==".into()),
+        );
     }
 
     #[test]

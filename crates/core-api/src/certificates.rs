@@ -11,11 +11,11 @@
 //! V1 最小能力：首启生成 own 证书、导入/删除 trusted、查看/信任 rejected、到期诊断、
 //! SecurityPolicy/MessageSecurityMode 配置透传（禁止默认忽略校验）。
 
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha1::{Sha1, Digest};
+use sha1::{Digest, Sha1};
 use x509_parser::prelude::*;
 
 const CERT_DIR: &str = "data/certificates/opcua";
@@ -48,7 +48,9 @@ pub struct CertStore {
 
 impl CertStore {
     pub fn new<P: AsRef<Path>>(base: P) -> Self {
-        Self { base: base.as_ref().to_path_buf() }
+        Self {
+            base: base.as_ref().to_path_buf(),
+        }
     }
 
     pub fn default_path() -> PathBuf {
@@ -78,9 +80,13 @@ impl CertStore {
         for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
-            if !path.is_file() { continue; }
+            if !path.is_file() {
+                continue;
+            }
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            if ext != "pem" && ext != "der" && ext != "crt" { continue; }
+            if ext != "pem" && ext != "der" && ext != "crt" {
+                continue;
+            }
             match Self::parse_file(&path) {
                 Ok(info) => out.push(info),
                 Err(e) => {
@@ -107,7 +113,8 @@ impl CertStore {
         let thumbprint = format!("{:X}", hasher.finalize());
 
         // 解析 X509
-        let (_, cert) = X509Certificate::from_der(&der).map_err(|e| format!("x509 解析失败: {e:?}"))?;
+        let (_, cert) =
+            X509Certificate::from_der(&der).map_err(|e| format!("x509 解析失败: {e:?}"))?;
         let subject = cert.subject.to_string();
         let issuer = cert.issuer.to_string();
         let not_before = cert.validity.not_before.to_string();
@@ -119,8 +126,15 @@ impl CertStore {
         let expired = not_after_dt.map(|t| t < now).unwrap_or(false);
         let days_remaining = not_after_dt.map(|t| (t - now).num_days()).unwrap_or(0);
 
-        let pem_preview = String::from_utf8_lossy(&data).chars().take(100).collect::<String>();
-        let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+        let pem_preview = String::from_utf8_lossy(&data)
+            .chars()
+            .take(100)
+            .collect::<String>();
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
 
         Ok(CertInfo {
             thumbprint,
@@ -139,9 +153,19 @@ impl CertStore {
         // ASN1Time 转 chrono：尝试解析字符串
         let s = t.to_string();
         // 尝试 RFC2822 或自定义
-        chrono::DateTime::parse_from_rfc2822(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))
-            .or_else(|| chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S UTC").ok().map(|n| n.and_utc()))
-            .or_else(|| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc)))
+        chrono::DateTime::parse_from_rfc2822(&s)
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .or_else(|| {
+                chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S UTC")
+                    .ok()
+                    .map(|n| n.and_utc())
+            })
+            .or_else(|| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            })
     }
 
     /// 导入受信任证书（PEM 文本）
@@ -183,7 +207,9 @@ impl CertStore {
     /// 删除受信任证书
     pub fn remove_trusted(&self, thumbprint: &str) -> Result<bool, String> {
         let dir = self.store_path("trusted");
-        if !dir.exists() { return Ok(false); }
+        if !dir.exists() {
+            return Ok(false);
+        }
         let tp_upper = thumbprint.to_uppercase();
         for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
@@ -228,11 +254,16 @@ impl CertStore {
         let alt_cert_path = own_dir.join("cert.der");
         let private_dir = self.base.join("private");
         let alt_key_path = private_dir.join("private.pem");
-        if cert_path.exists() && key_path.exists() && alt_cert_path.exists() && alt_key_path.exists() {
+        if cert_path.exists()
+            && key_path.exists()
+            && alt_cert_path.exists()
+            && alt_key_path.exists()
+        {
             return Ok(false);
         }
         // 使用 rcgen 生成（0.13 API）
-        let certified = rcgen::generate_simple_self_signed(vec!["Mesa-opcua".to_string()]).map_err(|e| e.to_string())?;
+        let certified = rcgen::generate_simple_self_signed(vec!["Mesa-opcua".to_string()])
+            .map_err(|e| e.to_string())?;
         let pem = certified.cert.pem();
         let key_pem = certified.key_pair.serialize_pem();
         let der = certified.cert.der().to_vec();
@@ -299,7 +330,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = CertStore::new(tmp.path());
         store.ensure_own_cert().unwrap();
-        let own_list = store.list("own").unwrap();
+        let _own_list = store.list("own").unwrap();
         let pem_path = tmp.path().join("own/own.pem");
         let pem_text = std::fs::read_to_string(&pem_path).unwrap();
         let tp = store.add_trusted(&pem_text).unwrap();

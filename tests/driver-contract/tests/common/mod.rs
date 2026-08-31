@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use mesa_core_types::{AcquisitionTask, DriverBinding, PointDescriptor, TaskMode};
-use mesa_driver_manager::session::{Session, SessionEvent, SessionError};
+use mesa_driver_manager::session::{Session, SessionError, SessionEvent};
 use mesa_driver_protocol::pb;
 use mesa_driver_sdk::{SdkFaults, serve_with_faults};
 use mesa_driver_simulator::SimulatorDriver;
@@ -34,7 +34,9 @@ pub fn init_log() {
 
 /// 仓库根目录（workspace 根）。
 pub fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
 }
 
 /// 已构建的 simulator 可执行文件路径。
@@ -47,7 +49,7 @@ pub fn sim_exe() -> PathBuf {
     let target = repo_root().join("target");
     for profile in ["debug", "release"] {
         for name in ["Mesa-driver-simulator.exe", "Mesa-driver-simulator"] {
-            let p = target.join(profile).join(&name);
+            let p = target.join(profile).join(name);
             if p.is_file() {
                 return p;
             }
@@ -72,13 +74,25 @@ pub async fn start_sim_server_with_faults(faults: SdkFaults) -> (u16, Cancellati
                 let cancel = CancellationToken::new();
                 let c = cancel.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_with_faults(SimulatorDriver, listener, TOKEN.into(), c.clone(), Some(faults)).await {
+                    if let Err(e) = serve_with_faults(
+                        SimulatorDriver,
+                        listener,
+                        TOKEN.into(),
+                        c.clone(),
+                        Some(faults),
+                    )
+                    .await
+                    {
                         eprintln!("sim server ended: {e}");
                     }
                 });
                 return (port, cancel);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse || e.raw_os_error() == Some(10055) || e.raw_os_error() == Some(10048) => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AddrInUse
+                    || e.raw_os_error() == Some(10055)
+                    || e.raw_os_error() == Some(10048) =>
+            {
                 last_err = Some(e);
                 tokio::time::sleep(Duration::from_millis(50 * (i + 1))).await;
                 continue;
@@ -153,7 +167,12 @@ pub async fn configure_tasks(
 }
 
 /// ApplyPointMap 并断言成功。
-pub async fn apply_point_map(session: &Session, handle: u32, revision: u64, map: HashMap<String, u32>) {
+pub async fn apply_point_map(
+    session: &Session,
+    handle: u32,
+    revision: u64,
+    map: HashMap<String, u32>,
+) {
     let reply = session
         .call(pb::envelope::Body::ApplyPointMap(pb::ApplyPointMap {
             connection_handle: handle,
@@ -186,7 +205,9 @@ pub async fn start_connection(session: &Session, handle: u32, epoch: u64) {
 /// StopConnection 并断言 Ack 成功（无论此前是否在运行）。
 pub async fn stop_connection(session: &Session, handle: u32) -> bool {
     let reply = session
-        .call(pb::envelope::Body::StopConnection(pb::StopConnection { connection_handle: handle }))
+        .call(pb::envelope::Body::StopConnection(pb::StopConnection {
+            connection_handle: handle,
+        }))
         .await
         .expect("stop rpc");
     match reply.body {
@@ -198,7 +219,9 @@ pub async fn stop_connection(session: &Session, handle: u32) -> bool {
 /// CloseConnection 并断言成功。
 pub async fn close_connection(session: &Session, handle: u32) {
     let reply = session
-        .call(pb::envelope::Body::CloseConnection(pb::CloseConnection { connection_handle: handle }))
+        .call(pb::envelope::Body::CloseConnection(pb::CloseConnection {
+            connection_handle: handle,
+        }))
         .await
         .expect("close rpc");
     assert!(
@@ -244,7 +267,10 @@ pub async fn configure_and_start(
 /// 在 deadline 内收取一个批次；超时 panic。
 /// State/DriverError 事件被静默跳过——断言错误事件用 [`expect_driver_error`]，
 /// 这里只关心数据面。
-pub async fn recv_batch(events: &mut tokio::sync::mpsc::Receiver<SessionEvent>, secs: u64) -> mesa_core_types::DataBatch {
+pub async fn recv_batch(
+    events: &mut tokio::sync::mpsc::Receiver<SessionEvent>,
+    secs: u64,
+) -> mesa_core_types::DataBatch {
     let deadline = std::time::Instant::now() + Duration::from_secs(secs);
     loop {
         let remain = deadline.saturating_duration_since(std::time::Instant::now());
@@ -266,7 +292,12 @@ pub async fn expect_driver_error(
     let deadline = Duration::from_secs(secs);
     loop {
         match tokio::time::timeout(deadline, events.recv()).await {
-            Ok(Some(SessionEvent::DriverError { kind, code, message, .. })) => {
+            Ok(Some(SessionEvent::DriverError {
+                kind,
+                code,
+                message,
+                ..
+            })) => {
                 return (kind, code, message);
             }
             // 配置失败也可能以错误帧之外的路径表现：请求侧直接报错

@@ -120,15 +120,25 @@ pub fn scan_drivers(root: &Path) -> Vec<DiscoveredDriver> {
 fn check_platform(m: &DriverManifest) -> (bool, Option<String>) {
     let host_os = std::env::consts::OS; // "windows" | "linux"
     let host_arch = std::env::consts::ARCH; // "x86_64"
-    if let Some(os_list) = &m.os {
-        if !os_list.iter().any(|o| o.eq_ignore_ascii_case(host_os)) {
-            return (false, Some(format!("PLATFORM_MISMATCH: os {host_os} not in {os_list:?}")));
-        }
+    if let Some(os_list) = &m.os
+        && !os_list.iter().any(|o| o.eq_ignore_ascii_case(host_os))
+    {
+        return (
+            false,
+            Some(format!(
+                "PLATFORM_MISMATCH: os {host_os} not in {os_list:?}"
+            )),
+        );
     }
-    if let Some(arch_list) = &m.arch {
-        if !arch_list.iter().any(|a| a.eq_ignore_ascii_case(host_arch)) {
-            return (false, Some(format!("PLATFORM_MISMATCH: arch {host_arch} not in {arch_list:?}")));
-        }
+    if let Some(arch_list) = &m.arch
+        && !arch_list.iter().any(|a| a.eq_ignore_ascii_case(host_arch))
+    {
+        return (
+            false,
+            Some(format!(
+                "PLATFORM_MISMATCH: arch {host_arch} not in {arch_list:?}"
+            )),
+        );
     }
     (true, None)
 }
@@ -137,26 +147,44 @@ fn check_platform(m: &DriverManifest) -> (bool, Option<String>) {
 /// 1. Manifest 同目录（部署形态）；
 /// 2. 仓库 target/{debug,release}/（开发形态：cargo build 后无需拷贝）。
 ///
+/// 大小写兼容：`driver.toml` 约定 `Mesa-driver-*`（大写 M，见方案 §15 示例），
+/// 而 `cargo build` 产物为 `mesa-driver-*`（小写，`[[bin]] name` 决定）。
+/// Windows 文件系统不区分大小写可直接命中，Linux 区分大小写，故额外做
+/// 不区分大小写的目录扫描兜底，避免跨平台静默 `executable not found`。
+///
 /// TODO: 打包阶段引入安装布局约定后收敛为单一规则（§25）。
 fn resolve_executable(dir: &Path, exe: &str) -> Option<PathBuf> {
+    // 精确匹配优先（Windows 大小写不敏感可直接命中）
     for name in [exe.to_string(), format!("{exe}.exe")] {
         let p = dir.join(&name);
         if p.is_file() {
             return Some(p);
         }
     }
+    // 大小写不敏感兜底：扫描同目录，适配 Linux 下 Mesa vs mesa 差异
+    if let Some(found) = find_case_insensitive(dir, exe) {
+        return Some(found);
+    }
     // 向上查找 target 目录（最多 5 层），适配 workspace 根在上级的情况
     let mut cur = dir.parent();
     for _ in 0..5 {
         let Some(p) = cur else { break };
         for profile in ["debug", "release"] {
-            let cand = p.join("target").join(profile).join(exe);
+            let base = p.join("target").join(profile);
+            let cand = base.join(exe);
             if cand.is_file() {
                 return Some(cand);
             }
-            let cand_exe = p.join("target").join(profile).join(format!("{exe}.exe"));
+            let cand_exe = base.join(format!("{exe}.exe"));
             if cand_exe.is_file() {
                 return Some(cand_exe);
+            }
+            // target 目录同样做大小写不敏感兜底
+            if let Some(found) = find_case_insensitive(&base, exe) {
+                return Some(found);
+            }
+            if let Some(found) = find_case_insensitive(&base, &format!("{exe}.exe")) {
+                return Some(found);
             }
         }
         cur = p.parent();
@@ -164,10 +192,29 @@ fn resolve_executable(dir: &Path, exe: &str) -> Option<PathBuf> {
     None
 }
 
+/// 在 `dir` 下不区分大小写查找 `target_name` 文件。
+fn find_case_insensitive(dir: &Path, target_name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let want = target_name.to_ascii_lowercase();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().to_ascii_lowercase() == want {
+            let p = entry.path();
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 /// 轻量 SemVer 形状校验（x.y.z 全数字）。完整 SemVer 语义校验留给发布工具链。
 fn is_semver_like(v: &str) -> bool {
     let parts: Vec<&str> = v.split('.').collect();
-    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -221,7 +268,11 @@ arch = ["{}"]
         let found = scan_drivers(&root);
         assert_eq!(found.len(), 2, "good + wrongproto, badtoml skipped");
         let sim = found.iter().find(|d| d.manifest.id == "sim").unwrap();
-        assert!(sim.launchable(), "sim must be launchable: {:?}", sim.platform_reason);
+        assert!(
+            sim.launchable(),
+            "sim must be launchable: {:?}",
+            sim.platform_reason
+        );
         let wp = found.iter().find(|d| d.manifest.id == "wp").unwrap();
         assert!(!wp.protocol_ok);
 

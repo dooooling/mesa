@@ -76,13 +76,20 @@ async fn main() {
     if std::env::var("MESA_OPCUA_PKI_DIR").is_err() {
         let pki = mesa_core_api::certificates::CertStore::default_path();
         // 安全性：早期启动单线程，环境变量写入无数据竞争
-        unsafe { std::env::set_var("MESA_OPCUA_PKI_DIR", &pki); }
+        unsafe {
+            std::env::set_var("MESA_OPCUA_PKI_DIR", &pki);
+        }
         tracing::info!(pki=%pki.display(), "set MESA_OPCUA_PKI_DIR");
     }
 
-    let app_state = mesa_core_api::AppState::new(manager.clone(), store.clone(), args.drivers_dir.clone());
+    let app_state =
+        mesa_core_api::AppState::new(manager.clone(), store.clone(), args.drivers_dir.clone());
     let api_shutdown = manager.shutdown_token().child_token();
-    let api = tokio::spawn(mesa_core_api::serve(app_state, args.http_port, api_shutdown));
+    let api = tokio::spawn(mesa_core_api::serve(
+        app_state,
+        args.http_port,
+        api_shutdown,
+    ));
 
     print_banner(args.http_port, &args.db_path);
 
@@ -147,7 +154,7 @@ fn print_banner(http_port: u16, db_path: &str) {
 
 #[cfg(unix)]
 async fn wait_for_interrupt() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
@@ -168,7 +175,11 @@ fn maybe_seed_demo(store: &ConfigStore) -> Result<bool, String> {
         return Ok(false);
     }
     // 幂等：device 已存在则复用
-    let dev = DeviceRecord { id: "sim-device".into(), name: "Simulator Device".into(), profile: None };
+    let dev = DeviceRecord {
+        id: "sim-device".into(),
+        name: "Simulator Device".into(),
+        profile: None,
+    };
     let _ = store.create_device(&dev);
     let rec = EndpointRecord {
         id: "sim-001".into(),

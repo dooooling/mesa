@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::endpoint::{run_endpoint, BuiltinEndpoint, PointIdAllocator, PointIdSource};
-use crate::manifest::{scan_drivers, DiscoveredDriver};
+use crate::endpoint::{BuiltinEndpoint, PointIdAllocator, PointIdSource, run_endpoint};
+use crate::manifest::{DiscoveredDriver, scan_drivers};
 use crate::snapshot::{DriverInfo, Snapshot};
 
 struct RunningEntry {
@@ -50,10 +50,16 @@ impl MesaManager {
                 id: d.manifest.id.clone(),
                 name: d.manifest.name.clone(),
                 version: d.manifest.version.clone(),
-                protocol: format!("{}.{}", d.manifest.protocol_major, d.manifest.protocol_minor),
+                protocol: format!(
+                    "{}.{}",
+                    d.manifest.protocol_major, d.manifest.protocol_minor
+                ),
                 launchable: d.launchable(),
                 reason: if d.platform_ok {
-                    d.executable_path.as_ref().map(|_| None).unwrap_or(Some("executable not found".into()))
+                    d.executable_path
+                        .as_ref()
+                        .map(|_| None)
+                        .unwrap_or(Some("executable not found".into()))
                 } else {
                     d.platform_reason.clone()
                 },
@@ -111,10 +117,10 @@ impl MesaManager {
         let source = Arc::clone(&self.source);
         let handle = tokio::spawn(run_endpoint(disc, cfg.clone(), snapshot, source, shutdown));
 
-        self.running.lock().unwrap().insert(
-            cfg.endpoint_id,
-            RunningEntry { cancel, handle },
-        );
+        self.running
+            .lock()
+            .unwrap()
+            .insert(cfg.endpoint_id, RunningEntry { cancel, handle });
         Ok(())
     }
 
@@ -126,7 +132,9 @@ impl MesaManager {
     /// 停止指定 Endpoint。返回是否曾处于运行态。
     pub async fn stop_endpoint(&self, endpoint_id: &str) -> bool {
         let entry = self.running.lock().unwrap().remove(endpoint_id);
-        let Some(entry) = entry else { return false; };
+        let Some(entry) = entry else {
+            return false;
+        };
         entry.cancel.cancel();
         // 等待运行任务结束，最多 10s（涵盖子进程终止宽限）
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), entry.handle).await;
@@ -143,7 +151,12 @@ impl MesaManager {
         self.shutdown.cancel();
         let handles: Vec<tokio::task::JoinHandle<()>> = {
             let mut m = self.running.lock().unwrap();
-            m.drain().map(|(_, e)| { e.cancel.cancel(); e.handle }).collect()
+            m.drain()
+                .map(|(_, e)| {
+                    e.cancel.cancel();
+                    e.handle
+                })
+                .collect()
         };
         for h in handles {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(10), h).await;

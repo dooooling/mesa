@@ -56,14 +56,21 @@ async fn quality_injection_static_and_transition() {
         bad_static.len() >= 5 && bad_static.iter().all(|q| *q == Quality::Bad),
         "static BAD point must always report BAD, got {bad_static:?}"
     );
-    assert!(cycle.len() >= 6, "must observe several batches of the cycling point");
+    assert!(
+        cycle.len() >= 6,
+        "must observe several batches of the cycling point"
+    );
     // 转换序列：第 1-2 批 GOOD，第 3-5 批 BAD，第 6 批起恢复 GOOD
     assert_eq!(cycle[0].1, Quality::Good);
     assert_eq!(cycle[1].1, Quality::Good);
     assert_eq!(cycle[2].1, Quality::Bad);
     assert_eq!(cycle[3].1, Quality::Bad);
     assert_eq!(cycle[4].1, Quality::Bad);
-    assert_eq!(cycle[5].1, Quality::Good, "quality must recover after good_again_after");
+    assert_eq!(
+        cycle[5].1,
+        Quality::Good,
+        "quality must recover after good_again_after"
+    );
 
     teardown(&mut session, Some(cancel));
 }
@@ -107,9 +114,11 @@ async fn backpressure_coalesces_and_keeps_control_responsive() {
     tokio::time::sleep(Duration::from_millis(700)).await;
 
     // 控制面在数据洪峰下必须仍然响应（Control 消息不排队在数据合并路径上）
-    let meta =
-        tokio::time::timeout(Duration::from_secs(2), session.metadata()).await;
-    assert!(meta.is_ok(), "control plane must stay responsive under data flood");
+    let meta = tokio::time::timeout(Duration::from_secs(2), session.metadata()).await;
+    assert!(
+        meta.is_ok(),
+        "control plane must stay responsive under data flood"
+    );
     assert_eq!(meta.unwrap().unwrap().0, "simulator");
 
     // 恢复消费：批次继续到达且出现 sequence 缺口（丢弃/合并的可观测证据）。
@@ -124,7 +133,10 @@ async fn backpressure_coalesces_and_keeps_control_responsive() {
         }
         last_seq = b.sequence;
     }
-    assert!(gaps > 0, "sequence gaps must be observable after consumer stall");
+    assert!(
+        gaps > 0,
+        "sequence gaps must be observable after consumer stall"
+    );
 
     teardown(&mut session, Some(cancel));
 }

@@ -4,8 +4,6 @@
 
 mod common;
 
-use std::collections::HashMap;
-
 use mesa_core_types::{AcquisitionTask, PointDescriptor, TaskMode};
 use mesa_driver_manager::session::Session;
 use mesa_driver_protocol::pb;
@@ -84,7 +82,13 @@ async fn invalid_config_returns_structured_error() {
 
     // 2) 缺少 points 数组
     let missing = vec![poll_task("t", 50, serde_json::json!({}))];
-    configure_tasks_expect_error(&mut session, &mut events, &missing, "INVALID_BINDING_CONFIG").await;
+    configure_tasks_expect_error(
+        &mut session,
+        &mut events,
+        &missing,
+        "INVALID_BINDING_CONFIG",
+    )
+    .await;
 
     // 3) Subscribe 模式不被支持
     let sub = vec![AcquisitionTask {
@@ -104,7 +108,13 @@ async fn invalid_config_returns_structured_error() {
         50,
         serde_json::json!({"points":[{"key":"x","kind":"warp_drive"}]}),
     )];
-    configure_tasks_expect_error(&mut session, &mut events, &unknown, "UNSUPPORTED_SOURCE_KIND").await;
+    configure_tasks_expect_error(
+        &mut session,
+        &mut events,
+        &unknown,
+        "UNSUPPORTED_SOURCE_KIND",
+    )
+    .await;
 
     teardown(&mut session, Some(cancel));
 }
@@ -124,8 +134,7 @@ async fn configure_tasks_expect_error(
             tasks: tasks_pb,
         }))
         .await; // 响应可能是空 ack 或直接无帧，断言以 DriverError 事件为准
-    let (_, code, _) =
-        expect_driver_error_with(session, events, expected_code).await;
+    let (_, code, _) = expect_driver_error_with(session, events, expected_code).await;
     assert_eq!(code, expected_code);
 }
 
@@ -158,8 +167,16 @@ async fn duplicate_point_key_rejected_over_ipc() {
 
     open_connection(&session, H, "{}").await;
     let dup = vec![
-        poll_task("t1", 100, serde_json::json!({"points":[{"key":"same.key","kind":"counter"}]})),
-        poll_task("t2", 100, serde_json::json!({"points":[{"key":"same.key","kind":"counter"}]})),
+        poll_task(
+            "t1",
+            100,
+            serde_json::json!({"points":[{"key":"same.key","kind":"counter"}]}),
+        ),
+        poll_task(
+            "t2",
+            100,
+            serde_json::json!({"points":[{"key":"same.key","kind":"counter"}]}),
+        ),
     ];
     let tasks_pb = mesa_driver_protocol::tasks_to_pb(&dup).unwrap();
     let _ = session
@@ -169,7 +186,8 @@ async fn duplicate_point_key_rejected_over_ipc() {
             tasks: tasks_pb,
         }))
         .await;
-    let (kind, code, _) = expect_driver_error_with(&session, &mut events, "DUPLICATE_POINT_KEY").await;
+    let (kind, code, _) =
+        expect_driver_error_with(&session, &mut events, "DUPLICATE_POINT_KEY").await;
     assert_eq!(code, "DUPLICATE_POINT_KEY");
     assert_eq!(kind, "ConfigurationError");
 
@@ -203,7 +221,8 @@ async fn failed_reconfigure_keeps_previous_snapshot() {
             tasks: tasks_pb,
         }))
         .await;
-    let (_, code, _) = expect_driver_error_with(&session, &mut events, "UNSUPPORTED_SOURCE_KIND").await;
+    let (_, code, _) =
+        expect_driver_error_with(&session, &mut events, "UNSUPPORTED_SOURCE_KIND").await;
     assert_eq!(code, "UNSUPPORTED_SOURCE_KIND");
 
     // 旧快照仍然有效：按 rev1 的描述符分配 id 并启动，数据照常流出
@@ -212,7 +231,11 @@ async fn failed_reconfigure_keeps_previous_snapshot() {
     start_connection(&session, H, 42).await;
     let b = recv_batch(&mut events, 3).await;
     assert_eq!(b.stream_epoch, 42);
-    assert!(b.values.iter().all(|v| v.point_id >= 100 && v.point_id <= 101));
+    assert!(
+        b.values
+            .iter()
+            .all(|v| v.point_id >= 100 && v.point_id <= 101)
+    );
 
     teardown(&mut session, Some(cancel));
 }
@@ -226,7 +249,10 @@ async fn point_registration_stable_across_configures() {
     open_connection(&session, H, "{}").await;
     let d1 = configure_tasks(&session, H, 1, &[poll_task("t", 100, two_points())]).await;
     let d2 = configure_tasks(&session, H, 2, &[poll_task("t", 100, two_points())]).await;
-    assert_eq!(d1, d2, "descriptor set must be stable across identical reconfigures");
+    assert_eq!(
+        d1, d2,
+        "descriptor set must be stable across identical reconfigures"
+    );
 
     teardown(&mut session_drop(session), Some(cancel));
 }
@@ -251,7 +277,10 @@ async fn start_stop_idempotent_without_leaks() {
     assert_no_batches_for(&mut events, 300).await;
 
     // 未运行时再次 Stop 幂等成功
-    assert!(stop_connection(&session, H).await, "double stop must be idempotent");
+    assert!(
+        stop_connection(&session, H).await,
+        "double stop must be idempotent"
+    );
 
     // 第二轮运行（新 epoch）
     start_connection(&session, H, 22).await;
@@ -282,7 +311,10 @@ async fn start_while_running_is_rejected() {
         .unwrap();
     match reply.body {
         Some(pb::envelope::Body::StartConnectionAck(a)) => {
-            assert!(!ack_ok_raw(a.result.as_ref()), "start while running must fail");
+            assert!(
+                !ack_ok_raw(a.result.as_ref()),
+                "start while running must fail"
+            );
         }
         other => panic!("unexpected {other:?}"),
     }
@@ -328,7 +360,10 @@ async fn multiple_connections_and_partial_failure_isolation() {
             break;
         }
     }
-    assert!(seen_a && seen_b, "both connections must stream concurrently");
+    assert!(
+        seen_a && seen_b,
+        "both connections must stream concurrently"
+    );
 
     // Partial failure：连接 B 配置一个非法任务被拒，A 不受影响继续出数
     let broken = vec![poll_task(
@@ -354,7 +389,10 @@ async fn multiple_connections_and_partial_failure_isolation() {
             break;
         }
     }
-    assert!(got_a_after_failure, "connection A must keep flowing after B's failure");
+    assert!(
+        got_a_after_failure,
+        "connection A must keep flowing after B's failure"
+    );
 
     teardown(&mut session, Some(cancel));
 }
@@ -385,18 +423,16 @@ async fn runtime_reconfigure_swaps_epoch_and_points() {
     apply_point_map(&session, H, 2, sequential_ids(&new_desc, 77)).await;
     start_connection(&session, H, 222).await;
 
-    let mut saw_new = false;
-    for _ in 0..5 {
-        let b = recv_batch(&mut events, 3).await;
-        assert_eq!(b.stream_epoch, 222, "all batches after reconfigure carry the new epoch");
-        assert!(
-            b.values.iter().all(|v| v.point_id == 77),
-            "only the new point set may appear"
-        );
-        saw_new = true;
-        break;
-    }
-    assert!(saw_new);
+    // 验证重配置后新 epoch/新点位已生效（取首个 batch 即可，无需循环）
+    let b = recv_batch(&mut events, 3).await;
+    assert_eq!(
+        b.stream_epoch, 222,
+        "all batches after reconfigure carry the new epoch"
+    );
+    assert!(
+        b.values.iter().all(|v| v.point_id == 77),
+        "only the new point set may appear"
+    );
 
     teardown(&mut session, Some(cancel));
 }

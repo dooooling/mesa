@@ -1,12 +1,17 @@
-use mesa_driver_focas2::{parse_address, FakeFocasApi, NativeFocasApi, FocasApi};
+use mesa_driver_focas2::{FocasApi, NativeFocasApi, parse_address};
 #[tokio::main]
 async fn main() {
     let api = NativeFocasApi::new();
-    let host = std::env::args().nth(1).unwrap_or_else(|| "192.168.15.165".into());
+    let host = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "192.168.15.165".into());
     println!("connecting to {}:8193 ...", host);
     match api.connect(&host, 8193, 5000).await {
         Ok(()) => println!("connect OK"),
-        Err(e) => { println!("connect failed: {}", e); return; }
+        Err(e) => {
+            println!("connect failed: {}", e);
+            return;
+        }
     }
     let addrs = vec![
         parse_address("status").unwrap(),
@@ -16,7 +21,7 @@ async fn main() {
     println!("reading {:?} ...", addrs);
     match api.read_batch(&addrs).await {
         Ok(vals) => {
-            for (a,v) in addrs.iter().zip(vals.iter()) {
+            for (a, v) in addrs.iter().zip(vals.iter()) {
                 println!("{:?} -> {:?}", a, v);
             }
         }

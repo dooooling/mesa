@@ -1,8 +1,8 @@
 //! Conn-1000 无 Task/Handle 泄漏预检（Simulator only）
 //! 单 Driver 进程 1000 Handles 低速 100ms，断言无泄漏
 
-use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
 use mesa_config_store::ConfigStore;
+use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
 use mesa_driver_manager::{MesaManager, StorePointIdSource};
 use std::sync::Arc;
 
@@ -23,7 +23,10 @@ async fn conn_1000_no_leak() {
                 id: format!("t{i}"),
                 mode: TaskMode::Poll,
                 interval_ms: Some(100),
-                binding: DriverBinding { kind: "simulator.points".into(), config: serde_json::json!({"points":[{"key": format!("k{i}"), "kind":"counter"}]}) },
+                binding: DriverBinding {
+                    kind: "simulator.points".into(),
+                    config: serde_json::json!({"points":[{"key": format!("k{i}"), "kind":"counter"}]}),
+                },
             }],
         };
         mgr.start_endpoint(ep).unwrap();

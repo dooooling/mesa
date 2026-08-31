@@ -329,9 +329,7 @@ pub struct DuplicatePointKey(pub String);
 
 /// 对 Descriptor 集合做唯一性校验。Driver 在 configure 返回前自查一次，
 /// Core 写入 PointRegistry 前再审一次，形成双重保护。
-pub fn ensure_unique_point_keys(
-    descriptors: &[PointDescriptor],
-) -> Result<(), DuplicatePointKey> {
+pub fn ensure_unique_point_keys(descriptors: &[PointDescriptor]) -> Result<(), DuplicatePointKey> {
     let mut seen = std::collections::HashSet::with_capacity(descriptors.len());
     for d in descriptors {
         if !seen.insert(d.point_key.as_str()) {
@@ -429,7 +427,10 @@ mod tests {
             id: "t1".into(),
             mode,
             interval_ms: interval,
-            binding: DriverBinding { kind: "sim".into(), config: serde_json::json!({}) },
+            binding: DriverBinding {
+                kind: "sim".into(),
+                config: serde_json::json!({}),
+            },
         };
         assert_eq!(
             mk(TaskMode::Poll, None).validate(),
@@ -450,7 +451,10 @@ mod tests {
             id: "  ".into(),
             mode: TaskMode::Subscribe,
             interval_ms: None,
-            binding: DriverBinding { kind: "k".into(), config: serde_json::json!({}) },
+            binding: DriverBinding {
+                kind: "k".into(),
+                config: serde_json::json!({}),
+            },
         };
         assert_eq!(t.validate(), Err(TaskValidationError::EmptyTaskId));
     }

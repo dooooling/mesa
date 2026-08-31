@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mesa_core_types::{ensure_unique_point_keys, ConnectionState, DataBatch, PointDefinition, PointDescriptor};
+use mesa_core_types::{
+    ConnectionState, DataBatch, PointDefinition, PointDescriptor, ensure_unique_point_keys,
+};
 use mesa_driver_protocol::pb;
 use tokio_util::sync::CancellationToken;
 
@@ -49,7 +51,11 @@ pub struct BuiltinEndpoint {
 /// Point ID 分配与 revision 供给的抽象。Core 负责稳定分配，Driver 只透传 id。
 pub trait PointIdSource: Send + Sync {
     /// 为一批 descriptor 分配稳定 id（按序返回）。实现负责持久化与墓碑复用。
-    fn assign(&self, endpoint_id: &str, descriptors: &[PointDescriptor]) -> Result<Vec<u32>, String>;
+    fn assign(
+        &self,
+        endpoint_id: &str,
+        descriptors: &[PointDescriptor],
+    ) -> Result<Vec<u32>, String>;
     /// 已知映射（重启恢复时预填）。
     fn known_map(&self, endpoint_id: &str) -> HashMap<String, u32>;
     /// 当前 revision（全量快照版本号），用于 Configure/Apply 的原子性标记。
@@ -73,24 +79,28 @@ impl PointIdAllocator {
     fn assign_keys(&self, used: &mut HashMap<String, u32>, keys: &[String]) -> Vec<u32> {
         keys.iter()
             .map(|k| {
-                *used.entry(k.clone()).or_insert_with(|| {
-                    self.next.fetch_add(1, Ordering::Relaxed) as u32 + 1
-                })
+                *used
+                    .entry(k.clone())
+                    .or_insert_with(|| self.next.fetch_add(1, Ordering::Relaxed) as u32 + 1)
             })
             .collect()
     }
 }
 
 impl PointIdSource for PointIdAllocator {
-    fn assign(&self, endpoint_id: &str, descriptors: &[PointDescriptor]) -> Result<Vec<u32>, String> {
+    fn assign(
+        &self,
+        endpoint_id: &str,
+        descriptors: &[PointDescriptor],
+    ) -> Result<Vec<u32>, String> {
         ensure_unique_point_keys(descriptors).map_err(|e| e.to_string())?;
         let mut maps = self.maps.lock().unwrap();
         let map = maps.entry(endpoint_id.to_string()).or_default();
         let mut out = Vec::with_capacity(descriptors.len());
         for d in descriptors {
-            let id = *map.entry(d.point_key.clone()).or_insert_with(|| {
-                self.next.fetch_add(1, Ordering::Relaxed) as u32 + 1
-            });
+            let id = *map
+                .entry(d.point_key.clone())
+                .or_insert_with(|| self.next.fetch_add(1, Ordering::Relaxed) as u32 + 1);
             out.push(id);
         }
         // 内存版 revision：首次 assign 后记为 1，后续保持
@@ -102,11 +112,21 @@ impl PointIdSource for PointIdAllocator {
     }
 
     fn known_map(&self, endpoint_id: &str) -> HashMap<String, u32> {
-        self.maps.lock().unwrap().get(endpoint_id).cloned().unwrap_or_default()
+        self.maps
+            .lock()
+            .unwrap()
+            .get(endpoint_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn revision(&self, endpoint_id: &str) -> u64 {
-        *self.revisions.lock().unwrap().get(endpoint_id).unwrap_or(&1)
+        *self
+            .revisions
+            .lock()
+            .unwrap()
+            .get(endpoint_id)
+            .unwrap_or(&1)
     }
 }
 
@@ -122,14 +142,24 @@ impl StorePointIdSource {
 }
 
 impl PointIdSource for StorePointIdSource {
-    fn assign(&self, endpoint_id: &str, descriptors: &[PointDescriptor]) -> Result<Vec<u32>, String> {
+    fn assign(
+        &self,
+        endpoint_id: &str,
+        descriptors: &[PointDescriptor],
+    ) -> Result<Vec<u32>, String> {
         let defs = self
             .store
             .assign_point_ids(endpoint_id, descriptors)
             .map_err(|e| e.to_string())?;
         // 保持输入顺序返回
-        let by_key: HashMap<&str, u32> = defs.iter().map(|d| (d.point_key.as_str(), d.point_id)).collect();
-        Ok(descriptors.iter().map(|d| by_key[d.point_key.as_str()]).collect())
+        let by_key: HashMap<&str, u32> = defs
+            .iter()
+            .map(|d| (d.point_key.as_str(), d.point_id))
+            .collect();
+        Ok(descriptors
+            .iter()
+            .map(|d| by_key[d.point_key.as_str()])
+            .collect())
     }
 
     fn known_map(&self, endpoint_id: &str) -> HashMap<String, u32> {
@@ -157,11 +187,27 @@ pub async fn run_endpoint(
     let mut id_map: HashMap<String, u32> = source.known_map(&cfg.endpoint_id);
     let mut last_epoch: u64 = 0;
 
-    set_status(&snapshot, &cfg, ConnectionState::Connecting, "", id_map.len(), last_epoch, source.revision(&cfg.endpoint_id));
+    set_status(
+        &snapshot,
+        &cfg,
+        ConnectionState::Connecting,
+        "",
+        id_map.len(),
+        last_epoch,
+        source.revision(&cfg.endpoint_id),
+    );
 
     loop {
         if shutdown.is_cancelled() {
-            set_status(&snapshot, &cfg, ConnectionState::Stopped, "stopped", id_map.len(), last_epoch, source.revision(&cfg.endpoint_id));
+            set_status(
+                &snapshot,
+                &cfg,
+                ConnectionState::Stopped,
+                "stopped",
+                id_map.len(),
+                last_epoch,
+                source.revision(&cfg.endpoint_id),
+            );
             return;
         }
 
@@ -177,12 +223,28 @@ pub async fn run_endpoint(
         .await
         {
             AttemptOutcome::Shutdown => {
-                set_status(&snapshot, &cfg, ConnectionState::Stopped, "stopped", id_map.len(), last_epoch, source.revision(&cfg.endpoint_id));
+                set_status(
+                    &snapshot,
+                    &cfg,
+                    ConnectionState::Stopped,
+                    "stopped",
+                    id_map.len(),
+                    last_epoch,
+                    source.revision(&cfg.endpoint_id),
+                );
                 return;
             }
             AttemptOutcome::ConfigurationFailed(detail) => {
                 tracing::error!(endpoint = %cfg.endpoint_id, %detail, "configuration error, no retry");
-                set_status(&snapshot, &cfg, ConnectionState::Failed, &detail, id_map.len(), last_epoch, source.revision(&cfg.endpoint_id));
+                set_status(
+                    &snapshot,
+                    &cfg,
+                    ConnectionState::Failed,
+                    &detail,
+                    id_map.len(),
+                    last_epoch,
+                    source.revision(&cfg.endpoint_id),
+                );
                 return;
             }
             AttemptOutcome::Lost(reason) => {
@@ -273,10 +335,25 @@ async fn attempt_session(
         }
     }
 
-    set_status(snapshot, cfg, ConnectionState::Running, "", id_map.len(), *last_epoch, source.revision(&cfg.endpoint_id));
+    set_status(
+        snapshot,
+        cfg,
+        ConnectionState::Running,
+        "",
+        id_map.len(),
+        *last_epoch,
+        source.revision(&cfg.endpoint_id),
+    );
 
-    let outcome =
-        event_loop(cfg, snapshot, &session, unresponsive_flag.as_ref(), &mut events, shutdown).await;
+    let outcome = event_loop(
+        cfg,
+        snapshot,
+        &session,
+        unresponsive_flag.as_ref(),
+        &mut events,
+        shutdown,
+    )
+    .await;
 
     if !session.is_unresponsive() {
         let _ = session.post(pb_shutdown_body()).await;
@@ -342,7 +419,8 @@ async fn run_config_flow(
         .map(mesa_driver_protocol::descriptor_from_pb)
         .collect::<Result<_, _>>()
         .map_err(|e| AttemptOutcome::ConfigurationFailed(e.to_string()))?;
-    ensure_unique_point_keys(&parsed).map_err(|e| AttemptOutcome::ConfigurationFailed(e.to_string()))?;
+    ensure_unique_point_keys(&parsed)
+        .map_err(|e| AttemptOutcome::ConfigurationFailed(e.to_string()))?;
 
     // 分配稳定 point_id（持久化或内存）
     let ids = source
@@ -355,12 +433,20 @@ async fn run_config_flow(
     let defs: Vec<PointDefinition> = parsed
         .iter()
         .zip(&ids)
-        .map(|(d, &id)| PointDefinition { point_id: id, point_key: d.point_key.clone(), data_type: d.data_type, unit: d.unit.clone() })
+        .map(|(d, &id)| PointDefinition {
+            point_id: id,
+            point_key: d.point_key.clone(),
+            data_type: d.data_type,
+            unit: d.unit.clone(),
+        })
         .collect();
     snapshot.register_points(&cfg.endpoint_id, &defs);
 
     // ApplyPointMap
-    let map: HashMap<String, u32> = defs.iter().map(|d| (d.point_key.clone(), d.point_id)).collect();
+    let map: HashMap<String, u32> = defs
+        .iter()
+        .map(|d| (d.point_key.clone(), d.point_id))
+        .collect();
     let reply = session
         .call(Body::ApplyPointMap(pb::ApplyPointMap {
             connection_handle: HANDLE,
@@ -375,7 +461,10 @@ async fn run_config_flow(
     // StartConnection(new stream_epoch)
     let epoch = new_stream_epoch();
     let reply = session
-        .call(Body::StartConnection(pb::StartConnection { connection_handle: HANDLE, stream_epoch: epoch }))
+        .call(Body::StartConnection(pb::StartConnection {
+            connection_handle: HANDLE,
+            stream_epoch: epoch,
+        }))
         .await
         .map_err(|e| AttemptOutcome::Lost(format!("start rpc: {e}")))?;
     let result = expect_ack(reply.body).ok_or_else(|| lost("StartConnection"))?;
@@ -430,7 +519,9 @@ async fn event_loop(
 
 // ---- 小工具 ----
 
-fn tasks_to_pb_checked(cfg: &BuiltinEndpoint) -> Result<Vec<pb::AcquisitionTaskProto>, AttemptOutcome> {
+fn tasks_to_pb_checked(
+    cfg: &BuiltinEndpoint,
+) -> Result<Vec<pb::AcquisitionTaskProto>, AttemptOutcome> {
     mesa_driver_protocol::tasks_to_pb(&cfg.tasks)
         .map_err(|e| AttemptOutcome::ConfigurationFailed(e.to_string()))
 }

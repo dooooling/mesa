@@ -70,10 +70,7 @@ pub async fn read_envelope<R: AsyncRead + Unpin + Send>(
 
 /// 版本协商（§14.3）：Major 必须相等，否则拒绝；Minor 取双方较小值，
 /// 保证两端都只使用彼此都支持的特性集。
-pub fn negotiate(
-    driver: (u32, u32),
-    core: (u32, u32),
-) -> Result<(u32, u32), IncompatibleProtocol> {
+pub fn negotiate(driver: (u32, u32), core: (u32, u32)) -> Result<(u32, u32), IncompatibleProtocol> {
     if driver.0 != core.0 {
         return Err(IncompatibleProtocol {
             driver_major: driver.0,
@@ -254,11 +251,15 @@ pub fn task_from_pb(t: pb::AcquisitionTaskProto) -> Result<AcquisitionTask, Conv
     })
 }
 
-pub fn tasks_to_pb(tasks: &[AcquisitionTask]) -> Result<Vec<pb::AcquisitionTaskProto>, ConvertError> {
+pub fn tasks_to_pb(
+    tasks: &[AcquisitionTask],
+) -> Result<Vec<pb::AcquisitionTaskProto>, ConvertError> {
     tasks.iter().map(task_to_pb).collect()
 }
 
-pub fn tasks_from_pb(tasks: Vec<pb::AcquisitionTaskProto>) -> Result<Vec<AcquisitionTask>, ConvertError> {
+pub fn tasks_from_pb(
+    tasks: Vec<pb::AcquisitionTaskProto>,
+) -> Result<Vec<AcquisitionTask>, ConvertError> {
     tasks.into_iter().map(task_from_pb).collect()
 }
 
@@ -318,7 +319,11 @@ pub fn result_into_error(r: pb::GenericResult) -> Option<pb::ErrorDetail> {
     } else {
         r.error.or_else(|| {
             // 对端违约：ok=false 却未附错误详情，按 Internal 兜底
-            Some(error_detail(ErrorKind::Internal, "", "peer returned failure without detail"))
+            Some(error_detail(
+                ErrorKind::Internal,
+                "",
+                "peer returned failure without detail",
+            ))
         })
     }
 }
@@ -420,7 +425,9 @@ mod tests {
         buf.put_u32_le(MAX_FRAME_LEN + 1);
         let mut r = &buf.freeze()[..];
         match read_envelope(&mut r).await {
-            Err(ProtocolError::FrameTooLarge { size, .. }) => assert_eq!(size, (MAX_FRAME_LEN + 1) as u64),
+            Err(ProtocolError::FrameTooLarge { size, .. }) => {
+                assert_eq!(size, (MAX_FRAME_LEN + 1) as u64)
+            }
             other => panic!("expected FrameTooLarge, got {other:?}"),
         }
     }

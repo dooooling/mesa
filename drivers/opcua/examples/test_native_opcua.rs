@@ -1,8 +1,10 @@
-use mesa_driver_opcua::{parse_address, NativeOpcUaApi, OpcUaApi};
+use mesa_driver_opcua::{NativeOpcUaApi, OpcUaApi, parse_address};
 
 #[tokio::main]
 async fn main() {
-    let url = std::env::args().nth(1).unwrap_or("opc.tcp://uademo.prosysopc.com:53530/OPCUA/SimulationServer".to_string());
+    let url = std::env::args()
+        .nth(1)
+        .unwrap_or("opc.tcp://uademo.prosysopc.com:53530/OPCUA/SimulationServer".to_string());
     println!("connecting to {}", url);
     let api = NativeOpcUaApi::new();
     match api.connect(&url, 5000).await {

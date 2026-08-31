@@ -26,8 +26,9 @@ async fn handshake_token_mismatch_is_rejected() {
 #[tokio::test]
 async fn handshake_and_metadata_roundtrip() {
     let (port, cancel) = start_sim_server().await;
-    let (session, _events, unresponsive) =
-        Session::connect(port, TOKEN).await.expect("handshake with correct token");
+    let (session, _events, unresponsive) = Session::connect(port, TOKEN)
+        .await
+        .expect("handshake with correct token");
     assert!(!unresponsive.load(std::sync::atomic::Ordering::Relaxed));
 
     let (driver_id, name, version) = session.metadata().await.expect("metadata");
@@ -81,14 +82,22 @@ async fn databatch_epoch_sequence_semantics() {
             Err(_) => break,
         }
     }
-    assert!(batches.len() >= 3, "should receive several batches, got {}", batches.len());
+    assert!(
+        batches.len() >= 3,
+        "should receive several batches, got {}",
+        batches.len()
+    );
 
     let mut last_seq = 0;
     for b in &batches {
         assert_eq!(b.stream_epoch, EPOCH, "epoch must echo Start value");
         assert_eq!(b.connection_handle, HANDLE, "handle must be stamped by sdk");
         assert!(b.sequence > last_seq, "sequence strictly increasing");
-        assert_eq!(b.sequence - last_seq, 1, "no gap expected without backpressure");
+        assert_eq!(
+            b.sequence - last_seq,
+            1,
+            "no gap expected without backpressure"
+        );
         last_seq = b.sequence;
         assert!(b.timestamp_ns > 0, "timestamp present");
         for pv in &b.values {

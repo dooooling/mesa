@@ -6,12 +6,12 @@
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 use crate::address::{Area, S7Address};
 use crate::codec::S7Kind;
-use mesa_driver_sdk::SdkDriverError;
 use mesa_core_types::ErrorKind;
+use mesa_driver_sdk::SdkDriverError;
 
 // ---------------------------------------------------------------------------
 // 协议常量（中文注释解释“为什么”）
@@ -50,9 +50,13 @@ const S7_MAX_ITEMS_PER_PDU: usize = 19;
 const S7_ERR_ADDRESS: u8 = 0x05;
 const S7_ERR_CONTEXT: u8 = 0x04;
 const S7_ERR_ACCESS: u8 = 0x03;
+// TODO: S7 错误码预留，0x06 类型不匹配用于诊断，不直接抛错但需保留映射
+#[allow(dead_code)]
 const S7_ERR_TYPE_MISMATCH: u8 = 0x06;
 const S7_ITEM_OK: u8 = 0xFF;
 /// S7 传输层：0x04=Byte 0x03=Bit 0x10=S7 变量规范
+// TODO: S7 传输类型预留，当前批量读仅用 0x12 简化，需保留以备按类型分流
+#[allow(dead_code)]
 const S7_TRANSPORT_BYTE: u8 = 0x04;
 const S7_TRANSPORT_BIT: u8 = 0x03;
 const S7_VAR_SPEC: u8 = 0x12;
@@ -72,7 +76,14 @@ pub struct S7ConnConfig {
 
 impl Default for S7ConnConfig {
     fn default() -> Self {
-        Self { host: "127.0.0.1".into(), port: S7_DEFAULT_PORT, rack: 0, slot: 1, timeout_ms: 3000, pdu_length: S7_PDU_DEFAULT }
+        Self {
+            host: "127.0.0.1".into(),
+            port: S7_DEFAULT_PORT,
+            rack: 0,
+            slot: 1,
+            timeout_ms: 3000,
+            pdu_length: S7_PDU_DEFAULT,
+        }
     }
 }
 
@@ -85,16 +96,29 @@ impl S7ConnConfig {
         }
         if let Some(p) = v.get("port").and_then(|x| x.as_u64()) {
             if p == 0 || p > 65535 {
-                return Err(SdkDriverError::configuration("BAD_CONFIG", format!("port {} 非法", p)));
+                return Err(SdkDriverError::configuration(
+                    "BAD_CONFIG",
+                    format!("port {} 非法", p),
+                ));
             }
             cfg.port = p as u16;
         }
         if let Some(r) = v.get("rack").and_then(|x| x.as_u64()) {
-            if r > S7_MAX_RACK as u64 { return Err(SdkDriverError::configuration("BAD_CONFIG", format!("rack {} 非法，允许 0..{}", r, S7_MAX_RACK))); }
+            if r > S7_MAX_RACK as u64 {
+                return Err(SdkDriverError::configuration(
+                    "BAD_CONFIG",
+                    format!("rack {} 非法，允许 0..{}", r, S7_MAX_RACK),
+                ));
+            }
             cfg.rack = r as u8;
         }
         if let Some(s) = v.get("slot").and_then(|x| x.as_u64()) {
-            if s > S7_MAX_SLOT as u64 { return Err(SdkDriverError::configuration("BAD_CONFIG", format!("slot {} 非法，允许 0..{}", s, S7_MAX_SLOT))); }
+            if s > S7_MAX_SLOT as u64 {
+                return Err(SdkDriverError::configuration(
+                    "BAD_CONFIG",
+                    format!("slot {} 非法，允许 0..{}", s, S7_MAX_SLOT),
+                ));
+            }
             cfg.slot = s as u8;
         }
         if let Some(t) = v.get("timeout_ms").and_then(|x| x.as_u64()) {
@@ -115,7 +139,9 @@ impl S7ConnConfig {
         Ok(cfg)
     }
 
-    fn timeout(&self) -> Duration { Duration::from_millis(self.timeout_ms) }
+    fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms)
+    }
 }
 
 /// 单个读项（地址 + 类型）。
@@ -137,11 +163,26 @@ impl S7Client {
     /// 建立连接并完成握手。失败返回带诊断的 SdkDriverError。
     pub async fn connect(cfg: S7ConnConfig) -> Result<Self, SdkDriverError> {
         let addr = format!("{}:{}", cfg.host, cfg.port);
-        let stream = timeout(cfg.timeout(), TcpStream::connect(&addr)).await
-            .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "CONNECT_TIMEOUT", format!("连接 {addr} 超时（{}ms），检查 PLC 是否可达、端口 102 是否放通", cfg.timeout_ms)))?
+        let stream = timeout(cfg.timeout(), TcpStream::connect(&addr))
+            .await
+            .map_err(|_| {
+                SdkDriverError::new(
+                    ErrorKind::Timeout,
+                    "CONNECT_TIMEOUT",
+                    format!(
+                        "连接 {addr} 超时（{}ms），检查 PLC 是否可达、端口 102 是否放通",
+                        cfg.timeout_ms
+                    ),
+                )
+            })?
             .map_err(|e| map_connect_error(e, &addr, &cfg))?;
 
-        let mut client = Self { stream, pdu_ref: 1, pdu_length: cfg.pdu_length, cfg };
+        let mut client = Self {
+            stream,
+            pdu_ref: 1,
+            pdu_length: cfg.pdu_length,
+            cfg,
+        };
         client.iso_connect().await?;
         client.s7_setup().await?;
         tracing::info!(host=%client.cfg.host, port=client.cfg.port, rack=client.cfg.rack, slot=client.cfg.slot, pdu=client.pdu_length, "S7 连接建立");
@@ -151,14 +192,21 @@ impl S7Client {
     async fn iso_connect(&mut self) -> Result<(), SdkDriverError> {
         let src_tsap = S7_TSAP_BASE;
         // 经典推导：dst = 0x0100 | (rack<<5 | slot)，与 snap7/TIA Portal 兼容
-        let dst_tsap = S7_TSAP_BASE | ((self.cfg.rack as u16) << S7_TSAP_RACK_SHIFT) | (self.cfg.slot as u16);
+        let dst_tsap =
+            S7_TSAP_BASE | ((self.cfg.rack as u16) << S7_TSAP_RACK_SHIFT) | (self.cfg.slot as u16);
         let pkt = build_cotp_cr(src_tsap, dst_tsap);
-        timeout(self.cfg.timeout(), self.send_raw(&pkt)).await
+        timeout(self.cfg.timeout(), self.send_raw(&pkt))
+            .await
             .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "COTP_TIMEOUT", "COTP CR 超时"))?
-            .map_err(|e| SdkDriverError::new(ErrorKind::Connection, "COTP_SEND_FAIL", e.to_string()))?;
-        let resp = timeout(self.cfg.timeout(), self.recv_packet()).await
+            .map_err(|e| {
+                SdkDriverError::new(ErrorKind::Connection, "COTP_SEND_FAIL", e.to_string())
+            })?;
+        let resp = timeout(self.cfg.timeout(), self.recv_packet())
+            .await
             .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "COTP_TIMEOUT", "COTP CC 超时"))?
-            .map_err(|e| SdkDriverError::new(ErrorKind::Connection, "COTP_RECV_FAIL", e.to_string()))?;
+            .map_err(|e| {
+                SdkDriverError::new(ErrorKind::Connection, "COTP_RECV_FAIL", e.to_string())
+            })?;
         // COTP CC 期望 0xD0（Connection Confirm）
         if resp.len() < 6 || resp[5] != COTP_CC {
             return Err(SdkDriverError::new(
@@ -173,16 +221,30 @@ impl S7Client {
     async fn s7_setup(&mut self) -> Result<(), SdkDriverError> {
         let pkt = build_s7_setup(self.pdu_ref, self.pdu_length);
         self.pdu_ref = self.pdu_ref.wrapping_add(1).max(1);
-        timeout(self.cfg.timeout(), self.send_raw(&pkt)).await
-            .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "S7_SETUP_TIMEOUT", "S7 Setup 超时"))?
-            .map_err(|e| SdkDriverError::new(ErrorKind::Connection, "S7_SETUP_SEND_FAIL", e.to_string()))?;
-        let resp = timeout(self.cfg.timeout(), self.recv_packet()).await
-            .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "S7_SETUP_TIMEOUT", "S7 Setup 响应超时"))?
-            .map_err(|e| SdkDriverError::new(ErrorKind::Connection, "S7_SETUP_RECV_FAIL", e.to_string()))?;
+        timeout(self.cfg.timeout(), self.send_raw(&pkt))
+            .await
+            .map_err(|_| {
+                SdkDriverError::new(ErrorKind::Timeout, "S7_SETUP_TIMEOUT", "S7 Setup 超时")
+            })?
+            .map_err(|e| {
+                SdkDriverError::new(ErrorKind::Connection, "S7_SETUP_SEND_FAIL", e.to_string())
+            })?;
+        let resp = timeout(self.cfg.timeout(), self.recv_packet())
+            .await
+            .map_err(|_| {
+                SdkDriverError::new(ErrorKind::Timeout, "S7_SETUP_TIMEOUT", "S7 Setup 响应超时")
+            })?
+            .map_err(|e| {
+                SdkDriverError::new(ErrorKind::Connection, "S7_SETUP_RECV_FAIL", e.to_string())
+            })?;
         // 解析 S7 payload
         let payload = &resp[7..]; // 跳过 TPKT 4 + COTP 3
         if payload.len() < 12 {
-            return Err(SdkDriverError::new(ErrorKind::Protocol, "S7_SETUP_SHORT", format!("Setup 响应过短 {}", payload.len())));
+            return Err(SdkDriverError::new(
+                ErrorKind::Protocol,
+                "S7_SETUP_SHORT",
+                format!("Setup 响应过短 {}", payload.len()),
+            ));
         }
         // S7 ROSCTR 0x03 = Ack（0x01 为 Job）
         if payload[1] != S7_ROSCTR_ACK {
@@ -201,7 +263,10 @@ impl S7Client {
     }
 
     /// 批量读取。返回与 items 等长的 `Option<原始字节>`，`None` 表示该 item 的 S7 返回码非 0xFF（按项 BAD 隔离，不整体失败）。
-    pub async fn read_vars(&mut self, items: &[ReadItem]) -> Result<Vec<Option<Vec<u8>>>, SdkDriverError> {
+    pub async fn read_vars(
+        &mut self,
+        items: &[ReadItem],
+    ) -> Result<Vec<Option<Vec<u8>>>, SdkDriverError> {
         if items.is_empty() {
             return Ok(vec![]);
         }
@@ -210,12 +275,22 @@ impl S7Client {
         for chunk in items.chunks(S7_MAX_ITEMS_PER_PDU) {
             let pkt = build_read_req(self.pdu_ref, chunk);
             self.pdu_ref = self.pdu_ref.wrapping_add(1).max(1);
-            timeout(self.cfg.timeout(), self.send_raw(&pkt)).await
-                .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "READ_TIMEOUT", "Read 请求超时"))?
-                .map_err(|e| SdkDriverError::new(ErrorKind::Connection, "READ_SEND_FAIL", e.to_string()))?;
-            let resp = timeout(self.cfg.timeout(), self.recv_packet()).await
-                .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "READ_TIMEOUT", "Read 响应超时"))?
-                .map_err(|e| SdkDriverError::new(ErrorKind::Connection, "READ_RECV_FAIL", e.to_string()))?;
+            timeout(self.cfg.timeout(), self.send_raw(&pkt))
+                .await
+                .map_err(|_| {
+                    SdkDriverError::new(ErrorKind::Timeout, "READ_TIMEOUT", "Read 请求超时")
+                })?
+                .map_err(|e| {
+                    SdkDriverError::new(ErrorKind::Connection, "READ_SEND_FAIL", e.to_string())
+                })?;
+            let resp = timeout(self.cfg.timeout(), self.recv_packet())
+                .await
+                .map_err(|_| {
+                    SdkDriverError::new(ErrorKind::Timeout, "READ_TIMEOUT", "Read 响应超时")
+                })?
+                .map_err(|e| {
+                    SdkDriverError::new(ErrorKind::Connection, "READ_RECV_FAIL", e.to_string())
+                })?;
             let mut part = parse_read_resp(&resp, chunk)?;
             all.append(&mut part);
         }
@@ -232,11 +307,20 @@ impl S7Client {
         let mut hdr = [0u8; 4];
         self.stream.read_exact(&mut hdr).await?;
         if hdr[0] != TPKT_VERSION {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("TPKT 版本异常 {:02x}，期望 {:02x}", hdr[0], TPKT_VERSION)));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("TPKT 版本异常 {:02x}，期望 {:02x}", hdr[0], TPKT_VERSION),
+            ));
         }
         let len = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
-        if len < TPKT_MIN_LEN || len > TPKT_MAX_LEN {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("TPKT 长度非法 {}，允许 {}..{}", len, TPKT_MIN_LEN, TPKT_MAX_LEN)));
+        if !(TPKT_MIN_LEN..=TPKT_MAX_LEN).contains(&len) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "TPKT 长度非法 {}，允许 {}..{}",
+                    len, TPKT_MIN_LEN, TPKT_MAX_LEN
+                ),
+            ));
         }
         let mut buf = vec![0u8; len];
         buf[0..4].copy_from_slice(&hdr);
@@ -248,13 +332,32 @@ impl S7Client {
 fn build_cotp_cr(src: u16, dst: u16) -> Vec<u8> {
     // COTP CR：LI 0x11 / PDU type CR 0xE0 / TPDU size 0x0A=1024 / src/dst TSAP
     let mut cotp = vec![
-        0x11, COTP_CR, 0x00, 0x00, 0x00, 0x01, 0x00,
-        0xC0, 0x01, 0x0A,
-        0xC1, 0x02, ((src >> 8) as u8), (src as u8),
-        0xC2, 0x02, ((dst >> 8) as u8), (dst as u8),
+        0x11,
+        COTP_CR,
+        0x00,
+        0x00,
+        0x00,
+        0x01,
+        0x00,
+        0xC0,
+        0x01,
+        0x0A,
+        0xC1,
+        0x02,
+        ((src >> 8) as u8),
+        (src as u8),
+        0xC2,
+        0x02,
+        ((dst >> 8) as u8),
+        (dst as u8),
     ];
     let tpkt_len = (4 + cotp.len()) as u16;
-    let mut pkt = vec![TPKT_VERSION, 0x00, (tpkt_len >> 8) as u8, (tpkt_len & 0xFF) as u8];
+    let mut pkt = vec![
+        TPKT_VERSION,
+        0x00,
+        (tpkt_len >> 8) as u8,
+        (tpkt_len & 0xFF) as u8,
+    ];
     pkt.append(&mut cotp);
     pkt
 }
@@ -270,7 +373,12 @@ fn build_s7_setup(pdu_ref: u16, pdu_len: u16) -> Vec<u8> {
     // COTP Data
     let cotp = [0x02, COTP_DT, 0x80];
     let tpkt_len = (4 + cotp.len() + s7.len()) as u16;
-    let mut pkt = vec![TPKT_VERSION, 0x00, (tpkt_len >> 8) as u8, (tpkt_len & 0xFF) as u8];
+    let mut pkt = vec![
+        TPKT_VERSION,
+        0x00,
+        (tpkt_len >> 8) as u8,
+        (tpkt_len & 0xFF) as u8,
+    ];
     pkt.extend_from_slice(&cotp);
     pkt.extend_from_slice(&s7);
     pkt
@@ -312,38 +420,68 @@ fn build_read_req(pdu_ref: u16, items: &[ReadItem]) -> Vec<u8> {
     s7.extend_from_slice(&param);
     let cotp = [0x02, COTP_DT, 0x80];
     let tpkt_len = (4 + cotp.len() + s7.len()) as u16;
-    let mut pkt = vec![TPKT_VERSION, 0x00, (tpkt_len >> 8) as u8, (tpkt_len & 0xFF) as u8];
+    let mut pkt = vec![
+        TPKT_VERSION,
+        0x00,
+        (tpkt_len >> 8) as u8,
+        (tpkt_len & 0xFF) as u8,
+    ];
     pkt.extend_from_slice(&cotp);
     pkt.extend_from_slice(&s7);
     pkt
 }
 
-fn parse_read_resp(resp: &[u8], sent_items: &[ReadItem]) -> Result<Vec<Option<Vec<u8>>>, SdkDriverError> {
+fn parse_read_resp(
+    resp: &[u8],
+    sent_items: &[ReadItem],
+) -> Result<Vec<Option<Vec<u8>>>, SdkDriverError> {
     if resp.len() < 7 + 12 {
-        return Err(SdkDriverError::new(ErrorKind::Protocol, "READ_SHORT", format!("响应过短 {}", resp.len())));
+        return Err(SdkDriverError::new(
+            ErrorKind::Protocol,
+            "READ_SHORT",
+            format!("响应过短 {}", resp.len()),
+        ));
     }
     let s7 = &resp[7..];
     if s7.len() < 12 {
-        return Err(SdkDriverError::new(ErrorKind::Protocol, "S7_SHORT", "S7 头部缺失"));
+        return Err(SdkDriverError::new(
+            ErrorKind::Protocol,
+            "S7_SHORT",
+            "S7 头部缺失",
+        ));
     }
     let rosctr = s7[1];
     if rosctr != S7_ROSCTR_ACK {
         let err_class = s7.get(17).copied().unwrap_or(0);
-        return Err(map_s7_error(err_class, &format!("Read 被拒绝 rosctr={:02x} 期望 {:02x}", rosctr, S7_ROSCTR_ACK)));
+        return Err(map_s7_error(
+            err_class,
+            &format!(
+                "Read 被拒绝 rosctr={:02x} 期望 {:02x}",
+                rosctr, S7_ROSCTR_ACK
+            ),
+        ));
     }
     let param_len = u16::from_be_bytes([s7[6], s7[7]]) as usize;
     let data_len = u16::from_be_bytes([s7[8], s7[9]]) as usize;
     if s7.len() < 12 + param_len + data_len {
-        return Err(SdkDriverError::new(ErrorKind::Protocol, "S7_LEN_MISMATCH", "S7 长度与实际不符"));
+        return Err(SdkDriverError::new(
+            ErrorKind::Protocol,
+            "S7_LEN_MISMATCH",
+            "S7 长度与实际不符",
+        ));
     }
-    let data = &s7[12 + param_len.. 12 + param_len + data_len];
+    let data = &s7[12 + param_len..12 + param_len + data_len];
     // param 预期 0x04 00? 对于成功读取，param 首字节 0x04，次字节 item 数
     // data 结构：每 item 4 字节头 + 数据（若奇数长度则填充 1 字节）— 按项 BAD 隔离
     let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(sent_items.len());
     let mut off = 0;
     for (idx, it) in sent_items.iter().enumerate() {
         if off + 4 > data.len() {
-            return Err(SdkDriverError::new(ErrorKind::Protocol, "READ_ITEM_SHORT", format!("item {idx} 头部缺失")));
+            return Err(SdkDriverError::new(
+                ErrorKind::Protocol,
+                "READ_ITEM_SHORT",
+                format!("item {idx} 头部缺失"),
+            ));
         }
         let ret = data[off];
         let transport = data[off + 1];
@@ -353,11 +491,17 @@ fn parse_read_resp(resp: &[u8], sent_items: &[ReadItem]) -> Result<Vec<Option<Ve
             // 按项 BAD：记录日志但不整体失败，调用方将该点发 BAD
             tracing::warn!(addr=%format_addr(&it.addr), ret=ret, "S7 item 0x{:02X} 按项 BAD", ret);
             // 仍需跳过该 item 的数据区（若有）以对齐下一项
-            let byte_len = (len_bits + 7) / 8;
+            let byte_len = len_bits.div_ceil(8);
             // S7 在错误时 len_bits 可能为 0，仍按 0 处理，不消费数据
             if byte_len > 0 && off + byte_len <= data.len() {
                 off += byte_len;
-                if byte_len % 2 == 1 && off < data.len() && data[off] == 0x00 && idx + 1 < sent_items.len() { off += 1; }
+                if byte_len % 2 == 1
+                    && off < data.len()
+                    && data[off] == 0x00
+                    && idx + 1 < sent_items.len()
+                {
+                    off += 1;
+                }
             }
             out.push(None);
             continue;
@@ -366,13 +510,17 @@ fn parse_read_resp(resp: &[u8], sent_items: &[ReadItem]) -> Result<Vec<Option<Ve
         let byte_len = if transport == S7_TRANSPORT_BIT || it.kind == S7Kind::Bool {
             1
         } else {
-            (len_bits + 7) / 8
+            len_bits.div_ceil(8)
         };
         // 但为防御实现差异，回退到 kind 预期长度
         let expect = it.kind.byte_len();
         let take = byte_len.min(expect).max(1);
         if off + take > data.len() {
-            return Err(SdkDriverError::new(ErrorKind::Protocol, "READ_DATA_SHORT", format!("item {idx} 数据缺失")));
+            return Err(SdkDriverError::new(
+                ErrorKind::Protocol,
+                "READ_DATA_SHORT",
+                format!("item {idx} 数据缺失"),
+            ));
         }
         let mut bytes = data[off..off + take].to_vec();
         // 对于 BIT，S7 返回的当字节最低位为值，需保留 0/1 映射
@@ -391,7 +539,7 @@ fn parse_read_resp(resp: &[u8], sent_items: &[ReadItem]) -> Result<Vec<Option<Ve
                 // 预测下一个头部 ret 应为 0xFF，若下一字节是 0xFF 则不是填充；此处保守处理：若下一字节是 0xFF 且再下一字节 transport 合理，则为新头部而非填充
                 // 简化：若长度为奇数且下一个字节为 0x00 填充则跳过
                 // 实测读 20 字节偶数不会触发；读 1 字节会触发填充
-                if off + 4 <= data.len() && data[off] == 0x00 && data[off+1] != 0x04 {
+                if off + 4 <= data.len() && data[off] == 0x00 && data[off + 1] != 0x04 {
                     // 可能是填充，跳过
                     off += 1;
                 } else if take % 2 == 1 {
@@ -414,15 +562,37 @@ fn parse_read_resp(resp: &[u8], sent_items: &[ReadItem]) -> Result<Vec<Option<Ve
 /// SZL 读取（Common 诊断）：S7 功能 0x07 SZL，返回原始 SZL 负载（已去 TPKT/COTP/S7 头）。
 /// 用于 `SZL 0x0011` CPU 诊断、`0x0131` 模块标识等只读诊断，不走点位批次。
 impl S7Client {
-    pub async fn read_szl(&mut self, szl_id: u16, szl_index: u16) -> Result<Vec<u8>, SdkDriverError> {
+    pub async fn read_szl(
+        &mut self,
+        szl_id: u16,
+        szl_index: u16,
+    ) -> Result<Vec<u8>, SdkDriverError> {
         let pkt = build_szl_req(self.pdu_ref, szl_id, szl_index);
         self.pdu_ref = self.pdu_ref.wrapping_add(1).max(1);
-        timeout(self.cfg.timeout(), self.send_raw(&pkt)).await
-            .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "SZL_TIMEOUT", format!("SZL 0x{szl_id:04X} 请求超时")))?
-            .map_err(|e| SdkDriverError::new(ErrorKind::Connection, "SZL_SEND_FAIL", e.to_string()))?;
-        let resp = timeout(self.cfg.timeout(), self.recv_packet()).await
-            .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "SZL_TIMEOUT", format!("SZL 0x{szl_id:04X} 响应超时")))?
-            .map_err(|e| SdkDriverError::new(ErrorKind::Connection, "SZL_RECV_FAIL", e.to_string()))?;
+        timeout(self.cfg.timeout(), self.send_raw(&pkt))
+            .await
+            .map_err(|_| {
+                SdkDriverError::new(
+                    ErrorKind::Timeout,
+                    "SZL_TIMEOUT",
+                    format!("SZL 0x{szl_id:04X} 请求超时"),
+                )
+            })?
+            .map_err(|e| {
+                SdkDriverError::new(ErrorKind::Connection, "SZL_SEND_FAIL", e.to_string())
+            })?;
+        let resp = timeout(self.cfg.timeout(), self.recv_packet())
+            .await
+            .map_err(|_| {
+                SdkDriverError::new(
+                    ErrorKind::Timeout,
+                    "SZL_TIMEOUT",
+                    format!("SZL 0x{szl_id:04X} 响应超时"),
+                )
+            })?
+            .map_err(|e| {
+                SdkDriverError::new(ErrorKind::Connection, "SZL_RECV_FAIL", e.to_string())
+            })?;
         parse_szl_resp(&resp, szl_id)
     }
 }
@@ -435,12 +605,19 @@ fn build_szl_req(pdu_ref: u16, szl_id: u16, szl_index: u16) -> Vec<u8> {
     s7.extend_from_slice(&pdu_ref.to_be_bytes());
     s7.extend_from_slice(&[0x00, 0x08, 0x00, 0x04]);
     // UserData 头：0x00 0x01 0x12 0x04 0x11 0x44 0x01 0x00 0xFF 0x09 0x00 0x04
-    s7.extend_from_slice(&[0x00, 0x01, 0x12, 0x04, 0x11, 0x44, 0x01, 0x00, 0xFF, 0x09, 0x00, 0x04]);
+    s7.extend_from_slice(&[
+        0x00, 0x01, 0x12, 0x04, 0x11, 0x44, 0x01, 0x00, 0xFF, 0x09, 0x00, 0x04,
+    ]);
     s7.extend_from_slice(&szl_id.to_be_bytes());
     s7.extend_from_slice(&szl_index.to_be_bytes());
     let cotp = [0x02, COTP_DT, 0x80];
     let tpkt_len = (4 + cotp.len() + s7.len()) as u16;
-    let mut pkt = vec![TPKT_VERSION, 0x00, (tpkt_len >> 8) as u8, (tpkt_len & 0xFF) as u8];
+    let mut pkt = vec![
+        TPKT_VERSION,
+        0x00,
+        (tpkt_len >> 8) as u8,
+        (tpkt_len & 0xFF) as u8,
+    ];
     pkt.extend_from_slice(&cotp);
     pkt.extend_from_slice(&s7);
     pkt
@@ -448,10 +625,20 @@ fn build_szl_req(pdu_ref: u16, szl_id: u16, szl_index: u16) -> Vec<u8> {
 
 fn parse_szl_resp(resp: &[u8], szl_id: u16) -> Result<Vec<u8>, SdkDriverError> {
     if resp.len() < 7 + 12 {
-        return Err(SdkDriverError::new(ErrorKind::Protocol, "SZL_SHORT", format!("SZL 0x{szl_id:04X} 响应过短 {}", resp.len())));
+        return Err(SdkDriverError::new(
+            ErrorKind::Protocol,
+            "SZL_SHORT",
+            format!("SZL 0x{szl_id:04X} 响应过短 {}", resp.len()),
+        ));
     }
     let s7 = &resp[7..];
-    if s7.len() < 12 { return Err(SdkDriverError::new(ErrorKind::Protocol, "SZL_S7_SHORT", "SZL S7 头缺失")); }
+    if s7.len() < 12 {
+        return Err(SdkDriverError::new(
+            ErrorKind::Protocol,
+            "SZL_S7_SHORT",
+            "SZL S7 头缺失",
+        ));
+    }
     if s7[1] != S7_ROSCTR_ACK && s7[1] != 0x07 {
         return Err(map_s7_error(s7[17], &format!("SZL 0x{szl_id:04X} 被拒绝")));
     }
@@ -469,20 +656,36 @@ fn format_addr(a: &S7Address) -> String {
             }
         }
         Area::Merker => {
-            if let Some(bit) = a.bit_offset { format!("M{}.{}", a.byte_offset, bit) } else { format!("MB{}", a.byte_offset) }
+            if let Some(bit) = a.bit_offset {
+                format!("M{}.{}", a.byte_offset, bit)
+            } else {
+                format!("MB{}", a.byte_offset)
+            }
         }
         Area::Input => {
-            if let Some(bit) = a.bit_offset { format!("I{}.{}", a.byte_offset, bit) } else { format!("IB{}", a.byte_offset) }
+            if let Some(bit) = a.bit_offset {
+                format!("I{}.{}", a.byte_offset, bit)
+            } else {
+                format!("IB{}", a.byte_offset)
+            }
         }
         Area::Output => {
-            if let Some(bit) = a.bit_offset { format!("Q{}.{}", a.byte_offset, bit) } else { format!("QB{}", a.byte_offset) }
+            if let Some(bit) = a.bit_offset {
+                format!("Q{}.{}", a.byte_offset, bit)
+            } else {
+                format!("QB{}", a.byte_offset)
+            }
         }
         Area::Counter => format!("C{}", a.byte_offset),
         Area::Timer => format!("T{}", a.byte_offset),
         Area::PeripheralInput => format!("PIW{}", a.byte_offset),
         Area::PeripheralOutput => format!("PQW{}", a.byte_offset),
         Area::Local => {
-            if let Some(bit) = a.bit_offset { format!("L{}.{}", a.byte_offset, bit) } else { format!("LB{}", a.byte_offset) }
+            if let Some(bit) = a.bit_offset {
+                format!("L{}.{}", a.byte_offset, bit)
+            } else {
+                format!("LB{}", a.byte_offset)
+            }
         }
     }
 }
@@ -490,7 +693,9 @@ fn format_addr(a: &S7Address) -> String {
 fn map_connect_error(e: std::io::Error, addr: &str, cfg: &S7ConnConfig) -> SdkDriverError {
     let kind = e.kind();
     let hint = match kind {
-        std::io::ErrorKind::ConnectionRefused => format!("连接被拒绝 {}（PLC 未开机/端口 {} 未开放）", addr, cfg.port),
+        std::io::ErrorKind::ConnectionRefused => {
+            format!("连接被拒绝 {}（PLC 未开机/端口 {} 未开放）", addr, cfg.port)
+        }
         std::io::ErrorKind::TimedOut => format!("连接超时 {}（网络不可达或 PLC 无响应）", addr),
         _ => format!("TCP 连接失败 {}: {e}", addr),
     };
@@ -499,10 +704,23 @@ fn map_connect_error(e: std::io::Error, addr: &str, cfg: &S7ConnConfig) -> SdkDr
 
 fn map_s7_error(code: u8, ctx: &str) -> SdkDriverError {
     let (kind, help) = match code {
-        S7_ERR_CONTEXT => (ErrorKind::Configuration, "（0x04 上下文不支持）S7-1200/1500 请在 TIA Portal 硬件组态 CPU 属性 -> 防护与安全 -> 连接机制 中勾选“允许来自远程对象的 PUT/GET 通信访问”"),
-        S7_ERR_ADDRESS => (ErrorKind::Address, "（0x05 地址错误）检查 DB 是否存在且为标准访问（非优化块），地址是否越界"),
-        S7_ERR_ACCESS => (ErrorKind::Configuration, "（0x03 拒绝）CPU 保护等级或安全策略禁止外部访问"),
+        S7_ERR_CONTEXT => (
+            ErrorKind::Configuration,
+            "（0x04 上下文不支持）S7-1200/1500 请在 TIA Portal 硬件组态 CPU 属性 -> 防护与安全 -> 连接机制 中勾选“允许来自远程对象的 PUT/GET 通信访问”",
+        ),
+        S7_ERR_ADDRESS => (
+            ErrorKind::Address,
+            "（0x05 地址错误）检查 DB 是否存在且为标准访问（非优化块），地址是否越界",
+        ),
+        S7_ERR_ACCESS => (
+            ErrorKind::Configuration,
+            "（0x03 拒绝）CPU 保护等级或安全策略禁止外部访问",
+        ),
         _ => (ErrorKind::Protocol, ""),
     };
-    SdkDriverError::new(kind, format!("S7_0x{code:02X}"), format!("{ctx}: S7 错误 0x{code:02X} {help}"))
+    SdkDriverError::new(
+        kind,
+        format!("S7_0x{code:02X}"),
+        format!("{ctx}: S7 错误 0x{code:02X} {help}"),
+    )
 }

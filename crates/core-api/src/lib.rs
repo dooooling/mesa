@@ -82,9 +82,18 @@ fn store_err_to_response(e: StoreError) -> (StatusCode, Json<serde_json::Value>)
         StoreError::Duplicate(msg) => (StatusCode::CONFLICT, Json(json_error("CONFLICT", &msg))),
         StoreError::NotFound(msg) => (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &msg))),
         StoreError::Conflict(msg) => (StatusCode::CONFLICT, Json(json_error("CONFLICT", &msg))),
-        StoreError::Validation(msg) => (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", &msg))),
-        StoreError::Json(err) => (StatusCode::BAD_REQUEST, Json(json_error("INVALID_JSON", &err.to_string()))),
-        StoreError::Sqlite(err) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &err.to_string()))),
+        StoreError::Validation(msg) => (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("VALIDATION_ERROR", &msg)),
+        ),
+        StoreError::Json(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("INVALID_JSON", &err.to_string())),
+        ),
+        StoreError::Sqlite(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &err.to_string())),
+        ),
     }
 }
 
@@ -119,7 +128,8 @@ async fn list_endpoints(State(state): State<Arc<AppState>>) -> Json<serde_json::
         .into_iter()
         .map(|rec| {
             let runtime = live.get(&rec.id).cloned();
-            let conn: serde_json::Value = serde_json::from_str(&rec.connection_json).unwrap_or(serde_json::json!({}));
+            let conn: serde_json::Value =
+                serde_json::from_str(&rec.connection_json).unwrap_or(serde_json::json!({}));
             serde_json::json!({
                 "id": rec.id,
                 "device_id": rec.device_id,
@@ -135,7 +145,9 @@ async fn list_endpoints(State(state): State<Arc<AppState>>) -> Json<serde_json::
 }
 
 async fn latest_points(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "points": state.snapshot.latest_all(), "count": state.snapshot.latest_all().len() }))
+    Json(
+        serde_json::json!({ "points": state.snapshot.latest_all(), "count": state.snapshot.latest_all().len() }),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +203,10 @@ async fn get_device(
 ) -> (StatusCode, Json<serde_json::Value>) {
     match state.store.get_device(&id) {
         Ok(Some(d)) => (StatusCode::OK, Json(serde_json::to_value(d).unwrap())),
-        Ok(None) => (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &format!("device `{id}`")))),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("device `{id}`"))),
+        ),
         Err(e) => store_err_to_response(e),
     }
 }
@@ -200,9 +215,16 @@ async fn create_device(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateDeviceReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let rec = DeviceRecord { id: body.id.clone(), name: body.name, profile: body.profile };
+    let rec = DeviceRecord {
+        id: body.id.clone(),
+        name: body.name,
+        profile: body.profile,
+    };
     match state.store.create_device(&rec) {
-        Ok(()) => (StatusCode::CREATED, Json(serde_json::to_value(&rec).unwrap())),
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::to_value(&rec).unwrap()),
+        ),
         Err(e) => store_err_to_response(e),
     }
 }
@@ -212,10 +234,17 @@ async fn update_device(
     Path(id): Path<String>,
     Json(body): Json<UpdateDeviceReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let rec = DeviceRecord { id: id.clone(), name: body.name, profile: body.profile };
+    let rec = DeviceRecord {
+        id: id.clone(),
+        name: body.name,
+        profile: body.profile,
+    };
     match state.store.update_device(&rec) {
         Ok(true) => (StatusCode::OK, Json(serde_json::to_value(&rec).unwrap())),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &format!("device `{id}`")))),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("device `{id}`"))),
+        ),
         Err(e) => store_err_to_response(e),
     }
 }
@@ -226,7 +255,10 @@ async fn delete_device(
 ) -> (StatusCode, Json<serde_json::Value>) {
     match state.store.delete_device(&id) {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "deleted": id }))),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &format!("device `{id}`")))),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("device `{id}`"))),
+        ),
         Err(e) => store_err_to_response(e),
     }
 }
@@ -257,14 +289,21 @@ async fn get_endpoint(
     match state.store.get_endpoint(&id) {
         Ok(Some(rec)) => {
             let runtime = state.snapshot.endpoint(&id);
-            let conn: serde_json::Value = serde_json::from_str(&rec.connection_json).unwrap_or(serde_json::json!({}));
-            (StatusCode::OK, Json(serde_json::json!({
-                "id": rec.id, "device_id": rec.device_id, "driver_id": rec.driver_id,
-                "connection": conn, "desired_running": rec.desired_running,
-                "updated_at_ns": rec.updated_at_ns, "runtime": runtime,
-            })))
+            let conn: serde_json::Value =
+                serde_json::from_str(&rec.connection_json).unwrap_or(serde_json::json!({}));
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": rec.id, "device_id": rec.device_id, "driver_id": rec.driver_id,
+                    "connection": conn, "desired_running": rec.desired_running,
+                    "updated_at_ns": rec.updated_at_ns, "runtime": runtime,
+                })),
+            )
         }
-        Ok(None) => (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &format!("endpoint `{id}`")))),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
+        ),
         Err(e) => store_err_to_response(e),
     }
 }
@@ -274,7 +313,13 @@ async fn create_endpoint(
     Json(body): Json<CreateEndpointReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if !body.connection.is_object() {
-        return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", "connection 必须为 JSON 对象")));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "VALIDATION_ERROR",
+                "connection 必须为 JSON 对象",
+            )),
+        );
     }
     let rec = EndpointRecord {
         id: body.id.clone(),
@@ -285,7 +330,10 @@ async fn create_endpoint(
         updated_at_ns: mesa_core_types::now_unix_ns(),
     };
     match state.store.create_endpoint(&rec) {
-        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({ "id": rec.id }))),
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": rec.id })),
+        ),
         Err(e) => store_err_to_response(e),
     }
 }
@@ -297,13 +345,31 @@ async fn update_endpoint(
 ) -> (StatusCode, Json<serde_json::Value>) {
     // 运行中禁止热改（§6.2：必须 Stop→Configure→Start）
     if state.manager.is_running(&id) {
-        return (StatusCode::CONFLICT, Json(json_error("CONFLICT", "endpoint 正在运行，请先停止后再修改配置")));
+        return (
+            StatusCode::CONFLICT,
+            Json(json_error(
+                "CONFLICT",
+                "endpoint 正在运行，请先停止后再修改配置",
+            )),
+        );
     }
     if !body.connection.is_object() {
-        return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", "connection 必须为 JSON 对象")));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "VALIDATION_ERROR",
+                "connection 必须为 JSON 对象",
+            )),
+        );
     }
-    let Some(mut rec) = (match state.store.get_endpoint(&id) { Ok(v) => v, Err(e) => return store_err_to_response(e) }) else {
-        return (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))));
+    let Some(mut rec) = (match state.store.get_endpoint(&id) {
+        Ok(v) => v,
+        Err(e) => return store_err_to_response(e),
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
+        );
     };
     rec.device_id = body.device_id;
     rec.driver_id = body.driver_id;
@@ -311,7 +377,10 @@ async fn update_endpoint(
     rec.updated_at_ns = mesa_core_types::now_unix_ns();
     match state.store.update_endpoint(&rec) {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "updated": id }))),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &format!("endpoint `{id}`")))),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
+        ),
         Err(e) => store_err_to_response(e),
     }
 }
@@ -321,11 +390,20 @@ async fn delete_endpoint(
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if state.manager.is_running(&id) {
-        return (StatusCode::CONFLICT, Json(json_error("CONFLICT", "endpoint 正在运行，请先停止后再删除")));
+        return (
+            StatusCode::CONFLICT,
+            Json(json_error(
+                "CONFLICT",
+                "endpoint 正在运行，请先停止后再删除",
+            )),
+        );
     }
     match state.store.delete_endpoint(&id) {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "deleted": id }))),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &format!("endpoint `{id}`")))),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
+        ),
         Err(e) => store_err_to_response(e),
     }
 }
@@ -336,14 +414,25 @@ async fn start_endpoint(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let rec = match state.store.get_endpoint(&id) {
         Ok(Some(r)) => r,
-        Ok(None) => return (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &format!("endpoint `{id}`")))),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
+            );
+        }
         Err(e) => return store_err_to_response(e),
     };
     if state.manager.is_running(&id) {
-        return (StatusCode::CONFLICT, Json(json_error("CONFLICT", "endpoint 已在运行")));
+        return (
+            StatusCode::CONFLICT,
+            Json(json_error("CONFLICT", "endpoint 已在运行")),
+        );
     }
     // 构造 BuiltinEndpoint
-    let tasks = match state.store.list_tasks(&id) { Ok(v) => v, Err(e) => return store_err_to_response(e) };
+    let tasks = match state.store.list_tasks(&id) {
+        Ok(v) => v,
+        Err(e) => return store_err_to_response(e),
+    };
     let cfg = mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: rec.id.clone(),
         driver_id: rec.driver_id.clone(),
@@ -355,7 +444,10 @@ async fn start_endpoint(
             let _ = state.store.set_desired_running(&id, true);
             (StatusCode::OK, Json(serde_json::json!({ "started": id })))
         }
-        Err(msg) => (StatusCode::BAD_REQUEST, Json(json_error("START_FAILED", &msg))),
+        Err(msg) => (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("START_FAILED", &msg)),
+        ),
     }
 }
 
@@ -366,11 +458,17 @@ async fn stop_endpoint(
     if !state.manager.is_running(&id) {
         // 即使未运行也更新期望态，保持幂等
         let _ = state.store.set_desired_running(&id, false);
-        return (StatusCode::OK, Json(serde_json::json!({ "stopped": id, "was_running": false })));
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "stopped": id, "was_running": false })),
+        );
     }
     let was = state.manager.stop_endpoint(&id).await;
     let _ = state.store.set_desired_running(&id, false);
-    (StatusCode::OK, Json(serde_json::json!({ "stopped": id, "was_running": was })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "stopped": id, "was_running": was })),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -393,12 +491,18 @@ async fn list_tasks(
     Query(q): Query<TasksQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let Some(ep) = q.endpoint else {
-        return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", "缺少查询参数 endpoint")));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("VALIDATION_ERROR", "缺少查询参数 endpoint")),
+        );
     };
     match state.store.list_tasks(&ep) {
         Ok(v) => {
             let rev = state.store.current_revision(&ep).unwrap_or(0);
-            (StatusCode::OK, Json(serde_json::json!({ "endpoint_id": ep, "revision": rev, "tasks": v })))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "endpoint_id": ep, "revision": rev, "tasks": v })),
+            )
         }
         Err(e) => store_err_to_response(e),
     }
@@ -409,13 +513,25 @@ async fn replace_tasks(
     Json(body): Json<ReplaceTasksReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let Some(ep) = body.endpoint_id else {
-        return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", "缺少 endpoint_id")));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("VALIDATION_ERROR", "缺少 endpoint_id")),
+        );
     };
     if state.manager.is_running(&ep) {
-        return (StatusCode::CONFLICT, Json(json_error("CONFLICT", "endpoint 正在运行，请先停止后再修改任务")));
+        return (
+            StatusCode::CONFLICT,
+            Json(json_error(
+                "CONFLICT",
+                "endpoint 正在运行，请先停止后再修改任务",
+            )),
+        );
     }
     match state.store.replace_tasks(&ep, &body.tasks) {
-        Ok(rev) => (StatusCode::OK, Json(serde_json::json!({ "endpoint_id": ep, "revision": rev }))),
+        Ok(rev) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "endpoint_id": ep, "revision": rev })),
+        ),
         Err(e) => store_err_to_response(e),
     }
 }
@@ -429,21 +545,46 @@ async fn put_tasks_for_endpoint(
     let tasks: Vec<AcquisitionTask> = if let Some(arr) = body.get("tasks") {
         match serde_json::from_value(arr.clone()) {
             Ok(v) => v,
-            Err(e) => return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", &e.to_string()))),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_error("VALIDATION_ERROR", &e.to_string())),
+                );
+            }
         }
     } else if body.is_array() {
         match serde_json::from_value(body) {
             Ok(v) => v,
-            Err(e) => return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", &e.to_string()))),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_error("VALIDATION_ERROR", &e.to_string())),
+                );
+            }
         }
     } else {
-        return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", "body 需为 {tasks:[...]} 或 [...]")));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "VALIDATION_ERROR",
+                "body 需为 {tasks:[...]} 或 [...]",
+            )),
+        );
     };
     if state.manager.is_running(&endpoint_id) {
-        return (StatusCode::CONFLICT, Json(json_error("CONFLICT", "endpoint 正在运行，请先停止后再修改任务")));
+        return (
+            StatusCode::CONFLICT,
+            Json(json_error(
+                "CONFLICT",
+                "endpoint 正在运行，请先停止后再修改任务",
+            )),
+        );
     }
     match state.store.replace_tasks(&endpoint_id, &tasks) {
-        Ok(rev) => (StatusCode::OK, Json(serde_json::json!({ "endpoint_id": endpoint_id, "revision": rev }))),
+        Ok(rev) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "endpoint_id": endpoint_id, "revision": rev })),
+        ),
         Err(e) => store_err_to_response(e),
     }
 }
@@ -453,7 +594,13 @@ async fn delete_task(
     Path((endpoint_id, task_id)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if state.manager.is_running(&endpoint_id) {
-        return (StatusCode::CONFLICT, Json(json_error("CONFLICT", "endpoint 正在运行，请先停止后再修改任务")));
+        return (
+            StatusCode::CONFLICT,
+            Json(json_error(
+                "CONFLICT",
+                "endpoint 正在运行，请先停止后再修改任务",
+            )),
+        );
     }
     let mut tasks = match state.store.list_tasks(&endpoint_id) {
         Ok(v) => v,
@@ -462,10 +609,16 @@ async fn delete_task(
     let before = tasks.len();
     tasks.retain(|t| t.id != task_id);
     if tasks.len() == before {
-        return (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &format!("task `{task_id}`"))));
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("task `{task_id}`"))),
+        );
     }
     match state.store.replace_tasks(&endpoint_id, &tasks) {
-        Ok(rev) => (StatusCode::OK, Json(serde_json::json!({ "deleted": task_id, "revision": rev }))),
+        Ok(rev) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "deleted": task_id, "revision": rev })),
+        ),
         Err(e) => store_err_to_response(e),
     }
 }
@@ -475,7 +628,9 @@ async fn delete_task(
 // ---------------------------------------------------------------------------
 
 async fn rescan_drivers(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let infos = state.manager.rescan(std::path::Path::new(&state.drivers_dir));
+    let infos = state
+        .manager
+        .rescan(std::path::Path::new(&state.drivers_dir));
     Json(serde_json::json!({ "drivers": infos }))
 }
 
@@ -489,11 +644,23 @@ async fn list_cert_store(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let valid = ["own", "trusted", "issuers", "rejected"];
     if !valid.contains(&store.as_str()) {
-        return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", "store 需为 own/trusted/issuers/rejected")));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "VALIDATION_ERROR",
+                "store 需为 own/trusted/issuers/rejected",
+            )),
+        );
     }
     match state.cert_store.list(&store) {
-        Ok(list) => (StatusCode::OK, Json(serde_json::json!({ "store": store, "count": list.len(), "certs": list }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &e))),
+        Ok(list) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "store": store, "count": list.len(), "certs": list })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &e)),
+        ),
     }
 }
 
@@ -507,11 +674,20 @@ async fn add_trusted_cert(
     Json(body): Json<AddTrustedReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if body.pem.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", "pem 不能为空")));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("VALIDATION_ERROR", "pem 不能为空")),
+        );
     }
     match state.cert_store.add_trusted(&body.pem) {
-        Ok(tp) => (StatusCode::CREATED, Json(serde_json::json!({ "thumbprint": tp }))),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json_error("INVALID_CERT", &e))),
+        Ok(tp) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "thumbprint": tp })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("INVALID_CERT", &e)),
+        ),
     }
 }
 
@@ -520,9 +696,21 @@ async fn remove_trusted_cert(
     Path(thumbprint): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     match state.cert_store.remove_trusted(&thumbprint) {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "deleted": thumbprint }))),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &format!("证书 {thumbprint} 不存在")))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &e))),
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "deleted": thumbprint })),
+        ),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json_error(
+                "NOT_FOUND",
+                &format!("证书 {thumbprint} 不存在"),
+            )),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &e)),
+        ),
     }
 }
 
@@ -531,9 +719,21 @@ async fn trust_rejected_cert(
     Path(thumbprint): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     match state.cert_store.trust_rejected(&thumbprint) {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "trusted": thumbprint }))),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(json_error("NOT_FOUND", &format!("rejected 证书 {thumbprint} 不存在")))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &e))),
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "trusted": thumbprint })),
+        ),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json_error(
+                "NOT_FOUND",
+                &format!("rejected 证书 {thumbprint} 不存在"),
+            )),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &e)),
+        ),
     }
 }
 
@@ -543,26 +743,52 @@ async fn cert_diagnostics(State(state): State<Arc<AppState>>) -> Json<serde_json
 
 async fn list_own(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
     match state.cert_store.list("own") {
-        Ok(list) => (StatusCode::OK, Json(serde_json::json!({ "store": "own", "count": list.len(), "certs": list }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &e))),
+        Ok(list) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "store": "own", "count": list.len(), "certs": list })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &e)),
+        ),
     }
 }
 async fn list_trusted(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
     match state.cert_store.list("trusted") {
-        Ok(list) => (StatusCode::OK, Json(serde_json::json!({ "store": "trusted", "count": list.len(), "certs": list }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &e))),
+        Ok(list) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "store": "trusted", "count": list.len(), "certs": list })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &e)),
+        ),
     }
 }
 async fn list_issuers(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
     match state.cert_store.list("issuers") {
-        Ok(list) => (StatusCode::OK, Json(serde_json::json!({ "store": "issuers", "count": list.len(), "certs": list }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &e))),
+        Ok(list) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "store": "issuers", "count": list.len(), "certs": list })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &e)),
+        ),
     }
 }
-async fn list_rejected(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+async fn list_rejected(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
     match state.cert_store.list("rejected") {
-        Ok(list) => (StatusCode::OK, Json(serde_json::json!({ "store": "rejected", "count": list.len(), "certs": list }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error("INTERNAL", &e))),
+        Ok(list) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "store": "rejected", "count": list.len(), "certs": list })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &e)),
+        ),
     }
 }
 
@@ -575,14 +801,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         // 只读 / 诊断
         .route("/api/v1/drivers", get(list_drivers))
         .route("/api/v1/drivers/rescan", post(rescan_drivers))
-        .route("/api/v1/endpoints", get(list_endpoints).post(create_endpoint))
-        .route("/api/v1/endpoints/{id}", get(get_endpoint).put(update_endpoint).delete(delete_endpoint))
+        .route(
+            "/api/v1/endpoints",
+            get(list_endpoints).post(create_endpoint),
+        )
+        .route(
+            "/api/v1/endpoints/{id}",
+            get(get_endpoint)
+                .put(update_endpoint)
+                .delete(delete_endpoint),
+        )
         .route("/api/v1/endpoints/{id}/state", get(endpoint_state))
         .route("/api/v1/points/latest", get(latest_points))
         .route("/api/v1/diagnostics", get(diagnostics))
         // Devices CRUD
         .route("/api/v1/devices", get(list_devices).post(create_device))
-        .route("/api/v1/devices/{id}", get(get_device).put(update_device).delete(delete_device))
+        .route(
+            "/api/v1/devices/{id}",
+            get(get_device).put(update_device).delete(delete_device),
+        )
         // 启停
         .route("/api/v1/endpoints/{id}/start", post(start_endpoint))
         .route("/api/v1/endpoints/{id}/stop", post(stop_endpoint))
@@ -591,13 +828,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/tasks/{endpoint_id}", put(put_tasks_for_endpoint))
         .route("/api/v1/tasks/{endpoint_id}/{task_id}", delete(delete_task))
         // 证书管理 §19.3（显式路由避免 Axum 参数与静态路径 405 冲突）
-        .route("/api/v1/certificates/opcua/diagnostics", get(cert_diagnostics))
+        .route(
+            "/api/v1/certificates/opcua/diagnostics",
+            get(cert_diagnostics),
+        )
         .route("/api/v1/certificates/opcua/own", get(list_own))
-        .route("/api/v1/certificates/opcua/trusted", get(list_trusted).post(add_trusted_cert))
+        .route(
+            "/api/v1/certificates/opcua/trusted",
+            get(list_trusted).post(add_trusted_cert),
+        )
         .route("/api/v1/certificates/opcua/issuers", get(list_issuers))
         .route("/api/v1/certificates/opcua/rejected", get(list_rejected))
-        .route("/api/v1/certificates/opcua/trusted/{thumbprint}", delete(remove_trusted_cert))
-        .route("/api/v1/certificates/opcua/rejected/{thumbprint}/trust", post(trust_rejected_cert))
+        .route(
+            "/api/v1/certificates/opcua/trusted/{thumbprint}",
+            delete(remove_trusted_cert),
+        )
+        .route(
+            "/api/v1/certificates/opcua/rejected/{thumbprint}/trust",
+            post(trust_rejected_cert),
+        )
         // 兼容参数路由（保留）
         .route("/api/v1/certificates/opcua/{store}", get(list_cert_store))
         // 健康探针
@@ -608,20 +857,26 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// 兼容旧入口：仅含只读路由（供不需要持久化的单测使用）。
 pub fn router_readonly(snapshot: Arc<Snapshot>) -> Router {
     Router::new()
-        .route("/api/v1/drivers", get({
-            let s = snapshot.clone();
-            move |_: State<Arc<Snapshot>>| {
-                let s = s.clone();
-                async move { Json(serde_json::json!({ "drivers": s.drivers() })) }
-            }
-        }))
-        .route("/api/v1/endpoints", get({
-            let s = snapshot.clone();
-            move |_: State<Arc<Snapshot>>| {
-                let s = s.clone();
-                async move { Json(serde_json::json!({ "endpoints": s.endpoints() })) }
-            }
-        }))
+        .route(
+            "/api/v1/drivers",
+            get({
+                let s = snapshot.clone();
+                move |_: State<Arc<Snapshot>>| {
+                    let s = s.clone();
+                    async move { Json(serde_json::json!({ "drivers": s.drivers() })) }
+                }
+            }),
+        )
+        .route(
+            "/api/v1/endpoints",
+            get({
+                let s = snapshot.clone();
+                move |_: State<Arc<Snapshot>>| {
+                    let s = s.clone();
+                    async move { Json(serde_json::json!({ "endpoints": s.endpoints() })) }
+                }
+            }),
+        )
         .route("/healthz", get(|| async { "ok" }))
         .with_state(snapshot)
 }
