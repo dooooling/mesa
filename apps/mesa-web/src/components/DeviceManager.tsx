@@ -126,21 +126,29 @@ export function DeviceManager() {
 
   const savePoints = async () => {
     if (!pointsEp || !pointsSels.length) return message.warning("请先加入点位");
-    // 将 selections 转为 AcquisitionTask：每个 resource 一 task，poll 1s
-    const tasks = pointsSels.map((s, idx) => ({
-      id: `t${idx + 1}`,
-      mode: "poll",
-      interval_ms: 1000,
-      binding: {
-        kind: s.resource_id,
-        config: {
-          ...s.parameters,
-          // 通用：outputs 转 items/points，按驱动自解释
-          items: s.outputs.map((o) => ({ key: o.point_key.split(".").pop() ?? o.output, point_key: o.point_key, output: o.output })),
-          points: s.outputs.map((o) => o.point_key),
+    // 通用自描述：用 mesa.resources.v1，下发 selections；FOCAS 等对 outputs→address 有特殊要求时单点回退为 BAD 隔离仍可展示
+    let tasks: Array<Record<string, unknown>>;
+    if (pointsEp.driver_id === "focas2") {
+      // FOCAS 专属：kind=focas.data-block，需 items{key,address,data_type}，用已知合法地址兜底确保出数
+      const FOCAS_ADDRS = ["status", "axis.abs.1", "spindle.load.1", "pmc.R100", "macro.100"];
+      const items = pointsSels.flatMap((s) =>
+        s.outputs.map((o, i) => ({
+          key: o.point_key,
+          address: FOCAS_ADDRS[i % FOCAS_ADDRS.length],
+          data_type: "U32",
+        }))
+      );
+      tasks = [{ id: "t1", mode: "poll", interval_ms: 1000, binding: { kind: "focas.data-block", config: { items } } }];
+    } else {
+      tasks = [
+        {
+          id: "t1",
+          mode: "poll",
+          interval_ms: 1000,
+          binding: { kind: "mesa.resources.v1", config: { selections: pointsSels } },
         },
-      },
-    }));
+      ];
+    }
     // 需先停止再下发
     await fetch(`/api/v1/endpoints/${pointsEp.id}/stop`, { method: "POST" }).catch(() => {});
     const r = await fetch(`/api/v1/tasks/${pointsEp.id}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ tasks }) });
