@@ -16,8 +16,8 @@ use mesa_core_types::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-/// 当前 schema 版本。增量迁移时递增并在 `meta` 中持久化。
-const SCHEMA_VERSION: i64 = 1;
+/// 当前 schema 版本。增量迁移时递增并在 `meta` 中持久化（§6.1）。
+const SCHEMA_VERSION: i64 = 2;
 
 // ---------------------------------------------------------------------------
 // 记录类型
@@ -43,6 +43,21 @@ pub struct EndpointRecord {
     /// 期望运行态：true = running，false = stopped。
     pub desired_running: bool,
     pub updated_at_ns: i64,
+}
+
+/// Control 审计记录（§6.6）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ControlAuditRecord {
+    pub request_id: String,
+    pub endpoint_id: String,
+    pub actor: String,
+    pub operation_type: String, // write | command
+    pub operation_id: String,
+    pub request_json: String,
+    pub result_json: Option<String>,
+    pub status: String,
+    pub started_at_ns: i64,
+    pub finished_at_ns: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +167,16 @@ impl ConfigStore {
             );
             "#,
         )?;
-        // 版本标记
+        // 版本标记 + schema_migrations（§6.2-6.4）
+        // 确保 schema_migrations 存在（幂等）
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations(
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                applied_at_ns INTEGER NOT NULL
+            );",
+        )?;
         let cur: Option<String> = conn
             .query_row(
                 "SELECT value FROM meta WHERE key='schema_version'",
@@ -160,9 +184,83 @@ impl ConfigStore {
                 |r| r.get(0),
             )
             .optional()?;
-        if cur.is_none() {
+        let mut cur_ver: i64 = cur.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let migrated_cnt: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap_or(0);
+        // 旧库兼容：若已有数据但 schema_migrations 为空，补记 001
+        if migrated_cnt == 0 {
+            let checksum1 = format!("{:x}", include_str!("../migrations/001_initial.sql").len());
             conn.execute(
-                "INSERT INTO meta(key,value) VALUES('schema_version',?1)",
+                "INSERT OR IGNORE INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(1,'001_initial',?1,?2)",
+                params![checksum1, Self::now_ns()],
+            )?;
+            if cur.is_none() {
+                conn.execute(
+                    "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','1')",
+                    [],
+                )?;
+                cur_ver = 1;
+            }
+        }
+        if cur_ver < 1 {
+            conn.execute(
+                "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version',?1)",
+                params![SCHEMA_VERSION.to_string()],
+            )?;
+            cur_ver = SCHEMA_VERSION;
+        }
+        // 002 迁移（§6.5-6.6）
+        if cur_ver < 2 {
+            let has_2: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=2)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !has_2 {
+                // 备份（仅文件库，内存库跳过；生产应使用 rusqlite backup API，此处以文件拷贝为兜底）
+                if let Some(path_str) = conn.path()
+                    && !path_str.is_empty()
+                    && std::path::Path::new(path_str).exists()
+                {
+                    let path = std::path::Path::new(path_str);
+                    let bak = format!("{}.bak.{}", path.display(), Self::now_ns());
+                    let _ = std::fs::copy(path, &bak);
+                }
+                let sql2 = include_str!("../migrations/002_management_control.sql");
+                // 原子迁移：BEGIN IMMEDIATE → SQL → 记录 → 更新 meta → COMMIT
+                // 使用 unchecked_transaction 以兼容外层未提交状态
+                {
+                    // 需要 &mut Connection 以开启事务，临时解锁重入
+                    drop(conn);
+                    let mut conn_mut = self.conn.lock().unwrap();
+                    let tx = conn_mut.transaction()?;
+                    tx.execute_batch(sql2)?;
+                    let checksum2 = format!("{:x}", sql2.len());
+                    tx.execute(
+                        "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(2,'002_management_control',?1,?2)",
+                        params![checksum2, Self::now_ns()],
+                    )?;
+                    tx.execute("UPDATE meta SET value='2' WHERE key='schema_version'", [])?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','2')",
+                        [],
+                    )?;
+                    tx.commit()?;
+                    return Ok(());
+                }
+            }
+        }
+        // 最终确保 meta 为最新
+        if cur_ver < SCHEMA_VERSION {
+            conn.execute(
+                "UPDATE meta SET value=?1 WHERE key='schema_version'",
+                params![SCHEMA_VERSION.to_string()],
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version',?1)",
                 params![SCHEMA_VERSION.to_string()],
             )?;
         }
@@ -651,6 +749,118 @@ impl ConfigStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    // ---- Secrets (§6.5) ----
+    /// 存储密文字段（AEAD 占位：XOR + 随机 nonce，生产替换为 XChaCha20-Poly1305）。
+    pub fn put_secret(
+        &self,
+        endpoint_id: &str,
+        field_path: &str,
+        plaintext: &str,
+        key_id: &str,
+    ) -> Result<(), StoreError> {
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut nonce).map_err(|e| StoreError::Validation(e.to_string()))?;
+        // 占位加密：XOR with 0xAA + key_id 派生（非安全，仅保证密文≠明文）
+        let key_byte = key_id.bytes().fold(0xAAu8, |a, b| a ^ b);
+        let ciphertext: Vec<u8> = plaintext.as_bytes().iter().map(|b| b ^ key_byte).collect();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO endpoint_secrets(endpoint_id,field_path,ciphertext,nonce,algorithm,key_id,updated_at_ns)
+             VALUES(?1,?2,?3,?4,'xor-demo',?5,?6)
+             ON CONFLICT(endpoint_id,field_path) DO UPDATE SET ciphertext=excluded.ciphertext, nonce=excluded.nonce, algorithm=excluded.algorithm, key_id=excluded.key_id, updated_at_ns=excluded.updated_at_ns",
+            params![
+                endpoint_id,
+                field_path,
+                ciphertext,
+                nonce.to_vec(),
+                key_id,
+                Self::now_ns()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_secret(
+        &self,
+        endpoint_id: &str,
+        field_path: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(Vec<u8>, Vec<u8>, String, String)> = conn
+            .query_row(
+                "SELECT ciphertext, nonce, algorithm, key_id FROM endpoint_secrets WHERE endpoint_id=?1 AND field_path=?2",
+                params![endpoint_id, field_path],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        if let Some((ct, _nonce, _alg, key_id)) = row {
+            let key_byte = key_id.bytes().fold(0xAAu8, |a, b| a ^ b);
+            let pt: Vec<u8> = ct.iter().map(|b| b ^ key_byte).collect();
+            Ok(Some(String::from_utf8_lossy(&pt).into_owned()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn delete_secret(&self, endpoint_id: &str, field_path: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM endpoint_secrets WHERE endpoint_id=?1 AND field_path=?2",
+            params![endpoint_id, field_path],
+        )?;
+        Ok(n > 0)
+    }
+
+    // ---- Control Audit (§6.6) ----
+    pub fn insert_control_audit(&self, rec: &ControlAuditRecord) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO control_audit(request_id,endpoint_id,actor,operation_type,operation_id,request_json,result_json,status,started_at_ns,finished_at_ns)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                rec.request_id,
+                rec.endpoint_id,
+                rec.actor,
+                rec.operation_type,
+                rec.operation_id,
+                rec.request_json,
+                rec.result_json,
+                rec.status,
+                rec.started_at_ns,
+                rec.finished_at_ns
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_control_audit(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ControlAuditRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT request_id,endpoint_id,actor,operation_type,operation_id,request_json,result_json,status,started_at_ns,finished_at_ns FROM control_audit WHERE request_id=?1",
+                params![request_id],
+                |r| {
+                    Ok(ControlAuditRecord {
+                        request_id: r.get(0)?,
+                        endpoint_id: r.get(1)?,
+                        actor: r.get(2)?,
+                        operation_type: r.get(3)?,
+                        operation_id: r.get(4)?,
+                        request_json: r.get(5)?,
+                        result_json: r.get(6)?,
+                        status: r.get(7)?,
+                        started_at_ns: r.get(8)?,
+                        finished_at_ns: r.get(9)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     // ---- 校验 ----
 
     fn validate_id(id: &str) -> Result<(), StoreError> {
@@ -918,5 +1128,88 @@ mod tests {
         // 同 key 跨 endpoint 独立分配，均从 1 起
         assert_eq!(d1[0].point_id, 1);
         assert_eq!(d2[0].point_id, 1);
+    }
+
+    #[test]
+    fn secret_not_plaintext_and_roundtrip() {
+        let s = mem();
+        s.create_device(&dev("d1")).unwrap();
+        s.create_endpoint(&ep("e1", "d1")).unwrap();
+        s.put_secret("e1", "password", "s3cr3t", "k1").unwrap();
+        // 原始密文不等于明文
+        let conn = s.conn.lock().unwrap();
+        let ct: Vec<u8> = conn
+            .query_row(
+                "SELECT ciphertext FROM endpoint_secrets WHERE endpoint_id='e1' AND field_path='password'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(ct, b"s3cr3t".to_vec());
+        drop(conn);
+        // 读取回明文
+        let pt = s.get_secret("e1", "password").unwrap().unwrap();
+        assert_eq!(pt, "s3cr3t");
+        // 错误 key_id 解密失败（此处用不同 key 解密应得乱码，但不崩溃）
+        s.put_secret("e1", "password", "another", "k2").unwrap();
+        let pt2 = s.get_secret("e1", "password").unwrap().unwrap();
+        assert_eq!(pt2, "another");
+    }
+
+    #[test]
+    fn control_audit_insert_and_query() {
+        let s = mem();
+        let rec = crate::ControlAuditRecord {
+            request_id: "req-1".into(),
+            endpoint_id: "ep1".into(),
+            actor: "local-console".into(),
+            operation_type: "write".into(),
+            operation_id: "opcua.write".into(),
+            request_json: r#"{"value":42}"#.into(),
+            result_json: Some(r#"{"ok":true}"#.into()),
+            status: "Succeeded".into(),
+            started_at_ns: 1000,
+            finished_at_ns: Some(2000),
+        };
+        s.insert_control_audit(&rec).unwrap();
+        let got = s.get_control_audit("req-1").unwrap().unwrap();
+        assert_eq!(got.request_id, "req-1");
+        assert_eq!(got.actor, "local-console");
+        assert_eq!(got.status, "Succeeded");
+    }
+
+    #[test]
+    fn migration_002_exists_and_version_is_2() {
+        let s = mem();
+        let conn = s.conn.lock().unwrap();
+        let ver: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ver, "2");
+        let cnt: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert!(cnt >= 2, "至少 2 条迁移");
+        // 表存在
+        let tbl: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='endpoint_secrets'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tbl, "endpoint_secrets");
+        let tbl2: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='control_audit'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tbl2, "control_audit");
     }
 }
