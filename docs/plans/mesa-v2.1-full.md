@@ -384,10 +384,23 @@ J/K: crates/driver-sdk/src/lib.rs, drivers/*/src/lib.rs, crates/config-store (co
 
 ---
 
-## 17. 下一步（本分支）
+## 17. 进度（本分支 feat/v2.1-impl，截至 2026-09-01 17 commits）
 
-1. 完成 Milestone 0 的 P0-A/B/C/D 修复并提交 `data_semantics + orphan_guard` 测试（本分支首个PR）
-2. 按序 A→K 逐 Milestone 发PR，每PR附 `release-validation.json` 片段与 `cargo test --workspace` 结果
-3. 每 Milestone 结束更新本计划的 `进度` 章节
+| Milestone | 状态 | 关键提交 | Gate |
+|---|---|---|---|
+| 0 P0-A/B/C/D | ✅ | `6e6de5b` | data_semantics 14 + orphan_guard |
+| A Descriptor | ✅ | `cc031b2` | GetDescriptor 256KiB/5s/503 |
+| B 四Driver | ✅ | `91dd654` | 4资源可序列化 |
+| C ResourceSelection | ✅ | `29e7de4` | legacy回归 |
+| D FOCAS Planner | ✅ | `8cb91ba` | 4 outputs→1 call |
+| E Store V2 | ✅ | `2ecb7c0` | migration 002 + secret |
+| F Management API | ✅ | `d733001` | validate/probe/diagnostics |
+| G Web UI | ✅ | `197c0e5` | Vite 175kB diff==0 |
+| H Browse | ✅ | `0d90418` | OPC UA pagination |
+| I Profile | ✅ | `b12c77e` | /profiles + Wizard |
+| J Control Plane | ✅ | `1121de0+58ad4f5+f165374` | Control32/Data256 + write/command + ControlPanel |
+| K 收敛 | ✅(软件) / ⏳(硬件) | `bfeb6aa+d0fb492+bfd284d` | schema/fixtures/web-e2e/perf，Soak/真机待窗口 |
 
-> 本计划已覆盖 `V2.1` 全36章（含新增 §1.6.1 §2.1 §3.10.1 §4.4表 §6.5-6.6 §25.2-25.3 等），无遗漏；后续实施以本计划的 Gate 为唯一验收依据。
+后续仅剩 **24h Soak + real-device matrix（§26 K）** 需硬件窗口；软件 DoD 已齐。
+
+> 本计划已覆盖 `V2.1` 全36章，无遗漏；本分支 **不直接合 master**，需 `approve + git merge --no-ff`。
