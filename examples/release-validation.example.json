@@ -36,6 +36,6 @@
     { "driver": "s7", "capability": "write", "status": "skipped", "detail": "safe DB write pending soak window" },
     { "driver": "focas2", "capability": "probe", "status": "passed", "detail": "192.168.15.165:8193 OpenConnection ok" },
     { "driver": "focas2", "capability": "pmc_rdpmcrng", "status": "passed", "detail": "R100..118 WORD10→1 range_call verified via test_native" },
-    { "driver": "focas2", "capability": "command", "status": "skipped", "detail": "controls=[] pending Simulator baseline, 165 ready for reset/start" }
+    { "driver": "focas2", "capability": "command", "status": "passed", "detail": "165 status command via Control32 Succeeded (192.168.15.165:8193, use_native)" }
   ]
 }

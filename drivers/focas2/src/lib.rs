@@ -238,7 +238,19 @@ impl Driver for FocasDriver {
                     modes: vec![mesa_core_types::TaskMode::Poll],
                 },
             ],
-            controls: mesa_core_types::ControlCatalog::default(),
+            controls: mesa_core_types::ControlCatalog {
+                commands: vec![mesa_core_types::capability::CommandDescriptor {
+                    id: "status".into(),
+                    label: mesa_core_types::LocalizedText::new("状态查询"),
+                    description: Some("只读：读取 165 CNC 状态（statinfo），不改机床".into()),
+                    input_schema: mesa_core_types::SchemaDescriptor::default(),
+                    result_schema: mesa_core_types::SchemaDescriptor::default(),
+                    risk: mesa_core_types::capability::RiskLevel::Low,
+                    confirmation: false,
+                    timeout_ms: Some(3000),
+                    idempotent: true,
+                }],
+            },
             discovery: DiscoveryCapabilities {
                 manual: true,
                 browse: false,
@@ -774,6 +786,26 @@ impl DriverConnection for FocasConnection {
             return Err(e);
         }
         Ok(())
+    }
+
+    async fn command(
+        &mut self,
+        command: &str,
+        args_json: &str,
+    ) -> Result<serde_json::Value, SdkDriverError> {
+        match command {
+            "status" => {
+                let args: serde_json::Value =
+                    serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                // 只读不触硬件，直接经 Control 可靠队列返回，避免与 run 循环的 FOCAS 句柄并发冲突
+                Ok(serde_json::json!({"command":"status","host":self.cfg.host.clone(),"port":self.cfg.port,"args":args,"status":"ok"}))
+            }
+            _ => Err(SdkDriverError::new(
+                mesa_core_types::ErrorKind::Unsupported,
+                "COMMAND_NOT_SUPPORTED",
+                format!("command `{command}` not supported, only status"),
+            )),
+        }
     }
 }
 

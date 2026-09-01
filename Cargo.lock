@@ -1305,6 +1305,7 @@ dependencies = [
  "mesa-core-types",
  "mesa-driver-manager",
  "mesa-driver-sdk",
+ "mesa-driver-simulator",
  "serde_json",
  "tempfile",
  "tokio",
