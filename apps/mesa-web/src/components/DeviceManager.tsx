@@ -153,7 +153,8 @@ export function DeviceManager() {
 
   const saveEdit = async () => {
     if (!editEp) return;
-    const v = editForm.getFieldsValue();
+    let v: Record<string, unknown>;
+    try { v = await editForm.validateFields(); } catch { return; }
     const connection: Record<string, unknown> = {};
     for (const k of Object.keys(v)) if (v[k] !== undefined && v[k] !== "" && v[k] !== null) connection[k] = v[k];
     // 重连态需先停止再改
