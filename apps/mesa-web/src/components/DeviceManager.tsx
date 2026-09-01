@@ -115,9 +115,19 @@ export function DeviceManager() {
   };
 
   const act = async (id: string, a: "start" | "stop" | "delete") => {
+    if (a === "delete") {
+      await fetch(`/api/v1/endpoints/${id}/stop`, { method: "POST" }).catch(() => {});
+      await new Promise((r) => setTimeout(r, 300));
+    }
     const url = a === "delete" ? `/api/v1/endpoints/${id}` : `/api/v1/endpoints/${id}/${a}`;
     const r = await fetch(url, { method: a === "delete" ? "DELETE" : "POST" });
-    if (!r.ok) { const j = await r.json().catch(() => ({})); message.error(j.error?.message ?? a + " 失败"); return; }
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      // 重连态下 CONFLICT 提示需先停止，已尝试停止仍失败则直接提示
+      message.error(j.error?.message ?? a + " 失败");
+      load();
+      return;
+    }
     message.success(a + " 成功");
     load();
   };
@@ -135,8 +145,8 @@ export function DeviceManager() {
 
   useEffect(() => {
     if (editOpen && editDesc) {
-      // Modal 动画 + 字段渲染后回填
-      const id = setTimeout(() => editForm.setFieldsValue({ ...editConn }), 300);
+      editForm.resetFields();
+      const id = setTimeout(() => editForm.setFieldsValue({ ...editConn }), 100);
       return () => clearTimeout(id);
     }
   }, [editOpen, editDesc, editConn]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -146,9 +156,12 @@ export function DeviceManager() {
     const v = editForm.getFieldsValue();
     const connection: Record<string, unknown> = {};
     for (const k of Object.keys(v)) if (v[k] !== undefined && v[k] !== "" && v[k] !== null) connection[k] = v[k];
-    const r = await fetch(`/api/v1/endpoints/${editEp.id}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ device_id: editEp.device_id ?? editEp.id, driver_id: editEp.driver_id, connection }) });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) return message.error(j.error?.message ?? "修改失败（需先停止）");
+    // 重连态需先停止再改
+    await fetch(`/api/v1/endpoints/${editEp.id}/stop`, { method: "POST" }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 300));
+    const r2 = await fetch(`/api/v1/endpoints/${editEp.id}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ device_id: editEp.device_id ?? editEp.id, driver_id: editEp.driver_id, connection }) });
+    const j = await r2.json().catch(() => ({}));
+    if (!r2.ok) return message.error(j.error?.message ?? "修改失败");
     message.success("修改成功");
     setEditOpen(false);
     load();
@@ -285,7 +298,7 @@ export function DeviceManager() {
         </Form>
       </Modal>
 
-      <Modal title={`编辑 · ${editEp?.id ?? ""}`} open={editOpen} onOk={saveEdit} onCancel={() => setEditOpen(false)} okText="保存" width={640} destroyOnClose>
+      <Modal title={`编辑 · ${editEp?.id ?? ""}`} open={editOpen} onOk={saveEdit} onCancel={() => setEditOpen(false)} okText="保存" width={640} destroyOnClose={false} forceRender>
         {!editDesc ? <div style={{ color: "#999" }}>加载中…</div> : (
           <Form form={editForm} layout="vertical">
             {(editDesc.connection.fields ?? []).map((f) => (
