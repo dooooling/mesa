@@ -268,7 +268,10 @@ async fn get_profile(
     } else {
         (
             StatusCode::NOT_FOUND,
-            Json(json_error("NOT_FOUND", &format!("profile `{id}` not found"))),
+            Json(json_error(
+                "NOT_FOUND",
+                &format!("profile `{id}` not found"),
+            )),
         )
     }
 }
@@ -459,8 +462,11 @@ async fn browse_endpoint(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(json_error("NOT_FOUND", &format!("endpoint `{id}` not found"))),
-            )
+                Json(json_error(
+                    "NOT_FOUND",
+                    &format!("endpoint `{id}` not found"),
+                )),
+            );
         }
         Err(e) => return store_err_to_response(e),
     };
@@ -470,7 +476,14 @@ async fn browse_endpoint(
     let limit = body.limit.unwrap_or(50).min(1000);
     match state
         .manager
-        .browse(&rec.driver_id, &rec.connection_json, &parent, &filter, &cursor, limit)
+        .browse(
+            &rec.driver_id,
+            &rec.connection_json,
+            &parent,
+            &filter,
+            &cursor,
+            limit,
+        )
         .await
     {
         Ok((nodes, next)) => {
@@ -492,7 +505,7 @@ async fn browse_endpoint(
                 StatusCode::OK,
                 Json(serde_json::json!({ "nodes": nodes_json, "next_cursor": next })),
             )
-        },
+        }
         Err(e) => {
             let status = if e.code == "BROWSE_FAILED" || e.code == "DRIVER_UNAVAILABLE" {
                 StatusCode::SERVICE_UNAVAILABLE
@@ -556,7 +569,9 @@ fn json_to_value(v: &serde_json::Value) -> Result<mesa_core_types::Value, String
         serde_json::Value::String(s) => Ok(mesa_core_types::Value::String(s.clone())),
         serde_json::Value::Array(arr) => {
             // 简单按首元素类型推断，Simulator 仅需标量，数组罕用
-            Err(format!("array value not supported in control write: {arr:?}"))
+            Err(format!(
+                "array value not supported in control write: {arr:?}"
+            ))
         }
         serde_json::Value::Null => Err("null value not allowed".into()),
         serde_json::Value::Object(_) => {
@@ -574,7 +589,10 @@ async fn control_write(
     if !state.enable_control {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json_error("CONTROL_DISABLED", "control plane disabled, start mesad with --enable-control")),
+            Json(json_error(
+                "CONTROL_DISABLED",
+                "control plane disabled, start mesad with --enable-control",
+            )),
         );
     }
     // endpoint 存在性校验
@@ -583,28 +601,47 @@ async fn control_write(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(json_error("NOT_FOUND", &format!("endpoint `{id}` not found"))),
-            )
+                Json(json_error(
+                    "NOT_FOUND",
+                    &format!("endpoint `{id}` not found"),
+                )),
+            );
         }
         Err(e) => return store_err_to_response(e),
     };
     let _ = rec; // 已校验存在，具体 driver 能力由 Driver 二次校验
     let target = body.target.trim();
     if target.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", "target required")));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("VALIDATION_ERROR", "target required")),
+        );
     }
     let value = if let Some(v) = body.value_typed {
         v
     } else {
         match json_to_value(&body.value) {
             Ok(v) => v,
-            Err(e) => return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", &e))),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_error("VALIDATION_ERROR", &e)),
+                );
+            }
         }
     };
     let expected = if let Some(ev) = body.expected_value {
         match json_to_value(&ev) {
             Ok(v) => Some(v),
-            Err(e) => return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", &format!("expected_value: {e}")))),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_error(
+                        "VALIDATION_ERROR",
+                        &format!("expected_value: {e}"),
+                    )),
+                );
+            }
         }
     } else {
         None
@@ -618,16 +655,23 @@ async fn control_write(
         actor: "local-api".into(),
         operation_type: "write".into(),
         operation_id: target.to_string(),
-        request_json: serde_json::json!({"target": target, "value": format!("{value:?}")}).to_string(),
+        request_json: serde_json::json!({"target": target, "value": format!("{value:?}")})
+            .to_string(),
         result_json: None,
         status: "STARTED".into(),
         started_at_ns: mesa_core_types::now_unix_ns(),
         finished_at_ns: None,
     };
     let _ = state.store.insert_control_audit(&audit_started);
-    match state.manager.control_write(&id, target, value, expected).await {
+    match state
+        .manager
+        .control_write(&id, target, value, expected)
+        .await
+    {
         Ok(readback) => {
-            let detail = serde_json::json!({"readback": readback.as_ref().map(|v| format!("{v:?}"))}).to_string();
+            let detail =
+                serde_json::json!({"readback": readback.as_ref().map(|v| format!("{v:?}"))})
+                    .to_string();
             let audit = mesa_config_store::ControlAuditRecord {
                 request_id: format!("{}-done", request_id),
                 endpoint_id: id.clone(),
@@ -641,8 +685,14 @@ async fn control_write(
                 finished_at_ns: Some(mesa_core_types::now_unix_ns()),
             };
             let _ = state.store.insert_control_audit(&audit);
-            let rb_json = readback.map(|v| serde_json::to_value(&v).unwrap_or(serde_json::Value::Null));
-            (StatusCode::OK, Json(serde_json::json!({"request_id": request_id, "status":"Succeeded", "readback": rb_json})))
+            let rb_json =
+                readback.map(|v| serde_json::to_value(&v).unwrap_or(serde_json::Value::Null));
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({"request_id": request_id, "status":"Succeeded", "readback": rb_json}),
+                ),
+            )
         }
         Err(e) => {
             let audit = mesa_config_store::ControlAuditRecord {
@@ -658,8 +708,17 @@ async fn control_write(
                 finished_at_ns: Some(mesa_core_types::now_unix_ns()),
             };
             let _ = state.store.insert_control_audit(&audit);
-            let status = if e.code == "ENDPOINT_NOT_RUNNING" { StatusCode::CONFLICT } else { StatusCode::BAD_GATEWAY };
-            (status, Json(serde_json::json!({"error": {"code": e.code, "message": e.message}, "request_id": request_id})))
+            let status = if e.code == "ENDPOINT_NOT_RUNNING" {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (
+                status,
+                Json(
+                    serde_json::json!({"error": {"code": e.code, "message": e.message}, "request_id": request_id}),
+                ),
+            )
         }
     }
 }
@@ -680,7 +739,10 @@ async fn control_command(
     if !state.enable_control {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json_error("CONTROL_DISABLED", "control plane disabled, start mesad with --enable-control")),
+            Json(json_error(
+                "CONTROL_DISABLED",
+                "control plane disabled, start mesad with --enable-control",
+            )),
         );
     }
     let rec = match state.store.get_endpoint(&id) {
@@ -688,14 +750,23 @@ async fn control_command(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(json_error("NOT_FOUND", &format!("endpoint `{id}` not found"))),
-            )
+                Json(json_error(
+                    "NOT_FOUND",
+                    &format!("endpoint `{id}` not found"),
+                )),
+            );
         }
         Err(e) => return store_err_to_response(e),
     };
     let _ = rec;
     // 解析 body 中的 command_id / input
-    let parsed: ControlCommandReq = serde_json::from_value(body.clone()).unwrap_or(ControlCommandReq { command_id: None, command: None, input_json: None, input: None });
+    let parsed: ControlCommandReq =
+        serde_json::from_value(body.clone()).unwrap_or(ControlCommandReq {
+            command_id: None,
+            command: None,
+            input_json: None,
+            input: None,
+        });
     let command_id = parsed.command_id.or(parsed.command).unwrap_or(cmd);
     let input_json = if let Some(s) = parsed.input_json {
         s
@@ -721,9 +792,17 @@ async fn control_command(
         finished_at_ns: None,
     };
     let _ = state.store.insert_control_audit(&audit_started);
-    match state.manager.control_command(&id, &command_id, &input_json).await {
+    match state
+        .manager
+        .control_command(&id, &command_id, &input_json)
+        .await
+    {
         Ok((status, result_json, error)) => {
-            let audit_status = if status == "Succeeded" { "COMPLETED" } else { "FAILED" };
+            let audit_status = if status == "Succeeded" {
+                "COMPLETED"
+            } else {
+                "FAILED"
+            };
             let audit = mesa_config_store::ControlAuditRecord {
                 request_id: format!("{}-done", request_id),
                 endpoint_id: id.clone(),
@@ -737,8 +816,14 @@ async fn control_command(
                 finished_at_ns: Some(mesa_core_types::now_unix_ns()),
             };
             let _ = state.store.insert_control_audit(&audit);
-            let result_val: serde_json::Value = serde_json::from_str(&result_json).unwrap_or(serde_json::Value::String(result_json.clone()));
-            (StatusCode::OK, Json(serde_json::json!({"request_id": request_id, "status": status, "result": result_val, "error": error})))
+            let result_val: serde_json::Value = serde_json::from_str(&result_json)
+                .unwrap_or(serde_json::Value::String(result_json.clone()));
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({"request_id": request_id, "status": status, "result": result_val, "error": error}),
+                ),
+            )
         }
         Err(e) => {
             let audit = mesa_config_store::ControlAuditRecord {
@@ -754,8 +839,17 @@ async fn control_command(
                 finished_at_ns: Some(mesa_core_types::now_unix_ns()),
             };
             let _ = state.store.insert_control_audit(&audit);
-            let status = if e.code == "ENDPOINT_NOT_RUNNING" { StatusCode::CONFLICT } else { StatusCode::BAD_GATEWAY };
-            (status, Json(serde_json::json!({"error": {"code": e.code, "message": e.message}, "request_id": request_id})))
+            let status = if e.code == "ENDPOINT_NOT_RUNNING" {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (
+                status,
+                Json(
+                    serde_json::json!({"error": {"code": e.code, "message": e.message}, "request_id": request_id}),
+                ),
+            )
         }
     }
 }
@@ -787,7 +881,9 @@ async fn list_control_audit(
             let next_cursor = list.last().map(|r| r.started_at_ns.to_string());
             (
                 StatusCode::OK,
-                Json(serde_json::json!({"audits": list, "next_cursor": next_cursor, "count": list.len()})),
+                Json(
+                    serde_json::json!({"audits": list, "next_cursor": next_cursor, "count": list.len()}),
+                ),
             )
         }
         Err(e) => store_err_to_response(e),
@@ -802,7 +898,10 @@ async fn get_control_audit(
         Ok(Some(rec)) => (StatusCode::OK, Json(serde_json::to_value(rec).unwrap())),
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json(json_error("NOT_FOUND", &format!("audit `{request_id}` not found"))),
+            Json(json_error(
+                "NOT_FOUND",
+                &format!("audit `{request_id}` not found"),
+            )),
         ),
         Err(e) => store_err_to_response(e),
     }
@@ -1575,7 +1674,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/endpoints/{id}/browse", post(browse_endpoint))
         .route("/api/v1/endpoints/{id}/import", post(import_endpoint))
         .route("/api/v1/endpoints/{id}/write", post(control_write))
-        .route("/api/v1/endpoints/{id}/commands/{command}", post(control_command))
+        .route(
+            "/api/v1/endpoints/{id}/commands/{command}",
+            post(control_command),
+        )
         .route("/api/v1/control/audit", get(list_control_audit))
         .route("/api/v1/control/audit/{request_id}", get(get_control_audit))
         .route("/api/v1/points/latest", get(latest_points))

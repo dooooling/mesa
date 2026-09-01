@@ -798,7 +798,9 @@ impl DriverConnection for FocasConnection {
                 let args: serde_json::Value =
                     serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
                 // 只读不触硬件，直接经 Control 可靠队列返回，避免与 run 循环的 FOCAS 句柄并发冲突
-                Ok(serde_json::json!({"command":"status","host":self.cfg.host.clone(),"port":self.cfg.port,"args":args,"status":"ok"}))
+                Ok(
+                    serde_json::json!({"command":"status","host":self.cfg.host.clone(),"port":self.cfg.port,"args":args,"status":"ok"}),
+                )
             }
             _ => Err(SdkDriverError::new(
                 mesa_core_types::ErrorKind::Unsupported,

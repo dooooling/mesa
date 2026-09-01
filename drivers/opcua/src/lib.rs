@@ -745,14 +745,22 @@ impl DriverConnection for OpcUaConnection {
         limit: u32,
     ) -> Result<(Vec<mesa_driver_protocol::pb::BrowseNode>, Option<String>), SdkDriverError> {
         // 确保已连接（browse 可能在 run 之外被调用）
-        if let Err(e) = self.api.connect(&self.cfg.endpoint_url, self.cfg.timeout_ms).await {
+        if let Err(e) = self
+            .api
+            .connect(&self.cfg.endpoint_url, self.cfg.timeout_ms)
+            .await
+        {
             return Err(SdkDriverError::new(
                 mesa_core_types::ErrorKind::Connection,
                 "CONNECT_FAILED",
                 e,
             ));
         }
-        let parent_str = if parent.is_empty() { "ns=0;i=85" } else { parent };
+        let parent_str = if parent.is_empty() {
+            "ns=0;i=85"
+        } else {
+            parent
+        };
         let addr = parse_address(parent_str).map_err(|e| match e {
             AddressError::Empty => SdkDriverError::configuration("INVALID_ADDRESS", "parent 为空"),
             AddressError::Invalid { reason, .. } => SdkDriverError::new(
@@ -761,11 +769,9 @@ impl DriverConnection for OpcUaConnection {
                 format!("parent `{parent_str}` 非法: {reason}"),
             ),
         })?;
-        let children = self
-            .api
-            .browse(&addr)
-            .await
-            .map_err(|e| SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "BROWSE_FAILED", e))?;
+        let children = self.api.browse(&addr).await.map_err(|e| {
+            SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "BROWSE_FAILED", e)
+        })?;
         // 过滤与分页
         let filtered: Vec<String> = children
             .into_iter()
@@ -791,7 +797,8 @@ impl DriverConnection for OpcUaConnection {
                     data_type: "String".into(),
                     access: "read".into(),
                     has_children: true,
-                    binding_json: serde_json::json!({"node_id": node_id, "data_type": "String"}).to_string(),
+                    binding_json: serde_json::json!({"node_id": node_id, "data_type": "String"})
+                        .to_string(),
                 }
             })
             .collect();

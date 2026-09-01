@@ -56,7 +56,13 @@ impl DeviceProfile {
             return Err("driver_id 不能为空".into());
         }
         // match_rules 白名单校验
-        let allowed_fields = ["driver_id", "probe.vendor", "probe.family", "probe.model", "probe.firmware"];
+        let allowed_fields = [
+            "driver_id",
+            "probe.vendor",
+            "probe.family",
+            "probe.model",
+            "probe.firmware",
+        ];
         let allowed_ops = ["eq", "in", "prefix"];
         for r in &self.match_rules {
             if !allowed_fields.contains(&r.field.as_str()) {

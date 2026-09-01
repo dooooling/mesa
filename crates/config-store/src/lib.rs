@@ -874,7 +874,10 @@ impl ConfigStore {
         sql.push_str(" ORDER BY started_at_ns DESC LIMIT ?");
         args.push(Box::new(limit as i64));
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> = args
+            .iter()
+            .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
+            .collect();
         let rows = stmt.query_map(params.as_slice(), |r| {
             Ok(ControlAuditRecord {
                 request_id: r.get(0)?,

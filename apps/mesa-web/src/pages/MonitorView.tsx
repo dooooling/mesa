@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Card, Input, Select, Space, Table, Tag } from "antd";
 
-type Point = { endpoint_id: string; point_key: string; point_id: number; quality: string; value: { type: string; value: unknown }; timestamp_ns: number };
+type Point = { endpoint_id: string; key: string; point_key?: string; point_id: number; quality: string; type: string; value: unknown; timestamp_ns: number };
 
 export function MonitorView() {
   const [points, setPoints] = useState<Point[]>([]);
@@ -16,8 +16,9 @@ export function MonitorView() {
   }, []);
 
   const data = points.filter((p) => {
+    const k = p.key ?? p.point_key ?? "";
     if (quality !== "ALL" && p.quality !== quality) return false;
-    if (filter && !(p.point_key.includes(filter) || p.endpoint_id.includes(filter))) return false;
+    if (filter && !(k.includes(filter) || p.endpoint_id.includes(filter))) return false;
     return true;
   });
 
@@ -39,9 +40,9 @@ export function MonitorView() {
         pagination={{ pageSize: 20 }}
         columns={[
           { title: "设备", dataIndex: "endpoint_id", render: (v: string) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{v}</span> },
-          { title: "点位", dataIndex: "point_key", render: (v: string) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{v}</span> },
-          { title: "值", render: (_: unknown, r: Point) => String(r.value.value) },
-          { title: "类型", render: (_: unknown, r: Point) => <Tag>{r.value.type}</Tag> },
+          { title: "点位", render: (_: unknown, r: Point) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{r.key ?? r.point_key ?? ""}</span> },
+          { title: "值", render: (_: unknown, r: Point) => String(r.value ?? "") },
+          { title: "类型", dataIndex: "type", render: (v: string) => <Tag>{v ?? "—"}</Tag> },
           { title: "质量", dataIndex: "quality", render: (v: string) => <Tag color={v === "GOOD" ? "green" : v === "BAD" ? "red" : "orange"}>{v}</Tag> },
           { title: "时间", render: (_: unknown, r: Point) => new Date(Number(r.timestamp_ns) / 1e6).toLocaleTimeString() },
         ]}

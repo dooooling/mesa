@@ -51,7 +51,9 @@ pub struct MesaManager {
     descriptor_cache: RwLock<HashMap<DescriptorCacheKey, CachedDescriptor>>,
     profiles: RwLock<Vec<mesa_core_types::DeviceProfile>>,
     /// 活跃会话注册表：endpoint_id -> Session（用于 Control 面可靠转发，§22）
-    active_sessions: std::sync::Arc<RwLock<HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>>,
+    active_sessions: std::sync::Arc<
+        RwLock<HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>,
+    >,
 }
 
 impl MesaManager {
@@ -325,24 +327,30 @@ impl MesaManager {
         cursor: &str,
         limit: u32,
     ) -> Result<(Vec<mesa_driver_protocol::pb::BrowseNode>, Option<String>), DescriptorError> {
-        let disc = self
-            .find_driver(driver_id)
-            .ok_or_else(|| DescriptorError::new("DRIVER_UNAVAILABLE", format!("driver `{driver_id}` not found")))?;
+        let disc = self.find_driver(driver_id).ok_or_else(|| {
+            DescriptorError::new(
+                "DRIVER_UNAVAILABLE",
+                format!("driver `{driver_id}` not found"),
+            )
+        })?;
         let mut proc = crate::process::DriverProcess::spawn(&disc)
             .await
-            .map_err(|e| DescriptorError::new("DRIVER_UNAVAILABLE", format!("spawn failed: {e}")))?;
+            .map_err(|e| {
+                DescriptorError::new("DRIVER_UNAVAILABLE", format!("spawn failed: {e}"))
+            })?;
         let port = proc.port;
         let token = proc.token.clone();
-        let (mut session, _events, _) = match crate::session::Session::connect_retry(port, &token).await {
-            Ok(v) => v,
-            Err(e) => {
-                proc.terminate().await;
-                return Err(DescriptorError::new(
-                    "DRIVER_UNAVAILABLE",
-                    format!("handshake failed: {e}"),
-                ));
-            }
-        };
+        let (mut session, _events, _) =
+            match crate::session::Session::connect_retry(port, &token).await {
+                Ok(v) => v,
+                Err(e) => {
+                    proc.terminate().await;
+                    return Err(DescriptorError::new(
+                        "DRIVER_UNAVAILABLE",
+                        format!("handshake failed: {e}"),
+                    ));
+                }
+            };
         // 打开临时连接（handle 1）
         let handle = 1;
         let open_res = session
@@ -373,7 +381,10 @@ impl MesaManager {
             _ => {
                 session.invalidate();
                 proc.terminate().await;
-                return Err(DescriptorError::new("DRIVER_UNAVAILABLE", "open unexpected"));
+                return Err(DescriptorError::new(
+                    "DRIVER_UNAVAILABLE",
+                    "open unexpected",
+                ));
             }
         }
         let res = session
@@ -397,7 +408,12 @@ impl MesaManager {
             let m = self.active_sessions.read().unwrap();
             m.get(endpoint_id).cloned()
         }
-        .ok_or_else(|| DescriptorError::new("ENDPOINT_NOT_RUNNING", format!("endpoint `{endpoint_id}` not running")))?;
+        .ok_or_else(|| {
+            DescriptorError::new(
+                "ENDPOINT_NOT_RUNNING",
+                format!("endpoint `{endpoint_id}` not running"),
+            )
+        })?;
         let request_id = format!("wr-{}-{}", endpoint_id, mesa_core_types::now_unix_ns());
         let sess = sess_arc.lock().await;
         // 约定 handle 1 为 Endpoint 主连接（endpoint.rs HANDLE=1）
@@ -417,7 +433,12 @@ impl MesaManager {
             let m = self.active_sessions.read().unwrap();
             m.get(endpoint_id).cloned()
         }
-        .ok_or_else(|| DescriptorError::new("ENDPOINT_NOT_RUNNING", format!("endpoint `{endpoint_id}` not running")))?;
+        .ok_or_else(|| {
+            DescriptorError::new(
+                "ENDPOINT_NOT_RUNNING",
+                format!("endpoint `{endpoint_id}` not running"),
+            )
+        })?;
         let request_id = format!("cmd-{}-{}", endpoint_id, mesa_core_types::now_unix_ns());
         let sess = sess_arc.lock().await;
         sess.command(1, &request_id, command_id, input_json)
@@ -444,7 +465,11 @@ impl MesaManager {
     }
 
     /// 直接通过 registry 操作（供 endpoint.rs 使用，避免 &self 借用冲突）
-    pub fn registry(&self) -> std::sync::Arc<RwLock<HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>> {
+    pub fn registry(
+        &self,
+    ) -> std::sync::Arc<
+        RwLock<HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>,
+    > {
         std::sync::Arc::clone(&self.active_sessions)
     }
 }

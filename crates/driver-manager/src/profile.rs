@@ -34,7 +34,9 @@ pub fn load_profiles(drivers_dir: &Path) -> Vec<DeviceProfile> {
             match serde_json::from_str::<DeviceProfile>(&content) {
                 Ok(p) => match p.validate() {
                     Ok(()) => out.push(p),
-                    Err(e) => tracing::warn!(path=%path.display(), error=%e, "profile validate failed"),
+                    Err(e) => {
+                        tracing::warn!(path=%path.display(), error=%e, "profile validate failed")
+                    }
                 },
                 Err(e) => tracing::warn!(path=%path.display(), error=%e, "profile parse failed"),
             }

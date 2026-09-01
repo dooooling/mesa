@@ -147,7 +147,9 @@ fn parse_args() -> Args {
                 i += 1;
             }
             other => {
-                eprintln!("unknown arg: {other} (supported: --drivers-dir --http-port --db --enable-control)");
+                eprintln!(
+                    "unknown arg: {other} (supported: --drivers-dir --http-port --db --enable-control)"
+                );
                 i += 1;
             }
         }
