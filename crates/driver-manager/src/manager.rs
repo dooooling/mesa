@@ -285,4 +285,74 @@ impl MesaManager {
             .map(|((id, ver), _)| (format!("{id}@{ver}"), "cached".into()))
             .collect()
     }
+
+    /// Browse（§20）：临时进程 + 分页，用于 OPC UA 等支持浏览的驱动
+    pub async fn browse(
+        &self,
+        driver_id: &str,
+        connection_json: &str,
+        parent: &str,
+        filter: &str,
+        cursor: &str,
+        limit: u32,
+    ) -> Result<(Vec<mesa_driver_protocol::pb::BrowseNode>, Option<String>), DescriptorError> {
+        let disc = self
+            .find_driver(driver_id)
+            .ok_or_else(|| DescriptorError::new("DRIVER_UNAVAILABLE", format!("driver `{driver_id}` not found")))?;
+        let mut proc = crate::process::DriverProcess::spawn(&disc)
+            .await
+            .map_err(|e| DescriptorError::new("DRIVER_UNAVAILABLE", format!("spawn failed: {e}")))?;
+        let port = proc.port;
+        let token = proc.token.clone();
+        let (mut session, _events, _) = match crate::session::Session::connect_retry(port, &token).await {
+            Ok(v) => v,
+            Err(e) => {
+                proc.terminate().await;
+                return Err(DescriptorError::new(
+                    "DRIVER_UNAVAILABLE",
+                    format!("handshake failed: {e}"),
+                ));
+            }
+        };
+        // 打开临时连接（handle 1）
+        let handle = 1;
+        let open_res = session
+            .call(mesa_driver_protocol::pb::envelope::Body::OpenConnection(
+                mesa_driver_protocol::pb::OpenConnection {
+                    connection_handle: handle,
+                    endpoint_id: format!("browse-{driver_id}"),
+                    config_json: connection_json.to_string(),
+                },
+            ))
+            .await
+            .map_err(|e| DescriptorError::new("DRIVER_UNAVAILABLE", format!("open failed: {e}")))?;
+        match open_res.body {
+            Some(mesa_driver_protocol::pb::envelope::Body::OpenConnectionAck(ack)) => {
+                let ok = ack.result.map(|r| r.ok).unwrap_or(false);
+                if !ok {
+                    session.invalidate();
+                    proc.terminate().await;
+                    return Err(DescriptorError::new("DRIVER_UNAVAILABLE", "open not ok"));
+                }
+            }
+            Some(mesa_driver_protocol::pb::envelope::Body::DriverError(e)) => {
+                let d = e.detail.unwrap_or_default();
+                session.invalidate();
+                proc.terminate().await;
+                return Err(DescriptorError::new(d.code, d.message));
+            }
+            _ => {
+                session.invalidate();
+                proc.terminate().await;
+                return Err(DescriptorError::new("DRIVER_UNAVAILABLE", "open unexpected"));
+            }
+        }
+        let res = session
+            .browse(handle, parent, filter, cursor, limit)
+            .await
+            .map_err(|e| DescriptorError::new("BROWSE_FAILED", format!("{e}")))?;
+        session.invalidate();
+        proc.terminate().await;
+        Ok(res)
+    }
 }

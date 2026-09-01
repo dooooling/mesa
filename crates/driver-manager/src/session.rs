@@ -330,6 +330,58 @@ impl Session {
         }
     }
 
+    /// Browse（§20）：分页浏览，返回 (nodes, next_cursor)
+    pub async fn browse(
+        &self,
+        connection_handle: u32,
+        parent: &str,
+        filter: &str,
+        cursor: &str,
+        limit: u32,
+    ) -> Result<(Vec<pb::BrowseNode>, Option<String>), SessionError> {
+        let id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
+        let rx = self.shared.register(id);
+        let env = pb::Envelope {
+            msg_id: id,
+            body: Some(pb::envelope::Body::BrowseRequest(pb::BrowseRequest {
+                connection_handle,
+                parent: parent.to_string(),
+                filter: filter.to_string(),
+                cursor: cursor.to_string(),
+                limit,
+            })),
+        };
+        {
+            let mut wr = self.shared.writer.lock().await;
+            write_envelope(&mut *wr, &env).await?;
+        }
+        let reply = match tokio::time::timeout(Duration::from_secs(10), rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => return Err(SessionError::Closed),
+            Err(_) => {
+                self.shared.unregister(id);
+                return Err(SessionError::Timeout);
+            }
+        };
+        match reply.body {
+            Some(pb::envelope::Body::BrowseResponse(resp)) => {
+                if let Some(result) = resp.result {
+                    if !result.ok {
+                        let d = result.error.unwrap_or_default();
+                        return Err(SessionError::Handshake(format!("{}/{}: {}", d.kind, d.code, d.message)));
+                    }
+                }
+                let next = if resp.next_cursor.is_empty() {
+                    None
+                } else {
+                    Some(resp.next_cursor)
+                };
+                Ok((resp.nodes, next))
+            }
+            _ => Err(SessionError::Closed),
+        }
+    }
+
     /// 发送一帧并等待同 msg_id 的响应帧。超时即清理登记项，防止泄漏。
     pub async fn call(&self, body: pb::envelope::Body) -> Result<pb::Envelope, SessionError> {
         let id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);

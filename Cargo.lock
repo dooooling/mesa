@@ -1228,6 +1228,7 @@ dependencies = [
  "base64",
  "bytes",
  "mesa-core-types",
+ "mesa-driver-protocol",
  "mesa-driver-sdk",
  "serde",
  "serde_json",

@@ -395,6 +395,85 @@ async fn probe_driver(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct BrowseReq {
+    parent: Option<String>,
+    filter: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+async fn browse_endpoint(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<BrowseReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let rec = match state.store.get_endpoint(&id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json_error("NOT_FOUND", &format!("endpoint `{id}` not found"))),
+            )
+        }
+        Err(e) => return store_err_to_response(e),
+    };
+    let parent = body.parent.unwrap_or_default();
+    let filter = body.filter.unwrap_or_default();
+    let cursor = body.cursor.unwrap_or_default();
+    let limit = body.limit.unwrap_or(50).min(1000);
+    match state
+        .manager
+        .browse(&rec.driver_id, &rec.connection_json, &parent, &filter, &cursor, limit)
+        .await
+    {
+        Ok((nodes, next)) => {
+            let nodes_json: Vec<serde_json::Value> = nodes
+                .into_iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "id": n.id,
+                        "label": n.label,
+                        "kind": n.kind,
+                        "data_type": n.data_type,
+                        "access": n.access,
+                        "has_children": n.has_children,
+                        "binding_json": n.binding_json,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "nodes": nodes_json, "next_cursor": next })),
+            )
+        },
+        Err(e) => {
+            let status = if e.code == "BROWSE_FAILED" || e.code == "DRIVER_UNAVAILABLE" {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                status,
+                Json(serde_json::json!({ "error": { "code": e.code, "message": e.message } })),
+            )
+        }
+    }
+}
+
+async fn import_endpoint(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(_body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // 占位：当前仅 OPC UA 等支持 browse，import 框架待 Milestone H 扩展
+    let _ = state.store.get_endpoint(&id);
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json_error("NOT_IMPLEMENTED", "import not yet implemented")),
+    )
+}
+
 async fn endpoint_diagnostics(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1157,6 +1236,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/endpoints/{id}/diagnostics",
             get(endpoint_diagnostics),
         )
+        .route("/api/v1/endpoints/{id}/browse", post(browse_endpoint))
+        .route("/api/v1/endpoints/{id}/import", post(import_endpoint))
         .route("/api/v1/points/latest", get(latest_points))
         .route("/api/v1/diagnostics", get(diagnostics))
         // Devices CRUD

@@ -50,6 +50,10 @@ message Envelope {
     // Management Plane: Descriptor 自描述（§4.4 V2.1）低频 JSON，不污染 DataBatch 热路径
     GetDescriptor get_descriptor = 32;
     DescriptorReport descriptor_report = 33;
+
+    // Management Plane: Browse / Discovery（§20）分页、懒加载，禁一次返全空间
+    BrowseRequest browse_request = 34;
+    BrowseResponse browse_response = 35;
   }
 }
 
@@ -262,4 +266,29 @@ message DescriptorReport {
   uint32 contract_major = 1;
   uint32 contract_minor = 2;
   string descriptor_json = 3;
+}
+
+message BrowseRequest {
+  uint32 connection_handle = 1;
+  string parent = 2;
+  string filter = 3;
+  string cursor = 4;
+  uint32 limit = 5;
+}
+
+message BrowseNode {
+  string id = 1;
+  string label = 2;
+  string kind = 3;
+  string data_type = 4;
+  string access = 5;
+  bool has_children = 6;
+  // 选中后生成 ResourceSelection 的 binding 片段（JSON 字符串），由前端透传
+  string binding_json = 7;
+}
+
+message BrowseResponse {
+  repeated BrowseNode nodes = 1;
+  string next_cursor = 2;
+  GenericResult result = 3;
 }

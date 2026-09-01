@@ -12,8 +12,10 @@
 mesa*.db
 mesa*.db-wal
 mesa*.db-shm
+mesa.db.bak.*
 *.db-wal
 *.db-shm
+*.bak.*
 
 # OPC UA 证书（本地生成）
 /data/

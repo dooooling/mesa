@@ -146,6 +146,21 @@ pub trait DriverConnection: Send {
         sink: DataSink,
         shutdown: CancellationToken,
     ) -> Result<(), SdkDriverError>;
+
+    /// 浏览（§20）：仅 OPC UA 等支持，默认返回 Unsupported。
+    async fn browse(
+        &mut self,
+        _parent: &str,
+        _filter: &str,
+        _cursor: &str,
+        _limit: u32,
+    ) -> Result<(Vec<mesa_driver_protocol::pb::BrowseNode>, Option<String>), SdkDriverError> {
+        Err(SdkDriverError::new(
+            mesa_core_types::ErrorKind::Unsupported,
+            "UNSUPPORTED",
+            "browse not supported",
+        ))
+    }
 }
 
 // 别名：AcquisitionTask 仅在 trait 签名中出现，保持与方案 §16 一致的命名可见性
@@ -705,6 +720,9 @@ async fn request_loop(
             Some(pb::envelope::Body::CloseConnection(req)) => {
                 on_close(session, req, env.msg_id).await
             }
+            Some(pb::envelope::Body::BrowseRequest(req)) => {
+                on_browse(session, req, env.msg_id).await
+            }
             Some(pb::envelope::Body::Shutdown(_)) => {
                 tracing::info!("shutdown requested by core");
                 return Ok(());
@@ -1037,6 +1055,92 @@ async fn on_close(session: &Session, req: pb::CloseConnection, msg_id: u64) {
             )),
         })
         .await;
+}
+
+async fn on_browse(session: &Session, req: pb::BrowseRequest, msg_id: u64) {
+    // 取对应连接，若 handle 为 0 则取任意已打开连接（兼容 probe 场景）
+    let conn_opt = {
+        let mut m = session.entries.lock().unwrap();
+        if let Some(entry) = m.get_mut(&req.connection_handle) {
+            entry.conn.take()
+        } else if req.connection_handle == 0 {
+            // 取第一个可用连接
+            let mut found = None;
+            for (_, e) in m.iter_mut() {
+                if e.conn.is_some() {
+                    found = e.conn.take();
+                    break;
+                }
+            }
+            found
+        } else {
+            None
+        }
+    };
+    let Some(mut conn) = conn_opt else {
+        session
+            .sink
+            .send_control(pb::Envelope {
+                msg_id,
+                body: Some(pb::envelope::Body::BrowseResponse(pb::BrowseResponse {
+                    nodes: vec![],
+                    next_cursor: "".into(),
+                    result: Some(err_result(
+                        ErrorKind::Internal,
+                        "NO_CONNECTION",
+                        "browse: connection not open",
+                    )),
+                })),
+            })
+            .await;
+        return;
+    };
+    let res = conn
+        .browse(&req.parent, &req.filter, &req.cursor, req.limit)
+        .await;
+    // 归还连接
+    {
+        let mut m = session.entries.lock().unwrap();
+        if let Some(entry) = m.get_mut(&req.connection_handle) {
+            entry.conn = Some(conn);
+        } else {
+            // 若原 handle 为 0，归还到任意
+            for (_, e) in m.iter_mut() {
+                if e.conn.is_none() {
+                    e.conn = Some(conn);
+                    break;
+                }
+            }
+        }
+    }
+    match res {
+        Ok((nodes, next)) => {
+            session
+                .sink
+                .send_control(pb::Envelope {
+                    msg_id,
+                    body: Some(pb::envelope::Body::BrowseResponse(pb::BrowseResponse {
+                        nodes,
+                        next_cursor: next.unwrap_or_default(),
+                        result: Some(ok_result()),
+                    })),
+                })
+                .await;
+        }
+        Err(e) => {
+            session
+                .sink
+                .send_control(pb::Envelope {
+                    msg_id,
+                    body: Some(pb::envelope::Body::BrowseResponse(pb::BrowseResponse {
+                        nodes: vec![],
+                        next_cursor: "".into(),
+                        result: Some(err_result(e.kind, &e.code, e.message)),
+                    })),
+                })
+                .await;
+        }
+    }
 }
 
 impl Session {

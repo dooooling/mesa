@@ -737,6 +737,67 @@ impl DriverConnection for OpcUaConnection {
         Ok(())
     }
 
+    async fn browse(
+        &mut self,
+        parent: &str,
+        filter: &str,
+        cursor: &str,
+        limit: u32,
+    ) -> Result<(Vec<mesa_driver_protocol::pb::BrowseNode>, Option<String>), SdkDriverError> {
+        // 确保已连接（browse 可能在 run 之外被调用）
+        if let Err(e) = self.api.connect(&self.cfg.endpoint_url, self.cfg.timeout_ms).await {
+            return Err(SdkDriverError::new(
+                mesa_core_types::ErrorKind::Connection,
+                "CONNECT_FAILED",
+                e,
+            ));
+        }
+        let parent_str = if parent.is_empty() { "ns=0;i=85" } else { parent };
+        let addr = parse_address(parent_str).map_err(|e| match e {
+            AddressError::Empty => SdkDriverError::configuration("INVALID_ADDRESS", "parent 为空"),
+            AddressError::Invalid { reason, .. } => SdkDriverError::new(
+                mesa_core_types::ErrorKind::Address,
+                "INVALID_ADDRESS",
+                format!("parent `{parent_str}` 非法: {reason}"),
+            ),
+        })?;
+        let children = self
+            .api
+            .browse(&addr)
+            .await
+            .map_err(|e| SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "BROWSE_FAILED", e))?;
+        // 过滤与分页
+        let filtered: Vec<String> = children
+            .into_iter()
+            .filter(|n| filter.is_empty() || n.contains(filter))
+            .collect();
+        let start = cursor.parse::<usize>().unwrap_or(0);
+        let lim = if limit == 0 { 50 } else { limit as usize };
+        let end = (start + lim).min(filtered.len());
+        let slice = &filtered[start..end];
+        let next_cursor = if end < filtered.len() {
+            Some(end.to_string())
+        } else {
+            None
+        };
+        let nodes = slice
+            .iter()
+            .map(|name| {
+                let node_id = format!("ns=2;s={}", name);
+                mesa_driver_protocol::pb::BrowseNode {
+                    id: name.clone(),
+                    label: name.clone(),
+                    kind: "node".into(),
+                    data_type: "String".into(),
+                    access: "read".into(),
+                    has_children: true,
+                    binding_json: serde_json::json!({"node_id": node_id, "data_type": "String"}).to_string(),
+                }
+            })
+            .collect();
+        Ok((nodes, next_cursor))
+    }
+
     async fn run(
         &mut self,
         sink: DataSink,
