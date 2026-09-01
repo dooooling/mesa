@@ -230,8 +230,8 @@ export function DeviceManager() {
           <>
             <div style={{ marginBottom: 12, display: "flex", gap: 8, alignItems: "center" }}>
               <span style={{ fontSize: 12 }}>采集周期</span>
-              <InputNumber min={100} max={60000} step={100} value={intervalMs} onChange={(v) => setIntervalMs(v ?? 1000)} addonAfter="ms" style={{ width: 180 }} />
-              <span style={{ fontSize: 12, color: "#999" }}>100ms–60s</span>
+              <InputNumber min={10} max={60000} step={10} value={intervalMs} onChange={(v) => setIntervalMs(v ?? 1000)} addonAfter="ms" style={{ width: 180 }} />
+              <span style={{ fontSize: 12, color: "#999" }}>10ms–60s，20ms已通过50K/s压测</span>
             </div>
             <ResourcePickerAntd resources={pointsDesc.resources} onAdd={(s) => {
               const keys = s.outputs.map((o) => o.point_key);
