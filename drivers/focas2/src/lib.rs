@@ -52,6 +52,204 @@ impl Driver for FocasDriver {
         }
     }
 
+    fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
+        use mesa_core_types::{
+            AccessMode, DataType, DiscoveryCapabilities, DriverCapabilities, DriverDescriptor,
+            DriverIdentity, FieldDescriptor, FieldType, LocalizedText, OutputDescriptor,
+            ResourceDescriptor, SchemaDescriptor,
+        };
+        let m = self.metadata();
+        DriverDescriptor {
+            contract_major: 1,
+            contract_minor: 0,
+            identity: DriverIdentity {
+                driver_id: m.driver_id,
+                name: m.name,
+                version: m.version,
+            },
+            connection: SchemaDescriptor {
+                fields: vec![
+                    FieldDescriptor::new("host", "Host", FieldType::Host)
+                        .required(true)
+                        .default_value(serde_json::json!("192.168.0.1")),
+                    FieldDescriptor::new("port", "Port", FieldType::Port)
+                        .required(false)
+                        .default_value(serde_json::json!(8193)),
+                    FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
+                        .required(false)
+                        .default_value(serde_json::json!(3000)),
+                ],
+            },
+            resources: vec![
+                ResourceDescriptor {
+                    id: "dynamic".into(),
+                    label: LocalizedText::new("Dynamic"),
+                    parameters: SchemaDescriptor {
+                        fields: vec![
+                            FieldDescriptor::new("axis", "Axis", FieldType::Integer)
+                                .required(false)
+                                .default_value(serde_json::json!(1)),
+                        ],
+                    },
+                    outputs: vec![
+                        OutputDescriptor {
+                            id: "feed".into(),
+                            label: LocalizedText::new("Feed"),
+                            data_type: DataType::U32,
+                            unit: Some("mm/min".into()),
+                            access: AccessMode::Read,
+                        },
+                        OutputDescriptor {
+                            id: "spindle.speed".into(),
+                            label: LocalizedText::new("Spindle Speed"),
+                            data_type: DataType::U32,
+                            unit: Some("rpm".into()),
+                            access: AccessMode::Read,
+                        },
+                        OutputDescriptor {
+                            id: "program.current".into(),
+                            label: LocalizedText::new("Current Program"),
+                            data_type: DataType::String,
+                            unit: None,
+                            access: AccessMode::Read,
+                        },
+                        OutputDescriptor {
+                            id: "position.absolute".into(),
+                            label: LocalizedText::new("Absolute Position"),
+                            data_type: DataType::I32,
+                            unit: Some("pulse".into()),
+                            access: AccessMode::Read,
+                        },
+                    ],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
+                    id: "status".into(),
+                    label: LocalizedText::new("Status"),
+                    parameters: SchemaDescriptor::default(),
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Status"),
+                        data_type: DataType::U32,
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
+                    id: "axis".into(),
+                    label: LocalizedText::new("Axis"),
+                    parameters: SchemaDescriptor {
+                        fields: vec![
+                            FieldDescriptor::new("axis", "Axis", FieldType::Integer).required(true),
+                        ],
+                    },
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Position"),
+                        data_type: DataType::I32,
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
+                    id: "spindle".into(),
+                    label: LocalizedText::new("Spindle"),
+                    parameters: SchemaDescriptor {
+                        fields: vec![
+                            FieldDescriptor::new("spindle", "Spindle", FieldType::Integer)
+                                .required(true),
+                        ],
+                    },
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Load"),
+                        data_type: DataType::U32,
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
+                    id: "pmc".into(),
+                    label: LocalizedText::new("PMC"),
+                    parameters: SchemaDescriptor {
+                        fields: vec![
+                            FieldDescriptor::new("kind", "Kind", FieldType::Enum)
+                                .required(true)
+                                .default_value(serde_json::json!("R")),
+                            FieldDescriptor::new("addr", "Address", FieldType::Integer)
+                                .required(true),
+                        ],
+                    },
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Value"),
+                        data_type: DataType::I32,
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
+                    id: "macro".into(),
+                    label: LocalizedText::new("Macro"),
+                    parameters: SchemaDescriptor {
+                        fields: vec![
+                            FieldDescriptor::new("number", "Number", FieldType::Integer)
+                                .required(true),
+                        ],
+                    },
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Value"),
+                        data_type: DataType::F64,
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
+                    id: "alarm".into(),
+                    label: LocalizedText::new("Alarm"),
+                    parameters: SchemaDescriptor::default(),
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Alarm"),
+                        data_type: DataType::String,
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
+                    id: "program".into(),
+                    label: LocalizedText::new("Program"),
+                    parameters: SchemaDescriptor::default(),
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Program"),
+                        data_type: DataType::String,
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+            ],
+            controls: mesa_core_types::ControlCatalog::default(),
+            discovery: DiscoveryCapabilities {
+                manual: true,
+                browse: false,
+                import: false,
+            },
+            capabilities: DriverCapabilities {
+                poll: true,
+                ..Default::default()
+            },
+        }
+    }
+
     async fn open_connection(
         &self,
         _endpoint_id: &str,

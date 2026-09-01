@@ -62,6 +62,79 @@ impl Driver for OpcUaDriver {
         }
     }
 
+    fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
+        use mesa_core_types::{
+            AccessMode, DataType, DiscoveryCapabilities, DriverCapabilities, DriverDescriptor,
+            DriverIdentity, FieldDescriptor, FieldType, LocalizedText, OutputDescriptor,
+            ResourceDescriptor, SchemaDescriptor,
+        };
+        let m = self.metadata();
+        DriverDescriptor {
+            contract_major: 1,
+            contract_minor: 0,
+            identity: DriverIdentity {
+                driver_id: m.driver_id,
+                name: m.name,
+                version: m.version,
+            },
+            connection: SchemaDescriptor {
+                fields: vec![
+                    FieldDescriptor::new("endpoint_url", "Endpoint URL", FieldType::Url)
+                        .required(true)
+                        .default_value(serde_json::json!("opc.tcp://127.0.0.1:4840")),
+                    FieldDescriptor::new("security_policy", "Security Policy", FieldType::Enum)
+                        .required(false)
+                        .default_value(serde_json::json!("None")),
+                    FieldDescriptor::new("security_mode", "Security Mode", FieldType::Enum)
+                        .required(false)
+                        .default_value(serde_json::json!("None")),
+                    FieldDescriptor::new("username", "Username", FieldType::String).required(false),
+                    FieldDescriptor::new("password", "Password", FieldType::Secret).required(false),
+                    FieldDescriptor::new("certificate", "Certificate", FieldType::CertificateRef)
+                        .required(false),
+                    FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
+                        .required(false)
+                        .default_value(serde_json::json!(5000)),
+                ],
+            },
+            resources: vec![ResourceDescriptor {
+                id: "node".into(),
+                label: LocalizedText::new("Node"),
+                parameters: SchemaDescriptor {
+                    fields: vec![
+                        FieldDescriptor::new("node_id", "NodeId", FieldType::String).required(true),
+                        FieldDescriptor::new("attribute", "Attribute", FieldType::Enum)
+                            .required(false)
+                            .default_value(serde_json::json!("Value")),
+                    ],
+                },
+                outputs: vec![OutputDescriptor {
+                    id: "value".into(),
+                    label: LocalizedText::new("Value"),
+                    data_type: DataType::String,
+                    unit: None,
+                    access: AccessMode::Read,
+                }],
+                modes: vec![
+                    mesa_core_types::TaskMode::Poll,
+                    mesa_core_types::TaskMode::Subscribe,
+                ],
+            }],
+            controls: mesa_core_types::ControlCatalog::default(),
+            discovery: DiscoveryCapabilities {
+                manual: true,
+                browse: true,
+                import: false,
+            },
+            capabilities: DriverCapabilities {
+                poll: true,
+                subscribe: true,
+                browse: true,
+                ..Default::default()
+            },
+        }
+    }
+
     async fn open_connection(
         &self,
         _endpoint_id: &str,

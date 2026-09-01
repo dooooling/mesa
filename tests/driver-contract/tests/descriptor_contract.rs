@@ -303,6 +303,41 @@ fn simulator_descriptor_is_valid_and_small() {
 }
 
 #[test]
+fn s7_descriptor_is_valid() {
+    let d = mesa_driver_s7::S7Driver.descriptor();
+    d.validate().expect("s7 descriptor must be valid");
+    assert_eq!(d.identity.driver_id, "s7");
+    assert!(serde_json::to_string(&d).unwrap().len() < 256 * 1024);
+    assert!(d.resources.iter().any(|r| r.id == "memory"));
+}
+
+#[test]
+fn focas_descriptor_is_valid() {
+    let d = mesa_driver_focas2::FocasDriver.descriptor();
+    d.validate().expect("focas2 descriptor must be valid");
+    assert_eq!(d.identity.driver_id, "focas2");
+    assert!(serde_json::to_string(&d).unwrap().len() < 256 * 1024);
+    // 验收：1 Resource 多 Outputs
+    let dyn_res = d
+        .resources
+        .iter()
+        .find(|r| r.id == "dynamic")
+        .expect("dynamic");
+    assert!(dyn_res.outputs.len() >= 4, "dynamic must have >=4 outputs");
+    assert!(d.resources.iter().any(|r| r.id == "pmc"));
+}
+
+#[test]
+fn opcua_descriptor_is_valid() {
+    let d = mesa_driver_opcua::OpcUaDriver.descriptor();
+    d.validate().expect("opcua descriptor must be valid");
+    assert_eq!(d.identity.driver_id, "opcua");
+    assert!(serde_json::to_string(&d).unwrap().len() < 256 * 1024);
+    assert!(d.capabilities.browse, "opcua must support browse");
+    assert!(d.discovery.browse);
+}
+
+#[test]
 fn descriptor_json_roundtrip_stable() {
     let d = synthetic_descriptor();
     let a = serde_json::to_string(&d).unwrap();

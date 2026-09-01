@@ -12,6 +12,9 @@ mesa-core-types = { workspace = true }
 mesa-driver-protocol = { workspace = true }
 mesa-driver-sdk = { workspace = true }
 mesa-driver-simulator = { path = "../../drivers/simulator" }
+mesa-driver-s7 = { path = "../../drivers/s7" }
+mesa-driver-focas2 = { path = "../../drivers/focas2" }
+mesa-driver-opcua = { path = "../../drivers/opcua" }
 mesa-driver-manager = { workspace = true }
 mesa-config-store = { workspace = true }
 tokio = { workspace = true }

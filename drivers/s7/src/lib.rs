@@ -48,6 +48,82 @@ impl Driver for S7Driver {
         }
     }
 
+    fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
+        use mesa_core_types::{
+            AccessMode, DataType, DiscoveryCapabilities, DriverCapabilities, DriverDescriptor,
+            DriverIdentity, FieldDescriptor, FieldType, LocalizedText, OutputDescriptor,
+            ResourceDescriptor, SchemaDescriptor,
+        };
+        let m = self.metadata();
+        DriverDescriptor {
+            contract_major: 1,
+            contract_minor: 0,
+            identity: DriverIdentity {
+                driver_id: m.driver_id,
+                name: m.name,
+                version: m.version,
+            },
+            connection: SchemaDescriptor {
+                fields: vec![
+                    FieldDescriptor::new("host", "Host", FieldType::Host)
+                        .required(true)
+                        .default_value(serde_json::json!("192.168.0.1")),
+                    FieldDescriptor::new("port", "Port", FieldType::Port)
+                        .required(false)
+                        .default_value(serde_json::json!(102)),
+                    FieldDescriptor::new("rack", "Rack", FieldType::Integer)
+                        .required(false)
+                        .default_value(serde_json::json!(0)),
+                    FieldDescriptor::new("slot", "Slot", FieldType::Integer)
+                        .required(false)
+                        .default_value(serde_json::json!(1)),
+                    FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
+                        .required(false)
+                        .default_value(serde_json::json!(3000)),
+                ],
+            },
+            resources: vec![ResourceDescriptor {
+                id: "memory".into(),
+                label: LocalizedText::new("Memory"),
+                parameters: SchemaDescriptor {
+                    fields: vec![
+                        FieldDescriptor::new("area", "Area", FieldType::Enum)
+                            .required(true)
+                            .default_value(serde_json::json!("DB")),
+                        FieldDescriptor::new("db", "DB Number", FieldType::Integer)
+                            .required(false)
+                            .default_value(serde_json::json!(10)),
+                        FieldDescriptor::new("offset", "Offset", FieldType::Integer).required(true),
+                        FieldDescriptor::new("data_type", "Data Type", FieldType::Enum)
+                            .required(true)
+                            .default_value(serde_json::json!("REAL")),
+                        FieldDescriptor::new("bit", "Bit", FieldType::Integer).required(false),
+                        FieldDescriptor::new("length", "Length", FieldType::Integer)
+                            .required(false),
+                    ],
+                },
+                outputs: vec![OutputDescriptor {
+                    id: "value".into(),
+                    label: LocalizedText::new("Value"),
+                    data_type: DataType::F64,
+                    unit: None,
+                    access: AccessMode::Read,
+                }],
+                modes: vec![mesa_core_types::TaskMode::Poll],
+            }],
+            controls: mesa_core_types::ControlCatalog::default(),
+            discovery: DiscoveryCapabilities {
+                manual: true,
+                browse: false,
+                import: false,
+            },
+            capabilities: DriverCapabilities {
+                poll: true,
+                ..Default::default()
+            },
+        }
+    }
+
     async fn open_connection(
         &self,
         _endpoint_id: &str,
