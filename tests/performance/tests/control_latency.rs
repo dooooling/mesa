@@ -17,7 +17,9 @@ fn poll_task(key: &str) -> AcquisitionTask {
 }
 
 fn percentile(mut v: Vec<u128>, p: f64) -> u128 {
-    if v.is_empty() { return 0; }
+    if v.is_empty() {
+        return 0;
+    }
     v.sort_unstable();
     let idx = ((p / 100.0) * (v.len() as f64 - 1.0)).round() as usize;
     v[idx.min(v.len() - 1)]
@@ -28,13 +30,15 @@ async fn control_write_p95_within_20ms() {
     let driver = mesa_driver_simulator::SimulatorDriver;
     let mut conn = driver.open_connection("ep", "{}").await.unwrap();
     conn.configure(1, vec![poll_task("sim.x")]).await.unwrap();
-    conn.apply_point_map([("sim.x".to_string(), 1)].into_iter().collect()).await.unwrap();
+    conn.apply_point_map([("sim.x".to_string(), 1)].into_iter().collect())
+        .await
+        .unwrap();
 
     let mut samples = Vec::with_capacity(30);
     for _ in 0..30 {
         let start = std::time::Instant::now();
         conn.write("sim.x", Value::F64(1.0), None).await.unwrap();
-        samples.push(start.elapsed().as_micros() as u128 / 1000);
+        samples.push(start.elapsed().as_micros() / 1000);
     }
     let p95 = percentile(samples.clone(), 95.0);
     let p99 = percentile(samples, 99.0);
@@ -48,13 +52,15 @@ async fn control_command_p95_within_20ms() {
     let driver = mesa_driver_simulator::SimulatorDriver;
     let mut conn = driver.open_connection("ep", "{}").await.unwrap();
     conn.configure(1, vec![poll_task("sim.x")]).await.unwrap();
-    conn.apply_point_map([("sim.x".to_string(), 1)].into_iter().collect()).await.unwrap();
+    conn.apply_point_map([("sim.x".to_string(), 1)].into_iter().collect())
+        .await
+        .unwrap();
 
     let mut samples = Vec::with_capacity(30);
     for _ in 0..30 {
         let start = std::time::Instant::now();
         conn.command("reset", "{}").await.unwrap();
-        samples.push(start.elapsed().as_micros() as u128 / 1000);
+        samples.push(start.elapsed().as_micros() / 1000);
     }
     let p95 = percentile(samples.clone(), 95.0);
     let p99 = percentile(samples, 99.0);

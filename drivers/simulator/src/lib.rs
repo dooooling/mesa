@@ -770,14 +770,14 @@ impl DriverConnection for SimConnection {
         _expected: Option<Value>,
     ) -> Result<(), SdkDriverError> {
         // Simulator 控制：若已配置则校验 target 合法性，否则直接成功（用于 probe 前的轻量校验）
-        if let Some(plan) = &self.plan {
-            if !plan.points.iter().any(|p| p.key == target) {
-                return Err(SdkDriverError::new(
-                    ErrorKind::Internal,
-                    "TARGET_NOT_FOUND",
-                    format!("target `{target}` not found"),
-                ));
-            }
+        if let Some(plan) = &self.plan
+            && !plan.points.iter().any(|p| p.key == target)
+        {
+            return Err(SdkDriverError::new(
+                ErrorKind::Internal,
+                "TARGET_NOT_FOUND",
+                format!("target `{target}` not found"),
+            ));
         }
         Ok(())
     }

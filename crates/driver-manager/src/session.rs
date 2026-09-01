@@ -365,14 +365,20 @@ impl Session {
         };
         match reply.body {
             Some(pb::envelope::Body::WriteResponse(resp)) => {
-                if let Some(result) = resp.result {
-                    if !result.ok {
-                        let d = result.error.unwrap_or_default();
-                        return Err(SessionError::Handshake(format!("{}/{}: {}", d.kind, d.code, d.message)));
-                    }
+                if let Some(result) = resp.result
+                    && !result.ok
+                {
+                    let d = result.error.unwrap_or_default();
+                    return Err(SessionError::Handshake(format!(
+                        "{}/{}: {}",
+                        d.kind, d.code, d.message
+                    )));
                 }
                 if let Some(v) = resp.readback {
-                    Ok(Some(mesa_driver_protocol::value_from_pb(v).map_err(|e| SessionError::Handshake(e.to_string()))?))
+                    Ok(Some(
+                        mesa_driver_protocol::value_from_pb(v)
+                            .map_err(|e| SessionError::Handshake(e.to_string()))?,
+                    ))
                 } else {
                     Ok(None)
                 }
@@ -413,7 +419,9 @@ impl Session {
             }
         };
         match reply.body {
-            Some(pb::envelope::Body::CommandResponse(resp)) => Ok((resp.status, resp.result_json, resp.error)),
+            Some(pb::envelope::Body::CommandResponse(resp)) => {
+                Ok((resp.status, resp.result_json, resp.error))
+            }
             _ => Err(SessionError::Closed),
         }
     }
@@ -453,11 +461,14 @@ impl Session {
         };
         match reply.body {
             Some(pb::envelope::Body::BrowseResponse(resp)) => {
-                if let Some(result) = resp.result {
-                    if !result.ok {
-                        let d = result.error.unwrap_or_default();
-                        return Err(SessionError::Handshake(format!("{}/{}: {}", d.kind, d.code, d.message)));
-                    }
+                if let Some(result) = resp.result
+                    && !result.ok
+                {
+                    let d = result.error.unwrap_or_default();
+                    return Err(SessionError::Handshake(format!(
+                        "{}/{}: {}",
+                        d.kind, d.code, d.message
+                    )));
                 }
                 let next = if resp.next_cursor.is_empty() {
                     None

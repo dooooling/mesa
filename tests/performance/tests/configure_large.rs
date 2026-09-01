@@ -32,7 +32,7 @@ async fn bench(n: usize) -> u128 {
     for _ in 0..20 {
         let start = Instant::now();
         let _ = conn.configure(1, vec![make_task(n, "t")]).await.unwrap();
-        samples.push(start.elapsed().as_millis() as u128);
+        samples.push(start.elapsed().as_millis());
     }
     samples.sort_unstable();
     let p95 = samples[(0.95 * (samples.len() as f64 - 1.0)).round() as usize];

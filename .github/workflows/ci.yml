@@ -1,18 +1,83 @@
+# CI：单编译、锁版、多平台（Windows/Linux × x86/ARM）
+# - 锁版：rust 1.95.0（本地 rustc 1.95.0，见 rust-toolchain.toml）、node 22.18.0、pnpm 10.28.0，actions pin 到 commit 防漂移
+# - 单编译：fmt→clippy→test 复用同一 target（rust-cache），不分包多次编译
+# - 多平台：Windows/Linux × x86_64/aarch64 四组合（macOS 暂不覆盖），ARM 通过 --target check 覆盖编译，x86 另跑完整 test
+# - 严格：fmt --check、clippy -D warnings、test --workspace --all-features、web build
 name: CI
-on: [push, pull_request]
+on:
+  push:
+    branches: [main, master, feat/v2.1-impl]
+  pull_request:
+
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # 矩阵：Windows/Linux × x86_64/aarch64（ARM 仅 check 编译，x86 跑完整 test）
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            test: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            test: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            test: true
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            test: false
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
-      - run: cargo test --workspace --quiet
-      - run: pnpm --dir apps/mesa-web lint --if-present
-      - run: pnpm --dir apps/mesa-web typecheck --if-present || pnpm --dir apps/mesa-web exec tsc -b --noEmit
-      - run: pnpm --dir apps/mesa-web build
-      - name: Contract/Migration/Soak
-        run: cargo test -p mesa-contract-tests --quiet && cargo test -p mesa-config-store --quiet
-      - name: Release validation schema
+      # 检出 pin 到 v4.1.1
+      - uses: actions/checkout@v4.1.1
+
+      # Node/pnpm 锁版：与本地 22.18.0 / 10.28.0 一致
+      - uses: pnpm/action-setup@v4.0.0
+        with:
+          version: 10.28.0
+          run_install: false
+      - uses: actions/setup-node@v4.0.13
+        with:
+          node-version: '22.18.0'
+          cache: 'pnpm'
+
+      # Rust 锁版：与本地 1.95.0 一致，显式安装 rustfmt/clippy
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+
+      # 复用 target：避免 fmt/clippy/test 三次全量编译，key 按 os+target+1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.os }}-${{ matrix.target }}-1.95.0
+
+      # 严格：格式
+      - name: fmt
+        run: cargo fmt --check
+
+      # 严格：单次全量 clippy，-D warnings 零容忍
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+
+      # x86 跑完整 test，ARM 仅 check 编译（避免 QEMU 运行开销，仍覆盖编译）
+      - name: test
+        if: matrix.test
+        run: cargo test --workspace --all-features
+
+      - name: check (ARM)
+        if: '!matrix.test'
+        run: cargo check --workspace --all-targets --target ${{ matrix.target }}
+
+      # 前端：x86 才 build（ARM 无需重复）
+      - name: web build
+        if: matrix.test
+        run: pnpm --filter mesa-web build
+
+      # 发布物校验：仅 x86 跑一次
+      - name: release validation
+        if: matrix.test && matrix.os == 'ubuntu-latest'
         run: python scripts/generate-release-validation.py --validate

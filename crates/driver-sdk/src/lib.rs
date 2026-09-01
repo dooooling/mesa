@@ -648,7 +648,9 @@ async fn writer_loop(
             },
         }
         // 任一通道关闭后若另一通道也关闭则退出
-        if control_rx.is_closed() && data_rx.is_closed() { break; }
+        if control_rx.is_closed() && data_rx.is_closed() {
+            break;
+        }
     }
 }
 
@@ -746,9 +748,7 @@ async fn request_loop(
             Some(pb::envelope::Body::BrowseRequest(req)) => {
                 on_browse(session, req, env.msg_id).await
             }
-            Some(pb::envelope::Body::WriteRequest(req)) => {
-                on_write(session, req, env.msg_id).await
-            }
+            Some(pb::envelope::Body::WriteRequest(req)) => on_write(session, req, env.msg_id).await,
             Some(pb::envelope::Body::CommandRequest(req)) => {
                 on_command(session, req, env.msg_id).await
             }
@@ -1274,13 +1274,9 @@ async fn on_write(session: &Session, req: pb::WriteRequest, msg_id: u64) {
             return;
         }
     };
-    let expected = match req.expected_value {
-        Some(v) => match mesa_driver_protocol::value_from_pb(v) {
-            Ok(v) => Some(v),
-            Err(_) => None,
-        },
-        None => None,
-    };
+    let expected = req
+        .expected_value
+        .and_then(|v| mesa_driver_protocol::value_from_pb(v).ok());
     let res = conn.write(&req.target, value, expected).await;
     {
         let mut m = session.entries.lock().unwrap();

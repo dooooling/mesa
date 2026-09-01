@@ -182,7 +182,14 @@ pub async fn run_endpoint(
     snapshot: Arc<Snapshot>,
     source: Arc<dyn PointIdSource>,
     shutdown: CancellationToken,
-    registry: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>>,
+    registry: std::sync::Arc<
+        std::sync::RwLock<
+            std::collections::HashMap<
+                String,
+                std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>,
+            >,
+        >,
+    >,
 ) {
     let mut backoff_idx = 0usize;
     let mut id_map: HashMap<String, u32> = source.known_map(&cfg.endpoint_id);
@@ -304,6 +311,7 @@ fn set_status(
 }
 
 /// 一次完整连接尝试：成功则阻塞在事件循环直到断开/判死/停机。
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 async fn attempt_session(
     disc: &DiscoveredDriver,
     cfg: &BuiltinEndpoint,
@@ -312,7 +320,14 @@ async fn attempt_session(
     id_map: &mut HashMap<String, u32>,
     last_epoch: &mut u64,
     shutdown: &CancellationToken,
-    registry: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>>,
+    registry: &std::sync::Arc<
+        std::sync::RwLock<
+            std::collections::HashMap<
+                String,
+                std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>,
+            >,
+        >,
+    >,
 ) -> AttemptOutcome {
     let mut process = match DriverProcess::spawn(disc).await {
         Ok(p) => p,
@@ -337,7 +352,10 @@ async fn attempt_session(
     // run_config_flow 需经 Mutex 单次加锁，避免跨 await 持锁导致 !Send
     let config_res = {
         let sess = session_arc.lock().await;
-        run_config_flow(&*sess, cfg, source, id_map, snapshot, last_epoch).await
+        #[allow(clippy::explicit_auto_deref)]
+        {
+            run_config_flow(&sess, cfg, source, id_map, snapshot, last_epoch).await
+        }
     };
     match config_res {
         Ok(()) => {}

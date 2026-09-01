@@ -1,0 +1,4 @@
+# 锁版：与 CI 1.95.0 一致，防本地/CI 漂移
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

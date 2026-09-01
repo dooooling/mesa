@@ -764,14 +764,14 @@ impl DriverConnection for S7Connection {
             (addr, k)
         };
         // expected 校验（CAS 语义，Plan 存在时对比当前计划值类型）
-        if let Some(exp) = expected {
-            if std::mem::discriminant(&exp) != std::mem::discriminant(&value) {
-                return Err(SdkDriverError::new(
-                    mesa_core_types::ErrorKind::Internal,
-                    "EXPECTED_MISMATCH",
-                    "expected_value 类型与写入值不一致",
-                ));
-            }
+        if let Some(exp) = expected
+            && std::mem::discriminant(&exp) != std::mem::discriminant(&value)
+        {
+            return Err(SdkDriverError::new(
+                mesa_core_types::ErrorKind::Internal,
+                "EXPECTED_MISMATCH",
+                "expected_value 类型与写入值不一致",
+            ));
         }
         // Value → bytes（仅 INT/WORD 2字节路径，DB10.DBW0 最小闭环）
         let data = match value {
@@ -786,7 +786,7 @@ impl DriverConnection for S7Connection {
                     mesa_core_types::ErrorKind::Unsupported,
                     "UNSUPPORTED_VALUE",
                     format!("S7 write 暂仅支持 INT/WORD 2字节，got {value:?}"),
-                ))
+                ));
             }
         };
         let mut client = crate::client::S7Client::connect(self.cfg.clone()).await?;
