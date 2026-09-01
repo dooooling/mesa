@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mesa.example.com/schemas/release-validation.schema.json",
+  "title": "Mesa Release Validation",
+  "type": "object",
+  "required": ["schema_version", "git_sha", "environment", "contract_tests"],
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "git_sha": { "type": "string", "minLength": 7 },
+    "generated_at_ns": { "type": "integer" },
+    "environment": {
+      "type": "object",
+      "required": ["os", "cpu", "ram", "rust_version", "build_profile"],
+      "properties": {
+        "os": { "type": "string" },
+        "cpu": { "type": "string" },
+        "cores": { "type": "integer", "minimum": 1 },
+        "ram": { "type": "string" },
+        "rust_version": { "type": "string" },
+        "build_profile": { "type": "string", "enum": ["debug", "release"] }
+      },
+      "additionalProperties": true
+    },
+    "contract_tests": {
+      "type": "object",
+      "required": ["passed", "failed", "total"],
+      "properties": {
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 },
+        "suites": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+    "performance": {
+      "type": "object",
+      "properties": {
+        "throughput_updates_per_sec": { "type": "number" },
+        "ipc_p95_ms": { "type": "number" },
+        "ipc_p99_ms": { "type": "number" },
+        "configure_1k_ms": { "type": "number" },
+        "configure_10k_ms": { "type": "number" },
+        "configure_50k_ms": { "type": "number" },
+        "rss_delta_mib": { "type": "number" }
+      },
+      "additionalProperties": true
+    },
+    "soak": {
+      "type": "object",
+      "properties": {
+        "duration_hours": { "type": "number" },
+        "rss_growth_percent": { "type": "number" },
+        "leak_detected": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "real_device_matrix": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["driver", "capability", "status"],
+        "properties": {
+          "driver": { "type": "string" },
+          "capability": { "type": "string" },
+          "status": { "type": "string", "enum": ["passed", "failed", "skipped"] },
+          "detail": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

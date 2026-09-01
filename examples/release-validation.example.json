@@ -1,0 +1,37 @@
+{
+  "schema_version": "1.0.0",
+  "git_sha": "50a9bfb",
+  "generated_at_ns": 1725148800000000000,
+  "environment": {
+    "os": "windows-11",
+    "cpu": "Intel i7",
+    "cores": 8,
+    "ram": "32GB",
+    "rust_version": "1.82.0",
+    "build_profile": "release"
+  },
+  "contract_tests": {
+    "passed": 68,
+    "failed": 0,
+    "total": 68,
+    "suites": ["data_semantics", "descriptor_contract", "resource_contract", "control_contract"]
+  },
+  "performance": {
+    "throughput_updates_per_sec": 51200,
+    "ipc_p95_ms": 12.5,
+    "ipc_p99_ms": 38.0,
+    "configure_1k_ms": 45,
+    "configure_10k_ms": 420,
+    "configure_50k_ms": 3200,
+    "rss_delta_mib": 128
+  },
+  "soak": {
+    "duration_hours": 24,
+    "rss_growth_percent": 4.2,
+    "leak_detected": false
+  },
+  "real_device_matrix": [
+    { "driver": "simulator", "capability": "write", "status": "passed", "detail": "Writablesim.counter via Control queue reliable" },
+    { "driver": "s7", "capability": "probe", "status": "skipped", "detail": "no hardware" }
+  ]
+}
