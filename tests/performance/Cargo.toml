@@ -9,6 +9,7 @@ mesa-core-types = { workspace = true }
 mesa-driver-sdk = { workspace = true }
 mesa-config-store = { workspace = true }
 mesa-driver-manager = { workspace = true }
+mesa-driver-simulator = { path = "../../drivers/simulator" }
 mesa-core-api = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

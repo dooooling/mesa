@@ -1,0 +1,18 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo test --workspace --quiet
+      - run: pnpm --dir apps/mesa-web lint --if-present
+      - run: pnpm --dir apps/mesa-web typecheck --if-present || pnpm --dir apps/mesa-web exec tsc -b --noEmit
+      - run: pnpm --dir apps/mesa-web build
+      - name: Contract/Migration/Soak
+        run: cargo test -p mesa-contract-tests --quiet && cargo test -p mesa-config-store --quiet
+      - name: Release validation schema
+        run: python scripts/generate-release-validation.py --validate
