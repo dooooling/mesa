@@ -371,6 +371,26 @@ impl S7Client {
         ))
     }
 
+    /// 单点写入：DB10.DBW0 INT 2字节为例，data 为大端编码
+    pub async fn write_single(
+        &mut self,
+        addr: &S7Address,
+        kind: crate::codec::S7Kind,
+        data: &[u8],
+    ) -> Result<(), SdkDriverError> {
+        let pkt = build_write_req(self.pdu_ref, addr, kind, data);
+        self.pdu_ref = self.pdu_ref.wrapping_add(1).max(1);
+        timeout(self.cfg.timeout(), self.send_raw(&pkt))
+            .await
+            .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "WRITE_TIMEOUT", "Write 请求超时"))?
+            .map_err(|e| SdkDriverError::new(ErrorKind::Connection, "WRITE_SEND_FAIL", e.to_string()))?;
+        let resp = timeout(self.cfg.timeout(), self.recv_packet())
+            .await
+            .map_err(|_| SdkDriverError::new(ErrorKind::Timeout, "WRITE_TIMEOUT", "Write 响应超时"))?
+            .map_err(|e| SdkDriverError::new(ErrorKind::Connection, "WRITE_RECV_FAIL", e.to_string()))?;
+        parse_write_resp(&resp)
+    }
+
     async fn send_raw(&mut self, data: &[u8]) -> std::io::Result<()> {
         self.stream.write_all(data).await?;
         self.stream.flush().await
@@ -623,6 +643,86 @@ fn build_bulk_read_req(pdu_ref: u16, ranges: &[(S7Address, usize)]) -> Vec<u8> {
     pkt.extend_from_slice(&cotp);
     pkt.extend_from_slice(&s7);
     pkt
+}
+
+const S7_FUNC_WRITE: u8 = 0x05;
+
+fn build_write_req(pdu_ref: u16, addr: &S7Address, kind: crate::codec::S7Kind, data: &[u8]) -> Vec<u8> {
+    // WriteVar 单项：param 0x05 0x01 + 12字节 ANY；data 0x00 0x04 + bit_len(2) + data
+    let area = addr.area.code();
+    let db = addr.db_number;
+    let bit_addr = addr.bit_address();
+    let transport = match addr.area {
+        crate::address::Area::Counter => 0x1C,
+        crate::address::Area::Timer => 0x1D,
+        _ => kind.transport_size(),
+    };
+    let req_len = match addr.area {
+        crate::address::Area::Counter | crate::address::Area::Timer => 1,
+        _ => kind.request_len(),
+    };
+    let mut param = Vec::with_capacity(14);
+    param.push(S7_FUNC_WRITE);
+    param.push(1);
+    param.extend_from_slice(&[S7_VAR_SPEC, S7_VAR_SPEC_LEN, S7_SYNTAX_ID_S7ANY, transport]);
+    param.extend_from_slice(&req_len.to_be_bytes());
+    param.extend_from_slice(&db.to_be_bytes());
+    param.push(area);
+    param.push(((bit_addr >> 16) & 0xFF) as u8);
+    param.push(((bit_addr >> 8) & 0xFF) as u8);
+    param.push((bit_addr & 0xFF) as u8);
+    let param_len = param.len() as u16;
+    // Data 部分：0x00 0x04 + bit_len + data（偶对齐已天然满足 2 字节）
+    let bit_len = (data.len() * 8) as u16;
+    // 传输尺寸 0x04 对应 BYTE/WORD/DWORD，长度按 bit 计
+    let mut s7_data = Vec::with_capacity(4 + data.len());
+    s7_data.extend_from_slice(&[0x00, 0x04]);
+    s7_data.extend_from_slice(&bit_len.to_be_bytes());
+    s7_data.extend_from_slice(data);
+    // 若 data 长度奇数需 pad 0（Write 的 DATA 项偶对齐）
+    if s7_data.len() % 2 == 1 {
+        s7_data.push(0);
+    }
+    let data_len = s7_data.len() as u16;
+    let mut s7 = Vec::with_capacity(12 + param.len() + s7_data.len());
+    s7.extend_from_slice(&[0x32, S7_ROSCTR_JOB, 0x00, 0x00]);
+    s7.extend_from_slice(&pdu_ref.to_be_bytes());
+    s7.extend_from_slice(&param_len.to_be_bytes());
+    s7.extend_from_slice(&data_len.to_be_bytes());
+    s7.extend_from_slice(&param);
+    s7.extend_from_slice(&s7_data);
+    let cotp = [0x02, COTP_DT, 0x80];
+    let tpkt_len = (4 + cotp.len() + s7.len()) as u16;
+    let mut pkt = vec![TPKT_VERSION, 0x00, (tpkt_len >> 8) as u8, (tpkt_len & 0xFF) as u8];
+    pkt.extend_from_slice(&cotp);
+    pkt.extend_from_slice(&s7);
+    pkt
+}
+
+fn parse_write_resp(resp: &[u8]) -> Result<(), SdkDriverError> {
+    if resp.len() < 7 + 12 {
+        return Err(SdkDriverError::new(ErrorKind::Protocol, "WRITE_SHORT", format!("Write响应过短 {}", resp.len())));
+    }
+    let s7 = &resp[7..];
+    if s7[1] != S7_ROSCTR_ACK {
+        return Err(map_s7_error(s7.get(17).copied().unwrap_or(0), &format!("Write被拒绝 rosctr={:02x}", s7[1])));
+    }
+    // Data 部分首字节为 per-item return code（0xFF 成功）
+    // S7 header 12 + param 2（func+count）+ data
+    if s7.len() < 14 {
+        return Err(SdkDriverError::new(ErrorKind::Protocol, "WRITE_S7_SHORT", "S7 write ack过短"));
+    }
+    // param_len 在 s7[6..8]，data 从 s7[12+param_len..]
+    let param_len = u16::from_be_bytes([s7[6], s7[7]]) as usize;
+    let data_start = 12 + param_len;
+    if s7.len() <= data_start {
+        return Err(SdkDriverError::new(ErrorKind::Protocol, "WRITE_NO_DATA", "Write ack无Data"));
+    }
+    let ret = s7[data_start];
+    if ret != 0xFF {
+        return Err(map_s7_error(ret, &format!("Write item ret {ret:02x}")));
+    }
+    Ok(())
 }
 
 fn parse_bulk_resp(

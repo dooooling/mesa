@@ -721,6 +721,89 @@ impl DriverConnection for S7Connection {
         }
         Ok(())
     }
+
+    async fn write(
+        &mut self,
+        target: &str,
+        value: mesa_core_types::Value,
+        expected: Option<mesa_core_types::Value>,
+    ) -> Result<(), SdkDriverError> {
+        // 查找 target 对应的地址（优先 plan，已配置时）或直接按 S7 地址解析（DB10.DBW0）
+        let (addr, kind) = if let Some(plan) = &self.plan {
+            if let Some(spec) = plan.points.iter().find(|p| p.key == target) {
+                (spec.addr.clone(), spec.kind)
+            } else {
+                // 兼容直接地址模式（DB10.DBW0 + data_type 从 Value 推断）
+                let dt = match &value {
+                    mesa_core_types::Value::Bool(_) => "BOOL",
+                    mesa_core_types::Value::I32(_) | mesa_core_types::Value::I64(_) => "INT",
+                    mesa_core_types::Value::U32(_) | mesa_core_types::Value::U64(_) => "WORD",
+                    mesa_core_types::Value::F32(_) => "REAL",
+                    mesa_core_types::Value::F64(_) => "LREAL",
+                    _ => "WORD",
+                };
+                let addr = crate::address::parse_address(target).map_err(|e| {
+                    SdkDriverError::new(
+                        mesa_core_types::ErrorKind::Address,
+                        "INVALID_ADDRESS",
+                        format!("target `{target}` 非法: {e:?}"),
+                    )
+                })?;
+                let (_, k) = crate::codec::parse_data_type(dt)?;
+                (addr, k)
+            }
+        } else {
+            let addr = crate::address::parse_address(target).map_err(|e| {
+                SdkDriverError::new(
+                    mesa_core_types::ErrorKind::Address,
+                    "INVALID_ADDRESS",
+                    format!("target `{target}` 非法: {e:?}"),
+                )
+            })?;
+            let (_, k) = crate::codec::parse_data_type("INT")?;
+            (addr, k)
+        };
+        // expected 校验（CAS 语义，Plan 存在时对比当前计划值类型）
+        if let Some(exp) = expected {
+            if std::mem::discriminant(&exp) != std::mem::discriminant(&value) {
+                return Err(SdkDriverError::new(
+                    mesa_core_types::ErrorKind::Internal,
+                    "EXPECTED_MISMATCH",
+                    "expected_value 类型与写入值不一致",
+                ));
+            }
+        }
+        // Value → bytes（仅 INT/WORD 2字节路径，DB10.DBW0 最小闭环）
+        let data = match value {
+            mesa_core_types::Value::I32(v) => (v as i16).to_be_bytes().to_vec(),
+            mesa_core_types::Value::I64(v) => (v as i16).to_be_bytes().to_vec(),
+            mesa_core_types::Value::U32(v) => (v as u16).to_be_bytes().to_vec(),
+            mesa_core_types::Value::U64(v) => (v as u16).to_be_bytes().to_vec(),
+            mesa_core_types::Value::F64(v) => (v as i16).to_be_bytes().to_vec(),
+            mesa_core_types::Value::Bool(b) => vec![if b { 1 } else { 0 }],
+            _ => {
+                return Err(SdkDriverError::new(
+                    mesa_core_types::ErrorKind::Unsupported,
+                    "UNSUPPORTED_VALUE",
+                    format!("S7 write 暂仅支持 INT/WORD 2字节，got {value:?}"),
+                ))
+            }
+        };
+        let mut client = crate::client::S7Client::connect(self.cfg.clone()).await?;
+        client.write_single(&addr, kind, &data).await
+    }
+
+    async fn command(
+        &mut self,
+        command: &str,
+        _args_json: &str,
+    ) -> Result<serde_json::Value, SdkDriverError> {
+        Err(SdkDriverError::new(
+            mesa_core_types::ErrorKind::Unsupported,
+            "COMMAND_NOT_SUPPORTED",
+            format!("S7 不支持 command `{command}`"),
+        ))
+    }
 }
 
 #[cfg(test)]
