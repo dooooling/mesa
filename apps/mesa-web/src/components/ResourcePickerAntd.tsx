@@ -19,12 +19,20 @@ export function ResourcePickerAntd({ resources, onAdd }: { resources: ResourceDe
 
       {!!res.parameters.fields.length && (
         <Card size="small" title="参数">
-          {res.parameters.fields.map((f) => (
-            <div key={f.key} style={{ marginBottom: 8 }}>
-              <div style={{ fontSize: 12 }}>{f.label}{f.required ? " *" : ""}</div>
-              <Input value={String(params[f.key] ?? f.default ?? "")} placeholder={f.ui.placeholder} onChange={(e) => setParams({ ...params, [f.key]: e.target.value })} />
-            </div>
-          ))}
+          {res.parameters.fields.map((f) => {
+            const isEnum = f.field_type === "enum";
+            const opts = f.validation.enum_options?.length ? f.validation.enum_options : f.key === "area" ? ["DB","M","I","Q"] : f.key === "data_type" ? ["REAL","INT","WORD","DWORD","DINT","BOOL","BYTE","STRING","WSTRING"] : [];
+            return (
+              <div key={f.key} style={{ marginBottom: 8 }}>
+                <div style={{ fontSize: 12 }}>{f.label}{f.required ? " *" : ""}</div>
+                {isEnum ? (
+                  <Select style={{ width: "100%" }} value={String(params[f.key] ?? f.default ?? opts[0] ?? "")} onChange={(v) => setParams({ ...params, [f.key]: v })} options={opts.map((o) => ({ value: o, label: o }))} />
+                ) : (
+                  <Input value={String(params[f.key] ?? f.default ?? "")} placeholder={f.ui.placeholder} onChange={(e) => setParams({ ...params, [f.key]: e.target.value })} />
+                )}
+              </div>
+            );
+          })}
         </Card>
       )}
 

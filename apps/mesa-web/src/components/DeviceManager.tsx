@@ -145,11 +145,9 @@ export function DeviceManager() {
 
   const saveEdit = async () => {
     if (!editEp) return;
-    let v: Record<string, unknown>;
-    try { v = await editForm.validateFields(); } catch { return; }
     const connection: Record<string, unknown> = {};
-    for (const k of Object.keys(v)) if (v[k] !== undefined && v[k] !== "" && v[k] !== null) connection[k] = v[k];
-    // 重连态需先停止再改
+    for (const k of Object.keys(editConn)) if (editConn[k] !== undefined && editConn[k] !== "" && editConn[k] !== null) connection[k] = editConn[k];
+    if (!Object.keys(connection).length) return message.warning("请填写连接参数");
     await fetch(`/api/v1/endpoints/${editEp.id}/stop`, { method: "POST" }).catch(() => {});
     await new Promise((r) => setTimeout(r, 300));
     const r2 = await fetch(`/api/v1/endpoints/${editEp.id}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ device_id: editEp.device_id ?? editEp.id, driver_id: editEp.driver_id, connection }) });
@@ -165,8 +163,34 @@ export function DeviceManager() {
     const r = await fetch(`/api/v1/drivers/${ep.driver_id}/descriptor`).then((x) => x.json()).catch(() => null);
     setPointsDesc(r);
     fetch(`/api/v1/tasks?endpoint=${ep.id}`).then((x) => x.json()).then((j) => {
-      const tasks = j.tasks ?? [];
-      if (tasks.length) message.info(`已有 ${tasks.length} 任务`);
+      const tasks: Array<{ interval_ms?: number; binding: { kind: string; config: Record<string, unknown> } }> = j.tasks ?? [];
+      if (tasks.length) {
+        // 回显已有任务到已选
+        const first = tasks[0];
+        if (first) setIntervalMs(first.interval_ms ?? 1000);
+        if (first?.binding.kind === "mesa.resources.v1") {
+          const sels = (first.binding.config as { selections?: typeof pointsSels }).selections;
+          if (sels?.length) setPointsSels(sels);
+        } else if (first?.binding.kind === "s7.address-group") {
+          const items = (first.binding.config as { items?: Array<{ key: string; address: string; data_type: string }> }).items ?? [];
+          // 将 items 反解为一条 memory 选型供编辑（area/db/offset 从 address 粗略解析，data_type 保留）
+          const sels = items.map((it) => ({
+            resource_id: "memory",
+            parameters: { address: it.address, data_type: it.data_type, area: it.address.startsWith("DB") ? "DB" : "M", db: 10, offset: 0 } as Record<string, unknown>,
+            outputs: [{ output: "value", point_key: it.key }],
+          }));
+          if (sels.length) setPointsSels(sels as never);
+        } else if (first?.binding.kind === "focas.data-block") {
+          const items = (first.binding.config as { items?: Array<{ key: string }> }).items ?? [];
+          const sels = items.map((it) => ({
+            resource_id: "dynamic",
+            parameters: {},
+            outputs: [{ output: "value", point_key: it.key }],
+          }));
+          if (sels.length) setPointsSels(sels as never);
+        }
+        if (tasks.length) message.info(`已回显 ${tasks.length} 任务`);
+      }
     }).catch(() => {});
   };
 
@@ -185,6 +209,7 @@ export function DeviceManager() {
       tasks = [{ id: "t1", mode: "poll", interval_ms: intervalMs, binding: { kind: "focas.data-block", config: { items } } }];
     } else if (pointsEp.driver_id === "s7") {
       const toAddr = (p: Record<string, unknown>): string => {
+        if (p.address && typeof p.address === "string" && (p.address as string).trim()) return String(p.address);
         const area = String(p.area ?? "DB");
         const db = p.db ?? 10;
         const offset = p.offset ?? 0;
@@ -293,14 +318,28 @@ export function DeviceManager() {
 
       <Modal title={`编辑 · ${editEp?.id ?? ""}`} open={editOpen} onOk={saveEdit} onCancel={() => setEditOpen(false)} okText="保存" width={640} destroyOnHidden={false} forceRender>
         {!editDesc ? <div style={{ color: "#999" }}>加载中…</div> : (
-          <Form form={editForm} layout="vertical" preserve={false} key={`${editEp?.id}-${JSON.stringify(editConn)}`} initialValues={editConn}>
-            {(editDesc.connection.fields ?? []).map((f) => (
-              <Form.Item key={f.key} name={f.key} label={f.label} tooltip={f.description} valuePropName={f.field_type === "boolean" ? "checked" : "value"}>
-                <FieldControl f={f} />
-              </Form.Item>
-            ))}
+          <div style={{ display: "grid", gap: 12 }}>
+            {(editDesc.connection.fields ?? []).map((f) => {
+              const val = editConn[f.key] as never;
+              const common = { value: val ?? f.default ?? "", onChange: (e: unknown) => {
+                const v = typeof e === "object" && e !== null && "target" in (e as never) ? (e as { target: { value: unknown } }).target.value : e;
+                // Switch 会传 boolean，InputNumber 传 number
+                setEditConn((prev) => ({ ...prev, [f.key]: v as unknown }));
+              } };
+              if (f.field_type === "boolean") {
+                return <div key={f.key}><span style={{ fontSize: 12 }}>{f.label}</span><Switch checked={!!val} onChange={(v) => setEditConn((p) => ({ ...p, [f.key]: v }))} style={{ marginLeft: 8 }} /></div>;
+              }
+              if (f.field_type === "enum") {
+                return <div key={f.key}><div style={{ fontSize: 12 }}>{f.label}</div><Select style={{ width: "100%" }} value={String(val ?? f.default ?? "")} onChange={(v) => setEditConn((p) => ({ ...p, [f.key]: v }))} options={(f.validation.enum_options ?? []).map((o) => ({ value: o, label: o }))} /></div>;
+              }
+              if (f.field_type === "integer" || f.field_type === "port" || f.field_type === "number" || f.field_type === "duration") {
+                return <div key={f.key}><div style={{ fontSize: 12 }}>{f.label}</div><InputNumber style={{ width: "100%" }} value={val as number} onChange={(v) => setEditConn((p) => ({ ...p, [f.key]: v }))} /></div>;
+              }
+              return <div key={f.key}><div style={{ fontSize: 12 }}>{f.label}</div><Input value={String(val ?? f.default ?? "")} onChange={(e) => setEditConn((p) => ({ ...p, [f.key]: e.target.value }))} /></div>;
+            })}
             <div style={{ fontSize: 12, color: "#999" }}>需先停止再修改，保存后需手动启动</div>
-          </Form>
+            <div style={{ fontSize: 10, color: "#999", wordBreak: "break-all" }}>当前: {JSON.stringify(editConn)}</div>
+          </div>
         )}
       </Modal>
 
@@ -318,8 +357,17 @@ export function DeviceManager() {
               if (dup) return message.warning(`point_key 重复：${keys.join(", ")} 已存在`);
               setPointsSels((p) => [...p, s]);
             }} />
-            <div style={{ marginTop: 12, fontSize: 12, color: "#999" }}>已选 {pointsSels.length} 项 · {intervalMs}ms 轮询 · 保存将执行 Stop → PUT /tasks/{pointsEp?.id} → Start</div>
-            {!!pointsSels.length && <pre style={{ marginTop: 8, fontSize: 11, background: "#f5f5f5", padding: 8, maxHeight: 160, overflow: "auto" }}>{JSON.stringify(pointsSels, null, 2)}</pre>}
+            <div style={{ marginTop: 12, fontSize: 12, color: "#999" }}>已选 {pointsSels.length} 项 · {intervalMs}ms 轮询 · 保存将执行 Stop → PUT /tasks/{pointsEp?.id} → Start <Button size="small" onClick={() => setPointsSels([])} style={{ marginLeft: 8 }}>清空</Button></div>
+            {!!pointsSels.length && (
+              <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
+                {pointsSels.map((s, idx) => (
+                  <div key={idx} style={{ display: "flex", gap: 8, alignItems: "center", padding: 6, border: "1px solid #eee", borderRadius: 6 }}>
+                    <span style={{ flex: 1, fontFamily: "monospace", fontSize: 11 }}>{s.resource_id} → {s.outputs.map((o) => o.point_key).join(", ")} <span style={{ color: "#999" }}>{JSON.stringify(s.parameters)}</span></span>
+                    <Button size="small" danger onClick={() => setPointsSels((p) => p.filter((_, i) => i !== idx))}>移除</Button>
+                  </div>
+                ))}
+              </div>
+            )}
           </>
         )}
       </Modal>
