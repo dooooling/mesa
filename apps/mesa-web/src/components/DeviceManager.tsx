@@ -1,4 +1,4 @@
-// 设备：驱动自描述表单，切换驱动即切换参数，带校验/探测
+// 设备：驱动自描述表单，带编辑与状态互斥
 import { useEffect, useState } from "react";
 import { Alert, Button, Card, Form, Input, InputNumber, Modal, Select, Space, Switch, Table, Tag, message } from "antd";
 import type { DriverDescriptor, FieldDescriptor } from "../types";
@@ -20,7 +20,7 @@ function FieldControl({ f }: { f: FieldDescriptor }) {
 }
 
 export function DeviceManager() {
-  const [endpoints, setEndpoints] = useState<Array<{ id: string; driver_id: string; state?: string }>>([]);
+  const [endpoints, setEndpoints] = useState<Array<{ id: string; driver_id: string; device_id?: string; state?: string; connection?: Record<string, unknown> }>>([]);
   const [open, setOpen] = useState(false);
   const [form] = Form.useForm();
   const [desc, setDesc] = useState<DriverDescriptor | null>(null);
@@ -32,11 +32,15 @@ export function DeviceManager() {
   const [pointsDesc, setPointsDesc] = useState<DriverDescriptor | null>(null);
   const [pointsSels, setPointsSels] = useState<Array<{ resource_id: string; parameters: Record<string, unknown>; outputs: Array<{ output: string; point_key: string }> }>>([]);
   const [intervalMs, setIntervalMs] = useState(1000);
+  const [editOpen, setEditOpen] = useState(false);
+  const [editEp, setEditEp] = useState<{ id: string; driver_id: string; device_id?: string } | null>(null);
+  const [editForm] = Form.useForm();
+  const [editDesc, setEditDesc] = useState<DriverDescriptor | null>(null);
 
   const load = () => fetch("/api/v1/endpoints").then((r) => r.json()).then((j) => {
     const eps = (j.endpoints ?? []).map((e: never) => {
-      const x = e as { id: string; driver_id: string; runtime?: { state?: string }; state?: string };
-      return { id: x.id, driver_id: x.driver_id, state: x.state ?? x.runtime?.state };
+      const x = e as { id: string; driver_id: string; device_id?: string; connection?: Record<string, unknown>; runtime?: { state?: string }; state?: string };
+      return { id: x.id, driver_id: x.driver_id, device_id: x.device_id, connection: x.connection, state: x.state ?? x.runtime?.state };
     });
     setEndpoints(eps);
   }).catch(() => {});
@@ -46,7 +50,6 @@ export function DeviceManager() {
     if (!open) return;
     fetch(`/api/v1/drivers/${driverId}/descriptor`).then((r) => r.json()).then((d) => {
       setDesc(d);
-      // 仅对空字段填默认值，不覆盖用户已填的 host
       const cur = form.getFieldsValue();
       const defaults: Record<string, unknown> = {};
       for (const f of d.connection.fields ?? []) if (f.default !== undefined && (cur[f.key] === undefined || cur[f.key] === "" || cur[f.key] === null)) defaults[f.key] = f.default;
@@ -91,11 +94,9 @@ export function DeviceManager() {
         if (k === "id" || k === "driver_id") continue;
         if (v[k] !== undefined && v[k] !== "" && v[k] !== null) connection[k] = v[k];
       }
-      // 先建 device（endpoint 依赖 device 外键）
       const devRes = await fetch("/api/v1/devices", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, name: id }) });
       if (!devRes.ok) {
         const j = await devRes.json().catch(() => ({}));
-        // 已存在则忽略
         if (j.error?.code !== "DUPLICATE" && !String(j.error?.message ?? "").includes("已存在")) {
           message.error(j.error?.message ?? "创建设备失败");
           return;
@@ -120,21 +121,43 @@ export function DeviceManager() {
     load();
   };
 
+  const openEdit = async (ep: { id: string; driver_id: string }) => {
+    const r = await fetch(`/api/v1/endpoints/${ep.id}`).then((x) => x.json()).catch(() => null);
+    if (!r) return message.error("获取设备失败");
+    const detail = r.runtime ?? r;
+    const conn = r.connection ?? detail?.connection ?? {};
+    setEditEp({ id: r.id ?? ep.id, driver_id: r.driver_id ?? ep.driver_id, device_id: r.device_id });
+    const d = await fetch(`/api/v1/drivers/${r.driver_id ?? ep.driver_id}/descriptor`).then((x) => x.json()).catch(() => null);
+    setEditDesc(d);
+    setEditOpen(true);
+    setTimeout(() => editForm.setFieldsValue({ ...conn }), 100);
+  };
+
+  const saveEdit = async () => {
+    if (!editEp) return;
+    const v = editForm.getFieldsValue();
+    const connection: Record<string, unknown> = {};
+    for (const k of Object.keys(v)) if (v[k] !== undefined && v[k] !== "" && v[k] !== null) connection[k] = v[k];
+    const r = await fetch(`/api/v1/endpoints/${editEp.id}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ device_id: editEp.device_id ?? editEp.id, driver_id: editEp.driver_id, connection }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) return message.error(j.error?.message ?? "修改失败（需先停止）");
+    message.success("修改成功");
+    setEditOpen(false);
+    load();
+  };
+
   const openPoints = async (ep: { id: string; driver_id: string }) => {
     setPointsEp(ep); setPointsSels([]); setIntervalMs(1000); setPointsOpen(true);
     const r = await fetch(`/api/v1/drivers/${ep.driver_id}/descriptor`).then((x) => x.json()).catch(() => null);
     setPointsDesc(r);
-    // 回显已有 tasks
     fetch(`/api/v1/tasks?endpoint=${ep.id}`).then((x) => x.json()).then((j) => {
       const tasks = j.tasks ?? [];
-      // 粗略回显为 selections 仅提示数量
       if (tasks.length) message.info(`已有 ${tasks.length} 任务`);
     }).catch(() => {});
   };
 
   const savePoints = async () => {
     if (!pointsEp || !pointsSels.length) return message.warning("请先加入点位");
-    // 通用自描述：用 mesa.resources.v1，下发 selections；S7/FOCAS 需合成真实地址
     let tasks: Array<Record<string, unknown>>;
     if (pointsEp.driver_id === "focas2") {
       const FOCAS_ADDRS = ["status", "axis.abs.1", "spindle.load.1", "pmc.R100", "macro.100"];
@@ -147,7 +170,6 @@ export function DeviceManager() {
       );
       tasks = [{ id: "t1", mode: "poll", interval_ms: intervalMs, binding: { kind: "focas.data-block", config: { items } } }];
     } else if (pointsEp.driver_id === "s7") {
-      // S7 需合成 DB/M/I/Q 地址：DB10.DBD0 / DB10.DBX0.0 等
       const toAddr = (p: Record<string, unknown>): string => {
         const area = String(p.area ?? "DB");
         const db = p.db ?? 10;
@@ -182,7 +204,6 @@ export function DeviceManager() {
         },
       ];
     }
-    // 需先停止再下发
     await fetch(`/api/v1/endpoints/${pointsEp.id}/stop`, { method: "POST" }).catch(() => {});
     const r = await fetch(`/api/v1/tasks/${pointsEp.id}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ tasks }) });
     const j = await r.json().catch(() => ({}));
@@ -192,6 +213,8 @@ export function DeviceManager() {
     setPointsOpen(false);
     load();
   };
+
+  const isRunning = (s?: string) => (s ?? "").toUpperCase() === "RUNNING";
 
   return (
     <div style={{ display: "grid", gap: 16 }}>
@@ -203,16 +226,19 @@ export function DeviceManager() {
           columns={[
             { title: "ID", dataIndex: "id", render: (v: string) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{v}</span> },
             { title: "驱动", dataIndex: "driver_id", render: (v: string) => <Tag>{v}</Tag> },
-            { title: "状态", dataIndex: "state", render: (v: string) => <Tag color={(v ?? "").toUpperCase() === "RUNNING" ? "green" : (v ?? "").toUpperCase() === "FAILED" ? "red" : "default"}>{v ?? "—"}</Tag> },
+            { title: "状态", dataIndex: "state", render: (v: string) => <Tag color={isRunning(v) ? "green" : (v ?? "").toUpperCase() === "FAILED" ? "red" : "default"}>{v ?? "—"}</Tag> },
             {
-              title: "操作", render: (_: unknown, r: { id: string; driver_id: string }) => (
-                <Space>
-                  <Button size="small" onClick={() => openPoints(r)}>点位</Button>
-                  <Button size="small" onClick={() => act(r.id, "start")}>启动</Button>
-                  <Button size="small" onClick={() => act(r.id, "stop")}>停止</Button>
-                  <Button size="small" danger onClick={() => act(r.id, "delete")}>删除</Button>
-                </Space>
-              ),
+              title: "操作", render: (_: unknown, r: { id: string; driver_id: string; state?: string }) => {
+                const running = isRunning(r.state);
+                return (
+                  <Space>
+                    <Button size="small" onClick={() => openEdit(r)}>编辑</Button>
+                    <Button size="small" onClick={() => openPoints(r)}>点位</Button>
+                    {!running ? <Button size="small" type="primary" onClick={() => act(r.id, "start")}>启动</Button> : <Button size="small" onClick={() => act(r.id, "stop")}>停止</Button>}
+                    <Button size="small" danger onClick={() => act(r.id, "delete")}>删除</Button>
+                  </Space>
+                );
+              },
             },
           ]}
         />
@@ -249,6 +275,19 @@ export function DeviceManager() {
           </Space>
           {!!issues.length && <Alert style={{ marginTop: 8 }} type="error" message={issues.map((i) => `${i.path}: ${i.message}`).join("； ")} />}
         </Form>
+      </Modal>
+
+      <Modal title={`编辑 · ${editEp?.id ?? ""}`} open={editOpen} onOk={saveEdit} onCancel={() => setEditOpen(false)} okText="保存" width={640} destroyOnClose>
+        {!editDesc ? <div style={{ color: "#999" }}>加载中…</div> : (
+          <Form form={editForm} layout="vertical">
+            {(editDesc.connection.fields ?? []).map((f) => (
+              <Form.Item key={f.key} name={f.key} label={f.label} tooltip={f.description} valuePropName={f.field_type === "boolean" ? "checked" : "value"}>
+                <FieldControl f={f} />
+              </Form.Item>
+            ))}
+            <div style={{ fontSize: 12, color: "#999" }}>需先停止再修改，保存后需手动启动</div>
+          </Form>
+        )}
       </Modal>
 
       <Modal title={`点位 · ${pointsEp?.id ?? ""}`} open={pointsOpen} onOk={savePoints} onCancel={() => setPointsOpen(false)} okText="保存并启动" width={720} destroyOnClose>
