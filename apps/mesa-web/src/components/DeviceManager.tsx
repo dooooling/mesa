@@ -233,7 +233,12 @@ export function DeviceManager() {
               <InputNumber min={100} max={60000} step={100} value={intervalMs} onChange={(v) => setIntervalMs(v ?? 1000)} addonAfter="ms" style={{ width: 180 }} />
               <span style={{ fontSize: 12, color: "#999" }}>100ms–60s</span>
             </div>
-            <ResourcePickerAntd resources={pointsDesc.resources} onAdd={(s) => setPointsSels((p) => [...p, s])} />
+            <ResourcePickerAntd resources={pointsDesc.resources} onAdd={(s) => {
+              const keys = s.outputs.map((o) => o.point_key);
+              const dup = pointsSels.some((ex) => ex.outputs.some((o) => keys.includes(o.point_key)));
+              if (dup) return message.warning(`point_key 重复：${keys.join(", ")} 已存在`);
+              setPointsSels((p) => [...p, s]);
+            }} />
             <div style={{ marginTop: 12, fontSize: 12, color: "#999" }}>已选 {pointsSels.length} 项 · {intervalMs}ms 轮询 · 保存将执行 Stop → PUT /tasks/{pointsEp?.id} → Start</div>
             {!!pointsSels.length && <pre style={{ marginTop: 8, fontSize: 11, background: "#f5f5f5", padding: 8, maxHeight: 160, overflow: "auto" }}>{JSON.stringify(pointsSels, null, 2)}</pre>}
           </>
