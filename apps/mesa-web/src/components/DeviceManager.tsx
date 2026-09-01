@@ -258,7 +258,7 @@ export function DeviceManager() {
         />
       </Card>
 
-      <Modal title="新增设备" open={open} onOk={create} onCancel={() => setOpen(false)} okText="创建" destroyOnClose width={640}>
+      <Modal title="新增设备" open={open} onOk={create} onCancel={() => setOpen(false)} okText="创建" destroyOnHidden width={640}>
         <Form form={form} layout="vertical" initialValues={{ driver_id: "simulator" }}>
           <Form.Item name="driver_id" label="驱动" rules={[{ required: true }]}>
             <Select options={DRIVERS} onChange={(v) => setDriverId(v)} />
@@ -291,9 +291,9 @@ export function DeviceManager() {
         </Form>
       </Modal>
 
-      <Modal title={`编辑 · ${editEp?.id ?? ""}`} open={editOpen} onOk={saveEdit} onCancel={() => setEditOpen(false)} okText="保存" width={640} destroyOnClose={false} forceRender>
+      <Modal title={`编辑 · ${editEp?.id ?? ""}`} open={editOpen} onOk={saveEdit} onCancel={() => setEditOpen(false)} okText="保存" width={640} destroyOnHidden={false} forceRender>
         {!editDesc ? <div style={{ color: "#999" }}>加载中…</div> : (
-          <Form form={editForm} layout="vertical" key={`${editEp?.id}-${JSON.stringify(editConn)}`} initialValues={editConn}>
+          <Form form={editForm} layout="vertical" preserve={false} key={`${editEp?.id}-${JSON.stringify(editConn)}`} initialValues={editConn}>
             {(editDesc.connection.fields ?? []).map((f) => (
               <Form.Item key={f.key} name={f.key} label={f.label} tooltip={f.description} valuePropName={f.field_type === "boolean" ? "checked" : "value"}>
                 <FieldControl f={f} />
@@ -304,7 +304,7 @@ export function DeviceManager() {
         )}
       </Modal>
 
-      <Modal title={`点位 · ${pointsEp?.id ?? ""}`} open={pointsOpen} onOk={savePoints} onCancel={() => setPointsOpen(false)} okText="保存并启动" width={720} destroyOnClose>
+      <Modal title={`点位 · ${pointsEp?.id ?? ""}`} open={pointsOpen} onOk={savePoints} onCancel={() => setPointsOpen(false)} okText="保存并启动" width={720} destroyOnHidden>
         {!pointsDesc ? <div style={{ color: "#999" }}>加载资源…</div> : (
           <>
             <div style={{ marginBottom: 12, display: "flex", gap: 8, alignItems: "center" }}>
