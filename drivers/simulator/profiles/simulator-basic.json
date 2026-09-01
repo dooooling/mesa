@@ -1,0 +1,24 @@
+{
+  "profile_version": 1,
+  "id": "simulator-basic",
+  "version": "1.0.0",
+  "vendor": "Mesa",
+  "family": "Simulator",
+  "model": "Basic",
+  "driver_id": "simulator",
+  "match_rules": [
+    { "field": "driver_id", "op": "eq", "value": "simulator" }
+  ],
+  "connection_defaults": {},
+  "rate_classes": { "realtime": 100, "normal": 1000, "slow": 10000 },
+  "presets": [
+    {
+      "id": "basic",
+      "label": { "default": "Basic", "zh-CN": "基础" },
+      "selections": [
+        { "resource_id": "counter", "parameters": {}, "outputs": [{ "output": "value", "point_key": "sim.counter" }] },
+        { "resource_id": "sine", "parameters": { "amplitude": 100, "period_ms": 5000 }, "outputs": [{ "output": "value", "point_key": "sim.sine" }] }
+      ]
+    }
+  ]
+}

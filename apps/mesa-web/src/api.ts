@@ -21,6 +21,8 @@ export const api = {
   listDrivers: () => getJson("/api/v1/drivers"),
   getDriver: (id: string) => getJson(`/api/v1/drivers/${id}`),
   getDescriptor: (id: string) => getJson(`/api/v1/drivers/${id}/descriptor`),
+  listProfiles: () => getJson("/api/v1/profiles"),
+  getProfile: (id: string) => getJson(`/api/v1/profiles/${id}`),
   validateConnection: (id: string, connection: unknown) =>
     postJson(`/api/v1/drivers/${id}/validate-connection`, { connection }),
   probe: (id: string, connection: unknown) =>

@@ -1,0 +1,23 @@
+{
+  "profile_version": 1,
+  "id": "opcua-generic",
+  "version": "1.0.0",
+  "vendor": "Generic",
+  "family": "OPC UA",
+  "model": "Generic",
+  "driver_id": "opcua",
+  "match_rules": [
+    { "field": "driver_id", "op": "eq", "value": "opcua" }
+  ],
+  "connection_defaults": { "endpoint_url": "opc.tcp://127.0.0.1:4840", "security_policy": "None", "security_mode": "None" },
+  "rate_classes": { "realtime": 100, "normal": 1000, "slow": 10000 },
+  "presets": [
+    {
+      "id": "basic",
+      "label": { "default": "Basic" },
+      "selections": [
+        { "resource_id": "node", "parameters": { "node_id": "ns=2;i=2", "data_type": "U32" }, "outputs": [{ "output": "value", "point_key": "opc.counter" }] }
+      ]
+    }
+  ]
+}

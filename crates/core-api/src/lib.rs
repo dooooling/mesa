@@ -227,6 +227,24 @@ async fn get_driver(
     }
 }
 
+async fn list_profiles(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "profiles": state.manager.list_profiles() }))
+}
+
+async fn get_profile(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(p) = state.manager.get_profile(&id) {
+        (StatusCode::OK, Json(serde_json::to_value(p).unwrap()))
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("profile `{id}` not found"))),
+        )
+    }
+}
+
 async fn get_driver_descriptor(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1221,6 +1239,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(validate_connection),
         )
         .route("/api/v1/drivers/{id}/probe", post(probe_driver))
+        .route("/api/v1/profiles", get(list_profiles))
+        .route("/api/v1/profiles/{id}", get(get_profile))
         .route(
             "/api/v1/endpoints",
             get(list_endpoints).post(create_endpoint),

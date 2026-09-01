@@ -1,0 +1,34 @@
+{
+  "profile_version": 1,
+  "id": "fanuc-0i-f-plus",
+  "version": "1.0.0",
+  "vendor": "FANUC",
+  "family": "0i",
+  "model": "0i-F Plus",
+  "driver_id": "focas2",
+  "match_rules": [
+    { "field": "driver_id", "op": "eq", "value": "focas2" },
+    { "field": "probe.model", "op": "eq", "value": "0i-F Plus" }
+  ],
+  "connection_defaults": { "port": 8193, "timeout_ms": 3000 },
+  "rate_classes": { "realtime": 100, "normal": 1000, "slow": 10000 },
+  "presets": [
+    {
+      "id": "basic",
+      "label": { "default": "Basic", "zh-CN": "基础数据" },
+      "selections": [
+        { "resource_id": "dynamic", "parameters": { "axis": 1 }, "outputs": [{ "output": "feed", "point_key": "machine.feed" }, { "output": "spindle.speed", "point_key": "machine.spindle_speed" }] },
+        { "resource_id": "status", "parameters": {}, "outputs": [{ "output": "value", "point_key": "machine.status" }] },
+        { "resource_id": "alarm", "parameters": {}, "outputs": [{ "output": "value", "point_key": "machine.alarm" }] }
+      ]
+    },
+    {
+      "id": "production",
+      "label": { "default": "Production" },
+      "selections": [
+        { "resource_id": "dynamic", "parameters": { "axis": 1 }, "outputs": [{ "output": "feed", "point_key": "machine.feed" }] },
+        { "resource_id": "program", "parameters": {}, "outputs": [{ "output": "value", "point_key": "machine.program" }] }
+      ]
+    }
+  ]
+}

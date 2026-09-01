@@ -1,0 +1,24 @@
+{
+  "profile_version": 1,
+  "id": "s7-1200",
+  "version": "1.0.0",
+  "vendor": "Siemens",
+  "family": "S7-1200",
+  "model": "1214C",
+  "driver_id": "s7",
+  "match_rules": [
+    { "field": "driver_id", "op": "eq", "value": "s7" }
+  ],
+  "connection_defaults": { "port": 102, "rack": 0, "slot": 1, "timeout_ms": 3000 },
+  "rate_classes": { "realtime": 100, "normal": 1000, "slow": 10000 },
+  "presets": [
+    {
+      "id": "basic",
+      "label": { "default": "Basic", "zh-CN": "基础" },
+      "selections": [
+        { "resource_id": "memory", "parameters": { "address": "DB1.DBD0", "data_type": "REAL" }, "outputs": [{ "output": "value", "point_key": "s7.db1.real0" }] },
+        { "resource_id": "memory", "parameters": { "address": "M0.0", "data_type": "BOOL" }, "outputs": [{ "output": "value", "point_key": "s7.m0.0" }] }
+      ]
+    }
+  ]
+}

@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::endpoint::{BuiltinEndpoint, PointIdAllocator, PointIdSource, run_endpoint};
 use crate::manifest::{DiscoveredDriver, scan_drivers};
+use crate::profile::load_profiles;
 use crate::snapshot::{DriverInfo, Snapshot};
 
 /// Descriptor 缓存键（§4.5）：(driver_id, driver_version)
@@ -48,6 +49,7 @@ pub struct MesaManager {
     running: Mutex<HashMap<String, RunningEntry>>,
     shutdown: CancellationToken,
     descriptor_cache: RwLock<HashMap<DescriptorCacheKey, CachedDescriptor>>,
+    profiles: RwLock<Vec<mesa_core_types::DeviceProfile>>,
 }
 
 impl MesaManager {
@@ -61,6 +63,7 @@ impl MesaManager {
         let drivers = scan_drivers(drivers_dir);
         let snapshot = Arc::new(Snapshot::new());
         snapshot.set_drivers(Self::driver_infos(&drivers));
+        let profiles = load_profiles(drivers_dir);
         Self {
             drivers: RwLock::new(drivers),
             snapshot,
@@ -68,6 +71,7 @@ impl MesaManager {
             running: Mutex::new(HashMap::new()),
             shutdown: CancellationToken::new(),
             descriptor_cache: RwLock::new(HashMap::new()),
+            profiles: RwLock::new(profiles),
         }
     }
 
@@ -103,7 +107,7 @@ impl MesaManager {
         self.shutdown.clone()
     }
 
-    /// 重新扫描驱动目录，刷新可用驱动清单并清空 Descriptor 缓存（§4.5）。
+    /// 重新扫描驱动目录，刷新可用驱动清单并清空 Descriptor 缓存（§4.5），同时重载 Profiles。
     pub fn rescan(&self, drivers_dir: &Path) -> Vec<DriverInfo> {
         let drivers = scan_drivers(drivers_dir);
         let infos = Self::driver_infos(&drivers);
@@ -111,6 +115,7 @@ impl MesaManager {
         self.snapshot.set_drivers(infos.clone());
         // 清空全部 Descriptor Cache（§4.5 精确失效 1）
         self.descriptor_cache.write().unwrap().clear();
+        *self.profiles.write().unwrap() = load_profiles(drivers_dir);
         infos
     }
 
@@ -284,6 +289,19 @@ impl MesaManager {
             .iter()
             .map(|((id, ver), _)| (format!("{id}@{ver}"), "cached".into()))
             .collect()
+    }
+
+    pub fn list_profiles(&self) -> Vec<mesa_core_types::DeviceProfile> {
+        self.profiles.read().unwrap().clone()
+    }
+
+    pub fn get_profile(&self, id: &str) -> Option<mesa_core_types::DeviceProfile> {
+        self.profiles
+            .read()
+            .unwrap()
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
     }
 
     /// Browse（§20）：临时进程 + 分页，用于 OPC UA 等支持浏览的驱动
