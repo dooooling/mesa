@@ -31,6 +31,7 @@ export function DeviceManager() {
   const [pointsEp, setPointsEp] = useState<{ id: string; driver_id: string } | null>(null);
   const [pointsDesc, setPointsDesc] = useState<DriverDescriptor | null>(null);
   const [pointsSels, setPointsSels] = useState<Array<{ resource_id: string; parameters: Record<string, unknown>; outputs: Array<{ output: string; point_key: string }> }>>([]);
+  const [intervalMs, setIntervalMs] = useState(1000);
 
   const load = () => fetch("/api/v1/endpoints").then((r) => r.json()).then((j) => {
     const eps = (j.endpoints ?? []).map((e: never) => {
@@ -119,7 +120,7 @@ export function DeviceManager() {
   };
 
   const openPoints = async (ep: { id: string; driver_id: string }) => {
-    setPointsEp(ep); setPointsSels([]); setPointsOpen(true);
+    setPointsEp(ep); setPointsSels([]); setIntervalMs(1000); setPointsOpen(true);
     const r = await fetch(`/api/v1/drivers/${ep.driver_id}/descriptor`).then((x) => x.json()).catch(() => null);
     setPointsDesc(r);
     // 回显已有 tasks
@@ -144,13 +145,13 @@ export function DeviceManager() {
           data_type: "U32",
         }))
       );
-      tasks = [{ id: "t1", mode: "poll", interval_ms: 1000, binding: { kind: "focas.data-block", config: { items } } }];
+      tasks = [{ id: "t1", mode: "poll", interval_ms: intervalMs, binding: { kind: "focas.data-block", config: { items } } }];
     } else {
       tasks = [
         {
           id: "t1",
           mode: "poll",
-          interval_ms: 1000,
+          interval_ms: intervalMs,
           binding: { kind: "mesa.resources.v1", config: { selections: pointsSels } },
         },
       ];
@@ -227,8 +228,13 @@ export function DeviceManager() {
       <Modal title={`点位 · ${pointsEp?.id ?? ""}`} open={pointsOpen} onOk={savePoints} onCancel={() => setPointsOpen(false)} okText="保存并启动" width={720} destroyOnClose>
         {!pointsDesc ? <div style={{ color: "#999" }}>加载资源…</div> : (
           <>
+            <div style={{ marginBottom: 12, display: "flex", gap: 8, alignItems: "center" }}>
+              <span style={{ fontSize: 12 }}>采集周期</span>
+              <InputNumber min={100} max={60000} step={100} value={intervalMs} onChange={(v) => setIntervalMs(v ?? 1000)} addonAfter="ms" style={{ width: 180 }} />
+              <span style={{ fontSize: 12, color: "#999" }}>100ms–60s</span>
+            </div>
             <ResourcePickerAntd resources={pointsDesc.resources} onAdd={(s) => setPointsSels((p) => [...p, s])} />
-            <div style={{ marginTop: 12, fontSize: 12, color: "#999" }}>已选 {pointsSels.length} 项 · 保存将执行 Stop → PUT /tasks/{pointsEp?.id} → Start</div>
+            <div style={{ marginTop: 12, fontSize: 12, color: "#999" }}>已选 {pointsSels.length} 项 · {intervalMs}ms 轮询 · 保存将执行 Stop → PUT /tasks/{pointsEp?.id} → Start</div>
             {!!pointsSels.length && <pre style={{ marginTop: 8, fontSize: 11, background: "#f5f5f5", padding: 8, maxHeight: 160, overflow: "auto" }}>{JSON.stringify(pointsSels, null, 2)}</pre>}
           </>
         )}
