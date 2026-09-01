@@ -36,6 +36,7 @@ export function DeviceManager() {
   const [editEp, setEditEp] = useState<{ id: string; driver_id: string; device_id?: string } | null>(null);
   const [editForm] = Form.useForm();
   const [editDesc, setEditDesc] = useState<DriverDescriptor | null>(null);
+  const [editConn, setEditConn] = useState<Record<string, unknown>>({});
 
   const load = () => fetch("/api/v1/endpoints").then((r) => r.json()).then((j) => {
     const eps = (j.endpoints ?? []).map((e: never) => {
@@ -124,14 +125,20 @@ export function DeviceManager() {
   const openEdit = async (ep: { id: string; driver_id: string }) => {
     const r = await fetch(`/api/v1/endpoints/${ep.id}`).then((x) => x.json()).catch(() => null);
     if (!r) return message.error("获取设备失败");
-    const detail = r.runtime ?? r;
-    const conn = r.connection ?? detail?.connection ?? {};
+    const conn = r.connection ?? {};
     setEditEp({ id: r.id ?? ep.id, driver_id: r.driver_id ?? ep.driver_id, device_id: r.device_id });
+    setEditConn(conn);
     const d = await fetch(`/api/v1/drivers/${r.driver_id ?? ep.driver_id}/descriptor`).then((x) => x.json()).catch(() => null);
     setEditDesc(d);
     setEditOpen(true);
-    setTimeout(() => editForm.setFieldsValue({ ...conn }), 100);
   };
+
+  useEffect(() => {
+    if (editOpen && editDesc) {
+      // 确保表单字段已渲染后再回填历史值
+      setTimeout(() => editForm.setFieldsValue({ ...editConn }), 50);
+    }
+  }, [editOpen, editDesc, editConn]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const saveEdit = async () => {
     if (!editEp) return;
