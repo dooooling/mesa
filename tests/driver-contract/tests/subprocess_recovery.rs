@@ -148,12 +148,15 @@ async fn driver_crash_restore_via_endpoint_runtime() {
 
     let disc = sim_discovered();
     let snap = snapshot.clone();
+    let registry: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<Session>>>>> =
+        std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let rt = tokio::spawn(run_endpoint(
         disc,
         cfg.clone(),
         snap,
         allocator,
         shutdown.clone(),
+        registry,
     ));
 
     // 第一次运行：RUNNING 且 epoch != 0，记录点集与 epoch

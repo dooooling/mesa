@@ -50,6 +50,8 @@ pub struct MesaManager {
     shutdown: CancellationToken,
     descriptor_cache: RwLock<HashMap<DescriptorCacheKey, CachedDescriptor>>,
     profiles: RwLock<Vec<mesa_core_types::DeviceProfile>>,
+    /// 活跃会话注册表：endpoint_id -> Session（用于 Control 面可靠转发，§22）
+    active_sessions: std::sync::Arc<RwLock<HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>>,
 }
 
 impl MesaManager {
@@ -72,6 +74,7 @@ impl MesaManager {
             shutdown: CancellationToken::new(),
             descriptor_cache: RwLock::new(HashMap::new()),
             profiles: RwLock::new(profiles),
+            active_sessions: std::sync::Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -150,7 +153,15 @@ impl MesaManager {
         let cancel = shutdown.clone();
         let snapshot = Arc::clone(&self.snapshot);
         let source = Arc::clone(&self.source);
-        let handle = tokio::spawn(run_endpoint(disc, cfg.clone(), snapshot, source, shutdown));
+        let registry = std::sync::Arc::clone(&self.active_sessions);
+        let handle = tokio::spawn(run_endpoint(
+            disc,
+            cfg.clone(),
+            snapshot,
+            source,
+            shutdown,
+            registry,
+        ));
 
         self.running
             .lock()
@@ -372,5 +383,68 @@ impl MesaManager {
         session.invalidate();
         proc.terminate().await;
         Ok(res)
+    }
+
+    /// Control Write（§22）：经由活跃会话的可靠 Control 队列转发，永不 Latest-Wins
+    pub async fn control_write(
+        &self,
+        endpoint_id: &str,
+        target: &str,
+        value: mesa_core_types::Value,
+        expected: Option<mesa_core_types::Value>,
+    ) -> Result<Option<mesa_core_types::Value>, DescriptorError> {
+        let sess_arc = {
+            let m = self.active_sessions.read().unwrap();
+            m.get(endpoint_id).cloned()
+        }
+        .ok_or_else(|| DescriptorError::new("ENDPOINT_NOT_RUNNING", format!("endpoint `{endpoint_id}` not running")))?;
+        let request_id = format!("wr-{}-{}", endpoint_id, mesa_core_types::now_unix_ns());
+        let sess = sess_arc.lock().await;
+        // 约定 handle 1 为 Endpoint 主连接（endpoint.rs HANDLE=1）
+        sess.write(1, &request_id, target, value, expected)
+            .await
+            .map_err(|e| DescriptorError::new("CONTROL_FAILED", format!("{e}")))
+    }
+
+    /// Control Command（§22）：可靠转发，返回 (status, result_json, error)
+    pub async fn control_command(
+        &self,
+        endpoint_id: &str,
+        command_id: &str,
+        input_json: &str,
+    ) -> Result<(String, String, String), DescriptorError> {
+        let sess_arc = {
+            let m = self.active_sessions.read().unwrap();
+            m.get(endpoint_id).cloned()
+        }
+        .ok_or_else(|| DescriptorError::new("ENDPOINT_NOT_RUNNING", format!("endpoint `{endpoint_id}` not running")))?;
+        let request_id = format!("cmd-{}-{}", endpoint_id, mesa_core_types::now_unix_ns());
+        let sess = sess_arc.lock().await;
+        sess.command(1, &request_id, command_id, input_json)
+            .await
+            .map_err(|e| DescriptorError::new("CONTROL_FAILED", format!("{e}")))
+    }
+
+    /// 供 Endpoint 运行时注册/注销活跃会话（§22 Control 面）
+    pub fn register_session(
+        &self,
+        endpoint_id: &str,
+        sess: crate::session::Session,
+    ) -> std::sync::Arc<tokio::sync::Mutex<crate::session::Session>> {
+        let arc = std::sync::Arc::new(tokio::sync::Mutex::new(sess));
+        self.active_sessions
+            .write()
+            .unwrap()
+            .insert(endpoint_id.to_string(), std::sync::Arc::clone(&arc));
+        arc
+    }
+
+    pub fn unregister_session(&self, endpoint_id: &str) {
+        self.active_sessions.write().unwrap().remove(endpoint_id);
+    }
+
+    /// 直接通过 registry 操作（供 endpoint.rs 使用，避免 &self 借用冲突）
+    pub fn registry(&self) -> std::sync::Arc<RwLock<HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>> {
+        std::sync::Arc::clone(&self.active_sessions)
     }
 }

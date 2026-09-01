@@ -182,6 +182,7 @@ pub async fn run_endpoint(
     snapshot: Arc<Snapshot>,
     source: Arc<dyn PointIdSource>,
     shutdown: CancellationToken,
+    registry: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>>,
 ) {
     let mut backoff_idx = 0usize;
     let mut id_map: HashMap<String, u32> = source.known_map(&cfg.endpoint_id);
@@ -219,6 +220,7 @@ pub async fn run_endpoint(
             &mut id_map,
             &mut last_epoch,
             &shutdown,
+            &registry,
         )
         .await
         {
@@ -310,6 +312,7 @@ async fn attempt_session(
     id_map: &mut HashMap<String, u32>,
     last_epoch: &mut u64,
     shutdown: &CancellationToken,
+    registry: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>>,
 ) -> AttemptOutcome {
     let mut process = match DriverProcess::spawn(disc).await {
         Ok(p) => p,
@@ -324,12 +327,26 @@ async fn attempt_session(
                 return AttemptOutcome::Lost(format!("connect failed: {e}"));
             }
         };
-    let mut session = session;
+    // 注册活跃会话供 Control 面可靠转发（§22），Control 与 Data 共用同一 TCP 但分队列
+    let session_arc = std::sync::Arc::new(tokio::sync::Mutex::new(session));
+    registry
+        .write()
+        .unwrap()
+        .insert(cfg.endpoint_id.clone(), std::sync::Arc::clone(&session_arc));
 
-    match run_config_flow(&session, cfg, source, id_map, snapshot, last_epoch).await {
+    // run_config_flow 需经 Mutex 单次加锁，避免跨 await 持锁导致 !Send
+    let config_res = {
+        let sess = session_arc.lock().await;
+        run_config_flow(&*sess, cfg, source, id_map, snapshot, last_epoch).await
+    };
+    match config_res {
         Ok(()) => {}
         Err(outcome) => {
-            session.invalidate();
+            {
+                let mut sess = session_arc.lock().await;
+                sess.invalidate();
+            }
+            registry.write().unwrap().remove(&cfg.endpoint_id);
             process.terminate().await;
             return outcome;
         }
@@ -345,21 +362,28 @@ async fn attempt_session(
         source.revision(&cfg.endpoint_id),
     );
 
+    // 事件循环期间保持会话注册，Control 请求通过同一 session_arc 的 Mutex 串行化
     let outcome = event_loop(
         cfg,
         snapshot,
-        &session,
         unresponsive_flag.as_ref(),
         &mut events,
         shutdown,
     )
     .await;
 
-    if !session.is_unresponsive() {
-        let _ = session.post(pb_shutdown_body()).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    {
+        let sess = session_arc.lock().await;
+        if !sess.is_unresponsive() {
+            let _ = sess.post(pb_shutdown_body()).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
-    session.invalidate();
+    {
+        let mut sess = session_arc.lock().await;
+        sess.invalidate();
+    }
+    registry.write().unwrap().remove(&cfg.endpoint_id);
     drop(events);
     process.terminate().await;
     outcome
@@ -478,7 +502,6 @@ async fn run_config_flow(
 async fn event_loop(
     cfg: &BuiltinEndpoint,
     snapshot: &Arc<Snapshot>,
-    session: &Session,
     unresponsive_flag: &std::sync::atomic::AtomicBool,
     events: &mut tokio::sync::mpsc::Receiver<SessionEvent>,
     shutdown: &CancellationToken,
@@ -508,7 +531,7 @@ async fn event_loop(
                 None => return AttemptOutcome::Lost("event channel closed".into()),
             },
             _ = watchdog.tick() => {
-                if session.is_unresponsive() || unresponsive_flag.load(Ordering::Relaxed) {
+                if unresponsive_flag.load(Ordering::Relaxed) {
                     return AttemptOutcome::Lost("heartbeat dead".into());
                 }
             }

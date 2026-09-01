@@ -330,6 +330,94 @@ impl Session {
         }
     }
 
+    /// Write（§22 可靠控制，无 Latest-Wins）：发送 WriteRequest 并等待 WriteResponse
+    pub async fn write(
+        &self,
+        connection_handle: u32,
+        request_id: &str,
+        target: &str,
+        value: mesa_core_types::Value,
+        expected: Option<mesa_core_types::Value>,
+    ) -> Result<Option<mesa_core_types::Value>, SessionError> {
+        let id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
+        let rx = self.shared.register(id);
+        let env = pb::Envelope {
+            msg_id: id,
+            body: Some(pb::envelope::Body::WriteRequest(pb::WriteRequest {
+                connection_handle,
+                request_id: request_id.to_string(),
+                target: target.to_string(),
+                value: Some(mesa_driver_protocol::value_to_pb(&value)),
+                expected_value: expected.as_ref().map(mesa_driver_protocol::value_to_pb),
+            })),
+        };
+        {
+            let mut wr = self.shared.writer.lock().await;
+            write_envelope(&mut *wr, &env).await?;
+        }
+        let reply = match tokio::time::timeout(Duration::from_secs(10), rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => return Err(SessionError::Closed),
+            Err(_) => {
+                self.shared.unregister(id);
+                return Err(SessionError::Timeout);
+            }
+        };
+        match reply.body {
+            Some(pb::envelope::Body::WriteResponse(resp)) => {
+                if let Some(result) = resp.result {
+                    if !result.ok {
+                        let d = result.error.unwrap_or_default();
+                        return Err(SessionError::Handshake(format!("{}/{}: {}", d.kind, d.code, d.message)));
+                    }
+                }
+                if let Some(v) = resp.readback {
+                    Ok(Some(mesa_driver_protocol::value_from_pb(v).map_err(|e| SessionError::Handshake(e.to_string()))?))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Err(SessionError::Closed),
+        }
+    }
+
+    /// Command（§22）：发送 CommandRequest 并等待 CommandResponse
+    pub async fn command(
+        &self,
+        connection_handle: u32,
+        request_id: &str,
+        command_id: &str,
+        input_json: &str,
+    ) -> Result<(String, String, String), SessionError> {
+        let id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
+        let rx = self.shared.register(id);
+        let env = pb::Envelope {
+            msg_id: id,
+            body: Some(pb::envelope::Body::CommandRequest(pb::CommandRequest {
+                connection_handle,
+                request_id: request_id.to_string(),
+                command_id: command_id.to_string(),
+                input_json: input_json.to_string(),
+            })),
+        };
+        {
+            let mut wr = self.shared.writer.lock().await;
+            write_envelope(&mut *wr, &env).await?;
+        }
+        let reply = match tokio::time::timeout(Duration::from_secs(10), rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => return Err(SessionError::Closed),
+            Err(_) => {
+                self.shared.unregister(id);
+                return Err(SessionError::Timeout);
+            }
+        };
+        match reply.body {
+            Some(pb::envelope::Body::CommandResponse(resp)) => Ok((resp.status, resp.result_json, resp.error)),
+            _ => Err(SessionError::Closed),
+        }
+    }
+
     /// Browse（§20）：分页浏览，返回 (nodes, next_cursor)
     pub async fn browse(
         &self,

@@ -82,8 +82,17 @@ async fn main() {
         tracing::info!(pki=%pki.display(), "set MESA_OPCUA_PKI_DIR");
     }
 
-    let app_state =
-        mesa_core_api::AppState::new(manager.clone(), store.clone(), args.drivers_dir.clone());
+    let app_state = mesa_core_api::AppState::new_with_control(
+        manager.clone(),
+        store.clone(),
+        args.drivers_dir.clone(),
+        args.enable_control,
+    );
+    if args.enable_control {
+        tracing::warn!("control plane ENABLED (--enable-control)");
+    } else {
+        tracing::info!("control plane disabled (use --enable-control to enable)");
+    }
     let api_shutdown = manager.shutdown_token().child_token();
     let api = tokio::spawn(mesa_core_api::serve(
         app_state,
@@ -105,6 +114,7 @@ struct Args {
     drivers_dir: String,
     http_port: u16,
     db_path: String,
+    enable_control: bool,
 }
 
 fn parse_args() -> Args {
@@ -112,6 +122,7 @@ fn parse_args() -> Args {
         drivers_dir: "drivers".into(),
         http_port: DEFAULT_HTTP_PORT,
         db_path: DEFAULT_DB_PATH.into(),
+        enable_control: false,
     };
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -131,8 +142,12 @@ fn parse_args() -> Args {
                 out.db_path = argv.get(i + 1).cloned().unwrap_or(out.db_path);
                 i += 2;
             }
+            "--enable-control" => {
+                out.enable_control = true;
+                i += 1;
+            }
             other => {
-                eprintln!("unknown arg: {other} (supported: --drivers-dir --http-port --db)");
+                eprintln!("unknown arg: {other} (supported: --drivers-dir --http-port --db --enable-control)");
                 i += 1;
             }
         }

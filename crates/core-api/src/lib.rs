@@ -33,6 +33,8 @@ pub struct AppState {
     pub drivers_dir: String,
     pub start_time: Instant,
     pub cert_store: Arc<CertStore>,
+    /// 控制面总闸：默认关闭，需 --enable-control 显式开启（§22）
+    pub enable_control: bool,
 }
 
 impl AppState {
@@ -44,11 +46,36 @@ impl AppState {
         Self::new_with_cert_dir(manager, store, drivers_dir, CertStore::default_path())
     }
 
+    pub fn new_with_control(
+        manager: Arc<MesaManager>,
+        store: Arc<ConfigStore>,
+        drivers_dir: String,
+        enable_control: bool,
+    ) -> Arc<Self> {
+        Self::new_with_cert_dir_and_control(
+            manager,
+            store,
+            drivers_dir,
+            CertStore::default_path(),
+            enable_control,
+        )
+    }
+
     pub fn new_with_cert_dir(
         manager: Arc<MesaManager>,
         store: Arc<ConfigStore>,
         drivers_dir: String,
         cert_dir: std::path::PathBuf,
+    ) -> Arc<Self> {
+        Self::new_with_cert_dir_and_control(manager, store, drivers_dir, cert_dir, false)
+    }
+
+    pub fn new_with_cert_dir_and_control(
+        manager: Arc<MesaManager>,
+        store: Arc<ConfigStore>,
+        drivers_dir: String,
+        cert_dir: std::path::PathBuf,
+        enable_control: bool,
     ) -> Arc<Self> {
         let snapshot = manager.snapshot();
         let cert_store = Arc::new(CertStore::new(cert_dir));
@@ -66,6 +93,7 @@ impl AppState {
             drivers_dir,
             start_time: Instant::now(),
             cert_store,
+            enable_control,
         })
     }
 }
@@ -490,6 +518,246 @@ async fn import_endpoint(
         StatusCode::NOT_IMPLEMENTED,
         Json(json_error("NOT_IMPLEMENTED", "import not yet implemented")),
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlWriteReq {
+    target: String,
+    value: serde_json::Value,
+    expected_value: Option<serde_json::Value>,
+    // 允许直接传 typed Value 的 tag 形式（兼容 Value 枚举序列化）
+    #[serde(default)]
+    value_typed: Option<mesa_core_types::Value>,
+}
+
+fn json_to_value(v: &serde_json::Value) -> Result<mesa_core_types::Value, String> {
+    match v {
+        serde_json::Value::Bool(b) => Ok(mesa_core_types::Value::Bool(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                // 优先 I32，若超出则 I64
+                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                    Ok(mesa_core_types::Value::I32(i as i32))
+                } else {
+                    Ok(mesa_core_types::Value::I64(i))
+                }
+            } else if let Some(u) = n.as_u64() {
+                if u <= u32::MAX as u64 {
+                    Ok(mesa_core_types::Value::U32(u as u32))
+                } else {
+                    Ok(mesa_core_types::Value::U64(u))
+                }
+            } else if let Some(f) = n.as_f64() {
+                Ok(mesa_core_types::Value::F64(f))
+            } else {
+                Err("invalid number".into())
+            }
+        }
+        serde_json::Value::String(s) => Ok(mesa_core_types::Value::String(s.clone())),
+        serde_json::Value::Array(arr) => {
+            // 简单按首元素类型推断，Simulator 仅需标量，数组罕用
+            Err(format!("array value not supported in control write: {arr:?}"))
+        }
+        serde_json::Value::Null => Err("null value not allowed".into()),
+        serde_json::Value::Object(_) => {
+            // 尝试按 Value 枚举的 tag 形式反序列化（如 {"F64":1.0}）
+            serde_json::from_value::<mesa_core_types::Value>(v.clone()).map_err(|e| e.to_string())
+        }
+    }
+}
+
+async fn control_write(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ControlWriteReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !state.enable_control {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("CONTROL_DISABLED", "control plane disabled, start mesad with --enable-control")),
+        );
+    }
+    // endpoint 存在性校验
+    let rec = match state.store.get_endpoint(&id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json_error("NOT_FOUND", &format!("endpoint `{id}` not found"))),
+            )
+        }
+        Err(e) => return store_err_to_response(e),
+    };
+    let _ = rec; // 已校验存在，具体 driver 能力由 Driver 二次校验
+    let target = body.target.trim();
+    if target.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", "target required")));
+    }
+    let value = if let Some(v) = body.value_typed {
+        v
+    } else {
+        match json_to_value(&body.value) {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", &e))),
+        }
+    };
+    let expected = if let Some(ev) = body.expected_value {
+        match json_to_value(&ev) {
+            Ok(v) => Some(v),
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(json_error("VALIDATION_ERROR", &format!("expected_value: {e}")))),
+        }
+    } else {
+        None
+    };
+    // TODO: PolicyProvider scope=control:execute 鉴权（V1 loopback 默认放行，actor=local-api）
+    // 审计 STARTED（同步插入，失败不阻断控制）
+    let request_id = format!("api-wr-{}-{}", id, mesa_core_types::now_unix_ns());
+    let audit_started = mesa_config_store::ControlAuditRecord {
+        request_id: request_id.clone(),
+        endpoint_id: id.clone(),
+        actor: "local-api".into(),
+        operation_type: "write".into(),
+        operation_id: target.to_string(),
+        request_json: serde_json::json!({"target": target, "value": format!("{value:?}")}).to_string(),
+        result_json: None,
+        status: "STARTED".into(),
+        started_at_ns: mesa_core_types::now_unix_ns(),
+        finished_at_ns: None,
+    };
+    let _ = state.store.insert_control_audit(&audit_started);
+    match state.manager.control_write(&id, target, value, expected).await {
+        Ok(readback) => {
+            let detail = serde_json::json!({"readback": readback.as_ref().map(|v| format!("{v:?}"))}).to_string();
+            let audit = mesa_config_store::ControlAuditRecord {
+                request_id: format!("{}-done", request_id),
+                endpoint_id: id.clone(),
+                actor: "local-api".into(),
+                operation_type: "write".into(),
+                operation_id: target.to_string(),
+                request_json: detail.clone(),
+                result_json: Some(detail),
+                status: "COMPLETED".into(),
+                started_at_ns: mesa_core_types::now_unix_ns(),
+                finished_at_ns: Some(mesa_core_types::now_unix_ns()),
+            };
+            let _ = state.store.insert_control_audit(&audit);
+            let rb_json = readback.map(|v| serde_json::to_value(&v).unwrap_or(serde_json::Value::Null));
+            (StatusCode::OK, Json(serde_json::json!({"request_id": request_id, "status":"Succeeded", "readback": rb_json})))
+        }
+        Err(e) => {
+            let audit = mesa_config_store::ControlAuditRecord {
+                request_id: format!("{}-failed", request_id),
+                endpoint_id: id.clone(),
+                actor: "local-api".into(),
+                operation_type: "write".into(),
+                operation_id: target.to_string(),
+                request_json: serde_json::json!({"target": target}).to_string(),
+                result_json: Some(e.message.clone()),
+                status: "FAILED".into(),
+                started_at_ns: mesa_core_types::now_unix_ns(),
+                finished_at_ns: Some(mesa_core_types::now_unix_ns()),
+            };
+            let _ = state.store.insert_control_audit(&audit);
+            let status = if e.code == "ENDPOINT_NOT_RUNNING" { StatusCode::CONFLICT } else { StatusCode::BAD_GATEWAY };
+            (status, Json(serde_json::json!({"error": {"code": e.code, "message": e.message}, "request_id": request_id})))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlCommandReq {
+    command_id: Option<String>,
+    command: Option<String>,
+    input_json: Option<String>,
+    input: Option<serde_json::Value>,
+}
+
+async fn control_command(
+    State(state): State<Arc<AppState>>,
+    Path((id, cmd)): Path<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !state.enable_control {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("CONTROL_DISABLED", "control plane disabled, start mesad with --enable-control")),
+        );
+    }
+    let rec = match state.store.get_endpoint(&id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json_error("NOT_FOUND", &format!("endpoint `{id}` not found"))),
+            )
+        }
+        Err(e) => return store_err_to_response(e),
+    };
+    let _ = rec;
+    // 解析 body 中的 command_id / input
+    let parsed: ControlCommandReq = serde_json::from_value(body.clone()).unwrap_or(ControlCommandReq { command_id: None, command: None, input_json: None, input: None });
+    let command_id = parsed.command_id.or(parsed.command).unwrap_or(cmd);
+    let input_json = if let Some(s) = parsed.input_json {
+        s
+    } else if let Some(v) = parsed.input {
+        serde_json::to_string(&v).unwrap_or("{}".into())
+    } else if body.is_object() && !body.as_object().unwrap().is_empty() {
+        // 将整个 body 当作 input（兼容前端直接传参对象）
+        serde_json::to_string(&body).unwrap_or("{}".into())
+    } else {
+        "{}".into()
+    };
+    let request_id = format!("api-cmd-{}-{}", id, mesa_core_types::now_unix_ns());
+    let audit_started = mesa_config_store::ControlAuditRecord {
+        request_id: request_id.clone(),
+        endpoint_id: id.clone(),
+        actor: "local-api".into(),
+        operation_type: "command".into(),
+        operation_id: command_id.clone(),
+        request_json: input_json.clone(),
+        result_json: None,
+        status: "STARTED".into(),
+        started_at_ns: mesa_core_types::now_unix_ns(),
+        finished_at_ns: None,
+    };
+    let _ = state.store.insert_control_audit(&audit_started);
+    match state.manager.control_command(&id, &command_id, &input_json).await {
+        Ok((status, result_json, error)) => {
+            let audit_status = if status == "Succeeded" { "COMPLETED" } else { "FAILED" };
+            let audit = mesa_config_store::ControlAuditRecord {
+                request_id: format!("{}-done", request_id),
+                endpoint_id: id.clone(),
+                actor: "local-api".into(),
+                operation_type: "command".into(),
+                operation_id: command_id.clone(),
+                request_json: input_json.clone(),
+                result_json: Some(format!("{status}:{result_json}:{error}")),
+                status: audit_status.into(),
+                started_at_ns: mesa_core_types::now_unix_ns(),
+                finished_at_ns: Some(mesa_core_types::now_unix_ns()),
+            };
+            let _ = state.store.insert_control_audit(&audit);
+            let result_val: serde_json::Value = serde_json::from_str(&result_json).unwrap_or(serde_json::Value::String(result_json.clone()));
+            (StatusCode::OK, Json(serde_json::json!({"request_id": request_id, "status": status, "result": result_val, "error": error})))
+        }
+        Err(e) => {
+            let audit = mesa_config_store::ControlAuditRecord {
+                request_id: format!("{}-failed", request_id),
+                endpoint_id: id.clone(),
+                actor: "local-api".into(),
+                operation_type: "command".into(),
+                operation_id: command_id.clone(),
+                request_json: input_json.clone(),
+                result_json: Some(e.message.clone()),
+                status: "FAILED".into(),
+                started_at_ns: mesa_core_types::now_unix_ns(),
+                finished_at_ns: Some(mesa_core_types::now_unix_ns()),
+            };
+            let _ = state.store.insert_control_audit(&audit);
+            let status = if e.code == "ENDPOINT_NOT_RUNNING" { StatusCode::CONFLICT } else { StatusCode::BAD_GATEWAY };
+            (status, Json(serde_json::json!({"error": {"code": e.code, "message": e.message}, "request_id": request_id})))
+        }
+    }
 }
 
 async fn endpoint_diagnostics(
@@ -1258,6 +1526,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/endpoints/{id}/browse", post(browse_endpoint))
         .route("/api/v1/endpoints/{id}/import", post(import_endpoint))
+        .route("/api/v1/endpoints/{id}/write", post(control_write))
+        .route("/api/v1/endpoints/{id}/commands/{command}", post(control_command))
         .route("/api/v1/points/latest", get(latest_points))
         .route("/api/v1/diagnostics", get(diagnostics))
         // Devices CRUD

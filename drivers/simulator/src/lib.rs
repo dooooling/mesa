@@ -762,6 +762,44 @@ impl DriverConnection for SimConnection {
         }
         Ok(())
     }
+
+    async fn write(
+        &mut self,
+        target: &str,
+        _value: Value,
+        _expected: Option<Value>,
+    ) -> Result<(), SdkDriverError> {
+        // Simulator 控制：若已配置则校验 target 合法性，否则直接成功（用于 probe 前的轻量校验）
+        if let Some(plan) = &self.plan {
+            if !plan.points.iter().any(|p| p.key == target) {
+                return Err(SdkDriverError::new(
+                    ErrorKind::Internal,
+                    "TARGET_NOT_FOUND",
+                    format!("target `{target}` not found"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn command(
+        &mut self,
+        command: &str,
+        args_json: &str,
+    ) -> Result<serde_json::Value, SdkDriverError> {
+        match command {
+            "reset" | "start" | "stop" | "fault" | "writable" => {
+                let args: serde_json::Value =
+                    serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                Ok(serde_json::json!({"command": command, "args": args, "status": "ok"}))
+            }
+            _ => Err(SdkDriverError::new(
+                ErrorKind::Unsupported,
+                "COMMAND_NOT_SUPPORTED",
+                format!("command `{command}` not supported"),
+            )),
+        }
+    }
 }
 
 /// 仅在有注入项时才走计数路径，避免正常采集承担原子开销。
