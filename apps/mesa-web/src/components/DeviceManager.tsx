@@ -32,7 +32,13 @@ export function DeviceManager() {
   const [pointsDesc, setPointsDesc] = useState<DriverDescriptor | null>(null);
   const [pointsSels, setPointsSels] = useState<Array<{ resource_id: string; parameters: Record<string, unknown>; outputs: Array<{ output: string; point_key: string }> }>>([]);
 
-  const load = () => fetch("/api/v1/endpoints").then((r) => r.json()).then((j) => setEndpoints(j.endpoints ?? [])).catch(() => {});
+  const load = () => fetch("/api/v1/endpoints").then((r) => r.json()).then((j) => {
+    const eps = (j.endpoints ?? []).map((e: never) => {
+      const x = e as { id: string; driver_id: string; runtime?: { state?: string }; state?: string };
+      return { id: x.id, driver_id: x.driver_id, state: x.state ?? x.runtime?.state };
+    });
+    setEndpoints(eps);
+  }).catch(() => {});
   useEffect(() => { load(); }, []);
 
   useEffect(() => {
@@ -170,7 +176,7 @@ export function DeviceManager() {
           columns={[
             { title: "ID", dataIndex: "id", render: (v: string) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{v}</span> },
             { title: "驱动", dataIndex: "driver_id", render: (v: string) => <Tag>{v}</Tag> },
-            { title: "状态", dataIndex: "state", render: (v: string) => <Tag color={v === "running" ? "green" : "default"}>{v ?? "—"}</Tag> },
+            { title: "状态", dataIndex: "state", render: (v: string) => <Tag color={(v ?? "").toUpperCase() === "RUNNING" ? "green" : (v ?? "").toUpperCase() === "FAILED" ? "red" : "default"}>{v ?? "—"}</Tag> },
             {
               title: "操作", render: (_: unknown, r: { id: string; driver_id: string }) => (
                 <Space>
