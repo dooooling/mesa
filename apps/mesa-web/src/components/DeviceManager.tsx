@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { Alert, Button, Card, Form, Input, InputNumber, Modal, Select, Space, Switch, Table, Tag, message } from "antd";
 import type { DriverDescriptor, FieldDescriptor } from "../types";
+import { ResourcePickerAntd } from "./ResourcePickerAntd";
 
 const DRIVERS = [
   { value: "simulator", label: "Simulator" },
@@ -26,6 +27,10 @@ export function DeviceManager() {
   const [driverId, setDriverId] = useState("simulator");
   const [probe, setProbe] = useState<{ ok: boolean; msg: string } | null>(null);
   const [issues, setIssues] = useState<Array<{ path: string; message: string }>>([]);
+  const [pointsOpen, setPointsOpen] = useState(false);
+  const [pointsEp, setPointsEp] = useState<{ id: string; driver_id: string } | null>(null);
+  const [pointsDesc, setPointsDesc] = useState<DriverDescriptor | null>(null);
+  const [pointsSels, setPointsSels] = useState<Array<{ resource_id: string; parameters: Record<string, unknown>; outputs: Array<{ output: string; point_key: string }> }>>([]);
 
   const load = () => fetch("/api/v1/endpoints").then((r) => r.json()).then((j) => setEndpoints(j.endpoints ?? [])).catch(() => {});
   useEffect(() => { load(); }, []);
@@ -107,6 +112,46 @@ export function DeviceManager() {
     load();
   };
 
+  const openPoints = async (ep: { id: string; driver_id: string }) => {
+    setPointsEp(ep); setPointsSels([]); setPointsOpen(true);
+    const r = await fetch(`/api/v1/drivers/${ep.driver_id}/descriptor`).then((x) => x.json()).catch(() => null);
+    setPointsDesc(r);
+    // 回显已有 tasks
+    fetch(`/api/v1/tasks?endpoint=${ep.id}`).then((x) => x.json()).then((j) => {
+      const tasks = j.tasks ?? [];
+      // 粗略回显为 selections 仅提示数量
+      if (tasks.length) message.info(`已有 ${tasks.length} 任务`);
+    }).catch(() => {});
+  };
+
+  const savePoints = async () => {
+    if (!pointsEp || !pointsSels.length) return message.warning("请先加入点位");
+    // 将 selections 转为 AcquisitionTask：每个 resource 一 task，poll 1s
+    const tasks = pointsSels.map((s, idx) => ({
+      id: `t${idx + 1}`,
+      mode: "poll",
+      interval_ms: 1000,
+      binding: {
+        kind: s.resource_id,
+        config: {
+          ...s.parameters,
+          // 通用：outputs 转 items/points，按驱动自解释
+          items: s.outputs.map((o) => ({ key: o.point_key.split(".").pop() ?? o.output, point_key: o.point_key, output: o.output })),
+          points: s.outputs.map((o) => o.point_key),
+        },
+      },
+    }));
+    // 需先停止再下发
+    await fetch(`/api/v1/endpoints/${pointsEp.id}/stop`, { method: "POST" }).catch(() => {});
+    const r = await fetch(`/api/v1/tasks/${pointsEp.id}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ tasks }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) return message.error(j.error?.message ?? "点位保存失败");
+    message.success("点位已保存，正在启动…");
+    await fetch(`/api/v1/endpoints/${pointsEp.id}/start`, { method: "POST" });
+    setPointsOpen(false);
+    load();
+  };
+
   return (
     <div style={{ display: "grid", gap: 16 }}>
       <Card size="small" extra={<Button type="primary" onClick={() => { setDriverId("simulator"); setOpen(true); }}>新增设备</Button>} title={`设备 · ${endpoints.length}`}>
@@ -119,8 +164,9 @@ export function DeviceManager() {
             { title: "驱动", dataIndex: "driver_id", render: (v: string) => <Tag>{v}</Tag> },
             { title: "状态", dataIndex: "state", render: (v: string) => <Tag color={v === "running" ? "green" : "default"}>{v ?? "—"}</Tag> },
             {
-              title: "操作", render: (_: unknown, r: { id: string }) => (
+              title: "操作", render: (_: unknown, r: { id: string; driver_id: string }) => (
                 <Space>
+                  <Button size="small" onClick={() => openPoints(r)}>点位</Button>
                   <Button size="small" onClick={() => act(r.id, "start")}>启动</Button>
                   <Button size="small" onClick={() => act(r.id, "stop")}>停止</Button>
                   <Button size="small" danger onClick={() => act(r.id, "delete")}>删除</Button>
@@ -162,6 +208,16 @@ export function DeviceManager() {
           </Space>
           {!!issues.length && <Alert style={{ marginTop: 8 }} type="error" message={issues.map((i) => `${i.path}: ${i.message}`).join("； ")} />}
         </Form>
+      </Modal>
+
+      <Modal title={`点位 · ${pointsEp?.id ?? ""}`} open={pointsOpen} onOk={savePoints} onCancel={() => setPointsOpen(false)} okText="保存并启动" width={720} destroyOnClose>
+        {!pointsDesc ? <div style={{ color: "#999" }}>加载资源…</div> : (
+          <>
+            <ResourcePickerAntd resources={pointsDesc.resources} onAdd={(s) => setPointsSels((p) => [...p, s])} />
+            <div style={{ marginTop: 12, fontSize: 12, color: "#999" }}>已选 {pointsSels.length} 项 · 保存将执行 Stop → PUT /tasks/{pointsEp?.id} → Start</div>
+            {!!pointsSels.length && <pre style={{ marginTop: 8, fontSize: 11, background: "#f5f5f5", padding: 8, maxHeight: 160, overflow: "auto" }}>{JSON.stringify(pointsSels, null, 2)}</pre>}
+          </>
+        )}
       </Modal>
     </div>
   );
