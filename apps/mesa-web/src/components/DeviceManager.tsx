@@ -135,8 +135,9 @@ export function DeviceManager() {
 
   useEffect(() => {
     if (editOpen && editDesc) {
-      // 确保表单字段已渲染后再回填历史值
-      setTimeout(() => editForm.setFieldsValue({ ...editConn }), 50);
+      // Modal 动画 + 字段渲染后回填
+      const id = setTimeout(() => editForm.setFieldsValue({ ...editConn }), 300);
+      return () => clearTimeout(id);
     }
   }, [editOpen, editDesc, editConn]); // eslint-disable-line react-hooks/exhaustive-deps
 
