@@ -136,20 +136,12 @@ export function DeviceManager() {
     const r = await fetch(`/api/v1/endpoints/${ep.id}`).then((x) => x.json()).catch(() => null);
     if (!r) return message.error("获取设备失败");
     const conn = r.connection ?? {};
-    setEditEp({ id: r.id ?? ep.id, driver_id: r.driver_id ?? ep.driver_id, device_id: r.device_id });
-    setEditConn(conn);
     const d = await fetch(`/api/v1/drivers/${r.driver_id ?? ep.driver_id}/descriptor`).then((x) => x.json()).catch(() => null);
     setEditDesc(d);
+    setEditConn(conn);
+    setEditEp({ id: r.id ?? ep.id, driver_id: r.driver_id ?? ep.driver_id, device_id: r.device_id });
     setEditOpen(true);
   };
-
-  useEffect(() => {
-    if (editOpen && editDesc) {
-      editForm.resetFields();
-      const id = setTimeout(() => editForm.setFieldsValue({ ...editConn }), 100);
-      return () => clearTimeout(id);
-    }
-  }, [editOpen, editDesc, editConn]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const saveEdit = async () => {
     if (!editEp) return;
@@ -301,7 +293,7 @@ export function DeviceManager() {
 
       <Modal title={`编辑 · ${editEp?.id ?? ""}`} open={editOpen} onOk={saveEdit} onCancel={() => setEditOpen(false)} okText="保存" width={640} destroyOnClose={false} forceRender>
         {!editDesc ? <div style={{ color: "#999" }}>加载中…</div> : (
-          <Form form={editForm} layout="vertical">
+          <Form form={editForm} layout="vertical" key={`${editEp?.id}-${JSON.stringify(editConn)}`} initialValues={editConn}>
             {(editDesc.connection.fields ?? []).map((f) => (
               <Form.Item key={f.key} name={f.key} label={f.label} tooltip={f.description} valuePropName={f.field_type === "boolean" ? "checked" : "value"}>
                 <FieldControl f={f} />
