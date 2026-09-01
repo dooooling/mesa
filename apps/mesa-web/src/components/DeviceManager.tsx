@@ -46,10 +46,11 @@ export function DeviceManager() {
     if (!open) return;
     fetch(`/api/v1/drivers/${driverId}/descriptor`).then((r) => r.json()).then((d) => {
       setDesc(d);
-      // 填入默认值
+      // 仅对空字段填默认值，不覆盖用户已填的 host
+      const cur = form.getFieldsValue();
       const defaults: Record<string, unknown> = {};
-      for (const f of d.connection.fields ?? []) if (f.default !== undefined) defaults[f.key] = f.default;
-      form.setFieldsValue(defaults);
+      for (const f of d.connection.fields ?? []) if (f.default !== undefined && (cur[f.key] === undefined || cur[f.key] === "" || cur[f.key] === null)) defaults[f.key] = f.default;
+      if (Object.keys(defaults).length) form.setFieldsValue(defaults);
       setProbe(null); setIssues([]);
     }).catch(() => setDesc(null));
   }, [driverId, open]); // eslint-disable-line react-hooks/exhaustive-deps
