@@ -71,3 +71,58 @@ impl ResourceDescriptor {
         Ok(())
     }
 }
+
+/// 通用 ResourceSelection 契约（V2.1 §15）：统一 Envelope，不统一协议参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelectedOutput {
+    pub output: String,
+    pub point_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResourceSelection {
+    pub resource_id: String,
+    pub parameters: serde_json::Value,
+    pub outputs: Vec<SelectedOutput>,
+}
+
+/// 通用 Binding `mesa.resources.v1` 的顶层形态（§15）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GenericBinding {
+    pub selections: Vec<ResourceSelection>,
+}
+
+impl GenericBinding {
+    pub fn from_json(v: &serde_json::Value) -> Result<Self, String> {
+        serde_json::from_value(v.clone()).map_err(|e| e.to_string())
+    }
+}
+
+/// 校验 ResourceSelection 合法性（§15）：resource/output 存在、point_key 唯一等，由驱动结合 Descriptor 完成，此处仅做结构级校验。
+pub fn validate_selections_structure(selections: &[ResourceSelection]) -> Result<(), String> {
+    use std::collections::HashSet;
+    let mut seen_keys = HashSet::new();
+    for sel in selections {
+        if sel.resource_id.trim().is_empty() {
+            return Err("resource_id 不能为空".into());
+        }
+        if sel.outputs.is_empty() {
+            return Err(format!("resource {} outputs 不能为空", sel.resource_id));
+        }
+        for out in &sel.outputs {
+            if out.output.trim().is_empty() || out.point_key.trim().is_empty() {
+                return Err("output/point_key 不能为空".into());
+            }
+            if !seen_keys.insert(&out.point_key) {
+                return Err(format!("point_key 重复: {}", out.point_key));
+            }
+        }
+        if !sel.parameters.is_object() && !sel.parameters.is_null() {
+            return Err(format!("resource {} parameters 需为对象", sel.resource_id));
+        }
+    }
+    Ok(())
+}
+
+/// 通用 Binding 种别常量
+pub const GENERIC_BINDING_KIND: &str = "mesa.resources.v1";

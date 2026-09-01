@@ -34,8 +34,8 @@ use std::time::Duration;
 
 use mesa_core_types::{
     AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, ErrorKind,
-    PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, ensure_unique_point_keys,
-    now_unix_ns,
+    GENERIC_BINDING_KIND, GenericBinding, PointDescriptor, PointMap, PointValue, Quality, TaskMode,
+    Value, ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio_util::sync::CancellationToken;
@@ -502,11 +502,56 @@ impl DriverConnection for SimConnection {
                     format!("task `{}`: simulator only supports poll mode", task.id),
                 ));
             }
+            if task.binding.kind == GENERIC_BINDING_KIND {
+                // 通用 ResourceSelection 路径（§15）：selections -> points
+                let binding: GenericBinding = serde_json::from_value(task.binding.config.clone())
+                    .map_err(|e| {
+                    SdkDriverError::configuration(
+                        "INVALID_BINDING_CONFIG",
+                        format!("task `{}`: invalid generic binding: {e}", task.id),
+                    )
+                })?;
+                // 结构级校验（point_key 唯一等）
+                mesa_core_types::validate_selections_structure(&binding.selections)
+                    .map_err(|e| SdkDriverError::configuration("INVALID_BINDING_CONFIG", e))?;
+                let mut indices = Vec::new();
+                for sel in &binding.selections {
+                    // Simulator 资源映射：resource_id 即 SourceKind，parameters 即源参数
+                    for out in &sel.outputs {
+                        // 构造与 Legacy 兼容的 SourceSpec 解析输入：合并 kind 与 parameters
+                        let mut src_json = sel.parameters.clone();
+                        if src_json.is_null() {
+                            src_json = serde_json::json!({});
+                        }
+                        if let Some(obj) = src_json.as_object_mut() {
+                            obj.insert("kind".into(), serde_json::json!(sel.resource_id));
+                        } else {
+                            src_json = serde_json::json!({"kind": sel.resource_id});
+                        }
+                        indices.push(new_points.len());
+                        new_points.push(SourceSpec::parse(&out.point_key, &src_json)?);
+                    }
+                }
+                // 泛型路径的 indices 已收集，此处直接创建任务计划
+                new_tasks.push(TaskPlan {
+                    id: task.id.clone(),
+                    interval_ms: task.interval_ms.expect("validated above"),
+                    point_indices: indices,
+                    burst: task
+                        .binding
+                        .config
+                        .get("burst")
+                        .and_then(|b| b.as_u64())
+                        .unwrap_or(1)
+                        .max(1),
+                });
+                continue;
+            }
             if task.binding.kind != BINDING_KIND {
                 return Err(SdkDriverError::configuration(
                     "UNSUPPORTED_BINDING",
                     format!(
-                        "task `{}`: binding kind `{}` unsupported, expected `{BINDING_KIND}`",
+                        "task `{}`: binding kind `{}` unsupported, expected `{BINDING_KIND}` or `{GENERIC_BINDING_KIND}`",
                         task.id, task.binding.kind
                     ),
                 ));

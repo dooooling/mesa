@@ -23,8 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mesa_core_types::{
-    AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, PointDescriptor,
-    PointMap, PointValue, Quality, TaskMode, Value, ensure_unique_point_keys, now_unix_ns,
+    AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, GENERIC_BINDING_KIND,
+    GenericBinding, PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value,
+    ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio_util::sync::CancellationToken;
@@ -425,11 +426,66 @@ impl DriverConnection for FocasConnection {
                     format!("task `{}`: focas2 仅支持 poll", task.id),
                 ));
             }
+            if task.binding.kind == GENERIC_BINDING_KIND {
+                let binding: GenericBinding = serde_json::from_value(task.binding.config.clone())
+                    .map_err(|e| {
+                    SdkDriverError::configuration(
+                        "INVALID_BINDING_CONFIG",
+                        format!("task `{}`: invalid generic binding: {e}", task.id),
+                    )
+                })?;
+                mesa_core_types::validate_selections_structure(&binding.selections)
+                    .map_err(|e| SdkDriverError::configuration("INVALID_BINDING_CONFIG", e))?;
+                let mut indices = Vec::new();
+                for sel in &binding.selections {
+                    for out in &sel.outputs {
+                        // 优先使用 parameters.address，否则回退到 output id（便于测试直接使用合法 FOCAS 地址作为 output）
+                        let addr_str = sel
+                            .parameters
+                            .get("address")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&out.output)
+                            .to_string();
+                        let dt_str = sel
+                            .parameters
+                            .get("data_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("U32");
+                        let addr = parse_address(&addr_str).map_err(|e| match e {
+                            AddressError::Empty => SdkDriverError::configuration(
+                                "INVALID_ADDRESS",
+                                format!("point `{}` 地址为空", out.point_key),
+                            ),
+                            AddressError::Invalid { reason, .. } => SdkDriverError::new(
+                                mesa_core_types::ErrorKind::Address,
+                                "INVALID_ADDRESS",
+                                format!(
+                                    "point `{}` 地址 `{addr_str}` 非法: {reason}",
+                                    out.point_key
+                                ),
+                            ),
+                        })?;
+                        let data_type = parse_data_type(dt_str)?;
+                        indices.push(new_points.len());
+                        new_points.push(PointSpec {
+                            key: out.point_key.clone(),
+                            addr,
+                            data_type,
+                        });
+                    }
+                }
+                new_tasks.push(TaskPlan {
+                    id: task.id.clone(),
+                    interval_ms: task.interval_ms.expect("validated above"),
+                    point_indices: indices,
+                });
+                continue;
+            }
             if task.binding.kind != BINDING_KIND {
                 return Err(SdkDriverError::configuration(
                     "UNSUPPORTED_BINDING",
                     format!(
-                        "task `{}`: 期望 {BINDING_KIND}，实际 {}",
+                        "task `{}`: 期望 {BINDING_KIND} 或 {GENERIC_BINDING_KIND}，实际 {}",
                         task.id, task.binding.kind
                     ),
                 ));

@@ -31,8 +31,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mesa_core_types::{
-    AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, PointDescriptor,
-    PointMap, PointValue, Quality, TaskMode, Value, ensure_unique_point_keys, now_unix_ns,
+    AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, GENERIC_BINDING_KIND,
+    GenericBinding, PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value,
+    ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio_util::sync::CancellationToken;
@@ -437,6 +438,77 @@ impl DriverConnection for OpcUaConnection {
         for task in &tasks {
             task.validate()
                 .map_err(|e| SdkDriverError::configuration("INVALID_TASK", e.to_string()))?;
+            if task.binding.kind == GENERIC_BINDING_KIND {
+                let binding: GenericBinding = serde_json::from_value(task.binding.config.clone())
+                    .map_err(|e| {
+                    SdkDriverError::configuration(
+                        "INVALID_BINDING_CONFIG",
+                        format!("task `{}`: invalid generic binding: {e}", task.id),
+                    )
+                })?;
+                mesa_core_types::validate_selections_structure(&binding.selections)
+                    .map_err(|e| SdkDriverError::configuration("INVALID_BINDING_CONFIG", e))?;
+                if task.mode != TaskMode::Poll {
+                    return Err(SdkDriverError::new(
+                        mesa_core_types::ErrorKind::Unsupported,
+                        "MODE_NOT_SUPPORTED",
+                        format!("task `{}`: generic opcua only supports poll", task.id),
+                    ));
+                }
+                let mut indices = Vec::new();
+                for sel in &binding.selections {
+                    if sel.resource_id != "node" {
+                        return Err(SdkDriverError::configuration(
+                            "UNSUPPORTED_RESOURCE",
+                            format!("task `{}`: opcua generic only supports node", task.id),
+                        ));
+                    }
+                    for out in &sel.outputs {
+                        let node_id = sel
+                            .parameters
+                            .get("node_id")
+                            .or_else(|| sel.parameters.get("address"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&out.output)
+                            .to_string();
+                        let dt_str = sel
+                            .parameters
+                            .get("data_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("STRING");
+                        let addr = parse_address(&node_id).map_err(|e| match e {
+                            AddressError::Empty => SdkDriverError::configuration(
+                                "INVALID_ADDRESS",
+                                format!("point `{}` node_id 为空", out.point_key),
+                            ),
+                            AddressError::Invalid { reason, .. } => SdkDriverError::new(
+                                mesa_core_types::ErrorKind::Address,
+                                "INVALID_ADDRESS",
+                                format!(
+                                    "point `{}` node_id `{node_id}` 非法: {reason}",
+                                    out.point_key
+                                ),
+                            ),
+                        })?;
+                        let data_type = parse_data_type(dt_str)?;
+                        indices.push(new_points.len());
+                        new_points.push(PointSpec {
+                            key: out.point_key.clone(),
+                            addr,
+                            data_type,
+                        });
+                    }
+                }
+                let interval = task.interval_ms.expect("validated");
+                new_tasks.push(TaskPlan {
+                    id: task.id.clone(),
+                    kind: TaskKind::Poll {
+                        interval_ms: interval,
+                    },
+                    point_indices: indices,
+                });
+                continue;
+            }
             // Poll / Subscribe / Browse 三分支
             let is_poll = task.binding.kind == BINDING_POLL;
             let is_sub = task.binding.kind == BINDING_SUB;
@@ -445,7 +517,7 @@ impl DriverConnection for OpcUaConnection {
                 return Err(SdkDriverError::configuration(
                     "UNSUPPORTED_BINDING",
                     format!(
-                        "task `{}`: 期望 {BINDING_POLL}/{BINDING_SUB}/{BINDING_BROWSE}，实际 {}",
+                        "task `{}`: 期望 {BINDING_POLL}/{BINDING_SUB}/{BINDING_BROWSE} 或 {GENERIC_BINDING_KIND}，实际 {}",
                         task.id, task.binding.kind
                     ),
                 ));

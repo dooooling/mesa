@@ -12,7 +12,10 @@ pub mod schema;
 
 pub use capability::{ControlCatalog, DiscoveryCapabilities, DriverCapabilities};
 pub use descriptor::{DriverDescriptor, DriverIdentity};
-pub use resource::{AccessMode, OutputDescriptor, ResourceDescriptor};
+pub use resource::{
+    AccessMode, GENERIC_BINDING_KIND, GenericBinding, OutputDescriptor, ResourceDescriptor,
+    ResourceSelection, SelectedOutput, validate_selections_structure,
+};
 pub use schema::{
     Condition, ConditionOp, FieldDescriptor, FieldType, FieldValidation, LocalizedText,
     SchemaDescriptor, UiHints,

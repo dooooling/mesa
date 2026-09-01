@@ -20,8 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mesa_core_types::{
-    AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, PointDescriptor,
-    PointMap, PointValue, TaskMode, Value, ensure_unique_point_keys, now_unix_ns,
+    AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, GENERIC_BINDING_KIND,
+    GenericBinding, PointDescriptor, PointMap, PointValue, TaskMode, Value,
+    ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio::sync::Mutex;
@@ -265,11 +266,98 @@ impl DriverConnection for S7Connection {
                     format!("task `{}`: s7 仅支持 poll", task.id),
                 ));
             }
+            if task.binding.kind == GENERIC_BINDING_KIND {
+                let binding: GenericBinding = serde_json::from_value(task.binding.config.clone())
+                    .map_err(|e| {
+                    SdkDriverError::configuration(
+                        "INVALID_BINDING_CONFIG",
+                        format!("task `{}`: invalid generic binding: {e}", task.id),
+                    )
+                })?;
+                mesa_core_types::validate_selections_structure(&binding.selections)
+                    .map_err(|e| SdkDriverError::configuration("INVALID_BINDING_CONFIG", e))?;
+                let mut indices = Vec::new();
+                for sel in &binding.selections {
+                    if sel.resource_id != "memory" {
+                        return Err(SdkDriverError::configuration(
+                            "UNSUPPORTED_RESOURCE",
+                            format!("task `{}`: s7 only supports memory resource", task.id),
+                        ));
+                    }
+                    for out in &sel.outputs {
+                        // 优先使用 parameters.address，兼容 descriptor 的 area/db/offset 形式
+                        let addr_str = if let Some(a) =
+                            sel.parameters.get("address").and_then(|v| v.as_str())
+                        {
+                            a.to_string()
+                        } else {
+                            // 从 area/db/offset/bit 组合（简化示例，仅支持通用 address）
+                            return Err(SdkDriverError::configuration(
+                                "INVALID_BINDING_CONFIG",
+                                format!(
+                                    "point `{}` generic s7 requires parameters.address",
+                                    out.point_key
+                                ),
+                            ));
+                        };
+                        let dt_str = sel
+                            .parameters
+                            .get("data_type")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                SdkDriverError::configuration(
+                                    "INVALID_POINT",
+                                    format!("point `{}` 缺少 data_type", out.point_key),
+                                )
+                            })?;
+                        let addr = parse_address(&addr_str).map_err(|e| match e {
+                            AddressError::Empty => SdkDriverError::configuration(
+                                "INVALID_ADDRESS",
+                                format!("point `{}` 地址为空", out.point_key),
+                            ),
+                            AddressError::Invalid { reason, .. } => SdkDriverError::new(
+                                mesa_core_types::ErrorKind::Address,
+                                "INVALID_ADDRESS",
+                                format!(
+                                    "point `{}` 地址 `{addr_str}` 非法: {reason}",
+                                    out.point_key
+                                ),
+                            ),
+                        })?;
+                        let (data_type, kind) = parse_data_type(dt_str)?;
+                        if kind == S7Kind::Bool && addr.bit_offset.is_none() {
+                            return Err(SdkDriverError::configuration(
+                                "INVALID_ADDRESS",
+                                format!("point `{}` BOOL 必须带位", out.point_key),
+                            ));
+                        }
+                        if kind != S7Kind::Bool && addr.bit_offset.is_some() {
+                            return Err(SdkDriverError::configuration(
+                                "INVALID_ADDRESS",
+                                format!("point `{}` 非 BOOL 不应带位", out.point_key),
+                            ));
+                        }
+                        indices.push(new_points.len());
+                        new_points.push(PointSpec {
+                            key: out.point_key.clone(),
+                            addr,
+                            kind,
+                            data_type,
+                        });
+                    }
+                }
+                new_tasks.push(TaskPlan {
+                    id: task.id.clone(),
+                    interval_ms: task.interval_ms.expect("validated above"),
+                    point_indices: indices,
+                });
+                continue;
+            }
             if task.binding.kind != BINDING_KIND {
                 return Err(SdkDriverError::configuration(
                     "UNSUPPORTED_BINDING",
                     format!(
-                        "task `{}`: 期望 {BINDING_KIND}，实际 {}",
+                        "task `{}`: 期望 {BINDING_KIND} 或 {GENERIC_BINDING_KIND}，实际 {}",
                         task.id, task.binding.kind
                     ),
                 ));
