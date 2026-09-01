@@ -31,4 +31,8 @@ export const api = {
   listDevices: () => getJson("/api/v1/devices"),
   diagnostics: () => getJson("/api/v1/diagnostics"),
   endpointDiagnostics: (id: string) => getJson(`/api/v1/endpoints/${id}/diagnostics`),
+  controlWrite: (endpointId: string, target: string, value: unknown, expected?: unknown) =>
+    postJson(`/api/v1/endpoints/${endpointId}/write`, { target, value, expected_value: expected }),
+  controlCommand: (endpointId: string, command: string, input: unknown) =>
+    postJson(`/api/v1/endpoints/${endpointId}/commands/${command}`, input && typeof input === "object" ? input as Record<string, unknown> : { input }),
 };

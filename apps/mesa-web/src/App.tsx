@@ -1,4 +1,5 @@
 import { Link, Route, Routes } from "react-router-dom";
+import { ControlPanel } from "./components/ControlPanel";
 import { DeviceWizard } from "./components/DeviceWizard";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { BrowsePage } from "./pages/Browse";
@@ -10,11 +11,13 @@ export default function App() {
       <nav style={{ padding: 12, borderBottom: "1px solid #ddd" }}>
         <Link to="/" style={{ marginRight: 12 }}>设备向导</Link>
         <Link to="/browse" style={{ marginRight: 12 }}>浏览</Link>
+        <Link to="/control" style={{ marginRight: 12 }}>控制</Link>
         <Link to="/diagnostics" style={{ marginRight: 12 }}>诊断</Link>
       </nav>
       <Routes>
         <Route path="/" element={<DeviceWizard />} />
         <Route path="/browse" element={<BrowsePage />} />
+        <Route path="/control" element={<ControlPanel />} />
         <Route path="/diagnostics" element={<DiagnosticsPanel />} />
       </Routes>
     </div>
