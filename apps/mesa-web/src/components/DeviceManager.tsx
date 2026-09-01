@@ -1,6 +1,6 @@
-// 设备：驱动自描述表单，切换驱动即切换参数
+// 设备：驱动自描述表单，切换驱动即切换参数，带校验/探测
 import { useEffect, useState } from "react";
-import { Button, Card, Form, Input, InputNumber, Modal, Select, Space, Switch, Table, Tag, message } from "antd";
+import { Alert, Button, Card, Form, Input, InputNumber, Modal, Select, Space, Switch, Table, Tag, message } from "antd";
 import type { DriverDescriptor, FieldDescriptor } from "../types";
 
 const DRIVERS = [
@@ -24,19 +24,50 @@ export function DeviceManager() {
   const [form] = Form.useForm();
   const [desc, setDesc] = useState<DriverDescriptor | null>(null);
   const [driverId, setDriverId] = useState("simulator");
+  const [probe, setProbe] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [issues, setIssues] = useState<Array<{ path: string; message: string }>>([]);
 
   const load = () => fetch("/api/v1/endpoints").then((r) => r.json()).then((j) => setEndpoints(j.endpoints ?? [])).catch(() => {});
   useEffect(() => { load(); }, []);
 
-  // 弹框内驱动切换即拉取 Descriptor
   useEffect(() => {
     if (!open) return;
-    fetch(`/api/v1/drivers/${driverId}/descriptor`).then((r) => r.json()).then(setDesc).catch(() => setDesc(null));
-    // 保留已填的 id，清空连接字段
-    const cur = form.getFieldsValue();
-    form.resetFields();
-    form.setFieldsValue({ driver_id: driverId, id: cur.id });
+    fetch(`/api/v1/drivers/${driverId}/descriptor`).then((r) => r.json()).then((d) => {
+      setDesc(d);
+      // 填入默认值
+      const defaults: Record<string, unknown> = {};
+      for (const f of d.connection.fields ?? []) if (f.default !== undefined) defaults[f.key] = f.default;
+      form.setFieldsValue(defaults);
+      setProbe(null); setIssues([]);
+    }).catch(() => setDesc(null));
   }, [driverId, open]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const getConnection = () => {
+    const v = form.getFieldsValue();
+    const conn: Record<string, unknown> = {};
+    for (const k of Object.keys(v)) {
+      if (k === "id" || k === "driver_id") continue;
+      if (v[k] !== undefined && v[k] !== "" && v[k] !== null) conn[k] = v[k];
+    }
+    return conn;
+  };
+
+  const doValidate = async () => {
+    const connection = getConnection();
+    const r = await fetch(`/api/v1/drivers/${driverId}/validate-connection`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ connection }) });
+    const j = await r.json();
+    if (r.ok) { setIssues([]); message.success("校验通过"); }
+    else { setIssues(j.issues ?? []); message.error(j.error?.message ?? "校验失败"); }
+  };
+
+  const doProbe = async () => {
+    const connection = getConnection();
+    const r = await fetch(`/api/v1/drivers/${driverId}/probe`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ connection }) });
+    const j = await r.json();
+    const ok = !!j.reachable;
+    setProbe(ok ? { ok: true, msg: "可达" } : { ok: false, msg: j.error ?? "不可达" });
+    if (ok) message.success("探测可达"); else message.error(j.error ?? "探测不可达");
+  };
 
   const create = async () => {
     try {
@@ -45,7 +76,7 @@ export function DeviceManager() {
       const connection: Record<string, unknown> = {};
       for (const k of Object.keys(v)) {
         if (k === "id" || k === "driver_id") continue;
-        if (v[k] !== undefined && v[k] !== "") connection[k] = v[k];
+        if (v[k] !== undefined && v[k] !== "" && v[k] !== null) connection[k] = v[k];
       }
       const r = await fetch("/api/v1/endpoints", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, device_id: id, driver_id: v.driver_id, connection }) });
       const j = await r.json();
@@ -53,8 +84,9 @@ export function DeviceManager() {
       message.success(`已创建 ${id}`);
       setOpen(false);
       form.resetFields();
+      setProbe(null); setIssues([]);
       load();
-    } catch { /* validate */ }
+    } catch { /* antd validate */ }
   };
 
   const act = async (id: string, a: "start" | "stop" | "delete") => {
@@ -77,7 +109,7 @@ export function DeviceManager() {
             { title: "驱动", dataIndex: "driver_id", render: (v: string) => <Tag>{v}</Tag> },
             { title: "状态", dataIndex: "state", render: (v: string) => <Tag color={v === "running" ? "green" : "default"}>{v ?? "—"}</Tag> },
             {
-              title: "操作", render: (_: unknown, r: { id: string; state?: string }) => (
+              title: "操作", render: (_: unknown, r: { id: string }) => (
                 <Space>
                   <Button size="small" onClick={() => act(r.id, "start")}>启动</Button>
                   <Button size="small" onClick={() => act(r.id, "stop")}>停止</Button>
@@ -113,6 +145,12 @@ export function DeviceManager() {
                 ))}
             </>
           )}
+          <Space style={{ marginTop: 8 }}>
+            <Button onClick={doValidate}>校验</Button>
+            <Button onClick={doProbe}>探测</Button>
+            {probe && <Tag color={probe.ok ? "green" : "red"}>{probe.msg}</Tag>}
+          </Space>
+          {!!issues.length && <Alert style={{ marginTop: 8 }} type="error" message={issues.map((i) => `${i.path}: ${i.message}`).join("； ")} />}
         </Form>
       </Modal>
     </div>
