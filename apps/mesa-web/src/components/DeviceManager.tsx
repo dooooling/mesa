@@ -1,6 +1,7 @@
-// 设备：简单表格 + 新增，无引导
+// 设备：驱动自描述表单，切换驱动即切换参数
 import { useEffect, useState } from "react";
-import { Button, Card, Form, Input, Modal, Select, Space, Table, Tag, message } from "antd";
+import { Button, Card, Form, Input, InputNumber, Modal, Select, Space, Switch, Table, Tag, message } from "antd";
+import type { DriverDescriptor, FieldDescriptor } from "../types";
 
 const DRIVERS = [
   { value: "simulator", label: "Simulator" },
@@ -9,25 +10,43 @@ const DRIVERS = [
   { value: "opcua", label: "OPC UA" },
 ];
 
+function FieldControl({ f }: { f: FieldDescriptor }) {
+  if (f.field_type === "boolean") return <Switch />;
+  if (f.field_type === "enum") return <Select options={(f.validation.enum_options ?? []).map((o) => ({ value: o, label: o }))} />;
+  if (f.field_type === "integer" || f.field_type === "port" || f.field_type === "number" || f.field_type === "duration") return <InputNumber style={{ width: "100%" }} />;
+  if (f.field_type === "secret") return <Input.Password />;
+  return <Input placeholder={f.ui.placeholder} />;
+}
+
 export function DeviceManager() {
   const [endpoints, setEndpoints] = useState<Array<{ id: string; driver_id: string; state?: string }>>([]);
   const [open, setOpen] = useState(false);
   const [form] = Form.useForm();
+  const [desc, setDesc] = useState<DriverDescriptor | null>(null);
+  const [driverId, setDriverId] = useState("simulator");
 
   const load = () => fetch("/api/v1/endpoints").then((r) => r.json()).then((j) => setEndpoints(j.endpoints ?? [])).catch(() => {});
   useEffect(() => { load(); }, []);
+
+  // 弹框内驱动切换即拉取 Descriptor
+  useEffect(() => {
+    if (!open) return;
+    fetch(`/api/v1/drivers/${driverId}/descriptor`).then((r) => r.json()).then(setDesc).catch(() => setDesc(null));
+    // 保留已填的 id，清空连接字段
+    const cur = form.getFieldsValue();
+    form.resetFields();
+    form.setFieldsValue({ driver_id: driverId, id: cur.id });
+  }, [driverId, open]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const create = async () => {
     try {
       const v = await form.validateFields();
       const id = v.id?.trim() || `${v.driver_id}-${Date.now().toString(36)}`;
       const connection: Record<string, unknown> = {};
-      if (v.host) connection.host = v.host;
-      if (v.port) connection.port = Number(v.port);
-      if (v.rack !== undefined) connection.rack = Number(v.rack);
-      if (v.slot !== undefined) connection.slot = Number(v.slot);
-      // 其余字段原样带入
-      Object.keys(v).forEach((k) => { if (!["id", "driver_id", "host", "port", "rack", "slot"].includes(k) && v[k] !== undefined && v[k] !== "") connection[k] = v[k]; });
+      for (const k of Object.keys(v)) {
+        if (k === "id" || k === "driver_id") continue;
+        if (v[k] !== undefined && v[k] !== "") connection[k] = v[k];
+      }
       const r = await fetch("/api/v1/endpoints", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, device_id: id, driver_id: v.driver_id, connection }) });
       const j = await r.json();
       if (!r.ok) return message.error(j.error?.message ?? "创建失败");
@@ -48,7 +67,7 @@ export function DeviceManager() {
 
   return (
     <div style={{ display: "grid", gap: 16 }}>
-      <Card size="small" extra={<Button type="primary" onClick={() => setOpen(true)}>新增设备</Button>} title={`设备 · ${endpoints.length}`}>
+      <Card size="small" extra={<Button type="primary" onClick={() => { setDriverId("simulator"); setOpen(true); }}>新增设备</Button>} title={`设备 · ${endpoints.length}`}>
         <Table
           size="small"
           rowKey="id"
@@ -70,14 +89,30 @@ export function DeviceManager() {
         />
       </Card>
 
-      <Modal title="新增设备" open={open} onOk={create} onCancel={() => setOpen(false)} okText="创建" destroyOnClose>
+      <Modal title="新增设备" open={open} onOk={create} onCancel={() => setOpen(false)} okText="创建" destroyOnClose width={640}>
         <Form form={form} layout="vertical" initialValues={{ driver_id: "simulator" }}>
-          <Form.Item name="driver_id" label="驱动" rules={[{ required: true }]}><Select options={DRIVERS} /></Form.Item>
+          <Form.Item name="driver_id" label="驱动" rules={[{ required: true }]}>
+            <Select options={DRIVERS} onChange={(v) => setDriverId(v)} />
+          </Form.Item>
           <Form.Item name="id" label="ID（可空自动生成）"><Input placeholder="s7-01" /></Form.Item>
-          <Form.Item name="host" label="Host"><Input placeholder="192.168.0.10" /></Form.Item>
-          <Form.Item name="port" label="Port"><Input placeholder="102 / 8193 / 4840" /></Form.Item>
-          <Form.Item name="rack" label="Rack"><Input placeholder="0" /></Form.Item>
-          <Form.Item name="slot" label="Slot"><Input placeholder="1" /></Form.Item>
+          {!desc ? <div style={{ color: "#999", fontSize: 12 }}>加载连接参数…</div> : (
+            <>
+              {(desc.connection.fields ?? [])
+                .slice().sort((a, b) => (a.ui.order ?? 999) - (b.ui.order ?? 999))
+                .map((f) => (
+                  <Form.Item
+                    key={f.key}
+                    name={f.key}
+                    label={f.label}
+                    tooltip={f.description}
+                    valuePropName={f.field_type === "boolean" ? "checked" : "value"}
+                    rules={f.required ? [{ required: true, message: `${f.label} 必填` }] : []}
+                  >
+                    <FieldControl f={f} />
+                  </Form.Item>
+                ))}
+            </>
+          )}
         </Form>
       </Modal>
     </div>
