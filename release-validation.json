@@ -67,8 +67,8 @@
     {
       "driver": "focas2",
       "capability": "command",
-      "status": "skipped",
-      "detail": "controls=[] pending Simulator baseline (165 ready)"
+      "status": "passed",
+      "detail": "165 status command via Control32 Succeeded (192.168.15.165:8193)"
     }
   ]
 }
