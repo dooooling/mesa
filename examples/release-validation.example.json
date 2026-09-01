@@ -31,7 +31,11 @@
     "leak_detected": false
   },
   "real_device_matrix": [
-    { "driver": "simulator", "capability": "write", "status": "passed", "detail": "Writablesim.counter via Control queue reliable" },
-    { "driver": "s7", "capability": "probe", "status": "skipped", "detail": "no hardware" }
+    { "driver": "simulator", "capability": "write", "status": "passed", "detail": "Writable sim.counter via Control queue reliable" },
+    { "driver": "s7", "capability": "probe", "status": "passed", "detail": "192.168.15.97:102 OpenConnection ok (rack0/slot1) via probe_97" },
+    { "driver": "s7", "capability": "write", "status": "skipped", "detail": "safe DB write pending soak window" },
+    { "driver": "focas2", "capability": "probe", "status": "passed", "detail": "192.168.15.165:8193 OpenConnection ok" },
+    { "driver": "focas2", "capability": "pmc_rdpmcrng", "status": "passed", "detail": "R100..118 WORD10→1 range_call verified via test_native" },
+    { "driver": "focas2", "capability": "command", "status": "skipped", "detail": "controls=[] pending Simulator baseline, 165 ready for reset/start" }
   ]
 }
