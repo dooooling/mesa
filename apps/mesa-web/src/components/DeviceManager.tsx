@@ -235,7 +235,7 @@ export function DeviceManager() {
     load();
   };
 
-  const isRunning = (s?: string) => (s ?? "").toUpperCase() === "RUNNING";
+  const isRunning = (s?: string) => ["RUNNING","CONNECTING","RECONNECTING"].includes((s ?? "").toUpperCase());
 
   return (
     <div style={{ display: "grid", gap: 16 }}>
