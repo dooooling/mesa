@@ -78,6 +78,16 @@ export function DeviceManager() {
         if (k === "id" || k === "driver_id") continue;
         if (v[k] !== undefined && v[k] !== "" && v[k] !== null) connection[k] = v[k];
       }
+      // 先建 device（endpoint 依赖 device 外键）
+      const devRes = await fetch("/api/v1/devices", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, name: id }) });
+      if (!devRes.ok) {
+        const j = await devRes.json().catch(() => ({}));
+        // 已存在则忽略
+        if (j.error?.code !== "DUPLICATE" && !String(j.error?.message ?? "").includes("已存在")) {
+          message.error(j.error?.message ?? "创建设备失败");
+          return;
+        }
+      }
       const r = await fetch("/api/v1/endpoints", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, device_id: id, driver_id: v.driver_id, connection }) });
       const j = await r.json();
       if (!r.ok) return message.error(j.error?.message ?? "创建失败");
