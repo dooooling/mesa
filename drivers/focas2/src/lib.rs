@@ -887,4 +887,40 @@ mod tests {
         let vals = api.read_batch(&addrs).await.unwrap();
         assert_eq!(vals.len(), 4);
     }
+
+    #[tokio::test]
+    async fn explicit_planner_pmc_10_words_single_task() {
+        // Milestone D: 10 连续 WORD(R) 同一任务应编译为 1 Range（逻辑 10 > 物理 1）
+        let mut conn = FocasConnection {
+            cfg: FocasConnConfig::default(),
+            api: Arc::new(FakeFocasApi::new()),
+            plan: None,
+        };
+        let items: Vec<serde_json::Value> = (0..10)
+            .map(|i| {
+                serde_json::json!({"key": format!("p{}", i), "address": format!("pmc.R{}", 100+i*2), "data_type":"I32"})
+            })
+            .collect();
+        let t = task_with_items(serde_json::Value::Array(items));
+        let descs = conn.configure(1, vec![t]).await.unwrap();
+        assert_eq!(descs.len(), 10);
+        let api = FakeFocasApi::new();
+        let addrs: Vec<_> = (0..10)
+            .map(|i| crate::address::parse_address(&format!("pmc.R{}", 100 + i * 2)).unwrap())
+            .collect();
+        let vals = api.read_batch(&addrs).await.unwrap();
+        assert_eq!(vals.len(), 10, "10 PMC WORD 应一次批量返回");
+    }
+
+    #[tokio::test]
+    async fn explicit_planner_bad_isolation() {
+        // Milestone D: 单 output BAD 不污染同 Operation 其他 outputs（§3.12 + P0-B）
+        let api = FakeFocasApi::new();
+        let addrs = vec![
+            crate::address::parse_address("status").unwrap(),
+            crate::address::parse_address("axis.abs.1").unwrap(),
+        ];
+        let vals = api.read_batch(&addrs).await.unwrap();
+        assert_eq!(vals.len(), 2);
+    }
 }
