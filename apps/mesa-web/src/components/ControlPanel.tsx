@@ -5,14 +5,14 @@ type EndpointBrief = { id: string; driver_id: string };
 
 export function ControlPanel() {
   const [endpoints, setEndpoints] = useState<EndpointBrief[]>([]);
-  const [selected, setSelected] = useState<string>("");
-  const [descriptor, setDescriptor] = useState<{ controls?: { commands: Array<{ id: string; label: { zh?: string; en?: string } | string }> } } | null>(null);
+  const [selected, setSelected] = useState("");
+  const [descriptor, setDescriptor] = useState<{ controls?: { commands: Array<{ id: string; label?: unknown }> } } | null>(null);
   const [target, setTarget] = useState("sim.counter");
   const [value, setValue] = useState("42");
-  const [cmd, setCmd] = useState("reset");
+  const [cmd, setCmd] = useState("status");
   const [cmdInput, setCmdInput] = useState("{}");
-  const [result, setResult] = useState<string>("");
-  const [error, setError] = useState<string>("");
+  const [result, setResult] = useState("");
+  const [error, setError] = useState("");
 
   useEffect(() => {
     api.listEndpoints().then((j: { endpoints: Array<{ id: string; driver_id: string }> }) => {
@@ -32,15 +32,10 @@ export function ControlPanel() {
   const doWrite = async () => {
     setError(""); setResult("");
     let parsed: unknown = value;
-    // 尝试按数字解析
     const num = Number(value);
     if (value.trim() !== "" && !Number.isNaN(num) && String(num) === value.trim()) parsed = num;
     else if (value === "true" || value === "false") parsed = value === "true";
-    const r = await fetch(`/api/v1/endpoints/${selected}/write`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ target, value: parsed }),
-    });
+    const r = await fetch(`/api/v1/endpoints/${selected}/write`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ target, value: parsed }) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) setError(`${r.status} ${j.error?.code || ""} ${j.error?.message || JSON.stringify(j)}`);
     else setResult(JSON.stringify(j, null, 2));
@@ -50,43 +45,54 @@ export function ControlPanel() {
     setError(""); setResult("");
     let input: unknown = {};
     try { input = JSON.parse(cmdInput); } catch { input = {}; }
-    const r = await fetch(`/api/v1/endpoints/${selected}/commands/${cmd}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(input && typeof input === "object" && !Array.isArray(input) ? input : { input }),
-    });
+    const r = await fetch(`/api/v1/endpoints/${selected}/commands/${cmd}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input && typeof input === "object" && !Array.isArray(input) ? input : { input }) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) setError(`${r.status} ${j.error?.code || ""} ${j.error?.message || JSON.stringify(j)}`);
     else setResult(JSON.stringify(j, null, 2));
   };
 
   return (
-    <div style={{ padding: 16 }}>
-      <h2>控制面（需 --enable-control）</h2>
-      <p style={{ color: "#666" }}>可靠 Control 队列，禁 Latest-Wins；默认关闭，未开启时返回 503 CONTROL_DISABLED。</p>
-      <label>Endpoint: <select value={selected} onChange={(e) => setSelected(e.target.value)}>
-        {endpoints.map((e) => <option key={e.id} value={e.id}>{e.id} ({e.driver_id})</option>)}
-      </select></label>
+    <div style={{ display: "grid", gap: 16 }}>
+      <div className="card">
+        <div className="card-bd" style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <span className="badge badge-warn">需 --enable-control</span>
+          <span className="help">可靠 Control 队列（32 有界，禁 Latest-Wins）；未开启返回 503 CONTROL_DISABLED</span>
+          <span style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+            <span className="label">Endpoint</span>
+            <select className="select" value={selected} onChange={(e) => setSelected(e.target.value)} style={{ minWidth: 260 }}>
+              {endpoints.map((e) => <option key={e.id} value={e.id}>{e.id} ({e.driver_id})</option>)}
+              {!endpoints.length && <option value="">暂无端点</option>}
+            </select>
+          </span>
+        </div>
+      </div>
+
       {descriptor?.controls?.commands?.length ? (
-        <div style={{ marginTop: 8 }}>可用命令: {descriptor.controls.commands.map((c) => c.id).join(", ")}</div>
+        <div className="card"><div className="card-bd"><span className="label">可用命令：</span> {descriptor.controls.commands.map((c) => <span key={c.id} className="kbd mono" style={{ marginRight: 8 }}>{c.id}</span>)}</div></div>
       ) : null}
 
-      <fieldset style={{ marginTop: 16 }}>
-        <legend>Write</legend>
-        <label>target: <input value={target} onChange={(e) => setTarget(e.target.value)} style={{ width: 200 }} /></label>{" "}
-        <label>value: <input value={value} onChange={(e) => setValue(e.target.value)} style={{ width: 120 }} /></label>{" "}
-        <button onClick={doWrite}>写入</button>
-      </fieldset>
+      <div className="grid grid-2">
+        <div className="card">
+          <div className="card-hd"><h3>Write</h3><span className="kbd">POST /endpoints/:id/write</span></div>
+          <div className="card-bd" style={{ display: "grid", gap: 12 }}>
+            <div><div className="label" style={{ marginBottom: 6 }}>target（point_key / binding）</div><input className="input mono" value={target} onChange={(e) => setTarget(e.target.value)} placeholder="sim.counter / ns=2;s=Demo.Static.Scalar.Int32" /></div>
+            <div><div className="label" style={{ marginBottom: 6 }}>value</div><input className="input mono" value={value} onChange={(e) => setValue(e.target.value)} placeholder="42 / true / 字符串" /></div>
+            <button className="btn" onClick={doWrite}>写入</button>
+          </div>
+        </div>
 
-      <fieldset style={{ marginTop: 16 }}>
-        <legend>Command</legend>
-        <label>command: <input value={cmd} onChange={(e) => setCmd(e.target.value)} style={{ width: 120 }} /></label>{" "}
-        <label>input_json: <input value={cmdInput} onChange={(e) => setCmdInput(e.target.value)} style={{ width: 300 }} /></label>{" "}
-        <button onClick={doCommand}>执行</button>
-      </fieldset>
+        <div className="card">
+          <div className="card-hd"><h3>Command</h3><span className="kbd">POST /endpoints/:id/commands/:command</span></div>
+          <div className="card-bd" style={{ display: "grid", gap: 12 }}>
+            <div><div className="label" style={{ marginBottom: 6 }}>command</div><input className="input mono" value={cmd} onChange={(e) => setCmd(e.target.value)} placeholder="status / reset" /></div>
+            <div><div className="label" style={{ marginBottom: 6 }}>input_json</div><input className="input mono" value={cmdInput} onChange={(e) => setCmdInput(e.target.value)} placeholder='{}' /></div>
+            <button className="btn" onClick={doCommand}>执行</button>
+          </div>
+        </div>
+      </div>
 
-      {error && <pre style={{ color: "crimson", background: "#fee", padding: 8 }}>{error}</pre>}
-      {result && <pre style={{ background: "#f6f6f6", padding: 8 }}>{result}</pre>}
+      {error && <div className="card" style={{ borderColor: "rgba(239,68,68,.35)" }}><div className="card-bd"><pre style={{ margin: 0, color: "#fca5a5", whiteSpace: "pre-wrap" }}>{error}</pre></div></div>}
+      {result && <div className="card"><div className="card-hd"><h3>结果</h3><span className="badge badge-ok">200 OK</span></div><div className="card-bd scroll"><pre className="mono" style={{ margin: 0, fontSize: 12, whiteSpace: "pre-wrap" }}>{result}</pre></div></div>}
     </div>
   );
 }
