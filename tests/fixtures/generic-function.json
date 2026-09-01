@@ -1,0 +1,9 @@
+{
+  "$schema": "mesa/fixtures/generic-function",
+  "description": "FANUC FOCAS功能块导入示例（Function→Resource映射，§17 Dynamic/status/axis等）",
+  "driver_id": "focas2",
+  "functions": [
+    { "function": "cnc_rddynamic2", "axis": 1, "outputs": ["feed", "spindle"], "point_keys": ["focas.feed", "focas.spindle"] },
+    { "function": "pmc_rdpmcrng", "address": "R100", "count": 10, "point_keys": ["focas.r100", "focas.r102"] }
+  ]
+}

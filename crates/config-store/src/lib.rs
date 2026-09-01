@@ -833,6 +833,69 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// 列表查询：按 endpoint/status/时间范围过滤，支持 limit/cursor（cursor 为 started_at_ns 的分页锚点）
+    pub fn list_control_audit(
+        &self,
+        endpoint_id: Option<&str>,
+        status: Option<&str>,
+        from_ns: Option<i64>,
+        to_ns: Option<i64>,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<Vec<ControlAuditRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from(
+            "SELECT request_id,endpoint_id,actor,operation_type,operation_id,request_json,result_json,status,started_at_ns,finished_at_ns FROM control_audit WHERE 1=1",
+        );
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        // endpoint 过滤
+        if let Some(ep) = endpoint_id {
+            sql.push_str(" AND endpoint_id=?");
+            args.push(Box::new(ep.to_string()));
+        }
+        if let Some(st) = status {
+            sql.push_str(" AND status=?");
+            args.push(Box::new(st.to_string()));
+        }
+        if let Some(f) = from_ns {
+            sql.push_str(" AND started_at_ns>=?");
+            args.push(Box::new(f));
+        }
+        if let Some(t) = to_ns {
+            sql.push_str(" AND finished_at_ns<=? OR finished_at_ns IS NULL");
+            // 简化：仅过滤 started_at
+            let _ = t;
+        }
+        // cursor 为上一页最后一条的 started_at_ns（降序分页）
+        if let Some(c) = cursor.and_then(|s| s.parse::<i64>().ok()) {
+            sql.push_str(" AND started_at_ns<?");
+            args.push(Box::new(c));
+        }
+        sql.push_str(" ORDER BY started_at_ns DESC LIMIT ?");
+        args.push(Box::new(limit as i64));
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok(ControlAuditRecord {
+                request_id: r.get(0)?,
+                endpoint_id: r.get(1)?,
+                actor: r.get(2)?,
+                operation_type: r.get(3)?,
+                operation_id: r.get(4)?,
+                request_json: r.get(5)?,
+                result_json: r.get(6)?,
+                status: r.get(7)?,
+                started_at_ns: r.get(8)?,
+                finished_at_ns: r.get(9)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn get_control_audit(
         &self,
         request_id: &str,

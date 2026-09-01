@@ -1,0 +1,10 @@
+{
+  "$schema": "mesa/fixtures/generic-object-dictionary",
+  "description": "CANopen/CiA402对象字典示例（Index/SubIndex→point_key）",
+  "driver_id": "canopen",
+  "objects": [
+    { "index": "0x6040", "sub": 0, "name": "Controlword", "data_type": "U16", "point_key": "can.controlword", "access": "read_write" },
+    { "index": "0x6064", "sub": 0, "name": "PositionActual", "data_type": "I32", "point_key": "can.position", "access": "read" }
+  ],
+  "profile": "cia402-drive"
+}

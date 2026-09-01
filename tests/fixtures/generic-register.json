@@ -1,0 +1,11 @@
+{
+  "$schema": "mesa/fixtures/generic-register",
+  "description": "S7/FOCAS寄存器导入示例（§20 导入器声明格式，Driver/Profile声明NodeSet/L5X等，不设Universal格式）",
+  "driver_id": "s7",
+  "registers": [
+    { "address": "DB10.DBW0", "data_type": "I16", "point_key": "s7.db10_w0", "access": "read" },
+    { "address": "DB10.DBX2.0", "data_type": "Bool", "point_key": "s7.db10_x2_0", "access": "read" },
+    { "address": "R100", "data_type": "WORD", "point_key": "focas.r100", "access": "read" }
+  ],
+  "import_options": { "task_mode": "poll", "interval_ms": 1000 }
+}

@@ -760,6 +760,54 @@ async fn control_command(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    endpoint_id: Option<String>,
+    status: Option<String>,
+    from_ns: Option<i64>,
+    to_ns: Option<i64>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+async fn list_control_audit(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<AuditQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let limit = q.limit.unwrap_or(50).min(200);
+    match state.store.list_control_audit(
+        q.endpoint_id.as_deref(),
+        q.status.as_deref(),
+        q.from_ns,
+        q.to_ns,
+        limit,
+        q.cursor.as_deref(),
+    ) {
+        Ok(list) => {
+            let next_cursor = list.last().map(|r| r.started_at_ns.to_string());
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"audits": list, "next_cursor": next_cursor, "count": list.len()})),
+            )
+        }
+        Err(e) => store_err_to_response(e),
+    }
+}
+
+async fn get_control_audit(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.store.get_control_audit(&request_id) {
+        Ok(Some(rec)) => (StatusCode::OK, Json(serde_json::to_value(rec).unwrap())),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("audit `{request_id}` not found"))),
+        ),
+        Err(e) => store_err_to_response(e),
+    }
+}
+
 async fn endpoint_diagnostics(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1528,6 +1576,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/endpoints/{id}/import", post(import_endpoint))
         .route("/api/v1/endpoints/{id}/write", post(control_write))
         .route("/api/v1/endpoints/{id}/commands/{command}", post(control_command))
+        .route("/api/v1/control/audit", get(list_control_audit))
+        .route("/api/v1/control/audit/{request_id}", get(get_control_audit))
         .route("/api/v1/points/latest", get(latest_points))
         .route("/api/v1/diagnostics", get(diagnostics))
         // Devices CRUD

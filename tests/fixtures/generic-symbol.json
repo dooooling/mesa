@@ -1,0 +1,10 @@
+{
+  "$schema": "mesa/fixtures/generic-symbol",
+  "description": "符号表导入示例（TIA Portal符号/L5X，映射为 ResourceSelection）",
+  "driver_id": "s7",
+  "symbols": [
+    { "name": "Motor.Speed", "address": "DB20.DBD4", "data_type": "Real", "point_key": "s7.motor_speed" },
+    { "name": "Motor.Status", "address": "DB20.DBX8.0", "data_type": "Bool", "point_key": "s7.motor_status" }
+  ],
+  "profile_hint": "s7-1200"
+}

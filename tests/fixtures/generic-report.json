@@ -1,0 +1,10 @@
+{
+  "$schema": "mesa/fixtures/generic-report",
+  "description": "ImportIssue报告示例（§20 severity:Warning/Error，含code/path/line）",
+  "import_id": "import-001",
+  "issues": [
+    { "severity": "Warning", "code": "UNMAPPED_TYPE", "message": "type WORD mapped to U16", "path": "registers[2]", "line": 8, "column": 12 },
+    { "severity": "Error", "code": "DUPLICATE_POINT_KEY", "message": "point_key s7.db10_w0 duplicated", "path": "registers[3]", "line": 10, "column": 5 }
+  ],
+  "summary": { "warnings": 1, "errors": 1, "can_apply": false, "note": "有Error禁Apply，仅Warning可Apply但UI必须展示" }
+}
