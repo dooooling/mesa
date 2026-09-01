@@ -133,10 +133,9 @@ export function DeviceManager() {
 
   const savePoints = async () => {
     if (!pointsEp || !pointsSels.length) return message.warning("请先加入点位");
-    // 通用自描述：用 mesa.resources.v1，下发 selections；FOCAS 等对 outputs→address 有特殊要求时单点回退为 BAD 隔离仍可展示
+    // 通用自描述：用 mesa.resources.v1，下发 selections；S7/FOCAS 需合成真实地址
     let tasks: Array<Record<string, unknown>>;
     if (pointsEp.driver_id === "focas2") {
-      // FOCAS 专属：kind=focas.data-block，需 items{key,address,data_type}，用已知合法地址兜底确保出数
       const FOCAS_ADDRS = ["status", "axis.abs.1", "spindle.load.1", "pmc.R100", "macro.100"];
       const items = pointsSels.flatMap((s) =>
         s.outputs.map((o, i) => ({
@@ -146,6 +145,32 @@ export function DeviceManager() {
         }))
       );
       tasks = [{ id: "t1", mode: "poll", interval_ms: intervalMs, binding: { kind: "focas.data-block", config: { items } } }];
+    } else if (pointsEp.driver_id === "s7") {
+      // S7 需合成 DB/M/I/Q 地址：DB10.DBD0 / DB10.DBX0.0 等
+      const toAddr = (p: Record<string, unknown>): string => {
+        const area = String(p.area ?? "DB");
+        const db = p.db ?? 10;
+        const offset = p.offset ?? 0;
+        const bit = p.bit;
+        const dt = String(p.data_type ?? "REAL").toUpperCase();
+        if (area === "DB") {
+          if (dt === "BOOL" && bit !== undefined && bit !== "") return `DB${db}.DBX${offset}.${bit}`;
+          if (dt === "REAL" || dt === "DWORD" || dt === "DINT") return `DB${db}.DBD${offset}`;
+          if (dt === "INT" || dt === "WORD") return `DB${db}.DBW${offset}`;
+          if (dt === "BYTE") return `DB${db}.DBB${offset}`;
+          return `DB${db}.DBD${offset}`;
+        }
+        if (dt === "BOOL" && bit !== undefined && bit !== "") return `${area}${offset}.${bit}`;
+        return `${area}W${offset}`;
+      };
+      const items = pointsSels.flatMap((s) =>
+        s.outputs.map((o) => ({
+          key: o.point_key,
+          address: toAddr(s.parameters),
+          data_type: String(s.parameters.data_type ?? "REAL"),
+        }))
+      );
+      tasks = [{ id: "t1", mode: "poll", interval_ms: intervalMs, binding: { kind: "s7.address-group", config: { items } } }];
     } else {
       tasks = [
         {
