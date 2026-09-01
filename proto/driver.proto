@@ -54,6 +54,12 @@ message Envelope {
     // Management Plane: Browse / Discovery（§20）分页、懒加载，禁一次返全空间
     BrowseRequest browse_request = 34;
     BrowseResponse browse_response = 35;
+
+    // Control Plane: Write / Command（§22）可靠队列，永不 Latest-Wins
+    WriteRequest write_request = 36;
+    WriteResponse write_response = 37;
+    CommandRequest command_request = 38;
+    CommandResponse command_response = 39;
   }
 }
 
@@ -291,4 +297,32 @@ message BrowseResponse {
   repeated BrowseNode nodes = 1;
   string next_cursor = 2;
   GenericResult result = 3;
+}
+
+message WriteRequest {
+  uint32 connection_handle = 1;
+  string request_id = 2;
+  string target = 3;
+  ValueMsg value = 4;
+  optional ValueMsg expected_value = 5;
+}
+
+message WriteResponse {
+  string request_id = 1;
+  GenericResult result = 2;
+  optional ValueMsg readback = 3;
+}
+
+message CommandRequest {
+  uint32 connection_handle = 1;
+  string request_id = 2;
+  string command_id = 3;
+  string input_json = 4;
+}
+
+message CommandResponse {
+  string request_id = 1;
+  string status = 2; // Succeeded | Failed | TimedOut | Rejected | Cancelled
+  string result_json = 3;
+  string error = 4;
 }

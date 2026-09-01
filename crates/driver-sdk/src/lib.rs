@@ -26,7 +26,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// 出站队列容量。当前取保守值 256；性能预算阶段（§22）按 50K updates/s 压测结果调整。
+#[allow(dead_code)]
 const OUTBOUND_CAPACITY: usize = 256;
+const CONTROL_CAPACITY: usize = 32;
+const DATA_CAPACITY: usize = 256;
 
 /// 握手阶段读超时。超时视为对端异常，直接断开。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -161,6 +164,33 @@ pub trait DriverConnection: Send {
             "browse not supported",
         ))
     }
+
+    /// 控制面写入（J §11）：默认 Unsupported，OPC UA 先行实现。
+    async fn write(
+        &mut self,
+        _target: &str,
+        _value: mesa_core_types::Value,
+        _expected: Option<mesa_core_types::Value>,
+    ) -> Result<(), SdkDriverError> {
+        Err(SdkDriverError::new(
+            mesa_core_types::ErrorKind::Unsupported,
+            "UNSUPPORTED",
+            "write not supported",
+        ))
+    }
+
+    /// 控制面命令（J §11）：默认 Unsupported，预留统一入口。
+    async fn command(
+        &mut self,
+        _command: &str,
+        _args_json: &str,
+    ) -> Result<serde_json::Value, SdkDriverError> {
+        Err(SdkDriverError::new(
+            mesa_core_types::ErrorKind::Unsupported,
+            "UNSUPPORTED",
+            "command not supported",
+        ))
+    }
 }
 
 // 别名：AcquisitionTask 仅在 trait 签名中出现，保持与方案 §16 一致的命名可见性
@@ -170,23 +200,8 @@ pub use mesa_core_types::AcquisitionTask;
 // DataSink：带 Latest-Wins 合并的发布端
 // ---------------------------------------------------------------------------
 
-enum OutboundMsg {
-    /// 控制类消息：不允许丢弃，满载时等待（消费端是专职 writer task，必然前进）。
-    Control(pb::Envelope),
-    /// 数据批次：允许被合并/丢弃。
-    Data(DataBatch),
-}
-
-#[cfg(test)]
-impl std::fmt::Debug for OutboundMsg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OutboundMsg::Control(_) => f.write_str("Control"),
-            OutboundMsg::Data(b) => write!(f, "Data(seq={})", b.sequence),
-        }
-    }
-}
-
+/// 出站控制/数据分流：Control 32 容量可靠队列（永不合并/永不 Latest-Wins），
+/// Data 256 容量 Latest-Wins 合并队列（§12）。writer 侧 biased select! Control 优先。
 struct CoalescerState {
     pending: Option<DataBatch>,
     coalesced_points: u64,
@@ -195,7 +210,8 @@ struct CoalescerState {
 /// Driver 发布数据的句柄。Clone 廉价；内部共享有界通道与合并缓冲。
 #[derive(Clone)]
 pub struct DataSink {
-    tx: mpsc::Sender<OutboundMsg>,
+    control_tx: mpsc::Sender<pb::Envelope>,
+    data_tx: mpsc::Sender<DataBatch>,
     state: Arc<Mutex<CoalescerState>>,
     /// 本 sink 绑定的 connection_handle；0 表示会话级（不发数据）。
     handle: u32,
@@ -210,9 +226,10 @@ impl std::fmt::Debug for DataSink {
 }
 
 impl DataSink {
-    fn new(tx: mpsc::Sender<OutboundMsg>) -> Self {
+    fn new(control_tx: mpsc::Sender<pb::Envelope>, data_tx: mpsc::Sender<DataBatch>) -> Self {
         Self {
-            tx,
+            control_tx,
+            data_tx,
             state: Arc::new(Mutex::new(CoalescerState {
                 pending: None,
                 coalesced_points: 0,
@@ -227,7 +244,8 @@ impl DataSink {
     /// 无需关心 handle/epoch 的注入细节。
     pub fn for_connection(&self, handle: u32, stream_epoch: u64) -> Self {
         Self {
-            tx: self.tx.clone(),
+            control_tx: self.control_tx.clone(),
+            data_tx: self.data_tx.clone(),
             state: Arc::new(Mutex::new(CoalescerState {
                 pending: None,
                 coalesced_points: 0,
@@ -243,21 +261,17 @@ impl DataSink {
     /// NOTE: 合并导致 sequence 缺口——这正是 §10/§12 定义的语义（缺口可观测、
     /// 不代表设备时间顺序），下游不得假设 sequence 连续。
     pub async fn publish(&self, mut batch: DataBatch) {
-        // 盖戳：高频帧只携带 handle+epoch+point_id，标识字段由 SDK 统一注入
         if self.handle != 0 {
             batch.connection_handle = self.handle;
             batch.stream_epoch = self.epoch;
         }
-        // 单调埋点：若 Driver 未填则由 SDK 统一填入宿主机单调时钟（同宿主可比）
         if batch.mono_ns.is_none() {
             batch.mono_ns = Some(mesa_core_types::host_mono_ns());
         }
-        // 非阻塞发送：成功则零拷贝直接入队，仅在 Full 时才进入合并路径，避免热路径无条件 clone
-        match self.tx.try_send(OutboundMsg::Data(batch)) {
+        match self.data_tx.try_send(batch) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(OutboundMsg::Data(batch))) => {
+            Err(mpsc::error::TrySendError::Full(batch)) => {
                 let mut st = self.state.lock().unwrap();
-                // 先 take 再合并，避免对 state 的双重可变借用
                 let mut coalesced = 0u64;
                 let new_pending = match st.pending.take() {
                     Some(mut pending) => {
@@ -274,7 +288,6 @@ impl DataSink {
                         if batch.timestamp_ns > pending.timestamp_ns {
                             pending.timestamp_ns = batch.timestamp_ns;
                         }
-                        // coalesce 后 mono_ns 取最新（max），保证 Latest-Wins 的延迟样本反映最新 publish 时刻
                         pending.mono_ns = match (pending.mono_ns, batch.mono_ns) {
                             (Some(a), Some(b)) => Some(a.max(b)),
                             (Some(a), None) => Some(a),
@@ -282,7 +295,6 @@ impl DataSink {
                             (None, None) => None,
                         };
                         pending.values = merged.into_values().collect();
-                        // 稳定输出顺序，便于测试与排查
                         pending.values.sort_by_key(|pv| pv.point_id);
                         pending
                     }
@@ -291,26 +303,18 @@ impl DataSink {
                 st.coalesced_points += coalesced;
                 st.pending = Some(new_pending);
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // 控制帧 Full 理论上不发生（Control 永不合并），静默丢弃以保活
-                tracing::warn!("控制通道满，丢弃非数据帧");
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                // Core 连接已断开：静默丢弃即可，进程级退出由 server 循环处理
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 
     /// 尝试把合并缓冲冲回通道；通道仍满则保留缓冲下次再试。
-    /// 由 writer 在每次成功出帧后调用，保证积压最终被送出而非滞留。
     fn flush_pending(&self) {
         let mut st = self.state.lock().unwrap();
         if let Some(batch) = st.pending.take() {
-            match self.tx.try_send(OutboundMsg::Data(batch)) {
+            match self.data_tx.try_send(batch) {
                 Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(OutboundMsg::Data(b))) => st.pending = Some(b),
-                Err(mpsc::error::TrySendError::Full(_))
-                | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Err(mpsc::error::TrySendError::Full(b)) => st.pending = Some(b),
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
             }
         }
     }
@@ -320,9 +324,10 @@ impl DataSink {
         self.state.lock().unwrap().coalesced_points
     }
 
+    /// 控制面发送：可靠队列，不合并、满时等待（消费端必然前进），禁止 Latest-Wins。
     async fn send_control(&self, env: pb::Envelope) {
-        if self.tx.send(OutboundMsg::Control(env)).await.is_err() {
-            tracing::warn!("outbound channel closed, control message dropped");
+        if self.control_tx.send(env).await.is_err() {
+            tracing::warn!("control channel closed, message dropped");
         }
     }
 }
@@ -514,8 +519,9 @@ pub async fn serve_with_faults<D: Driver>(
     tracing::info!(%peer, driver = %meta.driver_id, "core connected");
 
     let (mut rd, mut wr) = socket.into_split();
-    let (tx, rx) = mpsc::channel::<OutboundMsg>(OUTBOUND_CAPACITY);
-    let sink = DataSink::new(tx.clone());
+    let (control_tx, control_rx) = mpsc::channel::<pb::Envelope>(CONTROL_CAPACITY);
+    let (data_tx, data_rx) = mpsc::channel::<DataBatch>(DATA_CAPACITY);
+    let sink = DataSink::new(control_tx.clone(), data_tx.clone());
 
     // ---- 握手：先发 Hello 再等 Welcome（§14.3）。握手期 writer 尚未启动，
     // 直接使用写半部，避免与请求循环的出站路径产生交错。----
@@ -575,9 +581,15 @@ pub async fn serve_with_faults<D: Driver>(
         msg_ids: AtomicU64::new(2),
     };
 
-    // ---- writer task：唯一拥有写半部，串行化所有出站帧 ----
+    // ---- writer task：唯一拥有写半部，串行化所有出站帧（Control 32 可靠优先，Data 256 Latest-Wins） ----
     let writer_shutdown = shutdown.child_token();
-    let writer = tokio::spawn(writer_loop(wr, rx, session.sink.clone(), writer_shutdown));
+    let writer = tokio::spawn(writer_loop(
+        wr,
+        control_rx,
+        data_rx,
+        session.sink.clone(),
+        writer_shutdown,
+    ));
 
     let result = request_loop(&session, rd, &shutdown, faults.as_ref()).await;
 
@@ -598,34 +610,45 @@ pub async fn serve_with_faults<D: Driver>(
 
 async fn writer_loop(
     mut wr: OwnedWriteHalf,
-    mut rx: mpsc::Receiver<OutboundMsg>,
+    mut control_rx: mpsc::Receiver<pb::Envelope>,
+    mut data_rx: mpsc::Receiver<DataBatch>,
     sink: DataSink,
     shutdown: CancellationToken,
 ) {
     loop {
         tokio::select! {
-            msg = rx.recv() => match msg {
-                Some(OutboundMsg::Control(env)) => {
-                    if write_envelope(&mut wr, &env).await.is_err() {
-                        break;
-                    }
+            biased;
+            _ = shutdown.cancelled() => break,
+            c = control_rx.recv() => match c {
+                Some(env) => {
+                    if write_envelope(&mut wr, &env).await.is_err() { break; }
                 }
-                Some(OutboundMsg::Data(batch)) => {
+                None => {
+                    // 控制通道关闭：继续排空数据通道或退出
+                    // 若数据通道也关闭则整体退出
+                    if data_rx.is_closed() { break; }
+                    // 否则继续循环等待数据
+                    continue;
+                }
+            },
+            d = data_rx.recv() => match d {
+                Some(batch) => {
                     let env = pb::Envelope {
                         msg_id: 0,
                         body: Some(pb::envelope::Body::DataBatch(batch_to_pb(&batch))),
                     };
-                    if write_envelope(&mut wr, &env).await.is_err() {
-                        break;
-                    } else {
-                        // 通道腾出空间后优先补发合并积压，保证最新值最终可达
-                        sink.flush_pending();
-                    }
+                    if write_envelope(&mut wr, &env).await.is_err() { break; }
+                    else { sink.flush_pending(); }
                 }
-                None => break,
+                None => {
+                    // 数据通道关闭：若控制也关闭则退出，否则等待控制消息
+                    if control_rx.is_closed() { break; }
+                    continue;
+                }
             },
-            _ = shutdown.cancelled() => break,
         }
+        // 任一通道关闭后若另一通道也关闭则退出
+        if control_rx.is_closed() && data_rx.is_closed() { break; }
     }
 }
 
@@ -722,6 +745,12 @@ async fn request_loop(
             }
             Some(pb::envelope::Body::BrowseRequest(req)) => {
                 on_browse(session, req, env.msg_id).await
+            }
+            Some(pb::envelope::Body::WriteRequest(req)) => {
+                on_write(session, req, env.msg_id).await
+            }
+            Some(pb::envelope::Body::CommandRequest(req)) => {
+                on_command(session, req, env.msg_id).await
             }
             Some(pb::envelope::Body::Shutdown(_)) => {
                 tracing::info!("shutdown requested by core");
@@ -1143,6 +1172,235 @@ async fn on_browse(session: &Session, req: pb::BrowseRequest, msg_id: u64) {
     }
 }
 
+async fn on_write(session: &Session, req: pb::WriteRequest, msg_id: u64) {
+    let conn_opt = {
+        let mut m = session.entries.lock().unwrap();
+        if let Some(entry) = m.get_mut(&req.connection_handle) {
+            entry.conn.take()
+        } else {
+            None
+        }
+    };
+    let exists = {
+        let m = session.entries.lock().unwrap();
+        m.contains_key(&req.connection_handle)
+    };
+    if conn_opt.is_none() && !exists {
+        session
+            .sink
+            .send_control(pb::Envelope {
+                msg_id,
+                body: Some(pb::envelope::Body::WriteResponse(pb::WriteResponse {
+                    request_id: req.request_id,
+                    result: Some(err_result(
+                        ErrorKind::Internal,
+                        "NO_CONNECTION",
+                        "write: connection not open",
+                    )),
+                    readback: None,
+                })),
+            })
+            .await;
+        return;
+    }
+    let Some(mut conn) = conn_opt else {
+        session
+            .sink
+            .send_control(pb::Envelope {
+                msg_id,
+                body: Some(pb::envelope::Body::WriteResponse(pb::WriteResponse {
+                    request_id: req.request_id,
+                    result: Some(err_result(
+                        ErrorKind::Internal,
+                        "BUSY",
+                        "write: connection busy",
+                    )),
+                    readback: None,
+                })),
+            })
+            .await;
+        return;
+    };
+    let value = match req.value {
+        Some(v) => match mesa_driver_protocol::value_from_pb(v) {
+            Ok(v) => v,
+            Err(e) => {
+                {
+                    let mut m = session.entries.lock().unwrap();
+                    if let Some(e2) = m.get_mut(&req.connection_handle) {
+                        e2.conn = Some(conn);
+                    }
+                }
+                session
+                    .sink
+                    .send_control(pb::Envelope {
+                        msg_id,
+                        body: Some(pb::envelope::Body::WriteResponse(pb::WriteResponse {
+                            request_id: req.request_id,
+                            result: Some(err_result(
+                                ErrorKind::Internal,
+                                "BAD_VALUE",
+                                format!("decode value: {e}"),
+                            )),
+                            readback: None,
+                        })),
+                    })
+                    .await;
+                return;
+            }
+        },
+        None => {
+            {
+                let mut m = session.entries.lock().unwrap();
+                if let Some(e2) = m.get_mut(&req.connection_handle) {
+                    e2.conn = Some(conn);
+                }
+            }
+            session
+                .sink
+                .send_control(pb::Envelope {
+                    msg_id,
+                    body: Some(pb::envelope::Body::WriteResponse(pb::WriteResponse {
+                        request_id: req.request_id,
+                        result: Some(err_result(
+                            ErrorKind::Internal,
+                            "MISSING_VALUE",
+                            "write: missing value",
+                        )),
+                        readback: None,
+                    })),
+                })
+                .await;
+            return;
+        }
+    };
+    let expected = match req.expected_value {
+        Some(v) => match mesa_driver_protocol::value_from_pb(v) {
+            Ok(v) => Some(v),
+            Err(_) => None,
+        },
+        None => None,
+    };
+    let res = conn.write(&req.target, value, expected).await;
+    {
+        let mut m = session.entries.lock().unwrap();
+        if let Some(e2) = m.get_mut(&req.connection_handle) {
+            e2.conn = Some(conn);
+        }
+    }
+    match res {
+        Ok(()) => {
+            session
+                .sink
+                .send_control(pb::Envelope {
+                    msg_id,
+                    body: Some(pb::envelope::Body::WriteResponse(pb::WriteResponse {
+                        request_id: req.request_id,
+                        result: Some(mesa_driver_protocol::ok_result()),
+                        readback: None,
+                    })),
+                })
+                .await;
+        }
+        Err(e) => {
+            session
+                .sink
+                .send_control(pb::Envelope {
+                    msg_id,
+                    body: Some(pb::envelope::Body::WriteResponse(pb::WriteResponse {
+                        request_id: req.request_id,
+                        result: Some(err_result(e.kind, &e.code, e.message)),
+                        readback: None,
+                    })),
+                })
+                .await;
+        }
+    }
+}
+
+async fn on_command(session: &Session, req: pb::CommandRequest, msg_id: u64) {
+    let conn_opt = {
+        let mut m = session.entries.lock().unwrap();
+        if let Some(entry) = m.get_mut(&req.connection_handle) {
+            entry.conn.take()
+        } else {
+            None
+        }
+    };
+    let exists = {
+        let m = session.entries.lock().unwrap();
+        m.contains_key(&req.connection_handle)
+    };
+    if conn_opt.is_none() && !exists {
+        session
+            .sink
+            .send_control(pb::Envelope {
+                msg_id,
+                body: Some(pb::envelope::Body::CommandResponse(pb::CommandResponse {
+                    request_id: req.request_id,
+                    status: "Failed".into(),
+                    result_json: "".into(),
+                    error: "NO_CONNECTION: command: connection not open".into(),
+                })),
+            })
+            .await;
+        return;
+    }
+    let Some(mut conn) = conn_opt else {
+        session
+            .sink
+            .send_control(pb::Envelope {
+                msg_id,
+                body: Some(pb::envelope::Body::CommandResponse(pb::CommandResponse {
+                    request_id: req.request_id,
+                    status: "Failed".into(),
+                    result_json: "".into(),
+                    error: "BUSY: command: connection busy".into(),
+                })),
+            })
+            .await;
+        return;
+    };
+    let res = conn.command(&req.command_id, &req.input_json).await;
+    {
+        let mut m = session.entries.lock().unwrap();
+        if let Some(e2) = m.get_mut(&req.connection_handle) {
+            e2.conn = Some(conn);
+        }
+    }
+    match res {
+        Ok(v) => {
+            let json = serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
+            session
+                .sink
+                .send_control(pb::Envelope {
+                    msg_id,
+                    body: Some(pb::envelope::Body::CommandResponse(pb::CommandResponse {
+                        request_id: req.request_id,
+                        status: "Succeeded".into(),
+                        result_json: json,
+                        error: "".into(),
+                    })),
+                })
+                .await;
+        }
+        Err(e) => {
+            session
+                .sink
+                .send_control(pb::Envelope {
+                    msg_id,
+                    body: Some(pb::envelope::Body::CommandResponse(pb::CommandResponse {
+                        request_id: req.request_id,
+                        status: "Failed".into(),
+                        result_json: "".into(),
+                        error: format!("{}/{}: {}", e.kind.as_str(), e.code, e.message),
+                    })),
+                })
+                .await;
+        }
+    }
+}
+
 impl Session {
     async fn send_control_ack_start(&self, msg_id: u64, handle: u32, ok: bool, why: &str) {
         let result = if ok {
@@ -1203,8 +1461,9 @@ mod tests {
     /// 腾出空间后积压的"最新值"最终可达。
     #[tokio::test]
     async fn sink_coalesces_latest_wins_when_full() {
-        let (tx, mut rx) = mpsc::channel::<OutboundMsg>(1);
-        let session_sink = DataSink::new(tx);
+        let (control_tx, _cr) = mpsc::channel::<pb::Envelope>(CONTROL_CAPACITY);
+        let (data_tx, mut rx) = mpsc::channel::<DataBatch>(1);
+        let session_sink = DataSink::new(control_tx, data_tx);
         let sink = session_sink.for_connection(7, 99);
 
         // 第一批直接入队（占满容量 1）
@@ -1222,12 +1481,12 @@ mod tests {
 
         // 消费者取走第一批后模拟 writer 出帧成功的补发路径
         match rx.recv().await {
-            Some(OutboundMsg::Data(b)) => assert_eq!(b.sequence, 1),
+            Some(b) => assert_eq!(b.sequence, 1),
             other => panic!("expected first batch, got {other:?}"),
         }
         sink.flush_pending();
         match rx.recv().await {
-            Some(OutboundMsg::Data(b)) => {
+            Some(b) => {
                 // Latest-Wins：只剩最新一批，值为该批的值
                 assert_eq!(b.sequence, 50);
                 assert_eq!(b.values.len(), 1);
