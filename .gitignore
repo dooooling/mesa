@@ -31,6 +31,12 @@ drivers/focas2/*.d
 drivers/opcua/*.d
 forgelink*.db
 
+# 前端产物
+apps/mesa-web/node_modules/
+apps/mesa-web/dist/
+apps/mesa-web/*.tsbuildinfo
+tests/driver-contract/data/
+
 # 临时 ARM/性能产物
 /target
 /aarch64-mesad
