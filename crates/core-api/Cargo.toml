@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 mesa-core-types = { workspace = true }
+mesa-driver-protocol = { workspace = true }
 mesa-driver-manager = { workspace = true }
 mesa-config-store = { workspace = true }
 axum = { workspace = true }

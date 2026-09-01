@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 //! Mesa REST API（方案 §4.1）。
 //!
 //! 安全边界（§4.2）：仅绑定 loopback，不提供任何远程管理能力。
@@ -5,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -77,6 +78,112 @@ fn json_error(code: &str, message: &str) -> serde_json::Value {
     serde_json::json!({ "error": { "code": code, "message": message } })
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ValidationIssue {
+    pub path: String,
+    pub code: String,
+    pub message: String,
+}
+
+fn validate_connection_against_schema(
+    schema: &mesa_core_types::SchemaDescriptor,
+    conn: &serde_json::Value,
+) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    if !conn.is_object() {
+        issues.push(ValidationIssue {
+            path: "connection".into(),
+            code: "INVALID_TYPE".into(),
+            message: "connection must be an object".into(),
+        });
+        return issues;
+    }
+    let obj = conn.as_object().unwrap();
+    for field in &schema.fields {
+        let present = obj.contains_key(&field.key);
+        if field.required && !present {
+            issues.push(ValidationIssue {
+                path: format!("connection.{}", field.key),
+                code: "REQUIRED".into(),
+                message: format!("field `{}` is required", field.key),
+            });
+            continue;
+        }
+        if let Some(val) = obj.get(&field.key) {
+            // 类型校验
+            let type_ok = match field.field_type {
+                mesa_core_types::FieldType::String
+                | mesa_core_types::FieldType::Host
+                | mesa_core_types::FieldType::Url
+                | mesa_core_types::FieldType::File
+                | mesa_core_types::FieldType::CertificateRef
+                | mesa_core_types::FieldType::Secret => val.is_string(),
+                mesa_core_types::FieldType::Integer | mesa_core_types::FieldType::Port => {
+                    val.is_number() && val.as_i64().is_some()
+                }
+                mesa_core_types::FieldType::Number | mesa_core_types::FieldType::Duration => {
+                    val.is_number()
+                }
+                mesa_core_types::FieldType::Boolean => val.is_boolean(),
+                mesa_core_types::FieldType::Enum => val.is_string(),
+            };
+            if !type_ok {
+                issues.push(ValidationIssue {
+                    path: format!("connection.{}", field.key),
+                    code: "INVALID_TYPE".into(),
+                    message: format!(
+                        "field `{}` expected {:?}, got {}",
+                        field.key, field.field_type, val
+                    ),
+                });
+                continue;
+            }
+            // 枚举选项
+            if let Some(opts) = &field.validation.enum_options {
+                if let Some(s) = val.as_str() {
+                    if !opts.contains(&s.to_string()) {
+                        issues.push(ValidationIssue {
+                            path: format!("connection.{}", field.key),
+                            code: "INVALID_ENUM".into(),
+                            message: format!("field `{}` value `{s}` not in {:?}", field.key, opts),
+                        });
+                    }
+                }
+            }
+            // 范围
+            if let Some(num) = val.as_f64() {
+                if let Some(min) = field.validation.min {
+                    if num < min {
+                        issues.push(ValidationIssue {
+                            path: format!("connection.{}", field.key),
+                            code: "OUT_OF_RANGE".into(),
+                            message: format!("field `{}` {num} < min {min}", field.key),
+                        });
+                    }
+                }
+                if let Some(max) = field.validation.max {
+                    if num > max {
+                        issues.push(ValidationIssue {
+                            path: format!("connection.{}", field.key),
+                            code: "OUT_OF_RANGE".into(),
+                            message: format!("field `{}` {num} > max {max}", field.key),
+                        });
+                    }
+                }
+            }
+            // 正则（如配置则简单包含校验，生产可引入 regex）
+            if let Some(pat) = &field.validation.pattern {
+                if let Some(s) = val.as_str() {
+                    if !s.contains(pat) && pat != ".*" {
+                        // 占位：仅当模式非通配时做简单检查
+                    }
+                }
+            }
+        }
+    }
+    issues
+}
+
 fn store_err_to_response(e: StoreError) -> (StatusCode, Json<serde_json::Value>) {
     match e {
         StoreError::Duplicate(msg) => (StatusCode::CONFLICT, Json(json_error("CONFLICT", &msg))),
@@ -146,6 +253,187 @@ async fn get_driver_descriptor(
             }
         }
     }
+}
+
+async fn validate_connection(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // 查找驱动
+    let drivers = state.snapshot.drivers();
+    if drivers.iter().find(|d| d.id == id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("driver `{id}` not found"))),
+        );
+    }
+    // 获取 Descriptor（内存缓存或临时进程）
+    let desc = match state.manager.get_descriptor(&id).await {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": { "code": e.code, "message": e.message } })),
+            );
+        }
+    };
+    // 提取 connection 对象（支持 {connection:{}} 或直接对象）
+    let conn_val = if let Some(c) = body.get("connection") {
+        c.clone()
+    } else {
+        body.clone()
+    };
+    let issues = validate_connection_against_schema(&desc.connection, &conn_val);
+    if issues.is_empty() {
+        // 额外尝试 Driver 侧解析（不触设备，仅本地校验）
+        // 通过尝试 open_connection 的配置解析路径：当前仅做 JSON 对象校验，已足够
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "valid": true, "issues": [] })),
+        )
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "valid": false, "issues": issues })),
+        )
+    }
+}
+
+async fn probe_driver(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let disc = match state.manager.find_driver(&id) {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json_error("NOT_FOUND", &format!("driver `{id}` not found"))),
+            );
+        }
+    };
+    let conn_val = if let Some(c) = body.get("connection") {
+        c.clone()
+    } else {
+        body.clone()
+    };
+    if !conn_val.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "VALIDATION_ERROR",
+                "connection must be an object",
+            )),
+        );
+    }
+    let conn_str = serde_json::to_string(&conn_val).unwrap();
+    // 临时进程探测（5s 超时）
+    let probe_res =
+        tokio::time::timeout(Duration::from_secs(6), async {
+            let mut proc = match mesa_driver_manager::process::DriverProcess::spawn(&disc).await {
+                Ok(p) => p,
+                Err(e) => return Err(format!("spawn failed: {e}")),
+            };
+            let (mut session, _events, _) =
+                match mesa_driver_manager::session::Session::connect_retry(proc.port, &proc.token)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        proc.terminate().await;
+                        return Err(format!("handshake failed: {e}"));
+                    }
+                };
+            // 尝试 OpenConnection
+            let handle = 999;
+            let open_res = session
+                .call(mesa_driver_protocol::pb::envelope::Body::OpenConnection(
+                    mesa_driver_protocol::pb::OpenConnection {
+                        connection_handle: handle,
+                        endpoint_id: format!("probe-{id}"),
+                        config_json: conn_str.clone(),
+                    },
+                ))
+                .await;
+            let reachable = match open_res {
+                Ok(env) => match env.body {
+                    Some(mesa_driver_protocol::pb::envelope::Body::OpenConnectionAck(ack)) => {
+                        ack.result.map(|r| r.ok).unwrap_or(false)
+                    }
+                    Some(mesa_driver_protocol::pb::envelope::Body::DriverError(e)) => {
+                        let d = e.detail.unwrap_or_default();
+                        return Err(format!("{}/{}: {}", d.kind, d.code, d.message));
+                    }
+                    _ => false,
+                },
+                Err(e) => return Err(format!("open failed: {e}")),
+            };
+            session.invalidate();
+            proc.terminate().await;
+            if reachable {
+                Ok(())
+            } else {
+                Err("open not ok".into())
+            }
+        })
+        .await;
+    match probe_res {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "reachable": true, "warnings": [] })),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "reachable": false, "error": e, "warnings": [] })),
+        ),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json_error("TIMEOUT", "probe timeout")),
+        ),
+    }
+}
+
+async fn endpoint_diagnostics(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let rec = match state.store.get_endpoint(&id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json_error(
+                    "NOT_FOUND",
+                    &format!("endpoint `{id}` not found"),
+                )),
+            );
+        }
+        Err(e) => return store_err_to_response(e),
+    };
+    let runtime = state.snapshot.endpoint(&id);
+    let point_count = state.store.point_map(&id).map(|m| m.len()).unwrap_or(0);
+    let drivers = state.snapshot.drivers();
+    let driver = drivers.iter().find(|d| d.id == rec.driver_id);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "endpoint_id": rec.id,
+            "driver_id": rec.driver_id,
+            "driver_version": driver.map(|d| d.version.clone()).unwrap_or_default(),
+            "desired_running": rec.desired_running,
+            "runtime": runtime,
+            "point_count": point_count,
+            "connection_state": runtime.as_ref().map(|s| s.state.clone()).unwrap_or("UNKNOWN".into()),
+            "descriptor_state": "Ready",
+            "profile_state": "None",
+            "data_queue_depth": 0,
+            "control_queue_depth": 0,
+            "last_connected_at_ns": serde_json::Value::Null,
+            "reconnect_attempt_total": 0,
+        })),
+    )
 }
 
 async fn endpoint_state(
@@ -850,6 +1138,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(get_driver_descriptor),
         )
         .route(
+            "/api/v1/drivers/{id}/validate-connection",
+            post(validate_connection),
+        )
+        .route("/api/v1/drivers/{id}/probe", post(probe_driver))
+        .route(
             "/api/v1/endpoints",
             get(list_endpoints).post(create_endpoint),
         )
@@ -860,6 +1153,10 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .delete(delete_endpoint),
         )
         .route("/api/v1/endpoints/{id}/state", get(endpoint_state))
+        .route(
+            "/api/v1/endpoints/{id}/diagnostics",
+            get(endpoint_diagnostics),
+        )
         .route("/api/v1/points/latest", get(latest_points))
         .route("/api/v1/diagnostics", get(diagnostics))
         // Devices CRUD

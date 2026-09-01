@@ -1128,8 +1128,10 @@ dependencies = [
 name = "mesa-contract-tests"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "libc",
  "mesa-config-store",
+ "mesa-core-api",
  "mesa-core-types",
  "mesa-driver-focas2",
  "mesa-driver-manager",
@@ -1141,6 +1143,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.59.0",
@@ -1156,6 +1159,7 @@ dependencies = [
  "mesa-config-store",
  "mesa-core-types",
  "mesa-driver-manager",
+ "mesa-driver-protocol",
  "pem",
  "rcgen",
  "serde",
