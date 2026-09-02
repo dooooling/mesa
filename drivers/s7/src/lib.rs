@@ -290,12 +290,70 @@ impl DriverConnection for S7Connection {
                             sel.parameters.get("address").and_then(|v| v.as_str())
                         {
                             a.to_string()
+                        } else if let Some(area) =
+                            sel.parameters.get("area").and_then(|v| v.as_str())
+                        {
+                            // Descriptor 形态 area/db/offset/data_type/bit/length -> 合成标准 S7 地址
+                            let area_u = area.to_ascii_uppercase();
+                            let db: u16 = sel
+                                .parameters
+                                .get("db")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u16;
+                            let offset: u32 = sel
+                                .parameters
+                                .get("offset")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u32;
+                            let bit: Option<u8> = sel
+                                .parameters
+                                .get("bit")
+                                .and_then(|v| v.as_u64())
+                                .map(|b| b as u8);
+                            let dt = sel
+                                .parameters
+                                .get("data_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("REAL");
+                            // 根据 data_type 推断 DB 前缀，BOOL 必须带位
+                            let is_bool = dt.eq_ignore_ascii_case("BOOL");
+                            if area_u == "DB" {
+                                if is_bool {
+                                    let b = bit.unwrap_or(0);
+                                    format!("DB{db}.DBX{offset}.{b}")
+                                } else {
+                                    // 根据 data_type 选择 DBB/DBW/DBD，默认 DBW
+                                    let prefix = match dt.to_ascii_uppercase().as_str() {
+                                        "REAL" | "DINT" | "DWORD" | "DWord" => "DBD",
+                                        "INT" | "WORD" | "UINT" => "DBW",
+                                        "BYTE" | "CHAR" | "SINT" | "USINT" => "DBB",
+                                        "BOOL" => "DBX",
+                                        _ => "DBW",
+                                    };
+                                    // 已处理 BOOL 分支，此处非 BOOL
+                                    format!("DB{db}.{prefix}{offset}")
+                                }
+                            } else if ["M", "I", "Q"].contains(&area_u.as_str()) {
+                                if let Some(b) = bit {
+                                    format!("{area_u}{offset}.{b}")
+                                } else if is_bool {
+                                    format!("{area_u}{offset}.0")
+                                } else {
+                                    format!("{area_u}W{offset}")
+                                }
+                            } else {
+                                // 其他区域直接拼接
+                                if let Some(b) = bit {
+                                    format!("{area_u}{offset}.{b}")
+                                } else {
+                                    format!("{area_u}{offset}")
+                                }
+                            }
                         } else {
-                            // 从 area/db/offset/bit 组合（简化示例，仅支持通用 address）
                             return Err(SdkDriverError::configuration(
                                 "INVALID_BINDING_CONFIG",
                                 format!(
-                                    "point `{}` generic s7 requires parameters.address",
+                                    "point `{}` generic s7 requires parameters.address or area/db/offset",
                                     out.point_key
                                 ),
                             ));

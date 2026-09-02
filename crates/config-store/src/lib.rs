@@ -7,8 +7,8 @@
 //! 所有写操作包在事务内，保证"全量替换要么全成功，要么保持旧版"。
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 #[allow(unused_imports)]
 use mesa_core_types::{
@@ -78,6 +78,135 @@ pub enum StoreError {
     Validation(String),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+// ---------------------------------------------------------------------------
+// Secret Master Key & AEAD
+// ---------------------------------------------------------------------------
+
+/// 全局 master key 缓存（进程内单例，避免重复文件 IO）
+static MASTER_KEY_CACHE: OnceLock<[u8; 32]> = OnceLock::new();
+
+fn master_key_bytes() -> Result<[u8; 32], StoreError> {
+    if let Some(k) = MASTER_KEY_CACHE.get() {
+        return Ok(*k);
+    }
+    // 1) 环境变量覆盖（支持 base64 或 32 字节原始字符串，适配离线工控机）
+    if let Ok(env) = std::env::var("MESA_MASTER_KEY") {
+        let env = env.trim();
+        if !env.is_empty() {
+            // 尝试 base64 解码
+            if let Ok(decoded) =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, env)
+                && decoded.len() == 32
+            {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&decoded);
+                let _ = MASTER_KEY_CACHE.set(k);
+                return Ok(k);
+            }
+            // 回退：取 env 字节的哈希派生（测试便利，非生产推荐）
+            if env.len() >= 8 {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                env.hash(&mut h);
+                let hv = h.finish();
+                let mut k = [0u8; 32];
+                k[..8].copy_from_slice(&hv.to_le_bytes());
+                k[8..16].copy_from_slice(&hv.to_le_bytes());
+                k[16..24].copy_from_slice(&hv.to_le_bytes());
+                k[24..32].copy_from_slice(&hv.to_le_bytes());
+                let _ = MASTER_KEY_CACHE.set(k);
+                return Ok(k);
+            }
+        }
+    }
+    // 2) 文件 $DATA/master.key（与 DB 同目录，0600）
+    // 对于 open_in_memory 场景，使用固定测试 key（仅单测）
+    let key = load_or_create_master_key_file()?;
+    let _ = MASTER_KEY_CACHE.set(key);
+    Ok(key)
+}
+
+fn load_or_create_master_key_file() -> Result<[u8; 32], StoreError> {
+    // 尝试从常见位置解析：优先环境变量 MESA_DATA_DIR，其次当前目录
+    let candidates: Vec<PathBuf> = if let Ok(dir) = std::env::var("MESA_DATA_DIR") {
+        vec![PathBuf::from(dir).join("master.key")]
+    } else {
+        vec![
+            PathBuf::from("data/master.key"),
+            PathBuf::from("./master.key"),
+            std::env::temp_dir().join("mesa-master.key"),
+        ]
+    };
+    for p in &candidates {
+        if p.is_file() {
+            let raw = std::fs::read(p)
+                .map_err(|e| StoreError::Validation(format!("read master.key: {e}")))?;
+            // 支持 base64 或原始 32 字节
+            if raw.len() == 32 {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&raw);
+                return Ok(k);
+            }
+            if let Ok(s) = String::from_utf8(raw.clone())
+                && let Ok(decoded) =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s.trim())
+                && decoded.len() == 32
+            {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&decoded);
+                return Ok(k);
+            }
+        }
+    }
+    // 不存在则生成并写入第一个候选路径
+    let mut key = [0u8; 32];
+    getrandom::getrandom(&mut key).map_err(|e| StoreError::Validation(e.to_string()))?;
+    let target = &candidates[0];
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // 写入 0600（Unix）或默认（Windows）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::write(target, &key);
+        let _ = std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(target, key);
+    }
+    Ok(key)
+}
+
+fn aead_encrypt(plaintext: &[u8], key: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>), StoreError> {
+    use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    let mut nonce_bytes = [0u8; 24];
+    getrandom::getrandom(&mut nonce_bytes).map_err(|e| StoreError::Validation(e.to_string()))?;
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    let ct = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| StoreError::Validation(format!("encrypt: {e}")))?;
+    Ok((ct, nonce_bytes.to_vec()))
+}
+
+fn aead_decrypt(ciphertext: &[u8], nonce: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, StoreError> {
+    use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    if nonce.len() != 24 {
+        return Err(StoreError::Validation(format!(
+            "invalid nonce len {}",
+            nonce.len()
+        )));
+    }
+    let n = XNonce::from_slice(nonce);
+    cipher
+        .decrypt(n, ciphertext)
+        .map_err(|e| StoreError::Validation(format!("decrypt: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -750,7 +879,7 @@ impl ConfigStore {
     }
 
     // ---- Secrets (§6.5) ----
-    /// 存储密文字段（AEAD 占位：XOR + 随机 nonce，生产替换为 XChaCha20-Poly1305）。
+    /// 存储密文字段（XChaCha20-Poly1305 + 24B nonce + master key 0600）
     pub fn put_secret(
         &self,
         endpoint_id: &str,
@@ -758,21 +887,18 @@ impl ConfigStore {
         plaintext: &str,
         key_id: &str,
     ) -> Result<(), StoreError> {
-        let mut nonce = [0u8; 12];
-        getrandom::getrandom(&mut nonce).map_err(|e| StoreError::Validation(e.to_string()))?;
-        // 占位加密：XOR with 0xAA + key_id 派生（非安全，仅保证密文≠明文）
-        let key_byte = key_id.bytes().fold(0xAAu8, |a, b| a ^ b);
-        let ciphertext: Vec<u8> = plaintext.as_bytes().iter().map(|b| b ^ key_byte).collect();
+        let key = master_key_bytes()?;
+        let (ciphertext, nonce) = aead_encrypt(plaintext.as_bytes(), &key)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO endpoint_secrets(endpoint_id,field_path,ciphertext,nonce,algorithm,key_id,updated_at_ns)
-             VALUES(?1,?2,?3,?4,'xor-demo',?5,?6)
+             VALUES(?1,?2,?3,?4,'xchacha20poly1305',?5,?6)
              ON CONFLICT(endpoint_id,field_path) DO UPDATE SET ciphertext=excluded.ciphertext, nonce=excluded.nonce, algorithm=excluded.algorithm, key_id=excluded.key_id, updated_at_ns=excluded.updated_at_ns",
             params![
                 endpoint_id,
                 field_path,
                 ciphertext,
-                nonce.to_vec(),
+                nonce,
                 key_id,
                 Self::now_ns()
             ],
@@ -793,9 +919,15 @@ impl ConfigStore {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        if let Some((ct, _nonce, _alg, key_id)) = row {
-            let key_byte = key_id.bytes().fold(0xAAu8, |a, b| a ^ b);
-            let pt: Vec<u8> = ct.iter().map(|b| b ^ key_byte).collect();
+        if let Some((ct, nonce, alg, key_id)) = row {
+            // 兼容旧 xor-demo 数据（迁移期）
+            if alg == "xor-demo" {
+                let key_byte = key_id.bytes().fold(0xAAu8, |a, b| a ^ b);
+                let pt: Vec<u8> = ct.iter().map(|b| b ^ key_byte).collect();
+                return Ok(Some(String::from_utf8_lossy(&pt).into_owned()));
+            }
+            let key = master_key_bytes()?;
+            let pt = aead_decrypt(&ct, &nonce, &key)?;
             Ok(Some(String::from_utf8_lossy(&pt).into_owned()))
         } else {
             Ok(None)
