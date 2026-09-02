@@ -1093,7 +1093,15 @@ async fn list_endpoints(State(state): State<Arc<AppState>>) -> Json<serde_json::
                 if let Ok(fields) = state.store.list_secret_fields(&rec.id) {
                     if !fields.is_empty() {
                         conn = redact_connection_for_response(conn, &rec.id, &state.store, &fields);
+                    } else if conn
+                        .as_object()
+                        .map(|m| m.values().any(|v| v.is_string()))
+                        .unwrap_or(false)
+                    {
+                        conn = serde_json::Value::Null;
                     }
+                } else {
+                    conn = serde_json::Value::Null;
                 }
             }
         }
@@ -1284,9 +1292,12 @@ async fn get_endpoint(
                             .map(|m| m.values().any(|v| v.is_string()))
                             .unwrap_or(false)
                         {
-                            // 无 Secret 记录但连接中仍有字符串值（如历史遗留），保守脱敏：不直接返回明文
-                            // 保持原样但前端应视 connection 为不可用，实际生产可返回 null
+                            // 历史遗留且无 Secret 记录、Descriptor 又不可用时不返回原始 connection，避免明文泄露
+                            conn = serde_json::Value::Null;
                         }
+                    } else {
+                        // 无法查询 Secret 列表时同样不返回原始 connection
+                        conn = serde_json::Value::Null;
                     }
                 }
             }
@@ -1410,6 +1421,7 @@ async fn update_endpoint(
             Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
         );
     };
+    let old_driver_id = rec.driver_id.clone();
     rec.device_id = body.device_id.clone();
     rec.driver_id = body.driver_id.clone();
     // Secret 集成（P0）：fail-closed + 单事务
@@ -1427,6 +1439,18 @@ async fn update_endpoint(
                                 secrets_to_upsert.push((sk.clone(), s.to_string()));
                                 obj.insert(sk.clone(), serde_json::json!({"secret_set": true}));
                             } else if is_secret_marker(&v) {
+                                // Driver 切换时同名 Secret 禁止复用（需重新明文）
+                                if old_driver_id != body.driver_id {
+                                    return (
+                                        StatusCode::BAD_REQUEST,
+                                        Json(json_error(
+                                            "SECRET_VALUE_REQUIRED",
+                                            &format!(
+                                                "field `{sk}` driver 已切换，需重新提供明文而非 marker"
+                                            ),
+                                        )),
+                                    );
+                                }
                                 // marker 需校验旧 Secret 是否存在
                                 match state.store.get_secret(&id, sk) {
                                     Ok(Some(_)) => {}
