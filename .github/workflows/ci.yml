@@ -1,7 +1,7 @@
 # CI：单编译、锁版、多平台（Windows/Linux × x86/ARM 原生 test）
 # - 锁版：rust 1.95.0（本地 rustc 1.95.0，见 rust-toolchain.toml）、node 22.18.0、pnpm 10.28.0，actions pin 防漂移
 # - 单编译：fmt→clippy→test 复用同一 target（rust-cache），不分包多次编译
-# - 多平台：Windows/Linux × x86_64/aarch64 四组合均原生 test（ARM 用原生 Runner，无 QEMU）
+# - 多平台：Windows/Linux × x86_64/aarch64 四组合均原生 test（无 --target 交叉，无 QEMU）
 # - 严格：fmt --check、clippy -D warnings、test --workspace --all-features、web build
 name: CI
 on:
@@ -11,19 +11,14 @@ on:
 
 jobs:
   check:
-    # 矩阵：四组合均原生 test（ARM 不再仅 check）
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
           - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4.1.1
@@ -42,19 +37,17 @@ jobs:
         with:
           toolchain: '1.95.0'
           components: rustfmt, clippy
-          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ${{ matrix.os }}-${{ matrix.target }}-1.95.0
+          shared-key: ${{ matrix.os }}-1.95.0
 
       - name: fmt
         run: cargo fmt --check
 
       - name: clippy
-        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # 四组合均原生 test（ARM 原生 Runner，无 QEMU）
       - name: test
         run: cargo test --workspace --all-features
 
