@@ -44,7 +44,7 @@ async fn orphan_guard_wrong_token_rejected() {
     let mut p = mesa_driver_manager::process::DriverProcess::spawn(&sim_discovered())
         .await
         .expect("spawn");
-    let res = Session::connect(p.port, "definitely-wrong").await;
+    let res = Session::connect_retry(p.port, "definitely-wrong").await;
     match res {
         Ok(_) => panic!("wrong token must be rejected"),
         Err(e) => assert_handshake_error(e),
