@@ -274,6 +274,9 @@ async fn start_stop_idempotent_without_leaks() {
 
     // 停止：Ack 成功且数据静默
     assert!(stop_connection(&session, H).await, "stop must ack ok");
+    // StopAck 为数据面 barrier，但 TCP 单 reader 保证 wire-before-StopAck 的 batch
+    // 必然在 StopAck 唤醒前已进入 events_rx，需排空 barrier 之前的 backlog 再判定静默
+    drain_pre_barrier_events(&mut events);
     assert_no_batches_for(&mut events, 300).await;
 
     // 未运行时再次 Stop 幂等成功
@@ -412,6 +415,7 @@ async fn runtime_reconfigure_swaps_epoch_and_points() {
 
     // Stop -> Configure(新点集) -> Apply -> Start(new epoch)
     assert!(stop_connection(&session, H).await);
+    drain_pre_barrier_events(&mut events);
     let new_tasks = vec![poll_task(
         "t2",
         40,
@@ -435,6 +439,30 @@ async fn runtime_reconfigure_swaps_epoch_and_points() {
     );
 
     teardown(&mut session, Some(cancel));
+}
+
+/// 排空 StopAck 之前已进入 events_rx 的 backlog（wire-before-StopAck）。
+/// 成功 StopConnectionAck 是该 Connection 当前 Stream Epoch 的数据面 barrier：
+/// 允许 DataBatch → StopAck，禁止 StopAck → 旧 DataBatch；但 TCP 单 reader 保证
+/// StopAck 唤醒前 wire-before-StopAck 的 batch 已在队列中，需先 try_recv 排空再判定静默。
+pub fn drain_pre_barrier_events(
+    events: &mut tokio::sync::mpsc::Receiver<mesa_driver_manager::session::SessionEvent>,
+) {
+    while let Ok(ev) = events.try_recv() {
+        match ev {
+            mesa_driver_manager::session::SessionEvent::Batch(_) => {
+                // barrier 之前的 backlog，允许丢弃
+            }
+            mesa_driver_manager::session::SessionEvent::State { .. } => {
+                // lifecycle state 可消费
+            }
+            mesa_driver_manager::session::SessionEvent::DriverError {
+                code, message, ..
+            } => {
+                panic!("unexpected driver error: {code}: {message}");
+            }
+        }
+    }
 }
 
 /// 断言窗口期内没有任何批次到达。
