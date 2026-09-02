@@ -81,7 +81,7 @@ impl Driver for FocasDriver {
                         .default_value(serde_json::json!(3000)),
                     FieldDescriptor::new("use_native", "Use Native FOCAS", FieldType::Boolean)
                         .required(false)
-                        .default_value(serde_json::json!(false)),
+                        .default_value(serde_json::json!(true)),
                 ],
             },
             resources: vec![

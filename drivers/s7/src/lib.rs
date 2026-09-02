@@ -369,7 +369,13 @@ impl DriverConnection for S7Connection {
                                 } else if is_bool {
                                     format!("{area_u}{offset}.0")
                                 } else {
-                                    format!("{area_u}W{offset}")
+                                    let prefix = match dt.to_ascii_uppercase().as_str() {
+                                        "REAL" | "DINT" | "DWORD" | "DWord" => "D",
+                                        "INT" | "WORD" | "UINT" => "W",
+                                        "BYTE" | "CHAR" | "SINT" | "USINT" => "B",
+                                        _ => "W",
+                                    };
+                                    format!("{area_u}{prefix}{offset}")
                                 }
                             } else {
                                 // 其他区域直接拼接

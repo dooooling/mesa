@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -212,6 +212,106 @@ fn validate_connection_against_schema(
     issues
 }
 
+// ---------------------------------------------------------------------------
+// Secret 集成：Descriptor 驱动的 Secret 处理（P0-1）
+// ---------------------------------------------------------------------------
+
+/// 获取 schema 中 Secret 类型字段的 key 集合
+fn secret_field_keys(schema: &mesa_core_types::SchemaDescriptor) -> Vec<String> {
+    schema
+        .fields
+        .iter()
+        .filter(|f| f.field_type == mesa_core_types::FieldType::Secret)
+        .map(|f| f.key.clone())
+        .collect()
+}
+
+/// 判断是否为已持久化的 Secret 标记 {"secret_set": true}
+fn is_secret_marker(v: &serde_json::Value) -> bool {
+    v.is_object()
+        && v.as_object()
+            .map(|m| m.get("secret_set") == Some(&serde_json::Value::Bool(true)))
+            .unwrap_or(false)
+}
+
+/// 创建/更新时：将明文密码写入 SecretStore，并将 connection 中的明文替换为 marker
+fn process_connection_for_store(
+    conn: &mut serde_json::Value,
+    endpoint_id: &str,
+    store: &ConfigStore,
+    secret_keys: &[String],
+) -> Result<(), StoreError> {
+    let Some(obj) = conn.as_object_mut() else {
+        return Ok(());
+    };
+    for key in secret_keys {
+        if let Some(val) = obj.get(key).cloned() {
+            if val.is_string() {
+                let plaintext = val.as_str().unwrap();
+                // 写入 SecretStore（key_id 固定为 master，算法由 Store 决定）
+                store.put_secret(endpoint_id, key, plaintext, "master")?;
+                // 替换为 marker，避免落盘明文
+                obj.insert(key.clone(), serde_json::json!({"secret_set": true}));
+            } else if is_secret_marker(&val) {
+                // 客户端传 marker 表示不更新，保持原 Secret 不动
+                // 已在 DB 中的 secret 保持不变，无需操作
+            } else {
+                // 其他类型（理论上已在 validate 阶段拦截）
+            }
+        } else {
+            // 字段缺失：若 DB 中已有 secret 且本次未传，视为删除
+            // 调用方需显式处理删除，这里不自动删，避免误删
+        }
+    }
+    Ok(())
+}
+
+/// 对存储的 connection_json 做脱敏：若为 Secret 字段且为字符串明文，则替换为 marker
+fn redact_connection_for_response(
+    mut conn: serde_json::Value,
+    endpoint_id: &str,
+    store: &ConfigStore,
+    secret_keys: &[String],
+) -> serde_json::Value {
+    let Some(obj) = conn.as_object_mut() else {
+        return conn;
+    };
+    for key in secret_keys {
+        // 若 SecretStore 中有对应 secret，则无论存储的是明文还是 marker，都返回 marker
+        if store.get_secret(endpoint_id, key).ok().flatten().is_some() {
+            obj.insert(key.clone(), serde_json::json!({"secret_set": true}));
+        } else if let Some(v) = obj.get(key) {
+            // 无 secret 但值为字符串（历史明文残留），也脱敏
+            if v.is_string() {
+                obj.insert(key.clone(), serde_json::json!({"secret_set": true}));
+            }
+        }
+    }
+    conn
+}
+
+/// 启动/探测时：将 marker 临时还原为明文（仅内存，不写盘）
+fn materialize_connection(
+    conn_str: &str,
+    endpoint_id: &str,
+    store: &ConfigStore,
+    secret_keys: &[String],
+) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(conn_str).unwrap_or(serde_json::json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        for key in secret_keys {
+            if let Some(cur) = obj.get(key) {
+                if is_secret_marker(cur) {
+                    if let Ok(Some(pt)) = store.get_secret(endpoint_id, key) {
+                        obj.insert(key.clone(), serde_json::Value::String(pt));
+                    }
+                }
+            }
+        }
+    }
+    serde_json::to_string(&v).unwrap_or_else(|_| conn_str.to_string())
+}
+
 fn store_err_to_response(e: StoreError) -> (StatusCode, Json<serde_json::Value>) {
     match e {
         StoreError::Duplicate(msg) => (StatusCode::CONFLICT, Json(json_error("CONFLICT", &msg))),
@@ -378,9 +478,9 @@ async fn probe_driver(
         );
     }
     let conn_str = serde_json::to_string(&conn_val).unwrap();
-    // 临时进程探测（5s 超时）
+    // 临时进程探测：需覆盖 DRIVER_STARTUP_TIMEOUT(6s) + handshake + OpenConnection
     let probe_res =
-        tokio::time::timeout(Duration::from_secs(6), async {
+        tokio::time::timeout(mesa_driver_manager::session::PROBE_TIMEOUT, async {
             let mut proc = match mesa_driver_manager::process::DriverProcess::spawn(&disc).await {
                 Ok(p) => p,
                 Err(e) => return Err(format!("spawn failed: {e}")),
@@ -1105,8 +1205,16 @@ async fn get_endpoint(
     match state.store.get_endpoint(&id) {
         Ok(Some(rec)) => {
             let runtime = state.snapshot.endpoint(&id);
-            let conn: serde_json::Value =
+            let mut conn: serde_json::Value =
                 serde_json::from_str(&rec.connection_json).unwrap_or(serde_json::json!({}));
+            // 脱敏：若为 Secret 字段则返回 marker 而非明文
+            if let Ok(desc) = state.manager.get_descriptor(&rec.driver_id).await {
+                let secret_keys = secret_field_keys(&desc.connection);
+                if !secret_keys.is_empty() {
+                    conn =
+                        redact_connection_for_response(conn, &rec.id, &state.store, &secret_keys);
+                }
+            }
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -1137,11 +1245,23 @@ async fn create_endpoint(
             )),
         );
     }
+    // Secret 集成：若 Descriptor 声明 Secret 字段，则将明文写入 SecretStore，connection 仅存 marker
+    let mut conn_val = body.connection.clone();
+    if let Ok(desc) = state.manager.get_descriptor(&body.driver_id).await {
+        let secret_keys = secret_field_keys(&desc.connection);
+        if !secret_keys.is_empty() {
+            if let Err(e) =
+                process_connection_for_store(&mut conn_val, &body.id, &state.store, &secret_keys)
+            {
+                return store_err_to_response(e);
+            }
+        }
+    }
     let rec = EndpointRecord {
         id: body.id.clone(),
         device_id: body.device_id,
         driver_id: body.driver_id,
-        connection_json: serde_json::to_string(&body.connection).unwrap(),
+        connection_json: serde_json::to_string(&conn_val).unwrap(),
         desired_running: false,
         updated_at_ns: mesa_core_types::now_unix_ns(),
     };
@@ -1187,9 +1307,31 @@ async fn update_endpoint(
             Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
         );
     };
-    rec.device_id = body.device_id;
-    rec.driver_id = body.driver_id;
-    rec.connection_json = serde_json::to_string(&body.connection).unwrap();
+    rec.device_id = body.device_id.clone();
+    rec.driver_id = body.driver_id.clone();
+    // Secret 集成：处理 Secret 字段的增删改
+    let mut conn_val = body.connection.clone();
+    if let Ok(desc) = state.manager.get_descriptor(&body.driver_id).await {
+        let secret_keys = secret_field_keys(&desc.connection);
+        if !secret_keys.is_empty() {
+            if let Err(e) =
+                process_connection_for_store(&mut conn_val, &id, &state.store, &secret_keys)
+            {
+                return store_err_to_response(e);
+            }
+            // 若本次请求未包含某 Secret 字段，则视为删除该 secret（显式移除）
+            for sk in &secret_keys {
+                if !conn_val
+                    .as_object()
+                    .map(|m| m.contains_key(sk))
+                    .unwrap_or(false)
+                {
+                    let _ = state.store.delete_secret(&id, sk);
+                }
+            }
+        }
+    }
+    rec.connection_json = serde_json::to_string(&conn_val).unwrap();
     rec.updated_at_ns = mesa_core_types::now_unix_ns();
     match state.store.update_endpoint(&rec) {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "updated": id }))),
@@ -1215,7 +1357,11 @@ async fn delete_endpoint(
         );
     }
     match state.store.delete_endpoint(&id) {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "deleted": id }))),
+        Ok(true) => {
+            // 清理 Snapshot 中的残留状态（latest/status）
+            state.snapshot.remove_endpoint(&id);
+            (StatusCode::OK, Json(serde_json::json!({ "deleted": id })))
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
@@ -1249,10 +1395,19 @@ async fn start_endpoint(
         Ok(v) => v,
         Err(e) => return store_err_to_response(e),
     };
+    // Secret 集成：启动时临时还原明文（仅内存）
+    let mut materialized_json = rec.connection_json.clone();
+    if let Ok(desc) = state.manager.get_descriptor(&rec.driver_id).await {
+        let secret_keys = secret_field_keys(&desc.connection);
+        if !secret_keys.is_empty() {
+            materialized_json =
+                materialize_connection(&rec.connection_json, &rec.id, &state.store, &secret_keys);
+        }
+    }
     let cfg = mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: rec.id.clone(),
         driver_id: rec.driver_id.clone(),
-        connection_json: rec.connection_json.clone(),
+        connection_json: materialized_json,
         tasks,
     };
     match state.manager.start_endpoint(cfg) {

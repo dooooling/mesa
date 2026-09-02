@@ -1119,6 +1119,13 @@ async fn on_stop(session: &Session, req: pb::StopConnection, msg_id: u64) {
         .lock()
         .unwrap()
         .remove(&req.connection_handle);
+    // 清理 per-connection pending 合并缓冲，避免长生命周期泄漏
+    session
+        .sink
+        .pending_registry
+        .lock()
+        .unwrap()
+        .remove(&req.connection_handle);
     session
         .sink
         .send_control(pb::Envelope {
@@ -1142,6 +1149,12 @@ async fn on_close(session: &Session, req: pb::CloseConnection, msg_id: u64) {
         .remove(&req.connection_handle);
     session
         .entries
+        .lock()
+        .unwrap()
+        .remove(&req.connection_handle);
+    session
+        .sink
+        .pending_registry
         .lock()
         .unwrap()
         .remove(&req.connection_handle);

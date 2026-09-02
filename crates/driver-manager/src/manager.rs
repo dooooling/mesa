@@ -144,7 +144,13 @@ impl MesaManager {
     }
 
     pub fn running_ids(&self) -> Vec<String> {
-        self.running.lock().unwrap().keys().cloned().collect()
+        self.running
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, entry)| !entry.handle.is_finished())
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 
     /// 启动一个 Endpoint。已在运行则返回错误。

@@ -119,7 +119,7 @@ impl Driver for OpcUaDriver {
                         .default_value(serde_json::json!(5000)),
                     FieldDescriptor::new("use_native", "Use Native Client", FieldType::Boolean)
                         .required(false)
-                        .default_value(serde_json::json!(false)),
+                        .default_value(serde_json::json!(true)),
                 ],
             },
             resources: vec![ResourceDescriptor {
@@ -351,6 +351,16 @@ impl OpcUaConnConfig {
             .get("password")
             .and_then(|x| x.as_str())
             .map(|s| s.to_string());
+        // 部分凭据必须拒绝而非静默 Anonymous
+        match (&username, &password) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(SdkDriverError::configuration(
+                    "BAD_CONFIG",
+                    "username 与 password 需同时提供或同时为空；仅提供其一视为配置错误",
+                ));
+            }
+            _ => {}
+        }
         let certificate = v
             .get("certificate")
             .and_then(|x| x.as_str())

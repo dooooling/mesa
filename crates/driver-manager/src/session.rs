@@ -117,15 +117,22 @@ pub struct Session {
     reader_cancel: CancellationToken,
 }
 
+/// 驱动启动窗口：从 spawn 到 listen 的容忍期（§14，Probe 外层需更大 budget）
+pub const DRIVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(6);
+/// Probe 整体超时需覆盖 startup + handshake + OpenConnection
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
+
 impl Session {
     /// 带重试的连接：子进程从 bind 到 listen 存在窗口期，连接拒绝属预期时序，
-    /// 自动退避重试；其他错误立即失败。总窗口约 3s。
+    /// 自动退避重试；其他错误立即失败。基于 deadline 而非固定次数，避免与外层超时打架。
     pub async fn connect_retry(
         port: u16,
         expected_token: &str,
     ) -> Result<(Self, mpsc::Receiver<SessionEvent>, Arc<AtomicBool>), SessionError> {
+        let deadline = tokio::time::Instant::now() + DRIVER_STARTUP_TIMEOUT;
+        #[allow(unused_assignments)]
         let mut last: Option<SessionError> = None;
-        for _ in 0..120 {
+        loop {
             match Self::connect(port, expected_token).await {
                 Ok(v) => return Ok(v),
                 Err(SessionError::Io(e))
@@ -137,9 +144,15 @@ impl Session {
                     ) =>
                 {
                     last = Some(SessionError::Io(e));
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 Err(e) => return Err(e),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
             }
         }
         Err(last.unwrap_or(SessionError::Timeout))

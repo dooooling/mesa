@@ -105,21 +105,10 @@ fn master_key_bytes() -> Result<[u8; 32], StoreError> {
                 let _ = MASTER_KEY_CACHE.set(k);
                 return Ok(k);
             }
-            // 回退：取 env 字节的哈希派生（测试便利，非生产推荐）
-            if env.len() >= 8 {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut h = DefaultHasher::new();
-                env.hash(&mut h);
-                let hv = h.finish();
-                let mut k = [0u8; 32];
-                k[..8].copy_from_slice(&hv.to_le_bytes());
-                k[8..16].copy_from_slice(&hv.to_le_bytes());
-                k[16..24].copy_from_slice(&hv.to_le_bytes());
-                k[24..32].copy_from_slice(&hv.to_le_bytes());
-                let _ = MASTER_KEY_CACHE.set(k);
-                return Ok(k);
-            }
+            // 生产级：仅接受 base64 32 字节，其余一律拒绝（禁止弱回退）
+            return Err(StoreError::Validation(
+                "MESA_MASTER_KEY 无效：需为 base64 编码的 32 字节随机密钥".into(),
+            ));
         }
     }
     // 2) 文件 $DATA/master.key（与 DB 同目录，0600）
@@ -166,18 +155,33 @@ fn load_or_create_master_key_file() -> Result<[u8; 32], StoreError> {
     getrandom::getrandom(&mut key).map_err(|e| StoreError::Validation(e.to_string()))?;
     let target = &candidates[0];
     if let Some(parent) = target.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .map_err(|e| StoreError::Validation(format!("create master.key dir: {e}")))?;
     }
-    // 写入 0600（Unix）或默认（Windows）
-    #[cfg(unix)]
+    // fail-closed：临时文件 + fsync + 0600 + 原子重命名，避免“加密成功但密钥未落盘”导致重启后永久无法解密
+    let tmp = target.with_extension("tmp");
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::write(target, key);
-        let _ = std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| StoreError::Validation(format!("create master.key tmp: {e}")))?;
+        f.write_all(&key)
+            .map_err(|e| StoreError::Validation(format!("write master.key tmp: {e}")))?;
+        f.sync_all()
+            .map_err(|e| StoreError::Validation(format!("fsync master.key tmp: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| StoreError::Validation(format!("chmod master.key tmp: {e}")))?;
+        }
     }
-    #[cfg(not(unix))]
+    std::fs::rename(&tmp, target)
+        .map_err(|e| StoreError::Validation(format!("rename master.key: {e}")))?;
+    // 确保父目录落盘（尽力）
+    if let Some(parent) = target.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
     {
-        let _ = std::fs::write(target, key);
+        let _ = dir.sync_all();
     }
     Ok(key)
 }

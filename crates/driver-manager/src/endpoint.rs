@@ -256,8 +256,11 @@ pub async fn run_endpoint(
                 );
                 return;
             }
-            AttemptOutcome::Lost(reason) => {
-                tracing::warn!(endpoint = %cfg.endpoint_id, %reason, "connection lost");
+            AttemptOutcome::Lost {
+                reason,
+                had_running_session,
+            } => {
+                tracing::warn!(endpoint = %cfg.endpoint_id, %reason, had_running_session, "connection lost");
                 snapshot.mark_communication_lost(&cfg.endpoint_id);
                 set_status(
                     &snapshot,
@@ -268,13 +271,14 @@ pub async fn run_endpoint(
                     last_epoch,
                     source.revision(&cfg.endpoint_id),
                 );
+                // 仅当本次 attempt 曾进入 Running（即 had_running_session）才归零，否则指数退避
+                if had_running_session {
+                    backoff_idx = 0;
+                }
             }
         }
 
-        // 成功运行后重连归零，否则指数退避
-        if last_epoch != 0 {
-            backoff_idx = 0;
-        }
+        // 未曾 Running 的连续失败则指数退避
         let delay = Duration::from_secs(reconnect_backoff_secs(backoff_idx));
         if backoff_idx < 10 {
             backoff_idx += 1;
@@ -293,7 +297,10 @@ pub async fn run_endpoint(
 enum AttemptOutcome {
     Shutdown,
     ConfigurationFailed(String),
-    Lost(String),
+    Lost {
+        reason: String,
+        had_running_session: bool,
+    },
 }
 
 fn set_status(
@@ -337,7 +344,12 @@ async fn attempt_session(
 ) -> AttemptOutcome {
     let mut process = match DriverProcess::spawn(disc).await {
         Ok(p) => p,
-        Err(e) => return AttemptOutcome::Lost(format!("spawn failed: {e}")),
+        Err(e) => {
+            return AttemptOutcome::Lost {
+                reason: format!("spawn failed: {e}"),
+                had_running_session: false,
+            };
+        }
     };
 
     let (session, mut events, unresponsive_flag) =
@@ -345,7 +357,10 @@ async fn attempt_session(
             Ok((s, ev, flag)) => (s, ev, flag),
             Err(e) => {
                 process.terminate().await;
-                return AttemptOutcome::Lost(format!("connect failed: {e}"));
+                return AttemptOutcome::Lost {
+                    reason: format!("connect failed: {e}"),
+                    had_running_session: false,
+                };
             }
         };
     // 注册活跃会话供 Control 面可靠转发（§22），Control 与 Data 共用同一 TCP 但分队列
@@ -438,7 +453,10 @@ async fn run_config_flow(
             config_json: cfg.connection_json.clone(),
         }))
         .await
-        .map_err(|e| AttemptOutcome::Lost(format!("open rpc: {e}")))?;
+        .map_err(|e| AttemptOutcome::Lost {
+            reason: format!("open rpc: {e}"),
+            had_running_session: false,
+        })?;
     let result = expect_ack(reply.body).ok_or_else(|| lost("OpenConnection"))?;
     config_gate(result, "OpenConnection")?;
 
@@ -452,7 +470,10 @@ async fn run_config_flow(
             tasks: tasks_pb,
         }))
         .await
-        .map_err(|e| AttemptOutcome::Lost(format!("configure rpc: {e}")))?;
+        .map_err(|e| AttemptOutcome::Lost {
+            reason: format!("configure rpc: {e}"),
+            had_running_session: false,
+        })?;
     let descriptors_pb = match reply.body {
         Some(Body::PointDescriptors(rep)) => rep.descriptors,
         Some(Body::DriverError(err)) => {
@@ -502,7 +523,10 @@ async fn run_config_flow(
             key_to_point_id: map,
         }))
         .await
-        .map_err(|e| AttemptOutcome::Lost(format!("apply rpc: {e}")))?;
+        .map_err(|e| AttemptOutcome::Lost {
+            reason: format!("apply rpc: {e}"),
+            had_running_session: false,
+        })?;
     let result = expect_ack(reply.body).ok_or_else(|| lost("ApplyPointMap"))?;
     config_gate(result, "ApplyPointMap")?;
 
@@ -514,7 +538,10 @@ async fn run_config_flow(
             stream_epoch: epoch,
         }))
         .await
-        .map_err(|e| AttemptOutcome::Lost(format!("start rpc: {e}")))?;
+        .map_err(|e| AttemptOutcome::Lost {
+            reason: format!("start rpc: {e}"),
+            had_running_session: false,
+        })?;
     let result = expect_ack(reply.body).ok_or_else(|| lost("StartConnection"))?;
     config_gate(result, "StartConnection")?;
     *last_epoch = epoch;
@@ -543,7 +570,10 @@ async fn event_loop(
                 Some(SessionEvent::State { state, detail, .. }) => {
                     tracing::debug!(endpoint=%cfg.endpoint_id, ?state, %detail, "state");
                     if matches!(state, ConnectionState::Stopped | ConnectionState::Failed) {
-                        return AttemptOutcome::Lost(format!("driver reported {state:?} {detail}"));
+                        return AttemptOutcome::Lost {
+                            reason: format!("driver reported {state:?} {detail}"),
+                            had_running_session: true,
+                        };
                     }
                 }
                 Some(SessionEvent::DriverError { kind, code, message, .. }) => {
@@ -552,11 +582,19 @@ async fn event_loop(
                         return AttemptOutcome::ConfigurationFailed(format!("{kind}/{code}: {message}"));
                     }
                 }
-                None => return AttemptOutcome::Lost("event channel closed".into()),
+                None => {
+                    return AttemptOutcome::Lost {
+                        reason: "event channel closed".into(),
+                        had_running_session: true,
+                    }
+                }
             },
             _ = watchdog.tick() => {
                 if unresponsive_flag.load(Ordering::Relaxed) {
-                    return AttemptOutcome::Lost("heartbeat dead".into());
+                    return AttemptOutcome::Lost {
+                        reason: "heartbeat dead".into(),
+                        had_running_session: true,
+                    };
                 }
             }
             _ = shutdown.cancelled() => return AttemptOutcome::Shutdown,
@@ -616,12 +654,18 @@ fn config_fail(kind: String, code: String, message: String) -> AttemptOutcome {
     if kind == "ConfigurationError" {
         AttemptOutcome::ConfigurationFailed(format!("{kind}/{code}: {message}"))
     } else {
-        AttemptOutcome::Lost(format!("{kind}/{code}: {message}"))
+        AttemptOutcome::Lost {
+            reason: format!("{kind}/{code}: {message}"),
+            had_running_session: false,
+        }
     }
 }
 
 fn lost(reason: impl Into<String>) -> AttemptOutcome {
-    AttemptOutcome::Lost(reason.into())
+    AttemptOutcome::Lost {
+        reason: reason.into(),
+        had_running_session: false,
+    }
 }
 
 static EPOCH_COUNTER: AtomicU64 = AtomicU64::new(0);
