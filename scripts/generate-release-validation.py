@@ -29,13 +29,9 @@ def is_clean_tree():
         return False
 
 def sha_matches(evidence_sha, head_full):
+    # 正式 Release 要求 40 位完整 SHA 精确相等
     if not evidence_sha or not head_full or head_full == "unknown":
         return False
-    # 证据可能是 40 或 7 位，均做前缀兼容
-    if len(evidence_sha) == 40 and len(head_full) == 40:
-        return evidence_sha == head_full
-    if len(evidence_sha) >= 7 and len(head_full) >= 7:
-        return head_full.startswith(evidence_sha) or evidence_sha.startswith(head_full)
     return evidence_sha == head_full
 
 def main():
@@ -84,6 +80,12 @@ def main():
     # 保留原始 wrapper 以便 strict 校验 git_sha
     real_dev_for_doc = rd_list if rd_list is not None else []
 
+    # build_profile 以 performance.json 的真实值（cfg debug_assertions）为准，避免聚合器猜测
+    env_build = "debug"
+    if isinstance(perf_raw, dict) and isinstance(perf_raw.get("build_profile"), str):
+        env_build = perf_raw.get("build_profile")
+    elif isinstance(soak_raw, dict) and isinstance(soak_raw.get("build_profile"), str):
+        env_build = soak_raw.get("build_profile")
     # contract/performance/soak 保留原始对象以便校验 git_sha
     doc = {
         "schema_version": "1.0.0",
@@ -97,7 +99,7 @@ def main():
             "cores": __import__("os").cpu_count() or 1,
             "ram": "unknown",
             "rust_version": rust_ver,
-            "build_profile": "release" if "--release" in sys.argv else "debug"
+            "build_profile": env_build
         },
         "contract_tests": contract if contract else {"passed": 0, "failed": 0, "total": 0, "suites": []},
         "performance": perf_raw if perf_raw else {"throughput_updates_per_sec": 0, "ipc_p95_ms": 0, "ipc_p99_ms": 0, "configure_1k_ms": 0, "configure_10k_ms": 0, "configure_50k_ms": 0, "rss_delta_mib": 0},
@@ -133,6 +135,11 @@ def main():
             suites = ct.get("suites", [])
             if not isinstance(suites, list) or not suites or not all(isinstance(s, str) for s in suites):
                 print(f"strict: contract_tests.suites 需为 string[] 当前 {suites}", file=sys.stderr); sys.exit(1)
+            required_suites = {"smoke","protocol_negotiation","session_lifecycle","data_plane","fault_tolerance","subprocess_recovery","discovery_contract","descriptor_contract","data_semantics","control_contract","management_api","profile_contract","resource_contract","subprocess_orphan_guard"}
+            if set(suites) != required_suites:
+                print(f"strict: contract_tests.suites 需为完整 14 suites {sorted(required_suites)} 当前 {sorted(suites)}", file=sys.stderr); sys.exit(1)
+            if ct.get("total") != len(suites) or ct.get("total") != 14 or ct.get("passed") != 14:
+                print(f"strict: contract_tests total/passed 需 ==14 当前 {ct}", file=sys.stderr); sys.exit(1)
             # --- Evidence 与 commit 绑定（40位全量，兼容短 7 位）---
             def check_sha(name, obj):
                 if not isinstance(obj, dict):
@@ -148,7 +155,7 @@ def main():
             check_sha("contract_tests", ct)
             # performance 必须绑定且为 soak 且 duration >=3600 且 release build
             check_sha("performance", perf)
-            if perf.get("build_profile") and perf.get("build_profile") != "release":
+            if perf.get("build_profile") != "release":
                 print(f"strict: performance.build_profile 需为 release 当前 {perf.get('build_profile')}", file=sys.stderr); sys.exit(1)
             mode = perf.get("mode")
             if mode != "soak":
@@ -156,8 +163,10 @@ def main():
             dur = perf.get("duration_seconds", 0)
             if not isinstance(dur, (int, float)) or dur < 3600:
                 print(f"strict: performance.duration_seconds {dur} <3600（需 1h soak）", file=sys.stderr); sys.exit(1)
-            # soak 必须绑定且 duration >=1h
+            # soak 必须绑定且 duration >=1h 且 release build
             check_sha("soak", soak_d)
+            if soak_d.get("build_profile") != "release":
+                print(f"strict: soak.build_profile 需为 release 当前 {soak_d.get('build_profile')}", file=sys.stderr); sys.exit(1)
             if soak_d.get("duration_hours", 0) < 1.0:
                 print(f"strict: soak duration {soak_d.get('duration_hours')}h <1.0h", file=sys.stderr); sys.exit(1)
             if soak_d.get("duration_seconds", dur) < 3600:

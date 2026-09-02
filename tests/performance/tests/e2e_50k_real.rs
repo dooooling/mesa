@@ -60,6 +60,13 @@ async fn e2e_50k_real_throughput() {
         Duration::from_secs(10)
     };
     let drivers_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../drivers");
+    // 测试开始即删旧 Evidence，避免失败后遗留假阳性
+    {
+        let out_dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/validation");
+        let _ = std::fs::remove_file(out_dir.join("performance.json"));
+        let _ = std::fs::remove_file(out_dir.join("soak.json"));
+    }
     // 使用内存版 PointIdAllocator（BuiltinEndpoint 不落库），避免 StorePointIdSource 对 ConfigStore endpoint 的强依赖导致 ConfigurationFailed
     let mgr = MesaManager::discover(&drivers_dir);
 
@@ -193,7 +200,13 @@ async fn e2e_50k_real_throughput() {
             "RSS 增长 {growth:.1}% >10% (start {s} end {e})，疑似泄漏"
         );
     }
-    // 产出 Release Validation 汇聚文件（供 scripts/generate-release-validation.py --strict）
+    // 最终仍需 RUNNING（必须在写 Evidence 之前通过，否则不留成功证据）
+    let st = snap.endpoint(ep_id).expect("endpoint still present");
+    assert_eq!(st.state, "RUNNING", "结束时仍应 RUNNING，实际 {:?}", st);
+
+    mgr.shutdown_all().await;
+
+    // 全部断言通过后最后一步才写 Evidence，保证文件存在=跑到成功终点
     // 注意：当前 RSS 仅度量 Core/Test 进程自身（/proc/self/status 或 sysinfo 当前进程），
     // 不含独立 Driver 子进程全量，文档中应表述为 Core/Test process RSS growth。
     {
@@ -279,10 +292,4 @@ async fn e2e_50k_real_throughput() {
             );
         }
     }
-
-    // 最终仍需 RUNNING
-    let st = snap.endpoint(ep_id).expect("endpoint still present");
-    assert_eq!(st.state, "RUNNING", "结束时仍应 RUNNING，实际 {:?}", st);
-
-    mgr.shutdown_all().await;
 }
