@@ -213,6 +213,8 @@ pub struct DataSink {
     control_tx: mpsc::Sender<pb::Envelope>,
     data_tx: mpsc::Sender<DataBatch>,
     state: Arc<Mutex<CoalescerState>>,
+    /// 全局 pending 注册表：handle -> CoalescerState，用于 writer 统一 flush
+    pending_registry: Arc<Mutex<HashMap<u32, Arc<Mutex<CoalescerState>>>>>,
     /// 本 sink 绑定的 connection_handle；0 表示会话级（不发数据）。
     handle: u32,
     /// 绑定连接的 stream_epoch，publish 时随 handle 一并盖戳（§10）。
@@ -234,6 +236,7 @@ impl DataSink {
                 pending: None,
                 coalesced_points: 0,
             })),
+            pending_registry: Arc::new(Mutex::new(HashMap::new())),
             handle: 0,
             epoch: 0,
         }
@@ -242,17 +245,23 @@ impl DataSink {
     /// 派生绑定到特定 Connection 的发布端：独立合并缓冲（不同连接不互相合并），
     /// 共享有界通道。Start 时由 SDK 调用；驱动在 run() 中拿到的即为此实例，
     /// 无需关心 handle/epoch 的注入细节。
-    // FIXME: writer_loop 当前仅对 session.sink 调用 flush_pending()，for_connection() 派生的独立
-    // CoalescerState.pending 可能未被及时冲回通道；当前测试通过不代表该路径已覆盖，
-    // 后续需将 flush 语义改为按连接或全局注册表统一调度（见本次 Stop barrier 修复后的待办）。
     pub fn for_connection(&self, handle: u32, stream_epoch: u64) -> Self {
+        let entry = {
+            let mut reg = self.pending_registry.lock().unwrap();
+            reg.entry(handle)
+                .or_insert_with(|| {
+                    Arc::new(Mutex::new(CoalescerState {
+                        pending: None,
+                        coalesced_points: 0,
+                    }))
+                })
+                .clone()
+        };
         Self {
             control_tx: self.control_tx.clone(),
             data_tx: self.data_tx.clone(),
-            state: Arc::new(Mutex::new(CoalescerState {
-                pending: None,
-                coalesced_points: 0,
-            })),
+            state: entry,
+            pending_registry: Arc::clone(&self.pending_registry),
             handle,
             epoch: stream_epoch,
         }
@@ -311,7 +320,34 @@ impl DataSink {
     }
 
     /// 尝试把合并缓冲冲回通道；通道仍满则保留缓冲下次再试。
+    /// 修复：遍历全局注册表，逐连接 flush，确保 per-connection pending 不会永久滞留。
     fn flush_pending(&self) {
+        // 先尝试 flush 全局注册表中的所有 pending（保证 Latest-Wins 最终可达）
+        let handles: Vec<u32> = {
+            let reg = self.pending_registry.lock().unwrap();
+            reg.keys().copied().collect()
+        };
+        for h in handles {
+            let entry_opt = {
+                let reg = self.pending_registry.lock().unwrap();
+                reg.get(&h).cloned()
+            };
+            if let Some(entry) = entry_opt {
+                let mut st = entry.lock().unwrap();
+                if let Some(batch) = st.pending.take() {
+                    match self.data_tx.try_send(batch) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(b)) => {
+                            st.pending = Some(b);
+                            // 通道仍满，后续 handle 也无法发送，提前跳出
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
+                }
+            }
+        }
+        // 兼容会话级 pending（handle 0 的独立 state）
         let mut st = self.state.lock().unwrap();
         if let Some(batch) = st.pending.take() {
             match self.data_tx.try_send(batch) {
