@@ -965,6 +965,21 @@ impl ConfigStore {
         Ok(())
     }
 
+    pub fn update_control_audit(
+        &self,
+        request_id: &str,
+        status: &str,
+        result_json: Option<&str>,
+        finished_at_ns: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE control_audit SET status=?1, result_json=?2, finished_at_ns=?3 WHERE request_id=?4",
+            params![status, result_json, finished_at_ns, request_id],
+        )?;
+        Ok(())
+    }
+
     /// 列表查询：按 endpoint/status/时间范围过滤，支持 limit/cursor（cursor 为 started_at_ns 的分页锚点）
     pub fn list_control_audit(
         &self,
@@ -994,9 +1009,8 @@ impl ConfigStore {
             args.push(Box::new(f));
         }
         if let Some(t) = to_ns {
-            sql.push_str(" AND finished_at_ns<=? OR finished_at_ns IS NULL");
-            // 简化：仅过滤 started_at
-            let _ = t;
+            sql.push_str(" AND (finished_at_ns<=? OR finished_at_ns IS NULL)");
+            args.push(Box::new(t));
         }
         // cursor 为上一页最后一条的 started_at_ns（降序分页）
         if let Some(c) = cursor.and_then(|s| s.parse::<i64>().ok()) {

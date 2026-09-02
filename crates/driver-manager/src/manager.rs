@@ -420,6 +420,7 @@ impl MesaManager {
         target: &str,
         value: mesa_core_types::Value,
         expected: Option<mesa_core_types::Value>,
+        request_id: &str,
     ) -> Result<Option<mesa_core_types::Value>, DescriptorError> {
         let sess_arc = {
             let m = self.active_sessions.read().unwrap();
@@ -431,10 +432,9 @@ impl MesaManager {
                 format!("endpoint `{endpoint_id}` not running"),
             )
         })?;
-        let request_id = format!("wr-{}-{}", endpoint_id, mesa_core_types::now_unix_ns());
         let sess = sess_arc.lock().await;
-        // 约定 handle 1 为 Endpoint 主连接（endpoint.rs HANDLE=1）
-        sess.write(1, &request_id, target, value, expected)
+        // 约定 handle 1 为 Endpoint 主连接（endpoint.rs HANDLE=1），request_id 贯穿审计
+        sess.write(1, request_id, target, value, expected)
             .await
             .map_err(|e| DescriptorError::new("CONTROL_FAILED", format!("{e}")))
     }
@@ -445,6 +445,7 @@ impl MesaManager {
         endpoint_id: &str,
         command_id: &str,
         input_json: &str,
+        request_id: &str,
     ) -> Result<(String, String, String), DescriptorError> {
         let sess_arc = {
             let m = self.active_sessions.read().unwrap();
@@ -456,9 +457,8 @@ impl MesaManager {
                 format!("endpoint `{endpoint_id}` not running"),
             )
         })?;
-        let request_id = format!("cmd-{}-{}", endpoint_id, mesa_core_types::now_unix_ns());
         let sess = sess_arc.lock().await;
-        sess.command(1, &request_id, command_id, input_json)
+        sess.command(1, request_id, command_id, input_json)
             .await
             .map_err(|e| DescriptorError::new("CONTROL_FAILED", format!("{e}")))
     }

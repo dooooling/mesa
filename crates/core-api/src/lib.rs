@@ -665,26 +665,19 @@ async fn control_write(
     let _ = state.store.insert_control_audit(&audit_started);
     match state
         .manager
-        .control_write(&id, target, value, expected)
+        .control_write(&id, target, value, expected, &request_id)
         .await
     {
         Ok(readback) => {
             let detail =
                 serde_json::json!({"readback": readback.as_ref().map(|v| format!("{v:?}"))})
                     .to_string();
-            let audit = mesa_config_store::ControlAuditRecord {
-                request_id: format!("{}-done", request_id),
-                endpoint_id: id.clone(),
-                actor: "local-api".into(),
-                operation_type: "write".into(),
-                operation_id: target.to_string(),
-                request_json: detail.clone(),
-                result_json: Some(detail),
-                status: "COMPLETED".into(),
-                started_at_ns: mesa_core_types::now_unix_ns(),
-                finished_at_ns: Some(mesa_core_types::now_unix_ns()),
-            };
-            let _ = state.store.insert_control_audit(&audit);
+            let _ = state.store.update_control_audit(
+                &request_id,
+                "COMPLETED",
+                Some(&detail),
+                mesa_core_types::now_unix_ns(),
+            );
             let rb_json =
                 readback.map(|v| serde_json::to_value(&v).unwrap_or(serde_json::Value::Null));
             (
@@ -695,19 +688,12 @@ async fn control_write(
             )
         }
         Err(e) => {
-            let audit = mesa_config_store::ControlAuditRecord {
-                request_id: format!("{}-failed", request_id),
-                endpoint_id: id.clone(),
-                actor: "local-api".into(),
-                operation_type: "write".into(),
-                operation_id: target.to_string(),
-                request_json: serde_json::json!({"target": target}).to_string(),
-                result_json: Some(e.message.clone()),
-                status: "FAILED".into(),
-                started_at_ns: mesa_core_types::now_unix_ns(),
-                finished_at_ns: Some(mesa_core_types::now_unix_ns()),
-            };
-            let _ = state.store.insert_control_audit(&audit);
+            let _ = state.store.update_control_audit(
+                &request_id,
+                "FAILED",
+                Some(&e.message),
+                mesa_core_types::now_unix_ns(),
+            );
             let status = if e.code == "ENDPOINT_NOT_RUNNING" {
                 StatusCode::CONFLICT
             } else {
@@ -794,7 +780,7 @@ async fn control_command(
     let _ = state.store.insert_control_audit(&audit_started);
     match state
         .manager
-        .control_command(&id, &command_id, &input_json)
+        .control_command(&id, &command_id, &input_json, &request_id)
         .await
     {
         Ok((status, result_json, error)) => {
@@ -803,19 +789,13 @@ async fn control_command(
             } else {
                 "FAILED"
             };
-            let audit = mesa_config_store::ControlAuditRecord {
-                request_id: format!("{}-done", request_id),
-                endpoint_id: id.clone(),
-                actor: "local-api".into(),
-                operation_type: "command".into(),
-                operation_id: command_id.clone(),
-                request_json: input_json.clone(),
-                result_json: Some(format!("{status}:{result_json}:{error}")),
-                status: audit_status.into(),
-                started_at_ns: mesa_core_types::now_unix_ns(),
-                finished_at_ns: Some(mesa_core_types::now_unix_ns()),
-            };
-            let _ = state.store.insert_control_audit(&audit);
+            let detail = format!("{status}:{result_json}:{error}");
+            let _ = state.store.update_control_audit(
+                &request_id,
+                audit_status,
+                Some(&detail),
+                mesa_core_types::now_unix_ns(),
+            );
             let result_val: serde_json::Value = serde_json::from_str(&result_json)
                 .unwrap_or(serde_json::Value::String(result_json.clone()));
             (
@@ -826,19 +806,12 @@ async fn control_command(
             )
         }
         Err(e) => {
-            let audit = mesa_config_store::ControlAuditRecord {
-                request_id: format!("{}-failed", request_id),
-                endpoint_id: id.clone(),
-                actor: "local-api".into(),
-                operation_type: "command".into(),
-                operation_id: command_id.clone(),
-                request_json: input_json.clone(),
-                result_json: Some(e.message.clone()),
-                status: "FAILED".into(),
-                started_at_ns: mesa_core_types::now_unix_ns(),
-                finished_at_ns: Some(mesa_core_types::now_unix_ns()),
-            };
-            let _ = state.store.insert_control_audit(&audit);
+            let _ = state.store.update_control_audit(
+                &request_id,
+                "FAILED",
+                Some(&e.message),
+                mesa_core_types::now_unix_ns(),
+            );
             let status = if e.code == "ENDPOINT_NOT_RUNNING" {
                 StatusCode::CONFLICT
             } else {
