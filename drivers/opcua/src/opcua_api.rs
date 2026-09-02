@@ -450,6 +450,7 @@ pub struct NativeOpcUaApi {
     security_mode: std::sync::Mutex<String>,
     username: std::sync::Mutex<Option<String>>,
     password: std::sync::Mutex<Option<String>>,
+    certificate: std::sync::Mutex<Option<String>>,
 }
 
 impl Default for NativeOpcUaApi {
@@ -467,6 +468,7 @@ impl NativeOpcUaApi {
             security_mode: std::sync::Mutex::new("None".into()),
             username: std::sync::Mutex::new(None),
             password: std::sync::Mutex::new(None),
+            certificate: std::sync::Mutex::new(None),
         }
     }
 
@@ -478,6 +480,7 @@ impl NativeOpcUaApi {
             security_mode: std::sync::Mutex::new("None".into()),
             username: std::sync::Mutex::new(None),
             password: std::sync::Mutex::new(None),
+            certificate: std::sync::Mutex::new(None),
         }
     }
     pub fn set_security(&self, policy: String, mode: String) {
@@ -487,6 +490,9 @@ impl NativeOpcUaApi {
     pub fn set_credentials(&self, username: Option<String>, password: Option<String>) {
         *self.username.lock().unwrap() = username;
         *self.password.lock().unwrap() = password;
+    }
+    pub fn set_certificate(&self, cert: Option<String>) {
+        *self.certificate.lock().unwrap() = cert;
     }
 
     fn default_pki_dir() -> std::path::PathBuf {
@@ -533,12 +539,32 @@ impl NativeOpcUaApi {
         let timeout = Duration::from_millis(timeout_ms);
         // pki_dir：优先环境变量 MESA_OPCUA_PKI_DIR（与 Core CertStore 同值），否则 data/certificates/opcua；显式 pki_dir 由上层通过 NativeOpcUaApi::new_with_pki_dir 注入
         let pki_dir = self.resolve_pki_dir();
+        // 若指定 certificate，则优先使用该证书（路径或 thumbprint 映射），否则沿用 own/own.der 固定 PKI
+        let (cert_path, key_path) = {
+            let cert_opt = self.certificate.lock().unwrap().clone();
+            if let Some(c) = cert_opt.filter(|s| !s.trim().is_empty()) {
+                let c = c.trim().to_string();
+                if c.ends_with(".der") || c.ends_with(".pem") {
+                    let key = if c.ends_with(".der") {
+                        c.replace(".der", ".key")
+                    } else {
+                        c.replace(".pem", ".key")
+                    };
+                    (c, key)
+                } else {
+                    // 视为 thumbprint 或相对路径，直接作为 cert 路径，key 同源
+                    (c.clone(), format!("{c}.key"))
+                }
+            } else {
+                ("own/own.der".into(), "own/own.key".into())
+            }
+        };
         let mut client = ClientBuilder::new()
             .application_name("Mesa OPC UA")
             .application_uri("urn:Mesa:opcua")
             .pki_dir(pki_dir)
-            .certificate_path("own/own.der")
-            .private_key_path("own/own.key")
+            .certificate_path(cert_path)
+            .private_key_path(key_path)
             .trust_server_certs(false)
             .verify_server_certs(true)
             .create_sample_keypair(false)

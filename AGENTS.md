@@ -4,9 +4,9 @@
 
 ## 仓库现状（先读这个）
 
-- 设计文档：`Mesa_Driver_MVP_实施方案.md`（V1.4）是唯一事实来源，写任何代码前必须先读
-- **M0 最小可运行版本已落地**：workspace 骨架 + core-types + driver-protocol + driver-sdk + driver-manager + core-api + apps/mesad + drivers/simulator
-- 尚未 `git init`，无版本历史
+- 设计文档：`docs/Mesa_驱动自描述动态UI采集控制完整开发实施方案.md`（V2.1，36ch）是唯一事实来源，写任何代码前必须先读；`Mesa_Driver_MVP_实施方案.md`（V1.4）为历史 MVP 基线，仅作兼容参考
+- **V2.1 已落地**：`Mesa_Driver_MVP_实施方案.md V1.4` 基线上的动态 UI / Secret / Browse / Control / 原子事务 / 50K 验收等扩展；`feat/v2.1-impl` 为当前开发分支
+- `rust-toolchain.toml channel="1.95.0"` / `Node 22.18 pnpm 10.28` / `apps/mesa-web`（AntD 最小管理端）
 
 ## 常用命令（M0 已验证）
 

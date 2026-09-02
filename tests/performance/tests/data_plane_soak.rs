@@ -11,8 +11,11 @@ use std::sync::Arc;
 #[tokio::test]
 async fn data_plane_50k_10s_ci() {
     let long_3000 = std::env::var("PERF_3000").is_ok();
+    let soak = std::env::var("PERF_SOAK").is_ok();
     let long = std::env::var("PERF_LONG").is_ok() || std::env::args().any(|a| a == "--long");
-    let dur = if long_3000 {
+    let dur = if soak {
+        Duration::from_secs(3600) // 60min Release Soak
+    } else if long_3000 {
         Duration::from_secs(3000) // 50min soak
     } else if long {
         Duration::from_secs(60) // 60s 性能门禁
@@ -64,8 +67,8 @@ async fn data_plane_50k_10s_ci() {
     assert!(elapsed >= 9.0, "elapsed {elapsed}");
     assert!(mgr.is_running("perf-50k"), "endpoint 不应退出 ids={ids:?}");
     assert!(!ids.is_empty(), "应有运行中 endpoint");
-    // CI 10s 用 40k 门禁，long 60s/50min 用 50k
-    let threshold = if long || long_3000 {
+    // CI 10s 用 40k 门禁，long 60s/50min/60min 用 50k
+    let threshold = if long || long_3000 || soak {
         50_000.0
     } else {
         40_000.0

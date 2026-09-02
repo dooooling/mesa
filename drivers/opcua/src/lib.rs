@@ -206,6 +206,7 @@ impl Driver for OpcUaDriver {
             };
             native.set_security(cfg.security_policy.clone(), cfg.security_mode.clone());
             native.set_credentials(cfg.username.clone(), cfg.password.clone());
+            native.set_certificate(cfg.certificate.clone());
             Arc::new(native)
         } else {
             Arc::new(FakeOpcUaApi::new())

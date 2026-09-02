@@ -1090,19 +1090,8 @@ async fn list_endpoints(State(state): State<Arc<AppState>>) -> Json<serde_json::
                 }
             }
             Err(_) => {
-                if let Ok(fields) = state.store.list_secret_fields(&rec.id) {
-                    if !fields.is_empty() {
-                        conn = redact_connection_for_response(conn, &rec.id, &state.store, &fields);
-                    } else if conn
-                        .as_object()
-                        .map(|m| m.values().any(|v| v.is_string()))
-                        .unwrap_or(false)
-                    {
-                        conn = serde_json::Value::Null;
-                    }
-                } else {
-                    conn = serde_json::Value::Null;
-                }
+                // 保守策略：Descriptor 不可用则直接不返回 connection
+                conn = serde_json::Value::Null;
             }
         }
         merged.push(serde_json::json!({
@@ -1265,7 +1254,7 @@ async fn get_endpoint(
             let runtime = state.snapshot.endpoint(&id);
             let mut conn: serde_json::Value =
                 serde_json::from_str(&rec.connection_json).unwrap_or(serde_json::json!({}));
-            // 脱敏：若为 Secret 字段则返回 marker 而非明文；Descriptor 不可用时按已有 Secret 列表兜底，避免历史明文泄露
+            // 脱敏：若为 Secret 字段则返回 marker 而非明文；Descriptor 不可用时一律不返回 connection，避免历史明文泄露
             match state.manager.get_descriptor(&rec.driver_id).await {
                 Ok(desc) => {
                     let secret_keys = secret_field_keys(&desc.connection);
@@ -1279,26 +1268,8 @@ async fn get_endpoint(
                     }
                 }
                 Err(_) => {
-                    if let Ok(fields) = state.store.list_secret_fields(&rec.id) {
-                        if !fields.is_empty() {
-                            conn = redact_connection_for_response(
-                                conn,
-                                &rec.id,
-                                &state.store,
-                                &fields,
-                            );
-                        } else if conn
-                            .as_object()
-                            .map(|m| m.values().any(|v| v.is_string()))
-                            .unwrap_or(false)
-                        {
-                            // 历史遗留且无 Secret 记录、Descriptor 又不可用时不返回原始 connection，避免明文泄露
-                            conn = serde_json::Value::Null;
-                        }
-                    } else {
-                        // 无法查询 Secret 列表时同样不返回原始 connection
-                        conn = serde_json::Value::Null;
-                    }
+                    // 保守策略：Descriptor 不可用则无法判断哪些字段为 Secret，直接不返回 connection
+                    conn = serde_json::Value::Null;
                 }
             }
             (
@@ -1473,12 +1444,14 @@ async fn update_endpoint(
                     }
                 }
             }
-            // Driver 切换：清理旧 Driver 残留的 Secret（不在新 Descriptor 中的字段）
-            if let Ok(existing) = state.store.list_secret_fields(&id) {
-                for ef in existing {
-                    if !secret_keys.contains(&ef) && !secrets_to_delete.contains(&ef) {
-                        secrets_to_delete.push(ef);
-                    }
+            // Driver 切换：清理旧 Driver 残留的 Secret（不在新 Descriptor 中的字段），查询失败则 fail-closed
+            let existing = match state.store.list_secret_fields(&id) {
+                Ok(v) => v,
+                Err(e) => return store_err_to_response(e),
+            };
+            for ef in existing {
+                if !secret_keys.contains(&ef) && !secrets_to_delete.contains(&ef) {
+                    secrets_to_delete.push(ef);
                 }
             }
         }
