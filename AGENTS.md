@@ -28,7 +28,7 @@ Contract Test 基线（§21 全部 20 项 + V2.1 扩展）共 14 suites 位于 `
 `smoke` / `protocol_negotiation` / `session_lifecycle` / `data_plane` / `fault_tolerance` /
 `subprocess_recovery` / `discovery_contract` / `descriptor_contract` / `data_semantics` /
 `control_contract` / `management_api` / `profile_contract` / `resource_contract` / `subprocess_orphan_guard`，
-唯一可信 Evidence 为 `cargo test --locked -p mesa-contract-tests --all-features && python scripts/write-contract-evidence.py` 产出的 `target/validation/contract.json`。任何新 Driver 必须全过该基线。
+唯一可信 Evidence 为 `python scripts/write-contract-evidence.py`（内部依次 `cargo build --locked --workspace` → `cargo test --locked -p mesa-contract-tests --all-features`）产出的 `target/validation/contract.json`。任何新 Driver 必须全过该基线。
 
 ## 项目是什么
 

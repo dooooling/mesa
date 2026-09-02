@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """生成 target/validation/contract.json 的唯一权威脚本（Suite Gate）。
 
-机器保证：本脚本自身执行 `cargo test --locked -p mesa-contract-tests --all-features`
-并仅在成功后才写出 contract.json，外部只需 `python scripts/write-contract-evidence.py`。
-测试开始前会删除旧 contract.json，失败时不留下看似有效的旧 Evidence。
+机器保证：本脚本先删除旧 contract.json，再依次执行
+  1) cargo build --locked --workspace  （重编全部 Driver binaries，避免旧二进制）
+  2) cargo test --locked -p mesa-contract-tests --all-features
+两步均成功后才写出 contract.json。外部唯一入口即 `python scripts/write-contract-evidence.py`，
+无法通过参数跳过测试。
 """
 import json, pathlib, subprocess, sys, datetime
 
@@ -38,12 +40,18 @@ def is_clean_tree():
     except Exception:
         return False
 
-def main():
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--skip-run", action="store_true", help="跳过 cargo test，仅生成（调试用）")
-    args = ap.parse_args()
+def run_or_exit(cmd, label):
+    print(f"running: {' '.join(cmd)} ...", flush=True)
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"{label} FAILED (exit {e.returncode}), not writing contract.json", file=sys.stderr)
+        sys.exit(e.returncode)
+    except FileNotFoundError as e:
+        print(f"cargo not found: {e}", file=sys.stderr)
+        sys.exit(127)
 
+def main():
     out = pathlib.Path("target/validation/contract.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     # 先删旧 Evidence，避免失败后遗留
@@ -52,19 +60,8 @@ def main():
     except FileNotFoundError:
         pass
 
-    if not args.skip_run:
-        print("running: cargo test --locked -p mesa-contract-tests --all-features ...", flush=True)
-        try:
-            subprocess.run(
-                ["cargo", "test", "--locked", "-p", "mesa-contract-tests", "--all-features"],
-                check=True,
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"contract tests FAILED (exit {e.returncode}), not writing contract.json", file=sys.stderr)
-            sys.exit(e.returncode)
-        except FileNotFoundError as e:
-            print(f"cargo not found: {e}", file=sys.stderr)
-            sys.exit(127)
+    run_or_exit(["cargo", "build", "--locked", "--workspace"], "cargo build")
+    run_or_exit(["cargo", "test", "--locked", "-p", "mesa-contract-tests", "--all-features"], "contract tests")
 
     sha = git_sha()
     doc = {
@@ -76,9 +73,8 @@ def main():
         "git_sha_short": sha[:7] if len(sha) >= 7 else sha,
         "generated_at_ns": int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9),
         "dirty": not is_clean_tree(),
-        "build_profile": "release" if not "--debug" in sys.argv else "debug",
     }
-    # 防御：保证集合完整性
+    # 防御：保证集合完整性（Contract Gate 验证行为契约，不含 build_profile）
     assert set(doc["suites"]) == REQUIRED_SET and doc["total"] == len(SUITES) == 14
     out.write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"wrote {out} suites={len(SUITES)} sha={sha} dirty={doc['dirty']}")
