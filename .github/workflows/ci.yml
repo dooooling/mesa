@@ -1,7 +1,7 @@
 # CI：单编译、锁版、多平台（Windows/Linux × x86/ARM 原生 test）
 # - 锁版：rust 1.95.0（本地 rustc 1.95.0，见 rust-toolchain.toml）、node 22.18.0、pnpm 10.28.0，actions pin 防漂移
-# - 单编译：fmt→clippy→test 复用同一 target（rust-cache），不分包多次编译
-# - 多平台：Windows/Linux × x86_64/aarch64 四组合均原生 test（无 --target 交叉，无 QEMU）
+# - 单编译：fmt→clippy→test 复用同一 target（同 job 内顺序执行，无多编译），本次弃用跨 run 缓存以避 proto build 产物 stale（Mesa.driver.v1.rs）
+# - 多平台：Windows/Linux × x86_64/aarch64 四组合均原生 test
 # - 严格：fmt --check、clippy -D warnings、test --workspace --all-features、web build
 name: CI
 on:
@@ -37,10 +37,6 @@ jobs:
         with:
           toolchain: '1.95.0'
           components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ${{ matrix.os }}-1.95.0
 
       - name: fmt
         run: cargo fmt --check
