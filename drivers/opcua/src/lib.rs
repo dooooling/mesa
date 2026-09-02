@@ -198,14 +198,13 @@ impl Driver for OpcUaDriver {
             .and_then(|x| x.as_bool())
             .unwrap_or(true);
         let api: Arc<dyn OpcUaApiTrait> = if use_native {
-            let native = if let Some(pki) = OpcUaConnConfig::resolve_pki_dir(&v) {
+            let native = if let Some(pki) = OpcUaConnConfig::resolve_pki_dir() {
                 NativeOpcUaApi::new_with_pki_dir(pki)
             } else {
                 NativeOpcUaApi::new()
             };
             native.set_security(cfg.security_policy.clone(), cfg.security_mode.clone());
             native.set_credentials(cfg.username.clone(), cfg.password.clone());
-            native.set_certificate(cfg.certificate.clone());
             Arc::new(native)
         } else {
             Arc::new(FakeOpcUaApi::new())
@@ -222,7 +221,6 @@ impl Driver for OpcUaDriver {
 // 连接配置
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct OpcUaConnConfig {
     endpoint_url: String,
@@ -233,7 +231,6 @@ struct OpcUaConnConfig {
     security_mode: String,
     username: Option<String>,
     password: Option<String>,
-    certificate: Option<String>,
 }
 
 impl Default for OpcUaConnConfig {
@@ -245,20 +242,13 @@ impl Default for OpcUaConnConfig {
             security_mode: "None".into(),
             username: None,
             password: None,
-            certificate: None,
         }
     }
 }
 
 impl OpcUaConnConfig {
-    /// 提取可选的 pki_dir（优先级：connection_json.pki_dir > 环境变量 > 默认）
-    fn resolve_pki_dir(v: &serde_json::Value) -> Option<std::path::PathBuf> {
-        if let Some(s) = v.get("pki_dir").and_then(|x| x.as_str()) {
-            let t = s.trim();
-            if !t.is_empty() {
-                return Some(std::path::PathBuf::from(t));
-            }
-        }
+    /// 提取可选的 pki_dir：仅允许环境变量 MESA_OPCUA_PKI_DIR 或默认值，禁止 Endpoint JSON 指定路径
+    fn resolve_pki_dir() -> Option<std::path::PathBuf> {
         std::env::var("MESA_OPCUA_PKI_DIR")
             .ok()
             .map(std::path::PathBuf::from)
@@ -361,10 +351,6 @@ impl OpcUaConnConfig {
             }
             _ => {}
         }
-        let certificate = v
-            .get("certificate")
-            .and_then(|x| x.as_str())
-            .map(|s| s.to_string());
         // 禁止生产默认忽略校验：若 policy/mode 为 None 则 trust_server_certs 需显式，但此处仅校验，实际连接由证书目录决定
         Ok(Self {
             endpoint_url,
@@ -373,7 +359,6 @@ impl OpcUaConnConfig {
             security_mode,
             username,
             password,
-            certificate,
         })
     }
 }

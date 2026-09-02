@@ -450,8 +450,6 @@ pub struct NativeOpcUaApi {
     security_mode: std::sync::Mutex<String>,
     username: std::sync::Mutex<Option<String>>,
     password: std::sync::Mutex<Option<String>>,
-    #[allow(dead_code)]
-    certificate: std::sync::Mutex<Option<String>>,
 }
 
 impl Default for NativeOpcUaApi {
@@ -469,7 +467,6 @@ impl NativeOpcUaApi {
             security_mode: std::sync::Mutex::new("None".into()),
             username: std::sync::Mutex::new(None),
             password: std::sync::Mutex::new(None),
-            certificate: std::sync::Mutex::new(None),
         }
     }
 
@@ -481,7 +478,6 @@ impl NativeOpcUaApi {
             security_mode: std::sync::Mutex::new("None".into()),
             username: std::sync::Mutex::new(None),
             password: std::sync::Mutex::new(None),
-            certificate: std::sync::Mutex::new(None),
         }
     }
     pub fn set_security(&self, policy: String, mode: String) {
@@ -491,9 +487,6 @@ impl NativeOpcUaApi {
     pub fn set_credentials(&self, username: Option<String>, password: Option<String>) {
         *self.username.lock().unwrap() = username;
         *self.password.lock().unwrap() = password;
-    }
-    pub fn set_certificate(&self, cert: Option<String>) {
-        *self.certificate.lock().unwrap() = cert;
     }
 
     fn default_pki_dir() -> std::path::PathBuf {

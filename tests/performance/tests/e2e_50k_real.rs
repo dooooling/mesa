@@ -33,7 +33,7 @@ fn current_rss_bytes() -> Option<u64> {
                 }
             }
         }
-        return None;
+        None
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -157,31 +157,41 @@ async fn e2e_50k_real_throughput() {
         "ipc samples must >0 (mono_ns 未埋点或跨进程时钟不可比)"
     );
     assert!(ipc_p95 != 0, "ipc p95 must >0");
-    // 普通 GitHub CI（共享 Runner）仅作灾难性回归门槛：p95 <50ms / p99 <100ms；
-    // 正式 Release SLO（固定硬件/self-hosted）仍为 p95 ≤20ms / p99 ≤50ms（见 docs/§22），
-    // 避免 Windows 共享 VM 的 4ms 抖动（如 24.23ms）误判为性能退化。
-    assert!(
-        ipc_p95 <= 50_000_000,
-        "ipc_p95 {ipc_p95}ns >50ms (CI disaster gate)"
-    );
-    assert!(
-        ipc_p99 <= 100_000_000,
-        "ipc_p99 {ipc_p99}ns >100ms (CI disaster gate)"
-    );
-    // Soak 模式：RSS 60min 增长 ≤10%（此处 3600s 全量，60s 快检不校验）
     if soak {
-        if let (Some(s), Some(e)) = (start_rss, end_rss) {
-            let growth = if s > 0 {
-                (e as f64 - s as f64) / s as f64 * 100.0
-            } else {
-                0.0
-            };
-            println!("rss soak growth {growth:.1}% start {s} end {e}");
-            assert!(
-                growth <= 10.0,
-                "RSS 增长 {growth:.1}% >10% (start {s} end {e})，疑似泄漏"
-            );
-        }
+        // Release Soak 正式 SLO：p95 ≤20ms / p99 ≤50ms
+        assert!(
+            ipc_p95 <= 20_000_000,
+            "ipc_p95 {ipc_p95}ns >20ms (soak SLO)"
+        );
+        assert!(
+            ipc_p99 <= 50_000_000,
+            "ipc_p99 {ipc_p99}ns >50ms (soak SLO)"
+        );
+    } else {
+        // 普通 GitHub CI（共享 Runner）仅作灾难性回归门槛：p95 <50ms / p99 <100ms
+        assert!(
+            ipc_p95 <= 50_000_000,
+            "ipc_p95 {ipc_p95}ns >50ms (CI disaster gate)"
+        );
+        assert!(
+            ipc_p99 <= 100_000_000,
+            "ipc_p99 {ipc_p99}ns >100ms (CI disaster gate)"
+        );
+    }
+    // Soak 模式：RSS 60min 增长 ≤10%，必须可读取否则 fail-closed
+    if soak {
+        let s = start_rss.expect("PERF_SOAK 必须能够读取 start RSS");
+        let e = end_rss.expect("PERF_SOAK 必须能够读取 end RSS");
+        let growth = if s > 0 {
+            (e as f64 - s as f64) / s as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!("rss soak growth {growth:.1}% start {s} end {e}");
+        assert!(
+            growth <= 10.0,
+            "RSS 增长 {growth:.1}% >10% (start {s} end {e})，疑似泄漏"
+        );
     }
 
     // 最终仍需 RUNNING

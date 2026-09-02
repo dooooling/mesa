@@ -191,8 +191,12 @@ impl CertStore {
         for dir in [&trusted_dir, &rejected_dir] {
             if let Ok(entries) = fs::read_dir(dir) {
                 for e in entries.flatten() {
-                    if e.file_name().to_string_lossy().contains(&thumbprint) {
-                        return Ok(thumbprint);
+                    let fname = e.file_name().to_string_lossy().to_string();
+                    // 要求完整 thumbprint 精确匹配（文件名不含扩展名大小写不敏感），避免短前缀误匹配
+                    if let Some(stem) = fname.split('.').next() {
+                        if stem.eq_ignore_ascii_case(&thumbprint) {
+                            return Ok(thumbprint);
+                        }
                     }
                 }
             }
@@ -204,35 +208,45 @@ impl CertStore {
         Ok(thumbprint)
     }
 
-    /// 删除受信任证书
+    /// 删除受信任证书（要求完整 thumbprint 精确匹配）
     pub fn remove_trusted(&self, thumbprint: &str) -> Result<bool, String> {
         let dir = self.store_path("trusted");
         if !dir.exists() {
             return Ok(false);
         }
-        let tp_upper = thumbprint.to_uppercase();
+        // 校验 thumbprint 格式：40 hex（SHA1）
+        if thumbprint.len() != 40 || !thumbprint.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("thumbprint `{thumbprint}` 非法，需 40 hex"));
+        }
         for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
-            let fname = entry.file_name().to_string_lossy().to_uppercase();
-            if fname.contains(&tp_upper) {
-                fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
-                tracing::info!(thumbprint=%thumbprint, "已删除受信任证书");
-                return Ok(true);
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if let Some(stem) = fname.split('.').next() {
+                if stem.eq_ignore_ascii_case(thumbprint) {
+                    fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
+                    tracing::info!(thumbprint=%thumbprint, "已删除受信任证书");
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
     }
 
-    /// 将 rejected 证书移至 trusted
+    /// 将 rejected 证书移至 trusted（要求完整 thumbprint 精确匹配）
     pub fn trust_rejected(&self, thumbprint: &str) -> Result<bool, String> {
         let rejected_dir = self.store_path("rejected");
         let trusted_dir = self.store_path("trusted");
         self.ensure_dirs().map_err(|e| e.to_string())?;
-        let tp_upper = thumbprint.to_uppercase();
+        if thumbprint.len() != 40 || !thumbprint.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("thumbprint `{thumbprint}` 非法，需 40 hex"));
+        }
         for entry in fs::read_dir(&rejected_dir).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
-            let fname = entry.file_name().to_string_lossy().to_uppercase();
-            if fname.contains(&tp_upper) {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if let Some(stem) = fname.split('.').next() {
+                if !stem.eq_ignore_ascii_case(thumbprint) {
+                    continue;
+                }
                 let data = fs::read(entry.path()).map_err(|e| e.to_string())?;
                 let dest = trusted_dir.join(entry.file_name());
                 fs::write(&dest, &data).map_err(|e| e.to_string())?;
@@ -272,13 +286,16 @@ impl CertStore {
         fs::write(&key_path, &key_pem).map_err(|e| e.to_string())?;
         // 双写兼容路径
         fs::write(&alt_cert_path, &der).map_err(|e| e.to_string())?;
-        let _ = fs::create_dir_all(&private_dir);
+        fs::create_dir_all(&private_dir).map_err(|e| e.to_string())?;
         fs::write(&alt_key_path, &key_pem).map_err(|e| e.to_string())?;
-        // 限制私钥权限（Unix）
+        // 限制私钥权限（Unix）——两份均 0600
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+                .map_err(|e| e.to_string())?;
+            fs::set_permissions(&alt_key_path, fs::Permissions::from_mode(0o600))
+                .map_err(|e| e.to_string())?;
         }
         tracing::info!(cert=%cert_path.display(), "已生成自签名 own 证书");
         Ok(true)
