@@ -456,9 +456,7 @@ pub fn drain_pre_barrier_events(
             mesa_driver_manager::session::SessionEvent::State { .. } => {
                 // lifecycle state 可消费
             }
-            mesa_driver_manager::session::SessionEvent::DriverError {
-                code, message, ..
-            } => {
+            mesa_driver_manager::session::SessionEvent::DriverError { code, message, .. } => {
                 panic!("unexpected driver error: {code}: {message}");
             }
         }
