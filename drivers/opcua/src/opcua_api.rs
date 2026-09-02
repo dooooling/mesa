@@ -448,6 +448,8 @@ pub struct NativeOpcUaApi {
     pki_dir: std::path::PathBuf,
     security_policy: std::sync::Mutex<String>,
     security_mode: std::sync::Mutex<String>,
+    username: std::sync::Mutex<Option<String>>,
+    password: std::sync::Mutex<Option<String>>,
 }
 
 impl Default for NativeOpcUaApi {
@@ -463,6 +465,8 @@ impl NativeOpcUaApi {
             pki_dir: Self::default_pki_dir(),
             security_policy: std::sync::Mutex::new("None".into()),
             security_mode: std::sync::Mutex::new("None".into()),
+            username: std::sync::Mutex::new(None),
+            password: std::sync::Mutex::new(None),
         }
     }
 
@@ -472,11 +476,17 @@ impl NativeOpcUaApi {
             pki_dir: p.into(),
             security_policy: std::sync::Mutex::new("None".into()),
             security_mode: std::sync::Mutex::new("None".into()),
+            username: std::sync::Mutex::new(None),
+            password: std::sync::Mutex::new(None),
         }
     }
     pub fn set_security(&self, policy: String, mode: String) {
         *self.security_policy.lock().unwrap() = policy;
         *self.security_mode.lock().unwrap() = mode;
+    }
+    pub fn set_credentials(&self, username: Option<String>, password: Option<String>) {
+        *self.username.lock().unwrap() = username;
+        *self.password.lock().unwrap() = password;
     }
 
     fn default_pki_dir() -> std::path::PathBuf {
@@ -544,15 +554,25 @@ impl NativeOpcUaApi {
             "SignAndEncrypt" => MessageSecurityMode::SignAndEncrypt,
             _ => MessageSecurityMode::None,
         };
-        let endpoint: EndpointDescription = (
-            endpoint_url,
-            policy.as_str(),
-            mode,
-            UserTokenPolicy::anonymous(),
-        )
-            .into();
+        let username = self.username.lock().unwrap().clone();
+        let password = self.password.lock().unwrap().clone();
+        // 根据是否提供用户名选择认证方式：有则 UserName，无则 Anonymous
+        let (user_policy, identity) = if let (Some(u), Some(p)) = (username, password) {
+            let pol = UserTokenPolicy {
+                policy_id: opcua_types::UAString::from("username"),
+                token_type: opcua_types::UserTokenType::UserName,
+                issued_token_type: opcua_types::UAString::null(),
+                issuer_endpoint_url: opcua_types::UAString::null(),
+                security_policy_uri: opcua_types::UAString::from(policy.as_str()),
+            };
+            (pol, IdentityToken::UserName(u, opcua_client::Password(p)))
+        } else {
+            (UserTokenPolicy::anonymous(), IdentityToken::Anonymous)
+        };
+        let endpoint: EndpointDescription =
+            (endpoint_url, policy.as_str(), mode, user_policy).into();
 
-        let connect_fut = client.connect_to_matching_endpoint(endpoint, IdentityToken::Anonymous);
+        let connect_fut = client.connect_to_matching_endpoint(endpoint, identity);
         let (session, event_loop) = tokio::time::timeout(timeout, connect_fut)
             .await
             .map_err(|_| format!("连接超时 {timeout_ms}ms {endpoint_url}"))?

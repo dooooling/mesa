@@ -205,6 +205,7 @@ impl Driver for OpcUaDriver {
                 NativeOpcUaApi::new()
             };
             native.set_security(cfg.security_policy.clone(), cfg.security_mode.clone());
+            native.set_credentials(cfg.username.clone(), cfg.password.clone());
             Arc::new(native)
         } else {
             Arc::new(FakeOpcUaApi::new())
@@ -230,6 +231,9 @@ struct OpcUaConnConfig {
     security_policy: String,
     /// MessageSecurityMode，如 "None" / "Sign" / "SignAndEncrypt"
     security_mode: String,
+    username: Option<String>,
+    password: Option<String>,
+    certificate: Option<String>,
 }
 
 impl Default for OpcUaConnConfig {
@@ -239,6 +243,9 @@ impl Default for OpcUaConnConfig {
             timeout_ms: 5000,
             security_policy: "None".into(),
             security_mode: "None".into(),
+            username: None,
+            password: None,
+            certificate: None,
         }
     }
 }
@@ -336,12 +343,27 @@ impl OpcUaConnConfig {
                 ),
             ));
         }
+        let username = v
+            .get("username")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+        let password = v
+            .get("password")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+        let certificate = v
+            .get("certificate")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
         // 禁止生产默认忽略校验：若 policy/mode 为 None 则 trust_server_certs 需显式，但此处仅校验，实际连接由证书目录决定
         Ok(Self {
             endpoint_url,
             timeout_ms,
             security_policy,
             security_mode,
+            username,
+            password,
+            certificate,
         })
     }
 }
