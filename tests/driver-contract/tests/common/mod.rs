@@ -43,12 +43,12 @@ pub fn repo_root() -> PathBuf {
 ///
 /// NOTE(cargo 行为): `cargo test -p mesa-contract-tests` 只构建依赖包的 lib，
 /// **不会**重编 simulator 的 bin。子进程类测试前若改过驱动代码，
-/// 必须先 `cargo build -p Mesa-driver-simulator`（或 `--workspace`），
+/// 必须先 `cargo build -p mesa-driver-simulator`（或 `--workspace`），
 /// 否则拉起的是旧二进制、故障注入不生效。
 pub fn sim_exe() -> PathBuf {
     let target = repo_root().join("target");
     for profile in ["debug", "release"] {
-        for name in ["Mesa-driver-simulator.exe", "Mesa-driver-simulator"] {
+        for name in ["mesa-driver-simulator.exe", "mesa-driver-simulator"] {
             let p = target.join(profile).join(name);
             if p.is_file() {
                 return p;

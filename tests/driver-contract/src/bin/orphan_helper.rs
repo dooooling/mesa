@@ -10,7 +10,7 @@ fn repo_root() -> PathBuf {
 fn sim_exe() -> PathBuf {
     let target = repo_root().join("target");
     for profile in ["debug", "release"] {
-        for name in ["Mesa-driver-simulator.exe", "Mesa-driver-simulator"] {
+        for name in ["mesa-driver-simulator.exe", "mesa-driver-simulator"] {
             let p = target.join(profile).join(name);
             if p.is_file() {
                 return p;
