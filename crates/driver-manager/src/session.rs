@@ -125,13 +125,15 @@ impl Session {
         expected_token: &str,
     ) -> Result<(Self, mpsc::Receiver<SessionEvent>, Arc<AtomicBool>), SessionError> {
         let mut last: Option<SessionError> = None;
-        for _ in 0..60 {
+        for _ in 0..120 {
             match Self::connect(port, expected_token).await {
                 Ok(v) => return Ok(v),
                 Err(SessionError::Io(e))
                     if matches!(
                         e.kind(),
-                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+                        std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::ConnectionReset
                     ) =>
                 {
                     last = Some(SessionError::Io(e));
