@@ -6,7 +6,7 @@
 
 /// prost 生成的类型。字段命名与 proto/driver.proto 一一对应。
 pub mod pb {
-    include!(concat!(env!("OUT_DIR"), "/Mesa.driver.v1.rs"));
+    include!(concat!(env!("OUT_DIR"), "/mesa.driver.v1.rs"));
 }
 
 use bytes::{BufMut, BytesMut};
