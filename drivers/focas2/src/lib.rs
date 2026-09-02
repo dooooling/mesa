@@ -290,11 +290,10 @@ impl Driver for FocasDriver {
             SdkDriverError::configuration("BAD_CONFIG", format!("connection JSON 非法: {e}"))
         })?;
         let cfg = FocasConnConfig::from_json(&v)?;
-        // 已支持 use_native=true 切 Native（44/44 2026-08-29 165 11 GOOD），默认 Fake 用于 CI
         let use_native = v
             .get("use_native")
             .and_then(|x| x.as_bool())
-            .unwrap_or(false);
+            .unwrap_or(true);
         let api: Arc<dyn FocasApiTrait> = if use_native {
             Arc::new(NativeFocasApi::new())
         } else {

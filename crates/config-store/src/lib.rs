@@ -538,6 +538,118 @@ impl ConfigStore {
         }
     }
 
+    /// 原子创建 Endpoint + Secrets（单事务，避免 FK 与半提交）
+    pub fn create_endpoint_with_secrets(
+        &self,
+        rec: &EndpointRecord,
+        secrets: &[(String, String)],
+    ) -> Result<(), StoreError> {
+        Self::validate_id(&rec.id)?;
+        Self::validate_id(&rec.device_id)?;
+        Self::validate_id(&rec.driver_id)?;
+        let v: serde_json::Value =
+            serde_json::from_str(&rec.connection_json).map_err(StoreError::Json)?;
+        if !v.is_object() {
+            return Err(StoreError::Validation("connection 必须为 JSON 对象".into()));
+        }
+        // 预先加密所有 secrets，避免事务中途失败
+        let key = master_key_bytes()?;
+        let mut encs: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
+        for (field, pt) in secrets {
+            let (ct, nonce) = aead_encrypt(pt.as_bytes(), &key)?;
+            encs.push((field.clone(), ct, nonce));
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let dev_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM devices WHERE id=?1)",
+            params![rec.device_id],
+            |r| r.get(0),
+        )?;
+        if !dev_exists {
+            return Err(StoreError::NotFound(format!(
+                "device `{}` 不存在",
+                rec.device_id
+            )));
+        }
+        let tx = conn.transaction()?;
+        let n = tx.execute(
+            "INSERT INTO endpoints(id,device_id,driver_id,connection_json,desired_running,updated_at_ns)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![rec.id, rec.device_id, rec.driver_id, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns],
+        );
+        match n {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(StoreError::Duplicate(format!(
+                    "endpoint `{}` 已存在",
+                    rec.id
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO config_revision(endpoint_id,revision) VALUES(?1,0)",
+            params![rec.id],
+        )?;
+        for (field, ct, nonce) in encs {
+            tx.execute(
+                "INSERT INTO endpoint_secrets(endpoint_id,field_path,ciphertext,nonce,algorithm,key_id,updated_at_ns)
+                 VALUES(?1,?2,?3,?4,'xchacha20poly1305','master',?5)
+                 ON CONFLICT(endpoint_id,field_path) DO UPDATE SET ciphertext=excluded.ciphertext, nonce=excluded.nonce, algorithm=excluded.algorithm, key_id=excluded.key_id, updated_at_ns=excluded.updated_at_ns",
+                params![rec.id, field, ct, nonce, Self::now_ns()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 原子更新 Endpoint + Secrets（单事务）
+    pub fn update_endpoint_with_secrets(
+        &self,
+        rec: &EndpointRecord,
+        secrets_to_upsert: &[(String, String)],
+        secrets_to_delete: &[String],
+    ) -> Result<bool, StoreError> {
+        let v: serde_json::Value =
+            serde_json::from_str(&rec.connection_json).map_err(StoreError::Json)?;
+        if !v.is_object() {
+            return Err(StoreError::Validation("connection 必须为 JSON 对象".into()));
+        }
+        let key = master_key_bytes()?;
+        let mut encs: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
+        for (field, pt) in secrets_to_upsert {
+            let (ct, nonce) = aead_encrypt(pt.as_bytes(), &key)?;
+            encs.push((field.clone(), ct, nonce));
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let n = tx.execute(
+            "UPDATE endpoints SET device_id=?1, driver_id=?2, connection_json=?3, desired_running=?4, updated_at_ns=?5 WHERE id=?6",
+            params![rec.device_id, rec.driver_id, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns, rec.id],
+        )?;
+        if n == 0 {
+            return Ok(false);
+        }
+        for (field, ct, nonce) in encs {
+            tx.execute(
+                "INSERT INTO endpoint_secrets(endpoint_id,field_path,ciphertext,nonce,algorithm,key_id,updated_at_ns)
+                 VALUES(?1,?2,?3,?4,'xchacha20poly1305','master',?5)
+                 ON CONFLICT(endpoint_id,field_path) DO UPDATE SET ciphertext=excluded.ciphertext, nonce=excluded.nonce, algorithm=excluded.algorithm, key_id=excluded.key_id, updated_at_ns=excluded.updated_at_ns",
+                params![rec.id, field, ct, nonce, Self::now_ns()],
+            )?;
+        }
+        for field in secrets_to_delete {
+            tx.execute(
+                "DELETE FROM endpoint_secrets WHERE endpoint_id=?1 AND field_path=?2",
+                params![rec.id, field],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn list_endpoints(&self) -> Result<Vec<EndpointRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

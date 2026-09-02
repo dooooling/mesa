@@ -235,6 +235,7 @@ fn is_secret_marker(v: &serde_json::Value) -> bool {
 }
 
 /// 创建/更新时：将明文密码写入 SecretStore，并将 connection 中的明文替换为 marker
+#[allow(dead_code)]
 fn process_connection_for_store(
     conn: &mut serde_json::Value,
     endpoint_id: &str,
@@ -1040,23 +1041,28 @@ async fn list_endpoints(State(state): State<Arc<AppState>>) -> Json<serde_json::
         .into_iter()
         .map(|s| (s.endpoint_id.clone(), s))
         .collect();
-    let merged: Vec<serde_json::Value> = stored
-        .into_iter()
-        .map(|rec| {
-            let runtime = live.get(&rec.id).cloned();
-            let conn: serde_json::Value =
-                serde_json::from_str(&rec.connection_json).unwrap_or(serde_json::json!({}));
-            serde_json::json!({
-                "id": rec.id,
-                "device_id": rec.device_id,
-                "driver_id": rec.driver_id,
-                "connection": conn,
-                "desired_running": rec.desired_running,
-                "updated_at_ns": rec.updated_at_ns,
-                "runtime": runtime,
-            })
-        })
-        .collect();
+    let mut merged: Vec<serde_json::Value> = Vec::with_capacity(stored.len());
+    for rec in stored {
+        let runtime = live.get(&rec.id).cloned();
+        let mut conn: serde_json::Value =
+            serde_json::from_str(&rec.connection_json).unwrap_or(serde_json::json!({}));
+        // 脱敏：同 get_endpoint，保持列表与详情一致（避免历史明文泄露）
+        if let Ok(desc) = state.manager.get_descriptor(&rec.driver_id).await {
+            let secret_keys = secret_field_keys(&desc.connection);
+            if !secret_keys.is_empty() {
+                conn = redact_connection_for_response(conn, &rec.id, &state.store, &secret_keys);
+            }
+        }
+        merged.push(serde_json::json!({
+            "id": rec.id,
+            "device_id": rec.device_id,
+            "driver_id": rec.driver_id,
+            "connection": conn,
+            "desired_running": rec.desired_running,
+            "updated_at_ns": rec.updated_at_ns,
+            "runtime": runtime,
+        }));
+    }
     Json(serde_json::json!({ "endpoints": merged }))
 }
 
@@ -1245,16 +1251,32 @@ async fn create_endpoint(
             )),
         );
     }
-    // Secret 集成：若 Descriptor 声明 Secret 字段，则将明文写入 SecretStore，connection 仅存 marker
+    // Secret 集成（P0）：Descriptor 必须可用，否则 fail-closed，避免明文绕过 SecretStore
     let mut conn_val = body.connection.clone();
-    if let Ok(desc) = state.manager.get_descriptor(&body.driver_id).await {
-        let secret_keys = secret_field_keys(&desc.connection);
-        if !secret_keys.is_empty() {
-            if let Err(e) =
-                process_connection_for_store(&mut conn_val, &body.id, &state.store, &secret_keys)
-            {
-                return store_err_to_response(e);
+    let mut secrets_to_upsert: Vec<(String, String)> = Vec::new();
+    match state.manager.get_descriptor(&body.driver_id).await {
+        Ok(desc) => {
+            let secret_keys = secret_field_keys(&desc.connection);
+            if !secret_keys.is_empty() {
+                if let Some(obj) = conn_val.as_object_mut() {
+                    for sk in &secret_keys {
+                        if let Some(v) = obj.get(sk).cloned() {
+                            if let Some(s) = v.as_str() {
+                                secrets_to_upsert.push((sk.clone(), s.to_string()));
+                                obj.insert(sk.clone(), serde_json::json!({"secret_set": true}));
+                            } else if is_secret_marker(&v) {
+                                // marker 表示不更新，忽略
+                            }
+                        }
+                    }
+                }
             }
+        }
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": { "code": e.code, "message": e.message } })),
+            );
         }
     }
     let rec = EndpointRecord {
@@ -1265,7 +1287,10 @@ async fn create_endpoint(
         desired_running: false,
         updated_at_ns: mesa_core_types::now_unix_ns(),
     };
-    match state.store.create_endpoint(&rec) {
+    match state
+        .store
+        .create_endpoint_with_secrets(&rec, &secrets_to_upsert)
+    {
         Ok(()) => (
             StatusCode::CREATED,
             Json(serde_json::json!({ "id": rec.id })),
@@ -1309,31 +1334,44 @@ async fn update_endpoint(
     };
     rec.device_id = body.device_id.clone();
     rec.driver_id = body.driver_id.clone();
-    // Secret 集成：处理 Secret 字段的增删改
+    // Secret 集成（P0）：fail-closed + 单事务
     let mut conn_val = body.connection.clone();
-    if let Ok(desc) = state.manager.get_descriptor(&body.driver_id).await {
-        let secret_keys = secret_field_keys(&desc.connection);
-        if !secret_keys.is_empty() {
-            if let Err(e) =
-                process_connection_for_store(&mut conn_val, &id, &state.store, &secret_keys)
-            {
-                return store_err_to_response(e);
-            }
-            // 若本次请求未包含某 Secret 字段，则视为删除该 secret（显式移除）
-            for sk in &secret_keys {
-                if !conn_val
-                    .as_object()
-                    .map(|m| m.contains_key(sk))
-                    .unwrap_or(false)
-                {
-                    let _ = state.store.delete_secret(&id, sk);
+    let mut secrets_to_upsert: Vec<(String, String)> = Vec::new();
+    let mut secrets_to_delete: Vec<String> = Vec::new();
+    match state.manager.get_descriptor(&body.driver_id).await {
+        Ok(desc) => {
+            let secret_keys = secret_field_keys(&desc.connection);
+            if !secret_keys.is_empty() {
+                if let Some(obj) = conn_val.as_object_mut() {
+                    for sk in &secret_keys {
+                        if let Some(v) = obj.get(sk).cloned() {
+                            if let Some(s) = v.as_str() {
+                                secrets_to_upsert.push((sk.clone(), s.to_string()));
+                                obj.insert(sk.clone(), serde_json::json!({"secret_set": true}));
+                            } else if is_secret_marker(&v) {
+                                // 保持不变
+                            }
+                        } else {
+                            // 未包含该 Secret 字段 → 显式删除
+                            secrets_to_delete.push(sk.clone());
+                        }
+                    }
                 }
             }
+        }
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": { "code": e.code, "message": e.message } })),
+            );
         }
     }
     rec.connection_json = serde_json::to_string(&conn_val).unwrap();
     rec.updated_at_ns = mesa_core_types::now_unix_ns();
-    match state.store.update_endpoint(&rec) {
+    match state
+        .store
+        .update_endpoint_with_secrets(&rec, &secrets_to_upsert, &secrets_to_delete)
+    {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "updated": id }))),
         Ok(false) => (
             StatusCode::NOT_FOUND,

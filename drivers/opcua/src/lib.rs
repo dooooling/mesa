@@ -197,7 +197,7 @@ impl Driver for OpcUaDriver {
         let use_native = v
             .get("use_native")
             .and_then(|x| x.as_bool())
-            .unwrap_or(false);
+            .unwrap_or(true);
         let api: Arc<dyn OpcUaApiTrait> = if use_native {
             let native = if let Some(pki) = OpcUaConnConfig::resolve_pki_dir(&v) {
                 NativeOpcUaApi::new_with_pki_dir(pki)
