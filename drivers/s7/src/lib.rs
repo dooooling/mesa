@@ -88,16 +88,46 @@ impl Driver for S7Driver {
                 label: LocalizedText::new("Memory"),
                 parameters: SchemaDescriptor {
                     fields: vec![
-                        FieldDescriptor::new("area", "Area", FieldType::Enum)
-                            .required(true)
-                            .default_value(serde_json::json!("DB")),
+                        {
+                            let mut f = FieldDescriptor::new("area", "Area", FieldType::Enum)
+                                .required(true)
+                                .default_value(serde_json::json!("DB"));
+                            f.validation.enum_options = Some(vec![
+                                "DB".into(),
+                                "M".into(),
+                                "I".into(),
+                                "Q".into(),
+                                "C".into(),
+                                "T".into(),
+                                "PI".into(),
+                                "PQ".into(),
+                                "V".into(),
+                                "L".into(),
+                            ]);
+                            f
+                        },
                         FieldDescriptor::new("db", "DB Number", FieldType::Integer)
                             .required(false)
                             .default_value(serde_json::json!(10)),
                         FieldDescriptor::new("offset", "Offset", FieldType::Integer).required(true),
-                        FieldDescriptor::new("data_type", "Data Type", FieldType::Enum)
-                            .required(true)
-                            .default_value(serde_json::json!("REAL")),
+                        {
+                            let mut f =
+                                FieldDescriptor::new("data_type", "Data Type", FieldType::Enum)
+                                    .required(true)
+                                    .default_value(serde_json::json!("REAL"));
+                            f.validation.enum_options = Some(vec![
+                                "BOOL".into(),
+                                "BYTE".into(),
+                                "WORD".into(),
+                                "DWORD".into(),
+                                "INT".into(),
+                                "DINT".into(),
+                                "REAL".into(),
+                                "CHAR".into(),
+                                "STRING".into(),
+                            ]);
+                            f
+                        },
                         FieldDescriptor::new("bit", "Bit", FieldType::Integer).required(false),
                         FieldDescriptor::new("length", "Length", FieldType::Integer)
                             .required(false),

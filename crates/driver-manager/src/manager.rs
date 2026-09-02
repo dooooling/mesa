@@ -278,8 +278,25 @@ impl MesaManager {
         desc.validate()
             .map_err(|e| DescriptorError::new("DRIVER_DESCRIPTOR_VALIDATION_FAILED", e))?;
 
-        // 校验 contract 版本语义（§4.2）：此处仅透传，若 Core 不支持 Major 可返回 UNSUPPORTED
-        // 暂允许任意 Major，未来 Core 可在此处做兼容性检查
+        // 校验 contract 版本语义（§4.2）：严格校验 Major
+        if major != desc.contract_major || major != 1 {
+            return Err(DescriptorError::new(
+                "DESCRIPTOR_CONTRACT_UNSUPPORTED",
+                format!(
+                    "contract major mismatch: driver reported {major}, descriptor {}/{}, core supports 1",
+                    desc.contract_major, desc.contract_minor
+                ),
+            ));
+        }
+        if desc.contract_major != 1 {
+            return Err(DescriptorError::new(
+                "DESCRIPTOR_CONTRACT_UNSUPPORTED",
+                format!(
+                    "descriptor contract {}.{} not supported, core expects 1.x",
+                    desc.contract_major, desc.contract_minor
+                ),
+            ));
+        }
 
         // 缓存
         self.descriptor_cache.write().unwrap().insert(
@@ -290,7 +307,7 @@ impl MesaManager {
             },
         );
 
-        let _ = (major, minor); // 保留与 proto 协商值一致性检查余地
+        let _ = minor;
         Ok(desc)
     }
 

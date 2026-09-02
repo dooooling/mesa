@@ -79,6 +79,9 @@ impl Driver for FocasDriver {
                     FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
                         .required(false)
                         .default_value(serde_json::json!(3000)),
+                    FieldDescriptor::new("use_native", "Use Native FOCAS", FieldType::Boolean)
+                        .required(false)
+                        .default_value(serde_json::json!(false)),
                 ],
             },
             resources: vec![
@@ -177,9 +180,24 @@ impl Driver for FocasDriver {
                     label: LocalizedText::new("PMC"),
                     parameters: SchemaDescriptor {
                         fields: vec![
-                            FieldDescriptor::new("kind", "Kind", FieldType::Enum)
-                                .required(true)
-                                .default_value(serde_json::json!("R")),
+                            {
+                                let mut f = FieldDescriptor::new("kind", "Kind", FieldType::Enum)
+                                    .required(true)
+                                    .default_value(serde_json::json!("R"));
+                                f.validation.enum_options = Some(vec![
+                                    "G".into(),
+                                    "R".into(),
+                                    "X".into(),
+                                    "Y".into(),
+                                    "F".into(),
+                                    "A".into(),
+                                    "D".into(),
+                                    "C".into(),
+                                    "K".into(),
+                                    "T".into(),
+                                ]);
+                                f
+                            },
                             FieldDescriptor::new("addr", "Address", FieldType::Integer)
                                 .required(true),
                         ],

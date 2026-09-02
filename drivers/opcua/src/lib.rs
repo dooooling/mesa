@@ -83,12 +83,33 @@ impl Driver for OpcUaDriver {
                     FieldDescriptor::new("endpoint_url", "Endpoint URL", FieldType::Url)
                         .required(true)
                         .default_value(serde_json::json!("opc.tcp://127.0.0.1:4840")),
-                    FieldDescriptor::new("security_policy", "Security Policy", FieldType::Enum)
+                    {
+                        let mut f = FieldDescriptor::new(
+                            "security_policy",
+                            "Security Policy",
+                            FieldType::Enum,
+                        )
                         .required(false)
-                        .default_value(serde_json::json!("None")),
-                    FieldDescriptor::new("security_mode", "Security Mode", FieldType::Enum)
-                        .required(false)
-                        .default_value(serde_json::json!("None")),
+                        .default_value(serde_json::json!("None"));
+                        f.validation.enum_options = Some(vec![
+                            "None".into(),
+                            "Basic128Rsa15".into(),
+                            "Basic256".into(),
+                            "Basic256Sha256".into(),
+                            "Aes128_Sha256_RsaOaep".into(),
+                            "Aes256_Sha256_RsaPss".into(),
+                        ]);
+                        f
+                    },
+                    {
+                        let mut f =
+                            FieldDescriptor::new("security_mode", "Security Mode", FieldType::Enum)
+                                .required(false)
+                                .default_value(serde_json::json!("None"));
+                        f.validation.enum_options =
+                            Some(vec!["None".into(), "Sign".into(), "SignAndEncrypt".into()]);
+                        f
+                    },
                     FieldDescriptor::new("username", "Username", FieldType::String).required(false),
                     FieldDescriptor::new("password", "Password", FieldType::Secret).required(false),
                     FieldDescriptor::new("certificate", "Certificate", FieldType::CertificateRef)
@@ -96,6 +117,9 @@ impl Driver for OpcUaDriver {
                     FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
                         .required(false)
                         .default_value(serde_json::json!(5000)),
+                    FieldDescriptor::new("use_native", "Use Native Client", FieldType::Boolean)
+                        .required(false)
+                        .default_value(serde_json::json!(false)),
                 ],
             },
             resources: vec![ResourceDescriptor {
@@ -104,9 +128,34 @@ impl Driver for OpcUaDriver {
                 parameters: SchemaDescriptor {
                     fields: vec![
                         FieldDescriptor::new("node_id", "NodeId", FieldType::String).required(true),
-                        FieldDescriptor::new("attribute", "Attribute", FieldType::Enum)
-                            .required(false)
-                            .default_value(serde_json::json!("Value")),
+                        {
+                            let mut f =
+                                FieldDescriptor::new("attribute", "Attribute", FieldType::Enum)
+                                    .required(false)
+                                    .default_value(serde_json::json!("Value"));
+                            f.validation.enum_options = Some(vec![
+                                "Value".into(),
+                                "BrowseName".into(),
+                                "DisplayName".into(),
+                                "DataType".into(),
+                            ]);
+                            f
+                        },
+                        {
+                            let mut f =
+                                FieldDescriptor::new("data_type", "Data Type", FieldType::Enum)
+                                    .required(false)
+                                    .default_value(serde_json::json!("STRING"));
+                            f.validation.enum_options = Some(vec![
+                                "STRING".into(),
+                                "INT32".into(),
+                                "INT64".into(),
+                                "FLOAT".into(),
+                                "DOUBLE".into(),
+                                "BOOL".into(),
+                            ]);
+                            f
+                        },
                     ],
                 },
                 outputs: vec![OutputDescriptor {

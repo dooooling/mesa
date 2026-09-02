@@ -281,10 +281,11 @@ impl Snapshot {
     pub fn mark_communication_lost(&self, endpoint_id: &str) {
         let mut latest = self.latest.write().unwrap();
         for ((ep, _pid), entry) in latest.iter_mut() {
-            if ep == endpoint_id && entry.quality != "BAD" {
+            if ep == endpoint_id {
                 entry.quality = "BAD".into();
                 entry.quality_code = Some("COMMUNICATION_LOST".into());
                 // 保留 entry.value（typed last value）与 timestamp_ns 不变，不置 Null
+                // 契约：无论之前是 GOOD 还是 BAD/DECODE_FAILED，断线后统一置为 COMMUNICATION_LOST
             }
         }
     }
