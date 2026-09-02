@@ -268,11 +268,47 @@ impl CertStore {
         let alt_cert_path = own_dir.join("cert.der");
         let private_dir = self.base.join("private");
         let alt_key_path = private_dir.join("private.pem");
-        if cert_path.exists()
-            && key_path.exists()
-            && alt_cert_path.exists()
-            && alt_key_path.exists()
-        {
+        // 若主身份已存在，仅修复兼容副本，避免轮换已受信任的 client identity
+        if cert_path.exists() && key_path.exists() {
+            let mut repaired = false;
+            if !alt_cert_path.exists() {
+                let der = fs::read(&cert_path).map_err(|e| e.to_string())?;
+                fs::write(&alt_cert_path, &der).map_err(|e| e.to_string())?;
+                repaired = true;
+            }
+            if !alt_key_path.exists() {
+                fs::create_dir_all(&private_dir).map_err(|e| e.to_string())?;
+                let key_pem = fs::read_to_string(&key_path).map_err(|e| e.to_string())?;
+                // own.key 已是 PEM 文本，直接复制
+                fs::write(&alt_key_path, &key_pem).map_err(|e| e.to_string())?;
+                repaired = true;
+            }
+            // 若仅副本缺失，已修复则返回
+            if key_path.exists()
+                && cert_path.exists()
+                && alt_cert_path.exists()
+                && alt_key_path.exists()
+            {
+                if repaired {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+                            .map_err(|e| e.to_string())?;
+                        fs::set_permissions(&alt_key_path, fs::Permissions::from_mode(0o600))
+                            .map_err(|e| e.to_string())?;
+                    }
+                    return Ok(false);
+                }
+                return Ok(false);
+            }
+        }
+        // 主身份缺任意一文件则视为不完整，fail-closed 不自动轮换，需人工介入
+        if cert_path.exists() != key_path.exists() {
+            return Err("own identity 不完整：own.der/own.key 需成对存在，请检查并修复".into());
+        }
+        if cert_path.exists() && key_path.exists() {
+            // 已在上方处理副本修复，不应到达此处
             return Ok(false);
         }
         // 使用 rcgen 生成（0.13 API）

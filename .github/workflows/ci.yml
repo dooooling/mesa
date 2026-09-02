@@ -59,13 +59,13 @@ jobs:
         run: cargo fmt --check
 
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: build drivers
-        run: cargo build --workspace
+        run: cargo build --locked --workspace
 
       - name: test
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
 
       - name: pnpm install
         run: pnpm --dir apps/mesa-web install

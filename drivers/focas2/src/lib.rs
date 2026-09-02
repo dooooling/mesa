@@ -79,9 +79,6 @@ impl Driver for FocasDriver {
                     FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
                         .required(false)
                         .default_value(serde_json::json!(3000)),
-                    FieldDescriptor::new("use_native", "Use Native FOCAS", FieldType::Boolean)
-                        .required(false)
-                        .default_value(serde_json::json!(true)),
                 ],
             },
             resources: vec![
