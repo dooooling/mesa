@@ -93,12 +93,12 @@ async fn orphan_guard_stdin_eof_exits_child_quickly() {
 /// token 注入端到端：真实子进程 + 正确 token 可握手；错误 token 被拒。
 #[tokio::test]
 async fn subprocess_token_handshake_paths() {
-    // 错误 token：握手必须失败且为握手层错误
+    // 错误 token：握手必须失败且为握手层错误（spawn 后需 connect_retry 处理 listen 窗口竞态）
     let mut p = mesa_driver_manager::process::DriverProcess::spawn(&sim_discovered())
         .await
         .expect("spawn");
     let port = p.port;
-    let res = Session::connect(port, "definitely-wrong").await;
+    let res = Session::connect_retry(port, "definitely-wrong").await;
     match res {
         Ok(_) => panic!("wrong token against real binary must be rejected"),
         Err(e) => assert_handshake_error(e),
