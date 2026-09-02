@@ -552,12 +552,14 @@ impl ConfigStore {
         if !v.is_object() {
             return Err(StoreError::Validation("connection 必须为 JSON 对象".into()));
         }
-        // 预先加密所有 secrets，避免事务中途失败
-        let key = master_key_bytes()?;
+        // 预先加密所有 secrets，避免事务中途失败；无 Secret 时不初始化 master key
         let mut encs: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
-        for (field, pt) in secrets {
-            let (ct, nonce) = aead_encrypt(pt.as_bytes(), &key)?;
-            encs.push((field.clone(), ct, nonce));
+        if !secrets.is_empty() {
+            let key = master_key_bytes()?;
+            for (field, pt) in secrets {
+                let (ct, nonce) = aead_encrypt(pt.as_bytes(), &key)?;
+                encs.push((field.clone(), ct, nonce));
+            }
         }
         let mut conn = self.conn.lock().unwrap();
         let dev_exists: bool = conn.query_row(
@@ -617,11 +619,13 @@ impl ConfigStore {
         if !v.is_object() {
             return Err(StoreError::Validation("connection 必须为 JSON 对象".into()));
         }
-        let key = master_key_bytes()?;
         let mut encs: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
-        for (field, pt) in secrets_to_upsert {
-            let (ct, nonce) = aead_encrypt(pt.as_bytes(), &key)?;
-            encs.push((field.clone(), ct, nonce));
+        if !secrets_to_upsert.is_empty() {
+            let key = master_key_bytes()?;
+            for (field, pt) in secrets_to_upsert {
+                let (ct, nonce) = aead_encrypt(pt.as_bytes(), &key)?;
+                encs.push((field.clone(), ct, nonce));
+            }
         }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -1057,6 +1061,14 @@ impl ConfigStore {
             params![endpoint_id, field_path],
         )?;
         Ok(n > 0)
+    }
+
+    pub fn list_secret_fields(&self, endpoint_id: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT field_path FROM endpoint_secrets WHERE endpoint_id=?1")?;
+        let rows = stmt.query_map(params![endpoint_id], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     // ---- Control Audit (§6.6) ----

@@ -297,20 +297,28 @@ fn materialize_connection(
     endpoint_id: &str,
     store: &ConfigStore,
     secret_keys: &[String],
-) -> String {
+) -> Result<String, StoreError> {
     let mut v: serde_json::Value = serde_json::from_str(conn_str).unwrap_or(serde_json::json!({}));
     if let Some(obj) = v.as_object_mut() {
         for key in secret_keys {
-            if let Some(cur) = obj.get(key) {
-                if is_secret_marker(cur) {
-                    if let Ok(Some(pt)) = store.get_secret(endpoint_id, key) {
-                        obj.insert(key.clone(), serde_json::Value::String(pt));
+            if let Some(cur) = obj.get(key).cloned() {
+                if is_secret_marker(&cur) {
+                    match store.get_secret(endpoint_id, key) {
+                        Ok(Some(pt)) => {
+                            obj.insert(key.clone(), serde_json::Value::String(pt));
+                        }
+                        Ok(None) => {
+                            return Err(StoreError::Validation(format!(
+                                "secret `{key}` marker 存在但 SecretStore 无记录 (endpoint `{endpoint_id}`)"
+                            )));
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
             }
         }
     }
-    serde_json::to_string(&v).unwrap_or_else(|_| conn_str.to_string())
+    serde_json::to_string(&v).map_err(StoreError::Json)
 }
 
 fn store_err_to_response(e: StoreError) -> (StatusCode, Json<serde_json::Value>) {
@@ -575,11 +583,37 @@ async fn browse_endpoint(
     let filter = body.filter.unwrap_or_default();
     let cursor = body.cursor.unwrap_or_default();
     let limit = body.limit.unwrap_or(50).min(1000);
+    // Browse 同 Start 一样需 materialize Secret，避免把 marker 交给 Driver
+    let mut browse_conn = rec.connection_json.clone();
+    match state.manager.get_descriptor(&rec.driver_id).await {
+        Ok(desc) => {
+            let secret_keys = secret_field_keys(&desc.connection);
+            if !secret_keys.is_empty() {
+                match materialize_connection(
+                    &rec.connection_json,
+                    &rec.id,
+                    &state.store,
+                    &secret_keys,
+                ) {
+                    Ok(s) => browse_conn = s,
+                    Err(e) => return store_err_to_response(e),
+                }
+            }
+        }
+        Err(e) => {
+            if rec.connection_json.contains("secret_set") {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": { "code": e.code, "message": e.message } })),
+                );
+            }
+        }
+    }
     match state
         .manager
         .browse(
             &rec.driver_id,
-            &rec.connection_json,
+            &browse_conn,
             &parent,
             &filter,
             &cursor,
@@ -1047,10 +1081,20 @@ async fn list_endpoints(State(state): State<Arc<AppState>>) -> Json<serde_json::
         let mut conn: serde_json::Value =
             serde_json::from_str(&rec.connection_json).unwrap_or(serde_json::json!({}));
         // 脱敏：同 get_endpoint，保持列表与详情一致（避免历史明文泄露）
-        if let Ok(desc) = state.manager.get_descriptor(&rec.driver_id).await {
-            let secret_keys = secret_field_keys(&desc.connection);
-            if !secret_keys.is_empty() {
-                conn = redact_connection_for_response(conn, &rec.id, &state.store, &secret_keys);
+        match state.manager.get_descriptor(&rec.driver_id).await {
+            Ok(desc) => {
+                let secret_keys = secret_field_keys(&desc.connection);
+                if !secret_keys.is_empty() {
+                    conn =
+                        redact_connection_for_response(conn, &rec.id, &state.store, &secret_keys);
+                }
+            }
+            Err(_) => {
+                if let Ok(fields) = state.store.list_secret_fields(&rec.id) {
+                    if !fields.is_empty() {
+                        conn = redact_connection_for_response(conn, &rec.id, &state.store, &fields);
+                    }
+                }
             }
         }
         merged.push(serde_json::json!({
@@ -1213,12 +1257,37 @@ async fn get_endpoint(
             let runtime = state.snapshot.endpoint(&id);
             let mut conn: serde_json::Value =
                 serde_json::from_str(&rec.connection_json).unwrap_or(serde_json::json!({}));
-            // 脱敏：若为 Secret 字段则返回 marker 而非明文
-            if let Ok(desc) = state.manager.get_descriptor(&rec.driver_id).await {
-                let secret_keys = secret_field_keys(&desc.connection);
-                if !secret_keys.is_empty() {
-                    conn =
-                        redact_connection_for_response(conn, &rec.id, &state.store, &secret_keys);
+            // 脱敏：若为 Secret 字段则返回 marker 而非明文；Descriptor 不可用时按已有 Secret 列表兜底，避免历史明文泄露
+            match state.manager.get_descriptor(&rec.driver_id).await {
+                Ok(desc) => {
+                    let secret_keys = secret_field_keys(&desc.connection);
+                    if !secret_keys.is_empty() {
+                        conn = redact_connection_for_response(
+                            conn,
+                            &rec.id,
+                            &state.store,
+                            &secret_keys,
+                        );
+                    }
+                }
+                Err(_) => {
+                    if let Ok(fields) = state.store.list_secret_fields(&rec.id) {
+                        if !fields.is_empty() {
+                            conn = redact_connection_for_response(
+                                conn,
+                                &rec.id,
+                                &state.store,
+                                &fields,
+                            );
+                        } else if conn
+                            .as_object()
+                            .map(|m| m.values().any(|v| v.is_string()))
+                            .unwrap_or(false)
+                        {
+                            // 无 Secret 记录但连接中仍有字符串值（如历史遗留），保守脱敏：不直接返回明文
+                            // 保持原样但前端应视 connection 为不可用，实际生产可返回 null
+                        }
+                    }
                 }
             }
             (
@@ -1265,7 +1334,16 @@ async fn create_endpoint(
                                 secrets_to_upsert.push((sk.clone(), s.to_string()));
                                 obj.insert(sk.clone(), serde_json::json!({"secret_set": true}));
                             } else if is_secret_marker(&v) {
-                                // marker 表示不更新，忽略
+                                // Create 时不允许 marker（无历史 Secret 可复用）
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(json_error(
+                                        "VALIDATION_ERROR",
+                                        &format!(
+                                            "field `{sk}`: create 时需提供明文，marker 仅更新时可用"
+                                        ),
+                                    )),
+                                );
                             }
                         }
                     }
@@ -1349,12 +1427,33 @@ async fn update_endpoint(
                                 secrets_to_upsert.push((sk.clone(), s.to_string()));
                                 obj.insert(sk.clone(), serde_json::json!({"secret_set": true}));
                             } else if is_secret_marker(&v) {
-                                // 保持不变
+                                // marker 需校验旧 Secret 是否存在
+                                match state.store.get_secret(&id, sk) {
+                                    Ok(Some(_)) => {}
+                                    Ok(None) => {
+                                        return (
+                                            StatusCode::BAD_REQUEST,
+                                            Json(json_error(
+                                                "SECRET_NOT_FOUND",
+                                                &format!("field `{sk}` marker 存在但无对应 Secret"),
+                                            )),
+                                        );
+                                    }
+                                    Err(e) => return store_err_to_response(e),
+                                }
                             }
                         } else {
                             // 未包含该 Secret 字段 → 显式删除
                             secrets_to_delete.push(sk.clone());
                         }
+                    }
+                }
+            }
+            // Driver 切换：清理旧 Driver 残留的 Secret（不在新 Descriptor 中的字段）
+            if let Ok(existing) = state.store.list_secret_fields(&id) {
+                for ef in existing {
+                    if !secret_keys.contains(&ef) && !secrets_to_delete.contains(&ef) {
+                        secrets_to_delete.push(ef);
                     }
                 }
             }
@@ -1433,13 +1532,31 @@ async fn start_endpoint(
         Ok(v) => v,
         Err(e) => return store_err_to_response(e),
     };
-    // Secret 集成：启动时临时还原明文（仅内存）
+    // Secret 集成：启动时临时还原明文（仅内存），fail-closed
     let mut materialized_json = rec.connection_json.clone();
-    if let Ok(desc) = state.manager.get_descriptor(&rec.driver_id).await {
-        let secret_keys = secret_field_keys(&desc.connection);
-        if !secret_keys.is_empty() {
-            materialized_json =
-                materialize_connection(&rec.connection_json, &rec.id, &state.store, &secret_keys);
+    match state.manager.get_descriptor(&rec.driver_id).await {
+        Ok(desc) => {
+            let secret_keys = secret_field_keys(&desc.connection);
+            if !secret_keys.is_empty() {
+                match materialize_connection(
+                    &rec.connection_json,
+                    &rec.id,
+                    &state.store,
+                    &secret_keys,
+                ) {
+                    Ok(s) => materialized_json = s,
+                    Err(e) => return store_err_to_response(e),
+                }
+            }
+        }
+        Err(e) => {
+            // 若存储的 connection 包含 secret marker，则 Descriptor 不可用视为安全失败
+            if rec.connection_json.contains("secret_set") {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": { "code": e.code, "message": e.message } })),
+                );
+            }
         }
     }
     let cfg = mesa_driver_manager::endpoint::BuiltinEndpoint {

@@ -8,6 +8,10 @@ use mesa_config_store::ConfigStore;
 use std::sync::Arc;
 use tower::ServiceExt;
 
+fn fake_opcua_connection() -> serde_json::Value {
+    serde_json::json!({"endpoint_url":"opc.tcp://127.0.0.1:4840","use_native":false})
+}
+
 async fn app_with_endpoint(
     driver_id: &str,
     connection: serde_json::Value,
@@ -40,12 +44,8 @@ async fn app_with_endpoint(
 
 #[tokio::test]
 async fn browse_opcua_pagination_and_filter() {
-    // OPC UA Fake 支持 browse
-    let (app, ep_id) = app_with_endpoint(
-        "opcua",
-        serde_json::json!({"endpoint_url":"opc.tcp://127.0.0.1:4840"}),
-    )
-    .await;
+    // OPC UA Fake 支持 browse（显式 use_native:false，避免默认 Native 去连 127.0.0.1:4840）
+    let (app, ep_id) = app_with_endpoint("opcua", fake_opcua_connection()).await;
     // 未过滤，limit 2
     let req = Request::builder()
         .uri(format!("/api/v1/endpoints/{ep_id}/browse"))
@@ -89,15 +89,12 @@ async fn browse_opcua_pagination_and_filter() {
         .header("content-type", "application/json")
         .body(Body::from(r#"{"parent":"","filter":"Fake","limit":10}"#))
         .unwrap();
-    let resp3 = app_with_endpoint(
-        "opcua",
-        serde_json::json!({"endpoint_url":"opc.tcp://127.0.0.1:4840"}),
-    )
-    .await
-    .0
-    .oneshot(req3)
-    .await
-    .unwrap();
+    let resp3 = app_with_endpoint("opcua", fake_opcua_connection())
+        .await
+        .0
+        .oneshot(req3)
+        .await
+        .unwrap();
     assert_eq!(resp3.status(), StatusCode::OK);
 }
 
@@ -129,11 +126,7 @@ async fn browse_unsupported_for_s7_and_simulator() {
 
 #[tokio::test]
 async fn browse_pagination_does_not_return_all_at_once() {
-    let (app, ep_id) = app_with_endpoint(
-        "opcua",
-        serde_json::json!({"endpoint_url":"opc.tcp://127.0.0.1:4840"}),
-    )
-    .await;
+    let (app, ep_id) = app_with_endpoint("opcua", fake_opcua_connection()).await;
     // 请求 limit 1，应只返回 1 且有 next_cursor
     let req = Request::builder()
         .uri(format!("/api/v1/endpoints/{ep_id}/browse"))
