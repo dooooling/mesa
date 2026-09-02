@@ -112,8 +112,7 @@ impl Driver for OpcUaDriver {
                     },
                     FieldDescriptor::new("username", "Username", FieldType::String).required(false),
                     FieldDescriptor::new("password", "Password", FieldType::Secret).required(false),
-                    FieldDescriptor::new("certificate", "Certificate", FieldType::CertificateRef)
-                        .required(false),
+                    // V2.1 单一 Client 身份（own/own.der），CertificateRef 预留多身份时再以 opaque thumbprint 引入
                     FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
                         .required(false)
                         .default_value(serde_json::json!(5000)),

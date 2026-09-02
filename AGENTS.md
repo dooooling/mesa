@@ -8,11 +8,11 @@
 - **V2.1 已落地**：`Mesa_Driver_MVP_实施方案.md V1.4` 基线上的动态 UI / Secret / Browse / Control / 原子事务 / 50K 验收等扩展；`feat/v2.1-impl` 为当前开发分支
 - `rust-toolchain.toml channel="1.95.0"` / `Node 22.18 pnpm 10.28` / `apps/mesa-web`（AntD 最小管理端）
 
-## 常用命令（M0 已验证）
+## 常用命令（已验证，rust 1.95.0）
 
 ```bash
 cargo build --workspace                                             # 构建（含全部驱动 bin）
-cargo test --workspace                                              # 全部测试（当前 42 个，含 §21 全量 Contract Test）
+cargo test --workspace                                              # 全部测试（含 §21 全量 Contract Test + V2.1 扩展）
 ./target/release/mesad                                         # 从 workspace 根启动（默认 drivers/ 目录 + 端口 8132）
 ```
 
@@ -30,7 +30,7 @@ Contract Test 基线（§21 全部 20 项）位于 `tests/driver-contract/tests/
 
 ## 项目是什么
 
-Mesa：工业设备统一采集平台 Driver MVP。Rust + Tokio + Protobuf IPC + SQLite。三类独立进程 Driver：S7（Siemens PLC）、FOCAS2（FANUC CNC）、OPC UA。
+Mesa：工业设备统一采集平台。Rust + Tokio + Protobuf IPC + SQLite。独立进程 Driver：S7（Siemens PLC）、FOCAS2（FANUC CNC）、OPC UA、Simulator（V2.1 四类）。
 
 计划目录结构见文档 §23（10 个 crate 的 cargo workspace + `drivers/` + `apps/mesad`）。
 
@@ -41,7 +41,7 @@ Mesa：工业设备统一采集平台 Driver MVP。Rust + Tokio + Protobuf IPC +
 - `point_id` 由 **Core 分配并持久化**，Driver/Core 重启后必须保持稳定（删除走 tombstone）；高频通道只传 `(connection_handle, point_id) + TypedValue`
 - 业务时间戳 = UTC Unix ns；性能测量用宿主机单调时钟，禁止两进程 UTC 相减
 - Driver 为独立进程：token 经 stdin 传入并持续监控该管道（EOF 即自杀退出）；Linux `PR_SET_PDEATHSIG`、Windows Job Object `KILL_ON_JOB_CLOSE` 防孤儿
-- V1 **严格只读**，不引入任何设备写路径
+- V1 兼容基线严格只读；V2.1 Control 默认 `disabled`，仅 `mesad --enable-control` 显式开启时允许 Write/Command，否则 `CONTROL_DISABLED`
 - 配置变更为全量快照替换；运行中的 Endpoint 改任务必须走 Stop → ConfigureTasks → ApplyPointMap → Start（新 `stream_epoch`），不允许热 Apply
 - **配置真值只在 Core**：Driver 进程不持久化业务配置，重启后由 Core 重放（Handshake → OpenConnection → ConfigureTasks → restore PointMap → Start）
 - **管理边界**：CLI 仅作为 REST API 客户端，禁止直接读写 SQLite 或证书目录；REST 默认仅绑定 loopback
