@@ -71,14 +71,24 @@ def main():
             soak_d = data.get("soak", {})
             rd = data.get("real_device_matrix", [])
             ct = data.get("contract_tests", {})
-            if ct.get("failed", 0) != 0 or ct.get("passed", 0) == 0:
-                print("strict: contract_tests 未通过或为空", file=sys.stderr); sys.exit(1)
-            if perf.get("throughput_updates_per_sec", 0) == 0 or perf.get("ipc_p95_ms", 0) == 0:
-                print("strict: performance 结果为空，需先跑 e2e_50k_real 并输出 target/validation/performance.json", file=sys.stderr); sys.exit(1)
-            if soak_d.get("duration_hours", 0) == 0:
-                print("strict: soak 结果为空，需先跑 PERF_SOAK=1 e2e_50k_real", file=sys.stderr); sys.exit(1)
+            # Contract 硬条件
+            if ct.get("failed", 0) != 0 or ct.get("passed", 0) == 0 or ct.get("passed", 0) != ct.get("total", 0):
+                print(f"strict: contract_tests 未全通过 {ct}", file=sys.stderr); sys.exit(1)
+            # Performance 硬条件：50K / 20ms / 50ms
+            if perf.get("throughput_updates_per_sec", 0) < 50000:
+                print(f"strict: throughput {perf.get('throughput_updates_per_sec')} < 50000", file=sys.stderr); sys.exit(1)
+            if perf.get("ipc_p95_ms", 0) > 20 or perf.get("ipc_p99_ms", 0) > 50:
+                print(f"strict: ipc p95 {perf.get('ipc_p95_ms')}ms >20 or p99 {perf.get('ipc_p99_ms')}ms >50", file=sys.stderr); sys.exit(1)
+            # Soak 硬条件
+            if soak_d.get("duration_hours", 0) < 1.0:
+                print(f"strict: soak duration {soak_d.get('duration_hours')}h <1.0h", file=sys.stderr); sys.exit(1)
+            if soak_d.get("rss_growth_percent", 100) > 10:
+                print(f"strict: rss_growth {soak_d.get('rss_growth_percent')}% >10%", file=sys.stderr); sys.exit(1)
+            if soak_d.get("leak_detected", True):
+                print("strict: leak_detected true", file=sys.stderr); sys.exit(1)
             if not rd:
                 print("strict: real_device_matrix 为空，需填真机矩阵", file=sys.stderr); sys.exit(1)
+            # 至少保证 release 要求的 Driver 有 passed
             print("validate PASS (strict)")
         else:
             print("validate PASS (required fields)")

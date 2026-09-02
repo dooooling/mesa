@@ -82,12 +82,18 @@ async fn main() {
         tracing::info!(pki=%pki.display(), "set MESA_OPCUA_PKI_DIR");
     }
 
-    let app_state = mesa_core_api::AppState::new_with_control(
+    let app_state = match mesa_core_api::AppState::try_new_with_control(
         manager.clone(),
         store.clone(),
         args.drivers_dir.clone(),
         args.enable_control,
-    );
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("certificate initialization failed: {e}");
+            std::process::exit(1);
+        }
+    };
     if args.enable_control {
         tracing::warn!("control plane ENABLED (--enable-control)");
     } else {

@@ -9,6 +9,10 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 fn fake_opcua_connection() -> serde_json::Value {
+    // 允许测试显式使用 Fake 驱动
+    unsafe {
+        std::env::set_var("MESA_ALLOW_FAKE_NATIVE", "1");
+    }
     serde_json::json!({"endpoint_url":"opc.tcp://127.0.0.1:4840","use_native":false})
 }
 

@@ -46,6 +46,21 @@ impl AppState {
         Self::new_with_cert_dir(manager, store, drivers_dir, CertStore::default_path())
     }
 
+    pub fn try_new_with_control(
+        manager: Arc<MesaManager>,
+        store: Arc<ConfigStore>,
+        drivers_dir: String,
+        enable_control: bool,
+    ) -> Result<Arc<Self>, String> {
+        Self::try_new_with_cert_dir_and_control(
+            manager,
+            store,
+            drivers_dir,
+            CertStore::default_path(),
+            enable_control,
+        )
+    }
+
     pub fn new_with_control(
         manager: Arc<MesaManager>,
         store: Arc<ConfigStore>,
@@ -70,23 +85,22 @@ impl AppState {
         Self::new_with_cert_dir_and_control(manager, store, drivers_dir, cert_dir, false)
     }
 
-    pub fn new_with_cert_dir_and_control(
+    pub fn try_new_with_cert_dir_and_control(
         manager: Arc<MesaManager>,
         store: Arc<ConfigStore>,
         drivers_dir: String,
         cert_dir: std::path::PathBuf,
         enable_control: bool,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, String> {
         let snapshot = manager.snapshot();
         let cert_store = Arc::new(CertStore::new(cert_dir));
-        // 确保目录并生成 own 证书（忽略错误，仅日志）
-        if let Err(e) = cert_store.ensure_dirs() {
-            tracing::warn!(error=%e, "证书目录创建失败");
-        }
-        if let Err(e) = cert_store.ensure_own_cert() {
-            tracing::warn!(error=%e, "own 证书生成失败");
-        }
-        Arc::new(Self {
+        cert_store
+            .ensure_dirs()
+            .map_err(|e| format!("证书目录创建失败: {e}"))?;
+        cert_store
+            .ensure_own_cert()
+            .map_err(|e| format!("own 证书初始化失败: {e}"))?;
+        Ok(Arc::new(Self {
             snapshot,
             manager,
             store,
@@ -94,6 +108,41 @@ impl AppState {
             start_time: Instant::now(),
             cert_store,
             enable_control,
+        }))
+    }
+
+    pub fn new_with_cert_dir_and_control(
+        manager: Arc<MesaManager>,
+        store: Arc<ConfigStore>,
+        drivers_dir: String,
+        cert_dir: std::path::PathBuf,
+        enable_control: bool,
+    ) -> Arc<Self> {
+        let manager_c = manager.clone();
+        let store_c = store.clone();
+        let drivers_dir_c = drivers_dir.clone();
+        let cert_dir_c = cert_dir.clone();
+        Self::try_new_with_cert_dir_and_control(
+            manager,
+            store,
+            drivers_dir,
+            cert_dir,
+            enable_control,
+        )
+        .unwrap_or_else(move |e| {
+            tracing::error!(error=%e, "证书初始化失败（兼容旧路径，仍启动但已告警）");
+            // 兼容旧 warn 路径：极端情况下仍返回实例，避免单测因证书目录不可写而崩
+            let snapshot = manager_c.snapshot();
+            let cert_store = Arc::new(CertStore::new(cert_dir_c));
+            Arc::new(Self {
+                snapshot,
+                manager: manager_c,
+                store: store_c,
+                drivers_dir: drivers_dir_c,
+                start_time: Instant::now(),
+                cert_store,
+                enable_control,
+            })
         })
     }
 }

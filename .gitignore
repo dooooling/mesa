@@ -44,3 +44,7 @@ tests/driver-contract/data/
 /aarch64-mesad
 /arm_test.sh
 /arm_s7*.sh
+
+# Release 产物（每次生成，非长期提交）
+/release-validation.json
+/target/validation/

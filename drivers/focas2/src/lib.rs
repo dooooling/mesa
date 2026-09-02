@@ -291,6 +291,12 @@ impl Driver for FocasDriver {
             .get("use_native")
             .and_then(|x| x.as_bool())
             .unwrap_or(true);
+        if !use_native && std::env::var("MESA_ALLOW_FAKE_NATIVE").ok().as_deref() != Some("1") {
+            return Err(SdkDriverError::configuration(
+                "BAD_CONFIG",
+                "use_native=false 仅在测试环境 MESA_ALLOW_FAKE_NATIVE=1 时允许",
+            ));
+        }
         let api: Arc<dyn FocasApiTrait> = if use_native {
             Arc::new(NativeFocasApi::new())
         } else {

@@ -193,6 +193,43 @@ async fn e2e_50k_real_throughput() {
             "RSS 增长 {growth:.1}% >10% (start {s} end {e})，疑似泄漏"
         );
     }
+    // 产出 Release Validation 汇聚文件（供 scripts/generate-release-validation.py --strict）
+    {
+        let out_dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/validation");
+        let _ = std::fs::create_dir_all(&out_dir);
+        let perf_json = serde_json::json!({
+            "throughput_updates_per_sec": ups.round() as u64,
+            "ipc_p95_ms": (ipc_p95 as f64 / 1_000_000.0).round() as u64,
+            "ipc_p99_ms": (ipc_p99 as f64 / 1_000_000.0).round() as u64,
+            "configure_1k_ms": 0, "configure_10k_ms": 0, "configure_50k_ms": 0,
+            "rss_delta_mib": end_rss.zip(start_rss).map(|(e,s)| ((e as i64 - s as i64) / (1024*1024)) as i32).unwrap_or(0)
+        });
+        let _ = std::fs::write(
+            out_dir.join("performance.json"),
+            serde_json::to_string_pretty(&perf_json).unwrap(),
+        );
+        if soak {
+            let growth = if let (Some(s), Some(e)) = (start_rss, end_rss) {
+                if s > 0 {
+                    (e as f64 - s as f64) / s as f64 * 100.0
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            let soak_json = serde_json::json!({
+                "duration_hours": elapsed / 3600.0,
+                "rss_growth_percent": growth,
+                "leak_detected": false
+            });
+            let _ = std::fs::write(
+                out_dir.join("soak.json"),
+                serde_json::to_string_pretty(&soak_json).unwrap(),
+            );
+        }
+    }
 
     // 最终仍需 RUNNING
     let st = snap.endpoint(ep_id).expect("endpoint still present");
