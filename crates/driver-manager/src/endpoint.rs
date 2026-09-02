@@ -271,8 +271,14 @@ pub async fn run_endpoint(
             }
         }
 
+        // 成功运行后重连归零，否则指数退避
+        if last_epoch != 0 {
+            backoff_idx = 0;
+        }
         let delay = Duration::from_secs(reconnect_backoff_secs(backoff_idx));
-        backoff_idx += 1;
+        if backoff_idx < 10 {
+            backoff_idx += 1;
+        }
         tracing::info!(endpoint = %cfg.endpoint_id, retry_in_secs = delay.as_secs(), "reconnecting");
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}

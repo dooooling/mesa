@@ -135,7 +135,12 @@ impl MesaManager {
     }
 
     pub fn is_running(&self, endpoint_id: &str) -> bool {
-        self.running.lock().unwrap().contains_key(endpoint_id)
+        let map = self.running.lock().unwrap();
+        if let Some(entry) = map.get(endpoint_id) {
+            !entry.handle.is_finished()
+        } else {
+            false
+        }
     }
 
     pub fn running_ids(&self) -> Vec<String> {

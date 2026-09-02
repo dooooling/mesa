@@ -97,6 +97,9 @@ pub struct EndpointStatus {
 pub struct LatestEntry {
     pub endpoint_id: String,
     pub point_id: u32,
+    #[serde(alias = "key")]
+    pub point_key: String,
+    // 兼容：同时输出 key，避免旧 UI 读取 point_key 为 undefined
     pub key: String,
     #[serde(flatten)]
     pub value: ValueJson,
@@ -173,11 +176,17 @@ impl Snapshot {
 
     /// 记录点元数据（ApplyPointMap 时）：point_id -> point_key，
     /// 供 latest 输出回填可读键名；数据类型由值本身携带（ValueJson.type）。
+    /// 语义为 replace：先清理该 endpoint 的旧映射，再插入新集合，避免减少任务后旧点残留。
     pub fn register_points(&self, endpoint_id: &str, defs: &[mesa_core_types::PointDefinition]) {
         let mut keys = self.keys.write().unwrap();
+        keys.retain(|(ep, _), _| ep != endpoint_id);
         for d in defs {
             keys.insert((endpoint_id.to_string(), d.point_id), d.point_key.clone());
         }
+        // 同步清理 latest 中已不在新点集的旧点
+        let valid_ids: std::collections::HashSet<u32> = defs.iter().map(|d| d.point_id).collect();
+        let mut latest = self.latest.write().unwrap();
+        latest.retain(|(ep, pid), _| ep != endpoint_id || valid_ids.contains(pid));
     }
 
     /// 应用一个批次到 LatestValueCache。同点覆盖即"最新值胜出"的 Core 侧体现。
@@ -205,10 +214,12 @@ impl Snapshot {
         let mut latest = self.latest.write().unwrap();
         for pv in &batch.values {
             let k = (endpoint_id.to_string(), pv.point_id);
+            let point_key = keys_snapshot.get(&k).cloned().unwrap_or_default();
             let entry = LatestEntry {
                 endpoint_id: endpoint_id.to_string(),
                 point_id: pv.point_id,
-                key: keys_snapshot.get(&k).cloned().unwrap_or_default(),
+                point_key: point_key.clone(),
+                key: point_key,
                 value: value_to_json(&pv.value),
                 quality: pv.quality.as_str().to_string(),
                 quality_code: pv.quality_code.map(|c| c.to_string()).or_else(|| {
@@ -288,6 +299,18 @@ impl Snapshot {
                 // 契约：无论之前是 GOOD 还是 BAD/DECODE_FAILED，断线后统一置为 COMMUNICATION_LOST
             }
         }
+    }
+
+    pub fn remove_endpoint(&self, endpoint_id: &str) {
+        self.keys
+            .write()
+            .unwrap()
+            .retain(|(ep, _), _| ep != endpoint_id);
+        self.latest
+            .write()
+            .unwrap()
+            .retain(|(ep, _), _| ep != endpoint_id);
+        self.endpoints.write().unwrap().remove(endpoint_id);
     }
 
     pub fn latest_all(&self) -> Vec<LatestEntry> {
