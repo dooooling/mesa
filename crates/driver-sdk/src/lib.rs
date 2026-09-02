@@ -242,6 +242,9 @@ impl DataSink {
     /// 派生绑定到特定 Connection 的发布端：独立合并缓冲（不同连接不互相合并），
     /// 共享有界通道。Start 时由 SDK 调用；驱动在 run() 中拿到的即为此实例，
     /// 无需关心 handle/epoch 的注入细节。
+    // FIXME: writer_loop 当前仅对 session.sink 调用 flush_pending()，for_connection() 派生的独立
+    // CoalescerState.pending 可能未被及时冲回通道；当前测试通过不代表该路径已覆盖，
+    // 后续需将 flush 语义改为按连接或全局注册表统一调度（见本次 Stop barrier 修复后的待办）。
     pub fn for_connection(&self, handle: u32, stream_epoch: u64) -> Self {
         Self {
             control_tx: self.control_tx.clone(),
@@ -442,6 +445,10 @@ struct Session {
     sink: DataSink,
     /// Arc 化以便 run 任务结束时把连接对象归还回表（Stop→Start 可重复）。
     entries: Arc<Mutex<HashMap<u32, ConnEntry>>>,
+    /// 当前允许发送数据的 stream_epoch（handle -> active epoch）。
+    /// Start 时插入，Stop/Close 时移除；writer 在真正写 socket 前检查，丢弃已停止/过期 epoch 的旧批次。
+    /// 该门控使成功的 StopConnectionAck 成为数据面 barrier：Ack 后 Core 不得再观察到该 epoch 的 DataBatch。
+    active_epochs: Arc<Mutex<HashMap<u32, u64>>>,
     // TODO: PlanSnapshot 冻结字段，msg_ids 为 IPC 信封递增 ID，V1 Control 面预留，当前 Data 面未单独递增但需保留以备全量序列追踪
     #[allow(dead_code)]
     msg_ids: AtomicU64,
@@ -578,6 +585,7 @@ pub async fn serve_with_faults<D: Driver>(
         driver: Box::new(driver),
         sink,
         entries: Arc::new(Mutex::new(HashMap::new())),
+        active_epochs: Arc::new(Mutex::new(HashMap::new())),
         msg_ids: AtomicU64::new(2),
     };
 
@@ -588,6 +596,7 @@ pub async fn serve_with_faults<D: Driver>(
         control_rx,
         data_rx,
         session.sink.clone(),
+        Arc::clone(&session.active_epochs),
         writer_shutdown,
     ));
 
@@ -613,6 +622,7 @@ async fn writer_loop(
     mut control_rx: mpsc::Receiver<pb::Envelope>,
     mut data_rx: mpsc::Receiver<DataBatch>,
     sink: DataSink,
+    active_epochs: Arc<Mutex<HashMap<u32, u64>>>,
     shutdown: CancellationToken,
 ) {
     loop {
@@ -633,6 +643,16 @@ async fn writer_loop(
             },
             d = data_rx.recv() => match d {
                 Some(batch) => {
+                    // Epoch Gate：已停止/过期的 stream 不得再发送（StopAck 为数据面 barrier）。
+                    // 即使 batch 已在 Data Queue 中排队，也在真正写 socket 前丢弃。
+                    let allowed = {
+                        let g = active_epochs.lock().unwrap();
+                        g.get(&batch.connection_handle).copied() == Some(batch.stream_epoch)
+                    };
+                    if !allowed {
+                        // 丢弃过期批次，不写出；继续处理下一个
+                        continue;
+                    }
                     let env = pb::Envelope {
                         msg_id: 0,
                         body: Some(pb::envelope::Body::DataBatch(batch_to_pb(&batch))),
@@ -1033,6 +1053,12 @@ async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
             });
         }
     }
+    // 激活 epoch 门控：此后该 handle 的旧 epoch 批次将被 writer 丢弃
+    session
+        .active_epochs
+        .lock()
+        .unwrap()
+        .insert(req.connection_handle, req.stream_epoch);
 
     // Start 的 Ack 复用请求 msg_id，便于 Core 侧关联
     session
@@ -1051,6 +1077,12 @@ async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
 
 async fn on_stop(session: &Session, req: pb::StopConnection, msg_id: u64) {
     session.stop_run(req.connection_handle).await;
+    // 去活门控：StopAck 为数据面 barrier，之后旧 epoch 的排队批次必须丢弃
+    session
+        .active_epochs
+        .lock()
+        .unwrap()
+        .remove(&req.connection_handle);
     session
         .sink
         .send_control(pb::Envelope {
@@ -1067,6 +1099,11 @@ async fn on_stop(session: &Session, req: pb::StopConnection, msg_id: u64) {
 
 async fn on_close(session: &Session, req: pb::CloseConnection, msg_id: u64) {
     session.stop_run(req.connection_handle).await;
+    session
+        .active_epochs
+        .lock()
+        .unwrap()
+        .remove(&req.connection_handle);
     session
         .entries
         .lock()
