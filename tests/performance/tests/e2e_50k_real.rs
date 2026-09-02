@@ -198,12 +198,35 @@ async fn e2e_50k_real_throughput() {
         let out_dir =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/validation");
         let _ = std::fs::create_dir_all(&out_dir);
+        let git_sha = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let mode = if soak {
+            "soak"
+        } else if long {
+            "long"
+        } else {
+            "quick"
+        };
         let perf_json = serde_json::json!({
             "throughput_updates_per_sec": ups.round() as u64,
             "ipc_p95_ms": (ipc_p95 as f64 / 1_000_000.0).round() as u64,
             "ipc_p99_ms": (ipc_p99 as f64 / 1_000_000.0).round() as u64,
             "configure_1k_ms": 0, "configure_10k_ms": 0, "configure_50k_ms": 0,
-            "rss_delta_mib": end_rss.zip(start_rss).map(|(e,s)| ((e as i64 - s as i64) / (1024*1024)) as i32).unwrap_or(0)
+            "rss_delta_mib": end_rss.zip(start_rss).map(|(e,s)| ((e as i64 - s as i64) / (1024*1024)) as i32).unwrap_or(0),
+            "git_sha": git_sha,
+            "generated_at_ns": mesa_core_types::now_unix_ns(),
+            "mode": mode,
+            "duration_seconds": elapsed
         });
         let _ = std::fs::write(
             out_dir.join("performance.json"),
@@ -222,7 +245,11 @@ async fn e2e_50k_real_throughput() {
             let soak_json = serde_json::json!({
                 "duration_hours": elapsed / 3600.0,
                 "rss_growth_percent": growth,
-                "leak_detected": false
+                "leak_detected": false,
+                "git_sha": git_sha,
+                "generated_at_ns": mesa_core_types::now_unix_ns(),
+                "mode": "soak",
+                "duration_seconds": elapsed
             });
             let _ = std::fs::write(
                 out_dir.join("soak.json"),

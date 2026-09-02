@@ -311,6 +311,28 @@ impl CertStore {
             // 已在上方处理副本修复，不应到达此处
             return Ok(false);
         }
+        // 主 pair 全无但兼容副本完整 → 从兼容副本恢复，避免重新生成导致 Server 不再信任
+        if !cert_path.exists()
+            && !key_path.exists()
+            && alt_cert_path.exists()
+            && alt_key_path.exists()
+        {
+            let der = fs::read(&alt_cert_path).map_err(|e| e.to_string())?;
+            fs::write(&cert_path, &der).map_err(|e| e.to_string())?;
+            let key_pem = fs::read_to_string(&alt_key_path).map_err(|e| e.to_string())?;
+            fs::write(&key_path, &key_pem).map_err(|e| e.to_string())?;
+            // 通过 DER 还原 PEM（若 alt_key 为 PEM，直接已恢复；若需额外兼容，保持一致）
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+                    .map_err(|e| e.to_string())?;
+                fs::set_permissions(&alt_key_path, fs::Permissions::from_mode(0o600))
+                    .map_err(|e| e.to_string())?;
+            }
+            tracing::info!("已从兼容副本恢复 own identity");
+            return Ok(false);
+        }
         // 使用 rcgen 生成（0.13 API）
         let certified = rcgen::generate_simple_self_signed(vec!["Mesa-opcua".to_string()])
             .map_err(|e| e.to_string())?;

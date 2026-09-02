@@ -41,6 +41,7 @@ async fn app_with_endpoint(
         .unwrap();
     let drivers_dir = common::repo_root().join("drivers");
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
+    #[allow(deprecated)]
     let state = mesa_core_api::AppState::new(mgr, store, drivers_dir.to_string_lossy().to_string());
     let router = mesa_core_api::router(state);
     (router, ep_id)

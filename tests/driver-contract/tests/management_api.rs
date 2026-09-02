@@ -12,6 +12,7 @@ async fn app() -> (axum::Router, Arc<mesa_driver_manager::MesaManager>) {
     let store = Arc::new(ConfigStore::open_in_memory().unwrap());
     let drivers_dir = common::repo_root().join("drivers");
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
+    #[allow(deprecated)]
     let state = mesa_core_api::AppState::new(
         mgr.clone(),
         store,

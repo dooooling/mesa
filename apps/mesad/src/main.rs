@@ -49,7 +49,29 @@ async fn main() {
         source,
     ));
 
-    // ---- 恢复期望运行的 Endpoint ----
+    // ---- PKI 初始化（必须在恢复 Endpoint/启动 Driver 之前，确保 OPC UA Secure 证书就绪）----
+    if std::env::var("MESA_OPCUA_PKI_DIR").is_err() {
+        let pki = mesa_core_api::certificates::CertStore::default_path();
+        unsafe {
+            std::env::set_var("MESA_OPCUA_PKI_DIR", &pki);
+        }
+        tracing::info!(pki=%pki.display(), "set MESA_OPCUA_PKI_DIR");
+    }
+
+    let app_state = match mesa_core_api::AppState::try_new_with_control(
+        manager.clone(),
+        store.clone(),
+        args.drivers_dir.clone(),
+        args.enable_control,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("certificate initialization failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // ---- 恢复期望运行的 Endpoint（已保证 PKI/证书就绪，避免 Secure Endpoint 竞态）----
     let stored_eps = store.list_endpoints().unwrap_or_default();
     if stored_eps.is_empty() {
         tracing::warn!("no endpoints in store; create one via REST POST /api/v1/endpoints");
@@ -72,28 +94,6 @@ async fn main() {
     }
 
     // ---- REST 服务 ----
-    // 注入 OPC UA pki_dir 环境（优先级：已有 env > 默认），供 Native 驱动子进程继承
-    if std::env::var("MESA_OPCUA_PKI_DIR").is_err() {
-        let pki = mesa_core_api::certificates::CertStore::default_path();
-        // 安全性：早期启动单线程，环境变量写入无数据竞争
-        unsafe {
-            std::env::set_var("MESA_OPCUA_PKI_DIR", &pki);
-        }
-        tracing::info!(pki=%pki.display(), "set MESA_OPCUA_PKI_DIR");
-    }
-
-    let app_state = match mesa_core_api::AppState::try_new_with_control(
-        manager.clone(),
-        store.clone(),
-        args.drivers_dir.clone(),
-        args.enable_control,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("certificate initialization failed: {e}");
-            std::process::exit(1);
-        }
-    };
     if args.enable_control {
         tracing::warn!("control plane ENABLED (--enable-control)");
     } else {

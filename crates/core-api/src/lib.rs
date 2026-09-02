@@ -38,6 +38,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[allow(deprecated)]
     pub fn new(
         manager: Arc<MesaManager>,
         store: Arc<ConfigStore>,
@@ -61,6 +62,11 @@ impl AppState {
         )
     }
 
+    #[allow(deprecated)]
+    #[deprecated(
+        since = "0.1.0",
+        note = "use try_new_with_control (fail-closed); fail-open constructor is test-only"
+    )]
     pub fn new_with_control(
         manager: Arc<MesaManager>,
         store: Arc<ConfigStore>,
@@ -76,6 +82,11 @@ impl AppState {
         )
     }
 
+    #[allow(deprecated)]
+    #[deprecated(
+        since = "0.1.0",
+        note = "use try_new_with_cert_dir_and_control; fail-open is test-only"
+    )]
     pub fn new_with_cert_dir(
         manager: Arc<MesaManager>,
         store: Arc<ConfigStore>,
@@ -111,6 +122,10 @@ impl AppState {
         }))
     }
 
+    #[deprecated(
+        since = "0.1.0",
+        note = "use try_new_with_cert_dir_and_control (fail-closed); fail-open is test-only"
+    )]
     pub fn new_with_cert_dir_and_control(
         manager: Arc<MesaManager>,
         store: Arc<ConfigStore>,
