@@ -172,7 +172,7 @@ fn load_or_create_master_key_file() -> Result<[u8; 32], StoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::write(target, &key);
+        let _ = std::fs::write(target, key);
         let _ = std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600));
     }
     #[cfg(not(unix))]
