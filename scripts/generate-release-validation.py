@@ -18,6 +18,26 @@ def sh(cmd):
 def git_short():
     return sh("git rev-parse --short HEAD")
 
+def git_full():
+    return sh("git rev-parse HEAD")
+
+def is_clean_tree():
+    try:
+        out = subprocess.check_output(["git", "status", "--porcelain"], text=True)
+        return out.strip() == ""
+    except Exception:
+        return False
+
+def sha_matches(evidence_sha, head_full):
+    if not evidence_sha or not head_full or head_full == "unknown":
+        return False
+    # 证据可能是 40 或 7 位，均做前缀兼容
+    if len(evidence_sha) == 40 and len(head_full) == 40:
+        return evidence_sha == head_full
+    if len(evidence_sha) >= 7 and len(head_full) >= 7:
+        return head_full.startswith(evidence_sha) or evidence_sha.startswith(head_full)
+    return evidence_sha == head_full
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="release-validation.json")
@@ -29,8 +49,10 @@ def main():
     ap.add_argument("--real-device-json", default=None)
     args = ap.parse_args()
 
-    git_sha = git_short()
+    git_sha = git_full()
+    git_sha_short = git_short()
     rust_ver = sh("rustc --version")
+    clean = is_clean_tree()
     def load_json(p):
         try:
             return json.loads(pathlib.Path(p).read_text(encoding="utf-8"))
@@ -66,7 +88,9 @@ def main():
     doc = {
         "schema_version": "1.0.0",
         "git_sha": git_sha,
+        "git_sha_short": git_sha_short,
         "generated_at_ns": int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9),
+        "dirty": not clean,
         "environment": {
             "os": f"{platform.system()} {platform.release()}",
             "cpu": platform.processor() or "unknown",
@@ -94,6 +118,11 @@ def main():
             if k not in data:
                 print(f"missing {k}", file=sys.stderr); sys.exit(1)
         if args.strict:
+            # 工作树必须干净，否则证据与代码不一致
+            if not clean:
+                print("strict: 工作树不干净 (git status --porcelain 非空)，请提交后再生成 Release Evidence", file=sys.stderr); sys.exit(1)
+            if data.get("dirty"):
+                print("strict: release-validation dirty==true", file=sys.stderr); sys.exit(1)
             perf = data.get("performance", {}) if isinstance(data.get("performance"), dict) else {}
             soak_d = data.get("soak", {}) if isinstance(data.get("soak"), dict) else {}
             rd = data.get("real_device_matrix", [])
@@ -104,19 +133,23 @@ def main():
             suites = ct.get("suites", [])
             if not isinstance(suites, list) or not suites or not all(isinstance(s, str) for s in suites):
                 print(f"strict: contract_tests.suites 需为 string[] 当前 {suites}", file=sys.stderr); sys.exit(1)
-            # --- Evidence 与 commit 绑定 ---
+            # --- Evidence 与 commit 绑定（40位全量，兼容短 7 位）---
             def check_sha(name, obj):
                 if not isinstance(obj, dict):
                     print(f"strict: {name} 需为 object 且携带 git_sha", file=sys.stderr); sys.exit(1)
                 sha = obj.get("git_sha")
                 if not sha or not isinstance(sha, str):
                     print(f"strict: {name}.git_sha 缺失，旧结果不能冒充新版本", file=sys.stderr); sys.exit(1)
-                if sha != git_sha:
+                if not sha_matches(sha, git_sha):
                     print(f"strict: {name}.git_sha {sha} != HEAD {git_sha}（旧 evidence）", file=sys.stderr); sys.exit(1)
+                if obj.get("dirty"):
+                    print(f"strict: {name} dirty==true，证据来自脏工作树", file=sys.stderr); sys.exit(1)
             # contract 必须绑定
             check_sha("contract_tests", ct)
-            # performance 必须绑定且为 soak 且 duration >=3600
+            # performance 必须绑定且为 soak 且 duration >=3600 且 release build
             check_sha("performance", perf)
+            if perf.get("build_profile") and perf.get("build_profile") != "release":
+                print(f"strict: performance.build_profile 需为 release 当前 {perf.get('build_profile')}", file=sys.stderr); sys.exit(1)
             mode = perf.get("mode")
             if mode != "soak":
                 print(f"strict: performance.mode 需为 soak 当前 {mode}", file=sys.stderr); sys.exit(1)
@@ -134,11 +167,15 @@ def main():
             # real-device 也需绑定（若 wrapper 存在）
             if rd_wrapper is not None:
                 rsha = rd_wrapper.get("git_sha")
-                if not rsha or rsha != git_sha:
+                if not rsha or not sha_matches(rsha, git_sha):
                     print(f"strict: real_device.git_sha {rsha} != HEAD {git_sha}", file=sys.stderr); sys.exit(1)
+                if rd_wrapper.get("dirty"):
+                    print("strict: real_device dirty==true", file=sys.stderr); sys.exit(1)
             elif isinstance(real_dev_raw, dict) and real_dev_raw.get("git_sha"):
-                if real_dev_raw.get("git_sha") != git_sha:
+                if not sha_matches(real_dev_raw.get("git_sha"), git_sha):
                     print(f"strict: real_device git_sha mismatch", file=sys.stderr); sys.exit(1)
+                if real_dev_raw.get("dirty"):
+                    print("strict: real_device dirty==true", file=sys.stderr); sys.exit(1)
             elif isinstance(real_dev_raw, list):
                 # 旧数组形态无绑定，直接失败，避免旧证据冒充
                 print("strict: real_device 证据未绑定 git_sha（需 object 含 git_sha + entries）", file=sys.stderr); sys.exit(1)

@@ -194,12 +194,14 @@ async fn e2e_50k_real_throughput() {
         );
     }
     // 产出 Release Validation 汇聚文件（供 scripts/generate-release-validation.py --strict）
+    // 注意：当前 RSS 仅度量 Core/Test 进程自身（/proc/self/status 或 sysinfo 当前进程），
+    // 不含独立 Driver 子进程全量，文档中应表述为 Core/Test process RSS growth。
     {
         let out_dir =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/validation");
         let _ = std::fs::create_dir_all(&out_dir);
         let git_sha = std::process::Command::new("git")
-            .args(["rev-parse", "--short", "HEAD"])
+            .args(["rev-parse", "HEAD"])
             .output()
             .ok()
             .and_then(|o| {
@@ -210,6 +212,18 @@ async fn e2e_50k_real_throughput() {
                 }
             })
             .unwrap_or_else(|| "unknown".to_string());
+        let git_sha_short = git_sha.chars().take(7).collect::<String>();
+        let dirty = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false);
+        let build_profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
         let mode = if soak {
             "soak"
         } else if long {
@@ -224,9 +238,13 @@ async fn e2e_50k_real_throughput() {
             "configure_1k_ms": 0, "configure_10k_ms": 0, "configure_50k_ms": 0,
             "rss_delta_mib": end_rss.zip(start_rss).map(|(e,s)| ((e as i64 - s as i64) / (1024*1024)) as i32).unwrap_or(0),
             "git_sha": git_sha,
+            "git_sha_short": git_sha_short,
             "generated_at_ns": mesa_core_types::now_unix_ns(),
             "mode": mode,
-            "duration_seconds": elapsed
+            "duration_seconds": elapsed,
+            "build_profile": build_profile,
+            "dirty": dirty,
+            "rss_scope": "core_test_process"
         });
         let _ = std::fs::write(
             out_dir.join("performance.json"),
@@ -247,9 +265,13 @@ async fn e2e_50k_real_throughput() {
                 "rss_growth_percent": growth,
                 "leak_detected": false,
                 "git_sha": git_sha,
+                "git_sha_short": git_sha_short,
                 "generated_at_ns": mesa_core_types::now_unix_ns(),
                 "mode": "soak",
-                "duration_seconds": elapsed
+                "duration_seconds": elapsed,
+                "build_profile": build_profile,
+                "dirty": dirty,
+                "rss_scope": "core_test_process"
             });
             let _ = std::fs::write(
                 out_dir.join("soak.json"),

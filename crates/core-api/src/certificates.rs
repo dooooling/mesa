@@ -311,6 +311,16 @@ impl CertStore {
             // 已在上方处理副本修复，不应到达此处
             return Ok(false);
         }
+        // 主全无时 compat 半套也 fail-closed，避免静默轮换（主完整时仅修复副本不报错）
+        if !cert_path.exists()
+            && !key_path.exists()
+            && (alt_cert_path.exists() != alt_key_path.exists())
+        {
+            return Err(
+                "compat identity 不完整：own/cert.der 与 private/private.pem 需成对存在，请检查并修复"
+                    .into(),
+            );
+        }
         // 主 pair 全无但兼容副本完整 → 从兼容副本恢复，避免重新生成导致 Server 不再信任
         if !cert_path.exists()
             && !key_path.exists()
@@ -417,5 +427,67 @@ mod tests {
         assert!(removed);
         let trusted2 = store.list("trusted").unwrap();
         assert_eq!(trusted2.len(), 0);
+    }
+
+    #[test]
+    fn ensure_own_main_half_fail_closed() {
+        let tmp = TempDir::new().unwrap();
+        let store = CertStore::new(tmp.path());
+        store.ensure_own_cert().unwrap();
+        // 制造主半套：删 own.key
+        std::fs::remove_file(tmp.path().join("own/own.key")).unwrap();
+        let err = store.ensure_own_cert().unwrap_err();
+        assert!(err.contains("own identity 不完整"));
+    }
+
+    #[test]
+    fn ensure_own_main_empty_compat_complete_restores() {
+        let tmp = TempDir::new().unwrap();
+        let store = CertStore::new(tmp.path());
+        store.ensure_own_cert().unwrap();
+        // 记录原始 DER
+        let orig_der = std::fs::read(tmp.path().join("own/own.der")).unwrap();
+        // 删主 pair
+        std::fs::remove_file(tmp.path().join("own/own.der")).unwrap();
+        std::fs::remove_file(tmp.path().join("own/own.key")).unwrap();
+        assert!(!tmp.path().join("own/own.der").exists());
+        // compat 仍完整（ensure_own 已双写）
+        assert!(tmp.path().join("own/cert.der").exists());
+        assert!(tmp.path().join("private/private.pem").exists());
+        // 再次 ensure 应从 compat 恢复而非重新生成
+        let created = store.ensure_own_cert().unwrap();
+        assert!(!created);
+        let restored = std::fs::read(tmp.path().join("own/own.der")).unwrap();
+        assert_eq!(orig_der, restored);
+    }
+
+    #[test]
+    fn ensure_own_main_empty_compat_half_fail_closed() {
+        let tmp = TempDir::new().unwrap();
+        let store = CertStore::new(tmp.path());
+        store.ensure_own_cert().unwrap();
+        // 删主
+        std::fs::remove_file(tmp.path().join("own/own.der")).unwrap();
+        std::fs::remove_file(tmp.path().join("own/own.key")).unwrap();
+        // 制造 compat 半套：删 private
+        std::fs::remove_file(tmp.path().join("private/private.pem")).unwrap();
+        assert!(tmp.path().join("own/cert.der").exists());
+        assert!(!tmp.path().join("private/private.pem").exists());
+        let err = store.ensure_own_cert().unwrap_err();
+        assert!(err.contains("compat identity 不完整"));
+    }
+
+    #[test]
+    fn ensure_own_main_complete_compat_missing_repairs() {
+        let tmp = TempDir::new().unwrap();
+        let store = CertStore::new(tmp.path());
+        store.ensure_own_cert().unwrap();
+        // 删 compat
+        std::fs::remove_file(tmp.path().join("own/cert.der")).unwrap();
+        std::fs::remove_file(tmp.path().join("private/private.pem")).unwrap();
+        let created = store.ensure_own_cert().unwrap();
+        assert!(!created);
+        assert!(tmp.path().join("own/cert.der").exists());
+        assert!(tmp.path().join("private/private.pem").exists());
     }
 }

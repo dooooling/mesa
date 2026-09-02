@@ -50,18 +50,24 @@ async fn main() {
     ));
 
     // ---- PKI 初始化（必须在恢复 Endpoint/启动 Driver 之前，确保 OPC UA Secure 证书就绪）----
+    // 只 resolve 一次 PKI 路径，Core 与 Driver 共用（自定义 MESA_OPCUA_PKI_DIR 时避免分叉）
+    let pki_dir = std::env::var_os("MESA_OPCUA_PKI_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(mesa_core_api::certificates::CertStore::default_path);
     if std::env::var("MESA_OPCUA_PKI_DIR").is_err() {
-        let pki = mesa_core_api::certificates::CertStore::default_path();
         unsafe {
-            std::env::set_var("MESA_OPCUA_PKI_DIR", &pki);
+            std::env::set_var("MESA_OPCUA_PKI_DIR", &pki_dir);
         }
-        tracing::info!(pki=%pki.display(), "set MESA_OPCUA_PKI_DIR");
+        tracing::info!(pki=%pki_dir.display(), "set MESA_OPCUA_PKI_DIR (default)");
+    } else {
+        tracing::info!(pki=%pki_dir.display(), "using MESA_OPCUA_PKI_DIR");
     }
 
-    let app_state = match mesa_core_api::AppState::try_new_with_control(
+    let app_state = match mesa_core_api::AppState::try_new_with_cert_dir_and_control(
         manager.clone(),
         store.clone(),
         args.drivers_dir.clone(),
+        pki_dir,
         args.enable_control,
     ) {
         Ok(s) => s,
