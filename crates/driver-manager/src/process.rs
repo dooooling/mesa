@@ -143,6 +143,7 @@ fn generate_session_token() -> String {
 // ---------------------------------------------------------------------------
 
 mod job {
+    #[cfg(windows)]
     use std::sync::OnceLock;
 
     /// Core 进程级唯一 Job Object：Core 终止后 OS 自动清理全部成员进程。
@@ -243,10 +244,5 @@ mod job {
             }
             Ok(JobHandle(handle))
         }
-    }
-
-    #[cfg(not(windows))]
-    fn create_core_job() -> Result<(), u32> {
-        unreachable!("non-windows has no core job")
     }
 }
