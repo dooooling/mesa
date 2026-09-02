@@ -46,6 +46,15 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: echo "PROTOC=/usr/bin/protoc" >> $GITHUB_ENV
 
+      - name: debug protoc (ubuntu)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          echo "PROTOC=$PROTOC"
+          protoc --version
+          ls -l proto/driver.proto
+          echo "CARGO_MANIFEST_DIR test"
+          ls -l crates/driver-protocol/build.rs
+
       - name: fmt
         run: cargo fmt --check
 
@@ -59,7 +68,7 @@ jobs:
         run: cargo test --workspace --all-features
 
       - name: pnpm install
-        run: pnpm install
+        run: pnpm --dir apps/mesa-web install
 
       - name: web build
         run: pnpm --filter mesa-web build
