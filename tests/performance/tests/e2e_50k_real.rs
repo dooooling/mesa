@@ -16,8 +16,9 @@ fn percentile(mut v: Vec<u64>, p: f64) -> u64 {
     v[idx.min(v.len() - 1)]
 }
 
+#[allow(dead_code)]
 fn current_rss_bytes() -> Option<u64> {
-    // Linux: /proc/self/status VmRSS
+    // Linux: /proc/self/status VmRSS（无 self-perturbation）
     #[cfg(target_os = "linux")]
     {
         if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
@@ -37,14 +38,45 @@ fn current_rss_bytes() -> Option<u64> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // Windows/Mac：尝试 sysinfo 兜底
-        let mut sys = sysinfo::System::new_all();
-        sys.refresh_memory();
+        // Windows/Mac：sysinfo 兜底（已废弃 new_all 高扰动路径，改为持久 Probe）
+        // 此函数仅保留用于非 Soak 快速路径；Soak 下使用 RssProbe::sample()
+        let mut sys = sysinfo::System::new();
         let pid = sysinfo::Pid::from(std::process::id() as usize);
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            false,
+            sysinfo::ProcessRefreshKind::new().with_memory(),
+        );
         if let Some(p) = sys.process(pid) {
             return Some(p.memory());
         }
         None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+struct RssProbe {
+    sys: sysinfo::System,
+    pid: sysinfo::Pid,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl RssProbe {
+    fn new() -> Self {
+        let pid = sysinfo::Pid::from(std::process::id() as usize);
+        Self {
+            sys: sysinfo::System::new(),
+            pid,
+        }
+    }
+
+    fn sample(&mut self) -> Option<u64> {
+        self.sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[self.pid]),
+            false,
+            sysinfo::ProcessRefreshKind::new().with_memory(),
+        );
+        self.sys.process(self.pid).map(|p| p.memory())
     }
 }
 
@@ -114,6 +146,15 @@ async fn e2e_50k_real_throughput() {
         snap.endpoint(ep_id)
     );
 
+    // P1-1/2：持久化 RSS Probe，避免每分钟 System::new_all() 自扰动；
+    // 在 warm-up 前即创建并预热一次，使 probe 自身分配不污染基线。
+    #[cfg(not(target_os = "linux"))]
+    let mut rss_probe = {
+        let mut p = RssProbe::new();
+        let _ = p.sample();
+        p
+    };
+
     // Soak 测量模型：warm-up 5min 后取稳态基线，再正式 60min 验收；阈值仍 §22 的 10%，
     // 但 start 已为高水位后的稳态值，避免冷启动基线误判。期间每 60s 采样一次用于趋势判断。
     let warmup = if soak {
@@ -136,11 +177,22 @@ async fn e2e_50k_real_throughput() {
             st_warm
         );
     }
-    // fail-closed：Soak 下 warm-up 后必须可读取稳态基线
+    // fail-closed：Soak 下 warm-up 后必须可读取稳态基线（Probe 复用）
+    #[cfg(target_os = "linux")]
     let start_rss = if soak {
         Some(current_rss_bytes().expect("PERF_SOAK warm-up 后必须能够读取 RSS baseline"))
     } else {
         current_rss_bytes()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let start_rss = if soak {
+        Some(
+            rss_probe
+                .sample()
+                .expect("PERF_SOAK warm-up 后必须能够读取 RSS baseline"),
+        )
+    } else {
+        rss_probe.sample()
     };
     let steady_rss_mib = start_rss.map(|v| v as f64 / (1024.0 * 1024.0));
     println!(
@@ -165,7 +217,10 @@ async fn e2e_50k_real_throughput() {
         while remaining > Duration::from_secs(0) {
             let step = remaining.min(sample_interval);
             tokio::time::sleep(step).await;
+            #[cfg(target_os = "linux")]
             let v = current_rss_bytes().expect("PERF_SOAK 周期 RSS 采样失败");
+            #[cfg(not(target_os = "linux"))]
+            let v = rss_probe.sample().expect("PERF_SOAK 周期 RSS 采样失败");
             rss_samples.push(v);
             end_rss = Some(v);
             remaining = remaining.saturating_sub(step);
@@ -181,7 +236,14 @@ async fn e2e_50k_real_throughput() {
     } else {
         tokio::time::sleep(dur).await;
         elapsed = start.elapsed().as_secs_f64();
-        end_rss = current_rss_bytes();
+        #[cfg(target_os = "linux")]
+        {
+            end_rss = current_rss_bytes();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            end_rss = rss_probe.sample();
+        }
         if let Some(v) = end_rss {
             rss_samples.push(v);
         }
@@ -265,6 +327,46 @@ async fn e2e_50k_real_throughput() {
             "rss soak growth {growth:.1}% start {s} end {e} peak {:?} samples {} warmup 300s steady baseline",
             rss_peak, rss_sample_count
         );
+        // P1-3：失败诊断文件，即使 Gate FAIL 也保留完整 61 samples（非 Release Evidence，strict 不读）
+        {
+            let out_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/validation");
+            let _ = std::fs::create_dir_all(&out_dir);
+            let git_sha = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            let rss_samples_mib: Vec<f64> = rss_samples
+                .iter()
+                .map(|v| *v as f64 / (1024.0 * 1024.0))
+                .collect();
+            let diag = serde_json::json!({
+                "passed": growth <= 10.0,
+                "failure": if growth <= 10.0 { serde_json::Value::Null } else { serde_json::Value::String("RSS_GROWTH".into()) },
+                "rss_probe": if cfg!(target_os = "linux") { "proc_status" } else { "sysinfo_current_pid_reused" },
+                "git_sha": git_sha,
+                "warmup_seconds": warmup.as_secs(),
+                "rss_start_mib": s as f64 / (1024.0*1024.0),
+                "rss_end_mib": e as f64 / (1024.0*1024.0),
+                "rss_peak_mib": rss_peak.map(|v| v as f64 / (1024.0*1024.0)),
+                "rss_sample_count": rss_sample_count,
+                "rss_samples_mib": rss_samples_mib,
+                "rss_growth_percent": growth,
+                "elapsed_seconds": elapsed,
+            });
+            let _ = std::fs::write(
+                out_dir.join("soak-diagnostic.json"),
+                serde_json::to_string_pretty(&diag).unwrap(),
+            );
+        }
         assert!(
             growth <= 10.0,
             "RSS 增长 {growth:.1}% >10% (start {s} end {e} peak {:?} samples {})，疑似泄漏或 warm-up 不足",
