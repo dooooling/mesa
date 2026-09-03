@@ -29,9 +29,12 @@ async fn main() {
     }
     match api.read_batch(&addrs).await {
         Ok(vals) => {
-            println!("read OK {} values", vals.len());
-            for (i, v) in vals.iter().enumerate() {
-                println!("  {}: {:?}", i, v);
+            println!("read OK {} DataValues", vals.len());
+            for (i, dv) in vals.iter().enumerate() {
+                println!(
+                    "  {}: status={:?} ts={:?} value={:?}",
+                    i, dv.status, dv.source_timestamp, dv.value
+                );
             }
         }
         Err(e) => println!("read failed: {}", e),

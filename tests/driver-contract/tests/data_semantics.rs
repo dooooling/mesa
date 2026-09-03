@@ -4,7 +4,7 @@
 use mesa_config_store::ConfigStore;
 use mesa_core_types::{
     AcquisitionTask, DataBatch, DataType, DriverBinding, PointDescriptor, PointValue, Quality,
-    TaskMode, Value, ensure_unique_point_keys, now_unix_ns,
+    TaskMode, Value, ValueOrigin, ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_manager::snapshot::Snapshot;
 
@@ -29,6 +29,7 @@ fn bad_value_type_still_matches_descriptor() {
         quality: Quality::Bad,
         quality_code: Some(1),
         source_timestamp_ns: None,
+        value_origin: ValueOrigin::Placeholder,
     };
     assert_eq!(pv.quality, Quality::Bad);
     assert_eq!(pv.value.data_type(), DataType::I32);
@@ -386,6 +387,7 @@ fn one_output_bad_does_not_poison_sibling() {
                 quality: Quality::Bad,
                 quality_code: Some(1),
                 source_timestamp_ns: None,
+                value_origin: ValueOrigin::Placeholder,
             },
             PointValue::good(2, Value::I32(99)),
         ],

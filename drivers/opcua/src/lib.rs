@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 //! OPC UA Driver — 方案 §7.3 节点/订阅/浏览型（V1 只读，44/44 2026-08-29）。
 //!
 //! - Poll 绑定：`opcua.node-group`
@@ -32,7 +33,7 @@ use std::time::Duration;
 
 use mesa_core_types::{
     AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, GENERIC_BINDING_KIND,
-    GenericBinding, PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value,
+    GenericBinding, PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, ValueOrigin,
     ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
@@ -496,6 +497,17 @@ fn coerce_value(v: Value, dt: DataType) -> Value {
     }
 }
 
+/// OPC UA DateTime ticks (1601-01-01, 100ns) → Unix ns（§7.3 精确保留）
+fn ticks_to_unix_ns(ticks: i64) -> i64 {
+    const TICKS_PER_SEC: i64 = 10_000_000;
+    const UNIX_TICKS_OFFSET: i64 = 11644473600 * TICKS_PER_SEC;
+    (ticks - UNIX_TICKS_OFFSET) * 100
+}
+
+fn source_timestamp_ns_from_dv(dv: &opcua_types::DataValue) -> Option<i64> {
+    dv.source_timestamp.map(|dt| ticks_to_unix_ns(dt.ticks()))
+}
+
 #[async_trait::async_trait]
 impl DriverConnection for OpcUaConnection {
     async fn configure(
@@ -939,52 +951,102 @@ impl DriverConnection for OpcUaConnection {
                     handles.push(tokio::spawn(async move {
                         let mut ticker = tokio::time::interval(interval);
                         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        // §5.5 last-known 连续性：按 point_id 缓存最近 GOOD 的 typed 值
+                        let mut last_known: HashMap<u32, Value> = HashMap::new();
                         loop {
                             tokio::select! {
                                 _ = ticker.tick() => {},
                                 _ = shutdown.cancelled() => break,
                             }
                             let addrs: Vec<OpcUaAddress> = points.iter().map(|(s, _)| s.addr.clone()).collect();
-                            let values = match api.read_batch(&addrs).await {
+                            let data_values = match api.read_batch(&addrs).await {
                                 Ok(v) => v,
                                 Err(e) => {
                                     tracing::error!(task=%task_id, error=%e, "OPC UA 读失败");
                                     return Err(SdkDriverError::new(mesa_core_types::ErrorKind::Connection, "READ_FAILED", e));
                                 }
                             };
-                            if values.len() != points.len() {
-                                tracing::warn!(task=%task_id, got=values.len(), expected=points.len(), "OPC UA 返回数量不一致");
+                            if data_values.len() != points.len() {
+                                tracing::warn!(task=%task_id, got=data_values.len(), expected=points.len(), "OPC UA 返回数量不一致");
                                 continue;
                             }
                             let mut batch_vals = Vec::with_capacity(points.len());
-                            for ((spec, pid), raw_val) in points.iter().zip(values) {
-                                if let Value::String(s) = &raw_val
-                                    && s.starts_with("ERR:") {
-                                        let q = if s.contains("Uncertain") { Quality::Uncertain } else { Quality::Bad };
-                                        let code = if s.contains("Uncertain") { Some(0x40000000) } else { Some(1) };
-                                        tracing::warn!(key=%spec.key, error=%s, quality=?q, "单点非 Good");
-                                        batch_vals.push(PointValue {
-                                            point_id: *pid,
-                                            value: raw_val,
-                                            quality: q,
-                                            quality_code: code,
-                                            source_timestamp_ns: None,
-                                        });
-                                        continue;
+                            for ((spec, pid), dv) in points.iter().zip(data_values) {
+                                let status = dv.status.unwrap_or(opcua_types::StatusCode::Good);
+                                let source_ts = source_timestamp_ns_from_dv(&dv);
+                                // 正常 GOOD 路径：保留 SourceTimestamp，不伪造 now
+                                if status.is_good() {
+                                    if let Some(variant) = dv.value {
+                                        if let Some(raw_val) = crate::opcua_api::variant_to_value(&variant) {
+                                            let coerced = coerce_value(raw_val, spec.data_type);
+                                            if !value_fits_data_type(&coerced, spec.data_type) {
+                                                tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配，按 BAD 隔离");
+                                                // 类型不匹配视为单点 BAD，按 placeholder/last-known 隔离
+                                                let cached = last_known.get(pid).cloned();
+                                                let (val, origin) = if let Some(v) = cached {
+                                                    (v, ValueOrigin::LastKnown)
+                                                } else {
+                                                    (Value::typed_placeholder(spec.data_type), ValueOrigin::Placeholder)
+                                                };
+                                                batch_vals.push(PointValue {
+                                                    point_id: *pid,
+                                                    value: val,
+                                                    quality: Quality::Bad,
+                                                    quality_code: Some(status.bits() as i32),
+                                                    source_timestamp_ns: source_ts,
+                                                    value_origin: origin,
+                                                });
+                                                continue;
+                                            }
+                                            // 成功 GOOD：更新 last_known，origin CURRENT
+                                            last_known.insert(*pid, coerced.clone());
+                                            batch_vals.push(PointValue {
+                                                point_id: *pid,
+                                                value: coerced,
+                                                quality: Quality::Good,
+                                                quality_code: None,
+                                                source_timestamp_ns: source_ts,
+                                                value_origin: ValueOrigin::Current,
+                                            });
+                                            continue;
+                                        }
                                     }
-                                let coerced = coerce_value(raw_val, spec.data_type);
-                                if !value_fits_data_type(&coerced, spec.data_type) {
-                                    tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配跳过");
-                                    continue;
+                                    // Good 状态但无 value / 转换失败 → 单点 BAD，保留 typed 语义
+                                    tracing::warn!(key=%spec.key, "DataValue Good 但无 value，按 BAD 隔离");
+                                    let cached = last_known.get(pid).cloned();
+                                    let (val, origin) = if let Some(v) = cached {
+                                        (v, ValueOrigin::LastKnown)
+                                    } else {
+                                        (Value::typed_placeholder(spec.data_type), ValueOrigin::Placeholder)
+                                    };
+                                    batch_vals.push(PointValue {
+                                        point_id: *pid,
+                                        value: val,
+                                        quality: Quality::Bad,
+                                        quality_code: Some(opcua_types::StatusCode::BadUnexpectedError.bits() as i32),
+                                        source_timestamp_ns: source_ts,
+                                        value_origin: origin,
+                                    });
+                                } else {
+                                    // BAD / Uncertain：typed BAD，携带 quality_code 与原 source_timestamp，value 用 last_known 或 placeholder
+                                    let q = crate::opcua_api::status_to_quality(status);
+                                    let code = Some(status.bits() as i32);
+                                    let cached = last_known.get(pid).cloned();
+                                    let (val, origin) = if let Some(v) = cached {
+                                        (v, ValueOrigin::LastKnown)
+                                    } else {
+                                        (Value::typed_placeholder(spec.data_type), ValueOrigin::Placeholder)
+                                    };
+                                    tracing::warn!(key=%spec.key, status=?status, quality=?q, origin=?origin, "单点非 Good，typed BAD 隔离");
+                                    batch_vals.push(PointValue {
+                                        point_id: *pid,
+                                        value: val,
+                                        quality: q,
+                                        quality_code: code,
+                                        source_timestamp_ns: source_ts,
+                                        value_origin: origin,
+                                    });
                                 }
-                                let ts = now_unix_ns();
-                                batch_vals.push(PointValue {
-                                    point_id: *pid,
-                                    value: coerced,
-                                    quality: Quality::Good,
-                                    quality_code: None,
-                                    source_timestamp_ns: Some(ts),
-                                });
                             }
                             if batch_vals.is_empty() { continue; }
                             sink.publish(DataBatch {
@@ -1014,16 +1076,28 @@ impl DriverConnection for OpcUaConnection {
                                 match api.browse(&spec.addr).await {
                                     Ok(refs) => {
                                         let val = Value::String(refs.join(";"));
-                                        batch_vals.push(PointValue::good(*pid, val));
+                                        batch_vals.push(PointValue {
+                                            point_id: *pid,
+                                            value: val,
+                                            quality: Quality::Good,
+                                            quality_code: None,
+                                            source_timestamp_ns: None,
+                                            value_origin: ValueOrigin::Current,
+                                        });
                                     }
                                     Err(e) => {
                                         tracing::warn!(key=%spec.key, error=%e, "Browse 单点 Bad");
+                                        // Browse 失败亦为 typed BAD + Placeholder（无 last-known 缓存，Browse 非连续信号）
                                         batch_vals.push(PointValue {
                                             point_id: *pid,
-                                            value: Value::String(format!("ERR:{}", e)),
+                                            value: Value::typed_placeholder(spec.data_type),
                                             quality: Quality::Bad,
-                                            quality_code: Some(1),
+                                            quality_code: Some(
+                                                opcua_types::StatusCode::BadUnexpectedError.bits()
+                                                    as i32,
+                                            ),
                                             source_timestamp_ns: None,
+                                            value_origin: ValueOrigin::Placeholder,
                                         });
                                     }
                                 }
@@ -1067,6 +1141,7 @@ impl DriverConnection for OpcUaConnection {
                             }
                         };
                         tracing::info!(task=%task_id, sub_id=%sub_id, "OPC UA 订阅已建立");
+                        let mut last_known: HashMap<u32, Value> = HashMap::new();
                         // 订阅事件循环：DataChangeCallback → mpsc → 批量聚合 → DataSink，KeepAlive 自然无事件不产批
                         loop {
                             let first = tokio::select! {
@@ -1090,54 +1165,36 @@ impl DriverConnection for OpcUaConnection {
                                     continue;
                                 };
                                 let dv = ev.data_value;
-                                // 状态按 OPC UA StatusCode 映射 GOOD/UNCERTAIN/BAD (§9.3)
-                                if let Some(status) = dv.status
-                                    && !status.is_good() {
-                                        let q = crate::opcua_api::status_to_quality(status);
-                                        tracing::warn!(key=%spec.key, status=?status, quality=?q, "单点非 Good");
-                                        batch_vals.push(PointValue {
-                                            point_id: *pid,
-                                            value: Value::String(format!("ERR:{:?}", status)),
-                                            quality: q,
-                                            quality_code: Some(status.bits() as i32),
-                                            source_timestamp_ns: None,
-                                        });
-                                        continue;
+                                let status = dv.status.unwrap_or(opcua_types::StatusCode::Good);
+                                let source_ts = source_timestamp_ns_from_dv(&dv);
+                                if status.is_good() {
+                                    if let Some(variant) = dv.value {
+                                        if let Some(raw_val) = crate::opcua_api::variant_to_value(&variant) {
+                                            let coerced = coerce_value(raw_val, spec.data_type);
+                                            if !value_fits_data_type(&coerced, spec.data_type) {
+                                                tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配，按 BAD 隔离");
+                                                let cached = last_known.get(pid).cloned();
+                                                let (val, origin) = if let Some(v) = cached { (v, ValueOrigin::LastKnown) } else { (Value::typed_placeholder(spec.data_type), ValueOrigin::Placeholder) };
+                                                batch_vals.push(PointValue { point_id: *pid, value: val, quality: Quality::Bad, quality_code: Some(status.bits() as i32), source_timestamp_ns: source_ts, value_origin: origin });
+                                                continue;
+                                            }
+                                            last_known.insert(*pid, coerced.clone());
+                                            batch_vals.push(PointValue { point_id: *pid, value: coerced, quality: Quality::Good, quality_code: None, source_timestamp_ns: source_ts, value_origin: ValueOrigin::Current });
+                                            continue;
+                                        }
                                     }
-                                let Some(variant) = dv.value else {
-                                    tracing::warn!(key=%spec.key, "DataValue 无 value");
-                                    batch_vals.push(PointValue {
-                                        point_id: *pid,
-                                        value: Value::String(format!("ERR:BadNoValue {:?}", dv.status)),
-                                        quality: Quality::Bad,
-                                        quality_code: Some(1),
-                                        source_timestamp_ns: None,
-                                    });
-                                    continue;
-                                };
-                                let Some(raw_val) = crate::opcua_api::variant_to_value(&variant) else {
-                                    continue;
-                                };
-                                let coerced = coerce_value(raw_val, spec.data_type);
-                                if !value_fits_data_type(&coerced, spec.data_type) {
-                                    tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配跳过");
-                                    continue;
+                                    tracing::warn!(key=%spec.key, "DataValue Good 但无 value，按 BAD 隔离");
+                                    let cached = last_known.get(pid).cloned();
+                                    let (val, origin) = if let Some(v) = cached { (v, ValueOrigin::LastKnown) } else { (Value::typed_placeholder(spec.data_type), ValueOrigin::Placeholder) };
+                                    batch_vals.push(PointValue { point_id: *pid, value: val, quality: Quality::Bad, quality_code: Some(opcua_types::StatusCode::BadUnexpectedError.bits() as i32), source_timestamp_ns: source_ts, value_origin: origin });
+                                } else {
+                                    let q = crate::opcua_api::status_to_quality(status);
+                                    let code = Some(status.bits() as i32);
+                                    let cached = last_known.get(pid).cloned();
+                                    let (val, origin) = if let Some(v) = cached { (v, ValueOrigin::LastKnown) } else { (Value::typed_placeholder(spec.data_type), ValueOrigin::Placeholder) };
+                                    tracing::warn!(key=%spec.key, status=?status, quality=?q, origin=?origin, "单点非 Good，typed BAD 隔离");
+                                    batch_vals.push(PointValue { point_id: *pid, value: val, quality: q, quality_code: code, source_timestamp_ns: source_ts, value_origin: origin });
                                 }
-                                // source_timestamp 透传：优先 DataValue.source_timestamp 1601 ticks→Unix ns，否则 now
-                                let ts_ns = dv.source_timestamp.map(|dt| {
-                                    let ticks = dt.ticks();
-                                    const TICKS_PER_SEC: i64 = 10_000_000;
-                                    const UNIX_TICKS_OFFSET: i64 = 11644473600 * TICKS_PER_SEC;
-                                    let unix_ticks = ticks - UNIX_TICKS_OFFSET;
-                                    unix_ticks * 100
-                                }).unwrap_or_else(now_unix_ns);
-                                batch_vals.push(PointValue {
-                                    point_id: *pid,
-                                    value: coerced,
-                                    quality: Quality::Good,
-                                    quality_code: None,
-                                    source_timestamp_ns: Some(ts_ns),
-                                });
                             }
                             if batch_vals.is_empty() {
                                 // KeepAlive 或全过滤：不递增 sequence，不产批 (§7.3)

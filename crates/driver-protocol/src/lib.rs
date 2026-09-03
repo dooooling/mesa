@@ -12,14 +12,15 @@ pub mod pb {
 use bytes::{BufMut, BytesMut};
 use mesa_core_types::{
     AcquisitionTask, ConnectionState, DataBatch, DataType, DriverBinding, ErrorKind,
-    PointDescriptor, PointValue, Quality, TaskMode, UnknownDataType, Value,
+    PointDescriptor, PointValue, Quality, TaskMode, UnknownDataType, Value, ValueOrigin,
 };
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// IPC 协议版本。Major 不兼容直接拒绝握手；Minor 取双方较小值。
+/// V1.2.1 新增 PointValue.value_origin（§5.5），Minor 1 保证新 Driver 的 typed BAD 语义可被新 Core 理解，旧端仍按 UNSPECIFIED 兼容解释
 pub const PROTOCOL_MAJOR: u32 = 1;
-pub const PROTOCOL_MINOR: u32 = 0;
+pub const PROTOCOL_MINOR: u32 = 1;
 
 /// 单帧上限。防止恶意/异常长度前缀导致无界分配（有界原则在 IPC 层的体现）。
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -179,23 +180,49 @@ pub fn quality_from_pb(s: &str) -> Result<Quality, ConvertError> {
     }
 }
 
+pub fn value_origin_to_pb(vo: ValueOrigin) -> i32 {
+    match vo {
+        ValueOrigin::Unspecified => pb::ValueOrigin::Unspecified as i32,
+        ValueOrigin::Current => pb::ValueOrigin::Current as i32,
+        ValueOrigin::LastKnown => pb::ValueOrigin::LastKnown as i32,
+        ValueOrigin::Placeholder => pb::ValueOrigin::Placeholder as i32,
+    }
+}
+
+pub fn value_origin_from_pb(v: i32) -> ValueOrigin {
+    match pb::ValueOrigin::try_from(v).unwrap_or(pb::ValueOrigin::Unspecified) {
+        pb::ValueOrigin::Unspecified => ValueOrigin::Unspecified,
+        pb::ValueOrigin::Current => ValueOrigin::Current,
+        pb::ValueOrigin::LastKnown => ValueOrigin::LastKnown,
+        pb::ValueOrigin::Placeholder => ValueOrigin::Placeholder,
+    }
+}
+
 pub fn point_value_to_pb(pv: &PointValue) -> pb::PointValueMsg {
+    // 新 Driver 禁止发送 UNSPECIFIED；若误传则按兼容规则归一化后再编码，避免对端歧义
+    let normalized_origin = pv.value_origin.normalize_unspecified(pv.quality);
     pb::PointValueMsg {
         point_id: pv.point_id,
         value: Some(value_to_pb(&pv.value)),
         quality: quality_to_pb(pv.quality),
         quality_code: pv.quality_code,
         source_timestamp_ns: pv.source_timestamp_ns,
+        value_origin: value_origin_to_pb(normalized_origin),
     }
 }
 
 pub fn point_value_from_pb(pv: pb::PointValueMsg) -> Result<PointValue, ConvertError> {
+    let quality = quality_from_pb(&pv.quality)?;
+    let raw_origin = value_origin_from_pb(pv.value_origin);
+    // 线上传输 UNSPECIFIED 按 §5.5 兼容解释：GOOD→Current / 非GOOD→Placeholder
+    let value_origin = raw_origin.normalize_unspecified(quality);
     Ok(PointValue {
         point_id: pv.point_id,
         value: value_from_pb(pv.value.ok_or(ConvertError::EmptyValue)?)?,
-        quality: quality_from_pb(&pv.quality)?,
+        quality,
         quality_code: pv.quality_code,
         source_timestamp_ns: pv.source_timestamp_ns,
+        value_origin,
     })
 }
 

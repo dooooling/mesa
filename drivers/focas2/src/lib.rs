@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use mesa_core_types::{
     AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, GENERIC_BINDING_KIND,
-    GenericBinding, PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value,
+    GenericBinding, PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, ValueOrigin,
     ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
@@ -746,6 +746,7 @@ impl DriverConnection for FocasConnection {
                                     quality: Quality::Bad,
                                     quality_code: Some(code),
                                     source_timestamp_ns: None,
+                                    value_origin: ValueOrigin::Placeholder,
                                 });
                                 continue;
                             }
@@ -759,6 +760,7 @@ impl DriverConnection for FocasConnection {
                                 quality: Quality::Bad,
                                 quality_code: Some(1),
                                 source_timestamp_ns: None,
+                                value_origin: ValueOrigin::Placeholder,
                             });
                             continue;
                         }

@@ -210,6 +210,16 @@ message DataBatchMsg {
   optional uint64 mono_ns = 6;
 }
 
+// 值的来源语义（§5.5 ValueOrigin，Minor 演进，UNSPECIFIED 兼容旧消息）：
+// - UNSPECIFIED + GOOD → CURRENT；UNSPECIFIED + BAD → PLACEHOLDER
+// - 新 Driver 必须显式发送 CURRENT / LAST_KNOWN / PLACEHOLDER，禁止发送 UNSPECIFIED
+enum ValueOrigin {
+  VALUE_ORIGIN_UNSPECIFIED = 0;
+  VALUE_ORIGIN_CURRENT = 1;
+  VALUE_ORIGIN_LAST_KNOWN = 2;
+  VALUE_ORIGIN_PLACEHOLDER = 3;
+}
+
 message PointValueMsg {
   uint32 point_id = 1;
   ValueMsg value = 2;
@@ -217,6 +227,8 @@ message PointValueMsg {
   string quality = 3;
   optional sint32 quality_code = 4;
   optional int64 source_timestamp_ns = 5;
+  // Minor 新增：值的来源语义，缺省 UNSPECIFIED 需按兼容规则解释
+  ValueOrigin value_origin = 6;
 }
 
 message ValueMsg {
