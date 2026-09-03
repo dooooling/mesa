@@ -12,6 +12,7 @@ members = [
     "drivers/s7",
     "drivers/focas2",
     "drivers/opcua",
+    "crates/opcua-transport",
     "tests/driver-contract",
     "tests/performance",
 ]
@@ -29,6 +30,7 @@ mesa-driver-sdk = { path = "crates/driver-sdk" }
 mesa-driver-manager = { path = "crates/driver-manager" }
 mesa-config-store = { path = "crates/config-store" }
 mesa-core-api = { path = "crates/core-api" }
+mesa-opcua-transport = { path = "crates/opcua-transport" }
 
 rusqlite = { version = "0.32", features = ["bundled"] }
 
