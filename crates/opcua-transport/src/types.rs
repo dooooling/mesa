@@ -242,10 +242,14 @@ pub struct UaBrowseNode {
     pub has_children: Option<bool>,
 }
 
-/// Browse 单页结果（V1 不做 continuation 翻页，超限由调用方分页 BrowseRequest）。
+/// Browse 单页结果：OPC UA 分页以服务端 opaque continuation point 推进，
+/// 调用方必须循环 `browse` → `browse_next` 直至 `continuation_point` 为 None，
+/// 结束（或放弃）后调用 `release_continuation` 释放服务端资源。
 #[derive(Debug, Clone)]
 pub struct UaBrowsePage {
     pub nodes: Vec<UaBrowseNode>,
+    /// 服务端 opaque 翻页令牌；None 表示已取完。内容不得解析，仅透传。
+    pub continuation_point: Option<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -279,11 +283,20 @@ impl Default for UaSubscriptionSpec {
     }
 }
 
-/// 数据变更事件（由 DataChangeCallback 转发，背压由上层 Latest-Wins 承接）。
+/// 数据变更事件（Latest-Wins 语义：拥塞时旧采样可丢，最新采样永不被旧采样挤掉）。
 #[derive(Debug)]
 pub struct UaDataChange {
     pub client_handle: u32,
     pub data_value: UaDataValue,
+}
+
+/// 订阅事件诊断计数（P0-B1 Gate：队列可丢采样，但必须可观测丢了多少旧采样）。
+#[derive(Debug, Default)]
+pub struct SubscriptionStats {
+    /// 回调收到的原始事件总数。
+    pub events_received: std::sync::atomic::AtomicU64,
+    /// 因同 handle 新值覆盖旧值而合并掉的旧采样数。
+    pub events_coalesced: std::sync::atomic::AtomicU64,
 }
 
 /// 已创建订阅：保留 Server Revised 参数，供 Planner 做 grouping 诊断。
@@ -294,6 +307,7 @@ pub struct UaSubscription {
     pub revised_lifetime_count: u32,
     pub revised_max_keep_alive_count: u32,
     pub receiver: tokio::sync::mpsc::Receiver<UaDataChange>,
+    pub stats: std::sync::Arc<SubscriptionStats>,
 }
 
 /// 单个受监控项的创建请求。

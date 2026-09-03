@@ -52,3 +52,29 @@ REST：`GET /certificates/opcua/{own,trusted,issuers,rejected} /diagnostics` `PO
 - [ ] `ProSys/硬件` 与 `§22 50K` Soak（后置）
 
 > 本文档随 `c2e6a7a/7fd55ae` 入仓，满足 `§19.3` 证书不自动信任要求。`2026-08-29 Browse+Security+DateTime/Arrays 已 44/44`
+
+## 6. Stage 2 transport addendum (P0-B, ASCII-only section)
+
+> Supersedes the stale Subscribe line in section 4 (try_send mpsc 256 drain 64).
+> New event path (Stage 2 P0-B1):
+> DataChangeCallback --push--> per-handle Latest-Wins slots (overwrite + stats)
+> --drain--> forwarder task --send().await--> adapter mpsc 256 --send().await--> Driver.
+> No try_send anywhere on the live path: congestion coalesces OLD samples in
+> slots, newest sample is never dropped by an older one. Drops are observable via
+> SubscriptionStats { events_received, events_coalesced }.
+>
+> Other P0-B deltas:
+> - P0-B2: per-item BAD from CreateMonitoredItems synthesizes an immediate initial
+>   BAD DataValue event for that handle (LastKnown/Placeholder from t=0).
+> - P0-B3: CreateMonitoredItems service failure rolls back via best-effort
+>   DeleteSubscription; DeleteMonitoredItems results are checked per item
+>   (only Good/BadMonitoredItemIdInvalid/BadSubscriptionIdInvalid pass).
+> - P0-B4: Browse aggregates continuation pages (browse/browse_next/release);
+>   per-page cap is BROWSE_MAX_REFS_PER_PAGE=1000, has_children stays None.
+> - P1: disconnect() closes session + aborts event-loop; Revised params are
+>   fail-closed; Read/Create/Delete results are cardinality-checked.
+> - Tests: cargo test -p mesa-opcua-transport (slots/helpers) +
+>   cargo test -p mesa-driver-opcua transport_adapter (Fake-injected adapter
+>   rollback/synthetic-BAD/continuation tests).
+> - Real opc.tcp:// software integration (local server, no hardware) is still
+>   REQUIRED before Stage 2 Gate sign-off.

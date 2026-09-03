@@ -4,6 +4,7 @@
 //! 分裂生命周期 + Revised 参数保留 + 幂等 cleanup。数据语义（Quality / ValueOrigin /
 //! LastKnown）不在此处理，由上层 Driver Adapter 负责。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,9 +18,9 @@ use opcua_types::{
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
-    OpcUaConnectOptions, OpcUaTransport, UaBrowseNode, UaBrowsePage, UaBrowseRequest, UaDataChange,
-    UaDataValue, UaIdentifier, UaMonitoredItemResult, UaMonitoredItemSpec, UaNodeClass, UaNodeRef,
-    UaOperation, UaSubscription, UaSubscriptionId, UaSubscriptionSpec, UaTransportError,
+    OpcUaConnectOptions, OpcUaTransport, UaBrowseNode, UaBrowsePage, UaBrowseRequest, UaDataValue,
+    UaIdentifier, UaMonitoredItemResult, UaMonitoredItemSpec, UaNodeClass, UaNodeRef, UaOperation,
+    UaSubscription, UaSubscriptionId, UaSubscriptionSpec, UaTransportError,
     error::map_service_error,
 };
 
@@ -83,7 +84,129 @@ fn from_opc_node_id(nid: &OpcNodeId) -> UaNodeRef {
 struct NativeInner {
     endpoint_url: String,
     session: Option<Arc<Session>>,
-    _handle: Option<tokio::task::JoinHandle<StatusCode>>,
+    handle: Option<tokio::task::JoinHandle<StatusCode>>,
+}
+
+/// 协议层数量不变式（P1-3）：请求 N 个必须返回 N 个结果，静默截断即违约。
+pub(crate) fn check_cardinality(
+    operation: UaOperation,
+    what: &str,
+    expected: usize,
+    actual: usize,
+) -> Result<(), UaTransportError> {
+    if expected != actual {
+        return Err(UaTransportError::service(
+            operation,
+            None,
+            false,
+            format!("{what} 数量不变式破坏：请求 {expected} 返回 {actual}"),
+        ));
+    }
+    Ok(())
+}
+
+/// cleanup 逐项状态判定（P0-B3.2）：仅明确幂等状态可吞，其他 BAD 必须 Err。
+pub(crate) fn check_delete_item_status(
+    operation: UaOperation,
+    monitored_item_id: u32,
+    status: StatusCode,
+) -> Result<(), UaTransportError> {
+    if status.is_good()
+        || status == StatusCode::BadMonitoredItemIdInvalid
+        || status == StatusCode::BadSubscriptionIdInvalid
+    {
+        Ok(())
+    } else {
+        Err(UaTransportError::service(
+            operation,
+            Some(status),
+            false,
+            format!("delete monitored item {monitored_item_id} 失败: {status:?}"),
+        ))
+    }
+}
+
+/// 订阅事件 Latest-Wins 槽（P0-B1）：按 client_handle 只保留最新采样。
+/// 回调线程（同步上下文）仅做 slot 覆盖 + 唤醒，永不阻塞；转发任务 drain 最新快照。
+pub(crate) struct SlotState {
+    pub slots: std::sync::Mutex<HashMap<u32, DataValue>>,
+    pub notify: tokio::sync::Notify,
+    pub stats: Arc<crate::SubscriptionStats>,
+}
+
+impl SlotState {
+    pub fn new(stats: Arc<crate::SubscriptionStats>) -> Self {
+        Self {
+            slots: std::sync::Mutex::new(HashMap::new()),
+            notify: tokio::sync::Notify::new(),
+            stats,
+        }
+    }
+
+    /// 同步压入（DataChangeCallback 上下文）：覆盖旧槽并计数 coalesced。
+    pub fn push(&self, client_handle: u32, dv: DataValue) {
+        use std::sync::atomic::Ordering;
+        self.stats.events_received.fetch_add(1, Ordering::Relaxed);
+        let mut slots = self.slots.lock().unwrap();
+        if slots.insert(client_handle, dv).is_some() {
+            self.stats.events_coalesced.fetch_add(1, Ordering::Relaxed);
+        }
+        self.notify.notify_one();
+    }
+
+    /// 取走全部最新快照（转发任务上下文）。
+    pub fn drain(&self) -> Vec<crate::UaDataChange> {
+        let mut slots = self.slots.lock().unwrap();
+        slots
+            .drain()
+            .map(|(client_handle, data_value)| crate::UaDataChange {
+                client_handle,
+                data_value,
+            })
+            .collect()
+    }
+}
+
+/// 单个 BrowseResult → 单页：整包 BAD 上抛 Err；引用逐条映射；
+/// `continuation_point` 原样透传（opaque，调用方不得解析）。
+pub(crate) fn browse_result_to_page(
+    r: opcua_types::BrowseResult,
+) -> Result<UaBrowsePage, UaTransportError> {
+    if r.status_code.is_bad() {
+        let status = r.status_code;
+        return Err(UaTransportError::service(
+            UaOperation::Browse,
+            Some(status),
+            false,
+            format!("browse 整包失败: {status:?}"),
+        ));
+    }
+    let mut nodes = Vec::new();
+    if let Some(refs) = r.references {
+        for rf in refs {
+            let node_class = match rf.node_class {
+                opcua_types::NodeClass::Object => UaNodeClass::Object,
+                opcua_types::NodeClass::Variable => UaNodeClass::Variable,
+                opcua_types::NodeClass::Method => UaNodeClass::Method,
+                _ => UaNodeClass::Unknown,
+            };
+            nodes.push(UaBrowseNode {
+                node_id: from_opc_node_id(&rf.node_id.node_id),
+                browse_name: rf.browse_name.name.as_ref().to_string(),
+                display_name: {
+                    let s = rf.display_name.text.as_ref().to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                },
+                node_class,
+                // 单次 Browse 不做 N+1 探测，一律 None（调用方按需再 Browse）
+                has_children: None,
+            });
+        }
+    }
+    Ok(UaBrowsePage {
+        nodes,
+        continuation_point: r.continuation_point.value.clone(),
+    })
 }
 
 /// 原生传输：持有 Session + event-loop JoinHandle；`disconnect()` 释放会话。
@@ -199,7 +322,7 @@ impl NativeOpcUaTransport {
         *guard = Some(NativeInner {
             endpoint_url: self.options.endpoint_url.clone(),
             session: Some(session.clone()),
-            _handle: Some(handle),
+            handle: Some(handle),
         });
         Ok(sess_clone)
     }
@@ -212,8 +335,22 @@ impl OpcUaTransport for NativeOpcUaTransport {
     }
 
     async fn disconnect(&self) -> Result<(), UaTransportError> {
-        let mut guard = self.inner.lock().await;
-        *guard = None;
+        // P1-1：证明性关闭——先请会话正常断开，再 abort event-loop task，最后清空槽位。
+        // 仅丢 JoinHandle 是 detach 而非退出，必须显式 abort。
+        let taken = {
+            let mut guard = self.inner.lock().await;
+            guard.take()
+        };
+        if let Some(inner) = taken {
+            if let Some(sess) = inner.session
+                && let Err(e) = sess.disconnect().await
+            {
+                tracing::debug!("session disconnect 返回错误（忽略，继续清理）: {e:?}");
+            }
+            if let Some(handle) = inner.handle {
+                handle.abort();
+            }
+        }
         Ok(())
     }
 
@@ -235,6 +372,8 @@ impl OpcUaTransport for NativeOpcUaTransport {
             .read(&to_read, TimestampsToReturn::Both, 0.0)
             .await
             .map_err(|e| map_service_error(UaOperation::Read, e))?;
+        // P1-3：数量不变式——请求 N 个必须返回 N 个，缺项静默对齐即违约。
+        check_cardinality(UaOperation::Read, "Read 结果", nodes.len(), values.len())?;
         // 单点 BAD 以 DataValue.status 逐点返回，不整体 Err（P0-B 冻结语义）
         Ok(values)
     }
@@ -320,41 +459,78 @@ impl OpcUaTransport for NativeOpcUaTransport {
             .browse(&[bd], request.max_refs, None)
             .await
             .map_err(|e| map_service_error(UaOperation::Browse, e))?;
-        let mut nodes = Vec::new();
-        for r in results {
-            // 整包 BAD → Err；单引用缺失仅跳过
-            if r.status_code.is_bad() {
-                let status = r.status_code;
-                return Err(UaTransportError::service(
-                    UaOperation::Browse,
-                    Some(status),
-                    false,
-                    format!("browse 整包失败: {status:?}"),
-                ));
-            }
-            if let Some(refs) = r.references {
-                for rf in refs {
-                    let node_class = match rf.node_class {
-                        opcua_types::NodeClass::Object => UaNodeClass::Object,
-                        opcua_types::NodeClass::Variable => UaNodeClass::Variable,
-                        opcua_types::NodeClass::Method => UaNodeClass::Method,
-                        _ => UaNodeClass::Unknown,
-                    };
-                    nodes.push(UaBrowseNode {
-                        node_id: from_opc_node_id(&rf.node_id.node_id),
-                        browse_name: rf.browse_name.name.as_ref().to_string(),
-                        display_name: {
-                            let s = rf.display_name.text.as_ref().to_string();
-                            if s.is_empty() { None } else { Some(s) }
-                        },
-                        node_class,
-                        // 单次 Browse 不做 N+1 探测，一律 None（调用方按需再 Browse）
-                        has_children: None,
-                    });
+        // 单个 BrowseDescription → 单个 BrowseResult，数量不变式同样适用。
+        check_cardinality(UaOperation::Browse, "Browse 结果", 1, results.len())?;
+        let page = browse_result_to_page(results.into_iter().next().ok_or_else(|| {
+            UaTransportError::service(
+                UaOperation::Browse,
+                None,
+                false,
+                "Browse 结果为空（已通过数量检查，不可达）",
+            )
+        })?)?;
+        Ok(page)
+    }
+
+    async fn browse_next(
+        &self,
+        continuation_point: Vec<u8>,
+    ) -> Result<UaBrowsePage, UaTransportError> {
+        let session = {
+            let guard = self.inner.lock().await;
+            guard
+                .as_ref()
+                .and_then(|i| i.session.clone())
+                .ok_or_else(|| {
+                    UaTransportError::session(UaOperation::Browse, None, "尚未连接，请先 connect")
+                })?
+        };
+        // 单 token 接力 → 单结果页；release=false 表示继续取页。
+        let results = session
+            .browse_next(false, &[ByteString::from(continuation_point)])
+            .await
+            .map_err(|e| map_service_error(UaOperation::Browse, e))?;
+        check_cardinality(UaOperation::Browse, "BrowseNext 结果", 1, results.len())?;
+        browse_result_to_page(results.into_iter().next().ok_or_else(|| {
+            UaTransportError::service(
+                UaOperation::Browse,
+                None,
+                false,
+                "BrowseNext 结果为空（已通过数量检查，不可达）",
+            )
+        })?)
+    }
+
+    async fn release_continuation(
+        &self,
+        continuation_point: Vec<u8>,
+    ) -> Result<(), UaTransportError> {
+        let session = {
+            let guard = self.inner.lock().await;
+            guard.as_ref().and_then(|i| i.session.clone())
+        };
+        let Some(sess) = session else {
+            // 会话已释放：服务端 continuation 随会话失效，幂等 Ok。
+            return Ok(());
+        };
+        match sess
+            .browse_next(true, &[ByteString::from(continuation_point)])
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let ue = map_service_error(UaOperation::Browse, e);
+                // 释放语义幂等：会话级失败 / continuation 已失效或耗尽均视为 Ok。
+                let gone = ue.status_code == Some(StatusCode::BadContinuationPointInvalid.bits())
+                    || ue.status_code == Some(StatusCode::BadNoContinuationPoints.bits());
+                if ue.is_idempotent_cleanup_ok() || gone {
+                    tracing::debug!(?ue, "release_continuation 幂等 Ok");
+                    Ok(())
+                } else {
+                    Err(ue)
                 }
             }
         }
-        Ok(UaBrowsePage { nodes })
     }
 
     async fn create_subscription(
@@ -375,16 +551,35 @@ impl OpcUaTransport for NativeOpcUaTransport {
                     )
                 })?
         };
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
-        let tx_cb = tx.clone();
+        // P0-B1：Latest-Wins 事件路径——回调（同步上下文）只做 slot 覆盖，
+        // 转发任务 drain 最新快照后 `send().await`（背压等待，永不丢最新）。
+        let stats = Arc::new(crate::SubscriptionStats::default());
+        let slots = Arc::new(SlotState::new(stats.clone()));
+        let cb_slots = slots.clone();
         let callback =
             DataChangeCallback::new(move |dv: DataValue, item: &opcua_client::MonitoredItem| {
-                let ev = UaDataChange {
-                    client_handle: item.client_handle(),
-                    data_value: dv,
-                };
-                let _ = tx_cb.try_send(ev);
+                cb_slots.push(item.client_handle(), dv);
             });
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let fwd_slots = slots.clone();
+        tokio::spawn(async move {
+            loop {
+                fwd_slots.notify.notified().await;
+                if tx.is_closed() {
+                    break;
+                }
+                let batch = fwd_slots.drain();
+                if batch.is_empty() {
+                    continue;
+                }
+                for ev in batch {
+                    // 背压时等待：旧槽可被新采样覆盖（Latest-Wins），最新采样不丢。
+                    if tx.send(ev).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
         let pub_interval = Duration::from_millis(spec.publishing_interval_ms.max(10));
         let sub_id = session
             .create_subscription(
@@ -398,7 +593,8 @@ impl OpcUaTransport for NativeOpcUaTransport {
             )
             .await
             .map_err(|e| map_service_error(UaOperation::CreateSubscription, e))?;
-        // Revised 参数从 session 内订阅状态回读（async-opcua 仅返回 id，不回 revised）
+        // Revised 参数从 session 内订阅状态回读（async-opcua 仅返回 id，不回 revised）。
+        // P1-2 fail-closed：创建刚成功订阅必在本地状态中，缺席即内部不一致，直接 Err。
         let (revised_pub_ms, revised_lifetime, revised_keep_alive) = {
             let state = session.subscription_state();
             let guard = state.lock();
@@ -408,11 +604,14 @@ impl OpcUaTransport for NativeOpcUaTransport {
                     sub.lifetime_count(),
                     sub.max_keep_alive_count(),
                 ),
-                None => (
-                    spec.publishing_interval_ms,
-                    spec.lifetime_count,
-                    spec.max_keep_alive_count,
-                ),
+                None => {
+                    return Err(UaTransportError::internal(
+                        UaOperation::CreateSubscription,
+                        format!(
+                            "订阅 {sub_id} 创建成功但本地订阅状态缺席（内部不一致，fail-closed）"
+                        ),
+                    ));
+                }
             }
         };
         Ok(UaSubscription {
@@ -422,6 +621,7 @@ impl OpcUaTransport for NativeOpcUaTransport {
             revised_lifetime_count: revised_lifetime,
             revised_max_keep_alive_count: revised_keep_alive,
             receiver: rx,
+            stats,
         })
     }
 
@@ -463,6 +663,13 @@ impl OpcUaTransport for NativeOpcUaTransport {
             .create_monitored_items(subscription_id, TimestampsToReturn::Both, reqs)
             .await
             .map_err(|e| map_service_error(UaOperation::CreateMonitoredItems, e))?;
+        // P1-3：数量不变式——逐项结果必须与请求一一对应，否则调用方无法归因。
+        check_cardinality(
+            UaOperation::CreateMonitoredItems,
+            "CreateMonitoredItems 结果",
+            items.len(),
+            created.len(),
+        )?;
         // 逐项结果：保留 status + revised sampling/queue，部分失败不整体 Err
         let mut out = Vec::with_capacity(created.len());
         for (spec, c) in items.iter().zip(created) {
@@ -495,11 +702,16 @@ impl OpcUaTransport for NativeOpcUaTransport {
         };
         match sess.delete_monitored_items(subscription_id, ids).await {
             Ok(results) => {
-                // 逐项 BAD 仍整体 Ok（幂等语义：已删/无此项即成功），仅记录诊断
+                // P0-B3.2：逐项判定——仅明确幂等状态可吞，其他 BAD 上抛；
+                // 数量不变式同样适用（结果必须与被删 id 一一对应）。
+                check_cardinality(
+                    UaOperation::DeleteMonitoredItems,
+                    "DeleteMonitoredItems 结果",
+                    ids.len(),
+                    results.len(),
+                )?;
                 for (id, st) in ids.iter().zip(results.iter()) {
-                    if !st.is_good() {
-                        tracing::debug!(monitored_item_id = id, status = ?st, "delete_monitored_items 单项非 Good，视为幂等成功");
-                    }
+                    check_delete_item_status(UaOperation::DeleteMonitoredItems, *id, *st)?;
                 }
                 Ok(())
             }
@@ -557,5 +769,76 @@ impl OpcUaTransport for NativeOpcUaTransport {
                 Err(ue)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn latest_wins_slot_keeps_newest_and_counts_coalesced() {
+        let stats = Arc::new(crate::SubscriptionStats::default());
+        let slots = SlotState::new(stats.clone());
+        slots.push(7, DataValue::new_now(1i32));
+        slots.push(7, DataValue::new_now(2i32)); // 覆盖旧采样：coalesced+1
+        slots.push(9, DataValue::new_now(3i32));
+        assert_eq!(stats.events_received.load(Ordering::Relaxed), 3);
+        assert_eq!(stats.events_coalesced.load(Ordering::Relaxed), 1);
+        let mut batch = slots.drain();
+        batch.sort_by_key(|e| e.client_handle);
+        assert_eq!(batch.len(), 2);
+        let v7 = batch[0].data_value.value.clone().expect("handle 7 有值");
+        assert_eq!(v7, opcua_types::Variant::Int32(2)); // 只保留最新采样
+        // drain 后槽清空
+        assert!(slots.drain().is_empty());
+    }
+
+    #[test]
+    fn cardinality_mismatch_is_non_retryable_service_error() {
+        let e = check_cardinality(UaOperation::Read, "Read 结果", 3, 2).expect_err("必须 Err");
+        assert_eq!(e.kind, crate::UaTransportErrorKind::Service);
+        assert!(!e.retryable);
+        assert!(check_cardinality(UaOperation::Read, "Read 结果", 3, 3).is_ok());
+    }
+
+    #[test]
+    fn delete_item_status_only_explicit_idempotent_passes() {
+        let ok = |s| check_delete_item_status(UaOperation::DeleteMonitoredItems, 42, s).is_ok();
+        assert!(ok(StatusCode::Good));
+        assert!(ok(StatusCode::BadMonitoredItemIdInvalid));
+        assert!(ok(StatusCode::BadSubscriptionIdInvalid));
+        // 其他 BAD（含会话级）必须上抛，不得在逐项路径吞掉
+        assert!(!ok(StatusCode::BadNodeIdUnknown));
+        assert!(!ok(StatusCode::BadSessionClosed));
+        assert!(!ok(StatusCode::BadNotImplemented));
+    }
+
+    #[test]
+    fn browse_result_page_passes_through_continuation_opaque() {
+        let r = opcua_types::BrowseResult {
+            status_code: StatusCode::Good,
+            continuation_point: ByteString::from(vec![9u8, 8u8]),
+            references: None,
+        };
+        let page = browse_result_to_page(r).expect("Good 整包必须 Ok");
+        assert!(page.nodes.is_empty());
+        assert_eq!(page.continuation_point, Some(vec![9u8, 8u8]));
+    }
+
+    #[test]
+    fn browse_result_bad_status_is_service_error() {
+        let r = opcua_types::BrowseResult {
+            status_code: StatusCode::Good,
+            continuation_point: ByteString::null(),
+            references: None,
+        };
+        // 先构造 Good 再改 BAD，避免构造即错
+        let mut bad = r;
+        bad.status_code = StatusCode::BadNodeIdUnknown;
+        let e = browse_result_to_page(bad).expect_err("整包 BAD 必须 Err");
+        assert_eq!(e.kind, crate::UaTransportErrorKind::Service);
+        assert_eq!(e.status_code, Some(StatusCode::BadNodeIdUnknown.bits()));
     }
 }
