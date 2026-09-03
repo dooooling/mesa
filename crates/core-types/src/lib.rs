@@ -186,6 +186,49 @@ impl Quality {
     }
 }
 
+/// 值的来源语义（方案 §5.5 V1.2.1）：用于区分 BAD 时的 last-known 连续性与 placeholder。
+/// - CURRENT：本次为协议返回的鲜活值（GOOD 时必为 CURRENT）
+/// - LAST_KNOWN：BAD 时携带上一次 GOOD 的 typed 值，保证 GOOD→BAD→GOOD 连续性
+/// - PLACEHOLDER：BAD 且无历史 GOOD 时的 typed neutral 占位（非业务值）
+/// - UNSPECIFIED：线上传输兼容态，旧消息缺省此字段时按 `Good→Current / Bad→Placeholder` 解释；新代码禁止主动发送 UNSPECIFIED
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ValueOrigin {
+    #[default]
+    #[serde(rename = "UNSPECIFIED")]
+    Unspecified = 0,
+    #[serde(rename = "CURRENT")]
+    Current = 1,
+    #[serde(rename = "LAST_KNOWN")]
+    LastKnown = 2,
+    #[serde(rename = "PLACEHOLDER")]
+    Placeholder = 3,
+}
+
+impl ValueOrigin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ValueOrigin::Unspecified => "UNSPECIFIED",
+            ValueOrigin::Current => "CURRENT",
+            ValueOrigin::LastKnown => "LAST_KNOWN",
+            ValueOrigin::Placeholder => "PLACEHOLDER",
+        }
+    }
+
+    /// 将线上传输的 UNSPECIFIED 按兼容规则解释为确定的业务语义（§5.5）
+    pub fn normalize_unspecified(self, quality: Quality) -> Self {
+        match self {
+            ValueOrigin::Unspecified => {
+                if quality == Quality::Good {
+                    ValueOrigin::Current
+                } else {
+                    ValueOrigin::Placeholder
+                }
+            }
+            other => other,
+        }
+    }
+}
+
 /// 高频数据面的统一值类型（方案 §9.2）。
 ///
 /// 不使用通用 JSON/Object：FOCAS2 结构体优先拆成稳定 Point，OPC UA Array 保留为
@@ -240,6 +283,31 @@ impl Value {
         }
     }
 
+    /// 按 DataType 生成 typed neutral placeholder（BAD 且无 last-known 时使用，非业务值）
+    pub fn typed_placeholder(data_type: DataType) -> Self {
+        match data_type {
+            DataType::Bool => Value::Bool(false),
+            DataType::I32 => Value::I32(0),
+            DataType::U32 => Value::U32(0),
+            DataType::I64 => Value::I64(0),
+            DataType::U64 => Value::U64(0),
+            DataType::F32 => Value::F32(0.0),
+            DataType::F64 => Value::F64(0.0),
+            DataType::String => Value::String(String::new()),
+            DataType::Bytes => Value::Bytes(Vec::new()),
+            DataType::DateTime => Value::DateTime(0),
+            DataType::BoolArray => Value::BoolArray(Vec::new()),
+            DataType::I32Array => Value::I32Array(Vec::new()),
+            DataType::U32Array => Value::U32Array(Vec::new()),
+            DataType::I64Array => Value::I64Array(Vec::new()),
+            DataType::U64Array => Value::U64Array(Vec::new()),
+            DataType::F32Array => Value::F32Array(Vec::new()),
+            DataType::F64Array => Value::F64Array(Vec::new()),
+            DataType::StringArray => Value::StringArray(Vec::new()),
+            DataType::DateTimeArray => Value::DateTimeArray(Vec::new()),
+        }
+    }
+
     /// 单点数值的浮点视图，仅供诊断/演示接口粗略展示，不参与任何业务计算。
     pub fn as_f64_approx(&self) -> Option<f64> {
         match self {
@@ -267,6 +335,9 @@ pub struct PointValue {
     pub quality_code: Option<i32>,
     /// 设备/协议提供的原始时间戳；协议未提供则 None（消费方回退到 Batch 时间戳）。
     pub source_timestamp_ns: Option<TimestampNs>,
+    /// 值的来源语义（§5.5）：CURRENT / LAST_KNOWN / PLACEHOLDER，线上传 UNSPECIFIED 需 normalize
+    #[serde(default)]
+    pub value_origin: ValueOrigin,
 }
 
 fn default_quality() -> Quality {
@@ -281,7 +352,14 @@ impl PointValue {
             quality: Quality::Good,
             quality_code: None,
             source_timestamp_ns: None,
+            value_origin: ValueOrigin::Current,
         }
+    }
+
+    /// 将可能的 UNSPECIFIED 按兼容规则归一化（旧消息兼容）
+    pub fn normalized(mut self) -> Self {
+        self.value_origin = self.value_origin.normalize_unspecified(self.quality);
+        self
     }
 }
 

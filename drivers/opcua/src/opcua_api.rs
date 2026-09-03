@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use mesa_core_types::Value;
+use opcua_types::{DataValue, DateTime, StatusCode, Variant};
 
 use crate::address::OpcUaAddress;
 
@@ -36,8 +37,9 @@ pub struct DataChangeEvent {
 pub trait OpcUaApi: Send + Sync {
     /// 建立会话（Fake 下即时成功；Native 下建 TCP+Security）
     async fn connect(&self, endpoint_url: &str, timeout_ms: u64) -> Result<(), String>;
-    /// 批量读（Poll 通路）；按传入地址顺序返回等长 Value，单点错误以 String 占位由上层转 Quality
-    async fn read_batch(&self, addrs: &[OpcUaAddress]) -> Result<Vec<Value>, String>;
+    /// 批量读（Poll 通路）；按传入地址顺序返回等长 DataValue，保留原生 StatusCode/SourceTimestamp（§5.5 P0-A）
+    /// 单点错误以 StatusCode!=Good 的 DataValue 表达，上层按 typed BAD + ValueOrigin 处理，禁止 String ERR 占位
+    async fn read_batch(&self, addrs: &[OpcUaAddress]) -> Result<Vec<DataValue>, String>;
     /// 断开（Fake 无操作）
     async fn disconnect(&self) -> Result<(), String> {
         Ok(())
@@ -102,32 +104,42 @@ impl FakeOpcUaApi {
     }
 
     /// 基于地址生成确定性 Fake 值（用于冒烟与 Contract）
+    #[allow(dead_code)]
     fn fake_value_for(&self, addr: &OpcUaAddress) -> Value {
+        // 复用 fake_variant_for 保证 Poll/Subscribe 一致性
+        variant_to_value(&self.fake_variant_for(addr)).unwrap_or(Value::String("fake:empty".into()))
+    }
+
+    /// 生成 Variant（与 subscribe 保持一致，便于 DataValue 统一）
+    fn fake_variant_for(&self, addr: &OpcUaAddress) -> Variant {
+        use opcua_types::{UAString, Variant};
         let r = self.next_rand();
         match &addr.identifier {
             crate::address::Identifier::Numeric(n) => {
-                // 数值型节点：按 n 奇偶返回 I32/U32，便于类型覆盖
                 if n % 2 == 0 {
-                    Value::I32((r % 10000) as i32)
+                    Variant::Int32((r % 10000) as i32)
                 } else {
-                    Value::U32((r % 10000) as u32)
+                    Variant::UInt32((r % 10000) as u32)
                 }
             }
             crate::address::Identifier::String(s) => {
-                // 字符串型：若含 Speed/Temp 等关键字返回 F64，否则 String
                 let lower = s.to_ascii_lowercase();
                 if lower.contains("speed") || lower.contains("sine") || lower.contains("temp") {
-                    Value::F64((r % 10000) as f64 / 10.0)
+                    Variant::Double((r % 10000) as f64 / 10.0)
                 } else if lower.contains("counter") || lower.contains("count") {
-                    Value::U32((r % 1000) as u32)
+                    Variant::UInt32((r % 1000) as u32)
                 } else if lower.contains("status") || lower.contains("state") {
-                    Value::U32((r % 4) as u32)
+                    Variant::UInt32((r % 4) as u32)
                 } else {
-                    Value::String(format!("fake:{s}:{}", r % 100))
+                    Variant::String(UAString::from(format!("fake:{s}:{}", r % 100)))
                 }
             }
-            crate::address::Identifier::Guid(_) => Value::String(format!("guid:{}", r % 1000)),
-            crate::address::Identifier::Opaque(_) => Value::String(format!("opaque:{}", r % 1000)),
+            crate::address::Identifier::Guid(_) => {
+                Variant::String(UAString::from(format!("guid:{}", r % 1000)))
+            }
+            crate::address::Identifier::Opaque(_) => {
+                Variant::String(UAString::from(format!("opaque:{}", r % 1000)))
+            }
         }
     }
 }
@@ -146,17 +158,32 @@ impl OpcUaApi for FakeOpcUaApi {
         Ok(())
     }
 
-    async fn read_batch(&self, addrs: &[OpcUaAddress]) -> Result<Vec<Value>, String> {
+    async fn read_batch(&self, addrs: &[OpcUaAddress]) -> Result<Vec<DataValue>, String> {
         let mut out = Vec::with_capacity(addrs.len());
         for addr in addrs {
-            // 模拟单点不支持：特定字符串触发 Bad（用于测试 Bad 隔离）
+            // 模拟单点不支持：特定字符串触发 Bad DataValue（用于测试 Bad 隔离与 typed BAD）
             if let crate::address::Identifier::String(s) = &addr.identifier
                 && (s.contains("bad") || s.contains("Bad"))
             {
-                out.push(Value::String("ERR:BadNodeIdUnknown".into()));
+                out.push(DataValue {
+                    value: None,
+                    status: Some(StatusCode::BadNodeIdUnknown),
+                    source_timestamp: Some(DateTime::now()),
+                    source_picoseconds: None,
+                    server_timestamp: Some(DateTime::now()),
+                    server_picoseconds: None,
+                });
                 continue;
             }
-            out.push(self.fake_value_for(addr));
+            let variant = self.fake_variant_for(addr);
+            out.push(DataValue {
+                value: Some(variant),
+                status: Some(StatusCode::Good),
+                source_timestamp: Some(DateTime::now()),
+                source_picoseconds: None,
+                server_timestamp: Some(DateTime::now()),
+                server_picoseconds: None,
+            });
         }
         Ok(out)
     }
@@ -278,8 +305,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use opcua_client::{ClientBuilder, IdentityToken, Session};
 use opcua_types::{
-    ByteString, DataValue, Guid, NodeId as OpcNodeId, ReadValueId, StatusCode, TimestampsToReturn,
-    UAString, Variant,
+    ByteString, Guid, NodeId as OpcNodeId, ReadValueId, TimestampsToReturn, UAString,
 };
 
 fn to_opc_node_id(addr: &OpcUaAddress) -> Result<OpcNodeId, String> {
@@ -604,7 +630,7 @@ impl OpcUaApi for NativeOpcUaApi {
             .map(|_| ())
     }
 
-    async fn read_batch(&self, addrs: &[OpcUaAddress]) -> Result<Vec<Value>, String> {
+    async fn read_batch(&self, addrs: &[OpcUaAddress]) -> Result<Vec<DataValue>, String> {
         let session = {
             let guard = self.inner.lock().await;
             guard
@@ -621,26 +647,8 @@ impl OpcUaApi for NativeOpcUaApi {
             .read(&nodes_to_read, TimestampsToReturn::Both, 0.0)
             .await
             .map_err(|e| format!("read 失败: {e:?}"))?;
-
-        let mut out = Vec::with_capacity(data_values.len());
-        for dv in data_values {
-            if let Some(status) = dv.status
-                && status != StatusCode::Good
-            {
-                out.push(Value::String(format!("ERR:{:?}", status)));
-                continue;
-            }
-            if let Some(variant) = dv.value {
-                if let Some(val) = variant_to_value(&variant) {
-                    out.push(val);
-                } else {
-                    out.push(Value::String(format!("ERR:BadNoValue {:?}", dv.status)));
-                }
-            } else {
-                out.push(Value::String(format!("ERR:BadNoValue {:?}", dv.status)));
-            }
-        }
-        Ok(out)
+        // 直接返回原生 DataValue，保留 StatusCode/SourceTimestamp 供上层按 typed BAD + ValueOrigin 处理（§5.5 P0-A）
+        Ok(data_values)
     }
 
     async fn subscribe(
@@ -790,6 +798,12 @@ mod tests {
         ];
         let vals = api.read_batch(&addrs).await.unwrap();
         assert_eq!(vals.len(), 3);
+        // Good DataValue 保留 SourceTimestamp 与 Variant
+        for dv in &vals {
+            assert!(dv.status.unwrap().is_good());
+            assert!(dv.source_timestamp.is_some());
+            assert!(dv.value.is_some());
+        }
     }
 
     #[tokio::test]
@@ -797,6 +811,10 @@ mod tests {
         let api = FakeOpcUaApi::new();
         let addrs = vec![parse_address("ns=2;s=bad_node").unwrap()];
         let vals = api.read_batch(&addrs).await.unwrap();
-        assert_eq!(vals[0], Value::String("ERR:BadNodeIdUnknown".into()));
+        assert_eq!(vals.len(), 1);
+        let dv = &vals[0];
+        assert_eq!(dv.status.unwrap(), StatusCode::BadNodeIdUnknown);
+        assert!(dv.source_timestamp.is_some());
+        assert!(dv.value.is_none());
     }
 }

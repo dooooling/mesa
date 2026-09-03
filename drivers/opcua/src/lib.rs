@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 //! OPC UA Driver — 方案 §7.3 节点/订阅/浏览型（V1 只读，44/44 2026-08-29）。
 //!
 //! - Poll 绑定：`opcua.node-group`
@@ -32,7 +33,7 @@ use std::time::Duration;
 
 use mesa_core_types::{
     AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, GENERIC_BINDING_KIND,
-    GenericBinding, PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value,
+    GenericBinding, PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, ValueOrigin,
     ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
@@ -496,6 +497,225 @@ fn coerce_value(v: Value, dt: DataType) -> Value {
     }
 }
 
+/// OPC UA DateTime ticks (1601-01-01, 100ns) → Unix ns（§7.3 精确保留）
+fn ticks_to_unix_ns(ticks: i64) -> i64 {
+    const TICKS_PER_SEC: i64 = 10_000_000;
+    const UNIX_TICKS_OFFSET: i64 = 11644473600 * TICKS_PER_SEC;
+    (ticks - UNIX_TICKS_OFFSET) * 100
+}
+
+fn source_timestamp_ns_from_dv(dv: &opcua_types::DataValue) -> Option<i64> {
+    dv.source_timestamp.map(|dt| ticks_to_unix_ns(dt.ticks()))
+}
+
+/// 最后一次 GOOD 的缓存（§5.5）：值 + 其 SourceTimestamp，避免 LastKnown 携带 BAD 时的伪时间
+#[derive(Debug, Clone)]
+struct LastKnownSample {
+    value: Value,
+    source_timestamp_ns: Option<i64>,
+}
+
+/// 统一解码：Poll 与 Subscribe 共享（P0-A.2），避免双实现分叉
+/// 语义冻结（V1.2.1）：
+/// - GOOD + 有效 typed 值 → CURRENT，更新 last_known
+/// - UNCERTAIN + 有效 typed 值 → CURRENT（质量 Uncertain），不更新 last_known
+/// - BAD / 无值 / 类型不匹配 → LAST_KNOWN（有缓存）或 PLACEHOLDER（无缓存），Placeholder 时 source_timestamp=None
+fn decode_data_value(
+    spec: &PointSpec,
+    point_id: u32,
+    dv: opcua_types::DataValue,
+    last_known: &mut HashMap<u32, LastKnownSample>,
+) -> PointValue {
+    use opcua_types::StatusCode;
+    let status = dv.status.unwrap_or(StatusCode::Good);
+    let source_ts_current = source_timestamp_ns_from_dv(&dv);
+
+    // 尝试提取并转换 Variant → Value
+    let maybe_raw = dv
+        .value
+        .as_ref()
+        .and_then(crate::opcua_api::variant_to_value);
+
+    // 类型兼容性校验（若有值）
+    let maybe_coerced = maybe_raw.map(|v| coerce_value(v, spec.data_type));
+
+    // GOOD 路径：必须有值且类型匹配 → CURRENT 并更新缓存
+    if status.is_good() {
+        if let Some(coerced) = maybe_coerced {
+            if value_fits_data_type(&coerced, spec.data_type) {
+                let sample = LastKnownSample {
+                    value: coerced.clone(),
+                    source_timestamp_ns: source_ts_current,
+                };
+                last_known.insert(point_id, sample);
+                return PointValue {
+                    point_id,
+                    value: coerced,
+                    quality: Quality::Good,
+                    quality_code: None,
+                    source_timestamp_ns: source_ts_current,
+                    value_origin: ValueOrigin::Current,
+                };
+            } else {
+                // GOOD 状态但类型不匹配 → BadTypeMismatch，按 BAD 隔离（P0-A.6）
+                let cached = last_known.get(&point_id);
+                let (val, origin, src) = match cached {
+                    Some(s) => (
+                        s.value.clone(),
+                        ValueOrigin::LastKnown,
+                        s.source_timestamp_ns,
+                    ),
+                    None => (
+                        Value::typed_placeholder(spec.data_type),
+                        ValueOrigin::Placeholder,
+                        None,
+                    ),
+                };
+                // Placeholder 强制 source=None
+                let src = if origin == ValueOrigin::Placeholder {
+                    None
+                } else {
+                    src
+                };
+                return PointValue {
+                    point_id,
+                    value: val,
+                    quality: Quality::Bad,
+                    quality_code: Some(StatusCode::BadTypeMismatch.bits() as i32),
+                    source_timestamp_ns: src,
+                    value_origin: origin,
+                };
+            }
+        }
+        // GOOD 但无值 → BadUnexpectedError，按 BAD 隔离
+        let cached = last_known.get(&point_id);
+        let (val, origin, src) = match cached {
+            Some(s) => (
+                s.value.clone(),
+                ValueOrigin::LastKnown,
+                s.source_timestamp_ns,
+            ),
+            None => (
+                Value::typed_placeholder(spec.data_type),
+                ValueOrigin::Placeholder,
+                None,
+            ),
+        };
+        let src = if origin == ValueOrigin::Placeholder {
+            None
+        } else {
+            src
+        };
+        return PointValue {
+            point_id,
+            value: val,
+            quality: Quality::Bad,
+            quality_code: Some(StatusCode::BadUnexpectedError.bits() as i32),
+            source_timestamp_ns: src,
+            value_origin: origin,
+        };
+    }
+
+    // UNCERTAIN：若有有效 typed 值则直接透传为 CURRENT（不更新 last_known），否则按 BAD 隔离
+    if status.is_uncertain() {
+        if let Some(coerced) = maybe_coerced {
+            if value_fits_data_type(&coerced, spec.data_type) {
+                return PointValue {
+                    point_id,
+                    value: coerced,
+                    quality: Quality::Uncertain,
+                    quality_code: Some(status.bits() as i32),
+                    source_timestamp_ns: source_ts_current,
+                    value_origin: ValueOrigin::Current,
+                };
+            } else {
+                let cached = last_known.get(&point_id);
+                let (val, origin, src) = match cached {
+                    Some(s) => (
+                        s.value.clone(),
+                        ValueOrigin::LastKnown,
+                        s.source_timestamp_ns,
+                    ),
+                    None => (
+                        Value::typed_placeholder(spec.data_type),
+                        ValueOrigin::Placeholder,
+                        None,
+                    ),
+                };
+                let src = if origin == ValueOrigin::Placeholder {
+                    None
+                } else {
+                    src
+                };
+                return PointValue {
+                    point_id,
+                    value: val,
+                    quality: Quality::Bad,
+                    quality_code: Some(StatusCode::BadTypeMismatch.bits() as i32),
+                    source_timestamp_ns: src,
+                    value_origin: origin,
+                };
+            }
+        }
+        // UNCERTAIN 但无值 → 按 LastKnown/Placeholder 隔离，质量保持 Uncertain
+        let cached = last_known.get(&point_id);
+        let (val, origin, src) = match cached {
+            Some(s) => (
+                s.value.clone(),
+                ValueOrigin::LastKnown,
+                s.source_timestamp_ns,
+            ),
+            None => (
+                Value::typed_placeholder(spec.data_type),
+                ValueOrigin::Placeholder,
+                None,
+            ),
+        };
+        let src = if origin == ValueOrigin::Placeholder {
+            None
+        } else {
+            src
+        };
+        return PointValue {
+            point_id,
+            value: val,
+            quality: Quality::Uncertain,
+            quality_code: Some(status.bits() as i32),
+            source_timestamp_ns: src,
+            value_origin: origin,
+        };
+    }
+
+    // BAD：LastKnown（有缓存）或 Placeholder（无缓存），Placeholder 时 source=None
+    let cached = last_known.get(&point_id);
+    let (val, origin, src) = match cached {
+        Some(s) => (
+            s.value.clone(),
+            ValueOrigin::LastKnown,
+            s.source_timestamp_ns,
+        ),
+        None => (
+            Value::typed_placeholder(spec.data_type),
+            ValueOrigin::Placeholder,
+            None,
+        ),
+    };
+    let src = if origin == ValueOrigin::Placeholder {
+        None
+    } else {
+        src
+    };
+    let q = crate::opcua_api::status_to_quality(status);
+    PointValue {
+        point_id,
+        value: val,
+        quality: q,
+        quality_code: Some(status.bits() as i32),
+        source_timestamp_ns: src,
+        value_origin: origin,
+    }
+}
+
 #[async_trait::async_trait]
 impl DriverConnection for OpcUaConnection {
     async fn configure(
@@ -939,52 +1159,29 @@ impl DriverConnection for OpcUaConnection {
                     handles.push(tokio::spawn(async move {
                         let mut ticker = tokio::time::interval(interval);
                         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        // §5.5 last-known 连续性：按 point_id 缓存最近 GOOD 的 typed 值
+                        let mut last_known: HashMap<u32, LastKnownSample> = HashMap::new();
                         loop {
                             tokio::select! {
                                 _ = ticker.tick() => {},
                                 _ = shutdown.cancelled() => break,
                             }
                             let addrs: Vec<OpcUaAddress> = points.iter().map(|(s, _)| s.addr.clone()).collect();
-                            let values = match api.read_batch(&addrs).await {
+                            let data_values = match api.read_batch(&addrs).await {
                                 Ok(v) => v,
                                 Err(e) => {
                                     tracing::error!(task=%task_id, error=%e, "OPC UA 读失败");
                                     return Err(SdkDriverError::new(mesa_core_types::ErrorKind::Connection, "READ_FAILED", e));
                                 }
                             };
-                            if values.len() != points.len() {
-                                tracing::warn!(task=%task_id, got=values.len(), expected=points.len(), "OPC UA 返回数量不一致");
+                            if data_values.len() != points.len() {
+                                tracing::warn!(task=%task_id, got=data_values.len(), expected=points.len(), "OPC UA 返回数量不一致");
                                 continue;
                             }
                             let mut batch_vals = Vec::with_capacity(points.len());
-                            for ((spec, pid), raw_val) in points.iter().zip(values) {
-                                if let Value::String(s) = &raw_val
-                                    && s.starts_with("ERR:") {
-                                        let q = if s.contains("Uncertain") { Quality::Uncertain } else { Quality::Bad };
-                                        let code = if s.contains("Uncertain") { Some(0x40000000) } else { Some(1) };
-                                        tracing::warn!(key=%spec.key, error=%s, quality=?q, "单点非 Good");
-                                        batch_vals.push(PointValue {
-                                            point_id: *pid,
-                                            value: raw_val,
-                                            quality: q,
-                                            quality_code: code,
-                                            source_timestamp_ns: None,
-                                        });
-                                        continue;
-                                    }
-                                let coerced = coerce_value(raw_val, spec.data_type);
-                                if !value_fits_data_type(&coerced, spec.data_type) {
-                                    tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配跳过");
-                                    continue;
-                                }
-                                let ts = now_unix_ns();
-                                batch_vals.push(PointValue {
-                                    point_id: *pid,
-                                    value: coerced,
-                                    quality: Quality::Good,
-                                    quality_code: None,
-                                    source_timestamp_ns: Some(ts),
-                                });
+                            for ((spec, pid), dv) in points.iter().zip(data_values) {
+                                let pv = decode_data_value(spec, *pid, dv, &mut last_known);
+                                batch_vals.push(pv);
                             }
                             if batch_vals.is_empty() { continue; }
                             sink.publish(DataBatch {
@@ -1014,16 +1211,28 @@ impl DriverConnection for OpcUaConnection {
                                 match api.browse(&spec.addr).await {
                                     Ok(refs) => {
                                         let val = Value::String(refs.join(";"));
-                                        batch_vals.push(PointValue::good(*pid, val));
+                                        batch_vals.push(PointValue {
+                                            point_id: *pid,
+                                            value: val,
+                                            quality: Quality::Good,
+                                            quality_code: None,
+                                            source_timestamp_ns: None,
+                                            value_origin: ValueOrigin::Current,
+                                        });
                                     }
                                     Err(e) => {
                                         tracing::warn!(key=%spec.key, error=%e, "Browse 单点 Bad");
+                                        // Browse 失败亦为 typed BAD + Placeholder（无 last-known 缓存，Browse 非连续信号）
                                         batch_vals.push(PointValue {
                                             point_id: *pid,
-                                            value: Value::String(format!("ERR:{}", e)),
+                                            value: Value::typed_placeholder(spec.data_type),
                                             quality: Quality::Bad,
-                                            quality_code: Some(1),
+                                            quality_code: Some(
+                                                opcua_types::StatusCode::BadUnexpectedError.bits()
+                                                    as i32,
+                                            ),
                                             source_timestamp_ns: None,
+                                            value_origin: ValueOrigin::Placeholder,
                                         });
                                     }
                                 }
@@ -1067,6 +1276,7 @@ impl DriverConnection for OpcUaConnection {
                             }
                         };
                         tracing::info!(task=%task_id, sub_id=%sub_id, "OPC UA 订阅已建立");
+                        let mut last_known: HashMap<u32, LastKnownSample> = HashMap::new();
                         // 订阅事件循环：DataChangeCallback → mpsc → 批量聚合 → DataSink，KeepAlive 自然无事件不产批
                         loop {
                             let first = tokio::select! {
@@ -1089,55 +1299,8 @@ impl DriverConnection for OpcUaConnection {
                                     tracing::warn!(task=%task_id, handle=%ev.client_handle, "未知 client_handle");
                                     continue;
                                 };
-                                let dv = ev.data_value;
-                                // 状态按 OPC UA StatusCode 映射 GOOD/UNCERTAIN/BAD (§9.3)
-                                if let Some(status) = dv.status
-                                    && !status.is_good() {
-                                        let q = crate::opcua_api::status_to_quality(status);
-                                        tracing::warn!(key=%spec.key, status=?status, quality=?q, "单点非 Good");
-                                        batch_vals.push(PointValue {
-                                            point_id: *pid,
-                                            value: Value::String(format!("ERR:{:?}", status)),
-                                            quality: q,
-                                            quality_code: Some(status.bits() as i32),
-                                            source_timestamp_ns: None,
-                                        });
-                                        continue;
-                                    }
-                                let Some(variant) = dv.value else {
-                                    tracing::warn!(key=%spec.key, "DataValue 无 value");
-                                    batch_vals.push(PointValue {
-                                        point_id: *pid,
-                                        value: Value::String(format!("ERR:BadNoValue {:?}", dv.status)),
-                                        quality: Quality::Bad,
-                                        quality_code: Some(1),
-                                        source_timestamp_ns: None,
-                                    });
-                                    continue;
-                                };
-                                let Some(raw_val) = crate::opcua_api::variant_to_value(&variant) else {
-                                    continue;
-                                };
-                                let coerced = coerce_value(raw_val, spec.data_type);
-                                if !value_fits_data_type(&coerced, spec.data_type) {
-                                    tracing::warn!(key=%spec.key, got=?coerced, expected=?spec.data_type, "类型不匹配跳过");
-                                    continue;
-                                }
-                                // source_timestamp 透传：优先 DataValue.source_timestamp 1601 ticks→Unix ns，否则 now
-                                let ts_ns = dv.source_timestamp.map(|dt| {
-                                    let ticks = dt.ticks();
-                                    const TICKS_PER_SEC: i64 = 10_000_000;
-                                    const UNIX_TICKS_OFFSET: i64 = 11644473600 * TICKS_PER_SEC;
-                                    let unix_ticks = ticks - UNIX_TICKS_OFFSET;
-                                    unix_ticks * 100
-                                }).unwrap_or_else(now_unix_ns);
-                                batch_vals.push(PointValue {
-                                    point_id: *pid,
-                                    value: coerced,
-                                    quality: Quality::Good,
-                                    quality_code: None,
-                                    source_timestamp_ns: Some(ts_ns),
-                                });
+                                let pv = decode_data_value(spec, *pid, ev.data_value, &mut last_known);
+                                batch_vals.push(pv);
                             }
                             if batch_vals.is_empty() {
                                 // KeepAlive 或全过滤：不递增 sequence，不产批 (§7.3)
@@ -1294,5 +1457,225 @@ mod tests {
         map.insert(descs[0].point_key.clone(), 1u32);
         conn.apply_point_map(map).await.unwrap();
         // 能走到 apply 即代表 Poll 快照构建正确；run 的 DataSink 发布由集成测试覆盖
+    }
+
+    // --- P0-A.9 GOOD→BAD→GOOD / first BAD / legacy / REST 契约测试（V1.2.1 Gate） ---
+
+    fn dv_good_f64(val: f64, ticks: i64) -> opcua_types::DataValue {
+        use opcua_types::{DataValue, DateTime, StatusCode, Variant};
+        DataValue {
+            value: Some(Variant::Double(val)),
+            status: Some(StatusCode::Good),
+            source_timestamp: Some(DateTime::from(ticks)),
+            source_picoseconds: None,
+            server_timestamp: Some(DateTime::now()),
+            server_picoseconds: None,
+        }
+    }
+
+    fn dv_bad(status: opcua_types::StatusCode, ticks: i64) -> opcua_types::DataValue {
+        use opcua_types::{DataValue, DateTime};
+        DataValue {
+            value: None,
+            status: Some(status),
+            source_timestamp: Some(DateTime::from(ticks)),
+            source_picoseconds: None,
+            server_timestamp: Some(DateTime::now()),
+            server_picoseconds: None,
+        }
+    }
+
+    fn point_spec_f64(key: &str) -> PointSpec {
+        PointSpec {
+            key: key.into(),
+            addr: crate::address::parse_address("ns=2;i=2").unwrap(),
+            data_type: mesa_core_types::DataType::F64,
+        }
+    }
+
+    #[test]
+    fn first_bad_no_history_placeholder() {
+        use std::collections::HashMap;
+        let spec = point_spec_f64("k1");
+        let mut last = HashMap::new();
+        // 首次即 BAD，无历史 → Placeholder + typed neutral + source None
+        const TICKS: i64 = 11644473600 * 10_000_000 + 1_000_000;
+        let dv = dv_bad(opcua_types::StatusCode::BadNodeIdUnknown, TICKS);
+        let pv = decode_data_value(&spec, 1, dv, &mut last);
+        assert_eq!(pv.quality, Quality::Bad);
+        assert_eq!(pv.value_origin, ValueOrigin::Placeholder);
+        assert_eq!(
+            pv.value,
+            Value::typed_placeholder(mesa_core_types::DataType::F64)
+        );
+        assert_eq!(
+            pv.source_timestamp_ns, None,
+            "Placeholder 必须无 source timestamp"
+        );
+        assert!(pv.quality_code.is_some());
+    }
+
+    #[test]
+    fn good_then_bad_last_known() {
+        use std::collections::HashMap;
+        let spec = point_spec_f64("k1");
+        let mut last = HashMap::new();
+        const TICKS_GOOD: i64 = 11644473600 * 10_000_000 + 1_000_000; // 1970+100ms
+        const TICKS_BAD: i64 = TICKS_GOOD + 5_000_000; // +500ms
+        let pv_good = decode_data_value(&spec, 1, dv_good_f64(12.5, TICKS_GOOD), &mut last);
+        assert_eq!(pv_good.value_origin, ValueOrigin::Current);
+        assert_eq!(
+            pv_good.source_timestamp_ns,
+            Some(ticks_to_unix_ns(TICKS_GOOD))
+        );
+        // BAD 时使用缓存 GOOD 的值与时间
+        let pv_bad = decode_data_value(
+            &spec,
+            1,
+            dv_bad(opcua_types::StatusCode::BadTimeout, TICKS_BAD),
+            &mut last,
+        );
+        assert_eq!(pv_bad.value_origin, ValueOrigin::LastKnown);
+        assert_eq!(pv_bad.value, Value::F64(12.5));
+        assert_eq!(
+            pv_bad.source_timestamp_ns,
+            Some(ticks_to_unix_ns(TICKS_GOOD)),
+            "LastKnown 必须携带 GOOD 的 SourceTimestamp"
+        );
+        assert_eq!(pv_bad.quality, Quality::Bad);
+    }
+
+    #[test]
+    fn good_bad_good_restores_current() {
+        use std::collections::HashMap;
+        let spec = point_spec_f64("k1");
+        let mut last = HashMap::new();
+        const T1: i64 = 11644473600 * 10_000_000 + 1_000_000;
+        const T2: i64 = T1 + 5_000_000;
+        const T3: i64 = T1 + 10_000_000;
+        let p1 = decode_data_value(&spec, 1, dv_good_f64(12.5, T1), &mut last);
+        assert_eq!(p1.value_origin, ValueOrigin::Current);
+        let p2 = decode_data_value(
+            &spec,
+            1,
+            dv_bad(opcua_types::StatusCode::BadTimeout, T2),
+            &mut last,
+        );
+        assert_eq!(p2.value_origin, ValueOrigin::LastKnown);
+        let p3 = decode_data_value(&spec, 1, dv_good_f64(13.2, T3), &mut last);
+        assert_eq!(p3.value_origin, ValueOrigin::Current);
+        assert_eq!(p3.value, Value::F64(13.2));
+        assert_eq!(p3.source_timestamp_ns, Some(ticks_to_unix_ns(T3)));
+        assert_eq!(p3.quality, Quality::Good);
+    }
+
+    #[test]
+    fn sibling_isolation_bad_does_not_poison_other() {
+        use std::collections::HashMap;
+        let spec_a = point_spec_f64("kA");
+        let spec_b = PointSpec {
+            key: "kB".into(),
+            addr: crate::address::parse_address("ns=2;i=3").unwrap(),
+            data_type: mesa_core_types::DataType::F64,
+        };
+        let mut last: HashMap<u32, LastKnownSample> = HashMap::new();
+        // 先给 B 一个 GOOD 缓存
+        let _ = decode_data_value(
+            &spec_b,
+            2,
+            dv_good_f64(99.0, 11644473600 * 10_000_000 + 1_000),
+            &mut last,
+        );
+        // A 首次 BAD → Placeholder，B 不受影响仍为 LastKnown/后续 Good？
+        const T_BAD: i64 = 11644473600 * 10_000_000 + 5_000_000;
+        let pv_a_bad = decode_data_value(
+            &spec_a,
+            1,
+            dv_bad(opcua_types::StatusCode::BadNodeIdUnknown, T_BAD),
+            &mut last,
+        );
+        assert_eq!(pv_a_bad.value_origin, ValueOrigin::Placeholder);
+        // B 再次 BAD 应为 LastKnown 99.0
+        let pv_b_bad = decode_data_value(
+            &spec_b,
+            2,
+            dv_bad(opcua_types::StatusCode::BadTimeout, T_BAD + 1_000),
+            &mut last,
+        );
+        assert_eq!(pv_b_bad.value_origin, ValueOrigin::LastKnown);
+        assert_eq!(pv_b_bad.value, Value::F64(99.0));
+        // A 的 GOOD 不影响 B 的缓存
+        let pv_a_good = decode_data_value(&spec_a, 1, dv_good_f64(1.1, T_BAD + 2_000), &mut last);
+        assert_eq!(pv_a_good.value_origin, ValueOrigin::Current);
+        let pv_b_bad2 = decode_data_value(
+            &spec_b,
+            2,
+            dv_bad(opcua_types::StatusCode::BadTimeout, T_BAD + 3_000),
+            &mut last,
+        );
+        assert_eq!(pv_b_bad2.value, Value::F64(99.0));
+    }
+
+    #[test]
+    fn uncertain_valid_value_is_current_not_last_known() {
+        use std::collections::HashMap;
+        let spec = point_spec_f64("k1");
+        let mut last = HashMap::new();
+        const T_GOOD: i64 = 11644473600 * 10_000_000 + 1_000_000;
+        const T_UNCERTAIN: i64 = T_GOOD + 5_000_000;
+        const T_BAD: i64 = T_UNCERTAIN + 5_000_000;
+        let _ = decode_data_value(&spec, 1, dv_good_f64(10.0, T_GOOD), &mut last);
+        // UNCERTAIN + 有效值 → Current，质量 Uncertain，不更新 last_known
+        let dv_uncertain = opcua_types::DataValue {
+            value: Some(opcua_types::Variant::Double(12.8)),
+            status: Some(opcua_types::StatusCode::Uncertain),
+            source_timestamp: Some(opcua_types::DateTime::from(T_UNCERTAIN)),
+            source_picoseconds: None,
+            server_timestamp: None,
+            server_picoseconds: None,
+        };
+        let pv_u = decode_data_value(&spec, 1, dv_uncertain, &mut last);
+        assert_eq!(pv_u.quality, Quality::Uncertain);
+        assert_eq!(pv_u.value_origin, ValueOrigin::Current);
+        assert_eq!(pv_u.value, Value::F64(12.8));
+        // 随后 BAD 应仍回退到 10.0（GOOD），而非 12.8（UNCERTAIN 未更新缓存）
+        let pv_bad = decode_data_value(
+            &spec,
+            1,
+            dv_bad(opcua_types::StatusCode::BadTimeout, T_BAD),
+            &mut last,
+        );
+        assert_eq!(pv_bad.value, Value::F64(10.0));
+        assert_eq!(pv_bad.value_origin, ValueOrigin::LastKnown);
+    }
+
+    #[test]
+    fn type_mismatch_produces_bad_type_mismatch_not_good_code() {
+        use std::collections::HashMap;
+        let spec = PointSpec {
+            key: "k1".into(),
+            addr: crate::address::parse_address("ns=2;s=MyString").unwrap(),
+            data_type: mesa_core_types::DataType::F64,
+        };
+        let mut last = HashMap::new();
+        // GOOD 状态但 String 值与 F64 不兼容 → BadTypeMismatch，Placeholder
+        let dv = opcua_types::DataValue {
+            value: Some(opcua_types::Variant::String(opcua_types::UAString::from(
+                "not a number",
+            ))),
+            status: Some(opcua_types::StatusCode::Good),
+            source_timestamp: Some(opcua_types::DateTime::now()),
+            source_picoseconds: None,
+            server_timestamp: None,
+            server_picoseconds: None,
+        };
+        let pv = decode_data_value(&spec, 1, dv, &mut last);
+        assert_eq!(pv.quality, Quality::Bad);
+        assert_eq!(
+            pv.quality_code,
+            Some(opcua_types::StatusCode::BadTypeMismatch.bits() as i32)
+        );
+        assert_eq!(pv.value_origin, ValueOrigin::Placeholder);
+        assert_ne!(pv.quality_code, Some(0));
     }
 }

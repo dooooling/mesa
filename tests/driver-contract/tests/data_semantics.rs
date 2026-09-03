@@ -4,7 +4,7 @@
 use mesa_config_store::ConfigStore;
 use mesa_core_types::{
     AcquisitionTask, DataBatch, DataType, DriverBinding, PointDescriptor, PointValue, Quality,
-    TaskMode, Value, ensure_unique_point_keys, now_unix_ns,
+    TaskMode, Value, ValueOrigin, ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_manager::snapshot::Snapshot;
 
@@ -29,6 +29,7 @@ fn bad_value_type_still_matches_descriptor() {
         quality: Quality::Bad,
         quality_code: Some(1),
         source_timestamp_ns: None,
+        value_origin: ValueOrigin::Placeholder,
     };
     assert_eq!(pv.quality, Quality::Bad);
     assert_eq!(pv.value.data_type(), DataType::I32);
@@ -386,6 +387,7 @@ fn one_output_bad_does_not_poison_sibling() {
                 quality: Quality::Bad,
                 quality_code: Some(1),
                 source_timestamp_ns: None,
+                value_origin: ValueOrigin::Placeholder,
             },
             PointValue::good(2, Value::I32(99)),
         ],
@@ -398,6 +400,214 @@ fn one_output_bad_does_not_poison_sibling() {
     assert_eq!(latest[0].value.value, serde_json::json!(0));
     assert_eq!(latest[1].quality, "GOOD");
     assert_eq!(latest[1].value.value, serde_json::json!(99));
+}
+
+// --- V1.2.1 P0-A GOOD→BAD→GOOD 平台连续性契约（§5.5）：驱动已保证 LastKnown，平台必须透传不丢失 ---
+#[test]
+fn p0a_good_bad_good_platform_continuity() {
+    let snap = Snapshot::new();
+    snap.register_points(
+        "ep1",
+        &[mesa_core_types::PointDefinition {
+            point_id: 1,
+            point_key: "k1".into(),
+            data_type: DataType::F64,
+            unit: None,
+        }],
+    );
+    // GOOD Current 12.5 @ T1
+    let t1: i64 = 1_700_000_000_000_000_000;
+    snap.apply_batch(
+        &DataBatch {
+            connection_handle: 0,
+            stream_epoch: 1,
+            sequence: 1,
+            timestamp_ns: t1,
+            values: vec![PointValue {
+                point_id: 1,
+                value: Value::F64(12.5),
+                quality: Quality::Good,
+                quality_code: None,
+                source_timestamp_ns: Some(t1),
+                value_origin: ValueOrigin::Current,
+            }],
+            mono_ns: None,
+        },
+        "ep1",
+    );
+    let e1 = snap.latest_all()[0].clone();
+    assert_eq!(e1.value_origin, "CURRENT");
+    assert_eq!(e1.source_timestamp_ns, Some(t1));
+    assert_eq!(e1.quality, "GOOD");
+
+    // BAD LastKnown 12.5 @ T1（复用 GOOD 的 source，不使用 BAD 自身时间）
+    snap.apply_batch(
+        &DataBatch {
+            connection_handle: 0,
+            stream_epoch: 1,
+            sequence: 2,
+            timestamp_ns: t1 + 500_000_000,
+            values: vec![PointValue {
+                point_id: 1,
+                value: Value::F64(12.5),
+                quality: Quality::Bad,
+                quality_code: Some(0x80340000u32 as i32),
+                source_timestamp_ns: Some(t1),
+                value_origin: ValueOrigin::LastKnown,
+            }],
+            mono_ns: None,
+        },
+        "ep1",
+    );
+    let e2 = snap.latest_all()[0].clone();
+    assert_eq!(e2.value_origin, "LAST_KNOWN");
+    assert_eq!(
+        e2.source_timestamp_ns,
+        Some(t1),
+        "LastKnown 必须携带 GOOD 的 SourceTimestamp"
+    );
+    assert_eq!(e2.value.value, serde_json::json!(12.5));
+    assert_eq!(e2.quality, "BAD");
+
+    // GOOD Current 13.2 @ T3 恢复
+    let t3 = t1 + 1_000_000_000;
+    snap.apply_batch(
+        &DataBatch {
+            connection_handle: 0,
+            stream_epoch: 1,
+            sequence: 3,
+            timestamp_ns: t3,
+            values: vec![PointValue {
+                point_id: 1,
+                value: Value::F64(13.2),
+                quality: Quality::Good,
+                quality_code: None,
+                source_timestamp_ns: Some(t3),
+                value_origin: ValueOrigin::Current,
+            }],
+            mono_ns: None,
+        },
+        "ep1",
+    );
+    let e3 = snap.latest_all()[0].clone();
+    assert_eq!(e3.value_origin, "CURRENT");
+    assert_eq!(e3.source_timestamp_ns, Some(t3));
+    assert_eq!(e3.value.value, serde_json::json!(13.2));
+    assert_eq!(e3.quality, "GOOD");
+}
+
+// --- V1.2.1 P0-A 首次 BAD 即 Placeholder（无历史 GOOD） ---
+#[test]
+fn p0a_first_bad_is_placeholder_no_source_timestamp() {
+    let snap = Snapshot::new();
+    snap.register_points(
+        "ep1",
+        &[mesa_core_types::PointDefinition {
+            point_id: 1,
+            point_key: "k1".into(),
+            data_type: DataType::F64,
+            unit: None,
+        }],
+    );
+    // 首次采样即 BAD，无 LastKnown → Placeholder + typed neutral + source None
+    snap.apply_batch(
+        &DataBatch {
+            connection_handle: 0,
+            stream_epoch: 1,
+            sequence: 1,
+            timestamp_ns: 1_000_000,
+            values: vec![PointValue {
+                point_id: 1,
+                value: Value::typed_placeholder(DataType::F64),
+                quality: Quality::Bad,
+                quality_code: Some(0x80340000u32 as i32),
+                // 驱动层已保证 Placeholder 的 source 为 None，即使传入 Some 也应被平台防御性清零
+                source_timestamp_ns: Some(9_999_999),
+                value_origin: ValueOrigin::Placeholder,
+            }],
+            mono_ns: None,
+        },
+        "ep1",
+    );
+    let e = snap.latest_all()[0].clone();
+    assert_eq!(e.value_origin, "PLACEHOLDER");
+    assert_eq!(
+        e.source_timestamp_ns, None,
+        "Placeholder 必须无 source_timestamp"
+    );
+    assert_eq!(e.value.value, serde_json::json!(0.0));
+    assert_eq!(e.quality, "BAD");
+    // REST JSON 必须可见 PLACEHOLDER 而非被吞
+    let json = serde_json::to_value(&e).unwrap();
+    assert_eq!(json["value_origin"], "PLACEHOLDER");
+    assert!(json.get("source_timestamp_ns").is_none());
+}
+
+// --- V1.2.1 P0-A Snapshot/REST value_origin 不丢失 ---
+#[test]
+fn p0a_snapshot_rest_value_origin_not_lost() {
+    let snap = Snapshot::new();
+    snap.register_points(
+        "ep1",
+        &[mesa_core_types::PointDefinition {
+            point_id: 1,
+            point_key: "k1".into(),
+            data_type: DataType::I32,
+            unit: None,
+        }],
+    );
+    // LastKnown
+    snap.apply_batch(
+        &DataBatch {
+            connection_handle: 0,
+            stream_epoch: 1,
+            sequence: 1,
+            timestamp_ns: 1_000_000,
+            values: vec![PointValue {
+                point_id: 1,
+                value: Value::I32(42),
+                quality: Quality::Bad,
+                quality_code: Some(1),
+                source_timestamp_ns: Some(500_000),
+                value_origin: ValueOrigin::LastKnown,
+            }],
+            mono_ns: None,
+        },
+        "ep1",
+    );
+    let e = snap.latest_all()[0].clone();
+    assert_eq!(e.value_origin, "LAST_KNOWN");
+    assert_eq!(e.source_timestamp_ns, Some(500_000));
+    let json = serde_json::to_value(&e).unwrap();
+    assert_eq!(json["value_origin"], "LAST_KNOWN");
+    assert_eq!(json["source_timestamp_ns"], 500_000);
+
+    // Placeholder
+    snap.apply_batch(
+        &DataBatch {
+            connection_handle: 0,
+            stream_epoch: 1,
+            sequence: 2,
+            timestamp_ns: 2_000_000,
+            values: vec![PointValue {
+                point_id: 1,
+                value: Value::typed_placeholder(DataType::I32),
+                quality: Quality::Bad,
+                quality_code: Some(1),
+                source_timestamp_ns: None,
+                value_origin: ValueOrigin::Placeholder,
+            }],
+            mono_ns: None,
+        },
+        "ep1",
+    );
+    let e2 = snap.latest_all()[0].clone();
+    assert_eq!(e2.value_origin, "PLACEHOLDER");
+    assert!(e2.source_timestamp_ns.is_none());
+    assert_eq!(
+        serde_json::to_value(&e2).unwrap()["value_origin"],
+        "PLACEHOLDER"
+    );
 }
 
 // --- automatic tombstone GC does not exist (§3.10.1) ---
