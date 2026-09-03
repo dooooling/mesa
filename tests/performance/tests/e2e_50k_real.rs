@@ -125,16 +125,34 @@ async fn e2e_50k_real_throughput() {
         println!("warm-up {}s ...", warmup.as_secs());
         tokio::time::sleep(warmup).await;
     }
-    let start_rss = current_rss_bytes();
+    // warm-up 后立即确认 Endpoint 仍 RUNNING，避免无效长跑
+    if soak {
+        let st_warm = snap
+            .endpoint(ep_id)
+            .expect("endpoint after warmup still present");
+        assert_eq!(
+            st_warm.state, "RUNNING",
+            "warm-up 后仍应 RUNNING，实际 {:?}",
+            st_warm
+        );
+    }
+    // fail-closed：Soak 下 warm-up 后必须可读取稳态基线
+    let start_rss = if soak {
+        Some(current_rss_bytes().expect("PERF_SOAK warm-up 后必须能够读取 RSS baseline"))
+    } else {
+        current_rss_bytes()
+    };
     let steady_rss_mib = start_rss.map(|v| v as f64 / (1024.0 * 1024.0));
     println!(
-        "steady baseline rss={:?} ({:.1?} MiB)",
-        start_rss, steady_rss_mib
+        "steady baseline rss={:?} ({:.1?} MiB) warmup={}s",
+        start_rss,
+        steady_rss_mib,
+        warmup.as_secs()
     );
     let start = Instant::now();
     let start_points = snap.point_value_total();
     let start_env = snap.envelopes_total();
-    // 周期采样 RSS（每 60s），用于区分“前 5min 涨到高水位后稳定” vs “持续正斜率泄漏”
+    // 周期采样 RSS（每 60s），fail-closed：Soak 下每次采样必须成功
     let mut rss_samples: Vec<u64> = Vec::new();
     if let Some(v) = start_rss {
         rss_samples.push(v);
@@ -147,13 +165,19 @@ async fn e2e_50k_real_throughput() {
         while remaining > Duration::from_secs(0) {
             let step = remaining.min(sample_interval);
             tokio::time::sleep(step).await;
-            if let Some(v) = current_rss_bytes() {
-                rss_samples.push(v);
-                end_rss = Some(v);
-            }
+            let v = current_rss_bytes().expect("PERF_SOAK 周期 RSS 采样失败");
+            rss_samples.push(v);
+            end_rss = Some(v);
             remaining = remaining.saturating_sub(step);
         }
         elapsed = start.elapsed().as_secs_f64();
+        // Soak 强制 sample 完整性：baseline 1 + 3600/60 = 61
+        let expected_samples = 1 + dur.as_secs() / sample_interval.as_secs();
+        assert_eq!(
+            rss_samples.len() as u64,
+            expected_samples,
+            "RSS sample count incomplete"
+        );
     } else {
         tokio::time::sleep(dur).await;
         elapsed = start.elapsed().as_secs_f64();
@@ -291,6 +315,10 @@ async fn e2e_50k_real_throughput() {
         } else {
             "quick"
         };
+        let rss_samples_mib: Vec<f64> = rss_samples
+            .iter()
+            .map(|v| *v as f64 / (1024.0 * 1024.0))
+            .collect();
         let perf_json = serde_json::json!({
             "throughput_updates_per_sec": ups.round() as u64,
             "ipc_p95_ms": (ipc_p95 as f64 / 1_000_000.0).round() as u64,
@@ -309,6 +337,7 @@ async fn e2e_50k_real_throughput() {
             "rss_end_mib": end_rss.map(|v| v as f64 / (1024.0*1024.0)),
             "rss_peak_mib": rss_peak.map(|v| v as f64 / (1024.0*1024.0)),
             "rss_sample_count": rss_sample_count,
+            "rss_samples_mib": rss_samples_mib,
             "warmup_seconds": warmup.as_secs()
         });
         let _ = std::fs::write(
@@ -341,6 +370,7 @@ async fn e2e_50k_real_throughput() {
                 "rss_end_mib": end_rss.map(|v| v as f64 / (1024.0*1024.0)),
                 "rss_peak_mib": rss_peak.map(|v| v as f64 / (1024.0*1024.0)),
                 "rss_sample_count": rss_sample_count,
+                "rss_samples_mib": rss_samples_mib.clone(),
                 "warmup_seconds": warmup.as_secs()
             });
             let _ = std::fs::write(

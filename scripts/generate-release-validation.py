@@ -163,10 +163,19 @@ def main():
             dur = perf.get("duration_seconds", 0)
             if not isinstance(dur, (int, float)) or dur < 3600:
                 print(f"strict: performance.duration_seconds {dur} <3600（需 1h soak）", file=sys.stderr); sys.exit(1)
-            # soak 必须绑定且 duration >=1h 且 release build
+            # soak 必须绑定且 duration >=1h 且 release build，且满足 warm-up + 周期采样契约
             check_sha("soak", soak_d)
             if soak_d.get("build_profile") != "release":
                 print(f"strict: soak.build_profile 需为 release 当前 {soak_d.get('build_profile')}", file=sys.stderr); sys.exit(1)
+            if soak_d.get("warmup_seconds", 0) < 300:
+                print(f"strict: soak.warmup_seconds {soak_d.get('warmup_seconds')} <300", file=sys.stderr); sys.exit(1)
+            if soak_d.get("rss_sample_count", 0) < 61:
+                print(f"strict: soak.rss_sample_count {soak_d.get('rss_sample_count')} <61", file=sys.stderr); sys.exit(1)
+            for k in ["rss_start_mib", "rss_end_mib", "rss_peak_mib"]:
+                if not isinstance(soak_d.get(k), (int, float)):
+                    print(f"strict: soak.{k} 缺失或非数字 {soak_d.get(k)}", file=sys.stderr); sys.exit(1)
+            if soak_d.get("rss_scope") != "core_test_process":
+                print(f"strict: soak.rss_scope 需为 core_test_process 当前 {soak_d.get('rss_scope')}", file=sys.stderr); sys.exit(1)
             if soak_d.get("duration_hours", 0) < 1.0:
                 print(f"strict: soak duration {soak_d.get('duration_hours')}h <1.0h", file=sys.stderr); sys.exit(1)
             if soak_d.get("duration_seconds", dur) < 3600:
