@@ -16,6 +16,7 @@ path = "src/main.rs"
 mesa-core-types = { workspace = true }
 mesa-driver-protocol = { workspace = true }
 mesa-driver-sdk = { workspace = true }
+mesa-opcua-transport = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
@@ -24,6 +25,5 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
-async-opcua-client = "0.19"
 async-opcua-types = "0.19"
 base64 = "0.22"
