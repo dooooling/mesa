@@ -169,13 +169,25 @@ def main():
                 print(f"strict: soak.build_profile 需为 release 当前 {soak_d.get('build_profile')}", file=sys.stderr); sys.exit(1)
             if soak_d.get("warmup_seconds", 0) < 300:
                 print(f"strict: soak.warmup_seconds {soak_d.get('warmup_seconds')} <300", file=sys.stderr); sys.exit(1)
-            if soak_d.get("rss_sample_count", 0) < 61:
-                print(f"strict: soak.rss_sample_count {soak_d.get('rss_sample_count')} <61", file=sys.stderr); sys.exit(1)
+            if soak_d.get("rss_sample_count", 0) != 61:
+                print(f"strict: soak.rss_sample_count 需 ==61 当前 {soak_d.get('rss_sample_count')}", file=sys.stderr); sys.exit(1)
             for k in ["rss_start_mib", "rss_end_mib", "rss_peak_mib"]:
                 if not isinstance(soak_d.get(k), (int, float)):
                     print(f"strict: soak.{k} 缺失或非数字 {soak_d.get(k)}", file=sys.stderr); sys.exit(1)
             if soak_d.get("rss_scope") != "core_test_process":
                 print(f"strict: soak.rss_scope 需为 core_test_process 当前 {soak_d.get('rss_scope')}", file=sys.stderr); sys.exit(1)
+            # P2 一致性：samples 数组与 count/start/end/peak 同源
+            samples = soak_d.get("rss_samples_mib")
+            if not isinstance(samples, list) or len(samples) != soak_d.get("rss_sample_count"):
+                print(f"strict: soak.rss_samples_mib len {len(samples) if isinstance(samples, list) else 'not list'} != rss_sample_count {soak_d.get('rss_sample_count')}", file=sys.stderr); sys.exit(1)
+            def approx_eq(a, b, eps=0.01):
+                return abs(float(a) - float(b)) <= eps
+            if not approx_eq(samples[0], soak_d.get("rss_start_mib")):
+                print(f"strict: soak.rss_samples_mib[0] {samples[0]} != rss_start_mib {soak_d.get('rss_start_mib')}", file=sys.stderr); sys.exit(1)
+            if not approx_eq(samples[-1], soak_d.get("rss_end_mib")):
+                print(f"strict: soak.rss_samples_mib[-1] {samples[-1]} != rss_end_mib {soak_d.get('rss_end_mib')}", file=sys.stderr); sys.exit(1)
+            if not approx_eq(max(samples), soak_d.get("rss_peak_mib")):
+                print(f"strict: soak max(rss_samples_mib) {max(samples)} != rss_peak_mib {soak_d.get('rss_peak_mib')}", file=sys.stderr); sys.exit(1)
             if soak_d.get("duration_hours", 0) < 1.0:
                 print(f"strict: soak duration {soak_d.get('duration_hours')}h <1.0h", file=sys.stderr); sys.exit(1)
             if soak_d.get("duration_seconds", dur) < 3600:
