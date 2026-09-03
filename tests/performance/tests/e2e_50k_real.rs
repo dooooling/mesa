@@ -92,12 +92,13 @@ async fn e2e_50k_real_throughput() {
         Duration::from_secs(10)
     };
     let drivers_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../drivers");
-    // 测试开始即删旧 Evidence，避免失败后遗留假阳性
+    // 测试开始即删旧 Evidence，避免失败后遗留假阳性（diagnostic 亦清理，避免旧曲线残留）
     {
         let out_dir =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/validation");
         let _ = std::fs::remove_file(out_dir.join("performance.json"));
         let _ = std::fs::remove_file(out_dir.join("soak.json"));
+        let _ = std::fs::remove_file(out_dir.join("soak-diagnostic.json"));
     }
     // 使用内存版 PointIdAllocator（BuiltinEndpoint 不落库），避免 StorePointIdSource 对 ConfigStore endpoint 的强依赖导致 ConfigurationFailed
     let mgr = MesaManager::discover(&drivers_dir);
