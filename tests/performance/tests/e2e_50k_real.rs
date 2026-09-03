@@ -114,14 +114,54 @@ async fn e2e_50k_real_throughput() {
         snap.endpoint(ep_id)
     );
 
+    // Soak 测量模型：warm-up 5min 后取稳态基线，再正式 60min 验收；阈值仍 §22 的 10%，
+    // 但 start 已为高水位后的稳态值，避免冷启动基线误判。期间每 60s 采样一次用于趋势判断。
+    let warmup = if soak {
+        Duration::from_secs(300)
+    } else {
+        Duration::from_secs(0)
+    };
+    if warmup.as_secs() > 0 {
+        println!("warm-up {}s ...", warmup.as_secs());
+        tokio::time::sleep(warmup).await;
+    }
     let start_rss = current_rss_bytes();
+    let steady_rss_mib = start_rss.map(|v| v as f64 / (1024.0 * 1024.0));
+    println!(
+        "steady baseline rss={:?} ({:.1?} MiB)",
+        start_rss, steady_rss_mib
+    );
     let start = Instant::now();
     let start_points = snap.point_value_total();
     let start_env = snap.envelopes_total();
-    // 单调时钟下等待 dur，中途不以 latest_all 去重长度估算吞吐
-    tokio::time::sleep(dur).await;
-    let elapsed = start.elapsed().as_secs_f64();
-    let end_rss = current_rss_bytes();
+    // 周期采样 RSS（每 60s），用于区分“前 5min 涨到高水位后稳定” vs “持续正斜率泄漏”
+    let mut rss_samples: Vec<u64> = Vec::new();
+    if let Some(v) = start_rss {
+        rss_samples.push(v);
+    }
+    let elapsed: f64;
+    let mut end_rss = start_rss;
+    if soak {
+        let sample_interval = Duration::from_secs(60);
+        let mut remaining = dur;
+        while remaining > Duration::from_secs(0) {
+            let step = remaining.min(sample_interval);
+            tokio::time::sleep(step).await;
+            if let Some(v) = current_rss_bytes() {
+                rss_samples.push(v);
+                end_rss = Some(v);
+            }
+            remaining = remaining.saturating_sub(step);
+        }
+        elapsed = start.elapsed().as_secs_f64();
+    } else {
+        tokio::time::sleep(dur).await;
+        elapsed = start.elapsed().as_secs_f64();
+        end_rss = current_rss_bytes();
+        if let Some(v) = end_rss {
+            rss_samples.push(v);
+        }
+    }
     let end_points = snap.point_value_total();
     let end_env = snap.envelopes_total();
     let delta_points = end_points.saturating_sub(start_points);
@@ -185,7 +225,10 @@ async fn e2e_50k_real_throughput() {
             "ipc_p99 {ipc_p99}ns >100ms (CI disaster gate)"
         );
     }
-    // Soak 模式：RSS 60min 增长 ≤10%，必须可读取否则 fail-closed
+    // Soak 模式：RSS 60min 增长 ≤10%（基于 warm-up 后稳态基线），必须可读取否则 fail-closed
+    // 周期采样用于事后趋势分析：若前 5min 涨到高水位后稳定属正常，若持续正斜率则为泄漏。
+    let rss_peak = rss_samples.iter().copied().max();
+    let rss_sample_count = rss_samples.len();
     if soak {
         let s = start_rss.expect("PERF_SOAK 必须能够读取 start RSS");
         let e = end_rss.expect("PERF_SOAK 必须能够读取 end RSS");
@@ -194,10 +237,14 @@ async fn e2e_50k_real_throughput() {
         } else {
             0.0
         };
-        println!("rss soak growth {growth:.1}% start {s} end {e}");
+        println!(
+            "rss soak growth {growth:.1}% start {s} end {e} peak {:?} samples {} warmup 300s steady baseline",
+            rss_peak, rss_sample_count
+        );
         assert!(
             growth <= 10.0,
-            "RSS 增长 {growth:.1}% >10% (start {s} end {e})，疑似泄漏"
+            "RSS 增长 {growth:.1}% >10% (start {s} end {e} peak {:?} samples {})，疑似泄漏或 warm-up 不足",
+            rss_peak, rss_sample_count
         );
     }
     // 最终仍需 RUNNING（必须在写 Evidence 之前通过，否则不留成功证据）
@@ -257,7 +304,12 @@ async fn e2e_50k_real_throughput() {
             "duration_seconds": elapsed,
             "build_profile": build_profile,
             "dirty": dirty,
-            "rss_scope": "core_test_process"
+            "rss_scope": "core_test_process",
+            "rss_start_mib": start_rss.map(|v| v as f64 / (1024.0*1024.0)),
+            "rss_end_mib": end_rss.map(|v| v as f64 / (1024.0*1024.0)),
+            "rss_peak_mib": rss_peak.map(|v| v as f64 / (1024.0*1024.0)),
+            "rss_sample_count": rss_sample_count,
+            "warmup_seconds": warmup.as_secs()
         });
         let _ = std::fs::write(
             out_dir.join("performance.json"),
@@ -284,7 +336,12 @@ async fn e2e_50k_real_throughput() {
                 "duration_seconds": elapsed,
                 "build_profile": build_profile,
                 "dirty": dirty,
-                "rss_scope": "core_test_process"
+                "rss_scope": "core_test_process",
+                "rss_start_mib": start_rss.map(|v| v as f64 / (1024.0*1024.0)),
+                "rss_end_mib": end_rss.map(|v| v as f64 / (1024.0*1024.0)),
+                "rss_peak_mib": rss_peak.map(|v| v as f64 / (1024.0*1024.0)),
+                "rss_sample_count": rss_sample_count,
+                "warmup_seconds": warmup.as_secs()
             });
             let _ = std::fs::write(
                 out_dir.join("soak.json"),
