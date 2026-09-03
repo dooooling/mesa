@@ -110,6 +110,11 @@ pub struct LatestEntry {
     pub quality_code: Option<String>,
     /// 批次时间戳（UTC Unix ns）；断线置 BAD 后保留最后值的旧时间戳，不生成虚假采样。
     pub timestamp_ns: i64,
+    /// 值的来源语义（§5.5）：CURRENT / LAST_KNOWN / PLACEHOLDER（REST/UI 区分 Stale/No valid value）
+    pub value_origin: String,
+    /// 协议原始 SourceTimestamp（UTC ns），Placeholder 时为 None，杜绝 0.0@19:04 伪语义
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_timestamp_ns: Option<i64>,
 }
 
 /// 进程级共享快照。锁粒度按用途拆分，REST 读路径互不阻塞；latest/keys 采用 RwLock
@@ -215,6 +220,17 @@ impl Snapshot {
         for pv in &batch.values {
             let k = (endpoint_id.to_string(), pv.point_id);
             let point_key = keys_snapshot.get(&k).cloned().unwrap_or_default();
+            // V1.2.1：透传 value_origin + source_timestamp，Placeholder 强制 source=None（已在解码层保证）
+            let origin = pv
+                .value_origin
+                .normalize_unspecified(pv.quality)
+                .as_str()
+                .to_string();
+            let src = if origin == "PLACEHOLDER" {
+                None
+            } else {
+                pv.source_timestamp_ns
+            };
             let entry = LatestEntry {
                 endpoint_id: endpoint_id.to_string(),
                 point_id: pv.point_id,
@@ -230,6 +246,8 @@ impl Snapshot {
                     }
                 }),
                 timestamp_ns: batch.timestamp_ns,
+                value_origin: origin,
+                source_timestamp_ns: src,
             };
             latest.insert(k, entry);
         }
@@ -289,12 +307,19 @@ impl Snapshot {
 
     /// 断线标记（§3.11 / §11）：将该 Endpoint 全部已知点置 BAD/COMMUNICATION_LOST，
     /// 保留最后一个 typed value 与原 timestamp，不生成虚假采样（P0-A 冻结契约）。
+    /// ValueOrigin 跃迁：PLACEHOLDER 保持 PLACEHOLDER（source=None），其余 CURRENT/LAST_KNOWN → LAST_KNOWN
     pub fn mark_communication_lost(&self, endpoint_id: &str) {
         let mut latest = self.latest.write().unwrap();
         for ((ep, _pid), entry) in latest.iter_mut() {
             if ep == endpoint_id {
                 entry.quality = "BAD".into();
                 entry.quality_code = Some("COMMUNICATION_LOST".into());
+                if entry.value_origin != "PLACEHOLDER" {
+                    entry.value_origin = "LAST_KNOWN".into();
+                }
+                if entry.value_origin == "PLACEHOLDER" {
+                    entry.source_timestamp_ns = None;
+                }
                 // 保留 entry.value（typed last value）与 timestamp_ns 不变，不置 Null
                 // 契约：无论之前是 GOOD 还是 BAD/DECODE_FAILED，断线后统一置为 COMMUNICATION_LOST
             }
@@ -321,5 +346,144 @@ impl Snapshot {
                 .then(a.point_id.cmp(&b.point_id))
         });
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesa_core_types::{
+        DataBatch, DataType, PointDefinition, PointValue, Quality, Value, ValueOrigin,
+    };
+
+    #[test]
+    fn placeholder_visible_in_rest_and_no_source_timestamp() {
+        let snap = Snapshot::new();
+        snap.register_points(
+            "ep1",
+            &[PointDefinition {
+                point_id: 1,
+                point_key: "k1".into(),
+                data_type: DataType::F64,
+                unit: None,
+            }],
+        );
+        let batch = DataBatch {
+            connection_handle: 1,
+            stream_epoch: 1,
+            sequence: 1,
+            timestamp_ns: 1_000_000,
+            values: vec![PointValue {
+                point_id: 1,
+                value: Value::F64(0.0),
+                quality: Quality::Bad,
+                quality_code: Some(0x80340000u32 as i32),
+                source_timestamp_ns: Some(999_999),
+                value_origin: ValueOrigin::Placeholder,
+            }],
+            mono_ns: None,
+        };
+        snap.apply_batch(&batch, "ep1");
+        let e = &snap.latest_all()[0];
+        assert_eq!(e.value_origin, "PLACEHOLDER");
+        assert_eq!(e.source_timestamp_ns, None, "Placeholder 必须无 source");
+        assert_eq!(e.quality, "BAD");
+        // REST JSON 必须包含 value_origin
+        let json = serde_json::to_value(e).unwrap();
+        assert_eq!(json["value_origin"], "PLACEHOLDER");
+    }
+
+    #[test]
+    fn last_known_rest_and_communication_lost_transition() {
+        let snap = Snapshot::new();
+        snap.register_points(
+            "ep1",
+            &[PointDefinition {
+                point_id: 1,
+                point_key: "k1".into(),
+                data_type: DataType::F64,
+                unit: None,
+            }],
+        );
+        let pv_current = PointValue {
+            point_id: 1,
+            value: Value::F64(12.5),
+            quality: Quality::Good,
+            quality_code: None,
+            source_timestamp_ns: Some(1_000),
+            value_origin: ValueOrigin::Current,
+        };
+        snap.apply_batch(
+            &DataBatch {
+                connection_handle: 1,
+                stream_epoch: 1,
+                sequence: 1,
+                timestamp_ns: 1_000_000,
+                values: vec![pv_current],
+                mono_ns: None,
+            },
+            "ep1",
+        );
+        let pv_last = PointValue {
+            point_id: 1,
+            value: Value::F64(12.5),
+            quality: Quality::Bad,
+            quality_code: Some(1),
+            source_timestamp_ns: Some(1_000),
+            value_origin: ValueOrigin::LastKnown,
+        };
+        snap.apply_batch(
+            &DataBatch {
+                connection_handle: 1,
+                stream_epoch: 1,
+                sequence: 2,
+                timestamp_ns: 2_000_000,
+                values: vec![pv_last],
+                mono_ns: None,
+            },
+            "ep1",
+        );
+        let e = snap.latest_all()[0].clone();
+        assert_eq!(e.value_origin, "LAST_KNOWN");
+        assert_eq!(e.source_timestamp_ns, Some(1_000));
+        snap.mark_communication_lost("ep1");
+        let e2 = &snap.latest_all()[0];
+        assert_eq!(e2.quality, "BAD");
+        assert_eq!(e2.quality_code.as_deref(), Some("COMMUNICATION_LOST"));
+        assert_eq!(e2.value_origin, "LAST_KNOWN");
+        assert_eq!(e2.source_timestamp_ns, Some(1_000));
+        // Placeholder 断线保持 Placeholder
+        let snap2 = Snapshot::new();
+        snap2.register_points(
+            "ep2",
+            &[PointDefinition {
+                point_id: 2,
+                point_key: "k2".into(),
+                data_type: DataType::I32,
+                unit: None,
+            }],
+        );
+        snap2.apply_batch(
+            &DataBatch {
+                connection_handle: 1,
+                stream_epoch: 1,
+                sequence: 1,
+                timestamp_ns: 1_000_000,
+                values: vec![PointValue {
+                    point_id: 2,
+                    value: Value::I32(0),
+                    quality: Quality::Bad,
+                    quality_code: Some(1),
+                    source_timestamp_ns: Some(123),
+                    value_origin: ValueOrigin::Placeholder,
+                }],
+                mono_ns: None,
+            },
+            "ep2",
+        );
+        snap2.mark_communication_lost("ep2");
+        let e3 = &snap2.latest_all()[0];
+        assert_eq!(e3.value_origin, "PLACEHOLDER");
+        assert_eq!(e3.source_timestamp_ns, None);
     }
 }

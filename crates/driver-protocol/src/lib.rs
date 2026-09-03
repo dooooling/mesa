@@ -482,4 +482,44 @@ mod tests {
         let back = task_from_pb(task_to_pb(&t).unwrap()).unwrap();
         assert_eq!(back, t);
     }
+
+    #[test]
+    fn legacy_proto_unspecified_maps_to_current_or_placeholder() {
+        // 旧消息缺省 value_origin=0 + GOOD → Current
+        let pv_good = PointValue {
+            point_id: 1,
+            value: Value::I32(5),
+            quality: Quality::Good,
+            quality_code: None,
+            source_timestamp_ns: None,
+            value_origin: ValueOrigin::Unspecified,
+        };
+        let pb_good = point_value_to_pb(&pv_good);
+        // normalize 后应为 Current (1)
+        assert_eq!(pb_good.value_origin, pb::ValueOrigin::Current as i32);
+        // 手造 legacy pb: origin=0 + quality BAD → Placeholder
+        let legacy_pb = pb::PointValueMsg {
+            point_id: 2,
+            value: Some(value_to_pb(&Value::I32(0))),
+            quality: "BAD".into(),
+            quality_code: Some(1),
+            source_timestamp_ns: None,
+            value_origin: 0, // Unspecified
+        };
+        let decoded = point_value_from_pb(legacy_pb).unwrap();
+        assert_eq!(decoded.value_origin, ValueOrigin::Placeholder);
+        assert_eq!(decoded.quality, Quality::Bad);
+        // legacy GOOD → Current
+        let legacy_good_pb = pb::PointValueMsg {
+            point_id: 3,
+            value: Some(value_to_pb(&Value::I32(7))),
+            quality: "".into(),
+            quality_code: None,
+            source_timestamp_ns: None,
+            value_origin: 0,
+        };
+        let decoded_good = point_value_from_pb(legacy_good_pb).unwrap();
+        assert_eq!(decoded_good.value_origin, ValueOrigin::Current);
+        assert_eq!(decoded_good.quality, Quality::Good);
+    }
 }
