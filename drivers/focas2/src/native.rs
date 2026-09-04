@@ -611,6 +611,28 @@ pub struct NativeLib {
 impl NativeLib {
     /// 按当前 OS/Arch 探测并加载库，失败返回明确错误（用于上层转 `CONNECT_FAILED`/`EW_NODLL`）
     pub fn load() -> Result<Self, String> {
+        Self::ensure_log_file();
+        Self::load_inner()
+    }
+
+    /// Linux 保命项：FANUC Linux fwlib 在连接失败写日志时，若 CWD 下没有
+    /// `fwlibeth.log` 会空指针解引用直接 SIGSEGV（进程级崩溃，catch 不住）。
+    /// 已用 ctypes 在 docker linux 下复现并验证：预建空文件后失败路径干净
+    /// 返回 EW_SOCKET。已存在则不动；其它平台 DLL 无此行为，不处理。
+    #[cfg(target_os = "linux")]
+    fn ensure_log_file() {
+        let log = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("fwlibeth.log");
+        if !log.exists() {
+            let _ = std::fs::write(&log, b"");
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn ensure_log_file() {}
+
+    fn load_inner() -> Result<Self, String> {
         // Windows：FOCAS 依赖同目录的 fwlibe1 等子 DLL，需将目录加入 PATH 供隐式依赖搜索
         #[cfg(target_os = "windows")]
         {
