@@ -40,6 +40,8 @@ pub struct FakeOpcUaTransport {
     pending: Mutex<HashMap<Vec<u8>, VecDeque<UaBrowsePage>>>,
     /// node key → create_monitored_items 逐项状态（缺省 Good）。
     create_status: Mutex<HashMap<String, StatusCode>>,
+    /// 预置 create_monitored_items 服务级整体失败（P0-B3 回滚测试用）。
+    create_mi_error: Mutex<Option<UaTransportError>>,
     /// create_subscription 返回前注入 receiver 的事件。
     live_batches: Mutex<VecDeque<FakeLiveBatch>>,
     next_sub_id: AtomicU32,
@@ -84,6 +86,13 @@ impl FakeOpcUaTransport {
             .lock()
             .unwrap()
             .insert(node_key(node), status);
+        self
+    }
+
+    /// 让下一次（及以后所有）`create_monitored_items` 整体返回 Err，
+    /// 模拟服务级失败，验证 adapter 回滚路径。
+    pub fn with_create_monitored_items_error(self, err: UaTransportError) -> Self {
+        *self.create_mi_error.lock().unwrap() = Some(err);
         self
     }
 
@@ -222,6 +231,9 @@ impl OpcUaTransport for FakeOpcUaTransport {
         _subscription_id: UaSubscriptionId,
         items: &[UaMonitoredItemSpec],
     ) -> Result<Vec<UaMonitoredItemResult>, UaTransportError> {
+        if let Some(err) = self.create_mi_error.lock().unwrap().clone() {
+            return Err(err);
+        }
         let statuses = self.create_status.lock().unwrap();
         let mut out = Vec::with_capacity(items.len());
         for spec in items {

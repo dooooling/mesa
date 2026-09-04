@@ -210,9 +210,14 @@ pub(crate) fn browse_result_to_page(
 }
 
 /// 原生传输：持有 Session + event-loop JoinHandle；`disconnect()` 释放会话。
+///
+/// P1-B5：每个订阅的 forwarder task 由 `forwarders[sub_id]` 跟踪，生命周期与
+/// subscription_id 绑定——创建成功且 Revised 校验通过后才 spawn，cleanup 成功
+/// 路径必 abort。否则正常 unsubscribe/shutdown 也会残留睡死在 Notify 上的 task。
 pub struct NativeOpcUaTransport {
     options: OpcUaConnectOptions,
     inner: Arc<AsyncMutex<Option<NativeInner>>>,
+    forwarders: Arc<AsyncMutex<HashMap<UaSubscriptionId, tokio::task::JoinHandle<()>>>>,
 }
 
 impl NativeOpcUaTransport {
@@ -220,11 +225,61 @@ impl NativeOpcUaTransport {
         Self {
             options,
             inner: Arc::new(AsyncMutex::new(None)),
+            forwarders: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
     pub fn options(&self) -> &OpcUaConnectOptions {
         &self.options
+    }
+
+    /// P1-B5：按 sub_id 摘除并 abort forwarder（幂等，无 handle 即空操作）。
+    /// abort 后 transport tx 被 drop，adapter 侧 sub_rx 得 None，其 forwarder
+    /// 自然退出，整条链闭环——unsubscribe/shutdown 不再残留 detached task。
+    async fn abort_forwarder(&self, id: UaSubscriptionId) {
+        if let Some(h) = self.forwarders.lock().await.remove(&id) {
+            tracing::debug!(sub_id = id, "abort 订阅 forwarder");
+            h.abort();
+        }
+    }
+
+    /// 直达服务端的删订阅（跳过本地存在性检查）。
+    /// 仅供 Revised 缺席回滚使用：此时本地状态恰恰缺席，但服务端订阅已存在。
+    async fn delete_subscription_rpc(
+        &self,
+        sess: &Session,
+        id: UaSubscriptionId,
+    ) -> Result<(), UaTransportError> {
+        match sess.delete_subscription(id).await {
+            Ok(status) => {
+                if status.is_good() || status == StatusCode::BadSubscriptionIdInvalid {
+                    self.abort_forwarder(id).await;
+                    Ok(())
+                } else if status == StatusCode::BadSessionClosed
+                    || status == StatusCode::BadSessionIdInvalid
+                {
+                    tracing::debug!(?status, "delete_subscription 会话已关闭，幂等 Ok");
+                    self.abort_forwarder(id).await;
+                    Ok(())
+                } else {
+                    Err(UaTransportError::service(
+                        UaOperation::DeleteSubscription,
+                        Some(status),
+                        false,
+                        format!("delete_subscription 失败: {status:?}"),
+                    ))
+                }
+            }
+            Err(e) => {
+                let ue = map_service_error(UaOperation::DeleteSubscription, e);
+                if ue.is_idempotent_cleanup_ok() {
+                    tracing::debug!(?ue, "delete_subscription cleanup 幂等 Ok");
+                    self.abort_forwarder(id).await;
+                    return Ok(());
+                }
+                Err(ue)
+            }
+        }
     }
 
     async fn ensure_session(&self) -> Result<Arc<Session>, UaTransportError> {
@@ -337,6 +392,7 @@ impl OpcUaTransport for NativeOpcUaTransport {
     async fn disconnect(&self) -> Result<(), UaTransportError> {
         // P1-1：证明性关闭——先请会话正常断开，再 abort event-loop task，最后清空槽位。
         // 仅丢 JoinHandle 是 detach 而非退出，必须显式 abort。
+        // P1-B5：同时 abort 全部订阅 forwarder（会话已死，它们只会睡死在 Notify 上）。
         let taken = {
             let mut guard = self.inner.lock().await;
             guard.take()
@@ -350,6 +406,11 @@ impl OpcUaTransport for NativeOpcUaTransport {
             if let Some(handle) = inner.handle {
                 handle.abort();
             }
+        }
+        let mut fwd = self.forwarders.lock().await;
+        for (id, h) in fwd.drain() {
+            tracing::debug!(sub_id = id, "disconnect abort 订阅 forwarder");
+            h.abort();
         }
         Ok(())
     }
@@ -553,6 +614,8 @@ impl OpcUaTransport for NativeOpcUaTransport {
         };
         // P0-B1：Latest-Wins 事件路径——回调（同步上下文）只做 slot 覆盖，
         // 转发任务 drain 最新快照后 `send().await`（背压等待，永不丢最新）。
+        // P1-B5：forwarder 在 CreateSubscription 成功且 Revised 校验通过后才 spawn，
+        // 创建失败路径根本无 task 可泄漏；Handle 按 sub_id 登记，cleanup 时 abort。
         let stats = Arc::new(crate::SubscriptionStats::default());
         let slots = Arc::new(SlotState::new(stats.clone()));
         let cb_slots = slots.clone();
@@ -560,11 +623,58 @@ impl OpcUaTransport for NativeOpcUaTransport {
             DataChangeCallback::new(move |dv: DataValue, item: &opcua_client::MonitoredItem| {
                 cb_slots.push(item.client_handle(), dv);
             });
+        // P1-B6：请求间隔原样上送，不做 silent clamp——Server 自会 revised，
+        // requested 字段必须等于实际发线值，否则诊断失真。
+        let pub_interval = Duration::from_millis(spec.publishing_interval_ms);
+        let sub_id = session
+            .create_subscription(
+                pub_interval,
+                spec.lifetime_count,
+                spec.max_keep_alive_count,
+                spec.max_notifications_per_publish,
+                spec.priority,
+                spec.publishing_enabled,
+                callback,
+            )
+            .await
+            .map_err(|e| map_service_error(UaOperation::CreateSubscription, e))?;
+        // Revised 参数从 session 内订阅状态回读（async-opcua 仅返回 id，不回 revised）。
+        // P1-2 fail-closed：创建刚成功订阅必在本地状态中，缺席即内部不一致；
+        // 此时服务端订阅已存在，必须 best-effort 删掉再 Err（不得拿着
+        // subscription_state 锁去 await，先释放锁再调 delete）。
+        // 锁只在块内持有：读完即释，绝不拿着 subscription_state 锁进 await。
+        let revised = {
+            let state = session.subscription_state();
+            let guard = state.lock();
+            guard.get(sub_id).map(|sub| {
+                (
+                    sub.publishing_interval().as_millis() as u64,
+                    sub.lifetime_count(),
+                    sub.max_keep_alive_count(),
+                )
+            })
+        };
+        let Some((revised_pub_ms, revised_lifetime, revised_keep_alive)) = revised else {
+            // 直达服务端删除（本地状态缺席，普通 delete 会因存在性检查跳过 RPC）。
+            if let Err(cleanup) = self.delete_subscription_rpc(&session, sub_id).await {
+                tracing::debug!(sub_id, ?cleanup, "Revised 缺席回滚删订阅失败（仅诊断）");
+            }
+            return Err(UaTransportError::internal(
+                UaOperation::CreateSubscription,
+                format!(
+                    "订阅 {sub_id} 创建成功但本地订阅状态缺席（内部不一致，已回滚，fail-closed）"
+                ),
+            ));
+        };
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let fwd_slots = slots.clone();
-        tokio::spawn(async move {
+        let fwd_handle = tokio::spawn(async move {
             loop {
-                fwd_slots.notify.notified().await;
+                // P1-B5 防御：receiver 被直接丢弃时，不必等下一次 Notify 即可退出。
+                tokio::select! {
+                    _ = tx.closed() => break,
+                    _ = fwd_slots.notify.notified() => {}
+                }
                 if tx.is_closed() {
                     break;
                 }
@@ -580,40 +690,7 @@ impl OpcUaTransport for NativeOpcUaTransport {
                 }
             }
         });
-        let pub_interval = Duration::from_millis(spec.publishing_interval_ms.max(10));
-        let sub_id = session
-            .create_subscription(
-                pub_interval,
-                spec.lifetime_count,
-                spec.max_keep_alive_count,
-                spec.max_notifications_per_publish,
-                spec.priority,
-                spec.publishing_enabled,
-                callback,
-            )
-            .await
-            .map_err(|e| map_service_error(UaOperation::CreateSubscription, e))?;
-        // Revised 参数从 session 内订阅状态回读（async-opcua 仅返回 id，不回 revised）。
-        // P1-2 fail-closed：创建刚成功订阅必在本地状态中，缺席即内部不一致，直接 Err。
-        let (revised_pub_ms, revised_lifetime, revised_keep_alive) = {
-            let state = session.subscription_state();
-            let guard = state.lock();
-            match guard.get(sub_id) {
-                Some(sub) => (
-                    sub.publishing_interval().as_millis() as u64,
-                    sub.lifetime_count(),
-                    sub.max_keep_alive_count(),
-                ),
-                None => {
-                    return Err(UaTransportError::internal(
-                        UaOperation::CreateSubscription,
-                        format!(
-                            "订阅 {sub_id} 创建成功但本地订阅状态缺席（内部不一致，fail-closed）"
-                        ),
-                    ));
-                }
-            }
-        };
+        self.forwarders.lock().await.insert(sub_id, fwd_handle);
         Ok(UaSubscription {
             id: sub_id,
             requested_publishing_interval_ms: spec.publishing_interval_ms,
@@ -732,43 +809,23 @@ impl OpcUaTransport for NativeOpcUaTransport {
             guard.as_ref().and_then(|i| i.session.clone())
         };
         let Some(sess) = session else {
+            // 无会话即无服务端对象；forwarder 若在（会话丢后残留）一并 abort。
+            self.abort_forwarder(id).await;
             return Ok(());
         };
-        // 本地无该订阅即幂等 Ok，避免向已关闭会话发包
-        {
+        // 本地无该订阅即幂等 Ok，避免向已关闭会话发包；forwarder 照 abort
+        //（防御：handle 登记与本地订阅状态不一致时也不残留 task）。
+        // 锁只在块内持有，释放后才进 await。
+        let exists = {
             let state = sess.subscription_state();
             let guard = state.lock();
-            if !guard.subscription_exists(id) {
-                return Ok(());
-            }
+            guard.subscription_exists(id)
+        };
+        if !exists {
+            self.abort_forwarder(id).await;
+            return Ok(());
         }
-        match sess.delete_subscription(id).await {
-            Ok(status) => {
-                if status.is_good() || status == StatusCode::BadSubscriptionIdInvalid {
-                    Ok(())
-                } else if status == StatusCode::BadSessionClosed
-                    || status == StatusCode::BadSessionIdInvalid
-                {
-                    tracing::debug!(?status, "delete_subscription 会话已关闭，幂等 Ok");
-                    Ok(())
-                } else {
-                    Err(UaTransportError::service(
-                        UaOperation::DeleteSubscription,
-                        Some(status),
-                        false,
-                        format!("delete_subscription 失败: {status:?}"),
-                    ))
-                }
-            }
-            Err(e) => {
-                let ue = map_service_error(UaOperation::DeleteSubscription, e);
-                if ue.is_idempotent_cleanup_ok() {
-                    tracing::debug!(?ue, "delete_subscription cleanup 幂等 Ok");
-                    return Ok(());
-                }
-                Err(ue)
-            }
-        }
+        self.delete_subscription_rpc(&sess, id).await
     }
 }
 
@@ -793,6 +850,27 @@ mod tests {
         assert_eq!(v7, opcua_types::Variant::Int32(2)); // 只保留最新采样
         // drain 后槽清空
         assert!(slots.drain().is_empty());
+    }
+
+    #[test]
+    fn burst_same_handle_keeps_only_latest_and_counts_all_coalesced() {
+        // P0-B1 饱和语义（确定性 burst 版）：同 handle 高速压入 1000 个采样，
+        // drain 只得最新一个，coalesced 精确计数被合并的 999 个旧采样。
+        // 全路径慢消费者版本见 examples/test_native_opcua.rs 真机 smoke。
+        let stats = Arc::new(crate::SubscriptionStats::default());
+        let slots = SlotState::new(stats.clone());
+        for v in 0..1000i32 {
+            slots.push(3, DataValue::new_now(v));
+        }
+        assert_eq!(stats.events_received.load(Ordering::Relaxed), 1000);
+        assert_eq!(stats.events_coalesced.load(Ordering::Relaxed), 999);
+        let batch = slots.drain();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].client_handle, 3);
+        assert_eq!(
+            batch[0].data_value.value,
+            Some(opcua_types::Variant::Int32(999))
+        );
     }
 
     #[test]

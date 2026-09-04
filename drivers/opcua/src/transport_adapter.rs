@@ -259,7 +259,10 @@ impl<T: OpcUaTransport> OpcUaApi for TransportApiAdapter<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mesa_opcua_transport::{FakeLiveBatch, FakeOpcUaTransport, UaBrowsePage, fake_browse_node};
+    use mesa_opcua_transport::{
+        FakeLiveBatch, FakeOpcUaTransport, UaBrowsePage, UaOperation, UaTransportError,
+        fake_browse_node,
+    };
     use opcua_types::{DataValue, Variant};
 
     fn addr(ns: u16, id: u32) -> OpcUaAddress {
@@ -333,6 +336,39 @@ mod tests {
         assert!(out[0].starts_with("Alpha "));
         assert!(out[1].starts_with("Beta "));
         assert_eq!(fake.released_continuations(), vec![token]);
+    }
+
+    #[tokio::test]
+    async fn create_monitored_items_service_failure_rolls_back_subscription_exactly_once() {
+        // P0-B3 Gate：服务级整体失败必须回滚（删刚建订阅恰一次），原始错误透出。
+        let fake = Arc::new(FakeOpcUaTransport::new().with_create_monitored_items_error(
+            UaTransportError::service(
+                UaOperation::CreateMonitoredItems,
+                Some(StatusCode::BadTooManyOperations),
+                false,
+                "Fake 服务级失败",
+            ),
+        ));
+        let adapter = TransportApiAdapter::with_transport(fake.clone());
+        let err = adapter
+            .subscribe(&[addr(2, 1), addr(2, 2)], 500, 250, 10, true)
+            .await
+            .expect_err("服务级失败必须整体 Err");
+        assert!(
+            err.contains("Fake 服务级失败"),
+            "原始错误必须透出而非被 cleanup 错误掩盖，实际: {err}"
+        );
+        let created = fake.created_subscriptions();
+        assert_eq!(created.len(), 1);
+        // 回滚删订阅恰一次；监控项从未建成功，无删项调用。
+        assert_eq!(fake.deleted_subscriptions(), created);
+        assert!(fake.deleted_items().is_empty());
+        // adapter 内 items 映射无残留：后续 unsubscribe 为空操作且 Ok（仅幂等复删订阅）。
+        adapter
+            .unsubscribe(created[0])
+            .await
+            .expect("回滚后无残留，unsubscribe 空操作 Ok");
+        assert!(fake.deleted_items().is_empty(), "回滚后不应有任何删项调用");
     }
 
     #[tokio::test]
