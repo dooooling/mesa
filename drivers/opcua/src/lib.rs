@@ -23,6 +23,7 @@
 
 mod address;
 mod opcua_api;
+mod probe;
 mod transport_adapter;
 
 pub use address::{AddressError, Identifier, OpcUaAddress, parse_address};
@@ -206,21 +207,36 @@ impl Driver for OpcUaDriver {
                 "use_native=false 仅在测试环境 MESA_ALLOW_FAKE_NATIVE=1 时允许",
             ));
         }
-        let api: Arc<dyn OpcUaApiTrait> = if use_native {
-            // Native 会话经公共 transport 建立（PKI 由驱动侧注入 options）
-            let options = cfg.connect_options();
-            Arc::new(TransportApiAdapter::new(options))
+        // transport 与 adapter 共享同一会话实例：创建一次，两处持有同一 Arc，
+        // probe 复用它，绝不另建第二会话（P0-2）。
+        // Native 会话经公共 transport 建立（PKI 由驱动侧注入 options）。
+        // Fake 分支：运行路径保持旧 FakeOpcUaApi 不动（canned 行为被现有单测
+        // 与 discovery 合同锁定），probe 用 transport fake；两者皆为无状态桩，
+        // 不存在真实会话可泄漏。
+        let (api, transport): (
+            Arc<dyn OpcUaApiTrait>,
+            Arc<dyn mesa_opcua_transport::OpcUaTransport>,
+        ) = if use_native {
+            let native = Arc::new(mesa_opcua_transport::NativeOpcUaTransport::new(
+                cfg.connect_options(),
+            ));
+            let api: Arc<dyn OpcUaApiTrait> =
+                Arc::new(TransportApiAdapter::with_transport(native.clone()));
+            (api, native)
         } else {
-            Arc::new(FakeOpcUaApi::new())
+            let api: Arc<dyn OpcUaApiTrait> = Arc::new(FakeOpcUaApi::new());
+            let fake: Arc<dyn mesa_opcua_transport::OpcUaTransport> =
+                Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new());
+            (api, fake)
         };
         Ok(Box::new(OpcUaConnection {
             cfg,
             api,
+            transport,
             plan: None,
         }))
     }
 }
-
 // ---------------------------------------------------------------------------
 // 连接配置
 // ---------------------------------------------------------------------------
@@ -428,6 +444,9 @@ struct PlanSnapshot {
 struct OpcUaConnection {
     cfg: OpcUaConnConfig,
     api: Arc<dyn OpcUaApiTrait>,
+    /// probe 复用的传输实例：与 api 背后的会话是同一个（open 时一次创建，
+    /// 两处共享同一 Arc），绝不为探测另建第二会话。
+    transport: Arc<dyn mesa_opcua_transport::OpcUaTransport>,
     plan: Option<PlanSnapshot>,
 }
 
@@ -731,6 +750,12 @@ fn decode_data_value(
 
 #[async_trait::async_trait]
 impl DriverConnection for OpcUaConnection {
+    /// OPC UA 动态探测：复用本连接的 transport（open 时与 adapter 共享同一 Arc，
+    /// 与采集同一会话），流程见 [`crate::probe::probe_with_transport`]。
+    async fn probe(&mut self) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
+        crate::probe::probe_with_transport(&*self.transport).await
+    }
+
     async fn configure(
         &mut self,
         revision: u64,
@@ -1392,6 +1417,7 @@ mod tests {
         let mut conn = OpcUaConnection {
             cfg: OpcUaConnConfig::default(),
             api: Arc::new(FakeOpcUaApi::new()),
+            transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
             plan: None,
         };
         let nodes = serde_json::json!([
@@ -1417,6 +1443,7 @@ mod tests {
         let mut conn = OpcUaConnection {
             cfg: OpcUaConnConfig::default(),
             api: Arc::new(FakeOpcUaApi::new()),
+            transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
             plan: None,
         };
         let nodes = serde_json::json!([{"key":"a","node_id":"ns=2;x=1","data_type":"U32"}]);
@@ -1432,6 +1459,7 @@ mod tests {
         let mut conn = OpcUaConnection {
             cfg: OpcUaConnConfig::default(),
             api: Arc::new(FakeOpcUaApi::new()),
+            transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
             plan: None,
         };
         let t = AcquisitionTask {
@@ -1464,6 +1492,7 @@ mod tests {
         let mut conn = OpcUaConnection {
             cfg: OpcUaConnConfig::default(),
             api: Arc::new(FakeOpcUaApi::new()),
+            transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
             plan: None,
         };
         let nodes = serde_json::json!([{"key":"a","node_id":"ns=2;s=Counter","data_type":"U32"}]);

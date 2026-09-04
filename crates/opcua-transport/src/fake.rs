@@ -33,6 +33,8 @@ pub struct FakeLiveBatch {
 #[derive(Debug, Default)]
 pub struct FakeOpcUaTransport {
     namespace_array: Mutex<Vec<String>>,
+    /// 预置 `read_namespace_array` 整体失败（probe read 证据合并测试用）。
+    namespace_error: Mutex<Option<UaTransportError>>,
     reads: Mutex<HashMap<String, DataValue>>,
     /// node key → 待返回的页队列（首个由 browse 返回，后续经 continuation 接力）。
     browse_pages: Mutex<HashMap<String, VecDeque<UaBrowsePage>>>,
@@ -65,6 +67,12 @@ impl FakeOpcUaTransport {
 
     pub fn with_namespace_array(self, uris: Vec<String>) -> Self {
         *self.namespace_array.lock().unwrap() = uris;
+        self
+    }
+
+    /// 让 `read_namespace_array` 返回指定错误（缺省成功）。
+    pub fn with_namespace_array_error(self, err: UaTransportError) -> Self {
+        *self.namespace_error.lock().unwrap() = Some(err);
         self
     }
 
@@ -205,6 +213,9 @@ impl OpcUaTransport for FakeOpcUaTransport {
     }
 
     async fn read_namespace_array(&self) -> Result<Vec<String>, UaTransportError> {
+        if let Some(e) = self.namespace_error.lock().unwrap().clone() {
+            return Err(e);
+        }
         Ok(self.namespace_array.lock().unwrap().clone())
     }
 

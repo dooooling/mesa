@@ -73,6 +73,21 @@ async fn descriptor_and_unknown_driver() {
     assert_eq!(resp2.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
+async fn post_json(app: axum::Router, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .uri(uri)
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
 #[tokio::test]
 async fn probe_does_not_create_endpoint() {
     let (app, _) = app().await;
@@ -84,6 +99,100 @@ async fn probe_does_not_create_endpoint() {
         .body(Body::from(r#"{"connection":{"seed":1}}"#))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    // probe 应返回 reachable，但不创建 Endpoint（endpoint 列表仍空）
-    assert!(resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE);
+    // probe 必须 reachable，且不创建 Endpoint（endpoint 列表为空）
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// §8 REST 冻结形状：device/capabilities/profile_hints/warnings。
+#[tokio::test]
+async fn probe_simulator_returns_frozen_shape() {
+    let (app, _) = app().await;
+    let (status, v) = post_json(
+        app,
+        "/api/v1/drivers/simulator/probe",
+        r#"{"connection":{}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["reachable"], true);
+    assert_eq!(v["device"]["vendor"], "Mesa");
+    assert_eq!(v["device"]["family"], "Simulator");
+    assert_eq!(v["device"]["model"], "Basic");
+    // P0-1：capabilities 为 CapabilityItem 数组（四态），simulator 为 poll-only
+    let caps = v["capabilities"].as_array().unwrap();
+    let state_of = |id: &str| {
+        caps.iter()
+            .find(|c| c["id"] == id)
+            .map(|c| c["state"].as_str().unwrap().to_string())
+    };
+    assert_eq!(state_of("read").as_deref(), Some("available"));
+    assert_eq!(state_of("subscribe").as_deref(), Some("not_present"));
+    assert_eq!(state_of("browse").as_deref(), Some("not_present"));
+    assert!(v["warnings"].as_array().unwrap().is_empty());
+    let hints = v["profile_hints"].as_array().unwrap();
+    assert!(
+        hints.iter().any(|h| h["profile_id"] == "simulator-basic"),
+        "hints 必须含 simulator-basic，实际: {hints:?}"
+    );
+}
+
+#[tokio::test]
+async fn probe_unknown_driver_is_404() {
+    let (app, _) = app().await;
+    let (status, v) = post_json(app, "/api/v1/drivers/nope/probe", r#"{"connection":{}}"#).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error"]["code"], "NOT_FOUND");
+}
+
+#[tokio::test]
+async fn probe_non_object_connection_is_400() {
+    let (app, _) = app().await;
+    let (status, v) = post_json(
+        app,
+        "/api/v1/drivers/simulator/probe",
+        r#"{"connection":42}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["code"], "VALIDATION_ERROR");
+}
+
+/// JSON 是 object 但驱动配置非法 → 400，code 透出驱动原因码（P1-2 结构化）。
+#[tokio::test]
+async fn probe_invalid_driver_config_is_400_with_driver_code() {
+    let (app, _) = app().await;
+    let (status, v) = post_json(
+        app,
+        "/api/v1/drivers/s7/probe",
+        r#"{"connection":{"host":"127.0.0.1","port":99999}}"#,
+    )
+    .await;
+    // 诊断要求：503 偶发（P1-A 端口竞态）时必须留下 response body，
+    // 否则无法区分 Handshake/Spawn/Rpc 三类失败（exact-SHA CI 教训）。
+    assert_eq!(status, StatusCode::BAD_REQUEST, "probe body: {v}");
+    assert_eq!(v["error"]["code"], "BAD_CONFIG", "probe body: {v}");
+}
+
+/// 设备不可达是 200 + reachable:false（不是 5xx）：s7 连关闭端口。
+#[tokio::test]
+async fn probe_s7_closed_port_is_unreachable_200() {
+    let (app, _) = app().await;
+    let (status, v) = post_json(
+        app,
+        "/api/v1/drivers/s7/probe",
+        r#"{"connection":{"host":"127.0.0.1","port":9}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["reachable"], false);
+    // P1-B：没探测到 ≠ 猜型号——unreachable 时 hints 必须为空，
+    // 禁止仅凭 driver_id 断言具体硬件型号（s7-1200/1214C）。
+    let hints = v["profile_hints"].as_array().unwrap();
+    assert!(
+        hints.is_empty(),
+        "unreachable 不得提示具体型号，实际: {hints:?}"
+    );
+    let warnings = v["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["code"], "CONNECTION_FAILED");
 }

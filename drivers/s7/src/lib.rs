@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mesa_core_types::{
-    AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, GENERIC_BINDING_KIND,
-    GenericBinding, PointDescriptor, PointMap, PointValue, TaskMode, Value,
-    ensure_unique_point_keys, now_unix_ns,
+    AcquisitionTask, CapabilityItem, CapabilityState, DataBatch, DataType, DriverMetadata,
+    DuplicatePointKey, GENERIC_BINDING_KIND, GenericBinding, PointDescriptor, PointMap, PointValue,
+    ProbeReport, ProbeWarning, TaskMode, Value, ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio::sync::Mutex;
@@ -171,6 +171,43 @@ impl Driver for S7Driver {
     }
 }
 
+/// SZL 0x0011 模块标识解析（fail-safe：任何结构不符都返回 None，
+/// 调用方降级为 IDENTITY_UNAVAILABLE，绝不误解析出假型号）。
+///
+/// 布局依据（与 snap7 兼容的 SZL UserData 结构；真机确认前为待验证假设，
+/// 见 NOTE）：UserData[0]=ReturnCode(0xFF 成功) [1]=TransportSize
+/// [2..4]=Length [4..6]=SZL ID 回显 [6..8]=Index 回显 [8..10]=记录区头
+/// [10..] 数据记录（0x0011 每条 28 字节）：[0..2]=Index [2..22]=MlfB
+///（20 字节 ASCII 订货号，如 "6ES7 214-1AG40-0XB0"）。
+/// NOTE: MlfB 偏移与记录长度需真机抓包确认（V1.2.1 真机门禁）；回显校验
+/// 保证布局不符时必然返回 None 而非错位解读。
+fn parse_szl_module_id(payload: &[u8], szl_id: u16, index: u16) -> Option<String> {
+    const RECORD_LEN: usize = 28;
+    const HEADER_LEN: usize = 10;
+    const MLFB_OFF: usize = 2;
+    const MLFB_LEN: usize = 20;
+    if payload.len() < HEADER_LEN + RECORD_LEN {
+        return None;
+    }
+    if payload[0] != 0xFF {
+        return None;
+    }
+    // 回显校验：SZL ID 与 Index 必须与请求一致，否则布局假设不成立
+    if payload[4..6] != szl_id.to_be_bytes() || payload[6..8] != index.to_be_bytes() {
+        return None;
+    }
+    let raw = &payload[HEADER_LEN + MLFB_OFF..HEADER_LEN + MLFB_OFF + MLFB_LEN];
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    let s = std::str::from_utf8(&raw[..end])
+        .ok()?
+        .trim_end()
+        .to_string();
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_graphic() || b == b' ') {
+        return None;
+    }
+    Some(s)
+}
+
 // ---------------------------------------------------------------------------
 // 采集计划
 // ---------------------------------------------------------------------------
@@ -278,6 +315,81 @@ fn merge_paired_to_bulks_with_max(
 
 #[async_trait::async_trait]
 impl DriverConnection for S7Connection {
+    /// S7 动态探测：复用本连接 cfg 建短 S7 会话，读 SZL 0x0011 取 CPU 标识。
+    /// - 建连失败 → Ok(unreachable)（设备不可达是探测结果）；
+    /// - SZL 失败或解析失败 → reachable + IDENTITY_UNAVAILABLE（绝不猜型号，
+    ///   更不从端口号反推，见 §8.5）。
+    /// NOTE: s7-1200 Profile 要求 probe.vendor==Siemens 且
+    /// probe.family==S7-1200 才提示；本 probe 现阶段 family 恒为 None
+    /// （1200/1500 区分需正式 MLFB 映射依据，确认前一律不做，宁缺毋滥），
+    /// 因此 s7-1200 按设计暂时不可达——可达但信息不足时不得过度推断。
+    /// 配置已在 OpenConnection 校验；短连接随函数返回 drop，不进入采集计划。
+    async fn probe(&mut self) -> Result<ProbeReport, SdkDriverError> {
+        let cfg = self.cfg.clone();
+        let mut client = match S7Client::connect(cfg).await {
+            Ok(c) => c,
+            Err(e) => return Ok(ProbeReport::unreachable("CONNECTION_FAILED", e.to_string())),
+        };
+        // P1-1：read 是否 Available 以本次 SZL 实测为准；失败即 Unknown，
+        // 绝不拿静态能力冒充实测结论。失败原因只写 capability detail（局部），
+        // warning 只写全局后果（P0-1 不重复规则：同一问题禁止两处复述）。
+        let (vendor, model, read_state, read_note) = match client.read_szl(0x0011, 1).await {
+            Ok(payload) => match parse_szl_module_id(&payload, 0x0011, 1) {
+                Some(mlfb) => {
+                    let vendor = mlfb.starts_with("6ES").then(|| "Siemens".to_string());
+                    (vendor, Some(mlfb), CapabilityState::Available, None)
+                }
+                None => (
+                    None,
+                    None,
+                    CapabilityState::Unknown,
+                    Some("SZL 0x0011 响应无法解析出模块标识".to_string()),
+                ),
+            },
+            Err(e) => (
+                None,
+                None,
+                CapabilityState::Unknown,
+                Some(format!("SZL 0x0011 读取失败: {e}")),
+            ),
+        };
+        let warnings = if read_note.is_some() {
+            vec![ProbeWarning {
+                code: "IDENTITY_UNAVAILABLE".into(),
+                message: "设备身份（vendor/model）未能识别，profile 提示可能缺失".into(),
+            }]
+        } else {
+            Vec::new()
+        };
+        Ok(ProbeReport {
+            reachable: true,
+            vendor,
+            family: None,
+            model,
+            firmware: None,
+            model_confidence: None,
+            // subscribe/browse 为实现确认缺席（静态事实，可断言）。
+            capabilities: vec![
+                CapabilityItem {
+                    id: "read".into(),
+                    state: read_state,
+                    detail: read_note,
+                },
+                CapabilityItem {
+                    id: "subscribe".into(),
+                    state: CapabilityState::NotPresent,
+                    detail: Some("s7 only supports poll mode".into()),
+                },
+                CapabilityItem {
+                    id: "browse".into(),
+                    state: CapabilityState::NotPresent,
+                    detail: Some("s7 has no browse space".into()),
+                },
+            ],
+            warnings,
+        })
+    }
+
     async fn configure(
         &mut self,
         revision: u64,
@@ -955,6 +1067,85 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "INVALID_ADDRESS");
+    }
+
+    /// 按 parse_szl_module_id 的布局假设构造合成 SZL 载荷（自举一致性；
+    /// 真机偏移确认前仅锁定布局，不证明硬件语义）。
+    fn synthetic_szl_payload(mlfb: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 10 + 28];
+        p[0] = 0xFF;
+        p[1] = 0x09;
+        p[2..4].copy_from_slice(&36u16.to_be_bytes());
+        p[4..6].copy_from_slice(&0x0011u16.to_be_bytes());
+        p[6..8].copy_from_slice(&1u16.to_be_bytes());
+        p[8..10].copy_from_slice(&28u16.to_be_bytes());
+        p[10..12].copy_from_slice(&1u16.to_be_bytes());
+        let n = mlfb.len().min(20);
+        p[12..12 + n].copy_from_slice(&mlfb[..n]);
+        for b in p[12 + n..12 + 20].iter_mut() {
+            *b = b' ';
+        }
+        p
+    }
+
+    #[test]
+    fn szl_module_id_parses_valid_mlfb() {
+        let p = synthetic_szl_payload(b"6ES7 214-1AG40-0XB0");
+        assert_eq!(
+            parse_szl_module_id(&p, 0x0011, 1).as_deref(),
+            Some("6ES7 214-1AG40-0XB0")
+        );
+    }
+
+    #[test]
+    fn szl_module_id_rejects_malformed() {
+        // 返回码非成功
+        let mut p = synthetic_szl_payload(b"6ES7 214-1AG40-0XB0");
+        p[0] = 0x00;
+        assert!(parse_szl_module_id(&p, 0x0011, 1).is_none());
+        // 回显不一致（布局假设不成立时绝不错位解读）
+        let p = synthetic_szl_payload(b"6ES7 214-1AG40-0XB0");
+        assert!(parse_szl_module_id(&p, 0x0012, 1).is_none());
+        assert!(parse_szl_module_id(&p, 0x0011, 2).is_none());
+        // 过短
+        assert!(parse_szl_module_id(&p[..20], 0x0011, 1).is_none());
+        // 非打印字符
+        let mut p = synthetic_szl_payload(b"6ES7 214-1AG40-0XB0");
+        p[12] = 0x01;
+        assert!(parse_szl_module_id(&p, 0x0011, 1).is_none());
+        // 全空
+        let p = synthetic_szl_payload(b"                    ");
+        assert!(parse_szl_module_id(&p, 0x0011, 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn open_rejects_bad_config_without_touching_network() {
+        // 配置校验仍在 OpenConnection（probe 复用已开连接，不再解析配置）
+        let d = S7Driver;
+        let err = match d.open_connection("t", "not-json").await {
+            Ok(_) => panic!("非法配置必须拒绝"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, "BAD_CONFIG");
+    }
+
+    #[tokio::test]
+    async fn probe_refused_port_is_unreachable_not_error() {
+        // 127.0.0.1:9 预期关闭：连接被拒 → Ok(unreachable)，不是 Err
+        let mut conn = S7Connection {
+            cfg: S7ConnConfig {
+                host: "127.0.0.1".into(),
+                port: 9,
+                ..Default::default()
+            },
+            plan: None,
+        };
+        let r = conn.probe().await.expect("不可达是探测结果，不应 Err");
+        assert!(!r.reachable);
+        assert_eq!(r.warnings.len(), 1);
+        assert_eq!(r.warnings[0].code, "CONNECTION_FAILED");
+        assert!(r.model.is_none());
+        assert!(r.capabilities.is_empty());
     }
 
     #[test]

@@ -7,12 +7,17 @@
 
 pub mod capability;
 pub mod descriptor;
+pub mod probe;
 pub mod profile;
 pub mod resource;
 pub mod schema;
 
 pub use capability::{ControlCatalog, DiscoveryCapabilities, DriverCapabilities};
 pub use descriptor::{DriverDescriptor, DriverIdentity};
+pub use probe::{
+    CapabilityItem, CapabilityState, PROBE_REPORT_MAX_BYTES, ProbeReport, ProbeWarning,
+    check_report_size,
+};
 pub use profile::{DeviceProfile, MatchRule, Preset, expand_preset};
 pub use resource::{
     AccessMode, GENERIC_BINDING_KIND, GenericBinding, OutputDescriptor, ResourceDescriptor,

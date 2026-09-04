@@ -11,6 +11,7 @@
 pub mod endpoint;
 pub mod manager;
 pub mod manifest;
+pub mod probe;
 pub mod process;
 pub mod profile;
 pub mod session;

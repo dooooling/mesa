@@ -207,6 +207,36 @@ pub struct OdbSt {
     pub utime: c_int,        // 加工时间（分）
 }
 
+/// `cnc_sysinfo` 返回：`ODBSYS`（20 字节），`B-64304EN 4.1` `fwlib.cs`
+/// - 布局：addinfo(2) max_axis(2) cnc_type(2) mt_type(2) series(4) version(4) axes(4)，
+///   字符区为 ASCII（不足补空格），`[u8; N]` 与 C `char[N]` 布局等价。
+/// - NOTE: series/version 偏移与真机确认前为待验证假设，调用方必须做回显无关的
+///   严格校验（非空可打印 ASCII），失败只降级 IDENTITY_UNAVAILABLE，绝不误报。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OdbSys {
+    pub addinfo: c_short,
+    pub max_axis: c_short,
+    pub cnc_type: [u8; 2],
+    pub mt_type: [u8; 2],
+    pub series: [u8; 4],
+    pub version: [u8; 4],
+    pub axes: [u8; 4],
+}
+
+/// ODBSYS 字符区解码（series/version/cnc_type 通用）：去 NUL/空格，
+/// 非空且全可打印 ASCII 才接受，否则 None（调用方降级 IDENTITY_UNAVAILABLE）。
+pub fn odbsys_field(raw: &[u8]) -> Option<String> {
+    let s = String::from_utf8_lossy(raw)
+        .trim_matches('\0')
+        .trim()
+        .to_string();
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_graphic() || b == b' ') {
+        return None;
+    }
+    Some(s)
+}
+
 /// `cnc_acts` 返回：`ODBACT`，`fwlib.cs:113` `platform/Acts.cs`
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -496,6 +526,7 @@ type FnAllClibHndl3 =
     unsafe extern "C" fn(*const c_char, c_ushort, c_long, *mut c_ushort) -> c_short;
 type FnFreelibHndl = unsafe extern "C" fn(c_ushort) -> c_short;
 type FnStatInfo = unsafe extern "C" fn(c_ushort, *mut OdbSt) -> c_short;
+type FnSysInfo = unsafe extern "C" fn(c_ushort, *mut OdbSys) -> c_short;
 type FnRdDynamic2 = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OdbDy2) -> c_short;
 type FnCncAbsolute = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OdbAxis) -> c_short;
 type FnCncRdMacro = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut Odbm) -> c_short;
@@ -546,6 +577,7 @@ pub struct NativeLib {
     pub cnc_allclibhndl3: Option<Symbol<'static, FnAllClibHndl3>>,
     pub cnc_freelibhndl: Option<Symbol<'static, FnFreelibHndl>>,
     pub cnc_statinfo: Option<Symbol<'static, FnStatInfo>>,
+    pub cnc_sysinfo: Option<Symbol<'static, FnSysInfo>>,
     pub cnc_rddynamic2: Option<Symbol<'static, FnRdDynamic2>>,
     pub cnc_absolute: Option<Symbol<'static, FnCncAbsolute>>,
     pub cnc_rdmacro: Option<Symbol<'static, FnCncRdMacro>>,
@@ -579,6 +611,36 @@ pub struct NativeLib {
 impl NativeLib {
     /// 按当前 OS/Arch 探测并加载库，失败返回明确错误（用于上层转 `CONNECT_FAILED`/`EW_NODLL`）
     pub fn load() -> Result<Self, String> {
+        Self::ensure_log_file()?;
+        Self::load_inner()
+    }
+
+    /// Linux 保命项：FANUC Linux fwlib 在连接失败写日志时，若 CWD 下没有
+    /// `fwlibeth.log` 会空指针解引用直接 SIGSEGV（进程级崩溃，catch 不住）。
+    /// 已用 ctypes 在 docker linux 下复现并验证：预建空文件后失败路径干净
+    /// 返回 EW_SOCKET。已存在则不动；其它平台 DLL 无此行为，不处理。
+    ///
+    /// P1 fail-closed：保命条件不满足（只读 CWD 等）时必须 Err 拒绝加载
+    /// （`FOCAS_LOG_INIT_FAILED`），绝不带着 SIGSEGV 风险继续（P1 fail-open 教训）。
+    #[cfg(target_os = "linux")]
+    fn ensure_log_file() -> Result<(), String> {
+        let log = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("fwlibeth.log");
+        if !log.exists() {
+            std::fs::write(&log, b"").map_err(|e| {
+                format!("FOCAS_LOG_INIT_FAILED: 无法预建 {log:?}（fwlib 无此文件会 SIGSEGV）: {e}")
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn ensure_log_file() -> Result<(), String> {
+        Ok(())
+    }
+
+    fn load_inner() -> Result<Self, String> {
         // Windows：FOCAS 依赖同目录的 fwlibe1 等子 DLL，需将目录加入 PATH 供隐式依赖搜索
         #[cfg(target_os = "windows")]
         {
@@ -791,6 +853,7 @@ impl NativeLib {
             cnc_allclibhndl3: None,
             cnc_freelibhndl: None,
             cnc_statinfo: None,
+            cnc_sysinfo: None,
             cnc_rddynamic2: None,
             cnc_absolute: None,
             cnc_rdmacro: None,
@@ -830,6 +893,10 @@ impl NativeLib {
                 .map(|s| std::mem::transmute(s));
             me.cnc_statinfo = (*raw)
                 .get::<FnStatInfo>(b"cnc_statinfo")
+                .ok()
+                .map(|s| std::mem::transmute(s));
+            me.cnc_sysinfo = (*raw)
+                .get::<FnSysInfo>(b"cnc_sysinfo")
                 .ok()
                 .map(|s| std::mem::transmute(s));
             me.cnc_rddynamic2 = (*raw)
@@ -989,6 +1056,22 @@ impl NativeLib {
     pub fn cnc_statinfo(&self, hdl: u16) -> Result<OdbSt, FocasRet> {
         let sym = self.cnc_statinfo.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<OdbSt>::uninit();
+        let rc = unsafe { sym(hdl as c_ushort, out.as_mut_ptr()) };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() {
+            Ok(unsafe { out.assume_init() })
+        } else {
+            Err(ret)
+        }
+    }
+
+    /// 读 CNC 系统信息：`cnc_sysinfo(hdl, ODBSYS*)`，`B-64304EN 4.1`
+    /// - 返回 series（"0i-F" 类）与 version，用于 probe 的 family/firmware；
+    ///   model 无法从 ODBSYS 唯一确定，由上层按真机确认的映射处理，此处不猜。
+    /// - 符号缺失/调用失败由上层转 IDENTITY_UNAVAILABLE，不 panic。
+    pub fn cnc_sysinfo(&self, hdl: u16) -> Result<OdbSys, FocasRet> {
+        let sym = self.cnc_sysinfo.as_ref().ok_or(FocasRet::Nodll)?;
+        let mut out = std::mem::MaybeUninit::<OdbSys>::uninit();
         let rc = unsafe { sym(hdl as c_ushort, out.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() {

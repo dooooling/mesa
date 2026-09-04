@@ -49,7 +49,7 @@ pub struct MesaManager {
     running: Mutex<HashMap<String, RunningEntry>>,
     shutdown: CancellationToken,
     descriptor_cache: RwLock<HashMap<DescriptorCacheKey, CachedDescriptor>>,
-    profiles: RwLock<Vec<mesa_core_types::DeviceProfile>>,
+    pub(crate) profiles: RwLock<Vec<mesa_core_types::DeviceProfile>>,
     /// 活跃会话注册表：endpoint_id -> Session（用于 Control 面可靠转发，§22）
     active_sessions: std::sync::Arc<
         RwLock<HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>,

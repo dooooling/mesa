@@ -522,20 +522,15 @@ async fn validate_connection(
     }
 }
 
+/// 动态探测（§8）：纯 HTTP 映射，编排（临时进程/Probe RPC/匹配/清理）
+/// 全部收敛在 `MesaManager::probe()`，本层只做形状转换与状态码映射。
+/// - 200：探测完成（含设备不可达 `reachable:false`，那是探测结果）；
+/// - 404/400：输入问题；501：Driver 不支持；503：基础设施失败；504：超时。
 async fn probe_driver(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let disc = match state.manager.find_driver(&id) {
-        Some(d) => d,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json_error("NOT_FOUND", &format!("driver `{id}` not found"))),
-            );
-        }
-    };
     let conn_val = if let Some(c) = body.get("connection") {
         c.clone()
     } else {
@@ -551,69 +546,58 @@ async fn probe_driver(
         );
     }
     let conn_str = serde_json::to_string(&conn_val).unwrap();
-    // 临时进程探测：需覆盖 DRIVER_STARTUP_TIMEOUT(6s) + handshake + OpenConnection
-    let probe_res =
-        tokio::time::timeout(mesa_driver_manager::session::PROBE_TIMEOUT, async {
-            let mut proc = match mesa_driver_manager::process::DriverProcess::spawn(&disc).await {
-                Ok(p) => p,
-                Err(e) => return Err(format!("spawn failed: {e}")),
-            };
-            let (mut session, _events, _) =
-                match mesa_driver_manager::session::Session::connect_retry(proc.port, &proc.token)
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        proc.terminate().await;
-                        return Err(format!("handshake failed: {e}"));
-                    }
-                };
-            // 尝试 OpenConnection
-            let handle = 999;
-            let open_res = session
-                .call(mesa_driver_protocol::pb::envelope::Body::OpenConnection(
-                    mesa_driver_protocol::pb::OpenConnection {
-                        connection_handle: handle,
-                        endpoint_id: format!("probe-{id}"),
-                        config_json: conn_str.clone(),
+    match state.manager.probe(&id, &conn_str).await {
+        Ok(res) => {
+            let r = res.report;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "reachable": r.reachable,
+                    "device": {
+                        "vendor": r.vendor,
+                        "family": r.family,
+                        "model": r.model,
+                        "firmware": r.firmware,
                     },
-                ))
-                .await;
-            let reachable = match open_res {
-                Ok(env) => match env.body {
-                    Some(mesa_driver_protocol::pb::envelope::Body::OpenConnectionAck(ack)) => {
-                        ack.result.map(|r| r.ok).unwrap_or(false)
-                    }
-                    Some(mesa_driver_protocol::pb::envelope::Body::DriverError(e)) => {
-                        let d = e.detail.unwrap_or_default();
-                        return Err(format!("{}/{}: {}", d.kind, d.code, d.message));
-                    }
-                    _ => false,
-                },
-                Err(e) => return Err(format!("open failed: {e}")),
-            };
-            session.invalidate();
-            proc.terminate().await;
-            if reachable {
-                Ok(())
-            } else {
-                Err("open not ok".into())
+                    "model_confidence": r.model_confidence,
+                    "capabilities": r.capabilities,
+                    "profile_hints": res
+                        .profile_hints
+                        .iter()
+                        .map(|h| serde_json::json!({ "profile_id": h.profile_id }))
+                        .collect::<Vec<_>>(),
+                    "warnings": r.warnings,
+                })),
+            )
+        }
+        Err(e) => {
+            use mesa_driver_manager::probe::ProbeError;
+            match e {
+                ProbeError::DriverNotFound(_) => (
+                    StatusCode::NOT_FOUND,
+                    Json(json_error("NOT_FOUND", &e.to_string())),
+                ),
+                ProbeError::Unsupported(_) => (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(json_error("PROBE_UNSUPPORTED", &e.to_string())),
+                ),
+                ProbeError::InvalidInput { code, message } => {
+                    (StatusCode::BAD_REQUEST, Json(json_error(&code, &message)))
+                }
+                ProbeError::Spawn(_) | ProbeError::Handshake(_) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json_error("DRIVER_UNAVAILABLE", &e.to_string())),
+                ),
+                ProbeError::Rpc(_) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json_error("PROBE_FAILED", &e.to_string())),
+                ),
+                ProbeError::RpcTimeout | ProbeError::Timeout => (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(json_error("PROBE_TIMEOUT", &e.to_string())),
+                ),
             }
-        })
-        .await;
-    match probe_res {
-        Ok(Ok(())) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "reachable": true, "warnings": [] })),
-        ),
-        Ok(Err(e)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "reachable": false, "error": e, "warnings": [] })),
-        ),
-        Err(_) => (
-            StatusCode::GATEWAY_TIMEOUT,
-            Json(json_error("TIMEOUT", "probe timeout")),
-        ),
+        }
     }
 }
 

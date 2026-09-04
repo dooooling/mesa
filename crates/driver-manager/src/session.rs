@@ -86,6 +86,14 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
     #[error("protocol error: {0}")]
     Protocol(#[from] ProtocolError),
+    /// Driver 侧结构化错误（P1-2：kind/code 保留，不格式化成字符串，
+    /// 调用方按 code 做精确路由，禁止 contains()/parse 回猜）。
+    #[error("driver error {kind}/{code}: {message}")]
+    Driver {
+        kind: String,
+        code: String,
+        message: String,
+    },
 }
 
 struct Shared {
@@ -115,6 +123,9 @@ pub struct Session {
     shared: Arc<Shared>,
     next_msg_id: AtomicU64,
     reader_cancel: CancellationToken,
+    /// 握手协商出的 Minor（双方较小值）。Probe RPC 要求 >= 2，
+    /// 旧 Driver 直接返回 Unsupported，不发 RPC 干等超时。
+    negotiated_minor: u32,
 }
 
 /// 驱动启动窗口：从 spawn 到 listen 的容忍期（§14，Probe 外层需更大 budget）
@@ -201,7 +212,7 @@ impl Session {
         if hello.session_token != expected_token {
             return Err(SessionError::Handshake("token mismatch".into()));
         }
-        negotiate(
+        let (_, negotiated_minor) = negotiate(
             (hello.protocol_major, hello.protocol_minor),
             (
                 mesa_driver_protocol::PROTOCOL_MAJOR,
@@ -285,6 +296,7 @@ impl Session {
                 shared,
                 next_msg_id: AtomicU64::new(100),
                 reader_cancel,
+                negotiated_minor,
             },
             events_rx,
             unresponsive_flag,
@@ -293,6 +305,11 @@ impl Session {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// 握手协商出的 Minor（probe 门控用）。
+    pub fn negotiated_minor(&self) -> u32 {
+        self.negotiated_minor
     }
 
     pub fn is_unresponsive(&self) -> bool {
@@ -340,6 +357,37 @@ impl Session {
                 }
                 // 校验 JSON 可解析性由调用方完成，此处仅透传
                 Ok((d.contract_major, d.contract_minor, d.descriptor_json))
+            }
+            _ => Err(SessionError::Closed),
+        }
+    }
+
+    /// Dynamic Probe（§8）：对已 OpenConnection 的 `connection_handle`
+    /// 发送 ProbeRequest 并等待 ProbeResponse。
+    /// 调用方（MesaManager）须先以 `negotiated_minor()` 门控版本，
+    /// 此处只做 RPC + 响应种类校验 + JSON 解码 + 大小校验，不解释业务语义。
+    /// Driver 侧失败以同 msg_id 的 DriverErrorReport 回到此处，转为错误上抛。
+    pub async fn probe(
+        &self,
+        connection_handle: u32,
+    ) -> Result<mesa_core_types::ProbeReport, SessionError> {
+        let reply = self
+            .call(pb::envelope::Body::ProbeRequest(pb::ProbeRequest {
+                connection_handle,
+            }))
+            .await?;
+        match reply.body {
+            Some(pb::envelope::Body::ProbeResponse(r)) => {
+                mesa_core_types::ProbeReport::from_report_json(&r.report_json)
+                    .map_err(SessionError::Handshake)
+            }
+            Some(pb::envelope::Body::DriverError(e)) => {
+                let d = e.detail.unwrap_or_default();
+                Err(SessionError::Driver {
+                    kind: d.kind,
+                    code: d.code,
+                    message: d.message,
+                })
             }
             _ => Err(SessionError::Closed),
         }

@@ -150,6 +150,18 @@ pub trait DriverConnection: Send {
         shutdown: CancellationToken,
     ) -> Result<(), SdkDriverError>;
 
+    /// 动态探测（§8）：复用本连接已建立的协议会话做纯查询，返回设备事实。
+    /// 禁止在此走 Configure/ApplyPointMap/Start；Secret/PKI/会话建立全部
+    /// 复用 OpenConnection 已完成的成果，不得另建第二套连接逻辑。
+    /// 默认返回 Unsupported。
+    async fn probe(&mut self) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
+        Err(SdkDriverError::new(
+            mesa_core_types::ErrorKind::Unsupported,
+            "PROBE_UNSUPPORTED",
+            "dynamic probe not supported",
+        ))
+    }
+
     /// 浏览（§20）：仅 OPC UA 等支持，默认返回 Unsupported。
     async fn browse(
         &mut self,
@@ -804,6 +816,7 @@ async fn request_loop(
             Some(pb::envelope::Body::BrowseRequest(req)) => {
                 on_browse(session, req, env.msg_id).await
             }
+            Some(pb::envelope::Body::ProbeRequest(req)) => on_probe(session, req, env.msg_id).await,
             Some(pb::envelope::Body::WriteRequest(req)) => on_write(session, req, env.msg_id).await,
             Some(pb::envelope::Body::CommandRequest(req)) => {
                 on_command(session, req, env.msg_id).await
@@ -1168,6 +1181,71 @@ async fn on_close(session: &Session, req: pb::CloseConnection, msg_id: u64) {
                     result: Some(ok_result()),
                 },
             )),
+        })
+        .await;
+}
+
+/// 动态探测（§8）：从 entries 取出 `connection_handle` 对应的连接，
+/// 调用 `DriverConnection::probe()`（复用其已建协议会话），用完归还。
+/// 成功 → `ProbeResponse{report_json}`（64 KiB 上限内，发送前二次检查）；
+/// 失败（含 handle 未打开）→ 同 msg_id 的 `DriverErrorReport`（复用等待路由）。
+async fn on_probe(session: &Session, req: pb::ProbeRequest, msg_id: u64) {
+    let conn_opt = {
+        session
+            .entries
+            .lock()
+            .unwrap()
+            .get_mut(&req.connection_handle)
+            .and_then(|e| e.conn.take())
+    };
+    let Some(mut conn) = conn_opt else {
+        session
+            .sink
+            .send_control(pb::Envelope {
+                msg_id,
+                body: Some(pb::envelope::Body::DriverError(pb::DriverErrorReport {
+                    connection_handle: Some(req.connection_handle),
+                    detail: Some(error_detail(
+                        mesa_core_types::ErrorKind::Internal,
+                        "NO_CONNECTION",
+                        "probe: connection not open",
+                    )),
+                })),
+            })
+            .await;
+        return;
+    };
+    let body = match conn.probe().await {
+        Ok(report) => match report.to_report_json() {
+            Ok(json) => pb::envelope::Body::ProbeResponse(pb::ProbeResponse { report_json: json }),
+            Err(e) => pb::envelope::Body::DriverError(pb::DriverErrorReport {
+                connection_handle: Some(req.connection_handle),
+                detail: Some(error_detail(
+                    mesa_core_types::ErrorKind::Internal,
+                    "PROBE_SERIALIZE_FAILED",
+                    e,
+                )),
+            }),
+        },
+        Err(err) => pb::envelope::Body::DriverError(pb::DriverErrorReport {
+            connection_handle: Some(req.connection_handle),
+            detail: Some(error_detail(err.kind, &err.code, err.message)),
+        }),
+    };
+    // 归还连接（probe 不消耗连接对象）
+    if let Some(entry) = session
+        .entries
+        .lock()
+        .unwrap()
+        .get_mut(&req.connection_handle)
+    {
+        entry.conn = Some(conn);
+    }
+    session
+        .sink
+        .send_control(pb::Envelope {
+            msg_id,
+            body: Some(body),
         })
         .await;
 }

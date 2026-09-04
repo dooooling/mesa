@@ -20,7 +20,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// IPC 协议版本。Major 不兼容直接拒绝握手；Minor 取双方较小值。
 /// V1.2.1 新增 PointValue.value_origin（§5.5），Minor 1 保证新 Driver 的 typed BAD 语义可被新 Core 理解，旧端仍按 UNSPECIFIED 兼容解释
 pub const PROTOCOL_MAJOR: u32 = 1;
-pub const PROTOCOL_MINOR: u32 = 1;
+pub const PROTOCOL_MINOR: u32 = 2;
+
+/// Dynamic Probe RPC 可用的最低协商 Minor（§8）。协商 Minor < 2 的旧 Driver
+/// 不识别 ProbeRequest（会静默忽略），Core 必须直接返回 Unsupported，
+/// 不得发 RPC 干等超时。
+pub const PROBE_RPC_MIN_MINOR: u32 = 2;
 
 /// 单帧上限。防止恶意/异常长度前缀导致无界分配（有界原则在 IPC 层的体现）。
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -442,6 +447,38 @@ mod tests {
             Some(pb::envelope::Body::Hello(h)) => {
                 assert_eq!(h.session_token, "secret");
                 assert_eq!(h.protocol_major, 1);
+            }
+            other => panic!("unexpected body: {other:?}"),
+        }
+    }
+
+    /// Probe RPC framing 回环：请求带 connection_handle，响应 JSON 原样透传。
+    #[tokio::test]
+    async fn probe_envelopes_roundtrip_over_duplex() {
+        let (mut a, mut b) = tokio::io::duplex(8 * 1024);
+        let req = pb::Envelope {
+            msg_id: 7,
+            body: Some(pb::envelope::Body::ProbeRequest(pb::ProbeRequest {
+                connection_handle: 999,
+            })),
+        };
+        write_envelope(&mut a, &req).await.unwrap();
+        match read_envelope(&mut b).await.unwrap().body {
+            Some(pb::envelope::Body::ProbeRequest(r)) => {
+                assert_eq!(r.connection_handle, 999);
+            }
+            other => panic!("unexpected body: {other:?}"),
+        }
+        let resp = pb::Envelope {
+            msg_id: 7,
+            body: Some(pb::envelope::Body::ProbeResponse(pb::ProbeResponse {
+                report_json: r#"{"reachable":true}"#.into(),
+            })),
+        };
+        write_envelope(&mut b, &resp).await.unwrap();
+        match read_envelope(&mut a).await.unwrap().body {
+            Some(pb::envelope::Body::ProbeResponse(r)) => {
+                assert_eq!(r.report_json, r#"{"reachable":true}"#);
             }
             other => panic!("unexpected body: {other:?}"),
         }

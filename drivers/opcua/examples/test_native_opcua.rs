@@ -18,7 +18,7 @@ async fn main() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("data/certificates/opcua"));
     let options = OpcUaConnectOptions {
-        endpoint_url: url,
+        endpoint_url: url.clone(),
         pki_dir,
         ..Default::default()
     };
@@ -215,4 +215,28 @@ async fn main() {
     }
     let _ = transport.disconnect().await;
     println!("disconnect OK");
+    // Dynamic Probe（§8）：open 建连 → connection.probe（复用同一 transport 会话）。
+    {
+        let drv = mesa_driver_opcua::OpcUaDriver;
+        let cfg = format!(r#"{{"endpoint_url":"{url}","timeout_ms":5000}}"#);
+        let mut conn = mesa_driver_sdk::Driver::open_connection(&drv, "smoke", &cfg)
+            .await
+            .expect("open 必须 Ok");
+        let rep = mesa_driver_sdk::DriverConnection::probe(&mut *conn)
+            .await
+            .expect("probe 必须 Ok");
+        println!(
+            "probe OK reachable={} vendor={:?} model={:?} firmware={:?} caps={:?} warnings={:?}",
+            rep.reachable,
+            rep.vendor,
+            rep.model,
+            rep.firmware,
+            rep.capabilities,
+            rep.warnings
+                .iter()
+                .map(|w| w.code.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(rep.reachable);
+    }
 }
