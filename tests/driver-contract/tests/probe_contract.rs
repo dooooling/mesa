@@ -38,7 +38,11 @@ fn exe_name(base: &str) -> String {
 /// 注意：Linux comm 截断到 15 字符，调用方传入的唯一名必须 ≤15 字符，
 /// 否则匹配永远为空、孤儿检查被静默旁路（"pb-sim-guard"=12，"pb-hang-guard"=13）。
 fn live_pids(name: &str) -> HashSet<u32> {
-    debug_assert!(name.len() <= 15, "comm truncation risk: {name}");
+    // Windows 按 IMAGENAME（含 .exe）匹配无截断；Linux comm 去扩展名后必须 ≤15
+    debug_assert!(
+        name.trim_end_matches(".exe").len() <= 15,
+        "comm truncation risk: {name}"
+    );
     #[cfg(windows)]
     {
         let out = std::process::Command::new("tasklist")
