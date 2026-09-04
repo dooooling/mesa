@@ -173,6 +173,30 @@ impl Driver for SimulatorDriver {
         let faults = parse_conn_faults(&cfg)?;
         Ok(Box::new(SimConnection { plan: None, faults }))
     }
+
+    /// Simulator 探测：无真实设备，返回确定性事实（合同基准）。
+    /// 仅校验 connection_json 为合法 JSON（与 open_connection 一致），
+    /// 不解析业务字段、不启动任何采集。
+    async fn probe(
+        &self,
+        connection_json: &str,
+    ) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
+        let _: serde_json::Value = serde_json::from_str(connection_json)
+            .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.to_string()))?;
+        Ok(mesa_core_types::ProbeReport {
+            reachable: true,
+            vendor: Some("Mesa".into()),
+            family: Some("Simulator".into()),
+            model: Some("Basic".into()),
+            firmware: Some("1.0".into()),
+            capabilities: mesa_core_types::ProbeCapabilities {
+                read: Some(true),
+                subscribe: Some(true),
+                browse: Some(true),
+            },
+            warnings: vec![],
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
