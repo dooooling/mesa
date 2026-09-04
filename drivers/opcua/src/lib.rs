@@ -23,6 +23,7 @@
 
 mod address;
 mod opcua_api;
+mod probe;
 mod transport_adapter;
 
 pub use address::{AddressError, Identifier, OpcUaAddress, parse_address};
@@ -218,6 +219,36 @@ impl Driver for OpcUaDriver {
             api,
             plan: None,
         }))
+    }
+
+    /// OPC UA 动态探测：只走公共 transport（Native/Fake），禁止直连 async-opcua。
+    /// 建连失败 → Ok(unreachable)；身份缺失 → MODEL_UNDETECTED；不断开泄漏
+    /// 由 probe_with_transport 内部 best-effort 保证。
+    async fn probe(
+        &self,
+        connection_json: &str,
+    ) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
+        let v: serde_json::Value = serde_json::from_str(connection_json).map_err(|e| {
+            SdkDriverError::configuration("BAD_CONFIG", format!("connection JSON 非法: {e}"))
+        })?;
+        let cfg = OpcUaConnConfig::from_json(&v)?;
+        let use_native = v
+            .get("use_native")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true);
+        if !use_native && std::env::var("MESA_ALLOW_FAKE_NATIVE").ok().as_deref() != Some("1") {
+            return Err(SdkDriverError::configuration(
+                "BAD_CONFIG",
+                "use_native=false 仅在测试环境 MESA_ALLOW_FAKE_NATIVE=1 时允许",
+            ));
+        }
+        if use_native {
+            let transport = mesa_opcua_transport::NativeOpcUaTransport::new(cfg.connect_options());
+            crate::probe::probe_with_transport(&transport).await
+        } else {
+            let transport = mesa_opcua_transport::FakeOpcUaTransport::new();
+            crate::probe::probe_with_transport(&transport).await
+        }
     }
 }
 

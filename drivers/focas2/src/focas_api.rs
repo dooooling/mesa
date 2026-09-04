@@ -26,6 +26,15 @@ const FAKE_RAND_MULT: u64 = 6364136223846793005;
 #[allow(dead_code)]
 const FAKE_RAND_XOR: u32 = 0x2545F491;
 
+/// CNC 系统信息（`cnc_sysinfo`/ODBSYS 的最小可用子集）。
+/// series 如 "0i-F"，version 为固件版本原文；model 无法从 ODBSYS 唯一确定，
+/// 由 Driver 层按真机确认的映射处理，此处绝不猜测。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocasSysInfo {
+    pub series: String,
+    pub version: String,
+}
+
 /// FOCAS2 访问抽象，所有阻塞调用应在 `spawn_blocking` 中执行（由调用方保证）。
 #[async_trait::async_trait]
 pub trait FocasApi: Send + Sync {
@@ -33,6 +42,8 @@ pub trait FocasApi: Send + Sync {
     async fn connect(&self, host: &str, port: u16, timeout_ms: u64) -> Result<(), String>;
     /// 批量读取（与 `S7Client::read_vars` 对称），按地址顺序返回 `Value`。
     async fn read_batch(&self, addresses: &[FocasAddress]) -> Result<Vec<Value>, String>;
+    /// 读系统信息（低风险只读，供动态探测；失败由调用方降级）。
+    async fn system_info(&self) -> Result<FocasSysInfo, String>;
     /// 断开（可选）
     async fn disconnect(&self) {}
 }
@@ -144,6 +155,14 @@ impl FocasApi for FakeFocasApi {
         }
         // Fake 下允许任意 host；若为示例中的非法占位则延迟模拟
         Ok(())
+    }
+
+    /// Fake 固定身份（合同基准，确定性）：一台 0i-F，固件 1.0。
+    async fn system_info(&self) -> Result<FocasSysInfo, String> {
+        Ok(FocasSysInfo {
+            series: "0i-F".into(),
+            version: "1.0".into(),
+        })
     }
 
     async fn read_batch(&self, addresses: &[FocasAddress]) -> Result<Vec<Value>, String> {
@@ -487,6 +506,30 @@ impl FocasApi for NativeFocasApi {
             })
             .await;
         }
+    }
+
+    async fn system_info(&self) -> Result<FocasSysInfo, String> {
+        let lib_arc = std::sync::Arc::clone(&self.lib);
+        let handle_arc = std::sync::Arc::clone(&self.handle);
+        tokio::task::spawn_blocking(move || {
+            let r = lib_arc.get_or_init(NativeLib::load);
+            let lib = match r {
+                Ok(l) => l,
+                Err(e) => return Err(e.clone()),
+            };
+            let hdl = handle_arc
+                .lock()
+                .unwrap()
+                .ok_or_else(|| "NOT_CONNECTED 未调用 connect".to_string())?;
+            let sys = lib.cnc_sysinfo(hdl).map_err(Self::map_ret_err)?;
+            let series = crate::native::odbsys_field(&sys.series)
+                .ok_or_else(|| "sysinfo series 非法".to_string())?;
+            let version = crate::native::odbsys_field(&sys.version)
+                .ok_or_else(|| "sysinfo version 非法".to_string())?;
+            Ok(FocasSysInfo { series, version })
+        })
+        .await
+        .map_err(|e| format!("JOIN_FAILED {e}"))?
     }
 }
 
