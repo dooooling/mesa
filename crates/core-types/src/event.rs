@@ -220,10 +220,30 @@ pub enum SequenceVerdict {
     Gap { expected: u64, got: u64 },
 }
 
+/// 事件批次（Core 契约形态，镜像 `DataBatch` header；PR6 ingress 直接消费）。
+///
+/// PR5-review P1：跟踪器只保留当前 epoch（`epoch`/`max_sequence` 各一个
+/// Option），有界。旧 epoch 在 sequence gate 之前已被 stale gate 丢掉，
+/// tracker 永久记住历史 epoch 属于无界状态。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventBatch {
+    pub connection_handle: u32,
+    pub stream_epoch: u64,
+    /// 同 `(connection_handle, stream_epoch)` 内严格递增（§11）。
+    pub sequence: u64,
+    /// Driver publish 时的 UTC Unix ns（业务时间）。
+    pub timestamp_ns: TimestampNs,
+    pub events: Vec<EventRecord>,
+    /// 单调时钟埋点（与 DataBatch.mono_ns 同语义：IPC latency 测量，0/None 表未埋点）。
+    #[serde(default)]
+    pub mono_ns: Option<u64>,
+}
+
 /// 同 endpoint 的 batch sequence 跟踪器（非线程安全，调用方持有锁）。
 #[derive(Debug, Default)]
 pub struct EventSequenceTracker {
-    max_per_epoch: std::collections::HashMap<u64, u64>,
+    epoch: Option<u64>,
+    max_sequence: Option<u64>,
 }
 
 impl EventSequenceTracker {
@@ -232,10 +252,13 @@ impl EventSequenceTracker {
     }
 
     pub fn check(&mut self, epoch: u64, seq: u64) -> SequenceVerdict {
-        let Some(max) = self.max_per_epoch.get(&epoch).copied() else {
-            self.max_per_epoch.insert(epoch, seq);
+        // epoch 切换即新流：旧状态整体丢弃，不跨 epoch 比较
+        if self.epoch != Some(epoch) {
+            self.epoch = Some(epoch);
+            self.max_sequence = Some(seq);
             return SequenceVerdict::Accept;
-        };
+        }
+        let max = self.max_sequence.expect("epoch 已设置则 max 必存在");
         if seq == max {
             return SequenceVerdict::Duplicate;
         }
@@ -250,7 +273,7 @@ impl EventSequenceTracker {
                 got: seq,
             },
         };
-        self.max_per_epoch.insert(epoch, seq);
+        self.max_sequence = Some(seq);
         verdict
     }
 }

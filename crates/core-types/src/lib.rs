@@ -17,9 +17,9 @@ pub use capability::{ControlCatalog, DiscoveryCapabilities, DriverCapabilities};
 pub use descriptor::{DriverDescriptor, DriverIdentity};
 pub use event::{
     ConditionTransition, EVENT_ATTRIBUTES_MAX_FIELDS, EVENT_BATCH_MAX_BYTES,
-    EVENT_RECORD_MAX_BYTES, EVENT_SEVERITY_MAX, EventCatalog, EventCondition, EventFieldDescriptor,
-    EventRecord, EventRecordError, EventSequenceTracker, EventStreamDescriptor, EventTask,
-    EventTaskError, SequenceVerdict,
+    EVENT_RECORD_MAX_BYTES, EVENT_SEVERITY_MAX, EventBatch, EventCatalog, EventCondition,
+    EventFieldDescriptor, EventRecord, EventRecordError, EventSequenceTracker,
+    EventStreamDescriptor, EventTask, EventTaskError, SequenceVerdict,
 };
 pub use probe::{
     CapabilityItem, CapabilityState, PROBE_REPORT_MAX_BYTES, ProbeReport, ProbeWarning,

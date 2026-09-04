@@ -408,33 +408,45 @@ pub fn event_record_from_pb(e: pb::EventRecordMsg) -> Result<EventRecord, Conver
 }
 
 /// 整批事件转换（§11 顺序契约由发送侧保证；此处只做逐条校验 + 256 KiB 上限，
-/// 任一非法即整批拒收，不收半批）。
+/// 任一非法即整批拒收，不收半批）。形态镜像 DataBatch：header 元数据完整保留，
+/// PR6 ingress 依赖 connection_handle（找 Endpoint）/stream_epoch（stale 门）
+/// /sequence（gap 门）/timestamp_ns/mono_ns，一律不丢。
 pub fn event_batch_to_pb(
-    connection_handle: u32,
-    stream_epoch: u64,
-    sequence: u64,
-    timestamp_ns: i64,
-    mono_ns: Option<u64>,
-    events: &[EventRecord],
+    batch: &mesa_core_types::EventBatch,
 ) -> Result<pb::EventBatchMsg, ConvertError> {
-    let batch = pb::EventBatchMsg {
-        connection_handle,
-        stream_epoch,
-        sequence,
-        timestamp_ns,
-        mono_ns,
-        events: events
+    let wire = pb::EventBatchMsg {
+        connection_handle: batch.connection_handle,
+        stream_epoch: batch.stream_epoch,
+        sequence: batch.sequence,
+        timestamp_ns: batch.timestamp_ns,
+        mono_ns: batch.mono_ns,
+        events: batch
+            .events
             .iter()
             .map(event_record_to_pb)
             .collect::<Result<Vec<_>, _>>()?,
     };
-    check_event_batch_size(&batch)?;
-    Ok(batch)
+    check_event_batch_size(&wire)?;
+    Ok(wire)
 }
 
-pub fn event_batch_from_pb(b: pb::EventBatchMsg) -> Result<Vec<EventRecord>, ConvertError> {
+pub fn event_batch_from_pb(
+    b: pb::EventBatchMsg,
+) -> Result<mesa_core_types::EventBatch, ConvertError> {
     check_event_batch_size(&b)?;
-    b.events.into_iter().map(event_record_from_pb).collect()
+    let events = b
+        .events
+        .into_iter()
+        .map(event_record_from_pb)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(mesa_core_types::EventBatch {
+        connection_handle: b.connection_handle,
+        stream_epoch: b.stream_epoch,
+        sequence: b.sequence,
+        timestamp_ns: b.timestamp_ns,
+        events,
+        mono_ns: b.mono_ns,
+    })
 }
 
 fn check_event_batch_size(b: &pb::EventBatchMsg) -> Result<(), ConvertError> {
@@ -750,25 +762,41 @@ mod tests {
         };
         // 70 条 × ~4KiB > 256KiB
         let events = vec![big; 70];
+        let batch = mesa_core_types::EventBatch {
+            connection_handle: 7,
+            stream_epoch: 99,
+            sequence: 5,
+            timestamp_ns: 1_700_000_000_000_000_000,
+            events,
+            mono_ns: Some(123),
+        };
         assert!(matches!(
-            event_batch_to_pb(1, 1, 1, 1, None, &events),
+            event_batch_to_pb(&batch),
             Err(ConvertError::EventBatchTooLarge(_))
         ));
         // 接收侧同样拒收（逐条合法但整批超限）
-        let mut batch = pb::EventBatchMsg {
-            connection_handle: 1,
-            stream_epoch: 1,
-            sequence: 1,
-            timestamp_ns: 1,
-            mono_ns: None,
-            events: events
+        let mut wire = pb::EventBatchMsg {
+            connection_handle: 7,
+            stream_epoch: 99,
+            sequence: 5,
+            timestamp_ns: 1_700_000_000_000_000_000,
+            mono_ns: Some(123),
+            events: batch
+                .events
                 .iter()
                 .map(|e| event_record_to_pb(e).unwrap())
                 .collect(),
         };
-        assert!(event_batch_from_pb(batch.clone()).is_err());
-        batch.events.truncate(2);
-        assert_eq!(event_batch_from_pb(batch).unwrap().len(), 2);
+        assert!(event_batch_from_pb(wire.clone()).is_err());
+        wire.events.truncate(2);
+        // header 元数据完整保留（PR6 ingress 依赖，一律不丢）
+        let back = event_batch_from_pb(wire).unwrap();
+        assert_eq!(back.connection_handle, 7);
+        assert_eq!(back.stream_epoch, 99);
+        assert_eq!(back.sequence, 5);
+        assert_eq!(back.timestamp_ns, 1_700_000_000_000_000_000);
+        assert_eq!(back.mono_ns, Some(123));
+        assert_eq!(back.events.len(), 2);
     }
 
     /// 空字符串 quality 必须按 GOOD 解释——这是"缺省即 GOOD"语义的落点。
