@@ -1328,8 +1328,11 @@ impl DriverConnection for OpcUaConnection {
                                         mono_ns: None,
         }).await;
                         }
-                        // 清理订阅
-                        let _ = api.unsubscribe(sub_id).await;
+                        // 清理订阅：失败不影响 shutdown 返回，但必须 warn
+                        //（P1-B7 保留的 cleanup error 到此是最后可见机会）。
+                        if let Err(e) = api.unsubscribe(sub_id).await {
+                            tracing::warn!(sub_id, error = %e, "shutdown 清理订阅失败（仅诊断）");
+                        }
                         Ok::<(), SdkDriverError>(())
                     }));
                 }

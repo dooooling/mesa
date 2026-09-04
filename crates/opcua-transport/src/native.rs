@@ -882,49 +882,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwarder_slow_consumer_ends_on_latest_with_coalesced_counted() {
-        // P0-B1 full-path 饱和测试：快生产者（同 handle 300 事件）× 慢消费者
-        //（channel 仅 2 格，每收一个睡 2ms）。断言：最终收到值恒为最新 299，
-        // 中间旧采样被合并（coalesced > 0），且无事件丢失到 panic/死锁。
+    async fn forwarder_backpressure_burst_ends_on_latest() {
+        // P0-B1 full-path 确定性背压测试（P1-Gate）：channel capacity=1，
+        // 全程无 sleep 猜测调度，每一步都有可观测的前置条件。
         // 生产者经 SlotState::push 注入——与真实 DataChangeCallback 同一入口。
         let stats = Arc::new(crate::SubscriptionStats::default());
         let slots = Arc::new(SlotState::new(stats.clone()));
-        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-        let fwd = tokio::spawn(forwarder_loop(slots.clone(), tx));
-        let producer = tokio::spawn({
-            let slots = slots.clone();
-            async move {
-                for v in 0..300i32 {
-                    slots.push(7, DataValue::new_now(v));
-                }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let fwd = tokio::spawn(forwarder_loop(slots.clone(), tx.clone()));
+
+        // 步骤 1：先压入 v0，等待 forwarder 把它送进 channel（capacity 归零
+        // 即 channel 真满；2s 超时则测试失败而非静默通过）。
+        slots.push(7, DataValue::new_now(0i32));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while tx.capacity() != 0 {
+                tokio::task::yield_now().await;
             }
-        });
-        let mut last: Option<crate::UaDataChange> = None;
-        while let Ok(Some(ev)) =
-            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
-        {
-            last = Some(ev);
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        })
+        .await
+        .expect("forwarder 应把首个事件送入 channel 使其变满");
+
+        // 步骤 2：channel 已满且无人消费——此时 burst 1..=200。forwarder
+        // 至多再完成一次 send 即被阻塞，后续 push 只能在 slot 里 overwrite。
+        for v in 1..=200i32 {
+            slots.push(7, DataValue::new_now(v));
         }
-        producer.await.expect("生产者不 panic");
-        // 生产者已结束：排空残余，50ms 无新事件即视为转发完成。
-        while let Ok(Some(ev)) =
-            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
-        {
-            last = Some(ev);
-        }
-        // 慢消费者在第一个 50ms 空闲就可能提前跳出首轮循环：此时生产者
-        // 未必结束；排空轮已补收，故最终值断言仍成立。
-        let ev = last.expect("至少收到一个事件");
-        assert_eq!(ev.client_handle, 7);
-        assert_eq!(ev.data_value.value, Some(opcua_types::Variant::Int32(299)));
-        assert_eq!(stats.events_received.load(Ordering::Relaxed), 300);
+        assert_eq!(stats.events_received.load(Ordering::Relaxed), 201);
+        // channel 仍满：forwarder 没能多送（否则 permits 会回升又被占，
+        // 但无人消费满 channel 不可能被排空——恒满即背压成立）。
+        assert_eq!(tx.capacity(), 0, "burst 期间无人消费，channel 必须保持真满");
         assert!(
             stats.events_coalesced.load(Ordering::Relaxed) > 0,
-            "慢消费者下必须发生旧采样合并"
+            "背压下同 handle 旧采样必须被合并计数"
         );
+
+        // 步骤 3：开始消费并排空。首个必为 v0（burst 前唯一送达），
+        // 中间至多一个 in-flight，终值恒为最新 200。
+        let mut first_value: Option<opcua_types::Variant> = None;
+        let mut last_value: Option<opcua_types::Variant> = None;
+        let mut count = 0u32;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await
+        {
+            assert_eq!(ev.client_handle, 7);
+            if first_value.is_none() {
+                first_value = ev.data_value.value.clone();
+            }
+            last_value = ev.data_value.value;
+            count += 1;
+        }
+        assert_eq!(
+            first_value,
+            Some(opcua_types::Variant::Int32(0)),
+            "首个送达的必须是 burst 前的 v0"
+        );
+        // 终值断言：所有 push 已完成且排空至 100ms 空闲，forwarder 必已把
+        // 最新快照送出——否则就是 Latest-Wins 违约。
+        assert_eq!(
+            last_value,
+            Some(opcua_types::Variant::Int32(200)),
+            "排空终值必须等于最后压入值"
+        );
+        assert!(count >= 2, "至少应看到 v0 与一个后续快照，实际 {count} 个");
+
         // 清理：丢 receiver，forwarder 必须经 tx.closed() 自行退出。
         drop(rx);
+        drop(tx);
         tokio::time::timeout(std::time::Duration::from_secs(2), fwd)
             .await
             .expect("forwarder 应在 receiver 丢弃后退出")
