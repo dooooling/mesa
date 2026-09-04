@@ -11,10 +11,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mesa_core_types::{ConnectionState as CoreState, DataBatch};
+use mesa_core_types::{ConnectionState as CoreState, DataBatch, EventBatch};
 use mesa_driver_protocol::{
-    ProtocolError, batch_from_pb, connection_state_from_pb, negotiate, pb, read_envelope,
-    write_envelope,
+    EVENT_PLANE_MIN_MINOR, ProtocolError, batch_from_pb, connection_state_from_pb,
+    event_batch_from_pb, negotiate, pb, read_envelope, write_envelope,
 };
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
@@ -57,6 +57,10 @@ impl Default for HeartbeatParams {
 /// 上行事件容量。控制类事件不允许静默丢弃，消费端必须活跃；
 /// 容量仅作瞬时洪峰缓冲，溢出计入诊断计数。
 pub const EVENT_CAPACITY: usize = 1024;
+/// 事件批次通道容量（Event Plane V1 §12）：与 Driver SDK 侧 EVENT_CAPACITY(128)
+/// 对等。事件流是独立可靠流——满队列意味着消费端已死，reader 按 fail-closed
+/// 关闭整条事件流（见 [`Session::event_stream_failed`]），绝不静默丢弃。
+pub const EVENT_BATCH_CAPACITY: usize = 128;
 
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
@@ -94,6 +98,11 @@ pub enum SessionError {
         code: String,
         message: String,
     },
+    /// Event Plane 不可用：非空 EventTask 要求协商 Minor >= EVENT_PLANE_MIN_MINOR，
+    /// 老 Driver 直接精确失败（`EVENT_PLANE_UNSUPPORTED` 语义），禁止发未知 RPC
+    /// 干等超时。调用方用 matches! 做精确路由。
+    #[error("event plane unsupported (negotiated minor {negotiated} < {required})")]
+    EventPlaneUnsupported { negotiated: u32, required: u32 },
 }
 
 struct Shared {
@@ -102,8 +111,20 @@ struct Shared {
     /// 写半部全局互斥：请求路径与心跳路径共享。
     writer: tokio::sync::Mutex<OwnedWriteHalf>,
     events_tx: mpsc::Sender<SessionEvent>,
+    /// 事件批次发送端：独立于 SessionEvent 队列的可靠流。reader 持有 Arc<Shared>
+    /// 持续写入；消费端从 [`Session::take_event_batches`] 取走接收端。
+    /// `Option` 形态是 fail-closed 的执行手段：溢出时 take() 丢弃发送端，
+    /// channel 即关闭，消费端 recv() 到 None（流终止），而不是永远阻塞。
+    event_tx: Mutex<Option<mpsc::Sender<EventBatch>>>,
     unresponsive: Arc<AtomicBool>,
     dropped_events: AtomicU64,
+    /// 事件流已死（fail-closed）：队列溢出后置位，reader 关闭 event channel，
+    /// 后续 EventBatch 全部拒绝。调用方以此触发重连，而不是继续收残缺流。
+    event_stream_dead: AtomicBool,
+    /// 因溢出被拒绝的 EventBatch 数（流已死后不再计数， incidental）。
+    event_overflow_drops: AtomicU64,
+    /// 解码失败被丢弃的 EventBatch 数（单批损坏可观测：下游 sequence gap 会如实反映）。
+    event_decode_errors: AtomicU64,
 }
 
 impl Shared {
@@ -126,6 +147,10 @@ pub struct Session {
     /// 握手协商出的 Minor（双方较小值）。Probe RPC 要求 >= 2，
     /// 旧 Driver 直接返回 Unsupported，不发 RPC 干等超时。
     negotiated_minor: u32,
+    /// 事件批次接收端：connect 时创建、随 Session 持有，消费端通过
+    /// [`Session::take_event_batches`] 一次性取走。connect 三元组签名不变，
+    /// 老调用方（endpoint/tests）零改动；PR7 EventIngress 再正式消费。
+    event_rx: Option<mpsc::Receiver<EventBatch>>,
 }
 
 /// 驱动启动窗口：从 spawn 到 listen 的容忍期（§14，Probe 外层需更大 budget）
@@ -240,13 +265,18 @@ impl Session {
         );
 
         let (events_tx, events_rx) = mpsc::channel(EVENT_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel(EVENT_BATCH_CAPACITY);
         let unresponsive_flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
             writer: tokio::sync::Mutex::new(wr),
             events_tx,
+            event_tx: Mutex::new(Some(event_tx)),
             unresponsive: Arc::clone(&unresponsive_flag),
             dropped_events: AtomicU64::new(0),
+            event_stream_dead: AtomicBool::new(false),
+            event_overflow_drops: AtomicU64::new(0),
+            event_decode_errors: AtomicU64::new(0),
         });
 
         // ---- reader：分发响应 + 上行事件；断开时关闭事件通道通知运行时 ----
@@ -297,6 +327,7 @@ impl Session {
                 next_msg_id: AtomicU64::new(100),
                 reader_cancel,
                 negotiated_minor,
+                event_rx: Some(event_rx),
             },
             events_rx,
             unresponsive_flag,
@@ -314,6 +345,81 @@ impl Session {
 
     pub fn is_unresponsive(&self) -> bool {
         self.shared.unresponsive.load(Ordering::Relaxed)
+    }
+
+    /// 取走事件批次接收端（一次性；重复调用返回 None）。
+    /// PR6 的 E2E Gate（contract test）与 PR7 的 EventIngress 由此消费 EventBatch 流。
+    pub fn take_event_batches(&mut self) -> Option<mpsc::Receiver<EventBatch>> {
+        self.event_rx.take()
+    }
+
+    /// 事件流是否已死（fail-closed）：队列溢出后 reader 关闭 channel 并置位。
+    /// 为 true 时消费端必须丢弃残缺流并触发重连，禁止继续用 sequence gate
+    /// "假装"流还完整——溢出丢了多少条不可观测，gap 计数已失去意义。
+    pub fn event_stream_failed(&self) -> bool {
+        self.shared.event_stream_dead.load(Ordering::Relaxed)
+    }
+
+    /// 因溢出被拒绝的 EventBatch 数（诊断用）。
+    pub fn event_overflow_drops(&self) -> u64 {
+        self.shared.event_overflow_drops.load(Ordering::Relaxed)
+    }
+
+    /// 解码失败被丢弃的 EventBatch 数（诊断用；下游 sequence gap 如实反映缺失）。
+    pub fn event_decode_errors(&self) -> u64 {
+        self.shared.event_decode_errors.load(Ordering::Relaxed)
+    }
+
+    /// 事件任务配置（Event Plane V1 §6 / PR6 Core 侧）：
+    /// - 空任务：不发 RPC，直接成功（老 Driver/无事件连接零成本）；
+    /// - 非空 + 协商 Minor < EVENT_PLANE_MIN_MINOR：立即 `EventPlaneUnsupported`，
+    ///   禁止发未知 RPC 干等超时；
+    /// - 非空 + Minor 达标：发 ConfigureEventTasks(42)，按 EventConfigApplied(43)
+    ///   的 result 判定（失败转精确的 `SessionError::Driver`）。
+    pub async fn configure_events(
+        &self,
+        connection_handle: u32,
+        revision: u64,
+        tasks: &[mesa_core_types::EventTask],
+    ) -> Result<(), SessionError> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        if self.negotiated_minor < EVENT_PLANE_MIN_MINOR {
+            return Err(SessionError::EventPlaneUnsupported {
+                negotiated: self.negotiated_minor,
+                required: EVENT_PLANE_MIN_MINOR,
+            });
+        }
+        let tasks_pb = tasks
+            .iter()
+            .map(mesa_driver_protocol::event_task_to_pb)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| SessionError::Handshake(e.to_string()))?;
+        let reply = self
+            .call(pb::envelope::Body::ConfigureEventTasks(
+                pb::ConfigureEventTasks {
+                    connection_handle,
+                    revision,
+                    tasks: tasks_pb,
+                },
+            ))
+            .await?;
+        match reply.body {
+            Some(pb::envelope::Body::EventConfigApplied(resp)) => match resp.result {
+                Some(r) if r.ok => Ok(()),
+                Some(r) => {
+                    let d = r.error.unwrap_or_default();
+                    Err(SessionError::Driver {
+                        kind: d.kind,
+                        code: d.code,
+                        message: d.message,
+                    })
+                }
+                None => Err(SessionError::Closed),
+            },
+            _ => Err(SessionError::Closed),
+        }
     }
 
     // ---- 协议化请求封装 ----
@@ -615,6 +721,48 @@ async fn reader_loop(mut rd: OwnedReadHalf, shared: Arc<Shared>, cancel: Cancell
             }
             continue;
         }
+        // 1.5) 事件批次走独立可靠流（Event Plane V1 §12）：绝不进入 SessionEvent
+        // 队列——该队列满时 try_send 丢弃的语义对事件不可接受。
+        if let Some(Body::EventBatch(b)) = env.body {
+            // 流已死后拒绝一切后续批次（channel 已关闭，try_send 必败；此处
+            // 短路避免无意义的解码开销）
+            if shared.event_stream_dead.load(Ordering::Relaxed) {
+                continue;
+            }
+            match event_batch_from_pb(b) {
+                Ok(batch) => {
+                    let mut guard = shared.event_tx.lock().unwrap();
+                    match guard.as_ref().map(|tx| tx.try_send(batch)) {
+                        // 流已死（发送端已 take）：拒绝后续批次
+                        None => {}
+                        Some(Ok(())) => {}
+                        Some(Err(mpsc::error::TrySendError::Full(_))) => {
+                            // fail-closed：满队列 = 消费端已死。丢了多少条不可观测，
+                            // sequence gap 已失去意义——丢弃发送端关闭整条流并置位，
+                            // 消费端 recv() 到 None 后触发重连。
+                            // NOTE: Closed 同样视为流终止（消费端主动 drop 接收端）。
+                            shared.event_overflow_drops.fetch_add(1, Ordering::Relaxed);
+                            shared.event_stream_dead.store(true, Ordering::Relaxed);
+                            *guard = None;
+                            tracing::error!(
+                                "event batch queue overflow: stream terminated (fail-closed)"
+                            );
+                        }
+                        Some(Err(mpsc::error::TrySendError::Closed(_))) => {
+                            shared.event_stream_dead.store(true, Ordering::Relaxed);
+                            *guard = None;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // 单批损坏：丢弃该批并计数，下游 sequence gap 如实反映缺失
+                    // （与溢出不同：丢了哪一批是可观测的，流完整性仍可判定）。
+                    shared.event_decode_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(error = %e, "event batch decode failed, batch dropped");
+                }
+            }
+            continue;
+        }
         // 2) 其余帧转为上行事件
         let ev =
             match env.body {
@@ -658,5 +806,197 @@ async fn reader_loop(mut rd: OwnedReadHalf, shared: Arc<Shared>, cancel: Cancell
 impl Drop for Session {
     fn drop(&mut self) {
         self.reader_cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回环 Session：真实 TCP 对（满足 writer 的 OwnedWriteHalf 类型），
+    /// reader/hb 不启动——只测 configure_events 的门控与编解码，不测网络。
+    struct Loopback {
+        session: Session,
+        // 存活守卫：server 端 socket + 通道接收端 + reader 取消令牌，测试结束才释放
+        _server: Option<tokio::net::TcpStream>,
+        _events_rx: mpsc::Receiver<SessionEvent>,
+        _event_rx: mpsc::Receiver<EventBatch>,
+        _reader_cancel: CancellationToken,
+    }
+
+    impl Loopback {
+        async fn new(negotiated_minor: u32) -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+            let cli = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let server = accept.await.unwrap();
+            let (rd, wr) = cli.into_split();
+            let (events_tx, events_rx) = mpsc::channel(EVENT_CAPACITY);
+            let (event_tx, event_rx) = mpsc::channel(EVENT_BATCH_CAPACITY);
+            let shared = Arc::new(Shared {
+                pending: Mutex::new(HashMap::new()),
+                writer: tokio::sync::Mutex::new(wr),
+                events_tx,
+                event_tx: Mutex::new(Some(event_tx)),
+                unresponsive: Arc::new(AtomicBool::new(false)),
+                dropped_events: AtomicU64::new(0),
+                event_stream_dead: AtomicBool::new(false),
+                event_overflow_drops: AtomicU64::new(0),
+                event_decode_errors: AtomicU64::new(0),
+            });
+            // call() 的响应分发依赖 reader_loop——回环测试也必须启动它
+            let reader_cancel = CancellationToken::new();
+            tokio::spawn(reader_loop(rd, Arc::clone(&shared), reader_cancel.clone()));
+            let session = Session {
+                port,
+                shared,
+                next_msg_id: AtomicU64::new(100),
+                reader_cancel: reader_cancel.clone(),
+                negotiated_minor,
+                event_rx: None,
+            };
+            Self {
+                session,
+                _server: Some(server),
+                _events_rx: events_rx,
+                _event_rx: event_rx,
+                _reader_cancel: reader_cancel,
+            }
+        }
+
+        fn task(id: &str) -> mesa_core_types::EventTask {
+            mesa_core_types::EventTask {
+                id: id.into(),
+                mode: mesa_core_types::TaskMode::Subscribe,
+                interval_ms: None,
+                binding: mesa_core_types::DriverBinding {
+                    kind: "k".into(),
+                    config: serde_json::Value::Null,
+                },
+            }
+        }
+    }
+
+    /// 空任务不发 RPC：server 端无任何读取也不会超时，直接成功。
+    #[tokio::test]
+    async fn configure_events_empty_tasks_needs_no_rpc() {
+        let lb = Loopback::new(2).await;
+        lb.session
+            .configure_events(7, 1, &[])
+            .await
+            .expect("empty tasks must succeed without RPC");
+    }
+
+    /// Minor Gate：协商 Minor < 3 + 非空任务 → 立即精确失败，不发 RPC。
+    #[tokio::test]
+    async fn configure_events_minor_gate_rejects_before_io() {
+        let lb = Loopback::new(2).await;
+        let err = lb
+            .session
+            .configure_events(7, 1, &[Loopback::task("e1")])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SessionError::EventPlaneUnsupported {
+                    negotiated: 2,
+                    required: 3
+                }
+            ),
+            "must fail fast with precise variant, got {err}"
+        );
+    }
+
+    /// Minor 达标 + server 回 EventConfigApplied(ok) → 成功全路径。
+    #[tokio::test]
+    async fn configure_events_roundtrip_success() {
+        let mut lb = Loopback::new(3).await;
+        // server 桩：读一帧 ConfigureEventTasks，回同 msg_id 的 EventConfigApplied
+        let server = lb._server.take().unwrap();
+        let (mut srd, mut swr) = server.into_split();
+        let stub = tokio::spawn(async move {
+            let req = read_envelope(&mut srd).await.unwrap();
+            let (handle, revision) = match req.body {
+                Some(pb::envelope::Body::ConfigureEventTasks(c)) => {
+                    (c.connection_handle, c.revision)
+                }
+                other => panic!("expected ConfigureEventTasks, got {other:?}"),
+            };
+            write_envelope(
+                &mut swr,
+                &pb::Envelope {
+                    msg_id: req.msg_id,
+                    body: Some(pb::envelope::Body::EventConfigApplied(
+                        pb::EventConfigApplied {
+                            connection_handle: handle,
+                            revision,
+                            result: Some(pb::GenericResult {
+                                ok: true,
+                                error: None,
+                            }),
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        });
+        lb.session
+            .configure_events(7, 9, &[Loopback::task("e1")])
+            .await
+            .expect("minor-3 roundtrip must succeed");
+        stub.await.unwrap();
+    }
+
+    /// server 回失败 result → 精确的 SessionError::Driver（kind/code 可路由）。
+    #[tokio::test]
+    async fn configure_events_driver_rejection_is_precise() {
+        let mut lb = Loopback::new(3).await;
+        let server = lb._server.take().unwrap();
+        let (mut srd, mut swr) = server.into_split();
+        let stub = tokio::spawn(async move {
+            let req = read_envelope(&mut srd).await.unwrap();
+            write_envelope(
+                &mut swr,
+                &pb::Envelope {
+                    msg_id: req.msg_id,
+                    body: Some(pb::envelope::Body::EventConfigApplied(
+                        pb::EventConfigApplied {
+                            connection_handle: 7,
+                            revision: 9,
+                            result: Some(pb::GenericResult {
+                                ok: false,
+                                error: Some(pb::ErrorDetail {
+                                    kind: "Unsupported".into(),
+                                    code: "EVENT_NOT_SUPPORTED".into(),
+                                    message: "no".into(),
+                                }),
+                            }),
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let err = lb
+            .session
+            .configure_events(7, 9, &[Loopback::task("e1")])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SessionError::Driver { ref code, .. } if code == "EVENT_NOT_SUPPORTED"
+            ),
+            "must surface precise driver code, got {err}"
+        );
+        stub.await.unwrap();
     }
 }
