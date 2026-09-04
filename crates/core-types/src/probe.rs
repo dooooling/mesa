@@ -85,15 +85,43 @@ impl ProbeReport {
     }
 
     /// 最小合法性校验（大小/UTF-8 由调用方在 IPC 边界保证）。
+    ///
+    /// P2 语义冻结（Driver→Core 契约，`Session::probe` 接收边界执行）：
+    /// - capability id 唯一：同一 ID 双态是语义冲突，直接拒收；
+    /// - unreachable 规范形态：身份全 None、无 capabilities、至少一个 warning
+    ///   道明原因（自相矛盾的报告拒收，不靠上层个案兜底）。
     pub fn validate(&self) -> Result<(), String> {
-        for c in &self.capabilities {
-            if c.id.trim().is_empty() {
-                return Err("capability id 不能为空".into());
+        {
+            use std::collections::HashSet;
+            let mut seen = HashSet::new();
+            for c in &self.capabilities {
+                if c.id.trim().is_empty() {
+                    return Err("capability id 不能为空".into());
+                }
+                if !seen.insert(c.id.as_str()) {
+                    return Err(format!("capability id 重复: {}", c.id));
+                }
             }
         }
         for w in &self.warnings {
             if w.code.trim().is_empty() {
                 return Err("probe warning code 不能为空".into());
+            }
+        }
+        if !self.reachable {
+            if self.vendor.is_some()
+                || self.family.is_some()
+                || self.model.is_some()
+                || self.firmware.is_some()
+                || self.model_confidence.is_some()
+            {
+                return Err("unreachable 报告不得携带设备身份".into());
+            }
+            if !self.capabilities.is_empty() {
+                return Err("unreachable 报告不得携带 capabilities".into());
+            }
+            if self.warnings.is_empty() {
+                return Err("unreachable 报告必须至少一个 warning 道明原因".into());
             }
         }
         Ok(())
@@ -226,6 +254,53 @@ mod tests {
         assert!(r.validate().is_err());
         r.capabilities.clear();
         r.warnings[0].code = String::new();
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn duplicate_capability_id_rejected() {
+        // P2：同一 ID 双态是语义冲突，fail-closed。
+        let r = ProbeReport::unreachable("C", "m");
+        let ok_report = ProbeReport {
+            reachable: true,
+            vendor: None,
+            family: None,
+            model: None,
+            firmware: None,
+            model_confidence: None,
+            capabilities: vec![
+                CapabilityItem {
+                    id: "read".into(),
+                    state: CapabilityState::Available,
+                    detail: None,
+                },
+                CapabilityItem {
+                    id: "read".into(),
+                    state: CapabilityState::NotPresent,
+                    detail: None,
+                },
+            ],
+            warnings: vec![],
+        };
+        assert!(ok_report.validate().is_err());
+        assert!(r.validate().is_ok());
+    }
+
+    #[test]
+    fn unreachable_canonical_form_enforced() {
+        // P2：unreachable 自带身份/capabilities/无 warning 一律拒收。
+        let mut r = ProbeReport::unreachable("C", "m");
+        r.vendor = Some("Siemens".into());
+        assert!(r.validate().is_err());
+        let mut r = ProbeReport::unreachable("C", "m");
+        r.capabilities.push(CapabilityItem {
+            id: "read".into(),
+            state: CapabilityState::Available,
+            detail: None,
+        });
+        assert!(r.validate().is_err());
+        let mut r = ProbeReport::unreachable("C", "m");
+        r.warnings.clear();
         assert!(r.validate().is_err());
     }
 }

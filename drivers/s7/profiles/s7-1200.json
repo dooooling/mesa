@@ -8,7 +8,8 @@
   "driver_id": "s7",
   "match_rules": [
     { "field": "driver_id", "op": "eq", "value": "s7" },
-    { "field": "probe.vendor", "op": "eq", "value": "Siemens" }
+    { "field": "probe.vendor", "op": "eq", "value": "Siemens" },
+    { "field": "probe.family", "op": "eq", "value": "S7-1200" }
   ],
   "connection_defaults": { "port": 102, "rack": 0, "slot": 1, "timeout_ms": 3000 },
   "rate_classes": { "realtime": 100, "normal": 1000, "slow": 10000 },
