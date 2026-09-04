@@ -319,6 +319,8 @@ impl DriverConnection for S7Connection {
     /// - 建连失败 → Ok(unreachable)（设备不可达是探测结果）；
     /// - SZL 失败或解析失败 → reachable + IDENTITY_UNAVAILABLE（绝不猜型号，
     ///   更不从端口号反推，见 §8.5）。
+    /// NOTE: s7-1200 Profile 要求 probe.vendor==Siemens 才提示；family 级
+    /// 1200/1500 区分需正式 MLFB 映射依据，确认前一律不做（宁缺毋滥）。
     /// 配置已在 OpenConnection 校验；短连接随函数返回 drop，不进入采集计划。
     async fn probe(&mut self) -> Result<ProbeReport, SdkDriverError> {
         let cfg = self.cfg.clone();
@@ -327,8 +329,8 @@ impl DriverConnection for S7Connection {
             Err(e) => return Ok(ProbeReport::unreachable("CONNECTION_FAILED", e.to_string())),
         };
         // P1-1：read 是否 Available 以本次 SZL 实测为准；失败即 Unknown，
-        // 绝不拿静态能力冒充实测结论。失败原因同时进 capability detail
-        // 与 IDENTITY_UNAVAILABLE warning（全局身份事实 + 局部实测证据）。
+        // 绝不拿静态能力冒充实测结论。失败原因只写 capability detail（局部），
+        // warning 只写全局后果（P0-1 不重复规则：同一问题禁止两处复述）。
         let (vendor, model, read_state, read_note) = match client.read_szl(0x0011, 1).await {
             Ok(payload) => match parse_szl_module_id(&payload, 0x0011, 1) {
                 Some(mlfb) => {
@@ -349,15 +351,14 @@ impl DriverConnection for S7Connection {
                 Some(format!("SZL 0x0011 读取失败: {e}")),
             ),
         };
-        let warnings = read_note
-            .clone()
-            .map(|message| {
-                vec![ProbeWarning {
-                    code: "IDENTITY_UNAVAILABLE".into(),
-                    message,
-                }]
-            })
-            .unwrap_or_default();
+        let warnings = if read_note.is_some() {
+            vec![ProbeWarning {
+                code: "IDENTITY_UNAVAILABLE".into(),
+                message: "设备身份（vendor/model）未能识别，profile 提示可能缺失".into(),
+            }]
+        } else {
+            Vec::new()
+        };
         Ok(ProbeReport {
             reachable: true,
             vendor,

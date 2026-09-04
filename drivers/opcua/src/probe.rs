@@ -64,26 +64,20 @@ fn capability_state_from_ua_error(e: &UaTransportError) -> CapabilityState {
 async fn probe_connected(transport: &dyn OpcUaTransport) -> ProbeReport {
     let mut warnings = Vec::new();
 
-    // 1. NamespaceArray：全局环境事实。失败时 capability 取错误映射状态
-    //（通常 Unknown），并追加 NAMESPACE_PARTIAL（影响身份解析的全局事项）。
-    let (read_state, read_detail) = match transport.read_namespace_array().await {
-        Ok(_) => (CapabilityState::Available, None),
-        Err(e) => {
-            warnings.push(ProbeWarning {
-                code: "NAMESPACE_PARTIAL".into(),
-                message: format!("NamespaceArray 读取失败: {e}"),
-            });
-            (
-                capability_state_from_ua_error(&e),
-                Some(format!("NamespaceArray 读取失败: {e}")),
-            )
-        }
-    };
+    // 1. NamespaceArray：全局环境事实。失败追加 NAMESPACE_PARTIAL
+    //（影响身份解析的全局事项）；read 定级延后到第 2 步做证据合并。
+    let ns_outcome = transport.read_namespace_array().await;
+    if let Err(e) = &ns_outcome {
+        warnings.push(ProbeWarning {
+            code: "NAMESPACE_PARTIAL".into(),
+            message: format!("NamespaceArray 读取失败: {e}"),
+        });
+    }
 
     // 2. 标准 BuildInfo 身份（逐点 BAD 容忍：单点缺失只影响对应字段）。
     // 同一缺失只报一次：整包失败报 IDENTITY_UNAVAILABLE；读成功但无身份
     // 报 MODEL_UNDETECTED（P0-1 不重复规则）。
-    let (vendor, model, firmware) = match transport
+    let (vendor, model, firmware, buildinfo_read_ok) = match transport
         .read(
             &IDENT_NODES
                 .iter()
@@ -101,15 +95,26 @@ async fn probe_connected(transport: &dyn OpcUaTransport) -> ProbeReport {
                     message: "标准 BuildInfo 无可用身份信息".into(),
                 });
             }
-            (v, m, f)
+            (v, m, f, true)
         }
         Err(e) => {
             warnings.push(ProbeWarning {
                 code: "IDENTITY_UNAVAILABLE".into(),
                 message: format!("BuildInfo 读取失败: {e}"),
             });
-            (None, None, None)
+            (None, None, None, false)
         }
+    };
+
+    // read 证据合并：NamespaceArray 与 BuildInfo 任一 Read 成功即证明
+    // Read 服务可用 → Available；双败才按 NamespaceArray 错误定级
+    //（BuildInfo 整包失败的局部原因已在 IDENTITY_UNAVAILABLE 里）。
+    let (read_state, read_detail) = match (&ns_outcome, buildinfo_read_ok) {
+        (Ok(_), _) | (_, true) => (CapabilityState::Available, None),
+        (Err(e), false) => (
+            capability_state_from_ua_error(e),
+            Some(format!("NamespaceArray 读取失败: {e}")),
+        ),
     };
 
     // 3. Objects 浅浏览确认 browse 能力（单页即可，不翻页）。
@@ -230,6 +235,28 @@ mod tests {
             cap(&r, "read").state,
             mesa_core_types::CapabilityState::Available
         );
+    }
+
+    #[tokio::test]
+    async fn namespace_failure_with_buildinfo_success_still_available() {
+        // read 证据合并：NamespaceArray 失败但 BuildInfo 读成功 → Read 服务
+        // 已被证实可用，read 必须 Available（不是 Unknown）；NAMESPACE_PARTIAL
+        // 照报（全局事项），但 read.detail 不复述（P0-1 不重复规则）。
+        use mesa_opcua_transport::{UaOperation, UaTransportError};
+        let t = ident_fake().with_namespace_array_error(UaTransportError::service(
+            UaOperation::ReadNamespaceArray,
+            Some(StatusCode::BadTimeout),
+            true,
+            "ns boom",
+        ));
+        let r = probe_with_transport(&t).await.expect("Ok");
+        assert!(r.reachable);
+        assert_eq!(
+            cap(&r, "read").state,
+            mesa_core_types::CapabilityState::Available
+        );
+        assert!(cap(&r, "read").detail.is_none());
+        assert!(r.warnings.iter().any(|w| w.code == "NAMESPACE_PARTIAL"));
     }
 
     #[tokio::test]

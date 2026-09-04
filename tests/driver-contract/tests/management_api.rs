@@ -167,8 +167,10 @@ async fn probe_invalid_driver_config_is_400_with_driver_code() {
         r#"{"connection":{"host":"127.0.0.1","port":99999}}"#,
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(v["error"]["code"], "BAD_CONFIG");
+    // 诊断要求：503 偶发（P1-A 端口竞态）时必须留下 response body，
+    // 否则无法区分 Handshake/Spawn/Rpc 三类失败（exact-SHA CI 教训）。
+    assert_eq!(status, StatusCode::BAD_REQUEST, "probe body: {v}");
+    assert_eq!(v["error"]["code"], "BAD_CONFIG", "probe body: {v}");
 }
 
 /// 设备不可达是 200 + reachable:false（不是 5xx）：s7 连关闭端口。
@@ -183,11 +185,12 @@ async fn probe_s7_closed_port_is_unreachable_200() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["reachable"], false);
-    // driver_id 规则仍满足，驱动级 hint 照常给出（无 probe 事实可证伪它）
+    // P1-B：没探测到 ≠ 猜型号——unreachable 时 hints 必须为空，
+    // 禁止仅凭 driver_id 断言具体硬件型号（s7-1200/1214C）。
     let hints = v["profile_hints"].as_array().unwrap();
     assert!(
-        hints.iter().any(|h| h["profile_id"] == "s7-1200"),
-        "实际: {hints:?}"
+        hints.is_empty(),
+        "unreachable 不得提示具体型号，实际: {hints:?}"
     );
     let warnings = v["warnings"].as_array().unwrap();
     assert_eq!(warnings.len(), 1);

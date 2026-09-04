@@ -92,8 +92,14 @@ impl MesaManager {
                 Err(_) => return Err(ProbeError::Timeout),
             };
         // facts→profile 解释权只在 Core：用本机加载的 profiles 做确定性匹配。
+        // 没探测到 ≠ 猜型号：unreachable 时 probe.* 全空，driver_id-only 规则
+        // 会误命中具体硬件型号（如 s7-1200/1214C），此时 hints 必须为空（P1-B）。
         let profiles = self.profiles.read().unwrap();
-        let profile_hints = match_profiles(driver_id, &report, &profiles);
+        let profile_hints = if report.reachable {
+            match_profiles(driver_id, &report, &profiles)
+        } else {
+            Vec::new()
+        };
         Ok(ProbeResult {
             report,
             profile_hints,

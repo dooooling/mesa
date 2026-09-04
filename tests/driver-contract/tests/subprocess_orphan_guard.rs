@@ -55,6 +55,54 @@ async fn orphan_guard_wrong_token_rejected() {
     p.terminate().await;
 }
 
+/// P1-A 并发 spawn：8 个 simulator 并发启动 → 端口/token 全不相同 →
+/// 每个 handshake 成功 → 全部 terminate 后无残留。
+/// 无 PortLease 时裸 free_port 高概率撞号（后 bind 失败，或连错进程
+/// 触发 token mismatch → 偶发 503）；本测试失败 = 租约被旁路或破坏。
+#[tokio::test]
+async fn concurrent_spawn_gets_unique_ports_tokens_and_no_orphan() {
+    const N: usize = 8;
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..N {
+        set.spawn(async move {
+            let mut p = mesa_driver_manager::process::DriverProcess::spawn(&sim_discovered())
+                .await
+                .expect("concurrent spawn");
+            let (port, pid, token) = (p.port, p.pid, p.token.clone());
+            // handshake 必须成功：连错进程会被 token mismatch fail-closed 拒绝
+            let (mut session, _events, _) = Session::connect_retry(port, &token)
+                .await
+                .expect("concurrent handshake");
+            session.invalidate();
+            p.terminate().await;
+            (port, pid, token)
+        });
+    }
+    let mut ports = HashSet::new();
+    let mut tokens = HashSet::new();
+    let mut pids = Vec::new();
+    while let Some(r) = set.join_next().await {
+        let (port, pid, token) = r.expect("spawn task panicked");
+        ports.insert(port);
+        tokens.insert(token);
+        pids.push(pid);
+    }
+    assert_eq!(ports.len(), N, "并发 spawn 端口必须全不相同");
+    assert_eq!(tokens.len(), N, "session token 必须全不相同");
+    // terminate 内部已 wait；有界轮询确认内核侧全部消失（防 zombie 误判）
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        pids.retain(|pid| is_pid_alive(*pid));
+        if pids.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("并发 spawn 残留子进程 pids={pids:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// stdin EOF → child exits quickly（第一层防护）
 #[tokio::test]
 async fn orphan_guard_stdin_eof_exits_quickly() {

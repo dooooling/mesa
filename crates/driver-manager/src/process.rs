@@ -7,7 +7,9 @@
 //! - Windows 上所有子进程加入启用 `KILL_ON_JOB_CLOSE` 的 Job Object
 //!   （孤儿防护第二层）；Linux 对应 PR_SET_PDEATHSIG 由 Driver 自己设置。
 
+use std::collections::HashSet;
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
@@ -42,6 +44,9 @@ pub struct DriverProcess {
     #[allow(dead_code)]
     stdin: Option<ChildStdin>,
     _job: job::JobAttachment,
+    /// 端口租约：与子进程生命周期绑定，drop 时释放。
+    /// 禁止移除——移除即重开 Core 内并发 spawn 抢同一端口的 TOCTOU（P1-A）。
+    _port_lease: PortLease,
 }
 
 impl DriverProcess {
@@ -52,7 +57,12 @@ impl DriverProcess {
             .as_ref()
             .ok_or_else(|| SpawnError::MissingBinary(disc.manifest.executable.clone()))?;
 
-        let port = free_port().ok_or(SpawnError::NoPort)?;
+        // 端口租约必须在 spawn 之前持有、随结构体释放：
+        // 同一 Core 并发 spawn 时，OS 循环复用端口号，裸 free_port 会让
+        // 两个 child 拿到同一端口（后 bind 失败，或更糟：Core 连错进程，
+        // token mismatch → Handshake 失败 → 偶发 503）。
+        let port_lease = lease_port().ok_or(SpawnError::NoPort)?;
+        let port = port_lease.port;
         let token = generate_session_token();
 
         let mut cmd = tokio::process::Command::new(exe);
@@ -92,6 +102,7 @@ impl DriverProcess {
             child,
             stdin: Some(stdin),
             _job: job,
+            _port_lease: port_lease,
         })
     }
 
@@ -116,14 +127,46 @@ impl DriverProcess {
     }
 }
 
-/// 取一个本机回环空闲端口。存在 TOCTOU 竞口窗口，本地部署可接受；
-/// 连接重试逻辑（wait_port_open）覆盖了端口尚未就绪的时序。
-fn free_port() -> Option<u16> {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .ok()?
-        .local_addr()
-        .ok()
-        .map(|a| a.port())
+/// Core 进程内已租出的 Driver IPC 端口表（P1-A）。
+/// OS 会循环复用刚释放的端口号；并发 spawn 时裸 bind(:0)-取号-drop
+/// 必然让两个 child 撞号。租约表消除 Core 内部竞争源（生产最现实的
+/// 竞争：多 Endpoint 并发启动 / reconnect 与 Probe 并发）。
+/// 外部进程在 bind-drop-child_bind 极小窗口抢号理论仍存在，届时靠
+/// connect_retry + token mismatch fail-closed 兜底（报错，不连错设备）。
+static ACTIVE_DRIVER_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
+fn active_driver_ports() -> &'static Mutex<HashSet<u16>> {
+    ACTIVE_DRIVER_PORTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// 端口租约：持有期间该端口不会被本 Core 再次分配；
+/// 随 `DriverProcess` drop 自动释放（子进程已退出，端口可安全复用）。
+struct PortLease {
+    port: u16,
+}
+
+impl Drop for PortLease {
+    fn drop(&mut self) {
+        active_driver_ports().lock().unwrap().remove(&self.port);
+    }
+}
+
+/// 分配 IPC 端口租约：OS bind(:0) 取号 + 进程内去重（至多 64 次重试）。
+/// 锁只保护 HashSet 插查（微秒级），bind 本身在锁外，不阻塞并发 spawn。
+fn lease_port() -> Option<PortLease> {
+    for _ in 0..64 {
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .ok()?
+            .local_addr()
+            .ok()?
+            .port();
+        // NOTE: 此处 listener 已 drop，child 尚未 bind——窗口仍在，
+        // 但至少本 Core 内绝不双发同一端口（外部抢号属下一级小概率事件）。
+        if active_driver_ports().lock().unwrap().insert(port) {
+            return Some(PortLease { port });
+        }
+    }
+    None
 }
 
 /// 256-bit 随机 session token 的十六进制形式（§14.2）。
