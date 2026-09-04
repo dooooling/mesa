@@ -1,78 +1,51 @@
-# CI：单编译、锁版、多平台（Windows/Linux × x86/ARM 原生 test）
-# - 锁版：rust 1.95.0（本地 rustc 1.95.0，见 rust-toolchain.toml）、node 22.18.0、pnpm 10.28.0，actions pin 防漂移
-# - 单编译：fmt→clippy→test 复用同一 target（同 job 内顺序执行，无多编译），本次弃用跨 run 缓存以避 proto build 产物 stale（Mesa.driver.v1.rs）
-# - 多平台：Windows/Linux × x86_64/aarch64 四组合均原生 test
-# - 严格：fmt --check、clippy -D warnings、test --workspace --all-features、web build
+# CI 统一入口/调度：本文件是唯一监听 PR/push 的 workflow，
+# 实际工作下沉到 _rust-primary/_rust-native/_web（均为 workflow_call，
+# 不各自监听 pull_request）。Branch Protection 只绑定最后的 `ci-gate`，
+# 内部增删 job 不需要再改保护规则。
+#
+# 成本模型（相对旧单 matrix 四平台全量）：
+#   fmt ×1 / clippy ×1 / web ×1 / fast-perf ×1 / correctness ×4
+# 四平台正确性（build/test/IPC/子进程/孤儿）一点没少。
 name: CI
 on:
   push:
     branches: [main, master, feat/v2.1-impl]
   pull_request:
 
+# 同一 PR 新 push 自动取消旧 run（省 runner）；push main 不 cancel。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  check:
+  rust-primary:
+    uses: ./.github/workflows/_rust-primary.yml
+
+  rust-native:
     strategy:
+      # 工业跨平台：一次 run 给出完整平台分布，不为省几分钟开 fail-fast
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-          - os: ubuntu-24.04-arm
-          - os: windows-latest
-          - os: windows-11-arm
-    runs-on: ${{ matrix.os }}
+          - runs-on: ubuntu-24.04-arm
+          - runs-on: windows-latest
+          - runs-on: windows-11-arm
+    uses: ./.github/workflows/_rust-native.yml
+    with:
+      runs-on: ${{ matrix.runs-on }}
+
+  web:
+    uses: ./.github/workflows/_web.yml
+
+  # 唯一 Merge Gate：依赖全部 success 才 success。
+  ci-gate:
+    needs: [rust-primary, rust-native, web]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
-
-      - uses: pnpm/action-setup@v4.4.0
-        with:
-          version: 10.28.0
-          run_install: false
-      - uses: actions/setup-node@v5
-        with:
-          node-version: '22.18.0'
-          cache: 'pnpm'
-          cache-dependency-path: 'apps/mesa-web/pnpm-lock.yaml'
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: '1.95.0'
-          components: rustfmt, clippy
-
-      - name: install protoc (ubuntu)
-        if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: set PROTOC env (ubuntu)
-        if: startsWith(matrix.os, 'ubuntu')
-        run: echo "PROTOC=/usr/bin/protoc" >> $GITHUB_ENV
-
-      - name: debug protoc (ubuntu)
-        if: startsWith(matrix.os, 'ubuntu')
+      - name: all required jobs must succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          echo "PROTOC=$PROTOC"
-          protoc --version
-          ls -l proto/driver.proto
-          echo "CARGO_MANIFEST_DIR test"
-          ls -l crates/driver-protocol/build.rs
-
-      - name: fmt
-        run: cargo fmt --check
-
-      - name: clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
-
-      - name: build drivers
-        run: cargo build --locked --workspace
-
-      - name: test
-        run: cargo test --locked --workspace --all-features
-
-      - name: pnpm install
-        run: pnpm --dir apps/mesa-web install
-
-      - name: web build
-        run: pnpm --filter mesa-web build
-
-      - name: release validation
-        if: matrix.os == 'ubuntu-latest'
-        run: python scripts/generate-release-validation.py --validate
+          python3 -c "import json,os,sys; n=json.loads(os.environ['NEEDS_JSON']); bad={k:v.get('result') for k,v in n.items() if v.get('result')!='success'}; print(json.dumps(n,indent=1)); sys.exit('GATE FAILED: %s' % bad if bad else 'GATE OK')"
