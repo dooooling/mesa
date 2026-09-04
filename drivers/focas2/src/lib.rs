@@ -320,6 +320,14 @@ impl Driver for FocasDriver {
             SdkDriverError::configuration("BAD_CONFIG", format!("connection JSON 非法: {e}"))
         })?;
         let cfg = FocasConnConfig::from_json(&v)?;
+        let api = Self::probe_api(&v)?;
+        Self::probe_with_api(&api, &cfg).await
+    }
+}
+
+impl FocasDriver {
+    /// 按 `use_native` + `MESA_ALLOW_FAKE_NATIVE` 门禁选择后端（与 open_connection 同规则）。
+    fn probe_api(v: &serde_json::Value) -> Result<Arc<dyn FocasApiTrait>, SdkDriverError> {
         let use_native = v
             .get("use_native")
             .and_then(|x| x.as_bool())
@@ -330,11 +338,18 @@ impl Driver for FocasDriver {
                 "use_native=false 仅在测试环境 MESA_ALLOW_FAKE_NATIVE=1 时允许",
             ));
         }
-        let api: Arc<dyn FocasApiTrait> = if use_native {
-            Arc::new(NativeFocasApi::new())
+        if use_native {
+            Ok(Arc::new(NativeFocasApi::new()))
         } else {
-            Arc::new(FakeFocasApi::new())
-        };
+            Ok(Arc::new(FakeFocasApi::new()))
+        }
+    }
+
+    /// 可注入后端的探测主体（单测直传 Fake，无需碰进程级 env）。
+    async fn probe_with_api(
+        api: &Arc<dyn FocasApiTrait>,
+        cfg: &FocasConnConfig,
+    ) -> Result<ProbeReport, SdkDriverError> {
         if let Err(e) = api.connect(&cfg.host, cfg.port, cfg.timeout_ms).await {
             return Ok(ProbeReport::unreachable("CONNECTION_FAILED", e));
         }
@@ -1001,11 +1016,15 @@ mod tests {
 
     #[tokio::test]
     async fn probe_fake_returns_deterministic_identity() {
-        // Fake 身份是合同基准：FANUC / 0i-F / 固件 1.0，model 恒 None + MODEL_UNDETECTED
-        // SAFETY: 本进程内仅本测试读写该变量（其余测试直连 FakeFocasApi，不读 env）
-        unsafe { std::env::set_var("MESA_ALLOW_FAKE_NATIVE", "1") };
-        let d = FocasDriver;
-        let r = Driver::probe(&d, r#"{"host":"127.0.0.1","use_native":false}"#)
+        // Fake 身份是合同基准：FANUC / 0i-F / 固件 1.0，model 恒 None + MODEL_UNDETECTED。
+        // 直传 Fake 后端，不碰进程级 env（多线程下 set_var/remove_var 与
+        // 其它测试的 env 读竞态会导致 Linux SIGABRT）。
+        let api: Arc<dyn FocasApiTrait> = Arc::new(FakeFocasApi::new());
+        let cfg = FocasConnConfig {
+            host: "127.0.0.1".into(),
+            ..Default::default()
+        };
+        let r = FocasDriver::probe_with_api(&api, &cfg)
             .await
             .expect("Fake probe 必须 Ok");
         assert!(r.reachable);
@@ -1015,7 +1034,6 @@ mod tests {
         assert!(r.model.is_none());
         assert!(r.warnings.iter().any(|w| w.code == "MODEL_UNDETECTED"));
         assert_eq!(r.capabilities.read, Some(true));
-        unsafe { std::env::remove_var("MESA_ALLOW_FAKE_NATIVE") };
     }
 
     #[tokio::test]
