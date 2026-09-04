@@ -15,6 +15,7 @@ use mesa_driver_protocol::PROBE_RPC_MIN_MINOR;
 
 use crate::manager::MesaManager;
 use crate::process::DriverProcess;
+use crate::profile::{ProfileMatch, match_profiles};
 use crate::session::{PROBE_TIMEOUT, Session, SessionError};
 
 /// 探测基础设施失败（注意：设备不可达不是 Err，是 `Ok(ProbeReport)`）。
@@ -40,21 +41,38 @@ pub enum ProbeError {
     Timeout,
 }
 
+/// 探测结果：设备事实 + Core 侧确定性 profile 提示（Driver 不参与匹配）。
+#[derive(Debug)]
+pub struct ProbeResult {
+    pub report: ProbeReport,
+    pub profile_hints: Vec<ProfileMatch>,
+}
+
 impl MesaManager {
-    /// 动态探测：返回设备事实报告。临时进程生命周期与本调用严格绑定。
+    /// 动态探测：返回设备事实报告 + profile 提示。临时进程生命周期与本调用严格绑定。
     pub async fn probe(
         &self,
         driver_id: &str,
         connection_json: &str,
-    ) -> Result<ProbeReport, ProbeError> {
+    ) -> Result<ProbeResult, ProbeError> {
         let disc = self
             .find_driver(driver_id)
             .ok_or_else(|| ProbeError::DriverNotFound(driver_id.to_string()))?;
         // 总 deadline 包住全部阶段；内层各步另有独立超时，互不打架。
-        match tokio::time::timeout(PROBE_TIMEOUT, Self::probe_inner(disc, connection_json)).await {
-            Ok(r) => r,
-            Err(_) => Err(ProbeError::Timeout),
-        }
+        let report =
+            match tokio::time::timeout(PROBE_TIMEOUT, Self::probe_inner(disc, connection_json))
+                .await
+            {
+                Ok(r) => r?,
+                Err(_) => return Err(ProbeError::Timeout),
+            };
+        // facts→profile 解释权只在 Core：用本机加载的 profiles 做确定性匹配。
+        let profiles = self.profiles.read().unwrap();
+        let profile_hints = match_profiles(driver_id, &report, &profiles);
+        Ok(ProbeResult {
+            report,
+            profile_hints,
+        })
     }
 
     async fn probe_inner(
