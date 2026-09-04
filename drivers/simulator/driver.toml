@@ -4,5 +4,5 @@ name = "Mesa Simulator"
 version = "0.1.0"
 executable = "Mesa-driver-simulator"
 protocol_major = 1
-protocol_minor = 1
+protocol_minor = 2
 sdk = "rust"

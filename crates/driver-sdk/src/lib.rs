@@ -118,6 +118,21 @@ pub trait Driver: Send + Sync + 'static {
         endpoint_id: &str,
         config_json: &str,
     ) -> Result<Box<dyn DriverConnection>, SdkDriverError>;
+
+    /// 动态探测（§8）：给一份连接配置，临时检查设备并返回事实报告。
+    /// 语义是纯查询——不得隐式走 OpenConnection/Configure/ApplyPointMap/Start；
+    /// 为探测建立的短生命周期协议连接是 Driver 内部实现细节，返回前必须收干净。
+    /// 默认实现返回 Unsupported（不要用 open_connection 冒充 dynamic probe）。
+    async fn probe(
+        &self,
+        _connection_json: &str,
+    ) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
+        Err(SdkDriverError::new(
+            mesa_core_types::ErrorKind::Unsupported,
+            "PROBE_UNSUPPORTED",
+            "该 Driver 未实现动态探测",
+        ))
+    }
 }
 
 /// 单个 Connection 的生命周期控制。
@@ -804,6 +819,7 @@ async fn request_loop(
             Some(pb::envelope::Body::BrowseRequest(req)) => {
                 on_browse(session, req, env.msg_id).await
             }
+            Some(pb::envelope::Body::ProbeRequest(req)) => on_probe(session, req, env.msg_id).await,
             Some(pb::envelope::Body::WriteRequest(req)) => on_write(session, req, env.msg_id).await,
             Some(pb::envelope::Body::CommandRequest(req)) => {
                 on_command(session, req, env.msg_id).await
@@ -1170,6 +1186,48 @@ async fn on_close(session: &Session, req: pb::CloseConnection, msg_id: u64) {
             )),
         })
         .await;
+}
+
+/// 动态探测（§8）：调用 `Driver::probe()` 并以 JSON framing 回应。
+/// 成功 → `ProbeResponse{report_json}`（64 KiB 上限内，发送前二次检查）；
+/// 失败 → 同 msg_id 的 `DriverErrorReport`（复用等待路由，kind/code 保留）。
+async fn on_probe(session: &Session, req: pb::ProbeRequest, msg_id: u64) {
+    match session.driver.probe(&req.connection_json).await {
+        Ok(report) => {
+            let body = match report.to_report_json() {
+                Ok(json) => {
+                    pb::envelope::Body::ProbeResponse(pb::ProbeResponse { report_json: json })
+                }
+                Err(e) => pb::envelope::Body::DriverError(pb::DriverErrorReport {
+                    connection_handle: None,
+                    detail: Some(error_detail(
+                        mesa_core_types::ErrorKind::Internal,
+                        "PROBE_SERIALIZE_FAILED",
+                        e,
+                    )),
+                }),
+            };
+            session
+                .sink
+                .send_control(pb::Envelope {
+                    msg_id,
+                    body: Some(body),
+                })
+                .await;
+        }
+        Err(err) => {
+            session
+                .sink
+                .send_control(pb::Envelope {
+                    msg_id,
+                    body: Some(pb::envelope::Body::DriverError(pb::DriverErrorReport {
+                        connection_handle: None,
+                        detail: Some(error_detail(err.kind, &err.code, err.message)),
+                    })),
+                })
+                .await;
+        }
+    }
 }
 
 async fn on_browse(session: &Session, req: pb::BrowseRequest, msg_id: u64) {

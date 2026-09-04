@@ -5,9 +5,10 @@
 // Major 不一致时握手直接拒绝（IncompatibleProtocol）。
 //
 // 方向约定：
-//   - Hello/PointDescriptorsReport/DataBatchMsg/ConnectionStateChanged/DriverErrorReport/Pong 由 Driver 发出
+//   - Hello/PointDescriptorsReport/DataBatchMsg/ConnectionStateChanged/DriverErrorReport/Pong/ProbeResponse 由 Driver 发出
 //   - 其余控制消息由 Core 发出
 //   - *Ack 为对应请求的响应，GenericResult.ok=false 时 error 必填
+//   - ProbeRequest 失败时 Driver 以同 msg_id 的 DriverErrorReport 回应（复用等待路由）
 
 syntax = "proto3";
 
@@ -60,6 +61,11 @@ message Envelope {
     WriteResponse write_response = 37;
     CommandRequest command_request = 38;
     CommandResponse command_response = 39;
+
+    // Management Plane: Dynamic Probe（§8）低频 JSON framing。
+    // Proto 只传契约外框，具体 ProbeReport 以 JSON 承载（core-types::probe）。
+    ProbeRequest probe_request = 40;
+    ProbeResponse probe_response = 41;
   }
 }
 
@@ -337,4 +343,16 @@ message CommandResponse {
   string status = 2; // Succeeded | Failed | TimedOut | Rejected | Cancelled
   string result_json = 3;
   string error = 4;
+}
+
+// 动态探测请求：connection_json 为连接配置 JSON（语义由 Driver 解释）。
+// 注意：Probe 不得隐式走 OpenConnection/Configure/ApplyPointMap/Start；
+// Driver 为探测建的短连接是其内部实现细节。
+message ProbeRequest {
+  string connection_json = 1;
+}
+
+// 动态探测响应：report_json 为 ProbeReport JSON（64 KiB 上限，UTF-8）。
+message ProbeResponse {
+  string report_json = 1;
 }
