@@ -1,0 +1,18 @@
+[package]
+name = "mesa-opcua-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "mesa_opcua_transport"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-opcua-client = "0.19"
+async-opcua-types = "0.19"
+base64 = "0.22"

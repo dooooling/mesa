@@ -23,9 +23,12 @@
 
 mod address;
 mod opcua_api;
+mod transport_adapter;
 
 pub use address::{AddressError, Identifier, OpcUaAddress, parse_address};
-pub use opcua_api::{DEFAULT_OPCUA_PORT, FakeOpcUaApi, NativeOpcUaApi, OpcUaApi};
+pub use mesa_opcua_transport::DEFAULT_OPCUA_PORT;
+pub use opcua_api::{FakeOpcUaApi, OpcUaApi};
+pub use transport_adapter::TransportApiAdapter;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -204,14 +207,9 @@ impl Driver for OpcUaDriver {
             ));
         }
         let api: Arc<dyn OpcUaApiTrait> = if use_native {
-            let native = if let Some(pki) = OpcUaConnConfig::resolve_pki_dir() {
-                NativeOpcUaApi::new_with_pki_dir(pki)
-            } else {
-                NativeOpcUaApi::new()
-            };
-            native.set_security(cfg.security_policy.clone(), cfg.security_mode.clone());
-            native.set_credentials(cfg.username.clone(), cfg.password.clone());
-            Arc::new(native)
+            // Native 会话经公共 transport 建立（PKI 由驱动侧注入 options）
+            let options = cfg.connect_options();
+            Arc::new(TransportApiAdapter::new(options))
         } else {
             Arc::new(FakeOpcUaApi::new())
         };
@@ -253,11 +251,26 @@ impl Default for OpcUaConnConfig {
 }
 
 impl OpcUaConnConfig {
-    /// 提取可选的 pki_dir：仅允许环境变量 MESA_OPCUA_PKI_DIR 或默认值，禁止 Endpoint JSON 指定路径
-    fn resolve_pki_dir() -> Option<std::path::PathBuf> {
+    /// PKI 目录解析（驱动侧职责）：仅允许环境变量 MESA_OPCUA_PKI_DIR 或默认值，
+    /// 禁止 Endpoint JSON 指定路径；解析后经 options 注入 transport（transport 不读环境变量）。
+    fn resolve_pki_dir() -> std::path::PathBuf {
         std::env::var("MESA_OPCUA_PKI_DIR")
-            .ok()
             .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("data/certificates/opcua"))
+    }
+
+    /// 组装 transport 连接选项（含 PKI 注入）。
+    fn connect_options(&self) -> mesa_opcua_transport::OpcUaConnectOptions {
+        mesa_opcua_transport::OpcUaConnectOptions {
+            endpoint_url: self.endpoint_url.clone(),
+            timeout_ms: self.timeout_ms,
+            security_policy: self.security_policy.clone(),
+            security_mode: self.security_mode.clone(),
+            username: self.username.clone(),
+            password: self.password.clone(),
+            pki_dir: Self::resolve_pki_dir(),
+            ..Default::default()
+        }
     }
 
     fn from_json(v: &serde_json::Value) -> Result<Self, SdkDriverError> {
@@ -1315,8 +1328,11 @@ impl DriverConnection for OpcUaConnection {
                                         mono_ns: None,
         }).await;
                         }
-                        // 清理订阅
-                        let _ = api.unsubscribe(sub_id).await;
+                        // 清理订阅：失败不影响 shutdown 返回，但必须 warn
+                        //（P1-B7 保留的 cleanup error 到此是最后可见机会）。
+                        if let Err(e) = api.unsubscribe(sub_id).await {
+                            tracing::warn!(sub_id, error = %e, "shutdown 清理订阅失败（仅诊断）");
+                        }
                         Ok::<(), SdkDriverError>(())
                     }));
                 }
