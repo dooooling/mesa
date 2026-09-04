@@ -9,8 +9,13 @@
 name: CI
 on:
   push:
-    branches: [main, master, feat/v2.1-impl]
+    branches: [main]
   pull_request:
+    branches: [main]
+
+# 最小权限意图：本 CI 只读 checkout + 运行测试/构建，不写回仓库。
+permissions:
+  contents: read
 
 # 同一 PR 新 push 自动取消旧 run（省 runner）；push main 不 cancel。
 concurrency:

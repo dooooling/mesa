@@ -8,6 +8,9 @@ name: rust-primary
 on:
   workflow_call:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -36,5 +39,16 @@ jobs:
       - name: test workspace (excluding performance)
         run: cargo test --locked --workspace --all-features --exclude mesa-performance-tests
 
-      - name: fast performance (default short mode)
-        run: cargo test --locked -p mesa-performance-tests
+      # PR Fast Perf：只跑秒级项。soak_short（60s）不在 PR 路径，
+      # 独立跑：cargo test -p mesa-performance-tests --test soak_short
+      # （nightly/manual；Formal 1h soak 另加 PERF_SOAK，见 tests/performance）。
+      - name: fast performance (PR set, soak_short excluded)
+        run: >
+          cargo test --locked -p mesa-performance-tests
+          --test backpressure
+          --test configure_large
+          --test conn_1000
+          --test control_latency
+          --test data_plane_soak
+          --test e2e_50k_real
+          --test ipc_latency
