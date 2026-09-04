@@ -86,6 +86,14 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
     #[error("protocol error: {0}")]
     Protocol(#[from] ProtocolError),
+    /// Driver 侧结构化错误（P1-2：kind/code 保留，不格式化成字符串，
+    /// 调用方按 code 做精确路由，禁止 contains()/parse 回猜）。
+    #[error("driver error {kind}/{code}: {message}")]
+    Driver {
+        kind: String,
+        code: String,
+        message: String,
+    },
 }
 
 struct Shared {
@@ -375,10 +383,11 @@ impl Session {
             }
             Some(pb::envelope::Body::DriverError(e)) => {
                 let d = e.detail.unwrap_or_default();
-                Err(SessionError::Handshake(format!(
-                    "{}/{}: {}",
-                    d.kind, d.code, d.message
-                )))
+                Err(SessionError::Driver {
+                    kind: d.kind,
+                    code: d.code,
+                    message: d.message,
+                })
             }
             _ => Err(SessionError::Closed),
         }

@@ -1,13 +1,13 @@
-//! MesaManager::probe() 编排（V1.2.1 §8，feat/dynamic-probe 阶段 3）。
+//! MesaManager::probe() 编排（V1.2.1 §8）。
 //!
 //! 唯一职责：为一次探测拉起临时 Driver 进程，走完
-//! spawn → handshake → Probe RPC → invalidate → terminate，
-//! 成功失败超时三条路都必须回收子进程，不留孤儿。
+//! spawn → handshake → OpenConnection(临时) → Probe RPC → CloseConnection
+//! → invalidate → terminate，成功失败超时三条路都必须回收子进程，不留孤儿。
 //!
 //! 硬性不变量（违反即架构错误）：
 //! - 不创建 Endpoint，不写 ConfigStore，不碰 PointRegistry；
 //! - 不启动 Data Plane，不改变 stream_epoch；
-//! - 不经过 OpenConnection/Configure/ApplyPointMap/Start（§8.5 禁止项）；
+//! - 禁止 Configure/ApplyPointMap/Start（§8.5）；
 //! - 设备不可达是探测结果（`Ok(unreachable)`），只有基础设施失败才是 `Err`。
 
 use mesa_core_types::ProbeReport;
@@ -36,9 +36,28 @@ pub enum ProbeError {
     /// Probe RPC 失败：对端关闭 / 非法报告 / Driver 侧错误（供 REST 映射 503）。
     #[error("probe rpc failed: {0}")]
     Rpc(String),
+    /// 连接配置被 Driver 拒绝（供 REST 映射 400；仍是基础设施侧结论，
+    /// 与 REST 层 JSON 外形校验的 VALIDATION_ERROR 区分）。
+    #[error("invalid probe input {code}: {message}")]
+    InvalidInput { code: String, message: String },
     /// 12s 总预算耗尽（含 spawn/handshake/RPC/cleanup）。
     #[error("probe timed out")]
     Timeout,
+}
+
+/// Driver 结构化错误 → ProbeError（P1-2：按 kind/code 精确路由，
+/// 禁止字符串 contains()/parse 回猜）。
+fn driver_error_to_probe_error(kind: &str, code: &str, message: String) -> ProbeError {
+    if code == "PROBE_UNSUPPORTED" {
+        ProbeError::Unsupported(message)
+    } else if kind == mesa_core_types::ErrorKind::Configuration.as_str() {
+        ProbeError::InvalidInput {
+            code: code.to_string(),
+            message,
+        }
+    } else {
+        ProbeError::Rpc(format!("{kind}/{code}: {message}"))
+    }
 }
 
 /// 探测结果：设备事实 + Core 侧确定性 profile 提示（Driver 不参与匹配）。
@@ -115,6 +134,11 @@ impl MesaManager {
                     .await
                     .map_err(|e| match e {
                         SessionError::Timeout => ProbeError::RpcTimeout,
+                        SessionError::Driver {
+                            kind,
+                            code,
+                            message,
+                        } => driver_error_to_probe_error(&kind, &code, message),
                         other => ProbeError::Rpc(other.to_string()),
                     });
                 // close 必须执行（best-effort）：probe 成败都不留已开连接
@@ -153,19 +177,21 @@ impl MesaManager {
                 Some(r) if r.ok => Ok(()),
                 Some(r) => {
                     let d = r.error.unwrap_or_default();
-                    Err(ProbeError::Rpc(format!(
-                        "open failed: {}/{}/{}",
-                        d.kind, d.code, d.message
-                    )))
+                    Err(driver_error_to_probe_error(
+                        &d.kind,
+                        &d.code,
+                        format!("open failed: {}", d.message),
+                    ))
                 }
                 None => Err(ProbeError::Rpc("open failed: empty result".into())),
             },
             Some(pb::envelope::Body::DriverError(e)) => {
                 let d = e.detail.unwrap_or_default();
-                Err(ProbeError::Rpc(format!(
-                    "open failed: {}/{}/{}",
-                    d.kind, d.code, d.message
-                )))
+                Err(driver_error_to_probe_error(
+                    &d.kind,
+                    &d.code,
+                    format!("open failed: {}", d.message),
+                ))
             }
             _ => Err(ProbeError::Rpc("open failed: unexpected reply".into())),
         }
@@ -196,6 +222,29 @@ mod tests {
         assert!(!probe_supported(1));
         assert!(probe_supported(2));
         assert!(probe_supported(u32::MAX));
+    }
+
+    #[test]
+    fn driver_error_routes_by_code_not_substring() {
+        // PROBE_UNSUPPORTED → Unsupported（REST 501）
+        assert!(matches!(
+            driver_error_to_probe_error("UnsupportedError", "PROBE_UNSUPPORTED", "x".into()),
+            ProbeError::Unsupported(_)
+        ));
+        // ConfigurationError → InvalidInput（REST 400），无论 message 写什么
+        assert!(matches!(
+            driver_error_to_probe_error("ConfigurationError", "BAD_CONFIG", "boom".into()),
+            ProbeError::InvalidInput { .. }
+        ));
+        // 其他 → Rpc（REST 503）
+        assert!(matches!(
+            driver_error_to_probe_error("ConnectionError", "CONNECT_FAIL", "x".into()),
+            ProbeError::Rpc(_)
+        ));
+        assert!(matches!(
+            driver_error_to_probe_error("", "", "x".into()),
+            ProbeError::Rpc(_)
+        ));
     }
 
     #[test]

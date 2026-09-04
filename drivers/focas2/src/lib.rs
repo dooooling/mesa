@@ -319,6 +319,7 @@ async fn await_probe_with_api(
     if let Err(e) = api.connect(&cfg.host, cfg.port, cfg.timeout_ms).await {
         return Ok(ProbeReport::unreachable("CONNECTION_FAILED", e));
     }
+    // P1-1：read 是否 Available 以本次 sysinfo 实测为准；失败即 Unknown。
     let report = match api.system_info().await {
         Ok(info) => ProbeReport {
             reachable: true,
@@ -327,8 +328,7 @@ async fn await_probe_with_api(
             model: None,
             firmware: Some(info.version),
             model_confidence: None,
-            // FOCAS2 Driver 为纯 poll 实现：read 已被本次 sysinfo 证实，
-            // subscribe/browse 为实现确认不支持。
+            // subscribe/browse 为实现确认缺席（静态事实，可断言）。
             capabilities: vec![
                 CapabilityItem {
                     id: "read".into(),
@@ -361,8 +361,8 @@ async fn await_probe_with_api(
             capabilities: vec![
                 CapabilityItem {
                     id: "read".into(),
-                    state: CapabilityState::Available,
-                    detail: None,
+                    state: CapabilityState::Unknown,
+                    detail: Some(format!("system_info 读取失败: {e}")),
                 },
                 CapabilityItem {
                     id: "subscribe".into(),

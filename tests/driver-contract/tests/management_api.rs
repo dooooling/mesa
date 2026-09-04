@@ -157,6 +157,20 @@ async fn probe_non_object_connection_is_400() {
     assert_eq!(v["error"]["code"], "VALIDATION_ERROR");
 }
 
+/// JSON 是 object 但驱动配置非法 → 400，code 透出驱动原因码（P1-2 结构化）。
+#[tokio::test]
+async fn probe_invalid_driver_config_is_400_with_driver_code() {
+    let (app, _) = app().await;
+    let (status, v) = post_json(
+        app,
+        "/api/v1/drivers/s7/probe",
+        r#"{"connection":{"host":"127.0.0.1","port":99999}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["code"], "BAD_CONFIG");
+}
+
 /// 设备不可达是 200 + reachable:false（不是 5xx）：s7 连关闭端口。
 #[tokio::test]
 async fn probe_s7_closed_port_is_unreachable_200() {

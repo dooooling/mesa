@@ -326,30 +326,38 @@ impl DriverConnection for S7Connection {
             Ok(c) => c,
             Err(e) => return Ok(ProbeReport::unreachable("CONNECTION_FAILED", e.to_string())),
         };
-        let (vendor, model, warnings) = match client.read_szl(0x0011, 1).await {
+        // P1-1：read 是否 Available 以本次 SZL 实测为准；失败即 Unknown，
+        // 绝不拿静态能力冒充实测结论。失败原因同时进 capability detail
+        // 与 IDENTITY_UNAVAILABLE warning（全局身份事实 + 局部实测证据）。
+        let (vendor, model, read_state, read_note) = match client.read_szl(0x0011, 1).await {
             Ok(payload) => match parse_szl_module_id(&payload, 0x0011, 1) {
                 Some(mlfb) => {
                     let vendor = mlfb.starts_with("6ES").then(|| "Siemens".to_string());
-                    (vendor, Some(mlfb), vec![])
+                    (vendor, Some(mlfb), CapabilityState::Available, None)
                 }
                 None => (
                     None,
                     None,
-                    vec![ProbeWarning {
-                        code: "IDENTITY_UNAVAILABLE".into(),
-                        message: "SZL 0x0011 响应无法解析出模块标识".into(),
-                    }],
+                    CapabilityState::Unknown,
+                    Some("SZL 0x0011 响应无法解析出模块标识".to_string()),
                 ),
             },
             Err(e) => (
                 None,
                 None,
-                vec![ProbeWarning {
-                    code: "IDENTITY_UNAVAILABLE".into(),
-                    message: format!("SZL 0x0011 读取失败: {e}"),
-                }],
+                CapabilityState::Unknown,
+                Some(format!("SZL 0x0011 读取失败: {e}")),
             ),
         };
+        let warnings = read_note
+            .clone()
+            .map(|message| {
+                vec![ProbeWarning {
+                    code: "IDENTITY_UNAVAILABLE".into(),
+                    message,
+                }]
+            })
+            .unwrap_or_default();
         Ok(ProbeReport {
             reachable: true,
             vendor,
@@ -357,13 +365,12 @@ impl DriverConnection for S7Connection {
             model,
             firmware: None,
             model_confidence: None,
-            // S7 Driver 为纯 poll 实现（见 descriptor）：read 已被本次 SZL 证实，
-            // subscribe/browse 为实现确认缺席。
+            // subscribe/browse 为实现确认缺席（静态事实，可断言）。
             capabilities: vec![
                 CapabilityItem {
                     id: "read".into(),
-                    state: CapabilityState::Available,
-                    detail: None,
+                    state: read_state,
+                    detail: read_note,
                 },
                 CapabilityItem {
                     id: "subscribe".into(),

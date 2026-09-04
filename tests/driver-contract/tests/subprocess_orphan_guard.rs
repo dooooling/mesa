@@ -323,8 +323,8 @@ async fn manager_probe_bad_config_fails_and_cleans_child() {
         .await
         .expect_err("非法 JSON 必须 Err");
     assert!(
-        matches!(err, ProbeError::Rpc(_)),
-        "simulator BAD_CONFIG 经 DriverError 回传，实际: {err}"
+        matches!(err, ProbeError::InvalidInput { .. }),
+        "simulator BAD_CONFIG 应结构化映射 InvalidInput，实际: {err}"
     );
     assert_no_orphan(&before, &exe_name(&unique));
     cleanup_dir(&root);

@@ -581,6 +581,9 @@ async fn probe_driver(
                     StatusCode::NOT_IMPLEMENTED,
                     Json(json_error("PROBE_UNSUPPORTED", &e.to_string())),
                 ),
+                ProbeError::InvalidInput { code, message } => {
+                    (StatusCode::BAD_REQUEST, Json(json_error(&code, &message)))
+                }
                 ProbeError::Spawn(_) | ProbeError::Handshake(_) => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(json_error("DRIVER_UNAVAILABLE", &e.to_string())),

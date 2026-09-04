@@ -7,7 +7,7 @@
 
 use mesa_core_types::{CapabilityItem, CapabilityState, ProbeReport, ProbeWarning};
 use mesa_driver_sdk::SdkDriverError;
-use mesa_opcua_transport::{OpcUaTransport, UaBrowseRequest, UaNodeRef};
+use mesa_opcua_transport::{OpcUaTransport, UaBrowseRequest, UaNodeRef, UaTransportError};
 
 /// 标准 Server 身份节点（ns=0，OPC UA 标准节点集）：
 /// ManufacturerName=2263 → vendor，ProductName=2261 → model，
@@ -50,14 +50,34 @@ pub async fn probe_with_transport(
     Ok(report)
 }
 
+/// 传输错误 → 四态（P1-1）：只认明确语义的 StatusCode，
+/// 超时/会话/服务/内部失败一律 Unknown，绝不谎报 AccessDenied。
+fn capability_state_from_ua_error(e: &UaTransportError) -> CapabilityState {
+    match e.status_code.map(opcua_types::StatusCode::from) {
+        Some(opcua_types::StatusCode::BadUserAccessDenied) => CapabilityState::AccessDenied,
+        Some(opcua_types::StatusCode::BadNodeIdUnknown)
+        | Some(opcua_types::StatusCode::BadNodeIdInvalid) => CapabilityState::NotPresent,
+        _ => CapabilityState::Unknown,
+    }
+}
+
 async fn probe_connected(transport: &dyn OpcUaTransport) -> ProbeReport {
     let mut warnings = Vec::new();
 
-    // 1. NamespaceArray：读成功即证实 read 通路；失败原因写入
-    // capability detail，不另起 warning（P0-1 不重复规则）。
-    let (read_ok, read_detail) = match transport.read_namespace_array().await {
-        Ok(_) => (true, None),
-        Err(e) => (false, Some(format!("NamespaceArray 读取失败: {e}"))),
+    // 1. NamespaceArray：全局环境事实。失败时 capability 取错误映射状态
+    //（通常 Unknown），并追加 NAMESPACE_PARTIAL（影响身份解析的全局事项）。
+    let (read_state, read_detail) = match transport.read_namespace_array().await {
+        Ok(_) => (CapabilityState::Available, None),
+        Err(e) => {
+            warnings.push(ProbeWarning {
+                code: "NAMESPACE_PARTIAL".into(),
+                message: format!("NamespaceArray 读取失败: {e}"),
+            });
+            (
+                capability_state_from_ua_error(&e),
+                Some(format!("NamespaceArray 读取失败: {e}")),
+            )
+        }
     };
 
     // 2. 标准 BuildInfo 身份（逐点 BAD 容忍：单点缺失只影响对应字段）。
@@ -92,45 +112,35 @@ async fn probe_connected(transport: &dyn OpcUaTransport) -> ProbeReport {
         }
     };
 
-    // 3. Objects 浅浏览确认 browse 能力（单页即可，不翻页）
-    let browse_ok = transport
+    // 3. Objects 浅浏览确认 browse 能力（单页即可，不翻页）。
+    // 失败原因只写 capability detail，不另起 warning（P1-1 不重复规则，
+    // BROWSE_CHECK_FAILED 已删除）。
+    let (browse_state, browse_detail) = match transport
         .browse(UaBrowseRequest {
             node: UaNodeRef::numeric(OBJECTS_ROOT.0, OBJECTS_ROOT.1),
             max_refs: 100,
         })
         .await
-        .is_ok();
-    if !browse_ok {
-        warnings.push(ProbeWarning {
-            code: "BROWSE_CHECK_FAILED".into(),
-            message: "Objects 浅浏览失败".into(),
-        });
-    }
+    {
+        Ok(_) => (CapabilityState::Available, None),
+        Err(e) => (
+            capability_state_from_ua_error(&e),
+            Some(format!("Objects 浏览失败: {e}")),
+        ),
+    };
 
     // 能力语义：read/browse 为本次实测结论；subscribe 本次未建订阅，
     // 无资格断言——直接省略该条目（缺席≠不支持）。
     let capabilities = vec![
         CapabilityItem {
             id: "read".into(),
-            state: if read_ok {
-                CapabilityState::Available
-            } else {
-                CapabilityState::AccessDenied
-            },
+            state: read_state,
             detail: read_detail,
         },
         CapabilityItem {
             id: "browse".into(),
-            state: if browse_ok {
-                CapabilityState::Available
-            } else {
-                CapabilityState::AccessDenied
-            },
-            detail: if browse_ok {
-                None
-            } else {
-                Some("Objects browse failed".into())
-            },
+            state: browse_state,
+            detail: browse_detail,
         },
     ];
     ProbeReport {
@@ -251,6 +261,55 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.code, "BAD_CONFIG");
+    }
+
+    #[test]
+    fn ua_error_maps_to_accurate_capability_state() {
+        use mesa_opcua_transport::{UaOperation, UaTransportError};
+        let err_with = |status: Option<opcua_types::StatusCode>| {
+            UaTransportError::service(UaOperation::Read, status, false, "test")
+        };
+        // 明确语义才判两态
+        assert_eq!(
+            capability_state_from_ua_error(&err_with(Some(
+                opcua_types::StatusCode::BadUserAccessDenied
+            ))),
+            CapabilityState::AccessDenied
+        );
+        assert_eq!(
+            capability_state_from_ua_error(&err_with(Some(
+                opcua_types::StatusCode::BadNodeIdUnknown
+            ))),
+            CapabilityState::NotPresent
+        );
+        assert_eq!(
+            capability_state_from_ua_error(&err_with(Some(
+                opcua_types::StatusCode::BadNodeIdInvalid
+            ))),
+            CapabilityState::NotPresent
+        );
+        // 超时/会话/无码一律 Unknown，绝不谎报 AccessDenied
+        assert_eq!(
+            capability_state_from_ua_error(&err_with(Some(opcua_types::StatusCode::BadTimeout))),
+            CapabilityState::Unknown
+        );
+        assert_eq!(
+            capability_state_from_ua_error(&err_with(Some(
+                opcua_types::StatusCode::BadSessionClosed
+            ))),
+            CapabilityState::Unknown
+        );
+        assert_eq!(
+            capability_state_from_ua_error(&err_with(None)),
+            CapabilityState::Unknown
+        );
+        assert_eq!(
+            capability_state_from_ua_error(&UaTransportError::timeout(
+                UaOperation::Browse,
+                "elapsed"
+            )),
+            CapabilityState::Unknown
+        );
     }
 
     #[test]
