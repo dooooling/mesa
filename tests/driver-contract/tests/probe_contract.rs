@@ -35,7 +35,10 @@ fn exe_name(base: &str) -> String {
 }
 
 /// 按可执行文件名快照存活 PID（标准库实现，无新依赖）。
+/// 注意：Linux comm 截断到 15 字符，调用方传入的唯一名必须 ≤15 字符，
+/// 否则匹配永远为空、孤儿检查被静默旁路（"pb-sim-guard"=12，"pb-hang-guard"=13）。
 fn live_pids(name: &str) -> HashSet<u32> {
+    debug_assert!(name.len() <= 15, "comm truncation risk: {name}");
     #[cfg(windows)]
     {
         let out = std::process::Command::new("tasklist")
@@ -65,10 +68,10 @@ fn live_pids(name: &str) -> HashSet<u32> {
             let Some(pid) = fname.to_str().and_then(|s| s.parse::<u32>().ok()) else {
                 continue;
             };
-            if let Ok(comm) = std::fs::read_to_string(e.path().join("comm")) {
-                if comm.trim() == name {
-                    set.insert(pid);
-                }
+            if let Ok(comm) = std::fs::read_to_string(e.path().join("comm"))
+                && comm.trim() == name
+            {
+                set.insert(pid);
             }
         }
         set
@@ -214,7 +217,7 @@ async fn session_probe_hanging_server_maps_to_timeout() {
 
 #[tokio::test]
 async fn manager_probe_success_reports_hints_and_cleans_child() {
-    let (root, unique) = stage_drivers_dir("ok", &sim_exe(), "probe-sim-guard");
+    let (root, unique) = stage_drivers_dir("ok", &sim_exe(), "pb-sim-guard");
     let before = live_pids(&exe_name(&unique));
     let mgr = MesaManager::discover(&root);
     let res = mgr.probe("simulator", "{}").await.expect("probe ok");
@@ -233,7 +236,7 @@ async fn manager_probe_success_reports_hints_and_cleans_child() {
 
 #[tokio::test]
 async fn manager_probe_bad_config_fails_and_cleans_child() {
-    let (root, unique) = stage_drivers_dir("bad", &sim_exe(), "probe-sim-guard");
+    let (root, unique) = stage_drivers_dir("bad", &sim_exe(), "pb-sim-guard");
     let before = live_pids(&exe_name(&unique));
     let mgr = MesaManager::discover(&root);
     let err = mgr
@@ -251,7 +254,7 @@ async fn manager_probe_bad_config_fails_and_cleans_child() {
 #[tokio::test]
 async fn manager_probe_timeout_cleans_hang_child() {
     // hang 桩：握手成功但永不回包 → 内层 RPC 10s 超时 → 同一清理尾回收子进程。
-    let (root, unique) = stage_drivers_dir("hang", &hang_exe(), "probe-hang-guard");
+    let (root, unique) = stage_drivers_dir("hang", &hang_exe(), "pb-hang-guard");
     // hang 桩的 manifest id 需改写为 hang（stage 函数写死 simulator，覆写 toml）
     let dir = root.join("simulator");
     std::fs::write(
