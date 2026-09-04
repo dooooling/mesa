@@ -203,6 +203,58 @@ pub enum EventTaskError {
     PollRequiresInterval { task: String },
 }
 
+/// batch sequence 判定（§11 冻结语义，PR5 先冻纯函数，PR6 ingress 调用执行）。
+///
+/// 规则（同 Connection 同 stream_epoch 内）：
+/// - 首个 sequence 任意值均接受（Driver 起始序号不做假设）；
+/// - `== max+1` → Accept（严格递增）；
+/// - `== max` → Duplicate（重传：已入库，建议丢弃，不形成第二条）；
+/// - `< max` → Regression（迟到旧批：建议丢弃 + `EVENT_SEQUENCE_REGRESSION`）；
+/// - `> max+1` → Gap（接受入库 + `event_sequence_gap_total += 1`，不能假装没发生）；
+/// - epoch 切换即新流，不跨 epoch 比较。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceVerdict {
+    Accept,
+    Duplicate,
+    Regression,
+    Gap { expected: u64, got: u64 },
+}
+
+/// 同 endpoint 的 batch sequence 跟踪器（非线程安全，调用方持有锁）。
+#[derive(Debug, Default)]
+pub struct EventSequenceTracker {
+    max_per_epoch: std::collections::HashMap<u64, u64>,
+}
+
+impl EventSequenceTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn check(&mut self, epoch: u64, seq: u64) -> SequenceVerdict {
+        let Some(max) = self.max_per_epoch.get(&epoch).copied() else {
+            self.max_per_epoch.insert(epoch, seq);
+            return SequenceVerdict::Accept;
+        };
+        if seq == max {
+            return SequenceVerdict::Duplicate;
+        }
+        if seq < max {
+            return SequenceVerdict::Regression;
+        }
+        // seq > max：连续则接受，跳跃则记 gap（两条路都推进 max，后续判定不塌）
+        let verdict = match max.checked_add(1) {
+            Some(next) if seq == next => SequenceVerdict::Accept,
+            _ => SequenceVerdict::Gap {
+                expected: max.saturating_add(1),
+                got: seq,
+            },
+        };
+        self.max_per_epoch.insert(epoch, seq);
+        verdict
+    }
+}
+
 /// 事件流描述（§5 EventCatalog）：Driver 声明自己有哪些事件源，供通用 UI
 /// 动态渲染 EventTaskEditor（禁止 `if driver == ...` 协议分支，§27）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -225,7 +277,8 @@ pub struct EventStreamDescriptor {
 pub struct EventFieldDescriptor {
     pub key: String,
     pub label: crate::schema::LocalizedText,
-    /// 取值同 DataType::as_str()（展示用，不做运行时类型强制）。
+    /// 取值必须是 `DataType::as_str()` 合法值（展示列类型；运行时载荷仍以
+    /// attributes 实际 Value 为准，此处只防拼写错误如 "temperature"）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_type: Option<String>,
 }
@@ -257,6 +310,14 @@ impl EventCatalog {
                 }
                 if !fseen.insert(&f.key) {
                     return Err(format!("event stream {} field key 重复: {}", s.id, f.key));
+                }
+                if let Some(dt) = &f.data_type
+                    && dt.parse::<crate::DataType>().is_err()
+                {
+                    return Err(format!(
+                        "event stream {} field {} data_type 非法: {dt}",
+                        s.id, f.key
+                    ));
                 }
             }
         }
@@ -375,6 +436,47 @@ mod tests {
             },
         };
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn sequence_semantics_accept_duplicate_regression_gap() {
+        // §11 冻结语义：同 epoch 严格递增；epoch 切换即新流
+        let mut t = EventSequenceTracker::new();
+        assert_eq!(t.check(1, 1), SequenceVerdict::Accept);
+        assert_eq!(t.check(1, 2), SequenceVerdict::Accept);
+        assert_eq!(t.check(1, 2), SequenceVerdict::Duplicate);
+        assert_eq!(t.check(1, 1), SequenceVerdict::Regression);
+        assert_eq!(
+            t.check(1, 4),
+            SequenceVerdict::Gap {
+                expected: 3,
+                got: 4
+            }
+        );
+        // gap 后 max 已推进，后续连续即接受
+        assert_eq!(t.check(1, 5), SequenceVerdict::Accept);
+        // 新 epoch 不继承旧 max
+        assert_eq!(t.check(2, 1), SequenceVerdict::Accept);
+        assert_eq!(t.check(2, 1), SequenceVerdict::Duplicate);
+    }
+
+    #[test]
+    fn catalog_rejects_illegal_field_data_type() {
+        let mut c = EventCatalog::default();
+        c.streams.push(EventStreamDescriptor {
+            id: "s".into(),
+            label: "S".into(),
+            modes: vec![],
+            parameters: crate::schema::SchemaDescriptor::default(),
+            fields: vec![EventFieldDescriptor {
+                key: "temp".into(),
+                label: "T".into(),
+                data_type: Some("temperature".into()),
+            }],
+        });
+        assert!(c.validate().is_err());
+        c.streams[0].fields[0].data_type = Some("f64".into());
+        assert!(c.validate().is_ok());
     }
 
     #[test]

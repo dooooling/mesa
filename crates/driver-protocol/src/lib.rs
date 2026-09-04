@@ -360,6 +360,13 @@ pub fn event_record_to_pb(e: &EventRecord) -> Result<pb::EventRecordMsg, Convert
 pub fn event_record_from_pb(e: pb::EventRecordMsg) -> Result<EventRecord, ConvertError> {
     let mut attributes = std::collections::BTreeMap::new();
     for a in e.attributes {
+        // P5-review：重复 key 静默覆盖等于丢失历史事实，必须整条拒收
+        if attributes.contains_key(&a.key) {
+            return Err(ConvertError::InvalidEventRecord(format!(
+                "duplicate attribute key: {}",
+                a.key
+            )));
+        }
         let v = value_from_pb(a.value.ok_or(ConvertError::EmptyValue)?)?;
         attributes.insert(a.key, v);
     }
@@ -376,12 +383,17 @@ pub fn event_record_from_pb(e: pb::EventRecordMsg) -> Result<EventRecord, Conver
             })
         })
         .transpose()?;
+    // P5-review：severity 截断等于把非法输入洗成合法数据；
+    // 溢出必须拒收，再由 validate() 检查 0..=1000
+    let severity = u16::try_from(e.severity).map_err(|_| {
+        ConvertError::InvalidEventRecord(format!("severity overflow: {}", e.severity))
+    })?;
     let rec = EventRecord {
         event_id: e.event_id,
         category: e.category,
         kind: e.kind,
         source: e.source,
-        severity: e.severity.min(u32::from(u16::MAX)) as u16,
+        severity,
         code: e.code,
         message: e.message,
         message_locale: e.message_locale,
@@ -643,6 +655,48 @@ mod tests {
             event_record_from_pb(event_record_to_pb(&flat).unwrap()).unwrap(),
             flat
         );
+    }
+
+    /// P5-review：severity 溢出整体拒收（禁止截断洗白），重复 attribute key
+    /// 整条拒收（禁止静默覆盖历史事实）。
+    #[test]
+    fn event_record_overflow_and_dupkey_rejected() {
+        use mesa_core_types::EventRecord;
+        let rec = EventRecord {
+            event_id: "e".into(),
+            category: "c".into(),
+            kind: "k".into(),
+            source: "s".into(),
+            severity: 1,
+            code: None,
+            message: None,
+            message_locale: None,
+            occurred_at_ns: None,
+            condition: None,
+            correlation_id: None,
+            attributes: BTreeMap::new(),
+        };
+        let mut wire = event_record_to_pb(&rec).unwrap();
+        wire.severity = 999_999;
+        assert!(matches!(
+            event_record_from_pb(wire),
+            Err(ConvertError::InvalidEventRecord(_))
+        ));
+        // wire 合法但超 1000 的 severity 同样拒收（validate 0..=1000）
+        let mut wire = event_record_to_pb(&rec).unwrap();
+        wire.severity = 5000;
+        assert!(event_record_from_pb(wire).is_err());
+        // 重复 attribute key 拒收
+        let mut wire = event_record_to_pb(&rec).unwrap();
+        let attr = pb::EventAttributeMsg {
+            key: "axis".into(),
+            value: Some(value_to_pb(&Value::I32(1))),
+        };
+        wire.attributes = vec![attr.clone(), attr];
+        assert!(matches!(
+            event_record_from_pb(wire),
+            Err(ConvertError::InvalidEventRecord(_))
+        ));
     }
 
     /// EventTask wire 往返 + 坏任务拒收（坏 EventTask 必须让 revision 失败，§35）。
