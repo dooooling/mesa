@@ -559,11 +559,8 @@ async fn probe_driver(
                         "model": r.model,
                         "firmware": r.firmware,
                     },
-                    "capabilities": {
-                        "read": r.capabilities.read,
-                        "subscribe": r.capabilities.subscribe,
-                        "browse": r.capabilities.browse,
-                    },
+                    "model_confidence": r.model_confidence,
+                    "capabilities": r.capabilities,
                     "profile_hints": res
                         .profile_hints
                         .iter()

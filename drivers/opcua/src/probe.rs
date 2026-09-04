@@ -5,7 +5,7 @@
 //! 探测内容：建连 → NamespaceArray → 标准 BuildInfo 身份 → Objects 浅浏览 → 断开。
 //! 不建订阅（subscribe 本次不确认 → None），不写任何东西。
 
-use mesa_core_types::{ProbeCapabilities, ProbeReport, ProbeWarning};
+use mesa_core_types::{CapabilityItem, CapabilityState, ProbeReport, ProbeWarning};
 use mesa_driver_sdk::SdkDriverError;
 use mesa_opcua_transport::{OpcUaTransport, UaBrowseRequest, UaNodeRef};
 
@@ -35,8 +35,10 @@ fn dv_string(dv: &mesa_opcua_transport::UaDataValue) -> Option<String> {
 }
 
 /// 通用探测流程（Native 与 Fake 共用；Fake 用于单测脚本化）。
-pub async fn probe_with_transport<T: OpcUaTransport>(
-    transport: &T,
+/// 参数为 `&dyn`（连接持有 `Arc<dyn OpcUaTransport>`，与采集共享同一 Arc；
+/// async_trait 下泛型 `?Sized` 不可用，故直接用 trait 对象）。
+pub async fn probe_with_transport(
+    transport: &dyn OpcUaTransport,
 ) -> Result<ProbeReport, SdkDriverError> {
     if let Err(e) = transport.connect().await {
         // 建连失败 = 设备不可达（探测结果，不是 Err）
@@ -48,22 +50,19 @@ pub async fn probe_with_transport<T: OpcUaTransport>(
     Ok(report)
 }
 
-async fn probe_connected<T: OpcUaTransport>(transport: &T) -> ProbeReport {
+async fn probe_connected(transport: &dyn OpcUaTransport) -> ProbeReport {
     let mut warnings = Vec::new();
 
-    // 1. NamespaceArray：读成功即证实 read 通路
-    let read_ok = match transport.read_namespace_array().await {
-        Ok(_) => true,
-        Err(e) => {
-            warnings.push(ProbeWarning {
-                code: "NAMESPACE_READ_FAILED".into(),
-                message: format!("NamespaceArray 读取失败: {e}"),
-            });
-            false
-        }
+    // 1. NamespaceArray：读成功即证实 read 通路；失败原因写入
+    // capability detail，不另起 warning（P0-1 不重复规则）。
+    let (read_ok, read_detail) = match transport.read_namespace_array().await {
+        Ok(_) => (true, None),
+        Err(e) => (false, Some(format!("NamespaceArray 读取失败: {e}"))),
     };
 
-    // 2. 标准 BuildInfo 身份（逐点 BAD 容忍：单点缺失只影响对应字段）
+    // 2. 标准 BuildInfo 身份（逐点 BAD 容忍：单点缺失只影响对应字段）。
+    // 同一缺失只报一次：整包失败报 IDENTITY_UNAVAILABLE；读成功但无身份
+    // 报 MODEL_UNDETECTED（P0-1 不重复规则）。
     let (vendor, model, firmware) = match transport
         .read(
             &IDENT_NODES
@@ -75,7 +74,14 @@ async fn probe_connected<T: OpcUaTransport>(transport: &T) -> ProbeReport {
     {
         Ok(vals) => {
             let get = |i: usize| vals.get(i).and_then(dv_string);
-            (get(0), get(1), get(2))
+            let (v, m, f) = (get(0), get(1), get(2));
+            if v.is_none() && m.is_none() && f.is_none() {
+                warnings.push(ProbeWarning {
+                    code: "MODEL_UNDETECTED".into(),
+                    message: "标准 BuildInfo 无可用身份信息".into(),
+                });
+            }
+            (v, m, f)
         }
         Err(e) => {
             warnings.push(ProbeWarning {
@@ -85,12 +91,6 @@ async fn probe_connected<T: OpcUaTransport>(transport: &T) -> ProbeReport {
             (None, None, None)
         }
     };
-    if vendor.is_none() && model.is_none() && firmware.is_none() {
-        warnings.push(ProbeWarning {
-            code: "MODEL_UNDETECTED".into(),
-            message: "标准 BuildInfo 无可用身份信息".into(),
-        });
-    }
 
     // 3. Objects 浅浏览确认 browse 能力（单页即可，不翻页）
     let browse_ok = transport
@@ -107,18 +107,40 @@ async fn probe_connected<T: OpcUaTransport>(transport: &T) -> ProbeReport {
         });
     }
 
+    // 能力语义：read/browse 为本次实测结论；subscribe 本次未建订阅，
+    // 无资格断言——直接省略该条目（缺席≠不支持）。
+    let capabilities = vec![
+        CapabilityItem {
+            id: "read".into(),
+            state: if read_ok {
+                CapabilityState::Available
+            } else {
+                CapabilityState::AccessDenied
+            },
+            detail: read_detail,
+        },
+        CapabilityItem {
+            id: "browse".into(),
+            state: if browse_ok {
+                CapabilityState::Available
+            } else {
+                CapabilityState::AccessDenied
+            },
+            detail: if browse_ok {
+                None
+            } else {
+                Some("Objects browse failed".into())
+            },
+        },
+    ];
     ProbeReport {
         reachable: true,
         vendor,
         family: None,
         model,
         firmware,
-        capabilities: ProbeCapabilities {
-            read: Some(read_ok),
-            // 本次未建订阅：按 Option<bool> 语义保持 None（未确认≠不支持）
-            subscribe: None,
-            browse: Some(browse_ok),
-        },
+        model_confidence: None,
+        capabilities,
         warnings,
     }
 }
@@ -153,6 +175,16 @@ mod tests {
             )
     }
 
+    fn cap<'a>(
+        r: &'a mesa_core_types::ProbeReport,
+        id: &str,
+    ) -> &'a mesa_core_types::CapabilityItem {
+        r.capabilities
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap_or_else(|| panic!("缺少 capability {id}"))
+    }
+
     #[tokio::test]
     async fn full_identity_probed() {
         let t = ident_fake();
@@ -162,9 +194,16 @@ mod tests {
         assert_eq!(r.model.as_deref(), Some("TestModel"));
         assert_eq!(r.firmware.as_deref(), Some("9.9"));
         assert!(r.warnings.is_empty());
-        assert_eq!(r.capabilities.read, Some(true));
-        assert_eq!(r.capabilities.subscribe, None);
-        assert_eq!(r.capabilities.browse, Some(true));
+        assert_eq!(
+            cap(&r, "read").state,
+            mesa_core_types::CapabilityState::Available
+        );
+        assert_eq!(
+            cap(&r, "browse").state,
+            mesa_core_types::CapabilityState::Available
+        );
+        // subscribe 本次未确认：无条目（缺席≠不支持）
+        assert!(r.capabilities.iter().all(|c| c.id != "subscribe"));
     }
 
     #[tokio::test]
@@ -177,29 +216,40 @@ mod tests {
         assert!(r.model.is_none());
         assert!(r.warnings.iter().any(|w| w.code == "MODEL_UNDETECTED"));
         // Fake 默认命名空间为空数组但读取成功
-        assert_eq!(r.capabilities.read, Some(true));
+        assert_eq!(
+            cap(&r, "read").state,
+            mesa_core_types::CapabilityState::Available
+        );
     }
 
     #[tokio::test]
-    async fn driver_probe_refused_port_is_unreachable() {
-        // 127.0.0.1:9 预期关闭：建连失败 → Ok(unreachable)，不断开泄漏由内部保证
+    async fn connection_probe_refused_port_is_unreachable() {
+        // 127.0.0.1:9 预期关闭：经已打开的连接探测，建连失败 → Ok(unreachable)。
+        // open 自身不建连（lazy），probe 内的 connect 触发失败。
         let d = crate::OpcUaDriver;
-        let r = mesa_driver_sdk::Driver::probe(
+        let mut conn = mesa_driver_sdk::Driver::open_connection(
             &d,
+            "t",
             r#"{"endpoint_url":"opc.tcp://127.0.0.1:9","timeout_ms":1000}"#,
         )
         .await
-        .expect("不可达是探测结果");
+        .expect("open 只解析配置");
+        let r = mesa_driver_sdk::DriverConnection::probe(&mut *conn)
+            .await
+            .expect("不可达是探测结果");
         assert!(!r.reachable);
         assert!(r.warnings.iter().any(|w| w.code == "CONNECTION_FAILED"));
+        assert!(r.capabilities.is_empty());
     }
 
     #[tokio::test]
-    async fn driver_probe_rejects_bad_config() {
+    async fn open_rejects_bad_config() {
+        // 配置校验在 OpenConnection（probe 复用已开连接）
         let d = crate::OpcUaDriver;
-        let err = mesa_driver_sdk::Driver::probe(&d, "not-json")
-            .await
-            .unwrap_err();
+        let err = match mesa_driver_sdk::Driver::open_connection(&d, "t", "not-json").await {
+            Ok(_) => panic!("非法配置必须拒绝"),
+            Err(e) => e,
+        };
         assert_eq!(err.code, "BAD_CONFIG");
     }
 

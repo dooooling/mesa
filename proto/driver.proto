@@ -345,11 +345,11 @@ message CommandResponse {
   string error = 4;
 }
 
-// 动态探测请求：connection_json 为连接配置 JSON（语义由 Driver 解释）。
-// 注意：Probe 不得隐式走 OpenConnection/Configure/ApplyPointMap/Start；
-// Driver 为探测建的短连接是其内部实现细节。
+// 动态探测请求：复用 OpenConnection 已建立的连接（§8.5 冻结生命周期）。
+// Probe 与正常采集走完全相同的 Secret/PKI/SecurityPolicy/会话建立路径，
+// 禁止维护第二套"Probe 如何连接设备"的逻辑；Configure/Apply/Start 仍禁止。
 message ProbeRequest {
-  string connection_json = 1;
+  uint32 connection_handle = 1;
 }
 
 // 动态探测响应：report_json 为 ProbeReport JSON（64 KiB 上限，UTF-8）。

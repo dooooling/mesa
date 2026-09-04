@@ -81,6 +81,9 @@ impl MesaManager {
         })
     }
 
+    /// 临时探测连接句柄（Core 分配；临时会话内唯一即可，0 有特殊含义禁用）。
+    const PROBE_HANDLE: u32 = 999;
+
     async fn probe_inner(
         disc: crate::manifest::DiscoveredDriver,
         connection_json: &str,
@@ -103,10 +106,20 @@ impl MesaManager {
                         PROBE_RPC_MIN_MINOR
                     )));
                 }
-                session.probe(connection_json).await.map_err(|e| match e {
-                    SessionError::Timeout => ProbeError::RpcTimeout,
-                    other => ProbeError::Rpc(other.to_string()),
-                })
+                // P0-2 冻结生命周期：OpenConnection → Probe → CloseConnection，
+                // 与正常采集走完全相同的建连路径（Secret/PKI/会话），
+                // Configure/Apply/Start 仍禁止。
+                Self::open_temp(&session, &disc.manifest.id, connection_json).await?;
+                let pr = session
+                    .probe(Self::PROBE_HANDLE)
+                    .await
+                    .map_err(|e| match e {
+                        SessionError::Timeout => ProbeError::RpcTimeout,
+                        other => ProbeError::Rpc(other.to_string()),
+                    });
+                // close 必须执行（best-effort）：probe 成败都不留已开连接
+                Self::close_temp(&session).await;
+                pr
             }
             .await;
             session.invalidate();
@@ -115,6 +128,60 @@ impl MesaManager {
         .await;
         proc.terminate().await;
         result
+    }
+
+    /// 打开临时探测连接（与正常采集相同的 OpenConnection 路径）。
+    async fn open_temp(
+        session: &Session,
+        driver_id: &str,
+        connection_json: &str,
+    ) -> Result<(), ProbeError> {
+        use mesa_driver_protocol::pb;
+        let reply = session
+            .call(pb::envelope::Body::OpenConnection(pb::OpenConnection {
+                connection_handle: Self::PROBE_HANDLE,
+                endpoint_id: format!("probe-{driver_id}"),
+                config_json: connection_json.to_string(),
+            }))
+            .await
+            .map_err(|e| match e {
+                SessionError::Timeout => ProbeError::RpcTimeout,
+                other => ProbeError::Rpc(other.to_string()),
+            })?;
+        match reply.body {
+            Some(pb::envelope::Body::OpenConnectionAck(ack)) => match ack.result {
+                Some(r) if r.ok => Ok(()),
+                Some(r) => {
+                    let d = r.error.unwrap_or_default();
+                    Err(ProbeError::Rpc(format!(
+                        "open failed: {}/{}/{}",
+                        d.kind, d.code, d.message
+                    )))
+                }
+                None => Err(ProbeError::Rpc("open failed: empty result".into())),
+            },
+            Some(pb::envelope::Body::DriverError(e)) => {
+                let d = e.detail.unwrap_or_default();
+                Err(ProbeError::Rpc(format!(
+                    "open failed: {}/{}/{}",
+                    d.kind, d.code, d.message
+                )))
+            }
+            _ => Err(ProbeError::Rpc("open failed: unexpected reply".into())),
+        }
+    }
+
+    /// 关闭临时探测连接（best-effort：失败只诊断，不掩盖探测结论）。
+    async fn close_temp(session: &Session) {
+        use mesa_driver_protocol::pb;
+        if let Err(e) = session
+            .call(pb::envelope::Body::CloseConnection(pb::CloseConnection {
+                connection_handle: Self::PROBE_HANDLE,
+            }))
+            .await
+        {
+            tracing::debug!("probe close temp connection failed (ignored): {e}");
+        }
     }
 }
 

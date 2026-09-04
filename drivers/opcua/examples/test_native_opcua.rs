@@ -215,11 +215,14 @@ async fn main() {
     }
     let _ = transport.disconnect().await;
     println!("disconnect OK");
-    // Dynamic Probe（§8）：同进程直接调 Driver::probe（transport 复用验证）。
+    // Dynamic Probe（§8）：open 建连 → connection.probe（复用同一 transport 会话）。
     {
         let drv = mesa_driver_opcua::OpcUaDriver;
         let cfg = format!(r#"{{"endpoint_url":"{url}","timeout_ms":5000}}"#);
-        let rep = mesa_driver_sdk::Driver::probe(&drv, &cfg)
+        let mut conn = mesa_driver_sdk::Driver::open_connection(&drv, "smoke", &cfg)
+            .await
+            .expect("open 必须 Ok");
+        let rep = mesa_driver_sdk::DriverConnection::probe(&mut *conn)
             .await
             .expect("probe 必须 Ok");
         println!(

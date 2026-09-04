@@ -354,17 +354,18 @@ impl Session {
         }
     }
 
-    /// Dynamic Probe（§8）：发送 ProbeRequest 并等待 ProbeResponse。
+    /// Dynamic Probe（§8）：对已 OpenConnection 的 `connection_handle`
+    /// 发送 ProbeRequest 并等待 ProbeResponse。
     /// 调用方（MesaManager）须先以 `negotiated_minor()` 门控版本，
     /// 此处只做 RPC + 响应种类校验 + JSON 解码 + 大小校验，不解释业务语义。
     /// Driver 侧失败以同 msg_id 的 DriverErrorReport 回到此处，转为错误上抛。
     pub async fn probe(
         &self,
-        connection_json: &str,
+        connection_handle: u32,
     ) -> Result<mesa_core_types::ProbeReport, SessionError> {
         let reply = self
             .call(pb::envelope::Body::ProbeRequest(pb::ProbeRequest {
-                connection_json: connection_json.to_string(),
+                connection_handle,
             }))
             .await?;
         match reply.body {

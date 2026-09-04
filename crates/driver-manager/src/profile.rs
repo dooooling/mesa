@@ -124,7 +124,7 @@ pub fn match_profiles(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mesa_core_types::{MatchRule, ProbeCapabilities};
+    use mesa_core_types::MatchRule;
 
     fn rule(field: &str, op: &str, value: serde_json::Value) -> MatchRule {
         MatchRule {
@@ -157,7 +157,8 @@ mod tests {
             family: Some("0i".into()),
             model: model.map(str::to_string),
             firmware: None,
-            capabilities: ProbeCapabilities::default(),
+            model_confidence: None,
+            capabilities: vec![],
             warnings: vec![],
         }
     }
@@ -301,7 +302,8 @@ mod tests {
             family: Some("0i".into()),
             model: Some("0i-F Plus".into()),
             firmware: Some("V10".into()),
-            capabilities: ProbeCapabilities::default(),
+            model_confidence: None,
+            capabilities: vec![],
             warnings: vec![],
         };
         let hits = match_profiles("focas2", &r, &profiles);

@@ -118,9 +118,16 @@ async fn probe_simulator_returns_frozen_shape() {
     assert_eq!(v["device"]["vendor"], "Mesa");
     assert_eq!(v["device"]["family"], "Simulator");
     assert_eq!(v["device"]["model"], "Basic");
-    assert_eq!(v["capabilities"]["read"], true);
-    assert_eq!(v["capabilities"]["subscribe"], true);
-    assert_eq!(v["capabilities"]["browse"], true);
+    // P0-1：capabilities 为 CapabilityItem 数组（四态），simulator 为 poll-only
+    let caps = v["capabilities"].as_array().unwrap();
+    let state_of = |id: &str| {
+        caps.iter()
+            .find(|c| c["id"] == id)
+            .map(|c| c["state"].as_str().unwrap().to_string())
+    };
+    assert_eq!(state_of("read").as_deref(), Some("available"));
+    assert_eq!(state_of("subscribe").as_deref(), Some("not_present"));
+    assert_eq!(state_of("browse").as_deref(), Some("not_present"));
     assert!(v["warnings"].as_array().unwrap().is_empty());
     let hints = v["profile_hints"].as_array().unwrap();
     assert!(

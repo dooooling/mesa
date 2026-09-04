@@ -15,7 +15,8 @@ pub mod schema;
 pub use capability::{ControlCatalog, DiscoveryCapabilities, DriverCapabilities};
 pub use descriptor::{DriverDescriptor, DriverIdentity};
 pub use probe::{
-    PROBE_REPORT_MAX_BYTES, ProbeCapabilities, ProbeReport, ProbeWarning, check_report_size,
+    CapabilityItem, CapabilityState, PROBE_REPORT_MAX_BYTES, ProbeReport, ProbeWarning,
+    check_report_size,
 };
 pub use profile::{DeviceProfile, MatchRule, Preset, expand_preset};
 pub use resource::{

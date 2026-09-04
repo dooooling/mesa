@@ -452,20 +452,20 @@ mod tests {
         }
     }
 
-    /// Probe RPC framing 回环：请求与响应的 JSON 载荷原样透传。
+    /// Probe RPC framing 回环：请求带 connection_handle，响应 JSON 原样透传。
     #[tokio::test]
     async fn probe_envelopes_roundtrip_over_duplex() {
         let (mut a, mut b) = tokio::io::duplex(8 * 1024);
         let req = pb::Envelope {
             msg_id: 7,
             body: Some(pb::envelope::Body::ProbeRequest(pb::ProbeRequest {
-                connection_json: r#"{"host":"127.0.0.1"}"#.into(),
+                connection_handle: 999,
             })),
         };
         write_envelope(&mut a, &req).await.unwrap();
         match read_envelope(&mut b).await.unwrap().body {
             Some(pb::envelope::Body::ProbeRequest(r)) => {
-                assert_eq!(r.connection_json, r#"{"host":"127.0.0.1"}"#);
+                assert_eq!(r.connection_handle, 999);
             }
             other => panic!("unexpected body: {other:?}"),
         }

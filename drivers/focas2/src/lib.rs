@@ -23,9 +23,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mesa_core_types::{
-    AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, GENERIC_BINDING_KIND,
-    GenericBinding, PointDescriptor, PointMap, PointValue, ProbeCapabilities, ProbeReport,
-    ProbeWarning, Quality, TaskMode, Value, ValueOrigin, ensure_unique_point_keys, now_unix_ns,
+    AcquisitionTask, CapabilityItem, CapabilityState, DataBatch, DataType, DriverMetadata,
+    DuplicatePointKey, GENERIC_BINDING_KIND, GenericBinding, PointDescriptor, PointMap, PointValue,
+    ProbeReport, ProbeWarning, Quality, TaskMode, Value, ValueOrigin, ensure_unique_point_keys,
+    now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio_util::sync::CancellationToken;
@@ -308,91 +309,81 @@ impl Driver for FocasDriver {
             plan: None,
         }))
     }
-
-    /// FOCAS2 动态探测：短连接 + `system_info`（低风险只读）。
-    /// - 配置非法 → Err；建连失败 → Ok(unreachable)；
-    /// - sysinfo 失败 → reachable + IDENTITY_UNAVAILABLE；
-    /// - series 可确认 family/firmware，但 model 无法从 ODBSYS 唯一确定，
-    ///   恒为 None + MODEL_UNDETECTED（等真机确认 series→model 映射）。
-    /// 短连接的 disconnect 在返回前 best-effort 执行，不掩盖探测结论。
-    async fn probe(&self, connection_json: &str) -> Result<ProbeReport, SdkDriverError> {
-        let v: serde_json::Value = serde_json::from_str(connection_json).map_err(|e| {
-            SdkDriverError::configuration("BAD_CONFIG", format!("connection JSON 非法: {e}"))
-        })?;
-        let cfg = FocasConnConfig::from_json(&v)?;
-        let api = Self::probe_api(&v)?;
-        Self::probe_with_api(&api, &cfg).await
-    }
 }
 
-impl FocasDriver {
-    /// 按 `use_native` + `MESA_ALLOW_FAKE_NATIVE` 门禁选择后端（与 open_connection 同规则）。
-    fn probe_api(v: &serde_json::Value) -> Result<Arc<dyn FocasApiTrait>, SdkDriverError> {
-        let use_native = v
-            .get("use_native")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(true);
-        if !use_native && std::env::var("MESA_ALLOW_FAKE_NATIVE").ok().as_deref() != Some("1") {
-            return Err(SdkDriverError::configuration(
-                "BAD_CONFIG",
-                "use_native=false 仅在测试环境 MESA_ALLOW_FAKE_NATIVE=1 时允许",
-            ));
-        }
-        if use_native {
-            Ok(Arc::new(NativeFocasApi::new()))
-        } else {
-            Ok(Arc::new(FakeFocasApi::new()))
-        }
+/// 可注入后端的探测主体（connection 方法与单测共用；单测直传 Fake，无需碰进程级 env）。
+async fn await_probe_with_api(
+    api: &Arc<dyn FocasApiTrait>,
+    cfg: &FocasConnConfig,
+) -> Result<ProbeReport, SdkDriverError> {
+    if let Err(e) = api.connect(&cfg.host, cfg.port, cfg.timeout_ms).await {
+        return Ok(ProbeReport::unreachable("CONNECTION_FAILED", e));
     }
-
-    /// 可注入后端的探测主体（单测直传 Fake，无需碰进程级 env）。
-    async fn probe_with_api(
-        api: &Arc<dyn FocasApiTrait>,
-        cfg: &FocasConnConfig,
-    ) -> Result<ProbeReport, SdkDriverError> {
-        if let Err(e) = api.connect(&cfg.host, cfg.port, cfg.timeout_ms).await {
-            return Ok(ProbeReport::unreachable("CONNECTION_FAILED", e));
-        }
-        let report = match api.system_info().await {
-            Ok(info) => ProbeReport {
-                reachable: true,
-                vendor: Some("FANUC".into()),
-                family: Some(info.series),
-                model: None,
-                firmware: Some(info.version),
-                // FOCAS2 Driver 为纯 poll 实现：read 已被本次 sysinfo 证实，
-                // subscribe/browse 为实现确认不支持。
-                capabilities: ProbeCapabilities {
-                    read: Some(true),
-                    subscribe: Some(false),
-                    browse: Some(false),
+    let report = match api.system_info().await {
+        Ok(info) => ProbeReport {
+            reachable: true,
+            vendor: Some("FANUC".into()),
+            family: Some(info.series),
+            model: None,
+            firmware: Some(info.version),
+            model_confidence: None,
+            // FOCAS2 Driver 为纯 poll 实现：read 已被本次 sysinfo 证实，
+            // subscribe/browse 为实现确认不支持。
+            capabilities: vec![
+                CapabilityItem {
+                    id: "read".into(),
+                    state: CapabilityState::Available,
+                    detail: None,
                 },
-                warnings: vec![ProbeWarning {
-                    code: "MODEL_UNDETECTED".into(),
-                    message: "ODBSYS series 无法唯一确定 model，需真机确认映射".into(),
-                }],
-            },
-            Err(e) => ProbeReport {
-                reachable: true,
-                vendor: Some("FANUC".into()),
-                family: None,
-                model: None,
-                firmware: None,
-                capabilities: ProbeCapabilities {
-                    read: Some(true),
-                    subscribe: Some(false),
-                    browse: Some(false),
+                CapabilityItem {
+                    id: "subscribe".into(),
+                    state: CapabilityState::NotPresent,
+                    detail: Some("focas2 only supports poll mode".into()),
                 },
-                warnings: vec![ProbeWarning {
-                    code: "IDENTITY_UNAVAILABLE".into(),
-                    message: format!("system_info 读取失败: {e}"),
-                }],
-            },
-        };
-        // 短连接清理（trait 返回 ()，无可掩盖的错误）
-        api.disconnect().await;
-        Ok(report)
-    }
+                CapabilityItem {
+                    id: "browse".into(),
+                    state: CapabilityState::NotPresent,
+                    detail: Some("focas2 has no browse space".into()),
+                },
+            ],
+            warnings: vec![ProbeWarning {
+                code: "MODEL_UNDETECTED".into(),
+                message: "ODBSYS series 无法唯一确定 model，需真机确认映射".into(),
+            }],
+        },
+        Err(e) => ProbeReport {
+            reachable: true,
+            vendor: Some("FANUC".into()),
+            family: None,
+            model: None,
+            firmware: None,
+            model_confidence: None,
+            capabilities: vec![
+                CapabilityItem {
+                    id: "read".into(),
+                    state: CapabilityState::Available,
+                    detail: None,
+                },
+                CapabilityItem {
+                    id: "subscribe".into(),
+                    state: CapabilityState::NotPresent,
+                    detail: Some("focas2 only supports poll mode".into()),
+                },
+                CapabilityItem {
+                    id: "browse".into(),
+                    state: CapabilityState::NotPresent,
+                    detail: Some("focas2 has no browse space".into()),
+                },
+            ],
+            warnings: vec![ProbeWarning {
+                code: "IDENTITY_UNAVAILABLE".into(),
+                message: format!("system_info 读取失败: {e}"),
+            }],
+        },
+    };
+    // 短连接清理（trait 返回 ()，无可掩盖的错误）
+    api.disconnect().await;
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +516,16 @@ fn parse_data_type(s: &str) -> Result<DataType, SdkDriverError> {
 
 #[async_trait::async_trait]
 impl DriverConnection for FocasConnection {
+    /// FOCAS2 动态探测：复用本连接的 api/cfg 做短连接 + `system_info`（低风险只读）。
+    /// - 建连失败 → Ok(unreachable)；sysinfo 失败 → reachable + IDENTITY_UNAVAILABLE；
+    /// - series 可确认 family/firmware，但 model 无法从 ODBSYS 唯一确定，
+    ///   恒为 None + MODEL_UNDETECTED（等真机确认 series→model 映射）。
+    /// 配置已在 OpenConnection 校验（含 use_native 门禁）；短连接的 disconnect
+    /// 在返回前 best-effort 执行，不掩盖探测结论。
+    async fn probe(&mut self) -> Result<ProbeReport, SdkDriverError> {
+        await_probe_with_api(&self.api, &self.cfg).await
+    }
+
     async fn configure(
         &mut self,
         revision: u64,
@@ -1017,39 +1018,51 @@ mod tests {
     #[tokio::test]
     async fn probe_fake_returns_deterministic_identity() {
         // Fake 身份是合同基准：FANUC / 0i-F / 固件 1.0，model 恒 None + MODEL_UNDETECTED。
-        // 直传 Fake 后端，不碰进程级 env（多线程下 set_var/remove_var 与
-        // 其它测试的 env 读竞态会导致 Linux SIGABRT）。
-        let api: Arc<dyn FocasApiTrait> = Arc::new(FakeFocasApi::new());
-        let cfg = FocasConnConfig {
-            host: "127.0.0.1".into(),
-            ..Default::default()
+        // 经已打开的连接调用（OpenConnection 阶段已做配置门禁），不碰进程级 env。
+        let mut conn = FocasConnection {
+            cfg: FocasConnConfig::default(),
+            api: Arc::new(FakeFocasApi::new()),
+            plan: None,
         };
-        let r = FocasDriver::probe_with_api(&api, &cfg)
-            .await
-            .expect("Fake probe 必须 Ok");
+        let r = conn.probe().await.expect("Fake probe 必须 Ok");
         assert!(r.reachable);
         assert_eq!(r.vendor.as_deref(), Some("FANUC"));
         assert_eq!(r.family.as_deref(), Some("0i-F"));
         assert_eq!(r.firmware.as_deref(), Some("1.0"));
         assert!(r.model.is_none());
         assert!(r.warnings.iter().any(|w| w.code == "MODEL_UNDETECTED"));
-        assert_eq!(r.capabilities.read, Some(true));
+        assert!(
+            r.capabilities
+                .iter()
+                .any(|c| c.id == "read" && c.state == mesa_core_types::CapabilityState::Available)
+        );
     }
 
     #[tokio::test]
-    async fn probe_rejects_bad_config() {
+    async fn open_rejects_bad_config() {
+        // 配置校验在 OpenConnection（probe 复用已开连接）
         let d = FocasDriver;
-        let err = Driver::probe(&d, "not-json").await.unwrap_err();
+        let err = match d.open_connection("t", "not-json").await {
+            Ok(_) => panic!("非法配置必须拒绝"),
+            Err(e) => e,
+        };
         assert_eq!(err.code, "BAD_CONFIG");
     }
 
     #[tokio::test]
     async fn probe_native_without_dll_is_unreachable() {
-        // CI 无 fwlib：Native 建连失败 → Ok(unreachable)，不是 Err
-        let d = FocasDriver;
-        let r = Driver::probe(&d, r#"{"host":"127.0.0.1","port":9}"#)
-            .await
-            .expect("不可达是探测结果");
+        // CI 无 fwlib（Linux 下 load 失败干净返回，不再 SIGSEGV）：Native 建连失败
+        // → Ok(unreachable)，不是 Err。经已打开的连接调用，不碰进程级 env。
+        let mut conn = FocasConnection {
+            cfg: FocasConnConfig {
+                host: "127.0.0.1".into(),
+                port: 9,
+                timeout_ms: 1000,
+            },
+            api: Arc::new(NativeFocasApi::new()),
+            plan: None,
+        };
+        let r = conn.probe().await.expect("不可达是探测结果");
         assert!(!r.reachable);
         assert!(r.warnings.iter().any(|w| w.code == "CONNECTION_FAILED"));
     }

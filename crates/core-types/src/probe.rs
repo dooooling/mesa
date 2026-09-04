@@ -1,9 +1,13 @@
-//! Dynamic Probe 数据契约（V1.2.1 §8，feat/dynamic-probe 阶段 1）。
+//! Dynamic Probe 数据契约（V1.2.1 §8，feat/dynamic-probe）。
 //!
 //! 边界：本模块只描述"本次探测到的设备事实"，不做匹配、不做持久化、不碰
 //! Data Plane。Driver 只返回 facts，facts→profile 的解释权只在 Core。
-//! 三态能力使用 `Option<bool>`：`Some(true)` 已确认支持 / `Some(false)`
-//! 已确认不支持 / `None` 本次未确认——"没探测"绝不能被误读为"不支持"。
+//!
+//! 能力模型（冻结）：动态字符串 ID + 四态，不是固定三 bool——
+//! 后者无法区分 AccessDenied/NotPresent，更承载不了 alarm/tool/drive/gud
+//! 这类动态 capability ID（P0-1）。
+//! - `CapabilityItem.detail`：只写该 capability 自己的局部原因；
+//! - `ProbeWarning`：只写跨 capability / 全局性问题；同一问题禁止两处重复。
 
 use serde::{Deserialize, Serialize};
 
@@ -11,31 +15,40 @@ use serde::{Deserialize, Serialize};
 /// 超限视为非法报告，fail-closed）。
 pub const PROBE_REPORT_MAX_BYTES: usize = 64 * 1024;
 
-/// 本次实际探测到的设备能力（与静态 `DriverCapabilities` 语义不同：
-/// 后者声明 Driver 类型支持什么，前者记录这次对端实际确认了什么）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct ProbeCapabilities {
+/// 能力状态（冻结四态，序列化为 snake_case）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityState {
+    Available,
+    AccessDenied,
+    NotPresent,
+    Unknown,
+}
+
+/// 单个动态能力：ID 为动态字符串（如 `alarm`/`tool`/`drive`/`gud`），
+/// Core 不解释 ID 含义，只做透传与 profile 匹配输入。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityItem {
+    pub id: String,
+    pub state: CapabilityState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub read: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subscribe: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub browse: Option<bool>,
+    pub detail: Option<String>,
 }
 
 /// 结构化 Warning：只承载跨 capability / 全局性问题（如 MODEL_UNDETECTED、
-/// NAMESPACE_PARTIAL），单个 capability 的状态原因只写它自己的去处，
-/// 同一问题禁止同时写两处。不设 severity/category——按需再评审。
+/// NAMESPACE_PARTIAL、OPTIONAL_PROBE_TIMEOUT、SECURITY_DOWNGRADE）。
+/// 不设 severity/category——按需再评审。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeWarning {
     pub code: String,
     pub message: String,
 }
 
-/// 动态探测报告：Driver::probe() 的返回契约。
+/// 动态探测报告：DriverConnection::probe() 的返回契约。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeReport {
     pub reachable: bool,
+    /// 扩展事实（不参与匹配白名单校验之外的任何解释）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -44,8 +57,11 @@ pub struct ProbeReport {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firmware: Option<String>,
+    /// 模型识别置信度（如 high/low），识别失败时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_confidence: Option<String>,
     #[serde(default)]
-    pub capabilities: ProbeCapabilities,
+    pub capabilities: Vec<CapabilityItem>,
     #[serde(default)]
     pub warnings: Vec<ProbeWarning>,
 }
@@ -59,7 +75,8 @@ impl ProbeReport {
             family: None,
             model: None,
             firmware: None,
-            capabilities: ProbeCapabilities::default(),
+            model_confidence: None,
+            capabilities: vec![],
             warnings: vec![ProbeWarning {
                 code: code.into(),
                 message: message.into(),
@@ -69,6 +86,11 @@ impl ProbeReport {
 
     /// 最小合法性校验（大小/UTF-8 由调用方在 IPC 边界保证）。
     pub fn validate(&self) -> Result<(), String> {
+        for c in &self.capabilities {
+            if c.id.trim().is_empty() {
+                return Err("capability id 不能为空".into());
+            }
+        }
         for w in &self.warnings {
             if w.code.trim().is_empty() {
                 return Err("probe warning code 不能为空".into());
@@ -117,11 +139,29 @@ mod tests {
             family: Some("0i-F".into()),
             model: Some("0i-F Plus".into()),
             firmware: Some("V1.0".into()),
-            capabilities: ProbeCapabilities {
-                read: Some(true),
-                subscribe: None,
-                browse: Some(false),
-            },
+            model_confidence: Some("high".into()),
+            capabilities: vec![
+                CapabilityItem {
+                    id: "tool".into(),
+                    state: CapabilityState::Available,
+                    detail: None,
+                },
+                CapabilityItem {
+                    id: "alarm".into(),
+                    state: CapabilityState::AccessDenied,
+                    detail: Some("BadUserAccessDenied".into()),
+                },
+                CapabilityItem {
+                    id: "drive".into(),
+                    state: CapabilityState::NotPresent,
+                    detail: None,
+                },
+                CapabilityItem {
+                    id: "gud".into(),
+                    state: CapabilityState::Unknown,
+                    detail: None,
+                },
+            ],
             warnings: vec![ProbeWarning {
                 code: "NAMESPACE_PARTIAL".into(),
                 message: "partial".into(),
@@ -130,19 +170,21 @@ mod tests {
         let s = r.to_report_json().expect("序列化 Ok");
         let back = ProbeReport::from_report_json(&s).expect("回读 Ok");
         assert_eq!(r, back);
-        // None 能力不序列化（压缩噪音），但回读仍为 None
-        assert!(!s.contains("subscribe"));
+        // 四态序列化形态冻结
+        assert!(s.contains("\"access_denied\""));
+        assert!(s.contains("\"not_present\""));
     }
 
     #[test]
-    fn unknown_device_allows_all_none_and_empty_warnings() {
+    fn unknown_device_allows_all_none_and_empty_lists() {
         let r = ProbeReport {
             reachable: true,
             vendor: None,
             family: None,
             model: None,
             firmware: None,
-            capabilities: ProbeCapabilities::default(),
+            model_confidence: None,
+            capabilities: vec![],
             warnings: vec![],
         };
         let back = ProbeReport::from_report_json(&r.to_report_json().unwrap()).unwrap();
@@ -153,6 +195,7 @@ mod tests {
     fn unreachable_helper_carries_code_only_in_warnings() {
         let r = ProbeReport::unreachable("CONNECTION_FAILED", "timeout");
         assert!(!r.reachable);
+        assert!(r.capabilities.is_empty());
         assert_eq!(r.warnings.len(), 1);
         assert_eq!(r.warnings[0].code, "CONNECTION_FAILED");
     }
@@ -162,7 +205,7 @@ mod tests {
         // 旧/最小报告缺字段时按 None/空处理，不报错
         let back = ProbeReport::from_report_json(r#"{"reachable":true}"#).unwrap();
         assert!(back.reachable);
-        assert_eq!(back.capabilities, ProbeCapabilities::default());
+        assert!(back.capabilities.is_empty());
         assert!(back.warnings.is_empty());
     }
 
@@ -173,10 +216,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_warning_code_rejected() {
-        let mut r = ProbeReport::unreachable("", "m");
+    fn empty_ids_rejected() {
+        let mut r = ProbeReport::unreachable("C", "m");
+        r.capabilities.push(CapabilityItem {
+            id: "  ".into(),
+            state: CapabilityState::Unknown,
+            detail: None,
+        });
         assert!(r.validate().is_err());
-        r.warnings[0].code = "OK".into();
-        assert!(r.validate().is_ok());
+        r.capabilities.clear();
+        r.warnings[0].code = String::new();
+        assert!(r.validate().is_err());
     }
 }

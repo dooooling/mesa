@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mesa_core_types::{
-    AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, GENERIC_BINDING_KIND,
-    GenericBinding, PointDescriptor, PointMap, PointValue, ProbeCapabilities, ProbeReport,
-    ProbeWarning, TaskMode, Value, ensure_unique_point_keys, now_unix_ns,
+    AcquisitionTask, CapabilityItem, CapabilityState, DataBatch, DataType, DriverMetadata,
+    DuplicatePointKey, GENERIC_BINDING_KIND, GenericBinding, PointDescriptor, PointMap, PointValue,
+    ProbeReport, ProbeWarning, TaskMode, Value, ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio::sync::Mutex;
@@ -168,62 +168,6 @@ impl Driver for S7Driver {
             cfg: s7cfg,
             plan: None,
         }))
-    }
-
-    /// S7 动态探测：建短 S7 会话，读 SZL 0x0011 取 CPU 标识。
-    /// - 配置非法 → Err（基础设施/配置失败）；
-    /// - 建连失败 → Ok(unreachable)（设备不可达是探测结果）；
-    /// - SZL 失败或解析失败 → reachable + IDENTITY_UNAVAILABLE（绝不猜型号，
-    ///   更不从端口号反推，见 §8.5）。
-    /// 短连接随函数返回 drop，不进入任何采集计划。
-    async fn probe(&self, connection_json: &str) -> Result<ProbeReport, SdkDriverError> {
-        let v: serde_json::Value = serde_json::from_str(connection_json).map_err(|e| {
-            SdkDriverError::configuration("BAD_CONFIG", format!("connection JSON 非法: {e}"))
-        })?;
-        let cfg = S7ConnConfig::from_json(&v)?;
-        let mut client = match S7Client::connect(cfg).await {
-            Ok(c) => c,
-            Err(e) => return Ok(ProbeReport::unreachable("CONNECTION_FAILED", e.to_string())),
-        };
-        let (vendor, model, warnings) = match client.read_szl(0x0011, 1).await {
-            Ok(payload) => match parse_szl_module_id(&payload, 0x0011, 1) {
-                Some(mlfb) => {
-                    let vendor = mlfb.starts_with("6ES").then(|| "Siemens".to_string());
-                    (vendor, Some(mlfb), vec![])
-                }
-                None => (
-                    None,
-                    None,
-                    vec![ProbeWarning {
-                        code: "IDENTITY_UNAVAILABLE".into(),
-                        message: "SZL 0x0011 响应无法解析出模块标识".into(),
-                    }],
-                ),
-            },
-            Err(e) => (
-                None,
-                None,
-                vec![ProbeWarning {
-                    code: "IDENTITY_UNAVAILABLE".into(),
-                    message: format!("SZL 0x0011 读取失败: {e}"),
-                }],
-            ),
-        };
-        Ok(ProbeReport {
-            reachable: true,
-            vendor,
-            family: None,
-            model,
-            firmware: None,
-            // S7 Driver 为纯 poll 实现（见 descriptor）：read 已被本次 SZL 证实，
-            // subscribe/browse 为实现确认不支持。
-            capabilities: ProbeCapabilities {
-                read: Some(true),
-                subscribe: Some(false),
-                browse: Some(false),
-            },
-            warnings,
-        })
     }
 }
 
@@ -371,6 +315,71 @@ fn merge_paired_to_bulks_with_max(
 
 #[async_trait::async_trait]
 impl DriverConnection for S7Connection {
+    /// S7 动态探测：复用本连接 cfg 建短 S7 会话，读 SZL 0x0011 取 CPU 标识。
+    /// - 建连失败 → Ok(unreachable)（设备不可达是探测结果）；
+    /// - SZL 失败或解析失败 → reachable + IDENTITY_UNAVAILABLE（绝不猜型号，
+    ///   更不从端口号反推，见 §8.5）。
+    /// 配置已在 OpenConnection 校验；短连接随函数返回 drop，不进入采集计划。
+    async fn probe(&mut self) -> Result<ProbeReport, SdkDriverError> {
+        let cfg = self.cfg.clone();
+        let mut client = match S7Client::connect(cfg).await {
+            Ok(c) => c,
+            Err(e) => return Ok(ProbeReport::unreachable("CONNECTION_FAILED", e.to_string())),
+        };
+        let (vendor, model, warnings) = match client.read_szl(0x0011, 1).await {
+            Ok(payload) => match parse_szl_module_id(&payload, 0x0011, 1) {
+                Some(mlfb) => {
+                    let vendor = mlfb.starts_with("6ES").then(|| "Siemens".to_string());
+                    (vendor, Some(mlfb), vec![])
+                }
+                None => (
+                    None,
+                    None,
+                    vec![ProbeWarning {
+                        code: "IDENTITY_UNAVAILABLE".into(),
+                        message: "SZL 0x0011 响应无法解析出模块标识".into(),
+                    }],
+                ),
+            },
+            Err(e) => (
+                None,
+                None,
+                vec![ProbeWarning {
+                    code: "IDENTITY_UNAVAILABLE".into(),
+                    message: format!("SZL 0x0011 读取失败: {e}"),
+                }],
+            ),
+        };
+        Ok(ProbeReport {
+            reachable: true,
+            vendor,
+            family: None,
+            model,
+            firmware: None,
+            model_confidence: None,
+            // S7 Driver 为纯 poll 实现（见 descriptor）：read 已被本次 SZL 证实，
+            // subscribe/browse 为实现确认缺席。
+            capabilities: vec![
+                CapabilityItem {
+                    id: "read".into(),
+                    state: CapabilityState::Available,
+                    detail: None,
+                },
+                CapabilityItem {
+                    id: "subscribe".into(),
+                    state: CapabilityState::NotPresent,
+                    detail: Some("s7 only supports poll mode".into()),
+                },
+                CapabilityItem {
+                    id: "browse".into(),
+                    state: CapabilityState::NotPresent,
+                    detail: Some("s7 has no browse space".into()),
+                },
+            ],
+            warnings,
+        })
+    }
+
     async fn configure(
         &mut self,
         revision: u64,
@@ -1100,23 +1109,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_rejects_bad_config_without_touching_network() {
+    async fn open_rejects_bad_config_without_touching_network() {
+        // 配置校验仍在 OpenConnection（probe 复用已开连接，不再解析配置）
         let d = S7Driver;
-        let err = Driver::probe(&d, "not-json").await.unwrap_err();
+        let err = match d.open_connection("t", "not-json").await {
+            Ok(_) => panic!("非法配置必须拒绝"),
+            Err(e) => e,
+        };
         assert_eq!(err.code, "BAD_CONFIG");
     }
 
     #[tokio::test]
     async fn probe_refused_port_is_unreachable_not_error() {
-        // 127.0.0.1:9 预期关闭：连接被拒 → Ok(unreachable)，不是 Err。
-        let d = S7Driver;
-        let r = Driver::probe(&d, r#"{"host":"127.0.0.1","port":9}"#)
-            .await
-            .expect("不可达是探测结果，不应 Err");
+        // 127.0.0.1:9 预期关闭：连接被拒 → Ok(unreachable)，不是 Err
+        let mut conn = S7Connection {
+            cfg: S7ConnConfig {
+                host: "127.0.0.1".into(),
+                port: 9,
+                ..Default::default()
+            },
+            plan: None,
+        };
+        let r = conn.probe().await.expect("不可达是探测结果，不应 Err");
         assert!(!r.reachable);
         assert_eq!(r.warnings.len(), 1);
         assert_eq!(r.warnings[0].code, "CONNECTION_FAILED");
         assert!(r.model.is_none());
+        assert!(r.capabilities.is_empty());
     }
 
     #[test]

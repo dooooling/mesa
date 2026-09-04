@@ -4,6 +4,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use mesa_core_types::{AcquisitionTask, PointDescriptor, TaskMode};
 use mesa_driver_manager::session::Session;
 use mesa_driver_protocol::pb;
@@ -479,4 +481,98 @@ pub async fn assert_no_batches_for(
             Ok(None) => return,
         }
     }
+}
+
+// ---- Dynamic Probe 会话级（§8，P0-3 由 probe_contract 并入）----
+
+// ---- 会话级（in-process）----
+
+#[tokio::test]
+async fn session_probe_simulator_returns_identity() {
+    let (port, cancel) = start_sim_server().await;
+    let (session, _events, _) = Session::connect(port, TOKEN).await.unwrap();
+    assert_eq!(
+        session.negotiated_minor(),
+        mesa_driver_protocol::PROTOCOL_MINOR
+    );
+    // P0-2：先 OpenConnection 建连，再 ProbeRequest(handle)
+    let open = session
+        .call(mesa_driver_protocol::pb::envelope::Body::OpenConnection(
+            mesa_driver_protocol::pb::OpenConnection {
+                connection_handle: 7,
+                endpoint_id: "probe-test".into(),
+                config_json: "{}".into(),
+            },
+        ))
+        .await
+        .expect("open ok");
+    assert!(matches!(
+        open.body,
+        Some(mesa_driver_protocol::pb::envelope::Body::OpenConnectionAck(
+            _
+        ))
+    ));
+    let r = session.probe(7).await.expect("probe ok");
+    assert!(r.reachable);
+    assert_eq!(r.vendor.as_deref(), Some("Mesa"));
+    assert_eq!(r.family.as_deref(), Some("Simulator"));
+    assert_eq!(r.model.as_deref(), Some("Basic"));
+    assert_eq!(r.firmware.as_deref(), Some("1.0"));
+    let state = |id: &str| r.capabilities.iter().find(|c| c.id == id).map(|c| c.state);
+    assert_eq!(
+        state("read"),
+        Some(mesa_core_types::CapabilityState::Available)
+    );
+    assert!(r.warnings.is_empty());
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn session_probe_hanging_server_maps_to_timeout() {
+    // 假驱动：走完 Hello/Welcome 后永远沉默 → RPC 超时（REQUEST_TIMEOUT 10s）。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        use mesa_driver_protocol::{pb, read_envelope, write_envelope};
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let (mut rd, mut wr) = stream.into_split();
+        // 驱动先发言 Hello，Core 回 Welcome（§14.3 握手方向）
+        let Ok(_) = write_envelope(
+            &mut wr,
+            &pb::Envelope {
+                msg_id: 1,
+                body: Some(pb::envelope::Body::Hello(pb::Hello {
+                    driver_id: "hang".into(),
+                    driver_version: "0.0.0".into(),
+                    protocol_major: mesa_driver_protocol::PROTOCOL_MAJOR,
+                    protocol_minor: mesa_driver_protocol::PROTOCOL_MINOR,
+                    sdk_version: "test".into(),
+                    platform: std::env::consts::OS.into(),
+                    instance_id: "hang-1".into(),
+                    session_token: TOKEN.into(),
+                })),
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let Ok(_) = read_envelope(&mut rd).await else {
+            return;
+        };
+        // 读掉 ProbeRequest 然后沉默
+        let _ = read_envelope(&mut rd).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    let (session, _events, _) = Session::connect(port, TOKEN).await.unwrap();
+    // P0-2：probe 需要已打开的 handle；hang 服务对任何请求沉默 → RPC 超时
+    let err = session.probe(7).await.expect_err("必须超时");
+    assert!(
+        matches!(err, mesa_driver_manager::session::SessionError::Timeout),
+        "实际: {err}"
+    );
 }
