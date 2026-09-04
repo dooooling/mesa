@@ -185,6 +185,8 @@ impl Driver for OpcUaDriver {
                 browse: true,
                 ..Default::default()
             },
+            // Event Plane PR5：老 Driver 无事件目录即 empty（Major 不升级）
+            events: Default::default(),
         }
     }
 

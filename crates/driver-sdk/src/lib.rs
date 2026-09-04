@@ -108,6 +108,8 @@ pub trait Driver: Send + Sync + 'static {
                 ..Default::default()
             },
             capabilities: mesa_core_types::DriverCapabilities::default(),
+            // 老 Driver 无事件目录即 empty（Event §5 向后兼容，Major 不升级）
+            events: Default::default(),
         }
     }
 

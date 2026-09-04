@@ -30,6 +30,10 @@ pub struct DriverDescriptor {
     pub discovery: DiscoveryCapabilities,
     #[serde(default)]
     pub capabilities: DriverCapabilities,
+    /// 事件目录（Event Plane §5）：serde(default) 保证老 Driver 无该字段时
+    /// 按 empty 正常工作，Descriptor Major 不升级（backwards-compatible Minor）。
+    #[serde(default)]
+    pub events: crate::event::EventCatalog,
 }
 
 impl DriverDescriptor {
@@ -51,6 +55,7 @@ impl DriverDescriptor {
             }
         }
         self.controls.validate()?;
+        self.events.validate()?;
         Ok(())
     }
 }

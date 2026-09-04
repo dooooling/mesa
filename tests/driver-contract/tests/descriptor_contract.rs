@@ -185,6 +185,7 @@ fn synthetic_descriptor() -> DriverDescriptor {
             ..Default::default()
         },
         capabilities: DriverCapabilities::default(),
+        events: Default::default(),
     }
 }
 

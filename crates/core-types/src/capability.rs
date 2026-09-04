@@ -17,6 +17,9 @@ pub struct DriverCapabilities {
     pub write: bool,
     #[serde(default)]
     pub method: bool,
+    /// 是否支持事件（Event Plane §5）：老 Driver 缺字段即 false，正常工作。
+    #[serde(default)]
+    pub events: bool,
 }
 
 /// Discovery 能力（§20.1）。
