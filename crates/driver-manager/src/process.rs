@@ -127,32 +127,51 @@ impl DriverProcess {
     }
 }
 
-/// Core 进程内已租出的 Driver IPC 端口表（P1-A）。
+/// Core 进程内已租出的 Driver IPC 端口表（P1-A 第一层：线程/任务间去重）。
 /// OS 会循环复用刚释放的端口号；并发 spawn 时裸 bind(:0)-取号-drop
 /// 必然让两个 child 撞号。租约表消除 Core 内部竞争源（生产最现实的
 /// 竞争：多 Endpoint 并发启动 / reconnect 与 Probe 并发）。
-/// 外部进程在 bind-drop-child_bind 极小窗口抢号理论仍存在，届时靠
-/// connect_retry + token mismatch fail-closed 兜底（报错，不连错设备）。
 static ACTIVE_DRIVER_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
 
 fn active_driver_ports() -> &'static Mutex<HashSet<u16>> {
     ACTIVE_DRIVER_PORTS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// 端口租约：持有期间该端口不会被本 Core 再次分配；
+/// 跨进程端口声明目录：`create_new` 原子性保证同一端口同时只被一个
+/// Mesa 进程认领（P1-A 第二层）。cargo 并行跑多个 test binary 时各是
+/// 独立进程，进程内表管不到——此前表现为连到别人的 driver 被 RST
+///（`Connection reset by peer` → 503 DRIVER_UNAVAILABLE，CI 2/2 复现）。
+fn port_claim_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("mesa-driver-ports")
+}
+
+/// 端口租约：持有期间该端口不会被任何 Mesa 进程再次分配；
 /// 随 `DriverProcess` drop 自动释放（子进程已退出，端口可安全复用）。
+///
+/// 崩溃残留说明：Core 被 kill -9 时声明文件残留，该端口被后续运行跳过。
+/// 临时端口空间巨大（~28k）且 CI runner 是一次性的，属良性；生产 Core
+/// 崩溃一次才漏一个端口，相对于引入跨平台 PID 存活检查的复杂度可接受。
 struct PortLease {
     port: u16,
+    /// 声明文件句柄：一直打开，drop 时先关后删（Windows 下打开的文件删不掉）。
+    _claim_file: Option<std::fs::File>,
+    claim_path: std::path::PathBuf,
 }
 
 impl Drop for PortLease {
     fn drop(&mut self) {
         active_driver_ports().lock().unwrap().remove(&self.port);
+        drop(self._claim_file.take());
+        let _ = std::fs::remove_file(&self.claim_path);
     }
 }
 
-/// 分配 IPC 端口租约：OS bind(:0) 取号 + 进程内去重（至多 64 次重试）。
-/// 锁只保护 HashSet 插查（微秒级），bind 本身在锁外，不阻塞并发 spawn。
+/// 分配 IPC 端口租约：OS bind(:0) 取号 + 进程内去重 + 跨进程声明
+/// （至多 64 次重试）。锁只保护 HashSet 插查（微秒级），bind 与文件
+/// 声明在锁外，不阻塞并发 spawn。
+///
+/// 剩余窗口（接受）：非 Mesa 外部进程在 bind-drop-child_bind 间隙抢号。
+/// 届时靠 connect_retry + token mismatch fail-closed 兜底（报错，不连错设备）。
 fn lease_port() -> Option<PortLease> {
     for _ in 0..64 {
         let port = std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -160,13 +179,40 @@ fn lease_port() -> Option<PortLease> {
             .local_addr()
             .ok()?
             .port();
-        // NOTE: 此处 listener 已 drop，child 尚未 bind——窗口仍在，
-        // 但至少本 Core 内绝不双发同一端口（外部抢号属下一级小概率事件）。
-        if active_driver_ports().lock().unwrap().insert(port) {
-            return Some(PortLease { port });
+        if !active_driver_ports().lock().unwrap().insert(port) {
+            continue;
+        }
+        match claim_port_cross_process(port) {
+            Some((file, path)) => {
+                return Some(PortLease {
+                    port,
+                    _claim_file: Some(file),
+                    claim_path: path,
+                });
+            }
+            // 被别的 Mesa 进程认领：退回本进程名额，换号重试
+            None => {
+                active_driver_ports().lock().unwrap().remove(&port);
+            }
         }
     }
     None
+}
+
+/// 跨进程认领端口：`create_new` 原子，文件已存在即认领失败。
+/// 目录创建失败视为认领失败（换号重试，不 fail 整个 spawn）。
+fn claim_port_cross_process(port: u16) -> Option<(std::fs::File, std::path::PathBuf)> {
+    let dir = port_claim_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let path = dir.join(format!("port-{port}.lock"));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()
+        .map(|f| (f, path))
 }
 
 /// 256-bit 随机 session token 的十六进制形式（§14.2）。

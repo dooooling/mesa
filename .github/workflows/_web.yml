@@ -1,0 +1,31 @@
+# Web（Ubuntu x64，一次）：mesa-web 与 Rust Native 并行跑，
+# Windows/ARM runner 不再为 Rust 装 Node/pnpm。
+name: web
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 10.28.0
+          run_install: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22.18.0'
+          cache: 'pnpm'
+          cache-dependency-path: 'apps/mesa-web/pnpm-lock.yaml'
+
+      - name: pnpm install
+        run: pnpm --dir apps/mesa-web install --frozen-lockfile
+
+      - name: web build
+        run: pnpm --filter mesa-web build

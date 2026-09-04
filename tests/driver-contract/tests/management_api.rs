@@ -100,7 +100,17 @@ async fn probe_does_not_create_endpoint() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     // probe 必须 reachable，且不创建 Endpoint（endpoint 列表为空）
-    assert_eq!(resp.status(), StatusCode::OK);
+    // 诊断要求：非 200 必须带 body（偶发 503 时区分 Handshake/Spawn/Rpc）。
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "probe body: {}",
+        String::from_utf8_lossy(&bytes)
+    );
 }
 
 /// §8 REST 冻结形状：device/capabilities/profile_hints/warnings。
@@ -113,8 +123,8 @@ async fn probe_simulator_returns_frozen_shape() {
         r#"{"connection":{}}"#,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(v["reachable"], true);
+    assert_eq!(status, StatusCode::OK, "probe body: {v}");
+    assert_eq!(v["reachable"], true, "probe body: {v}");
     assert_eq!(v["device"]["vendor"], "Mesa");
     assert_eq!(v["device"]["family"], "Simulator");
     assert_eq!(v["device"]["model"], "Basic");
@@ -183,8 +193,8 @@ async fn probe_s7_closed_port_is_unreachable_200() {
         r#"{"connection":{"host":"127.0.0.1","port":9}}"#,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(v["reachable"], false);
+    assert_eq!(status, StatusCode::OK, "probe body: {v}");
+    assert_eq!(v["reachable"], false, "probe body: {v}");
     // P1-B：没探测到 ≠ 猜型号——unreachable 时 hints 必须为空，
     // 禁止仅凭 driver_id 断言具体硬件型号（s7-1200/1214C）。
     let hints = v["profile_hints"].as_array().unwrap();

@@ -1,0 +1,54 @@
+# Rust Primary（Ubuntu x64，唯一）：平台无关工作只做一次——
+# fmt / clippy / workspace build / workspace correctness（除 performance）/
+# fast performance（默认短模式；PERF_SOAK/PERF_LONG 长 soak 永不进 PR）。
+#
+# protoc：全部走 protoc-bin-vendored（Cargo.lock 锁定），不 apt install，
+# 不设 PROTOC（build.rs 无 PROTOC 时自动用 vendored，更确定性）。
+name: rust-primary
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  primary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master@2026-09-05
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt, clippy
+
+      - name: fmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: build workspace
+        run: cargo build --locked --workspace
+
+      - name: test workspace (excluding performance)
+        run: cargo test --locked --workspace --all-features --exclude mesa-performance-tests
+
+      # PR Fast Perf：只跑秒级项。soak_short（60s）不在 PR 路径，
+      # 独立跑：cargo test -p mesa-performance-tests --test soak_short
+      # （nightly/manual；Formal 1h soak 另加 PERF_SOAK，见 tests/performance）。
+      - name: fast performance (PR set, soak_short excluded)
+        run: >
+          cargo test --locked -p mesa-performance-tests
+          --test backpressure
+          --test configure_large
+          --test conn_1000
+          --test control_latency
+          --test data_plane_soak
+          --test e2e_50k_real
+          --test ipc_latency
