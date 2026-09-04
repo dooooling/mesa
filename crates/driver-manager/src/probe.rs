@@ -48,6 +48,12 @@ pub struct ProbeResult {
     pub profile_hints: Vec<ProfileMatch>,
 }
 
+/// Probe RPC 版本门控（纯函数，可单测）：协商 Minor < 2 的旧 Driver
+/// 不识别 ProbeRequest（会静默忽略），必须直接 Unsupported，不得发 RPC 干等。
+pub(crate) fn probe_supported(negotiated_minor: u32) -> bool {
+    negotiated_minor >= mesa_driver_protocol::PROBE_RPC_MIN_MINOR
+}
+
 impl MesaManager {
     /// 动态探测：返回设备事实报告 + profile 提示。临时进程生命周期与本调用严格绑定。
     pub async fn probe(
@@ -90,7 +96,7 @@ impl MesaManager {
                 .await
                 .map_err(|e| ProbeError::Handshake(e.to_string()))?;
             let r = async {
-                if session.negotiated_minor() < PROBE_RPC_MIN_MINOR {
+                if !probe_supported(session.negotiated_minor()) {
                     return Err(ProbeError::Unsupported(format!(
                         "negotiated minor {} < {}",
                         session.negotiated_minor(),
@@ -116,6 +122,14 @@ impl MesaManager {
 mod tests {
     use super::*;
     use crate::manager::MesaManager;
+
+    #[test]
+    fn old_minor_is_gated_before_any_rpc() {
+        assert!(!probe_supported(0));
+        assert!(!probe_supported(1));
+        assert!(probe_supported(2));
+        assert!(probe_supported(u32::MAX));
+    }
 
     #[test]
     fn probe_error_display_is_stable() {

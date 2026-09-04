@@ -21,6 +21,7 @@ SUITES = [
     "data_semantics",
     "control_contract",
     "management_api",
+    "probe_contract",
     "profile_contract",
     "resource_contract",
     "subprocess_orphan_guard",
@@ -75,7 +76,7 @@ def main():
         "dirty": not is_clean_tree(),
     }
     # 防御：保证集合完整性（Contract Gate 验证行为契约，不含 build_profile）
-    assert set(doc["suites"]) == REQUIRED_SET and doc["total"] == len(SUITES) == 14
+    assert set(doc["suites"]) == REQUIRED_SET and doc["total"] == len(SUITES) == 15
     out.write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"wrote {out} suites={len(SUITES)} sha={sha} dirty={doc['dirty']}")
 
