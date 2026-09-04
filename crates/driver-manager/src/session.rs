@@ -125,6 +125,15 @@ struct Shared {
     event_overflow_drops: AtomicU64,
     /// 解码失败被丢弃的 EventBatch 数（单批损坏可观测：下游 sequence gap 会如实反映）。
     event_decode_errors: AtomicU64,
+    /// Core 侧事件 epoch 门（P0 barrier）：handle -> 当前活跃 stream_epoch。
+    /// SDK writer 的 active_epochs 只能挡住"尚未写 socket"的批次；已进入 TCP/
+    /// event_rx 缓冲的旧 epoch 批次靠这道门在 [`EventReceiver`] 消费时过滤——
+    /// StopAck 之后调用方永远观察不到旧 epoch。
+    active_event_epochs: Mutex<HashMap<u32, u64>>,
+    /// Start 意图登记：msg_id -> (handle, epoch)。`call()` 在发出 StartConnection
+    /// 时记录，reader 在 StartConnectionAck 到达时消费（成败都清理，有界）。
+    /// Ack 本身不带 epoch，必须靠这次登记找回。
+    pending_event_starts: Mutex<HashMap<u64, (u32, u64)>>,
 }
 
 impl Shared {
@@ -246,13 +255,16 @@ impl Session {
         )
         .map_err(|e| SessionError::Handshake(e.to_string()))?;
 
-        // ---- 回 Welcome（协商 Minor 取双方较小值）----
+        // ---- 回 Welcome（协商 Minor 取双方较小值，必须如实回告）----
+        // 1.2 老驱动靠 accepted_protocol_minor 知道自己被当作 1.2 对待；
+        // 若固定回 Core 自身 Minor，wire 上的协商结果就是错的（即使 Core 侧
+        // 因自存 negotiated_minor 还能正确执行 Event Gate）。
         let welcome = pb::Envelope {
             msg_id: hello_env.msg_id,
             body: Some(pb::envelope::Body::Welcome(pb::Welcome {
                 core_version: format!("Mesad v{}", env!("CARGO_PKG_VERSION")),
                 accepted_protocol_major: mesa_driver_protocol::PROTOCOL_MAJOR,
-                accepted_protocol_minor: mesa_driver_protocol::PROTOCOL_MINOR,
+                accepted_protocol_minor: negotiated_minor,
             })),
         };
         write_envelope(&mut wr, &welcome).await?;
@@ -277,6 +289,8 @@ impl Session {
             event_stream_dead: AtomicBool::new(false),
             event_overflow_drops: AtomicU64::new(0),
             event_decode_errors: AtomicU64::new(0),
+            active_event_epochs: Mutex::new(HashMap::new()),
+            pending_event_starts: Mutex::new(HashMap::new()),
         });
 
         // ---- reader：分发响应 + 上行事件；断开时关闭事件通道通知运行时 ----
@@ -348,9 +362,14 @@ impl Session {
     }
 
     /// 取走事件批次接收端（一次性；重复调用返回 None）。
+    /// 返回的是带 Core 侧 epoch 门的 [`EventReceiver`]（P0 barrier），不是裸
+    /// channel：StopAck 之后旧 epoch 批次即使已在缓冲中也不可见。
     /// PR6 的 E2E Gate（contract test）与 PR7 的 EventIngress 由此消费 EventBatch 流。
-    pub fn take_event_batches(&mut self) -> Option<mpsc::Receiver<EventBatch>> {
-        self.event_rx.take()
+    pub fn take_event_batches(&mut self) -> Option<EventReceiver> {
+        self.event_rx.take().map(|rx| EventReceiver {
+            rx,
+            shared: Arc::clone(&self.shared),
+        })
     }
 
     /// 事件流是否已死（fail-closed）：队列溢出后 reader 关闭 channel 并置位。
@@ -653,6 +672,16 @@ impl Session {
     /// 发送一帧并等待同 msg_id 的响应帧。超时即清理登记项，防止泄漏。
     pub async fn call(&self, body: pb::envelope::Body) -> Result<pb::Envelope, SessionError> {
         let id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
+        // 事件 barrier 自维护：Start 意图在此登记，reader 在 Ack 到达时更新
+        // epoch 门。所有 Start/Stop/Close 都经本方法，调用方无需记得调 hook，
+        // barrier 永不错位（endpoint/tests 零改动）。
+        if let pb::envelope::Body::StartConnection(req) = &body {
+            self.shared
+                .pending_event_starts
+                .lock()
+                .unwrap()
+                .insert(id, (req.connection_handle, req.stream_epoch));
+        }
         let rx = self.shared.register(id);
         let env = pb::Envelope {
             msg_id: id,
@@ -709,6 +738,9 @@ async fn reader_loop(mut rd: OwnedReadHalf, shared: Arc<Shared>, cancel: Cancell
             if let Some(tx) = sender {
                 let _ = tx.send(env.clone());
             }
+            // 生命周期 Ack 嗅探：维护 Core 侧事件 epoch 门（P0 barrier）。
+            // 注意嗅探的是"已确认送达请求方"的回复帧，与请求方是否处理无关。
+            snoop_lifecycle_ack(&shared, env.msg_id, &env.body);
             if is_driver_error && let Some(Body::DriverError(e)) = env.body {
                 let d = e.detail.unwrap_or_default();
                 let ev = SessionEvent::DriverError {
@@ -803,6 +835,108 @@ async fn reader_loop(mut rd: OwnedReadHalf, shared: Arc<Shared>, cancel: Cancell
     // 通过 is_unresponsive/请求失败等信号兜底感知断连。
 }
 
+/// 生命周期 Ack 嗅探：维护 Core 侧事件 epoch 门（P0 barrier，PR6 review）。
+///
+/// - `StartConnectionAck(ok)` → 以请求时登记的 epoch 激活该 handle；
+/// - `StopConnectionAck(ok)` / `CloseConnectionAck(ok)` → 去活该 handle；
+/// - 失败的 Ack 不改变门状态（流语义未变）；Start 登记项无论成败都清理（有界）。
+/// - 回执 handle 与请求不一致视为对端违约：不更新门并告警（宁可错杀新流，
+///   不可放行旧 epoch）。
+fn snoop_lifecycle_ack(shared: &Shared, msg_id: u64, body: &Option<pb::envelope::Body>) {
+    use pb::envelope::Body;
+    match body {
+        Some(Body::StartConnectionAck(ack)) => {
+            let start = shared.pending_event_starts.lock().unwrap().remove(&msg_id);
+            if !ack.result.as_ref().is_some_and(|r| r.ok) {
+                return;
+            }
+            match start {
+                Some((handle, epoch)) if ack.connection_handle == handle => {
+                    shared
+                        .active_event_epochs
+                        .lock()
+                        .unwrap()
+                        .insert(handle, epoch);
+                }
+                Some((handle, epoch)) => {
+                    tracing::warn!(
+                        req_handle = handle,
+                        req_epoch = epoch,
+                        ack_handle = ack.connection_handle,
+                        "StartConnectionAck handle mismatch, epoch gate untouched"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        msg_id,
+                        "StartConnectionAck without recorded Start, epoch gate untouched"
+                    );
+                }
+            }
+        }
+        Some(Body::StopConnectionAck(ack)) if ack.result.as_ref().is_some_and(|r| r.ok) => {
+            shared
+                .active_event_epochs
+                .lock()
+                .unwrap()
+                .remove(&ack.connection_handle);
+        }
+        Some(Body::CloseConnectionAck(ack))
+            if ack.result.as_ref().is_some_and(|r| r.ok) =>
+        {
+            shared
+                .active_event_epochs
+                .lock()
+                .unwrap()
+                .remove(&ack.connection_handle);
+        }
+        _ => {}
+    }
+}
+
+/// 事件批次接收端：Core 侧 epoch 门的执行点（P0 barrier）。
+///
+/// 即使旧 epoch 批次已在 mpsc 缓冲中排队（SDK 门挡不住"已写 socket"的），
+/// StopAck 去活后 `recv()`/`try_recv()` 也会在内部丢弃它们——调用方永远
+/// 观察不到 StopAck 之后的旧 epoch。流终止（fail-closed/会话结束）时
+/// `recv()` 返回 None，与普通 channel 语义一致。
+pub struct EventReceiver {
+    rx: mpsc::Receiver<EventBatch>,
+    shared: Arc<Shared>,
+}
+
+impl EventReceiver {
+    fn batch_active(shared: &Shared, b: &EventBatch) -> bool {
+        shared
+            .active_event_epochs
+            .lock()
+            .unwrap()
+            .get(&b.connection_handle)
+            .copied()
+            == Some(b.stream_epoch)
+    }
+
+    pub async fn recv(&mut self) -> Option<EventBatch> {
+        loop {
+            let b = self.rx.recv().await?;
+            if Self::batch_active(&self.shared, &b) {
+                return Some(b);
+            }
+            // stale：StopAck 后的旧 epoch，内部丢弃继续等（调用方不可见）
+        }
+    }
+
+    pub fn try_recv(&mut self) -> Result<EventBatch, mpsc::error::TryRecvError> {
+        loop {
+            match self.rx.try_recv() {
+                Ok(b) if Self::batch_active(&self.shared, &b) => return Ok(b),
+                Ok(_) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         self.reader_cancel.cancel();
@@ -848,6 +982,8 @@ mod tests {
                 event_stream_dead: AtomicBool::new(false),
                 event_overflow_drops: AtomicU64::new(0),
                 event_decode_errors: AtomicU64::new(0),
+                active_event_epochs: Mutex::new(HashMap::new()),
+                pending_event_starts: Mutex::new(HashMap::new()),
             });
             // call() 的响应分发依赖 reader_loop——回环测试也必须启动它
             let reader_cancel = CancellationToken::new();
@@ -951,6 +1087,99 @@ mod tests {
             .configure_events(7, 9, &[Loopback::task("e1")])
             .await
             .expect("minor-3 roundtrip must succeed");
+        stub.await.unwrap();
+    }
+
+    /// 生命周期 Ack 嗅探：Start 激活门、Stop 去活门、失败 Ack 不动门。
+    #[tokio::test]
+    async fn lifecycle_ack_snoop_drives_event_epoch_gate() {
+        let mut lb = Loopback::new(3).await;
+        let server = lb._server.take().unwrap();
+        let (mut srd, mut swr) = server.into_split();
+        let stub = tokio::spawn(async move {
+            // Start → ok（Ack 本身不带 epoch，门靠 Core 登记的请求值激活）
+            let req = read_envelope(&mut srd).await.unwrap();
+            let handle = match req.body {
+                Some(pb::envelope::Body::StartConnection(c)) => c.connection_handle,
+                other => panic!("expected Start, got {other:?}"),
+            };
+            write_envelope(
+                &mut swr,
+                &pb::Envelope {
+                    msg_id: req.msg_id,
+                    body: Some(pb::envelope::Body::StartConnectionAck(
+                        pb::StartConnectionAck {
+                            connection_handle: handle,
+                            result: Some(pb::GenericResult {
+                                ok: true,
+                                error: None,
+                            }),
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+            // Stop → ok
+            let req = read_envelope(&mut srd).await.unwrap();
+            let handle = match req.body {
+                Some(pb::envelope::Body::StopConnection(_)) => handle,
+                other => panic!("expected Stop, got {other:?}"),
+            };
+            write_envelope(
+                &mut swr,
+                &pb::Envelope {
+                    msg_id: req.msg_id,
+                    body: Some(pb::envelope::Body::StopConnectionAck(
+                        pb::StopConnectionAck {
+                            connection_handle: handle,
+                            result: Some(pb::GenericResult {
+                                ok: true,
+                                error: None,
+                            }),
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        });
+        lb.session
+            .call(pb::envelope::Body::StartConnection(pb::StartConnection {
+                connection_handle: 7,
+                stream_epoch: 4242,
+            }))
+            .await
+            .unwrap();
+        // 给 reader 一个调度机会处理 Ack
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            lb.session
+                .shared
+                .active_event_epochs
+                .lock()
+                .unwrap()
+                .get(&7),
+            Some(&4242),
+            "Start Ack 必须激活 epoch 门"
+        );
+        lb.session
+            .call(pb::envelope::Body::StopConnection(pb::StopConnection {
+                connection_handle: 7,
+            }))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            lb.session
+                .shared
+                .active_event_epochs
+                .lock()
+                .unwrap()
+                .get(&7)
+                .is_none(),
+            "Stop Ack 必须去活 epoch 门"
+        );
         stub.await.unwrap();
     }
 

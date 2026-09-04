@@ -1052,9 +1052,10 @@ async fn run_sim_event_task(
                     attributes: std::collections::BTreeMap::from([("value".into(), Value::U64(n))]),
                 };
                 if let Err(e) = events.publish(vec![record]).await {
-                    // 背压可见：队列满说明 Core 消费端已死，记 warn 后继续
-                    // （序号不回退，下游 gap 可观测；由 Core 侧 fail-closed 兜底）。
+                    // publish 只在通道关闭（会话 teardown）时失败；队列满只会
+                    // 等待（背压），永不丢 occurrence。失败即退出本任务循环。
                     tracing::warn!(error = %e, tick = n, "sim event publish failed");
+                    return;
                 }
             }
         }

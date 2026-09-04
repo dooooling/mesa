@@ -34,8 +34,8 @@ const OUTBOUND_CAPACITY: usize = 256;
 const CONTROL_CAPACITY: usize = 32;
 const DATA_CAPACITY: usize = 256;
 /// 事件队列容量 128（Event Plane V1 §12）：事件是低频 occurrence，128 足够吸收
-/// 瞬时抖动；持续满队列说明 Core 消费端已死，publish 必须显式报错
-/// （[`EventPublishError::QueueFull`]）而不是扩容或丢弃——背压靠"失败可见"传导。
+/// 瞬时抖动；持续满队列时 publish **等待**（背压），而不是扩容、合并或丢弃——
+/// 事件 occurrence 丢一条就是流完整性 broken，连接还 RUNNING 属于"假装流完整"。
 const EVENT_CAPACITY: usize = 128;
 
 /// 握手阶段读超时。超时视为对端异常，直接断开。
@@ -249,9 +249,11 @@ struct CoalescerState {
     coalesced_points: u64,
 }
 
-/// 事件发布失败（Event Plane V1 §12 fail-closed）：任何一种失败都必须显式
-/// 返回给驱动，禁止静默丢弃。`QueueFull` 携带被拒绝的事件数，供驱动做
-/// 可观测的降级（如记入诊断计数后继续运行，Core 侧 sequence gap 会如实反映缺失）。
+/// 事件发布失败（Event Plane V1 §12 fail-closed）：入队前校验失败（未绑定/
+/// 空批/坏记录/超大）当场拒绝；入队本身永不丢弃——队列满时 **等待**
+/// （背压），只在通道关闭（会话 teardown）时返回 [`EventPublishError::Closed`]。
+/// 注意没有 `QueueFull` 变体：满队列就拒绝并让驱动 warn 后继续，会造成
+/// "seq 100 → seq 102 但连接仍 RUNNING"的残缺流，违反 Event Plane 完整性。
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum EventPublishError {
     #[error("event sink not bound to a connection")]
@@ -262,8 +264,6 @@ pub enum EventPublishError {
     InvalidRecord(String),
     #[error("event batch too large: {0} bytes > 256 KiB")]
     TooLarge(usize),
-    #[error("event queue full, {dropped} event(s) refused (no silent drop)")]
-    QueueFull { dropped: usize },
     #[error("event channel closed")]
     Closed,
 }
@@ -272,7 +272,7 @@ pub enum EventPublishError {
 /// handle/epoch 绑定）。Clone 廉价。
 ///
 /// 与 DataSink 的根本区别：publish 永不合并、永不 Latest-Wins；队列满时
-/// 返回 [`EventPublishError::QueueFull`] 而不是覆盖旧数据。batch header
+/// **等待**而不是覆盖旧数据或报错丢弃。batch header
 /// （connection_handle/stream_epoch/sequence/timestamp_ns/mono_ns）全部由
 /// SDK 自动填充，驱动只管交 `Vec<EventRecord>`。
 #[derive(Clone, Debug)]
@@ -288,6 +288,12 @@ pub struct EventSink {
 impl EventSink {
     /// 发布一批事件。sequence 由 SDK 按 (handle, epoch) 自动分配并递增；
     /// epoch 切换（Stop → Start）后自动从 1 重新开始，驱动无需感知。
+    ///
+    /// 背压语义（P0）：队列满时 `send().await` 等待，不合并、不覆盖、不拒绝——
+    /// occurrence 要么完整入队，要么会话已死（Closed）。等待期间不监听 shutdown：
+    /// writer 持续排空（Core 活着）则自然疏通；会话 teardown 时发送端随 sink
+    /// 一起释放，等待以 Closed 结束。驱动主循环在两次 publish 之间照常响应
+    /// shutdown 即可，不会卡死。
     pub async fn publish(&self, events: Vec<EventRecord>) -> Result<u64, EventPublishError> {
         if self.handle == 0 {
             return Err(EventPublishError::Unbound);
@@ -331,13 +337,12 @@ impl EventSink {
         if approx > mesa_core_types::EVENT_BATCH_MAX_BYTES {
             return Err(EventPublishError::TooLarge(approx));
         }
-        let n = batch.events.len();
-        match self.event_tx.try_send(batch) {
+        // 有界可靠入队：满则等待（背压），只在会话 teardown 时失败。
+        // 同步 callback 不能 await 的驱动（未来 OPC UA/SINUMERIK）不得直调此处，
+        // 应自建 bounded raw-ingress + async forwarder，overflow 时按订阅失败处理。
+        match self.event_tx.send(batch).await {
             Ok(()) => Ok(sequence),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                Err(EventPublishError::QueueFull { dropped: n })
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(EventPublishError::Closed),
+            Err(_) => Err(EventPublishError::Closed),
         }
     }
 }
@@ -2004,29 +2009,49 @@ mod tests {
         assert_eq!(r, 1);
     }
 
-    /// Event 永不合并：队列积压时两批都保留，满时显式报错（0 silent drop）。
+    /// Event 永不合并永不丢：队列满时 publish 等待（背压），而不是合并、
+    /// 覆盖或报错丢弃；腾出空间后等待的批次完整入队且序号连续。
     #[tokio::test]
-    async fn event_sink_never_coalesces_and_fails_closed_when_full() {
+    async fn event_sink_backpressures_instead_of_dropping() {
         let (control_tx, _) = mpsc::channel::<pb::Envelope>(CONTROL_CAPACITY);
         let (data_tx, _) = mpsc::channel::<DataBatch>(DATA_CAPACITY);
-        // 容量 1：第一批占满，第二批起必须 QueueFull
+        // 容量 1：第一批占满
         let (event_tx, mut erx) = mpsc::channel::<EventBatch>(1);
         let sink = DataSink::new(control_tx, data_tx, event_tx).for_connection(7, 100);
         let events = sink.events();
         events.publish(vec![event("e1")]).await.unwrap();
-        // 通道满：第二批被拒绝（不是合并、不是覆盖、不是等待）
-        let err = events.publish(vec![event("e2")]).await.unwrap_err();
-        assert_eq!(err, EventPublishError::QueueFull { dropped: 1 });
-        // 第一批原样可达
+
+        // 第二批在满队列上必须等待：50ms 内不得完成（没合并、没覆盖、没报错）
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let parked = events.clone();
+        tokio::spawn(async move {
+            let r = parked.publish(vec![event("e2")]).await;
+            let _ = done_tx.send(r);
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), done_rx)
+                .await
+                .is_err(),
+            "full queue must park the producer, not drop/merge/reject"
+        );
+        // 腾出空间 → 等待的批次完整入队，序号连续（1 → 2，无缺口）
         let b = erx.recv().await.unwrap();
         assert_eq!(b.sequence, 1);
-        assert_eq!(b.events.len(), 1);
         assert_eq!(b.events[0].event_id, "e1");
-        // 腾出空间后可继续，序号不回退
-        let s = events.publish(vec![event("e3")]).await.unwrap();
-        assert_eq!(s, 3);
-        let b = erx.recv().await.unwrap();
-        assert_eq!(b.events[0].event_id, "e3");
+        let b = tokio::time::timeout(Duration::from_secs(2), erx.recv())
+            .await
+            .expect("parked publish must complete after drain")
+            .unwrap();
+        assert_eq!(b.sequence, 2);
+        assert_eq!(b.events.len(), 1);
+        assert_eq!(b.events[0].event_id, "e2");
+
+        // 会话 teardown（接收端释放）→ 等待以 Closed 结束，不 hanging
+        drop(erx);
+        assert_eq!(
+            events.publish(vec![event("e3")]).await.unwrap_err(),
+            EventPublishError::Closed
+        );
     }
 
     /// publish 前置校验：坏记录/空批/未绑定当场拒绝，不占用队列。

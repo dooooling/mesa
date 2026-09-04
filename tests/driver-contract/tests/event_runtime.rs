@@ -74,8 +74,10 @@ async fn configure_start_with_events(
 }
 
 /// 在 secs 内收一个 EventBatch；超时或流终止都 panic（各测试按需自捕）。
+/// 注意收的是带 Core 侧 epoch 门的 [`EventReceiver`]：StopAck 后的旧 epoch
+/// 在此不可见（P0 barrier），测试断言的正是这道门。
 async fn recv_event_batch(
-    erx: &mut tokio::sync::mpsc::Receiver<EventBatch>,
+    erx: &mut mesa_driver_manager::session::EventReceiver,
     secs: u64,
 ) -> EventBatch {
     tokio::time::timeout(Duration::from_secs(secs), erx.recv())
