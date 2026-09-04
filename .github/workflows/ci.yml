@@ -48,4 +48,4 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          python3 -c "import json,os,sys; n=json.loads(os.environ['NEEDS_JSON']); bad={k:v.get('result') for k,v in n.items() if v.get('result')!='success'}; print(json.dumps(n,indent=1)); sys.exit('GATE FAILED: %s' % bad if bad else 'GATE OK')"
+          python3 -c "import json,os,sys; n=json.loads(os.environ['NEEDS_JSON']); bad={k:v.get('result') for k,v in n.items() if v.get('result')!='success'}; print(json.dumps(n,indent=1)); print('GATE FAILED: %s' % bad if bad else 'GATE OK'); sys.exit(1 if bad else 0)"
