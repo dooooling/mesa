@@ -17,7 +17,7 @@
 - **目录** `data/certificates/opcua/{own,trusted,issuers,rejected,private}` 与 `async-opcua pki_dir` 兼容：
   - `own/own.der + own.pem + own.key` 双写 `own/cert.der + private/private.pem` 供 `ClientBuilder::certificate_path/private_key_path` 复用
   - `own.key 0o600`
-- **pki_dir 解析** `connection_json.pki_dir > env MESA_OPCUA_PKI_DIR > data/certificates/opcua`，`Mesad` 启动时若 env 未设则注入默认（子进程继承）
+- **pki_dir ??(Stage 2 ??)**:transport ?????????(?? connection_json / ???? / ????);PKI ??????? `OpcUaConnectOptions.pki_dir` ???
 - **SecurityPolicy** `None/Basic128Rsa15/Basic256/Basic256Sha256/Aes128_Sha256_RsaOaep/Aes256_Sha256_RsaPss`，`MessageSecurityMode None/Sign/SignAndEncrypt` 均透传校验，非法直接 `BAD_CONFIG`
 - **禁止默认忽略校验**：`ClientBuilder::trust_server_certs(false) verify_server_certs(true) create_sample_keypair(false)`。`None` 安全策略下自签 `python` 仍可 `connect OK`；`Sign/SignAndEncrypt` 未知证书首次落 `rejected/`，需 `POST /api/v1/certificates/opcua/rejected/{thumb}/trust` 人工迁移至 `trusted/` 后重连
 
@@ -28,7 +28,7 @@ REST：`GET /certificates/opcua/{own,trusted,issuers,rejected} /diagnostics` `PO
 | Server | 地址 | Security | 路径 | 结果 | 备注 |
 |---|---|---|---|---|---|
 | **Fake** | `opc.tcp://127.0.0.1:4840` | `None` | `Poll/Sub/Browse 8134 4点 Poll/Sub/Browse 300ms` | ✅ `8134 ep-opc 4点 objs i=85.Child1 cnt 948 speed 308.5 sub_cnt 209` `Fake 11 passed` `Browse Poll Sub KeepAlive7不产批` | `Mesad 8134 opcua_browse.db` |
-| **UA-.NETStandard Reference** `ghcr.io/php-opcua/uanetstandard-test-suite` | `opc.tcp://127.0.0.1:4840/UA/TestServer` `4843 AllSecurity` | `None/SignAndEncrypt` | `Poll BulkRead Sub DataChange Browse` | ⏳ `docker pull timeout 120s 本机外网受限，代码 44/44 已就绪待 4840/4843 真测` | `Reference 300节点 12方法` `假脱机待补` |
+| **UA-.NETStandard Reference** `ghcr.io/php-opcua/uanetstandard-test-suite` | `opc.tcp://127.0.0.1:4840/UA/TestServer` | `None` | `Poll/Sub/Browse/continuation` | ? `2026-09-04 ????:connect/read/ns/browse(4??)/max_refs=1??3?/revised 250?300ms/??BAD/live CurrentTime/cleanup??` | `test_native_opcua.rs` |
 | **python asyncua** `0.19` | `opc.tcp://127.0.0.1:4840/freeopcua/server/` `ns=2` | `None` | `Poll Native BulkRead` + `Subscribe` | ✅ `8190 Poll RUNNING Sub KeepAlive` `c2e6a7a` | 历史验证 |
 | **ProSys/open62541/硬件** | — | — | — | 未启 | `ProSys Certified` `open62541 1.4 Docker` 可替 `Reference` |
 
@@ -37,7 +37,7 @@ REST：`GET /certificates/opcua/{own,trusted,issuers,rejected} /diagnostics` `PO
 ## 4. 真回调与背压
 
 - `Poll`：`interval tick Skip → read_batch → coerce → DataBatch sequence++ → DataSink Latest-Wins (256+1024) → IPC`
-- `Subscribe`：`create_subscription(publishing 500ms/30/10) → create_monitored_items(sampling 250 queue10) → DataChangeCallback try_send(mpsc 256) → 批量 drain 64 + Bad隔离 → DataBatch`；`KeepAlive` 空 `NotificationMessage` 自然无回调，不产批不递增 `seq`
+- `Subscribe`:`create_subscription(publishing 500ms/30/10)` ? `create_monitored_items(sampling 250 queue10)` ? `DataChangeCallback` ?? per-handle Latest-Wins slot ?? ? forwarder `drain + send().await` ? adapter `send().await` ? `DataBatch`;?? BAD ???? BAD ??;`unsubscribe` ????? best-effort ???;`SubscriptionStats{received,coalesced}` ???????
 - `source_timestamp_ns` 取 `DataValue.source_timestamp` 否则 `now_unix_ns()`，业务时间 UTC ns，性能用单调时钟禁 UTC 相减 `§9-11`
 - 配置变更全量快照 `Stop→Configure→Apply→Start(new stream_epoch)` `point_id` 稳定 `tombstone`
 
@@ -55,7 +55,7 @@ REST：`GET /certificates/opcua/{own,trusted,issuers,rejected} /diagnostics` `PO
 
 ## 6. Stage 2 transport addendum (P0-B, ASCII-only section)
 
-> Supersedes the stale Subscribe line in section 4 (try_send mpsc 256 drain 64).
+> Section 4 Subscribe ??? Stage 2 ??(P0-B7);?????? `try_send(mpsc 256) + drain 64`,????
 > New event path (Stage 2 P0-B1):
 > DataChangeCallback --push--> per-handle Latest-Wins slots (overwrite + stats)
 > --drain--> forwarder task --send().await--> adapter mpsc 256 --send().await--> Driver.

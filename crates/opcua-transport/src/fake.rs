@@ -42,6 +42,8 @@ pub struct FakeOpcUaTransport {
     create_status: Mutex<HashMap<String, StatusCode>>,
     /// 预置 create_monitored_items 服务级整体失败（P0-B3 回滚测试用）。
     create_mi_error: Mutex<Option<UaTransportError>>,
+    /// 预置 delete_monitored_items 非幂等失败（P1-B7 测试用）。
+    delete_mi_error: Mutex<Option<UaTransportError>>,
     /// create_subscription 返回前注入 receiver 的事件。
     live_batches: Mutex<VecDeque<FakeLiveBatch>>,
     next_sub_id: AtomicU32,
@@ -93,6 +95,12 @@ impl FakeOpcUaTransport {
     /// 模拟服务级失败，验证 adapter 回滚路径。
     pub fn with_create_monitored_items_error(self, err: UaTransportError) -> Self {
         *self.create_mi_error.lock().unwrap() = Some(err);
+        self
+    }
+
+    /// 让 `delete_monitored_items` 返回指定错误（P1-B7：删项失败也必须删订阅）。
+    pub fn with_delete_monitored_items_error(self, err: UaTransportError) -> Self {
+        *self.delete_mi_error.lock().unwrap() = Some(err);
         self
     }
 
@@ -268,6 +276,9 @@ impl OpcUaTransport for FakeOpcUaTransport {
             .lock()
             .unwrap()
             .push((subscription_id, ids.to_vec()));
+        if let Some(err) = self.delete_mi_error.lock().unwrap().clone() {
+            return Err(err);
+        }
         Ok(())
     }
 

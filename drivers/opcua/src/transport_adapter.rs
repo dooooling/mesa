@@ -197,23 +197,43 @@ impl<T: OpcUaTransport> OpcUaApi for TransportApiAdapter<T> {
     }
 
     async fn unsubscribe(&self, subscription_id: u32) -> Result<(), String> {
-        // 按序清理：先删项再删订阅，均为幂等 Ok（BadSubscriptionIdInvalid/会话关闭即成功）
+        // P1-B7：按序清理但永不短路——删项失败也必须 best-effort 删订阅，
+        // 因为删整个 Subscription 本身就会收掉所属 MonitoredItems；若在此
+        // return，服务端订阅会残留到整个 Session 断开并继续产生流量。
         let ids = self
             .items
             .lock()
             .unwrap()
             .remove(&subscription_id)
             .unwrap_or_default();
-        if !ids.is_empty() {
+        let item_err = if ids.is_empty() {
+            None
+        } else {
             self.transport
                 .delete_monitored_items(subscription_id, &ids)
                 .await
-                .map_err(|e| e.to_string())?;
-        }
-        self.transport
+                .err()
+        };
+        let sub_err = self
+            .transport
             .delete_subscription(subscription_id)
             .await
-            .map_err(|e| e.to_string())
+            .err();
+        // 优先返回原始删项错误；删订阅失败仅诊断（不掩盖第一个错误）。
+        if let Some(e) = item_err {
+            if let Some(se) = sub_err {
+                tracing::debug!(
+                    subscription_id,
+                    ?se,
+                    "unsubscribe 删项已失败后删订阅亦失败（仅诊断）"
+                );
+            }
+            return Err(e.to_string());
+        }
+        match sub_err {
+            Some(e) => Err(e.to_string()),
+            None => Ok(()),
+        }
     }
 
     async fn browse(&self, node: &OpcUaAddress) -> Result<Vec<String>, String> {
@@ -369,6 +389,38 @@ mod tests {
             .await
             .expect("回滚后无残留，unsubscribe 空操作 Ok");
         assert!(fake.deleted_items().is_empty(), "回滚后不应有任何删项调用");
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_attempts_delete_subscription_even_if_delete_items_fails() {
+        // P1-B7：删项非幂等失败时，删订阅仍必须执行（删订阅会收掉所属监控项），
+        // 且优先返回原始删项错误。
+        let fake = Arc::new(FakeOpcUaTransport::new().with_delete_monitored_items_error(
+            UaTransportError::service(
+                UaOperation::DeleteMonitoredItems,
+                Some(StatusCode::BadNotImplemented),
+                false,
+                "Fake 删项失败",
+            ),
+        ));
+        let adapter = TransportApiAdapter::with_transport(fake.clone());
+        let (sub_id, _rx) = adapter
+            .subscribe(&[addr(2, 1)], 500, 250, 10, true)
+            .await
+            .expect("订阅 Ok");
+        let err = adapter
+            .unsubscribe(sub_id)
+            .await
+            .expect_err("删项失败必须 Err");
+        assert!(
+            err.contains("Fake 删项失败"),
+            "优先返回原始删项错误，实际: {err}"
+        );
+        assert_eq!(
+            fake.deleted_subscriptions(),
+            vec![sub_id],
+            "删项失败也不能跳过删订阅"
+        );
     }
 
     #[tokio::test]

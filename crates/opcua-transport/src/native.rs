@@ -209,6 +209,35 @@ pub(crate) fn browse_result_to_page(
     })
 }
 
+/// 订阅转发循环（P0-B1/P1-B5）：drain slot 最新快照后 `send().await`。
+/// 抽取为独立函数以便慢消费者饱和测试直接驱动；生产路径由
+/// `create_subscription` 在 Revised 校验通过后 spawn。
+pub(crate) async fn forwarder_loop(
+    slots: Arc<SlotState>,
+    tx: tokio::sync::mpsc::Sender<crate::UaDataChange>,
+) {
+    loop {
+        // P1-B5 防御：receiver 被直接丢弃时，不必等下一次 Notify 即可退出。
+        tokio::select! {
+            _ = tx.closed() => break,
+            _ = slots.notify.notified() => {}
+        }
+        if tx.is_closed() {
+            break;
+        }
+        let batch = slots.drain();
+        if batch.is_empty() {
+            continue;
+        }
+        for ev in batch {
+            // 背压时等待：旧槽可被新采样覆盖（Latest-Wins），最新采样不丢。
+            if tx.send(ev).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
 /// 原生传输：持有 Session + event-loop JoinHandle；`disconnect()` 释放会话。
 ///
 /// P1-B5：每个订阅的 forwarder task 由 `forwarders[sub_id]` 跟踪，生命周期与
@@ -668,28 +697,7 @@ impl OpcUaTransport for NativeOpcUaTransport {
         };
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let fwd_slots = slots.clone();
-        let fwd_handle = tokio::spawn(async move {
-            loop {
-                // P1-B5 防御：receiver 被直接丢弃时，不必等下一次 Notify 即可退出。
-                tokio::select! {
-                    _ = tx.closed() => break,
-                    _ = fwd_slots.notify.notified() => {}
-                }
-                if tx.is_closed() {
-                    break;
-                }
-                let batch = fwd_slots.drain();
-                if batch.is_empty() {
-                    continue;
-                }
-                for ev in batch {
-                    // 背压时等待：旧槽可被新采样覆盖（Latest-Wins），最新采样不丢。
-                    if tx.send(ev).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        });
+        let fwd_handle = tokio::spawn(async move { forwarder_loop(fwd_slots, tx).await });
         self.forwarders.lock().await.insert(sub_id, fwd_handle);
         Ok(UaSubscription {
             id: sub_id,
@@ -856,7 +864,7 @@ mod tests {
     fn burst_same_handle_keeps_only_latest_and_counts_all_coalesced() {
         // P0-B1 饱和语义（确定性 burst 版）：同 handle 高速压入 1000 个采样，
         // drain 只得最新一个，coalesced 精确计数被合并的 999 个旧采样。
-        // 全路径慢消费者版本见 examples/test_native_opcua.rs 真机 smoke。
+        // 含转发循环的慢消费者版本见 forwarder_slow_consumer_ends_on_latest。
         let stats = Arc::new(crate::SubscriptionStats::default());
         let slots = SlotState::new(stats.clone());
         for v in 0..1000i32 {
@@ -871,6 +879,56 @@ mod tests {
             batch[0].data_value.value,
             Some(opcua_types::Variant::Int32(999))
         );
+    }
+
+    #[tokio::test]
+    async fn forwarder_slow_consumer_ends_on_latest_with_coalesced_counted() {
+        // P0-B1 full-path 饱和测试：快生产者（同 handle 300 事件）× 慢消费者
+        //（channel 仅 2 格，每收一个睡 2ms）。断言：最终收到值恒为最新 299，
+        // 中间旧采样被合并（coalesced > 0），且无事件丢失到 panic/死锁。
+        // 生产者经 SlotState::push 注入——与真实 DataChangeCallback 同一入口。
+        let stats = Arc::new(crate::SubscriptionStats::default());
+        let slots = Arc::new(SlotState::new(stats.clone()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let fwd = tokio::spawn(forwarder_loop(slots.clone(), tx));
+        let producer = tokio::spawn({
+            let slots = slots.clone();
+            async move {
+                for v in 0..300i32 {
+                    slots.push(7, DataValue::new_now(v));
+                }
+            }
+        });
+        let mut last: Option<crate::UaDataChange> = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            last = Some(ev);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        producer.await.expect("生产者不 panic");
+        // 生产者已结束：排空残余，50ms 无新事件即视为转发完成。
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            last = Some(ev);
+        }
+        // 慢消费者在第一个 50ms 空闲就可能提前跳出首轮循环：此时生产者
+        // 未必结束；排空轮已补收，故最终值断言仍成立。
+        let ev = last.expect("至少收到一个事件");
+        assert_eq!(ev.client_handle, 7);
+        assert_eq!(ev.data_value.value, Some(opcua_types::Variant::Int32(299)));
+        assert_eq!(stats.events_received.load(Ordering::Relaxed), 300);
+        assert!(
+            stats.events_coalesced.load(Ordering::Relaxed) > 0,
+            "慢消费者下必须发生旧采样合并"
+        );
+        // 清理：丢 receiver，forwarder 必须经 tx.closed() 自行退出。
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(2), fwd)
+            .await
+            .expect("forwarder 应在 receiver 丢弃后退出")
+            .expect("forwarder 不 panic");
     }
 
     #[test]
