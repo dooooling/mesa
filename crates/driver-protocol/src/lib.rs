@@ -11,8 +11,9 @@ pub mod pb {
 
 use bytes::{BufMut, BytesMut};
 use mesa_core_types::{
-    AcquisitionTask, ConnectionState, DataBatch, DataType, DriverBinding, ErrorKind,
-    PointDescriptor, PointValue, Quality, TaskMode, UnknownDataType, Value, ValueOrigin,
+    AcquisitionTask, ConditionTransition, ConnectionState, DataBatch, DataType, DriverBinding,
+    ErrorKind, EventCondition, EventRecord, EventTask, PointDescriptor, PointValue, Quality,
+    TaskMode, UnknownDataType, Value, ValueOrigin,
 };
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -20,12 +21,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// IPC 协议版本。Major 不兼容直接拒绝握手；Minor 取双方较小值。
 /// V1.2.1 新增 PointValue.value_origin（§5.5），Minor 1 保证新 Driver 的 typed BAD 语义可被新 Core 理解，旧端仍按 UNSPECIFIED 兼容解释
 pub const PROTOCOL_MAJOR: u32 = 1;
-pub const PROTOCOL_MINOR: u32 = 2;
+pub const PROTOCOL_MINOR: u32 = 3;
 
 /// Dynamic Probe RPC 可用的最低协商 Minor（§8）。协商 Minor < 2 的旧 Driver
 /// 不识别 ProbeRequest（会静默忽略），Core 必须直接返回 Unsupported，
 /// 不得发 RPC 干等超时。
 pub const PROBE_RPC_MIN_MINOR: u32 = 2;
+
+/// Event Plane 可用的最低协商 Minor（Event V1 §10，纯 additive 1.2 → 1.3）。
+/// EventTask 存在但 negotiated_minor < 3 时，Core 必须回 EVENT_PLANE_UNSUPPORTED，
+/// 不得发未知消息干等 timeout。
+pub const EVENT_PLANE_MIN_MINOR: u32 = 3;
 
 /// 单帧上限。防止恶意/异常长度前缀导致无界分配（有界原则在 IPC 层的体现）。
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -114,6 +120,12 @@ pub enum ConvertError {
     InvalidQuality(String),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid event task: {0}")]
+    InvalidEventTask(String),
+    #[error("invalid event record: {0}")]
+    InvalidEventRecord(String),
+    #[error("event batch too large: {0}")]
+    EventBatchTooLarge(String),
 }
 
 pub fn value_to_pb(v: &Value) -> pb::ValueMsg {
@@ -258,6 +270,197 @@ pub fn batch_from_pb(b: pb::DataBatchMsg) -> Result<DataBatch, ConvertError> {
     })
 }
 
+/// Condition 跃迁的 wire 字符串（serde snake_case 形态复用，与 JSON 一致）。
+fn transition_to_str(t: ConditionTransition) -> &'static str {
+    match t {
+        ConditionTransition::Raised => "raised",
+        ConditionTransition::Updated => "updated",
+        ConditionTransition::Acknowledged => "acknowledged",
+        ConditionTransition::Confirmed => "confirmed",
+        ConditionTransition::Cleared => "cleared",
+    }
+}
+
+fn transition_from_str(s: &str) -> Result<ConditionTransition, ConvertError> {
+    match s {
+        "raised" => Ok(ConditionTransition::Raised),
+        "updated" => Ok(ConditionTransition::Updated),
+        "acknowledged" => Ok(ConditionTransition::Acknowledged),
+        "confirmed" => Ok(ConditionTransition::Confirmed),
+        "cleared" => Ok(ConditionTransition::Cleared),
+        other => Err(ConvertError::InvalidEventRecord(format!(
+            "transition 非法: {other}"
+        ))),
+    }
+}
+
+pub fn event_task_to_pb(t: &EventTask) -> Result<pb::EventTaskProto, ConvertError> {
+    Ok(pb::EventTaskProto {
+        id: t.id.clone(),
+        mode: t.mode.as_str().to_string(),
+        interval_ms: t.interval_ms,
+        binding_kind: t.binding.kind.clone(),
+        binding_config_json: serde_json::to_string(&t.binding.config)?,
+    })
+}
+
+pub fn event_task_from_pb(t: pb::EventTaskProto) -> Result<EventTask, ConvertError> {
+    let mode = match t.mode.as_str() {
+        "poll" => TaskMode::Poll,
+        "subscribe" => TaskMode::Subscribe,
+        other => return Err(ConvertError::InvalidMode(other.to_string())),
+    };
+    let task = EventTask {
+        id: t.id,
+        mode,
+        interval_ms: t.interval_ms,
+        binding: DriverBinding {
+            kind: t.binding_kind,
+            config: serde_json::from_str(&t.binding_config_json)?,
+        },
+    };
+    task.validate()
+        .map_err(|e| ConvertError::InvalidEventTask(e.to_string()))?;
+    Ok(task)
+}
+
+pub fn event_record_to_pb(e: &EventRecord) -> Result<pb::EventRecordMsg, ConvertError> {
+    e.validate()
+        .map_err(|err| ConvertError::InvalidEventRecord(err.to_string()))?;
+    Ok(pb::EventRecordMsg {
+        event_id: e.event_id.clone(),
+        category: e.category.clone(),
+        kind: e.kind.clone(),
+        source: e.source.clone(),
+        severity: u32::from(e.severity),
+        code: e.code.clone(),
+        message: e.message.clone(),
+        message_locale: e.message_locale.clone(),
+        occurred_at_ns: e.occurred_at_ns,
+        condition: e.condition.as_ref().map(|c| pb::EventConditionMsg {
+            condition_id: c.condition_id.clone(),
+            transition: transition_to_str(c.transition).to_string(),
+            active: c.active,
+            acknowledged: c.acknowledged,
+            confirmed: c.confirmed,
+            retain: c.retain,
+        }),
+        correlation_id: e.correlation_id.clone(),
+        attributes: e
+            .attributes
+            .iter()
+            .map(|(k, v)| pb::EventAttributeMsg {
+                key: k.clone(),
+                value: Some(value_to_pb(v)),
+            })
+            .collect(),
+    })
+}
+
+pub fn event_record_from_pb(e: pb::EventRecordMsg) -> Result<EventRecord, ConvertError> {
+    let mut attributes = std::collections::BTreeMap::new();
+    for a in e.attributes {
+        // P5-review：重复 key 静默覆盖等于丢失历史事实，必须整条拒收
+        if attributes.contains_key(&a.key) {
+            return Err(ConvertError::InvalidEventRecord(format!(
+                "duplicate attribute key: {}",
+                a.key
+            )));
+        }
+        let v = value_from_pb(a.value.ok_or(ConvertError::EmptyValue)?)?;
+        attributes.insert(a.key, v);
+    }
+    let condition = e
+        .condition
+        .map(|c| {
+            Ok::<_, ConvertError>(EventCondition {
+                condition_id: c.condition_id,
+                transition: transition_from_str(&c.transition)?,
+                active: c.active,
+                acknowledged: c.acknowledged,
+                confirmed: c.confirmed,
+                retain: c.retain,
+            })
+        })
+        .transpose()?;
+    // P5-review：severity 截断等于把非法输入洗成合法数据；
+    // 溢出必须拒收，再由 validate() 检查 0..=1000
+    let severity = u16::try_from(e.severity).map_err(|_| {
+        ConvertError::InvalidEventRecord(format!("severity overflow: {}", e.severity))
+    })?;
+    let rec = EventRecord {
+        event_id: e.event_id,
+        category: e.category,
+        kind: e.kind,
+        source: e.source,
+        severity,
+        code: e.code,
+        message: e.message,
+        message_locale: e.message_locale,
+        occurred_at_ns: e.occurred_at_ns,
+        condition,
+        correlation_id: e.correlation_id,
+        attributes,
+    };
+    rec.validate()
+        .map_err(|err| ConvertError::InvalidEventRecord(err.to_string()))?;
+    Ok(rec)
+}
+
+/// 整批事件转换（§11 顺序契约由发送侧保证；此处只做逐条校验 + 256 KiB 上限，
+/// 任一非法即整批拒收，不收半批）。形态镜像 DataBatch：header 元数据完整保留，
+/// PR6 ingress 依赖 connection_handle（找 Endpoint）/stream_epoch（stale 门）
+/// /sequence（gap 门）/timestamp_ns/mono_ns，一律不丢。
+pub fn event_batch_to_pb(
+    batch: &mesa_core_types::EventBatch,
+) -> Result<pb::EventBatchMsg, ConvertError> {
+    let wire = pb::EventBatchMsg {
+        connection_handle: batch.connection_handle,
+        stream_epoch: batch.stream_epoch,
+        sequence: batch.sequence,
+        timestamp_ns: batch.timestamp_ns,
+        mono_ns: batch.mono_ns,
+        events: batch
+            .events
+            .iter()
+            .map(event_record_to_pb)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    check_event_batch_size(&wire)?;
+    Ok(wire)
+}
+
+pub fn event_batch_from_pb(
+    b: pb::EventBatchMsg,
+) -> Result<mesa_core_types::EventBatch, ConvertError> {
+    check_event_batch_size(&b)?;
+    let events = b
+        .events
+        .into_iter()
+        .map(event_record_from_pb)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(mesa_core_types::EventBatch {
+        connection_handle: b.connection_handle,
+        stream_epoch: b.stream_epoch,
+        sequence: b.sequence,
+        timestamp_ns: b.timestamp_ns,
+        events,
+        mono_ns: b.mono_ns,
+    })
+}
+
+fn check_event_batch_size(b: &pb::EventBatchMsg) -> Result<(), ConvertError> {
+    use prost::Message;
+    let n = b.encoded_len();
+    if n > mesa_core_types::EVENT_BATCH_MAX_BYTES {
+        return Err(ConvertError::EventBatchTooLarge(format!(
+            "event batch {n} > {} bytes",
+            mesa_core_types::EVENT_BATCH_MAX_BYTES
+        )));
+    }
+    Ok(())
+}
+
 pub fn task_to_pb(t: &AcquisitionTask) -> Result<pb::AcquisitionTaskProto, ConvertError> {
     Ok(pb::AcquisitionTaskProto {
         id: t.id.clone(),
@@ -390,6 +593,7 @@ impl ErrorDetailBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     /// 全部 Value 变体的编解码必须无损往返，这是高频通道正确性的根基。
     #[test]
@@ -418,6 +622,181 @@ mod tests {
         for v in samples {
             assert_eq!(value_from_pb(value_to_pb(&v)).unwrap(), v);
         }
+    }
+
+    /// EventRecord wire 往返：condition/attributes/occurred_at 全保留；
+    /// 非法 transition 与超限 severity 在 from 侧拒收。
+    #[test]
+    fn event_record_proto_roundtrip() {
+        use mesa_core_types::{EventCondition, EventRecord};
+        let rec = EventRecord {
+            event_id: "A700012:raised:7".into(),
+            category: "alarm".into(),
+            kind: "alarm.condition".into(),
+            source: "Channel1".into(),
+            severity: 700,
+            code: Some("700012".into()),
+            message: Some("overtemp".into()),
+            message_locale: None,
+            occurred_at_ns: Some(1_700_000_000_000_000_000),
+            condition: Some(EventCondition {
+                condition_id: "A700012".into(),
+                transition: ConditionTransition::Raised,
+                active: Some(true),
+                acknowledged: None,
+                confirmed: None,
+                retain: Some(true),
+            }),
+            correlation_id: None,
+            attributes: BTreeMap::from([
+                ("axis".into(), Value::I32(1)),
+                ("temp".into(), Value::F64(89.5)),
+            ]),
+        };
+        let back = event_record_from_pb(event_record_to_pb(&rec).unwrap()).unwrap();
+        assert_eq!(back, rec);
+        // 非法 transition 拒收
+        let mut bad = event_record_to_pb(&rec).unwrap();
+        bad.condition.as_mut().unwrap().transition = "exploded".into();
+        assert!(event_record_from_pb(bad).is_err());
+        // 瞬时事件（无 condition/occurred_at）同样往返
+        let mut flat = rec.clone();
+        flat.condition = None;
+        flat.occurred_at_ns = None;
+        assert_eq!(
+            event_record_from_pb(event_record_to_pb(&flat).unwrap()).unwrap(),
+            flat
+        );
+    }
+
+    /// P5-review：severity 溢出整体拒收（禁止截断洗白），重复 attribute key
+    /// 整条拒收（禁止静默覆盖历史事实）。
+    #[test]
+    fn event_record_overflow_and_dupkey_rejected() {
+        use mesa_core_types::EventRecord;
+        let rec = EventRecord {
+            event_id: "e".into(),
+            category: "c".into(),
+            kind: "k".into(),
+            source: "s".into(),
+            severity: 1,
+            code: None,
+            message: None,
+            message_locale: None,
+            occurred_at_ns: None,
+            condition: None,
+            correlation_id: None,
+            attributes: BTreeMap::new(),
+        };
+        let mut wire = event_record_to_pb(&rec).unwrap();
+        wire.severity = 999_999;
+        assert!(matches!(
+            event_record_from_pb(wire),
+            Err(ConvertError::InvalidEventRecord(_))
+        ));
+        // wire 合法但超 1000 的 severity 同样拒收（validate 0..=1000）
+        let mut wire = event_record_to_pb(&rec).unwrap();
+        wire.severity = 5000;
+        assert!(event_record_from_pb(wire).is_err());
+        // 重复 attribute key 拒收
+        let mut wire = event_record_to_pb(&rec).unwrap();
+        let attr = pb::EventAttributeMsg {
+            key: "axis".into(),
+            value: Some(value_to_pb(&Value::I32(1))),
+        };
+        wire.attributes = vec![attr.clone(), attr];
+        assert!(matches!(
+            event_record_from_pb(wire),
+            Err(ConvertError::InvalidEventRecord(_))
+        ));
+    }
+
+    /// EventTask wire 往返 + 坏任务拒收（坏 EventTask 必须让 revision 失败，§35）。
+    #[test]
+    fn event_task_proto_roundtrip() {
+        use mesa_core_types::{DriverBinding, EventTask};
+        let t = EventTask {
+            id: "alarms".into(),
+            mode: TaskMode::Subscribe,
+            interval_ms: None,
+            binding: DriverBinding {
+                kind: "ac".into(),
+                config: serde_json::json!({"area": "NCK"}),
+            },
+        };
+        assert_eq!(
+            event_task_from_pb(event_task_to_pb(&t).unwrap()).unwrap(),
+            t
+        );
+        // Poll 无 interval 拒收
+        let bad = pb::EventTaskProto {
+            id: "e1".into(),
+            mode: "poll".into(),
+            interval_ms: None,
+            binding_kind: "k".into(),
+            binding_config_json: "{}".into(),
+        };
+        assert!(matches!(
+            event_task_from_pb(bad),
+            Err(ConvertError::InvalidEventTask(_))
+        ));
+    }
+
+    /// EventBatch 上限 256 KiB 双向执行（发送侧与接收侧都不收半批）。
+    #[test]
+    fn event_batch_size_cap_enforced_both_directions() {
+        use mesa_core_types::EventRecord;
+        let big = EventRecord {
+            event_id: "e".into(),
+            category: "c".into(),
+            kind: "k".into(),
+            source: "s".into(),
+            severity: 1,
+            code: None,
+            message: Some("z".repeat(4000)),
+            message_locale: None,
+            occurred_at_ns: None,
+            condition: None,
+            correlation_id: None,
+            attributes: BTreeMap::new(),
+        };
+        // 70 条 × ~4KiB > 256KiB
+        let events = vec![big; 70];
+        let batch = mesa_core_types::EventBatch {
+            connection_handle: 7,
+            stream_epoch: 99,
+            sequence: 5,
+            timestamp_ns: 1_700_000_000_000_000_000,
+            events,
+            mono_ns: Some(123),
+        };
+        assert!(matches!(
+            event_batch_to_pb(&batch),
+            Err(ConvertError::EventBatchTooLarge(_))
+        ));
+        // 接收侧同样拒收（逐条合法但整批超限）
+        let mut wire = pb::EventBatchMsg {
+            connection_handle: 7,
+            stream_epoch: 99,
+            sequence: 5,
+            timestamp_ns: 1_700_000_000_000_000_000,
+            mono_ns: Some(123),
+            events: batch
+                .events
+                .iter()
+                .map(|e| event_record_to_pb(e).unwrap())
+                .collect(),
+        };
+        assert!(event_batch_from_pb(wire.clone()).is_err());
+        wire.events.truncate(2);
+        // header 元数据完整保留（PR6 ingress 依赖，一律不丢）
+        let back = event_batch_from_pb(wire).unwrap();
+        assert_eq!(back.connection_handle, 7);
+        assert_eq!(back.stream_epoch, 99);
+        assert_eq!(back.sequence, 5);
+        assert_eq!(back.timestamp_ns, 1_700_000_000_000_000_000);
+        assert_eq!(back.mono_ns, Some(123));
+        assert_eq!(back.events.len(), 2);
     }
 
     /// 空字符串 quality 必须按 GOOD 解释——这是"缺省即 GOOD"语义的落点。
