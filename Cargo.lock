@@ -1191,6 +1191,7 @@ dependencies = [
 name = "mesa-contract-tests"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "libc",
  "mesa-config-store",

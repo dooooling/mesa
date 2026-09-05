@@ -6,7 +6,8 @@
 //!
 //! 背压模型（方案 §12）：SDK 内部出站队列有界；数据批次在队列满时执行
 //! Latest-Wins Coalescing（同 point_id 仅保留最新值）；控制类消息走阻塞式入队，
-//! 永不丢弃。
+//! 永不丢弃。事件批次（Event Plane V1）走第三条独立可靠队列：禁止合并、
+//! 禁止 Latest-Wins、满时显式报错永不静默丢弃。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,11 +15,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mesa_core_types::{
-    ConnectionState, DataBatch, DriverMetadata, ErrorKind, PointDescriptor, PointMap,
+    ConnectionState, DataBatch, DriverMetadata, ErrorKind, EventBatch, EventRecord,
+    PointDescriptor, PointMap,
 };
 use mesa_driver_protocol::{
     ConvertError, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolError, batch_to_pb, err_result,
-    error_detail, ok_result, pb, read_envelope, tasks_from_pb, write_envelope,
+    error_detail, event_batch_to_pb, event_task_from_pb, ok_result, pb, read_envelope,
+    tasks_from_pb, write_envelope,
 };
 use tokio::net::TcpListener;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -30,6 +33,10 @@ use tokio_util::sync::CancellationToken;
 const OUTBOUND_CAPACITY: usize = 256;
 const CONTROL_CAPACITY: usize = 32;
 const DATA_CAPACITY: usize = 256;
+/// 事件队列容量 128（Event Plane V1 §12）：事件是低频 occurrence，128 足够吸收
+/// 瞬时抖动；持续满队列时 publish **等待**（背压），而不是扩容、合并或丢弃——
+/// 事件 occurrence 丢一条就是流完整性 broken，连接还 RUNNING 属于"假装流完整"。
+const EVENT_CAPACITY: usize = 128;
 
 /// 握手阶段读超时。超时视为对端异常，直接断开。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -179,6 +186,27 @@ pub trait DriverConnection: Send {
         ))
     }
 
+    /// 事件任务配置（Event Plane V1 §6 / PR6）：默认空任务直接接受（老 Driver
+    /// 零改动即可通过 Minor Gate 的"无 EventTask"路径）；非空任务返回
+    /// Unsupported（`EVENT_NOT_SUPPORTED`）。支持事件的 Driver 覆盖本方法，
+    /// 校验 binding 语义（Core 永不解析 binding）并记住订阅计划供 run() 使用。
+    async fn configure_events(
+        &mut self,
+        revision: u64,
+        tasks: Vec<EventTask>,
+    ) -> Result<(), SdkDriverError> {
+        let _ = revision;
+        if tasks.is_empty() {
+            Ok(())
+        } else {
+            Err(SdkDriverError::new(
+                ErrorKind::Unsupported,
+                "EVENT_NOT_SUPPORTED",
+                "event tasks not supported by this driver",
+            ))
+        }
+    }
+
     /// 控制面写入（J §11）：默认 Unsupported，OPC UA 先行实现。
     async fn write(
         &mut self,
@@ -207,8 +235,8 @@ pub trait DriverConnection: Send {
     }
 }
 
-// 别名：AcquisitionTask 仅在 trait 签名中出现，保持与方案 §16 一致的命名可见性
-pub use mesa_core_types::AcquisitionTask;
+// 别名：AcquisitionTask/EventTask 在 trait 签名中出现，保持与方案 §16 一致的命名可见性
+pub use mesa_core_types::{AcquisitionTask, EventTask};
 
 // ---------------------------------------------------------------------------
 // DataSink：带 Latest-Wins 合并的发布端
@@ -221,14 +249,115 @@ struct CoalescerState {
     coalesced_points: u64,
 }
 
+/// 事件发布失败（Event Plane V1 §12 fail-closed）：入队前校验失败（未绑定/
+/// 空批/坏记录/超大）当场拒绝；入队本身永不丢弃——队列满时 **等待**
+/// （背压），只在通道关闭（会话 teardown）时返回 [`EventPublishError::Closed`]。
+/// 注意没有 `QueueFull` 变体：满队列就拒绝并让驱动 warn 后继续，会造成
+/// "seq 100 → seq 102 但连接仍 RUNNING"的残缺流，违反 Event Plane 完整性。
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum EventPublishError {
+    #[error("event sink not bound to a connection")]
+    Unbound,
+    #[error("event batch is empty")]
+    Empty,
+    #[error("EVENT_RECORD_INVALID: {0}")]
+    InvalidRecord(String),
+    #[error("event batch too large: {0} bytes > 256 KiB")]
+    TooLarge(usize),
+    #[error("event channel closed")]
+    Closed,
+}
+
+/// Driver 发布事件的句柄（由 [`DataSink::events`] 派生，与派生源共享
+/// handle/epoch 绑定）。Clone 廉价。
+///
+/// 与 DataSink 的根本区别：publish 永不合并、永不 Latest-Wins；队列满时
+/// **等待**而不是覆盖旧数据或报错丢弃。batch header
+/// （connection_handle/stream_epoch/sequence/timestamp_ns/mono_ns）全部由
+/// SDK 自动填充，驱动只管交 `Vec<EventRecord>`。
+#[derive(Clone, Debug)]
+pub struct EventSink {
+    event_tx: mpsc::Sender<EventBatch>,
+    /// handle -> (epoch, next_sequence)：每个 epoch 独立从 1 递增（§11）。
+    /// Stop/Close 时清理该 handle 条目，一切运行时状态有界。
+    seq: Arc<Mutex<HashMap<u32, (u64, u64)>>>,
+    handle: u32,
+    epoch: u64,
+}
+
+impl EventSink {
+    /// 发布一批事件。sequence 由 SDK 按 (handle, epoch) 自动分配并递增；
+    /// epoch 切换（Stop → Start）后自动从 1 重新开始，驱动无需感知。
+    ///
+    /// 背压语义（P0）：队列满时 `send().await` 等待，不合并、不覆盖、不拒绝——
+    /// occurrence 要么完整入队，要么会话已死（Closed）。等待期间不监听 shutdown：
+    /// writer 持续排空（Core 活着）则自然疏通；会话 teardown 时发送端随 sink
+    /// 一起释放，等待以 Closed 结束。驱动主循环在两次 publish 之间照常响应
+    /// shutdown 即可，不会卡死。
+    pub async fn publish(&self, events: Vec<EventRecord>) -> Result<u64, EventPublishError> {
+        if self.handle == 0 {
+            return Err(EventPublishError::Unbound);
+        }
+        if events.is_empty() {
+            return Err(EventPublishError::Empty);
+        }
+        // 驱动侧前置校验：坏记录在 publish 当场拒绝，不占用队列、不污染 wire。
+        for e in &events {
+            e.validate()
+                .map_err(|e| EventPublishError::InvalidRecord(e.to_string()))?;
+        }
+        let sequence = {
+            let mut m = self.seq.lock().unwrap();
+            match m.get_mut(&self.handle) {
+                Some((ep, next)) if *ep == self.epoch => {
+                    let s = *next;
+                    *next = next.saturating_add(1);
+                    s
+                }
+                // 新 handle 或新 epoch：一律从 1 开始（§11 新流语义）
+                _ => {
+                    m.insert(self.handle, (self.epoch, 2));
+                    1
+                }
+            }
+        };
+        let batch = EventBatch {
+            connection_handle: self.handle,
+            stream_epoch: self.epoch,
+            sequence,
+            timestamp_ns: mesa_core_types::now_unix_ns(),
+            events,
+            mono_ns: Some(mesa_core_types::host_mono_ns()),
+        };
+        // 粗粒度上限预检（JSON 体积与 proto 同量级；精确 256 KiB 由 writer 侧
+        // event_batch_to_pb 最终强制执行）。超大批次在 publish 当场拒绝。
+        let approx = serde_json::to_string(&batch)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
+        if approx > mesa_core_types::EVENT_BATCH_MAX_BYTES {
+            return Err(EventPublishError::TooLarge(approx));
+        }
+        // 有界可靠入队：满则等待（背压），只在会话 teardown 时失败。
+        // 同步 callback 不能 await 的驱动（未来 OPC UA/SINUMERIK）不得直调此处，
+        // 应自建 bounded raw-ingress + async forwarder，overflow 时按订阅失败处理。
+        match self.event_tx.send(batch).await {
+            Ok(()) => Ok(sequence),
+            Err(_) => Err(EventPublishError::Closed),
+        }
+    }
+}
+
 /// Driver 发布数据的句柄。Clone 廉价；内部共享有界通道与合并缓冲。
 #[derive(Clone)]
 pub struct DataSink {
     control_tx: mpsc::Sender<pb::Envelope>,
     data_tx: mpsc::Sender<DataBatch>,
+    event_tx: mpsc::Sender<EventBatch>,
     state: Arc<Mutex<CoalescerState>>,
     /// 全局 pending 注册表：handle -> CoalescerState，用于 writer 统一 flush
     pending_registry: Arc<Mutex<HashMap<u32, Arc<Mutex<CoalescerState>>>>>,
+    /// 事件 sequence 注册表：handle -> (epoch, next_sequence)，见 [`EventSink`]。
+    event_seq: Arc<Mutex<HashMap<u32, (u64, u64)>>>,
     /// 本 sink 绑定的 connection_handle；0 表示会话级（不发数据）。
     handle: u32,
     /// 绑定连接的 stream_epoch，publish 时随 handle 一并盖戳（§10）。
@@ -242,15 +371,21 @@ impl std::fmt::Debug for DataSink {
 }
 
 impl DataSink {
-    fn new(control_tx: mpsc::Sender<pb::Envelope>, data_tx: mpsc::Sender<DataBatch>) -> Self {
+    fn new(
+        control_tx: mpsc::Sender<pb::Envelope>,
+        data_tx: mpsc::Sender<DataBatch>,
+        event_tx: mpsc::Sender<EventBatch>,
+    ) -> Self {
         Self {
             control_tx,
             data_tx,
+            event_tx,
             state: Arc::new(Mutex::new(CoalescerState {
                 pending: None,
                 coalesced_points: 0,
             })),
             pending_registry: Arc::new(Mutex::new(HashMap::new())),
+            event_seq: Arc::new(Mutex::new(HashMap::new())),
             handle: 0,
             epoch: 0,
         }
@@ -274,10 +409,24 @@ impl DataSink {
         Self {
             control_tx: self.control_tx.clone(),
             data_tx: self.data_tx.clone(),
+            event_tx: self.event_tx.clone(),
             state: entry,
             pending_registry: Arc::clone(&self.pending_registry),
+            event_seq: Arc::clone(&self.event_seq),
             handle,
             epoch: stream_epoch,
+        }
+    }
+
+    /// 派生事件发布端：与本 sink 共享 handle/epoch 绑定与 sequence 注册表。
+    /// 支持事件的驱动在 run() 中 `let events = sink.events();` 后发布；
+    /// 不支持事件的驱动忽略本方法即可（零成本）。
+    pub fn events(&self) -> EventSink {
+        EventSink {
+            event_tx: self.event_tx.clone(),
+            seq: Arc::clone(&self.event_seq),
+            handle: self.handle,
+            epoch: self.epoch,
         }
     }
 
@@ -578,7 +727,8 @@ pub async fn serve_with_faults<D: Driver>(
     let (mut rd, mut wr) = socket.into_split();
     let (control_tx, control_rx) = mpsc::channel::<pb::Envelope>(CONTROL_CAPACITY);
     let (data_tx, data_rx) = mpsc::channel::<DataBatch>(DATA_CAPACITY);
-    let sink = DataSink::new(control_tx.clone(), data_tx.clone());
+    let (event_tx, event_rx) = mpsc::channel::<EventBatch>(EVENT_CAPACITY);
+    let sink = DataSink::new(control_tx.clone(), data_tx.clone(), event_tx.clone());
 
     // ---- 握手：先发 Hello 再等 Welcome（§14.3）。握手期 writer 尚未启动，
     // 直接使用写半部，避免与请求循环的出站路径产生交错。----
@@ -639,12 +789,15 @@ pub async fn serve_with_faults<D: Driver>(
         msg_ids: AtomicU64::new(2),
     };
 
-    // ---- writer task：唯一拥有写半部，串行化所有出站帧（Control 32 可靠优先，Data 256 Latest-Wins） ----
+    // ---- writer task：唯一拥有写半部，串行化所有出站帧 ----
+    // 调度（Event Plane V1 §12）：Control 永远最高优先；Event/Data 公平交替——
+    // 禁止 `Control > Event > Data` 固定偏序，否则 Alarm 风暴会让 Data 永久饥饿。
     let writer_shutdown = shutdown.child_token();
     let writer = tokio::spawn(writer_loop(
         wr,
         control_rx,
         data_rx,
+        event_rx,
         session.sink.clone(),
         Arc::clone(&session.active_epochs),
         writer_shutdown,
@@ -667,14 +820,47 @@ pub async fn serve_with_faults<D: Driver>(
     result
 }
 
+/// Event/Data 公平取帧：按 `event_turn` 交替先手，保证双路饱和时严格轮流
+/// （C E D / C D E 交替，Control 由外层 biased 恒优先）；仅一侧有数据时
+/// biased select 仍会取到该侧，不引入额外延迟。
+enum FairMsg {
+    Event(Option<EventBatch>),
+    Data(Option<DataBatch>),
+}
+
+async fn recv_fair(
+    event_rx: &mut mpsc::Receiver<EventBatch>,
+    data_rx: &mut mpsc::Receiver<DataBatch>,
+    event_turn: &mut bool,
+) -> FairMsg {
+    let msg = if *event_turn {
+        tokio::select! {
+            biased;
+            e = event_rx.recv() => FairMsg::Event(e),
+            d = data_rx.recv() => FairMsg::Data(d),
+        }
+    } else {
+        tokio::select! {
+            biased;
+            d = data_rx.recv() => FairMsg::Data(d),
+            e = event_rx.recv() => FairMsg::Event(e),
+        }
+    };
+    *event_turn = !*event_turn;
+    msg
+}
+
 async fn writer_loop(
     mut wr: OwnedWriteHalf,
     mut control_rx: mpsc::Receiver<pb::Envelope>,
     mut data_rx: mpsc::Receiver<DataBatch>,
+    mut event_rx: mpsc::Receiver<EventBatch>,
     sink: DataSink,
     active_epochs: Arc<Mutex<HashMap<u32, u64>>>,
     shutdown: CancellationToken,
 ) {
+    // 事件先手：Alarm 风暴与 Data 洪峰同时到达时，第一帧优先保证事件不被 Data 抢占
+    let mut event_turn = true;
     loop {
         tokio::select! {
             biased;
@@ -684,15 +870,42 @@ async fn writer_loop(
                     if write_envelope(&mut wr, &env).await.is_err() { break; }
                 }
                 None => {
-                    // 控制通道关闭：继续排空数据通道或退出
-                    // 若数据通道也关闭则整体退出
-                    if data_rx.is_closed() { break; }
-                    // 否则继续循环等待数据
+                    // 控制通道关闭：继续排空数据/事件通道或退出
+                    if data_rx.is_closed() && event_rx.is_closed() { break; }
                     continue;
                 }
             },
-            d = data_rx.recv() => match d {
-                Some(batch) => {
+            msg = recv_fair(&mut event_rx, &mut data_rx, &mut event_turn) => match msg {
+                FairMsg::Event(Some(batch)) => {
+                    // Epoch Gate（与 Data 同门）：StopAck 为事件面 barrier，
+                    // 之后旧 epoch 的排队 EventBatch 必须丢弃，Core 永不可见。
+                    let allowed = {
+                        let g = active_epochs.lock().unwrap();
+                        g.get(&batch.connection_handle).copied() == Some(batch.stream_epoch)
+                    };
+                    if !allowed {
+                        continue;
+                    }
+                    let wire = match event_batch_to_pb(&batch) {
+                        Ok(w) => w,
+                        // 驱动 bug（publish 已做前置校验，理论不可达）：大声记录并丢弃，
+                        // 绝不能让 writer 崩溃连累 Control/Data。
+                        Err(e) => {
+                            tracing::error!(
+                                handle = batch.connection_handle,
+                                error = %e,
+                                "event batch rejected at wire time (driver bug), dropped"
+                            );
+                            continue;
+                        }
+                    };
+                    let env = pb::Envelope {
+                        msg_id: 0,
+                        body: Some(pb::envelope::Body::EventBatch(wire)),
+                    };
+                    if write_envelope(&mut wr, &env).await.is_err() { break; }
+                }
+                FairMsg::Data(Some(batch)) => {
                     // Epoch Gate：已停止/过期的 stream 不得再发送（StopAck 为数据面 barrier）。
                     // 即使 batch 已在 Data Queue 中排队，也在真正写 socket 前丢弃。
                     let allowed = {
@@ -710,15 +923,17 @@ async fn writer_loop(
                     if write_envelope(&mut wr, &env).await.is_err() { break; }
                     else { sink.flush_pending(); }
                 }
-                None => {
-                    // 数据通道关闭：若控制也关闭则退出，否则等待控制消息
-                    if control_rx.is_closed() { break; }
+                FairMsg::Event(None) | FairMsg::Data(None) => {
+                    // 某通道关闭：其余通道全关才退出，否则继续服务剩余通道
+                    if control_rx.is_closed() && data_rx.is_closed() && event_rx.is_closed() {
+                        break;
+                    }
                     continue;
                 }
             },
         }
-        // 任一通道关闭后若另一通道也关闭则退出
-        if control_rx.is_closed() && data_rx.is_closed() {
+        // 三通道全关则退出
+        if control_rx.is_closed() && data_rx.is_closed() && event_rx.is_closed() {
             break;
         }
     }
@@ -805,6 +1020,9 @@ async fn request_loop(
             }
             Some(pb::envelope::Body::ApplyPointMap(req)) => {
                 on_apply_point_map(session, req, env.msg_id).await;
+            }
+            Some(pb::envelope::Body::ConfigureEventTasks(req)) => {
+                on_configure_events(session, req, env.msg_id).await
             }
             Some(pb::envelope::Body::StartConnection(req)) => {
                 on_start(session, req, env.msg_id).await
@@ -1037,6 +1255,75 @@ async fn on_apply_point_map(session: &Session, req: pb::ApplyPointMap, msg_id: u
         .await;
 }
 
+/// 事件任务配置（proto 42 → 43）：错误统一走 `EventConfigApplied.result`，
+/// 不另造 DriverError 分流——调用方只需看一处结果（PR6 接线约定）。
+async fn on_configure_events(session: &Session, req: pb::ConfigureEventTasks, msg_id: u64) {
+    // 取出连接对象供 configure_events 使用；失败必须归还，避免"打开但不可用"
+    let taken = session
+        .entries
+        .lock()
+        .unwrap()
+        .get_mut(&req.connection_handle)
+        .and_then(|e| e.conn.take());
+
+    let Some(mut conn) = taken else {
+        session
+            .sink
+            .send_control(pb::Envelope {
+                msg_id,
+                body: Some(pb::envelope::Body::EventConfigApplied(
+                    pb::EventConfigApplied {
+                        connection_handle: req.connection_handle,
+                        revision: req.revision,
+                        result: Some(err_result(
+                            ErrorKind::Internal,
+                            "NO_CONNECTION",
+                            "connection not open",
+                        )),
+                    },
+                )),
+            })
+            .await;
+        return;
+    };
+
+    // wire → Core EventTask：逐条解码，任一非法即整个 revision 失败（§35）
+    let tasks: Result<Vec<EventTask>, ConvertError> =
+        req.tasks.into_iter().map(event_task_from_pb).collect();
+    let result = match tasks {
+        Err(e) => {
+            let err = SdkDriverError::from(e);
+            err_result(err.kind, &err.code, err.message)
+        }
+        Ok(tasks) => match conn.configure_events(req.revision, tasks).await {
+            Ok(()) => ok_result(),
+            Err(err) => err_result(err.kind, &err.code, err.message),
+        },
+    };
+    // 归还连接（configure_events 不消耗连接对象）
+    if let Some(e) = session
+        .entries
+        .lock()
+        .unwrap()
+        .get_mut(&req.connection_handle)
+    {
+        e.conn = Some(conn);
+    }
+    session
+        .sink
+        .send_control(pb::Envelope {
+            msg_id,
+            body: Some(pb::envelope::Body::EventConfigApplied(
+                pb::EventConfigApplied {
+                    connection_handle: req.connection_handle,
+                    revision: req.revision,
+                    result: Some(result),
+                },
+            )),
+        })
+        .await;
+}
+
 async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
     // 前置校验：必须已完成 configure 且未在运行
     let ready = {
@@ -1141,6 +1428,13 @@ async fn on_stop(session: &Session, req: pb::StopConnection, msg_id: u64) {
         .lock()
         .unwrap()
         .remove(&req.connection_handle);
+    // 清理事件 sequence 状态：下次 Start 即新 epoch，序号从 1 重建，有界
+    session
+        .sink
+        .event_seq
+        .lock()
+        .unwrap()
+        .remove(&req.connection_handle);
     session
         .sink
         .send_control(pb::Envelope {
@@ -1170,6 +1464,12 @@ async fn on_close(session: &Session, req: pb::CloseConnection, msg_id: u64) {
     session
         .sink
         .pending_registry
+        .lock()
+        .unwrap()
+        .remove(&req.connection_handle);
+    session
+        .sink
+        .event_seq
         .lock()
         .unwrap()
         .remove(&req.connection_handle);
@@ -1621,11 +1921,21 @@ mod tests {
     /// 背压语义（§12 / §21 Backpressure 行）的确定性验证：
     /// 通道满载时同点批次合并为最新值，coalesced 计数可观测，
     /// 腾出空间后积压的"最新值"最终可达。
+    /// 会话级 sink + 存活的接收端（_erx 必须在测试作用域内存活，
+    /// 否则 try_send 直接 Closed）。
+    fn test_session_sink() -> (DataSink, mpsc::Receiver<EventBatch>) {
+        let (control_tx, _) = mpsc::channel::<pb::Envelope>(CONTROL_CAPACITY);
+        let (data_tx, _) = mpsc::channel::<DataBatch>(DATA_CAPACITY);
+        let (event_tx, erx) = mpsc::channel::<EventBatch>(EVENT_CAPACITY);
+        (DataSink::new(control_tx, data_tx, event_tx), erx)
+    }
+
     #[tokio::test]
     async fn sink_coalesces_latest_wins_when_full() {
         let (control_tx, _cr) = mpsc::channel::<pb::Envelope>(CONTROL_CAPACITY);
         let (data_tx, mut rx) = mpsc::channel::<DataBatch>(1);
-        let session_sink = DataSink::new(control_tx, data_tx);
+        let (event_tx, _er) = mpsc::channel::<EventBatch>(EVENT_CAPACITY);
+        let session_sink = DataSink::new(control_tx, data_tx, event_tx);
         let sink = session_sink.for_connection(7, 99);
 
         // 第一批直接入队（占满容量 1）
@@ -1656,5 +1966,154 @@ mod tests {
             }
             other => panic!("expected merged latest batch, got {other:?}"),
         }
+    }
+
+    fn event(id: &str) -> EventRecord {
+        EventRecord {
+            event_id: id.into(),
+            category: "alarm".into(),
+            kind: "alarm.condition".into(),
+            source: "Channel1".into(),
+            severity: 700,
+            code: None,
+            message: None,
+            message_locale: None,
+            occurred_at_ns: None,
+            condition: None,
+            correlation_id: None,
+            attributes: Default::default(),
+        }
+    }
+
+    /// EventSink 自动盖戳 + sequence 按 (handle, epoch) 独立递增；
+    /// 新 epoch 从 1 重来（§11）。
+    #[tokio::test]
+    async fn event_sink_stamps_header_and_sequences_per_epoch() {
+        let (root, _erx) = test_session_sink();
+        let sink = root.for_connection(7, 100);
+        let events = sink.events();
+        let s1 = events.publish(vec![event("e1")]).await.unwrap();
+        let s2 = events.publish(vec![event("e2")]).await.unwrap();
+        assert_eq!((s1, s2), (1, 2));
+        // 同一 sink 派生的第二个 EventSink 共享序号（同一连接同一 epoch）
+        let s3 = sink.events().publish(vec![event("e3")]).await.unwrap();
+        assert_eq!(s3, 3);
+        // 新 epoch 从 1 重来；旧 epoch 序号不继承（同 registry：真实路径由
+        // serve() 持有的 DataSink 派生，for_connection 共享 event_seq）
+        let sink_new_epoch = sink.for_connection(7, 101);
+        let r = sink_new_epoch
+            .events()
+            .publish(vec![event("e4")])
+            .await
+            .unwrap();
+        assert_eq!(r, 1);
+    }
+
+    /// Event 永不合并永不丢：队列满时 publish 等待（背压），而不是合并、
+    /// 覆盖或报错丢弃；腾出空间后等待的批次完整入队且序号连续。
+    #[tokio::test]
+    async fn event_sink_backpressures_instead_of_dropping() {
+        let (control_tx, _) = mpsc::channel::<pb::Envelope>(CONTROL_CAPACITY);
+        let (data_tx, _) = mpsc::channel::<DataBatch>(DATA_CAPACITY);
+        // 容量 1：第一批占满
+        let (event_tx, mut erx) = mpsc::channel::<EventBatch>(1);
+        let sink = DataSink::new(control_tx, data_tx, event_tx).for_connection(7, 100);
+        let events = sink.events();
+        events.publish(vec![event("e1")]).await.unwrap();
+
+        // 第二批在满队列上必须等待：50ms 内不得完成（没合并、没覆盖、没报错）
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let parked = events.clone();
+        tokio::spawn(async move {
+            let r = parked.publish(vec![event("e2")]).await;
+            let _ = done_tx.send(r);
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), done_rx)
+                .await
+                .is_err(),
+            "full queue must park the producer, not drop/merge/reject"
+        );
+        // 腾出空间 → 等待的批次完整入队，序号连续（1 → 2，无缺口）
+        let b = erx.recv().await.unwrap();
+        assert_eq!(b.sequence, 1);
+        assert_eq!(b.events[0].event_id, "e1");
+        let b = tokio::time::timeout(Duration::from_secs(2), erx.recv())
+            .await
+            .expect("parked publish must complete after drain")
+            .unwrap();
+        assert_eq!(b.sequence, 2);
+        assert_eq!(b.events.len(), 1);
+        assert_eq!(b.events[0].event_id, "e2");
+
+        // 会话 teardown（接收端释放）→ 等待以 Closed 结束，不 hanging
+        drop(erx);
+        assert_eq!(
+            events.publish(vec![event("e3")]).await.unwrap_err(),
+            EventPublishError::Closed
+        );
+    }
+
+    /// publish 前置校验：坏记录/空批/未绑定当场拒绝，不占用队列。
+    #[tokio::test]
+    async fn event_sink_rejects_invalid_upfront() {
+        let (root, _erx) = test_session_sink();
+        let sink = root.for_connection(7, 100);
+        let events = sink.events();
+        assert_eq!(
+            events.publish(vec![]).await.unwrap_err(),
+            EventPublishError::Empty
+        );
+        let mut bad = event("bad");
+        bad.event_id = String::new();
+        assert!(matches!(
+            events.publish(vec![bad]).await.unwrap_err(),
+            EventPublishError::InvalidRecord(_)
+        ));
+        let (root2, _erx2) = test_session_sink();
+        let unbound = root2.events();
+        assert_eq!(
+            unbound.publish(vec![event("x")]).await.unwrap_err(),
+            EventPublishError::Unbound
+        );
+    }
+
+    /// 默认 configure_events：空任务接受，非空拒绝（老 Driver 零改动）。
+    #[tokio::test]
+    async fn default_configure_events_accepts_empty_rejects_nonempty() {
+        struct Stub;
+        #[async_trait::async_trait]
+        impl DriverConnection for Stub {
+            async fn configure(
+                &mut self,
+                _r: u64,
+                _t: Vec<AcquisitionTask>,
+            ) -> Result<Vec<mesa_core_types::PointDescriptor>, SdkDriverError> {
+                Ok(vec![])
+            }
+            async fn apply_point_map(&mut self, _m: PointMap) -> Result<(), SdkDriverError> {
+                Ok(())
+            }
+            async fn run(
+                &mut self,
+                _s: DataSink,
+                _c: CancellationToken,
+            ) -> Result<(), SdkDriverError> {
+                Ok(())
+            }
+        }
+        let mut stub = Stub;
+        assert!(stub.configure_events(1, vec![]).await.is_ok());
+        let task = EventTask {
+            id: "e1".into(),
+            mode: mesa_core_types::TaskMode::Subscribe,
+            interval_ms: None,
+            binding: mesa_core_types::DriverBinding {
+                kind: "k".into(),
+                config: serde_json::Value::Null,
+            },
+        };
+        let err = stub.configure_events(1, vec![task]).await.unwrap_err();
+        assert_eq!(err.code, "EVENT_NOT_SUPPORTED");
     }
 }

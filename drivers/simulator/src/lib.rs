@@ -33,14 +33,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use mesa_core_types::{
-    AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, ErrorKind,
-    GENERIC_BINDING_KIND, GenericBinding, PointDescriptor, PointMap, PointValue, Quality, TaskMode,
-    Value, ensure_unique_point_keys, now_unix_ns,
+    AcquisitionTask, ConditionTransition, DataBatch, DataType, DriverMetadata, DuplicatePointKey,
+    ErrorKind, EventCondition, EventRecord, EventTask, GENERIC_BINDING_KIND, GenericBinding,
+    PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, ensure_unique_point_keys,
+    now_unix_ns,
 };
-use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
+use mesa_driver_sdk::{DataSink, Driver, DriverConnection, EventSink, SdkDriverError};
 use tokio_util::sync::CancellationToken;
 
 pub const BINDING_KIND: &str = "simulator.points";
+/// 事件任务 binding kind：config 形如 `{ "stream": "sim.events.counter" }`，
+/// stream 取值见 [`SIM_EVENT_STREAM_COUNTER`] / [`SIM_EVENT_STREAM_ALARM`]。
+/// 语义完全由本驱动解释（Core 不懂协议）。
+pub const EVENT_BINDING_KIND: &str = "simulator.events";
+/// 计数器事件流：周期性瞬时事件（`counter.tick`），无 condition。
+pub const SIM_EVENT_STREAM_COUNTER: &str = "sim.events.counter";
+/// 报警周期流：每次 run 走一遍 Raised → Updated → Acknowledged → Cleared，
+/// 四条独立 occurrence 共享同一 condition_id（`SIM-ALARM-100`）。
+pub const SIM_EVENT_STREAM_ALARM: &str = "sim.events.alarm-cycle";
+/// 报警流的 condition 身份（四条记录共享）。
+pub const SIM_ALARM_CONDITION_ID: &str = "SIM-ALARM-100";
 
 /// Simulator 驱动实例。无连接级共享状态——每个连接独立持有采集计划。
 #[derive(Default)]
@@ -62,8 +74,9 @@ impl Driver for SimulatorDriver {
     fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
         use mesa_core_types::{
             AccessMode, DataType, DiscoveryCapabilities, DriverCapabilities, DriverDescriptor,
-            DriverIdentity, FieldDescriptor, FieldType, LocalizedText, OutputDescriptor,
-            ResourceDescriptor, SchemaDescriptor,
+            DriverIdentity, EventCatalog, EventFieldDescriptor, EventStreamDescriptor,
+            FieldDescriptor, FieldType, LocalizedText, OutputDescriptor, ResourceDescriptor,
+            SchemaDescriptor, TaskMode,
         };
         let m = self.metadata();
         DriverDescriptor {
@@ -157,10 +170,37 @@ impl Driver for SimulatorDriver {
             },
             capabilities: DriverCapabilities {
                 poll: true,
+                events: true,
                 ..Default::default()
             },
-            // Event Plane PR5：老 Driver 无事件目录即 empty（Major 不升级）
-            events: Default::default(),
+            // Event Plane V1 §5：Simulator 是第一个 Reference Event Driver，
+            // 声明 counter（瞬时）+ alarm-cycle（Condition 四态）两个事件流
+            events: EventCatalog {
+                streams: vec![
+                    EventStreamDescriptor {
+                        id: SIM_EVENT_STREAM_COUNTER.into(),
+                        label: LocalizedText::new("Counter Events"),
+                        modes: vec![TaskMode::Poll, TaskMode::Subscribe],
+                        parameters: SchemaDescriptor::default(),
+                        fields: vec![EventFieldDescriptor {
+                            key: "value".into(),
+                            label: LocalizedText::new("Counter value"),
+                            data_type: Some("u64".into()),
+                        }],
+                    },
+                    EventStreamDescriptor {
+                        id: SIM_EVENT_STREAM_ALARM.into(),
+                        label: LocalizedText::new("Alarm Cycle"),
+                        modes: vec![TaskMode::Poll, TaskMode::Subscribe],
+                        parameters: SchemaDescriptor::default(),
+                        fields: vec![EventFieldDescriptor {
+                            key: "code".into(),
+                            label: LocalizedText::new("Alarm code"),
+                            data_type: Some("string".into()),
+                        }],
+                    },
+                ],
+            },
         }
     }
 
@@ -173,7 +213,11 @@ impl Driver for SimulatorDriver {
         let cfg: serde_json::Value = serde_json::from_str(config_json)
             .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.to_string()))?;
         let faults = parse_conn_faults(&cfg)?;
-        Ok(Box::new(SimConnection { plan: None, faults }))
+        Ok(Box::new(SimConnection {
+            plan: None,
+            faults,
+            event_plan: None,
+        }))
     }
 }
 
@@ -479,7 +523,47 @@ struct PlanSnapshot {
 struct SimConnection {
     plan: Option<PlanSnapshot>,
     faults: ConnFaults,
+    /// 事件订阅计划（Event Plane V1 §6 全量快照，原子替换，与数据计划独立）。
+    /// None/空 = 不发射任何事件；run() 只在有任务时起事件循环。
+    event_plan: Option<EventPlanSnapshot>,
 }
+
+/// configure_events 成功后的事件订阅快照（revision 对应 ConfigureEventTasks.revision）。
+#[derive(Debug)]
+struct EventPlanSnapshot {
+    #[allow(dead_code)]
+    revision: u64,
+    tasks: Vec<SimEventTask>,
+}
+
+/// 单个事件任务的驱动内解释形态：stream 决定发射器，interval 决定周期。
+#[derive(Debug)]
+struct SimEventTask {
+    #[allow(dead_code)]
+    id: String,
+    stream: SimEventStream,
+    interval_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimEventStream {
+    Counter,
+    AlarmCycle,
+}
+
+impl SimEventStream {
+    fn parse(stream: &str) -> Option<Self> {
+        match stream {
+            SIM_EVENT_STREAM_COUNTER => Some(Self::Counter),
+            SIM_EVENT_STREAM_ALARM => Some(Self::AlarmCycle),
+            _ => None,
+        }
+    }
+}
+
+/// run() 调用计数（进程级单调）：alarm-cycle 每次 run 走一遍四态，
+/// event_id 必须跨 run 唯一（Endpoint 内去重键），用 run 序号区分。
+static SIM_EVENT_RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[async_trait::async_trait]
 impl DriverConnection for SimConnection {
@@ -654,6 +738,75 @@ impl DriverConnection for SimConnection {
         Ok(descriptors)
     }
 
+    /// 事件任务配置（Event Plane V1 §6）：空快照清空订阅；非空快照逐条校验
+    /// （任务结构 + binding kind + stream 存在性），任一非法即整个 revision
+    /// 失败且旧订阅保持不变（§35 原子切换）。
+    async fn configure_events(
+        &mut self,
+        revision: u64,
+        tasks: Vec<EventTask>,
+    ) -> Result<(), SdkDriverError> {
+        use mesa_core_types::EventTaskError;
+        let mut new_tasks = Vec::with_capacity(tasks.len());
+        for task in &tasks {
+            task.validate().map_err(|e| match e {
+                EventTaskError::EmptyTaskId => SdkDriverError::configuration(
+                    "INVALID_EVENT_TASK",
+                    format!("event task id 不能为空 (revision {revision})"),
+                ),
+                EventTaskError::PollRequiresInterval { task } => SdkDriverError::configuration(
+                    "INVALID_EVENT_TASK",
+                    format!("event task `{task}`: Poll 模式必须提供正整数 interval_ms"),
+                ),
+            })?;
+            if task.binding.kind != EVENT_BINDING_KIND {
+                return Err(SdkDriverError::configuration(
+                    "UNSUPPORTED_EVENT_BINDING",
+                    format!(
+                        "event task `{}`: binding kind `{}` unsupported, expected `{EVENT_BINDING_KIND}`",
+                        task.id, task.binding.kind
+                    ),
+                ));
+            }
+            let stream_name = task
+                .binding
+                .config
+                .get("stream")
+                .and_then(|s| s.as_str())
+                .ok_or_else(|| {
+                    SdkDriverError::configuration(
+                        "INVALID_EVENT_BINDING_CONFIG",
+                        format!(
+                            "event task `{}`: missing string `stream` (expected `{SIM_EVENT_STREAM_COUNTER}` or `{SIM_EVENT_STREAM_ALARM}`)",
+                            task.id
+                        ),
+                    )
+                })?;
+            let stream = SimEventStream::parse(stream_name).ok_or_else(|| {
+                SdkDriverError::configuration(
+                    "UNKNOWN_EVENT_STREAM",
+                    format!("event task `{}`: unknown stream `{stream_name}`", task.id),
+                )
+            })?;
+            // Poll 用任务自带周期；Subscribe 用驱动默认 100ms 节奏
+            let interval_ms = match task.mode {
+                TaskMode::Poll => task.interval_ms.expect("validated above"),
+                TaskMode::Subscribe => task.interval_ms.unwrap_or(100).max(1),
+            };
+            new_tasks.push(SimEventTask {
+                id: task.id.clone(),
+                stream,
+                interval_ms,
+            });
+        }
+        tracing::info!(revision, tasks = new_tasks.len(), "event plan built");
+        self.event_plan = Some(EventPlanSnapshot {
+            revision,
+            tasks: new_tasks,
+        });
+        Ok(())
+    }
+
     async fn apply_point_map(&mut self, map: PointMap) -> Result<(), SdkDriverError> {
         let snapshot = self.plan.as_mut().ok_or_else(|| {
             SdkDriverError::new(
@@ -718,6 +871,8 @@ impl DriverConnection for SimConnection {
         // 连接级已发布批次数：故障注入（fail/crash_after_batches）的触发依据
         let published = Arc::new(AtomicU64::new(0));
         let started = std::time::Instant::now();
+        // 本次 run 的事件序号：alarm event_id 跨 run 唯一（Endpoint 内去重键）
+        let event_run_seq = SIM_EVENT_RUN_SEQ.fetch_add(1, Ordering::Relaxed);
 
         let mut handles = Vec::with_capacity(snapshot.tasks.len());
         for plan in &snapshot.tasks {
@@ -791,6 +946,20 @@ impl DriverConnection for SimConnection {
                 run
             }));
         }
+        // 事件循环：仅当配置了非空事件计划才启动（无订阅不发射，
+        // 避免无消费者的批次占用 Event Queue）。
+        if let Some(eplan) = &self.event_plan {
+            for task in &eplan.tasks {
+                let events = sink.events();
+                let shutdown = shutdown.clone();
+                let stream = task.stream;
+                let interval = Duration::from_millis(task.interval_ms);
+                handles.push(tokio::spawn(async move {
+                    run_sim_event_task(events, shutdown, stream, event_run_seq, interval).await;
+                    Ok::<(), SdkDriverError>(())
+                }));
+            }
+        }
         for h in handles {
             let _ = h.await;
         }
@@ -839,6 +1008,131 @@ impl DriverConnection for SimConnection {
 /// 仅在有注入项时才走计数路径，避免正常采集承担原子开销。
 fn faults_eq_default(f: ConnFaults) -> bool {
     f == ConnFaults::default()
+}
+
+// ---------------------------------------------------------------------------
+// 事件发射器（Event Plane V1 Reference 实现，PR6）
+// ---------------------------------------------------------------------------
+
+/// 单个事件任务的发射循环（与数据采集循环独立，共享 shutdown）。
+/// Counter：按 interval 周期发射瞬时事件；AlarmCycle：每次 run 走一遍
+/// Raised → Updated → Acknowledged → Cleared 四态后结束（周期性重复由
+/// Stop → Start 驱动，保证测试确定性）。
+async fn run_sim_event_task(
+    events: EventSink,
+    shutdown: CancellationToken,
+    stream: SimEventStream,
+    run_seq: u64,
+    interval: Duration,
+) {
+    match stream {
+        SimEventStream::Counter => {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut n: u64 = 0;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = shutdown.cancelled() => return,
+                }
+                n += 1;
+                let record = EventRecord {
+                    event_id: format!("sim.counter:{run_seq}:{n}"),
+                    category: "message".into(),
+                    kind: "counter.tick".into(),
+                    source: "sim".into(),
+                    severity: 0,
+                    code: None,
+                    message: Some(format!("counter tick {n}")),
+                    message_locale: Some("en".into()),
+                    // 瞬时事件无设备时间：occurred_at_ns 为 None（禁止伪造 now）
+                    occurred_at_ns: None,
+                    condition: None,
+                    correlation_id: None,
+                    attributes: std::collections::BTreeMap::from([("value".into(), Value::U64(n))]),
+                };
+                if let Err(e) = events.publish(vec![record]).await {
+                    // publish 只在通道关闭（会话 teardown）时失败；队列满只会
+                    // 等待（背压），永不丢 occurrence。失败即退出本任务循环。
+                    tracing::warn!(error = %e, tick = n, "sim event publish failed");
+                    return;
+                }
+            }
+        }
+        SimEventStream::AlarmCycle => {
+            // 四态：独立 event_id、共享 condition_id（§1 生命周期语义）
+            let steps = [
+                (
+                    ConditionTransition::Raised,
+                    true,
+                    None,
+                    700u16,
+                    "alarm raised",
+                ),
+                (
+                    ConditionTransition::Updated,
+                    true,
+                    None,
+                    700,
+                    "alarm updated",
+                ),
+                (
+                    ConditionTransition::Acknowledged,
+                    true,
+                    Some(true),
+                    400,
+                    "alarm acknowledged",
+                ),
+                (
+                    ConditionTransition::Cleared,
+                    false,
+                    None,
+                    200,
+                    "alarm cleared",
+                ),
+            ];
+            for (i, (transition, active, acknowledged, severity, message)) in
+                steps.into_iter().enumerate()
+            {
+                // 首条立即发射，后续间隔 50ms（给 Core 留出逐批到达的时序）
+                if i > 0 {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                        _ = shutdown.cancelled() => return,
+                    }
+                }
+                let name = format!("{transition:?}").to_lowercase();
+                let record = EventRecord {
+                    event_id: format!("sim.alarm100:{run_seq}:{name}"),
+                    category: "alarm".into(),
+                    kind: "alarm.condition".into(),
+                    source: "Channel1".into(),
+                    severity,
+                    code: Some("SIM-100".into()),
+                    message: Some(message.into()),
+                    message_locale: Some("en".into()),
+                    occurred_at_ns: Some(now_unix_ns()),
+                    condition: Some(EventCondition {
+                        condition_id: SIM_ALARM_CONDITION_ID.into(),
+                        transition,
+                        active: Some(active),
+                        acknowledged,
+                        confirmed: None,
+                        retain: Some(true),
+                    }),
+                    correlation_id: None,
+                    attributes: std::collections::BTreeMap::from([(
+                        "code".into(),
+                        Value::String("SIM-100".into()),
+                    )]),
+                };
+                if let Err(e) = events.publish(vec![record]).await {
+                    tracing::warn!(error = %e, step = i, "sim alarm publish failed");
+                    return;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
