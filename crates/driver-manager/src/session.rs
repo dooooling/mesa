@@ -881,9 +881,7 @@ fn snoop_lifecycle_ack(shared: &Shared, msg_id: u64, body: &Option<pb::envelope:
                 .unwrap()
                 .remove(&ack.connection_handle);
         }
-        Some(Body::CloseConnectionAck(ack))
-            if ack.result.as_ref().is_some_and(|r| r.ok) =>
-        {
+        Some(Body::CloseConnectionAck(ack)) if ack.result.as_ref().is_some_and(|r| r.ok) => {
             shared
                 .active_event_epochs
                 .lock()
