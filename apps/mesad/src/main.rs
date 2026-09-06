@@ -78,6 +78,18 @@ async fn main() {
                 None
             }
         };
+    // ---- Retention sweeper（⑧b，v1.1 §17 冻结默认：30d/1M/10min/batch1000）----
+    // 无 CLI flag（调参需求出现时再加）；events.db 不可用时不启动。
+    // shutdown 由 manager token 级联（shutdown_all 取消 → sweeper 退出）。
+    let retention_shutdown = manager.shutdown_token().child_token();
+    let retention_task = event_services.clone().map(|svc| {
+        let shutdown = retention_shutdown.clone();
+        tokio::spawn(mesa_event_store::retention::run_retention_loop(
+            svc.store.clone(),
+            mesa_event_store::RetentionConfig::default(),
+            shutdown,
+        ))
+    });
 
     // ---- PKI 初始化（必须在恢复 Endpoint/启动 Driver 之前，确保 OPC UA Secure 证书就绪）----
     // 只 resolve 一次 PKI 路径，Core 与 Driver 共用（自定义 MESA_OPCUA_PKI_DIR 时避免分叉）
@@ -166,6 +178,10 @@ async fn main() {
     wait_for_interrupt().await;
     tracing::info!("shutdown signal received, stopping...");
     manager.shutdown_all().await;
+    // retention sweeper 随 token 退出；abort 兜底（已退出的 abort 无害）
+    if let Some(t) = retention_task {
+        t.abort();
+    }
     api.abort();
     tracing::info!("bye");
 }
@@ -174,8 +190,8 @@ struct Args {
     drivers_dir: String,
     http_port: u16,
     db_path: String,
-    /// events.db 路径（默认与 --db 同目录的 events.db，v1.1 §19）；
-    /// retention 相关 flag 见 step ⑧。
+    /// events.db 路径（默认与 --db 同目录的 events.db，v1.1 §19）。
+    /// retention 用冻结默认（⑧b，无 flag）。
     events_db_path: Option<std::path::PathBuf>,
     enable_control: bool,
 }

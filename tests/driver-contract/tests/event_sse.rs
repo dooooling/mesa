@@ -193,6 +193,51 @@ impl SseClient {
     }
 }
 
+/// 普通 JSON GET（裸 TCP；`GET /api/v1/events/stats` 等诊断接口用）。
+/// 返回 `(status, body_json)`。
+async fn get_json(port: u16, path: &str) -> (u16, serde_json::Value) {
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut buf)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&buf);
+    let status: u16 = text
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    // 最后一个 `\r\n\r\n` 之后是 body（chunked 传输时先解码）
+    let body = text.split("\r\n\r\n").last().unwrap_or("");
+    let body = if text.contains("transfer-encoding: chunked") {
+        let mut out = String::new();
+        let mut rest = body;
+        loop {
+            let end = rest.find("\r\n").unwrap_or(rest.len());
+            let size = usize::from_str_radix(rest[..end].trim(), 16).unwrap_or(0);
+            if size == 0 {
+                break;
+            }
+            rest = &rest[end + 2..];
+            out.push_str(&rest[..size.min(rest.len())]);
+            rest = &rest[size.min(rest.len())..];
+            rest = rest.strip_prefix("\r\n").unwrap_or(rest);
+        }
+        out
+    } else {
+        body.to_string()
+    };
+    (status, serde_json::from_str(&body).unwrap())
+}
+
 /// live-only 默认：无游标不灌历史，首帧即新提交行。
 #[tokio::test]
 async fn sse_live_only_by_default() {
@@ -390,5 +435,19 @@ async fn sse_lagged_catch_up_from_db() {
         assert!(seq > prev);
         prev = seq;
     }
+    // branch contract（⑧c）：程序级证明 Lagged 分支确实走过，
+    // 而非"8MB 超 socket 缓冲"的环境假设；replay 帧计数同步断言。
+    let (status, stats) = get_json(_srv.port, "/api/v1/events/stats").await;
+    assert_eq!(status, 200);
+    assert!(
+        stats["sse_lagged_total"].as_u64().unwrap() >= 1,
+        "必须至少命中一次 Lagged，stats={stats}"
+    );
+    assert_eq!(
+        stats["sse_replay_frames_total"].as_u64().unwrap(),
+        2010,
+        "DB replay 帧总数必须恰为 2010，stats={stats}"
+    );
+    assert_eq!(stats["stored_rows"].as_u64().unwrap(), 2010);
     let _ = std::fs::remove_file(&db);
 }

@@ -120,19 +120,26 @@ pub fn query_by_seq(conn: &Connection, seq: i64) -> Result<Option<StoredEvent>, 
     }
 }
 
-/// SSE replay 页：`seq > after` 的行按 ASC 取 `limit` 条（调用方循环翻页
+/// SSE replay 页：`(after, until]` 区间按 ASC 取 `limit` 条（调用方循环翻页
 /// 直到不满页；与 history 的 DESC 分页互不干扰）。
+/// `until_seq = Some(h)` 把上界字面锁死在建连 high-water（初始 replay 用，
+/// 区间恒为 `(cursor, high_water]`）；`None` 即 `i64::MAX` 追 DB 现状
+/// （live 期 gap/Lag/reconcile 用）。单条静态 SQL，无分支拼接。
 pub fn query_range_asc(
     conn: &Connection,
     after_seq: i64,
+    until_seq: Option<i64>,
     limit: u32,
 ) -> Result<Vec<StoredEvent>, EventStoreError> {
     let sql = format!(
-        "SELECT {} FROM events WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
+        "SELECT {} FROM events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq ASC LIMIT ?3",
         schema::SELECT_COLS
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map((after_seq, limit as i64), schema::row_to_stored)?;
+    let rows = stmt.query_map(
+        (after_seq, until_seq.unwrap_or(i64::MAX), limit as i64),
+        schema::row_to_stored,
+    )?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(EventStoreError::Fatal)
 }
@@ -141,4 +148,31 @@ pub fn query_range_asc(
 pub fn max_seq(conn: &Connection) -> Result<i64, EventStoreError> {
     let v: Option<i64> = conn.query_row("SELECT MAX(seq) FROM events", [], |r| r.get(0))?;
     Ok(v.unwrap_or(0))
+}
+
+/// Retention 时间阈值（⑧b）：`received_at_ns >= since` 的最小 seq，
+/// 即"应保留"的第一行；`None` = 全表都比 since 旧（调用方转 max+1 全清）。
+/// 用 `received_at_ns`（Core 落盘时钟，恒存在）而非 `occurred_at_ns`
+/// （可为 NULL，设备时钟还可能回拨）。
+pub fn min_seq_received_since(
+    conn: &Connection,
+    since_ns: i64,
+) -> Result<Option<i64>, EventStoreError> {
+    let v: Option<i64> = conn.query_row(
+        "SELECT MIN(seq) FROM events WHERE received_at_ns >= ?1",
+        [since_ns],
+        |r| r.get(0),
+    )?;
+    Ok(v)
+}
+
+/// Retention 数量阈值（⑧b）：按 seq ASC 第 `offset` 行（0-based）的 seq，
+/// 即跳过最老的 `offset` 行后"应保留"的第一行；`None` = 行数不足。
+pub fn seq_by_asc_offset(conn: &Connection, offset: i64) -> Result<Option<i64>, EventStoreError> {
+    let mut stmt = conn.prepare("SELECT seq FROM events ORDER BY seq ASC LIMIT 1 OFFSET ?1")?;
+    let mut rows = stmt.query_map([offset], |r| r.get::<_, i64>(0))?;
+    match rows.next() {
+        Some(r) => Ok(Some(r?)),
+        None => Ok(None),
+    }
 }

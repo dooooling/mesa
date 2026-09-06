@@ -86,9 +86,12 @@ pub type SharedIngressStats = Arc<Mutex<IngressStats>>;
 /// 运行 ingress 直到流关闭、fatal 或优雅取消。`endpoint_id` 即去重作用域
 /// 与存储分区。
 ///
-/// 优雅取消（Checkpoint B 方案 A）：cancel 只在循环头检查——当前
-/// commit+publish 必完整执行后才退出，杜绝"DB 已有但 Hub 未发布"的静默缺口
-/// （abort 只作为超时兜底，见 `attempt_session`）。
+/// 优雅取消（Checkpoint B 方案 A + ⑨ final drain）：cancel 只在循环头检查——
+/// 当前 commit+publish 必完整执行；cancel 到达后**排空 channel 里已有批次**
+/// 再退出（⑨：Stop 时已进入 Core 的旧 epoch Event 不得因 ingress 先退而被
+/// 遗弃）。barrier（reader 已结束）保证 drain 期间无新到达——drain 必终止；
+/// 无 barrier 时见空即停（仍严格优于直接返回）。
+/// abort 只作为超时兜底（见 `attempt_session`）。
 pub async fn run_event_ingress(
     mut rx: EventReceiver,
     endpoint_id: String,
@@ -96,29 +99,58 @@ pub async fn run_event_ingress(
     stats: SharedIngressStats,
     shutdown: CancellationToken,
 ) -> Result<(), IngressFatal> {
-    let mut tracker = EventSequenceTracker::new();
-    // 已见最大序号（epoch, seq）：tracker 不暴露内部 max，ingress 本地维护，
-    // 用于 Regression fatal 的精确上下文（之前最大是多少）。
-    let mut max_seen: Option<(u64, u64)> = None;
+    let mut proc = BatchProcessor::new(endpoint_id, services, stats);
     loop {
         let batch = tokio::select! {
             b = rx.recv() => b.ok_or(IngressFatal::StreamClosed)?,
-            // 优雅退出：当前 commit+publish 已完成（循环尾），下次迭代不再取批
-            _ = shutdown.cancelled() => return Ok(()),
+            // 优雅退出：当前 commit+publish 已完成（循环尾）；先排空再返回
+            _ = shutdown.cancelled() => {
+                while let Ok(batch) = rx.try_recv() {
+                    proc.process(batch).await?;
+                }
+                return Ok(());
+            }
         };
-        stats.lock().unwrap().batches += 1;
+        proc.process(batch).await?;
+    }
+}
+
+/// 单批处理（主循环与 final drain 共用；语义恒一致）。
+struct BatchProcessor {
+    endpoint_id: String,
+    services: Arc<EventServices>,
+    stats: SharedIngressStats,
+    tracker: EventSequenceTracker,
+    // 已见最大序号（epoch, seq）：tracker 不暴露内部 max，本地维护，
+    // 用于 Regression fatal 的精确上下文（之前最大是多少）。
+    max_seen: Option<(u64, u64)>,
+}
+
+impl BatchProcessor {
+    fn new(endpoint_id: String, services: Arc<EventServices>, stats: SharedIngressStats) -> Self {
+        Self {
+            endpoint_id,
+            services,
+            stats,
+            tracker: EventSequenceTracker::new(),
+            max_seen: None,
+        }
+    }
+
+    async fn process(&mut self, batch: mesa_core_types::EventBatch) -> Result<(), IngressFatal> {
+        self.stats.lock().unwrap().batches += 1;
         let (handle, epoch, seq) = (batch.connection_handle, batch.stream_epoch, batch.sequence);
         // Sequence Gate（PR5 冻结语义，PR7 第一次执法）
-        match tracker.check(epoch, seq) {
+        match self.tracker.check(epoch, seq) {
             SequenceVerdict::Accept => {
-                max_seen = Some((epoch, seq));
+                self.max_seen = Some((epoch, seq));
             }
             SequenceVerdict::Gap { expected, got } => {
                 // 缺口可观测：入库 + 计数，不假装没发生
-                stats.lock().unwrap().gaps += 1;
-                max_seen = Some((epoch, got));
+                self.stats.lock().unwrap().gaps += 1;
+                self.max_seen = Some((epoch, got));
                 tracing::warn!(
-                    endpoint = %endpoint_id,
+                    endpoint = %self.endpoint_id,
                     expected, got,
                     "event sequence gap, committed with gap accounted"
                 );
@@ -126,16 +158,17 @@ pub async fn run_event_ingress(
             SequenceVerdict::Duplicate => {
                 // 整批跳过：不开 DB txn（同 seq 即同内容是 wire invariant，
                 // 无需第二套 payload hash）。
-                stats.lock().unwrap().batch_duplicates += 1;
+                self.stats.lock().unwrap().batch_duplicates += 1;
                 tracing::debug!(
-                    endpoint = %endpoint_id,
+                    endpoint = %self.endpoint_id,
                     seq,
                     "duplicate event batch skipped without transaction"
                 );
-                continue;
+                return Ok(());
             }
             SequenceVerdict::Regression => {
-                let prev = max_seen
+                let prev = self
+                    .max_seen
                     .filter(|(e, _)| *e == epoch)
                     .map(|(_, s)| s)
                     .unwrap_or(0);
@@ -149,46 +182,42 @@ pub async fn run_event_ingress(
         }
         // v1.1 §3：received_at 每 batch 取一次，同批共用
         let received_at_ns = now_unix_ns();
-        let res = services
+        let res = self
+            .services
             .store
             .commit_batch(CommitRequest {
-                endpoint_id: endpoint_id.clone(),
+                endpoint_id: self.endpoint_id.clone(),
                 batch,
                 received_at_ns,
             })
             .await;
         match res {
             Ok(outcome) => {
-                stats.lock().unwrap().persisted_events += outcome.inserted.len() as u64;
-                stats.lock().unwrap().event_duplicates += outcome.duplicates;
+                self.stats.lock().unwrap().persisted_events += outcome.inserted.len() as u64;
+                self.stats.lock().unwrap().event_duplicates += outcome.duplicates;
                 // 先 COMMIT，后发布：Hub 只见已落盘行（重放旧行不再发布）
                 for ev in &outcome.inserted {
-                    services.hub.publish(ev);
+                    self.services.hub.publish(ev);
                 }
+                Ok(())
             }
             Err(mesa_event_store::EventStoreError::IdCollision {
                 endpoint_id,
                 event_id,
-            }) => {
-                return Err(IngressFatal::IdCollision {
-                    endpoint_id,
-                    event_id,
-                });
-            }
-            Err(mesa_event_store::EventStoreError::InvalidRecord(detail)) => {
-                return Err(IngressFatal::InvalidBatch(format!(
-                    "handle {handle}: {detail}"
-                )));
-            }
+            }) => Err(IngressFatal::IdCollision {
+                endpoint_id,
+                event_id,
+            }),
+            Err(mesa_event_store::EventStoreError::InvalidRecord(detail)) => Err(
+                IngressFatal::InvalidBatch(format!("handle {handle}: {detail}")),
+            ),
             Err(mesa_event_store::EventStoreError::Unavailable(detail)) => {
-                return Err(IngressFatal::StoreUnavailable(detail));
+                Err(IngressFatal::StoreUnavailable(detail))
             }
             Err(mesa_event_store::EventStoreError::Fatal(e)) => {
-                return Err(IngressFatal::StoreUnavailable(format!("sqlite: {e}")));
+                Err(IngressFatal::StoreUnavailable(format!("sqlite: {e}")))
             }
-            Err(mesa_event_store::EventStoreError::Encode(e)) => {
-                return Err(IngressFatal::InvalidBatch(e));
-            }
+            Err(mesa_event_store::EventStoreError::Encode(e)) => Err(IngressFatal::InvalidBatch(e)),
         }
     }
 }

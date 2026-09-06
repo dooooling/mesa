@@ -16,7 +16,7 @@ use axum::http::{Request, StatusCode};
 use mesa_core_types::{DriverBinding, EventBatch, EventRecord, EventTask, TaskMode, Value};
 use mesa_driver_manager::MesaManager;
 use mesa_driver_manager::endpoint::BuiltinEndpoint;
-use mesa_driver_simulator::{EVENT_BINDING_KIND, SIM_EVENT_STREAM_ALARM};
+use mesa_driver_simulator::{EVENT_BINDING_KIND, SIM_EVENT_STREAM_ALARM, SIM_EVENT_STREAM_COUNTER};
 use mesa_event_store::{
     CommitRequest, EVENT_HUB_CAPACITY, EventFilter, EventHub, EventServices, EventStore,
 };
@@ -42,6 +42,23 @@ fn alarm_task() -> EventTask {
         binding: DriverBinding {
             kind: EVENT_BINDING_KIND.into(),
             config: serde_json::json!({"stream": SIM_EVENT_STREAM_ALARM}),
+        },
+    }
+}
+
+/// 洪峰计数器（⑨ Gate 用）：Poll 1ms 节奏（1000/s），瞬时事件。
+/// 该速率下 driver 停产 teardown 窗口（数 ms）内必有多个在途批次：
+/// 旧 cancel-first 顺序高概率掉尾（Gate 牙口），新 barrier 顺序零遗弃；
+/// ingress 单行 txn 吞吐（数 k/s）下 1000/s 不应触发 overflow fail-closed
+/// （若触发会换 epoch，`by_epoch.len()` 断言即红——误报可区分）。
+fn flood_task() -> EventTask {
+    EventTask {
+        id: "cnt".into(),
+        mode: TaskMode::Poll,
+        interval_ms: Some(2),
+        binding: DriverBinding {
+            kind: EVENT_BINDING_KIND.into(),
+            config: serde_json::json!({"stream": SIM_EVENT_STREAM_COUNTER}),
         },
     }
 }
@@ -545,6 +562,97 @@ async fn graceful_shutdown_publishes_every_commit() {
         );
     }
     drop(mgr);
+    let _ = std::fs::remove_file(&db);
+}
+
+/// ⑨ Stop barrier/drain Gate（生产端到端锁）：洪峰中 Stop，旧 epoch 已进入
+/// Core 的 Event 不得因 ingress 先退而被遗弃。
+///
+/// 完整链（见 `attempt_session` 收尾 + `run_event_ingress`）：Shutdown-post →
+/// terminate → 等 reader 结束（TCP FIN 之前全部字节已 pump）→ cancel ingress →
+/// final drain 提交 channel 全部。确定性遗弃证明在单测
+/// `session::tests::ingress_cancel_drains_backlog`（旧行为 73/200）与
+/// `reader_eof_barrier_means_all_batches_pumped`；本测试锁定真实 Stop 路径：
+/// 断言逐 epoch `batch_sequence` 无缺口；五轮 stop/start 反复执行 barrier；
+/// 末轮重开 events.db 验证 drain 的行真正落盘（不只是 WAL 可见）。
+/// 无 sleep 定序：等待只用 `wait_until` 条件轮询 + `stop_endpoint` 的
+/// 完成语义。
+#[tokio::test]
+async fn stop_barrier_drains_inflight_epoch_events() {
+    common::init_log();
+    let db = tmp_events_db("stopgate");
+    let _ = std::fs::remove_file(&db);
+
+    let store = Arc::new(EventStore::open(&db).unwrap());
+    let mgr = MesaManager::discover(&repo_root().join("drivers"));
+    mgr.set_event_services(EventServices::new(
+        store.clone(),
+        EventHub::new(EVENT_HUB_CAPACITY),
+    ));
+    let cfg = || BuiltinEndpoint {
+        endpoint_id: "ct-evt-stopgate".into(),
+        driver_id: "simulator".into(),
+        connection_json: "{}".into(),
+        tasks: vec![poll_task(
+            "t1",
+            50,
+            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+        )],
+        event_tasks: vec![flood_task()],
+    };
+
+    // 五轮（总量 <500 行 history 上限，见下方 limit）：旧顺序每轮掉尾概率
+    // 高，五轮全过的概率可忽略；新顺序恒过。
+    for round in 0..5 {
+        mgr.start_endpoint(cfg()).unwrap();
+        // 洪峰形成（≥80 行/轮）
+        let base = store.stats().unwrap().rows;
+        wait_until(20, || store.stats().unwrap().rows >= base + 80).await;
+        assert!(mgr.stop_endpoint("ct-evt-stopgate").await);
+        // 逐 epoch 连续性：同 epoch 内 batch_sequence 无缺口、无重复
+        let (rows, _) = store
+            .query_history(&EventFilter {
+                endpoint_id: Some("ct-evt-stopgate".into()),
+                limit: Some(500),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut by_epoch: std::collections::HashMap<u64, Vec<u64>> =
+            std::collections::HashMap::new();
+        for r in &rows {
+            by_epoch
+                .entry(r.stream_epoch)
+                .or_default()
+                .push(r.batch_sequence);
+        }
+        assert_eq!(
+            by_epoch.len(),
+            round + 1,
+            "每轮新 epoch，第 {round} 轮后应有 {} 个 epoch",
+            round + 1
+        );
+        for (epoch, mut seqs) in by_epoch {
+            seqs.sort_unstable();
+            let before = seqs.len();
+            seqs.dedup();
+            assert_eq!(seqs.len(), before, "epoch {epoch} 有重复 batch_sequence");
+            let contiguous = seqs.last().unwrap() - seqs.first().unwrap() + 1 == seqs.len() as u64;
+            assert!(
+                contiguous,
+                "epoch {epoch} 有缺口（Stop 遗弃在途 Event）：{:?}...{:?}",
+                &seqs[..seqs.len().min(5)],
+                &seqs[seqs.len().saturating_sub(5)..]
+            );
+        }
+    }
+    // 落盘性：重开 events.db，barrier-drain 的行必须全在
+    let rows_before = store.stats().unwrap().rows;
+    assert!(rows_before >= 400, "五轮洪峰应 ≥400 行，实际 {rows_before}");
+    drop(store);
+    drop(mgr);
+    let reopened = EventStore::open(&db).unwrap();
+    assert_eq!(reopened.stats().unwrap().rows, rows_before);
+    drop(reopened);
     let _ = std::fs::remove_file(&db);
 }
 

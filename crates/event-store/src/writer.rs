@@ -46,6 +46,15 @@ pub enum WriteCommand {
         CommitRequest,
         oneshot::Sender<Result<CommitResult, EventStoreError>>,
     ),
+    /// Retention purge（⑧b）：删除 `seq < before_seq` 最多 `batch_limit` 行。
+    /// 走写通道而非读连接——与 commit 同一串行队列，天然互斥：
+    /// purge 与 commit 永不并发，且 purge 发出时已排队的 commit 先执行
+    /// （顺序 = 发送顺序，无需额外 flush；P0 定序保证）。
+    Purge {
+        before_seq: i64,
+        batch_limit: u64,
+        reply: oneshot::Sender<Result<usize, EventStoreError>>,
+    },
 }
 
 /// Writer 主循环（blocking 线程内运行）。发送端全部释放即退出。
@@ -55,8 +64,31 @@ pub fn writer_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCommand>) {
             WriteCommand::Commit(req, reply) => {
                 let _ = reply.send(commit_batch(&mut conn, &req));
             }
+            WriteCommand::Purge {
+                before_seq,
+                batch_limit,
+                reply,
+            } => {
+                let _ = reply.send(purge_batch(&mut conn, before_seq, batch_limit));
+            }
         }
     }
+}
+
+/// 小批量 purge（调用方需保证单线程调用——writer 线程独占连接）。
+/// 单次最多删 `batch_limit` 行（长写事务拆小，避免阻塞 commit）；
+/// 调用方（retention sweeper）循环调用直到返回 0。
+fn purge_batch(
+    conn: &mut Connection,
+    before_seq: i64,
+    batch_limit: u64,
+) -> Result<usize, EventStoreError> {
+    let n = conn.execute(
+        "DELETE FROM events WHERE seq IN (\
+             SELECT seq FROM events WHERE seq < ?1 ORDER BY seq LIMIT ?2)",
+        rusqlite::params![before_seq, batch_limit as i64],
+    )?;
+    Ok(n)
 }
 
 /// 整批提交（调用方需保证单线程调用——writer 线程独占连接）。

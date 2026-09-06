@@ -396,7 +396,93 @@ async fn purge_and_stats() {
         .await
         .unwrap();
     let cutoff = res.inserted[3].seq;
-    assert_eq!(store.purge_before_seq(cutoff, 100).unwrap(), 3);
+    assert_eq!(store.purge_before_seq(cutoff, 100).await.unwrap(), 3);
     assert_eq!(store.stats().unwrap().rows, 2);
     assert!(store.stats().unwrap().size_bytes > 0);
+}
+
+/// ⑧b retention sweep：数量上限删最老、时间窗删过期、空 sweep 无操作。
+#[tokio::test]
+async fn retention_sweep_count_and_time() {
+    use std::sync::Arc;
+
+    use crate::retention::{RetentionConfig, sweep_once};
+
+    let store = Arc::new(EventStore::open_in_memory().unwrap());
+    let events: Vec<EventRecord> = (0..5).map(|i| record(&format!("r{i}"))).collect();
+    store
+        .commit_batch(CommitRequest {
+            endpoint_id: "sim-001".into(),
+            batch: batch(1, 11, events),
+            received_at_ns: now_unix_ns(),
+        })
+        .await
+        .unwrap();
+    // 数量上限 3 → 删最老的 2 行（seq 最小的两行）
+    let cfg = RetentionConfig {
+        retention_days: 0, // 本用例不按时间删
+        max_records: 3,
+        interval_secs: 600,
+        purge_batch: 1000,
+    };
+    assert_eq!(sweep_once(&store, &cfg).await.unwrap(), 2);
+    assert_eq!(store.stats().unwrap().rows, 3);
+    // 时间窗 0 天是"不按时间删"；用 retention_days=30（全部在窗内）应删 0 行
+    let cfg = RetentionConfig {
+        retention_days: 30,
+        max_records: 0,
+        interval_secs: 600,
+        purge_batch: 1000,
+    };
+    assert_eq!(sweep_once(&store, &cfg).await.unwrap(), 0);
+    assert_eq!(store.stats().unwrap().rows, 3);
+    // 部分过期 → Some 臂：只删 cutoff 之前的旧行，新行保留。
+    // 注意提交顺序：time purge 按 seq 前缀删（append 时序 ≈ seq 序的
+    // 生产不变量），旧行必须先入库。
+    let store3 = Arc::new(EventStore::open_in_memory().unwrap());
+    let old3: Vec<EventRecord> = (0..2).map(|i| record(&format!("old{i}"))).collect();
+    store3
+        .commit_batch(CommitRequest {
+            endpoint_id: "sim-001".into(),
+            batch: batch(1, 11, old3),
+            received_at_ns: now_unix_ns() - 31 * 86_400_000_000_000,
+        })
+        .await
+        .unwrap();
+    let fresh: Vec<EventRecord> = (0..3).map(|i| record(&format!("fresh{i}"))).collect();
+    store3
+        .commit_batch(CommitRequest {
+            endpoint_id: "sim-001".into(),
+            batch: batch(2, 11, fresh),
+            received_at_ns: now_unix_ns(),
+        })
+        .await
+        .unwrap();
+    let cfg = RetentionConfig {
+        retention_days: 30,
+        max_records: 0,
+        interval_secs: 600,
+        purge_batch: 1, // 小批量多轮也必须删净
+    };
+    assert_eq!(sweep_once(&store3, &cfg).await.unwrap(), 2);
+    assert_eq!(store3.stats().unwrap().rows, 3);
+    // 全表过期 → None 臂（before = max+1）全清
+    let store2 = Arc::new(EventStore::open_in_memory().unwrap());
+    let old2: Vec<EventRecord> = (0..2).map(|i| record(&format!("o{i}"))).collect();
+    store2
+        .commit_batch(CommitRequest {
+            endpoint_id: "sim-001".into(),
+            batch: batch(1, 11, old2),
+            received_at_ns: now_unix_ns() - 31 * 86_400_000_000_000,
+        })
+        .await
+        .unwrap();
+    let cfg = RetentionConfig {
+        retention_days: 30,
+        max_records: 0,
+        interval_secs: 600,
+        purge_batch: 1000,
+    };
+    assert_eq!(sweep_once(&store2, &cfg).await.unwrap(), 2);
+    assert_eq!(store2.stats().unwrap().rows, 0);
 }

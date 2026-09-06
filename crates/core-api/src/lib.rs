@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use axum::extract::{Path, Query, State};
@@ -1986,21 +1987,25 @@ type SseItem = Result<axum::response::sse::Event, std::convert::Infallible>;
 
 /// 单页 catch-up（P0-2 流式）：查 `PAGE+1` 行，满页则留 1 行探知"还有更多"，
 /// 只返回 `PAGE` 帧并报告未穷尽。调用方逐页 yield，任意时刻最多持有约
-/// 一页（历史再大也不先堆完再发；DB 持续写时由 high-water/游标收敛）。
+/// 一页（历史再大也不先堆完再发）。
+/// `until = Some(h)`：初始 replay，查询上界字面锁死，区间恒为 `(from, h]`；
+/// `until = None`：live 期追赶（gap/Lag/reconcile），追 DB 现状。
 /// 返回 `(new_cursor, frames, exhausted)`；`None` = DB 失败或坏行
 /// （调用方结束流，客户端按旧游标重连重试）。
 async fn sse_catch_up_page(
     store: &Arc<mesa_event_store::EventStore>,
     from: i64,
+    until: Option<i64>,
 ) -> Option<(i64, Vec<SseItem>, bool)> {
     let s = store.clone();
-    let page = match tokio::task::spawn_blocking(move || s.replay_range(from, SSE_REPLAY_PAGE + 1))
-        .await
-    {
-        Ok(Ok(p)) => p,
-        // DB 失败 / 任务失败 → 结束流（客户端按旧游标重连重试）
-        _ => return None,
-    };
+    let page =
+        match tokio::task::spawn_blocking(move || s.replay_range(from, until, SSE_REPLAY_PAGE + 1))
+            .await
+        {
+            Ok(Ok(p)) => p,
+            // DB 失败 / 任务失败 → 结束流（客户端按旧游标重连重试）
+            _ => return None,
+        };
     let exhausted = page.len() <= SSE_REPLAY_PAGE as usize;
     let mut cursor = from;
     let mut frames = Vec::with_capacity(page.len().min(SSE_REPLAY_PAGE as usize));
@@ -2079,16 +2084,23 @@ async fn events_live(
             ));
         }
     };
+    // ⑧c 诊断：本连接发出的 DB replay 帧 / Lagged 事故 / reconcile 执行
+    let diag = svc.diagnostics.clone();
     let s = async_stream::stream! {
-        // 初始 replay（P0-2）：逐页 yield，内存只驻一页；只追到连接时刻的
-        // high-water（有界——DB 持续写也不追"移动中的终点"，剩下的走 live）。
+        // 初始 replay（P0-2 + ⑧a）：逐页 yield，内存只驻一页；查询上界字面
+        // 锁死在建连 high-water——区间恒为 `(cursor, high_water]`，DB 在
+        // high-water 之后再写多少行也不会越界（剩下的走 live）。
         let mut last_sent: i64 = match effective {
             Some(cur) => {
                 let mut cursor = cur;
                 while cursor < connect_high_water {
-                    let Some((cur2, frames, _)) = sse_catch_up_page(&store, cursor).await else {
+                    let Some((cur2, frames, _)) =
+                        sse_catch_up_page(&store, cursor, Some(connect_high_water)).await
+                    else {
                         return;
                     };
+                    diag.replay_frames_total
+                        .fetch_add(frames.len() as u64, Ordering::Relaxed);
                     for f in frames {
                         yield f;
                     }
@@ -2125,10 +2137,12 @@ async fn events_live(
                             );
                             loop {
                                 let Some((cur2, frames, done)) =
-                                    sse_catch_up_page(&store, last_sent).await
+                                    sse_catch_up_page(&store, last_sent, None).await
                                 else {
                                     return;
                                 };
+                                diag.replay_frames_total
+                                    .fetch_add(frames.len() as u64, Ordering::Relaxed);
                                 for f in frames {
                                     yield f;
                                 }
@@ -2148,12 +2162,15 @@ async fn events_live(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, last_sent, "SSE slow consumer, catching up from DB");
+                        diag.lagged_total.fetch_add(1, Ordering::Relaxed);
                         loop {
                             let Some((cur2, frames, done)) =
-                                sse_catch_up_page(&store, last_sent).await
+                                sse_catch_up_page(&store, last_sent, None).await
                             else {
                                 return;
                             };
+                            diag.replay_frames_total
+                                .fetch_add(frames.len() as u64, Ordering::Relaxed);
                             for f in frames {
                                 yield f;
                             }
@@ -2168,7 +2185,8 @@ async fn events_live(
                 _ = reconcile.tick() => {
                     // P1：abort 兜底漏 publish（commit 落盘但 Hub 未发）无任何
                     // Hub 信号，只能靠 DB 对账发现。慢连接 15s 一次 max 循环，
-                    // 代价一次索引聚合，可接受。
+                    // 代价一次索引聚合，可接受。每次 tick 执行都计数（存活证明）。
+                    diag.reconcile_total.fetch_add(1, Ordering::Relaxed);
                     let check = {
                         let store = store.clone();
                         tokio::task::spawn_blocking(move || store.max_seq()).await
@@ -2178,10 +2196,12 @@ async fn events_live(
                         tracing::debug!(last_sent, "SSE reconcile found new rows, catching up");
                         loop {
                             let Some((cur2, frames, done)) =
-                                sse_catch_up_page(&store, last_sent).await
+                                sse_catch_up_page(&store, last_sent, None).await
                             else {
                                 return;
                             };
+                            diag.replay_frames_total
+                                .fetch_add(frames.len() as u64, Ordering::Relaxed);
                             for f in frames {
                                 yield f;
                             }
@@ -2200,6 +2220,40 @@ async fn events_live(
             .interval(std::time::Duration::from_secs(15))
             .text("ping"),
     ))
+}
+
+/// ⑧c 事件面诊断：SSE 计数（lagged/replay/reconcile）+ store 规模。
+/// 计数是进程级累计（Relaxed 原子），`/events/live` 的各连接共同累加；
+/// 给"Lagged 测试从概率升级为 branch contract"提供程序级证明点。
+async fn events_stats(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(svc) = state.event_services() else {
+        return events_unavailable();
+    };
+    let lagged = svc.diagnostics.lagged_total.load(Ordering::Relaxed);
+    let replay = svc.diagnostics.replay_frames_total.load(Ordering::Relaxed);
+    let reconciled = svc.diagnostics.reconcile_total.load(Ordering::Relaxed);
+    let store = svc.store.clone();
+    let res = tokio::task::spawn_blocking(move || store.stats()).await;
+    match res {
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &format!("stats task failed: {e}"))),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &e.to_string())),
+        ),
+        Ok(Ok(st)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "sse_lagged_total": lagged,
+                "sse_replay_frames_total": replay,
+                "sse_reconcile_total": reconciled,
+                "stored_rows": st.rows,
+                "stored_size_bytes": st.size_bytes,
+            })),
+        ),
+    }
 }
 
 async fn get_event(
@@ -2537,6 +2591,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // 共存——axum 静态优先，无需调序（同 certificates/opcua 前例）。
         .route("/api/v1/events", get(list_events))
         .route("/api/v1/events/live", get(events_live))
+        .route("/api/v1/events/stats", get(events_stats))
         .route("/api/v1/events/{seq}", get(get_event))
         .route(
             "/api/v1/endpoints/{id}/event-tasks",

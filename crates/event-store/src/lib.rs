@@ -9,11 +9,13 @@
 
 mod hub;
 mod query;
+pub mod retention;
 mod schema;
 mod writer;
 
 pub use hub::{EVENT_HUB_CAPACITY, EventHub};
 pub use query::{EventFilter, max_seq, query_by_seq, query_history, query_range_asc};
+pub use retention::RetentionConfig;
 pub use schema::{EVENT_SCHEMA_VERSION, StoredEvent, transition_str};
 pub use writer::{CommitRequest, CommitResult, EventStoreStats};
 
@@ -396,14 +398,16 @@ impl EventStore {
         query::query_by_seq(&conn, seq)
     }
 
-    /// SSE replay 页（阻塞式；见上）。
+    /// SSE replay 页（阻塞式；见上）。`until_seq` 语义见
+    /// [`query::query_range_asc`]（初始 replay 传建连 high-water，live 追赶传 `None`）。
     pub fn replay_range(
         &self,
         after_seq: i64,
+        until_seq: Option<i64>,
         limit: u32,
     ) -> Result<Vec<schema::StoredEvent>, EventStoreError> {
         let conn = self.reader.lock().unwrap();
-        query::query_range_asc(&conn, after_seq, limit)
+        query::query_range_asc(&conn, after_seq, until_seq, limit)
     }
 
     /// 当前最大 seq（阻塞式；见上）。
@@ -412,18 +416,31 @@ impl EventStore {
         query::max_seq(&conn)
     }
 
-    /// 小批量 purge（retention 用）：删除 `seq < cutoff` 最多 `limit` 行，
-    /// 返回实际删除数。热路径永不调用（maintenance task 见 step ⑧）。
-    pub fn purge_before_seq(&self, cutoff_seq: i64, limit: u64) -> Result<usize, EventStoreError> {
-        let conn = self.reader.lock().unwrap();
-        // 用读连接执行 purge（WAL 下读写并发安全；maintenance 低频，
-        // 不值得为此唤醒 writer 线程）。
-        let n = conn.execute(
-            "DELETE FROM events WHERE seq IN (\
-                 SELECT seq FROM events WHERE seq < ?1 ORDER BY seq LIMIT ?2)",
-            rusqlite::params![cutoff_seq, limit as i64],
-        )?;
-        Ok(n)
+    /// 读连接守卫（crate 内阻塞查询用；async 上下文调用方自行 spawn_blocking）。
+    pub(crate) fn reader_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.reader.lock().unwrap()
+    }
+
+    /// 小批量 purge（retention 用）：删除 `seq < before_seq` 最多 `batch` 行，
+    /// 返回实际删除数。走 writer 命令通道（与 commit 同一串行队列，天然互斥；
+    /// 热路径永不调用）。writer 线程已死报 `Unavailable`（sweeper 只 warn）。
+    pub async fn purge_before_seq(
+        &self,
+        before_seq: i64,
+        batch: u64,
+    ) -> Result<usize, EventStoreError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.writer_tx
+            .send(writer::WriteCommand::Purge {
+                before_seq,
+                batch_limit: batch,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| EventStoreError::Unavailable("event writer queue closed".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| EventStoreError::Unavailable("event writer died before reply".into()))?
     }
 
     /// WAL 被动 checkpoint（maintenance 尾调用，不在热路径）。
@@ -458,16 +475,35 @@ impl Drop for EventStore {
     }
 }
 
-/// 事件面服务束（v1.1 §20）：store + hub 打包，避免 AppState/Manager
-/// 堆十几个 Event 字段。诊断计数见 step ⑧（`EventDiagnostics`）。
+/// 事件面诊断计数（⑧c，v1.1 §21 的 SSE 侧）：
+///
+/// - `lagged_total`：Hub `Lagged` 事故次数（慢消费者被迫回 DB 补齐）。
+/// - `replay_frames_total`：DB replay 发出的帧总数（含初始 replay 与一切追赶）。
+/// - `reconcile_total`：15s reconcile 对账执行次数。
+///
+/// 全 `Relaxed`（纯观测，顺序无关；`GET /events/stats` 暴露）。
+#[derive(Debug, Default)]
+pub struct EventDiagnostics {
+    pub lagged_total: std::sync::atomic::AtomicU64,
+    pub replay_frames_total: std::sync::atomic::AtomicU64,
+    pub reconcile_total: std::sync::atomic::AtomicU64,
+}
+
+/// 事件面服务束（v1.1 §20）：store + hub + 诊断打包，避免 AppState/Manager
+/// 堆十几个 Event 字段。
 pub struct EventServices {
     pub store: Arc<EventStore>,
     pub hub: Arc<EventHub>,
+    pub diagnostics: Arc<EventDiagnostics>,
 }
 
 impl EventServices {
     pub fn new(store: Arc<EventStore>, hub: Arc<EventHub>) -> Arc<Self> {
-        Arc::new(Self { store, hub })
+        Arc::new(Self {
+            store,
+            hub,
+            diagnostics: Arc::new(EventDiagnostics::default()),
+        })
     }
 }
 

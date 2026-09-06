@@ -455,24 +455,43 @@ async fn attempt_session(
     )
     .await;
 
-    // ingress 收尾：优雅取消（当前 commit+publish 必完整执行，见
-    // run_event_ingress），杜绝"DB 已有但 Hub 未发布"的静默缺口。
-    shutdown_ingress(ingress_shutdown, ingress).await;
-
+    // ⑨ Stop barrier（真 barrier，不是 sleep）：Shutdown-post → terminate →
+    // 等 reader 结束 → 再 drain ingress。
+    // terminate 关 stdin（EOF 防护）+ 宽限后强杀：driver 必然退出 → TCP FIN →
+    // reader 把 FIN 之前全部字节 pump 进 channel 后结束（TCP 有序性保证）。
+    // reader 是事件 channel 的唯一生产者 ⇒ reader 结束时"已进入 Core 的
+    // 旧 epoch Event"已全部在 channel 里；此时再 cancel ingress 做 final
+    // drain，零窗口（旧顺序 cancel-first 下，drain 与 driver 停产之间在途
+    // 批次会落入无人消费的 channel 而静默丢失）。
+    // reader 5s 未结束（顽固对端）→ 超时降级 drain 现有（等价旧行为）。
+    // 50ms sleep 已删除：等的对象是"reader 结束"这个条件，不是时长。
     {
         let sess = session_arc.lock().await;
         if !sess.is_unresponsive() {
             let _ = sess.post(pb_shutdown_body()).await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+    process.terminate().await;
+    {
+        let sess = session_arc.lock().await;
+        if !sess.wait_reader_done(Duration::from_secs(5)).await {
+            tracing::warn!(
+                endpoint = %cfg.endpoint_id,
+                "reader did not finish after terminate, draining what arrived"
+            );
+        }
+    }
+    // ingress 收尾：优雅取消（当前 commit+publish 必完整执行，见
+    // run_event_ingress），杜绝"DB 已有但 Hub 未发布"的静默缺口。
+    // barrier 已达成时 final drain 提交的即 channel 全部，无遗弃。
+    shutdown_ingress(ingress_shutdown, ingress).await;
+
     {
         let mut sess = session_arc.lock().await;
         sess.invalidate();
     }
     registry.write().unwrap().remove(&cfg.endpoint_id);
     drop(events);
-    process.terminate().await;
     outcome
 }
 
