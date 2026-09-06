@@ -104,9 +104,10 @@ export const api = {
   replaceEventTasks: (endpointId: string, tasks: EventTask[]) =>
     putJson(`/api/v1/endpoints/${endpointId}/event-tasks`, { event_tasks: tasks }),
   eventStats: (): Promise<EventStats> => getJson("/api/v1/events/stats"),
-  // SSE 无窗口启动的关键：冻结全局高水位 H（GET /events?limit=1）
-  eventHead: async (): Promise<number | null> => {
+  // SSE 无窗口启动的关键：冻结全局高水位 H（number；空库为 0，因 Store seq 自 1 起，
+  // SSE 永远携带 ?after_seq=H，杜绝 live-only 漏事件窗口）。
+  eventHead: async (): Promise<number> => {
     const res = (await getJson("/api/v1/events?limit=1")) as ListEventsResponse;
-    return res.events.length > 0 ? res.events[0].seq : null;
+    return res.events.length > 0 ? res.events[0].seq : 0;
   },
 };

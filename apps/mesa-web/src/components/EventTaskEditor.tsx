@@ -1,12 +1,12 @@
 // PR8 订阅配置：Descriptor-driven EventTask Editor。
 // 流程 Endpoint → driver_id → DriverDescriptor.events.streams → 动态表单；
 // 全文件禁止出现任何驱动业务判断（grep 锚点：无 driver 私有 kind 字面量）。
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Button, Card, Input, InputNumber, Select, Space, Tag } from "antd";
 import { DeleteOutlined, PlusOutlined } from "@ant-design/icons";
 import { api } from "../api";
 import type { DriverDescriptor, EventStreamDescriptor, EventTask, LocalizedText, TaskMode } from "../types";
-import { DescriptorFields } from "./DescriptorFields";
+import { DescriptorFields, materializeSchemaDefaults } from "./DescriptorFields";
 import {
   GENERIC_EVENT_BINDING_KIND,
   buildGenericEventBinding,
@@ -44,9 +44,16 @@ function streamById(streams: EventStreamDescriptor[], id: string): EventStreamDe
   return streams.find((s) => s.id === id);
 }
 
-function toDraft(task: EventTask): Draft {
+function toDraft(task: EventTask, streams: EventStreamDescriptor[] = []): Draft {
   if (!isGenericEventTask(task)) return { key: nextKey(), kind: "legacy", task };
   const streamId = genericStreamIdOf(task) ?? "";
+  // P1-4：落盘/服务端参数与 schema defaults 合并物化——UI 显示的 default 即实际值，
+  // required+default 字段不再出现“显示 100 却禁保存”的不一致。
+  const st = streamById(streams, streamId);
+  const parameters = {
+    ...materializeSchemaDefaults(st?.parameters ?? { fields: [] }),
+    ...genericParametersOf(task),
+  };
   return {
     key: nextKey(),
     kind: "generic",
@@ -54,7 +61,7 @@ function toDraft(task: EventTask): Draft {
     streamId,
     mode: task.mode,
     interval_ms: task.interval_ms ?? null,
-    parameters: genericParametersOf(task),
+    parameters,
   };
 }
 
@@ -81,6 +88,9 @@ export function EventTaskEditor() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  // P0-2：Endpoint 切换竞态——旧请求返回绝不能覆盖新 Endpoint 的 descriptor/drafts，
+  // 否则可能把 A 的事件配置写进 B。
+  const loadGen = useRef(0);
 
   // Endpoint 列表（含运行态；running → 只读）
   const refreshEndpoints = useCallback(async () => {
@@ -102,19 +112,23 @@ export function EventTaskEditor() {
   const running = !!selected?.running;
   const streams = useMemo(() => descriptor?.events?.streams ?? [], [descriptor]);
 
-  // 选中 Endpoint → Descriptor + 现有 EventTask
+  // 选中 Endpoint → Descriptor + 现有 EventTask（代际守卫：stale 响应直接丢弃）
   useEffect(() => {
     if (!selected) return;
+    const id = ++loadGen.current;
     setLoading(true);
     setError(null);
     setSaved(false);
     Promise.all([api.getDescriptor(selected.driver_id), api.listEventTasks(selected.id)])
       .then(([desc, tasks]) => {
+        if (id !== loadGen.current) return;
+        const streams = (desc as DriverDescriptor).events?.streams ?? [];
         setDescriptor(desc as DriverDescriptor);
-        setDrafts(((tasks.event_tasks ?? []) as EventTask[]).map(toDraft));
+        setDrafts(((tasks.event_tasks ?? []) as EventTask[]).map((t) => toDraft(t, streams)));
         setLoading(false);
       })
       .catch((e) => {
+        if (id !== loadGen.current) return;
         setError(e instanceof Error ? e.message : String(e));
         setLoading(false);
       });
@@ -126,6 +140,7 @@ export function EventTaskEditor() {
   const addTask = () => {
     const first = streams[0];
     if (!first) return;
+    const mode = first.modes[0] ?? "subscribe";
     setDrafts((cur) => [
       ...cur,
       {
@@ -133,9 +148,9 @@ export function EventTaskEditor() {
         kind: "generic",
         id: `event-${cur.length + 1}`,
         streamId: first.id,
-        mode: first.modes[0] ?? "subscribe",
-        interval_ms: (first.modes[0] ?? "subscribe") === "poll" ? 1000 : null,
-        parameters: {},
+        mode,
+        interval_ms: mode === "poll" ? 1000 : null,
+        parameters: materializeSchemaDefaults(first.parameters),
       },
     ]);
   };
@@ -276,7 +291,7 @@ export function EventTaskEditor() {
                           streamId: v,
                           mode: nm,
                           interval_ms: nm === "poll" ? d.interval_ms ?? 1000 : null,
-                          parameters: {},
+                          parameters: materializeSchemaDefaults(ns?.parameters ?? { fields: [] }),
                         });
                       }}
                       style={{ minWidth: 260 }}

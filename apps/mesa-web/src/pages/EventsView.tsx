@@ -32,7 +32,7 @@ export function EventsView() {
   const [endpoints, setEndpoints] = useState<string[]>([]);
   const [history, setHistory] = useState<StoredEvent[]>([]);
   const [nextCursor, setNextCursor] = useState<number | null>(null);
-  const [highWater, setHighWater] = useState<number | null>(null);
+  const [highWater, setHighWater] = useState<number>(0);
   const [booted, setBooted] = useState(false);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -41,9 +41,19 @@ export function EventsView() {
   const [liveOn, setLiveOn] = useState(true);
   const [selected, setSelected] = useState<StoredEvent | null>(null);
   const [stats, setStats] = useState<EventStats | null>(null);
-  const reqId = useRef(0);
+  // 所有历史请求（首屏/过滤 reload/加载更早）共用一个代际：旧代际结果绝不能覆盖/污染新状态。
+  const histGen = useRef(0);
+  // reload 在途期间到达的 live 行：首屏替换完成时合入，避免被覆盖。
+  const pendingLiveRef = useRef<StoredEvent[]>([]);
   const formRef = useRef(form);
   formRef.current = form;
+
+  /** 取出在途 live 行（按新 filter 重过一遍），并清空暂存。 */
+  const drainPendingLive = (next: EventFilterForm): StoredEvent[] => {
+    const live = pendingLiveRef.current.filter((ev) => matchesLiveFilter(ev, next));
+    pendingLiveRef.current = [];
+    return live;
+  };
 
   // Endpoint 下拉（事件页独立加载，失败不阻塞事件主体）
   useEffect(() => {
@@ -56,49 +66,50 @@ export function EventsView() {
       .catch(() => {});
   }, []);
 
-  // ① 冻结全局高水位 H → ② 当前 filter 历史页 → ③ ?after_seq=H 建 SSE（无窗口）
+  // P0-1 冻结顺序：H → 历史页完成 → 最后 setHighWater + setBooted（SSE 在历史完成后才建连）。
+  // 空库 H = 0（seq 自 1 起），SSE 永远 ?after_seq=H，杜绝 live-only 漏事件窗口。
   useEffect(() => {
-    const id = ++reqId.current;
+    const id = ++histGen.current;
     setLoading(true);
     setError(null);
-    api
-      .eventHead()
-      .then((h) => {
-        if (reqId.current !== id) return;
+    (async () => {
+      try {
+        const h = await api.eventHead();
+        const page = await api.listEvents(toEventFilter(formRef.current, { limit: EVENT_FIRST_PAGE_LIMIT }));
+        if (histGen.current !== id) return;
+        const live = drainPendingLive(formRef.current);
+        setHistory(mergeEvents([...page.events].sort((a, b) => b.seq - a.seq), live));
+        setNextCursor(page.next_cursor);
         setHighWater(h);
+        setLoading(false);
         setBooted(true);
-        return api.listEvents(toEventFilter(formRef.current, { limit: EVENT_FIRST_PAGE_LIMIT })).then((res) => {
-          if (reqId.current !== id) return;
-          setHistory([...res.events].sort((a, b) => b.seq - a.seq));
-          setNextCursor(res.next_cursor);
-          setLoading(false);
-        });
-      })
-      .catch((e) => {
-        if (reqId.current !== id) return;
+      } catch (e) {
+        if (histGen.current !== id) return;
         if (isEventStoreUnavailable(e)) setUnavailable(true);
         else setError(e instanceof Error ? e.message : String(e));
         setLoading(false);
         setBooted(true);
-      });
+      }
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const reloadHistory = useCallback((next: EventFilterForm) => {
-    const id = ++reqId.current;
+    const id = ++histGen.current;
     setLoading(true);
     setError(null);
     setNextCursor(null);
     api
       .listEvents(toEventFilter(next, { limit: EVENT_FIRST_PAGE_LIMIT }))
       .then((res) => {
-        if (reqId.current !== id) return;
-        setHistory([...res.events].sort((a, b) => b.seq - a.seq));
+        if (histGen.current !== id) return;
+        const live = drainPendingLive(next);
+        setHistory(mergeEvents([...res.events].sort((a, b) => b.seq - a.seq), live));
         setNextCursor(res.next_cursor);
         setLoading(false);
       })
       .catch((e) => {
-        if (reqId.current !== id) return;
+        if (histGen.current !== id) return;
         if (isEventStoreUnavailable(e)) setUnavailable(true);
         else setError(e instanceof Error ? e.message : String(e));
         setLoading(false);
@@ -114,11 +125,19 @@ export function EventsView() {
   );
 
   const loadOlder = useCallback(() => {
-    if (nextCursor === null || nextCursor === undefined) return;
+    if (nextCursor === null || nextCursor === undefined || loadingMore) return;
+    // additive 请求不推进代际；但若其间发生过 reload/filter（代际或 filter 对象已变）则丢弃，
+    // 旧 filter 的 older 行绝不混进新页面。
+    const id = histGen.current;
+    const snapshot = formRef.current;
     setLoadingMore(true);
     api
-      .listEvents(toEventFilter(formRef.current, { before_seq: nextCursor, limit: EVENT_FIRST_PAGE_LIMIT }))
+      .listEvents(toEventFilter(snapshot, { before_seq: nextCursor, limit: EVENT_FIRST_PAGE_LIMIT }))
       .then((res) => {
+        if (id !== histGen.current || formRef.current !== snapshot) {
+          setLoadingMore(false);
+          return;
+        }
         setHistory((cur) => mergeEvents(cur, res.events));
         setNextCursor(res.next_cursor);
         setLoadingMore(false);
@@ -128,10 +147,14 @@ export function EventsView() {
         else setError(e instanceof Error ? e.message : String(e));
         setLoadingMore(false);
       });
-  }, [nextCursor]);
+  }, [nextCursor, loadingMore]);
 
   const onLive = useCallback((ev: StoredEvent) => {
     if (!matchesLiveFilter(ev, formRef.current)) return;
+    pendingLiveRef.current.push(ev);
+    if (pendingLiveRef.current.length > 1000) {
+      pendingLiveRef.current.splice(0, pendingLiveRef.current.length - 1000);
+    }
     setHistory((cur) => mergeEvents(cur, [ev]));
   }, []);
 

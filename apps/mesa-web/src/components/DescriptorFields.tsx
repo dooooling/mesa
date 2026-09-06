@@ -13,6 +13,19 @@ function isVisible(field: FieldDescriptor, values: Record<string, unknown>): boo
   return true;
 }
 
+/**
+ * P1-4：将 schema 中带 `default` 的字段物化为参数初值。调用方在新建任务、
+ * 切换流、加载服务端任务时统一使用，保证“UI 显示的 default 即实际保存值”，
+ * required + default 字段不再出现显示有值却禁保存的不一致。
+ */
+export function materializeSchemaDefaults(schema: SchemaDescriptor): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const f of schema.fields ?? []) {
+    if (f.default !== undefined) out[f.key] = f.default;
+  }
+  return out;
+}
+
 function FieldControl({
   field,
   value,

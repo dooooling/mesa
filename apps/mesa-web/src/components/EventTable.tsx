@@ -35,9 +35,9 @@ export function EventTable({
         },
         {
           title: "Severity",
-          width: 110,
-          render: (_: unknown, r: StoredEvent) =>
-            r.event.severity === 0 ? <Tag>0 unknown</Tag> : <Tag color={r.event.severity >= 700 ? "red" : r.event.severity >= 300 ? "orange" : "default"}>{formatSeverity(r.event.severity)}</Tag>,
+          width: 130,
+          // P1-2：只显示 0..1000 原值（0 = unknown），颜色也不做 warning/critical 分类
+          render: (_: unknown, r: StoredEvent) => <Tag>{formatSeverity(r.event.severity)}</Tag>,
         },
         { title: "Category", dataIndex: ["event", "category"], width: 110 },
         { title: "Kind", dataIndex: ["event", "kind"], width: 160 },

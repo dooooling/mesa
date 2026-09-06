@@ -58,9 +58,9 @@ afterEach(() => {
 });
 
 describe("sseUrl", () => {
-  it("首连携带冻结高水位 H", () => {
+  it("永远携带冻结高水位（空库为 0，无 live-only 形态）", () => {
     expect(sseUrl(7)).toBe("/api/v1/events/live?after_seq=7");
-    expect(sseUrl(null)).toBe("/api/v1/events/live");
+    expect(sseUrl(0)).toBe("/api/v1/events/live?after_seq=0");
   });
 });
 
@@ -103,5 +103,26 @@ describe("useEventStream", () => {
     expect(MockEventSource.instances).toHaveLength(2);
     // 恢复后从保留游标重连（DB replay missed）
     expect(MockEventSource.instances[1].url).toContain("after_seq=5");
+  });
+
+  it("冻结高水位后到：无帧时跟进，有帧时绝不回拉", () => {
+    const onEvent = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ afterSeq }: { afterSeq: number }) => useEventStream({ afterSeq, enabled: true, onEvent }),
+      { initialProps: { afterSeq: 0 } },
+    );
+    expect(MockEventSource.instances).toHaveLength(1);
+    expect(MockEventSource.instances[0].url).toContain("after_seq=0");
+    // H 到达（调用方已完成历史）：重建连接并携带 H
+    rerender({ afterSeq: 5 });
+    expect(MockEventSource.instances).toHaveLength(2);
+    expect(MockEventSource.instances[1].url).toContain("after_seq=5");
+    // 收到帧后游标前进；同值 prop 重渲染不回拉游标
+    act(() => MockEventSource.instances[1].emit("mesa-event", JSON.stringify(makeEvent(9))));
+    expect(result.current.lastSeq).toBe(9);
+    rerender({ afterSeq: 5 });
+    expect(MockEventSource.instances).toHaveLength(2);
+    expect(result.current.lastSeq).toBe(9);
+    expect(onEvent).toHaveBeenCalledTimes(1);
   });
 });

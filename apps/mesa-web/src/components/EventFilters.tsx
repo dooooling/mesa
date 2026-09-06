@@ -1,6 +1,23 @@
 // PR8 事件过滤栏：完整使用 PR7 过滤能力；category/kind/code/condition_id 均为精确匹配。
+// 时间范围对应 received_at_ns（接收时间），明确不叫“发生时间”。
 import { Button, Col, Input, InputNumber, Row, Select } from "antd";
 import type { ActiveFilter, EventFilterForm } from "../events/filters";
+
+/** ns 时间戳 → datetime-local 输入值（本地时区，精确到分钟）。 */
+export function nsToLocalInput(ns: number | undefined): string {
+  if (ns === undefined) return "";
+  const d = new Date(ns / 1e6);
+  if (Number.isNaN(d.getTime())) return "";
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** datetime-local 输入值 → ns 时间戳；空/非法返回 undefined（即不过滤）。 */
+export function localInputToNs(v: string): number | undefined {
+  if (!v) return undefined;
+  const t = new Date(v).getTime();
+  return Number.isFinite(t) ? Math.floor(t * 1e6) : undefined;
+}
 
 export function EventFilters({
   value,
@@ -85,6 +102,28 @@ export function EventFilters({
         </Col>
         <Col span={6} style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Button onClick={onReset}>重置</Button>
+        </Col>
+      </Row>
+      <Row gutter={8}>
+        <Col span={6}>
+          <Input
+            type="datetime-local"
+            value={nsToLocalInput(value.from_ns)}
+            onChange={(e) => set({ from_ns: localInputToNs(e.target.value) })}
+            placeholder="接收时间起"
+            title="接收时间起（received_at_ns）"
+            style={{ width: "100%" }}
+          />
+        </Col>
+        <Col span={6}>
+          <Input
+            type="datetime-local"
+            value={nsToLocalInput(value.to_ns)}
+            onChange={(e) => set({ to_ns: localInputToNs(e.target.value) })}
+            placeholder="接收时间止"
+            title="接收时间止（received_at_ns）"
+            style={{ width: "100%" }}
+          />
         </Col>
       </Row>
       <div style={{ color: "#888", fontSize: 12 }}>

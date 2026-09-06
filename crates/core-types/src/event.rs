@@ -326,6 +326,20 @@ impl EventCatalog {
                 return Err(format!("event stream id 重复: {}", s.id));
             }
             s.parameters.validate()?;
+            // PR8 P0-3 安全边界：EventTask 参数明文持久化于 ConfigStore
+            //（`binding_config_json`），不允许 Secret 类型字段；连接认证
+            // Secret 只能走 `DriverDescriptor.connection` + SecretStore。
+            // 此处直接让 descriptor 校验失败，坏目录在入口即被拒绝。
+            if s.parameters
+                .fields
+                .iter()
+                .any(|f| f.field_type == crate::FieldType::Secret)
+            {
+                return Err(format!(
+                    "event stream {} parameters 不允许 Secret 类型字段",
+                    s.id
+                ));
+            }
             let mut fseen = HashSet::new();
             for f in &s.fields {
                 if f.key.trim().is_empty() {
@@ -360,9 +374,15 @@ pub const GENERIC_EVENT_BINDING_KIND: &str = "mesa.events.v1";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenericEventBinding {
     pub stream_id: String,
-    /// 对应目标流 `parameters` Schema 的用户取值；缺省为空对象。
-    #[serde(default)]
+    /// 对应目标流 `parameters` Schema 的用户取值；缺省即 `{}`（与显式空对象
+    /// 等价，永不出现 Null，保证 OPC UA/SINUMERIK 等未来使用者无二义性）。
+    #[serde(default = "default_event_parameters")]
     pub parameters: serde_json::Value,
+}
+
+/// `GenericEventBinding.parameters` 的缺省值：空对象（不是 Null）。
+fn default_event_parameters() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 impl GenericEventBinding {
@@ -561,11 +581,32 @@ mod tests {
         let s = serde_json::to_string(&b).unwrap();
         let back = GenericEventBinding::from_json(&serde_json::from_str(&s).unwrap()).unwrap();
         assert_eq!(back, b);
-        // 缺省 parameters 反序列化成功（Web 可省略空对象）。
+        // 缺省 parameters 反序列化得到 {}（永不为 Null，见 P1-4）。
         let raw = serde_json::json!({"stream_id": "sim.events.counter"});
         let v: GenericEventBinding = serde_json::from_value(raw).unwrap();
         assert_eq!(v.stream_id, "sim.events.counter");
-        assert!(v.parameters.is_null() || v.parameters.is_object());
+        assert_eq!(v.parameters, serde_json::json!({}));
         assert_eq!(GENERIC_EVENT_BINDING_KIND, "mesa.events.v1");
+    }
+
+    #[test]
+    fn catalog_rejects_secret_event_parameters() {
+        // PR8 P0-3：事件流 parameters 含 Secret 即 descriptor 非法。
+        let mut c = EventCatalog::default();
+        c.streams.push(EventStreamDescriptor {
+            id: "s".into(),
+            label: "S".into(),
+            modes: vec![TaskMode::Subscribe],
+            parameters: crate::schema::SchemaDescriptor {
+                fields: vec![
+                    crate::schema::FieldDescriptor::new("token", "Token", crate::FieldType::Secret)
+                        .required(true),
+                ],
+            },
+            fields: vec![],
+        });
+        assert!(c.validate().is_err());
+        c.streams[0].parameters.fields[0].field_type = crate::FieldType::String;
+        assert!(c.validate().is_ok());
     }
 }

@@ -35,4 +35,13 @@ describe("toEventFilter", () => {
       before_seq: 77,
     });
   });
+
+  it("接收时间范围透传（received_at，不过滤发生时间）", () => {
+    const out = toEventFilter(
+      { ...EMPTY_EVENT_FILTER_FORM, from_ns: 1_700_000_000_000_000_000, to_ns: 1_700_000_001_000_000_000 },
+      {},
+    );
+    expect(out.from_ns).toBe(1_700_000_000_000_000_000);
+    expect(out.to_ns).toBe(1_700_000_001_000_000_000);
+  });
 });

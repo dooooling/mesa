@@ -9,8 +9,8 @@ export type EventStreamStatus = "connecting" | "live" | "reconnecting" | "paused
 const SSE_EVENT_NAME = "mesa-event";
 
 export interface UseEventStreamOptions {
-  /** 初始高水位 H（GET /events?limit=1 冻结）；null 表示尚无事件，照常建连。 */
-  afterSeq: number | null;
+  /** 冻结高水位 H（空库为 0）；SSE 永远 ?after_seq=H，杜绝 live-only 窗口。 */
+  afterSeq: number;
   /** 是否建连（暂停时传 false，Hook 会 close 并保留游标）。 */
   enabled: boolean;
   onEvent: (ev: StoredEvent) => void;
@@ -34,21 +34,34 @@ function decodeFrame(data: string): StoredEvent | null {
   }
 }
 
-export function sseUrl(afterSeq: number | null): string {
-  return afterSeq === null || afterSeq === undefined
-    ? "/api/v1/events/live"
-    : `/api/v1/events/live?after_seq=${afterSeq}`;
+export function sseUrl(afterSeq: number): string {
+  return `/api/v1/events/live?after_seq=${afterSeq}`;
 }
 
 export function useEventStream({ afterSeq, enabled, onEvent, onError }: UseEventStreamOptions): UseEventStreamResult {
   const [status, setStatus] = useState<EventStreamStatus>(enabled ? "connecting" : "paused");
-  const [lastSeq, setLastSeq] = useState<number | null>(afterSeq);
+  const [lastSeq, setLastSeq] = useState<number>(afterSeq);
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
-  const seqRef = useRef<number | null>(afterSeq);
+  const seqRef = useRef<number>(afterSeq);
   const [paused, setPaused] = useState(!enabled);
+  const prevPropRef = useRef<number>(afterSeq);
+
+  useEffect(() => {
+    setPaused(!enabled);
+  }, [enabled]);
+
+  // 调用方按 H → history → 建连顺序推进：冻结高水位到达、且本地尚未收到任何帧时跟进游标。
+  // 已有 live 帧（seqRef 已前进）时绝不回拉。
+  useEffect(() => {
+    if (seqRef.current === prevPropRef.current && afterSeq !== prevPropRef.current) {
+      seqRef.current = afterSeq;
+      setLastSeq(afterSeq);
+    }
+    prevPropRef.current = afterSeq;
+  }, [afterSeq]);
 
   useEffect(() => {
     setPaused(!enabled);
@@ -60,8 +73,8 @@ export function useEventStream({ afterSeq, enabled, onEvent, onError }: UseEvent
       return;
     }
     // Resume 从上次游标继续：DB replay missed，无需浏览器堆 pending。
-    // 首连时 seqRef 仍为初始 null，取冻结高水位 afterSeq（无窗口启动的关键）。
-    const start = seqRef.current ?? afterSeq;
+    // 首连时 seqRef 即冻结高水位 H（调用方保证 history 完成之后才建连）。
+    const start = seqRef.current;
     setStatus("connecting");
     const src = new EventSource(sseUrl(start));
     let opened = false;
@@ -69,7 +82,7 @@ export function useEventStream({ afterSeq, enabled, onEvent, onError }: UseEvent
       const ev = decodeFrame(e.data);
       if (!ev) return;
       // 服务端已保证 (cursor, high_water] + live 去重；客户端再按 seq 前进游标。
-      if (seqRef.current === null || ev.seq > seqRef.current) {
+      if (ev.seq > seqRef.current) {
         seqRef.current = ev.seq;
         setLastSeq(ev.seq);
       }

@@ -1,7 +1,7 @@
 // PR8 Gate（组件）：EventTask Editor 纯 Descriptor 驱动；只发 mesa.events.v1；
 // 私有绑定只读可删；运行中只读；409 保留表单。
 import { describe, expect, it, vi, beforeEach, type Mock } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { api } from "../api";
 import { EventTaskEditor } from "./EventTaskEditor";
@@ -168,5 +168,61 @@ describe("EventTaskEditor", () => {
     mocked.getDescriptor.mockResolvedValue({ ...DESCRIPTOR, events: { streams: [] } });
     render(<EventTaskEditor />);
     expect(await screen.findByText("该驱动未声明事件流")).toBeTruthy();
+  });
+
+  it("P0-2：切 Endpoint 后旧请求被忽略，保存写新设备的任务", async () => {
+    const user = userEvent.setup();
+    const taskEp1 = { ...GENERIC_TASK, id: "task-ep1" };
+    const taskEp2 = { ...GENERIC_TASK, id: "task-ep2" };
+    mocked.listEndpoints.mockResolvedValue({
+      endpoints: [
+        { id: "ep1", driver_id: "drv1" },
+        { id: "ep2", driver_id: "drv1" },
+      ],
+    });
+    mocked.getDescriptor.mockResolvedValue(DESCRIPTOR);
+    // 两端点的任务请求都挂起，由测试按序放行
+    const resolvers: Record<string, () => void> = {};
+    mocked.listEventTasks.mockImplementation(
+      (id: string) =>
+        new Promise((resolve) => {
+          resolvers[id] = () =>
+            resolve({
+              endpoint_id: id,
+              revision: 1,
+              event_tasks: id === "ep1" ? [taskEp1] : [taskEp2],
+            });
+        }),
+    );
+    mocked.replaceEventTasks.mockResolvedValue({ revision: 2 });
+    render(<EventTaskEditor />);
+    // 自动选中 ep1，请求 A 在途
+    await screen.findByText("ep1");
+    await waitFor(() => expect(resolvers["ep1"]).toBeDefined());
+    // 切到 ep2，请求 B 在途（点 option 内部文本节点；点 wrapper 不触发提交）
+    await user.click(screen.getByText("ep1"));
+    const candidates = await screen.findAllByText("ep2");
+    const inner =
+      candidates.find((el) => el.classList.contains("ant-select-item-option-content")) ??
+      candidates[candidates.length - 1];
+    await user.click(inner);
+    await waitFor(() => expect(resolvers["ep2"]).toBeDefined());
+    // B 先回：显示 ep2
+    await act(async () => {
+      resolvers["ep2"]();
+    });
+    expect(await screen.findByText("任务 · task-ep2")).toBeTruthy();
+    // A 后回：必须被忽略，UI 仍是 ep2
+    await act(async () => {
+      resolvers["ep1"]();
+    });
+    expect(screen.queryByText("任务 · task-ep1")).toBeNull();
+    expect(screen.getByText("任务 · task-ep2")).toBeTruthy();
+    // 保存必须写 ep2 的任务，而不是 A 的
+    await user.click(screen.getByRole("button", { name: "保存订阅" }));
+    await waitFor(() => expect(mocked.replaceEventTasks).toHaveBeenCalledTimes(1));
+    const [endpointId, tasks] = mocked.replaceEventTasks.mock.calls[0] as [string, typeof GENERIC_TASK[]];
+    expect(endpointId).toBe("ep2");
+    expect(tasks.map((t) => t.id)).toEqual(["task-ep2"]);
   });
 });
