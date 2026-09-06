@@ -28,7 +28,11 @@ mod probe;
 mod transport_adapter;
 
 pub use address::{AddressError, Identifier, OpcUaAddress, parse_address};
-pub use event::{EventScope, OPCUA_EVENT_STREAM_ID, OpcUaEventPlanSnapshot, OpcUaEventTaskPlan};
+pub use event::{
+    DecodedEvent, EventDecodeContext, EventScope, OPCUA_EVENT_STREAM_ID, OpcUaEventPlanSnapshot,
+    OpcUaEventTaskPlan, STANDARD_EVENT_FIELD_COUNT, STANDARD_EVENT_FIELDS, StandardEventClause,
+    StandardEventField, canonical_node_id, decode_event_fields, standard_event_clauses,
+};
 pub use mesa_opcua_transport::DEFAULT_OPCUA_PORT;
 pub use opcua_api::{FakeOpcUaApi, OpcUaApi};
 pub use transport_adapter::TransportApiAdapter;
@@ -539,7 +543,7 @@ fn coerce_value(v: Value, dt: DataType) -> Value {
 }
 
 /// OPC UA DateTime ticks (1601-01-01, 100ns) → Unix ns（§7.3 精确保留）
-fn ticks_to_unix_ns(ticks: i64) -> i64 {
+pub(crate) fn ticks_to_unix_ns(ticks: i64) -> i64 {
     const TICKS_PER_SEC: i64 = 10_000_000;
     const UNIX_TICKS_OFFSET: i64 = 11644473600 * TICKS_PER_SEC;
     (ticks - UNIX_TICKS_OFFSET) * 100
