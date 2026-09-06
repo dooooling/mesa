@@ -18,16 +18,16 @@ const generic = (stream_id: string): EventTask => ({
 
 describe("generic event binding", () => {
   it("唯一构造点生成标准信封", () => {
-    const b = buildGenericEventBinding("sim.events.alarm-cycle", { area: 1 });
+    const b = buildGenericEventBinding("test.stream.alarm", { area: 1 });
     expect(b.kind).toBe("mesa.events.v1");
-    expect(b.config).toEqual({ stream_id: "sim.events.alarm-cycle", parameters: { area: 1 } });
+    expect(b.config).toEqual({ stream_id: "test.stream.alarm", parameters: { area: 1 } });
     expect(GENERIC_EVENT_BINDING_KIND).toBe("mesa.events.v1");
   });
 
   it("标准任务识别 + stream/parameters 解析", () => {
-    const t = generic("sim.events.counter");
+    const t = generic("test.stream.counter");
     expect(isGenericEventTask(t)).toBe(true);
-    expect(genericStreamIdOf(t)).toBe("sim.events.counter");
+    expect(genericStreamIdOf(t)).toBe("test.stream.counter");
     expect(genericParametersOf(t)).toEqual({});
   });
 
@@ -36,7 +36,7 @@ describe("generic event binding", () => {
       id: "old",
       mode: "subscribe",
       interval_ms: null,
-      binding: { kind: "simulator.events", config: { stream: "sim.events.counter" } },
+      binding: { kind: "legacy.private", config: { stream: "test.stream.counter" } },
     };
     expect(isGenericEventTask(legacy)).toBe(false);
     expect(genericStreamIdOf(legacy)).toBeUndefined();

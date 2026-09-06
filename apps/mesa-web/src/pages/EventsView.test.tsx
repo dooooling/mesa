@@ -137,7 +137,8 @@ describe("EventsView", () => {
     await user.type(input, "zz");
     await waitFor(() => expect(screen.queryByText("msg-5")).toBeNull());
     // 重载请求带上新 filter
-    const lastCall = mocked.listEvents.mock.calls.at(-1)?.[0] as { category?: string };
+    const calls = mocked.listEvents.mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as { category?: string };
     expect(lastCall.category).toContain("zz");
   });
 

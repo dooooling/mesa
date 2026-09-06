@@ -1395,4 +1395,75 @@ mod tests {
         assert_eq!(vals[0], (11, Value::F64(7.0)));
         assert_eq!(vals[1], (22, Value::Bool(true)));
     }
+
+    fn generic_event_task(id: &str, mode: TaskMode, interval_ms: Option<u64>, stream_id: &str) -> EventTask {
+        EventTask {
+            id: id.into(),
+            mode,
+            interval_ms,
+            binding: DriverBinding {
+                kind: GENERIC_EVENT_BINDING_KIND.into(),
+                config: serde_json::json!({"stream_id": stream_id, "parameters": {}}),
+            },
+        }
+    }
+
+    fn legacy_event_task(id: &str, stream: &str) -> EventTask {
+        EventTask {
+            id: id.into(),
+            mode: TaskMode::Subscribe,
+            interval_ms: None,
+            binding: DriverBinding {
+                kind: EVENT_BINDING_KIND.into(),
+                config: serde_json::json!({"stream": stream}),
+            },
+        }
+    }
+
+    /// PR8 P0：新标准 `mesa.events.v1` 被接受（Subscribe 缺省节奏 / Poll 自带周期）。
+    #[tokio::test]
+    async fn simulator_accepts_mesa_events_v1() {
+        let mut conn = SimConnection::default();
+        conn.configure_events(
+            1,
+            vec![
+                generic_event_task("e-sub", TaskMode::Subscribe, None, SIM_EVENT_STREAM_ALARM),
+                generic_event_task("e-poll", TaskMode::Poll, Some(100), SIM_EVENT_STREAM_COUNTER),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(conn.event_plan.as_ref().unwrap().tasks.len(), 2);
+    }
+
+    /// PR7 legacy `simulator.events` 继续可用（旧开发数据库无需 migration）。
+    #[tokio::test]
+    async fn simulator_legacy_binding_still_accepted() {
+        let mut conn = SimConnection::default();
+        conn.configure_events(1, vec![legacy_event_task("e-old", SIM_EVENT_STREAM_COUNTER)])
+            .await
+            .unwrap();
+        assert_eq!(conn.event_plan.as_ref().unwrap().tasks.len(), 1);
+    }
+
+    /// 未知流精确报错（新旧两种信封形态一致）。
+    #[tokio::test]
+    async fn unknown_event_stream_rejected() {
+        let mut conn = SimConnection::default();
+        let err = conn
+            .configure_events(1, vec![generic_event_task("e", TaskMode::Subscribe, None, "no.such.stream")])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "UNKNOWN_EVENT_STREAM");
+        let err = conn
+            .configure_events(1, vec![legacy_event_task("e", "no.such.stream")])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "UNKNOWN_EVENT_STREAM");
+        // 非法 kind 精确报错（提示两种合法取值）
+        let mut bad = generic_event_task("e", TaskMode::Subscribe, None, SIM_EVENT_STREAM_COUNTER);
+        bad.binding.kind = "other.events".into();
+        let err = conn.configure_events(1, vec![bad]).await.unwrap_err();
+        assert_eq!(err.code, "UNSUPPORTED_EVENT_BINDING");
+    }
 }

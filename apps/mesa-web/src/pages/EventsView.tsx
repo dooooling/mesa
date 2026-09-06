@@ -1,4 +1,4 @@
-// PR8 EventsView：事件记录 Tab（历史 + SSE 无窗口合并）；订阅配置 Tab 由下一步填充。
+// PR8 EventsView：事件记录（历史 + SSE 无窗口合并）与订阅配置。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Button, Card, Space, Tabs, Tag } from "antd";
 import { api, isEventStoreUnavailable } from "../api";
@@ -131,7 +131,7 @@ export function EventsView() {
   }, [nextCursor]);
 
   const onLive = useCallback((ev: StoredEvent) => {
-    if (!matchesLiveFilter(formRef.current, ev)) return;
+    if (!matchesLiveFilter(ev, formRef.current)) return;
     setHistory((cur) => mergeEvents(cur, [ev]));
   }, []);
 
