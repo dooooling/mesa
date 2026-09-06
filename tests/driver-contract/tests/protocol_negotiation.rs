@@ -91,3 +91,100 @@ async fn driver_rejects_core_major_downgrade() {
         "error must mention version rejection: {msg}"
     );
 }
+
+/// 真 1.2 驱动（裸帧 Hello{1,2}，不经当前 SDK）：
+/// Welcome 必须如实回 accepted_minor=2（协商值，不是 Core 自身 3）；
+/// 该会话的 Event Gate 必须以协商值 2 执行（非空任务秒级精确拒绝）。
+#[tokio::test]
+async fn minor_negotiation_with_real_1_2_driver_is_honest() {
+    use mesa_core_types::{DriverBinding, EventTask, TaskMode};
+    use mesa_driver_manager::session::SessionError;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // 假 1.2 驱动：发 Hello{1,2} → 校验 Welcome → 保持连接供后续 RPC 门控验证
+    let stub = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (mut rd, mut wr) = sock.into_split();
+        let hello = pb::Envelope {
+            msg_id: 1,
+            body: Some(pb::envelope::Body::Hello(pb::Hello {
+                driver_id: "legacy-1.2".into(),
+                driver_version: "1.2.0".into(),
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: 2,
+                sdk_version: "test".into(),
+                platform: "test".into(),
+                instance_id: "test-1".into(),
+                session_token: TOKEN.into(),
+            })),
+        };
+        write_envelope(&mut wr, &hello).await.unwrap();
+        let welcome = read_envelope(&mut rd)
+            .await
+            .expect("core must answer Welcome");
+        let w = match welcome.body {
+            Some(pb::envelope::Body::Welcome(w)) => w,
+            other => panic!("expected Welcome, got {other:?}"),
+        };
+        assert_eq!(w.accepted_protocol_major, PROTOCOL_MAJOR);
+        assert_eq!(
+            w.accepted_protocol_minor, 2,
+            "Welcome 必须回协商 Minor=2，不能回 Core 自身 Minor"
+        );
+        // 保持连接：心跳 Ping 到达即回 Pong（让会话在断言期间存活）
+        loop {
+            let env = match read_envelope(&mut rd).await {
+                Ok(e) => e,
+                Err(_) => break,
+            };
+            if matches!(env.body, Some(pb::envelope::Body::Ping(_))) {
+                let pong = pb::Envelope {
+                    msg_id: env.msg_id,
+                    body: Some(pb::envelope::Body::Pong(pb::Pong {})),
+                };
+                if write_envelope(&mut wr, &pong).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let (mut session, _events, _) = Session::connect(port, TOKEN)
+        .await
+        .expect("1.2 handshake ok");
+    assert_eq!(session.negotiated_minor(), 2, "协商值必须为双方较小值 2");
+    // wire 级门控：该会话发非空事件任务必须秒级精确拒绝（不发未知 RPC 干等）
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        session.configure_events(
+            7,
+            1,
+            &[EventTask {
+                id: "e1".into(),
+                mode: TaskMode::Subscribe,
+                interval_ms: None,
+                binding: DriverBinding {
+                    kind: "k".into(),
+                    config: serde_json::Value::Null,
+                },
+            }],
+        ),
+    )
+    .await
+    .expect("1.2 gate must answer fast")
+    .expect_err("1.2 driver must reject event tasks");
+    assert!(
+        matches!(
+            err,
+            SessionError::EventPlaneUnsupported {
+                negotiated: 2,
+                required: 3
+            }
+        ),
+        "必须精确报 EventPlaneUnsupported，got {err}"
+    );
+
+    teardown(&mut session, None);
+    stub.abort();
+}
