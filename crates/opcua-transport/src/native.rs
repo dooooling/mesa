@@ -238,6 +238,43 @@ pub(crate) async fn forwarder_loop(
     }
 }
 
+/// Event callback 同步桥（§5）：与 Data `SlotState::push` 同一入口层级，
+/// 供 `EventCallback` 闭包与单测直接驱动。只允许同步操作：
+/// 计数 → try_send → Full/None 时 fatal。禁止解码/IO/await/spawn。
+pub(crate) fn push_event_notification(
+    tx: &tokio::sync::mpsc::Sender<crate::event::UaEventNotification>,
+    fatal_tx: &tokio::sync::watch::Sender<Option<crate::event::UaEventStreamFatal>>,
+    stats: &crate::event::EventSubscriptionStats,
+    client_handle: u32,
+    fields: Option<Vec<opcua_types::Variant>>,
+) {
+    use crate::event::UaEventStreamFatal;
+    use std::sync::atomic::Ordering;
+    stats.events_received.fetch_add(1, Ordering::Relaxed);
+    let Some(fields) = fields else {
+        // 无字段的通知无法按位置解码：契约已破坏，直接宣布流不可信。
+        fatal_tx.send_replace(Some(UaEventStreamFatal::MalformedNotification));
+        return;
+    };
+    match tx.try_send(crate::event::UaEventNotification {
+        client_handle,
+        fields,
+    }) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            stats
+                .callback_queue_overflow
+                .fetch_add(1, Ordering::Relaxed);
+            // 禁止 drop-oldest / coalesce / 假装 RUNNING：宣布完整性失效，
+            // 由上层 fail 当前 attempt（Manager 重连开新 epoch）。
+            fatal_tx.send_replace(Some(UaEventStreamFatal::CallbackQueueOverflow));
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            // receiver 已释放 = teardown 进行中，静默丢弃。
+        }
+    }
+}
+
 /// 原生传输：持有 Session + event-loop JoinHandle；`disconnect()` 释放会话。
 ///
 /// P1-B5：每个订阅的 forwarder task 由 `forwarders[sub_id]` 跟踪，生命周期与
@@ -836,27 +873,152 @@ impl OpcUaTransport for NativeOpcUaTransport {
         self.delete_subscription_rpc(&sess, id).await
     }
 
-    // TODO(PR9-②): Native EventCallback 有界 FIFO + fatal watch，随 Stage ② 落地。
-    // 当前仅保编译，调用即内部错误。
+    // PR9-② Native EventCallback：同步上下文内只做 try_send（§5）。
+    // 不解码、不落盘、不 await。Full 即完整性破坏 → fatal，绝不 drop-oldest。
     async fn create_event_subscription(
         &self,
-        _spec: UaSubscriptionSpec,
+        spec: UaSubscriptionSpec,
     ) -> Result<crate::event::UaEventSubscription, UaTransportError> {
-        Err(UaTransportError::internal(
-            UaOperation::CreateEventSubscription,
-            "Native event path 未实现（PR9 Stage ② 落地）",
-        ))
+        use crate::event::{EVENT_CALLBACK_QUEUE_CAPACITY, EventSubscriptionStats};
+        use opcua_client::EventCallback;
+        let session = {
+            let guard = self.inner.lock().await;
+            guard
+                .as_ref()
+                .and_then(|i| i.session.clone())
+                .ok_or_else(|| {
+                    UaTransportError::session(
+                        UaOperation::CreateEventSubscription,
+                        None,
+                        "尚未连接，请先 connect",
+                    )
+                })?
+        };
+        let stats = Arc::new(EventSubscriptionStats::default());
+        let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CALLBACK_QUEUE_CAPACITY);
+        let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+        let cb_stats = stats.clone();
+        let callback = EventCallback::new(
+            move |fields: Option<Vec<opcua_types::Variant>>, item: &opcua_client::MonitoredItem| {
+                push_event_notification(&tx, &fatal_tx, &cb_stats, item.client_handle(), fields);
+            },
+        );
+        // P1-B6 同理：请求间隔原样上送，Server revised 为准。
+        let pub_interval = Duration::from_millis(spec.publishing_interval_ms);
+        let sub_id = session
+            .create_subscription(
+                pub_interval,
+                spec.lifetime_count,
+                spec.max_keep_alive_count,
+                spec.max_notifications_per_publish,
+                spec.priority,
+                spec.publishing_enabled,
+                callback,
+            )
+            .await
+            .map_err(|e| map_service_error(UaOperation::CreateEventSubscription, e))?;
+        // Revised 回读 + 缺席回滚（与 Data 路径同一 fail-closed 语义）。
+        let revised = {
+            let state = session.subscription_state();
+            let guard = state.lock();
+            guard.get(sub_id).map(|sub| {
+                (
+                    sub.publishing_interval().as_millis() as u64,
+                    sub.lifetime_count(),
+                    sub.max_keep_alive_count(),
+                )
+            })
+        };
+        let Some((revised_pub_ms, revised_lifetime, revised_keep_alive)) = revised else {
+            if let Err(cleanup) = self.delete_subscription_rpc(&session, sub_id).await {
+                tracing::debug!(
+                    sub_id,
+                    ?cleanup,
+                    "Event 订阅 Revised 缺席回滚删订阅失败（仅诊断）"
+                );
+            }
+            return Err(UaTransportError::internal(
+                UaOperation::CreateEventSubscription,
+                format!(
+                    "Event 订阅 {sub_id} 创建成功但本地订阅状态缺席（内部不一致，已回滚，fail-closed）"
+                ),
+            ));
+        };
+        // NOTE: Event 路径不 spawn forwarder task——receiver 直达调用方（Driver
+        // runtime），无 slot 中转；cleanup 只需服务端 delete（幂等），无本地 task 可泄漏。
+        Ok(crate::event::UaEventSubscription {
+            id: sub_id,
+            requested_publishing_interval_ms: spec.publishing_interval_ms,
+            revised_publishing_interval_ms: revised_pub_ms,
+            revised_lifetime_count: revised_lifetime,
+            revised_max_keep_alive_count: revised_keep_alive,
+            receiver: rx,
+            fatal: fatal_rx,
+            stats,
+        })
     }
 
     async fn create_event_monitored_items(
         &self,
-        _subscription_id: UaSubscriptionId,
-        _items: &[crate::event::UaEventMonitoredItemSpec],
+        subscription_id: UaSubscriptionId,
+        items: &[crate::event::UaEventMonitoredItemSpec],
     ) -> Result<Vec<crate::event::UaEventMonitoredItemResult>, UaTransportError> {
-        Err(UaTransportError::internal(
+        use crate::event::decode_event_filter_result;
+        let session = {
+            let guard = self.inner.lock().await;
+            guard
+                .as_ref()
+                .and_then(|i| i.session.clone())
+                .ok_or_else(|| {
+                    UaTransportError::session(
+                        UaOperation::CreateEventMonitoredItems,
+                        None,
+                        "尚未连接，请先 connect",
+                    )
+                })?
+        };
+        let mut reqs = Vec::with_capacity(items.len());
+        for it in items {
+            reqs.push(crate::event::build_event_monitored_item_request(it)?);
+        }
+        // 事件时间以字段形式到达（Time/ReceiveTime select clauses），无需 data timestamps。
+        let created = session
+            .create_monitored_items(subscription_id, TimestampsToReturn::Neither, reqs)
+            .await
+            .map_err(|e| map_service_error(UaOperation::CreateEventMonitoredItems, e))?;
+        check_cardinality(
             UaOperation::CreateEventMonitoredItems,
-            "Native event path 未实现（PR9 Stage ② 落地）",
-        ))
+            "CreateEventMonitoredItems 结果",
+            items.len(),
+            created.len(),
+        )?;
+        let mut out = Vec::with_capacity(created.len());
+        for (spec, c) in items.iter().zip(created) {
+            let r = &c.result;
+            // 单项 BAD 不整体 Err（调用方回滚）；Good 项的 filter_result 必须可解码，
+            // 否则是协议违约（fail-closed，整包 Err）。
+            let clause_statuses = if r.status_code.is_good() {
+                decode_event_filter_result(&r.filter_result, spec.filter.select_clauses.len())?
+                    .iter()
+                    .map(|s| s.bits())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            out.push(crate::event::UaEventMonitoredItemResult {
+                client_handle: spec.client_handle,
+                monitored_item_id: if r.status_code.is_good() {
+                    r.monitored_item_id
+                } else {
+                    0
+                },
+                status_code: r.status_code.bits(),
+                requested_queue_size: spec.queue_size,
+                revised_queue_size: r.revised_queue_size,
+                select_clause_statuses: clause_statuses,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -1022,5 +1184,94 @@ mod tests {
         let e = browse_result_to_page(bad).expect_err("整包 BAD 必须 Err");
         assert_eq!(e.kind, crate::UaTransportErrorKind::Service);
         assert_eq!(e.status_code, Some(StatusCode::BadNodeIdUnknown.bits()));
+    }
+
+    // ---- PR9-② Event callback 桥：FIFO + fail-closed（与 Latest-Wins 对照） ----
+
+    // 单测脚手架：复杂元组类型仅测试用，允许。
+    #[allow(clippy::type_complexity)]
+    fn event_bridge() -> (
+        tokio::sync::mpsc::Sender<crate::event::UaEventNotification>,
+        tokio::sync::mpsc::Receiver<crate::event::UaEventNotification>,
+        tokio::sync::watch::Sender<Option<crate::event::UaEventStreamFatal>>,
+        tokio::sync::watch::Receiver<Option<crate::event::UaEventStreamFatal>>,
+        Arc<crate::event::EventSubscriptionStats>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::event::EVENT_CALLBACK_QUEUE_CAPACITY);
+        let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+        let stats = Arc::new(crate::event::EventSubscriptionStats::default());
+        (tx, rx, fatal_tx, fatal_rx, stats)
+    }
+
+    fn ev_fields(n: i32) -> Option<Vec<opcua_types::Variant>> {
+        Some(vec![opcua_types::Variant::Int32(n)])
+    }
+
+    #[tokio::test]
+    async fn event_bridge_preserves_order_never_coalesces() {
+        // 与 burst_same_handle 对照：1000 个 occurrence 必须全部保留、保序，
+        // 绝不允许 Latest-Wins 式合并。
+        use crate::event::UaEventStreamFatal;
+        let (tx, mut rx, fatal_tx, fatal_rx, stats) = event_bridge();
+        for v in 0..1000i32 {
+            push_event_notification(&tx, &fatal_tx, &stats, 3, ev_fields(v));
+        }
+        assert_eq!(stats.events_received(), 1000);
+        assert_eq!(*fatal_rx.borrow(), None);
+        for v in 0..1000i32 {
+            let n = rx.recv().await.expect("occurrence 不得丢失");
+            assert_eq!(n.client_handle, 3);
+            assert_eq!(n.fields, vec![opcua_types::Variant::Int32(v)]);
+        }
+        assert!(rx.try_recv().is_err());
+        let _ = UaEventStreamFatal::CallbackQueueOverflow.as_str();
+    }
+
+    #[test]
+    fn event_bridge_full_is_fatal_not_drop_oldest() {
+        // channel 容量 1024：确定性填满（无消费者），再压即 Full。
+        // 旧 ordered prefix 必须完整保留，且 fatal 精确计数。
+        use crate::event::UaEventStreamFatal;
+        let (tx, mut rx, fatal_tx, fatal_rx, stats) = event_bridge();
+        for v in 0..crate::event::EVENT_CALLBACK_QUEUE_CAPACITY as i32 {
+            push_event_notification(&tx, &fatal_tx, &stats, 3, ev_fields(v));
+        }
+        assert_eq!(*fatal_rx.borrow(), None);
+        for v in 0..3i32 {
+            push_event_notification(&tx, &fatal_tx, &stats, 3, ev_fields(10_000 + v));
+        }
+        assert_eq!(stats.callback_queue_overflow(), 3);
+        assert_eq!(
+            *fatal_rx.borrow(),
+            Some(UaEventStreamFatal::CallbackQueueOverflow)
+        );
+        for v in 0..crate::event::EVENT_CALLBACK_QUEUE_CAPACITY as i32 {
+            let n = rx.try_recv().expect("prefix 必须完整（禁 drop-oldest）");
+            assert_eq!(n.fields, vec![opcua_types::Variant::Int32(v)]);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn event_bridge_none_fields_is_malformed_fatal() {
+        use crate::event::UaEventStreamFatal;
+        let (tx, mut rx, fatal_tx, fatal_rx, stats) = event_bridge();
+        push_event_notification(&tx, &fatal_tx, &stats, 3, None);
+        assert_eq!(
+            *fatal_rx.borrow(),
+            Some(UaEventStreamFatal::MalformedNotification)
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(stats.events_received(), 1);
+    }
+
+    #[test]
+    fn event_bridge_closed_receiver_is_silent() {
+        let (tx, rx, fatal_tx, fatal_rx, _stats) = event_bridge();
+        drop(rx);
+        let stats = Arc::new(crate::event::EventSubscriptionStats::default());
+        push_event_notification(&tx, &fatal_tx, &stats, 3, ev_fields(1));
+        // teardown 进行中：静默丢弃，不报 fatal。
+        assert_eq!(*fatal_rx.borrow(), None);
     }
 }

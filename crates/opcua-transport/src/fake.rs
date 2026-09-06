@@ -48,6 +48,16 @@ pub struct FakeOpcUaTransport {
     delete_mi_error: Mutex<Option<UaTransportError>>,
     /// create_subscription 返回前注入 receiver 的事件。
     live_batches: Mutex<VecDeque<FakeLiveBatch>>,
+    /// 预置下一次（及以后所有）`create_event_subscription` 返回前注入的原生事件通知。
+    event_batches: Mutex<VecDeque<crate::event::UaEventNotification>>,
+    /// notifier key → create_event_monitored_items 逐项状态（缺省 Good）。
+    event_create_status: Mutex<HashMap<String, StatusCode>>,
+    /// notifier key → 逐 clause 状态（缺省全 Good，长度自动对齐 clauses 数）。
+    event_clause_statuses: Mutex<HashMap<String, Vec<StatusCode>>>,
+    /// 预置 create_event_subscription 整体失败（session loss 类测试用）。
+    event_sub_error: Mutex<Option<UaTransportError>>,
+    /// 预置 create_event_monitored_items 服务级整体失败（回滚测试用）。
+    event_mi_error: Mutex<Option<UaTransportError>>,
     next_sub_id: AtomicU32,
     next_mi_id: AtomicU32,
     created_subs: Mutex<Vec<UaSubscriptionId>>,
@@ -115,6 +125,51 @@ impl FakeOpcUaTransport {
     /// 下一次 `create_subscription` 返回的 receiver 将先收到这些事件。
     pub fn with_live_batch(self, batch: FakeLiveBatch) -> Self {
         self.live_batches.lock().unwrap().push_back(batch);
+        self
+    }
+
+    /// 预置原生事件通知：下一次 `create_event_subscription` 返回的 receiver
+    /// 将按序先收到这些通知（Fake 只造 `UaEventNotification`，绝不直接造
+    /// EventRecord——decoder 必须走真实路径）。
+    pub fn with_event_notifications(
+        self,
+        notifications: Vec<crate::event::UaEventNotification>,
+    ) -> Self {
+        self.event_batches.lock().unwrap().extend(notifications);
+        self
+    }
+
+    /// 预置某 notifier 的 `create_event_monitored_items` 逐项状态。
+    pub fn with_event_item_status(self, notifier: &UaNodeRef, status: StatusCode) -> Self {
+        self.event_create_status
+            .lock()
+            .unwrap()
+            .insert(node_key(notifier), status);
+        self
+    }
+
+    /// 预置某 notifier 的逐 clause 状态（bad filter 类测试用）。
+    pub fn with_event_clause_statuses(
+        self,
+        notifier: &UaNodeRef,
+        statuses: Vec<StatusCode>,
+    ) -> Self {
+        self.event_clause_statuses
+            .lock()
+            .unwrap()
+            .insert(node_key(notifier), statuses);
+        self
+    }
+
+    /// 让 `create_event_subscription` 整体返回 Err（session loss 类测试用）。
+    pub fn with_event_subscription_error(self, err: UaTransportError) -> Self {
+        *self.event_sub_error.lock().unwrap() = Some(err);
+        self
+    }
+
+    /// 让 `create_event_monitored_items` 整体返回 Err（回滚测试用）。
+    pub fn with_event_monitored_items_error(self, err: UaTransportError) -> Self {
+        *self.event_mi_error.lock().unwrap() = Some(err);
         self
     }
 
@@ -298,28 +353,70 @@ impl OpcUaTransport for FakeOpcUaTransport {
         Ok(())
     }
 
-    // TODO(PR9-②): Fake raw event transport（预置 UaEventNotification 序列 +
-    // overflow / BAD filter / session loss 脚本），随 native EventCallback 一起落地。
-    // 当前仅保编译，调用即内部错误，避免半实现 Fake 被误认为可用。
+    // PR9-② Fake raw event：只造 UaEventNotification（位置数组），
+    // 绝不直接造 EventRecord——decoder 必须走真实路径（§24）。
     async fn create_event_subscription(
         &self,
-        _spec: UaSubscriptionSpec,
+        spec: UaSubscriptionSpec,
     ) -> Result<crate::event::UaEventSubscription, UaTransportError> {
-        Err(UaTransportError::internal(
-            UaOperation::CreateEventSubscription,
-            "Fake event path 未实现（PR9 Stage ② 落地）",
-        ))
+        if let Some(err) = self.event_sub_error.lock().unwrap().clone() {
+            return Err(err);
+        }
+        let id = self.next_sub_id.fetch_add(1, Ordering::SeqCst);
+        self.created_subs.lock().unwrap().push(id);
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::event::EVENT_CALLBACK_QUEUE_CAPACITY);
+        let (_fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+        // 预置通知按序注入（单测规模，必须能容纳；超限即脚本错误，直接 panic）。
+        for n in self.event_batches.lock().unwrap().drain(..) {
+            tx.try_send(n)
+                .expect("fake event batch 必须能容纳（单测规模）");
+        }
+        Ok(crate::event::UaEventSubscription {
+            id,
+            requested_publishing_interval_ms: spec.publishing_interval_ms,
+            revised_publishing_interval_ms: spec.publishing_interval_ms,
+            revised_lifetime_count: spec.lifetime_count,
+            revised_max_keep_alive_count: spec.max_keep_alive_count,
+            receiver: rx,
+            fatal: fatal_rx,
+            stats: Arc::new(crate::event::EventSubscriptionStats::default()),
+        })
     }
 
     async fn create_event_monitored_items(
         &self,
         _subscription_id: UaSubscriptionId,
-        _items: &[crate::event::UaEventMonitoredItemSpec],
+        items: &[crate::event::UaEventMonitoredItemSpec],
     ) -> Result<Vec<crate::event::UaEventMonitoredItemResult>, UaTransportError> {
-        Err(UaTransportError::internal(
-            UaOperation::CreateEventMonitoredItems,
-            "Fake event path 未实现（PR9 Stage ② 落地）",
-        ))
+        if let Some(err) = self.event_mi_error.lock().unwrap().clone() {
+            return Err(err);
+        }
+        let statuses = self.event_create_status.lock().unwrap();
+        let clause_maps = self.event_clause_statuses.lock().unwrap();
+        let mut out = Vec::with_capacity(items.len());
+        for spec in items {
+            let key = node_key(&spec.notifier);
+            let status = statuses.get(&key).copied().unwrap_or(StatusCode::Good);
+            let good = status.is_good();
+            let n = spec.filter.select_clauses.len();
+            let clause_statuses = clause_maps
+                .get(&key)
+                .map(|v| v.iter().map(|s| s.bits()).collect())
+                .unwrap_or_else(|| vec![StatusCode::Good.bits(); n]);
+            out.push(crate::event::UaEventMonitoredItemResult {
+                client_handle: spec.client_handle,
+                monitored_item_id: if good {
+                    self.next_mi_id.fetch_add(1, Ordering::SeqCst)
+                } else {
+                    0
+                },
+                status_code: status.bits(),
+                requested_queue_size: spec.queue_size,
+                revised_queue_size: spec.queue_size,
+                select_clause_statuses: clause_statuses,
+            });
+        }
+        Ok(out)
     }
 }
 
