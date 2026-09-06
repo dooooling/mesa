@@ -25,9 +25,7 @@ jobs:
           cache-dependency-path: 'apps/mesa-web/pnpm-lock.yaml'
 
       - name: pnpm install
-        # PR8 起含 Web 单测新依赖；沙箱外首次安装后应重锁 lockfile 并恢复 --frozen-lockfile
-        # TODO(web): 有网络环境执行 pnpm --dir apps/mesa-web install 后提交 lockfile，恢复 frozen 安装
-        run: pnpm --dir apps/mesa-web install --no-frozen-lockfile
+        run: pnpm --dir apps/mesa-web install --frozen-lockfile
 
       - name: web test
         run: pnpm --filter mesa-web test
