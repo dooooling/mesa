@@ -225,4 +225,37 @@ describe("EventTaskEditor", () => {
     expect(endpointId).toBe("ep2");
     expect(tasks.map((t) => t.id)).toEqual(["task-ep2"]);
   });
+
+  it("P0：B 加载失败不暴露 A 的旧配置，保存禁用", async () => {
+    const user = userEvent.setup();
+    const taskEp1 = { ...GENERIC_TASK, id: "task-ep1" };
+    mocked.listEndpoints.mockResolvedValue({
+      endpoints: [
+        { id: "ep1", driver_id: "drv1" },
+        { id: "ep2", driver_id: "drv1" },
+      ],
+    });
+    mocked.getDescriptor.mockResolvedValue(DESCRIPTOR);
+    mocked.listEventTasks.mockImplementation((id: string) => {
+      if (id === "ep1") {
+        return Promise.resolve({ endpoint_id: id, revision: 1, event_tasks: [taskEp1] });
+      }
+      return Promise.reject(new Error("boom"));
+    });
+    render(<EventTaskEditor />);
+    // A 加载成功
+    expect(await screen.findByText("任务 · task-ep1")).toBeTruthy();
+    // 切到 ep2：其任务请求失败
+    await user.click(screen.getByText("ep1"));
+    const candidates = await screen.findAllByText("ep2");
+    const inner =
+      candidates.find((el) => el.classList.contains("ant-select-item-option-content")) ??
+      candidates[candidates.length - 1];
+    await user.click(inner);
+    expect(await screen.findByText("订阅配置失败")).toBeTruthy();
+    // A 的旧卡片不再出现；失败态不暴露编辑器，保存按钮不存在且绝不写出
+    expect(screen.queryByText("任务 · task-ep1")).toBeNull();
+    expect(screen.queryByRole("button", { name: "保存订阅" })).toBeNull();
+    expect(mocked.replaceEventTasks).not.toHaveBeenCalled();
+  });
 });

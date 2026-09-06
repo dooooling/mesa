@@ -64,10 +64,6 @@ export function useEventStream({ afterSeq, enabled, onEvent, onError }: UseEvent
   }, [afterSeq]);
 
   useEffect(() => {
-    setPaused(!enabled);
-  }, [enabled]);
-
-  useEffect(() => {
     if (paused) {
       setStatus("paused");
       return;

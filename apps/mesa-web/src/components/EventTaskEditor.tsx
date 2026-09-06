@@ -88,6 +88,9 @@ export function EventTaskEditor() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  // P0 归属门：drafts/descriptor 到底属于哪个 Endpoint。切换即失效旧状态；
+  // 加载失败绝不重新暴露上一台设备的 editor；保存仅当归属与选中一致才允许。
+  const [loadedEndpointId, setLoadedEndpointId] = useState<string | null>(null);
   // P0-2：Endpoint 切换竞态——旧请求返回绝不能覆盖新 Endpoint 的 descriptor/drafts，
   // 否则可能把 A 的事件配置写进 B。
   const loadGen = useRef(0);
@@ -115,16 +118,23 @@ export function EventTaskEditor() {
   // 选中 Endpoint → Descriptor + 现有 EventTask（代际守卫：stale 响应直接丢弃）
   useEffect(() => {
     if (!selected) return;
+    const endpointId = selected.id;
+    const driverId = selected.driver_id;
     const id = ++loadGen.current;
     setLoading(true);
     setError(null);
     setSaved(false);
-    Promise.all([api.getDescriptor(selected.driver_id), api.listEventTasks(selected.id)])
+    // 切换即失效旧归属：失败/竞态下不残留上一台设备的可编辑内容
+    setLoadedEndpointId(null);
+    setDescriptor(null);
+    setDrafts([]);
+    Promise.all([api.getDescriptor(driverId), api.listEventTasks(endpointId)])
       .then(([desc, tasks]) => {
         if (id !== loadGen.current) return;
         const streams = (desc as DriverDescriptor).events?.streams ?? [];
         setDescriptor(desc as DriverDescriptor);
         setDrafts(((tasks.event_tasks ?? []) as EventTask[]).map((t) => toDraft(t, streams)));
+        setLoadedEndpointId(endpointId);
         setLoading(false);
       })
       .catch((e) => {
@@ -173,7 +183,8 @@ export function EventTaskEditor() {
   const hasProblem = problems.some((p) => p !== null);
 
   const save = async () => {
-    if (!selected || running || saving || hasProblem) return;
+    // 归属门：只有当前选中 Endpoint 成功加载出的配置才允许保存
+    if (!selected || loadedEndpointId !== selected.id || running || saving || hasProblem) return;
     setSaving(true);
     setError(null);
     setSaved(false);
@@ -228,7 +239,16 @@ export function EventTaskEditor() {
 
       {loading ? (
         <Card size="small" loading />
-      ) : descriptor && streams.length === 0 ? (
+      ) : !selected ? (
+        <Alert type="info" showIcon message="请选择 Endpoint" description="选择后加载其事件订阅配置。" />
+      ) : !descriptor ? (
+        <Alert
+          type="info"
+          showIcon
+          message="订阅配置不可用"
+          description="该 Endpoint 的描述与任务尚未成功加载（见上方错误）；不会显示其他设备的旧配置，保存已禁用。"
+        />
+      ) : streams.length === 0 ? (
         <Alert type="info" showIcon message="该驱动未声明事件流" description="descriptor.events 为空，无可配置的事件订阅。" />
       ) : (
         <div style={{ display: "grid", gap: 12 }}>
@@ -346,7 +366,12 @@ export function EventTaskEditor() {
             <span style={{ marginLeft: 12, fontSize: 12, color: "#888" }}>只生成 {GENERIC_EVENT_BINDING_KIND}</span>
           </div>
           <div>
-            <Button type="primary" onClick={save} loading={saving} disabled={running || hasProblem || !selected}>
+            <Button
+              type="primary"
+              onClick={save}
+              loading={saving}
+              disabled={running || loading || loadedEndpointId !== selected?.id || hasProblem || !selected}
+            >
               保存订阅
             </Button>
           </div>

@@ -143,6 +143,11 @@ export function EventsView() {
         setLoadingMore(false);
       })
       .catch((e) => {
+        // stale 失败同样丢弃：旧 filter 的错误绝不显示在新页面，也不碰 loadingMore 之外的状态
+        if (id !== histGen.current || formRef.current !== snapshot) {
+          setLoadingMore(false);
+          return;
+        }
         if (isEventStoreUnavailable(e)) setUnavailable(true);
         else setError(e instanceof Error ? e.message : String(e));
         setLoadingMore(false);

@@ -374,8 +374,9 @@ pub const GENERIC_EVENT_BINDING_KIND: &str = "mesa.events.v1";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenericEventBinding {
     pub stream_id: String,
-    /// 对应目标流 `parameters` Schema 的用户取值；缺省即 `{}`（与显式空对象
-    /// 等价，永不出现 Null，保证 OPC UA/SINUMERIK 等未来使用者无二义性）。
+    /// 对应目标流 `parameters` Schema 的用户取值；字段缺省即 `{}`。
+    /// 为兼容手写旧配置，显式 `null` 在解析时同样归一为 `{}`（见 `from_json`），
+    /// 因此运行时只存在对象形态，未来使用者无二义性。
     #[serde(default = "default_event_parameters")]
     pub parameters: serde_json::Value,
 }
@@ -387,7 +388,11 @@ fn default_event_parameters() -> serde_json::Value {
 
 impl GenericEventBinding {
     pub fn from_json(v: &serde_json::Value) -> Result<Self, String> {
-        serde_json::from_value(v.clone()).map_err(|e| e.to_string())
+        let mut b: Self = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
+        if b.parameters.is_null() {
+            b.parameters = default_event_parameters();
+        }
+        Ok(b)
     }
 }
 
@@ -586,6 +591,12 @@ mod tests {
         let v: GenericEventBinding = serde_json::from_value(raw).unwrap();
         assert_eq!(v.stream_id, "sim.events.counter");
         assert_eq!(v.parameters, serde_json::json!({}));
+        // 显式 null 同样归一为 {}（手写旧配置兼容）。
+        let n = GenericEventBinding::from_json(
+            &serde_json::json!({"stream_id": "s", "parameters": null}),
+        )
+        .unwrap();
+        assert_eq!(n.parameters, serde_json::json!({}));
         assert_eq!(GENERIC_EVENT_BINDING_KIND, "mesa.events.v1");
     }
 
