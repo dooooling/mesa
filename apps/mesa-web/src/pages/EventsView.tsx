@@ -9,6 +9,7 @@ import { useEventStream } from "../events/useEventStream";
 import { EventFilters } from "../components/EventFilters";
 import { EventTable } from "../components/EventTable";
 import { EventDetailDrawer } from "../components/EventDetailDrawer";
+import { EventTaskEditor } from "../components/EventTaskEditor";
 
 /** SSE 实时事件的客户端过滤（服务端 live 无过滤参数；语义与后端 SQL 对齐：精确匹配 + active NULL 不参与）。 */
 export function matchesLiveFilter(ev: StoredEvent, form: EventFilterForm): boolean {
@@ -190,7 +191,7 @@ export function EventsView() {
             {
               key: "tasks",
               label: "订阅配置",
-              children: <Alert type="info" showIcon message="订阅配置（PR8-B）" description="Descriptor-driven EventTask Editor 在下一步 commit 落地。" />,
+              children: <EventTaskEditor />,
             },
           ]}
         />
