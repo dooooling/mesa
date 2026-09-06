@@ -88,7 +88,11 @@ pub enum StoreError {
 /// 全局 master key 缓存（进程内单例，避免重复文件 IO）
 static MASTER_KEY_CACHE: OnceLock<[u8; 32]> = OnceLock::new();
 
-fn master_key_bytes() -> Result<[u8; 32], StoreError> {
+/// P0-1：key 目录由 `open(path)` 的 DB 父目录决定（docstring 本就承诺
+/// "与 DB 同目录"），`open_in_memory` 对应 `None`。CWD 相对路径
+/// （`data/master.key` 等）已删除——`cargo test -p mesa-config-store` 的
+/// CWD 恰是 crate 目录，旧实现会在源码树里生成真 key 并被误提交。
+fn master_key_bytes(key_dir: Option<&PathBuf>) -> Result<[u8; 32], StoreError> {
     if let Some(k) = MASTER_KEY_CACHE.get() {
         return Ok(*k);
     }
@@ -112,49 +116,46 @@ fn master_key_bytes() -> Result<[u8; 32], StoreError> {
             ));
         }
     }
-    // 2) 文件 $DATA/master.key（与 DB 同目录，0600）
-    // 对于 open_in_memory 场景，使用固定测试 key（仅单测）
-    let key = load_or_create_master_key_file()?;
+    // 2) in-memory 库：固定测试 key，不碰磁盘（单测永不生成真 key 文件）
+    let Some(dir) = key_dir else {
+        let k = [0xA5u8; 32];
+        let _ = MASTER_KEY_CACHE.set(k);
+        return Ok(k);
+    };
+    // 3) 文件库：`MESA_DATA_DIR` 覆盖，否则与 DB 同目录，0600
+    let target = if let Ok(env_dir) = std::env::var("MESA_DATA_DIR") {
+        PathBuf::from(env_dir).join("master.key")
+    } else {
+        dir.join("master.key")
+    };
+    let key = load_or_create_master_key_file(&target)?;
     let _ = MASTER_KEY_CACHE.set(key);
     Ok(key)
 }
 
-fn load_or_create_master_key_file() -> Result<[u8; 32], StoreError> {
-    // 尝试从常见位置解析：优先环境变量 MESA_DATA_DIR，其次当前目录
-    let candidates: Vec<PathBuf> = if let Ok(dir) = std::env::var("MESA_DATA_DIR") {
-        vec![PathBuf::from(dir).join("master.key")]
-    } else {
-        vec![
-            PathBuf::from("data/master.key"),
-            PathBuf::from("./master.key"),
-            std::env::temp_dir().join("mesa-master.key"),
-        ]
-    };
-    for p in &candidates {
-        if p.is_file() {
-            let raw = std::fs::read(p)
-                .map_err(|e| StoreError::Validation(format!("read master.key: {e}")))?;
-            // 支持 base64 或原始 32 字节
-            if raw.len() == 32 {
-                let mut k = [0u8; 32];
-                k.copy_from_slice(&raw);
-                return Ok(k);
-            }
-            if let Ok(s) = String::from_utf8(raw.clone())
-                && let Ok(decoded) =
-                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s.trim())
-                && decoded.len() == 32
-            {
-                let mut k = [0u8; 32];
-                k.copy_from_slice(&decoded);
-                return Ok(k);
-            }
+fn load_or_create_master_key_file(target: &PathBuf) -> Result<[u8; 32], StoreError> {
+    if target.is_file() {
+        let raw = std::fs::read(target)
+            .map_err(|e| StoreError::Validation(format!("read master.key: {e}")))?;
+        // 支持 base64 或原始 32 字节
+        if raw.len() == 32 {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&raw);
+            return Ok(k);
+        }
+        if let Ok(s) = String::from_utf8(raw.clone())
+            && let Ok(decoded) =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s.trim())
+            && decoded.len() == 32
+        {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&decoded);
+            return Ok(k);
         }
     }
-    // 不存在则生成并写入第一个候选路径
+    // 不存在则生成并写入目标路径
     let mut key = [0u8; 32];
     getrandom::getrandom(&mut key).map_err(|e| StoreError::Validation(e.to_string()))?;
-    let target = &candidates[0];
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| StoreError::Validation(format!("create master.key dir: {e}")))?;
@@ -220,6 +221,8 @@ fn aead_decrypt(ciphertext: &[u8], nonce: &[u8], key: &[u8; 32]) -> Result<Vec<u
 
 pub struct ConfigStore {
     conn: Mutex<Connection>,
+    /// master.key 目录：文件库 = DB 父目录（P0-1），内存库 = None（固定测试 key）。
+    key_dir: Option<PathBuf>,
 }
 
 impl ConfigStore {
@@ -234,21 +237,34 @@ impl ConfigStore {
             })?;
         }
         let conn = Connection::open(path)?;
+        // P0-1：key 目录锚定 DB 位置，不再依赖进程 CWD。
+        // 无父目录（如 `mesa.db`）即当前目录——绝不能回落到测试 key。
+        let key_dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => Some(p.to_path_buf()),
+            _ => Some(PathBuf::from(".")),
+        };
         let s = Self {
             conn: Mutex::new(conn),
+            key_dir,
         };
         s.migrate()?;
         Ok(s)
     }
 
-    /// 内存库（单测/临时使用）。
+    /// 内存库（单测/临时使用）：Secret 用固定测试 key，不写任何 key 文件。
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
         let s = Self {
             conn: Mutex::new(conn),
+            key_dir: None,
         };
         s.migrate()?;
         Ok(s)
+    }
+
+    /// 本实例的 master key（`&self` 方法，P0-1：目录锚定 DB，desync 不可能）。
+    fn master_key_bytes(&self) -> Result<[u8; 32], StoreError> {
+        master_key_bytes(self.key_dir.as_ref())
     }
 
     /// 迁移前的文件拷贝兜底（仅文件库；生产应使用 rusqlite backup API）。
@@ -587,7 +603,7 @@ impl ConfigStore {
         // 预先加密所有 secrets，避免事务中途失败；无 Secret 时不初始化 master key
         let mut encs: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
         if !secrets.is_empty() {
-            let key = master_key_bytes()?;
+            let key = self.master_key_bytes()?;
             for (field, pt) in secrets {
                 let (ct, nonce) = aead_encrypt(pt.as_bytes(), &key)?;
                 encs.push((field.clone(), ct, nonce));
@@ -653,7 +669,7 @@ impl ConfigStore {
         }
         let mut encs: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
         if !secrets_to_upsert.is_empty() {
-            let key = master_key_bytes()?;
+            let key = self.master_key_bytes()?;
             for (field, pt) in secrets_to_upsert {
                 let (ct, nonce) = aead_encrypt(pt.as_bytes(), &key)?;
                 encs.push((field.clone(), ct, nonce));
@@ -1165,7 +1181,7 @@ impl ConfigStore {
         plaintext: &str,
         key_id: &str,
     ) -> Result<(), StoreError> {
-        let key = master_key_bytes()?;
+        let key = self.master_key_bytes()?;
         let (ciphertext, nonce) = aead_encrypt(plaintext.as_bytes(), &key)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1204,7 +1220,7 @@ impl ConfigStore {
                 let pt: Vec<u8> = ct.iter().map(|b| b ^ key_byte).collect();
                 return Ok(Some(String::from_utf8_lossy(&pt).into_owned()));
             }
-            let key = master_key_bytes()?;
+            let key = self.master_key_bytes()?;
             let pt = aead_decrypt(&ct, &nonce, &key)?;
             Ok(Some(String::from_utf8_lossy(&pt).into_owned()))
         } else {
@@ -1852,6 +1868,16 @@ mod tests {
         s.put_secret("e1", "password", "another", "k2").unwrap();
         let pt2 = s.get_secret("e1", "password").unwrap().unwrap();
         assert_eq!(pt2, "another");
+        // P0-1 回归：内存库 Secret 全程不碰磁盘，CWD 下不得出现 key 文件
+        //（旧实现会在 crate 目录生成 data/master.key 并被误提交）。
+        assert!(
+            !std::path::Path::new("data/master.key").exists(),
+            "in-memory secret must not create data/master.key under CWD"
+        );
+        assert!(
+            !std::path::Path::new("./master.key").exists(),
+            "in-memory secret must not create ./master.key under CWD"
+        );
     }
 
     #[test]

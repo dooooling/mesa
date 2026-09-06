@@ -46,16 +46,16 @@ fn alarm_task() -> EventTask {
     }
 }
 
-/// 洪峰计数器（⑨ Gate 用）：Poll 1ms 节奏（1000/s），瞬时事件。
-/// 该速率下 driver 停产 teardown 窗口（数 ms）内必有多个在途批次：
-/// 旧 cancel-first 顺序高概率掉尾（Gate 牙口），新 barrier 顺序零遗弃；
-/// ingress 单行 txn 吞吐（数 k/s）下 1000/s 不应触发 overflow fail-closed
-/// （若触发会换 epoch，`by_epoch.len()` 断言即红——误报可区分）。
+/// 洪峰计数器（⑨ Gate 用）：Poll 10ms 节奏（100/s），瞬时事件。
+/// 本测试是端到端锁（真实 Stop 路径 + 逐 epoch 连续 + 落盘），牙口不在速率：
+/// 确定性遗弃证明在单测 `ingress_cancel_drains_backlog`（旧行为 73/200）。
+/// 速率刻意保守——慢机器（CI ARM）上过高速率会触发 overflow fail-closed
+/// 换 epoch 造成误红；100/s 下 ingress 单行 txn 吞吐绰绰有余。
 fn flood_task() -> EventTask {
     EventTask {
         id: "cnt".into(),
         mode: TaskMode::Poll,
-        interval_ms: Some(2),
+        interval_ms: Some(10),
         binding: DriverBinding {
             kind: EVENT_BINDING_KIND.into(),
             config: serde_json::json!({"stream": SIM_EVENT_STREAM_COUNTER}),
@@ -150,7 +150,7 @@ async fn production_path_alarm_cycle_persists_before_visible() {
     hub_ids.sort();
     assert_eq!(hub_ids, ids);
 
-    assert!(mgr.stop_endpoint("ct-evt-001").await);
+    assert_eq!(mgr.stop_endpoint("ct-evt-001").await, Ok(true));
     // 停止后历史仍在（重启恢复的前置：落盘即事实）
     let (rows, _) = store
         .query_history(&EventFilter {
@@ -206,7 +206,7 @@ async fn event_ids_unique_across_driver_process_restart() {
                 .unwrap_or(false)
         })
         .await;
-        assert!(mgr.stop_endpoint("ct-evt-restart").await);
+        assert_eq!(mgr.stop_endpoint("ct-evt-restart").await, Ok(true));
     }
 
     let (rows, _) = store
@@ -488,7 +488,7 @@ async fn event_task_rest_crud_and_running_conflict() {
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
     assert_eq!(v["error"]["code"], "CONFLICT");
-    assert!(mgr.stop_endpoint("ct-task-001").await);
+    assert_eq!(mgr.stop_endpoint("ct-task-001").await, Ok(true));
 
     let _ = std::fs::remove_file(&db);
 }
@@ -530,7 +530,7 @@ async fn graceful_shutdown_publishes_every_commit() {
             .unwrap_or(false)
     })
     .await;
-    assert!(mgr.stop_endpoint("ct-evt-grace").await);
+    assert_eq!(mgr.stop_endpoint("ct-evt-grace").await, Ok(true));
 
     // 排空 Hub：DB 有的 event_id 必须全在 Hub 里
     let (db_rows, _) = store
@@ -608,7 +608,7 @@ async fn stop_barrier_drains_inflight_epoch_events() {
         // 洪峰形成（≥80 行/轮）
         let base = store.stats().unwrap().rows;
         wait_until(20, || store.stats().unwrap().rows >= base + 80).await;
-        assert!(mgr.stop_endpoint("ct-evt-stopgate").await);
+        assert_eq!(mgr.stop_endpoint("ct-evt-stopgate").await, Ok(true));
         // 逐 epoch 连续性：同 epoch 内 batch_sequence 无缺口、无重复
         let (rows, _) = store
             .query_history(&EventFilter {
@@ -645,6 +645,9 @@ async fn stop_barrier_drains_inflight_epoch_events() {
             );
         }
     }
+    // P0-3：已停止后再停 → Ok(false) 幂等成功（Result<bool> 双变体），
+    // 不是"没停掉也返回 true"的旧语义。
+    assert_eq!(mgr.stop_endpoint("ct-evt-stopgate").await, Ok(false));
     // 落盘性：重开 events.db，barrier-drain 的行必须全在
     let rows_before = store.stats().unwrap().rows;
     assert!(rows_before >= 400, "五轮洪峰应 ≥400 行，实际 {rows_before}");
@@ -695,7 +698,7 @@ async fn data_only_path_unaffected() {
     // 无事件入库
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(store.stats().unwrap().rows, 0);
-    assert!(mgr.stop_endpoint("ct-data-001").await);
+    assert_eq!(mgr.stop_endpoint("ct-data-001").await, Ok(true));
     drop(mgr);
     let _ = std::fs::remove_file(&db);
 }

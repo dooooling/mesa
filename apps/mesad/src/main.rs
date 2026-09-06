@@ -86,6 +86,7 @@ async fn main() {
         let shutdown = retention_shutdown.clone();
         tokio::spawn(mesa_event_store::retention::run_retention_loop(
             svc.store.clone(),
+            svc.diagnostics.clone(),
             mesa_event_store::RetentionConfig::default(),
             shutdown,
         ))

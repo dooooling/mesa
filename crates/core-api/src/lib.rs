@@ -1661,12 +1661,20 @@ async fn stop_endpoint(
             Json(serde_json::json!({ "stopped": id, "was_running": false })),
         );
     }
-    let was = state.manager.stop_endpoint(&id).await;
+    // P0-3：teardown 异常（drain fatal/timeout）是 500 显式错误，
+    // 不再"Detach 了也返回成功"。任务已结束（await 过），期望态照常落 false。
+    let res = state.manager.stop_endpoint(&id).await;
     let _ = state.store.set_desired_running(&id, false);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "stopped": id, "was_running": was })),
-    )
+    match res {
+        Ok(was) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "stopped": id, "was_running": was })),
+        ),
+        Err(detail) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("STOP_FAILED", &detail)),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2222,16 +2230,17 @@ async fn events_live(
     ))
 }
 
-/// ⑧c 事件面诊断：SSE 计数（lagged/replay/reconcile）+ store 规模。
-/// 计数是进程级累计（Relaxed 原子），`/events/live` 的各连接共同累加；
-/// 给"Lagged 测试从概率升级为 branch contract"提供程序级证明点。
+/// ⑧c 事件面诊断：SSE 计数（lagged/replay/reconcile）加 store 规模。
+/// P1-1 补全 ingress 全局计数、retention 累计 purge 与 hub live 订阅数。
+/// 计数是进程级累计（Relaxed 原子），各连接与 attempt 共同累加；
+/// 给 Lagged 分支契约测试提供程序级证明点。
 async fn events_stats(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
     let Some(svc) = state.event_services() else {
         return events_unavailable();
     };
-    let lagged = svc.diagnostics.lagged_total.load(Ordering::Relaxed);
-    let replay = svc.diagnostics.replay_frames_total.load(Ordering::Relaxed);
-    let reconciled = svc.diagnostics.reconcile_total.load(Ordering::Relaxed);
+    let d = &svc.diagnostics;
+    let load = |v: &std::sync::atomic::AtomicU64| v.load(Ordering::Relaxed);
+    let live_clients = svc.hub.receiver_count();
     let store = svc.store.clone();
     let res = tokio::task::spawn_blocking(move || store.stats()).await;
     match res {
@@ -2246,9 +2255,20 @@ async fn events_stats(State(state): State<Arc<AppState>>) -> (StatusCode, Json<s
         Ok(Ok(st)) => (
             StatusCode::OK,
             Json(serde_json::json!({
-                "sse_lagged_total": lagged,
-                "sse_replay_frames_total": replay,
-                "sse_reconcile_total": reconciled,
+                "sse_lagged_total": load(&d.lagged_total),
+                "sse_replay_frames_total": load(&d.replay_frames_total),
+                "sse_reconcile_total": load(&d.reconcile_total),
+                "ingress_batches_total": load(&d.ingress_batches_total),
+                "ingress_persisted_events_total": load(&d.ingress_persisted_events_total),
+                "ingress_batch_duplicates_total": load(&d.ingress_batch_duplicates_total),
+                "ingress_event_duplicates_total": load(&d.ingress_event_duplicates_total),
+                "ingress_gaps_total": load(&d.ingress_gaps_total),
+                "ingress_regressions_total": load(&d.ingress_regressions_total),
+                "ingress_collisions_total": load(&d.ingress_collisions_total),
+                "ingress_invalid_total": load(&d.ingress_invalid_total),
+                "ingress_store_failures_total": load(&d.ingress_store_failures_total),
+                "retention_purged_total": load(&d.retention_purged_total),
+                "live_clients": live_clients,
                 "stored_rows": st.rows,
                 "stored_size_bytes": st.size_bytes,
             })),

@@ -1417,7 +1417,7 @@ mod tests {
         use mesa_core_types::{EventRecord, Value};
         use mesa_event_store::{EventFilter, EventHub, EventServices, EventStore};
 
-        use crate::event_ingress::{IngressStats, run_event_ingress};
+        use crate::event_ingress::run_event_ingress;
 
         const N: u64 = 200;
         const HANDLE: u32 = 1;
@@ -1452,7 +1452,6 @@ mod tests {
         });
         let store = Arc::new(EventStore::open_in_memory().unwrap());
         let services = EventServices::new(store.clone(), EventHub::new(4));
-        let stats = Arc::new(Mutex::new(IngressStats::default()));
         let shutdown = CancellationToken::new();
         let rx = EventReceiver {
             rx: event_rx,
@@ -1461,8 +1460,7 @@ mod tests {
         let h = tokio::spawn(run_event_ingress(
             rx,
             "ep-drain".into(),
-            services,
-            stats,
+            services.clone(),
             shutdown.clone(),
         ));
         let batch = |seq: u64| EventBatch {
@@ -1508,6 +1506,22 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows.len(), N as usize, "200 批必须全提交");
+        // P1-1：同一批数据同时聚合进全局 diagnostics（非黑洞）
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            services
+                .diagnostics
+                .ingress_batches_total
+                .load(Ordering::Relaxed),
+            N
+        );
+        assert_eq!(
+            services
+                .diagnostics
+                .ingress_persisted_events_total
+                .load(Ordering::Relaxed),
+            N
+        );
         let mut seqs: Vec<u64> = rows.iter().map(|r| r.batch_sequence).collect();
         seqs.sort_unstable();
         assert!(

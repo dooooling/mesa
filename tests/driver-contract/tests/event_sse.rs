@@ -449,5 +449,25 @@ async fn sse_lagged_catch_up_from_db() {
         "DB replay 帧总数必须恰为 2010，stats={stats}"
     );
     assert_eq!(stats["stored_rows"].as_u64().unwrap(), 2010);
+    // P1-1：诊断契约锁形——新增计数键必须存在（本测试无 ingress，
+    // ingress_* 为 0；聚合正确性由单测 ingress_cancel_drains_backlog 断言）。
+    for key in [
+        "ingress_batches_total",
+        "ingress_persisted_events_total",
+        "ingress_batch_duplicates_total",
+        "ingress_event_duplicates_total",
+        "ingress_gaps_total",
+        "ingress_regressions_total",
+        "ingress_collisions_total",
+        "ingress_invalid_total",
+        "ingress_store_failures_total",
+        "retention_purged_total",
+        "live_clients",
+    ] {
+        assert!(
+            stats.get(key).and_then(|v| v.as_u64()).is_some(),
+            "stats 缺键 {key}：{stats}"
+        );
+    }
     let _ = std::fs::remove_file(&db);
 }

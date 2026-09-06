@@ -14,10 +14,11 @@
 //! reconnect/backoff（had_running_session=true）。**只杀本 endpoint attempt，
 //! 不碰其他 endpoint，更不 shutdown 整个 Mesa。**
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mesa_core_types::{EventSequenceTracker, SequenceVerdict, now_unix_ns};
-use mesa_event_store::{CommitRequest, EventServices};
+use mesa_event_store::{CommitRequest, EventDiagnostics, EventServices};
 use tokio_util::sync::CancellationToken;
 
 use crate::session::EventReceiver;
@@ -67,21 +68,42 @@ impl IngressFatal {
     }
 }
 
-/// Ingress 运行统计。调用方持有 [`SharedIngressStats`] 并在运行期读取
-/// （step ⑧ 聚合进 Endpoint diagnostics）；本函数只写不读。
-#[derive(Debug, Default)]
-pub struct IngressStats {
-    pub batches: u64,
-    pub persisted_events: u64,
-    /// batch 层整批跳过（tracker Duplicate，不开 txn）。
-    pub batch_duplicates: u64,
-    /// event 层逐条去重（UNIQUE 同 payload，txn 内）。
-    pub event_duplicates: u64,
-    pub gaps: u64,
+/// teardown drain 结论（P0-3）：`shutdown_ingress` 的显式结果，禁止吞错。
+/// Stop 必须等待 teardown 真正完成；drain 失败是显式错误，不是 `true`。
+#[derive(Debug)]
+pub enum EventDrainError {
+    /// drain 中精确失败（collision/unavailable/regression/stream-closed 等）：
+    /// code 透出原精确码，调用方禁止 contains 回猜。
+    Fatal(IngressFatal),
+    /// drain 5s 未退出（abort 兜底已执行）：backlog 可能未 COMMIT，
+    /// 既无 DB 行也无 Hub 行，SSE reconcile 救不了——必须显式报错。
+    Timeout,
+    /// drain 任务 panic/join 失败：同 Timeout 处理（未完成即失败）。
+    Join(String),
 }
 
-/// 共享统计句柄（attempt 内创建，step ⑧ 接入快照/REST）。
-pub type SharedIngressStats = Arc<Mutex<IngressStats>>;
+impl EventDrainError {
+    /// wire/REST/日志用精确原因码。
+    pub fn code(&self) -> &'static str {
+        match self {
+            EventDrainError::Fatal(f) => f.code(),
+            EventDrainError::Timeout => "EVENT_DRAIN_TIMEOUT",
+            EventDrainError::Join(_) => "EVENT_DRAIN_FAILED",
+        }
+    }
+}
+
+impl std::fmt::Display for EventDrainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventDrainError::Fatal(e) => write!(f, "{}: {e}", e.code()),
+            EventDrainError::Timeout => {
+                write!(f, "EVENT_DRAIN_TIMEOUT: ingress did not finish drain in 5s")
+            }
+            EventDrainError::Join(e) => write!(f, "EVENT_DRAIN_FAILED: {e}"),
+        }
+    }
+}
 
 /// 运行 ingress 直到流关闭、fatal 或优雅取消。`endpoint_id` 即去重作用域
 /// 与存储分区。
@@ -92,14 +114,15 @@ pub type SharedIngressStats = Arc<Mutex<IngressStats>>;
 /// 遗弃）。barrier（reader 已结束）保证 drain 期间无新到达——drain 必终止；
 /// 无 barrier 时见空即停（仍严格优于直接返回）。
 /// abort 只作为超时兜底（见 `attempt_session`）。
+/// P1-1：运行质量计数直写 `services.diagnostics`（全局、live），不再经
+/// per-attempt 本地统计中转（黑洞已除；attempt 结束后计数保留在全局）。
 pub async fn run_event_ingress(
     mut rx: EventReceiver,
     endpoint_id: String,
     services: Arc<EventServices>,
-    stats: SharedIngressStats,
     shutdown: CancellationToken,
 ) -> Result<(), IngressFatal> {
-    let mut proc = BatchProcessor::new(endpoint_id, services, stats);
+    let mut proc = BatchProcessor::new(endpoint_id, services);
     loop {
         let batch = tokio::select! {
             b = rx.recv() => b.ok_or(IngressFatal::StreamClosed)?,
@@ -119,7 +142,6 @@ pub async fn run_event_ingress(
 struct BatchProcessor {
     endpoint_id: String,
     services: Arc<EventServices>,
-    stats: SharedIngressStats,
     tracker: EventSequenceTracker,
     // 已见最大序号（epoch, seq）：tracker 不暴露内部 max，本地维护，
     // 用于 Regression fatal 的精确上下文（之前最大是多少）。
@@ -127,18 +149,23 @@ struct BatchProcessor {
 }
 
 impl BatchProcessor {
-    fn new(endpoint_id: String, services: Arc<EventServices>, stats: SharedIngressStats) -> Self {
+    fn new(endpoint_id: String, services: Arc<EventServices>) -> Self {
         Self {
             endpoint_id,
             services,
-            stats,
             tracker: EventSequenceTracker::new(),
             max_seen: None,
         }
     }
 
+    /// 诊断计数（P1-1）：Relaxed 原子，直写全局 diagnostics，
+    /// live 可观测（`GET /events/stats` 暴露）。
+    fn diag(&self, n: u64, field: fn(&EventDiagnostics) -> &AtomicU64) {
+        field(&self.services.diagnostics).fetch_add(n, Ordering::Relaxed);
+    }
+
     async fn process(&mut self, batch: mesa_core_types::EventBatch) -> Result<(), IngressFatal> {
-        self.stats.lock().unwrap().batches += 1;
+        self.diag(1, |d| &d.ingress_batches_total);
         let (handle, epoch, seq) = (batch.connection_handle, batch.stream_epoch, batch.sequence);
         // Sequence Gate（PR5 冻结语义，PR7 第一次执法）
         match self.tracker.check(epoch, seq) {
@@ -147,7 +174,7 @@ impl BatchProcessor {
             }
             SequenceVerdict::Gap { expected, got } => {
                 // 缺口可观测：入库 + 计数，不假装没发生
-                self.stats.lock().unwrap().gaps += 1;
+                self.diag(1, |d| &d.ingress_gaps_total);
                 self.max_seen = Some((epoch, got));
                 tracing::warn!(
                     endpoint = %self.endpoint_id,
@@ -158,7 +185,7 @@ impl BatchProcessor {
             SequenceVerdict::Duplicate => {
                 // 整批跳过：不开 DB txn（同 seq 即同内容是 wire invariant，
                 // 无需第二套 payload hash）。
-                self.stats.lock().unwrap().batch_duplicates += 1;
+                self.diag(1, |d| &d.ingress_batch_duplicates_total);
                 tracing::debug!(
                     endpoint = %self.endpoint_id,
                     seq,
@@ -172,6 +199,7 @@ impl BatchProcessor {
                     .filter(|(e, _)| *e == epoch)
                     .map(|(_, s)| s)
                     .unwrap_or(0);
+                self.diag(1, |d| &d.ingress_regressions_total);
                 return Err(IngressFatal::SequenceRegression {
                     handle,
                     epoch,
@@ -193,8 +221,10 @@ impl BatchProcessor {
             .await;
         match res {
             Ok(outcome) => {
-                self.stats.lock().unwrap().persisted_events += outcome.inserted.len() as u64;
-                self.stats.lock().unwrap().event_duplicates += outcome.duplicates;
+                self.diag(outcome.inserted.len() as u64, |d| {
+                    &d.ingress_persisted_events_total
+                });
+                self.diag(outcome.duplicates, |d| &d.ingress_event_duplicates_total);
                 // 先 COMMIT，后发布：Hub 只见已落盘行（重放旧行不再发布）
                 for ev in &outcome.inserted {
                     self.services.hub.publish(ev);
@@ -204,20 +234,31 @@ impl BatchProcessor {
             Err(mesa_event_store::EventStoreError::IdCollision {
                 endpoint_id,
                 event_id,
-            }) => Err(IngressFatal::IdCollision {
-                endpoint_id,
-                event_id,
-            }),
-            Err(mesa_event_store::EventStoreError::InvalidRecord(detail)) => Err(
-                IngressFatal::InvalidBatch(format!("handle {handle}: {detail}")),
-            ),
+            }) => {
+                self.diag(1, |d| &d.ingress_collisions_total);
+                Err(IngressFatal::IdCollision {
+                    endpoint_id,
+                    event_id,
+                })
+            }
+            Err(mesa_event_store::EventStoreError::InvalidRecord(detail)) => {
+                self.diag(1, |d| &d.ingress_invalid_total);
+                Err(IngressFatal::InvalidBatch(format!(
+                    "handle {handle}: {detail}"
+                )))
+            }
             Err(mesa_event_store::EventStoreError::Unavailable(detail)) => {
+                self.diag(1, |d| &d.ingress_store_failures_total);
                 Err(IngressFatal::StoreUnavailable(detail))
             }
             Err(mesa_event_store::EventStoreError::Fatal(e)) => {
+                self.diag(1, |d| &d.ingress_store_failures_total);
                 Err(IngressFatal::StoreUnavailable(format!("sqlite: {e}")))
             }
-            Err(mesa_event_store::EventStoreError::Encode(e)) => Err(IngressFatal::InvalidBatch(e)),
+            Err(mesa_event_store::EventStoreError::Encode(e)) => {
+                self.diag(1, |d| &d.ingress_invalid_total);
+                Err(IngressFatal::InvalidBatch(e))
+            }
         }
     }
 }

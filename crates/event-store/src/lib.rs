@@ -475,11 +475,27 @@ impl Drop for EventStore {
     }
 }
 
-/// 事件面诊断计数（⑧c，v1.1 §21 的 SSE 侧）：
+/// 事件面诊断计数（⑧c SSE 侧 + P1-1 ingress/retention 侧）：
 ///
+/// SSE 侧：
 /// - `lagged_total`：Hub `Lagged` 事故次数（慢消费者被迫回 DB 补齐）。
 /// - `replay_frames_total`：DB replay 发出的帧总数（含初始 replay 与一切追赶）。
 /// - `reconcile_total`：15s reconcile 对账执行次数。
+///
+/// Ingress 侧（P1-1：`sequence_gap` 这类"允许继续但必须可观测"的情况
+/// 在此计数，不再只有一条日志；fatal 类在返回前计数）：
+/// - `ingress_batches_total`：收到的 batch 总数。
+/// - `ingress_persisted_events_total`：实际入库 event 总数。
+/// - `ingress_batch_duplicates_total`：tracker 层整批跳过（不开 txn）。
+/// - `ingress_event_duplicates_total`：UNIQUE 层逐条去重（txn 内）。
+/// - `ingress_gaps_total`：sequence 缺口（入库+计数，继续跑）。
+/// - `ingress_regressions_total`：sequence 回退 fatal。
+/// - `ingress_collisions_total`：同 id 异 payload fatal。
+/// - `ingress_invalid_total`：坏记录 fatal（含编码失败）。
+/// - `ingress_store_failures_total`：store 不可用 fatal。
+///
+/// Retention 侧：`retention_purged_total` 为 sweeper 累计删除行数。
+/// `live_clients` 不计数（读 `hub.receiver_count()` 实时值）。
 ///
 /// 全 `Relaxed`（纯观测，顺序无关；`GET /events/stats` 暴露）。
 #[derive(Debug, Default)]
@@ -487,6 +503,16 @@ pub struct EventDiagnostics {
     pub lagged_total: std::sync::atomic::AtomicU64,
     pub replay_frames_total: std::sync::atomic::AtomicU64,
     pub reconcile_total: std::sync::atomic::AtomicU64,
+    pub ingress_batches_total: std::sync::atomic::AtomicU64,
+    pub ingress_persisted_events_total: std::sync::atomic::AtomicU64,
+    pub ingress_batch_duplicates_total: std::sync::atomic::AtomicU64,
+    pub ingress_event_duplicates_total: std::sync::atomic::AtomicU64,
+    pub ingress_gaps_total: std::sync::atomic::AtomicU64,
+    pub ingress_regressions_total: std::sync::atomic::AtomicU64,
+    pub ingress_collisions_total: std::sync::atomic::AtomicU64,
+    pub ingress_invalid_total: std::sync::atomic::AtomicU64,
+    pub ingress_store_failures_total: std::sync::atomic::AtomicU64,
+    pub retention_purged_total: std::sync::atomic::AtomicU64,
 }
 
 /// 事件面服务束（v1.1 §20）：store + hub + 诊断打包，避免 AppState/Manager

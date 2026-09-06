@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::{EventStore, query};
+use crate::{EventDiagnostics, EventStore, query};
 
 /// Retention 配置（v1.1 §17 冻结默认）。
 #[derive(Debug, Clone)]
@@ -39,8 +39,11 @@ impl Default for RetentionConfig {
 }
 
 /// Retention 主循环（mesad spawn，`shutdown` 触发即退）。
+/// P1-1：每次 sweep 的删除数累积进 `diagnostics.retention_purged_total`
+///（`GET /events/stats` 可见）。
 pub async fn run_retention_loop(
     store: Arc<EventStore>,
+    diagnostics: Arc<EventDiagnostics>,
     config: RetentionConfig,
     shutdown: CancellationToken,
 ) {
@@ -55,10 +58,17 @@ pub async fn run_retention_loop(
             _ = shutdown.cancelled() => break,
             _ = tokio::time::sleep(Duration::from_secs(config.interval_secs)) => {}
         }
-        if let Err(e) = sweep_once(&store, &config).await {
-            // maintenance 失败不升级：下次 tick 重试（fail-open 只影响磁盘占用，
-            // 不影响写入可用性；磁盘打满由部署层监控告警）。
-            tracing::warn!("event retention sweep failed: {e}");
+        match sweep_once(&store, &config).await {
+            Ok(n) => {
+                diagnostics
+                    .retention_purged_total
+                    .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => {
+                // maintenance 失败不升级：下次 tick 重试（fail-open 只影响磁盘占用，
+                // 不影响写入可用性；磁盘打满由部署层监控告警）。
+                tracing::warn!("event retention sweep failed: {e}");
+            }
         }
     }
     tracing::info!("event retention sweeper stopped");
