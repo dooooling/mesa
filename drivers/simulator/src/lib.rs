@@ -34,16 +34,17 @@ use std::time::Duration;
 
 use mesa_core_types::{
     AcquisitionTask, ConditionTransition, DataBatch, DataType, DriverMetadata, DuplicatePointKey,
-    ErrorKind, EventCondition, EventRecord, EventTask, GENERIC_BINDING_KIND, GenericBinding,
-    PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, ensure_unique_point_keys,
-    now_unix_ns,
+    ErrorKind, EventCondition, EventRecord, EventTask, GENERIC_BINDING_KIND,
+    GENERIC_EVENT_BINDING_KIND, GenericBinding, GenericEventBinding, PointDescriptor, PointMap,
+    PointValue, Quality, TaskMode, Value, ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, EventSink, SdkDriverError};
 use tokio_util::sync::CancellationToken;
 
 pub const BINDING_KIND: &str = "simulator.points";
-/// 事件任务 binding kind：config 形如 `{ "stream": "sim.events.counter" }`，
+/// 事件任务 binding kind（PR7 legacy，继续接受）：config 形如 `{ "stream": "sim.events.counter" }`，
 /// stream 取值见 [`SIM_EVENT_STREAM_COUNTER`] / [`SIM_EVENT_STREAM_ALARM`]。
+/// 新标准为 `mesa.events.v1`（[`GENERIC_EVENT_BINDING_KIND`]）；Web 只生成新标准。
 /// 语义完全由本驱动解释（Core 不懂协议）。
 pub const EVENT_BINDING_KIND: &str = "simulator.events";
 /// 计数器事件流：周期性瞬时事件（`counter.tick`），无 condition。
@@ -763,11 +764,58 @@ impl DriverConnection for SimConnection {
                     format!("event task `{task}`: Poll 模式必须提供正整数 interval_ms"),
                 ),
             })?;
+            if task.binding.kind == GENERIC_EVENT_BINDING_KIND {
+                // PR8 标准路径：`mesa.events.v1 { stream_id, parameters }`。
+                // Core 不解释语义；本驱动 lookup stream_id 并校验 parameters。
+                let binding =
+                    GenericEventBinding::from_json(&task.binding.config).map_err(|e| {
+                        SdkDriverError::configuration(
+                            "INVALID_EVENT_BINDING_CONFIG",
+                            format!(
+                                "event task `{}`: invalid generic event binding: {e}",
+                                task.id
+                            ),
+                        )
+                    })?;
+                if binding.stream_id.trim().is_empty() {
+                    return Err(SdkDriverError::configuration(
+                        "INVALID_EVENT_BINDING_CONFIG",
+                        format!("event task `{}`: missing string `stream_id`", task.id),
+                    ));
+                }
+                // Simulator 当前流均无 parameters：只接受对象/空，拒绝数组等形态，
+                // 避免未来参数被静默吞掉；有字段的流在 PR9 风格扩展时再按 Schema 校验。
+                if !binding.parameters.is_object() && !binding.parameters.is_null() {
+                    return Err(SdkDriverError::configuration(
+                        "INVALID_EVENT_BINDING_CONFIG",
+                        format!("event task `{}`: `parameters` 需为对象", task.id),
+                    ));
+                }
+                let stream = SimEventStream::parse(&binding.stream_id).ok_or_else(|| {
+                    SdkDriverError::configuration(
+                        "UNKNOWN_EVENT_STREAM",
+                        format!(
+                            "event task `{}`: unknown stream `{}`",
+                            task.id, binding.stream_id
+                        ),
+                    )
+                })?;
+                let interval_ms = match task.mode {
+                    TaskMode::Poll => task.interval_ms.expect("validated above"),
+                    TaskMode::Subscribe => task.interval_ms.unwrap_or(100).max(1),
+                };
+                new_tasks.push(SimEventTask {
+                    id: task.id.clone(),
+                    stream,
+                    interval_ms,
+                });
+                continue;
+            }
             if task.binding.kind != EVENT_BINDING_KIND {
                 return Err(SdkDriverError::configuration(
                     "UNSUPPORTED_EVENT_BINDING",
                     format!(
-                        "event task `{}`: binding kind `{}` unsupported, expected `{EVENT_BINDING_KIND}`",
+                        "event task `{}`: binding kind `{}` unsupported, expected `{GENERIC_EVENT_BINDING_KIND}` or `{EVENT_BINDING_KIND}`",
                         task.id, task.binding.kind
                     ),
                 ));
@@ -1347,5 +1395,97 @@ mod tests {
             .collect();
         assert_eq!(vals[0], (11, Value::F64(7.0)));
         assert_eq!(vals[1], (22, Value::Bool(true)));
+    }
+
+    fn generic_event_task(
+        id: &str,
+        mode: TaskMode,
+        interval_ms: Option<u64>,
+        stream_id: &str,
+    ) -> EventTask {
+        EventTask {
+            id: id.into(),
+            mode,
+            interval_ms,
+            binding: DriverBinding {
+                kind: GENERIC_EVENT_BINDING_KIND.into(),
+                config: serde_json::json!({"stream_id": stream_id, "parameters": {}}),
+            },
+        }
+    }
+
+    fn legacy_event_task(id: &str, stream: &str) -> EventTask {
+        EventTask {
+            id: id.into(),
+            mode: TaskMode::Subscribe,
+            interval_ms: None,
+            binding: DriverBinding {
+                kind: EVENT_BINDING_KIND.into(),
+                config: serde_json::json!({"stream": stream}),
+            },
+        }
+    }
+
+    /// PR8 P0：新标准 `mesa.events.v1` 被接受（Subscribe 缺省节奏 / Poll 自带周期）。
+    #[tokio::test]
+    async fn simulator_accepts_mesa_events_v1() {
+        let mut conn = SimConnection::default();
+        conn.configure_events(
+            1,
+            vec![
+                generic_event_task("e-sub", TaskMode::Subscribe, None, SIM_EVENT_STREAM_ALARM),
+                generic_event_task(
+                    "e-poll",
+                    TaskMode::Poll,
+                    Some(100),
+                    SIM_EVENT_STREAM_COUNTER,
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(conn.event_plan.as_ref().unwrap().tasks.len(), 2);
+    }
+
+    /// PR7 legacy `simulator.events` 继续可用（旧开发数据库无需 migration）。
+    #[tokio::test]
+    async fn simulator_legacy_binding_still_accepted() {
+        let mut conn = SimConnection::default();
+        conn.configure_events(
+            1,
+            vec![legacy_event_task("e-old", SIM_EVENT_STREAM_COUNTER)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(conn.event_plan.as_ref().unwrap().tasks.len(), 1);
+    }
+
+    /// 未知流精确报错（新旧两种信封形态一致）。
+    #[tokio::test]
+    async fn unknown_event_stream_rejected() {
+        let mut conn = SimConnection::default();
+        let err = conn
+            .configure_events(
+                1,
+                vec![generic_event_task(
+                    "e",
+                    TaskMode::Subscribe,
+                    None,
+                    "no.such.stream",
+                )],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "UNKNOWN_EVENT_STREAM");
+        let err = conn
+            .configure_events(1, vec![legacy_event_task("e", "no.such.stream")])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "UNKNOWN_EVENT_STREAM");
+        // 非法 kind 精确报错（提示两种合法取值）
+        let mut bad = generic_event_task("e", TaskMode::Subscribe, None, SIM_EVENT_STREAM_COUNTER);
+        bad.binding.kind = "other.events".into();
+        let err = conn.configure_events(1, vec![bad]).await.unwrap_err();
+        assert_eq!(err.code, "UNSUPPORTED_EVENT_BINDING");
     }
 }

@@ -14,6 +14,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use mesa_core_types::{DriverBinding, EventBatch, EventRecord, EventTask, TaskMode, Value};
+use mesa_core_types::{GENERIC_EVENT_BINDING_KIND, GenericEventBinding};
 use mesa_driver_manager::MesaManager;
 use mesa_driver_manager::endpoint::BuiltinEndpoint;
 use mesa_driver_simulator::{EVENT_BINDING_KIND, SIM_EVENT_STREAM_ALARM, SIM_EVENT_STREAM_COUNTER};
@@ -42,6 +43,24 @@ fn alarm_task() -> EventTask {
         binding: DriverBinding {
             kind: EVENT_BINDING_KIND.into(),
             config: serde_json::json!({"stream": SIM_EVENT_STREAM_ALARM}),
+        },
+    }
+}
+
+/// PR8 P1-5：与 `alarm_task` 同语义的标准 `mesa.events.v1` 形态。
+/// 生产路径 Gate 必须走 generic 信封（legacy 兼容由 Simulator 单测保住）。
+fn generic_alarm_task() -> EventTask {
+    let binding = GenericEventBinding {
+        stream_id: SIM_EVENT_STREAM_ALARM.into(),
+        parameters: serde_json::json!({}),
+    };
+    EventTask {
+        id: "al".into(),
+        mode: TaskMode::Subscribe,
+        interval_ms: None,
+        binding: DriverBinding {
+            kind: GENERIC_EVENT_BINDING_KIND.into(),
+            config: serde_json::to_value(&binding).unwrap(),
         },
     }
 }
@@ -86,7 +105,7 @@ async fn production_path_alarm_cycle_persists_before_visible() {
             50,
             serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
         )],
-        event_tasks: vec![alarm_task()],
+        event_tasks: vec![generic_alarm_task()],
     })
     .unwrap();
 

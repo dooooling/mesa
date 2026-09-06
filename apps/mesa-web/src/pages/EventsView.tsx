@@ -1,0 +1,254 @@
+// PR8 EventsView：事件记录（历史 + SSE 无窗口合并）与订阅配置。
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Alert, Button, Card, Space, Tabs, Tag } from "antd";
+import { api, isEventStoreUnavailable } from "../api";
+import type { EventStats, StoredEvent } from "../types";
+import { EMPTY_EVENT_FILTER_FORM, EVENT_FIRST_PAGE_LIMIT, toEventFilter, type EventFilterForm } from "../events/filters";
+import { mergeEvents } from "../events/model";
+import { useEventStream } from "../events/useEventStream";
+import { EventFilters } from "../components/EventFilters";
+import { EventTable } from "../components/EventTable";
+import { EventDetailDrawer } from "../components/EventDetailDrawer";
+import { EventDiagnostics } from "../components/EventDiagnostics";
+import { EventTaskEditor } from "../components/EventTaskEditor";
+
+/** SSE 实时事件的客户端过滤（服务端 live 无过滤参数；语义与后端 SQL 对齐：精确匹配 + active NULL 不参与）。 */
+export function matchesLiveFilter(ev: StoredEvent, form: EventFilterForm): boolean {
+  if (form.endpoint_id && form.endpoint_id.trim() !== "" && ev.endpoint_id !== form.endpoint_id.trim()) return false;
+  if (form.category && form.category.trim() !== "" && ev.event.category !== form.category.trim()) return false;
+  if (form.kind && form.kind.trim() !== "" && ev.event.kind !== form.kind.trim()) return false;
+  if (form.code && form.code.trim() !== "" && (ev.event.code ?? "") !== form.code.trim()) return false;
+  if (form.condition_id && form.condition_id.trim() !== "" && (ev.event.condition?.condition_id ?? "") !== form.condition_id.trim()) return false;
+  if (typeof form.severity_min === "number" && ev.event.severity < form.severity_min) return false;
+  if (form.active === "active" && ev.event.condition?.active !== true) return false;
+  if (form.active === "inactive" && ev.event.condition?.active !== false) return false;
+  if (typeof form.from_ns === "number" && ev.received_at_ns < form.from_ns) return false;
+  if (typeof form.to_ns === "number" && ev.received_at_ns > form.to_ns) return false;
+  return true;
+}
+
+export function EventsView() {
+  const [form, setForm] = useState<EventFilterForm>(EMPTY_EVENT_FILTER_FORM);
+  const [endpoints, setEndpoints] = useState<string[]>([]);
+  const [history, setHistory] = useState<StoredEvent[]>([]);
+  const [nextCursor, setNextCursor] = useState<number | null>(null);
+  const [highWater, setHighWater] = useState<number>(0);
+  const [booted, setBooted] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [unavailable, setUnavailable] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [liveOn, setLiveOn] = useState(true);
+  const [selected, setSelected] = useState<StoredEvent | null>(null);
+  const [stats, setStats] = useState<EventStats | null>(null);
+  // 所有历史请求（首屏/过滤 reload/加载更早）共用一个代际：旧代际结果绝不能覆盖/污染新状态。
+  const histGen = useRef(0);
+  // reload 在途期间到达的 live 行：首屏替换完成时合入，避免被覆盖。
+  const pendingLiveRef = useRef<StoredEvent[]>([]);
+  const formRef = useRef(form);
+  formRef.current = form;
+
+  /** 取出在途 live 行（按新 filter 重过一遍），并清空暂存。 */
+  const drainPendingLive = (next: EventFilterForm): StoredEvent[] => {
+    const live = pendingLiveRef.current.filter((ev) => matchesLiveFilter(ev, next));
+    pendingLiveRef.current = [];
+    return live;
+  };
+
+  // Endpoint 下拉（事件页独立加载，失败不阻塞事件主体）
+  useEffect(() => {
+    api
+      .listEndpoints()
+      .then((j) => {
+        const eps = (j.endpoints ?? []) as { id: string }[];
+        setEndpoints(eps.map((e) => e.id));
+      })
+      .catch(() => {});
+  }, []);
+
+  // P0-1 冻结顺序：H → 历史页完成 → 最后 setHighWater + setBooted（SSE 在历史完成后才建连）。
+  // 空库 H = 0（seq 自 1 起），SSE 永远 ?after_seq=H，杜绝 live-only 漏事件窗口。
+  useEffect(() => {
+    const id = ++histGen.current;
+    setLoading(true);
+    setError(null);
+    (async () => {
+      try {
+        const h = await api.eventHead();
+        const page = await api.listEvents(toEventFilter(formRef.current, { limit: EVENT_FIRST_PAGE_LIMIT }));
+        if (histGen.current !== id) return;
+        const live = drainPendingLive(formRef.current);
+        setHistory(mergeEvents([...page.events].sort((a, b) => b.seq - a.seq), live));
+        setNextCursor(page.next_cursor);
+        setHighWater(h);
+        setLoading(false);
+        setBooted(true);
+      } catch (e) {
+        if (histGen.current !== id) return;
+        if (isEventStoreUnavailable(e)) setUnavailable(true);
+        else setError(e instanceof Error ? e.message : String(e));
+        setLoading(false);
+        setBooted(true);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const reloadHistory = useCallback((next: EventFilterForm) => {
+    const id = ++histGen.current;
+    setLoading(true);
+    setError(null);
+    setNextCursor(null);
+    api
+      .listEvents(toEventFilter(next, { limit: EVENT_FIRST_PAGE_LIMIT }))
+      .then((res) => {
+        if (histGen.current !== id) return;
+        const live = drainPendingLive(next);
+        setHistory(mergeEvents([...res.events].sort((a, b) => b.seq - a.seq), live));
+        setNextCursor(res.next_cursor);
+        setLoading(false);
+      })
+      .catch((e) => {
+        if (histGen.current !== id) return;
+        if (isEventStoreUnavailable(e)) setUnavailable(true);
+        else setError(e instanceof Error ? e.message : String(e));
+        setLoading(false);
+      });
+  }, []);
+
+  const onFilterChange = useCallback(
+    (next: EventFilterForm) => {
+      setForm(next);
+      reloadHistory(next);
+    },
+    [reloadHistory],
+  );
+
+  const loadOlder = useCallback(() => {
+    if (nextCursor === null || nextCursor === undefined || loadingMore) return;
+    // additive 请求不推进代际；但若其间发生过 reload/filter（代际或 filter 对象已变）则丢弃，
+    // 旧 filter 的 older 行绝不混进新页面。
+    const id = histGen.current;
+    const snapshot = formRef.current;
+    setLoadingMore(true);
+    api
+      .listEvents(toEventFilter(snapshot, { before_seq: nextCursor, limit: EVENT_FIRST_PAGE_LIMIT }))
+      .then((res) => {
+        if (id !== histGen.current || formRef.current !== snapshot) {
+          setLoadingMore(false);
+          return;
+        }
+        setHistory((cur) => mergeEvents(cur, res.events));
+        setNextCursor(res.next_cursor);
+        setLoadingMore(false);
+      })
+      .catch((e) => {
+        // stale 失败同样丢弃：旧 filter 的错误绝不显示在新页面，也不碰 loadingMore 之外的状态
+        if (id !== histGen.current || formRef.current !== snapshot) {
+          setLoadingMore(false);
+          return;
+        }
+        if (isEventStoreUnavailable(e)) setUnavailable(true);
+        else setError(e instanceof Error ? e.message : String(e));
+        setLoadingMore(false);
+      });
+  }, [nextCursor, loadingMore]);
+
+  const onLive = useCallback((ev: StoredEvent) => {
+    if (!matchesLiveFilter(ev, formRef.current)) return;
+    pendingLiveRef.current.push(ev);
+    if (pendingLiveRef.current.length > 1000) {
+      pendingLiveRef.current.splice(0, pendingLiveRef.current.length - 1000);
+    }
+    setHistory((cur) => mergeEvents(cur, [ev]));
+  }, []);
+
+  // 诊断轮询（15s；失败静默，页面主体不受影响）
+  useEffect(() => {
+    let stop = false;
+    const tick = () => {
+      api
+        .eventStats()
+        .then((s) => {
+          if (!stop) setStats(s);
+        })
+        .catch(() => {});
+    };
+    tick();
+    const id = window.setInterval(tick, 15000);
+    return () => {
+      stop = true;
+      window.clearInterval(id);
+    };
+  }, []);
+
+  const stream = useEventStream({ afterSeq: highWater, enabled: booted && liveOn && !unavailable, onEvent: onLive });
+
+  const statusTag = useMemo(() => {
+    if (!liveOn) return <Tag>PAUSED</Tag>;
+    if (stream.status === "live") return <Tag color="green">LIVE ●</Tag>;
+    if (stream.status === "reconnecting") return <Tag color="orange">RECONNECTING</Tag>;
+    if (stream.status === "connecting") return <Tag color="blue">CONNECTING</Tag>;
+    return <Tag>{stream.status.toUpperCase()}</Tag>;
+  }, [liveOn, stream.status]);
+
+  return (
+    <div style={{ display: "grid", gap: 12 }}>
+      <Card
+        size="small"
+        title={
+          <Space>
+            <span>事件</span>
+            {statusTag}
+          </Space>
+        }
+        extra={
+          <Space>
+            <Button size="small" onClick={() => setLiveOn((v) => !v)}>
+              {liveOn ? "暂停实时" : "恢复实时"}
+            </Button>
+          </Space>
+        }
+      >
+        {unavailable ? (
+          <Alert type="error" showIcon message="Event service unavailable" description="EventStore 当前不可用；设备、监控、Data Plane 页面继续正常。事件任务可读取配置，但 Event-enabled Endpoint 无法启动。" />
+        ) : null}
+        {error ? <Alert type="error" showIcon message="加载失败" description={error} style={{ marginTop: unavailable ? 8 : 0 }} /> : null}
+        <div style={{ marginTop: 8 }}>
+          <EventDiagnostics stats={stats} />
+        </div>
+        <Tabs
+          defaultActiveKey="records"
+          items={[
+            {
+              key: "records",
+              label: "事件记录",
+              children: (
+                <div style={{ display: "grid", gap: 12 }}>
+                  <EventFilters
+                    value={form}
+                    endpoints={endpoints}
+                    onChange={onFilterChange}
+                    onReset={() => onFilterChange(EMPTY_EVENT_FILTER_FORM)}
+                  />
+                  <EventTable events={history} loading={loading} onSelect={setSelected} />
+                  <div style={{ display: "flex", justifyContent: "center" }}>
+                    <Button onClick={loadOlder} loading={loadingMore} disabled={nextCursor === null || nextCursor === undefined}>
+                      {nextCursor === null || nextCursor === undefined ? "没有更多" : "加载更早"}
+                    </Button>
+                  </div>
+                </div>
+              ),
+            },
+            {
+              key: "tasks",
+              label: "订阅配置",
+              children: <EventTaskEditor />,
+            },
+          ]}
+        />
+      </Card>
+      <EventDetailDrawer event={selected} onClose={() => setSelected(null)} />
+    </div>
+  );
+}

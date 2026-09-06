@@ -72,7 +72,117 @@ export interface DriverDescriptor {
   resources: ResourceDescriptor[];
   controls: { commands: unknown[] };
   discovery: { manual: boolean; browse: boolean; import: boolean };
-  capabilities: { poll: boolean; subscribe: boolean; browse: boolean; write: boolean; method: boolean };
+  capabilities: { poll: boolean; subscribe: boolean; browse: boolean; write: boolean; method: boolean; events?: boolean };
+  // Event Plane V1 §5：老 Driver 可能缺省该字段，Web 按空目录处理（与 Rust serde(default) 对齐）
+  events?: EventCatalog;
+}
+
+// PR8 通用事件契约（与 core-types/src/event.rs 镜像，不含协议语义）
+export type TaskMode = "poll" | "subscribe";
+
+export interface EventFieldDescriptor {
+  key: string;
+  label: LocalizedText;
+  data_type?: string;
+}
+
+export interface EventStreamDescriptor {
+  id: string;
+  label: LocalizedText;
+  modes: TaskMode[];
+  parameters: SchemaDescriptor;
+  fields: EventFieldDescriptor[];
+}
+
+export interface EventCatalog {
+  streams: EventStreamDescriptor[];
+}
+
+export interface DriverBinding {
+  kind: string;
+  config: unknown;
+}
+
+export interface EventTask {
+  id: string;
+  mode: TaskMode;
+  interval_ms?: number | null;
+  binding: DriverBinding;
+}
+
+export type ConditionTransition = "raised" | "updated" | "acknowledged" | "confirmed" | "cleared";
+
+export interface StoredEventCondition {
+  condition_id: string;
+  transition: ConditionTransition;
+  active?: boolean | null;
+  acknowledged?: boolean | null;
+  confirmed?: boolean | null;
+  retain?: boolean | null;
+}
+
+// PR7 GET /api/v1/events 响应行：StoredEvent → event 嵌套形态（core-api stored_event_json）
+export interface StoredEvent {
+  seq: number;
+  endpoint_id: string;
+  stream_epoch: number;
+  batch_sequence: number;
+  received_at_ns: number;
+  event: {
+    event_id: string;
+    category: string;
+    kind: string;
+    source: string;
+    severity: number;
+    code?: string | null;
+    message?: string | null;
+    message_locale?: string | null;
+    occurred_at_ns?: number | null;
+    published_at_ns: number;
+    connection_handle: number;
+    condition?: StoredEventCondition | null;
+    correlation_id?: string | null;
+    attributes: Record<string, unknown>;
+  };
+}
+
+export interface ListEventsResponse {
+  events: StoredEvent[];
+  next_cursor: number | null;
+}
+
+export interface EventFilter {
+  endpoint_id?: string;
+  category?: string;
+  kind?: string;
+  severity_min?: number;
+  code?: string;
+  condition_id?: string;
+  active?: boolean;
+  from_ns?: number;
+  to_ns?: number;
+  before_seq?: number;
+  after_seq?: number;
+  limit?: number;
+}
+
+export interface EventStats {
+  sse_lagged_total: number;
+  sse_replay_frames_total: number;
+  sse_reconcile_total: number;
+  ingress_batches_total: number;
+  ingress_persisted_events_total: number;
+  ingress_batch_duplicates_total: number;
+  ingress_event_duplicates_total: number;
+  ingress_gaps_total: number;
+  ingress_regressions_total: number;
+  ingress_collisions_total: number;
+  ingress_invalid_total: number;
+  ingress_store_failures_total: number;
+  retention_purged_total: number;
+  live_clients: number;
+  stored_rows: number;
+  stored_size_bytes: number;
 }
 
 export interface ValidationIssue {

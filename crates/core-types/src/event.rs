@@ -326,6 +326,20 @@ impl EventCatalog {
                 return Err(format!("event stream id 重复: {}", s.id));
             }
             s.parameters.validate()?;
+            // PR8 P0-3 安全边界：EventTask 参数明文持久化于 ConfigStore
+            //（`binding_config_json`），不允许 Secret 类型字段；连接认证
+            // Secret 只能走 `DriverDescriptor.connection` + SecretStore。
+            // 此处直接让 descriptor 校验失败，坏目录在入口即被拒绝。
+            if s.parameters
+                .fields
+                .iter()
+                .any(|f| f.field_type == crate::FieldType::Secret)
+            {
+                return Err(format!(
+                    "event stream {} parameters 不允许 Secret 类型字段",
+                    s.id
+                ));
+            }
             let mut fseen = HashSet::new();
             for f in &s.fields {
                 if f.key.trim().is_empty() {
@@ -345,6 +359,40 @@ impl EventCatalog {
             }
         }
         Ok(())
+    }
+}
+
+/// 通用事件绑定种别（PR8 P0 契约补洞，镜像 `mesa.resources.v1` 设计）。
+///
+/// 统一 Envelope，不统一协议语义：`stream_id` 指向
+/// `EventStreamDescriptor.id`，`parameters` 对应其 `parameters` Schema；
+/// Core 只做透传与持久化，Driver 负责 `lookup stream_id → validate
+/// parameters → 构建协议内计划`。
+pub const GENERIC_EVENT_BINDING_KIND: &str = "mesa.events.v1";
+
+/// 通用事件绑定 `mesa.events.v1` 的顶层形态：Web 只生成此种 EventTask。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GenericEventBinding {
+    pub stream_id: String,
+    /// 对应目标流 `parameters` Schema 的用户取值；字段缺省即 `{}`。
+    /// 为兼容手写旧配置，显式 `null` 在解析时同样归一为 `{}`（见 `from_json`），
+    /// 因此运行时只存在对象形态，未来使用者无二义性。
+    #[serde(default = "default_event_parameters")]
+    pub parameters: serde_json::Value,
+}
+
+/// `GenericEventBinding.parameters` 的缺省值：空对象（不是 Null）。
+fn default_event_parameters() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+impl GenericEventBinding {
+    pub fn from_json(v: &serde_json::Value) -> Result<Self, String> {
+        let mut b: Self = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
+        if b.parameters.is_null() {
+            b.parameters = default_event_parameters();
+        }
+        Ok(b)
     }
 }
 
@@ -526,5 +574,50 @@ mod tests {
         assert!(c.validate().is_ok());
         c.streams.push(c.streams[0].clone());
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn generic_event_binding_roundtrip() {
+        // PR8 P0：通用信封 `mesa.events.v1` 序列化往返；parameters 缺省为空。
+        let b = GenericEventBinding {
+            stream_id: "sim.events.alarm-cycle".into(),
+            parameters: serde_json::json!({}),
+        };
+        let s = serde_json::to_string(&b).unwrap();
+        let back = GenericEventBinding::from_json(&serde_json::from_str(&s).unwrap()).unwrap();
+        assert_eq!(back, b);
+        // 缺省 parameters 反序列化得到 {}（永不为 Null，见 P1-4）。
+        let raw = serde_json::json!({"stream_id": "sim.events.counter"});
+        let v: GenericEventBinding = serde_json::from_value(raw).unwrap();
+        assert_eq!(v.stream_id, "sim.events.counter");
+        assert_eq!(v.parameters, serde_json::json!({}));
+        // 显式 null 同样归一为 {}（手写旧配置兼容）。
+        let n = GenericEventBinding::from_json(
+            &serde_json::json!({"stream_id": "s", "parameters": null}),
+        )
+        .unwrap();
+        assert_eq!(n.parameters, serde_json::json!({}));
+        assert_eq!(GENERIC_EVENT_BINDING_KIND, "mesa.events.v1");
+    }
+
+    #[test]
+    fn catalog_rejects_secret_event_parameters() {
+        // PR8 P0-3：事件流 parameters 含 Secret 即 descriptor 非法。
+        let mut c = EventCatalog::default();
+        c.streams.push(EventStreamDescriptor {
+            id: "s".into(),
+            label: "S".into(),
+            modes: vec![TaskMode::Subscribe],
+            parameters: crate::schema::SchemaDescriptor {
+                fields: vec![
+                    crate::schema::FieldDescriptor::new("token", "Token", crate::FieldType::Secret)
+                        .required(true),
+                ],
+            },
+            fields: vec![],
+        });
+        assert!(c.validate().is_err());
+        c.streams[0].parameters.fields[0].field_type = crate::FieldType::String;
+        assert!(c.validate().is_ok());
     }
 }
