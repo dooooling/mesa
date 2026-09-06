@@ -22,11 +22,13 @@
 //! - SourceTimestamp 1601 ticks→Unix ns 精确保留，Quality GOOD/UNCERTAIN/BAD 按 StatusCode 映射，Array→Typed Array
 
 mod address;
+mod event;
 mod opcua_api;
 mod probe;
 mod transport_adapter;
 
 pub use address::{AddressError, Identifier, OpcUaAddress, parse_address};
+pub use event::{EventScope, OPCUA_EVENT_STREAM_ID, OpcUaEventPlanSnapshot, OpcUaEventTaskPlan};
 pub use mesa_opcua_transport::DEFAULT_OPCUA_PORT;
 pub use opcua_api::{FakeOpcUaApi, OpcUaApi};
 pub use transport_adapter::TransportApiAdapter;
@@ -183,10 +185,11 @@ impl Driver for OpcUaDriver {
                 poll: true,
                 subscribe: true,
                 browse: true,
+                events: true,
                 ..Default::default()
             },
-            // Event Plane PR5：老 Driver 无事件目录即 empty（Major 不升级）
-            events: Default::default(),
+            // PR9：声明唯一 subscribe-only 事件流 `opcua.events`（Stage ③）。
+            events: event::opcua_event_catalog(),
         }
     }
 
@@ -236,6 +239,7 @@ impl Driver for OpcUaDriver {
             api,
             transport,
             plan: None,
+            event_plan: None,
         }))
     }
 }
@@ -450,6 +454,9 @@ struct OpcUaConnection {
     /// 两处共享同一 Arc），绝不为探测另建第二会话。
     transport: Arc<dyn mesa_opcua_transport::OpcUaTransport>,
     plan: Option<PlanSnapshot>,
+    /// 事件计划快照（Stage ③）：`configure_events` 原子替换，供 run() 启动
+    /// Event workers；空表/None = 无事件订阅。
+    event_plan: Option<OpcUaEventPlanSnapshot>,
 }
 
 impl std::fmt::Debug for OpcUaConnection {
@@ -1068,6 +1075,22 @@ impl DriverConnection for OpcUaConnection {
         Ok(())
     }
 
+    /// 事件任务配置（PR9 Stage ③）：只接受 `mesa.events.v1` 标准 binding；
+    /// 全部解析成功才原子替换旧计划（Stage ⑤ run() 按快照起 Event workers）。
+    async fn configure_events(
+        &mut self,
+        revision: u64,
+        tasks: Vec<mesa_core_types::EventTask>,
+    ) -> Result<(), SdkDriverError> {
+        let plans = event::parse_event_tasks(&tasks)?;
+        tracing::info!(revision, tasks = plans.len(), "opcua event plan built");
+        self.event_plan = Some(OpcUaEventPlanSnapshot {
+            revision,
+            tasks: plans,
+        });
+        Ok(())
+    }
+
     async fn browse(
         &mut self,
         parent: &str,
@@ -1421,6 +1444,7 @@ mod tests {
             api: Arc::new(FakeOpcUaApi::new()),
             transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
             plan: None,
+            event_plan: None,
         };
         let nodes = serde_json::json!([
             {"key":"a","node_id":"ns=2;i=2","data_type":"U32"},
@@ -1447,6 +1471,7 @@ mod tests {
             api: Arc::new(FakeOpcUaApi::new()),
             transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
             plan: None,
+            event_plan: None,
         };
         let nodes = serde_json::json!([{"key":"a","node_id":"ns=2;x=1","data_type":"U32"}]);
         let err = conn
@@ -1463,6 +1488,7 @@ mod tests {
             api: Arc::new(FakeOpcUaApi::new()),
             transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
             plan: None,
+            event_plan: None,
         };
         let t = AcquisitionTask {
             id: "s1".into(),
@@ -1496,6 +1522,7 @@ mod tests {
             api: Arc::new(FakeOpcUaApi::new()),
             transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
             plan: None,
+            event_plan: None,
         };
         let nodes = serde_json::json!([{"key":"a","node_id":"ns=2;s=Counter","data_type":"U32"}]);
         let t = task_with_nodes(nodes);
