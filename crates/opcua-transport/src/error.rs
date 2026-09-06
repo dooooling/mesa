@@ -53,6 +53,10 @@ pub enum UaOperation {
     DeleteMonitoredItems,
     DeleteSubscription,
     Disconnect,
+    /// Event 订阅创建（与 Data 订阅平行，队列语义不同，日志/排障区分）。
+    CreateEventSubscription,
+    /// Event 监控项创建（含 EventFilter 编码与结果校验）。
+    CreateEventMonitoredItems,
 }
 
 impl UaOperation {
@@ -67,6 +71,8 @@ impl UaOperation {
             UaOperation::DeleteMonitoredItems => "DeleteMonitoredItems",
             UaOperation::DeleteSubscription => "DeleteSubscription",
             UaOperation::Disconnect => "Disconnect",
+            UaOperation::CreateEventSubscription => "CreateEventSubscription",
+            UaOperation::CreateEventMonitoredItems => "CreateEventMonitoredItems",
         }
     }
 }

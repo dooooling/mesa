@@ -297,6 +297,30 @@ impl OpcUaTransport for FakeOpcUaTransport {
         self.deleted_subs.lock().unwrap().push(id);
         Ok(())
     }
+
+    // TODO(PR9-②): Fake raw event transport（预置 UaEventNotification 序列 +
+    // overflow / BAD filter / session loss 脚本），随 native EventCallback 一起落地。
+    // 当前仅保编译，调用即内部错误，避免半实现 Fake 被误认为可用。
+    async fn create_event_subscription(
+        &self,
+        _spec: UaSubscriptionSpec,
+    ) -> Result<crate::event::UaEventSubscription, UaTransportError> {
+        Err(UaTransportError::internal(
+            UaOperation::CreateEventSubscription,
+            "Fake event path 未实现（PR9 Stage ② 落地）",
+        ))
+    }
+
+    async fn create_event_monitored_items(
+        &self,
+        _subscription_id: UaSubscriptionId,
+        _items: &[crate::event::UaEventMonitoredItemSpec],
+    ) -> Result<Vec<crate::event::UaEventMonitoredItemResult>, UaTransportError> {
+        Err(UaTransportError::internal(
+            UaOperation::CreateEventMonitoredItems,
+            "Fake event path 未实现（PR9 Stage ② 落地）",
+        ))
+    }
 }
 
 /// 测试用小构造：单个 Variable 引用。

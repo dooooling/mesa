@@ -835,6 +835,29 @@ impl OpcUaTransport for NativeOpcUaTransport {
         }
         self.delete_subscription_rpc(&sess, id).await
     }
+
+    // TODO(PR9-②): Native EventCallback 有界 FIFO + fatal watch，随 Stage ② 落地。
+    // 当前仅保编译，调用即内部错误。
+    async fn create_event_subscription(
+        &self,
+        _spec: UaSubscriptionSpec,
+    ) -> Result<crate::event::UaEventSubscription, UaTransportError> {
+        Err(UaTransportError::internal(
+            UaOperation::CreateEventSubscription,
+            "Native event path 未实现（PR9 Stage ② 落地）",
+        ))
+    }
+
+    async fn create_event_monitored_items(
+        &self,
+        _subscription_id: UaSubscriptionId,
+        _items: &[crate::event::UaEventMonitoredItemSpec],
+    ) -> Result<Vec<crate::event::UaEventMonitoredItemResult>, UaTransportError> {
+        Err(UaTransportError::internal(
+            UaOperation::CreateEventMonitoredItems,
+            "Native event path 未实现（PR9 Stage ② 落地）",
+        ))
+    }
 }
 
 #[cfg(test)]
