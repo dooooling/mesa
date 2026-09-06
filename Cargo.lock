@@ -1204,6 +1204,7 @@ dependencies = [
  "mesa-driver-s7",
  "mesa-driver-sdk",
  "mesa-driver-simulator",
+ "mesa-event-store",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -1272,6 +1273,7 @@ dependencies = [
  "mesa-config-store",
  "mesa-core-types",
  "mesa-driver-protocol",
+ "mesa-event-store",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -1361,6 +1363,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesa-event-store"
+version = "0.1.0"
+dependencies = [
+ "mesa-core-types",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mesa-opcua-transport"
 version = "0.1.0"
 dependencies = [
@@ -1398,6 +1414,7 @@ dependencies = [
  "mesa-core-api",
  "mesa-core-types",
  "mesa-driver-manager",
+ "mesa-event-store",
  "serde_json",
  "tokio",
  "tokio-util",

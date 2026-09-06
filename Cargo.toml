@@ -6,6 +6,7 @@ members = [
     "crates/driver-sdk",
     "crates/driver-manager",
     "crates/config-store",
+    "crates/event-store",
     "crates/core-api",
     "apps/mesad",
     "drivers/simulator",
@@ -29,6 +30,7 @@ mesa-driver-protocol = { path = "crates/driver-protocol" }
 mesa-driver-sdk = { path = "crates/driver-sdk" }
 mesa-driver-manager = { path = "crates/driver-manager" }
 mesa-config-store = { path = "crates/config-store" }
+mesa-event-store = { path = "crates/event-store" }
 mesa-core-api = { path = "crates/core-api" }
 mesa-opcua-transport = { path = "crates/opcua-transport" }
 
@@ -43,6 +45,7 @@ libc = "0.2"
 windows-sys = { version = "0.59", features = ["Win32_System_Performance", "Win32_System_Threading", "Win32_Foundation", "Win32_System_JobObjects"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

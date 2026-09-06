@@ -49,6 +49,32 @@ async fn main() {
         source,
     ));
 
+    // ---- EventStore（PR7 v1.1 §2/§22）：独立 events.db，失败不连累 Data Plane ----
+    // 打开失败 → Unavailable 模式：普通 Data-only Endpoint 照常运行，
+    // 有 EventTask 的 Endpoint 拒绝 Start（EVENT_STORE_UNAVAILABLE），
+    // /api/v1/events 系接口 503（step ⑤）。
+    let events_db_path = args
+        .events_db_path
+        .clone()
+        .unwrap_or_else(|| default_events_db_path(&db_path));
+    match mesa_event_store::EventStore::open(&events_db_path) {
+        Ok(event_store) => {
+            let services = mesa_event_store::EventServices::new(
+                Arc::new(event_store),
+                mesa_event_store::EventHub::new(mesa_event_store::EVENT_HUB_CAPACITY),
+            );
+            manager.set_event_services(services);
+            tracing::info!(db = %events_db_path.display(), "events.db opened");
+        }
+        Err(e) => {
+            tracing::error!(
+                db = %events_db_path.display(),
+                "events.db unavailable ({e}); data-only endpoints still run, \
+                 event-enabled endpoints will refuse to start"
+            );
+        }
+    }
+
     // ---- PKI 初始化（必须在恢复 Endpoint/启动 Driver 之前，确保 OPC UA Secure 证书就绪）----
     // 只 resolve 一次 PKI 路径，Core 与 Driver 共用（自定义 MESA_OPCUA_PKI_DIR 时避免分叉）
     let pki_dir = std::env::var_os("MESA_OPCUA_PKI_DIR")
@@ -87,11 +113,14 @@ async fn main() {
             continue;
         }
         let tasks = store.list_tasks(&rec.id).unwrap_or_default();
+        // PR7 v1.1 §13：Data 与 Event 任务一起恢复（空 = 老行为）
+        let event_tasks = store.list_event_tasks(&rec.id).unwrap_or_default();
         let cfg = mesa_driver_manager::endpoint::BuiltinEndpoint {
             endpoint_id: rec.id.clone(),
             driver_id: rec.driver_id.clone(),
             connection_json: rec.connection_json.clone(),
             tasks,
+            event_tasks,
         };
         match manager.start_endpoint(cfg) {
             Ok(()) => tracing::info!(endpoint = %rec.id, "restored endpoint (desired=running)"),
@@ -126,6 +155,9 @@ struct Args {
     drivers_dir: String,
     http_port: u16,
     db_path: String,
+    /// events.db 路径（默认与 --db 同目录的 events.db，v1.1 §19）；
+    /// retention 相关 flag 见 step ⑧。
+    events_db_path: Option<std::path::PathBuf>,
     enable_control: bool,
 }
 
@@ -134,6 +166,7 @@ fn parse_args() -> Args {
         drivers_dir: "drivers".into(),
         http_port: DEFAULT_HTTP_PORT,
         db_path: DEFAULT_DB_PATH.into(),
+        events_db_path: None,
         enable_control: false,
     };
     let argv: Vec<String> = std::env::args().collect();
@@ -154,19 +187,31 @@ fn parse_args() -> Args {
                 out.db_path = argv.get(i + 1).cloned().unwrap_or(out.db_path);
                 i += 2;
             }
+            "--events-db" => {
+                out.events_db_path = argv.get(i + 1).map(std::path::PathBuf::from);
+                i += 2;
+            }
             "--enable-control" => {
                 out.enable_control = true;
                 i += 1;
             }
             other => {
                 eprintln!(
-                    "unknown arg: {other} (supported: --drivers-dir --http-port --db --enable-control)"
+                    "unknown arg: {other} (supported: --drivers-dir --http-port --db --events-db --enable-control)"
                 );
                 i += 1;
             }
         }
     }
     out
+}
+
+/// 默认 events.db 路径：与 --db 同目录（v1.1 §19，不搞两个存储根）。
+fn default_events_db_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    match db_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join("events.db"),
+        _ => std::path::PathBuf::from("events.db"),
+    }
 }
 
 fn print_banner(http_port: u16, db_path: &str) {

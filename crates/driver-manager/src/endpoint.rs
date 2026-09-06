@@ -14,11 +14,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mesa_core_types::{
-    ConnectionState, DataBatch, PointDefinition, PointDescriptor, ensure_unique_point_keys,
+    ConnectionState, DataBatch, EventTask, PointDefinition, PointDescriptor,
+    ensure_unique_point_keys,
 };
 use mesa_driver_protocol::pb;
+use mesa_event_store::EventServices;
 use tokio_util::sync::CancellationToken;
 
+use crate::event_ingress::{IngressFatal, IngressStats, run_event_ingress};
 use crate::manifest::DiscoveredDriver;
 use crate::process::DriverProcess;
 use crate::session::{Session, SessionEvent};
@@ -42,6 +45,8 @@ pub struct BuiltinEndpoint {
     /// Endpoint.connection 的 JSON 序列化，语义由 Driver 解释。
     pub connection_json: String,
     pub tasks: Vec<mesa_core_types::AcquisitionTask>,
+    /// 事件订阅快照（PR7 v1.1 §11）：空 = 无事件订阅，老路径零成本。
+    pub event_tasks: Vec<EventTask>,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +181,9 @@ impl PointIdSource for StorePointIdSource {
 // ---------------------------------------------------------------------------
 
 /// 单个 Endpoint 的运行任务。返回即表示该 Endpoint 已停止且不再重试。
+///
+/// `events` 为 `None` 时为纯 Data-only 路径（EventStore 不可用或未配置时）：
+/// 不接管 EventReceiver、不起 ingress，数据面完全不受影响（v1.1 §9 隔离）。
 pub async fn run_endpoint(
     disc: DiscoveredDriver,
     cfg: BuiltinEndpoint,
@@ -190,6 +198,7 @@ pub async fn run_endpoint(
             >,
         >,
     >,
+    events: Option<Arc<EventServices>>,
 ) {
     let mut backoff_idx = 0usize;
     let mut id_map: HashMap<String, u32> = source.known_map(&cfg.endpoint_id);
@@ -228,6 +237,7 @@ pub async fn run_endpoint(
             &mut last_epoch,
             &shutdown,
             &registry,
+            events.as_ref(),
         )
         .await
         {
@@ -341,6 +351,7 @@ async fn attempt_session(
             >,
         >,
     >,
+    services: Option<&Arc<EventServices>>,
 ) -> AttemptOutcome {
     let mut process = match DriverProcess::spawn(disc).await {
         Ok(p) => p,
@@ -352,7 +363,7 @@ async fn attempt_session(
         }
     };
 
-    let (session, mut events, unresponsive_flag) =
+    let (mut session, mut events, unresponsive_flag) =
         match Session::connect_retry(process.port, &process.token).await {
             Ok((s, ev, flag)) => (s, ev, flag),
             Err(e) => {
@@ -363,6 +374,13 @@ async fn attempt_session(
                 };
             }
         };
+    // v1.1 §14：Start 之前接管 EventReceiver。无 EventServices（Data-only）
+    // 则不接管——接收端随 Session 释放，reader 侧溢出无人消费也无人在意。
+    let event_rx = if services.is_some() {
+        session.take_event_batches()
+    } else {
+        None
+    };
     // 注册活跃会话供 Control 面可靠转发（§22），Control 与 Data 共用同一 TCP 但分队列
     let session_arc = std::sync::Arc::new(tokio::sync::Mutex::new(session));
     registry
@@ -401,15 +419,40 @@ async fn attempt_session(
         source.revision(&cfg.endpoint_id),
     );
 
+    // 配置成功后起 ingress（Start 之前已接管 EventReceiver，见上）：
+    // 有 EventServices 才起；Data-only 照旧无 ingress。
+    // 统计句柄 step ⑧ 接入 Endpoint diagnostics，此处仅创建持有。
+    let _ingress_stats: crate::event_ingress::SharedIngressStats =
+        Arc::new(Mutex::new(IngressStats::default()));
+    let mut ingress: Option<tokio::task::JoinHandle<Result<(), IngressFatal>>> =
+        match (event_rx, services) {
+            (Some(rx), Some(svc)) => Some(tokio::spawn(run_event_ingress(
+                rx,
+                cfg.endpoint_id.clone(),
+                Arc::clone(svc),
+                Arc::clone(&_ingress_stats),
+            ))),
+            _ => None,
+        };
+
     // 事件循环期间保持会话注册，Control 请求通过同一 session_arc 的 Mutex 串行化
     let outcome = event_loop(
         cfg,
         snapshot,
         unresponsive_flag.as_ref(),
         &mut events,
+        &mut ingress,
         shutdown,
     )
     .await;
+
+    // ingress 收尾：abort 后等待结束。abort 时若正处 commit→publish 之间，
+    // commit 仍会落盘（writer 线程不受 abort 影响）而 hub 发布被跳过——
+    // 等价于一次 broadcast lag，SSE replay 按 seq 补回，不丢事实。
+    if let Some(h) = ingress {
+        h.abort();
+        let _ = h.await;
+    }
 
     {
         let sess = session_arc.lock().await;
@@ -530,6 +573,16 @@ async fn run_config_flow(
     let result = expect_ack(reply.body).ok_or_else(|| lost("ApplyPointMap"))?;
     config_gate(result, "ApplyPointMap")?;
 
+    // ConfigureEventTasks（PR7 v1.1 §11）：Apply 之后、Start 之前。
+    // 空任务零成本（Session 内直接成功，不发 RPC，老 Driver 路径无变化）；
+    // 失败则不 Start——同一 revision 半更新（Data 新 + Event 旧）永不存在。
+    if let Err(e) = session
+        .configure_events(HANDLE, revision, &cfg.event_tasks)
+        .await
+    {
+        return Err(event_config_fail(e));
+    }
+
     // StartConnection(new stream_epoch)
     let epoch = new_stream_epoch();
     let reply = session
@@ -555,6 +608,7 @@ async fn event_loop(
     snapshot: &Arc<Snapshot>,
     unresponsive_flag: &std::sync::atomic::AtomicBool,
     events: &mut tokio::sync::mpsc::Receiver<SessionEvent>,
+    ingress: &mut Option<tokio::task::JoinHandle<Result<(), IngressFatal>>>,
     shutdown: &CancellationToken,
 ) -> AttemptOutcome {
     const WATCHDOG_TICK: Duration = Duration::from_secs(2);
@@ -563,6 +617,38 @@ async fn event_loop(
 
     loop {
         tokio::select! {
+            // EventIngress fatal（v1.1 §4）：只杀本 attempt，走 Lost 重连；
+            // Data-only（ingress=None）时本分支挂起永不就绪。
+            // NOTE: 不加 `if ingress.is_some()` guard——future 已持有 &mut 借用，
+            // guard 的二次借用编译不过；pending 分支语义等价。
+            res = async {
+                match ingress {
+                    Some(h) => h.await,
+                    None => {
+                        std::future::pending::<
+                            Result<Result<(), IngressFatal>, tokio::task::JoinError>,
+                        >()
+                        .await
+                    }
+                }
+            } => {
+                return match res {
+                    Ok(Ok(_stats)) => AttemptOutcome::Lost {
+                        // ingress 正常返回理论不可达（无限循环直到 fatal/流关闭）；
+                        // 若发生，按 Lost 重连而非静默 Running。
+                        reason: "event ingress exited".into(),
+                        had_running_session: true,
+                    },
+                    Ok(Err(fatal)) => AttemptOutcome::Lost {
+                        reason: format!("{}: {fatal}", fatal.code()),
+                        had_running_session: true,
+                    },
+                    Err(join_err) => AttemptOutcome::Lost {
+                        reason: format!("event ingress panicked: {join_err}"),
+                        had_running_session: true,
+                    },
+                };
+            }
             ev = events.recv() => match ev {
                 Some(SessionEvent::Batch(batch)) => {
                     apply_batch_logged(snapshot, cfg, batch);
@@ -628,6 +714,37 @@ fn apply_batch_logged(snapshot: &Arc<Snapshot>, cfg: &BuiltinEndpoint, batch: Da
     let ns = start.elapsed().as_nanos() as u64;
     snapshot.record_snapshot_apply_latency_ns(ns);
     tracing::trace!(endpoint=%cfg.endpoint_id, seq=batch.sequence, values=n, snapshot_apply_latency_ns=ns, "batch");
+}
+
+/// 事件配置失败路由："配错了"（老驱动无能力/老 minor/校验拒绝）→
+/// ConfigurationFailed（不重试，重试也不会长出能力）；真正的传输失败 →
+/// Lost（走 reconnect）。空任务永不走到这里（Session 内直接成功）。
+fn event_config_fail(e: crate::session::SessionError) -> AttemptOutcome {
+    use crate::session::SessionError;
+    match e {
+        SessionError::Driver {
+            kind,
+            code,
+            message,
+        } => {
+            let detail = format!("{kind}/{code}: {message}");
+            if kind == "ConfigurationError" || kind == "Unsupported" {
+                AttemptOutcome::ConfigurationFailed(detail)
+            } else {
+                AttemptOutcome::Lost {
+                    reason: format!("configure-events: {detail}"),
+                    had_running_session: false,
+                }
+            }
+        }
+        SessionError::EventPlaneUnsupported { .. } => {
+            AttemptOutcome::ConfigurationFailed(format!("configure-events: {e}"))
+        }
+        other => AttemptOutcome::Lost {
+            reason: format!("configure-events rpc: {other}"),
+            had_running_session: false,
+        },
+    }
 }
 
 fn expect_ack(body: Option<pb::envelope::Body>) -> Option<pb::GenericResult> {

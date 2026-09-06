@@ -144,6 +144,7 @@ async fn driver_crash_restore_via_endpoint_runtime() {
                 ]
             }),
         )],
+        event_tasks: vec![],
     };
 
     let disc = sim_discovered();
@@ -160,6 +161,8 @@ async fn driver_crash_restore_via_endpoint_runtime() {
         allocator,
         shutdown.clone(),
         registry,
+        // Data-only（无 EventServices）：复用生产 Data 路径做 crash 恢复验证
+        None,
     ));
 
     // 第一次运行：RUNNING 且 epoch != 0，记录点集与 epoch

@@ -12,12 +12,13 @@ use std::sync::{Mutex, OnceLock};
 
 #[allow(unused_imports)]
 use mesa_core_types::{
-    AcquisitionTask, DataType, PointDefinition, PointDescriptor, ensure_unique_point_keys,
+    AcquisitionTask, DataType, EventTask, PointDefinition, PointDescriptor,
+    ensure_unique_point_keys,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// 当前 schema 版本。增量迁移时递增并在 `meta` 中持久化（§6.1）。
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 // ---------------------------------------------------------------------------
 // 记录类型
@@ -382,12 +383,57 @@ impl ConfigStore {
                         [],
                     )?;
                     tx.commit()?;
-                    return Ok(());
+                    // 不再直接返回：继续 003（v1→v3 一次 open 走完；外层 conn
+                    // guard 已 drop，后续重新加锁）。旧行为（分两次 open 收敛）
+                    // 依然兼容：meta=2 的库下次 open 走下面的 003 分支。
+                    cur_ver = 2;
+                }
+            }
+        }
+        // 003 迁移（PR7 EventTask，v1.1 §10）
+        if cur_ver < 3 {
+            let has_3: bool = {
+                let conn = self.conn.lock().unwrap();
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=3)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false)
+            };
+            if !has_3 {
+                // 备份（与 002 同策略：仅文件库）
+                if let Some(path_str) = self.conn.lock().unwrap().path()
+                    && !path_str.is_empty()
+                    && std::path::Path::new(path_str).exists()
+                {
+                    let path = std::path::Path::new(path_str);
+                    let bak = format!("{}.bak.{}", path.display(), Self::now_ns());
+                    let _ = std::fs::copy(path, &bak);
+                }
+                let sql3 = include_str!("../migrations/003_event_tasks.sql");
+                {
+                    let mut conn_mut = self.conn.lock().unwrap();
+                    let tx = conn_mut.transaction()?;
+                    tx.execute_batch(sql3)?;
+                    let checksum3 = format!("{:x}", sql3.len());
+                    tx.execute(
+                        "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(3,'003_event_tasks',?1,?2)",
+                        params![checksum3, Self::now_ns()],
+                    )?;
+                    tx.execute("UPDATE meta SET value='3' WHERE key='schema_version'", [])?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','3')",
+                        [],
+                    )?;
+                    tx.commit()?;
+                    cur_ver = 3;
                 }
             }
         }
         // 最终确保 meta 为最新
         if cur_ver < SCHEMA_VERSION {
+            let conn = self.conn.lock().unwrap();
             conn.execute(
                 "UPDATE meta SET value=?1 WHERE key='schema_version'",
                 params![SCHEMA_VERSION.to_string()],
@@ -832,6 +878,124 @@ impl ConfigStore {
             let cfg: serde_json::Value =
                 serde_json::from_str(&binding_config_json).unwrap_or(serde_json::json!({}));
             Ok(AcquisitionTask {
+                id: r.get(0)?,
+                mode,
+                interval_ms: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                binding: mesa_core_types::DriverBinding {
+                    kind: r.get(3)?,
+                    config: cfg,
+                },
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // ---- EventTasks（全量快照替换，与 Tasks 对等，PR7 v1.1 §10）----
+
+    /// 全量替换某 endpoint 的事件任务集合。空数组表示清空（= 无事件订阅）。
+    /// 成功时 revision 自增并返回新 revision（与 Data tasks 共用同一计数器：
+    /// 任何配置变化都使 revision 前进）；失败则事务回滚、旧配置保持不变。
+    /// 只做 Mesa contract/结构校验（id 非空唯一、Poll/interval 关系）；
+    /// protocol-specific binding 语义留给 Driver 在 ConfigureEventTasks 时判定。
+    pub fn replace_event_tasks(
+        &self,
+        endpoint_id: &str,
+        tasks: &[EventTask],
+    ) -> Result<u64, StoreError> {
+        for t in tasks {
+            t.validate()
+                .map_err(|e| StoreError::Validation(e.to_string()))?;
+        }
+        {
+            let mut seen = HashSet::new();
+            for t in tasks {
+                if !seen.insert(&t.id) {
+                    return Err(StoreError::Validation(format!(
+                        "duplicate event task id `{}`",
+                        t.id
+                    )));
+                }
+            }
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM endpoints WHERE id=?1)",
+            params![endpoint_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::NotFound(format!(
+                "endpoint `{endpoint_id}` 不存在"
+            )));
+        }
+
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM event_tasks WHERE endpoint_id=?1",
+            params![endpoint_id],
+        )?;
+        for t in tasks {
+            tx.execute(
+                "INSERT INTO event_tasks(endpoint_id,id,mode,interval_ms,binding_kind,binding_config_json)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    endpoint_id,
+                    t.id,
+                    t.mode.as_str(),
+                    t.interval_ms.map(|v| v as i64),
+                    t.binding.kind,
+                    serde_json::to_string(&t.binding.config).unwrap(),
+                ],
+            )?;
+        }
+        // bump revision（与 replace_tasks 同一计数器）
+        let cur: i64 = tx
+            .query_row(
+                "SELECT revision FROM config_revision WHERE endpoint_id=?1",
+                params![endpoint_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let next = (cur + 1) as u64;
+        tx.execute(
+            "INSERT INTO config_revision(endpoint_id,revision) VALUES(?1,?2)
+             ON CONFLICT(endpoint_id) DO UPDATE SET revision=excluded.revision",
+            params![endpoint_id, next as i64],
+        )?;
+        tx.execute(
+            "UPDATE endpoints SET updated_at_ns=?1 WHERE id=?2",
+            params![Self::now_ns(), endpoint_id],
+        )?;
+        tx.commit()?;
+        Ok(next)
+    }
+
+    pub fn list_event_tasks(&self, endpoint_id: &str) -> Result<Vec<EventTask>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,mode,interval_ms,binding_kind,binding_config_json FROM event_tasks WHERE endpoint_id=?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![endpoint_id], |r| {
+            let mode_s: String = r.get(1)?;
+            // 新表由本函数写入，mode 取值受控；未知值视为数据损坏，硬失败
+            // （不像老 tasks 表那样静默回落 Poll）。
+            let mode = match mode_s.as_str() {
+                "poll" => mesa_core_types::TaskMode::Poll,
+                "subscribe" => mesa_core_types::TaskMode::Subscribe,
+                other => {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        format!("unknown event task mode `{other}`").into(),
+                    ));
+                }
+            };
+            let binding_config_json: String = r.get(4)?;
+            let cfg: serde_json::Value =
+                serde_json::from_str(&binding_config_json).unwrap_or(serde_json::json!({}));
+            Ok(EventTask {
                 id: r.get(0)?,
                 mode,
                 interval_ms: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
@@ -1381,6 +1545,86 @@ mod tests {
         ));
     }
 
+    fn event_task(id: &str) -> EventTask {
+        EventTask {
+            id: id.into(),
+            mode: TaskMode::Subscribe,
+            interval_ms: None,
+            binding: DriverBinding {
+                kind: "simulator.events".into(),
+                config: serde_json::json!({"stream": "sim.events.alarm-cycle"}),
+            },
+        }
+    }
+
+    /// migration 003：新库 schema_version=3 且 event_tasks 表可用；
+    /// v2 无损（老数据路径不受影响由 002 测试覆盖，此处断言版本标记）。
+    #[test]
+    fn migration_003_event_tasks_table() {
+        let s = mem();
+        let ver: String = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ver, "3");
+        let has: bool = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=3)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has);
+        s.create_device(&dev("d1")).unwrap();
+        s.create_endpoint(&ep("e1", "d1")).unwrap();
+        // 空快照即无订阅
+        assert!(s.list_event_tasks("e1").unwrap().is_empty());
+        let r1 = s.replace_event_tasks("e1", &[event_task("al")]).unwrap();
+        assert_eq!(r1, 1);
+        let tasks = s.list_event_tasks("e1").unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "al");
+        assert_eq!(tasks[0].mode, TaskMode::Subscribe);
+        // revision 与 Data tasks 共用计数器
+        s.replace_tasks("e1", &[task("t1", 100)]).unwrap();
+        assert_eq!(s.current_revision("e1").unwrap(), 2);
+        // 全量替换 + 非法拒绝（Poll 无 interval）+ 回滚不推进 revision
+        assert!(matches!(
+            s.replace_event_tasks(
+                "e1",
+                &[EventTask {
+                    id: "bad".into(),
+                    mode: TaskMode::Poll,
+                    interval_ms: None,
+                    binding: DriverBinding {
+                        kind: "k".into(),
+                        config: serde_json::json!({}),
+                    },
+                }]
+            ),
+            Err(StoreError::Validation(_))
+        ));
+        assert_eq!(s.current_revision("e1").unwrap(), 2);
+        assert_eq!(s.list_event_tasks("e1").unwrap().len(), 1);
+        // 重复 id 拒绝
+        assert!(matches!(
+            s.replace_event_tasks("e1", &[event_task("d"), event_task("d")]),
+            Err(StoreError::Validation(_))
+        ));
+        // endpoint 删除级联清理配置行（历史在 events.db，不受影响）
+        assert!(s.delete_endpoint("e1").unwrap());
+        assert!(s.list_event_tasks("e1").unwrap().is_empty());
+    }
+
     #[test]
     fn point_id_stable_and_tombstone_reuse() {
         let s = mem();
@@ -1519,7 +1763,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_002_exists_and_version_is_2() {
+    fn migration_chain_intact_through_003() {
         let s = mem();
         let conn = s.conn.lock().unwrap();
         let ver: String = conn
@@ -1529,11 +1773,20 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "2");
+        // PR7 起 SCHEMA_VERSION=3；002 本身仍必须存在且已应用（增量链不断）
+        assert!(ver == "3", "新库应为 v3，got {ver}");
+        let has2: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=2)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has2, "002 迁移记录不得丢失");
         let cnt: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert!(cnt >= 2, "至少 2 条迁移");
+        assert!(cnt >= 3, "至少 3 条迁移");
         // 表存在
         let tbl: String = conn
             .query_row(

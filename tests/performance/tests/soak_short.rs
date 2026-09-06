@@ -30,6 +30,7 @@ async fn soak_60s_multi_endpoint_no_leak() {
             driver_id: "simulator".into(),
             connection_json: "{}".into(),
             tasks,
+            event_tasks: vec![],
         };
         mgr.start_endpoint(ep).unwrap();
     }
@@ -54,6 +55,7 @@ async fn soak_60s_multi_endpoint_no_leak() {
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
         tasks,
+        event_tasks: vec![],
     };
     let _ = mgr.start_endpoint(ep);
     tokio::time::sleep(dur - Duration::from_secs(22)).await;

@@ -54,6 +54,9 @@ pub struct MesaManager {
     active_sessions: std::sync::Arc<
         RwLock<HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>,
     >,
+    /// 事件面服务（PR7 v1.1 §20）：`None` = 纯 Data-only 模式（EventStore
+    /// 不可用时），endpoint 不起 ingress，数据面完全不受影响（§9 隔离）。
+    event_services: RwLock<Option<Arc<mesa_event_store::EventServices>>>,
 }
 
 impl MesaManager {
@@ -77,7 +80,14 @@ impl MesaManager {
             descriptor_cache: RwLock::new(HashMap::new()),
             profiles: RwLock::new(profiles),
             active_sessions: std::sync::Arc::new(RwLock::new(HashMap::new())),
+            event_services: RwLock::new(None),
         }
+    }
+
+    /// 注入事件面服务（Mesad 在 EventStore 打开后调用一次）。构造器签名不变，
+    /// 老调用方（Contract Test 等）不传即 Data-only。
+    pub fn set_event_services(&self, services: Arc<mesa_event_store::EventServices>) {
+        *self.event_services.write().unwrap() = Some(services);
     }
 
     fn driver_infos(drivers: &[DiscoveredDriver]) -> Vec<DriverInfo> {
@@ -167,6 +177,7 @@ impl MesaManager {
         let snapshot = Arc::clone(&self.snapshot);
         let source = Arc::clone(&self.source);
         let registry = std::sync::Arc::clone(&self.active_sessions);
+        let events = self.event_services.read().unwrap().clone();
         let handle = tokio::spawn(run_endpoint(
             disc,
             cfg.clone(),
@@ -174,6 +185,7 @@ impl MesaManager {
             source,
             shutdown,
             registry,
+            events,
         ));
 
         self.running
