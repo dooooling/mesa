@@ -23,7 +23,7 @@ mesa.db.bak.*
 
 # Secret master key（P0-1：真 key 永不入仓；测试只用内存固定 key 或 DB 同目录文件）
 **/master.key
-**/master.key.tmp
+**/master.tmp
 
 # Driver 构建产物（cargo build 产于 target，drivers/ 下为 QEMU/本地调试拷贝，勿入仓）
 # 注：driver.toml 中 executable 为 "Mesa-driver-*"（大写 M），而 cargo bin 为 "mesa-driver-*"（小写），

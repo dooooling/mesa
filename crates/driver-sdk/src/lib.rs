@@ -654,6 +654,25 @@ struct RunHandle {
     join: tokio::task::JoinHandle<()>,
 }
 
+/// 等待 run task 退出；超时则 abort 并回收（P0-3 Final）。
+/// 禁止 `timeout(join)` 裸用——超时会 drop JoinHandle 使 task detach：后台
+/// producer 仍可 `publish` 成功，而 writer 已按"无新生产"退出，造成
+/// "publish Ok 的 batch 没写 TCP"。abort 完成后再 cancel writer，
+/// writer_shutdown 的"全部生产者已停"前提才是硬保证（与 writer JoinHandle
+/// 同一修法，见 serve 收尾 NOTE）。
+async fn stop_run_handle(rh: RunHandle, ctx: &'static str) {
+    rh.cancel.cancel();
+    let mut join = rh.join;
+    tokio::select! {
+        _ = &mut join => {}
+        _ = tokio::time::sleep(RUN_DRAIN_GRACE) => {
+            tracing::error!("run task did not stop in time, aborting ({ctx})");
+            join.abort();
+            let _ = join.await;
+        }
+    }
+}
+
 struct ConnEntry {
     /// configure 与 run 之间连接对象会被临时 take；None 表示正在运行中。
     conn: Option<Box<dyn DriverConnection>>,
@@ -698,7 +717,8 @@ impl Session {
             .await;
     }
 
-    /// 取消运行中的采集并等待其退出；超时则放弃等待（进程退出兜底）。
+    /// 取消运行中的采集并等待其退出；超时则 abort 回收（P0-3 Final，
+    /// 见 `stop_run_handle`——detach 的 producer 会破坏 writer drain 前提）。
     async fn stop_run(&self, handle: u32) {
         let rh = self
             .entries
@@ -707,13 +727,7 @@ impl Session {
             .get_mut(&handle)
             .and_then(|e| e.run.take());
         if let Some(rh) = rh {
-            rh.cancel.cancel();
-            if tokio::time::timeout(RUN_DRAIN_GRACE, rh.join)
-                .await
-                .is_err()
-            {
-                tracing::warn!(handle, "run task did not drain in time");
-            }
+            stop_run_handle(rh, "stop_run").await;
         }
     }
 }
@@ -832,10 +846,10 @@ pub async fn serve_with_faults<D: Driver>(
 
     let result = request_loop(&session, rd, &shutdown, faults.as_ref()).await;
 
-    // P0-2 两阶段 teardown（顺序即正确性）：
+    // P0-2 两阶段 teardown（顺序即正确性）+ P0-3 Final：
     // ① request_loop 已结束 → cancel 全局 shutdown，run tasks 观察到后停止生产；
-    // ② join 全部 run tasks（各自 RUN_DRAIN_GRACE 超时兜底）→ 此后无新生产
-    //    （超时未退的顽固 task 是驱动 bug，其残留输出由 drain 超时兜底）；
+    // ② 逐个 stop_run_handle（等退出 / 超时 abort 回收）→ 此后无新生产是硬
+    //    保证（abort 完成才继续；detach 残留会 publish 成功而 writer 已退）；
     // ③ 触发 writer_shutdown → writer 把队列里已有帧写完再退（drain 模式），
     //    然后 TCP FIN。active_epochs 全程不变，排队 Event 不丢。
     shutdown.cancel();
@@ -844,13 +858,7 @@ pub async fn serve_with_faults<D: Driver>(
         m.values_mut().filter_map(|e| e.run.take()).collect()
     };
     for rh in handles {
-        rh.cancel.cancel();
-        if tokio::time::timeout(RUN_DRAIN_GRACE, rh.join)
-            .await
-            .is_err()
-        {
-            tracing::error!("run task did not stop in time, writer drain is bounded");
-        }
+        stop_run_handle(rh, "serve-teardown").await;
     }
     writer_shutdown.cancel();
     // NOTE: 不能用 timeout(writer)——超时会 drop JoinHandle 使任务 detach

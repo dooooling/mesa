@@ -85,17 +85,15 @@ pub enum StoreError {
 // Secret Master Key & AEAD
 // ---------------------------------------------------------------------------
 
-/// 全局 master key 缓存（进程内单例，避免重复文件 IO）
-static MASTER_KEY_CACHE: OnceLock<[u8; 32]> = OnceLock::new();
-
-/// P0-1：key 目录由 `open(path)` 的 DB 父目录决定（docstring 本就承诺
+/// P0-1 Final：key 目录由 `open(path)` 的 DB 父目录决定（docstring 本就承诺
 /// "与 DB 同目录"），`open_in_memory` 对应 `None`。CWD 相对路径
 /// （`data/master.key` 等）已删除——`cargo test -p mesa-config-store` 的
 /// CWD 恰是 crate 目录，旧实现会在源码树里生成真 key 并被误提交。
-fn master_key_bytes(key_dir: Option<&PathBuf>) -> Result<[u8; 32], StoreError> {
-    if let Some(k) = MASTER_KEY_CACHE.get() {
-        return Ok(*k);
-    }
+/// 缓存是实例级（`ConfigStore::master_key`），禁止进程全局 static——同一进程
+/// 内 in-memory 库（固定测试 key）与多个文件库（各目录独立 key）共存时，
+/// 全局缓存会把先访问者的 key 串给后访问者（文件库 key 文件甚至不生成，
+/// 进程重启后旧 Secret 永久无法解密）。
+fn load_master_key(key_dir: Option<&PathBuf>) -> Result<[u8; 32], StoreError> {
     // 1) 环境变量覆盖（支持 base64 或 32 字节原始字符串，适配离线工控机）
     if let Ok(env) = std::env::var("MESA_MASTER_KEY") {
         let env = env.trim();
@@ -107,7 +105,6 @@ fn master_key_bytes(key_dir: Option<&PathBuf>) -> Result<[u8; 32], StoreError> {
             {
                 let mut k = [0u8; 32];
                 k.copy_from_slice(&decoded);
-                let _ = MASTER_KEY_CACHE.set(k);
                 return Ok(k);
             }
             // 生产级：仅接受 base64 32 字节，其余一律拒绝（禁止弱回退）
@@ -118,9 +115,7 @@ fn master_key_bytes(key_dir: Option<&PathBuf>) -> Result<[u8; 32], StoreError> {
     }
     // 2) in-memory 库：固定测试 key，不碰磁盘（单测永不生成真 key 文件）
     let Some(dir) = key_dir else {
-        let k = [0xA5u8; 32];
-        let _ = MASTER_KEY_CACHE.set(k);
-        return Ok(k);
+        return Ok([0xA5u8; 32]);
     };
     // 3) 文件库：`MESA_DATA_DIR` 覆盖，否则与 DB 同目录，0600
     let target = if let Ok(env_dir) = std::env::var("MESA_DATA_DIR") {
@@ -128,9 +123,7 @@ fn master_key_bytes(key_dir: Option<&PathBuf>) -> Result<[u8; 32], StoreError> {
     } else {
         dir.join("master.key")
     };
-    let key = load_or_create_master_key_file(&target)?;
-    let _ = MASTER_KEY_CACHE.set(key);
-    Ok(key)
+    load_or_create_master_key_file(&target)
 }
 
 fn load_or_create_master_key_file(target: &PathBuf) -> Result<[u8; 32], StoreError> {
@@ -223,6 +216,9 @@ pub struct ConfigStore {
     conn: Mutex<Connection>,
     /// master.key 目录：文件库 = DB 父目录（P0-1），内存库 = None（固定测试 key）。
     key_dir: Option<PathBuf>,
+    /// master key 实例级缓存（P0-1 Final）：`get_or_try_init` 串行化并发首次
+    /// 访问；各实例独立，in-memory/多目录文件库同进程共存不串 key。
+    master_key: OnceLock<[u8; 32]>,
 }
 
 impl ConfigStore {
@@ -246,6 +242,7 @@ impl ConfigStore {
         let s = Self {
             conn: Mutex::new(conn),
             key_dir,
+            master_key: OnceLock::new(),
         };
         s.migrate()?;
         Ok(s)
@@ -257,14 +254,28 @@ impl ConfigStore {
         let s = Self {
             conn: Mutex::new(conn),
             key_dir: None,
+            master_key: OnceLock::new(),
         };
         s.migrate()?;
         Ok(s)
     }
 
-    /// 本实例的 master key（`&self` 方法，P0-1：目录锚定 DB，desync 不可能）。
+    /// 本实例的 master key（P0-1 Final：实例级缓存 + 目录锚定 DB，跨实例
+    /// desync 不可能）。并发首次访问由初始化锁串行化——同实例双生成会产生
+    /// "缓存 key ≠ 落盘 key"；锁是进程共享的，但只保护初始化路径，缓存仍
+    /// 是实例级（`OnceLock::get_or_try_init` 仍为 nightly 特性，不可用）。
     fn master_key_bytes(&self) -> Result<[u8; 32], StoreError> {
-        master_key_bytes(self.key_dir.as_ref())
+        if let Some(k) = self.master_key.get() {
+            return Ok(*k);
+        }
+        static INIT_LOCK: Mutex<()> = Mutex::new(());
+        let _g = INIT_LOCK.lock().unwrap();
+        if let Some(k) = self.master_key.get() {
+            return Ok(*k);
+        }
+        let key = load_master_key(self.key_dir.as_ref())?;
+        let _ = self.master_key.set(key);
+        Ok(key)
     }
 
     /// 迁移前的文件拷贝兜底（仅文件库；生产应使用 rusqlite backup API）。
@@ -1878,6 +1889,78 @@ mod tests {
             !std::path::Path::new("./master.key").exists(),
             "in-memory secret must not create ./master.key under CWD"
         );
+    }
+
+    /// P0-1 Final：master key 是 per-store 语义，不是进程全局。
+    /// 同一测试进程内：in-memory（固定测试 key）先访问 Secret，再开两个
+    /// 不同目录的文件库各自 put/get，drop 重开后三者必须各自可解密。
+    /// 旧全局 `MASTER_KEY_CACHE` 下文件库会命中 `[0xA5;32]`、key 文件甚至
+    /// 不生成，重启即失密——本测试逐项断言锁死。
+    #[test]
+    fn master_key_is_per_store_not_process_global() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "mesa-keyscope-{}-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        // 1) in-memory 先访问 Secret（旧全局缓存会被固定测试 key 污染）
+        let m = mem();
+        m.create_device(&dev("d0")).unwrap();
+        m.create_endpoint(&ep("e0", "d0")).unwrap();
+        m.put_secret("e0", "password", "mem-secret", "k1").unwrap();
+        assert_eq!(
+            m.get_secret("e0", "password").unwrap().as_deref(),
+            Some("mem-secret")
+        );
+
+        // 2) 文件库 A：key 文件必须真实生成（旧实现直接命中缓存，不生成）
+        let a_db = base.join("a").join("mesa.db");
+        let a = ConfigStore::open(&a_db).unwrap();
+        a.create_device(&dev("da")).unwrap();
+        a.create_endpoint(&ep("ea", "da")).unwrap();
+        a.put_secret("ea", "password", "a-secret", "k1").unwrap();
+        let a_key = base.join("a").join("master.key");
+        assert!(
+            a_key.is_file(),
+            "file store must generate its own master.key"
+        );
+        drop(a);
+
+        // 3) 文件库 B：另一独立 key
+        let b_db = base.join("b").join("mesa.db");
+        let b = ConfigStore::open(&b_db).unwrap();
+        b.create_device(&dev("db")).unwrap();
+        b.create_endpoint(&ep("eb", "db")).unwrap();
+        b.put_secret("eb", "password", "b-secret", "k1").unwrap();
+        drop(b);
+        assert_ne!(
+            std::fs::read(base.join("a").join("master.key")).unwrap(),
+            std::fs::read(base.join("b").join("master.key")).unwrap(),
+            "distinct DB dirs must hold distinct keys"
+        );
+
+        // 4) 全部重开：各自可解密（旧实现 A/B 会读到 [0xA5;32] 而解密失败）
+        let a2 = ConfigStore::open(&a_db).unwrap();
+        assert_eq!(
+            a2.get_secret("ea", "password").unwrap().as_deref(),
+            Some("a-secret")
+        );
+        let b2 = ConfigStore::open(&b_db).unwrap();
+        assert_eq!(
+            b2.get_secret("eb", "password").unwrap().as_deref(),
+            Some("b-secret")
+        );
+        // in-memory 不受文件库影响
+        assert_eq!(
+            m.get_secret("e0", "password").unwrap().as_deref(),
+            Some("mem-secret")
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

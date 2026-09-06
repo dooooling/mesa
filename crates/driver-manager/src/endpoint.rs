@@ -447,12 +447,21 @@ async fn attempt_session(
             let drain_err = shutdown_ingress(ingress_shutdown.clone(), ingress)
                 .await
                 .err();
+            // P0-2 Final：配置失败也可能已 Start（部分成功），先 post Shutdown
+            // 再走 terminate_after_shutdown——stdin 保持 OPEN 让 SDK 自然退出；
+            // 若 driver 根本没起来，Phase 1 超时后 emergency EOF 兜底。
+            {
+                let sess = session_arc.lock().await;
+                if !sess.is_unresponsive() {
+                    let _ = sess.post(pb_shutdown_body()).await;
+                }
+            }
             {
                 let mut sess = session_arc.lock().await;
                 sess.invalidate();
             }
             registry.write().unwrap().remove(&cfg.endpoint_id);
-            process.terminate().await;
+            process.terminate_after_shutdown().await;
             return (outcome, drain_err);
         }
     }
@@ -478,26 +487,29 @@ async fn attempt_session(
     )
     .await;
 
-    // ⑨ Stop barrier（真 barrier，不是 sleep）：Shutdown-post → terminate →
-    // 等 reader 结束 → 再 drain ingress。
-    // terminate 关 stdin（EOF 防护）+ 宽限后强杀：driver 必然退出 → TCP FIN →
-    // reader 把 FIN 之前全部字节 pump 进 channel 后结束（TCP 有序性保证）。
-    // reader 是事件 channel 的唯一生产者 ⇒ reader 结束时"已进入 Core 的
-    // 旧 epoch Event"已全部在 channel 里；此时再 cancel ingress 做 final
-    // drain，零窗口（旧顺序 cancel-first 下，drain 与 driver 停产之间在途
-    // 批次会落入无人消费的 channel 而静默丢失）。
-    // reader 5s 未结束（顽固对端）→ 超时降级 drain 现有（等价旧行为）。
-    // 50ms sleep 已删除：等的对象是"reader 结束"这个条件，不是时长。
+    // ⑨ Stop barrier（真 barrier，不是 sleep）：Shutdown-post →
+    // terminate_after_shutdown → 等 reader 结束 → 再 drain ingress。
+    // P0-2 Final：terminate_after_shutdown 在 Phase 1 保持 stdin OPEN——SDK
+    // 侧 Shutdown RPC → run tasks 停 → writer drain → TCP FIN → 自然退出；
+    // liveness guard 不抢跑。reader 把 FIN 之前全部字节 pump 进 channel 后
+    // 结束（TCP 有序性保证）。reader 是事件 channel 的唯一生产者 ⇒ reader
+    // 结束时"已进入 Core 的旧 epoch Event"已全部在 channel 里；此时再
+    // cancel ingress 做 final drain，零窗口（旧顺序 cancel-first 下，drain
+    // 与 driver 停产之间在途批次会落入无人消费的 channel 而静默丢失）。
+    // Phase 1 超时（顽固对端）→ emergency EOF → reader 5s 未结束 →
+    // 超时降级 drain 现有（等价旧行为）。50ms sleep 已删除：等的对象是
+    // "reader 结束"这个条件，不是时长。
     // P0-3 teardown 总预算（全有界，Manager 直接 await，无外层超时）：
-    // terminate 5s + reader barrier 5s + ingress drain 5s ≈ 15s worst-case，
-    // 正常路径百 ms 内。超时/失败经 drain_err 显式上报。
+    // graceful 5s（+ emergency 后 terminate 5s）+ reader barrier 5s +
+    // ingress drain 5s ≈ 20s worst-case，正常路径百 ms 内。
+    // 超时/失败经 drain_err 显式上报。
     {
         let sess = session_arc.lock().await;
         if !sess.is_unresponsive() {
             let _ = sess.post(pb_shutdown_body()).await;
         }
     }
-    process.terminate().await;
+    process.terminate_after_shutdown().await;
     {
         let sess = session_arc.lock().await;
         if !sess.wait_reader_done(Duration::from_secs(5)).await {

@@ -295,12 +295,36 @@ fn assert_no_orphan(before: &HashSet<u32>, name: &str) {
 
 /// 搭临时 drivers 目录：二进制按唯一名拷贝（防并行串扰）+ profiles 拷贝（hints 验证）。
 /// 返回 (root, exe_unique_name)。
+///
+/// CI ARM ETXTBSY（`Text file busy`，os error 26）修法：直接 `copy` 到最终
+/// 可执行路径，会让"写者尚未完全关闭"与紧随其后的 `exec` 在慢文件系统上
+/// 竞争。这里走 copy → 临时文件 → fsync/close → 显式可执行位 → 原子 rename
+/// → 最终路径：rename 后目标从未以写模式打开过，exec 不可能撞上 ETXTBSY。
 fn stage_drivers_dir(tag: &str, src_exe: &Path, unique_base: &str) -> (PathBuf, String) {
+    use std::io::Write;
     let root = std::env::temp_dir().join(format!("fl-probe-{tag}-{}", now_ns()));
     let dir = root.join("simulator");
     std::fs::create_dir_all(&dir).unwrap();
     let name = exe_name(unique_base);
-    std::fs::copy(src_exe, dir.join(&name)).unwrap();
+    let final_path = dir.join(&name);
+    let tmp_path = dir.join(format!("{name}.staging"));
+    {
+        let mut src = std::fs::File::open(src_exe).unwrap();
+        let mut tmp = std::fs::File::create(&tmp_path).unwrap();
+        std::io::copy(&mut src, &mut tmp).unwrap();
+        tmp.flush().unwrap();
+        tmp.sync_all().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    } // src + tmp 全部关闭：此后 tmp 无任何写者
+    std::fs::rename(&tmp_path, &final_path).unwrap();
+    // 目录项落盘（best-effort）：rename 后 crash 也不丢目标
+    if let Ok(d) = std::fs::File::open(&dir) {
+        let _ = d.sync_all();
+    }
     std::fs::write(
         dir.join("driver.toml"),
         format!(
