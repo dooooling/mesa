@@ -1,6 +1,6 @@
 // PR8 Gate（组件）：历史首屏 + mesa-event SSE 帧出现 + history/SSE 同 seq 去重 + filter 切换重置。
 import { describe, expect, it, vi, beforeEach, afterEach, type Mock } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { api } from "../api";
 import { EventsView } from "./EventsView";
@@ -148,8 +148,7 @@ describe("EventsView", () => {
     await screen.findByText("msg-3");
     await user.click(screen.getByRole("button", { name: "加载更早" }));
     expect(await screen.findByText("msg-1")).toBeTruthy();
-    // 旧页仍在且无重复
-    const table = screen.getByRole("table");
-    expect(within(table).getAllByText("msg-3")).toHaveLength(1);
+    // 旧页仍在且无重复（诊断区无事件文本，全屏断言即可）
+    expect(screen.getAllByText("msg-3")).toHaveLength(1);
   });
 });
