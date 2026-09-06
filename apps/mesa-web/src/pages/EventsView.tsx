@@ -2,13 +2,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Button, Card, Space, Tabs, Tag } from "antd";
 import { api, isEventStoreUnavailable } from "../api";
-import type { StoredEvent } from "../types";
+import type { EventStats, StoredEvent } from "../types";
 import { EMPTY_EVENT_FILTER_FORM, EVENT_FIRST_PAGE_LIMIT, toEventFilter, type EventFilterForm } from "../events/filters";
 import { mergeEvents } from "../events/model";
 import { useEventStream } from "../events/useEventStream";
 import { EventFilters } from "../components/EventFilters";
 import { EventTable } from "../components/EventTable";
 import { EventDetailDrawer } from "../components/EventDetailDrawer";
+import { EventDiagnostics } from "../components/EventDiagnostics";
 import { EventTaskEditor } from "../components/EventTaskEditor";
 
 /** SSE 实时事件的客户端过滤（服务端 live 无过滤参数；语义与后端 SQL 对齐：精确匹配 + active NULL 不参与）。 */
@@ -39,6 +40,7 @@ export function EventsView() {
   const [error, setError] = useState<string | null>(null);
   const [liveOn, setLiveOn] = useState(true);
   const [selected, setSelected] = useState<StoredEvent | null>(null);
+  const [stats, setStats] = useState<EventStats | null>(null);
   const reqId = useRef(0);
   const formRef = useRef(form);
   formRef.current = form;
@@ -133,6 +135,25 @@ export function EventsView() {
     setHistory((cur) => mergeEvents(cur, [ev]));
   }, []);
 
+  // 诊断轮询（15s；失败静默，页面主体不受影响）
+  useEffect(() => {
+    let stop = false;
+    const tick = () => {
+      api
+        .eventStats()
+        .then((s) => {
+          if (!stop) setStats(s);
+        })
+        .catch(() => {});
+    };
+    tick();
+    const id = window.setInterval(tick, 15000);
+    return () => {
+      stop = true;
+      window.clearInterval(id);
+    };
+  }, []);
+
   const stream = useEventStream({ afterSeq: highWater, enabled: booted && liveOn && !unavailable, onEvent: onLive });
 
   const statusTag = useMemo(() => {
@@ -165,6 +186,9 @@ export function EventsView() {
           <Alert type="error" showIcon message="Event service unavailable" description="EventStore 当前不可用；设备、监控、Data Plane 页面继续正常。事件任务可读取配置，但 Event-enabled Endpoint 无法启动。" />
         ) : null}
         {error ? <Alert type="error" showIcon message="加载失败" description={error} style={{ marginTop: unavailable ? 8 : 0 }} /> : null}
+        <div style={{ marginTop: 8 }}>
+          <EventDiagnostics stats={stats} />
+        </div>
         <Tabs
           defaultActiveKey="records"
           items={[
