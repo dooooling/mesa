@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use mesa_core_types::{EventSequenceTracker, SequenceVerdict, now_unix_ns};
 use mesa_event_store::{CommitRequest, EventServices};
+use tokio_util::sync::CancellationToken;
 
 use crate::session::EventReceiver;
 
@@ -82,20 +83,29 @@ pub struct IngressStats {
 /// 共享统计句柄（attempt 内创建，step ⑧ 接入快照/REST）。
 pub type SharedIngressStats = Arc<Mutex<IngressStats>>;
 
-/// 运行 ingress 直到流关闭或 fatal。`endpoint_id` 即去重作用域与存储分区。
-/// 成功路径不存在（无限循环）：正常结束只可能被 abort（调用方负责）。
+/// 运行 ingress 直到流关闭、fatal 或优雅取消。`endpoint_id` 即去重作用域
+/// 与存储分区。
+///
+/// 优雅取消（Checkpoint B 方案 A）：cancel 只在循环头检查——当前
+/// commit+publish 必完整执行后才退出，杜绝"DB 已有但 Hub 未发布"的静默缺口
+/// （abort 只作为超时兜底，见 `attempt_session`）。
 pub async fn run_event_ingress(
     mut rx: EventReceiver,
     endpoint_id: String,
     services: Arc<EventServices>,
     stats: SharedIngressStats,
+    shutdown: CancellationToken,
 ) -> Result<(), IngressFatal> {
     let mut tracker = EventSequenceTracker::new();
     // 已见最大序号（epoch, seq）：tracker 不暴露内部 max，ingress 本地维护，
     // 用于 Regression fatal 的精确上下文（之前最大是多少）。
     let mut max_seen: Option<(u64, u64)> = None;
     loop {
-        let batch = rx.recv().await.ok_or(IngressFatal::StreamClosed)?;
+        let batch = tokio::select! {
+            b = rx.recv() => b.ok_or(IngressFatal::StreamClosed)?,
+            // 优雅退出：当前 commit+publish 已完成（循环尾），下次迭代不再取批
+            _ = shutdown.cancelled() => return Ok(()),
+        };
         stats.lock().unwrap().batches += 1;
         let (handle, epoch, seq) = (batch.connection_handle, batch.stream_epoch, batch.sequence);
         // Sequence Gate（PR5 冻结语义，PR7 第一次执法）

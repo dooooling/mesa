@@ -389,6 +389,9 @@ async fn attempt_session(
     // 统计句柄 step ⑧ 接入 Endpoint diagnostics，此处仅创建持有。
     let _ingress_stats: crate::event_ingress::SharedIngressStats =
         Arc::new(Mutex::new(IngressStats::default()));
+    // ingress 优雅取消令牌（Checkpoint B 方案 A）：attempt 结束时先 cancel，
+    // 当前 commit+publish 完整执行后退出；超时才 abort（见下方收尾）。
+    let ingress_shutdown = shutdown.child_token();
     let mut ingress: Option<tokio::task::JoinHandle<Result<(), IngressFatal>>> =
         match (event_rx, services) {
             (Some(rx), Some(svc)) => Some(tokio::spawn(run_event_ingress(
@@ -396,6 +399,7 @@ async fn attempt_session(
                 cfg.endpoint_id.clone(),
                 Arc::clone(svc),
                 Arc::clone(&_ingress_stats),
+                ingress_shutdown.clone(),
             ))),
             _ => None,
         };
@@ -417,11 +421,8 @@ async fn attempt_session(
     match config_res {
         Ok(()) => {}
         Err(outcome) => {
-            // 配置失败：ingress 若已 spawn（Start 前）一并 abort，避免无主消费
-            if let Some(h) = ingress {
-                h.abort();
-                let _ = h.await;
-            }
+            // 配置失败：ingress 若已 spawn（Start 前）优雅停下，避免无主消费
+            shutdown_ingress(ingress_shutdown.clone(), ingress).await;
             {
                 let mut sess = session_arc.lock().await;
                 sess.invalidate();
@@ -453,13 +454,9 @@ async fn attempt_session(
     )
     .await;
 
-    // ingress 收尾：abort 后等待结束。abort 时若正处 commit→publish 之间，
-    // commit 仍会落盘（writer 线程不受 abort 影响）而 hub 发布被跳过——
-    // 等价于一次 broadcast lag，SSE replay 按 seq 补回，不丢事实。
-    if let Some(h) = ingress {
-        h.abort();
-        let _ = h.await;
-    }
+    // ingress 收尾：优雅取消（当前 commit+publish 必完整执行，见
+    // run_event_ingress），杜绝"DB 已有但 Hub 未发布"的静默缺口。
+    shutdown_ingress(ingress_shutdown, ingress).await;
 
     {
         let sess = session_arc.lock().await;
@@ -480,6 +477,31 @@ async fn attempt_session(
 
 fn pb_shutdown_body() -> pb::envelope::Body {
     pb::envelope::Body::Shutdown(pb::Shutdown {})
+}
+
+/// ingress 优雅停机（Checkpoint B 方案 A）：先 cancel 让当前 commit+publish
+/// 完整执行，5s 内未退出才 abort（磁盘 hang 等极端情况，大声告警）。
+/// abort 兜底仍可能跳过 hub 发布——等价于一次 broadcast lag，SSE replay
+/// 按 seq 补回；DB 事实本身不受影响（writer 线程不受 abort 影响）。
+async fn shutdown_ingress(
+    cancel: CancellationToken,
+    ingress: Option<tokio::task::JoinHandle<Result<(), IngressFatal>>>,
+) {
+    let Some(h) = ingress else {
+        return;
+    };
+    cancel.cancel();
+    // NOTE: 不能用 timeout(h)——超时会 drop JoinHandle 使任务 detach 继续跑。
+    // select 保留所有权，超时后显式 abort。
+    let mut h = h;
+    tokio::select! {
+        _ = &mut h => {}
+        _ = tokio::time::sleep(Duration::from_secs(5)) => {
+            tracing::error!("event ingress did not exit in 5s, aborting");
+            h.abort();
+            let _ = h.await;
+        }
+    }
 }
 
 /// 配置闭环（§6.2）：Open -> Configure -> PointDescriptors -> ApplyPointMap -> Start。

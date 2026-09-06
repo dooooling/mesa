@@ -13,8 +13,9 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use mesa_config_store::{ConfigStore, DeviceRecord, EndpointRecord, StoreError};
-use mesa_core_types::AcquisitionTask;
+use mesa_core_types::{AcquisitionTask, EventTask};
 use mesa_driver_manager::{MesaManager, Snapshot};
+use mesa_event_store::{EventFilter, EventServices, StoredEvent};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
@@ -35,6 +36,22 @@ pub struct AppState {
     pub cert_store: Arc<CertStore>,
     /// 控制面总闸：默认关闭，需 --enable-control 显式开启（§22）
     pub enable_control: bool,
+    /// 事件面服务（PR7 v1.1 §20）。`None` = EventStore 不可用（§22）：
+    /// `/events*` 系接口 503，Data 面不受影响。
+    /// `OnceLock` 保证只注入一次；构造器签名零 churn，老调用方默认无事件。
+    pub events: std::sync::OnceLock<Option<Arc<EventServices>>>,
+}
+
+impl AppState {
+    /// 注入事件面服务（Mesad 在 EventStore 打开后调一次；测试按需调）。
+    pub fn set_event_services(&self, services: Arc<EventServices>) {
+        let _ = self.events.set(Some(services));
+    }
+
+    /// 取事件面服务（`None` 即不可用，调用方转 503）。
+    pub fn event_services(&self) -> Option<Arc<EventServices>> {
+        self.events.get().cloned().flatten()
+    }
 }
 
 impl AppState {
@@ -119,6 +136,7 @@ impl AppState {
             start_time: Instant::now(),
             cert_store,
             enable_control,
+            events: std::sync::OnceLock::new(),
         }))
     }
 
@@ -157,6 +175,7 @@ impl AppState {
                 start_time: Instant::now(),
                 cert_store,
                 enable_control,
+                events: std::sync::OnceLock::new(),
             })
         })
     }
@@ -1802,6 +1821,414 @@ async fn delete_task(
 }
 
 // ---------------------------------------------------------------------------
+// Events（PR7 v1.1 §16/§17）：历史 + 单条 + EventTask CRUD
+// ---------------------------------------------------------------------------
+
+/// EventStore 不可用时的统一回答（§22）：503 + 精确码，Data 面不受影响。
+fn events_unavailable() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json_error(
+            "EVENT_STORE_UNAVAILABLE",
+            "events.db unavailable; data plane unaffected",
+        )),
+    )
+}
+
+/// StoredEvent → v1.1 §16 响应形态。`attributes_json` 损坏（理论不可达，
+/// writer 写入前即合法 JSON）→ 整页 500 fail-closed，禁止静默吞行。
+/// NOTE: `stream_epoch`/`batch_sequence` 是 u64，JSON number 精确承载；
+/// JS 客户端超 2^53 会失精度——游标/ID 一律用 `seq`（i64 安全范围）。
+fn stored_event_json(
+    ev: &StoredEvent,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let attrs: serde_json::Value = serde_json::from_str(&ev.attributes_json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(
+                "INTERNAL",
+                &format!("corrupt attributes_json: {e}"),
+            )),
+        )
+    })?;
+    let condition = match (&ev.condition_id, &ev.transition) {
+        (None, None) => serde_json::Value::Null,
+        (id, tr) => serde_json::json!({
+            "condition_id": id,
+            "transition": tr,
+            "active": ev.active,
+            "acknowledged": ev.acknowledged,
+            "confirmed": ev.confirmed,
+            "retain": ev.retain,
+        }),
+    };
+    Ok(serde_json::json!({
+        "seq": ev.seq,
+        "endpoint_id": ev.endpoint_id,
+        "stream_epoch": ev.stream_epoch,
+        "batch_sequence": ev.batch_sequence,
+        "received_at_ns": ev.received_at_ns,
+        "event": {
+            "event_id": ev.event_id,
+            "category": ev.category,
+            "kind": ev.kind,
+            "source": ev.source,
+            "severity": ev.severity,
+            "code": ev.code,
+            "message": ev.message,
+            "message_locale": ev.message_locale,
+            "occurred_at_ns": ev.occurred_at_ns,
+            "published_at_ns": ev.published_at_ns,
+            "connection_handle": ev.connection_handle,
+            "condition": condition,
+            "correlation_id": ev.correlation_id,
+            "attributes": attrs,
+        },
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct EventsQuery {
+    endpoint_id: Option<String>,
+    category: Option<String>,
+    kind: Option<String>,
+    severity_min: Option<u16>,
+    code: Option<String>,
+    condition_id: Option<String>,
+    active: Option<bool>,
+    from_ns: Option<i64>,
+    to_ns: Option<i64>,
+    before_seq: Option<i64>,
+    after_seq: Option<i64>,
+    limit: Option<u32>,
+}
+
+async fn list_events(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<EventsQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(svc) = state.event_services() else {
+        return events_unavailable();
+    };
+    let filter = EventFilter {
+        endpoint_id: q.endpoint_id,
+        category: q.category,
+        kind: q.kind,
+        severity_min: q.severity_min,
+        code: q.code,
+        condition_id: q.condition_id,
+        active: q.active,
+        from_ns: q.from_ns,
+        to_ns: q.to_ns,
+        before_seq: q.before_seq,
+        after_seq: q.after_seq,
+        limit: q.limit,
+    };
+    // 阻塞式 SQLite 查询不得占 Tokio worker（与 writer 线程模型对应）
+    let store = svc.store.clone();
+    let res = tokio::task::spawn_blocking(move || store.query_history(&filter)).await;
+    match res {
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &format!("query task failed: {e}"))),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &e.to_string())),
+        ),
+        Ok(Ok((rows, next))) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for r in &rows {
+                match stored_event_json(r) {
+                    Ok(v) => out.push(v),
+                    Err(e) => return e,
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "events": out, "next_cursor": next })),
+            )
+        }
+    }
+}
+
+/// SSE replay 单页行数。replay 按页循环直到不满页；慢消费者追赶时每页
+/// 前进，必收敛（除非写入快于查询 sustained——彼时 lag 循环继续，属于
+/// 背压可见，不静默）。
+const SSE_REPLAY_PAGE: u32 = 1000;
+
+/// SSE 帧构造。 corruption 行返回 `None`（调用方结束流：客户端按最后收到
+/// 的 id 重连重试；该分支理论不可达——writer 写入的 attributes_json 恒合法）。
+/// fail-closed：不断发半坏帧；客户端重连后 replay 仍会撞到该行并再次结束——
+/// 响亮失败，而非静默跳行。
+fn sse_frame(ev: &StoredEvent) -> Option<axum::response::sse::Event> {
+    match stored_event_json(ev) {
+        Ok(v) => {
+            let data = serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
+            Some(
+                axum::response::sse::Event::default()
+                    .id(ev.seq.to_string())
+                    .event("mesa-event")
+                    .data(data),
+            )
+        }
+        Err(_) => {
+            tracing::error!(
+                seq = ev.seq,
+                "corrupt stored event in SSE path, ending stream"
+            );
+            None
+        }
+    }
+}
+
+/// 从 `from` 开始重放，返回 `(last_sent, frames)`；DB 失败返回 `None`
+/// （调用方结束流，客户端按旧游标重连重试）。
+async fn sse_replay_frames(
+    store: Arc<mesa_event_store::EventStore>,
+    from: i64,
+) -> Option<(
+    i64,
+    Vec<Result<axum::response::sse::Event, std::convert::Infallible>>,
+)> {
+    let mut cursor = from;
+    let mut frames = Vec::new();
+    loop {
+        let s = store.clone();
+        let page = match tokio::task::spawn_blocking(move || {
+            s.replay_range(cursor, SSE_REPLAY_PAGE)
+        })
+        .await
+        {
+            Ok(Ok(p)) => p,
+            // DB 失败 / 任务失败 → 结束流（客户端按旧游标重连重试）
+            _ => return None,
+        };
+        if page.is_empty() {
+            break;
+        }
+        let full = page.len() == SSE_REPLAY_PAGE as usize;
+        for ev in &page {
+            let f = sse_frame(ev)?;
+            cursor = ev.seq;
+            frames.push(Ok(f));
+        }
+        if !full {
+            break;
+        }
+    }
+    Some((cursor, frames))
+}
+
+#[derive(Debug, Deserialize)]
+struct LiveQuery {
+    after_seq: Option<i64>,
+}
+
+/// Live SSE（PR7 v1.1 §18 九步协议）：
+/// 1. handler 内先 subscribe（重放查询之前）；2. 合并游标
+///    `max(query.after_seq, Last-Event-ID)`；3. 有游标则 DB replay，
+///    无则记 high-water 后 live-only；4. last_sent 去重；5. Hub live；
+/// 6. `seq <= last_sent` 跳过；7. Lagged → DB catch-up；8. Hub 关闭则结束。
+///
+/// 无游标新连接默认 live-only（不灌历史；回填用显式 `?after_seq=`）。
+/// 断开清理：流 drop 即取消，Receiver 释放，`receiver_count` 回落——无显式注销。
+async fn events_live(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<LiveQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<
+    axum::response::sse::Sse<
+        impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+    (StatusCode, Json<serde_json::Value>),
+> {
+    let svc = state.event_services().ok_or_else(events_unavailable)?;
+    // 非法游标 400：静默当 absent 会藏掉客户端真正想要的重放起点
+    let header_cursor: Option<i64> = match headers.get("last-event-id") {
+        None => None,
+        Some(v) => Some(
+            v.to_str()
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json_error("VALIDATION_ERROR", "invalid Last-Event-ID")),
+                    )
+                })?,
+        ),
+    };
+    let effective = [q.after_seq, header_cursor].into_iter().flatten().max();
+
+    // 1. 先 subscribe：此后提交的行进 hub 缓存；handler 之前提交的行由 replay 覆盖
+    let hub_rx = svc.hub.subscribe();
+    let store = svc.store.clone();
+    let s = async_stream::stream! {
+        // 3/4. replay 或 high-water
+        let mut last_sent: i64 = match effective {
+            Some(cur) => {
+                let Some((cur2, frames)) = sse_replay_frames(store.clone(), cur).await else {
+                    return;
+                };
+                for f in frames {
+                    yield f;
+                }
+                cur2
+            }
+            None => {
+                // live-only：记当前最大 seq 为分水岭（此后提交的行走 live）
+                match tokio::task::spawn_blocking({
+                    let store = store.clone();
+                    move || store.max_seq()
+                })
+                .await
+                {
+                    Ok(Ok(m)) => m,
+                    _ => return,
+                }
+            }
+        };
+        // 5/6/7/8. live + 去重 + Lagged catch-up
+        let mut rx = hub_rx;
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    if ev.seq <= last_sent {
+                        continue;
+                    }
+                    last_sent = ev.seq;
+                    // corrupt 即结束流（见 sse_frame；Infallible 无值可构造，
+                    // 故显式 match 而非 map）
+                    let Some(f) = sse_frame(&ev) else {
+                        return;
+                    };
+                    yield Ok(f);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, last_sent, "SSE slow consumer, catching up from DB");
+                    let Some((cur2, frames)) = sse_replay_frames(store.clone(), last_sent).await
+                    else {
+                        return;
+                    };
+                    for f in frames {
+                        yield f;
+                    }
+                    last_sent = cur2;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Ok(axum::response::sse::Sse::new(s).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    ))
+}
+
+async fn get_event(
+    State(state): State<Arc<AppState>>,
+    Path(seq): Path<i64>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(svc) = state.event_services() else {
+        return events_unavailable();
+    };
+    let store = svc.store.clone();
+    let res = tokio::task::spawn_blocking(move || store.query_by_seq(seq)).await;
+    match res {
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &format!("query task failed: {e}"))),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &e.to_string())),
+        ),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("event seq `{seq}`"))),
+        ),
+        Ok(Ok(Some(row))) => match stored_event_json(&row) {
+            Ok(v) => (StatusCode::OK, Json(v)),
+            Err(e) => e,
+        },
+    }
+}
+
+async fn list_event_tasks(
+    State(state): State<Arc<AppState>>,
+    Path(endpoint_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.store.list_event_tasks(&endpoint_id) {
+        Ok(v) => {
+            let rev = state.store.current_revision(&endpoint_id).unwrap_or(0);
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({ "endpoint_id": endpoint_id, "revision": rev, "event_tasks": v }),
+                ),
+            )
+        }
+        Err(e) => store_err_to_response(e),
+    }
+}
+
+async fn put_event_tasks(
+    State(state): State<Arc<AppState>>,
+    Path(endpoint_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // body 可为 {event_tasks:[...]} 或直接 [...]（与 put_tasks_for_endpoint 同宽容）
+    let tasks: Vec<EventTask> = if let Some(arr) = body.get("event_tasks") {
+        match serde_json::from_value(arr.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_error("VALIDATION_ERROR", &e.to_string())),
+                );
+            }
+        }
+    } else if body.is_array() {
+        match serde_json::from_value(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_error("VALIDATION_ERROR", &e.to_string())),
+                );
+            }
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "VALIDATION_ERROR",
+                "body 需为 {event_tasks:[...]} 或 [...]",
+            )),
+        );
+    };
+    // 运行中禁止修改（与 Data tasks 同语义，v1.1 §17：无 PATCH，只有全量 replace）
+    if state.manager.is_running(&endpoint_id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json_error(
+                "CONFLICT",
+                "endpoint 正在运行，请先停止后再修改事件任务",
+            )),
+        );
+    }
+    match state.store.replace_event_tasks(&endpoint_id, &tasks) {
+        Ok(rev) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "endpoint_id": endpoint_id, "revision": rev })),
+        ),
+        Err(e) => store_err_to_response(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // drivers rescan
 // ---------------------------------------------------------------------------
 
@@ -2030,6 +2457,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/tasks", get(list_tasks).post(replace_tasks))
         .route("/api/v1/tasks/{endpoint_id}", put(put_tasks_for_endpoint))
         .route("/api/v1/tasks/{endpoint_id}/{task_id}", delete(delete_task))
+        // Events（PR7 v1.1 §16/§17）。
+        // NOTE: `/events/live`（⑦ SSE，静态段）与 `/events/{seq}`（动态段）
+        // 共存——axum 静态优先，无需调序（同 certificates/opcua 前例）。
+        .route("/api/v1/events", get(list_events))
+        .route("/api/v1/events/live", get(events_live))
+        .route("/api/v1/events/{seq}", get(get_event))
+        .route(
+            "/api/v1/endpoints/{id}/event-tasks",
+            get(list_event_tasks).put(put_event_tasks),
+        )
         // 证书管理 §19.3（显式路由避免 Axum 参数与静态路径 405 冲突）
         .route(
             "/api/v1/certificates/opcua/diagnostics",

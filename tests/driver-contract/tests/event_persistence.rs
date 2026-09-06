@@ -7,14 +7,20 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mesa_core_types::{DriverBinding, EventTask, TaskMode};
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use mesa_core_types::{DriverBinding, EventBatch, EventRecord, EventTask, TaskMode, Value};
 use mesa_driver_manager::MesaManager;
 use mesa_driver_manager::endpoint::BuiltinEndpoint;
 use mesa_driver_simulator::{EVENT_BINDING_KIND, SIM_EVENT_STREAM_ALARM};
-use mesa_event_store::{EVENT_HUB_CAPACITY, EventFilter, EventHub, EventServices, EventStore};
+use mesa_event_store::{
+    CommitRequest, EVENT_HUB_CAPACITY, EventFilter, EventHub, EventServices, EventStore,
+};
+use tower::ServiceExt;
 
 use common::*;
 
@@ -197,6 +203,347 @@ async fn event_ids_unique_across_driver_process_restart() {
     ids.sort_unstable();
     ids.dedup();
     assert_eq!(ids.len(), 8, "跨进程 event_id 必须互异");
+    drop(mgr);
+    let _ = std::fs::remove_file(&db);
+}
+
+/// ⑤ History REST：播种 5 行后验证分页/过滤/单条/404；
+/// 无 EventServices 时 503 精确码。
+#[tokio::test]
+async fn event_history_rest_pagination_filters_and_detail() {
+    common::init_log();
+    let db = tmp_events_db("rest");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(EventStore::open(&db).unwrap());
+
+    // 播种：5 条 alarm（severity 递增，便于过滤断言）
+    let mut events = Vec::new();
+    for i in 0..5 {
+        events.push(EventRecord {
+            event_id: format!("seed-{i}"),
+            category: if i % 2 == 0 {
+                "alarm".into()
+            } else {
+                "message".into()
+            },
+            kind: "alarm.condition".into(),
+            source: "Channel1".into(),
+            severity: (i * 200) as u16,
+            code: Some("SEED".into()),
+            message: Some(format!("seed event {i}")),
+            message_locale: None,
+            occurred_at_ns: None,
+            condition: None,
+            correlation_id: None,
+            attributes: BTreeMap::from([("i".into(), Value::I32(i))]),
+        });
+    }
+    let res = store
+        .commit_batch(CommitRequest {
+            endpoint_id: "ct-rest-001".into(),
+            batch: EventBatch {
+                connection_handle: 1,
+                stream_epoch: 0xE100,
+                sequence: 1,
+                timestamp_ns: 1_700_000_000_000_000_000,
+                events,
+                mono_ns: None,
+            },
+            received_at_ns: 1_700_000_000_000_000_001,
+        })
+        .await
+        .unwrap();
+    assert_eq!(res.inserted.len(), 5);
+    let first_seq = res.inserted[0].seq;
+
+    let drivers_dir = repo_root().join("drivers");
+    let cfg_store = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
+    let mgr = Arc::new(MesaManager::discover(&drivers_dir));
+    #[allow(deprecated)]
+    let state =
+        mesa_core_api::AppState::new(mgr, cfg_store, drivers_dir.to_string_lossy().to_string());
+    state.set_event_services(EventServices::new(
+        store.clone(),
+        EventHub::new(EVENT_HUB_CAPACITY),
+    ));
+    let app = mesa_core_api::router(state);
+
+    async fn get(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    // 全量：5 行 DESC，第 0 行 seq 最大
+    let (st, v) = get(app.clone(), "/api/v1/events?endpoint_id=ct-rest-001").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["events"].as_array().unwrap().len(), 5);
+    assert!(v["events"][0]["seq"].as_i64().unwrap() > v["events"][4]["seq"].as_i64().unwrap());
+    assert_eq!(v["events"][0]["event"]["event_id"], "seed-4");
+    assert!(v["next_cursor"].is_null());
+    // 形态：top-level + event 嵌套
+    assert_eq!(v["events"][0]["endpoint_id"], "ct-rest-001");
+    assert_eq!(v["events"][0]["event"]["severity"], 800);
+    // attributes 保持 typed Value 派生形态（PR8 UI 按此解释类型）
+    assert_eq!(
+        v["events"][0]["event"]["attributes"]["i"],
+        serde_json::json!({"I32": 4})
+    );
+
+    // 分页：limit=2 走三页，无重复无遗漏
+    let (st, p1) = get(
+        app.clone(),
+        "/api/v1/events?endpoint_id=ct-rest-001&limit=2",
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(p1["events"].as_array().unwrap().len(), 2);
+    let c1 = p1["next_cursor"].as_i64().expect("还有后页");
+    let (st, p2) = get(
+        app.clone(),
+        &format!("/api/v1/events?endpoint_id=ct-rest-001&limit=2&before_seq={c1}"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(p2["events"].as_array().unwrap().len(), 2);
+    let c2 = p2["next_cursor"].as_i64().expect("还有后页");
+    let (st, p3) = get(
+        app.clone(),
+        &format!("/api/v1/events?endpoint_id=ct-rest-001&limit=2&before_seq={c2}"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(p3["events"].as_array().unwrap().len(), 1);
+    assert!(p3["next_cursor"].is_null());
+    let mut all: Vec<i64> = [&p1, &p2, &p3]
+        .iter()
+        .flat_map(|p| p["events"].as_array().unwrap().iter())
+        .map(|e| e["seq"].as_i64().unwrap())
+        .collect();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), 5);
+
+    // 过滤
+    let (st, v) = get(app.clone(), "/api/v1/events?category=alarm").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["events"].as_array().unwrap().len(), 3);
+    let (st, v) = get(app.clone(), "/api/v1/events?severity_min=400").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["events"].as_array().unwrap().len(), 3);
+
+    // 单条 + 404
+    let (st, v) = get(app.clone(), &format!("/api/v1/events/{first_seq}")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["seq"], first_seq);
+    assert_eq!(v["event"]["event_id"], "seed-0");
+    let (st, _) = get(app.clone(), "/api/v1/events/999999999").await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // 无服务 → 503 精确码
+    let mgr2 = Arc::new(MesaManager::discover(&repo_root().join("drivers")));
+    let cfg2 = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
+    #[allow(deprecated)]
+    let state2 = mesa_core_api::AppState::new(
+        mgr2,
+        cfg2,
+        repo_root().join("drivers").to_string_lossy().to_string(),
+    );
+    let app2 = mesa_core_api::router(state2);
+    let (st, v) = get(app2, "/api/v1/events").await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(v["error"]["code"], "EVENT_STORE_UNAVAILABLE");
+
+    let _ = std::fs::remove_file(&db);
+}
+
+/// ⑤ EventTask REST：PUT/GET 全量快照；运行中 409。
+#[tokio::test]
+async fn event_task_rest_crud_and_running_conflict() {
+    common::init_log();
+    let db = tmp_events_db("taskrest");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(EventStore::open(&db).unwrap());
+
+    let drivers_dir = repo_root().join("drivers");
+    let cfg_store = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
+    cfg_store
+        .create_device(&mesa_config_store::DeviceRecord {
+            id: "d1".into(),
+            name: "D1".into(),
+            profile: None,
+        })
+        .unwrap();
+    cfg_store
+        .create_endpoint(&mesa_config_store::EndpointRecord {
+            id: "ct-task-001".into(),
+            device_id: "d1".into(),
+            driver_id: "simulator".into(),
+            connection_json: "{}".into(),
+            desired_running: false,
+            updated_at_ns: 0,
+        })
+        .unwrap();
+    let mgr = Arc::new(MesaManager::discover(&drivers_dir));
+    #[allow(deprecated)]
+    let state = mesa_core_api::AppState::new(
+        mgr.clone(),
+        cfg_store,
+        drivers_dir.to_string_lossy().to_string(),
+    );
+    state.set_event_services(EventServices::new(store, EventHub::new(EVENT_HUB_CAPACITY)));
+    let app = mesa_core_api::router(state);
+
+    async fn put(
+        app: axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .uri(uri)
+            .method("PUT")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    async fn get(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    let body = serde_json::json!({"event_tasks": [{
+        "id": "al", "mode": "subscribe", "interval_ms": null,
+        "binding": {"kind": "simulator.events", "config": {"stream": "sim.events.alarm-cycle"}}
+    }]});
+    let (st, v) = put(
+        app.clone(),
+        "/api/v1/endpoints/ct-task-001/event-tasks",
+        body,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["revision"], 1);
+    let (st, v) = get(app.clone(), "/api/v1/endpoints/ct-task-001/event-tasks").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["event_tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(v["event_tasks"][0]["id"], "al");
+
+    // 启动后 PUT → 409（需先提供 data task 才能 start）
+    let _ = put(
+        app.clone(),
+        "/api/v1/endpoints/ct-task-001/event-tasks",
+        serde_json::json!({"event_tasks": []}),
+    )
+    .await;
+    // 直接经 manager 启动（带 data task），再 PUT 事件任务 → 409
+    mgr.start_endpoint(BuiltinEndpoint {
+        endpoint_id: "ct-task-001".into(),
+        driver_id: "simulator".into(),
+        connection_json: "{}".into(),
+        tasks: vec![poll_task(
+            "t1",
+            50,
+            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+        )],
+        event_tasks: vec![],
+    })
+    .unwrap();
+    let (st, v) = put(
+        app.clone(),
+        "/api/v1/endpoints/ct-task-001/event-tasks",
+        serde_json::json!({"event_tasks": []}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(v["error"]["code"], "CONFLICT");
+    assert!(mgr.stop_endpoint("ct-task-001").await);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+/// 优雅停机证明（Checkpoint B 方案 A）：stop 时正在飞的 commit 必完整
+/// publish 后 ingress 才退出——DB 有的行 Hub 全有（commit-but-not-published
+/// 缺口不存在）。订阅必须在 Start 前建立（早订阅者视角）。
+#[tokio::test]
+async fn graceful_shutdown_publishes_every_commit() {
+    common::init_log();
+    let db = tmp_events_db("graceful");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(EventStore::open(&db).unwrap());
+    let hub = EventHub::new(EVENT_HUB_CAPACITY);
+    // 早订阅：Start 前即位，不漏任何已提交行
+    let mut live = hub.subscribe();
+    let mgr = MesaManager::discover(&repo_root().join("drivers"));
+    mgr.set_event_services(EventServices::new(store.clone(), hub));
+
+    mgr.start_endpoint(BuiltinEndpoint {
+        endpoint_id: "ct-evt-grace".into(),
+        driver_id: "simulator".into(),
+        connection_json: "{}".into(),
+        tasks: vec![poll_task(
+            "t1",
+            50,
+            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+        )],
+        event_tasks: vec![alarm_task()],
+    })
+    .unwrap();
+    wait_until(15, || {
+        store
+            .query_history(&EventFilter {
+                endpoint_id: Some("ct-evt-grace".into()),
+                ..Default::default()
+            })
+            .map(|(rows, _)| rows.len() >= 4)
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(mgr.stop_endpoint("ct-evt-grace").await);
+
+    // 排空 Hub：DB 有的 event_id 必须全在 Hub 里
+    let (db_rows, _) = store
+        .query_history(&EventFilter {
+            endpoint_id: Some("ct-evt-grace".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut hub_ids = std::collections::HashSet::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while hub_ids.len() < db_rows.len() && std::time::Instant::now() < deadline {
+        match tokio::time::timeout(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            live.recv(),
+        )
+        .await
+        {
+            Ok(Ok(ev)) => {
+                hub_ids.insert(ev.event_id);
+            }
+            _ => break,
+        }
+    }
+    for r in &db_rows {
+        assert!(
+            hub_ids.contains(&r.event_id),
+            "已提交 {} 必须已发布到 Hub",
+            r.event_id
+        );
+    }
     drop(mgr);
     let _ = std::fs::remove_file(&db);
 }

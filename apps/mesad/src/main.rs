@@ -57,23 +57,27 @@ async fn main() {
         .events_db_path
         .clone()
         .unwrap_or_else(|| default_events_db_path(&db_path));
-    match mesa_event_store::EventStore::open(&events_db_path) {
-        Ok(event_store) => {
-            let services = mesa_event_store::EventServices::new(
-                Arc::new(event_store),
-                mesa_event_store::EventHub::new(mesa_event_store::EVENT_HUB_CAPACITY),
-            );
-            manager.set_event_services(services);
-            tracing::info!(db = %events_db_path.display(), "events.db opened");
-        }
-        Err(e) => {
-            tracing::error!(
-                db = %events_db_path.display(),
-                "events.db unavailable ({e}); data-only endpoints still run, \
-                 event-enabled endpoints will refuse to start"
-            );
-        }
-    }
+    // Option 分两步：manager（运行期）与 AppState（REST/SSE）各持一份
+    let event_services: Option<Arc<mesa_event_store::EventServices>> =
+        match mesa_event_store::EventStore::open(&events_db_path) {
+            Ok(event_store) => {
+                let services = mesa_event_store::EventServices::new(
+                    Arc::new(event_store),
+                    mesa_event_store::EventHub::new(mesa_event_store::EVENT_HUB_CAPACITY),
+                );
+                manager.set_event_services(services.clone());
+                tracing::info!(db = %events_db_path.display(), "events.db opened");
+                Some(services)
+            }
+            Err(e) => {
+                tracing::error!(
+                    db = %events_db_path.display(),
+                    "events.db unavailable ({e}); data-only endpoints still run, \
+                     event-enabled endpoints will refuse to start"
+                );
+                None
+            }
+        };
 
     // ---- PKI 初始化（必须在恢复 Endpoint/启动 Driver 之前，确保 OPC UA Secure 证书就绪）----
     // 只 resolve 一次 PKI 路径，Core 与 Driver 共用（自定义 MESA_OPCUA_PKI_DIR 时避免分叉）
@@ -102,6 +106,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // REST/SSE 的事件面（⑥）：有则注入，无则 /events* 系 503
+    if let Some(svc) = event_services {
+        app_state.set_event_services(svc);
+    }
 
     // ---- 恢复期望运行的 Endpoint（已保证 PKI/证书就绪，避免 Secure Endpoint 竞态）----
     let stored_eps = store.list_endpoints().unwrap_or_default();

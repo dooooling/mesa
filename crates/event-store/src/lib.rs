@@ -13,7 +13,7 @@ mod schema;
 mod writer;
 
 pub use hub::{EVENT_HUB_CAPACITY, EventHub};
-pub use query::{EventFilter, query_history};
+pub use query::{EventFilter, max_seq, query_by_seq, query_history, query_range_asc};
 pub use schema::{EVENT_SCHEMA_VERSION, StoredEvent, transition_str};
 pub use writer::{CommitRequest, CommitResult, EventStoreStats};
 
@@ -388,6 +388,28 @@ impl EventStore {
     ) -> Result<(Vec<schema::StoredEvent>, Option<i64>), EventStoreError> {
         let conn = self.reader.lock().unwrap();
         query::query_history(&conn, filter)
+    }
+
+    /// 按 seq 取单行（阻塞式；同上 spawn_blocking 包裹）。
+    pub fn query_by_seq(&self, seq: i64) -> Result<Option<schema::StoredEvent>, EventStoreError> {
+        let conn = self.reader.lock().unwrap();
+        query::query_by_seq(&conn, seq)
+    }
+
+    /// SSE replay 页（阻塞式；见上）。
+    pub fn replay_range(
+        &self,
+        after_seq: i64,
+        limit: u32,
+    ) -> Result<Vec<schema::StoredEvent>, EventStoreError> {
+        let conn = self.reader.lock().unwrap();
+        query::query_range_asc(&conn, after_seq, limit)
+    }
+
+    /// 当前最大 seq（阻塞式；见上）。
+    pub fn max_seq(&self) -> Result<i64, EventStoreError> {
+        let conn = self.reader.lock().unwrap();
+        query::max_seq(&conn)
     }
 
     /// 小批量 purge（retention 用）：删除 `seq < cutoff` 最多 `limit` 行，

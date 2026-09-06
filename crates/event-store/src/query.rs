@@ -108,3 +108,37 @@ pub fn query_history(
     };
     Ok((rows, next_cursor))
 }
+
+/// 按 seq 取单行（detail drawer 用）。无行返回 `Ok(None)`，调用方转 404。
+pub fn query_by_seq(conn: &Connection, seq: i64) -> Result<Option<StoredEvent>, EventStoreError> {
+    let sql = format!("SELECT {} FROM events WHERE seq = ?1", schema::SELECT_COLS);
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query_map([seq], schema::row_to_stored)?;
+    match rows.next() {
+        Some(r) => Ok(Some(r?)),
+        None => Ok(None),
+    }
+}
+
+/// SSE replay 页：`seq > after` 的行按 ASC 取 `limit` 条（调用方循环翻页
+/// 直到不满页；与 history 的 DESC 分页互不干扰）。
+pub fn query_range_asc(
+    conn: &Connection,
+    after_seq: i64,
+    limit: u32,
+) -> Result<Vec<StoredEvent>, EventStoreError> {
+    let sql = format!(
+        "SELECT {} FROM events WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
+        schema::SELECT_COLS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map((after_seq, limit as i64), schema::row_to_stored)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(EventStoreError::Fatal)
+}
+
+/// 当前最大 seq（无行则 0；live-only 连接的 high-water mark）。
+pub fn max_seq(conn: &Connection) -> Result<i64, EventStoreError> {
+    let v: Option<i64> = conn.query_row("SELECT MAX(seq) FROM events", [], |r| r.get(0))?;
+    Ok(v.unwrap_or(0))
+}
