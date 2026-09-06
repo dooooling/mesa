@@ -1982,42 +1982,34 @@ fn sse_frame(ev: &StoredEvent) -> Option<axum::response::sse::Event> {
     }
 }
 
-/// 从 `from` 开始重放，返回 `(last_sent, frames)`；DB 失败返回 `None`
+type SseItem = Result<axum::response::sse::Event, std::convert::Infallible>;
+
+/// 单页 catch-up（P0-2 流式）：查 `PAGE+1` 行，满页则留 1 行探知"还有更多"，
+/// 只返回 `PAGE` 帧并报告未穷尽。调用方逐页 yield，任意时刻最多持有约
+/// 一页（历史再大也不先堆完再发；DB 持续写时由 high-water/游标收敛）。
+/// 返回 `(new_cursor, frames, exhausted)`；`None` = DB 失败或坏行
 /// （调用方结束流，客户端按旧游标重连重试）。
-async fn sse_replay_frames(
-    store: Arc<mesa_event_store::EventStore>,
+async fn sse_catch_up_page(
+    store: &Arc<mesa_event_store::EventStore>,
     from: i64,
-) -> Option<(
-    i64,
-    Vec<Result<axum::response::sse::Event, std::convert::Infallible>>,
-)> {
-    let mut cursor = from;
-    let mut frames = Vec::new();
-    loop {
-        let s = store.clone();
-        let page = match tokio::task::spawn_blocking(move || {
-            s.replay_range(cursor, SSE_REPLAY_PAGE)
-        })
+) -> Option<(i64, Vec<SseItem>, bool)> {
+    let s = store.clone();
+    let page = match tokio::task::spawn_blocking(move || s.replay_range(from, SSE_REPLAY_PAGE + 1))
         .await
-        {
-            Ok(Ok(p)) => p,
-            // DB 失败 / 任务失败 → 结束流（客户端按旧游标重连重试）
-            _ => return None,
-        };
-        if page.is_empty() {
-            break;
-        }
-        let full = page.len() == SSE_REPLAY_PAGE as usize;
-        for ev in &page {
-            let f = sse_frame(ev)?;
-            cursor = ev.seq;
-            frames.push(Ok(f));
-        }
-        if !full {
-            break;
-        }
+    {
+        Ok(Ok(p)) => p,
+        // DB 失败 / 任务失败 → 结束流（客户端按旧游标重连重试）
+        _ => return None,
+    };
+    let exhausted = page.len() <= SSE_REPLAY_PAGE as usize;
+    let mut cursor = from;
+    let mut frames = Vec::with_capacity(page.len().min(SSE_REPLAY_PAGE as usize));
+    for ev in page.into_iter().take(SSE_REPLAY_PAGE as usize) {
+        let f = sse_frame(&ev)?;
+        cursor = ev.seq;
+        frames.push(Ok(f));
     }
-    Some((cursor, frames))
+    Some((cursor, frames, exhausted))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2025,11 +2017,21 @@ struct LiveQuery {
     after_seq: Option<i64>,
 }
 
-/// Live SSE（PR7 v1.1 §18 九步协议）：
-/// 1. handler 内先 subscribe（重放查询之前）；2. 合并游标
-///    `max(query.after_seq, Last-Event-ID)`；3. 有游标则 DB replay，
-///    无则记 high-water 后 live-only；4. last_sent 去重；5. Hub live；
-/// 6. `seq <= last_sent` 跳过；7. Lagged → DB catch-up；8. Hub 关闭则结束。
+/// Live SSE（Checkpoint B 收紧版；原则：**Hub 是提示、DB seq 是交付权威**）：
+/// ```text
+/// CONNECT
+///   parse cursor → hub.subscribe() → connect_high_water = DB.max_seq()
+///   → HTTP 200（P0-3：boundary 在 200 前固定）
+/// 有 cursor：pagewise replay (cursor, high_water]（P0-2 流式有界）
+/// 无 cursor：live-only，last_sent = high_water
+/// LIVE LOOP（select!）：
+///   Hub seq <= last_sent → duplicate skip
+///   Hub seq == last_sent+1 → fast emit
+///   Hub seq > last_sent+1 → DB catch-up ASC（P0-1 多 ingress 乱序）
+///   Hub Lagged → DB catch-up ASC
+///   15s tick → DB reconcile（P1：abort 漏 publish 的最终兜底）
+///   Hub Closed → 结束
+/// ```
 ///
 /// 无游标新连接默认 live-only（不灌历史；回填用显式 `?after_seq=`）。
 /// 断开清理：流 drop 即取消，Receiver 释放，`receiver_count` 回落——无显式注销。
@@ -2038,9 +2040,7 @@ async fn events_live(
     Query(q): Query<LiveQuery>,
     headers: axum::http::HeaderMap,
 ) -> Result<
-    axum::response::sse::Sse<
-        impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
-    >,
+    axum::response::sse::Sse<impl tokio_stream::Stream<Item = SseItem>>,
     (StatusCode, Json<serde_json::Value>),
 > {
     let svc = state.event_services().ok_or_else(events_unavailable)?;
@@ -2061,62 +2061,137 @@ async fn events_live(
     };
     let effective = [q.after_seq, header_cursor].into_iter().flatten().max();
 
-    // 1. 先 subscribe：此后提交的行进 hub 缓存；handler 之前提交的行由 replay 覆盖
+    // subscribe → high-water 都在返回 200 之前固定（P0-3）：客户端拿到 200
+    // 后发生的 commit 必属于 live，不会被当成历史 baseline 吃掉。
     let hub_rx = svc.hub.subscribe();
     let store = svc.store.clone();
+    let connect_high_water = match tokio::task::spawn_blocking({
+        let store = store.clone();
+        move || store.max_seq()
+    })
+    .await
+    {
+        Ok(Ok(m)) => m,
+        _ => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error("INTERNAL", "events high-water unavailable")),
+            ));
+        }
+    };
     let s = async_stream::stream! {
-        // 3/4. replay 或 high-water
+        // 初始 replay（P0-2）：逐页 yield，内存只驻一页；只追到连接时刻的
+        // high-water（有界——DB 持续写也不追"移动中的终点"，剩下的走 live）。
         let mut last_sent: i64 = match effective {
             Some(cur) => {
-                let Some((cur2, frames)) = sse_replay_frames(store.clone(), cur).await else {
-                    return;
-                };
-                for f in frames {
-                    yield f;
-                }
-                cur2
-            }
-            None => {
-                // live-only：记当前最大 seq 为分水岭（此后提交的行走 live）
-                match tokio::task::spawn_blocking({
-                    let store = store.clone();
-                    move || store.max_seq()
-                })
-                .await
-                {
-                    Ok(Ok(m)) => m,
-                    _ => return,
-                }
-            }
-        };
-        // 5/6/7/8. live + 去重 + Lagged catch-up
-        let mut rx = hub_rx;
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    if ev.seq <= last_sent {
-                        continue;
-                    }
-                    last_sent = ev.seq;
-                    // corrupt 即结束流（见 sse_frame；Infallible 无值可构造，
-                    // 故显式 match 而非 map）
-                    let Some(f) = sse_frame(&ev) else {
-                        return;
-                    };
-                    yield Ok(f);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, last_sent, "SSE slow consumer, catching up from DB");
-                    let Some((cur2, frames)) = sse_replay_frames(store.clone(), last_sent).await
-                    else {
+                let mut cursor = cur;
+                while cursor < connect_high_water {
+                    let Some((cur2, frames, _)) = sse_catch_up_page(&store, cursor).await else {
                         return;
                     };
                     for f in frames {
                         yield f;
                     }
-                    last_sent = cur2;
+                    // 空页/DB 无进展即停（high-water 内行数固定，不会死循环）
+                    if cur2 == cursor {
+                        break;
+                    }
+                    cursor = cur2;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                cursor
+            }
+            None => connect_high_water,
+        };
+        let mut rx = hub_rx;
+        // reconcile 心跳：首 tick 立即消费（interval 首 tick 即时触发语义）
+        let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(15));
+        reconcile.tick().await;
+        loop {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Ok(ev) => {
+                        if ev.seq <= last_sent {
+                            // duplicate（重放/Hub 重叠、乱序迟到）：跳过
+                            continue;
+                        }
+                        if ev.seq > last_sent + 1 {
+                            // P0-1：Hub 顺序 ≠ 交付顺序。多 ingress 并发下
+                            // publish 可能乱序（101 先于 100），直接发会让
+                            // 100 永久丢失——回 DB 按 seq ASC 补齐再发。
+                            tracing::debug!(
+                                got = ev.seq,
+                                last_sent,
+                                "SSE hub gap, catching up from DB"
+                            );
+                            loop {
+                                let Some((cur2, frames, done)) =
+                                    sse_catch_up_page(&store, last_sent).await
+                                else {
+                                    return;
+                                };
+                                for f in frames {
+                                    yield f;
+                                }
+                                last_sent = cur2;
+                                if done {
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        // fast-path：严格下一行，直接发
+                        last_sent = ev.seq;
+                        let Some(f) = sse_frame(&ev) else {
+                            return;
+                        };
+                        yield Ok(f);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, last_sent, "SSE slow consumer, catching up from DB");
+                        loop {
+                            let Some((cur2, frames, done)) =
+                                sse_catch_up_page(&store, last_sent).await
+                            else {
+                                return;
+                            };
+                            for f in frames {
+                                yield f;
+                            }
+                            last_sent = cur2;
+                            if done {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = reconcile.tick() => {
+                    // P1：abort 兜底漏 publish（commit 落盘但 Hub 未发）无任何
+                    // Hub 信号，只能靠 DB 对账发现。慢连接 15s 一次 max 循环，
+                    // 代价一次索引聚合，可接受。
+                    let check = {
+                        let store = store.clone();
+                        tokio::task::spawn_blocking(move || store.max_seq()).await
+                    };
+                    let behind = matches!(check, Ok(Ok(m)) if m > last_sent);
+                    if behind {
+                        tracing::debug!(last_sent, "SSE reconcile found new rows, catching up");
+                        loop {
+                            let Some((cur2, frames, done)) =
+                                sse_catch_up_page(&store, last_sent).await
+                            else {
+                                return;
+                            };
+                            for f in frames {
+                                yield f;
+                            }
+                            last_sent = cur2;
+                            if done {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
     };

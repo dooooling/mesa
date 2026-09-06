@@ -389,9 +389,10 @@ async fn attempt_session(
     // 统计句柄 step ⑧ 接入 Endpoint diagnostics，此处仅创建持有。
     let _ingress_stats: crate::event_ingress::SharedIngressStats =
         Arc::new(Mutex::new(IngressStats::default()));
-    // ingress 优雅取消令牌（Checkpoint B 方案 A）：attempt 结束时先 cancel，
-    // 当前 commit+publish 完整执行后退出；超时才 abort（见下方收尾）。
-    let ingress_shutdown = shutdown.child_token();
+    // ingress 优雅取消令牌（Checkpoint B 方案 A）：独立 token，只在
+    // shutdown_ingress() 里 cancel。不能用 child_token——父 shutdown cancel
+    // 会抢先触发，与 event_loop 的正常退出竞争，把"优雅停机"误判成 Lost。
+    let ingress_shutdown = CancellationToken::new();
     let mut ingress: Option<tokio::task::JoinHandle<Result<(), IngressFatal>>> =
         match (event_rx, services) {
             (Some(rx), Some(svc)) => Some(tokio::spawn(run_event_ingress(

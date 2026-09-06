@@ -287,41 +287,108 @@ async fn sse_cursor_max_rule_and_bad_header() {
     let _ = std::fs::remove_file(&db);
 }
 
-/// Lagged → DB catch-up：小 hub + 洪峰，帧覆盖全部且有序、无静默跳行。
+/// P0-1：多 ingress 全局乱序 → DB 补齐。
+/// 两行都已提交（hub 外），但按 row2 → row1 倒序 publish：
+/// 无论服务端调度如何交错，输出必须是 1,2 各一次（hub 顺序≠交付顺序）。
+#[tokio::test]
+async fn sse_hub_reorder_recovers_from_db() {
+    common::init_log();
+    // 空库连接（high-water=0），再入库、再倒序 publish
+    let db = tmp_db("reorder");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(EventStore::open(&db).unwrap());
+    let hub = EventHub::new(EVENT_HUB_CAPACITY);
+    let _srv = serve(store.clone(), hub.clone()).await;
+    let (status, mut cli) = SseClient::connect(_srv.port, "/api/v1/events/live", &[]).await;
+    assert_eq!(status, 200);
+    // 空库 high-water=0；两行入库（不 publish），再倒序 publish
+    let mut stored = Vec::new();
+    for (id, n, seq) in [("o-1", 1, 1u64), ("o-2", 2, 2u64)] {
+        let res = store
+            .commit_batch(CommitRequest {
+                endpoint_id: "ep".into(),
+                batch: EventBatch {
+                    connection_handle: 1,
+                    stream_epoch: 0xE200,
+                    sequence: seq,
+                    timestamp_ns: 1_700_000_000_000_000_000,
+                    events: vec![seed_record(id, n)],
+                    mono_ns: None,
+                },
+                received_at_ns: 1_700_000_000_000_000_001,
+            })
+            .await
+            .unwrap();
+        stored.push(res.inserted.into_iter().next().unwrap());
+    }
+    // 倒序 publish：row2 先，row1 后（同步连发，服务端任何交错下结果必须一致）
+    hub.publish(&stored[1]);
+    hub.publish(&stored[0]);
+    let f1 = cli.next_frame_timeout(5).await;
+    let f2 = cli.next_frame_timeout(5).await;
+    assert_eq!(f1.id.as_deref(), Some("1"));
+    assert_eq!(f2.id.as_deref(), Some("2"));
+    let _ = std::fs::remove_file(&db);
+}
+
+/// Lagged → DB catch-up（确定性）：replay 期服务端零 hub 轮询。
+/// 2000 行初始 replay 在客户端未读时不可能完成（远超 socket 缓冲），
+/// 此时 publish 的 10 行必在 hub（cap=4）溢出 → Lagged → DB 补齐。
+/// 断言 2010 帧精确升序全覆盖（少一行/错一序即失败）。
 #[tokio::test]
 async fn sse_lagged_catch_up_from_db() {
     common::init_log();
     let db = tmp_db("lag");
     let _ = std::fs::remove_file(&db);
     let store = Arc::new(EventStore::open(&db).unwrap());
-    // hub 容量 4：10 行洪峰必 lag
     let hub = EventHub::new(4);
+    // 2000 行大载荷直接入库（不 publish）：约 8MB，任何默认 socket 缓冲都
+    // 一次吃不完，保证 replay 期服务端不进入 live（即零 hub 轮询）。
+    let big = "x".repeat(4096);
+    for i in 0..2000 {
+        let mut r = seed_record(&format!("bulk-{i}"), i);
+        r.message = Some(big.clone());
+        store
+            .commit_batch(CommitRequest {
+                endpoint_id: "ep".into(),
+                batch: EventBatch {
+                    connection_handle: 1,
+                    stream_epoch: 0xE200,
+                    sequence: (i + 1) as u64,
+                    timestamp_ns: 1_700_000_000_000_000_000,
+                    events: vec![r],
+                    mono_ns: None,
+                },
+                received_at_ns: 1_700_000_000_000_000_001,
+            })
+            .await
+            .unwrap();
+    }
     let _srv = serve(store.clone(), hub.clone()).await;
-
-    let (status, mut cli) = SseClient::connect(_srv.port, "/api/v1/events/live", &[]).await;
+    // after_seq=0 → replay (0,2000]；一帧不读（replay 不可能完成）
+    let (status, mut cli) =
+        SseClient::connect(_srv.port, "/api/v1/events/live?after_seq=0", &[]).await;
     assert_eq!(status, 200);
-    // 连接已建立（subscribe 在 handler 内完成）后再洪峰
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // replay 期内 publish 10 行：必在 hub 溢出（cap=4，服务端零轮询）
     for i in 0..10 {
-        commit(&store, &hub, "ep", &format!("l-{i}"), i, (i + 1) as u64).await;
+        commit(
+            &store,
+            &hub,
+            "ep",
+            &format!("l-{i}"),
+            10_000 + i,
+            2001 + i as u64,
+        )
+        .await;
     }
-    let mut got = Vec::new();
-    for _ in 0..10 {
-        got.push(
-            cli.next_frame_timeout(5)
-                .await
-                .id
-                .unwrap()
-                .parse::<i64>()
-                .unwrap(),
-        );
+    // 读完全部 2010 帧：精确升序、无遗漏、无重复
+    let mut prev = 0i64;
+    for expect in 1..=2010i64 {
+        let f = cli.next_frame_timeout(30).await;
+        let seq: i64 = f.id.unwrap().parse().unwrap();
+        assert_eq!(seq, expect, "第 {expect} 帧必须恰为 seq={expect}");
+        assert!(seq > prev);
+        prev = seq;
     }
-    let mut sorted = got.clone();
-    sorted.sort_unstable();
-    assert_eq!(sorted.len(), 10, "10 行必须全到，无静默跳行");
-    assert!(
-        got.windows(2).all(|w| w[0] < w[1]),
-        "帧必须按 seq 递增，got {got:?}"
-    );
     let _ = std::fs::remove_file(&db);
 }
