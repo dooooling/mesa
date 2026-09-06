@@ -19,7 +19,8 @@ pub use event::{
     ConditionTransition, EVENT_ATTRIBUTES_MAX_FIELDS, EVENT_BATCH_MAX_BYTES,
     EVENT_RECORD_MAX_BYTES, EVENT_SEVERITY_MAX, EventBatch, EventCatalog, EventCondition,
     EventFieldDescriptor, EventRecord, EventRecordError, EventSequenceTracker,
-    EventStreamDescriptor, EventTask, EventTaskError, SequenceVerdict,
+    EventStreamDescriptor, EventTask, EventTaskError, GENERIC_EVENT_BINDING_KIND,
+    GenericEventBinding, SequenceVerdict,
 };
 pub use probe::{
     CapabilityItem, CapabilityState, PROBE_REPORT_MAX_BYTES, ProbeReport, ProbeWarning,

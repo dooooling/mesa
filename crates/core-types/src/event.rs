@@ -348,6 +348,29 @@ impl EventCatalog {
     }
 }
 
+/// 通用事件绑定种别（PR8 P0 契约补洞，镜像 `mesa.resources.v1` 设计）。
+///
+/// 统一 Envelope，不统一协议语义：`stream_id` 指向
+/// `EventStreamDescriptor.id`，`parameters` 对应其 `parameters` Schema；
+/// Core 只做透传与持久化，Driver 负责 `lookup stream_id → validate
+/// parameters → 构建协议内计划`。
+pub const GENERIC_EVENT_BINDING_KIND: &str = "mesa.events.v1";
+
+/// 通用事件绑定 `mesa.events.v1` 的顶层形态：Web 只生成此种 EventTask。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GenericEventBinding {
+    pub stream_id: String,
+    /// 对应目标流 `parameters` Schema 的用户取值；缺省为空对象。
+    #[serde(default)]
+    pub parameters: serde_json::Value,
+}
+
+impl GenericEventBinding {
+    pub fn from_json(v: &serde_json::Value) -> Result<Self, String> {
+        serde_json::from_value(v.clone()).map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +549,23 @@ mod tests {
         assert!(c.validate().is_ok());
         c.streams.push(c.streams[0].clone());
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn generic_event_binding_roundtrip() {
+        // PR8 P0：通用信封 `mesa.events.v1` 序列化往返；parameters 缺省为空。
+        let b = GenericEventBinding {
+            stream_id: "sim.events.alarm-cycle".into(),
+            parameters: serde_json::json!({}),
+        };
+        let s = serde_json::to_string(&b).unwrap();
+        assert_eq!(GenericEventBinding::from_json(&serde_json::from_str(&s).unwrap()).unwrap(), b);
+        // 缺省 parameters 反序列化成功（Web 可省略空对象）。
+        let v: GenericEventBinding =
+            serde_json::from_value(serde_json::json!({"stream_id": "sim.events.counter"}))
+                .unwrap();
+        assert_eq!(v.stream_id, "sim.events.counter");
+        assert!(v.parameters.is_null() || v.parameters.is_object());
+        assert_eq!(GENERIC_EVENT_BINDING_KIND, "mesa.events.v1");
     }
 }
