@@ -1366,6 +1366,7 @@ async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
 
     let run_cancel = CancellationToken::new();
     let task_cancel = run_cancel.clone();
+    let gate_cancel = run_cancel.clone();
     // 每个连接独立 sink：合并缓冲隔离 + 自动盖 handle/epoch 戳
     let sink_for_run = session
         .sink
@@ -1374,9 +1375,33 @@ async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
     let entries = Arc::clone(&session.entries);
     let mut conn = conn; // &mut 调用需要可变绑定
 
+    // Start release gate（P0）：run 任务先 park，Ack 入队后才放行。
+    // 否则首批 Data/Event 可能抢在 active_epochs.insert（SDK 门）或
+    // StartConnectionAck（Core 门）之前产生，被当 stale 静默丢弃——
+    // seq=1 的 occurrence 永久丢失，而连接显示 RUNNING。
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     // 采集任务独立于请求循环运行；结束（含出错）时上报终态，
     // 并把连接对象归还回表，使该连接可被再次 Configure/Start（§21 可重复启停）。
     let join = tokio::spawn(async move {
+        // park 期被 Stop/Shutdown 取消：归还连接并静默退出（StopAck/Shutdown
+        // 本身即确认，不再上报终态，避免 Stop 后多出一条幽灵 Stopped）。
+        // release 端释放而未发送（on_start 未走完，如进程退出中）：同样归还退出。
+        tokio::select! {
+            r = release_rx => {
+                if r.is_err() {
+                    if let Some(entry) = entries.lock().unwrap().get_mut(&handle) {
+                        entry.conn = Some(conn);
+                    }
+                    return;
+                }
+            }
+            _ = gate_cancel.cancelled() => {
+                if let Some(entry) = entries.lock().unwrap().get_mut(&handle) {
+                    entry.conn = Some(conn);
+                }
+                return;
+            }
+        }
         let outcome = conn.run(sink_for_run.clone(), task_cancel).await;
         // 先归还再上报：保证 Stop ack 返回时连接已可复用
         if let Some(entry) = entries.lock().unwrap().get_mut(&handle) {
@@ -1409,7 +1434,9 @@ async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
         .unwrap()
         .insert(req.connection_handle, req.stream_epoch);
 
-    // Start 的 Ack 复用请求 msg_id，便于 Core 侧关联
+    // Start 的 Ack 复用请求 msg_id，便于 Core 侧关联。
+    // Ack 走 Control 可靠队列（writer biased 恒优先）：Ack 先入队、run 后放行，
+    // wire 顺序恒为 `StartConnectionAck → first Data/EventBatch`（Data 同理）。
     session
         .sink
         .send_control(pb::Envelope {
@@ -1422,6 +1449,7 @@ async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
             )),
         })
         .await;
+    let _ = release_tx.send(());
 }
 
 async fn on_stop(session: &Session, req: pb::StopConnection, msg_id: u64) {

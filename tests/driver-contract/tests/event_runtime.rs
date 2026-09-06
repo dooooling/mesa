@@ -265,6 +265,51 @@ async fn event_single_handle_multi_publisher_stays_ordered() {
 }
 
 // ---------------------------------------------------------------------------
+// P0 Start race：首批永不丢失（PR7 式早消费）
+// ---------------------------------------------------------------------------
+
+/// PR7 的真实消费方式：先 take EventReceiver 并常驻 recv，再 Start。
+/// 若 SDK 在 Ack 入队前放行 run，首批会撞上两道门（SDK writer 门 / Core
+/// EventReceiver 门）被当 stale 丢弃。连续 3 轮，每轮首批必须 epoch 对、
+/// sequence == 1——seq=1 的 occurrence 永不丢失。
+#[tokio::test]
+async fn event_first_batch_never_lost_before_start_ack() {
+    init_log();
+    let (port, server_cancel) = start_sim_server().await;
+    let (mut session, _events, _) = Session::connect(port, TOKEN).await.unwrap();
+
+    open_connection(&session, 7, "{}").await;
+    let descriptors = configure_tasks(&session, 7, 1, &[mini_data_task()]).await;
+    apply_point_map(&session, 7, 1, sequential_ids(&descriptors, 11)).await;
+    session
+        .configure_events(
+            7,
+            1,
+            &[sim_event_task(
+                "cnt",
+                SIM_EVENT_STREAM_COUNTER,
+                TaskMode::Poll,
+                Some(10),
+            )],
+        )
+        .await
+        .unwrap();
+    // 早消费：Start 之前就 take 并开始等（PR7 EventIngress 常驻形态）
+    let mut erx = session.take_event_batches().unwrap();
+
+    for round in 0..3u64 {
+        let epoch = 0xE000_0800 + round;
+        start_connection(&session, 7, epoch).await;
+        let b = recv_event_batch(&mut erx, 5).await;
+        assert_eq!(b.stream_epoch, epoch, "round {round}: 首批 epoch 必须正确");
+        assert_eq!(b.sequence, 1, "round {round}: 首批 sequence 必须为 1");
+        assert!(stop_connection(&session, 7).await);
+    }
+
+    teardown(&mut session, Some(server_cancel));
+}
+
+// ---------------------------------------------------------------------------
 // Gate 4/8：新 epoch 从 1 重来 + 多次启停无状态泄漏（有界）
 // ---------------------------------------------------------------------------
 
