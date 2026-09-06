@@ -1,9 +1,10 @@
 import { Layout, Menu, theme } from "antd";
-import { DashboardOutlined, ApiOutlined, EyeOutlined } from "@ant-design/icons";
+import { DashboardOutlined, ApiOutlined, EyeOutlined, BellOutlined } from "@ant-design/icons";
 import { Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { Dashboard } from "./pages/Dashboard";
 import { DeviceManager } from "./components/DeviceManager";
 import { MonitorView } from "./pages/MonitorView";
+import { EventsView } from "./pages/EventsView";
 
 const { Header, Sider, Content } = Layout;
 
@@ -11,6 +12,7 @@ const items = [
   { key: "/", icon: <DashboardOutlined />, label: "看板" },
   { key: "/devices", icon: <ApiOutlined />, label: "设备" },
   { key: "/monitor", icon: <EyeOutlined />, label: "监控" },
+  { key: "/events", icon: <BellOutlined />, label: "事件" },
 ];
 
 export default function App() {
@@ -37,6 +39,7 @@ export default function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/devices" element={<DeviceManager />} />
             <Route path="/monitor" element={<MonitorView />} />
+            <Route path="/events" element={<EventsView />} />
           </Routes>
         </Content>
       </Layout>
