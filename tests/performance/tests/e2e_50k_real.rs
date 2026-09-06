@@ -125,6 +125,7 @@ async fn e2e_50k_real_throughput() {
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
         tasks,
+        event_tasks: vec![],
     };
     mgr.start_endpoint(ep).unwrap();
     let snap = mgr.snapshot();

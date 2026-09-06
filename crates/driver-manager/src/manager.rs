@@ -39,7 +39,9 @@ impl DescriptorError {
 
 struct RunningEntry {
     cancel: CancellationToken,
-    handle: tokio::task::JoinHandle<()>,
+    /// P0-3：任务返回 teardown 结论（`None` = 干净，`Some` = drain 异常描述），
+    /// `stop_endpoint` 转为显式错误，禁止 detach-success。
+    handle: tokio::task::JoinHandle<Option<String>>,
 }
 
 pub struct MesaManager {
@@ -54,6 +56,9 @@ pub struct MesaManager {
     active_sessions: std::sync::Arc<
         RwLock<HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>,
     >,
+    /// 事件面服务（PR7 v1.1 §20）：`None` = 纯 Data-only 模式（EventStore
+    /// 不可用时），endpoint 不起 ingress，数据面完全不受影响（§9 隔离）。
+    event_services: RwLock<Option<Arc<mesa_event_store::EventServices>>>,
 }
 
 impl MesaManager {
@@ -77,7 +82,14 @@ impl MesaManager {
             descriptor_cache: RwLock::new(HashMap::new()),
             profiles: RwLock::new(profiles),
             active_sessions: std::sync::Arc::new(RwLock::new(HashMap::new())),
+            event_services: RwLock::new(None),
         }
+    }
+
+    /// 注入事件面服务（Mesad 在 EventStore 打开后调用一次）。构造器签名不变，
+    /// 老调用方（Contract Test 等）不传即 Data-only。
+    pub fn set_event_services(&self, services: Arc<mesa_event_store::EventServices>) {
+        *self.event_services.write().unwrap() = Some(services);
     }
 
     fn driver_infos(drivers: &[DiscoveredDriver]) -> Vec<DriverInfo> {
@@ -154,9 +166,19 @@ impl MesaManager {
     }
 
     /// 启动一个 Endpoint。已在运行则返回错误。
+    ///
+    /// P0-2 fail-closed：事件使能（`event_tasks` 非空）但 EventStore 不可用
+    /// （`event_services == None`）时直接拒绝，连 Driver 进程都不启动——
+    /// 否则事件会发出却无人持久化，形成"RUNNING 但丢历史"的静默缺口。
     pub fn start_endpoint(&self, cfg: BuiltinEndpoint) -> Result<(), String> {
         if self.is_running(&cfg.endpoint_id) {
             return Err(format!("endpoint `{}` already running", cfg.endpoint_id));
+        }
+        if !cfg.event_tasks.is_empty() && self.event_services.read().unwrap().is_none() {
+            return Err(format!(
+                "EVENT_STORE_UNAVAILABLE: endpoint `{}` has event tasks but EventStore is unavailable",
+                cfg.endpoint_id
+            ));
         }
         let disc = self
             .find_driver(&cfg.driver_id)
@@ -167,6 +189,7 @@ impl MesaManager {
         let snapshot = Arc::clone(&self.snapshot);
         let source = Arc::clone(&self.source);
         let registry = std::sync::Arc::clone(&self.active_sessions);
+        let events = self.event_services.read().unwrap().clone();
         let handle = tokio::spawn(run_endpoint(
             disc,
             cfg.clone(),
@@ -174,6 +197,7 @@ impl MesaManager {
             source,
             shutdown,
             registry,
+            events,
         ));
 
         self.running
@@ -188,16 +212,25 @@ impl MesaManager {
         self.start_endpoint(cfg)
     }
 
-    /// 停止指定 Endpoint。返回是否曾处于运行态。
-    pub async fn stop_endpoint(&self, endpoint_id: &str) -> bool {
+    /// 停止指定 Endpoint。
+    ///
+    /// P0-3：`Ok(was_running)`——`false` = 当时未运行（幂等成功）；
+    /// `Err(detail)` = teardown 异常（drain fatal/timeout 精确码在前，
+    /// 或任务 panic）。Stop 等待 teardown 真正完成才返回：
+    /// 内部各步骤自带 bounded timeout（terminate/barrier/drain 各 5s），
+    /// Manager 直接 await，不再用"比总预算还短的外层 timeout 静默 detach"。
+    /// 返回后新旧 attempt 不重叠（同一 endpoint 立即 Start 安全）。
+    pub async fn stop_endpoint(&self, endpoint_id: &str) -> Result<bool, String> {
         let entry = self.running.lock().unwrap().remove(endpoint_id);
         let Some(entry) = entry else {
-            return false;
+            return Ok(false);
         };
         entry.cancel.cancel();
-        // 等待运行任务结束，最多 10s（涵盖子进程终止宽限）
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), entry.handle).await;
-        true
+        match entry.handle.await {
+            Ok(None) => Ok(true),
+            Ok(Some(drain_err)) => Err(drain_err),
+            Err(join) => Err(format!("EVENT_DRAIN_FAILED: endpoint task failed: {join}")),
+        }
     }
 
     /// 统一停机（消费 self，兼容旧调用）。
@@ -206,21 +239,30 @@ impl MesaManager {
     }
 
     /// 统一停机（&self 版，供 Arc 持有者调用）。
+    /// P0-3：直接 await 全部任务（teardown 全步骤有界，必结束），
+    /// 异常大声记录；进程退出路径无调用方可接收错误，但绝不静默 detach。
     pub async fn shutdown_all(&self) {
         self.shutdown.cancel();
-        let handles: Vec<tokio::task::JoinHandle<()>> = {
+        let handles: Vec<(String, tokio::task::JoinHandle<Option<String>>)> = {
             let mut m = self.running.lock().unwrap();
             m.drain()
-                .map(|(_, e)| {
+                .map(|(id, e)| {
                     e.cancel.cancel();
-                    e.handle
+                    (id, e.handle)
                 })
                 .collect()
         };
-        for h in handles {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), h).await;
+        for (id, h) in handles {
+            match h.await {
+                Ok(None) => {}
+                Ok(Some(e)) => {
+                    tracing::error!(endpoint = %id, "shutdown teardown failed: {e}");
+                }
+                Err(join) => {
+                    tracing::error!(endpoint = %id, "shutdown task failed: {join}");
+                }
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     /// 懒加载获取 Driver Descriptor（§12）：临时 spawn → handshake → GetDescriptor → cache → shutdown
@@ -499,5 +541,63 @@ impl MesaManager {
         RwLock<HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>,
     > {
         std::sync::Arc::clone(&self.active_sessions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_mgr() -> MesaManager {
+        // 空驱动目录：门在 find_driver 之前触发，无需真实驱动
+        MesaManager::discover(std::path::Path::new(
+            "testdata/empty-drivers-does-not-exist",
+        ))
+    }
+
+    fn endpoint_with_events() -> BuiltinEndpoint {
+        BuiltinEndpoint {
+            endpoint_id: "ep-evt".into(),
+            driver_id: "simulator".into(),
+            connection_json: "{}".into(),
+            tasks: vec![],
+            event_tasks: vec![mesa_core_types::EventTask {
+                id: "al".into(),
+                mode: mesa_core_types::TaskMode::Subscribe,
+                interval_ms: None,
+                binding: mesa_core_types::DriverBinding {
+                    kind: "simulator.events".into(),
+                    config: serde_json::json!({"stream": "sim.events.alarm-cycle"}),
+                },
+            }],
+        }
+    }
+
+    /// P0-2：事件使能 + 无 EventStore → 拒绝启动（精确码），且不建 Driver 进程。
+    #[test]
+    fn event_enabled_without_store_is_rejected() {
+        let mgr = empty_mgr();
+        let err = mgr
+            .start_endpoint(endpoint_with_events())
+            .expect_err("must refuse without EventStore");
+        assert!(
+            err.contains("EVENT_STORE_UNAVAILABLE"),
+            "精确原因码，got {err}"
+        );
+        assert!(!mgr.is_running("ep-evt"), "拒绝后不得有运行态残留");
+    }
+
+    /// Data-only 无 EventStore 照常放行到驱动查找（门只看 event_tasks）。
+    #[test]
+    fn data_only_without_store_passes_gate() {
+        let mgr = empty_mgr();
+        let mut cfg = endpoint_with_events();
+        cfg.event_tasks.clear();
+        // 空驱动目录 → 死在 find_driver，而不是事件门
+        let err = mgr.start_endpoint(cfg).expect_err("no driver here");
+        assert!(
+            err.contains("not found or not launchable"),
+            "应走到驱动查找，got {err}"
+        );
     }
 }

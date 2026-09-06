@@ -17,7 +17,7 @@ use mesa_driver_protocol::{
     event_batch_from_pb, negotiate, pb, read_envelope, write_envelope,
 };
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 /// 单次请求的响应超时。当前驱动均为内存操作；真实协议驱动若接近该阈值，
@@ -134,6 +134,13 @@ struct Shared {
     /// 时记录，reader 在 StartConnectionAck 到达时消费（成败都清理，有界）。
     /// Ack 本身不带 epoch，必须靠这次登记找回。
     pending_event_starts: Mutex<HashMap<u64, (u32, u64)>>,
+    /// ⑨ Stop barrier：reader 结束标志。reader 是事件 channel 的唯一生产者，
+    /// TCP 有序性保证 FIN 之前全部字节先到——reader 结束 ⟹ driver 已停产且
+    /// 已发送批次已全部 pump 进 channel。`attempt_session` 收尾时等这个信号
+    /// （而非 sleep）再 drain ingress，Stop 窗口零遗弃（溢出 fail-closed 除外，
+    /// 那是独立计数路径）。
+    reader_done: AtomicBool,
+    reader_done_notify: Notify,
 }
 
 impl Shared {
@@ -291,9 +298,11 @@ impl Session {
             event_decode_errors: AtomicU64::new(0),
             active_event_epochs: Mutex::new(HashMap::new()),
             pending_event_starts: Mutex::new(HashMap::new()),
+            reader_done: AtomicBool::new(false),
+            reader_done_notify: Notify::new(),
         });
 
-        // ---- reader：分发响应 + 上行事件；断开时关闭事件通道通知运行时 ----
+        // ---- reader：分发响应 + 上行事件；结束时置位 reader_done（⑨ barrier） ----
         let reader_cancel = CancellationToken::new();
         tokio::spawn(reader_loop(rd, Arc::clone(&shared), reader_cancel.clone()));
 
@@ -749,6 +758,23 @@ impl Session {
     pub fn invalidate(&mut self) {
         self.reader_cancel.cancel();
     }
+
+    /// ⑨ Stop barrier：等 reader 结束（driver 停产 + 已发送全部 pump 进 channel）。
+    /// `true` = barrier 达成（drain 零窗口）；`false` = 超时（顽固对端，
+    /// 调用方降级 drain 现有——等价于旧行为）。轮询-free：Notify 等待。
+    pub async fn wait_reader_done(&self, timeout: Duration) -> bool {
+        if self.shared.reader_done.load(Ordering::Relaxed) {
+            return true;
+        }
+        // 先 enable（注册等待者）再复查标志：消除"置位恰好发生在检查与
+        // 首 poll 之间"的丢失唤醒（notify_waiters 只唤已注册者，不存 permit）。
+        let mut notified = Box::pin(self.shared.reader_done_notify.notified());
+        notified.as_mut().enable();
+        if self.shared.reader_done.load(Ordering::Relaxed) {
+            return true;
+        }
+        tokio::time::timeout(timeout, notified).await.is_ok()
+    }
 }
 
 async fn reader_loop(mut rd: OwnedReadHalf, shared: Arc<Shared>, cancel: CancellationToken) {
@@ -865,9 +891,13 @@ async fn reader_loop(mut rd: OwnedReadHalf, shared: Arc<Shared>, cancel: Cancell
             }
         }
     }
-    // reader 结束 => events channel 随 Shared drop 关闭，Endpoint 以 recv()==None 感知断开。
-    // NOTE: events_tx 存于 Shared，Session 全部克隆销毁后才真正关闭——Endpoint 运行时
-    // 通过 is_unresponsive/请求失败等信号兜底感知断连。
+    // reader 结束 => 置位 reader_done 并唤醒 barrier 等待者（⑨）。
+    // NOTE: event_tx 存于 Shared（EventReceiver 续命），clean 路径 channel
+    // 并不关闭——barrier 信号是"reader 结束"本身，不是 channel Closed。
+    // events channel（SessionEvent 侧）随 Shared drop 关闭，Endpoint 以
+    // recv()==None 感知断开；运行时另经 is_unresponsive/请求失败兜底感知断连。
+    shared.reader_done.store(true, Ordering::Relaxed);
+    shared.reader_done_notify.notify_waiters();
 }
 
 /// 生命周期 Ack 嗅探：维护 Core 侧事件 epoch 门（P0 barrier，PR6 review）。
@@ -1017,6 +1047,8 @@ mod tests {
                 event_decode_errors: AtomicU64::new(0),
                 active_event_epochs: Mutex::new(HashMap::new()),
                 pending_event_starts: Mutex::new(HashMap::new()),
+                reader_done: AtomicBool::new(false),
+                reader_done_notify: Notify::new(),
             });
             // call() 的响应分发依赖 reader_loop——回环测试也必须启动它
             let reader_cancel = CancellationToken::new();
@@ -1260,5 +1292,241 @@ mod tests {
             "must surface precise driver code, got {err}"
         );
         stub.await.unwrap();
+    }
+
+    /// ⑨ Stop barrier 的程序级证明（确定性）：fake driver 背靠背发 N 批后 FIN。
+    /// - FIN 前 barrier 不达成：信号是"reader 结束"（EOF），不是"pump 了一些"；
+    /// - FIN 后 barrier 达成，且 N 批经 EventReceiver（epoch 门已激活）有序
+    ///   全 drain，无多无少。
+    /// 这是 `attempt_session` 收尾"Shutdown → terminate → 等 reader →
+    /// 再 drain ingress"零窗口的事实基础。
+    #[tokio::test]
+    async fn reader_eof_barrier_means_all_batches_pumped() {
+        use mesa_core_types::{EventRecord, Value};
+        use mesa_driver_protocol::event_batch_to_pb;
+
+        const N: u64 = 64;
+        const HANDLE: u32 = 1;
+        const EPOCH: u64 = 0xB0A9;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let cli = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let server = accept.await.unwrap();
+        let (rd, wr) = cli.into_split();
+        let (events_tx, _events_rx) = mpsc::channel(EVENT_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel(EVENT_BATCH_CAPACITY);
+        let shared = Arc::new(Shared {
+            pending: Mutex::new(HashMap::new()),
+            writer: tokio::sync::Mutex::new(wr),
+            events_tx,
+            event_tx: Mutex::new(Some(event_tx)),
+            unresponsive: Arc::new(AtomicBool::new(false)),
+            dropped_events: AtomicU64::new(0),
+            event_stream_dead: AtomicBool::new(false),
+            event_overflow_drops: AtomicU64::new(0),
+            event_decode_errors: AtomicU64::new(0),
+            active_event_epochs: Mutex::new(HashMap::from([(HANDLE, EPOCH)])),
+            pending_event_starts: Mutex::new(HashMap::new()),
+            reader_done: AtomicBool::new(false),
+            reader_done_notify: Notify::new(),
+        });
+        let cancel = CancellationToken::new();
+        tokio::spawn(reader_loop(rd, Arc::clone(&shared), cancel.clone()));
+        let session = Session {
+            port,
+            shared: Arc::clone(&shared),
+            next_msg_id: AtomicU64::new(100),
+            reader_cancel: cancel,
+            negotiated_minor: 3,
+            event_rx: None,
+        };
+        // fake driver：只写不读，背靠背发 N 批
+        let (_srd, mut swr) = server.into_split();
+        for seq in 1..=N {
+            let batch = EventBatch {
+                connection_handle: HANDLE,
+                stream_epoch: EPOCH,
+                sequence: seq,
+                timestamp_ns: 1_700_000_000_000_000_000,
+                events: vec![EventRecord {
+                    event_id: format!("b-{seq}"),
+                    category: "message".into(),
+                    kind: "counter.tick".into(),
+                    source: "T".into(),
+                    severity: 100,
+                    code: None,
+                    message: None,
+                    message_locale: None,
+                    occurred_at_ns: None,
+                    condition: None,
+                    correlation_id: None,
+                    attributes: std::collections::BTreeMap::from([(
+                        "n".into(),
+                        Value::I32(seq as i32),
+                    )]),
+                }],
+                mono_ns: None,
+            };
+            let wire = event_batch_to_pb(&batch).unwrap();
+            write_envelope(
+                &mut swr,
+                &pb::Envelope {
+                    msg_id: 0,
+                    body: Some(pb::envelope::Body::EventBatch(wire)),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // FIN 前：reader 还阻塞在 read 上，barrier 不达成
+        assert!(!shared.reader_done.load(Ordering::Relaxed));
+        assert!(!session.wait_reader_done(Duration::from_millis(200)).await);
+        // FIN（写方向结束即 FIN；读半部不影响）
+        drop(swr);
+        drop(_srd);
+        assert!(
+            session.wait_reader_done(Duration::from_secs(5)).await,
+            "reader 必须在 FIN 后结束"
+        );
+        // N 批全在 channel 里：有序 drain，无多无少
+        let mut rx = EventReceiver {
+            rx: event_rx,
+            shared: Arc::clone(&shared),
+        };
+        for expect in 1..=N {
+            let b = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("barrier 达成后 drain 不得超时")
+                .expect("batch present");
+            assert_eq!(b.sequence, expect);
+        }
+        assert!(rx.try_recv().is_err(), "channel 必须恰好排空");
+    }
+
+    /// ⑨ final drain 的程序级证明（确定性）：200 批背靠背填 channel
+    /// （发送速度 >> 提交速度，cancel 时 backlog 必非空），随后 cancel；
+    /// join 后 200 批必须全提交且 `batch_sequence` 连续。
+    /// 无 drain 的旧行为（cancel 直接返回）下此测试必红——backlog 被遗弃。
+    #[tokio::test]
+    async fn ingress_cancel_drains_backlog() {
+        use mesa_core_types::{EventRecord, Value};
+        use mesa_event_store::{EventFilter, EventHub, EventServices, EventStore};
+
+        use crate::event_ingress::run_event_ingress;
+
+        const N: u64 = 200;
+        const HANDLE: u32 = 1;
+        const EPOCH: u64 = 0xD0A1;
+        // Shared 需要一个写半部占位（本测试不用请求路径，保持存活即可）
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let cli = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let _server = accept.await.unwrap();
+        let (_rd, wr) = cli.into_split();
+        let (event_tx, event_rx) = mpsc::channel(EVENT_BATCH_CAPACITY);
+        let feed = event_tx.clone();
+        let shared = Arc::new(Shared {
+            pending: Mutex::new(HashMap::new()),
+            writer: tokio::sync::Mutex::new(wr),
+            events_tx: mpsc::channel(EVENT_CAPACITY).0,
+            event_tx: Mutex::new(Some(event_tx)),
+            unresponsive: Arc::new(AtomicBool::new(false)),
+            dropped_events: AtomicU64::new(0),
+            event_stream_dead: AtomicBool::new(false),
+            event_overflow_drops: AtomicU64::new(0),
+            event_decode_errors: AtomicU64::new(0),
+            active_event_epochs: Mutex::new(HashMap::from([(HANDLE, EPOCH)])),
+            pending_event_starts: Mutex::new(HashMap::new()),
+            reader_done: AtomicBool::new(false),
+            reader_done_notify: Notify::new(),
+        });
+        let store = Arc::new(EventStore::open_in_memory().unwrap());
+        let services = EventServices::new(store.clone(), EventHub::new(4));
+        let shutdown = CancellationToken::new();
+        let rx = EventReceiver {
+            rx: event_rx,
+            shared: Arc::clone(&shared),
+        };
+        let h = tokio::spawn(run_event_ingress(
+            rx,
+            "ep-drain".into(),
+            services.clone(),
+            shutdown.clone(),
+        ));
+        let batch = |seq: u64| EventBatch {
+            connection_handle: HANDLE,
+            stream_epoch: EPOCH,
+            sequence: seq,
+            timestamp_ns: 1_700_000_000_000_000_000,
+            events: vec![EventRecord {
+                event_id: format!("d-{seq}"),
+                category: "message".into(),
+                kind: "counter.tick".into(),
+                source: "T".into(),
+                severity: 100,
+                code: None,
+                message: None,
+                message_locale: None,
+                occurred_at_ns: None,
+                condition: None,
+                correlation_id: None,
+                attributes: std::collections::BTreeMap::from([(
+                    "n".into(),
+                    Value::I32(seq as i32),
+                )]),
+            }],
+            mono_ns: None,
+        };
+        // 背靠背发送（send 背压保证 200 全进过 channel；ingress 并发消费中，
+        // cancel 时 backlog 必非空——发送 200 个 commit 顶多数十个）。
+        for seq in 1..=N {
+            feed.send(batch(seq)).await.unwrap();
+        }
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(30), h)
+            .await
+            .expect("cancel+drain 必须退出")
+            .unwrap()
+            .expect("drain 不得 fatal");
+        // 200 全提交且连续（遗弃任一批即断号）
+        let (rows, _) = store
+            .query_history(&EventFilter {
+                limit: Some(500),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), N as usize, "200 批必须全提交");
+        // P1-1：同一批数据同时聚合进全局 diagnostics（非黑洞）
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            services
+                .diagnostics
+                .ingress_batches_total
+                .load(Ordering::Relaxed),
+            N
+        );
+        assert_eq!(
+            services
+                .diagnostics
+                .ingress_persisted_events_total
+                .load(Ordering::Relaxed),
+            N
+        );
+        let mut seqs: Vec<u64> = rows.iter().map(|r| r.batch_sequence).collect();
+        seqs.sort_unstable();
+        assert!(
+            seqs.iter().enumerate().all(|(i, s)| *s == i as u64 + 1),
+            "batch_sequence 必须连续 1..=200"
+        );
     }
 }

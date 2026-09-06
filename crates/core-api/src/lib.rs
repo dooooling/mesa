@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use axum::extract::{Path, Query, State};
@@ -13,8 +14,9 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use mesa_config_store::{ConfigStore, DeviceRecord, EndpointRecord, StoreError};
-use mesa_core_types::AcquisitionTask;
+use mesa_core_types::{AcquisitionTask, EventTask};
 use mesa_driver_manager::{MesaManager, Snapshot};
+use mesa_event_store::{EventFilter, EventServices, StoredEvent};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
@@ -35,6 +37,22 @@ pub struct AppState {
     pub cert_store: Arc<CertStore>,
     /// 控制面总闸：默认关闭，需 --enable-control 显式开启（§22）
     pub enable_control: bool,
+    /// 事件面服务（PR7 v1.1 §20）。`None` = EventStore 不可用（§22）：
+    /// `/events*` 系接口 503，Data 面不受影响。
+    /// `OnceLock` 保证只注入一次；构造器签名零 churn，老调用方默认无事件。
+    pub events: std::sync::OnceLock<Option<Arc<EventServices>>>,
+}
+
+impl AppState {
+    /// 注入事件面服务（Mesad 在 EventStore 打开后调一次；测试按需调）。
+    pub fn set_event_services(&self, services: Arc<EventServices>) {
+        let _ = self.events.set(Some(services));
+    }
+
+    /// 取事件面服务（`None` 即不可用，调用方转 503）。
+    pub fn event_services(&self) -> Option<Arc<EventServices>> {
+        self.events.get().cloned().flatten()
+    }
 }
 
 impl AppState {
@@ -119,6 +137,7 @@ impl AppState {
             start_time: Instant::now(),
             cert_store,
             enable_control,
+            events: std::sync::OnceLock::new(),
         }))
     }
 
@@ -157,6 +176,7 @@ impl AppState {
                 start_time: Instant::now(),
                 cert_store,
                 enable_control,
+                events: std::sync::OnceLock::new(),
             })
         })
     }
@@ -1604,11 +1624,18 @@ async fn start_endpoint(
             }
         }
     }
+    // PR7 v1.1 §11：REST 启动同样带上已持久化的事件任务（与开机恢复一致）。
+    // P0-2 fail-closed：读取失败不得静默降级为 Data-only，直接返回存储错误。
+    let event_tasks = match state.store.list_event_tasks(&id) {
+        Ok(v) => v,
+        Err(e) => return store_err_to_response(e),
+    };
     let cfg = mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: rec.id.clone(),
         driver_id: rec.driver_id.clone(),
         connection_json: materialized_json,
         tasks,
+        event_tasks,
     };
     match state.manager.start_endpoint(cfg) {
         Ok(()) => {
@@ -1634,12 +1661,20 @@ async fn stop_endpoint(
             Json(serde_json::json!({ "stopped": id, "was_running": false })),
         );
     }
-    let was = state.manager.stop_endpoint(&id).await;
+    // P0-3：teardown 异常（drain fatal/timeout）是 500 显式错误，
+    // 不再"Detach 了也返回成功"。任务已结束（await 过），期望态照常落 false。
+    let res = state.manager.stop_endpoint(&id).await;
     let _ = state.store.set_desired_running(&id, false);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "stopped": id, "was_running": was })),
-    )
+    match res {
+        Ok(was) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "stopped": id, "was_running": was })),
+        ),
+        Err(detail) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("STOP_FAILED", &detail)),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1789,6 +1824,554 @@ async fn delete_task(
         Ok(rev) => (
             StatusCode::OK,
             Json(serde_json::json!({ "deleted": task_id, "revision": rev })),
+        ),
+        Err(e) => store_err_to_response(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Events（PR7 v1.1 §16/§17）：历史 + 单条 + EventTask CRUD
+// ---------------------------------------------------------------------------
+
+/// EventStore 不可用时的统一回答（§22）：503 + 精确码，Data 面不受影响。
+fn events_unavailable() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json_error(
+            "EVENT_STORE_UNAVAILABLE",
+            "events.db unavailable; data plane unaffected",
+        )),
+    )
+}
+
+/// StoredEvent → v1.1 §16 响应形态。`attributes_json` 损坏（理论不可达，
+/// writer 写入前即合法 JSON）→ 整页 500 fail-closed，禁止静默吞行。
+/// NOTE: `stream_epoch`/`batch_sequence` 是 u64，JSON number 精确承载；
+/// JS 客户端超 2^53 会失精度——游标/ID 一律用 `seq`（i64 安全范围）。
+fn stored_event_json(
+    ev: &StoredEvent,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let attrs: serde_json::Value = serde_json::from_str(&ev.attributes_json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(
+                "INTERNAL",
+                &format!("corrupt attributes_json: {e}"),
+            )),
+        )
+    })?;
+    let condition = match (&ev.condition_id, &ev.transition) {
+        (None, None) => serde_json::Value::Null,
+        (id, tr) => serde_json::json!({
+            "condition_id": id,
+            "transition": tr,
+            "active": ev.active,
+            "acknowledged": ev.acknowledged,
+            "confirmed": ev.confirmed,
+            "retain": ev.retain,
+        }),
+    };
+    Ok(serde_json::json!({
+        "seq": ev.seq,
+        "endpoint_id": ev.endpoint_id,
+        "stream_epoch": ev.stream_epoch,
+        "batch_sequence": ev.batch_sequence,
+        "received_at_ns": ev.received_at_ns,
+        "event": {
+            "event_id": ev.event_id,
+            "category": ev.category,
+            "kind": ev.kind,
+            "source": ev.source,
+            "severity": ev.severity,
+            "code": ev.code,
+            "message": ev.message,
+            "message_locale": ev.message_locale,
+            "occurred_at_ns": ev.occurred_at_ns,
+            "published_at_ns": ev.published_at_ns,
+            "connection_handle": ev.connection_handle,
+            "condition": condition,
+            "correlation_id": ev.correlation_id,
+            "attributes": attrs,
+        },
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct EventsQuery {
+    endpoint_id: Option<String>,
+    category: Option<String>,
+    kind: Option<String>,
+    severity_min: Option<u16>,
+    code: Option<String>,
+    condition_id: Option<String>,
+    active: Option<bool>,
+    from_ns: Option<i64>,
+    to_ns: Option<i64>,
+    before_seq: Option<i64>,
+    after_seq: Option<i64>,
+    limit: Option<u32>,
+}
+
+async fn list_events(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<EventsQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(svc) = state.event_services() else {
+        return events_unavailable();
+    };
+    let filter = EventFilter {
+        endpoint_id: q.endpoint_id,
+        category: q.category,
+        kind: q.kind,
+        severity_min: q.severity_min,
+        code: q.code,
+        condition_id: q.condition_id,
+        active: q.active,
+        from_ns: q.from_ns,
+        to_ns: q.to_ns,
+        before_seq: q.before_seq,
+        after_seq: q.after_seq,
+        limit: q.limit,
+    };
+    // 阻塞式 SQLite 查询不得占 Tokio worker（与 writer 线程模型对应）
+    let store = svc.store.clone();
+    let res = tokio::task::spawn_blocking(move || store.query_history(&filter)).await;
+    match res {
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &format!("query task failed: {e}"))),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &e.to_string())),
+        ),
+        Ok(Ok((rows, next))) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for r in &rows {
+                match stored_event_json(r) {
+                    Ok(v) => out.push(v),
+                    Err(e) => return e,
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "events": out, "next_cursor": next })),
+            )
+        }
+    }
+}
+
+/// SSE replay 单页行数。replay 按页循环直到不满页；慢消费者追赶时每页
+/// 前进，必收敛（除非写入快于查询 sustained——彼时 lag 循环继续，属于
+/// 背压可见，不静默）。
+const SSE_REPLAY_PAGE: u32 = 1000;
+
+/// SSE 帧构造。 corruption 行返回 `None`（调用方结束流：客户端按最后收到
+/// 的 id 重连重试；该分支理论不可达——writer 写入的 attributes_json 恒合法）。
+/// fail-closed：不断发半坏帧；客户端重连后 replay 仍会撞到该行并再次结束——
+/// 响亮失败，而非静默跳行。
+fn sse_frame(ev: &StoredEvent) -> Option<axum::response::sse::Event> {
+    match stored_event_json(ev) {
+        Ok(v) => {
+            let data = serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
+            Some(
+                axum::response::sse::Event::default()
+                    .id(ev.seq.to_string())
+                    .event("mesa-event")
+                    .data(data),
+            )
+        }
+        Err(_) => {
+            tracing::error!(
+                seq = ev.seq,
+                "corrupt stored event in SSE path, ending stream"
+            );
+            None
+        }
+    }
+}
+
+type SseItem = Result<axum::response::sse::Event, std::convert::Infallible>;
+
+/// 单页 catch-up（P0-2 流式）：查 `PAGE+1` 行，满页则留 1 行探知"还有更多"，
+/// 只返回 `PAGE` 帧并报告未穷尽。调用方逐页 yield，任意时刻最多持有约
+/// 一页（历史再大也不先堆完再发）。
+/// `until = Some(h)`：初始 replay，查询上界字面锁死，区间恒为 `(from, h]`；
+/// `until = None`：live 期追赶（gap/Lag/reconcile），追 DB 现状。
+/// 返回 `(new_cursor, frames, exhausted)`；`None` = DB 失败或坏行
+/// （调用方结束流，客户端按旧游标重连重试）。
+async fn sse_catch_up_page(
+    store: &Arc<mesa_event_store::EventStore>,
+    from: i64,
+    until: Option<i64>,
+) -> Option<(i64, Vec<SseItem>, bool)> {
+    let s = store.clone();
+    let page =
+        match tokio::task::spawn_blocking(move || s.replay_range(from, until, SSE_REPLAY_PAGE + 1))
+            .await
+        {
+            Ok(Ok(p)) => p,
+            // DB 失败 / 任务失败 → 结束流（客户端按旧游标重连重试）
+            _ => return None,
+        };
+    let exhausted = page.len() <= SSE_REPLAY_PAGE as usize;
+    let mut cursor = from;
+    let mut frames = Vec::with_capacity(page.len().min(SSE_REPLAY_PAGE as usize));
+    for ev in page.into_iter().take(SSE_REPLAY_PAGE as usize) {
+        let f = sse_frame(&ev)?;
+        cursor = ev.seq;
+        frames.push(Ok(f));
+    }
+    Some((cursor, frames, exhausted))
+}
+
+#[derive(Debug, Deserialize)]
+struct LiveQuery {
+    after_seq: Option<i64>,
+}
+
+/// Live SSE（Checkpoint B 收紧版；原则：**Hub 是提示、DB seq 是交付权威**）：
+/// ```text
+/// CONNECT
+///   parse cursor → hub.subscribe() → connect_high_water = DB.max_seq()
+///   → HTTP 200（P0-3：boundary 在 200 前固定）
+/// 有 cursor：pagewise replay (cursor, high_water]（P0-2 流式有界）
+/// 无 cursor：live-only，last_sent = high_water
+/// LIVE LOOP（select!）：
+///   Hub seq <= last_sent → duplicate skip
+///   Hub seq == last_sent+1 → fast emit
+///   Hub seq > last_sent+1 → DB catch-up ASC（P0-1 多 ingress 乱序）
+///   Hub Lagged → DB catch-up ASC
+///   15s tick → DB reconcile（P1：abort 漏 publish 的最终兜底）
+///   Hub Closed → 结束
+/// ```
+///
+/// 无游标新连接默认 live-only（不灌历史；回填用显式 `?after_seq=`）。
+/// 断开清理：流 drop 即取消，Receiver 释放，`receiver_count` 回落——无显式注销。
+async fn events_live(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<LiveQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<
+    axum::response::sse::Sse<impl tokio_stream::Stream<Item = SseItem>>,
+    (StatusCode, Json<serde_json::Value>),
+> {
+    let svc = state.event_services().ok_or_else(events_unavailable)?;
+    // 非法游标 400：静默当 absent 会藏掉客户端真正想要的重放起点
+    let header_cursor: Option<i64> = match headers.get("last-event-id") {
+        None => None,
+        Some(v) => Some(
+            v.to_str()
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json_error("VALIDATION_ERROR", "invalid Last-Event-ID")),
+                    )
+                })?,
+        ),
+    };
+    let effective = [q.after_seq, header_cursor].into_iter().flatten().max();
+
+    // subscribe → high-water 都在返回 200 之前固定（P0-3）：客户端拿到 200
+    // 后发生的 commit 必属于 live，不会被当成历史 baseline 吃掉。
+    let hub_rx = svc.hub.subscribe();
+    let store = svc.store.clone();
+    let connect_high_water = match tokio::task::spawn_blocking({
+        let store = store.clone();
+        move || store.max_seq()
+    })
+    .await
+    {
+        Ok(Ok(m)) => m,
+        _ => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error("INTERNAL", "events high-water unavailable")),
+            ));
+        }
+    };
+    // ⑧c 诊断：本连接发出的 DB replay 帧 / Lagged 事故 / reconcile 执行
+    let diag = svc.diagnostics.clone();
+    let s = async_stream::stream! {
+        // 初始 replay（P0-2 + ⑧a）：逐页 yield，内存只驻一页；查询上界字面
+        // 锁死在建连 high-water——区间恒为 `(cursor, high_water]`，DB 在
+        // high-water 之后再写多少行也不会越界（剩下的走 live）。
+        let mut last_sent: i64 = match effective {
+            Some(cur) => {
+                let mut cursor = cur;
+                while cursor < connect_high_water {
+                    let Some((cur2, frames, _)) =
+                        sse_catch_up_page(&store, cursor, Some(connect_high_water)).await
+                    else {
+                        return;
+                    };
+                    diag.replay_frames_total
+                        .fetch_add(frames.len() as u64, Ordering::Relaxed);
+                    for f in frames {
+                        yield f;
+                    }
+                    // 空页/DB 无进展即停（high-water 内行数固定，不会死循环）
+                    if cur2 == cursor {
+                        break;
+                    }
+                    cursor = cur2;
+                }
+                cursor
+            }
+            None => connect_high_water,
+        };
+        let mut rx = hub_rx;
+        // reconcile 心跳：首 tick 立即消费（interval 首 tick 即时触发语义）
+        let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(15));
+        reconcile.tick().await;
+        loop {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Ok(ev) => {
+                        if ev.seq <= last_sent {
+                            // duplicate（重放/Hub 重叠、乱序迟到）：跳过
+                            continue;
+                        }
+                        if ev.seq > last_sent + 1 {
+                            // P0-1：Hub 顺序 ≠ 交付顺序。多 ingress 并发下
+                            // publish 可能乱序（101 先于 100），直接发会让
+                            // 100 永久丢失——回 DB 按 seq ASC 补齐再发。
+                            tracing::debug!(
+                                got = ev.seq,
+                                last_sent,
+                                "SSE hub gap, catching up from DB"
+                            );
+                            loop {
+                                let Some((cur2, frames, done)) =
+                                    sse_catch_up_page(&store, last_sent, None).await
+                                else {
+                                    return;
+                                };
+                                diag.replay_frames_total
+                                    .fetch_add(frames.len() as u64, Ordering::Relaxed);
+                                for f in frames {
+                                    yield f;
+                                }
+                                last_sent = cur2;
+                                if done {
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        // fast-path：严格下一行，直接发
+                        last_sent = ev.seq;
+                        let Some(f) = sse_frame(&ev) else {
+                            return;
+                        };
+                        yield Ok(f);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, last_sent, "SSE slow consumer, catching up from DB");
+                        diag.lagged_total.fetch_add(1, Ordering::Relaxed);
+                        loop {
+                            let Some((cur2, frames, done)) =
+                                sse_catch_up_page(&store, last_sent, None).await
+                            else {
+                                return;
+                            };
+                            diag.replay_frames_total
+                                .fetch_add(frames.len() as u64, Ordering::Relaxed);
+                            for f in frames {
+                                yield f;
+                            }
+                            last_sent = cur2;
+                            if done {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = reconcile.tick() => {
+                    // P1：abort 兜底漏 publish（commit 落盘但 Hub 未发）无任何
+                    // Hub 信号，只能靠 DB 对账发现。慢连接 15s 一次 max 循环，
+                    // 代价一次索引聚合，可接受。每次 tick 执行都计数（存活证明）。
+                    diag.reconcile_total.fetch_add(1, Ordering::Relaxed);
+                    let check = {
+                        let store = store.clone();
+                        tokio::task::spawn_blocking(move || store.max_seq()).await
+                    };
+                    let behind = matches!(check, Ok(Ok(m)) if m > last_sent);
+                    if behind {
+                        tracing::debug!(last_sent, "SSE reconcile found new rows, catching up");
+                        loop {
+                            let Some((cur2, frames, done)) =
+                                sse_catch_up_page(&store, last_sent, None).await
+                            else {
+                                return;
+                            };
+                            diag.replay_frames_total
+                                .fetch_add(frames.len() as u64, Ordering::Relaxed);
+                            for f in frames {
+                                yield f;
+                            }
+                            last_sent = cur2;
+                            if done {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    Ok(axum::response::sse::Sse::new(s).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    ))
+}
+
+/// ⑧c 事件面诊断：SSE 计数（lagged/replay/reconcile）加 store 规模。
+/// P1-1 补全 ingress 全局计数、retention 累计 purge 与 hub live 订阅数。
+/// 计数是进程级累计（Relaxed 原子），各连接与 attempt 共同累加；
+/// 给 Lagged 分支契约测试提供程序级证明点。
+async fn events_stats(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(svc) = state.event_services() else {
+        return events_unavailable();
+    };
+    let d = &svc.diagnostics;
+    let load = |v: &std::sync::atomic::AtomicU64| v.load(Ordering::Relaxed);
+    let live_clients = svc.hub.receiver_count();
+    let store = svc.store.clone();
+    let res = tokio::task::spawn_blocking(move || store.stats()).await;
+    match res {
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &format!("stats task failed: {e}"))),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &e.to_string())),
+        ),
+        Ok(Ok(st)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "sse_lagged_total": load(&d.lagged_total),
+                "sse_replay_frames_total": load(&d.replay_frames_total),
+                "sse_reconcile_total": load(&d.reconcile_total),
+                "ingress_batches_total": load(&d.ingress_batches_total),
+                "ingress_persisted_events_total": load(&d.ingress_persisted_events_total),
+                "ingress_batch_duplicates_total": load(&d.ingress_batch_duplicates_total),
+                "ingress_event_duplicates_total": load(&d.ingress_event_duplicates_total),
+                "ingress_gaps_total": load(&d.ingress_gaps_total),
+                "ingress_regressions_total": load(&d.ingress_regressions_total),
+                "ingress_collisions_total": load(&d.ingress_collisions_total),
+                "ingress_invalid_total": load(&d.ingress_invalid_total),
+                "ingress_store_failures_total": load(&d.ingress_store_failures_total),
+                "retention_purged_total": load(&d.retention_purged_total),
+                "live_clients": live_clients,
+                "stored_rows": st.rows,
+                "stored_size_bytes": st.size_bytes,
+            })),
+        ),
+    }
+}
+
+async fn get_event(
+    State(state): State<Arc<AppState>>,
+    Path(seq): Path<i64>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(svc) = state.event_services() else {
+        return events_unavailable();
+    };
+    let store = svc.store.clone();
+    let res = tokio::task::spawn_blocking(move || store.query_by_seq(seq)).await;
+    match res {
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &format!("query task failed: {e}"))),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error("INTERNAL", &e.to_string())),
+        ),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("event seq `{seq}`"))),
+        ),
+        Ok(Ok(Some(row))) => match stored_event_json(&row) {
+            Ok(v) => (StatusCode::OK, Json(v)),
+            Err(e) => e,
+        },
+    }
+}
+
+async fn list_event_tasks(
+    State(state): State<Arc<AppState>>,
+    Path(endpoint_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.store.list_event_tasks(&endpoint_id) {
+        Ok(v) => {
+            let rev = state.store.current_revision(&endpoint_id).unwrap_or(0);
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({ "endpoint_id": endpoint_id, "revision": rev, "event_tasks": v }),
+                ),
+            )
+        }
+        Err(e) => store_err_to_response(e),
+    }
+}
+
+async fn put_event_tasks(
+    State(state): State<Arc<AppState>>,
+    Path(endpoint_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // body 可为 {event_tasks:[...]} 或直接 [...]（与 put_tasks_for_endpoint 同宽容）
+    let tasks: Vec<EventTask> = if let Some(arr) = body.get("event_tasks") {
+        match serde_json::from_value(arr.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_error("VALIDATION_ERROR", &e.to_string())),
+                );
+            }
+        }
+    } else if body.is_array() {
+        match serde_json::from_value(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_error("VALIDATION_ERROR", &e.to_string())),
+                );
+            }
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "VALIDATION_ERROR",
+                "body 需为 {event_tasks:[...]} 或 [...]",
+            )),
+        );
+    };
+    // 运行中禁止修改（与 Data tasks 同语义，v1.1 §17：无 PATCH，只有全量 replace）
+    if state.manager.is_running(&endpoint_id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json_error(
+                "CONFLICT",
+                "endpoint 正在运行，请先停止后再修改事件任务",
+            )),
+        );
+    }
+    match state.store.replace_event_tasks(&endpoint_id, &tasks) {
+        Ok(rev) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "endpoint_id": endpoint_id, "revision": rev })),
         ),
         Err(e) => store_err_to_response(e),
     }
@@ -2023,6 +2606,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/tasks", get(list_tasks).post(replace_tasks))
         .route("/api/v1/tasks/{endpoint_id}", put(put_tasks_for_endpoint))
         .route("/api/v1/tasks/{endpoint_id}/{task_id}", delete(delete_task))
+        // Events（PR7 v1.1 §16/§17）。
+        // NOTE: `/events/live`（⑦ SSE，静态段）与 `/events/{seq}`（动态段）
+        // 共存——axum 静态优先，无需调序（同 certificates/opcua 前例）。
+        .route("/api/v1/events", get(list_events))
+        .route("/api/v1/events/live", get(events_live))
+        .route("/api/v1/events/stats", get(events_stats))
+        .route("/api/v1/events/{seq}", get(get_event))
+        .route(
+            "/api/v1/endpoints/{id}/event-tasks",
+            get(list_event_tasks).put(put_event_tasks),
+        )
         // 证书管理 §19.3（显式路由避免 Axum 参数与静态路径 405 冲突）
         .route(
             "/api/v1/certificates/opcua/diagnostics",

@@ -9,6 +9,7 @@
 //! - [`manager`]：编排入口
 
 pub mod endpoint;
+pub mod event_ingress;
 pub mod manager;
 pub mod manifest;
 pub mod probe;

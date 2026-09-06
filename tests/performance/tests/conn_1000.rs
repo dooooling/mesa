@@ -26,6 +26,7 @@ async fn conn_1000_no_leak() {
                     config: serde_json::json!({"points":[{"key": format!("k{i}"), "kind":"counter"}]}),
                 },
             }],
+            event_tasks: vec![],
         };
         mgr.start_endpoint(ep).unwrap();
     }

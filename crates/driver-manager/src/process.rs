@@ -73,7 +73,7 @@ impl DriverProcess {
             // 进程对象被 drop 时兜底杀掉，防止异常路径泄漏
             .kill_on_drop(true);
 
-        let mut child = cmd.spawn()?;
+        let mut child = spawn_retry_txtbsy(&mut cmd).await?;
         let pid = child.id().unwrap_or(0);
 
         #[cfg(windows)]
@@ -113,6 +113,9 @@ impl DriverProcess {
 
     /// 优雅退出：关闭 stdin 触发 EOF 防护 → 等待宽限 → 强杀。
     /// IPC 层的 Shutdown 消息由上层在调用本方法前发送。
+    ///
+    /// 异常路径专用（spawn 后握手失败、probe/browse 临时进程回收等）。
+    /// 正常 Stop 禁止走这里——见 [`DriverProcess::terminate_after_shutdown`]。
     pub async fn terminate(&mut self) {
         // 关闭 liveness 管道是第一信号
         drop(self.stdin.take());
@@ -125,6 +128,56 @@ impl DriverProcess {
             }
         }
     }
+
+    /// 正常 Shutdown 收尾（P0-2 Final）：已 post Shutdown RPC 后调用。
+    ///
+    /// Phase 1：stdin 保持 OPEN，给 Driver 自然退出的机会——SDK 侧 Shutdown
+    /// RPC → run tasks 停止 → writer drain → TCP FIN → 进程退出。stdin 一直
+    /// 开着，liveness guard 不会抢跑 `process::exit(0)`，drain 链完整：
+    /// producer stop → SDK queue drain → TCP drain → 自然退出 →
+    /// Core reader EOF → event_rx drain → EventStore COMMIT。
+    ///
+    /// Phase 2（Phase 1 超时才进入）：emergency EOF——关 stdin 让 liveness
+    /// guard 兜底，再沿 [`DriverProcess::terminate`] 语义等宽限 → 强杀。
+    /// RPC 与 stdin pipe 之间无 happens-before，正常路径绝不能先关 stdin。
+    pub async fn terminate_after_shutdown(&mut self) {
+        match tokio::time::timeout(TERMINATE_GRACE, self.child.wait()).await {
+            Ok(_) => return,
+            Err(_) => {
+                tracing::warn!(
+                    pid = self.pid,
+                    "driver did not exit after Shutdown, emergency EOF"
+                );
+            }
+        }
+        self.terminate().await;
+    }
+}
+
+/// ETXTBSY 有界重试（CI ARM 基建，非 Event 逻辑）：staged 可执行文件在慢
+/// 文件系统上，"拷贝 close → exec"之间可能仍被认为有写者（Linux errno 26
+/// `Text file busy`）。只对该 errno 重试（10 × 50ms ≈ 500ms 上限），其余
+/// 错误直接返回。测试侧 staging 已走"临时文件 + 原子 rename"，本重试是
+/// 第二层兜底；正常路径一次成功，零行为变化。
+async fn spawn_retry_txtbsy(cmd: &mut tokio::process::Command) -> Result<Child, std::io::Error> {
+    let mut last: Option<std::io::Error> = None;
+    for _ in 0..10 {
+        match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(e) => {
+                #[cfg(target_os = "linux")]
+                let txtbsy = e.raw_os_error() == Some(26);
+                #[cfg(not(target_os = "linux"))]
+                let txtbsy = false;
+                if !txtbsy {
+                    return Err(e);
+                }
+                last = Some(e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    Err(last.expect("retry loop always sets last error"))
 }
 
 /// Core 进程内已租出的 Driver IPC 端口表（P1-A 第一层：线程/任务间去重）。

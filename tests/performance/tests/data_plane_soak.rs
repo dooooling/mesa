@@ -44,6 +44,7 @@ async fn data_plane_50k_10s_ci() {
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
         tasks,
+        event_tasks: vec![],
     };
     mgr.start_endpoint(ep).unwrap();
     // 等待 RUNNING

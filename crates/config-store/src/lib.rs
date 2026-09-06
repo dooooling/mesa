@@ -12,12 +12,13 @@ use std::sync::{Mutex, OnceLock};
 
 #[allow(unused_imports)]
 use mesa_core_types::{
-    AcquisitionTask, DataType, PointDefinition, PointDescriptor, ensure_unique_point_keys,
+    AcquisitionTask, DataType, EventTask, PointDefinition, PointDescriptor,
+    ensure_unique_point_keys,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// 当前 schema 版本。增量迁移时递增并在 `meta` 中持久化（§6.1）。
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 // ---------------------------------------------------------------------------
 // 记录类型
@@ -84,13 +85,15 @@ pub enum StoreError {
 // Secret Master Key & AEAD
 // ---------------------------------------------------------------------------
 
-/// 全局 master key 缓存（进程内单例，避免重复文件 IO）
-static MASTER_KEY_CACHE: OnceLock<[u8; 32]> = OnceLock::new();
-
-fn master_key_bytes() -> Result<[u8; 32], StoreError> {
-    if let Some(k) = MASTER_KEY_CACHE.get() {
-        return Ok(*k);
-    }
+/// P0-1 Final：key 目录由 `open(path)` 的 DB 父目录决定（docstring 本就承诺
+/// "与 DB 同目录"），`open_in_memory` 对应 `None`。CWD 相对路径
+/// （`data/master.key` 等）已删除——`cargo test -p mesa-config-store` 的
+/// CWD 恰是 crate 目录，旧实现会在源码树里生成真 key 并被误提交。
+/// 缓存是实例级（`ConfigStore::master_key`），禁止进程全局 static——同一进程
+/// 内 in-memory 库（固定测试 key）与多个文件库（各目录独立 key）共存时，
+/// 全局缓存会把先访问者的 key 串给后访问者（文件库 key 文件甚至不生成，
+/// 进程重启后旧 Secret 永久无法解密）。
+fn load_master_key(key_dir: Option<&PathBuf>) -> Result<[u8; 32], StoreError> {
     // 1) 环境变量覆盖（支持 base64 或 32 字节原始字符串，适配离线工控机）
     if let Ok(env) = std::env::var("MESA_MASTER_KEY") {
         let env = env.trim();
@@ -102,7 +105,6 @@ fn master_key_bytes() -> Result<[u8; 32], StoreError> {
             {
                 let mut k = [0u8; 32];
                 k.copy_from_slice(&decoded);
-                let _ = MASTER_KEY_CACHE.set(k);
                 return Ok(k);
             }
             // 生产级：仅接受 base64 32 字节，其余一律拒绝（禁止弱回退）
@@ -111,49 +113,42 @@ fn master_key_bytes() -> Result<[u8; 32], StoreError> {
             ));
         }
     }
-    // 2) 文件 $DATA/master.key（与 DB 同目录，0600）
-    // 对于 open_in_memory 场景，使用固定测试 key（仅单测）
-    let key = load_or_create_master_key_file()?;
-    let _ = MASTER_KEY_CACHE.set(key);
-    Ok(key)
+    // 2) in-memory 库：固定测试 key，不碰磁盘（单测永不生成真 key 文件）
+    let Some(dir) = key_dir else {
+        return Ok([0xA5u8; 32]);
+    };
+    // 3) 文件库：`MESA_DATA_DIR` 覆盖，否则与 DB 同目录，0600
+    let target = if let Ok(env_dir) = std::env::var("MESA_DATA_DIR") {
+        PathBuf::from(env_dir).join("master.key")
+    } else {
+        dir.join("master.key")
+    };
+    load_or_create_master_key_file(&target)
 }
 
-fn load_or_create_master_key_file() -> Result<[u8; 32], StoreError> {
-    // 尝试从常见位置解析：优先环境变量 MESA_DATA_DIR，其次当前目录
-    let candidates: Vec<PathBuf> = if let Ok(dir) = std::env::var("MESA_DATA_DIR") {
-        vec![PathBuf::from(dir).join("master.key")]
-    } else {
-        vec![
-            PathBuf::from("data/master.key"),
-            PathBuf::from("./master.key"),
-            std::env::temp_dir().join("mesa-master.key"),
-        ]
-    };
-    for p in &candidates {
-        if p.is_file() {
-            let raw = std::fs::read(p)
-                .map_err(|e| StoreError::Validation(format!("read master.key: {e}")))?;
-            // 支持 base64 或原始 32 字节
-            if raw.len() == 32 {
-                let mut k = [0u8; 32];
-                k.copy_from_slice(&raw);
-                return Ok(k);
-            }
-            if let Ok(s) = String::from_utf8(raw.clone())
-                && let Ok(decoded) =
-                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s.trim())
-                && decoded.len() == 32
-            {
-                let mut k = [0u8; 32];
-                k.copy_from_slice(&decoded);
-                return Ok(k);
-            }
+fn load_or_create_master_key_file(target: &PathBuf) -> Result<[u8; 32], StoreError> {
+    if target.is_file() {
+        let raw = std::fs::read(target)
+            .map_err(|e| StoreError::Validation(format!("read master.key: {e}")))?;
+        // 支持 base64 或原始 32 字节
+        if raw.len() == 32 {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&raw);
+            return Ok(k);
+        }
+        if let Ok(s) = String::from_utf8(raw.clone())
+            && let Ok(decoded) =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s.trim())
+            && decoded.len() == 32
+        {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&decoded);
+            return Ok(k);
         }
     }
-    // 不存在则生成并写入第一个候选路径
+    // 不存在则生成并写入目标路径
     let mut key = [0u8; 32];
     getrandom::getrandom(&mut key).map_err(|e| StoreError::Validation(e.to_string()))?;
-    let target = &candidates[0];
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| StoreError::Validation(format!("create master.key dir: {e}")))?;
@@ -219,6 +214,11 @@ fn aead_decrypt(ciphertext: &[u8], nonce: &[u8], key: &[u8; 32]) -> Result<Vec<u
 
 pub struct ConfigStore {
     conn: Mutex<Connection>,
+    /// master.key 目录：文件库 = DB 父目录（P0-1），内存库 = None（固定测试 key）。
+    key_dir: Option<PathBuf>,
+    /// master key 实例级缓存（P0-1 Final）：`get_or_try_init` 串行化并发首次
+    /// 访问；各实例独立，in-memory/多目录文件库同进程共存不串 key。
+    master_key: OnceLock<[u8; 32]>,
 }
 
 impl ConfigStore {
@@ -233,25 +233,70 @@ impl ConfigStore {
             })?;
         }
         let conn = Connection::open(path)?;
+        // P0-1：key 目录锚定 DB 位置，不再依赖进程 CWD。
+        // 无父目录（如 `mesa.db`）即当前目录——绝不能回落到测试 key。
+        let key_dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => Some(p.to_path_buf()),
+            _ => Some(PathBuf::from(".")),
+        };
         let s = Self {
             conn: Mutex::new(conn),
+            key_dir,
+            master_key: OnceLock::new(),
         };
         s.migrate()?;
         Ok(s)
     }
 
-    /// 内存库（单测/临时使用）。
+    /// 内存库（单测/临时使用）：Secret 用固定测试 key，不写任何 key 文件。
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
         let s = Self {
             conn: Mutex::new(conn),
+            key_dir: None,
+            master_key: OnceLock::new(),
         };
         s.migrate()?;
         Ok(s)
     }
 
+    /// 本实例的 master key（P0-1 Final：实例级缓存 + 目录锚定 DB，跨实例
+    /// desync 不可能）。并发首次访问由初始化锁串行化——同实例双生成会产生
+    /// "缓存 key ≠ 落盘 key"；锁是进程共享的，但只保护初始化路径，缓存仍
+    /// 是实例级（`OnceLock::get_or_try_init` 仍为 nightly 特性，不可用）。
+    fn master_key_bytes(&self) -> Result<[u8; 32], StoreError> {
+        if let Some(k) = self.master_key.get() {
+            return Ok(*k);
+        }
+        static INIT_LOCK: Mutex<()> = Mutex::new(());
+        let _g = INIT_LOCK.lock().unwrap();
+        if let Some(k) = self.master_key.get() {
+            return Ok(*k);
+        }
+        let key = load_master_key(self.key_dir.as_ref())?;
+        let _ = self.master_key.set(key);
+        Ok(key)
+    }
+
+    /// 迁移前的文件拷贝兜底（仅文件库；生产应使用 rusqlite backup API）。
+    /// 调用方需持有 conn guard（只读 path，不重入加锁）。
+    fn backup_file_db(conn: &Connection) {
+        if let Some(path_str) = conn.path()
+            && !path_str.is_empty()
+            && std::path::Path::new(path_str).exists()
+        {
+            let path = std::path::Path::new(path_str);
+            let bak = format!("{}.bak.{}", path.display(), Self::now_ns());
+            let _ = std::fs::copy(path, &bak);
+        }
+    }
+
     fn migrate(&self) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        // P0-1：单个 guard 走完全程，禁止中途 drop/re-lock——旧代码在 002
+        // 分支 drop 外层 guard，而现实 v2 库根本不进 <2 分支，003 的重入
+        // lock 在同一线程永久自锁。conn.transaction() 只需 &mut 重借，
+        // 不需要释放 guard。
+        let mut conn = self.conn.lock().unwrap();
         // 建表：幂等
         conn.execute_batch(
             r#"
@@ -353,37 +398,51 @@ impl ConfigStore {
                 )
                 .unwrap_or(false);
             if !has_2 {
-                // 备份（仅文件库，内存库跳过；生产应使用 rusqlite backup API，此处以文件拷贝为兜底）
-                if let Some(path_str) = conn.path()
-                    && !path_str.is_empty()
-                    && std::path::Path::new(path_str).exists()
-                {
-                    let path = std::path::Path::new(path_str);
-                    let bak = format!("{}.bak.{}", path.display(), Self::now_ns());
-                    let _ = std::fs::copy(path, &bak);
-                }
+                Self::backup_file_db(&conn);
                 let sql2 = include_str!("../migrations/002_management_control.sql");
-                // 原子迁移：BEGIN IMMEDIATE → SQL → 记录 → 更新 meta → COMMIT
-                // 使用 unchecked_transaction 以兼容外层未提交状态
-                {
-                    // 需要 &mut Connection 以开启事务，临时解锁重入
-                    drop(conn);
-                    let mut conn_mut = self.conn.lock().unwrap();
-                    let tx = conn_mut.transaction()?;
-                    tx.execute_batch(sql2)?;
-                    let checksum2 = format!("{:x}", sql2.len());
-                    tx.execute(
-                        "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(2,'002_management_control',?1,?2)",
-                        params![checksum2, Self::now_ns()],
-                    )?;
-                    tx.execute("UPDATE meta SET value='2' WHERE key='schema_version'", [])?;
-                    tx.execute(
-                        "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','2')",
-                        [],
-                    )?;
-                    tx.commit()?;
-                    return Ok(());
-                }
+                // 原子迁移：SQL → 记录 → 更新 meta → COMMIT（单事务）
+                let tx = conn.transaction()?;
+                tx.execute_batch(sql2)?;
+                let checksum2 = format!("{:x}", sql2.len());
+                tx.execute(
+                    "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(2,'002_management_control',?1,?2)",
+                    params![checksum2, Self::now_ns()],
+                )?;
+                tx.execute("UPDATE meta SET value='2' WHERE key='schema_version'", [])?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','2')",
+                    [],
+                )?;
+                tx.commit()?;
+                cur_ver = 2;
+            }
+        }
+        // 003 迁移（PR7 EventTask，v1.1 §10）
+        if cur_ver < 3 {
+            let has_3: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=3)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !has_3 {
+                Self::backup_file_db(&conn);
+                let sql3 = include_str!("../migrations/003_event_tasks.sql");
+                let tx = conn.transaction()?;
+                tx.execute_batch(sql3)?;
+                let checksum3 = format!("{:x}", sql3.len());
+                tx.execute(
+                    "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(3,'003_event_tasks',?1,?2)",
+                    params![checksum3, Self::now_ns()],
+                )?;
+                tx.execute("UPDATE meta SET value='3' WHERE key='schema_version'", [])?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','3')",
+                    [],
+                )?;
+                tx.commit()?;
+                cur_ver = 3;
             }
         }
         // 最终确保 meta 为最新
@@ -555,7 +614,7 @@ impl ConfigStore {
         // 预先加密所有 secrets，避免事务中途失败；无 Secret 时不初始化 master key
         let mut encs: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
         if !secrets.is_empty() {
-            let key = master_key_bytes()?;
+            let key = self.master_key_bytes()?;
             for (field, pt) in secrets {
                 let (ct, nonce) = aead_encrypt(pt.as_bytes(), &key)?;
                 encs.push((field.clone(), ct, nonce));
@@ -621,7 +680,7 @@ impl ConfigStore {
         }
         let mut encs: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
         if !secrets_to_upsert.is_empty() {
-            let key = master_key_bytes()?;
+            let key = self.master_key_bytes()?;
             for (field, pt) in secrets_to_upsert {
                 let (ct, nonce) = aead_encrypt(pt.as_bytes(), &key)?;
                 encs.push((field.clone(), ct, nonce));
@@ -844,6 +903,132 @@ impl ConfigStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    // ---- EventTasks（全量快照替换，与 Tasks 对等，PR7 v1.1 §10）----
+
+    /// 全量替换某 endpoint 的事件任务集合。空数组表示清空（= 无事件订阅）。
+    /// 成功时 revision 自增并返回新 revision（与 Data tasks 共用同一计数器：
+    /// 任何配置变化都使 revision 前进）；失败则事务回滚、旧配置保持不变。
+    /// 只做 Mesa contract/结构校验（id 非空唯一、Poll/interval 关系）；
+    /// protocol-specific binding 语义留给 Driver 在 ConfigureEventTasks 时判定。
+    pub fn replace_event_tasks(
+        &self,
+        endpoint_id: &str,
+        tasks: &[EventTask],
+    ) -> Result<u64, StoreError> {
+        for t in tasks {
+            t.validate()
+                .map_err(|e| StoreError::Validation(e.to_string()))?;
+        }
+        {
+            let mut seen = HashSet::new();
+            for t in tasks {
+                if !seen.insert(&t.id) {
+                    return Err(StoreError::Validation(format!(
+                        "duplicate event task id `{}`",
+                        t.id
+                    )));
+                }
+            }
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM endpoints WHERE id=?1)",
+            params![endpoint_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::NotFound(format!(
+                "endpoint `{endpoint_id}` 不存在"
+            )));
+        }
+
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM event_tasks WHERE endpoint_id=?1",
+            params![endpoint_id],
+        )?;
+        for t in tasks {
+            tx.execute(
+                "INSERT INTO event_tasks(endpoint_id,id,mode,interval_ms,binding_kind,binding_config_json)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    endpoint_id,
+                    t.id,
+                    t.mode.as_str(),
+                    t.interval_ms.map(|v| v as i64),
+                    t.binding.kind,
+                    serde_json::to_string(&t.binding.config).unwrap(),
+                ],
+            )?;
+        }
+        // bump revision（与 replace_tasks 同一计数器）
+        let cur: i64 = tx
+            .query_row(
+                "SELECT revision FROM config_revision WHERE endpoint_id=?1",
+                params![endpoint_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let next = (cur + 1) as u64;
+        tx.execute(
+            "INSERT INTO config_revision(endpoint_id,revision) VALUES(?1,?2)
+             ON CONFLICT(endpoint_id) DO UPDATE SET revision=excluded.revision",
+            params![endpoint_id, next as i64],
+        )?;
+        tx.execute(
+            "UPDATE endpoints SET updated_at_ns=?1 WHERE id=?2",
+            params![Self::now_ns(), endpoint_id],
+        )?;
+        tx.commit()?;
+        Ok(next)
+    }
+
+    pub fn list_event_tasks(&self, endpoint_id: &str) -> Result<Vec<EventTask>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,mode,interval_ms,binding_kind,binding_config_json FROM event_tasks WHERE endpoint_id=?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![endpoint_id], |r| {
+            let mode_s: String = r.get(1)?;
+            // 新表由本函数写入，mode 取值受控；未知值视为数据损坏，硬失败
+            // （不像老 tasks 表那样静默回落 Poll）。
+            let mode = match mode_s.as_str() {
+                "poll" => mesa_core_types::TaskMode::Poll,
+                "subscribe" => mesa_core_types::TaskMode::Subscribe,
+                other => {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        format!("unknown event task mode `{other}`").into(),
+                    ));
+                }
+            };
+            let binding_config_json: String = r.get(4)?;
+            // P0-2：坏 binding JSON 硬失败（与非法 mode 同语义；静默 `{}` 会
+            // 让损坏的订阅变成"配了但行为不对"的幽灵任务）。
+            let cfg: serde_json::Value =
+                serde_json::from_str(&binding_config_json).map_err(|e: serde_json::Error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        format!("corrupt event binding_config_json: {e}").into(),
+                    )
+                })?;
+            Ok(EventTask {
+                id: r.get(0)?,
+                mode,
+                interval_ms: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                binding: mesa_core_types::DriverBinding {
+                    kind: r.get(3)?,
+                    config: cfg,
+                },
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn current_revision(&self, endpoint_id: &str) -> Result<u64, StoreError> {
         let conn = self.conn.lock().unwrap();
         let v: Option<i64> = conn
@@ -1007,7 +1192,7 @@ impl ConfigStore {
         plaintext: &str,
         key_id: &str,
     ) -> Result<(), StoreError> {
-        let key = master_key_bytes()?;
+        let key = self.master_key_bytes()?;
         let (ciphertext, nonce) = aead_encrypt(plaintext.as_bytes(), &key)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1046,7 +1231,7 @@ impl ConfigStore {
                 let pt: Vec<u8> = ct.iter().map(|b| b ^ key_byte).collect();
                 return Ok(Some(String::from_utf8_lossy(&pt).into_owned()));
             }
-            let key = master_key_bytes()?;
+            let key = self.master_key_bytes()?;
             let pt = aead_decrypt(&ct, &nonce, &key)?;
             Ok(Some(String::from_utf8_lossy(&pt).into_owned()))
         } else {
@@ -1381,6 +1566,206 @@ mod tests {
         ));
     }
 
+    fn event_task(id: &str) -> EventTask {
+        EventTask {
+            id: id.into(),
+            mode: TaskMode::Subscribe,
+            interval_ms: None,
+            binding: DriverBinding {
+                kind: "simulator.events".into(),
+                config: serde_json::json!({"stream": "sim.events.alarm-cycle"}),
+            },
+        }
+    }
+
+    /// migration 003：新库 schema_version=3 且 event_tasks 表可用；
+    /// v2 无损（老数据路径不受影响由 002 测试覆盖，此处断言版本标记）。
+    #[test]
+    fn migration_003_event_tasks_table() {
+        let s = mem();
+        let ver: String = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ver, "3");
+        let has: bool = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=3)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has);
+        s.create_device(&dev("d1")).unwrap();
+        s.create_endpoint(&ep("e1", "d1")).unwrap();
+        // 空快照即无订阅
+        assert!(s.list_event_tasks("e1").unwrap().is_empty());
+        let r1 = s.replace_event_tasks("e1", &[event_task("al")]).unwrap();
+        assert_eq!(r1, 1);
+        let tasks = s.list_event_tasks("e1").unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "al");
+        assert_eq!(tasks[0].mode, TaskMode::Subscribe);
+        // revision 与 Data tasks 共用计数器
+        s.replace_tasks("e1", &[task("t1", 100)]).unwrap();
+        assert_eq!(s.current_revision("e1").unwrap(), 2);
+        // 全量替换 + 非法拒绝（Poll 无 interval）+ 回滚不推进 revision
+        assert!(matches!(
+            s.replace_event_tasks(
+                "e1",
+                &[EventTask {
+                    id: "bad".into(),
+                    mode: TaskMode::Poll,
+                    interval_ms: None,
+                    binding: DriverBinding {
+                        kind: "k".into(),
+                        config: serde_json::json!({}),
+                    },
+                }]
+            ),
+            Err(StoreError::Validation(_))
+        ));
+        assert_eq!(s.current_revision("e1").unwrap(), 2);
+        assert_eq!(s.list_event_tasks("e1").unwrap().len(), 1);
+        // 重复 id 拒绝
+        assert!(matches!(
+            s.replace_event_tasks("e1", &[event_task("d"), event_task("d")]),
+            Err(StoreError::Validation(_))
+        ));
+        // endpoint 删除级联清理配置行（历史在 events.db，不受影响）
+        assert!(s.delete_endpoint("e1").unwrap());
+        assert!(s.list_event_tasks("e1").unwrap().is_empty());
+    }
+
+    /// P0-1 回归：现实 v2 文件库 open() 必须一次走到 v3（旧代码在此自锁）。
+    /// 构造方式：按 v2 应有形态手写建表 + meta=2 + migrations 1,2 + 业务行，
+    /// 再 ConfigStore::open()（同一线程重复 lock 即永挂，测试会直接卡死）。
+    #[test]
+    fn v2_file_db_upgrades_to_v3_without_data_loss() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mesa-config-v2up-{}-{}.db",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE devices(id TEXT PRIMARY KEY, name TEXT NOT NULL, profile TEXT);
+                CREATE TABLE endpoints(
+                    id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE RESTRICT,
+                    driver_id TEXT NOT NULL,
+                    connection_json TEXT NOT NULL,
+                    desired_running INTEGER NOT NULL DEFAULT 0,
+                    updated_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE tasks(
+                    endpoint_id TEXT NOT NULL REFERENCES endpoints(id) ON DELETE CASCADE,
+                    id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    interval_ms INTEGER,
+                    binding_kind TEXT NOT NULL,
+                    binding_config_json TEXT NOT NULL,
+                    PRIMARY KEY(endpoint_id, id)
+                );
+                CREATE TABLE schema_migrations(
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    applied_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE endpoint_secrets(
+                    endpoint_id TEXT NOT NULL,
+                    field_path TEXT NOT NULL,
+                    ciphertext BLOB NOT NULL,
+                    nonce BLOB NOT NULL,
+                    algorithm TEXT NOT NULL,
+                    key_id TEXT NOT NULL,
+                    updated_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(endpoint_id, field_path)
+                );
+                INSERT INTO meta(key,value) VALUES('schema_version','2');
+                INSERT INTO schema_migrations(version,name,checksum,applied_at_ns)
+                    VALUES(1,'001_initial','x',1),(2,'002_management_control','y',2);
+                INSERT INTO devices(id,name) VALUES('d1','D1');
+                INSERT INTO endpoints(id,device_id,driver_id,connection_json,desired_running,updated_at_ns)
+                    VALUES('e1','d1','simulator','{}',1,7);
+                INSERT INTO tasks(endpoint_id,id,mode,interval_ms,binding_kind,binding_config_json)
+                    VALUES('e1','t1','poll',100,'simulator.points','{}');
+                "#,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO endpoint_secrets(endpoint_id,field_path,ciphertext,nonce,algorithm,key_id,updated_at_ns)
+                 VALUES('e1','password',?1,?2,'aead','k1',8)",
+                params![vec![1u8, 2, 3], vec![9u8]],
+            )
+            .unwrap();
+        }
+        // 前置确认：确实是 v2
+        {
+            let conn = Connection::open(&path).unwrap();
+            let ver: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ver, "2");
+        }
+        // 升级（自锁会在此永久 hanging，CI 超时即失败）
+        let s = ConfigStore::open(&path).unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            let ver: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ver, "3");
+            // 旧业务行全部还在
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE endpoint_id='e1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1);
+            let blob: Vec<u8> = conn
+                .query_row(
+                    "SELECT ciphertext FROM endpoint_secrets WHERE endpoint_id='e1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(blob, vec![1u8, 2, 3]);
+        }
+        // 公共 API 视角：endpoint/任务可读，event_tasks 可用
+        assert_eq!(s.list_tasks("e1").unwrap().len(), 1);
+        assert!(s.list_event_tasks("e1").unwrap().is_empty());
+        s.replace_event_tasks("e1", &[event_task("al")]).unwrap();
+        assert_eq!(s.list_event_tasks("e1").unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn point_id_stable_and_tombstone_reuse() {
         let s = mem();
@@ -1494,6 +1879,88 @@ mod tests {
         s.put_secret("e1", "password", "another", "k2").unwrap();
         let pt2 = s.get_secret("e1", "password").unwrap().unwrap();
         assert_eq!(pt2, "another");
+        // P0-1 回归：内存库 Secret 全程不碰磁盘，CWD 下不得出现 key 文件
+        //（旧实现会在 crate 目录生成 data/master.key 并被误提交）。
+        assert!(
+            !std::path::Path::new("data/master.key").exists(),
+            "in-memory secret must not create data/master.key under CWD"
+        );
+        assert!(
+            !std::path::Path::new("./master.key").exists(),
+            "in-memory secret must not create ./master.key under CWD"
+        );
+    }
+
+    /// P0-1 Final：master key 是 per-store 语义，不是进程全局。
+    /// 同一测试进程内：in-memory（固定测试 key）先访问 Secret，再开两个
+    /// 不同目录的文件库各自 put/get，drop 重开后三者必须各自可解密。
+    /// 旧全局 `MASTER_KEY_CACHE` 下文件库会命中 `[0xA5;32]`、key 文件甚至
+    /// 不生成，重启即失密——本测试逐项断言锁死。
+    #[test]
+    fn master_key_is_per_store_not_process_global() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "mesa-keyscope-{}-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        // 1) in-memory 先访问 Secret（旧全局缓存会被固定测试 key 污染）
+        let m = mem();
+        m.create_device(&dev("d0")).unwrap();
+        m.create_endpoint(&ep("e0", "d0")).unwrap();
+        m.put_secret("e0", "password", "mem-secret", "k1").unwrap();
+        assert_eq!(
+            m.get_secret("e0", "password").unwrap().as_deref(),
+            Some("mem-secret")
+        );
+
+        // 2) 文件库 A：key 文件必须真实生成（旧实现直接命中缓存，不生成）
+        let a_db = base.join("a").join("mesa.db");
+        let a = ConfigStore::open(&a_db).unwrap();
+        a.create_device(&dev("da")).unwrap();
+        a.create_endpoint(&ep("ea", "da")).unwrap();
+        a.put_secret("ea", "password", "a-secret", "k1").unwrap();
+        let a_key = base.join("a").join("master.key");
+        assert!(
+            a_key.is_file(),
+            "file store must generate its own master.key"
+        );
+        drop(a);
+
+        // 3) 文件库 B：另一独立 key
+        let b_db = base.join("b").join("mesa.db");
+        let b = ConfigStore::open(&b_db).unwrap();
+        b.create_device(&dev("db")).unwrap();
+        b.create_endpoint(&ep("eb", "db")).unwrap();
+        b.put_secret("eb", "password", "b-secret", "k1").unwrap();
+        drop(b);
+        assert_ne!(
+            std::fs::read(base.join("a").join("master.key")).unwrap(),
+            std::fs::read(base.join("b").join("master.key")).unwrap(),
+            "distinct DB dirs must hold distinct keys"
+        );
+
+        // 4) 全部重开：各自可解密（旧实现 A/B 会读到 [0xA5;32] 而解密失败）
+        let a2 = ConfigStore::open(&a_db).unwrap();
+        assert_eq!(
+            a2.get_secret("ea", "password").unwrap().as_deref(),
+            Some("a-secret")
+        );
+        let b2 = ConfigStore::open(&b_db).unwrap();
+        assert_eq!(
+            b2.get_secret("eb", "password").unwrap().as_deref(),
+            Some("b-secret")
+        );
+        // in-memory 不受文件库影响
+        assert_eq!(
+            m.get_secret("e0", "password").unwrap().as_deref(),
+            Some("mem-secret")
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -1519,7 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_002_exists_and_version_is_2() {
+    fn migration_chain_intact_through_003() {
         let s = mem();
         let conn = s.conn.lock().unwrap();
         let ver: String = conn
@@ -1529,11 +1996,20 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "2");
+        // PR7 起 SCHEMA_VERSION=3；002 本身仍必须存在且已应用（增量链不断）
+        assert!(ver == "3", "新库应为 v3，got {ver}");
+        let has2: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=2)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has2, "002 迁移记录不得丢失");
         let cnt: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert!(cnt >= 2, "至少 2 条迁移");
+        assert!(cnt >= 3, "至少 3 条迁移");
         // 表存在
         let tbl: String = conn
             .query_row(

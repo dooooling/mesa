@@ -46,16 +46,36 @@ pub fn repo_root() -> PathBuf {
 /// 必须先 `cargo build -p mesa-driver-simulator`（或 `--workspace`），
 /// 否则拉起的是旧二进制、故障注入不生效。
 pub fn sim_exe() -> PathBuf {
+    find_built_binary("mesa-driver-simulator")
+}
+
+/// 已构建的 mesad 可执行文件路径（P1-2 进程级 restart Gate 用；
+/// 同上，先 `cargo build --workspace`，否则是旧二进制）。
+pub fn mesad_exe() -> PathBuf {
+    find_built_binary("mesad")
+}
+
+fn find_built_binary(name: &str) -> PathBuf {
     let target = repo_root().join("target");
     for profile in ["debug", "release"] {
-        for name in ["mesa-driver-simulator.exe", "mesa-driver-simulator"] {
-            let p = target.join(profile).join(name);
+        for suffix in [".exe", ""] {
+            let p = target.join(profile).join(format!("{name}{suffix}"));
             if p.is_file() {
                 return p;
             }
         }
     }
-    panic!("simulator binary not built; run cargo build/test first");
+    panic!("{name} binary not built; run cargo build/test first");
+}
+
+/// 找一个空闲 loopback 端口（bind :0 取号即释放；TOCTOU 下被占则调用方重试）。
+pub async fn free_port() -> u16 {
+    tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// 启动进程内 Simulator SDK 服务（无故障注入），返回 (端口, 停机句柄)。

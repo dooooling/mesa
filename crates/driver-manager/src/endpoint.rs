@@ -14,11 +14,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mesa_core_types::{
-    ConnectionState, DataBatch, PointDefinition, PointDescriptor, ensure_unique_point_keys,
+    ConnectionState, DataBatch, EventTask, PointDefinition, PointDescriptor,
+    ensure_unique_point_keys,
 };
 use mesa_driver_protocol::pb;
+use mesa_event_store::EventServices;
 use tokio_util::sync::CancellationToken;
 
+use crate::event_ingress::{EventDrainError, IngressFatal, run_event_ingress};
 use crate::manifest::DiscoveredDriver;
 use crate::process::DriverProcess;
 use crate::session::{Session, SessionEvent};
@@ -42,6 +45,8 @@ pub struct BuiltinEndpoint {
     /// Endpoint.connection 的 JSON 序列化，语义由 Driver 解释。
     pub connection_json: String,
     pub tasks: Vec<mesa_core_types::AcquisitionTask>,
+    /// 事件订阅快照（PR7 v1.1 §11）：空 = 无事件订阅，老路径零成本。
+    pub event_tasks: Vec<EventTask>,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +181,12 @@ impl PointIdSource for StorePointIdSource {
 // ---------------------------------------------------------------------------
 
 /// 单个 Endpoint 的运行任务。返回即表示该 Endpoint 已停止且不再重试。
+///
+/// 返回值（P0-3）：teardown 结论。`None` = 干净；`Some(desc)` = 收尾异常
+/// （drain fatal/timeout 等精确描述），`stop_endpoint` 转为显式错误。
+/// `events` 为 `None` 时为纯 Data-only 路径（EventStore 不可用或未配置时）：
+/// 不接管 EventReceiver、不起 ingress，数据面完全不受影响（v1.1 §9 隔离）。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_endpoint(
     disc: DiscoveredDriver,
     cfg: BuiltinEndpoint,
@@ -190,7 +201,8 @@ pub async fn run_endpoint(
             >,
         >,
     >,
-) {
+    events: Option<Arc<EventServices>>,
+) -> Option<String> {
     let mut backoff_idx = 0usize;
     let mut id_map: HashMap<String, u32> = source.known_map(&cfg.endpoint_id);
     let mut last_epoch: u64 = 0;
@@ -216,10 +228,10 @@ pub async fn run_endpoint(
                 last_epoch,
                 source.revision(&cfg.endpoint_id),
             );
-            return;
+            return None;
         }
 
-        match attempt_session(
+        let (outcome, drain_err) = attempt_session(
             &disc,
             &cfg,
             &snapshot,
@@ -228,9 +240,10 @@ pub async fn run_endpoint(
             &mut last_epoch,
             &shutdown,
             &registry,
+            events.as_ref(),
         )
-        .await
-        {
+        .await;
+        match outcome {
             AttemptOutcome::Shutdown => {
                 set_status(
                     &snapshot,
@@ -241,10 +254,14 @@ pub async fn run_endpoint(
                     last_epoch,
                     source.revision(&cfg.endpoint_id),
                 );
-                return;
+                // P0-3：teardown 结论随任务返回，stop_endpoint 转显式错误
+                return drain_err.map(|e| e.to_string());
             }
             AttemptOutcome::ConfigurationFailed(detail) => {
                 tracing::error!(endpoint = %cfg.endpoint_id, %detail, "configuration error, no retry");
+                if let Some(e) = &drain_err {
+                    tracing::error!(endpoint = %cfg.endpoint_id, %e, "teardown drain failed");
+                }
                 set_status(
                     &snapshot,
                     &cfg,
@@ -254,12 +271,18 @@ pub async fn run_endpoint(
                     last_epoch,
                     source.revision(&cfg.endpoint_id),
                 );
-                return;
+                return drain_err.map(|e| e.to_string());
             }
             AttemptOutcome::Lost {
                 reason,
                 had_running_session,
             } => {
+                // P0-3：Lost 路径（重连继续）drain 失败只大声记录——没有
+                // Stop 调用方可以接收它；abort 丢弃的 backlog 由重连后的
+                // 新 epoch 继续（旧 epoch 行已 COMMIT 的不受影响）。
+                if let Some(e) = &drain_err {
+                    tracing::error!(endpoint = %cfg.endpoint_id, %reason, %e, "teardown drain failed, reconnecting");
+                }
                 tracing::warn!(endpoint = %cfg.endpoint_id, %reason, had_running_session, "connection lost");
                 snapshot.mark_communication_lost(&cfg.endpoint_id);
                 set_status(
@@ -288,7 +311,7 @@ pub async fn run_endpoint(
             _ = tokio::time::sleep(delay) => {}
             _ = shutdown.cancelled() => {
                 set_status(&snapshot, &cfg, ConnectionState::Stopped, "core shutdown", id_map.len(), last_epoch, source.revision(&cfg.endpoint_id));
-                return;
+                return None;
             }
         }
     }
@@ -324,6 +347,9 @@ fn set_status(
 }
 
 /// 一次完整连接尝试：成功则阻塞在事件循环直到断开/判死/停机。
+/// 返回 `(outcome, drain_err)`（P0-3）：teardown 的 drain 结论随 attempt
+/// 带出（`None` = 无 ingress 或干净），由 `run_endpoint` 路由到
+/// stop 显式错误或大声日志，禁止吞错。
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 async fn attempt_session(
     disc: &DiscoveredDriver,
@@ -341,27 +367,62 @@ async fn attempt_session(
             >,
         >,
     >,
-) -> AttemptOutcome {
+    services: Option<&Arc<EventServices>>,
+) -> (AttemptOutcome, Option<EventDrainError>) {
     let mut process = match DriverProcess::spawn(disc).await {
         Ok(p) => p,
         Err(e) => {
-            return AttemptOutcome::Lost {
-                reason: format!("spawn failed: {e}"),
-                had_running_session: false,
-            };
+            return (
+                AttemptOutcome::Lost {
+                    reason: format!("spawn failed: {e}"),
+                    had_running_session: false,
+                },
+                None,
+            );
         }
     };
 
-    let (session, mut events, unresponsive_flag) =
+    let (mut session, mut events, unresponsive_flag) =
         match Session::connect_retry(process.port, &process.token).await {
             Ok((s, ev, flag)) => (s, ev, flag),
             Err(e) => {
                 process.terminate().await;
-                return AttemptOutcome::Lost {
-                    reason: format!("connect failed: {e}"),
-                    had_running_session: false,
-                };
+                return (
+                    AttemptOutcome::Lost {
+                        reason: format!("connect failed: {e}"),
+                        had_running_session: false,
+                    },
+                    None,
+                );
             }
+        };
+    // v1.1 §14 + P1：Event-enabled（services + 非空 event_tasks）才接管。
+    // Data-only（无 services，或 tasks 为空）不 take、不 spawn——接收端随
+    // Session 释放，零成本（reader 侧溢出无人消费也无人在意）。
+    let want_events = services.is_some() && !cfg.event_tasks.is_empty();
+    let event_rx = if want_events {
+        session.take_event_batches()
+    } else {
+        None
+    };
+    // P1：ingress 在 run_config_flow（→ Start）之前 spawn。StartAck 后首批
+    // 即可能到达；若等 Start 成功后再 spawn，洪峰会在消费者就位前先塞 channel。
+    // （PR6 release gate 保证 Start 前无 batch，但消费者早到位消除整类窗口。）
+    // P1-1：运行质量计数由 ingress 直写 `services.diagnostics`（全局 live），
+    // 无 per-attempt 本地中转（黑洞已除）。
+    // ingress 优雅取消令牌（Checkpoint B 方案 A）：独立 token，只在
+    // shutdown_ingress() 里 cancel。不能用 child_token——父 shutdown cancel
+    // 会抢先触发，与 event_loop 的正常退出竞争，把"优雅停机"误判成 Lost。
+    let ingress_shutdown = CancellationToken::new();
+    let mut ingress: Option<tokio::task::JoinHandle<Result<(), IngressFatal>>> =
+        match (event_rx, services) {
+            (Some(rx), Some(svc)) => Some(tokio::spawn(run_event_ingress(
+                rx,
+                cfg.endpoint_id.clone(),
+                Arc::clone(svc),
+                ingress_shutdown.clone(),
+            ))),
+            _ => None,
         };
     // 注册活跃会话供 Control 面可靠转发（§22），Control 与 Data 共用同一 TCP 但分队列
     let session_arc = std::sync::Arc::new(tokio::sync::Mutex::new(session));
@@ -381,13 +442,27 @@ async fn attempt_session(
     match config_res {
         Ok(()) => {}
         Err(outcome) => {
+            // 配置失败：ingress 若已 spawn（Start 前）优雅停下，避免无主消费；
+            // drain 结论一并带出（P0-3，次级错误不覆盖主 outcome）
+            let drain_err = shutdown_ingress(ingress_shutdown.clone(), ingress)
+                .await
+                .err();
+            // P0-2 Final：配置失败也可能已 Start（部分成功），先 post Shutdown
+            // 再走 terminate_after_shutdown——stdin 保持 OPEN 让 SDK 自然退出；
+            // 若 driver 根本没起来，Phase 1 超时后 emergency EOF 兜底。
+            {
+                let sess = session_arc.lock().await;
+                if !sess.is_unresponsive() {
+                    let _ = sess.post(pb_shutdown_body()).await;
+                }
+            }
             {
                 let mut sess = session_arc.lock().await;
                 sess.invalidate();
             }
             registry.write().unwrap().remove(&cfg.endpoint_id);
-            process.terminate().await;
-            return outcome;
+            process.terminate_after_shutdown().await;
+            return (outcome, drain_err);
         }
     }
 
@@ -407,29 +482,93 @@ async fn attempt_session(
         snapshot,
         unresponsive_flag.as_ref(),
         &mut events,
+        &mut ingress,
         shutdown,
     )
     .await;
 
+    // ⑨ Stop barrier（真 barrier，不是 sleep）：Shutdown-post →
+    // terminate_after_shutdown → 等 reader 结束 → 再 drain ingress。
+    // P0-2 Final：terminate_after_shutdown 在 Phase 1 保持 stdin OPEN——SDK
+    // 侧 Shutdown RPC → run tasks 停 → writer drain → TCP FIN → 自然退出；
+    // liveness guard 不抢跑。reader 把 FIN 之前全部字节 pump 进 channel 后
+    // 结束（TCP 有序性保证）。reader 是事件 channel 的唯一生产者 ⇒ reader
+    // 结束时"已进入 Core 的旧 epoch Event"已全部在 channel 里；此时再
+    // cancel ingress 做 final drain，零窗口（旧顺序 cancel-first 下，drain
+    // 与 driver 停产之间在途批次会落入无人消费的 channel 而静默丢失）。
+    // Phase 1 超时（顽固对端）→ emergency EOF → reader 5s 未结束 →
+    // 超时降级 drain 现有（等价旧行为）。50ms sleep 已删除：等的对象是
+    // "reader 结束"这个条件，不是时长。
+    // P0-3 teardown 总预算（全有界，Manager 直接 await，无外层超时）：
+    // graceful 5s（+ emergency 后 terminate 5s）+ reader barrier 5s +
+    // ingress drain 5s ≈ 20s worst-case，正常路径百 ms 内。
+    // 超时/失败经 drain_err 显式上报。
     {
         let sess = session_arc.lock().await;
         if !sess.is_unresponsive() {
             let _ = sess.post(pb_shutdown_body()).await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+    process.terminate_after_shutdown().await;
+    {
+        let sess = session_arc.lock().await;
+        if !sess.wait_reader_done(Duration::from_secs(5)).await {
+            tracing::warn!(
+                endpoint = %cfg.endpoint_id,
+                "reader did not finish after terminate, draining what arrived"
+            );
+        }
+    }
+    // ingress 收尾：优雅取消（当前 commit+publish 必完整执行，见
+    // run_event_ingress），杜绝"DB 已有但 Hub 未发布"的静默缺口。
+    // barrier 已达成时 final drain 提交的即 channel 全部，无遗弃。
+    // P0-3：drain 结论显式带出（fatal/timeout），不再吞错。
+    let drain_err = shutdown_ingress(ingress_shutdown, ingress).await.err();
+
     {
         let mut sess = session_arc.lock().await;
         sess.invalidate();
     }
     registry.write().unwrap().remove(&cfg.endpoint_id);
     drop(events);
-    process.terminate().await;
-    outcome
+    (outcome, drain_err)
 }
 
 fn pb_shutdown_body() -> pb::envelope::Body {
     pb::envelope::Body::Shutdown(pb::Shutdown {})
+}
+
+/// ingress 优雅停机（Checkpoint B 方案 A + ⑨ final drain + P0-3）：
+/// 先 cancel（当前 commit+publish 完整执行 + final drain 排空），5s 内未退出
+/// 才 abort（磁盘 hang 等极端情况）。
+///
+/// P0-3：返回显式结果，禁止吞错——drain 中的精确失败（collision/unavailable/
+/// regression）与 5s 超时（abort 时 backlog 可能根本未 COMMIT，既无 DB 行
+/// 也无 Hub 行）都必须向上传播，由 `stop_endpoint` 转为显式错误；
+/// "Stop 返回成功但后台仍在跑"（detach-success）在此终结。
+async fn shutdown_ingress(
+    cancel: CancellationToken,
+    ingress: Option<tokio::task::JoinHandle<Result<(), IngressFatal>>>,
+) -> Result<(), EventDrainError> {
+    let Some(mut h) = ingress else {
+        return Ok(());
+    };
+    cancel.cancel();
+    // NOTE: 不能用 timeout(h)——超时会 drop JoinHandle 使任务 detach 继续跑。
+    // select 保留所有权，超时后显式 abort。
+    tokio::select! {
+        r = &mut h => match r {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(fatal)) => Err(EventDrainError::Fatal(fatal)),
+            Err(join) => Err(EventDrainError::Join(join.to_string())),
+        },
+        _ = tokio::time::sleep(Duration::from_secs(5)) => {
+            tracing::error!("event ingress did not exit in 5s, aborting");
+            h.abort();
+            let _ = h.await;
+            Err(EventDrainError::Timeout)
+        }
+    }
 }
 
 /// 配置闭环（§6.2）：Open -> Configure -> PointDescriptors -> ApplyPointMap -> Start。
@@ -530,6 +669,16 @@ async fn run_config_flow(
     let result = expect_ack(reply.body).ok_or_else(|| lost("ApplyPointMap"))?;
     config_gate(result, "ApplyPointMap")?;
 
+    // ConfigureEventTasks（PR7 v1.1 §11）：Apply 之后、Start 之前。
+    // 空任务零成本（Session 内直接成功，不发 RPC，老 Driver 路径无变化）；
+    // 失败则不 Start——同一 revision 半更新（Data 新 + Event 旧）永不存在。
+    if let Err(e) = session
+        .configure_events(HANDLE, revision, &cfg.event_tasks)
+        .await
+    {
+        return Err(event_config_fail(e));
+    }
+
     // StartConnection(new stream_epoch)
     let epoch = new_stream_epoch();
     let reply = session
@@ -555,6 +704,7 @@ async fn event_loop(
     snapshot: &Arc<Snapshot>,
     unresponsive_flag: &std::sync::atomic::AtomicBool,
     events: &mut tokio::sync::mpsc::Receiver<SessionEvent>,
+    ingress: &mut Option<tokio::task::JoinHandle<Result<(), IngressFatal>>>,
     shutdown: &CancellationToken,
 ) -> AttemptOutcome {
     const WATCHDOG_TICK: Duration = Duration::from_secs(2);
@@ -563,6 +713,38 @@ async fn event_loop(
 
     loop {
         tokio::select! {
+            // EventIngress fatal（v1.1 §4）：只杀本 attempt，走 Lost 重连；
+            // Data-only（ingress=None）时本分支挂起永不就绪。
+            // NOTE: 不加 `if ingress.is_some()` guard——future 已持有 &mut 借用，
+            // guard 的二次借用编译不过；pending 分支语义等价。
+            res = async {
+                match ingress {
+                    Some(h) => h.await,
+                    None => {
+                        std::future::pending::<
+                            Result<Result<(), IngressFatal>, tokio::task::JoinError>,
+                        >()
+                        .await
+                    }
+                }
+            } => {
+                return match res {
+                    Ok(Ok(_stats)) => AttemptOutcome::Lost {
+                        // ingress 正常返回理论不可达（无限循环直到 fatal/流关闭）；
+                        // 若发生，按 Lost 重连而非静默 Running。
+                        reason: "event ingress exited".into(),
+                        had_running_session: true,
+                    },
+                    Ok(Err(fatal)) => AttemptOutcome::Lost {
+                        reason: format!("{}: {fatal}", fatal.code()),
+                        had_running_session: true,
+                    },
+                    Err(join_err) => AttemptOutcome::Lost {
+                        reason: format!("event ingress panicked: {join_err}"),
+                        had_running_session: true,
+                    },
+                };
+            }
             ev = events.recv() => match ev {
                 Some(SessionEvent::Batch(batch)) => {
                     apply_batch_logged(snapshot, cfg, batch);
@@ -630,6 +812,37 @@ fn apply_batch_logged(snapshot: &Arc<Snapshot>, cfg: &BuiltinEndpoint, batch: Da
     tracing::trace!(endpoint=%cfg.endpoint_id, seq=batch.sequence, values=n, snapshot_apply_latency_ns=ns, "batch");
 }
 
+/// 事件配置失败路由："配错了"（老驱动无能力/老 minor/校验拒绝）→
+/// ConfigurationFailed（不重试，重试也不会长出能力）；真正的传输失败 →
+/// Lost（走 reconnect）。空任务永不走到这里（Session 内直接成功）。
+fn event_config_fail(e: crate::session::SessionError) -> AttemptOutcome {
+    use crate::session::SessionError;
+    match e {
+        SessionError::Driver {
+            kind,
+            code,
+            message,
+        } => {
+            let detail = format!("{kind}/{code}: {message}");
+            if kind == "ConfigurationError" || kind == "Unsupported" {
+                AttemptOutcome::ConfigurationFailed(detail)
+            } else {
+                AttemptOutcome::Lost {
+                    reason: format!("configure-events: {detail}"),
+                    had_running_session: false,
+                }
+            }
+        }
+        SessionError::EventPlaneUnsupported { .. } => {
+            AttemptOutcome::ConfigurationFailed(format!("configure-events: {e}"))
+        }
+        other => AttemptOutcome::Lost {
+            reason: format!("configure-events rpc: {other}"),
+            had_running_session: false,
+        },
+    }
+}
+
 fn expect_ack(body: Option<pb::envelope::Body>) -> Option<pb::GenericResult> {
     use pb::envelope::Body as B;
     match body {
@@ -674,4 +887,64 @@ fn new_stream_epoch() -> u64 {
     let pid = std::process::id() as u64;
     let c = EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed);
     n ^ (pid << 32) ^ c.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event_ingress::IngressFatal;
+
+    /// P0-3：drain 正常 → Ok（None ingress 同样 Ok，Data-only 零成本）。
+    #[tokio::test]
+    async fn shutdown_ingress_clean_is_ok() {
+        assert!(
+            shutdown_ingress(CancellationToken::new(), None)
+                .await
+                .is_ok()
+        );
+        let h = tokio::spawn(async { Ok::<(), IngressFatal>(()) });
+        assert!(
+            shutdown_ingress(CancellationToken::new(), Some(h))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// P0-3：drain 中精确失败 → 原精确码透出（禁止吞错/泛化）。
+    #[tokio::test]
+    async fn shutdown_ingress_fatal_propagates_precise_code() {
+        let h = tokio::spawn(async {
+            Err::<(), IngressFatal>(IngressFatal::StoreUnavailable("disk gone".into()))
+        });
+        let err = shutdown_ingress(CancellationToken::new(), Some(h))
+            .await
+            .expect_err("fatal must propagate");
+        assert_eq!(err.code(), "EVENT_STORE_UNAVAILABLE");
+        assert!(err.to_string().contains("EVENT_STORE_UNAVAILABLE"));
+
+        let h = tokio::spawn(async {
+            Err::<(), IngressFatal>(IngressFatal::IdCollision {
+                endpoint_id: "e".into(),
+                event_id: "x".into(),
+            })
+        });
+        let err = shutdown_ingress(CancellationToken::new(), Some(h))
+            .await
+            .expect_err("fatal must propagate");
+        assert_eq!(err.code(), "EVENT_ID_COLLISION");
+    }
+
+    /// P0-3：drain 5s 未退出 → EVENT_DRAIN_TIMEOUT（abort 已执行，不 detach）。
+    /// 5s 固定开销：P0 headline 行为值得一次慢断言（suite 内已有 30s 级用例）。
+    #[tokio::test]
+    async fn shutdown_ingress_timeout_is_explicit_error() {
+        let h = tokio::spawn(async {
+            // 无视 cancel 的顽固任务（模拟磁盘 hang）：pending 永不就绪
+            std::future::pending::<Result<(), IngressFatal>>().await
+        });
+        let err = shutdown_ingress(CancellationToken::new(), Some(h))
+            .await
+            .expect_err("timeout must be explicit error, not success");
+        assert_eq!(err.code(), "EVENT_DRAIN_TIMEOUT");
+    }
 }

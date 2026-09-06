@@ -17,6 +17,7 @@ mesa-driver-focas2 = { path = "../../drivers/focas2" }
 mesa-driver-opcua = { path = "../../drivers/opcua" }
 mesa-core-api = { path = "../../crates/core-api" }
 mesa-driver-manager = { workspace = true }
+mesa-event-store = { workspace = true }
 axum = { workspace = true }
 tower = "0.5"
 mesa-config-store = { workspace = true }

@@ -45,6 +45,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 真实协议驱动若需关闭 socket/session，应在其 run() 内响应取消并自行限时。
 const RUN_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
+/// writer drain 上限（P0-2）：writer_shutdown 触发时队列里至多
+/// 32+256+128 帧，loopback 下毫秒级写完；5s 是顽固生产者（cancel 后仍
+/// publish 的驱动 bug）场景的兜底，超时即大声记录后退出（Core 侧
+/// terminate 强杀是最后一道门）。正常路径永不触及该上限。
+const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 // ---------------------------------------------------------------------------
 // 驱动开发者面对的 trait 与错误类型
 // ---------------------------------------------------------------------------
@@ -295,6 +301,13 @@ pub struct EventSink {
 }
 
 impl EventSink {
+    /// 本次 run 的 stream_epoch 只读视图（PR7：synthetic occurrence 的 run
+    /// 作用域——Simulator 用它构造跨进程重启唯一的 event_id；Core epoch
+    /// 是稳定的 run scope，比进程级计数更适合做 ID 作用域）。
+    pub fn stream_epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// 发布一批事件。sequence 由 SDK 按 (handle, epoch) 自动分配并递增；
     /// epoch 切换（Stop → Start）后自动从 1 重新开始，驱动无需感知。
     ///
@@ -641,6 +654,25 @@ struct RunHandle {
     join: tokio::task::JoinHandle<()>,
 }
 
+/// 等待 run task 退出；超时则 abort 并回收（P0-3 Final）。
+/// 禁止 `timeout(join)` 裸用——超时会 drop JoinHandle 使 task detach：后台
+/// producer 仍可 `publish` 成功，而 writer 已按"无新生产"退出，造成
+/// "publish Ok 的 batch 没写 TCP"。abort 完成后再 cancel writer，
+/// writer_shutdown 的"全部生产者已停"前提才是硬保证（与 writer JoinHandle
+/// 同一修法，见 serve 收尾 NOTE）。
+async fn stop_run_handle(rh: RunHandle, ctx: &'static str) {
+    rh.cancel.cancel();
+    let mut join = rh.join;
+    tokio::select! {
+        _ = &mut join => {}
+        _ = tokio::time::sleep(RUN_DRAIN_GRACE) => {
+            tracing::error!("run task did not stop in time, aborting ({ctx})");
+            join.abort();
+            let _ = join.await;
+        }
+    }
+}
+
 struct ConnEntry {
     /// configure 与 run 之间连接对象会被临时 take；None 表示正在运行中。
     conn: Option<Box<dyn DriverConnection>>,
@@ -685,7 +717,8 @@ impl Session {
             .await;
     }
 
-    /// 取消运行中的采集并等待其退出；超时则放弃等待（进程退出兜底）。
+    /// 取消运行中的采集并等待其退出；超时则 abort 回收（P0-3 Final，
+    /// 见 `stop_run_handle`——detach 的 producer 会破坏 writer drain 前提）。
     async fn stop_run(&self, handle: u32) {
         let rh = self
             .entries
@@ -694,13 +727,7 @@ impl Session {
             .get_mut(&handle)
             .and_then(|e| e.run.take());
         if let Some(rh) = rh {
-            rh.cancel.cancel();
-            if tokio::time::timeout(RUN_DRAIN_GRACE, rh.join)
-                .await
-                .is_err()
-            {
-                tracing::warn!(handle, "run task did not drain in time");
-            }
+            stop_run_handle(rh, "stop_run").await;
         }
     }
 }
@@ -803,7 +830,10 @@ pub async fn serve_with_faults<D: Driver>(
     // ---- writer task：唯一拥有写半部，串行化所有出站帧 ----
     // 调度（Event Plane V1 §12）：Control 永远最高优先；Event/Data 公平交替——
     // 禁止 `Control > Event > Data` 固定偏序，否则 Alarm 风暴会让 Data 永久饥饿。
-    let writer_shutdown = shutdown.child_token();
+    // P0-2：writer_shutdown 是独立 token（不是全局 shutdown 的 child）——只在
+    // 全部生产者停止后触发，触发后 writer 进入 drain 模式（排空已有帧再退），
+    // 而不是直接 break 丢队列尾。
+    let writer_shutdown = CancellationToken::new();
     let writer = tokio::spawn(writer_loop(
         wr,
         control_rx,
@@ -811,23 +841,37 @@ pub async fn serve_with_faults<D: Driver>(
         event_rx,
         session.sink.clone(),
         Arc::clone(&session.active_epochs),
-        writer_shutdown,
+        writer_shutdown.clone(),
     ));
 
     let result = request_loop(&session, rd, &shutdown, faults.as_ref()).await;
 
-    // 会话结束：取消全部采集循环并等待 writer 排空退出
+    // P0-2 两阶段 teardown（顺序即正确性）+ P0-3 Final：
+    // ① request_loop 已结束 → cancel 全局 shutdown，run tasks 观察到后停止生产；
+    // ② 逐个 stop_run_handle（等退出 / 超时 abort 回收）→ 此后无新生产是硬
+    //    保证（abort 完成才继续；detach 残留会 publish 成功而 writer 已退）；
+    // ③ 触发 writer_shutdown → writer 把队列里已有帧写完再退（drain 模式），
+    //    然后 TCP FIN。active_epochs 全程不变，排队 Event 不丢。
     shutdown.cancel();
     let handles: Vec<RunHandle> = {
         let mut m = session.entries.lock().unwrap();
         m.values_mut().filter_map(|e| e.run.take()).collect()
     };
     for rh in handles {
-        rh.cancel.cancel();
-        let _ = tokio::time::timeout(RUN_DRAIN_GRACE, rh.join).await;
+        stop_run_handle(rh, "serve-teardown").await;
     }
-    drop(session.sink.clone());
-    let _ = writer.await;
+    writer_shutdown.cancel();
+    // NOTE: 不能用 timeout(writer)——超时会 drop JoinHandle 使任务 detach
+    // 后台写半残 socket。借用 join，超时后显式 abort 再回收。
+    let mut writer = writer;
+    tokio::select! {
+        _ = &mut writer => {}
+        _ = tokio::time::sleep(WRITER_DRAIN_TIMEOUT) => {
+            tracing::error!("event/data writer did not drain in time, aborting");
+            writer.abort();
+            let _ = writer.await;
+        }
+    }
     result
 }
 
@@ -872,17 +916,41 @@ async fn writer_loop(
 ) {
     // 事件先手：Alarm 风暴与 Data 洪峰同时到达时，第一帧优先保证事件不被 Data 抢占
     let mut event_turn = true;
+    // P0-2 drain 模式：shutdown（独立 writer_shutdown，只在全部生产者停止后
+    // 由 serve 触发）不再直接 break——先把队列里已有帧按原公平顺序写完再退。
+    // active_epochs 保持不变，排队 Event 不会被 epoch 门丢掉。
+    // 无生产者后队列只减不增，drain 必终止（顽固生产者由 serve 侧超时兜底）。
+    let mut draining = false;
     loop {
+        // drain 期队列一空即退，不等待（等待会永久 hanging：发送端虽闲置但未全
+        // 释放，is_closed 永假；判空用 is_empty——单消费者，无并发竞态）。
+        if draining && control_rx.is_empty() && data_rx.is_empty() && event_rx.is_empty() {
+            break;
+        }
+        // 关+空的 control 不再轮询：已关闭通道的 recv 瞬时返回 None，
+        // biased 下会永远抢占 recv_fair 造成空转饿死（drain 期 control
+        // 先关是常态）。条件每轮重算（phase 1 仍可能有新控制帧）。
+        let control_done = control_rx.is_closed() && control_rx.is_empty();
         tokio::select! {
             biased;
-            _ = shutdown.cancelled() => break,
-            c = control_rx.recv() => match c {
+            _ = shutdown.cancelled(), if !draining => {
+                draining = true;
+            }
+            c = control_rx.recv(), if !control_done => match c {
                 Some(env) => {
                     if write_envelope(&mut wr, &env).await.is_err() { break; }
                 }
                 None => {
-                    // 控制通道关闭：继续排空数据/事件通道或退出
-                    if data_rx.is_closed() && event_rx.is_closed() { break; }
+                    // 控制通道关闭：继续排空数据/事件通道或退出。
+                    // P0-2：关闭 ≠ 排空——发送端已释放但队列仍有帧时必须
+                    // 继续，不可 break（否则 drain 期 control 先关即丢尾）。
+                    if data_rx.is_closed()
+                        && data_rx.is_empty()
+                        && event_rx.is_closed()
+                        && event_rx.is_empty()
+                    {
+                        break;
+                    }
                     continue;
                 }
             },
@@ -935,16 +1003,29 @@ async fn writer_loop(
                     else { sink.flush_pending(); }
                 }
                 FairMsg::Event(None) | FairMsg::Data(None) => {
-                    // 某通道关闭：其余通道全关才退出，否则继续服务剩余通道
-                    if control_rx.is_closed() && data_rx.is_closed() && event_rx.is_closed() {
+                    // 某通道关闭：其余通道全关"且排空"才退出（P0-2：关闭≠排空），
+                    // 否则继续服务剩余通道
+                    if control_rx.is_closed()
+                        && control_rx.is_empty()
+                        && data_rx.is_closed()
+                        && data_rx.is_empty()
+                        && event_rx.is_closed()
+                        && event_rx.is_empty()
+                    {
                         break;
                     }
                     continue;
                 }
             },
         }
-        // 三通道全关则退出
-        if control_rx.is_closed() && data_rx.is_closed() && event_rx.is_closed() {
+        // 三通道全关且排空则退出（P0-2：关闭≠排空）
+        if control_rx.is_closed()
+            && control_rx.is_empty()
+            && data_rx.is_closed()
+            && data_rx.is_empty()
+            && event_rx.is_closed()
+            && event_rx.is_empty()
+        {
             break;
         }
     }
@@ -2108,6 +2189,90 @@ mod tests {
                 .unwrap();
             assert_eq!(b.sequence, expect, "wire 顺序必须等于序号顺序");
         }
+    }
+
+    /// P0-2 SDK outbound drain 的确定性 Gate：128 个 publish 全部 Ok 后
+    /// （writer 尚未启动，backlog 确定非空），再启动 writer 且 writer_shutdown
+    /// 已预取消（serve 两阶段的第③步快照）；读端（Core 侧）必须在 EOF 前收到
+    /// 全部 128 个 EventBatch 且 sequence 连续，随后 writer 退出关闭写半部。
+    /// 旧行为（shutdown 直接 break）下首轮 poll 即退，0 帧即 EOF，必红。
+    /// 零竞态：backlog 先于 writer 存在，不依赖 socket 阻塞时序。
+    #[tokio::test]
+    async fn writer_shutdown_drains_queued_events_before_fin() {
+        const N: u64 = EVENT_CAPACITY as u64;
+        const HANDLE: u32 = 7;
+        const EPOCH: u64 = 4242;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let cli = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let server = accept.await.unwrap();
+
+        let (control_tx, control_rx) = mpsc::channel::<pb::Envelope>(CONTROL_CAPACITY);
+        let (data_tx, data_rx) = mpsc::channel::<DataBatch>(DATA_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel::<EventBatch>(EVENT_CAPACITY);
+        // 生产者：128 个 publish 全 Ok，writer 未启动 → 队列满且无人消费
+        let producer = DataSink::new(control_tx, data_tx, event_tx).for_connection(HANDLE, EPOCH);
+        let events = producer.events();
+        for i in 1..=N {
+            let seq = events
+                .publish(vec![event(&format!("q-{i}"))])
+                .await
+                .unwrap();
+            assert_eq!(seq, i);
+        }
+        drop(producer);
+        // writer 自持的 sink（idle，不生产；drain 判空用 is_empty，不依赖关闭）
+        let (c2, _) = mpsc::channel::<pb::Envelope>(CONTROL_CAPACITY);
+        let (d2, _) = mpsc::channel::<DataBatch>(DATA_CAPACITY);
+        let (e2, _) = mpsc::channel::<EventBatch>(EVENT_CAPACITY);
+        let sink = DataSink::new(c2, d2, e2);
+        let epochs = Arc::new(Mutex::new(HashMap::from([(HANDLE, EPOCH)])));
+        // serve 第③步快照：生产者已全部停止后才触发 writer_shutdown
+        let writer_shutdown = CancellationToken::new();
+        writer_shutdown.cancel();
+        // 方向：writer 写 accept 侧（Driver→Core），读端在 connect 侧；
+        // 各自另一半保持存活 idle（避免 RST/EOF 误判），不参与读写。
+        let (crd, _cwr) = cli.into_split();
+        let (_srd, swr) = server.into_split();
+        let mut srd = crd;
+        let w = tokio::spawn(writer_loop(
+            swr,
+            control_rx,
+            data_rx,
+            event_rx,
+            sink,
+            epochs,
+            writer_shutdown,
+        ));
+        // Core 侧：读完 128 帧，随后必须是 EOF（writer 退出关写半部）
+        for expect in 1..=N {
+            let env = tokio::time::timeout(Duration::from_secs(10), read_envelope(&mut srd))
+                .await
+                .expect("drain 不得超时")
+                .expect("帧必须可解");
+            match env.body {
+                Some(pb::envelope::Body::EventBatch(b)) => {
+                    assert_eq!(b.connection_handle, HANDLE);
+                    assert_eq!(b.stream_epoch, EPOCH);
+                    assert_eq!(b.sequence, expect, "drain 不得丢尾/乱序");
+                }
+                other => panic!("expect EventBatch, got {other:?}"),
+            }
+        }
+        let tail = read_envelope(&mut srd).await;
+        assert!(
+            matches!(&tail, Err(ProtocolError::Io(e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "128 帧后必须是 EOF（writer 已退出），got {tail:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(5), w)
+            .await
+            .expect("writer 必须退出")
+            .unwrap();
     }
 
     /// publish 前置校验：坏记录/空批/未绑定当场拒绝，不占用队列。
