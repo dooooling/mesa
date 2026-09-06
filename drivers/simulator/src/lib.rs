@@ -536,10 +536,12 @@ struct EventPlanSnapshot {
     tasks: Vec<SimEventTask>,
 }
 
-/// 单个事件任务的驱动内解释形态：stream 决定发射器，interval 决定周期。
+/// 单个事件任务的驱动内解释形态：stream 决定发射器，interval 决定周期，
+/// id 参与 event_id 构造（§2 去重键：同一 connection 的多个同流任务必须
+/// 生成互异 event_id，否则 PR7 的 UNIQUE(endpoint_id,event_id) 会把合法
+/// occurrence 当重复事件丢掉）。
 #[derive(Debug)]
 struct SimEventTask {
-    #[allow(dead_code)]
     id: String,
     stream: SimEventStream,
     interval_ms: u64,
@@ -954,8 +956,10 @@ impl DriverConnection for SimConnection {
                 let shutdown = shutdown.clone();
                 let stream = task.stream;
                 let interval = Duration::from_millis(task.interval_ms);
+                let task_id = task.id.clone();
                 handles.push(tokio::spawn(async move {
-                    run_sim_event_task(events, shutdown, stream, event_run_seq, interval).await;
+                    run_sim_event_task(events, shutdown, stream, event_run_seq, task_id, interval)
+                        .await;
                     Ok::<(), SdkDriverError>(())
                 }));
             }
@@ -1023,6 +1027,7 @@ async fn run_sim_event_task(
     shutdown: CancellationToken,
     stream: SimEventStream,
     run_seq: u64,
+    task_id: String,
     interval: Duration,
 ) {
     match stream {
@@ -1037,7 +1042,8 @@ async fn run_sim_event_task(
                 }
                 n += 1;
                 let record = EventRecord {
-                    event_id: format!("sim.counter:{run_seq}:{n}"),
+                    // task_id 参与构造：同 connection 多同流任务的 event_id 互异
+                    event_id: format!("sim.counter:{run_seq}:{task_id}:{n}"),
                     category: "message".into(),
                     kind: "counter.tick".into(),
                     source: "sim".into(),
@@ -1103,7 +1109,7 @@ async fn run_sim_event_task(
                 }
                 let name = format!("{transition:?}").to_lowercase();
                 let record = EventRecord {
-                    event_id: format!("sim.alarm100:{run_seq}:{name}"),
+                    event_id: format!("sim.alarm100:{run_seq}:{task_id}:{name}"),
                     category: "alarm".into(),
                     kind: "alarm.condition".into(),
                     source: "Channel1".into(),

@@ -275,12 +275,21 @@ pub enum EventPublishError {
 /// **等待**而不是覆盖旧数据或报错丢弃。batch header
 /// （connection_handle/stream_epoch/sequence/timestamp_ns/mono_ns）全部由
 /// SDK 自动填充，驱动只管交 `Vec<EventRecord>`。
+/// 单连接事件序号器（P0-2）：sequence 分配 → enqueue 必须原子化。
+/// 同一 connection 的多个 EventTask 会并发 publish；若只锁"分配序号"、
+/// 解锁后再 send，wire 顺序就会与序号错开（11 先于 10 到达），违反§11。
+/// 因此同一 bound sink 派生的所有 EventSink 共享这一个 async 锁，
+/// publish 全程持有直到 send().await 成功——wire 顺序 == sequence 顺序。
+/// 每个 epoch 全新实例、从 1 开始；无全局表、无需 Stop 清理、天然有界。
+#[derive(Debug)]
+struct EventSequencer {
+    next: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct EventSink {
     event_tx: mpsc::Sender<EventBatch>,
-    /// handle -> (epoch, next_sequence)：每个 epoch 独立从 1 递增（§11）。
-    /// Stop/Close 时清理该 handle 条目，一切运行时状态有界。
-    seq: Arc<Mutex<HashMap<u32, (u64, u64)>>>,
+    seq: Arc<tokio::sync::Mutex<EventSequencer>>,
     handle: u32,
     epoch: u64,
 }
@@ -288,6 +297,10 @@ pub struct EventSink {
 impl EventSink {
     /// 发布一批事件。sequence 由 SDK 按 (handle, epoch) 自动分配并递增；
     /// epoch 切换（Stop → Start）后自动从 1 重新开始，驱动无需感知。
+    ///
+    /// 顺序语义（P0-2）：全程持有 per-connection async 锁——序号分配与
+    /// send().await 在同一临界区内完成。多 publisher 并发时 wire 到达顺序
+    /// 与序号顺序严格一致，不可能出现"11 先于 10"。
     ///
     /// 背压语义（P0）：队列满时 `send().await` 等待，不合并、不覆盖、不拒绝——
     /// occurrence 要么完整入队，要么会话已死（Closed）。等待期间不监听 shutdown：
@@ -302,25 +315,14 @@ impl EventSink {
             return Err(EventPublishError::Empty);
         }
         // 驱动侧前置校验：坏记录在 publish 当场拒绝，不占用队列、不污染 wire。
+        // （锁外执行：纯计算，不触及序号状态）
         for e in &events {
             e.validate()
                 .map_err(|e| EventPublishError::InvalidRecord(e.to_string()))?;
         }
-        let sequence = {
-            let mut m = self.seq.lock().unwrap();
-            match m.get_mut(&self.handle) {
-                Some((ep, next)) if *ep == self.epoch => {
-                    let s = *next;
-                    *next = next.saturating_add(1);
-                    s
-                }
-                // 新 handle 或新 epoch：一律从 1 开始（§11 新流语义）
-                _ => {
-                    m.insert(self.handle, (self.epoch, 2));
-                    1
-                }
-            }
-        };
+        // 序号分配 → wire 入队原子化：锁住直到 send 成功才递增。
+        let mut seq = self.seq.lock().await;
+        let sequence = seq.next;
         let batch = EventBatch {
             connection_handle: self.handle,
             stream_epoch: self.epoch,
@@ -330,7 +332,8 @@ impl EventSink {
             mono_ns: Some(mesa_core_types::host_mono_ns()),
         };
         // 粗粒度上限预检（JSON 体积与 proto 同量级；精确 256 KiB 由 writer 侧
-        // event_batch_to_pb 最终强制执行）。超大批次在 publish 当场拒绝。
+        // event_batch_to_pb 最终强制执行）。超大批次在 publish 当场拒绝，
+        // 且不消耗序号（序号只在成功入队后递增）。
         let approx = serde_json::to_string(&batch)
             .map(|s| s.len())
             .unwrap_or(usize::MAX);
@@ -341,7 +344,12 @@ impl EventSink {
         // 同步 callback 不能 await 的驱动（未来 OPC UA/SINUMERIK）不得直调此处，
         // 应自建 bounded raw-ingress + async forwarder，overflow 时按订阅失败处理。
         match self.event_tx.send(batch).await {
-            Ok(()) => Ok(sequence),
+            Ok(()) => {
+                // u64 耗尽属不可达（每秒百万批也需数十万年）；saturating 兜底，
+                // 语义是"序号空间实现上限"，不是静默回绕。
+                seq.next = sequence.saturating_add(1);
+                Ok(sequence)
+            }
             Err(_) => Err(EventPublishError::Closed),
         }
     }
@@ -356,8 +364,8 @@ pub struct DataSink {
     state: Arc<Mutex<CoalescerState>>,
     /// 全局 pending 注册表：handle -> CoalescerState，用于 writer 统一 flush
     pending_registry: Arc<Mutex<HashMap<u32, Arc<Mutex<CoalescerState>>>>>,
-    /// 事件 sequence 注册表：handle -> (epoch, next_sequence)，见 [`EventSink`]。
-    event_seq: Arc<Mutex<HashMap<u32, (u64, u64)>>>,
+    /// 事件序号器：同一 bound sink 派生的所有 EventSink 共享（见 [`EventSequencer`]）。
+    event_seq: Arc<tokio::sync::Mutex<EventSequencer>>,
     /// 本 sink 绑定的 connection_handle；0 表示会话级（不发数据）。
     handle: u32,
     /// 绑定连接的 stream_epoch，publish 时随 handle 一并盖戳（§10）。
@@ -385,7 +393,8 @@ impl DataSink {
                 coalesced_points: 0,
             })),
             pending_registry: Arc::new(Mutex::new(HashMap::new())),
-            event_seq: Arc::new(Mutex::new(HashMap::new())),
+            // 会话级占位（handle 0 永不发事件）；for_connection 会换成新实例
+            event_seq: Arc::new(tokio::sync::Mutex::new(EventSequencer { next: 1 })),
             handle: 0,
             epoch: 0,
         }
@@ -412,7 +421,9 @@ impl DataSink {
             event_tx: self.event_tx.clone(),
             state: entry,
             pending_registry: Arc::clone(&self.pending_registry),
-            event_seq: Arc::clone(&self.event_seq),
+            // 新 epoch 即新序号器、从 1 开始（§11 新流语义）；旧实例随旧
+            // sink 一起释放，无全局表、无需 Stop 清理、天然有界
+            event_seq: Arc::new(tokio::sync::Mutex::new(EventSequencer { next: 1 })),
             handle,
             epoch: stream_epoch,
         }
@@ -1428,13 +1439,6 @@ async fn on_stop(session: &Session, req: pb::StopConnection, msg_id: u64) {
         .lock()
         .unwrap()
         .remove(&req.connection_handle);
-    // 清理事件 sequence 状态：下次 Start 即新 epoch，序号从 1 重建，有界
-    session
-        .sink
-        .event_seq
-        .lock()
-        .unwrap()
-        .remove(&req.connection_handle);
     session
         .sink
         .send_control(pb::Envelope {
@@ -1464,12 +1468,6 @@ async fn on_close(session: &Session, req: pb::CloseConnection, msg_id: u64) {
     session
         .sink
         .pending_registry
-        .lock()
-        .unwrap()
-        .remove(&req.connection_handle);
-    session
-        .sink
-        .event_seq
         .lock()
         .unwrap()
         .remove(&req.connection_handle);
@@ -2052,6 +2050,36 @@ mod tests {
             events.publish(vec![event("e3")]).await.unwrap_err(),
             EventPublishError::Closed
         );
+    }
+
+    /// 多 publisher 并发：到达顺序必须恰为 1..=N（P0-2 分配→入队原子化）。
+    #[tokio::test]
+    async fn event_sink_concurrent_publishers_stay_ordered() {
+        let (control_tx, _) = mpsc::channel::<pb::Envelope>(CONTROL_CAPACITY);
+        let (data_tx, _) = mpsc::channel::<DataBatch>(DATA_CAPACITY);
+        let (event_tx, mut erx) = mpsc::channel::<EventBatch>(64);
+        let sink = DataSink::new(control_tx, data_tx, event_tx).for_connection(7, 100);
+        let mut handles = Vec::new();
+        for t in 0..8u64 {
+            let e = sink.events();
+            handles.push(tokio::spawn(async move {
+                for i in 0..5u64 {
+                    let id = format!("t{t}-{i}");
+                    e.publish(vec![event(&id)]).await.unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        // 40 批到达顺序必须严格 1..=40（旧 HashMap+先分配后发送必现 11→10 倒置）
+        for expect in 1..=40u64 {
+            let b = tokio::time::timeout(Duration::from_secs(2), erx.recv())
+                .await
+                .expect("ordered delivery")
+                .unwrap();
+            assert_eq!(b.sequence, expect, "wire 顺序必须等于序号顺序");
+        }
     }
 
     /// publish 前置校验：坏记录/空批/未绑定当场拒绝，不占用队列。

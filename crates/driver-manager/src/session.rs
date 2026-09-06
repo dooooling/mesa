@@ -675,13 +675,28 @@ impl Session {
         // 事件 barrier 自维护：Start 意图在此登记，reader 在 Ack 到达时更新
         // epoch 门。所有 Start/Stop/Close 都经本方法，调用方无需记得调 hook，
         // barrier 永不错位（endpoint/tests 零改动）。
-        if let pb::envelope::Body::StartConnection(req) = &body {
+        let start_epoch = match &body {
+            pb::envelope::Body::StartConnection(req) => {
+                Some((req.connection_handle, req.stream_epoch))
+            }
+            _ => None,
+        };
+        if let Some((handle, epoch)) = start_epoch {
             self.shared
                 .pending_event_starts
                 .lock()
                 .unwrap()
-                .insert(id, (req.connection_handle, req.stream_epoch));
+                .insert(id, (handle, epoch));
         }
+        let start_intent = start_epoch.is_some();
+        // Start 登记项清理（P1 有界）：正常 StartConnectionAck 由 reader 嗅探
+        // 删除；以下所有"等不到 Ack"的出口都在此删除，重复删除无害。
+        // NOTE: 顺手补上 write 失败时的 unregister——原 `?` 直接返回会漏掉它。
+        let scrub_start_intent = |s: &Self| {
+            if start_intent {
+                s.shared.pending_event_starts.lock().unwrap().remove(&id);
+            }
+        };
         let rx = self.shared.register(id);
         let env = pb::Envelope {
             msg_id: id,
@@ -689,13 +704,30 @@ impl Session {
         };
         {
             let mut wr = self.shared.writer.lock().await;
-            write_envelope(&mut *wr, &env).await?;
+            if let Err(e) = write_envelope(&mut *wr, &env).await {
+                self.shared.unregister(id);
+                scrub_start_intent(self);
+                return Err(e.into());
+            }
         }
         match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(reply)) => Ok(reply),
-            Ok(Err(_)) => Err(SessionError::Closed),
+            Ok(Ok(reply)) => {
+                // 对端答非所问（非 StartConnectionAck）：永远等不到嗅探，在此清理
+                if start_intent
+                    && !matches!(reply.body, Some(pb::envelope::Body::StartConnectionAck(_)))
+                {
+                    scrub_start_intent(self);
+                }
+                Ok(reply)
+            }
+            Ok(Err(_)) => {
+                self.shared.unregister(id);
+                scrub_start_intent(self);
+                Err(SessionError::Closed)
+            }
             Err(_) => {
                 self.shared.unregister(id);
+                scrub_start_intent(self);
                 Err(SessionError::Timeout)
             }
         }
@@ -735,12 +767,15 @@ async fn reader_loop(mut rd: OwnedReadHalf, shared: Arc<Shared>, cancel: Cancell
         if env.msg_id != 0 && shared.pending.lock().unwrap().contains_key(&env.msg_id) {
             let is_driver_error = matches!(env.body, Some(Body::DriverError(_)));
             let sender = shared.pending.lock().unwrap().remove(&env.msg_id);
+            // 生命周期 Ack 嗅探必须先于唤醒（P0 race）：oneshot::send 会唤醒
+            // Session::call() 的等待者，多线程下调用方可能在 reader 执行 snoop
+            // 前就从 stop_connection() 返回并 try_recv。若先唤醒后删门，
+            // StopAck 与门删除之间存在窗口，旧 epoch 会漏出来。
+            // 先提交状态、再唤醒——"StopAck 返回"才真正构成 happens-before barrier。
+            snoop_lifecycle_ack(&shared, env.msg_id, &env.body);
             if let Some(tx) = sender {
                 let _ = tx.send(env.clone());
             }
-            // 生命周期 Ack 嗅探：维护 Core 侧事件 epoch 门（P0 barrier）。
-            // 注意嗅探的是"已确认送达请求方"的回复帧，与请求方是否处理无关。
-            snoop_lifecycle_ack(&shared, env.msg_id, &env.body);
             if is_driver_error && let Some(Body::DriverError(e)) = env.body {
                 let d = e.detail.unwrap_or_default();
                 let ev = SessionEvent::DriverError {

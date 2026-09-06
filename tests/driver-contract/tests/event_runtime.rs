@@ -215,6 +215,56 @@ async fn event_sequence_strictly_increasing_no_coalescing() {
 }
 
 // ---------------------------------------------------------------------------
+// P0-2 单 handle 多 publisher：sequence 到达顺序必须严格 1,2,3...
+// ---------------------------------------------------------------------------
+
+/// 同一 connection 配两个 counter EventTask（10ms 高频并发 publish）：
+/// 收到的 12 批 sequence 必须恰为 1..=12（分配→入队原子化），且 event_id
+/// 全互异（task id 已纳入 ID 构造，PR7 去重键安全）。
+#[tokio::test]
+async fn event_single_handle_multi_publisher_stays_ordered() {
+    init_log();
+    let (port, server_cancel) = start_sim_server().await;
+    let (mut session, _events, _) = Session::connect(port, TOKEN).await.unwrap();
+
+    open_connection(&session, 7, "{}").await;
+    let descriptors = configure_tasks(&session, 7, 1, &[mini_data_task()]).await;
+    apply_point_map(&session, 7, 1, sequential_ids(&descriptors, 11)).await;
+    session
+        .configure_events(
+            7,
+            1,
+            &[
+                sim_event_task("cnt-a", SIM_EVENT_STREAM_COUNTER, TaskMode::Poll, Some(10)),
+                sim_event_task("cnt-b", SIM_EVENT_STREAM_COUNTER, TaskMode::Poll, Some(10)),
+            ],
+        )
+        .await
+        .unwrap();
+    start_connection(&session, 7, 0xE000_0701).await;
+    let mut erx = session.take_event_batches().unwrap();
+
+    let mut seqs = Vec::new();
+    let mut ids = Vec::new();
+    for _ in 0..12 {
+        let b = recv_event_batch(&mut erx, 5).await;
+        assert_eq!(b.stream_epoch, 0xE000_0701);
+        seqs.push(b.sequence);
+        ids.extend(b.events.iter().map(|e| e.event_id.clone()));
+    }
+    assert_eq!(
+        seqs,
+        (1..=12u64).collect::<Vec<_>>(),
+        "双 publisher 并发下 wire 顺序必须等于序号顺序"
+    );
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 12, "双任务 event_id 必须互异，got {ids:?}");
+
+    teardown(&mut session, Some(server_cancel));
+}
+
+// ---------------------------------------------------------------------------
 // Gate 4/8：新 epoch 从 1 重来 + 多次启停无状态泄漏（有界）
 // ---------------------------------------------------------------------------
 
