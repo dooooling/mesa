@@ -30,5 +30,5 @@ tracing-subscriber = { workspace = true }
 windows-sys = { workspace = true }
 libc = { workspace = true }
 
-# TODO: Contract Test 目前仅有 M0 冒烟子集（Handshake 认证 / DataBatch 语义），
-# 全量 20 项基线（§21）在 Phase 3 补齐，Simulator 必须第一个全过。
+# NOTE: Contract 基线（§21 全部 20 项 + V2.1 扩展）共 14 suites，见 tests/；
+# Simulator 已第一个全过，S7/FOCAS2/OPC UA 不得绕过或裁剪该基线。
