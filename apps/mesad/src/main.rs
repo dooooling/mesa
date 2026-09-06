@@ -113,8 +113,19 @@ async fn main() {
             continue;
         }
         let tasks = store.list_tasks(&rec.id).unwrap_or_default();
-        // PR7 v1.1 §13：Data 与 Event 任务一起恢复（空 = 老行为）
-        let event_tasks = store.list_event_tasks(&rec.id).unwrap_or_default();
+        // PR7 v1.1 §13：Data 与 Event 任务一起恢复（空 = 老行为）。
+        // P0-2 fail-closed：事件配置读失败不得按 Data-only 启动该 Endpoint，
+        // 跳过并记录（下次重启/手动 Start 重试），禁止 silent downgrade。
+        let event_tasks = match store.list_event_tasks(&rec.id) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(
+                    endpoint = %rec.id,
+                    "skip restore: list_event_tasks failed: {e}"
+                );
+                continue;
+            }
+        };
         let cfg = mesa_driver_manager::endpoint::BuiltinEndpoint {
             endpoint_id: rec.id.clone(),
             driver_id: rec.driver_id.clone(),

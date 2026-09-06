@@ -563,9 +563,11 @@ impl SimEventStream {
     }
 }
 
-/// run() 调用计数（进程级单调）：alarm-cycle 每次 run 走一遍四态，
-/// event_id 必须跨 run 唯一（Endpoint 内去重键），用 run 序号区分。
-static SIM_EVENT_RUN_SEQ: AtomicU64 = AtomicU64::new(0);
+/// NOTE（P0-3）：event_id 不再用进程级计数区分 run——Mesa reconnect 会重建
+/// Driver 进程，进程级计数重启归零会导致跨进程 event_id 重复（同 id 异
+/// occurred_at → EVENT_ID_COLLISION → 永久重连循环）。改用 Core stream_epoch
+/// 做 run 作用域（`EventSink::stream_epoch()`），每次 Start 都是新 epoch，
+/// 新 epoch 即新一组 synthetic occurrence。
 
 #[async_trait::async_trait]
 impl DriverConnection for SimConnection {
@@ -873,8 +875,8 @@ impl DriverConnection for SimConnection {
         // 连接级已发布批次数：故障注入（fail/crash_after_batches）的触发依据
         let published = Arc::new(AtomicU64::new(0));
         let started = std::time::Instant::now();
-        // 本次 run 的事件序号：alarm event_id 跨 run 唯一（Endpoint 内去重键）
-        let event_run_seq = SIM_EVENT_RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+        // 本次 run 的 epoch：事件 ID 的 run 作用域（P0-3，跨进程重启唯一）
+        let event_epoch = sink.events().stream_epoch();
 
         let mut handles = Vec::with_capacity(snapshot.tasks.len());
         for plan in &snapshot.tasks {
@@ -958,7 +960,7 @@ impl DriverConnection for SimConnection {
                 let interval = Duration::from_millis(task.interval_ms);
                 let task_id = task.id.clone();
                 handles.push(tokio::spawn(async move {
-                    run_sim_event_task(events, shutdown, stream, event_run_seq, task_id, interval)
+                    run_sim_event_task(events, shutdown, stream, event_epoch, task_id, interval)
                         .await;
                     Ok::<(), SdkDriverError>(())
                 }));
@@ -1026,7 +1028,7 @@ async fn run_sim_event_task(
     events: EventSink,
     shutdown: CancellationToken,
     stream: SimEventStream,
-    run_seq: u64,
+    epoch: u64,
     task_id: String,
     interval: Duration,
 ) {
@@ -1042,8 +1044,9 @@ async fn run_sim_event_task(
                 }
                 n += 1;
                 let record = EventRecord {
-                    // task_id 参与构造：同 connection 多同流任务的 event_id 互异
-                    event_id: format!("sim.counter:{run_seq}:{task_id}:{n}"),
+                    // epoch + task_id 双作用域：跨进程重启唯一（P0-3），
+                    // 同 connection 多同流任务互异（PR6）。
+                    event_id: format!("sim.counter:{epoch}:{task_id}:{n}"),
                     category: "message".into(),
                     kind: "counter.tick".into(),
                     source: "sim".into(),
@@ -1109,7 +1112,7 @@ async fn run_sim_event_task(
                 }
                 let name = format!("{transition:?}").to_lowercase();
                 let record = EventRecord {
-                    event_id: format!("sim.alarm100:{run_seq}:{task_id}:{name}"),
+                    event_id: format!("sim.alarm100:{epoch}:{task_id}:{name}"),
                     category: "alarm".into(),
                     kind: "alarm.condition".into(),
                     source: "Channel1".into(),

@@ -295,6 +295,13 @@ pub struct EventSink {
 }
 
 impl EventSink {
+    /// 本次 run 的 stream_epoch 只读视图（PR7：synthetic occurrence 的 run
+    /// 作用域——Simulator 用它构造跨进程重启唯一的 event_id；Core epoch
+    /// 是稳定的 run scope，比进程级计数更适合做 ID 作用域）。
+    pub fn stream_epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// 发布一批事件。sequence 由 SDK 按 (handle, epoch) 自动分配并递增；
     /// epoch 切换（Stop → Start）后自动从 1 重新开始，驱动无需感知。
     ///

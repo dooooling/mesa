@@ -164,9 +164,19 @@ impl MesaManager {
     }
 
     /// 启动一个 Endpoint。已在运行则返回错误。
+    ///
+    /// P0-2 fail-closed：事件使能（`event_tasks` 非空）但 EventStore 不可用
+    /// （`event_services == None`）时直接拒绝，连 Driver 进程都不启动——
+    /// 否则事件会发出却无人持久化，形成"RUNNING 但丢历史"的静默缺口。
     pub fn start_endpoint(&self, cfg: BuiltinEndpoint) -> Result<(), String> {
         if self.is_running(&cfg.endpoint_id) {
             return Err(format!("endpoint `{}` already running", cfg.endpoint_id));
+        }
+        if !cfg.event_tasks.is_empty() && self.event_services.read().unwrap().is_none() {
+            return Err(format!(
+                "EVENT_STORE_UNAVAILABLE: endpoint `{}` has event tasks but EventStore is unavailable",
+                cfg.endpoint_id
+            ));
         }
         let disc = self
             .find_driver(&cfg.driver_id)
@@ -511,5 +521,63 @@ impl MesaManager {
         RwLock<HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>,
     > {
         std::sync::Arc::clone(&self.active_sessions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_mgr() -> MesaManager {
+        // 空驱动目录：门在 find_driver 之前触发，无需真实驱动
+        MesaManager::discover(std::path::Path::new(
+            "testdata/empty-drivers-does-not-exist",
+        ))
+    }
+
+    fn endpoint_with_events() -> BuiltinEndpoint {
+        BuiltinEndpoint {
+            endpoint_id: "ep-evt".into(),
+            driver_id: "simulator".into(),
+            connection_json: "{}".into(),
+            tasks: vec![],
+            event_tasks: vec![mesa_core_types::EventTask {
+                id: "al".into(),
+                mode: mesa_core_types::TaskMode::Subscribe,
+                interval_ms: None,
+                binding: mesa_core_types::DriverBinding {
+                    kind: "simulator.events".into(),
+                    config: serde_json::json!({"stream": "sim.events.alarm-cycle"}),
+                },
+            }],
+        }
+    }
+
+    /// P0-2：事件使能 + 无 EventStore → 拒绝启动（精确码），且不建 Driver 进程。
+    #[test]
+    fn event_enabled_without_store_is_rejected() {
+        let mgr = empty_mgr();
+        let err = mgr
+            .start_endpoint(endpoint_with_events())
+            .expect_err("must refuse without EventStore");
+        assert!(
+            err.contains("EVENT_STORE_UNAVAILABLE"),
+            "精确原因码，got {err}"
+        );
+        assert!(!mgr.is_running("ep-evt"), "拒绝后不得有运行态残留");
+    }
+
+    /// Data-only 无 EventStore 照常放行到驱动查找（门只看 event_tasks）。
+    #[test]
+    fn data_only_without_store_passes_gate() {
+        let mgr = empty_mgr();
+        let mut cfg = endpoint_with_events();
+        cfg.event_tasks.clear();
+        // 空驱动目录 → 死在 find_driver，而不是事件门
+        let err = mgr.start_endpoint(cfg).expect_err("no driver here");
+        assert!(
+            err.contains("not found or not launchable"),
+            "应走到驱动查找，got {err}"
+        );
     }
 }

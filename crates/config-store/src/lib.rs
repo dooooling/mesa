@@ -251,8 +251,25 @@ impl ConfigStore {
         Ok(s)
     }
 
+    /// 迁移前的文件拷贝兜底（仅文件库；生产应使用 rusqlite backup API）。
+    /// 调用方需持有 conn guard（只读 path，不重入加锁）。
+    fn backup_file_db(conn: &Connection) {
+        if let Some(path_str) = conn.path()
+            && !path_str.is_empty()
+            && std::path::Path::new(path_str).exists()
+        {
+            let path = std::path::Path::new(path_str);
+            let bak = format!("{}.bak.{}", path.display(), Self::now_ns());
+            let _ = std::fs::copy(path, &bak);
+        }
+    }
+
     fn migrate(&self) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        // P0-1：单个 guard 走完全程，禁止中途 drop/re-lock——旧代码在 002
+        // 分支 drop 外层 guard，而现实 v2 库根本不进 <2 分支，003 的重入
+        // lock 在同一线程永久自锁。conn.transaction() 只需 &mut 重借，
+        // 不需要释放 guard。
+        let mut conn = self.conn.lock().unwrap();
         // 建表：幂等
         conn.execute_batch(
             r#"
@@ -354,86 +371,55 @@ impl ConfigStore {
                 )
                 .unwrap_or(false);
             if !has_2 {
-                // 备份（仅文件库，内存库跳过；生产应使用 rusqlite backup API，此处以文件拷贝为兜底）
-                if let Some(path_str) = conn.path()
-                    && !path_str.is_empty()
-                    && std::path::Path::new(path_str).exists()
-                {
-                    let path = std::path::Path::new(path_str);
-                    let bak = format!("{}.bak.{}", path.display(), Self::now_ns());
-                    let _ = std::fs::copy(path, &bak);
-                }
+                Self::backup_file_db(&conn);
                 let sql2 = include_str!("../migrations/002_management_control.sql");
-                // 原子迁移：BEGIN IMMEDIATE → SQL → 记录 → 更新 meta → COMMIT
-                // 使用 unchecked_transaction 以兼容外层未提交状态
-                {
-                    // 需要 &mut Connection 以开启事务，临时解锁重入
-                    drop(conn);
-                    let mut conn_mut = self.conn.lock().unwrap();
-                    let tx = conn_mut.transaction()?;
-                    tx.execute_batch(sql2)?;
-                    let checksum2 = format!("{:x}", sql2.len());
-                    tx.execute(
-                        "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(2,'002_management_control',?1,?2)",
-                        params![checksum2, Self::now_ns()],
-                    )?;
-                    tx.execute("UPDATE meta SET value='2' WHERE key='schema_version'", [])?;
-                    tx.execute(
-                        "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','2')",
-                        [],
-                    )?;
-                    tx.commit()?;
-                    // 不再直接返回：继续 003（v1→v3 一次 open 走完；外层 conn
-                    // guard 已 drop，后续重新加锁）。旧行为（分两次 open 收敛）
-                    // 依然兼容：meta=2 的库下次 open 走下面的 003 分支。
-                    cur_ver = 2;
-                }
+                // 原子迁移：SQL → 记录 → 更新 meta → COMMIT（单事务）
+                let tx = conn.transaction()?;
+                tx.execute_batch(sql2)?;
+                let checksum2 = format!("{:x}", sql2.len());
+                tx.execute(
+                    "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(2,'002_management_control',?1,?2)",
+                    params![checksum2, Self::now_ns()],
+                )?;
+                tx.execute("UPDATE meta SET value='2' WHERE key='schema_version'", [])?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','2')",
+                    [],
+                )?;
+                tx.commit()?;
+                cur_ver = 2;
             }
         }
         // 003 迁移（PR7 EventTask，v1.1 §10）
         if cur_ver < 3 {
-            let has_3: bool = {
-                let conn = self.conn.lock().unwrap();
-                conn.query_row(
+            let has_3: bool = conn
+                .query_row(
                     "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=3)",
                     [],
                     |r| r.get(0),
                 )
-                .unwrap_or(false)
-            };
+                .unwrap_or(false);
             if !has_3 {
-                // 备份（与 002 同策略：仅文件库）
-                if let Some(path_str) = self.conn.lock().unwrap().path()
-                    && !path_str.is_empty()
-                    && std::path::Path::new(path_str).exists()
-                {
-                    let path = std::path::Path::new(path_str);
-                    let bak = format!("{}.bak.{}", path.display(), Self::now_ns());
-                    let _ = std::fs::copy(path, &bak);
-                }
+                Self::backup_file_db(&conn);
                 let sql3 = include_str!("../migrations/003_event_tasks.sql");
-                {
-                    let mut conn_mut = self.conn.lock().unwrap();
-                    let tx = conn_mut.transaction()?;
-                    tx.execute_batch(sql3)?;
-                    let checksum3 = format!("{:x}", sql3.len());
-                    tx.execute(
-                        "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(3,'003_event_tasks',?1,?2)",
-                        params![checksum3, Self::now_ns()],
-                    )?;
-                    tx.execute("UPDATE meta SET value='3' WHERE key='schema_version'", [])?;
-                    tx.execute(
-                        "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','3')",
-                        [],
-                    )?;
-                    tx.commit()?;
-                    cur_ver = 3;
-                }
+                let tx = conn.transaction()?;
+                tx.execute_batch(sql3)?;
+                let checksum3 = format!("{:x}", sql3.len());
+                tx.execute(
+                    "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(3,'003_event_tasks',?1,?2)",
+                    params![checksum3, Self::now_ns()],
+                )?;
+                tx.execute("UPDATE meta SET value='3' WHERE key='schema_version'", [])?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','3')",
+                    [],
+                )?;
+                tx.commit()?;
+                cur_ver = 3;
             }
         }
         // 最终确保 meta 为最新
         if cur_ver < SCHEMA_VERSION {
-            let conn = self.conn.lock().unwrap();
             conn.execute(
                 "UPDATE meta SET value=?1 WHERE key='schema_version'",
                 params![SCHEMA_VERSION.to_string()],
@@ -993,8 +979,16 @@ impl ConfigStore {
                 }
             };
             let binding_config_json: String = r.get(4)?;
+            // P0-2：坏 binding JSON 硬失败（与非法 mode 同语义；静默 `{}` 会
+            // 让损坏的订阅变成"配了但行为不对"的幽灵任务）。
             let cfg: serde_json::Value =
-                serde_json::from_str(&binding_config_json).unwrap_or(serde_json::json!({}));
+                serde_json::from_str(&binding_config_json).map_err(|e: serde_json::Error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        format!("corrupt event binding_config_json: {e}").into(),
+                    )
+                })?;
             Ok(EventTask {
                 id: r.get(0)?,
                 mode,
@@ -1623,6 +1617,126 @@ mod tests {
         // endpoint 删除级联清理配置行（历史在 events.db，不受影响）
         assert!(s.delete_endpoint("e1").unwrap());
         assert!(s.list_event_tasks("e1").unwrap().is_empty());
+    }
+
+    /// P0-1 回归：现实 v2 文件库 open() 必须一次走到 v3（旧代码在此自锁）。
+    /// 构造方式：按 v2 应有形态手写建表 + meta=2 + migrations 1,2 + 业务行，
+    /// 再 ConfigStore::open()（同一线程重复 lock 即永挂，测试会直接卡死）。
+    #[test]
+    fn v2_file_db_upgrades_to_v3_without_data_loss() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mesa-config-v2up-{}-{}.db",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE devices(id TEXT PRIMARY KEY, name TEXT NOT NULL, profile TEXT);
+                CREATE TABLE endpoints(
+                    id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE RESTRICT,
+                    driver_id TEXT NOT NULL,
+                    connection_json TEXT NOT NULL,
+                    desired_running INTEGER NOT NULL DEFAULT 0,
+                    updated_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE tasks(
+                    endpoint_id TEXT NOT NULL REFERENCES endpoints(id) ON DELETE CASCADE,
+                    id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    interval_ms INTEGER,
+                    binding_kind TEXT NOT NULL,
+                    binding_config_json TEXT NOT NULL,
+                    PRIMARY KEY(endpoint_id, id)
+                );
+                CREATE TABLE schema_migrations(
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    applied_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE endpoint_secrets(
+                    endpoint_id TEXT NOT NULL,
+                    field_path TEXT NOT NULL,
+                    ciphertext BLOB NOT NULL,
+                    nonce BLOB NOT NULL,
+                    algorithm TEXT NOT NULL,
+                    key_id TEXT NOT NULL,
+                    updated_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(endpoint_id, field_path)
+                );
+                INSERT INTO meta(key,value) VALUES('schema_version','2');
+                INSERT INTO schema_migrations(version,name,checksum,applied_at_ns)
+                    VALUES(1,'001_initial','x',1),(2,'002_management_control','y',2);
+                INSERT INTO devices(id,name) VALUES('d1','D1');
+                INSERT INTO endpoints(id,device_id,driver_id,connection_json,desired_running,updated_at_ns)
+                    VALUES('e1','d1','simulator','{}',1,7);
+                INSERT INTO tasks(endpoint_id,id,mode,interval_ms,binding_kind,binding_config_json)
+                    VALUES('e1','t1','poll',100,'simulator.points','{}');
+                "#,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO endpoint_secrets(endpoint_id,field_path,ciphertext,nonce,algorithm,key_id,updated_at_ns)
+                 VALUES('e1','password',?1,?2,'aead','k1',8)",
+                params![vec![1u8, 2, 3], vec![9u8]],
+            )
+            .unwrap();
+        }
+        // 前置确认：确实是 v2
+        {
+            let conn = Connection::open(&path).unwrap();
+            let ver: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ver, "2");
+        }
+        // 升级（自锁会在此永久 hanging，CI 超时即失败）
+        let s = ConfigStore::open(&path).unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            let ver: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ver, "3");
+            // 旧业务行全部还在
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE endpoint_id='e1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1);
+            let blob: Vec<u8> = conn
+                .query_row(
+                    "SELECT ciphertext FROM endpoint_secrets WHERE endpoint_id='e1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(blob, vec![1u8, 2, 3]);
+        }
+        // 公共 API 视角：endpoint/任务可读，event_tasks 可用
+        assert_eq!(s.list_tasks("e1").unwrap().len(), 1);
+        assert!(s.list_event_tasks("e1").unwrap().is_empty());
+        s.replace_event_tasks("e1", &[event_task("al")]).unwrap();
+        assert_eq!(s.list_event_tasks("e1").unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

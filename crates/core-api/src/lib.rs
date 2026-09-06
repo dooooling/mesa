@@ -1604,8 +1604,12 @@ async fn start_endpoint(
             }
         }
     }
-    // PR7 v1.1 §11：REST 启动同样带上已持久化的事件任务（与开机恢复一致）
-    let event_tasks = state.store.list_event_tasks(&id).unwrap_or_default();
+    // PR7 v1.1 §11：REST 启动同样带上已持久化的事件任务（与开机恢复一致）。
+    // P0-2 fail-closed：读取失败不得静默降级为 Data-only，直接返回存储错误。
+    let event_tasks = match state.store.list_event_tasks(&id) {
+        Ok(v) => v,
+        Err(e) => return store_err_to_response(e),
+    };
     let cfg = mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: rec.id.clone(),
         driver_id: rec.driver_id.clone(),

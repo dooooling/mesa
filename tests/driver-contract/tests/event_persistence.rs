@@ -140,6 +140,67 @@ async fn production_path_alarm_cycle_persists_before_visible() {
     let _ = std::fs::remove_file(&db);
 }
 
+/// P0-3：endpoint stop → start（新 Driver 进程）后 event_id 不重复。
+///
+/// 旧进程 run_seq 归零陷阱已除（epoch 作用域）：两轮各 4 条 alarm，
+/// DB 共 8 行、8 个互异 event_id、0 collision（collision 会触发重连风暴）。
+#[tokio::test]
+async fn event_ids_unique_across_driver_process_restart() {
+    common::init_log();
+    let db = tmp_events_db("restart");
+    let _ = std::fs::remove_file(&db);
+
+    let store = Arc::new(EventStore::open(&db).unwrap());
+    let mgr = MesaManager::discover(&repo_root().join("drivers"));
+    mgr.set_event_services(EventServices::new(
+        store.clone(),
+        EventHub::new(EVENT_HUB_CAPACITY),
+    ));
+    let cfg = || BuiltinEndpoint {
+        endpoint_id: "ct-evt-restart".into(),
+        driver_id: "simulator".into(),
+        connection_json: "{}".into(),
+        tasks: vec![poll_task(
+            "t1",
+            50,
+            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+        )],
+        event_tasks: vec![alarm_task()],
+    };
+
+    for round in 0..2 {
+        mgr.start_endpoint(cfg()).unwrap();
+        // 每轮等够累计 4*(round+1) 条（新进程新 epoch，ID 与上一轮互异；
+        // 不能只等 >=4，否则第二轮会因首轮残留立即返回）
+        let target = 4 * (round + 1);
+        wait_until(15, || {
+            store
+                .query_history(&EventFilter {
+                    endpoint_id: Some("ct-evt-restart".into()),
+                    ..Default::default()
+                })
+                .map(|(rows, _)| rows.len() >= target)
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(mgr.stop_endpoint("ct-evt-restart").await);
+    }
+
+    let (rows, _) = store
+        .query_history(&EventFilter {
+            endpoint_id: Some("ct-evt-restart".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 8, "两轮 4+4 全入库，无 collision 丢失");
+    let mut ids: Vec<&str> = rows.iter().map(|r| r.event_id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 8, "跨进程 event_id 必须互异");
+    drop(mgr);
+    let _ = std::fs::remove_file(&db);
+}
+
 /// Data-only 老路径零成本：无 EventServices 的 manager 照旧跑数据，
 ///
 /// 且无事件任务的 endpoint 在有 EventServices 时也不发 Event RPC。

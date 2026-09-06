@@ -360,6 +360,28 @@ async fn pagination_and_filters() {
     assert_eq!(rows.len(), 5);
 }
 
+/// P1 golden vector：canonical JSON 全串 + SHA-256 精确冻结。
+/// 目标是"跨版本可比"——serde_json 升级或有人"优化" canonical 映射时，
+/// 此测试变红，而不是静默改变历史 payload_hash 兼容性。
+#[test]
+fn canonical_hash_golden_vector() {
+    let mut r = record("GOLDEN-1");
+    r.attributes = BTreeMap::from([
+        ("z".into(), Value::I32(-7)),
+        ("a".into(), Value::Bool(true)),
+        ("code".into(), Value::String("G1".into())),
+    ]);
+    let s = serde_json::to_string(&crate::canonical_event_payload(&r).unwrap()).unwrap();
+    assert_eq!(
+        s,
+        r#"{"attributes":{"a":{"type":"bool","value":true},"code":{"type":"string","value":"G1"},"z":{"type":"i32","value":-7}},"category":"alarm","code":"SIM-100","condition":{"acknowledged":null,"active":true,"condition_id":"SIM-ALARM-100","confirmed":null,"retain":true,"transition":"raised"},"correlation_id":null,"event_id":"GOLDEN-1","kind":"alarm.condition","message":"overtemp","message_locale":"en","occurred_at_ns":1700000000000000000,"severity":700,"source":"Channel1"}"#
+    );
+    assert_eq!(
+        crate::event_payload_hash(&r).unwrap(),
+        "d2432d51ef1908c9a4726d4d4a76e2d8aeb71cf61b687d2bcef3d8fc01b8644f"
+    );
+}
+
 /// purge + stats。
 #[tokio::test]
 async fn purge_and_stats() {

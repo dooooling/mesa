@@ -374,13 +374,31 @@ async fn attempt_session(
                 };
             }
         };
-    // v1.1 §14：Start 之前接管 EventReceiver。无 EventServices（Data-only）
-    // 则不接管——接收端随 Session 释放，reader 侧溢出无人消费也无人在意。
-    let event_rx = if services.is_some() {
+    // v1.1 §14 + P1：Event-enabled（services + 非空 event_tasks）才接管。
+    // Data-only（无 services，或 tasks 为空）不 take、不 spawn——接收端随
+    // Session 释放，零成本（reader 侧溢出无人消费也无人在意）。
+    let want_events = services.is_some() && !cfg.event_tasks.is_empty();
+    let event_rx = if want_events {
         session.take_event_batches()
     } else {
         None
     };
+    // P1：ingress 在 run_config_flow（→ Start）之前 spawn。StartAck 后首批
+    // 即可能到达；若等 Start 成功后再 spawn，洪峰会在消费者就位前先塞 channel。
+    // （PR6 release gate 保证 Start 前无 batch，但消费者早到位消除整类窗口。）
+    // 统计句柄 step ⑧ 接入 Endpoint diagnostics，此处仅创建持有。
+    let _ingress_stats: crate::event_ingress::SharedIngressStats =
+        Arc::new(Mutex::new(IngressStats::default()));
+    let mut ingress: Option<tokio::task::JoinHandle<Result<(), IngressFatal>>> =
+        match (event_rx, services) {
+            (Some(rx), Some(svc)) => Some(tokio::spawn(run_event_ingress(
+                rx,
+                cfg.endpoint_id.clone(),
+                Arc::clone(svc),
+                Arc::clone(&_ingress_stats),
+            ))),
+            _ => None,
+        };
     // 注册活跃会话供 Control 面可靠转发（§22），Control 与 Data 共用同一 TCP 但分队列
     let session_arc = std::sync::Arc::new(tokio::sync::Mutex::new(session));
     registry
@@ -399,6 +417,11 @@ async fn attempt_session(
     match config_res {
         Ok(()) => {}
         Err(outcome) => {
+            // 配置失败：ingress 若已 spawn（Start 前）一并 abort，避免无主消费
+            if let Some(h) = ingress {
+                h.abort();
+                let _ = h.await;
+            }
             {
                 let mut sess = session_arc.lock().await;
                 sess.invalidate();
@@ -418,22 +441,6 @@ async fn attempt_session(
         *last_epoch,
         source.revision(&cfg.endpoint_id),
     );
-
-    // 配置成功后起 ingress（Start 之前已接管 EventReceiver，见上）：
-    // 有 EventServices 才起；Data-only 照旧无 ingress。
-    // 统计句柄 step ⑧ 接入 Endpoint diagnostics，此处仅创建持有。
-    let _ingress_stats: crate::event_ingress::SharedIngressStats =
-        Arc::new(Mutex::new(IngressStats::default()));
-    let mut ingress: Option<tokio::task::JoinHandle<Result<(), IngressFatal>>> =
-        match (event_rx, services) {
-            (Some(rx), Some(svc)) => Some(tokio::spawn(run_event_ingress(
-                rx,
-                cfg.endpoint_id.clone(),
-                Arc::clone(svc),
-                Arc::clone(&_ingress_stats),
-            ))),
-            _ => None,
-        };
 
     // 事件循环期间保持会话注册，Control 请求通过同一 session_arc 的 Mutex 串行化
     let outcome = event_loop(

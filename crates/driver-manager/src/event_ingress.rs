@@ -72,7 +72,10 @@ impl IngressFatal {
 pub struct IngressStats {
     pub batches: u64,
     pub persisted_events: u64,
-    pub duplicates: u64,
+    /// batch 层整批跳过（tracker Duplicate，不开 txn）。
+    pub batch_duplicates: u64,
+    /// event 层逐条去重（UNIQUE 同 payload，txn 内）。
+    pub event_duplicates: u64,
     pub gaps: u64,
 }
 
@@ -113,6 +116,7 @@ pub async fn run_event_ingress(
             SequenceVerdict::Duplicate => {
                 // 整批跳过：不开 DB txn（同 seq 即同内容是 wire invariant，
                 // 无需第二套 payload hash）。
+                stats.lock().unwrap().batch_duplicates += 1;
                 tracing::debug!(
                     endpoint = %endpoint_id,
                     seq,
@@ -146,7 +150,7 @@ pub async fn run_event_ingress(
         match res {
             Ok(outcome) => {
                 stats.lock().unwrap().persisted_events += outcome.inserted.len() as u64;
-                stats.lock().unwrap().duplicates += outcome.duplicates;
+                stats.lock().unwrap().event_duplicates += outcome.duplicates;
                 // 先 COMMIT，后发布：Hub 只见已落盘行（重放旧行不再发布）
                 for ev in &outcome.inserted {
                     services.hub.publish(ev);
