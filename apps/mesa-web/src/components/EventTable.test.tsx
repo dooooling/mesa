@@ -7,9 +7,10 @@ import { makeEvent } from "../test/fixtures";
 describe("EventTable", () => {
   it("历史首屏渲染固定列", () => {
     render(<EventTable events={[makeEvent(2), makeEvent(1)]} loading={false} onSelect={() => {}} />);
-    expect(screen.getByText("alarm.condition")).toBeTruthy();
-    expect(screen.getByText("overtemp")).toBeTruthy();
-    expect(screen.getByText("raised")).toBeTruthy();
+    // 两行共享 kind/message/transition（同一 condition 的两条 occurrence）
+    expect(screen.getAllByText("alarm.condition")).toHaveLength(2);
+    expect(screen.getAllByText("overtemp")).toHaveLength(2);
+    expect(screen.getAllByText("raised")).toHaveLength(2);
   });
 
   it("occurred_at 缺失显示 em dash", () => {

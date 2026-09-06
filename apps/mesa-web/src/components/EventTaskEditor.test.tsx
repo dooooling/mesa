@@ -120,7 +120,8 @@ describe("EventTaskEditor", () => {
     const spin = screen.getByRole("spinbutton");
     await user.clear(spin);
     expect(await screen.findByText("Poll 模式必须提供正整数 interval_ms")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "保存订阅" })).toBeDisabled();
+    const save = screen.getByRole("button", { name: "保存订阅" });
+    expect((save as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("私有绑定只读展示、可删除", async () => {
@@ -130,8 +131,8 @@ describe("EventTaskEditor", () => {
     expect(await screen.findByText("Legacy / Private Binding")).toBeTruthy();
     expect(screen.getByText("legacy.private")).toBeTruthy();
     const card = screen.getByText("old-private").closest(".ant-card") as HTMLElement;
-    const del = within(card).getByRole("button", { name: "删除" });
-    expect(del).toBeEnabled();
+    const del = within(card).getByRole("button", { name: /删除/ });
+    expect((del as HTMLButtonElement).disabled).toBe(false);
     await user.click(del);
     await waitFor(() => expect(screen.queryByText("Legacy / Private Binding")).toBeNull());
   });
@@ -144,7 +145,8 @@ describe("EventTaskEditor", () => {
     render(<EventTaskEditor />);
     await screen.findByText("运行中 · 只读");
     expect(screen.getByText("事件任务只能在 Endpoint 停止状态修改")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "保存订阅" })).toBeDisabled();
+    const save = screen.getByRole("button", { name: "保存订阅" });
+    expect((save as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("PUT body 只含 mesa.events.v1（无私有 kind）", async () => {

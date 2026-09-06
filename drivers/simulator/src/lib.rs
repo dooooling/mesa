@@ -34,9 +34,9 @@ use std::time::Duration;
 
 use mesa_core_types::{
     AcquisitionTask, ConditionTransition, DataBatch, DataType, DriverMetadata, DuplicatePointKey,
-    ErrorKind, EventCondition, EventRecord, EventTask, GENERIC_BINDING_KIND, GENERIC_EVENT_BINDING_KIND,
-    GenericBinding, GenericEventBinding, PointDescriptor, PointMap, PointValue, Quality, TaskMode,
-    Value, ensure_unique_point_keys, now_unix_ns,
+    ErrorKind, EventCondition, EventRecord, EventTask, GENERIC_BINDING_KIND,
+    GENERIC_EVENT_BINDING_KIND, GenericBinding, GenericEventBinding, PointDescriptor, PointMap,
+    PointValue, Quality, TaskMode, Value, ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, EventSink, SdkDriverError};
 use tokio_util::sync::CancellationToken;
@@ -767,12 +767,16 @@ impl DriverConnection for SimConnection {
             if task.binding.kind == GENERIC_EVENT_BINDING_KIND {
                 // PR8 标准路径：`mesa.events.v1 { stream_id, parameters }`。
                 // Core 不解释语义；本驱动 lookup stream_id 并校验 parameters。
-                let binding = GenericEventBinding::from_json(&task.binding.config).map_err(|e| {
-                    SdkDriverError::configuration(
-                        "INVALID_EVENT_BINDING_CONFIG",
-                        format!("event task `{}`: invalid generic event binding: {e}", task.id),
-                    )
-                })?;
+                let binding =
+                    GenericEventBinding::from_json(&task.binding.config).map_err(|e| {
+                        SdkDriverError::configuration(
+                            "INVALID_EVENT_BINDING_CONFIG",
+                            format!(
+                                "event task `{}`: invalid generic event binding: {e}",
+                                task.id
+                            ),
+                        )
+                    })?;
                 if binding.stream_id.trim().is_empty() {
                     return Err(SdkDriverError::configuration(
                         "INVALID_EVENT_BINDING_CONFIG",
@@ -784,10 +788,7 @@ impl DriverConnection for SimConnection {
                 if !binding.parameters.is_object() && !binding.parameters.is_null() {
                     return Err(SdkDriverError::configuration(
                         "INVALID_EVENT_BINDING_CONFIG",
-                        format!(
-                            "event task `{}`: `parameters` 需为对象",
-                            task.id
-                        ),
+                        format!("event task `{}`: `parameters` 需为对象", task.id),
                     ));
                 }
                 let stream = SimEventStream::parse(&binding.stream_id).ok_or_else(|| {
@@ -1396,7 +1397,12 @@ mod tests {
         assert_eq!(vals[1], (22, Value::Bool(true)));
     }
 
-    fn generic_event_task(id: &str, mode: TaskMode, interval_ms: Option<u64>, stream_id: &str) -> EventTask {
+    fn generic_event_task(
+        id: &str,
+        mode: TaskMode,
+        interval_ms: Option<u64>,
+        stream_id: &str,
+    ) -> EventTask {
         EventTask {
             id: id.into(),
             mode,
@@ -1428,7 +1434,12 @@ mod tests {
             1,
             vec![
                 generic_event_task("e-sub", TaskMode::Subscribe, None, SIM_EVENT_STREAM_ALARM),
-                generic_event_task("e-poll", TaskMode::Poll, Some(100), SIM_EVENT_STREAM_COUNTER),
+                generic_event_task(
+                    "e-poll",
+                    TaskMode::Poll,
+                    Some(100),
+                    SIM_EVENT_STREAM_COUNTER,
+                ),
             ],
         )
         .await
@@ -1440,9 +1451,12 @@ mod tests {
     #[tokio::test]
     async fn simulator_legacy_binding_still_accepted() {
         let mut conn = SimConnection::default();
-        conn.configure_events(1, vec![legacy_event_task("e-old", SIM_EVENT_STREAM_COUNTER)])
-            .await
-            .unwrap();
+        conn.configure_events(
+            1,
+            vec![legacy_event_task("e-old", SIM_EVENT_STREAM_COUNTER)],
+        )
+        .await
+        .unwrap();
         assert_eq!(conn.event_plan.as_ref().unwrap().tasks.len(), 1);
     }
 
@@ -1451,7 +1465,15 @@ mod tests {
     async fn unknown_event_stream_rejected() {
         let mut conn = SimConnection::default();
         let err = conn
-            .configure_events(1, vec![generic_event_task("e", TaskMode::Subscribe, None, "no.such.stream")])
+            .configure_events(
+                1,
+                vec![generic_event_task(
+                    "e",
+                    TaskMode::Subscribe,
+                    None,
+                    "no.such.stream",
+                )],
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, "UNKNOWN_EVENT_STREAM");

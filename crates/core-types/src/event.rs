@@ -559,11 +559,11 @@ mod tests {
             parameters: serde_json::json!({}),
         };
         let s = serde_json::to_string(&b).unwrap();
-        assert_eq!(GenericEventBinding::from_json(&serde_json::from_str(&s).unwrap()).unwrap(), b);
+        let back = GenericEventBinding::from_json(&serde_json::from_str(&s).unwrap()).unwrap();
+        assert_eq!(back, b);
         // 缺省 parameters 反序列化成功（Web 可省略空对象）。
-        let v: GenericEventBinding =
-            serde_json::from_value(serde_json::json!({"stream_id": "sim.events.counter"}))
-                .unwrap();
+        let raw = serde_json::json!({"stream_id": "sim.events.counter"});
+        let v: GenericEventBinding = serde_json::from_value(raw).unwrap();
         assert_eq!(v.stream_id, "sim.events.counter");
         assert!(v.parameters.is_null() || v.parameters.is_object());
         assert_eq!(GENERIC_EVENT_BINDING_KIND, "mesa.events.v1");

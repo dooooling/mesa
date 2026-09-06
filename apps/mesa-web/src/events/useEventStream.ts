@@ -60,7 +60,8 @@ export function useEventStream({ afterSeq, enabled, onEvent, onError }: UseEvent
       return;
     }
     // Resume 从上次游标继续：DB replay missed，无需浏览器堆 pending。
-    const start = seqRef.current;
+    // 首连时 seqRef 仍为初始 null，取冻结高水位 afterSeq（无窗口启动的关键）。
+    const start = seqRef.current ?? afterSeq;
     setStatus("connecting");
     const src = new EventSource(sseUrl(start));
     let opened = false;
