@@ -16,6 +16,14 @@ fn fake_opcua_connection() -> serde_json::Value {
     serde_json::json!({"endpoint_url":"opc.tcp://127.0.0.1:4840","use_native":false})
 }
 
+fn fake_sinumerik_connection() -> serde_json::Value {
+    // SINUMERIK Fake 驱动（空脚本 Fake：browse 返回空页，仅验证管道与身份形态）
+    unsafe {
+        std::env::set_var("MESA_ALLOW_FAKE_NATIVE", "1");
+    }
+    serde_json::json!({"endpoint_url":"opc.tcp://127.0.0.1:4840","use_native":false})
+}
+
 async fn app_with_endpoint(
     driver_id: &str,
     connection: serde_json::Value,
@@ -146,4 +154,37 @@ async fn browse_pagination_does_not_return_all_at_once() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["nodes"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn browse_sinumerik_plumbing_and_canonical_shape() {
+    // SINUMERIK browse 管道门：驱动被发现、二进制可拉起、browse 200。
+    // 空脚本 Fake 返回空页；若有节点，身份必须全部 canonical nsu= 形态
+    //（翻页聚合与换算覆盖在驱动单测 + fixture 自检，不在此重复）。
+    // 注意：改过驱动代码后须先 cargo build --workspace（旧二进制静默失效）。
+    let (app, ep_id) = app_with_endpoint("sinumerik", fake_sinumerik_connection()).await;
+    let req = Request::builder()
+        .uri(format!("/api/v1/endpoints/{ep_id}/browse"))
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"parent":"","limit":10}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let nodes = v["nodes"].as_array().expect("nodes 数组");
+    for n in nodes {
+        let id = n["id"].as_str().expect("BrowseNode.id");
+        assert!(
+            id.starts_with("nsu="),
+            "sinumerik browse 身份必须 canonical nsu= 形态，实际: {id}"
+        );
+        let binding: serde_json::Value =
+            serde_json::from_str(n["binding_json"].as_str().expect("binding_json"))
+                .expect("binding_json 合法 JSON");
+        assert_eq!(binding["node_id"].as_str(), Some(id));
+    }
 }

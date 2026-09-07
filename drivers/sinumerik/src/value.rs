@@ -252,8 +252,8 @@ pub fn decode_data_value(
 
     // GOOD 路径：必须有值且类型匹配 → CURRENT 并更新缓存
     if status.is_good() {
-        if let Some(coerced) = maybe_coerced {
-            if value_fits_data_type(&coerced, spec.data_type) {
+        match maybe_coerced {
+            Some(coerced) if value_fits_data_type(&coerced, spec.data_type) => {
                 let sample = LastKnownSample {
                     value: coerced.clone(),
                     source_timestamp_ns: source_ts_current,
@@ -269,35 +269,39 @@ pub fn decode_data_value(
                 };
             }
             // GOOD 但类型不匹配 → BadTypeMismatch 隔离
-            return bad_with_cache(
-                spec,
-                point_id,
-                last_known,
-                StatusCode::BadTypeMismatch.bits() as i32,
-            );
+            Some(_) => {
+                return bad_with_cache(
+                    spec,
+                    point_id,
+                    last_known,
+                    StatusCode::BadTypeMismatch.bits() as i32,
+                );
+            }
+            // GOOD 但无值 → BadUnexpectedError 隔离
+            None => {
+                return bad_with_cache(
+                    spec,
+                    point_id,
+                    last_known,
+                    StatusCode::BadUnexpectedError.bits() as i32,
+                );
+            }
         }
-        // GOOD 但无值 → BadUnexpectedError 隔离
-        return bad_with_cache(
-            spec,
-            point_id,
-            last_known,
-            StatusCode::BadUnexpectedError.bits() as i32,
-        );
     }
 
     // UNCERTAIN + 有效 typed 值 → CURRENT（质量 Uncertain），不更新 last_known
     if !status.is_bad() {
-        if let Some(coerced) = maybe_coerced {
-            if value_fits_data_type(&coerced, spec.data_type) {
-                return PointValue {
-                    point_id,
-                    value: coerced,
-                    quality: Quality::Uncertain,
-                    quality_code: Some(status.bits() as i32),
-                    source_timestamp_ns: source_ts_current,
-                    value_origin: ValueOrigin::Current,
-                };
-            }
+        if let Some(coerced) = maybe_coerced
+            && value_fits_data_type(&coerced, spec.data_type)
+        {
+            return PointValue {
+                point_id,
+                value: coerced,
+                quality: Quality::Uncertain,
+                quality_code: Some(status.bits() as i32),
+                source_timestamp_ns: source_ts_current,
+                value_origin: ValueOrigin::Current,
+            };
         }
         // UNCERTAIN 但无值/类型不符 → LastKnown/Placeholder，质量保持 Uncertain
         let (val, origin, src) = cached_or_placeholder(spec, point_id, last_known);

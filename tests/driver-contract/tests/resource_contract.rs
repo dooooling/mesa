@@ -211,6 +211,59 @@ async fn legacy_still_works_for_all_drivers() {
         },
     };
     assert!(opcua.configure(1, vec![legacy_opcua]).await.is_ok());
+
+    // SINUMERIK legacy（canonical nsu= 身份）
+    let mut sinumerik = mesa_driver_sinumerik::SinumerikDriver
+        .open_connection("ep1", "{}")
+        .await
+        .unwrap();
+    let legacy_sinumerik = AcquisitionTask {
+        id: "t1".into(),
+        mode: TaskMode::Poll,
+        interval_ms: Some(100),
+        binding: DriverBinding {
+            kind: mesa_driver_sinumerik::BINDING_POLL.into(),
+            config: json!({"nodes":[{"key":"a","node_id":"nsu=http://www.siemens.com/sinumerik;s=Speed","data_type":"F64"}]}),
+        },
+    };
+    assert!(sinumerik.configure(1, vec![legacy_sinumerik]).await.is_ok());
+}
+
+#[tokio::test]
+async fn sinumerik_generic_node_ok_and_legacy_index_rejected() {
+    // 通用绑定 canonical 身份通过；legacy ns= 索引形态 fail-closed。
+    let mut conn = mesa_driver_sinumerik::SinumerikDriver
+        .open_connection("ep1", "{}")
+        .await
+        .unwrap();
+    let task = generic_task(
+        "t1",
+        vec![ResourceSelection {
+            resource_id: "node".into(),
+            parameters: json!({"node_id":"nsu=http://www.siemens.com/sinumerik;s=Speed","data_type":"F64"}),
+            outputs: vec![SelectedOutput {
+                output: "value".into(),
+                point_key: "spindle.speed".into(),
+            }],
+        }],
+    );
+    let descs = conn.configure(1, vec![task]).await.unwrap();
+    assert_eq!(descs.len(), 1);
+    assert_eq!(descs[0].point_key, "spindle.speed");
+
+    let bad = generic_task(
+        "t2",
+        vec![ResourceSelection {
+            resource_id: "node".into(),
+            parameters: json!({"node_id":"ns=2;s=Speed","data_type":"F64"}),
+            outputs: vec![SelectedOutput {
+                output: "value".into(),
+                point_key: "k".into(),
+            }],
+        }],
+    );
+    let err = conn.configure(2, vec![bad]).await.unwrap_err();
+    assert_eq!(err.code, "INVALID_ADDRESS");
 }
 
 #[test]

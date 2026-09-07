@@ -21,11 +21,18 @@
 
 mod canonical;
 mod config;
+mod fixture;
 mod probe;
 mod value;
 
-pub use canonical::{CanonicalError, ResolveError, SinumerikIdentifier, SinumerikNodeId};
+pub use canonical::{
+    CanonicalError, ResolveError, SinumerikIdentifier, SinumerikNodeId, parse_canonical,
+};
 pub use config::SinumerikConnConfig;
+pub use fixture::{
+    FIXTURE_FIRMWARE, FIXTURE_MODEL, FIXTURE_VENDOR, OBJECTS_ROOT, SIEMENS_INDEX, SIEMENS_NS,
+    STD_NS, namespace_array, sinumerik_shaped_fake,
+};
 pub use probe::probe_with_transport;
 pub use value::{
     LastKnownSample, PointSpec, decode_data_value, parse_data_type, status_to_quality,

@@ -1325,6 +1325,7 @@ dependencies = [
  "mesa-driver-s7",
  "mesa-driver-sdk",
  "mesa-driver-simulator",
+ "mesa-driver-sinumerik",
  "mesa-event-store",
  "rusqlite",
  "serde_json",
