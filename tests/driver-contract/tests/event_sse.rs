@@ -80,12 +80,16 @@ struct TestServer {
 }
 
 async fn serve(store: Arc<EventStore>, hub: Arc<EventHub>) -> TestServer {
+    serve_with_services(EventServices::new(store, hub)).await
+}
+
+async fn serve_with_services(services: Arc<EventServices>) -> TestServer {
     let drivers_dir = repo_root().join("drivers");
     let cfg = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
     #[allow(deprecated)]
     let state = mesa_core_api::AppState::new(mgr, cfg, drivers_dir.to_string_lossy().to_string());
-    state.set_event_services(EventServices::new(store, hub));
+    state.set_event_services(services);
     let app = mesa_core_api::router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -345,6 +349,102 @@ async fn sse_consumer_kill_reconnects_with_last_event_id() {
     let s7 = commit(&store, &hub, "ep", "k-6", 6, 7).await;
     let f = cli2.next_frame_timeout(5).await;
     assert_eq!(f.id.as_deref(), Some(s7.to_string()).as_deref());
+    let _ = std::fs::remove_file(&db);
+}
+
+/// 诊断契约（PR10 commit 7 §14）：真 ingress 流量后，
+/// `GET /events/stats` 键集完整（16 键冻结）且计数值与 DB 自洽
+///（persisted == stored_rows == 实际行数，batches ≥ persisted）。
+/// dup/gap/collision 等计数器的接线由 lifecycle torture 的诊断增量门
+/// 直接锁定；此处锁暴露形状 + 基本自洽。零生产改动。
+#[tokio::test]
+async fn events_stats_contract_keys_and_values() {
+    common::init_log();
+    let db = tmp_db("stats");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(EventStore::open(&db).unwrap());
+    let hub = EventHub::new(EVENT_HUB_CAPACITY);
+    let services = EventServices::new(store.clone(), hub.clone());
+
+    // 真 ingress 流量：manager + Sim counter（与 pressure 同形状），
+    // 计数器落在同一个 services Arc 上，stats 读同一份。
+    let drivers_dir = repo_root().join("drivers");
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
+    mgr.set_event_services(Arc::clone(&services));
+    let binding = mesa_core_types::GenericEventBinding {
+        stream_id: mesa_driver_simulator::SIM_EVENT_STREAM_COUNTER.into(),
+        parameters: serde_json::json!({}),
+    };
+    mgr.start_endpoint(mesa_driver_manager::endpoint::BuiltinEndpoint {
+        endpoint_id: "hd-stats".into(),
+        driver_id: "simulator".into(),
+        connection_json: "{}".into(),
+        tasks: vec![],
+        event_tasks: vec![mesa_core_types::EventTask {
+            id: "cnt".into(),
+            mode: mesa_core_types::TaskMode::Poll,
+            interval_ms: Some(50),
+            binding: mesa_core_types::DriverBinding {
+                kind: mesa_core_types::GENERIC_EVENT_BINDING_KIND.into(),
+                config: serde_json::to_value(&binding).unwrap(),
+            },
+        }],
+    })
+    .unwrap();
+    // 等 ≥20 行落盘（真流量证据），再停 endpoint 冻结计数器
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let rows = loop {
+        let n = store
+            .query_history(&mesa_event_store::EventFilter {
+                endpoint_id: Some("hd-stats".into()),
+                limit: Some(500),
+                ..Default::default()
+            })
+            .unwrap()
+            .0
+            .len();
+        if n >= 20 {
+            break n as u64;
+        }
+        assert!(std::time::Instant::now() < deadline, "30s 内行数不足 20");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert_eq!(mgr.stop_endpoint("hd-stats").await, Ok(true));
+
+    // stats 读同一 services：键集冻结 + 值自洽
+    let _srv = serve_with_services(Arc::clone(&services)).await;
+    let (status, v) = get_json(_srv.port, "/api/v1/events/stats").await;
+    assert_eq!(status, 200);
+    let obj = v.as_object().expect("stats 必须是 JSON 对象");
+    let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "ingress_batch_duplicates_total",
+            "ingress_batches_total",
+            "ingress_collisions_total",
+            "ingress_event_duplicates_total",
+            "ingress_gaps_total",
+            "ingress_invalid_total",
+            "ingress_persisted_events_total",
+            "ingress_regressions_total",
+            "ingress_store_failures_total",
+            "live_clients",
+            "retention_purged_total",
+            "sse_lagged_total",
+            "sse_reconcile_total",
+            "sse_replay_frames_total",
+            "stored_rows",
+            "stored_size_bytes",
+        ],
+        "stats 键集冻结，增删都必须显式评审"
+    );
+    assert_eq!(v["ingress_persisted_events_total"], rows);
+    assert_eq!(v["stored_rows"], rows);
+    assert!(v["ingress_batches_total"].as_u64().unwrap() >= rows);
+    assert_eq!(v["ingress_store_failures_total"], 0);
+    assert!(v["stored_size_bytes"].as_u64().unwrap() > 0);
     let _ = std::fs::remove_file(&db);
 }
 
