@@ -50,12 +50,9 @@ pub struct FakeOpcUaTransport {
     live_batches: Mutex<VecDeque<FakeLiveBatch>>,
     /// 预置下一次（及以后所有）`create_event_subscription` 返回前注入的原生事件通知。
     event_batches: Mutex<VecDeque<crate::event::UaEventNotification>>,
-    /// 存活的事件 sender（订阅 id → sender）：Fake 必须持有发送端，
-    /// 否则 receiver 建完即见 None（与 Native“sender 随会话存活”语义一致）；
-    /// `delete_subscription` 时摘除，通道关闭。
-    event_senders: Mutex<
-        HashMap<UaSubscriptionId, tokio::sync::mpsc::Sender<crate::event::UaEventNotification>>,
-    >,
+    /// 存活的事件 producer（订阅 id → 共享态）：Fake 经它预注入通知；
+    /// `delete_subscription` 时摘除并关门，通道关闭（drain-to-None 可终止）。
+    event_producers: Mutex<HashMap<UaSubscriptionId, Arc<crate::event::EventProducerShared>>>,
     /// 存活的 fatal sender（订阅 id → sender）：同上，否则 changed() 建完即 Err。
     event_fatal_senders: Mutex<
         HashMap<
@@ -67,6 +64,8 @@ pub struct FakeOpcUaTransport {
     event_create_status: Mutex<HashMap<String, StatusCode>>,
     /// notifier key → 逐 clause 状态（缺省全 Good，长度自动对齐 clauses 数）。
     event_clause_statuses: Mutex<HashMap<String, Vec<StatusCode>>>,
+    /// notifier key → 逐 where-element 状态（缺省空，即 scope=all 形态）。
+    event_where_statuses: Mutex<HashMap<String, Vec<StatusCode>>>,
     /// 预置 create_event_subscription 整体失败（session loss 类测试用）。
     event_sub_error: Mutex<Option<UaTransportError>>,
     /// 预置 create_event_monitored_items 服务级整体失败（回滚测试用）。
@@ -168,6 +167,19 @@ impl FakeOpcUaTransport {
         statuses: Vec<StatusCode>,
     ) -> Self {
         self.event_clause_statuses
+            .lock()
+            .unwrap()
+            .insert(node_key(notifier), statuses);
+        self
+    }
+
+    /// 预置某 notifier 的逐 where-element 状态（P0-3：OfType 被拒类测试用）。
+    pub fn with_event_where_statuses(
+        self,
+        notifier: &UaNodeRef,
+        statuses: Vec<StatusCode>,
+    ) -> Self {
+        self.event_where_statuses
             .lock()
             .unwrap()
             .insert(node_key(notifier), statuses);
@@ -363,9 +375,13 @@ impl OpcUaTransport for FakeOpcUaTransport {
 
     async fn delete_subscription(&self, id: UaSubscriptionId) -> Result<(), UaTransportError> {
         self.deleted_subs.lock().unwrap().push(id);
-        // 摘除事件发送端，receiver 侧随即见 None（会话结束语义）。
-        self.event_senders.lock().unwrap().remove(&id);
-        self.event_fatal_senders.lock().unwrap().remove(&id);
+        // 关门并摘除 producer：receiver 侧随即见 None（会话结束语义）。
+        // 注意：fatal sender 故意保留（随 Fake 本体释放）——服务端删订阅不杀
+        // 会话，fatal 通道必须保持 OPEN，否则 shutdown-drain 会把 changed-Err
+        // 误判为 SESSION_LOST（与 Native“fatal_tx 活在 session 回调里”一致）。
+        if let Some(p) = self.event_producers.lock().unwrap().remove(&id) {
+            p.close();
+        }
         Ok(())
     }
 
@@ -382,13 +398,19 @@ impl OpcUaTransport for FakeOpcUaTransport {
         self.created_subs.lock().unwrap().push(id);
         let (tx, rx) = tokio::sync::mpsc::channel(crate::event::EVENT_CALLBACK_QUEUE_CAPACITY);
         let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
-        // 预置通知按序注入（单测规模，必须能容纳；超限即脚本错误，直接 panic）。
+        // producer 共享态持有发送端（随订阅存活，delete 时关门摘除）；
+        // 预置通知经同一扇门注入（单测规模，必须能容纳；超限即脚本错误）。
+        let producer = crate::event::EventProducerShared::new(tx);
         for n in self.event_batches.lock().unwrap().drain(..) {
-            tx.try_send(n)
-                .expect("fake event batch 必须能容纳（单测规模）");
+            assert!(
+                matches!(producer.try_send(n), crate::event::ProducerSend::Sent),
+                "fake event batch 必须能容纳（单测规模）"
+            );
         }
-        // 发送端随订阅存活（delete 时摘除），receiver 不会早于会话结束见 None。
-        self.event_senders.lock().unwrap().insert(id, tx);
+        self.event_producers
+            .lock()
+            .unwrap()
+            .insert(id, Arc::clone(&producer));
         self.event_fatal_senders
             .lock()
             .unwrap()
@@ -402,6 +424,7 @@ impl OpcUaTransport for FakeOpcUaTransport {
             receiver: rx,
             fatal: fatal_rx,
             stats: Arc::new(crate::event::EventSubscriptionStats::default()),
+            producer,
         })
     }
 
@@ -415,6 +438,7 @@ impl OpcUaTransport for FakeOpcUaTransport {
         }
         let statuses = self.event_create_status.lock().unwrap();
         let clause_maps = self.event_clause_statuses.lock().unwrap();
+        let where_maps = self.event_where_statuses.lock().unwrap();
         let mut out = Vec::with_capacity(items.len());
         for spec in items {
             let key = node_key(&spec.notifier);
@@ -425,6 +449,11 @@ impl OpcUaTransport for FakeOpcUaTransport {
                 .get(&key)
                 .map(|v| v.iter().map(|s| s.bits()).collect())
                 .unwrap_or_else(|| vec![StatusCode::Good.bits(); n]);
+            // where 缺省为空（scope=all 形态）；显式脚本覆盖 scope=conditions。
+            let where_statuses = where_maps
+                .get(&key)
+                .map(|v| v.iter().map(|s| s.bits()).collect())
+                .unwrap_or_default();
             out.push(crate::event::UaEventMonitoredItemResult {
                 client_handle: spec.client_handle,
                 monitored_item_id: if good {
@@ -436,6 +465,7 @@ impl OpcUaTransport for FakeOpcUaTransport {
                 requested_queue_size: spec.queue_size,
                 revised_queue_size: spec.queue_size,
                 select_clause_statuses: clause_statuses,
+                where_clause_statuses: where_statuses,
             });
         }
         Ok(out)

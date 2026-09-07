@@ -157,92 +157,165 @@ async fn run_event_task_inner(
         ));
     }
     let mi_id = created.monitored_item_id;
-    // 所有权拆分：receiver 先 drop（§21 先停 raw 接收），再删监控项/订阅。
+    // P0-3：where 部分同样是 filter 定义的一半。all 要求无 BAD（本实现
+    // all 形态不带 where，空数组即通过）；conditions 要求恰一个 OfType
+    // element 且 Good——否则用户要的过滤语义并未成立，必须拒绝。
+    let where_bad: Vec<u32> = created
+        .where_clause_statuses
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !opcua_types::StatusCode::from(**s).is_good())
+        .map(|(i, _)| i as u32)
+        .collect();
+    let where_ok = match task.scope {
+        EventScope::All => where_bad.is_empty(),
+        EventScope::Conditions => created.where_clause_statuses.len() == 1 && where_bad.is_empty(),
+    };
+    if !where_ok {
+        rollback_subscription(transport, sub.id).await;
+        return Err(SdkDriverError::new(
+            ErrorKind::Connection,
+            "OPCUA_EVENT_FILTER_REJECTED",
+            format!(
+                "task `{}`: where 子句未被服务器接受（scope={:?}，BAD 索引 {where_bad:?}）",
+                task.id, task.scope,
+            ),
+        ));
+    }
     let sub_id = sub.id;
-    let mut rx = sub.receiver;
-    let mut fatal = sub.fatal;
+    // sub 本体保留（shutdown 时调 close_producer）；主循环与 drain 直接以
+    // 不相交字段借用进 select（receiver ↔ fatal 互不干扰）。
+    let mut sub = sub;
     let ctx = EventDecodeContext {
         namespaces: namespaces.as_slice(),
         notifier: &task.notifier,
     };
-    // 主循环：fatal/notify/shutdown 三路；shutdown 后排空 transport 队列
-    // 再退出（§31：Stop 前已进 callback 的 occurrence 必须 COMMIT）。
-    let mut stopping = false;
-    let outcome = loop {
-        if stopping {
-            match rx.try_recv() {
-                Ok(first) => {
-                    if let Err(e) = publish_batch(&ctx, task, sink, first, &mut rx).await {
-                        break Err(e);
-                    }
-                    continue;
-                }
-                Err(_) => break Ok(()),
-            }
-        }
+    // 主循环：fatal/notify/shutdown 三路。shutdown 只置位、不直接退出；
+    // 真正的停止是下面的"关门 → drain"序列（P0-1）。
+    enum RunExit {
+        Shutdown,
+        Failed(SdkDriverError),
+    }
+    let exit = loop {
         tokio::select! {
-            _ = shutdown.cancelled() => {
-                stopping = true;
+            _ = shutdown.cancelled() => break RunExit::Shutdown,
+            fatal_changed = sub.fatal.changed() => {
+                break RunExit::Failed(map_fatal_changed(&task.id, fatal_changed, *sub.fatal.borrow()));
             }
-            fatal_changed = fatal.changed() => {
-                break match fatal_changed {
-                    Err(_) => Err(SdkDriverError::new(
-                        ErrorKind::Connection,
-                        "OPCUA_EVENT_SESSION_LOST",
-                        format!("task `{}`: 事件流 sender 丢失（会话已死）", task.id),
-                    )),
-                    Ok(()) => match *fatal.borrow() {
-                        Some(UaEventStreamFatal::CallbackQueueOverflow) => {
-                            Err(SdkDriverError::new(
-                                ErrorKind::Connection,
-                                "OPCUA_EVENT_CALLBACK_OVERFLOW",
-                                format!("task `{}`: callback 队列溢出，流完整性已失效", task.id),
-                            ))
-                        }
-                        Some(UaEventStreamFatal::MalformedNotification) => {
-                            Err(SdkDriverError::new(
-                                ErrorKind::Connection,
-                                "OPCUA_EVENT_DECODE_FAILED",
-                                format!("task `{}`: 收到无字段通知，契约已破坏", task.id),
-                            ))
-                        }
-                        // watch 初始 None；changed 触发必有值，防御性分支。
-                        None => Err(SdkDriverError::new(
-                            ErrorKind::Internal,
-                            "OPCUA_EVENT_SESSION_LOST",
-                            format!("task `{}`: fatal 信号为空（内部不一致）", task.id),
-                        )),
-                    },
-                };
-            }
-            first = rx.recv() => {
+            first = sub.receiver.recv() => {
                 let Some(first) = first else {
-                    // 通道关闭且已空：shutdown 竞态下属干净退出（无可转发项），
-                    // 否则即会话完整性丢失。
-                    if shutdown.is_cancelled() {
-                        break Ok(());
-                    }
-                    break Err(SdkDriverError::new(
+                    break RunExit::Failed(SdkDriverError::new(
                         ErrorKind::Connection,
                         "OPCUA_EVENT_SESSION_LOST",
                         format!("task `{}`: 事件通道关闭（会话已死）", task.id),
                     ));
                 };
-                if let Err(e) = publish_batch(&ctx, task, sink, first, &mut rx).await {
-                    break Err(e);
+                if let Err(e) = publish_batch(&ctx, task, sink, first, &mut sub.receiver).await {
+                    break RunExit::Failed(e);
                 }
             }
         }
     };
-    // §21 单任务 teardown：停 raw 接收 → 删监控项 → 删订阅（幂等，失败仅诊断）。
-    drop(rx);
+    match exit {
+        RunExit::Failed(e) => {
+            // 失败即停：尽力关门清理（失败仅诊断），不 drain、不掩盖原始错误。
+            sub.close_producer();
+            cleanup_event_subscription(transport, &task.id, sub_id, mi_id).await;
+            Err(e)
+        }
+        RunExit::Shutdown => {
+            // P0-1 收尾模型：先关 producer（删监控项 → 删订阅 → 本地门，
+            // 此后 callback 不可能再 send），receiver 保持 OPEN，drain 到
+            // sender CLOSED（None）。drain 期 fatal 值为 Some 照常 fail；
+            // sender 丢失则是正常 teardown（server delete 连带 drop session
+            // 侧 callback），此后只 drain（flag 防 changed-Err 空转）。
+            cleanup_event_subscription(transport, &task.id, sub_id, mi_id).await;
+            sub.close_producer();
+            let mut fatal_gone = false;
+            loop {
+                if fatal_gone {
+                    let Some(first) = sub.receiver.recv().await else {
+                        break;
+                    };
+                    publish_batch(&ctx, task, sink, first, &mut sub.receiver).await?;
+                    continue;
+                }
+                tokio::select! {
+                    fatal_changed = sub.fatal.changed() => {
+                        if fatal_changed.is_ok() && sub.fatal.borrow().is_some() {
+                            return Err(map_fatal_changed(
+                                &task.id,
+                                Ok(()),
+                                *sub.fatal.borrow(),
+                            ));
+                        }
+                        if fatal_changed.is_err() {
+                            fatal_gone = true;
+                        }
+                        // Ok + None（防御性）/ Err 后继续 drain。
+                    }
+                    next = sub.receiver.recv() => {
+                        let Some(first) = next else {
+                            break;
+                        };
+                        publish_batch(&ctx, task, sink, first, &mut sub.receiver).await?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// fatal watch 映射（主循环与 shutdown-drain 共用：drain 期间的 fatal
+/// 同样是完整性破坏，不得吞成正常 Stop）。
+fn map_fatal_changed(
+    task_id: &str,
+    changed: Result<(), tokio::sync::watch::error::RecvError>,
+    current: Option<UaEventStreamFatal>,
+) -> SdkDriverError {
+    match changed {
+        Err(_) => SdkDriverError::new(
+            ErrorKind::Connection,
+            "OPCUA_EVENT_SESSION_LOST",
+            format!("task `{task_id}`: 事件流 sender 丢失（会话已死）"),
+        ),
+        Ok(()) => match current {
+            Some(UaEventStreamFatal::CallbackQueueOverflow) => SdkDriverError::new(
+                ErrorKind::Connection,
+                "OPCUA_EVENT_CALLBACK_OVERFLOW",
+                format!("task `{task_id}`: callback 队列溢出，流完整性已失效"),
+            ),
+            Some(UaEventStreamFatal::MalformedNotification) => SdkDriverError::new(
+                ErrorKind::Connection,
+                "OPCUA_EVENT_DECODE_FAILED",
+                format!("task `{task_id}`: 收到无字段通知，契约已破坏"),
+            ),
+            // watch 初始 None；changed 触发必有值，防御性分支。
+            None => SdkDriverError::new(
+                ErrorKind::Internal,
+                "OPCUA_EVENT_SESSION_LOST",
+                format!("task `{task_id}`: fatal 信号为空（内部不一致）"),
+            ),
+        },
+    }
+}
+
+/// 单任务 teardown：删监控项 → 删订阅（幂等，失败仅诊断）。
+/// 注意：transport 的 delete_subscription 内部先关本地 producer 门
+/// （P0-1），之后 driver 再显式 close_producer 幂等加固。
+async fn cleanup_event_subscription(
+    transport: &Arc<dyn OpcUaTransport>,
+    task_id: &str,
+    sub_id: u32,
+    mi_id: u32,
+) {
     if let Err(e) = transport.delete_monitored_items(sub_id, &[mi_id]).await {
-        tracing::warn!(task = %task.id, sub_id, error = %e, "事件监控项清理失败（仅诊断）");
+        tracing::warn!(task = %task_id, sub_id, error = %e, "事件监控项清理失败（仅诊断）");
     }
     if let Err(e) = transport.delete_subscription(sub_id).await {
-        tracing::warn!(task = %task.id, sub_id, error = %e, "事件订阅清理失败（仅诊断）");
+        tracing::warn!(task = %task_id, sub_id, error = %e, "事件订阅清理失败（仅诊断）");
     }
-    outcome
 }
 
 /// 聚合当前已就绪的 occurrence（首个 + try_recv 至多 64）→ 逐个解码 →
@@ -287,17 +360,56 @@ async fn publish_batch(
         server_overflow |= decoded.server_queue_overflow;
         records.push(decoded.record);
     }
-    match sink.publish(records).await {
-        Ok(_) => {}
-        // 会话 teardown 中：publish 原子失败（无任何记录入队），静默结束；
-        // 已入队部分由 Stop barrier 覆盖。
-        Err(EventPublishError::Closed) => return Ok(()),
-        Err(e) => {
-            return Err(SdkDriverError::new(
-                ErrorKind::Connection,
-                "OPCUA_EVENT_PUBLISH_FAILED",
-                format!("task `{}`: publish 失败: {e:?}", task.id),
-            ));
+    // P0-2：按字节边界有序 split。SDK 保证 TooLarge 不消耗 sequence
+    // （序号只在成功入队后递增），故二分重试安全：左半永远先于右半，
+    // occurrence order 不变。`publish` 按值拿走 vec，TooLarge 不回吐，
+    // 故 len>1 的 chunk 先 clone 留底（单次 memcpy，相对 DB/网络可忽略）。
+    // 单条仍 TooLarge 即记录级超限（validate 理论上已拦，属防御性分支）。
+    let mut pending = std::collections::VecDeque::from([records]);
+    while let Some(chunk) = pending.pop_front() {
+        if chunk.is_empty() {
+            continue;
+        }
+        if chunk.len() == 1 {
+            match sink.publish(chunk).await {
+                Ok(_) => {}
+                Err(EventPublishError::Closed) => return Ok(()),
+                Err(EventPublishError::TooLarge(_)) => {
+                    return Err(SdkDriverError::new(
+                        ErrorKind::Connection,
+                        "OPCUA_EVENT_RECORD_TOO_LARGE",
+                        format!("task `{}`: 单条事件记录超过批大小上限", task.id),
+                    ));
+                }
+                Err(e) => {
+                    return Err(SdkDriverError::new(
+                        ErrorKind::Connection,
+                        "OPCUA_EVENT_PUBLISH_FAILED",
+                        format!("task `{}`: publish 失败: {e:?}", task.id),
+                    ));
+                }
+            }
+            continue;
+        }
+        let retry = chunk.clone();
+        match sink.publish(chunk).await {
+            Ok(_) => {}
+            // 会话 teardown 中：publish 原子失败（无任何记录入队），静默结束；
+            // 已入队部分由 Stop barrier 覆盖。
+            Err(EventPublishError::Closed) => return Ok(()),
+            Err(EventPublishError::TooLarge(_)) => {
+                let mut left = retry;
+                let right = left.split_off(left.len() / 2);
+                pending.push_front(right);
+                pending.push_front(left); // 左半先行，order 不变
+            }
+            Err(e) => {
+                return Err(SdkDriverError::new(
+                    ErrorKind::Connection,
+                    "OPCUA_EVENT_PUBLISH_FAILED",
+                    format!("task `{}`: publish 失败: {e:?}", task.id),
+                ));
+            }
         }
     }
     if server_overflow {
@@ -346,6 +458,11 @@ mod tests {
 
     /// 19 字段 BaseEvent 通知（与 event.rs 解码单测同构，走真实 decoder）。
     fn base_notification() -> UaEventNotification {
+        base_notification_with(vec![7u8, 7, 7], "runtime event")
+    }
+
+    /// 参数化通知：EventId 字节 + message（P0-1/P0-2 测试用）。
+    fn base_notification_with(id: Vec<u8>, message: &str) -> UaEventNotification {
         use opcua_types::{ByteString, DateTime, LocalizedText, UAString, Variant as V};
         let dt = |ns: i64| {
             V::DateTime(Box::new(DateTime::from(
@@ -353,14 +470,14 @@ mod tests {
             )))
         };
         let mut fields = vec![
-            V::ByteString(ByteString::from(vec![7u8, 7, 7])), // EventId
+            V::ByteString(ByteString::from(id)), // EventId
             V::NodeId(Box::new(opcua_types::NodeId::new(0, 2041u32))), // EventType
             V::NodeId(Box::new(opcua_types::NodeId::new(0, 2253u32))), // SourceNode
-            V::String(UAString::from("MesaFixture")),         // SourceName
-            dt(1_700_000_000_000_000_000),                    // Time
-            dt(1_700_000_000_500_000_000),                    // ReceiveTime
-            V::LocalizedText(Box::new(LocalizedText::new("", "runtime event"))), // Message
-            V::UInt16(321),                                   // Severity
+            V::String(UAString::from("MesaFixture")), // SourceName
+            dt(1_700_000_000_000_000_000),       // Time
+            dt(1_700_000_000_500_000_000),       // ReceiveTime
+            V::LocalizedText(Box::new(LocalizedText::new("", message))), // Message
+            V::UInt16(321),                      // Severity
         ];
         fields.extend(std::iter::repeat_n(V::Empty, 19 - fields.len()));
         UaEventNotification {
@@ -489,5 +606,151 @@ mod tests {
         .expect_err("订阅失败必须上抛");
         assert_eq!(err.code, "OPCUA_EVENT_SUBSCRIBE_FAILED");
         assert!(fake.created_subscriptions().is_empty());
+    }
+
+    /// P0-1：shutdown 立刻到达（worker 可能一条都还没处理）→ 关门 → drain →
+    /// 已接受的 N 条必须 N/N 到达，且退出 Ok（Empty 误判即丢尾，本测试必红）。
+    #[tokio::test]
+    async fn shutdown_drains_all_accepted_notifications() {
+        const N: usize = 8;
+        let notifs = (0..N as u8)
+            .map(|i| base_notification_with(vec![0xA0 + i], "drain me"))
+            .collect();
+        let fake = Arc::new(
+            FakeOpcUaTransport::new()
+                .with_namespace_array(test_namespaces())
+                .with_event_notifications(notifs),
+        );
+        let transport: Arc<dyn OpcUaTransport> = fake.clone();
+        let (sink, mut erx) = test_sink();
+        let shutdown = CancellationToken::new();
+        let worker = tokio::spawn(run_event_task(
+            transport,
+            test_plan(),
+            Arc::new(test_namespaces()),
+            sink,
+            shutdown.clone(),
+        ));
+        // 调度无关：无论 worker 先处理还是先看到 cancel，最终必须 N/N + Ok。
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .expect("worker 必须退出")
+            .expect("worker 不 panic")
+            .expect("drain 后必须 Ok");
+        let mut got = vec![];
+        while got.len() < N {
+            let batch = tokio::time::timeout(std::time::Duration::from_secs(5), erx.recv())
+                .await
+                .expect("N 条必须全部到达")
+                .expect("通道不得关闭");
+            got.extend(batch.events);
+        }
+        assert_eq!(got.len(), N);
+        for (i, r) in got.iter().enumerate() {
+            assert_eq!(r.message.as_deref(), Some("drain me"));
+            let _ = i;
+        }
+        // EventId 互异且保序（队列顺序即注入顺序）。
+        let mut ids: Vec<&str> = got.iter().map(|r| r.event_id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), N);
+        // 清理发生（删监控项 → 删订阅 → 关门）。
+        assert_eq!(fake.deleted_subscriptions().len(), 1);
+    }
+
+    /// P0-2：64 条 × ~4.6 KiB（message 4000B）≈ 300 KiB > 256 KiB 上限 →
+    /// 首 publish 必 TooLarge → 二分成 2 批；32 条全部到达、顺序不变、
+    /// batch sequence 连续（TooLarge 不消耗序号）。
+    #[tokio::test]
+    async fn publish_splits_oversized_batches_preserving_order() {
+        const N: usize = 64;
+        let big = "M".repeat(4000);
+        let notifs = (0..N as u8)
+            .map(|i| base_notification_with(vec![0xB0 + (i >> 4), i & 0x0F], &big))
+            .collect();
+        let fake = Arc::new(
+            FakeOpcUaTransport::new()
+                .with_namespace_array(test_namespaces())
+                .with_event_notifications(notifs),
+        );
+        let transport: Arc<dyn OpcUaTransport> = fake.clone();
+        let (sink, mut erx) = test_sink();
+        let shutdown = CancellationToken::new();
+        let worker = tokio::spawn(run_event_task(
+            transport,
+            test_plan(),
+            Arc::new(test_namespaces()),
+            sink,
+            shutdown.clone(),
+        ));
+        let mut batches = vec![];
+        let mut total = 0usize;
+        while total < N {
+            let batch = tokio::time::timeout(std::time::Duration::from_secs(10), erx.recv())
+                .await
+                .expect("拆分后的批必须全部到达")
+                .expect("通道不得关闭");
+            total += batch.events.len();
+            batches.push(batch);
+        }
+        assert_eq!(total, N);
+        // 300 KiB 首 publish 必超限：恰好 2 批（32+32），sequence 连续。
+        assert_eq!(batches.len(), 2, "必须二分成 2 批，实际 {}", batches.len());
+        assert_eq!(batches[0].events.len(), 32);
+        assert_eq!(batches[1].events.len(), 32);
+        assert_eq!(batches[1].sequence, batches[0].sequence + 1);
+        // 跨批顺序不变（左半先于右半）：event_id 解码回字节，与注入序列
+        // 精确比对（注意：base64 sextet 序 ≠ ASCII 序，字符串比较无意义）。
+        use base64::Engine as _;
+        let all: Vec<&mesa_core_types::EventRecord> =
+            batches.iter().flat_map(|b| &b.events).collect();
+        let all_bytes: Vec<Vec<u8>> = all
+            .iter()
+            .map(|r| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(r.event_id.strip_prefix("opcua:").unwrap())
+                    .unwrap()
+            })
+            .collect();
+        let expect: Vec<Vec<u8>> = (0..N as u8)
+            .map(|i| vec![0xB0 + (i >> 4), i & 0x0F])
+            .collect();
+        assert_eq!(all_bytes, expect);
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .expect("worker 必须退出")
+            .expect("worker 不 panic")
+            .expect("必须 Ok");
+    }
+
+    /// P0-3：select 全 Good 但 where OfType 被拒 → FILTER_REJECTED + 回滚删订阅。
+    #[tokio::test]
+    async fn event_task_where_rejected_fails_and_rolls_back() {
+        use opcua_types::StatusCode;
+        let fake = Arc::new(
+            FakeOpcUaTransport::new()
+                .with_namespace_array(test_namespaces())
+                .with_event_where_statuses(
+                    &UaNodeRef::numeric(0, 2253),
+                    vec![StatusCode::BadFilterOperatorUnsupported],
+                ),
+        );
+        let transport: Arc<dyn OpcUaTransport> = fake.clone();
+        let (sink, _erx) = test_sink();
+        let err = run_event_task(
+            transport,
+            test_plan(),
+            Arc::new(test_namespaces()),
+            sink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("where 被拒必须失败");
+        assert_eq!(err.code, "OPCUA_EVENT_FILTER_REJECTED");
+        assert_eq!(fake.created_subscriptions().len(), 1);
+        assert_eq!(fake.deleted_subscriptions(), fake.created_subscriptions());
     }
 }

@@ -240,28 +240,34 @@ pub(crate) async fn forwarder_loop(
 
 /// Event callback 同步桥（§5）：与 Data `SlotState::push` 同一入口层级，
 /// 供 `EventCallback` 闭包与单测直接驱动。只允许同步操作：
-/// 计数 → try_send → Full/None 时 fatal。禁止解码/IO/await/spawn。
+/// 门检查 → 计数 → try_send → Full 时 fatal。禁止解码/IO/await/spawn。
+/// P0-1：发送经 producer 共享态（门 + 发送端同锁），关门后静默丢弃
+/// （Stop 后的 emission 本来就不该再进通道）。
 pub(crate) fn push_event_notification(
-    tx: &tokio::sync::mpsc::Sender<crate::event::UaEventNotification>,
+    producer: &crate::event::EventProducerShared,
     fatal_tx: &tokio::sync::watch::Sender<Option<crate::event::UaEventStreamFatal>>,
     stats: &crate::event::EventSubscriptionStats,
     client_handle: u32,
     fields: Option<Vec<opcua_types::Variant>>,
 ) {
-    use crate::event::UaEventStreamFatal;
+    use crate::event::{ProducerSend, UaEventStreamFatal};
     use std::sync::atomic::Ordering;
+    if !producer.is_open() {
+        // Stop 后到达：静默丢弃，不计数、不 fatal。
+        return;
+    }
     stats.events_received.fetch_add(1, Ordering::Relaxed);
     let Some(fields) = fields else {
         // 无字段的通知无法按位置解码：契约已破坏，直接宣布流不可信。
         fatal_tx.send_replace(Some(UaEventStreamFatal::MalformedNotification));
         return;
     };
-    match tx.try_send(crate::event::UaEventNotification {
+    match producer.try_send(crate::event::UaEventNotification {
         client_handle,
         fields,
     }) {
-        Ok(()) => {}
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+        ProducerSend::Sent => {}
+        ProducerSend::Full => {
             stats
                 .callback_queue_overflow
                 .fetch_add(1, Ordering::Relaxed);
@@ -269,8 +275,8 @@ pub(crate) fn push_event_notification(
             // 由上层 fail 当前 attempt（Manager 重连开新 epoch）。
             fatal_tx.send_replace(Some(UaEventStreamFatal::CallbackQueueOverflow));
         }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            // receiver 已释放 = teardown 进行中，静默丢弃。
+        ProducerSend::Closed => {
+            // 关门/摘除竞态下落空 = teardown 进行中，静默丢弃。
         }
     }
 }
@@ -284,6 +290,10 @@ pub struct NativeOpcUaTransport {
     options: OpcUaConnectOptions,
     inner: Arc<AsyncMutex<Option<NativeInner>>>,
     forwarders: Arc<AsyncMutex<HashMap<UaSubscriptionId, tokio::task::JoinHandle<()>>>>,
+    /// P0-1：Event producer 本地门（sub_id → 共享态）。delete_subscription 先关门
+    /// 再调服务端 RPC；driver shutdown 显式 close_producer 后 drain 到 None。
+    event_producers:
+        Arc<AsyncMutex<HashMap<UaSubscriptionId, Arc<crate::event::EventProducerShared>>>>,
 }
 
 impl NativeOpcUaTransport {
@@ -292,6 +302,7 @@ impl NativeOpcUaTransport {
             options,
             inner: Arc::new(AsyncMutex::new(None)),
             forwarders: Arc::new(AsyncMutex::new(HashMap::new())),
+            event_producers: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
@@ -849,6 +860,11 @@ impl OpcUaTransport for NativeOpcUaTransport {
     }
 
     async fn delete_subscription(&self, id: UaSubscriptionId) -> Result<(), UaTransportError> {
+        // P0-1：本地 producer 门先关（无论服务端 RPC 成败，callback 此后不再
+        // send；driver drain-to-None 的终止性依赖于此）。
+        if let Some(p) = self.event_producers.lock().await.remove(&id) {
+            p.close();
+        }
         let session = {
             let guard = self.inner.lock().await;
             guard.as_ref().and_then(|i| i.session.clone())
@@ -898,9 +914,18 @@ impl OpcUaTransport for NativeOpcUaTransport {
         let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CALLBACK_QUEUE_CAPACITY);
         let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
         let cb_stats = stats.clone();
+        // P0-1：callback 经 producer 共享态发送（门 + 发送端同锁）；关门后静默丢弃。
+        let producer = crate::event::EventProducerShared::new(tx);
+        let cb_producer = Arc::clone(&producer);
         let callback = EventCallback::new(
             move |fields: Option<Vec<opcua_types::Variant>>, item: &opcua_client::MonitoredItem| {
-                push_event_notification(&tx, &fatal_tx, &cb_stats, item.client_handle(), fields);
+                push_event_notification(
+                    &cb_producer,
+                    &fatal_tx,
+                    &cb_stats,
+                    item.client_handle(),
+                    fields,
+                );
             },
         );
         // P1-B6 同理：请求间隔原样上送，Server revised 为准。
@@ -930,6 +955,8 @@ impl OpcUaTransport for NativeOpcUaTransport {
             })
         };
         let Some((revised_pub_ms, revised_lifetime, revised_keep_alive)) = revised else {
+            // 本地门同样关闭（callback 不再 send，sender 摘除），再走服务端回滚。
+            producer.close();
             if let Err(cleanup) = self.delete_subscription_rpc(&session, sub_id).await {
                 tracing::debug!(
                     sub_id,
@@ -946,6 +973,11 @@ impl OpcUaTransport for NativeOpcUaTransport {
         };
         // NOTE: Event 路径不 spawn forwarder task——receiver 直达调用方（Driver
         // runtime），无 slot 中转；cleanup 只需服务端 delete（幂等），无本地 task 可泄漏。
+        // producer 门登记在册：delete_subscription 先关门，driver 显式 close 幂等。
+        self.event_producers
+            .lock()
+            .await
+            .insert(sub_id, Arc::clone(&producer));
         Ok(crate::event::UaEventSubscription {
             id: sub_id,
             requested_publishing_interval_ms: spec.publishing_interval_ms,
@@ -955,6 +987,7 @@ impl OpcUaTransport for NativeOpcUaTransport {
             receiver: rx,
             fatal: fatal_rx,
             stats,
+            producer,
         })
     }
 
@@ -997,13 +1030,15 @@ impl OpcUaTransport for NativeOpcUaTransport {
             let r = &c.result;
             // 单项 BAD 不整体 Err（调用方回滚）；Good 项的 filter_result 必须可解码，
             // 否则是协议违约（fail-closed，整包 Err）。
-            let clause_statuses = if r.status_code.is_good() {
-                decode_event_filter_result(&r.filter_result, spec.filter.select_clauses.len())?
-                    .iter()
-                    .map(|s| s.bits())
-                    .collect()
+            let (select_clause_statuses, where_clause_statuses) = if r.status_code.is_good() {
+                let decoded =
+                    decode_event_filter_result(&r.filter_result, spec.filter.select_clauses.len())?;
+                (
+                    decoded.select.iter().map(|s| s.bits()).collect(),
+                    decoded.where_element.iter().map(|s| s.bits()).collect(),
+                )
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
             out.push(crate::event::UaEventMonitoredItemResult {
                 client_handle: spec.client_handle,
@@ -1015,7 +1050,8 @@ impl OpcUaTransport for NativeOpcUaTransport {
                 status_code: r.status_code.bits(),
                 requested_queue_size: spec.queue_size,
                 revised_queue_size: r.revised_queue_size,
-                select_clause_statuses: clause_statuses,
+                select_clause_statuses,
+                where_clause_statuses,
             });
         }
         Ok(out)
@@ -1191,7 +1227,7 @@ mod tests {
     // 单测脚手架：复杂元组类型仅测试用，允许。
     #[allow(clippy::type_complexity)]
     fn event_bridge() -> (
-        tokio::sync::mpsc::Sender<crate::event::UaEventNotification>,
+        Arc<crate::event::EventProducerShared>,
         tokio::sync::mpsc::Receiver<crate::event::UaEventNotification>,
         tokio::sync::watch::Sender<Option<crate::event::UaEventStreamFatal>>,
         tokio::sync::watch::Receiver<Option<crate::event::UaEventStreamFatal>>,
@@ -1200,7 +1236,13 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(crate::event::EVENT_CALLBACK_QUEUE_CAPACITY);
         let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
         let stats = Arc::new(crate::event::EventSubscriptionStats::default());
-        (tx, rx, fatal_tx, fatal_rx, stats)
+        (
+            crate::event::EventProducerShared::new(tx),
+            rx,
+            fatal_tx,
+            fatal_rx,
+            stats,
+        )
     }
 
     fn ev_fields(n: i32) -> Option<Vec<opcua_types::Variant>> {
@@ -1267,11 +1309,29 @@ mod tests {
 
     #[test]
     fn event_bridge_closed_receiver_is_silent() {
-        let (tx, rx, fatal_tx, fatal_rx, _stats) = event_bridge();
+        let (producer, rx, fatal_tx, fatal_rx, _stats) = event_bridge();
         drop(rx);
         let stats = Arc::new(crate::event::EventSubscriptionStats::default());
-        push_event_notification(&tx, &fatal_tx, &stats, 3, ev_fields(1));
+        push_event_notification(&producer, &fatal_tx, &stats, 3, ev_fields(1));
         // teardown 进行中：静默丢弃，不报 fatal。
         assert_eq!(*fatal_rx.borrow(), None);
+    }
+
+    #[tokio::test]
+    async fn event_producer_close_is_idempotent_and_ends_stream() {
+        // P0-1：关门后 callback 静默丢弃（不计数、不 fatal）；关门前已接受项
+        // 保留；发送端摘除后 `recv() == None`（drain-to-None 可终止）。
+        let (producer, mut rx, fatal_tx, fatal_rx, stats) = event_bridge();
+        push_event_notification(&producer, &fatal_tx, &stats, 3, ev_fields(1));
+        producer.close();
+        producer.close(); // 幂等
+        push_event_notification(&producer, &fatal_tx, &stats, 3, ev_fields(2));
+        assert_eq!(*fatal_rx.borrow(), None);
+        assert_eq!(stats.events_received(), 1);
+        let n = rx.recv().await.expect("关门前已接受项必须保留");
+        assert_eq!(n.fields, vec![opcua_types::Variant::Int32(1)]);
+        // 发送端已在 close 时摘除：无残留 sender，drain 终止性成立。
+        assert!(rx.recv().await.is_none());
+        drop(producer);
     }
 }

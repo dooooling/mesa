@@ -8,7 +8,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use opcua_types::{
@@ -136,12 +136,21 @@ pub fn build_event_monitored_item_request(
 
 /// 服务端 `filter_result` 解码与校验：必须是 `EventFilterResult`，且
 /// select clause 结果数严格等于请求数（数量不变式，§26）；逐 clause 的
-/// Good 与否由调用方按策略判定（核心 BaseEvent clauses 必须全 Good），
-/// 本函数只原样返回状态码数组。
+/// Good 与否由调用方按策略判定（19 个必须全 Good），本函数只原样返回
+/// 状态码数组。P0-3：where 部分不再忽略——`where_element` 原样返回，
+/// 调用方按 scope 判定（all：无 BAD；conditions：恰一个 OfType 且 Good）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedEventFilterResult {
+    /// 逐 select clause 状态码，顺序对应请求（数量已校验）。
+    pub select: Vec<StatusCode>,
+    /// 逐 where element 状态码（空 where 即空数组）。
+    pub where_element: Vec<StatusCode>,
+}
+
 pub fn decode_event_filter_result(
     filter_result: &ExtensionObject,
     expected_clauses: usize,
-) -> Result<Vec<StatusCode>, UaTransportError> {
+) -> Result<DecodedEventFilterResult, UaTransportError> {
     let r = filter_result
         .inner_as::<EventFilterResult>()
         .ok_or_else(|| {
@@ -150,7 +159,7 @@ pub fn decode_event_filter_result(
                 "监控项 filter_result 非 EventFilterResult",
             )
         })?;
-    let codes = r.select_clause_results.clone().ok_or_else(|| {
+    let select = r.select_clause_results.clone().ok_or_else(|| {
         UaTransportError::protocol(
             UaOperation::CreateEventMonitoredItems,
             "EventFilterResult 缺少 select_clause_results",
@@ -160,9 +169,20 @@ pub fn decode_event_filter_result(
         UaOperation::CreateEventMonitoredItems,
         "EventFilter select 结果",
         expected_clauses,
-        codes.len(),
+        select.len(),
     )?;
-    Ok(codes)
+    let where_element = r
+        .where_clause_result
+        .element_results
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.status_code)
+        .collect();
+    Ok(DecodedEventFilterResult {
+        select,
+        where_element,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +246,71 @@ pub struct UaEventSubscription {
     /// 完整性破坏信号：`Some` 即当前 attempt 已不可信，调用方必须 fail。
     pub fatal: tokio::sync::watch::Receiver<Option<UaEventStreamFatal>>,
     pub stats: Arc<EventSubscriptionStats>,
+    pub(crate) producer: Arc<EventProducerShared>,
+}
+
+impl UaEventSubscription {
+    /// 本地 producer-close barrier（P0-1）：关门 + 摘除发送端。此后任何
+    /// callback 都无法再 publish；receiver 保持 OPEN，调用方 drain 到
+    /// sender CLOSED（`recv() == None`）即证明"已接受的 occurrence 已全部
+    /// 交出"。幂等，可重入。
+    pub fn close_producer(&self) {
+        self.producer.close();
+    }
+}
+
+/// Event producer 共享态（callback 与 close 的互斥点）：门 + 发送端二合一，
+/// 同一把小锁下判定，保证"关门后无新 send、先发的不丢"（drain 到 None 时
+/// 通道内即全部已接受项）。同步 callback 内只做 lock + try_send，不 await。
+#[derive(Debug, Default)]
+pub(crate) struct EventProducerShared {
+    open: AtomicBool,
+    tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<UaEventNotification>>>,
+}
+
+/// `try_send` 结果（调用方映射到统计/fatal/静默丢弃）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProducerSend {
+    /// 已入队。
+    Sent,
+    /// 队列满（调用方必须 fatal，绝不 drop-oldest）。
+    Full,
+    /// 门已关或发送端已摘除（Stop 后的 emission，静默丢弃即正确）。
+    Closed,
+}
+
+impl EventProducerShared {
+    pub(crate) fn new(tx: tokio::sync::mpsc::Sender<UaEventNotification>) -> Arc<Self> {
+        Arc::new(Self {
+            open: AtomicBool::new(true),
+            tx: std::sync::Mutex::new(Some(tx)),
+        })
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.open.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn try_send(&self, n: UaEventNotification) -> ProducerSend {
+        if !self.open.load(Ordering::SeqCst) {
+            return ProducerSend::Closed;
+        }
+        let guard = self.tx.lock().expect("producer 锁不中毒");
+        match guard.as_ref() {
+            None => ProducerSend::Closed,
+            Some(tx) => match tx.try_send(n) {
+                Ok(()) => ProducerSend::Sent,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => ProducerSend::Full,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => ProducerSend::Closed,
+            },
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        self.open.store(false, Ordering::SeqCst);
+        // 摘除发送端：通道关闭（已入队项保留），drain 到 None 即可终止。
+        self.tx.lock().expect("producer 锁不中毒").take();
+    }
 }
 
 /// 事件监控项创建结果（逐项 status + revised queue + clause 级状态）。
@@ -238,6 +323,8 @@ pub struct UaEventMonitoredItemResult {
     pub revised_queue_size: u32,
     /// 逐 clause 状态码（bits），顺序对应 `filter.select_clauses`。
     pub select_clause_statuses: Vec<u32>,
+    /// 逐 where element 状态码（bits）；空 where 即空数组（P0-3：不再忽略）。
+    pub where_clause_statuses: Vec<u32>,
 }
 
 #[cfg(test)]
@@ -319,18 +406,35 @@ mod tests {
 
     #[test]
     fn filter_result_validates_cardinality() {
-        use opcua_types::StatusCode;
+        use opcua_types::{ContentFilterElementResult, ContentFilterResult, StatusCode};
         let good = ExtensionObject::from_message(EventFilterResult {
             select_clause_results: Some(vec![StatusCode::Good, StatusCode::Good]),
             select_clause_diagnostic_infos: None,
-            where_clause_result: Default::default(),
+            where_clause_result: ContentFilterResult {
+                element_results: Some(vec![ContentFilterElementResult {
+                    status_code: StatusCode::Good,
+                    operand_status_codes: None,
+                    operand_diagnostic_infos: None,
+                }]),
+                element_diagnostic_infos: None,
+            },
         });
-        let codes = decode_event_filter_result(&good, 2).unwrap();
-        assert!(codes.iter().all(|c| c.is_good()));
+        let decoded = decode_event_filter_result(&good, 2).unwrap();
+        assert!(decoded.select.iter().all(|c| c.is_good()));
+        // P0-3：where element 结果原样返回（调用方按 scope 判定）。
+        assert_eq!(decoded.where_element, vec![StatusCode::Good]);
         // 数量对不上即违约
         assert!(decode_event_filter_result(&good, 3).is_err());
         // 非 EventFilterResult 即协议错误
         assert!(decode_event_filter_result(&ExtensionObject::null(), 0).is_err());
+        // 空 where 即空数组（scope=all 形态）
+        let no_where = ExtensionObject::from_message(EventFilterResult {
+            select_clause_results: Some(vec![StatusCode::Good]),
+            select_clause_diagnostic_infos: None,
+            where_clause_result: Default::default(),
+        });
+        let decoded = decode_event_filter_result(&no_where, 1).unwrap();
+        assert!(decoded.where_element.is_empty());
     }
 
     #[test]

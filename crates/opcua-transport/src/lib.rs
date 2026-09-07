@@ -25,10 +25,10 @@ pub mod types;
 
 pub use error::{UaOperation, UaTransportError, UaTransportErrorKind, map_service_error};
 pub use event::{
-    EVENT_CALLBACK_QUEUE_CAPACITY, EventSubscriptionStats, UaEventFilterSpec,
-    UaEventMonitoredItemResult, UaEventMonitoredItemSpec, UaEventNotification, UaEventSelectClause,
-    UaEventStreamFatal, UaEventSubscription, UaQualifiedNameRef, build_event_filter,
-    build_event_monitored_item_request, decode_event_filter_result,
+    DecodedEventFilterResult, EVENT_CALLBACK_QUEUE_CAPACITY, EventSubscriptionStats,
+    UaEventFilterSpec, UaEventMonitoredItemResult, UaEventMonitoredItemSpec, UaEventNotification,
+    UaEventSelectClause, UaEventStreamFatal, UaEventSubscription, UaQualifiedNameRef,
+    build_event_filter, build_event_monitored_item_request, decode_event_filter_result,
 };
 pub use fake::{FakeLiveBatch, FakeOpcUaTransport, fake_browse_node};
 pub use native::{DEFAULT_OPCUA_PORT, NativeOpcUaTransport};
