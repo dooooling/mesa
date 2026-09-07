@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use mesa_core_types::{EventBatch, EventCondition, EventRecord, Value};
@@ -121,12 +122,21 @@ pub fn event_batch(
 // store 直写 helpers（绕过 driver/manager，直达唯一写 API）
 // ---------------------------------------------------------------------------
 
+/// 进程内唯一临时 DB 路径：pid + wall clock + 原子 nonce。
+/// nonce 是必须的——同进程并行测试可能拿到相同的 `now_unix_ns()`
+///（Windows 时钟分辨率/调度），仅靠时间会撞名共用同一个 DB 文件，
+/// 在 open/PRAGMA 初始化时以 SQLITE_BUSY 偶发失败。不要用 busy_timeout
+/// 掩盖：两个测试本就不该共享同一个 DB。
+static NEXT_TMP_DB: AtomicU64 = AtomicU64::new(1);
+
 pub fn tmp_db(tag: &str) -> std::path::PathBuf {
+    let nonce = NEXT_TMP_DB.fetch_add(1, Ordering::Relaxed);
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "mesa-event-harden-{}-{}-{tag}.db",
+        "mesa-event-harden-{}-{}-{}-{tag}.db",
         std::process::id(),
-        mesa_core_types::now_unix_ns()
+        mesa_core_types::now_unix_ns(),
+        nonce,
     ));
     p
 }

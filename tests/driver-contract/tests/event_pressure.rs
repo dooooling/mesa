@@ -128,7 +128,7 @@ async fn sim_counter_burst_all_persisted_in_order() {
     rig.stop().await;
 }
 
-/// 数据负载下事件不饿死：20 点 @10ms 数据洪流 + 100/s 事件，8s 后事件
+/// 数据负载下事件不饿死：20 点 @10ms 数据洪流 + 20/s 事件，10s 后事件
 /// 依然连续落盘，endpoint 健康停止（无 Lost、无 fail-closed）。
 #[tokio::test]
 async fn data_load_does_not_starve_events() {

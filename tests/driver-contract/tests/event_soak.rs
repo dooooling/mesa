@@ -63,6 +63,12 @@ async fn steady_state_soak(tag: &str, secs: u64, min_rows: usize) {
     tokio::time::sleep(Duration::from_secs(secs)).await;
     assert!(mgr.is_running(&ep), "soak 全程 endpoint 必须存活");
 
+    // 先 Stop 再做 final snapshot：stop barrier 排空后状态冻结，
+    // rows 与 diagnostics 处于同一静止时刻，exact 对账才有意义
+    //（运行中先读 rows 再读 diagnostics，中间 commit 一条就会 ±1）。
+    // 这比旧顺序更强：barrier 尾部接收的 events 同样进入最终 invariant。
+    assert_eq!(mgr.stop_endpoint(&ep).await, Ok(true));
+
     // 长期无损：n 连续
     let rows = rows_of(&store, &ep);
     assert!(
@@ -112,7 +118,6 @@ async fn steady_state_soak(tag: &str, secs: u64, min_rows: usize) {
         d.ingress_persisted_events_total.load(Ordering::Relaxed),
         rows.len() as u64
     );
-    assert_eq!(mgr.stop_endpoint(&ep).await, Ok(true));
     let _ = std::fs::remove_file(&db);
 }
 
