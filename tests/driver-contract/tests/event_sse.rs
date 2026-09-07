@@ -296,6 +296,58 @@ async fn sse_replay_then_live_no_duplicates() {
     let _ = std::fs::remove_file(&db);
 }
 
+/// 消费者 kill → 重连恢复（PR10 commit 6 §12）：断线期间提交的行经 DB
+/// replay 精确补齐（无重复、无遗漏），之后 live 续上。hub 无订阅者时在途
+/// 通知可丢——恢复的唯一真相是 DB + Last-Event-ID 游标。
+#[tokio::test]
+async fn sse_consumer_kill_reconnects_with_last_event_id() {
+    common::init_log();
+    let db = tmp_db("kill");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(EventStore::open(&db).unwrap());
+    let hub = EventHub::new(EVENT_HUB_CAPACITY);
+    let mut seqs = Vec::new();
+    for i in 0..3 {
+        seqs.push(commit(&store, &hub, "ep", &format!("k-{i}"), i, (i + 1) as u64).await);
+    }
+    let _srv = serve(store.clone(), hub.clone()).await;
+
+    // 首连：after_seq=0 回放全部 3 行，记住末帧游标
+    let (status, mut cli) =
+        SseClient::connect(_srv.port, "/api/v1/events/live?after_seq=0", &[]).await;
+    assert_eq!(status, 200);
+    let mut last = 0i64;
+    for expect in &seqs {
+        let f = cli.next_frame_timeout(5).await;
+        assert_eq!(f.id.as_deref(), Some(expect.to_string()).as_deref());
+        last = expect.to_string().parse().unwrap();
+    }
+    // kill 消费者（drop 即关连接），断线期间提交 3 行（hub 无人听）
+    drop(cli);
+    let mut missed = Vec::new();
+    for i in 3..6 {
+        missed.push(commit(&store, &hub, "ep", &format!("k-{i}"), i, (i + 1) as u64).await);
+    }
+    // 重连带 Last-Event-ID：必须精确补齐断线 3 行（不多不少），随后 live 续上
+    let (status, mut cli2) = SseClient::connect(
+        _srv.port,
+        "/api/v1/events/live",
+        &[("Last-Event-ID", &last.to_string())],
+    )
+    .await;
+    assert_eq!(status, 200);
+    for expect in &missed {
+        let f = cli2.next_frame_timeout(5).await;
+        assert_eq!(f.id.as_deref(), Some(expect.to_string()).as_deref());
+        let v: serde_json::Value = serde_json::from_str(&f.data).unwrap();
+        assert!(v["event"]["event_id"].as_str().unwrap().starts_with("k-"));
+    }
+    let s7 = commit(&store, &hub, "ep", "k-6", 6, 7).await;
+    let f = cli2.next_frame_timeout(5).await;
+    assert_eq!(f.id.as_deref(), Some(s7.to_string()).as_deref());
+    let _ = std::fs::remove_file(&db);
+}
+
 /// 游标合并：max(query.after_seq, Last-Event-ID)；非法 header 400。
 #[tokio::test]
 async fn sse_cursor_max_rule_and_bad_header() {
