@@ -220,6 +220,8 @@ pub trait EventTestSource {
     /// replay 可观测性的唯一真相来源（DB exact-set 区分不了"收到并去重"
     /// 与"中途丢失"，计数器可以）。
     fn diagnostics(&self) -> (u64, u64);
+    /// store 失败计数（ingress_store_failures_total）：fault-injection 门用。
+    fn store_failures(&self) -> u64;
 }
 
 /// 等待诊断增量达标：persisted 精确（多一行都是 exact-set 联动失败），
@@ -283,6 +285,26 @@ fn sim_alarm_task() -> mesa_core_types::EventTask {
     }
 }
 
+impl SimulatorEventSource {
+    /// 挂接到调用方自建的 manager/store（fault-injection 等需共享 Store 时用）。
+    pub fn attach(
+        endpoint_id: &str,
+        mgr: Arc<mesa_driver_manager::MesaManager>,
+        store: Arc<EventStore>,
+        services: Arc<mesa_event_store::EventServices>,
+        db: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            endpoint_id: endpoint_id.into(),
+            mgr,
+            store,
+            services,
+            db,
+            running: false,
+        }
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl EventTestSource for SimulatorEventSource {
     async fn start(endpoint_id: &str) -> Self {
@@ -297,14 +319,7 @@ impl EventTestSource for SimulatorEventSource {
             mesa_event_store::EventHub::new(mesa_event_store::EVENT_HUB_CAPACITY),
         );
         mgr.set_event_services(std::sync::Arc::clone(&services));
-        Self {
-            endpoint_id: endpoint_id.into(),
-            mgr,
-            store,
-            services,
-            db,
-            running: false,
-        }
+        Self::attach(endpoint_id, mgr, store, services, db)
     }
 
     async fn start_endpoint(&mut self) {
@@ -365,6 +380,14 @@ impl EventTestSource for SimulatorEventSource {
             d.ingress_persisted_events_total.load(Ordering::Relaxed),
             d.ingress_event_duplicates_total.load(Ordering::Relaxed),
         )
+    }
+
+    fn store_failures(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.services
+            .diagnostics
+            .ingress_store_failures_total
+            .load(Ordering::Relaxed)
     }
 }
 
@@ -562,5 +585,13 @@ impl EventTestSource for OpcUaEventSource {
             d.ingress_persisted_events_total.load(Ordering::Relaxed),
             d.ingress_event_duplicates_total.load(Ordering::Relaxed),
         )
+    }
+
+    fn store_failures(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.services
+            .diagnostics
+            .ingress_store_failures_total
+            .load(Ordering::Relaxed)
     }
 }

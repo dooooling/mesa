@@ -1326,6 +1326,7 @@ dependencies = [
  "mesa-driver-sdk",
  "mesa-driver-simulator",
  "mesa-event-store",
+ "rusqlite",
  "serde_json",
  "tokio",
  "tokio-util",

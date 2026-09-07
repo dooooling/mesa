@@ -36,3 +36,7 @@ async-opcua-types = "0.19"
 
 # NOTE: Contract 基线（§21 全部 20 项 + V2.1 扩展）共 14 suites，见 tests/；
 # Simulator 已第一个全过，S7/FOCAS2/OPC UA 不得绕过或裁剪该基线。
+
+# PR10 fault-injection：busy 锁测试需直连 SQLite（仅测试用）。
+[dev-dependencies]
+rusqlite = { workspace = true }

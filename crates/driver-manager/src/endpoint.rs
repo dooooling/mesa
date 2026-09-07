@@ -728,6 +728,13 @@ async fn event_loop(
                     }
                 }
             } => {
+                // PR10 fault-injection 暴露：本分支返回意味着 handle 的 output
+                // 已被取走；必须 take 出来，否则 teardown 的 shutdown_ingress
+                // 复 poll 已完成 handle 会 panic（"JoinHandle polled after
+                // completion"），直接杀死 endpoint task 使 Lost 重连失效。
+                // 结论已在 res 里（下转为 Lost 原因 + 诊断计数），teardown
+                // 收到 None 即无 dead-handle 可 drain，语义完整。
+                let _ = ingress.take();
                 return match res {
                     Ok(Ok(_stats)) => AttemptOutcome::Lost {
                         // ingress 正常返回理论不可达（无限循环直到 fatal/流关闭）；

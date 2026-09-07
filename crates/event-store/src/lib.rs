@@ -17,7 +17,7 @@ pub use hub::{EVENT_HUB_CAPACITY, EventHub};
 pub use query::{EventFilter, max_seq, query_by_seq, query_history, query_range_asc};
 pub use retention::RetentionConfig;
 pub use schema::{EVENT_SCHEMA_VERSION, StoredEvent, transition_str};
-pub use writer::{CommitRequest, CommitResult, EventStoreStats};
+pub use writer::{CommitRequest, CommitResult, EventStoreStats, StoreFaults};
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -290,7 +290,11 @@ pub struct EventStore {
 }
 
 impl EventStore {
-    fn spawn(path: Option<std::path::PathBuf>, in_memory: bool) -> Result<Self, EventStoreError> {
+    fn spawn(
+        path: Option<std::path::PathBuf>,
+        in_memory: bool,
+        faults: std::sync::Arc<writer::StoreFaults>,
+    ) -> Result<Self, EventStoreError> {
         // 内存库 URI 必须实例唯一：`cache=shared` 按名称共享，同名即同库——
         // 并行单测若同名会互相污染 UNIQUE 约束。
         static MEM_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -347,7 +351,7 @@ impl EventStore {
         let (tx, rx) = tokio::sync::mpsc::channel(writer::WRITER_QUEUE);
         let join = std::thread::Builder::new()
             .name("event-store-writer".into())
-            .spawn(move || writer::writer_loop(write_conn, rx))
+            .spawn(move || writer::writer_loop(write_conn, rx, faults))
             .map_err(|e| EventStoreError::Unavailable(format!("spawn writer: {e}")))?;
         Ok(Self {
             writer_tx: tx,
@@ -358,12 +362,29 @@ impl EventStore {
 
     /// 打开（不存在则创建）文件库。
     pub fn open(path: &Path) -> Result<Self, EventStoreError> {
-        Self::spawn(Some(path.to_path_buf()), false)
+        Self::spawn(
+            Some(path.to_path_buf()),
+            false,
+            std::sync::Arc::new(writer::StoreFaults::default()),
+        )
+    }
+
+    /// 带故障注入的文件库（PR10 hardening 测试专用；生产永远用 `open`）。
+    /// 返回的 `Arc<StoreFaults>` 句柄可在测试中运行时切换故障开关。
+    pub fn open_with_faults(
+        path: &Path,
+        faults: std::sync::Arc<writer::StoreFaults>,
+    ) -> Result<Self, EventStoreError> {
+        Self::spawn(Some(path.to_path_buf()), false, faults)
     }
 
     /// 内存库（单测用；读写共享 `cache=shared` 同一底层）。
     pub fn open_in_memory() -> Result<Self, EventStoreError> {
-        Self::spawn(None, true)
+        Self::spawn(
+            None,
+            true,
+            std::sync::Arc::new(writer::StoreFaults::default()),
+        )
     }
 
     /// 提交一批（整批一事务）。`received_at_ns` 由调用方（EventIngress）
