@@ -22,11 +22,18 @@
 //! - SourceTimestamp 1601 ticks→Unix ns 精确保留，Quality GOOD/UNCERTAIN/BAD 按 StatusCode 映射，Array→Typed Array
 
 mod address;
+mod event;
+mod event_runtime;
 mod opcua_api;
 mod probe;
 mod transport_adapter;
 
 pub use address::{AddressError, Identifier, OpcUaAddress, parse_address};
+pub use event::{
+    DecodedEvent, EventDecodeContext, EventScope, OPCUA_EVENT_STREAM_ID, OpcUaEventPlanSnapshot,
+    OpcUaEventTaskPlan, STANDARD_EVENT_FIELD_COUNT, STANDARD_EVENT_FIELDS, StandardEventClause,
+    StandardEventField, canonical_node_id, decode_event_fields, standard_event_clauses,
+};
 pub use mesa_opcua_transport::DEFAULT_OPCUA_PORT;
 pub use opcua_api::{FakeOpcUaApi, OpcUaApi};
 pub use transport_adapter::TransportApiAdapter;
@@ -183,10 +190,11 @@ impl Driver for OpcUaDriver {
                 poll: true,
                 subscribe: true,
                 browse: true,
+                events: true,
                 ..Default::default()
             },
-            // Event Plane PR5：老 Driver 无事件目录即 empty（Major 不升级）
-            events: Default::default(),
+            // PR9：声明唯一 subscribe-only 事件流 `opcua.events`（Stage ③）。
+            events: event::opcua_event_catalog(),
         }
     }
 
@@ -236,6 +244,7 @@ impl Driver for OpcUaDriver {
             api,
             transport,
             plan: None,
+            event_plan: None,
         }))
     }
 }
@@ -450,6 +459,9 @@ struct OpcUaConnection {
     /// 两处共享同一 Arc），绝不为探测另建第二会话。
     transport: Arc<dyn mesa_opcua_transport::OpcUaTransport>,
     plan: Option<PlanSnapshot>,
+    /// 事件计划快照（Stage ③）：`configure_events` 原子替换，供 run() 启动
+    /// Event workers；空表/None = 无事件订阅。
+    event_plan: Option<OpcUaEventPlanSnapshot>,
 }
 
 impl std::fmt::Debug for OpcUaConnection {
@@ -532,7 +544,7 @@ fn coerce_value(v: Value, dt: DataType) -> Value {
 }
 
 /// OPC UA DateTime ticks (1601-01-01, 100ns) → Unix ns（§7.3 精确保留）
-fn ticks_to_unix_ns(ticks: i64) -> i64 {
+pub(crate) fn ticks_to_unix_ns(ticks: i64) -> i64 {
     const TICKS_PER_SEC: i64 = 10_000_000;
     const UNIX_TICKS_OFFSET: i64 = 11644473600 * TICKS_PER_SEC;
     (ticks - UNIX_TICKS_OFFSET) * 100
@@ -1068,6 +1080,22 @@ impl DriverConnection for OpcUaConnection {
         Ok(())
     }
 
+    /// 事件任务配置（PR9 Stage ③）：只接受 `mesa.events.v1` 标准 binding；
+    /// 全部解析成功才原子替换旧计划（Stage ⑤ run() 按快照起 Event workers）。
+    async fn configure_events(
+        &mut self,
+        revision: u64,
+        tasks: Vec<mesa_core_types::EventTask>,
+    ) -> Result<(), SdkDriverError> {
+        let plans = event::parse_event_tasks(&tasks)?;
+        tracing::info!(revision, tasks = plans.len(), "opcua event plan built");
+        self.event_plan = Some(OpcUaEventPlanSnapshot {
+            revision,
+            tasks: plans,
+        });
+        Ok(())
+    }
+
     async fn browse(
         &mut self,
         parent: &str,
@@ -1141,20 +1169,39 @@ impl DriverConnection for OpcUaConnection {
         sink: DataSink,
         shutdown: CancellationToken,
     ) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_ref().ok_or_else(|| {
-            SdkDriverError::new(
-                mesa_core_types::ErrorKind::Internal,
-                "NO_PLAN",
-                "run 前未 configure+apply",
-            )
-        })?;
-        let map = snap.map.as_ref().ok_or_else(|| {
-            SdkDriverError::new(
-                mesa_core_types::ErrorKind::Internal,
-                "NO_POINT_MAP",
-                "run 前未 apply_point_map",
-            )
-        })?;
+        // §18：一等 Event-only——Data 计划缺席/空表不再是错误；PointMap 只在
+        // 有 Data 任务时要求。Event-only 端点无需任何 Data point 即可 Start。
+        let has_data_tasks = self
+            .plan
+            .as_ref()
+            .map(|s| !s.tasks.is_empty())
+            .unwrap_or(false);
+        let data_plan = if has_data_tasks {
+            Some(self.plan.as_ref().ok_or_else(|| {
+                SdkDriverError::new(
+                    mesa_core_types::ErrorKind::Internal,
+                    "NO_PLAN",
+                    "run 前未 configure+apply",
+                )
+            })?)
+        } else {
+            None
+        };
+        let data_map = match data_plan {
+            None => None,
+            Some(snap) => Some(snap.map.as_ref().ok_or_else(|| {
+                SdkDriverError::new(
+                    mesa_core_types::ErrorKind::Internal,
+                    "NO_POINT_MAP",
+                    "run 前未 apply_point_map",
+                )
+            })?),
+        };
+        let event_tasks: Vec<event::OpcUaEventTaskPlan> = self
+            .event_plan
+            .as_ref()
+            .map(|e| e.tasks.clone())
+            .unwrap_or_default();
 
         // 建会话：Fake 即时成功；Native 失败则由 Manager 退避
         if let Err(e) = self
@@ -1176,27 +1223,30 @@ impl DriverConnection for OpcUaConnection {
         use std::sync::atomic::{AtomicU64, Ordering};
         let seq = Arc::new(AtomicU64::new(1));
         let shared_api = Arc::clone(&self.api);
-        let mut handles = Vec::with_capacity(snap.tasks.len());
-        for task in &snap.tasks {
-            let indices = task.point_indices.clone();
-            let points: Vec<(PointSpec, u32)> = indices
-                .iter()
-                .map(|&i| {
-                    let p = snap.points[i].clone();
-                    let pid = map[&p.key];
-                    (p, pid)
-                })
-                .collect();
-            let sink = sink.clone();
-            let shutdown = shutdown.clone();
-            let seq = Arc::clone(&seq);
-            let api = Arc::clone(&shared_api);
-            let task_id = task.id.clone();
-            let kind = task.kind.clone();
-            match kind {
-                TaskKind::Poll { interval_ms } => {
-                    let interval = Duration::from_millis(interval_ms);
-                    handles.push(tokio::spawn(async move {
+        // §20 轻量 supervisor：任一 child Err 即记 first error + cancel 全体，
+        // reap 全部后统一收尾（旧顺序 await 会被 hung worker 挡住错误传播）。
+        let mut set: tokio::task::JoinSet<Result<(), SdkDriverError>> = tokio::task::JoinSet::new();
+        if let (Some(snap), Some(map)) = (data_plan, data_map) {
+            for task in &snap.tasks {
+                let indices = task.point_indices.clone();
+                let points: Vec<(PointSpec, u32)> = indices
+                    .iter()
+                    .map(|&i| {
+                        let p = snap.points[i].clone();
+                        let pid = map[&p.key];
+                        (p, pid)
+                    })
+                    .collect();
+                let sink = sink.clone();
+                let shutdown = shutdown.clone();
+                let seq = Arc::clone(&seq);
+                let api = Arc::clone(&shared_api);
+                let task_id = task.id.clone();
+                let kind = task.kind.clone();
+                match kind {
+                    TaskKind::Poll { interval_ms } => {
+                        let interval = Duration::from_millis(interval_ms);
+                        set.spawn(async move {
                         let mut ticker = tokio::time::interval(interval);
                         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         // §5.5 last-known 连续性：按 point_id 缓存最近 GOOD 的 typed 值
@@ -1234,11 +1284,11 @@ impl DriverConnection for OpcUaConnection {
         }).await;
                         }
                         Ok::<(), SdkDriverError>(())
-                    }));
-                }
-                TaskKind::Browse { interval_ms } => {
-                    let interval = Duration::from_millis(interval_ms);
-                    handles.push(tokio::spawn(async move {
+                    });
+                    }
+                    TaskKind::Browse { interval_ms } => {
+                        let interval = Duration::from_millis(interval_ms);
+                        set.spawn(async move {
                         let mut ticker = tokio::time::interval(interval);
                         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         loop {
@@ -1291,23 +1341,23 @@ impl DriverConnection for OpcUaConnection {
                             .await;
                         }
                         Ok::<(), SdkDriverError>(())
-                    }));
-                }
-                TaskKind::Subscribe {
-                    publishing_interval_ms,
-                    sampling_interval_ms,
-                    queue_size,
-                    discard_oldest,
-                } => {
-                    let addrs: Vec<OpcUaAddress> =
-                        points.iter().map(|(s, _)| s.addr.clone()).collect();
-                    // handle -> (spec, pid) 映射，client_handle = idx+1
-                    let mut handle_map: HashMap<u32, (PointSpec, u32)> = HashMap::new();
-                    for (idx, (spec, pid)) in points.iter().enumerate() {
-                        handle_map.insert((idx as u32) + 1, (spec.clone(), *pid));
+                    });
                     }
-                    let handle_map = Arc::new(handle_map);
-                    handles.push(tokio::spawn(async move {
+                    TaskKind::Subscribe {
+                        publishing_interval_ms,
+                        sampling_interval_ms,
+                        queue_size,
+                        discard_oldest,
+                    } => {
+                        let addrs: Vec<OpcUaAddress> =
+                            points.iter().map(|(s, _)| s.addr.clone()).collect();
+                        // handle -> (spec, pid) 映射，client_handle = idx+1
+                        let mut handle_map: HashMap<u32, (PointSpec, u32)> = HashMap::new();
+                        for (idx, (spec, pid)) in points.iter().enumerate() {
+                            handle_map.insert((idx as u32) + 1, (spec.clone(), *pid));
+                        }
+                        let handle_map = Arc::new(handle_map);
+                        set.spawn(async move {
                         let (sub_id, mut rx) = match api.subscribe(&addrs, publishing_interval_ms, sampling_interval_ms, queue_size, discard_oldest).await {
                             Ok(v) => v,
                             Err(e) => {
@@ -1361,19 +1411,45 @@ impl DriverConnection for OpcUaConnection {
                             tracing::warn!(sub_id, error = %e, "shutdown 清理订阅失败（仅诊断）");
                         }
                         Ok::<(), SdkDriverError>(())
-                    }));
+                    });
+                    }
                 }
+            } // end for task in data_tasks
+        } // end if-let data tasks
+        // Event workers：与 Data 共享同一 Session（transport Arc 唯一），
+        // 但队列语义隔离（FIFO fail-closed vs Latest-Wins，§19）。
+        if !event_tasks.is_empty() {
+            // §13：NamespaceArray 启动时读一次，全任务共享快照。
+            let namespaces =
+                Arc::new(self.transport.read_namespace_array().await.map_err(|e| {
+                    SdkDriverError::new(
+                        mesa_core_types::ErrorKind::Connection,
+                        "OPCUA_EVENT_SUBSCRIBE_FAILED",
+                        format!("事件启动 NamespaceArray 读取失败: {e}"),
+                    )
+                })?);
+            let event_sink = sink.events();
+            for task in event_tasks {
+                set.spawn(event_runtime::run_event_task(
+                    Arc::clone(&self.transport),
+                    task,
+                    Arc::clone(&namespaces),
+                    event_sink.clone(),
+                    shutdown.clone(),
+                ));
             }
         }
 
         let mut final_err: Option<SdkDriverError> = None;
-        for h in handles {
-            match h.await {
+        while let Some(res) = set.join_next().await {
+            match res {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     if final_err.is_none() {
                         final_err = Some(e);
                     }
+                    // 任一 child Err 即 cancel 全体（§20），继续 reap 剩余 workers。
+                    shutdown.cancel();
                 }
                 Err(join_err) => {
                     tracing::error!(%join_err, "OPC UA 任务 panic");
@@ -1384,10 +1460,24 @@ impl DriverConnection for OpcUaConnection {
                             join_err.to_string(),
                         ));
                     }
+                    shutdown.cancel();
                 }
             }
-            if final_err.is_some() {
-                shutdown.cancel();
+        }
+        // §21 连接 teardown 末端：best-effort disconnect（会话槽位清空，
+        // 下次 Start 经 ensure_session 重建）。失败仅诊断：不掩盖原始错误，
+        // 不让干净 Stop 失败。必须加 bound：对已死会话发 CloseSession 可能
+        // 永不返回（P0-3），teardown 挂起会把已经判定的 Err/Ok 拖成永久 RUNNING。
+        let dc_timeout = std::time::Duration::from_millis(self.cfg.timeout_ms);
+        match tokio::time::timeout(dc_timeout, self.transport.disconnect()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "OPC UA run 结束 disconnect 失败（仅诊断）");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "OPC UA run 结束 disconnect 超时（仅诊断，会话槽位已在 transport 内清空）"
+                );
             }
         }
         if let Some(e) = final_err {
@@ -1414,6 +1504,95 @@ mod tests {
         }
     }
 
+    /// §18 硬门：Event-only 端点（零 Data point）必须能 Start，
+    /// 事件到达，全程不要求 PointMap。
+    #[tokio::test]
+    async fn event_only_endpoint_starts_without_data_points() {
+        use mesa_core_types::{DriverBinding, EventTask, GENERIC_EVENT_BINDING_KIND};
+        use mesa_driver_sdk::DataSink;
+        use mesa_opcua_transport::{FakeOpcUaTransport, UaEventNotification};
+        use opcua_types::{ByteString, DateTime, LocalizedText, UAString, Variant as V};
+
+        let namespaces = vec![
+            "http://opcfoundation.org/UA/".to_string(),
+            "http://example.com/Other/".to_string(),
+            "http://example.com/MyModel/".to_string(),
+        ];
+        let dt = |ns: i64| {
+            V::DateTime(Box::new(DateTime::from(
+                ns / 100 + 11644473600 * 10_000_000,
+            )))
+        };
+        let mut fields = vec![
+            V::ByteString(ByteString::from(vec![9u8, 9, 9])), // EventId
+            V::NodeId(Box::new(opcua_types::NodeId::new(0, 2041u32))), // EventType
+            V::NodeId(Box::new(opcua_types::NodeId::new(0, 2253u32))), // SourceNode
+            V::String(UAString::from("MesaFixture")),         // SourceName
+            dt(1_700_000_000_000_000_000),                    // Time
+            dt(1_700_000_000_500_000_000),                    // ReceiveTime
+            V::LocalizedText(Box::new(LocalizedText::new("", "event-only"))), // Message
+            V::UInt16(100),                                   // Severity
+        ];
+        fields.extend(std::iter::repeat_n(V::Empty, 19 - fields.len()));
+        let fake = Arc::new(
+            FakeOpcUaTransport::new()
+                .with_namespace_array(namespaces)
+                .with_event_notifications(vec![UaEventNotification {
+                    client_handle: 1,
+                    fields,
+                }]),
+        );
+        let mut conn = OpcUaConnection {
+            cfg: OpcUaConnConfig::default(),
+            api: Arc::new(FakeOpcUaApi::new()),
+            transport: fake.clone(),
+            plan: None,
+            event_plan: None,
+        };
+        // 零 Data 任务 + 一个 generic 事件任务（configure_events 用 [] 语义清空亦可）。
+        conn.configure(1, vec![]).await.unwrap();
+        conn.configure_events(
+            1,
+            vec![EventTask {
+                id: "ev-only".into(),
+                mode: TaskMode::Subscribe,
+                interval_ms: None,
+                binding: DriverBinding {
+                    kind: GENERIC_EVENT_BINDING_KIND.into(),
+                    config: serde_json::json!({
+                        "stream_id": "opcua.events",
+                        "parameters": {},
+                    }),
+                },
+            }],
+        )
+        .await
+        .unwrap();
+        // 注意：刻意不调 apply_point_map——Event-only 不得要求它。
+        let (ctrl_tx, _ctrl_rx) =
+            tokio::sync::mpsc::channel::<mesa_driver_protocol::pb::Envelope>(8);
+        let (data_tx, _data_rx) = tokio::sync::mpsc::channel::<mesa_core_types::DataBatch>(8);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<mesa_driver_sdk::EventBatch>(8);
+        let sink = DataSink::for_test(ctrl_tx, data_tx, event_tx).for_connection(7, 1);
+        let shutdown = CancellationToken::new();
+        let sd = shutdown.clone();
+        let run_handle = tokio::spawn(async move { conn.run(sink, sd).await });
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("事件必须到达（Event-only Start 成功）")
+            .expect("通道不得关闭");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].message.as_deref(), Some("event-only"));
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
+            .await
+            .expect("run 必须退出")
+            .expect("run 不 panic")
+            .expect("正常 Stop 必须 Ok");
+        // 清理发生且会话已断开（teardown 末端 disconnect）。
+        assert_eq!(fake.deleted_subscriptions().len(), 1);
+    }
+
     #[tokio::test]
     async fn configure_ok_and_duplicate_rejected() {
         let mut conn = OpcUaConnection {
@@ -1421,6 +1600,7 @@ mod tests {
             api: Arc::new(FakeOpcUaApi::new()),
             transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
             plan: None,
+            event_plan: None,
         };
         let nodes = serde_json::json!([
             {"key":"a","node_id":"ns=2;i=2","data_type":"U32"},
@@ -1447,6 +1627,7 @@ mod tests {
             api: Arc::new(FakeOpcUaApi::new()),
             transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
             plan: None,
+            event_plan: None,
         };
         let nodes = serde_json::json!([{"key":"a","node_id":"ns=2;x=1","data_type":"U32"}]);
         let err = conn
@@ -1463,6 +1644,7 @@ mod tests {
             api: Arc::new(FakeOpcUaApi::new()),
             transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
             plan: None,
+            event_plan: None,
         };
         let t = AcquisitionTask {
             id: "s1".into(),
@@ -1496,6 +1678,7 @@ mod tests {
             api: Arc::new(FakeOpcUaApi::new()),
             transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
             plan: None,
+            event_plan: None,
         };
         let nodes = serde_json::json!([{"key":"a","node_id":"ns=2;s=Counter","data_type":"U32"}]);
         let t = task_with_nodes(nodes);

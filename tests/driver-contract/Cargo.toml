@@ -29,6 +29,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 windows-sys = { workspace = true }
 libc = { workspace = true }
+# PR9 fixture：Mesa-owned OPC UA Event 服务器（与 driver 侧同版本）
+async-opcua-server = "0.19"
+async-opcua-nodes = "0.19"
+async-opcua-types = "0.19"
 
 # NOTE: Contract 基线（§21 全部 20 项 + V2.1 扩展）共 14 suites，见 tests/；
 # Simulator 已第一个全过，S7/FOCAS2/OPC UA 不得绕过或裁剪该基线。

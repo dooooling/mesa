@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -238,6 +239,11 @@ pub(crate) async fn forwarder_loop(
     }
 }
 
+/// Event callback 同步桥说明（§5）：唯一准入点是
+/// [`crate::event::EventProducerShared::admit`]（门检查 + 字段校验 +
+/// try_send + fatal 同一临界区，P0-2）。入口层级与 Data `SlotState::push`
+/// 同级，禁止解码/IO/await/spawn.
+///
 /// 原生传输：持有 Session + event-loop JoinHandle；`disconnect()` 释放会话。
 ///
 /// P1-B5：每个订阅的 forwarder task 由 `forwarders[sub_id]` 跟踪，生命周期与
@@ -247,6 +253,16 @@ pub struct NativeOpcUaTransport {
     options: OpcUaConnectOptions,
     inner: Arc<AsyncMutex<Option<NativeInner>>>,
     forwarders: Arc<AsyncMutex<HashMap<UaSubscriptionId, tokio::task::JoinHandle<()>>>>,
+    /// P0-1：Event producer 本地门（sub_id → 共享态）。delete_subscription 先关门
+    /// 再调服务端 RPC；driver shutdown 显式 close_producer 后 drain 到 None。
+    event_producers:
+        Arc<AsyncMutex<HashMap<UaSubscriptionId, Arc<crate::event::EventProducerShared>>>>,
+    /// P0-3：session 世代（connect_inner/disconnect 递增，过期 watcher 自退）。
+    session_epoch: Arc<AtomicU64>,
+    /// P0-3：当前世代 event-loop 已意外结束（非 teardown）。ensure 见此即重连。
+    session_dead: Arc<AtomicBool>,
+    /// P0-3：session 守望任务（轮询 event-loop JoinHandle 完成态）。
+    session_watcher: Arc<AsyncMutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl NativeOpcUaTransport {
@@ -255,6 +271,10 @@ impl NativeOpcUaTransport {
             options,
             inner: Arc::new(AsyncMutex::new(None)),
             forwarders: Arc::new(AsyncMutex::new(HashMap::new())),
+            event_producers: Arc::new(AsyncMutex::new(HashMap::new())),
+            session_epoch: Arc::new(AtomicU64::new(0)),
+            session_dead: Arc::new(AtomicBool::new(false)),
+            session_watcher: Arc::new(AsyncMutex::new(None)),
         }
     }
 
@@ -317,6 +337,9 @@ impl NativeOpcUaTransport {
             if let Some(inner) = guard.as_ref()
                 && inner.endpoint_url == self.options.endpoint_url
                 && let Some(sess) = &inner.session
+                // P0-3：event-loop 已意外结束的 session 永不返回（watcher 置位），
+                // 否则 Event worker 会拿着已死会话显示 RUNNING。
+                && !self.session_dead.load(Ordering::SeqCst)
             {
                 return Ok(sess.clone());
             }
@@ -401,6 +424,24 @@ impl NativeOpcUaTransport {
             )
         })?;
 
+        // P0-3：世代先行递增（旧 watcher 自退），再挂新守望。event-loop 结束语义：
+        // 手动关闭返回 Good（仅 disconnect 路径），重连最终失败返回 Bad。
+        // 非 teardown 的任何结束都判死：关全部 event producer（worker 经
+        // recv-None 报 SESSION_LOST）+ abort 数据 forwarder。
+        let generation = self.session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.session_dead.store(false, Ordering::SeqCst);
+        let watcher = tokio::spawn(Self::watch_session(
+            generation,
+            Arc::clone(&self.session_epoch),
+            Arc::clone(&self.session_dead),
+            Arc::clone(&self.inner),
+            Arc::clone(&self.event_producers),
+            Arc::clone(&self.forwarders),
+        ));
+        if let Some(old) = self.session_watcher.lock().await.replace(watcher) {
+            old.abort();
+        }
+
         let sess_clone = session.clone();
         let mut guard = self.inner.lock().await;
         *guard = Some(NativeInner {
@@ -409,6 +450,53 @@ impl NativeOpcUaTransport {
             handle: Some(handle),
         });
         Ok(sess_clone)
+    }
+
+    /// P0-3 session 守望：轮询 event-loop JoinHandle 完成态（100ms）。
+    /// 世代过期（重连/disconnect）即自退；当前世代的任何结束（Good/Bad）
+    /// 只要不是我们发起的 teardown，都判会话死：置位 + 关全部 producer +
+    /// abort 数据 forwarder。Event worker 经 receiver-None 报 SESSION_LOST，
+    /// run Err，Manager 开新 attempt（新世代）。
+    async fn watch_session(
+        generation: u64,
+        epoch: Arc<AtomicU64>,
+        dead: Arc<AtomicBool>,
+        inner: Arc<AsyncMutex<Option<NativeInner>>>,
+        producers: Arc<
+            AsyncMutex<HashMap<UaSubscriptionId, Arc<crate::event::EventProducerShared>>>,
+        >,
+        forwarders: Arc<AsyncMutex<HashMap<UaSubscriptionId, tokio::task::JoinHandle<()>>>>,
+    ) {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if epoch.load(Ordering::SeqCst) != generation {
+                return; // 已重连或已断开，本守望过期
+            }
+            let finished = {
+                let guard = inner.lock().await;
+                guard
+                    .as_ref()
+                    .and_then(|i| i.handle.as_ref())
+                    .is_some_and(|h| h.is_finished())
+            };
+            if !finished {
+                continue;
+            }
+            // 置位先行（ensure 即刻拒死 session），再二次确认世代（防与新
+            // connect 的 producer 注册竞态），最后关门。
+            dead.store(true, Ordering::SeqCst);
+            if epoch.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            tracing::debug!("session 守望：event-loop 已结束，关全部 producer");
+            for (_, p) in producers.lock().await.drain() {
+                p.close();
+            }
+            for (_, h) in forwarders.lock().await.drain() {
+                h.abort();
+            }
+            return;
+        }
     }
 }
 
@@ -422,6 +510,11 @@ impl OpcUaTransport for NativeOpcUaTransport {
         // P1-1：证明性关闭——先请会话正常断开，再 abort event-loop task，最后清空槽位。
         // 仅丢 JoinHandle 是 detach 而非退出，必须显式 abort。
         // P1-B5：同时 abort 全部订阅 forwarder（会话已死，它们只会睡死在 Notify 上）。
+        // P0-3：世代先行递增（守望自退），再 abort 守望；关全部 event producer。
+        self.session_epoch.fetch_add(1, Ordering::SeqCst);
+        if let Some(w) = self.session_watcher.lock().await.take() {
+            w.abort();
+        }
         let taken = {
             let mut guard = self.inner.lock().await;
             guard.take()
@@ -441,6 +534,10 @@ impl OpcUaTransport for NativeOpcUaTransport {
             tracing::debug!(sub_id = id, "disconnect abort 订阅 forwarder");
             h.abort();
         }
+        for (_, p) in self.event_producers.lock().await.drain() {
+            p.close();
+        }
+        self.session_dead.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -812,6 +909,11 @@ impl OpcUaTransport for NativeOpcUaTransport {
     }
 
     async fn delete_subscription(&self, id: UaSubscriptionId) -> Result<(), UaTransportError> {
+        // P0-1：本地 producer 门先关（无论服务端 RPC 成败，callback 此后不再
+        // send；driver drain-to-None 的终止性依赖于此）。
+        if let Some(p) = self.event_producers.lock().await.remove(&id) {
+            p.close();
+        }
         let session = {
             let guard = self.inner.lock().await;
             guard.as_ref().and_then(|i| i.session.clone())
@@ -834,6 +936,182 @@ impl OpcUaTransport for NativeOpcUaTransport {
             return Ok(());
         }
         self.delete_subscription_rpc(&sess, id).await
+    }
+
+    // PR9-② Native EventCallback：同步上下文内只做 try_send（§5）。
+    // 不解码、不落盘、不 await。Full 即完整性破坏 → fatal，绝不 drop-oldest。
+    async fn create_event_subscription(
+        &self,
+        spec: UaSubscriptionSpec,
+    ) -> Result<crate::event::UaEventSubscription, UaTransportError> {
+        use crate::event::{EVENT_CALLBACK_QUEUE_CAPACITY, EventSubscriptionStats};
+        use opcua_client::EventCallback;
+        let session = {
+            let guard = self.inner.lock().await;
+            guard
+                .as_ref()
+                .and_then(|i| i.session.clone())
+                .ok_or_else(|| {
+                    UaTransportError::session(
+                        UaOperation::CreateEventSubscription,
+                        None,
+                        "尚未连接，请先 connect",
+                    )
+                })?
+        };
+        let stats = Arc::new(EventSubscriptionStats::default());
+        let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CALLBACK_QUEUE_CAPACITY);
+        let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+        let cb_stats = stats.clone();
+        // P0-2：callback 经 producer.admit（门检查 + 字段校验 + try_send +
+        // fatal 同一临界区）；关门后静默丢弃。
+        let producer = crate::event::EventProducerShared::new(tx);
+        let cb_producer = Arc::clone(&producer);
+        let callback = EventCallback::new(
+            move |fields: Option<Vec<opcua_types::Variant>>, item: &opcua_client::MonitoredItem| {
+                cb_producer.admit(fields, item.client_handle(), &fatal_tx, &cb_stats);
+            },
+        );
+        // P1-B6 同理：请求间隔原样上送，Server revised 为准。
+        let pub_interval = Duration::from_millis(spec.publishing_interval_ms);
+        let sub_id = session
+            .create_subscription(
+                pub_interval,
+                spec.lifetime_count,
+                spec.max_keep_alive_count,
+                spec.max_notifications_per_publish,
+                spec.priority,
+                spec.publishing_enabled,
+                callback,
+            )
+            .await
+            .map_err(|e| map_service_error(UaOperation::CreateEventSubscription, e))?;
+        // Revised 回读 + 缺席回滚（与 Data 路径同一 fail-closed 语义）。
+        let revised = {
+            let state = session.subscription_state();
+            let guard = state.lock();
+            guard.get(sub_id).map(|sub| {
+                (
+                    sub.publishing_interval().as_millis() as u64,
+                    sub.lifetime_count(),
+                    sub.max_keep_alive_count(),
+                )
+            })
+        };
+        let Some((revised_pub_ms, revised_lifetime, revised_keep_alive)) = revised else {
+            // 本地门同样关闭（callback 不再 send，sender 摘除），再走服务端回滚。
+            producer.close();
+            if let Err(cleanup) = self.delete_subscription_rpc(&session, sub_id).await {
+                tracing::debug!(
+                    sub_id,
+                    ?cleanup,
+                    "Event 订阅 Revised 缺席回滚删订阅失败（仅诊断）"
+                );
+            }
+            return Err(UaTransportError::internal(
+                UaOperation::CreateEventSubscription,
+                format!(
+                    "Event 订阅 {sub_id} 创建成功但本地订阅状态缺席（内部不一致，已回滚，fail-closed）"
+                ),
+            ));
+        };
+        // NOTE: Event 路径不 spawn forwarder task——receiver 直达调用方（Driver
+        // runtime），无 slot 中转；cleanup 只需服务端 delete（幂等），无本地 task 可泄漏。
+        // producer 门登记在册：delete_subscription 先关门，driver 显式 close 幂等。
+        self.event_producers
+            .lock()
+            .await
+            .insert(sub_id, Arc::clone(&producer));
+        Ok(crate::event::UaEventSubscription {
+            id: sub_id,
+            requested_publishing_interval_ms: spec.publishing_interval_ms,
+            revised_publishing_interval_ms: revised_pub_ms,
+            revised_lifetime_count: revised_lifetime,
+            revised_max_keep_alive_count: revised_keep_alive,
+            receiver: rx,
+            fatal: fatal_rx,
+            stats,
+            producer,
+        })
+    }
+
+    async fn create_event_monitored_items(
+        &self,
+        subscription_id: UaSubscriptionId,
+        items: &[crate::event::UaEventMonitoredItemSpec],
+    ) -> Result<Vec<crate::event::UaEventMonitoredItemResult>, UaTransportError> {
+        use crate::event::decode_event_filter_result;
+        let session = {
+            let guard = self.inner.lock().await;
+            guard
+                .as_ref()
+                .and_then(|i| i.session.clone())
+                .ok_or_else(|| {
+                    UaTransportError::session(
+                        UaOperation::CreateEventMonitoredItems,
+                        None,
+                        "尚未连接，请先 connect",
+                    )
+                })?
+        };
+        let mut reqs = Vec::with_capacity(items.len());
+        for it in items {
+            reqs.push(crate::event::build_event_monitored_item_request(it)?);
+        }
+        // 事件时间以字段形式到达（Time/ReceiveTime select clauses），无需 data timestamps。
+        let created = session
+            .create_monitored_items(subscription_id, TimestampsToReturn::Neither, reqs)
+            .await
+            .map_err(|e| map_service_error(UaOperation::CreateEventMonitoredItems, e))?;
+        check_cardinality(
+            UaOperation::CreateEventMonitoredItems,
+            "CreateEventMonitoredItems 结果",
+            items.len(),
+            created.len(),
+        )?;
+        let mut out = Vec::with_capacity(created.len());
+        for (spec, c) in items.iter().zip(created) {
+            let r = &c.result;
+            // 单项 BAD 不整体 Err（调用方回滚）；Good 项的 filter_result 必须可解码，
+            // 否则是协议违约（fail-closed，整包 Err）。
+            let (select_clause_statuses, where_clause_statuses, where_operand_statuses) = if r
+                .status_code
+                .is_good()
+            {
+                let decoded =
+                    decode_event_filter_result(&r.filter_result, spec.filter.select_clauses.len())?;
+                (
+                    decoded.select.iter().map(|s| s.bits()).collect(),
+                    decoded
+                        .where_elements
+                        .iter()
+                        .map(|e| e.status.bits())
+                        .collect(),
+                    decoded
+                        .where_elements
+                        .iter()
+                        .map(|e| e.operand_statuses.iter().map(|s| s.bits()).collect())
+                        .collect(),
+                )
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
+            out.push(crate::event::UaEventMonitoredItemResult {
+                client_handle: spec.client_handle,
+                monitored_item_id: if r.status_code.is_good() {
+                    r.monitored_item_id
+                } else {
+                    0
+                },
+                status_code: r.status_code.bits(),
+                requested_queue_size: spec.queue_size,
+                revised_queue_size: r.revised_queue_size,
+                select_clause_statuses,
+                where_clause_statuses,
+                where_operand_statuses,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -999,5 +1277,120 @@ mod tests {
         let e = browse_result_to_page(bad).expect_err("整包 BAD 必须 Err");
         assert_eq!(e.kind, crate::UaTransportErrorKind::Service);
         assert_eq!(e.status_code, Some(StatusCode::BadNodeIdUnknown.bits()));
+    }
+
+    // ---- PR9-② Event callback 桥：FIFO + fail-closed（与 Latest-Wins 对照） ----
+
+    // 单测脚手架：复杂元组类型仅测试用，允许。
+    #[allow(clippy::type_complexity)]
+    fn event_bridge() -> (
+        Arc<crate::event::EventProducerShared>,
+        tokio::sync::mpsc::Receiver<crate::event::UaEventNotification>,
+        tokio::sync::watch::Sender<Option<crate::event::UaEventStreamFatal>>,
+        tokio::sync::watch::Receiver<Option<crate::event::UaEventStreamFatal>>,
+        Arc<crate::event::EventSubscriptionStats>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::event::EVENT_CALLBACK_QUEUE_CAPACITY);
+        let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+        let stats = Arc::new(crate::event::EventSubscriptionStats::default());
+        (
+            crate::event::EventProducerShared::new(tx),
+            rx,
+            fatal_tx,
+            fatal_rx,
+            stats,
+        )
+    }
+
+    fn ev_fields(n: i32) -> Option<Vec<opcua_types::Variant>> {
+        Some(vec![opcua_types::Variant::Int32(n)])
+    }
+
+    #[tokio::test]
+    async fn event_bridge_preserves_order_never_coalesces() {
+        // 与 burst_same_handle 对照：1000 个 occurrence 必须全部保留、保序，
+        // 绝不允许 Latest-Wins 式合并。
+        use crate::event::UaEventStreamFatal;
+        let (tx, mut rx, fatal_tx, fatal_rx, stats) = event_bridge();
+        for v in 0..1000i32 {
+            tx.admit(ev_fields(v), 3, &fatal_tx, &stats);
+        }
+        assert_eq!(stats.events_received(), 1000);
+        assert_eq!(*fatal_rx.borrow(), None);
+        for v in 0..1000i32 {
+            let n = rx.recv().await.expect("occurrence 不得丢失");
+            assert_eq!(n.client_handle, 3);
+            assert_eq!(n.fields, vec![opcua_types::Variant::Int32(v)]);
+        }
+        assert!(rx.try_recv().is_err());
+        let _ = UaEventStreamFatal::CallbackQueueOverflow.as_str();
+    }
+
+    #[test]
+    fn event_bridge_full_is_fatal_not_drop_oldest() {
+        // channel 容量 1024：确定性填满（无消费者），再压即 Full。
+        // 旧 ordered prefix 必须完整保留，且 fatal 精确计数。
+        use crate::event::UaEventStreamFatal;
+        let (tx, mut rx, fatal_tx, fatal_rx, stats) = event_bridge();
+        for v in 0..crate::event::EVENT_CALLBACK_QUEUE_CAPACITY as i32 {
+            tx.admit(ev_fields(v), 3, &fatal_tx, &stats);
+        }
+        assert_eq!(*fatal_rx.borrow(), None);
+        for v in 0..3i32 {
+            tx.admit(ev_fields(10_000 + v), 3, &fatal_tx, &stats);
+        }
+        assert_eq!(stats.callback_queue_overflow(), 3);
+        assert_eq!(
+            *fatal_rx.borrow(),
+            Some(UaEventStreamFatal::CallbackQueueOverflow)
+        );
+        for v in 0..crate::event::EVENT_CALLBACK_QUEUE_CAPACITY as i32 {
+            let n = rx.try_recv().expect("prefix 必须完整（禁 drop-oldest）");
+            assert_eq!(n.fields, vec![opcua_types::Variant::Int32(v)]);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn event_bridge_none_fields_is_malformed_fatal() {
+        use crate::event::UaEventStreamFatal;
+        let (tx, mut rx, fatal_tx, fatal_rx, stats) = event_bridge();
+        tx.admit(None, 3, &fatal_tx, &stats);
+        assert_eq!(
+            *fatal_rx.borrow(),
+            Some(UaEventStreamFatal::MalformedNotification)
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(stats.events_received(), 1);
+    }
+
+    #[test]
+    fn event_bridge_closed_receiver_is_silent() {
+        let (producer, rx, fatal_tx, fatal_rx, _stats) = event_bridge();
+        drop(rx);
+        let stats = Arc::new(crate::event::EventSubscriptionStats::default());
+        producer.admit(ev_fields(1), 3, &fatal_tx, &stats);
+        // teardown 进行中：静默丢弃，不报 fatal。
+        assert_eq!(*fatal_rx.borrow(), None);
+    }
+
+    #[tokio::test]
+    async fn event_producer_close_is_idempotent_and_ends_stream() {
+        // P0-2：关门后 callback（含 malformed）静默丢弃，不计数、不 fatal；
+        // 关门前已接受项保留；发送端摘除后 `recv() == None`（drain-to-None
+        // 可终止）。fatal 在关门临界区内发出，不可能迟到到 close 之后。
+        let (producer, mut rx, fatal_tx, fatal_rx, stats) = event_bridge();
+        producer.admit(ev_fields(1), 3, &fatal_tx, &stats);
+        producer.close();
+        producer.close(); // 幂等
+        producer.admit(ev_fields(2), 3, &fatal_tx, &stats);
+        producer.admit(None, 3, &fatal_tx, &stats); // 关门后的 malformed 也静默
+        assert_eq!(*fatal_rx.borrow(), None);
+        assert_eq!(stats.events_received(), 1);
+        let n = rx.recv().await.expect("关门前已接受项必须保留");
+        assert_eq!(n.fields, vec![opcua_types::Variant::Int32(1)]);
+        // 发送端已在 close 时摘除：无残留 sender，drain 终止性成立。
+        assert!(rx.recv().await.is_none());
+        drop(producer);
     }
 }

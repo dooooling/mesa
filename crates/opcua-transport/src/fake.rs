@@ -48,6 +48,30 @@ pub struct FakeOpcUaTransport {
     delete_mi_error: Mutex<Option<UaTransportError>>,
     /// create_subscription 返回前注入 receiver 的事件。
     live_batches: Mutex<VecDeque<FakeLiveBatch>>,
+    /// 预置下一次（及以后所有）`create_event_subscription` 返回前注入的原生事件通知。
+    event_batches: Mutex<VecDeque<crate::event::UaEventNotification>>,
+    /// 存活的事件 producer（订阅 id → 共享态）：Fake 经它预注入通知；
+    /// `delete_subscription` 时摘除并关门，通道关闭（drain-to-None 可终止）。
+    event_producers: Mutex<HashMap<UaSubscriptionId, Arc<crate::event::EventProducerShared>>>,
+    /// 存活的 fatal sender（订阅 id → sender）：同上，否则 changed() 建完即 Err。
+    event_fatal_senders: Mutex<
+        HashMap<
+            UaSubscriptionId,
+            tokio::sync::watch::Sender<Option<crate::event::UaEventStreamFatal>>,
+        >,
+    >,
+    /// notifier key → create_event_monitored_items 逐项状态（缺省 Good）。
+    event_create_status: Mutex<HashMap<String, StatusCode>>,
+    /// notifier key → 逐 clause 状态（缺省全 Good，长度自动对齐 clauses 数）。
+    event_clause_statuses: Mutex<HashMap<String, Vec<StatusCode>>>,
+    /// notifier key → 逐 where-element 状态（缺省空，即 scope=all 形态）。
+    event_where_statuses: Mutex<HashMap<String, Vec<StatusCode>>>,
+    /// notifier key → 逐 element operand 状态（缺省空，即未报告即接受）。
+    event_where_operand_statuses: Mutex<HashMap<String, Vec<Vec<StatusCode>>>>,
+    /// 预置 create_event_subscription 整体失败（session loss 类测试用）。
+    event_sub_error: Mutex<Option<UaTransportError>>,
+    /// 预置 create_event_monitored_items 服务级整体失败（回滚测试用）。
+    event_mi_error: Mutex<Option<UaTransportError>>,
     next_sub_id: AtomicU32,
     next_mi_id: AtomicU32,
     created_subs: Mutex<Vec<UaSubscriptionId>>,
@@ -115,6 +139,78 @@ impl FakeOpcUaTransport {
     /// 下一次 `create_subscription` 返回的 receiver 将先收到这些事件。
     pub fn with_live_batch(self, batch: FakeLiveBatch) -> Self {
         self.live_batches.lock().unwrap().push_back(batch);
+        self
+    }
+
+    /// 预置原生事件通知：下一次 `create_event_subscription` 返回的 receiver
+    /// 将按序先收到这些通知（Fake 只造 `UaEventNotification`，绝不直接造
+    /// EventRecord——decoder 必须走真实路径）。
+    pub fn with_event_notifications(
+        self,
+        notifications: Vec<crate::event::UaEventNotification>,
+    ) -> Self {
+        self.event_batches.lock().unwrap().extend(notifications);
+        self
+    }
+
+    /// 预置某 notifier 的 `create_event_monitored_items` 逐项状态。
+    pub fn with_event_item_status(self, notifier: &UaNodeRef, status: StatusCode) -> Self {
+        self.event_create_status
+            .lock()
+            .unwrap()
+            .insert(node_key(notifier), status);
+        self
+    }
+
+    /// 预置某 notifier 的逐 clause 状态（bad filter 类测试用）。
+    pub fn with_event_clause_statuses(
+        self,
+        notifier: &UaNodeRef,
+        statuses: Vec<StatusCode>,
+    ) -> Self {
+        self.event_clause_statuses
+            .lock()
+            .unwrap()
+            .insert(node_key(notifier), statuses);
+        self
+    }
+
+    /// 预置某 notifier 的逐 where-element 状态（P0-3：OfType 被拒类测试用）。
+    pub fn with_event_where_statuses(
+        self,
+        notifier: &UaNodeRef,
+        statuses: Vec<StatusCode>,
+    ) -> Self {
+        self.event_where_statuses
+            .lock()
+            .unwrap()
+            .insert(node_key(notifier), statuses);
+        self
+    }
+
+    /// 预置某 notifier 的逐 element operand 状态（P1：operand BAD 类测试用；
+    /// 外层与 element 一一对应，未报告的 element 填空数组）。
+    pub fn with_event_where_operand_statuses(
+        self,
+        notifier: &UaNodeRef,
+        statuses: Vec<Vec<StatusCode>>,
+    ) -> Self {
+        self.event_where_operand_statuses
+            .lock()
+            .unwrap()
+            .insert(node_key(notifier), statuses);
+        self
+    }
+
+    /// 让 `create_event_subscription` 整体返回 Err（session loss 类测试用）。
+    pub fn with_event_subscription_error(self, err: UaTransportError) -> Self {
+        *self.event_sub_error.lock().unwrap() = Some(err);
+        self
+    }
+
+    /// 让 `create_event_monitored_items` 整体返回 Err（回滚测试用）。
+    pub fn with_event_monitored_items_error(self, err: UaTransportError) -> Self {
+        *self.event_mi_error.lock().unwrap() = Some(err);
         self
     }
 
@@ -295,7 +391,113 @@ impl OpcUaTransport for FakeOpcUaTransport {
 
     async fn delete_subscription(&self, id: UaSubscriptionId) -> Result<(), UaTransportError> {
         self.deleted_subs.lock().unwrap().push(id);
+        // 关门并摘除 producer：receiver 侧随即见 None（会话结束语义）。
+        // 注意：fatal sender 故意保留（随 Fake 本体释放）——服务端删订阅不杀
+        // 会话，fatal 通道必须保持 OPEN，否则 shutdown-drain 会把 changed-Err
+        // 误判为 SESSION_LOST（与 Native“fatal_tx 活在 session 回调里”一致）。
+        if let Some(p) = self.event_producers.lock().unwrap().remove(&id) {
+            p.close();
+        }
         Ok(())
+    }
+
+    // PR9-② Fake raw event：只造 UaEventNotification（位置数组），
+    // 绝不直接造 EventRecord——decoder 必须走真实路径（§24）。
+    async fn create_event_subscription(
+        &self,
+        spec: UaSubscriptionSpec,
+    ) -> Result<crate::event::UaEventSubscription, UaTransportError> {
+        if let Some(err) = self.event_sub_error.lock().unwrap().clone() {
+            return Err(err);
+        }
+        let id = self.next_sub_id.fetch_add(1, Ordering::SeqCst);
+        self.created_subs.lock().unwrap().push(id);
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::event::EVENT_CALLBACK_QUEUE_CAPACITY);
+        let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+        // producer 共享态持有发送端（随订阅存活，delete 时关门摘除）；
+        // 预置通知经同一扇门注入（单测规模，必须能容纳；超限即脚本错误）。
+        let producer = crate::event::EventProducerShared::new(tx);
+        for n in self.event_batches.lock().unwrap().drain(..) {
+            assert!(
+                matches!(producer.try_send(n), crate::event::ProducerSend::Sent),
+                "fake event batch 必须能容纳（单测规模）"
+            );
+        }
+        self.event_producers
+            .lock()
+            .unwrap()
+            .insert(id, Arc::clone(&producer));
+        self.event_fatal_senders
+            .lock()
+            .unwrap()
+            .insert(id, fatal_tx);
+        Ok(crate::event::UaEventSubscription {
+            id,
+            requested_publishing_interval_ms: spec.publishing_interval_ms,
+            revised_publishing_interval_ms: spec.publishing_interval_ms,
+            revised_lifetime_count: spec.lifetime_count,
+            revised_max_keep_alive_count: spec.max_keep_alive_count,
+            receiver: rx,
+            fatal: fatal_rx,
+            stats: Arc::new(crate::event::EventSubscriptionStats::default()),
+            producer,
+        })
+    }
+
+    async fn create_event_monitored_items(
+        &self,
+        _subscription_id: UaSubscriptionId,
+        items: &[crate::event::UaEventMonitoredItemSpec],
+    ) -> Result<Vec<crate::event::UaEventMonitoredItemResult>, UaTransportError> {
+        if let Some(err) = self.event_mi_error.lock().unwrap().clone() {
+            return Err(err);
+        }
+        let statuses = self.event_create_status.lock().unwrap();
+        let clause_maps = self.event_clause_statuses.lock().unwrap();
+        let where_maps = self.event_where_statuses.lock().unwrap();
+        let mut out = Vec::with_capacity(items.len());
+        for spec in items {
+            let key = node_key(&spec.notifier);
+            let status = statuses.get(&key).copied().unwrap_or(StatusCode::Good);
+            let good = status.is_good();
+            let n = spec.filter.select_clauses.len();
+            let clause_statuses = clause_maps
+                .get(&key)
+                .map(|v| v.iter().map(|s| s.bits()).collect())
+                .unwrap_or_else(|| vec![StatusCode::Good.bits(); n]);
+            // where 缺省为空（scope=all 形态）；显式脚本覆盖 scope=conditions。
+            let where_statuses = where_maps
+                .get(&key)
+                .map(|v| v.iter().map(|s| s.bits()).collect())
+                .unwrap_or_default();
+            // operand 缺省为空（服务端未报告即接受，P1）；显式脚本覆盖。
+            let where_operands = self
+                .event_where_operand_statuses
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(|v| {
+                    v.iter()
+                        .map(|ops| ops.iter().map(|s| s.bits()).collect())
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(crate::event::UaEventMonitoredItemResult {
+                client_handle: spec.client_handle,
+                monitored_item_id: if good {
+                    self.next_mi_id.fetch_add(1, Ordering::SeqCst)
+                } else {
+                    0
+                },
+                status_code: status.bits(),
+                requested_queue_size: spec.queue_size,
+                revised_queue_size: spec.queue_size,
+                select_clause_statuses: clause_statuses,
+                where_clause_statuses: where_statuses,
+                where_operand_statuses: where_operands,
+            });
+        }
+        Ok(out)
     }
 }
 

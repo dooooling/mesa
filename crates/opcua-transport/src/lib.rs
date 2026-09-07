@@ -18,11 +18,19 @@
 //! `MESA_OPCUA_PKI_DIR` 环境变量。
 
 pub mod error;
+pub mod event;
 pub mod fake;
 pub mod native;
 pub mod types;
 
 pub use error::{UaOperation, UaTransportError, UaTransportErrorKind, map_service_error};
+pub use event::{
+    DecodedEventFilterResult, DecodedWhereElement, EVENT_CALLBACK_QUEUE_CAPACITY,
+    EventSubscriptionStats, UaEventFilterSpec, UaEventMonitoredItemResult,
+    UaEventMonitoredItemSpec, UaEventNotification, UaEventSelectClause, UaEventStreamFatal,
+    UaEventSubscription, UaQualifiedNameRef, build_event_filter,
+    build_event_monitored_item_request, decode_event_filter_result,
+};
 pub use fake::{FakeLiveBatch, FakeOpcUaTransport, fake_browse_node};
 pub use native::{DEFAULT_OPCUA_PORT, NativeOpcUaTransport};
 pub use types::{
@@ -88,4 +96,19 @@ pub trait OpcUaTransport: Send + Sync {
 
     /// 删订阅：本地无该订阅 / 对端已无 / 会话已关闭均幂等 Ok（仅 cleanup 路径）。
     async fn delete_subscription(&self, id: UaSubscriptionId) -> Result<(), UaTransportError>;
+
+    /// 仅建 Event 订阅：与 [`OpcUaTransport::create_subscription`] 平行，
+    /// 返回 FIFO receiver + fatal watch（Latest-Wins 通道绝不复用）。
+    async fn create_event_subscription(
+        &self,
+        spec: UaSubscriptionSpec,
+    ) -> Result<crate::event::UaEventSubscription, UaTransportError>;
+
+    /// 独立建 Event 监控项：逐项返回 status + revised queue + clause 级状态；
+    /// 部分失败不整体 Err，由调用方按策略判定后回滚。
+    async fn create_event_monitored_items(
+        &self,
+        subscription_id: UaSubscriptionId,
+        items: &[crate::event::UaEventMonitoredItemSpec],
+    ) -> Result<Vec<crate::event::UaEventMonitoredItemResult>, UaTransportError>;
 }

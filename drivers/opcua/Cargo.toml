@@ -27,3 +27,7 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 async-opcua-types = "0.19"
 base64 = "0.22"
+
+[dev-dependencies]
+async-opcua-server = "0.19"
+async-opcua-nodes = "0.19"

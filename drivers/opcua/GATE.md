@@ -78,3 +78,56 @@ REST：`GET /certificates/opcua/{own,trusted,issuers,rejected} /diagnostics` `PO
 >   rollback/synthetic-BAD/continuation tests).
 > - Real opc.tcp:// software integration (local server, no hardware) is still
 >   REQUIRED before Stage 2 Gate sign-off.
+
+## 7. PR9 Events & Conditions（`feat/opcua-events` → PR #10）
+
+链路：`EventNotifier → Subscription → EventFilter/SelectClauses → EventCallback
+→ 有界 FIFO → transport → Driver decoder → EventRecord → PR6 EventSink →
+PR7 EventIngress → events.db → REST/SSE → PR8 Web`。
+`event-store / Core Event API / Generic Web` 零改动，无对应 Gate。
+
+跑法：`cargo test -p mesa-driver-opcua --lib`；
+`--test opcua_event_spike`；`--test opcua_event_native`；
+`cargo test -p mesa-contract-tests --test opcua_event_e2e -- --test-threads=1`
+（各起 loopback fixture + 驱动子进程，串行最稳）；
+`python scripts/write-contract-evidence.py`（14 suites Data 回归，唯一准入基线）。
+
+- [x] 19 clause 全 Good 才订阅：任一 select BAD / where 未接受 →
+  `OPCUA_EVENT_FILTER_REJECTED` + 回滚删订阅（位置契约容不得形变）
+- [x] ConditionId 取 Part 9 Table 10 字面形（`ConditionType/[]/NodeId`，golden
+  锁死索引 8 + 类型 + 空路径 + NodeId；production wire contract 不容形变）：
+  async-opcua 0.19 类型树缺 ConditionType 空路径（self）注册，标准 clause 在
+  validation 即 BAD——方向搞清楚：这是 server 对标准 clause 的接受缺口，
+  fixture 以 `patch_condition_self_path`（空路径 → Object 类；validation 本就
+  规定 Object 节点取 NodeId）补偿之。`["ConditionId"]` 伪字段 fixture 故意不
+  回答（合规 server 无此组件，回答即掩盖互操作问题）。上游补齐 self 路径后删 patch。
+- [x] Stop 先关本地门再 drain：shutdown 第一件事即 `close_producer()`（server
+  cleanup RPC 再慢，期间也不再撑本地 FIFO），再删监控项/订阅；callback 唯一
+  准入点 `admit()`（门检查 + 字段校验 + try_send + fatal 同一临界区，
+  close() 返回后不可能再出现 Event 或 fatal）；receiver 保持 OPEN，drain 到
+  None；drain 期 fatal 值为 Some 照常 fail，sender 丢失视为正常 teardown
+- [x] Session 永久丢失传播：transport `watch_session` 轮询 event-loop 完成态
+  （Good=手动，仅 disconnect 路径；其余结束皆判死），`ensure_session` 永不
+  返回已死会话；死亡即关全部 event producer（worker 经 recv-None 报
+  `OPCUA_EVENT_SESSION_LOST`）+ abort 数据 forwarder；run teardown 的
+  `disconnect()` 加 bound（对死会话发 CloseSession 可能永不返回）；
+  真断线 Gate（kill fixture → 90s 内 run 必 `SESSION_LOST`，~15s 实测）
+- [x] Batch 字节边界：64 条按数量聚批后，`TooLarge` 有序二分（SDK 保证不耗
+  sequence，左半先于右半）；单条仍超限 → `OPCUA_EVENT_RECORD_TOO_LARGE`
+- [x] `scope=conditions` 真过滤：OfType(ConditionType) 的 where element 结果
+  逐个校验（exactly-one + Good），BAD 即拒绝；报告的 operand BAD 同样
+  fail-closed（element 表面 Good 也掩盖不了）；`scope=all` 要求 exactly 0 个
+  where element
+- [x] `notifier_node_id` 配置期真解析：GUID 真 parse + Opaque 真 Base64 解码
+  （canonical 化），失败即 `INVALID_EVENT_NOTIFIER`，不拖到 Start
+- [x] `queue_size` 上限 1024 与本地 callback FIFO 对齐（默认 1000 不动）
+- [x] 落盘 exact（5 行 id/transition/occurred + Hub commit-then-publish）；
+  跨 epoch 重放去重；64 occurrence Stop 屏障（(batch,index) 无重无缺）；
+  in-process REST 烟雾（分页语义由 PR7 继承）
+- [x] Event-only 端点：`run()` 不强制 Data plan/PointMap；Data+Event 共享同一 Session
+
+Fixture（`drivers/opcua/tests/support/`，Mesa-owned loopback，非厂商代表）：
+`E0 probe + 观测` barrier（禁止 sleep 猜测）；Manager 级用"trigger 即轮询条件 +
+去重收敛"。已知上游缺口（带 TODO）：类型树缺 ConditionType 空路径 self 注册
+（`patch_condition_self_path` 补偿，见上）；fixture 队列上限提到 2000
+（缺省 item 10/sub 20 会静默丢 burst，仅 fixture 容量声明）。
