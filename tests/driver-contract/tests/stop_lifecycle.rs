@@ -68,7 +68,7 @@ async fn stop_after_driver_death_is_bounded_and_explicit() {
     .unwrap();
 
     // 存活证据：行落盘（crash 前数据确实流动，不是起不来）。
-    common::wait_until(30, || rows_of(&store, ep).len() >= 1).await;
+    common::wait_until(30, || !rows_of(&store, ep).is_empty()).await;
     // 死亡证据：crash 后 snapshot 必现 RECONNECTING 窗口（Lost→退避间隙，
     // 50ms 轮询必抓到；注意是 RECONNECTING 而非 FAILED——后者只用于配置失败）。
     common::wait_until(

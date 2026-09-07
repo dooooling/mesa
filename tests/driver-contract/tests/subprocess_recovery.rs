@@ -124,6 +124,12 @@ async fn subprocess_token_handshake_paths() {
 #[tokio::test]
 async fn driver_crash_restore_via_endpoint_runtime() {
     common::init_log();
+    // 本测试需要快速判死：20s 恢复预算按 ~2s 判死标定，生产心跳（5s/3s×3≈18s）
+    // 下必然超时。显式启用 fast heartbeat（同 event_store_faults 模式）；
+    // 同 binary 其他测试不依赖心跳时序，交叉看到 fast 也无害，故不 unset。
+    unsafe {
+        std::env::set_var("MESA_HEARTBEAT_FAST", "1");
+    }
     let snapshot = std::sync::Arc::new(Snapshot::new());
     let allocator: std::sync::Arc<dyn PointIdSource> =
         std::sync::Arc::new(PointIdAllocator::default());
