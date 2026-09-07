@@ -1,6 +1,9 @@
-//! Fast soak（PR10 commit 8 §15）：Simulator 稳态长跑 150s（CI 友好上限）。
-//! 锁长期无损（counter n 全程连续）、无 epoch 漂移、无诊断异常、
-//! 干净停止。OPC UA 长稳态由 soak 档覆盖，此处只锁 Sim 稳态基线。
+//! Soak gates（PR10 commit 8 §15 + Final 分档）。
+//! required fast soak（60s）：PR 门 + unified evidence 常跑档，锁 counter
+//! 连续、单 epoch、diagnostics 零异常、clean stop（~1200 events 足够覆盖）。
+//! extended soak（150s，`#[ignore]`）：manual/nightly 档，语义与 fast 同，
+//! 跑 `cargo test -- --ignored event_soak` 手动执行，不进 required CI.
+//! OPC UA 长稳态由 soak 档覆盖，此处只锁 Sim 稳态基线。
 
 mod common;
 mod event_common;
@@ -20,25 +23,24 @@ fn drivers_dir() -> std::path::PathBuf {
         .join("drivers")
 }
 
-/// 150s 稳态：~3000 行 counter 事件全程连续（1..=max 无缺口无重复）、
-/// 单 epoch（无 failover）、诊断零异常（store 失败/gap/回退/冲突全 0）、
-/// 干净停止。任一静默丢失/漂移在此必现形。
-#[tokio::test]
-async fn sim_steady_state_soak_150s_no_loss_no_drift() {
+/// 稳态 soak 本体：`secs` 秒 counter（50ms）+ data（100ms）混合负载后，
+/// 锁长期无损（n 全程连续）、无 epoch 漂移、诊断零异常、干净停止。
+/// 任一静默丢失/漂移在此必现形。
+async fn steady_state_soak(tag: &str, secs: u64, min_rows: usize) {
     common::init_log();
-    let db = event_common::tmp_db("soak");
+    let db = event_common::tmp_db(tag);
     let _ = std::fs::remove_file(&db);
     let store = std::sync::Arc::new(EventStore::open(&db).unwrap());
     let services = EventServices::new(store.clone(), EventHub::new(EVENT_HUB_CAPACITY));
     let mgr = std::sync::Arc::new(MesaManager::discover(&drivers_dir()));
     mgr.set_event_services(std::sync::Arc::clone(&services));
-    let ep = "hd-soak-150s";
+    let ep = format!("hd-soak-{tag}");
     let binding = mesa_core_types::GenericEventBinding {
         stream_id: mesa_driver_simulator::SIM_EVENT_STREAM_COUNTER.into(),
         parameters: serde_json::json!({}),
     };
     mgr.start_endpoint(BuiltinEndpoint {
-        endpoint_id: ep.into(),
+        endpoint_id: ep.clone(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
         tasks: vec![common::poll_task(
@@ -58,12 +60,16 @@ async fn sim_steady_state_soak_150s_no_loss_no_drift() {
     })
     .unwrap();
 
-    tokio::time::sleep(Duration::from_secs(150)).await;
-    assert!(mgr.is_running(ep), "soak 全程 endpoint 必须存活");
+    tokio::time::sleep(Duration::from_secs(secs)).await;
+    assert!(mgr.is_running(&ep), "soak 全程 endpoint 必须存活");
 
     // 长期无损：n 连续
-    let rows = rows_of(&store, ep);
-    assert!(rows.len() >= 1500, "150s 应有规模，got {}", rows.len());
+    let rows = rows_of(&store, &ep);
+    assert!(
+        rows.len() >= min_rows,
+        "{secs}s 应有规模，got {}",
+        rows.len()
+    );
     let mut ns: Vec<u64> = rows
         .iter()
         .map(|r| {
@@ -106,6 +112,19 @@ async fn sim_steady_state_soak_150s_no_loss_no_drift() {
         d.ingress_persisted_events_total.load(Ordering::Relaxed),
         rows.len() as u64
     );
-    assert_eq!(mgr.stop_endpoint(ep).await, Ok(true));
+    assert_eq!(mgr.stop_endpoint(&ep).await, Ok(true));
     let _ = std::fs::remove_file(&db);
+}
+
+/// required fast soak（60s，~1200 events）：PR 门 + evidence 常跑档。
+#[tokio::test]
+async fn sim_steady_state_soak_60s_no_loss_no_drift() {
+    steady_state_soak("60s", 60, 600).await;
+}
+
+/// extended soak（150s）：manual/nightly 档（`-- --ignored` 手动跑）。
+#[tokio::test]
+#[ignore]
+async fn sim_extended_soak_150s_no_loss_no_drift() {
+    steady_state_soak("150s", 150, 1500).await;
 }

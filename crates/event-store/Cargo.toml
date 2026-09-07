@@ -13,3 +13,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+
+# PR10 hardening：测试故障注入编译开关（默认关闭）。
+# 默认构建无 StoreFaults API、无 fault-check 热路径；hardening 合同测试
+# 经 dev 依赖显式开启（见 tests/driver-contract/Cargo.toml）。
+[features]
+test-hooks = []
