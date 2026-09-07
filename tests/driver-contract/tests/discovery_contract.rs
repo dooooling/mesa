@@ -158,8 +158,9 @@ async fn browse_pagination_does_not_return_all_at_once() {
 
 #[tokio::test]
 async fn browse_sinumerik_plumbing_and_canonical_shape() {
-    // SINUMERIK browse 管道门：驱动被发现、二进制可拉起、browse 200。
-    // 空脚本 Fake 返回空页；若有节点，身份必须全部 canonical nsu= 形态
+    // SINUMERIK browse 门：驱动被发现、二进制可拉起、browse 200。
+    // Fake 路径装载确定性 fixture（根下 Channel/Axis/Spindle 两页聚合）；
+    // 身份必须全部 canonical nsu= 形态，binding 与 id 一致
     //（翻页聚合与换算覆盖在驱动单测 + fixture 自检，不在此重复）。
     // 注意：改过驱动代码后须先 cargo build --workspace（旧二进制静默失效）。
     let (app, ep_id) = app_with_endpoint("sinumerik", fake_sinumerik_connection()).await;
@@ -176,10 +177,12 @@ async fn browse_sinumerik_plumbing_and_canonical_shape() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let nodes = v["nodes"].as_array().expect("nodes 数组");
+    // fixture 语义：两页聚合共 3 个子节点（Channel/Axis/Spindle）。
+    assert_eq!(nodes.len(), 3, "fixture browse 应聚合 3 节点，实际: {v}");
     for n in nodes {
         let id = n["id"].as_str().expect("BrowseNode.id");
         assert!(
-            id.starts_with("nsu="),
+            id.starts_with("nsu=http://www.siemens.com/sinumerik;"),
             "sinumerik browse 身份必须 canonical nsu= 形态，实际: {id}"
         );
         let binding: serde_json::Value =

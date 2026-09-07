@@ -54,13 +54,23 @@
 
 ## 5. 生命周期不变量（测试锁定）
 
-- point_id 不漂（canonical 吸收 index 漂移）；
+- point_id 不漂（canonical 吸收 index 漂移；Stop→Start 同 point_id，Manager 级 E2E 锁定）；
 - 旧 session 不继续产数据（writer 按 epoch 丢弃；Stop 后不再 publish）；
 - 新 session 不产生双 writer（supervisor 任一 Err 即 cancel 全体并 reap）；
 - Stop 后不再产出（teardown 有界 disconnect，失败/超时仅诊断，不掩盖原始错误）；
 - reconnect 不重复注册 subscription（失败回滚删订阅恰一次；shutdown 按序删项+删订阅可观测）；
+- **订阅会话丢失 → `SESSION_LOST`（Connection），绝不是 `Ok(Stopped)`**：
+  transport abort forwarders 关闭 receiver 后，worker 先删项+删订阅再 Err，
+  经 supervisor cancel/reap、统一 disconnect 出口返回 run Err，
+  Manager 据此 Failed+重建（干净 Stop 仍走 `shutdown.cancelled()` 正常退出）；
+- **统一 teardown 出口**：`run()` 建连成功后经 `run_connected()`，
+  NamespaceArray/换算/worker 的一切 early-Err 必经有界 disconnect（各恰一次，测试计数锁定）；
 - Data queue 不泄漏（Latest-Wins 有界；teardown 无残留映射）；
-- 非法配置 fail closed（`BAD_CONFIG` / `INVALID_ADDRESS` / `UNKNOWN_NAMESPACE` /
+- 非法配置 fail-closed（`BAD_CONFIG` / `INVALID_ADDRESS` / `UNKNOWN_NAMESPACE` /
+  `EMPTY_PLAN` / `EVENT_NOT_SUPPORTED`；端口 1..=65535、queue_size u32 checked，
+  超范围即拒）；
+- Secret 不进日志（`SinumerikConnConfig` 手写 Debug：password 恒 `<redacted>`，
+  连接 Debug 同理；两级脱敏断言锁定）。
   `EMPTY_PLAN` / `EVENT_NOT_SUPPORTED`）。
 
 ## 6. PR11 明确禁止（出现即 scope drift）
@@ -73,12 +83,16 @@ Control Plane API。成功定义：Mesa 可以稳定地看见并读取 SINUMERIK
 
 ## 7. Definition of Done（PR11）
 
-- [x] Descriptor / Probe / Browse / Continuation / ResourceSelection …… PASS（单测 40）
-- [x] Stable canonical resource identity / Stable point_id …… PASS（换算+重连测试）
+- [x] Descriptor / Probe / Browse / Continuation / ResourceSelection …… PASS（单测 47）
+- [x] Stable canonical resource identity / Stable point_id …… PASS（换算+重连+Stop/Start 测试）
 - [x] Read scalar / typed values / Bad Status / Poll / Subscribe …… PASS
 - [x] Reconnect / Stop / Session-loss / Invalid config fail closed …… PASS
+  （含 Subscribe-only `SESSION_LOST` 双门：Err 而非 Stopped、重连同 point_id）
+- [x] 统一 teardown 出口（early-Err 也 bounded disconnect 恰一次）…… PASS
+- [x] Checked numeric conversions（port/queue/index）+ Secret-safe Debug …… PASS
 - [x] Shared Data contract（descriptor/resource/discovery 合同门）…… PASS
-- [x] No Core sinumerik branch / No Event / No Control …… PASS（本目录内，无 Core 改动）
+- [x] Manager 级 Data E2E（真子进程→wire→Configure→PointMap→盖戳→Stop）…… PASS
+- [x] No Core sinumerik branch / No Event / No Control …… PASS（无 Core 改动）
 - [x] 确定性 fixture（`src/fixture.rs`，冻结已验证语义，PR12 在此补回归）
 - [ ] 真机验证（PR12，不在本 PR）
 

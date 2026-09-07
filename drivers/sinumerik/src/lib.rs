@@ -46,7 +46,7 @@ use mesa_core_types::{
     PointDescriptor, PointMap, ensure_unique_point_keys,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
-use mesa_opcua_transport::{FakeOpcUaTransport, NativeOpcUaTransport, OpcUaTransport};
+use mesa_opcua_transport::{NativeOpcUaTransport, OpcUaTransport};
 use tokio_util::sync::CancellationToken;
 
 /// 驱动 ID（Core 侧无分支；仅 Descriptor identity 与 driver.toml 声明）。
@@ -221,10 +221,13 @@ impl Driver for SinumerikDriver {
         }
         // transport 与采集/探测/浏览共享同一会话实例：创建一次，连接持有同一 Arc，
         // probe/browse/run 复用它，绝不另建第二会话。
+        // Fake 路径（测试专用门控）直接装载确定性 fixture（`fixture::sinumerik_shaped_fake`），
+        // 使 Manager 级 E2E 无需真机即可走通真实子进程路径；行为仍受
+        // MESA_ALLOW_FAKE_NATIVE=1 门控，生产 Native 路径零影响。
         let transport: Arc<dyn OpcUaTransport> = if use_native {
             Arc::new(NativeOpcUaTransport::new(cfg.connect_options()))
         } else {
-            Arc::new(FakeOpcUaTransport::new())
+            Arc::new(crate::fixture::sinumerik_shaped_fake())
         };
         Ok(Box::new(SinumerikConnection {
             cfg,
@@ -1285,7 +1288,7 @@ fn subscribe_kind_from_config(
 mod tests {
     use super::*;
     use mesa_core_types::{DriverBinding, ResourceSelection, SelectedOutput, TaskMode};
-    use mesa_opcua_transport::{UaBrowsePage, UaNodeRef, fake_browse_node};
+    use mesa_opcua_transport::{FakeOpcUaTransport, UaBrowsePage, UaNodeRef, fake_browse_node};
     use serde_json::json;
 
     const STD_NS: &str = "http://opcfoundation.org/UA/";
