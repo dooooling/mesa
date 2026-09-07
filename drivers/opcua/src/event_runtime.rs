@@ -122,22 +122,26 @@ async fn run_event_task_inner(
         }
     };
     if opcua_types::StatusCode::from(created.status_code).is_good() {
-        // §26：核心 BaseEvent clauses 必须全 Good；Condition clauses 允许
-        // Empty/BAD（服务器不支持条件字段是正常情况，非 filter 定义非法）。
-        let base_bad = created
+        // 位置契约要求全部 clause Good：任一 BAD 都意味着服务端解析出的通知
+        // 数组必然形变（有的栈丢弃坏 clause，有的填 null，行为不统一），绝不
+        // 在"缺字段"上继续运行。Condition 字段对非 Condition occurrence 返回
+        // Empty 值是正常的（§26）——那是值层面的事；定义层 invalid 即失败。
+        let bad: Vec<u32> = created
             .select_clause_statuses
             .iter()
-            .take(8)
-            .filter(|s| !opcua_types::StatusCode::from(**s).is_good())
-            .count();
-        if base_bad > 0 {
+            .enumerate()
+            .filter(|(_, s)| !opcua_types::StatusCode::from(**s).is_good())
+            .map(|(i, _)| i as u32)
+            .collect();
+        if !bad.is_empty() {
             rollback_subscription(transport, sub.id).await;
             return Err(SdkDriverError::new(
                 ErrorKind::Connection,
                 "OPCUA_EVENT_FILTER_REJECTED",
                 format!(
-                    "task `{}`: {base_bad} 个核心事件 clause 被服务器拒绝",
-                    task.id
+                    "task `{}`: {} 个事件 clause 被服务器拒绝（索引 {bad:?}）",
+                    task.id,
+                    bad.len()
                 ),
             ));
         }
@@ -437,10 +441,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_task_base_clause_rejected_fails() {
+    async fn event_task_any_clause_rejected_fails() {
         use opcua_types::StatusCode;
+        // 注意：故意 BAD 一个非 Base clause（Enabled，索引 12）——位置契约
+        // 要求 19 个全 Good，任何一个 BAD 都必须拒绝（形变即违约）。
         let mut clauses = vec![StatusCode::Good; 19];
-        clauses[0] = StatusCode::BadNotSupported;
+        clauses[12] = StatusCode::BadNotSupported;
         let fake = Arc::new(
             FakeOpcUaTransport::new()
                 .with_namespace_array(test_namespaces())
