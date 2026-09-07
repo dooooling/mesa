@@ -1,6 +1,8 @@
-[env]
-MESA_HEARTBEAT_FAST = "1"
-MESA_RECONNECT_FAST = "1"
+# 注意：测试提速开关（heartbeat/reconnect fast）不得放在这里全局启用。
+# 全局 fast heartbeat 会污染所有 cargo test（60s soak 也跑 1s×2 激进判死，
+# CI 调度抖动即误判 unresponsive，进而跳过 graceful Shutdown 引发 drain 超时）。
+# 需要快速 lifecycle 的测试按显式启用原则自备（如 event_store_faults 的
+# set_var 模式，或 Session::connect_with_heartbeat 显式传参）。
 
 [alias]
 test-contract = "test -p mesa-contract-tests -- --test-threads=1"

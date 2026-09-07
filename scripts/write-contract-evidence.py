@@ -40,6 +40,8 @@ SUITES = [
     "event_store_faults",
     # PR11 SINUMERIK Read-only V1：真子进程 Data E2E（fixture 种子，无需真机）。
     "sinumerik_data_e2e",
+    # Hotfix Stop-vs-failure lifecycle gate：driver 死亡后显式 Stop 有界显式。
+    "stop_lifecycle",
 ]
 REQUIRED_SET = set(SUITES)
 
@@ -91,7 +93,7 @@ def main():
         "dirty": not is_clean_tree(),
     }
     # 防御：保证集合完整性（Contract Gate 验证行为契约，不含 build_profile）
-    assert set(doc["suites"]) == REQUIRED_SET and doc["total"] == len(SUITES) == 26
+    assert set(doc["suites"]) == REQUIRED_SET and doc["total"] == len(SUITES) == 27
     out.write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"wrote {out} suites={len(SUITES)} sha={sha} dirty={doc['dirty']}")
 
