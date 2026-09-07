@@ -177,7 +177,7 @@ impl Harness {
         ordered
     }
 
-    async fn stop(self) {
+    async fn stop(mut self) {
         self.shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(10), self.run_handle)
             .await
@@ -275,4 +275,26 @@ async fn native_e2e_scope_conditions_filters_base_events() {
         "E1 必须被 scope 过滤（3s 内无新事件），实际 {extra:?}"
     );
     h.stop().await;
+}
+
+/// P0-3：真断线 Gate。E1 收到后杀服务器（TCP 断 + 端口释放）→ client 重试
+/// 耗尽 → event-loop 结束 → transport 守望关 producer → worker 必须以
+/// `OPCUA_EVENT_SESSION_LOST` fail 当前 attempt（有限时间内，不得永久 RUNNING）。
+#[tokio::test]
+async fn native_e2e_session_loss_fails_attempt() {
+    let mut h = Harness::start("all").await;
+    h.probe_barrier().await;
+    h.srv.trigger(&e1_base());
+    let got = h.collect_ids(&[eid_of(0xE1)]).await;
+    assert_eq!(got.len(), 1);
+    // 杀服务器（abort：TCP 断 + 端口释放，模拟掉电）。注意：刻意不 cancel
+    // shutdown——worker 必须走 session-loss 失败路径，而非正常 Stop 路径。
+    h.srv.kill().await;
+    let res = tokio::time::timeout(Duration::from_secs(90), &mut h.run_handle)
+        .await
+        .expect("90s 内 run 必须结束（不得永久 RUNNING）")
+        .expect("run 任务不 panic");
+    let err = res.expect_err("会话死亡必须 fail 当前 attempt");
+    assert_eq!(err.code, "OPCUA_EVENT_SESSION_LOST");
+    h.shutdown.cancel();
 }

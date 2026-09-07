@@ -1466,9 +1466,19 @@ impl DriverConnection for OpcUaConnection {
         }
         // §21 连接 teardown 末端：best-effort disconnect（会话槽位清空，
         // 下次 Start 经 ensure_session 重建）。失败仅诊断：不掩盖原始错误，
-        // 不让干净 Stop 失败。
-        if let Err(e) = self.transport.disconnect().await {
-            tracing::warn!(error = %e, "OPC UA run 结束 disconnect 失败（仅诊断）");
+        // 不让干净 Stop 失败。必须加 bound：对已死会话发 CloseSession 可能
+        // 永不返回（P0-3），teardown 挂起会把已经判定的 Err/Ok 拖成永久 RUNNING。
+        let dc_timeout = std::time::Duration::from_millis(self.cfg.timeout_ms);
+        match tokio::time::timeout(dc_timeout, self.transport.disconnect()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "OPC UA run 结束 disconnect 失败（仅诊断）");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "OPC UA run 结束 disconnect 超时（仅诊断，会话槽位已在 transport 内清空）"
+                );
+            }
         }
         if let Some(e) = final_err {
             return Err(e);
