@@ -31,6 +31,7 @@ pub use value::{
     LastKnownSample, PointSpec, decode_data_value, parse_data_type, status_to_quality,
 };
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use mesa_core_types::{
@@ -250,7 +251,6 @@ struct TaskPlan {
     point_indices: Vec<usize>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 struct PlanSnapshot {
     revision: u64,
@@ -259,7 +259,9 @@ struct PlanSnapshot {
     map: Option<PointMap>,
 }
 
-struct SinumerikConnection {
+/// 单个 SINUMERIK 运行时连接（经 [`SinumerikDriver::open_connection`] 或
+/// [`SinumerikConnection::with_transport`] 构造）。
+pub struct SinumerikConnection {
     cfg: SinumerikConnConfig,
     /// 采集/探测/浏览共享的传输会话（open 时一次创建，同一 Arc）。
     transport: Arc<dyn OpcUaTransport>,
@@ -276,7 +278,8 @@ impl std::fmt::Debug for SinumerikConnection {
 }
 
 impl SinumerikConnection {
-    /// 测试/Fixture 注入脚本化 transport（生产经 `open_connection` 构造）。
+    /// 测试/Fixture 注入脚本化 transport（生产经 `open_connection` 构造；
+    /// contract 测试与确定性 fixture 共用本入口，避免第二套建连逻辑）。
     pub fn with_transport(cfg: SinumerikConnConfig, transport: Arc<dyn OpcUaTransport>) -> Self {
         Self {
             cfg,
@@ -388,8 +391,7 @@ impl DriverConnection for SinumerikConnection {
                         });
                     }
                 }
-                let (kind, _interval) = task_kind_from_mode(task, &task.id)?;
-                let _ = _interval;
+                let kind = task_kind_from_mode(task, &task.id)?;
                 new_tasks.push(TaskPlan {
                     id: task.id.clone(),
                     kind,
@@ -492,8 +494,7 @@ impl DriverConnection for SinumerikConnection {
                     data_type,
                 });
             }
-            let (kind, _interval) = task_kind_from_binding(task, &task.id, is_poll)?;
-            let _ = _interval;
+            let kind = task_kind_from_binding(task, &task.id, is_poll)?;
             new_tasks.push(TaskPlan {
                 id: task.id.clone(),
                 kind,
@@ -730,19 +731,388 @@ impl DriverConnection for SinumerikConnection {
         Ok((nodes, next_cursor))
     }
 
-    /// 只读数据路径在后续 commit 落地（Poll → Subscribe → 重连硬化）。
-    /// 此处先显式 Unsupported，避免"静默无数据"被误读为正常空闲。
+    /// 只读采集主循环（Checkpoint C/D）。
+    ///
+    /// 不变量（Review Gate）：
+    /// - 每次 run 用新鲜 NamespaceArray 把 canonical URI 换算为当前 index
+    ///   （重连/index 漂移自愈；canonical 不变 → point_id 不漂）；
+    /// - 旧 session 不继续产数据（writer 按 epoch 丢弃，见 SDK；本驱动 Stop 后
+    ///   不再 publish，teardown 做有界 disconnect）；
+    /// - 任一任务 Err 即 cancel 全体并 reap（轻量 supervisor，与通用 OPC UA 同形）；
+    /// - teardown 永不掩盖原始错误（disconnect 失败/超时仅诊断）。
     async fn run(
         &mut self,
-        _sink: DataSink,
-        _shutdown: CancellationToken,
+        sink: DataSink,
+        shutdown: CancellationToken,
     ) -> Result<(), SdkDriverError> {
-        let _ = _sink;
-        Err(SdkDriverError::new(
-            mesa_core_types::ErrorKind::Unsupported,
-            "READ_PATH_NOT_YET",
-            "只读数据路径在后续 commit 落地（当前仅 Descriptor/Probe/Browse/Identity）",
-        ))
+        use mesa_core_types::{DataBatch, now_unix_ns};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        let snap = self.plan.as_ref().ok_or_else(|| {
+            SdkDriverError::new(
+                mesa_core_types::ErrorKind::Internal,
+                "NO_PLAN",
+                "run 前未 configure+apply",
+            )
+        })?;
+        // V1 无事件面：零任务的 run 是无意义空转，直接 fail-closed。
+        if snap.tasks.is_empty() {
+            return Err(SdkDriverError::configuration(
+                "EMPTY_PLAN",
+                "无采集任务（sinumerik V1 只读：至少一个 poll/subscribe 任务）",
+            ));
+        }
+        let map = snap.map.as_ref().ok_or_else(|| {
+            SdkDriverError::new(
+                mesa_core_types::ErrorKind::Internal,
+                "NO_POINT_MAP",
+                "run 前未 apply_point_map",
+            )
+        })?;
+        tracing::info!(
+            revision = snap.revision,
+            tasks = snap.tasks.len(),
+            "SINUMERIK run 启动"
+        );
+
+        // 建会话：失败由 Manager 退避重建（fail-closed，不吞错）。
+        if let Err(e) = self.transport.connect().await {
+            return Err(SdkDriverError::new(
+                mesa_core_types::ErrorKind::Connection,
+                "CONNECT_FAILED",
+                e.to_string(),
+            ));
+        }
+        // 本次 run 的命名空间快照：重连后 URI→index 重新换算，index 漂移自愈。
+        let namespaces = self.transport.read_namespace_array().await.map_err(|e| {
+            SdkDriverError::new(
+                mesa_core_types::ErrorKind::Connection,
+                "NAMESPACE_FAILED",
+                format!("run 启动 NamespaceArray 读取失败: {e}"),
+            )
+        })?;
+        // 全部 canonical 点一次换算（缺 URI 即 fail-closed，不带病运行）。
+        let mut resolved: Vec<(PointSpec, u32, mesa_opcua_transport::UaNodeRef)> = Vec::new();
+        for point in &snap.points {
+            let pid = map.get(&point.key).ok_or_else(|| {
+                SdkDriverError::configuration(
+                    "MISSING_POINT_ID",
+                    format!("point `{}` 缺少映射", point.key),
+                )
+            })?;
+            let node = point.node.resolve(&namespaces).map_err(|e| {
+                SdkDriverError::new(
+                    mesa_core_types::ErrorKind::Address,
+                    "UNKNOWN_NAMESPACE",
+                    format!("point `{}` 换算失败: {e}", point.key),
+                )
+            })?;
+            resolved.push((point.clone(), *pid, node));
+        }
+        let resolved = Arc::new(resolved);
+
+        let seq = Arc::new(AtomicU64::new(1));
+        let mut set: tokio::task::JoinSet<Result<(), SdkDriverError>> = tokio::task::JoinSet::new();
+        for task in &snap.tasks {
+            let indices = task.point_indices.clone();
+            let points: Vec<(PointSpec, u32, mesa_opcua_transport::UaNodeRef)> = indices
+                .iter()
+                .map(|&i| {
+                    let (spec, pid, node) = &resolved[i];
+                    (spec.clone(), *pid, node.clone())
+                })
+                .collect();
+            let sink = sink.clone();
+            let shutdown = shutdown.clone();
+            let seq = Arc::clone(&seq);
+            let transport = Arc::clone(&self.transport);
+            let task_id = task.id.clone();
+            match task.kind.clone() {
+                TaskKind::Poll { interval_ms } => {
+                    let interval = Duration::from_millis(interval_ms);
+                    set.spawn(async move {
+                        let mut ticker = tokio::time::interval(interval);
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        // §5.5 last-known 连续性：按 point_id 缓存最近 GOOD 的 typed 值
+                        let mut last_known: HashMap<u32, LastKnownSample> = HashMap::new();
+                        loop {
+                            tokio::select! {
+                                _ = ticker.tick() => {},
+                                _ = shutdown.cancelled() => break,
+                            }
+                            let nodes: Vec<mesa_opcua_transport::UaNodeRef> =
+                                points.iter().map(|(_, _, n)| n.clone()).collect();
+                            let data_values = match transport.read(&nodes).await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::error!(task=%task_id, error=%e, "SINUMERIK 读失败");
+                                    return Err(SdkDriverError::new(
+                                        mesa_core_types::ErrorKind::Connection,
+                                        "READ_FAILED",
+                                        e.to_string(),
+                                    ));
+                                }
+                            };
+                            if data_values.len() != points.len() {
+                                tracing::warn!(
+                                    task=%task_id,
+                                    got=data_values.len(),
+                                    expected=points.len(),
+                                    "SINUMERIK 返回数量不一致"
+                                );
+                                continue;
+                            }
+                            let mut batch_vals = Vec::with_capacity(points.len());
+                            for ((spec, pid, _), dv) in points.iter().zip(data_values) {
+                                batch_vals.push(decode_data_value(spec, *pid, dv, &mut last_known));
+                            }
+                            if batch_vals.is_empty() {
+                                continue;
+                            }
+                            sink.publish(DataBatch {
+                                connection_handle: 0,
+                                stream_epoch: 0,
+                                sequence: seq.fetch_add(1, Ordering::Relaxed),
+                                timestamp_ns: now_unix_ns(),
+                                values: batch_vals,
+                                mono_ns: None,
+                            })
+                            .await;
+                        }
+                        Ok::<(), SdkDriverError>(())
+                    });
+                }
+                TaskKind::Subscribe {
+                    publishing_interval_ms,
+                    sampling_interval_ms,
+                    queue_size,
+                    discard_oldest,
+                } => {
+                    set.spawn(async move {
+                        use mesa_opcua_transport::{UaMonitoredItemSpec, UaSubscriptionSpec};
+                        // 分裂生命周期第一步：仅建订阅（保留 Server Revised 供诊断）
+                        let sub = match transport
+                            .create_subscription(UaSubscriptionSpec {
+                                publishing_interval_ms,
+                                lifetime_count: 30,
+                                max_keep_alive_count: 10,
+                                max_notifications_per_publish: 0,
+                                priority: 0,
+                                publishing_enabled: true,
+                            })
+                            .await
+                        {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!(task=%task_id, error=%e, "SINUMERIK 订阅失败");
+                                return Err(SdkDriverError::new(
+                                    mesa_core_types::ErrorKind::Connection,
+                                    "SUBSCRIBE_FAILED",
+                                    e.to_string(),
+                                ));
+                            }
+                        };
+                        tracing::info!(
+                            task=%task_id,
+                            sub_id=sub.id,
+                            requested=sub.requested_publishing_interval_ms,
+                            revised=sub.revised_publishing_interval_ms,
+                            "SINUMERIK 订阅已建立（revised 由 Server 协商）"
+                        );
+                        // 第二步：独立建监控项（client_handle = idx+1）
+                        let mi_specs: Vec<UaMonitoredItemSpec> = points
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, (_, _, node))| UaMonitoredItemSpec {
+                                node: node.clone(),
+                                client_handle: (idx as u32) + 1,
+                                sampling_interval_ms,
+                                queue_size,
+                                discard_oldest,
+                            })
+                            .collect();
+                        let results = match transport
+                            .create_monitored_items(sub.id, &mi_specs)
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                // 服务级失败必须回滚刚建的空订阅（cleanup 失败仅诊断）。
+                                if let Err(cleanup) = transport.delete_subscription(sub.id).await {
+                                    tracing::debug!(
+                                        sub_id = sub.id,
+                                        ?cleanup,
+                                        "订阅创建失败后回滚删订阅失败（仅诊断）"
+                                    );
+                                }
+                                return Err(SdkDriverError::new(
+                                    mesa_core_types::ErrorKind::Connection,
+                                    "SUBSCRIBE_FAILED",
+                                    e.to_string(),
+                                ));
+                            }
+                        };
+                        // handle -> (spec, pid)；单项 BAD 合成初始 BAD 事件并隔离该项
+                        //（失败项永不到达 live 流，不合成则首个 live 前该点"无值"而非
+                        // LastKnown/Placeholder）。client_handle = idx+1，反查 points。
+                        let mut handle_map: HashMap<u32, (PointSpec, u32)> = HashMap::new();
+                        let mut ok_ids = Vec::new();
+                        let mut initial_bads: Vec<(usize, opcua_types::StatusCode)> = Vec::new();
+                        for r in &results {
+                            let status = opcua_types::StatusCode::from(r.status_code);
+                            let idx = (r.client_handle as usize).checked_sub(1);
+                            let point = idx.and_then(|i| points.get(i));
+                            match (status.is_good(), point) {
+                                (true, Some((spec, pid, _))) => {
+                                    handle_map.insert(r.client_handle, (spec.clone(), *pid));
+                                    ok_ids.push(r.monitored_item_id);
+                                }
+                                _ => {
+                                    if let Some(idx) = idx {
+                                        initial_bads.push((idx, status));
+                                    }
+                                }
+                            }
+                        }
+                        let mut sub_rx = sub.receiver;
+                        let mut last_known: HashMap<u32, LastKnownSample> = HashMap::new();
+                        // 初始 BAD 有序在 live 之前（与通用 OPC UA 同序）。
+                        for (idx, status) in initial_bads {
+                            let Some((spec, pid, _)) = points.get(idx) else {
+                                continue;
+                            };
+                            let dv = opcua_types::DataValue {
+                                value: None,
+                                status: Some(status),
+                                source_timestamp: None,
+                                source_picoseconds: None,
+                                server_timestamp: None,
+                                server_picoseconds: None,
+                            };
+                            let pv = decode_data_value(spec, *pid, dv, &mut last_known);
+                            sink.publish(DataBatch {
+                                connection_handle: 0,
+                                stream_epoch: 0,
+                                sequence: seq.fetch_add(1, Ordering::Relaxed),
+                                timestamp_ns: now_unix_ns(),
+                                values: vec![pv],
+                                mono_ns: None,
+                            })
+                            .await;
+                        }
+                        // 订阅事件循环：批量聚合（Latest-Wins 由 Sink 承接），
+                        // KeepAlive 无事件不产批、不递增 sequence。
+                        loop {
+                            let first = tokio::select! {
+                                ev = sub_rx.recv() => ev,
+                                _ = shutdown.cancelled() => break,
+                            };
+                            let Some(first_ev) = first else {
+                                tracing::warn!(task=%task_id, "订阅通道关闭");
+                                break;
+                            };
+                            let mut events = vec![first_ev];
+                            while let Ok(ev) = sub_rx.try_recv() {
+                                events.push(ev);
+                                if events.len() >= 64 {
+                                    break;
+                                }
+                            }
+                            let mut batch_vals = Vec::with_capacity(events.len());
+                            for ev in events {
+                                let Some((spec, pid)) = handle_map.get(&ev.client_handle) else {
+                                    tracing::warn!(
+                                        task=%task_id,
+                                        handle=%ev.client_handle,
+                                        "未知 client_handle"
+                                    );
+                                    continue;
+                                };
+                                batch_vals.push(decode_data_value(
+                                    spec,
+                                    *pid,
+                                    ev.data_value,
+                                    &mut last_known,
+                                ));
+                            }
+                            if batch_vals.is_empty() {
+                                continue;
+                            }
+                            sink.publish(DataBatch {
+                                connection_handle: 0,
+                                stream_epoch: 0,
+                                sequence: seq.fetch_add(1, Ordering::Relaxed),
+                                timestamp_ns: now_unix_ns(),
+                                values: batch_vals,
+                                mono_ns: None,
+                            })
+                            .await;
+                        }
+                        // 按序清理但永不短路：删项失败也 best-effort 删订阅
+                        //（删订阅会收掉所属监控项），失败仅诊断。
+                        if !ok_ids.is_empty()
+                            && let Err(e) = transport.delete_monitored_items(sub.id, &ok_ids).await
+                        {
+                            tracing::warn!(
+                                sub_id = sub.id,
+                                error = %e,
+                                "shutdown 删监控项失败（仅诊断，继续删订阅）"
+                            );
+                        }
+                        if let Err(e) = transport.delete_subscription(sub.id).await {
+                            tracing::warn!(
+                                sub_id = sub.id,
+                                error = %e,
+                                "shutdown 删订阅失败（仅诊断）"
+                            );
+                        }
+                        Ok::<(), SdkDriverError>(())
+                    });
+                }
+            }
+        }
+
+        let mut final_err: Option<SdkDriverError> = None;
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if final_err.is_none() {
+                        final_err = Some(e);
+                    }
+                    // 任一 child Err 即 cancel 全体，继续 reap 剩余 workers。
+                    shutdown.cancel();
+                }
+                Err(join_err) => {
+                    tracing::error!(%join_err, "SINUMERIK 任务 panic");
+                    if final_err.is_none() {
+                        final_err = Some(SdkDriverError::new(
+                            mesa_core_types::ErrorKind::Internal,
+                            "TASK_PANIC",
+                            join_err.to_string(),
+                        ));
+                    }
+                    shutdown.cancel();
+                }
+            }
+        }
+        // teardown 末端：best-effort disconnect（有界，防已死会话 CloseSession 永不返回）。
+        // 失败/超时仅诊断：不掩盖原始错误，不让干净 Stop 失败。
+        let dc_timeout = std::time::Duration::from_millis(self.cfg.timeout_ms);
+        match tokio::time::timeout(dc_timeout, self.transport.disconnect()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "SINUMERIK run 结束 disconnect 失败（仅诊断）");
+            }
+            Err(_) => {
+                tracing::warn!("SINUMERIK run 结束 disconnect 超时（仅诊断）");
+            }
+        }
+        if let Some(e) = final_err {
+            return Err(e);
+        }
+        Ok(())
     }
 }
 
@@ -751,10 +1121,7 @@ impl DriverConnection for SinumerikConnection {
 // ---------------------------------------------------------------------------
 
 /// 通用绑定按 TaskMode 派生 TaskKind（含 subscribe 参数缺省，与通用 OPC UA 同口径）。
-fn task_kind_from_mode(
-    task: &AcquisitionTask,
-    task_id: &str,
-) -> Result<(TaskKind, u64), SdkDriverError> {
+fn task_kind_from_mode(task: &AcquisitionTask, task_id: &str) -> Result<TaskKind, SdkDriverError> {
     match task.mode {
         mesa_core_types::TaskMode::Poll => {
             let interval = task.interval_ms.ok_or_else(|| {
@@ -766,22 +1133,13 @@ fn task_kind_from_mode(
                     "interval_ms 需 >0",
                 ));
             }
-            Ok((
-                TaskKind::Poll {
-                    interval_ms: interval,
-                },
-                interval,
-            ))
+            Ok(TaskKind::Poll {
+                interval_ms: interval,
+            })
         }
         mesa_core_types::TaskMode::Subscribe => {
-            let (kind, interval) = subscribe_kind_from_config(&task.binding.config, task_id)?;
-            Ok((kind, interval))
+            subscribe_kind_from_config(&task.binding.config, task_id)
         }
-        _ => Err(SdkDriverError::new(
-            mesa_core_types::ErrorKind::Unsupported,
-            "MODE_NOT_SUPPORTED",
-            format!("task `{task_id}`: sinumerik node 仅支持 poll/subscribe"),
-        )),
     }
 }
 
@@ -789,7 +1147,7 @@ fn task_kind_from_binding(
     task: &AcquisitionTask,
     task_id: &str,
     is_poll: bool,
-) -> Result<(TaskKind, u64), SdkDriverError> {
+) -> Result<TaskKind, SdkDriverError> {
     if is_poll {
         let interval = task.interval_ms.ok_or_else(|| {
             SdkDriverError::configuration("INVALID_TASK", "poll 缺少 interval_ms")
@@ -800,12 +1158,9 @@ fn task_kind_from_binding(
                 "interval_ms 需 >0",
             ));
         }
-        Ok((
-            TaskKind::Poll {
-                interval_ms: interval,
-            },
-            interval,
-        ))
+        Ok(TaskKind::Poll {
+            interval_ms: interval,
+        })
     } else {
         subscribe_kind_from_config(&task.binding.config, task_id)
     }
@@ -814,7 +1169,7 @@ fn task_kind_from_binding(
 fn subscribe_kind_from_config(
     config: &serde_json::Value,
     task_id: &str,
-) -> Result<(TaskKind, u64), SdkDriverError> {
+) -> Result<TaskKind, SdkDriverError> {
     let publishing_interval_ms = config
         .get("publishing_interval_ms")
         .and_then(|v| v.as_u64())
@@ -837,20 +1192,13 @@ fn subscribe_kind_from_config(
             format!("task `{task_id}`: publishing/sampling/queue 需 >0"),
         ));
     }
-    Ok((
-        TaskKind::Subscribe {
-            publishing_interval_ms,
-            sampling_interval_ms,
-            queue_size,
-            discard_oldest,
-        },
+    Ok(TaskKind::Subscribe {
         publishing_interval_ms,
-    ))
+        sampling_interval_ms,
+        queue_size,
+        discard_oldest,
+    })
 }
-
-// 抑制未使用告警：run 落地后启用（TaskPlan.kind/point_indices、PlanSnapshot 全字段）。
-#[allow(dead_code)]
-fn _plan_fields_used(_plan: &TaskPlan) {}
 
 #[cfg(test)]
 mod tests {
@@ -1207,5 +1555,527 @@ mod tests {
             .await
             .expect_err("PR11 非空事件必须拒绝");
         assert_eq!(err.code, "EVENT_NOT_SUPPORTED");
+    }
+}
+
+/// run 级测试（Checkpoint C/D）：Poll / Subscribe / 重连 / Stop。
+///
+/// 全部经脚本化 Fake（生产 transport 零改动）；会话/teardown 语义与通用 OPC UA
+/// 驱动同形（supervisor、回滚、有界 disconnect、epoch 盖戳）。
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+    use mesa_core_types::{
+        DataBatch, DriverBinding, GenericBinding, ResourceSelection, SelectedOutput, TaskMode,
+    };
+    use mesa_driver_sdk::{DataSink, EventBatch};
+    use mesa_opcua_transport::{
+        FakeLiveBatch, FakeOpcUaTransport, OpcUaTransport, UaBrowsePage, UaBrowseRequest,
+        UaDataValue, UaEventMonitoredItemResult, UaEventMonitoredItemSpec, UaEventSubscription,
+        UaMonitoredItemId, UaMonitoredItemResult, UaMonitoredItemSpec, UaNodeRef, UaOperation,
+        UaSubscription, UaSubscriptionId, UaSubscriptionSpec, UaTransportError,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::mpsc;
+
+    const STD_NS: &str = "http://opcfoundation.org/UA/";
+    const SIEMENS_NS: &str = "http://www.siemens.com/sinumerik";
+
+    fn sink_with_epoch(handle: u32, epoch: u64) -> (DataSink, mpsc::Receiver<DataBatch>) {
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<mesa_driver_protocol::pb::Envelope>(8);
+        let (data_tx, data_rx) = mpsc::channel::<DataBatch>(64);
+        let (event_tx, _event_rx) = mpsc::channel::<EventBatch>(8);
+        (
+            DataSink::for_test(ctrl_tx, data_tx, event_tx).for_connection(handle, epoch),
+            data_rx,
+        )
+    }
+
+    fn generic_task(
+        id: &str,
+        mode: TaskMode,
+        interval_ms: Option<u64>,
+        node_id: &str,
+        data_type: &str,
+        point_key: &str,
+        extra: serde_json::Value,
+    ) -> AcquisitionTask {
+        let mut parameters = serde_json::json!({"node_id": node_id, "data_type": data_type});
+        if let Some(obj) = extra.as_object() {
+            for (k, v) in obj {
+                parameters[k] = v.clone();
+            }
+        }
+        AcquisitionTask {
+            id: id.into(),
+            mode,
+            interval_ms,
+            binding: DriverBinding {
+                kind: GENERIC_BINDING_KIND.into(),
+                config: serde_json::to_value(GenericBinding {
+                    selections: vec![ResourceSelection {
+                        resource_id: "node".into(),
+                        parameters,
+                        outputs: vec![SelectedOutput {
+                            output: "value".into(),
+                            point_key: point_key.into(),
+                        }],
+                    }],
+                })
+                .unwrap(),
+            },
+        }
+    }
+
+    fn poll_task(node_id: &str, point_key: &str) -> AcquisitionTask {
+        generic_task(
+            "t-poll",
+            TaskMode::Poll,
+            Some(50),
+            node_id,
+            "F64",
+            point_key,
+            serde_json::json!({}),
+        )
+    }
+
+    async fn next_batch(rx: &mut mpsc::Receiver<DataBatch>, what: &str) -> DataBatch {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{what} 超时"))
+            .expect("通道不得关闭")
+    }
+
+    /// 会话杀死模拟：前 N 次 read 成功，之后整体失败（READ_FAILED 路径）。
+    /// 其余方法全部透传给内部 Fake（只测"会话中途死亡"，不测 transport 本体）。
+    struct FlakyTransport {
+        inner: FakeOpcUaTransport,
+        ok_reads_left: AtomicUsize,
+    }
+
+    impl FlakyTransport {
+        fn new(inner: FakeOpcUaTransport, ok_reads: usize) -> Self {
+            Self {
+                inner,
+                ok_reads_left: AtomicUsize::new(ok_reads),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OpcUaTransport for FlakyTransport {
+        async fn connect(&self) -> Result<(), UaTransportError> {
+            self.inner.connect().await
+        }
+        async fn disconnect(&self) -> Result<(), UaTransportError> {
+            self.inner.disconnect().await
+        }
+        async fn read(&self, nodes: &[UaNodeRef]) -> Result<Vec<UaDataValue>, UaTransportError> {
+            match self
+                .ok_reads_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            {
+                Ok(_) => self.inner.read(nodes).await,
+                Err(_) => Err(UaTransportError::service(
+                    UaOperation::Read,
+                    Some(opcua_types::StatusCode::BadTimeout),
+                    true,
+                    "Flaky: 会话已杀死",
+                )),
+            }
+        }
+        async fn browse(&self, request: UaBrowseRequest) -> Result<UaBrowsePage, UaTransportError> {
+            self.inner.browse(request).await
+        }
+        async fn browse_next(
+            &self,
+            continuation_point: Vec<u8>,
+        ) -> Result<UaBrowsePage, UaTransportError> {
+            self.inner.browse_next(continuation_point).await
+        }
+        async fn release_continuation(
+            &self,
+            continuation_point: Vec<u8>,
+        ) -> Result<(), UaTransportError> {
+            self.inner.release_continuation(continuation_point).await
+        }
+        async fn read_namespace_array(&self) -> Result<Vec<String>, UaTransportError> {
+            self.inner.read_namespace_array().await
+        }
+        async fn create_subscription(
+            &self,
+            spec: UaSubscriptionSpec,
+        ) -> Result<UaSubscription, UaTransportError> {
+            self.inner.create_subscription(spec).await
+        }
+        async fn create_monitored_items(
+            &self,
+            subscription_id: UaSubscriptionId,
+            items: &[UaMonitoredItemSpec],
+        ) -> Result<Vec<UaMonitoredItemResult>, UaTransportError> {
+            self.inner
+                .create_monitored_items(subscription_id, items)
+                .await
+        }
+        async fn delete_monitored_items(
+            &self,
+            subscription_id: UaSubscriptionId,
+            ids: &[UaMonitoredItemId],
+        ) -> Result<(), UaTransportError> {
+            self.inner
+                .delete_monitored_items(subscription_id, ids)
+                .await
+        }
+        async fn delete_subscription(&self, id: UaSubscriptionId) -> Result<(), UaTransportError> {
+            self.inner.delete_subscription(id).await
+        }
+        async fn create_event_subscription(
+            &self,
+            spec: UaSubscriptionSpec,
+        ) -> Result<UaEventSubscription, UaTransportError> {
+            self.inner.create_event_subscription(spec).await
+        }
+        async fn create_event_monitored_items(
+            &self,
+            subscription_id: UaSubscriptionId,
+            items: &[UaEventMonitoredItemSpec],
+        ) -> Result<Vec<UaEventMonitoredItemResult>, UaTransportError> {
+            self.inner
+                .create_event_monitored_items(subscription_id, items)
+                .await
+        }
+    }
+
+    fn speed_fake() -> FakeOpcUaTransport {
+        FakeOpcUaTransport::new()
+            .with_namespace_array(vec![STD_NS.to_string(), SIEMENS_NS.to_string()])
+            .with_read(
+                &UaNodeRef::string(1, "Speed"),
+                opcua_types::DataValue::new_now(1500.0f64),
+            )
+    }
+
+    #[tokio::test]
+    async fn poll_run_publishes_decoded_batch_and_stop_is_clean() {
+        let mut conn = SinumerikConnection::with_transport(
+            SinumerikConnConfig::default(),
+            Arc::new(speed_fake()),
+        );
+        conn.configure(
+            1,
+            vec![poll_task(
+                &format!("nsu={SIEMENS_NS};s=Speed"),
+                "spindle.speed",
+            )],
+        )
+        .await
+        .expect("configure Ok");
+        let mut map = PointMap::new();
+        map.insert("spindle.speed".into(), 1001);
+        conn.apply_point_map(map).await.expect("apply Ok");
+
+        let (sink, mut rx) = sink_with_epoch(7, 3);
+        let shutdown = CancellationToken::new();
+        let sd = shutdown.clone();
+        let mut conn_task = conn;
+        let run_handle = tokio::spawn(async move { conn_task.run(sink, sd).await });
+        let batch = next_batch(&mut rx, "首个 poll 批次").await;
+        // SDK 盖戳：驱动传 0/0，wire 上为绑定 handle/epoch。
+        assert_eq!(batch.connection_handle, 7);
+        assert_eq!(batch.stream_epoch, 3);
+        assert_eq!(batch.values.len(), 1);
+        assert_eq!(batch.values[0].point_id, 1001);
+        assert_eq!(batch.values[0].value, mesa_core_types::Value::F64(1500.0));
+        assert_eq!(batch.values[0].quality, mesa_core_types::Quality::Good);
+        assert_eq!(
+            batch.values[0].value_origin,
+            mesa_core_types::ValueOrigin::Current
+        );
+        // Stop：run 干净退出，不再产出。
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
+            .await
+            .expect("run 必须退出")
+            .expect("run 不 panic")
+            .expect("正常 Stop 必须 Ok");
+    }
+
+    #[tokio::test]
+    async fn poll_bad_point_is_explicit_placeholder() {
+        // 未预置 read 的点 → Fake 单点 BAD → typed placeholder（绝不静默 0）。
+        let mut conn = SinumerikConnection::with_transport(
+            SinumerikConnConfig::default(),
+            Arc::new(
+                FakeOpcUaTransport::new()
+                    .with_namespace_array(vec![STD_NS.to_string(), SIEMENS_NS.to_string()]),
+            ),
+        );
+        conn.configure(
+            1,
+            vec![poll_task(&format!("nsu={SIEMENS_NS};s=Missing"), "missing")],
+        )
+        .await
+        .expect("configure Ok");
+        let mut map = PointMap::new();
+        map.insert("missing".into(), 1002);
+        conn.apply_point_map(map).await.expect("apply Ok");
+
+        let (sink, mut rx) = sink_with_epoch(7, 3);
+        let shutdown = CancellationToken::new();
+        let sd = shutdown.clone();
+        let run_handle = tokio::spawn(async move { conn.run(sink, sd).await });
+        let batch = next_batch(&mut rx, "BAD 批次").await;
+        assert_eq!(batch.values[0].point_id, 1002);
+        assert_eq!(batch.values[0].quality, mesa_core_types::Quality::Bad);
+        assert_eq!(
+            batch.values[0].value_origin,
+            mesa_core_types::ValueOrigin::Placeholder
+        );
+        assert_eq!(batch.values[0].source_timestamp_ns, None);
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
+            .await
+            .expect("run 必须退出")
+            .expect("run 不 panic")
+            .expect("Stop 必须 Ok");
+    }
+
+    #[tokio::test]
+    async fn run_without_plan_or_with_empty_plan_fails_closed() {
+        let (sink, _rx) = sink_with_epoch(7, 3);
+        // 未 configure
+        let mut conn = SinumerikConnection::with_transport(
+            SinumerikConnConfig::default(),
+            Arc::new(speed_fake()),
+        );
+        let err = conn
+            .run(sink, CancellationToken::new())
+            .await
+            .expect_err("未 configure 必须拒绝");
+        assert_eq!(err.code, "NO_PLAN");
+        // 空任务表（V1 无事件可豁免，直接拒绝空转）
+        let (sink, _rx) = sink_with_epoch(7, 3);
+        let mut conn = SinumerikConnection::with_transport(
+            SinumerikConnConfig::default(),
+            Arc::new(speed_fake()),
+        );
+        conn.configure(1, vec![])
+            .await
+            .expect("空表 configure 接受");
+        let mut map = PointMap::new();
+        map.insert("nope".into(), 1);
+        let err = conn
+            .run(sink, CancellationToken::new())
+            .await
+            .expect_err("空任务 run 必须拒绝");
+        assert_eq!(err.code, "EMPTY_PLAN");
+        let _ = map;
+    }
+
+    #[tokio::test]
+    async fn run_unknown_namespace_fails_closed() {
+        // 设备 NamespaceArray 无该 URI（命名空间被改）→ 不带病运行。
+        let mut conn = SinumerikConnection::with_transport(
+            SinumerikConnConfig::default(),
+            Arc::new(FakeOpcUaTransport::new().with_namespace_array(vec![STD_NS.to_string()])),
+        );
+        conn.configure(
+            1,
+            vec![poll_task(&format!("nsu={SIEMENS_NS};s=Speed"), "speed")],
+        )
+        .await
+        .expect("configure 只做语法校验，通过");
+        let mut map = PointMap::new();
+        map.insert("speed".into(), 1001);
+        conn.apply_point_map(map).await.expect("apply Ok");
+        let (sink, _rx) = sink_with_epoch(7, 3);
+        let err = conn
+            .run(sink, CancellationToken::new())
+            .await
+            .expect_err("未知命名空间必须 fail-closed");
+        assert_eq!(err.code, "UNKNOWN_NAMESPACE");
+    }
+
+    #[tokio::test]
+    async fn session_loss_fails_run_and_reconnect_resumes_same_point_id() {
+        // 生命周期核心：kill session → run 报 READ_FAILED（Manager 据此重建）；
+        // 新会话（命名空间 index 已漂移）→ 同一 canonical 同一 point_id，数据继续。
+        let task = poll_task(&format!("nsu={SIEMENS_NS};s=Speed"), "speed");
+        let mut map = PointMap::new();
+        map.insert("speed".into(), 1001);
+
+        // 第一程：1 次成功 read 后会话死亡
+        let flaky = Arc::new(FlakyTransport::new(speed_fake(), 1));
+        let mut conn =
+            SinumerikConnection::with_transport(SinumerikConnConfig::default(), flaky.clone());
+        conn.configure(1, vec![task.clone()])
+            .await
+            .expect("configure");
+        conn.apply_point_map(map.clone()).await.expect("apply");
+        let (sink, mut rx) = sink_with_epoch(7, 3);
+        let err = {
+            let shutdown = CancellationToken::new();
+            conn.run(sink, shutdown)
+                .await
+                .expect_err("会话死亡必须 Err")
+        };
+        assert_eq!(err.code, "READ_FAILED");
+        let first = next_batch(&mut rx, "死亡前批次").await;
+        assert_eq!(first.values[0].point_id, 1001);
+
+        // 第二程：重建连接（index 1→3 漂移），同一 Core 映射 → 同 point_id
+        let revived = FakeOpcUaTransport::new()
+            .with_namespace_array(vec![
+                STD_NS.to_string(),
+                "urn:other".to_string(),
+                "urn:more".to_string(),
+                SIEMENS_NS.to_string(),
+            ])
+            .with_read(
+                &UaNodeRef::string(3, "Speed"),
+                opcua_types::DataValue::new_now(1600.0f64),
+            );
+        let mut conn2 =
+            SinumerikConnection::with_transport(SinumerikConnConfig::default(), Arc::new(revived));
+        conn2.configure(2, vec![task]).await.expect("configure");
+        conn2.apply_point_map(map).await.expect("apply");
+        let (sink2, mut rx2) = sink_with_epoch(7, 4);
+        let shutdown2 = CancellationToken::new();
+        let sd2 = shutdown2.clone();
+        let run2 = tokio::spawn(async move { conn2.run(sink2, sd2).await });
+        let batch2 = next_batch(&mut rx2, "重连后批次").await;
+        assert_eq!(batch2.values[0].point_id, 1001, "point_id 不漂");
+        assert_eq!(batch2.values[0].value, mesa_core_types::Value::F64(1600.0));
+        shutdown2.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), run2)
+            .await
+            .expect("run2 必须退出")
+            .expect("run2 不 panic")
+            .expect("Stop 必须 Ok");
+    }
+
+    #[tokio::test]
+    async fn subscribe_run_forwards_live_and_cleans_up() {
+        // 订阅：live 事件解码转发；shutdown 按序清理（删项+删订阅可观测）。
+        let fake = Arc::new(
+            FakeOpcUaTransport::new()
+                .with_namespace_array(vec![STD_NS.to_string(), SIEMENS_NS.to_string()])
+                .with_live_batch(FakeLiveBatch {
+                    events: vec![(1, opcua_types::DataValue::new_now(42i32))],
+                }),
+        );
+        let mut conn =
+            SinumerikConnection::with_transport(SinumerikConnConfig::default(), fake.clone());
+        conn.configure(
+            1,
+            vec![generic_task(
+                "t-sub",
+                TaskMode::Subscribe,
+                None,
+                &format!("nsu={SIEMENS_NS};s=Counter"),
+                "I32",
+                "counter",
+                serde_json::json!({"publishing_interval_ms": 100}),
+            )],
+        )
+        .await
+        .expect("configure Ok");
+        let mut map = PointMap::new();
+        map.insert("counter".into(), 2001);
+        conn.apply_point_map(map).await.expect("apply Ok");
+
+        let (sink, mut rx) = sink_with_epoch(7, 3);
+        let shutdown = CancellationToken::new();
+        let sd = shutdown.clone();
+        let run_handle = tokio::spawn(async move { conn.run(sink, sd).await });
+        let batch = next_batch(&mut rx, "订阅 live 批次").await;
+        assert_eq!(batch.values[0].point_id, 2001);
+        assert_eq!(batch.values[0].value, mesa_core_types::Value::I32(42));
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
+            .await
+            .expect("run 必须退出")
+            .expect("run 不 panic")
+            .expect("Stop 必须 Ok");
+        // 清理可观测：监控项与订阅均被删除（无泄漏）。
+        assert_eq!(fake.created_subscriptions().len(), 1);
+        assert_eq!(fake.deleted_subscriptions().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn subscribe_single_bad_item_synthesizes_initial_bad_first() {
+        // 单项建项失败 → 初始 BAD 有序在 live 之前（与通用 OPC UA 同序）。
+        let fake = Arc::new(
+            FakeOpcUaTransport::new()
+                .with_namespace_array(vec![STD_NS.to_string(), SIEMENS_NS.to_string()])
+                .with_create_status(
+                    &UaNodeRef::string(1, "Broken"),
+                    opcua_types::StatusCode::BadNodeIdUnknown,
+                )
+                .with_live_batch(FakeLiveBatch {
+                    events: vec![(1, opcua_types::DataValue::new_now(7i32))],
+                }),
+        );
+        let mut conn =
+            SinumerikConnection::with_transport(SinumerikConnConfig::default(), fake.clone());
+        let task = AcquisitionTask {
+            id: "t-sub".into(),
+            mode: TaskMode::Subscribe,
+            interval_ms: None,
+            binding: DriverBinding {
+                kind: GENERIC_BINDING_KIND.into(),
+                config: serde_json::to_value(GenericBinding {
+                    selections: vec![
+                        ResourceSelection {
+                            resource_id: "node".into(),
+                            parameters: serde_json::json!({
+                                "node_id": format!("nsu={SIEMENS_NS};s=Counter"),
+                                "data_type": "I32",
+                            }),
+                            outputs: vec![SelectedOutput {
+                                output: "value".into(),
+                                point_key: "counter".into(),
+                            }],
+                        },
+                        ResourceSelection {
+                            resource_id: "node".into(),
+                            parameters: serde_json::json!({
+                                "node_id": format!("nsu={SIEMENS_NS};s=Broken"),
+                                "data_type": "I32",
+                            }),
+                            outputs: vec![SelectedOutput {
+                                output: "value".into(),
+                                point_key: "broken".into(),
+                            }],
+                        },
+                    ],
+                })
+                .unwrap(),
+            },
+        };
+        conn.configure(1, vec![task]).await.expect("configure Ok");
+        let mut map = PointMap::new();
+        map.insert("counter".into(), 2001);
+        map.insert("broken".into(), 2002);
+        conn.apply_point_map(map).await.expect("apply Ok");
+
+        let (sink, mut rx) = sink_with_epoch(7, 3);
+        let shutdown = CancellationToken::new();
+        let sd = shutdown.clone();
+        let run_handle = tokio::spawn(async move { conn.run(sink, sd).await });
+        // 首批：失败项的合成 BAD（有序在 live 之前）
+        let bad = next_batch(&mut rx, "初始 BAD").await;
+        assert_eq!(bad.values[0].point_id, 2002);
+        assert_eq!(bad.values[0].quality, mesa_core_types::Quality::Bad);
+        // 次批：live 好值
+        let live = next_batch(&mut rx, "live").await;
+        assert_eq!(live.values[0].point_id, 2001);
+        assert_eq!(live.values[0].value, mesa_core_types::Value::I32(7));
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
+            .await
+            .expect("run 必须退出")
+            .expect("run 不 panic")
+            .expect("Stop 必须 Ok");
     }
 }
