@@ -61,6 +61,9 @@ pub enum ResolveError {
     /// URI 不在当前 NamespaceArray 中（设备侧命名空间变化，fail-closed）。
     #[error("命名空间 URI `{uri}` 不在设备 NamespaceArray（{count} 项）中")]
     UnknownNamespace { uri: String, count: usize },
+    /// NamespaceArray 项数超出 u16（理论上不可能；静默 wrap 会指向错误命名空间）。
+    #[error("NamespaceArray 过大（{count} 项），无法换算 index")]
+    TooManyNamespaces { count: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +197,10 @@ impl SinumerikNodeId {
                 uri: self.namespace_uri.clone(),
                 count: namespaces.len(),
             })?;
+        // checked conversion：静默 wrap 会指向错误命名空间，fail-closed。
+        let namespace = u16::try_from(index).map_err(|_| ResolveError::TooManyNamespaces {
+            count: namespaces.len(),
+        })?;
         let identifier = match &self.identifier {
             SinumerikIdentifier::Numeric(n) => UaIdentifier::Numeric(*n),
             SinumerikIdentifier::String(s) => UaIdentifier::String(s.clone()),
@@ -201,7 +208,7 @@ impl SinumerikNodeId {
             SinumerikIdentifier::Opaque(b) => UaIdentifier::Opaque(b.clone()),
         };
         Ok(UaNodeRef {
-            namespace: index as u16,
+            namespace,
             identifier,
         })
     }

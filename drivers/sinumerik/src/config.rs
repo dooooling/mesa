@@ -13,7 +13,7 @@ use mesa_driver_sdk::SdkDriverError;
 // 连接配置
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SinumerikConnConfig {
     pub endpoint_url: String,
     pub timeout_ms: u64,
@@ -23,6 +23,21 @@ pub struct SinumerikConnConfig {
     pub security_mode: String,
     pub username: Option<String>,
     pub password: Option<String>,
+}
+
+// Secret-safe Debug（P1）：password 永不进日志。username 是握手明文身份
+// （OPC UA UserNameIdentityToken 本就明文传输），保留明文以便定位配错用户。
+impl std::fmt::Debug for SinumerikConnConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SinumerikConnConfig")
+            .field("endpoint_url", &self.endpoint_url)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("security_policy", &self.security_policy)
+            .field("security_mode", &self.security_mode)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl Default for SinumerikConnConfig {
@@ -73,11 +88,21 @@ impl SinumerikConnConfig {
         {
             s.to_string()
         } else if let Some(host) = v.get("host").and_then(|x| x.as_str()) {
-            let port = v
+            // P1 checked conversion：`as u16` 会对 65536+ 静默 wrap（65536→0），
+            // 端口必须 1..=65535，否则 BAD_CONFIG（fail-closed）。
+            let port_u64 = v
                 .get("port")
                 .and_then(|x| x.as_u64())
-                .unwrap_or(mesa_opcua_transport::DEFAULT_OPCUA_PORT as u64)
-                as u16;
+                .unwrap_or(mesa_opcua_transport::DEFAULT_OPCUA_PORT as u64);
+            let port = u16::try_from(port_u64)
+                .ok()
+                .filter(|p| *p > 0)
+                .ok_or_else(|| {
+                    SdkDriverError::configuration(
+                        "BAD_CONFIG",
+                        format!("port `{port_u64}` 非法，需 1..=65535"),
+                    )
+                })?;
             format!("opc.tcp://{host}:{port}")
         } else {
             "opc.tcp://127.0.0.1:4840".to_string()
@@ -197,5 +222,35 @@ mod tests {
         assert!(cfg(serde_json::json!({"username": "u"})).is_err());
         assert!(cfg(serde_json::json!({"password": "p"})).is_err());
         assert!(cfg(serde_json::json!({"username": "u", "password": "p"})).is_ok());
+    }
+
+    #[test]
+    fn port_narrowing_fails_closed() {
+        // P1：`as u16` 会对 65536+ 静默 wrap（65536→0，70000→4464），必须拒绝。
+        assert!(cfg(serde_json::json!({"host": "h", "port": 0})).is_err());
+        assert!(cfg(serde_json::json!({"host": "h", "port": 1})).is_ok());
+        assert!(cfg(serde_json::json!({"host": "h", "port": 65535})).is_ok());
+        assert!(cfg(serde_json::json!({"host": "h", "port": 65536})).is_err());
+        assert!(cfg(serde_json::json!({"host": "h", "port": 70000})).is_err());
+        assert!(cfg(serde_json::json!({"host": "h", "port": 4294967296_u64})).is_err());
+    }
+
+    #[test]
+    fn debug_redacts_password() {
+        // P1：Secret 不进日志。password 脱敏；username 是握手明文身份，保留可诊断。
+        let c = cfg(serde_json::json!({
+            "endpoint_url": "opc.tcp://10.0.0.5:4840",
+            "username": "operator",
+            "password": "known-secret-123",
+        }))
+        .expect("配置 Ok");
+        let dbg = format!("{c:?}");
+        assert!(
+            !dbg.contains("known-secret-123"),
+            "Debug 泄漏明文密码: {dbg}"
+        );
+        assert!(dbg.contains("<redacted>"));
+        assert!(dbg.contains("operator"));
+        assert!(dbg.contains("opc.tcp://10.0.0.5:4840"));
     }
 }

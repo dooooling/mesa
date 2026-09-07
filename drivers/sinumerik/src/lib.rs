@@ -1252,10 +1252,17 @@ fn subscribe_kind_from_config(
         .get("sampling_interval_ms")
         .and_then(|v| v.as_u64())
         .unwrap_or(250);
-    let queue_size = config
+    let queue_size_u64 = config
         .get("queue_size")
         .and_then(|v| v.as_u64())
-        .unwrap_or(10) as u32;
+        .unwrap_or(10);
+    // P1 checked conversion：`as u32` 会对 u32::MAX+ 静默截断，直接拒绝。
+    let queue_size = u32::try_from(queue_size_u64).map_err(|_| {
+        SdkDriverError::configuration(
+            "INVALID_BINDING_CONFIG",
+            format!("task `{task_id}`: queue_size `{queue_size_u64}` 超出 u32 范围"),
+        )
+    })?;
     let discard_oldest = config
         .get("discard_oldest")
         .and_then(|v| v.as_bool())
@@ -1447,6 +1454,46 @@ mod tests {
             .await
             .expect_err("缺 node_id 必须拒绝");
         assert_eq!(err.code, "INVALID_BINDING_CONFIG");
+    }
+
+    #[tokio::test]
+    async fn configure_rejects_oversized_queue_size() {
+        // P1：`as u32` 会对 u32::MAX+ 静默截断，必须 INVALID_BINDING_CONFIG。
+        let mut conn =
+            SinumerikConnection::with_transport(cfg_json(), Arc::new(FakeOpcUaTransport::new()));
+        let task = AcquisitionTask {
+            id: "t-sub".into(),
+            mode: TaskMode::Subscribe,
+            interval_ms: None,
+            binding: DriverBinding {
+                kind: BINDING_SUB.into(),
+                config: json!({"nodes": [
+                    {"key": "a", "node_id": format!("nsu={SIEMENS_NS};s=A"), "data_type": "I32"},
+                ], "queue_size": 4294967296_u64}),
+            },
+        };
+        let err = conn
+            .configure(1, vec![task])
+            .await
+            .expect_err("超范围 queue_size 必须拒绝");
+        assert_eq!(err.code, "INVALID_BINDING_CONFIG");
+    }
+
+    #[test]
+    fn connection_debug_redacts_password() {
+        // P1：连接 Debug 经 cfg 透出，同样不得泄漏明文密码。
+        let cfg = SinumerikConnConfig::from_json(&json!({
+            "endpoint_url": "opc.tcp://10.0.0.5:4840",
+            "username": "operator",
+            "password": "known-secret-123",
+        }))
+        .expect("配置 Ok");
+        let conn = SinumerikConnection::with_transport(cfg, Arc::new(FakeOpcUaTransport::new()));
+        let dbg = format!("{conn:?}");
+        assert!(
+            !dbg.contains("known-secret-123"),
+            "连接 Debug 泄漏明文密码: {dbg}"
+        );
     }
 
     #[tokio::test]
