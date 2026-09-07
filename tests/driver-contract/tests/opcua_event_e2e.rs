@@ -1,5 +1,9 @@
-//! OPC UA Event mesad 级 E2E（PR9 Stage ⑦）：fixture 服务器（测试进程内）→
-//! 真 opcua 驱动子进程 → Manager → EventIngress → events.db。
+//! OPC UA Event Manager 级 E2E（PR9 Stage ⑦）：fixture 服务器（测试进程内）→
+//! 真 opcua 驱动子进程 → Manager → EventIngress → events.db（+ in-process
+//! REST 烟雾）。
+//!
+//! 不是 mesad 进程级：REST/SSE 层本 PR 零改动（协议无关，由 PR7/PR8 gate 继承）；
+//! 此处仅用 in-process Router 证明 native 行经 unchanged 的 HTTP 层可见。
 //!
 //! 纪律：trigger 循环 + `wait_until(DB 可观测态)`，不用 sleep 猜测；
 //! 同一 EventId 重复 trigger 依赖 EventStore 去重（§30：新 epoch 重放不增行）。
@@ -297,6 +301,72 @@ async fn opcua_stop_barrier_keeps_all_occurrences() {
             assert_eq!(*got as usize, expect, "batch {batch} 批内序号有缺口");
         }
     }
+    drop(mgr);
+    srv.stop().await;
+    let _ = std::fs::remove_file(&db);
+}
+
+/// P1-3 REST 烟雾：native 行经 unchanged 的 HTTP 层可见（in-process Router；
+/// 不是 mesad 进程——REST/SSE 本 PR 零改动，分页/过滤语义由 PR7 gate 继承）。
+#[tokio::test]
+async fn opcua_native_rows_visible_via_rest() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    common::init_log();
+    ensure_pki_dir();
+    let db = tmp_db("rest");
+    let _ = std::fs::remove_file(&db);
+    let srv = event_server::FixtureEventServer::start().await;
+
+    let store = Arc::new(EventStore::open(&db).unwrap());
+    let mgr = MesaManager::discover(&repo_root().join("drivers"));
+    mgr.set_event_services(EventServices::new(
+        store.clone(),
+        EventHub::new(EVENT_HUB_CAPACITY),
+    ));
+    mgr.start_endpoint(endpoint(&srv.endpoint_url())).unwrap();
+    let mut polls = 0u32;
+    wait_until(60, || {
+        polls += 1;
+        if polls % 4 == 1 {
+            srv.trigger(&event_server::e2_raised());
+        }
+        !rows_of(&store).is_empty()
+    })
+    .await;
+
+    let drivers_dir = repo_root().join("drivers");
+    let cfg_store = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
+    let mgr = Arc::new(mgr);
+    #[allow(deprecated)]
+    let state = mesa_core_api::AppState::new(
+        mgr.clone(),
+        cfg_store,
+        drivers_dir.to_string_lossy().to_string(),
+    );
+    state.set_event_services(EventServices::new(
+        store.clone(),
+        EventHub::new(EVENT_HUB_CAPACITY),
+    ));
+    let app = mesa_core_api::router(state);
+    let req = Request::builder()
+        .uri("/api/v1/events?endpoint_id=ct-opcua-evt")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let events = v["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["event"]["event_id"], "opcua:4g");
+    assert_eq!(events[0]["event"]["kind"], "opcua.condition");
+
+    assert_eq!(mgr.stop_endpoint("ct-opcua-evt").await, Ok(true));
     drop(mgr);
     srv.stop().await;
     let _ = std::fs::remove_file(&db);

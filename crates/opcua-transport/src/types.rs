@@ -170,23 +170,34 @@ impl UaNodeRef {
                 Ok(Self::string(namespace, v))
             }
             "g" => {
+                // P1-1：真解析（36 位长度不够——必须合法 GUID），失败即配置期
+                // 错误，不拖到 Start 才暴露；存储 canonical 小写连字符形
+                // （与 from_opc_node_id 的 `Guid::to_string` 一致，可往返）。
                 let v = val.trim();
-                if v.len() != 36 {
-                    return Err(format!("NodeId `{s}` 非法，guid 长度非法"));
-                }
+                let guid: opcua_types::Guid = v
+                    .parse()
+                    .map_err(|_| format!("NodeId `{s}` 非法，guid 格式非法"))?;
                 Ok(Self {
                     namespace,
-                    identifier: UaIdentifier::Guid(v.to_string()),
+                    identifier: UaIdentifier::Guid(guid.to_string()),
                 })
             }
             "b" => {
+                // P1-1：真 Base64 解码（STANDARD 带填充，与 wire/native 一致），
+                // 失败即配置期错误；存储重编码 canonical 形。
+                use base64::Engine as _;
                 let v = val.trim();
                 if v.is_empty() {
                     return Err(format!("NodeId `{s}` 非法，opaque 为空"));
                 }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(v)
+                    .map_err(|_| format!("NodeId `{s}` 非法，opaque 非法 Base64"))?;
                 Ok(Self {
                     namespace,
-                    identifier: UaIdentifier::Opaque(v.to_string()),
+                    identifier: UaIdentifier::Opaque(
+                        base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    ),
                 })
             }
             _ => Err(format!("NodeId `{s}` 非法，未知类型 `{kind}`")),
@@ -346,6 +357,23 @@ mod tests {
         assert_eq!(s.to_string(), "ns=2;s=Motor.Speed");
         assert!(UaNodeRef::parse("ns=2;x=1").is_err());
         assert!(UaNodeRef::parse("bad").is_err());
+    }
+
+    #[test]
+    fn node_ref_parse_validates_guid_and_opaque_early() {
+        // P1-1：36 位非 GUID / 非法 Base64 必须在 parse 当场失败，
+        // 不拖到 Start 才暴露为运行期重连。
+        assert!(UaNodeRef::parse("ns=2;g=zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz").is_err());
+        assert!(UaNodeRef::parse("ns=2;g=short").is_err());
+        assert!(UaNodeRef::parse("ns=2;b=@@@NOT-BASE64@@@").is_err());
+        assert!(UaNodeRef::parse("ns=2;b=").is_err());
+        // 合法值通过且 canonical 化（大小写归一，可往返）。
+        let g = UaNodeRef::parse("ns=2;g=8A0A1B2C-3D4E-5F60-7080-90A0B0C0D0E0").unwrap();
+        assert_eq!(g.to_string(), "ns=2;g=8a0a1b2c-3d4e-5f60-7080-90a0b0c0d0e0");
+        let g2 = UaNodeRef::parse(&g.to_string()).unwrap();
+        assert_eq!(g, g2);
+        let b = UaNodeRef::parse("ns=2;b=AQID").unwrap();
+        assert_eq!(b.to_string(), "ns=2;b=AQID");
     }
 
     #[test]

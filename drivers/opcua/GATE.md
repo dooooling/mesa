@@ -78,3 +78,39 @@ REST：`GET /certificates/opcua/{own,trusted,issuers,rejected} /diagnostics` `PO
 >   rollback/synthetic-BAD/continuation tests).
 > - Real opc.tcp:// software integration (local server, no hardware) is still
 >   REQUIRED before Stage 2 Gate sign-off.
+
+## 7. PR9 Events & Conditions（`feat/opcua-events` → PR #10）
+
+链路：`EventNotifier → Subscription → EventFilter/SelectClauses → EventCallback
+→ 有界 FIFO → transport → Driver decoder → EventRecord → PR6 EventSink →
+PR7 EventIngress → events.db → REST/SSE → PR8 Web`。
+`event-store / Core Event API / Generic Web` 零改动，无对应 Gate。
+
+跑法：`cargo test -p mesa-driver-opcua --lib`；
+`--test opcua_event_spike`；`--test opcua_event_native`；
+`cargo test -p mesa-contract-tests --test opcua_event_e2e -- --test-threads=1`
+（各起 loopback fixture + 驱动子进程，串行最稳）；
+`python scripts/write-contract-evidence.py`（14 suites Data 回归，唯一准入基线）。
+
+- [x] 19 clause 全 Good 才订阅：任一 select BAD / where 未接受 →
+  `OPCUA_EVENT_FILTER_REJECTED` + 回滚删订阅（位置契约容不得形变）
+- [x] Stop 先关 producer 再 drain：删监控项 → 删订阅 → 本地门（transport
+  `EventProducerShared`：门 + 发送端同锁，关门后 callback 无法再 send），
+  receiver 保持 OPEN，drain 到 sender CLOSED（None）；drain 期 fatal 照常 fail
+- [x] Batch 字节边界：64 条按数量聚批后，`TooLarge` 有序二分（SDK 保证不耗
+  sequence，左半先于右半）；单条仍超限 → `OPCUA_EVENT_RECORD_TOO_LARGE`
+- [x] `scope=conditions` 真过滤：OfType(ConditionType) 的 where element 结果
+  逐个校验（exactly-one + Good），BAD 即拒绝
+- [x] `notifier_node_id` 配置期真解析：GUID 真 parse + Opaque 真 Base64 解码
+  （canonical 化），失败即 `INVALID_EVENT_NOTIFIER`，不拖到 Start
+- [x] `queue_size` 上限 1024 与本地 callback FIFO 对齐（默认 1000 不动）
+- [x] 落盘 exact（5 行 id/transition/occurred + Hub commit-then-publish）；
+  跨 epoch 重放去重；64 occurrence Stop 屏障（(batch,index) 无重无缺）；
+  in-process REST 烟雾（分页语义由 PR7 继承）
+- [x] Event-only 端点：`run()` 不强制 Data plan/PointMap；Data+Event 共享同一 Session
+
+Fixture（`drivers/opcua/tests/support/`，Mesa-owned loopback，非厂商代表）：
+`E0 probe + 观测` barrier（禁止 sleep 猜测）；Manager 级用"trigger 即轮询条件 +
+去重收敛"。已知上游缺口（带 TODO）：生成地址空间缺
+`ConditionType.ConditionId` 声明（补路径注册）；fixture 队列上限提到 2000
+（缺省 item 10/sub 20 会静默丢 burst，仅 fixture 容量声明）。

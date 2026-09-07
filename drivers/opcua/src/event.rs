@@ -26,8 +26,13 @@ pub const DEFAULT_EVENT_NOTIFIER: &str = "ns=0;i=2253";
 /// 默认发布间隔 500ms（>0）。
 pub const DEFAULT_PUBLISHING_INTERVAL_MS: u64 = 500;
 
-/// 默认服务端队列 1000（1..=10000，`discard_oldest=false` 见 transport）。
+/// 默认服务端队列 1000。P1-2：上限与本地 callback FIFO 对齐
+/// （`EVENT_CALLBACK_QUEUE_CAPACITY` = 1024）：对外宣称的 server queue
+/// 不得大于本地 ingress 的确定性吸收能力，否则第 1025 条即 fail-closed，
+/// 属于"合法配置必然失败"。默认 1000 保持不动。
 pub const DEFAULT_EVENT_QUEUE_SIZE: u32 = 1000;
+/// 服务端队列上限（与 transport 本地 FIFO 容量一致）。
+pub const MAX_EVENT_QUEUE_SIZE: u32 = mesa_opcua_transport::EVENT_CALLBACK_QUEUE_CAPACITY as u32;
 
 /// 事件范围：全部事件 / 仅 Conditions（OfType 过滤）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +78,7 @@ pub fn opcua_event_catalog() -> EventCatalog {
         .required(false)
         .default_value(serde_json::json!(DEFAULT_EVENT_QUEUE_SIZE));
     queue.validation.min = Some(1.0);
-    queue.validation.max = Some(10_000.0);
+    queue.validation.max = Some(MAX_EVENT_QUEUE_SIZE as f64);
     EventCatalog {
         streams: vec![EventStreamDescriptor {
             id: OPCUA_EVENT_STREAM_ID.into(),
@@ -252,7 +257,7 @@ pub fn parse_event_tasks(
             "queue_size",
             u64::from(DEFAULT_EVENT_QUEUE_SIZE),
             1,
-            10_000,
+            u64::from(MAX_EVENT_QUEUE_SIZE),
         )? as u32;
         out.push(OpcUaEventTaskPlan {
             id: task.id.clone(),
@@ -909,6 +914,27 @@ mod tests {
                 .code,
             "INVALID_EVENT_PARAMETER"
         );
+        // P1-2：上限与本地 FIFO 对齐（1024）；1025 非法，1024 合法。
+        let t = generic_task(
+            "t",
+            OPCUA_EVENT_STREAM_ID,
+            serde_json::json!({"queue_size": 1025}),
+        );
+        assert_eq!(
+            parse_event_tasks(std::slice::from_ref(&t))
+                .unwrap_err()
+                .code,
+            "INVALID_EVENT_PARAMETER"
+        );
+        let t = generic_task(
+            "t",
+            OPCUA_EVENT_STREAM_ID,
+            serde_json::json!({"queue_size": 1024}),
+        );
+        assert_eq!(
+            parse_event_tasks(std::slice::from_ref(&t)).unwrap()[0].queue_size,
+            1024
+        );
         let t = generic_task(
             "t",
             OPCUA_EVENT_STREAM_ID,
@@ -935,6 +961,29 @@ mod tests {
             "t",
             OPCUA_EVENT_STREAM_ID,
             serde_json::json!({"notifier_node_id": "bad"}),
+        );
+        assert_eq!(
+            parse_event_tasks(std::slice::from_ref(&t))
+                .unwrap_err()
+                .code,
+            "INVALID_EVENT_NOTIFIER"
+        );
+        // P1-1：GUID/Base64 必须真解析（配置期拒绝，不拖到 Start）。
+        let t = generic_task(
+            "t",
+            OPCUA_EVENT_STREAM_ID,
+            serde_json::json!({"notifier_node_id": "ns=2;b=@@@NOT-BASE64@@@"}),
+        );
+        assert_eq!(
+            parse_event_tasks(std::slice::from_ref(&t))
+                .unwrap_err()
+                .code,
+            "INVALID_EVENT_NOTIFIER"
+        );
+        let t = generic_task(
+            "t",
+            OPCUA_EVENT_STREAM_ID,
+            serde_json::json!({"notifier_node_id": "ns=2;g=zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"}),
         );
         assert_eq!(
             parse_event_tasks(std::slice::from_ref(&t))
