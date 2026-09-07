@@ -1,5 +1,8 @@
 //! Event Plane V1 contract harness（PR10）：source-neutral 测试基建。
 //!
+//! 多测试 target 共享：单个 target 只用子集是常态（与 `common/mod.rs` 同例）。
+#![allow(dead_code)]
+//!
 //! 设计：Store 层 gate（identity/collision/atomicity/sequence）直接用
 //! record/batch 构造器 + `EventStore::commit_batch`，天然 source-neutral；
 //! Runtime 层 gate（reconnect/epoch/stop/backpressure/fairness）经
