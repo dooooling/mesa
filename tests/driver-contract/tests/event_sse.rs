@@ -391,9 +391,11 @@ async fn events_stats_contract_keys_and_values() {
         }],
     })
     .unwrap();
-    // 等 ≥20 行落盘（真流量证据），再停 endpoint 冻结计数器
+    // 等 ≥20 行落盘（真流量证据），再停 endpoint。
+    // Stop 是冻结边界：final row count 必须在 Stop 完成后重取——
+    // barrier 会正常 drain 一条尾巴，先冻结再比是确定性竞态。
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let rows = loop {
+    loop {
         let n = store
             .query_history(&mesa_event_store::EventFilter {
                 endpoint_id: Some("hd-stats".into()),
@@ -404,12 +406,21 @@ async fn events_stats_contract_keys_and_values() {
             .0
             .len();
         if n >= 20 {
-            break n as u64;
+            break;
         }
         assert!(std::time::Instant::now() < deadline, "30s 内行数不足 20");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    };
+    }
     assert_eq!(mgr.stop_endpoint("hd-stats").await, Ok(true));
+    let rows = store
+        .query_history(&mesa_event_store::EventFilter {
+            endpoint_id: Some("hd-stats".into()),
+            limit: Some(500),
+            ..Default::default()
+        })
+        .unwrap()
+        .0
+        .len() as u64;
 
     // stats 读同一 services：键集冻结 + 值自洽
     let _srv = serve_with_services(Arc::clone(&services)).await;
