@@ -11,6 +11,7 @@ use event_common::{EventTestSource, SimulatorEventSource};
 async fn hardening_harness_sim_source_emits_alarm_cycle() {
     common::init_log();
     let mut src = SimulatorEventSource::start("hd-smoke-001").await;
+    src.start_endpoint().await;
     let ids = src.emit_round(0).await;
     assert_eq!(ids.len(), 4);
     let mut sorted = ids.clone();
@@ -19,6 +20,6 @@ async fn hardening_harness_sim_source_emits_alarm_cycle() {
     assert_eq!(sorted.len(), 4, "四态 event_id 必须互异");
     let rows = event_common::rows_of(&src.store(), src.endpoint_id());
     assert_eq!(rows.len(), 4);
-    src.disconnect().await;
+    src.stop_endpoint().await;
     src.stop().await;
 }

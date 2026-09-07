@@ -3,28 +3,50 @@
 //! fixture）。多轮启停 + 故意重放后，DB 恰好等于发射并集（不多不少）；
 //! 每轮 epoch 互异；Stop 后旧 epoch 永不再出新行。
 
+//! Replay 可观测性（review P1）：exact-set 区分不了"收到并去重"与"中途丢失"
+//!（去重契约的数学事实），故每轮额外锁 ingress 诊断增量：
+//! persisted（新行）+ duplicates（UNIQUE 层去重），缺一不可。
+
 mod common;
 mod event_common;
 
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use event_common::{EventTestSource, OpcUaEventSource, SimulatorEventSource, rows_of};
+use event_common::{
+    EventTestSource, OpcUaEventSource, SimulatorEventSource, rows_of, wait_diagnostics,
+};
 
-/// 多轮 torture：emit → disconnect → reconnect → emit（含重放）→ …
-/// 最终 DB event_id 集合恰好等于全部发射并集；epoch 轮轮互异；seq 单调。
-async fn reconnect_torture_exact_set<S: EventTestSource>(endpoint: &str) {
+/// 多轮 torture：start → emit → stop × 3（含重放）。
+/// DB exact-set + 每轮 epoch 新 + 每轮 persisted 精确 / duplicates 下界。
+async fn reconnect_torture_exact_set<S: EventTestSource>(
+    endpoint: &str,
+    // 每轮期望（persisted 精确增量，duplicates 下界）：调用方按源语义给出
+    expect: [(u64, u64); 3],
+) {
     let mut src = S::start(endpoint).await;
     let mut emitted = BTreeSet::new();
     // 每轮新行（相对上一轮多出来的 id）的 epoch 不得见于之前轮次：
-    // reconnect 确实开了新 epoch；纯重放轮（无新行）不要求新 epoch 落盘。
+    // 确实开了新 epoch；纯重放轮（无新行）不要求新 epoch 落盘。
     let mut seen_epochs = BTreeSet::new();
     let mut known: BTreeSet<String> = BTreeSet::new();
-    for round in 0..3u32 {
+    for (round, (want_p, want_d)) in expect.iter().enumerate() {
+        let round = round as u32;
+        src.start_endpoint().await;
+        let base = src.diagnostics();
         let ids = src.emit_round(round).await;
+        // 先等诊断增量（replay 收到并去重的直接证据），再断言集合。
+        // persisted 精确；duplicates 取下界（trigger 轮询冗余同样计入去重）。
+        wait_diagnostics(&src, base, *want_p, *want_d, Duration::from_secs(60)).await;
+        let (p1, d1) = src.diagnostics();
+        assert_eq!(p1 - base.0, *want_p, "round {round} persisted 增量");
+        assert!(
+            d1 - base.1 >= *want_d,
+            "round {round} duplicates 增量：want≥{want_d} got={}",
+            d1 - base.1,
+        );
         emitted.extend(ids.clone());
-        src.disconnect().await;
-        src.reconnect().await;
+        src.stop_endpoint().await;
         let rows = rows_of(&src.store(), src.endpoint_id());
         let epoch_of: std::collections::HashMap<&str, u64> = rows
             .iter()
@@ -62,13 +84,16 @@ async fn reconnect_torture_exact_set<S: EventTestSource>(endpoint: &str) {
 #[tokio::test]
 async fn sim_reconnect_torture_exact_set() {
     common::init_log();
-    reconnect_torture_exact_set::<SimulatorEventSource>("hd-torture-sim").await;
+    // Simulator 每轮新 epoch + 新 ids（无重放）：3×(+4,+0)。
+    reconnect_torture_exact_set::<SimulatorEventSource>("hd-torture-sim", [(4, 0); 3]).await;
 }
 
 #[tokio::test]
 async fn opcua_reconnect_torture_exact_set() {
     common::init_log();
-    reconnect_torture_exact_set::<OpcUaEventSource>("hd-torture-opcua").await;
+    // round0 [E1,E2] 全新；round1 [E2重放,E3]；round2 全重放。
+    reconnect_torture_exact_set::<OpcUaEventSource>("hd-torture-opcua", [(2, 0), (1, 1), (0, 3)])
+        .await;
 }
 
 /// Stop barrier 重复启停：每轮新增恰好等于本轮发射；StopAck 后旧 epoch
@@ -76,6 +101,7 @@ async fn opcua_reconnect_torture_exact_set() {
 async fn stop_barrier_repeated<S: EventTestSource>(endpoint: &str, rounds: u32) {
     let mut src = S::start(endpoint).await;
     for round in 0..rounds {
+        src.start_endpoint().await;
         let ids = src.emit_round(round).await;
         // 本轮新增 = 发射去重后（重放部分不增行）
         let rows = rows_of(&src.store(), src.endpoint_id());
@@ -85,8 +111,7 @@ async fn stop_barrier_repeated<S: EventTestSource>(endpoint: &str, rounds: u32) 
             ids.iter().collect::<BTreeSet<_>>().len(),
             "round {round} 新增必须等于本轮发射去重"
         );
-        src.disconnect().await;
-        src.reconnect().await;
+        src.stop_endpoint().await;
     }
     // 静默窗口：Stop 后 2s 内行数纹丝不动
     let before = rows_of(&src.store(), src.endpoint_id()).len();
