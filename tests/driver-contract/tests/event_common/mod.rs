@@ -185,14 +185,17 @@ pub async fn wait_rows(
 // Runtime gate trait：两个独立 Event source 跑同一份契约
 // ---------------------------------------------------------------------------
 
-/// source-neutral 运行时契约。`emit_round` 语义：触发一次发射轮次并返回
-/// 本轮 occurrence 的 event_id 集合（顺序无关；重复调用返回新轮次）。
-/// disconnect/reconnect 模拟传输入断（kill/恢复），endpoint 配置保留，
-/// reconnect 后必须是新 epoch。
-#[async_trait::async_trait]
+/// source-neutral 运行时契约。`emit_round(round)` 语义：触发第 round 轮发射
+/// 并返回本轮 occurrence 的 event_id 集合（含故意重放，顺序无关）。
+/// disconnect/reconnect 模拟传输入断与恢复（stop/start，新 epoch）；
+/// kill 级 Lost 由各源已有专属 Gate 覆盖（PR9 native 真断线），此处不断言。
+///
+/// `?Send`：OPC UA fixture 的 start future 非 Send（server builder），
+/// contract 测试跑 `current_thread`，与现有 opcua e2e 一致。
+#[async_trait::async_trait(?Send)]
 pub trait EventTestSource {
     async fn start(endpoint_id: &str) -> Self;
-    async fn emit_round(&mut self) -> Vec<String>;
+    async fn emit_round(&mut self, round: u32) -> Vec<String>;
     async fn disconnect(&mut self);
     async fn reconnect(&mut self);
     async fn stop(self);
@@ -234,7 +237,7 @@ fn sim_alarm_task() -> mesa_core_types::EventTask {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl EventTestSource for SimulatorEventSource {
     async fn start(endpoint_id: &str) -> Self {
         let db = tmp_db("sim");
@@ -255,8 +258,10 @@ impl EventTestSource for SimulatorEventSource {
         }
     }
 
-    async fn emit_round(&mut self) -> Vec<String> {
+    async fn emit_round(&mut self, _round: u32) -> Vec<String> {
         use mesa_driver_manager::endpoint::BuiltinEndpoint;
+        // round 被忽略：Simulator 每次 Start 都是新 epoch + 新 ids（epoch 作用域）。
+        let before = rows_of(&self.store, &self.endpoint_id).len();
         self.mgr
             .start_endpoint(BuiltinEndpoint {
                 endpoint_id: self.endpoint_id.clone(),
@@ -267,7 +272,14 @@ impl EventTestSource for SimulatorEventSource {
             })
             .unwrap();
         // alarm-cycle 每轮恰 4 条（Raised/Updated/Acknowledged/Cleared）。
-        let rows = wait_rows(&self.store, &self.endpoint_id, 4, Duration::from_secs(30)).await;
+        let rows = wait_rows(
+            &self.store,
+            &self.endpoint_id,
+            before + 4,
+            Duration::from_secs(30),
+        )
+        .await;
+        // rows_of 按 seq DESC：take(4) 即本轮新增。
         rows.iter().take(4).map(|r| r.event_id.clone()).collect()
     }
 
@@ -276,12 +288,176 @@ impl EventTestSource for SimulatorEventSource {
     }
 
     async fn reconnect(&mut self) {
-        // 新 Start = 新 epoch（SDK 序号器重建）；旧行保留，去重跨 epoch 有效。
-        let _ = self.emit_round().await;
+        // endpoint 已停；下一轮 emit_round 起新 Start = 新 epoch。
     }
 
     async fn stop(self) {
         let _ = self.mgr.stop_endpoint(&self.endpoint_id).await;
+        let _ = std::fs::remove_file(&self.db);
+    }
+
+    fn store(&self) -> Arc<EventStore> {
+        self.store.clone()
+    }
+
+    fn endpoint_id(&self) -> &str {
+        &self.endpoint_id
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OPC UA 源：manager + 真 opcua 驱动子进程 + 进程内 fixture 服务器
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)] // 各测试目标取用子集，未用 helper 属正常
+#[path = "../../../../drivers/opcua/tests/support/event_server.rs"]
+mod event_server;
+
+/// round → 触发集（固定 E-id；含故意重放。id 形如 `opcua:4Q`，
+/// 单字节 EventId 的 base64url，由到达断言自验证）。
+fn opcua_round(round: u32) -> Vec<&'static str> {
+    match round % 3 {
+        0 => vec!["opcua:4Q", "opcua:4g"],
+        1 => vec!["opcua:4g", "opcua:4w"],
+        _ => vec!["opcua:4Q", "opcua:4g", "opcua:4w"],
+    }
+}
+
+fn opcua_event_task() -> mesa_core_types::EventTask {
+    use mesa_core_types::{DriverBinding, EventTask, GENERIC_EVENT_BINDING_KIND, TaskMode};
+    EventTask {
+        id: "opcua-main-events".into(),
+        mode: TaskMode::Subscribe,
+        interval_ms: None,
+        binding: DriverBinding {
+            kind: GENERIC_EVENT_BINDING_KIND.into(),
+            config: serde_json::json!({
+                "stream_id": "opcua.events",
+                "parameters": {
+                    "notifier_node_id": "ns=0;i=2253",
+                    "scope": "all",
+                    "publishing_interval_ms": 500,
+                    "queue_size": 1000,
+                },
+            }),
+        },
+    }
+}
+
+/// PKI 目录：全进程统一（None 策略下空目录即可；统一值避免 env 并发写竞争）。
+fn ensure_pki_dir() -> std::path::PathBuf {
+    static ONCE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("mesa-opcua-pki-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY：测试进程内单值初始化（OnceLock），与 discovery_contract 同模式。
+        unsafe {
+            std::env::set_var("MESA_OPCUA_PKI_DIR", &dir);
+        }
+        dir.clone()
+    })
+    .clone()
+}
+
+pub struct OpcUaEventSource {
+    endpoint_id: String,
+    mgr: Arc<mesa_driver_manager::MesaManager>,
+    store: Arc<EventStore>,
+    db: std::path::PathBuf,
+    srv: Option<event_server::FixtureEventServer>,
+    running: bool,
+}
+
+#[async_trait::async_trait(?Send)]
+impl EventTestSource for OpcUaEventSource {
+    async fn start(endpoint_id: &str) -> Self {
+        ensure_pki_dir();
+        let db = tmp_db("opcua");
+        let _ = std::fs::remove_file(&db);
+        let store = open_store(&db);
+        let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(
+            &repo_drivers_dir(),
+        ));
+        mgr.set_event_services(mesa_event_store::EventServices::new(
+            store.clone(),
+            mesa_event_store::EventHub::new(mesa_event_store::EVENT_HUB_CAPACITY),
+        ));
+        Self {
+            endpoint_id: endpoint_id.into(),
+            mgr,
+            store,
+            db,
+            srv: None,
+            running: false,
+        }
+    }
+
+    async fn emit_round(&mut self, round: u32) -> Vec<String> {
+        use mesa_driver_manager::endpoint::BuiltinEndpoint;
+        if self.srv.is_none() {
+            self.srv = Some(event_server::FixtureEventServer::start().await);
+        }
+        let url = self.srv.as_ref().unwrap().endpoint_url();
+        if !self.running {
+            self.mgr
+                .start_endpoint(BuiltinEndpoint {
+                    endpoint_id: self.endpoint_id.clone(),
+                    driver_id: "opcua".into(),
+                    connection_json: format!(r#"{{"endpoint_url":"{url}","timeout_ms":5000}}"#),
+                    tasks: vec![],
+                    event_tasks: vec![opcua_event_task()],
+                })
+                .unwrap();
+            self.running = true;
+        }
+        let plan = opcua_round(round);
+        // trigger 即轮询：每 200ms 补打本轮全集，直到 ids 齐（去重收敛，不靠 sleep）。
+        let want: Vec<String> = plan.iter().map(|id| id.to_string()).collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            {
+                let srv = self.srv.as_ref().unwrap();
+                for id in &want {
+                    match id.as_str() {
+                        "opcua:4Q" => srv.trigger(&event_server::e1_base()),
+                        "opcua:4g" => srv.trigger(&event_server::e2_raised()),
+                        "opcua:4w" => srv.trigger(&event_server::e3_updated()),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            let rows = rows_of(&self.store, &self.endpoint_id);
+            if want.iter().all(|id| rows.iter().any(|r| &r.event_id == id)) {
+                return want;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "60s 内本轮 ids 未齐：want={want:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn disconnect(&mut self) {
+        // manager 级 stop（graceful，快）。kill 级 Lost 由 PR9 专属 Gate 覆盖。
+        if self.running {
+            assert_eq!(self.mgr.stop_endpoint(&self.endpoint_id).await, Ok(true));
+            self.running = false;
+        }
+    }
+
+    async fn reconnect(&mut self) {
+        // 只复位运行态，发射由下一轮 emit_round 完成（新 Start = 新 epoch）。
+        self.running = false;
+    }
+
+    async fn stop(mut self) {
+        if self.running {
+            let _ = self.mgr.stop_endpoint(&self.endpoint_id).await;
+        }
+        if let Some(mut srv) = self.srv.take() {
+            srv.stop().await;
+        }
         let _ = std::fs::remove_file(&self.db);
     }
 

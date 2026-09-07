@@ -11,7 +11,7 @@ use event_common::{EventTestSource, SimulatorEventSource};
 async fn hardening_harness_sim_source_emits_alarm_cycle() {
     common::init_log();
     let mut src = SimulatorEventSource::start("hd-smoke-001").await;
-    let ids = src.emit_round().await;
+    let ids = src.emit_round(0).await;
     assert_eq!(ids.len(), 4);
     let mut sorted = ids.clone();
     sorted.sort();
