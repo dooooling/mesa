@@ -153,6 +153,8 @@ pub fn rows_of(store: &EventStore, endpoint_id: &str) -> Vec<StoredEvent> {
     store
         .query_history(&mesa_event_store::EventFilter {
             endpoint_id: Some(endpoint_id.into()),
+            // pressure 测试上千行：默认 limit 会截断
+            limit: Some(100_000),
             ..Default::default()
         })
         .unwrap()
