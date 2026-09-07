@@ -785,10 +785,7 @@ mod tests {
         let fake = Arc::new(
             FakeOpcUaTransport::new()
                 .with_namespace_array(test_namespaces())
-                .with_event_where_statuses(
-                    &UaNodeRef::numeric(0, 2253),
-                    vec![StatusCode::Good],
-                )
+                .with_event_where_statuses(&UaNodeRef::numeric(0, 2253), vec![StatusCode::Good])
                 .with_event_where_operand_statuses(
                     &UaNodeRef::numeric(0, 2253),
                     vec![vec![StatusCode::BadFilterLiteralInvalid]],
@@ -808,10 +805,7 @@ mod tests {
         .await
         .expect_err("operand 被拒必须失败");
         assert_eq!(err.code, "OPCUA_EVENT_FILTER_REJECTED");
-        assert_eq!(
-            fake.deleted_subscriptions(),
-            fake.created_subscriptions()
-        );
+        assert_eq!(fake.deleted_subscriptions(), fake.created_subscriptions());
     }
 
     /// P1：scope=all 形态下多一个 where element 同样拒绝（exactly 0）。
@@ -821,10 +815,7 @@ mod tests {
         let fake = Arc::new(
             FakeOpcUaTransport::new()
                 .with_namespace_array(test_namespaces())
-                .with_event_where_statuses(
-                    &UaNodeRef::numeric(0, 2253),
-                    vec![StatusCode::Good],
-                ),
+                .with_event_where_statuses(&UaNodeRef::numeric(0, 2253), vec![StatusCode::Good]),
         );
         let transport: Arc<dyn OpcUaTransport> = fake.clone();
         let (sink, _erx) = test_sink();
@@ -838,9 +829,6 @@ mod tests {
         .await
         .expect_err("all 形态带 where 必须失败");
         assert_eq!(err.code, "OPCUA_EVENT_FILTER_REJECTED");
-        assert_eq!(
-            fake.deleted_subscriptions(),
-            fake.created_subscriptions()
-        );
+        assert_eq!(fake.deleted_subscriptions(), fake.created_subscriptions());
     }
 }

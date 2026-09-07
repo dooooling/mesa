@@ -47,6 +47,7 @@ impl FixtureEventServer {
             .max_monitored_item_queue_size = 2000;
         builder.limits_mut().subscriptions.max_queued_notifications = 2000;
         let (server, handle) = builder.build().expect("fixture 服务器必须可建");
+        patch_condition_self_path(&handle);
         let server_task = Some(tokio::spawn(async move { server.run_with(listener).await }));
         // 就绪定义：TCP 可建连（run_with 内 node manager 初始化完成后 accept）。
         // connect 失败即重试至 10s 上限，超时则失败而非静默通过。
@@ -123,6 +124,23 @@ pub fn trigger_event(handle: &opcua_server::ServerHandle, event: &dyn opcua_node
 // §23 V1 事件集：固定 EventId / 时间 / 状态（绝不用 now()，可重复精确断言）
 // ---------------------------------------------------------------------------
 
+/// fixture 侧补偿：async-opcua 0.19 类型树没有 ConditionType 的空路径（self）
+/// 注册，导致标准 Table 10 clause（ConditionType，[]，NodeId）在 validation
+/// 即判 BadNodeIdUnknown。注意方向——这是在补 server 对标准 clause 的接受能力，
+/// 不是在给非标准 clause 开绿灯（旧 patch 恰恰反了，已删）。
+/// 注册空路径 → Object 类：validation 的 attribute 检查本就规定
+/// “Object 节点取 NodeId 属性”（instance 自身即 object），求值侧见 lookup。
+/// 上游类型树补齐 self 路径后删除本函数。
+fn patch_condition_self_path(handle: &opcua_server::ServerHandle) {
+    use opcua_types::{NodeClass, NodeId, ObjectTypeId};
+    let prop_id = NodeId::new(1, opcua_types::UAString::from("FixtureConditionSelf"));
+    let cond_type = NodeId::new(0, ObjectTypeId::ConditionType as u32);
+    handle
+        .type_tree()
+        .write()
+        .add_type_property(&prop_id, &cond_type, &[], NodeClass::Object);
+}
+
 /// Unix ns → OPC UA ticks（与生产换算互逆）。
 pub fn ns_to_ticks(ns: i64) -> i64 {
     ns / 100 + 11644473600 * 10_000_000
@@ -166,9 +184,13 @@ impl FixtureConditionEvent {
     ) -> opcua_types::Variant {
         use opcua_types::Variant;
         use opcua_types::event_field::EventField as _;
-        // Part 4 §7.7.4.5：BaseEventType 形 clause 按路径求值；
-        // ConditionId 在 Condition 实例上是真实属性（非 Condition 返回 Empty）。
+        // Part 9 Table 10：ConditionId 即 Condition instance 自身的 NodeId，
+        // clause 为（ConditionType，空路径，NodeId 属性）。["ConditionId"]
+        // 伪字段故意不回答（非标准，合规 server 无此组件）。
         if browse_path.is_empty() {
+            if attribute_id == opcua_types::AttributeId::NodeId {
+                return self.condition_id.clone().into();
+            }
             return Variant::Empty;
         }
         // 其余字段只接受 Value 属性（与服务端校验一致）。
@@ -192,7 +214,6 @@ impl FixtureConditionEvent {
             {
                 self.base.get_value(attribute_id, index_range, browse_path)
             }
-            ["ConditionId"] => self.condition_id.clone().into(),
             ["ConditionName"] => self.condition_name.clone().into(),
             ["BranchId"] => self
                 .branch_id

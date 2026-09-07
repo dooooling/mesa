@@ -306,7 +306,7 @@ pub struct StandardEventClause {
     pub name: &'static str,
     pub type_id: u32,
     pub path: &'static [&'static str],
-    /// 属性一律 Value(13)：含 ConditionId（见下）。
+    /// 属性：ConditionId 取 NodeId（空路径，见表下注释），其余取 Value(13)。
     pub attribute_id: u32,
 }
 
@@ -362,18 +362,13 @@ pub const STANDARD_EVENT_FIELDS: [StandardEventClause; STANDARD_EVENT_FIELD_COUN
     },
     StandardEventClause {
         name: "ConditionId",
-        // P0-1（Part 9 Table 10）：ConditionId 不是 ConditionType 下显式建模的
-        // 组件，而是 Condition instance 自身的 NodeId。首选形
-        // (ConditionType, [], NodeId) 经实证被 async-opcua 0.19 validation
-        // 拒绝（空路径在其类型树不可解，与补丁无关）；此处取规范另一条路——
-        // Part 4 §7.7.4.5 明确规定 typeDefinitionId=BaseEventType 的 clause
-        // 按 browsePath 求值（忽略类型），Condition 实例均暴露 ConditionId
-        // 属性，非 Condition occurrence 返回 Empty（值层面，clause 仍 Good）。
-        // 我们的订阅本就是异构流（base + conditions 同订阅），BaseEventType
-        // 形正是为此设计的。
-        type_id: opcua_types::ObjectTypeId::BaseEventType as u32,
-        path: &["ConditionId"],
-        attribute_id: opcua_types::AttributeId::Value as u32,
+        // Part 9 Table 10 字面形：ConditionId 不是 ConditionType 下显式建模的
+        // 组件，而是 Condition instance 自身的 NodeId，故 type=ConditionType、
+        // 空路径、属性 NodeId。这是 production wire contract，fixture 绿不绿
+        // 都不得改这里（server 侧不合规由 fixture 补偿，见 support/event_server）。
+        type_id: opcua_types::ObjectTypeId::ConditionType as u32,
+        path: &[],
+        attribute_id: opcua_types::AttributeId::NodeId as u32,
     },
     StandardEventClause {
         name: "ConditionName",
@@ -1064,7 +1059,7 @@ mod tests {
         assert_eq!(F::Active as usize, 13);
         assert_eq!(F::Acknowledged as usize, 15);
         assert_eq!(F::ConfirmedTransitionTime as usize, 18);
-        // 类型分布：9 Base（含 ConditionId，见表上注释）+ 4 Condition
+        // 类型分布：8 Base + 5 Condition（含 ConditionId，Table 10 字面形）
         // + 2 Alarm + 4 Ackable（ObjectTypeId，非字面量）。
         let (base, cond, alarm, ack) = (2041u32, 2782u32, 2915u32, 2881u32);
         assert_eq!(opcua_types::ObjectTypeId::BaseEventType as u32, base);
@@ -1076,17 +1071,29 @@ mod tests {
         );
         for (i, f) in STANDARD_EVENT_FIELDS.iter().enumerate() {
             let want = match i {
-                0..=8 => base,
-                9..=12 => cond,
+                0..=7 => base,
+                8..=12 => cond,
                 13..=14 => alarm,
                 _ => ack,
             };
             assert_eq!(f.type_id, want, "字段 {} 类型错位", f.name);
         }
-        // 属性一律 Value(13)；Enabled/状态类一律两段路径；
-        // ConditionId 锁定索引 8 + ["ConditionId"] + Value + BaseEventType
-        //（Part 4 §7.7.4.5 异构流规则，见表上注释）。
-        for f in &STANDARD_EVENT_FIELDS {
+        // 属性：18 个 Value(13) + ConditionId 一个 NodeId(1，空路径）；
+        // 状态类一律两段路径；ConditionId 锁定索引 8 + ConditionType +
+        // 空路径 + NodeId（Part 9 Table 10 字面形，wire contract 不容形变）。
+        assert_eq!(
+            STANDARD_EVENT_FIELDS[8].type_id,
+            opcua_types::ObjectTypeId::ConditionType as u32
+        );
+        assert!(STANDARD_EVENT_FIELDS[8].path.is_empty());
+        assert_eq!(
+            STANDARD_EVENT_FIELDS[8].attribute_id,
+            opcua_types::AttributeId::NodeId as u32
+        );
+        for (i, f) in STANDARD_EVENT_FIELDS.iter().enumerate() {
+            if i == F::ConditionId as usize {
+                continue; // 已在上文锁死 Table 10 形，不参与 Value 断言
+            }
             assert_eq!(
                 f.attribute_id,
                 opcua_types::AttributeId::Value as u32,

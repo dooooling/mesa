@@ -94,12 +94,13 @@ PR7 EventIngress → events.db → REST/SSE → PR8 Web`。
 
 - [x] 19 clause 全 Good 才订阅：任一 select BAD / where 未接受 →
   `OPCUA_EVENT_FILTER_REJECTED` + 回滚删订阅（位置契约容不得形变）
-- [x] ConditionId 取 BaseEventType 形（`BaseEventType/["ConditionId"]/Value`）：
-  Part 9 Table 10 的 `(ConditionType, [], NodeId)` 经实证被 async-opcua 0.19
-  validation 拒绝（空路径在其类型树不可解，非补丁问题）；`(ConditionType,
-  ["ConditionId"], Value)` 同意为非标准（要求显式建模组件）。此处取规范另一条路——
-  Part 4 §7.7.4.5（BaseEventType 形按路径求值，异构流正解），无补丁 19 全 Good，
-  E2E 绿。patch 已删。
+- [x] ConditionId 取 Part 9 Table 10 字面形（`ConditionType/[]/NodeId`，golden
+  锁死索引 8 + 类型 + 空路径 + NodeId；production wire contract 不容形变）：
+  async-opcua 0.19 类型树缺 ConditionType 空路径（self）注册，标准 clause 在
+  validation 即 BAD——方向搞清楚：这是 server 对标准 clause 的接受缺口，
+  fixture 以 `patch_condition_self_path`（空路径 → Object 类；validation 本就
+  规定 Object 节点取 NodeId）补偿之。`["ConditionId"]` 伪字段 fixture 故意不
+  回答（合规 server 无此组件，回答即掩盖互操作问题）。上游补齐 self 路径后删 patch。
 - [x] Stop 先关本地门再 drain：shutdown 第一件事即 `close_producer()`（server
   cleanup RPC 再慢，期间也不再撑本地 FIFO），再删监控项/订阅；callback 唯一
   准入点 `admit()`（门检查 + 字段校验 + try_send + fatal 同一临界区，
@@ -127,6 +128,6 @@ PR7 EventIngress → events.db → REST/SSE → PR8 Web`。
 
 Fixture（`drivers/opcua/tests/support/`，Mesa-owned loopback，非厂商代表）：
 `E0 probe + 观测` barrier（禁止 sleep 猜测）；Manager 级用"trigger 即轮询条件 +
-去重收敛"。已知上游缺口（带 TODO）：生成地址空间缺
-`ConditionType.ConditionId` 声明（补路径注册）；fixture 队列上限提到 2000
+去重收敛"。已知上游缺口（带 TODO）：类型树缺 ConditionType 空路径 self 注册
+（`patch_condition_self_path` 补偿，见上）；fixture 队列上限提到 2000
 （缺省 item 10/sub 20 会静默丢 burst，仅 fixture 容量声明）。
