@@ -33,13 +33,20 @@ impl FixtureEventServer {
             .await
             .expect("fixture 端口必须可绑");
         let port = listener.local_addr().expect("端口可读").port();
-        let (server, handle) = ServerBuilder::new_anonymous("MesaEventFixture")
+        let mut builder = ServerBuilder::new_anonymous("MesaEventFixture")
             .host("127.0.0.1")
             .port(port)
             .pki_dir(pki_dir.clone())
-            .create_sample_keypair(true)
-            .build()
-            .expect("fixture 服务器必须可建");
+            .create_sample_keypair(true);
+        // fixture 队列上限：缺省值是测试型小数字（item 10 / subscription 20），
+        // burst 会被服务端静默丢弃；提到与生产请求（1000）匹配的量级。
+        // 注意：这是 fixture 侧的容量声明，不是被测行为。
+        builder
+            .limits_mut()
+            .subscriptions
+            .max_monitored_item_queue_size = 2000;
+        builder.limits_mut().subscriptions.max_queued_notifications = 2000;
+        let (server, handle) = builder.build().expect("fixture 服务器必须可建");
         patch_condition_id_declaration(&handle);
         let server_task = Some(tokio::spawn(async move { server.run_with(listener).await }));
         // 就绪定义：TCP 可建连（run_with 内 node manager 初始化完成后 accept）。
