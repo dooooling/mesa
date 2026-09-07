@@ -97,7 +97,7 @@ async fn opcua_native_production_path_persists_five_events() {
     ensure_pki_dir();
     let db = tmp_db("prod");
     let _ = std::fs::remove_file(&db);
-    let srv = event_server::FixtureEventServer::start().await;
+    let mut srv = event_server::FixtureEventServer::start().await;
 
     let store = Arc::new(EventStore::open(&db).unwrap());
     let hub = EventHub::new(EVENT_HUB_CAPACITY);
@@ -190,7 +190,7 @@ async fn opcua_reconnect_replay_dedups_and_appends() {
     ensure_pki_dir();
     let db = tmp_db("reconnect");
     let _ = std::fs::remove_file(&db);
-    let srv = event_server::FixtureEventServer::start().await;
+    let mut srv = event_server::FixtureEventServer::start().await;
 
     let store = Arc::new(EventStore::open(&db).unwrap());
     let mgr = MesaManager::discover(&repo_root().join("drivers"));
@@ -238,7 +238,7 @@ async fn opcua_stop_barrier_keeps_all_occurrences() {
     ensure_pki_dir();
     let db = tmp_db("stopgate");
     let _ = std::fs::remove_file(&db);
-    let srv = event_server::FixtureEventServer::start().await;
+    let mut srv = event_server::FixtureEventServer::start().await;
 
     let store = Arc::new(EventStore::open(&db).unwrap());
     let mgr = MesaManager::discover(&repo_root().join("drivers"));
@@ -318,7 +318,7 @@ async fn opcua_native_rows_visible_via_rest() {
     ensure_pki_dir();
     let db = tmp_db("rest");
     let _ = std::fs::remove_file(&db);
-    let srv = event_server::FixtureEventServer::start().await;
+    let mut srv = event_server::FixtureEventServer::start().await;
 
     let store = Arc::new(EventStore::open(&db).unwrap());
     let mgr = MesaManager::discover(&repo_root().join("drivers"));

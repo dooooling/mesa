@@ -47,7 +47,6 @@ impl FixtureEventServer {
             .max_monitored_item_queue_size = 2000;
         builder.limits_mut().subscriptions.max_queued_notifications = 2000;
         let (server, handle) = builder.build().expect("fixture 服务器必须可建");
-        patch_condition_id_declaration(&handle);
         let server_task = Some(tokio::spawn(async move { server.run_with(listener).await }));
         // 就绪定义：TCP 可建连（run_with 内 node manager 初始化完成后 accept）。
         // connect 失败即重试至 10s 上限，超时则失败而非静默通过。
@@ -73,13 +72,37 @@ impl FixtureEventServer {
         format!("opc.tcp://127.0.0.1:{}", self.port)
     }
 
-    /// 停止服务器并回收任务 + PKI 临时目录。
-    pub async fn stop(mut self) {
+    /// 停止服务器并回收任务 + PKI 临时目录（`&mut`：kill 后 harness 仍可
+    /// join run 句柄做断言，见 session-loss Gate）。
+    pub async fn stop(&mut self) {
         self.handle.cancel();
         if let Some(t) = self.server_task.take() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(10), t).await;
         }
         let _ = std::fs::remove_dir_all(&self.pki_dir);
+    }
+
+    /// 杀服务器（abort 任务：监听 + 已建连 socket 立刻释放，模拟掉电/进程消失）。
+    /// 优雅 `stop()` 要求驱动先断开（否则 server accept 循环不退出）；真断线
+    /// Gate 恰恰需要"驱动还连着时服务器消失"，故用 abort。
+    pub async fn kill(&mut self) {
+        if let Some(t) = self.server_task.take() {
+            t.abort();
+            let _ = t.await;
+        }
+        let _ = std::fs::remove_dir_all(&self.pki_dir);
+        // 确认端口已释放（connect 被拒），再返回——否则 client 的重连计时
+        // 起点不确定。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+            .await
+            .is_ok()
+        {
+            if std::time::Instant::now() >= deadline {
+                panic!("kill 后 10s 端口仍可建连");
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     /// 显式 trigger 一个事件（调用方保证 monitored item 已 Good 的 barrier 之后；
@@ -99,27 +122,6 @@ pub fn trigger_event(handle: &opcua_server::ServerHandle, event: &dyn opcua_node
 // ---------------------------------------------------------------------------
 // §23 V1 事件集：固定 EventId / 时间 / 状态（绝不用 now()，可重复精确断言）
 // ---------------------------------------------------------------------------
-
-/// 上游缺口补丁：async-opcua 0.19 生成地址空间缺少 `ConditionType.ConditionId`
-/// 属性声明（ConditionName/Retain/EnabledState 均有，唯独缺它；Part 9 定义
-/// ConditionId 为 Condition 必备属性，故判定为上游缺口而非标准行为）。
-/// 缺了它，`(ConditionType, ["ConditionId"])` clause 在 filter 校验即 BAD，
-/// 通知数组形变。补丁仅注册 browse 路径（校验只看路径与 node_class），
-///
-/// TODO：上游补齐标准声明后删除本函数。
-fn patch_condition_id_declaration(handle: &opcua_server::ServerHandle) {
-    use opcua_types::{NodeClass, NodeId, ObjectTypeId, QualifiedName};
-    // propid 取 fixture 命名空间字符串 id：零标准碰撞风险（仅路径参与校验）。
-    let prop_id = NodeId::new(1, opcua_types::UAString::from("FixtureConditionId"));
-    let cond_type = NodeId::new(0, ObjectTypeId::ConditionType as u32);
-    let segment = QualifiedName::new(0, "ConditionId");
-    handle.type_tree().write().add_type_property(
-        &prop_id,
-        &cond_type,
-        &[&segment],
-        NodeClass::Variable,
-    );
-}
 
 /// Unix ns → OPC UA ticks（与生产换算互逆）。
 pub fn ns_to_ticks(ns: i64) -> i64 {
@@ -164,7 +166,12 @@ impl FixtureConditionEvent {
     ) -> opcua_types::Variant {
         use opcua_types::Variant;
         use opcua_types::event_field::EventField as _;
-        // 与服务端校验一致：只接受 Value 属性。
+        // Part 4 §7.7.4.5：BaseEventType 形 clause 按路径求值；
+        // ConditionId 在 Condition 实例上是真实属性（非 Condition 返回 Empty）。
+        if browse_path.is_empty() {
+            return Variant::Empty;
+        }
+        // 其余字段只接受 Value 属性（与服务端校验一致）。
         if attribute_id != opcua_types::AttributeId::Value {
             return Variant::Empty;
         }

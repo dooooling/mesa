@@ -94,13 +94,29 @@ PR7 EventIngress → events.db → REST/SSE → PR8 Web`。
 
 - [x] 19 clause 全 Good 才订阅：任一 select BAD / where 未接受 →
   `OPCUA_EVENT_FILTER_REJECTED` + 回滚删订阅（位置契约容不得形变）
-- [x] Stop 先关 producer 再 drain：删监控项 → 删订阅 → 本地门（transport
-  `EventProducerShared`：门 + 发送端同锁，关门后 callback 无法再 send），
-  receiver 保持 OPEN，drain 到 sender CLOSED（None）；drain 期 fatal 照常 fail
+- [x] ConditionId 取 BaseEventType 形（`BaseEventType/["ConditionId"]/Value`）：
+  Part 9 Table 10 的 `(ConditionType, [], NodeId)` 经实证被 async-opcua 0.19
+  validation 拒绝（空路径在其类型树不可解，非补丁问题）；`(ConditionType,
+  ["ConditionId"], Value)` 同意为非标准（要求显式建模组件）。此处取规范另一条路——
+  Part 4 §7.7.4.5（BaseEventType 形按路径求值，异构流正解），无补丁 19 全 Good，
+  E2E 绿。patch 已删。
+- [x] Stop 先关本地门再 drain：shutdown 第一件事即 `close_producer()`（server
+  cleanup RPC 再慢，期间也不再撑本地 FIFO），再删监控项/订阅；callback 唯一
+  准入点 `admit()`（门检查 + 字段校验 + try_send + fatal 同一临界区，
+  close() 返回后不可能再出现 Event 或 fatal）；receiver 保持 OPEN，drain 到
+  None；drain 期 fatal 值为 Some 照常 fail，sender 丢失视为正常 teardown
+- [x] Session 永久丢失传播：transport `watch_session` 轮询 event-loop 完成态
+  （Good=手动，仅 disconnect 路径；其余结束皆判死），`ensure_session` 永不
+  返回已死会话；死亡即关全部 event producer（worker 经 recv-None 报
+  `OPCUA_EVENT_SESSION_LOST`）+ abort 数据 forwarder；run teardown 的
+  `disconnect()` 加 bound（对死会话发 CloseSession 可能永不返回）；
+  真断线 Gate（kill fixture → 90s 内 run 必 `SESSION_LOST`，~15s 实测）
 - [x] Batch 字节边界：64 条按数量聚批后，`TooLarge` 有序二分（SDK 保证不耗
   sequence，左半先于右半）；单条仍超限 → `OPCUA_EVENT_RECORD_TOO_LARGE`
 - [x] `scope=conditions` 真过滤：OfType(ConditionType) 的 where element 结果
-  逐个校验（exactly-one + Good），BAD 即拒绝
+  逐个校验（exactly-one + Good），BAD 即拒绝；报告的 operand BAD 同样
+  fail-closed（element 表面 Good 也掩盖不了）；`scope=all` 要求 exactly 0 个
+  where element
 - [x] `notifier_node_id` 配置期真解析：GUID 真 parse + Opaque 真 Base64 解码
   （canonical 化），失败即 `INVALID_EVENT_NOTIFIER`，不拖到 Start
 - [x] `queue_size` 上限 1024 与本地 callback FIFO 对齐（默认 1000 不动）

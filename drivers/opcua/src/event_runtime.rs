@@ -157,19 +157,42 @@ async fn run_event_task_inner(
         ));
     }
     let mi_id = created.monitored_item_id;
-    // P0-3：where 部分同样是 filter 定义的一半。all 要求无 BAD（本实现
-    // all 形态不带 where，空数组即通过）；conditions 要求恰一个 OfType
-    // element 且 Good——否则用户要的过滤语义并未成立，必须拒绝。
-    let where_bad: Vec<u32> = created
+    // P0-3/P1：where 部分同样是 filter 定义的一半。all 要求 exactly 0 个
+    // element（本实现 all 形态不带 where，多一个都是非预期）；conditions
+    // 要求恰一个 OfType element 且 Good。报告的 operand BAD 同样 fail-closed
+    //（element 表面 Good 也掩盖不了 operand 错误；未报告即接受）。
+    // 否则用户要的过滤语义并未成立，必须拒绝。
+    fn is_good(bits: u32) -> bool {
+        opcua_types::StatusCode::from(bits).is_good()
+    }
+    let bad_elements: Vec<u32> = created
         .where_clause_statuses
         .iter()
         .enumerate()
-        .filter(|(_, s)| !opcua_types::StatusCode::from(**s).is_good())
+        .filter(|(_, s)| !is_good(**s))
         .map(|(i, _)| i as u32)
         .collect();
+    let bad_operands: Vec<(u32, u32)> = created
+        .where_operand_statuses
+        .iter()
+        .enumerate()
+        .flat_map(|(ei, ops)| {
+            ops.iter().enumerate().filter_map(move |(oi, s)| {
+                if is_good(*s) {
+                    None
+                } else {
+                    Some((ei as u32, oi as u32))
+                }
+            })
+        })
+        .collect();
     let where_ok = match task.scope {
-        EventScope::All => where_bad.is_empty(),
-        EventScope::Conditions => created.where_clause_statuses.len() == 1 && where_bad.is_empty(),
+        EventScope::All => created.where_clause_statuses.is_empty() && bad_operands.is_empty(),
+        EventScope::Conditions => {
+            created.where_clause_statuses.len() == 1
+                && bad_elements.is_empty()
+                && bad_operands.is_empty()
+        }
     };
     if !where_ok {
         rollback_subscription(transport, sub.id).await;
@@ -177,7 +200,7 @@ async fn run_event_task_inner(
             ErrorKind::Connection,
             "OPCUA_EVENT_FILTER_REJECTED",
             format!(
-                "task `{}`: where 子句未被服务器接受（scope={:?}，BAD 索引 {where_bad:?}）",
+                "task `{}`: where 子句未被服务器接受（scope={:?}，BAD element {bad_elements:?}，BAD operand {bad_operands:?}）",
                 task.id, task.scope,
             ),
         ));
@@ -224,13 +247,14 @@ async fn run_event_task_inner(
             Err(e)
         }
         RunExit::Shutdown => {
-            // P0-1 收尾模型：先关 producer（删监控项 → 删订阅 → 本地门，
-            // 此后 callback 不可能再 send），receiver 保持 OPEN，drain 到
-            // sender CLOSED（None）。drain 期 fatal 值为 Some 照常 fail；
-            // sender 丢失则是正常 teardown（server delete 连带 drop session
-            // 侧 callback），此后只 drain（flag 防 changed-Err 空转）。
-            cleanup_event_subscription(transport, &task.id, sub_id, mi_id).await;
+            // P0-2 收尾模型：shutdown 第一件事即关本地门（server cleanup RPC
+            // 再慢，期间也不会继续把本地 FIFO 撑爆），再删监控项/订阅，
+            // receiver 保持 OPEN，drain 到 sender CLOSED（None）。drain 期
+            // fatal 值为 Some 照常 fail；sender 丢失则是正常 teardown
+            // （server delete 连带 drop session 侧 callback），此后只 drain
+            //（flag 防 changed-Err 空转）。
             sub.close_producer();
+            cleanup_event_subscription(transport, &task.id, sub_id, mi_id).await;
             let mut fatal_gone = false;
             loop {
                 if fatal_gone {
@@ -752,5 +776,71 @@ mod tests {
         assert_eq!(err.code, "OPCUA_EVENT_FILTER_REJECTED");
         assert_eq!(fake.created_subscriptions().len(), 1);
         assert_eq!(fake.deleted_subscriptions(), fake.created_subscriptions());
+    }
+
+    /// P1：element 表面 Good 但 operand 报 BAD → 同样 FILTER_REJECTED。
+    #[tokio::test]
+    async fn event_task_where_operand_bad_fails_and_rolls_back() {
+        use opcua_types::StatusCode;
+        let fake = Arc::new(
+            FakeOpcUaTransport::new()
+                .with_namespace_array(test_namespaces())
+                .with_event_where_statuses(
+                    &UaNodeRef::numeric(0, 2253),
+                    vec![StatusCode::Good],
+                )
+                .with_event_where_operand_statuses(
+                    &UaNodeRef::numeric(0, 2253),
+                    vec![vec![StatusCode::BadFilterLiteralInvalid]],
+                ),
+        );
+        let transport: Arc<dyn OpcUaTransport> = fake.clone();
+        let (sink, _erx) = test_sink();
+        let mut plan = test_plan();
+        plan.scope = EventScope::Conditions;
+        let err = run_event_task(
+            transport,
+            plan,
+            Arc::new(test_namespaces()),
+            sink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("operand 被拒必须失败");
+        assert_eq!(err.code, "OPCUA_EVENT_FILTER_REJECTED");
+        assert_eq!(
+            fake.deleted_subscriptions(),
+            fake.created_subscriptions()
+        );
+    }
+
+    /// P1：scope=all 形态下多一个 where element 同样拒绝（exactly 0）。
+    #[tokio::test]
+    async fn event_task_all_scope_with_where_element_fails() {
+        use opcua_types::StatusCode;
+        let fake = Arc::new(
+            FakeOpcUaTransport::new()
+                .with_namespace_array(test_namespaces())
+                .with_event_where_statuses(
+                    &UaNodeRef::numeric(0, 2253),
+                    vec![StatusCode::Good],
+                ),
+        );
+        let transport: Arc<dyn OpcUaTransport> = fake.clone();
+        let (sink, _erx) = test_sink();
+        let err = run_event_task(
+            transport,
+            test_plan(),
+            Arc::new(test_namespaces()),
+            sink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("all 形态带 where 必须失败");
+        assert_eq!(err.code, "OPCUA_EVENT_FILTER_REJECTED");
+        assert_eq!(
+            fake.deleted_subscriptions(),
+            fake.created_subscriptions()
+        );
     }
 }

@@ -8,7 +8,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 
 use opcua_types::{
@@ -137,14 +137,23 @@ pub fn build_event_monitored_item_request(
 /// 服务端 `filter_result` 解码与校验：必须是 `EventFilterResult`，且
 /// select clause 结果数严格等于请求数（数量不变式，§26）；逐 clause 的
 /// Good 与否由调用方按策略判定（19 个必须全 Good），本函数只原样返回
-/// 状态码数组。P0-3：where 部分不再忽略——`where_element` 原样返回，
-/// 调用方按 scope 判定（all：无 BAD；conditions：恰一个 OfType 且 Good）。
+/// 状态码数组。P0-3：where 部分不再忽略——`where_elements` 原样返回
+/// （element + 逐 operand 状态），调用方按 scope 判定（all：0 个 element；
+/// conditions：恰一个 OfType 且 Good，operand 同样 fail-closed，P1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedWhereElement {
+    /// element 自身状态码。
+    pub status: StatusCode,
+    /// 逐 operand 状态码（服务端未报告即空数组，调用方按"缺席即接受"处理）。
+    pub operand_statuses: Vec<StatusCode>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedEventFilterResult {
     /// 逐 select clause 状态码，顺序对应请求（数量已校验）。
     pub select: Vec<StatusCode>,
-    /// 逐 where element 状态码（空 where 即空数组）。
-    pub where_element: Vec<StatusCode>,
+    /// 逐 where element（含 operand）状态码（空 where 即空数组）。
+    pub where_elements: Vec<DecodedWhereElement>,
 }
 
 pub fn decode_event_filter_result(
@@ -171,17 +180,20 @@ pub fn decode_event_filter_result(
         expected_clauses,
         select.len(),
     )?;
-    let where_element = r
+    let where_elements = r
         .where_clause_result
         .element_results
         .clone()
         .unwrap_or_default()
         .into_iter()
-        .map(|e| e.status_code)
+        .map(|e| DecodedWhereElement {
+            status: e.status_code,
+            operand_statuses: e.operand_status_codes.unwrap_or_default(),
+        })
         .collect();
     Ok(DecodedEventFilterResult {
         select,
-        where_element,
+        where_elements,
     })
 }
 
@@ -259,16 +271,23 @@ impl UaEventSubscription {
     }
 }
 
-/// Event producer 共享态（callback 与 close 的互斥点）：门 + 发送端二合一，
-/// 同一把小锁下判定，保证"关门后无新 send、先发的不丢"（drain 到 None 时
-/// 通道内即全部已接受项）。同步 callback 内只做 lock + try_send，不 await。
+/// Event producer 共享态（callback 与 close 的线性化点）：门 + 发送端同一把
+/// 锁。`admit()`（门检查 + 字段校验 + try_send + fatal）与 `close()` 互斥：
+/// close() 返回意味着此前线性化的 callback 已全部完成（入队或 fatal 已发出），
+/// 此后不会再出现任何 Event 或 fatal。同步 callback 内只做 lock + try_send，
+/// 不 await（fatal 的 `send_replace` 与原子计数不跨 await，无死锁环）。
 #[derive(Debug, Default)]
 pub(crate) struct EventProducerShared {
-    open: AtomicBool,
-    tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<UaEventNotification>>>,
+    state: std::sync::Mutex<ProducerState>,
 }
 
-/// `try_send` 结果（调用方映射到统计/fatal/静默丢弃）。
+#[derive(Debug, Default)]
+struct ProducerState {
+    open: bool,
+    tx: Option<tokio::sync::mpsc::Sender<UaEventNotification>>,
+}
+
+/// `try_send` 结果（Fake 预注入与单测用；callback 一律走 `admit`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProducerSend {
     /// 已入队。
@@ -282,21 +301,65 @@ pub(crate) enum ProducerSend {
 impl EventProducerShared {
     pub(crate) fn new(tx: tokio::sync::mpsc::Sender<UaEventNotification>) -> Arc<Self> {
         Arc::new(Self {
-            open: AtomicBool::new(true),
-            tx: std::sync::Mutex::new(Some(tx)),
+            state: std::sync::Mutex::new(ProducerState {
+                open: true,
+                tx: Some(tx),
+            }),
         })
     }
 
-    pub(crate) fn is_open(&self) -> bool {
-        self.open.load(Ordering::SeqCst)
+    /// P0-2：callback 唯一准入点。门检查、字段校验、try_send、fatal 发送
+    /// 全在同一临界区——fatal 不可能迟到到 close 之后无人观察。
+    pub(crate) fn admit(
+        &self,
+        fields: Option<Vec<opcua_types::Variant>>,
+        client_handle: u32,
+        fatal_tx: &tokio::sync::watch::Sender<Option<UaEventStreamFatal>>,
+        stats: &EventSubscriptionStats,
+    ) {
+        use std::sync::atomic::Ordering;
+        let guard = self.state.lock().expect("producer 锁不中毒");
+        if !guard.open {
+            // 关门后到达：静默丢弃，不计数、不 fatal。
+            return;
+        }
+        stats.events_received.fetch_add(1, Ordering::Relaxed);
+        let Some(fields) = fields else {
+            // 无字段的通知无法按位置解码：契约已破坏（锁内宣布，无迟到窗口）。
+            fatal_tx.send_replace(Some(UaEventStreamFatal::MalformedNotification));
+            return;
+        };
+        let notification = UaEventNotification {
+            client_handle,
+            fields,
+        };
+        match guard.tx.as_ref() {
+            None => {
+                // 锁内 open ⇒ tx 必 Some；防御性静默（receiver 已释放）。
+            }
+            Some(tx) => match tx.try_send(notification) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    stats
+                        .callback_queue_overflow
+                        .fetch_add(1, Ordering::Relaxed);
+                    // 禁止 drop-oldest / coalesce / 假装 RUNNING（锁内宣布）。
+                    fatal_tx.send_replace(Some(UaEventStreamFatal::CallbackQueueOverflow));
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // receiver 已释放 = teardown 进行中，静默丢弃。
+                }
+            },
+        }
     }
 
+    /// 门外裸发送（Fake 预注入与单测用；生产 callback 必须走 `admit`）。
     pub(crate) fn try_send(&self, n: UaEventNotification) -> ProducerSend {
-        if !self.open.load(Ordering::SeqCst) {
+        let guard = self.state.lock().expect("producer 锁不中毒");
+        if !guard.open {
             return ProducerSend::Closed;
         }
-        let guard = self.tx.lock().expect("producer 锁不中毒");
-        match guard.as_ref() {
+        match guard.tx.as_ref() {
             None => ProducerSend::Closed,
             Some(tx) => match tx.try_send(n) {
                 Ok(()) => ProducerSend::Sent,
@@ -307,9 +370,10 @@ impl EventProducerShared {
     }
 
     pub(crate) fn close(&self) {
-        self.open.store(false, Ordering::SeqCst);
+        let mut guard = self.state.lock().expect("producer 锁不中毒");
+        guard.open = false;
         // 摘除发送端：通道关闭（已入队项保留），drain 到 None 即可终止。
-        self.tx.lock().expect("producer 锁不中毒").take();
+        guard.tx.take();
     }
 }
 
@@ -325,6 +389,9 @@ pub struct UaEventMonitoredItemResult {
     pub select_clause_statuses: Vec<u32>,
     /// 逐 where element 状态码（bits）；空 where 即空数组（P0-3：不再忽略）。
     pub where_clause_statuses: Vec<u32>,
+    /// 与 `where_clause_statuses` 平行的逐 element operand 状态码（bits）；
+    /// 服务端未报告即空数组（P1：报告的 BAD 同样 fail-closed）。
+    pub where_operand_statuses: Vec<Vec<u32>>,
 }
 
 #[cfg(test)]
@@ -413,7 +480,7 @@ mod tests {
             where_clause_result: ContentFilterResult {
                 element_results: Some(vec![ContentFilterElementResult {
                     status_code: StatusCode::Good,
-                    operand_status_codes: None,
+                    operand_status_codes: Some(vec![StatusCode::Good]),
                     operand_diagnostic_infos: None,
                 }]),
                 element_diagnostic_infos: None,
@@ -421,8 +488,13 @@ mod tests {
         });
         let decoded = decode_event_filter_result(&good, 2).unwrap();
         assert!(decoded.select.iter().all(|c| c.is_good()));
-        // P0-3：where element 结果原样返回（调用方按 scope 判定）。
-        assert_eq!(decoded.where_element, vec![StatusCode::Good]);
+        // P0-3/P1：where element + operand 结果原样返回（调用方按 scope 判定）。
+        assert_eq!(decoded.where_elements.len(), 1);
+        assert!(decoded.where_elements[0].status.is_good());
+        assert_eq!(
+            decoded.where_elements[0].operand_statuses,
+            vec![StatusCode::Good]
+        );
         // 数量对不上即违约
         assert!(decode_event_filter_result(&good, 3).is_err());
         // 非 EventFilterResult 即协议错误
@@ -434,7 +506,7 @@ mod tests {
             where_clause_result: Default::default(),
         });
         let decoded = decode_event_filter_result(&no_where, 1).unwrap();
-        assert!(decoded.where_element.is_empty());
+        assert!(decoded.where_elements.is_empty());
     }
 
     #[test]

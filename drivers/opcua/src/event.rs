@@ -306,105 +306,134 @@ pub struct StandardEventClause {
     pub name: &'static str,
     pub type_id: u32,
     pub path: &'static [&'static str],
+    /// 属性一律 Value(13)：含 ConditionId（见下）。
+    pub attribute_id: u32,
 }
 
-/// 标准字段表：类型一律用 `ObjectTypeId`（禁魔法数字），属性一律取 Value(13)
-///（属性节点的取值属性；事件字段经 browse_path 定位到属性节点后读其 Value）。
+/// 标准字段表：类型一律用 `ObjectTypeId`（禁魔法数字）。
 pub const STANDARD_EVENT_FIELDS: [StandardEventClause; STANDARD_EVENT_FIELD_COUNT] = [
     StandardEventClause {
         name: "EventId",
         type_id: opcua_types::ObjectTypeId::BaseEventType as u32,
         path: &["EventId"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "EventType",
         type_id: opcua_types::ObjectTypeId::BaseEventType as u32,
         path: &["EventType"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "SourceNode",
         type_id: opcua_types::ObjectTypeId::BaseEventType as u32,
         path: &["SourceNode"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "SourceName",
         type_id: opcua_types::ObjectTypeId::BaseEventType as u32,
         path: &["SourceName"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "Time",
         type_id: opcua_types::ObjectTypeId::BaseEventType as u32,
         path: &["Time"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "ReceiveTime",
         type_id: opcua_types::ObjectTypeId::BaseEventType as u32,
         path: &["ReceiveTime"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "Message",
         type_id: opcua_types::ObjectTypeId::BaseEventType as u32,
         path: &["Message"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "Severity",
         type_id: opcua_types::ObjectTypeId::BaseEventType as u32,
         path: &["Severity"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "ConditionId",
-        type_id: opcua_types::ObjectTypeId::ConditionType as u32,
+        // P0-1（Part 9 Table 10）：ConditionId 不是 ConditionType 下显式建模的
+        // 组件，而是 Condition instance 自身的 NodeId。首选形
+        // (ConditionType, [], NodeId) 经实证被 async-opcua 0.19 validation
+        // 拒绝（空路径在其类型树不可解，与补丁无关）；此处取规范另一条路——
+        // Part 4 §7.7.4.5 明确规定 typeDefinitionId=BaseEventType 的 clause
+        // 按 browsePath 求值（忽略类型），Condition 实例均暴露 ConditionId
+        // 属性，非 Condition occurrence 返回 Empty（值层面，clause 仍 Good）。
+        // 我们的订阅本就是异构流（base + conditions 同订阅），BaseEventType
+        // 形正是为此设计的。
+        type_id: opcua_types::ObjectTypeId::BaseEventType as u32,
         path: &["ConditionId"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "ConditionName",
         type_id: opcua_types::ObjectTypeId::ConditionType as u32,
         path: &["ConditionName"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "BranchId",
         type_id: opcua_types::ObjectTypeId::ConditionType as u32,
         path: &["BranchId"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "Retain",
         type_id: opcua_types::ObjectTypeId::ConditionType as u32,
         path: &["Retain"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "Enabled",
         type_id: opcua_types::ObjectTypeId::ConditionType as u32,
         path: &["EnabledState", "Id"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "Active",
         type_id: opcua_types::ObjectTypeId::AlarmConditionType as u32,
         path: &["ActiveState", "Id"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "ActiveTransitionTime",
         type_id: opcua_types::ObjectTypeId::AlarmConditionType as u32,
         path: &["ActiveState", "TransitionTime"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "Acknowledged",
         type_id: opcua_types::ObjectTypeId::AcknowledgeableConditionType as u32,
         path: &["AckedState", "Id"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "AckedTransitionTime",
         type_id: opcua_types::ObjectTypeId::AcknowledgeableConditionType as u32,
         path: &["AckedState", "TransitionTime"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "Confirmed",
         type_id: opcua_types::ObjectTypeId::AcknowledgeableConditionType as u32,
         path: &["ConfirmedState", "Id"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
     StandardEventClause {
         name: "ConfirmedTransitionTime",
         type_id: opcua_types::ObjectTypeId::AcknowledgeableConditionType as u32,
         path: &["ConfirmedState", "TransitionTime"],
+        attribute_id: opcua_types::AttributeId::Value as u32,
     },
 ];
 
@@ -422,7 +451,7 @@ pub fn standard_event_clauses() -> Vec<UaEventSelectClause> {
                     name: (*n).into(),
                 })
                 .collect(),
-            attribute_id: opcua_types::AttributeId::Value as u32,
+            attribute_id: f.attribute_id,
         })
         .collect()
 }
@@ -1035,7 +1064,8 @@ mod tests {
         assert_eq!(F::Active as usize, 13);
         assert_eq!(F::Acknowledged as usize, 15);
         assert_eq!(F::ConfirmedTransitionTime as usize, 18);
-        // 类型分布：8 Base + 5 Condition + 2 Alarm + 4 Ackable（ObjectTypeId，非字面量）。
+        // 类型分布：9 Base（含 ConditionId，见表上注释）+ 4 Condition
+        // + 2 Alarm + 4 Ackable（ObjectTypeId，非字面量）。
         let (base, cond, alarm, ack) = (2041u32, 2782u32, 2915u32, 2881u32);
         assert_eq!(opcua_types::ObjectTypeId::BaseEventType as u32, base);
         assert_eq!(opcua_types::ObjectTypeId::ConditionType as u32, cond);
@@ -1046,15 +1076,23 @@ mod tests {
         );
         for (i, f) in STANDARD_EVENT_FIELDS.iter().enumerate() {
             let want = match i {
-                0..=7 => base,
-                8..=12 => cond,
+                0..=8 => base,
+                9..=12 => cond,
                 13..=14 => alarm,
                 _ => ack,
             };
             assert_eq!(f.type_id, want, "字段 {} 类型错位", f.name);
         }
-        // 属性一律 Value(13)；Enabled/状态类一律两段路径。
+        // 属性一律 Value(13)；Enabled/状态类一律两段路径；
+        // ConditionId 锁定索引 8 + ["ConditionId"] + Value + BaseEventType
+        //（Part 4 §7.7.4.5 异构流规则，见表上注释）。
         for f in &STANDARD_EVENT_FIELDS {
+            assert_eq!(
+                f.attribute_id,
+                opcua_types::AttributeId::Value as u32,
+                "字段 {} 必须是 Value 属性",
+                f.name
+            );
             assert!(!f.path.is_empty(), "字段 {} 必须显式路径", f.name);
         }
         assert_eq!(STANDARD_EVENT_FIELDS[12].path, &["EnabledState", "Id"]);
@@ -1066,7 +1104,7 @@ mod tests {
         assert_eq!(clauses.len(), STANDARD_EVENT_FIELD_COUNT);
         for (c, f) in clauses.iter().zip(STANDARD_EVENT_FIELDS.iter()) {
             assert_eq!(c.type_definition_id, UaNodeRef::numeric(0, f.type_id));
-            assert_eq!(c.attribute_id, 13);
+            assert_eq!(c.attribute_id, f.attribute_id);
             let got: Vec<_> = c.browse_path.iter().map(|q| q.name.as_str()).collect();
             assert_eq!(got, f.path);
         }

@@ -66,6 +66,8 @@ pub struct FakeOpcUaTransport {
     event_clause_statuses: Mutex<HashMap<String, Vec<StatusCode>>>,
     /// notifier key → 逐 where-element 状态（缺省空，即 scope=all 形态）。
     event_where_statuses: Mutex<HashMap<String, Vec<StatusCode>>>,
+    /// notifier key → 逐 element operand 状态（缺省空，即未报告即接受）。
+    event_where_operand_statuses: Mutex<HashMap<String, Vec<Vec<StatusCode>>>>,
     /// 预置 create_event_subscription 整体失败（session loss 类测试用）。
     event_sub_error: Mutex<Option<UaTransportError>>,
     /// 预置 create_event_monitored_items 服务级整体失败（回滚测试用）。
@@ -180,6 +182,20 @@ impl FakeOpcUaTransport {
         statuses: Vec<StatusCode>,
     ) -> Self {
         self.event_where_statuses
+            .lock()
+            .unwrap()
+            .insert(node_key(notifier), statuses);
+        self
+    }
+
+    /// 预置某 notifier 的逐 element operand 状态（P1：operand BAD 类测试用；
+    /// 外层与 element 一一对应，未报告的 element 填空数组）。
+    pub fn with_event_where_operand_statuses(
+        self,
+        notifier: &UaNodeRef,
+        statuses: Vec<Vec<StatusCode>>,
+    ) -> Self {
+        self.event_where_operand_statuses
             .lock()
             .unwrap()
             .insert(node_key(notifier), statuses);
@@ -454,6 +470,18 @@ impl OpcUaTransport for FakeOpcUaTransport {
                 .get(&key)
                 .map(|v| v.iter().map(|s| s.bits()).collect())
                 .unwrap_or_default();
+            // operand 缺省为空（服务端未报告即接受，P1）；显式脚本覆盖。
+            let where_operands = self
+                .event_where_operand_statuses
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(|v| {
+                    v.iter()
+                        .map(|ops| ops.iter().map(|s| s.bits()).collect())
+                        .collect()
+                })
+                .unwrap_or_default();
             out.push(crate::event::UaEventMonitoredItemResult {
                 client_handle: spec.client_handle,
                 monitored_item_id: if good {
@@ -466,6 +494,7 @@ impl OpcUaTransport for FakeOpcUaTransport {
                 revised_queue_size: spec.queue_size,
                 select_clause_statuses: clause_statuses,
                 where_clause_statuses: where_statuses,
+                where_operand_statuses: where_operands,
             });
         }
         Ok(out)

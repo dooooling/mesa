@@ -8,7 +8,7 @@ use support::event_server::FixtureEventServer;
 
 #[tokio::test]
 async fn spike_fixture_server_accepts_transport_connect() {
-    let srv = FixtureEventServer::start().await;
+    let mut srv = FixtureEventServer::start().await;
     let client_pki = srv.pki_dir.join("..").join(format!(
         "mesa-opcua-event-fixture-cli-{}",
         std::process::id()
@@ -42,7 +42,7 @@ async fn spike_event_subscription_receives_triggered_base_event() {
     };
     use opcua_types::{ByteString, DateTime, LocalizedText, NodeId, ObjectTypeId, Variant};
 
-    let srv = FixtureEventServer::start().await;
+    let mut srv = FixtureEventServer::start().await;
     let client_pki = srv.pki_dir.join("..").join(format!(
         "mesa-opcua-event-fixture-cli-ev-{}",
         std::process::id()
