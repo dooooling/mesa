@@ -71,7 +71,6 @@
   超范围即拒）；
 - Secret 不进日志（`SinumerikConnConfig` 手写 Debug：password 恒 `<redacted>`，
   连接 Debug 同理；两级脱敏断言锁定）。
-  `EMPTY_PLAN` / `EVENT_NOT_SUPPORTED`）。
 
 ## 6. PR11 明确禁止（出现即 scope drift）
 
