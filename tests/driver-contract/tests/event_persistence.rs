@@ -65,16 +65,17 @@ fn generic_alarm_task() -> EventTask {
     }
 }
 
-/// 洪峰计数器（⑨ Gate 用）：Poll 10ms 节奏（100/s），瞬时事件。
+/// Stop barrier 计数器（⑨ Gate 用）：Poll 50ms 节奏（~20/s，可持续速率）。
 /// 本测试是端到端锁（真实 Stop 路径 + 逐 epoch 连续 + 落盘），牙口不在速率：
 /// 确定性遗弃证明在单测 `ingress_cancel_drains_backlog`（旧行为 73/200）。
-/// 速率刻意保守——慢机器（CI ARM）上过高速率会触发 overflow fail-closed
-/// 换 epoch 造成误红；100/s 下 ingress 单行 txn 吞吐绰绰有余。
+/// 100/s 在 debug 构建下超过 ingress 单批 txn 吞吐，会正确触发 overflow
+/// fail-closed 换 epoch（由 event_pressure 冻结为 overload 域行为）——
+/// 此处必须用可持续速率，否则测的是"过载"而不是 Stop barrier。
 fn flood_task() -> EventTask {
     EventTask {
         id: "cnt".into(),
         mode: TaskMode::Poll,
-        interval_ms: Some(10),
+        interval_ms: Some(50),
         binding: DriverBinding {
             kind: EVENT_BINDING_KIND.into(),
             config: serde_json::json!({"stream": SIM_EVENT_STREAM_COUNTER}),
@@ -624,9 +625,10 @@ async fn stop_barrier_drains_inflight_epoch_events() {
     // 高，五轮全过的概率可忽略；新顺序恒过。
     for round in 0..5 {
         mgr.start_endpoint(cfg()).unwrap();
-        // 洪峰形成（≥80 行/轮）
+        // 负载形成（≥25 行/轮，producer 仍活跃时直接 Stop——证明的是
+        // "accepted tail drains"，不是"永远吸收过载"）
         let base = store.stats().unwrap().rows;
-        wait_until(20, || store.stats().unwrap().rows >= base + 80).await;
+        wait_until(20, || store.stats().unwrap().rows >= base + 25).await;
         assert_eq!(mgr.stop_endpoint("ct-evt-stopgate").await, Ok(true));
         // 逐 epoch 连续性：同 epoch 内 batch_sequence 无缺口、无重复
         let (rows, _) = store
@@ -669,7 +671,7 @@ async fn stop_barrier_drains_inflight_epoch_events() {
     assert_eq!(mgr.stop_endpoint("ct-evt-stopgate").await, Ok(false));
     // 落盘性：重开 events.db，barrier-drain 的行必须全在
     let rows_before = store.stats().unwrap().rows;
-    assert!(rows_before >= 400, "五轮洪峰应 ≥400 行，实际 {rows_before}");
+    assert!(rows_before >= 125, "五轮应 ≥125 行，实际 {rows_before}");
     drop(store);
     drop(mgr);
     let reopened = EventStore::open(&db).unwrap();

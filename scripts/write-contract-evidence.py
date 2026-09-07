@@ -24,6 +24,20 @@ SUITES = [
     "profile_contract",
     "resource_contract",
     "subprocess_orphan_guard",
+    # PR10 Event Plane V1：事件面全部 contract suites（含 hardening gates）。
+    # cargo test 跑整个包（新二进制自动参跑）；此名单是证据manifest，
+    # 增删 suite 必须显式评审（与 stats 键冻结同理）。
+    "event_hardening_smoke",
+    "event_identity",
+    "event_lifecycle",
+    "event_persistence",
+    "event_pressure",
+    "event_retention_pressure",
+    "event_runtime",
+    "event_scheduler",
+    "event_soak",
+    "event_sse",
+    "event_store_faults",
 ]
 REQUIRED_SET = set(SUITES)
 
@@ -75,7 +89,7 @@ def main():
         "dirty": not is_clean_tree(),
     }
     # 防御：保证集合完整性（Contract Gate 验证行为契约，不含 build_profile）
-    assert set(doc["suites"]) == REQUIRED_SET and doc["total"] == len(SUITES) == 14
+    assert set(doc["suites"]) == REQUIRED_SET and doc["total"] == len(SUITES) == 25
     out.write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"wrote {out} suites={len(SUITES)} sha={sha} dirty={doc['dirty']}")
 

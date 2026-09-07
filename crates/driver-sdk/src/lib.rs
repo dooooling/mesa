@@ -2114,6 +2114,50 @@ mod tests {
         }
     }
 
+    /// Event Plane 背压冻结（PR10 §5）：满队列 publish 必须等待，
+    /// 不失败、不丢弃、不合并。腾出空间后完成且序号连续、内容 intact。
+    /// 与 Data Latest-Wins 的对照：事件走独立可靠队列，无 QueueFull 变体。
+    #[tokio::test]
+    async fn event_sink_full_waits_without_loss_or_coalesce() {
+        use std::time::Duration;
+        let (session_sink, mut erx) = test_session_sink();
+        let conn = session_sink.for_connection(7, 99);
+        let events = conn.events();
+        for i in 1..=EVENT_CAPACITY {
+            let seq = events
+                .publish(vec![event(&format!("w-{i}"))])
+                .await
+                .unwrap();
+            assert_eq!(seq, i as u64);
+        }
+        // 第 129 个 publish 必须 pending（200ms 内不得完成/失败）
+        let pend = tokio::spawn(async move { events.publish(vec![event("w-last")]).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !pend.is_finished(),
+            "满队列 publish 必须等待，不失败不丢不合并"
+        );
+        // 消费腾出空间 → 完成，序号连续
+        let first = erx.recv().await.expect("首批必在");
+        assert_eq!(first.events[0].event_id, "w-1");
+        let seq = tokio::time::timeout(Duration::from_secs(5), pend)
+            .await
+            .expect("腾出空间后必须完成")
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq, EVENT_CAPACITY as u64 + 1);
+        // 排空：剩余顺序 intact（w-2..w-128, w-last）
+        let mut ids = vec![];
+        for _ in 0..EVENT_CAPACITY {
+            let b = erx.recv().await.expect("排空不得缺");
+            ids.extend(b.events.iter().map(|r| r.event_id.clone()));
+        }
+        assert_eq!(ids.len(), EVENT_CAPACITY);
+        assert_eq!(ids[0], "w-2");
+        assert_eq!(ids[EVENT_CAPACITY - 1], "w-last");
+        assert!(erx.try_recv().is_err());
+    }
+
     /// EventSink 自动盖戳 + sequence 按 (handle, epoch) 独立递增；
     /// 新 epoch 从 1 重来（§11）。
     #[tokio::test]

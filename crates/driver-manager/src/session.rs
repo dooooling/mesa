@@ -1529,4 +1529,235 @@ mod tests {
             "batch_sequence 必须连续 1..=200"
         );
     }
+
+    /// 真 ingress sequence 契约（PR10 §3）：跑同一份 `run_event_ingress`
+    ///（tracker + store + diagnostics + fatal 码）。嵌套 mod 以便构造
+    /// epoch 门后的 `EventReceiver`；contract suite 侧只锁存储语义，
+    /// 此处锁“流完整性语言 → DB commit order”全链。
+    mod ingress_sequence_contract {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use mesa_core_types::{EventBatch, EventRecord, Value};
+        use mesa_event_store::{
+            EVENT_HUB_CAPACITY, EventDiagnostics, EventFilter, EventHub, EventServices, EventStore,
+        };
+        use tokio::sync::{Notify, mpsc};
+        use tokio_util::sync::CancellationToken;
+
+        use super::super::{EVENT_BATCH_CAPACITY, EVENT_CAPACITY, EventReceiver, Shared};
+        use crate::event_ingress::{IngressFatal, run_event_ingress};
+
+        const HANDLE: u32 = 1;
+
+        fn record(id: String) -> EventRecord {
+            EventRecord {
+                event_id: id,
+                category: "message".into(),
+                kind: "counter.tick".into(),
+                source: "T".into(),
+                severity: 100,
+                code: None,
+                message: None,
+                message_locale: None,
+                occurred_at_ns: None,
+                condition: None,
+                correlation_id: None,
+                attributes: std::collections::BTreeMap::from([("n".into(), Value::I32(1))]),
+            }
+        }
+
+        fn batch(handle: u32, epoch: u64, seq: u64, id: &str) -> EventBatch {
+            EventBatch {
+                connection_handle: handle,
+                stream_epoch: epoch,
+                sequence: seq,
+                timestamp_ns: 1_700_000_000_000_000_000,
+                events: vec![record(id.into())],
+                mono_ns: None,
+            }
+        }
+
+        struct Rig {
+            tx: mpsc::Sender<EventBatch>,
+            shared: Arc<Shared>,
+            shutdown: CancellationToken,
+            worker: Option<tokio::task::JoinHandle<Result<(), IngressFatal>>>,
+            store: Arc<EventStore>,
+            services: Arc<EventServices>,
+        }
+
+        impl Rig {
+            async fn start(epoch: u64) -> Self {
+                // Shared 需要一个写半部占位（本测试不用请求路径，保持存活即可）。
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                    .await
+                    .unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+                let cli = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .unwrap();
+                let _server = accept.await.unwrap();
+                let (_rd, wr) = cli.into_split();
+                let (event_tx, _event_rx) = mpsc::channel(EVENT_BATCH_CAPACITY);
+                let shared = Arc::new(Shared {
+                    pending: Mutex::new(HashMap::new()),
+                    writer: tokio::sync::Mutex::new(wr),
+                    events_tx: mpsc::channel(EVENT_CAPACITY).0,
+                    event_tx: Mutex::new(Some(event_tx)),
+                    unresponsive: Arc::new(AtomicBool::new(false)),
+                    dropped_events: AtomicU64::new(0),
+                    event_stream_dead: AtomicBool::new(false),
+                    event_overflow_drops: AtomicU64::new(0),
+                    event_decode_errors: AtomicU64::new(0),
+                    active_event_epochs: Mutex::new(HashMap::from([(HANDLE, epoch)])),
+                    pending_event_starts: Mutex::new(HashMap::new()),
+                    reader_done: AtomicBool::new(false),
+                    reader_done_notify: Notify::new(),
+                });
+                let (tx, rx) = mpsc::channel(EVENT_BATCH_CAPACITY);
+                let store = Arc::new(EventStore::open_in_memory().unwrap());
+                let services = EventServices::new(store.clone(), EventHub::new(EVENT_HUB_CAPACITY));
+                let shutdown = CancellationToken::new();
+                let rx = EventReceiver {
+                    rx,
+                    shared: Arc::clone(&shared),
+                };
+                let worker = tokio::spawn(run_event_ingress(
+                    rx,
+                    "hd-ingress".into(),
+                    services.clone(),
+                    shutdown.clone(),
+                ));
+                Self {
+                    tx,
+                    shared,
+                    shutdown,
+                    worker: Some(worker),
+                    store,
+                    services,
+                }
+            }
+
+            /// epoch 门切换（模拟 reconnect 开新 epoch；tracker 侧自动新流）。
+            fn switch_epoch(&self, epoch: u64) {
+                self.shared
+                    .active_event_epochs
+                    .lock()
+                    .unwrap()
+                    .insert(HANDLE, epoch);
+            }
+
+            async fn finish_ok(&mut self) {
+                self.shutdown.cancel();
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.worker.take().expect("只 finish 一次"),
+                )
+                .await
+                .expect("ingress 必须退出")
+                .expect("不 panic")
+                .expect("正常 drain 必须 Ok");
+            }
+
+            fn seqs_asc(&self) -> Vec<i64> {
+                let (rows, _) = self
+                    .store
+                    .query_history(&EventFilter {
+                        endpoint_id: Some("hd-ingress".into()),
+                        limit: Some(100),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let mut seqs: Vec<i64> = rows.iter().map(|r| r.seq).collect();
+                seqs.sort_unstable();
+                seqs
+            }
+
+            fn diag(&self, f: fn(&EventDiagnostics) -> &AtomicU64) -> u64 {
+                f(&self.services.diagnostics).load(Ordering::Relaxed)
+            }
+
+            /// 等待落盘行数达标（epoch 切换前必须先让旧 epoch 批次流完，
+            /// 否则 stale 门正确丢弃它们——那是生产语义，不是测试能省的 barrier）。
+            async fn wait_rows(&self, n: usize) {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    if self.seqs_asc().len() >= n {
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "落盘行数不足：want>={n}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+
+        /// §3 冻结：10/11/12 正常 → 14 gap（入库+计数+推进）→ 14 整批跳过
+        ///（不开 txn，无新行）→ 新 epoch 首 seq 任意值。store seq 始终
+        /// 纯 commit order 1..=5。
+        #[tokio::test]
+        async fn accept_gap_duplicate_then_new_epoch() {
+            let mut rig = Rig::start(0xE1).await;
+            for s in [10u64, 11, 12] {
+                rig.tx
+                    .send(batch(HANDLE, 0xE1, s, &format!("g-{s}")))
+                    .await
+                    .unwrap();
+            }
+            rig.tx.send(batch(HANDLE, 0xE1, 14, "g-14")).await.unwrap();
+            rig.tx.send(batch(HANDLE, 0xE1, 14, "g-14")).await.unwrap();
+            rig.wait_rows(4).await;
+            rig.switch_epoch(0xE2);
+            rig.tx.send(batch(HANDLE, 0xE2, 1, "g-new")).await.unwrap();
+            rig.finish_ok().await;
+            assert_eq!(rig.seqs_asc(), vec![1, 2, 3, 4, 5]);
+            assert_eq!(rig.diag(|d| &d.ingress_gaps_total), 1, "14 恰一次 gap");
+            assert_eq!(
+                rig.diag(|d| &d.ingress_batch_duplicates_total),
+                1,
+                "第二个 14 整批跳过"
+            );
+            assert_eq!(rig.diag(|d| &d.ingress_persisted_events_total), 5);
+        }
+
+        /// 10/11/10 → `EVENT_SEQUENCE_REGRESSION` 杀本 attempt；已入库两行保留。
+        #[tokio::test]
+        async fn regression_kills_attempt() {
+            let mut rig = Rig::start(0xE1).await;
+            for (s, id) in [(10u64, "r-10"), (11, "r-11"), (10, "r-10-dup")] {
+                rig.tx.send(batch(HANDLE, 0xE1, s, id)).await.unwrap();
+            }
+            // tx 故意不清：worker 在第 3 批即 fatal 返回，无需靠通道关闭结束。
+            let err = tokio::time::timeout(
+                Duration::from_secs(10),
+                rig.worker.take().expect("worker 必存在"),
+            )
+            .await
+            .expect("ingress 必须结束")
+            .expect("不 panic")
+            .expect_err("regression 必须 fatal");
+            assert_eq!(err.code(), "EVENT_SEQUENCE_REGRESSION");
+            assert_eq!(rig.seqs_asc(), vec![1, 2]);
+            assert_eq!(rig.diag(|d| &d.ingress_regressions_total), 1);
+        }
+
+        /// transport sequence 再跳，store seq 仍是纯 commit order。
+        #[tokio::test]
+        async fn store_seq_isolated_from_transport_sequence() {
+            let mut rig = Rig::start(7).await;
+            rig.tx.send(batch(HANDLE, 7, 100, "t-100")).await.unwrap();
+            rig.tx.send(batch(HANDLE, 7, 200, "t-200")).await.unwrap();
+            rig.wait_rows(2).await;
+            rig.switch_epoch(8);
+            rig.tx.send(batch(HANDLE, 8, 1, "t-1")).await.unwrap();
+            rig.finish_ok().await;
+            assert_eq!(rig.seqs_asc(), vec![1, 2, 3]);
+        }
+    }
 }

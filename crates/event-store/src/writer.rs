@@ -9,6 +9,11 @@
 
 use mesa_core_types::EventBatch;
 use rusqlite::{Connection, params};
+#[cfg(feature = "test-hooks")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::schema::{self, StoredEvent};
@@ -55,14 +60,81 @@ pub enum WriteCommand {
         batch_limit: u64,
         reply: oneshot::Sender<Result<usize, EventStoreError>>,
     },
+    /// 测试故障器装配（`test-hooks`）：writer 线程收到后持有，后续 Commit
+    /// 按其规则注入 SQLITE_FULL。首命令语义（open_with_faults 同步发送，
+    /// 通道初始为空，必排在一切 Commit 之前），故装配无竞态。
+    #[cfg(feature = "test-hooks")]
+    SetFaults(std::sync::Arc<StoreFaults>),
+}
+
+/// 测试专用故障注入（PR10 hardening，`test-hooks` feature 门控）：
+/// 默认构建中本类型与装配 API 均不存在，writer 热路径零检查。
+/// 开启后 writer 线程在每次 Commit 前检查：计数到达 `fail_commit_at`
+///（1-based；0 = 不注入）时返回 SQLITE_FULL 风格的 `Fatal` 错误，走与真实
+/// 磁盘故障完全相同的回滚 + 归一路径（ingress → `EVENT_STORE_UNAVAILABLE`）。
+/// `fail_sticky` 为 true 时第 N 个起每个 commit 都失败（持续故障 + 恢复验证）。
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Default)]
+pub struct StoreFaults {
+    /// 第几个 commit 开始失败（1-based；0 = 永不失败）。
+    pub fail_commit_at: AtomicU64,
+    /// true = 到达后持续失败直到测试改回 false（恢复验证用，可运行时切换）。
+    pub fail_sticky: std::sync::atomic::AtomicBool,
+    commits: AtomicU64,
+}
+
+#[cfg(feature = "test-hooks")]
+impl StoreFaults {
+    /// 构造故障器：第 `at` 个 commit 起失败（1-based；0 = 永不失败）；
+    /// `sticky` 为 true 则持续失败直到测试改回（`fail_sticky` 是公开原子量）。
+    pub fn new(at: u64, sticky: bool) -> Self {
+        Self {
+            fail_commit_at: AtomicU64::new(at),
+            fail_sticky: std::sync::atomic::AtomicBool::new(sticky),
+            commits: AtomicU64::new(0),
+        }
+    }
+
+    fn check(&self) -> Result<(), EventStoreError> {
+        let at = self.fail_commit_at.load(Ordering::Relaxed);
+        if at == 0 {
+            return Ok(());
+        }
+        let n = self.commits.fetch_add(1, Ordering::Relaxed) + 1;
+        let hit = if self.fail_sticky.load(Ordering::Relaxed) {
+            n >= at
+        } else {
+            n == at
+        };
+        if hit {
+            // SQLITE_FULL（13）：调用方（ingress）按 Fatal 归一为 StoreUnavailable，
+            // 与真实磁盘满路径一致（整批回滚，不污染）。
+            Err(EventStoreError::Fatal(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(13),
+                Some("disk full (injected fault)".into()),
+            )))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Writer 主循环（blocking 线程内运行）。发送端全部释放即退出。
+/// 默认构建：Commit 直落 `commit_batch`，无故障检查。
 pub fn writer_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCommand>) {
+    #[cfg(feature = "test-hooks")]
+    let mut faults: Option<Arc<StoreFaults>> = None;
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             WriteCommand::Commit(req, reply) => {
-                let _ = reply.send(commit_batch(&mut conn, &req));
+                #[cfg(feature = "test-hooks")]
+                let res = match faults.as_ref().map(|f| f.check()).unwrap_or(Ok(())) {
+                    Ok(()) => commit_batch(&mut conn, &req),
+                    Err(e) => Err(e),
+                };
+                #[cfg(not(feature = "test-hooks"))]
+                let res = commit_batch(&mut conn, &req);
+                let _ = reply.send(res);
             }
             WriteCommand::Purge {
                 before_seq,
@@ -70,6 +142,10 @@ pub fn writer_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCommand>) {
                 reply,
             } => {
                 let _ = reply.send(purge_batch(&mut conn, before_seq, batch_limit));
+            }
+            #[cfg(feature = "test-hooks")]
+            WriteCommand::SetFaults(f) => {
+                faults = Some(f);
             }
         }
     }

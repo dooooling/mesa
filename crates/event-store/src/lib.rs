@@ -17,6 +17,8 @@ pub use hub::{EVENT_HUB_CAPACITY, EventHub};
 pub use query::{EventFilter, max_seq, query_by_seq, query_history, query_range_asc};
 pub use retention::RetentionConfig;
 pub use schema::{EVENT_SCHEMA_VERSION, StoredEvent, transition_str};
+#[cfg(feature = "test-hooks")]
+pub use writer::StoreFaults;
 pub use writer::{CommitRequest, CommitResult, EventStoreStats};
 
 use std::path::Path;
@@ -359,6 +361,22 @@ impl EventStore {
     /// 打开（不存在则创建）文件库。
     pub fn open(path: &Path) -> Result<Self, EventStoreError> {
         Self::spawn(Some(path.to_path_buf()), false)
+    }
+
+    /// 带故障注入的文件库（`test-hooks` 门控，hardening 测试专用；
+    /// 默认构建中本函数不存在，生产永远用 `open`）。
+    /// 故障器经首命令装配（通道初始为空，必排在一切 Commit 之前，无竞态）。
+    #[cfg(feature = "test-hooks")]
+    pub fn open_with_faults(
+        path: &Path,
+        faults: std::sync::Arc<writer::StoreFaults>,
+    ) -> Result<Self, EventStoreError> {
+        let store = Self::spawn(Some(path.to_path_buf()), false)?;
+        store
+            .writer_tx
+            .try_send(writer::WriteCommand::SetFaults(faults))
+            .map_err(|_| EventStoreError::Unavailable("event writer queue closed".into()))?;
+        Ok(store)
     }
 
     /// 内存库（单测用；读写共享 `cache=shared` 同一底层）。
