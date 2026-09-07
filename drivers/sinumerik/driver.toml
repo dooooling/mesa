@@ -1,0 +1,10 @@
+# SINUMERIK Driver — 只读 V1（PR11 起步）
+# Siemens SINUMERIK CNC 经由公共 mesa-opcua-transport 接入（复用 Native OPC UA，
+# 本驱动只承载设备语义：Descriptor / Probe / Browse / 稳定身份 / 只读采集）。
+id = "sinumerik"
+name = "SINUMERIK"
+version = "0.1.0"
+executable = "Mesa-driver-sinumerik"
+protocol_major = 1
+protocol_minor = 3
+sdk = "rust"

@@ -339,6 +339,23 @@ fn opcua_descriptor_is_valid() {
 }
 
 #[test]
+fn sinumerik_descriptor_is_valid_and_read_only() {
+    // PR11：SINUMERIK 只读地基与通用 OPC UA 同一 Descriptor 契约（无 Core 分支）。
+    let d = mesa_driver_sinumerik::SinumerikDriver.descriptor();
+    d.validate().expect("sinumerik descriptor must be valid");
+    assert_eq!(d.identity.driver_id, "sinumerik");
+    assert!(serde_json::to_string(&d).unwrap().len() < 256 * 1024);
+    assert!(d.capabilities.poll, "sinumerik V1 must poll");
+    assert!(d.capabilities.subscribe, "sinumerik V1 must subscribe");
+    assert!(d.capabilities.browse, "sinumerik must support browse");
+    assert!(d.discovery.browse);
+    assert!(!d.capabilities.write, "V1 只读：不得声明 write");
+    assert!(!d.capabilities.events, "PR11 无事件：不得声明 events");
+    assert!(d.controls.commands.is_empty(), "V1 只读：无控制目录");
+    assert!(d.resources.iter().any(|r| r.id == "node"));
+}
+
+#[test]
 fn descriptor_json_roundtrip_stable() {
     let d = synthetic_descriptor();
     let a = serde_json::to_string(&d).unwrap();

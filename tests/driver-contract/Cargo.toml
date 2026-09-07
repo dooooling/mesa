@@ -15,6 +15,7 @@ mesa-driver-simulator = { path = "../../drivers/simulator" }
 mesa-driver-s7 = { path = "../../drivers/s7" }
 mesa-driver-focas2 = { path = "../../drivers/focas2" }
 mesa-driver-opcua = { path = "../../drivers/opcua" }
+mesa-driver-sinumerik = { path = "../../drivers/sinumerik" }
 mesa-core-api = { path = "../../crates/core-api" }
 mesa-driver-manager = { workspace = true }
 mesa-event-store = { workspace = true }
