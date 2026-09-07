@@ -15,8 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mesa_core_types::{
-    ConnectionState, DataBatch, DriverMetadata, ErrorKind, EventBatch, EventRecord,
-    PointDescriptor, PointMap,
+    ConnectionState, DriverMetadata, ErrorKind, EventRecord, PointDescriptor, PointMap,
 };
 use mesa_driver_protocol::{
     ConvertError, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolError, batch_to_pb, err_result,
@@ -241,8 +240,9 @@ pub trait DriverConnection: Send {
     }
 }
 
-// 别名：AcquisitionTask/EventTask 在 trait 签名中出现，保持与方案 §16 一致的命名可见性
-pub use mesa_core_types::{AcquisitionTask, EventTask};
+// 别名：AcquisitionTask/EventTask 在 trait 签名中出现，保持与方案 §16 一致的命名可见性；
+// EventBatch/DataBatch 供驱动运行时测试构造通道。
+pub use mesa_core_types::{AcquisitionTask, DataBatch, EventBatch, EventTask};
 
 // ---------------------------------------------------------------------------
 // DataSink：带 Latest-Wins 合并的发布端
@@ -301,6 +301,18 @@ pub struct EventSink {
 }
 
 impl EventSink {
+    /// 集成测试专用构造：直连给定 event 通道（handle/epoch 由调用方指定）。
+    /// 生产路径必须经 [`DataSink::events`] 派生；本函数仅供驱动运行时测试
+    /// （Fake/Native fixture），不得在生产代码中使用。
+    pub fn for_test(event_tx: mpsc::Sender<EventBatch>, handle: u32, stream_epoch: u64) -> Self {
+        Self {
+            event_tx,
+            seq: Arc::new(tokio::sync::Mutex::new(EventSequencer { next: 1 })),
+            handle,
+            epoch: stream_epoch,
+        }
+    }
+
     /// 本次 run 的 stream_epoch 只读视图（PR7：synthetic occurrence 的 run
     /// 作用域——Simulator 用它构造跨进程重启唯一的 event_id；Core epoch
     /// 是稳定的 run scope，比进程级计数更适合做 ID 作用域）。
@@ -392,6 +404,16 @@ impl std::fmt::Debug for DataSink {
 }
 
 impl DataSink {
+    /// 集成测试专用构造：直连给定三通道（未绑定 handle/epoch，行为同会话占位）。
+    /// 生产路径由 `serve()` 构造；本函数仅供驱动运行时测试，不得在生产代码中使用。
+    pub fn for_test(
+        control_tx: mpsc::Sender<pb::Envelope>,
+        data_tx: mpsc::Sender<DataBatch>,
+        event_tx: mpsc::Sender<EventBatch>,
+    ) -> Self {
+        Self::new(control_tx, data_tx, event_tx)
+    }
+
     fn new(
         control_tx: mpsc::Sender<pb::Envelope>,
         data_tx: mpsc::Sender<DataBatch>,

@@ -50,6 +50,19 @@ pub struct FakeOpcUaTransport {
     live_batches: Mutex<VecDeque<FakeLiveBatch>>,
     /// 预置下一次（及以后所有）`create_event_subscription` 返回前注入的原生事件通知。
     event_batches: Mutex<VecDeque<crate::event::UaEventNotification>>,
+    /// 存活的事件 sender（订阅 id → sender）：Fake 必须持有发送端，
+    /// 否则 receiver 建完即见 None（与 Native“sender 随会话存活”语义一致）；
+    /// `delete_subscription` 时摘除，通道关闭。
+    event_senders: Mutex<
+        HashMap<UaSubscriptionId, tokio::sync::mpsc::Sender<crate::event::UaEventNotification>>,
+    >,
+    /// 存活的 fatal sender（订阅 id → sender）：同上，否则 changed() 建完即 Err。
+    event_fatal_senders: Mutex<
+        HashMap<
+            UaSubscriptionId,
+            tokio::sync::watch::Sender<Option<crate::event::UaEventStreamFatal>>,
+        >,
+    >,
     /// notifier key → create_event_monitored_items 逐项状态（缺省 Good）。
     event_create_status: Mutex<HashMap<String, StatusCode>>,
     /// notifier key → 逐 clause 状态（缺省全 Good，长度自动对齐 clauses 数）。
@@ -350,6 +363,9 @@ impl OpcUaTransport for FakeOpcUaTransport {
 
     async fn delete_subscription(&self, id: UaSubscriptionId) -> Result<(), UaTransportError> {
         self.deleted_subs.lock().unwrap().push(id);
+        // 摘除事件发送端，receiver 侧随即见 None（会话结束语义）。
+        self.event_senders.lock().unwrap().remove(&id);
+        self.event_fatal_senders.lock().unwrap().remove(&id);
         Ok(())
     }
 
@@ -365,12 +381,18 @@ impl OpcUaTransport for FakeOpcUaTransport {
         let id = self.next_sub_id.fetch_add(1, Ordering::SeqCst);
         self.created_subs.lock().unwrap().push(id);
         let (tx, rx) = tokio::sync::mpsc::channel(crate::event::EVENT_CALLBACK_QUEUE_CAPACITY);
-        let (_fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+        let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
         // 预置通知按序注入（单测规模，必须能容纳；超限即脚本错误，直接 panic）。
         for n in self.event_batches.lock().unwrap().drain(..) {
             tx.try_send(n)
                 .expect("fake event batch 必须能容纳（单测规模）");
         }
+        // 发送端随订阅存活（delete 时摘除），receiver 不会早于会话结束见 None。
+        self.event_senders.lock().unwrap().insert(id, tx);
+        self.event_fatal_senders
+            .lock()
+            .unwrap()
+            .insert(id, fatal_tx);
         Ok(crate::event::UaEventSubscription {
             id,
             requested_publishing_interval_ms: spec.publishing_interval_ms,
