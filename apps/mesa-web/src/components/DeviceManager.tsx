@@ -4,7 +4,9 @@ import { Alert, Button, Card, Form, Input, InputNumber, Modal, Select, Space, Sw
 import type { DriverDescriptor, FieldDescriptor } from "../types";
 import { ResourcePickerAntd } from "./ResourcePickerAntd";
 
-const DRIVERS = [
+// 后端 discovery 不可用时的兜底（正常情况下拉来自 /api/v1/drivers，
+// 新驱动如 sinumerik 无需改前端即出现）。
+const FALLBACK_DRIVERS = [
   { value: "simulator", label: "Simulator" },
   { value: "s7", label: "Siemens S7" },
   { value: "focas2", label: "FANUC FOCAS2" },
@@ -25,6 +27,8 @@ export function DeviceManager() {
   const [form] = Form.useForm();
   const [desc, setDesc] = useState<DriverDescriptor | null>(null);
   const [driverId, setDriverId] = useState("simulator");
+  // 驱动下拉以后端 discovery 为准（新驱动自动出现）；后端不可用时用兜底。
+  const [driverOptions, setDriverOptions] = useState(FALLBACK_DRIVERS);
   const [probe, setProbe] = useState<{ ok: boolean; msg: string } | null>(null);
   const [issues, setIssues] = useState<Array<{ path: string; message: string }>>([]);
   const [pointsOpen, setPointsOpen] = useState(false);
@@ -46,6 +50,16 @@ export function DeviceManager() {
     setEndpoints(eps);
   }).catch(() => {});
   useEffect(() => { load(); }, []);
+  useEffect(() => {
+    fetch("/api/v1/drivers").then((r) => r.json()).then((j) => {
+      const ds = ((j.drivers ?? []) as Array<{ id: string; name: string }>)
+        .map((d) => ({ value: d.id, label: d.name }));
+      if (ds.length) {
+        setDriverOptions(ds);
+        setDriverId((cur) => (ds.some((x) => x.value === cur) ? cur : ds[0].value));
+      }
+    }).catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -286,7 +300,7 @@ export function DeviceManager() {
       <Modal title="新增设备" open={open} onOk={create} onCancel={() => setOpen(false)} okText="创建" destroyOnHidden width={640}>
         <Form form={form} layout="vertical" initialValues={{ driver_id: "simulator" }}>
           <Form.Item name="driver_id" label="驱动" rules={[{ required: true }]}>
-            <Select options={DRIVERS} onChange={(v) => setDriverId(v)} />
+            <Select options={driverOptions} onChange={(v) => setDriverId(v)} />
           </Form.Item>
           <Form.Item name="id" label="ID（可空自动生成）"><Input placeholder="s7-01" /></Form.Item>
           {!desc ? <div style={{ color: "#999", fontSize: 12 }}>加载连接参数…</div> : (
