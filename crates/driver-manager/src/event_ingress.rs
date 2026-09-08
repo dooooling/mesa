@@ -75,8 +75,9 @@ pub enum EventDrainError {
     /// drain 中精确失败（collision/unavailable/regression/stream-closed 等）：
     /// code 透出原精确码，调用方禁止 contains 回猜。
     Fatal(IngressFatal),
-    /// drain 5s 未退出（abort 兜底已执行）：backlog 可能未 COMMIT，
-    /// 既无 DB 行也无 Hub 行，SSE reconcile 救不了——必须显式报错。
+    /// drain 超时（`shutdown_ingress` 的 deadline，未退出则 abort 兜底已执行）：
+    /// backlog 可能未 COMMIT，既无 DB 行也无 Hub 行，SSE reconcile 救不了——
+    /// 必须显式报错。文本不写具体秒数（预算是可组合推导值，会变；码冻结不变）。
     Timeout,
     /// drain 任务 panic/join 失败：同 Timeout 处理（未完成即失败）。
     Join(String),
@@ -98,7 +99,10 @@ impl std::fmt::Display for EventDrainError {
         match self {
             EventDrainError::Fatal(e) => write!(f, "{}: {e}", e.code()),
             EventDrainError::Timeout => {
-                write!(f, "EVENT_DRAIN_TIMEOUT: ingress did not finish drain in 5s")
+                write!(
+                    f,
+                    "EVENT_DRAIN_TIMEOUT: ingress did not finish before drain deadline"
+                )
             }
             EventDrainError::Join(e) => write!(f, "EVENT_DRAIN_FAILED: {e}"),
         }

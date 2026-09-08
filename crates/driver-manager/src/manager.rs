@@ -217,8 +217,8 @@ impl MesaManager {
     /// P0-3：`Ok(was_running)`——`false` = 当时未运行（幂等成功）；
     /// `Err(detail)` = teardown 异常（drain fatal/timeout 精确码在前，
     /// 或任务 panic）。Stop 等待 teardown 真正完成才返回：
-    /// 内部各步骤自带 bounded timeout（terminate/barrier 各 5s，drain 为
-    /// 可组合预算 15s，见 `INGRESS_DRAIN_TIMEOUT`），
+    /// 内部各步骤自带 bounded timeout（post 5s + terminate 10s + barrier 5s +
+    /// drain 可组合预算 15s，见 `INGRESS_DRAIN_TIMEOUT`，总 ≈ 35s 最坏），
     /// Manager 直接 await，不再用"比总预算还短的外层 timeout 静默 detach"。
     /// 返回后新旧 attempt 不重叠（同一 endpoint 立即 Start 安全）。
     pub async fn stop_endpoint(&self, endpoint_id: &str) -> Result<bool, String> {

@@ -123,10 +123,27 @@ async fn stop_while_reconnecting_is_bounded_and_explicit() {
     let _ = std::fs::remove_file(&db);
 }
 
-/// Stop 等待 in-flight commit 的确定性 Gate（main CI #103 真因冻结）。
+/// Stop 等待 in-flight commit 的确定性 Gate（main CI #103 真因冻结），
+/// 且是旧实现的真回归测试（old 必红 / new 必绿），不是"没撞到就不红"的采样.
 ///
 /// 用 test-only writer 栅栏把一个 commit 暂停在"已发送、未执行"状态，
 /// 此时并发 Stop 必须**等待**（500ms 内不得返回——提前返回或超时误判都是 bug），
+/// 然后继续卡住直到 Stop 发起后约 12s 才放行：
+///
+/// ```text
+/// 旧实现（drain timer 5s，起于 shutdown_ingress ≈ Stop 后 0.5s）：
+///     timer 在约 5.5s 先赢 → 确定性返回 Err(EVENT_DRAIN_TIMEOUT) → 测试红
+/// 新实现（drain timer 15s，可组合预算）：
+///     放行（12s）恒早于 timer（起于 ≥0s，15s 后才赢）→ drain 成功 → 测试绿
+/// ```
+///
+/// 判别力推导：旧实现失败 ⟺ shutdown_ingress 在 Stop 后 7s 内开始。
+/// 健康驱动（simulator 响应 Shutdown）约 0.5s 内到达，14× 裕度；
+/// 均匀调度膨胀下 sleep 与 pre 同比拉伸，关系保持。新实现通过是无条件的
+/// （放行时刻恒早于新 timer，与 pre 无关）。仅当 teardown 前置阶段全部
+/// 病态拉满（pre ≥ 7s）时判别力退化——超出任何 timing Gate 的覆盖范围，
+/// 届时测试按"Stop 有界"继续断言，不误报。
+///
 /// 放行后 Stop 成功，且 DB/Hub 精确、Stop 后无新写。冻结的关系：
 /// `reader_done → 无新生产 → in-flight 完成 → 队列排空 → drain ACK → Stop 返回`。
 ///
@@ -191,6 +208,11 @@ async fn stop_waits_for_inflight_commit_then_drains_exact() {
             .is_err(),
         "栅栏关闭时 Stop 必须等待 in-flight commit，不得提前返回",
     );
+
+    // 判别 hold：继续卡住到 Stop 发起后约 12s。旧 5s timer（起于
+    // shutdown_ingress）必在此期间先赢 → 旧代码确定性 TIMEOUT 红；
+    // 新 15s timer 不可能赢 → 放行后确定性成功绿。见函数头推导。
+    tokio::time::sleep(Duration::from_secs(12)).await;
 
     // 放行 → Stop 成功（有界）。
     gate.release();

@@ -541,8 +541,8 @@ async fn attempt_session(
     // 超时降级 drain 现有（等价旧行为）。50ms sleep 已删除：等的对象是
     // "reader 结束"这个条件，不是时长。
     // P0-3 teardown 总预算（全有界，Manager 直接 await，无外层超时）：
-    // graceful 5s（+ emergency 后 terminate 5s）+ reader barrier 5s +
-    // ingress drain 15s（可组合预算，见 `INGRESS_DRAIN_TIMEOUT`）≈ 30s
+    // post 5s + terminate 10s + reader barrier 5s +
+    // ingress drain 15s（可组合预算，见 `INGRESS_DRAIN_TIMEOUT`）≈ 35s
     // worst-case，正常路径百 ms 内。超时/失败经 drain_err 显式上报。
     let drain_err = teardown_attempt(
         &cfg.endpoint_id,
@@ -576,6 +576,12 @@ const INGRESS_DRAIN_TIMEOUT: Duration = Duration::from_millis(
 /// 走大声 `EVENT_DRAIN_TIMEOUT`，不静默——预算覆盖现实最坏，不覆盖病态。
 const INGRESS_DRAIN_MARGIN_MS: u64 = 10_000;
 
+/// producer-stop 请求有界等待：Shutdown post 只是停产请求（best-effort），
+/// 超时则直接进入 terminate（terminate 兜底一切：grace → emergency EOF →
+/// 强杀）；post 自身不得成为 teardown 链中的无界 await（此前形式上无界，
+/// `terminate_after_shutdown` 之前存在无限等待窗口）。
+const SHUTDOWN_POST_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 统一 teardown 原语（producer-stop → bounded terminate → reader barrier → drain → cleanup）。
 ///
 /// 所有 attempt 退出路径（正常 Stop / Lost 重连 / 配置失败 / heartbeat 判死）
@@ -584,14 +590,15 @@ const INGRESS_DRAIN_MARGIN_MS: u64 = 10_000;
 /// 顺序，已收敛到此：producer 未停时 drain 面对的不是密封输入，排空语义不成立。
 ///
 /// 顺序契约（对应 `reader_done → 无新生产 → in-flight 完成 → 队列排空 → drain ACK`）：
-/// 1. 能响应则 post Shutdown（生产者停产；unresponsive 时跳过，bounded post）；
+/// 1. 能响应则 post Shutdown（生产者停产；unresponsive 时跳过；
+///    post 本身 [`SHUTDOWN_POST_TIMEOUT`] 有界，超时直接进入 terminate）；
 /// 2. `terminate_after_shutdown`（graceful 5s + emergency 后 terminate 5s）；
 /// 3. `wait_reader_done` barrier 5s（超时降级：drain 已到达者）；
 /// 4. `shutdown_ingress`（in-flight commit 完成 + 密封 backlog 排空 + Hub 发布）；
 /// 5. session 失效 + 注册表摘除 + 事件接收端释放。
 ///
-/// 总预算 ≈ 5 + 5 + 5 + drain(15) ≈ 30s 最坏，正常路径百 ms 内；
-/// 超时/失败经返回值显式上报。
+/// 总预算严格有界 ≈ post 5 + terminate 10 + reader 5 + drain 15 ≈ 35s 最坏，
+/// 正常路径百 ms 内；超时/失败经返回值显式上报。
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 async fn teardown_attempt(
     endpoint_id: &str,
@@ -605,7 +612,9 @@ async fn teardown_attempt(
     {
         let sess = session_arc.lock().await;
         if !sess.is_unresponsive() {
-            let _ = sess.post(pb_shutdown_body()).await;
+            // Best-effort 停产请求：有界等待，超时/失败都直接进入 terminate。
+            let _ =
+                tokio::time::timeout(SHUTDOWN_POST_TIMEOUT, sess.post(pb_shutdown_body())).await;
         }
     }
     process.terminate_after_shutdown().await;
