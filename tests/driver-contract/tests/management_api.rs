@@ -167,6 +167,31 @@ async fn probe_non_object_connection_is_400() {
     assert_eq!(v["error"]["code"], "VALIDATION_ERROR");
 }
 
+/// 并发 Probe 确定性 Gate（Management startup 收敛）：同一驱动 8 个并行
+/// Probe 必须全部成功、可达——spawn/租约/建连在并发下不得串扰（错连/抢端口）。
+/// 不断言时序，只断言并发正确性；临时进程由 probe attempt 单出口回收。
+#[tokio::test]
+async fn probe_concurrent_same_driver_all_succeed() {
+    let (app, _) = app().await;
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            post_json(
+                app,
+                "/api/v1/drivers/simulator/probe",
+                r#"{"connection":{}}"#,
+            )
+            .await
+        }));
+    }
+    for h in handles {
+        let (status, v) = h.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "probe body: {v}");
+        assert_eq!(v["reachable"], true, "probe body: {v}");
+    }
+}
+
 /// JSON 是 object 但驱动配置非法 → 400，code 透出驱动原因码（P1-2 结构化）。
 #[tokio::test]
 async fn probe_invalid_driver_config_is_400_with_driver_code() {

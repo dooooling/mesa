@@ -15,7 +15,7 @@ use mesa_core_types::{
     AcquisitionTask, ConditionTransition, DriverBinding, DriverMetadata, EventBatch, EventTask,
     PointDescriptor, PointMap, TaskMode,
 };
-use mesa_driver_manager::session::{Session, SessionError};
+use mesa_driver_manager::session::{EVENT_BATCH_CAPACITY, Session, SessionError};
 use mesa_driver_sdk::{
     DataSink, Driver, DriverConnection, SdkDriverError, SdkFaults, serve_with_faults,
 };
@@ -470,9 +470,10 @@ async fn event_flood_neither_starves_data_nor_control() {
 // Gate 9：溢出 fail-closed（Core 侧）
 // ---------------------------------------------------------------------------
 
-/// 不消费 event_rx + 10ms 洪峰：128 槽位必满 → 流终止（fail-closed）：
+/// 不消费 event_rx + 10ms 洪峰：通道槽位必满 → 流终止（fail-closed）：
 /// `event_stream_failed()` 置位、overflow 计数 ≥1、排空已有缓冲后 recv 到 None，
-/// 而不是静默丢弃后继续。
+/// 而不是静默丢弃后继续。填满时长由容量公式推导（`EVENT_BATCH_CAPACITY` /
+/// 100/s + 余量），不是魔法数字。
 #[tokio::test]
 async fn event_overflow_terminates_stream_fail_closed() {
     init_log();
@@ -492,8 +493,10 @@ async fn event_overflow_terminates_stream_fail_closed() {
         )],
     )
     .await;
-    // 故意不 take_event_batches：消费端已死，队列必满（128 × 10ms ≈ 1.3s）
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // 故意不 take_event_batches：消费端已死，队列必满。
+    // 填满时长 = 容量 / 到达率 + 余量（10ms 间隔即 100/s；余量覆盖调度抖动）。
+    let fill_secs = EVENT_BATCH_CAPACITY as u64 / 100 + 5;
+    tokio::time::sleep(Duration::from_secs(fill_secs)).await;
 
     assert!(session.event_stream_failed(), "溢出必须置位 fail-closed");
     assert!(session.event_overflow_drops() >= 1, "溢出必须计数可见");

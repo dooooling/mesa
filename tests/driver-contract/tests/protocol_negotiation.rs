@@ -16,32 +16,56 @@ use common::*;
 /// 驱动声明更高 Major → Core 必须拒绝握手（Session 侧 negotiate 失败）。
 #[tokio::test]
 async fn core_rejects_incompatible_driver_major() {
-    // 假驱动：接受连接后发送 protocol_major + 1 的 Hello
+    // 假驱动：§14.3 方向由 Driver 先发言 Hello，这里故意声明更高 Major。
+    // Core 必须在协商期以 Handshake 错误拒绝，而不是干等超时。
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();
-        let (mut rd, mut wr) = sock.into_split();
-        if let Ok(hello) = read_envelope(&mut rd).await {
-            let mut h = match hello.body {
-                Some(pb::envelope::Body::Hello(h)) => h,
-                _ => return,
-            };
-            h.protocol_major += 1; // 制造 Major 不兼容
-            let env = pb::Envelope {
-                msg_id: hello.msg_id,
-                body: Some(pb::envelope::Body::Hello(h)),
-            };
-            let _ = write_envelope(&mut wr, &env).await;
-            // 保持连接片刻，观察 Core 是否主动断开
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
+        let (_, mut wr) = sock.into_split();
+        let env = pb::Envelope {
+            msg_id: 1,
+            body: Some(pb::envelope::Body::Hello(pb::Hello {
+                driver_id: "bad-major".into(),
+                driver_version: "0.0.0".into(),
+                protocol_major: PROTOCOL_MAJOR + 1, // 制造 Major 不兼容
+                protocol_minor: PROTOCOL_MINOR,
+                sdk_version: "test".into(),
+                platform: std::env::consts::OS.into(),
+                instance_id: "bad-major-1".into(),
+                session_token: TOKEN.into(),
+            })),
+        };
+        let _ = write_envelope(&mut wr, &env).await;
+        // 保持连接片刻，观察 Core 是否主动断开
+        tokio::time::sleep(Duration::from_secs(2)).await;
     });
 
     let result = Session::connect(port, TOKEN).await;
     match result {
         Ok(_) => panic!("incompatible major must be rejected"),
         Err(e) => assert_handshake_error(e),
+    }
+}
+
+/// 对端 accept 后永远沉默 → Hello 等待超时是 Timeout（语义真相），
+/// 不是 Handshake 文本错误；调用方（含 probe startup 分类）据此精确路由。
+#[tokio::test]
+async fn silent_driver_hello_wait_is_timeout() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _sock = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let result = Session::connect(port, TOKEN).await;
+    match result {
+        Ok(_) => panic!("silent driver must time out"),
+        Err(e) => assert!(
+            matches!(e, mesa_driver_manager::session::SessionError::Timeout),
+            "hello 等待超时必须是 Timeout 变体，实际: {e}"
+        ),
     }
 }
 

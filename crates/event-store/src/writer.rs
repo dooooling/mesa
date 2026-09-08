@@ -9,13 +9,10 @@
 
 use mesa_core_types::EventBatch;
 use rusqlite::{Connection, params};
+use std::sync::Arc;
 #[cfg(feature = "test-hooks")]
 use std::sync::Mutex;
-#[cfg(feature = "test-hooks")]
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::schema::{self, StoredEvent};
@@ -186,12 +183,19 @@ impl StoreFaults {
 
 /// Writer 主循环（blocking 线程内运行）。发送端全部释放即退出。
 /// 默认构建：Commit 直落 `commit_batch`，无故障检查。
-pub fn writer_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCommand>) {
+/// `commit_latency_max_ns`：每次 commit 执行耗时（不含队列等待）最大值，
+/// stall 位置判定用（ingress 测到的大延迟若此处很小，说明堵在队列/调度）。
+pub fn writer_loop(
+    mut conn: Connection,
+    mut rx: mpsc::Receiver<WriteCommand>,
+    commit_latency_max_ns: Arc<AtomicU64>,
+) {
     #[cfg(feature = "test-hooks")]
     let mut faults: Option<Arc<StoreFaults>> = None;
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             WriteCommand::Commit(req, reply) => {
+                let exec_start = std::time::Instant::now();
                 #[cfg(feature = "test-hooks")]
                 let res = match faults.as_ref().map(|f| f.check()).unwrap_or(Ok(())) {
                     Ok(()) => {
@@ -207,6 +211,7 @@ pub fn writer_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCommand>) {
                 };
                 #[cfg(not(feature = "test-hooks"))]
                 let res = commit_batch(&mut conn, &req);
+                record_max_ns(&commit_latency_max_ns, exec_start.elapsed().as_nanos());
                 let _ = reply.send(res);
             }
             WriteCommand::Purge {
@@ -220,6 +225,18 @@ pub fn writer_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCommand>) {
             WriteCommand::SetFaults(f) => {
                 faults = Some(f);
             }
+        }
+    }
+}
+
+/// 最大值收敛（诊断计数用；writer 单线程写，调用方 low contention）。
+fn record_max_ns(target: &AtomicU64, elapsed: u128) {
+    let v = elapsed.min(u128::from(u64::MAX)) as u64;
+    let mut cur = target.load(Ordering::Relaxed);
+    while v > cur {
+        match target.compare_exchange_weak(cur, v, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
         }
     }
 }

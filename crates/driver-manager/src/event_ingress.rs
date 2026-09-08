@@ -214,6 +214,9 @@ impl BatchProcessor {
         }
         // v1.1 §3：received_at 每 batch 取一次，同批共用
         let received_at_ns = now_unix_ns();
+        // commit 延迟测量（单调时钟）：队列等待 + writer 执行，为容量公式
+        // STALL 输入与 stall 调查提供实证。
+        let commit_start = std::time::Instant::now();
         let res = self
             .services
             .store
@@ -223,6 +226,27 @@ impl BatchProcessor {
                 received_at_ns,
             })
             .await;
+        let commit_latency_ns = commit_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.services
+            .diagnostics
+            .ingress_commit_latency_last_ns
+            .store(commit_latency_ns, Ordering::Relaxed);
+        // max 语义不能用 fetch_add：CAS 循环收敛（低竞争，commit 串行）。
+        {
+            let max_ref = &self.services.diagnostics.ingress_commit_latency_max_ns;
+            let mut cur = max_ref.load(Ordering::Relaxed);
+            while commit_latency_ns > cur {
+                match max_ref.compare_exchange_weak(
+                    cur,
+                    commit_latency_ns,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(v) => cur = v,
+                }
+            }
+        }
         match res {
             Ok(outcome) => {
                 self.diag(outcome.inserted.len() as u64, |d| {

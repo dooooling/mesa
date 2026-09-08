@@ -435,6 +435,8 @@ async fn events_stats_contract_keys_and_values() {
             "ingress_batch_duplicates_total",
             "ingress_batches_total",
             "ingress_collisions_total",
+            "ingress_commit_latency_last_ns",
+            "ingress_commit_latency_max_ns",
             "ingress_event_duplicates_total",
             "ingress_gaps_total",
             "ingress_invalid_total",
@@ -624,6 +626,8 @@ async fn sse_lagged_catch_up_from_db() {
         "ingress_collisions_total",
         "ingress_invalid_total",
         "ingress_store_failures_total",
+        "ingress_commit_latency_last_ns",
+        "ingress_commit_latency_max_ns",
         "retention_purged_total",
         "live_clients",
     ] {

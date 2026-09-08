@@ -604,7 +604,7 @@ async fn probe_driver(
                 ProbeError::InvalidInput { code, message } => {
                     (StatusCode::BAD_REQUEST, Json(json_error(&code, &message)))
                 }
-                ProbeError::Spawn(_) | ProbeError::Handshake(_) => (
+                ProbeError::Spawn(_) | ProbeError::Handshake { .. } => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(json_error("DRIVER_UNAVAILABLE", &e.to_string())),
                 ),
@@ -2267,6 +2267,8 @@ async fn events_stats(State(state): State<Arc<AppState>>) -> (StatusCode, Json<s
                 "ingress_collisions_total": load(&d.ingress_collisions_total),
                 "ingress_invalid_total": load(&d.ingress_invalid_total),
                 "ingress_store_failures_total": load(&d.ingress_store_failures_total),
+                "ingress_commit_latency_last_ns": load(&d.ingress_commit_latency_last_ns),
+                "ingress_commit_latency_max_ns": load(&d.ingress_commit_latency_max_ns),
                 "retention_purged_total": load(&d.retention_purged_total),
                 "live_clients": live_clients,
                 "stored_rows": st.rows,
