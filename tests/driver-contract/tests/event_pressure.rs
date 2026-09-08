@@ -251,10 +251,12 @@ impl HubWitness {
     }
 }
 
-/// 确定性 stall 恢复 Gate：20/s 下 commit 暂停 6s（120 批 ≪ 512），
-/// Core 不得判死/重连（单 epoch），行冻结可观测；放行后完整恢复精确。
+/// 确定性 stall 恢复 Gate：20/s 下 commit 暂停 6s，Core 不得判死/重连
+/// （单 epoch），行冻结可观测；放行后等 backlog 必空再 Stop，全精确。
 /// 同时证明 control 面存活：stall 全程 snapshot 恒为 RUNNING（心跳未判死、
 /// endpoint 未 Lost——判死/重连会留下新 epoch，单 epoch 断言即覆盖）。
+/// 本测试只证明 A（stall→backlog→catch-up exact→正常 Stop），不测
+/// Stop-under-heavy-backlog（后者另立精确 N 的 Gate，不在本测试顺带）。
 #[tokio::test]
 async fn event_stall_6s_recovers_exact() {
     common::init_log();
@@ -268,8 +270,10 @@ async fn event_stall_6s_recovers_exact() {
     common::wait_until(10, || gate.entered() >= 1).await;
     let frozen = rig.counter_ns().len();
 
-    // 6s stall：120 批远小于容量；snapshot 必须全程 RUNNING（无 Lost/重连）。
+    // 6s stall：snapshot 必须全程 RUNNING（无 Lost/重连）。
+    // interval 50ms 即发射上限 20/s（Skip 只会更少），hold 期积压天然远小于容量。
     let snapshot = rig.mgr.snapshot();
+    let hold_start = std::time::Instant::now();
     tokio::time::sleep(Duration::from_secs(6)).await;
     assert_eq!(
         rig.counter_ns().len(),
@@ -281,9 +285,17 @@ async fn event_stall_6s_recovers_exact() {
         "stall 期间 endpoint 必须保持 RUNNING（Core 存活，未判死重连）",
     );
 
+    // hold 期最大发射数自标定（实测 hold 时长 / interval 上限 + 余量），
+    // 不假设 runner 速度，只用 interval 的硬上限。
+    let max_hold_emissions = hold_start.elapsed().as_millis() / 50 + 8;
     gate.release();
-    // 恢复：行继续增长后 Stop，全精确 + 单 epoch + Hub 精确。
-    common::wait_until(30, || rig.counter_ns().len() >= frozen + 10).await;
+    // catch-up 必空信号（FIFO 保证）：提交按到达顺序落盘，hold 期发射至多
+    // max_hold_emissions；当累计提交超过 frozen + 上限 + 20（新发射）时，
+    // hold 期积压必然已全部落盘——backlog 已空，此时 Stop 的 final drain
+    // 无重压可背（把 Stop-under-backlog 排除在本测试之外）。
+    const CATCH_UP_MARGIN: u64 = 20;
+    let drained_target = frozen as u64 + max_hold_emissions as u64 + CATCH_UP_MARGIN;
+    common::wait_until(60, || rig.counter_ns().len() as u64 >= drained_target).await;
     rig.mgr.stop_endpoint(&rig.endpoint_id).await.unwrap();
     let ns = rig.counter_ns();
     let max = *ns.last().unwrap();
