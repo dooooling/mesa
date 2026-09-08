@@ -8,20 +8,27 @@
 //! （Simulator run() 要求数据计划存在），事件配置在 Start 之前下发。
 
 mod common;
+mod event_common;
 
+use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
+use event_common::{rows_of, tmp_db};
 use mesa_core_types::{
     AcquisitionTask, ConditionTransition, DriverBinding, DriverMetadata, EventBatch, EventTask,
     PointDescriptor, PointMap, TaskMode,
 };
+use mesa_driver_manager::event_ingress::run_event_ingress;
 use mesa_driver_manager::session::{EVENT_BATCH_CAPACITY, Session, SessionError};
+use mesa_driver_protocol::{PROTOCOL_MAJOR, PROTOCOL_MINOR, pb, read_envelope, write_envelope};
 use mesa_driver_sdk::{
     DataSink, Driver, DriverConnection, SdkDriverError, SdkFaults, serve_with_faults,
 };
 use mesa_driver_simulator::{
     EVENT_BINDING_KIND, SIM_ALARM_CONDITION_ID, SIM_EVENT_STREAM_ALARM, SIM_EVENT_STREAM_COUNTER,
 };
+use mesa_event_store::{EventHub, EventServices, EventStore};
 use tokio_util::sync::CancellationToken;
 
 use common::*;
@@ -734,4 +741,325 @@ async fn event_legacy_driver_rejects_immediately_with_precise_code() {
     );
 
     teardown(&mut session, Some(server_cancel));
+}
+
+// ---------------------------------------------------------------------------
+// 精确批量 Gates（hardening）：数量代替"时间×推测速率"。
+// 同文件 Gate 9（sim 计时洪峰）保留作 session 级集成覆盖；这里用脚本化
+// fake driver（无 timer）证明精确分界：容量内全活、容量+1 必死、500 精确
+// 落盘。所有等待都是"条件必成立"（TCP 必达 + reader 必 pump），
+// 超时只在真 bug 时触发，不赌 runner 快慢。
+// ---------------------------------------------------------------------------
+
+/// 精确批次构造：单事件一批，sequence = i，event_id 唯一，epoch 统一。
+fn exact_batch(handle: u32, epoch: u64, seq: u64) -> pb::EventBatchMsg {
+    pb::EventBatchMsg {
+        connection_handle: handle,
+        stream_epoch: epoch,
+        sequence: seq,
+        timestamp_ns: mesa_core_types::now_unix_ns(),
+        mono_ns: None,
+        events: vec![pb::EventRecordMsg {
+            event_id: format!("exact:{seq}"),
+            category: "message".into(),
+            kind: "exact.tick".into(),
+            source: "exact".into(),
+            severity: 0,
+            code: None,
+            message: Some(format!("exact tick {seq}")),
+            message_locale: None,
+            occurred_at_ns: None,
+            condition: None,
+            correlation_id: None,
+            attributes: vec![],
+        }],
+    }
+}
+
+/// 脚本化 fake driver：Hello → Welcome → 应答 ConfigureEventTasks /
+// StartConnection → 按波次精确发射（无 timer，数量即真相）。
+/// `second_wave` 非空时等测试放行再发射（512 存活 / 513 死亡分界的执行手段）；
+/// 发射后读到 EOF 退出（teardown 关 socket 即清理，无残留任务）。
+async fn start_exact_fake(
+    first_wave: Vec<pb::EventBatchMsg>,
+    second_wave: Vec<pb::EventBatchMsg>,
+    release: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> u16 {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (mut rd, mut wr) = sock.into_split();
+        // Driver 先发言 Hello（§14.3），token 与 Core 期望一致。
+        write_envelope(
+            &mut wr,
+            &pb::Envelope {
+                msg_id: 1,
+                body: Some(pb::envelope::Body::Hello(pb::Hello {
+                    driver_id: "exact".into(),
+                    driver_version: "0.0.0".into(),
+                    protocol_major: PROTOCOL_MAJOR,
+                    protocol_minor: PROTOCOL_MINOR,
+                    sdk_version: "test".into(),
+                    platform: std::env::consts::OS.into(),
+                    instance_id: "exact-1".into(),
+                    session_token: TOKEN.into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        // Welcome 读掉（握手完成；token 由 Core 校验）。
+        let _ = read_envelope(&mut rd).await;
+        let mut release = release;
+        loop {
+            let req = match read_envelope(&mut rd).await {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            match req.body {
+                Some(pb::envelope::Body::ConfigureEventTasks(c)) => {
+                    write_envelope(
+                        &mut wr,
+                        &pb::Envelope {
+                            msg_id: req.msg_id,
+                            body: Some(pb::envelope::Body::EventConfigApplied(
+                                pb::EventConfigApplied {
+                                    connection_handle: c.connection_handle,
+                                    revision: c.revision,
+                                    result: Some(pb::GenericResult {
+                                        ok: true,
+                                        error: None,
+                                    }),
+                                },
+                            )),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                Some(pb::envelope::Body::StartConnection(c)) => {
+                    write_envelope(
+                        &mut wr,
+                        &pb::Envelope {
+                            msg_id: req.msg_id,
+                            body: Some(pb::envelope::Body::StartConnectionAck(
+                                pb::StartConnectionAck {
+                                    connection_handle: c.connection_handle,
+                                    result: Some(pb::GenericResult {
+                                        ok: true,
+                                        error: None,
+                                    }),
+                                },
+                            )),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    for (i, b) in first_wave.iter().enumerate() {
+                        write_envelope(
+                            &mut wr,
+                            &pb::Envelope {
+                                msg_id: 9000 + i as u64,
+                                body: Some(pb::envelope::Body::EventBatch(b.clone())),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    if !second_wave.is_empty() {
+                        // 等测试确认第一波全部到达后再发射分界批。
+                        if let Some(rx) = release.take() {
+                            let _ = rx.await;
+                        }
+                        for (i, b) in second_wave.iter().enumerate() {
+                            write_envelope(
+                                &mut wr,
+                                &pb::Envelope {
+                                    msg_id: 9500 + i as u64,
+                                    body: Some(pb::envelope::Body::EventBatch(b.clone())),
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        }
+                    }
+                    // 发射后读到 EOF 退出。
+                    loop {
+                        if read_envelope(&mut rd).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Some(pb::envelope::Body::Ping(_)) => {
+                    write_envelope(
+                        &mut wr,
+                        &pb::Envelope {
+                            msg_id: req.msg_id,
+                            body: Some(pb::envelope::Body::Pong(pb::Pong {})),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                _ => {}
+            }
+        }
+    });
+    port
+}
+
+/// 精确事件任务（binding 内容 fake 直接忽略；Core 只做透传）。
+fn exact_task() -> EventTask {
+    EventTask {
+        id: "exact".into(),
+        mode: TaskMode::Poll,
+        interval_ms: Some(1000),
+        binding: DriverBinding {
+            kind: "exact-test".into(),
+            config: serde_json::json!({}),
+        },
+    }
+}
+
+/// SLO 精确证明：500 个 occurrence（公式 RATE×STALL×SAFETY 的 RATE×10s）在
+/// 10s budget 内精确推送/持久化：DB=500、无丢失无重复、单 epoch、Hub=500。
+/// 不经过 Tokio interval——"可持续 ≥50/s"由数量+budget 证明，不由 timer 证明。
+#[tokio::test]
+async fn exact_500_events_pipeline_exact_within_budget() {
+    init_log();
+    const N: u64 = 500;
+    const HANDLE: u32 = 7;
+    const EPOCH: u64 = 0xE000_0E01;
+    let batches: Vec<_> = (1..=N).map(|i| exact_batch(HANDLE, EPOCH, i)).collect();
+    let port = start_exact_fake(batches, vec![], None).await;
+
+    let db = tmp_db("exact-slo");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(EventStore::open(&db).unwrap());
+    // Hub 按测试体量精确配额（500 < 1024：结尾排空不断言 Lagged 场景）。
+    let services = Arc::new(EventServices::new(store.clone(), EventHub::new(1024)));
+    let hub_rx = services.hub.subscribe();
+
+    let (mut session, _events, _) = Session::connect(port, TOKEN).await.unwrap();
+    session
+        .configure_events(HANDLE, 1, &[exact_task()])
+        .await
+        .expect("configure_events must succeed");
+    start_connection(&session, HANDLE, EPOCH).await;
+    let erx = session.take_event_batches().unwrap();
+    let shutdown = CancellationToken::new();
+    let ingress_h = tokio::spawn(run_event_ingress(
+        erx,
+        "exact-slo".into(),
+        Arc::clone(&services),
+        shutdown.clone(),
+    ));
+
+    // 500 精确落盘（10s budget；条件必成立，超时只在真 bug 时触发）。
+    common::wait_until(10, || {
+        services
+            .diagnostics
+            .ingress_persisted_events_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= N
+    })
+    .await;
+
+    // DB 精确：500 行、event_id exact:1..=500 连续、单 epoch。
+    let rows = rows_of(&store, "exact-slo");
+    assert_eq!(rows.len(), N as usize, "DB 必须恰好 500 行");
+    let mut ids: Vec<u64> = rows
+        .iter()
+        .map(|r| {
+            r.event_id
+                .strip_prefix("exact:")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, (1..=N).collect::<Vec<_>>(), "event_id 必须精确连续");
+    let epochs: BTreeSet<u64> = rows.iter().map(|r| r.stream_epoch).collect();
+    assert_eq!(epochs, BTreeSet::from([EPOCH]), "必须单 epoch");
+    {
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            services
+                .diagnostics
+                .ingress_persisted_events_total
+                .load(Ordering::Relaxed),
+            N,
+        );
+    }
+
+    // Hub 精确：恰好收到 DB 全部行（commit-then-publish）。
+    let mut got = BTreeSet::new();
+    let mut hub_rx = hub_rx;
+    while let Ok(ev) = hub_rx.try_recv() {
+        got.insert(ev.event_id.clone());
+    }
+    let want: BTreeSet<String> = rows.iter().map(|r| r.event_id.clone()).collect();
+    assert_eq!(got, want, "Hub 必须恰好收到 DB 全部行");
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), ingress_h)
+        .await
+        .expect("ingress 必须随 cancel 退出")
+        .unwrap()
+        .expect("ingress 不得 fatal");
+    teardown(&mut session, None);
+    let _ = std::fs::remove_file(&db);
+}
+
+/// 容量精确分界：512 批全部存活（depth 见证到达），第 513 批必触发
+/// fail-closed（置位 + 计数 + backlog 完整可排空后流终止）。
+/// 数量即真相：不依赖任何速率假设，慢 runner 只是到达得晚，不会误判。
+#[tokio::test]
+async fn exact_capacity_plus_one_overflow_is_loud() {
+    init_log();
+    const HANDLE: u32 = 7;
+    const EPOCH: u64 = 0xE000_0E02;
+    let cap = EVENT_BATCH_CAPACITY as u64;
+    let first: Vec<_> = (1..=cap).map(|i| exact_batch(HANDLE, EPOCH, i)).collect();
+    let second = vec![exact_batch(HANDLE, EPOCH, cap + 1)];
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let port = start_exact_fake(first, second, Some(rx)).await;
+
+    let (mut session, _events, _) = Session::connect(port, TOKEN).await.unwrap();
+    session
+        .configure_events(HANDLE, 1, &[exact_task()])
+        .await
+        .expect("configure_events must succeed");
+    start_connection(&session, HANDLE, EPOCH).await;
+
+    // 全部到达见证（TCP 必达 + reader 必 pump；慢 runner 只需更久）。
+    common::wait_until(30, || session.event_queue_depth_last_sample() >= cap).await;
+    assert!(
+        !session.event_stream_failed(),
+        "容量内 512 批必须全部存活，不得 fail-closed"
+    );
+    assert_eq!(session.event_queue_high_water(), cap, "高水位必须恰为容量");
+
+    // 放行第 513 批 → 必死。
+    tx.send(()).unwrap();
+    common::wait_until(10, || session.event_stream_failed()).await;
+    assert!(session.event_overflow_drops() >= 1, "溢出必须计数可见");
+
+    // backlog 完整可排空后流终止（恰 512 + None，不能挂不能多不能少）。
+    let mut erx = session.take_event_batches().unwrap();
+    let mut drained = 0u64;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), erx.recv()).await {
+            Ok(Some(_)) => drained += 1,
+            Ok(None) => break,
+            Err(_) => panic!("terminated stream must close, not hang"),
+        }
+    }
+    assert_eq!(drained, cap, "终止前缓冲必须恰为 512 批");
+
+    teardown(&mut session, None);
 }

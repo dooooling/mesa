@@ -14,12 +14,8 @@ use mesa_core_types::ProbeReport;
 use mesa_driver_protocol::PROBE_RPC_MIN_MINOR;
 
 use crate::manager::MesaManager;
-use crate::process::DriverProcess;
 use crate::profile::{ProfileMatch, match_profiles};
-use crate::session::{
-    ConnectError, HeartbeatParams, PROBE_TIMEOUT, Session, SessionError, StartupStage,
-};
-use mesa_driver_protocol::ProtocolError;
+use crate::session::{PROBE_TIMEOUT, Session, SessionError, StartupStage};
 
 /// 探测基础设施失败（注意：设备不可达不是 Err，是 `Ok(ProbeReport)`）。
 #[derive(Debug, thiserror::Error)]
@@ -83,18 +79,6 @@ pub(crate) fn probe_supported(negotiated_minor: u32) -> bool {
     negotiated_minor >= mesa_driver_protocol::PROBE_RPC_MIN_MINOR
 }
 
-/// 单次探测 attempt 结果：成功 / 直接失败 / startup transport 瞬态（可重建）。
-#[derive(Debug)]
-enum AttemptOutcome {
-    Ok(ProbeReport),
-    Fail(ProbeError),
-    RetryTransient(ProbeError),
-}
-
-/// 启动 attempt 上限（含首次）：瞬态重建一次。单 attempt 内建连重试
-/// 另有 6s deadline；外层 PROBE_TIMEOUT（12s）兜底总和。
-const MAX_STARTUP_ATTEMPTS: u32 = 2;
-
 impl MesaManager {
     /// 动态探测：返回设备事实报告 + profile 提示。临时进程生命周期与本调用严格绑定。
     pub async fn probe(
@@ -135,117 +119,61 @@ impl MesaManager {
         disc: crate::manifest::DiscoveredDriver,
         connection_json: &str,
     ) -> Result<ProbeReport, ProbeError> {
-        // startup transport 瞬态最多重建一次：kill 半活临时进程 → 新 port →
-        // 新 spawn → 整个 attempt 重来。同一 Driver 进程只 accept 一次管理连接
-        // （§14.2），重试绝不能在同一进程上 reconnect，只能重建。
-        // 仅 transport 瞬态（建连三阶段的 Io/Timeout/Protocol(Io)）重试；
-        // 驱动已说话后的语义错误一次判死。外层 PROBE_TIMEOUT 兜底总预算。
-        for attempt in 0..MAX_STARTUP_ATTEMPTS {
-            match Self::probe_attempt(&disc, connection_json).await {
-                AttemptOutcome::Ok(report) => return Ok(report),
-                AttemptOutcome::Fail(e) => return Err(e),
-                AttemptOutcome::RetryTransient(e) if attempt + 1 < MAX_STARTUP_ATTEMPTS => {
-                    tracing::warn!(
-                        driver = %disc.manifest.id,
-                        attempt = attempt + 1,
-                        error = %e,
-                        "probe startup transient, respawning fresh attempt"
-                    );
+        // startup transport 瞬态由原语重建（kill 半活进程 → 新 port → 新 spawn，
+        // 最多一次）；语义失败与 RPC 错误原样带出。外层 PROBE_TIMEOUT 兜底总预算。
+        // 同一 Driver 进程只 accept 一次管理连接（§14.2），重试只能重建。
+        crate::temp_op::temp_driver_attempt(&disc, |td| async {
+            let r = Self::probe_rpc(&td.session, &disc.manifest.id, connection_json).await;
+            (td, r)
+        })
+        .await
+        .map_err(|e| match e {
+            crate::temp_op::TempOpError::Startup(crate::temp_op::TempStartupError::Connect(c)) => {
+                ProbeError::Handshake {
+                    stage: c.stage,
+                    message: c.source.to_string(),
                 }
-                AttemptOutcome::RetryTransient(e) => return Err(e),
             }
-        }
-        unreachable!("loop always returns within MAX_STARTUP_ATTEMPTS");
+            crate::temp_op::TempOpError::Startup(crate::temp_op::TempStartupError::Spawn {
+                message,
+                ..
+            }) => ProbeError::Spawn(message),
+            crate::temp_op::TempOpError::Rpc(e) => e,
+        })
     }
 
-    /// 单次 attempt：spawn → handshake → OpenConnection(临时) → Probe RPC →
-    /// CloseConnection → invalidate → terminate。成功失败都回收子进程，不留孤儿。
-    async fn probe_attempt(
-        disc: &crate::manifest::DiscoveredDriver,
+    /// OpenConnection → Probe → CloseConnection 的 RPC 段（建连之后）：
+    /// 与正常采集走完全相同的建连路径（Secret/PKI/会话），
+    /// Configure/Apply/Start 仍禁止。
+    async fn probe_rpc(
+        session: &Session,
+        driver_id: &str,
         connection_json: &str,
-    ) -> AttemptOutcome {
-        let mut proc = match DriverProcess::spawn(disc).await {
-            Ok(p) => p,
-            Err(e) => return AttemptOutcome::Fail(ProbeError::Spawn(e.to_string())),
-        };
-        // 单出口清理：无论 inner 成功失败，临时进程必须 terminate。
-        // session.invalidate() 在 inner 内部、RPC 结束后执行（连接级清理），
-        // 进程级 terminate 在此统一执行（RAII guard 思想的手动版）。
-        let result: AttemptOutcome = async {
-            let (mut session, _events, _) = match Session::connect_retry_with_stage(
-                proc.port,
-                &proc.token,
-                HeartbeatParams::default(),
-            )
+    ) -> Result<ProbeReport, ProbeError> {
+        if !probe_supported(session.negotiated_minor()) {
+            return Err(ProbeError::Unsupported(format!(
+                "negotiated minor {} < {}",
+                session.negotiated_minor(),
+                PROBE_RPC_MIN_MINOR
+            )));
+        }
+        // P0-2 冻结生命周期：OpenConnection → Probe → CloseConnection。
+        Self::open_temp(session, driver_id, connection_json).await?;
+        let pr = session
+            .probe(Self::PROBE_HANDLE)
             .await
-            {
-                Ok(v) => v,
-                Err(e) => return Self::classify_connect_error(e),
-            };
-            let r = async {
-                if !probe_supported(session.negotiated_minor()) {
-                    return AttemptOutcome::Fail(ProbeError::Unsupported(format!(
-                        "negotiated minor {} < {}",
-                        session.negotiated_minor(),
-                        PROBE_RPC_MIN_MINOR
-                    )));
-                }
-                // P0-2 冻结生命周期：OpenConnection → Probe → CloseConnection，
-                // 与正常采集走完全相同的建连路径（Secret/PKI/会话），
-                // Configure/Apply/Start 仍禁止。
-                if let Err(e) = Self::open_temp(&session, &disc.manifest.id, connection_json).await
-                {
-                    return AttemptOutcome::Fail(e);
-                }
-                let pr = session
-                    .probe(Self::PROBE_HANDLE)
-                    .await
-                    .map_err(|e| match e {
-                        SessionError::Timeout => ProbeError::RpcTimeout,
-                        SessionError::Driver {
-                            kind,
-                            code,
-                            message,
-                        } => driver_error_to_probe_error(&kind, &code, message),
-                        other => ProbeError::Rpc(other.to_string()),
-                    });
-                // close 必须执行（best-effort）：probe 成败都不留已开连接
-                Self::close_temp(&session).await;
-                match pr {
-                    Ok(report) => AttemptOutcome::Ok(report),
-                    Err(e) => AttemptOutcome::Fail(e),
-                }
-            }
-            .await;
-            session.invalidate();
-            r
-        }
-        .await;
-        proc.terminate().await;
-        result
-    }
-
-    /// 建连失败分类（零字符串匹配，按 (stage, source 变体) 精确路由）：
-    /// Connect/Hello/Welcome 三阶段的 Io/Timeout/Protocol(Io) 是 startup
-    /// transport 瞬态（accept 后对端启动期死亡、listen 窗口抖动），可重建；
-    /// token/版本/解码等语义失败一次判死。open_temp 之后（含）的错误不在此
-    /// 处理（驱动已说话，走各 RPC 变体）。
-    fn classify_connect_error(e: ConnectError) -> AttemptOutcome {
-        let transient = matches!(
-            e.source,
-            SessionError::Io(_)
-                | SessionError::Timeout
-                | SessionError::Protocol(ProtocolError::Io(_))
-        );
-        let err = ProbeError::Handshake {
-            stage: e.stage,
-            message: e.source.to_string(),
-        };
-        if transient {
-            AttemptOutcome::RetryTransient(err)
-        } else {
-            AttemptOutcome::Fail(err)
-        }
+            .map_err(|e| match e {
+                SessionError::Timeout => ProbeError::RpcTimeout,
+                SessionError::Driver {
+                    kind,
+                    code,
+                    message,
+                } => driver_error_to_probe_error(&kind, &code, message),
+                other => ProbeError::Rpc(other.to_string()),
+            });
+        // close 必须执行（best-effort）：probe 成败都不留已开连接
+        Self::close_temp(session).await;
+        pr
     }
 
     /// 打开临时探测连接（与正常采集相同的 OpenConnection 路径）。
@@ -405,11 +333,14 @@ mod tests {
 
     /// 建连失败分类（零字符串匹配）：Connect/Hello/Welcome 三阶段的
     /// Io/Timeout/Protocol(Io) 是 startup transport 瞬态 → 可重建；
-    /// token/版本/解码等语义失败一次判死。main CI 的 s7 probe 握手 reset
+    /// token/版本/关闭等语义失败一次判死。main CI 的 s7 probe 握手 reset
     /// （Hello 阶段 Protocol(Io)）即第一类，当时无此路由直接 503。
+    /// 路由谓词在 [`crate::temp_op`]（三操作共用），此处锁定谓词 + Handshake
+    /// 构造（stage 可观测 + 原始 message 透出）。
     #[test]
     fn classify_connect_error_routes_by_stage_and_variant() {
-        use crate::session::SessionError;
+        use crate::session::{ConnectError, SessionError, StartupStage};
+        use crate::temp_op::is_transient_connect;
         use mesa_driver_protocol::ProtocolError;
 
         fn reset_io() -> std::io::Error {
@@ -428,9 +359,8 @@ mod tests {
                 SessionError::Timeout,
                 SessionError::Protocol(ProtocolError::Io(reset_io())),
             ] {
-                let r = MesaManager::classify_connect_error(ConnectError { stage, source });
                 assert!(
-                    matches!(r, AttemptOutcome::RetryTransient(_)),
+                    is_transient_connect(&ConnectError { stage, source }),
                     "stage={stage:?} 必须可重建",
                 );
             }
@@ -441,23 +371,25 @@ mod tests {
             SessionError::Handshake("first frame must be Hello".into()),
             SessionError::Closed,
         ] {
-            let r = MesaManager::classify_connect_error(ConnectError {
-                stage: StartupStage::Hello,
-                source,
-            });
-            assert!(matches!(r, AttemptOutcome::Fail(_)), "语义失败必须一次判死",);
+            assert!(
+                !is_transient_connect(&ConnectError {
+                    stage: StartupStage::Hello,
+                    source,
+                }),
+                "语义失败必须一次判死",
+            );
         }
-        // 阶段可观测：Handshake 错误自带 stage，下次 reset 直接定位。
-        let r = MesaManager::classify_connect_error(ConnectError {
+        // 阶段可观测：Handshake 错误自带 stage + 原始 message，下次 reset 直接定位。
+        let err = ProbeError::Handshake {
             stage: StartupStage::Hello,
-            source: SessionError::Protocol(ProtocolError::Io(reset_io())),
-        });
-        match r {
-            AttemptOutcome::RetryTransient(ProbeError::Handshake { stage, message }) => {
+            message: SessionError::Protocol(ProtocolError::Io(reset_io())).to_string(),
+        };
+        match err {
+            ProbeError::Handshake { stage, message } => {
                 assert_eq!(stage, StartupStage::Hello);
                 assert!(message.contains("test-reset-marker"), "实际: {message}");
             }
-            other => panic!("分类错误，实际: {other:?}"),
+            other => panic!("构造错误，实际: {other:?}"),
         }
     }
 }

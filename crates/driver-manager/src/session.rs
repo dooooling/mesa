@@ -60,13 +60,15 @@ pub const EVENT_CAPACITY: usize = 1024;
 /// 事件批次通道容量（Event Plane V1 §12）：推导值，非经验数字。
 /// 容量公式为 `MAX_SUSTAINED_EVENT_RATE × MAX_COMMIT_STALL × SAFETY_FACTOR`，
 /// 即 50/s × 5s × 2 = 500 → 取 512。其中 RATE 50/s 是 V1 事件面持续速率
-/// SLO（`event_rate_sustained_50_per_sec_10s` Gate 实证；soak/pressure 的
-/// 20/s 只是基线负载，不是上限；100/s 在 CI 硬件上只能发出约 62/s，
-/// 不得作为 SLO 输入——见速率测试注释）；STALL 5s 是单次 commit 最坏
-/// （SQLite busy 上限，见 [`mesa_event_store::EVENT_STORE_BUSY_TIMEOUT_MS`]）；
-/// SAFETY 2 是调度与 Windows 磁盘抖动余量。
+/// SLO（`exact_500_events_pipeline_exact_within_budget` 精确 Gate 实证：
+/// 500 个 occurrence 在 10s budget 内精确落盘；soak/pressure 的 20/s 只是
+/// 基线负载，不是上限；100/s 在 CI 硬件上只能发出约 62/s，
+/// 不得作为 SLO 输入）；STALL 5s 是单次 commit 最坏（SQLite busy 上限，见
+/// [`mesa_event_store::EVENT_STORE_BUSY_TIMEOUT_MS`]）；SAFETY 2 是调度与
+/// Windows 磁盘抖动余量。
 /// 公式内负载下 overflow 即 bug；超出（持续 >50/s 或 >10s 级 stall）才允许
-/// `EVENT_STREAM_CLOSED` fail-closed（`event_capacity_boundary` Gate 实证边界）。
+/// `EVENT_STREAM_CLOSED` fail-closed（`exact_capacity_plus_one_overflow_is_loud`
+/// 精确 Gate 实证分界：512 全活 / 513 必死）。
 /// 事件流是独立可靠流——满队列时 reader 按 fail-closed 关闭整条事件流
 /// （见 [`Session::event_stream_failed`]），绝不静默丢弃。
 pub const EVENT_BATCH_CAPACITY: usize = 512;
@@ -196,9 +198,10 @@ struct Shared {
     event_stream_dead: AtomicBool,
     /// 因溢出被拒绝的 EventBatch 数（流已死后不再计数， incidental）。
     event_overflow_drops: AtomicU64,
-    /// 事件队列深度（发送侧采样：每次成功发送后记录 `容量-剩余`；发送间隙
-    /// 只减不增，故为保守上界估计。容量公式验证与 stall Gate 的观测锚点）。
-    event_queue_depth: AtomicU64,
+    /// 事件队列深度（发送侧采样快照，非实时值：只在成功 `try_send` 后更新，
+    /// 消费端 dequeue 不回写；发送间隙只减不增，故为保守上界估计。
+    /// 精确批量测试用它做"全部到达"见证；`high_water` 做单调最大值）。
+    event_queue_depth_last_sample: AtomicU64,
     /// 事件队列高水位（单调：历史最大深度；overflow 调查的第一证据）。
     event_queue_high_water: AtomicU64,
     /// 解码失败被丢弃的 EventBatch 数（单批损坏可观测：下游 sequence gap 会如实反映）。
@@ -442,7 +445,7 @@ impl Session {
             dropped_events: AtomicU64::new(0),
             event_stream_dead: AtomicBool::new(false),
             event_overflow_drops: AtomicU64::new(0),
-            event_queue_depth: AtomicU64::new(0),
+            event_queue_depth_last_sample: AtomicU64::new(0),
             event_queue_high_water: AtomicU64::new(0),
             event_decode_errors: AtomicU64::new(0),
             active_event_epochs: Mutex::new(HashMap::new()),
@@ -542,9 +545,11 @@ impl Session {
         self.shared.event_overflow_drops.load(Ordering::Relaxed)
     }
 
-    /// 事件队列深度（发送侧采样快照；容量公式验证与 stall Gate 的观测锚点）。
-    pub fn event_queue_depth(&self) -> u64 {
-        self.shared.event_queue_depth.load(Ordering::Relaxed)
+    /// 事件队列深度快照（发送侧采样，非实时值；精确批量测试的到达见证）。
+    pub fn event_queue_depth_last_sample(&self) -> u64 {
+        self.shared
+            .event_queue_depth_last_sample
+            .load(Ordering::Relaxed)
     }
 
     /// 事件队列高水位（单调；overflow 调查的第一证据）。
@@ -993,7 +998,9 @@ async fn reader_loop(mut rd: OwnedReadHalf, shared: Arc<Shared>, cancel: Cancell
                             if let Some(tx) = guard.as_ref() {
                                 let depth =
                                     (EVENT_BATCH_CAPACITY.saturating_sub(tx.capacity())) as u64;
-                                shared.event_queue_depth.store(depth, Ordering::Relaxed);
+                                shared
+                                    .event_queue_depth_last_sample
+                                    .store(depth, Ordering::Relaxed);
                                 shared
                                     .event_queue_high_water
                                     .fetch_max(depth, Ordering::Relaxed);
@@ -1214,7 +1221,7 @@ mod tests {
                 dropped_events: AtomicU64::new(0),
                 event_stream_dead: AtomicBool::new(false),
                 event_overflow_drops: AtomicU64::new(0),
-                event_queue_depth: AtomicU64::new(0),
+                event_queue_depth_last_sample: AtomicU64::new(0),
                 event_queue_high_water: AtomicU64::new(0),
                 event_decode_errors: AtomicU64::new(0),
                 active_event_epochs: Mutex::new(HashMap::new()),
@@ -1501,7 +1508,7 @@ mod tests {
             dropped_events: AtomicU64::new(0),
             event_stream_dead: AtomicBool::new(false),
             event_overflow_drops: AtomicU64::new(0),
-            event_queue_depth: AtomicU64::new(0),
+            event_queue_depth_last_sample: AtomicU64::new(0),
             event_queue_high_water: AtomicU64::new(0),
             event_decode_errors: AtomicU64::new(0),
             active_event_epochs: Mutex::new(HashMap::from([(HANDLE, EPOCH)])),
@@ -1618,7 +1625,7 @@ mod tests {
             dropped_events: AtomicU64::new(0),
             event_stream_dead: AtomicBool::new(false),
             event_overflow_drops: AtomicU64::new(0),
-            event_queue_depth: AtomicU64::new(0),
+            event_queue_depth_last_sample: AtomicU64::new(0),
             event_queue_high_water: AtomicU64::new(0),
             event_decode_errors: AtomicU64::new(0),
             active_event_epochs: Mutex::new(HashMap::from([(HANDLE, EPOCH)])),
@@ -1788,7 +1795,7 @@ mod tests {
                     dropped_events: AtomicU64::new(0),
                     event_stream_dead: AtomicBool::new(false),
                     event_overflow_drops: AtomicU64::new(0),
-                    event_queue_depth: AtomicU64::new(0),
+                    event_queue_depth_last_sample: AtomicU64::new(0),
                     event_queue_high_water: AtomicU64::new(0),
                     event_decode_errors: AtomicU64::new(0),
                     active_event_epochs: Mutex::new(HashMap::from([(HANDLE, epoch)])),

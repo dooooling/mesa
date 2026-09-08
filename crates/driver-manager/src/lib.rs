@@ -17,6 +17,7 @@ pub mod process;
 pub mod profile;
 pub mod session;
 pub mod snapshot;
+pub(crate) mod temp_op;
 
 pub use endpoint::{BuiltinEndpoint, PointIdAllocator, PointIdSource, StorePointIdSource};
 pub use manager::MesaManager;

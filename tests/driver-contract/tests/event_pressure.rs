@@ -148,12 +148,12 @@ async fn data_load_does_not_starve_events() {
 }
 
 // ---------------------------------------------------------------------------
-// 容量公式 Gates（hardening/runtime-determinism）：速率 SLO + stall 恢复 +
-// 溢出边界。公式 `容量 >= 50/s × 5s × 2 = 500 → 512`（见
-// `EVENT_BATCH_CAPACITY`），三个测试各证一项，不赌调度。
-// 注意 100/s 不是 SLO 输入：CI 硬件 10ms tick 只能发出约 62/s（Skip 丢 tick，
-// 管道无丢失），且 event_persistence 早有"100/s 超过 ingress 吞吐"的记录。
-// 虚高的设计目标不得进公式。
+// stall 恢复 Gate（hardening）：commit 暂停期间 Core 不判死、放行后精确恢复。
+// 速率 SLO 与容量边界的严格证明在 `event_runtime` 的精确批量 Gate
+//（`exact_500_events_pipeline_exact_within_budget` /
+// `exact_capacity_plus_one_overflow_is_loud`）：数量代替"时间×推测速率"。
+// 本文件的 stall 测试按 interval 上限天然 rate-safe（50ms tick 至多 20/s，
+// 6s 至多 120 批 ≪ 512，与 runner 快慢无关），保留作 manager 级集成覆盖。
 // ---------------------------------------------------------------------------
 /// 容量公式测试基座：带故障器（栅栏能力）+ Hub 见证者 + event-only counter 端点。
 struct StallRig {
@@ -251,50 +251,6 @@ impl HubWitness {
     }
 }
 
-/// V1 持续速率 SLO 实证：50/s × 10s ≈ 500 事件，无丢失无重复、
-/// 单 epoch、persisted 精确、Hub 精确。这是容量公式 RATE 输入的证据；
-/// 计数允许调度余量（≥400），连续性与精确性不让步。
-#[tokio::test]
-async fn event_rate_sustained_50_per_sec_10s() {
-    common::init_log();
-    let rig = StallRig::start(
-        "hd-rate-50",
-        std::sync::Arc::new(StoreFaults::new(0, false)),
-    );
-    let hub = HubWitness::subscribe(&rig.services);
-    rig.start_counter(20);
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    rig.mgr.stop_endpoint(&rig.endpoint_id).await.unwrap();
-
-    let ns = rig.counter_ns();
-    assert!(ns.len() >= 400, "50/s×10s 应有规模，got {}", ns.len());
-    let max = *ns.last().unwrap();
-    assert_eq!(ns.len() as u64, max, "持续速率下不得丢失重复");
-    for w in ns.windows(2) {
-        assert_eq!(w[1], w[0] + 1, "持续速率下必须连续");
-    }
-    assert_eq!(rig.epochs().len(), 1, "不得触发重连");
-    {
-        use std::sync::atomic::Ordering;
-        assert_eq!(
-            rig.services
-                .diagnostics
-                .ingress_persisted_events_total
-                .load(Ordering::Relaxed),
-            ns.len() as u64,
-        );
-    }
-    // 2s 静默（无新发布）后收 Hub 对账。
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let got = hub.finish().await;
-    let want: BTreeSet<String> = rows_of(&rig.store, &rig.endpoint_id)
-        .iter()
-        .map(|r| r.event_id.clone())
-        .collect();
-    assert_eq!(got, want, "Hub 必须恰好收到 DB 全部行");
-    let _ = std::fs::remove_file(&rig.db);
-}
-
 /// 确定性 stall 恢复 Gate：20/s 下 commit 暂停 6s（120 批 ≪ 512），
 /// Core 不得判死/重连（单 epoch），行冻结可观测；放行后完整恢复精确。
 /// 同时证明 control 面存活：stall 全程 snapshot 恒为 RUNNING（心跳未判死、
@@ -357,50 +313,5 @@ async fn event_stall_6s_recovers_exact() {
         .map(|r| r.event_id.clone())
         .collect();
     assert_eq!(got, want, "Hub 必须恰好收到 DB 全部行");
-    let _ = std::fs::remove_file(&rig.db);
-}
-
-/// 容量边界 Gate：100/s 下 commit 暂停（速率远超公式输入，快速填满），
-/// 通道满 512 即溢出，必须触发 `EVENT_STREAM_CLOSED` fail-closed
-/// （大声重连，而非静默丢失）。这是公式上界的另一半证据：
-/// 预算内恢复、超预算大声失败。hold 时长定量推导（见下），Lost 在放行后观测。
-#[tokio::test]
-async fn event_capacity_boundary_overflow_is_loud() {
-    common::init_log();
-    let faults = std::sync::Arc::new(StoreFaults::new(0, false));
-    let rig = StallRig::start("hd-capacity-edge", faults.clone());
-    rig.start_counter(10);
-    common::wait_until(30, || rig.counter_ns().len() >= 2).await;
-
-    let gate = faults.arm_commit_gate();
-    common::wait_until(10, || gate.entered() >= 1).await;
-    // 定量 hold（不赌观测时机）：writer 暂停后通道以实际速率堆积。
-    // 同 suite 速率测试已实证下限 40/s，22s ⇒ ≥880 批 > 512，溢出必发。
-    // 注意 Lost 不能在 hold 期间观测：ingress 正 parked 在被暂停 commit 的
-    // 回复上，不再调 recv，也就看不到通道关闭——放行恢复 pump 后 Lost 才触发。
-    // 这是测试时序事实，不是生产缺陷（生产 writer 最终会完成 commit）。
-    let snapshot = rig.mgr.snapshot();
-    tokio::time::sleep(Duration::from_secs(22)).await;
-    gate.release();
-    // 放行后 ingress 恢复 pump → recv 到 None → StreamClosed → Lost →
-    // RECONNECTING（明细码）。再观测，此时 writer 已自由，窗口必现。
-    common::wait_until(30, || {
-        matches!(snapshot.endpoint("hd-capacity-edge"), Some(ref s) if s.state == "RECONNECTING" && s.detail.contains("EVENT_STREAM_CLOSED"))
-    })
-    .await;
-
-    // 重连后新 epoch 继续；Stop 有界显式；旧 epoch 行仍在（fail-closed 不丢已落盘）。
-    common::wait_until(30, || rig.epochs().len() >= 2).await;
-    let res = tokio::time::timeout(
-        Duration::from_secs(40),
-        rig.mgr.stop_endpoint(&rig.endpoint_id),
-    )
-    .await
-    .expect("Stop 必须有界返回");
-    assert!(
-        res.is_ok(),
-        "边界测试后 Stop 应成功（drain 已恢复），实际: {res:?}"
-    );
-    assert!(rig.epochs().len() >= 2, "溢出必须留下重连新 epoch 证据",);
     let _ = std::fs::remove_file(&rig.db);
 }
