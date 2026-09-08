@@ -17,11 +17,33 @@ fn fake_opcua_connection() -> serde_json::Value {
 }
 
 fn fake_sinumerik_connection() -> serde_json::Value {
-    // SINUMERIK Fake 驱动（空脚本 Fake：browse 返回空页，仅验证管道与身份形态）
+    // SINUMERIK Fake 驱动：装载确定性 fixture（根下 3 节点两页聚合）。
     unsafe {
         std::env::set_var("MESA_ALLOW_FAKE_NATIVE", "1");
     }
     serde_json::json!({"endpoint_url":"opc.tcp://127.0.0.1:4840","use_native":false})
+}
+
+/// suite 内 process-heavy Browse 测试串行锁：同文件测试并行拉起多个真实
+/// driver subprocess，spawn/session 建连存在启动瞬态（曾在 Ubuntu ARM 以
+/// 偶发 503 现形）。串行只收敛本 suite，不动 workspace 并行度——禁止
+/// `--test-threads=1` 一刀切掩盖真正该承受并发的测试。
+static BROWSE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// 200 断言带 body 取证：非 200 时只看状态码无法区分 DRIVER_UNAVAILABLE /
+/// BROWSE_FAILED，必须把 Mesa error body 打出来再判。
+async fn assert_browse_ok(resp: axum::response::Response, what: &str) -> serde_json::Value {
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{what} browse failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+    serde_json::from_slice(&body).unwrap()
 }
 
 async fn app_with_endpoint(
@@ -57,6 +79,7 @@ async fn app_with_endpoint(
 
 #[tokio::test]
 async fn browse_opcua_pagination_and_filter() {
+    let _guard = BROWSE_SERIAL.lock().await;
     // OPC UA Fake 支持 browse（显式 use_native:false，避免默认 Native 去连 127.0.0.1:4840）
     let (app, ep_id) = app_with_endpoint("opcua", fake_opcua_connection()).await;
     // 未过滤，limit 2
@@ -67,17 +90,7 @@ async fn browse_opcua_pagination_and_filter() {
         .body(Body::from(r#"{"parent":"","limit":2}"#))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    if resp.status() != StatusCode::OK {
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        eprintln!("browse opcua failed: {}", String::from_utf8_lossy(&body));
-        panic!("browse failed");
-    }
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let v = assert_browse_ok(resp, "opcua p1").await;
     assert!(v["nodes"].as_array().unwrap().len() <= 2);
     // 若有下一页，next_cursor 非空
     if let Some(next) = v["next_cursor"].as_str()
@@ -93,7 +106,7 @@ async fn browse_opcua_pagination_and_filter() {
             )))
             .unwrap();
         let resp2 = app.oneshot(req2).await.unwrap();
-        assert_eq!(resp2.status(), StatusCode::OK);
+        assert_browse_ok(resp2, "opcua p2").await;
     }
     // 过滤
     let req3 = Request::builder()
@@ -108,11 +121,12 @@ async fn browse_opcua_pagination_and_filter() {
         .oneshot(req3)
         .await
         .unwrap();
-    assert_eq!(resp3.status(), StatusCode::OK);
+    assert_browse_ok(resp3, "opcua filter").await;
 }
 
 #[tokio::test]
 async fn browse_unsupported_for_s7_and_simulator() {
+    let _guard = BROWSE_SERIAL.lock().await;
     for driver in ["s7", "simulator"] {
         let conn = if driver == "s7" {
             serde_json::json!({"host":"127.0.0.1","port":102})
@@ -139,6 +153,7 @@ async fn browse_unsupported_for_s7_and_simulator() {
 
 #[tokio::test]
 async fn browse_pagination_does_not_return_all_at_once() {
+    let _guard = BROWSE_SERIAL.lock().await;
     let (app, ep_id) = app_with_endpoint("opcua", fake_opcua_connection()).await;
     // 请求 limit 1，应只返回 1 且有 next_cursor
     let req = Request::builder()
@@ -148,11 +163,7 @@ async fn browse_pagination_does_not_return_all_at_once() {
         .body(Body::from(r#"{"parent":"","limit":1}"#))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let v = assert_browse_ok(resp, "opcua limit1").await;
     assert_eq!(v["nodes"].as_array().unwrap().len(), 1);
 }
 
@@ -163,6 +174,7 @@ async fn browse_sinumerik_plumbing_and_canonical_shape() {
     // 身份必须全部 canonical nsu= 形态，binding 与 id 一致
     //（翻页聚合与换算覆盖在驱动单测 + fixture 自检，不在此重复）。
     // 注意：改过驱动代码后须先 cargo build --workspace（旧二进制静默失效）。
+    let _guard = BROWSE_SERIAL.lock().await;
     let (app, ep_id) = app_with_endpoint("sinumerik", fake_sinumerik_connection()).await;
     let req = Request::builder()
         .uri(format!("/api/v1/endpoints/{ep_id}/browse"))
@@ -171,11 +183,7 @@ async fn browse_sinumerik_plumbing_and_canonical_shape() {
         .body(Body::from(r#"{"parent":"","limit":10}"#))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let v = assert_browse_ok(resp, "sinumerik").await;
     let nodes = v["nodes"].as_array().expect("nodes 数组");
     // fixture 语义：两页聚合共 3 个子节点（Channel/Axis/Spindle）。
     assert_eq!(nodes.len(), 3, "fixture browse 应聚合 3 节点，实际: {v}");

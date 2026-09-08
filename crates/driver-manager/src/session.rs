@@ -181,11 +181,22 @@ impl Session {
         port: u16,
         expected_token: &str,
     ) -> Result<(Self, mpsc::Receiver<SessionEvent>, Arc<AtomicBool>), SessionError> {
+        Self::connect_retry_with_heartbeat(port, expected_token, HeartbeatParams::default()).await
+    }
+
+    /// 可显式指定心跳参数的建连重试（测试按需传入 fast 参数，不再依赖进程 env；
+    /// 默认心跳语义仍由 [`HeartbeatParams::default`] 定义，`connect_retry`
+    /// 与 endpoint 默认路径均经它取得——`MESA_HEARTBEAT_FAST=1` 显式覆盖能力保留）。
+    pub async fn connect_retry_with_heartbeat(
+        port: u16,
+        expected_token: &str,
+        hb: HeartbeatParams,
+    ) -> Result<(Self, mpsc::Receiver<SessionEvent>, Arc<AtomicBool>), SessionError> {
         let deadline = tokio::time::Instant::now() + DRIVER_STARTUP_TIMEOUT;
         #[allow(unused_assignments)]
         let mut last: Option<SessionError> = None;
         loop {
-            match Self::connect(port, expected_token).await {
+            match Self::connect_with_heartbeat(port, expected_token, hb).await {
                 Ok(v) => return Ok(v),
                 Err(SessionError::Io(e))
                     if matches!(
