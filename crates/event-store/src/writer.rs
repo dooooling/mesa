@@ -10,6 +10,8 @@
 use mesa_core_types::EventBatch;
 use rusqlite::{Connection, params};
 #[cfg(feature = "test-hooks")]
+use std::sync::Mutex;
+#[cfg(feature = "test-hooks")]
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -81,6 +83,45 @@ pub struct StoreFaults {
     /// true = 到达后持续失败直到测试改回 false（恢复验证用，可运行时切换）。
     pub fail_sticky: std::sync::atomic::AtomicBool,
     commits: AtomicU64,
+    /// 提交栅栏（Stop-drain 确定性 Gate 用）：`Some` 时 writer 在执行下一个
+    /// commit 之前阻塞，直到测试放行。One-shot：仅暂停紧随其后的第一个
+    /// commit，取走后后续 commit 不受影响。
+    commit_gate: Mutex<Option<Arc<CommitGate>>>,
+}
+
+/// 提交栅栏（`test-hooks`）：writer 线程侧状态。测试侧句柄见 [`CommitGateHandle`]。
+#[cfg(feature = "test-hooks")]
+#[derive(Debug)]
+struct CommitGate {
+    /// writer 到达栅栏的累计次数（单调；测试据此确认 commit 已被暂停，
+    /// 而不是"还没发出来"，栅栏等待才是确定性的）。
+    entered: AtomicU64,
+    /// 放行通道接收端（writer 侧阻塞等待；测试 abandon 时发送端释放，
+    /// `recv` 返回 Err 即直接放行，writer 永不因测试悬挂）。
+    release_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+/// 提交栅栏测试句柄（`test-hooks`）：由 [`StoreFaults::arm_commit_gate`] 创建。
+#[cfg(feature = "test-hooks")]
+#[derive(Debug)]
+pub struct CommitGateHandle {
+    gate: Arc<CommitGate>,
+    release_tx: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(feature = "test-hooks")]
+impl CommitGateHandle {
+    /// writer 到达栅栏的累计次数（`>= 1` 即当前 commit 已被暂停，
+    /// 此时并发 Stop 必定落在"in-flight commit 未完成"窗口内）。
+    pub fn entered(&self) -> u64 {
+        self.gate.entered.load(Ordering::SeqCst)
+    }
+
+    /// 放行被暂停的 commit（消费句柄；放行后 writer 继续执行该 commit，
+    /// commit-then-publish 原子性不受影响）。
+    pub fn release(self) {
+        let _ = self.release_tx.send(());
+    }
 }
 
 #[cfg(feature = "test-hooks")]
@@ -92,7 +133,31 @@ impl StoreFaults {
             fail_commit_at: AtomicU64::new(at),
             fail_sticky: std::sync::atomic::AtomicBool::new(sticky),
             commits: AtomicU64::new(0),
+            commit_gate: Mutex::new(None),
         }
+    }
+
+    /// 布防提交栅栏：writer 收到的下一个 Commit 在执行前阻塞，
+    /// 直到句柄 [`CommitGateHandle::release`] 放行（或句柄释放，
+    /// 此时 writer 直接放行，永不悬挂）。测试流程：
+    /// 布防 → 触发 commit → 等 `entered() >= 1` → 并发 Stop →
+    /// 断言 Stop 未返回（正在等 in-flight commit）→ 放行 →
+    /// Stop 成功 + DB/Hub 精确 + Stop 后无新写。
+    /// 注意：暂停的是共享 writer 线程，布防期间同库其他 commit 同样等待；
+    /// Gate 测试内只跑单个 endpoint，隔离由测试保证。
+    pub fn arm_commit_gate(self: &Arc<Self>) -> CommitGateHandle {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new(CommitGate {
+            entered: AtomicU64::new(0),
+            release_rx: Mutex::new(Some(release_rx)),
+        });
+        *self.commit_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        CommitGateHandle { gate, release_tx }
+    }
+
+    /// 取走已布防的栅栏（writer 线程调用，one-shot）。
+    fn take_commit_gate(&self) -> Option<Arc<CommitGate>> {
+        self.commit_gate.lock().unwrap().take()
     }
 
     fn check(&self) -> Result<(), EventStoreError> {
@@ -129,7 +194,15 @@ pub fn writer_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCommand>) {
             WriteCommand::Commit(req, reply) => {
                 #[cfg(feature = "test-hooks")]
                 let res = match faults.as_ref().map(|f| f.check()).unwrap_or(Ok(())) {
-                    Ok(()) => commit_batch(&mut conn, &req),
+                    Ok(()) => {
+                        // 提交栅栏（one-shot）：暂停紧随其后的第一个 commit，
+                        // 让并发 Stop 确定性落在 in-flight 窗口内。
+                        if let Some(gate) = faults.as_ref().and_then(|f| f.take_commit_gate()) {
+                            gate.entered.fetch_add(1, Ordering::SeqCst);
+                            let _ = gate.release_rx.lock().unwrap().take().map(|rx| rx.recv());
+                        }
+                        commit_batch(&mut conn, &req)
+                    }
                     Err(e) => Err(e),
                 };
                 #[cfg(not(feature = "test-hooks"))]

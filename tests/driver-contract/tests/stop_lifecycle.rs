@@ -11,6 +11,12 @@
 //!
 //! 触发器用 simulator 现有 `crash_after_batches` 故障（确定性进程死亡），
 //! 不新增驱动故障种类。不改生产语义、不放宽 timeout/断言。
+//!
+//! 第二个测试（`stop_waits_for_inflight_commit_then_drains_exact`）是真
+//! in-flight race 的确定性 Gate：test-only writer 栅栏暂停 commit，并发
+//! Stop 必须等待（不得提前返回、不得超时误判），放行后成功 + DB/Hub 精确 +
+//! Stop 后无新写。它冻结的是 `reader_done → 无新生产 → in-flight 完成 →
+//! 队列排空 → drain ACK → Stop 返回` 这条关系。
 
 mod common;
 mod event_common;
@@ -21,7 +27,7 @@ use event_common::{rows_of, tmp_db};
 use mesa_core_types::{DriverBinding, EventTask, GENERIC_EVENT_BINDING_KIND, TaskMode};
 use mesa_driver_manager::MesaManager;
 use mesa_driver_manager::endpoint::BuiltinEndpoint;
-use mesa_event_store::{EVENT_HUB_CAPACITY, EventHub, EventServices, EventStore};
+use mesa_event_store::{EVENT_HUB_CAPACITY, EventHub, EventServices, EventStore, StoreFaults};
 
 fn drivers_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -114,5 +120,141 @@ async fn stop_while_reconnecting_is_bounded_and_explicit() {
         !mgr.is_running(ep),
         "Stop 返回后端点不得再运行，实际 outcome={res:?}"
     );
+    let _ = std::fs::remove_file(&db);
+}
+
+/// Stop 等待 in-flight commit 的确定性 Gate（main CI #103 真因冻结）。
+///
+/// 用 test-only writer 栅栏把一个 commit 暂停在"已发送、未执行"状态，
+/// 此时并发 Stop 必须**等待**（500ms 内不得返回——提前返回或超时误判都是 bug），
+/// 放行后 Stop 成功，且 DB/Hub 精确、Stop 后无新写。冻结的关系：
+/// `reader_done → 无新生产 → in-flight 完成 → 队列排空 → drain ACK → Stop 返回`。
+///
+/// 时序全部由栅栏握手决定，不赌调度：`entered() >= 1` 之前 Stop 尚未发起；
+/// 栅栏关闭期间 Stop 不可能完成（drain 需要该 commit 的 reply）。
+#[tokio::test]
+async fn stop_waits_for_inflight_commit_then_drains_exact() {
+    common::init_log();
+    let db = tmp_db("stop-gate");
+    let _ = std::fs::remove_file(&db);
+    // 故障器仅提供栅栏能力，不注入失败（new(0, false) 永不失败）。
+    let faults = std::sync::Arc::new(StoreFaults::new(0, false));
+    let store = std::sync::Arc::new(
+        EventStore::open_with_faults(&db, std::sync::Arc::clone(&faults)).unwrap(),
+    );
+    let hub = EventHub::new(EVENT_HUB_CAPACITY);
+    let services = EventServices::new(store.clone(), std::sync::Arc::clone(&hub));
+    let mgr = std::sync::Arc::new(MesaManager::discover(&drivers_dir()));
+    mgr.set_event_services(std::sync::Arc::clone(&services));
+    let ep = "hd-stop-gate";
+
+    // Hub 精确送达的见证者：start 之前订阅（broadcast 迟到者收不到旧消息，
+    // 订阅必须在生产之前）。结尾一次性 try_recv 排空：本测试总量远小于 Hub
+    // 容量（256），Lagged 不可能；比后台排空任务少一个 abort 间隙，无误红窗口。
+    let mut hub_rx = hub.subscribe();
+
+    let binding = mesa_core_types::GenericEventBinding {
+        stream_id: mesa_driver_simulator::SIM_EVENT_STREAM_COUNTER.into(),
+        parameters: serde_json::json!({}),
+    };
+    mgr.start_endpoint(BuiltinEndpoint {
+        endpoint_id: ep.into(),
+        driver_id: "simulator".into(),
+        connection_json: "{}".into(),
+        tasks: vec![],
+        event_tasks: vec![EventTask {
+            id: "cnt".into(),
+            mode: TaskMode::Poll,
+            interval_ms: Some(50),
+            binding: DriverBinding {
+                kind: GENERIC_EVENT_BINDING_KIND.into(),
+                config: serde_json::to_value(&binding).unwrap(),
+            },
+        }],
+    })
+    .unwrap();
+
+    // commit 流动证据（栅栏布防前生产正常，不是起不来）。
+    common::wait_until(30, || rows_of(&store, ep).len() >= 2).await;
+
+    // 布防 → 等 writer 到达栅栏（commit 已发送、执行中被暂停；entered 计数
+    // 让"暂停已生效"可观测，不赌"commit 已经发出来了"）。
+    let gate = faults.arm_commit_gate();
+    common::wait_until(10, || gate.entered() >= 1).await;
+
+    // 并发 Stop：栅栏关闭期间必须等待，不得提前返回（成功或超时都是 bug）。
+    let stop_fut = mgr.stop_endpoint(ep);
+    tokio::pin!(stop_fut);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut stop_fut)
+            .await
+            .is_err(),
+        "栅栏关闭时 Stop 必须等待 in-flight commit，不得提前返回",
+    );
+
+    // 放行 → Stop 成功（有界）。
+    gate.release();
+    let res = tokio::time::timeout(Duration::from_secs(30), stop_fut)
+        .await
+        .expect("放行后 Stop 必须有界返回");
+    assert_eq!(res, Ok(true), "放行后 Stop 必须干净成功，实际: {res:?}");
+
+    // 精确：DB 行连续 + persisted 计数 == 行数。
+    let rows = rows_of(&store, ep);
+    let mut ns: Vec<u64> = rows
+        .iter()
+        .map(|r| {
+            let v: serde_json::Value = serde_json::from_str(&r.attributes_json).unwrap();
+            v["value"]["U64"].as_u64().unwrap()
+        })
+        .collect();
+    ns.sort_unstable();
+    let max = *ns.last().unwrap();
+    assert_eq!(ns.len() as u64, max, "无丢失无重复");
+    for w in ns.windows(2) {
+        assert_eq!(w[1], w[0] + 1, "n 必须连续");
+    }
+    {
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            services
+                .diagnostics
+                .ingress_persisted_events_total
+                .load(Ordering::Relaxed),
+            rows.len() as u64,
+            "persisted 必须等于行数",
+        );
+    }
+
+    // 精确：Hub 收到的 == DB 落盘的（commit-then-publish 原子性）。
+    // Stop 后 2s 静默窗口：无新生产；然后排空 Hub 比较；同时验证 Stop 后无新写。
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let quiet_rows = rows_of(&store, ep).len();
+    {
+        use std::sync::atomic::Ordering;
+        let quiet_persisted = services
+            .diagnostics
+            .ingress_persisted_events_total
+            .load(Ordering::Relaxed);
+        assert_eq!(quiet_rows, rows.len(), "Stop 后 DB 不得再出新行");
+        assert_eq!(
+            quiet_persisted,
+            rows.len() as u64,
+            "Stop 后 persisted 不得再涨"
+        );
+    }
+    let mut got: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    loop {
+        match hub_rx.try_recv() {
+            Ok(ev) => {
+                got.insert(ev.event_id.clone());
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(e) => panic!("Hub 排空不得失败（总量远小于容量），实际: {e:?}"),
+        }
+    }
+    let want: std::collections::BTreeSet<String> =
+        rows.iter().map(|r| r.event_id.clone()).collect();
+    assert_eq!(got, want, "Hub 必须恰好收到 DB 全部行（不多不少）");
     let _ = std::fs::remove_file(&db);
 }
