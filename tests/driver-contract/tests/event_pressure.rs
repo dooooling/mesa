@@ -149,8 +149,11 @@ async fn data_load_does_not_starve_events() {
 
 // ---------------------------------------------------------------------------
 // 容量公式 Gates（hardening/runtime-determinism）：速率 SLO + stall 恢复 +
-// 溢出边界。公式 `容量 >= 100/s × 5s × 2 = 1000 → 1024`（见
+// 溢出边界。公式 `容量 >= 50/s × 5s × 2 = 500 → 512`（见
 // `EVENT_BATCH_CAPACITY`），三个测试各证一项，不赌调度。
+// 注意 100/s 不是 SLO 输入：CI 硬件 10ms tick 只能发出约 62/s（Skip 丢 tick，
+// 管道无丢失），且 event_persistence 早有"100/s 超过 ingress 吞吐"的记录。
+// 虚高的设计目标不得进公式。
 // ---------------------------------------------------------------------------
 /// 容量公式测试基座：带故障器（栅栏能力）+ Hub 见证者 + event-only counter 端点。
 struct StallRig {
@@ -248,23 +251,23 @@ impl HubWitness {
     }
 }
 
-/// V1 持续速率 SLO 实证：100/s × 10s ≈ 1000 事件，无丢失无重复、
+/// V1 持续速率 SLO 实证：50/s × 10s ≈ 500 事件，无丢失无重复、
 /// 单 epoch、persisted 精确、Hub 精确。这是容量公式 RATE 输入的证据；
-/// 计数允许调度余量（≥800），连续性与精确性不让步。
+/// 计数允许调度余量（≥400），连续性与精确性不让步。
 #[tokio::test]
-async fn event_rate_sustained_100_per_sec_10s() {
+async fn event_rate_sustained_50_per_sec_10s() {
     common::init_log();
     let rig = StallRig::start(
-        "hd-rate-100",
+        "hd-rate-50",
         std::sync::Arc::new(StoreFaults::new(0, false)),
     );
     let hub = HubWitness::subscribe(&rig.services);
-    rig.start_counter(10);
+    rig.start_counter(20);
     tokio::time::sleep(Duration::from_secs(10)).await;
     rig.mgr.stop_endpoint(&rig.endpoint_id).await.unwrap();
 
     let ns = rig.counter_ns();
-    assert!(ns.len() >= 800, "100/s×10s 应有规模，got {}", ns.len());
+    assert!(ns.len() >= 400, "50/s×10s 应有规模，got {}", ns.len());
     let max = *ns.last().unwrap();
     assert_eq!(ns.len() as u64, max, "持续速率下不得丢失重复");
     for w in ns.windows(2) {
@@ -292,7 +295,7 @@ async fn event_rate_sustained_100_per_sec_10s() {
     let _ = std::fs::remove_file(&rig.db);
 }
 
-/// 确定性 stall 恢复 Gate：20/s 下 commit 暂停 6s（120 批 ≪ 1024），
+/// 确定性 stall 恢复 Gate：20/s 下 commit 暂停 6s（120 批 ≪ 512），
 /// Core 不得判死/重连（单 epoch），行冻结可观测；放行后完整恢复精确。
 /// 同时证明 control 面存活：stall 全程 snapshot 恒为 RUNNING（心跳未判死、
 /// endpoint 未 Lost——判死/重连会留下新 epoch，单 epoch 断言即覆盖）。
@@ -357,9 +360,10 @@ async fn event_stall_6s_recovers_exact() {
     let _ = std::fs::remove_file(&rig.db);
 }
 
-/// 容量边界 Gate：100/s 下 commit 暂停 13s（≈1300 > 1024），必须触发
-/// `EVENT_STREAM_CLOSED` fail-closed（大声重连，而非静默丢失）。
-/// 这是公式上界的另一半证据：预算内恢复、超预算大声失败。
+/// 容量边界 Gate：100/s 下 commit 暂停（速率远超公式输入，快速填满），
+/// 通道满 512 即溢出，必须触发 `EVENT_STREAM_CLOSED` fail-closed
+/// （大声重连，而非静默丢失）。这是公式上界的另一半证据：
+/// 预算内恢复、超预算大声失败。hold 时长定量推导（见下），Lost 在放行后观测。
 #[tokio::test]
 async fn event_capacity_boundary_overflow_is_loud() {
     common::init_log();
@@ -371,7 +375,7 @@ async fn event_capacity_boundary_overflow_is_loud() {
     let gate = faults.arm_commit_gate();
     common::wait_until(10, || gate.entered() >= 1).await;
     // 定量 hold（不赌观测时机）：writer 暂停后通道以实际速率堆积。
-    // 同 suite 速率测试已实证下限 80/s，22s ⇒ ≥1760 批 > 1024，溢出必发。
+    // 同 suite 速率测试已实证下限 40/s，22s ⇒ ≥880 批 > 512，溢出必发。
     // 注意 Lost 不能在 hold 期间观测：ingress 正 parked 在被暂停 commit 的
     // 回复上，不再调 recv，也就看不到通道关闭——放行恢复 pump 后 Lost 才触发。
     // 这是测试时序事实，不是生产缺陷（生产 writer 最终会完成 commit）。

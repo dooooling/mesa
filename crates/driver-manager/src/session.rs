@@ -59,16 +59,17 @@ impl Default for HeartbeatParams {
 pub const EVENT_CAPACITY: usize = 1024;
 /// 事件批次通道容量（Event Plane V1 §12）：推导值，非经验数字。
 /// 容量公式为 `MAX_SUSTAINED_EVENT_RATE × MAX_COMMIT_STALL × SAFETY_FACTOR`，
-/// 即 100/s × 5s × 2 = 1000 → 取 1024。其中 RATE 100/s 是 V1 事件面持续速率
-/// SLO（`event_rate_sustained_100s` Gate 实证；soak/pressure 的 20/s 只是基线
-/// 负载，不是上限）；STALL 5s 是单次 commit 最坏（SQLite busy 上限，见
-/// [`mesa_event_store::EVENT_STORE_BUSY_TIMEOUT_MS`]）；SAFETY 2 是调度与
-/// Windows 磁盘抖动余量。
-/// 公式内负载下 overflow 即 bug；超出（持续 >100/s 或 >10s 级 stall）才允许
+/// 即 50/s × 5s × 2 = 500 → 取 512。其中 RATE 50/s 是 V1 事件面持续速率
+/// SLO（`event_rate_sustained_50_per_sec_10s` Gate 实证；soak/pressure 的
+/// 20/s 只是基线负载，不是上限；100/s 在 CI 硬件上只能发出约 62/s，
+/// 不得作为 SLO 输入——见速率测试注释）；STALL 5s 是单次 commit 最坏
+/// （SQLite busy 上限，见 [`mesa_event_store::EVENT_STORE_BUSY_TIMEOUT_MS`]）；
+/// SAFETY 2 是调度与 Windows 磁盘抖动余量。
+/// 公式内负载下 overflow 即 bug；超出（持续 >50/s 或 >10s 级 stall）才允许
 /// `EVENT_STREAM_CLOSED` fail-closed（`event_capacity_boundary` Gate 实证边界）。
 /// 事件流是独立可靠流——满队列时 reader 按 fail-closed 关闭整条事件流
 /// （见 [`Session::event_stream_failed`]），绝不静默丢弃。
-pub const EVENT_BATCH_CAPACITY: usize = 1024;
+pub const EVENT_BATCH_CAPACITY: usize = 512;
 
 #[derive(Debug, Clone)]
 pub enum SessionEvent {

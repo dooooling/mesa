@@ -87,7 +87,7 @@ async fn backpressure_coalesces_and_keeps_control_responsive() {
     open_connection(&session, H, "{}").await;
     // burst 注入保证产出速率与 OS 定时器精度无关：
     // 20ms tick × burst 200 ≈ 10000 批/s，700ms 停滞 ≈ 7000 批
-    // 远超 出站队列(256) + Core 事件队列(1024) 的总吸收量。
+    // 远超 出站队列(256) + Core 事件队列(512) 的总吸收量。
     let descriptors = configure_tasks(
         &session,
         H,
@@ -122,7 +122,7 @@ async fn backpressure_coalesces_and_keeps_control_responsive() {
     assert_eq!(meta.unwrap().unwrap().0, "simulator");
 
     // 恢复消费：批次继续到达且出现 sequence 缺口（丢弃/合并的可观测证据）。
-    // 积压按序排队，缺口位于事件队列容量(~1024)之后，需扫描足够深。
+    // 积压按序排队，缺口位于事件队列容量(~512)之后，需扫描足够深。
     let mut gaps = 0u32;
     let mut last_seq = 0u64;
     let scanned_start = std::time::Instant::now();
