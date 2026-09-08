@@ -10,7 +10,7 @@
 
 use std::ops::Range;
 
-use crate::error::{S7TransportError, S7_ITEM_OK, s7_cpu_error};
+use crate::error::{S7_ITEM_OK, S7TransportError, s7_cpu_error};
 use crate::pdu::{S7_FUNC_READ, S7_ROSCTR_ACK, S7_ROSCTR_JOB, check_lengths, s7_header, wrap_s7};
 
 // ---------------------------------------------------------------------------
@@ -121,16 +121,16 @@ pub fn parse_read_response(
     }
     let s7 = &resp[7..];
     if s7.len() < 12 {
-        return Err(S7TransportError::protocol(
-            "S7_SHORT",
-            "S7 头部缺失",
-        ));
+        return Err(S7TransportError::protocol("S7_SHORT", "S7 头部缺失"));
     }
     if s7[1] != S7_ROSCTR_ACK {
         let err_class = s7.get(17).copied().unwrap_or(0);
         return Err(s7_cpu_error(
             err_class,
-            &format!("Read 被拒绝 rosctr={:02x} 期望 {:02x}", s7[1], S7_ROSCTR_ACK),
+            &format!(
+                "Read 被拒绝 rosctr={:02x} 期望 {:02x}",
+                s7[1], S7_ROSCTR_ACK
+            ),
         ));
     }
     let (param_len, data_len) = check_lengths(s7)?;
@@ -154,7 +154,10 @@ pub fn parse_read_response(
             let byte_len = len_bits.div_ceil(8);
             if byte_len > 0 && off + byte_len <= data.len() {
                 off += byte_len;
-                if byte_len % 2 == 1 && off < data.len() && data[off] == 0x00 && idx + 1 < items.len()
+                if byte_len % 2 == 1
+                    && off < data.len()
+                    && data[off] == 0x00
+                    && idx + 1 < items.len()
                 {
                     off += 1;
                 }
@@ -238,10 +241,7 @@ pub fn parse_bulk_response(
     }
     let s7 = &resp[7..];
     if s7.len() < 12 {
-        return Err(S7TransportError::protocol(
-            "S7_SHORT",
-            "S7 头部缺失",
-        ));
+        return Err(S7TransportError::protocol("S7_SHORT", "S7 头部缺失"));
     }
     if s7[1] != S7_ROSCTR_ACK {
         let err_class = s7.get(17).copied().unwrap_or(0);
@@ -270,7 +270,10 @@ pub fn parse_bulk_response(
             let byte_len = len_bits.div_ceil(8);
             if byte_len > 0 && off + byte_len <= data.len() {
                 off += byte_len;
-                if byte_len % 2 == 1 && off < data.len() && idx + 1 < items.len() && data[off] == 0x00
+                if byte_len % 2 == 1
+                    && off < data.len()
+                    && idx + 1 < items.len()
+                    && data[off] == 0x00
                 {
                     off += 1;
                 }

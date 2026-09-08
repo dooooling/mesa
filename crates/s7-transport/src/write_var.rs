@@ -47,7 +47,10 @@ pub fn parse_write_response(resp: &[u8]) -> Result<(), S7TransportError> {
         ));
     }
     let s7 = &resp[7..];
-    check_ack(s7, &format!("Write被拒绝 rosctr={:02x}", s7.get(1).copied().unwrap_or(0)))?;
+    check_ack(
+        s7,
+        &format!("Write被拒绝 rosctr={:02x}", s7.get(1).copied().unwrap_or(0)),
+    )?;
     if s7.len() < 14 {
         return Err(S7TransportError::protocol(
             "WRITE_S7_SHORT",

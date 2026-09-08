@@ -47,9 +47,7 @@ impl Default for FixtureState {
 }
 
 /// 启动假服务器：返回监听地址与 accept 任务句柄（测试结束时 `abort`）。
-pub async fn spawn_fake_s7(
-    state: FixtureState,
-) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+pub async fn spawn_fake_s7(state: FixtureState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("fixture bind");
@@ -195,13 +193,7 @@ fn szl_ack(req: &[u8], payload: &[u8]) -> Vec<u8> {
 }
 
 /// 测试用 S7ANY 规范构造（脚手架约定：`0x12 0x0A 0x10 transport len db area addr24`）。
-pub fn test_s7any_spec(
-    transport: u8,
-    req_len: u16,
-    db: u16,
-    area: u8,
-    bit_addr: u32,
-) -> Vec<u8> {
+pub fn test_s7any_spec(transport: u8, req_len: u16, db: u16, area: u8, bit_addr: u32) -> Vec<u8> {
     let mut v = vec![0x12, 0x0A, 0x10, transport];
     v.extend_from_slice(&req_len.to_be_bytes());
     v.extend_from_slice(&db.to_be_bytes());
@@ -329,7 +321,10 @@ mod tests {
         let (mut s, h) = connect(FixtureState::default()).await;
         let payload = s.read_szl(0x0011, 1).await.unwrap();
         assert!(payload.len() >= 8);
-        assert_eq!(&payload[payload.len() - 8..], &[0xFF, 0x09, 0x00, 0x24, 0x00, 0x11, 0x00, 0x01]);
+        assert_eq!(
+            &payload[payload.len() - 8..],
+            &[0xFF, 0x09, 0x00, 0x24, 0x00, 0x11, 0x00, 0x01]
+        );
         s.disconnect().await.unwrap();
         h.abort();
     }

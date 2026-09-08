@@ -108,10 +108,7 @@ pub fn s7_header(rosctr: u8, pdu_ref: u16, param_len: u16, data_len: u16) -> [u8
 /// 检查 S7 Ack 的 ROSCTR，不符则按 CPU 错误码映射（供 Read/Write/SZL 共用）。
 pub fn check_ack(s7: &[u8], ctx: &str) -> Result<(), S7TransportError> {
     if s7.len() < 12 {
-        return Err(S7TransportError::protocol(
-            "S7_SHORT",
-            "S7 头部缺失",
-        ));
+        return Err(S7TransportError::protocol("S7_SHORT", "S7 头部缺失"));
     }
     if s7[1] != S7_ROSCTR_ACK {
         let err_class = s7.get(17).copied().unwrap_or(0);
@@ -123,10 +120,7 @@ pub fn check_ack(s7: &[u8], ctx: &str) -> Result<(), S7TransportError> {
 /// 校验 S7 报文声明长度与实际一致（param_len/data_len），供 Read/Write 共用。
 pub fn check_lengths(s7: &[u8]) -> Result<(usize, usize), S7TransportError> {
     if s7.len() < 12 {
-        return Err(S7TransportError::protocol(
-            "S7_SHORT",
-            "S7 头部缺失",
-        ));
+        return Err(S7TransportError::protocol("S7_SHORT", "S7 头部缺失"));
     }
     let param_len = u16::from_be_bytes([s7[6], s7[7]]) as usize;
     let data_len = u16::from_be_bytes([s7[8], s7[9]]) as usize;
@@ -150,8 +144,8 @@ mod tests {
         assert_eq!(
             pkt,
             vec![
-                0x03, 0x00, 0x00, 0x19, 0x02, 0xF0, 0x80, 0x32, 0x01, 0x00, 0x00, 0x00, 0x01,
-                0x00, 0x08, 0x00, 0x00, 0xF0, 0x00, 0x00, 0x01, 0x00, 0x01, 0x01, 0xE0,
+                0x03, 0x00, 0x00, 0x19, 0x02, 0xF0, 0x80, 0x32, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
+                0x08, 0x00, 0x00, 0xF0, 0x00, 0x00, 0x01, 0x00, 0x01, 0x01, 0xE0,
             ]
         );
     }

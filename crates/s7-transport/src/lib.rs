@@ -27,8 +27,8 @@ pub mod tpkt;
 pub mod write_var;
 
 pub use config::{
-    S7ConnectOptions, S7_DEFAULT_PORT, S7_MAX_RACK, S7_MAX_SLOT, S7_MIN_TIMEOUT_MS, S7_PDU_DEFAULT,
-    S7_PDU_MAX, S7_PDU_MIN, S7_TSAP_BASE, S7_TSAP_RACK_SHIFT,
+    S7_DEFAULT_PORT, S7_MAX_RACK, S7_MAX_SLOT, S7_MIN_TIMEOUT_MS, S7_PDU_DEFAULT, S7_PDU_MAX,
+    S7_PDU_MIN, S7_TSAP_BASE, S7_TSAP_RACK_SHIFT, S7ConnectOptions,
 };
 pub use cotp::{COTP_CC, COTP_CR, COTP_DATA_HEADER, COTP_DT};
 pub use error::{
@@ -37,8 +37,7 @@ pub use error::{
 };
 pub use pdu::{S7_FUNC_READ, S7_FUNC_WRITE, S7_ROSCTR_ACK, S7_ROSCTR_JOB, S7_SYNTAX_ID_S7ANY};
 pub use read_var::{
-    S7ReadVarItem, S7ReadVarResult, S7_CHUNK_SAFETY_MARGIN, S7_MAX_ITEMS_PER_PDU,
-    S7_TRANSPORT_BIT,
+    S7_CHUNK_SAFETY_MARGIN, S7_MAX_ITEMS_PER_PDU, S7_TRANSPORT_BIT, S7ReadVarItem, S7ReadVarResult,
 };
 pub use session::S7Session;
 pub use write_var::S7_WRITE_TRANSPORT_BYTE;

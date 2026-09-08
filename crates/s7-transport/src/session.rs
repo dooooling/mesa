@@ -144,7 +144,11 @@ impl S7Session {
                 .map_err(|_| {
                     S7TransportError::timeout(
                         "READ_TIMEOUT",
-                        if bulk { "Bulk Read 请求超时" } else { "Read 请求超时" },
+                        if bulk {
+                            "Bulk Read 请求超时"
+                        } else {
+                            "Read 请求超时"
+                        },
                     )
                 })?
                 .map_err(|e| map_io_error(e, "READ_SEND_FAIL"))?;
@@ -153,7 +157,11 @@ impl S7Session {
                 .map_err(|_| {
                     S7TransportError::timeout(
                         "READ_TIMEOUT",
-                        if bulk { "Bulk Read 响应超时" } else { "Read 响应超时" },
+                        if bulk {
+                            "Bulk Read 响应超时"
+                        } else {
+                            "Read 响应超时"
+                        },
                     )
                 })?
                 .map_err(|e| map_io_error(e, "READ_RECV_FAIL"))?;

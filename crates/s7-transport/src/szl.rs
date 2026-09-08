@@ -35,10 +35,7 @@ pub fn parse_szl_response(resp: &[u8], szl_id: u16) -> Result<Vec<u8>, S7Transpo
     }
     let s7 = &resp[7..];
     if s7.len() < 12 {
-        return Err(S7TransportError::protocol(
-            "SZL_S7_SHORT",
-            "SZL S7 头缺失",
-        ));
+        return Err(S7TransportError::protocol("SZL_S7_SHORT", "SZL S7 头缺失"));
     }
     if s7[1] != S7_ROSCTR_ACK && s7[1] != 0x07 {
         // NOTE: 下标用 get（抽取前为直接下标，畸形短包会 panic；此处 fail-closed）。
@@ -70,7 +67,9 @@ mod tests {
     fn szl_ack_passthrough_and_reject() {
         // S7(10 头) + 12 字节 UserData 头 + 4 字节负载：s7[12..] 原样透传 16 字节。
         let mut s7 = vec![0x32, 0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x10];
-        s7.extend_from_slice(&[0x00, 0x01, 0x12, 0x04, 0x11, 0x44, 0x01, 0x00, 0xFF, 0x09, 0x00, 0x04]);
+        s7.extend_from_slice(&[
+            0x00, 0x01, 0x12, 0x04, 0x11, 0x44, 0x01, 0x00, 0xFF, 0x09, 0x00, 0x04,
+        ]);
         s7.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
         let mut resp = vec![0x03, 0x00, 0x00, 0x00, 0x02, 0xF0, 0x80];
         resp.extend_from_slice(&s7);

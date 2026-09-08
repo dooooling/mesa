@@ -18,8 +18,8 @@ use crate::codec::S7Kind;
 use crate::s7any::{encode_bulk_item, encode_read_item, encode_write_spec};
 use mesa_core_types::ErrorKind;
 use mesa_s7_transport::{
-    S7ConnectOptions, S7Session, S7TransportError, S7TransportErrorKind,
     S7_MAX_RACK, S7_MAX_SLOT, S7_MIN_TIMEOUT_MS, S7_PDU_DEFAULT, S7_PDU_MAX, S7_PDU_MIN,
+    S7ConnectOptions, S7Session, S7TransportError, S7TransportErrorKind,
 };
 
 /// 连接参数（来自 Endpoint.connection JSON，契约与抽取前一致）。
@@ -132,7 +132,9 @@ impl S7Client {
     /// 建立连接并完成握手。失败返回带诊断的 SdkDriverError。
     pub async fn connect(cfg: S7ConnConfig) -> Result<Self, SdkDriverError> {
         let options = cfg.to_transport()?;
-        let session = S7Session::connect(options).await.map_err(map_transport_error)?;
+        let session = S7Session::connect(options)
+            .await
+            .map_err(map_transport_error)?;
         tracing::info!(
             host = %cfg.host,
             port = cfg.port,
@@ -177,7 +179,11 @@ impl S7Client {
                 let mut bytes = r.data;
                 // 防御：BIT 读取返回 1 字节 0x00/0x01，归一化（调用方常规经 BYTE 读后取位，此处仅兜底直传 BOOL 的情形）。
                 if it.kind == S7Kind::Bool {
-                    bytes = vec![if bytes.first().copied().unwrap_or(0) != 0 { 1 } else { 0 }];
+                    bytes = vec![if bytes.first().copied().unwrap_or(0) != 0 {
+                        1
+                    } else {
+                        0
+                    }];
                 }
                 Some(bytes)
             })

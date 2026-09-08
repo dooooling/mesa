@@ -122,7 +122,10 @@ mod tests {
             s7_cpu_error(0x04, "ctx").kind,
             S7TransportErrorKind::Configuration
         );
-        assert_eq!(s7_cpu_error(0x05, "ctx").kind, S7TransportErrorKind::Address);
+        assert_eq!(
+            s7_cpu_error(0x05, "ctx").kind,
+            S7TransportErrorKind::Address
+        );
         assert_eq!(
             s7_cpu_error(0x03, "ctx").kind,
             S7TransportErrorKind::Configuration

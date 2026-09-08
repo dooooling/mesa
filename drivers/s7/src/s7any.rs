@@ -9,7 +9,7 @@
 
 use crate::address::{Area, S7Address};
 use crate::codec::S7Kind;
-use mesa_s7_transport::{S7ReadVarItem, S7_SYNTAX_ID_S7ANY};
+use mesa_s7_transport::{S7_SYNTAX_ID_S7ANY, S7ReadVarItem};
 
 /// S7ANY 规范固定长度 12 字节。
 pub const S7ANY_SPEC_LEN: usize = 12;
@@ -49,7 +49,13 @@ pub fn encode_s7any(area_code: u8, db: u16, bit_addr: u32, transport: u8, req_le
 pub fn encode_read_item(addr: &S7Address, kind: S7Kind) -> S7ReadVarItem {
     let (transport, req_len) = spec_params(addr.area, kind);
     S7ReadVarItem {
-        var_spec: encode_s7any(addr.area.code(), addr.db_number, addr.bit_address(), transport, req_len),
+        var_spec: encode_s7any(
+            addr.area.code(),
+            addr.db_number,
+            addr.bit_address(),
+            transport,
+            req_len,
+        ),
         expected_data_len: kind.byte_len(),
     }
 }
@@ -62,7 +68,13 @@ pub fn encode_bulk_item(addr: &S7Address, len: usize) -> S7ReadVarItem {
         _ => (S7ANY_TRANSPORT_BYTE, len as u16),
     };
     S7ReadVarItem {
-        var_spec: encode_s7any(addr.area.code(), addr.db_number, addr.bit_address(), transport, req_len),
+        var_spec: encode_s7any(
+            addr.area.code(),
+            addr.db_number,
+            addr.bit_address(),
+            transport,
+            req_len,
+        ),
         expected_data_len: len,
     }
 }
@@ -70,7 +82,13 @@ pub fn encode_bulk_item(addr: &S7Address, len: usize) -> S7ReadVarItem {
 /// 写项规范 → 12 字节（transport/request_len 与读同口径）。
 pub fn encode_write_spec(addr: &S7Address, kind: S7Kind) -> Vec<u8> {
     let (transport, req_len) = spec_params(addr.area, kind);
-    encode_s7any(addr.area.code(), addr.db_number, addr.bit_address(), transport, req_len)
+    encode_s7any(
+        addr.area.code(),
+        addr.db_number,
+        addr.bit_address(),
+        transport,
+        req_len,
+    )
 }
 
 #[cfg(test)]
@@ -83,10 +101,18 @@ mod tests {
         // DB10.DBD20 REAL：area 0x84，db 10，bit_addr=(20*8)=160=0xA0；
         // transport BYTE(0x02)，req_len 4。
         let addr = parse_address("DB10.DBD20").unwrap();
-        let spec = encode_s7any(addr.area.code(), addr.db_number, addr.bit_address(), 0x02, 4);
+        let spec = encode_s7any(
+            addr.area.code(),
+            addr.db_number,
+            addr.bit_address(),
+            0x02,
+            4,
+        );
         assert_eq!(
             spec,
-            vec![0x12, 0x0A, 0x10, 0x02, 0x00, 0x04, 0x00, 0x0A, 0x84, 0x00, 0x00, 0xA0]
+            vec![
+                0x12, 0x0A, 0x10, 0x02, 0x00, 0x04, 0x00, 0x0A, 0x84, 0x00, 0x00, 0xA0
+            ]
         );
     }
 
