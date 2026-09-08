@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::event_ingress::{EventDrainError, IngressFatal, run_event_ingress};
 use crate::manifest::DiscoveredDriver;
 use crate::process::DriverProcess;
-use crate::session::{Session, SessionEvent};
+use crate::session::{HeartbeatParams, Session, SessionEvent};
 use crate::snapshot::{EndpointStatus, Snapshot};
 
 /// 连接级退避序列（§11.1 默认值）。当前不做上限熔断，成功后归零。
@@ -186,6 +186,8 @@ impl PointIdSource for StorePointIdSource {
 /// （drain fatal/timeout 等精确描述），`stop_endpoint` 转为显式错误。
 /// `events` 为 `None` 时为纯 Data-only 路径（EventStore 不可用或未配置时）：
 /// 不接管 EventReceiver、不起 ingress，数据面完全不受影响（v1.1 §9 隔离）。
+/// `heartbeat` 为本次运行的会话心跳参数（调用方显式给出；manager 传默认，
+/// 测试按需传 fast——不再经进程 env 隐式决定）。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_endpoint(
     disc: DiscoveredDriver,
@@ -202,6 +204,7 @@ pub async fn run_endpoint(
         >,
     >,
     events: Option<Arc<EventServices>>,
+    heartbeat: HeartbeatParams,
 ) -> Option<String> {
     let mut backoff_idx = 0usize;
     let mut id_map: HashMap<String, u32> = source.known_map(&cfg.endpoint_id);
@@ -241,6 +244,7 @@ pub async fn run_endpoint(
             &shutdown,
             &registry,
             events.as_ref(),
+            heartbeat,
         )
         .await;
         match outcome {
@@ -368,6 +372,7 @@ async fn attempt_session(
         >,
     >,
     services: Option<&Arc<EventServices>>,
+    heartbeat: HeartbeatParams,
 ) -> (AttemptOutcome, Option<EventDrainError>) {
     let mut process = match DriverProcess::spawn(disc).await {
         Ok(p) => p,
@@ -382,20 +387,25 @@ async fn attempt_session(
         }
     };
 
-    let (mut session, mut events, unresponsive_flag) =
-        match Session::connect_retry(process.port, &process.token).await {
-            Ok((s, ev, flag)) => (s, ev, flag),
-            Err(e) => {
-                process.terminate().await;
-                return (
-                    AttemptOutcome::Lost {
-                        reason: format!("connect failed: {e}"),
-                        had_running_session: false,
-                    },
-                    None,
-                );
-            }
-        };
+    let (mut session, mut events, unresponsive_flag) = match Session::connect_retry_with_heartbeat(
+        process.port,
+        &process.token,
+        heartbeat,
+    )
+    .await
+    {
+        Ok((s, ev, flag)) => (s, ev, flag),
+        Err(e) => {
+            process.terminate().await;
+            return (
+                AttemptOutcome::Lost {
+                    reason: format!("connect failed: {e}"),
+                    had_running_session: false,
+                },
+                None,
+            );
+        }
+    };
     // v1.1 §14 + P1：Event-enabled（services + 非空 event_tasks）才接管。
     // Data-only（无 services，或 tasks 为空）不 take、不 spawn——接收端随
     // Session 释放，零成本（reader 侧溢出无人消费也无人在意）。

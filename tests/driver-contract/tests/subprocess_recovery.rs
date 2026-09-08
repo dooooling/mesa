@@ -15,7 +15,7 @@ use mesa_driver_manager::endpoint::{
 };
 use mesa_driver_manager::manifest::{DiscoveredDriver, scan_drivers};
 use mesa_driver_manager::process::TERMINATE_GRACE;
-use mesa_driver_manager::session::Session;
+use mesa_driver_manager::session::{HeartbeatParams, Session};
 use mesa_driver_manager::snapshot::Snapshot;
 use tokio_util::sync::CancellationToken;
 
@@ -124,12 +124,13 @@ async fn subprocess_token_handshake_paths() {
 #[tokio::test]
 async fn driver_crash_restore_via_endpoint_runtime() {
     common::init_log();
-    // 本测试需要快速判死：20s 恢复预算按 ~2s 判死标定，生产心跳（5s/3s×3≈18s）
-    // 下必然超时。显式启用 fast heartbeat（同 event_store_faults 模式）；
-    // 同 binary 其他测试不依赖心跳时序，交叉看到 fast 也无害，故不 unset。
-    unsafe {
-        std::env::set_var("MESA_HEARTBEAT_FAST", "1");
-    }
+    // 本测试需要快速判死：20s 恢复预算按 ~2s 判死标定。心跳参数显式传入
+    // endpoint runtime（1s/1s×2），不读进程 env、不污染同进程其他测试。
+    let heartbeat = HeartbeatParams {
+        ping_period: Duration::from_secs(1),
+        pong_deadline: Duration::from_secs(1),
+        max_missed: 2,
+    };
     let snapshot = std::sync::Arc::new(Snapshot::new());
     let allocator: std::sync::Arc<dyn PointIdSource> =
         std::sync::Arc::new(PointIdAllocator::default());
@@ -169,6 +170,7 @@ async fn driver_crash_restore_via_endpoint_runtime() {
         registry,
         // Data-only（无 EventServices）：复用生产 Data 路径做 crash 恢复验证
         None,
+        heartbeat,
     ));
 
     // 第一次运行：RUNNING 且 epoch != 0，记录点集与 epoch

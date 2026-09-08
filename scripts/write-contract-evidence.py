@@ -40,7 +40,7 @@ SUITES = [
     "event_store_faults",
     # PR11 SINUMERIK Read-only V1：真子进程 Data E2E（fixture 种子，无需真机）。
     "sinumerik_data_e2e",
-    # Hotfix Stop-vs-failure lifecycle gate：driver 死亡后显式 Stop 有界显式。
+    # Hotfix Stop-during-reconnect lifecycle gate：重连退避中显式 Stop 有界显式。
     "stop_lifecycle",
 ]
 REQUIRED_SET = set(SUITES)

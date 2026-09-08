@@ -1,13 +1,16 @@
-//! Stop-vs-failure lifecycle gate：driver 死亡后显式 Stop 必须有界、结果显式。
+//! Stop-during-reconnect lifecycle gate：重连退避中显式 Stop 必须有界、结果显式。
 //!
-//! 背景：heartbeat 标记 unresponsive 会跳过 graceful Shutdown post，而 Stop
-//! barrier 的 ingress drain 是 5s fail-closed（`EVENT_DRAIN_TIMEOUT`）。当显式
-//! Stop 与 failure/session-loss 竞争时，`stop_endpoint` 必须在预算内返回显式
-//! 结论（`Ok(was_running)` 或带精确码的 `Err`），不能 hang、不能静默成功。
-//! 本文件只锁该契约，不改生产语义、不放宽任何 timeout/断言。
+//! 诚实契约（review P1）：本测试观察的是 crash 之后、teardown 已结束、
+//! snapshot 处于 RECONNECTING（退避间隙）的窗口，此时 Stop 取消退避 sleep
+//! 并等待 endpoint 任务结束。它锁的是“重连中 Stop 有界显式”，**不是**
+//! “teardown 进行中与 failure 竞争的真 race”——后者需要进程活着但 stalled
+//! 的确定性复现手段，当前没有（不造平台相关的 suspend 原语、不新增驱动
+//! 故障种类），故不在此冒充覆盖。真 race 的三段式已有各自 Gate：
+//! unresponsive 标记（fault_tolerance 会话级）、有界 drain + fail-closed
+//! 超时码（endpoint in-crate）、本测试的有界显式 Stop。
 //!
 //! 触发器用 simulator 现有 `crash_after_batches` 故障（确定性进程死亡），
-//! 不新增驱动故障种类。
+//! 不新增驱动故障种类。不改生产语义、不放宽 timeout/断言。
 
 mod common;
 mod event_common;
@@ -27,19 +30,37 @@ fn drivers_dir() -> std::path::PathBuf {
         .join("drivers")
 }
 
-/// driver 死亡后显式 Stop：40s 内必须返回显式结论，之后端点不得再运行。
+/// Stop 错误码冻结集合：`stop_endpoint` 的 `Err(String)` 必须是以下精确码之一
+/// 开头（`EventDrainError::code` / manager Join 映射），禁止空消息或未定义码。
+fn assert_frozen_stop_code(msg: &str) {
+    const FROZEN: [&str; 7] = [
+        "EVENT_DRAIN_TIMEOUT",
+        "EVENT_DRAIN_FAILED",
+        "EVENT_SEQUENCE_REGRESSION",
+        "EVENT_ID_COLLISION",
+        "EVENT_STORE_UNAVAILABLE",
+        "EVENT_RECORD_INVALID",
+        "EVENT_STREAM_CLOSED",
+    ];
+    assert!(
+        FROZEN.iter().any(|c| msg.starts_with(c)),
+        "Stop Err 必须是冻结码集合成员，实际: {msg:?}",
+    );
+}
+
+/// 重连退避中显式 Stop：40s 内必须返回显式结论，之后端点不得再运行。
 /// data 任务触发 crash（2 批即死），event 任务保证 ingress/drain 路径被执行到。
 #[tokio::test]
-async fn stop_after_driver_death_is_bounded_and_explicit() {
+async fn stop_while_reconnecting_is_bounded_and_explicit() {
     common::init_log();
-    let db = tmp_db("stop-death");
+    let db = tmp_db("stop-reconnect");
     let _ = std::fs::remove_file(&db);
     let store = std::sync::Arc::new(EventStore::open(&db).unwrap());
     let services = EventServices::new(store.clone(), EventHub::new(EVENT_HUB_CAPACITY));
     let mgr = std::sync::Arc::new(MesaManager::discover(&drivers_dir()));
     mgr.set_event_services(std::sync::Arc::clone(&services));
     let snapshot = mgr.snapshot();
-    let ep = "hd-stop-death";
+    let ep = "hd-stop-reconnect";
 
     let binding = mesa_core_types::GenericEventBinding {
         stream_id: mesa_driver_simulator::SIM_EVENT_STREAM_COUNTER.into(),
@@ -77,15 +98,15 @@ async fn stop_after_driver_death_is_bounded_and_explicit() {
     )
     .await;
 
-    // 与 failure 竞争的显式 Stop：40s（≈2× teardown 最坏预算）内必须返回，
-    // 结论显式（Ok 布尔或带码 Err），不 hang、不静默。
+    // 重连退避中显式 Stop：40s（≈2× teardown 最坏预算）内必须返回，
+    // 结论显式（Ok 布尔或冻结码 Err），不 hang、不静默。
     let res = tokio::time::timeout(Duration::from_secs(40), mgr.stop_endpoint(ep))
         .await
-        .expect("Stop 与 failure 竞争时必须有界返回");
+        .expect("重连中 Stop 必须有界返回");
     match &res {
         Ok(was_running) => eprintln!("stop outcome: Ok({was_running})"),
         Err(msg) => {
-            assert!(!msg.trim().is_empty(), "Err 必须带精确码，不能空消息");
+            assert_frozen_stop_code(msg);
             eprintln!("stop outcome: Err({msg})");
         }
     }
