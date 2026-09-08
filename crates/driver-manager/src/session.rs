@@ -185,7 +185,8 @@ impl Session {
     }
 
     /// 可显式指定心跳参数的建连重试（测试按需传入 fast 参数，不再依赖进程 env；
-    /// 生产路径一律经 [`Session::connect_retry`] 走默认语义）。
+    /// 默认心跳语义仍由 [`HeartbeatParams::default`] 定义，`connect_retry`
+    /// 与 endpoint 默认路径均经它取得——`MESA_HEARTBEAT_FAST=1` 显式覆盖能力保留）。
     pub async fn connect_retry_with_heartbeat(
         port: u16,
         expected_token: &str,

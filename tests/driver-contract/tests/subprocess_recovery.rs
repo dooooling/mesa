@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use mesa_core_types::ConnectionState;
 use mesa_driver_manager::endpoint::{
-    BuiltinEndpoint, PointIdAllocator, PointIdSource, run_endpoint,
+    BuiltinEndpoint, PointIdAllocator, PointIdSource, run_endpoint_with_heartbeat,
 };
 use mesa_driver_manager::manifest::{DiscoveredDriver, scan_drivers};
 use mesa_driver_manager::process::TERMINATE_GRACE;
@@ -161,7 +161,7 @@ async fn driver_crash_restore_via_endpoint_runtime() {
             std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<Session>>>,
         >,
     > = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-    let rt = tokio::spawn(run_endpoint(
+    let rt = tokio::spawn(run_endpoint_with_heartbeat(
         disc,
         cfg.clone(),
         snap,

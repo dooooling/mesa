@@ -186,10 +186,48 @@ impl PointIdSource for StorePointIdSource {
 /// （drain fatal/timeout 等精确描述），`stop_endpoint` 转为显式错误。
 /// `events` 为 `None` 时为纯 Data-only 路径（EventStore 不可用或未配置时）：
 /// 不接管 EventReceiver、不起 ingress，数据面完全不受影响（v1.1 §9 隔离）。
-/// `heartbeat` 为本次运行的会话心跳参数（调用方显式给出；manager 传默认，
-/// 测试按需传 fast——不再经进程 env 隐式决定）。
+///
+/// 心跳语义：本函数使用默认心跳参数（`HeartbeatParams::default()`，仍保留
+/// `MESA_HEARTBEAT_FAST=1` 显式覆盖能力）；需要显式心跳的调用方请用
+/// [`run_endpoint_with_heartbeat`]。旧签名保持不变，非 breaking。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_endpoint(
+    disc: DiscoveredDriver,
+    cfg: BuiltinEndpoint,
+    snapshot: Arc<Snapshot>,
+    source: Arc<dyn PointIdSource>,
+    shutdown: CancellationToken,
+    registry: std::sync::Arc<
+        std::sync::RwLock<
+            std::collections::HashMap<
+                String,
+                std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>,
+            >,
+        >,
+    >,
+    events: Option<Arc<EventServices>>,
+) -> Option<String> {
+    run_endpoint_with_heartbeat(
+        disc,
+        cfg,
+        snapshot,
+        source,
+        shutdown,
+        registry,
+        events,
+        HeartbeatParams::default(),
+    )
+    .await
+}
+
+/// 单个 Endpoint 的运行任务（显式心跳版）。返回即表示该 Endpoint 已停止且不再重试。
+///
+/// 返回值（P0-3）：teardown 结论。`None` = 干净；`Some(desc)` = 收尾异常
+/// （drain fatal/timeout 等精确描述），`stop_endpoint` 转为显式错误。
+/// `heartbeat` 为本次运行的会话心跳参数（调用方显式给出；测试按需传 fast，
+/// 不再经进程 env 隐式决定）。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_endpoint_with_heartbeat(
     disc: DiscoveredDriver,
     cfg: BuiltinEndpoint,
     snapshot: Arc<Snapshot>,

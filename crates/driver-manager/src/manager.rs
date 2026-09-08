@@ -9,7 +9,6 @@ use tokio_util::sync::CancellationToken;
 use crate::endpoint::{BuiltinEndpoint, PointIdAllocator, PointIdSource, run_endpoint};
 use crate::manifest::{DiscoveredDriver, scan_drivers};
 use crate::profile::load_profiles;
-use crate::session::HeartbeatParams;
 use crate::snapshot::{DriverInfo, Snapshot};
 
 /// Descriptor 缓存键（§4.5）：(driver_id, driver_version)
@@ -199,8 +198,6 @@ impl MesaManager {
             shutdown,
             registry,
             events,
-            // 生产路径：默认心跳语义（原全局 env，现显式 default）。
-            HeartbeatParams::default(),
         ));
 
         self.running
