@@ -18,6 +18,8 @@ pub use query::{EventFilter, max_seq, query_by_seq, query_history, query_range_a
 pub use retention::RetentionConfig;
 pub use schema::{EVENT_SCHEMA_VERSION, StoredEvent, transition_str};
 #[cfg(feature = "test-hooks")]
+pub use writer::CommitGateHandle;
+#[cfg(feature = "test-hooks")]
 pub use writer::StoreFaults;
 pub use writer::{CommitRequest, CommitResult, EventStoreStats};
 
@@ -260,6 +262,12 @@ impl From<CanonicalError> for EventStoreError {
 
 /// PRAGMA 与连接调优（v1.1 冻结常量）。
 const BUSY_TIMEOUT_MS: i64 = 5000;
+
+/// SQLite busy 上限（跨 crate 契约锚点）：writer 线程内单次 SQL 等待锁的
+/// 最坏时间。Stop drain 的外层预算必须严格覆盖它（见 driver-manager
+/// `shutdown_ingress` 的可组合预算推导）；外层 timer 若与该值同长，
+/// 超时契约即不可组合——正常偏慢的 commit 会被误判为 drain 失败。
+pub const EVENT_STORE_BUSY_TIMEOUT_MS: i64 = BUSY_TIMEOUT_MS;
 
 fn tune_connection(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(&format!(

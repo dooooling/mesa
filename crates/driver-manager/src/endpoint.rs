@@ -490,26 +490,19 @@ async fn attempt_session(
     match config_res {
         Ok(()) => {}
         Err(outcome) => {
-            // 配置失败：ingress 若已 spawn（Start 前）优雅停下，避免无主消费；
-            // drain 结论一并带出（P0-3，次级错误不覆盖主 outcome）
-            let drain_err = shutdown_ingress(ingress_shutdown.clone(), ingress)
-                .await
-                .err();
-            // P0-2 Final：配置失败也可能已 Start（部分成功），先 post Shutdown
-            // 再走 terminate_after_shutdown——stdin 保持 OPEN 让 SDK 自然退出；
-            // 若 driver 根本没起来，Phase 1 超时后 emergency EOF 兜底。
-            {
-                let sess = session_arc.lock().await;
-                if !sess.is_unresponsive() {
-                    let _ = sess.post(pb_shutdown_body()).await;
-                }
-            }
-            {
-                let mut sess = session_arc.lock().await;
-                sess.invalidate();
-            }
-            registry.write().unwrap().remove(&cfg.endpoint_id);
-            process.terminate_after_shutdown().await;
+            // 配置失败走统一 teardown（producer-stop → terminate → reader
+            // barrier → drain，与正常 Stop 同一原语；drain 结论一并带出，
+            // P0-3，次级错误不覆盖主 outcome）。
+            let drain_err = teardown_attempt(
+                &cfg.endpoint_id,
+                &session_arc,
+                &mut process,
+                ingress_shutdown,
+                ingress,
+                events,
+                std::sync::Arc::clone(registry),
+            )
+            .await;
             return (outcome, drain_err);
         }
     }
@@ -535,50 +528,32 @@ async fn attempt_session(
     )
     .await;
 
-    // ⑨ Stop barrier（真 barrier，不是 sleep）：Shutdown-post →
-    // terminate_after_shutdown → 等 reader 结束 → 再 drain ingress。
-    // P0-2 Final：terminate_after_shutdown 在 Phase 1 保持 stdin OPEN——SDK
-    // 侧 Shutdown RPC → run tasks 停 → writer drain → TCP FIN → 自然退出；
-    // liveness guard 不抢跑。reader 把 FIN 之前全部字节 pump 进 channel 后
-    // 结束（TCP 有序性保证）。reader 是事件 channel 的唯一生产者 ⇒ reader
-    // 结束时"已进入 Core 的旧 epoch Event"已全部在 channel 里；此时再
-    // cancel ingress 做 final drain，零窗口（旧顺序 cancel-first 下，drain
-    // 与 driver 停产之间在途批次会落入无人消费的 channel 而静默丢失）。
+    // ⑨ Stop barrier（真 barrier，不是 sleep，见 `teardown_attempt`）：
+    // Shutdown-post → terminate_after_shutdown → 等 reader 结束 → 再 drain
+    // ingress。P0-2 Final：terminate_after_shutdown 在 Phase 1 保持 stdin
+    // OPEN——SDK 侧 Shutdown RPC → run tasks 停 → writer drain → TCP FIN →
+    // 自然退出；liveness guard 不抢跑。reader 把 FIN 之前全部字节 pump 进
+    // channel 后结束（TCP 有序性保证）。reader 是事件 channel 的唯一生产者
+    // ⇒ reader 结束时"已进入 Core 的旧 epoch Event"已全部在 channel 里；
+    // 此时再 cancel ingress 做 final drain，零窗口（旧顺序 cancel-first 下，
+    // drain 与 driver 停产之间在途批次会落入无人消费的 channel 而静默丢失）。
     // Phase 1 超时（顽固对端）→ emergency EOF → reader 5s 未结束 →
     // 超时降级 drain 现有（等价旧行为）。50ms sleep 已删除：等的对象是
     // "reader 结束"这个条件，不是时长。
     // P0-3 teardown 总预算（全有界，Manager 直接 await，无外层超时）：
-    // graceful 5s（+ emergency 后 terminate 5s）+ reader barrier 5s +
-    // ingress drain 5s ≈ 20s worst-case，正常路径百 ms 内。
-    // 超时/失败经 drain_err 显式上报。
-    {
-        let sess = session_arc.lock().await;
-        if !sess.is_unresponsive() {
-            let _ = sess.post(pb_shutdown_body()).await;
-        }
-    }
-    process.terminate_after_shutdown().await;
-    {
-        let sess = session_arc.lock().await;
-        if !sess.wait_reader_done(Duration::from_secs(5)).await {
-            tracing::warn!(
-                endpoint = %cfg.endpoint_id,
-                "reader did not finish after terminate, draining what arrived"
-            );
-        }
-    }
-    // ingress 收尾：优雅取消（当前 commit+publish 必完整执行，见
-    // run_event_ingress），杜绝"DB 已有但 Hub 未发布"的静默缺口。
-    // barrier 已达成时 final drain 提交的即 channel 全部，无遗弃。
-    // P0-3：drain 结论显式带出（fatal/timeout），不再吞错。
-    let drain_err = shutdown_ingress(ingress_shutdown, ingress).await.err();
-
-    {
-        let mut sess = session_arc.lock().await;
-        sess.invalidate();
-    }
-    registry.write().unwrap().remove(&cfg.endpoint_id);
-    drop(events);
+    // post 5s + terminate 10s + reader barrier 5s +
+    // ingress drain 15s（可组合预算，见 `INGRESS_DRAIN_TIMEOUT`）≈ 35s
+    // worst-case，正常路径百 ms 内。超时/失败经 drain_err 显式上报。
+    let drain_err = teardown_attempt(
+        &cfg.endpoint_id,
+        &session_arc,
+        &mut process,
+        ingress_shutdown,
+        ingress,
+        events,
+        std::sync::Arc::clone(registry),
+    )
+    .await;
     (outcome, drain_err)
 }
 
@@ -586,14 +561,95 @@ fn pb_shutdown_body() -> pb::envelope::Body {
     pb::envelope::Body::Shutdown(pb::Shutdown {})
 }
 
+/// ingress drain 外层预算（可组合推导，非魔法数字）：
+/// 必须严格覆盖 writer 线程内最坏情况（单次 in-flight commit 的 busy 上限
+/// [`mesa_event_store::EVENT_STORE_BUSY_TIMEOUT_MS`]），再加密封 backlog
+/// 排空 + 调度余量。外层 timer 若与内层最坏同长，正常偏慢的成功路径会被
+/// 误判为 `EVENT_DRAIN_TIMEOUT`（main CI #103 实证：在途 commit + Windows
+/// 调度抖动 idle 耗尽 5s，timer 先赢）。超时分支保留为真磁盘 hang 的
+/// 大声失败兜底，不代表成功。
+const INGRESS_DRAIN_TIMEOUT: Duration = Duration::from_millis(
+    mesa_event_store::EVENT_STORE_BUSY_TIMEOUT_MS as u64 + INGRESS_DRAIN_MARGIN_MS,
+);
+/// 余量：reader barrier 达成后 backlog 有限（生产者已停），覆盖其排空 +
+/// Tokio/Windows 调度抖动。病态 backlog（通道上限 128 批全慢）超出本预算时
+/// 走大声 `EVENT_DRAIN_TIMEOUT`，不静默——预算覆盖现实最坏，不覆盖病态。
+const INGRESS_DRAIN_MARGIN_MS: u64 = 10_000;
+
+/// producer-stop 请求有界等待：Shutdown post 只是停产请求（best-effort），
+/// 超时则直接进入 terminate（terminate 兜底一切：grace → emergency EOF →
+/// 强杀）；post 自身不得成为 teardown 链中的无界 await（此前形式上无界，
+/// `terminate_after_shutdown` 之前存在无限等待窗口）。
+const SHUTDOWN_POST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 统一 teardown 原语（producer-stop → bounded terminate → reader barrier → drain → cleanup）。
+///
+/// 所有 attempt 退出路径（正常 Stop / Lost 重连 / 配置失败 / heartbeat 判死）
+/// 共用同一顺序；区别仅在于主 outcome 如何上报，drain 次级结论随返回值带出
+/// （不覆盖主 outcome）。此前配置失败路径是"drain 先于 producer stop"的第二套
+/// 顺序，已收敛到此：producer 未停时 drain 面对的不是密封输入，排空语义不成立。
+///
+/// 顺序契约（对应 `reader_done → 无新生产 → in-flight 完成 → 队列排空 → drain ACK`）：
+/// 1. 能响应则 post Shutdown（生产者停产；unresponsive 时跳过；
+///    post 本身 [`SHUTDOWN_POST_TIMEOUT`] 有界，超时直接进入 terminate）；
+/// 2. `terminate_after_shutdown`（graceful 5s + emergency 后 terminate 5s）；
+/// 3. `wait_reader_done` barrier 5s（超时降级：drain 已到达者）；
+/// 4. `shutdown_ingress`（in-flight commit 完成 + 密封 backlog 排空 + Hub 发布）；
+/// 5. session 失效 + 注册表摘除 + 事件接收端释放。
+///
+/// 总预算严格有界 ≈ post 5 + terminate 10 + reader 5 + drain 15 ≈ 35s 最坏，
+/// 正常路径百 ms 内；超时/失败经返回值显式上报。
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+async fn teardown_attempt(
+    endpoint_id: &str,
+    session_arc: &Arc<tokio::sync::Mutex<Session>>,
+    process: &mut DriverProcess,
+    ingress_shutdown: CancellationToken,
+    ingress: Option<tokio::task::JoinHandle<Result<(), IngressFatal>>>,
+    events: tokio::sync::mpsc::Receiver<SessionEvent>,
+    registry: Arc<std::sync::RwLock<HashMap<String, Arc<tokio::sync::Mutex<Session>>>>>,
+) -> Option<EventDrainError> {
+    {
+        let sess = session_arc.lock().await;
+        if !sess.is_unresponsive() {
+            // Best-effort 停产请求：有界等待，超时/失败都直接进入 terminate。
+            let _ =
+                tokio::time::timeout(SHUTDOWN_POST_TIMEOUT, sess.post(pb_shutdown_body())).await;
+        }
+    }
+    process.terminate_after_shutdown().await;
+    {
+        let sess = session_arc.lock().await;
+        if !sess.wait_reader_done(Duration::from_secs(5)).await {
+            tracing::warn!(
+                endpoint = %endpoint_id,
+                "reader did not finish after terminate, draining what arrived"
+            );
+        }
+    }
+    let drain_err = shutdown_ingress(ingress_shutdown, ingress).await.err();
+    {
+        let mut sess = session_arc.lock().await;
+        sess.invalidate();
+    }
+    registry.write().unwrap().remove(endpoint_id);
+    drop(events);
+    drain_err
+}
+
 /// ingress 优雅停机（Checkpoint B 方案 A + ⑨ final drain + P0-3）：
-/// 先 cancel（当前 commit+publish 完整执行 + final drain 排空），5s 内未退出
-/// 才 abort（磁盘 hang 等极端情况）。
+/// 先 cancel（当前 commit+publish 完整执行 + final drain 排空），
+/// [`INGRESS_DRAIN_TIMEOUT`] 内未退出才 abort（磁盘 hang 等极端情况）。
 ///
 /// P0-3：返回显式结果，禁止吞错——drain 中的精确失败（collision/unavailable/
-/// regression）与 5s 超时（abort 时 backlog 可能根本未 COMMIT，既无 DB 行
+/// regression）与超时（abort 时 backlog 可能根本未 COMMIT，既无 DB 行
 /// 也无 Hub 行）都必须向上传播，由 `stop_endpoint` 转为显式错误；
 /// "Stop 返回成功但后台仍在跑"（detach-success）在此终结。
+///
+/// 残余诚实声明：abort 不能撤回已送达 writer 线程的 commit（命令一旦发送，
+/// writer 侧仍会执行并 COMMIT，只是 reply 无人接收、Hub 不再发布）。
+/// 因此超时后可能出现"DB 有行而 Hub 未发布"的缺口——本函数以显式
+/// `EVENT_DRAIN_TIMEOUT` 大声报告，不伪装成功；调用方不得把该错误当成功吞掉。
 async fn shutdown_ingress(
     cancel: CancellationToken,
     ingress: Option<tokio::task::JoinHandle<Result<(), IngressFatal>>>,
@@ -610,8 +666,11 @@ async fn shutdown_ingress(
             Ok(Err(fatal)) => Err(EventDrainError::Fatal(fatal)),
             Err(join) => Err(EventDrainError::Join(join.to_string())),
         },
-        _ = tokio::time::sleep(Duration::from_secs(5)) => {
-            tracing::error!("event ingress did not exit in 5s, aborting");
+        _ = tokio::time::sleep(INGRESS_DRAIN_TIMEOUT) => {
+            tracing::error!(
+                "event ingress did not exit in {:?}, aborting",
+                INGRESS_DRAIN_TIMEOUT
+            );
             h.abort();
             let _ = h.await;
             Err(EventDrainError::Timeout)
@@ -989,8 +1048,9 @@ mod tests {
         assert_eq!(err.code(), "EVENT_ID_COLLISION");
     }
 
-    /// P0-3：drain 5s 未退出 → EVENT_DRAIN_TIMEOUT（abort 已执行，不 detach）。
-    /// 5s 固定开销：P0 headline 行为值得一次慢断言（suite 内已有 30s 级用例）。
+    /// P0-3：drain 超时（[`INGRESS_DRAIN_TIMEOUT`]）→ EVENT_DRAIN_TIMEOUT
+    ///（abort 已执行，不 detach）。固定开销一次慢断言（suite 内已有 30s 级用例）。
+    /// 超时码本身是冻结契约，时长是可组合预算——改预算不改码。
     #[tokio::test]
     async fn shutdown_ingress_timeout_is_explicit_error() {
         let h = tokio::spawn(async {
