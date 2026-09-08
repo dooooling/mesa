@@ -12,9 +12,10 @@
 mod address;
 pub mod client; // Common SZL 直连诊断需对外暴露（V1 只读，不影响 Core 隔离）
 mod codec;
+mod s7any;
 
 pub use address::{S7Address, parse_address};
-pub use codec::{decode_value, parse_data_type};
+pub use codec::{S7Kind, decode_value, parse_data_type};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +33,6 @@ pub const BINDING_KIND: &str = "s7.address-group";
 
 use address::AddressError;
 use client::{ReadItem, S7Client, S7ConnConfig};
-use codec::S7Kind;
 
 #[derive(Default)]
 pub struct S7Driver;

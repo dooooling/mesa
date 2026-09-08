@@ -15,6 +15,7 @@ members = [
     "drivers/opcua",
     "drivers/sinumerik",
     "crates/opcua-transport",
+    "crates/s7-transport",
     "tests/driver-contract",
     "tests/performance",
 ]
@@ -34,6 +35,7 @@ mesa-config-store = { path = "crates/config-store" }
 mesa-event-store = { path = "crates/event-store" }
 mesa-core-api = { path = "crates/core-api" }
 mesa-opcua-transport = { path = "crates/opcua-transport" }
+mesa-s7-transport = { path = "crates/s7-transport" }
 
 rusqlite = { version = "0.32", features = ["bundled"] }
 

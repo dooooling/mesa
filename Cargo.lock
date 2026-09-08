@@ -1455,6 +1455,7 @@ dependencies = [
  "bytes",
  "mesa-core-types",
  "mesa-driver-sdk",
+ "mesa-s7-transport",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -1551,6 +1552,15 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mesa-s7-transport"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
