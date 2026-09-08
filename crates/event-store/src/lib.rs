@@ -297,6 +297,8 @@ pub struct EventStore {
     writer_tx: tokio::sync::mpsc::Sender<writer::WriteCommand>,
     reader: Arc<Mutex<Connection>>,
     writer_join: Option<std::thread::JoinHandle<()>>,
+    /// writer 线程 commit 执行耗时最大值 ns（不含队列等待；stall 位置判定）。
+    writer_commit_latency_max_ns: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl EventStore {
@@ -355,15 +357,25 @@ impl EventStore {
         };
 
         let (tx, rx) = tokio::sync::mpsc::channel(writer::WRITER_QUEUE);
+        let writer_commit_latency_max_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let latency_probe = Arc::clone(&writer_commit_latency_max_ns);
         let join = std::thread::Builder::new()
             .name("event-store-writer".into())
-            .spawn(move || writer::writer_loop(write_conn, rx))
+            .spawn(move || writer::writer_loop(write_conn, rx, latency_probe))
             .map_err(|e| EventStoreError::Unavailable(format!("spawn writer: {e}")))?;
         Ok(Self {
             writer_tx: tx,
             reader: Arc::new(Mutex::new(read_conn)),
             writer_join: Some(join),
+            writer_commit_latency_max_ns,
         })
+    }
+
+    /// writer 线程 commit 执行耗时最大值 ns（不含队列等待；与 ingress 侧
+    /// `ingress_commit_latency_max_ns`（含等待）对照即得 stall 位置）。
+    pub fn writer_commit_latency_max_ns(&self) -> u64 {
+        self.writer_commit_latency_max_ns
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 打开（不存在则创建）文件库。
@@ -538,6 +550,11 @@ pub struct EventDiagnostics {
     pub ingress_collisions_total: std::sync::atomic::AtomicU64,
     pub ingress_invalid_total: std::sync::atomic::AtomicU64,
     pub ingress_store_failures_total: std::sync::atomic::AtomicU64,
+    /// 最近一次 `commit_batch()` 耗时 ns（队列等待 + writer 执行；
+    /// stall 时长定位的第一证据；单调时钟测量）。
+    pub ingress_commit_latency_last_ns: std::sync::atomic::AtomicU64,
+    /// 历史最大 commit 耗时 ns（单调；容量公式 STALL 输入的实证来源）。
+    pub ingress_commit_latency_max_ns: std::sync::atomic::AtomicU64,
     pub retention_purged_total: std::sync::atomic::AtomicU64,
 }
 

@@ -57,10 +57,21 @@ impl Default for HeartbeatParams {
 /// 上行事件容量。控制类事件不允许静默丢弃，消费端必须活跃；
 /// 容量仅作瞬时洪峰缓冲，溢出计入诊断计数。
 pub const EVENT_CAPACITY: usize = 1024;
-/// 事件批次通道容量（Event Plane V1 §12）：与 Driver SDK 侧 EVENT_CAPACITY(128)
-/// 对等。事件流是独立可靠流——满队列意味着消费端已死，reader 按 fail-closed
-/// 关闭整条事件流（见 [`Session::event_stream_failed`]），绝不静默丢弃。
-pub const EVENT_BATCH_CAPACITY: usize = 128;
+/// 事件批次通道容量（Event Plane V1 §12）：推导值，非经验数字。
+/// 容量公式为 `MAX_SUSTAINED_EVENT_RATE × MAX_COMMIT_STALL × SAFETY_FACTOR`，
+/// 即 50/s × 5s × 2 = 500 → 取 512。其中 RATE 50/s 是 V1 事件面持续速率
+/// SLO（`exact_500_events_pipeline_exact_within_budget` 精确 Gate 实证：
+/// 500 个 occurrence 在 10s budget 内精确落盘；soak/pressure 的 20/s 只是
+/// 基线负载，不是上限；100/s 在 CI 硬件上只能发出约 62/s，
+/// 不得作为 SLO 输入）；STALL 5s 是单次 commit 最坏（SQLite busy 上限，见
+/// [`mesa_event_store::EVENT_STORE_BUSY_TIMEOUT_MS`]）；SAFETY 2 是调度与
+/// Windows 磁盘抖动余量。
+/// 公式内负载下 overflow 即 bug；超出（持续 >50/s 或 >10s 级 stall）才允许
+/// `EVENT_STREAM_CLOSED` fail-closed（`exact_capacity_plus_one_overflow_is_loud`
+/// 精确 Gate 实证分界：512 全活 / 513 必死）。
+/// 事件流是独立可靠流——满队列时 reader 按 fail-closed 关闭整条事件流
+/// （见 [`Session::event_stream_failed`]），绝不静默丢弃。
+pub const EVENT_BATCH_CAPACITY: usize = 512;
 
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
@@ -105,6 +116,70 @@ pub enum SessionError {
     EventPlaneUnsupported { negotiated: u32, required: u32 },
 }
 
+/// 临时操作启动阶段（Core 可观测粒度）：startup transport 失败时直接定位
+/// 死在哪，不再只看 "Connection reset" 猜。各阶段见证方不同：
+/// Spawn/Bind 由进程管理侧（`DriverProcess::spawn` 内租约+exec）见证，
+/// Connect/Hello/Welcome 由本模块建连路径见证，Rpc 由调用方（probe 等）
+/// 的各 RPC 变体隐式见证（`InvalidInput`/`Rpc`/`RpcTimeout` 即阶段）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupStage {
+    /// 子进程 spawn + 可执行体启动（`SpawnError::MissingBinary/Io/Job`）。
+    Spawn,
+    /// IPC 端口租约获取（`SpawnError::NoPort`；bind(:0) 取号 + 跨进程声明）。
+    Bind,
+    /// TCP 连接建立（拒绝/超时/重置属启动窗口预期，可退避重试）。
+    Connect,
+    /// Driver 首帧 Hello 的到达与校验（token/版本协商语义失败不得重试，
+    /// transport 重置属对端启动期死亡，可整个 attempt 重建）。
+    Hello,
+    /// Welcome 回写（写失败即 transport 失败）。
+    Welcome,
+    /// 握手后 RPC（OpenConnection/Probe/Close 等，见调用方精确变体）。
+    Rpc,
+}
+
+impl std::fmt::Display for StartupStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            StartupStage::Spawn => "spawn",
+            StartupStage::Bind => "bind",
+            StartupStage::Connect => "connect",
+            StartupStage::Hello => "hello",
+            StartupStage::Welcome => "welcome",
+            StartupStage::Rpc => "rpc",
+        };
+        f.write_str(s)
+    }
+}
+
+/// 带阶段的建连失败：`source` 保持原 [`SessionError`] 语义（调用方已有匹配
+/// 不动），`stage` 说明死在启动链哪一环。Management Plane 据此决定：
+/// transport 瞬态（Io/Timeout/Protocol(Io) 于 Connect/Hello/Welcome）
+/// 可 kill 后整个 attempt 重建；语义失败（token/版本/解码）一次判死。
+#[derive(Debug)]
+pub struct ConnectError {
+    pub stage: StartupStage,
+    pub source: SessionError,
+}
+
+impl ConnectError {
+    fn new(stage: StartupStage, source: SessionError) -> Self {
+        Self { stage, source }
+    }
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "connect failed at {}: {}", self.stage, self.source)
+    }
+}
+
+impl std::error::Error for ConnectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 struct Shared {
     /// msg_id -> 等待响应的 sender。请求方登记，reader 分发。
     pending: Mutex<HashMap<u64, oneshot::Sender<pb::Envelope>>>,
@@ -123,6 +198,12 @@ struct Shared {
     event_stream_dead: AtomicBool,
     /// 因溢出被拒绝的 EventBatch 数（流已死后不再计数， incidental）。
     event_overflow_drops: AtomicU64,
+    /// 事件队列深度（发送侧采样快照，非实时值：只在成功 `try_send` 后更新，
+    /// 消费端 dequeue 不回写；发送间隙只减不增，故为保守上界估计。
+    /// 精确批量测试用它做"全部到达"见证；`high_water` 做单调最大值）。
+    event_queue_depth_last_sample: AtomicU64,
+    /// 事件队列高水位（单调：历史最大深度；overflow 调查的第一证据）。
+    event_queue_high_water: AtomicU64,
     /// 解码失败被丢弃的 EventBatch 数（单批损坏可观测：下游 sequence gap 会如实反映）。
     event_decode_errors: AtomicU64,
     /// Core 侧事件 epoch 门（P0 barrier）：handle -> 当前活跃 stream_epoch。
@@ -192,33 +273,57 @@ impl Session {
         expected_token: &str,
         hb: HeartbeatParams,
     ) -> Result<(Self, mpsc::Receiver<SessionEvent>, Arc<AtomicBool>), SessionError> {
+        Self::connect_retry_with_stage(port, expected_token, hb)
+            .await
+            .map_err(|e| e.source)
+    }
+
+    /// 带阶段的建连重试：与 [`Session::connect_retry_with_heartbeat`] 同一
+    /// 重试语义（仅顶层连接拒绝/超时/重置退避），失败携带 [`StartupStage`]。
+    /// Management Plane 据此做 attempt 级重建决策；endpoint 运行时不使用
+    /// （其重连循环在 attempt 层已有退避，此处 stage 仅供诊断）。
+    pub async fn connect_retry_with_stage(
+        port: u16,
+        expected_token: &str,
+        hb: HeartbeatParams,
+    ) -> Result<(Self, mpsc::Receiver<SessionEvent>, Arc<AtomicBool>), ConnectError> {
         let deadline = tokio::time::Instant::now() + DRIVER_STARTUP_TIMEOUT;
         #[allow(unused_assignments)]
-        let mut last: Option<SessionError> = None;
+        let mut last: Option<ConnectError> = None;
         loop {
-            match Self::connect_with_heartbeat(port, expected_token, hb).await {
+            match Self::connect_with_stage(port, expected_token, hb).await {
                 Ok(v) => return Ok(v),
-                Err(SessionError::Io(e))
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::ConnectionRefused
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    last = Some(SessionError::Io(e));
+                Err(e) => {
+                    // 仅顶层连接拒绝/超时/重置退避（listen 窗口期）；包在
+                    // Protocol 里的 Io（accept 后对端死亡）同一进程重试无意义
+                    // （accept-once），直接返回，由调用方整个 attempt 重建。
+                    let retryable = match &e.source {
+                        SessionError::Io(io) => matches!(
+                            io.kind(),
+                            std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::ConnectionReset
+                        ),
+                        _ => false,
+                    };
+                    if !retryable {
+                        return Err(e);
+                    }
+                    last = Some(e);
                     if tokio::time::Instant::now() >= deadline {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                Err(e) => return Err(e),
             }
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
         }
-        Err(last.unwrap_or(SessionError::Timeout))
+        Err(last.unwrap_or(ConnectError::new(
+            StartupStage::Connect,
+            SessionError::Timeout,
+        )))
     }
 
     /// 建立到 Driver IPC 端口的连接并完成握手（默认心跳参数）。
@@ -228,7 +333,6 @@ impl Session {
     ) -> Result<(Self, mpsc::Receiver<SessionEvent>, Arc<AtomicBool>), SessionError> {
         Self::connect_with_heartbeat(port, expected_token, HeartbeatParams::default()).await
     }
-
     /// [`Session::connect`] 的心跳参数覆盖变体：合同测试以短周期验证判死路径，
     /// 避免真实 5s×3 的等待。
     ///
@@ -242,27 +346,58 @@ impl Session {
         expected_token: &str,
         hb: HeartbeatParams,
     ) -> Result<(Self, mpsc::Receiver<SessionEvent>, Arc<AtomicBool>), SessionError> {
+        Self::connect_with_stage(port, expected_token, hb)
+            .await
+            .map_err(|e| e.source)
+    }
+
+    /// 带阶段的建连（`connect_with_heartbeat` 的 stage 显式版）：失败携带
+    /// [`StartupStage`]，成功语义与返回值与旧函数逐字一致。
+    /// Hello 读超时报告为 [`SessionError::Timeout`]（语义真相：对端未在
+    /// 5s 内说话；此前是 `Handshake("hello timeout")` 字符串，无调用方
+    /// 匹配该文本，改为变体后调用方可用变体精确路由）。
+    pub async fn connect_with_stage(
+        port: u16,
+        expected_token: &str,
+        hb: HeartbeatParams,
+    ) -> Result<(Self, mpsc::Receiver<SessionEvent>, Arc<AtomicBool>), ConnectError> {
         let stream = tokio::time::timeout(
             Duration::from_secs(3),
             tokio::net::TcpStream::connect(("127.0.0.1", port)),
         )
         .await
-        .map_err(|_| SessionError::Timeout)?
-        .map_err(SessionError::Io)?;
+        .map_err(|_| ConnectError::new(StartupStage::Connect, SessionError::Timeout))?
+        .map_err(|e| ConnectError::new(StartupStage::Connect, SessionError::Io(e)))?;
 
         let (mut rd, mut wr) = stream.into_split();
 
         // ---- 读 Hello 并校验 ----
-        let hello_env = tokio::time::timeout(Duration::from_secs(5), read_envelope(&mut rd))
-            .await
-            .map_err(|_| SessionError::Handshake("hello timeout".into()))??;
+        let hello_env =
+            match tokio::time::timeout(Duration::from_secs(5), read_envelope(&mut rd)).await {
+                Err(_) => {
+                    return Err(ConnectError::new(
+                        StartupStage::Hello,
+                        SessionError::Timeout,
+                    ));
+                }
+                Ok(inner) => inner
+                    .map_err(|e| ConnectError::new(StartupStage::Hello, SessionError::from(e)))?,
+            };
         let hello = match hello_env.body {
             Some(pb::envelope::Body::Hello(h)) => h,
-            _ => return Err(SessionError::Handshake("first frame must be Hello".into())),
+            _ => {
+                return Err(ConnectError::new(
+                    StartupStage::Hello,
+                    SessionError::Handshake("first frame must be Hello".into()),
+                ));
+            }
         };
         // 本地回环场景 token 为一次性随机值，直接比较足够（NOTE: 非常数时间比较）
         if hello.session_token != expected_token {
-            return Err(SessionError::Handshake("token mismatch".into()));
+            return Err(ConnectError::new(
+                StartupStage::Hello,
+                SessionError::Handshake("token mismatch".into()),
+            ));
         }
         let (_, negotiated_minor) = negotiate(
             (hello.protocol_major, hello.protocol_minor),
@@ -271,7 +406,9 @@ impl Session {
                 mesa_driver_protocol::PROTOCOL_MINOR,
             ),
         )
-        .map_err(|e| SessionError::Handshake(e.to_string()))?;
+        .map_err(|e| {
+            ConnectError::new(StartupStage::Hello, SessionError::Handshake(e.to_string()))
+        })?;
 
         // ---- 回 Welcome（协商 Minor 取双方较小值，必须如实回告）----
         // 1.2 老驱动靠 accepted_protocol_minor 知道自己被当作 1.2 对待；
@@ -285,7 +422,9 @@ impl Session {
                 accepted_protocol_minor: negotiated_minor,
             })),
         };
-        write_envelope(&mut wr, &welcome).await?;
+        write_envelope(&mut wr, &welcome)
+            .await
+            .map_err(|e| ConnectError::new(StartupStage::Welcome, SessionError::from(e)))?;
 
         tracing::info!(
             driver = %hello.driver_id,
@@ -306,6 +445,8 @@ impl Session {
             dropped_events: AtomicU64::new(0),
             event_stream_dead: AtomicBool::new(false),
             event_overflow_drops: AtomicU64::new(0),
+            event_queue_depth_last_sample: AtomicU64::new(0),
+            event_queue_high_water: AtomicU64::new(0),
             event_decode_errors: AtomicU64::new(0),
             active_event_epochs: Mutex::new(HashMap::new()),
             pending_event_starts: Mutex::new(HashMap::new()),
@@ -402,6 +543,18 @@ impl Session {
     /// 因溢出被拒绝的 EventBatch 数（诊断用）。
     pub fn event_overflow_drops(&self) -> u64 {
         self.shared.event_overflow_drops.load(Ordering::Relaxed)
+    }
+
+    /// 事件队列深度快照（发送侧采样，非实时值；精确批量测试的到达见证）。
+    pub fn event_queue_depth_last_sample(&self) -> u64 {
+        self.shared
+            .event_queue_depth_last_sample
+            .load(Ordering::Relaxed)
+    }
+
+    /// 事件队列高水位（单调；overflow 调查的第一证据）。
+    pub fn event_queue_high_water(&self) -> u64 {
+        self.shared.event_queue_high_water.load(Ordering::Relaxed)
     }
 
     /// 解码失败被丢弃的 EventBatch 数（诊断用；下游 sequence gap 如实反映缺失）。
@@ -839,7 +992,20 @@ async fn reader_loop(mut rd: OwnedReadHalf, shared: Arc<Shared>, cancel: Cancell
                     match guard.as_ref().map(|tx| tx.try_send(batch)) {
                         // 流已死（发送端已 take）：拒绝后续批次
                         None => {}
-                        Some(Ok(())) => {}
+                        Some(Ok(())) => {
+                            // 深度/水位采样（发送侧唯一可观测点；消费侧在
+                            // ingress，无 Shared 视野，故为发送时刻快照）。
+                            if let Some(tx) = guard.as_ref() {
+                                let depth =
+                                    (EVENT_BATCH_CAPACITY.saturating_sub(tx.capacity())) as u64;
+                                shared
+                                    .event_queue_depth_last_sample
+                                    .store(depth, Ordering::Relaxed);
+                                shared
+                                    .event_queue_high_water
+                                    .fetch_max(depth, Ordering::Relaxed);
+                            }
+                        }
                         Some(Err(mpsc::error::TrySendError::Full(_))) => {
                             // fail-closed：满队列 = 消费端已死。丢了多少条不可观测，
                             // sequence gap 已失去意义——丢弃发送端关闭整条流并置位，
@@ -1055,6 +1221,8 @@ mod tests {
                 dropped_events: AtomicU64::new(0),
                 event_stream_dead: AtomicBool::new(false),
                 event_overflow_drops: AtomicU64::new(0),
+                event_queue_depth_last_sample: AtomicU64::new(0),
+                event_queue_high_water: AtomicU64::new(0),
                 event_decode_errors: AtomicU64::new(0),
                 active_event_epochs: Mutex::new(HashMap::new()),
                 pending_event_starts: Mutex::new(HashMap::new()),
@@ -1340,6 +1508,8 @@ mod tests {
             dropped_events: AtomicU64::new(0),
             event_stream_dead: AtomicBool::new(false),
             event_overflow_drops: AtomicU64::new(0),
+            event_queue_depth_last_sample: AtomicU64::new(0),
+            event_queue_high_water: AtomicU64::new(0),
             event_decode_errors: AtomicU64::new(0),
             active_event_epochs: Mutex::new(HashMap::from([(HANDLE, EPOCH)])),
             pending_event_starts: Mutex::new(HashMap::new()),
@@ -1455,6 +1625,8 @@ mod tests {
             dropped_events: AtomicU64::new(0),
             event_stream_dead: AtomicBool::new(false),
             event_overflow_drops: AtomicU64::new(0),
+            event_queue_depth_last_sample: AtomicU64::new(0),
+            event_queue_high_water: AtomicU64::new(0),
             event_decode_errors: AtomicU64::new(0),
             active_event_epochs: Mutex::new(HashMap::from([(HANDLE, EPOCH)])),
             pending_event_starts: Mutex::new(HashMap::new()),
@@ -1623,6 +1795,8 @@ mod tests {
                     dropped_events: AtomicU64::new(0),
                     event_stream_dead: AtomicBool::new(false),
                     event_overflow_drops: AtomicU64::new(0),
+                    event_queue_depth_last_sample: AtomicU64::new(0),
+                    event_queue_high_water: AtomicU64::new(0),
                     event_decode_errors: AtomicU64::new(0),
                     active_event_epochs: Mutex::new(HashMap::from([(HANDLE, epoch)])),
                     pending_event_starts: Mutex::new(HashMap::new()),

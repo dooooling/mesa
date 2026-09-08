@@ -1,0 +1,63 @@
+# Runtime Stress（稳定化阶段 merge-required）：确定性 Gate 只证明机制正确，
+# 概率性采样仍需重复覆盖。只跑历史上最抖的平台（Windows x64）与关键场景，
+# 重复 2～3 次；deterministic gates 全过 + stress 全过 + cross-platform 全过
+# 三层一起，才算 hardening 完成。重复运行只增加采样概率，不替代 Gate。
+# 成本说明：独立 runner，需重编 workspace（与 native job 并行，不阻塞它）。
+name: runtime-stress
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  stress:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master@2026-09-05
+        with:
+          toolchain: '1.95.0'
+
+      - name: build workspace
+        run: cargo build --locked --workspace
+
+      # 最易抖场景 ×2：60s 稳态 soak（Stop/drain 全链路 + 溢出边界）。
+      - name: stress event_soak 60s x2
+        run: >
+          cargo test --locked -p mesa-contract-tests --all-features
+          --test event_soak sim_steady_state_soak_60s_no_loss_no_drift
+          && cargo test --locked -p mesa-contract-tests --all-features
+          --test event_soak sim_steady_state_soak_60s_no_loss_no_drift
+
+      # Stop/drain 确定性 Gates ×2（含 in-flight 判别 hold）。
+      - name: stress stop_lifecycle x2
+        run: >
+          cargo test --locked -p mesa-contract-tests --all-features
+          --test stop_lifecycle
+          && cargo test --locked -p mesa-contract-tests --all-features
+          --test stop_lifecycle
+
+      # 容量公式 Gates ×1（速率 SLO + stall 恢复 + 溢出边界，内含长 hold）。
+      - name: stress event_pressure x1
+        run: >
+          cargo test --locked -p mesa-contract-tests --all-features
+          --test event_pressure
+
+      # 并发 Probe ×2（startup spawn/租约/建连并发正确性）。
+      - name: stress management_api x2
+        run: >
+          cargo test --locked -p mesa-contract-tests --all-features
+          --test management_api
+          && cargo test --locked -p mesa-contract-tests --all-features
+          --test management_api

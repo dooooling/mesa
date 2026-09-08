@@ -5,6 +5,7 @@
 #
 # 成本模型（相对旧单 matrix 四平台全量）：
 #   fmt ×1 / clippy ×1 / web ×1 / fast-perf ×1 / correctness ×4
+#   + stress ×1（稳定化阶段：win-x64 关键场景重复采样，见 _runtime-stress.yml）
 # 四平台正确性（build/test/IPC/子进程/孤儿）一点没少。
 name: CI
 on:
@@ -42,9 +43,16 @@ jobs:
   web:
     uses: ./.github/workflows/_web.yml
 
+  # Runtime Stress（稳定化阶段 merge-required）：见 _runtime-stress.yml。
+  # 只跑 Windows x64 关键场景重复采样，与 native job 并行。
+  runtime-stress:
+    uses: ./.github/workflows/_runtime-stress.yml
+    with:
+      runs-on: windows-latest
+
   # 唯一 Merge Gate：依赖全部 success 才 success。
   ci-gate:
-    needs: [rust-primary, rust-native, web]
+    needs: [rust-primary, rust-native, web, runtime-stress]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10

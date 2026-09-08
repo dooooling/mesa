@@ -285,83 +285,101 @@ impl MesaManager {
             return Ok(cached.descriptor.clone());
         }
 
-        // 未命中：临时进程
-        let mut proc = crate::process::DriverProcess::spawn(&disc)
-            .await
-            .map_err(|e| {
-                DescriptorError::new("DRIVER_UNAVAILABLE", format!("spawn failed: {e}"))
-            })?;
+        // 未命中：临时进程（startup transport 瞬态由原语重建，见 temp_op）。
+        let desc = crate::temp_op::temp_driver_attempt(&disc, |mut td| async {
+            let session = &mut td.session;
+            let gd = session.get_descriptor().await.map_err(|e| match e {
+                crate::session::SessionError::Timeout => {
+                    DescriptorError::new("DRIVER_DESCRIPTOR_TIMEOUT", "descriptor timeout 5s")
+                }
+                crate::session::SessionError::Handshake(msg) if msg.contains("too large") => {
+                    DescriptorError::new("DRIVER_DESCRIPTOR_TOO_LARGE", msg)
+                }
+                other => DescriptorError::new("DRIVER_UNAVAILABLE", format!("{other}")),
+            });
+            let (major, minor, json) = match gd {
+                Ok(v) => v,
+                Err(e) => return (td, Err(e)),
+            };
 
-        let (mut session, _events, _) =
-            crate::session::Session::connect_retry(proc.port, &proc.token)
-                .await
-                .map_err(|e| {
-                    proc.force_kill();
-                    DescriptorError::new("DRIVER_UNAVAILABLE", format!("handshake failed: {e}"))
-                })?;
-
-        let (major, minor, json) = session.get_descriptor().await.map_err(|e| match e {
-            crate::session::SessionError::Timeout => {
-                DescriptorError::new("DRIVER_DESCRIPTOR_TIMEOUT", "descriptor timeout 5s")
+            if json.len() > 256 * 1024 {
+                return (
+                    td,
+                    Err(DescriptorError::new(
+                        "DRIVER_DESCRIPTOR_TOO_LARGE",
+                        format!("descriptor {} bytes exceeds 256KiB", json.len()),
+                    )),
+                );
             }
-            crate::session::SessionError::Handshake(msg) if msg.contains("too large") => {
-                DescriptorError::new("DRIVER_DESCRIPTOR_TOO_LARGE", msg)
+
+            let parsed: Result<mesa_core_types::DriverDescriptor, _> =
+                serde_json::from_str(&json).map_err(|e| {
+                    DescriptorError::new(
+                        "DRIVER_DESCRIPTOR_INVALID_JSON",
+                        format!("invalid json: {e}"),
+                    )
+                });
+            let desc = match parsed {
+                Ok(v) => v,
+                Err(e) => return (td, Err(e)),
+            };
+
+            // 校验契约（字段唯一、visible_if 等）
+            if let Err(e) = desc.validate() {
+                return (
+                    td,
+                    Err(DescriptorError::new(
+                        "DRIVER_DESCRIPTOR_VALIDATION_FAILED",
+                        e,
+                    )),
+                );
             }
-            other => DescriptorError::new("DRIVER_UNAVAILABLE", format!("{other}")),
+
+            // 校验 contract 版本语义（§4.2）：严格校验 Major
+            if major != desc.contract_major || major != 1 {
+                return (
+                    td,
+                    Err(DescriptorError::new(
+                        "DESCRIPTOR_CONTRACT_UNSUPPORTED",
+                        format!(
+                            "contract major mismatch: driver reported {major}, descriptor {}/{}, core supports 1",
+                            desc.contract_major, desc.contract_minor
+                        ),
+                    )),
+                );
+            }
+            if desc.contract_major != 1 {
+                return (
+                    td,
+                    Err(DescriptorError::new(
+                        "DESCRIPTOR_CONTRACT_UNSUPPORTED",
+                        format!(
+                            "descriptor contract {}.{} not supported, core expects 1.x",
+                            desc.contract_major, desc.contract_minor
+                        ),
+                    )),
+                );
+            }
+
+            // 缓存
+            self.descriptor_cache.write().unwrap().insert(
+                key.clone(),
+                CachedDescriptor {
+                    descriptor: desc.clone(),
+                    fetched_at_ns: mesa_core_types::now_unix_ns(),
+                },
+            );
+
+            let _ = minor;
+            (td, Ok(desc))
+        })
+        .await
+        .map_err(|e| match e {
+            crate::temp_op::TempOpError::Startup(s) => {
+                DescriptorError::new("DRIVER_UNAVAILABLE", s.to_string())
+            }
+            crate::temp_op::TempOpError::Rpc(e) => e,
         })?;
-
-        // 清理临时进程
-        session.invalidate();
-        proc.terminate().await;
-
-        if json.len() > 256 * 1024 {
-            return Err(DescriptorError::new(
-                "DRIVER_DESCRIPTOR_TOO_LARGE",
-                format!("descriptor {} bytes exceeds 256KiB", json.len()),
-            ));
-        }
-
-        let desc: mesa_core_types::DriverDescriptor = serde_json::from_str(&json).map_err(|e| {
-            DescriptorError::new(
-                "DRIVER_DESCRIPTOR_INVALID_JSON",
-                format!("invalid json: {e}"),
-            )
-        })?;
-
-        // 校验契约（字段唯一、visible_if 等）
-        desc.validate()
-            .map_err(|e| DescriptorError::new("DRIVER_DESCRIPTOR_VALIDATION_FAILED", e))?;
-
-        // 校验 contract 版本语义（§4.2）：严格校验 Major
-        if major != desc.contract_major || major != 1 {
-            return Err(DescriptorError::new(
-                "DESCRIPTOR_CONTRACT_UNSUPPORTED",
-                format!(
-                    "contract major mismatch: driver reported {major}, descriptor {}/{}, core supports 1",
-                    desc.contract_major, desc.contract_minor
-                ),
-            ));
-        }
-        if desc.contract_major != 1 {
-            return Err(DescriptorError::new(
-                "DESCRIPTOR_CONTRACT_UNSUPPORTED",
-                format!(
-                    "descriptor contract {}.{} not supported, core expects 1.x",
-                    desc.contract_major, desc.contract_minor
-                ),
-            ));
-        }
-
-        // 缓存
-        self.descriptor_cache.write().unwrap().insert(
-            key,
-            CachedDescriptor {
-                descriptor: desc.clone(),
-                fetched_at_ns: mesa_core_types::now_unix_ns(),
-            },
-        );
-
-        let _ = minor;
         Ok(desc)
     }
 
@@ -404,67 +422,65 @@ impl MesaManager {
                 format!("driver `{driver_id}` not found"),
             )
         })?;
-        let mut proc = crate::process::DriverProcess::spawn(&disc)
-            .await
-            .map_err(|e| {
-                DescriptorError::new("DRIVER_UNAVAILABLE", format!("spawn failed: {e}"))
-            })?;
-        let port = proc.port;
-        let token = proc.token.clone();
-        let (mut session, _events, _) =
-            match crate::session::Session::connect_retry(port, &token).await {
+        // 临时进程（startup transport 瞬态由原语重建，见 temp_op）。
+        crate::temp_op::temp_driver_attempt(&disc, |mut td| async {
+            let session = &mut td.session;
+            // 打开临时连接（handle 1）
+            let handle = 1;
+            let opened = session
+                .call(mesa_driver_protocol::pb::envelope::Body::OpenConnection(
+                    mesa_driver_protocol::pb::OpenConnection {
+                        connection_handle: handle,
+                        endpoint_id: format!("browse-{driver_id}"),
+                        config_json: connection_json.to_string(),
+                    },
+                ))
+                .await
+                .map_err(|e| {
+                    DescriptorError::new("DRIVER_UNAVAILABLE", format!("open failed: {e}"))
+                });
+            let open_res = match opened {
                 Ok(v) => v,
-                Err(e) => {
-                    proc.terminate().await;
-                    return Err(DescriptorError::new(
-                        "DRIVER_UNAVAILABLE",
-                        format!("handshake failed: {e}"),
-                    ));
-                }
+                Err(e) => return (td, Err(e)),
             };
-        // 打开临时连接（handle 1）
-        let handle = 1;
-        let open_res = session
-            .call(mesa_driver_protocol::pb::envelope::Body::OpenConnection(
-                mesa_driver_protocol::pb::OpenConnection {
-                    connection_handle: handle,
-                    endpoint_id: format!("browse-{driver_id}"),
-                    config_json: connection_json.to_string(),
-                },
-            ))
-            .await
-            .map_err(|e| DescriptorError::new("DRIVER_UNAVAILABLE", format!("open failed: {e}")))?;
-        match open_res.body {
-            Some(mesa_driver_protocol::pb::envelope::Body::OpenConnectionAck(ack)) => {
-                let ok = ack.result.map(|r| r.ok).unwrap_or(false);
-                if !ok {
-                    session.invalidate();
-                    proc.terminate().await;
-                    return Err(DescriptorError::new("DRIVER_UNAVAILABLE", "open not ok"));
+            let open_outcome: Result<(), DescriptorError> = match open_res.body {
+                Some(mesa_driver_protocol::pb::envelope::Body::OpenConnectionAck(ack)) => {
+                    let ok = ack.result.map(|r| r.ok).unwrap_or(false);
+                    if !ok {
+                        Err(DescriptorError::new("DRIVER_UNAVAILABLE", "open not ok"))
+                    } else {
+                        Ok(())
+                    }
                 }
-            }
-            Some(mesa_driver_protocol::pb::envelope::Body::DriverError(e)) => {
-                let d = e.detail.unwrap_or_default();
-                session.invalidate();
-                proc.terminate().await;
-                return Err(DescriptorError::new(d.code, d.message));
-            }
-            _ => {
-                session.invalidate();
-                proc.terminate().await;
-                return Err(DescriptorError::new(
+                Some(mesa_driver_protocol::pb::envelope::Body::DriverError(e)) => {
+                    let d = e.detail.unwrap_or_default();
+                    Err(DescriptorError::new(d.code, d.message))
+                }
+                _ => Err(DescriptorError::new(
                     "DRIVER_UNAVAILABLE",
                     "open unexpected",
-                ));
+                )),
+            };
+            if let Err(e) = open_outcome {
+                return (td, Err(e));
             }
-        }
-        let res = session
-            .browse(handle, parent, filter, cursor, limit)
-            .await
-            .map_err(|e| DescriptorError::new("BROWSE_FAILED", format!("{e}")))?;
-        session.invalidate();
-        proc.terminate().await;
-        Ok(res)
+            let browsed = session
+                .browse(handle, parent, filter, cursor, limit)
+                .await
+                .map_err(|e| DescriptorError::new("BROWSE_FAILED", format!("{e}")));
+            let res = match browsed {
+                Ok(v) => v,
+                Err(e) => return (td, Err(e)),
+            };
+            (td, Ok(res))
+        })
+        .await
+        .map_err(|e| match e {
+            crate::temp_op::TempOpError::Startup(s) => {
+                DescriptorError::new("DRIVER_UNAVAILABLE", s.to_string())
+            }
+            crate::temp_op::TempOpError::Rpc(e) => e,
+        })
     }
 
     /// Control Write（§22）：经由活跃会话的可靠 Control 队列转发，永不 Latest-Wins
