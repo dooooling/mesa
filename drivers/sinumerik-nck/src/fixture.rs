@@ -180,19 +180,12 @@ async fn serve_conn(mut stream: tokio::net::TcpStream, shared: Arc<Mutex<NckFixt
     let s7 = &pkt[7..];
     let requested = u16::from_be_bytes([s7[s7.len() - 2], s7[s7.len() - 1]]);
     let negotiated = requested.min(max_pdu).to_be_bytes();
+    // 标准 25 字节 ack：S7(18) = header(10) + params(8)，协商值在 S7[16..18]
+    //（与 transport 解析位一致；曾经 33 字节自创口径，PR20 改标准）。
     let mut ack = vec![0x32u8, 0x03, 0x00, 0x00, s7[4], s7[5]];
     ack.extend_from_slice(&[0x00, 0x08, 0x00, 0x00]);
-    ack.extend_from_slice(&[0xF0, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00]);
-    ack.extend_from_slice(&[
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        negotiated[0],
-        negotiated[1],
-        0x00,
-    ]);
+    ack.extend_from_slice(&[0xF0, 0x00, 0x00, 0x01, 0x00, 0x01]);
+    ack.extend_from_slice(&negotiated);
     if !send_packet(&mut stream, &ack).await {
         return;
     }

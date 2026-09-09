@@ -3,8 +3,8 @@
 //! 用途：为 `S7Session` 提供确定性端到端验证（握手/分片/逐项 BAD/SZL/写），
 //! 不依赖真机，不依赖现场抓包。行为约定：
 //!
-//! - `COTP CR → CC`；`Setup → Ack`（协商值取 `min(请求, max_pdu)`，放在 S7 区
-//!   `[23..25]`，与 `parse_setup_ack` 的读取位一致）；
+//! - `COTP CR → CC`；`Setup → Ack`（标准 25 字节，协商值取 `min(请求, max_pdu)`，
+//!   放在 S7 区 `[16..18]`，与 `parse_setup_ack` 的读取位一致）；
 //! - `Read` 按 S7ANY 规范长度字段（`spec[4..6]`）返回确定性 pattern（连接级全局
 //!   序号：第 n 个项全字节为 `n+1`，跨分片可断言顺序），奇长项后补 `0x00`（除末项）；
 //! - `fail_item` 指定的当包第 k 项返回 `0x05` 无数据（逐项 BAD 注入）；
@@ -119,13 +119,13 @@ async fn serve_conn(mut stream: tokio::net::TcpStream, shared: Arc<Mutex<Fixture
 fn setup_ack(req: &[u8], max_pdu: u16) -> Vec<u8> {
     let requested = u16::from_be_bytes([req[req.len() - 2], req[req.len() - 1]]);
     let negotiated = requested.min(max_pdu);
+    // 标准 25 字节 ack：S7(18) = header(10) + params(8)，协商值在 s7[16..18]
+    //（parse_setup_ack 读取位；曾经 33 字节自创口径，PR20 改标准）。
     let mut s7 = vec![0x32, 0x03, 0x00, 0x00];
     s7.extend_from_slice(&[req[4], req[5]]); // PDU ref 回显
     s7.extend_from_slice(&[0x00, 0x08, 0x00, 0x00]);
-    s7.extend_from_slice(&[0xF0, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00]);
-    // 补到 26 字节，协商值放在 s7[23..25]（parse_setup_ack 读取位）。
-    let nb = negotiated.to_be_bytes();
-    s7.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, nb[0], nb[1], 0x00]);
+    s7.extend_from_slice(&[0xF0, 0x00, 0x00, 0x01, 0x00, 0x01]);
+    s7.extend_from_slice(&negotiated.to_be_bytes());
     s7
 }
 

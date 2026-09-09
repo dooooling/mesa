@@ -47,11 +47,15 @@ pub fn build_s7_setup(pdu_ref: u16, requested_pdu: u16) -> Vec<u8> {
     pkt
 }
 
-/// 解析 Setup Ack，返回协商后 PDU（`min(请求, 对端)`，0 视为不协商）。
+/// 解析 Setup Ack，返回协商后 PDU（`min(请求, 对端)`，0 视为对方无表示）。
 ///
-/// 行为与抽取前 `s7_setup` 的解析段逐字一致：短包/非 Ack 即协议错误。
+/// 标准布局（Wireshark/PLC/Snap7 一致，ADR 0002 跨源核对）：
+/// S7(18) = header(10) + params `[F0 00 | 00 01 | 00 01 | PDU]`，
+/// 协商值在 `payload[16..18]`；短于 18 即 `S7_SETUP_SHORT`。
+/// 历史实现曾读 `payload[23..25]`（自创口径，仅回环自洽，真机漏协商），
+/// PR20 改标准口径（附带修好“真机向下协商被静默跳过”的潜伏 bug）。
 pub fn parse_setup_ack(resp: &[u8], requested_pdu: u16) -> Result<u16, S7TransportError> {
-    if resp.len() < 7 + 12 {
+    if resp.len() < 7 + 18 {
         return Err(S7TransportError::protocol(
             "S7_SETUP_SHORT",
             format!("Setup 响应过短 {}", resp.len().saturating_sub(7)),
@@ -59,7 +63,7 @@ pub fn parse_setup_ack(resp: &[u8], requested_pdu: u16) -> Result<u16, S7Transpo
     }
     // 跳过 TPKT 4 + COTP 3。
     let payload = &resp[7..];
-    if payload.len() < 12 {
+    if payload.len() < 18 {
         return Err(S7TransportError::protocol(
             "S7_SETUP_SHORT",
             format!("Setup 响应过短 {}", payload.len()),
@@ -69,12 +73,11 @@ pub fn parse_setup_ack(resp: &[u8], requested_pdu: u16) -> Result<u16, S7Transpo
         let err = payload.get(17).copied().unwrap_or(0);
         return Err(s7_cpu_error(err, "S7 Setup 被拒绝"));
     }
+    // 只向下协商（min），0 视为对方无表示（保持请求值）。
+    let n = u16::from_be_bytes([payload[16], payload[17]]);
     let mut negotiated = requested_pdu;
-    if payload.len() >= 25 {
-        let n = u16::from_be_bytes([payload[23], payload[24]]);
-        if n != 0 && n < negotiated {
-            negotiated = n;
-        }
+    if n != 0 && n < negotiated {
+        negotiated = n;
     }
     Ok(negotiated)
 }
@@ -152,20 +155,26 @@ mod tests {
 
     #[test]
     fn setup_ack_negotiates_downward_only() {
-        // 构造 Ack：TPKT(4)+COTP(3)+S7(≥25 字节，payload[23..25] 为协商 PDU)。
-        let mut resp = vec![0x03, 0x00, 0x00, 0x00, 0x02, 0xF0, 0x80];
+        // 标准 25 字节 Ack：TPKT(4)+COTP(3)+S7(18)，协商 PDU 在 payload[16..18]。
+        let mut resp = vec![0x03, 0x00, 0x00, 0x19, 0x02, 0xF0, 0x80];
         let mut s7 = vec![0x32, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x00];
-        s7.extend_from_slice(&[0xF0, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00]);
-        // 再补 8 字节，使 payload 长度 ≥25；协商值放在 payload[23..25]。
-        // s7[18..23] 填充，s7[23]=0x00 s7[24]=0xF0 → 240（向下协商）。
-        s7.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x00, 0xF0, 0x00]);
+        s7.extend_from_slice(&[0xF0, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0xF0]);
         resp.extend_from_slice(&s7);
+        assert_eq!(resp.len(), 25);
         assert_eq!(parse_setup_ack(&resp, 480).unwrap(), 240);
         // 对端报更大（960）不向上取。
         let mut resp2 = resp.clone();
-        resp2[7 + 23] = 0x03;
-        resp2[7 + 24] = 0xC0;
+        resp2[7 + 16] = 0x03;
+        resp2[7 + 17] = 0xC0;
         assert_eq!(parse_setup_ack(&resp2, 480).unwrap(), 480);
+        // 对端 0 视为无表示，保持请求值。
+        let mut resp3 = resp.clone();
+        resp3[7 + 16] = 0x00;
+        resp3[7 + 17] = 0x00;
+        assert_eq!(parse_setup_ack(&resp3, 480).unwrap(), 480);
+        // 短于标准 S7(18) 即拒绝（不再静默沿用请求值）。
+        let short = &resp[..7 + 17];
+        assert!(parse_setup_ack(short, 480).is_err());
     }
 
     #[test]
