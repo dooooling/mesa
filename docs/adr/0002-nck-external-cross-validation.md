@@ -54,25 +54,23 @@ Sharp7 `ReadNckArea` 已实现同变量跨 PDU 拆分，语义为：同
 预算 `MaxElements = (PDU-18)/WordSize`。Mesa P2-1 曾拒绝猜测 line 分段语义；
 本条作为第二独立证据记录，待真机确认后实现（届时与 Sharp7 差分拆分点）。
 
-## 响应/setup framing：NCK 方言（PR20 live 互操作结论）
+## 响应/setup framing：Ack_Data 统一信封（PR20 review 纠正）
 
-互操作挖出的最大发现：Mesa 的 S7 层 framing 曾是“两处谎言互抵”
-（`12+plen` 解析 + fixture 谎报 plen + 自创 33 字节 setup ack），
-回环自洽、真机必 broken（setup 漏协商、读错位判 BAD）。已修正：
+> 本节替代初版“NCK 方言”说法（已撤回）：`00 00` 从来都是 Ack_Data
+> header 的 error bytes，不是 NCK 方言。NCK 与 PLC 共用同一信封，
+> 差异仅 var-spec syntax。
 
-- Setup 解析改 header 判别：S7(18) 标准形 vs S7(20)+`00 00` 扩展形，
-  PDU 取 S7 末 2 字节（两形皆然），其他形状 `S7_SETUP_SHAPE` 拒绝；
-- 读解析改 `10+plen`（只认 header 声明）；fixture plen 说真话
-  （PLC 标准 2 字节 param，NCK 扩展 4 字节 `[00 00 04 count]`，项位置零移动）；
-- NCK 方言 = PLC + 2 字节 errinfo（setup 与读一致）：Sharp7 三处解析位
-  （setup/单读/多读）与 Mesa NCK fixture 逐字节吻合，live 互操作
-  （setup + 单读 + 多读 rc=0，pattern 正确解码）实证通过。
-- PLC 方言 = 标准（Wireshark/Snap7 一致）；s7 驱动读路径同步修好。
-
-仍 open：errinfo 是否为真机 NCU 行为（Sharp7 硬件派生 vs 标准 S7 推测；
-T1/T2 之争收敛为“解析器两形皆吃 + fixture 按方言说真话”，任一真机形态
-都不再静默错）。write/szl 解析同病（`12+plen`），但零 live 调用者，
-留待其路径上线前按同口径修正 + 真机确认，不在本轮范围。
+- S7 头按 ROSCTR 切分（Wireshark 主干 `hlength` 实证）：Job=10 字节，
+  Ack/Ack_Data=12 字节（bytes 10-11 为 error class/code）。
+- Setup Ack 冻结：S7(20) = 12 字节头 + plen=8 + `[F0 … PDU]`，
+  PDU 在 S7[18..20]（25 字节是 Setup 请求长度，响应一直是 27 字节；
+  Snap7/Sharp7 的 `Length==27` 是对的）。
+- Read 响应冻结：12 字节头 + plen=2 + `[04 count]` + items（+14）。
+- 解析器只认 header 声明（`12+plen`，errinfo 非零即拒绝）；
+  fixture plen 说真话；write 的 `12+plen` 从来是对的（撤回“同病待修”，
+  write 留现状），SZL 另 ROSCTR 路径、单独分析。
+- Sharp7 rsp 被接受 = compatibility evidence（emulator 生成），
+  不是独立 server framing evidence；请求 vectors 才是独立 wire evidence。
 
 ## 方法冻结（证据等级）
 

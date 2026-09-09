@@ -18,8 +18,8 @@
 
 use std::ops::Range;
 
-use crate::error::{S7_ITEM_OK, S7TransportError, S7TransportErrorKind, s7_cpu_error};
-use crate::pdu::{S7_FUNC_READ, S7_ROSCTR_ACK, S7_ROSCTR_JOB, check_lengths, s7_header, wrap_s7};
+use crate::error::{S7_ITEM_OK, S7TransportError, S7TransportErrorKind};
+use crate::pdu::{S7_FUNC_READ, S7_ROSCTR_JOB, check_ack, check_lengths, s7_header, wrap_s7};
 
 // ---------------------------------------------------------------------------
 // 协议常量（解释“为什么”）
@@ -170,20 +170,12 @@ pub fn parse_read_response(
     if s7.len() < 12 {
         return Err(S7TransportError::protocol("S7_SHORT", "S7 头部缺失"));
     }
-    if s7[1] != S7_ROSCTR_ACK {
-        let err_class = s7.get(17).copied().unwrap_or(0);
-        return Err(s7_cpu_error(
-            err_class,
-            &format!(
-                "Read 被拒绝 rosctr={:02x} 期望 {:02x}",
-                s7[1], S7_ROSCTR_ACK
-            ),
-        ));
-    }
+    // ROSCTR + header error bytes 统一校验（err class/code 非零即拒绝）。
+    check_ack(s7, "Read")?;
     let (param_len, data_len) = check_lengths(s7)?;
-    // data 起点 = 10 字节头 + param 区（标准 PLC：plen=2 → +12；
-    // NCK 扩展：plen=4 → +14；只认 header 声明，不猜）。
-    let data = &s7[10 + param_len..10 + param_len + data_len];
+    // data 起点 = 12 字节 Ack_Data 头 + param 区（标准 Read：plen=2 → +14；
+    // 只认 header 声明，不猜）。
+    let data = &s7[12 + param_len..12 + param_len + data_len];
     let mut out: Vec<S7ReadVarResult> = Vec::with_capacity(items.len());
     let mut off = 0;
     for idx in 0..items.len() {
@@ -285,15 +277,9 @@ pub fn parse_bulk_response(
     if s7.len() < 12 {
         return Err(S7TransportError::protocol("S7_SHORT", "S7 头部缺失"));
     }
-    if s7[1] != S7_ROSCTR_ACK {
-        let err_class = s7.get(17).copied().unwrap_or(0);
-        return Err(s7_cpu_error(
-            err_class,
-            &format!("Bulk Read 被拒绝 rosctr={:02x}", s7[1]),
-        ));
-    }
+    check_ack(s7, "Bulk Read")?;
     let (param_len, data_len) = check_lengths(s7)?;
-    let data = &s7[10 + param_len..10 + param_len + data_len];
+    let data = &s7[12 + param_len..12 + param_len + data_len];
     let mut out = Vec::with_capacity(items.len());
     let mut off = 0;
     for idx in 0..items.len() {
@@ -395,14 +381,15 @@ mod tests {
         assert_eq!(&pkt[19..31], &[0x12; 12]);
     }
 
-    /// 构造最小 Read Ack 响应：TPKT+COTP+S7(10 头)+param(data_len 声明)+data。
-    /// param 按声明原样放（plen 说真话；解析器按 10+plen 定位）。
+    /// 构造最小 Read Ack 响应：S7 = 10 字节头 + 2 字节 error(00 00)
+    /// + param(data_len 声明) + data；plen 只计 param（说真话）。
     fn ack_resp(data_items: &[u8], param: &[u8]) -> Vec<u8> {
         let param_len = param.len() as u16;
         let data_len = data_items.len() as u16;
         let mut s7 = vec![0x32, 0x03, 0x00, 0x00, 0x00, 0x01];
         s7.extend_from_slice(&param_len.to_be_bytes());
         s7.extend_from_slice(&data_len.to_be_bytes());
+        s7.extend_from_slice(&[0x00, 0x00]); // Ack_Data header error bytes
         s7.extend_from_slice(param);
         s7.extend_from_slice(data_items);
         let mut pkt = vec![0x03, 0x00, 0x00, 0x00, 0x02, 0xF0, 0x80];
@@ -441,12 +428,39 @@ mod tests {
 
     #[test]
     fn parse_rejected_rosctr_maps_cpu_error() {
-        // S7 区需 ≥18 字节（s7[17] 为 CPU 错误码位）：8 字节 param 补齐，
-        // 末字节 0x05 即错误码。
-        let mut resp = ack_resp(&[], &[0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05]);
-        resp[7 + 1] = 0x01; // ROSCTR Job（非 Ack）
+        // ROSCTR 非 Ack_Data → CPU 错误映射（s7[17] 为码位）。
+        let mut resp = ack_resp(&[], &[0x04, 0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00]);
+        resp[7 + 1] = 0x01; // ROSCTR Job（非 Ack_Data）
         let err = parse_read_response(&resp, &[item(12, 1)]).unwrap_err();
         assert_eq!(err.code, "S7_0x05");
+    }
+
+    #[test]
+    fn ack_data_header_error_fails() {
+        // header error class 非零 → S7_HEADER_ERR（不再从 s7[17] 取码）。
+        let mut resp = ack_resp(&[0xFF, 0x04, 0x00, 0x08, 0x2A], &[0x04, 0x01]);
+        resp[7 + 10] = 0x84;
+        let err = parse_read_response(&resp, &[item(12, 1)]).unwrap_err();
+        assert_eq!(err.code, "S7_HEADER_ERR");
+        // error code 非零 → CPU 错误映射。
+        let mut resp2 = ack_resp(&[0xFF, 0x04, 0x00, 0x08, 0x2A], &[0x04, 0x01]);
+        resp2[7 + 11] = 0x05;
+        let err = parse_read_response(&resp2, &[item(12, 1)]).unwrap_err();
+        assert_eq!(err.code, "S7_0x05");
+    }
+
+    #[test]
+    fn read_ack_param_len_2_data_starts_at_14() {
+        // 标准 Ack_Data 信封：12 字节头 + plen=2 → 项从 +14 起。
+        //（NCK 与 generic 信封相同，差异仅 var-spec syntax。）
+        let data = [0xFF, 0x04, 0x00, 0x08, 0x2A];
+        let resp = ack_resp(&data, &[0x04, 0x01]);
+        let s7 = &resp[7..];
+        assert_eq!(&s7[10..12], &[0x00, 0x00], "header error bytes");
+        assert_eq!(&s7[12..14], &[0x04, 0x01], "param func+count");
+        assert_eq!(s7[14], 0xFF, "首项返回码位");
+        let out = parse_read_response(&resp, &[item(12, 1)]).unwrap();
+        assert_eq!(out[0].data, vec![0x2A]);
     }
 
     #[test]
@@ -456,17 +470,6 @@ mod tests {
         let resp = ack_resp(&data, &[0x04, 0x02]);
         let err = parse_read_response(&resp, &[item(12, 1), item(12, 1)]).unwrap_err();
         assert_eq!(err.code, "READ_ITEM_SHORT");
-    }
-
-    #[test]
-    fn extended_param_shape_parses_at_10_plus_plen() {
-        // NCK 扩展形：plen=4（说真话），param [00 00 04 01]，项从 +14 起
-        //（Sharp7 解析位一致；标准形 plen=2 时项从 +12 起，只认 header 声明）。
-        let data = [0xFF, 0x04, 0x00, 0x08, 0x2A];
-        let resp = ack_resp(&data, &[0x00, 0x00, 0x04, 0x01]);
-        let out = parse_read_response(&resp, &[item(12, 1)]).unwrap();
-        assert_eq!(out[0].return_code, 0xFF);
-        assert_eq!(out[0].data, vec![0x2A]);
     }
 
     #[test]

@@ -6,7 +6,9 @@
 //! 约束：Area 恒为 0（N）——`0<<4 == 0<<5`，刻意避开 area 合成未决分歧；
 //! 本测试不断言任何非零 Area 的 areaunit 字节。
 //!
-//! 三重断言：
+//! 三重断言（证据等级见 ADR 0002：请求为独立 wire evidence，
+//! 响应为 compatibility evidence——rsp 是 emulator 生成、Sharp7 接受，
+//! 不是独立 server framing evidence）：
 //! 1. Sharp7 请求 item == Mesa `encode_var_spec` 同逻辑地址输出（exact differential）；
 //! 2. 同一抓包的响应经 Mesa transport 解析为 GOOD + pattern 数据
 //!    （Sharp7 当时解码 rc=0；两实现对同一 wire 一致解码）；
@@ -130,14 +132,16 @@ fn responses_parse_good_in_mesa_too() {
 }
 
 #[test]
-fn setup_ack_shape_is_nck_extended() {
-    // rsp-04：27 字节扩展 Setup（errinfo + PDU@S7[18]=480），Sharp7 当时
-    // 以此完成协商（NckConnectTo rc=0）；Mesa 解析器必须同样接受。
+fn setup_ack_shape_is_standard_ack_data() {
+    // rsp-04：标准 Ack_Data Setup（27 字节）：12 字节头 + plen=8 +
+    // PDU@S7[18]=480。Sharp7 当时以此完成协商（NckConnectTo rc=0）；
+    // Mesa 解析器必须同样接受（`00 00` 是 header error bytes，无 NCK 方言）。
     let rsp = read("rsp-04.bin");
     assert_eq!(rsp.len(), 27);
     let s7 = &rsp[7..];
     assert_eq!(s7.len(), 20);
-    assert_eq!(&s7[10..12], &[0x00, 0x00], "errinfo 标记");
+    assert_eq!(&s7[6..8], &[0x00, 0x08], "plen=8（说真话）");
+    assert_eq!(&s7[10..12], &[0x00, 0x00], "header error bytes");
     assert_eq!(u16::from_be_bytes([s7[18], s7[19]]), 480);
     let pdu = parse_setup_ack(&rsp, 480).expect("Mesa Setup 解析");
     assert_eq!(pdu, 480);

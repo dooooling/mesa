@@ -34,7 +34,6 @@ cargo test -p mesa-driver-sinumerik-nck --test sharp7_vectors
 
 - area 合成：Sharp7 用 `NckArea<<4`，Mesa/Wireshark/Softing 用 `<<5`。
   本 harness 只用 **Area=0（N）**，两侧字节一致，不触分歧。
-- setup/响应 framing：NCK 方言（errinfo + 扩展形）与 PLC 标准形并存，
-  Mesa 解析器两形皆吃（header 判别），emulator 说 NCK 方言。
-  互操作成功 = 两实现对方言一致，不直接证明真机形态（仍 open）。
+- 信封：双方共用标准 Ack_Data（12 字节头 + plen 说真话），无 NCK 方言；
+  rsp 被 Sharp7 接受 = compatibility evidence，不是独立 server evidence。
 - `0x06` 长度单位：Sharp7 按 bit，Wireshark 按 byte；实验避开该 transport。

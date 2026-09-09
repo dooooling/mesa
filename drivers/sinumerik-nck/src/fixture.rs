@@ -1,7 +1,8 @@
 //! NCK 回环脚手架（Commit C：COTP/Setup 握手 + NCK ReadVar 服务）。
 //!
-//! 对端行为（确定性，无真机）：
-//! - `COTP CR → CC`；`Setup → Ack`（协商 `min(请求, max_pdu)`）；
+//! 对端行为（确定性，无真机；标准 Ack_Data 信封，与 generic S7 同构，
+//! NCK 差异仅 var-spec syntax）：
+//! - `COTP CR → CC`；`Setup → Ack`（27 字节，协商 `min(请求, max_pdu)`）；
 //! - `Read`：逐项解析 10 字节 NCK 规范（`12 08 syntax …`，syntax 非
 //!   0x82/83/84 即关连接，形如真机拒收畸形）；GOOD 项返回 pattern 数据
 //!   （连接级全局序号：第 n 项全字节为 `n+1`），长度 = `linecount × element_size`
@@ -164,7 +165,7 @@ async fn serve_conn(mut stream: tokio::net::TcpStream, shared: Arc<Mutex<NckFixt
             return;
         }
     }
-    // 2) Setup → Ack（协商 min(请求, max_pdu)，放在 S7 区 [23..25]）。
+    // 2) Setup → Ack（标准 Ack_Data 信封，协商 min(请求, max_pdu)）。
     let max_pdu = {
         let m = shared.lock().expect("fixture 状态").max_pdu;
         if m == 0 { 480 } else { m }
@@ -177,18 +178,7 @@ async fn serve_conn(mut stream: tokio::net::TcpStream, shared: Arc<Mutex<NckFixt
     if pkt.len() < 7 + 18 {
         return;
     }
-    let s7 = &pkt[7..];
-    let requested = u16::from_be_bytes([s7[s7.len() - 2], s7[s7.len() - 1]]);
-    let negotiated = requested.min(max_pdu).to_be_bytes();
-    // NCK 扩展形 Setup（27 字节）：errinfo(00 00) + params(8)，协商值在
-    // S7[18..20]。与读响应 param `[00 00 04 count]` 同构（NCK 方言 uniformly
-    // 带 errinfo；Sharp7 硬件派生解析位一致，硬件终裁前见 ADR 0002）。
-    // transport 解析器按 S7 总长判别（18 标准 / 20 扩展），两形皆吃。
-    let mut ack = vec![0x32u8, 0x03, 0x00, 0x00, s7[4], s7[5]];
-    ack.extend_from_slice(&[0x00, 0x0A, 0x00, 0x00]);
-    ack.extend_from_slice(&[0x00, 0x00]);
-    ack.extend_from_slice(&[0xF0, 0x00, 0x00, 0x01, 0x00, 0x01]);
-    ack.extend_from_slice(&negotiated);
+    let ack = build_setup_ack(&pkt[7..], max_pdu);
     if !send_packet(&mut stream, &ack).await {
         return;
     }
@@ -220,7 +210,22 @@ async fn serve_conn(mut stream: tokio::net::TcpStream, shared: Arc<Mutex<NckFixt
     }
 }
 
-/// 构造 NCK 读响应：param [04, count] + 逐项 `[ret, transport, len16, data]`。
+/// 构造标准 Ack_Data Setup（27 字节）：12 字节头（00 00 error）+ 8 字节
+/// param，plen=8（说真话），协商值 `min(请求, max_pdu)` 在 S7[18..20]。
+/// 与读响应信封同构（无 NCK 方言；曾经自创口径，PR20 改标准）。
+fn build_setup_ack(s7req: &[u8], max_pdu: u16) -> Vec<u8> {
+    let requested = u16::from_be_bytes([s7req[s7req.len() - 2], s7req[s7req.len() - 1]]);
+    let negotiated = requested.min(max_pdu).to_be_bytes();
+    let mut ack = vec![0x32u8, 0x03, 0x00, 0x00, s7req[4], s7req[5]];
+    ack.extend_from_slice(&[0x00, 0x08, 0x00, 0x00]);
+    ack.extend_from_slice(&[0x00, 0x00]);
+    ack.extend_from_slice(&[0xF0, 0x00, 0x00, 0x01, 0x00, 0x01]);
+    ack.extend_from_slice(&negotiated);
+    ack
+}
+
+/// 构造 NCK 读响应：标准 Ack_Data 信封（12 字节头 + plen=2 + `[04 count]`），
+/// 逐项 `[ret, transport, len16, data]`（NCK 差异仅 var-spec syntax）。
 fn read_ack(req: &[u8], state: &NckFixtureState, ordinal: &mut u64) -> Vec<u8> {
     if state.fail_reads {
         // 致命短包：驱动侧整包 fatal（fail 当前 attempt，Manager 重建会话）。
@@ -283,10 +288,10 @@ fn read_ack(req: &[u8], state: &NckFixtureState, ordinal: &mut u64) -> Vec<u8> {
         return vec![0x32, 0x03];
     }
     let mut s7 = vec![0x32u8, 0x03, 0x00, 0x00, req[4], req[5]];
-    s7.extend_from_slice(&[0x00, 0x04]);
+    s7.extend_from_slice(&[0x00, 0x02]);
     s7.extend_from_slice(&(data.len() as u16).to_be_bytes());
-    // NCK 扩展形 param（4 字节 [00 00 04 count]，plen=4 说真话；项仍从
-    // S7[14] 起，与 Sharp7 解析位一致，位置相对上版零移动）。
+    // 标准 Ack_Data 信封：2 字节 error(00 00) + 2 字节 param [04 count]，
+    // plen=2（说真话）；项从 S7[14] 起（与 Sharp7 解析位一致；无 NCK 方言）。
     s7.extend_from_slice(&[0x00, 0x00, 0x04, count as u8]);
     s7.extend_from_slice(&data);
     // 记录收到的规范（exact 发送字节断言用）。
@@ -468,6 +473,18 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "READ_SHORT");
+    }
+
+    #[test]
+    fn nck_fixture_emits_same_ack_data_envelope() {
+        // NCK 与 generic 共用标准 Ack_Data 信封（差异仅 var-spec syntax）：
+        // Setup 27B（plen=8，PDU@S7[18..20]）。
+        let req = mesa_s7_transport::pdu::build_s7_setup(1, 480);
+        let ack = build_setup_ack(&req[7..], 480);
+        assert_eq!(ack.len(), 20);
+        assert_eq!(&ack[10..12], &[0x00, 0x00], "header error bytes");
+        assert_eq!(&ack[6..8], &[0x00, 0x08], "plen=8");
+        assert_eq!(&ack[18..20], &[0x01, 0xE0], "协商 480");
     }
 
     #[tokio::test]
