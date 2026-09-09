@@ -39,7 +39,7 @@ use mesa_driver_sinumerik_nck::{NckFixture, NckFixtureState};
 enum Scenario {
     /// 全 GOOD（序号 pattern 数据）。
     Happy,
-    /// 指定项返回 `0x05`（`--fail-items 1,3`）。
+    /// 指定项返回 `0x05`（`--fail-items 0,2`，0-based）。
     PartialBad,
     /// transport 改 `0x07`（P1-4 校验对象）。
     WrongTransport,

@@ -41,9 +41,11 @@
 - Wireshark：`0x06` 按 byte；Sharp7：`>>3`（按 bit）。
 - Mesa 跟随 Wireshark（`0x06/0x07/0x09` 按 byte；`0x03` 取 `div_ceil`，
   与 Wireshark 数学逐字一致；未知 transport 按 byte，见下）。
-- 影响面：真机 Read 响应实际只出现 `0x03/0x04`（`0x07/0x09` 罕见，
-  `0x06` 未见实证），且未知值按 byte 偏向 fail-loud（多消费→`READ_DATA_SHORT`），
-  而非静默错位。真机若出现 `0x06` 即按本 ADR 重审。
+- 影响面：现有 S7 真机证据确认 `0x04` 的 length 为 bit 口径；
+  SINUMERIK NCK 真机响应的 `transport_size` 分布尚未验证（`0x07/0x09`
+  罕见，`0x06` 未见实证）。未知值按 byte 偏向 fail-loud（多消费→
+  `READ_DATA_SHORT`），而非欠消费导致的静默错位。真机若出现 `0x06`
+  即按本 ADR 重审。
 
 ## Sharp7 单变量 PDU 拆分（未来 P2-1 的第二证据）
 
