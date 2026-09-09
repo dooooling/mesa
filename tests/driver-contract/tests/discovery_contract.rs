@@ -16,14 +16,6 @@ fn fake_opcua_connection() -> serde_json::Value {
     serde_json::json!({"endpoint_url":"opc.tcp://127.0.0.1:4840","use_native":false})
 }
 
-fn fake_sinumerik_connection() -> serde_json::Value {
-    // SINUMERIK Fake 驱动：装载确定性 fixture（根下 3 节点两页聚合）。
-    unsafe {
-        std::env::set_var("MESA_ALLOW_FAKE_NATIVE", "1");
-    }
-    serde_json::json!({"endpoint_url":"opc.tcp://127.0.0.1:4840","use_native":false})
-}
-
 /// suite 内 process-heavy Browse 测试串行锁：同文件测试并行拉起多个真实
 /// driver subprocess，spawn/session 建连存在启动瞬态（曾在 Ubuntu ARM 以
 /// 偶发 503 现形）。串行只收敛本 suite，不动 workspace 并行度——禁止
@@ -168,34 +160,21 @@ async fn browse_pagination_does_not_return_all_at_once() {
 }
 
 #[tokio::test]
-async fn browse_sinumerik_plumbing_and_canonical_shape() {
-    // SINUMERIK browse 门：驱动被发现、二进制可拉起、browse 200。
-    // Fake 路径装载确定性 fixture（根下 Channel/Axis/Spindle 两页聚合）；
-    // 身份必须全部 canonical nsu= 形态，binding 与 id 一致
-    //（翻页聚合与换算覆盖在驱动单测 + fixture 自检，不在此重复）。
+async fn browse_sinumerik_nck_is_plumbed_but_browse_arrives_with_topology() {
+    // ADR 0001 Commit B：`sinumerik` 已退役，`sinumerik-nck` 空壳 discovery
+    // 可见但 browse 能力随 Commit E（Catalog + Topology）到来；此处只锁
+    // discovery  plumbing（驱动被发现、二进制可拉起），browse 语义由 Commit E
+    // 的 `nck://` canonical 门覆盖。
     // 注意：改过驱动代码后须先 cargo build --workspace（旧二进制静默失效）。
     let _guard = BROWSE_SERIAL.lock().await;
-    let (app, ep_id) = app_with_endpoint("sinumerik", fake_sinumerik_connection()).await;
-    let req = Request::builder()
-        .uri(format!("/api/v1/endpoints/{ep_id}/browse"))
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(r#"{"parent":"","limit":10}"#))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    let v = assert_browse_ok(resp, "sinumerik").await;
-    let nodes = v["nodes"].as_array().expect("nodes 数组");
-    // fixture 语义：两页聚合共 3 个子节点（Channel/Axis/Spindle）。
-    assert_eq!(nodes.len(), 3, "fixture browse 应聚合 3 节点，实际: {v}");
-    for n in nodes {
-        let id = n["id"].as_str().expect("BrowseNode.id");
-        assert!(
-            id.starts_with("nsu=http://www.siemens.com/sinumerik;"),
-            "sinumerik browse 身份必须 canonical nsu= 形态，实际: {id}"
-        );
-        let binding: serde_json::Value =
-            serde_json::from_str(n["binding_json"].as_str().expect("binding_json"))
-                .expect("binding_json 合法 JSON");
-        assert_eq!(binding["node_id"].as_str(), Some(id));
-    }
+    let drivers_dir = common::repo_root().join("drivers");
+    let mgr = mesa_driver_manager::MesaManager::discover(&drivers_dir);
+    assert!(
+        mgr.find_driver("sinumerik-nck").is_some(),
+        "sinumerik-nck 必须可被发现"
+    );
+    assert!(
+        mgr.find_driver("sinumerik").is_none(),
+        "旧 sinumerik 必须零残留"
+    );
 }

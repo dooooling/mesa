@@ -1325,7 +1325,7 @@ dependencies = [
  "mesa-driver-s7",
  "mesa-driver-sdk",
  "mesa-driver-simulator",
- "mesa-driver-sinumerik",
+ "mesa-driver-sinumerik-nck",
  "mesa-event-store",
  "rusqlite",
  "serde_json",
@@ -1492,17 +1492,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "mesa-driver-sinumerik"
+name = "mesa-driver-sinumerik-nck"
 version = "0.1.0"
 dependencies = [
- "async-opcua-types",
  "async-trait",
- "base64",
- "bytes",
  "mesa-core-types",
  "mesa-driver-protocol",
  "mesa-driver-sdk",
- "mesa-opcua-transport",
+ "mesa-s7-transport",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

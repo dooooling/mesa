@@ -5,12 +5,13 @@ import type { DriverDescriptor, FieldDescriptor } from "../types";
 import { ResourcePickerAntd } from "./ResourcePickerAntd";
 
 // 后端 discovery 不可用时的兜底（正常情况下拉来自 /api/v1/drivers，
-// 新驱动如 sinumerik 无需改前端即出现）。
+// 新驱动如 sinumerik-nck 无需改前端即出现）。
 const FALLBACK_DRIVERS = [
   { value: "simulator", label: "Simulator" },
   { value: "s7", label: "Siemens S7" },
   { value: "focas2", label: "FANUC FOCAS2" },
   { value: "opcua", label: "OPC UA" },
+  { value: "sinumerik-nck", label: "SINUMERIK NCK" },
 ];
 
 function FieldControl({ f }: { f: FieldDescriptor }) {

@@ -1,29 +1,26 @@
 [package]
-name = "mesa-driver-sinumerik"
+name = "mesa-driver-sinumerik-nck"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "mesa_driver_sinumerik"
+name = "mesa_driver_sinumerik_nck"
 path = "src/lib.rs"
 
 [[bin]]
-name = "mesa-driver-sinumerik"
+name = "mesa-driver-sinumerik-nck"
 path = "src/main.rs"
 
 [dependencies]
 mesa-core-types = { workspace = true }
 mesa-driver-protocol = { workspace = true }
 mesa-driver-sdk = { workspace = true }
-mesa-opcua-transport = { workspace = true }
+mesa-s7-transport = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-bytes = { workspace = true }
 thiserror = { workspace = true }
-async-opcua-types = "0.19"
-base64 = "0.22"

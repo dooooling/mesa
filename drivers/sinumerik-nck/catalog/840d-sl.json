@@ -1,0 +1,6 @@
+{
+  "$comment": "840D sl 系列增量（叠加 common）。条目形态见 catalog.rs parse_entry；数值回填需附真机证据行（GATE.md）。",
+  "$schema": "mesa:nck-catalog/v1",
+  "family": "840d-sl",
+  "variables": []
+}

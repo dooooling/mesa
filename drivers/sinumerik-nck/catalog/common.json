@@ -1,0 +1,6 @@
+{
+  "$comment": "NCK Catalog（跨系列通用）。铁律：wire 数值须经官方变量定义 + 确定性协议测试 + 真机三方确认方可填写；真机确认前 variables 保持为空（shipped_catalog_files_parse_and_hold_no_memory_numbers 锁定）。",
+  "$schema": "mesa:nck-catalog/v1",
+  "family": "common",
+  "variables": []
+}

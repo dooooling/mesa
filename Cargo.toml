@@ -13,7 +13,7 @@ members = [
     "drivers/s7",
     "drivers/focas2",
     "drivers/opcua",
-    "drivers/sinumerik",
+    "drivers/sinumerik-nck",
     "crates/opcua-transport",
     "crates/s7-transport",
     "tests/driver-contract",

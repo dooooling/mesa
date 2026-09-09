@@ -49,11 +49,6 @@ pub fn sim_exe() -> PathBuf {
     find_built_binary("mesa-driver-simulator")
 }
 
-/// 已构建的 sinumerik 可执行文件路径（同上，先 `--workspace` 构建，否则是旧二进制）。
-pub fn sinumerik_exe() -> PathBuf {
-    find_built_binary("mesa-driver-sinumerik")
-}
-
 /// 已构建的 mesad 可执行文件路径（P1-2 进程级 restart Gate 用；
 /// 同上，先 `cargo build --workspace`，否则是旧二进制）。
 pub fn mesad_exe() -> PathBuf {
