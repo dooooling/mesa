@@ -12,8 +12,8 @@ use crate::cotp::{build_cotp_cr, check_cc};
 use crate::error::{S7TransportError, map_connect_error};
 use crate::pdu::{build_s7_setup, parse_setup_ack};
 use crate::read_var::{
-    S7ReadVarItem, S7ReadVarResult, build_read_request, parse_bulk_response, parse_read_response,
-    plan_chunks,
+    S7ReadVarItem, S7ReadVarResult, build_read_request, check_single_item_fits,
+    parse_bulk_response, parse_read_response, plan_chunks,
 };
 use crate::szl::{build_szl_request, parse_szl_response};
 use crate::tpkt::{map_io_error, recv_packet, send_packet};
@@ -137,6 +137,11 @@ impl S7Session {
         let mut all = Vec::with_capacity(items.len());
         for range in plan_chunks(items, self.negotiated_pdu, bulk) {
             let chunk = &items[range];
+            // P2-1：单 item 自身超 PDU 即 fail-closed（plan_chunks 只做批间分片，
+            // 不会拆单个 item；NCK line_count 分段语义待真机确认前不猜）。
+            if chunk.len() == 1 {
+                check_single_item_fits(&chunk[0], self.negotiated_pdu, bulk)?;
+            }
             let pkt = build_read_request(self.pdu_ref, chunk);
             self.bump_pdu_ref();
             timeout(self.options.timeout(), send_packet(&mut self.stream, &pkt))

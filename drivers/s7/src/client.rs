@@ -177,6 +177,13 @@ impl S7Client {
                     return None;
                 }
                 let mut bytes = r.data;
+                // P1-2：transport 返回完整 wire 数据；长度语义由本层决定——
+                // 截断到请求长度（多余字节是设备多回，不是本点数据；不足则
+                // 原样透传，由 decode 报 SHORT_DATA，不在这里伪造）。
+                let want = it.kind.byte_len();
+                if bytes.len() > want {
+                    bytes.truncate(want);
+                }
                 // 防御：BIT 读取返回 1 字节 0x00/0x01，归一化（调用方常规经 BYTE 读后取位，此处仅兜底直传 BOOL 的情形）。
                 if it.kind == S7Kind::Bool {
                     bytes = vec![if bytes.first().copied().unwrap_or(0) != 0 {
@@ -221,7 +228,14 @@ impl S7Client {
                     tracing::warn!(idx = i, ret = r.return_code, "Bulk item BAD");
                     None
                 } else {
-                    Some(r.data)
+                    // P1-2：transport 返回完整 wire 数据；本层截断到请求长度，
+                    // 恢复 lib 按期望偏移切片的不变式（不足则原样透传）。
+                    let mut b = r.data;
+                    let want = physical[i].1;
+                    if b.len() > want {
+                        b.truncate(want);
+                    }
+                    Some(b)
                 }
             })
             .collect();
