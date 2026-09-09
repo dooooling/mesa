@@ -1,27 +1,33 @@
-//! SINUMERIK NCK Driver — 原生 NCK 只读（ADR 0001，Commit B 空壳）。
+//! SINUMERIK NCK Driver — 原生 NCK 只读（ADR 0001，Commit C 起可读）。
 //!
 //! 架构位置：
 //! ```text
 //! sinumerik-nck（本 crate：NCK 设备语义，variable 资源）
-//!       ↓ 不透明 var_spec（0x82/83/84，Commit C 起）
+//!       ↓ 不透明 var_spec（0x82/83/84，见 codec）
 //! mesa-s7-transport（S7Comm 会话/ReadVar/分片）
 //! ```
 //!
 //! - Core 只认识 Descriptor / ProbeReport / ResourceSelection / DataBatch，
 //!   无任何 `driver_id == "sinumerik-nck"` 分支；
 //! - V1 严格只读：`write`/`command` 沿用 SDK 默认 Unsupported；事件目录为空；
-//! - 本空壳实现 descriptor + 连接配置校验；probe/configure/browse/run 全部
-//!   `NOT_IMPLEMENTED`（TODO 注 Commit C/D/E，先让发现与契约就位）。
+//! - Commit C 点亮 wire codec + 会话直读；configure/数据面/browse 仍
+//!   `NOT_IMPLEMENTED`（TODO 注 Commit D/E）。
 
 mod address;
 mod catalog;
+mod client;
+mod codec;
 mod config;
 mod fixture;
+mod value;
 
 pub use address::{AddressError, NckArea, NckUnitMode, NckVariableRef};
 pub use catalog::{CatalogError, NckCatalog, NckShape, NckVariableDefinition, NckWireDefinition};
+pub use client::{NckClient, NckReadItem};
+pub use codec::{CodecError, NckWireAddress, encode_var_spec, resolve as resolve_wire};
 pub use config::{NCK_DEFAULT_PORT, NckConnConfig};
 pub use fixture::{NckFixtureState, spawn_nck_fixture};
+pub use value::{NckDataKind, NckSample, ValueError, decode_value};
 
 use mesa_core_types::{AcquisitionTask, DriverMetadata, PointDescriptor, PointMap};
 use mesa_driver_sdk::{Driver, DriverConnection, SdkDriverError};
