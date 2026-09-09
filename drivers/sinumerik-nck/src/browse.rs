@@ -378,7 +378,8 @@ mod tests {
         let params = b["parameters"].as_object().unwrap();
         let r = crate::address::NckVariableRef::from_parameters(params).unwrap();
         let def = cat.lookup(r.area, &r.block, &r.variable).unwrap();
-        let (wire, _, _) = crate::codec::resolve(&r, def).unwrap();
+        let rv = crate::codec::resolve(&r, def).unwrap();
+        let wire = rv.wire;
         assert_eq!(
             crate::codec::encode_var_spec(&wire),
             vec![0x12, 0x08, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01]

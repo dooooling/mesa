@@ -115,11 +115,21 @@ pub fn encode_var_spec(wire: &NckWireAddress) -> Vec<u8> {
 /// - shape 校验：Scalar 禁 line/column；Lines 必须 line；LinesAndColumns
 ///   必须 line + column（任一来自用户显式值；catalog 默认 column 计入）。
 ///   NOTE：严格性待真机放宽/收紧，只调此处。
-/// - 类型-线缆一致性：`kind` 字节长必须等于 `element_size`（防 catalog 笔误）。
+/// - 类型-线缆一致性：`kind` 字节长必须等于 `element_size`（防 catalog 笔误）；
+/// - 响应期望：`expected_transport_size` 取 catalog `wire.transport_size`
+///   （P1-4：响应 transport/长度逐项校验，不符即 BAD，不猜）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedVariable {
+    pub wire: NckWireAddress,
+    pub kind: NckDataKind,
+    pub expected_data_len: usize,
+    pub expected_transport_size: u8,
+}
+
 pub fn resolve(
     r: &NckVariableRef,
     def: &NckVariableDefinition,
-) -> Result<(NckWireAddress, NckDataKind, usize), CodecError> {
+) -> Result<ResolvedVariable, CodecError> {
     let kind = NckDataKind::parse(&def.data_type).map_err(|_| CodecError::TypeWireMismatch {
         variable: def.variable.clone(),
         data_type: def.data_type.clone(),
@@ -165,10 +175,15 @@ pub fn resolve(
         module: def.wire.module,
         line_count: r.count as u8,
     };
-    let expected_len = (r.count as usize)
+    let expected_data_len = (r.count as usize)
         .checked_mul(def.wire.element_size)
         .expect("count×element_size 上溢（count≤255，element 有界）");
-    Ok((wire, kind, expected_len))
+    Ok(ResolvedVariable {
+        wire,
+        kind,
+        expected_data_len,
+        expected_transport_size: def.wire.transport_size,
+    })
 }
 
 fn bad_shape(def: &NckVariableDefinition, reason: &str) -> CodecError {
@@ -229,7 +244,8 @@ mod tests {
                 "variable": "actFeedRate", "line": 3, "unit_mode": mode,
             }));
             let d = def(NckShape::Lines, 42);
-            let (w, _, _) = resolve(&rr, &d).unwrap();
+            let rv = resolve(&rr, &d).unwrap();
+            let w = rv.wire;
             assert_eq!(w.syntax_id, syntax, "{mode}");
             assert_eq!(
                 encode_var_spec(&w),
@@ -252,12 +268,14 @@ mod tests {
         // 缺省用 catalog；用户显式覆盖。
         let d = def(NckShape::LinesAndColumns, 42);
         let rr = r(serde_json::json!({"area": "C", "block": "S", "variable": "v", "line": 1}));
-        let (w, _, _) = resolve(&rr, &d).unwrap();
+        let rv = resolve(&rr, &d).unwrap();
+        let w = rv.wire;
         assert_eq!((w.column, w.line), (42, 1));
+        assert_eq!(rv.expected_transport_size, d.wire.transport_size);
         let rr2 = r(
             serde_json::json!({"area": "C", "block": "S", "variable": "v", "line": 1, "column": 7}),
         );
-        let (w2, _, _) = resolve(&rr2, &d).unwrap();
+        let w2 = resolve(&rr2, &d).unwrap().wire;
         assert_eq!((w2.column, w2.line), (7, 1));
     }
 
@@ -273,8 +291,11 @@ mod tests {
         assert!(resolve(&bad2, &lines).is_err());
         // 标量无行列通过，line 缺省 0。
         let ok = r(serde_json::json!({"area": "N", "block": "N", "variable": "v"}));
-        let (w, _, exp) = resolve(&ok, &scalar).unwrap();
-        assert_eq!((w.line, w.column, exp), (0, 0, 8));
+        let rv = resolve(&ok, &scalar).unwrap();
+        assert_eq!(
+            (rv.wire.line, rv.wire.column, rv.expected_data_len),
+            (0, 0, 8)
+        );
     }
 
     #[test]
@@ -296,8 +317,8 @@ mod tests {
         let rr = r(
             serde_json::json!({"area": "C", "block": "S", "variable": "v", "line": 1, "count": 3}),
         );
-        let (w, _, exp) = resolve(&rr, &d).unwrap();
-        assert_eq!(w.line_count, 3);
-        assert_eq!(exp, 24);
+        let rv = resolve(&rr, &d).unwrap();
+        assert_eq!(rv.wire.line_count, 3);
+        assert_eq!(rv.expected_data_len, 24);
     }
 }

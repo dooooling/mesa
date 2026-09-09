@@ -1,15 +1,17 @@
-//! NCK 会话客户端（Commit C：经 `mesa-s7-transport` 的 ReadVar 直读）。
+//! NCK 会话客户端（经 `mesa-s7-transport` 的 ReadVar 直读）。
 //!
 //! 分层（与 s7 对称）：
 //! ```text
 //! 本模块：NckConnConfig → S7Session 建连 / NckWireAddress → var_spec（codec）/
-//!     传输错误 → SDK 错误映射
-//!       ↓ 不透明 var_spec + 期望长度
+//!     逐项响应校验（P1-4）/ 传输错误 → SDK 错误映射
+//!       ↓ 不透明 var_spec + 期望长度（分片 hint）
 //! mesa-s7-transport（S7Session）：TCP/TPKT/COTP/Setup/ReadVar/分片
 //! ```
 //!
-//! 逐项错误隔离：单项 return code 非 0xFF → 该项 `None`（调用方发 BAD），
-//! 不整体失败；整包 ROSCTR/长度/基数错位才是连接级 fatal（transport 侧判定）。
+//! 逐项错误隔离（P1-4 fail-closed，不猜）：单项 `return_code != 0xFF`、
+//! `transport_size` 与期望不符、wire 数据长度与期望不符，任一成立该项即 BAD
+//! （`data` 为空，调用方发 BAD 点）；整包 ROSCTR/长度/基数错位才是连接级
+//! fatal（transport 侧判定）。
 
 use mesa_driver_sdk::SdkDriverError;
 
@@ -18,18 +20,23 @@ use crate::config::NckConnConfig;
 use mesa_core_types::ErrorKind;
 use mesa_s7_transport::{S7ReadVarItem, S7Session, S7TransportError, S7TransportErrorKind};
 
-/// 单个 NCK 读项（线缆地址 + 期望返回字节数，见 `codec::resolve`）。
+/// 单个 NCK 读项（线缆地址 + 响应期望，见 `codec::resolve`）。
 #[derive(Debug, Clone)]
 pub struct NckReadItem {
     pub wire: NckWireAddress,
     pub expected_data_len: usize,
+    /// 响应 `transport_size` 期望（catalog `wire.transport_size`）。
+    pub expected_transport_size: u8,
 }
 
-/// 单项读结果：返回码 + 数据（BAD 项 `data` 为空，调用方按项隔离发 BAD，
-/// `return_code` 留作 quality_code 诊断）。
+/// 单项读结果：返回码 + 传输尺寸 + 数据（BAD 项 `data` 为空，调用方按项
+/// 隔离发 BAD；`return_code`（非 FF 时）留作 quality_code 诊断，
+/// transport/长度 mismatch 时 `return_code` 为 FF、`quality_code` 为 None，
+/// 原因见 warn 日志，不伪造协议码）。
 #[derive(Debug, Clone)]
 pub struct NckReadResult {
     pub return_code: u8,
+    pub transport_size: u8,
     pub data: Option<Vec<u8>>,
 }
 
@@ -57,8 +64,9 @@ impl NckClient {
         Ok(Self { session })
     }
 
-    /// 批量读。返回与 items 等长的逐项结果，单项 return code 非 0xFF 即 BAD
-    /// （`data` 为空，不整体失败）；整包 ROSCTR/长度/基数错位才是连接级 fatal。
+    /// 批量读。返回与 items 等长的逐项结果；任一 mismatch（return code /
+    /// transport / 长度）该项即 BAD（`data` 为空，不整体失败）；
+    /// 整包 ROSCTR/长度/基数错位才是连接级 fatal。
     pub async fn read_vars(
         &mut self,
         items: &[NckReadItem],
@@ -80,18 +88,33 @@ impl NckClient {
             .map_err(map_transport_error)?;
         Ok(results
             .into_iter()
-            .map(|r| {
-                if r.return_code != mesa_s7_transport::S7_ITEM_OK {
-                    tracing::warn!(return_code = r.return_code, "NCK item 按项 BAD",);
-                    NckReadResult {
-                        return_code: r.return_code,
-                        data: None,
-                    }
+            .zip(items.iter())
+            .map(|(r, it)| {
+                let bad = if r.return_code != mesa_s7_transport::S7_ITEM_OK {
+                    tracing::warn!(return_code = r.return_code, "NCK item 按项 BAD");
+                    true
+                } else if r.transport_size != it.expected_transport_size {
+                    // P1-4：错误类型的数据绝不能标 GOOD（CNC 采集红线）。
+                    tracing::warn!(
+                        got = r.transport_size,
+                        want = it.expected_transport_size,
+                        "NCK transport 类型不符，按项 BAD",
+                    );
+                    true
+                } else if r.data.len() != it.expected_data_len {
+                    tracing::warn!(
+                        got = r.data.len(),
+                        want = it.expected_data_len,
+                        "NCK 响应长度不符，按项 BAD",
+                    );
+                    true
                 } else {
-                    NckReadResult {
-                        return_code: r.return_code,
-                        data: Some(r.data),
-                    }
+                    false
+                };
+                NckReadResult {
+                    return_code: r.return_code,
+                    transport_size: r.transport_size,
+                    data: if bad { None } else { Some(r.data) },
                 }
             })
             .collect())

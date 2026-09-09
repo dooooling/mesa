@@ -27,7 +27,9 @@ pub use address::{AddressError, NckArea, NckUnitMode, NckVariableRef};
 pub use browse::build_tree;
 pub use catalog::{CatalogError, NckCatalog, NckShape, NckVariableDefinition, NckWireDefinition};
 pub use client::{NckClient, NckReadItem, NckReadResult};
-pub use codec::{CodecError, NckWireAddress, encode_var_spec, resolve as resolve_wire};
+pub use codec::{
+    CodecError, NckWireAddress, ResolvedVariable, encode_var_spec, resolve as resolve_wire,
+};
 pub use config::{NCK_DEFAULT_PORT, NckConnConfig};
 pub use fixture::{NckFixture, NckFixtureState};
 pub use probe::{NCK_ANCHOR_PENDING, probe_with_session};
@@ -192,6 +194,8 @@ struct PointSpec {
     wire: NckWireAddress,
     kind: NckDataKind,
     expected_len: usize,
+    /// 响应 transport 期望（P1-4 逐项校验）。
+    expected_transport_size: u8,
     data_type: mesa_core_types::DataType,
     unit: Option<String>,
 }
@@ -245,8 +249,9 @@ fn decode_point(
     let good_value: Option<Value> = raw.and_then(|bytes| {
         let elem = spec.kind.byte_len();
         let count = spec.expected_len / elem;
-        if bytes.len() < spec.expected_len || count == 0 {
-            tracing::warn!(key = %spec.key, canonical = %spec.var_ref.canonical_key(), got = bytes.len(), need = spec.expected_len, "NCK 数据短包，按 BAD 隔离");
+        // P1-4：client 已保证 exact，此处再收一道（exact，不猜不补）。
+        if bytes.len() != spec.expected_len || count == 0 {
+            tracing::warn!(key = %spec.key, canonical = %spec.var_ref.canonical_key(), got = bytes.len(), need = spec.expected_len, "NCK 数据长度不符，按 BAD 隔离");
             return None;
         }
         let mut elems = Vec::with_capacity(count);
@@ -430,7 +435,7 @@ impl DriverConnection for NckConnection {
                                 format!("point `{}`: {e}", out.point_key),
                             )
                         })?;
-                    let (wire, kind, expected_len) = resolve_wire(&var_ref, def).map_err(|e| {
+                    let rv = resolve_wire(&var_ref, def).map_err(|e| {
                         SdkDriverError::new(
                             mesa_core_types::ErrorKind::Address,
                             "INVALID_VARIABLE",
@@ -446,10 +451,11 @@ impl DriverConnection for NckConnection {
                     new_points.push(PointSpec {
                         key: out.point_key.clone(),
                         var_ref,
-                        wire,
-                        kind,
-                        expected_len,
-                        data_type: kind.core_type(),
+                        wire: rv.wire,
+                        kind: rv.kind,
+                        expected_len: rv.expected_data_len,
+                        expected_transport_size: rv.expected_transport_size,
+                        data_type: rv.kind.core_type(),
                         unit: def.unit.clone(),
                     });
                 }
@@ -585,6 +591,7 @@ impl DriverConnection for NckConnection {
                         .map(|(spec, _)| NckReadItem {
                             wire: spec.wire,
                             expected_data_len: spec.expected_len,
+                            expected_transport_size: spec.expected_transport_size,
                         })
                         .collect();
                     let results = {

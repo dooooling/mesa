@@ -31,6 +31,10 @@ pub struct NckFixtureState {
     pub truncate: bool,
     /// 读失败注入：响应致命短包（驱动侧 fail 当前 attempt，session-loss 测试）。
     pub fail_reads: bool,
+    /// P1-4 注入：响应 transport 改为 0x07（长度自洽），驱动必须按项 BAD。
+    pub wrong_transport: bool,
+    /// P1-4 注入：响应数据减半（长度自洽），驱动必须按项 BAD。
+    pub short_payload: bool,
     /// 已收规范记录（测试断言 exact 发送字节用）。
     pub received: Arc<Mutex<Vec<Vec<u8>>>>,
 }
@@ -242,15 +246,28 @@ fn read_ack(req: &[u8], state: &NckFixtureState, ordinal: &mut u64) -> Vec<u8> {
             continue;
         }
         // 数据长度 = linecount × element_size；pattern 全字节为序号 tag。
+        // P1-4 注入：wrong_transport 改 transport（长度按 byte 自洽）；
+        // short_payload 减半数据（长度字段同步减半，自洽短包）。
         let linecount = spec[9] as usize;
         let len = linecount * state.element_size;
-        let len_bits = (len * 8) as u16;
+        let (transport, wire_len) = if state.wrong_transport {
+            (0x07u8, len)
+        } else if state.short_payload {
+            (0x04u8, len / 2)
+        } else {
+            (0x04u8, len)
+        };
+        let len_field = if transport == 0x04 {
+            (wire_len * 8) as u16
+        } else {
+            wire_len as u16
+        };
         data.push(0xFF);
-        data.push(0x04);
-        data.extend_from_slice(&len_bits.to_be_bytes());
-        data.extend_from_slice(&vec![tag; len]);
+        data.push(transport);
+        data.extend_from_slice(&len_field.to_be_bytes());
+        data.extend_from_slice(&vec![tag; wire_len]);
         // 奇长项补齐（除末项），模仿 CPU 字对齐。
-        if len % 2 == 1 && k + 1 < specs.len() {
+        if wire_len % 2 == 1 && k + 1 < specs.len() {
             data.push(0x00);
         }
     }
@@ -306,6 +323,7 @@ mod tests {
                 line_count: linecount,
             },
             expected_data_len: linecount as usize * 8,
+            expected_transport_size: 0x04,
         }
     }
 
@@ -441,5 +459,65 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "READ_SHORT");
+    }
+
+    #[tokio::test]
+    async fn nck_transport_size_mismatch_is_bad() {
+        // P1-4：return_code FF 但 transport 0x07≠期望 0x04 → 按项 BAD
+        // （错误类型的数据绝不能标 GOOD），不整体失败。
+        let fx = NckFixture::spawn(NckFixtureState {
+            wrong_transport: true,
+            ..state()
+        })
+        .await;
+        let mut c = connect(&fx).await;
+        let out = c
+            .read_vars(&[item(0x82, 0x41, 42, 0, 1), item(0x82, 0x41, 42, 1, 1)])
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out[0].data.is_none(), "transport 不符必须 BAD");
+        assert_eq!(out[0].return_code, 0xFF);
+        assert_eq!(out[0].transport_size, 0x07);
+        assert!(out[1].data.is_none());
+    }
+
+    #[tokio::test]
+    async fn nck_response_length_mismatch_is_bad() {
+        // P1-4：自洽短包（4 字节，期望 8）→ 按项 BAD，不整体失败。
+        let fx = NckFixture::spawn(NckFixtureState {
+            short_payload: true,
+            ..state()
+        })
+        .await;
+        let mut c = connect(&fx).await;
+        let out = c.read_vars(&[item(0x82, 0x41, 42, 0, 1)]).await.unwrap();
+        assert!(out[0].data.is_none(), "长度不符必须 BAD");
+        assert_eq!(out[0].return_code, 0xFF);
+    }
+
+    #[tokio::test]
+    async fn nck_single_item_over_negotiated_pdu_fails_closed() {
+        // P2-1：F64 count=255（期望 2040）@协商 480 → 发送前拒绝，
+        // 不发超长请求（line 分段语义待真机确认）。
+        let fx = NckFixture::spawn(state()).await;
+        let mut c = connect(&fx).await;
+        assert_eq!(c.negotiated_pdu_length(), 480);
+        let huge = NckReadItem {
+            wire: NckWireAddress {
+                syntax_id: 0x82,
+                area_unit: 0x41,
+                column: 42,
+                line: 1,
+                module: 0x12,
+                line_count: 255,
+            },
+            expected_data_len: 255 * 8,
+            expected_transport_size: 0x04,
+        };
+        let err = c.read_vars(&[huge]).await.unwrap_err();
+        assert_eq!(err.code, "READ_ITEM_TOO_LARGE");
+        // fixture 侧未收到任何规范（拒绝发生在发送前）。
+        assert!(fx.received_specs().is_empty());
     }
 }
