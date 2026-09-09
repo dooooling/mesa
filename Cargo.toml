@@ -16,6 +16,7 @@ members = [
     "drivers/sinumerik-nck",
     "crates/opcua-transport",
     "crates/s7-transport",
+    "tools/nck-emulator",
     "tests/driver-contract",
     "tests/performance",
 ]

@@ -40,7 +40,7 @@ pub const S7_CHUNK_SAFETY_MARGIN: usize = 32;
 /// fail-loud（多消费→`READ_DATA_SHORT`），而非欠消费导致的静默错位）。
 pub fn wire_data_len(transport: u8, len_field: usize) -> usize {
     match transport {
-        0x03 | 0x04 | 0x05 => len_field.div_ceil(8),
+        0x03..=0x05 => len_field.div_ceil(8),
         _ => len_field,
     }
 }

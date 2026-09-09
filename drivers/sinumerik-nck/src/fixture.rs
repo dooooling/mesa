@@ -35,6 +35,9 @@ pub struct NckFixtureState {
     pub wrong_transport: bool,
     /// P1-4 注入：响应数据减半（长度自洽），驱动必须按项 BAD。
     pub short_payload: bool,
+    /// 读 N 次后主动断开当连接（`disconnect_after_n_reads` 场景；
+    /// `None` = 永不主动断开）。计数按连接独立。
+    pub disconnect_after_reads: Option<usize>,
     /// 已收规范记录（测试断言 exact 发送字节用）。
     pub received: Arc<Mutex<Vec<Vec<u8>>>>,
 }
@@ -63,12 +66,15 @@ pub struct NckFixture {
 }
 
 impl NckFixture {
-    /// 启动脚手架：握手 + NCK ReadVar 服务循环。
+    /// 启动脚手架（本机回环随机端口）+ 初始状态：握手 + NCK ReadVar 服务循环。
     pub async fn spawn(state: NckFixtureState) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("fixture bind");
-        let addr = listener.local_addr().expect("fixture addr");
+        Self::spawn_with_state("127.0.0.1:0".parse().expect("回环地址"), state).await
+    }
+
+    /// 启动脚手架（指定监听地址 + 初始状态；standalone emulator 用固定端口）。
+    pub async fn spawn_with_state(addr: SocketAddr, state: NckFixtureState) -> Self {
+        let listener = TcpListener::bind(addr).await.expect("fixture bind");
+        let bound = listener.local_addr().expect("fixture addr");
         let shared = Arc::new(Mutex::new(state));
         let conn_shared = Arc::clone(&shared);
         let handle = tokio::spawn(async move {
@@ -83,7 +89,7 @@ impl NckFixture {
             }
         });
         Self {
-            addr,
+            addr: bound,
             state: shared,
             handle,
         }
@@ -190,8 +196,9 @@ async fn serve_conn(mut stream: tokio::net::TcpStream, shared: Arc<Mutex<NckFixt
     if !send_packet(&mut stream, &ack).await {
         return;
     }
-    // 3) NCK ReadVar 服务循环（连接级全局序号供 pattern）。
+    // 3) NCK ReadVar 服务循环（连接级全局序号供 pattern；读计数供断开场景）。
     let mut ordinal: u64 = 0;
+    let mut reads: usize = 0;
     loop {
         let pkt = match read_packet(&mut stream).await {
             Some(p) => p,
@@ -208,6 +215,10 @@ async fn serve_conn(mut stream: tokio::net::TcpStream, shared: Arc<Mutex<NckFixt
         let state = shared.lock().expect("fixture 状态").clone();
         let resp = read_ack(s7, &state, &mut ordinal);
         if !send_packet(&mut stream, &resp).await {
+            break;
+        }
+        reads += 1;
+        if state.disconnect_after_reads.is_some_and(|n| reads >= n) {
             break;
         }
     }
@@ -460,6 +471,39 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "READ_SHORT");
+    }
+
+    #[tokio::test]
+    async fn spawn_with_state_binds_fixed_addr() {
+        // Layer4：指定地址绑定（emulator 固定端口路径），端口号原样保留。
+        let fx = NckFixture::spawn_with_state("127.0.0.1:0".parse().unwrap(), state()).await;
+        assert_eq!(fx.addr.ip().to_string(), "127.0.0.1");
+        assert!(fx.addr.port() != 0, "随机端口必须落定");
+        let mut c = connect(&fx).await;
+        let out = c.read_vars(&[item(0x82, 0x41, 42, 0, 1)]).await.unwrap();
+        assert!(out[0].data.is_some());
+    }
+
+    #[tokio::test]
+    async fn disconnect_after_reads_closes_connection() {
+        // Layer4：服务 1 次读后主动断开；第 2 次读必须连接级失败。
+        let fx = NckFixture::spawn(NckFixtureState {
+            disconnect_after_reads: Some(1),
+            ..state()
+        })
+        .await;
+        let mut c = connect(&fx).await;
+        let ok = c.read_vars(&[item(0x82, 0x41, 42, 0, 1)]).await.unwrap();
+        assert!(ok[0].data.is_some());
+        let err = c
+            .read_vars(&[item(0x82, 0x41, 42, 0, 1)])
+            .await
+            .unwrap_err();
+        assert!(
+            err.code == "READ_TIMEOUT" || err.code == "READ_RECV_FAIL" || err.code == "READ_SHORT",
+            "断开后读必须失败，实际: {}",
+            err.code
+        );
     }
 
     #[tokio::test]
