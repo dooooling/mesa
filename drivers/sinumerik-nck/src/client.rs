@@ -25,6 +25,14 @@ pub struct NckReadItem {
     pub expected_data_len: usize,
 }
 
+/// 单项读结果：返回码 + 数据（BAD 项 `data` 为空，调用方按项隔离发 BAD，
+/// `return_code` 留作 quality_code 诊断）。
+#[derive(Debug, Clone)]
+pub struct NckReadResult {
+    pub return_code: u8,
+    pub data: Option<Vec<u8>>,
+}
+
 /// NCK 客户端：持有已建立的 S7Comm 会话。
 pub struct NckClient {
     session: S7Session,
@@ -49,12 +57,12 @@ impl NckClient {
         Ok(Self { session })
     }
 
-    /// 批量读。返回与 items 等长的 `Option<原始字节>`，`None` 表示该项
-    /// NCK 返回码非 0xFF（按项 BAD 隔离，不整体失败）。
+    /// 批量读。返回与 items 等长的逐项结果，单项 return code 非 0xFF 即 BAD
+    /// （`data` 为空，不整体失败）；整包 ROSCTR/长度/基数错位才是连接级 fatal。
     pub async fn read_vars(
         &mut self,
         items: &[NckReadItem],
-    ) -> Result<Vec<Option<Vec<u8>>>, SdkDriverError> {
+    ) -> Result<Vec<NckReadResult>, SdkDriverError> {
         if items.is_empty() {
             return Ok(vec![]);
         }
@@ -75,9 +83,15 @@ impl NckClient {
             .map(|r| {
                 if r.return_code != mesa_s7_transport::S7_ITEM_OK {
                     tracing::warn!(return_code = r.return_code, "NCK item 按项 BAD",);
-                    None
+                    NckReadResult {
+                        return_code: r.return_code,
+                        data: None,
+                    }
                 } else {
-                    Some(r.data)
+                    NckReadResult {
+                        return_code: r.return_code,
+                        data: Some(r.data),
+                    }
                 }
             })
             .collect())

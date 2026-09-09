@@ -87,6 +87,30 @@ impl NckCatalog {
         Self::default()
     }
 
+    /// 装载随仓 catalog（`catalog/{common,840d-sl,828d}.json` 依次合并，
+    /// 后者覆盖前者；目录由 `MESA_NCK_CATALOG_DIR` 覆盖，缺省随 crate 源码）。
+    ///
+    /// 缺失/非法即 fail-closed（资产缺失必须 loud，不能静默空跑）。
+    /// NOTE: 系列冲突（同变量两系列不同 wire）当前以后文件为准；probe 确定
+    /// 系列后按系列裁剪（Commit E），V1 文件皆空无冲突。
+    pub fn load_shipped() -> Result<Self, CatalogError> {
+        let dir = std::env::var("MESA_NCK_CATALOG_DIR")
+            .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string() + "/catalog");
+        let mut cat = Self::empty();
+        for family in ["common", "840d-sl", "828d"] {
+            let path = format!("{dir}/{family}.json");
+            let text = std::fs::read_to_string(&path).map_err(|e| CatalogError::Invalid {
+                reason: format!("catalog 缺失 {path}: {e}"),
+            })?;
+            let v: serde_json::Value =
+                serde_json::from_str(&text).map_err(|e| CatalogError::Invalid {
+                    reason: format!("catalog 非法 {path}: {e}"),
+                })?;
+            cat.merge(Self::from_json(&v)?);
+        }
+        Ok(cat)
+    }
+
     /// 从 JSON 文档加载（`catalog/*.json` 形态，见 `catalog/common.json` 注释）。
     pub fn from_json(v: &serde_json::Value) -> Result<Self, CatalogError> {
         let mut cat = Self::empty();

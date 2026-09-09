@@ -29,6 +29,8 @@ pub struct NckFixtureState {
     pub fail_items: HashSet<usize>,
     /// 畸形模式：读响应截断（malformed 测试）。
     pub truncate: bool,
+    /// 读失败注入：响应致命短包（驱动侧 fail 当前 attempt，session-loss 测试）。
+    pub fail_reads: bool,
     /// 已收规范记录（测试断言 exact 发送字节用）。
     pub received: Arc<Mutex<Vec<Vec<u8>>>>,
 }
@@ -47,26 +49,68 @@ impl NckFixtureState {
 }
 
 /// 启动脚手架：握手 + NCK ReadVar 服务循环。
-pub async fn spawn_nck_fixture(
-    state: NckFixtureState,
-) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("fixture bind");
-    let addr = listener.local_addr().expect("fixture addr");
-    let shared = Arc::new(Mutex::new(state));
-    let handle = tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
-            };
-            let shared = Arc::clone(&shared);
-            tokio::spawn(async move {
-                serve_conn(stream, shared).await;
-            });
+/// 回环脚手架句柄：地址 + 可变状态（故障注入）+ 确定性清理（drop 即 abort）。
+pub struct NckFixture {
+    /// 监听地址（驱动 dial 用）。
+    pub addr: SocketAddr,
+    /// 共享状态：测试中途可改（`fail_items`/`fail_reads` 注入）。
+    pub state: Arc<Mutex<NckFixtureState>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl NckFixture {
+    /// 启动脚手架：握手 + NCK ReadVar 服务循环。
+    pub async fn spawn(state: NckFixtureState) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("fixture bind");
+        let addr = listener.local_addr().expect("fixture addr");
+        let shared = Arc::new(Mutex::new(state));
+        let conn_shared = Arc::clone(&shared);
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let shared = Arc::clone(&conn_shared);
+                tokio::spawn(async move {
+                    serve_conn(stream, shared).await;
+                });
+            }
+        });
+        Self {
+            addr,
+            state: shared,
+            handle,
         }
-    });
-    (addr, handle)
+    }
+
+    /// 收到的规范记录（exact 发送字节断言用）。
+    pub fn received_specs(&self) -> Vec<Vec<u8>> {
+        self.state
+            .lock()
+            .expect("fixture 记录")
+            .received
+            .lock()
+            .expect("fixture 记录")
+            .clone()
+    }
+
+    /// 注入当包 BAD（项索引集，每请求重新计数）。
+    pub fn set_fail_items(&self, items: &[usize]) {
+        self.state.lock().expect("fixture 状态").fail_items = items.iter().copied().collect();
+    }
+
+    /// 注入读失败（返回畸形/致命，驱动侧 fail 当前 attempt）。
+    pub fn set_fail_reads(&self, fail: bool) {
+        self.state.lock().expect("fixture 状态").fail_reads = fail;
+    }
+}
+
+impl Drop for NckFixture {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 async fn read_packet(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
@@ -167,6 +211,10 @@ async fn serve_conn(mut stream: tokio::net::TcpStream, shared: Arc<Mutex<NckFixt
 
 /// 构造 NCK 读响应：param [04, count] + 逐项 `[ret, transport, len16, data]`。
 fn read_ack(req: &[u8], state: &NckFixtureState, ordinal: &mut u64) -> Vec<u8> {
+    if state.fail_reads {
+        // 致命短包：驱动侧整包 fatal（fail 当前 attempt，Manager 重建会话）。
+        return vec![0x32, 0x03];
+    }
     // 请求 param [0x04, count] 位于 s7[10..12]，规范从 s7[12] 起每 10 字节一项。
     let count = req.get(11).copied().unwrap_or(0) as usize;
     let mut specs = Vec::with_capacity(count);
@@ -228,19 +276,23 @@ mod tests {
     use crate::codec::NckWireAddress;
     use crate::config::NckConnConfig;
 
-    async fn connect(state: &NckFixtureState) -> (NckClient, SocketAddr) {
-        let (addr, _) = spawn_nck_fixture(state.clone()).await;
-        // NOTE: handle 故意不 abort（测试结束即回收；abort 竞争曾导致偶发失败）。
+    async fn connect(fx: &NckFixture) -> NckClient {
         let cfg = NckConnConfig {
             host: "127.0.0.1".into(),
-            port: addr.port(),
+            port: fx.addr.port(),
             local_tsap: 0x0100,
             remote_tsap: 0x0100,
             timeout_ms: 3000,
             requested_pdu_length: 480,
         };
-        let client = NckClient::connect(&cfg).await.expect("NCK 建连");
-        (client, addr)
+        NckClient::connect(&cfg).await.expect("NCK 建连")
+    }
+
+    fn state() -> NckFixtureState {
+        NckFixtureState {
+            element_size: 8,
+            ..Default::default()
+        }
     }
 
     fn item(syntax: u8, area_unit: u8, column: u16, line: u16, linecount: u8) -> NckReadItem {
@@ -257,13 +309,20 @@ mod tests {
         }
     }
 
+    fn data_of(out: &[crate::client::NckReadResult], k: usize) -> &Vec<u8> {
+        out[k]
+            .data
+            .as_ref()
+            .unwrap_or_else(|| panic!("第 {k} 项应为 GOOD"))
+    }
+
     #[tokio::test]
     async fn handshake_negotiates_pdu() {
         use mesa_s7_transport::{S7ConnectOptions, S7Session};
-        let (addr, h) = spawn_nck_fixture(NckFixtureState::with_max_pdu(240)).await;
+        let fx = NckFixture::spawn(NckFixtureState::with_max_pdu(240)).await;
         let opts = S7ConnectOptions {
             host: "127.0.0.1".into(),
-            port: addr.port(),
+            port: fx.addr.port(),
             local_tsap: 0x0100,
             remote_tsap: 0x0100,
             timeout_ms: 3000,
@@ -272,22 +331,18 @@ mod tests {
         let session = S7Session::connect(opts).await.expect("握手成功");
         assert_eq!(session.negotiated_pdu_length(), 240);
         session.disconnect().await.unwrap();
-        h.abort();
     }
 
     #[tokio::test]
     async fn loopback_single_read_exact() {
-        let state = NckFixtureState {
-            element_size: 8,
-            ..Default::default()
-        };
-        let (mut c, _) = connect(&state).await;
+        let fx = NckFixture::spawn(state()).await;
+        let mut c = connect(&fx).await;
         let out = c.read_vars(&[item(0x82, 0x41, 42, 3, 1)]).await.unwrap();
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].as_ref().unwrap(), &vec![0x01; 8]);
+        assert_eq!(data_of(&out, 0), &vec![0x01; 8]);
         // exact 发送字节断言。
         assert_eq!(
-            state.received_specs(),
+            fx.received_specs(),
             vec![vec![
                 0x12, 0x08, 0x82, 0x41, 0x00, 0x2A, 0x00, 0x03, 0x12, 0x01
             ]]
@@ -296,41 +351,41 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_multi_read_chunks_in_order() {
-        let state = NckFixtureState {
-            element_size: 8,
-            ..Default::default()
-        };
-        let (mut c, _) = connect(&state).await;
+        let fx = NckFixture::spawn(state()).await;
+        let mut c = connect(&fx).await;
         // 10 字节规范 + 8 期望：首项 18、后续 22；预算 448 → 20+5 两包。
         let items: Vec<_> = (0..25).map(|k| item(0x82, 0x41, 42, k as u16, 1)).collect();
         let out = c.read_vars(&items).await.unwrap();
         assert_eq!(out.len(), 25);
-        for (k, raw) in out.iter().enumerate() {
-            assert_eq!(raw.as_ref().unwrap(), &vec![(k as u8) + 1; 8], "第 {k} 项");
+        for (k, r) in out.iter().enumerate() {
+            assert_eq!(
+                r.data.as_ref().unwrap(),
+                &vec![(k as u8) + 1; 8],
+                "第 {k} 项"
+            );
         }
-        assert_eq!(state.received_specs().len(), 25);
+        assert_eq!(fx.received_specs().len(), 25);
     }
 
     #[tokio::test]
     async fn loopback_partial_bad_isolated_and_truncate_fatal() {
-        let mut st = NckFixtureState {
-            element_size: 8,
-            ..Default::default()
-        };
-        st.fail_items.insert(1);
-        let (mut c, _) = connect(&st).await;
+        let fx = NckFixture::spawn(state()).await;
+        fx.set_fail_items(&[1]);
+        let mut c = connect(&fx).await;
         let items: Vec<_> = (0..3).map(|k| item(0x82, 0x41, 42, k, 1)).collect();
         let out = c.read_vars(&items).await.unwrap();
         assert_eq!(out.len(), 3);
-        assert!(out[0].is_some());
-        assert!(out[1].is_none(), "第 1 项 BAD 必须隔离");
-        assert_eq!(out[2].as_ref().unwrap(), &vec![0x03; 8]);
+        assert!(out[0].data.is_some());
+        assert!(out[1].data.is_none(), "第 1 项 BAD 必须隔离");
+        assert_eq!(out[1].return_code, 0x05);
+        assert_eq!(data_of(&out, 2), &vec![0x03; 8]);
 
-        let trunc = NckFixtureState {
+        let fx2 = NckFixture::spawn(NckFixtureState {
             truncate: true,
             ..Default::default()
-        };
-        let (mut c2, _) = connect(&trunc).await;
+        })
+        .await;
+        let mut c2 = connect(&fx2).await;
         let err = c2
             .read_vars(&[item(0x82, 0x41, 42, 0, 1)])
             .await
@@ -344,11 +399,8 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_all_three_syntaxes_accepted() {
-        let state = NckFixtureState {
-            element_size: 8,
-            ..Default::default()
-        };
-        let (mut c, _) = connect(&state).await;
+        let fx = NckFixture::spawn(state()).await;
+        let mut c = connect(&fx).await;
         let out = c
             .read_vars(&[
                 item(0x82, 0x41, 1, 1, 1),
@@ -358,8 +410,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.len(), 3);
-        assert!(out.iter().all(|r| r.is_some()));
-        let specs = state.received_specs();
+        assert!(out.iter().all(|r| r.data.is_some()));
+        let specs = fx.received_specs();
         assert_eq!(specs.len(), 3);
         assert_eq!(specs[0][2], 0x82);
         assert_eq!(specs[1][2], 0x83);
@@ -368,13 +420,26 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_linecount_scales_data() {
-        let state = NckFixtureState {
-            element_size: 8,
-            ..Default::default()
-        };
-        let (mut c, _) = connect(&state).await;
+        let fx = NckFixture::spawn(state()).await;
+        let mut c = connect(&fx).await;
         // linecount=3 → 24 字节。
         let out = c.read_vars(&[item(0x82, 0x41, 42, 1, 3)]).await.unwrap();
-        assert_eq!(out[0].as_ref().unwrap(), &vec![0x01; 24]);
+        assert_eq!(data_of(&out, 0), &vec![0x01; 24]);
+    }
+
+    #[tokio::test]
+    async fn loopback_fail_reads_is_session_fatal() {
+        let fx = NckFixture::spawn(state()).await;
+        let mut c = connect(&fx).await;
+        // 先 GOOD，确认通路。
+        let ok = c.read_vars(&[item(0x82, 0x41, 42, 0, 1)]).await.unwrap();
+        assert!(ok[0].data.is_some());
+        // 中途注入读失败 → 整包 fatal（驱动侧 fail 当前 attempt，Manager 重建）。
+        fx.set_fail_reads(true);
+        let err = c
+            .read_vars(&[item(0x82, 0x41, 42, 0, 1)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "READ_SHORT");
     }
 }
