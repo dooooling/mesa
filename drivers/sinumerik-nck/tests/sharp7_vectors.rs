@@ -6,13 +6,11 @@
 //! 约束：Area 恒为 0（N）——`0<<4 == 0<<5`，刻意避开 area 合成未决分歧；
 //! 本测试不断言任何非零 Area 的 areaunit 字节。
 //!
-//! 三重断言（证据等级见 ADR 0002：请求为独立 wire evidence，
-//! 响应为 compatibility evidence——rsp 是 emulator 生成、Sharp7 接受，
-//! 不是独立 server framing evidence）：
+//! 三重断言（F3 证据等价：S7WLDouble + element-size 8，Sharp7 与 Mesa
+//! 对同一 wire 得到相同语义数据，不止 framing/status 一致）：
 //! 1. Sharp7 请求 item == Mesa `encode_var_spec` 同逻辑地址输出（exact differential）；
-//! 2. 同一抓包的响应经 Mesa transport 解析为 GOOD + pattern 数据
-//!    （Sharp7 当时解码 rc=0；两实现对同一 wire 一致解码）；
-//! 3. manifest 的 pin（commit/area/rc）与文件集一致，防向量漂移。
+//! 2. Sharp7 manifest 解码字节 == Mesa 同包回放解码字节（双解码一致）；
+//! 3. manifest 的 pin（commit/area/rc/wordLen）与文件集一致，防向量漂移。
 
 use mesa_driver_sinumerik_nck::{NckWireAddress, encode_var_spec};
 use mesa_s7_transport::pdu::parse_setup_ack;
@@ -57,6 +55,9 @@ fn manifest_pins_source_and_outcome() {
         "Sharp7 pin 漂移即失效"
     );
     assert_eq!(m["area"], 0, "只允许 Area=0（分歧规避）");
+    // F3 等价要求：S7WLDouble(0x1A=26) + element-size 8，Sharp7 必须解出
+    // 完整 8 字节（不止 framing/status 一致）。
+    assert_eq!(m["wordLen"], 26, "必须 S7WLDouble");
     assert_eq!(m["events"][0]["rc"], 0);
     assert_eq!(m["events"][1]["rc"], 0);
     for f in [
@@ -71,6 +72,35 @@ fn manifest_pins_source_and_outcome() {
     ] {
         assert!(dir().join(f).exists(), "缺 {f}");
     }
+}
+
+#[test]
+fn sharp7_single_double_decodes_exact_8_bytes() {
+    // Sharp7 端（manifest）：单读 rc=0、bytesRead=8、data 全 0x01。
+    let m = manifest();
+    let single = &m["events"][0];
+    assert_eq!(single["bytesRead"], 8);
+    assert_eq!(single["data"], "01-01-01-01-01-01-01-01");
+    // Mesa 端（同包回放）：GOOD + 同样 8 字节 → 同一 wire 双解码一致。
+    let rsp = read("rsp-06.bin");
+    let out = parse_read_response(&rsp, &[parse_item()]).expect("Mesa 解析");
+    assert_eq!(out[0].return_code, 0xFF);
+    assert_eq!(out[0].data, vec![0x01; 8]);
+}
+
+#[test]
+fn sharp7_multi_results_and_buffers_exact() {
+    // Sharp7 端：overall rc=0、双 GOOD、两 buffer 各 exact 8 字节。
+    let m = manifest();
+    let multi = &m["events"][1];
+    assert_eq!(multi["results"], serde_json::json!([0, 0]));
+    assert_eq!(multi["buf0"], "02-02-02-02-02-02-02-02");
+    assert_eq!(multi["buf1"], "03-03-03-03-03-03-03-03");
+    // Mesa 端（同包回放）：同样 GOOD + 同样 pattern → 双解码一致。
+    let rsp = read("rsp-08.bin");
+    let out = parse_read_response(&rsp, &[parse_item(), parse_item()]).expect("Mesa 解析");
+    assert_eq!(out[0].data, vec![0x02; 8]);
+    assert_eq!(out[1].data, vec![0x03; 8]);
 }
 
 #[test]
@@ -111,24 +141,6 @@ fn parse_item() -> S7ReadVarItem {
         var_spec: vec![0x12],
         expected_data_len: 8,
     }
-}
-
-#[test]
-fn responses_parse_good_in_mesa_too() {
-    // rsp-06：Sharp7 当时解码 rc=0 取 1 字节 0x01；Mesa 解析同包必须 GOOD
-    // 且 8 字节 pattern 全 0x01（连接内首项序号 tag）。
-    let rsp = read("rsp-06.bin");
-    let out = parse_read_response(&rsp, &[parse_item()]).expect("Mesa 解析");
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].return_code, 0xFF);
-    assert_eq!(out[0].transport_size, 0x04);
-    assert_eq!(out[0].data, vec![0x01; 8]);
-    // rsp-08：两项 tags 0x02/0x03（序号跨请求连续），Mesa 同样 GOOD。
-    let rsp = read("rsp-08.bin");
-    let out = parse_read_response(&rsp, &[parse_item(), parse_item()]).expect("Mesa 解析");
-    assert_eq!(out.len(), 2);
-    assert_eq!(out[0].data, vec![0x02; 8]);
-    assert_eq!(out[1].data, vec![0x03; 8]);
 }
 
 #[test]

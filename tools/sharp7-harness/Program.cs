@@ -26,8 +26,20 @@ static class Harness
         public int Param = 42;
         public int Start = 0;
         public int Amount = 1;
-        public int WordLen = 2; // S7WLByte
+        public int WordLen = 0x1A; // S7WLDouble（8 bytes；与 emulator element-size 8 等价，F3 证据等价要求）
     }
+
+    // 期望解码字节数 = Amount × WordSize（WordLen 决定；DOUBLE=8）。
+    // F3 要求 Sharp7 与 Mesa 对同一 wire 得到相同语义数据（exact bytes），
+    // 不止 framing/status 一致。
+    static int ExpectedBytes(Args a) => a.Amount * WordSize(a.WordLen);
+
+    static int WordSize(int wordLen) => wordLen switch
+    {
+        0x1A => 8, // S7WLDouble
+        0x02 => 1, // S7WLByte
+        _ => -1,   // 未支持：拒绝猜
+    };
 
     static int Main(string[] argv)
     {
@@ -61,24 +73,30 @@ static class Harness
 
         // client 与 pump 并发：握手包必须在 NckConnectTo 期间就被转发。
         // 顺序：等 accept（client TCP 经 backlog 完成）→ 起 pump → client 建连+读写。
+        // 严格 exit 码（证据工具禁 false-green）：任何一步失败即非零退出；
+        // clientDone 必在 finally 置位，避免主线程空等。
         var clientDone = new ManualResetEventSlim(false);
         int clientRc = 0;
         var clientThread = new Thread(() =>
         {
+            var client = new S7Client();
             try
             {
-                var client = new S7Client();
+                int expect = ExpectedBytes(a);
+                if (expect <= 0 || expect > 256) { Console.WriteLine($"bad wordlen {a.WordLen}"); clientRc = 10; return; }
                 client.PLCPort = tapPort;
                 int rc = client.NckConnectTo("127.0.0.1");
                 Console.WriteLine($"NckConnectTo rc={rc}");
-                if (rc != 0) { clientRc = 1; return; }
+                if (rc != 0) { clientRc = 11; return; }
 
-                // --- single read（ReadNckArea） ---
+                // --- single read（ReadNckArea）：要求 exact bytes ---
                 byte[] singleBuf = new byte[256];
                 int bytesRead = 0;
                 rc = client.ReadNckArea(0, a.Unit, a.Module, a.Param, a.Start, a.Amount, a.WordLen, singleBuf, ref bytesRead);
                 Console.WriteLine($"ReadNckArea rc={rc} bytesRead={bytesRead} data={BitConverter.ToString(singleBuf, 0, Math.Max(bytesRead, 0))}");
                 lock (events) { events.Add(new { op = "single", rc, bytesRead, data = BitConverter.ToString(singleBuf, 0, Math.Max(bytesRead, 0)) }); }
+                if (rc != 0) { clientRc = 12; return; }
+                if (bytesRead != expect) { Console.WriteLine($"single bytes mismatch {bytesRead} != {expect}"); clientRc = 13; return; }
 
                 // --- multi read（ReadMultiNckVars，两项：param 与 param+1） ---
                 var multi = new S7NckMultiVar(client);
@@ -87,14 +105,19 @@ static class Harness
                 multi.NckAdd(0, a.Unit, a.Module, a.Param, a.WordLen, a.Start, a.Amount, ref buf0);
                 multi.NckAdd(0, a.Unit, a.Module, a.Param + 1, a.WordLen, a.Start, a.Amount, ref buf1);
                 rc = multi.ReadNck();
-                Console.WriteLine($"MultiRead rc={rc} results=[{multi.Results[0]},{multi.Results[1]}]");
-                lock (events) { events.Add(new { op = "multi", rc, results = new[] { multi.Results[0], multi.Results[1] } }); }
-                if (rc != 0) clientRc = 2;
+                Console.WriteLine($"MultiRead rc={rc} results=[{multi.Results[0]},{multi.Results[1]}] buf0={BitConverter.ToString(buf0, 0, expect)} buf1={BitConverter.ToString(buf1, 0, expect)}");
+                lock (events) { events.Add(new { op = "multi", rc, results = new[] { multi.Results[0], multi.Results[1] }, buf0 = BitConverter.ToString(buf0, 0, expect), buf1 = BitConverter.ToString(buf1, 0, expect) }); }
+                if (rc != 0) { clientRc = 14; return; }
+                if (multi.Results[0] != 0 || multi.Results[1] != 0) { Console.WriteLine("multi item BAD"); clientRc = 15; return; }
 
                 client.Disconnect();
             }
             catch (Exception e) { Console.WriteLine($"client end: {e.Message}"); clientRc = 1; }
-            clientDone.Set();
+            finally
+            {
+                try { client.Disconnect(); } catch { }
+                clientDone.Set();
+            }
         });
         clientThread.IsBackground = true;
         clientThread.Start();
@@ -102,19 +125,21 @@ static class Harness
         if (!acceptDone.Wait(10000)) return Fail("tap accept timeout", -1);
         // tap 双向泵跑在独立线程（req = client→server，rsp = 反向）。
         // accept 已发生，client 握手字节已在内核缓冲，pump 接管即转发，不丢包。
+        int pumpRc = 0;
         var pumpThread = new Thread(() =>
         {
             try { Pump(fromClient.GetStream(), toEmu.GetStream(), a.Out, seq); }
-            catch (Exception e) { Console.WriteLine($"pump end: {e.Message}"); }
+            catch (Exception e) { Console.WriteLine($"pump end: {e.Message}"); pumpRc = 21; }
         });
         pumpThread.IsBackground = true;
         pumpThread.Start();
-        clientDone.Wait(60000);
+        if (!clientDone.Wait(60000)) { Console.WriteLine("client timeout"); clientRc = 31; }
         // 确定性 teardown：关两端 socket 解开 pump 的阻塞读，再 Join。
         try { fromClient.Close(); } catch { }
         try { toEmu.Close(); } catch { }
         pumpThread.Join(5000);
         tap.Stop();
+        if (pumpRc != 0) return pumpRc;
 
         var manifest = new
         {

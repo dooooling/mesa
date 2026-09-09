@@ -21,8 +21,8 @@
   - F2 Wireshark assertions pinned（核对矩阵 #1–#6 入库；`wire_data_len`
     与主干解码数学一致）。✅
   - F3 Sharp7 reference vectors / interoperability：pinned vectors 入库 +
-    Rust 离线回放（单读/多读 exact differential 为独立 wire evidence；
-    响应为 compatibility evidence）✅；
+    Rust 离线回放（请求 exact differential；S7WLDouble 下双方对同一 wire
+    解出相同语义数据——单读 8 字节 exact，多读双 buffer exact）✅；
     live 互操作（setup/单读/多读 rc=0）本地实证 ✅；
     非零 Area 差分与 `<<4` 仲裁仍 open ❌（Area=0 刻意规避）。
   - F4 Softing semantic evidence pinned（AWL 字段顺序 + 例证值入库）。✅

@@ -97,6 +97,14 @@ pub fn parse_setup_ack(resp: &[u8], requested_pdu: u16) -> Result<u16, S7Transpo
             "Setup data_len 非 0",
         ));
     }
+    // param 首字节必须为 Setup function 0xF0（别的 8 字节 parameter 响应
+    // 不得冒充 Setup，避免误把末两字节当 negotiated PDU）。
+    if payload[12] != 0xF0 {
+        return Err(S7TransportError::protocol(
+            "S7_SETUP_SHAPE",
+            "Setup function 非 0xF0",
+        ));
+    }
     // 只向下协商（min），0 视为对方无表示（保持请求值）。
     let n = u16::from_be_bytes([payload[18], payload[19]]);
     let mut negotiated = requested_pdu;
@@ -245,6 +253,19 @@ mod tests {
         resp2[7 + 11] = 0x05;
         let err = parse_setup_ack(&resp2, 480).unwrap_err();
         assert_eq!(err.code, "S7_0x05");
+    }
+
+    #[test]
+    fn setup_wrong_function_rejected() {
+        // 20 字节/p Len 8/dlen 0 全对，但 param 首字节非 0xF0
+        //（别的 8 字节 parameter 响应不得冒充 Setup）。
+        let mut resp = vec![0x03, 0x00, 0x00, 0x1B, 0x02, 0xF0, 0x80];
+        let mut s7 = vec![0x32, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x00];
+        s7.extend_from_slice(&[0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x01, 0xE0, 0x00, 0x00]);
+        resp.extend_from_slice(&s7);
+        assert_eq!(resp.len(), 27);
+        let err = parse_setup_ack(&resp, 480).unwrap_err();
+        assert_eq!(err.code, "S7_SETUP_SHAPE");
     }
 
     #[test]

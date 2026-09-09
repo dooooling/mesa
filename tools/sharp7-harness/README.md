@@ -21,10 +21,15 @@ emulator，并抓取双方 raw bytes。CI 不跑 dotnet（见下）；CI 只复�
 # 1. 起 emulator（任一场景；happy 给 GOOD，partial_bad 给按项 BAD）
 mesa-nck-emulator --port 1102 --scenario happy --element-size 8
 
-# 2. 跑 harness（Area=N 避开 <<4/<<5 未决分歧；0<<4 == 0<<5）
+# 2. 跑 harness（Area=N 避开 <<4/<<5 未决分歧；0<<4 == 0<<5；
+#    WordLen 默认 S7WLDouble(0x1A)，与 element-size 8 等价，要求 exact bytes）
 dotnet run --project tools/sharp7-harness -- \
   --emulator 127.0.0.1:1102 --out drivers/sinumerik-nck/tests/reference/sharp7 \
   --unit 1 --module 18 --param 42 --start 0 --amount 1
+
+# harness 是证据工具：任何一步失败（connect/single/multi/bytes/Results/
+# 超时/pump 异常）即非零退出，不产出可用 vectors（禁 false-green）。
+# 单读要求 bytesRead==8 且 data exact；多读要求双 GOOD 且双 buffer exact。
 
 # 3. 检查 out 下 req-*.bin / rsp-*.bin / manifest.json，然后跑 Rust 回放测试
 cargo test -p mesa-driver-sinumerik-nck --test sharp7_vectors

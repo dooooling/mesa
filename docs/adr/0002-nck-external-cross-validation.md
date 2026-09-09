@@ -69,8 +69,9 @@ Sharp7 `ReadNckArea` 已实现同变量跨 PDU 拆分，语义为：同
 - 解析器只认 header 声明（`12+plen`，errinfo 非零即拒绝）；
   fixture plen 说真话；write 的 `12+plen` 从来是对的（撤回“同病待修”，
   write 留现状），SZL 另 ROSCTR 路径、单独分析。
-- Sharp7 rsp 被接受 = compatibility evidence（emulator 生成），
-  不是独立 server framing evidence；请求 vectors 才是独立 wire evidence。
+- Sharp7 rsp 被接受 = cross-decoder equivalence（S7WLDouble 下双方对同一
+  wire 解出相同语义数据；rsp 仍由 emulator 生成，不是独立 server evidence，
+  但超出 framing-only）。请求 vectors 为独立 wire evidence。
 
 ## 方法冻结（证据等级）
 
