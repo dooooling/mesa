@@ -559,7 +559,10 @@ impl DriverConnection for NckConnection {
         );
         let client = std::sync::Arc::new(tokio::sync::Mutex::new(client));
         let seq = std::sync::Arc::new(AtomicU64::new(1));
-        let mut handles = Vec::with_capacity(snap.tasks.len());
+        // P1-1：JoinSet（哪个 task 先结束就先观察哪个）。顺序 await Vec
+        // 在多 task 下会饿死错误传播：健康的无限 Poll task 排在前面时，
+        // 后面 task 的 Err 永远等不到 cancel，run() 不返回，Manager 不重建。
+        let mut set: tokio::task::JoinSet<Result<(), SdkDriverError>> = tokio::task::JoinSet::new();
         for task in &snap.tasks {
             let indices = task.point_indices.clone();
             let points: Vec<(PointSpec, u32)> = indices
@@ -576,7 +579,7 @@ impl DriverConnection for NckConnection {
             let client = std::sync::Arc::clone(&client);
             let interval = std::time::Duration::from_millis(task.interval_ms);
             let task_id = task.id.clone();
-            handles.push(tokio::spawn(async move {
+            set.spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut last_known: std::collections::HashMap<u32, Value> =
@@ -631,16 +634,18 @@ impl DriverConnection for NckConnection {
                     .await;
                 }
                 Ok::<(), SdkDriverError>(())
-            }));
+            });
         }
         let mut final_err: Option<SdkDriverError> = None;
-        for h in handles {
-            match h.await {
+        while let Some(res) = set.join_next().await {
+            match res {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     if final_err.is_none() {
                         final_err = Some(e);
                     }
+                    // 任一 task Err 即 cancel 全体，继续 reap 剩余 task。
+                    shutdown.cancel();
                 }
                 Err(join_err) => {
                     tracing::error!(%join_err, "NCK 任务 panic");
@@ -651,10 +656,8 @@ impl DriverConnection for NckConnection {
                             join_err.to_string(),
                         ));
                     }
+                    shutdown.cancel();
                 }
-            }
-            if final_err.is_some() {
-                shutdown.cancel();
             }
         }
         if let Some(e) = final_err {
@@ -1063,5 +1066,47 @@ mod tests {
         let r = conn.run(sink, sd).await;
         let err = r.expect_err("会话丢失必须 fail attempt");
         assert_eq!(err.code, "READ_SHORT");
+    }
+
+    #[tokio::test]
+    async fn nck_second_poll_task_failure_fails_whole_attempt() {
+        // P1-1 回归：task A（前）永久健康 + task B（后）每 tick 致命
+        // （F64 count=255 → 单 item 超 PDU，发送前拒绝）。
+        // 顺序 await 下 B 的 Err 会被 A 的无限 Poll 饿死，run 永不返回；
+        // JoinSet 下 run 必须 bounded time 内 Err。
+        use mesa_driver_sdk::DataSink;
+        let fx = NckFixture::spawn(NckFixtureState {
+            element_size: 8,
+            ..Default::default()
+        })
+        .await;
+        let mut conn = conn_with_synthetic();
+        conn.cfg.port = fx.addr.port();
+        let mut huge_sel = speed_selection("big");
+        huge_sel[0]["parameters"]["count"] = serde_json::json!(255);
+        conn.configure(
+            1,
+            vec![
+                poll_task("tA", speed_selection("healthy")),
+                poll_task("tB", huge_sel),
+            ],
+        )
+        .await
+        .unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert("healthy".to_string(), 7u32);
+        map.insert("big".to_string(), 8u32);
+        conn.apply_point_map(map).await.unwrap();
+        let (data_tx, _data_rx) = tokio::sync::mpsc::channel::<mesa_core_types::DataBatch>(16);
+        let (ctrl_tx, _ctrl_rx) =
+            tokio::sync::mpsc::channel::<mesa_driver_protocol::pb::Envelope>(8);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<mesa_driver_sdk::EventBatch>(8);
+        let sink = DataSink::for_test(ctrl_tx, data_tx, event_tx);
+        let sd = tokio_util::sync::CancellationToken::new();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(10), conn.run(sink, sd)).await;
+        let err = r
+            .expect("run 必须在 bounded time 内返回（JoinSet 回归）")
+            .expect_err("task B 致命必须 fail 整个 attempt");
+        assert_eq!(err.code, "READ_ITEM_TOO_LARGE");
     }
 }

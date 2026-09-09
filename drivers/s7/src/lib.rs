@@ -738,7 +738,9 @@ impl DriverConnection for S7Connection {
         use std::sync::atomic::{AtomicU64, Ordering};
         let seq = Arc::new(AtomicU64::new(1));
 
-        let mut handles = Vec::with_capacity(snap.tasks.len());
+        // P1-1：JoinSet（哪个 task 先结束就先观察哪个；顺序 await 会在多 task
+        // 下饿死错误传播，与 opcua/sinumerik-nck 同口径）。
+        let mut set: tokio::task::JoinSet<Result<(), SdkDriverError>> = tokio::task::JoinSet::new();
         for task in &snap.tasks {
             let indices = task.point_indices.clone();
             let points: Vec<(PointSpec, u32)> = indices
@@ -755,7 +757,7 @@ impl DriverConnection for S7Connection {
             let client = Arc::clone(&client);
             let interval = Duration::from_millis(task.interval_ms);
             let task_id = task.id.clone();
-            handles.push(tokio::spawn(async move {
+            set.spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
@@ -895,18 +897,19 @@ impl DriverConnection for S7Connection {
                     .await;
                 }
                 Ok::<(), SdkDriverError>(())
-            }));
+            });
         }
 
-        // 等待任一任务失败或全部被取消
+        // JoinSet reap：任一任务失败即 cancel 全体并继续收割剩余任务。
         let mut final_err: Option<SdkDriverError> = None;
-        for h in handles {
-            match h.await {
+        while let Some(res) = set.join_next().await {
+            match res {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     if final_err.is_none() {
                         final_err = Some(e);
                     }
+                    shutdown.cancel();
                 }
                 Err(join_err) => {
                     tracing::error!(%join_err, "S7 任务 panic");
@@ -917,11 +920,8 @@ impl DriverConnection for S7Connection {
                             join_err.to_string(),
                         ));
                     }
+                    shutdown.cancel();
                 }
-            }
-            // 若已有失败，取消其余
-            if final_err.is_some() {
-                shutdown.cancel();
             }
         }
         if let Some(e) = final_err {
