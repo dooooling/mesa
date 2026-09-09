@@ -1,61 +1,62 @@
 //! Standalone process E2E（Gate F5）：二进制子进程 × 真实 TCP × `NckClient`。
 //!
-//! 每用例：spawn binary → 等监听 → 建连（COTP/Setup）→ NCK ReadVar →
-//! 按场景断言 → kill/reap（守卫 drop 兜底，杜绝孤儿）。
+//! 每用例：spawn binary（`--port 0`，OS 原子分配）→ 读子进程自报 READY
+//! 地址 → 建连（COTP/Setup）→ NCK ReadVar → 按场景断言。
+//! 端口约定（冻结）：**禁止预占端口**——`free_port→release→bind` 是 TOCTOU，
+//! main CI #120 实证（并行测试端口复用 → 子进程 bind 失败退出 → 误连他进程
+//! 端口 → kill 后 `Connection refused`）。只认目标子进程自己的 READY 行。
 //! 对端用 `NckClient`：F5 验证的是**进程边界与服务语义**，不是 codec
 //! 独立正确性（后者归 F3 Sharp7 互操作；见 emulator 头能力矩阵）。
 
 use std::net::SocketAddr;
-use std::process::{Child, Command};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use mesa_driver_sinumerik_nck::{NckClient, NckConnConfig, NckReadItem, NckWireAddress};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// 子进程守卫：drop 即 kill + reap。
-struct ChildGuard {
-    inner: Option<Child>,
+/// READY 行前缀（与 `main.rs::READY_PREFIX` 同值；双写冻结，改一处必改另一处，
+/// schema 测试只校验格式存在，不跨 crate 引用避免测试耦合生产常量）。
+const READY_PREFIX: &str = "MESA_NCK_EMULATOR_READY=";
+
+/// 运行中的 emulator 子进程（`kill_on_drop`：drop 即杀，无孤儿；僵尸由
+/// 测试进程退出时统一回收——短命测试进程可接受，见模块注释）。
+struct EmulatorProcess {
+    _child: tokio::process::Child,
+    addr: SocketAddr,
 }
 
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(mut c) = self.inner.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-}
-
-/// 空闲端口（bind 即关的经典 race，回环测试可接受；监听等待另有 15s 上限）。
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("回环 bind")
-        .local_addr()
-        .expect("本机地址")
-        .port()
-}
-
-fn spawn_emulator(port: u16, args: &[&str]) -> ChildGuard {
+/// 启动 emulator 并等待其自报 READY（15s 上限；READY 即已 bind，
+/// 后继 connect 由内核 backlog 承接，无需二次等待）。
+async fn spawn_emulator(args: &[&str]) -> EmulatorProcess {
     let bin = env!("CARGO_BIN_EXE_mesa-nck-emulator");
-    let mut cmd = Command::new(bin);
-    cmd.arg("--port")
-        .arg(port.to_string())
+    let mut child = tokio::process::Command::new(bin)
+        .arg("--port")
+        .arg("0")
         .args(args)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let child = cmd.spawn().expect("emulator 子进程启动");
-    ChildGuard { inner: Some(child) }
-}
-
-/// 等待监听（15s 上限；探测连接无数据即关，不影响后继会话）。
-async fn wait_listen(port: u16) {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            return;
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("emulator 子进程启动");
+    let stderr = child.stderr.take().expect("stderr 已管道");
+    let mut lines = BufReader::new(stderr).lines();
+    let addr: SocketAddr = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match lines.next_line().await.expect("stderr 读取") {
+                Some(line) => {
+                    if let Some(rest) = line.strip_prefix(READY_PREFIX) {
+                        return rest.parse().expect("READY 地址非法");
+                    }
+                }
+                None => panic!("emulator 未打印 READY 即退出"),
+            }
         }
-        assert!(Instant::now() < deadline, "emulator 端口 {port} 15s 未监听");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    })
+    .await
+    .expect("15s 未收到 emulator READY");
+    EmulatorProcess {
+        _child: child,
+        addr,
     }
 }
 
@@ -94,10 +95,8 @@ async fn connect(port: u16) -> NckClient {
 
 #[tokio::test]
 async fn e2e_happy() {
-    let port = free_port();
-    let _guard = spawn_emulator(port, &["--scenario", "happy", "--element-size", "8"]);
-    wait_listen(port).await;
-    let mut c = connect(port).await;
+    let emulator = spawn_emulator(&["--scenario", "happy", "--element-size", "8"]).await;
+    let mut c = connect(emulator.addr.port()).await;
     assert_eq!(c.negotiated_pdu_length(), 480);
     let out = c.read_vars(&[item(1)]).await.expect("happy 读");
     let data = out[0].data.as_ref().expect("happy 必须 GOOD");
@@ -110,10 +109,8 @@ async fn e2e_happy() {
 
 #[tokio::test]
 async fn e2e_partial_bad() {
-    let port = free_port();
-    let _guard = spawn_emulator(port, &["--scenario", "partial_bad", "--fail-items", "0"]);
-    wait_listen(port).await;
-    let mut c = connect(port).await;
+    let emulator = spawn_emulator(&["--scenario", "partial_bad", "--fail-items", "0"]).await;
+    let mut c = connect(emulator.addr.port()).await;
     let out = c
         .read_vars(&[item(1), item(1)])
         .await
@@ -125,10 +122,8 @@ async fn e2e_partial_bad() {
 
 #[tokio::test]
 async fn e2e_wrong_transport() {
-    let port = free_port();
-    let _guard = spawn_emulator(port, &["--scenario", "wrong_transport"]);
-    wait_listen(port).await;
-    let mut c = connect(port).await;
+    let emulator = spawn_emulator(&["--scenario", "wrong_transport"]).await;
+    let mut c = connect(emulator.addr.port()).await;
     let out = c.read_vars(&[item(1)]).await.expect("读返回");
     assert!(out[0].data.is_none(), "transport 不符必须 BAD");
     assert_eq!(out[0].return_code, 0xFF);
@@ -137,20 +132,16 @@ async fn e2e_wrong_transport() {
 
 #[tokio::test]
 async fn e2e_short_payload() {
-    let port = free_port();
-    let _guard = spawn_emulator(port, &["--scenario", "short_payload"]);
-    wait_listen(port).await;
-    let mut c = connect(port).await;
+    let emulator = spawn_emulator(&["--scenario", "short_payload"]).await;
+    let mut c = connect(emulator.addr.port()).await;
     let out = c.read_vars(&[item(1)]).await.expect("读返回");
     assert!(out[0].data.is_none(), "短包必须 BAD");
 }
 
 #[tokio::test]
 async fn e2e_malformed() {
-    let port = free_port();
-    let _guard = spawn_emulator(port, &["--scenario", "malformed"]);
-    wait_listen(port).await;
-    let mut c = connect(port).await;
+    let emulator = spawn_emulator(&["--scenario", "malformed"]).await;
+    let mut c = connect(emulator.addr.port()).await;
     assert!(
         c.read_vars(&[item(1)]).await.is_err(),
         "截断包必须连接级失败"
@@ -159,18 +150,14 @@ async fn e2e_malformed() {
 
 #[tokio::test]
 async fn e2e_disconnect_after_n() {
-    let port = free_port();
-    let _guard = spawn_emulator(
-        port,
-        &[
-            "--scenario",
-            "disconnect_after_n",
-            "--disconnect-after",
-            "1",
-        ],
-    );
-    wait_listen(port).await;
-    let mut c = connect(port).await;
+    let emulator = spawn_emulator(&[
+        "--scenario",
+        "disconnect_after_n",
+        "--disconnect-after",
+        "1",
+    ])
+    .await;
+    let mut c = connect(emulator.addr.port()).await;
     let ok = c.read_vars(&[item(1)]).await.expect("首次读");
     assert!(ok[0].data.is_some());
     assert!(c.read_vars(&[item(1)]).await.is_err(), "断开后读必须失败");
@@ -178,10 +165,8 @@ async fn e2e_disconnect_after_n() {
 
 #[tokio::test]
 async fn e2e_pdu_240() {
-    let port = free_port();
-    let _guard = spawn_emulator(port, &["--scenario", "pdu_240"]);
-    wait_listen(port).await;
-    let mut c = connect(port).await;
+    let emulator = spawn_emulator(&["--scenario", "pdu_240"]).await;
+    let mut c = connect(emulator.addr.port()).await;
     assert_eq!(c.negotiated_pdu_length(), 240);
     let out = c.read_vars(&[item(1)]).await.expect("小 PDU 读");
     assert!(out[0].data.is_some());
@@ -189,10 +174,8 @@ async fn e2e_pdu_240() {
 
 #[tokio::test]
 async fn e2e_pdu_480() {
-    let port = free_port();
-    let _guard = spawn_emulator(port, &["--scenario", "pdu_480"]);
-    wait_listen(port).await;
-    let mut c = connect(port).await;
+    let emulator = spawn_emulator(&["--scenario", "pdu_480"]).await;
+    let mut c = connect(emulator.addr.port()).await;
     assert_eq!(c.negotiated_pdu_length(), 480);
     let out = c.read_vars(&[item(1)]).await.expect("读");
     assert!(out[0].data.is_some());
@@ -201,10 +184,8 @@ async fn e2e_pdu_480() {
 #[tokio::test]
 async fn e2e_pdu_960() {
     // 客户端请求 480 → min(480,960)=480：上限透传不断言 960 本身。
-    let port = free_port();
-    let _guard = spawn_emulator(port, &["--scenario", "pdu_960"]);
-    wait_listen(port).await;
-    let mut c = connect(port).await;
+    let emulator = spawn_emulator(&["--scenario", "pdu_960"]).await;
+    let mut c = connect(emulator.addr.port()).await;
     assert_eq!(c.negotiated_pdu_length(), 480);
     let out = c.read_vars(&[item(1)]).await.expect("读");
     assert!(out[0].data.is_some());

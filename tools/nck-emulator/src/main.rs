@@ -34,6 +34,9 @@ use std::net::SocketAddr;
 
 use mesa_driver_sinumerik_nck::{NckFixture, NckFixtureState};
 
+/// READY 行前缀（冻结；E2E 只认此前缀行解析实际地址）。
+pub const READY_PREFIX: &str = "MESA_NCK_EMULATOR_READY=";
+
 /// 内置场景（CLI `--scenario` 取值）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scenario {
@@ -186,6 +189,10 @@ async fn main() {
     });
     let fx = NckFixture::spawn_with_state(cli.addr, state).await;
     eprintln!("nck-emulator listening on {}", fx.addr);
+    // READY 协议：`--port 0` 时端口由 OS 在 bind 瞬间原子分配——测试禁止
+    // 预占端口（free_port→release→bind 是 TOCTOU，main CI #120 实证），
+    // 只认子进程自报的本行（人类可读行保留，机器只解析前缀）。
+    eprintln!("{READY_PREFIX}{}", fx.addr);
     // 前台运行：Ctrl-C 即退出（测试工具，无需优雅关闭）。
     let _ = tokio::signal::ctrl_c().await;
 }
