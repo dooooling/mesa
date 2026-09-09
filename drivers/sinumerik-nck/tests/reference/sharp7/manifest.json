@@ -1,0 +1,27 @@
+{
+  "sharp7_commit": "eac1e728f8523278564e83c276fa6b8d281e6ba0",
+  "area": 0,
+  "unit": 1,
+  "module": 18,
+  "param": 42,
+  "start": 0,
+  "amount": 1,
+  "wordLen": 2,
+  "files": 8,
+  "events": [
+    {
+      "op": "single",
+      "rc": 0,
+      "bytesRead": 1,
+      "data": "01"
+    },
+    {
+      "op": "multi",
+      "rc": 0,
+      "results": [
+        0,
+        0
+      ]
+    }
+  ]
+}

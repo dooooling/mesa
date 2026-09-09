@@ -54,6 +54,26 @@ Sharp7 `ReadNckArea` 已实现同变量跨 PDU 拆分，语义为：同
 预算 `MaxElements = (PDU-18)/WordSize`。Mesa P2-1 曾拒绝猜测 line 分段语义；
 本条作为第二独立证据记录，待真机确认后实现（届时与 Sharp7 差分拆分点）。
 
+## 响应/setup framing：NCK 方言（PR20 live 互操作结论）
+
+互操作挖出的最大发现：Mesa 的 S7 层 framing 曾是“两处谎言互抵”
+（`12+plen` 解析 + fixture 谎报 plen + 自创 33 字节 setup ack），
+回环自洽、真机必 broken（setup 漏协商、读错位判 BAD）。已修正：
+
+- Setup 解析改 header 判别：S7(18) 标准形 vs S7(20)+`00 00` 扩展形，
+  PDU 取 S7 末 2 字节（两形皆然），其他形状 `S7_SETUP_SHAPE` 拒绝；
+- 读解析改 `10+plen`（只认 header 声明）；fixture plen 说真话
+  （PLC 标准 2 字节 param，NCK 扩展 4 字节 `[00 00 04 count]`，项位置零移动）；
+- NCK 方言 = PLC + 2 字节 errinfo（setup 与读一致）：Sharp7 三处解析位
+  （setup/单读/多读）与 Mesa NCK fixture 逐字节吻合，live 互操作
+  （setup + 单读 + 多读 rc=0，pattern 正确解码）实证通过。
+- PLC 方言 = 标准（Wireshark/Snap7 一致）；s7 驱动读路径同步修好。
+
+仍 open：errinfo 是否为真机 NCU 行为（Sharp7 硬件派生 vs 标准 S7 推测；
+T1/T2 之争收敛为“解析器两形皆吃 + fixture 按方言说真话”，任一真机形态
+都不再静默错）。write/szl 解析同病（`12+plen`），但零 live 调用者，
+留待其路径上线前按同口径修正 + 真机确认，不在本轮范围。
+
 ## 方法冻结（证据等级）
 
 - Siemens 官方文档 = authoritative semantic evidence（**当前缺失**：
@@ -65,5 +85,5 @@ Sharp7 `ReadNckArea` 已实现同变量跨 PDU 拆分，语义为：同
   不等于 Siemens 官方文档）；
 - 真机 NCU = final behavioral evidence（TSAP、wire address、catalog mapping
   三项只能真机证明）。
-- 下一步：Layer4 standalone emulator（本分支后半部分），Sharp7 互操作待
-  emulator 就绪后接入；tshark PCAP 门暂缓（runner 无 tshark，静态核对已覆盖九成价值）。
+- PR20 已交付：Layer4 emulator + Sharp7 live 互操作（setup/单读/多读全通，
+  vectors 入库回放）；tshark PCAP 门暂缓（runner 无 tshark，静态核对已覆盖九成价值）。

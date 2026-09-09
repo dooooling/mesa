@@ -34,8 +34,7 @@ cargo test -p mesa-driver-sinumerik-nck --test sharp7_vectors
 
 - area 合成：Sharp7 用 `NckArea<<4`，Mesa/Wireshark/Softing 用 `<<5`。
   本 harness 只用 **Area=0（N）**，两侧字节一致，不触分歧。
-- 响应 framing：Sharp7 期望 count@S7[13]/首项@S7[14]
-  （疑似 2 字节 errclass/errcode），Mesa 当前 +12。
-  emulator 需 `--response-style sharp7` 才可被 Sharp7 成功解码；
-  该差异记为 open，不作为任一方“正确”的证据。
+- setup/响应 framing：NCK 方言（errinfo + 扩展形）与 PLC 标准形并存，
+  Mesa 解析器两形皆吃（header 判别），emulator 说 NCK 方言。
+  互操作成功 = 两实现对方言一致，不直接证明真机形态（仍 open）。
 - `0x06` 长度单位：Sharp7 按 bit，Wireshark 按 byte；实验避开该 transport。

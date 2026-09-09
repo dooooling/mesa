@@ -54,6 +54,7 @@ pub fn build_s7_setup(pdu_ref: u16, requested_pdu: u16) -> Vec<u8> {
 /// - NCK 扩展形（Sharp7 硬件派生：setup/读响应 uniformly 带 2 字节 errinfo，
 ///   与 NCK 读响应 `[00 00 04 count]` param 同构）：S7(20)，S7[10..12] 为
 ///   `00 00` 标记，PDU 在末 2 字节。
+///
 /// 判别只认 S7 总长 ∈ {18, 20}（20 必须带 `00 00` 标记），PDU 取 S7 末 2 字节
 /// （两形皆然）；其他形状即 `S7_SETUP_SHAPE`（fail-closed，不猜）。
 /// 历史实现曾读固定 `payload[23..25]`（自创口径，真机漏协商），已废除。
