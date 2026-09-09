@@ -1,0 +1,6 @@
+{
+  "$comment": "828D 系列增量（叠加 common，需独立真机 Gate，不得由 840D 推断）。",
+  "$schema": "mesa:nck-catalog/v1",
+  "family": "828d",
+  "variables": []
+}

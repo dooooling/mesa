@@ -4,18 +4,20 @@
 //! - Poll 绑定：`opcua.node-group`
 //!   ```json
 //!   { "nodes": [
-//!       { "key": "counter", "node_id": "ns=2;s=Counter", "data_type": "U32" },
-//!       { "key": "sine",    "node_id": "ns=2;i=2",        "data_type": "DOUBLE" }
+//!       { "key": "counter", "node_id": "nsu=http://example.com/MyModel/;s=Counter", "data_type": "U32" },
+//!       { "key": "sine",    "node_id": "nsu=http://example.com/MyModel/;i=2",        "data_type": "DOUBLE" }
 //!   ]}
 //!   ```
+//!   node_id 一律 canonical `nsu=` 形态（`ns=<index>` 拒绝，见 `address`）；
+//!   运行期每次建会话后经 NamespaceArray 换算为当前 index（漂移自愈）。
 //! - Subscribe 绑定：`opcua.subscription`（publishing 500 sampling 30 queue10，§7.3）
 //!   ```json
 //!   { "publishing_interval_ms": 500, "sampling_interval_ms": 250, "queue_size": 10,
-//!     "discard_oldest": true, "nodes": [ {"key":"k","node_id":"ns=2;i=2"} ] }
+//!     "discard_oldest": true, "nodes": [ {"key":"k","node_id":"nsu=http://example.com/MyModel/;i=2"} ] }
 //!   ```
-//! - Browse 绑定：`opcua.browse`（周期浏览，§7.3 V1 支持）
+//! - Browse 绑定：`opcua.browse`（周期浏览，§7.3 V1 支持，父子一律 canonical）
 //!   ```json
-//!   { "nodes": [ {"key":"objects","node_id":"ns=0;i=85","data_type":"STRING"} ] }
+//!   { "nodes": [ {"key":"objects","node_id":"nsu=http://opcfoundation.org/UA/;i=85","data_type":"STRING"} ] }
 //!   ```
 //! - NodeId 解析见 `address::parse_address`；Core 不触及此文件（硬约束）。
 //! - SecurityPolicy/MessageSecurityMode 透传至 Native ClientBuilder pki_dir/own.der/key trust false verify true
@@ -234,9 +236,15 @@ impl Driver for OpcUaDriver {
                 Arc::new(TransportApiAdapter::with_transport(native.clone()));
             (api, native)
         } else {
+            // Fake 命名空间契约（测试专用，确定性）：[OPC 基础, mesa fake]。
+            // 运行期 canonical 换算与 browse 逆向以此快照为基准。
             let api: Arc<dyn OpcUaApiTrait> = Arc::new(FakeOpcUaApi::new());
-            let fake: Arc<dyn mesa_opcua_transport::OpcUaTransport> =
-                Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new());
+            let fake: Arc<dyn mesa_opcua_transport::OpcUaTransport> = Arc::new(
+                mesa_opcua_transport::FakeOpcUaTransport::new().with_namespace_array(vec![
+                    mesa_opcua_transport::OPC_BASE_NAMESPACE_URI.to_string(),
+                    "urn:mesa:fake:1".to_string(),
+                ]),
+            );
             (api, fake)
         };
         Ok(Box::new(OpcUaConnection {
@@ -1116,11 +1124,11 @@ impl DriverConnection for OpcUaConnection {
             ));
         }
         let parent_str = if parent.is_empty() {
-            "ns=0;i=85"
+            format!("nsu={};i=85", mesa_opcua_transport::OPC_BASE_NAMESPACE_URI)
         } else {
-            parent
+            parent.to_string()
         };
-        let addr = parse_address(parent_str).map_err(|e| match e {
+        let mut parent_addr = parse_address(&parent_str).map_err(|e| match e {
             AddressError::Empty => SdkDriverError::configuration("INVALID_ADDRESS", "parent 为空"),
             AddressError::Invalid { reason, .. } => SdkDriverError::new(
                 mesa_core_types::ErrorKind::Address,
@@ -1128,13 +1136,39 @@ impl DriverConnection for OpcUaConnection {
                 format!("parent `{parent_str}` 非法: {reason}"),
             ),
         })?;
-        let children = self.api.browse(&addr).await.map_err(|e| {
+        let namespaces = self.transport.read_namespace_array().await.map_err(|e| {
+            SdkDriverError::new(
+                mesa_core_types::ErrorKind::Connection,
+                "BROWSE_FAILED",
+                format!("NamespaceArray 读取失败: {e}"),
+            )
+        })?;
+        parent_addr.resolve(&namespaces).map_err(|e| {
+            SdkDriverError::new(
+                mesa_core_types::ErrorKind::Address,
+                "UNKNOWN_NAMESPACE",
+                format!("parent `{parent_str}`: {e}"),
+            )
+        })?;
+        let children = self.api.browse(&parent_addr).await.map_err(|e| {
             SdkDriverError::new(mesa_core_types::ErrorKind::Internal, "BROWSE_FAILED", e)
         })?;
-        // 过滤与分页
-        let filtered: Vec<String> = children
+        // 子节点 index → canonical（越界项跳过并告警，不杀整页）。
+        let mut canonical_children: Vec<(String, String)> = Vec::with_capacity(children.len());
+        for c in &children {
+            match mesa_opcua_transport::OpcUaNodeId::from_index_ref(&c.node, &namespaces) {
+                Some(id) => canonical_children.push((c.name.clone(), id.canonical_key())),
+                None => tracing::warn!(
+                    name = %c.name,
+                    ns = c.node.namespace,
+                    "browse 子节点命名空间越界，已跳过",
+                ),
+            }
+        }
+        // 过滤与分页（过滤同时匹配展示名与 canonical 身份）。
+        let filtered: Vec<(String, String)> = canonical_children
             .into_iter()
-            .filter(|n| filter.is_empty() || n.contains(filter))
+            .filter(|(name, id)| filter.is_empty() || name.contains(filter) || id.contains(filter))
             .collect();
         let start = cursor.parse::<usize>().unwrap_or(0);
         let lim = if limit == 0 { 50 } else { limit as usize };
@@ -1147,18 +1181,15 @@ impl DriverConnection for OpcUaConnection {
         };
         let nodes = slice
             .iter()
-            .map(|name| {
-                let node_id = format!("ns=2;s={}", name);
-                mesa_driver_protocol::pb::BrowseNode {
-                    id: name.clone(),
-                    label: name.clone(),
-                    kind: "node".into(),
-                    data_type: "String".into(),
-                    access: "read".into(),
-                    has_children: true,
-                    binding_json: serde_json::json!({"node_id": node_id, "data_type": "String"})
-                        .to_string(),
-                }
+            .map(|(name, node_id)| mesa_driver_protocol::pb::BrowseNode {
+                id: node_id.clone(),
+                label: name.clone(),
+                kind: "node".into(),
+                data_type: "String".into(),
+                access: "read".into(),
+                has_children: true,
+                binding_json: serde_json::json!({"node_id": node_id, "data_type": "String"})
+                    .to_string(),
             })
             .collect();
         Ok((nodes, next_cursor))
@@ -1176,6 +1207,49 @@ impl DriverConnection for OpcUaConnection {
             .as_ref()
             .map(|s| !s.tasks.is_empty())
             .unwrap_or(false);
+
+        // 建会话：Fake 即时成功；Native 失败则由 Manager 退避
+        if let Err(e) = self
+            .api
+            .connect(&self.cfg.endpoint_url, self.cfg.timeout_ms)
+            .await
+        {
+            if e.contains("NOT_IMPLEMENTED") || e.contains("未实现") {
+                return Err(SdkDriverError::configuration("NOT_IMPLEMENTED", e));
+            } else {
+                return Err(SdkDriverError::new(
+                    mesa_core_types::ErrorKind::Connection,
+                    "CONNECT_FAILED",
+                    e,
+                ));
+            }
+        }
+
+        // canonical → index：建会话后读新鲜 NamespaceArray，全点一次换算
+        // （漂移自愈；未知 URI 即 fail-closed，绝不带着过期 index 运行）。
+        // Fake 路径不消费 index（identifier 直通），Native 路径此处全部落定。
+        // 快照同时供 Event workers 换算 notifier（run 期一次读取）。
+        // NOTE: 必须在 data_plan 不可变借用之前完成（&mut 先结束，NLL 允许后借）。
+        let namespaces = self.transport.read_namespace_array().await.map_err(|e| {
+            SdkDriverError::new(
+                mesa_core_types::ErrorKind::Connection,
+                "NAMESPACE_FAILED",
+                format!("NamespaceArray 读取失败: {e}"),
+            )
+        })?;
+        if let Some(snap) = self.plan.as_mut() {
+            for p in &mut snap.points {
+                p.addr.resolve(&namespaces).map_err(|e| {
+                    SdkDriverError::new(
+                        mesa_core_types::ErrorKind::Address,
+                        "UNKNOWN_NAMESPACE",
+                        format!("point `{}`: {e}", p.key),
+                    )
+                })?;
+            }
+        }
+        let namespaces = Arc::new(namespaces);
+
         let data_plan = if has_data_tasks {
             Some(self.plan.as_ref().ok_or_else(|| {
                 SdkDriverError::new(
@@ -1202,23 +1276,6 @@ impl DriverConnection for OpcUaConnection {
             .as_ref()
             .map(|e| e.tasks.clone())
             .unwrap_or_default();
-
-        // 建会话：Fake 即时成功；Native 失败则由 Manager 退避
-        if let Err(e) = self
-            .api
-            .connect(&self.cfg.endpoint_url, self.cfg.timeout_ms)
-            .await
-        {
-            if e.contains("NOT_IMPLEMENTED") || e.contains("未实现") {
-                return Err(SdkDriverError::configuration("NOT_IMPLEMENTED", e));
-            } else {
-                return Err(SdkDriverError::new(
-                    mesa_core_types::ErrorKind::Connection,
-                    "CONNECT_FAILED",
-                    e,
-                ));
-            }
-        }
 
         use std::sync::atomic::{AtomicU64, Ordering};
         let seq = Arc::new(AtomicU64::new(1));
@@ -1288,6 +1345,7 @@ impl DriverConnection for OpcUaConnection {
                     }
                     TaskKind::Browse { interval_ms } => {
                         let interval = Duration::from_millis(interval_ms);
+                        let namespaces = Arc::clone(&namespaces);
                         set.spawn(async move {
                         let mut ticker = tokio::time::interval(interval);
                         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1300,7 +1358,27 @@ impl DriverConnection for OpcUaConnection {
                             for (spec, pid) in &points {
                                 match api.browse(&spec.addr).await {
                                     Ok(refs) => {
-                                        let val = Value::String(refs.join(";"));
+                                        // 子节点 canonical 身份（越界项跳过并告警，不杀整轮）。
+                                        let mut parts = Vec::with_capacity(refs.len());
+                                        for c in &refs {
+                                            match mesa_opcua_transport::OpcUaNodeId::from_index_ref(
+                                                &c.node,
+                                                &namespaces,
+                                            ) {
+                                                Some(id) => parts.push(format!(
+                                                    "{} {}",
+                                                    c.name,
+                                                    id.canonical_key()
+                                                )),
+                                                None => tracing::warn!(
+                                                    key = %spec.key,
+                                                    name = %c.name,
+                                                    ns = c.node.namespace,
+                                                    "Browse 子节点命名空间越界，已跳过",
+                                                ),
+                                            }
+                                        }
+                                        let val = Value::String(parts.join(";"));
                                         batch_vals.push(PointValue {
                                             point_id: *pid,
                                             value: val,
@@ -1418,16 +1496,8 @@ impl DriverConnection for OpcUaConnection {
         } // end if-let data tasks
         // Event workers：与 Data 共享同一 Session（transport Arc 唯一），
         // 但队列语义隔离（FIFO fail-closed vs Latest-Wins，§19）。
+        // NamespaceArray 快照与 Data 路径共享（run 期一次读取）。
         if !event_tasks.is_empty() {
-            // §13：NamespaceArray 启动时读一次，全任务共享快照。
-            let namespaces =
-                Arc::new(self.transport.read_namespace_array().await.map_err(|e| {
-                    SdkDriverError::new(
-                        mesa_core_types::ErrorKind::Connection,
-                        "OPCUA_EVENT_SUBSCRIBE_FAILED",
-                        format!("事件启动 NamespaceArray 读取失败: {e}"),
-                    )
-                })?);
             let event_sink = sink.events();
             for task in event_tasks {
                 set.spawn(event_runtime::run_event_task(
@@ -1603,15 +1673,15 @@ mod tests {
             event_plan: None,
         };
         let nodes = serde_json::json!([
-            {"key":"a","node_id":"ns=2;i=2","data_type":"U32"},
-            {"key":"b","node_id":"ns=2;s=Motor.Speed","data_type":"F64"}
+            {"key":"a","node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"U32"},
+            {"key":"b","node_id":"nsu=http://example.com/MyModel/;s=Motor.Speed","data_type":"F64"}
         ]);
         let t = task_with_nodes(nodes);
         let descs = conn.configure(1, vec![t]).await.unwrap();
         assert_eq!(descs.len(), 2);
         let dup = serde_json::json!([
-            {"key":"a","node_id":"ns=2;i=2","data_type":"U32"},
-            {"key":"a","node_id":"ns=2;i=3","data_type":"U32"}
+            {"key":"a","node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"U32"},
+            {"key":"a","node_id":"nsu=http://example.com/MyModel/;i=3","data_type":"U32"}
         ]);
         let err = conn
             .configure(2, vec![task_with_nodes(dup)])
@@ -1652,7 +1722,7 @@ mod tests {
             interval_ms: None,
             binding: DriverBinding {
                 kind: BINDING_SUB.into(),
-                config: serde_json::json!({"publishing_interval_ms":500,"sampling_interval_ms":250,"queue_size":10,"nodes":[{"key":"a","node_id":"ns=2;i=2","data_type":"U32"}]}),
+                config: serde_json::json!({"publishing_interval_ms":500,"sampling_interval_ms":250,"queue_size":10,"nodes":[{"key":"a","node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"U32"}]}),
             },
         };
         let descs = conn.configure(1, vec![t]).await.unwrap();
@@ -1664,7 +1734,7 @@ mod tests {
             interval_ms: None,
             binding: DriverBinding {
                 kind: BINDING_SUB.into(),
-                config: serde_json::json!({"nodes":[{"key":"b","node_id":"ns=2;s=MyVar","data_type":"STRING"}]}),
+                config: serde_json::json!({"nodes":[{"key":"b","node_id":"nsu=http://example.com/MyModel/;s=MyVar","data_type":"STRING"}]}),
             },
         };
         let descs2 = conn.configure(2, vec![t2]).await.unwrap();
@@ -1680,7 +1750,7 @@ mod tests {
             plan: None,
             event_plan: None,
         };
-        let nodes = serde_json::json!([{"key":"a","node_id":"ns=2;s=Counter","data_type":"U32"}]);
+        let nodes = serde_json::json!([{"key":"a","node_id":"nsu=http://example.com/MyModel/;s=Counter","data_type":"U32"}]);
         let t = task_with_nodes(nodes);
         let descs = conn.configure(1, vec![t]).await.unwrap();
         let mut map = std::collections::HashMap::new();
@@ -1718,7 +1788,7 @@ mod tests {
     fn point_spec_f64(key: &str) -> PointSpec {
         PointSpec {
             key: key.into(),
-            addr: crate::address::parse_address("ns=2;i=2").unwrap(),
+            addr: crate::address::parse_address("nsu=http://example.com/MyModel/;i=2").unwrap(),
             data_type: mesa_core_types::DataType::F64,
         }
     }
@@ -1805,7 +1875,7 @@ mod tests {
         let spec_a = point_spec_f64("kA");
         let spec_b = PointSpec {
             key: "kB".into(),
-            addr: crate::address::parse_address("ns=2;i=3").unwrap(),
+            addr: crate::address::parse_address("nsu=http://example.com/MyModel/;i=3").unwrap(),
             data_type: mesa_core_types::DataType::F64,
         };
         let mut last: HashMap<u32, LastKnownSample> = HashMap::new();
@@ -1884,7 +1954,8 @@ mod tests {
         use std::collections::HashMap;
         let spec = PointSpec {
             key: "k1".into(),
-            addr: crate::address::parse_address("ns=2;s=MyString").unwrap(),
+            addr: crate::address::parse_address("nsu=http://example.com/MyModel/;s=MyString")
+                .unwrap(),
             data_type: mesa_core_types::DataType::F64,
         };
         let mut last = HashMap::new();

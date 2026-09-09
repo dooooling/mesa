@@ -61,6 +61,15 @@ async fn run_event_task_inner(
     sink: &EventSink,
     shutdown: &CancellationToken,
 ) -> Result<(), SdkDriverError> {
+    // canonical notifier → 当前会话 index（与 Data 路径同一快照；未知 URI
+    // 即 fail-closed，不带着过期 index 订阅）。
+    let notifier = task.notifier.resolve(namespaces).map_err(|e| {
+        SdkDriverError::new(
+            ErrorKind::Address,
+            "UNKNOWN_NAMESPACE",
+            format!("event task `{}`: {e}", task.id),
+        )
+    })?;
     // 与 Data 订阅同一会话参数（lifetime ≥ 3×keepalive）；事件走独立订阅，
     // 同一 Session 下 Data/Event 队列物理隔离（§19）。
     let sub = transport
@@ -91,7 +100,7 @@ async fn run_event_task_inner(
         None
     };
     let item = UaEventMonitoredItemSpec {
-        notifier: task.notifier.clone(),
+        notifier: notifier.clone(),
         client_handle: 1,
         queue_size: task.queue_size,
         filter: UaEventFilterSpec {
@@ -211,7 +220,7 @@ async fn run_event_task_inner(
     let mut sub = sub;
     let ctx = EventDecodeContext {
         namespaces: namespaces.as_slice(),
-        notifier: &task.notifier,
+        notifier: &notifier,
     };
     // 主循环：fatal/notify/shutdown 三路。shutdown 只置位、不直接退出；
     // 真正的停止是下面的"关门 → drain"序列（P0-1）。
@@ -473,7 +482,10 @@ mod tests {
     fn test_plan() -> OpcUaEventTaskPlan {
         OpcUaEventTaskPlan {
             id: "ev1".into(),
-            notifier: UaNodeRef::numeric(0, 2253),
+            notifier: mesa_opcua_transport::parse_canonical(
+                "nsu=http://opcfoundation.org/UA/;i=2253",
+            )
+            .expect("测试 notifier 合法"),
             scope: EventScope::All,
             publishing_interval_ms: 500,
             queue_size: 1000,

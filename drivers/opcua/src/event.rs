@@ -20,8 +20,8 @@ use mesa_opcua_transport::{UaEventSelectClause, UaNodeRef, UaQualifiedNameRef};
 /// PR9 唯一事件流：OPC UA Events（subscribe only）。
 pub const OPCUA_EVENT_STREAM_ID: &str = "opcua.events";
 
-/// 默认 notifier：Server 对象（ns=0;i=2253）。
-pub const DEFAULT_EVENT_NOTIFIER: &str = "ns=0;i=2253";
+/// 默认 notifier：Server 对象（canonical 基础命名空间形态）。
+pub const DEFAULT_EVENT_NOTIFIER: &str = "nsu=http://opcfoundation.org/UA/;i=2253";
 
 /// 默认发布间隔 500ms（>0）。
 pub const DEFAULT_PUBLISHING_INTERVAL_MS: u64 = 500;
@@ -104,10 +104,11 @@ pub fn opcua_event_catalog() -> EventCatalog {
 // ---------------------------------------------------------------------------
 
 /// 单个事件任务的冻结计划：解析期全部校验通过后才整体替换旧计划（原子切换）。
+/// notifier 为 canonical 身份（配置期只接受 `nsu=`），运行期经快照换算 index。
 #[derive(Debug, Clone)]
 pub struct OpcUaEventTaskPlan {
     pub id: String,
-    pub notifier: UaNodeRef,
+    pub notifier: mesa_opcua_transport::OpcUaNodeId,
     pub scope: EventScope,
     pub publishing_interval_ms: u64,
     pub queue_size: u32,
@@ -227,10 +228,13 @@ pub fn parse_event_tasks(
             .get("notifier_node_id")
             .and_then(|v| v.as_str())
             .unwrap_or(DEFAULT_EVENT_NOTIFIER);
-        let notifier = UaNodeRef::parse(notifier_str).map_err(|e| {
+        let notifier = mesa_opcua_transport::parse_canonical(notifier_str).map_err(|e| {
             configuration(
                 "INVALID_EVENT_NOTIFIER",
-                format!("event task `{}`: notifier_node_id 非法: {e}", task.id),
+                format!(
+                    "event task `{}`: notifier_node_id 非法: {e}（须为 canonical nsu= 形态）",
+                    task.id
+                ),
             )
         })?;
         let scope = params
@@ -996,7 +1000,7 @@ mod tests {
         let t = generic_task(
             "t",
             OPCUA_EVENT_STREAM_ID,
-            serde_json::json!({"notifier_node_id": "ns=2;b=@@@NOT-BASE64@@@"}),
+            serde_json::json!({"notifier_node_id": "nsu=http://example.com/M/;b=@@@NOT-BASE64@@@"}),
         );
         assert_eq!(
             parse_event_tasks(std::slice::from_ref(&t))
@@ -1007,13 +1011,37 @@ mod tests {
         let t = generic_task(
             "t",
             OPCUA_EVENT_STREAM_ID,
-            serde_json::json!({"notifier_node_id": "ns=2;g=zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"}),
+            serde_json::json!({"notifier_node_id": "nsu=http://example.com/M/;g=zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"}),
         );
         assert_eq!(
             parse_event_tasks(std::slice::from_ref(&t))
                 .unwrap_err()
                 .code,
             "INVALID_EVENT_NOTIFIER"
+        );
+        // legacy ns= 一律拒绝（即使是稳定的 ns=0，也必须走 canonical）。
+        let t = generic_task(
+            "t",
+            OPCUA_EVENT_STREAM_ID,
+            serde_json::json!({"notifier_node_id": "ns=0;i=2253"}),
+        );
+        let err = parse_event_tasks(std::slice::from_ref(&t)).unwrap_err();
+        assert_eq!(err.code, "INVALID_EVENT_NOTIFIER");
+        assert!(
+            err.message.contains("nsu="),
+            "须指引 canonical，实际: {}",
+            err.message
+        );
+        // canonical 合法值通过。
+        let t = generic_task(
+            "t",
+            OPCUA_EVENT_STREAM_ID,
+            serde_json::json!({"notifier_node_id": "nsu=http://opcfoundation.org/UA/;i=2253"}),
+        );
+        let plans = parse_event_tasks(std::slice::from_ref(&t)).unwrap();
+        assert_eq!(
+            plans[0].notifier.canonical_key(),
+            "nsu=http://opcfoundation.org/UA/;i=2253"
         );
     }
 

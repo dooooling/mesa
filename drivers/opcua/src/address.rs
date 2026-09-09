@@ -1,42 +1,29 @@
-//! OPC UA NodeId 解析（方案 §7.3 节点型，Core 不懂协议硬约束）。
+//! OPC UA 地址（Commit A：canonical `nsu=` 契约，方案 §7.3 节点型）。
 //!
-//! 支持 OPC UA 标准 NodeId 文本表示（Part 4 §7.2）：
-//! - `ns=2;i=1234` 数值型（Numeric）
-//! - `ns=2;s=Motor.Speed` 字符串型（String）
-//! - `ns=2;g=72962B91-FA75-4A99-8A64-03D6D025A2DA` GUID 型
-//! - `ns=2;b=M/RbKBsRVkePCePcx24oRA==` 不透明型（Opaque，Base64）
-//! - 省略 ns 默认为 `ns=0`：`i=2253` / `s=MyVar`
-//! - 允许大小写不敏感、空格容忍、分号空格变体
+//! - 配置边界（`configure`/`browse parent`/`event notifier`）只接受 canonical
+//!   `nsu=<uri>;<i|s|g|b>=<id>`，`ns=<index>` 一律拒绝（索引漂移导致 point_id
+//!   漂移，见 transport `node_ref`）；
+//! - 运行期 index 在每次建会话后用新鲜 NamespaceArray 解析（`resolve`），
+//!   漂移自愈，canonical 不变；未知 URI 即 fail-closed，不静默回退；
+//! - Fake 路径不消费 index（`namespace: None` 照常工作），Native 路径必须先
+//!   `resolve`（adapter 内 `None` 即编程错误，fail-closed）。
 //!
-//! V1 只读，不涉及 NodeId 创建，仅解析与校验；非法一律在 `configure` 阶段拒绝。
+//! Core 不触及此文件（硬性约束）。
 
-use thiserror::Error;
+pub use mesa_opcua_transport::{OpcUaNodeId, ResolveError, UaIdentifier as Identifier, UaNodeRef};
 
-// ---------------------------------------------------------------------------
-// 常量（中文解释“为什么”）
-// ---------------------------------------------------------------------------
-/// OPC UA 命名空间索引为 u16（0..65535），0 为 OPC 基础命名空间
-const MAX_NAMESPACE: u32 = 65535;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Identifier {
-    Numeric(u32),
-    String(String),
-    Guid(String),
-    Opaque(String), // Base64 原文
-}
-
+/// 驱动侧地址：canonical 身份 + 当前会话解析出的 index。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpcUaAddress {
-    /// 命名空间索引
-    pub namespace: u16,
-    /// 标识符
-    pub identifier: Identifier,
-    /// 原始字符串（用于诊断回显，保持用户输入大小写之外的规范化形式）
+    /// canonical 身份（configure 期确定，持久稳定）。
+    pub node: OpcUaNodeId,
+    /// 当前会话的 namespace index（run 期 `resolve` 后为 `Some`）。
+    pub namespace: Option<u16>,
+    /// 用户输入原文（诊断回显）。
     pub raw: String,
 }
 
-#[derive(Debug, Error, Clone, PartialEq)]
+#[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum AddressError {
     #[error("空地址")]
     Empty,
@@ -44,233 +31,102 @@ pub enum AddressError {
     Invalid { input: String, reason: String },
 }
 
-/// 解析 NodeId 字符串
+impl From<mesa_opcua_transport::CanonicalError> for AddressError {
+    fn from(e: mesa_opcua_transport::CanonicalError) -> Self {
+        match e {
+            mesa_opcua_transport::CanonicalError::Empty => AddressError::Empty,
+            mesa_opcua_transport::CanonicalError::Invalid { input, reason } => {
+                AddressError::Invalid { input, reason }
+            }
+        }
+    }
+}
+
+/// 解析 canonical 地址（只接受 `nsu=`；`ns=` legacy 一律拒绝并指引 browse）。
 pub fn parse_address(input: &str) -> Result<OpcUaAddress, AddressError> {
-    let raw_input = input.trim();
-    if raw_input.is_empty() {
-        return Err(AddressError::Empty);
-    }
-    // 容忍空格：移除所有空白字符后再解析，但保留错误回显用原始 trimmed
-    let s = raw_input.replace(' ', "");
-    if s.is_empty() {
-        return Err(AddressError::Empty);
-    }
-    let parts: Vec<&str> = s.split(';').filter(|p| !p.is_empty()).collect();
-    if parts.is_empty() {
-        return Err(AddressError::Invalid {
-            input: raw_input.to_string(),
-            reason: "格式需如 ns=2;i=1234 或 ns=2;s=MyVar".into(),
-        });
-    }
-
-    let mut namespace: Option<u16> = None;
-    let mut identifier: Option<Identifier> = None;
-
-    for part in parts {
-        let (k, v) = part.split_once('=').ok_or_else(|| AddressError::Invalid {
-            input: raw_input.to_string(),
-            reason: format!("分段 `{part}` 需含 =，如 ns=2 或 i=42"),
-        })?;
-        let key = k.trim().to_ascii_lowercase();
-        let val = v.trim();
-        if val.is_empty() {
-            return Err(AddressError::Invalid {
-                input: raw_input.to_string(),
-                reason: format!("`{key}` 的值不能为空"),
-            });
-        }
-        match key.as_str() {
-            "ns" => {
-                if namespace.is_some() {
-                    return Err(AddressError::Invalid {
-                        input: raw_input.to_string(),
-                        reason: "ns 重复".into(),
-                    });
-                }
-                let n: u32 = val.parse().map_err(|_| AddressError::Invalid {
-                    input: raw_input.to_string(),
-                    reason: format!("ns `{val}` 非法，需 0..{MAX_NAMESPACE}"),
-                })?;
-                if n > MAX_NAMESPACE {
-                    return Err(AddressError::Invalid {
-                        input: raw_input.to_string(),
-                        reason: format!("ns 必须 0..{MAX_NAMESPACE}"),
-                    });
-                }
-                namespace = Some(n as u16);
-            }
-            "i" => {
-                if identifier.is_some() {
-                    return Err(AddressError::Invalid {
-                        input: raw_input.to_string(),
-                        reason: "标识符重复（i/s/g/b 只能选一）".into(),
-                    });
-                }
-                // Numeric 允许 u32，无符号
-                let n: u32 = val.parse().map_err(|_| AddressError::Invalid {
-                    input: raw_input.to_string(),
-                    reason: format!("i `{val}` 非法，需无符号整数"),
-                })?;
-                identifier = Some(Identifier::Numeric(n));
-            }
-            "s" => {
-                if identifier.is_some() {
-                    return Err(AddressError::Invalid {
-                        input: raw_input.to_string(),
-                        reason: "标识符重复（i/s/g/b 只能选一）".into(),
-                    });
-                }
-                // String 标识符：保留原大小写（已去空格），但 OPC UA 字符串区分大小写
-                // 这里 v 来自去空格后的 s，若用户原始含空格已归一化，属容忍行为
-                if val.is_empty() {
-                    return Err(AddressError::Invalid {
-                        input: raw_input.to_string(),
-                        reason: "s 字符串标识符不能为空".into(),
-                    });
-                }
-                identifier = Some(Identifier::String(val.to_string()));
-            }
-            "g" => {
-                if identifier.is_some() {
-                    return Err(AddressError::Invalid {
-                        input: raw_input.to_string(),
-                        reason: "标识符重复（i/s/g/b 只能选一）".into(),
-                    });
-                }
-                // GUID 校验：形如 72962B91-FA75-4A99-8A64-03D6D025A2DA（8-4-4-4-12 十六进制）
-                if !is_valid_guid(val) {
-                    return Err(AddressError::Invalid {
-                        input: raw_input.to_string(),
-                        reason: format!("g GUID `{val}` 非法，需 8-4-4-4-12 十六进制"),
-                    });
-                }
-                identifier = Some(Identifier::Guid(val.to_string()));
-            }
-            "b" => {
-                if identifier.is_some() {
-                    return Err(AddressError::Invalid {
-                        input: raw_input.to_string(),
-                        reason: "标识符重复（i/s/g/b 只能选一）".into(),
-                    });
-                }
-                // Opaque：要求 Base64 字符集，长度不限但不能为空
-                if !is_valid_base64(val) {
-                    return Err(AddressError::Invalid {
-                        input: raw_input.to_string(),
-                        reason: format!("b Opaque `{val}` 非法，需 Base64 字符"),
-                    });
-                }
-                identifier = Some(Identifier::Opaque(val.to_string()));
-            }
-            _ => {
-                return Err(AddressError::Invalid {
-                    input: raw_input.to_string(),
-                    reason: format!("未知分段 `{key}`，期望 ns/i/s/g/b"),
-                });
-            }
-        }
-    }
-
-    let ident = identifier.ok_or_else(|| AddressError::Invalid {
-        input: raw_input.to_string(),
-        reason: "缺少标识符（i/s/g/b 需选其一），如 ns=2;i=1234".into(),
-    })?;
-    let ns = namespace.unwrap_or(0);
-
+    let node = mesa_opcua_transport::parse_canonical(input)?;
     Ok(OpcUaAddress {
-        namespace: ns,
-        identifier: ident,
-        raw: raw_input.to_string(),
+        raw: node.raw.clone(),
+        node,
+        namespace: None,
     })
 }
 
-fn is_valid_guid(s: &str) -> bool {
-    // 8-4-4-4-12 且均为 hex
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 5 {
-        return false;
+impl OpcUaAddress {
+    /// 运行期换算：canonical → 当前会话 index（成功后 `namespace` 置 `Some`）。
+    pub fn resolve(&mut self, namespaces: &[String]) -> Result<UaNodeRef, ResolveError> {
+        let r = self.node.resolve(namespaces)?;
+        self.namespace = Some(r.namespace);
+        Ok(r)
     }
-    let lens = [8, 4, 4, 4, 12];
-    for (p, &exp) in parts.iter().zip(lens.iter()) {
-        if p.len() != exp {
-            return false;
-        }
-        if !p.chars().all(|c| c.is_ascii_hexdigit()) {
-            return false;
-        }
-    }
-    true
-}
 
-fn is_valid_base64(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
+    /// 取当前会话 index（未 `resolve` 即编程错误，fail-closed）。
+    pub fn to_node_ref(&self) -> Result<UaNodeRef, String> {
+        let namespace = self.namespace.ok_or_else(|| {
+            format!(
+                "节点 `{}` 未解析 namespace index（run 期必须先 resolve）",
+                self.node.canonical_key()
+            )
+        })?;
+        Ok(UaNodeRef {
+            namespace,
+            identifier: self.node.identifier.clone(),
+        })
     }
-    // 允许 A-Za-z0-9+/= 填充
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ok(s: &str, ns: u16, ident: Identifier) {
-        let a = parse_address(s).unwrap_or_else(|e| panic!("parse {s} failed: {e}"));
-        assert_eq!(a.namespace, ns, "ns mismatch for {s}");
-        assert_eq!(a.identifier, ident, "ident mismatch for {s}");
+    const URI: &str = "http://example.com/MyModel/";
+
+    #[test]
+    fn canonical_accepted_unresolved_by_default() {
+        let a = parse_address(&format!("nsu={URI};s=Motor.Speed")).expect("canonical Ok");
+        assert_eq!(a.namespace, None);
+        assert_eq!(a.node.namespace_uri, URI);
+        assert!(a.to_node_ref().is_err(), "未 resolve 即 fail-closed");
     }
 
     #[test]
-    fn numeric_forms() {
-        ok("ns=2;i=1234", 2, Identifier::Numeric(1234));
-        ok("ns=0;i=2253", 0, Identifier::Numeric(2253));
-        ok("i=42", 0, Identifier::Numeric(42));
-        ok("NS=3;I=999", 3, Identifier::Numeric(999));
-        ok(" ns=2 ; i=1 ", 2, Identifier::Numeric(1));
+    fn resolve_fills_index_and_shifts_heal() {
+        let mut a = parse_address(&format!("nsu={URI};i=2")).expect("parse ok");
+        let ns = vec![
+            mesa_opcua_transport::OPC_BASE_NAMESPACE_URI.to_string(),
+            URI.to_string(),
+        ];
+        let r = a.resolve(&ns).expect("resolve ok");
+        assert_eq!(r.namespace, 1);
+        assert_eq!(a.namespace, Some(1));
+        assert_eq!(a.to_node_ref().unwrap(), r);
+        // 未知 URI fail-closed，不污染已解析值
+        assert!(a.resolve(&["http://other/".to_string()]).is_err());
+        assert_eq!(a.namespace, Some(1));
     }
 
     #[test]
-    fn string_forms() {
-        ok(
-            "ns=2;s=Motor.Speed",
-            2,
-            Identifier::String("Motor.Speed".into()),
-        );
-        ok(
-            "ns=2;s=HelloWorld",
-            2,
-            Identifier::String("HelloWorld".into()),
-        );
-        ok("s=MyVar", 0, Identifier::String("MyVar".into()));
+    fn legacy_ns_rejected_with_guidance() {
+        for s in ["ns=2;s=X", "ns=2;i=1", "NS=0;I=85", "i=42", ""] {
+            let err = parse_address(s).expect_err(&format!("必须拒绝: {s:?}"));
+            match err {
+                AddressError::Empty => assert!(s.trim().is_empty()),
+                AddressError::Invalid { reason, .. } => {
+                    assert!(
+                        reason.contains("nsu=") || reason.contains("canonical"),
+                        "须指引 canonical，实际: {reason}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
-    fn guid_and_opaque() {
-        ok(
-            "ns=2;g=72962B91-FA75-4A99-8A64-03D6D025A2DA",
-            2,
-            Identifier::Guid("72962B91-FA75-4A99-8A64-03D6D025A2DA".into()),
-        );
-        ok(
-            "ns=1;b=M/RbKBsRVkePCePcx24oRA==",
-            1,
-            Identifier::Opaque("M/RbKBsRVkePCePcx24oRA==".into()),
-        );
-    }
-
-    #[test]
-    fn invalid_rejected() {
-        assert!(parse_address("").is_err());
-        assert!(parse_address("ns=2").is_err()); // 缺 identifier
-        assert!(parse_address("ns=2;x=1").is_err()); // 未知 key
-        assert!(parse_address("ns=99999;i=1").is_err()); // ns 越界
-        assert!(parse_address("ns=2;i=abc").is_err());
-        assert!(parse_address("ns=2;i=1;s=foo").is_err()); // 重复 identifier
-        assert!(parse_address("ns=2;ns=3;i=1").is_err()); // 重复 ns
-        assert!(parse_address("ns=2;g=not-a-guid").is_err());
-        assert!(parse_address("ns=2;b=$$$").is_err()); // 非 base64
-        assert!(parse_address("ns=2;s=").is_err());
-        assert!(parse_address("i=").is_err());
+    fn invalid_shapes_rejected() {
+        assert!(parse_address("nsu=;s=X").is_err());
+        assert!(parse_address("nsu=uri;x=1").is_err());
+        assert!(parse_address("nsu=uri;i=abc").is_err());
+        assert!(parse_address("nsu=uri;g=not-a-guid").is_err());
+        assert!(parse_address("nsu=uri;b=$$$").is_err());
     }
 }

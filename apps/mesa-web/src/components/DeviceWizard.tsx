@@ -15,11 +15,22 @@ interface Profile {
   presets: { id: string; label: { default: string; "zh-CN"?: string }; selections: unknown[] }[];
 }
 
-const DRIVERS = [
+// 已知驱动的图标；未知驱动用默认符号（列表本身以后端 discovery 为准，
+// 新驱动如 sinumerik-nck 无需改前端即出现；后端不可用时用下面的兜底卡片）。
+const DRIVER_ICONS: Record<string, string> = {
+  simulator: "◐",
+  s7: "⬢",
+  focas2: "⬣",
+  opcua: "⬔",
+  "sinumerik-nck": "⬘",
+};
+
+const FALLBACK_DRIVERS = [
   { id: "simulator", name: "Simulator", sub: "本地仿真 · 零硬件", icon: "◐" },
   { id: "s7", name: "Siemens S7", sub: "S7-1200/1500 · DB/M/I/Q", icon: "⬢" },
   { id: "focas2", name: "FANUC FOCAS2", sub: "0i-F · PMC/动态/宏变量", icon: "⬣" },
   { id: "opcua", name: "OPC UA", sub: "订阅/轮询 · 证书安全", icon: "⬔" },
+  { id: "sinumerik-nck", name: "SINUMERIK NCK", sub: "Siemens CNC · 原生只读", icon: "⬘" },
 ];
 
 export function DeviceWizard() {
@@ -34,8 +45,20 @@ export function DeviceWizard() {
   const [valid, setValid] = useState<boolean | null>(null);
   const [selections, setSelections] = useState<unknown[]>([]);
   const [live, setLive] = useState<{ points: Array<{ endpoint_id: string; point_key: string; point_id: number; value: { type: string; value: unknown }; quality: string; timestamp_ns: number }> } | null>(null);
+  // 驱动卡片以后端 discovery 为准（sub 取后端版本号；后端不可用时用兜底）。
+  const [drivers, setDrivers] = useState(FALLBACK_DRIVERS);
 
   useEffect(() => { api.listProfiles().then((j) => setProfiles(j.profiles ?? [])).catch(() => {}); }, []);
+  useEffect(() => {
+    api.listDrivers().then((j) => {
+      const ds = ((j.drivers ?? []) as Array<{ id: string; name: string; version: string }>)
+        .map((d) => ({ id: d.id, name: d.name, sub: `v${d.version}`, icon: DRIVER_ICONS[d.id] ?? "○" }));
+      if (ds.length) {
+        setDrivers(ds);
+        setDriverId((cur) => (ds.some((x) => x.id === cur) ? cur : ""));
+      }
+    }).catch(() => {});
+  }, []);
 
   const selectedProfile = useMemo(() => profiles.find((p) => p.id === profileId) ?? null, [profiles, profileId]);
   const driverProfiles = useMemo(() => profiles.filter((p) => p.driver_id === driverId), [profiles, driverId]);
@@ -121,7 +144,7 @@ export function DeviceWizard() {
         <div className="card">
           <div className="card-hd"><h3>① 选择驱动</h3><span className="help">按设备类型选择，一切能力由驱动自描述</span></div>
           <div className="card-bd grid grid-2">
-            {DRIVERS.map((d) => (
+            {drivers.map((d) => (
               <button
                 key={d.id}
                 onClick={() => setDriverId(d.id)}

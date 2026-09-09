@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 mesa-core-types = { workspace = true }
 mesa-driver-sdk = { workspace = true }
+mesa-s7-transport = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

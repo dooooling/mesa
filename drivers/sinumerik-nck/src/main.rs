@@ -1,13 +1,13 @@
-//! SINUMERIK Driver 进程入口（与 opcua/s7/simulator 同序列）。
+//! SINUMERIK NCK Driver 进程入口（方案 §14）。
 //!
-//! 序列：读 token → liveness 守护 → 监听 loopback 端口 → SDK serve。
+//! 序列与 s7/opcua/simulator 保持一致：读 token → liveness 守护 → 监听 loopback 端口 → SDK serve。
 
 fn main() {
     let port: u16 = match std::env::args().nth(2).or_else(|| std::env::args().nth(1)) {
         Some(arg) => arg
             .parse()
             .unwrap_or_else(|_| panic!("invalid --port value {arg}")),
-        None => panic!("usage: Mesa-driver-sinumerik --port <u16>"),
+        None => panic!("usage: Mesa-driver-sinumerik-nck --port <u16>"),
     };
 
     let session_token = mesa_driver_sdk::read_session_token_from_stdin();
@@ -33,14 +33,14 @@ fn main() {
         }
 
         if let Err(e) = mesa_driver_sdk::serve(
-            mesa_driver_sinumerik::SinumerikDriver,
+            mesa_driver_sinumerik_nck::SinumerikNckDriver,
             listener,
             session_token,
             shutdown,
         )
         .await
         {
-            eprintln!("sinumerik driver exited with error: {e}");
+            eprintln!("sinumerik-nck driver exited with error: {e}");
             std::process::exit(1);
         }
     });
