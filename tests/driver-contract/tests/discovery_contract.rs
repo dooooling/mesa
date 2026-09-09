@@ -160,11 +160,10 @@ async fn browse_pagination_does_not_return_all_at_once() {
 }
 
 #[tokio::test]
-async fn browse_sinumerik_nck_is_plumbed_but_browse_arrives_with_topology() {
-    // ADR 0001 Commit B：`sinumerik` 已退役，`sinumerik-nck` 空壳 discovery
-    // 可见但 browse 能力随 Commit E（Catalog + Topology）到来；此处只锁
-    // discovery  plumbing（驱动被发现、二进制可拉起），browse 语义由 Commit E
-    // 的 `nck://` canonical 门覆盖。
+async fn browse_sinumerik_nck_catalog_tree_e2e() {
+    // ADR 0001 Commit E：`sinumerik-nck` browse 是 Catalog 虚拟树（纯函数，
+    // 无需会话）——子进程 E2E：驱动被发现、二进制可拉起、browse 200。
+    // 随仓 catalog 为空（真机回填前），根即空页；身份形态为 `nck://` canonical。
     // 注意：改过驱动代码后须先 cargo build --workspace（旧二进制静默失效）。
     let _guard = BROWSE_SERIAL.lock().await;
     let drivers_dir = common::repo_root().join("drivers");
@@ -177,4 +176,20 @@ async fn browse_sinumerik_nck_is_plumbed_but_browse_arrives_with_topology() {
         mgr.find_driver("sinumerik").is_none(),
         "旧 sinumerik 必须零残留"
     );
+    let (app, ep_id) = app_with_endpoint(
+        "sinumerik-nck",
+        serde_json::json!({"host":"127.0.0.1","local_tsap":256,"remote_tsap":258}),
+    )
+    .await;
+    let req = Request::builder()
+        .uri(format!("/api/v1/endpoints/{ep_id}/browse"))
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"parent":"","limit":10}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let v = assert_browse_ok(resp, "sinumerik-nck").await;
+    let nodes = v["nodes"].as_array().expect("nodes 数组");
+    // 空 catalog → 空根（不伪造内容）；未知 parent 同样空页。
+    assert!(nodes.is_empty(), "空 catalog 根必须为空，实际: {v}");
 }

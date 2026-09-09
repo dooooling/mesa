@@ -1,4 +1,4 @@
-//! SINUMERIK NCK Driver — 原生 NCK 只读（ADR 0001，Commit C 起可读）。
+//! SINUMERIK NCK Driver — 原生 NCK 只读（ADR 0001，Commit E 完成 V1 地基）。
 //!
 //! 架构位置：
 //! ```text
@@ -10,23 +10,28 @@
 //! - Core 只认识 Descriptor / ProbeReport / ResourceSelection / DataBatch，
 //!   无任何 `driver_id == "sinumerik-nck"` 分支；
 //! - V1 严格只读：`write`/`command` 沿用 SDK 默认 Unsupported；事件目录为空；
-//! - Commit C 点亮 wire codec + 会话直读；configure/数据面/browse 仍
-//!   `NOT_IMPLEMENTED`（TODO 注 Commit D/E）。
+//! - probe 诚实语义：会话可达≠身份确认（family 待 anchor，真机 PR7）。
 
 mod address;
+mod browse;
 mod catalog;
 mod client;
 mod codec;
 mod config;
 mod fixture;
+mod probe;
+mod topology;
 mod value;
 
 pub use address::{AddressError, NckArea, NckUnitMode, NckVariableRef};
+pub use browse::build_tree;
 pub use catalog::{CatalogError, NckCatalog, NckShape, NckVariableDefinition, NckWireDefinition};
 pub use client::{NckClient, NckReadItem, NckReadResult};
 pub use codec::{CodecError, NckWireAddress, encode_var_spec, resolve as resolve_wire};
 pub use config::{NCK_DEFAULT_PORT, NckConnConfig};
 pub use fixture::{NckFixture, NckFixtureState};
+pub use probe::{NCK_ANCHOR_PENDING, probe_with_session};
+pub use topology::{NckAxis, NckChannel, NckTopology, axis_path, channel_path};
 pub use value::{NckDataKind, NckSample, ValueError, decode_value};
 
 use mesa_core_types::{AcquisitionTask, DriverMetadata, PointDescriptor, PointMap};
@@ -142,15 +147,15 @@ impl Driver for SinumerikNckDriver {
             controls: mesa_core_types::ControlCatalog::default(),
             discovery: DiscoveryCapabilities {
                 manual: true,
-                // Commit E 翻转为 true（Catalog + Topology 虚拟树就位后）。
-                browse: false,
+                // Commit E：Catalog 虚拟树就位（空 catalog 即空根，不伪造内容）。
+                browse: true,
                 import: false,
             },
             capabilities: DriverCapabilities {
                 poll: true,
-                // 不伪造 Subscribe（ReadVar 本质是请求/响应）；browse 能力随 Commit E。
+                // 不伪造 Subscribe（ReadVar 本质是请求/响应）。
                 subscribe: false,
-                browse: false,
+                browse: true,
                 ..Default::default()
             },
             // Event Plane：NCK V1 无事件目录即 empty（Major 不升级）。
@@ -173,6 +178,7 @@ impl Driver for SinumerikNckDriver {
         Ok(Box::new(NckConnection {
             cfg,
             catalog,
+            topology: None,
             plan: None,
         }))
     }
@@ -208,6 +214,8 @@ struct PlanSnapshot {
 pub struct NckConnection {
     cfg: NckConnConfig,
     catalog: NckCatalog,
+    /// 拓扑快照（probe 回填；V1 恒 None，browse 退化为纯 Catalog 树）。
+    topology: Option<NckTopology>,
     plan: Option<PlanSnapshot>,
 }
 
@@ -217,17 +225,10 @@ impl NckConnection {
         Self {
             cfg,
             catalog,
+            topology: None,
             plan: None,
         }
     }
-}
-
-fn not_implemented(what: &str) -> SdkDriverError {
-    SdkDriverError::new(
-        mesa_core_types::ErrorKind::Internal,
-        "NOT_IMPLEMENTED",
-        format!("sinumerik-nck {what} 尚未实现（见 GATE.md）"),
-    )
 }
 
 /// 单点解码：GOOD + 足长 → Current（更新 last_known）；BAD/短包 → 有缓存
@@ -347,11 +348,10 @@ fn pack_array(kind: NckDataKind, elems: Vec<mesa_core_types::Value>) -> mesa_cor
 
 #[async_trait::async_trait]
 impl DriverConnection for NckConnection {
-    // TODO(Commit E)：TCP → COTP → Setup → NCK 0x82 安全探测变量 → topology 摘要。
-    // probe anchor 须从官方变量表选永久只读跨版本稳定变量，真机 Gate 冻结。
+    /// 探测：S7Comm 会话可达性（reachable），身份恒待确认
+    /// （family/model 为 None + `NCK_ANCHOR_PENDING`，见 probe）。
     async fn probe(&mut self) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
-        let _ = &self.cfg;
-        Err(not_implemented("probe"))
+        Ok(probe_with_session(&self.cfg).await)
     }
 
     /// 通用绑定 `mesa.resources.v1`（resource_id `variable`）→ Catalog →
@@ -656,15 +656,23 @@ impl DriverConnection for NckConnection {
         Ok(())
     }
 
-    // TODO(Commit E)：Catalog + Topology 虚拟 Browse 树。
+    /// 浏览：Catalog 虚拟树（纯函数，无需会话；topology 由 probe 回填，
+    /// V1 为空即纯 Catalog 树）。未知 parent → 空页。
     async fn browse(
         &mut self,
-        _parent: &str,
-        _filter: &str,
-        _cursor: &str,
-        _limit: u32,
+        parent: &str,
+        filter: &str,
+        cursor: &str,
+        limit: u32,
     ) -> Result<(Vec<mesa_driver_protocol::pb::BrowseNode>, Option<String>), SdkDriverError> {
-        Err(not_implemented("browse"))
+        Ok(build_tree(
+            &self.catalog,
+            self.topology.as_ref(),
+            parent,
+            filter,
+            cursor,
+            limit,
+        ))
     }
 }
 
@@ -679,6 +687,8 @@ mod tests {
         assert_eq!(d.identity.driver_id, "sinumerik-nck");
         assert!(d.capabilities.poll, "NCK V1 必须 poll");
         assert!(!d.capabilities.subscribe, "NCK 不伪造 subscribe");
+        assert!(d.capabilities.browse, "NCK browse（Catalog 树）已就位");
+        assert!(d.discovery.browse, "discovery browse 已就位");
         assert!(!d.capabilities.write, "NCK V1 只读");
         assert!(!d.capabilities.method, "NCK V1 无 command");
         assert!(!d.capabilities.events, "NCK V1 无事件");
@@ -733,8 +743,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_and_browse_still_skeleton_until_topology() {
-        // probe/browse 随 Commit E（topology）点亮，此处只锁 NOT_IMPLEMENTED。
+    async fn probe_honest_and_browse_empty_catalog() {
+        // 空 catalog：browse 根为空页（不伪造内容）；probe 可达但身份待确认。
         let mut conn = NckConnection::with_catalog(
             NckConnConfig::from_json(&serde_json::json!({
                 "host": "10.0.0.5", "local_tsap": 256, "remote_tsap": 258,
@@ -742,11 +752,36 @@ mod tests {
             .unwrap(),
             NckCatalog::empty(),
         );
-        assert_eq!(conn.probe().await.unwrap_err().code, "NOT_IMPLEMENTED");
-        assert_eq!(
-            conn.browse("", "", "", 0).await.unwrap_err().code,
-            "NOT_IMPLEMENTED"
+        let (nodes, next) = conn.browse("", "", "", 0).await.unwrap();
+        assert!(nodes.is_empty());
+        assert!(next.is_none());
+        // probe 打不可达桩（10.0.0.5 无真机）→ 不可达规范报告。
+        let report = conn.probe().await.unwrap();
+        assert!(!report.reachable, "无真机时 probe 必须不可达");
+    }
+
+    #[tokio::test]
+    async fn browse_synthetic_tree_and_probe_reachable() {
+        // 合成 catalog：browse 树可导航；fixture 可达且身份待确认。
+        let fx = NckFixture::spawn(NckFixtureState::default()).await;
+        let mut conn = NckConnection::with_catalog(
+            NckConnConfig::from_json(&serde_json::json!({
+                "host": "127.0.0.1", "local_tsap": 256, "remote_tsap": 258,
+            }))
+            .unwrap(),
+            synthetic_catalog(),
         );
+        conn.cfg.port = fx.addr.port();
+        let (root, _) = conn.browse("", "", "", 0).await.unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].id, "nck://C");
+        let (leaves, _) = conn.browse("nck://C/SEMA", "", "", 0).await.unwrap();
+        assert_eq!(leaves.len(), 1);
+        assert!(leaves[0].id.starts_with("nck://C/"));
+        let report = conn.probe().await.unwrap();
+        assert!(report.reachable);
+        assert!(report.family.is_none(), "无 anchor 不得断言 family");
+        assert!(report.warnings.iter().any(|w| w.code == NCK_ANCHOR_PENDING));
     }
 
     /// 合成 catalog（脚手架数值，非 Siemens 语义； wired module/column 仅测机器）。

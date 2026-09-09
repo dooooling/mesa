@@ -149,6 +149,15 @@ impl NckCatalog {
         self.entries.is_empty()
     }
 
+    /// 全变量（Area 字母 → Block → Variable 稳定排序；browse 建树用）。
+    pub fn variables(&self) -> Vec<&NckVariableDefinition> {
+        let mut v: Vec<_> = self.entries.values().collect();
+        v.sort_by(|a, b| {
+            (a.area.letter(), &a.block, &a.variable).cmp(&(b.area.letter(), &b.block, &b.variable))
+        });
+        v
+    }
+
     /// 查询变量定义（未知即 `UnknownVariable`，调用方按项 BAD/配置拒绝）。
     pub fn lookup(
         &self,
