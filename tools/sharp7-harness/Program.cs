@@ -27,6 +27,9 @@ static class Harness
         public int Start = 0;
         public int Amount = 1;
         public int WordLen = 0x1A; // S7WLDouble（8 bytes；与 emulator element-size 8 等价，F3 证据等价要求）
+        public string ExpectSingle = ""; // hex（可带-）：单读 exact 内容期望，不提供则只验长度
+        public string ExpectMulti0 = ""; // multi 首项 exact 内容期望
+        public string ExpectMulti1 = ""; // multi 次项 exact 内容期望
     }
 
     // 期望解码字节数 = Amount × WordSize（WordLen 决定；DOUBLE=8）。
@@ -40,6 +43,33 @@ static class Harness
         0x02 => 1, // S7WLByte
         _ => -1,   // 未支持：拒绝猜
     };
+
+    // hex 解析（BitConverter 风格，可带 '-' 分隔；非法即抛，由调用方判失败）。
+    static byte[] ParseHex(string h)
+    {
+        string s = h.Replace("-", "");
+        if (s.Length == 0 || s.Length % 2 != 0) throw new Exception($"hex 非法 {h}");
+        var b = new byte[s.Length / 2];
+        for (int i = 0; i < b.Length; i++) b[i] = Convert.ToByte(s.Substring(i * 2, 2), 16);
+        return b;
+    }
+
+    // exact 内容比对（长度 + 逐字节）；不一致打印首个差异位并返回 false。
+    static bool ExactIs(byte[] got, int count, byte[] want, string tag)
+    {
+        if (count != want.Length)
+        {
+            Console.WriteLine($"{tag} 长度 {count} != 期望 {want.Length}");
+            return false;
+        }
+        for (int i = 0; i < want.Length; i++)
+            if (got[i] != want[i])
+            {
+                Console.WriteLine($"{tag}[{i}] {got[i]:X2} != 期望 {want[i]:X2}");
+                return false;
+            }
+        return true;
+    }
 
     static int Main(string[] argv)
     {
@@ -97,6 +127,10 @@ static class Harness
                 lock (events) { events.Add(new { op = "single", rc, bytesRead, data = BitConverter.ToString(singleBuf, 0, Math.Max(bytesRead, 0)) }); }
                 if (rc != 0) { clientRc = 12; return; }
                 if (bytesRead != expect) { Console.WriteLine($"single bytes mismatch {bytesRead} != {expect}"); clientRc = 13; return; }
+                // exact 内容 gating（提供 --expect-single 时）：长度对了还不够，
+                // 内容必须逐字节一致，否则证据无效。
+                if (a.ExpectSingle.Length > 0 && !ExactIs(singleBuf, bytesRead, ParseHex(a.ExpectSingle), "single"))
+                { clientRc = 16; return; }
 
                 // --- multi read（ReadMultiNckVars，两项：param 与 param+1） ---
                 var multi = new S7NckMultiVar(client);
@@ -109,6 +143,10 @@ static class Harness
                 lock (events) { events.Add(new { op = "multi", rc, results = new[] { multi.Results[0], multi.Results[1] }, buf0 = BitConverter.ToString(buf0, 0, expect), buf1 = BitConverter.ToString(buf1, 0, expect) }); }
                 if (rc != 0) { clientRc = 14; return; }
                 if (multi.Results[0] != 0 || multi.Results[1] != 0) { Console.WriteLine("multi item BAD"); clientRc = 15; return; }
+                if (a.ExpectMulti0.Length > 0 && !ExactIs(buf0, expect, ParseHex(a.ExpectMulti0), "multi0"))
+                { clientRc = 17; return; }
+                if (a.ExpectMulti1.Length > 0 && !ExactIs(buf1, expect, ParseHex(a.ExpectMulti1), "multi1"))
+                { clientRc = 18; return; }
 
                 client.Disconnect();
             }
@@ -125,21 +163,25 @@ static class Harness
         if (!acceptDone.Wait(10000)) return Fail("tap accept timeout", -1);
         // tap 双向泵跑在独立线程（req = client→server，rsp = 反向）。
         // accept 已发生，client 握手字节已在内核缓冲，pump 接管即转发，不丢包。
-        int pumpRc = 0;
+        var pumpSt = new PumpState();
         var pumpThread = new Thread(() =>
         {
-            try { Pump(fromClient.GetStream(), toEmu.GetStream(), a.Out, seq); }
-            catch (Exception e) { Console.WriteLine($"pump end: {e.Message}"); pumpRc = 21; }
+            try { Pump(fromClient.GetStream(), toEmu.GetStream(), a.Out, seq, pumpSt); }
+            catch (Exception e) { Console.WriteLine($"pump end: {e.Message}"); Interlocked.CompareExchange(ref pumpSt.rc, 21, 0); }
         });
         pumpThread.IsBackground = true;
         pumpThread.Start();
         if (!clientDone.Wait(60000)) { Console.WriteLine("client timeout"); clientRc = 31; }
-        // 确定性 teardown：关两端 socket 解开 pump 的阻塞读，再 Join。
+        // 确定性 teardown：先立预期关闭旗，再关两端 socket 解开阻塞读。
+        teardown = true;
         try { fromClient.Close(); } catch { }
         try { toEmu.Close(); } catch { }
-        pumpThread.Join(5000);
+        // Join 超时即失败（pump 线程泄漏/死锁不得静默）。
+        if (!pumpThread.Join(5000)) { Console.WriteLine("pump join timeout"); return 32; }
         tap.Stop();
-        if (pumpRc != 0) return pumpRc;
+        // client 优先（更有信息量），pump 错误其次。
+        if (clientRc != 0) return clientRc;
+        if (pumpSt.rc != 0) return pumpSt.rc;
 
         var manifest = new
         {
@@ -161,29 +203,37 @@ static class Harness
     }
 
     sealed class Seq { public int n; }
+    // teardown 预期关闭旗：teardown 后 socket 读写抛异常属预期，不记错。
+    static volatile bool teardown;
 
     // 一次读一整包 TPKT（4 字节头给长度），双向各自编号落盘。
-    static void Pump(NetworkStream c2s, NetworkStream s2c, string outDir, Seq seq)
+    // worker 异常经 pumpRc 上报（set-once，首错为准），不再 catch-all 静默。
+    sealed class PumpState { public int rc; }
+    static void Pump(NetworkStream c2s, NetworkStream s2c, string outDir, Seq seq, PumpState st)
     {
-        var t1 = new Thread(() => Forward(c2s, s2c, outDir, "req", seq));
-        var t2 = new Thread(() => Forward(s2c, c2s, outDir, "rsp", seq));
+        var t1 = new Thread(() => Forward(c2s, s2c, outDir, "req", seq, st));
+        var t2 = new Thread(() => Forward(s2c, c2s, outDir, "rsp", seq, st));
         t1.IsBackground = t2.IsBackground = true;
         t1.Start(); t2.Start();
         t1.Join(); t2.Join();
     }
 
-    static void Forward(NetworkStream from, NetworkStream to, string outDir, string tag, Seq seq)
+    static void Forward(NetworkStream from, NetworkStream to, string outDir, string tag, Seq seq, PumpState st)
     {
         try
         {
             while (true)
             {
                 byte[] hdr = ReadExact(from, 4);
-                if (hdr == null) break;
+                if (hdr == null) break; // 对端正常关：EOF 即停泵（非错）
                 int len = (hdr[2] << 8) | hdr[3];
-                if (len < 4 || len > 8192) break;
+                if (len < 4 || len > 8192)
+                {
+                    if (!teardown) { Console.WriteLine($"{tag} 非法 TPKT 长 {len}"); Interlocked.CompareExchange(ref st.rc, 22, 0); }
+                    break;
+                }
                 byte[] rest = ReadExact(from, len - 4);
-                if (rest == null) break;
+                if (rest == null) break; // 同上：包内 EOF 即停泵
                 byte[] pkt = new byte[len];
                 Buffer.BlockCopy(hdr, 0, pkt, 0, 4);
                 Buffer.BlockCopy(rest, 0, pkt, 4, len - 4);
@@ -193,7 +243,16 @@ static class Harness
                 to.Write(pkt, 0, pkt.Length);
             }
         }
-        catch { /* 对端关闭即停泵 */ }
+        catch (Exception e)
+        {
+            // teardown 预期关闭（我们主动关 socket 解阻塞读）不记错；
+            // 其余一律上报（首错为准）。
+            if (!teardown)
+            {
+                Console.WriteLine($"{tag} pump 异常: {e.GetType().Name}: {e.Message}");
+                Interlocked.CompareExchange(ref st.rc, 22, 0);
+            }
+        }
     }
 
     static byte[] ReadExact(NetworkStream s, int n)
@@ -260,6 +319,9 @@ static class Harness
                 case "--start": a.Start = int.Parse(v); break;
                 case "--amount": a.Amount = int.Parse(v); break;
                 case "--wordlen": a.WordLen = int.Parse(v); break;
+                case "--expect-single": a.ExpectSingle = v; break;
+                case "--expect-multi0": a.ExpectMulti0 = v; break;
+                case "--expect-multi1": a.ExpectMulti1 = v; break;
                 default: throw new Exception($"未知参数 {k}");
             }
         }

@@ -25,7 +25,10 @@ mesa-nck-emulator --port 1102 --scenario happy --element-size 8
 #    WordLen 默认 S7WLDouble(0x1A)，与 element-size 8 等价，要求 exact bytes）
 dotnet run --project tools/sharp7-harness -- \
   --emulator 127.0.0.1:1102 --out drivers/sinumerik-nck/tests/reference/sharp7 \
-  --unit 1 --module 18 --param 42 --start 0 --amount 1
+  --unit 1 --module 18 --param 42 --start 0 --amount 1 \
+  --expect-single 01-01-01-01-01-01-01-01 \
+  --expect-multi0 02-02-02-02-02-02-02-02 \
+  --expect-multi1 03-03-03-03-03-03-03-03
 
 # harness 是证据工具：任何一步失败（connect/single/multi/bytes/Results/
 # 超时/pump 异常）即非零退出，不产出可用 vectors（禁 false-green）。

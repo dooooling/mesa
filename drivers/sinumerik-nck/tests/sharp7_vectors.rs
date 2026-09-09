@@ -58,6 +58,7 @@ fn manifest_pins_source_and_outcome() {
     // F3 等价要求：S7WLDouble(0x1A=26) + element-size 8，Sharp7 必须解出
     // 完整 8 字节（不止 framing/status 一致）。
     assert_eq!(m["wordLen"], 26, "必须 S7WLDouble");
+    assert_eq!(m["files"], 8, "8 个包文件（4 req + 4 rsp）");
     assert_eq!(m["events"][0]["rc"], 0);
     assert_eq!(m["events"][1]["rc"], 0);
     for f in [

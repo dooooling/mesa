@@ -573,6 +573,19 @@ mod tests {
     }
 
     #[test]
+    fn read_extra_bytes_beyond_declared_data_len_rejected() {
+        // 声明长度之外多一字节（TPKT 长度同步更新，frame 完整但 S7 语义超长）
+        // → S7_LEN_MISMATCH。data 切片只认声明长度，trailing 检查抓不到此处。
+        let data = [0xFF, 0x04, 0x00, 0x08, 0x2A];
+        let mut resp = ack_resp(&data, &[0x04, 0x01]);
+        resp.push(0xAA); // S7 末尾垃圾字节
+        let len = resp.len() as u16; // TPKT 总长同步，frame 层面合法
+        resp[2..4].copy_from_slice(&len.to_be_bytes());
+        let err = parse_read_response(&resp, &[item(12, 1)]).unwrap_err();
+        assert_eq!(err.code, "S7_LEN_MISMATCH");
+    }
+
+    #[test]
     fn bulk_read_same_envelope_checks() {
         // Bulk 路执行同一套 envelope：错 function / count / trailing 全拒绝。
         let data = [0xFF, 0x04, 0x00, 0x20, 0x01, 0x02, 0x03, 0x04];

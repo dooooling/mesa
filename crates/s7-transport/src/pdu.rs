@@ -172,20 +172,22 @@ fn check_ack_data_header(s7: &[u8], ctx: &str) -> Result<(), S7TransportError> {
     Ok(())
 }
 
-/// 校验 S7 Ack_Data 报文声明长度与实际一致（param_len/data_len）。
+/// 校验 S7 Ack_Data 报文声明长度与实际**精确一致**（param_len/data_len）。
 ///
 /// data 起点恒为 `12 + param_len`（12 字节 Ack_Data 头 + param 区，
-/// 标准 Read：plen=2 → +14）。只认 header 声明，不猜。
+/// 标准 Read：plen=2 → +14）。只认 header 声明，不猜；声明之外多一字节
+/// 少一字节都是畸形（TPKT 只管 frame 完整，不管 S7 语义长度）。
 pub fn check_lengths(s7: &[u8]) -> Result<(usize, usize), S7TransportError> {
     if s7.len() < 12 {
         return Err(S7TransportError::protocol("S7_SHORT", "S7 头部缺失"));
     }
     let param_len = u16::from_be_bytes([s7[6], s7[7]]) as usize;
     let data_len = u16::from_be_bytes([s7[8], s7[9]]) as usize;
-    if s7.len() < S7_HEADER_LEN_ACK_DATA + param_len + data_len {
+    let expected = S7_HEADER_LEN_ACK_DATA + param_len + data_len;
+    if s7.len() != expected {
         return Err(S7TransportError::protocol(
             "S7_LEN_MISMATCH",
-            "S7 长度与实际不符",
+            format!("S7 长度声明 {expected}，实际 {}", s7.len()),
         ));
     }
     Ok((param_len, data_len))
