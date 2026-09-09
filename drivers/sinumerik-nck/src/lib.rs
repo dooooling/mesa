@@ -25,7 +25,9 @@ mod value;
 
 pub use address::{AddressError, NckArea, NckUnitMode, NckVariableRef};
 pub use browse::build_tree;
-pub use catalog::{CatalogError, NckCatalog, NckShape, NckVariableDefinition, NckWireDefinition};
+pub use catalog::{
+    CatalogError, CatalogRegistry, NckCatalog, NckShape, NckVariableDefinition, NckWireDefinition,
+};
 pub use client::{NckClient, NckReadItem, NckReadResult};
 pub use codec::{
     CodecError, NckWireAddress, ResolvedVariable, encode_var_spec, resolve as resolve_wire,
@@ -82,6 +84,14 @@ impl Driver for SinumerikNckDriver {
                     FieldDescriptor::new("port", "Port", FieldType::Port)
                         .required(false)
                         .default_value(serde_json::json!(102)),
+                    // P1-3：系列显式必填（common + 单 family，无静默默认；
+                    // 选项与 catalog/ 目录的系列文件对应，新增系列需同步加枚举）。
+                    {
+                        let mut f = FieldDescriptor::new("family", "Family", FieldType::Enum)
+                            .required(true);
+                        f.validation.enum_options = Some(vec!["840d-sl".into(), "828d".into()]);
+                        f
+                    },
                     // TSAP 显式必填（NCK 无 rack/slot 推导；远端值由 profile + 真机 Gate 定）。
                     FieldDescriptor::new("local_tsap", "Local TSAP", FieldType::Integer)
                         .required(true),
@@ -123,9 +133,16 @@ impl Driver for SinumerikNckDriver {
                         FieldDescriptor::new("line", "Line", FieldType::Integer).required(false),
                         FieldDescriptor::new("column", "Column", FieldType::Integer)
                             .required(false),
-                        FieldDescriptor::new("count", "Count", FieldType::Integer)
-                            .required(false)
-                            .default_value(serde_json::json!(1)),
+                        // P2-2：count 全层 1..=255（UI 层 min/max 只是指引，
+                        // 真正拒绝在 address 解析）。
+                        {
+                            let mut f = FieldDescriptor::new("count", "Count", FieldType::Integer)
+                                .required(false)
+                                .default_value(serde_json::json!(1));
+                            f.validation.min = Some(1.0);
+                            f.validation.max = Some(255.0);
+                            f
+                        },
                         {
                             let mut f =
                                 FieldDescriptor::new("unit_mode", "Unit mode", FieldType::Enum)
@@ -174,9 +191,13 @@ impl Driver for SinumerikNckDriver {
             SdkDriverError::configuration("BAD_CONFIG", format!("connection JSON 非法: {e}"))
         })?;
         let cfg = NckConnConfig::from_json(&v)?;
-        let catalog = NckCatalog::load_shipped().map_err(|e| {
-            SdkDriverError::configuration("BAD_CONFIG", format!("NCK catalog 装载失败: {e}"))
-        })?;
+        // P1-3：common + exactly one family（未知 family 即 BAD_CONFIG，
+        // 绝不把全系列合并成一个视图）。
+        let catalog = CatalogRegistry::load_shipped()
+            .and_then(|r| r.resolve(&cfg.family))
+            .map_err(|e| {
+                SdkDriverError::configuration("BAD_CONFIG", format!("NCK catalog 装载失败: {e}"))
+            })?;
         Ok(Box::new(NckConnection {
             cfg,
             catalog,
@@ -699,6 +720,18 @@ mod tests {
         assert!(!d.capabilities.subscribe, "NCK 不伪造 subscribe");
         assert!(d.capabilities.browse, "NCK browse（Catalog 树）已就位");
         assert!(d.discovery.browse, "discovery browse 已就位");
+        // P1-3：连接 family 显式必填（选项与 catalog 系列文件对应）。
+        let conn_keys: Vec<_> = d.connection.fields.iter().map(|f| f.key.as_str()).collect();
+        assert!(conn_keys.contains(&"family"), "缺 family");
+        let fam = d
+            .connection
+            .fields
+            .iter()
+            .find(|f| f.key == "family")
+            .unwrap();
+        assert!(fam.required);
+        let opts = fam.validation.enum_options.clone().unwrap();
+        assert_eq!(opts, vec!["840d-sl".to_string(), "828d".to_string()]);
         assert!(!d.capabilities.write, "NCK V1 只读");
         assert!(!d.capabilities.method, "NCK V1 无 command");
         assert!(!d.capabilities.events, "NCK V1 无事件");
@@ -746,10 +779,20 @@ mod tests {
         let ok = d
             .open_connection(
                 "t",
-                r#"{"host":"10.0.0.5","local_tsap":256,"remote_tsap":258}"#,
+                r#"{"host":"10.0.0.5","family":"840d-sl","local_tsap":256,"remote_tsap":258}"#,
             )
             .await;
         assert!(ok.is_ok());
+        // 未知 family 拒绝（P1-3：绝不全系列合并）。
+        assert_eq!(
+            err_of(
+                &d,
+                r#"{"host":"10.0.0.5","family":"nope","local_tsap":256,"remote_tsap":258}"#
+            )
+            .await
+            .code,
+            "BAD_CONFIG"
+        );
     }
 
     #[tokio::test]
@@ -757,7 +800,8 @@ mod tests {
         // 空 catalog：browse 根为空页（不伪造内容）；probe 可达但身份待确认。
         let mut conn = NckConnection::with_catalog(
             NckConnConfig::from_json(&serde_json::json!({
-                "host": "10.0.0.5", "local_tsap": 256, "remote_tsap": 258,
+                "host": "10.0.0.5", "family": "840d-sl",
+                "local_tsap": 256, "remote_tsap": 258,
             }))
             .unwrap(),
             NckCatalog::empty(),
@@ -776,7 +820,8 @@ mod tests {
         let fx = NckFixture::spawn(NckFixtureState::default()).await;
         let mut conn = NckConnection::with_catalog(
             NckConnConfig::from_json(&serde_json::json!({
-                "host": "127.0.0.1", "local_tsap": 256, "remote_tsap": 258,
+                "host": "127.0.0.1", "family": "840d-sl",
+                "local_tsap": 256, "remote_tsap": 258,
             }))
             .unwrap(),
             synthetic_catalog(),
@@ -808,7 +853,8 @@ mod tests {
     fn conn_with_synthetic() -> NckConnection {
         NckConnection::with_catalog(
             NckConnConfig::from_json(&serde_json::json!({
-                "host": "127.0.0.1", "local_tsap": 256, "remote_tsap": 258,
+                "host": "127.0.0.1", "family": "840d-sl",
+                "local_tsap": 256, "remote_tsap": 258,
             }))
             .unwrap(),
             synthetic_catalog(),

@@ -72,6 +72,8 @@ pub enum CatalogError {
         block: String,
         variable: String,
     },
+    #[error("未知 family `{family}`（已知：{known:?}）")]
+    UnknownFamily { family: String, known: Vec<String> },
     #[error("catalog 形状非法: {reason}")]
     Invalid { reason: String },
 }
@@ -87,28 +89,10 @@ impl NckCatalog {
         Self::default()
     }
 
-    /// 装载随仓 catalog（`catalog/{common,840d-sl,828d}.json` 依次合并，
-    /// 后者覆盖前者；目录由 `MESA_NCK_CATALOG_DIR` 覆盖，缺省随 crate 源码）。
-    ///
-    /// 缺失/非法即 fail-closed（资产缺失必须 loud，不能静默空跑）。
-    /// NOTE: 系列冲突（同变量两系列不同 wire）当前以后文件为准；probe 确定
-    /// 系列后按系列裁剪（Commit E），V1 文件皆空无冲突。
-    pub fn load_shipped() -> Result<Self, CatalogError> {
-        let dir = std::env::var("MESA_NCK_CATALOG_DIR")
-            .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string() + "/catalog");
-        let mut cat = Self::empty();
-        for family in ["common", "840d-sl", "828d"] {
-            let path = format!("{dir}/{family}.json");
-            let text = std::fs::read_to_string(&path).map_err(|e| CatalogError::Invalid {
-                reason: format!("catalog 缺失 {path}: {e}"),
-            })?;
-            let v: serde_json::Value =
-                serde_json::from_str(&text).map_err(|e| CatalogError::Invalid {
-                    reason: format!("catalog 非法 {path}: {e}"),
-                })?;
-            cat.merge(Self::from_json(&v)?);
-        }
-        Ok(cat)
+    /// 目录由 `MESA_NCK_CATALOG_DIR` 覆盖，缺省随 crate 源码。
+    pub fn catalog_dir() -> String {
+        std::env::var("MESA_NCK_CATALOG_DIR")
+            .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string() + "/catalog")
     }
 
     /// 从 JSON 文档加载（`catalog/*.json` 形态，见 `catalog/common.json` 注释）。
@@ -177,6 +161,127 @@ impl NckCatalog {
                 variable: variable.to_string(),
             })
     }
+
+    /// 校验 family 归属（P1-3：`supported_families` 真参与装载）。
+    ///
+    /// - `family = None`（即 `common.json`）：条目必须 family 无关
+    ///   （`supported_families` 为空），否则是放错文件的系列条目；
+    /// - `family = Some(f)`（系列文件）：条目必须声明归属该系列。
+    pub fn validate_family_scope(&self, family: Option<&str>) -> Result<(), CatalogError> {
+        for d in self.entries.values() {
+            match family {
+                None => {
+                    if !d.supported_families.is_empty() {
+                        return Err(CatalogError::Invalid {
+                            reason: format!(
+                                "common.json 条目 {}/{}/{} 带 supported_families（系列条目必须进系列文件）",
+                                d.area.letter(),
+                                d.block,
+                                d.variable
+                            ),
+                        });
+                    }
+                }
+                Some(f) => {
+                    if !d.supported_families.iter().any(|s| s == f) {
+                        return Err(CatalogError::Invalid {
+                            reason: format!(
+                                "{f}.json 条目 {}/{}/{} 未声明归属 {f}",
+                                d.area.letter(),
+                                d.block,
+                                d.variable
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 系列注册表（P1-3：common + exactly one family，绝不全量合并）
+// ---------------------------------------------------------------------------
+
+/// Catalog 系列注册表：`common`（全系列无关）+ 每系列独立 catalog。
+///
+/// 装载即 `common + exactly one family` 合并视图；同变量在两系列不同
+/// mapping 时各自独立，运行时按连接 `family` 选择，互不覆盖。
+/// 未来 `family = auto`：probe 检测系列后 resolve，不一致 fail-closed。
+#[derive(Debug, Clone, Default)]
+pub struct CatalogRegistry {
+    common: NckCatalog,
+    families: HashMap<String, NckCatalog>,
+}
+
+impl CatalogRegistry {
+    /// 从目录装载（`common.json` 必需；其余 `*.json` 按文件名为 family）。
+    ///
+    /// 缺失/非法/`supported_families` 归属不符即 fail-closed。
+    pub fn load_dir(dir: &str) -> Result<Self, CatalogError> {
+        let common = read_catalog_file(&format!("{dir}/common.json"))?;
+        common.validate_family_scope(None)?;
+        let mut families = HashMap::new();
+        let entries = std::fs::read_dir(dir).map_err(|e| CatalogError::Invalid {
+            reason: format!("catalog 目录不可读 {dir}: {e}"),
+        })?;
+        let mut names: Vec<String> = Vec::new();
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let stem = match p.file_stem().and_then(|x| x.to_str()) {
+                Some(s) if s != "common" => s.to_string(),
+                _ => continue,
+            };
+            names.push(stem);
+        }
+        names.sort();
+        for name in names {
+            let cat = read_catalog_file(&format!("{dir}/{name}.json"))?;
+            cat.validate_family_scope(Some(&name))?;
+            families.insert(name, cat);
+        }
+        Ok(Self { common, families })
+    }
+
+    /// 装载随仓 catalog（目录规则见 `NckCatalog::catalog_dir`）。
+    pub fn load_shipped() -> Result<Self, CatalogError> {
+        Self::load_dir(&NckCatalog::catalog_dir())
+    }
+
+    /// 已知系列（排序稳定）。
+    pub fn families(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.families.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// 解析为运行视图：`common` 叠加指定系列（系列覆盖 common 同键）。
+    pub fn resolve(&self, family: &str) -> Result<NckCatalog, CatalogError> {
+        let fam = self
+            .families
+            .get(family)
+            .ok_or_else(|| CatalogError::UnknownFamily {
+                family: family.to_string(),
+                known: self.families(),
+            })?;
+        let mut cat = self.common.clone();
+        cat.merge(fam.clone());
+        Ok(cat)
+    }
+}
+
+fn read_catalog_file(path: &str) -> Result<NckCatalog, CatalogError> {
+    let text = std::fs::read_to_string(path).map_err(|e| CatalogError::Invalid {
+        reason: format!("catalog 缺失 {path}: {e}"),
+    })?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| CatalogError::Invalid {
+        reason: format!("catalog 非法 {path}: {e}"),
+    })?;
+    NckCatalog::from_json(&v)
 }
 
 fn parse_entry(e: &serde_json::Value) -> Result<NckVariableDefinition, String> {
@@ -324,5 +429,126 @@ mod tests {
             let cat = NckCatalog::from_json(&v).expect("schema 合法");
             assert!(cat.is_empty(), "{f}.json 真机确认前必须为空");
         }
+        // 随仓注册表：两系列已知，空系列可解析。
+        let reg = CatalogRegistry::load_shipped().expect("随仓注册表合法");
+        assert_eq!(reg.families(), vec!["828d", "840d-sl"]);
+        assert!(reg.resolve("840d-sl").unwrap().is_empty());
+    }
+
+    /// 环境变量串行锁（MESA_NCK_CATALOG_DIR 是进程全局，测试不得并行改）。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn write_catalog_dir(tag: &str, files: &[(&str, &str)]) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "mesa-nck-catalog-test-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("测试目录");
+        for (name, content) in files {
+            std::fs::write(dir.join(name), content).expect("测试 catalog 写入");
+        }
+        dir.to_string_lossy().into_owned()
+    }
+
+    fn var_entry(module: u8, family: &str) -> String {
+        format!(
+            r#"{{"area": "C", "block": "SEMA", "variable": "actFeedRate",
+             "data_type": "F64", "shape": "lines",
+             "wire": {{"module": {module}, "column": 42, "transport_size": 4, "element_size": 8}},
+             "supported_families": ["{family}"]}}"#
+        )
+    }
+
+    #[test]
+    fn catalog_840d_and_828d_same_variable_do_not_override() {
+        // P1-3 核心：同变量两系列不同 mapping，各自独立解析，互不覆盖。
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = write_catalog_dir(
+            "families",
+            &[
+                ("common.json", r#"{"variables": []}"#),
+                (
+                    "840d-sl.json",
+                    &format!(r#"{{"variables": [{}]}}"#, var_entry(18, "840d-sl")),
+                ),
+                (
+                    "828d.json",
+                    &format!(r#"{{"variables": [{}]}}"#, var_entry(21, "828d")),
+                ),
+            ],
+        );
+        unsafe {
+            std::env::set_var("MESA_NCK_CATALOG_DIR", &dir);
+        }
+        let reg = CatalogRegistry::load_shipped().expect("双系列注册表合法");
+        assert_eq!(reg.families(), vec!["828d", "840d-sl"]);
+        let d840d = reg
+            .resolve("840d-sl")
+            .unwrap()
+            .lookup(NckArea::Channel, "SEMA", "actFeedRate")
+            .unwrap()
+            .clone();
+        let d828d = reg
+            .resolve("828d")
+            .unwrap()
+            .lookup(NckArea::Channel, "SEMA", "actFeedRate")
+            .unwrap()
+            .clone();
+        assert_eq!(d840d.wire.module, 18);
+        assert_eq!(d828d.wire.module, 21, "828D 不得被 840D 覆盖");
+        // 未知 family fail-closed。
+        let err = reg.resolve("nope").unwrap_err();
+        assert!(matches!(err, CatalogError::UnknownFamily { .. }));
+        unsafe {
+            std::env::remove_var("MESA_NCK_CATALOG_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn family_scope_validation_rejects_misplaced_entries() {
+        // common 里放系列条目、系列文件里放未声明归属的条目，装载即拒绝。
+        let _guard = ENV_LOCK.lock().unwrap();
+        let bad_common = write_catalog_dir(
+            "bad-common",
+            &[
+                (
+                    "common.json",
+                    &format!(r#"{{"variables": [{}]}}"#, var_entry(1, "840d-sl")),
+                ),
+                ("840d-sl.json", r#"{"variables": []}"#),
+            ],
+        );
+        unsafe {
+            std::env::set_var("MESA_NCK_CATALOG_DIR", &bad_common);
+        }
+        assert!(
+            CatalogRegistry::load_shipped().is_err(),
+            "common 里的系列条目必须拒绝"
+        );
+        let bad_family = write_catalog_dir(
+            "bad-family",
+            &[
+                ("common.json", r#"{"variables": []}"#),
+                (
+                    "840d-sl.json",
+                    &format!(r#"{{"variables": [{}]}}"#, var_entry(1, "828d")),
+                ),
+            ],
+        );
+        unsafe {
+            std::env::set_var("MESA_NCK_CATALOG_DIR", &bad_family);
+        }
+        assert!(
+            CatalogRegistry::load_shipped().is_err(),
+            "未声明归属的系列条目必须拒绝"
+        );
+        unsafe {
+            std::env::remove_var("MESA_NCK_CATALOG_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&bad_common);
+        let _ = std::fs::remove_dir_all(&bad_family);
     }
 }

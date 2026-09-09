@@ -178,7 +178,7 @@ async fn browse_sinumerik_nck_catalog_tree_e2e() {
     );
     let (app, ep_id) = app_with_endpoint(
         "sinumerik-nck",
-        serde_json::json!({"host":"127.0.0.1","local_tsap":256,"remote_tsap":258}),
+        serde_json::json!({"host":"127.0.0.1","family":"840d-sl","local_tsap":256,"remote_tsap":258}),
     )
     .await;
     let req = Request::builder()

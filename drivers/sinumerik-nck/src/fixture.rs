@@ -297,6 +297,7 @@ mod tests {
         let cfg = NckConnConfig {
             host: "127.0.0.1".into(),
             port: fx.addr.port(),
+            family: "840d-sl".into(),
             local_tsap: 0x0100,
             remote_tsap: 0x0100,
             timeout_ms: 3000,

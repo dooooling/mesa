@@ -26,6 +26,12 @@ pub const NCK_DEFAULT_TIMEOUT_MS: u64 = 5000;
 pub struct NckConnConfig {
     pub host: String,
     pub port: u16,
+    /// 系列 family（P1-3：`840d-sl` / `828d`，显式必填）。
+    ///
+    /// catalog 按 `common + exactly one family` 装载，跨系列 mapping 差异
+    /// 不得互相覆盖；probe 尚不能可靠识别系列时，显式配置是唯一可靠来源
+    /// （未来 `family = auto` + probe 检测 + 不一致 fail-closed，见 P1-3）。
+    pub family: String,
     /// 本地 TSAP（上位机侧）。
     pub local_tsap: u16,
     /// 远端 TSAP（NCK 侧；具体值由 profile + 真机 Gate 冻结）。
@@ -39,8 +45,9 @@ impl Default for NckConnConfig {
         Self {
             host: "192.168.0.1".into(),
             port: NCK_DEFAULT_PORT,
-            // NOTE: TSAP 默认值待真机 Gate 冻结（ADR 0001 §7）；此处占位，
-            // 生产配置必须显式填写（descriptor 侧 required）。
+            // NOTE: family 无默认值（显式必填，from_json 拒绝缺失）；
+            // TSAP 默认值待真机 Gate 冻结（ADR 0001 §7），生产配置必须显式填写。
+            family: String::new(),
             local_tsap: 0x0100,
             remote_tsap: 0x0100,
             timeout_ms: NCK_DEFAULT_TIMEOUT_MS,
@@ -90,6 +97,16 @@ impl NckConnConfig {
         if let Some(pdu) = v.get("pdu_length").and_then(|x| x.as_u64()) {
             cfg.pdu_length_set(pdu)?;
         }
+        // family：显式必填（common + 单 family 装载，无静默默认系列）。
+        let family = v
+            .get("family")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                SdkDriverError::configuration("BAD_CONFIG", "family 必填（如 840d-sl/828d）")
+            })?;
+        cfg.family = family.to_string();
         if cfg.host.trim().is_empty() {
             return Err(SdkDriverError::configuration("BAD_CONFIG", "host 不能为空"));
         }
@@ -134,42 +151,54 @@ mod tests {
     #[test]
     fn tsap_required_and_validated() {
         // 缺 TSAP 即拒绝（NCK 无 rack/slot 推导可回退）。
-        assert!(cfg(serde_json::json!({"host": "10.0.0.5"})).is_err());
+        assert!(cfg(serde_json::json!({"host": "10.0.0.5", "family": "840d-sl"})).is_err());
+        // family 显式必填（无静默默认系列）。
+        assert!(
+            cfg(serde_json::json!({"host": "10.0.0.5", "local_tsap": 256, "remote_tsap": 258}))
+                .is_err()
+        );
         let c = cfg(serde_json::json!({
             "host": "10.0.0.5",
+            "family": "840d-sl",
             "local_tsap": 256,
             "remote_tsap": 258,
         }))
         .expect("显式 TSAP 通过");
         assert_eq!((c.local_tsap, c.remote_tsap), (256, 258));
+        assert_eq!(c.family, "840d-sl");
         // port 越界拒绝。
         assert!(
-            cfg(serde_json::json!({"host": "h", "port": 0, "local_tsap": 1, "remote_tsap": 1}))
+            cfg(serde_json::json!({"host": "h", "family": "f", "port": 0, "local_tsap": 1, "remote_tsap": 1}))
                 .is_err()
         );
         assert!(
-            cfg(serde_json::json!({"host": "h", "port": 70000, "local_tsap": 1, "remote_tsap": 1}))
+            cfg(serde_json::json!({"host": "h", "family": "f", "port": 70000, "local_tsap": 1, "remote_tsap": 1}))
                 .is_err()
         );
         // 空 host 拒绝。
-        assert!(cfg(serde_json::json!({"host": "", "local_tsap": 1, "remote_tsap": 1})).is_err());
+        assert!(
+            cfg(serde_json::json!({"host": "", "family": "f", "local_tsap": 1, "remote_tsap": 1}))
+                .is_err()
+        );
     }
 
     #[test]
     fn timeout_floor_and_pdu_range() {
         let c = cfg(
-            serde_json::json!({"host": "h", "local_tsap": 1, "remote_tsap": 1, "timeout_ms": 10}),
+            serde_json::json!({"host": "h", "family": "f", "local_tsap": 1, "remote_tsap": 1, "timeout_ms": 10}),
         )
         .unwrap();
         assert_eq!(c.timeout_ms, NCK_MIN_TIMEOUT_MS);
-        assert!(cfg(serde_json::json!({"host": "h", "local_tsap": 1, "remote_tsap": 1, "pdu_length": 100})).is_err());
-        assert!(cfg(serde_json::json!({"host": "h", "local_tsap": 1, "remote_tsap": 1, "pdu_length": 960})).is_ok());
+        assert!(cfg(serde_json::json!({"host": "h", "family": "f", "local_tsap": 1, "remote_tsap": 1, "pdu_length": 100})).is_err());
+        assert!(cfg(serde_json::json!({"host": "h", "family": "f", "local_tsap": 1, "remote_tsap": 1, "pdu_length": 960})).is_ok());
     }
 
     #[test]
     fn transport_passthrough_has_no_rack_slot() {
-        let c =
-            cfg(serde_json::json!({"host": "h", "local_tsap": 300, "remote_tsap": 400})).unwrap();
+        let c = cfg(
+            serde_json::json!({"host": "h", "family": "f", "local_tsap": 300, "remote_tsap": 400}),
+        )
+        .unwrap();
         let o = c.to_transport();
         assert_eq!((o.local_tsap, o.remote_tsap), (300, 400));
         assert_eq!(o.dial_addr(), "h:102");

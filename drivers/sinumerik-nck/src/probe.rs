@@ -66,7 +66,7 @@ mod tests {
 
     fn cfg_for(port: u16) -> NckConnConfig {
         NckConnConfig::from_json(&serde_json::json!({
-            "host": "127.0.0.1", "port": port,
+            "host": "127.0.0.1", "port": port, "family": "840d-sl",
             "local_tsap": 256, "remote_tsap": 258,
         }))
         .unwrap()
