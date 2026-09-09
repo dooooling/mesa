@@ -52,11 +52,16 @@ Sharp7 `ReadNckArea` 已实现同变量跨 PDU 拆分，语义为：同
 预算 `MaxElements = (PDU-18)/WordSize`。Mesa P2-1 曾拒绝猜测 line 分段语义；
 本条作为第二独立证据记录，待真机确认后实现（届时与 Sharp7 差分拆分点）。
 
-## 方法冻结
+## 方法冻结（证据等级）
 
-- Sharp7 = 布局/响应/拆分行为的**一票**，不是 oracle；
-- Wireshark dissector 源码 = 协议 oracle（静态核对已入库，零 CI 成本）；
-- Softing/官方文档 = 字段语义与例证值来源；
-- 真机 = 最终仲裁（TSAP、wire address、catalog mapping 三项只能真机证明）。
+- Siemens 官方文档 = authoritative semantic evidence（**当前缺失**：
+  无公开线缆规范来源，见锁文件 gaps；真机前此项空缺）；
+- Wireshark = independent decoder/reference（强独立参考解码器，
+  不是官方协议规范；静态核对已入库，零 CI 成本）；
+- Sharp7 = independent implementation evidence（一票，不是 oracle）；
+- Softing = industrial implementation/documentation evidence（第三方，
+  不等于 Siemens 官方文档）；
+- 真机 NCU = final behavioral evidence（TSAP、wire address、catalog mapping
+  三项只能真机证明）。
 - 下一步：Layer4 standalone emulator（本分支后半部分），Sharp7 互操作待
   emulator 就绪后接入；tshark PCAP 门暂缓（runner 无 tshark，静态核对已覆盖九成价值）。

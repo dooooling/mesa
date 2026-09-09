@@ -1,0 +1,52 @@
+{
+  "$comment": "NCK 外部交叉验证源锁定（ADR 0002）。master 会漂移：复核必须按 commit 取源，否则 7一致2分歧 无法重建。字段缺失或 JSON 非法即视为证据失效（emulator crate 有 schema 自检测试）。",
+  "verified_date": "2026-09-09",
+  "sources": [
+    {
+      "name": "wireshark",
+      "repo": "https://github.com/wireshark/wireshark.git",
+      "commit": "72ed39cb4a878b4baec93de7997befc50d816690",
+      "files": ["epan/dissectors/packet-s7comm.c"],
+      "role": "independent decoder/reference（非官方规范）",
+      "covers": [
+        {"claim": "NCK item 布局 type=0x12/len=8/syntax+8体", "ref": "s7comm_syntaxid_nck（约 L2883），分发 L3011-3015", "adr": "0002#1"},
+        {"claim": "syntax 0x82/83/84 = current/metric/inch", "ref": "L452-454，名表 L469-471", "adr": "0002#2"},
+        {"claim": "Area 索引 N=0..MMC=7", "ref": "nck_area_names L997-1007", "adr": "0002#3"},
+        {"claim": "areaunit = area>>5 / unit &0x1f（掩码0xe0）", "ref": "L2898-2901，字段注释 L1170/L7292", "adr": "0002#4"},
+        {"claim": "响应 length：0x03/04/05 按bit，其余按byte", "ref": "L481-487 注释 + 解码数学 L3113-3130/L5356-5366", "adr": "0002#5"},
+        {"claim": "奇长补齐（除末项）", "ref": "L3125-3130", "adr": "0002#6"}
+      ]
+    },
+    {
+      "name": "sharp7",
+      "repo": "https://github.com/soft79/Sharp7.git",
+      "commit": "eac1e728f8523278564e83c276fa6b8d281e6ba0",
+      "files": ["Sharp7.cs"],
+      "role": "independent implementation evidence（非 oracle：areaunit/0x06 两处分歧见 ADR）",
+      "covers": [
+        {"claim": "10 字节 item 模板与字段偏移（param@4/start@6/module@8/amount@9）", "ref": "S7Nck_MRD_ITEM L4932-4942，填充 L5091-5099/单读 L5021-5026", "adr": "0002#1"},
+        {"claim": "仅实现 0x82（无 83/84，不做其差分）", "ref": "模板 L4936 + changelog L42", "adr": "0002#2"},
+        {"claim": "响应：0x09/0x07/0x03 按byte，其余>>3；奇长补齐；BAD 只跳4字节头", "ref": "L5140-5153", "adr": "0002#5/7"},
+        {"claim": "单变量 PDU 拆分：同地址 + Start+=NumElements（未来 P2-1 第二证据）", "ref": "L5008-5049", "adr": "0002 附录"},
+        {"claim": "分歧：三处 NckArea<<4（Wireshark+Softing 证伪，调用约定不明）", "ref": "L5021/L5092/L5192", "adr": "0002 分歧A"}
+      ]
+    },
+    {
+      "name": "softing-datafeed-edge-connector",
+      "repo": "https://github.com/SoftingIndustrial/datafeed-edge-connector.git",
+      "commit": "ee02f383674c4165fb182ebb0cdcee73315b6606",
+      "files": ["edgeconnector/Controller_Connection_Configurations/Sinumerik_840D_configuration.md"],
+      "role": "industrial implementation/documentation evidence（第三方，非 Siemens 官方）",
+      "covers": [
+        {"claim": "AWL 字段顺序 SYNTAX_ID/Area_Unit/Column/Line/BlockType/NumOfLine", "ref": "L221-232", "adr": "0002#1"},
+        {"claim": "Area_Unit 例证：N=0x01，Channel=0x41（裁决 <<5）", "ref": "L248-249", "adr": "0002#4"},
+        {"claim": "NCK/PLC TSAP 区分；TCP/102；NCU 防火墙", "ref": "L45-47/L73-74/L197-203", "adr": "0002#8"}
+      ]
+    }
+  ],
+  "gaps": [
+    "Siemens 官方线缆规范（authoritative）：无公开来源，真机前缺失",
+    "0x06 长度单位：Wireshark 按byte vs Sharp7 按bit（ADR 0002 分歧B，影响面极小）",
+    "Sharp7 <<4 调用约定：无文档，真机或上游澄清前冻结（ADR 0002 分歧A）"
+  ]
+}

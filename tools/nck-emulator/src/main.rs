@@ -8,13 +8,26 @@
 //! 非目标：协议正确性判定（那是 Wireshark/文档/真机的事）；生产用途
 //! （无任何安全机制，仅回环测试）。
 //!
+//! 能力边界（冻结，勿超声明）：
+//! ```text
+//! 独立进程边界 / TCP-COTP 生命周期 / PDU 协商 / 故障注入 / reconnect ✅
+//! NCK codec 独立正确性 / area-unit / module-column 正确性           ❌
+//! ```
+//! 本服务与被测驱动共享同一 `NckFixture` 实现：通过只能证明进程与传输层，
+//! 不能证明 codec；codec 正确性由 ADR 0002 三源比对 + Sharp7 互操作（待接）承担。
+//!
 //! 用法：
 //! ```text
 //! mesa-nck-emulator --port 1102 --scenario happy --element-size 8
-//! mesa-nck-emulator --port 1102 --scenario partial_bad --fail-items 1
+//! mesa-nck-emulator --port 1102 --scenario partial_bad --fail-items 0,2
 //! mesa-nck-emulator --port 1102 --scenario disconnect_after_n --disconnect-after 5
 //! mesa-nck-emulator --port 1102 --scenario pdu_240
 //! ```
+//!
+//! 索引约定（冻结）：`--fail-items` 为 **0-based**（第 1 项写 `0`），
+//! 与脚手架 `enumerate()` 口径一致，不做 1-based 转换（两套约定并存必错）。
+//! `--disconnect-after` 为正整数（`0` 拒绝：零次即断开无意义，
+//! 且与“成功 N 次后断开”语义冲突）。
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -109,12 +122,16 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 }
             }
             "--disconnect-after" => {
-                disconnect_after = Some(
-                    it.next()
-                        .ok_or("--disconnect-after 缺值")?
-                        .parse()
-                        .map_err(|_| "--disconnect-after 需为正整数")?,
-                );
+                let n: usize = it
+                    .next()
+                    .ok_or("--disconnect-after 缺值")?
+                    .parse()
+                    .map_err(|_| "--disconnect-after 需为正整数")?;
+                // fail-closed：0 无意义（“零次即断开”与场景语义冲突），直接拒绝。
+                if n == 0 {
+                    return Err("--disconnect-after 需为正整数（0 无意义，已拒绝）".into());
+                }
+                disconnect_after = Some(n);
             }
             _ => return Err(format!("未知参数 `{a}`")),
         }
@@ -222,11 +239,56 @@ mod tests {
     }
 
     #[test]
+    fn evidence_lock_is_machine_readable() {
+        // 外部源锁定文件（ADR 0002）：字段缺失/非法即证据失效，必须 loud。
+        // 路径以本 crate 为锚（tools/nck-emulator → ../../docs），搬仓即显式失败。
+        let path = format!(
+            "{}/../../docs/evidence/nck-external-sources.lock.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(&path).expect("证据锁文件缺失");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("锁文件非法 JSON");
+        let sources = v
+            .get("sources")
+            .and_then(|x| x.as_array())
+            .expect("锁文件缺 sources 数组");
+        assert!(sources.len() >= 3, "至少锁定三源，实际 {}", sources.len());
+        for s in sources {
+            for key in ["name", "repo", "commit", "files", "role", "covers"] {
+                assert!(s.get(key).is_some(), "源缺字段 `{key}`");
+            }
+            let commit = s.get("commit").and_then(|x| x.as_str()).unwrap_or("");
+            assert_eq!(commit.len(), 40, "commit 必须为完整 40 位 SHA");
+            assert!(
+                commit.chars().all(|c| c.is_ascii_hexdigit()),
+                "commit 非 hex"
+            );
+            assert!(
+                !s.get("covers")
+                    .and_then(|x| x.as_array())
+                    .map(|a| a.is_empty())
+                    .unwrap_or(true),
+                "covers 不得为空"
+            );
+        }
+    }
+
+    #[test]
     fn bad_inputs_rejected() {
         assert!(parse_args(&args(&["--nope"])).is_err());
         assert!(parse_args(&args(&["--scenario", "nope"])).is_err());
         assert!(parse_args(&args(&["--port"])).is_err());
         assert!(parse_args(&args(&["--element-size", "0"])).is_err());
+        // --disconnect-after 0 直接拒绝（不解释成“成功一次后断开”）。
+        assert!(
+            parse_args(&args(&[
+                "--scenario",
+                "disconnect_after_n",
+                "--disconnect-after",
+                "0"
+            ]))
+            .is_err()
+        );
         // partial_bad 无索引、disconnect_after_n 无次数 → 场景错误。
         let cli = parse_args(&args(&["--scenario", "partial_bad"])).unwrap();
         assert!(state_for(&cli).is_err());
