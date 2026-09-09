@@ -233,16 +233,18 @@ impl NckVariableRef {
         let area_no = opt_u16("area_no")?;
         let line = opt_u16("line")?;
         let column = opt_u16("column")?;
+        // P2-2：count 全层冻结 1..=255（wire line_count 单字节；配置期即拒绝，
+        // 不拖到 codec 深层。codec 侧 CountOutOfRange 作为纵深保留）。
         let count = p
             .get("count")
             .and_then(|v| v.as_u64())
             .map(|n| {
                 u16::try_from(n)
                     .ok()
-                    .filter(|c| *c > 0)
+                    .filter(|c| (1..=255).contains(c))
                     .ok_or_else(|| AddressError::Invalid {
                         input: "count".into(),
-                        reason: "count 需为 1..=65535".into(),
+                        reason: "count 需为 1..=255（line_count 单字节）".into(),
                     })
             })
             .transpose()?
@@ -334,6 +336,19 @@ mod tests {
                 "area": "C", "block": "B", "variable": "x", "count": 0,
             })))
             .is_err()
+        );
+        // P2-2：count 上限 255（line_count 单字节），256 即拒绝。
+        assert!(
+            NckVariableRef::from_parameters(&params(serde_json::json!({
+                "area": "C", "block": "B", "variable": "x", "count": 256,
+            })))
+            .is_err()
+        );
+        assert!(
+            NckVariableRef::from_parameters(&params(serde_json::json!({
+                "area": "C", "block": "B", "variable": "x", "count": 255,
+            })))
+            .is_ok()
         );
         assert!(
             NckVariableRef::from_parameters(&params(serde_json::json!({

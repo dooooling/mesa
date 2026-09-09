@@ -10,7 +10,7 @@
   ✅ 已过（Commit C）。
 - Gate D（数据面）：configure/PointMap/Poll/DataBatch/LastKnown/Stop +
   driver contract + session-loss fail attempt + PDU 分片回环。
-  ✅ 已过（Commit D）。
+  ⚠️ 评审后摘 ✅（P1-1/P1-2/P1-4/P2-1 修复中，exact gates 重验通过后恢复）。
 - Gate E（topology+browse）：probe（会话可达 + 身份诚实待确认）/
   topology 类型 / Catalog 虚拟浏览树（binding 回环可用）/ 管理面 E2E。
   ✅ 已过（Commit E）。probe anchor 与 topology 实例回填待真机 PR7。
@@ -24,6 +24,6 @@ connect / probe / channel+axis topology / 轴实际值与速度 / R 参数 /
 
 ## 状态
 
-- 当前：experimental（V1 地基完成：codec + 数据面 + probe/browse；
-  随仓 catalog 为空，真机回填前生产 probe 身份恒待确认）。
+- 当前：experimental（V1 地基评审修复中；随仓 catalog 为空，
+  真机回填前生产 probe 身份恒待确认）。
 - `supported` 需全部真机门通过后翻转。

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 // 连接选项：PKI 由调用方注入，本 crate 绝不读取 MESA_OPCUA_PKI_DIR
 // ---------------------------------------------------------------------------
 
-/// 建连选项：调用方（mesa-driver-opcua / 未来 sinumerik）负责从环境或配置解析
+/// 建连选项：调用方（mesa-driver-opcua，含 SINUMERIK OPC UA）负责从环境或配置解析
 /// `pki_dir` 后传入；transport 只使用传入值。
 #[derive(Debug, Clone)]
 pub struct OpcUaConnectOptions {
