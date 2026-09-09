@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net7.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>sharp7-harness</AssemblyName>
+  </PropertyGroup>
+
+  <!-- Sharp7.cs 为上游源码逐字拷贝（见 README），本工程只加 Program.cs 驱动它；
+       默认已含全部 Compile 项，无需显式列出。 -->
+
+</Project>

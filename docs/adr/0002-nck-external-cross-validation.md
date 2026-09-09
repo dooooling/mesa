@@ -54,6 +54,25 @@ Sharp7 `ReadNckArea` 已实现同变量跨 PDU 拆分，语义为：同
 预算 `MaxElements = (PDU-18)/WordSize`。Mesa P2-1 曾拒绝猜测 line 分段语义；
 本条作为第二独立证据记录，待真机确认后实现（届时与 Sharp7 差分拆分点）。
 
+## 响应/setup framing：Ack_Data 统一信封（PR20 review 纠正）
+
+> 本节替代初版“NCK 方言”说法（已撤回）：`00 00` 从来都是 Ack_Data
+> header 的 error bytes，不是 NCK 方言。NCK 与 PLC 共用同一信封，
+> 差异仅 var-spec syntax。
+
+- S7 头按 ROSCTR 切分（Wireshark 主干 `hlength` 实证）：Job=10 字节，
+  Ack/Ack_Data=12 字节（bytes 10-11 为 error class/code）。
+- Setup Ack 冻结：S7(20) = 12 字节头 + plen=8 + `[F0 … PDU]`，
+  PDU 在 S7[18..20]（25 字节是 Setup 请求长度，响应一直是 27 字节；
+  Snap7/Sharp7 的 `Length==27` 是对的）。
+- Read 响应冻结：12 字节头 + plen=2 + `[04 count]` + items（+14）。
+- 解析器只认 header 声明（`12+plen`，errinfo 非零即拒绝）；
+  fixture plen 说真话；write 的 `12+plen` 从来是对的（撤回“同病待修”，
+  write 留现状），SZL 另 ROSCTR 路径、单独分析。
+- Sharp7 rsp 被接受 = cross-decoder equivalence（S7WLDouble 下双方对同一
+  wire 解出相同语义数据；rsp 仍由 emulator 生成，不是独立 server evidence，
+  但超出 framing-only）。请求 vectors 为独立 wire evidence。
+
 ## 方法冻结（证据等级）
 
 - Siemens 官方文档 = authoritative semantic evidence（**当前缺失**：
@@ -65,5 +84,5 @@ Sharp7 `ReadNckArea` 已实现同变量跨 PDU 拆分，语义为：同
   不等于 Siemens 官方文档）；
 - 真机 NCU = final behavioral evidence（TSAP、wire address、catalog mapping
   三项只能真机证明）。
-- 下一步：Layer4 standalone emulator（本分支后半部分），Sharp7 互操作待
-  emulator 就绪后接入；tshark PCAP 门暂缓（runner 无 tshark，静态核对已覆盖九成价值）。
+- PR20 已交付：Layer4 emulator + Sharp7 live 互操作（setup/单读/多读全通，
+  vectors 入库回放）；tshark PCAP 门暂缓（runner 无 tshark，静态核对已覆盖九成价值）。

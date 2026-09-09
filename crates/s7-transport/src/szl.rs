@@ -4,7 +4,7 @@
 //! 上层诊断做二次解析。`s7` Driver 的 probe 用 `SZL 0x0011` 取 CPU 订货号。
 
 use crate::error::S7TransportError;
-use crate::pdu::{S7_ROSCTR_ACK, wrap_s7};
+use crate::pdu::{S7_ROSCTR_ACK_DATA, wrap_s7};
 
 /// 构造 SZL 请求（UserData 固定头 + SZL ID/Index），与抽取前逐字节一致。
 ///
@@ -37,7 +37,7 @@ pub fn parse_szl_response(resp: &[u8], szl_id: u16) -> Result<Vec<u8>, S7Transpo
     if s7.len() < 12 {
         return Err(S7TransportError::protocol("SZL_S7_SHORT", "SZL S7 头缺失"));
     }
-    if s7[1] != S7_ROSCTR_ACK && s7[1] != 0x07 {
+    if s7[1] != S7_ROSCTR_ACK_DATA && s7[1] != 0x07 {
         // NOTE: 下标用 get（抽取前为直接下标，畸形短包会 panic；此处 fail-closed）。
         let code = s7.get(17).copied().unwrap_or(0);
         return Err(crate::error::s7_cpu_error(

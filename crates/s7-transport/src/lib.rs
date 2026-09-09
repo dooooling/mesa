@@ -35,7 +35,7 @@ pub use error::{
     S7_ERR_ACCESS, S7_ERR_ADDRESS, S7_ERR_CONTEXT, S7_ITEM_OK, S7TransportError,
     S7TransportErrorKind, map_connect_error, s7_cpu_error,
 };
-pub use pdu::{S7_FUNC_READ, S7_FUNC_WRITE, S7_ROSCTR_ACK, S7_ROSCTR_JOB, S7_SYNTAX_ID_S7ANY};
+pub use pdu::{S7_FUNC_READ, S7_FUNC_WRITE, S7_ROSCTR_ACK_DATA, S7_ROSCTR_JOB, S7_SYNTAX_ID_S7ANY};
 pub use read_var::{
     S7_CHUNK_SAFETY_MARGIN, S7_MAX_ITEMS_PER_PDU, S7_TRANSPORT_BIT, S7ReadVarItem, S7ReadVarResult,
 };

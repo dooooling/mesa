@@ -18,8 +18,8 @@
 
 use std::ops::Range;
 
-use crate::error::{S7_ITEM_OK, S7TransportError, S7TransportErrorKind, s7_cpu_error};
-use crate::pdu::{S7_FUNC_READ, S7_ROSCTR_ACK, S7_ROSCTR_JOB, check_lengths, s7_header, wrap_s7};
+use crate::error::{S7_ITEM_OK, S7TransportError, S7TransportErrorKind};
+use crate::pdu::{S7_FUNC_READ, S7_ROSCTR_JOB, check_ack, check_lengths, s7_header, wrap_s7};
 
 // ---------------------------------------------------------------------------
 // 协议常量（解释“为什么”）
@@ -170,17 +170,13 @@ pub fn parse_read_response(
     if s7.len() < 12 {
         return Err(S7TransportError::protocol("S7_SHORT", "S7 头部缺失"));
     }
-    if s7[1] != S7_ROSCTR_ACK {
-        let err_class = s7.get(17).copied().unwrap_or(0);
-        return Err(s7_cpu_error(
-            err_class,
-            &format!(
-                "Read 被拒绝 rosctr={:02x} 期望 {:02x}",
-                s7[1], S7_ROSCTR_ACK
-            ),
-        ));
-    }
+    // ROSCTR + header error bytes 统一校验（err class/code 非零即拒绝）。
+    check_ack(s7, "Read")?;
     let (param_len, data_len) = check_lengths(s7)?;
+    // Read envelope 校验（fail-closed）：plen=2、param=[0x04, count==items]。
+    check_read_envelope(s7, param_len, items.len(), "Read")?;
+    // data 起点 = 12 字节 Ack_Data 头 + param 区（标准 Read：plen=2 → +14；
+    // 只认 header 声明，不猜）。
     let data = &s7[12 + param_len..12 + param_len + data_len];
     let mut out: Vec<S7ReadVarResult> = Vec::with_capacity(items.len());
     let mut off = 0;
@@ -200,7 +196,15 @@ pub fn parse_read_response(
         if ret != S7_ITEM_OK {
             // 按项 BAD：仍完整跳过该项数据区以对齐下一项（错误时 len 可能为 0）。
             tracing::warn!(idx, ret, "S7 ReadVar item 按项 BAD");
-            if wire_len > 0 && off + wire_len <= data.len() {
+            // BAD 项声明 payload 超出剩余包长 → 截断报文，整包 fatal
+            //（不能用不可信长度对齐后项）。
+            if wire_len > 0 && off + wire_len > data.len() {
+                return Err(S7TransportError::protocol(
+                    "READ_DATA_SHORT",
+                    format!("item {idx} BAD 项 payload 截断"),
+                ));
+            }
+            if wire_len > 0 {
                 off += wire_len;
                 if wire_len % 2 == 1
                     && off < data.len()
@@ -257,7 +261,51 @@ pub fn parse_read_response(
             }
         }
     }
+    // 声明 data 区必须被刚好消费完（多余项/trailing bytes 即畸形）。
+    if off != data.len() {
+        return Err(S7TransportError::protocol(
+            "S7_TRAILING_DATA",
+            format!("Read 消费 {off} 但声明 {data_len}"),
+        ));
+    }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// 响应解析（Bulk 路：简化填充逻辑，与抽取前 `parse_bulk_resp` 逐行一致）
+// ---------------------------------------------------------------------------
+
+/// Read 响应 envelope 校验（fail-closed）：`plen == 2` 且
+/// `param == [0x04, item_count]`（count 必须等于调用方 items 数）。
+///
+/// 畸形（Write function 冒充、count 虚报、多余 trailing 由调用方消费校验）
+/// 在此拦截，不进入 item 解析。
+fn check_read_envelope(
+    s7: &[u8],
+    param_len: usize,
+    items_len: usize,
+    ctx: &str,
+) -> Result<(), S7TransportError> {
+    if param_len != 2 {
+        return Err(S7TransportError::protocol(
+            "S7_PARAM_LEN",
+            format!("{ctx} param_len 非 2（实际 {param_len}）"),
+        ));
+    }
+    // check_lengths 已保证 s7.len() ≥ 14，可直读 param。
+    if s7[12] != S7_FUNC_READ {
+        return Err(S7TransportError::protocol(
+            "S7_PARAM_FUNC",
+            format!("{ctx} param function 非 Read（实际 {:02x}）", s7[12]),
+        ));
+    }
+    if s7[13] as usize != items_len {
+        return Err(S7TransportError::protocol(
+            "S7_COUNT_MISMATCH",
+            format!("{ctx} 对端 count {} 与调用方 {} 不一致", s7[13], items_len),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -283,14 +331,9 @@ pub fn parse_bulk_response(
     if s7.len() < 12 {
         return Err(S7TransportError::protocol("S7_SHORT", "S7 头部缺失"));
     }
-    if s7[1] != S7_ROSCTR_ACK {
-        let err_class = s7.get(17).copied().unwrap_or(0);
-        return Err(s7_cpu_error(
-            err_class,
-            &format!("Bulk Read 被拒绝 rosctr={:02x}", s7[1]),
-        ));
-    }
+    check_ack(s7, "Bulk Read")?;
     let (param_len, data_len) = check_lengths(s7)?;
+    check_read_envelope(s7, param_len, items.len(), "Bulk Read")?;
     let data = &s7[12 + param_len..12 + param_len + data_len];
     let mut out = Vec::with_capacity(items.len());
     let mut off = 0;
@@ -308,7 +351,14 @@ pub fn parse_bulk_response(
         let wire_len = wire_data_len(transport, len_field);
         if ret != S7_ITEM_OK {
             tracing::warn!(idx, ret, "Bulk item BAD");
-            if wire_len > 0 && off + wire_len <= data.len() {
+            // BAD 项声明 payload 超出剩余包长 → 截断报文，整包 fatal。
+            if wire_len > 0 && off + wire_len > data.len() {
+                return Err(S7TransportError::protocol(
+                    "READ_DATA_SHORT",
+                    format!("bulk {idx} BAD 项 payload 截断"),
+                ));
+            }
+            if wire_len > 0 {
                 off += wire_len;
                 if wire_len % 2 == 1
                     && off < data.len()
@@ -340,6 +390,13 @@ pub fn parse_bulk_response(
         if wire_len % 2 == 1 && off < data.len() && idx + 1 < items.len() && data[off] == 0x00 {
             off += 1;
         }
+    }
+    // 声明 data 区必须被刚好消费完（多余项/trailing bytes 即畸形）。
+    if off != data.len() {
+        return Err(S7TransportError::protocol(
+            "S7_TRAILING_DATA",
+            format!("Bulk 消费 {off} 但声明 {data_len}"),
+        ));
     }
     Ok(out)
 }
@@ -393,14 +450,15 @@ mod tests {
         assert_eq!(&pkt[19..31], &[0x12; 12]);
     }
 
-    /// 构造最小 Read Ack 响应：TPKT+COTP+S7(12 头)+param(2)+data。
+    /// 构造最小 Read Ack 响应：S7 = 10 字节头 + 2 字节 error(00 00)
+    /// + param(data_len 声明) + data；plen 只计 param（说真话）。
     fn ack_resp(data_items: &[u8], param: &[u8]) -> Vec<u8> {
         let param_len = param.len() as u16;
         let data_len = data_items.len() as u16;
         let mut s7 = vec![0x32, 0x03, 0x00, 0x00, 0x00, 0x01];
         s7.extend_from_slice(&param_len.to_be_bytes());
         s7.extend_from_slice(&data_len.to_be_bytes());
-        s7.extend_from_slice(&[0x00, 0x00]);
+        s7.extend_from_slice(&[0x00, 0x00]); // Ack_Data header error bytes
         s7.extend_from_slice(param);
         s7.extend_from_slice(data_items);
         let mut pkt = vec![0x03, 0x00, 0x00, 0x00, 0x02, 0xF0, 0x80];
@@ -439,11 +497,125 @@ mod tests {
 
     #[test]
     fn parse_rejected_rosctr_maps_cpu_error() {
-        // S7 区需 ≥18 字节（s7[17] 为 CPU 错误码位），用 6 字节 param 补齐。
-        let mut resp = ack_resp(&[], &[0x04, 0x01, 0x00, 0x00, 0x00, 0x05]);
-        resp[7 + 1] = 0x01; // ROSCTR Job（非 Ack）
+        // ROSCTR 非 Ack_Data → CPU 错误映射（s7[17] 为码位）。
+        let mut resp = ack_resp(&[], &[0x04, 0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00]);
+        resp[7 + 1] = 0x01; // ROSCTR Job（非 Ack_Data）
         let err = parse_read_response(&resp, &[item(12, 1)]).unwrap_err();
         assert_eq!(err.code, "S7_0x05");
+    }
+
+    #[test]
+    fn ack_data_header_error_fails() {
+        // header error class 非零 → S7_HEADER_ERR（不再从 s7[17] 取码）。
+        let mut resp = ack_resp(&[0xFF, 0x04, 0x00, 0x08, 0x2A], &[0x04, 0x01]);
+        resp[7 + 10] = 0x84;
+        let err = parse_read_response(&resp, &[item(12, 1)]).unwrap_err();
+        assert_eq!(err.code, "S7_HEADER_ERR");
+        // error code 非零 → CPU 错误映射。
+        let mut resp2 = ack_resp(&[0xFF, 0x04, 0x00, 0x08, 0x2A], &[0x04, 0x01]);
+        resp2[7 + 11] = 0x05;
+        let err = parse_read_response(&resp2, &[item(12, 1)]).unwrap_err();
+        assert_eq!(err.code, "S7_0x05");
+    }
+
+    #[test]
+    fn read_wrong_function_rejected() {
+        // param 首字节为 Write(0x05) → 整包拒绝（不得按 Read 解）。
+        let data = [0xFF, 0x04, 0x00, 0x08, 0x2A];
+        let resp = ack_resp(&data, &[0x05, 0x01]);
+        let err = parse_read_response(&resp, &[item(12, 1)]).unwrap_err();
+        assert_eq!(err.code, "S7_PARAM_FUNC");
+    }
+
+    #[test]
+    fn read_param_len_not_2_rejected() {
+        // plen=4（多 2 字节 param）→ 拒绝（只认冻结形状）。
+        let data = [0xFF, 0x04, 0x00, 0x08, 0x2A];
+        let resp = ack_resp(&data, &[0x00, 0x00, 0x04, 0x01]);
+        let err = parse_read_response(&resp, &[item(12, 1)]).unwrap_err();
+        assert_eq!(err.code, "S7_PARAM_LEN");
+    }
+
+    #[test]
+    fn read_param_count_mismatch_rejected() {
+        // 对端 count=2 但调用方只期待 1 项 → 拒绝（虚报 count 不进解析）。
+        let data = [0xFF, 0x04, 0x00, 0x08, 0x2A];
+        let resp = ack_resp(&data, &[0x04, 0x02]);
+        let err = parse_read_response(&resp, &[item(12, 1)]).unwrap_err();
+        assert_eq!(err.code, "S7_COUNT_MISMATCH");
+    }
+
+    #[test]
+    fn read_extra_item_or_trailing_data_rejected() {
+        // 调用方期待 1 项但 data 区还有完整第 2 项 → 消费不完，整包拒绝。
+        let data = [
+            0xFF, 0x04, 0x00, 0x08, 0x2A, // 第 1 项
+            0xFF, 0x04, 0x00, 0x08, 0x2B, // 多余第 2 项
+        ];
+        let resp = ack_resp(&data, &[0x04, 0x01]);
+        let err = parse_read_response(&resp, &[item(12, 1)]).unwrap_err();
+        assert_eq!(err.code, "S7_TRAILING_DATA");
+        // 纯 trailing 垃圾字节同样拒绝。
+        let data2 = [0xFF, 0x04, 0x00, 0x08, 0x2A, 0x00];
+        let resp2 = ack_resp(&data2, &[0x04, 0x01]);
+        let err = parse_read_response(&resp2, &[item(12, 1)]).unwrap_err();
+        assert_eq!(err.code, "S7_TRAILING_DATA");
+    }
+
+    #[test]
+    fn read_bad_item_truncated_payload_rejected() {
+        // BAD 项声明 8 字节 payload 但包内只剩 1 字节 → 截断报文整包 fatal
+        //（不再静默返回 BAD）。
+        let data = [0x05, 0x04, 0x00, 0x40, 0x2A];
+        let resp = ack_resp(&data, &[0x04, 0x01]);
+        let err = parse_read_response(&resp, &[item(12, 1)]).unwrap_err();
+        assert_eq!(err.code, "READ_DATA_SHORT");
+    }
+
+    #[test]
+    fn read_extra_bytes_beyond_declared_data_len_rejected() {
+        // 声明长度之外多一字节（TPKT 长度同步更新，frame 完整但 S7 语义超长）
+        // → S7_LEN_MISMATCH。data 切片只认声明长度，trailing 检查抓不到此处。
+        let data = [0xFF, 0x04, 0x00, 0x08, 0x2A];
+        let mut resp = ack_resp(&data, &[0x04, 0x01]);
+        resp.push(0xAA); // S7 末尾垃圾字节
+        let len = resp.len() as u16; // TPKT 总长同步，frame 层面合法
+        resp[2..4].copy_from_slice(&len.to_be_bytes());
+        let err = parse_read_response(&resp, &[item(12, 1)]).unwrap_err();
+        assert_eq!(err.code, "S7_LEN_MISMATCH");
+    }
+
+    #[test]
+    fn bulk_read_same_envelope_checks() {
+        // Bulk 路执行同一套 envelope：错 function / count / trailing 全拒绝。
+        let data = [0xFF, 0x04, 0x00, 0x20, 0x01, 0x02, 0x03, 0x04];
+        let err = parse_bulk_response(&ack_resp(&data, &[0x05, 0x01]), &[item(12, 2)]).unwrap_err();
+        assert_eq!(err.code, "S7_PARAM_FUNC");
+        let err = parse_bulk_response(&ack_resp(&data, &[0x04, 0x02]), &[item(12, 2)]).unwrap_err();
+        assert_eq!(err.code, "S7_COUNT_MISMATCH");
+        let mut trailing = data.to_vec();
+        trailing.push(0x00);
+        let err =
+            parse_bulk_response(&ack_resp(&trailing, &[0x04, 0x01]), &[item(12, 2)]).unwrap_err();
+        assert_eq!(err.code, "S7_TRAILING_DATA");
+        // BAD 截断同样 fatal。
+        let bad = [0x05, 0x04, 0x00, 0x40, 0x2A];
+        let err = parse_bulk_response(&ack_resp(&bad, &[0x04, 0x01]), &[item(12, 2)]).unwrap_err();
+        assert_eq!(err.code, "READ_DATA_SHORT");
+    }
+
+    #[test]
+    fn read_ack_param_len_2_data_starts_at_14() {
+        // 标准 Ack_Data 信封：12 字节头 + plen=2 → 项从 +14 起。
+        //（NCK 与 generic 信封相同，差异仅 var-spec syntax。）
+        let data = [0xFF, 0x04, 0x00, 0x08, 0x2A];
+        let resp = ack_resp(&data, &[0x04, 0x01]);
+        let s7 = &resp[7..];
+        assert_eq!(&s7[10..12], &[0x00, 0x00], "header error bytes");
+        assert_eq!(&s7[12..14], &[0x04, 0x01], "param func+count");
+        assert_eq!(s7[14], 0xFF, "首项返回码位");
+        let out = parse_read_response(&resp, &[item(12, 1)]).unwrap();
+        assert_eq!(out[0].data, vec![0x2A]);
     }
 
     #[test]

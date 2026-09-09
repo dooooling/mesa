@@ -20,8 +20,11 @@
     三源 commit 锁定）。✅
   - F2 Wireshark assertions pinned（核对矩阵 #1–#6 入库；`wire_data_len`
     与主干解码数学一致）。✅
-  - F3 Sharp7 reference vectors / interoperability（未做：等 emulator 就绪后
-    C# harness 对打；`<<4` 分歧冻结中，不得做 areaunit 字节差分）。❌
+  - F3 Sharp7 reference vectors / interoperability：pinned vectors 入库 +
+    Rust 离线回放（请求 exact differential；S7WLDouble 下双方对同一 wire
+    解出相同语义数据——单读 8 字节 exact，多读双 buffer exact）✅；
+    live 互操作（setup/单读/多读 rc=0）本地实证 ✅；
+    非零 Area 差分与 `<<4` 仲裁仍 open ❌（Area=0 刻意规避）。
   - F4 Softing semantic evidence pinned（AWL 字段顺序 + 例证值入库）。✅
   - F5 standalone emulator process E2E（9 场景独立进程服务 + 握手验证）。✅
   - F6 disagreements explicitly unresolved（`<<4`/`0x06` 保持 open，
