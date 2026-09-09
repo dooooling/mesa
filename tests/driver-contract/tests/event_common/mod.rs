@@ -430,7 +430,7 @@ fn opcua_event_task() -> mesa_core_types::EventTask {
             config: serde_json::json!({
                 "stream_id": "opcua.events",
                 "parameters": {
-                    "notifier_node_id": "ns=0;i=2253",
+                    "notifier_node_id": "nsu=http://opcfoundation.org/UA/;i=2253",
                     "scope": "all",
                     "publishing_interval_ms": 500,
                     "queue_size": 1000,

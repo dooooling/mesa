@@ -80,7 +80,7 @@ impl Harness {
                     config: serde_json::json!({
                         "stream_id": "opcua.events",
                         "parameters": {
-                            "notifier_node_id": "ns=0;i=2253",
+                            "notifier_node_id": "nsu=http://opcfoundation.org/UA/;i=2253",
                             "scope": scope,
                             "publishing_interval_ms": 500,
                             "queue_size": 1000,

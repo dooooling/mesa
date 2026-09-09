@@ -65,11 +65,19 @@ pub trait OpcUaApi: Send + Sync {
         let _ = subscription_id;
         Ok(())
     }
-    /// 浏览节点（§7.3 Browse）：返回引用描述
-    async fn browse(&self, node: &OpcUaAddress) -> Result<Vec<String>, String> {
+    /// 浏览节点（§7.3 Browse）：返回结构化子节点（展示名 + index 形态引用，
+    /// 调用方经当次 NamespaceArray 快照换算为 canonical 后再对外）。
+    async fn browse(&self, node: &OpcUaAddress) -> Result<Vec<OpcUaBrowseChild>, String> {
         let _ = node;
         Err("NOT_IMPLEMENTED: browse 未实现".into())
     }
+}
+
+/// Browse 子节点：展示名 + transport 侧 index 形态引用。
+#[derive(Debug, Clone)]
+pub struct OpcUaBrowseChild {
+    pub name: String,
+    pub node: mesa_opcua_transport::UaNodeRef,
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +120,7 @@ impl FakeOpcUaApi {
     fn fake_variant_for(&self, addr: &OpcUaAddress) -> Variant {
         use opcua_types::{UAString, Variant};
         let r = self.next_rand();
-        match &addr.identifier {
+        match &addr.node.identifier {
             crate::address::Identifier::Numeric(n) => {
                 if n % 2 == 0 {
                     Variant::Int32((r % 10000) as i32)
@@ -160,7 +168,7 @@ impl OpcUaApi for FakeOpcUaApi {
         let mut out = Vec::with_capacity(addrs.len());
         for addr in addrs {
             // 模拟单点不支持：特定字符串触发 Bad DataValue（用于测试 Bad 隔离与 typed BAD）
-            if let crate::address::Identifier::String(s) = &addr.identifier
+            if let crate::address::Identifier::String(s) = &addr.node.identifier
                 && (s.contains("bad") || s.contains("Bad"))
             {
                 out.push(DataValue {
@@ -216,7 +224,7 @@ impl OpcUaApi for FakeOpcUaApi {
                 for (idx, addr) in addrs.iter().enumerate() {
                     let client_handle = (idx as u32) + 1;
                     // Bad 节点产生 Bad 状态
-                    let is_bad = matches!(&addr.identifier, crate::address::Identifier::String(s) if s.contains("bad") || s.contains("Bad"));
+                    let is_bad = matches!(&addr.node.identifier, crate::address::Identifier::String(s) if s.contains("bad") || s.contains("Bad"));
                     let dv = if is_bad {
                         DataValue {
                             value: None,
@@ -229,7 +237,7 @@ impl OpcUaApi for FakeOpcUaApi {
                     } else {
                         local_seed = local_seed.wrapping_mul(FAKE_RAND_MULT).wrapping_add(1);
                         let r = local_seed;
-                        let variant = match &addr.identifier {
+                        let variant = match &addr.node.identifier {
                             crate::address::Identifier::Numeric(n) => {
                                 if n % 2 == 0 {
                                     Variant::Int32((r % 10000) as i32)
@@ -282,14 +290,33 @@ impl OpcUaApi for FakeOpcUaApi {
     async fn unsubscribe(&self, _subscription_id: u32) -> Result<(), String> {
         Ok(())
     }
-    async fn browse(&self, node: &OpcUaAddress) -> Result<Vec<String>, String> {
-        // Fake 浏览：基于 node 生成 2-3 个子节点名
-        let base = match &node.identifier {
+    async fn browse(&self, node: &OpcUaAddress) -> Result<Vec<OpcUaBrowseChild>, String> {
+        // Fake 浏览：基于 node 生成 2 个子节点（同命名空间索引，字符串标识）。
+        // Fake 不解析 index：沿用父节点的已解析值（未解析即 0，由调用方快照换算）。
+        let ns = node.namespace.unwrap_or(0);
+        let base = match &node.node.identifier {
             crate::address::Identifier::String(s) => s.clone(),
             crate::address::Identifier::Numeric(n) => format!("i={n}"),
-            _ => "node".into(),
+            crate::address::Identifier::Guid(g) => format!("g={g}"),
+            crate::address::Identifier::Opaque(b) => format!("b={b}"),
         };
-        Ok(vec![format!("{base}.Child1"), format!("{base}.Child2")])
+        use mesa_opcua_transport::{UaIdentifier, UaNodeRef};
+        Ok(vec![
+            OpcUaBrowseChild {
+                name: format!("{base}.Child1"),
+                node: UaNodeRef {
+                    namespace: ns,
+                    identifier: UaIdentifier::String(format!("{base}.Child1")),
+                },
+            },
+            OpcUaBrowseChild {
+                name: format!("{base}.Child2"),
+                node: UaNodeRef {
+                    namespace: ns,
+                    identifier: UaIdentifier::String(format!("{base}.Child2")),
+                },
+            },
+        ])
     }
 }
 
@@ -452,10 +479,11 @@ mod tests {
     async fn fake_read_batch_smoke() {
         let api = FakeOpcUaApi::new();
         api.connect("opc.tcp://127.0.0.1:4840", 1000).await.unwrap();
+        let uri = "http://example.com/MyModel/";
         let addrs = vec![
-            parse_address("ns=2;i=2").unwrap(),
-            parse_address("ns=2;s=Counter").unwrap(),
-            parse_address("ns=2;s=Motor.Speed").unwrap(),
+            parse_address(&format!("nsu={uri};i=2")).unwrap(),
+            parse_address(&format!("nsu={uri};s=Counter")).unwrap(),
+            parse_address(&format!("nsu={uri};s=Motor.Speed")).unwrap(),
         ];
         let vals = api.read_batch(&addrs).await.unwrap();
         assert_eq!(vals.len(), 3);
@@ -470,7 +498,7 @@ mod tests {
     #[tokio::test]
     async fn fake_bad_isolation() {
         let api = FakeOpcUaApi::new();
-        let addrs = vec![parse_address("ns=2;s=bad_node").unwrap()];
+        let addrs = vec![parse_address("nsu=http://example.com/MyModel/;s=bad_node").unwrap()];
         let vals = api.read_batch(&addrs).await.unwrap();
         assert_eq!(vals.len(), 1);
         let dv = &vals[0];

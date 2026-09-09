@@ -134,7 +134,7 @@ async fn opcua_generic_node_ok() {
         "t1",
         vec![ResourceSelection {
             resource_id: "node".into(),
-            parameters: json!({"node_id":"ns=2;i=2","data_type":"U32"}),
+            parameters: json!({"node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"U32"}),
             outputs: vec![SelectedOutput {
                 output: "value".into(),
                 point_key: "opc.counter".into(),
@@ -144,6 +144,21 @@ async fn opcua_generic_node_ok() {
     let descs = conn.configure(1, vec![task]).await.unwrap();
     assert_eq!(descs.len(), 1);
     assert_eq!(descs[0].point_key, "opc.counter");
+
+    // legacy ns= 索引形态 fail-closed（与 sinumerik 同口径）。
+    let bad = generic_task(
+        "t2",
+        vec![ResourceSelection {
+            resource_id: "node".into(),
+            parameters: json!({"node_id":"ns=2;i=2","data_type":"U32"}),
+            outputs: vec![SelectedOutput {
+                output: "value".into(),
+                point_key: "k".into(),
+            }],
+        }],
+    );
+    let err = conn.configure(2, vec![bad]).await.unwrap_err();
+    assert_eq!(err.code, "INVALID_ADDRESS");
 }
 
 #[tokio::test]
@@ -196,7 +211,7 @@ async fn legacy_still_works_for_all_drivers() {
     };
     assert!(focas.configure(1, vec![legacy_focas]).await.is_ok());
 
-    // OPC UA legacy
+    // OPC UA legacy binding（地址契约已为 canonical nsu=，此处锁的是 binding kind 兼容）
     let mut opcua = mesa_driver_opcua::OpcUaDriver
         .open_connection("ep1", "{}")
         .await
@@ -207,7 +222,7 @@ async fn legacy_still_works_for_all_drivers() {
         interval_ms: Some(100),
         binding: DriverBinding {
             kind: mesa_driver_opcua::BINDING_POLL.into(),
-            config: json!({"nodes":[{"key":"a","node_id":"ns=2;i=2","data_type":"U32"}]}),
+            config: json!({"nodes":[{"key":"a","node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"U32"}]}),
         },
     };
     assert!(opcua.configure(1, vec![legacy_opcua]).await.is_ok());

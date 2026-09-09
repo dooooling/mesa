@@ -21,6 +21,7 @@ pub mod error;
 pub mod event;
 pub mod fake;
 pub mod native;
+pub mod node_ref;
 pub mod types;
 
 pub use error::{UaOperation, UaTransportError, UaTransportErrorKind, map_service_error};
@@ -33,6 +34,9 @@ pub use event::{
 };
 pub use fake::{FakeLiveBatch, FakeOpcUaTransport, fake_browse_node};
 pub use native::{DEFAULT_OPCUA_PORT, NativeOpcUaTransport};
+pub use node_ref::{
+    CanonicalError, OPC_BASE_NAMESPACE_URI, OpcUaNodeId, ResolveError, parse_canonical,
+};
 pub use types::{
     OpcUaConnectOptions, SubscriptionStats, UaBrowseNode, UaBrowsePage, UaBrowseRequest,
     UaDataChange, UaDataValue, UaIdentifier, UaMonitoredItemId, UaMonitoredItemResult,

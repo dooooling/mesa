@@ -10,30 +10,23 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use mesa_opcua_transport::{
-    NativeOpcUaTransport, OpcUaConnectOptions, OpcUaTransport, UaBrowseRequest, UaIdentifier,
+    NativeOpcUaTransport, OpcUaConnectOptions, OpcUaTransport, UaBrowseRequest,
     UaMonitoredItemSpec, UaNodeRef, UaSubscriptionSpec,
 };
 use opcua_types::StatusCode;
 
-use super::opcua_api::{DataChangeEvent, OpcUaApi};
-use crate::address::{Identifier, OpcUaAddress};
+use super::opcua_api::{DataChangeEvent, OpcUaApi, OpcUaBrowseChild};
+use crate::address::OpcUaAddress;
+
+/// 已解析地址 → transport 引用（未 `resolve` 即编程错误，fail-closed；
+/// run 期全点先解析，正常路径到此必为 `Some`）。
+fn addr_to_node(addr: &OpcUaAddress) -> Result<UaNodeRef, String> {
+    addr.to_node_ref()
+}
 
 /// 单页最大引用数（命名常量：服务端仍可按自身上限截断并返回 continuation，
 /// 本 adapter 用 continuation 接力取全页，见 `browse()`）。
 const BROWSE_MAX_REFS_PER_PAGE: u32 = 1000;
-
-fn addr_to_node(addr: &OpcUaAddress) -> UaNodeRef {
-    let identifier = match &addr.identifier {
-        Identifier::Numeric(n) => UaIdentifier::Numeric(*n),
-        Identifier::String(s) => UaIdentifier::String(s.clone()),
-        Identifier::Guid(g) => UaIdentifier::Guid(g.clone()),
-        Identifier::Opaque(b) => UaIdentifier::Opaque(b.clone()),
-    };
-    UaNodeRef {
-        namespace: addr.namespace,
-        identifier,
-    }
-}
 
 /// Native 会话的 transport 实现（PKI 已由上层经 options 注入，本层不读环境变量）。
 /// 泛型 `T` 便于测试注入 [`mesa_opcua_transport::FakeOpcUaTransport`]；生产用默认
@@ -73,7 +66,8 @@ impl<T: OpcUaTransport> OpcUaApi for TransportApiAdapter<T> {
         &self,
         addrs: &[OpcUaAddress],
     ) -> Result<Vec<opcua_types::DataValue>, String> {
-        let nodes: Vec<UaNodeRef> = addrs.iter().map(addr_to_node).collect();
+        let nodes: Result<Vec<UaNodeRef>, String> = addrs.iter().map(addr_to_node).collect();
+        let nodes = nodes?;
         self.transport.read(&nodes).await.map_err(|e| {
             // 正常路径的 SessionClosed 必须上抛为 Err（由 Manager 退避重建），禁止吞掉
             e.to_string()
@@ -115,17 +109,20 @@ impl<T: OpcUaTransport> OpcUaApi for TransportApiAdapter<T> {
             "OPC UA 订阅已建立（revised 参数由 Server 协商）"
         );
         // 分裂生命周期第二步：独立建监控项（逐项状态保留，部分失败不整体 Err）
-        let mi_specs: Vec<UaMonitoredItemSpec> = addrs
+        let mi_specs: Result<Vec<UaMonitoredItemSpec>, String> = addrs
             .iter()
             .enumerate()
-            .map(|(idx, addr)| UaMonitoredItemSpec {
-                node: addr_to_node(addr),
-                client_handle: (idx as u32) + 1,
-                sampling_interval_ms,
-                queue_size,
-                discard_oldest,
+            .map(|(idx, addr)| {
+                Ok(UaMonitoredItemSpec {
+                    node: addr_to_node(addr)?,
+                    client_handle: (idx as u32) + 1,
+                    sampling_interval_ms,
+                    queue_size,
+                    discard_oldest,
+                })
             })
             .collect();
+        let mi_specs = mi_specs?;
         let results = match self
             .transport
             .create_monitored_items(sub.id, &mi_specs)
@@ -236,24 +233,25 @@ impl<T: OpcUaTransport> OpcUaApi for TransportApiAdapter<T> {
         }
     }
 
-    async fn browse(&self, node: &OpcUaAddress) -> Result<Vec<String>, String> {
+    async fn browse(&self, node: &OpcUaAddress) -> Result<Vec<OpcUaBrowseChild>, String> {
         // P0-B4：continuation 接力取全页——首 browse + browse_next 直至 token 为空；
         // 消费过的旧 token  best-effort 释放（失败仅诊断，不中断翻页）。
+        // 返回结构化子节点（展示名 + index 引用），canonical 换算由调用方经当次
+        // NamespaceArray 快照完成（index 越界项由调用方跳过并告警，不杀整页）。
         let mut out = Vec::new();
         let mut page = self
             .transport
             .browse(UaBrowseRequest {
-                node: addr_to_node(node),
+                node: addr_to_node(node)?,
                 max_refs: BROWSE_MAX_REFS_PER_PAGE,
             })
             .await
             .map_err(|e| e.to_string())?;
         loop {
-            out.extend(
-                page.nodes
-                    .into_iter()
-                    .map(|n| format!("{} {}", n.browse_name, n.node_id)),
-            );
+            out.extend(page.nodes.into_iter().map(|n| OpcUaBrowseChild {
+                name: n.browse_name,
+                node: n.node_id,
+            }));
             let Some(token) = page.continuation_point else {
                 break;
             };
@@ -271,7 +269,6 @@ impl<T: OpcUaTransport> OpcUaApi for TransportApiAdapter<T> {
             }
             page = next;
         }
-        // 保持旧字符串形态 `"<browse_name> <node_id>"`，上层过滤/分页逻辑不变
         Ok(out)
     }
 }
@@ -279,17 +276,21 @@ impl<T: OpcUaTransport> OpcUaApi for TransportApiAdapter<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address::parse_address;
     use mesa_opcua_transport::{
         FakeLiveBatch, FakeOpcUaTransport, UaBrowsePage, UaOperation, UaTransportError,
         fake_browse_node,
     };
     use opcua_types::{DataValue, Variant};
 
+    const TEST_URI: &str = "http://example.com/MyModel/";
+
     fn addr(ns: u16, id: u32) -> OpcUaAddress {
+        let node = parse_address(&format!("nsu={TEST_URI};i={id}")).expect("测试地址合法");
         OpcUaAddress {
-            namespace: ns,
-            identifier: Identifier::Numeric(id),
-            raw: format!("ns={ns};i={id}"),
+            raw: node.raw.clone(),
+            node: node.node,
+            namespace: Some(ns),
         }
     }
 
@@ -353,8 +354,10 @@ mod tests {
 
         let out = adapter.browse(&addr(1, 85)).await.expect("翻页聚合 Ok");
         assert_eq!(out.len(), 2);
-        assert!(out[0].starts_with("Alpha "));
-        assert!(out[1].starts_with("Beta "));
+        assert_eq!(out[0].name, "Alpha");
+        assert_eq!(out[0].node, node(2, 10));
+        assert_eq!(out[1].name, "Beta");
+        assert_eq!(out[1].node, node(2, 11));
         assert_eq!(fake.released_continuations(), vec![token]);
     }
 

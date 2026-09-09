@@ -4,8 +4,8 @@
 
 use mesa_driver_opcua::parse_address;
 use mesa_opcua_transport::{
-    NativeOpcUaTransport, OpcUaConnectOptions, OpcUaTransport, UaBrowseRequest,
-    UaMonitoredItemSpec, UaNodeRef, UaSubscriptionSpec,
+    NativeOpcUaTransport, OPC_BASE_NAMESPACE_URI, OpcUaConnectOptions, OpcUaTransport,
+    UaBrowseRequest, UaMonitoredItemSpec, UaNodeRef, UaSubscriptionSpec,
 };
 
 #[tokio::main]
@@ -30,27 +30,31 @@ async fn main() {
             return;
         }
     }
-    let nodes = vec!["ns=2;i=1", "ns=2;s=Sine", "ns=2;i=1001", "ns=2;s=MyString"];
+    // canonical 流程：先读 NamespaceArray，再换算 canonical → 当前 index。
+    let namespaces = match transport.read_namespace_array().await {
+        Ok(ns) => {
+            println!("namespace array: {:?}", ns);
+            ns
+        }
+        Err(e) => {
+            println!("namespace array failed: {}", e);
+            return;
+        }
+    };
+    // ServerStatusCurrentTime 经基础命名空间 canonical（任何 Server 必有）。
+    let mut canonicals = vec![format!("nsu={OPC_BASE_NAMESPACE_URI};i=2258")];
+    // 仿真命名空间（Prosys SimulationServer）存在即加读，不存在则跳过。
+    if let Some(sim) = namespaces.iter().find(|u| u.contains("Simulation")) {
+        canonicals.push(format!("nsu={sim};s=Sine"));
+        canonicals.push(format!("nsu={sim};i=1001"));
+    }
     let mut refs = vec![];
-    for n in nodes {
+    for n in &canonicals {
         match parse_address(n) {
-            Ok(a) => refs.push(UaNodeRef {
-                namespace: a.namespace,
-                identifier: match a.identifier {
-                    mesa_driver_opcua::Identifier::Numeric(x) => {
-                        mesa_opcua_transport::UaIdentifier::Numeric(x)
-                    }
-                    mesa_driver_opcua::Identifier::String(s) => {
-                        mesa_opcua_transport::UaIdentifier::String(s)
-                    }
-                    mesa_driver_opcua::Identifier::Guid(g) => {
-                        mesa_opcua_transport::UaIdentifier::Guid(g)
-                    }
-                    mesa_driver_opcua::Identifier::Opaque(b) => {
-                        mesa_opcua_transport::UaIdentifier::Opaque(b)
-                    }
-                },
-            }),
+            Ok(mut a) => match a.resolve(&namespaces) {
+                Ok(r) => refs.push(r),
+                Err(e) => println!("resolve {} failed: {}", n, e),
+            },
             Err(e) => println!("parse {} failed: {:?}", n, e),
         }
     }
@@ -65,10 +69,6 @@ async fn main() {
             }
         }
         Err(e) => println!("read failed: {}", e),
-    }
-    match transport.read_namespace_array().await {
-        Ok(ns) => println!("namespace array: {:?}", ns),
-        Err(e) => println!("namespace array failed: {}", e),
     }
     let root = UaNodeRef::numeric(0, 85);
     match transport
