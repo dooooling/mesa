@@ -180,10 +180,13 @@ async fn serve_conn(mut stream: tokio::net::TcpStream, shared: Arc<Mutex<NckFixt
     let s7 = &pkt[7..];
     let requested = u16::from_be_bytes([s7[s7.len() - 2], s7[s7.len() - 1]]);
     let negotiated = requested.min(max_pdu).to_be_bytes();
-    // 标准 25 字节 ack：S7(18) = header(10) + params(8)，协商值在 S7[16..18]
-    //（与 transport 解析位一致；曾经 33 字节自创口径，PR20 改标准）。
+    // NCK 扩展形 Setup（27 字节）：errinfo(00 00) + params(8)，协商值在
+    // S7[18..20]。与读响应 param `[00 00 04 count]` 同构（NCK 方言 uniformly
+    // 带 errinfo；Sharp7 硬件派生解析位一致，硬件终裁前见 ADR 0002）。
+    // transport 解析器按 S7 总长判别（18 标准 / 20 扩展），两形皆吃。
     let mut ack = vec![0x32u8, 0x03, 0x00, 0x00, s7[4], s7[5]];
-    ack.extend_from_slice(&[0x00, 0x08, 0x00, 0x00]);
+    ack.extend_from_slice(&[0x00, 0x0A, 0x00, 0x00]);
+    ack.extend_from_slice(&[0x00, 0x00]);
     ack.extend_from_slice(&[0xF0, 0x00, 0x00, 0x01, 0x00, 0x01]);
     ack.extend_from_slice(&negotiated);
     if !send_packet(&mut stream, &ack).await {
@@ -280,9 +283,10 @@ fn read_ack(req: &[u8], state: &NckFixtureState, ordinal: &mut u64) -> Vec<u8> {
         return vec![0x32, 0x03];
     }
     let mut s7 = vec![0x32u8, 0x03, 0x00, 0x00, req[4], req[5]];
-    s7.extend_from_slice(&[0x00, 0x02]);
+    s7.extend_from_slice(&[0x00, 0x04]);
     s7.extend_from_slice(&(data.len() as u16).to_be_bytes());
-    // 响应 param 占位 4 字节（与传输层解析 `12+param_len` 口径对齐，见 s7 回环）。
+    // NCK 扩展形 param（4 字节 [00 00 04 count]，plen=4 说真话；项仍从
+    // S7[14] 起，与 Sharp7 解析位一致，位置相对上版零移动）。
     s7.extend_from_slice(&[0x00, 0x00, 0x04, count as u8]);
     s7.extend_from_slice(&data);
     // 记录收到的规范（exact 发送字节断言用）。

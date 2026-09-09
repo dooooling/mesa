@@ -168,7 +168,8 @@ fn read_ack(req: &[u8], state: &FixtureState, ordinal: &mut u64) -> Vec<u8> {
     s7.extend_from_slice(&[req[4], req[5]]);
     s7.extend_from_slice(&[0x00, 0x02]);
     s7.extend_from_slice(&(data.len() as u16).to_be_bytes());
-    s7.extend_from_slice(&[0x00, 0x00, 0x04, count as u8]);
+    // 标准 PLC 形：2 字节 param [04 count]，plen=2（说真话；解析器按 10+plen 定位）。
+    s7.extend_from_slice(&[0x04, count as u8]);
     s7.extend_from_slice(&data);
     s7
 }

@@ -49,11 +49,14 @@ pub fn build_s7_setup(pdu_ref: u16, requested_pdu: u16) -> Vec<u8> {
 
 /// 解析 Setup Ack，返回协商后 PDU（`min(请求, 对端)`，0 视为对方无表示）。
 ///
-/// 标准布局（Wireshark/PLC/Snap7 一致，ADR 0002 跨源核对）：
-/// S7(18) = header(10) + params `[F0 00 | 00 01 | 00 01 | PDU]`，
-/// 协商值在 `payload[16..18]`；短于 18 即 `S7_SETUP_SHORT`。
-/// 历史实现曾读 `payload[23..25]`（自创口径，仅回环自洽，真机漏协商），
-/// PR20 改标准口径（附带修好“真机向下协商被静默跳过”的潜伏 bug）。
+/// 双重方言（PR20 互操作结论，ADR 0002）：
+/// - 标准形（PLC/Wireshark）：S7(18) = header(10) + params(8)，PDU 在末 2 字节；
+/// - NCK 扩展形（Sharp7 硬件派生：setup/读响应 uniformly 带 2 字节 errinfo，
+///   与 NCK 读响应 `[00 00 04 count]` param 同构）：S7(20)，S7[10..12] 为
+///   `00 00` 标记，PDU 在末 2 字节。
+/// 判别只认 S7 总长 ∈ {18, 20}（20 必须带 `00 00` 标记），PDU 取 S7 末 2 字节
+/// （两形皆然）；其他形状即 `S7_SETUP_SHAPE`（fail-closed，不猜）。
+/// 历史实现曾读固定 `payload[23..25]`（自创口径，真机漏协商），已废除。
 pub fn parse_setup_ack(resp: &[u8], requested_pdu: u16) -> Result<u16, S7TransportError> {
     if resp.len() < 7 + 18 {
         return Err(S7TransportError::protocol(
@@ -63,18 +66,24 @@ pub fn parse_setup_ack(resp: &[u8], requested_pdu: u16) -> Result<u16, S7Transpo
     }
     // 跳过 TPKT 4 + COTP 3。
     let payload = &resp[7..];
-    if payload.len() < 18 {
+    if payload.len() != 18 && payload.len() != 20 {
         return Err(S7TransportError::protocol(
-            "S7_SETUP_SHORT",
-            format!("Setup 响应过短 {}", payload.len()),
+            "S7_SETUP_SHAPE",
+            format!("Setup 形状未知 S7 长 {}", payload.len()),
         ));
     }
     if payload[1] != S7_ROSCTR_ACK {
         let err = payload.get(17).copied().unwrap_or(0);
         return Err(s7_cpu_error(err, "S7 Setup 被拒绝"));
     }
+    if payload.len() == 20 && (payload[10] != 0 || payload[11] != 0) {
+        return Err(S7TransportError::protocol(
+            "S7_SETUP_SHAPE",
+            "扩展 Setup 缺 errinfo 标记",
+        ));
+    }
     // 只向下协商（min），0 视为对方无表示（保持请求值）。
-    let n = u16::from_be_bytes([payload[16], payload[17]]);
+    let n = u16::from_be_bytes([payload[payload.len() - 2], payload[payload.len() - 1]]);
     let mut negotiated = requested_pdu;
     if n != 0 && n < negotiated {
         negotiated = n;
@@ -121,13 +130,16 @@ pub fn check_ack(s7: &[u8], ctx: &str) -> Result<(), S7TransportError> {
 }
 
 /// 校验 S7 报文声明长度与实际一致（param_len/data_len），供 Read/Write 共用。
+///
+/// data 起点恒为 `10 + param_len`（10 字节头 + param 区）；历史实现曾用
+/// `12 + param_len`（仅当发送方谎报 plen、少报 2 时成立），PR20 改标准口径。
 pub fn check_lengths(s7: &[u8]) -> Result<(usize, usize), S7TransportError> {
     if s7.len() < 12 {
         return Err(S7TransportError::protocol("S7_SHORT", "S7 头部缺失"));
     }
     let param_len = u16::from_be_bytes([s7[6], s7[7]]) as usize;
     let data_len = u16::from_be_bytes([s7[8], s7[9]]) as usize;
-    if s7.len() < 12 + param_len + data_len {
+    if s7.len() < 10 + param_len + data_len {
         return Err(S7TransportError::protocol(
             "S7_LEN_MISMATCH",
             "S7 长度与实际不符",
@@ -175,6 +187,25 @@ mod tests {
         // 短于标准 S7(18) 即拒绝（不再静默沿用请求值）。
         let short = &resp[..7 + 17];
         assert!(parse_setup_ack(short, 480).is_err());
+    }
+
+    #[test]
+    fn setup_ack_accepts_nck_extended_shape() {
+        // NCK 扩展形（27 字节）：errinfo(00 00) + params(8)，PDU 在末 2 字节。
+        let mut resp = vec![0x03, 0x00, 0x00, 0x1B, 0x02, 0xF0, 0x80];
+        let mut s7 = vec![0x32, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x0A, 0x00, 0x00];
+        s7.extend_from_slice(&[0x00, 0x00, 0xF0, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0xF0]);
+        resp.extend_from_slice(&s7);
+        assert_eq!(resp.len(), 27);
+        assert_eq!(parse_setup_ack(&resp, 480).unwrap(), 240);
+        // 20 字节但缺 errinfo 标记 → 形状拒绝（不猜）。
+        let mut bad = resp.clone();
+        bad[7 + 10] = 0x04;
+        assert!(parse_setup_ack(&bad, 480).is_err());
+        // 既非 18 又非 20 → 形状拒绝。
+        let mut odd = resp.clone();
+        odd.push(0x00);
+        assert!(parse_setup_ack(&odd, 480).is_err());
     }
 
     #[test]
