@@ -113,6 +113,18 @@ impl NckCatalog {
                 block: def.block.clone(),
                 variable: def.variable.clone(),
             };
+            // P2b：同一文件内重复键直接拒绝（last-one-wins 会静默吞定义）；
+            // 只有 `common + 所选 family` 的 merge 才允许有意的系列覆盖。
+            if cat.entries.contains_key(&key) {
+                return Err(CatalogError::Invalid {
+                    reason: format!(
+                        "variables[{i}]: 重复变量 {}/{}/{}（同文件内不允许覆盖）",
+                        def.area.letter(),
+                        def.block,
+                        def.variable
+                    ),
+                });
+            }
             cat.entries.insert(key, def);
         }
         Ok(cat)
@@ -248,6 +260,10 @@ impl CatalogRegistry {
     }
 
     /// 装载随仓 catalog（目录规则见 `NckCatalog::catalog_dir`）。
+    ///
+    /// 测试不变式：本仓测试一律用 `load_dir` 直传目录，**禁止读写
+    /// `MESA_NCK_CATALOG_DIR`**（进程全局 env + Rust 并行测试 = CI #115
+    /// 的跨测试 race；零 mutation 构造性无 race，env 分支仅生产生效）。
     pub fn load_shipped() -> Result<Self, CatalogError> {
         Self::load_dir(&NckCatalog::catalog_dir())
     }
@@ -341,15 +357,21 @@ fn parse_entry(e: &serde_json::Value) -> Result<NckVariableDefinition, String> {
         .and_then(|n| usize::try_from(n).ok())
         .filter(|n| *n > 0)
         .ok_or("wire.element_size 需为正整数")?;
-    let supported_families = e
-        .get("supported_families")
-        .and_then(|v| v.as_array())
-        .map(|a| {
+    // P2b：supported_families 逐项严格解析——非字符串元素（如数字）
+    // 直接 Invalid，不静默丢弃（fail-closed，不猜）。
+    let supported_families: Vec<String> = match e.get("supported_families") {
+        None => Vec::new(),
+        Some(v) => {
+            let a = v.as_array().ok_or("supported_families 需为字符串数组")?;
             a.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+                .map(|x| {
+                    x.as_str()
+                        .map(|s| s.to_string())
+                        .ok_or("supported_families 元素需为字符串")
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
     Ok(NckVariableDefinition {
         area,
         block,
@@ -422,21 +444,22 @@ mod tests {
     #[test]
     fn shipped_catalog_files_parse_and_hold_no_memory_numbers() {
         // 随仓 catalog 必须可解析；真机确认前 variables 为空（铁律）。
+        // NOTE：刻意走 `load_dir` 直传目录，不碰 `MESA_NCK_CATALOG_DIR`
+        // （进程全局 env 曾导致 CI #115 并行 race；测试零 env mutation，
+        // 构造性无 race，见 CatalogRegistry::load_shipped 注释）。
+        let dir = format!("{}/catalog", env!("CARGO_MANIFEST_DIR"));
         for f in ["common", "840d-sl", "828d"] {
-            let path = format!("{}/catalog/{f}.json", env!("CARGO_MANIFEST_DIR"));
+            let path = format!("{dir}/{f}.json");
             let text = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("缺 {path}"));
             let v: serde_json::Value = serde_json::from_str(&text).expect("合法 JSON");
             let cat = NckCatalog::from_json(&v).expect("schema 合法");
             assert!(cat.is_empty(), "{f}.json 真机确认前必须为空");
         }
         // 随仓注册表：两系列已知，空系列可解析。
-        let reg = CatalogRegistry::load_shipped().expect("随仓注册表合法");
+        let reg = CatalogRegistry::load_dir(&dir).expect("随仓注册表合法");
         assert_eq!(reg.families(), vec!["828d", "840d-sl"]);
         assert!(reg.resolve("840d-sl").unwrap().is_empty());
     }
-
-    /// 环境变量串行锁（MESA_NCK_CATALOG_DIR 是进程全局，测试不得并行改）。
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn write_catalog_dir(tag: &str, files: &[(&str, &str)]) -> String {
         let dir = std::env::temp_dir().join(format!(
@@ -464,7 +487,6 @@ mod tests {
     #[test]
     fn catalog_840d_and_828d_same_variable_do_not_override() {
         // P1-3 核心：同变量两系列不同 mapping，各自独立解析，互不覆盖。
-        let _guard = ENV_LOCK.lock().unwrap();
         let dir = write_catalog_dir(
             "families",
             &[
@@ -479,10 +501,7 @@ mod tests {
                 ),
             ],
         );
-        unsafe {
-            std::env::set_var("MESA_NCK_CATALOG_DIR", &dir);
-        }
-        let reg = CatalogRegistry::load_shipped().expect("双系列注册表合法");
+        let reg = CatalogRegistry::load_dir(&dir).expect("双系列注册表合法");
         assert_eq!(reg.families(), vec!["828d", "840d-sl"]);
         let d840d = reg
             .resolve("840d-sl")
@@ -501,16 +520,12 @@ mod tests {
         // 未知 family fail-closed。
         let err = reg.resolve("nope").unwrap_err();
         assert!(matches!(err, CatalogError::UnknownFamily { .. }));
-        unsafe {
-            std::env::remove_var("MESA_NCK_CATALOG_DIR");
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn family_scope_validation_rejects_misplaced_entries() {
         // common 里放系列条目、系列文件里放未声明归属的条目，装载即拒绝。
-        let _guard = ENV_LOCK.lock().unwrap();
         let bad_common = write_catalog_dir(
             "bad-common",
             &[
@@ -521,11 +536,8 @@ mod tests {
                 ("840d-sl.json", r#"{"variables": []}"#),
             ],
         );
-        unsafe {
-            std::env::set_var("MESA_NCK_CATALOG_DIR", &bad_common);
-        }
         assert!(
-            CatalogRegistry::load_shipped().is_err(),
+            CatalogRegistry::load_dir(&bad_common).is_err(),
             "common 里的系列条目必须拒绝"
         );
         let bad_family = write_catalog_dir(
@@ -538,17 +550,32 @@ mod tests {
                 ),
             ],
         );
-        unsafe {
-            std::env::set_var("MESA_NCK_CATALOG_DIR", &bad_family);
-        }
         assert!(
-            CatalogRegistry::load_shipped().is_err(),
+            CatalogRegistry::load_dir(&bad_family).is_err(),
             "未声明归属的系列条目必须拒绝"
         );
-        unsafe {
-            std::env::remove_var("MESA_NCK_CATALOG_DIR");
-        }
         let _ = std::fs::remove_dir_all(&bad_common);
         let _ = std::fs::remove_dir_all(&bad_family);
+    }
+
+    #[test]
+    fn strict_parsing_rejects_bad_families_and_dup_keys() {
+        // P2b：supported_families 非字符串元素直接 Invalid（不静默丢弃）。
+        let bad_fam = serde_json::json!({"variables": [{
+            "area": "C", "block": "S", "variable": "v",
+            "data_type": "F64", "shape": "scalar",
+            "wire": {"module": 1, "column": 0, "transport_size": 4, "element_size": 8},
+            "supported_families": [123],
+        }]});
+        assert!(NckCatalog::from_json(&bad_fam).is_err());
+        // P2b：同文件内重复键直接拒绝（只有 common+family merge 允许覆盖）。
+        let good = serde_json::json!({
+            "area": "C", "block": "S", "variable": "v",
+            "data_type": "F64", "shape": "scalar",
+            "wire": {"module": 1, "column": 0, "transport_size": 4, "element_size": 8},
+        });
+        let dup = serde_json::json!({"variables": [good.clone(), good]});
+        let err = NckCatalog::from_json(&dup).unwrap_err();
+        assert!(matches!(err, CatalogError::Invalid { .. }), "实际: {err:?}");
     }
 }

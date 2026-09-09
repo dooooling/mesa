@@ -257,7 +257,11 @@ impl NckConnection {
 }
 
 /// 单点解码：GOOD + 足长 → Current（更新 last_known）；BAD/短包 → 有缓存
-/// LastKnown、无缓存 Placeholder；quality_code 携带 NCK 返回码（解码失败为 None）。
+/// LastKnown、无缓存 Placeholder。
+/// `quality_code` 只携带设备原生返回码（`return_code != 0xFF` 时）；
+/// Mesa 本地校验失败（transport/长度 mismatch，此时 return_code 为 0xFF）
+/// 填 None——`0xFF` 本意是设备 item 成功，写成 quality_code 会误导诊断，
+/// 原因以 warn 日志为准。
 /// `source_timestamp_ns` 恒 None（协议无此语义，不伪造）。
 fn decode_point(
     spec: &PointSpec,
@@ -315,7 +319,11 @@ fn decode_point(
                 point_id,
                 value: val,
                 quality: Quality::Bad,
-                quality_code: return_code.map(|c| c as i32),
+                // P2a：仅设备原生错误码进 quality_code；本地校验失败
+                // （return_code 0xFF）填 None，不伪造协议成功码为诊断码。
+                quality_code: return_code
+                    .filter(|&c| c != mesa_s7_transport::S7_ITEM_OK)
+                    .map(|c| c as i32),
                 source_timestamp_ns: None,
                 value_origin: origin,
             }
@@ -1112,6 +1120,50 @@ mod tests {
         let r = conn.run(sink, sd).await;
         let err = r.expect_err("会话丢失必须 fail attempt");
         assert_eq!(err.code, "READ_SHORT");
+    }
+
+    #[tokio::test]
+    async fn run_transport_mismatch_is_bad_without_fake_success_code() {
+        // P2a：设备 return_code 0xFF 但 transport 不符 → BAD，且 quality_code
+        // 必须为 None（0xFF 本意成功，写成诊断码会误导）。
+        use mesa_driver_sdk::DataSink;
+        let fx = NckFixture::spawn(NckFixtureState {
+            element_size: 8,
+            wrong_transport: true,
+            ..Default::default()
+        })
+        .await;
+        let mut conn = conn_with_synthetic();
+        conn.cfg.port = fx.addr.port();
+        conn.configure(1, vec![poll_task("t1", speed_selection("axis3.speed"))])
+            .await
+            .unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert("axis3.speed".to_string(), 7u32);
+        conn.apply_point_map(map).await.unwrap();
+        let (data_tx, mut data_rx) = tokio::sync::mpsc::channel::<mesa_core_types::DataBatch>(16);
+        let (ctrl_tx, _ctrl_rx) =
+            tokio::sync::mpsc::channel::<mesa_driver_protocol::pb::Envelope>(8);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<mesa_driver_sdk::EventBatch>(8);
+        let sink = DataSink::for_test(ctrl_tx, data_tx, event_tx);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let sd = shutdown.clone();
+        let h = tokio::spawn(async move { conn.run(sink, sd).await });
+        let b = tokio::time::timeout(std::time::Duration::from_secs(10), data_rx.recv())
+            .await
+            .expect("BAD 批必须到达")
+            .expect("通道不断");
+        assert_eq!(b.values[0].quality, mesa_core_types::Quality::Bad);
+        assert_eq!(
+            b.values[0].quality_code, None,
+            "本地校验失败不得伪造 255 为诊断码"
+        );
+        assert_eq!(
+            b.values[0].value_origin,
+            mesa_core_types::ValueOrigin::Placeholder
+        );
+        shutdown.cancel();
+        h.await.expect("join").expect("run Ok 退出");
     }
 
     #[tokio::test]
