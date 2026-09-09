@@ -1524,6 +1524,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesa-nck-emulator"
+version = "0.1.0"
+dependencies = [
+ "mesa-driver-sinumerik-nck",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mesa-opcua-transport"
 version = "0.1.0"
 dependencies = [

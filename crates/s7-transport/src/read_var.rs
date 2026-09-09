@@ -4,11 +4,11 @@
 //! 12 字节（含 `0x12 0x0A 0x10` 头），NCK 由 `sinumerik-nck` Driver 编码
 //! `0x82/83/84` 规范。分片只看字节开销，与语法无关。
 //!
-//! 解析铁律（P1-2 修正）
+//! 解析铁律（P1-2 修正，ADR 0002 对齐 Wireshark 主干）
 //!
 //! - `length` 单位由 `transport_size` 决定：`0x03/0x04/0x05` 按 bit 计
-//!   （真机实证：单字节读回 `transport=0x04 len=8`），`0x06/0x07/0x09`
-//!   按 byte 计（Wireshark S7Comm 口径）；未知值沿用历史 bit 口径；
+//!   （真机实证：单字节读回 `transport=0x04 len=8`），其余一律按 byte 计
+//!   （含 `0x06/0x07/0x09` 与未知值；未知按 byte 偏向 fail-loud）；
 //! - 解析恒完整消费 wire payload 并返回完整数据，**不在本层截断**。
 //!   `expected_data_len` 只是 PDU 分片规划 hint；长度/类型语义由上层
 //!   （s7/nck Driver）各自校验。截断会同时丢数据与错位后续 item offset；
@@ -34,15 +34,14 @@ pub const S7_CHUNK_SAFETY_MARGIN: usize = 32;
 
 /// 响应 `length` 字段的 wire payload 字节数（transport 决定单位）。
 ///
-/// - `0x03`：BIT 单读恒 1 字节；
-/// - `0x06/0x07/0x09`：按 byte 计（Wireshark S7Comm 口径）；
-/// - 其余（含 `0x04/0x05` 与未知值）：按 bit 计、`div_ceil(8)`
-///   （`0x04` 有真机实证；未知值沿用历史口径，不静默换单位）。
+/// 与 Wireshark 主干解码数学逐字一致（ADR 0002 §5）：
+/// `0x03/0x04/0x05` 按 bit 计（`div_ceil(8)`；`0x04` 另有真机实证），
+/// 其余一律按 byte 计（含 `0x06/0x07/0x09` 与未知值——未知按 byte 偏向
+/// fail-loud（多消费→`READ_DATA_SHORT`），而非欠消费导致的静默错位）。
 pub fn wire_data_len(transport: u8, len_field: usize) -> usize {
     match transport {
-        S7_TRANSPORT_BIT => 1,
-        0x06 | 0x07 | 0x09 => len_field,
-        _ => len_field.div_ceil(8),
+        0x03..=0x05 => len_field.div_ceil(8),
+        _ => len_field,
     }
 }
 
@@ -540,14 +539,16 @@ mod tests {
 
     #[test]
     fn wire_data_len_units() {
+        // 与 Wireshark 主干解码数学一致（ADR 0002 §5）：3/4/5 按 bit，
+        // 其余（含未知）一律按 byte。
         assert_eq!(wire_data_len(0x03, 1), 1);
+        assert_eq!(wire_data_len(0x03, 8), 1);
         assert_eq!(wire_data_len(0x04, 16), 2);
         assert_eq!(wire_data_len(0x05, 16), 2);
         assert_eq!(wire_data_len(0x06, 8), 8);
         assert_eq!(wire_data_len(0x07, 8), 8);
         assert_eq!(wire_data_len(0x09, 4), 4);
-        // 未知值沿用历史 bit 口径。
-        assert_eq!(wire_data_len(0x02, 16), 2);
+        assert_eq!(wire_data_len(0x02, 16), 16);
     }
 
     #[test]

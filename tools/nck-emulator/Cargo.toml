@@ -1,0 +1,15 @@
+[package]
+name = "mesa-nck-emulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SINUMERIK NCK standalone 回环 emulator（Layer4 无真机验证；确定性场景服务，供 Mesa/Sharp7 双客户端对打）"
+
+[[bin]]
+name = "mesa-nck-emulator"
+path = "src/main.rs"
+
+[dependencies]
+mesa-driver-sinumerik-nck = { path = "../../drivers/sinumerik-nck" }
+tokio = { workspace = true }
+serde_json = { workspace = true }

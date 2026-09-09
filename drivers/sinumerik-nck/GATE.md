@@ -15,6 +15,17 @@
 - Gate E（topology+browse）：probe（会话可达 + 身份诚实待确认）/
   topology 类型 / Catalog 虚拟浏览树（binding 回环可用）/ 管理面 E2E。
   ✅ 已过（Commit E）。probe anchor 与 topology 实例回填待真机 PR7。
+- Gate F（外部无真机验证，ADR 0002）：真机到手前可证明项的上限。
+  - F1 source provenance pinned（`docs/evidence/nck-external-sources.lock.json`，
+    三源 commit 锁定）。✅
+  - F2 Wireshark assertions pinned（核对矩阵 #1–#6 入库；`wire_data_len`
+    与主干解码数学一致）。✅
+  - F3 Sharp7 reference vectors / interoperability（未做：等 emulator 就绪后
+    C# harness 对打；`<<4` 分歧冻结中，不得做 areaunit 字节差分）。❌
+  - F4 Softing semantic evidence pinned（AWL 字段顺序 + 例证值入库）。✅
+  - F5 standalone emulator process E2E（9 场景独立进程服务 + 握手验证）。✅
+  - F6 disagreements explicitly unresolved（`<<4`/`0x06` 保持 open，
+    不得静默修掉）。✅（保持 open 即通过项）
 
 ## 真机门（840D sl，PR7）
 
@@ -27,4 +38,6 @@ connect / probe / channel+axis topology / 轴实际值与速度 / R 参数 /
 
 - 当前：experimental（V1 地基评审修复完成；随仓 catalog 为空，
   真机回填前生产 probe 身份恒待确认）。
+- 真机前恒为 ❌（Gate F 通过也不翻转）：`NCK_ANCHOR_PENDING` / TSAP confirmed /
+  Catalog mapping / 840D supported。
 - `supported` 需全部真机门通过后翻转。
