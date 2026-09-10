@@ -82,6 +82,10 @@ pub enum AddressError {
     Invalid { input: String, reason: String },
 }
 
+/// S7 ANY 位地址上限 24 bit（线缆只编码 3 字节，超限必须拒绝而非截断，
+/// 否则用户的高地址会被静默读成另一个低地址）。
+pub const S7ANY_MAX_BIT_ADDRESS: u32 = 0xFF_FFFF;
+
 impl S7Address {
     /// 将地址编码为 S7 ANY 结构中的 3 字节位偏移（byte_offset*8+bit）。
     /// Counter/Timer 例外：线缆上传递的是编号本身，不乘 8。
@@ -90,6 +94,25 @@ impl S7Address {
             Area::Counter | Area::Timer => self.byte_offset,
             _ => self.byte_offset * S7_BITS_PER_BYTE + self.bit_offset.unwrap_or(0) as u32,
         }
+    }
+
+    /// checked 版位地址（u64 中间计算防 `byte_offset*8` u32 溢出；
+    /// 超 24 bit 即 `Invalid`，encoder 禁止静默 mask）。
+    pub fn wire_bit_address(&self) -> Result<u32, AddressError> {
+        let v: u64 = match self.area {
+            Area::Counter | Area::Timer => self.byte_offset as u64,
+            _ => {
+                self.byte_offset as u64 * S7_BITS_PER_BYTE as u64
+                    + self.bit_offset.unwrap_or(0) as u64
+            }
+        };
+        u32::try_from(v)
+            .ok()
+            .filter(|b| *b <= S7ANY_MAX_BIT_ADDRESS)
+            .ok_or_else(|| AddressError::Invalid {
+                input: format!("{:?}:{}", self.area, self.byte_offset),
+                reason: format!("位地址 {v} 超出 S7 ANY 24-bit 上限 {S7ANY_MAX_BIT_ADDRESS}"),
+            })
     }
 }
 

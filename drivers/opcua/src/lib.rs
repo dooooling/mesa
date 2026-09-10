@@ -159,9 +159,12 @@ impl Driver for OpcUaDriver {
                     fields: vec![
                         FieldDescriptor::new("node_id", "NodeId", FieldType::String).required(true),
                         {
+                            // FromParameter 参数必须 required（S7 同口径）：
+                            // UI 可用 default 预填，但 canonical selection 必须显式携带，
+                            // 否则 resolve() → None 与 configure 默认值分叉。
                             let mut f =
                                 FieldDescriptor::new("data_type", "Data Type", FieldType::Enum)
-                                    .required(false)
+                                    .required(true)
                                     .default_value(serde_json::json!("STRING"));
                             // 选项与 CANONICAL_DATA_TYPES 同源
                             f.validation.enum_options = Some(
@@ -189,8 +192,9 @@ impl Driver for OpcUaDriver {
                     access: AccessMode::Read,
                 }],
                 modes: vec![
+                    // PR3：generic 当前只执行 Poll；Subscribe 只存在于 legacy
+                    // runtime，Descriptor 不报执行不了的 mode（设计后再加回）。
                     mesa_core_types::TaskMode::Poll,
-                    mesa_core_types::TaskMode::Subscribe,
                 ],
             }],
             controls: mesa_core_types::ControlCatalog::default(),
@@ -1630,6 +1634,33 @@ mod tests {
             .open_connection("ep1", "{}")
             .await
             .expect("open")
+    }
+
+    /// PR3 mode 门：descriptor 声明的每个 mode 都必须 generic configure 成功
+    ///（报执行不了的 mode 即 Descriptor lie；Subscribe 回归留待设计）。
+    #[tokio::test]
+    async fn declared_modes_all_configurable() {
+        use mesa_core_types::TaskMode;
+        let d = OpcUaDriver.descriptor();
+        let node = d.resources.iter().find(|r| r.id == "node").unwrap();
+        assert_eq!(node.modes, vec![TaskMode::Poll]);
+        for mode in &node.modes {
+            let task = AcquisitionTask {
+                id: "t1".into(),
+                mode: *mode,
+                interval_ms: Some(100),
+                binding: DriverBinding {
+                    kind: GENERIC_BINDING_KIND.into(),
+                    config: serde_json::json!({"selections": node_selection("k", serde_json::json!({
+                        "node_id": "nsu=http://example.com/MyModel/;i=2",
+                        "data_type": "STRING",
+                    }))}),
+                },
+            };
+            let mut conn = test_conn().await;
+            let descs = conn.configure(1, vec![task]).await.unwrap();
+            assert_eq!(descs.len(), 1);
+        }
     }
 
     /// PR3 闭环：10 个 canonical data_type → validate_instance PASS →

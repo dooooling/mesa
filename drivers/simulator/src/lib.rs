@@ -1311,6 +1311,12 @@ mod tests {
             5,
             "counter/sine/toggle/random/constant 全声明"
         );
+        // coverage 门：cases 必须覆盖全部 (resource, output) 声明对
+        let declared: std::collections::BTreeSet<(String, String)> = d
+            .resources
+            .iter()
+            .flat_map(|r| r.outputs.iter().map(move |o| (r.id.clone(), o.id.clone())))
+            .collect();
         let cases: Vec<(&str, serde_json::Value)> = vec![
             (
                 "counter",
@@ -1329,6 +1335,11 @@ mod tests {
             ),
             ("constant", serde_json::json!({"value": 42})),
         ];
+        let tested: std::collections::BTreeSet<(String, String)> = cases
+            .iter()
+            .map(|(r, _)| (r.to_string(), "value".to_string()))
+            .collect();
+        assert_eq!(declared, tested, "测试必须覆盖全部声明对");
         for (resource_id, params) in cases {
             let res = d.resources.iter().find(|r| r.id == resource_id).unwrap();
             // ① descriptor 参数面合法

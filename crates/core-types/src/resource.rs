@@ -140,6 +140,15 @@ impl ResourceDescriptor {
                         self.id, o.id, parameter, field.field_type
                     ));
                 }
+                // 类型参数必须 required：optional 会让“schema 合法但缺参”的
+                // selection 通过校验，而 resolve() → None 与 configure 默认值分叉。
+                // UI 预填走 default，不走 optional。
+                if !field.required {
+                    return Err(format!(
+                        "resource {} output {} 的类型参数 {} 必须 required",
+                        self.id, o.id, parameter
+                    ));
+                }
                 let options = field.validation.enum_options.clone().unwrap_or_default();
                 for opt in &options {
                     if !mapping.contains_key(opt) {

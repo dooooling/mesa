@@ -46,49 +46,59 @@ pub fn encode_s7any(area_code: u8, db: u16, bit_addr: u32, transport: u8, req_le
 }
 
 /// 单点读项 → 传输项（transport/request_len 按类型，期望长度按 `byte_len`）。
-pub fn encode_read_item(addr: &S7Address, kind: S7Kind) -> S7ReadVarItem {
+/// 位地址超 24 bit 即 Err（禁止截断后访问错误地址）。
+pub fn encode_read_item(
+    addr: &S7Address,
+    kind: S7Kind,
+) -> Result<S7ReadVarItem, crate::address::AddressError> {
     let (transport, req_len) = spec_params(addr.area, kind);
-    S7ReadVarItem {
+    Ok(S7ReadVarItem {
         var_spec: encode_s7any(
             addr.area.code(),
             addr.db_number,
-            addr.bit_address(),
+            addr.wire_bit_address()?,
             transport,
             req_len,
         ),
         expected_data_len: kind.byte_len(),
-    }
+    })
 }
 
 /// 连续区批量项 → 传输项（恒 BYTE 批量，C/T 保持字寻址特殊）。
-pub fn encode_bulk_item(addr: &S7Address, len: usize) -> S7ReadVarItem {
+pub fn encode_bulk_item(
+    addr: &S7Address,
+    len: usize,
+) -> Result<S7ReadVarItem, crate::address::AddressError> {
     let (transport, req_len) = match addr.area {
         Area::Counter => (S7ANY_TRANSPORT_COUNTER, 1),
         Area::Timer => (S7ANY_TRANSPORT_TIMER, 1),
         _ => (S7ANY_TRANSPORT_BYTE, len as u16),
     };
-    S7ReadVarItem {
+    Ok(S7ReadVarItem {
         var_spec: encode_s7any(
             addr.area.code(),
             addr.db_number,
-            addr.bit_address(),
+            addr.wire_bit_address()?,
             transport,
             req_len,
         ),
         expected_data_len: len,
-    }
+    })
 }
 
 /// 写项规范 → 12 字节（transport/request_len 与读同口径）。
-pub fn encode_write_spec(addr: &S7Address, kind: S7Kind) -> Vec<u8> {
+pub fn encode_write_spec(
+    addr: &S7Address,
+    kind: S7Kind,
+) -> Result<Vec<u8>, crate::address::AddressError> {
     let (transport, req_len) = spec_params(addr.area, kind);
-    encode_s7any(
+    Ok(encode_s7any(
         addr.area.code(),
         addr.db_number,
-        addr.bit_address(),
+        addr.wire_bit_address()?,
         transport,
         req_len,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -133,11 +143,40 @@ mod tests {
     #[test]
     fn read_item_expected_len_follows_kind() {
         let addr = parse_address("DB10.DBD0").unwrap();
-        let it = encode_read_item(&addr, S7Kind::Real);
+        let it = encode_read_item(&addr, S7Kind::Real).unwrap();
         assert_eq!(it.var_spec.len(), 12);
         assert_eq!(it.expected_data_len, 4);
         let s = parse_address("DB10.DBD0").unwrap();
-        let str_item = encode_read_item(&s, S7Kind::String);
+        let str_item = encode_read_item(&s, S7Kind::String).unwrap();
         assert_eq!(str_item.expected_data_len, 256);
+    }
+
+    /// 24-bit 上限：2097151*8+7 == 0xFFFFFF 通过；2097152 拒绝（禁止截断）。
+    #[test]
+    fn wire_bit_address_checked_no_truncation() {
+        use crate::address::{Area, S7Address};
+        let max_ok = S7Address {
+            area: Area::Db,
+            db_number: 1,
+            byte_offset: 2_097_151,
+            bit_offset: Some(7),
+        };
+        assert_eq!(max_ok.wire_bit_address().unwrap(), 0xFF_FFFF);
+        let over = S7Address {
+            area: Area::Db,
+            db_number: 1,
+            byte_offset: 2_097_152,
+            bit_offset: None,
+        };
+        assert!(over.wire_bit_address().is_err());
+        assert!(encode_read_item(&over, S7Kind::Real).is_err());
+        // C/T 编号同样受 24-bit 约束
+        let c_over = S7Address {
+            area: Area::Counter,
+            db_number: 0,
+            byte_offset: 0x1_000_000,
+            bit_offset: None,
+        };
+        assert!(c_over.wire_bit_address().is_err());
     }
 }

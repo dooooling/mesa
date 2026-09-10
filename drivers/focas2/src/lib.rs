@@ -55,22 +55,23 @@ fn resolve_generic_point(
             format!("point `{point_key}` generic focas2 不接受 address，用声明式参数"),
         ));
     }
-    // 整数参数（required 缺失即错；范围错即错；非整数即错）
-    let int_param = |key: &str, required: bool, default: u64, min: u64, max: u64| match params
-        .get(key)
-        .and_then(|v| v.as_u64())
-    {
-        Some(n) if n >= min && n <= max => Ok(n),
-        Some(n) => Err(bad(
-            "INVALID_BINDING_CONFIG",
-            format!("point `{point_key}` 参数 {key}={n} 超出 {min}..={max}"),
-        )),
-        None if required => Err(bad(
-            "INVALID_POINT",
-            format!("point `{point_key}` 缺少参数 {key}"),
-        )),
-        None => Ok(default),
-    };
+    // 整数参数 fail-closed：None → default/required-missing；
+    // Some(非 u64 或越界) → 直接 reject，绝不当作不存在。
+    let int_param =
+        |key: &str, required: bool, default: u64, min: u64, max: u64| match params.get(key) {
+            None if required => Err(bad(
+                "INVALID_POINT",
+                format!("point `{point_key}` 缺少参数 {key}"),
+            )),
+            None => Ok(default),
+            Some(v) => match v.as_u64() {
+                Some(n) if n >= min && n <= max => Ok(n),
+                _ => Err(bad(
+                    "INVALID_BINDING_CONFIG",
+                    format!("point `{point_key}` 参数 {key}={v} 非法（需 {min}..={max} 整数）"),
+                )),
+            },
+        };
     let (addr, data_type) = match (resource_id, output) {
         ("status", "value") => (FocasAddress::Status, DataType::U32),
         ("dynamic", "feed") => (FocasAddress::Feed, DataType::U32),
@@ -113,18 +114,21 @@ fn resolve_generic_point(
             )
         }
         ("pmc", "value") => {
+            // canonical 精确拼写（Descriptor Enum 同口径；"r"/"RABC" 等
+            // 大小写/前缀变体只属于 legacy parser，不进 generic）。
             let kind_s = params.get("kind").and_then(|v| v.as_str()).ok_or_else(|| {
                 bad(
                     "INVALID_POINT",
                     format!("point `{point_key}` pmc 缺少 kind"),
                 )
             })?;
-            let kind = kind_s.to_ascii_uppercase().chars().next().ok_or_else(|| {
-                bad(
-                    "INVALID_POINT",
-                    format!("point `{point_key}` pmc kind 为空"),
-                )
-            })?;
+            if kind_s.len() != 1 {
+                return Err(bad(
+                    "INVALID_DATA_TYPE",
+                    format!("point `{point_key}` pmc kind `{kind_s}` 非 canonical 单字符"),
+                ));
+            }
+            let kind = kind_s.chars().next().unwrap();
             if !PMC_KINDS.contains(&kind) {
                 return Err(bad(
                     "INVALID_DATA_TYPE",
@@ -349,8 +353,14 @@ impl Driver for FocasDriver {
                                     Some(PMC_KINDS.iter().map(|k| k.to_string()).collect());
                                 f
                             },
-                            FieldDescriptor::new("addr", "Address", FieldType::Integer)
-                                .required(true),
+                            {
+                                let mut f =
+                                    FieldDescriptor::new("addr", "Address", FieldType::Integer)
+                                        .required(true);
+                                f.validation.min = Some(0.0);
+                                f.validation.max = Some(4294967295.0);
+                                f
+                            },
                         ],
                     },
                     outputs: vec![OutputDescriptor {
@@ -368,10 +378,14 @@ impl Driver for FocasDriver {
                     id: "macro".into(),
                     label: LocalizedText::new("Macro"),
                     parameters: SchemaDescriptor {
-                        fields: vec![
-                            FieldDescriptor::new("number", "Number", FieldType::Integer)
-                                .required(true),
-                        ],
+                        fields: vec![{
+                            let mut f =
+                                FieldDescriptor::new("number", "Number", FieldType::Integer)
+                                    .required(true);
+                            f.validation.min = Some(0.0);
+                            f.validation.max = Some(4294967295.0);
+                            f
+                        }],
                     },
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
@@ -399,21 +413,9 @@ impl Driver for FocasDriver {
                     }],
                     modes: vec![mesa_core_types::TaskMode::Poll],
                 },
-                ResourceDescriptor {
-                    id: "program".into(),
-                    label: LocalizedText::new("Program"),
-                    parameters: SchemaDescriptor::default(),
-                    outputs: vec![OutputDescriptor {
-                        id: "value".into(),
-                        label: LocalizedText::new("Program"),
-                        type_spec: OutputTypeSpec::Fixed {
-                            data_type: DataType::String,
-                        },
-                        unit: None,
-                        access: AccessMode::Read,
-                    }],
-                    modes: vec![mesa_core_types::TaskMode::Poll],
-                },
+                // NOTE(PR3 canonical)：独立 program 资源已删除——它与
+                // dynamic/program.current 同义（ProgramName/String），
+                // 双入口违反唯一 canonical；程序名只走 dynamic 家族。
             ],
             controls: mesa_core_types::ControlCatalog {
                 commands: vec![mesa_core_types::capability::CommandDescriptor {
@@ -1141,6 +1143,13 @@ mod tests {
     async fn generic_canonical_loop_closed_for_all_resources() {
         let d = FocasDriver.descriptor();
         d.validate().expect("descriptor 必须合法");
+        // coverage 门：测试集合必须 == Descriptor 全部 (resource, output)，
+        // 新增 Resource 忘记 resolver 即红（不再靠人工数“7 个”）。
+        let declared: std::collections::BTreeSet<(String, String)> = d
+            .resources
+            .iter()
+            .flat_map(|r| r.outputs.iter().map(move |o| (r.id.clone(), o.id.clone())))
+            .collect();
         let cases: Vec<(&str, &str, serde_json::Value, DataType)> = vec![
             ("status", "value", serde_json::json!({}), DataType::U32),
             (
@@ -1193,6 +1202,11 @@ mod tests {
             ),
             ("alarm", "value", serde_json::json!({}), DataType::String),
         ];
+        let tested: std::collections::BTreeSet<(String, String)> = cases
+            .iter()
+            .map(|(r, o, _, _)| (r.to_string(), o.to_string()))
+            .collect();
+        assert_eq!(declared, tested, "测试必须覆盖全部声明对");
         for (resource_id, output, params, expected) in cases {
             let res = d.resources.iter().find(|r| r.id == resource_id).unwrap();
             let issues = res.parameters.validate_instance("parameters", &params);
@@ -1240,6 +1254,21 @@ mod tests {
                 "pmc kind 非 canonical（M 只属于 legacy）",
                 serde_json::json!([{"resource_id": "pmc", "parameters": {"kind": "M", "addr": 0}, "outputs": [{"output": "value", "point_key": "k"}]}]),
                 "INVALID_DATA_TYPE",
+            ),
+            (
+                "pmc kind 小写不接受",
+                serde_json::json!([{"resource_id": "pmc", "parameters": {"kind": "r", "addr": 0}, "outputs": [{"output": "value", "point_key": "k"}]}]),
+                "INVALID_DATA_TYPE",
+            ),
+            (
+                "pmc kind 前缀不接受",
+                serde_json::json!([{"resource_id": "pmc", "parameters": {"kind": "RABC", "addr": 0}, "outputs": [{"output": "value", "point_key": "k"}]}]),
+                "INVALID_DATA_TYPE",
+            ),
+            (
+                "axis 非法值不得回落 default",
+                serde_json::json!([{"resource_id": "axis", "parameters": {"axis": -1}, "outputs": [{"output": "value", "point_key": "k"}]}]),
+                "INVALID_BINDING_CONFIG",
             ),
         ];
         for (name, sel, code) in cases {

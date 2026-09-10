@@ -128,10 +128,25 @@ impl Driver for S7Driver {
                             ]);
                             f
                         },
-                        FieldDescriptor::new("db", "DB Number", FieldType::Integer)
-                            .required(false)
-                            .default_value(serde_json::json!(10)),
-                        FieldDescriptor::new("offset", "Offset", FieldType::Integer).required(true),
+                        {
+                            // db 缺省即 10（与 generic 解析一致）；范围 u16，
+                            // 非法值由 parser 拒绝，绝不回落默认值。
+                            let mut f = FieldDescriptor::new("db", "DB Number", FieldType::Integer)
+                                .required(false)
+                                .default_value(serde_json::json!(10));
+                            f.validation.min = Some(0.0);
+                            f.validation.max = Some(65535.0);
+                            f
+                        },
+                        {
+                            // offset 必须非负；负数/小数在 Integer 层即非法，
+                            // parser 对“存在但非法”直接拒绝，不回落 0。
+                            let mut f =
+                                FieldDescriptor::new("offset", "Offset", FieldType::Integer)
+                                    .required(true);
+                            f.validation.min = Some(0.0);
+                            f
+                        },
                         {
                             let mut f =
                                 FieldDescriptor::new("data_type", "Data Type", FieldType::Enum)
@@ -146,7 +161,14 @@ impl Driver for S7Driver {
                             );
                             f
                         },
-                        FieldDescriptor::new("bit", "Bit", FieldType::Integer).required(false),
+                        {
+                            // bit 仅 0..=7；非法值 parser 拒绝，不回落。
+                            let mut f = FieldDescriptor::new("bit", "Bit", FieldType::Integer)
+                                .required(false);
+                            f.validation.min = Some(0.0);
+                            f.validation.max = Some(7.0);
+                            f
+                        },
                     ],
                 },
                 outputs: vec![OutputDescriptor {
@@ -495,40 +517,47 @@ impl DriverConnection for S7Connection {
                                     format!("point `{}` generic s7 需要 area 参数", out.point_key),
                                 )
                             })?;
+                        // 数值三态 fail-closed：不存在 → 缺失错/default；
+                        // 存在但非整数/越界 → 非法错；绝不把“存在非法”当不存在。
+                        // （as_u64 对 -1/小数返回 None，必须先分存在性。）
+                        let bad_num = |key: &str, v: &serde_json::Value| {
+                            SdkDriverError::configuration(
+                                "INVALID_ADDRESS",
+                                format!(
+                                    "point `{}` 参数 {key}={v} 非法（需非负整数）",
+                                    out.point_key
+                                ),
+                            )
+                        };
                         // Descriptor 默认 db=10：缺省即 10（与 descriptor 一致，
-                        // 不得静默用 0）。
-                        let db: u16 = match sel.parameters.get("db").and_then(|v| v.as_u64()) {
+                        // 不得静默用 0；存在非法即拒绝）。
+                        let db: u16 = match sel.parameters.get("db") {
                             None => 10,
-                            Some(n) if n <= u16::MAX as u64 => n as u16,
-                            Some(n) => {
+                            Some(v) => match v.as_u64() {
+                                Some(n) if n <= u16::MAX as u64 => n as u16,
+                                _ => return Err(bad_num("db", v)),
+                            },
+                        };
+                        // offset 必填（descriptor required）：缺失即错。
+                        let offset: u32 = match sel.parameters.get("offset") {
+                            None => {
                                 return Err(SdkDriverError::configuration(
-                                    "INVALID_ADDRESS",
-                                    format!("point `{}` db {n} 超出 u16", out.point_key),
+                                    "INVALID_POINT",
+                                    format!("point `{}` 缺少 offset", out.point_key),
                                 ));
                             }
-                        };
-                        let offset: u32 =
-                            match sel.parameters.get("offset").and_then(|v| v.as_u64()) {
-                                None => 0,
+                            Some(v) => match v.as_u64() {
                                 Some(n) if n <= u32::MAX as u64 => n as u32,
-                                Some(n) => {
-                                    return Err(SdkDriverError::configuration(
-                                        "INVALID_ADDRESS",
-                                        format!("point `{}` offset {n} 超出 u32", out.point_key),
-                                    ));
-                                }
-                            };
-                        let bit: Option<u8> =
-                            match sel.parameters.get("bit").and_then(|v| v.as_u64()) {
-                                None => None,
+                                _ => return Err(bad_num("offset", v)),
+                            },
+                        };
+                        let bit: Option<u8> = match sel.parameters.get("bit") {
+                            None => None,
+                            Some(v) => match v.as_u64() {
                                 Some(n) if n <= 7 => Some(n as u8),
-                                Some(n) => {
-                                    return Err(SdkDriverError::configuration(
-                                        "INVALID_ADDRESS",
-                                        format!("point `{}` bit {n} 非法（0..=7）", out.point_key),
-                                    ));
-                                }
-                            };
+                                _ => return Err(bad_num("bit", v)),
+                            },
+                        };
                         // BOOL 必须显式带位（不得静默默认 .0）；非 BOOL 不应带位。
                         if kind == S7Kind::Bool && bit.is_none() {
                             return Err(SdkDriverError::configuration(
@@ -603,6 +632,13 @@ impl DriverConnection for S7Connection {
                                     out.point_key
                                 ),
                             ),
+                        })?;
+                        // configure 期即封 24-bit（超限不拖到 read 编码，更不截断）。
+                        addr.wire_bit_address().map_err(|e| {
+                            SdkDriverError::configuration(
+                                "INVALID_ADDRESS",
+                                format!("point `{}`: {e}", out.point_key),
+                            )
                         })?;
                         indices.push(new_points.len());
                         new_points.push(PointSpec {
@@ -690,6 +726,10 @@ impl DriverConnection for S7Connection {
                     ),
                 })?;
                 let (data_type, kind) = parse_data_type(dt_str)?;
+                // 24-bit 同封（legacy 亦不得拖到 read）。
+                addr.wire_bit_address().map_err(|e| {
+                    SdkDriverError::configuration("INVALID_ADDRESS", format!("point `{key}`: {e}"))
+                })?;
                 // BOOL 必须带位
                 if kind == S7Kind::Bool && addr.bit_offset.is_none() {
                     return Err(SdkDriverError::configuration(
@@ -1150,6 +1190,40 @@ mod tests {
         }])
     }
 
+    /// PR3 同源门：descriptor enum == CANONICAL keys == mapping keys，
+    /// 三处改一处即全改，漂移即红。
+    #[test]
+    fn canonical_sources_agree() {
+        let d = S7Driver.descriptor();
+        let mem = d.resources.iter().find(|r| r.id == "memory").unwrap();
+        let enum_opts = mem
+            .parameters
+            .fields
+            .iter()
+            .find(|f| f.key == "data_type")
+            .unwrap()
+            .validation
+            .enum_options
+            .clone()
+            .unwrap();
+        let canon: Vec<String> = CANONICAL_DATA_TYPES
+            .iter()
+            .map(|(k, _, _)| k.to_string())
+            .collect();
+        assert_eq!(enum_opts, canon);
+        let mapping_keys: Vec<String> = match &mem.outputs[0].type_spec {
+            mesa_core_types::OutputTypeSpec::FromParameter { mapping, .. } => {
+                let mut ks: Vec<String> = mapping.keys().cloned().collect();
+                ks.sort();
+                ks
+            }
+            other => panic!("memory.value 必须 FromParameter，实际 {other:?}"),
+        };
+        let mut canon_sorted = canon.clone();
+        canon_sorted.sort();
+        assert_eq!(mapping_keys, canon_sorted);
+    }
+
     /// PR3 闭环：9 个 canonical data_type × descriptor 参数面 →
     /// validate_instance PASS → generic configure PASS →
     /// PointDescriptor.data_type == OutputTypeSpec.resolve(parameters)。
@@ -1221,6 +1295,31 @@ mod tests {
             (
                 "db 溢出",
                 serde_json::json!({"area": "DB", "db": 70000, "offset": 0, "data_type": "REAL"}),
+                "INVALID_ADDRESS",
+            ),
+            (
+                "db 负数不得回落默认 10",
+                serde_json::json!({"area": "DB", "db": -1, "offset": 0, "data_type": "REAL"}),
+                "INVALID_ADDRESS",
+            ),
+            (
+                "offset 负数不得回落 0",
+                serde_json::json!({"area": "DB", "db": 1, "offset": -1, "data_type": "REAL"}),
+                "INVALID_ADDRESS",
+            ),
+            (
+                "offset 缺失",
+                serde_json::json!({"area": "DB", "db": 1, "data_type": "REAL"}),
+                "INVALID_POINT",
+            ),
+            (
+                "bit 越界",
+                serde_json::json!({"area": "DB", "db": 1, "offset": 0, "data_type": "BOOL", "bit": 9}),
+                "INVALID_ADDRESS",
+            ),
+            (
+                "offset 超 24-bit wire 上限",
+                serde_json::json!({"area": "DB", "db": 1, "offset": 3000000, "data_type": "REAL"}),
                 "INVALID_ADDRESS",
             ),
         ];

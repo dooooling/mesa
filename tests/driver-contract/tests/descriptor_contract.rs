@@ -449,6 +449,10 @@ fn output_type_spec_parameter_must_exist_and_be_enum() {
     let mut r2 = from_parameter_resource(vec!["REAL"], vec![("REAL", DataType::F32)]);
     r2.parameters.fields[0].field_type = FieldType::String;
     assert!(r2.validate().is_err());
+    // 类型参数 optional → 拒绝（缺参 selection 会 schema 合法但 resolve 出 None）
+    let mut r3 = from_parameter_resource(vec!["REAL"], vec![("REAL", DataType::F32)]);
+    r3.parameters.fields[0].required = false;
+    assert!(r3.validate().is_err());
 }
 
 #[test]
