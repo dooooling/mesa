@@ -88,6 +88,21 @@ async fn post_json(app: axum::Router, uri: &str, body: &str) -> (StatusCode, ser
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
+async fn put_json(app: axum::Router, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .uri(uri)
+        .method("PUT")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
 #[tokio::test]
 async fn probe_does_not_create_endpoint() {
     let (app, _) = app().await;
@@ -250,8 +265,83 @@ async fn task_save_gate_rejects_unknown_resource_and_connection_field() {
     assert_eq!(s, StatusCode::OK, "body: {v}");
     // 非法 mode（simulator counter 只报 Poll）→ 400
     let bad_mode = good.replace("\"mode\":\"poll\"", "\"mode\":\"subscribe\"");
-    let (s, v) = post_json(app, "/api/v1/tasks", &bad_mode).await;
+    let (s, v) = post_json(app.clone(), "/api/v1/tasks", &bad_mode).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    // 跨 Task point_key 重复 → 400（endpoint-wide 唯一，单 Task 内各自合法）
+    let dup = r#"{"endpoint_id":"e1","tasks":[
+        {"id":"t1","mode":"poll","interval_ms":100,"binding":{"kind":"mesa.resources.v1","config":{"selections":[
+        {"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k"}]}]}}},
+        {"id":"t2","mode":"poll","interval_ms":100,"binding":{"kind":"mesa.resources.v1","config":{"selections":[
+        {"resource_id":"sine","parameters":{},"outputs":[{"output":"value","point_key":"k"}]}]}}}]}"#;
+    let (s, v) = post_json(app.clone(), "/api/v1/tasks", dup).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert!(
+        v["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["code"] == "DUPLICATE_POINT_KEY")
+    );
+    // driver_id 不可变 → 400
+    let (s, v) = put_json(
+        app,
+        "/api/v1/endpoints/e1",
+        r#"{"device_id":"d1","driver_id":"s7","connection":{}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], "IMMUTABLE_DRIVER");
+}
+
+/// PR4 Secret 正式语义：缺失保留旧值、marker 保留、显式 clear 删除。
+///（opcua password 为 optional Secret；marker 复用可观测保留/删除。）
+#[tokio::test]
+async fn secret_update_missing_keeps_and_clear_deletes() {
+    let (app, _) = app().await;
+    let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let conn = r#"{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":"pw1"}"#;
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        &format!(r#"{{"id":"e9","device_id":"d1","driver_id":"opcua","connection":{conn}}}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    // 更新时不带 password → 保留；随后 marker 更新成功即证明旧值仍在
+    let conn2 = r#"{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u"}"#;
+    let (s, v) = put_json(
+        app.clone(),
+        "/api/v1/endpoints/e9",
+        &format!(r#"{{"device_id":"d1","driver_id":"opcua","connection":{conn2}}}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let conn3 = r#"{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":{"secret_set":true}}"#;
+    let (s, v) = put_json(
+        app.clone(),
+        "/api/v1/endpoints/e9",
+        &format!(r#"{{"device_id":"d1","driver_id":"opcua","connection":{conn3}}}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "marker 保留应成功，body: {v}");
+    // 显式 clear → 删除；随后 marker 应报 SECRET_NOT_FOUND
+    let conn4 = r#"{"endpoint_url":"opc.tcp://127.0.0.1:4840","password":{"clear_secret":true}}"#;
+    let (s, v) = put_json(
+        app.clone(),
+        "/api/v1/endpoints/e9",
+        &format!(r#"{{"device_id":"d1","driver_id":"opcua","connection":{conn4}}}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let (s, v) = put_json(
+        app,
+        "/api/v1/endpoints/e9",
+        &format!(r#"{{"device_id":"d1","driver_id":"opcua","connection":{conn3}}}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], "SECRET_NOT_FOUND");
 }
 
 /// 设备不可达是 200 + reachable:false（不是 5xx）：s7 连关闭端口。

@@ -194,15 +194,24 @@ fn json_error(code: &str, message: &str) -> serde_json::Value {
 // Task 保存门禁：Core 统一 Descriptor 校验（PR4）
 // ---------------------------------------------------------------------------
 
-/// Data Task 保存门禁（generic 任务唯一实现；legacy 种别是 Driver 私有，
-/// Core 只做结构校验，由 store 层 `task.validate()` 覆盖）。
-/// issues 为空即通过；endpoint 缺失/descriptor 不可用分别映射 404/503。
+/// Data Task 保存门禁（generic 任务走集合级统一校验；legacy 种别是 Driver
+/// 私有，Core 只做结构校验，由 store 层 `task.validate()` 覆盖）。
+/// 无 generic 任务（含 `tasks=[]` 清空）直接放行，不碰 Descriptor——legacy
+/// 不依赖 Driver 可用性。issues 为空即通过；endpoint 缺失/descriptor 不可用
+/// 分别映射 404/503。
 async fn gate_data_tasks(
     state: &AppState,
     endpoint_id: &str,
     tasks: &[mesa_core_types::AcquisitionTask],
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let err = |code: StatusCode, v: serde_json::Value| Err((code, Json(v)));
+    // legacy true bypass：无 generic 即无 Core 语义校验对象
+    if !tasks
+        .iter()
+        .any(|t| t.binding.kind == mesa_core_types::GENERIC_BINDING_KIND)
+    {
+        return Ok(());
+    }
     let rec = match state.store.get_endpoint(endpoint_id) {
         Ok(Some(r)) => r,
         Ok(None) => {
@@ -222,19 +231,15 @@ async fn gate_data_tasks(
             );
         }
     };
+    // 解析全部 generic 绑定，集合级一次校验（Endpoint-wide point_key 唯一）
+    let mut parsed: Vec<(usize, mesa_core_types::GenericBinding)> = Vec::new();
     let mut issues = Vec::new();
     for (i, task) in tasks.iter().enumerate() {
         if task.binding.kind != mesa_core_types::GENERIC_BINDING_KIND {
             continue;
         }
-        let root = format!("tasks[{i}].selections");
         match mesa_core_types::GenericBinding::from_json(&task.binding.config) {
-            Ok(binding) => issues.extend(mesa_core_types::validate_selections_against(
-                &desc,
-                &task.mode,
-                &binding.selections,
-                &root,
-            )),
+            Ok(binding) => parsed.push((i, binding)),
             Err(e) => issues.push(mesa_core_types::ValidationIssue {
                 path: format!("tasks[{i}].binding"),
                 code: "INVALID_BINDING_CONFIG".into(),
@@ -242,6 +247,30 @@ async fn gate_data_tasks(
             }),
         }
     }
+    // generic 解析失败即返（避免 roots 与 parsed 错位误报）
+    if !issues.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "valid": false, "issues": issues }),
+        );
+    }
+    let roots: Vec<String> = parsed
+        .iter()
+        .map(|(i, _)| format!("tasks[{i}].selections"))
+        .collect();
+    let set_inputs: Vec<(
+        &mesa_core_types::TaskMode,
+        &[mesa_core_types::ResourceSelection],
+        &str,
+    )> = parsed
+        .iter()
+        .zip(roots.iter())
+        .map(|((i, b), r)| (&tasks[*i].mode, &b.selections[..], r.as_str()))
+        .collect();
+    issues.extend(mesa_core_types::validate_task_set_against(
+        &desc,
+        &set_inputs,
+    ));
     if issues.is_empty() {
         Ok(())
     } else {
@@ -252,13 +281,20 @@ async fn gate_data_tasks(
     }
 }
 
-/// 事件 Task 保存门禁（同上，`mesa.events.v1` 走 `desc.events` 目录校验）。
+/// 事件 Task 保存门禁（同上，`mesa.events.v1` 走 `desc.events` 目录校验；
+/// 无 generic 事件任务直接放行，不碰 Descriptor）。
 async fn gate_event_tasks(
     state: &AppState,
     endpoint_id: &str,
     tasks: &[mesa_core_types::EventTask],
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let err = |code: StatusCode, v: serde_json::Value| Err((code, Json(v)));
+    if !tasks
+        .iter()
+        .any(|t| t.binding.kind == mesa_core_types::GENERIC_EVENT_BINDING_KIND)
+    {
+        return Ok(());
+    }
     let rec = match state.store.get_endpoint(endpoint_id) {
         Ok(Some(r)) => r,
         Ok(None) => {
@@ -327,6 +363,14 @@ fn is_secret_marker(v: &serde_json::Value) -> bool {
     v.is_object()
         && v.as_object()
             .map(|m| m.get("secret_set") == Some(&serde_json::Value::Bool(true)))
+            .unwrap_or(false)
+}
+
+/// 判断是否为显式删除 Secret 标记 {"clear_secret": true}
+fn is_clear_secret_marker(v: &serde_json::Value) -> bool {
+    v.is_object()
+        && v.as_object()
+            .map(|m| m.get("clear_secret") == Some(&serde_json::Value::Bool(true)))
             .unwrap_or(false)
 }
 
@@ -1446,80 +1490,105 @@ async fn update_endpoint(
             Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
         );
     };
-    let old_driver_id = rec.driver_id.clone();
+    // driver_id 创建后不可变（冻结契约）：选错 Driver 删除重建；
+    // 否则已有 tasks 与新 Driver 的 Descriptor 必然错位。
+    if body.driver_id != rec.driver_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "IMMUTABLE_DRIVER",
+                &format!(
+                    "endpoint driver_id 不可变更（{} → {}）；请删除后重建",
+                    rec.driver_id, body.driver_id
+                ),
+            )),
+        );
+    }
     rec.device_id = body.device_id.clone();
-    rec.driver_id = body.driver_id.clone();
-    // Secret 集成（P0）：fail-closed + 单事务
+    // Secret 正式语义（P0）：明文→更新；marker→保留（须存在）；
+    // 缺失→保留旧值；显式 {"clear_secret": true}→删除。
+    // 先构造 logical candidate（真实值）跑统一校验，通过后再落盘 marker 形态。
     let mut conn_val = body.connection.clone();
     let mut secrets_to_upsert: Vec<(String, String)> = Vec::new();
     let mut secrets_to_delete: Vec<String> = Vec::new();
-    match state.manager.get_descriptor(&body.driver_id).await {
+    match state.manager.get_descriptor(&rec.driver_id).await {
         Ok(desc) => {
             let secret_keys = secret_field_keys(&desc.connection);
+            // logical candidate：各 secret 字段填真实值（明文/物化旧值/继承旧值）
+            let mut logical = conn_val.clone();
             if !secret_keys.is_empty() {
-                if let Some(obj) = conn_val.as_object_mut() {
-                    for sk in &secret_keys {
-                        if let Some(v) = obj.get(sk).cloned() {
-                            if let Some(s) = v.as_str() {
-                                secrets_to_upsert.push((sk.clone(), s.to_string()));
-                                obj.insert(sk.clone(), serde_json::json!({"secret_set": true}));
-                            } else if is_secret_marker(&v) {
-                                // Driver 切换时同名 Secret 禁止复用（需重新明文）
-                                if old_driver_id != body.driver_id {
+                let mut logical_obj = logical.as_object_mut();
+                let Some(obj) = conn_val.as_object_mut() else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json_error(
+                            "VALIDATION_ERROR",
+                            "connection 必须为 JSON 对象",
+                        )),
+                    );
+                };
+                for sk in &secret_keys {
+                    match obj.get(sk).cloned() {
+                        Some(v) if v.is_string() => {
+                            // 明文：logical 用真实新值；persistence 换 marker
+                            secrets_to_upsert.push((sk.clone(), v.as_str().unwrap().to_string()));
+                            obj.insert(sk.clone(), serde_json::json!({"secret_set": true}));
+                        }
+                        Some(v) if is_secret_marker(&v) => {
+                            // marker：须存在旧值；logical 物化真实旧值参检
+                            match state.store.get_secret(&id, sk) {
+                                Ok(Some(pt)) => {
+                                    if let Some(lo) = logical_obj.as_mut() {
+                                        lo.insert(sk.clone(), serde_json::Value::String(pt));
+                                    }
+                                }
+                                Ok(None) => {
                                     return (
                                         StatusCode::BAD_REQUEST,
                                         Json(json_error(
-                                            "SECRET_VALUE_REQUIRED",
-                                            &format!(
-                                                "field `{sk}` driver 已切换，需重新提供明文而非 marker"
-                                            ),
+                                            "SECRET_NOT_FOUND",
+                                            &format!("field `{sk}` marker 存在但无对应 Secret"),
                                         )),
                                     );
                                 }
-                                // marker 需校验旧 Secret 是否存在
-                                match state.store.get_secret(&id, sk) {
-                                    Ok(Some(_)) => {}
-                                    Ok(None) => {
-                                        return (
-                                            StatusCode::BAD_REQUEST,
-                                            Json(json_error(
-                                                "SECRET_NOT_FOUND",
-                                                &format!("field `{sk}` marker 存在但无对应 Secret"),
-                                            )),
-                                        );
-                                    }
-                                    Err(e) => return store_err_to_response(e),
-                                }
+                                Err(e) => return store_err_to_response(e),
                             }
-                        } else {
-                            // 未包含该 Secret 字段 → 显式删除
+                        }
+                        Some(v) if is_clear_secret_marker(&v) => {
+                            // 显式删除：logical 与 persistence 同时移除
                             secrets_to_delete.push(sk.clone());
+                            obj.remove(sk);
+                            if let Some(lo) = logical_obj.as_mut() {
+                                lo.remove(sk);
+                            }
+                        }
+                        Some(v) => {
+                            // 非 string 非 marker 非 clear（如数字/数组）：保持原样，
+                            // 交给统一校验报 INVALID_TYPE，不在这里猜测意图
+                            if let Some(lo) = logical_obj.as_mut() {
+                                lo.insert(sk.clone(), v);
+                            }
+                        }
+                        None => {
+                            // 缺失 → 保留旧值：旧值存在则 logical 继承真实值参检，
+                            // persistence 保持 marker；无旧值则两侧都缺失
+                            //（required 与否由统一校验裁决）
+                            match state.store.get_secret(&id, sk) {
+                                Ok(Some(pt)) => {
+                                    if let Some(lo) = logical_obj.as_mut() {
+                                        lo.insert(sk.clone(), serde_json::Value::String(pt));
+                                    }
+                                    obj.insert(sk.clone(), serde_json::json!({"secret_set": true}));
+                                }
+                                Ok(None) => {}
+                                Err(e) => return store_err_to_response(e),
+                            }
                         }
                     }
                 }
             }
-            // Driver 切换：清理旧 Driver 残留的 Secret（不在新 Descriptor 中的字段），查询失败则 fail-closed
-            let existing = match state.store.list_secret_fields(&id) {
-                Ok(v) => v,
-                Err(e) => return store_err_to_response(e),
-            };
-            for ef in existing {
-                if !secret_keys.contains(&ef) && !secrets_to_delete.contains(&ef) {
-                    secrets_to_delete.push(ef);
-                }
-            }
-            // PR4 门禁：connection 统一校验（secret 感知：已验证存在的 marker
-            // 填占位字符串参检；缺失的 required secret 即 REQUIRED 错误，
-            // 与“删除语义”冲突时以契约为准——缺 required 不可入库）。
-            let mut val_copy = conn_val.clone();
-            if let Some(obj) = val_copy.as_object_mut() {
-                for sk in &secret_keys {
-                    if obj.get(sk).is_some_and(is_secret_marker) {
-                        obj.insert(sk.clone(), serde_json::json!("*"));
-                    }
-                }
-            }
-            let conn_issues = desc.connection.validate_instance("connection", &val_copy);
+            // 统一校验跑在 logical 真实值上（含 Secret regex 等规则）
+            let conn_issues = desc.connection.validate_instance("connection", &logical);
             if !conn_issues.is_empty() {
                 return (
                     StatusCode::BAD_REQUEST,

@@ -30,7 +30,7 @@ pub use probe::{
 pub use resource::{
     AccessMode, GENERIC_BINDING_KIND, GenericBinding, OutputDescriptor, OutputTypeSpec,
     ResourceDescriptor, ResourceSelection, SelectedOutput, validate_selections_against,
-    validate_selections_structure,
+    validate_selections_structure, validate_task_set_against,
 };
 pub use schema::{
     Condition, ConditionOp, FieldDescriptor, FieldType, FieldValidation, LocalizedText,

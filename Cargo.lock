@@ -1293,7 +1293,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mesa-config-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -1307,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-contract-tests"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-opcua-nodes",
  "async-opcua-server",
@@ -1339,7 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-core-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -1365,7 +1365,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-core-types"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "regex",
@@ -1377,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-driver-focas2"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "getrandom 0.2.17",
@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-driver-manager"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "getrandom 0.2.17",
  "mesa-config-store",
@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-driver-opcua"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-opcua-nodes",
  "async-opcua-server",
@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-driver-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "mesa-core-types",
@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-driver-s7"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-driver-sdk"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "mesa-core-types",
@@ -1481,7 +1481,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-driver-simulator"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "mesa-core-types",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-driver-sinumerik-nck"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "mesa-core-types",
@@ -1511,7 +1511,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-event-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "mesa-core-types",
  "rusqlite",
@@ -1526,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-nck-emulator"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "mesa-driver-sinumerik-nck",
  "serde_json",
@@ -1535,7 +1535,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-opcua-transport"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-opcua-client",
  "async-opcua-types",
@@ -1565,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "mesa-s7-transport"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "thiserror 2.0.20",
  "tokio",
@@ -1574,7 +1574,7 @@ dependencies = [
 
 [[package]]
 name = "mesad"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "mesa-config-store",
  "mesa-core-api",

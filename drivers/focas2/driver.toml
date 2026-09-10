@@ -1,7 +1,7 @@
 # FANUC FOCAS2 Driver — 方案 §7.2 资源型
 id = "focas2"
 name = "FANUC FOCAS2"
-version = "0.2.0"
+version = "0.3.0"
 executable = "Mesa-driver-focas2"
 protocol_major = 1
 protocol_minor = 3
