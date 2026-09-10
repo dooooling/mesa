@@ -154,10 +154,14 @@ impl S7Client {
         if items.is_empty() {
             return Ok(vec![]);
         }
-        let encoded: Vec<_> = items
-            .iter()
-            .map(|it| encode_read_item(&it.addr, it.kind))
-            .collect();
+        // wire 位地址超限即整批拒绝（单点 BAD 隔离只处理设备回码，
+        // 不掩盖本地编码错误）。
+        let mut encoded = Vec::with_capacity(items.len());
+        for it in items {
+            encoded.push(encode_read_item(&it.addr, it.kind).map_err(|e| {
+                SdkDriverError::configuration("INVALID_ADDRESS", format!("编码失败: {e}"))
+            })?);
+        }
         let results = self
             .session
             .read_var(&encoded)
@@ -209,10 +213,12 @@ impl S7Client {
         }
         let (physical, logical_to_physical) =
             fragment_ranges(ranges, self.session.negotiated_pdu_length());
-        let encoded: Vec<_> = physical
-            .iter()
-            .map(|(addr, len)| encode_bulk_item(addr, *len))
-            .collect();
+        let mut encoded = Vec::with_capacity(physical.len());
+        for (addr, len) in &physical {
+            encoded.push(encode_bulk_item(addr, *len).map_err(|e| {
+                SdkDriverError::configuration("INVALID_ADDRESS", format!("编码失败: {e}"))
+            })?);
+        }
         // 整批一次 bulk 读：传输层按 PDU 自动打包多项（与抽取前 physical 打包
         // 循环同口径），逐项 BAD 隔离后重组回 logical。
         let results = self
@@ -253,7 +259,9 @@ impl S7Client {
         kind: crate::codec::S7Kind,
         data: &[u8],
     ) -> Result<(), SdkDriverError> {
-        let spec = encode_write_spec(addr, kind);
+        let spec = encode_write_spec(addr, kind).map_err(|e| {
+            SdkDriverError::configuration("INVALID_ADDRESS", format!("编码失败: {e}"))
+        })?;
         self.session
             .write_var(&spec, data)
             .await

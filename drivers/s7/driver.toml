@@ -1,7 +1,7 @@
 # Siemens S7 Driver — 方案 §7.1 地址型
 id = "s7"
 name = "Siemens S7"
-version = "0.1.0"
+version = "0.2.0"
 executable = "Mesa-driver-s7"
 protocol_major = 1
 protocol_minor = 3

@@ -96,10 +96,22 @@ impl Driver for SimulatorDriver {
                 ],
             },
             resources: vec![
+                // PR3 golden：descriptor 参数面 = parser 接受的 canonical 全集。
+                // 遗漏任一参数即契约不闭合（PR4 Task 门禁会按此拒绝未知字段）。
                 ResourceDescriptor {
                     id: "counter".into(),
                     label: LocalizedText::new("Counter"),
-                    parameters: SchemaDescriptor::default(),
+                    parameters: SchemaDescriptor {
+                        fields: vec![
+                            FieldDescriptor::new("start", "Start", FieldType::Number)
+                                .required(false)
+                                .default_value(serde_json::json!(0.0)),
+                            FieldDescriptor::new("step", "Step", FieldType::Number)
+                                .required(false)
+                                .default_value(serde_json::json!(1.0)),
+                            FieldDescriptor::new("wrap", "Wrap", FieldType::Number).required(false),
+                        ],
+                    },
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Value"),
@@ -119,9 +131,22 @@ impl Driver for SimulatorDriver {
                             FieldDescriptor::new("amplitude", "Amplitude", FieldType::Number)
                                 .required(false)
                                 .default_value(serde_json::json!(100.0)),
-                            FieldDescriptor::new("period_ms", "Period ms", FieldType::Integer)
+                            {
+                                // period_ms<=0 parser 按 1 钳位：canonical 直接禁 0，
+                                // 合法输入必须有精确含义，不依赖钳位。
+                                let mut f = FieldDescriptor::new(
+                                    "period_ms",
+                                    "Period ms",
+                                    FieldType::Integer,
+                                )
                                 .required(false)
-                                .default_value(serde_json::json!(5000)),
+                                .default_value(serde_json::json!(5000));
+                                f.validation.min = Some(1.0);
+                                f
+                            },
+                            FieldDescriptor::new("offset", "Offset", FieldType::Number)
+                                .required(false)
+                                .default_value(serde_json::json!(0.0)),
                         ],
                     },
                     outputs: vec![OutputDescriptor {
@@ -136,9 +161,46 @@ impl Driver for SimulatorDriver {
                     modes: vec![mesa_core_types::TaskMode::Poll],
                 },
                 ResourceDescriptor {
+                    id: "toggle".into(),
+                    label: LocalizedText::new("Toggle"),
+                    parameters: SchemaDescriptor {
+                        fields: vec![
+                            FieldDescriptor::new("initial", "Initial", FieldType::Boolean)
+                                .required(false)
+                                .default_value(serde_json::json!(false)),
+                        ],
+                    },
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Value"),
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::Bool,
+                        },
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
                     id: "random".into(),
                     label: LocalizedText::new("Random"),
-                    parameters: SchemaDescriptor::default(),
+                    parameters: SchemaDescriptor {
+                        fields: vec![
+                            FieldDescriptor::new("min", "Min", FieldType::Number)
+                                .required(false)
+                                .default_value(serde_json::json!(-100.0)),
+                            FieldDescriptor::new("max", "Max", FieldType::Number)
+                                .required(false)
+                                .default_value(serde_json::json!(100.0)),
+                            {
+                                let mut f =
+                                    FieldDescriptor::new("seed", "Seed", FieldType::Integer)
+                                        .required(false);
+                                f.validation.min = Some(0.0);
+                                f
+                            },
+                        ],
+                    },
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Value"),
@@ -366,11 +428,23 @@ impl SourceSpec {
                 };
                 SourceSpec::Constant { value }
             }
-            "random" => SourceSpec::Random {
-                min: get_f("min").unwrap_or(-100.0),
-                max: get_f("max").unwrap_or(100.0),
-                seed: v.get("seed").and_then(|s| s.as_u64()),
-            },
+            "random" => {
+                let min = get_f("min").unwrap_or(-100.0);
+                let max = get_f("max").unwrap_or(100.0);
+                // fail-closed：min>max 的随机区间无精确含义，直接拒绝
+                //（descriptor 表达不了跨字段约束，由 parser 兜底）。
+                if min > max {
+                    return Err(bad_point(
+                        key,
+                        &format!("`random.min` {min} > `random.max` {max}"),
+                    ));
+                }
+                SourceSpec::Random {
+                    min,
+                    max,
+                    seed: v.get("seed").and_then(|s| s.as_u64()),
+                }
+            }
             other => {
                 return Err(SdkDriverError::configuration(
                     "UNSUPPORTED_SOURCE_KIND",
@@ -1211,6 +1285,116 @@ mod tests {
                 config: points,
             },
         }
+    }
+
+    fn generic_task(id: &str, selections: serde_json::Value) -> AcquisitionTask {
+        AcquisitionTask {
+            id: id.into(),
+            mode: TaskMode::Poll,
+            interval_ms: Some(100),
+            binding: DriverBinding {
+                kind: GENERIC_BINDING_KIND.into(),
+                config: serde_json::json!({"selections": selections}),
+            },
+        }
+    }
+
+    /// PR3 golden：descriptor 声明的每种合法输入 → validate_instance PASS →
+    /// mesa.resources.v1 selection → configure PASS → PointDescriptor.data_type
+    /// == type_spec.resolve(parameters)。
+    #[tokio::test]
+    async fn golden_descriptor_selection_configure_point_type_closed() {
+        let d = SimulatorDriver.descriptor();
+        d.validate().expect("descriptor 必须合法");
+        assert_eq!(
+            d.resources.len(),
+            5,
+            "counter/sine/toggle/random/constant 全声明"
+        );
+        // coverage 门：cases 必须覆盖全部 (resource, output) 声明对
+        let declared: std::collections::BTreeSet<(String, String)> = d
+            .resources
+            .iter()
+            .flat_map(|r| r.outputs.iter().map(move |o| (r.id.clone(), o.id.clone())))
+            .collect();
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "counter",
+                serde_json::json!({"start": 1, "step": 2, "wrap": 10}),
+            ),
+            ("counter", serde_json::json!({})),
+            (
+                "sine",
+                serde_json::json!({"amplitude": 50, "period_ms": 1000, "offset": 5}),
+            ),
+            ("toggle", serde_json::json!({"initial": true})),
+            ("toggle", serde_json::json!({})),
+            (
+                "random",
+                serde_json::json!({"min": -5, "max": 5, "seed": 7}),
+            ),
+            ("constant", serde_json::json!({"value": 42})),
+        ];
+        let tested: std::collections::BTreeSet<(String, String)> = cases
+            .iter()
+            .map(|(r, _)| (r.to_string(), "value".to_string()))
+            .collect();
+        assert_eq!(declared, tested, "测试必须覆盖全部声明对");
+        for (resource_id, params) in cases {
+            let res = d.resources.iter().find(|r| r.id == resource_id).unwrap();
+            // ① descriptor 参数面合法
+            let issues = res.parameters.validate_instance("parameters", &params);
+            assert!(issues.is_empty(), "{resource_id} {params}: {issues:?}");
+            // ② resolve 出类型
+            let pmap = params.as_object().unwrap().clone();
+            let expected = res.outputs[0].type_spec.resolve(&pmap);
+            assert!(expected.is_some(), "{resource_id} 类型必须可解析");
+            // ③ selection → configure → PointDescriptor 一致
+            let sel = serde_json::json!([{
+                "resource_id": resource_id,
+                "parameters": params,
+                "outputs": [{"output": "value", "point_key": format!("{resource_id}.value")}],
+            }]);
+            let mut conn = SimConnection::default();
+            let descs = conn
+                .configure(1, vec![generic_task("t", sel)])
+                .await
+                .unwrap();
+            assert_eq!(descs.len(), 1);
+            assert_eq!(descs[0].data_type, expected.unwrap(), "{resource_id}");
+        }
+    }
+
+    /// 未声明的 resource_id 不得成为公共契约（generic 路径直接拒绝）。
+    #[tokio::test]
+    async fn golden_undeclared_resource_rejected() {
+        let sel = serde_json::json!([{
+            "resource_id": "quantum_flux",
+            "parameters": {},
+            "outputs": [{"output": "value", "point_key": "q.value"}],
+        }]);
+        let mut conn = SimConnection::default();
+        let err = conn
+            .configure(1, vec![generic_task("t", sel)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "UNSUPPORTED_SOURCE_KIND");
+    }
+
+    /// random min>max fail-closed（descriptor 表达不了跨字段约束）。
+    #[tokio::test]
+    async fn golden_random_min_gt_max_rejected() {
+        let sel = serde_json::json!([{
+            "resource_id": "random",
+            "parameters": {"min": 10, "max": -10},
+            "outputs": [{"output": "value", "point_key": "r.value"}],
+        }]);
+        let mut conn = SimConnection::default();
+        let err = conn
+            .configure(1, vec![generic_task("t", sel)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "INVALID_POINT_SPEC");
     }
 
     #[tokio::test]

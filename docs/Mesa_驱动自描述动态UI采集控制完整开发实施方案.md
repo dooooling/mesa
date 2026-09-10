@@ -962,6 +962,17 @@ Manager 取 Descriptor 顺序：先检查 `DescriptorReport.contract_major`
 （旧 V1 直接 `DESCRIPTOR_CONTRACT_UNSUPPORTED`，不 parse），再 parse
 `descriptor_json`，再校验内外 major 一致，最后 `validate()`。
 
+版本边界（PR3 澄清）：`contract_major/minor` 是 **Core ↔ Driver
+Descriptor 结构协议版本**（JSON shape / 字段增删 / 语义规则变化才升级，
+如 2.0 三处 breaking）。**单个 Driver 的资源含义、canonical 参数、
+支持类型变化**（如 S7 新增 data_type 选项、FOCAS 修正 output 类型）
+归该 **Driver version / behavior contract** 管理，由 driver_id+version
+区分，**不得**因此全局升 Major（一个 S7 修改不让所有 Driver 跟着 3.0）。
+
+冻结说明：Descriptor 2.0 在 PR22–PR23 完成冻结；冻结后新增会拒绝
+既有合法 Descriptor 的全局规则（如 FromParameter 必须 required），
+按 Major 演进，不再视为“冻结补完”。
+
 ```text
 contract_major
 contract_minor

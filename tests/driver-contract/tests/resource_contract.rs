@@ -86,11 +86,12 @@ async fn s7_generic_memory_ok() {
         .open_connection("ep1", r#"{"host":"127.0.0.1"}"#)
         .await
         .unwrap();
+    // canonical 结构化参数（address 字符串只属于 legacy，不进 generic）
     let task = generic_task(
         "t1",
         vec![ResourceSelection {
             resource_id: "memory".into(),
-            parameters: json!({"address":"DB10.DBD0","data_type":"REAL"}),
+            parameters: json!({"area":"DB","db":10,"offset":0,"data_type":"REAL"}),
             outputs: vec![SelectedOutput {
                 output: "value".into(),
                 point_key: "motor.speed".into(),
@@ -108,11 +109,12 @@ async fn focas_generic_status_ok() {
         .open_connection("ep1", "{}")
         .await
         .unwrap();
+    // canonical：resource status 无参数（address/data_type 只属于 legacy）
     let task = generic_task(
         "t1",
         vec![ResourceSelection {
             resource_id: "status".into(),
-            parameters: json!({"address":"status","data_type":"U32"}),
+            parameters: json!({}),
             outputs: vec![SelectedOutput {
                 output: "value".into(),
                 point_key: "cnc.status".into(),
@@ -122,6 +124,7 @@ async fn focas_generic_status_ok() {
     let descs = conn.configure(1, vec![task]).await.unwrap();
     assert_eq!(descs.len(), 1);
     assert_eq!(descs[0].point_key, "cnc.status");
+    assert_eq!(descs[0].data_type, mesa_core_types::DataType::U32);
 }
 
 #[tokio::test]
@@ -130,11 +133,12 @@ async fn opcua_generic_node_ok() {
         .open_connection("ep1", "{}")
         .await
         .unwrap();
+    // canonical data_type（旧 "U32" 拼写只属于 legacy，不进 generic）
     let task = generic_task(
         "t1",
         vec![ResourceSelection {
             resource_id: "node".into(),
-            parameters: json!({"node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"U32"}),
+            parameters: json!({"node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"UINT32"}),
             outputs: vec![SelectedOutput {
                 output: "value".into(),
                 point_key: "opc.counter".into(),
@@ -144,13 +148,14 @@ async fn opcua_generic_node_ok() {
     let descs = conn.configure(1, vec![task]).await.unwrap();
     assert_eq!(descs.len(), 1);
     assert_eq!(descs[0].point_key, "opc.counter");
+    assert_eq!(descs[0].data_type, mesa_core_types::DataType::U32);
 
     // legacy ns= 索引形态 fail-closed（与 sinumerik 同口径）。
     let bad = generic_task(
         "t2",
         vec![ResourceSelection {
             resource_id: "node".into(),
-            parameters: json!({"node_id":"ns=2;i=2","data_type":"U32"}),
+            parameters: json!({"node_id":"ns=2;i=2","data_type":"UINT32"}),
             outputs: vec![SelectedOutput {
                 output: "value".into(),
                 point_key: "k".into(),

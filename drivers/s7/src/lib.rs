@@ -31,6 +31,28 @@ use tokio_util::sync::CancellationToken;
 
 pub const BINDING_KIND: &str = "s7.address-group";
 
+/// S7 canonical data_type 公共契约（PR3）：generic `mesa.resources.v1` 路径
+/// 只接受这 9 个精确大写拼写；parser 的大小写 alias / LREAL / WSTRING /
+/// TIME 等只属于 legacy `s7.address-group` 兼容，不等于产品契约。
+/// 本表是 descriptor mapping 与 generic 门禁的唯一来源（两处同源）。
+pub const CANONICAL_DATA_TYPES: [(&str, DataType, S7Kind); 9] = [
+    ("BOOL", DataType::Bool, S7Kind::Bool),
+    ("BYTE", DataType::U32, S7Kind::Byte),
+    ("WORD", DataType::U32, S7Kind::Word),
+    ("DWORD", DataType::U32, S7Kind::Dword),
+    ("INT", DataType::I32, S7Kind::Int),
+    ("DINT", DataType::I32, S7Kind::Dint),
+    ("REAL", DataType::F32, S7Kind::Real),
+    ("CHAR", DataType::U32, S7Kind::Byte),
+    ("STRING", DataType::String, S7Kind::String),
+];
+
+/// C/T 计数器/定时器区允许的 kind：传输固定返回 2 字节计数值，
+/// 只有 byte_len==2 的 kind 语义成立（REAL 等 4 字节 kind 会错位）。
+fn counter_timer_kind_ok(kind: S7Kind) -> bool {
+    matches!(kind, S7Kind::Word | S7Kind::Int)
+}
+
 use address::AddressError;
 use client::{ReadItem, S7Client, S7ConnConfig};
 
@@ -51,9 +73,9 @@ impl Driver for S7Driver {
 
     fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
         use mesa_core_types::{
-            AccessMode, DataType, DriverCapabilities, DriverDescriptor, DriverIdentity,
-            FieldDescriptor, FieldType, LocalizedText, OutputDescriptor, OutputTypeSpec,
-            ResourceDescriptor, ResourceSelectionMethod, SchemaDescriptor,
+            AccessMode, DriverCapabilities, DriverDescriptor, DriverIdentity, FieldDescriptor,
+            FieldType, LocalizedText, OutputDescriptor, OutputTypeSpec, ResourceDescriptor,
+            ResourceSelectionMethod, SchemaDescriptor,
         };
         let m = self.metadata();
         DriverDescriptor {
@@ -106,55 +128,60 @@ impl Driver for S7Driver {
                             ]);
                             f
                         },
-                        FieldDescriptor::new("db", "DB Number", FieldType::Integer)
-                            .required(false)
-                            .default_value(serde_json::json!(10)),
-                        FieldDescriptor::new("offset", "Offset", FieldType::Integer).required(true),
+                        {
+                            // db 缺省即 10（与 generic 解析一致）；范围 u16，
+                            // 非法值由 parser 拒绝，绝不回落默认值。
+                            let mut f = FieldDescriptor::new("db", "DB Number", FieldType::Integer)
+                                .required(false)
+                                .default_value(serde_json::json!(10));
+                            f.validation.min = Some(0.0);
+                            f.validation.max = Some(65535.0);
+                            f
+                        },
+                        {
+                            // offset 必须非负；负数/小数在 Integer 层即非法，
+                            // parser 对“存在但非法”直接拒绝，不回落 0。
+                            let mut f =
+                                FieldDescriptor::new("offset", "Offset", FieldType::Integer)
+                                    .required(true);
+                            f.validation.min = Some(0.0);
+                            f
+                        },
                         {
                             let mut f =
                                 FieldDescriptor::new("data_type", "Data Type", FieldType::Enum)
                                     .required(true)
                                     .default_value(serde_json::json!("REAL"));
-                            f.validation.enum_options = Some(vec![
-                                "BOOL".into(),
-                                "BYTE".into(),
-                                "WORD".into(),
-                                "DWORD".into(),
-                                "INT".into(),
-                                "DINT".into(),
-                                "REAL".into(),
-                                "CHAR".into(),
-                                "STRING".into(),
-                            ]);
+                            // 选项与 CANONICAL_DATA_TYPES 同源（改一处即全改）
+                            f.validation.enum_options = Some(
+                                CANONICAL_DATA_TYPES
+                                    .iter()
+                                    .map(|(k, _, _)| k.to_string())
+                                    .collect(),
+                            );
                             f
                         },
-                        FieldDescriptor::new("bit", "Bit", FieldType::Integer).required(false),
-                        FieldDescriptor::new("length", "Length", FieldType::Integer)
-                            .required(false),
+                        {
+                            // bit 仅 0..=7；非法值 parser 拒绝，不回落。
+                            let mut f = FieldDescriptor::new("bit", "Bit", FieldType::Integer)
+                                .required(false);
+                            f.validation.min = Some(0.0);
+                            f.validation.max = Some(7.0);
+                            f
+                        },
                     ],
                 },
                 outputs: vec![OutputDescriptor {
                     id: "value".into(),
                     label: LocalizedText::new("Value"),
-                    // NOTE(PR3 对齐项)：类型随 data_type 参数（codec.parse_data_type
-                    // 口径转写；Descriptor 参数面为 area/db/offset 形态，parser 另
-                    // 接受 address 字符串形态，两形态对齐在 PR3 审计）。
+                    // mapping 与 CANONICAL_DATA_TYPES 同源（精确 9 选项）；
+                    // length 已删除：STRING 长度由 DB 实际 max_len 决定，driver 不消费该参数。
                     type_spec: OutputTypeSpec::FromParameter {
                         parameter: "data_type".into(),
-                        mapping: [
-                            ("BOOL", DataType::Bool),
-                            ("BYTE", DataType::U32),
-                            ("WORD", DataType::U32),
-                            ("DWORD", DataType::U32),
-                            ("INT", DataType::I32),
-                            ("DINT", DataType::I32),
-                            ("REAL", DataType::F32),
-                            ("CHAR", DataType::U32),
-                            ("STRING", DataType::String),
-                        ]
-                        .into_iter()
-                        .map(|(k, v)| (k.to_string(), v))
-                        .collect(),
+                        mapping: CANONICAL_DATA_TYPES
+                            .iter()
+                            .map(|(k, dt, _)| (k.to_string(), *dt))
+                            .collect(),
                     },
                     unit: None,
                     access: AccessMode::Read,
@@ -442,85 +469,20 @@ impl DriverConnection for S7Connection {
                         ));
                     }
                     for out in &sel.outputs {
-                        // 优先使用 parameters.address，兼容 descriptor 的 area/db/offset 形式
-                        let addr_str = if let Some(a) =
-                            sel.parameters.get("address").and_then(|v| v.as_str())
-                        {
-                            a.to_string()
-                        } else if let Some(area) =
-                            sel.parameters.get("area").and_then(|v| v.as_str())
-                        {
-                            // Descriptor 形态 area/db/offset/data_type/bit/length -> 合成标准 S7 地址
-                            let area_u = area.to_ascii_uppercase();
-                            let db: u16 = sel
-                                .parameters
-                                .get("db")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0) as u16;
-                            let offset: u32 = sel
-                                .parameters
-                                .get("offset")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0) as u32;
-                            let bit: Option<u8> = sel
-                                .parameters
-                                .get("bit")
-                                .and_then(|v| v.as_u64())
-                                .map(|b| b as u8);
-                            let dt = sel
-                                .parameters
-                                .get("data_type")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("REAL");
-                            // 根据 data_type 推断 DB 前缀，BOOL 必须带位
-                            let is_bool = dt.eq_ignore_ascii_case("BOOL");
-                            if area_u == "DB" {
-                                if is_bool {
-                                    let b = bit.unwrap_or(0);
-                                    format!("DB{db}.DBX{offset}.{b}")
-                                } else {
-                                    // 根据 data_type 选择 DBB/DBW/DBD，默认 DBW
-                                    let prefix = match dt.to_ascii_uppercase().as_str() {
-                                        "REAL" | "DINT" | "DWORD" | "DWord" => "DBD",
-                                        "INT" | "WORD" | "UINT" => "DBW",
-                                        "BYTE" | "CHAR" | "SINT" | "USINT" => "DBB",
-                                        "BOOL" => "DBX",
-                                        _ => "DBW",
-                                    };
-                                    // 已处理 BOOL 分支，此处非 BOOL
-                                    format!("DB{db}.{prefix}{offset}")
-                                }
-                            } else if ["M", "I", "Q"].contains(&area_u.as_str()) {
-                                if let Some(b) = bit {
-                                    format!("{area_u}{offset}.{b}")
-                                } else if is_bool {
-                                    format!("{area_u}{offset}.0")
-                                } else {
-                                    let prefix = match dt.to_ascii_uppercase().as_str() {
-                                        "REAL" | "DINT" | "DWORD" | "DWord" => "D",
-                                        "INT" | "WORD" | "UINT" => "W",
-                                        "BYTE" | "CHAR" | "SINT" | "USINT" => "B",
-                                        _ => "W",
-                                    };
-                                    format!("{area_u}{prefix}{offset}")
-                                }
-                            } else {
-                                // 其他区域直接拼接
-                                if let Some(b) = bit {
-                                    format!("{area_u}{offset}.{b}")
-                                } else {
-                                    format!("{area_u}{offset}")
-                                }
-                            }
-                        } else {
+                        // PR3 canonical：generic 路径只接受结构化参数
+                        // area/db/offset/data_type/bit，拒绝 address 字符串
+                        //（address 只属于 legacy s7.address-group 兼容）。
+                        if sel.parameters.get("address").is_some() {
                             return Err(SdkDriverError::configuration(
                                 "INVALID_BINDING_CONFIG",
                                 format!(
-                                    "point `{}` generic s7 requires parameters.address or area/db/offset",
+                                    "point `{}` generic s7 不接受 address，改用 area/db/offset/data_type",
                                     out.point_key
                                 ),
                             ));
-                        };
+                        }
+                        // data_type 必须精确命中 canonical 9 选项（大小写敏感）；
+                        // parser alias（lreal/wstring/time 等）不等于产品契约。
                         let dt_str = sel
                             .parameters
                             .get("data_type")
@@ -531,6 +493,132 @@ impl DriverConnection for S7Connection {
                                     format!("point `{}` 缺少 data_type", out.point_key),
                                 )
                             })?;
+                        let (data_type, kind) = CANONICAL_DATA_TYPES
+                            .iter()
+                            .find(|(k, _, _)| *k == dt_str)
+                            .map(|(_, dt, k)| (*dt, *k))
+                            .ok_or_else(|| {
+                                SdkDriverError::configuration(
+                                    "INVALID_DATA_TYPE",
+                                    format!(
+                                        "point `{}` data_type `{dt_str}` 非 canonical（仅接受 {:?}）",
+                                        out.point_key,
+                                        CANONICAL_DATA_TYPES.map(|(k, _, _)| k),
+                                    ),
+                                )
+                            })?;
+                        let area = sel
+                            .parameters
+                            .get("area")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                SdkDriverError::configuration(
+                                    "INVALID_BINDING_CONFIG",
+                                    format!("point `{}` generic s7 需要 area 参数", out.point_key),
+                                )
+                            })?;
+                        // 数值三态 fail-closed：不存在 → 缺失错/default；
+                        // 存在但非整数/越界 → 非法错；绝不把“存在非法”当不存在。
+                        // （as_u64 对 -1/小数返回 None，必须先分存在性。）
+                        let bad_num = |key: &str, v: &serde_json::Value| {
+                            SdkDriverError::configuration(
+                                "INVALID_ADDRESS",
+                                format!(
+                                    "point `{}` 参数 {key}={v} 非法（需非负整数）",
+                                    out.point_key
+                                ),
+                            )
+                        };
+                        // Descriptor 默认 db=10：缺省即 10（与 descriptor 一致，
+                        // 不得静默用 0；存在非法即拒绝）。
+                        let db: u16 = match sel.parameters.get("db") {
+                            None => 10,
+                            Some(v) => match v.as_u64() {
+                                Some(n) if n <= u16::MAX as u64 => n as u16,
+                                _ => return Err(bad_num("db", v)),
+                            },
+                        };
+                        // offset 必填（descriptor required）：缺失即错。
+                        let offset: u32 = match sel.parameters.get("offset") {
+                            None => {
+                                return Err(SdkDriverError::configuration(
+                                    "INVALID_POINT",
+                                    format!("point `{}` 缺少 offset", out.point_key),
+                                ));
+                            }
+                            Some(v) => match v.as_u64() {
+                                Some(n) if n <= u32::MAX as u64 => n as u32,
+                                _ => return Err(bad_num("offset", v)),
+                            },
+                        };
+                        let bit: Option<u8> = match sel.parameters.get("bit") {
+                            None => None,
+                            Some(v) => match v.as_u64() {
+                                Some(n) if n <= 7 => Some(n as u8),
+                                _ => return Err(bad_num("bit", v)),
+                            },
+                        };
+                        // BOOL 必须显式带位（不得静默默认 .0）；非 BOOL 不应带位。
+                        if kind == S7Kind::Bool && bit.is_none() {
+                            return Err(SdkDriverError::configuration(
+                                "INVALID_ADDRESS",
+                                format!("point `{}` BOOL 必须带 bit 参数", out.point_key),
+                            ));
+                        }
+                        if kind != S7Kind::Bool && bit.is_some() {
+                            return Err(SdkDriverError::configuration(
+                                "INVALID_ADDRESS",
+                                format!("point `{}` 非 BOOL 不应带位", out.point_key),
+                            ));
+                        }
+                        // C/T 区只接受 2 字节 kind（传输固定回 2 字节计数值，
+                        // REAL 等 4 字节 kind 会错位；BOOL 已在上一步拒绝）。
+                        let area_u = area.to_ascii_uppercase();
+                        if (area_u == "C" || area_u == "T") && !counter_timer_kind_ok(kind) {
+                            return Err(SdkDriverError::configuration(
+                                "INVALID_ADDRESS",
+                                format!(
+                                    "point `{}` C/T 区仅接受 WORD/INT（{dt_str} 字节宽不匹配）",
+                                    out.point_key
+                                ),
+                            ));
+                        }
+                        // 合成标准 S7 地址（与 legacy parse_address 同语法）
+                        let addr_str = if area_u == "DB" {
+                            if kind == S7Kind::Bool {
+                                format!("DB{db}.DBX{offset}.{}", bit.unwrap_or(0))
+                            } else {
+                                // 根据 data_type 选择 DBB/DBW/DBD，默认 DBW
+                                let prefix = match dt_str {
+                                    "REAL" | "DINT" | "DWORD" => "DBD",
+                                    "INT" | "WORD" => "DBW",
+                                    "BYTE" | "CHAR" => "DBB",
+                                    "STRING" => "DBB",
+                                    _ => "DBW",
+                                };
+                                format!("DB{db}.{prefix}{offset}")
+                            }
+                        } else if ["M", "I", "Q"].contains(&area_u.as_str()) {
+                            if let Some(b) = bit {
+                                format!("{area_u}{offset}.{b}")
+                            } else {
+                                let prefix = match dt_str {
+                                    "REAL" | "DINT" | "DWORD" => "D",
+                                    "INT" | "WORD" => "W",
+                                    "BYTE" | "CHAR" => "B",
+                                    "STRING" => "B",
+                                    _ => "W",
+                                };
+                                format!("{area_u}{prefix}{offset}")
+                            }
+                        } else {
+                            // 其他区域直接拼接（C/T/PI/PQ/V/L 等 parse_address 语法）
+                            if let Some(b) = bit {
+                                format!("{area_u}{offset}.{b}")
+                            } else {
+                                format!("{area_u}{offset}")
+                            }
+                        };
                         let addr = parse_address(&addr_str).map_err(|e| match e {
                             AddressError::Empty => SdkDriverError::configuration(
                                 "INVALID_ADDRESS",
@@ -545,19 +633,13 @@ impl DriverConnection for S7Connection {
                                 ),
                             ),
                         })?;
-                        let (data_type, kind) = parse_data_type(dt_str)?;
-                        if kind == S7Kind::Bool && addr.bit_offset.is_none() {
-                            return Err(SdkDriverError::configuration(
+                        // configure 期即封 24-bit（超限不拖到 read 编码，更不截断）。
+                        addr.wire_bit_address().map_err(|e| {
+                            SdkDriverError::configuration(
                                 "INVALID_ADDRESS",
-                                format!("point `{}` BOOL 必须带位", out.point_key),
-                            ));
-                        }
-                        if kind != S7Kind::Bool && addr.bit_offset.is_some() {
-                            return Err(SdkDriverError::configuration(
-                                "INVALID_ADDRESS",
-                                format!("point `{}` 非 BOOL 不应带位", out.point_key),
-                            ));
-                        }
+                                format!("point `{}`: {e}", out.point_key),
+                            )
+                        })?;
                         indices.push(new_points.len());
                         new_points.push(PointSpec {
                             key: out.point_key.clone(),
@@ -644,6 +726,10 @@ impl DriverConnection for S7Connection {
                     ),
                 })?;
                 let (data_type, kind) = parse_data_type(dt_str)?;
+                // 24-bit 同封（legacy 亦不得拖到 read）。
+                addr.wire_bit_address().map_err(|e| {
+                    SdkDriverError::configuration("INVALID_ADDRESS", format!("point `{key}`: {e}"))
+                })?;
                 // BOOL 必须带位
                 if kind == S7Kind::Bool && addr.bit_offset.is_none() {
                     return Err(SdkDriverError::configuration(
@@ -1082,6 +1168,188 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "INVALID_ADDRESS");
+    }
+
+    fn generic_task(selections: serde_json::Value) -> AcquisitionTask {
+        AcquisitionTask {
+            id: "t1".into(),
+            mode: TaskMode::Poll,
+            interval_ms: Some(100),
+            binding: DriverBinding {
+                kind: GENERIC_BINDING_KIND.into(),
+                config: serde_json::json!({"selections": selections}),
+            },
+        }
+    }
+
+    fn memory_selection(point_key: &str, params: serde_json::Value) -> serde_json::Value {
+        serde_json::json!([{
+            "resource_id": "memory",
+            "parameters": params,
+            "outputs": [{"output": "value", "point_key": point_key}],
+        }])
+    }
+
+    /// PR3 同源门：descriptor enum == CANONICAL keys == mapping keys，
+    /// 三处改一处即全改，漂移即红。
+    #[test]
+    fn canonical_sources_agree() {
+        let d = S7Driver.descriptor();
+        let mem = d.resources.iter().find(|r| r.id == "memory").unwrap();
+        let enum_opts = mem
+            .parameters
+            .fields
+            .iter()
+            .find(|f| f.key == "data_type")
+            .unwrap()
+            .validation
+            .enum_options
+            .clone()
+            .unwrap();
+        let canon: Vec<String> = CANONICAL_DATA_TYPES
+            .iter()
+            .map(|(k, _, _)| k.to_string())
+            .collect();
+        assert_eq!(enum_opts, canon);
+        let mapping_keys: Vec<String> = match &mem.outputs[0].type_spec {
+            mesa_core_types::OutputTypeSpec::FromParameter { mapping, .. } => {
+                let mut ks: Vec<String> = mapping.keys().cloned().collect();
+                ks.sort();
+                ks
+            }
+            other => panic!("memory.value 必须 FromParameter，实际 {other:?}"),
+        };
+        let mut canon_sorted = canon.clone();
+        canon_sorted.sort();
+        assert_eq!(mapping_keys, canon_sorted);
+    }
+
+    /// PR3 闭环：9 个 canonical data_type × descriptor 参数面 →
+    /// validate_instance PASS → generic configure PASS →
+    /// PointDescriptor.data_type == OutputTypeSpec.resolve(parameters)。
+    #[tokio::test]
+    async fn generic_canonical_loop_closed_for_all_types() {
+        let d = S7Driver.descriptor();
+        d.validate().expect("descriptor 必须合法");
+        let mem = d.resources.iter().find(|r| r.id == "memory").unwrap();
+        for (dt, expected, _) in CANONICAL_DATA_TYPES {
+            let mut params = serde_json::json!({
+                "area": "DB", "db": 1, "offset": 0, "data_type": dt,
+            });
+            if dt == "BOOL" {
+                params["bit"] = serde_json::json!(3);
+            }
+            // ① descriptor 参数面合法
+            let issues = mem.parameters.validate_instance("parameters", &params);
+            assert!(issues.is_empty(), "{dt}: {issues:?}");
+            // ② resolve 出类型
+            let pmap = params.as_object().unwrap().clone();
+            assert_eq!(
+                mem.outputs[0].type_spec.resolve(&pmap),
+                Some(expected),
+                "{dt}"
+            );
+            // ③ generic configure → PointDescriptor 一致
+            let mut conn = S7Connection {
+                cfg: S7ConnConfig::default(),
+                plan: None,
+            };
+            let descs = conn
+                .configure(1, vec![generic_task(memory_selection("k", params))])
+                .await
+                .unwrap();
+            assert_eq!(descs.len(), 1);
+            assert_eq!(descs[0].data_type, expected, "{dt}");
+        }
+    }
+
+    /// generic 路径拒绝：address 字符串、alias 小写、BOOL 缺 bit、C+REAL、db 溢出。
+    #[tokio::test]
+    async fn generic_rejects_non_canonical() {
+        let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+            (
+                "address 字符串不接受",
+                serde_json::json!({"address": "DB10.DBD0", "data_type": "REAL"}),
+                "INVALID_BINDING_CONFIG",
+            ),
+            (
+                "alias 小写不接受",
+                serde_json::json!({"area": "DB", "db": 1, "offset": 0, "data_type": "real"}),
+                "INVALID_DATA_TYPE",
+            ),
+            (
+                "LREAL 非 canonical",
+                serde_json::json!({"area": "DB", "db": 1, "offset": 0, "data_type": "LREAL"}),
+                "INVALID_DATA_TYPE",
+            ),
+            (
+                "BOOL 缺 bit",
+                serde_json::json!({"area": "DB", "db": 1, "offset": 0, "data_type": "BOOL"}),
+                "INVALID_ADDRESS",
+            ),
+            (
+                "C 区 REAL 字节宽不匹配",
+                serde_json::json!({"area": "C", "offset": 1, "data_type": "REAL"}),
+                "INVALID_ADDRESS",
+            ),
+            (
+                "db 溢出",
+                serde_json::json!({"area": "DB", "db": 70000, "offset": 0, "data_type": "REAL"}),
+                "INVALID_ADDRESS",
+            ),
+            (
+                "db 负数不得回落默认 10",
+                serde_json::json!({"area": "DB", "db": -1, "offset": 0, "data_type": "REAL"}),
+                "INVALID_ADDRESS",
+            ),
+            (
+                "offset 负数不得回落 0",
+                serde_json::json!({"area": "DB", "db": 1, "offset": -1, "data_type": "REAL"}),
+                "INVALID_ADDRESS",
+            ),
+            (
+                "offset 缺失",
+                serde_json::json!({"area": "DB", "db": 1, "data_type": "REAL"}),
+                "INVALID_POINT",
+            ),
+            (
+                "bit 越界",
+                serde_json::json!({"area": "DB", "db": 1, "offset": 0, "data_type": "BOOL", "bit": 9}),
+                "INVALID_ADDRESS",
+            ),
+            (
+                "offset 超 24-bit wire 上限",
+                serde_json::json!({"area": "DB", "db": 1, "offset": 3000000, "data_type": "REAL"}),
+                "INVALID_ADDRESS",
+            ),
+        ];
+        for (name, params, code) in cases {
+            let mut conn = S7Connection {
+                cfg: S7ConnConfig::default(),
+                plan: None,
+            };
+            let err = conn
+                .configure(1, vec![generic_task(memory_selection("k", params))])
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code, "{name}");
+        }
+        // C 区 WORD 合法（2 字节语义成立）
+        let mut conn = S7Connection {
+            cfg: S7ConnConfig::default(),
+            plan: None,
+        };
+        let descs = conn
+            .configure(
+                1,
+                vec![generic_task(memory_selection(
+                    "k",
+                    serde_json::json!({"area": "C", "offset": 1, "data_type": "WORD"}),
+                ))],
+            )
+            .await
+            .unwrap();
+        assert_eq!(descs[0].data_type, mesa_core_types::DataType::U32);
     }
 
     /// 按 parse_szl_module_id 的布局假设构造合成 SZL 载荷（自举一致性；

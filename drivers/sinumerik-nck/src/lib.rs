@@ -475,6 +475,13 @@ impl DriverConnection for NckConnection {
                         canonical = %var_ref.canonical_key(),
                         "NCK 点位已解析",
                     );
+                    // count>1 运行时发 typed array（pack_array），
+                    // PointDescriptor 必须同口径，否则 GOOD 值类型对不上声明
+                    let data_type = if var_ref.count > 1 {
+                        rv.kind.core_array_type()
+                    } else {
+                        rv.kind.core_type()
+                    };
                     new_points.push(PointSpec {
                         key: out.point_key.clone(),
                         var_ref,
@@ -482,7 +489,7 @@ impl DriverConnection for NckConnection {
                         kind: rv.kind,
                         expected_len: rv.expected_data_len,
                         expected_transport_size: rv.expected_transport_size,
-                        data_type: rv.kind.core_type(),
+                        data_type,
                         unit: def.unit.clone(),
                     });
                 }
@@ -891,6 +898,43 @@ mod tests {
             },
             "outputs": [{"output": "value", "point_key": point_key}],
         }])
+    }
+
+    /// PR3 闭环（DriverResolved）：catalog 条目类型 → configure →
+    /// PointDescriptor；count=1 标量、count>1 同口径 array（pack_array 一致）。
+    #[tokio::test]
+    async fn driver_resolved_type_matches_catalog_and_count() {
+        let d = SinumerikNckDriver.descriptor();
+        d.validate().expect("descriptor 必须合法");
+        let var = d.resources.iter().find(|r| r.id == "variable").unwrap();
+        assert_eq!(
+            var.outputs[0].type_spec,
+            mesa_core_types::OutputTypeSpec::DriverResolved
+        );
+        // count=1 → F64（catalog data_type）
+        let mut conn = conn_with_synthetic();
+        let params = serde_json::json!({
+            "area": "C", "area_no": 1, "block": "SEMA",
+            "variable": "actFeedRate", "line": 3,
+        });
+        let issues = var.parameters.validate_instance("parameters", &params);
+        assert!(issues.is_empty(), "{issues:?}");
+        let descs = conn
+            .configure(1, vec![poll_task("t1", speed_selection("k1"))])
+            .await
+            .unwrap();
+        assert_eq!(descs[0].data_type, mesa_core_types::DataType::F64);
+        // count=3 → F64Array（与 pack_array 同口径）
+        let mut sel3 = speed_selection("k3");
+        sel3[0]["parameters"]["count"] = serde_json::json!(3);
+        let params3 = sel3[0]["parameters"].clone();
+        let issues3 = var.parameters.validate_instance("parameters", &params3);
+        assert!(issues3.is_empty(), "{issues3:?}");
+        let descs3 = conn
+            .configure(2, vec![poll_task("t2", sel3)])
+            .await
+            .unwrap();
+        assert_eq!(descs3[0].data_type, mesa_core_types::DataType::F64Array);
     }
 
     #[tokio::test]

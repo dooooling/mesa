@@ -87,7 +87,8 @@ impl FakeFocasApi {
                 Value::U32(r % 4)
             }
             FocasAddress::Alarm => {
-                Value::U32(r % 3) // 0 无报警 1 报警 2 警告
+                // 报警文本（native 同口径 String；Fake 不得用 U32 伪造）
+                Value::String(format!("ALM{}", r % 3))
             }
             FocasAddress::ProgramNumber => Value::U32(1000 + (r % 9000)),
             FocasAddress::ProgramMain => Value::U32(1000 + (r % 9000)),

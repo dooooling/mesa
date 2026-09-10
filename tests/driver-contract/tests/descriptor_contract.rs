@@ -449,6 +449,10 @@ fn output_type_spec_parameter_must_exist_and_be_enum() {
     let mut r2 = from_parameter_resource(vec!["REAL"], vec![("REAL", DataType::F32)]);
     r2.parameters.fields[0].field_type = FieldType::String;
     assert!(r2.validate().is_err());
+    // 类型参数 optional → 拒绝（缺参 selection 会 schema 合法但 resolve 出 None）
+    let mut r3 = from_parameter_resource(vec!["REAL"], vec![("REAL", DataType::F32)]);
+    r3.parameters.fields[0].required = false;
+    assert!(r3.validate().is_err());
 }
 
 #[test]
@@ -467,15 +471,17 @@ fn s7_and_opcua_descriptors_declare_from_parameter() {
         }
         other => panic!("s7 memory.value 必须为 FromParameter，实际 {other:?}"),
     }
-    // OPC UA node.value ← data_type（6 选项全覆盖）
+    // OPC UA node.value ← data_type（10 选项全覆盖，见 CANONICAL_DATA_TYPES）
     let opc = mesa_driver_opcua::OpcUaDriver.descriptor();
     let node = opc.resources.iter().find(|r| r.id == "node").unwrap();
     match &node.outputs[0].type_spec {
         OutputTypeSpec::FromParameter { parameter, mapping } => {
             assert_eq!(parameter, "data_type");
-            assert_eq!(mapping.len(), 6);
+            assert_eq!(mapping.len(), 10);
             assert_eq!(mapping["DOUBLE"], DataType::F64);
             assert_eq!(mapping["BOOL"], DataType::Bool);
+            assert_eq!(mapping["UINT32"], DataType::U32);
+            assert_eq!(mapping["DATETIME"], DataType::DateTime);
         }
         other => panic!("opcua node.value 必须为 FromParameter，实际 {other:?}"),
     }
@@ -729,6 +735,50 @@ fn validate_instance_covers_required_type_enum_range_pattern_unknown() {
     // 非对象
     let issues = schema.validate_instance("connection", &serde_json::json!(42));
     assert!(issues.iter().any(|i| i.code == "INVALID_TYPE"));
+}
+
+#[test]
+fn driver_version_identity_toml_metadata_package_agree() {
+    // §4.1 门禁：driver.toml.version == DriverMetadata.version == package version；
+    // Descriptor/公开行为变化必须同步三处，禁止同一 version 对应不同语义。
+    use mesa_driver_sdk::Driver;
+    let drivers: Vec<(&str, String)> = vec![
+        (
+            "simulator",
+            mesa_driver_simulator::SimulatorDriver.metadata().version,
+        ),
+        ("s7", mesa_driver_s7::S7Driver.metadata().version),
+        ("focas2", mesa_driver_focas2::FocasDriver.metadata().version),
+        ("opcua", mesa_driver_opcua::OpcUaDriver.metadata().version),
+        (
+            "sinumerik-nck",
+            mesa_driver_sinumerik_nck::SinumerikNckDriver
+                .metadata()
+                .version,
+        ),
+    ];
+    for (dir, meta_version) in drivers {
+        let toml_text = std::fs::read_to_string(
+            common::repo_root()
+                .join("drivers")
+                .join(dir)
+                .join("driver.toml"),
+        )
+        .unwrap();
+        let toml_version = toml_text
+            .lines()
+            .find_map(|l| l.strip_prefix("version = \"")?.strip_suffix('"'))
+            .expect("driver.toml 必须有 version");
+        assert_eq!(
+            toml_version, meta_version,
+            "{dir}: driver.toml 与 metadata 版本不一致"
+        );
+        assert_eq!(
+            meta_version,
+            env!("CARGO_PKG_VERSION"),
+            "{dir}: metadata 与 package 版本不一致"
+        );
+    }
 }
 
 #[tokio::test]
