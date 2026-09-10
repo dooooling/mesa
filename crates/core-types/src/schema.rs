@@ -38,7 +38,7 @@ impl From<&str> for LocalizedText {
 }
 
 /// V1 支持的字段类型（§12），禁止任意字符串类型。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldType {
     String,
@@ -131,8 +131,9 @@ impl SchemaDescriptor {
         Self { fields }
     }
 
-    /// 校验 Schema 的静态契约：key 唯一、enum 唯一、visible_if 引用存在等。
-    pub fn validate(&self) -> Result<(), String> {
+    /// 校验 Schema 定义本身是否合法（Descriptor 静态契约）：
+    /// key 唯一/非空、enum 选项唯一、default 类型一致、visible_if 引用存在。
+    pub fn validate_definition(&self) -> Result<(), String> {
         use std::collections::HashSet;
         let mut seen = HashSet::new();
         for f in &self.fields {
@@ -176,6 +177,12 @@ impl SchemaDescriptor {
                     ));
                 }
             }
+            // pattern 必须为合法 regex（定义期拦截，instance 期不再容忍）
+            if let Some(pat) = &f.validation.pattern
+                && regex::Regex::new(pat).is_err()
+            {
+                return Err(format!("field {} pattern 非法 regex: {pat}", f.key));
+            }
         }
         // visible_if 引用字段存在
         for f in &self.fields {
@@ -189,6 +196,146 @@ impl SchemaDescriptor {
             }
         }
         Ok(())
+    }
+
+    /// 校验用户输入实例是否合法（Core 唯一 Schema Validator）：
+    /// required、JSON 类型、enum、min/max、pattern（真 regex）、未知字段。
+    /// 路径以 `root` 为前缀（如 `connection.host`）；返回全部问题（不短路），
+    /// 空 Vec 表示通过。调用方（Validate Connection / Create / Update Endpoint /
+    /// ResourceSelection / Event 参数）必须全部走本函数，不得各写一套。
+    pub fn validate_instance(&self, root: &str, value: &serde_json::Value) -> Vec<ValidationIssue> {
+        let mut issues = Vec::new();
+        let Some(obj) = value.as_object() else {
+            issues.push(ValidationIssue {
+                path: root.into(),
+                code: "INVALID_TYPE".into(),
+                message: format!("{root} must be an object"),
+            });
+            return issues;
+        };
+        for field in &self.fields {
+            let path = format!("{root}.{}", field.key);
+            let Some(val) = obj.get(&field.key) else {
+                if field.required {
+                    issues.push(ValidationIssue {
+                        path,
+                        code: "REQUIRED".into(),
+                        message: format!("field `{}` is required", field.key),
+                    });
+                }
+                continue;
+            };
+            // Secret 持久化标记 {"secret_set": true} 视为已提供，不校验内容
+            if field.field_type == FieldType::Secret && is_secret_marker(val) {
+                continue;
+            }
+            if !field_type_matches(field.field_type, val) {
+                issues.push(ValidationIssue {
+                    path,
+                    code: "INVALID_TYPE".into(),
+                    message: format!(
+                        "field `{}` expected {:?}, got {}",
+                        field.key, field.field_type, val
+                    ),
+                });
+                continue;
+            }
+            if let Some(opts) = &field.validation.enum_options
+                && let Some(s) = val.as_str()
+                && !opts.iter().any(|o| o == s)
+            {
+                issues.push(ValidationIssue {
+                    path: path.clone(),
+                    code: "INVALID_ENUM".into(),
+                    message: format!("field `{}` value `{s}` not in {opts:?}", field.key),
+                });
+            }
+            if let Some(num) = val.as_f64() {
+                if let Some(min) = field.validation.min
+                    && num < min
+                {
+                    issues.push(ValidationIssue {
+                        path: path.clone(),
+                        code: "OUT_OF_RANGE".into(),
+                        message: format!("field `{}` {num} < min {min}", field.key),
+                    });
+                }
+                if let Some(max) = field.validation.max
+                    && num > max
+                {
+                    issues.push(ValidationIssue {
+                        path: path.clone(),
+                        code: "OUT_OF_RANGE".into(),
+                        message: format!("field `{}` {num} > max {max}", field.key),
+                    });
+                }
+            }
+            // 真 regex（fail-closed：pattern 非法即配置错误，由定义校验拦截；
+            // 此处若编译失败视为不匹配并报告）。
+            if let Some(pat) = &field.validation.pattern
+                && let Some(s) = val.as_str()
+            {
+                match regex::Regex::new(pat) {
+                    Ok(re) => {
+                        if !re.is_match(s) {
+                            issues.push(ValidationIssue {
+                                path: path.clone(),
+                                code: "PATTERN_MISMATCH".into(),
+                                message: format!("field `{}` value `{s}` 不匹配 {pat}", field.key),
+                            });
+                        }
+                    }
+                    Err(e) => issues.push(ValidationIssue {
+                        path: path.clone(),
+                        code: "INVALID_PATTERN".into(),
+                        message: format!("field `{}` pattern 非法: {e}", field.key),
+                    }),
+                }
+            }
+        }
+        // 未知字段（拼写错误早发现，不静默吞掉）
+        for key in obj.keys() {
+            if !self.fields.iter().any(|f| &f.key == key) {
+                issues.push(ValidationIssue {
+                    path: format!("{root}.{key}"),
+                    code: "UNKNOWN_FIELD".into(),
+                    message: format!("unknown field `{key}`"),
+                });
+            }
+        }
+        issues
+    }
+}
+
+/// 单个校验问题（Core 唯一形状；`path` 含调用方前缀）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValidationIssue {
+    pub path: String,
+    pub code: String,
+    pub message: String,
+}
+
+/// Secret 持久化标记 {"secret_set": true}：已存值，不校验内容。
+fn is_secret_marker(v: &serde_json::Value) -> bool {
+    v.is_object()
+        && v.as_object()
+            .map(|m| m.get("secret_set") == Some(&serde_json::Value::Bool(true)))
+            .unwrap_or(false)
+}
+
+/// JSON 值与 FieldType 一致性（与 definition 校验同口径）。
+fn field_type_matches(t: FieldType, val: &serde_json::Value) -> bool {
+    match t {
+        FieldType::String
+        | FieldType::Host
+        | FieldType::Url
+        | FieldType::File
+        | FieldType::CertificateRef
+        | FieldType::Secret => val.is_string(),
+        FieldType::Integer | FieldType::Port => val.is_number() && val.as_i64().is_some(),
+        FieldType::Number | FieldType::Duration => val.is_number(),
+        FieldType::Boolean => val.is_boolean(),
+        FieldType::Enum => val.is_string(),
     }
 }
 

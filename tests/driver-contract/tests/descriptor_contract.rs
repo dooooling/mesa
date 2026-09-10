@@ -8,11 +8,12 @@ use mesa_driver_sdk::Driver;
 
 use mesa_core_types::{
     AccessMode, DataType, DriverDescriptor, FieldDescriptor, FieldType, LocalizedText,
-    OutputDescriptor, ResourceDescriptor, SchemaDescriptor,
+    OutputDescriptor, OutputTypeSpec, ResourceDescriptor, ResourceSelectionMethod,
+    SchemaDescriptor,
 };
 
 fn synthetic_descriptor() -> DriverDescriptor {
-    use mesa_core_types::capability::{ControlCatalog, DiscoveryCapabilities, DriverCapabilities};
+    use mesa_core_types::capability::{ControlCatalog, DriverCapabilities};
     use mesa_core_types::schema::{Condition, ConditionOp, FieldValidation, UiHints};
     // 覆盖全部 12 种 FieldType 的合成 Schema
     let fields = vec![
@@ -163,7 +164,9 @@ fn synthetic_descriptor() -> DriverDescriptor {
         outputs: vec![OutputDescriptor {
             id: "value".into(),
             label: LocalizedText::new("Value"),
-            data_type: DataType::F64,
+            type_spec: OutputTypeSpec::Fixed {
+                data_type: DataType::F64,
+            },
             unit: None,
             access: AccessMode::Read,
         }],
@@ -180,10 +183,7 @@ fn synthetic_descriptor() -> DriverDescriptor {
         connection: conn,
         resources,
         controls: ControlCatalog::default(),
-        discovery: DiscoveryCapabilities {
-            manual: true,
-            ..Default::default()
-        },
+        resource_selection_methods: vec![ResourceSelectionMethod::Manual],
         capabilities: DriverCapabilities::default(),
         events: Default::default(),
     }
@@ -231,7 +231,9 @@ fn resource_id_unique_enforced() {
         outputs: vec![OutputDescriptor {
             id: "value".into(),
             label: LocalizedText::new("v"),
-            data_type: DataType::Bool,
+            type_spec: OutputTypeSpec::Fixed {
+                data_type: DataType::Bool,
+            },
             unit: None,
             access: AccessMode::Read,
         }],
@@ -246,7 +248,9 @@ fn output_id_unique_enforced() {
     d.resources[0].outputs.push(OutputDescriptor {
         id: "value".into(),
         label: LocalizedText::new("dup"),
-        data_type: DataType::Bool,
+        type_spec: OutputTypeSpec::Fixed {
+            data_type: DataType::Bool,
+        },
         unit: None,
         access: AccessMode::Read,
     });
@@ -334,8 +338,15 @@ fn opcua_descriptor_is_valid() {
     d.validate().expect("opcua descriptor must be valid");
     assert_eq!(d.identity.driver_id, "opcua");
     assert!(serde_json::to_string(&d).unwrap().len() < 256 * 1024);
-    assert!(d.capabilities.browse, "opcua must support browse");
-    assert!(d.discovery.browse);
+    // Browse 是 resource_selection_methods 的唯一真值（capabilities 不再重复）
+    assert!(
+        d.resource_selection_methods
+            .contains(&ResourceSelectionMethod::Browse)
+    );
+    assert!(
+        d.resource_selection_methods
+            .contains(&ResourceSelectionMethod::Manual)
+    );
 }
 
 #[test]
@@ -361,6 +372,187 @@ fn descriptor_json_roundtrip_stable() {
     let b: DriverDescriptor = serde_json::from_str(&a).unwrap();
     let c = serde_json::to_string(&b).unwrap();
     assert_eq!(a, c);
+}
+
+fn from_parameter_resource(
+    options: Vec<&str>,
+    mapping: Vec<(&str, DataType)>,
+) -> ResourceDescriptor {
+    let mut f = FieldDescriptor::new("data_type", "Data Type", FieldType::Enum).required(true);
+    f.validation.enum_options = Some(options.into_iter().map(|s| s.to_string()).collect());
+    ResourceDescriptor {
+        id: "memory".into(),
+        label: LocalizedText::new("Memory"),
+        parameters: SchemaDescriptor::new(vec![f]),
+        outputs: vec![OutputDescriptor {
+            id: "value".into(),
+            label: LocalizedText::new("Value"),
+            type_spec: OutputTypeSpec::FromParameter {
+                parameter: "data_type".into(),
+                mapping: mapping
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+            },
+            unit: None,
+            access: AccessMode::Read,
+        }],
+        modes: vec![],
+    }
+}
+
+#[test]
+fn output_type_spec_from_parameter_validates_and_resolves() {
+    let r = from_parameter_resource(
+        vec!["REAL", "BOOL"],
+        vec![("REAL", DataType::F32), ("BOOL", DataType::Bool)],
+    );
+    r.validate().expect("mapping 全覆盖必须通过");
+    let out = &r.outputs[0];
+    let params = |v: &str| {
+        [("data_type".to_string(), serde_json::json!(v))]
+            .into_iter()
+            .collect::<serde_json::Map<String, serde_json::Value>>()
+    };
+    assert_eq!(out.type_spec.resolve(&params("REAL")), Some(DataType::F32));
+    assert_eq!(out.type_spec.resolve(&params("BOOL")), Some(DataType::Bool));
+    // 未知键 → None（Driver 在 Configure 时拒绝，不得静默定类型）
+    assert_eq!(out.type_spec.resolve(&params("NOPE")), None);
+}
+
+#[test]
+fn output_type_spec_mapping_missing_option_rejected() {
+    // mapping 漏掉 BOOL → 定义期拒绝
+    let r = from_parameter_resource(vec!["REAL", "BOOL"], vec![("REAL", DataType::F32)]);
+    assert!(r.validate().is_err());
+}
+
+#[test]
+fn output_type_spec_mapping_extra_key_rejected() {
+    // mapping 多出 NOPE → 定义期拒绝
+    let r = from_parameter_resource(
+        vec!["REAL"],
+        vec![("REAL", DataType::F32), ("NOPE", DataType::Bool)],
+    );
+    assert!(r.validate().is_err());
+}
+
+#[test]
+fn output_type_spec_parameter_must_exist_and_be_enum() {
+    // 引用不存在的参数 → 拒绝
+    let mut r = from_parameter_resource(vec!["REAL"], vec![("REAL", DataType::F32)]);
+    if let OutputTypeSpec::FromParameter { parameter, .. } = &mut r.outputs[0].type_spec {
+        *parameter = "nope".into();
+    }
+    assert!(r.validate().is_err());
+    // 参数非 Enum → 拒绝
+    let mut r2 = from_parameter_resource(vec!["REAL"], vec![("REAL", DataType::F32)]);
+    r2.parameters.fields[0].field_type = FieldType::String;
+    assert!(r2.validate().is_err());
+}
+
+#[test]
+fn s7_and_opcua_descriptors_declare_from_parameter() {
+    // S7 memory.value ← data_type（9 选项全覆盖）
+    let s7 = mesa_driver_s7::S7Driver.descriptor();
+    let mem = s7.resources.iter().find(|r| r.id == "memory").unwrap();
+    match &mem.outputs[0].type_spec {
+        OutputTypeSpec::FromParameter { parameter, mapping } => {
+            assert_eq!(parameter, "data_type");
+            assert_eq!(mapping.len(), 9);
+            assert_eq!(mapping["REAL"], DataType::F32);
+            assert_eq!(mapping["BOOL"], DataType::Bool);
+            assert_eq!(mapping["DINT"], DataType::I32);
+            assert_eq!(mapping["STRING"], DataType::String);
+        }
+        other => panic!("s7 memory.value 必须为 FromParameter，实际 {other:?}"),
+    }
+    // OPC UA node.value ← data_type（6 选项全覆盖）
+    let opc = mesa_driver_opcua::OpcUaDriver.descriptor();
+    let node = opc.resources.iter().find(|r| r.id == "node").unwrap();
+    match &node.outputs[0].type_spec {
+        OutputTypeSpec::FromParameter { parameter, mapping } => {
+            assert_eq!(parameter, "data_type");
+            assert_eq!(mapping.len(), 6);
+            assert_eq!(mapping["DOUBLE"], DataType::F64);
+            assert_eq!(mapping["BOOL"], DataType::Bool);
+        }
+        other => panic!("opcua node.value 必须为 FromParameter，实际 {other:?}"),
+    }
+    // NCK catalog 变量 → DriverResolved
+    let nck = mesa_driver_sinumerik_nck::SinumerikNckDriver.descriptor();
+    let var = nck.resources.iter().find(|r| r.id == "variable").unwrap();
+    assert_eq!(var.outputs[0].type_spec, OutputTypeSpec::DriverResolved);
+}
+
+#[test]
+fn resource_selection_methods_replaces_discovery_bools() {
+    // methods 为唯一真值；序列化为 snake_case 字符串数组（可扩展枚举）
+    let d = mesa_driver_opcua::OpcUaDriver.descriptor();
+    let json = serde_json::to_value(&d.resource_selection_methods).unwrap();
+    assert_eq!(json, serde_json::json!(["manual", "browse"]));
+    let back: Vec<ResourceSelectionMethod> = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        back,
+        vec![
+            ResourceSelectionMethod::Manual,
+            ResourceSelectionMethod::Browse
+        ]
+    );
+}
+
+#[test]
+fn validate_instance_covers_required_type_enum_range_pattern_unknown() {
+    let schema = SchemaDescriptor::new(vec![
+        FieldDescriptor::new("host", "Host", FieldType::Host).required(true),
+        {
+            let mut f = FieldDescriptor::new("port", "Port", FieldType::Port).required(false);
+            f.validation.min = Some(1.0);
+            f.validation.max = Some(65535.0);
+            f
+        },
+        {
+            let mut f = FieldDescriptor::new("mode", "Mode", FieldType::Enum).required(false);
+            f.validation.enum_options = Some(vec!["a".into(), "b".into()]);
+            f
+        },
+        {
+            let mut f = FieldDescriptor::new("code", "Code", FieldType::String).required(false);
+            f.validation.pattern = Some("^[A-Z]{2}[0-9]+$".into());
+            f
+        },
+    ]);
+    // 全合法 → 空 issues
+    let ok = serde_json::json!({"host":"h","port":102,"mode":"a","code":"AB12"});
+    assert!(schema.validate_instance("connection", &ok).is_empty());
+    // 缺 required
+    let issues = schema.validate_instance("connection", &serde_json::json!({}));
+    assert!(
+        issues
+            .iter()
+            .any(|i| i.code == "REQUIRED" && i.path == "connection.host")
+    );
+    // 类型错
+    let issues = schema.validate_instance("connection", &serde_json::json!({"host":1}));
+    assert!(issues.iter().any(|i| i.code == "INVALID_TYPE"));
+    // 枚举错
+    let issues =
+        schema.validate_instance("connection", &serde_json::json!({"host":"h","mode":"z"}));
+    assert!(issues.iter().any(|i| i.code == "INVALID_ENUM"));
+    // 越界
+    let issues =
+        schema.validate_instance("connection", &serde_json::json!({"host":"h","port":99999}));
+    assert!(issues.iter().any(|i| i.code == "OUT_OF_RANGE"));
+    // 真 regex（旧伪实现 s.contains 会放过 "ab12"）
+    let issues =
+        schema.validate_instance("connection", &serde_json::json!({"host":"h","code":"ab12"}));
+    assert!(issues.iter().any(|i| i.code == "PATTERN_MISMATCH"));
+    // 未知字段
+    let issues = schema.validate_instance("connection", &serde_json::json!({"host":"h","typo":1}));
+    assert!(issues.iter().any(|i| i.code == "UNKNOWN_FIELD"));
+    // 非对象
+    let issues = schema.validate_instance("connection", &serde_json::json!(42));
+    assert!(issues.iter().any(|i| i.code == "INVALID_TYPE"));
 }
 
 #[tokio::test]

@@ -39,9 +39,9 @@ export function ResourcePicker({ resources, onAdd }: { resources: ResourceDescri
                   else setOutputs(outputs.filter((x) => x.output !== o.id));
                 }} />
                 <span style={{ flex: 1 }}>
-                  <span className="label">{o.label["zh-CN"] ?? o.label.default}</span> <span className="kbd mono">{o.id}</span> <span className="help">[{o.data_type}{o.unit ? ` · ${o.unit}` : ""} · {o.access}]</span>
+                  <span className="label">{o.label["zh-CN"] ?? o.label.default}</span> <span className="kbd mono">{o.id}</span> <span className="help">[{o.type_spec.kind === "fixed" ? o.type_spec.data_type : o.type_spec.kind}{o.unit ? ` · ${o.unit}` : ""} · {o.access}]</span>
                 </span>
-                <span className="badge">{o.data_type}</span>
+                <span className="badge">{o.type_spec.kind === "fixed" ? o.type_spec.data_type : o.type_spec.kind}</span>
               </label>
             );
           })}

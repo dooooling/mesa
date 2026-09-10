@@ -325,7 +325,7 @@ impl EventCatalog {
             if !seen.insert(&s.id) {
                 return Err(format!("event stream id 重复: {}", s.id));
             }
-            s.parameters.validate()?;
+            s.parameters.validate_definition()?;
             // PR8 P0-3 安全边界：EventTask 参数明文持久化于 ConfigStore
             //（`binding_config_json`），不允许 Secret 类型字段；连接认证
             // Secret 只能走 `DriverDescriptor.connection` + SecretStore。

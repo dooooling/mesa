@@ -74,10 +74,10 @@ impl Driver for SimulatorDriver {
 
     fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
         use mesa_core_types::{
-            AccessMode, DataType, DiscoveryCapabilities, DriverCapabilities, DriverDescriptor,
-            DriverIdentity, EventCatalog, EventFieldDescriptor, EventStreamDescriptor,
-            FieldDescriptor, FieldType, LocalizedText, OutputDescriptor, ResourceDescriptor,
-            SchemaDescriptor, TaskMode,
+            AccessMode, DataType, DriverCapabilities, DriverDescriptor, DriverIdentity,
+            EventCatalog, EventFieldDescriptor, EventStreamDescriptor, FieldDescriptor, FieldType,
+            LocalizedText, OutputDescriptor, OutputTypeSpec, ResourceDescriptor,
+            ResourceSelectionMethod, SchemaDescriptor, TaskMode,
         };
         let m = self.metadata();
         DriverDescriptor {
@@ -103,7 +103,9 @@ impl Driver for SimulatorDriver {
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Value"),
-                        data_type: DataType::F64,
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::F64,
+                        },
                         unit: None,
                         access: AccessMode::Read,
                     }],
@@ -125,7 +127,9 @@ impl Driver for SimulatorDriver {
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Value"),
-                        data_type: DataType::F64,
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::F64,
+                        },
                         unit: None,
                         access: AccessMode::Read,
                     }],
@@ -138,7 +142,9 @@ impl Driver for SimulatorDriver {
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Value"),
-                        data_type: DataType::F64,
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::F64,
+                        },
                         unit: None,
                         access: AccessMode::Read,
                     }],
@@ -156,7 +162,9 @@ impl Driver for SimulatorDriver {
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Value"),
-                        data_type: DataType::F64,
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::F64,
+                        },
                         unit: None,
                         access: AccessMode::Read,
                     }],
@@ -164,11 +172,7 @@ impl Driver for SimulatorDriver {
                 },
             ],
             controls: mesa_core_types::ControlCatalog::default(),
-            discovery: DiscoveryCapabilities {
-                manual: true,
-                browse: false,
-                import: false,
-            },
+            resource_selection_methods: vec![ResourceSelectionMethod::Manual],
             capabilities: DriverCapabilities {
                 poll: true,
                 events: true,

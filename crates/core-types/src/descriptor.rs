@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::capability::{ControlCatalog, DiscoveryCapabilities, DriverCapabilities};
+use crate::capability::{ControlCatalog, DriverCapabilities, ResourceSelectionMethod};
 use crate::resource::ResourceDescriptor;
 use crate::schema::SchemaDescriptor;
 
@@ -26,8 +26,9 @@ pub struct DriverDescriptor {
     pub resources: Vec<ResourceDescriptor>,
     #[serde(default)]
     pub controls: ControlCatalog,
+    /// 资源配置方式（§20.1）：唯一真值，可扩展枚举。
     #[serde(default)]
-    pub discovery: DiscoveryCapabilities,
+    pub resource_selection_methods: Vec<ResourceSelectionMethod>,
     #[serde(default)]
     pub capabilities: DriverCapabilities,
     /// 事件目录（Event Plane §5）：serde(default) 保证老 Driver 无该字段时
@@ -42,7 +43,7 @@ impl DriverDescriptor {
         if self.identity.driver_id.trim().is_empty() {
             return Err("identity.driver_id 不能为空".into());
         }
-        self.connection.validate()?;
+        self.connection.validate_definition()?;
         // resources 唯一
         {
             use std::collections::HashSet;

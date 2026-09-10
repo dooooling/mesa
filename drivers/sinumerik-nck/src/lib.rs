@@ -63,9 +63,9 @@ impl Driver for SinumerikNckDriver {
 
     fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
         use mesa_core_types::{
-            AccessMode, DataType, DiscoveryCapabilities, DriverCapabilities, DriverDescriptor,
-            DriverIdentity, FieldDescriptor, FieldType, LocalizedText, OutputDescriptor,
-            ResourceDescriptor, SchemaDescriptor,
+            AccessMode, DriverCapabilities, DriverDescriptor, DriverIdentity, FieldDescriptor,
+            FieldType, LocalizedText, OutputDescriptor, OutputTypeSpec, ResourceDescriptor,
+            ResourceSelectionMethod, SchemaDescriptor,
         };
         let m = self.metadata();
         DriverDescriptor {
@@ -157,24 +157,22 @@ impl Driver for SinumerikNckDriver {
                 outputs: vec![OutputDescriptor {
                     id: "value".into(),
                     label: LocalizedText::new("Value"),
-                    data_type: DataType::F64,
+                    // 类型来自 catalog 条目，只能 Configure 时确定。
+                    type_spec: OutputTypeSpec::DriverResolved,
                     unit: None,
                     access: AccessMode::Read,
                 }],
                 modes: vec![mesa_core_types::TaskMode::Poll],
             }],
             controls: mesa_core_types::ControlCatalog::default(),
-            discovery: DiscoveryCapabilities {
-                manual: true,
-                // Commit E：Catalog 虚拟树就位（空 catalog 即空根，不伪造内容）。
-                browse: true,
-                import: false,
-            },
+            resource_selection_methods: vec![
+                ResourceSelectionMethod::Manual,
+                ResourceSelectionMethod::Browse,
+            ],
             capabilities: DriverCapabilities {
                 poll: true,
                 // 不伪造 Subscribe（ReadVar 本质是请求/响应）。
                 subscribe: false,
-                browse: true,
                 ..Default::default()
             },
             // Event Plane：NCK V1 无事件目录即 empty（Major 不升级）。
@@ -726,8 +724,11 @@ mod tests {
         assert_eq!(d.identity.driver_id, "sinumerik-nck");
         assert!(d.capabilities.poll, "NCK V1 必须 poll");
         assert!(!d.capabilities.subscribe, "NCK 不伪造 subscribe");
-        assert!(d.capabilities.browse, "NCK browse（Catalog 树）已就位");
-        assert!(d.discovery.browse, "discovery browse 已就位");
+        // Browse 是 resource_selection_methods 的唯一真值
+        assert!(
+            d.resource_selection_methods
+                .contains(&mesa_core_types::ResourceSelectionMethod::Browse)
+        );
         // P1-3：连接 family 显式必填（选项与 catalog 系列文件对应）。
         let conn_keys: Vec<_> = d.connection.fields.iter().map(|f| f.key.as_str()).collect();
         assert!(conn_keys.contains(&"family"), "缺 family");

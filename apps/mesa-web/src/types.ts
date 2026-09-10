@@ -48,10 +48,17 @@ export interface LocalizedText {
   "zh-CN"?: string;
 }
 
+export interface OutputTypeSpec {
+  kind: "fixed" | "from_parameter" | "driver_resolved";
+  data_type?: string;
+  parameter?: string;
+  mapping?: Record<string, string>;
+}
+
 export interface OutputDescriptor {
   id: string;
   label: LocalizedText;
-  data_type: string;
+  type_spec: OutputTypeSpec;
   unit?: string;
   access: "read" | "write" | "readwrite";
 }
@@ -71,8 +78,8 @@ export interface DriverDescriptor {
   connection: SchemaDescriptor;
   resources: ResourceDescriptor[];
   controls: { commands: unknown[] };
-  discovery: { manual: boolean; browse: boolean; import: boolean };
-  capabilities: { poll: boolean; subscribe: boolean; browse: boolean; write: boolean; method: boolean; events?: boolean };
+  resource_selection_methods: Array<"manual" | "browse" | "import">;
+  capabilities: { poll: boolean; subscribe: boolean; write: boolean; method: boolean; events?: boolean };
   // Event Plane V1 §5：老 Driver 可能缺省该字段，Web 按空目录处理（与 Rust serde(default) 对齐）
   events?: EventCatalog;
 }

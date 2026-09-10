@@ -51,9 +51,9 @@ impl Driver for S7Driver {
 
     fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
         use mesa_core_types::{
-            AccessMode, DataType, DiscoveryCapabilities, DriverCapabilities, DriverDescriptor,
-            DriverIdentity, FieldDescriptor, FieldType, LocalizedText, OutputDescriptor,
-            ResourceDescriptor, SchemaDescriptor,
+            AccessMode, DataType, DriverCapabilities, DriverDescriptor, DriverIdentity,
+            FieldDescriptor, FieldType, LocalizedText, OutputDescriptor, OutputTypeSpec,
+            ResourceDescriptor, ResourceSelectionMethod, SchemaDescriptor,
         };
         let m = self.metadata();
         DriverDescriptor {
@@ -136,18 +136,33 @@ impl Driver for S7Driver {
                 outputs: vec![OutputDescriptor {
                     id: "value".into(),
                     label: LocalizedText::new("Value"),
-                    data_type: DataType::F64,
+                    // NOTE(PR3 对齐项)：类型随 data_type 参数（codec.parse_data_type
+                    // 口径转写；Descriptor 参数面为 area/db/offset 形态，parser 另
+                    // 接受 address 字符串形态，两形态对齐在 PR3 审计）。
+                    type_spec: OutputTypeSpec::FromParameter {
+                        parameter: "data_type".into(),
+                        mapping: [
+                            ("BOOL", DataType::Bool),
+                            ("BYTE", DataType::U32),
+                            ("WORD", DataType::U32),
+                            ("DWORD", DataType::U32),
+                            ("INT", DataType::I32),
+                            ("DINT", DataType::I32),
+                            ("REAL", DataType::F32),
+                            ("CHAR", DataType::U32),
+                            ("STRING", DataType::String),
+                        ]
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
+                    },
                     unit: None,
                     access: AccessMode::Read,
                 }],
                 modes: vec![mesa_core_types::TaskMode::Poll],
             }],
             controls: mesa_core_types::ControlCatalog::default(),
-            discovery: DiscoveryCapabilities {
-                manual: true,
-                browse: false,
-                import: false,
-            },
+            resource_selection_methods: vec![ResourceSelectionMethod::Manual],
             capabilities: DriverCapabilities {
                 poll: true,
                 ..Default::default()

@@ -56,9 +56,9 @@ impl Driver for FocasDriver {
 
     fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
         use mesa_core_types::{
-            AccessMode, DataType, DiscoveryCapabilities, DriverCapabilities, DriverDescriptor,
-            DriverIdentity, FieldDescriptor, FieldType, LocalizedText, OutputDescriptor,
-            ResourceDescriptor, SchemaDescriptor,
+            AccessMode, DataType, DriverCapabilities, DriverDescriptor, DriverIdentity,
+            FieldDescriptor, FieldType, LocalizedText, OutputDescriptor, OutputTypeSpec,
+            ResourceDescriptor, ResourceSelectionMethod, SchemaDescriptor,
         };
         let m = self.metadata();
         DriverDescriptor {
@@ -97,28 +97,36 @@ impl Driver for FocasDriver {
                         OutputDescriptor {
                             id: "feed".into(),
                             label: LocalizedText::new("Feed"),
-                            data_type: DataType::U32,
+                            type_spec: OutputTypeSpec::Fixed {
+                                data_type: DataType::U32,
+                            },
                             unit: Some("mm/min".into()),
                             access: AccessMode::Read,
                         },
                         OutputDescriptor {
                             id: "spindle.speed".into(),
                             label: LocalizedText::new("Spindle Speed"),
-                            data_type: DataType::U32,
+                            type_spec: OutputTypeSpec::Fixed {
+                                data_type: DataType::U32,
+                            },
                             unit: Some("rpm".into()),
                             access: AccessMode::Read,
                         },
                         OutputDescriptor {
                             id: "program.current".into(),
                             label: LocalizedText::new("Current Program"),
-                            data_type: DataType::String,
+                            type_spec: OutputTypeSpec::Fixed {
+                                data_type: DataType::String,
+                            },
                             unit: None,
                             access: AccessMode::Read,
                         },
                         OutputDescriptor {
                             id: "position.absolute".into(),
                             label: LocalizedText::new("Absolute Position"),
-                            data_type: DataType::I32,
+                            type_spec: OutputTypeSpec::Fixed {
+                                data_type: DataType::I32,
+                            },
                             unit: Some("pulse".into()),
                             access: AccessMode::Read,
                         },
@@ -132,7 +140,9 @@ impl Driver for FocasDriver {
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Status"),
-                        data_type: DataType::U32,
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::U32,
+                        },
                         unit: None,
                         access: AccessMode::Read,
                     }],
@@ -149,7 +159,9 @@ impl Driver for FocasDriver {
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Position"),
-                        data_type: DataType::I32,
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::I32,
+                        },
                         unit: None,
                         access: AccessMode::Read,
                     }],
@@ -167,7 +179,9 @@ impl Driver for FocasDriver {
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Load"),
-                        data_type: DataType::U32,
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::U32,
+                        },
                         unit: None,
                         access: AccessMode::Read,
                     }],
@@ -203,7 +217,9 @@ impl Driver for FocasDriver {
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Value"),
-                        data_type: DataType::I32,
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::I32,
+                        },
                         unit: None,
                         access: AccessMode::Read,
                     }],
@@ -221,7 +237,9 @@ impl Driver for FocasDriver {
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Value"),
-                        data_type: DataType::F64,
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::F64,
+                        },
                         unit: None,
                         access: AccessMode::Read,
                     }],
@@ -234,7 +252,9 @@ impl Driver for FocasDriver {
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Alarm"),
-                        data_type: DataType::String,
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::String,
+                        },
                         unit: None,
                         access: AccessMode::Read,
                     }],
@@ -247,7 +267,9 @@ impl Driver for FocasDriver {
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Program"),
-                        data_type: DataType::String,
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::String,
+                        },
                         unit: None,
                         access: AccessMode::Read,
                     }],
@@ -267,11 +289,7 @@ impl Driver for FocasDriver {
                     idempotent: true,
                 }],
             },
-            discovery: DiscoveryCapabilities {
-                manual: true,
-                browse: false,
-                import: false,
-            },
+            resource_selection_methods: vec![ResourceSelectionMethod::Manual],
             capabilities: DriverCapabilities {
                 poll: true,
                 ..Default::default()

@@ -190,112 +190,6 @@ fn json_error(code: &str, message: &str) -> serde_json::Value {
     serde_json::json!({ "error": { "code": code, "message": message } })
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ValidationIssue {
-    pub path: String,
-    pub code: String,
-    pub message: String,
-}
-
-fn validate_connection_against_schema(
-    schema: &mesa_core_types::SchemaDescriptor,
-    conn: &serde_json::Value,
-) -> Vec<ValidationIssue> {
-    let mut issues = Vec::new();
-    if !conn.is_object() {
-        issues.push(ValidationIssue {
-            path: "connection".into(),
-            code: "INVALID_TYPE".into(),
-            message: "connection must be an object".into(),
-        });
-        return issues;
-    }
-    let obj = conn.as_object().unwrap();
-    for field in &schema.fields {
-        let present = obj.contains_key(&field.key);
-        if field.required && !present {
-            issues.push(ValidationIssue {
-                path: format!("connection.{}", field.key),
-                code: "REQUIRED".into(),
-                message: format!("field `{}` is required", field.key),
-            });
-            continue;
-        }
-        if let Some(val) = obj.get(&field.key) {
-            // 类型校验
-            let type_ok = match field.field_type {
-                mesa_core_types::FieldType::String
-                | mesa_core_types::FieldType::Host
-                | mesa_core_types::FieldType::Url
-                | mesa_core_types::FieldType::File
-                | mesa_core_types::FieldType::CertificateRef
-                | mesa_core_types::FieldType::Secret => val.is_string(),
-                mesa_core_types::FieldType::Integer | mesa_core_types::FieldType::Port => {
-                    val.is_number() && val.as_i64().is_some()
-                }
-                mesa_core_types::FieldType::Number | mesa_core_types::FieldType::Duration => {
-                    val.is_number()
-                }
-                mesa_core_types::FieldType::Boolean => val.is_boolean(),
-                mesa_core_types::FieldType::Enum => val.is_string(),
-            };
-            if !type_ok {
-                issues.push(ValidationIssue {
-                    path: format!("connection.{}", field.key),
-                    code: "INVALID_TYPE".into(),
-                    message: format!(
-                        "field `{}` expected {:?}, got {}",
-                        field.key, field.field_type, val
-                    ),
-                });
-                continue;
-            }
-            // 枚举选项
-            if let Some(opts) = &field.validation.enum_options {
-                if let Some(s) = val.as_str() {
-                    if !opts.contains(&s.to_string()) {
-                        issues.push(ValidationIssue {
-                            path: format!("connection.{}", field.key),
-                            code: "INVALID_ENUM".into(),
-                            message: format!("field `{}` value `{s}` not in {:?}", field.key, opts),
-                        });
-                    }
-                }
-            }
-            // 范围
-            if let Some(num) = val.as_f64() {
-                if let Some(min) = field.validation.min {
-                    if num < min {
-                        issues.push(ValidationIssue {
-                            path: format!("connection.{}", field.key),
-                            code: "OUT_OF_RANGE".into(),
-                            message: format!("field `{}` {num} < min {min}", field.key),
-                        });
-                    }
-                }
-                if let Some(max) = field.validation.max {
-                    if num > max {
-                        issues.push(ValidationIssue {
-                            path: format!("connection.{}", field.key),
-                            code: "OUT_OF_RANGE".into(),
-                            message: format!("field `{}` {num} > max {max}", field.key),
-                        });
-                    }
-                }
-            }
-            // 正则（如配置则简单包含校验，生产可引入 regex）
-            if let Some(pat) = &field.validation.pattern {
-                if let Some(s) = val.as_str() {
-                    if !s.contains(pat) && pat != ".*" {
-                        // 占位：仅当模式非通配时做简单检查
-                    }
-                }
-            }
-        }
-    }
-    issues
-}
-
 // ---------------------------------------------------------------------------
 // Secret 集成：Descriptor 驱动的 Secret 处理（P0-1）
 // ---------------------------------------------------------------------------
@@ -505,7 +399,9 @@ async fn validate_connection(
     } else {
         body.clone()
     };
-    let issues = validate_connection_against_schema(&desc.connection, &conn_val);
+    // 统一 Schema Validator（Core 唯一实现）：required/类型/enum/min/max/
+    // pattern（真 regex）/未知字段，一次返回全部问题。
+    let issues = desc.connection.validate_instance("connection", &conn_val);
     if issues.is_empty() {
         // 额外尝试 Driver 侧解析（不触设备，仅本地校验）
         // 通过尝试 open_connection 的配置解析路径：当前仅做 JSON 对象校验，已足够

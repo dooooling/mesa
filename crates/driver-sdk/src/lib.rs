@@ -115,10 +115,7 @@ pub trait Driver: Send + Sync + 'static {
             connection: mesa_core_types::SchemaDescriptor::default(),
             resources: vec![],
             controls: mesa_core_types::ControlCatalog::default(),
-            discovery: mesa_core_types::DiscoveryCapabilities {
-                manual: true,
-                ..Default::default()
-            },
+            resource_selection_methods: vec![mesa_core_types::ResourceSelectionMethod::Manual],
             capabilities: mesa_core_types::DriverCapabilities::default(),
             // 老 Driver 无事件目录即 empty（Event §5 向后兼容，Major 不升级）
             events: Default::default(),

@@ -7,10 +7,10 @@ export const handlers = [
       contract_minor: 0,
       identity: { driver_id: params.id, name: `Mock ${params.id}`, version: "0.0.0" },
       connection: { fields: [{ key: "host", label: { zh: "主机" }, field_type: "Host", required: true }] },
-      resources: [{ id: "counter", label: { zh: "计数器" }, parameters: { fields: [] }, outputs: [{ id: "value", label: { zh: "值" }, data_type: "F64" }], modes: ["poll"] }],
+      resources: [{ id: "counter", label: { zh: "计数器" }, parameters: { fields: [] }, outputs: [{ id: "value", label: { zh: "值" }, type_spec: { kind: "fixed", data_type: "F64" } }], modes: ["poll"] }],
       events: { streams: [] },
       controls: { commands: [{ id: "reset", label: { zh: "复位" }, risk: "low" }] },
-      discovery: { manual: true }, capabilities: { poll: true, events: false }
+      resource_selection_methods: ["manual"], capabilities: { poll: true, events: false }
     })
   ),
   http.post("/api/v1/drivers/:id/validate-connection", async () =>

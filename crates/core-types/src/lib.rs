@@ -12,7 +12,7 @@ pub mod probe;
 pub mod resource;
 pub mod schema;
 
-pub use capability::{ControlCatalog, DiscoveryCapabilities, DriverCapabilities};
+pub use capability::{ControlCatalog, DriverCapabilities, ResourceSelectionMethod};
 pub use descriptor::{DriverDescriptor, DriverIdentity};
 pub use event::{
     ConditionTransition, EVENT_ATTRIBUTES_MAX_FIELDS, EVENT_BATCH_MAX_BYTES,
@@ -26,12 +26,12 @@ pub use probe::{
     check_report_size,
 };
 pub use resource::{
-    AccessMode, GENERIC_BINDING_KIND, GenericBinding, OutputDescriptor, ResourceDescriptor,
-    ResourceSelection, SelectedOutput, validate_selections_structure,
+    AccessMode, GENERIC_BINDING_KIND, GenericBinding, OutputDescriptor, OutputTypeSpec,
+    ResourceDescriptor, ResourceSelection, SelectedOutput, validate_selections_structure,
 };
 pub use schema::{
     Condition, ConditionOp, FieldDescriptor, FieldType, FieldValidation, LocalizedText,
-    SchemaDescriptor, UiHints,
+    SchemaDescriptor, UiHints, ValidationIssue,
 };
 
 use serde::{Deserialize, Serialize};
