@@ -113,7 +113,7 @@ async fn probe_does_not_create_endpoint() {
     );
 }
 
-/// §8 REST 冻结形状：device/capabilities/profile_hints/warnings。
+/// §8 REST 冻结形状：device/capabilities/warnings（Probe 只返回事实）。
 #[tokio::test]
 async fn probe_simulator_returns_frozen_shape() {
     let (app, _) = app().await;
@@ -139,11 +139,7 @@ async fn probe_simulator_returns_frozen_shape() {
     assert_eq!(state_of("subscribe").as_deref(), Some("not_present"));
     assert_eq!(state_of("browse").as_deref(), Some("not_present"));
     assert!(v["warnings"].as_array().unwrap().is_empty());
-    let hints = v["profile_hints"].as_array().unwrap();
-    assert!(
-        hints.iter().any(|h| h["profile_id"] == "simulator-basic"),
-        "hints 必须含 simulator-basic，实际: {hints:?}"
-    );
+    assert!(v.get("profile_hints").is_none(), "profile_hints 已删除");
 }
 
 #[tokio::test]
@@ -220,13 +216,8 @@ async fn probe_s7_closed_port_is_unreachable_200() {
     .await;
     assert_eq!(status, StatusCode::OK, "probe body: {v}");
     assert_eq!(v["reachable"], false, "probe body: {v}");
-    // P1-B：没探测到 ≠ 猜型号——unreachable 时 hints 必须为空，
-    // 禁止仅凭 driver_id 断言具体硬件型号（s7-1200/1214C）。
-    let hints = v["profile_hints"].as_array().unwrap();
-    assert!(
-        hints.is_empty(),
-        "unreachable 不得提示具体型号，实际: {hints:?}"
-    );
+    // 没探测到 ≠ 猜型号：profile_hints 字段已删除，不做任何型号推断。
+    assert!(v.get("profile_hints").is_none(), "profile_hints 已删除");
     let warnings = v["warnings"].as_array().unwrap();
     assert_eq!(warnings.len(), 1);
     assert_eq!(warnings[0]["code"], "CONNECTION_FAILED");

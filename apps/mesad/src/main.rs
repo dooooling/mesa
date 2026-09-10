@@ -288,7 +288,6 @@ fn maybe_seed_demo(store: &ConfigStore) -> Result<bool, String> {
     let dev = DeviceRecord {
         id: "sim-device".into(),
         name: "Simulator Device".into(),
-        profile: None,
     };
     let _ = store.create_device(&dev);
     let rec = EndpointRecord {

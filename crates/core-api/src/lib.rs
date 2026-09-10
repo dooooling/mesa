@@ -448,27 +448,6 @@ async fn get_driver(
     }
 }
 
-async fn list_profiles(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "profiles": state.manager.list_profiles() }))
-}
-
-async fn get_profile(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    if let Some(p) = state.manager.get_profile(&id) {
-        (StatusCode::OK, Json(serde_json::to_value(p).unwrap()))
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json_error(
-                "NOT_FOUND",
-                &format!("profile `{id}` not found"),
-            )),
-        )
-    }
-}
-
 async fn get_driver_descriptor(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -581,11 +560,6 @@ async fn probe_driver(
                     },
                     "model_confidence": r.model_confidence,
                     "capabilities": r.capabilities,
-                    "profile_hints": res
-                        .profile_hints
-                        .iter()
-                        .map(|h| serde_json::json!({ "profile_id": h.profile_id }))
-                        .collect::<Vec<_>>(),
                     "warnings": r.warnings,
                 })),
             )
@@ -1209,13 +1183,11 @@ async fn diagnostics(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
 struct CreateDeviceReq {
     id: String,
     name: String,
-    profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UpdateDeviceReq {
     name: String,
-    profile: Option<String>,
 }
 
 async fn list_devices(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -1249,7 +1221,6 @@ async fn create_device(
     let rec = DeviceRecord {
         id: body.id.clone(),
         name: body.name,
-        profile: body.profile,
     };
     match state.store.create_device(&rec) {
         Ok(()) => (
@@ -1268,7 +1239,6 @@ async fn update_device(
     let rec = DeviceRecord {
         id: id.clone(),
         name: body.name,
-        profile: body.profile,
     };
     match state.store.update_device(&rec) {
         Ok(true) => (StatusCode::OK, Json(serde_json::to_value(&rec).unwrap())),
@@ -2567,8 +2537,6 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(validate_connection),
         )
         .route("/api/v1/drivers/{id}/probe", post(probe_driver))
-        .route("/api/v1/profiles", get(list_profiles))
-        .route("/api/v1/profiles/{id}", get(get_profile))
         .route(
             "/api/v1/endpoints",
             get(list_endpoints).post(create_endpoint),

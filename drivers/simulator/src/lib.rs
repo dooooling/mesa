@@ -1,7 +1,7 @@
 //! Mesa Simulator Driver（方案附录 A）。
 //!
 //! 定位：Driver Framework 的参考实现与 Contract/Performance Test 基线，
-//! 不属于正式设备协议范围。行为配置属于测试配置，不进入生产 DeviceProfile。
+//! 不属于正式设备协议范围。行为配置属于测试配置，不进入生产采集模板。
 //!
 //! 已实现数据源（附录 A.1 子集）：Constant / Counter / Sine / Toggle / Random。
 //! binding 形如：

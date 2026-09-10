@@ -24,13 +24,11 @@ const SCHEMA_VERSION: i64 = 3;
 // 记录类型
 // ---------------------------------------------------------------------------
 
-/// Device 记录（§5.2）。
+/// Device 记录（§5.2）：用户管理的设备/机器/采集对象容器（非严格物理实体）。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceRecord {
     pub id: String,
     pub name: String,
-    /// 关联的 DeviceProfile id，可空（V1 允许先建设备后补 profile）。
-    pub profile: Option<String>,
 }
 
 /// Endpoint 记录（§5.3）。`connection` 的语义由 Driver 解释，Core 只做 JSON 透传。
@@ -308,8 +306,7 @@ impl ConfigStore {
             );
             CREATE TABLE IF NOT EXISTS devices(
                 id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                profile TEXT
+                name TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS endpoints(
                 id TEXT PRIMARY KEY,
@@ -474,8 +471,8 @@ impl ConfigStore {
         }
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "INSERT INTO devices(id,name,profile) VALUES(?1,?2,?3)",
-            params![rec.id, rec.name, rec.profile],
+            "INSERT INTO devices(id,name) VALUES(?1,?2)",
+            params![rec.id, rec.name],
         );
         match n {
             Ok(_) => Ok(()),
@@ -490,12 +487,11 @@ impl ConfigStore {
 
     pub fn list_devices(&self) -> Result<Vec<DeviceRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id,name,profile FROM devices ORDER BY id")?;
+        let mut stmt = conn.prepare("SELECT id,name FROM devices ORDER BY id")?;
         let rows = stmt.query_map([], |r| {
             Ok(DeviceRecord {
                 id: r.get(0)?,
                 name: r.get(1)?,
-                profile: r.get(2)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -504,13 +500,12 @@ impl ConfigStore {
     pub fn get_device(&self, id: &str) -> Result<Option<DeviceRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id,name,profile FROM devices WHERE id=?1",
+            "SELECT id,name FROM devices WHERE id=?1",
             params![id],
             |r| {
                 Ok(DeviceRecord {
                     id: r.get(0)?,
                     name: r.get(1)?,
-                    profile: r.get(2)?,
                 })
             },
         )
@@ -524,8 +519,8 @@ impl ConfigStore {
         }
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "UPDATE devices SET name=?1, profile=?2 WHERE id=?3",
-            params![rec.name, rec.profile, rec.id],
+            "UPDATE devices SET name=?1 WHERE id=?2",
+            params![rec.name, rec.id],
         )?;
         Ok(n > 0)
     }
@@ -1424,7 +1419,6 @@ mod tests {
         DeviceRecord {
             id: id.into(),
             name: format!("{id}-name"),
-            profile: None,
         }
     }
 
