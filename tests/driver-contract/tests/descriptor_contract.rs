@@ -467,15 +467,17 @@ fn s7_and_opcua_descriptors_declare_from_parameter() {
         }
         other => panic!("s7 memory.value 必须为 FromParameter，实际 {other:?}"),
     }
-    // OPC UA node.value ← data_type（6 选项全覆盖）
+    // OPC UA node.value ← data_type（10 选项全覆盖，见 CANONICAL_DATA_TYPES）
     let opc = mesa_driver_opcua::OpcUaDriver.descriptor();
     let node = opc.resources.iter().find(|r| r.id == "node").unwrap();
     match &node.outputs[0].type_spec {
         OutputTypeSpec::FromParameter { parameter, mapping } => {
             assert_eq!(parameter, "data_type");
-            assert_eq!(mapping.len(), 6);
+            assert_eq!(mapping.len(), 10);
             assert_eq!(mapping["DOUBLE"], DataType::F64);
             assert_eq!(mapping["BOOL"], DataType::Bool);
+            assert_eq!(mapping["UINT32"], DataType::U32);
+            assert_eq!(mapping["DATETIME"], DataType::DateTime);
         }
         other => panic!("opcua node.value 必须为 FromParameter，实际 {other:?}"),
     }

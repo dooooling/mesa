@@ -56,6 +56,24 @@ pub const BINDING_POLL: &str = "opcua.node-group";
 pub const BINDING_SUB: &str = "opcua.subscription";
 pub const BINDING_BROWSE: &str = "opcua.browse";
 
+/// OPC UA canonical data_type 公共契约（PR3）：generic `mesa.resources.v1`
+/// 只接受这 10 个精确大写拼写；parser 的大小写 alias（int/real/str/…）
+/// 只属于 legacy binding 兼容。descriptor mapping 与 generic 门禁同源。
+/// NOTE：driver 只读 Value 属性；`attribute` 参数已删除（声明了但零消费
+/// 的死 knob 不进契约，需要读 BrowseName 等属性时另立 feature）。
+pub const CANONICAL_DATA_TYPES: [(&str, DataType); 10] = [
+    ("STRING", DataType::String),
+    ("INT32", DataType::I32),
+    ("UINT32", DataType::U32),
+    ("INT64", DataType::I64),
+    ("UINT64", DataType::U64),
+    ("FLOAT", DataType::F32),
+    ("DOUBLE", DataType::F64),
+    ("BOOL", DataType::Bool),
+    ("BYTES", DataType::Bytes),
+    ("DATETIME", DataType::DateTime),
+];
+
 use opcua_api::OpcUaApi as OpcUaApiTrait;
 
 // ---------------------------------------------------------------------------
@@ -79,7 +97,7 @@ impl Driver for OpcUaDriver {
 
     fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
         use mesa_core_types::{
-            AccessMode, DataType, DriverCapabilities, DriverDescriptor, DriverIdentity,
+            AccessMode, DriverCapabilities, DriverDescriptor, DriverIdentity,
             FieldDescriptor, FieldType, LocalizedText, OutputDescriptor, OutputTypeSpec,
             ResourceDescriptor, ResourceSelectionMethod, SchemaDescriptor,
         };
@@ -142,30 +160,16 @@ impl Driver for OpcUaDriver {
                         FieldDescriptor::new("node_id", "NodeId", FieldType::String).required(true),
                         {
                             let mut f =
-                                FieldDescriptor::new("attribute", "Attribute", FieldType::Enum)
-                                    .required(false)
-                                    .default_value(serde_json::json!("Value"));
-                            f.validation.enum_options = Some(vec![
-                                "Value".into(),
-                                "BrowseName".into(),
-                                "DisplayName".into(),
-                                "DataType".into(),
-                            ]);
-                            f
-                        },
-                        {
-                            let mut f =
                                 FieldDescriptor::new("data_type", "Data Type", FieldType::Enum)
                                     .required(false)
                                     .default_value(serde_json::json!("STRING"));
-                            f.validation.enum_options = Some(vec![
-                                "STRING".into(),
-                                "INT32".into(),
-                                "INT64".into(),
-                                "FLOAT".into(),
-                                "DOUBLE".into(),
-                                "BOOL".into(),
-                            ]);
+                            // 选项与 CANONICAL_DATA_TYPES 同源
+                            f.validation.enum_options = Some(
+                                CANONICAL_DATA_TYPES
+                                    .iter()
+                                    .map(|(k, _)| k.to_string())
+                                    .collect(),
+                            );
                             f
                         },
                     ],
@@ -173,20 +177,13 @@ impl Driver for OpcUaDriver {
                 outputs: vec![OutputDescriptor {
                     id: "value".into(),
                     label: LocalizedText::new("Value"),
-                    // 类型随 data_type 参数（parse_data_type 口径转写）。
+                    // 类型随 data_type 参数（canonical 口径，见 CANONICAL_DATA_TYPES）。
                     type_spec: OutputTypeSpec::FromParameter {
                         parameter: "data_type".into(),
-                        mapping: [
-                            ("STRING", DataType::String),
-                            ("INT32", DataType::I32),
-                            ("INT64", DataType::I64),
-                            ("FLOAT", DataType::F32),
-                            ("DOUBLE", DataType::F64),
-                            ("BOOL", DataType::Bool),
-                        ]
-                        .into_iter()
-                        .map(|(k, v)| (k.to_string(), v))
-                        .collect(),
+                        mapping: CANONICAL_DATA_TYPES
+                            .iter()
+                            .map(|(k, dt)| (k.to_string(), *dt))
+                            .collect(),
                     },
                     unit: None,
                     access: AccessMode::Read,
@@ -827,13 +824,21 @@ impl DriverConnection for OpcUaConnection {
                         ));
                     }
                     for out in &sel.outputs {
+                        // PR3 canonical：只接受 node_id（address 回退已删除）；
+                        // node_id 缺失即 INVALID（descriptor 要求必填）。
                         let node_id = sel
                             .parameters
                             .get("node_id")
-                            .or_else(|| sel.parameters.get("address"))
                             .and_then(|v| v.as_str())
-                            .unwrap_or(&out.output)
+                            .ok_or_else(|| {
+                                SdkDriverError::configuration(
+                                    "INVALID_POINT",
+                                    format!("point `{}` 缺少 node_id", out.point_key),
+                                )
+                            })?
                             .to_string();
+                        // data_type 缺省即 STRING（与 descriptor default 一致）；
+                        // 非 canonical 拼写直接拒绝（alias 只属于 legacy）。
                         let dt_str = sel
                             .parameters
                             .get("data_type")
@@ -853,7 +858,20 @@ impl DriverConnection for OpcUaConnection {
                                 ),
                             ),
                         })?;
-                        let data_type = parse_data_type(dt_str)?;
+                        let data_type = CANONICAL_DATA_TYPES
+                            .iter()
+                            .find(|(k, _)| *k == dt_str)
+                            .map(|(_, dt)| *dt)
+                            .ok_or_else(|| {
+                                SdkDriverError::configuration(
+                                    "INVALID_DATA_TYPE",
+                                    format!(
+                                        "point `{}` data_type `{dt_str}` 非 canonical（仅接受 {:?}）",
+                                        out.point_key,
+                                        CANONICAL_DATA_TYPES.map(|(k, _)| k),
+                                    ),
+                                )
+                            })?;
                         indices.push(new_points.len());
                         new_points.push(PointSpec {
                             key: out.point_key.clone(),
@@ -1197,10 +1215,11 @@ impl DriverConnection for OpcUaConnection {
                 id: node_id.clone(),
                 label: name.clone(),
                 kind: "node".into(),
-                data_type: "String".into(),
+                // browse 发出的类型必须是 canonical（回填 selection 可直接过门禁）
+                data_type: "STRING".into(),
                 access: "read".into(),
                 has_children: true,
-                binding_json: serde_json::json!({"node_id": node_id, "data_type": "String"})
+                binding_json: serde_json::json!({"node_id": node_id, "data_type": "STRING"})
                     .to_string(),
             })
             .collect();
@@ -1583,6 +1602,102 @@ mod tests {
                 kind: BINDING_POLL.into(),
                 config: serde_json::json!({"nodes": nodes}),
             },
+        }
+    }
+
+    fn generic_task(selections: serde_json::Value) -> AcquisitionTask {
+        AcquisitionTask {
+            id: "t1".into(),
+            mode: TaskMode::Poll,
+            interval_ms: Some(100),
+            binding: DriverBinding {
+                kind: GENERIC_BINDING_KIND.into(),
+                config: serde_json::json!({"selections": selections}),
+            },
+        }
+    }
+
+    fn node_selection(point_key: &str, params: serde_json::Value) -> serde_json::Value {
+        serde_json::json!([{
+            "resource_id": "node",
+            "parameters": params,
+            "outputs": [{"output": "value", "point_key": point_key}],
+        }])
+    }
+
+    async fn test_conn() -> Box<dyn DriverConnection> {
+        OpcUaDriver
+            .open_connection("ep1", "{}")
+            .await
+            .expect("open")
+    }
+
+    /// PR3 闭环：10 个 canonical data_type → validate_instance PASS →
+    /// generic configure PASS → PointDescriptor == resolve()。
+    #[tokio::test]
+    async fn generic_canonical_loop_closed_for_all_types() {
+        let d = OpcUaDriver.descriptor();
+        d.validate().expect("descriptor 必须合法");
+        let node = d.resources.iter().find(|r| r.id == "node").unwrap();
+        assert!(
+            node.parameters.fields.iter().all(|f| f.key != "attribute"),
+            "attribute 死参数必须已删除"
+        );
+        for (dt, expected) in CANONICAL_DATA_TYPES {
+            let params = serde_json::json!({
+                "node_id": "nsu=http://example.com/MyModel/;i=2",
+                "data_type": dt,
+            });
+            let issues = node.parameters.validate_instance("parameters", &params);
+            assert!(issues.is_empty(), "{dt}: {issues:?}");
+            let pmap = params.as_object().unwrap().clone();
+            assert_eq!(
+                node.outputs[0].type_spec.resolve(&pmap),
+                Some(expected),
+                "{dt}"
+            );
+            let mut conn = test_conn().await;
+            let descs = conn
+                .configure(1, vec![generic_task(node_selection("k", params))])
+                .await
+                .unwrap();
+            assert_eq!(descs.len(), 1);
+            assert_eq!(descs[0].data_type, expected, "{dt}");
+        }
+    }
+
+    /// generic 拒绝：address 回退、缺 node_id、小写 alias、旧 U32 拼写。
+    #[tokio::test]
+    async fn generic_rejects_non_canonical() {
+        let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+            (
+                "address 回退不接受",
+                serde_json::json!({"address": "nsu=http://example.com/MyModel/;i=2"}),
+                "INVALID_POINT",
+            ),
+            (
+                "缺 node_id",
+                serde_json::json!({"data_type": "STRING"}),
+                "INVALID_POINT",
+            ),
+            (
+                "小写 alias 不接受",
+                serde_json::json!({"node_id": "nsu=http://example.com/MyModel/;i=2", "data_type": "string"}),
+                "INVALID_DATA_TYPE",
+            ),
+            (
+                "旧 U32 拼写不接受（canonical 为 UINT32）",
+                serde_json::json!({"node_id": "nsu=http://example.com/MyModel/;i=2", "data_type": "U32"}),
+                "INVALID_DATA_TYPE",
+            ),
+        ];
+        for (name, params, code) in cases {
+            let mut conn = test_conn().await;
+            let err = conn
+                .configure(1, vec![generic_task(node_selection("k", params))])
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code, "{name}");
         }
     }
 

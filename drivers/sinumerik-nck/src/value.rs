@@ -42,6 +42,18 @@ impl NckDataKind {
         }
     }
 
+    /// Core 数组类型（count>1 时 PointDescriptor 用，与 pack_array 同口径；
+    /// count==1 永不进 array 分支）。
+    pub fn core_array_type(self) -> mesa_core_types::DataType {
+        match self {
+            NckDataKind::F64 => mesa_core_types::DataType::F64Array,
+            NckDataKind::F32 => mesa_core_types::DataType::F32Array,
+            NckDataKind::I32 => mesa_core_types::DataType::I32Array,
+            NckDataKind::U32 => mesa_core_types::DataType::U32Array,
+            NckDataKind::Bool => mesa_core_types::DataType::BoolArray,
+        }
+    }
+
     /// 解析 catalog `data_type`（大小写不敏感；STRING 等暂不支持）。
     pub fn parse(s: &str) -> Result<Self, ValueError> {
         match s.trim().to_ascii_uppercase().as_str() {
