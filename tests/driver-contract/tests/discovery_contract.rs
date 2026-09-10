@@ -47,7 +47,6 @@ async fn app_with_endpoint(
         .create_device(&mesa_config_store::DeviceRecord {
             id: "d1".into(),
             name: "dev".into(),
-            profile: None,
         })
         .unwrap();
     let ep_id = format!("ep-{driver_id}");

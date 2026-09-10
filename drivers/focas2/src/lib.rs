@@ -380,7 +380,7 @@ async fn await_probe_with_api(
             // P0-1 不重复规则：局部原因只在 read.detail，全局后果只在 warning。
             warnings: vec![ProbeWarning {
                 code: "IDENTITY_UNAVAILABLE".into(),
-                message: "设备身份（series/version）未能识别，profile 提示可能缺失".into(),
+                message: "设备身份（series/version）未能识别".into(),
             }],
         },
     };

@@ -1,19 +1,9 @@
 // 直观向导：选驱动 → 连设备 → 设点位 → 看数据（V2.1 无 driverId 分支，一切以 Descriptor 为准）
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { DriverDescriptor } from "../types";
 import { SchemaForm } from "./SchemaForm";
 import { ResourcePicker } from "./ResourcePicker";
-
-interface Profile {
-  id: string;
-  vendor: string;
-  family: string;
-  model: string;
-  driver_id: string;
-  connection_defaults: Record<string, unknown>;
-  presets: { id: string; label: { default: string; "zh-CN"?: string }; selections: unknown[] }[];
-}
 
 // 已知驱动的图标；未知驱动用默认符号（列表本身以后端 discovery 为准，
 // 新驱动如 sinumerik-nck 无需改前端即出现；后端不可用时用下面的兜底卡片）。
@@ -36,8 +26,6 @@ const FALLBACK_DRIVERS = [
 export function DeviceWizard() {
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const [driverId, setDriverId] = useState("");
-  const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [profileId, setProfileId] = useState("");
   const [desc, setDesc] = useState<DriverDescriptor | null>(null);
   const [connection, setConnection] = useState<Record<string, unknown>>({});
   const [issues, setIssues] = useState<{ path: string; message: string }[]>([]);
@@ -48,7 +36,6 @@ export function DeviceWizard() {
   // 驱动卡片以后端 discovery 为准（sub 取后端版本号；后端不可用时用兜底）。
   const [drivers, setDrivers] = useState(FALLBACK_DRIVERS);
 
-  useEffect(() => { api.listProfiles().then((j) => setProfiles(j.profiles ?? [])).catch(() => {}); }, []);
   useEffect(() => {
     api.listDrivers().then((j) => {
       const ds = ((j.drivers ?? []) as Array<{ id: string; name: string; version: string }>)
@@ -60,27 +47,15 @@ export function DeviceWizard() {
     }).catch(() => {});
   }, []);
 
-  const selectedProfile = useMemo(() => profiles.find((p) => p.id === profileId) ?? null, [profiles, profileId]);
-  const driverProfiles = useMemo(() => profiles.filter((p) => p.driver_id === driverId), [profiles, driverId]);
-
-  // 选驱动后拉取 Descriptor 并填入 Profile 默认值
+  // 选驱动后拉取 Descriptor（连接默认值走 SchemaForm 的字段 default）
   useEffect(() => {
     if (!driverId) return;
     api.getDescriptor(driverId).then((d) => {
       setDesc(d);
-      setConnection(selectedProfile?.connection_defaults ?? {});
+      setConnection({});
       setIssues([]); setProbe(null); setValid(null);
     }).catch(() => setDesc(null));
-    // 切换驱动时重置 profile 选择
-    if (selectedProfile && selectedProfile.driver_id !== driverId) setProfileId("");
   }, [driverId]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // 切换 Profile 时带入默认值
-  useEffect(() => {
-    if (selectedProfile && driverId === selectedProfile.driver_id) {
-      setConnection(selectedProfile.connection_defaults ?? {});
-    }
-  }, [selectedProfile, driverId]);
 
   // 轮询最新值
   useEffect(() => {
@@ -164,23 +139,6 @@ export function DeviceWizard() {
               </button>
             ))}
           </div>
-          {driverId && driverProfiles.length > 0 && (
-            <div className="card-bd" style={{ paddingTop: 0 }}>
-              <div className="label" style={{ marginBottom: 6 }}>可选型号（Profile，可跳过）</div>
-              <select className="select" value={profileId} onChange={(e) => setProfileId(e.target.value)}>
-                <option value="">不选型号，直接用驱动默认</option>
-                {driverProfiles.map((p) => <option key={p.id} value={p.id}>{p.vendor} {p.family} {p.model} — {p.id}</option>)}
-              </select>
-              {selectedProfile && (
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
-                  <span className="help">快捷预设：</span>
-                  {selectedProfile.presets.map((pr) => (
-                    <button key={pr.id} className="btn btn-ghost btn-sm" onClick={() => setSelections((s) => [...s, ...pr.selections])}>+ {pr.label["zh-CN"] ?? pr.label.default}</button>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
           <div className="card-bd" style={{ display: "flex", justifyContent: "flex-end" }}>
             <button className="btn" disabled={!canNext2} onClick={() => setStep(2)}>下一步：连接设备 →</button>
           </div>
@@ -197,7 +155,6 @@ export function DeviceWizard() {
           <div className="card-bd">
             {!desc ? <div className="help">加载连接表单…</div> : (
               <>
-                {selectedProfile && <div className="badge badge-ok" style={{ marginBottom: 10 }}>已填入 {selectedProfile.id} 默认连接</div>}
                 <SchemaForm schema={desc.connection} values={connection} onChange={setConnection} issues={issues} />
                 <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
                   <button className="btn" onClick={validate}>校验</button>

@@ -293,7 +293,7 @@ fn assert_no_orphan(before: &HashSet<u32>, name: &str) {
     }
 }
 
-/// 搭临时 drivers 目录：二进制按唯一名拷贝（防并行串扰）+ profiles 拷贝（hints 验证）。
+/// 搭临时 drivers 目录：二进制按唯一名拷贝（防并行串扰）。
 /// 返回 (root, exe_unique_name)。
 ///
 /// CI ARM ETXTBSY（`Text file busy`，os error 26）修法：直接 `copy` 到最终
@@ -333,19 +333,6 @@ fn stage_drivers_dir(tag: &str, src_exe: &Path, unique_base: &str) -> (PathBuf, 
         ),
     )
     .unwrap();
-    // profiles 拷贝：hints 端到端验证用
-    let prof_src = repo_root()
-        .join("drivers")
-        .join("simulator")
-        .join("profiles");
-    let prof_dst = dir.join("profiles");
-    std::fs::create_dir_all(&prof_dst).unwrap();
-    for e in std::fs::read_dir(&prof_src).unwrap().flatten() {
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) == Some("json") {
-            std::fs::copy(&p, prof_dst.join(p.file_name().unwrap())).unwrap();
-        }
-    }
     (root, unique_base.to_string())
 }
 
@@ -367,20 +354,13 @@ fn cleanup_dir(root: &Path) {
 // ---- 编排级（真子进程）----
 
 #[tokio::test]
-async fn manager_probe_success_reports_hints_and_cleans_child() {
+async fn manager_probe_success_reports_facts_and_cleans_child() {
     let (root, unique) = stage_drivers_dir("ok", &sim_exe(), "pb-sim-guard");
     let before = live_pids(&exe_name(&unique));
     let mgr = MesaManager::discover(&root);
     let res = mgr.probe("simulator", "{}").await.expect("probe ok");
-    assert!(res.report.reachable);
-    assert_eq!(res.report.vendor.as_deref(), Some("Mesa"));
-    assert!(
-        res.profile_hints
-            .iter()
-            .any(|h| h.profile_id == "simulator-basic"),
-        "hints 必须含 simulator-basic，实际: {:?}",
-        res.profile_hints
-    );
+    assert!(res.reachable);
+    assert_eq!(res.vendor.as_deref(), Some("Mesa"));
     assert_no_orphan(&before, &exe_name(&unique));
     cleanup_dir(&root);
 }

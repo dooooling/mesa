@@ -18,19 +18,17 @@ use mesa_core_types::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// 当前 schema 版本。增量迁移时递增并在 `meta` 中持久化（§6.1）。
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 // ---------------------------------------------------------------------------
 // 记录类型
 // ---------------------------------------------------------------------------
 
-/// Device 记录（§5.2）。
+/// Device 记录（§5.2）：用户管理的设备/机器/采集对象容器（非严格物理实体）。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceRecord {
     pub id: String,
     pub name: String,
-    /// 关联的 DeviceProfile id，可空（V1 允许先建设备后补 profile）。
-    pub profile: Option<String>,
 }
 
 /// Endpoint 记录（§5.3）。`connection` 的语义由 Driver 解释，Core 只做 JSON 透传。
@@ -308,8 +306,7 @@ impl ConfigStore {
             );
             CREATE TABLE IF NOT EXISTS devices(
                 id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                profile TEXT
+                name TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS endpoints(
                 id TEXT PRIMARY KEY,
@@ -445,6 +442,47 @@ impl ConfigStore {
                 cur_ver = 3;
             }
         }
+        // 004 迁移（DeviceProfile 整条链删除）：去掉 devices.profile。
+        // v4 不变量：所有 v4 库的 devices 表严格为 (id, name)。
+        if cur_ver < 4 {
+            let has_4: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=4)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !has_4 {
+                Self::backup_file_db(&conn);
+                // 新库建表已不含 profile 列，直接 DROP 会报错；先查 PRAGMA。
+                let has_col: bool = conn
+                    .prepare("PRAGMA table_info(devices)")?
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?
+                    .iter()
+                    .any(|c| c == "profile");
+                let tx = conn.transaction()?;
+                if has_col {
+                    let sql4 = include_str!("../migrations/004_remove_device_profile.sql");
+                    tx.execute_batch(sql4)?;
+                }
+                let checksum4 = format!(
+                    "{:x}",
+                    include_str!("../migrations/004_remove_device_profile.sql").len()
+                );
+                tx.execute(
+                    "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(4,'004_remove_device_profile',?1,?2)",
+                    params![checksum4, Self::now_ns()],
+                )?;
+                tx.execute("UPDATE meta SET value='4' WHERE key='schema_version'", [])?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','4')",
+                    [],
+                )?;
+                tx.commit()?;
+                cur_ver = 4;
+            }
+        }
         // 最终确保 meta 为最新
         if cur_ver < SCHEMA_VERSION {
             conn.execute(
@@ -474,8 +512,8 @@ impl ConfigStore {
         }
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "INSERT INTO devices(id,name,profile) VALUES(?1,?2,?3)",
-            params![rec.id, rec.name, rec.profile],
+            "INSERT INTO devices(id,name) VALUES(?1,?2)",
+            params![rec.id, rec.name],
         );
         match n {
             Ok(_) => Ok(()),
@@ -490,12 +528,11 @@ impl ConfigStore {
 
     pub fn list_devices(&self) -> Result<Vec<DeviceRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id,name,profile FROM devices ORDER BY id")?;
+        let mut stmt = conn.prepare("SELECT id,name FROM devices ORDER BY id")?;
         let rows = stmt.query_map([], |r| {
             Ok(DeviceRecord {
                 id: r.get(0)?,
                 name: r.get(1)?,
-                profile: r.get(2)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -504,13 +541,12 @@ impl ConfigStore {
     pub fn get_device(&self, id: &str) -> Result<Option<DeviceRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id,name,profile FROM devices WHERE id=?1",
+            "SELECT id,name FROM devices WHERE id=?1",
             params![id],
             |r| {
                 Ok(DeviceRecord {
                     id: r.get(0)?,
                     name: r.get(1)?,
-                    profile: r.get(2)?,
                 })
             },
         )
@@ -524,8 +560,8 @@ impl ConfigStore {
         }
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "UPDATE devices SET name=?1, profile=?2 WHERE id=?3",
-            params![rec.name, rec.profile, rec.id],
+            "UPDATE devices SET name=?1 WHERE id=?2",
+            params![rec.name, rec.id],
         )?;
         Ok(n > 0)
     }
@@ -1424,7 +1460,6 @@ mod tests {
         DeviceRecord {
             id: id.into(),
             name: format!("{id}-name"),
-            profile: None,
         }
     }
 
@@ -1578,7 +1613,7 @@ mod tests {
         }
     }
 
-    /// migration 003：新库 schema_version=3 且 event_tasks 表可用；
+    /// migration 链：新库 schema_version=最新版且 event_tasks 表可用；
     /// v2 无损（老数据路径不受影响由 002 测试覆盖，此处断言版本标记）。
     #[test]
     fn migration_003_event_tasks_table() {
@@ -1593,7 +1628,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "3");
+        assert_eq!(ver, "4");
         let has: bool = s
             .conn
             .lock()
@@ -1646,8 +1681,9 @@ mod tests {
         assert!(s.list_event_tasks("e1").unwrap().is_empty());
     }
 
-    /// P0-1 回归：现实 v2 文件库 open() 必须一次走到 v3（旧代码在此自锁）。
-    /// 构造方式：按 v2 应有形态手写建表 + meta=2 + migrations 1,2 + 业务行，
+    /// P0-1 回归：现实 v2 文件库 open() 必须一次走到最新版（旧代码在此自锁）。
+    /// 构造方式：按 v2 应有形态手写建表 + meta=2 + migrations 1,2 + 业务行
+    ///（含带 profile 值的设备行，验证 004 只去列不丢行），
     /// 再 ConfigStore::open()（同一线程重复 lock 即永挂，测试会直接卡死）。
     #[test]
     fn v2_file_db_upgrades_to_v3_without_data_loss() {
@@ -1702,6 +1738,7 @@ mod tests {
                 INSERT INTO schema_migrations(version,name,checksum,applied_at_ns)
                     VALUES(1,'001_initial','x',1),(2,'002_management_control','y',2);
                 INSERT INTO devices(id,name) VALUES('d1','D1');
+                INSERT INTO devices(id,name,profile) VALUES('d2','D2','s7-1200');
                 INSERT INTO endpoints(id,device_id,driver_id,connection_json,desired_running,updated_at_ns)
                     VALUES('e1','d1','simulator','{}',1,7);
                 INSERT INTO tasks(endpoint_id,id,mode,interval_ms,binding_kind,binding_config_json)
@@ -1739,7 +1776,20 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "3");
+            assert_eq!(ver, "4");
+            // 004：profile 列已删除，但设备行本身保留（仅去列，不丢行）
+            let cols: Vec<String> = conn
+                .prepare("PRAGMA table_info(devices)")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(cols, vec!["id".to_string(), "name".to_string()]);
+            let d2: String = conn
+                .query_row("SELECT name FROM devices WHERE id='d2'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(d2, "D2");
             // 旧业务行全部还在
             let n: i64 = conn
                 .query_row(
@@ -1996,8 +2046,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // PR7 起 SCHEMA_VERSION=3；002 本身仍必须存在且已应用（增量链不断）
-        assert!(ver == "3", "新库应为 v3，got {ver}");
+        // PR7 起 SCHEMA_VERSION=3，DeviceProfile 删除后升至 4；
+        // 002/003 本身仍必须存在且已应用（增量链不断）
+        assert!(ver == "4", "新库应为 v4，got {ver}");
         let has2: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=2)",
@@ -2009,7 +2060,7 @@ mod tests {
         let cnt: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert!(cnt >= 3, "至少 3 条迁移");
+        assert!(cnt >= 4, "至少 4 条迁移");
         // 表存在
         let tbl: String = conn
             .query_row(

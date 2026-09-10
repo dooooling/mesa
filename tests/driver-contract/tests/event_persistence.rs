@@ -412,7 +412,6 @@ async fn event_task_rest_crud_and_running_conflict() {
         .create_device(&mesa_config_store::DeviceRecord {
             id: "d1".into(),
             name: "D1".into(),
-            profile: None,
         })
         .unwrap();
     cfg_store

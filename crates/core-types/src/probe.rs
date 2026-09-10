@@ -1,7 +1,7 @@
 //! Dynamic Probe 数据契约（V1.2.1 §8，feat/dynamic-probe）。
 //!
 //! 边界：本模块只描述"本次探测到的设备事实"，不做匹配、不做持久化、不碰
-//! Data Plane。Driver 只返回 facts，facts→profile 的解释权只在 Core。
+//! Data Plane。Driver 只返回 facts，不参与任何型号解释。
 //!
 //! 能力模型（冻结）：动态字符串 ID + 四态，不是固定三 bool——
 //! 后者无法区分 AccessDenied/NotPresent，更承载不了 alarm/tool/drive/gud
@@ -26,7 +26,7 @@ pub enum CapabilityState {
 }
 
 /// 单个动态能力：ID 为动态字符串（如 `alarm`/`tool`/`drive`/`gud`），
-/// Core 不解释 ID 含义，只做透传与 profile 匹配输入。
+/// Core 不解释 ID 含义，只做透传。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityItem {
     pub id: String,

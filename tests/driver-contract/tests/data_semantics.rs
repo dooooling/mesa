@@ -61,7 +61,6 @@ fn same_point_key_restores_same_point_id() {
         .create_device(&mesa_config_store::DeviceRecord {
             id: "d1".into(),
             name: "dev".into(),
-            profile: None,
         })
         .unwrap();
     store
@@ -93,7 +92,6 @@ fn deleted_point_id_never_reused() {
         .create_device(&mesa_config_store::DeviceRecord {
             id: "d1".into(),
             name: "dev".into(),
-            profile: None,
         })
         .unwrap();
     store
@@ -150,7 +148,6 @@ fn re_add_tombstone_restores_same_id() {
         .create_device(&mesa_config_store::DeviceRecord {
             id: "d1".into(),
             name: "dev".into(),
-            profile: None,
         })
         .unwrap();
     store
@@ -183,7 +180,6 @@ fn revision_success_plus_one() {
         .create_device(&mesa_config_store::DeviceRecord {
             id: "d1".into(),
             name: "dev".into(),
-            profile: None,
         })
         .unwrap();
     store
@@ -224,7 +220,6 @@ fn revision_failure_unchanged() {
         .create_device(&mesa_config_store::DeviceRecord {
             id: "d1".into(),
             name: "dev".into(),
-            profile: None,
         })
         .unwrap();
     store

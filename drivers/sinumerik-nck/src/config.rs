@@ -34,7 +34,7 @@ pub struct NckConnConfig {
     pub family: String,
     /// 本地 TSAP（上位机侧）。
     pub local_tsap: u16,
-    /// 远端 TSAP（NCK 侧；具体值由 profile + 真机 Gate 冻结）。
+    /// 远端 TSAP（NCK 侧；具体值由真机 Gate 冻结）。
     pub remote_tsap: u16,
     pub timeout_ms: u64,
     pub requested_pdu_length: u16,
@@ -72,7 +72,7 @@ impl NckConnConfig {
             }
             cfg.port = p as u16;
         }
-        // TSAP：显式必填（NCK 无 rack/slot 推导；远端值由 profile + 真机 Gate 定）。
+        // TSAP：显式必填（NCK 无 rack/slot 推导；远端值由真机 Gate 定）。
         let local = v
             .get("local_tsap")
             .and_then(|x| x.as_u64())

@@ -14,7 +14,6 @@ use mesa_core_types::ProbeReport;
 use mesa_driver_protocol::PROBE_RPC_MIN_MINOR;
 
 use crate::manager::MesaManager;
-use crate::profile::{ProfileMatch, match_profiles};
 use crate::session::{PROBE_TIMEOUT, Session, SessionError, StartupStage};
 
 /// 探测基础设施失败（注意：设备不可达不是 Err，是 `Ok(ProbeReport)`）。
@@ -66,13 +65,6 @@ fn driver_error_to_probe_error(kind: &str, code: &str, message: String) -> Probe
     }
 }
 
-/// 探测结果：设备事实 + Core 侧确定性 profile 提示（Driver 不参与匹配）。
-#[derive(Debug)]
-pub struct ProbeResult {
-    pub report: ProbeReport,
-    pub profile_hints: Vec<ProfileMatch>,
-}
-
 /// Probe RPC 版本门控（纯函数，可单测）：协商 Minor < 2 的旧 Driver
 /// 不识别 ProbeRequest（会静默忽略），必须直接 Unsupported，不得发 RPC 干等。
 pub(crate) fn probe_supported(negotiated_minor: u32) -> bool {
@@ -80,12 +72,13 @@ pub(crate) fn probe_supported(negotiated_minor: u32) -> bool {
 }
 
 impl MesaManager {
-    /// 动态探测：返回设备事实报告 + profile 提示。临时进程生命周期与本调用严格绑定。
+    /// 动态探测：返回设备事实报告。临时进程生命周期与本调用严格绑定。
+    /// 没探测到 ≠ 猜型号：unreachable 时 probe.* 全空，不做任何型号推断。
     pub async fn probe(
         &self,
         driver_id: &str,
         connection_json: &str,
-    ) -> Result<ProbeResult, ProbeError> {
+    ) -> Result<ProbeReport, ProbeError> {
         let disc = self
             .find_driver(driver_id)
             .ok_or_else(|| ProbeError::DriverNotFound(driver_id.to_string()))?;
@@ -97,19 +90,7 @@ impl MesaManager {
                 Ok(r) => r?,
                 Err(_) => return Err(ProbeError::Timeout),
             };
-        // facts→profile 解释权只在 Core：用本机加载的 profiles 做确定性匹配。
-        // 没探测到 ≠ 猜型号：unreachable 时 probe.* 全空，driver_id-only 规则
-        // 会误命中具体硬件型号（如 s7-1200/1214C），此时 hints 必须为空（P1-B）。
-        let profiles = self.profiles.read().unwrap();
-        let profile_hints = if report.reachable {
-            match_profiles(driver_id, &report, &profiles)
-        } else {
-            Vec::new()
-        };
-        Ok(ProbeResult {
-            report,
-            profile_hints,
-        })
+        Ok(report)
     }
 
     /// 临时探测连接句柄（Core 分配；临时会话内唯一即可，0 有特殊含义禁用）。

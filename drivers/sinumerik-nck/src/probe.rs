@@ -17,7 +17,7 @@ use mesa_core_types::{ProbeReport, ProbeWarning};
 use crate::config::NckConnConfig;
 use mesa_s7_transport::{S7ConnectOptions, S7Session};
 
-/// anchor 缺失警告码（真机回填后消失；Core 侧 profile 永不据此匹配）。
+/// anchor 缺失警告码（真机回填后消失）。
 pub const NCK_ANCHOR_PENDING: &str = "NCK_ANCHOR_PENDING";
 
 /// 建连探测：成功 → reachable + 待确认警告；失败 → 不可达规范报告。

@@ -14,7 +14,6 @@ pub mod manager;
 pub mod manifest;
 pub mod probe;
 pub mod process;
-pub mod profile;
 pub mod session;
 pub mod snapshot;
 pub(crate) mod temp_op;
