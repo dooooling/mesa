@@ -292,6 +292,7 @@ fn maybe_seed_demo(store: &ConfigStore) -> Result<bool, String> {
     let _ = store.create_device(&dev);
     let rec = EndpointRecord {
         id: "sim-001".into(),
+        name: "Simulator".into(),
         device_id: "sim-device".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),

@@ -100,7 +100,9 @@ async fn put_json(app: axum::Router, uri: &str, body: &str) -> (StatusCode, serd
     let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap())
+    // axum 提取层拒绝（如 deny_unknown_fields）时 body 非 JSON，置 Null 只断状态码
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, v)
 }
 
 #[tokio::test]
@@ -230,17 +232,41 @@ async fn task_save_gate_rejects_unknown_resource_and_connection_field() {
     let (s, v) = post_json(
         app.clone(),
         "/api/v1/endpoints",
-        r#"{"id":"e1","device_id":"d1","driver_id":"simulator","connection":{"seed":1}}"#,
+        r#"{"id":"e1","name":"E1","device_id":"d1","driver_id":"simulator","connection":{"seed":1}}"#,
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
     assert_eq!(v["valid"], false);
     assert!(!v["issues"].as_array().unwrap().is_empty());
+    // name 缺失 → 400（PR25：展示名必填；axum 提取层直接拒绝）
+    let req = Request::builder()
+        .uri("/api/v1/endpoints")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"id":"e1","device_id":"d1","driver_id":"simulator","connection":{}}"#,
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::BAD_REQUEST
+            || resp.status() == StatusCode::UNPROCESSABLE_ENTITY,
+        "缺 name 应拒绝，got {}",
+        resp.status()
+    );
+    // name 空白 → 400（store 层统一规则）
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        r#"{"id":"e1","name":"  ","device_id":"d1","driver_id":"simulator","connection":{}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
     // 合法 endpoint
     let (s, _) = post_json(
         app.clone(),
         "/api/v1/endpoints",
-        r#"{"id":"e1","device_id":"d1","driver_id":"simulator","connection":{}}"#,
+        r#"{"id":"e1","name":"E1","device_id":"d1","driver_id":"simulator","connection":{}}"#,
     )
     .await;
     assert_eq!(s, StatusCode::CREATED, "create endpoint");
@@ -282,15 +308,38 @@ async fn task_save_gate_rejects_unknown_resource_and_connection_field() {
             .iter()
             .any(|i| i["code"] == "DUPLICATE_POINT_KEY")
     );
-    // driver_id 不可变 → 400
+    // driver_id 已从 Update 形状移除：传入即未知字段拒绝（提取层 400/422，
+    // 不再是“传入后检查不能变”）
     let (s, v) = put_json(
-        app,
+        app.clone(),
         "/api/v1/endpoints/e1",
-        r#"{"device_id":"d1","driver_id":"s7","connection":{}}"#,
+        r#"{"name":"E1","device_id":"d1","driver_id":"s7","connection":{}}"#,
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
-    assert_eq!(v["error"]["code"], "IMMUTABLE_DRIVER");
+    assert!(
+        s == StatusCode::BAD_REQUEST || s == StatusCode::UNPROCESSABLE_ENTITY,
+        "driver_id 应被形状拒绝，got {s} body: {v}"
+    );
+    // name 更新全链路携带：改名成功且 get 可见
+    let (s, v) = put_json(
+        app.clone(),
+        "/api/v1/endpoints/e1",
+        r#"{"name":"PLC-1","device_id":"d1","connection":{}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let req = Request::builder()
+        .uri("/api/v1/endpoints/e1")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let ep: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(ep["name"], "PLC-1", "get 可见新名: {ep}");
+    assert_eq!(ep["driver_id"], "simulator", "driver 未动: {ep}");
 }
 
 /// PR4 Secret 正式语义：缺失保留旧值、marker 保留、显式 clear 删除。
@@ -304,7 +353,9 @@ async fn secret_update_missing_keeps_and_clear_deletes() {
     let (s, _) = post_json(
         app.clone(),
         "/api/v1/endpoints",
-        &format!(r#"{{"id":"e9","device_id":"d1","driver_id":"opcua","connection":{conn}}}"#),
+        &format!(
+            r#"{{"id":"e9","name":"E9","device_id":"d1","driver_id":"opcua","connection":{conn}}}"#
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::CREATED);
@@ -313,7 +364,7 @@ async fn secret_update_missing_keeps_and_clear_deletes() {
     let (s, v) = put_json(
         app.clone(),
         "/api/v1/endpoints/e9",
-        &format!(r#"{{"device_id":"d1","driver_id":"opcua","connection":{conn2}}}"#),
+        &format!(r#"{{"name":"E9","device_id":"d1","connection":{conn2}}}"#),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {v}");
@@ -321,7 +372,7 @@ async fn secret_update_missing_keeps_and_clear_deletes() {
     let (s, v) = put_json(
         app.clone(),
         "/api/v1/endpoints/e9",
-        &format!(r#"{{"device_id":"d1","driver_id":"opcua","connection":{conn3}}}"#),
+        &format!(r#"{{"name":"E9","device_id":"d1","connection":{conn3}}}"#),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "marker 保留应成功，body: {v}");
@@ -330,14 +381,14 @@ async fn secret_update_missing_keeps_and_clear_deletes() {
     let (s, v) = put_json(
         app.clone(),
         "/api/v1/endpoints/e9",
-        &format!(r#"{{"device_id":"d1","driver_id":"opcua","connection":{conn4}}}"#),
+        &format!(r#"{{"name":"E9","device_id":"d1","connection":{conn4}}}"#),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "body: {v}");
     let (s, v) = put_json(
         app,
         "/api/v1/endpoints/e9",
-        &format!(r#"{{"device_id":"d1","driver_id":"opcua","connection":{conn3}}}"#),
+        &format!(r#"{{"name":"E9","device_id":"d1","connection":{conn3}}}"#),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");

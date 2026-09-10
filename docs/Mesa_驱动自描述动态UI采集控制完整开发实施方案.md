@@ -1353,9 +1353,12 @@ Update：
 → 删除 Secret
 ```
 
-Endpoint 的 `driver_id` 创建后不可变（PR4 冻结）：选错 Driver 删除重建；
-update 传入不同 driver_id 即 `IMMUTABLE_DRIVER` 拒绝，Store UPDATE 永不写
-driver_id。`Endpoint.name` 尚未进入 `EndpointRecord`，归下一 PR domain 项。
+Endpoint 的 `driver_id` 创建后不可变（PR4 冻结，PR25 落到形状层）：
+选错 Driver 删除重建；Update 请求体已移除 `driver_id` 字段
+（`deny_unknown_fields`，传入即未知字段拒绝），Store UPDATE 永不写该列。
+Endpoint 展示名 `name`（PR25）：创建必填、更新可改，非空（去空白后）且
+长度 ≤128；DB migration v5（`005_endpoint_name.sql`）持久化，旧行默认为 ''，
+读出后更新时必须补名。`Endpoint` 更丰富的 domain 能力归后续 PR。
 
 ## 5.5 Driver 获取 Secret
 

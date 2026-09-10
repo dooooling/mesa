@@ -66,6 +66,7 @@ fn same_point_key_restores_same_point_id() {
     store
         .create_endpoint(&mesa_config_store::EndpointRecord {
             id: "ep1".into(),
+            name: "EP1".into(),
             device_id: "d1".into(),
             driver_id: "simulator".into(),
             connection_json: "{}".into(),
@@ -97,6 +98,7 @@ fn deleted_point_id_never_reused() {
     store
         .create_endpoint(&mesa_config_store::EndpointRecord {
             id: "ep1".into(),
+            name: "EP1".into(),
             device_id: "d1".into(),
             driver_id: "simulator".into(),
             connection_json: "{}".into(),
@@ -153,6 +155,7 @@ fn re_add_tombstone_restores_same_id() {
     store
         .create_endpoint(&mesa_config_store::EndpointRecord {
             id: "ep1".into(),
+            name: "EP1".into(),
             device_id: "d1".into(),
             driver_id: "simulator".into(),
             connection_json: "{}".into(),
@@ -185,6 +188,7 @@ fn revision_success_plus_one() {
     store
         .create_endpoint(&mesa_config_store::EndpointRecord {
             id: "ep1".into(),
+            name: "EP1".into(),
             device_id: "d1".into(),
             driver_id: "simulator".into(),
             connection_json: "{}".into(),
@@ -225,6 +229,7 @@ fn revision_failure_unchanged() {
     store
         .create_endpoint(&mesa_config_store::EndpointRecord {
             id: "ep1".into(),
+            name: "EP1".into(),
             device_id: "d1".into(),
             driver_id: "simulator".into(),
             connection_json: "{}".into(),

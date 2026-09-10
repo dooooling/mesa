@@ -1190,6 +1190,7 @@ async fn list_endpoints(State(state): State<Arc<AppState>>) -> Json<serde_json::
         }
         merged.push(serde_json::json!({
             "id": rec.id,
+            "name": rec.name,
             "device_id": rec.device_id,
             "driver_id": rec.driver_id,
             "connection": conn,
@@ -1323,15 +1324,19 @@ async fn delete_device(
 #[derive(Debug, Deserialize)]
 struct CreateEndpointReq {
     id: String,
+    name: String,
     device_id: String,
     driver_id: String,
     connection: serde_json::Value,
 }
 
+/// Update shape（PR25）：`driver_id` 已从形状移除（创建后不可变），传入即
+/// `deny_unknown_fields` 拒绝，不再是“传入后检查不能变”。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateEndpointReq {
+    name: String,
     device_id: String,
-    driver_id: String,
     connection: serde_json::Value,
 }
 
@@ -1365,7 +1370,8 @@ async fn get_endpoint(
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
-                    "id": rec.id, "device_id": rec.device_id, "driver_id": rec.driver_id,
+                    "id": rec.id, "name": rec.name,
+                    "device_id": rec.device_id, "driver_id": rec.driver_id,
                     "connection": conn, "desired_running": rec.desired_running,
                     "updated_at_ns": rec.updated_at_ns, "runtime": runtime,
                 })),
@@ -1439,6 +1445,7 @@ async fn create_endpoint(
     }
     let rec = EndpointRecord {
         id: body.id.clone(),
+        name: body.name.clone(),
         device_id: body.device_id,
         driver_id: body.driver_id,
         connection_json: serde_json::to_string(&conn_val).unwrap(),
@@ -1490,21 +1497,10 @@ async fn update_endpoint(
             Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
         );
     };
-    // driver_id 创建后不可变（冻结契约）：选错 Driver 删除重建；
-    // 否则已有 tasks 与新 Driver 的 Descriptor 必然错位。
-    if body.driver_id != rec.driver_id {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json_error(
-                "IMMUTABLE_DRIVER",
-                &format!(
-                    "endpoint driver_id 不可变更（{} → {}）；请删除后重建",
-                    rec.driver_id, body.driver_id
-                ),
-            )),
-        );
-    }
+    // driver_id 创建后不可变：Update 形状已移除该字段（deny_unknown_fields），
+    // 此处无任何 driver_id 写入路径；Store UPDATE 同样永不触碰该列。
     rec.device_id = body.device_id.clone();
+    rec.name = body.name.clone();
     // Secret 正式语义（P0）：明文→更新；marker→保留（须存在）；
     // 缺失→保留旧值；显式 {"clear_secret": true}→删除。
     // 先构造 logical candidate（真实值）跑统一校验，通过后再落盘 marker 形态。
