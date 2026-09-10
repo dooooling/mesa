@@ -48,10 +48,24 @@ export interface LocalizedText {
   "zh-CN"?: string;
 }
 
+// 与 core-types DataType 的 serde wire format 镜像（PascalCase；
+// as_str() 的小写形态不是 wire format，不得用于此类型）。
+// 若 Rust 侧改 wire，descriptor_contract 的 wire 断言会先红。
+export type DataType =
+  | "Bool" | "I32" | "U32" | "I64" | "U64" | "F32" | "F64"
+  | "String" | "Bytes" | "DateTime"
+  | "BoolArray" | "I32Array" | "U32Array" | "I64Array" | "U64Array"
+  | "F32Array" | "F64Array" | "StringArray" | "DateTimeArray";
+
+export type OutputTypeSpec =
+  | { kind: "fixed"; data_type: DataType }
+  | { kind: "from_parameter"; parameter: string; mapping: Record<string, DataType> }
+  | { kind: "driver_resolved" };
+
 export interface OutputDescriptor {
   id: string;
   label: LocalizedText;
-  data_type: string;
+  type_spec: OutputTypeSpec;
   unit?: string;
   access: "read" | "write" | "readwrite";
 }
@@ -71,8 +85,8 @@ export interface DriverDescriptor {
   connection: SchemaDescriptor;
   resources: ResourceDescriptor[];
   controls: { commands: unknown[] };
-  discovery: { manual: boolean; browse: boolean; import: boolean };
-  capabilities: { poll: boolean; subscribe: boolean; browse: boolean; write: boolean; method: boolean; events?: boolean };
+  resource_selection_methods: Array<"manual" | "browse" | "import">;
+  capabilities: { poll: boolean; subscribe: boolean; write: boolean; method: boolean; events?: boolean };
   // Event Plane V1 §5：老 Driver 可能缺省该字段，Web 按空目录处理（与 Rust serde(default) 对齐）
   events?: EventCatalog;
 }

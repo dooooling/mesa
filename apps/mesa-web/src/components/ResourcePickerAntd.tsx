@@ -46,7 +46,7 @@ export function ResourcePickerAntd({ resources, onAdd }: { resources: ResourceDe
                   if (e.target.checked) setOutputs([...outputs, { output: o.id, point_key: `${res.id}.${o.id}` }]);
                   else setOutputs(outputs.filter((x) => x.output !== o.id));
                 }} />
-                <span style={{ flex: 1 }}>{(o.label as unknown as { default: string })?.default ?? o.id} <Tag>{o.data_type}</Tag></span>
+                <span style={{ flex: 1 }}>{(o.label as unknown as { default: string })?.default ?? o.id} <Tag>{o.type_spec.kind === "fixed" ? o.type_spec.data_type : o.type_spec.kind === "from_parameter" ? `←${o.type_spec.parameter}` : "driver"}</Tag></span>
               </label>
             );
           })}

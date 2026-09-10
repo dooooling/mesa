@@ -4,15 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::SchemaDescriptor;
 
-/// Driver 能力（§13 capabilities）。
+/// Driver 能力（§13 capabilities）：仅 Runtime 能力，资源配置方式见
+/// `ResourceSelectionMethod`（唯一真值，不在此重复）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct DriverCapabilities {
     #[serde(default)]
     pub poll: bool,
     #[serde(default)]
     pub subscribe: bool,
-    #[serde(default)]
-    pub browse: bool,
     #[serde(default)]
     pub write: bool,
     #[serde(default)]
@@ -22,15 +21,15 @@ pub struct DriverCapabilities {
     pub events: bool,
 }
 
-/// Discovery 能力（§20.1）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct DiscoveryCapabilities {
-    #[serde(default)]
-    pub manual: bool,
-    #[serde(default)]
-    pub browse: bool,
-    #[serde(default)]
-    pub import: bool,
+/// 资源配置方式（§20.1）：可组合的资源选择方式（Manual/Browse/Import，可多选），
+/// 未来 UploadProject/Catalog/Template 加变体，不加 bool。
+/// `DriverDescriptor.resource_selection_methods` 为唯一真值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceSelectionMethod {
+    Manual,
+    Browse,
+    Import,
 }
 
 /// Control 风险等级（§22）。
@@ -85,8 +84,8 @@ impl ControlCatalog {
             if !seen.insert(&c.id) {
                 return Err(format!("command id 重复: {}", c.id));
             }
-            c.input_schema.validate()?;
-            c.result_schema.validate()?;
+            c.input_schema.validate_definition()?;
+            c.result_schema.validate_definition()?;
         }
         Ok(())
     }

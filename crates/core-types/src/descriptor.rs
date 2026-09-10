@@ -2,9 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::capability::{ControlCatalog, DiscoveryCapabilities, DriverCapabilities};
+use crate::capability::{ControlCatalog, DriverCapabilities, ResourceSelectionMethod};
 use crate::resource::ResourceDescriptor;
 use crate::schema::SchemaDescriptor;
+
+/// Descriptor 契约版本（§4.2）：V2 删除/改变 wire shape
+///（`data_type→type_spec`、`discovery→resource_selection_methods`、
+/// 删除 `capabilities.browse`），Major 必须升级。禁止魔数，全部引用本常量。
+pub const DESCRIPTOR_CONTRACT_MAJOR: u32 = 2;
+pub const DESCRIPTOR_CONTRACT_MINOR: u32 = 0;
 
 /// Driver 身份（§13 identity）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -26,8 +32,9 @@ pub struct DriverDescriptor {
     pub resources: Vec<ResourceDescriptor>,
     #[serde(default)]
     pub controls: ControlCatalog,
+    /// 资源配置方式（§20.1）：唯一真值，可扩展枚举。
     #[serde(default)]
-    pub discovery: DiscoveryCapabilities,
+    pub resource_selection_methods: Vec<ResourceSelectionMethod>,
     #[serde(default)]
     pub capabilities: DriverCapabilities,
     /// 事件目录（Event Plane §5）：serde(default) 保证老 Driver 无该字段时
@@ -42,7 +49,17 @@ impl DriverDescriptor {
         if self.identity.driver_id.trim().is_empty() {
             return Err("identity.driver_id 不能为空".into());
         }
-        self.connection.validate()?;
+        self.connection.validate_definition()?;
+        // resource_selection_methods 唯一（可组合，不去重即契约非法）
+        {
+            use std::collections::HashSet;
+            let mut seen = HashSet::new();
+            for m in &self.resource_selection_methods {
+                if !seen.insert(m) {
+                    return Err(format!("resource_selection_methods 重复: {m:?}"));
+                }
+            }
+        }
         // resources 唯一
         {
             use std::collections::HashSet;

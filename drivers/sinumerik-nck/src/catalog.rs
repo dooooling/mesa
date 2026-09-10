@@ -2,7 +2,7 @@
 //!
 //! 链路：用户语义（Area/Block/Variable/Line/Column）→ Catalog →
 //! `NckWireAddress`（syntax/area_unit/column/line/module/line_count）→ codec。
-//! 系列 mapping 变化只换 Catalog，不动 Resource API / Core / Profile / Data Plane。
+//! 系列 mapping 变化只换 Catalog，不动 Resource API / Core / Data Plane。
 //!
 //! 铁律（CONTRACT.md）：wire 数值必须由官方变量定义 + 确定性协议测试 +
 //! 真机三方确认后方可进入 `supported` catalog；本模块只定 schema 与解析规则，

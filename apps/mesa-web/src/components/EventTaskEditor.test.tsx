@@ -30,8 +30,8 @@ const DESCRIPTOR = {
   connection: { fields: [] },
   resources: [],
   controls: { commands: [] },
-  discovery: { manual: true, browse: false, import: false },
-  capabilities: { poll: true, subscribe: true, browse: false, write: false, method: false, events: true },
+  resource_selection_methods: ["manual"],
+  capabilities: { poll: true, subscribe: true, write: false, method: false, events: true },
   events: {
     streams: [
       {

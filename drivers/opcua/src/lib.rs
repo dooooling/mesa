@@ -79,14 +79,14 @@ impl Driver for OpcUaDriver {
 
     fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
         use mesa_core_types::{
-            AccessMode, DataType, DiscoveryCapabilities, DriverCapabilities, DriverDescriptor,
-            DriverIdentity, FieldDescriptor, FieldType, LocalizedText, OutputDescriptor,
-            ResourceDescriptor, SchemaDescriptor,
+            AccessMode, DataType, DriverCapabilities, DriverDescriptor, DriverIdentity,
+            FieldDescriptor, FieldType, LocalizedText, OutputDescriptor, OutputTypeSpec,
+            ResourceDescriptor, ResourceSelectionMethod, SchemaDescriptor,
         };
         let m = self.metadata();
         DriverDescriptor {
-            contract_major: 1,
-            contract_minor: 0,
+            contract_major: mesa_core_types::DESCRIPTOR_CONTRACT_MAJOR,
+            contract_minor: mesa_core_types::DESCRIPTOR_CONTRACT_MINOR,
             identity: DriverIdentity {
                 driver_id: m.driver_id,
                 name: m.name,
@@ -173,7 +173,21 @@ impl Driver for OpcUaDriver {
                 outputs: vec![OutputDescriptor {
                     id: "value".into(),
                     label: LocalizedText::new("Value"),
-                    data_type: DataType::String,
+                    // 类型随 data_type 参数（parse_data_type 口径转写）。
+                    type_spec: OutputTypeSpec::FromParameter {
+                        parameter: "data_type".into(),
+                        mapping: [
+                            ("STRING", DataType::String),
+                            ("INT32", DataType::I32),
+                            ("INT64", DataType::I64),
+                            ("FLOAT", DataType::F32),
+                            ("DOUBLE", DataType::F64),
+                            ("BOOL", DataType::Bool),
+                        ]
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
+                    },
                     unit: None,
                     access: AccessMode::Read,
                 }],
@@ -183,15 +197,13 @@ impl Driver for OpcUaDriver {
                 ],
             }],
             controls: mesa_core_types::ControlCatalog::default(),
-            discovery: DiscoveryCapabilities {
-                manual: true,
-                browse: true,
-                import: false,
-            },
+            resource_selection_methods: vec![
+                ResourceSelectionMethod::Manual,
+                ResourceSelectionMethod::Browse,
+            ],
             capabilities: DriverCapabilities {
                 poll: true,
                 subscribe: true,
-                browse: true,
                 events: true,
                 ..Default::default()
             },

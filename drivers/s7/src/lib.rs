@@ -51,14 +51,14 @@ impl Driver for S7Driver {
 
     fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
         use mesa_core_types::{
-            AccessMode, DataType, DiscoveryCapabilities, DriverCapabilities, DriverDescriptor,
-            DriverIdentity, FieldDescriptor, FieldType, LocalizedText, OutputDescriptor,
-            ResourceDescriptor, SchemaDescriptor,
+            AccessMode, DataType, DriverCapabilities, DriverDescriptor, DriverIdentity,
+            FieldDescriptor, FieldType, LocalizedText, OutputDescriptor, OutputTypeSpec,
+            ResourceDescriptor, ResourceSelectionMethod, SchemaDescriptor,
         };
         let m = self.metadata();
         DriverDescriptor {
-            contract_major: 1,
-            contract_minor: 0,
+            contract_major: mesa_core_types::DESCRIPTOR_CONTRACT_MAJOR,
+            contract_minor: mesa_core_types::DESCRIPTOR_CONTRACT_MINOR,
             identity: DriverIdentity {
                 driver_id: m.driver_id,
                 name: m.name,
@@ -136,18 +136,33 @@ impl Driver for S7Driver {
                 outputs: vec![OutputDescriptor {
                     id: "value".into(),
                     label: LocalizedText::new("Value"),
-                    data_type: DataType::F64,
+                    // NOTE(PR3 对齐项)：类型随 data_type 参数（codec.parse_data_type
+                    // 口径转写；Descriptor 参数面为 area/db/offset 形态，parser 另
+                    // 接受 address 字符串形态，两形态对齐在 PR3 审计）。
+                    type_spec: OutputTypeSpec::FromParameter {
+                        parameter: "data_type".into(),
+                        mapping: [
+                            ("BOOL", DataType::Bool),
+                            ("BYTE", DataType::U32),
+                            ("WORD", DataType::U32),
+                            ("DWORD", DataType::U32),
+                            ("INT", DataType::I32),
+                            ("DINT", DataType::I32),
+                            ("REAL", DataType::F32),
+                            ("CHAR", DataType::U32),
+                            ("STRING", DataType::String),
+                        ]
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
+                    },
                     unit: None,
                     access: AccessMode::Read,
                 }],
                 modes: vec![mesa_core_types::TaskMode::Poll],
             }],
             controls: mesa_core_types::ControlCatalog::default(),
-            discovery: DiscoveryCapabilities {
-                manual: true,
-                browse: false,
-                import: false,
-            },
+            resource_selection_methods: vec![ResourceSelectionMethod::Manual],
             capabilities: DriverCapabilities {
                 poll: true,
                 ..Default::default()
@@ -321,10 +336,8 @@ impl DriverConnection for S7Connection {
     /// - 建连失败 → Ok(unreachable)（设备不可达是探测结果）；
     /// - SZL 失败或解析失败 → reachable + IDENTITY_UNAVAILABLE（绝不猜型号，
     ///   更不从端口号反推，见 §8.5）。
-    /// NOTE: s7-1200 Profile 要求 probe.vendor==Siemens 且
-    /// probe.family==S7-1200 才提示；本 probe 现阶段 family 恒为 None
-    /// （1200/1500 区分需正式 MLFB 映射依据，确认前一律不做，宁缺毋滥），
-    /// 因此 s7-1200 按设计暂时不可达——可达但信息不足时不得过度推断。
+    /// NOTE: 1200/1500 区分需正式 MLFB 映射依据，确认前 family 恒为 None，
+    /// 可达但信息不足时不得过度推断（宁缺毋滥）。
     /// 配置已在 OpenConnection 校验；短连接随函数返回 drop，不进入采集计划。
     async fn probe(&mut self) -> Result<ProbeReport, SdkDriverError> {
         let cfg = self.cfg.clone();

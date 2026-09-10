@@ -36,6 +36,50 @@ impl DescriptorError {
     }
 }
 
+/// §4.2 Descriptor version gate（纯函数，可单测）：
+/// 先检查 report.contract_major（旧 V1 直接 DESCRIPTOR_CONTRACT_UNSUPPORTED，
+/// 不 parse），再 parse descriptor_json，再校验 descriptor 内 major 与 report
+/// 一致，最后 validate()。
+pub(crate) fn gate_descriptor_report(
+    major: u32,
+    minor: u32,
+    json: &str,
+) -> Result<mesa_core_types::DriverDescriptor, DescriptorError> {
+    use mesa_core_types::{DESCRIPTOR_CONTRACT_MAJOR, DESCRIPTOR_CONTRACT_MINOR};
+    if major != DESCRIPTOR_CONTRACT_MAJOR {
+        return Err(DescriptorError::new(
+            "DESCRIPTOR_CONTRACT_UNSUPPORTED",
+            format!(
+                "driver reports contract {major}.{minor}, core supports {DESCRIPTOR_CONTRACT_MAJOR}.{DESCRIPTOR_CONTRACT_MINOR}"
+            ),
+        ));
+    }
+    if json.len() > 256 * 1024 {
+        return Err(DescriptorError::new(
+            "DRIVER_DESCRIPTOR_TOO_LARGE",
+            format!("descriptor {} bytes exceeds 256KiB", json.len()),
+        ));
+    }
+    let desc: mesa_core_types::DriverDescriptor = serde_json::from_str(json).map_err(|e| {
+        DescriptorError::new(
+            "DRIVER_DESCRIPTOR_INVALID_JSON",
+            format!("invalid json: {e}"),
+        )
+    })?;
+    if desc.contract_major != major {
+        return Err(DescriptorError::new(
+            "DESCRIPTOR_CONTRACT_UNSUPPORTED",
+            format!(
+                "contract major mismatch: report {major}, descriptor {}/{}",
+                desc.contract_major, desc.contract_minor
+            ),
+        ));
+    }
+    desc.validate()
+        .map_err(|e| DescriptorError::new("DRIVER_DESCRIPTOR_VALIDATION_FAILED", e))?;
+    Ok(desc)
+}
+
 struct RunningEntry {
     cancel: CancellationToken,
     /// P0-3：任务返回 teardown 结论（`None` = 干净，`Some` = drain 异常描述），
@@ -297,64 +341,11 @@ impl MesaManager {
                 Err(e) => return (td, Err(e)),
             };
 
-            if json.len() > 256 * 1024 {
-                return (
-                    td,
-                    Err(DescriptorError::new(
-                        "DRIVER_DESCRIPTOR_TOO_LARGE",
-                        format!("descriptor {} bytes exceeds 256KiB", json.len()),
-                    )),
-                );
-            }
-
-            let parsed: Result<mesa_core_types::DriverDescriptor, _> =
-                serde_json::from_str(&json).map_err(|e| {
-                    DescriptorError::new(
-                        "DRIVER_DESCRIPTOR_INVALID_JSON",
-                        format!("invalid json: {e}"),
-                    )
-                });
-            let desc = match parsed {
+            // §4.2 version gate（纯函数，先 major 后 parse，见 gate_descriptor_report）
+            let desc = match gate_descriptor_report(major, minor, &json) {
                 Ok(v) => v,
                 Err(e) => return (td, Err(e)),
             };
-
-            // 校验契约（字段唯一、visible_if 等）
-            if let Err(e) = desc.validate() {
-                return (
-                    td,
-                    Err(DescriptorError::new(
-                        "DRIVER_DESCRIPTOR_VALIDATION_FAILED",
-                        e,
-                    )),
-                );
-            }
-
-            // 校验 contract 版本语义（§4.2）：严格校验 Major
-            if major != desc.contract_major || major != 1 {
-                return (
-                    td,
-                    Err(DescriptorError::new(
-                        "DESCRIPTOR_CONTRACT_UNSUPPORTED",
-                        format!(
-                            "contract major mismatch: driver reported {major}, descriptor {}/{}, core supports 1",
-                            desc.contract_major, desc.contract_minor
-                        ),
-                    )),
-                );
-            }
-            if desc.contract_major != 1 {
-                return (
-                    td,
-                    Err(DescriptorError::new(
-                        "DESCRIPTOR_CONTRACT_UNSUPPORTED",
-                        format!(
-                            "descriptor contract {}.{} not supported, core expects 1.x",
-                            desc.contract_major, desc.contract_minor
-                        ),
-                    )),
-                );
-            }
 
             // 缓存
             self.descriptor_cache.write().unwrap().insert(
@@ -546,6 +537,50 @@ impl MesaManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 最小合法 V2 descriptor JSON（§4.2 gate 单测夹具）。
+    fn minimal_v2_json() -> String {
+        serde_json::json!({
+            "contract_major": mesa_core_types::DESCRIPTOR_CONTRACT_MAJOR,
+            "contract_minor": mesa_core_types::DESCRIPTOR_CONTRACT_MINOR,
+            "identity": {"driver_id": "t", "name": "T", "version": "0"},
+            "connection": {"fields": []},
+        })
+        .to_string()
+    }
+
+    /// V1 report 直接拒绝（先 gate 后 parse：JSON 合法也照样拒）。
+    #[test]
+    fn v1_descriptor_report_rejected_before_parse() {
+        let err = gate_descriptor_report(1, 0, &minimal_v2_json()).unwrap_err();
+        assert_eq!(err.code, "DESCRIPTOR_CONTRACT_UNSUPPORTED");
+    }
+
+    /// report 与 descriptor 内 major 不一致 → 拒绝。
+    #[test]
+    fn report_descriptor_major_mismatch_rejected() {
+        let mut v: serde_json::Value = serde_json::from_str(&minimal_v2_json()).unwrap();
+        v["contract_major"] = serde_json::json!(99);
+        let err = gate_descriptor_report(
+            mesa_core_types::DESCRIPTOR_CONTRACT_MAJOR,
+            mesa_core_types::DESCRIPTOR_CONTRACT_MINOR,
+            &v.to_string(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "DESCRIPTOR_CONTRACT_UNSUPPORTED");
+    }
+
+    /// V2 合法 → 通过。
+    #[test]
+    fn v2_descriptor_report_accepted() {
+        let d = gate_descriptor_report(
+            mesa_core_types::DESCRIPTOR_CONTRACT_MAJOR,
+            mesa_core_types::DESCRIPTOR_CONTRACT_MINOR,
+            &minimal_v2_json(),
+        )
+        .unwrap();
+        assert_eq!(d.contract_major, mesa_core_types::DESCRIPTOR_CONTRACT_MAJOR);
+    }
 
     fn empty_mgr() -> MesaManager {
         // 空驱动目录：门在 find_driver 之前触发，无需真实驱动

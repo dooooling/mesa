@@ -105,8 +105,8 @@ pub trait Driver: Send + Sync + 'static {
     fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
         let m = self.metadata();
         mesa_core_types::DriverDescriptor {
-            contract_major: 1,
-            contract_minor: 0,
+            contract_major: mesa_core_types::DESCRIPTOR_CONTRACT_MAJOR,
+            contract_minor: mesa_core_types::DESCRIPTOR_CONTRACT_MINOR,
             identity: mesa_core_types::DriverIdentity {
                 driver_id: m.driver_id,
                 name: m.name,
@@ -115,10 +115,7 @@ pub trait Driver: Send + Sync + 'static {
             connection: mesa_core_types::SchemaDescriptor::default(),
             resources: vec![],
             controls: mesa_core_types::ControlCatalog::default(),
-            discovery: mesa_core_types::DiscoveryCapabilities {
-                manual: true,
-                ..Default::default()
-            },
+            resource_selection_methods: vec![mesa_core_types::ResourceSelectionMethod::Manual],
             capabilities: mesa_core_types::DriverCapabilities::default(),
             // 老 Driver 无事件目录即 empty（Event §5 向后兼容，Major 不升级）
             events: Default::default(),

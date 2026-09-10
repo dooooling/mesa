@@ -3,7 +3,7 @@
 > 仓库：`dooooling/mesa`  
 > 基线：当前 `master`  
 > 文档性质：**施工契约 + 测试契约 + 验收契约**  
-> 核心原则：不推翻现有 Runtime / Data Plane；先冻结契约，再实现 Descriptor、动态 UI、Profile、Discovery 和 Control Plane。
+> 核心原则：不推翻现有 Runtime / Data Plane；先冻结契约，再实现 Descriptor、动态 UI、Resource Selection / Browse 和 Control Plane。
 
 ---
 
@@ -33,7 +33,7 @@ V1 严格只读不会因为 Control 设计提前被破坏
 5. Data / Management / Control Queue 隔离；
 6. Configure / Runtime 性能预算；
 7. Diagnostics / Runbook；
-8. DeviceProfile / Preset / i18n / ImportIssue；
+8. Resource Selection / Browse / Import / i18n / ImportIssue（DeviceProfile / Preset 已废止，见 §10/PR #21）；
 9. Driver 子进程防孤儿；
 10. V1 Read-Only → Future Control 的过渡规则；
 11. Descriptor Proto / REST 错误码；
@@ -451,16 +451,27 @@ REST / Frontend rendering review
 
 ## 3.2 OutputDescriptor
 
-Resource Output 最小契约：
+Resource Output 最小契约（Descriptor V2，contract 2.0）：类型不再是固定
+`data_type`，而是 `OutputTypeSpec` 三态声明（配置阶段的能力说明，运行时
+真值仍是 `PointDescriptor.data_type`）：
 
 ```rust
 pub struct OutputDescriptor {
     pub id: String,
     pub label: LocalizedText,
-    pub data_type: DataType,
+    pub type_spec: OutputTypeSpec,
     pub unit: Option<String>,
     pub access: AccessMode,
-    pub quality_codes: Vec<QualityCodeDescriptor>,
+}
+
+/// kind = "fixed"：类型恒定（如 FOCAS machine status → U32）
+/// kind = "from_parameter"：类型由资源参数决定（如 S7 memory.value ←
+///   data_type 参数），mapping 必须与该 Enum 参数选项精确双向覆盖
+/// kind = "driver_resolved"：只能 Configure 时确定（如 NCK catalog 变量）
+pub enum OutputTypeSpec {
+    Fixed { data_type: DataType },
+    FromParameter { parameter: String, mapping: BTreeMap<String, DataType> },
+    DriverResolved,
 }
 ```
 
@@ -511,7 +522,9 @@ GOOD 时：
 
 ```text
 value 必须存在
-value 类型必须 == OutputDescriptor.data_type
+value 类型必须 == OutputTypeSpec 解析后的类型（Fixed 直接取；
+FromParameter 按 selection 参数查 mapping；DriverResolved 以
+PointDescriptor.data_type 为准）
 value 具有当前业务有效性
 ```
 
@@ -548,7 +561,7 @@ BAD 表示：
 为了保持 TypedValue 契约：
 
 ```text
-BAD Point 仍必须携带与 data_type 匹配的 Value
+BAD Point 仍必须携带与解析后类型匹配的 Value（以 PointDescriptor.data_type 为准）
 ```
 
 规则：
@@ -941,6 +954,14 @@ Driver 二进制、Descriptor 或 Profile 发生正式对外行为变化时必�
 
 ## 4.2 Descriptor Contract
 
+当前版本：**2.0**（PR #22 按本节 Major 规则升级：`data_type→type_spec`、
+`discovery→resource_selection_methods`、删除 `capabilities.browse`）。
+唯一真值：`core-types::DESCRIPTOR_CONTRACT_MAJOR/MINOR`，禁止魔数。
+
+Manager 取 Descriptor 顺序：先检查 `DescriptorReport.contract_major`
+（旧 V1 直接 `DESCRIPTOR_CONTRACT_UNSUPPORTED`，不 parse），再 parse
+`descriptor_json`，再校验内外 major 一致，最后 `validate()`。
+
 ```text
 contract_major
 contract_minor
@@ -1087,7 +1108,7 @@ HTTP 503 Service Unavailable
     "message": "driver descriptor is invalid",
     "issues": [
       {
-        "path": "resources[2].outputs[0].data_type",
+        "path": "resources[2].outputs[0].type_spec",
         "code": "UNKNOWN_DATA_TYPE",
         "message": "unsupported data type"
       }
@@ -2198,6 +2219,30 @@ condition.field 必须引用同一 Schema 已存在字段
 
 禁止跨 Resource 任意依赖和任意表达式执行。
 
+统一 Schema Validator（Core 唯一实现，
+`core-types::SchemaDescriptor::validate_definition/validate_instance`；
+Validate Connection / Create / Update Endpoint / ResourceSelection /
+Event 参数必须全部走它，不得各写一套）：
+
+```text
+validate_definition（Descriptor 静态契约）：
+  key 非空唯一；Enum 必须带非空 options，非 Enum 不得带 options；
+  min/max 仅数值型（Integer/Number/Port/Duration）且 min<=max；
+  pattern 仅 string-like 且合法 regex；
+  default 必须同时满足 type/enum/min-max/pattern；
+  Port 内禀 integer 1..=65535，Duration 内禀 number >= 0
+  （Driver 可用 min/max 进一步收窄，不得放宽）
+
+validate_instance（用户输入）：
+  required、JSON 类型（含 Port/Duration 内禀）、enum、min/max、
+  pattern（真 regex）、未知字段拒绝；
+  类型对但值越界（Port 99999、Duration -1）→ OUT_OF_RANGE，
+  JSON 类型本身不对（Port "102"）→ INVALID_TYPE；
+  Secret 只有 JSON string 一种合法形态，SecretStore 的
+  {"secret_set": true} 脱敏表示由 core-api 在调用前 materialize，
+  不得进 Contract 层
+```
+
 ---
 
 # 13. DriverDescriptor
@@ -2210,10 +2255,14 @@ pub struct DriverDescriptor {
     pub connection: SchemaDescriptor,
     pub resources: Vec<ResourceDescriptor>,
     pub controls: ControlCatalog,
-    pub discovery: DiscoveryCapabilities,
+    pub resource_selection_methods: Vec<ResourceSelectionMethod>,
     pub capabilities: DriverCapabilities,
 }
 ```
+
+`resource_selection_methods`（§20.1）是 Browse 能力的唯一真值
+（`capabilities.browse` 已删除，不重复）；`connection` 可含 Secret
+（走 SecretStore），`resources[].parameters` 禁止 Secret（明文落 Task）。
 
 ## 13.1 Driver SDK 修改
 
@@ -2246,6 +2295,11 @@ Resource 表示：
 ```
 
 不是 Physical Protocol Function。
+
+Resource parameters 安全边界：禁止 `FieldType::Secret`（ResourceSelection
+最终明文落 `Task.binding_config_json`；认证 Secret 只能走
+`connection` + SecretStore，与 EventStream.parameters 同规则）。
+Output 类型见 §3.2 `OutputTypeSpec`（运行时真值 `PointDescriptor.data_type`）。
 
 ---
 
@@ -2493,9 +2547,10 @@ OPCUA-specific frontend component
 
 ---
 
-# 20. Discovery / Browse / Import
+# 20. Resource Selection / Browse / Import
 
-必须同时支持：
+资源选择方式是可组合枚举（`resource_selection_methods`，唯一真值，
+可多选；未来 UploadProject/Catalog/Template 加变体，不加 bool）：
 
 ```text
 Manual
@@ -2503,15 +2558,18 @@ Browse
 Import
 ```
 
-## 20.1 DiscoveryCapabilities
+## 20.1 ResourceSelectionMethod
 
 ```rust
-pub struct DiscoveryCapabilities {
-    pub manual: bool,
-    pub browse: bool,
-    pub import: bool,
+pub enum ResourceSelectionMethod {
+    Manual,
+    Browse,
+    Import,
 }
 ```
+
+（旧 `DiscoveryCapabilities{manual,browse,import}` 三 bool 与
+`capabilities.browse` 已删除，见 §4.2 2.0 升级说明。）
 
 ## 20.2 Browse API
 
@@ -2547,7 +2605,7 @@ BrowseNode {
 
 ## 20.3 Import
 
-Importer 由 Driver/Profile 声明。
+Importer 由 Driver 声明。
 
 未来包括：
 
@@ -3165,6 +3223,7 @@ REST API
 ```text
 GetDescriptor <= 256 KiB
 GetDescriptor timeout 5s
+report major 先 gate 后 parse（V1 直接 DESCRIPTOR_CONTRACT_UNSUPPORTED）
 REST 503 exact error-code contract
 Descriptor contract tests
 Simulator Descriptor
@@ -3313,11 +3372,12 @@ frontend diff == 0
 
 ---
 
-## Milestone H — Discovery / Import
+## Milestone H — Resource Selection / Browse / Import
 
 ### 完成
 
 ```text
+ResourceSelectionMethod（Manual/Browse/Import 可组合，唯一真值）
 Browse contract
 OPC UA Browse
 ImportIssue
@@ -3639,7 +3699,7 @@ Value::String("ERR:...")
 目标：
 
 ```text
-value 保持 Output data_type
+value 保持 Output 解析后类型（以 PointDescriptor.data_type 为准）
 quality = BAD
 quality_code = protocol error
 ```

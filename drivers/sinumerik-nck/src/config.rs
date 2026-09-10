@@ -1,8 +1,8 @@
 //! NCK 连接配置（ADR 0001 §7：NCK Connection Contract）。
 //!
 //! 不照搬 S7 PLC 的 rack/slot（那是 PLC 连接心智）：NCK 直接填写
-//! `local_tsap`/`remote_tsap`。TSAP 默认值不凭经验写死，由 Device Profile +
-//! 真机 Gate 决定；此处仅做范围校验（u16 非零由传输层兜底）。
+//! `local_tsap`/`remote_tsap`。TSAP 默认值不凭经验写死，由真机 Gate
+//! 决定；此处仅做范围校验（u16 非零由传输层兜底）。
 //!
 //! 安全边界：Native NCK 无证书/用户口令/安全策略，本配置绝不出现
 //! username/password/certificate/security_policy（见 CONTRACT.md）。
