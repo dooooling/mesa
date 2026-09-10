@@ -417,6 +417,7 @@ async fn event_task_rest_crud_and_running_conflict() {
     cfg_store
         .create_endpoint(&mesa_config_store::EndpointRecord {
             id: "ct-task-001".into(),
+            name: "CT".into(),
             device_id: "d1".into(),
             driver_id: "simulator".into(),
             connection_json: "{}".into(),

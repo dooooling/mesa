@@ -23,7 +23,7 @@ function FieldControl({ f }: { f: FieldDescriptor }) {
 }
 
 export function DeviceManager() {
-  const [endpoints, setEndpoints] = useState<Array<{ id: string; driver_id: string; device_id?: string; state?: string; connection?: Record<string, unknown> }>>([]);
+  const [endpoints, setEndpoints] = useState<Array<{ id: string; name?: string; driver_id: string; device_id?: string; state?: string; connection?: Record<string, unknown> }>>([]);
   const [open, setOpen] = useState(false);
   const [form] = Form.useForm();
   const [desc, setDesc] = useState<DriverDescriptor | null>(null);
@@ -38,15 +38,15 @@ export function DeviceManager() {
   const [pointsSels, setPointsSels] = useState<Array<{ resource_id: string; parameters: Record<string, unknown>; outputs: Array<{ output: string; point_key: string }> }>>([]);
   const [intervalMs, setIntervalMs] = useState(1000);
   const [editOpen, setEditOpen] = useState(false);
-  const [editEp, setEditEp] = useState<{ id: string; driver_id: string; device_id?: string } | null>(null);
+  const [editEp, setEditEp] = useState<{ id: string; name?: string; driver_id: string; device_id?: string } | null>(null);
   const [editForm] = Form.useForm();
   const [editDesc, setEditDesc] = useState<DriverDescriptor | null>(null);
   const [editConn, setEditConn] = useState<Record<string, unknown>>({});
 
   const load = () => fetch("/api/v1/endpoints").then((r) => r.json()).then((j) => {
     const eps = (j.endpoints ?? []).map((e: never) => {
-      const x = e as { id: string; driver_id: string; device_id?: string; connection?: Record<string, unknown>; runtime?: { state?: string }; state?: string };
-      return { id: x.id, driver_id: x.driver_id, device_id: x.device_id, connection: x.connection, state: x.state ?? x.runtime?.state };
+      const x = e as { id: string; name?: string; driver_id: string; device_id?: string; connection?: Record<string, unknown>; runtime?: { state?: string }; state?: string };
+      return { id: x.id, name: x.name ?? x.id, driver_id: x.driver_id, device_id: x.device_id, connection: x.connection, state: x.state ?? x.runtime?.state };
     });
     setEndpoints(eps);
   }).catch(() => {});
@@ -118,7 +118,7 @@ export function DeviceManager() {
           return;
         }
       }
-      const r = await fetch("/api/v1/endpoints", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, device_id: id, driver_id: v.driver_id, connection }) });
+      const r = await fetch("/api/v1/endpoints", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, name: id, device_id: id, driver_id: v.driver_id, connection }) });
       const j = await r.json();
       if (!r.ok) return message.error(j.error?.message ?? "创建失败");
       message.success(`已创建 ${id}`);
@@ -154,7 +154,7 @@ export function DeviceManager() {
     const d = await fetch(`/api/v1/drivers/${r.driver_id ?? ep.driver_id}/descriptor`).then((x) => x.json()).catch(() => null);
     setEditDesc(d);
     setEditConn(conn);
-    setEditEp({ id: r.id ?? ep.id, driver_id: r.driver_id ?? ep.driver_id, device_id: r.device_id });
+    setEditEp({ id: r.id ?? ep.id, name: r.name ?? r.id ?? ep.id, driver_id: r.driver_id ?? ep.driver_id, device_id: r.device_id });
     setEditOpen(true);
   };
 
@@ -165,7 +165,8 @@ export function DeviceManager() {
     if (!Object.keys(connection).length) return message.warning("请填写连接参数");
     await fetch(`/api/v1/endpoints/${editEp.id}/stop`, { method: "POST" }).catch(() => {});
     await new Promise((r) => setTimeout(r, 300));
-    const r2 = await fetch(`/api/v1/endpoints/${editEp.id}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ device_id: editEp.device_id ?? editEp.id, driver_id: editEp.driver_id, connection }) });
+    // PR25：Update 形状无 driver_id（不可变）；name 透传（命名 UX 归 PR27）
+    const r2 = await fetch(`/api/v1/endpoints/${editEp.id}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: editEp.name ?? editEp.id, device_id: editEp.device_id ?? editEp.id, connection }) });
     const j = await r2.json().catch(() => ({}));
     if (!r2.ok) return message.error(j.error?.message ?? "修改失败");
     message.success("修改成功");
@@ -279,6 +280,7 @@ export function DeviceManager() {
           dataSource={endpoints}
           columns={[
             { title: "ID", dataIndex: "id", render: (v: string) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{v}</span> },
+            { title: "名称", dataIndex: "name", render: (v: string) => v ?? "—" },
             { title: "驱动", dataIndex: "driver_id", render: (v: string) => <Tag>{v}</Tag> },
             { title: "状态", dataIndex: "state", render: (v: string) => <Tag color={isRunning(v) ? "green" : (v ?? "").toUpperCase() === "FAILED" ? "red" : "default"}>{v ?? "—"}</Tag> },
             {

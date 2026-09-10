@@ -53,6 +53,7 @@ async fn app_with_endpoint(
     store
         .create_endpoint(&mesa_config_store::EndpointRecord {
             id: ep_id.clone(),
+            name: ep_id.clone(),
             device_id: "d1".into(),
             driver_id: driver_id.into(),
             connection_json: serde_json::to_string(&connection).unwrap(),

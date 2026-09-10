@@ -139,7 +139,7 @@ async fn mesad_process_restart_recovers_events_and_history() {
         port1,
         "POST",
         "/api/v1/endpoints",
-        Some(r#"{"id":"ep-restart","device_id":"d1","driver_id":"simulator","connection":{}}"#),
+        Some(r#"{"id":"ep-restart","name":"Restart","device_id":"d1","driver_id":"simulator","connection":{}}"#),
     )
     .await;
     assert!(st == 200 || st == 201, "create endpoint, got {st}");

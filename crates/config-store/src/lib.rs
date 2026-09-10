@@ -18,7 +18,7 @@ use mesa_core_types::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// 当前 schema 版本。增量迁移时递增并在 `meta` 中持久化（§6.1）。
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 // ---------------------------------------------------------------------------
 // 记录类型
@@ -32,9 +32,11 @@ pub struct DeviceRecord {
 }
 
 /// Endpoint 记录（§5.3）。`connection` 的语义由 Driver 解释，Core 只做 JSON 透传。
+/// `name` 为展示名（PR25）：创建必填、更新可改；`driver_id` 创建后不可变。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EndpointRecord {
     pub id: String,
+    pub name: String,
     pub device_id: String,
     pub driver_id: String,
     /// 已序列化的 connection JSON（对象）。
@@ -312,6 +314,7 @@ impl ConfigStore {
                 id TEXT PRIMARY KEY,
                 device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE RESTRICT,
                 driver_id TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
                 connection_json TEXT NOT NULL,
                 desired_running INTEGER NOT NULL DEFAULT 0,
                 updated_at_ns INTEGER NOT NULL
@@ -483,6 +486,50 @@ impl ConfigStore {
                 cur_ver = 4;
             }
         }
+        // 005 迁移（PR25）：endpoints 增加展示名 name。
+        // v5 不变量：所有 v5 库的 endpoints 表严格含 name 列（旧行默认为 ''）。
+        if cur_ver < 5 {
+            let has_5: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=5)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !has_5 {
+                Self::backup_file_db(&conn);
+                // 新库建表已含 name 列，直接 ADD 会报错；先查 PRAGMA。
+                let has_col: bool = conn
+                    .prepare("PRAGMA table_info(endpoints)")?
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?
+                    .iter()
+                    .any(|c| c == "name");
+                let tx = conn.transaction()?;
+                if !has_col {
+                    let sql5 = include_str!("../migrations/005_endpoint_name.sql");
+                    tx.execute_batch(sql5)?;
+                }
+                // 回填无条件执行：列已存在但 migration record 缺失的重入路径
+                // 同样保证 v5 不变量（所有 name 非空，旧行以 id 回填）。
+                tx.execute("UPDATE endpoints SET name=id WHERE trim(name)=''", [])?;
+                let checksum5 = format!(
+                    "{:x}",
+                    include_str!("../migrations/005_endpoint_name.sql").len()
+                );
+                tx.execute(
+                    "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(5,'005_endpoint_name',?1,?2)",
+                    params![checksum5, Self::now_ns()],
+                )?;
+                tx.execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','5')",
+                    [],
+                )?;
+                tx.commit()?;
+                cur_ver = 5;
+            }
+        }
         // 最终确保 meta 为最新
         if cur_ver < SCHEMA_VERSION {
             conn.execute(
@@ -589,6 +636,7 @@ impl ConfigStore {
         Self::validate_id(&rec.id)?;
         Self::validate_id(&rec.device_id)?;
         Self::validate_id(&rec.driver_id)?;
+        Self::validate_endpoint_name(&rec.name)?;
         // 校验 connection_json 为合法 JSON 对象
         let v: serde_json::Value =
             serde_json::from_str(&rec.connection_json).map_err(StoreError::Json)?;
@@ -609,9 +657,9 @@ impl ConfigStore {
             )));
         }
         let n = conn.execute(
-            "INSERT INTO endpoints(id,device_id,driver_id,connection_json,desired_running,updated_at_ns)
-             VALUES(?1,?2,?3,?4,?5,?6)",
-            params![rec.id, rec.device_id, rec.driver_id, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns],
+            "INSERT INTO endpoints(id,device_id,driver_id,name,connection_json,desired_running,updated_at_ns)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![rec.id, rec.device_id, rec.driver_id, rec.name, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns],
         );
         match n {
             Ok(_) => {
@@ -642,6 +690,7 @@ impl ConfigStore {
         Self::validate_id(&rec.id)?;
         Self::validate_id(&rec.device_id)?;
         Self::validate_id(&rec.driver_id)?;
+        Self::validate_endpoint_name(&rec.name)?;
         let v: serde_json::Value =
             serde_json::from_str(&rec.connection_json).map_err(StoreError::Json)?;
         if !v.is_object() {
@@ -670,9 +719,9 @@ impl ConfigStore {
         }
         let tx = conn.transaction()?;
         let n = tx.execute(
-            "INSERT INTO endpoints(id,device_id,driver_id,connection_json,desired_running,updated_at_ns)
-             VALUES(?1,?2,?3,?4,?5,?6)",
-            params![rec.id, rec.device_id, rec.driver_id, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns],
+            "INSERT INTO endpoints(id,device_id,driver_id,name,connection_json,desired_running,updated_at_ns)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![rec.id, rec.device_id, rec.driver_id, rec.name, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns],
         );
         match n {
             Ok(_) => {}
@@ -709,6 +758,7 @@ impl ConfigStore {
         secrets_to_upsert: &[(String, String)],
         secrets_to_delete: &[String],
     ) -> Result<bool, StoreError> {
+        Self::validate_endpoint_name(&rec.name)?;
         let v: serde_json::Value =
             serde_json::from_str(&rec.connection_json).map_err(StoreError::Json)?;
         if !v.is_object() {
@@ -726,8 +776,8 @@ impl ConfigStore {
         let tx = conn.transaction()?;
         // driver_id 创建后不可变：UPDATE 永不触碰 driver_id（API 层已拒绝变更）
         let n = tx.execute(
-            "UPDATE endpoints SET device_id=?1, connection_json=?2, desired_running=?3, updated_at_ns=?4 WHERE id=?5",
-            params![rec.device_id, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns, rec.id],
+            "UPDATE endpoints SET device_id=?1, name=?2, connection_json=?3, desired_running=?4, updated_at_ns=?5 WHERE id=?6",
+            params![rec.device_id, rec.name, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns, rec.id],
         )?;
         if n == 0 {
             return Ok(false);
@@ -753,16 +803,17 @@ impl ConfigStore {
     pub fn list_endpoints(&self) -> Result<Vec<EndpointRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,device_id,driver_id,connection_json,desired_running,updated_at_ns FROM endpoints ORDER BY id",
+            "SELECT id,device_id,driver_id,name,connection_json,desired_running,updated_at_ns FROM endpoints ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(EndpointRecord {
                 id: r.get(0)?,
                 device_id: r.get(1)?,
                 driver_id: r.get(2)?,
-                connection_json: r.get(3)?,
-                desired_running: r.get::<_, i32>(4)? != 0,
-                updated_at_ns: r.get(5)?,
+                name: r.get(3)?,
+                connection_json: r.get(4)?,
+                desired_running: r.get::<_, i32>(5)? != 0,
+                updated_at_ns: r.get(6)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -771,16 +822,17 @@ impl ConfigStore {
     pub fn get_endpoint(&self, id: &str) -> Result<Option<EndpointRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id,device_id,driver_id,connection_json,desired_running,updated_at_ns FROM endpoints WHERE id=?1",
+            "SELECT id,device_id,driver_id,name,connection_json,desired_running,updated_at_ns FROM endpoints WHERE id=?1",
             params![id],
             |r| {
                 Ok(EndpointRecord {
                     id: r.get(0)?,
                     device_id: r.get(1)?,
                     driver_id: r.get(2)?,
-                    connection_json: r.get(3)?,
-                    desired_running: r.get::<_, i32>(4)? != 0,
-                    updated_at_ns: r.get(5)?,
+                    name: r.get(3)?,
+                    connection_json: r.get(4)?,
+                    desired_running: r.get::<_, i32>(5)? != 0,
+                    updated_at_ns: r.get(6)?,
                 })
             },
         )
@@ -789,6 +841,7 @@ impl ConfigStore {
     }
 
     pub fn update_endpoint(&self, rec: &EndpointRecord) -> Result<bool, StoreError> {
+        Self::validate_endpoint_name(&rec.name)?;
         let v: serde_json::Value =
             serde_json::from_str(&rec.connection_json).map_err(StoreError::Json)?;
         if !v.is_object() {
@@ -797,8 +850,8 @@ impl ConfigStore {
         let conn = self.conn.lock().unwrap();
         // driver_id 创建后不可变：UPDATE 永不触碰 driver_id
         let n = conn.execute(
-            "UPDATE endpoints SET device_id=?1, connection_json=?2, desired_running=?3, updated_at_ns=?4 WHERE id=?5",
-            params![rec.device_id, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns, rec.id],
+            "UPDATE endpoints SET device_id=?1, name=?2, connection_json=?3, desired_running=?4, updated_at_ns=?5 WHERE id=?6",
+            params![rec.device_id, rec.name, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns, rec.id],
         )?;
         Ok(n > 0)
     }
@@ -1435,6 +1488,18 @@ impl ConfigStore {
         }
         Ok(())
     }
+
+    /// Endpoint 展示名校验（PR25）：非空（去空白后），长度 ≤128（与 id 同口径）。
+    /// v5 不变量：所有行 name 非空（旧行迁移时以 id 回填）。
+    fn validate_endpoint_name(name: &str) -> Result<(), StoreError> {
+        if name.trim().is_empty() {
+            return Err(StoreError::Validation("endpoint name 不能为空".into()));
+        }
+        if name.len() > 128 {
+            return Err(StoreError::Validation("endpoint name 过长（≤128）".into()));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1468,6 +1533,7 @@ mod tests {
     fn ep(id: &str, device: &str) -> EndpointRecord {
         EndpointRecord {
             id: id.into(),
+            name: format!("{id} 名称"),
             device_id: device.into(),
             driver_id: "simulator".into(),
             connection_json: "{}".into(),
@@ -1630,7 +1696,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "4");
+        assert_eq!(ver, "5");
         let has: bool = s
             .conn
             .lock()
@@ -1778,7 +1844,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "4");
+            assert_eq!(ver, "5");
             // 004：profile 列已删除，但设备行本身保留（仅去列，不丢行）
             let cols: Vec<String> = conn
                 .prepare("PRAGMA table_info(devices)")
@@ -1815,6 +1881,76 @@ mod tests {
         assert!(s.list_event_tasks("e1").unwrap().is_empty());
         s.replace_event_tasks("e1", &[event_task("al")]).unwrap();
         assert_eq!(s.list_event_tasks("e1").unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v4_file_db_upgrades_to_v5_endpoint_name_without_data_loss() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mesa-config-v4up-{}-{}.db",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE devices(id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE endpoints(
+                    id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE RESTRICT,
+                    driver_id TEXT NOT NULL,
+                    connection_json TEXT NOT NULL,
+                    desired_running INTEGER NOT NULL DEFAULT 0,
+                    updated_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE schema_migrations(
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    applied_at_ns INTEGER NOT NULL
+                );
+                INSERT INTO meta(key,value) VALUES('schema_version','4');
+                INSERT INTO schema_migrations(version,name,checksum,applied_at_ns)
+                    VALUES(1,'001_initial','x',1),(2,'002_management_control','y',2),
+                    (3,'003_event_tasks','z',3),(4,'004_remove_device_profile','w',4);
+                INSERT INTO devices(id,name) VALUES('d1','D1');
+                INSERT INTO endpoints(id,device_id,driver_id,connection_json,desired_running,updated_at_ns)
+                    VALUES('e1','d1','simulator','{}',1,7);
+                "#,
+            )
+            .unwrap();
+        }
+        let s = ConfigStore::open(&path).unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            let ver: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ver, "5");
+            // 旧行以 id 回填 name，业务行保留
+            let old_name: String = conn
+                .query_row("SELECT name FROM endpoints WHERE id='e1'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(old_name, "e1");
+        }
+        // 公共 API：旧行可读且名已回填；新写入必须带非空名，空名拒绝
+        let got = s.get_endpoint("e1").unwrap().unwrap();
+        assert_eq!(got.name, "e1");
+        let mut named = got.clone();
+        named.name = "NCK".into();
+        assert!(s.update_endpoint(&named).unwrap());
+        assert_eq!(s.get_endpoint("e1").unwrap().unwrap().name, "NCK");
+        named.name = "  ".into();
+        assert!(s.update_endpoint(&named).is_err());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2048,9 +2184,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // PR7 起 SCHEMA_VERSION=3，DeviceProfile 删除后升至 4；
+        // PR7 起 SCHEMA_VERSION=3，DeviceProfile 删除后升至 4，Endpoint.name 后升至 5；
         // 002/003 本身仍必须存在且已应用（增量链不断）
-        assert!(ver == "4", "新库应为 v4，got {ver}");
+        assert!(ver == "5", "新库应为 v5，got {ver}");
         let has2: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=2)",
