@@ -25,12 +25,12 @@ async fn app() -> (axum::Router, Arc<mesa_driver_manager::MesaManager>) {
 #[tokio::test]
 async fn validate_connection_ok_and_field_error() {
     let (app, _) = app().await;
-    // 正确连接：simulator seed
+    // 正确连接：simulator 空连接（未知字段会被统一校验拒绝）
     let req = Request::builder()
         .uri("/api/v1/drivers/simulator/validate-connection")
         .method("POST")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"connection":{"seed":1}}"#))
+        .body(Body::from(r#"{"connection":{}}"#))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -88,6 +88,21 @@ async fn post_json(app: axum::Router, uri: &str, body: &str) -> (StatusCode, ser
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
+async fn put_json(app: axum::Router, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .uri(uri)
+        .method("PUT")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
 #[tokio::test]
 async fn probe_does_not_create_endpoint() {
     let (app, _) = app().await;
@@ -96,7 +111,7 @@ async fn probe_does_not_create_endpoint() {
         .uri("/api/v1/drivers/simulator/probe")
         .method("POST")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"connection":{"seed":1}}"#))
+        .body(Body::from(r#"{"connection":{}}"#))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     // probe 必须 reachable，且不创建 Endpoint（endpoint 列表为空）
@@ -202,6 +217,131 @@ async fn probe_invalid_driver_config_is_400_with_driver_code() {
     // 否则无法区分 Handshake/Spawn/Rpc 三类失败（exact-SHA CI 教训）。
     assert_eq!(status, StatusCode::BAD_REQUEST, "probe body: {v}");
     assert_eq!(v["error"]["code"], "BAD_CONFIG", "probe body: {v}");
+}
+
+/// PR4 Task 保存门禁：generic 非法选择（未知 resource / 未知字段）入库即 400；
+/// 合法选择 200；endpoint connection 未知字段创建即 400。
+#[tokio::test]
+async fn task_save_gate_rejects_unknown_resource_and_connection_field() {
+    let (app, _) = app().await;
+    let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
+    assert_eq!(s, StatusCode::CREATED, "create device");
+    // connection 未知字段 → 400（统一校验，未声明即拒绝）
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        r#"{"id":"e1","device_id":"d1","driver_id":"simulator","connection":{"seed":1}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["valid"], false);
+    assert!(!v["issues"].as_array().unwrap().is_empty());
+    // 合法 endpoint
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        r#"{"id":"e1","device_id":"d1","driver_id":"simulator","connection":{}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "create endpoint");
+    // 未知 resource → 400
+    let bad = r#"{"endpoint_id":"e1","tasks":[{"id":"t1","mode":"poll","interval_ms":100,
+        "binding":{"kind":"mesa.resources.v1","config":{"selections":[
+        {"resource_id":"nope","parameters":{},"outputs":[{"output":"value","point_key":"k"}]}]}}}]}"#;
+    let (s, v) = post_json(app.clone(), "/api/v1/tasks", bad).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["valid"], false);
+    // 未知参数字段 → 400
+    let bad2 = r#"{"endpoint_id":"e1","tasks":[{"id":"t1","mode":"poll","interval_ms":100,
+        "binding":{"kind":"mesa.resources.v1","config":{"selections":[
+        {"resource_id":"counter","parameters":{"bogus":1},"outputs":[{"output":"value","point_key":"k"}]}]}}}]}"#;
+    let (s, v) = post_json(app.clone(), "/api/v1/tasks", bad2).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    // 合法 generic → 200
+    let good = r#"{"endpoint_id":"e1","tasks":[{"id":"t1","mode":"poll","interval_ms":100,
+        "binding":{"kind":"mesa.resources.v1","config":{"selections":[
+        {"resource_id":"counter","parameters":{"start":1},"outputs":[{"output":"value","point_key":"k"}]}]}}}]}"#;
+    let (s, v) = post_json(app.clone(), "/api/v1/tasks", good).await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    // 非法 mode（simulator counter 只报 Poll）→ 400
+    let bad_mode = good.replace("\"mode\":\"poll\"", "\"mode\":\"subscribe\"");
+    let (s, v) = post_json(app.clone(), "/api/v1/tasks", &bad_mode).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    // 跨 Task point_key 重复 → 400（endpoint-wide 唯一，单 Task 内各自合法）
+    let dup = r#"{"endpoint_id":"e1","tasks":[
+        {"id":"t1","mode":"poll","interval_ms":100,"binding":{"kind":"mesa.resources.v1","config":{"selections":[
+        {"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k"}]}]}}},
+        {"id":"t2","mode":"poll","interval_ms":100,"binding":{"kind":"mesa.resources.v1","config":{"selections":[
+        {"resource_id":"sine","parameters":{},"outputs":[{"output":"value","point_key":"k"}]}]}}}]}"#;
+    let (s, v) = post_json(app.clone(), "/api/v1/tasks", dup).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert!(
+        v["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["code"] == "DUPLICATE_POINT_KEY")
+    );
+    // driver_id 不可变 → 400
+    let (s, v) = put_json(
+        app,
+        "/api/v1/endpoints/e1",
+        r#"{"device_id":"d1","driver_id":"s7","connection":{}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], "IMMUTABLE_DRIVER");
+}
+
+/// PR4 Secret 正式语义：缺失保留旧值、marker 保留、显式 clear 删除。
+///（opcua password 为 optional Secret；marker 复用可观测保留/删除。）
+#[tokio::test]
+async fn secret_update_missing_keeps_and_clear_deletes() {
+    let (app, _) = app().await;
+    let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let conn = r#"{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":"pw1"}"#;
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        &format!(r#"{{"id":"e9","device_id":"d1","driver_id":"opcua","connection":{conn}}}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    // 更新时不带 password → 保留；随后 marker 更新成功即证明旧值仍在
+    let conn2 = r#"{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u"}"#;
+    let (s, v) = put_json(
+        app.clone(),
+        "/api/v1/endpoints/e9",
+        &format!(r#"{{"device_id":"d1","driver_id":"opcua","connection":{conn2}}}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let conn3 = r#"{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":{"secret_set":true}}"#;
+    let (s, v) = put_json(
+        app.clone(),
+        "/api/v1/endpoints/e9",
+        &format!(r#"{{"device_id":"d1","driver_id":"opcua","connection":{conn3}}}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "marker 保留应成功，body: {v}");
+    // 显式 clear → 删除；随后 marker 应报 SECRET_NOT_FOUND
+    let conn4 = r#"{"endpoint_url":"opc.tcp://127.0.0.1:4840","password":{"clear_secret":true}}"#;
+    let (s, v) = put_json(
+        app.clone(),
+        "/api/v1/endpoints/e9",
+        &format!(r#"{{"device_id":"d1","driver_id":"opcua","connection":{conn4}}}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let (s, v) = put_json(
+        app,
+        "/api/v1/endpoints/e9",
+        &format!(r#"{{"device_id":"d1","driver_id":"opcua","connection":{conn3}}}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], "SECRET_NOT_FOUND");
 }
 
 /// 设备不可达是 200 + reachable:false（不是 5xx）：s7 连关闭端口。

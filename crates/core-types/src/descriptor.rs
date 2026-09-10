@@ -71,6 +71,10 @@ impl DriverDescriptor {
                 r.validate()?;
             }
         }
+        // NOTE：resources modes ↔ capabilities 的交叉检查故意不在此做——
+        // Descriptor 2.0 definition validity 已在 PR22–PR23 冻结，事后收紧即
+        // Major 变更；执行能力检查归 `validate_task_set_against`（配置能否被
+        // 该 Driver 执行），见 resource.rs。
         self.controls.validate()?;
         self.events.validate()?;
         Ok(())

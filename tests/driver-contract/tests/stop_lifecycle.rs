@@ -76,7 +76,7 @@ async fn stop_while_reconnecting_is_bounded_and_explicit() {
         endpoint_id: ep.into(),
         driver_id: "simulator".into(),
         // 第 2 个 data 批后进程退出（50ms poll → 约 100ms 后死亡）。
-        connection_json: r#"{"faults":{"crash_after_batches":2}}"#.into(),
+        connection_json: r#"{"crash_after_batches":2}"#.into(),
         tasks: vec![common::poll_task(
             "d",
             50,

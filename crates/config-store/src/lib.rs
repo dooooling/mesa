@@ -724,9 +724,10 @@ impl ConfigStore {
         }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        // driver_id 创建后不可变：UPDATE 永不触碰 driver_id（API 层已拒绝变更）
         let n = tx.execute(
-            "UPDATE endpoints SET device_id=?1, driver_id=?2, connection_json=?3, desired_running=?4, updated_at_ns=?5 WHERE id=?6",
-            params![rec.device_id, rec.driver_id, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns, rec.id],
+            "UPDATE endpoints SET device_id=?1, connection_json=?2, desired_running=?3, updated_at_ns=?4 WHERE id=?5",
+            params![rec.device_id, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns, rec.id],
         )?;
         if n == 0 {
             return Ok(false);
@@ -794,9 +795,10 @@ impl ConfigStore {
             return Err(StoreError::Validation("connection 必须为 JSON 对象".into()));
         }
         let conn = self.conn.lock().unwrap();
+        // driver_id 创建后不可变：UPDATE 永不触碰 driver_id
         let n = conn.execute(
-            "UPDATE endpoints SET device_id=?1, driver_id=?2, connection_json=?3, desired_running=?4, updated_at_ns=?5 WHERE id=?6",
-            params![rec.device_id, rec.driver_id, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns, rec.id],
+            "UPDATE endpoints SET device_id=?1, connection_json=?2, desired_running=?3, updated_at_ns=?4 WHERE id=?5",
+            params![rec.device_id, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns, rec.id],
         )?;
         Ok(n > 0)
     }

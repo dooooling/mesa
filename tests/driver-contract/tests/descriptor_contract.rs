@@ -184,7 +184,11 @@ fn synthetic_descriptor() -> DriverDescriptor {
         resources,
         controls: ControlCatalog::default(),
         resource_selection_methods: vec![ResourceSelectionMethod::Manual],
-        capabilities: DriverCapabilities::default(),
+        // capabilities 必须与 resources modes 同口径（交叉不变量）
+        capabilities: DriverCapabilities {
+            poll: true,
+            ..Default::default()
+        },
         events: Default::default(),
     }
 }
@@ -199,6 +203,99 @@ fn synthetic_descriptor_covers_all_field_types_and_validates() {
     let back: DriverDescriptor = serde_json::from_str(&json).unwrap();
     assert_eq!(back.connection.fields.len(), 12);
     back.validate().unwrap();
+}
+
+#[test]
+fn task_set_gate_rejects_cross_task_dup_and_write_only_output() {
+    use mesa_core_types::{AccessMode, OutputDescriptor, OutputTypeSpec, TaskMode};
+    let mut d = synthetic_descriptor();
+    // 追加一个只写 output
+    d.resources[0].outputs.push(OutputDescriptor {
+        id: "cmd".into(),
+        label: "cmd".into(),
+        type_spec: OutputTypeSpec::Fixed {
+            data_type: mesa_core_types::DataType::Bool,
+        },
+        unit: None,
+        access: AccessMode::Write,
+    });
+    d.validate().unwrap();
+    let res_id = d.resources[0].id.clone();
+    let mk_sel = |key: &str| mesa_core_types::ResourceSelection {
+        resource_id: res_id.clone(),
+        parameters: serde_json::json!({}),
+        outputs: vec![mesa_core_types::SelectedOutput {
+            output: "cmd".into(),
+            point_key: key.into(),
+        }],
+    };
+    // 只写 output 不可采集
+    let issues = mesa_core_types::validate_task_set_against(
+        &d,
+        &[(&TaskMode::Poll, &[mk_sel("k1")][..], "tasks[0].selections")],
+    );
+    assert!(
+        issues.iter().any(|i| i.code == "ACCESS_NOT_SUPPORTED"),
+        "{issues:?}"
+    );
+    // 跨 Task 同 key 即重复（ResourceDescriptor 仅 schematic，用 value 测法不同路径）
+    let good_sel = |key: &str| mesa_core_types::ResourceSelection {
+        resource_id: res_id.clone(),
+        parameters: serde_json::json!({}),
+        outputs: vec![mesa_core_types::SelectedOutput {
+            output: d.resources[0].outputs[0].id.clone(),
+            point_key: key.into(),
+        }],
+    };
+    let issues = mesa_core_types::validate_task_set_against(
+        &d,
+        &[
+            (
+                &TaskMode::Poll,
+                &[good_sel("dup")][..],
+                "tasks[0].selections",
+            ),
+            (
+                &TaskMode::Poll,
+                &[good_sel("dup")][..],
+                "tasks[1].selections",
+            ),
+        ],
+    );
+    assert!(
+        issues.iter().any(|i| i.code == "DUPLICATE_POINT_KEY"),
+        "{issues:?}"
+    );
+}
+
+/// 分层门：capabilities 缺口在任务门拒绝，但 Descriptor 2.0 本身仍合法
+///（definition validity 冻结，不得事后收紧）。
+#[test]
+fn capabilities_gap_rejected_at_task_gate_not_descriptor() {
+    use mesa_core_types::TaskMode;
+    let mut d = synthetic_descriptor();
+    d.capabilities.poll = false;
+    // Descriptor 层：仍然合法（2.0 未收紧）
+    d.validate().expect("2.0 definition validity 不得收紧");
+    let res_id = d.resources[0].id.clone();
+    let out_id = d.resources[0].outputs[0].id.clone();
+    let sel = mesa_core_types::ResourceSelection {
+        resource_id: res_id,
+        parameters: serde_json::json!({}),
+        outputs: vec![mesa_core_types::SelectedOutput {
+            output: out_id,
+            point_key: "k".into(),
+        }],
+    };
+    // 任务层：Poll 跑不起来，必须拒绝
+    let issues = mesa_core_types::validate_task_set_against(
+        &d,
+        &[(&TaskMode::Poll, &[sel][..], "tasks[0].selections")],
+    );
+    assert!(
+        issues.iter().any(|i| i.code == "MODE_NOT_SUPPORTED"),
+        "{issues:?}"
+    );
 }
 
 #[test]

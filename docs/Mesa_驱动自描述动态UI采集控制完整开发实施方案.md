@@ -1353,6 +1353,10 @@ Update：
 → 删除 Secret
 ```
 
+Endpoint 的 `driver_id` 创建后不可变（PR4 冻结）：选错 Driver 删除重建；
+update 传入不同 driver_id 即 `IMMUTABLE_DRIVER` 拒绝，Store UPDATE 永不写
+driver_id。`Endpoint.name` 尚未进入 `EndpointRecord`，归下一 PR domain 项。
+
 ## 5.5 Driver 获取 Secret
 
 运行 Endpoint：
@@ -2336,8 +2340,19 @@ resource exists
 parameters schema valid
 output exists
 point_key valid
-point_key endpoint unique
+point_key endpoint unique（跨 Task 全集合，validate_task_set_against）
+task mode 被资源 modes 支持
+只写 output 不可被采集任务选中
 ```
+
+Core 统一执行点（PR4）：`validate_task_set_against`（data）/
+`validate_event_binding_against`（event）是 Task 保存门禁唯一实现——
+REST 全量 replace/PUT 与 start_endpoint 启动前都必须先过本校验再入库/启动；
+无 generic 任务（含清空）直接放行，不碰 Descriptor（legacy 不依赖 Driver 可用）。
+Driver 侧 configure 是第二道门，不得替代。Legacy 种别是 Driver 私有，
+Core 只做结构校验。connection 同理先过 `validate_instance` 再入库
+（secret 感知：logical 真实值参检——明文用新值、marker 物化旧值、
+缺失继承旧值、显式 clear 删除）。
 
 通用 Binding：
 

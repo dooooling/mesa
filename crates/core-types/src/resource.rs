@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{FieldType, LocalizedText, SchemaDescriptor};
+use crate::descriptor::DriverDescriptor;
+use crate::schema::{FieldType, LocalizedText, SchemaDescriptor, ValidationIssue};
 use crate::{DataType, TaskMode};
 
 /// 访问模式（§3.2）。
@@ -226,3 +227,139 @@ pub fn validate_selections_structure(selections: &[ResourceSelection]) -> Result
 
 /// 通用 Binding 种别常量
 pub const GENERIC_BINDING_KIND: &str = "mesa.resources.v1";
+
+/// Core 统一 ResourceSelection 校验（§15，Task 保存门禁语义实现）：
+/// 结构（沿用 `validate_selections_structure` 语义）+ Descriptor 语义
+///（resource 存在、output 存在、task mode 被资源支持、parameters 过
+/// `validate_instance`）。路径以 `root` 为前缀（如 `tasks[0].selections`）。
+/// 空 Vec = 通过。Driver 侧 configure 是第二道门，不得替代本函数。
+///
+/// 注意：point_key 唯一只在本 Task 内保证；跨 Task 的 Endpoint-wide 唯一
+/// 由 `validate_task_set_against` 统一执行——保存/启动门禁必须走集合入口。
+pub fn validate_selections_against(
+    descriptor: &DriverDescriptor,
+    mode: &TaskMode,
+    selections: &[ResourceSelection],
+    root: &str,
+) -> Vec<ValidationIssue> {
+    validate_task_set_against(descriptor, &[(mode, selections, root)])
+}
+
+/// Task 集合级校验（保存/启动门禁唯一入口）：逐 Task 复用单 Task 语义，
+/// 外加 **Endpoint-wide point_key 唯一**（跨所有传入 Task；冻结契约
+/// `point_key endpoint unique`，ConfigStore 只保 task id 唯一，拦不住此处）。
+/// `tasks` 每项为 (task mode, selections, 路径前缀如 `tasks[0].selections`)。
+pub fn validate_task_set_against(
+    descriptor: &DriverDescriptor,
+    tasks: &[(&TaskMode, &[ResourceSelection], &str)],
+) -> Vec<ValidationIssue> {
+    use std::collections::HashMap;
+    let mut issues = Vec::new();
+    // point_key → 首次出现位置（跨 Task 全局唯一）
+    let mut seen_keys: HashMap<&str, String> = HashMap::new();
+    for (mode, selections, root) in tasks {
+        // 结构级（同 binding 内 point_key 唯一等；结构坏即跳过本 Task，避免级联误报）
+        if let Err(e) = validate_selections_structure(selections) {
+            issues.push(ValidationIssue {
+                path: (*root).into(),
+                code: "INVALID_STRUCTURE".into(),
+                message: e,
+            });
+            continue;
+        }
+        for (i, sel) in selections.iter().enumerate() {
+            let base = format!("{root}[{i}]");
+            let Some(res) = descriptor
+                .resources
+                .iter()
+                .find(|r| r.id == sel.resource_id)
+            else {
+                issues.push(ValidationIssue {
+                    path: format!("{base}.resource_id"),
+                    code: "UNKNOWN_RESOURCE".into(),
+                    message: format!("resource `{}` 未声明", sel.resource_id),
+                });
+                continue;
+            };
+            // mode 支持（modes 为空即默认仅 Poll）
+            let effective: Vec<TaskMode> = if res.modes.is_empty() {
+                vec![TaskMode::Poll]
+            } else {
+                res.modes.clone()
+            };
+            if !effective.contains(*mode) {
+                issues.push(ValidationIssue {
+                    path: base.clone(),
+                    code: "MODE_NOT_SUPPORTED".into(),
+                    message: format!("resource `{}` 不支持 {mode:?} 模式", sel.resource_id),
+                });
+            }
+            // 执行能力：resource 允许还不够，Driver capabilities 必须对应为
+            // true，否则保存门禁会放行 Runtime 实际跑不起来的 mode。
+            //（故意放在任务校验层而非 Descriptor::validate：2.0 definition
+            // validity 已冻结，此处只裁决“当前配置能否被该 Driver 执行”。）
+            let cap_ok = match mode {
+                TaskMode::Poll => descriptor.capabilities.poll,
+                TaskMode::Subscribe => descriptor.capabilities.subscribe,
+            };
+            if !cap_ok {
+                issues.push(ValidationIssue {
+                    path: base.clone(),
+                    code: "MODE_NOT_SUPPORTED".into(),
+                    message: format!("driver capabilities 不支持 {mode:?} 模式"),
+                });
+            }
+            // parameters（null 视为 {}，与 Driver 侧归一一致）
+            let params = if sel.parameters.is_null() {
+                serde_json::json!({})
+            } else {
+                sel.parameters.clone()
+            };
+            for issue in res
+                .parameters
+                .validate_instance(&format!("{base}.parameters"), &params)
+            {
+                issues.push(issue);
+            }
+            // outputs 存在性 + point_key Endpoint-wide 唯一 + 读访问
+            for out in &sel.outputs {
+                let out_desc = res.outputs.iter().find(|o| o.id == out.output);
+                if out_desc.is_none() {
+                    issues.push(ValidationIssue {
+                        path: format!("{base}.outputs"),
+                        code: "UNKNOWN_OUTPUT".into(),
+                        message: format!(
+                            "resource `{}` 无 output `{}`",
+                            sel.resource_id, out.output
+                        ),
+                    });
+                }
+                // 数据采集任务只能读：只写 output 不可被 Poll/Subscribe 选中
+                //（写走 Control 面，不进采集 PointDescriptor）。
+                if out_desc.is_some_and(|o| o.access == AccessMode::Write) {
+                    issues.push(ValidationIssue {
+                        path: format!("{base}.outputs"),
+                        code: "ACCESS_NOT_SUPPORTED".into(),
+                        message: format!(
+                            "resource `{}` output `{}` 只写，不可采集",
+                            sel.resource_id, out.output
+                        ),
+                    });
+                }
+                if let Some(first) = seen_keys.get(out.point_key.as_str()) {
+                    issues.push(ValidationIssue {
+                        path: format!("{base}.outputs"),
+                        code: "DUPLICATE_POINT_KEY".into(),
+                        message: format!(
+                            "point_key `{}` 与 {first} 重复（endpoint 内必须唯一）",
+                            out.point_key
+                        ),
+                    });
+                } else {
+                    seen_keys.insert(&out.point_key, base.clone());
+                }
+            }
+        }
+    }
+    issues
+}
