@@ -65,12 +65,6 @@ fn driver_error_to_probe_error(kind: &str, code: &str, message: String) -> Probe
     }
 }
 
-/// 探测结果：设备事实（Driver 只返回 facts，不参与任何型号解释）。
-#[derive(Debug)]
-pub struct ProbeResult {
-    pub report: ProbeReport,
-}
-
 /// Probe RPC 版本门控（纯函数，可单测）：协商 Minor < 2 的旧 Driver
 /// 不识别 ProbeRequest（会静默忽略），必须直接 Unsupported，不得发 RPC 干等。
 pub(crate) fn probe_supported(negotiated_minor: u32) -> bool {
@@ -84,7 +78,7 @@ impl MesaManager {
         &self,
         driver_id: &str,
         connection_json: &str,
-    ) -> Result<ProbeResult, ProbeError> {
+    ) -> Result<ProbeReport, ProbeError> {
         let disc = self
             .find_driver(driver_id)
             .ok_or_else(|| ProbeError::DriverNotFound(driver_id.to_string()))?;
@@ -96,7 +90,7 @@ impl MesaManager {
                 Ok(r) => r?,
                 Err(_) => return Err(ProbeError::Timeout),
             };
-        Ok(ProbeResult { report })
+        Ok(report)
     }
 
     /// 临时探测连接句柄（Core 分配；临时会话内唯一即可，0 有特殊含义禁用）。

@@ -345,7 +345,7 @@ P1.3 Configure / Runtime 性能预算
 
 ```text
 P2.1 Diagnostics / Runbook
-P2.2 DeviceProfile / Preset / i18n / ImportIssue
+P2.2 DeviceProfile / Preset / i18n / ImportIssue（DeviceProfile 部分已废止，见 §10/PR #21）
 P2.3 Release Validation Artifact Schema
 ```
 
@@ -1566,6 +1566,9 @@ Endpoint 删除后历史控制审计仍然必须保留
 
 ## 6.7 DeviceProfile 不进 V2 DB
 
+> **已废止（PR #21）：DeviceProfile 整条链已删除，`devices` 表 schema v4
+> 仅含 `(id, name)`。本节保留仅作历史参考。**
+
 V1 Profile 作为 Driver Package 版本化资产：
 
 ```text
@@ -1904,6 +1907,13 @@ Diagnostics 字段
 ---
 
 # 10. P2.2：DeviceProfile 精确契约
+
+> **已废止（架构冻结复审，PR #21 删除 DeviceProfile 整条链）：**
+> `DeviceProfile/MatchRule/Preset/profile_hints/DeviceRecord.profile`、
+> `/api/v1/profiles/*`、`drivers/*/profiles/*.json` 已全部删除；
+> Probe 只返回事实，不做型号推断。未来如需“采集模板”另立
+> `CollectionPreset/Template`，CNC 语义统一另立 `AssetModel`，
+> 均不再使用 DeviceProfile 名称。本章保留仅作历史参考。
 
 Profile 不允许任意脚本。
 
@@ -3325,6 +3335,8 @@ no OPC UA special frontend component
 ---
 
 ## Milestone I — DeviceProfile
+
+> **已废止（PR #21 删除 DeviceProfile 整条链）。以下保留仅作历史参考。**
 
 ### 完成
 

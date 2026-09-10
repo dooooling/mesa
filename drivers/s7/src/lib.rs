@@ -358,7 +358,7 @@ impl DriverConnection for S7Connection {
         let warnings = if read_note.is_some() {
             vec![ProbeWarning {
                 code: "IDENTITY_UNAVAILABLE".into(),
-                message: "设备身份（vendor/model）未能识别，profile 提示可能缺失".into(),
+                message: "无法从 SZL 可靠确定设备身份信息（vendor/model）".into(),
             }]
         } else {
             Vec::new()

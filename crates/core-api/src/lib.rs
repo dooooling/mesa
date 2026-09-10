@@ -546,24 +546,21 @@ async fn probe_driver(
     }
     let conn_str = serde_json::to_string(&conn_val).unwrap();
     match state.manager.probe(&id, &conn_str).await {
-        Ok(res) => {
-            let r = res.report;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "reachable": r.reachable,
-                    "device": {
-                        "vendor": r.vendor,
-                        "family": r.family,
-                        "model": r.model,
-                        "firmware": r.firmware,
-                    },
-                    "model_confidence": r.model_confidence,
-                    "capabilities": r.capabilities,
-                    "warnings": r.warnings,
-                })),
-            )
-        }
+        Ok(r) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "reachable": r.reachable,
+                "device": {
+                    "vendor": r.vendor,
+                    "family": r.family,
+                    "model": r.model,
+                    "firmware": r.firmware,
+                },
+                "model_confidence": r.model_confidence,
+                "capabilities": r.capabilities,
+                "warnings": r.warnings,
+            })),
+        ),
         Err(e) => {
             use mesa_driver_manager::probe::ProbeError;
             match e {
@@ -1089,7 +1086,6 @@ async fn endpoint_diagnostics(
             "point_count": point_count,
             "connection_state": runtime.as_ref().map(|s| s.state.clone()).unwrap_or("UNKNOWN".into()),
             "descriptor_state": "Ready",
-            "profile_state": "None",
             "data_queue_depth": 0,
             "control_queue_depth": 0,
             "last_connected_at_ns": serde_json::Value::Null,

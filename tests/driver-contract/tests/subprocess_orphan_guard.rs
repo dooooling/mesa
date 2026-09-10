@@ -359,8 +359,8 @@ async fn manager_probe_success_reports_facts_and_cleans_child() {
     let before = live_pids(&exe_name(&unique));
     let mgr = MesaManager::discover(&root);
     let res = mgr.probe("simulator", "{}").await.expect("probe ok");
-    assert!(res.report.reachable);
-    assert_eq!(res.report.vendor.as_deref(), Some("Mesa"));
+    assert!(res.reachable);
+    assert_eq!(res.vendor.as_deref(), Some("Mesa"));
     assert_no_orphan(&before, &exe_name(&unique));
     cleanup_dir(&root);
 }

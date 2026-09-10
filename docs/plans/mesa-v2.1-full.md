@@ -284,6 +284,9 @@ Gate：`OPC UA 100 nodes→Add→ResourceSelection`，`S7 Manual仍正常`，无
 
 ## 11. Milestone I — DeviceProfile（§10）
 
+> **已废止（PR #21 删除 DeviceProfile 整条链）：本节全部内容不再实施，
+> 保留仅作历史参考。Probe 只返回事实；模板/语义模型以后另立概念。**
+
 `DeviceProfile{id,version,vendor,family,model,driver_id,match_rules,connection_defaults,rate_classes,presets}` 存 `drivers/<driver>/profiles/*.json`，`Device.profile`引ID（例 `fanuc-0i-f-plus` §10.1）。
 
 `MatchRule field∈{driver_id,probe.vendor/family/model/firmware} op∈{eq,in,prefix}` 禁JS/regex；多匹配 `model>family>返回候选`；`Preset→Selection[]→ResourceSelection[]→按(mode,interval)归并auto-poll-{100,1000,10000}`，手工Task不隐式合并；`point_key` 稳定，改则 `Profile MAJOR + warning`；`LocalizedText{default,zh-CN}` fallback `requested→default→id`；`Unit` 由 `OutputDescriptor` 定，禁Profile字符串换算（未来显式transform）。

@@ -92,7 +92,7 @@ impl Driver for SinumerikNckDriver {
                         f.validation.enum_options = Some(vec!["840d-sl".into(), "828d".into()]);
                         f
                     },
-                    // TSAP 显式必填（NCK 无 rack/slot 推导；远端值由 profile + 真机 Gate 定）。
+                    // TSAP 显式必填（NCK 无 rack/slot 推导；远端值由真机 Gate 定）。
                     FieldDescriptor::new("local_tsap", "Local TSAP", FieldType::Integer)
                         .required(true),
                     FieldDescriptor::new("remote_tsap", "Remote TSAP", FieldType::Integer)
