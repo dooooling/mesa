@@ -140,7 +140,7 @@ async fn driver_crash_restore_via_endpoint_runtime() {
     let cfg = BuiltinEndpoint {
         endpoint_id: "ct-crash".into(),
         driver_id: "simulator".into(),
-        connection_json: r#"{"faults":{"crash_after_batches":3}}"#.into(),
+        connection_json: r#"{"crash_after_batches":3}"#.into(),
         tasks: vec![poll_task(
             "t",
             40,

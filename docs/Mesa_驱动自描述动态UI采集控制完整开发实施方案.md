@@ -2337,7 +2337,15 @@ parameters schema valid
 output exists
 point_key valid
 point_key endpoint unique
+task mode 被资源 modes 支持
 ```
+
+Core 统一执行点（PR4）：`validate_selections_against`（data）/
+`validate_event_binding_against`（event）是 Task 保存门禁唯一实现——
+REST 全量 replace/PUT 与 start_endpoint 启动前都必须先过本校验再入库/启动；
+Driver 侧 configure 是第二道门，不得替代。Legacy 种别是 Driver 私有，
+Core 只做结构校验。connection 同理先过 `validate_instance` 再入库
+（secret 感知：marker 占位参检，缺 required 即拒）。
 
 通用 Binding：
 

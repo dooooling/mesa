@@ -396,6 +396,59 @@ impl GenericEventBinding {
     }
 }
 
+/// Core 统一事件绑定校验（§5，事件 Task 保存门禁唯一实现）：
+/// stream 存在、task mode 被流支持、parameters 过 `validate_instance`。
+/// 空 Vec = 通过。
+pub fn validate_event_binding_against(
+    catalog: &EventCatalog,
+    mode: &TaskMode,
+    binding: &GenericEventBinding,
+    root: &str,
+) -> Vec<crate::schema::ValidationIssue> {
+    use crate::schema::ValidationIssue;
+    let mut issues = Vec::new();
+    if binding.stream_id.trim().is_empty() {
+        issues.push(ValidationIssue {
+            path: format!("{root}.stream_id"),
+            code: "INVALID_STRUCTURE".into(),
+            message: "stream_id 不能为空".into(),
+        });
+        return issues;
+    }
+    let Some(stream) = catalog.streams.iter().find(|s| s.id == binding.stream_id) else {
+        issues.push(ValidationIssue {
+            path: format!("{root}.stream_id"),
+            code: "UNKNOWN_STREAM".into(),
+            message: format!("event stream `{}` 未声明", binding.stream_id),
+        });
+        return issues;
+    };
+    let effective: Vec<TaskMode> = if stream.modes.is_empty() {
+        vec![TaskMode::Subscribe]
+    } else {
+        stream.modes.clone()
+    };
+    if !effective.contains(mode) {
+        issues.push(ValidationIssue {
+            path: root.into(),
+            code: "MODE_NOT_SUPPORTED".into(),
+            message: format!("event stream `{}` 不支持 {mode:?} 模式", binding.stream_id),
+        });
+    }
+    let params = if binding.parameters.is_null() {
+        default_event_parameters()
+    } else {
+        binding.parameters.clone()
+    };
+    for issue in stream
+        .parameters
+        .validate_instance(&format!("{root}.parameters"), &params)
+    {
+        issues.push(issue);
+    }
+    issues
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

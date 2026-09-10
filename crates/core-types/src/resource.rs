@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{FieldType, LocalizedText, SchemaDescriptor};
+use crate::descriptor::DriverDescriptor;
+use crate::schema::{FieldType, LocalizedText, SchemaDescriptor, ValidationIssue};
 use crate::{DataType, TaskMode};
 
 /// 访问模式（§3.2）。
@@ -226,3 +227,86 @@ pub fn validate_selections_structure(selections: &[ResourceSelection]) -> Result
 
 /// 通用 Binding 种别常量
 pub const GENERIC_BINDING_KIND: &str = "mesa.resources.v1";
+
+/// Core 统一 ResourceSelection 校验（§15，Task 保存门禁唯一实现）：
+/// 结构（沿用 `validate_selections_structure` 语义）+ Descriptor 语义
+///（resource 存在、output 存在、task mode 被资源支持、parameters 过
+/// `validate_instance`）。路径以 `root` 为前缀（如 `tasks[0].selections`）。
+/// 空 Vec = 通过。Driver 侧 configure 是第二道门，不得替代本函数。
+pub fn validate_selections_against(
+    descriptor: &DriverDescriptor,
+    mode: &TaskMode,
+    selections: &[ResourceSelection],
+    root: &str,
+) -> Vec<ValidationIssue> {
+    use std::collections::HashSet;
+    let mut issues = Vec::new();
+    // 结构级（point_key 唯一等；结构坏即返，避免级联误报）
+    if let Err(e) = validate_selections_structure(selections) {
+        issues.push(ValidationIssue {
+            path: root.into(),
+            code: "INVALID_STRUCTURE".into(),
+            message: e,
+        });
+        return issues;
+    }
+    let mut seen_keys = HashSet::new();
+    for (i, sel) in selections.iter().enumerate() {
+        let base = format!("{root}[{i}]");
+        let Some(res) = descriptor
+            .resources
+            .iter()
+            .find(|r| r.id == sel.resource_id)
+        else {
+            issues.push(ValidationIssue {
+                path: format!("{base}.resource_id"),
+                code: "UNKNOWN_RESOURCE".into(),
+                message: format!("resource `{}` 未声明", sel.resource_id),
+            });
+            continue;
+        };
+        // mode 支持（modes 为空即默认仅 Poll）
+        let effective: Vec<TaskMode> = if res.modes.is_empty() {
+            vec![TaskMode::Poll]
+        } else {
+            res.modes.clone()
+        };
+        if !effective.contains(mode) {
+            issues.push(ValidationIssue {
+                path: base.clone(),
+                code: "MODE_NOT_SUPPORTED".into(),
+                message: format!("resource `{}` 不支持 {mode:?} 模式", sel.resource_id),
+            });
+        }
+        // parameters（null 视为 {}，与 Driver 侧归一一致）
+        let params = if sel.parameters.is_null() {
+            serde_json::json!({})
+        } else {
+            sel.parameters.clone()
+        };
+        for issue in res
+            .parameters
+            .validate_instance(&format!("{base}.parameters"), &params)
+        {
+            issues.push(issue);
+        }
+        // outputs 存在性 + point_key 唯一（跨 selection）
+        for out in &sel.outputs {
+            if !res.outputs.iter().any(|o| o.id == out.output) {
+                issues.push(ValidationIssue {
+                    path: format!("{base}.outputs"),
+                    code: "UNKNOWN_OUTPUT".into(),
+                    message: format!("resource `{}` 无 output `{}`", sel.resource_id, out.output),
+                });
+            }
+            if !seen_keys.insert(&out.point_key) {
+                issues.push(ValidationIssue {
+                    path: format!("{base}.outputs"),
+                    code: "DUPLICATE_POINT_KEY".into(),
+                    message: format!("point_key 重复: {}", out.point_key),
+                });
+            }
+        }
+    }
+    issues
+}

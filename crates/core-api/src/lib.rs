@@ -191,6 +191,124 @@ fn json_error(code: &str, message: &str) -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
+// Task 保存门禁：Core 统一 Descriptor 校验（PR4）
+// ---------------------------------------------------------------------------
+
+/// Data Task 保存门禁（generic 任务唯一实现；legacy 种别是 Driver 私有，
+/// Core 只做结构校验，由 store 层 `task.validate()` 覆盖）。
+/// issues 为空即通过；endpoint 缺失/descriptor 不可用分别映射 404/503。
+async fn gate_data_tasks(
+    state: &AppState,
+    endpoint_id: &str,
+    tasks: &[mesa_core_types::AcquisitionTask],
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let err = |code: StatusCode, v: serde_json::Value| Err((code, Json(v)));
+    let rec = match state.store.get_endpoint(endpoint_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return err(
+                StatusCode::NOT_FOUND,
+                json_error("NOT_FOUND", &format!("endpoint `{endpoint_id}`")),
+            );
+        }
+        Err(e) => return Err(store_err_to_response(e)),
+    };
+    let desc = match state.manager.get_descriptor(&rec.driver_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({ "error": { "code": e.code, "message": e.message } }),
+            );
+        }
+    };
+    let mut issues = Vec::new();
+    for (i, task) in tasks.iter().enumerate() {
+        if task.binding.kind != mesa_core_types::GENERIC_BINDING_KIND {
+            continue;
+        }
+        let root = format!("tasks[{i}].selections");
+        match mesa_core_types::GenericBinding::from_json(&task.binding.config) {
+            Ok(binding) => issues.extend(mesa_core_types::validate_selections_against(
+                &desc,
+                &task.mode,
+                &binding.selections,
+                &root,
+            )),
+            Err(e) => issues.push(mesa_core_types::ValidationIssue {
+                path: format!("tasks[{i}].binding"),
+                code: "INVALID_BINDING_CONFIG".into(),
+                message: e,
+            }),
+        }
+    }
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        err(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "valid": false, "issues": issues }),
+        )
+    }
+}
+
+/// 事件 Task 保存门禁（同上，`mesa.events.v1` 走 `desc.events` 目录校验）。
+async fn gate_event_tasks(
+    state: &AppState,
+    endpoint_id: &str,
+    tasks: &[mesa_core_types::EventTask],
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let err = |code: StatusCode, v: serde_json::Value| Err((code, Json(v)));
+    let rec = match state.store.get_endpoint(endpoint_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return err(
+                StatusCode::NOT_FOUND,
+                json_error("NOT_FOUND", &format!("endpoint `{endpoint_id}`")),
+            );
+        }
+        Err(e) => return Err(store_err_to_response(e)),
+    };
+    let desc = match state.manager.get_descriptor(&rec.driver_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({ "error": { "code": e.code, "message": e.message } }),
+            );
+        }
+    };
+    let mut issues = Vec::new();
+    for (i, task) in tasks.iter().enumerate() {
+        if task.binding.kind != mesa_core_types::GENERIC_EVENT_BINDING_KIND {
+            continue;
+        }
+        let root = format!("event_tasks[{i}]");
+        match mesa_core_types::GenericEventBinding::from_json(&task.binding.config) {
+            Ok(binding) => issues.extend(mesa_core_types::validate_event_binding_against(
+                &desc.events,
+                &task.mode,
+                &binding,
+                &root,
+            )),
+            Err(e) => issues.push(mesa_core_types::ValidationIssue {
+                path: format!("{root}.binding"),
+                code: "INVALID_BINDING_CONFIG".into(),
+                message: e,
+            }),
+        }
+    }
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        err(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "valid": false, "issues": issues }),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Secret 集成：Descriptor 驱动的 Secret 处理（P0-1）
 // ---------------------------------------------------------------------------
 
@@ -1235,6 +1353,14 @@ async fn create_endpoint(
     let mut secrets_to_upsert: Vec<(String, String)> = Vec::new();
     match state.manager.get_descriptor(&body.driver_id).await {
         Ok(desc) => {
+            // PR4 门禁：connection 先过统一校验（明文 secret 即 string，合法形态）
+            let conn_issues = desc.connection.validate_instance("connection", &conn_val);
+            if !conn_issues.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "valid": false, "issues": conn_issues })),
+                );
+            }
             let secret_keys = secret_field_keys(&desc.connection);
             if !secret_keys.is_empty() {
                 if let Some(obj) = conn_val.as_object_mut() {
@@ -1382,6 +1508,24 @@ async fn update_endpoint(
                     secrets_to_delete.push(ef);
                 }
             }
+            // PR4 门禁：connection 统一校验（secret 感知：已验证存在的 marker
+            // 填占位字符串参检；缺失的 required secret 即 REQUIRED 错误，
+            // 与“删除语义”冲突时以契约为准——缺 required 不可入库）。
+            let mut val_copy = conn_val.clone();
+            if let Some(obj) = val_copy.as_object_mut() {
+                for sk in &secret_keys {
+                    if obj.get(sk).is_some_and(is_secret_marker) {
+                        obj.insert(sk.clone(), serde_json::json!("*"));
+                    }
+                }
+            }
+            let conn_issues = desc.connection.validate_instance("connection", &val_copy);
+            if !conn_issues.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "valid": false, "issues": conn_issues })),
+                );
+            }
         }
         Err(e) => {
             return (
@@ -1457,6 +1601,10 @@ async fn start_endpoint(
         Ok(v) => v,
         Err(e) => return store_err_to_response(e),
     };
+    // PR4 门禁：启动前同样过统一校验（存量脏配置在此拦截，不进 Runtime 碰运气）
+    if let Err(r) = gate_data_tasks(&state, &id, &tasks).await {
+        return r;
+    }
     // Secret 集成：启动时临时还原明文（仅内存），fail-closed
     let mut materialized_json = rec.connection_json.clone();
     match state.manager.get_descriptor(&rec.driver_id).await {
@@ -1490,6 +1638,9 @@ async fn start_endpoint(
         Ok(v) => v,
         Err(e) => return store_err_to_response(e),
     };
+    if let Err(r) = gate_event_tasks(&state, &id, &event_tasks).await {
+        return r;
+    }
     let cfg = mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: rec.id.clone(),
         driver_id: rec.driver_id.clone(),
@@ -1593,6 +1744,10 @@ async fn replace_tasks(
             )),
         );
     }
+    // PR4 门禁：generic 任务先过统一 Descriptor 校验再入库
+    if let Err(r) = gate_data_tasks(&state, &ep, &body.tasks).await {
+        return r;
+    }
     match state.store.replace_tasks(&ep, &body.tasks) {
         Ok(rev) => (
             StatusCode::OK,
@@ -1645,6 +1800,10 @@ async fn put_tasks_for_endpoint(
                 "endpoint 正在运行，请先停止后再修改任务",
             )),
         );
+    }
+    // PR4 门禁：generic 任务先过统一 Descriptor 校验再入库
+    if let Err(r) = gate_data_tasks(&state, &endpoint_id, &tasks).await {
+        return r;
     }
     match state.store.replace_tasks(&endpoint_id, &tasks) {
         Ok(rev) => (
@@ -2229,6 +2388,10 @@ async fn put_event_tasks(
                 "endpoint 正在运行，请先停止后再修改事件任务",
             )),
         );
+    }
+    // PR4 门禁：mesa.events.v1 任务先过事件目录校验再入库
+    if let Err(r) = gate_event_tasks(&state, &endpoint_id, &tasks).await {
+        return r;
     }
     match state.store.replace_event_tasks(&endpoint_id, &tasks) {
         Ok(rev) => (

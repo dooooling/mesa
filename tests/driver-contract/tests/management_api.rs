@@ -25,12 +25,12 @@ async fn app() -> (axum::Router, Arc<mesa_driver_manager::MesaManager>) {
 #[tokio::test]
 async fn validate_connection_ok_and_field_error() {
     let (app, _) = app().await;
-    // 正确连接：simulator seed
+    // 正确连接：simulator 空连接（未知字段会被统一校验拒绝）
     let req = Request::builder()
         .uri("/api/v1/drivers/simulator/validate-connection")
         .method("POST")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"connection":{"seed":1}}"#))
+        .body(Body::from(r#"{"connection":{}}"#))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -96,7 +96,7 @@ async fn probe_does_not_create_endpoint() {
         .uri("/api/v1/drivers/simulator/probe")
         .method("POST")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"connection":{"seed":1}}"#))
+        .body(Body::from(r#"{"connection":{}}"#))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     // probe 必须 reachable，且不创建 Endpoint（endpoint 列表为空）
@@ -202,6 +202,56 @@ async fn probe_invalid_driver_config_is_400_with_driver_code() {
     // 否则无法区分 Handshake/Spawn/Rpc 三类失败（exact-SHA CI 教训）。
     assert_eq!(status, StatusCode::BAD_REQUEST, "probe body: {v}");
     assert_eq!(v["error"]["code"], "BAD_CONFIG", "probe body: {v}");
+}
+
+/// PR4 Task 保存门禁：generic 非法选择（未知 resource / 未知字段）入库即 400；
+/// 合法选择 200；endpoint connection 未知字段创建即 400。
+#[tokio::test]
+async fn task_save_gate_rejects_unknown_resource_and_connection_field() {
+    let (app, _) = app().await;
+    let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
+    assert_eq!(s, StatusCode::CREATED, "create device");
+    // connection 未知字段 → 400（统一校验，未声明即拒绝）
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        r#"{"id":"e1","device_id":"d1","driver_id":"simulator","connection":{"seed":1}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["valid"], false);
+    assert!(!v["issues"].as_array().unwrap().is_empty());
+    // 合法 endpoint
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        r#"{"id":"e1","device_id":"d1","driver_id":"simulator","connection":{}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "create endpoint");
+    // 未知 resource → 400
+    let bad = r#"{"endpoint_id":"e1","tasks":[{"id":"t1","mode":"poll","interval_ms":100,
+        "binding":{"kind":"mesa.resources.v1","config":{"selections":[
+        {"resource_id":"nope","parameters":{},"outputs":[{"output":"value","point_key":"k"}]}]}}}]}"#;
+    let (s, v) = post_json(app.clone(), "/api/v1/tasks", bad).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["valid"], false);
+    // 未知参数字段 → 400
+    let bad2 = r#"{"endpoint_id":"e1","tasks":[{"id":"t1","mode":"poll","interval_ms":100,
+        "binding":{"kind":"mesa.resources.v1","config":{"selections":[
+        {"resource_id":"counter","parameters":{"bogus":1},"outputs":[{"output":"value","point_key":"k"}]}]}}}]}"#;
+    let (s, v) = post_json(app.clone(), "/api/v1/tasks", bad2).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    // 合法 generic → 200
+    let good = r#"{"endpoint_id":"e1","tasks":[{"id":"t1","mode":"poll","interval_ms":100,
+        "binding":{"kind":"mesa.resources.v1","config":{"selections":[
+        {"resource_id":"counter","parameters":{"start":1},"outputs":[{"output":"value","point_key":"k"}]}]}}}]}"#;
+    let (s, v) = post_json(app.clone(), "/api/v1/tasks", good).await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    // 非法 mode（simulator counter 只报 Poll）→ 400
+    let bad_mode = good.replace("\"mode\":\"poll\"", "\"mode\":\"subscribe\"");
+    let (s, v) = post_json(app, "/api/v1/tasks", &bad_mode).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
 }
 
 /// 设备不可达是 200 + reachable:false（不是 5xx）：s7 连关闭端口。

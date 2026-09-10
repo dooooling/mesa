@@ -20,9 +20,9 @@
 //!
 //! - 点级 `"quality": "BAD"|"UNCERTAIN"` 静态质量覆盖；
 //! - 点级 `"bad_after_batches": N` / `"good_again_after": M` 实现 GOOD→BAD→GOOD 转换；
-//! - connection 配置 `"faults": {"fail_after_batches": N}` 在第 N 批后连接报
+//! - connection 顶层 `"fail_after_batches": N` 在第 N 批后连接报
 //!   SIMULATED_DISCONNECT（验证 Core 重连语义）；
-//! - `"faults": {"crash_after_batches": N}` 直接退出进程（仅子进程模式有意义，
+//! - `"crash_after_batches": N` 直接退出进程（仅子进程模式有意义，
 //!   进程内使用会终止测试进程），验证 Driver Crash Restore。
 //!
 //! TODO: 附录 A 其余能力（delay/jitter/burst/silent_interval）待性能预算阶段（§22）
@@ -89,10 +89,23 @@ impl Driver for SimulatorDriver {
                 version: m.version,
             },
             connection: SchemaDescriptor {
+                // PR4 connection canonical：故障注入为顶层可选整数
+                //（嵌套 faults 对象不可声明，Schema 无对象类型）；
+                // 旧 connection `seed` 是无效果死 knob，已删除
+                //（随机种子走各资源 seed 参数）。
                 fields: vec![
-                    FieldDescriptor::new("seed", "Seed", FieldType::Integer)
-                        .required(false)
-                        .default_value(serde_json::json!(0)),
+                    FieldDescriptor::new(
+                        "fail_after_batches",
+                        "Fail After Batches",
+                        FieldType::Integer,
+                    )
+                    .required(false),
+                    FieldDescriptor::new(
+                        "crash_after_batches",
+                        "Crash After Batches",
+                        FieldType::Integer,
+                    )
+                    .required(false),
                 ],
             },
             resources: vec![
@@ -473,7 +486,8 @@ fn bad_point(key: &str, why: &str) -> SdkDriverError {
     SdkDriverError::configuration("INVALID_POINT_SPEC", format!("point `{key}`: {why}"))
 }
 
-/// 连接级故障注入（附录 A.3）。从 connection 配置的 `faults` 对象解析。
+/// 连接级故障注入（附录 A.3）。从 connection 顶层可选整数解析
+///（canonical 单形态；嵌套 `faults` 已删除）。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct ConnFaults {
     /// 第 N 批发布后连接以 ConnectionError/SIMULATED_DISCONNECT 结束，
@@ -485,21 +499,12 @@ struct ConnFaults {
 }
 
 fn parse_conn_faults(cfg: &serde_json::Value) -> Result<ConnFaults, SdkDriverError> {
-    let mut f = ConnFaults::default();
-    let Some(faults) = cfg.get("faults") else {
-        return Ok(f);
-    };
-    if !faults.is_object() {
-        return Err(SdkDriverError::configuration(
-            "BAD_CONFIG",
-            "`faults` must be an object".to_string(),
-        ));
-    }
-    f.fail_after_batches = parse_batch_threshold(faults, "fail_after_batches")
-        .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?;
-    f.crash_after_batches = parse_batch_threshold(faults, "crash_after_batches")
-        .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?;
-    Ok(f)
+    Ok(ConnFaults {
+        fail_after_batches: parse_batch_threshold(cfg, "fail_after_batches")
+            .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?,
+        crash_after_batches: parse_batch_threshold(cfg, "crash_after_batches")
+            .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?,
+    })
 }
 
 /// 运行期可变状态。与点位一一对应，由各任务循环独占持有，无跨任务共享。
@@ -1506,29 +1511,21 @@ mod tests {
 
     #[tokio::test]
     async fn conn_faults_parse_and_default_config_ok() {
-        // 无 faults 字段的空配置照常工作（兼容空配置）
+        // 无故障字段的空配置照常工作（兼容空配置）
         let conn = SimulatorDriver.open_connection("e", "{}").await.unwrap();
         let _ = conn;
 
         let f = parse_conn_faults(
-            &serde_json::json!({"faults": {"fail_after_batches": 4, "crash_after_batches": 10}}),
+            &serde_json::json!({"fail_after_batches": 4, "crash_after_batches": 10}),
         )
         .unwrap();
         assert_eq!(f.fail_after_batches, Some(4));
         assert_eq!(f.crash_after_batches, Some(10));
 
-        // faults 非对象 / 阈值非法 → 结构化配置错误
+        // 阈值非法 → 结构化配置错误
         // （Box<dyn DriverConnection> 非 Debug，不能用 unwrap_err，需手动匹配）
         let err = match SimulatorDriver
-            .open_connection("e", "{\"faults\": []}")
-            .await
-        {
-            Err(e) => e,
-            Ok(_) => panic!("non-object faults must be rejected"),
-        };
-        assert_eq!(err.code, "BAD_CONFIG");
-        let err = match SimulatorDriver
-            .open_connection("e", "{\"faults\": {\"crash_after_batches\": \"x\"}}")
+            .open_connection("e", "{\"crash_after_batches\": \"x\"}")
             .await
         {
             Err(e) => e,

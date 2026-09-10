@@ -159,7 +159,7 @@ GET /api/v1/drivers/{id}/descriptor   # 懒加载：临时spawn→handshake→Ge
 
 | Driver | Descriptor 要点 | 保留的运行时能力 |
 |---|---|---|
-| **Simulator** (§15) | `connection{seed,points,frequency,failure_mode} / resources{counter,sine,random,constant}/outputs{value}` | 作为 Generic UI/Contract 测试Driver |
+| **Simulator** (§15) | `connection{fail_after_batches,crash_after_batches} / resources{counter,sine,toggle,random,constant}/outputs{value}`（PR4：connection `seed` 死 knob 删除，`faults` 嵌套打平为顶层整数） | 作为 Generic UI/Contract 测试Driver |
 | **S7** (§16,18) | `connection{host,port,rack,slot,timeout} / resource memory{area,db,offset,data_type,bit,length}` | `merge_paired_to_bulks_with_max / PDU negotiation / fragment/reassemble / BAD fallback` 保留，不参与Descriptor |
 | **FOCAS2** (§17) | `resources ≥9: dynamic/status/axis/spindle/pmc/macro/parameter/diagnosis/alarm/program`，`dynamic(axis)→feed/spindle.speed/program.current/position.absolute` 展示 **1 Resource多Outputs** | 后续 Milestone D 的 Planner 基础 |
 | **OPC UA** (§19) | `connection{endpointUrl,policy,mode,auth,CertificateRef} + resource node{NodeId,Attribute} + capabilities{poll,subscribe,browse,write,method}` | 订阅与Browse分离 |

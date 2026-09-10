@@ -21,7 +21,7 @@ pub use event::{
     EVENT_RECORD_MAX_BYTES, EVENT_SEVERITY_MAX, EventBatch, EventCatalog, EventCondition,
     EventFieldDescriptor, EventRecord, EventRecordError, EventSequenceTracker,
     EventStreamDescriptor, EventTask, EventTaskError, GENERIC_EVENT_BINDING_KIND,
-    GenericEventBinding, SequenceVerdict,
+    GenericEventBinding, SequenceVerdict, validate_event_binding_against,
 };
 pub use probe::{
     CapabilityItem, CapabilityState, PROBE_REPORT_MAX_BYTES, ProbeReport, ProbeWarning,
@@ -29,7 +29,8 @@ pub use probe::{
 };
 pub use resource::{
     AccessMode, GENERIC_BINDING_KIND, GenericBinding, OutputDescriptor, OutputTypeSpec,
-    ResourceDescriptor, ResourceSelection, SelectedOutput, validate_selections_structure,
+    ResourceDescriptor, ResourceSelection, SelectedOutput, validate_selections_against,
+    validate_selections_structure,
 };
 pub use schema::{
     Condition, ConditionOp, FieldDescriptor, FieldType, FieldValidation, LocalizedText,
