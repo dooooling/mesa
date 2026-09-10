@@ -510,6 +510,9 @@ impl ConfigStore {
                     let sql5 = include_str!("../migrations/005_endpoint_name.sql");
                     tx.execute_batch(sql5)?;
                 }
+                // 回填无条件执行：列已存在但 migration record 缺失的重入路径
+                // 同样保证 v5 不变量（所有 name 非空，旧行以 id 回填）。
+                tx.execute("UPDATE endpoints SET name=id WHERE trim(name)=''", [])?;
                 let checksum5 = format!(
                     "{:x}",
                     include_str!("../migrations/005_endpoint_name.sql").len()
@@ -1487,7 +1490,7 @@ impl ConfigStore {
     }
 
     /// Endpoint 展示名校验（PR25）：非空（去空白后），长度 ≤128（与 id 同口径）。
-    /// 旧库迁移行默认为 ''，读出后更新时必须补名——脏数据在写入侧拦截。
+    /// v5 不变量：所有行 name 非空（旧行迁移时以 id 回填）。
     fn validate_endpoint_name(name: &str) -> Result<(), StoreError> {
         if name.trim().is_empty() {
             return Err(StoreError::Validation("endpoint name 不能为空".into()));
@@ -1933,15 +1936,15 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(ver, "5");
-            // 旧行 name 默认为 ''，业务行保留
+            // 旧行以 id 回填 name，业务行保留
             let old_name: String = conn
                 .query_row("SELECT name FROM endpoints WHERE id='e1'", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(old_name, "");
+            assert_eq!(old_name, "e1");
         }
-        // 公共 API：旧行可读；新写入必须带非空名，空名拒绝
+        // 公共 API：旧行可读且名已回填；新写入必须带非空名，空名拒绝
         let got = s.get_endpoint("e1").unwrap().unwrap();
-        assert_eq!(got.name, "");
+        assert_eq!(got.name, "e1");
         let mut named = got.clone();
         named.name = "NCK".into();
         assert!(s.update_endpoint(&named).unwrap());
