@@ -181,6 +181,19 @@ impl SchemaDescriptor {
             {
                 return Err(format!("field {} min {min} > max {max}", f.key));
             }
+            // min/max 不得放宽 Port/Duration 内禀范围（自相矛盾的约束直接非法）
+            if let Some((lo, hi, name)) = intrinsic_range(f.field_type) {
+                if let Some(min) = f.validation.min
+                    && min < lo
+                {
+                    return Err(format!("field {} min {min} 放宽{name}内禀下界 {lo}", f.key));
+                }
+                if let Some(max) = f.validation.max
+                    && max > hi
+                {
+                    return Err(format!("field {} max {max} 放宽{name}内禀上界 {hi}", f.key));
+                }
+            }
             // pattern：仅 string-like 可带，且必须为合法 regex
             if let Some(pat) = &f.validation.pattern {
                 if !matches!(
@@ -216,6 +229,15 @@ impl SchemaDescriptor {
                     ));
                 }
                 if let Some(num) = def.as_f64() {
+                    // default 同样受内禀范围约束
+                    if let Some((lo, hi, name)) = intrinsic_range(f.field_type)
+                        && (num < lo || num > hi)
+                    {
+                        return Err(format!(
+                            "field {} default {num} 不在{name}内禀范围 [{lo}, {hi}]",
+                            f.key
+                        ));
+                    }
                     if let Some(min) = f.validation.min
                         && num < min
                     {
@@ -305,6 +327,20 @@ impl SchemaDescriptor {
                 });
             }
             if let Some(num) = val.as_f64() {
+                // Port/Duration 内禀范围（类型对但值越界 → OUT_OF_RANGE，
+                // 不得误报 INVALID_TYPE）。
+                if let Some((lo, hi, name)) = intrinsic_range(field.field_type)
+                    && (num < lo || num > hi)
+                {
+                    issues.push(ValidationIssue {
+                        path: path.clone(),
+                        code: "OUT_OF_RANGE".into(),
+                        message: format!(
+                            "field `{}` {num} 不在{name}内禀范围 [{lo}, {hi}]",
+                            field.key
+                        ),
+                    });
+                }
                 if let Some(min) = field.validation.min
                     && num < min
                 {
@@ -369,9 +405,8 @@ pub struct ValidationIssue {
     pub message: String,
 }
 
-/// JSON 值与 FieldType 一致性（与 definition 校验同口径）。
-/// Port/Duration 带内禀约束（Port 1..=65535，Duration >= 0）；
-/// Driver 可再用 validation.min/max 进一步收窄，但不得放宽。
+/// JSON 值与 FieldType 一致性（只回答“类型对不对”，不管值域）。
+/// Port → integer，Duration → number；值域由 [`intrinsic_range`] 回答。
 fn field_type_matches(t: FieldType, val: &serde_json::Value) -> bool {
     match t {
         FieldType::String
@@ -380,12 +415,20 @@ fn field_type_matches(t: FieldType, val: &serde_json::Value) -> bool {
         | FieldType::File
         | FieldType::CertificateRef
         | FieldType::Secret => val.is_string(),
-        FieldType::Integer => val.is_number() && val.as_i64().is_some(),
-        FieldType::Port => val.as_i64().is_some_and(|p| (1..=65535).contains(&p)),
-        FieldType::Number => val.is_number(),
-        FieldType::Duration => val.as_f64().is_some_and(|d| d >= 0.0),
+        FieldType::Integer | FieldType::Port => val.is_number() && val.as_i64().is_some(),
+        FieldType::Number | FieldType::Duration => val.is_number(),
         FieldType::Boolean => val.is_boolean(),
         FieldType::Enum => val.is_string(),
+    }
+}
+
+/// Port/Duration 内禀范围（Driver 可用 min/max 进一步收窄，不得放宽）：
+/// Port 1..=65535，Duration >= 0。返回 (lo, hi, 名称)。
+fn intrinsic_range(t: FieldType) -> Option<(f64, f64, &'static str)> {
+    match t {
+        FieldType::Port => Some((1.0, 65535.0, "Port")),
+        FieldType::Duration => Some((0.0, f64::INFINITY, "Duration")),
+        _ => None,
     }
 }
 

@@ -637,4 +637,22 @@ mod tests {
             DataType::DateTimeArray
         );
     }
+
+    /// DataType wire format 冻结（PascalCase；as_str() 小写不是 wire）：
+    /// TS DataType 与此镜像，漂移即红。改 wire 须走 cross-contract 变更。
+    #[test]
+    fn data_type_wire_format_is_pascal_case() {
+        assert_eq!(
+            serde_json::to_value(DataType::F64).unwrap(),
+            serde_json::json!("F64")
+        );
+        assert_eq!(
+            serde_json::to_value(DataType::Bool).unwrap(),
+            serde_json::json!("Bool")
+        );
+        assert_eq!(
+            serde_json::to_value(DataType::DateTimeArray).unwrap(),
+            serde_json::json!("DateTimeArray")
+        );
+    }
 }

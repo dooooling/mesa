@@ -583,12 +583,34 @@ fn definition_enforces_port_duration_intrinsics() {
             .validate_definition()
             .is_err()
     );
-    // instance 期同样：port -1 → INVALID_TYPE
+    // min/max 不得放宽内禀：Port min 0 / max 99999 → 拒绝；Duration min -1 → 拒绝
+    let mut f3 = FieldDescriptor::new("port", "Port", FieldType::Port).required(false);
+    f3.validation.min = Some(0.0);
+    assert!(
+        SchemaDescriptor::new(vec![f3])
+            .validate_definition()
+            .is_err()
+    );
+    let mut f4 = FieldDescriptor::new("port", "Port", FieldType::Port).required(false);
+    f4.validation.max = Some(99999.0);
+    assert!(
+        SchemaDescriptor::new(vec![f4])
+            .validate_definition()
+            .is_err()
+    );
+    let mut f5 = FieldDescriptor::new("timeout_ms", "Timeout", FieldType::Duration).required(false);
+    f5.validation.min = Some(-1.0);
+    assert!(
+        SchemaDescriptor::new(vec![f5])
+            .validate_definition()
+            .is_err()
+    );
+    // instance 期：port -1 → OUT_OF_RANGE（类型对，值越界）
     let schema = SchemaDescriptor::new(vec![
         FieldDescriptor::new("port", "Port", FieldType::Port).required(true),
     ]);
     let issues = schema.validate_instance("connection", &serde_json::json!({"port": -1}));
-    assert!(issues.iter().any(|i| i.code == "INVALID_TYPE"));
+    assert!(issues.iter().any(|i| i.code == "OUT_OF_RANGE"));
 }
 
 #[test]
@@ -684,7 +706,8 @@ fn validate_instance_covers_required_type_enum_range_pattern_unknown() {
     let issues =
         schema.validate_instance("connection", &serde_json::json!({"host":"h","mode":"z"}));
     assert!(issues.iter().any(|i| i.code == "INVALID_ENUM"));
-    // 越界（min/max 收窄；Port 超内禀范围则先判 INVALID_TYPE）
+    // 越界（min/max 收窄；Port/Duration 内禀越界同样 OUT_OF_RANGE，
+    // 字符串给数值字段才是 INVALID_TYPE）
     let issues = schema.validate_instance(
         "connection",
         &serde_json::json!({"host":"h","threshold":150}),
@@ -692,6 +715,9 @@ fn validate_instance_covers_required_type_enum_range_pattern_unknown() {
     assert!(issues.iter().any(|i| i.code == "OUT_OF_RANGE"));
     let issues =
         schema.validate_instance("connection", &serde_json::json!({"host":"h","port":99999}));
+    assert!(issues.iter().any(|i| i.code == "OUT_OF_RANGE"));
+    let issues =
+        schema.validate_instance("connection", &serde_json::json!({"host":"h","port":"102"}));
     assert!(issues.iter().any(|i| i.code == "INVALID_TYPE"));
     // 真 regex（旧伪实现 s.contains 会放过 "ab12"）
     let issues =

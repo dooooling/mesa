@@ -48,12 +48,14 @@ export interface LocalizedText {
   "zh-CN"?: string;
 }
 
-// 与 core-types OutputTypeSpec 镜像（discriminated union，非法定态不可表示）
+// 与 core-types DataType 的 serde wire format 镜像（PascalCase；
+// as_str() 的小写形态不是 wire format，不得用于此类型）。
+// 若 Rust 侧改 wire，descriptor_contract 的 wire 断言会先红。
 export type DataType =
-  | "bool" | "i32" | "u32" | "i64" | "u64" | "f32" | "f64"
-  | "string" | "bytes" | "datetime"
-  | "bool[]" | "i32[]" | "u32[]" | "i64[]" | "u64[]"
-  | "f32[]" | "f64[]" | "string[]" | "datetime[]";
+  | "Bool" | "I32" | "U32" | "I64" | "U64" | "F32" | "F64"
+  | "String" | "Bytes" | "DateTime"
+  | "BoolArray" | "I32Array" | "U32Array" | "I64Array" | "U64Array"
+  | "F32Array" | "F64Array" | "StringArray" | "DateTimeArray";
 
 export type OutputTypeSpec =
   | { kind: "fixed"; data_type: DataType }

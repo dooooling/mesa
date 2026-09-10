@@ -3,7 +3,7 @@
 > 仓库：`dooooling/mesa`  
 > 基线：当前 `master`  
 > 文档性质：**施工契约 + 测试契约 + 验收契约**  
-> 核心原则：不推翻现有 Runtime / Data Plane；先冻结契约，再实现 Descriptor、动态 UI、Profile、Discovery 和 Control Plane。
+> 核心原则：不推翻现有 Runtime / Data Plane；先冻结契约，再实现 Descriptor、动态 UI、Resource Selection / Browse 和 Control Plane。
 
 ---
 
@@ -33,7 +33,7 @@ V1 严格只读不会因为 Control 设计提前被破坏
 5. Data / Management / Control Queue 隔离；
 6. Configure / Runtime 性能预算；
 7. Diagnostics / Runbook；
-8. DeviceProfile / Preset / i18n / ImportIssue；
+8. Resource Selection / Browse / Import / i18n / ImportIssue（DeviceProfile / Preset 已废止，见 §10/PR #21）；
 9. Driver 子进程防孤儿；
 10. V1 Read-Only → Future Control 的过渡规则；
 11. Descriptor Proto / REST 错误码；
@@ -2236,6 +2236,8 @@ validate_definition（Descriptor 静态契约）：
 validate_instance（用户输入）：
   required、JSON 类型（含 Port/Duration 内禀）、enum、min/max、
   pattern（真 regex）、未知字段拒绝；
+  类型对但值越界（Port 99999、Duration -1）→ OUT_OF_RANGE，
+  JSON 类型本身不对（Port "102"）→ INVALID_TYPE；
   Secret 只有 JSON string 一种合法形态，SecretStore 的
   {"secret_set": true} 脱敏表示由 core-api 在调用前 materialize，
   不得进 Contract 层
