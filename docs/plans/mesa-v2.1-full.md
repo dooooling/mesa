@@ -83,7 +83,7 @@ P0 未完成不得宣布 `Descriptor Contract Frozen / Runtime Baseline Frozen`�
 crates/core-types/src/descriptor.rs   # FieldDescriptor{key,label,field_type,required,default,validation,ui:UiHints}
 crates/core-types/src/schema.rs       # SchemaDescriptor + validate()
 crates/core-types/src/resource.rs     # ResourceDescriptor{id,label,parameters:Schema,outputs,modes}
-crates/core-types/src/capability.rs   # DriverCapabilities/DiscoveryCapabilities/ControlCatalog
+crates/core-types/src/capability.rs   # DriverCapabilities/ResourceSelectionMethod/ControlCatalog
 ```
 
 §6 建议：不再塞 `lib.rs`，`lib.rs` 仅 re-export。
@@ -101,7 +101,7 @@ pub struct DriverDescriptor {
   pub connection: SchemaDescriptor,
   pub resources: Vec<ResourceDescriptor>,
   pub controls: ControlCatalog,
-  pub discovery: DiscoveryCapabilities,
+  pub resource_selection_methods: Vec<ResourceSelectionMethod>,
   pub capabilities: DriverCapabilities,
 }
 ```
@@ -269,11 +269,11 @@ Gate：`Driver增字段→API自动变，前端0改`（§34）。
 
 ## 10. Milestone H — Discovery/Import（§11, §20）
 
-`DiscoveryCapabilities{manual,browse,import}`；
+`ResourceSelectionMethod{Manual,Browse,Import}` 可组合枚举（唯一真值）；
 
 ```
 POST /api/v1/endpoints/{id}/browse {parent,filter,cursor,limit} → BrowseNode{id,label,kind,data_type,access,has_children,binding,metadata} # 分页懒加载，禁一次返全namespace
-POST /api/v1/endpoints/{id}/import # 导入器由Driver/Profile声明：NodeSet/L5X/ACD/SCL/IODD/EDS/DCF/CSV，不设Universal格式
+POST /api/v1/endpoints/{id}/import # 导入器由Driver声明：NodeSet/L5X/ACD/SCL/IODD/EDS/DCF/CSV，不设Universal格式
 ```
 
 `ImportIssue{severity∈{Warning,Error},code,message,path,line,column}`：有Error禁Apply，仅Warning可Apply但UI必须展示。

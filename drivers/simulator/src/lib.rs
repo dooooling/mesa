@@ -81,8 +81,8 @@ impl Driver for SimulatorDriver {
         };
         let m = self.metadata();
         DriverDescriptor {
-            contract_major: 1,
-            contract_minor: 0,
+            contract_major: mesa_core_types::DESCRIPTOR_CONTRACT_MAJOR,
+            contract_minor: mesa_core_types::DESCRIPTOR_CONTRACT_MINOR,
             identity: DriverIdentity {
                 driver_id: m.driver_id,
                 name: m.name,

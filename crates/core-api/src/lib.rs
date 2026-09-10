@@ -403,8 +403,6 @@ async fn validate_connection(
     // pattern（真 regex）/未知字段，一次返回全部问题。
     let issues = desc.connection.validate_instance("connection", &conn_val);
     if issues.is_empty() {
-        // 额外尝试 Driver 侧解析（不触设备，仅本地校验）
-        // 通过尝试 open_connection 的配置解析路径：当前仅做 JSON 对象校验，已足够
         (
             StatusCode::OK,
             Json(serde_json::json!({ "valid": true, "issues": [] })),

@@ -48,12 +48,17 @@ export interface LocalizedText {
   "zh-CN"?: string;
 }
 
-export interface OutputTypeSpec {
-  kind: "fixed" | "from_parameter" | "driver_resolved";
-  data_type?: string;
-  parameter?: string;
-  mapping?: Record<string, string>;
-}
+// 与 core-types OutputTypeSpec 镜像（discriminated union，非法定态不可表示）
+export type DataType =
+  | "bool" | "i32" | "u32" | "i64" | "u64" | "f32" | "f64"
+  | "string" | "bytes" | "datetime"
+  | "bool[]" | "i32[]" | "u32[]" | "i64[]" | "u64[]"
+  | "f32[]" | "f64[]" | "string[]" | "datetime[]";
+
+export type OutputTypeSpec =
+  | { kind: "fixed"; data_type: DataType }
+  | { kind: "from_parameter"; parameter: string; mapping: Record<string, DataType> }
+  | { kind: "driver_resolved" };
 
 export interface OutputDescriptor {
   id: string;

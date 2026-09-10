@@ -89,6 +89,20 @@ impl ResourceDescriptor {
             return Err("resource id 不能为空".into());
         }
         self.parameters.validate_definition()?;
+        // 安全边界：ResourceSelection 最终明文落 Task.binding_config_json，
+        // Resource 参数禁止 Secret（认证 Secret 只能走 connection + SecretStore，
+        // 与 EventStream.parameters 同规则）。
+        if self
+            .parameters
+            .fields
+            .iter()
+            .any(|f| f.field_type == FieldType::Secret)
+        {
+            return Err(format!(
+                "resource {} parameters 不得含 Secret 字段",
+                self.id
+            ));
+        }
         // outputs 唯一
         {
             use std::collections::HashSet;

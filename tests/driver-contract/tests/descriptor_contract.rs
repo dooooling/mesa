@@ -173,8 +173,8 @@ fn synthetic_descriptor() -> DriverDescriptor {
         modes: vec![],
     }];
     DriverDescriptor {
-        contract_major: 1,
-        contract_minor: 0,
+        contract_major: mesa_core_types::DESCRIPTOR_CONTRACT_MAJOR,
+        contract_minor: mesa_core_types::DESCRIPTOR_CONTRACT_MINOR,
         identity: mesa_core_types::descriptor::DriverIdentity {
             driver_id: "synthetic".into(),
             name: "Synthetic".into(),
@@ -204,8 +204,8 @@ fn synthetic_descriptor_covers_all_field_types_and_validates() {
 #[test]
 fn contract_version_must_be_present() {
     let mut d = synthetic_descriptor();
-    d.contract_major = 1;
-    d.contract_minor = 0;
+    d.contract_major = mesa_core_types::DESCRIPTOR_CONTRACT_MAJOR;
+    d.contract_minor = mesa_core_types::DESCRIPTOR_CONTRACT_MINOR;
     assert!(d.validate().is_ok());
 }
 
@@ -302,8 +302,8 @@ fn simulator_descriptor_is_valid_and_small() {
     d.validate().expect("simulator descriptor must be valid");
     let json = serde_json::to_string(&d).unwrap();
     assert!(json.len() < 256 * 1024);
-    // 实现契约：1.0
-    assert_eq!(d.contract_major, 1);
+    // 实现契约：2.0（常量唯一真值，禁止魔数）
+    assert_eq!(d.contract_major, mesa_core_types::DESCRIPTOR_CONTRACT_MAJOR);
     assert!(!d.resources.is_empty());
 }
 
@@ -486,6 +486,144 @@ fn s7_and_opcua_descriptors_declare_from_parameter() {
 }
 
 #[test]
+fn definition_rejects_bad_defaults_and_loose_rules() {
+    // Enum default 不在 options → 拒绝
+    let mut f = FieldDescriptor::new("m", "M", FieldType::Enum).required(false);
+    f.validation.enum_options = Some(vec!["a".into()]);
+    f.default = Some(serde_json::json!("z"));
+    assert!(
+        SchemaDescriptor::new(vec![f])
+            .validate_definition()
+            .is_err()
+    );
+    // Enum 无 options → 拒绝
+    let f2 = FieldDescriptor::new("m", "M", FieldType::Enum).required(false);
+    assert!(
+        SchemaDescriptor::new(vec![f2])
+            .validate_definition()
+            .is_err()
+    );
+    // 非 Enum 带 options → 拒绝
+    let mut f3 = FieldDescriptor::new("s", "S", FieldType::String).required(false);
+    f3.validation.enum_options = Some(vec!["a".into()]);
+    assert!(
+        SchemaDescriptor::new(vec![f3])
+            .validate_definition()
+            .is_err()
+    );
+    // Integer default 越界 → 拒绝
+    let mut f4 = FieldDescriptor::new("n", "N", FieldType::Integer).required(false);
+    f4.validation.min = Some(1.0);
+    f4.validation.max = Some(10.0);
+    f4.default = Some(serde_json::json!(20));
+    assert!(
+        SchemaDescriptor::new(vec![f4])
+            .validate_definition()
+            .is_err()
+    );
+    // min > max → 拒绝
+    let mut f5 = FieldDescriptor::new("n", "N", FieldType::Integer).required(false);
+    f5.validation.min = Some(10.0);
+    f5.validation.max = Some(1.0);
+    assert!(
+        SchemaDescriptor::new(vec![f5])
+            .validate_definition()
+            .is_err()
+    );
+    // String 带 min → 拒绝；Integer 带 pattern → 拒绝
+    let mut f6 = FieldDescriptor::new("s", "S", FieldType::String).required(false);
+    f6.validation.min = Some(1.0);
+    assert!(
+        SchemaDescriptor::new(vec![f6])
+            .validate_definition()
+            .is_err()
+    );
+    let mut f7 = FieldDescriptor::new("n", "N", FieldType::Integer).required(false);
+    f7.validation.pattern = Some(".*".into());
+    assert!(
+        SchemaDescriptor::new(vec![f7])
+            .validate_definition()
+            .is_err()
+    );
+    // default 不匹配 pattern → 拒绝
+    let mut f8 = FieldDescriptor::new("c", "C", FieldType::String).required(false);
+    f8.validation.pattern = Some("^ABC$".into());
+    f8.default = Some(serde_json::json!("XYZ"));
+    assert!(
+        SchemaDescriptor::new(vec![f8])
+            .validate_definition()
+            .is_err()
+    );
+    // 非法 regex → 拒绝
+    let mut f9 = FieldDescriptor::new("c", "C", FieldType::String).required(false);
+    f9.validation.pattern = Some("([".into());
+    assert!(
+        SchemaDescriptor::new(vec![f9])
+            .validate_definition()
+            .is_err()
+    );
+}
+
+#[test]
+fn definition_enforces_port_duration_intrinsics() {
+    // Port default -1 → 拒绝（内禀 1..=65535）；Duration 负数 → 拒绝
+    let f = FieldDescriptor::new("port", "Port", FieldType::Port)
+        .required(false)
+        .default_value(serde_json::json!(-1));
+    assert!(
+        SchemaDescriptor::new(vec![f])
+            .validate_definition()
+            .is_err()
+    );
+    let f2 = FieldDescriptor::new("timeout_ms", "Timeout", FieldType::Duration)
+        .required(false)
+        .default_value(serde_json::json!(-5));
+    assert!(
+        SchemaDescriptor::new(vec![f2])
+            .validate_definition()
+            .is_err()
+    );
+    // instance 期同样：port -1 → INVALID_TYPE
+    let schema = SchemaDescriptor::new(vec![
+        FieldDescriptor::new("port", "Port", FieldType::Port).required(true),
+    ]);
+    let issues = schema.validate_instance("connection", &serde_json::json!({"port": -1}));
+    assert!(issues.iter().any(|i| i.code == "INVALID_TYPE"));
+}
+
+#[test]
+fn resource_parameters_reject_secret() {
+    let r = ResourceDescriptor {
+        id: "r".into(),
+        label: LocalizedText::new("R"),
+        parameters: SchemaDescriptor::new(vec![
+            FieldDescriptor::new("password", "Password", FieldType::Secret).required(true),
+        ]),
+        outputs: vec![OutputDescriptor {
+            id: "value".into(),
+            label: LocalizedText::new("V"),
+            type_spec: OutputTypeSpec::Fixed {
+                data_type: DataType::Bool,
+            },
+            unit: None,
+            access: AccessMode::Read,
+        }],
+        modes: vec![],
+    };
+    assert!(r.validate().is_err());
+}
+
+#[test]
+fn resource_selection_methods_reject_duplicates() {
+    let mut d = synthetic_descriptor();
+    d.resource_selection_methods = vec![
+        ResourceSelectionMethod::Manual,
+        ResourceSelectionMethod::Manual,
+    ];
+    assert!(d.validate().is_err());
+}
+
+#[test]
 fn resource_selection_methods_replaces_discovery_bools() {
     // methods 为唯一真值；序列化为 snake_case 字符串数组（可扩展枚举）
     let d = mesa_driver_opcua::OpcUaDriver.descriptor();
@@ -509,6 +647,13 @@ fn validate_instance_covers_required_type_enum_range_pattern_unknown() {
             let mut f = FieldDescriptor::new("port", "Port", FieldType::Port).required(false);
             f.validation.min = Some(1.0);
             f.validation.max = Some(65535.0);
+            f
+        },
+        {
+            let mut f =
+                FieldDescriptor::new("threshold", "Threshold", FieldType::Number).required(false);
+            f.validation.min = Some(0.0);
+            f.validation.max = Some(100.0);
             f
         },
         {
@@ -539,10 +684,15 @@ fn validate_instance_covers_required_type_enum_range_pattern_unknown() {
     let issues =
         schema.validate_instance("connection", &serde_json::json!({"host":"h","mode":"z"}));
     assert!(issues.iter().any(|i| i.code == "INVALID_ENUM"));
-    // 越界
+    // 越界（min/max 收窄；Port 超内禀范围则先判 INVALID_TYPE）
+    let issues = schema.validate_instance(
+        "connection",
+        &serde_json::json!({"host":"h","threshold":150}),
+    );
+    assert!(issues.iter().any(|i| i.code == "OUT_OF_RANGE"));
     let issues =
         schema.validate_instance("connection", &serde_json::json!({"host":"h","port":99999}));
-    assert!(issues.iter().any(|i| i.code == "OUT_OF_RANGE"));
+    assert!(issues.iter().any(|i| i.code == "INVALID_TYPE"));
     // 真 regex（旧伪实现 s.contains 会放过 "ab12"）
     let issues =
         schema.validate_instance("connection", &serde_json::json!({"host":"h","code":"ab12"}));

@@ -57,8 +57,8 @@ impl Driver for S7Driver {
         };
         let m = self.metadata();
         DriverDescriptor {
-            contract_major: 1,
-            contract_minor: 0,
+            contract_major: mesa_core_types::DESCRIPTOR_CONTRACT_MAJOR,
+            contract_minor: mesa_core_types::DESCRIPTOR_CONTRACT_MINOR,
             identity: DriverIdentity {
                 driver_id: m.driver_id,
                 name: m.name,
@@ -336,10 +336,8 @@ impl DriverConnection for S7Connection {
     /// - 建连失败 → Ok(unreachable)（设备不可达是探测结果）；
     /// - SZL 失败或解析失败 → reachable + IDENTITY_UNAVAILABLE（绝不猜型号，
     ///   更不从端口号反推，见 §8.5）。
-    /// NOTE: s7-1200 Profile 要求 probe.vendor==Siemens 且
-    /// probe.family==S7-1200 才提示；本 probe 现阶段 family 恒为 None
-    /// （1200/1500 区分需正式 MLFB 映射依据，确认前一律不做，宁缺毋滥），
-    /// 因此 s7-1200 按设计暂时不可达——可达但信息不足时不得过度推断。
+    /// NOTE: 1200/1500 区分需正式 MLFB 映射依据，确认前 family 恒为 None，
+    /// 可达但信息不足时不得过度推断（宁缺毋滥）。
     /// 配置已在 OpenConnection 校验；短连接随函数返回 drop，不进入采集计划。
     async fn probe(&mut self) -> Result<ProbeReport, SdkDriverError> {
         let cfg = self.cfg.clone();

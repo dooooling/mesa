@@ -132,7 +132,9 @@ impl SchemaDescriptor {
     }
 
     /// 校验 Schema 定义本身是否合法（Descriptor 静态契约）：
-    /// key 唯一/非空、enum 选项唯一、default 类型一致、visible_if 引用存在。
+    /// key 唯一/非空、enum 非空且仅 Enum 可带、min/max 仅数值型且 min<=max、
+    /// pattern 仅 string-like 且合法 regex、default 必须同时满足 type/enum/
+    /// min-max/pattern、Port/Duration 内禀约束、visible_if 引用存在。
     pub fn validate_definition(&self) -> Result<(), String> {
         use std::collections::HashSet;
         let mut seen = HashSet::new();
@@ -143,45 +145,98 @@ impl SchemaDescriptor {
             if !seen.insert(&f.key) {
                 return Err(format!("field key 重复: {}", f.key));
             }
-            if let Some(opts) = &f.validation.enum_options {
-                let mut es = HashSet::new();
-                for o in opts {
-                    if !es.insert(o) {
-                        return Err(format!("field {} enum option 重复: {}", f.key, o));
+            // enum_options：仅 Enum 可带，且必须非空、选项唯一
+            match &f.validation.enum_options {
+                Some(opts) => {
+                    if f.field_type != FieldType::Enum {
+                        return Err(format!("field {} 非 Enum 不得带 enum_options", f.key));
+                    }
+                    if opts.is_empty() {
+                        return Err(format!("field {} enum_options 不得为空", f.key));
+                    }
+                    let mut es = HashSet::new();
+                    for o in opts {
+                        if !es.insert(o) {
+                            return Err(format!("field {} enum option 重复: {}", f.key, o));
+                        }
                     }
                 }
-                if f.field_type != FieldType::Enum && !opts.is_empty() {
-                    // 允许非 Enum 也携带选项，但通常仅 Enum 需要
+                None => {
+                    if f.field_type == FieldType::Enum {
+                        return Err(format!("field {} Enum 必须声明 enum_options", f.key));
+                    }
                 }
             }
-            // default 类型与 field_type 的轻量一致性（不做完整 JSON Schema 推导）
-            if let Some(def) = &f.default {
-                let ok = match f.field_type {
+            // min/max：仅数值型（Integer/Number/Port/Duration）可带，且 min<=max
+            if (f.validation.min.is_some() || f.validation.max.is_some())
+                && !matches!(
+                    f.field_type,
+                    FieldType::Integer | FieldType::Number | FieldType::Port | FieldType::Duration
+                )
+            {
+                return Err(format!("field {} 非数值型不得带 min/max", f.key));
+            }
+            if let (Some(min), Some(max)) = (f.validation.min, f.validation.max)
+                && min > max
+            {
+                return Err(format!("field {} min {min} > max {max}", f.key));
+            }
+            // pattern：仅 string-like 可带，且必须为合法 regex
+            if let Some(pat) = &f.validation.pattern {
+                if !matches!(
+                    f.field_type,
                     FieldType::String
-                    | FieldType::Host
-                    | FieldType::Url
-                    | FieldType::File
-                    | FieldType::CertificateRef
-                    | FieldType::Secret => def.is_string(),
-                    FieldType::Integer | FieldType::Port => {
-                        def.is_number() && def.as_i64().is_some()
-                    }
-                    FieldType::Number | FieldType::Duration => def.is_number(),
-                    FieldType::Boolean => def.is_boolean(),
-                    FieldType::Enum => def.is_string(),
-                };
-                if !ok {
+                        | FieldType::Host
+                        | FieldType::Url
+                        | FieldType::File
+                        | FieldType::CertificateRef
+                        | FieldType::Secret
+                ) {
+                    return Err(format!("field {} 非字符串型不得带 pattern", f.key));
+                }
+                if regex::Regex::new(pat).is_err() {
+                    return Err(format!("field {} pattern 非法 regex: {pat}", f.key));
+                }
+            }
+            // default：必须同时满足 type/enum/min-max/pattern（含 Port/Duration 内禀）
+            if let Some(def) = &f.default {
+                if !field_type_matches(f.field_type, def) {
                     return Err(format!(
                         "field {} default 类型与 field_type {:?} 不匹配: {}",
                         f.key, f.field_type, def
                     ));
                 }
-            }
-            // pattern 必须为合法 regex（定义期拦截，instance 期不再容忍）
-            if let Some(pat) = &f.validation.pattern
-                && regex::Regex::new(pat).is_err()
-            {
-                return Err(format!("field {} pattern 非法 regex: {pat}", f.key));
+                if let Some(opts) = &f.validation.enum_options
+                    && let Some(s) = def.as_str()
+                    && !opts.iter().any(|o| o == s)
+                {
+                    return Err(format!(
+                        "field {} default `{s}` 不在 enum_options 中",
+                        f.key
+                    ));
+                }
+                if let Some(num) = def.as_f64() {
+                    if let Some(min) = f.validation.min
+                        && num < min
+                    {
+                        return Err(format!("field {} default {num} < min {min}", f.key));
+                    }
+                    if let Some(max) = f.validation.max
+                        && num > max
+                    {
+                        return Err(format!("field {} default {num} > max {max}", f.key));
+                    }
+                }
+                if let Some(pat) = &f.validation.pattern
+                    && let Some(s) = def.as_str()
+                    && let Ok(re) = regex::Regex::new(pat)
+                    && !re.is_match(s)
+                {
+                    return Err(format!(
+                        "field {} default `{s}` 不匹配 pattern {pat}",
+                        f.key
+                    ));
+                }
             }
         }
         // visible_if 引用字段存在
@@ -225,10 +280,9 @@ impl SchemaDescriptor {
                 }
                 continue;
             };
-            // Secret 持久化标记 {"secret_set": true} 视为已提供，不校验内容
-            if field.field_type == FieldType::Secret && is_secret_marker(val) {
-                continue;
-            }
+            // Secret 只有 JSON string 一种合法形态（SecretStore 的脱敏/持久化
+            // 表示 {"secret_set": true} 由 core-api 在调用前 materialize，
+            // 不得进 Contract 层）。
             if !field_type_matches(field.field_type, val) {
                 issues.push(ValidationIssue {
                     path,
@@ -315,15 +369,9 @@ pub struct ValidationIssue {
     pub message: String,
 }
 
-/// Secret 持久化标记 {"secret_set": true}：已存值，不校验内容。
-fn is_secret_marker(v: &serde_json::Value) -> bool {
-    v.is_object()
-        && v.as_object()
-            .map(|m| m.get("secret_set") == Some(&serde_json::Value::Bool(true)))
-            .unwrap_or(false)
-}
-
 /// JSON 值与 FieldType 一致性（与 definition 校验同口径）。
+/// Port/Duration 带内禀约束（Port 1..=65535，Duration >= 0）；
+/// Driver 可再用 validation.min/max 进一步收窄，但不得放宽。
 fn field_type_matches(t: FieldType, val: &serde_json::Value) -> bool {
     match t {
         FieldType::String
@@ -332,8 +380,10 @@ fn field_type_matches(t: FieldType, val: &serde_json::Value) -> bool {
         | FieldType::File
         | FieldType::CertificateRef
         | FieldType::Secret => val.is_string(),
-        FieldType::Integer | FieldType::Port => val.is_number() && val.as_i64().is_some(),
-        FieldType::Number | FieldType::Duration => val.is_number(),
+        FieldType::Integer => val.is_number() && val.as_i64().is_some(),
+        FieldType::Port => val.as_i64().is_some_and(|p| (1..=65535).contains(&p)),
+        FieldType::Number => val.is_number(),
+        FieldType::Duration => val.as_f64().is_some_and(|d| d >= 0.0),
         FieldType::Boolean => val.is_boolean(),
         FieldType::Enum => val.is_string(),
     }

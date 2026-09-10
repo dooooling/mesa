@@ -21,8 +21,8 @@ pub struct DriverCapabilities {
     pub events: bool,
 }
 
-/// 资源配置方式（§20.1）：Manual/Browse/Import 三选，可扩展
-/// （未来 UploadProject/Catalog/Template 加变体，不加 bool）。
+/// 资源配置方式（§20.1）：可组合的资源选择方式（Manual/Browse/Import，可多选），
+/// 未来 UploadProject/Catalog/Template 加变体，不加 bool。
 /// `DriverDescriptor.resource_selection_methods` 为唯一真值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

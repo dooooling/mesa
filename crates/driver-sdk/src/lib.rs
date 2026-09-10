@@ -105,8 +105,8 @@ pub trait Driver: Send + Sync + 'static {
     fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
         let m = self.metadata();
         mesa_core_types::DriverDescriptor {
-            contract_major: 1,
-            contract_minor: 0,
+            contract_major: mesa_core_types::DESCRIPTOR_CONTRACT_MAJOR,
+            contract_minor: mesa_core_types::DESCRIPTOR_CONTRACT_MINOR,
             identity: mesa_core_types::DriverIdentity {
                 driver_id: m.driver_id,
                 name: m.name,

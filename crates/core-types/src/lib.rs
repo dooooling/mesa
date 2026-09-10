@@ -13,7 +13,9 @@ pub mod resource;
 pub mod schema;
 
 pub use capability::{ControlCatalog, DriverCapabilities, ResourceSelectionMethod};
-pub use descriptor::{DriverDescriptor, DriverIdentity};
+pub use descriptor::{
+    DESCRIPTOR_CONTRACT_MAJOR, DESCRIPTOR_CONTRACT_MINOR, DriverDescriptor, DriverIdentity,
+};
 pub use event::{
     ConditionTransition, EVENT_ATTRIBUTES_MAX_FIELDS, EVENT_BATCH_MAX_BYTES,
     EVENT_RECORD_MAX_BYTES, EVENT_SEVERITY_MAX, EventBatch, EventCatalog, EventCondition,
