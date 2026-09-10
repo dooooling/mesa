@@ -73,9 +73,9 @@ impl Driver for S7Driver {
 
     fn descriptor(&self) -> mesa_core_types::DriverDescriptor {
         use mesa_core_types::{
-            AccessMode, DriverCapabilities, DriverDescriptor, DriverIdentity,
-            FieldDescriptor, FieldType, LocalizedText, OutputDescriptor, OutputTypeSpec,
-            ResourceDescriptor, ResourceSelectionMethod, SchemaDescriptor,
+            AccessMode, DriverCapabilities, DriverDescriptor, DriverIdentity, FieldDescriptor,
+            FieldType, LocalizedText, OutputDescriptor, OutputTypeSpec, ResourceDescriptor,
+            ResourceSelectionMethod, SchemaDescriptor,
         };
         let m = self.metadata();
         DriverDescriptor {
