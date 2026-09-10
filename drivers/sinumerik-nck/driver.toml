@@ -3,7 +3,7 @@
 # 直读 NCK，与 `opcua`（SINUMERIK OPC UA）、`s7`（SIMATIC S7ANY）互不重叠。
 id = "sinumerik-nck"
 name = "SINUMERIK NCK"
-version = "0.1.0"
+version = "0.2.0"
 executable = "Mesa-driver-sinumerik-nck"
 protocol_major = 1
 protocol_minor = 3

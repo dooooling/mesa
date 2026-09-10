@@ -969,6 +969,10 @@ Descriptor 结构协议版本**（JSON shape / 字段增删 / 语义规则变化
 归该 **Driver version / behavior contract** 管理，由 driver_id+version
 区分，**不得**因此全局升 Major（一个 S7 修改不让所有 Driver 跟着 3.0）。
 
+冻结说明：Descriptor 2.0 在 PR22–PR23 完成冻结；冻结后新增会拒绝
+既有合法 Descriptor 的全局规则（如 FromParameter 必须 required），
+按 Major 演进，不再视为“冻结补完”。
+
 ```text
 contract_major
 contract_minor

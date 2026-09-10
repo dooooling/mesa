@@ -737,6 +737,50 @@ fn validate_instance_covers_required_type_enum_range_pattern_unknown() {
     assert!(issues.iter().any(|i| i.code == "INVALID_TYPE"));
 }
 
+#[test]
+fn driver_version_identity_toml_metadata_package_agree() {
+    // §4.1 门禁：driver.toml.version == DriverMetadata.version == package version；
+    // Descriptor/公开行为变化必须同步三处，禁止同一 version 对应不同语义。
+    use mesa_driver_sdk::Driver;
+    let drivers: Vec<(&str, String)> = vec![
+        (
+            "simulator",
+            mesa_driver_simulator::SimulatorDriver.metadata().version,
+        ),
+        ("s7", mesa_driver_s7::S7Driver.metadata().version),
+        ("focas2", mesa_driver_focas2::FocasDriver.metadata().version),
+        ("opcua", mesa_driver_opcua::OpcUaDriver.metadata().version),
+        (
+            "sinumerik-nck",
+            mesa_driver_sinumerik_nck::SinumerikNckDriver
+                .metadata()
+                .version,
+        ),
+    ];
+    for (dir, meta_version) in drivers {
+        let toml_text = std::fs::read_to_string(
+            common::repo_root()
+                .join("drivers")
+                .join(dir)
+                .join("driver.toml"),
+        )
+        .unwrap();
+        let toml_version = toml_text
+            .lines()
+            .find_map(|l| l.strip_prefix("version = \"")?.strip_suffix('"'))
+            .expect("driver.toml 必须有 version");
+        assert_eq!(
+            toml_version, meta_version,
+            "{dir}: driver.toml 与 metadata 版本不一致"
+        );
+        assert_eq!(
+            meta_version,
+            env!("CARGO_PKG_VERSION"),
+            "{dir}: metadata 与 package 版本不一致"
+        );
+    }
+}
+
 #[tokio::test]
 async fn manager_lazy_load_descriptor_via_temp_process() {
     // cargo build 需先产出 simulator 二进制（与 subprocess_recovery 同理）

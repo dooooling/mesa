@@ -841,13 +841,18 @@ impl DriverConnection for OpcUaConnection {
                                 )
                             })?
                             .to_string();
-                        // data_type 缺省即 STRING（与 descriptor default 一致）；
-                        // 非 canonical 拼写直接拒绝（alias 只属于 legacy）。
+                        // data_type 必填（descriptor required）：缺失即 INVALID_POINT，
+                        // 不得回落 STRING（回落即与 validate_instance/required 双真值）。
                         let dt_str = sel
                             .parameters
                             .get("data_type")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("STRING");
+                            .ok_or_else(|| {
+                                SdkDriverError::configuration(
+                                    "INVALID_POINT",
+                                    format!("point `{}` 缺少 data_type", out.point_key),
+                                )
+                            })?;
                         let addr = parse_address(&node_id).map_err(|e| match e {
                             AddressError::Empty => SdkDriverError::configuration(
                                 "INVALID_ADDRESS",
@@ -1709,6 +1714,11 @@ mod tests {
             (
                 "缺 node_id",
                 serde_json::json!({"data_type": "STRING"}),
+                "INVALID_POINT",
+            ),
+            (
+                "缺 data_type（descriptor required）",
+                serde_json::json!({"node_id": "nsu=http://example.com/MyModel/;i=2"}),
                 "INVALID_POINT",
             ),
             (
