@@ -71,30 +71,10 @@ impl DriverDescriptor {
                 r.validate()?;
             }
         }
-        // resources ↔ runtime capabilities 交叉不变量：某 resource 声明了
-        // Poll/Subscribe mode，capabilities 必须对应为 true，否则 Core 会在
-        // 保存门禁放行一个 Runtime 实际跑不起来的 mode。
-        {
-            let mut needs_poll = false;
-            let mut needs_sub = false;
-            for r in &self.resources {
-                let eff: Vec<crate::TaskMode> = if r.modes.is_empty() {
-                    vec![crate::TaskMode::Poll]
-                } else {
-                    r.modes.clone()
-                };
-                needs_poll |= eff.contains(&crate::TaskMode::Poll);
-                needs_sub |= eff.contains(&crate::TaskMode::Subscribe);
-            }
-            if needs_poll && !self.capabilities.poll {
-                return Err("capabilities.poll 为 false，但有 resource 声明 Poll mode".into());
-            }
-            if needs_sub && !self.capabilities.subscribe {
-                return Err(
-                    "capabilities.subscribe 为 false，但有 resource 声明 Subscribe mode".into(),
-                );
-            }
-        }
+        // NOTE：resources modes ↔ capabilities 的交叉检查故意不在此做——
+        // Descriptor 2.0 definition validity 已在 PR22–PR23 冻结，事后收紧即
+        // Major 变更；执行能力检查归 `validate_task_set_against`（配置能否被
+        // 该 Driver 执行），见 resource.rs。
         self.controls.validate()?;
         self.events.validate()?;
         Ok(())

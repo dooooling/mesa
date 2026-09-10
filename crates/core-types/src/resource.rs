@@ -294,6 +294,21 @@ pub fn validate_task_set_against(
                     message: format!("resource `{}` 不支持 {mode:?} 模式", sel.resource_id),
                 });
             }
+            // 执行能力：resource 允许还不够，Driver capabilities 必须对应为
+            // true，否则保存门禁会放行 Runtime 实际跑不起来的 mode。
+            //（故意放在任务校验层而非 Descriptor::validate：2.0 definition
+            // validity 已冻结，此处只裁决“当前配置能否被该 Driver 执行”。）
+            let cap_ok = match mode {
+                TaskMode::Poll => descriptor.capabilities.poll,
+                TaskMode::Subscribe => descriptor.capabilities.subscribe,
+            };
+            if !cap_ok {
+                issues.push(ValidationIssue {
+                    path: base.clone(),
+                    code: "MODE_NOT_SUPPORTED".into(),
+                    message: format!("driver capabilities 不支持 {mode:?} 模式"),
+                });
+            }
             // parameters（null 视为 {}，与 Driver 侧归一一致）
             let params = if sel.parameters.is_null() {
                 serde_json::json!({})

@@ -268,6 +268,36 @@ fn task_set_gate_rejects_cross_task_dup_and_write_only_output() {
     );
 }
 
+/// 分层门：capabilities 缺口在任务门拒绝，但 Descriptor 2.0 本身仍合法
+///（definition validity 冻结，不得事后收紧）。
+#[test]
+fn capabilities_gap_rejected_at_task_gate_not_descriptor() {
+    use mesa_core_types::TaskMode;
+    let mut d = synthetic_descriptor();
+    d.capabilities.poll = false;
+    // Descriptor 层：仍然合法（2.0 未收紧）
+    d.validate().expect("2.0 definition validity 不得收紧");
+    let res_id = d.resources[0].id.clone();
+    let out_id = d.resources[0].outputs[0].id.clone();
+    let sel = mesa_core_types::ResourceSelection {
+        resource_id: res_id,
+        parameters: serde_json::json!({}),
+        outputs: vec![mesa_core_types::SelectedOutput {
+            output: out_id,
+            point_key: "k".into(),
+        }],
+    };
+    // 任务层：Poll 跑不起来，必须拒绝
+    let issues = mesa_core_types::validate_task_set_against(
+        &d,
+        &[(&TaskMode::Poll, &[sel][..], "tasks[0].selections")],
+    );
+    assert!(
+        issues.iter().any(|i| i.code == "MODE_NOT_SUPPORTED"),
+        "{issues:?}"
+    );
+}
+
 #[test]
 fn contract_version_must_be_present() {
     let mut d = synthetic_descriptor();
