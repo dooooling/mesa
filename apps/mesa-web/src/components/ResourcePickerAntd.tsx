@@ -35,7 +35,9 @@ export function ResourcePickerAntd({
   resources: ResourceDescriptor[];
   /** 已存在的 point_key（含当前已选）：用于自动命名去重，最终唯一性由 Core 门禁负责 */
   existingKeys: string[];
-  onAdd: (sel: ResourceSelectionInput) => void;
+  /** 返回 true 表示父层已接收；成功后清空 outputs（保留 params），
+   * 再次勾选同 output 自然生成 .2/.3，连续加入形成闭环 */
+  onAdd: (sel: ResourceSelectionInput) => boolean;
 }) {
   const [rid, setRid] = useState(resources[0]?.id ?? "");
   const [params, setParams] = useState<Record<string, unknown>>(() =>
@@ -113,7 +115,9 @@ export function ResourcePickerAntd({
       <Button
         type="primary"
         disabled={!outputs.length}
-        onClick={() => onAdd({ resource_id: res.id, parameters: params, outputs })}
+        onClick={() => {
+          if (onAdd({ resource_id: res.id, parameters: params, outputs })) setOutputs([]);
+        }}
       >
         加入
       </Button>

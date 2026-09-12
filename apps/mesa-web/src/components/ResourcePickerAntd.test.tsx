@@ -2,11 +2,12 @@
 // ResourceSelection（typed 参数 + default 物化 + point_key 自动命名）。
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import { ResourcePickerAntd, suggestPointKey } from "./ResourcePickerAntd";
 import type { ResourceDescriptor } from "../types";
 
 // 虚构协议 "mockbus"：真实代码库从未见过这些 resource/参数。
+// encoding（required enum）与 scaled（required boolean）故意无 default：
+// Core 允许 required 无 default，UI 不得显示假值（显示即保存）。
 const MOCK_RESOURCES: ResourceDescriptor[] = [
   {
     id: "register",
@@ -14,8 +15,8 @@ const MOCK_RESOURCES: ResourceDescriptor[] = [
     parameters: {
       fields: [
         { key: "unit", label: "Unit", field_type: "integer", required: true, default: 3, validation: { min: 0 }, ui: {} },
-        { key: "encoding", label: "Encoding", field_type: "enum", required: true, default: "BE", validation: { enum_options: ["BE", "LE"] }, ui: {} },
-        { key: "scaled", label: "Scaled", field_type: "boolean", required: false, validation: {}, ui: {} },
+        { key: "encoding", label: "Encoding", field_type: "enum", required: true, validation: { enum_options: ["BE", "LE"] }, ui: {} },
+        { key: "scaled", label: "Scaled", field_type: "boolean", required: true, validation: {}, ui: {} },
       ],
     },
     outputs: [
@@ -37,9 +38,8 @@ describe("suggestPointKey", () => {
 });
 
 describe("ResourcePickerAntd（mock driver）", () => {
-  it("无协议分支即可选型：typed 参数 + default 物化 + 合法 selection", async () => {
-    const user = userEvent.setup();
-    const onAdd = vi.fn();
+  it("无协议分支即可选型：typed 参数 + default 物化 + 无假值", () => {
+    const onAdd = vi.fn((_sel: unknown): boolean => true);
     render(<ResourcePickerAntd resources={MOCK_RESOURCES} existingKeys={[]} onAdd={onAdd} />);
     // 按输出勾选（boolean 参数同样渲染 checkbox，必须用 aria-label 精确定位）
     const outputBox = (id: string) => {
@@ -58,7 +58,9 @@ describe("ResourcePickerAntd（mock driver）", () => {
     expect(sel.resource_id).toBe("register");
     // default 物化为 typed 值（integer 3 为 number，非字符串）
     expect(sel.parameters.unit).toBe(3);
-    expect(sel.parameters.encoding).toBe("BE");
+    // 无 default 的 required enum/boolean 不得凭空出现（显示即保存）
+    expect("encoding" in sel.parameters).toBe(false);
+    expect("scaled" in sel.parameters).toBe(false);
     // point_key 自动命名
     expect(sel.outputs).toEqual([
       { output: "value", point_key: "register.value" },
@@ -66,16 +68,36 @@ describe("ResourcePickerAntd（mock driver）", () => {
     ]);
   });
 
-  it("existingKeys 冲突时自动 .2 命名", async () => {
-    const user = userEvent.setup();
-    const onAdd = vi.fn();
-    render(
-      <ResourcePickerAntd resources={MOCK_RESOURCES} existingKeys={["register.value"]} onAdd={onAdd} />,
+  it("同一 picker 连续加入三次：value/.2/.3（成功清 outputs、保留 params）", () => {
+    const added: string[] = [];
+    const onAdd = vi.fn((_sel: unknown): boolean => true);
+    const { rerender } = render(
+      <ResourcePickerAntd resources={MOCK_RESOURCES} existingKeys={added} onAdd={onAdd} />,
     );
-    const box = screen.getByRole("checkbox", { name: "output-value" });
-    fireEvent.click(box.querySelector("input") ?? box);
+    const addValue = () => {
+      const el = screen.getByRole("checkbox", { name: "output-value" });
+      fireEvent.click(el.querySelector("input") ?? el);
+      fireEvent.click(screen.getByText(/加\s*入/).closest("button")!);
+      const sel = onAdd.mock.calls[onAdd.mock.calls.length - 1]![0] as {
+        outputs: Array<{ point_key: string }>;
+      };
+      for (const o of sel.outputs) added.push(o.point_key);
+      rerender(<ResourcePickerAntd resources={MOCK_RESOURCES} existingKeys={added} onAdd={onAdd} />);
+    };
+    addValue();
+    addValue();
+    addValue();
+    expect(onAdd).toHaveBeenCalledTimes(3);
+    expect(added).toEqual(["register.value", "register.value.2", "register.value.3"]);
+  });
+
+  it("父层拒绝时不清空（用户手改撞车可继续编辑）", () => {
+    const onAdd = vi.fn((_sel: unknown): boolean => false);
+    render(<ResourcePickerAntd resources={MOCK_RESOURCES} existingKeys={[]} onAdd={onAdd} />);
+    const el = screen.getByRole("checkbox", { name: "output-value" });
+    fireEvent.click(el.querySelector("input") ?? el);
     fireEvent.click(screen.getByText(/加\s*入/).closest("button")!);
-    const sel = onAdd.mock.calls[0]![0] as { outputs: Array<{ point_key: string }> };
-    expect(sel.outputs[0]!.point_key).toBe("register.value.2");
+    // 拒绝后 outputs 保留：point_key 输入框仍在
+    expect(screen.getByDisplayValue("register.value")).toBeTruthy();
   });
 });

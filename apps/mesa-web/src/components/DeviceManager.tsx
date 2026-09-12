@@ -323,8 +323,12 @@ export function DeviceManager() {
                 // 真正唯一性由 PR24 Core endpoint-wide 门禁裁决）
                 const keys = s.outputs.map((o) => o.point_key);
                 const dup = pointsSels.some((ex) => ex.outputs.some((o) => keys.includes(o.point_key)));
-                if (dup) return message.warning(`point_key 重复：${keys.join(", ")} 已存在`);
+                if (dup) {
+                  message.warning(`point_key 重复：${keys.join(", ")} 已存在`);
+                  return false;
+                }
                 setPointsSels((p) => [...p, s]);
+                return true;
               }}
             />
             <div style={{ marginTop: 12, fontSize: 12, color: "#999" }}>已选 {pointsSels.length} 项 · {intervalMs}ms 轮询 · 保存将执行 Stop → PUT /tasks/{pointsEp?.id} → Start <Button size="small" onClick={() => setPointsSels([])} style={{ marginLeft: 8 }}>清空</Button></div>

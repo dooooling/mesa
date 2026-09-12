@@ -44,6 +44,25 @@ function FieldControl({
     </span>
   );
   if (field.field_type === "boolean") {
+    // 三态：无真实值/default 时为 unset（indeterminate），不显示假 false；
+    // 用户操作后才写入 boolean。required 无 default 的合法字段不得“看起来有值”。
+    if (value === undefined && field.default === undefined) {
+      return (
+        <div style={{ display: "grid", gap: 4 }}>
+          <span style={{ fontSize: 12 }}>{label}</span>
+          <Select
+            disabled={disabled}
+            value={undefined}
+            placeholder="未选择"
+            onChange={(v) => onChange(v === "true")}
+            options={[
+              { value: "true", label: "true" },
+              { value: "false", label: "false" },
+            ]}
+          />
+        </div>
+      );
+    }
     return (
       <div>
         <Checkbox disabled={disabled} checked={Boolean(value ?? field.default ?? false)} onChange={(e) => onChange(e.target.checked)}>
@@ -54,14 +73,17 @@ function FieldControl({
   }
   if (field.field_type === "enum") {
     const opts = field.validation.enum_options ?? [];
+    // 无真实值/default 时保持未选择（allowClear 可清回 unset）；禁止 opts[0]
+    // 假默认值——Web 不替 Descriptor 发明语义，缺 required 由 Core 门禁裁决。
     return (
       <div style={{ display: "grid", gap: 4 }}>
         <span style={{ fontSize: 12 }}>{label}</span>
         <Select
           disabled={disabled}
-          value={(value as string) ?? (field.default as string) ?? opts[0]}
+          value={(value as string) ?? (field.default as string) ?? undefined}
           onChange={onChange}
-          placeholder={field.ui.placeholder}
+          placeholder={field.ui.placeholder ?? "未选择"}
+          allowClear={!field.required}
           options={opts.map((o) => ({ value: o, label: o }))}
         />
       </div>
