@@ -10,15 +10,15 @@ function integrityError(s: EventStats): boolean {
 
 export function EventDiagnostics({ stats }: { stats: EventStats | null }) {
   const [open, setOpen] = useState(false);
-  if (!stats) return <div style={{ fontSize: 12, color: "#888" }}>诊断加载中…</div>;
+  if (!stats) return <div style={{ fontSize: 12, color: "#525252" }}>诊断加载中…</div>;
   const bad = integrityError(stats);
   return (
     <div>
       <Space wrap>
-        <span style={{ fontSize: 12, color: "#888" }}>
+        <span style={{ fontSize: 12, color: "#525252" }}>
           Store {stats.stored_rows.toLocaleString()} events · {formatBytes(stats.stored_size_bytes)}
         </span>
-        <span style={{ fontSize: 12, color: "#888" }}>Live {stats.live_clients} client{stats.live_clients === 1 ? "" : "s"}</span>
+        <span style={{ fontSize: 12, color: "#525252" }}>Live {stats.live_clients} client{stats.live_clients === 1 ? "" : "s"}</span>
         {bad ? (
           <Tag color="red">
             Integrity ERROR · regressions {stats.ingress_regressions_total} · collisions {stats.ingress_collisions_total} ·

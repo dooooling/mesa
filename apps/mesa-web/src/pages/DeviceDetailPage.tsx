@@ -334,7 +334,7 @@ export function DeviceDetailPage() {
   if (notFound) {
     return (
       <Card size="small" title="设备不存在">
-        <p style={{ color: "#999" }}>设备 `{deviceId}` 不存在，可能已被删除。</p>
+        <p style={{ color: "#525252" }}>设备 `{deviceId}` 不存在，可能已被删除。</p>
         <Button type="primary" onClick={() => nav("/devices")}>返回设备列表</Button>
       </Card>
     );
@@ -344,7 +344,7 @@ export function DeviceDetailPage() {
     <div style={{ display: "grid", gap: 16 }}>
       <Card
         size="small"
-        title={<span>设备 · {device?.name ?? deviceId} <span style={{ fontFamily: "monospace", fontSize: 12, color: "#999" }}>{deviceId}</span></span>}
+        title={<span>设备 · {device?.name ?? deviceId} <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12, color: "#525252" }}>{deviceId}</span></span>}
         extra={
           <Space>
             <Button size="small" onClick={() => nav("/devices")}>返回</Button>
@@ -354,7 +354,7 @@ export function DeviceDetailPage() {
           </Space>
         }
       >
-        <div style={{ fontSize: 12, color: "#999" }}>下挂 {endpoints.length} 个连接 · 所有操作均作用于 Endpoint，设备本身不直接采集</div>
+        <div style={{ fontSize: 12, color: "#525252" }}>下挂 {endpoints.length} 个连接 · 所有操作均作用于 Endpoint，设备本身不直接采集</div>
       </Card>
 
       <Row gutter={[16, 16]}>
@@ -364,11 +364,11 @@ export function DeviceDetailPage() {
             <Col key={ep.id} xs={24} lg={12} xl={8}>
               <Card
                 size="small"
-                title={<span style={{ fontFamily: "monospace", fontSize: 13 }}>{ep.name ?? ep.id}</span>}
+                title={<span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 13 }}>{ep.name ?? ep.id}</span>}
                 extra={<Tag color={running ? "green" : (ep.state ?? "").toUpperCase() === "FAILED" ? "red" : "default"}>{ep.state ?? "—"}</Tag>}
               >
                 <div style={{ display: "grid", gap: 8 }}>
-                  <div style={{ fontSize: 12, color: "#999", fontFamily: "monospace" }}>{ep.id}</div>
+                  <div style={{ fontSize: 12, color: "#525252", fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>{ep.id}</div>
                   <div><Tag>{ep.driver_id}</Tag></div>
                   <Space wrap>
                     <Button size="small" onClick={() => openEdit(ep)}>编辑连接</Button>
@@ -385,7 +385,7 @@ export function DeviceDetailPage() {
         })}
       </Row>
       {!endpoints.length && (
-        <Card size="small"><div style={{ color: "#999", fontSize: 12 }}>该设备下暂无连接，点“新增连接”添加第一个 Endpoint（不会新增设备）。</div></Card>
+        <Card size="small"><div style={{ color: "#525252", fontSize: 12 }}>该设备下暂无连接，点“新增连接”添加第一个 Endpoint（不会新增设备）。</div></Card>
       )}
 
       <Modal title={`新增连接 · 归属 ${deviceId}`} open={addOpen} onOk={doAdd} onCancel={() => setAddOpen(false)} okText="创建" destroyOnHidden width={640}>
@@ -397,9 +397,9 @@ export function DeviceDetailPage() {
             <Input placeholder="如 PLC / NCK / OPC UA" />
           </Form.Item>
           <Form.Item name="id" label="连接 ID（可空自动生成，与设备 ID 独立）">
-            <Input placeholder={`${driverId}-xxxxxx`} style={{ fontFamily: "monospace" }} />
+            <Input placeholder={`${driverId}-xxxxxx`} style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }} />
           </Form.Item>
-          {!addDesc ? <div style={{ color: "#999", fontSize: 12 }}>加载连接参数…</div> : (
+          {!addDesc ? <div style={{ color: "#525252", fontSize: 12 }}>加载连接参数…</div> : (
             <DescriptorFields schema={addDesc.connection} value={addConn} onChange={setAddConn} />
           )}
           <Space style={{ marginTop: 8 }}>
@@ -415,16 +415,16 @@ export function DeviceDetailPage() {
         <div style={{ marginBottom: 12, display: "flex", gap: 8, alignItems: "center" }}>
           <span style={{ fontSize: 12 }}>驱动</span>
           <Tag>{editEp?.driver_id}</Tag>
-          <span style={{ fontSize: 12, color: "#999" }}>创建后不可改</span>
+          <span style={{ fontSize: 12, color: "#525252" }}>创建后不可改</span>
         </div>
         <div style={{ marginBottom: 12 }}>
           <div style={{ fontSize: 12, marginBottom: 4 }}>连接名称</div>
           <Input value={editName} onChange={(e) => setEditName(e.target.value)} />
         </div>
-        {!editDesc ? <div style={{ color: "#999" }}>加载中…</div> : (
+        {!editDesc ? <div style={{ color: "#525252" }}>加载中…</div> : (
           <DescriptorFields schema={editDesc.connection} value={editConn} onChange={setEditConn} />
         )}
-        <div style={{ marginTop: 8, fontSize: 12, color: "#999" }}>需先停止再修改（已自动停止），保存后需手动启动</div>
+        <div style={{ marginTop: 8, fontSize: 12, color: "#525252" }}>需先停止再修改（已自动停止），保存后需手动启动</div>
       </Modal>
 
       <Modal title={`设备改名 · ${deviceId}`} open={renameOpen} onOk={saveRename} onCancel={() => setRenameOpen(false)} okText="保存" destroyOnHidden>
@@ -436,12 +436,12 @@ export function DeviceDetailPage() {
       </Modal>
 
       <Modal title={`点位 · ${pointsEp?.id ?? ""}`} open={pointsOpen} onOk={savePoints} onCancel={() => setPointsOpen(false)} okText="保存并启动" width={720} destroyOnHidden>
-        {!pointsDesc ? <div style={{ color: "#999" }}>加载资源…</div> : (
+        {!pointsDesc ? <div style={{ color: "#525252" }}>加载资源…</div> : (
           <>
             <div style={{ marginBottom: 12, display: "flex", gap: 8, alignItems: "center" }}>
               <span style={{ fontSize: 12 }}>采集周期</span>
               <InputNumber min={10} max={60000} step={10} value={intervalMs} onChange={(v) => setIntervalMs(v ?? 1000)} addonAfter="ms" style={{ width: 180 }} />
-              <span style={{ fontSize: 12, color: "#999" }}>10ms–60s，20ms已通过50K/s压测</span>
+              <span style={{ fontSize: 12, color: "#525252" }}>10ms–60s，20ms已通过50K/s压测</span>
             </div>
             <ResourcePickerAntd
               resources={pointsDesc.resources}
@@ -457,12 +457,12 @@ export function DeviceDetailPage() {
                 return true;
               }}
             />
-            <div style={{ marginTop: 12, fontSize: 12, color: "#999" }}>已选 {pointsSels.length} 项 · {intervalMs}ms 轮询 · 保存将执行 Stop → PUT /tasks/{pointsEp?.id} → Start <Button size="small" onClick={() => setPointsSels([])} style={{ marginLeft: 8 }}>清空</Button></div>
+            <div style={{ marginTop: 12, fontSize: 12, color: "#525252" }}>已选 {pointsSels.length} 项 · {intervalMs}ms 轮询 · 保存将执行 Stop → PUT /tasks/{pointsEp?.id} → Start <Button size="small" onClick={() => setPointsSels([])} style={{ marginLeft: 8 }}>清空</Button></div>
             {!!pointsSels.length && (
               <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
                 {pointsSels.map((s, idx) => (
-                  <div key={idx} style={{ display: "flex", gap: 8, alignItems: "center", padding: 6, border: "1px solid #eee", borderRadius: 6 }}>
-                    <span style={{ flex: 1, fontFamily: "monospace", fontSize: 11 }}>{s.resource_id} → {s.outputs.map((o) => o.point_key).join(", ")} <span style={{ color: "#999" }}>{JSON.stringify(s.parameters)}</span></span>
+                  <div key={idx} style={{ display: "flex", gap: 8, alignItems: "center", padding: 6, border: "1px solid #e0e0e0", borderRadius: 0 }}>
+                    <span style={{ flex: 1, fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}>{s.resource_id} → {s.outputs.map((o) => o.point_key).join(", ")} <span style={{ color: "#525252" }}>{JSON.stringify(s.parameters)}</span></span>
                     <Button size="small" danger onClick={() => setPointsSels((p) => p.filter((_, i) => i !== idx))}>移除</Button>
                   </div>
                 ))}

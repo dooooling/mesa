@@ -126,7 +126,7 @@ export function EventFilters({
           />
         </Col>
       </Row>
-      <div style={{ color: "#888", fontSize: 12 }}>
+      <div style={{ color: "#525252", fontSize: 12 }}>
         时间过滤对应 received_at_ns（接收时间），非设备发生时间；后端按 seq DESC 分页，默认 100、最大 500。
       </div>
     </div>

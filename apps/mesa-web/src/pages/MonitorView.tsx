@@ -39,8 +39,8 @@ export function MonitorView() {
         dataSource={data}
         pagination={{ pageSize: 20 }}
         columns={[
-          { title: "设备", dataIndex: "endpoint_id", render: (v: string) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{v}</span> },
-          { title: "点位", render: (_: unknown, r: Point) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{r.key ?? r.point_key ?? ""}</span> },
+          { title: "设备", dataIndex: "endpoint_id", render: (v: string) => <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>{v}</span> },
+          { title: "点位", render: (_: unknown, r: Point) => <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>{r.key ?? r.point_key ?? ""}</span> },
           { title: "值", render: (_: unknown, r: Point) => String(r.value ?? "") },
           { title: "类型", dataIndex: "type", render: (v: string) => <Tag>{v ?? "—"}</Tag> },
           { title: "质量", dataIndex: "quality", render: (v: string) => <Tag color={v === "GOOD" ? "green" : v === "BAD" ? "red" : "orange"}>{v}</Tag> },

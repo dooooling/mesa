@@ -91,7 +91,7 @@ export function DevicesPage() {
           dataSource={devices}
           onRow={(r) => ({ onClick: () => nav(`/devices/${r.id}`), style: { cursor: "pointer" } })}
           columns={[
-            { title: "ID", dataIndex: "id", render: (v: string) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{v}</span> },
+            { title: "ID", dataIndex: "id", render: (v: string) => <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>{v}</span> },
             { title: "名称", dataIndex: "name", render: (v: string) => v ?? "—" },
             {
               title: "连接",
@@ -113,7 +113,7 @@ export function DevicesPage() {
           ]}
           locale={{ emptyText: "暂无设备，先新建设备或走新建向导" }}
         />
-        <div style={{ marginTop: 8, fontSize: 12, color: "#999" }}>
+        <div style={{ marginTop: 8, fontSize: 12, color: "#525252" }}>
           设备 {deviceCount} 个 · 连接 {endpointTotal} 个（连接归属设备，不计入设备数）
         </div>
       </Card>
@@ -121,12 +121,12 @@ export function DevicesPage() {
       <Modal title="新建设备" open={open} onOk={create} onCancel={() => setOpen(false)} okText="创建" destroyOnHidden>
         <Form form={form} layout="vertical">
           <Form.Item name="id" label="设备 ID" rules={[{ required: true, message: "设备 ID 必填" }]}>
-            <Input placeholder="device-a" style={{ fontFamily: "monospace" }} />
+            <Input placeholder="device-a" style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }} />
           </Form.Item>
           <Form.Item name="name" label="设备名称">
             <Input placeholder="默认为 ID" />
           </Form.Item>
-          <div style={{ fontSize: 12, color: "#999" }}>只创建 Device；连接在设备详情页按需添加，可一对多。</div>
+          <div style={{ fontSize: 12, color: "#525252" }}>只创建 Device；连接在设备详情页按需添加，可一对多。</div>
         </Form>
       </Modal>
     </div>

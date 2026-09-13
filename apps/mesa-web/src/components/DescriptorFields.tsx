@@ -40,7 +40,7 @@ function FieldControl({
   const label = (
     <span>
       {field.label} {field.required && <span style={{ color: "#ff4d4f" }}>*</span>}
-      {field.description ? <span style={{ color: "#888", fontWeight: 400 }}> — {field.description}</span> : null}
+      {field.description ? <span style={{ color: "#525252", fontWeight: 400 }}> — {field.description}</span> : null}
     </span>
   );
   if (field.field_type === "boolean") {
@@ -154,7 +154,7 @@ function FieldControl({
         value={String(value ?? field.default ?? "")}
         onChange={(e) => onChange(e.target.value)}
         placeholder={field.ui.placeholder}
-        style={{ fontFamily: "monospace" }}
+        style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}
       />
     </div>
   );
@@ -173,7 +173,7 @@ export function DescriptorFields({
 }) {
   const fields = (schema.fields ?? []).filter((f) => isVisible(f, value));
   const sorted = [...fields].sort((a, b) => (a.ui.order ?? 999) - (b.ui.order ?? 999));
-  if (sorted.length === 0) return <div style={{ color: "#888", fontSize: 12 }}>该流无参数</div>;
+  if (sorted.length === 0) return <div style={{ color: "#525252", fontSize: 12 }}>该流无参数</div>;
   const groups = new Map<string, FieldDescriptor[]>();
   for (const f of sorted) {
     const g = f.ui.group ?? "default";
@@ -184,7 +184,7 @@ export function DescriptorFields({
     <div style={{ display: "grid", gap: 12 }}>
       {[...groups.entries()].map(([g, fs]) => (
         <div key={g}>
-          {g !== "default" ? <div style={{ fontSize: 12, color: "#888", marginBottom: 6 }}>{g}</div> : null}
+          {g !== "default" ? <div style={{ fontSize: 12, color: "#525252", marginBottom: 6 }}>{g}</div> : null}
           <div style={{ display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))" }}>
             {fs.map((f) => (
               <FieldControl

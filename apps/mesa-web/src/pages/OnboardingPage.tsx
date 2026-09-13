@@ -124,7 +124,7 @@ export function OnboardingPage() {
         <Card size="small" title="① 创建设备">
           <Form form={deviceForm} layout="vertical">
             <Form.Item name="id" label="设备 ID" rules={[{ required: true, message: "设备 ID 必填" }]}>
-              <Input placeholder="device-a" style={{ fontFamily: "monospace" }} />
+              <Input placeholder="device-a" style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }} />
             </Form.Item>
             <Form.Item name="name" label="设备名称">
               <Input placeholder="默认为 ID" />
@@ -147,9 +147,9 @@ export function OnboardingPage() {
               <Input placeholder="如 PLC / NCK / OPC UA" />
             </Form.Item>
             <Form.Item name="id" label="连接 ID（可空自动生成，与设备 ID 独立）">
-              <Input placeholder={`${driverId}-xxxxxx`} style={{ fontFamily: "monospace" }} />
+              <Input placeholder={`${driverId}-xxxxxx`} style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }} />
             </Form.Item>
-            {!desc ? <div style={{ color: "#999", fontSize: 12 }}>加载连接参数…</div> : (
+            {!desc ? <div style={{ color: "#525252", fontSize: 12 }}>加载连接参数…</div> : (
               <DescriptorFields schema={desc.connection} value={conn} onChange={setConn} />
             )}
             <Space style={{ marginTop: 8 }}>
@@ -171,7 +171,7 @@ export function OnboardingPage() {
           </Form>
           {/* 设备已持久化提交，不再伪装可退回未提交的 Step 1；
               需调整设备请到设备详情改名，连接失败本页直接重试。 */}
-          <div style={{ fontSize: 12, color: "#999", marginTop: 16, marginBottom: 8 }}>
+          <div style={{ fontSize: 12, color: "#525252", marginTop: 16, marginBottom: 8 }}>
             设备 {deviceId} 已创建（已提交）。改名请到设备详情，连接失败可修正后重试。
           </div>
           <Space style={{ marginTop: 0 }}>
@@ -183,12 +183,12 @@ export function OnboardingPage() {
 
       {step === 2 && (
         <Card size="small" title="③ 完成 · 两个独立对象已生成">
-          <pre style={{ fontFamily: "monospace", fontSize: 12, background: "rgba(0,0,0,.04)", padding: 12, borderRadius: 8 }}>
+          <pre style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12, background: "#f4f4f4", padding: 12, borderRadius: 0 }}>
 {`Device ${deviceId}（${deviceName}）
 └─ Endpoint ${endpointId}
      └─ Driver ${driverId}`}
           </pre>
-          <div style={{ fontSize: 12, color: "#999", marginBottom: 12 }}>
+          <div style={{ fontSize: 12, color: "#525252", marginBottom: 12 }}>
             Device 与 Endpoint id 各自独立；继续加连接请到设备详情（不新增设备）。
           </div>
           <Space>

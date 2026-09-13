@@ -53,7 +53,7 @@ export function Dashboard() {
               dataSource={devices}
               onRow={(r) => ({ onClick: () => nav(`/devices/${r.id}`), style: { cursor: "pointer" } })}
               columns={[
-                { title: "设备", dataIndex: "id", render: (v: string) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{v}</span> },
+                { title: "设备", dataIndex: "id", render: (v: string) => <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>{v}</span> },
                 { title: "名称", dataIndex: "name", render: (v: string) => v ?? "—" },
               ]}
               locale={{ emptyText: "暂无设备" }}
@@ -68,7 +68,7 @@ export function Dashboard() {
               rowKey={(r) => `${(r as Point).endpoint_id}:${(r as Point).point_id}`}
               dataSource={points.slice(0, 8) as never[]}
               columns={[
-                { title: "点位", render: (_: unknown, r: Point) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{r.key ?? r.point_key ?? ""}</span> },
+                { title: "点位", render: (_: unknown, r: Point) => <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>{r.key ?? r.point_key ?? ""}</span> },
                 { title: "值", render: (_: unknown, r: Point) => String(r.value ?? "") },
                 { title: "质量", dataIndex: "quality", render: (v: string) => <Tag color={v === "GOOD" ? "green" : v === "BAD" ? "red" : "orange"}>{v}</Tag> },
               ]}

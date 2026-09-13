@@ -270,11 +270,11 @@ export function EventTaskEditor() {
                     </Button>
                   }
                 >
-                  <div style={{ fontSize: 12, color: "#888" }}>kind: <span style={{ fontFamily: "monospace" }}>{d.task.binding.kind}</span></div>
-                  <pre style={{ fontSize: 12, background: "rgba(0,0,0,.04)", padding: 8, borderRadius: 6, overflow: "auto" }}>
+                  <div style={{ fontSize: 12, color: "#525252" }}>kind: <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>{d.task.binding.kind}</span></div>
+                  <pre style={{ fontSize: 12, background: "#f4f4f4", padding: 8, borderRadius: 0, overflow: "auto" }}>
                     {JSON.stringify(d.task.binding.config, null, 2)}
                   </pre>
-                  <div style={{ fontSize: 12, color: "#888" }}>私有绑定只读展示、可删除，不可结构化编辑。</div>
+                  <div style={{ fontSize: 12, color: "#525252" }}>私有绑定只读展示、可删除，不可结构化编辑。</div>
                 </Card>
               );
             }
@@ -298,7 +298,7 @@ export function EventTaskEditor() {
                       value={d.id}
                       disabled={running}
                       onChange={(e) => patchGeneric(d.key, { id: e.target.value })}
-                      style={{ width: 200, fontFamily: "monospace" }}
+                      style={{ width: 200, fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}
                     />
                     <span>Event Stream</span>
                     <Select
@@ -348,7 +348,7 @@ export function EventTaskEditor() {
                         onChange={(next) => patchGeneric(d.key, { parameters: next })}
                       />
                       {st.fields.length > 0 ? (
-                        <div style={{ fontSize: 12, color: "#888" }}>
+                        <div style={{ fontSize: 12, color: "#525252" }}>
                           该流可能产生的字段：{st.fields.map((f) => f.key).join(" · ")}
                         </div>
                       ) : null}
@@ -363,7 +363,7 @@ export function EventTaskEditor() {
             <Button icon={<PlusOutlined />} onClick={addTask} disabled={running || streams.length === 0}>
               添加订阅
             </Button>
-            <span style={{ marginLeft: 12, fontSize: 12, color: "#888" }}>只生成 {GENERIC_EVENT_BINDING_KIND}</span>
+            <span style={{ marginLeft: 12, fontSize: 12, color: "#525252" }}>只生成 {GENERIC_EVENT_BINDING_KIND}</span>
           </div>
           <div>
             <Button
