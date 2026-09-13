@@ -12,7 +12,12 @@ import {
   canDeleteDevice,
   cleanConnection,
   isRunningState,
+  mergeAcquisitionTasks,
+  selectionsOf,
+  splitAcquisitionTasks,
+  type AcquisitionTaskShape,
   type Device,
+  type ResourceSelection,
 } from "../deviceModel";
 import { DescriptorFields, materializeSchemaDefaults } from "../components/DescriptorFields";
 import { ResourcePickerAntd } from "../components/ResourcePickerAntd";
@@ -35,12 +40,6 @@ interface Endpoint {
   state?: string;
   connection?: Record<string, unknown>;
 }
-
-type Selection = {
-  resource_id: string;
-  parameters: Record<string, unknown>;
-  outputs: Array<{ output: string; point_key: string }>;
-};
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -72,11 +71,14 @@ export function DeviceDetailPage() {
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameForm] = Form.useForm();
 
-  // 点位配置
+  // 点位配置（单任务编辑器）：只编辑 canonical 任务，其余任务原样保留，
+  // 绝不因 PUT 全量替换而误删 task-b/task-c（P0 数据安全）。
   const [pointsOpen, setPointsOpen] = useState(false);
   const [pointsEp, setPointsEp] = useState<Endpoint | null>(null);
   const [pointsDesc, setPointsDesc] = useState<DriverDescriptor | null>(null);
-  const [pointsSels, setPointsSels] = useState<Selection[]>([]);
+  const [pointsSels, setPointsSels] = useState<ResourceSelection[]>([]);
+  const [existingTasks, setExistingTasks] = useState<AcquisitionTaskShape[]>([]);
+  const [preservedTasks, setPreservedTasks] = useState<AcquisitionTaskShape[]>([]);
   const [intervalMs, setIntervalMs] = useState(1000);
 
   const load = async () => {
@@ -287,36 +289,39 @@ export function DeviceDetailPage() {
   const openPoints = async (ep: Endpoint) => {
     setPointsEp(ep);
     setPointsSels([]);
+    setExistingTasks([]);
+    setPreservedTasks([]);
     setIntervalMs(1000);
     setPointsOpen(true);
     const r = await fetch(`/api/v1/drivers/${ep.driver_id}/descriptor`).then((x) => x.json()).catch(() => null);
     setPointsDesc(r);
     fetch(`/api/v1/tasks?endpoint=${ep.id}`).then((x) => x.json()).then((j) => {
-      const tasks: Array<{ interval_ms?: number; binding: { kind: string; config: { selections?: Selection[] } } }> = j.tasks ?? [];
+      const tasks = (j.tasks ?? []) as AcquisitionTaskShape[];
+      setExistingTasks(tasks);
+      // 只回显 canonical 任务；其余任务保留且不在此编辑（P0：防误删）
+      const { editable, preserved } = splitAcquisitionTasks(tasks);
+      setPreservedTasks(preserved);
+      if (editable) {
+        if (editable.mode === "poll") setIntervalMs(editable.interval_ms ?? 1000);
+        const sels = selectionsOf(editable);
+        if (sels.length) setPointsSels(sels);
+      }
       if (tasks.length) {
-        const first = tasks[0];
-        if (first) setIntervalMs(first.interval_ms ?? 1000);
-        // 回显只理解 mesa.resources.v1 canonical 形态
-        if (first?.binding.kind === "mesa.resources.v1") {
-          const sels = first.binding.config?.selections;
-          if (sels?.length) setPointsSels(sels);
-        }
-        message.info(`已回显 ${tasks.length} 任务`);
+        message.info(
+          preserved.length
+            ? `已回显 canonical 任务，另有 ${preserved.length} 个任务将被保留（${preserved.map((t) => t.id).join("、")}）`
+            : `已回显 ${tasks.length} 任务`,
+        );
       }
     }).catch(() => {});
   };
 
   const savePoints = async () => {
     if (!pointsEp || !pointsSels.length) return message.warning("请先加入点位");
-    // 只发 mesa.resources.v1 canonical 形态，合法性由 Core 门禁裁决
-    const tasks = [
-      {
-        id: "t1",
-        mode: "poll",
-        interval_ms: intervalMs,
-        binding: { kind: "mesa.resources.v1", config: { selections: pointsSels } },
-      },
-    ];
+    // 只发 mesa.resources.v1 canonical 形态，其它任务逐字保留；
+    // 合法性由 Core 门禁裁决
+    const tasks = mergeAcquisitionTasks(existingTasks, { interval_ms: intervalMs, selections: pointsSels });
+    const preservedCount = tasks.length - 1;
     await api.stopEndpoint(pointsEp.id).catch(() => {});
     const r = await fetch(`/api/v1/tasks/${pointsEp.id}`, {
       method: "PUT",
@@ -325,7 +330,7 @@ export function DeviceDetailPage() {
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) return message.error(j.error?.message ?? "点位保存失败");
-    message.success("点位已保存，正在启动…");
+    message.success(preservedCount > 0 ? `点位已保存（另保留 ${preservedCount} 个任务），正在启动…` : "点位已保存，正在启动…");
     await api.startEndpoint(pointsEp.id);
     setPointsOpen(false);
     load();
@@ -458,6 +463,14 @@ export function DeviceDetailPage() {
               }}
             />
             <div style={{ marginTop: 12, fontSize: 12, color: "#525252" }}>已选 {pointsSels.length} 项 · {intervalMs}ms 轮询 · 保存将执行 Stop → PUT /tasks/{pointsEp?.id} → Start <Button size="small" onClick={() => setPointsSels([])} style={{ marginLeft: 8 }}>清空</Button></div>
+            {preservedTasks.length > 0 && (
+              <div style={{ marginTop: 8, fontSize: 12, color: "#525252" }}>
+                以下任务不在此编辑、保存时原样保留：
+                {preservedTasks.map((t) => (
+                  <Tag key={t.id} style={{ marginLeft: 6 }}>{t.id} · {t.binding.kind} · {t.mode}</Tag>
+                ))}
+              </div>
+            )}
             {!!pointsSels.length && (
               <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
                 {pointsSels.map((s, idx) => (

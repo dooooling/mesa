@@ -148,3 +148,84 @@ export function canDeleteDevice(
   }
   return { ok: true };
 }
+
+// ---------------------------------------------------------------------------
+// Acquisition Task Set（P0：Web 单任务编辑器不得破坏多 Task）
+//
+// 背景：PUT /tasks/{endpoint} 是全量替换。旧 Web 只回显 tasks[0]、保存时
+// 只发 [{id:"t1"}]，会把 task-b/task-c 等其它任务静默删掉。正确语义：
+// Web 只编辑 canonical（mesa.resources.v1）任务，其余任务原样保留。
+// ---------------------------------------------------------------------------
+
+/** Web 可理解的 canonical 点位选择形态（与 ResourcePickerAntd 产出一致）。 */
+export interface ResourceSelection {
+  resource_id: string;
+  parameters: Record<string, unknown>;
+  outputs: Array<{ output: string; point_key: string }>;
+}
+
+export const CANONICAL_RESOURCES_KIND = "mesa.resources.v1";
+
+/** 服务端任务形状（Web 只读 id/mode/interval/binding.kind，不解释其它 binding）。 */
+export interface AcquisitionTaskShape {
+  id: string;
+  mode: string;
+  interval_ms?: number | null;
+  binding: {
+    kind: string;
+    config?: unknown;
+  };
+}
+
+/**
+ * 拆分任务集：第一个 canonical 任务归 Web 编辑，其余全部归保留。
+ * 无 canonical 时 editable 为 null（保存即新增），preserved 为全集。
+ */
+export function splitAcquisitionTasks(tasks: AcquisitionTaskShape[]): {
+  editable: AcquisitionTaskShape | null;
+  preserved: AcquisitionTaskShape[];
+} {
+  const idx = tasks.findIndex((t) => t.binding.kind === CANONICAL_RESOURCES_KIND);
+  if (idx < 0) return { editable: null, preserved: [...tasks] };
+  return {
+    editable: tasks[idx],
+    preserved: tasks.filter((_, i) => i !== idx),
+  };
+}
+
+/** 从 canonical 任务的 config 里提取已选（非 canonical 形态返回空数组）。 */
+export function selectionsOf(task: AcquisitionTaskShape | null): ResourceSelection[] {
+  if (!task || task.binding.kind !== CANONICAL_RESOURCES_KIND) return [];
+  const config = task.binding.config as { selections?: ResourceSelection[] } | undefined;
+  return config?.selections ?? [];
+}
+
+/**
+ * 合并回写：用编辑结果更新 canonical 任务，其余任务逐字保留。
+ * - 沿用已存在的 canonical id（不增殖 id；无则用占位 t1，冲突时 t1-2/t1-3…避让）；
+ * - 沿用已存在的 mode（外来 subscribe 任务不得被编辑器默默翻成 poll）；
+ *   poll 任务写编辑器周期，非 poll 任务保留原周期。
+ */
+export function mergeAcquisitionTasks(
+  existing: AcquisitionTaskShape[],
+  edited: { interval_ms: number; selections: ResourceSelection[] },
+): AcquisitionTaskShape[] {
+  const { editable, preserved } = splitAcquisitionTasks(existing);
+  const taken = new Set(existing.map((t) => t.id));
+  let id = editable?.id ?? "t1";
+  if (!editable) {
+    let n = 2;
+    while (taken.has(id)) {
+      id = `t1-${n}`;
+      n += 1;
+    }
+  }
+  const mode = editable?.mode ?? "poll";
+  const canonical: AcquisitionTaskShape = {
+    id,
+    mode,
+    interval_ms: mode === "poll" ? edited.interval_ms : (editable?.interval_ms ?? null),
+    binding: { kind: CANONICAL_RESOURCES_KIND, config: { selections: edited.selections } },
+  };
+  return [...preserved, canonical];
+}

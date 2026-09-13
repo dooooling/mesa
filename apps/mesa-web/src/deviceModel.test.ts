@@ -10,7 +10,10 @@ import {
   groupEndpointsByDevice,
   isDriverChangeAttempt,
   isRunningState,
+  mergeAcquisitionTasks,
+  splitAcquisitionTasks,
   suggestEndpointId,
+  type AcquisitionTaskShape,
 } from "./deviceModel";
 
 describe("groupEndpointsByDevice", () => {
@@ -136,5 +139,81 @@ describe("isRunningState", () => {
     expect(isRunningState("reconnecting")).toBe(true);
     expect(isRunningState("STOPPED")).toBe(false);
     expect(isRunningState(undefined)).toBe(false);
+  });
+});
+
+const canon = (id: string, extra?: Partial<AcquisitionTaskShape>): AcquisitionTaskShape => ({
+  id,
+  mode: "poll",
+  interval_ms: 1000,
+  binding: {
+    kind: "mesa.resources.v1",
+    config: { selections: [{ resource_id: "r", parameters: {}, outputs: [] }] },
+  },
+  ...extra,
+});
+
+const other = (id: string): AcquisitionTaskShape => ({
+  id,
+  mode: "poll",
+  interval_ms: 500,
+  binding: { kind: "driver.native.v1", config: { op: "scan" } },
+});
+
+describe("splitAcquisitionTasks", () => {
+  it("首个 canonical 归编辑，其余归保留（task-a/b/c 场景）", () => {
+    const { editable, preserved } = splitAcquisitionTasks([canon("task-a"), other("task-b"), other("task-c")]);
+    expect(editable?.id).toBe("task-a");
+    expect(preserved.map((t) => t.id)).toEqual(["task-b", "task-c"]);
+  });
+
+  it("无 canonical 时 editable 为空、全部保留", () => {
+    const { editable, preserved } = splitAcquisitionTasks([other("task-b"), other("task-c")]);
+    expect(editable).toBeNull();
+    expect(preserved.map((t) => t.id)).toEqual(["task-b", "task-c"]);
+  });
+
+  it("多个 canonical 时只取第一个编辑，第二个保留", () => {
+    const { editable, preserved } = splitAcquisitionTasks([canon("c1"), canon("c2")]);
+    expect(editable?.id).toBe("c1");
+    expect(preserved.map((t) => t.id)).toEqual(["c2"]);
+  });
+});
+
+describe("mergeAcquisitionTasks", () => {
+  const sel = [{ resource_id: "r2", parameters: {}, outputs: [] }];
+
+  it("更新沿用原 canonical id，其它任务逐字保留（核心回归）", () => {
+    const out = mergeAcquisitionTasks([canon("task-a"), other("task-b"), other("task-c")], {
+      interval_ms: 2000,
+      selections: sel,
+    });
+    expect(out.map((t) => t.id).sort()).toEqual(["task-a", "task-b", "task-c"]);
+    const a = out.find((t) => t.id === "task-a")!;
+    expect(a.interval_ms).toBe(2000);
+    expect((a.binding.config as { selections: unknown }).selections).toEqual(sel);
+    // 被保留任务逐字不动（含自定义 binding）
+    expect(out.find((t) => t.id === "task-b")).toEqual(other("task-b"));
+    expect(out.find((t) => t.id === "task-c")).toEqual(other("task-c"));
+  });
+
+  it("空集保存即新增 t1", () => {
+    const out = mergeAcquisitionTasks([], { interval_ms: 1000, selections: sel });
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe("t1");
+    expect(out[0].binding.kind).toBe("mesa.resources.v1");
+  });
+
+  it("t1 被占用时避让为 t1-2", () => {
+    const out = mergeAcquisitionTasks([other("t1")], { interval_ms: 1000, selections: sel });
+    expect(out.map((t) => t.id).sort()).toEqual(["t1", "t1-2"]);
+  });
+
+  it("外来 subscribe canonical 不被默默翻成 poll，周期也保留", () => {
+    const sub = canon("sub-1", { mode: "subscribe", interval_ms: null });
+    const out = mergeAcquisitionTasks([sub], { interval_ms: 1000, selections: sel });
+    expect(out).toHaveLength(1);
+    expect(out[0].mode).toBe("subscribe");
+    expect(out[0].interval_ms).toBeNull();
   });
 });
