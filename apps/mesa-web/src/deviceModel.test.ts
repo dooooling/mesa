@@ -107,6 +107,13 @@ describe("cleanConnection", () => {
       cleanConnection({ a: "", b: undefined, c: null, d: false, e: 0, f: "x" }),
     ).toEqual({ d: false, e: 0, f: "x" });
   });
+
+  it("Secret marker 原样保留（未触碰时后端按 marker-preserve 保留旧值）", () => {
+    expect(cleanConnection({ password: { secret_set: true }, host: "x" })).toEqual({
+      password: { secret_set: true },
+      host: "x",
+    });
+  });
 });
 
 describe("canDeleteDevice", () => {

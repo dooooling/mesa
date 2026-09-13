@@ -39,9 +39,11 @@ export function DevicesPage() {
 
   const create = async () => {
     try {
-      const v = (await form.validateFields()) as { id: string; name: string };
+      const v = (await form.validateFields()) as { id: string; name?: string };
       const id = v.id.trim();
-      const name = v.name.trim() || id;
+      // 名称可空（placeholder“默认为 ID”）：未填时用 id；可选链避免
+      // undefined.trim() 抛异常后被空 catch 当校验失败吞掉的静默失败。
+      const name = v.name?.trim() || id;
       const r = await api.createDevice({ id, name });
       if (r.status !== 201 && r.status !== 200) {
         message.error(r.body?.error?.message ?? "创建设备失败");

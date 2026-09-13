@@ -83,6 +83,8 @@ export function DeviceDetailPage() {
     try {
       const d = (await api.getDevice(deviceId)) as Device;
       setDevice(d);
+      // 同一路由实例从不存在 ID 切到存在 ID 时，清掉旧的 404 view
+      setNotFound(false);
     } catch (e) {
       const err = e as { status?: number };
       if (err?.status === 404) setNotFound(true);

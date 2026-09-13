@@ -17,6 +17,11 @@ const FALLBACK_DRIVERS = [
   { value: "sinumerik-nck", label: "SINUMERIK NCK" },
 ];
 
+// 驱动默认值的唯一真相来源：React state 与 Form initialValues 都取此处。
+// “再建一个”必须同时复位两者，否则下拉显示与实际提交的 driver 会分叉
+//（用户看到 Simulator，实际却按上次的 opcua 创建）。
+const DEFAULT_DRIVER = "simulator";
+
 export function OnboardingPage() {
   const nav = useNavigate();
   const [step, setStep] = useState(0);
@@ -25,7 +30,7 @@ export function OnboardingPage() {
   const [deviceId, setDeviceId] = useState("");
   const [deviceName, setDeviceName] = useState("");
   const [endpointId, setEndpointId] = useState("");
-  const [driverId, setDriverId] = useState("simulator");
+  const [driverId, setDriverId] = useState(DEFAULT_DRIVER);
   const [driverOptions, setDriverOptions] = useState(FALLBACK_DRIVERS);
   const [desc, setDesc] = useState<DriverDescriptor | null>(null);
   const [conn, setConn] = useState<Record<string, unknown>>({});
@@ -67,6 +72,22 @@ export function OnboardingPage() {
       setDeviceName(name);
       setStep(1);
     } catch { /* antd 校验未通过 */ }
+  };
+
+  // 向导全量复位（“再建一个”）：state 与表单必须同归 DEFAULT_DRIVER，
+  // 外加描述/连接/诊断状态清零，不留上一轮的 Descriptor 或校验残留。
+  const resetWizard = () => {
+    setStep(0);
+    setDeviceId("");
+    setDeviceName("");
+    setEndpointId("");
+    setDriverId(DEFAULT_DRIVER);
+    deviceForm.resetFields();
+    epForm.resetFields();
+    setDesc(null);
+    setConn({});
+    setProbe(null);
+    setIssues([]);
   };
 
   const submitEndpoint = async () => {
@@ -118,7 +139,7 @@ export function OnboardingPage() {
 
       {step === 1 && (
         <Card size="small" title={`② 添加首个连接 · 归属 ${deviceId}`} extra={<Tag>{deviceName}</Tag>}>
-          <Form form={epForm} layout="vertical" initialValues={{ driver_id: "simulator" }}>
+          <Form form={epForm} layout="vertical" initialValues={{ driver_id: DEFAULT_DRIVER }}>
             <Form.Item name="driver_id" label="驱动（创建后不可改）" rules={[{ required: true }]}>
               <Select options={driverOptions} onChange={(v) => { setDriverId(v); setConn({}); }} />
             </Form.Item>
@@ -148,8 +169,13 @@ export function OnboardingPage() {
             </Space>
             {!!issues.length && <Alert style={{ marginTop: 8 }} type="error" message={issues.map((i) => `${i.path}: ${i.message}`).join("； ")} />}
           </Form>
-          <Space style={{ marginTop: 16 }}>
-            <Button onClick={() => setStep(0)}>← 返回</Button>
+          {/* 设备已持久化提交，不再伪装可退回未提交的 Step 1；
+              需调整设备请到设备详情改名，连接失败本页直接重试。 */}
+          <div style={{ fontSize: 12, color: "#999", marginTop: 16, marginBottom: 8 }}>
+            设备 {deviceId} 已创建（已提交）。改名请到设备详情，连接失败可修正后重试。
+          </div>
+          <Space style={{ marginTop: 0 }}>
+            <Button onClick={() => nav(`/devices/${deviceId}`)}>进入设备 →</Button>
             <Button type="primary" onClick={submitEndpoint}>完成</Button>
           </Space>
         </Card>
@@ -167,14 +193,7 @@ export function OnboardingPage() {
           </div>
           <Space>
             <Button type="primary" onClick={() => nav(`/devices/${deviceId}`)}>进入设备 →</Button>
-            <Button onClick={() => {
-              setStep(0);
-              setDeviceId("");
-              setEndpointId("");
-              deviceForm.resetFields();
-              epForm.resetFields();
-              setConn({});
-            }}>再建一个</Button>
+            <Button onClick={resetWizard}>再建一个</Button>
             <Button onClick={() => nav("/devices")}>返回列表</Button>
           </Space>
         </Card>
