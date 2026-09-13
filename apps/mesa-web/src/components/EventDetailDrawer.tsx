@@ -12,10 +12,10 @@ export function EventDetailDrawer({ event, onClose }: { event: StoredEvent | nul
             <h4>Identity</h4>
             <Descriptions size="small" column={1} bordered>
               <Descriptions.Item label="Store seq">{event.seq}</Descriptions.Item>
-              <Descriptions.Item label="event_id"><span style={{ fontFamily: "monospace" }}>{event.event.event_id}</span></Descriptions.Item>
-              <Descriptions.Item label="endpoint_id"><span style={{ fontFamily: "monospace" }}>{event.endpoint_id}</span></Descriptions.Item>
+              <Descriptions.Item label="event_id"><span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>{event.event.event_id}</span></Descriptions.Item>
+              <Descriptions.Item label="endpoint_id"><span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>{event.endpoint_id}</span></Descriptions.Item>
               <Descriptions.Item label="category">{event.event.category}</Descriptions.Item>
-              <Descriptions.Item label="kind"><span style={{ fontFamily: "monospace" }}>{event.event.kind}</span></Descriptions.Item>
+              <Descriptions.Item label="kind"><span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>{event.event.kind}</span></Descriptions.Item>
             </Descriptions>
           </section>
           <section>
@@ -40,7 +40,7 @@ export function EventDetailDrawer({ event, onClose }: { event: StoredEvent | nul
             <section>
               <h4>Condition</h4>
               <Descriptions size="small" column={1} bordered>
-                <Descriptions.Item label="condition_id"><span style={{ fontFamily: "monospace" }}>{event.event.condition.condition_id}</span></Descriptions.Item>
+                <Descriptions.Item label="condition_id"><span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>{event.event.condition.condition_id}</span></Descriptions.Item>
                 <Descriptions.Item label="transition"><Tag>{event.event.condition.transition}</Tag></Descriptions.Item>
                 <Descriptions.Item label="active">{String(event.event.condition.active ?? "—")}</Descriptions.Item>
                 <Descriptions.Item label="acknowledged">{String(event.event.condition.acknowledged ?? "—")}</Descriptions.Item>
@@ -52,7 +52,7 @@ export function EventDetailDrawer({ event, onClose }: { event: StoredEvent | nul
           <section>
             <h4>Metadata</h4>
             <Descriptions size="small" column={1} bordered>
-              <Descriptions.Item label="correlation_id"><span style={{ fontFamily: "monospace" }}>{event.event.correlation_id ?? "—"}</span></Descriptions.Item>
+              <Descriptions.Item label="correlation_id"><span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>{event.event.correlation_id ?? "—"}</span></Descriptions.Item>
               <Descriptions.Item label="connection_handle">{event.event.connection_handle}</Descriptions.Item>
               <Descriptions.Item label="stream_epoch">{event.stream_epoch}</Descriptions.Item>
               <Descriptions.Item label="batch_sequence">{event.batch_sequence}</Descriptions.Item>
@@ -65,8 +65,8 @@ export function EventDetailDrawer({ event, onClose }: { event: StoredEvent | nul
               locale={{ emptyText: "无 attributes" }}
               dataSource={Object.entries(event.event.attributes ?? {}).map(([k, v]) => ({ k, v: formatMesaValue(v) }))}
               columns={[
-                { title: "key", dataIndex: "k", width: 180, render: (v: string) => <span style={{ fontFamily: "monospace" }}>{v}</span> },
-                { title: "value", dataIndex: "v", render: (v: string) => <span style={{ fontFamily: "monospace" }}>{v}</span> },
+                { title: "key", dataIndex: "k", width: 180, render: (v: string) => <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>{v}</span> },
+                { title: "value", dataIndex: "v", render: (v: string) => <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>{v}</span> },
               ]}
             />
           </section>

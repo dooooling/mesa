@@ -46,7 +46,7 @@ export function ResourcePickerAntd({
   const [outputs, setOutputs] = useState<Array<{ output: string; point_key: string }>>([]);
 
   const res = resources.find((r) => r.id === rid);
-  if (!res) return <div style={{ color: "#999" }}>无可用资源</div>;
+  if (!res) return <div style={{ color: "#525252" }}>无可用资源</div>;
 
   const switchResource = (v: string) => {
     setRid(v);
@@ -106,7 +106,7 @@ export function ResourcePickerAntd({
               key={o.output}
               value={o.point_key}
               onChange={(e) => setOutputs(outputs.map((x) => (x.output === o.output ? { ...x, point_key: e.target.value } : x)))}
-              prefix={<span style={{ fontSize: 11, color: "#999" }}>{o.output}</span>}
+              prefix={<span style={{ fontSize: 11, color: "#525252" }}>{o.output}</span>}
             />
           ))}
         </div>

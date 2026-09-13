@@ -22,16 +22,16 @@ export function EventTable({
       onRow={(r) => ({ onClick: () => onSelect(r), style: { cursor: "pointer" } })}
       locale={{ emptyText: "暂无事件 · 请配置 EventTask 并启动 Endpoint" }}
       columns={[
-        { title: "Seq", dataIndex: "seq", width: 90, render: (v: number) => <span style={{ fontFamily: "monospace" }}>{v}</span> },
+        { title: "Seq", dataIndex: "seq", width: 90, render: (v: number) => <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>{v}</span> },
         {
           title: "发生时间",
           width: 190,
-          render: (_: unknown, r: StoredEvent) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{formatNsTime(r.event.occurred_at_ns)}</span>,
+          render: (_: unknown, r: StoredEvent) => <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>{formatNsTime(r.event.occurred_at_ns)}</span>,
         },
         {
           title: "接收时间",
           width: 190,
-          render: (_: unknown, r: StoredEvent) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{formatNsTime(r.received_at_ns)}</span>,
+          render: (_: unknown, r: StoredEvent) => <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>{formatNsTime(r.received_at_ns)}</span>,
         },
         {
           title: "Severity",

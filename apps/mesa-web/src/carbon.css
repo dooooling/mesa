@@ -1,0 +1,134 @@
+/* Carbon 主题层（web-ui/DESIGN.md）：白画布 + 单 IBM 蓝 + 全 0 圆角 + hairline 无阴影。
+ *
+ * 分工：色板/字号/圆角尽量走 ConfigProvider token（main.tsx）；这里只收
+ * token 表达不了的三件事——Carbon 输入框形态（灰底 + 底线 + 2px 蓝下划线
+ * focus）、侧边选中态（灰底 + 左侧蓝条）、以及 antd CSS-in-JS 注入顺序下
+ * 必须用 !important 才能坐稳的几何兜底（0 圆角 / 去阴影）。
+ * 正文统一 Plex Sans + letter-spacing 0.16px（Carbon 精度细节，不得去掉）。 */
+
+:root {
+  --carbon-blue: #0f62fe;
+  --carbon-blue-hover: #0043ce;
+  --carbon-blue-active: #002d9c;
+  --carbon-canvas: #ffffff;
+  --carbon-surface-1: #f4f4f4;
+  --carbon-surface-2: #e0e0e0;
+  --carbon-hairline: #e0e0e0;
+  --carbon-field-underline: #8d8d8d;
+  --carbon-selected: #e5e5e5;
+  --carbon-ink: #161616;
+  --carbon-ink-muted: #525252;
+  --carbon-ink-subtle: #8c8c8c;
+  --carbon-error: #da1e28;
+  --carbon-success: #24a148;
+}
+
+html, body {
+  margin: 0;
+  background: var(--carbon-canvas);
+  color: var(--carbon-ink);
+  font-family: 'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif;
+  letter-spacing: 0.16px;
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+/* 几何兜底：一切矩形，圆角归零、装饰阴影拿掉（Carbon resist drop shadows，
+ * 层级只靠 surface 变化 + 1px hairline）。 */
+.ant-btn,
+.ant-input,
+.ant-input-number,
+.ant-input-affix-wrapper,
+.ant-select-selector,
+.ant-card,
+.ant-modal-content,
+.ant-drawer-content,
+.ant-tag,
+.ant-table,
+.ant-table-container,
+.ant-alert,
+.ant-message-notice-content,
+.ant-notification-notice,
+.ant-dropdown-menu,
+.ant-select-dropdown,
+.ant-tooltip-inner,
+.ant-popover-inner,
+.ant-checkbox-inner,
+.ant-input-number-handler-wrap {
+  border-radius: 0 !important;
+}
+.ant-card,
+.ant-modal-content,
+.ant-drawer-content,
+.ant-table {
+  box-shadow: none !important;
+}
+
+/* Carbon text-input：灰底 + 仅底线；focus 把底线换成 2px 蓝下划线
+ *（overlay 式 inset shadow，不占布局）；error 同理换红。 */
+.ant-input,
+.ant-input-affix-wrapper,
+.ant-input-number,
+.ant-select .ant-select-selector {
+  border-width: 0 0 1px 0 !important;
+  border-bottom-color: var(--carbon-field-underline) !important;
+}
+.ant-input:focus,
+.ant-input-focused,
+.ant-input-affix-wrapper:focus,
+.ant-input-affix-wrapper-focused,
+.ant-input-number:focus,
+.ant-input-number-focused,
+.ant-select-focused .ant-select-selector {
+  box-shadow: inset 0 -2px 0 var(--carbon-blue) !important;
+  border-bottom-color: var(--carbon-blue) !important;
+}
+.ant-input-status-error,
+.ant-input-affix-wrapper-status-error,
+.ant-input-number-status-error,
+.ant-select-status-error .ant-select-selector {
+  box-shadow: none !important;
+  border-bottom-color: var(--carbon-field-underline) !important;
+}
+.ant-input-status-error:focus,
+.ant-input-affix-wrapper-status-error:focus,
+.ant-select-status-error.ant-select-focused .ant-select-selector {
+  box-shadow: inset 0 -2px 0 var(--carbon-error) !important;
+  border-bottom-color: var(--carbon-error) !important;
+}
+
+/* 侧边导航选中态：灰底 + 左侧 3px 蓝条（Carbon side-nav 筆法），文字墨黑；
+ * hover 仅 surface 变化，不抢蓝色（蓝色只给主 CTA / 链接 / focus）。 */
+.ant-menu-light .ant-menu-item-selected {
+  background-color: var(--carbon-selected) !important;
+  color: var(--carbon-ink) !important;
+  box-shadow: inset 3px 0 0 var(--carbon-blue);
+}
+.ant-menu-light .ant-menu-item:hover {
+  background-color: var(--carbon-surface-1) !important;
+  color: var(--carbon-ink) !important;
+}
+
+/* 下拉选中项同侧边：灰底墨字，蓝色不泛滥。 */
+.ant-select-item-option-selected:not(.ant-select-item-option-disabled) {
+  background-color: var(--carbon-selected) !important;
+  color: var(--carbon-ink) !important;
+}
+
+/* 卡片标题回归 400 权重（Carbon 不用粗标题压人）。 */
+.ant-card-head-title {
+  font-weight: 400;
+}
+
+/* 表头浅灰底 + 墨字（Carbon data-table 笔法）。 */
+.ant-table-thead > tr > th {
+  background: var(--carbon-surface-1) !important;
+  color: var(--carbon-ink) !important;
+  font-weight: 600;
+}
+
+/* 代码块统一浅灰底细线（行内 background 已清扫为 surface-1，这里只定边框几何）。 */
+pre {
+  border: 1px solid var(--carbon-hairline);
+  border-radius: 0;
+}
