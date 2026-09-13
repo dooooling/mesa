@@ -1,6 +1,8 @@
-// PR8 EventsView：事件记录（历史 + SSE 无窗口合并）与订阅配置。
+// EventsView：全局事件观察面（历史 + SSE 无窗口合并 + 诊断）。
+// 事件订阅配置属于 Endpoint 管理面，已移至 Endpoint Workspace「事件」页，
+// 本页不再承载（contract 分开：观察 vs 配置）。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Button, Card, Space, Tabs, Tag } from "antd";
+import { Alert, Button, Card, Space, Tag } from "antd";
 import { api, isEventStoreUnavailable } from "../api";
 import type { EventStats, StoredEvent } from "../types";
 import { EMPTY_EVENT_FILTER_FORM, EVENT_FIRST_PAGE_LIMIT, toEventFilter, type EventFilterForm } from "../events/filters";
@@ -10,7 +12,6 @@ import { EventFilters } from "../components/EventFilters";
 import { EventTable } from "../components/EventTable";
 import { EventDetailDrawer } from "../components/EventDetailDrawer";
 import { EventDiagnostics } from "../components/EventDiagnostics";
-import { EventTaskEditor } from "../components/EventTaskEditor";
 
 /** SSE 实时事件的客户端过滤（服务端 live 无过滤参数；语义与后端 SQL 对齐：精确匹配 + active NULL 不参与）。 */
 export function matchesLiveFilter(ev: StoredEvent, form: EventFilterForm): boolean {
@@ -217,36 +218,23 @@ export function EventsView() {
         <div style={{ marginTop: 8 }}>
           <EventDiagnostics stats={stats} />
         </div>
-        <Tabs
-          defaultActiveKey="records"
-          items={[
-            {
-              key: "records",
-              label: "事件记录",
-              children: (
-                <div style={{ display: "grid", gap: 12 }}>
-                  <EventFilters
-                    value={form}
-                    endpoints={endpoints}
-                    onChange={onFilterChange}
-                    onReset={() => onFilterChange(EMPTY_EVENT_FILTER_FORM)}
-                  />
-                  <EventTable events={history} loading={loading} onSelect={setSelected} />
-                  <div style={{ display: "flex", justifyContent: "center" }}>
-                    <Button onClick={loadOlder} loading={loadingMore} disabled={nextCursor === null || nextCursor === undefined}>
-                      {nextCursor === null || nextCursor === undefined ? "没有更多" : "加载更早"}
-                    </Button>
-                  </div>
-                </div>
-              ),
-            },
-            {
-              key: "tasks",
-              label: "订阅配置",
-              children: <EventTaskEditor />,
-            },
-          ]}
-        />
+        <div style={{ marginTop: 8, fontSize: 12, color: "#525252" }}>
+          事件订阅配置请到“设备 → 连接 → 事件”页管理，本页只做全局观察。
+        </div>
+        <div style={{ marginTop: 8, display: "grid", gap: 12 }}>
+          <EventFilters
+            value={form}
+            endpoints={endpoints}
+            onChange={onFilterChange}
+            onReset={() => onFilterChange(EMPTY_EVENT_FILTER_FORM)}
+          />
+          <EventTable events={history} loading={loading} onSelect={setSelected} />
+          <div style={{ display: "flex", justifyContent: "center" }}>
+            <Button onClick={loadOlder} loading={loadingMore} disabled={nextCursor === null || nextCursor === undefined}>
+              {nextCursor === null || nextCursor === undefined ? "没有更多" : "加载更早"}
+            </Button>
+          </div>
+        </div>
       </Card>
       <EventDetailDrawer event={selected} onClose={() => setSelected(null)} />
     </div>
