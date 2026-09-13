@@ -90,10 +90,25 @@ function FieldControl({
     );
   }
   if (field.field_type === "secret") {
+    // Secret 已设置 marker（如 {secret_set:true}）是“后端持有旧值”的凭证，
+    // 不是明文：禁止把它当字符串喂给 <input>（否则显示成 [object Object]，
+    // 用户一编辑还会把显示产物写回成新密码）。显示空值 + 保持不变占位；
+    // state 里保留 marker 原样回传，后端按 marker-preserve 保留历史 Secret；
+    // 用户键入新值后 marker 即被明文替换，后端更新 Secret。
+    const secretSet =
+      value !== null &&
+      typeof value === "object" &&
+      (value as { secret_set?: unknown }).secret_set === true;
+    const displayValue = typeof value === "string" ? value : "";
     return (
       <div style={{ display: "grid", gap: 4 }}>
         <span style={{ fontSize: 12 }}>{label}</span>
-        <Input.Password disabled={disabled} value={(value as string) ?? ""} onChange={(e) => onChange(e.target.value)} placeholder={field.ui.placeholder} />
+        <Input.Password
+          disabled={disabled}
+          value={displayValue}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={secretSet ? "已设置，留空保持不变" : field.ui.placeholder}
+        />
       </div>
     );
   }

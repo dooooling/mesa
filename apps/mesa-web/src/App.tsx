@@ -1,16 +1,21 @@
 import { Layout, Menu, theme } from "antd";
-import { DashboardOutlined, ApiOutlined, EyeOutlined, BellOutlined } from "@ant-design/icons";
+import { DashboardOutlined, ApiOutlined, PlusOutlined, EyeOutlined, BellOutlined } from "@ant-design/icons";
 import { Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { Dashboard } from "./pages/Dashboard";
-import { DeviceManager } from "./components/DeviceManager";
+import { DevicesPage } from "./pages/DevicesPage";
+import { DeviceDetailPage } from "./pages/DeviceDetailPage";
+import { OnboardingPage } from "./pages/OnboardingPage";
 import { MonitorView } from "./pages/MonitorView";
 import { EventsView } from "./pages/EventsView";
 
 const { Header, Sider, Content } = Layout;
 
+// 导航以 Device 为管理入口：设备列表 / 设备详情 / 新建向导；
+// Endpoint 是采集运行实体，只在设备详情内管理，不再有顶层入口。
 const items = [
   { key: "/", icon: <DashboardOutlined />, label: "看板" },
   { key: "/devices", icon: <ApiOutlined />, label: "设备" },
+  { key: "/onboarding", icon: <PlusOutlined />, label: "新建" },
   { key: "/monitor", icon: <EyeOutlined />, label: "监控" },
   { key: "/events", icon: <BellOutlined />, label: "事件" },
 ];
@@ -19,7 +24,9 @@ export default function App() {
   const loc = useLocation();
   const nav = useNavigate();
   const { token } = theme.useToken();
-  const selected = items.find((i) => i.key !== "/" && loc.pathname.startsWith(i.key))?.key ?? "/";
+  // /devices/:id 高亮归属 /devices，保持 Device 入口心智
+  const selected = loc.pathname.startsWith("/devices/") ? "/devices"
+    : (items.find((i) => i.key !== "/" && loc.pathname.startsWith(i.key))?.key ?? "/");
 
   return (
     <Layout style={{ minHeight: "100vh" }}>
@@ -37,7 +44,9 @@ export default function App() {
         <Content style={{ margin: 16 }}>
           <Routes>
             <Route path="/" element={<Dashboard />} />
-            <Route path="/devices" element={<DeviceManager />} />
+            <Route path="/devices" element={<DevicesPage />} />
+            <Route path="/devices/:id" element={<DeviceDetailPage />} />
+            <Route path="/onboarding" element={<OnboardingPage />} />
             <Route path="/monitor" element={<MonitorView />} />
             <Route path="/events" element={<EventsView />} />
           </Routes>

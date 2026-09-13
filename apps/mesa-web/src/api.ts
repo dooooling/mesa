@@ -86,6 +86,37 @@ export const api = {
     postJson(`/api/v1/drivers/${id}/probe`, { connection }),
   listEndpoints: () => getJson("/api/v1/endpoints"),
   listDevices: () => getJson("/api/v1/devices"),
+  getDevice: (id: string) => getJson(`/api/v1/devices/${id}`),
+  createDevice: (body: { id: string; name: string }) =>
+    postJson("/api/v1/devices", body),
+  updateDevice: (id: string, body: { name: string }) =>
+    putJson(`/api/v1/devices/${id}`, body),
+  deleteDevice: async (id: string) => {
+    const r = await fetch(`/api/v1/devices/${id}`, { method: "DELETE" });
+    const j = await r.json().catch(() => ({}));
+    return { status: r.status, body: j };
+  },
+  // Endpoint 创建：device_id 固定来自当前 Device；修改形状无 driver_id
+  //（PR25 deny_unknown_fields，创建后不可变），类型层面即禁止传入。
+  createEndpoint: (body: {
+    id: string;
+    name: string;
+    device_id: string;
+    driver_id: string;
+    connection: Record<string, unknown>;
+  }) => postJson("/api/v1/endpoints", body),
+  updateEndpoint: (id: string, body: {
+    name: string;
+    device_id: string;
+    connection: Record<string, unknown>;
+  }) => putJson(`/api/v1/endpoints/${id}`, body),
+  deleteEndpoint: async (id: string) => {
+    const r = await fetch(`/api/v1/endpoints/${id}`, { method: "DELETE" });
+    const j = await r.json().catch(() => ({}));
+    return { status: r.status, body: j };
+  },
+  startEndpoint: (id: string) => postJson(`/api/v1/endpoints/${id}/start`, {}),
+  stopEndpoint: (id: string) => postJson(`/api/v1/endpoints/${id}/stop`, {}),
   diagnostics: () => getJson("/api/v1/diagnostics"),
   endpointDiagnostics: (id: string) => getJson(`/api/v1/endpoints/${id}/diagnostics`),
   controlWrite: (endpointId: string, target: string, value: unknown, expected?: unknown) =>

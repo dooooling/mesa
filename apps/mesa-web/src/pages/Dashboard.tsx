@@ -1,13 +1,22 @@
+// PR27：看板计数分离——设备数只数 /devices，连接数只数 /endpoints。
+// 过去“设备”卡片数的是 endpoints（Device≈Endpoint 旧假设），此处修正。
 import { useEffect, useMemo, useState } from "react";
 import { Card, Col, Row, Statistic, Table, Tag } from "antd";
+import { useNavigate } from "react-router-dom";
+import { isRunningState } from "../deviceModel";
 
 type Point = { endpoint_id: string; key: string; point_key?: string; point_id: number; quality: string; type: string; value: unknown };
 
 export function Dashboard() {
+  const nav = useNavigate();
+  const [devices, setDevices] = useState<Array<{ id: string; name: string }>>([]);
   const [endpoints, setEndpoints] = useState<Array<{ id: string; driver_id: string; state?: string }>>([]);
   const [points, setPoints] = useState<Point[]>([]);
 
   useEffect(() => {
+    fetch("/api/v1/devices").then((r) => r.json()).then((j) => {
+      setDevices(j.devices ?? []);
+    }).catch(() => {});
     fetch("/api/v1/endpoints").then((r) => r.json()).then((j) => {
       const eps = (j.endpoints ?? []).map((e: never) => {
         const x = e as { id: string; driver_id: string; runtime?: { state?: string }; state?: string };
@@ -21,30 +30,31 @@ export function Dashboard() {
     return () => window.clearInterval(id);
   }, []);
 
-  const online = useMemo(() => endpoints.filter((e) => (e.state ?? "").toUpperCase() === "RUNNING").length, [endpoints]);
+  const online = useMemo(() => endpoints.filter((e) => isRunningState(e.state)).length, [endpoints]);
   const bad = useMemo(() => points.filter((p) => p.quality === "BAD").length, [points]);
 
   return (
     <div style={{ display: "grid", gap: 16 }}>
       <Row gutter={[16, 16]}>
-        <Col xs={12} lg={6}><Card><Statistic title="设备" value={endpoints.length} /></Card></Col>
-        <Col xs={12} lg={6}><Card><Statistic title="在线" value={online} valueStyle={{ color: online ? "#3f8600" : "#cf1322" }} /></Card></Col>
-        <Col xs={12} lg={6}><Card><Statistic title="点位" value={points.length} /></Card></Col>
-        <Col xs={12} lg={6}><Card><Statistic title="异常" value={bad} valueStyle={{ color: bad ? "#cf1322" : undefined }} /></Card></Col>
+        <Col xs={12} lg={5}><Card><Statistic title="设备" value={devices.length} /></Card></Col>
+        <Col xs={12} lg={5}><Card><Statistic title="连接" value={endpoints.length} /></Card></Col>
+        <Col xs={12} lg={5}><Card><Statistic title="在线" value={online} valueStyle={{ color: online ? "#3f8600" : "#cf1322" }} /></Card></Col>
+        <Col xs={12} lg={5}><Card><Statistic title="点位" value={points.length} /></Card></Col>
+        <Col xs={12} lg={4}><Card><Statistic title="异常" value={bad} valueStyle={{ color: bad ? "#cf1322" : undefined }} /></Card></Col>
       </Row>
 
       <Row gutter={[16, 16]}>
         <Col xs={24} lg={12}>
-          <Card title="设备" size="small">
+          <Card title="设备" size="small" extra={<a onClick={() => nav("/devices")}>管理 →</a>}>
             <Table
               size="small"
               pagination={false}
               rowKey="id"
-              dataSource={endpoints}
+              dataSource={devices}
+              onRow={(r) => ({ onClick: () => nav(`/devices/${r.id}`), style: { cursor: "pointer" } })}
               columns={[
                 { title: "设备", dataIndex: "id", render: (v: string) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{v}</span> },
-                { title: "驱动", dataIndex: "driver_id", render: (v: string) => <Tag>{v}</Tag> },
-                { title: "状态", dataIndex: "state", render: (v: string) => <Tag color={(v ?? "").toUpperCase() === "RUNNING" ? "green" : (v ?? "").toUpperCase() === "FAILED" ? "red" : "default"}>{v ?? "—"}</Tag> },
+                { title: "名称", dataIndex: "name", render: (v: string) => v ?? "—" },
               ]}
               locale={{ emptyText: "暂无设备" }}
             />
