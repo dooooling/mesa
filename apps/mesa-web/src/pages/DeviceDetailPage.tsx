@@ -451,6 +451,8 @@ export function DeviceDetailPage() {
             <ResourcePickerAntd
               resources={pointsDesc.resources}
               existingKeys={pointsSels.flatMap((s) => s.outputs.map((o) => o.point_key))}
+              selectionMethods={pointsDesc.resource_selection_methods}
+              endpointId={pointsEp?.id}
               onAdd={(s) => {
                 const keys = s.outputs.map((o) => o.point_key);
                 const dup = pointsSels.some((ex) => ex.outputs.some((o) => keys.includes(o.point_key)));
