@@ -7,6 +7,7 @@ import { DeleteOutlined, PlusOutlined } from "@ant-design/icons";
 import { api } from "../api";
 import type { DriverDescriptor, EventStreamDescriptor, EventTask, LocalizedText, TaskMode } from "../types";
 import { DescriptorFields, materializeSchemaDefaults } from "./DescriptorFields";
+import { ApplyWithRestart } from "./ApplyWithRestart";
 import {
   GENERIC_EVENT_BINDING_KIND,
   buildGenericEventBinding,
@@ -183,9 +184,11 @@ export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string 
 
   const hasProblem = problems.some((p) => p !== null);
 
-  const save = async () => {
-    // 归属门：只有当前选中 Endpoint 成功加载出的配置才允许保存
-    if (!selected || loadedEndpointId !== selected.id || running || saving || hasProblem) return;
+  const save = async (restart: boolean) => {
+    // 归属门：只有当前选中 Endpoint 成功加载出的配置才允许保存。
+    // 统一生命周期：运行中先停止再应用（停止是本次应用的一部分），
+    // 是否恢复运行由复选框决定；已停止则直接应用。
+    if (!selected || loadedEndpointId !== selected.id || saving || hasProblem) return;
     setSaving(true);
     setError(null);
     setSaved(false);
@@ -200,8 +203,14 @@ export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string 
       };
     });
     try {
+      if (running) {
+        await api.stopEndpoint(selected.id);
+        await new Promise((r) => setTimeout(r, 300));
+      }
       await api.replaceEventTasks(selected.id, tasks);
+      if (running && restart) await api.startEndpoint(selected.id);
       setSaved(true);
+      refreshEndpoints().catch(() => {});
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       const status = (e as { status?: number }).status;
@@ -230,18 +239,15 @@ export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string 
             options={endpoints.map((e) => ({ value: e.id, label: `${e.id}${e.running ? "（运行中）" : ""}` }))}
           />
           {selected ? <Tag>{selected.driver_id}</Tag> : null}
-          {running ? <Tag color="orange">运行中 · 只读</Tag> : <Tag color="green">已停止 · 可编辑</Tag>}
+          {running ? <Tag color="orange">运行中</Tag> : <Tag color="green">已停止 · 可编辑</Tag>}
         </Space>
       ) : (
         <Space>
           {selected ? <Tag>{selected.driver_id}</Tag> : null}
-          {running ? <Tag color="orange">运行中 · 只读</Tag> : <Tag color="green">已停止 · 可编辑</Tag>}
+          {running ? <Tag color="orange">运行中</Tag> : <Tag color="green">已停止 · 可编辑</Tag>}
         </Space>
       )}
 
-      {running ? (
-        <Alert type="warning" showIcon message="事件任务只能在 Endpoint 停止状态修改" description="停止设备必须是用户显式动作；本页不会自动 Stop。" />
-      ) : null}
       {error ? <Alert type="error" showIcon message="订阅配置失败" description={error} /> : null}
       {saved ? <Alert type="success" showIcon message="已保存" description="EventTask 全量快照已替换。" /> : null}
 
@@ -277,7 +283,7 @@ export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string 
                     </Space>
                   }
                   extra={
-                    <Button size="small" danger icon={<DeleteOutlined />} disabled={running} onClick={() => removeDraft(d.key)}>
+                    <Button size="small" danger icon={<DeleteOutlined />} disabled={saving} onClick={() => removeDraft(d.key)}>
                       删除
                     </Button>
                   }
@@ -298,7 +304,7 @@ export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string 
                 size="small"
                 title={<span>任务 · {d.id || "(未命名)"}</span>}
                 extra={
-                  <Button size="small" danger icon={<DeleteOutlined />} disabled={running} onClick={() => removeDraft(d.key)}>
+                  <Button size="small" danger icon={<DeleteOutlined />} disabled={saving} onClick={() => removeDraft(d.key)}>
                     删除
                   </Button>
                 }
@@ -308,14 +314,14 @@ export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string 
                     <span>Task ID</span>
                     <Input
                       value={d.id}
-                      disabled={running}
+                      disabled={saving}
                       onChange={(e) => patchGeneric(d.key, { id: e.target.value })}
                       style={{ width: 200, fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}
                     />
                     <span>Event Stream</span>
                     <Select
                       value={d.streamId}
-                      disabled={running}
+                      disabled={saving}
                       onChange={(v) => {
                         const ns = streamById(streams, v);
                         const nm = ns?.modes[0] ?? "subscribe";
@@ -332,7 +338,7 @@ export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string 
                     <span>Mode</span>
                     <Select
                       value={d.mode}
-                      disabled={running}
+                      disabled={saving}
                       onChange={(v: TaskMode) =>
                         patchGeneric(d.key, { mode: v, interval_ms: v === "poll" ? d.interval_ms ?? 1000 : null })
                       }
@@ -345,7 +351,7 @@ export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string 
                         <InputNumber
                           min={1}
                           value={d.interval_ms ?? undefined}
-                          disabled={running}
+                          disabled={saving}
                           onChange={(v) => patchGeneric(d.key, { interval_ms: typeof v === "number" ? v : null })}
                         />
                       </>
@@ -356,7 +362,7 @@ export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string 
                       <DescriptorFields
                         schema={st.parameters}
                         value={d.parameters}
-                        disabled={running}
+                        disabled={saving}
                         onChange={(next) => patchGeneric(d.key, { parameters: next })}
                       />
                       {st.fields.length > 0 ? (
@@ -372,20 +378,19 @@ export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string 
             );
           })}
           <div>
-            <Button icon={<PlusOutlined />} onClick={addTask} disabled={running || streams.length === 0}>
+            <Button icon={<PlusOutlined />} onClick={addTask} disabled={saving || streams.length === 0}>
               添加订阅
             </Button>
             <span style={{ marginLeft: 12, fontSize: 12, color: "#525252" }}>只生成 {GENERIC_EVENT_BINDING_KIND}</span>
           </div>
           <div>
-            <Button
-              type="primary"
-              onClick={save}
-              loading={saving}
-              disabled={running || loading || loadedEndpointId !== selected?.id || hasProblem || !selected}
-            >
-              保存订阅
-            </Button>
+            <ApplyWithRestart
+              running={running}
+              applying={saving}
+              canApply={loadedEndpointId === selected?.id && !hasProblem && !!selected}
+              applyLabel="保存订阅"
+              onApply={save}
+            />
           </div>
         </div>
       )}

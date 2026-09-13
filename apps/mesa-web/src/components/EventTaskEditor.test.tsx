@@ -1,5 +1,5 @@
 // PR8 Gate（组件）：EventTask Editor 纯 Descriptor 驱动；只发 mesa.events.v1；
-// 私有绑定只读可删；运行中只读；409 保留表单。
+// 私有绑定只读可删；运行中统一为停止并应用（复选框决定是否恢复运行）；409 保留表单。
 import { describe, expect, it, vi, beforeEach, type Mock } from "vitest";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -12,6 +12,8 @@ vi.mock("../api", () => ({
     getDescriptor: vi.fn(),
     listEventTasks: vi.fn(),
     replaceEventTasks: vi.fn(),
+    stopEndpoint: vi.fn(),
+    startEndpoint: vi.fn(),
   },
   isEventStoreUnavailable: () => false,
 }));
@@ -21,6 +23,8 @@ const mocked = api as unknown as {
   getDescriptor: Mock;
   listEventTasks: Mock;
   replaceEventTasks: Mock;
+  stopEndpoint: Mock;
+  startEndpoint: Mock;
 };
 
 const DESCRIPTOR = {
@@ -82,6 +86,8 @@ function mockStopped(eventTasks: unknown[] = [GENERIC_TASK, LEGACY_TASK]) {
   mocked.getDescriptor.mockResolvedValue(DESCRIPTOR);
   mocked.listEventTasks.mockResolvedValue({ endpoint_id: "ep1", revision: 1, event_tasks: eventTasks });
   mocked.replaceEventTasks.mockResolvedValue({ revision: 2 });
+  mocked.stopEndpoint.mockResolvedValue({ status: 200, body: {} });
+  mocked.startEndpoint.mockResolvedValue({ status: 200, body: {} });
 }
 
 beforeEach(() => {
@@ -137,16 +143,40 @@ describe("EventTaskEditor", () => {
     await waitFor(() => expect(screen.queryByText("Legacy / Private Binding")).toBeNull());
   });
 
-  it("运行中 Endpoint 只读、保存禁用", async () => {
+  it("运行中统一为停止并应用（默认恢复运行：stop→replace→start）", async () => {
+    const user = userEvent.setup();
     mockStopped([GENERIC_TASK]);
     mocked.listEndpoints.mockResolvedValue({
       endpoints: [{ id: "ep1", driver_id: "drv1", runtime: { state: "RUNNING" } }],
     });
     render(<EventTaskEditor />);
-    await screen.findByText("运行中 · 只读");
-    expect(screen.getByText("事件任务只能在 Endpoint 停止状态修改")).toBeTruthy();
-    const save = screen.getByRole("button", { name: "保存订阅" });
-    expect((save as HTMLButtonElement).disabled).toBe(true);
+    await screen.findByText("运行中");
+    // 统一条：重启说明 + 默认勾选的复选框 + 停止并应用
+    expect(screen.getByText("Endpoint 正在运行，应用修改需要重启")).toBeTruthy();
+    const apply = screen.getByRole("button", { name: /停\s*止并应用/ });
+    expect((apply as HTMLButtonElement).disabled).toBe(false);
+    const order: string[] = [];
+    mocked.stopEndpoint.mockImplementation(async () => { order.push("stop"); return { status: 200, body: {} }; });
+    mocked.replaceEventTasks.mockImplementation(async () => { order.push("replace"); return { revision: 2 }; });
+    mocked.startEndpoint.mockImplementation(async () => { order.push("start"); return { status: 200, body: {} }; });
+    await user.click(apply);
+    await waitFor(() => expect(mocked.replaceEventTasks).toHaveBeenCalledTimes(1));
+    expect(order).toEqual(["stop", "replace", "start"]);
+  });
+
+  it("运行中取消勾选则应用后保持停止", async () => {
+    const user = userEvent.setup();
+    mockStopped([GENERIC_TASK]);
+    mocked.listEndpoints.mockResolvedValue({
+      endpoints: [{ id: "ep1", driver_id: "drv1", runtime: { state: "RUNNING" } }],
+    });
+    render(<EventTaskEditor />);
+    await screen.findByText("运行中");
+    await user.click(screen.getByRole("checkbox"));
+    await user.click(screen.getByRole("button", { name: /停\s*止并应用/ }));
+    await waitFor(() => expect(mocked.replaceEventTasks).toHaveBeenCalledTimes(1));
+    expect(mocked.stopEndpoint).toHaveBeenCalledTimes(1);
+    expect(mocked.startEndpoint).not.toHaveBeenCalled();
   });
 
   it("PUT body 只含 mesa.events.v1（无私有 kind）", async () => {

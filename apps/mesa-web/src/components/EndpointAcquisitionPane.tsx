@@ -9,9 +9,11 @@ import {
   mergeAcquisitionTasks,
   selectionsOf,
   splitAcquisitionTasks,
+  isRunningState,
   type AcquisitionTaskShape,
   type ResourceSelection,
 } from "../deviceModel";
+import { ApplyWithRestart } from "./ApplyWithRestart";
 import { ResourcePickerAntd } from "./ResourcePickerAntd";
 
 export function EndpointAcquisitionPane({
@@ -27,6 +29,7 @@ export function EndpointAcquisitionPane({
   const [sels, setSels] = useState<ResourceSelection[]>([]);
   const [existingTasks, setExistingTasks] = useState<AcquisitionTaskShape[]>([]);
   const [preservedTasks, setPreservedTasks] = useState<AcquisitionTaskShape[]>([]);
+  const [running, setRunning] = useState(false);
   const [intervalMs, setIntervalMs] = useState(1000);
   const [saving, setSaving] = useState(false);
 
@@ -35,6 +38,14 @@ export function EndpointAcquisitionPane({
       .then((x) => x.json())
       .then((d) => setDesc(d))
       .catch(() => setDesc(null));
+    api.listEndpoints()
+      .then((j) => {
+        const live = ((j as { endpoints?: Array<{ id: string; runtime?: { state?: string }; state?: string }> }).endpoints ?? []).find(
+          (e) => e.id === endpointId,
+        );
+        setRunning(isRunningState(live?.state ?? live?.runtime?.state));
+      })
+      .catch(() => {});
     fetch(`/api/v1/tasks?endpoint=${endpointId}`)
       .then((x) => x.json())
       .then((j) => {
@@ -58,8 +69,9 @@ export function EndpointAcquisitionPane({
       .catch(() => {});
   }, [endpointId, driverId]);
 
-  const save = async () => {
+  const save = async (restart: boolean) => {
     if (!sels.length) return message.warning("请先加入点位");
+    const wasRunning = running;
     const tasks = mergeAcquisitionTasks(existingTasks, { interval_ms: intervalMs, selections: sels });
     const preservedCount = tasks.length - 1;
     setSaving(true);
@@ -75,8 +87,13 @@ export function EndpointAcquisitionPane({
         message.error(j.error?.message ?? "点位保存失败");
         return;
       }
-      message.success(preservedCount > 0 ? `点位已保存（另保留 ${preservedCount} 个任务），正在启动…` : "点位已保存，正在启动…");
-      await api.startEndpoint(endpointId);
+      // 已停止端点保持“保存并启动”旧语义；运行中是否恢复由复选框决定
+      if (restart || !wasRunning) await api.startEndpoint(endpointId);
+      message.success(
+        preservedCount > 0
+          ? `点位已保存（另保留 ${preservedCount} 个任务）${restart || !wasRunning ? "，正在启动…" : ""}`
+          : `点位已保存${restart || !wasRunning ? "，正在启动…" : ""}`,
+      );
       onChanged();
     } finally {
       setSaving(false);
@@ -130,7 +147,13 @@ export function EndpointAcquisitionPane({
         </div>
       )}
       <div>
-        <Button type="primary" onClick={save} loading={saving}>保存并启动</Button>
+        <ApplyWithRestart
+          running={running}
+          applying={saving}
+          canApply={sels.length > 0}
+          applyLabel="保存并启动"
+          onApply={save}
+        />
       </div>
     </div>
   );
