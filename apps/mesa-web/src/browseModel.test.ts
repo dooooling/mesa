@@ -32,6 +32,15 @@ describe("selectableFromNode", () => {
     });
   });
 
+  it("NCK 真实分支形态 binding_json='{}' 永远不可选（area/block/channel/axis）", () => {
+    // 真实 NCK Driver 非叶节点 binding_json 不是空串而是 "{}"；
+    // 若回落到 kind 会把分支误判成可选资源（P0-2 回归）。
+    for (const kind of ["area", "block", "channel", "axis"]) {
+      expect(selectableFromNode({ id: "nck://C", kind, has_children: true, binding_json: "{}" })).toBeNull();
+    }
+    expect(selectableFromNode({ id: "nck://C", kind: "area", has_children: true, binding_json: " { } " })).toBeNull();
+  });
+
   it("无 binding 的分支节点不可选用（只能下钻）", () => {
     expect(selectableFromNode({ id: "nck://C", kind: "group", has_children: true })).toBeNull();
     expect(selectableFromNode({ id: "x", kind: "node", binding_json: "  " })).toBeNull();

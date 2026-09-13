@@ -235,6 +235,26 @@ export function selectionsOf(task: AcquisitionTaskShape | null): ResourceSelecti
 }
 
 /**
+ * 点位编辑器任务快照加载状态（P0 数据安全：fail-closed 门）。
+ * - idle：尚未加载；loading：请求飞行中；ready：快照已就绪可安全合并；
+ * - error：加载失败，此时服务端任务集未知，绝不能把 [] 当作“无任务”去 PUT。
+ */
+export type TaskSnapshotState = "idle" | "loading" | "ready" | "error";
+
+/**
+ * 快照就绪判定：只有快照为 ready 且归属当前 Endpoint 时才允许保存。
+ * pending（idle/loading）与失败（error）一律不可 PUT，避免用空快照
+ * mergeAcquisitionTasks([], ...) 覆盖掉服务端已有 task-a/b/c。
+ */
+export function isTaskSnapshotReady(
+  state: TaskSnapshotState,
+  loadedEndpointId: string | null,
+  currentEndpointId: string,
+): boolean {
+  return state === "ready" && loadedEndpointId === currentEndpointId;
+}
+
+/**
  * 合并回写：用编辑结果更新 canonical 任务，其余任务逐字保留。
  * - 沿用已存在的 canonical id（不增殖 id；无则用占位 t1，冲突时 t1-2/t1-3…避让）；
  * - 沿用已存在的 mode（外来 subscribe 任务不得被编辑器默默翻成 poll）；

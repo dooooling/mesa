@@ -6,7 +6,7 @@
 // - NCK 叶：{"resource_id": "variable", "parameters": {...}}（显式 resource）
 // - OPC UA 叶：{"node_id": ..., "data_type": ...}（裸参数，resource 即 kind）
 // 本模块只理解这两种信封形态，不理解任何协议语义；无 binding 的分支节点
-// 只可“进入”下钻，不可生成选择。非法 JSON / 空 binding 一律返回 null。
+// 只可“进入”下钻，不可生成选择。非法 JSON / 空 binding / 空信封 "{}" 一律返回 null。
 export interface BrowseNode {
   id: string;
   label?: string;
@@ -34,6 +34,9 @@ export function selectableFromNode(node: BrowseNode): BrowseSelection | null {
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
   const obj = parsed as Record<string, unknown>;
+  // 空信封（如 NCK 非叶节点的 "{}"）永远不可选：无 resource 信息，
+  // 若回落到 node.kind 会把 area/block/channel 等分支误判成可选资源。
+  if (Object.keys(obj).length === 0) return null;
   // 显式 resource_id 优先，否则回落到 node.kind（OPC UA 口径）。
   const resourceId = typeof obj.resource_id === "string" && obj.resource_id.trim()
     ? obj.resource_id.trim()

@@ -10,6 +10,7 @@ import {
   groupEndpointsByDevice,
   isDriverChangeAttempt,
   isRunningState,
+  isTaskSnapshotReady,
   mergeAcquisitionTasks,
   splitAcquisitionTasks,
   resolveEndpointContexts,
@@ -251,5 +252,27 @@ describe("mergeAcquisitionTasks", () => {
     expect(out).toHaveLength(1);
     expect(out[0].mode).toBe("subscribe");
     expect(out[0].interval_ms).toBeNull();
+  });
+});
+
+describe("isTaskSnapshotReady", () => {
+  it("快照 pending（idle/loading）时不可 PUT（P0-1 回归：慢请求窗口）", () => {
+    expect(isTaskSnapshotReady("idle", null, "ep-1")).toBe(false);
+    expect(isTaskSnapshotReady("loading", null, "ep-1")).toBe(false);
+  });
+
+  it("快照失败（error）时不可 PUT（P0-1 回归：失败请求路径）", () => {
+    expect(isTaskSnapshotReady("error", null, "ep-1")).toBe(false);
+    // 即使有旧 loaded id，只要状态不是 ready 同样不可写
+    expect(isTaskSnapshotReady("error", "ep-1", "ep-1")).toBe(false);
+  });
+
+  it("ready 但串 Endpoint 时不可 PUT（旧快照不得污染新编辑器）", () => {
+    expect(isTaskSnapshotReady("ready", "ep-1", "ep-2")).toBe(false);
+    expect(isTaskSnapshotReady("ready", null, "ep-1")).toBe(false);
+  });
+
+  it("ready + 同 Endpoint 时才可 PUT", () => {
+    expect(isTaskSnapshotReady("ready", "ep-1", "ep-1")).toBe(true);
   });
 });
