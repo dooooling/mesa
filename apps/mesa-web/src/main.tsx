@@ -3,6 +3,13 @@ import ReactDOM from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import { ConfigProvider, theme } from "antd";
 import "./carbon.css";
+// IBM Plex 随 bundle 本地提供（@fontsource/SIL OFL）：Sans 取 300（展示字重，
+// 品牌嗓音）/400/600，Mono 取 400/500。只引需要的字重，不整包拉取。
+import "@fontsource/ibm-plex-sans/300.css";
+import "@fontsource/ibm-plex-sans/400.css";
+import "@fontsource/ibm-plex-sans/600.css";
+import "@fontsource/ibm-plex-mono/400.css";
+import "@fontsource/ibm-plex-mono/500.css";
 import { MONO, SANS } from "./theme";
 import App from "./App";
 

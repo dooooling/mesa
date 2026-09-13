@@ -1,9 +1,11 @@
 /* Carbon 主题层（web-ui/DESIGN.md）：白画布 + 单 IBM 蓝 + 全 0 圆角 + hairline 无阴影。
  *
  * 分工：色板/字号/圆角尽量走 ConfigProvider token（main.tsx）；这里只收
- * token 表达不了的三件事——Carbon 输入框形态（灰底 + 底线 + 2px 蓝下划线
- * focus）、侧边选中态（灰底 + 左侧蓝条）、以及 antd CSS-in-JS 注入顺序下
- * 必须用 !important 才能坐稳的几何兜底（0 圆角 / 去阴影）。
+ * token 表达不了的四件事——Carbon 输入框形态（灰底 + 底线 + 2px 蓝下划线
+ * focus，error 常红）、侧边/下拉选中态（灰底 + 左侧蓝条）、keyboard
+ * focus-visible 蓝 ring（本主题关掉了 antd glow，必须手工补回）、以及
+ * antd CSS-in-JS 注入顺序下必须用 !important 才能坐稳的几何兜底
+ *（0 圆角 / 去阴影）。
  * 正文统一 Plex Sans + letter-spacing 0.16px（Carbon 精度细节，不得去掉）。 */
 
 :root {
@@ -87,8 +89,9 @@ html, body {
 .ant-input-affix-wrapper-status-error,
 .ant-input-number-status-error,
 .ant-select-status-error .ant-select-selector {
+  /* 错误态不依赖焦点：未聚焦红 1px，聚焦红 2px（见下组规则）。 */
   box-shadow: none !important;
-  border-bottom-color: var(--carbon-field-underline) !important;
+  border-bottom-color: var(--carbon-error) !important;
 }
 .ant-input-status-error:focus,
 .ant-input-affix-wrapper-status-error:focus,
@@ -109,8 +112,7 @@ html, body {
   color: var(--carbon-ink) !important;
 }
 
-/* 下拉选中项同侧边：灰底墨字，蓝色不泛滥。 */
-.ant-select-item-option-selected:not(.ant-select-item-option-disabled) {
+/* 下拉选中项同侧边：灰底墨字，蓝色不泛滥。 */.ant-select-item-option-selected:not(.ant-select-item-option-disabled) {
   background-color: var(--carbon-selected) !important;
   color: var(--carbon-ink) !important;
 }
@@ -131,4 +133,25 @@ html, body {
 pre {
   border: 1px solid var(--carbon-hairline);
   border-radius: 0;
+}
+
+/* Keyboard focus 可见性：本主题关掉了 antd 的 glow（controlOutlineWidth 0），
+ * 但 Tab 可达就必须看得见——Carbon 式 2px 蓝 ring + 2px 偏移，覆盖所有
+ * keyboard-actionable 控件（按钮 / 菜单项 / 链接 / checkbox / radio / switch）。
+ * 文本输入类已有上面的 2px 蓝下划线，不再另加 ring，避免双重处理。 */
+button:focus-visible,
+a:focus-visible,
+.ant-menu-item:focus-visible,
+.ant-menu-submenu-title:focus-visible {
+  outline: 2px solid var(--carbon-blue);
+  outline-offset: 2px;
+}
+.ant-checkbox-input:focus-visible + .ant-checkbox-inner,
+.ant-radio-input:focus-visible + .ant-radio-inner {
+  outline: 2px solid var(--carbon-blue);
+  outline-offset: 2px;
+}
+.ant-switch:focus-visible {
+  outline: 2px solid var(--carbon-blue);
+  outline-offset: 2px;
 }
