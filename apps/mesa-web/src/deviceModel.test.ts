@@ -12,6 +12,7 @@ import {
   isRunningState,
   mergeAcquisitionTasks,
   splitAcquisitionTasks,
+  resolveEndpointContexts,
   suggestEndpointId,
   type AcquisitionTaskShape,
 } from "./deviceModel";
@@ -139,6 +140,41 @@ describe("isRunningState", () => {
     expect(isRunningState("reconnecting")).toBe(true);
     expect(isRunningState("STOPPED")).toBe(false);
     expect(isRunningState(undefined)).toBe(false);
+  });
+});
+
+describe("resolveEndpointContexts", () => {
+  const devices = [
+    { id: "device-a", name: "CNC-01" },
+    { id: "device-b", name: "Simulator" },
+  ];
+  it("endpoint 经 device_id 反查设备名（Device → Endpoint → Point）", () => {
+    const ctx = resolveEndpointContexts(
+      [
+        { id: "a-nck", name: "NCK", device_id: "device-a" },
+        { id: "b-sim", device_id: "device-b" },
+      ],
+      devices,
+    );
+    expect(ctx.get("a-nck")).toEqual({
+      endpointId: "a-nck",
+      endpointName: "NCK",
+      deviceId: "device-a",
+      deviceName: "CNC-01",
+    });
+    // endpoint 名缺失回落 id
+    expect(ctx.get("b-sim")?.endpointName).toBe("b-sim");
+    expect(ctx.get("b-sim")?.deviceName).toBe("Simulator");
+  });
+
+  it("Device 缺失时回落显示 device_id，不编造归属", () => {
+    const ctx = resolveEndpointContexts([{ id: "x", device_id: "gone" }], devices);
+    expect(ctx.get("x")?.deviceName).toBe("gone");
+  });
+
+  it("device_id 缺失时设备显示占位", () => {
+    const ctx = resolveEndpointContexts([{ id: "orphan" }], devices);
+    expect(ctx.get("orphan")).toMatchObject({ deviceId: "", deviceName: "—" });
   });
 });
 

@@ -23,6 +23,40 @@ export function isRunningState(state?: string): boolean {
   return ["RUNNING", "CONNECTING", "RECONNECTING"].includes((state ?? "").toUpperCase());
 }
 
+// ---------------------------------------------------------------------------
+// Monitor 语义（P0-3）：Device → Endpoint → Point 三级，文案不得把 Endpoint
+// 叫成“设备”。由 endpoint 归属 device_id 反查设备名；归属缺失时如实展示。
+// ---------------------------------------------------------------------------
+
+export interface EndpointContext {
+  endpointId: string;
+  endpointName: string;
+  deviceId: string;
+  deviceName: string;
+}
+
+/**
+ * 按 endpoint id 建上下文索引。deviceName 取 Device.name；Device 缺失
+ * （如已被删）时回落显示 device_id，endpoint 名缺失回落 id——不编造归属。
+ */
+export function resolveEndpointContexts(
+  endpoints: Array<{ id: string; name?: string; device_id?: string }>,
+  devices: Array<{ id: string; name: string }>,
+): Map<string, EndpointContext> {
+  const byId = new Map(devices.map((d) => [d.id, d.name] as const));
+  const out = new Map<string, EndpointContext>();
+  for (const ep of endpoints) {
+    const deviceId = ep.device_id ?? "";
+    out.set(ep.id, {
+      endpointId: ep.id,
+      endpointName: ep.name ?? ep.id,
+      deviceId,
+      deviceName: (deviceId && byId.get(deviceId)) || deviceId || "—",
+    });
+  }
+  return out;
+}
+
 /**
  * 按 device_id 归组 Endpoint。device_id 缺失的归入 "" 组，
  * 由页面显式渲染为“未归属”，不得默默并入任一 Device。
