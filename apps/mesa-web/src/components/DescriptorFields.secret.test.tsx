@@ -84,4 +84,48 @@ describe("Secret marker 渲染", () => {
     expect(screen.getByPlaceholderText("已设置，留空保持不变")).toBeTruthy();
     expect(onChange).not.toHaveBeenCalled();
   });
+
+  it("marker 态可标记清除（onChange 收到 clear 标记）", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <DescriptorFields
+        schema={schema(secretField())}
+        value={{ password: { secret_set: true } }}
+        onChange={onChange}
+      />,
+    );
+    await user.click(screen.getByText("清除凭据"));
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange.mock.calls[0][0]).toEqual({ password: { clear_secret: true } });
+  });
+
+  it("clear 标记态显示待生效 + 可撤销回 marker", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <DescriptorFields
+        schema={schema(secretField())}
+        value={{ password: { clear_secret: true } }}
+        onChange={onChange}
+      />,
+    );
+    expect(screen.getByText("已标记清除，保存后生效")).toBeTruthy();
+    const input = document.querySelector('input[type="password"]') as HTMLInputElement;
+    expect(input.disabled).toBe(true);
+    await user.click(screen.getByText(/撤\s*销/));
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange.mock.calls[0][0]).toEqual({ password: { secret_set: true } });
+  });
+
+  it("空字段不提供清除入口（无旧值可删）", () => {
+    render(
+      <DescriptorFields
+        schema={schema(secretField())}
+        value={{}}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.queryByText("清除凭据")).toBeNull();
+  });
 });

@@ -119,6 +119,13 @@ describe("cleanConnection", () => {
       host: "x",
     });
   });
+
+  it("clear 标记原样保留（后端按 clear 语义删除 Secret）", () => {
+    expect(cleanConnection({ password: { clear_secret: true }, host: "x" })).toEqual({
+      password: { clear_secret: true },
+      host: "x",
+    });
+  });
 });
 
 describe("canDeleteDevice", () => {

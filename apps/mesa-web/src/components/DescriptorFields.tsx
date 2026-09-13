@@ -1,6 +1,8 @@
-// PR8 受控描述字段：纯 controlled（无内部 local state），只理解 FieldDescriptor，
+// PR8 受控描述字段：值纯 controlled（无内部值状态），只理解 FieldDescriptor，
 // 不理解 Driver / Protocol / EventStream ID。PR9 OPC UA 事件过滤参数直接复用。
-import { Checkbox, Input, InputNumber, Select } from "antd";
+// 唯一内部状态是高级折叠显隐（纯展示，不触碰值）。
+import { useState } from "react";
+import { Button, Checkbox, Input, InputNumber, Select } from "antd";
 import type { FieldDescriptor, SchemaDescriptor } from "../types";
 
 function isVisible(field: FieldDescriptor, values: Record<string, unknown>): boolean {
@@ -99,16 +101,35 @@ function FieldControl({
       value !== null &&
       typeof value === "object" &&
       (value as { secret_set?: unknown }).secret_set === true;
+    // 显式清除标记（后端 clear 语义：删除已存 Secret；缺失/留空只是保留旧值，
+    // 没有删除入口——这就是清除按钮存在的理由）。
+    const clearMarked =
+      value !== null &&
+      typeof value === "object" &&
+      (value as { clear_secret?: unknown }).clear_secret === true;
     const displayValue = typeof value === "string" ? value : "";
     return (
       <div style={{ display: "grid", gap: 4 }}>
         <span style={{ fontSize: 12 }}>{label}</span>
         <Input.Password
-          disabled={disabled}
+          disabled={disabled || clearMarked}
           value={displayValue}
           onChange={(e) => onChange(e.target.value)}
           placeholder={secretSet ? "已设置，留空保持不变" : field.ui.placeholder}
         />
+        {secretSet && !disabled ? (
+          <Button size="small" danger onClick={() => onChange({ clear_secret: true })}>
+            清除凭据
+          </Button>
+        ) : null}
+        {clearMarked && !disabled ? (
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <span style={{ fontSize: 12, color: "#da1e28" }}>已标记清除，保存后生效</span>
+            <Button size="small" onClick={() => onChange({ secret_set: true })}>
+              撤销
+            </Button>
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -171,33 +192,49 @@ export function DescriptorFields({
   disabled?: boolean;
   onChange: (next: Record<string, unknown>) => void;
 }) {
+  // 高级字段折叠（ui.advanced）：通用行为，非 NCK-specific。默认只渲染
+  // 基础字段；高级参数收进折叠区，点开才渲染（渲染前不参与 visible 计算之外的任何逻辑）。
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const fields = (schema.fields ?? []).filter((f) => isVisible(f, value));
   const sorted = [...fields].sort((a, b) => (a.ui.order ?? 999) - (b.ui.order ?? 999));
   if (sorted.length === 0) return <div style={{ color: "#525252", fontSize: 12 }}>该流无参数</div>;
-  const groups = new Map<string, FieldDescriptor[]>();
-  for (const f of sorted) {
-    const g = f.ui.group ?? "default";
-    if (!groups.has(g)) groups.set(g, []);
-    groups.get(g)!.push(f);
-  }
+  const base = sorted.filter((f) => f.ui.advanced !== true);
+  const advanced = sorted.filter((f) => f.ui.advanced === true);
+  const renderGroups = (list: FieldDescriptor[]) => {
+    const groups = new Map<string, FieldDescriptor[]>();
+    for (const f of list) {
+      const g = f.ui.group ?? "default";
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g)!.push(f);
+    }
+    return [...groups.entries()].map(([g, fs]) => (
+      <div key={g}>
+        {g !== "default" ? <div style={{ fontSize: 12, color: "#525252", marginBottom: 6 }}>{g}</div> : null}
+        <div style={{ display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))" }}>
+          {fs.map((f) => (
+            <FieldControl
+              key={f.key}
+              field={f}
+              value={value[f.key]}
+              disabled={disabled}
+              onChange={(v) => onChange({ ...value, [f.key]: v })}
+            />
+          ))}
+        </div>
+      </div>
+    ));
+  };
   return (
     <div style={{ display: "grid", gap: 12 }}>
-      {[...groups.entries()].map(([g, fs]) => (
-        <div key={g}>
-          {g !== "default" ? <div style={{ fontSize: 12, color: "#525252", marginBottom: 6 }}>{g}</div> : null}
-          <div style={{ display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))" }}>
-            {fs.map((f) => (
-              <FieldControl
-                key={f.key}
-                field={f}
-                value={value[f.key]}
-                disabled={disabled}
-                onChange={(v) => onChange({ ...value, [f.key]: v })}
-              />
-            ))}
-          </div>
+      {renderGroups(base)}
+      {advanced.length > 0 ? (
+        <div>
+          <Button size="small" onClick={() => setShowAdvanced((v) => !v)}>
+            {showAdvanced ? "▾ 收起高级" : `▸ 高级（${advanced.length}）`}
+          </Button>
+          {showAdvanced ? <div style={{ marginTop: 8 }}>{renderGroups(advanced)}</div> : null}
         </div>
-      ))}
+      ) : null}
     </div>
   );
 }
