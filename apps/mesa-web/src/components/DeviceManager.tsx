@@ -181,29 +181,13 @@ export function DeviceManager() {
     fetch(`/api/v1/tasks?endpoint=${ep.id}`).then((x) => x.json()).then((j) => {
       const tasks: Array<{ interval_ms?: number; binding: { kind: string; config: Record<string, unknown> } }> = j.tasks ?? [];
       if (tasks.length) {
-        // 回显已有任务到已选
+        // 回显已有任务到已选：只理解 mesa.resources.v1（legacy 种别运行期由
+        // Driver 负责，管理面只编辑 canonical 形态）
         const first = tasks[0];
         if (first) setIntervalMs(first.interval_ms ?? 1000);
         if (first?.binding.kind === "mesa.resources.v1") {
           const sels = (first.binding.config as { selections?: typeof pointsSels }).selections;
           if (sels?.length) setPointsSels(sels);
-        } else if (first?.binding.kind === "s7.address-group") {
-          const items = (first.binding.config as { items?: Array<{ key: string; address: string; data_type: string }> }).items ?? [];
-          // 将 items 反解为一条 memory 选型供编辑（area/db/offset 从 address 粗略解析，data_type 保留）
-          const sels = items.map((it) => ({
-            resource_id: "memory",
-            parameters: { address: it.address, data_type: it.data_type, area: it.address.startsWith("DB") ? "DB" : "M", db: 10, offset: 0 } as Record<string, unknown>,
-            outputs: [{ output: "value", point_key: it.key }],
-          }));
-          if (sels.length) setPointsSels(sels as never);
-        } else if (first?.binding.kind === "focas.data-block") {
-          const items = (first.binding.config as { items?: Array<{ key: string }> }).items ?? [];
-          const sels = items.map((it) => ({
-            resource_id: "dynamic",
-            parameters: {},
-            outputs: [{ output: "value", point_key: it.key }],
-          }));
-          if (sels.length) setPointsSels(sels as never);
         }
         if (tasks.length) message.info(`已回显 ${tasks.length} 任务`);
       }
@@ -212,53 +196,16 @@ export function DeviceManager() {
 
   const savePoints = async () => {
     if (!pointsEp || !pointsSels.length) return message.warning("请先加入点位");
-    let tasks: Array<Record<string, unknown>>;
-    if (pointsEp.driver_id === "focas2") {
-      const FOCAS_ADDRS = ["status", "axis.abs.1", "spindle.load.1", "pmc.R100", "macro.100"];
-      const items = pointsSels.flatMap((s) =>
-        s.outputs.map((o, i) => ({
-          key: o.point_key,
-          address: FOCAS_ADDRS[i % FOCAS_ADDRS.length],
-          data_type: "U32",
-        }))
-      );
-      tasks = [{ id: "t1", mode: "poll", interval_ms: intervalMs, binding: { kind: "focas.data-block", config: { items } } }];
-    } else if (pointsEp.driver_id === "s7") {
-      const toAddr = (p: Record<string, unknown>): string => {
-        if (p.address && typeof p.address === "string" && (p.address as string).trim()) return String(p.address);
-        const area = String(p.area ?? "DB");
-        const db = p.db ?? 10;
-        const offset = p.offset ?? 0;
-        const bit = p.bit;
-        const dt = String(p.data_type ?? "REAL").toUpperCase();
-        if (area === "DB") {
-          if (dt === "BOOL" && bit !== undefined && bit !== "") return `DB${db}.DBX${offset}.${bit}`;
-          if (dt === "REAL" || dt === "DWORD" || dt === "DINT") return `DB${db}.DBD${offset}`;
-          if (dt === "INT" || dt === "WORD") return `DB${db}.DBW${offset}`;
-          if (dt === "BYTE") return `DB${db}.DBB${offset}`;
-          return `DB${db}.DBD${offset}`;
-        }
-        if (dt === "BOOL" && bit !== undefined && bit !== "") return `${area}${offset}.${bit}`;
-        return `${area}W${offset}`;
-      };
-      const items = pointsSels.flatMap((s) =>
-        s.outputs.map((o) => ({
-          key: o.point_key,
-          address: toAddr(s.parameters),
-          data_type: String(s.parameters.data_type ?? "REAL"),
-        }))
-      );
-      tasks = [{ id: "t1", mode: "poll", interval_ms: intervalMs, binding: { kind: "s7.address-group", config: { items } } }];
-    } else {
-      tasks = [
-        {
-          id: "t1",
-          mode: "poll",
-          interval_ms: intervalMs,
-          binding: { kind: "mesa.resources.v1", config: { selections: pointsSels } },
-        },
-      ];
-    }
+    // PR26：只发 mesa.resources.v1 canonical 形态（无 driver-specific 分支；
+    // FOCAS_ADDRS / toAddr 已删除，合法性由 PR24 Core 门禁裁决）。
+    const tasks: Array<Record<string, unknown>> = [
+      {
+        id: "t1",
+        mode: "poll",
+        interval_ms: intervalMs,
+        binding: { kind: "mesa.resources.v1", config: { selections: pointsSels } },
+      },
+    ];
     await fetch(`/api/v1/endpoints/${pointsEp.id}/stop`, { method: "POST" }).catch(() => {});
     const r = await fetch(`/api/v1/tasks/${pointsEp.id}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ tasks }) });
     const j = await r.json().catch(() => ({}));
@@ -368,12 +315,22 @@ export function DeviceManager() {
               <InputNumber min={10} max={60000} step={10} value={intervalMs} onChange={(v) => setIntervalMs(v ?? 1000)} addonAfter="ms" style={{ width: 180 }} />
               <span style={{ fontSize: 12, color: "#999" }}>10ms–60s，20ms已通过50K/s压测</span>
             </div>
-            <ResourcePickerAntd resources={pointsDesc.resources} onAdd={(s) => {
-              const keys = s.outputs.map((o) => o.point_key);
-              const dup = pointsSels.some((ex) => ex.outputs.some((o) => keys.includes(o.point_key)));
-              if (dup) return message.warning(`point_key 重复：${keys.join(", ")} 已存在`);
-              setPointsSels((p) => [...p, s]);
-            }} />
+            <ResourcePickerAntd
+              resources={pointsDesc.resources}
+              existingKeys={pointsSels.flatMap((s) => s.outputs.map((o) => o.point_key))}
+              onAdd={(s) => {
+                // 自动命名已去重；此处仅做最终兜底（用户手改 key 撞车时提示，
+                // 真正唯一性由 PR24 Core endpoint-wide 门禁裁决）
+                const keys = s.outputs.map((o) => o.point_key);
+                const dup = pointsSels.some((ex) => ex.outputs.some((o) => keys.includes(o.point_key)));
+                if (dup) {
+                  message.warning(`point_key 重复：${keys.join(", ")} 已存在`);
+                  return false;
+                }
+                setPointsSels((p) => [...p, s]);
+                return true;
+              }}
+            />
             <div style={{ marginTop: 12, fontSize: 12, color: "#999" }}>已选 {pointsSels.length} 项 · {intervalMs}ms 轮询 · 保存将执行 Stop → PUT /tasks/{pointsEp?.id} → Start <Button size="small" onClick={() => setPointsSels([])} style={{ marginLeft: 8 }}>清空</Button></div>
             {!!pointsSels.length && (
               <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
