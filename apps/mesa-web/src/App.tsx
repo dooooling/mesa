@@ -10,6 +10,7 @@ import { MonitorView } from "./pages/MonitorView";
 import { EventsView } from "./pages/EventsView";
 import { DeviceWorkspacePage } from "./workspace/DeviceWorkspacePage";
 import { LegacyEndpointRedirect } from "./workspace/LegacyEndpointRedirect";
+import { AddDeviceFlow } from "./addDevice/AddDeviceFlow";
 import { GlobalDataPage } from "./pages/GlobalDataPage";
 import { GlobalEventsPage } from "./pages/GlobalEventsPage";
 import { OverviewPage } from "./overview/OverviewPage";
@@ -74,6 +75,7 @@ export default function App() {
             <Route path="/" element={<Navigate to="/overview" replace />} />
             <Route path="/overview" element={<OverviewPage />} />
             <Route path="/devices" element={<DevicesPage />} />
+            <Route path="/devices/new" element={<AddDeviceFlow />} />
             <Route path="/devices/:deviceId/:tab" element={<DeviceWorkspacePage />} />
             <Route path="/devices/:deviceId" element={<Navigate to="overview" replace />} />
             <Route path="/devices/:deviceId/endpoints/:endpointId" element={<LegacyEndpointRedirect />} />

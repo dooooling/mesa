@@ -2,7 +2,7 @@
 // 数量只数 Device；Endpoint 数量另算（/endpoints），仅作为每行的
 // “连接数”附属信息展示，绝不混入 Device 计数。行点击进入 Device detail。
 import { useEffect, useState } from "react";
-import { Button, Card, Form, Input, Modal, Space, Table, Tag, message } from "antd";
+import { Button, Card, Input, Modal, Space, Table, Tag, message } from "antd";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { deviceCounts, groupEndpointsByDevice, isRunningState, type Device } from "../deviceModel";
@@ -22,10 +22,9 @@ export function DevicesPage() {
   const [epCountByDevice, setEpCountByDevice] = useState<Map<string, number>>(new Map());
   const [epStateByDevice, setEpStateByDevice] = useState<Map<string, string[]>>(new Map());
   const [endpointTotal, setEndpointTotal] = useState(0);
-  const [open, setOpen] = useState(false);
   // M1 瘦身：搜索框（按 ID/名称过滤），整行点击进入 Workspace。
+  // M4.2：创建收敛到 /devices/new，本页不再有创建 Modal（M5 删旧测试时同步）。
   const [search, setSearch] = useState("");
-  const [form] = Form.useForm();
 
   const load = async () => {
     try {
@@ -67,25 +66,6 @@ export function DevicesPage() {
 
   const gotoWorkspace = (id: string) => nav(`/devices/${id}/overview`);
 
-  const create = async () => {
-    try {
-      const v = (await form.validateFields()) as { id: string; name?: string };
-      const id = v.id.trim();
-      // 名称可空（placeholder“默认为 ID”）：未填时用 id；可选链避免
-      // undefined.trim() 抛异常后被空 catch 当校验失败吞掉的静默失败。
-      const name = v.name?.trim() || id;
-      const r = await api.createDevice({ id, name });
-      if (r.status !== 201 && r.status !== 200) {
-        message.error(r.body?.error?.message ?? "创建设备失败");
-        return;
-      }
-      message.success(`已创建设备 ${id}`);
-      setOpen(false);
-      form.resetFields();
-      load();
-    } catch { /* antd 校验未通过 */ }
-  };
-
   const remove = async (id: string) => {
     const n = epCountByDevice.get(id) ?? 0;
     if (n > 0) {
@@ -120,8 +100,8 @@ export function DevicesPage() {
         title={`设备 · ${deviceCount}`}
         extra={
           <Space>
-            <Button onClick={() => nav("/onboarding")}>新建向导</Button>
-            <Button type="primary" onClick={() => setOpen(true)}>+ 添加设备</Button>
+            {/* M4.2：唯一入口“+ 添加设备”进 /devices/new；旧 Modal/向导保留到 M5 删除。 */}
+            <Button type="primary" onClick={() => nav("/devices/new")}>+ 添加设备</Button>
           </Space>
         }
       >
@@ -175,18 +155,6 @@ export function DevicesPage() {
           设备 {deviceCount} 个 · 连接 {endpointTotal} 个（连接归属设备，不计入设备数）
         </div>
       </Card>
-
-      <Modal title="新建设备" open={open} onOk={create} onCancel={() => setOpen(false)} okText="创建" destroyOnHidden>
-        <Form form={form} layout="vertical">
-          <Form.Item name="id" label="设备 ID" rules={[{ required: true, message: "设备 ID 必填" }]}>
-            <Input placeholder="device-a" style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }} />
-          </Form.Item>
-          <Form.Item name="name" label="设备名称">
-            <Input placeholder="默认为 ID" />
-          </Form.Item>
-          <div style={{ fontSize: 12, color: "#525252" }}>只创建 Device；连接在设备详情页按需添加，可一对多。</div>
-        </Form>
-      </Modal>
     </div>
   );
 }
