@@ -20,6 +20,10 @@ export function MonitorView() {
   const [quality, setQuality] = useState<string>("ALL");
   const [deviceFilter, setDeviceFilter] = useState<string>("ALL");
   const [endpointFilter, setEndpointFilter] = useState<string>("ALL");
+  // 独立时钟（P1-1）：STALE 判定用的 now 必须每秒推进，不能只在 render 时
+  // 取 Date.now()——points 轮询失败时无 setState、无 rerender，now 会冻结
+  // 在最后一次成功时刻，age 永远停在 5s，正好在最需要 STALE 的故障场景失效。
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
     fetch("/api/v1/devices").then((r) => r.json()).then((j) => setDevices(j.devices ?? [])).catch(() => {});
@@ -32,7 +36,11 @@ export function MonitorView() {
     }).catch(() => {});
     const tick = () => fetch("/api/v1/points/latest").then((r) => r.json()).then((j) => setPoints(j.points ?? [])).catch(() => {});
     tick();
-    const id = window.setInterval(tick, 1000);
+    const id = window.setInterval(() => {
+      // 时钟与拉取解耦：拉取失败也不阻止时钟推进（STALE 照常出现）。
+      setNowMs(Date.now());
+      tick();
+    }, 1000);
     return () => window.clearInterval(id);
   }, []);
 
@@ -58,7 +66,6 @@ export function MonitorView() {
       (c?.deviceName.includes(filter) ?? false)
     );
   });
-  const now = Date.now();
 
   return (
     <Card
@@ -109,7 +116,7 @@ export function MonitorView() {
           {
             title: "更新",
             render: (_: unknown, r: Point) => {
-              const age = pointAgeMs(r.timestamp_ns, now);
+              const age = pointAgeMs(r.timestamp_ns, nowMs);
               const stale = age !== null && age > POINT_STALE_AFTER_MS;
               return (
                 <span>
