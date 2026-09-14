@@ -12,7 +12,8 @@ import { DeviceWorkspacePage } from "./workspace/DeviceWorkspacePage";
 import { LegacyEndpointRedirect } from "./workspace/LegacyEndpointRedirect";
 import { GlobalDataPage } from "./pages/GlobalDataPage";
 import { GlobalEventsPage } from "./pages/GlobalEventsPage";
-import { OverviewPage, SystemPage } from "./pages/V2Placeholders";
+import { OverviewPage } from "./overview/OverviewPage";
+import { SystemPage } from "./pages/V2Placeholders";
 
 const { Header, Sider, Content } = Layout;
 
