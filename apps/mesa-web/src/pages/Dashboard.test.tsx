@@ -19,6 +19,21 @@ beforeEach(() => {
 });
 
 describe("Dashboard freshness", () => {
+  // Statistic title 与 Card/Table 文案重名（如“设备”同时是 Statistic title、
+  // Card title、Table header），必须按 .ant-statistic-title 定位取值。
+  function statisticValue(title: string) {
+    const titleEl = screen
+      .getAllByText(title)
+      .find((el) => el.classList.contains("ant-statistic-title"));
+
+    expect(titleEl).toBeTruthy();
+
+    return titleEl!
+      .closest(".ant-statistic")
+      ?.querySelector(".ant-statistic-content-value")
+      ?.textContent;
+  }
+
   it("正常 2xx 显示真实计数，无 STALE", async () => {
     mockFetch(async (url) => {
       if (url === "/api/v1/devices") return { ok: true, status: 200, body: { devices: [{ id: "d1", name: "D1" }] } };
@@ -32,9 +47,17 @@ describe("Dashboard freshness", () => {
         <Dashboard />
       </MemoryRouter>,
     );
-    await waitFor(() => expect(screen.queryByText("STALE")).toBeNull());
-    // 设备 1 / 连接 1 / 运行中 1（严格 RUNNING 口径）
-    expect(screen.getByText("设备").closest(".ant-card")).toBeTruthy();
+    // 首轮 fetch 完成后再断言：统计值真实（设备 1 / 连接 1 / 运行中 1 /
+    // 点位 0 / BAD 0），且无 STALE——否则 queryByText 在 fetch 前即通过，
+    // 证明不了“2xx 后值已经 ready”。
+    await waitFor(() => {
+      expect(statisticValue("设备")).toBe("1");
+      expect(statisticValue("连接")).toBe("1");
+      expect(statisticValue("运行中")).toBe("1");
+      expect(statisticValue("最新点位")).toBe("0");
+      expect(statisticValue("BAD 质量")).toBe("0");
+    });
+    expect(screen.queryByText("STALE")).toBeNull();
   });
 
   it("HTTP 500 + error 包不得伪装成 0（标 STALE + 更新失败）", async () => {

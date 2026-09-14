@@ -34,7 +34,17 @@ export function MonitorView() {
         device_id: e.device_id,
       })));
     }).catch(() => {});
-    const tick = () => fetch("/api/v1/points/latest").then((r) => r.json()).then((j) => setPoints(j.points ?? [])).catch(() => {});
+    // points 快照 fail-closed：成功才替换；500/网络失败/坏形态一律保留
+    // last-known points，nowMs 独立推进让它们自然进入 STALE（绝不能
+    // 把错误包解释成 []，否则故障时旧点直接消失、无物可 STALE）。
+    const tick = () => fetch("/api/v1/points/latest").then(async (r) => {
+      if (!r.ok) throw new Error(`GET /points/latest ${r.status}`);
+      return r.json();
+    }).then((j) => {
+      const pts = (j as { points?: unknown }).points;
+      if (!Array.isArray(pts)) throw new Error("points 形态非法");
+      setPoints(pts as Point[]);
+    }).catch(() => {});
     tick();
     const id = window.setInterval(() => {
       // 时钟与拉取解耦：拉取失败也不阻止时钟推进（STALE 照常出现）。
