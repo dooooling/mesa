@@ -288,4 +288,67 @@ describe("EventTaskEditor", () => {
     expect(screen.queryByRole("button", { name: "保存订阅" })).toBeNull();
     expect(mocked.replaceEventTasks).not.toHaveBeenCalled();
   });
+
+  it("P0：fixed 模式 A→B 同组件复用必须跟随切换并只写 B", async () => {
+    const user = userEvent.setup();
+    const taskA = { ...GENERIC_TASK, id: "task-a" };
+    const taskB = { ...GENERIC_TASK, id: "task-b" };
+    mocked.listEndpoints.mockResolvedValue({
+      endpoints: [
+        { id: "ep-a", driver_id: "drv1" },
+        { id: "ep-b", driver_id: "drv1" },
+      ],
+    });
+    mocked.getDescriptor.mockResolvedValue(DESCRIPTOR);
+    mocked.listEventTasks.mockImplementation((id: string) =>
+      Promise.resolve({
+        endpoint_id: id,
+        revision: 1,
+        event_tasks: id === "ep-a" ? [taskA] : [taskB],
+      }),
+    );
+    mocked.replaceEventTasks.mockResolvedValue({ revision: 2 });
+    // Workspace 路由 A→B 复用同一 Editor：仅 fixedEndpointId 变化
+    const { rerender } = render(<EventTaskEditor fixedEndpointId="ep-a" />);
+    expect(await screen.findByText("任务 · task-a")).toBeTruthy();
+    rerender(<EventTaskEditor fixedEndpointId="ep-b" />);
+    // B 的配置必须加载出来，A 的旧卡片不得残留
+    expect(await screen.findByText("任务 · task-b")).toBeTruthy();
+    expect(screen.queryByText("任务 · task-a")).toBeNull();
+    // 保存只能写 B
+    await user.click(screen.getByRole("button", { name: "保存订阅" }));
+    await waitFor(() => expect(mocked.replaceEventTasks).toHaveBeenCalledTimes(1));
+    const [endpointId, tasks] = mocked.replaceEventTasks.mock.calls[0] as [string, typeof GENERIC_TASK[]];
+    expect(endpointId).toBe("ep-b");
+    expect(tasks.map((t) => t.id)).toEqual(["task-b"]);
+  });
+
+  it("stop 500 → 中止应用，不写订阅（postJson 不 throw 也必须拦截）", async () => {
+    const user = userEvent.setup();
+    mockStopped([GENERIC_TASK]);
+    mocked.listEndpoints.mockResolvedValue({
+      endpoints: [{ id: "ep1", driver_id: "drv1", runtime: { state: "RUNNING" } }],
+    });
+    mocked.stopEndpoint.mockResolvedValue({ status: 500, body: { error: { message: "stop boom" } } });
+    render(<EventTaskEditor />);
+    await screen.findByText("运行中");
+    await user.click(screen.getByRole("button", { name: /停\s*止并应用/ }));
+    await waitFor(() => expect(screen.getByText(/停止失败，已中止应用/)).toBeTruthy());
+    expect(mocked.replaceEventTasks).not.toHaveBeenCalled();
+    expect(mocked.startEndpoint).not.toHaveBeenCalled();
+  });
+
+  it("start 500 → 明确“配置已保存，但恢复运行失败”", async () => {
+    const user = userEvent.setup();
+    mockStopped([GENERIC_TASK]);
+    mocked.listEndpoints.mockResolvedValue({
+      endpoints: [{ id: "ep1", driver_id: "drv1", runtime: { state: "RUNNING" } }],
+    });
+    mocked.startEndpoint.mockResolvedValue({ status: 500, body: { error: { message: "start boom" } } });
+    render(<EventTaskEditor />);
+    await screen.findByText("运行中");
+    await user.click(screen.getByRole("button", { name: /停\s*止并应用/ }));
+    await waitFor(() => expect(mocked.replaceEventTasks).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText(/配置已保存，但恢复运行失败/)).toBeTruthy());
+  });
 });

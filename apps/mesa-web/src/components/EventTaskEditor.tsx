@@ -8,6 +8,7 @@ import { api } from "../api";
 import type { DriverDescriptor, EventStreamDescriptor, EventTask, LocalizedText, TaskMode } from "../types";
 import { DescriptorFields, materializeSchemaDefaults } from "./DescriptorFields";
 import { ApplyWithRestart } from "./ApplyWithRestart";
+import { applyEndpointChange, type LifecycleStepResult } from "../deviceModel";
 import {
   GENERIC_EVENT_BINDING_KIND,
   buildGenericEventBinding,
@@ -108,6 +109,13 @@ export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string 
     return list;
   }, [selectedId, fixedEndpointId]);
 
+  // 固定模式（Workspace）：归属锁定传入 id，路由 A→B 切 Endpoint 时同组件
+  // 复用，必须跟随 fixedEndpointId 切换选中（useState 只管首次，否则 URL
+  // 是 B、编辑器仍在改 A——P0 串改）。
+  useEffect(() => {
+    if (fixedEndpointId) setSelectedId(fixedEndpointId);
+  }, [fixedEndpointId]);
+
   useEffect(() => {
     refreshEndpoints().catch((e) => setError(e instanceof Error ? e.message : String(e)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -203,24 +211,52 @@ export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string 
       };
     });
     try {
-      if (running) {
-        await api.stopEndpoint(selected.id);
-        await new Promise((r) => setTimeout(r, 300));
-      }
-      await api.replaceEventTasks(selected.id, tasks);
-      if (running && restart) await api.startEndpoint(selected.id);
-      setSaved(true);
-      refreshEndpoints().catch(() => {});
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      const status = (e as { status?: number }).status;
-      // 运行中竞态 409：显示服务端错误并刷新运行态，保留用户表单不丢
-      if (status === 409) {
-        setError(`保存冲突（409）：Endpoint 可能已启动。${msg}`);
+      // 统一生命周期：postJson 对 409/500 不 throw，每步显式检查 status；
+      // stop 失败绝不 apply，apply 失败不 start，start 失败明确告知。
+      const outcome = await applyEndpointChange({
+        wasRunning: running,
+        restart,
+        stop: async (): Promise<LifecycleStepResult> => {
+          const r = await api.stopEndpoint(selected.id);
+          await new Promise((res) => setTimeout(res, 300));
+          return r.status === 200
+            ? { ok: true }
+            : { ok: false, message: (r.body as { error?: { message?: string } })?.error?.message ?? `停止失败（${r.status}），已中止应用` };
+        },
+        apply: async (): Promise<LifecycleStepResult> => {
+          try {
+            await api.replaceEventTasks(selected.id, tasks);
+            return { ok: true };
+          } catch (e) {
+            return { ok: false, message: e instanceof Error ? e.message : String(e) };
+          }
+        },
+        start: async (): Promise<LifecycleStepResult> => {
+          const r = await api.startEndpoint(selected.id);
+          return r.status === 200
+            ? { ok: true }
+            : { ok: false, message: (r.body as { error?: { message?: string } })?.error?.message ?? `恢复运行失败（${r.status}）` };
+        },
+      });
+      if (outcome.kind === "applied-restarted" || outcome.kind === "applied-stopped") {
+        setSaved(true);
         refreshEndpoints().catch(() => {});
-      } else {
-        setError(msg);
+        return;
       }
+      if (outcome.kind === "stop-failed") {
+        setError(`停止失败，已中止应用，未修改订阅：${outcome.message}`);
+        refreshEndpoints().catch(() => {});
+        return;
+      }
+      if (outcome.kind === "apply-failed-stopped") {
+        const m = outcome.message;
+        // 运行中竞态 409：显示服务端错误并刷新运行态，保留用户表单不丢
+        setError(m.includes("409") ? `保存冲突（409）：Endpoint 可能已启动。${m}` : m);
+        refreshEndpoints().catch(() => {});
+        return;
+      }
+      setError(`配置已保存，但恢复运行失败：${outcome.message}`);
+      refreshEndpoints().catch(() => {});
     } finally {
       setSaving(false);
     }

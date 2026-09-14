@@ -2,17 +2,18 @@
 // Modal 原样迁移）。单任务编辑器：只编辑 canonical（mesa.resources.v1）
 // 任务，其余任务原样保留（P0 数据安全）；保存 Stop → PUT → Start。
 import { useEffect, useState } from "react";
-import { Button, InputNumber, Tag, message } from "antd";
-import { Alert } from "antd";
+import { Alert, Button, InputNumber, Tag, message } from "antd";
 import { api } from "../api";
 import type { DriverDescriptor } from "../types";
 import {
+  applyEndpointChange,
   isTaskSnapshotReady,
   mergeAcquisitionTasks,
   selectionsOf,
   splitAcquisitionTasks,
   isRunningState,
   type AcquisitionTaskShape,
+  type LifecycleStepResult,
   type ResourceSelection,
   type TaskSnapshotState,
 } from "../deviceModel";
@@ -114,30 +115,62 @@ export function EndpointAcquisitionPane({
     // 描述门：Descriptor 未就绪同样不可 PUT（选型无合法依据，禁止凭空回写）。
     if (!desc) return message.error("资源描述加载失败，禁止保存。请切换后重试。");
     if (!sels.length) return message.warning("请先加入点位");
-    const wasRunning = running;
     const tasks = mergeAcquisitionTasks(existingTasks, { interval_ms: intervalMs, selections: sels });
     const preservedCount = tasks.length - 1;
+    const kept = (extra: string) =>
+      preservedCount > 0 ? `点位已保存（另保留 ${preservedCount} 个任务）${extra}` : `点位已保存${extra}`;
     setSaving(true);
     try {
-      await api.stopEndpoint(endpointId).catch(() => {});
-      const r = await fetch(`/api/v1/tasks/${endpointId}`, {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ tasks }),
+      // 统一生命周期：STOPPED 直接 apply（绝不自动 start）；RUNNING 经
+      // executor 走 stop → apply →（可选）start，各步失败都有明确 outcome。
+      const outcome = await applyEndpointChange({
+        wasRunning: running,
+        restart,
+        stop: async (): Promise<LifecycleStepResult> => {
+          const r = await api.stopEndpoint(endpointId).catch((e) => ({
+            status: -1,
+            body: { error: { message: e instanceof Error ? e.message : String(e) } },
+          }));
+          return r.status === 200
+            ? { ok: true }
+            : { ok: false, message: (r.body as { error?: { message?: string } })?.error?.message ?? `停止失败（${r.status}），已中止应用` };
+        },
+        apply: async (): Promise<LifecycleStepResult> => {
+          const r = await fetch(`/api/v1/tasks/${endpointId}`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ tasks }),
+          });
+          const j = await r.json().catch(() => ({}));
+          return r.ok
+            ? { ok: true }
+            : { ok: false, message: (j as { error?: { message?: string } })?.error?.message ?? "点位保存失败" };
+        },
+        start: async (): Promise<LifecycleStepResult> => {
+          const r = await api.startEndpoint(endpointId).catch((e) => ({
+            status: -1,
+            body: { error: { message: e instanceof Error ? e.message : String(e) } },
+          }));
+          return r.status === 200
+            ? { ok: true }
+            : { ok: false, message: (r.body as { error?: { message?: string } })?.error?.message ?? `恢复运行失败（${r.status}）` };
+        },
       });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) {
-        message.error(j.error?.message ?? "点位保存失败");
-        return;
+      if (outcome.kind === "applied-restarted") {
+        message.success(kept("，正在启动…"));
+        onChanged();
+      } else if (outcome.kind === "applied-stopped") {
+        message.success(running && !restart ? kept("，Endpoint 保持停止") : kept(""));
+        onChanged();
+      } else if (outcome.kind === "stop-failed") {
+        message.error(`停止失败，已中止应用，未修改点位：${outcome.message}`);
+      } else if (outcome.kind === "apply-failed-stopped") {
+        message.error(`应用失败，Endpoint 当前已停止：${outcome.message}`);
+        onChanged();
+      } else {
+        message.warning(`配置已保存，但恢复运行失败：${outcome.message}`);
+        onChanged();
       }
-      // 已停止端点保持“保存并启动”旧语义；运行中是否恢复由复选框决定
-      if (restart || !wasRunning) await api.startEndpoint(endpointId);
-      message.success(
-        preservedCount > 0
-          ? `点位已保存（另保留 ${preservedCount} 个任务）${restart || !wasRunning ? "，正在启动…" : ""}`
-          : `点位已保存${restart || !wasRunning ? "，正在启动…" : ""}`,
-      );
-      onChanged();
     } finally {
       setSaving(false);
     }

@@ -1,7 +1,7 @@
 // Endpoint Workspace（P1-4）：Endpoint 的专属工作空间，严格归属 Device
 //（路由 /devices/:deviceId/endpoints/:endpointId）。DeviceDetail 只管
 // Device 身份与连接列表；连接的编辑/采集/事件/诊断全部收敛到这里的五个 tab。
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Breadcrumb, Button, Card, Descriptions, Space, Tabs, Tag, message } from "antd";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
@@ -31,20 +31,41 @@ export function EndpointWorkspacePage() {
   const [eventTaskCount, setEventTaskCount] = useState<number | null>(null);
   const [diag, setDiag] = useState<unknown>(null);
   const [tab, setTab] = useState("overview");
+  // 路由代际：deviceId/endpointId 切换即新一代；旧请求的迟到响应一律丢弃，
+  // 否则 A 的慢响应会在 B 已加载后回来覆盖 ep（P0 串 Endpoint）。
+  const loadGen = useRef(0);
 
   const load = async () => {
+    const gen = ++loadGen.current;
+    // 切路由先失效旧身份：旧 ep 不得残留成新路由的操作依据。
+    setEp(null);
+    setNotFound(false);
     try {
       const d = (await api.getDevice(deviceId)) as Device;
+      if (loadGen.current !== gen) return;
       setDevice(d);
     } catch {
+      if (loadGen.current !== gen) return;
       // 设备名拿不到不致命，面包屑回落 id
     }
     try {
-      const r = (await fetch(`/api/v1/endpoints/${endpointId}`).then((x) => {
-        if (x.status === 404) throw Object.assign(new Error("not found"), { status: 404 });
+      const r = (await fetch(`/api/v1/endpoints/${endpointId}`).then(async (x) => {
+        if (!x.ok) {
+          const err = Object.assign(
+            new Error(x.status === 404 ? "not found" : `GET /endpoints/${endpointId} ${x.status}`),
+            { status: x.status },
+          );
+          throw err;
+        }
         return x.json();
       })) as EndpointDetail & { connection?: unknown };
+      if (loadGen.current !== gen) return;
+      // 形态守卫：错误包不得 masquerade 成 EndpointDetail（无 driver_id 即非法）。
+      if (!r || typeof r.driver_id !== "string" || !r.driver_id) {
+        throw Object.assign(new Error("endpoint 形态非法"), { status: 500 });
+      }
       const list = (await api.listEndpoints()) as { endpoints?: Array<{ id: string; runtime?: { state?: string }; state?: string }> };
+      if (loadGen.current !== gen) return;
       const live = (list.endpoints ?? []).find((e) => e.id === endpointId);
       setEp({
         id: r.id ?? endpointId,
@@ -55,19 +76,23 @@ export function EndpointWorkspacePage() {
       });
       setNotFound(false);
     } catch (e) {
+      if (loadGen.current !== gen) return;
       if ((e as { status?: number })?.status === 404) setNotFound(true);
       else message.error("加载连接失败");
     }
     fetch(`/api/v1/tasks?endpoint=${endpointId}`)
       .then((x) => x.json())
-      .then((j) => setTaskCount((j.tasks ?? []).length))
-      .catch(() => setTaskCount(null));
+      .then((j) => { if (loadGen.current === gen) setTaskCount((j.tasks ?? []).length); })
+      .catch(() => { if (loadGen.current === gen) setTaskCount(null); });
     api
       .listEventTasks(endpointId)
-      .then((j) => setEventTaskCount((j.event_tasks ?? []).length))
-      .catch(() => setEventTaskCount(null));
+      .then((j) => { if (loadGen.current === gen) setEventTaskCount((j.event_tasks ?? []).length); })
+      .catch(() => { if (loadGen.current === gen) setEventTaskCount(null); });
   };
-  useEffect(() => { load(); }, [deviceId, endpointId]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    setDiag(null);
+    load();
+  }, [deviceId, endpointId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadDiag = async () => {
     try {
@@ -110,7 +135,33 @@ export function EndpointWorkspacePage() {
   }
 
   const running = isRunningState(ep?.state);
-  const mismatch = ep?.device_id && ep.device_id !== deviceId;
+  const mismatch = !!ep?.device_id && ep.device_id !== deviceId;
+
+  // 归属 fail-closed：路由 deviceId 与 Endpoint 真实 device_id 不一致时，
+  // 只显示归属错误 + 前往正确路径，不渲染任何操作按钮和配置 Tab
+  //（否则用户会在错误的 Device 上下文里启停/改配置——与“严格嵌套”相悖）。
+  if (mismatch) {
+    return (
+      <div style={{ display: "grid", gap: 16 }}>
+        <Breadcrumb
+          items={[
+            { title: <Link to="/devices">设备</Link> },
+            { title: <Link to={`/devices/${deviceId}`}>{device?.name ?? deviceId}</Link> },
+            { title: ep?.name ?? endpointId },
+          ]}
+        />
+        <Card size="small" title="归属不一致">
+          <p style={{ fontSize: 12, color: "#525252" }}>
+            该连接实际归属设备 {ep?.device_id}，当前路径的设备（{deviceId}）不是其所有者。
+            为防止在错误的设备上下文里操作，已隐藏全部操作按钮与配置页。
+          </p>
+          <Button type="primary" size="small" onClick={() => nav(`/devices/${ep?.device_id}/endpoints/${endpointId}`)}>
+            前往正确位置 →
+          </Button>
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <div style={{ display: "grid", gap: 16 }}>
@@ -121,14 +172,6 @@ export function EndpointWorkspacePage() {
           { title: ep?.name ?? endpointId },
         ]}
       />
-
-      {mismatch ? (
-        <Card size="small">
-          <span style={{ fontSize: 12, color: "#525252" }}>
-            该连接实际归属设备 {ep?.device_id}，<Link to={`/devices/${ep?.device_id}/endpoints/${endpointId}`}>前往正确位置 →</Link>
-          </span>
-        </Card>
-      ) : null}
 
       <Card
         size="small"
