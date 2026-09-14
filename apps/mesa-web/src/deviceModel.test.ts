@@ -11,6 +11,7 @@ import {
   groupEndpointsByDevice,
   isDriverChangeAttempt,
   isRunningState,
+  isStrictlyRunning,
   isTaskSnapshotReady,
   mergeAcquisitionTasks,
   splitAcquisitionTasks,
@@ -150,6 +151,15 @@ describe("isRunningState", () => {
     expect(isRunningState("reconnecting")).toBe(true);
     expect(isRunningState("STOPPED")).toBe(false);
     expect(isRunningState(undefined)).toBe(false);
+  });
+
+  it("isStrictlyRunning 只认 RUNNING（过渡态不算在线）", () => {
+    expect(isStrictlyRunning("RUNNING")).toBe(true);
+    expect(isStrictlyRunning("running")).toBe(true);
+    expect(isStrictlyRunning("CONNECTING")).toBe(false);
+    expect(isStrictlyRunning("RECONNECTING")).toBe(false);
+    expect(isStrictlyRunning("STOPPED")).toBe(false);
+    expect(isStrictlyRunning(undefined)).toBe(false);
   });
 });
 

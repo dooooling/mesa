@@ -23,6 +23,15 @@ export function isRunningState(state?: string): boolean {
   return ["RUNNING", "CONNECTING", "RECONNECTING"].includes((state ?? "").toUpperCase());
 }
 
+/**
+ * 严格运行中（仅 RUNNING）。Dashboard“运行中”计数用此口径：
+ * CONNECTING / RECONNECTING 是过渡态，不得计入在线；过渡态在启停按钮
+ * 侧仍视为忙（isRunningState），避免重复启动。
+ */
+export function isStrictlyRunning(state?: string): boolean {
+  return (state ?? "").toUpperCase() === "RUNNING";
+}
+
 // ---------------------------------------------------------------------------
 // Monitor 语义（P0-3）：Device → Endpoint → Point 三级，文案不得把 Endpoint
 // 叫成“设备”。由 endpoint 归属 device_id 反查设备名；归属缺失时如实展示。
