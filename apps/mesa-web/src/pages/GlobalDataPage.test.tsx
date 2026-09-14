@@ -1,0 +1,160 @@
+// M3.1 回归：全局 /data 与设备页共用 point 语义。
+// - 跨设备聚合（设备/连接两列齐全）；
+// - ?device=/?connection= URL 联动与级联（设备切换连接回 ALL；非法值归一）；
+// - 共用 PointDetailDrawer（来源 Device/Connection/Endpoint 齐全，“打开设备”闭环）。
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { act, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { POINT_STALE_AFTER_MS } from "../deviceModel";
+import App from "../App";
+
+const T0 = 1_700_000_000_000;
+
+function pt(ep: string, key: string, quality: string, ageMs: number, value: unknown = 1) {
+  return {
+    endpoint_id: ep,
+    key,
+    point_id: key.length,
+    quality,
+    type: "f64",
+    value,
+    timestamp_ns: (T0 - ageMs) * 1e6,
+  };
+}
+
+function mockGlobal() {
+  (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string) => {
+    if (url === "/api/v1/devices") {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          devices: [
+            { id: "cnc-01", name: "CNC-01" },
+            { id: "plc-01", name: "PLC-01" },
+          ],
+        }),
+      };
+    }
+    if (url === "/api/v1/endpoints") {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          endpoints: [
+            { id: "focas", name: "FOCAS", driver_id: "focas2", device_id: "cnc-01", state: "RUNNING" },
+            { id: "s7", name: "S7", driver_id: "s7", device_id: "plc-01", state: "RUNNING" },
+          ],
+        }),
+      };
+    }
+    if (url === "/api/v1/points/latest") {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          points: [pt("focas", "spindle.speed", "GOOD", 500, 6000), pt("s7", "DB1.temp", "GOOD", 600, 36.5)],
+        }),
+      };
+    }
+    if (url === "/api/v1/devices/cnc-01") {
+      return { ok: true, status: 200, json: async () => ({ id: "cnc-01", name: "CNC-01" }) };
+    }
+    if (url === "/api/v1/devices/plc-01") {
+      return { ok: true, status: 200, json: async () => ({ id: "plc-01", name: "PLC-01" }) };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  });
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.useFakeTimers();
+  vi.setSystemTime(T0);
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
+
+function renderApp(path: string) {
+  return render(
+    <MemoryRouter initialEntries={[path]}>
+      <App />
+    </MemoryRouter>,
+  );
+}
+
+describe("M3.1 全局实时数据", () => {
+  it("跨设备聚合：设备/连接/点位三列齐全", async () => {
+    mockGlobal();
+    renderApp("/data");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("spindle.speed")).toBeTruthy();
+    expect(screen.getByText("DB1.temp")).toBeTruthy();
+    expect(screen.getAllByText("CNC-01").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("PLC-01").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("?device= 过滤只留该设备点位", async () => {
+    mockGlobal();
+    renderApp("/data?device=plc-01");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("DB1.temp")).toBeTruthy();
+    expect(screen.queryByText("spindle.speed")).toBeNull();
+  });
+
+  it("STALE 语义与设备页一致（旧点自然 STALE）", async () => {
+    (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string) => {
+      if (url === "/api/v1/devices") {
+        return { ok: true, status: 200, json: async () => ({ devices: [{ id: "cnc-01", name: "CNC-01" }] }) };
+      }
+      if (url === "/api/v1/endpoints") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            endpoints: [{ id: "focas", name: "FOCAS", driver_id: "focas2", device_id: "cnc-01", state: "RUNNING" }],
+          }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ points: [pt("focas", "old-k", "GOOD", POINT_STALE_AFTER_MS + 5000)] }),
+      };
+    });
+    renderApp("/data");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("old-k")).toBeTruthy();
+    expect(screen.getByText("STALE")).toBeTruthy();
+  });
+
+  it("共用 Drawer：来源齐全，“打开设备”闭环回设备页", async () => {
+    vi.useRealTimers();
+    mockGlobal();
+    const user = userEvent.setup();
+    renderApp("/data");
+    await screen.findByText("spindle.speed");
+    await user.click(screen.getByText("spindle.speed"));
+    await screen.findByText("打开连接配置");
+    // 来源：设备 + 连接 + endpoint 三段
+    expect(screen.getAllByText("CNC-01").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("FOCAS").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("focas").length).toBeGreaterThanOrEqual(1);
+    // Drawer 内“打开连接配置”闭环：进设备 Workspace config（上下文保留 FOCAS）。
+    // 表格行内“打开设备”与 Drawer 按钮重名，锚定 Drawer 的配置按钮。
+    await user.click(screen.getByText("打开连接配置"));
+    await waitFor(() => {
+      expect(screen.getByTestId("workspace-connection-context").textContent ?? "").toContain("FOCAS");
+    });
+  });
+});

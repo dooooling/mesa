@@ -10,7 +10,8 @@ import { MonitorView } from "./pages/MonitorView";
 import { EventsView } from "./pages/EventsView";
 import { DeviceWorkspacePage } from "./workspace/DeviceWorkspacePage";
 import { LegacyEndpointRedirect } from "./workspace/LegacyEndpointRedirect";
-import { GlobalDataPage, GlobalEventsPage, OverviewPage, SystemPage } from "./pages/V2Placeholders";
+import { GlobalDataPage } from "./pages/GlobalDataPage";
+import { GlobalEventsPage, OverviewPage, SystemPage } from "./pages/V2Placeholders";
 
 const { Header, Sider, Content } = Layout;
 

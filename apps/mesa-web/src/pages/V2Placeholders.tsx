@@ -15,19 +15,6 @@ export function OverviewPage() {
   );
 }
 
-export function GlobalDataPage() {
-  return (
-    <Card size="small" title="实时数据">
-      <Alert
-        type="info"
-        showIcon
-        message="M3 实现"
-        description="跨设备聚合搜索：设备/连接/状态过滤 + 全文搜索，行点击开 Drawer，可跳转所属设备。"
-      />
-    </Card>
-  );
-}
-
 export function GlobalEventsPage() {
   return (
     <Card size="small" title="事件">
