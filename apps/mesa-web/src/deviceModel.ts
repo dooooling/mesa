@@ -283,3 +283,60 @@ export function mergeAcquisitionTasks(
   };
   return [...preserved, canonical];
 }
+
+// ---------------------------------------------------------------------------
+// 统一生命周期状态机（P1：Connection / Acquisition / Event 三处同构）。
+//
+// 产品语义（PR30 gate，ApplyWithRestart 按钮行为即此语义）：
+// - STOPPED：直接 apply，绝不 start（保存后仍 STOPPED）；
+// - RUNNING + restart：stop → apply → start；
+// - RUNNING + !restart：stop → apply，结束后保持停止。
+// 错误语义（fail-closed，postJson 对 409/500 不 throw，只返回 status，
+// 调用方必须显式检查，绝不能“stop 500 照样 apply”或“start 500 报成功”）：
+// - stop 失败 → 中止，绝不 apply；
+// - apply 失败 → 不 start，明确“已停止”；
+// - start 失败 → 明确“配置已保存，但恢复运行失败”。
+// 本模块为纯状态机：实际 stop/apply/start 由调用方注入，返回 outcome
+// 由调用方映射为 message；三处 Pane 不得各写一套生命周期分支。
+// ---------------------------------------------------------------------------
+
+/** stop/apply/start 注入动作的返回：一律显式 ok，禁止靠 throw 隐式表达。 */
+export interface LifecycleStepResult {
+  ok: boolean;
+  message?: string;
+}
+
+/** applyEndpointChange 的确定性结果（调用方据此แสดง message，无歧义分支）。 */
+export type LifecycleOutcome =
+  | { kind: "applied-stopped"; restarted: false }
+  | { kind: "applied-restarted"; restarted: true }
+  | { kind: "stop-failed"; message: string }
+  | { kind: "apply-failed-stopped"; message: string }
+  | { kind: "applied-but-restart-failed"; message: string };
+
+/**
+ * 统一生命周期执行器：STOPPED 直接 apply；RUNNING 先 stop（失败即中止），
+ * apply 后按 restart 决定是否 start。各步失败都有明确 outcome，调用方
+ * 只负责把 outcome 翻译成中文 message，不得自行解释 wasRunning。
+ */
+export async function applyEndpointChange(args: {
+  wasRunning: boolean;
+  restart: boolean;
+  stop: () => Promise<LifecycleStepResult>;
+  apply: () => Promise<LifecycleStepResult>;
+  start: () => Promise<LifecycleStepResult>;
+}): Promise<LifecycleOutcome> {
+  if (!args.wasRunning) {
+    const a = await args.apply();
+    if (!a.ok) return { kind: "apply-failed-stopped", message: a.message ?? "应用失败" };
+    return { kind: "applied-stopped", restarted: false };
+  }
+  const s = await args.stop();
+  if (!s.ok) return { kind: "stop-failed", message: s.message ?? "停止失败，已中止应用" };
+  const a = await args.apply();
+  if (!a.ok) return { kind: "apply-failed-stopped", message: a.message ?? "应用失败，Endpoint 当前已停止" };
+  if (!args.restart) return { kind: "applied-stopped", restarted: false };
+  const r = await args.start();
+  if (!r.ok) return { kind: "applied-but-restart-failed", message: r.message ?? "配置已保存，但恢复运行失败" };
+  return { kind: "applied-restarted", restarted: true };
+}

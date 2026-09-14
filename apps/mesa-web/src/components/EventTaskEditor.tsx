@@ -7,6 +7,8 @@ import { DeleteOutlined, PlusOutlined } from "@ant-design/icons";
 import { api } from "../api";
 import type { DriverDescriptor, EventStreamDescriptor, EventTask, LocalizedText, TaskMode } from "../types";
 import { DescriptorFields, materializeSchemaDefaults } from "./DescriptorFields";
+import { ApplyWithRestart } from "./ApplyWithRestart";
+import { applyEndpointChange, type LifecycleStepResult } from "../deviceModel";
 import {
   GENERIC_EVENT_BINDING_KIND,
   buildGenericEventBinding,
@@ -79,9 +81,9 @@ function validateDraft(d: DraftGeneric, streams: EventStreamDescriptor[]): strin
   return null;
 }
 
-export function EventTaskEditor() {
+export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string }) {
   const [endpoints, setEndpoints] = useState<EndpointOption[]>([]);
-  const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
+  const [selectedId, setSelectedId] = useState<string | undefined>(fixedEndpointId);
   const [descriptor, setDescriptor] = useState<DriverDescriptor | null>(null);
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [loading, setLoading] = useState(false);
@@ -95,16 +97,24 @@ export function EventTaskEditor() {
   // 否则可能把 A 的事件配置写进 B。
   const loadGen = useRef(0);
 
-  // Endpoint 列表（含运行态；running → 只读）
+  // Endpoint 列表（含运行态；running → 只读）。固定模式（Workspace）下
+  // 列表仅用于取 driver_id/运行态，选择器 UI 隐藏，归属锁定传入 id。
   const refreshEndpoints = useCallback(async () => {
     const j = await api.listEndpoints();
     const list = ((j.endpoints ?? []) as { id: string; driver_id: string; runtime?: { state?: string } }[]).map(
       (e) => ({ id: e.id, driver_id: e.driver_id, running: !!e.runtime && e.runtime.state !== "STOPPED" }),
     );
     setEndpoints(list);
-    if (!selectedId && list.length > 0) setSelectedId(list[0].id);
+    if (!selectedId && !fixedEndpointId && list.length > 0) setSelectedId(list[0].id);
     return list;
-  }, [selectedId]);
+  }, [selectedId, fixedEndpointId]);
+
+  // 固定模式（Workspace）：归属锁定传入 id，路由 A→B 切 Endpoint 时同组件
+  // 复用，必须跟随 fixedEndpointId 切换选中（useState 只管首次，否则 URL
+  // 是 B、编辑器仍在改 A——P0 串改）。
+  useEffect(() => {
+    if (fixedEndpointId) setSelectedId(fixedEndpointId);
+  }, [fixedEndpointId]);
 
   useEffect(() => {
     refreshEndpoints().catch((e) => setError(e instanceof Error ? e.message : String(e)));
@@ -182,9 +192,11 @@ export function EventTaskEditor() {
 
   const hasProblem = problems.some((p) => p !== null);
 
-  const save = async () => {
-    // 归属门：只有当前选中 Endpoint 成功加载出的配置才允许保存
-    if (!selected || loadedEndpointId !== selected.id || running || saving || hasProblem) return;
+  const save = async (restart: boolean) => {
+    // 归属门：只有当前选中 Endpoint 成功加载出的配置才允许保存。
+    // 统一生命周期：运行中先停止再应用（停止是本次应用的一部分），
+    // 是否恢复运行由复选框决定；已停止则直接应用。
+    if (!selected || loadedEndpointId !== selected.id || saving || hasProblem) return;
     setSaving(true);
     setError(null);
     setSaved(false);
@@ -199,18 +211,52 @@ export function EventTaskEditor() {
       };
     });
     try {
-      await api.replaceEventTasks(selected.id, tasks);
-      setSaved(true);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      const status = (e as { status?: number }).status;
-      // 运行中竞态 409：显示服务端错误并刷新运行态，保留用户表单不丢
-      if (status === 409) {
-        setError(`保存冲突（409）：Endpoint 可能已启动。${msg}`);
+      // 统一生命周期：postJson 对 409/500 不 throw，每步显式检查 status；
+      // stop 失败绝不 apply，apply 失败不 start，start 失败明确告知。
+      const outcome = await applyEndpointChange({
+        wasRunning: running,
+        restart,
+        stop: async (): Promise<LifecycleStepResult> => {
+          const r = await api.stopEndpoint(selected.id);
+          await new Promise((res) => setTimeout(res, 300));
+          return r.status === 200
+            ? { ok: true }
+            : { ok: false, message: (r.body as { error?: { message?: string } })?.error?.message ?? `停止失败（${r.status}），已中止应用` };
+        },
+        apply: async (): Promise<LifecycleStepResult> => {
+          try {
+            await api.replaceEventTasks(selected.id, tasks);
+            return { ok: true };
+          } catch (e) {
+            return { ok: false, message: e instanceof Error ? e.message : String(e) };
+          }
+        },
+        start: async (): Promise<LifecycleStepResult> => {
+          const r = await api.startEndpoint(selected.id);
+          return r.status === 200
+            ? { ok: true }
+            : { ok: false, message: (r.body as { error?: { message?: string } })?.error?.message ?? `恢复运行失败（${r.status}）` };
+        },
+      });
+      if (outcome.kind === "applied-restarted" || outcome.kind === "applied-stopped") {
+        setSaved(true);
         refreshEndpoints().catch(() => {});
-      } else {
-        setError(msg);
+        return;
       }
+      if (outcome.kind === "stop-failed") {
+        setError(`停止失败，已中止应用，未修改订阅：${outcome.message}`);
+        refreshEndpoints().catch(() => {});
+        return;
+      }
+      if (outcome.kind === "apply-failed-stopped") {
+        const m = outcome.message;
+        // 运行中竞态 409：显示服务端错误并刷新运行态，保留用户表单不丢
+        setError(m.includes("409") ? `保存冲突（409）：Endpoint 可能已启动。${m}` : m);
+        refreshEndpoints().catch(() => {});
+        return;
+      }
+      setError(`配置已保存，但恢复运行失败：${outcome.message}`);
+      refreshEndpoints().catch(() => {});
     } finally {
       setSaving(false);
     }
@@ -218,29 +264,37 @@ export function EventTaskEditor() {
 
   return (
     <div style={{ display: "grid", gap: 12 }}>
-      <Space>
-        <span>Endpoint</span>
-        <Select
-          value={selectedId}
-          onChange={setSelectedId}
-          style={{ minWidth: 240 }}
-          placeholder="选择 Endpoint"
-          options={endpoints.map((e) => ({ value: e.id, label: `${e.id}${e.running ? "（运行中）" : ""}` }))}
-        />
-        {selected ? <Tag>{selected.driver_id}</Tag> : null}
-        {running ? <Tag color="orange">运行中 · 只读</Tag> : <Tag color="green">已停止 · 可编辑</Tag>}
-      </Space>
+      {!fixedEndpointId ? (
+        <Space>
+          <span>Endpoint</span>
+          <Select
+            value={selectedId}
+            onChange={setSelectedId}
+            style={{ minWidth: 240 }}
+            placeholder="选择 Endpoint"
+            options={endpoints.map((e) => ({ value: e.id, label: `${e.id}${e.running ? "（运行中）" : ""}` }))}
+          />
+          {selected ? <Tag>{selected.driver_id}</Tag> : null}
+          {running ? <Tag color="orange">运行中</Tag> : <Tag color="green">已停止 · 可编辑</Tag>}
+        </Space>
+      ) : (
+        <Space>
+          {selected ? <Tag>{selected.driver_id}</Tag> : null}
+          {running ? <Tag color="orange">运行中</Tag> : <Tag color="green">已停止 · 可编辑</Tag>}
+        </Space>
+      )}
 
-      {running ? (
-        <Alert type="warning" showIcon message="事件任务只能在 Endpoint 停止状态修改" description="停止设备必须是用户显式动作；本页不会自动 Stop。" />
-      ) : null}
       {error ? <Alert type="error" showIcon message="订阅配置失败" description={error} /> : null}
       {saved ? <Alert type="success" showIcon message="已保存" description="EventTask 全量快照已替换。" /> : null}
 
       {loading ? (
         <Card size="small" loading />
       ) : !selected ? (
-        <Alert type="info" showIcon message="请选择 Endpoint" description="选择后加载其事件订阅配置。" />
+        fixedEndpointId ? (
+          <Alert type="warning" showIcon message="Endpoint 不存在" description={`未找到 ${fixedEndpointId}，可能已被删除。`} />
+        ) : (
+          <Alert type="info" showIcon message="请选择 Endpoint" description="选择后加载其事件订阅配置。" />
+        )
       ) : !descriptor ? (
         <Alert
           type="info"
@@ -265,7 +319,7 @@ export function EventTaskEditor() {
                     </Space>
                   }
                   extra={
-                    <Button size="small" danger icon={<DeleteOutlined />} disabled={running} onClick={() => removeDraft(d.key)}>
+                    <Button size="small" danger icon={<DeleteOutlined />} disabled={saving} onClick={() => removeDraft(d.key)}>
                       删除
                     </Button>
                   }
@@ -286,7 +340,7 @@ export function EventTaskEditor() {
                 size="small"
                 title={<span>任务 · {d.id || "(未命名)"}</span>}
                 extra={
-                  <Button size="small" danger icon={<DeleteOutlined />} disabled={running} onClick={() => removeDraft(d.key)}>
+                  <Button size="small" danger icon={<DeleteOutlined />} disabled={saving} onClick={() => removeDraft(d.key)}>
                     删除
                   </Button>
                 }
@@ -296,14 +350,14 @@ export function EventTaskEditor() {
                     <span>Task ID</span>
                     <Input
                       value={d.id}
-                      disabled={running}
+                      disabled={saving}
                       onChange={(e) => patchGeneric(d.key, { id: e.target.value })}
                       style={{ width: 200, fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}
                     />
                     <span>Event Stream</span>
                     <Select
                       value={d.streamId}
-                      disabled={running}
+                      disabled={saving}
                       onChange={(v) => {
                         const ns = streamById(streams, v);
                         const nm = ns?.modes[0] ?? "subscribe";
@@ -320,7 +374,7 @@ export function EventTaskEditor() {
                     <span>Mode</span>
                     <Select
                       value={d.mode}
-                      disabled={running}
+                      disabled={saving}
                       onChange={(v: TaskMode) =>
                         patchGeneric(d.key, { mode: v, interval_ms: v === "poll" ? d.interval_ms ?? 1000 : null })
                       }
@@ -333,7 +387,7 @@ export function EventTaskEditor() {
                         <InputNumber
                           min={1}
                           value={d.interval_ms ?? undefined}
-                          disabled={running}
+                          disabled={saving}
                           onChange={(v) => patchGeneric(d.key, { interval_ms: typeof v === "number" ? v : null })}
                         />
                       </>
@@ -344,7 +398,7 @@ export function EventTaskEditor() {
                       <DescriptorFields
                         schema={st.parameters}
                         value={d.parameters}
-                        disabled={running}
+                        disabled={saving}
                         onChange={(next) => patchGeneric(d.key, { parameters: next })}
                       />
                       {st.fields.length > 0 ? (
@@ -360,20 +414,19 @@ export function EventTaskEditor() {
             );
           })}
           <div>
-            <Button icon={<PlusOutlined />} onClick={addTask} disabled={running || streams.length === 0}>
+            <Button icon={<PlusOutlined />} onClick={addTask} disabled={saving || streams.length === 0}>
               添加订阅
             </Button>
             <span style={{ marginLeft: 12, fontSize: 12, color: "#525252" }}>只生成 {GENERIC_EVENT_BINDING_KIND}</span>
           </div>
           <div>
-            <Button
-              type="primary"
-              onClick={save}
-              loading={saving}
-              disabled={running || loading || loadedEndpointId !== selected?.id || hasProblem || !selected}
-            >
-              保存订阅
-            </Button>
+            <ApplyWithRestart
+              running={running}
+              applying={saving}
+              canApply={loadedEndpointId === selected?.id && !hasProblem && !!selected}
+              applyLabel="保存订阅"
+              onApply={save}
+            />
           </div>
         </div>
       )}

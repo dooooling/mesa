@@ -4,6 +4,7 @@ import { Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { Dashboard } from "./pages/Dashboard";
 import { DevicesPage } from "./pages/DevicesPage";
 import { DeviceDetailPage } from "./pages/DeviceDetailPage";
+import { EndpointWorkspacePage } from "./pages/EndpointWorkspacePage";
 import { OnboardingPage } from "./pages/OnboardingPage";
 import { MonitorView } from "./pages/MonitorView";
 import { EventsView } from "./pages/EventsView";
@@ -25,8 +26,7 @@ export default function App() {
   const loc = useLocation();
   const nav = useNavigate();
   const { token } = theme.useToken();
-  // /devices/:id 与 /onboarding 都归属设备管理：前者是详情，后者是
-  // 设备创建流程（workflow route，非一级模块），Header 同显示“设备”
+  // Endpoint Workspace 严格嵌套在 Device 下（无顶层入口），高亮仍归属 /devices
   const selected = (loc.pathname === "/onboarding" || loc.pathname.startsWith("/devices/")) ? "/devices"
     : (items.find((i) => i.key !== "/" && loc.pathname.startsWith(i.key))?.key ?? "/");
 
@@ -54,6 +54,7 @@ export default function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/devices" element={<DevicesPage />} />
             <Route path="/devices/:id" element={<DeviceDetailPage />} />
+            <Route path="/devices/:deviceId/endpoints/:endpointId" element={<EndpointWorkspacePage />} />
             <Route path="/onboarding" element={<OnboardingPage />} />
             <Route path="/monitor" element={<MonitorView />} />
             <Route path="/events" element={<EventsView />} />

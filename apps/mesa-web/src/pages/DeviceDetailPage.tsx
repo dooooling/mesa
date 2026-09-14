@@ -1,28 +1,19 @@
-// PR27 Device-first：Device detail 主页面。下挂该 Device 的 Endpoint cards，
-// Start / Stop / Edit connection / Configure resources 全部作用于 Endpoint。
-// device_id 全页固定来自路由；driver_id 创建后不可改（修改请求无该字段）。
-import { useEffect, useRef, useState } from "react";
-import { Alert, Button, Card, Col, Form, Input, InputNumber, Modal, Row, Select, Space, Tag, message } from "antd";
+// Device detail（P1-4 瘦身后）：只负责 Device 身份（改名/删除）与连接列表
+//（新增/启停/删除）+ 进入 Endpoint Workspace。连接的编辑/采集/事件/诊断
+// 已全部收敛到 EndpointWorkspacePage 的五个 tab，不再堆 Modal。
+import { useEffect, useState } from "react";
+import { Alert, Button, Card, Form, Input, Modal, Select, Space, Table, Tag, message } from "antd";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import type { DriverDescriptor } from "../types";
 import {
   buildEndpointCreatePayload,
-  buildEndpointUpdatePayload,
   canDeleteDevice,
   cleanConnection,
   isRunningState,
-  isTaskSnapshotReady,
-  mergeAcquisitionTasks,
-  selectionsOf,
-  splitAcquisitionTasks,
-  type AcquisitionTaskShape,
   type Device,
-  type ResourceSelection,
-  type TaskSnapshotState,
 } from "../deviceModel";
 import { DescriptorFields, materializeSchemaDefaults } from "../components/DescriptorFields";
-import { ResourcePickerAntd } from "../components/ResourcePickerAntd";
 
 // 后端 discovery 不可用时的兜底（正常情况下拉来自 /api/v1/drivers，
 // 新驱动无需改前端即出现）。
@@ -40,7 +31,6 @@ interface Endpoint {
   driver_id: string;
   device_id?: string;
   state?: string;
-  connection?: Record<string, unknown>;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -62,33 +52,9 @@ export function DeviceDetailPage() {
   const [addIssues, setAddIssues] = useState<Array<{ path: string; message: string }>>([]);
   const [addProbe, setAddProbe] = useState<{ ok: boolean; msg: string } | null>(null);
 
-  // 编辑连接
-  const [editOpen, setEditOpen] = useState(false);
-  const [editEp, setEditEp] = useState<Endpoint | null>(null);
-  const [editDesc, setEditDesc] = useState<DriverDescriptor | null>(null);
-  const [editConn, setEditConn] = useState<Record<string, unknown>>({});
-  const [editName, setEditName] = useState("");
-
   // 设备改名
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameForm] = Form.useForm();
-
-  // 点位配置（单任务编辑器）：只编辑 canonical 任务，其余任务原样保留，
-  // 绝不因 PUT 全量替换而误删 task-b/task-c（P0 数据安全）。
-  const [pointsOpen, setPointsOpen] = useState(false);
-  const [pointsEp, setPointsEp] = useState<Endpoint | null>(null);
-  const [pointsDesc, setPointsDesc] = useState<DriverDescriptor | null>(null);
-  const [pointsSels, setPointsSels] = useState<ResourceSelection[]>([]);
-  const [existingTasks, setExistingTasks] = useState<AcquisitionTaskShape[]>([]);
-  const [preservedTasks, setPreservedTasks] = useState<AcquisitionTaskShape[]>([]);
-  const [intervalMs, setIntervalMs] = useState(1000);
-  // 任务快照门（P0 fail-closed）：只有 ready + 归属当前 Endpoint 才允许 PUT。
-  // loading/error 一律禁用保存，绝不能把 [] 当作“服务端没有任务”。
-  const [tasksLoadState, setTasksLoadState] = useState<TaskSnapshotState>("idle");
-  const [tasksLoadedEpId, setTasksLoadedEpId] = useState<string | null>(null);
-  const [tasksLoadError, setTasksLoadError] = useState("");
-  // 打开序号：丢弃过期请求的回包，避免切 Endpoint 后旧快照污染新编辑器。
-  const pointsSeq = useRef(0);
 
   const load = async () => {
     try {
@@ -225,41 +191,6 @@ export function DeviceDetailPage() {
     load();
   };
 
-  const openEdit = async (ep: Endpoint) => {
-    const r = (await fetch(`/api/v1/endpoints/${ep.id}`).then((x) => x.json()).catch(() => null)) as
-      | (Endpoint & { connection?: Record<string, unknown> })
-      | null;
-    if (!r) return message.error("获取连接失败");
-    const d = await fetch(`/api/v1/drivers/${r.driver_id ?? ep.driver_id}/descriptor`)
-      .then((x) => x.json()).catch(() => null);
-    setEditDesc(d);
-    // 服务端可能脱敏 Secret 字段；编辑页只改用户填写项，未动字段原样回传由后端合并语义决定
-    setEditConn((r.connection as Record<string, unknown>) ?? {});
-    setEditEp({ id: r.id ?? ep.id, name: r.name ?? ep.id, driver_id: r.driver_id ?? ep.driver_id, device_id: r.device_id });
-    setEditName(r.name ?? r.id ?? ep.id);
-    setEditOpen(true);
-  };
-
-  const saveEdit = async () => {
-    if (!editEp) return;
-    const cleaned = cleanConnection(editConn);
-    if (!Object.keys(cleaned).length) return message.warning("请填写连接参数");
-    await api.stopEndpoint(editEp.id).catch(() => {});
-    await sleep(300);
-    // driver_id 不可变：请求体无该字段（误带即后端 deny_unknown_fields 拒绝）
-    const body = buildEndpointUpdatePayload({ name: editName || editEp.id, deviceId, connection: cleaned });
-    try {
-      await api.updateEndpoint(editEp.id, body);
-    } catch (e) {
-      const err = e as { message?: string };
-      message.error(err?.message ?? "修改失败");
-      return;
-    }
-    message.success("修改成功（驱动未变，需手动启动）");
-    setEditOpen(false);
-    load();
-  };
-
   const openRename = () => {
     renameForm.setFieldsValue({ name: device?.name ?? "" });
     setRenameOpen(true);
@@ -295,92 +226,6 @@ export function DeviceDetailPage() {
     nav("/devices");
   };
 
-  const openPoints = async (ep: Endpoint) => {
-    const seq = ++pointsSeq.current;
-    setPointsEp(ep);
-    setPointsSels([]);
-    setExistingTasks([]);
-    setPreservedTasks([]);
-    setIntervalMs(1000);
-    setPointsDesc(null);
-    // 先进入 loading：快照未知前保存键保持禁用（fail-closed）。
-    setTasksLoadState("loading");
-    setTasksLoadedEpId(null);
-    setTasksLoadError("");
-    setPointsOpen(true);
-    // Descriptor + Task 快照并行加载；二者都成功才开放保存（任一失败都保持禁用）。
-    const [desc, tasksRes] = await Promise.all([
-      fetch(`/api/v1/drivers/${ep.driver_id}/descriptor`).then((x) => x.json()).catch(() => null),
-      fetch(`/api/v1/tasks?endpoint=${ep.id}`).then(async (x) => {
-        if (!x.ok) throw new Error(`GET /tasks ${x.status}`);
-        return (await x.json()) as { tasks?: AcquisitionTaskShape[] };
-      }).catch((e) => ({ error: e as unknown })),
-    ]);
-    // 过期请求直接丢弃（用户已打开另一个 Endpoint 的编辑器）。
-    if (pointsSeq.current !== seq) return;
-    // 只接受形态合法的 Descriptor：错误包（如 {error: ...}）不得 masquerade 成描述，
-    // 否则既可能 crash 选型器，又会错误放行下面的 Descriptor 保存门。
-    if (desc && Array.isArray((desc as { resources?: unknown }).resources)) setPointsDesc(desc);
-    if (tasksRes && !(tasksRes as { error?: unknown }).error) {
-      const tasks = ((tasksRes as { tasks?: AcquisitionTaskShape[] }).tasks ?? []) as AcquisitionTaskShape[];
-      setExistingTasks(tasks);
-      // 只回显 canonical 任务；其余任务保留且不在此编辑（P0：防误删）
-      const { editable, preserved } = splitAcquisitionTasks(tasks);
-      setPreservedTasks(preserved);
-      if (editable) {
-        if (editable.mode === "poll") setIntervalMs(editable.interval_ms ?? 1000);
-        const sels = selectionsOf(editable);
-        if (sels.length) setPointsSels(sels);
-      }
-      // 快照就绪：只有此时保存键才允许 PUT（空数组即服务端真的无任务）。
-      setTasksLoadedEpId(ep.id);
-      setTasksLoadState("ready");
-      if (tasks.length) {
-        message.info(
-          preserved.length
-            ? `已回显 canonical 任务，另有 ${preserved.length} 个任务将被保留（${preserved.map((t) => t.id).join("、")}）`
-            : `已回显 ${tasks.length} 任务`,
-        );
-      }
-    } else {
-      // Task 快照失败：fail-closed——显示错误并禁用保存，不拿 [] 去覆盖服务端。
-      setTasksLoadState("error");
-      setTasksLoadError("任务快照加载失败：服务端任务集未知，已禁用保存（关闭后重试，不会覆盖已有任务）。");
-    }
-  };
-
-  const savePoints = async () => {
-    if (!pointsEp) return;
-    // 快照门：pending / 失败 / 串 Endpoint 一律不可 PUT。
-    if (!isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, pointsEp.id)) {
-      if (tasksLoadState === "error") return message.error("任务快照加载失败，禁止保存以防覆盖已有任务。请关闭重试。");
-      return message.warning("任务快照加载中，禁止保存以防覆盖已有任务。请稍候。");
-    }
-    // 描述门：Descriptor 未就绪同样不可 PUT（选型无合法依据，禁止凭空回写）。
-    if (!pointsDesc) {
-      return tasksLoadState === "loading"
-        ? message.warning("资源描述加载中，禁止保存。请稍候。")
-        : message.error("资源描述加载失败，禁止保存。请关闭重试。");
-    }
-    if (!pointsSels.length) return message.warning("请先加入点位");
-    // 只发 mesa.resources.v1 canonical 形态，其它任务逐字保留；
-    // 合法性由 Core 门禁裁决
-    const tasks = mergeAcquisitionTasks(existingTasks, { interval_ms: intervalMs, selections: pointsSels });
-    const preservedCount = tasks.length - 1;
-    await api.stopEndpoint(pointsEp.id).catch(() => {});
-    const r = await fetch(`/api/v1/tasks/${pointsEp.id}`, {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ tasks }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) return message.error(j.error?.message ?? "点位保存失败");
-    message.success(preservedCount > 0 ? `点位已保存（另保留 ${preservedCount} 个任务），正在启动…` : "点位已保存，正在启动…");
-    await api.startEndpoint(pointsEp.id);
-    setPointsOpen(false);
-    load();
-  };
-
   if (notFound) {
     return (
       <Card size="small" title="设备不存在">
@@ -404,39 +249,43 @@ export function DeviceDetailPage() {
           </Space>
         }
       >
-        <div style={{ fontSize: 12, color: "#525252" }}>下挂 {endpoints.length} 个连接 · 所有操作均作用于 Endpoint，设备本身不直接采集</div>
+        <div style={{ fontSize: 12, color: "#525252" }}>下挂 {endpoints.length} 个连接 · 点行进入 Endpoint 工作空间</div>
       </Card>
 
-      <Row gutter={[16, 16]}>
-        {endpoints.map((ep) => {
-          const running = isRunningState(ep.state);
-          return (
-            <Col key={ep.id} xs={24} lg={12} xl={8}>
-              <Card
-                size="small"
-                title={<span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 13 }}>{ep.name ?? ep.id}</span>}
-                extra={<Tag color={running ? "green" : (ep.state ?? "").toUpperCase() === "FAILED" ? "red" : "default"}>{ep.state ?? "—"}</Tag>}
-              >
-                <div style={{ display: "grid", gap: 8 }}>
-                  <div style={{ fontSize: 12, color: "#525252", fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>{ep.id}</div>
-                  <div><Tag>{ep.driver_id}</Tag></div>
-                  <Space wrap>
-                    <Button size="small" onClick={() => openEdit(ep)}>编辑连接</Button>
-                    <Button size="small" onClick={() => openPoints(ep)}>配置点位</Button>
+      <Card size="small" title="连接">
+        <Table
+          size="small"
+          rowKey="id"
+          dataSource={endpoints}
+          onRow={(r) => ({ onClick: () => nav(`/devices/${deviceId}/endpoints/${r.id}`), style: { cursor: "pointer" } })}
+          columns={[
+            { title: "名称", dataIndex: "name", render: (v: string) => v ?? "—" },
+            { title: "ID", dataIndex: "id", render: (v: string) => <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>{v}</span> },
+            { title: "驱动", dataIndex: "driver_id", render: (v: string) => <Tag>{v}</Tag> },
+            {
+              title: "状态",
+              dataIndex: "state",
+              render: (v: string) => <Tag color={isRunningState(v) ? "green" : (v ?? "").toUpperCase() === "FAILED" ? "red" : "default"}>{v ?? "—"}</Tag>,
+            },
+            {
+              title: "操作",
+              render: (_: unknown, r: Endpoint) => {
+                const running = isRunningState(r.state);
+                return (
+                  <Space onClick={(e) => e.stopPropagation()}>
+                    <Button size="small" onClick={() => nav(`/devices/${deviceId}/endpoints/${r.id}`)}>进入</Button>
                     {!running
-                      ? <Button size="small" type="primary" onClick={() => act(ep.id, "start")}>启动</Button>
-                      : <Button size="small" onClick={() => act(ep.id, "stop")}>停止</Button>}
-                    <Button size="small" danger onClick={() => act(ep.id, "delete")}>删除</Button>
+                      ? <Button size="small" type="primary" onClick={() => act(r.id, "start")}>启动</Button>
+                      : <Button size="small" onClick={() => act(r.id, "stop")}>停止</Button>}
+                    <Button size="small" danger onClick={() => act(r.id, "delete")}>删除</Button>
                   </Space>
-                </div>
-              </Card>
-            </Col>
-          );
-        })}
-      </Row>
-      {!endpoints.length && (
-        <Card size="small"><div style={{ color: "#525252", fontSize: 12 }}>该设备下暂无连接，点“新增连接”添加第一个 Endpoint（不会新增设备）。</div></Card>
-      )}
+                );
+              },
+            },
+          ]}
+          locale={{ emptyText: "该设备下暂无连接，点“新增连接”添加第一个 Endpoint（不会新增设备）" }}
+        />
+      </Card>
 
       <Modal title={`新增连接 · 归属 ${deviceId}`} open={addOpen} onOk={doAdd} onCancel={() => setAddOpen(false)} okText="创建" destroyOnHidden width={640}>
         <Form form={addForm} layout="vertical" initialValues={{ driver_id: "simulator" }}>
@@ -461,83 +310,12 @@ export function DeviceDetailPage() {
         </Form>
       </Modal>
 
-      <Modal title={`编辑连接 · ${editEp?.id ?? ""}`} open={editOpen} onOk={saveEdit} onCancel={() => setEditOpen(false)} okText="保存" width={640} destroyOnHidden={false} forceRender>
-        <div style={{ marginBottom: 12, display: "flex", gap: 8, alignItems: "center" }}>
-          <span style={{ fontSize: 12 }}>驱动</span>
-          <Tag>{editEp?.driver_id}</Tag>
-          <span style={{ fontSize: 12, color: "#525252" }}>创建后不可改</span>
-        </div>
-        <div style={{ marginBottom: 12 }}>
-          <div style={{ fontSize: 12, marginBottom: 4 }}>连接名称</div>
-          <Input value={editName} onChange={(e) => setEditName(e.target.value)} />
-        </div>
-        {!editDesc ? <div style={{ color: "#525252" }}>加载中…</div> : (
-          <DescriptorFields schema={editDesc.connection} value={editConn} onChange={setEditConn} />
-        )}
-        <div style={{ marginTop: 8, fontSize: 12, color: "#525252" }}>需先停止再修改（已自动停止），保存后需手动启动</div>
-      </Modal>
-
       <Modal title={`设备改名 · ${deviceId}`} open={renameOpen} onOk={saveRename} onCancel={() => setRenameOpen(false)} okText="保存" destroyOnHidden>
         <Form form={renameForm} layout="vertical">
           <Form.Item name="name" label="设备名称" rules={[{ required: true, message: "设备名称必填" }]}>
             <Input />
           </Form.Item>
         </Form>
-      </Modal>
-
-      <Modal title={`点位 · ${pointsEp?.id ?? ""}`} open={pointsOpen} onOk={savePoints} onCancel={() => setPointsOpen(false)} okText="保存并启动" width={720} destroyOnHidden okButtonProps={{ disabled: !pointsEp || !pointsDesc || !isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, pointsEp.id) }}>
-        {tasksLoadState === "error" ? (
-          <Alert type="error" message={tasksLoadError || "任务快照加载失败"} description="服务端已有任务未知，为防止覆盖已禁用保存。请关闭弹窗后重试。" />
-        ) : null}
-        {tasksLoadState === "loading" ? <div style={{ color: "#525252", marginBottom: 8 }}>正在加载任务快照…（快照就绪前保存保持禁用，防止覆盖已有任务）</div> : null}
-        {!pointsDesc ? (
-          tasksLoadState === "loading"
-            ? <div style={{ color: "#525252" }}>加载资源…</div>
-            : <Alert type="error" message="资源描述加载失败" description="描述缺失时选型无合法依据，已禁用保存（不会覆盖已有任务）。请关闭弹窗后重试。" style={{ marginBottom: 8 }} />
-        ) : (
-          <>
-            <div style={{ marginBottom: 12, display: "flex", gap: 8, alignItems: "center" }}>
-              <span style={{ fontSize: 12 }}>采集周期</span>
-              <InputNumber min={10} max={60000} step={10} value={intervalMs} onChange={(v) => setIntervalMs(v ?? 1000)} addonAfter="ms" style={{ width: 180 }} />
-              <span style={{ fontSize: 12, color: "#525252" }}>10ms–60s，20ms已通过50K/s压测</span>
-            </div>
-            <ResourcePickerAntd
-              resources={pointsDesc.resources}
-              existingKeys={pointsSels.flatMap((s) => s.outputs.map((o) => o.point_key))}
-              selectionMethods={pointsDesc.resource_selection_methods}
-              endpointId={pointsEp?.id}
-              onAdd={(s) => {
-                const keys = s.outputs.map((o) => o.point_key);
-                const dup = pointsSels.some((ex) => ex.outputs.some((o) => keys.includes(o.point_key)));
-                if (dup) {
-                  message.warning(`point_key 重复：${keys.join(", ")} 已存在`);
-                  return false;
-                }
-                setPointsSels((p) => [...p, s]);
-                return true;
-              }}
-            />
-            <div style={{ marginTop: 12, fontSize: 12, color: "#525252" }}>已选 {pointsSels.length} 项 · {intervalMs}ms 轮询 · 保存将执行 Stop → PUT /tasks/{pointsEp?.id} → Start <Button size="small" onClick={() => setPointsSels([])} style={{ marginLeft: 8 }}>清空</Button></div>
-            {preservedTasks.length > 0 && (
-              <div style={{ marginTop: 8, fontSize: 12, color: "#525252" }}>
-                以下任务不在此编辑、保存时原样保留：
-                {preservedTasks.map((t) => (
-                  <Tag key={t.id} style={{ marginLeft: 6 }}>{t.id} · {t.binding.kind} · {t.mode}</Tag>
-                ))}
-              </div>
-            )}
-            {!!pointsSels.length && (
-              <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
-                {pointsSels.map((s, idx) => (
-                  <div key={idx} style={{ display: "flex", gap: 8, alignItems: "center", padding: 6, border: "1px solid #e0e0e0", borderRadius: 0 }}>
-                    <span style={{ flex: 1, fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}>{s.resource_id} → {s.outputs.map((o) => o.point_key).join(", ")} <span style={{ color: "#525252" }}>{JSON.stringify(s.parameters)}</span></span>
-                    <Button size="small" danger onClick={() => setPointsSels((p) => p.filter((_, i) => i !== idx))}>移除</Button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </>
-        )}
       </Modal>
     </div>
   );

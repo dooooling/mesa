@@ -2,6 +2,7 @@
 // 行为与协议语义由后端 contract 保证，这里只断言 Web 不再发明旧假设。
 import { describe, expect, it } from "vitest";
 import {
+  applyEndpointChange,
   buildEndpointCreatePayload,
   buildEndpointUpdatePayload,
   canDeleteDevice,
@@ -16,6 +17,7 @@ import {
   resolveEndpointContexts,
   suggestEndpointId,
   type AcquisitionTaskShape,
+  type LifecycleStepResult,
 } from "./deviceModel";
 
 describe("groupEndpointsByDevice", () => {
@@ -116,6 +118,13 @@ describe("cleanConnection", () => {
   it("Secret marker 原样保留（未触碰时后端按 marker-preserve 保留旧值）", () => {
     expect(cleanConnection({ password: { secret_set: true }, host: "x" })).toEqual({
       password: { secret_set: true },
+      host: "x",
+    });
+  });
+
+  it("clear 标记原样保留（后端按 clear 语义删除 Secret）", () => {
+    expect(cleanConnection({ password: { clear_secret: true }, host: "x" })).toEqual({
+      password: { clear_secret: true },
       host: "x",
     });
   });
@@ -274,5 +283,86 @@ describe("isTaskSnapshotReady", () => {
 
   it("ready + 同 Endpoint 时才可 PUT", () => {
     expect(isTaskSnapshotReady("ready", "ep-1", "ep-1")).toBe(true);
+  });
+});
+
+describe("applyEndpointChange", () => {
+  const ok = (): LifecycleStepResult => ({ ok: true });
+  const fail = (message: string): LifecycleStepResult => ({ ok: false, message });
+
+  it("STOPPED → 直接 apply，绝不 stop/start（保存后仍停止）", async () => {
+    const calls: string[] = [];
+    const out = await applyEndpointChange({
+      wasRunning: false,
+      restart: false,
+      stop: async () => { calls.push("stop"); return ok(); },
+      apply: async () => { calls.push("apply"); return ok(); },
+      start: async () => { calls.push("start"); return ok(); },
+    });
+    expect(out).toEqual({ kind: "applied-stopped", restarted: false });
+    expect(calls).toEqual(["apply"]);
+  });
+
+  it("RUNNING + restart → stop/apply/start 全走", async () => {
+    const calls: string[] = [];
+    const out = await applyEndpointChange({
+      wasRunning: true,
+      restart: true,
+      stop: async () => { calls.push("stop"); return ok(); },
+      apply: async () => { calls.push("apply"); return ok(); },
+      start: async () => { calls.push("start"); return ok(); },
+    });
+    expect(out).toEqual({ kind: "applied-restarted", restarted: true });
+    expect(calls).toEqual(["stop", "apply", "start"]);
+  });
+
+  it("RUNNING + !restart → stop/apply，不 start（保持停止）", async () => {
+    const calls: string[] = [];
+    const out = await applyEndpointChange({
+      wasRunning: true,
+      restart: false,
+      stop: async () => { calls.push("stop"); return ok(); },
+      apply: async () => { calls.push("apply"); return ok(); },
+      start: async () => { calls.push("start"); return ok(); },
+    });
+    expect(out).toEqual({ kind: "applied-stopped", restarted: false });
+    expect(calls).toEqual(["stop", "apply"]);
+  });
+
+  it("stop 500 → 中止，绝不 apply（更不 start）", async () => {
+    const calls: string[] = [];
+    const out = await applyEndpointChange({
+      wasRunning: true,
+      restart: true,
+      stop: async () => { calls.push("stop"); return fail("停止失败（500）"); },
+      apply: async () => { calls.push("apply"); return ok(); },
+      start: async () => { calls.push("start"); return ok(); },
+    });
+    expect(out.kind).toBe("stop-failed");
+    expect(calls).toEqual(["stop"]);
+  });
+
+  it("apply 失败 → 不 start，明确已停止", async () => {
+    const calls: string[] = [];
+    const out = await applyEndpointChange({
+      wasRunning: true,
+      restart: true,
+      stop: async () => { calls.push("stop"); return ok(); },
+      apply: async () => { calls.push("apply"); return fail("点位保存失败"); },
+      start: async () => { calls.push("start"); return ok(); },
+    });
+    expect(out.kind).toBe("apply-failed-stopped");
+    expect(calls).toEqual(["stop", "apply"]);
+  });
+
+  it("start 500 → applied-but-restart-failed（保存成功但恢复运行失败）", async () => {
+    const out = await applyEndpointChange({
+      wasRunning: true,
+      restart: true,
+      stop: async () => ok(),
+      apply: async () => ok(),
+      start: async () => fail("恢复运行失败（500）"),
+    });
+    expect(out.kind).toBe("applied-but-restart-failed");
   });
 });
