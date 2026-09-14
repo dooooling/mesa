@@ -2,7 +2,7 @@
 //（name 缺省时用 id；此前 v.name.trim() 在 undefined 上抛异常后被空
 // catch 当校验失败吞掉，點擊创建毫无反应）。
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { DevicesPage } from "./DevicesPage";
@@ -49,7 +49,11 @@ describe("DevicesPage 新建设备", () => {
     await screen.findByText("暂无设备，先新建设备或走新建向导");
 
     await user.click(screen.getByRole("button", { name: "新建设备" }));
-    await user.type(screen.getByPlaceholderText("device-a"), "device-only");
+    // payload 回归只验证提交值，不验证键盘逐字符输入：一次性 change
+    // 避免 AntD Form/Modal 在 jsdom 下逐键重排把测试推过 5s 墙。
+    fireEvent.change(screen.getByPlaceholderText("device-a"), {
+      target: { value: "device-only" },
+    });
     // 名称输入保持空白（placeholder“默认为 ID”）
     // antd 会在双汉字按钮文本中插入空格（“创 建”），用正则匹配
     await user.click(screen.getByRole("button", { name: /创\s?建/ }));
@@ -70,8 +74,12 @@ describe("DevicesPage 新建设备", () => {
     await screen.findByText("暂无设备，先新建设备或走新建向导");
 
     await user.click(screen.getByRole("button", { name: "新建设备" }));
-    await user.type(screen.getByPlaceholderText("device-a"), "device-a");
-    await user.type(screen.getByPlaceholderText("默认为 ID"), "Device A");
+    fireEvent.change(screen.getByPlaceholderText("device-a"), {
+      target: { value: "device-a" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("默认为 ID"), {
+      target: { value: "Device A" },
+    });
     await user.click(screen.getByRole("button", { name: /创\s?建/ }));
 
     await waitFor(() => {
