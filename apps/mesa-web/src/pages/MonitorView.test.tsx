@@ -53,8 +53,13 @@ describe("MonitorView STALE", () => {
       return { ok: false, status: 500, body: { error: { message: "boom" } } };
     });
     render(<MonitorView />);
+    // 首轮 fetch resolve 需要先 flush microtask：fake timers 下 findByText
+    // 的轮询等不到自动推进的 timer，用 act flush 后再同步断言。
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
     // 首屏有点、无 STALE（5s < 30s）
-    expect(await screen.findByText("k1")).toBeTruthy();
+    expect(screen.getByText("k1")).toBeTruthy();
     expect(screen.queryByText("STALE")).toBeNull();
     // 后续持续失败：不真实跑 30 个 interval（逐个触发 rerender + fetch，
     // CI 上跑到 5.6s 被 5s wall 截掉）；直接把 wall clock 推到 STALE 阈值
