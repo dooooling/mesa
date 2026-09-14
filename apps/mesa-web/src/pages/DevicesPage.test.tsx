@@ -48,7 +48,9 @@ describe("DevicesPage 新建设备", () => {
     );
     await screen.findByText("暂无设备，先新建设备或走新建向导");
 
-    await user.click(screen.getByRole("button", { name: "新建设备" }));
+    // M1 按钮改名“新建设备”→“+ 添加设备”（V2 只保留添加设备入口）：
+    // 按新文案点击，仍验证提交 payload（name 缺省用 id）。
+    await user.click(screen.getByRole("button", { name: "+ 添加设备" }));
     // payload 回归只验证提交值，不验证键盘逐字符输入：一次性 change
     // 避免 AntD Form/Modal 在 jsdom 下逐键重排把测试推过 5s 墙。
     fireEvent.change(screen.getByPlaceholderText("device-a"), {
@@ -73,7 +75,9 @@ describe("DevicesPage 新建设备", () => {
     );
     await screen.findByText("暂无设备，先新建设备或走新建向导");
 
-    await user.click(screen.getByRole("button", { name: "新建设备" }));
+    // M1 按钮改名“新建设备”→“+ 添加设备”（V2 只保留添加设备入口）：
+    // 按新文案点击，仍验证提交 payload（name 缺省用 id）。
+    await user.click(screen.getByRole("button", { name: "+ 添加设备" }));
     fireEvent.change(screen.getByPlaceholderText("device-a"), {
       target: { value: "device-a" },
     });
