@@ -1,7 +1,7 @@
 // PR27 Device-first：Device detail 主页面。下挂该 Device 的 Endpoint cards，
 // Start / Stop / Edit connection / Configure resources 全部作用于 Endpoint。
 // device_id 全页固定来自路由；driver_id 创建后不可改（修改请求无该字段）。
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Alert, Button, Card, Col, Form, Input, InputNumber, Modal, Row, Select, Space, Tag, message } from "antd";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
@@ -12,7 +12,14 @@ import {
   canDeleteDevice,
   cleanConnection,
   isRunningState,
+  isTaskSnapshotReady,
+  mergeAcquisitionTasks,
+  selectionsOf,
+  splitAcquisitionTasks,
+  type AcquisitionTaskShape,
   type Device,
+  type ResourceSelection,
+  type TaskSnapshotState,
 } from "../deviceModel";
 import { DescriptorFields, materializeSchemaDefaults } from "../components/DescriptorFields";
 import { ResourcePickerAntd } from "../components/ResourcePickerAntd";
@@ -35,12 +42,6 @@ interface Endpoint {
   state?: string;
   connection?: Record<string, unknown>;
 }
-
-type Selection = {
-  resource_id: string;
-  parameters: Record<string, unknown>;
-  outputs: Array<{ output: string; point_key: string }>;
-};
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -72,12 +73,22 @@ export function DeviceDetailPage() {
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameForm] = Form.useForm();
 
-  // 点位配置
+  // 点位配置（单任务编辑器）：只编辑 canonical 任务，其余任务原样保留，
+  // 绝不因 PUT 全量替换而误删 task-b/task-c（P0 数据安全）。
   const [pointsOpen, setPointsOpen] = useState(false);
   const [pointsEp, setPointsEp] = useState<Endpoint | null>(null);
   const [pointsDesc, setPointsDesc] = useState<DriverDescriptor | null>(null);
-  const [pointsSels, setPointsSels] = useState<Selection[]>([]);
+  const [pointsSels, setPointsSels] = useState<ResourceSelection[]>([]);
+  const [existingTasks, setExistingTasks] = useState<AcquisitionTaskShape[]>([]);
+  const [preservedTasks, setPreservedTasks] = useState<AcquisitionTaskShape[]>([]);
   const [intervalMs, setIntervalMs] = useState(1000);
+  // 任务快照门（P0 fail-closed）：只有 ready + 归属当前 Endpoint 才允许 PUT。
+  // loading/error 一律禁用保存，绝不能把 [] 当作“服务端没有任务”。
+  const [tasksLoadState, setTasksLoadState] = useState<TaskSnapshotState>("idle");
+  const [tasksLoadedEpId, setTasksLoadedEpId] = useState<string | null>(null);
+  const [tasksLoadError, setTasksLoadError] = useState("");
+  // 打开序号：丢弃过期请求的回包，避免切 Endpoint 后旧快照污染新编辑器。
+  const pointsSeq = useRef(0);
 
   const load = async () => {
     try {
@@ -285,38 +296,77 @@ export function DeviceDetailPage() {
   };
 
   const openPoints = async (ep: Endpoint) => {
+    const seq = ++pointsSeq.current;
     setPointsEp(ep);
     setPointsSels([]);
+    setExistingTasks([]);
+    setPreservedTasks([]);
     setIntervalMs(1000);
+    setPointsDesc(null);
+    // 先进入 loading：快照未知前保存键保持禁用（fail-closed）。
+    setTasksLoadState("loading");
+    setTasksLoadedEpId(null);
+    setTasksLoadError("");
     setPointsOpen(true);
-    const r = await fetch(`/api/v1/drivers/${ep.driver_id}/descriptor`).then((x) => x.json()).catch(() => null);
-    setPointsDesc(r);
-    fetch(`/api/v1/tasks?endpoint=${ep.id}`).then((x) => x.json()).then((j) => {
-      const tasks: Array<{ interval_ms?: number; binding: { kind: string; config: { selections?: Selection[] } } }> = j.tasks ?? [];
-      if (tasks.length) {
-        const first = tasks[0];
-        if (first) setIntervalMs(first.interval_ms ?? 1000);
-        // 回显只理解 mesa.resources.v1 canonical 形态
-        if (first?.binding.kind === "mesa.resources.v1") {
-          const sels = first.binding.config?.selections;
-          if (sels?.length) setPointsSels(sels);
-        }
-        message.info(`已回显 ${tasks.length} 任务`);
+    // Descriptor + Task 快照并行加载；二者都成功才开放保存（任一失败都保持禁用）。
+    const [desc, tasksRes] = await Promise.all([
+      fetch(`/api/v1/drivers/${ep.driver_id}/descriptor`).then((x) => x.json()).catch(() => null),
+      fetch(`/api/v1/tasks?endpoint=${ep.id}`).then(async (x) => {
+        if (!x.ok) throw new Error(`GET /tasks ${x.status}`);
+        return (await x.json()) as { tasks?: AcquisitionTaskShape[] };
+      }).catch((e) => ({ error: e as unknown })),
+    ]);
+    // 过期请求直接丢弃（用户已打开另一个 Endpoint 的编辑器）。
+    if (pointsSeq.current !== seq) return;
+    // 只接受形态合法的 Descriptor：错误包（如 {error: ...}）不得 masquerade 成描述，
+    // 否则既可能 crash 选型器，又会错误放行下面的 Descriptor 保存门。
+    if (desc && Array.isArray((desc as { resources?: unknown }).resources)) setPointsDesc(desc);
+    if (tasksRes && !(tasksRes as { error?: unknown }).error) {
+      const tasks = ((tasksRes as { tasks?: AcquisitionTaskShape[] }).tasks ?? []) as AcquisitionTaskShape[];
+      setExistingTasks(tasks);
+      // 只回显 canonical 任务；其余任务保留且不在此编辑（P0：防误删）
+      const { editable, preserved } = splitAcquisitionTasks(tasks);
+      setPreservedTasks(preserved);
+      if (editable) {
+        if (editable.mode === "poll") setIntervalMs(editable.interval_ms ?? 1000);
+        const sels = selectionsOf(editable);
+        if (sels.length) setPointsSels(sels);
       }
-    }).catch(() => {});
+      // 快照就绪：只有此时保存键才允许 PUT（空数组即服务端真的无任务）。
+      setTasksLoadedEpId(ep.id);
+      setTasksLoadState("ready");
+      if (tasks.length) {
+        message.info(
+          preserved.length
+            ? `已回显 canonical 任务，另有 ${preserved.length} 个任务将被保留（${preserved.map((t) => t.id).join("、")}）`
+            : `已回显 ${tasks.length} 任务`,
+        );
+      }
+    } else {
+      // Task 快照失败：fail-closed——显示错误并禁用保存，不拿 [] 去覆盖服务端。
+      setTasksLoadState("error");
+      setTasksLoadError("任务快照加载失败：服务端任务集未知，已禁用保存（关闭后重试，不会覆盖已有任务）。");
+    }
   };
 
   const savePoints = async () => {
-    if (!pointsEp || !pointsSels.length) return message.warning("请先加入点位");
-    // 只发 mesa.resources.v1 canonical 形态，合法性由 Core 门禁裁决
-    const tasks = [
-      {
-        id: "t1",
-        mode: "poll",
-        interval_ms: intervalMs,
-        binding: { kind: "mesa.resources.v1", config: { selections: pointsSels } },
-      },
-    ];
+    if (!pointsEp) return;
+    // 快照门：pending / 失败 / 串 Endpoint 一律不可 PUT。
+    if (!isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, pointsEp.id)) {
+      if (tasksLoadState === "error") return message.error("任务快照加载失败，禁止保存以防覆盖已有任务。请关闭重试。");
+      return message.warning("任务快照加载中，禁止保存以防覆盖已有任务。请稍候。");
+    }
+    // 描述门：Descriptor 未就绪同样不可 PUT（选型无合法依据，禁止凭空回写）。
+    if (!pointsDesc) {
+      return tasksLoadState === "loading"
+        ? message.warning("资源描述加载中，禁止保存。请稍候。")
+        : message.error("资源描述加载失败，禁止保存。请关闭重试。");
+    }
+    if (!pointsSels.length) return message.warning("请先加入点位");
+    // 只发 mesa.resources.v1 canonical 形态，其它任务逐字保留；
+    // 合法性由 Core 门禁裁决
+    const tasks = mergeAcquisitionTasks(existingTasks, { interval_ms: intervalMs, selections: pointsSels });
+    const preservedCount = tasks.length - 1;
     await api.stopEndpoint(pointsEp.id).catch(() => {});
     const r = await fetch(`/api/v1/tasks/${pointsEp.id}`, {
       method: "PUT",
@@ -325,7 +375,7 @@ export function DeviceDetailPage() {
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) return message.error(j.error?.message ?? "点位保存失败");
-    message.success("点位已保存，正在启动…");
+    message.success(preservedCount > 0 ? `点位已保存（另保留 ${preservedCount} 个任务），正在启动…` : "点位已保存，正在启动…");
     await api.startEndpoint(pointsEp.id);
     setPointsOpen(false);
     load();
@@ -435,8 +485,16 @@ export function DeviceDetailPage() {
         </Form>
       </Modal>
 
-      <Modal title={`点位 · ${pointsEp?.id ?? ""}`} open={pointsOpen} onOk={savePoints} onCancel={() => setPointsOpen(false)} okText="保存并启动" width={720} destroyOnHidden>
-        {!pointsDesc ? <div style={{ color: "#525252" }}>加载资源…</div> : (
+      <Modal title={`点位 · ${pointsEp?.id ?? ""}`} open={pointsOpen} onOk={savePoints} onCancel={() => setPointsOpen(false)} okText="保存并启动" width={720} destroyOnHidden okButtonProps={{ disabled: !pointsEp || !pointsDesc || !isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, pointsEp.id) }}>
+        {tasksLoadState === "error" ? (
+          <Alert type="error" message={tasksLoadError || "任务快照加载失败"} description="服务端已有任务未知，为防止覆盖已禁用保存。请关闭弹窗后重试。" />
+        ) : null}
+        {tasksLoadState === "loading" ? <div style={{ color: "#525252", marginBottom: 8 }}>正在加载任务快照…（快照就绪前保存保持禁用，防止覆盖已有任务）</div> : null}
+        {!pointsDesc ? (
+          tasksLoadState === "loading"
+            ? <div style={{ color: "#525252" }}>加载资源…</div>
+            : <Alert type="error" message="资源描述加载失败" description="描述缺失时选型无合法依据，已禁用保存（不会覆盖已有任务）。请关闭弹窗后重试。" style={{ marginBottom: 8 }} />
+        ) : (
           <>
             <div style={{ marginBottom: 12, display: "flex", gap: 8, alignItems: "center" }}>
               <span style={{ fontSize: 12 }}>采集周期</span>
@@ -446,6 +504,8 @@ export function DeviceDetailPage() {
             <ResourcePickerAntd
               resources={pointsDesc.resources}
               existingKeys={pointsSels.flatMap((s) => s.outputs.map((o) => o.point_key))}
+              selectionMethods={pointsDesc.resource_selection_methods}
+              endpointId={pointsEp?.id}
               onAdd={(s) => {
                 const keys = s.outputs.map((o) => o.point_key);
                 const dup = pointsSels.some((ex) => ex.outputs.some((o) => keys.includes(o.point_key)));
@@ -458,6 +518,14 @@ export function DeviceDetailPage() {
               }}
             />
             <div style={{ marginTop: 12, fontSize: 12, color: "#525252" }}>已选 {pointsSels.length} 项 · {intervalMs}ms 轮询 · 保存将执行 Stop → PUT /tasks/{pointsEp?.id} → Start <Button size="small" onClick={() => setPointsSels([])} style={{ marginLeft: 8 }}>清空</Button></div>
+            {preservedTasks.length > 0 && (
+              <div style={{ marginTop: 8, fontSize: 12, color: "#525252" }}>
+                以下任务不在此编辑、保存时原样保留：
+                {preservedTasks.map((t) => (
+                  <Tag key={t.id} style={{ marginLeft: 6 }}>{t.id} · {t.binding.kind} · {t.mode}</Tag>
+                ))}
+              </div>
+            )}
             {!!pointsSels.length && (
               <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
                 {pointsSels.map((s, idx) => (

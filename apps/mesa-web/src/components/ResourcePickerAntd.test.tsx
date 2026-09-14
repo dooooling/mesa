@@ -101,3 +101,35 @@ describe("ResourcePickerAntd（mock driver）", () => {
     expect(screen.getByDisplayValue("register.value")).toBeTruthy();
   });
 });
+
+describe("ResourcePickerAntd 选型模式（resource_selection_methods 声明驱动）", () => {
+  it("只声明 manual 时无 tab 壳（老布局零变化）", () => {
+    const onAdd = vi.fn((_sel: unknown): boolean => true);
+    render(
+      <ResourcePickerAntd resources={MOCK_RESOURCES} existingKeys={[]} onAdd={onAdd} selectionMethods={["manual"]} />,
+    );
+    expect(screen.queryByText("浏览")).toBeNull();
+    expect(screen.getByText(/加\s*入/)).toBeTruthy();
+  });
+
+  it("声明 browse 时出现浏览页（需要 endpointId）", async () => {
+    (globalThis as { fetch?: unknown }).fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ nodes: [], next_cursor: null }),
+    }));
+    const onAdd = vi.fn((_sel: unknown): boolean => true);
+    render(
+      <ResourcePickerAntd
+        resources={MOCK_RESOURCES}
+        existingKeys={[]}
+        onAdd={onAdd}
+        selectionMethods={["manual", "browse"]}
+        endpointId="ep1"
+      />,
+    );
+    fireEvent.click(screen.getByText("浏览"));
+    // Browse 页骨架：位置 + 过滤 + 浏览按钮
+    expect(await screen.findByText("位置")).toBeTruthy();
+    expect(screen.getByPlaceholderText("过滤")).toBeTruthy();
+  });
+});

@@ -1,6 +1,6 @@
 // PR8 Gate（组件）：历史首屏 + mesa-event SSE 帧出现 + history/SSE 同 seq 去重 + filter 切换重置。
 import { describe, expect, it, vi, beforeEach, afterEach, type Mock } from "vitest";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { api } from "../api";
 import type { StoredEvent } from "../types";
@@ -205,7 +205,6 @@ describe("EventsView", () => {
   });
 
   it("P1-1：filter 切换后旧 loadOlder 被忽略（不污染新页面）", async () => {
-    const user = userEvent.setup();
     render(<EventsView />);
     await screen.findByText("msg-3");
     let resolveOlder!: (v: { events: StoredEvent[]; next_cursor: number | null }) => void;
@@ -216,9 +215,13 @@ describe("EventsView", () => {
       if (filter.kind?.includes("zz")) return Promise.resolve({ events: [], next_cursor: null });
       return Promise.resolve({ ...historyPage([5, 4, 3]), next_cursor: 2 });
     });
-    await user.click(screen.getByRole("button", { name: "加载更早" }));
-    // 切 filter：reload 立即完成并清空旧页
-    await user.type(screen.getByPlaceholderText("Kind（精确匹配，如 alarm.condition）"), "zz");
+    await userEvent.setup().click(screen.getByRole("button", { name: "加载更早" }));
+    // 切 filter：一次 change 即切换 generation 并清空旧页（concurrency contract
+    // 只要求“切换即隔离”，不验证真实键盘逐字符输入；逐字符 onChange 会触发
+    // 多次 reload + AntD Table 重排，把键盘事件性能混进并发测试导致 CI 超时）。
+    fireEvent.change(screen.getByPlaceholderText("Kind（精确匹配，如 alarm.condition）"), {
+      target: { value: "zz" },
+    });
     await waitFor(() => expect(screen.queryByText("msg-5")).toBeNull());
     // 旧 older 迟到：必须被忽略
     await act(async () => {

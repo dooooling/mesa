@@ -10,7 +10,12 @@ import {
   groupEndpointsByDevice,
   isDriverChangeAttempt,
   isRunningState,
+  isTaskSnapshotReady,
+  mergeAcquisitionTasks,
+  splitAcquisitionTasks,
+  resolveEndpointContexts,
   suggestEndpointId,
+  type AcquisitionTaskShape,
 } from "./deviceModel";
 
 describe("groupEndpointsByDevice", () => {
@@ -136,5 +141,138 @@ describe("isRunningState", () => {
     expect(isRunningState("reconnecting")).toBe(true);
     expect(isRunningState("STOPPED")).toBe(false);
     expect(isRunningState(undefined)).toBe(false);
+  });
+});
+
+describe("resolveEndpointContexts", () => {
+  const devices = [
+    { id: "device-a", name: "CNC-01" },
+    { id: "device-b", name: "Simulator" },
+  ];
+  it("endpoint 经 device_id 反查设备名（Device → Endpoint → Point）", () => {
+    const ctx = resolveEndpointContexts(
+      [
+        { id: "a-nck", name: "NCK", device_id: "device-a" },
+        { id: "b-sim", device_id: "device-b" },
+      ],
+      devices,
+    );
+    expect(ctx.get("a-nck")).toEqual({
+      endpointId: "a-nck",
+      endpointName: "NCK",
+      deviceId: "device-a",
+      deviceName: "CNC-01",
+    });
+    // endpoint 名缺失回落 id
+    expect(ctx.get("b-sim")?.endpointName).toBe("b-sim");
+    expect(ctx.get("b-sim")?.deviceName).toBe("Simulator");
+  });
+
+  it("Device 缺失时回落显示 device_id，不编造归属", () => {
+    const ctx = resolveEndpointContexts([{ id: "x", device_id: "gone" }], devices);
+    expect(ctx.get("x")?.deviceName).toBe("gone");
+  });
+
+  it("device_id 缺失时设备显示占位", () => {
+    const ctx = resolveEndpointContexts([{ id: "orphan" }], devices);
+    expect(ctx.get("orphan")).toMatchObject({ deviceId: "", deviceName: "—" });
+  });
+});
+
+const canon = (id: string, extra?: Partial<AcquisitionTaskShape>): AcquisitionTaskShape => ({
+  id,
+  mode: "poll",
+  interval_ms: 1000,
+  binding: {
+    kind: "mesa.resources.v1",
+    config: { selections: [{ resource_id: "r", parameters: {}, outputs: [] }] },
+  },
+  ...extra,
+});
+
+const other = (id: string): AcquisitionTaskShape => ({
+  id,
+  mode: "poll",
+  interval_ms: 500,
+  binding: { kind: "driver.native.v1", config: { op: "scan" } },
+});
+
+describe("splitAcquisitionTasks", () => {
+  it("首个 canonical 归编辑，其余归保留（task-a/b/c 场景）", () => {
+    const { editable, preserved } = splitAcquisitionTasks([canon("task-a"), other("task-b"), other("task-c")]);
+    expect(editable?.id).toBe("task-a");
+    expect(preserved.map((t) => t.id)).toEqual(["task-b", "task-c"]);
+  });
+
+  it("无 canonical 时 editable 为空、全部保留", () => {
+    const { editable, preserved } = splitAcquisitionTasks([other("task-b"), other("task-c")]);
+    expect(editable).toBeNull();
+    expect(preserved.map((t) => t.id)).toEqual(["task-b", "task-c"]);
+  });
+
+  it("多个 canonical 时只取第一个编辑，第二个保留", () => {
+    const { editable, preserved } = splitAcquisitionTasks([canon("c1"), canon("c2")]);
+    expect(editable?.id).toBe("c1");
+    expect(preserved.map((t) => t.id)).toEqual(["c2"]);
+  });
+});
+
+describe("mergeAcquisitionTasks", () => {
+  const sel = [{ resource_id: "r2", parameters: {}, outputs: [] }];
+
+  it("更新沿用原 canonical id，其它任务逐字保留（核心回归）", () => {
+    const out = mergeAcquisitionTasks([canon("task-a"), other("task-b"), other("task-c")], {
+      interval_ms: 2000,
+      selections: sel,
+    });
+    expect(out.map((t) => t.id).sort()).toEqual(["task-a", "task-b", "task-c"]);
+    const a = out.find((t) => t.id === "task-a")!;
+    expect(a.interval_ms).toBe(2000);
+    expect((a.binding.config as { selections: unknown }).selections).toEqual(sel);
+    // 被保留任务逐字不动（含自定义 binding）
+    expect(out.find((t) => t.id === "task-b")).toEqual(other("task-b"));
+    expect(out.find((t) => t.id === "task-c")).toEqual(other("task-c"));
+  });
+
+  it("空集保存即新增 t1", () => {
+    const out = mergeAcquisitionTasks([], { interval_ms: 1000, selections: sel });
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe("t1");
+    expect(out[0].binding.kind).toBe("mesa.resources.v1");
+  });
+
+  it("t1 被占用时避让为 t1-2", () => {
+    const out = mergeAcquisitionTasks([other("t1")], { interval_ms: 1000, selections: sel });
+    expect(out.map((t) => t.id).sort()).toEqual(["t1", "t1-2"]);
+  });
+
+  it("外来 subscribe canonical 不被默默翻成 poll，周期也保留", () => {
+    const sub = canon("sub-1", { mode: "subscribe", interval_ms: null });
+    const out = mergeAcquisitionTasks([sub], { interval_ms: 1000, selections: sel });
+    expect(out).toHaveLength(1);
+    expect(out[0].mode).toBe("subscribe");
+    expect(out[0].interval_ms).toBeNull();
+  });
+});
+
+describe("isTaskSnapshotReady", () => {
+  it("快照 pending（idle/loading）时不可 PUT（P0-1 回归：慢请求窗口）", () => {
+    expect(isTaskSnapshotReady("idle", null, "ep-1")).toBe(false);
+    expect(isTaskSnapshotReady("loading", null, "ep-1")).toBe(false);
+  });
+
+  it("快照失败（error）时不可 PUT（P0-1 回归：失败请求路径）", () => {
+    expect(isTaskSnapshotReady("error", null, "ep-1")).toBe(false);
+    // 即使有旧 loaded id，只要状态不是 ready 同样不可写
+    expect(isTaskSnapshotReady("error", "ep-1", "ep-1")).toBe(false);
+  });
+
+  it("ready 但串 Endpoint 时不可 PUT（旧快照不得污染新编辑器）", () => {
+    expect(isTaskSnapshotReady("ready", "ep-1", "ep-2")).toBe(false);
+    expect(isTaskSnapshotReady("ready", null, "ep-1")).toBe(false);
+  });
+
+  it("ready + 同 Endpoint 时才可 PUT", () => {
+    expect(isTaskSnapshotReady("ready", "ep-1", "ep-1")).toBe(true);
   });
 });
