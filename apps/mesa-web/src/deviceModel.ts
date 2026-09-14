@@ -23,6 +23,15 @@ export function isRunningState(state?: string): boolean {
   return ["RUNNING", "CONNECTING", "RECONNECTING"].includes((state ?? "").toUpperCase());
 }
 
+/**
+ * 严格运行中（仅 RUNNING）。Dashboard“运行中”计数用此口径：
+ * CONNECTING / RECONNECTING 是过渡态，不得计入在线；过渡态在启停按钮
+ * 侧仍视为忙（isRunningState），避免重复启动。
+ */
+export function isStrictlyRunning(state?: string): boolean {
+  return (state ?? "").toUpperCase() === "RUNNING";
+}
+
 // ---------------------------------------------------------------------------
 // Monitor 语义（P0-3）：Device → Endpoint → Point 三级，文案不得把 Endpoint
 // 叫成“设备”。由 endpoint 归属 device_id 反查设备名；归属缺失时如实展示。
@@ -339,4 +348,55 @@ export async function applyEndpointChange(args: {
   const r = await args.start();
   if (!r.ok) return { kind: "applied-but-restart-failed", message: r.message ?? "配置已保存，但恢复运行失败" };
   return { kind: "applied-restarted", restarted: true };
+}
+
+// ---------------------------------------------------------------------------
+// Monitor 展示（P1-10）：类型感知的值渲染 + 更新年龄 + 过期指示。
+// 全量拉取是当前后端的唯一形态（/points/latest 无服务端过滤）；这里先做
+// 好客户端展示层（设备/连接下拉、数组摘要、STALE），服务端分页/订阅是后话.
+// ---------------------------------------------------------------------------
+
+/** 超过该年龄未更新即标 STALE（快照停更通常意味着采集已停）。 */
+export const POINT_STALE_AFTER_MS = 30_000;
+
+/**
+ * 类型感知的值渲染：标量直显；数组给长度 + 前 3 项摘要（不把几千点
+ * 全打出来压垮表格）；对象 JSON 截断；超长截断 160 字符。
+ */
+export function formatPointValue(value: unknown, maxLen = 160): string {
+  let s: string;
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "string") {
+    s = value;
+  } else if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    s = String(value);
+  } else if (Array.isArray(value)) {
+    const head = value.slice(0, 3).map((v) => (typeof v === "object" ? JSON.stringify(v) : String(v)));
+    s = `[${value.length}] ${head.join(", ")}${value.length > 3 ? ", …" : ""}`;
+  } else if (typeof value === "object") {
+    try {
+      s = JSON.stringify(value);
+    } catch {
+      s = String(value);
+    }
+  } else {
+    s = String(value);
+  }
+  return s.length > maxLen ? `${s.slice(0, maxLen)}…` : s;
+}
+
+/** timestamp_ns 距 now 的年龄（ms）；非法时间戳返回 null（不瞎标）。 */
+export function pointAgeMs(timestampNs: unknown, nowMs: number): number | null {
+  const n = typeof timestampNs === "number" ? timestampNs : Number(timestampNs);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return nowMs - Math.floor(n / 1e6);
+}
+
+/** 年龄文案：刚刚 / Ns前 / N分钟前；null → 占位。 */
+export function formatAge(ageMs: number | null): string {
+  if (ageMs === null || ageMs < 0) return "—";
+  if (ageMs < 1000) return "刚刚";
+  const s = Math.floor(ageMs / 1000);
+  if (s < 60) return `${s}秒前`;
+  return `${Math.floor(s / 60)}分钟前`;
 }

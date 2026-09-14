@@ -62,15 +62,25 @@ export function DevicesPage() {
       message.warning(`该设备下仍有 ${n} 个连接，请先到设备详情删除关联 Endpoint`);
       return;
     }
-    const r = await api.deleteDevice(id);
-    if (r.status !== 200) {
-      // 后端 RESTRICT 为最终裁决（如竞态下仍有 Endpoint），直接透传服务端文案
-      message.error(r.body?.error?.message ?? "删除失败");
-      load();
-      return;
-    }
-    message.success("已删除设备");
-    load();
+    // 破坏性操作明确确认：说明后果，不可恢复
+    Modal.confirm({
+      title: `删除设备 ${id}？`,
+      content: "设备删除后不可恢复。仍有连接时后端会拒绝，请先清空连接。",
+      okText: "删除",
+      okType: "danger",
+      cancelText: "取消",
+      onOk: async () => {
+        const r = await api.deleteDevice(id);
+        if (r.status !== 200) {
+          // 后端 RESTRICT 为最终裁决（如竞态下仍有 Endpoint），直接透传服务端文案
+          message.error(r.body?.error?.message ?? "删除失败");
+          load();
+          return;
+        }
+        message.success("已删除设备");
+        load();
+      },
+    });
   };
 
   return (

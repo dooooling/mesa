@@ -155,6 +155,18 @@ export function DeviceDetailPage() {
     } catch { /* antd 校验未通过 */ }
   };
 
+  // 破坏性操作明确确认：先停采集再删配置，所属设备保留，不可恢复
+  const deleteEndpoint = (id: string, name?: string) => {
+    Modal.confirm({
+      title: `删除连接 ${name ?? id}？`,
+      content: "将先停止采集并删除该连接的配置与任务；所属设备保留。删除后不可恢复。",
+      okText: "删除",
+      okType: "danger",
+      cancelText: "取消",
+      onOk: () => act(id, "delete"),
+    });
+  };
+
   const act = async (id: string, a: "start" | "stop" | "delete") => {
     if (a === "delete") {
       await api.stopEndpoint(id).catch(() => {});
@@ -216,14 +228,23 @@ export function DeviceDetailPage() {
       message.warning(pre.reason);
       return;
     }
-    const r = await api.deleteDevice(deviceId);
-    if (r.status !== 200) {
-      message.error(r.body?.error?.message ?? "删除失败");
-      load();
-      return;
-    }
-    message.success("已删除设备");
-    nav("/devices");
+    Modal.confirm({
+      title: `删除设备 ${deviceId}？`,
+      content: "设备删除后不可恢复；其连接必须已清空（仍有连接时后端会拒绝）。",
+      okText: "删除",
+      okType: "danger",
+      cancelText: "取消",
+      onOk: async () => {
+        const r = await api.deleteDevice(deviceId);
+        if (r.status !== 200) {
+          message.error(r.body?.error?.message ?? "删除失败");
+          load();
+          return;
+        }
+        message.success("已删除设备");
+        nav("/devices");
+      },
+    });
   };
 
   if (notFound) {
@@ -277,7 +298,7 @@ export function DeviceDetailPage() {
                     {!running
                       ? <Button size="small" type="primary" onClick={() => act(r.id, "start")}>启动</Button>
                       : <Button size="small" onClick={() => act(r.id, "stop")}>停止</Button>}
-                    <Button size="small" danger onClick={() => act(r.id, "delete")}>删除</Button>
+                    <Button size="small" danger onClick={() => deleteEndpoint(r.id, r.name)}>删除</Button>
                   </Space>
                 );
               },

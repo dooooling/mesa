@@ -11,6 +11,10 @@ import {
   groupEndpointsByDevice,
   isDriverChangeAttempt,
   isRunningState,
+  isStrictlyRunning,
+  formatAge,
+  formatPointValue,
+  pointAgeMs,
   isTaskSnapshotReady,
   mergeAcquisitionTasks,
   splitAcquisitionTasks,
@@ -144,12 +148,20 @@ describe("canDeleteDevice", () => {
   });
 });
 
-describe("isRunningState", () => {
-  it("RUNNING/CONNECTING/RECONNECTING 视为在线", () => {
+describe("isRunningState", () => {  it("RUNNING/CONNECTING/RECONNECTING 视为在线", () => {
     expect(isRunningState("RUNNING")).toBe(true);
     expect(isRunningState("reconnecting")).toBe(true);
     expect(isRunningState("STOPPED")).toBe(false);
     expect(isRunningState(undefined)).toBe(false);
+  });
+
+  it("isStrictlyRunning 只认 RUNNING（过渡态不算在线）", () => {
+    expect(isStrictlyRunning("RUNNING")).toBe(true);
+    expect(isStrictlyRunning("running")).toBe(true);
+    expect(isStrictlyRunning("CONNECTING")).toBe(false);
+    expect(isStrictlyRunning("RECONNECTING")).toBe(false);
+    expect(isStrictlyRunning("STOPPED")).toBe(false);
+    expect(isStrictlyRunning(undefined)).toBe(false);
   });
 });
 
@@ -364,5 +376,41 @@ describe("applyEndpointChange", () => {
       start: async () => fail("恢复运行失败（500）"),
     });
     expect(out.kind).toBe("applied-but-restart-failed");
+  });
+});
+
+describe("formatPointValue", () => {
+  it("标量直显、空值占位", () => {
+    expect(formatPointValue(42)).toBe("42");
+    expect(formatPointValue(true)).toBe("true");
+    expect(formatPointValue("abc")).toBe("abc");
+    expect(formatPointValue(null)).toBe("—");
+    expect(formatPointValue(undefined)).toBe("—");
+  });
+
+  it("数组给长度 + 前 3 项摘要，不全量展开", () => {
+    expect(formatPointValue([1, 2, 3])).toBe("[3] 1, 2, 3");
+    expect(formatPointValue([1, 2, 3, 4, 5])).toBe("[5] 1, 2, 3, …");
+    expect(formatPointValue([])).toBe("[0] ");
+  });
+
+  it("对象 JSON 化、超长截断", () => {
+    expect(formatPointValue({ a: 1 })).toBe('{"a":1}');
+    expect(formatPointValue("x".repeat(200)).endsWith("…")).toBe(true);
+  });
+});
+
+describe("pointAgeMs/formatAge", () => {
+  it("ns 转年龄；非法返回 null", () => {
+    expect(pointAgeMs(3_000_000_000, 5000)).toBe(2000);
+    expect(pointAgeMs(undefined, 5000)).toBeNull();
+    expect(pointAgeMs(-5, 5000)).toBeNull();
+  });
+
+  it("文案分级", () => {
+    expect(formatAge(null)).toBe("—");
+    expect(formatAge(500)).toBe("刚刚");
+    expect(formatAge(3000)).toBe("3秒前");
+    expect(formatAge(125000)).toBe("2分钟前");
   });
 });
