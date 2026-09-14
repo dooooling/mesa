@@ -4,10 +4,12 @@
 //   选择经 connection.ts 解析并同步回 URL（`?connection=` 稳定，不漂移）；
 // - 五个 tab 在 M1 只给真实框架（M2/M3 填内容），不复制旧页面。
 import { useEffect, useMemo, useState } from "react";
-import { Alert, Button, Card, Radio, Space, Tabs, Tag, message } from "antd";
+import { Alert, Button, Card, Space, Tabs, Tag } from "antd";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { api } from "../api";
-import { isRunningState, type Device } from "../deviceModel";
+import { isRunningState } from "../deviceModel";
+import { PointDetailDrawer } from "../components/PointDetailDrawer";
+import { DeviceLiveData } from "./DeviceLiveData";
+import { DeviceOverview } from "./DeviceOverview";
 import {
   WORKSPACE_TABS,
   isSingleConnectionTab,
@@ -15,6 +17,11 @@ import {
   resolveEffectiveConnection,
   type WorkspaceTab,
 } from "./connection";
+import {
+  useDeviceWorkspaceData,
+  type DevicePointView,
+  type WorkspaceEndpoint,
+} from "./useDeviceWorkspaceData";
 
 const TAB_LABEL: Record<WorkspaceTab, string> = {
   overview: "概览",
@@ -45,61 +52,25 @@ export function DeviceWorkspacePage() {
   const activeTab: WorkspaceTab = isWorkspaceTab(tab) ? tab : "overview";
   const nav = useNavigate();
   const [params, setParams] = useSearchParams();
-  const [device, setDevice] = useState<Device | null>(null);
-  const [notFound, setNotFound] = useState(false);
-  const [endpoints, setEndpoints] = useState<EndpointSummary[]>([]);
-  const [epError, setEpError] = useState("");
-  // 连接清单就绪前不得碰 URL：endpointIds 为空时任何“回落/归一”判定都是
-  // 基于不完整信息的误判（例如删掉合法的 ?connection=opcua），即上下文漂移。
-  const [epReady, setEpReady] = useState(false);
+  // M2：Overview 与 LiveData 共用同一快照源（单轮询/单 nowMs/单归属判定），
+  // 不再各自 GET /endpoints + /points/latest。
+  const data = useDeviceWorkspaceData(deviceId);
+  const {
+    device,
+    deviceNotFound: notFound,
+    deviceError,
+    endpoints,
+    endpointsReady: epReady,
+    endpointsError: epError,
+    endpointIds: deviceEndpointIds,
+  } = data;
+  const [openPoint, setOpenPoint] = useState<DevicePointView | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    setNotFound(false);
-    setDevice(null);
-    setEpReady(false);
-    api
-      .getDevice(deviceId)
-      .then((d) => {
-        if (!cancelled) setDevice(d as Device);
-      })
-      .catch((e: { status?: number }) => {
-        if (cancelled) return;
-        if (e?.status === 404) setNotFound(true);
-        else message.error("加载设备失败");
-      });
-    api
-      .listEndpoints()
-      .then((j) => {
-        if (cancelled) return;
-        const eps = ((j as { endpoints?: Array<EndpointSummary & { runtime?: { state?: string } }> }).endpoints ?? [])
-          .filter((e) => e.device_id === deviceId)
-          .map((e) => ({
-            id: e.id,
-            name: e.name ?? e.id,
-            driver_id: e.driver_id,
-            device_id: e.device_id,
-            state: e.state ?? e.runtime?.state,
-          }));
-        setEndpoints(eps);
-        setEpError("");
-        setEpReady(true);
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setEndpoints([]);
-          setEpError("连接清单加载失败：当前连接选择可能不完整，请稍后重试。");
-          // 失败同样算“就绪”（信息已完整：确实拿不到清单）：此时 config 的
-          // none 空状态与 URL 归一才是诚实的，不再等待。
-          setEpReady(true);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [deviceId]);
-
-  const endpointIds = useMemo(() => endpoints.map((e) => e.id), [endpoints]);
+  // M1 URL 稳定规则保持：清单未就绪前不动 URL，避免空清单误删合法参数。
+  const endpointIds = useMemo(
+    () => endpoints.filter((e) => (e.device_id ?? "") === deviceId).map((e) => e.id),
+    [endpoints, deviceId],
+  );
   const resolved = useMemo(
     () =>
       resolveEffectiveConnection({
@@ -138,34 +109,72 @@ export function DeviceWorkspacePage() {
     nav(`/devices/${deviceId}/${target}${qs ? `?${qs}` : ""}`);
   };
 
-  if (notFound) {
-    return (
-      <Card size="small" title="设备不存在">
-        <p style={{ color: "#525252" }}>设备 `{deviceId}` 不存在，可能已被删除。</p>
-        <Button type="primary" onClick={() => nav("/devices")}>返回设备列表</Button>
-      </Card>
-    );
-  }
-
   const singleTab = isSingleConnectionTab(activeTab);
   const effectiveId =
     resolved.effective.kind === "single" ? resolved.effective.endpointId : null;
   const activeEndpoint = endpoints.find((e) => e.id === effectiveId) ?? null;
+  // Header 连接数只数归属当前设备的连接（endpoints 全量里可能含其它设备，
+  // M1 只取当前设备时此处 endpointIds 即全量，保持一致即可）。
+  const deviceEndpoints = useMemo(
+    () => endpoints.filter((e) => (e.device_id ?? "") === deviceId),
+    [endpoints, deviceId],
+  );
 
-  const tabItems = WORKSPACE_TABS.map((t) => ({
-    key: t,
-    label: TAB_LABEL[t],
-    children: (
+  // 404 视图必须在全部 hook 之后 early return：notFound 由异步请求后置，
+  // 提前 return 会让本次渲染的 hook 数少于上次（Rendered fewer hooks）。
+  const notFoundView = notFound ? (
+    <Card size="small" title="设备不存在">
+      <p style={{ color: "#525252" }}>设备 `{deviceId}` 不存在，可能已被删除。</p>
+      <Button type="primary" onClick={() => nav("/devices")}>返回设备列表</Button>
+    </Card>
+  ) : null;
+
+  const renderTab = (t: WorkspaceTab) => {
+    if (t === "overview") {
+      return (
+        <DeviceOverview
+          deviceId={deviceId}
+          deviceName={device?.name ?? deviceId}
+          endpoints={deviceEndpoints}
+          endpointIds={endpointIds}
+          points={data.devicePoints}
+          counts={data.counts}
+          onOpenPoint={setOpenPoint}
+        />
+      );
+    }
+    if (t === "data") {
+      return (
+        <DeviceLiveData
+          endpoints={deviceEndpoints}
+          effectiveEndpointId={effectiveId}
+          points={data.devicePoints}
+          pointsError={data.pointsError}
+          onOpenPoint={setOpenPoint}
+          onSelectConnection={selectConnection}
+        />
+      );
+    }
+    return (
       <WorkspaceTabPlaceholder
         tab={t}
         deviceId={deviceId}
         deviceName={device?.name ?? deviceId}
-        endpoints={endpoints}
+        endpoints={deviceEndpoints}
         effective={resolved.effective}
         activeEndpoint={activeEndpoint}
       />
-    ),
+    );
+  };
+
+  const tabItems = WORKSPACE_TABS.map((t) => ({
+    key: t,
+    label: TAB_LABEL[t],
+    children: renderTab(t),
   }));
+
+  // notFound 视图：hook 之后才分支返回，保证每次渲染 hook 数一致。
+  if (notFoundView) return notFoundView;
 
   return (
     <div style={{ display: "grid", gap: 16 }}>
@@ -185,7 +194,7 @@ export function DeviceWorkspacePage() {
         }
       >
         <div style={{ fontSize: 12, color: "#525252" }}>
-          <span data-testid="workspace-connection-count">{endpoints.length} 个连接</span>
+          <span data-testid="workspace-connection-count">{deviceEndpoints.length} 个连接</span>
           {epReady ? (
             resolved.effective.kind === "single" && activeEndpoint
               ? <span data-testid="workspace-connection-context"> · 当前上下文：{activeEndpoint.name ?? activeEndpoint.id}</span>
@@ -212,7 +221,7 @@ export function DeviceWorkspacePage() {
               全部
             </Button>
           )}
-          {endpoints.map((e) => {
+          {deviceEndpoints.map((e) => {
             const active = effectiveId === e.id;
             return (
               <Button
@@ -245,19 +254,30 @@ export function DeviceWorkspacePage() {
       <Card size="small">
         <Tabs activeKey={activeTab} onChange={gotoTab} items={tabItems} />
       </Card>
+
+      {deviceError ? (
+        <Alert type="error" showIcon message="设备加载失败" description={deviceError} />
+      ) : null}
+
+      <PointDetailDrawer
+        deviceId={deviceId}
+        deviceName={device?.name ?? deviceId}
+        point={openPoint}
+        onClose={() => setOpenPoint(null)}
+      />
     </div>
   );
 }
 
-/** M1 占位：五个 tab 的真实框架。M2 填 overview/data，M3 填 events，
- *  M2/M4 填 config（含新增连接），M2 填 diagnostics。 */
+/** M1 占位：events/config/diagnostics 仍为框架。overview/data 已在 M2 实现，
+ *  M3 填 events，M2/M4 填 config（含新增连接），M2 填 diagnostics。 */
 function WorkspaceTabPlaceholder(props: {
   tab: WorkspaceTab;
   deviceId: string;
   deviceName: string;
-  endpoints: EndpointSummary[];
+  endpoints: WorkspaceEndpoint[];
   effective: { kind: string; endpointId?: string };
-  activeEndpoint: EndpointSummary | null;
+  activeEndpoint: WorkspaceEndpoint | null;
 }) {
   const { tab, deviceId, deviceName, endpoints, effective, activeEndpoint } = props;
   const scope =
@@ -267,8 +287,8 @@ function WorkspaceTabPlaceholder(props: {
         ? "暂无连接"
         : `全部连接（${endpoints.length} 个）`;
   const body: Record<WorkspaceTab, string> = {
-    overview: `M2 在此实现设备概览（运行状态/数据健康/需要关注/最近事件/最近数据）。`,
-    data: `M2 在此实现设备实时数据（默认全部连接，可按连接过滤；点行打开 Drawer）。`,
+    overview: `不应出现：overview 已在 M2 实现。`,
+    data: `不应出现：data 已在 M2 实现。`,
     events: `M3 在此实现设备事件（Device = ${deviceName} 自动限定，详情进 Drawer）。`,
     config: `M2/M4 在此实现设备配置（设备改名 + 单连接设置/采集/事件订阅 + 新增连接）。`,
     diagnostics: `M2 在此实现设备诊断（单连接状态 + 采集健康 + 高级诊断折叠）。`,
@@ -279,7 +299,6 @@ function WorkspaceTabPlaceholder(props: {
         {deviceName} <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>{deviceId}</span>
         {" · "}{scope}
       </div>
-      <Radio.Group value={tab} disabled style={{ display: "none" }} />
       <Alert type="info" showIcon message={TAB_LABEL[tab]} description={body[tab]} />
       {effective.kind === "none" && (tab === "config" || tab === "diagnostics") ? (
         <Alert type="warning" showIcon message="该设备暂无连接" description="请先添加连接后再配置或诊断。" />

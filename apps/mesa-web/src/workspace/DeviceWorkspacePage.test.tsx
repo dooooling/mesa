@@ -36,7 +36,14 @@ beforeEach(() => {
 
 function workspaceHandler(url: string) {
   if (url === "/api/v1/devices/cnc-01") return DEV();
+  // M2 共享快照层新增：inventory 全量（devices + endpoints）与 points 快照。
+  if (url === "/api/v1/devices") {
+    return { ok: true, status: 200, json: async () => ({ devices: [{ id: "cnc-01", name: "CNC-01" }] }) };
+  }
   if (url === "/api/v1/endpoints") return EPS();
+  if (url === "/api/v1/points/latest") {
+    return { ok: true, status: 200, json: async () => ({ points: [] }) };
+  }
   return { ok: false, status: 404, json: async () => ({}) };
 }
 
@@ -111,6 +118,10 @@ describe("M1 路由与兼容重定向", () => {
       return { ok: true, status: 200, json: async () => ({ devices: [{ id: "cnc-01", name: "CNC-01" }] }) };
     }
     if (url === "/api/v1/endpoints") return EPS();
+    // M2 共享快照层新增 points 轮询；兼容测试同样 mock，避免 pend 住。
+    if (url === "/api/v1/points/latest") {
+      return { ok: true, status: 200, json: async () => ({ points: [] }) };
+    }
     return { ok: false, status: 404, json: async () => ({}) };
   }
 
