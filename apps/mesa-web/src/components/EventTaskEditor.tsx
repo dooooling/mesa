@@ -79,9 +79,9 @@ function validateDraft(d: DraftGeneric, streams: EventStreamDescriptor[]): strin
   return null;
 }
 
-export function EventTaskEditor() {
+export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string }) {
   const [endpoints, setEndpoints] = useState<EndpointOption[]>([]);
-  const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
+  const [selectedId, setSelectedId] = useState<string | undefined>(fixedEndpointId);
   const [descriptor, setDescriptor] = useState<DriverDescriptor | null>(null);
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [loading, setLoading] = useState(false);
@@ -95,16 +95,17 @@ export function EventTaskEditor() {
   // 否则可能把 A 的事件配置写进 B。
   const loadGen = useRef(0);
 
-  // Endpoint 列表（含运行态；running → 只读）
+  // Endpoint 列表（含运行态；running → 只读）。固定模式（Workspace）下
+  // 列表仅用于取 driver_id/运行态，选择器 UI 隐藏，归属锁定传入 id。
   const refreshEndpoints = useCallback(async () => {
     const j = await api.listEndpoints();
     const list = ((j.endpoints ?? []) as { id: string; driver_id: string; runtime?: { state?: string } }[]).map(
       (e) => ({ id: e.id, driver_id: e.driver_id, running: !!e.runtime && e.runtime.state !== "STOPPED" }),
     );
     setEndpoints(list);
-    if (!selectedId && list.length > 0) setSelectedId(list[0].id);
+    if (!selectedId && !fixedEndpointId && list.length > 0) setSelectedId(list[0].id);
     return list;
-  }, [selectedId]);
+  }, [selectedId, fixedEndpointId]);
 
   useEffect(() => {
     refreshEndpoints().catch((e) => setError(e instanceof Error ? e.message : String(e)));
@@ -218,18 +219,25 @@ export function EventTaskEditor() {
 
   return (
     <div style={{ display: "grid", gap: 12 }}>
-      <Space>
-        <span>Endpoint</span>
-        <Select
-          value={selectedId}
-          onChange={setSelectedId}
-          style={{ minWidth: 240 }}
-          placeholder="选择 Endpoint"
-          options={endpoints.map((e) => ({ value: e.id, label: `${e.id}${e.running ? "（运行中）" : ""}` }))}
-        />
-        {selected ? <Tag>{selected.driver_id}</Tag> : null}
-        {running ? <Tag color="orange">运行中 · 只读</Tag> : <Tag color="green">已停止 · 可编辑</Tag>}
-      </Space>
+      {!fixedEndpointId ? (
+        <Space>
+          <span>Endpoint</span>
+          <Select
+            value={selectedId}
+            onChange={setSelectedId}
+            style={{ minWidth: 240 }}
+            placeholder="选择 Endpoint"
+            options={endpoints.map((e) => ({ value: e.id, label: `${e.id}${e.running ? "（运行中）" : ""}` }))}
+          />
+          {selected ? <Tag>{selected.driver_id}</Tag> : null}
+          {running ? <Tag color="orange">运行中 · 只读</Tag> : <Tag color="green">已停止 · 可编辑</Tag>}
+        </Space>
+      ) : (
+        <Space>
+          {selected ? <Tag>{selected.driver_id}</Tag> : null}
+          {running ? <Tag color="orange">运行中 · 只读</Tag> : <Tag color="green">已停止 · 可编辑</Tag>}
+        </Space>
+      )}
 
       {running ? (
         <Alert type="warning" showIcon message="事件任务只能在 Endpoint 停止状态修改" description="停止设备必须是用户显式动作；本页不会自动 Stop。" />
@@ -240,7 +248,11 @@ export function EventTaskEditor() {
       {loading ? (
         <Card size="small" loading />
       ) : !selected ? (
-        <Alert type="info" showIcon message="请选择 Endpoint" description="选择后加载其事件订阅配置。" />
+        fixedEndpointId ? (
+          <Alert type="warning" showIcon message="Endpoint 不存在" description={`未找到 ${fixedEndpointId}，可能已被删除。`} />
+        ) : (
+          <Alert type="info" showIcon message="请选择 Endpoint" description="选择后加载其事件订阅配置。" />
+        )
       ) : !descriptor ? (
         <Alert
           type="info"
