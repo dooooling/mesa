@@ -8,8 +8,9 @@ import { Alert, Button, Card, Select, Space, Tag } from "antd";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import type { StoredEvent } from "../types";
-import { EMPTY_EVENT_FILTER_FORM, type ActiveFilter, type EventFilterForm } from "../events/filters";
+import { EMPTY_EVENT_FILTER_FORM, type EventFilterForm } from "../events/filters";
 import { useEventFeed } from "../events/useEventFeed";
+import { EventFilterBar } from "../components/EventFilterBar";
 import { EventTable } from "../components/EventTable";
 import { EventDetailDrawer } from "../components/EventDetailDrawer";
 import { EventDiagnostics } from "../components/EventDiagnostics";
@@ -19,7 +20,9 @@ export function GlobalEventsPage() {
   const [params, setParams] = useSearchParams();
   const [devices, setDevices] = useState<Array<{ id: string; name: string }>>([]);
   const [endpoints, setEndpoints] = useState<Array<{ id: string; device_id?: string }>>([]);
-  const [active, setActive] = useState<ActiveFilter>("all");
+  // M3.5：除 endpoint 外的全部后端过滤（Active/时间/高级）收敛到一个 form，
+  // 文本型经 EventFilterBar 400ms debounce 后才进 form（避免每键一次 reload）。
+  const [rest, setRest] = useState<EventFilterForm>(EMPTY_EVENT_FILTER_FORM);
   const [selected, setSelected] = useState<StoredEvent | null>(null);
 
   const deviceParam = params.get("device") ?? "ALL";
@@ -88,19 +91,24 @@ export function GlobalEventsPage() {
     setParams(next);
   };
 
-  // 后端过滤：connection 有值即 endpoint_id；device 只做连接级联（后端无
-  // device_id 过滤——全局页是单源 endpoint/global 查询，不存在设备分页问题；
-  // 若 device 已选而 connection 为 ALL，后端查全局，前端按 device 归属过滤）。
+  // 后端过滤：connection 有值即 endpoint_id；其余全部来自 rest form。
+  // device 只做连接级联（后端无 device_id 过滤——全局页是单源查询，不存在
+  // 设备分页问题；device 已选而 connection 为 ALL 时后端查全局，前端按归属过滤）。
   const form: EventFilterForm = useMemo(
     () => ({
-      ...EMPTY_EVENT_FILTER_FORM,
-      active,
+      ...rest,
       endpoint_id: connectionParam !== "ALL" ? connectionParam : undefined,
     }),
-    [active, connectionParam],
+    [rest, connectionParam],
   );
   const feed = useEventFeed(form);
   const { history, nextCursor, loading, loadingMore, unavailable, error, liveOn } = feed;
+
+  // form 变化即 reload（与旧 EventsView 的 onFilterChange 语义一致）。
+  const onRestChange = (next: EventFilterForm) => {
+    setRest(next);
+    feed.reload({ ...next, endpoint_id: connectionParam !== "ALL" ? connectionParam : undefined });
+  };
 
   // device 限定的前端归属过滤（后端无 device 过滤时）：endpoint→device 查表。
   const deviceOf = useMemo(() => {
@@ -109,8 +117,6 @@ export function GlobalEventsPage() {
     return m;
   }, [endpoints]);
   const visible = useMemo(() => {
-    const onFilterChange = (_: EventFilterForm) => {};
-    void onFilterChange;
     if (deviceParam === "ALL") return history;
     return history.filter((ev) => {
       const owner = deviceOf.get(ev.endpoint_id) ?? "";
@@ -152,17 +158,6 @@ export function GlobalEventsPage() {
               style={{ width: 160 }}
               options={[{ value: "ALL", label: "全部设备" }, ...devices.map((d) => ({ value: d.id, label: d.name ?? d.id }))]}
             />
-            <Select value={connectionParam} onChange={setConnection} style={{ width: 160 }} options={endpointOptions} />
-            <Select
-              value={active}
-              onChange={setActive}
-              style={{ width: 140 }}
-              options={[
-                { value: "all", label: "全部状态" },
-                { value: "active", label: "Active" },
-                { value: "inactive", label: "已清除" },
-              ]}
-            />
             <Button size="small" onClick={() => feed.setLiveOn(!liveOn)}>
               {liveOn ? "暂停实时" : "恢复实时"}
             </Button>
@@ -176,10 +171,16 @@ export function GlobalEventsPage() {
         <div style={{ marginTop: 8 }}>
           <EventDiagnostics stats={feed.stats} />
         </div>
-        <div style={{ marginTop: 8, fontSize: 12, color: "#525252" }}>
-          高级筛选（Category/Kind/Code/Condition/Severity/时间）在 M3.5 与设备事件统一接入。
-        </div>
         <div style={{ marginTop: 8, display: "grid", gap: 12 }}>
+          <EventFilterBar
+            value={rest}
+            onChange={onRestChange}
+            onReset={() => onRestChange(EMPTY_EVENT_FILTER_FORM)}
+            showConnection
+            connectionValue={connectionParam}
+            connectionOptions={endpointOptions}
+            onConnectionChange={setConnection}
+          />
           <EventTable events={visible} loading={loading} onSelect={setSelected} />
           <div style={{ display: "flex", justifyContent: "center" }}>
             <Button onClick={feed.loadOlder} loading={loadingMore} disabled={nextCursor === null || nextCursor === undefined}>

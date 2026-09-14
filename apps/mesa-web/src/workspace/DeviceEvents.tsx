@@ -4,11 +4,14 @@
 //   （query.endpointIds 由 Workspace 传入，不在本组件另起 state）；
 // - 表格/Drawer 共用（EventTable/EventDetailDrawer），endpoint 列保留
 //   （多连接设备需要区分来源），不加设备列（已在设备内）。
+// - M3.5：过滤栏升级为 EventFilterBar（常用 Active/时间 + 高级精确匹配，
+//   文本 400ms debounce），与全局页同一组件。
 import { useMemo, useState } from "react";
-import { Alert, Button, Card, Space, Tag } from "antd";
+import { Alert, Button, Space, Tag } from "antd";
 import type { StoredEvent } from "../types";
-import type { ActiveFilter, EventFilterForm } from "../events/filters";
+import { EMPTY_EVENT_FILTER_FORM, type EventFilterForm } from "../events/filters";
 import { useDeviceEventFeed } from "../events/useDeviceEventFeed";
+import { EventFilterBar } from "../components/EventFilterBar";
 import { EventTable } from "../components/EventTable";
 import { EventDetailDrawer } from "../components/EventDetailDrawer";
 
@@ -20,16 +23,14 @@ export function DeviceEvents(props: {
   effectiveEndpointId: string | null;
 }) {
   const { deviceName, endpointIds, endpointNames, effectiveEndpointId } = props;
-  const [active, setActive] = useState<ActiveFilter>("all");
+  const [rest, setRest] = useState<EventFilterForm>(EMPTY_EVENT_FILTER_FORM);
   const [selected, setSelected] = useState<StoredEvent | null>(null);
 
-  // 其余过滤（M3.3 克制版：Active + 时间以后补齐，先跑通连接限定与合并）。
-  const filter = useMemo(() => ({ active }), [active]);
   const scopedEndpointIds = useMemo(
     () => (effectiveEndpointId ? [effectiveEndpointId] : endpointIds),
     [effectiveEndpointId, endpointIds],
   );
-  const feed = useDeviceEventFeed({ endpointIds: scopedEndpointIds, filter });
+  const feed = useDeviceEventFeed({ endpointIds: scopedEndpointIds, filter: rest });
 
   const statusTag = useMemo(() => {
     if (!feed.liveOn) return <Tag>PAUSED</Tag>;
@@ -39,42 +40,18 @@ export function DeviceEvents(props: {
     return <Tag>{feed.streamStatus.toUpperCase()}</Tag>;
   }, [feed.liveOn, feed.streamStatus]);
 
-  // EventFilterForm 兼容：表格/drawer 不需要 form，这里只为 Active 下拉提供
-  // 与全局一致的三态语义（后端映射见 toEventFilter）。
-  void (null as unknown as EventFilterForm | null);
   void endpointNames;
   void deviceName;
 
   return (
     <div style={{ display: "grid", gap: 12 }}>
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-        <Space>
-          <span style={{ fontSize: 12, color: "#525252" }}>状态</span>
-          <Button
-            size="small"
-            type={active === "all" ? "primary" : "default"}
-            onClick={() => setActive("all")}
-          >
-            全部
-          </Button>
-          <Button
-            size="small"
-            type={active === "active" ? "primary" : "default"}
-            onClick={() => setActive("active")}
-          >
-            Active
-          </Button>
-          <Button
-            size="small"
-            type={active === "inactive" ? "primary" : "default"}
-            onClick={() => setActive("inactive")}
-          >
-            已清除
-          </Button>
-        </Space>
         {statusTag}
         <Button size="small" onClick={() => feed.setLiveOn(!feed.liveOn)}>
           {feed.liveOn ? "暂停实时" : "恢复实时"}
+        </Button>
+        <Button size="small" onClick={() => feed.reload()}>
+          刷新
         </Button>
       </div>
 
@@ -86,6 +63,15 @@ export function DeviceEvents(props: {
         <Alert type="info" showIcon message="该设备暂无连接" description="事件随连接产生，先添加连接后再查看。" />
       ) : null}
 
+      <EventFilterBar
+        value={rest}
+        onChange={setRest}
+        onReset={() => setRest(EMPTY_EVENT_FILTER_FORM)}
+      />
+      <Space style={{ fontSize: 12, color: "#525252" }}>
+        <span>Device = {deviceName}（自动限定）</span>
+      </Space>
+
       <EventTable events={feed.history} loading={feed.loading} onSelect={setSelected} />
       <div style={{ display: "flex", justifyContent: "center" }}>
         <Button onClick={feed.loadOlder} loading={feed.loadingMore} disabled={!feed.hasMore}>
@@ -93,12 +79,6 @@ export function DeviceEvents(props: {
         </Button>
       </div>
       <EventDetailDrawer event={selected} onClose={() => setSelected(null)} />
-
-      <Card size="small" type="inner" title="M3.5 补齐">
-        <div style={{ fontSize: 12, color: "#525252" }}>
-          级别 / 时间 / 高级筛选（Category/Kind/Code/Condition/Severity）在 M3.5 与全局统一接入，查询层已预留 filter。
-        </div>
-      </Card>
     </div>
   );
 }
