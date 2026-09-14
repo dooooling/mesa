@@ -1,7 +1,7 @@
 // P1-4 Workspace 回归：嵌套路由装配 + 五 tab + 面包屑归属 Device。
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { act, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter, Route, Routes, RouterProvider, createMemoryRouter } from "react-router-dom";
 import { EndpointWorkspacePage } from "./EndpointWorkspacePage";
 
 const DESC = {
@@ -123,22 +123,25 @@ describe("EndpointWorkspacePage", () => {
       }
       return { ok: false, status: 404, json: async () => ({}) };
     });
-    // 同一 Workspace 组件 A→B 复用（路由切换不 remount）
-    const { rerender } = render(
-      <MemoryRouter initialEntries={["/devices/device-a/endpoints/a-nck"]}>
-        <Routes>
-          <Route path="/devices/:deviceId/endpoints/:endpointId" element={<EndpointWorkspacePage />} />
-        </Routes>
-      </MemoryRouter>,
+    // 真导航 A→B：同一 Router 内 navigate（MemoryRouter.initialEntries 只在
+    // 初始化生效，rerender 新 initialEntries 并不会导航——旧写法组件仍在 A
+    // 路由，b-sim 请求永远不会产生）。
+    const router = createMemoryRouter(
+      [
+        {
+          path: "/devices/:deviceId/endpoints/:endpointId",
+          element: <EndpointWorkspacePage />,
+        },
+      ],
+      {
+        initialEntries: ["/devices/device-a/endpoints/a-nck"],
+      },
     );
+    render(<RouterProvider router={router} />);
     await waitFor(() => expect(resolvers["a-nck"]).toBeDefined());
-    rerender(
-      <MemoryRouter initialEntries={["/devices/device-a/endpoints/b-sim"]}>
-        <Routes>
-          <Route path="/devices/:deviceId/endpoints/:endpointId" element={<EndpointWorkspacePage />} />
-        </Routes>
-      </MemoryRouter>,
-    );
+    await act(async () => {
+      await router.navigate("/devices/device-a/endpoints/b-sim");
+    });
     await waitFor(() => expect(resolvers["b-sim"]).toBeDefined());
     // B 先回：显示 SIM
     resolvers["b-sim"]();

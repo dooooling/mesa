@@ -60,20 +60,20 @@ describe("EndpointConnectionPane 归属安全", () => {
     await act(async () => {
       resolvers["ep-a"]({ id: "ep-a", name: "A", connection: { host: "10.0.0.1" } });
     });
-    await waitFor(() => expect(screen.getByRole("button", { name: "保存" })).toBeTruthy());
-    expect((screen.getByRole("button", { name: "保存" }) as HTMLButtonElement).disabled).toBe(false);
+    await waitFor(() => expect(screen.getByRole("button", { name: /保\s*存/ })).toBeTruthy());
+    expect((screen.getByRole("button", { name: /保\s*存/ }) as HTMLButtonElement).disabled).toBe(false);
     // 切到 B：B 的 GET 在途，快照复位后保存必须禁用
     rerender(
       <EndpointConnectionPane endpointId="ep-b" deviceId="dev" driverId="drv" initialName="B" onChanged={() => {}} />,
     );
     await waitFor(() => expect(resolvers["ep-b"]).toBeDefined());
-    expect((screen.getByRole("button", { name: "保存" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: /保\s*存/ }) as HTMLButtonElement).disabled).toBe(true);
     // B 回来后恢复可用
     await act(async () => {
       resolvers["ep-b"]({ id: "ep-b", name: "B", connection: { host: "10.0.0.2" } });
     });
     await waitFor(() =>
-      expect((screen.getByRole("button", { name: "保存" }) as HTMLButtonElement).disabled).toBe(false),
+      expect((screen.getByRole("button", { name: /保\s*存/ }) as HTMLButtonElement).disabled).toBe(false),
     );
   });
 
@@ -93,7 +93,7 @@ describe("EndpointConnectionPane 归属安全", () => {
       resolvers["ep-b"]({ id: "ep-b", name: "B", connection: { host: "host-b" } });
     });
     await waitFor(() =>
-      expect((screen.getByRole("button", { name: "保存" }) as HTMLButtonElement).disabled).toBe(false),
+      expect((screen.getByRole("button", { name: /保\s*存/ }) as HTMLButtonElement).disabled).toBe(false),
     );
     // A 后回（host=A）：必须被丢弃，输入框仍是 B 的值
     await act(async () => {
