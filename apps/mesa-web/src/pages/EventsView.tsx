@@ -1,13 +1,14 @@
 // EventsView：全局事件观察面（历史 + SSE 无窗口合并 + 诊断）。
 // 事件订阅配置属于 Endpoint 管理面，已移至 Endpoint Workspace「事件」页，
 // 本页不再承载（contract 分开：观察 vs 配置）。
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+// M3.2：数据机制已抽到 useEventFeed（历史/SSE/代际/merge 原样复用），本页只剩
+// UI 装配（过滤表单 + 表格 + Drawer + 诊断 + endpoint 下拉）。
+import { useEffect, useMemo, useState } from "react";
 import { Alert, Button, Card, Space, Tag } from "antd";
-import { api, isEventStoreUnavailable } from "../api";
-import type { EventStats, StoredEvent } from "../types";
-import { EMPTY_EVENT_FILTER_FORM, EVENT_FIRST_PAGE_LIMIT, toEventFilter, type EventFilterForm } from "../events/filters";
-import { mergeEvents } from "../events/model";
-import { useEventStream } from "../events/useEventStream";
+import { api } from "../api";
+import type { StoredEvent } from "../types";
+import { EMPTY_EVENT_FILTER_FORM, type EventFilterForm } from "../events/filters";
+import { useEventFeed } from "../events/useEventFeed";
 import { EventFilters } from "../components/EventFilters";
 import { EventTable } from "../components/EventTable";
 import { EventDetailDrawer } from "../components/EventDetailDrawer";
@@ -31,30 +32,11 @@ export function matchesLiveFilter(ev: StoredEvent, form: EventFilterForm): boole
 export function EventsView() {
   const [form, setForm] = useState<EventFilterForm>(EMPTY_EVENT_FILTER_FORM);
   const [endpoints, setEndpoints] = useState<string[]>([]);
-  const [history, setHistory] = useState<StoredEvent[]>([]);
-  const [nextCursor, setNextCursor] = useState<number | null>(null);
-  const [highWater, setHighWater] = useState<number>(0);
-  const [booted, setBooted] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [unavailable, setUnavailable] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [liveOn, setLiveOn] = useState(true);
   const [selected, setSelected] = useState<StoredEvent | null>(null);
-  const [stats, setStats] = useState<EventStats | null>(null);
-  // 所有历史请求（首屏/过滤 reload/加载更早）共用一个代际：旧代际结果绝不能覆盖/污染新状态。
-  const histGen = useRef(0);
-  // reload 在途期间到达的 live 行：首屏替换完成时合入，避免被覆盖。
-  const pendingLiveRef = useRef<StoredEvent[]>([]);
-  const formRef = useRef(form);
-  formRef.current = form;
-
-  /** 取出在途 live 行（按新 filter 重过一遍），并清空暂存。 */
-  const drainPendingLive = (next: EventFilterForm): StoredEvent[] => {
-    const live = pendingLiveRef.current.filter((ev) => matchesLiveFilter(ev, next));
-    pendingLiveRef.current = [];
-    return live;
-  };
+  // form 对象身份即 feed 的过滤身份：每次 onChange 产生新对象并 reload，
+  // 与旧“setForm + reloadHistory”语义一致。
+  const feed = useEventFeed(form);
+  const { history, nextCursor, loading, loadingMore, unavailable, error, liveOn } = feed;
 
   // Endpoint 下拉（事件页独立加载，失败不阻塞事件主体）
   useEffect(() => {
@@ -67,131 +49,21 @@ export function EventsView() {
       .catch(() => {});
   }, []);
 
-  // P0-1 冻结顺序：H → 历史页完成 → 最后 setHighWater + setBooted（SSE 在历史完成后才建连）。
-  // 空库 H = 0（seq 自 1 起），SSE 永远 ?after_seq=H，杜绝 live-only 漏事件窗口。
-  useEffect(() => {
-    const id = ++histGen.current;
-    setLoading(true);
-    setError(null);
-    (async () => {
-      try {
-        const h = await api.eventHead();
-        const page = await api.listEvents(toEventFilter(formRef.current, { limit: EVENT_FIRST_PAGE_LIMIT }));
-        if (histGen.current !== id) return;
-        const live = drainPendingLive(formRef.current);
-        setHistory(mergeEvents([...page.events].sort((a, b) => b.seq - a.seq), live));
-        setNextCursor(page.next_cursor);
-        setHighWater(h);
-        setLoading(false);
-        setBooted(true);
-      } catch (e) {
-        if (histGen.current !== id) return;
-        if (isEventStoreUnavailable(e)) setUnavailable(true);
-        else setError(e instanceof Error ? e.message : String(e));
-        setLoading(false);
-        setBooted(true);
-      }
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const reloadHistory = useCallback((next: EventFilterForm) => {
-    const id = ++histGen.current;
-    setLoading(true);
-    setError(null);
-    setNextCursor(null);
-    api
-      .listEvents(toEventFilter(next, { limit: EVENT_FIRST_PAGE_LIMIT }))
-      .then((res) => {
-        if (histGen.current !== id) return;
-        const live = drainPendingLive(next);
-        setHistory(mergeEvents([...res.events].sort((a, b) => b.seq - a.seq), live));
-        setNextCursor(res.next_cursor);
-        setLoading(false);
-      })
-      .catch((e) => {
-        if (histGen.current !== id) return;
-        if (isEventStoreUnavailable(e)) setUnavailable(true);
-        else setError(e instanceof Error ? e.message : String(e));
-        setLoading(false);
-      });
-  }, []);
-
-  const onFilterChange = useCallback(
-    (next: EventFilterForm) => {
-      setForm(next);
-      reloadHistory(next);
-    },
-    [reloadHistory],
-  );
-
-  const loadOlder = useCallback(() => {
-    if (nextCursor === null || nextCursor === undefined || loadingMore) return;
-    // additive 请求不推进代际；但若其间发生过 reload/filter（代际或 filter 对象已变）则丢弃，
-    // 旧 filter 的 older 行绝不混进新页面。
-    const id = histGen.current;
-    const snapshot = formRef.current;
-    setLoadingMore(true);
-    api
-      .listEvents(toEventFilter(snapshot, { before_seq: nextCursor, limit: EVENT_FIRST_PAGE_LIMIT }))
-      .then((res) => {
-        if (id !== histGen.current || formRef.current !== snapshot) {
-          setLoadingMore(false);
-          return;
-        }
-        setHistory((cur) => mergeEvents(cur, res.events));
-        setNextCursor(res.next_cursor);
-        setLoadingMore(false);
-      })
-      .catch((e) => {
-        // stale 失败同样丢弃：旧 filter 的错误绝不显示在新页面，也不碰 loadingMore 之外的状态
-        if (id !== histGen.current || formRef.current !== snapshot) {
-          setLoadingMore(false);
-          return;
-        }
-        if (isEventStoreUnavailable(e)) setUnavailable(true);
-        else setError(e instanceof Error ? e.message : String(e));
-        setLoadingMore(false);
-      });
-  }, [nextCursor, loadingMore]);
-
-  const onLive = useCallback((ev: StoredEvent) => {
-    if (!matchesLiveFilter(ev, formRef.current)) return;
-    pendingLiveRef.current.push(ev);
-    if (pendingLiveRef.current.length > 1000) {
-      pendingLiveRef.current.splice(0, pendingLiveRef.current.length - 1000);
-    }
-    setHistory((cur) => mergeEvents(cur, [ev]));
-  }, []);
-
-  // 诊断轮询（15s；失败静默，页面主体不受影响）
-  useEffect(() => {
-    let stop = false;
-    const tick = () => {
-      api
-        .eventStats()
-        .then((s) => {
-          if (!stop) setStats(s);
-        })
-        .catch(() => {});
-    };
-    tick();
-    const id = window.setInterval(tick, 15000);
-    return () => {
-      stop = true;
-      window.clearInterval(id);
-    };
-  }, []);
-
-  const stream = useEventStream({ afterSeq: highWater, enabled: booted && liveOn && !unavailable, onEvent: onLive });
+  // M3.2：form 对象身份即过滤身份。旧语义“setForm + reloadHistory”收敛为
+  // “setForm 即新 feed”：feed 内部首屏只跑一次挂载，过滤变化走 reload。
+  // 注意 useEventFeed 的首屏 effect 依赖 []，form 变化不会重跑首屏，必须显式 reload。
+  const onFilterChange = (next: EventFilterForm) => {
+    setForm(next);
+    feed.reload(next);
+  };
 
   const statusTag = useMemo(() => {
     if (!liveOn) return <Tag>PAUSED</Tag>;
-    if (stream.status === "live") return <Tag color="green">LIVE ●</Tag>;
-    if (stream.status === "reconnecting") return <Tag color="orange">RECONNECTING</Tag>;
-    if (stream.status === "connecting") return <Tag color="blue">CONNECTING</Tag>;
-    return <Tag>{stream.status.toUpperCase()}</Tag>;
-  }, [liveOn, stream.status]);
+    if (feed.streamStatus === "live") return <Tag color="green">LIVE ●</Tag>;
+    if (feed.streamStatus === "reconnecting") return <Tag color="orange">RECONNECTING</Tag>;
+    if (feed.streamStatus === "connecting") return <Tag color="blue">CONNECTING</Tag>;
+    return <Tag>{feed.streamStatus.toUpperCase()}</Tag>;
+  }, [liveOn, feed.streamStatus]);
 
   return (
     <div style={{ display: "grid", gap: 12 }}>
@@ -205,7 +77,7 @@ export function EventsView() {
         }
         extra={
           <Space>
-            <Button size="small" onClick={() => setLiveOn((v) => !v)}>
+            <Button size="small" onClick={() => feed.setLiveOn(!liveOn)}>
               {liveOn ? "暂停实时" : "恢复实时"}
             </Button>
           </Space>
@@ -216,7 +88,7 @@ export function EventsView() {
         ) : null}
         {error ? <Alert type="error" showIcon message="加载失败" description={error} style={{ marginTop: unavailable ? 8 : 0 }} /> : null}
         <div style={{ marginTop: 8 }}>
-          <EventDiagnostics stats={stats} />
+          <EventDiagnostics stats={feed.stats} />
         </div>
         <div style={{ marginTop: 8, fontSize: 12, color: "#525252" }}>
           事件订阅配置请到“设备 → 连接 → 事件”页管理，本页只做全局观察。
@@ -230,7 +102,7 @@ export function EventsView() {
           />
           <EventTable events={history} loading={loading} onSelect={setSelected} />
           <div style={{ display: "flex", justifyContent: "center" }}>
-            <Button onClick={loadOlder} loading={loadingMore} disabled={nextCursor === null || nextCursor === undefined}>
+            <Button onClick={feed.loadOlder} loading={loadingMore} disabled={nextCursor === null || nextCursor === undefined}>
               {nextCursor === null || nextCursor === undefined ? "没有更多" : "加载更早"}
             </Button>
           </div>
