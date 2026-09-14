@@ -3,15 +3,18 @@
 // 任务，其余任务原样保留（P0 数据安全）；保存 Stop → PUT → Start。
 import { useEffect, useState } from "react";
 import { Button, InputNumber, Tag, message } from "antd";
+import { Alert } from "antd";
 import { api } from "../api";
 import type { DriverDescriptor } from "../types";
 import {
+  isTaskSnapshotReady,
   mergeAcquisitionTasks,
   selectionsOf,
   splitAcquisitionTasks,
   isRunningState,
   type AcquisitionTaskShape,
   type ResourceSelection,
+  type TaskSnapshotState,
 } from "../deviceModel";
 import { ApplyWithRestart } from "./ApplyWithRestart";
 import { ResourcePickerAntd } from "./ResourcePickerAntd";
@@ -32,24 +35,41 @@ export function EndpointAcquisitionPane({
   const [running, setRunning] = useState(false);
   const [intervalMs, setIntervalMs] = useState(1000);
   const [saving, setSaving] = useState(false);
+  // 任务快照门（P0 fail-closed，与 DeviceDetail 点位 Modal 同门）：
+  // 只有 ready + 归属当前 Endpoint 才允许 PUT；loading/error 一律禁用保存，
+  // 绝不能把 [] 当作“服务端没有任务”去覆盖 task-a/b/c。
+  const [tasksLoadState, setTasksLoadState] = useState<TaskSnapshotState>("idle");
+  const [tasksLoadedEpId, setTasksLoadedEpId] = useState<string | null>(null);
+  const [tasksLoadError, setTasksLoadError] = useState("");
 
   useEffect(() => {
-    fetch(`/api/v1/drivers/${driverId}/descriptor`)
-      .then((x) => x.json())
-      .then((d) => setDesc(d))
-      .catch(() => setDesc(null));
-    api.listEndpoints()
-      .then((j) => {
-        const live = ((j as { endpoints?: Array<{ id: string; runtime?: { state?: string }; state?: string }> }).endpoints ?? []).find(
-          (e) => e.id === endpointId,
-        );
-        setRunning(isRunningState(live?.state ?? live?.runtime?.state));
-      })
-      .catch(() => {});
-    fetch(`/api/v1/tasks?endpoint=${endpointId}`)
-      .then((x) => x.json())
-      .then((j) => {
-        const tasks = (j.tasks ?? []) as AcquisitionTaskShape[];
+    // 切 Endpoint 时先复位：旧快照不得污染新窗格（fail-closed 默认禁用保存）。
+    setSels([]);
+    setExistingTasks([]);
+    setPreservedTasks([]);
+    setIntervalMs(1000);
+    setDesc(null);
+    setTasksLoadState("loading");
+    setTasksLoadedEpId(null);
+    setTasksLoadError("");
+    let cancelled = false;
+    // Descriptor + Task 快照并行加载；二者都成功才开放保存。
+    Promise.all([
+      fetch(`/api/v1/drivers/${driverId}/descriptor`)
+        .then((x) => x.json())
+        .catch(() => null),
+      fetch(`/api/v1/tasks?endpoint=${endpointId}`)
+        .then(async (x) => {
+          if (!x.ok) throw new Error(`GET /tasks ${x.status}`);
+          return (await x.json()) as { tasks?: AcquisitionTaskShape[] };
+        })
+        .catch((e) => ({ error: e as unknown })),
+    ]).then(([d, tasksRes]) => {
+      if (cancelled) return;
+      // 只接受形态合法的 Descriptor：错误包不得 masquerade 成描述。
+      if (d && Array.isArray((d as { resources?: unknown }).resources)) setDesc(d);
+      if (tasksRes && !(tasksRes as { error?: unknown }).error) {
+        const tasks = ((tasksRes as { tasks?: AcquisitionTaskShape[] }).tasks ?? []) as AcquisitionTaskShape[];
         setExistingTasks(tasks);
         const { editable, preserved } = splitAcquisitionTasks(tasks);
         setPreservedTasks(preserved);
@@ -58,6 +78,9 @@ export function EndpointAcquisitionPane({
           const s = selectionsOf(editable);
           if (s.length) setSels(s);
         }
+        // 快照就绪：只有此时保存才允许 PUT（空数组即服务端真的无任务）。
+        setTasksLoadedEpId(endpointId);
+        setTasksLoadState("ready");
         if (tasks.length) {
           message.info(
             preserved.length
@@ -65,11 +88,31 @@ export function EndpointAcquisitionPane({
               : `已回显 ${tasks.length} 任务`,
           );
         }
+      } else {
+        // Task 快照失败：fail-closed——显示错误并禁用保存，不拿 [] 去覆盖服务端。
+        setTasksLoadState("error");
+        setTasksLoadError("任务快照加载失败：服务端任务集未知，已禁用保存（请切换后重试，不会覆盖已有任务）。");
+      }
+    });
+    api.listEndpoints()
+      .then((j) => {
+        const live = ((j as { endpoints?: Array<{ id: string; runtime?: { state?: string }; state?: string }> }).endpoints ?? []).find(
+          (e) => e.id === endpointId,
+        );
+        if (!cancelled) setRunning(isRunningState(live?.state ?? live?.runtime?.state));
       })
       .catch(() => {});
+    return () => { cancelled = true; };
   }, [endpointId, driverId]);
 
   const save = async (restart: boolean) => {
+    // 快照门：pending / 失败 / 串 Endpoint 一律不可 PUT。
+    if (!isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, endpointId)) {
+      if (tasksLoadState === "error") return message.error("任务快照加载失败，禁止保存以防覆盖已有任务。请切换后重试。");
+      return message.warning("任务快照加载中，禁止保存以防覆盖已有任务。请稍候。");
+    }
+    // 描述门：Descriptor 未就绪同样不可 PUT（选型无合法依据，禁止凭空回写）。
+    if (!desc) return message.error("资源描述加载失败，禁止保存。请切换后重试。");
     if (!sels.length) return message.warning("请先加入点位");
     const wasRunning = running;
     const tasks = mergeAcquisitionTasks(existingTasks, { interval_ms: intervalMs, selections: sels });
@@ -100,9 +143,17 @@ export function EndpointAcquisitionPane({
     }
   };
 
-  if (!desc) return <div style={{ color: "#525252" }}>加载资源…</div>;
+  if (!desc && tasksLoadState === "loading") return <div style={{ color: "#525252" }}>加载资源…</div>;
   return (
     <div style={{ display: "grid", gap: 12, maxWidth: 860 }}>
+      {tasksLoadState === "error" ? (
+        <Alert type="error" message={tasksLoadError || "任务快照加载失败"} description="服务端已有任务未知，为防止覆盖已禁用保存。请切换后重试。" />
+      ) : null}
+      {tasksLoadState === "loading" ? <div style={{ fontSize: 12, color: "#525252" }}>正在加载任务快照…（快照就绪前保存保持禁用，防止覆盖已有任务）</div> : null}
+      {!desc ? (
+        <Alert type="error" message="资源描述加载失败" description="描述缺失时选型无合法依据，已禁用保存（不会覆盖已有任务）。请切换后重试。" />
+      ) : (
+      <>
       <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
         <span style={{ fontSize: 12 }}>采集周期</span>
         <InputNumber min={10} max={60000} step={10} value={intervalMs} onChange={(v) => setIntervalMs(v ?? 1000)} addonAfter="ms" style={{ width: 180 }} />
@@ -124,6 +175,7 @@ export function EndpointAcquisitionPane({
           return true;
         }}
       />
+      </>)}
       <div style={{ fontSize: 12, color: "#525252" }}>
         已选 {sels.length} 项 · {intervalMs}ms 轮询 · 保存将执行 Stop → PUT /tasks/{endpointId} → Start
         <Button size="small" onClick={() => setSels([])} style={{ marginLeft: 8 }}>清空</Button>
@@ -150,7 +202,7 @@ export function EndpointAcquisitionPane({
         <ApplyWithRestart
           running={running}
           applying={saving}
-          canApply={sels.length > 0}
+          canApply={sels.length > 0 && !!desc && isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, endpointId)}
           applyLabel="保存并启动"
           onApply={save}
         />
