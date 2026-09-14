@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { Card, Input, Select, Space, Table, Tag } from "antd";
-import { resolveEndpointContexts } from "../deviceModel";
+import {
+  POINT_STALE_AFTER_MS,
+  formatAge,
+  formatPointValue,
+  pointAgeMs,
+  resolveEndpointContexts,
+} from "../deviceModel";
 
 type Point = { endpoint_id: string; key: string; point_key?: string; point_id: number; quality: string; type: string; value: unknown; timestamp_ns: number };
 
@@ -12,6 +18,8 @@ export function MonitorView() {
   const [devices, setDevices] = useState<Array<{ id: string; name: string }>>([]);
   const [filter, setFilter] = useState("");
   const [quality, setQuality] = useState<string>("ALL");
+  const [deviceFilter, setDeviceFilter] = useState<string>("ALL");
+  const [endpointFilter, setEndpointFilter] = useState<string>("ALL");
 
   useEffect(() => {
     fetch("/api/v1/devices").then((r) => r.json()).then((j) => setDevices(j.devices ?? [])).catch(() => {});
@@ -30,11 +38,19 @@ export function MonitorView() {
 
   const ctx = useMemo(() => resolveEndpointContexts(endpoints, devices), [endpoints, devices]);
 
+  // 连接下拉随设备级联（设备切换时连接回到全部，避免无匹配死角）
+  const endpointOptions = useMemo(() => {
+    const list = deviceFilter === "ALL" ? endpoints : endpoints.filter((e) => (e.device_id ?? "") === deviceFilter);
+    return [{ value: "ALL", label: "全部连接" }, ...list.map((e) => ({ value: e.id, label: e.name ?? e.id }))];
+  }, [endpoints, deviceFilter]);
+
   const data = points.filter((p) => {
     const k = p.key ?? p.point_key ?? "";
     if (quality !== "ALL" && p.quality !== quality) return false;
-    if (!filter) return true;
     const c = ctx.get(p.endpoint_id);
+    if (deviceFilter !== "ALL" && (c?.deviceId ?? "") !== deviceFilter) return false;
+    if (endpointFilter !== "ALL" && p.endpoint_id !== endpointFilter) return false;
+    if (!filter) return true;
     return (
       k.includes(filter) ||
       p.endpoint_id.includes(filter) ||
@@ -42,13 +58,21 @@ export function MonitorView() {
       (c?.deviceName.includes(filter) ?? false)
     );
   });
+  const now = Date.now();
 
   return (
     <Card
       size="small"
       title={`监控 · ${data.length}/${points.length}`}
       extra={
-        <Space>
+        <Space wrap>
+          <Select
+            value={deviceFilter}
+            onChange={(v) => { setDeviceFilter(v); setEndpointFilter("ALL"); }}
+            style={{ width: 160 }}
+            options={[{ value: "ALL", label: "全部设备" }, ...devices.map((d) => ({ value: d.id, label: d.name ?? d.id }))]}
+          />
+          <Select value={endpointFilter} onChange={setEndpointFilter} style={{ width: 160 }} options={endpointOptions} />
           <Select value={quality} onChange={setQuality} style={{ width: 140 }} options={[{ value: "ALL", label: "全部质量" }, { value: "GOOD", label: "GOOD" }, { value: "BAD", label: "BAD" }, { value: "UNCERTAIN", label: "UNCERTAIN" }]} />
           <Input placeholder="过滤设备/连接/点位" value={filter} onChange={(e) => setFilter(e.target.value)} style={{ width: 180 }} allowClear />
         </Space>
@@ -79,9 +103,21 @@ export function MonitorView() {
             },
           },
           { title: "点位", render: (_: unknown, r: Point) => <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>{r.key ?? r.point_key ?? ""}</span> },
-          { title: "值", render: (_: unknown, r: Point) => String(r.value ?? "") },
+          { title: "值", render: (_: unknown, r: Point) => <span title={String(r.value ?? "")}>{formatPointValue(r.value)}</span> },
           { title: "类型", dataIndex: "type", render: (v: string) => <Tag>{v ?? "—"}</Tag> },
           { title: "质量", dataIndex: "quality", render: (v: string) => <Tag color={v === "GOOD" ? "green" : v === "BAD" ? "red" : "orange"}>{v}</Tag> },
+          {
+            title: "更新",
+            render: (_: unknown, r: Point) => {
+              const age = pointAgeMs(r.timestamp_ns, now);
+              const stale = age !== null && age > POINT_STALE_AFTER_MS;
+              return (
+                <span>
+                  {formatAge(age)}{stale ? <Tag color="orange" style={{ marginLeft: 6 }}>STALE</Tag> : null}
+                </span>
+              );
+            },
+          },
           { title: "时间", render: (_: unknown, r: Point) => new Date(Number(r.timestamp_ns) / 1e6).toLocaleTimeString() },
         ]}
         locale={{ emptyText: "暂无数据 · 请在设备页点 点位 配置并启动" }}
