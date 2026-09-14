@@ -14,7 +14,7 @@ import { AddDeviceFlow } from "./addDevice/AddDeviceFlow";
 import { GlobalDataPage } from "./pages/GlobalDataPage";
 import { GlobalEventsPage } from "./pages/GlobalEventsPage";
 import { OverviewPage } from "./overview/OverviewPage";
-import { SystemPage } from "./pages/V2Placeholders";
+import { SystemPage } from "./system/SystemPage";
 
 const { Header, Sider, Content } = Layout;
 
