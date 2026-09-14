@@ -8,6 +8,7 @@ import { Alert, Button, Card, Space, Tabs, Tag } from "antd";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { isRunningState } from "../deviceModel";
 import { PointDetailDrawer } from "../components/PointDetailDrawer";
+import { DeviceEvents } from "./DeviceEvents";
 import { DeviceLiveData } from "./DeviceLiveData";
 import { DeviceOverview } from "./DeviceOverview";
 import {
@@ -155,6 +156,16 @@ export function DeviceWorkspacePage() {
         />
       );
     }
+    if (t === "events") {
+      return (
+        <DeviceEvents
+          deviceName={device?.name ?? deviceId}
+          endpointIds={endpointIds}
+          endpointNames={new Map(deviceEndpoints.map((e) => [e.id, e.name ?? e.id]))}
+          effectiveEndpointId={effectiveId}
+        />
+      );
+    }
     return (
       <WorkspaceTabPlaceholder
         tab={t}
@@ -289,7 +300,7 @@ function WorkspaceTabPlaceholder(props: {
   const body: Record<WorkspaceTab, string> = {
     overview: `不应出现：overview 已在 M2 实现。`,
     data: `不应出现：data 已在 M2 实现。`,
-    events: `M3 在此实现设备事件（Device = ${deviceName} 自动限定，详情进 Drawer）。`,
+    events: `不应出现：events 已在 M3.3 实现。`,
     config: `M2/M4 在此实现设备配置（设备改名 + 单连接设置/采集/事件订阅 + 新增连接）。`,
     diagnostics: `M2 在此实现设备诊断（单连接状态 + 采集健康 + 高级诊断折叠）。`,
   };
