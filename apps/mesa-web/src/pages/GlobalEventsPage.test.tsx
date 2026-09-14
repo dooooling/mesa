@@ -154,5 +154,6 @@ describe("M3.4 全局事件", () => {
     await waitFor(() => {
       expect(screen.getByTestId("workspace-connection-context").textContent ?? "").toContain("FOCAS");
     });
-  });
+    // 并行 worker 下跨页导航 + 多轮事件链较重，放宽超时（单跑 7s 内稳定）。
+  }, 30000);
 });
