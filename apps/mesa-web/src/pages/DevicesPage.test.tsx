@@ -88,3 +88,43 @@ describe("DevicesPage 新建设备", () => {
     });
   });
 });
+
+describe("DevicesPage 删除设备", () => {
+  it("先弹明确确认，确认后才发 DELETE", async () => {
+    (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      calls.push({ method, url });
+      if (url === "/api/v1/devices" && method === "GET") {
+        return { ok: true, json: async () => ({ devices: [{ id: "device-a", name: "Device A" }] }) };
+      }
+      if (url === "/api/v1/endpoints" && method === "GET") {
+        return { ok: true, json: async () => ({ endpoints: [] }) };
+      }
+      if (method === "DELETE") {
+        return { ok: true, status: 200, json: async () => ({ deleted: "device-a" }) };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    });
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter>
+        <DevicesPage />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Device A");
+
+    await user.click(screen.getByRole("button", { name: /删\s?除/ }));
+    // 确认框说明后果（antd confirm 标题在 header/body 各渲染一次，只断言出现）
+    await waitFor(() => {
+      expect(screen.getAllByText("删除设备 device-a？").length).toBeGreaterThanOrEqual(1);
+    });
+    // 未确认不请求
+    expect(calls.some((c) => c.method === "DELETE")).toBe(false);
+    // 确认框确定按钮（antd 双汉字空格；行内删除按钮同名，取最后一个即确认框）
+    const oks = screen.getAllByRole("button", { name: /删\s?除/ });
+    await user.click(oks[oks.length - 1]);
+    await waitFor(() => {
+      expect(calls.some((c) => c.method === "DELETE" && c.url === "/api/v1/devices/device-a")).toBe(true);
+    });
+  }, 30000);
+});

@@ -2,7 +2,7 @@
 //（路由 /devices/:deviceId/endpoints/:endpointId）。DeviceDetail 只管
 // Device 身份与连接列表；连接的编辑/采集/事件/诊断全部收敛到这里的五个 tab。
 import { useEffect, useRef, useState } from "react";
-import { Breadcrumb, Button, Card, Descriptions, Space, Tabs, Tag, message } from "antd";
+import { Breadcrumb, Button, Card, Descriptions, Modal, Space, Tabs, Tag, message } from "antd";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import type { Device } from "../deviceModel";
@@ -102,6 +102,18 @@ export function EndpointWorkspacePage() {
     }
   };
 
+  // 破坏性操作明确确认：先停采集再删配置，所属设备保留，不可恢复
+  const deleteEndpoint = () => {
+    Modal.confirm({
+      title: `删除连接 ${ep?.name ?? endpointId}？`,
+      content: "将先停止采集并删除该连接的配置与任务；所属设备保留。删除后不可恢复。",
+      okText: "删除",
+      okType: "danger",
+      cancelText: "取消",
+      onOk: () => act("delete"),
+    });
+  };
+
   const act = async (a: "start" | "stop" | "delete") => {
     if (a === "delete") {
       await api.stopEndpoint(endpointId).catch(() => {});
@@ -189,7 +201,7 @@ export function EndpointWorkspacePage() {
             {!running
               ? <Button size="small" type="primary" onClick={() => act("start")}>启动</Button>
               : <Button size="small" onClick={() => act("stop")}>停止</Button>}
-            <Button size="small" danger onClick={() => act("delete")}>删除</Button>
+            <Button size="small" danger onClick={deleteEndpoint}>删除</Button>
           </Space>
         }
       >
