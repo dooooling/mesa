@@ -11,7 +11,8 @@ import { EventsView } from "./pages/EventsView";
 import { DeviceWorkspacePage } from "./workspace/DeviceWorkspacePage";
 import { LegacyEndpointRedirect } from "./workspace/LegacyEndpointRedirect";
 import { GlobalDataPage } from "./pages/GlobalDataPage";
-import { GlobalEventsPage, OverviewPage, SystemPage } from "./pages/V2Placeholders";
+import { GlobalEventsPage } from "./pages/GlobalEventsPage";
+import { OverviewPage, SystemPage } from "./pages/V2Placeholders";
 
 const { Header, Sider, Content } = Layout;
 
@@ -76,15 +77,15 @@ export default function App() {
             <Route path="/devices/:deviceId" element={<Navigate to="overview" replace />} />
             <Route path="/devices/:deviceId/endpoints/:endpointId" element={<LegacyEndpointRedirect />} />
             <Route path="/data" element={<GlobalDataPage />} />
-            <Route path="/events" element={<EventsView />} />
-            <Route path="/events-v2" element={<GlobalEventsPage />} />
+            <Route path="/events" element={<GlobalEventsPage />} />
             <Route path="/system" element={<SystemPage />} />
             {/* 旧入口（M5 删除）：DeviceDetail / Endpoint Workspace / Monitor /
-                Dashboard / Onboarding 暂时保留，但不再作为新入口。 */}
+                Dashboard / EventsView / Onboarding 暂时保留，但不再作为新入口。 */}
             <Route path="/dashboard-legacy" element={<Dashboard />} />
             <Route path="/devices/:id/legacy" element={<DeviceDetailPage />} />
             <Route path="/onboarding" element={<OnboardingPage />} />
             <Route path="/monitor" element={<MonitorView />} />
+            <Route path="/events-legacy" element={<EventsView />} />
             <Route path="*" element={<Navigate to="/overview" replace />} />
           </Routes>
         </Content>

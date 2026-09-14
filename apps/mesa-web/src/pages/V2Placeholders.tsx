@@ -15,19 +15,6 @@ export function OverviewPage() {
   );
 }
 
-export function GlobalEventsPage() {
-  return (
-    <Card size="small" title="事件">
-      <Alert
-        type="info"
-        showIcon
-        message="M3 实现"
-        description="全部设备事件聚合。当前全局事件仍在旧「事件」页可用，本页 M3 接入设备归属列与 Drawer。"
-      />
-    </Card>
-  );
-}
-
 export function SystemPage() {
   return (
     <Card size="small" title="系统">
