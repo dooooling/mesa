@@ -21,7 +21,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// IPC 协议版本。Major 不兼容直接拒绝握手；Minor 取双方较小值。
 /// V1.2.1 新增 PointValue.value_origin（§5.5），Minor 1 保证新 Driver 的 typed BAD 语义可被新 Core 理解，旧端仍按 UNSPECIFIED 兼容解释
 pub const PROTOCOL_MAJOR: u32 = 1;
-pub const PROTOCOL_MINOR: u32 = 3;
+/// Minor 4：PointDescriptorProto 新增可选 source_label（Point Presentation
+/// Metadata P1）。纯 additive：旧 Driver 不填→None 回落；新 Driver→旧 Core
+/// 未知字段忽略。Core 不得因 minor 不同拒绝运行（无 hard gate）。
+pub const PROTOCOL_MINOR: u32 = 4;
 
 /// Dynamic Probe RPC 可用的最低协商 Minor（§8）。协商 Minor < 2 的旧 Driver
 /// 不识别 ProbeRequest（会静默忽略），Core 必须直接返回 Unsupported，
@@ -513,6 +516,7 @@ pub fn descriptor_from_pb(d: pb::PointDescriptorProto) -> Result<PointDescriptor
         point_key: d.point_key,
         data_type: data_type_from_pb(&d.data_type)?,
         unit: d.unit,
+        source_label: d.source_label,
     })
 }
 

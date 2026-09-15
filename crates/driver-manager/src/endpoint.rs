@@ -753,6 +753,7 @@ async fn run_config_flow(
             point_key: d.point_key.clone(),
             data_type: d.data_type,
             unit: d.unit.clone(),
+            source_label: d.source_label.clone(),
         })
         .collect();
     snapshot.register_points(&cfg.endpoint_id, &defs);

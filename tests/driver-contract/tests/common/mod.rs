@@ -176,12 +176,10 @@ pub async fn configure_tasks(
         Some(pb::envelope::Body::PointDescriptors(rep)) => rep
             .descriptors
             .into_iter()
-            .map(|d| PointDescriptor {
-                point_key: d.point_key,
-                data_type: d.data_type.parse().expect("valid data type"),
-                unit: d.unit,
-            })
-            .collect(),
+            // P1：走统一转换（含 source_label wire 回环），不得手写构造
+            .map(mesa_driver_protocol::descriptor_from_pb)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("valid descriptors"),
         other => panic!("expected PointDescriptors, got {other:?}"),
     }
 }
