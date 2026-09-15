@@ -9,9 +9,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   POINT_STALE_AFTER_MS,
+  derivePointStale,
   pointAgeMs,
+  pointsSnapshotSignature,
   resolveEndpointContexts,
   type Device,
+  type PointStale,
 } from "../deviceModel";
 
 export interface WorkspacePoint {
@@ -40,7 +43,6 @@ export interface WorkspaceEndpoint {
   state?: string;
 }
 
-export type PointStale = "GOOD" | "BAD" | "STALE" | "UNKNOWN";
 
 export interface DevicePointView extends WorkspacePoint {
   /**
@@ -101,12 +103,7 @@ export interface DeviceWorkspaceData {
 export const DEVICE_POINTS_POLL_MS = 1000;
 export const DEVICE_ENDPOINTS_POLL_MS = 10_000;
 
-/** 派生点位状态：BAD 优先于 STALE；非法时间戳既不算 GOOD 也不算 STALE。 */
-export function derivePointStale(quality: string, ageMs: number | null): PointStale {
-  if ((quality ?? "").toUpperCase() === "BAD") return "BAD";
-  if (ageMs === null) return "UNKNOWN";
-  return ageMs > POINT_STALE_AFTER_MS ? "STALE" : "GOOD";
-}
+// derivePointStale / PointStale 已收敛到 deviceModel（签名门共用同一派生）。
 
 function toView(
   p: WorkspacePoint,
@@ -220,19 +217,30 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
         });
     };
 
+    // 签名门：同签名即值/质量/时间戳/派生全未变，跳过 setPoints，
+    // 下游 devicePoints/Table 引用不变 → 整表零重渲染。
+    // STALE 翻转参与签名，语义无损（翻转时机对齐 1s 轮询节拍）。
+    const sigRef = { current: "" };
     const loadPoints = () => {
       fetchJson("/api/v1/points/latest")
         .then((j) => {
           if (cancelled || gen.current !== id) return;
           const pts = (j as { points?: unknown }).points;
           if (!Array.isArray(pts)) throw new Error("points 形态非法");
-          setPoints(pts as WorkspacePoint[]);
+          const arr = pts as WorkspacePoint[];
+          const sig = pointsSnapshotSignature(arr, Date.now());
+          if (sig !== sigRef.current) {
+            sigRef.current = sig;
+            setPoints(arr);
+          }
           setPointsError(false);
         })
         .catch(() => {
-          // fail-closed：保留 last-known points，nowMs 独立推进使其自然 STALE。
+          // fail-closed：保留 last-known points；bump staleNonce 让派生
+          // STALE 按 nowMs 推进（异常路径才重算，正常时零 churn）。
           if (cancelled || gen.current !== id) return;
           setPointsError(true);
+          setStaleNonce((n) => n + 1);
         });
     };
 
@@ -276,7 +284,12 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
     [deviceEndpoints],
   );
 
+  // nowMs 不进 memo 依赖：正常轮询由签名门决定是否重建；
+  // 拉取失败时 staleNonce 推进 STALE（异常路径）。
+  const [staleNonce, setStaleNonce] = useState(0);
   const devicePoints = useMemo(() => {
+    void staleNonce;
+    const buildNow = Date.now();
     const views: DevicePointView[] = [];
     for (const p of points) {
       // RC2 修1：ownership 真正 fail-closed。能证明 endpoint 归属当前 device
@@ -288,10 +301,11 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
       //（配 empty 态，不展示别家数据）。
       const owner = ctx.get(p.endpoint_id)?.deviceId ?? "";
       if (owner !== deviceId) continue;
-      views.push(toView(p, nowMs, ctx));
+      views.push(toView(p, buildNow, ctx));
     }
     return views;
-  }, [points, ctx, deviceId, nowMs]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [points, ctx, deviceId, staleNonce]);
 
   const counts = useMemo(() => {
     let good = 0;

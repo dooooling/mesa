@@ -4,9 +4,8 @@
 // - 无 deviceId 限定：全局聚合，全量 points 全部成视图（含设备/连接归属名）。
 // 设备页继续用 useDeviceWorkspaceData（内部复用本源 + 设备过滤），语义同源。
 import { useEffect, useMemo, useRef, useState } from "react";
-import { resolveEndpointContexts, type Device } from "../deviceModel";
+import { derivePointStale, pointsSnapshotSignature, resolveEndpointContexts, type Device } from "../deviceModel";
 import {
-  derivePointStale,
   DEVICE_ENDPOINTS_POLL_MS,
   DEVICE_POINTS_POLL_MS,
   type DevicePointView,
@@ -82,13 +81,20 @@ export function useLivePointsSource(): LivePointsSource {
         });
     };
 
+    // 签名门（与设备页同语义）：无变化不替换引用。
+    const sigRef = { current: "" };
     const loadPoints = () => {
       fetchJson("/api/v1/points/latest")
         .then((j) => {
           if (cancelled || gen.current !== id) return;
           const pts = (j as { points?: unknown }).points;
           if (!Array.isArray(pts)) throw new Error("points 形态非法");
-          setPoints(pts as WorkspacePoint[]);
+          const arr = pts as WorkspacePoint[];
+          const sig = pointsSnapshotSignature(arr, Date.now());
+          if (sig !== sigRef.current) {
+            sigRef.current = sig;
+            setPoints(arr);
+          }
           setPointsError(false);
         })
         .catch(() => {

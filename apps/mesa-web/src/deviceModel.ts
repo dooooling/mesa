@@ -400,3 +400,66 @@ export function formatAge(ageMs: number | null): string {
   if (s < 60) return `${s}秒前`;
   return `${Math.floor(s / 60)}分钟前`;
 }
+
+/** 派生点位状态：BAD 优先于 STALE；非法时间戳既不算 GOOD 也不算 STALE。 */
+export type PointStale = "GOOD" | "BAD" | "STALE" | "UNKNOWN";
+
+export function derivePointStale(quality: string, ageMs: number | null): PointStale {
+  if ((quality ?? "").toUpperCase() === "BAD") return "BAD";
+  if (ageMs === null) return "UNKNOWN";
+  return ageMs > POINT_STALE_AFTER_MS ? "STALE" : "GOOD";
+}
+// ---------------------------------------------------------------------------
+// 实时渲染稳定化：points 快照签名门。loadPoints 每秒到达，但值/质量/
+// 时间戳/派生状态全未变时不替换快照引用，下游 memo 整表零重渲染。
+// STALE 翻转属于签名一部分（derived 参与签名），语义无损，只是翻转
+// 时机对齐到轮询节拍（本来就是 1s 轮询，无额外延迟）。
+// ---------------------------------------------------------------------------
+
+export interface PointSnapshotLike {
+  endpoint_id: string;
+  key?: string;
+  point_key?: string;
+  point_id: number;
+  quality: string;
+  value: unknown;
+  timestamp_ns: number;
+}
+
+/** 稳定排序键（与后端 latest_all 的 endpoint_id+point_id 口径一致）。 */
+export function pointSortKey(p: PointSnapshotLike): string {
+  return `${p.endpoint_id}:${p.point_id}`;
+}
+
+function signatureValue(v: unknown): string {
+  if (v === null || v === undefined) return "vnull";
+  if (typeof v === "number" || typeof v === "boolean" || typeof v === "string") {
+    return `${typeof v}:${String(v)}`;
+  }
+  try {
+    return `json:${JSON.stringify(v)}`;
+  } catch {
+    return "opaque";
+  }
+}
+
+/**
+ * 快照签名：每点 endpoint_id:point_id | quality | value | timestamp | derived(now)。
+ * 调用方每轮询一次算一次，与上次相同即跳过 setState。
+ */
+export function pointsSnapshotSignature(points: PointSnapshotLike[], nowMs: number): string {
+  const parts = new Array<string>(points.length);
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    const age = pointAgeMs(p.timestamp_ns, nowMs);
+    parts[i] = [
+      pointSortKey(p),
+      (p.quality ?? "").toUpperCase(),
+      signatureValue(p.value),
+      String(p.timestamp_ns ?? 0),
+      derivePointStale(p.quality, age),
+    ].join("|");
+  }
+  parts.sort();
+  return `${points.length}#${parts.join(";")}`;
+}

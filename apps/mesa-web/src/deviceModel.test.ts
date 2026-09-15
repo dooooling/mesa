@@ -15,6 +15,8 @@ import {
   formatAge,
   formatPointValue,
   pointAgeMs,
+  pointsSnapshotSignature,
+  derivePointStale,
   isTaskSnapshotReady,
   mergeAcquisitionTasks,
   splitAcquisitionTasks,
@@ -412,5 +414,44 @@ describe("pointAgeMs/formatAge", () => {
     expect(formatAge(500)).toBe("刚刚");
     expect(formatAge(3000)).toBe("3秒前");
     expect(formatAge(125000)).toBe("2分钟前");
+  });
+});
+
+describe("pointsSnapshotSignature", () => {
+  const T0 = 1_700_000_000_000;
+  const mk = (key: string, value: unknown, ageMs: number, quality = "GOOD") => ({
+    endpoint_id: "ep",
+    key,
+    point_id: key.length,
+    quality,
+    value,
+    timestamp_ns: (T0 - ageMs) * 1e6,
+  });
+
+  it("值/质量/时间戳全不变则签名不变（跳过重渲染）", () => {
+    const a = [mk("k1", 1.5, 500), mk("k2", "x", 600)];
+    expect(pointsSnapshotSignature(a, T0)).toBe(pointsSnapshotSignature(a, T0));
+  });
+
+  it("值变化则签名变化", () => {
+    const a = [mk("k1", 1.5, 500)];
+    const b = [mk("k1", 1.6, 500)];
+    expect(pointsSnapshotSignature(a, T0)).not.toBe(pointsSnapshotSignature(b, T0));
+  });
+
+  it("STALE 翻转属于签名（阈值 30s，语义无损）", () => {
+    const pts = [mk("k1", 1, 29_000)];
+    const s1 = pointsSnapshotSignature(pts, T0);
+    expect(derivePointStale("GOOD", 29_000)).toBe("GOOD");
+    // 时间推进越过阈值：签名必须变化（翻转被捕获）
+    const s2 = pointsSnapshotSignature(pts, T0 + 2000);
+    expect(s2).not.toBe(s1);
+    expect(derivePointStale("GOOD", 31_000)).toBe("STALE");
+  });
+
+  it("顺序无关（后端已稳定排序，防御性处理）", () => {
+    const a = [mk("k1", 1, 500), mk("k2", 2, 500)];
+    const b = [mk("k2", 2, 500), mk("k1", 1, 500)];
+    expect(pointsSnapshotSignature(a, T0)).toBe(pointsSnapshotSignature(b, T0));
   });
 });

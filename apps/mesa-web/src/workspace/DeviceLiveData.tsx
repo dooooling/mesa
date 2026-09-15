@@ -5,10 +5,9 @@
 // - 行点击打开 PointDetailDrawer，不跳页面。
 import { useMemo, useState } from "react";
 import { Button, Input, Select, Space, Table, Tag } from "antd";
-import { formatAge, formatPointValue } from "../deviceModel";
 import type { DevicePointView, WorkspaceEndpoint } from "./useDeviceWorkspaceData";
 import { ConnectionSelect } from "./ConnectionSelect";
-import { PointNameCell } from "./PointNameCell";
+import { AgeCell, NameCell, SourceCell, StatusCell, ValueCell } from "./LiveCells";
 import { useConnectionQuery } from "./useConnectionQuery";
 
 type StatusFilter = "ALL" | "GOOD" | "BAD" | "STALE";
@@ -62,6 +61,57 @@ export function DeviceLiveData(props: {
     return { total: scoped.length, good, bad, stale };
   }, [points, effectiveEndpointId]);
 
+  // 列定义 memo 化：每 render 新建 columns 数组会迫使 Table 全量重算。
+  // 固定布局 + 显式列宽：动态文本只在格内省略，不推动整表（Layout shift 根治）。
+  const columns = useMemo(
+    () => [
+      {
+        title: "数据点",
+        width: 240,
+        render: (_: unknown, r: DevicePointView) => <NameCell point={r} />,
+      },
+      {
+        title: "来源",
+        width: 220,
+        render: (_: unknown, r: DevicePointView) => <SourceCell point={r} />,
+      },
+      {
+        title: "当前值",
+        width: 180,
+        render: (_: unknown, r: DevicePointView) => <ValueCell point={r} />,
+      },
+      { title: "类型", width: 90, dataIndex: "type", render: (v: string) => <Tag>{v ?? "—"}</Tag> },
+      {
+        title: "连接",
+        width: 140,
+        render: (_: unknown, r: DevicePointView) => (
+          <span style={{ fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "block" }}>{r.endpointName}</span>
+        ),
+      },
+      {
+        title: "状态",
+        width: 90,
+        render: (_: unknown, r: DevicePointView) => <StatusCell derived={r.derived} />,
+      },
+      {
+        title: "更新",
+        width: 90,
+        render: (_: unknown, r: DevicePointView) => <AgeCell timestampNs={r.timestamp_ns} ageMs={r.ageMs} />,
+      },
+      {
+        // M7 可访问性：键盘路径（行 onClick 仅鼠标可达）。
+        title: "操作",
+        width: 80,
+        render: (_: unknown, r: DevicePointView) => (
+          <Button size="small" type="link" onClick={(e) => { e.stopPropagation(); onOpenPoint(r); }}>
+            详情
+          </Button>
+        ),
+      },
+    ],
+    [onOpenPoint],
+  );
+
   return (
     <div style={{ display: "grid", gap: 12 }}>
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
@@ -95,66 +145,13 @@ export function DeviceLiveData(props: {
 
       <Table
         size="small"
+        tableLayout="fixed"
         rowKey={(r) => `${(r as DevicePointView).endpoint_id}:${(r as DevicePointView).point_id}`}
         dataSource={filtered}
         pagination={{ pageSize: 20 }}
         onRow={(r) => ({ onClick: () => onOpenPoint(r as DevicePointView), style: { cursor: "pointer" } })}
-        columns={[
-          {
-            // P2 双行：第一行展示名，第二行 point_key（仅命名时）。
-            title: "数据点",
-            render: (_: unknown, r: DevicePointView) => <PointNameCell point={r} />,
-          },
-          {
-            // P1 来源列：有标签即标签；缺失显示"—"。
-            // point_key 不再兼任来源。
-            title: "来源",
-            render: (_: unknown, r: DevicePointView) => (
-              <span
-                title={r.source_label ? `Driver 来源：${r.source_label}` : "Driver 未提供来源"}
-                style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}
-              >
-                {r.sourceText ?? "—"}
-              </span>
-            ),
-          },
-          {
-            title: "当前值",
-            render: (_: unknown, r: DevicePointView) => (
-              <span title={String(r.value ?? "")}>{formatPointValue(r.value)}</span>
-            ),
-          },
-          { title: "类型", dataIndex: "type", render: (v: string) => <Tag>{v ?? "—"}</Tag> },
-          {
-            title: "连接",
-            render: (_: unknown, r: DevicePointView) => (
-              <span style={{ fontSize: 12 }}>{r.endpointName}</span>
-            ),
-          },
-          {
-            title: "状态",
-            render: (_: unknown, r: DevicePointView) => (
-              <Tag color={r.derived === "GOOD" ? "green" : r.derived === "BAD" ? "red" : "orange"}>
-                {r.derived}
-              </Tag>
-            ),
-          },
-          {
-            title: "更新",
-            render: (_: unknown, r: DevicePointView) => <span>{formatAge(r.ageMs)}</span>,
-          },
-          {
-            // M7 可访问性：键盘路径（行 onClick 仅鼠标可达）。
-            title: "操作",
-            width: 80,
-            render: (_: unknown, r: DevicePointView) => (
-              <Button size="small" type="link" onClick={(e) => { e.stopPropagation(); onOpenPoint(r); }}>
-                详情
-              </Button>
-            ),
-          },
-        ]}
-        locale={{ emptyText: "暂无数据" }}
+        columns={columns}
+locale={{ emptyText: "暂无数据" }}
       />
     </div>
   );
