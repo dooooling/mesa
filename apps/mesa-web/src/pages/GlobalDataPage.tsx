@@ -9,7 +9,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { formatAge, formatPointValue } from "../deviceModel";
 import { PointDetailDrawer } from "../components/PointDetailDrawer";
 import type { DevicePointView } from "../workspace/useDeviceWorkspaceData";
-import { PointNameCell } from "../workspace/PointNameCell";
+import { AgeCell, NameCell, SourceCell, StatusCell, ValueCell } from "../workspace/LiveCells";
 import { useLivePointsSource } from "../workspace/useLivePointsSource";
 
 type StatusFilter = "ALL" | "GOOD" | "BAD" | "STALE";
@@ -101,6 +101,85 @@ export function GlobalDataPage() {
       ? ""
       : (src.devices.find((d) => d.id === openPoint.deviceId)?.name ?? openPoint.deviceName ?? openPoint.deviceId);
 
+  // 列定义 memo 化 + 固定布局（与设备页同口径，Layout shift 根治）。
+  const columns = useMemo(
+    () => [
+      {
+        title: "设备",
+        width: 140,
+        render: (_: unknown, r: DevicePointView) => (
+          <span style={{ fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "block" }}>
+            {r.deviceName || r.deviceId || "—"}
+          </span>
+        ),
+      },
+      {
+        title: "连接",
+        width: 140,
+        render: (_: unknown, r: DevicePointView) => (
+          <span style={{ fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "block" }}>{r.endpointName}</span>
+        ),
+      },
+      {
+        title: "数据点",
+        width: 240,
+        render: (_: unknown, r: DevicePointView) => (
+          <NameCell
+            displayKey={r.displayKey}
+            pointKey={r.key ?? r.point_key ?? String(r.point_id)}
+            displayName={r.display_name}
+          />
+        ),
+      },
+      {
+        title: "来源",
+        width: 220,
+        render: (_: unknown, r: DevicePointView) => (
+          <SourceCell sourceText={r.sourceText} sourceLabel={r.source_label} />
+        ),
+      },
+      {
+        title: "当前值",
+        width: 180,
+        render: (_: unknown, r: DevicePointView) => <ValueCell value={r.value} />,
+      },
+      { title: "类型", width: 90, dataIndex: "type", render: (v: string) => <Tag>{v ?? "—"}</Tag> },
+      {
+        title: "状态",
+        width: 90,
+        render: (_: unknown, r: DevicePointView) => <StatusCell derived={r.derived} />,
+      },
+      {
+        title: "更新",
+        width: 90,
+        render: (_: unknown, r: DevicePointView) => <AgeCell timestampNs={r.timestamp_ns} />,
+      },
+      {
+        title: "操作",
+        width: 130,
+        render: (_: unknown, r: DevicePointView) => (
+          <Space onClick={(e) => e.stopPropagation()}>
+            {/* M7 可访问性：详情是 Drawer 的键盘路径（行 onClick 仅鼠标可达）。 */}
+            <Button size="small" type="link" onClick={() => setOpenPoint(r)}>
+              详情
+            </Button>
+            <Button
+              size="small"
+              type="link"
+              disabled={!r.deviceId}
+              onClick={() =>
+                nav(`/devices/${r.deviceId}/data${r.endpoint_id ? `?connection=${r.endpoint_id}` : ""}`)
+              }
+            >
+              打开设备 →
+            </Button>
+          </Space>
+        ),
+      },
+    ],
+    [setOpenPoint, nav],
+  );
+
   return (
     <div style={{ display: "grid", gap: 12 }}>
       <Card
@@ -138,78 +217,11 @@ export function GlobalDataPage() {
         <Table
           size="small"
           rowKey={(r) => `${(r as DevicePointView).endpoint_id}:${(r as DevicePointView).point_id}`}
+          tableLayout="fixed"
           dataSource={filtered}
           pagination={{ pageSize: 20 }}
           onRow={(r) => ({ onClick: () => setOpenPoint(r as DevicePointView), style: { cursor: "pointer" } })}
-          columns={[
-            {
-              title: "设备",
-              render: (_: unknown, r: DevicePointView) => r.deviceName || r.deviceId || "—",
-            },
-            {
-              title: "连接",
-              render: (_: unknown, r: DevicePointView) => (
-                <span style={{ fontSize: 12 }}>{r.endpointName}</span>
-              ),
-            },
-            {
-              // P2 双行（与设备页同口径）。
-              title: "数据点",
-              render: (_: unknown, r: DevicePointView) => <PointNameCell point={r} />,
-            },
-            {
-              // P1 来源列（与设备页同口径）
-              title: "来源",
-              render: (_: unknown, r: DevicePointView) => (
-                <span
-                  title={r.source_label ? `Driver 来源：${r.source_label}` : "Driver 未提供来源"}
-                  style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}
-                >
-                  {r.sourceText ?? "—"}
-                </span>
-              ),
-            },
-            {
-              title: "当前值",
-              render: (_: unknown, r: DevicePointView) => (
-                <span title={String(r.value ?? "")}>{formatPointValue(r.value)}</span>
-              ),
-            },
-            { title: "类型", dataIndex: "type", render: (v: string) => <Tag>{v ?? "—"}</Tag> },
-            {
-              title: "状态",
-              render: (_: unknown, r: DevicePointView) => (
-                <Tag color={r.derived === "GOOD" ? "green" : r.derived === "BAD" ? "red" : "orange"}>
-                  {r.derived}
-                </Tag>
-              ),
-            },
-            {
-              title: "更新",
-              render: (_: unknown, r: DevicePointView) => <span>{formatAge(r.ageMs)}</span>,
-            },
-            {
-              title: "操作",
-              render: (_: unknown, r: DevicePointView) => (
-                <Space onClick={(e) => e.stopPropagation()}>
-                  {/* M7 可访问性：详情是 Drawer 的键盘路径（行 onClick 仅鼠标可达）。 */}
-                  <Button size="small" type="link" onClick={() => setOpenPoint(r)}>
-                    详情
-                  </Button>
-                  <Button
-                    size="small"
-                    type="link"
-                    disabled={!r.deviceId}
-                    onClick={() =>
-                      nav(`/devices/${r.deviceId}/data${r.endpoint_id ? `?connection=${r.endpoint_id}` : ""}`)
-                    }
-                  >
-                    打开设备 →
-                  </Button>
-                </Space>
-              ),
-            },
-          ]}
+          columns={columns}
           locale={{ emptyText: "暂无数据" }}
         />
       </Card>

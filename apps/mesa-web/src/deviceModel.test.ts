@@ -15,6 +15,10 @@ import {
   formatAge,
   formatPointValue,
   pointAgeMs,
+  pointRowFingerprint,
+  reconcilePointSnapshots,
+  pointsSnapshotSignature,
+  derivePointStale,
   isTaskSnapshotReady,
   mergeAcquisitionTasks,
   splitAcquisitionTasks,
@@ -412,5 +416,122 @@ describe("pointAgeMs/formatAge", () => {
     expect(formatAge(500)).toBe("刚刚");
     expect(formatAge(3000)).toBe("3秒前");
     expect(formatAge(125000)).toBe("2分钟前");
+  });
+});
+
+describe("pointsSnapshotSignature", () => {
+  const T0 = 1_700_000_000_000;
+  const mk = (key: string, value: unknown, ageMs: number, quality = "GOOD") => ({
+    endpoint_id: "ep",
+    key,
+    point_id: key.length,
+    quality,
+    value,
+    timestamp_ns: (T0 - ageMs) * 1e6,
+  });
+
+  it("值/质量/时间戳全不变则签名不变（跳过重渲染）", () => {
+    const a = [mk("k1", 1.5, 500), mk("k2", "x", 600)];
+    expect(pointsSnapshotSignature(a, T0)).toBe(pointsSnapshotSignature(a, T0));
+  });
+
+  it("值变化则签名变化", () => {
+    const a = [mk("k1", 1.5, 500)];
+    const b = [mk("k1", 1.6, 500)];
+    expect(pointsSnapshotSignature(a, T0)).not.toBe(pointsSnapshotSignature(b, T0));
+  });
+
+  it("STALE 翻转属于签名（阈值 30s，语义无损）", () => {
+    const pts = [mk("k1", 1, 29_000)];
+    const s1 = pointsSnapshotSignature(pts, T0);
+    expect(derivePointStale("GOOD", 29_000)).toBe("GOOD");
+    // 时间推进越过阈值：签名必须变化（翻转被捕获）
+    const s2 = pointsSnapshotSignature(pts, T0 + 2000);
+    expect(s2).not.toBe(s1);
+    expect(derivePointStale("GOOD", 31_000)).toBe("STALE");
+  });
+
+  it("顺序无关（后端已稳定排序，防御性处理）", () => {
+    const a = [mk("k1", 1, 500), mk("k2", 2, 500)];
+    const b = [mk("k2", 2, 500), mk("k1", 1, 500)];
+    expect(pointsSnapshotSignature(a, T0)).toBe(pointsSnapshotSignature(b, T0));
+  });
+});
+
+describe("reconcilePointSnapshots", () => {
+  const T0 = 1_700_000_000_000;
+  const mk = (over: Record<string, unknown> = {}) => ({
+    endpoint_id: "ep",
+    key: "k1",
+    point_id: 1,
+    quality: "GOOD",
+    type: "f64",
+    value: 100,
+    timestamp_ns: (T0 - 500) * 1e6,
+    source_label: "DB10.DBD20",
+    ...over,
+  });
+
+  it("全同则保旧引用（下游 memo/行级 bailout 的真正保证）", () => {
+    const prev = [mk()];
+    const next = [mk()];
+    const { points, changed } = reconcilePointSnapshots(prev, next, T0);
+    expect(changed).toBe(false);
+    expect(points[0]).toBe(prev[0]);
+  });
+
+  it("source_label-only 变化必须更新（P1 metadata 可独立刷新）", () => {
+    const prev = [mk({ source_label: "DB10.DBD20" })];
+    const next = [mk({ source_label: "DB20.DBD40" })];
+    const { points, changed } = reconcilePointSnapshots(prev, next, T0);
+    expect(changed).toBe(true);
+    expect(points[0]).toBe(next[0]);
+    expect((points[0] as { source_label: string }).source_label).toBe("DB20.DBD40");
+  });
+
+  it("display_name-only 变化必须更新（可跨客户端改名）", () => {
+    const prev = [mk({ display_name: undefined })];
+    const next = [mk({ display_name: "新名字" })];
+    const { changed } = reconcilePointSnapshots(prev, next, T0);
+    expect(changed).toBe(true);
+  });
+
+  it("key/type-only 变化必须更新", () => {
+    expect(reconcilePointSnapshots([mk()], [mk({ type: "i32" })], T0).changed).toBe(true);
+    expect(reconcilePointSnapshots([mk()], [mk({ key: "k2" })], T0).changed).toBe(true);
+  });
+
+  it("STALE 翻转被捕获（derived 跨时刻比较）", () => {
+    const prev = [mk({ timestamp_ns: (T0 - 29_000) * 1e6 })];
+    const next = [mk({ timestamp_ns: (T0 - 29_000) * 1e6 })];
+    // 上轮 GOOD（29s），本轮 STALE（31s）：字段全同但跨阈值，必须更新
+    const { changed } = reconcilePointSnapshots(prev, next, T0 + 2000, T0);
+    expect(changed).toBe(true);
+    // 同一时刻内比较则不变（无跨阈值）
+    const same = reconcilePointSnapshots(prev, next, T0 + 2000, T0 + 2000);
+    expect(same.changed).toBe(false);
+  });
+
+  it("增删行改变长度即 changed", () => {
+    expect(reconcilePointSnapshots([mk()], [], T0).changed).toBe(true);
+    expect(reconcilePointSnapshots([], [mk()], T0).changed).toBe(true);
+  });
+
+  it("指纹覆盖全部 UI 可观察字段", () => {
+    const base = mk();
+    for (const over of [
+      { key: "k2" },
+      { point_key: "pk" },
+      { type: "i32" },
+      { quality: "BAD" },
+      { value: 101 },
+      { timestamp_ns: T0 * 1e6 },
+      { source_label: "X" },
+      { display_name: "N" },
+    ]) {
+      expect(pointRowFingerprint(base, T0)).not.toBe(
+        pointRowFingerprint({ ...base, ...over }, T0),
+      );
+    }
   });
 });
