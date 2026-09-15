@@ -93,8 +93,8 @@ describe("M2 设备数据归属与过滤", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(screen.getByText("mine")).toBeTruthy();
-    expect(screen.queryByText("theirs")).toBeNull();
+    expect(screen.getAllByText("mine").length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryAllByText("theirs")).toHaveLength(0);
   });
 
   it("4. connection= 过滤生效（URL 即唯一上下文）", async () => {
@@ -107,8 +107,8 @@ describe("M2 设备数据归属与过滤", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(screen.getByText("f-key")).toBeTruthy();
-    expect(screen.queryByText("o-key")).toBeNull();
+    expect(screen.getAllByText("f-key").length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryAllByText("o-key")).toHaveLength(0);
   });
 
   it("5. 无参默认全部连接", async () => {
@@ -121,9 +121,33 @@ describe("M2 设备数据归属与过滤", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(screen.getByText("f-key")).toBeTruthy();
-    expect(screen.getByText("o-key")).toBeTruthy();
+    expect(screen.getAllByText("f-key").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("o-key").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByTestId("workspace-connection-context").textContent ?? "").toContain("全部连接");
+  });
+
+  it("P1. 来源列：有 source_label 显示标签，无则回落技术坐标", async () => {
+    vi.useRealTimers();
+    mockWorkspace({
+      points: () => ({
+        points: [
+          { ...pt("focas", "labeled", "GOOD", 500), source_label: "DB10.DBD20" },
+          pt("opcua", "unlabeled", "GOOD", 500),
+        ],
+      }),
+    });
+    renderWorkspace("/devices/cnc-01/data");
+    await screen.findAllByText("labeled");
+    // 数据点列仍是 point_key
+    expect(screen.getAllByText("unlabeled").length).toBeGreaterThanOrEqual(1);
+    // 来源列：label 与回落坐标各一
+    expect(screen.getByText("DB10.DBD20")).toBeTruthy();
+    expect(screen.getAllByText("unlabeled").length).toBeGreaterThanOrEqual(2);
+    // Drawer 来源地址块同样展示
+    const user = userEvent.setup();
+    await user.click(screen.getAllByText("labeled")[0]);
+    await screen.findByText("来源地址");
+    expect(screen.getAllByText("DB10.DBD20").length).toBeGreaterThanOrEqual(2);
   });
 });
 
@@ -140,7 +164,7 @@ describe("M2 fail-closed 与 STALE", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(screen.getByText("k1")).toBeTruthy();
+    expect(screen.getAllByText("k1").length).toBeGreaterThanOrEqual(1);
     expect(screen.queryByText("STALE")).toBeNull();
 
     fail = true;
@@ -149,7 +173,7 @@ describe("M2 fail-closed 与 STALE", () => {
       await vi.advanceTimersByTimeAsync(1000);
     });
     // 不清空 + 自然 STALE
-    expect(screen.getByText("k1")).toBeTruthy();
+    expect(screen.getAllByText("k1").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("STALE")).toBeTruthy();
   });
 });
@@ -164,13 +188,15 @@ describe("M2 需要关注规则", () => {
       {
         endpoint_id: "ok-ep", key: "stale-k", point_id: 1, quality: "GOOD", type: "f64",
         value: 1, timestamp_ns: (T0 - POINT_STALE_AFTER_MS - 5000) * 1e6,
-        displayKey: "stale-k", ageMs: POINT_STALE_AFTER_MS + 5000, derived: "STALE" as const,
+        displayKey: "stale-k", sourceText: "stale-k",
+        ageMs: POINT_STALE_AFTER_MS + 5000, derived: "STALE" as const,
         endpointName: "OK-EP", deviceId: "cnc-01", deviceName: "CNC-01",
       },
       {
         endpoint_id: "ok-ep", key: "bad-k", point_id: 2, quality: "BAD", type: "f64",
         value: 0, timestamp_ns: T0 * 1e6,
-        displayKey: "bad-k", ageMs: 0, derived: "BAD" as const,
+        displayKey: "bad-k", sourceText: "bad-k",
+        ageMs: 0, derived: "BAD" as const,
         endpointName: "OK-EP", deviceId: "cnc-01", deviceName: "CNC-01",
       },
     ];
@@ -190,8 +216,8 @@ describe("M2 Drawer 与跳转", () => {
     });
     const user = userEvent.setup();
     renderWorkspace("/devices/cnc-01/data");
-    await screen.findByText("axis.z.position");
-    await user.click(screen.getByText("axis.z.position"));
+    await screen.findAllByText("axis.z.position");
+    await user.click(screen.getAllByText("axis.z.position")[0]);
     // Drawer：来源三段 + 跳转按钮（设备名在 Header/面包屑/占位多处重名，
     // 用 getAllBy 断言；endpoint 名/id 同理）
     await screen.findByText("打开连接配置");
@@ -288,13 +314,13 @@ describe("M2 代际守卫", () => {
     // B 先回：显示 point-b
     gateB.which = "b";
     gateB.resolve();
-    await waitFor(() => expect(screen.getByText("point-b")).toBeTruthy());
+    await waitFor(() => expect(screen.getAllByText("point-b").length).toBeGreaterThanOrEqual(1));
     // A 后回：必须被忽略
     gateA.which = "a";
     gateA.resolve();
     await new Promise((r) => setTimeout(r, 100));
-    expect(screen.queryByText("point-a")).toBeNull();
-    expect(screen.getByText("point-b")).toBeTruthy();
+    expect(screen.queryAllByText("point-a")).toHaveLength(0);
+    expect(screen.getAllByText("point-b").length).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -351,14 +377,14 @@ describe("RC2 ownership fail-closed", () => {
     );
     const user = userEvent.setup();
     await user.click(screen.getByText("go-a"));
-    await waitFor(() => expect(screen.getByText("point-a")).toBeTruthy(), { timeout: 10000 });
-    await user.click(screen.getByText("point-a"));
+    await waitFor(() => expect(screen.getAllByText("point-a").length).toBeGreaterThanOrEqual(1), { timeout: 10000 });
+    await user.click(screen.getAllByText("point-a")[0]);
     await screen.findByText("打开连接配置", undefined, { timeout: 10000 });
     // 切 B：Drawer 必须关闭（A 的 point 不得留在 B 页面）
     await user.click(screen.getByText("go-b"));
     await waitFor(() => expect(screen.queryByText("打开连接配置")).toBeNull(), { timeout: 10000 });
     // B 自己的点正常显示
-    expect(screen.getByText("point-b")).toBeTruthy();
+    expect(screen.getAllByText("point-b").length).toBeGreaterThanOrEqual(1);
   }, 30000);
 
   // review blocker：A→B 切换窗口 + B inventory 失败时，未知归属 points
@@ -427,17 +453,17 @@ describe("RC2 ownership fail-closed", () => {
     await user.click(screen.getByText("go-a"));
     await waitFor(() => expect(invGates.length).toBeGreaterThanOrEqual(1));
     invGates.forEach((g) => g.resolve());
-    await waitFor(() => expect(screen.getByText("point-a")).toBeTruthy());
+    await waitFor(() => expect(screen.getAllByText("point-a").length).toBeGreaterThanOrEqual(1));
     // 切 B：B 的 inventory 挂起（新 gate 不放行），points 仍是 A 的旧点
     await user.click(screen.getByText("go-b"));
     await waitFor(() => expect(invGates.length).toBeGreaterThanOrEqual(2));
     await new Promise((r) => setTimeout(r, 300));
     // B inventory 未就绪 → A 的点绝不能出现（owner=A≠B；B 的点无 mapping 同样不出）
-    expect(screen.queryByText("point-a")).toBeNull();
+    expect(screen.queryAllByText("point-a")).toHaveLength(0);
     // B inventory 恢复 → 仍无 point-a（A 的点 owner 明确非 B）
     invGates.forEach((g) => g.resolve());
     await new Promise((r) => setTimeout(r, 300));
-    expect(screen.queryByText("point-a")).toBeNull();
+    expect(screen.queryAllByText("point-a")).toHaveLength(0);
   }, 30000);
 
   it("10. B inventory 失败：未知归属 points 全部排除（空列表，不展示别家）", async () => {
@@ -470,6 +496,6 @@ describe("RC2 ownership fail-closed", () => {
       () => expect(screen.getByText("连接清单不可用")).toBeTruthy(),
       { timeout: 10000 },
     );
-    expect(screen.queryByText("ghost-point")).toBeNull();
+    expect(screen.queryAllByText("ghost-point")).toHaveLength(0);
   }, 30000);
 });
