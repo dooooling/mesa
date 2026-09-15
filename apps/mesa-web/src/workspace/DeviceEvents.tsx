@@ -6,7 +6,7 @@
 //   （多连接设备需要区分来源），不加设备列（已在设备内）。
 // - M3.5：过滤栏升级为 EventFilterBar（常用 Active/时间 + 高级精确匹配，
 //   文本 400ms debounce），与全局页同一组件。
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Alert, Button, Space, Tag } from "antd";
 import type { StoredEvent } from "../types";
 import { EMPTY_EVENT_FILTER_FORM, type EventFilterForm } from "../events/filters";
@@ -25,6 +25,14 @@ export function DeviceEvents(props: {
   const { deviceName, endpointIds, endpointNames, effectiveEndpointId } = props;
   const [rest, setRest] = useState<EventFilterForm>(EMPTY_EVENT_FILTER_FORM);
   const [selected, setSelected] = useState<StoredEvent | null>(null);
+
+  // RC2 修2：scope detail state 必须在 scope identity 变化时清空。
+  // DeviceEvents 的 scope 是 device（deviceName 变化即切设备）：不清的话
+  // A 的事件 Drawer 会留在 B 的页面上（EventDetailDrawer 无设备归属列，
+  // 用户无法察觉来源已错）。改名同 id 会误清一次，可接受（安全优先）。
+  useEffect(() => {
+    setSelected(null);
+  }, [deviceName]);
 
   const scopedEndpointIds = useMemo(
     () => (effectiveEndpointId ? [effectiveEndpointId] : endpointIds),
@@ -56,7 +64,18 @@ export function DeviceEvents(props: {
       </div>
 
       {feed.unavailable ? (
-        <Alert type="error" showIcon message="Event service unavailable" description="EventStore 当前不可用。" />
+        <Alert
+          type="error"
+          showIcon
+          message="Event service unavailable"
+          description="EventStore 当前不可用。恢复后点重试重新建连（重建高水位，不会 replay 大量历史）。"
+          action={
+            // RC2 修4：unavailable 也有重试（完整 boot → 新 H → SSE 重建）。
+            <Button size="small" onClick={() => feed.reload()}>
+              重试
+            </Button>
+          }
+        />
       ) : null}
       {feed.error ? (
         <Alert

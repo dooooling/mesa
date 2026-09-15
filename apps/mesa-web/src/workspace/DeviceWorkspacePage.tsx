@@ -69,6 +69,14 @@ export function DeviceWorkspacePage() {
   } = data;
   const [openPoint, setOpenPoint] = useState<DevicePointView | null>(null);
 
+  // RC2 修2：scope detail state 必须在 scope identity 变化时清空。
+  // 同一 route element 在 /devices/A/data → /devices/B/data 时被复用，
+  // 不清的话 A 的 Point Drawer 会开在 B 的页面上，而 Drawer 头已变成 B
+  // 的设备信息 → 错误来源展示。
+  useEffect(() => {
+    setOpenPoint(null);
+  }, [deviceId]);
+
   // M1 URL 稳定规则保持：清单未就绪前不动 URL，避免空清单误删合法参数。
   const endpointIds = useMemo(
     () => endpoints.filter((e) => (e.device_id ?? "") === deviceId).map((e) => e.id),

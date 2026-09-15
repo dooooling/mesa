@@ -90,6 +90,9 @@ export function useDeviceEventFeed(query: DeviceEventQuery): DeviceEventFeed {
     setError(null);
     setHistory([]);
     setCursor(null);
+    // RC2 修6：generation 更替自己负责复位 loadingMore（loadOlder 的 stale
+    // 失败分支直接 return 会把 loadingMore 留在 true）。
+    setLoadingMore(false);
     (async () => {
       try {
         const h = await api.eventHead();
@@ -101,6 +104,8 @@ export function useDeviceEventFeed(query: DeviceEventQuery): DeviceEventFeed {
           setHighWater(h);
           setLoading(false);
           setBooted(true);
+          // RC2 修4：完整 boot 成功即恢复（unavailable 清零，SSE 重建）。
+          setUnavailable(false);
           return;
         }
         const page = await fetchPage(q);
@@ -112,6 +117,8 @@ export function useDeviceEventFeed(query: DeviceEventQuery): DeviceEventFeed {
         setHighWater(h);
         setLoading(false);
         setBooted(true);
+        // RC2 修4：完整 boot 成功即恢复（unavailable 清零，SSE 重建）。
+        setUnavailable(false);
       } catch (e) {
         if (gen.current !== id) return;
         if (isEventStoreUnavailable(e)) setUnavailable(true);
@@ -140,10 +147,8 @@ export function useDeviceEventFeed(query: DeviceEventQuery): DeviceEventFeed {
     setLoadingMore(true);
     fetchPage(q, cursor)
       .then((page) => {
-        if (id !== gen.current) {
-          setLoadingMore(false);
-          return;
-        }
+        // RC2 修6：stale 响应绝不碰新 generation 状态。
+        if (id !== gen.current) return;
         // 合入时再按当前 query 过一遍：防期间 endpoint 集合收缩导致的归属外行。
         const cur = queryRef.current;
         const rows = page.events.filter((ev) => matchesQuery(ev, cur));

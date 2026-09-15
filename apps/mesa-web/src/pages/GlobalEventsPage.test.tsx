@@ -163,3 +163,96 @@ describe("M7 全局事件（device 服务端过滤）", () => {
     // 并行 worker 下跨页导航 + 多轮事件链较重，放宽超时（单跑 7s 内稳定）。
   }, 30000);
 });
+
+describe("RC2 事件恢复与单 reload owner", () => {
+  function mockFlakyEvents() {
+    let fail = true;
+    const calls: string[] = [];
+    (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string) => {
+      if (url === "/api/v1/devices") {
+        return { ok: true, status: 200, json: async () => ({ devices: [{ id: "cnc-01", name: "CNC-01" }] }) };
+      }
+      if (url === "/api/v1/endpoints") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            endpoints: [{ id: "focas", name: "FOCAS", driver_id: "focas2", device_id: "cnc-01", state: "RUNNING" }],
+          }),
+        };
+      }
+      if (url === "/api/v1/devices/cnc-01") {
+        return { ok: true, status: 200, json: async () => ({ id: "cnc-01", name: "CNC-01" }) };
+      }
+      if (url === "/api/v1/points/latest") {
+        return { ok: true, status: 200, json: async () => ({ points: [] }) };
+      }
+      if (url === "/api/v1/events?limit=1") {
+        return { ok: true, status: 200, json: async () => ({ events: [], next_cursor: null }) };
+      }
+      if (url.startsWith("/api/v1/events?") || url.startsWith("/api/v1/events&")) {
+        calls.push(url);
+        if (fail) {
+          return {
+            ok: false,
+            status: 503,
+            json: async () => ({ error: { code: "EVENT_STORE_UNAVAILABLE", message: "down" } }),
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ events: [ev(100, "focas", "cnc-alarm")], next_cursor: null }),
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    });
+    return { calls, heal: () => { fail = false; } };
+  }
+
+  it("修4：unavailable 后重试走完整 boot（Alert 消失 + SSE 重建，不 replay 旧 H）", async () => {
+    const { calls, heal } = mockFlakyEvents();
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/events"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    // 首屏失败 → unavailable Alert（带重试按钮）
+    await screen.findByText("Event service unavailable");
+    expect(screen.queryByText("cnc-alarm")).toBeNull();
+    const sseBefore = MockEventSource.instances.length;
+    // EventStore 恢复 → 点重试 → 完整 boot 成功 → Alert 消失 + 事件出现
+    heal();
+    await user.click(screen.getByRole("button", { name: /重\s?试/ }));
+    await screen.findByText("cnc-alarm");
+    await waitFor(() => expect(screen.queryByText("Event service unavailable")).toBeNull());
+    // SSE 用新 H 重建（新增一个 EventSource，而不是永久停在 unavailable）
+    await waitFor(() => expect(MockEventSource.instances.length).toBeGreaterThan(sseBefore));
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+  }, 30000);
+
+  it("修5：改一个 filter 只发一次 events 请求（单一 reload owner）", async () => {
+    mockGlobalEvents();
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    const eventsCalls = () => (fetchMock.mock.calls as string[][]).filter((c) => String(c[0]).startsWith("/api/v1/events?")).length;
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/events"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    await screen.findByText("cnc-alarm");
+    const before = eventsCalls();
+    // 改 Code 过滤（400ms debounce 后 formKey effect 统一 reload，只一次）。
+    // 高级筛选项默认收起，先展开。
+    await user.click(screen.getByText(/高级筛选/));
+    const input = screen.getByPlaceholderText("Code");
+    await user.type(input, "x");
+    await screen.findByText("plc-alarm");
+    await new Promise((r) => setTimeout(r, 800));
+    // 一次完整 boot = eventHead + 历史列表 = 2 个 events 请求；double reload
+    // 则会有 4 个（onRestChange 直接 reload 一次 + formKey effect 再 reload 一次）。
+    expect(eventsCalls() - before).toBe(2);
+  }, 30000);
+});
