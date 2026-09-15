@@ -1,27 +1,35 @@
 // M2 DeviceLiveData：设备内实时数据（从 MonitorView 拆出，产品结构重做）。
 // - 设备内不显示“设备”列（用户已在 Device Workspace 内）；全局 /data 才需要；
-// - 连接过滤复用 M1 的 connection 上下文，不另起 selection state；
+// - 连接筛选本页局部管理（useConnectionQuery allowAll + ConnectionSelect），
+//   不再由父 Workspace 注入 Connection Context；
 // - 行点击打开 PointDetailDrawer，不跳页面。
 import { useMemo, useState } from "react";
 import { Button, Input, Select, Space, Table, Tag } from "antd";
 import { formatAge, formatPointValue } from "../deviceModel";
 import type { DevicePointView, WorkspaceEndpoint } from "./useDeviceWorkspaceData";
+import { ConnectionSelect } from "./ConnectionSelect";
 import { PointNameCell } from "./PointNameCell";
+import { useConnectionQuery } from "./useConnectionQuery";
 
 type StatusFilter = "ALL" | "GOOD" | "BAD" | "STALE";
 
 export function DeviceLiveData(props: {
   endpoints: WorkspaceEndpoint[];
-  /** M1 解析后的有效连接（null = 全部）。 */
-  effectiveEndpointId: string | null;
+  endpointsReady: boolean;
   points: DevicePointView[];
   pointsError: boolean;
   onOpenPoint: (p: DevicePointView) => void;
-  onSelectConnection: (endpointId: string | null) => void;
 }) {
-  const { endpoints, effectiveEndpointId, points, pointsError, onOpenPoint, onSelectConnection } = props;
+  const { endpoints, endpointsReady, points, pointsError, onOpenPoint } = props;
   const [status, setStatus] = useState<StatusFilter>("ALL");
   const [search, setSearch] = useState("");
+  // 本页连接筛选（全部/单连接），URL 局部 ?connection=，不跨 Tab 同步。
+  const endpointIds = useMemo(() => endpoints.map((e) => e.id), [endpoints]);
+  const { selected: effectiveEndpointId, select: onSelectConnection } = useConnectionQuery({
+    endpointIds,
+    mode: "all",
+    ready: endpointsReady,
+  });
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -58,15 +66,7 @@ export function DeviceLiveData(props: {
     <div style={{ display: "grid", gap: 12 }}>
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <Space wrap>
-          <Select
-            value={effectiveEndpointId ?? "ALL"}
-            onChange={(v) => onSelectConnection(v === "ALL" ? null : v)}
-            style={{ width: 180 }}
-            options={[
-              { value: "ALL", label: "全部连接" },
-              ...endpoints.map((e) => ({ value: e.id, label: `${e.name ?? e.id}` })),
-            ]}
-          />
+          <ConnectionSelect endpoints={endpoints} value={effectiveEndpointId} allowAll onChange={onSelectConnection} />
           <Select
             value={status}
             onChange={setStatus}

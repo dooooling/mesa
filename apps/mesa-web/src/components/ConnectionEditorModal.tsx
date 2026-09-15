@@ -1,8 +1,9 @@
-// Endpoint 连接编辑窗格（Workspace「连接」tab；逻辑由 DeviceDetail 编辑
-// Modal 原样迁移）。driver_id 创建后不可改（请求体无该字段）；保存先停止，
-// 成功后需手动启动（生命周期统一见后续项，本窗格保持原语义）。
+// 连接编辑 Modal（容器由 EndpointConnectionPane 的 Pane 改成 Modal，
+// 安全逻辑原样保留）：GET Endpoint snapshot + GET Descriptor + 双归属
+// 快照门 + RUNNING → Stop → Apply → Restart + Secret 脱敏语义。
+// Prop 变化（切连接）即 remount 语义由父页 key 保证。
 import { useEffect, useState } from "react";
-import { Alert, Input, Space, Tag, message } from "antd";
+import { Alert, Input, Modal, Space, Tag, message } from "antd";
 import { api } from "../api";
 import type { DriverDescriptor } from "../types";
 import {
@@ -17,19 +18,16 @@ import { DescriptorFields } from "./DescriptorFields";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export function EndpointConnectionPane({
-  endpointId,
-  deviceId,
-  driverId,
-  initialName,
-  onChanged,
-}: {
+export function ConnectionEditorModal(props: {
   endpointId: string;
   deviceId: string;
   driverId: string;
   initialName: string;
+  open: boolean;
+  onClose: () => void;
   onChanged: () => void;
 }) {
+  const { endpointId, deviceId, driverId, initialName, open, onClose, onChanged } = props;
   const [desc, setDesc] = useState<DriverDescriptor | null>(null);
   const [conn, setConn] = useState<Record<string, unknown>>({});
   const [name, setName] = useState(initialName);
@@ -43,7 +41,8 @@ export function EndpointConnectionPane({
   const [connError, setConnError] = useState("");
 
   useEffect(() => {
-    // 切 Endpoint 先复位：旧 connection 不得残留成新窗格的可保存内容。
+    if (!open) return;
+    // 开窗即复位：旧 connection 不得残留成可保存内容。
     setConn({});
     setName(initialName);
     setDesc(null);
@@ -77,7 +76,7 @@ export function EndpointConnectionPane({
         setConnLoading(false);
       } else {
         setConnLoading(false);
-        setConnError("连接快照加载失败：服务端当前连接未知，已禁用保存（请切换后重试，不会用旧连接覆盖）。");
+        setConnError("连接快照加载失败：服务端当前连接未知，已禁用保存（请关闭重试，不会用旧连接覆盖）。");
       }
     });
     api.listEndpoints()
@@ -89,14 +88,14 @@ export function EndpointConnectionPane({
       })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [endpointId, driverId, initialName]);
+  }, [open, endpointId, driverId, initialName]);
 
   const connReady = connLoadedEpId === endpointId && !connLoading && !!desc;
 
   const save = async (restart: boolean) => {
-    // 快照门：B 未 ready 前保存禁用；串 Endpoint / 加载失败一律不可写。
+    // 快照门：未 ready 前保存禁用；串 Endpoint / 加载失败一律不可写。
     if (!connReady) {
-      if (connError) return message.error("连接快照加载失败，禁止保存以防用旧连接覆盖。请切换后重试。");
+      if (connError) return message.error("连接快照加载失败，禁止保存以防用旧连接覆盖。请关闭重试。");
       return message.warning("连接快照加载中，禁止保存以防串改另一连接。请稍候。");
     }
     const cleaned = cleanConnection(conn);
@@ -158,41 +157,52 @@ export function EndpointConnectionPane({
   };
 
   return (
-    <div style={{ display: "grid", gap: 12, maxWidth: 720 }}>
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <span style={{ fontSize: 12 }}>驱动</span>
-        <Tag>{driverId}</Tag>
-        <span style={{ fontSize: 12, color: "#525252" }}>创建后不可改</span>
+    <Modal
+      title={`编辑连接 · ${initialName}`}
+      open={open}
+      onCancel={onClose}
+      footer={null}
+      destroyOnHidden
+      width={720}
+    >
+      <div style={{ display: "grid", gap: 12 }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span style={{ fontSize: 12 }}>ID</span>
+          <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>{endpointId}</span>
+          <span style={{ fontSize: 12 }}>驱动</span>
+          <Tag>{driverId}</Tag>
+          <span style={{ fontSize: 12, color: "#525252" }}>创建后不可改</span>
+        </div>
+        <div>
+          <div style={{ fontSize: 12, marginBottom: 4 }}>连接名称</div>
+          <Input value={name} onChange={(e) => setName(e.target.value)} />
+        </div>
+        {!desc && connLoading ? (
+          <div style={{ color: "#525252" }}>加载中…</div>
+        ) : null}
+        {connError ? (
+          <Alert type="error" message={connError} description="服务端当前连接未知，为防止串改已禁用保存。请关闭重试。" />
+        ) : null}
+        {connLoading && !connError ? (
+          <div style={{ fontSize: 12, color: "#525252" }}>正在加载连接快照…（快照就绪前保存保持禁用，防止串改另一连接）</div>
+        ) : null}
+        {!desc && !connLoading ? (
+          <Alert type="error" message="资源描述加载失败" description="描述缺失时无合法编辑依据，已禁用保存。请关闭重试。" />
+        ) : null}
+        {desc ? (
+          <DescriptorFields schema={desc.connection} value={conn} onChange={setConn} />
+        ) : null}
+        <div style={{ fontSize: 12, color: "#525252" }}>需先停止再修改（停止是应用动作的一部分）</div>
+        <Space>
+          <ApplyWithRestart
+            running={running}
+            applying={saving}
+            canApply={Object.keys(cleanConnection(conn)).length > 0 && connReady}
+            applyLabel="保存"
+            onApply={save}
+          />
+        </Space>
       </div>
-      <div>
-        <div style={{ fontSize: 12, marginBottom: 4 }}>连接名称</div>
-        <Input value={name} onChange={(e) => setName(e.target.value)} />
-      </div>
-      {!desc && connLoading ? (
-        <div style={{ color: "#525252" }}>加载中…</div>
-      ) : null}
-      {connError ? (
-        <Alert type="error" message={connError} description="服务端当前连接未知，为防止串改已禁用保存。请切换后重试。" />
-      ) : null}
-      {connLoading && !connError ? (
-        <div style={{ fontSize: 12, color: "#525252" }}>正在加载连接快照…（快照就绪前保存保持禁用，防止串改另一连接）</div>
-      ) : null}
-      {!desc && !connLoading ? (
-        <Alert type="error" message="资源描述加载失败" description="描述缺失时无合法编辑依据，已禁用保存。请切换后重试。" />
-      ) : null}
-      {desc ? (
-        <DescriptorFields schema={desc.connection} value={conn} onChange={setConn} />
-      ) : null}
-      <div style={{ fontSize: 12, color: "#525252" }}>需先停止再修改（停止是应用动作的一部分）</div>
-      <Space>
-        <ApplyWithRestart
-          running={running}
-          applying={saving}
-          canApply={Object.keys(cleanConnection(conn)).length > 0 && connReady}
-          applyLabel="保存"
-          onApply={save}
-        />
-      </Space>
-    </div>
+    </Modal>
   );
 }

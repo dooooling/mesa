@@ -2,11 +2,14 @@
 // - 单连接状态：endpoint diagnostics（运行态/驱动版本/连接状态/重连计数）；
 // - 采集健康：该连接 tasks 快照（数量/revision）+ 其 points 的 GOOD/BAD/STALE；
 // - 高级诊断折叠：diagnostics 原始 JSON（排障用，不做二次解释）。
-// 全部只读，不触发任何变更；切连接 key remount，迟到响应不污染新窗格。
-import { useEffect, useState } from "react";
+// 全部只读，不触发任何变更；连接选择本页局部（单选，无连接即 Empty）。
+// 切连接 key remount，迟到响应不污染新窗格。
+import { useEffect, useMemo, useState } from "react";
 import { Alert, Card, Collapse, Descriptions, Table, Tag } from "antd";
 import { api } from "../api";
 import { isRunningState } from "../deviceModel";
+import { ConnectionSelect } from "./ConnectionSelect";
+import { useConnectionQuery } from "./useConnectionQuery";
 import type { DevicePointView, WorkspaceEndpoint } from "./useDeviceWorkspaceData";
 
 interface EndpointDiagnostics {
@@ -28,14 +31,21 @@ function fmtTime(ns?: number | null): string {
 
 export function DeviceDiagnostics({
   endpoints,
-  effectiveEndpointId,
+  endpointsReady,
   points,
 }: {
   endpoints: WorkspaceEndpoint[];
-  effectiveEndpointId: string | null;
+  endpointsReady: boolean;
   points: DevicePointView[];
   counts?: { good: number; bad: number; stale: number };
 }) {
+  // 本页连接选择（单选）：合法 query 沿用，缺失/非法回第一个，无连接即 Empty。
+  const endpointIds = useMemo(() => endpoints.map((e) => e.id), [endpoints]);
+  const { selected: effectiveEndpointId, select: onSelectConnection } = useConnectionQuery({
+    endpointIds,
+    mode: "single",
+    ready: endpointsReady,
+  });
   const active = endpoints.find((e) => e.id === effectiveEndpointId) ?? null;
   const [diag, setDiag] = useState<EndpointDiagnostics | null>(null);
   const [diagError, setDiagError] = useState("");
@@ -75,7 +85,7 @@ export function DeviceDiagnostics({
   }, [active?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!active) {
-    return <Alert type="warning" showIcon message="该设备暂无连接" description="请先新增连接后再诊断。" />;
+    return <Alert type="warning" showIcon message="该设备暂无连接" description="请先到「连接」页新增连接后再诊断。" />;
   }
 
   const epPoints = points.filter((p) => p.endpoint_id === active.id);
@@ -85,6 +95,11 @@ export function DeviceDiagnostics({
 
   return (
     <div key={active.id} style={{ display: "grid", gap: 16 }}>
+      <div style={{ display: "flex", alignItems: "center" }}>
+        <span style={{ marginLeft: "auto" }}>
+          <ConnectionSelect endpoints={endpoints} value={active.id} allowAll={false} onChange={onSelectConnection} />
+        </span>
+      </div>
       <Card size="small" title={`连接状态 · ${active.name ?? active.id}`} extra={<Tag>{active.driver_id}</Tag>}>
         {diagLoading ? (
           <div style={{ fontSize: 12, color: "#525252" }}>加载诊断中…</div>

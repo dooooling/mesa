@@ -1,7 +1,7 @@
 // M2 PointDetailDrawer：点击数据行打开，不跳页面。
 // - endpoint_id 只出现在“来源”下，不做主信息（Endpoint 是连接的后端映射）；
 // - 只有 /points/latest 快照时不画假趋势；历史/趋势后续再加；
-// - [打开连接配置]/[诊断] 进入同 Workspace 的对应 tab，保留 ?connection=。
+// - [采集设置]/[诊断] 进入同 Workspace 的对应 tab，保留 ?connection=。
 import { Button, Descriptions, Drawer, Space, Tag } from "antd";
 import { useNavigate } from "react-router-dom";
 import { formatAge, formatPointValue } from "../deviceModel";
@@ -29,10 +29,10 @@ export function PointDetailDrawer(props: {
   const { deviceId, deviceName, point, onClose, onRenamed } = props;
   const nav = useNavigate();
 
-  const gotoConfig = () => {
+  const gotoAcquisition = () => {
     if (!point) return;
     onClose();
-    nav(`/devices/${deviceId}/config?connection=${point.endpoint_id}`);
+    nav(`/devices/${deviceId}/acquisition?connection=${point.endpoint_id}`);
   };
   const gotoDiagnostics = () => {
     if (!point) return;
@@ -130,7 +130,7 @@ export function PointDetailDrawer(props: {
           </section>
 
           <Space>
-            <Button type="primary" onClick={gotoConfig}>打开连接配置</Button>
+            <Button type="primary" onClick={gotoAcquisition}>采集设置</Button>
             <Button onClick={gotoDiagnostics}>诊断</Button>
           </Space>
         </div>

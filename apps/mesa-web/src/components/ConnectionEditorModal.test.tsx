@@ -1,9 +1,10 @@
-// PR30 Gate（P0）：Connection Pane 跨 Endpoint 归属安全。
+// ConnectionEditorModal 归属安全（由 EndpointConnectionPane.test 迁移，
+// Pane→Modal 容器变更，安全约束不变）：
 // A→B 切换时 B 未 ready 前保存必须 disabled；A 的迟到响应不得污染 B。
 import { describe, expect, it, vi, beforeEach, type Mock } from "vitest";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { api } from "../api";
-import { EndpointConnectionPane } from "./EndpointConnectionPane";
+import { ConnectionEditorModal } from "./ConnectionEditorModal";
 
 vi.mock("../api", () => ({
   api: {
@@ -44,17 +45,30 @@ function mockFetchConn(resolvers: Record<string, (v: unknown) => void>) {
   mocked.startEndpoint.mockResolvedValue({ status: 200, body: {} });
 }
 
+function renderModal(ep: string, name: string) {
+  return render(
+    <ConnectionEditorModal
+      key={ep}
+      endpointId={ep}
+      deviceId="dev"
+      driverId="drv"
+      initialName={name}
+      open
+      onClose={() => {}}
+      onChanged={() => {}}
+    />,
+  );
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
 });
 
-describe("EndpointConnectionPane 归属安全", () => {
+describe("ConnectionEditorModal 归属安全", () => {
   it("B 未 ready 前保存 disabled（A→B 切换窗口不可写）", async () => {
     const resolvers: Record<string, (v: unknown) => void> = {};
     mockFetchConn(resolvers);
-    const { rerender } = render(
-      <EndpointConnectionPane endpointId="ep-a" deviceId="dev" driverId="drv" initialName="A" onChanged={() => {}} />,
-    );
+    const { unmount } = renderModal("ep-a", "A");
     // A 先回：保存可用
     await waitFor(() => expect(resolvers["ep-a"]).toBeDefined());
     await act(async () => {
@@ -62,10 +76,9 @@ describe("EndpointConnectionPane 归属安全", () => {
     });
     await waitFor(() => expect(screen.getByRole("button", { name: /保\s*存/ })).toBeTruthy());
     expect((screen.getByRole("button", { name: /保\s*存/ }) as HTMLButtonElement).disabled).toBe(false);
-    // 切到 B：B 的 GET 在途，快照复位后保存必须禁用
-    rerender(
-      <EndpointConnectionPane endpointId="ep-b" deviceId="dev" driverId="drv" initialName="B" onChanged={() => {}} />,
-    );
+    // 切到 B（父页 key remount 语义）：B 的 GET 在途，快照复位后保存必须禁用
+    unmount();
+    renderModal("ep-b", "B");
     await waitFor(() => expect(resolvers["ep-b"]).toBeDefined());
     expect((screen.getByRole("button", { name: /保\s*存/ }) as HTMLButtonElement).disabled).toBe(true);
     // B 回来后恢复可用
@@ -80,13 +93,11 @@ describe("EndpointConnectionPane 归属安全", () => {
   it("A 的迟到响应不得污染 B（保存写 B 的连接）", async () => {
     const resolvers: Record<string, (v: unknown) => void> = {};
     mockFetchConn(resolvers);
-    const { rerender } = render(
-      <EndpointConnectionPane endpointId="ep-a" deviceId="dev" driverId="drv" initialName="A" onChanged={() => {}} />,
-    );
+    const { unmount } = renderModal("ep-a", "A");
     await waitFor(() => expect(resolvers["ep-a"]).toBeDefined());
-    rerender(
-      <EndpointConnectionPane endpointId="ep-b" deviceId="dev" driverId="drv" initialName="B" onChanged={() => {}} />,
-    );
+    // 切到 B：A 的请求仍在途（旧 Modal 已卸载，但 fetch 仍会 resolve）
+    unmount();
+    renderModal("ep-b", "B");
     await waitFor(() => expect(resolvers["ep-b"]).toBeDefined());
     // B 先回（host=B）
     await act(async () => {
@@ -95,7 +106,7 @@ describe("EndpointConnectionPane 归属安全", () => {
     await waitFor(() =>
       expect((screen.getByRole("button", { name: /保\s*存/ }) as HTMLButtonElement).disabled).toBe(false),
     );
-    // A 后回（host=A）：必须被丢弃，输入框仍是 B 的值
+    // A 后回（host=A）：旧 Modal 已卸载，cancelled 丢弃；B 输入框仍是 B 的值
     await act(async () => {
       resolvers["ep-a"]({ id: "ep-a", name: "A", connection: { host: "host-a" } });
     });

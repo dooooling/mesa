@@ -68,7 +68,16 @@ export interface DeviceWorkspaceData {
   device: Device | null;
   deviceNotFound: boolean;
   deviceError: string;
+  /**
+   * 全局 inventory（未按设备过滤；仅供跨设备证明/聚合页使用）。
+   * 设备页必须用 deviceEndpoints，绝不能直接消费它（跨设备泄漏）。
+   */
   endpoints: WorkspaceEndpoint[];
+  /**
+   * 当前设备作用域的连接（device_id === deviceId，顺序即展示顺序）。
+   * Workspace 层唯一真相；六个页面和 Header 只允许收这个。
+   */
+  deviceEndpoints: WorkspaceEndpoint[];
   endpointsReady: boolean;
   endpointsError: string;
   /** 归属当前设备的连接 id（顺序即展示顺序）。失败时保留 last-known，不变空。 */
@@ -255,13 +264,16 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
     [endpoints, devices, device],
   );
 
-  // 当前设备的连接 id：按 device_id 过滤全局 last-known inventory。
+  // 当前设备的连接：按 device_id 过滤全局 last-known inventory。
   // 切 device 瞬间旧清单仍在，但 deviceId 已变，过滤结果自然为空（不串台）；
-  // 新 inventory 就绪后恢复。本值只决定“有哪些连接”，不决定 point 归属
-  //（归属由 devicePoints 的 ctx mapping 独立判定）。
-  const endpointIds = useMemo(
-    () => endpoints.filter((e) => (e.device_id ?? "") === deviceId).map((e) => e.id),
+  // 新 inventory 就绪后恢复。Workspace 层唯一设备作用域真相——页面只收这个。
+  const deviceEndpoints = useMemo(
+    () => endpoints.filter((e) => (e.device_id ?? "") === deviceId),
     [endpoints, deviceId],
+  );
+  const endpointIds = useMemo(
+    () => deviceEndpoints.map((e) => e.id),
+    [deviceEndpoints],
   );
 
   const devicePoints = useMemo(() => {
@@ -300,6 +312,7 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
     deviceNotFound,
     deviceError,
     endpoints,
+    deviceEndpoints,
     endpointsReady,
     endpointsError,
     endpointIds,

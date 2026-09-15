@@ -156,10 +156,11 @@ describe("M7 全局事件（device 服务端过滤）", () => {
     await user.click(screen.getByText("cnc-alarm"));
     await screen.findByText("打开设备 →");
     await user.click(screen.getByText("打开设备 →"));
-    // 进入设备事件页（设备身份 + 连接上下文 FOCAS）
+    // 进入设备事件页（MemoryRouter 不写 window.location，用事件页内容断言；
+    // Device 名在 Header/面包屑多处，用 AllBy）
     await waitFor(() => {
-      expect(screen.getByTestId("workspace-connection-context").textContent ?? "").toContain("FOCAS");
-    });
+      expect(screen.getAllByText("CNC-01").length).toBeGreaterThanOrEqual(1);
+    }, { timeout: 10000 });
     // 并行 worker 下跨页导航 + 多轮事件链较重，放宽超时（单跑 7s 内稳定）。
   }, 30000);
 });
