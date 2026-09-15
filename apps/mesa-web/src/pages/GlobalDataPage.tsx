@@ -75,10 +75,10 @@ export function GlobalDataPage() {
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return src.allPoints.filter((p) => {
-      if (deviceParam !== "ALL" && p.deviceId !== deviceParam) {
-        // 归属未知（清单缺失）时 fail-closed 保留，除非设备已选且点明确归属它设备。
-        if (p.deviceId) return false;
-      }
+      // RC2 修1：选了具体设备时归属必须可证明（p.deviceId === deviceParam），
+      // 未知归属一律排除——“无法判断”绝不解释成“可能属于所选设备”。
+      // device=ALL 是聚合本职，全显（含未知归属，归属列明示）。
+      if (deviceParam !== "ALL" && p.deviceId !== deviceParam) return false;
       if (connectionParam !== "ALL" && p.endpoint_id !== connectionParam) return false;
       if (status !== "ALL" && p.derived !== status) return false;
       if (!q) return true;

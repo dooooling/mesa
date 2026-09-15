@@ -297,3 +297,179 @@ describe("M2 代际守卫", () => {
     expect(screen.getByText("point-b")).toBeTruthy();
   });
 });
+
+describe("RC2 ownership fail-closed", () => {
+  it("11. A 开 Point Drawer 后切 B：Drawer 必须关闭（不展示 A 的点）", async () => {
+    vi.useRealTimers();
+    (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string) => {
+      if (url === "/api/v1/devices/cnc-a" || url === "/api/v1/devices/cnc-b") {
+        const id = url.split("/").pop()!;
+        return { ok: true, status: 200, json: async () => ({ id, name: id.toUpperCase() }) };
+      }
+      if (url === "/api/v1/devices" || url === "/api/v1/endpoints") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            devices: [
+              { id: "cnc-a", name: "CNC-A" },
+              { id: "cnc-b", name: "CNC-B" },
+            ],
+            endpoints: [
+              { id: "ep-a", name: "EP-A", driver_id: "s7", device_id: "cnc-a", state: "RUNNING" },
+              { id: "ep-b", name: "EP-B", driver_id: "s7", device_id: "cnc-b", state: "RUNNING" },
+            ],
+          }),
+        };
+      }
+      if (url === "/api/v1/points/latest") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ points: [pt("ep-a", "point-a", "GOOD", 500), pt("ep-b", "point-b", "GOOD", 500)] }),
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    }) as unknown as typeof fetch;
+    const { Link } = await import("react-router-dom");
+    function Nav() {
+      return (
+        <div>
+          <Link to="/devices/cnc-a/data">go-a</Link>
+          <Link to="/devices/cnc-b/data">go-b</Link>
+        </div>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <Nav />
+        <Routes>
+          <Route path="/" element={<div>home</div>} />
+          <Route path="/devices/:deviceId/:tab" element={<DeviceWorkspacePage />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByText("go-a"));
+    await waitFor(() => expect(screen.getByText("point-a")).toBeTruthy(), { timeout: 10000 });
+    await user.click(screen.getByText("point-a"));
+    await screen.findByText("打开连接配置", undefined, { timeout: 10000 });
+    // 切 B：Drawer 必须关闭（A 的 point 不得留在 B 页面）
+    await user.click(screen.getByText("go-b"));
+    await waitFor(() => expect(screen.queryByText("打开连接配置")).toBeNull(), { timeout: 10000 });
+    // B 自己的点正常显示
+    expect(screen.getByText("point-b")).toBeTruthy();
+  }, 30000);
+
+  // review blocker：A→B 切换窗口 + B inventory 失败时，未知归属 points
+  // 绝不能进入 B 的 devicePoints（错误设备归属展示，不是闪烁）。
+  it("9. A→B 时 B inventory 挂起：A 旧 points 绝不出现在 B", async () => {
+    vi.useRealTimers();
+    const invGates: Array<{ resolve: () => void }> = [];
+    (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string) => {
+      if (url === "/api/v1/devices/cnc-a" || url === "/api/v1/devices/cnc-b") {
+        const id = url.split("/").pop()!;
+        return { ok: true, status: 200, json: async () => ({ id, name: id.toUpperCase() }) };
+      }
+      if (url === "/api/v1/devices" || url === "/api/v1/endpoints") {
+        // inventory 挂起：调用方放行
+        const gate: { resolve: () => void } = { resolve: () => {} };
+        const p = new Promise<void>((r) => {
+          gate.resolve = r;
+        });
+        invGates.push(gate);
+        await p;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            devices: [
+              { id: "cnc-a", name: "CNC-A" },
+              { id: "cnc-b", name: "CNC-B" },
+            ],
+            endpoints: [
+              { id: "ep-a", name: "EP-A", driver_id: "s7", device_id: "cnc-a", state: "RUNNING" },
+              { id: "ep-b", name: "EP-B", driver_id: "s7", device_id: "cnc-b", state: "RUNNING" },
+            ],
+          }),
+        };
+      }
+      if (url === "/api/v1/points/latest") {
+        // points 始终回 A 的点（last-known 保留场景）
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ points: [pt("ep-a", "point-a", "GOOD", 500)] }),
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    }) as unknown as typeof fetch;
+    const { Link } = await import("react-router-dom");
+    function Nav() {
+      return (
+        <div>
+          <Link to="/devices/cnc-a/data">go-a</Link>
+          <Link to="/devices/cnc-b/data">go-b</Link>
+        </div>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <Nav />
+        <Routes>
+          <Route path="/" element={<div>home</div>} />
+          <Route path="/devices/:deviceId/:tab" element={<DeviceWorkspacePage />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const user = userEvent.setup();
+    // A：inventory 放行，point-a 出现
+    await user.click(screen.getByText("go-a"));
+    await waitFor(() => expect(invGates.length).toBeGreaterThanOrEqual(1));
+    invGates.forEach((g) => g.resolve());
+    await waitFor(() => expect(screen.getByText("point-a")).toBeTruthy());
+    // 切 B：B 的 inventory 挂起（新 gate 不放行），points 仍是 A 的旧点
+    await user.click(screen.getByText("go-b"));
+    await waitFor(() => expect(invGates.length).toBeGreaterThanOrEqual(2));
+    await new Promise((r) => setTimeout(r, 300));
+    // B inventory 未就绪 → A 的点绝不能出现（owner=A≠B；B 的点无 mapping 同样不出）
+    expect(screen.queryByText("point-a")).toBeNull();
+    // B inventory 恢复 → 仍无 point-a（A 的点 owner 明确非 B）
+    invGates.forEach((g) => g.resolve());
+    await new Promise((r) => setTimeout(r, 300));
+    expect(screen.queryByText("point-a")).toBeNull();
+  }, 30000);
+
+  it("10. B inventory 失败：未知归属 points 全部排除（空列表，不展示别家）", async () => {
+    vi.useRealTimers();
+    (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string) => {
+      if (url === "/api/v1/devices/cnc-b") {
+        return { ok: true, status: 200, json: async () => ({ id: "cnc-b", name: "CNC-B" }) };
+      }
+      if (url === "/api/v1/devices" || url === "/api/v1/endpoints") {
+        return { ok: false, status: 500, json: async () => ({ error: { message: "boom" } }) };
+      }
+      if (url === "/api/v1/points/latest") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ points: [pt("ghost-ep", "ghost-point", "GOOD", 500)] }),
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    }) as unknown as typeof fetch;
+    render(
+      <MemoryRouter initialEntries={["/devices/cnc-b/data"]}>
+        <Routes>
+          <Route path="/devices/:deviceId/:tab" element={<DeviceWorkspacePage />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    // inventory 失败告警出现，且 ghost 点绝不渲染
+    await waitFor(
+      () => expect(screen.getByText("连接清单不可用")).toBeTruthy(),
+      { timeout: 10000 },
+    );
+    expect(screen.queryByText("ghost-point")).toBeNull();
+  }, 30000);
+});

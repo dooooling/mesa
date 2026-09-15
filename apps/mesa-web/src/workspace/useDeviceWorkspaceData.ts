@@ -128,7 +128,12 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
     setDevice(null);
     setDeviceNotFound(false);
     setDeviceError("");
-    setEndpoints([]);
+    // RC2 修1：切 device 不再清空 endpoints/devices——/endpoints 与 /devices
+    // 是全局 inventory，last-known 可继续为 ownership mapping 提供证明；
+    // 按 deviceId 过滤的派生值（endpointIds/devicePoints）自然因 deviceId
+    // 变化而失效，不会串台。清空它们反而制造“无法证明归属”的窗口。
+    // 但 endpointsReady 必须复位（它是“当前 device inventory 已加载”的标志，
+    // 调用方据此决定是否动 URL；数据保留，标志复位）。
     setEndpointsReady(false);
     setEndpointsError("");
     // points 快照保留 last-known（跨设备切换不清零旧点，过滤后自然不可见；
@@ -223,32 +228,31 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
     [endpoints, devices, device],
   );
 
-  // 当前设备的连接 id：endpoints 未就绪前返回 last-known（state 里旧值），
-  // 绝不因一次失败变空；device 切换时 endpoints 已随代际清空，自然不可见。
+  // 当前设备的连接 id：按 device_id 过滤全局 last-known inventory。
+  // 切 device 瞬间旧清单仍在，但 deviceId 已变，过滤结果自然为空（不串台）；
+  // 新 inventory 就绪后恢复。本值只决定“有哪些连接”，不决定 point 归属
+  //（归属由 devicePoints 的 ctx mapping 独立判定）。
   const endpointIds = useMemo(
     () => endpoints.filter((e) => (e.device_id ?? "") === deviceId).map((e) => e.id),
     [endpoints, deviceId],
   );
-  const endpointIdSet = useMemo(() => new Set(endpointIds), [endpointIds]);
 
   const devicePoints = useMemo(() => {
     const views: DevicePointView[] = [];
     for (const p of points) {
-      const c = ctx.get(p.endpoint_id);
-      // 归属判定优先用 ctx（endpoints 清单），清单缺失该 endpoint 时回落：
-      // 若快照里有 deviceId 明确归属其它设备则排除，否则保留（fail-closed，
-      // 避免清单一次失败把全量点过滤成空）。
-      const owner = c?.deviceId ?? "";
-      if (owner && owner !== deviceId) continue;
-      if (!owner && !endpointIdSet.has(p.endpoint_id)) {
-        // endpoint 不在当前设备的 last-known 清单里：只有当清单已就绪且
-        // 明确非空时才排除（此时“不在清单”即“不归属”）；清单未就绪/失败时保留。
-        if (endpointsReady && endpointIds.length > 0) continue;
-      }
+      // RC2 修1：ownership 真正 fail-closed。能证明 endpoint 归属当前 device
+      //（ctx mapping 的 deviceId === deviceId）才显示；mapping 缺失（未知）
+      // 一律排除——“无法判断”绝不解释成“可能属于当前设备”。
+      // 切 device 窗口：旧 inventory 仍在，A 的 points owner=A≠B 被排除；
+      // B 的新 points 在旧清单无 mapping，同样被排除；等 B inventory 就绪
+      // 后 mapping 完整才显示。inventory 失败时 owner 恒未知 → 空列表
+      //（配 empty 态，不展示别家数据）。
+      const owner = ctx.get(p.endpoint_id)?.deviceId ?? "";
+      if (owner !== deviceId) continue;
       views.push(toView(p, nowMs, ctx));
     }
     return views;
-  }, [points, ctx, deviceId, endpointIdSet, endpointsReady, endpointIds.length, nowMs]);
+  }, [points, ctx, deviceId, nowMs]);
 
   const counts = useMemo(() => {
     let good = 0;
