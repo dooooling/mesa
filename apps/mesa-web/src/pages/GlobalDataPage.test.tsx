@@ -138,6 +138,45 @@ describe("M3.1 全局实时数据", () => {
     expect(screen.getByText("STALE")).toBeTruthy();
   });
 
+  it("连续失败仍自然 STALE（与设备页 staleNonce 同构）", async () => {
+    let fail = false;
+    (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string) => {
+      if (url === "/api/v1/devices") {
+        return { ok: true, status: 200, json: async () => ({ devices: [{ id: "cnc-01", name: "CNC-01" }] }) };
+      }
+      if (url === "/api/v1/endpoints") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            endpoints: [{ id: "focas", name: "FOCAS", driver_id: "focas2", device_id: "cnc-01", state: "RUNNING" }],
+          }),
+        };
+      }
+      if (url === "/api/v1/points/latest") {
+        if (fail) return { ok: false, status: 500, json: async () => ({ error: { message: "boom" } }) };
+        // 初始 age 29s（GOOD，阈值 30s 内）
+        return { ok: true, status: 200, json: async () => ({ points: [pt("focas", "edge-k", "GOOD", 29_000)] }) };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    });
+    renderApp("/data");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getAllByText("edge-k").length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText("STALE")).toBeNull();
+    // 后续持续失败 + 时间推进 2s（越过 30s 阈值）：失败分支 bump staleNonce
+    // 重派生，GOOD 必须自然变 STALE（derived 不冻住）。
+    fail = true;
+    vi.setSystemTime(T0 + 2000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(screen.getAllByText("edge-k").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("STALE")).toBeTruthy();
+  });
+
   it("共用 Drawer：来源齐全，“打开设备”闭环回设备页", async () => {
     vi.useRealTimers();
     mockGlobal();

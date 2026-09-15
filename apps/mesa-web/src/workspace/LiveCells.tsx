@@ -3,7 +3,7 @@
 // 跟着 render（memo 身份稳定才真正 bailout）。
 import { memo } from "react";
 import { Tag } from "antd";
-import { formatAge, pointAgeMs } from "../deviceModel";
+import { formatAge, formatPointValue, pointAgeMs } from "../deviceModel";
 import { PointNameCell } from "./PointNameCell";
 import { useStaleTick } from "./StaleClock";
 
@@ -61,7 +61,7 @@ export const ValueCell = memo(
   function ValueCell({ value }: { value: unknown }) {
     return (
       <span title={String(value ?? "")} style={{ ...NUMERIC_MONO, ...ELLIPSIS }}>
-        {formatValue(value)}
+        {formatPointValue(value)}
       </span>
     );
   },
@@ -81,21 +81,6 @@ function valueEqual(a: unknown, b: unknown): boolean {
     }
   }
   return false;
-}
-
-/** 值渲染（与 deviceModel.formatPointValue 同行为：标量直显，超长截断 160）。 */
-function formatValue(value: unknown): string {
-  if (value === null || value === undefined) return "—";
-  if (typeof value === "string") return value.length > 160 ? `${value.slice(0, 160)}…` : value;
-  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
-    return String(value);
-  }
-  try {
-    const s = JSON.stringify(value) ?? String(value);
-    return s.length > 160 ? `${s.slice(0, 160)}…` : s;
-  } catch {
-    return String(value);
-  }
 }
 
 /** 状态列：Tag 宽度由文本决定（GOOD/BAD/STALE/UNKNOWN），列宽固定后不挤邻列。 */

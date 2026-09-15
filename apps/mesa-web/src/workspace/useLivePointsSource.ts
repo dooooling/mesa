@@ -44,6 +44,8 @@ export function useLivePointsSource(): LivePointsSource {
   const [endpointsError, setEndpointsError] = useState("");
   const [points, setPoints] = useState<WorkspacePoint[]>([]);
   const [pointsError, setPointsError] = useState(false);
+  // 失败分支 bump：与设备页 staleNonce 同构，失败才重派生 STALE。
+  const [staleNonce, setStaleNonce] = useState(0);
   // 无 nowMs state：interval 只拉取，不 tick 整页。
   const gen = useRef(0);
 
@@ -101,6 +103,7 @@ export function useLivePointsSource(): LivePointsSource {
         .catch(() => {
           if (cancelled || gen.current !== id) return;
           setPointsError(true);
+          setStaleNonce((n) => n + 1);
         });
     };
 
@@ -130,8 +133,10 @@ export function useLivePointsSource(): LivePointsSource {
   );
 
   const allPoints = useMemo<DevicePointView[]>(
-    () =>
-      points.map((p) => {
+    () => {
+      // 失败时 staleNonce 推进 STALE（异常路径才重算，正常零 churn）。
+      void staleNonce;
+      return points.map((p) => {
         const c = ctx.get(p.endpoint_id);
         const buildNow = Date.now();
         const ageMs = pointAgeMs(p.timestamp_ns, buildNow);
@@ -147,9 +152,10 @@ export function useLivePointsSource(): LivePointsSource {
           deviceId: c?.deviceId ?? "",
           deviceName: c?.deviceName ?? "",
         };
-      }),
+      });
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [points, ctx],
+    [points, ctx, staleNonce],
   );
 
   const counts = useMemo(() => {
