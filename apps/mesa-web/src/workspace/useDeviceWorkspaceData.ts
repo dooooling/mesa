@@ -25,6 +25,11 @@ export interface WorkspacePoint {
   timestamp_ns: number;
   /** P1 来源标签（Driver 人类可读来源，如 S7 DB10.DBD20）；缺失即未支持。 */
   source_label?: string;
+  /**
+   * P2 用户展示名（registry 用户元数据，configure 不产生）。
+   * 缺失/空即未设置，UI 回落 point_key；永远不改变 id/key/label。
+   */
+  display_name?: string;
 }
 
 export interface WorkspaceEndpoint {
@@ -38,7 +43,10 @@ export interface WorkspaceEndpoint {
 export type PointStale = "GOOD" | "BAD" | "STALE" | "UNKNOWN";
 
 export interface DevicePointView extends WorkspacePoint {
-  /** 展示用点名（key 缺失回落 point_key，再缺失回落 point_id）。 */
+  /**
+   * P2 展示用点名：display_name ?? key ?? point_key ?? point_id。
+   * display_name 是用户命名（可改名），key/point_key 是语义身份。
+   */
   displayKey: string;
   /**
    * P1 来源展示（Name/Source 双字段口径）：
@@ -74,6 +82,11 @@ export interface DeviceWorkspaceData {
   counts: { total: number; good: number; bad: number; stale: number; unknown: number };
   /** M6：配置变更后立即刷新 inventory（不等 10s 轮询）。代际守卫内，安全。 */
   reloadInventory: () => void;
+  /**
+   * P2：改名后本地即时更新 points 快照（不等 1s 轮询）。
+   * 只改 display_name 字段，不碰值/时间戳/派生状态。
+   */
+  patchDisplayName: (endpoint_id: string, point_key: string, display_name: string | null) => void;
 }
 
 export const DEVICE_POINTS_POLL_MS = 1000;
@@ -95,7 +108,9 @@ function toView(
   const ageMs = pointAgeMs(p.timestamp_ns, nowMs);
   return {
     ...p,
-    displayKey: p.key ?? p.point_key ?? String(p.point_id),
+    // P2 Name：display_name ?? key（point_key） ?? point_id。
+    // display_name 为空串视为未设置（后端拒绝空串入库，此处防御性处理）。
+    displayKey: p.display_name?.trim() ? p.display_name : (p.key ?? p.point_key ?? String(p.point_id)),
     // P1 Source：有 label 即标签；缺失为 None（UI 显示"未提供"，
     // 不拿 point_key 反推——key 是"它是什么"，不是"它从哪里来"）。
     sourceText: p.source_label ?? null,
@@ -294,5 +309,14 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
     devicePoints,
     counts,
     reloadInventory: () => reloadRef.current(),
+    patchDisplayName: (endpoint_id, point_key, display_name) => {
+      setPoints((prev) =>
+        prev.map((p) =>
+          p.endpoint_id === endpoint_id && (p.key ?? p.point_key) === point_key
+            ? { ...p, display_name: display_name ?? undefined }
+            : p,
+        ),
+      );
+    },
   };
 }

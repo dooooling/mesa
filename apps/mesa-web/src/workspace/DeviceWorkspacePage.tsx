@@ -308,6 +308,13 @@ export function DeviceWorkspacePage() {
         deviceName={device?.name ?? deviceId}
         point={openPoint}
         onClose={() => setOpenPoint(null)}
+        // P2 改名：同步快照（表格双行即时更新）+ 刷新 Drawer 内展示。
+        onRenamed={(display_name) => {
+          if (!openPoint) return;
+          const key = openPoint.key ?? openPoint.point_key ?? "";
+          data.patchDisplayName(openPoint.endpoint_id, String(key), display_name);
+          setOpenPoint({ ...openPoint, display_name: display_name ?? undefined });
+        }}
       />
     </div>
   );

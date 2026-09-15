@@ -282,6 +282,8 @@ fn disconnect_preserves_typed_last_value() {
             data_type: DataType::I32,
             unit: None,
             source_label: None,
+
+            display_name: None,
         }],
     );
     let batch = DataBatch {
@@ -315,6 +317,8 @@ fn disconnect_keeps_original_timestamp() {
             data_type: DataType::U32,
             unit: None,
             source_label: None,
+
+            display_name: None,
         }],
     );
     let ts = now_unix_ns();
@@ -345,6 +349,8 @@ fn disconnect_sets_bad_communication_lost() {
             data_type: DataType::Bool,
             unit: None,
             source_label: None,
+
+            display_name: None,
         }],
     );
     snap.apply_batch(
@@ -377,6 +383,7 @@ fn one_output_bad_does_not_poison_sibling() {
                 data_type: DataType::I32,
                 unit: None,
                 source_label: None,
+                display_name: None,
             },
             mesa_core_types::PointDefinition {
                 point_id: 2,
@@ -384,6 +391,7 @@ fn one_output_bad_does_not_poison_sibling() {
                 data_type: DataType::I32,
                 unit: None,
                 source_label: None,
+                display_name: None,
             },
         ],
     );
@@ -426,6 +434,8 @@ fn p0a_good_bad_good_platform_continuity() {
             data_type: DataType::F64,
             unit: None,
             source_label: None,
+
+            display_name: None,
         }],
     );
     // GOOD Current 12.5 @ T1
@@ -521,6 +531,8 @@ fn p0a_first_bad_is_placeholder_no_source_timestamp() {
             data_type: DataType::F64,
             unit: None,
             source_label: None,
+
+            display_name: None,
         }],
     );
     // 首次采样即 BAD，无 LastKnown → Placeholder + typed neutral + source None
@@ -569,6 +581,8 @@ fn p0a_snapshot_rest_value_origin_not_lost() {
             data_type: DataType::I32,
             unit: None,
             source_label: None,
+
+            display_name: None,
         }],
     );
     // LastKnown

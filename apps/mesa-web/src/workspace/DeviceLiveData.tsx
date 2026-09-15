@@ -6,6 +6,7 @@ import { useMemo, useState } from "react";
 import { Button, Input, Select, Space, Table, Tag } from "antd";
 import { formatAge, formatPointValue } from "../deviceModel";
 import type { DevicePointView, WorkspaceEndpoint } from "./useDeviceWorkspaceData";
+import { PointNameCell } from "./PointNameCell";
 
 type StatusFilter = "ALL" | "GOOD" | "BAD" | "STALE";
 
@@ -98,12 +99,9 @@ export function DeviceLiveData(props: {
         onRow={(r) => ({ onClick: () => onOpenPoint(r as DevicePointView), style: { cursor: "pointer" } })}
         columns={[
           {
+            // P2 双行：第一行展示名，第二行 point_key（仅命名时）。
             title: "数据点",
-            render: (_: unknown, r: DevicePointView) => (
-              <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>
-                {r.displayKey}
-              </span>
-            ),
+            render: (_: unknown, r: DevicePointView) => <PointNameCell point={r} />,
           },
           {
             // P1 来源列：有标签即标签；缺失显示"—"。

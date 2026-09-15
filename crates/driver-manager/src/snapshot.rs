@@ -102,9 +102,13 @@ pub struct LatestEntry {
     // 兼容：同时输出 key，避免旧 UI 读取 point_key 为 undefined
     pub key: String,
     /// P1 Point Presentation Metadata：Driver 给的人类可读来源（如 S7
-    /// `DB10.DBD20`）。None 即未支持，UI 回落技术坐标。纯展示，非 identity。
+    /// `DB10.DBD20`）。None 即未支持，UI 诚实显示未提供。纯展示，非 identity。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_label: Option<String>,
+    /// P2 用户展示名（registry 回填，configure 不产生）。None = 未设置，
+    /// UI 回落 point_key；改名不改变 point_id/key/label。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(flatten)]
     pub value: ValueJson,
     pub quality: String,
@@ -121,9 +125,9 @@ pub struct LatestEntry {
     pub source_timestamp_ns: Option<i64>,
 }
 
-/// P1 点元数据：(point_key, source_label)。热路径 apply_batch 一次读锁同时
-/// 取 key+label，不新增锁（50K/s 锁争用敏感）。
-type PointMeta = (String, Option<String>);
+/// P2 后点元数据：(point_key, source_label, display_name)。热路径 apply_batch
+/// 一次读锁同时取三者，不新增锁（50K/s 锁争用敏感）。
+type PointMeta = (String, Option<String>, Option<String>);
 
 /// 进程级共享快照。锁粒度按用途拆分，REST 读路径互不阻塞；latest/meta 采用 RwLock
 /// 以支持高频 DataBatch 写入与 REST 并发读取（§22 50K/s 下 apply_batch 与 latest_all 争用显著）。
@@ -187,31 +191,38 @@ impl Snapshot {
         self.endpoints.read().unwrap().get(id).cloned()
     }
 
-    /// 记录点元数据（ApplyPointMap 时）：point_id -> (point_key, source_label)，
-    /// 供 latest 输出回填可读键名与来源；数据类型由值本身携带（ValueJson.type）。
+    /// 记录点元数据（ApplyPointMap 时）：point_id -> (point_key, source_label, display_name)，
+    /// 供 latest 输出回填可读键名、来源与展示名；数据类型由值本身携带（ValueJson.type）。
     /// 语义为 replace：先清理该 endpoint 的旧映射，再插入新集合，避免减少任务后旧点残留。
     /// P1：source_label 同步 replace（含 None 清空，与 registry 快照语义一致）；
     /// 已有 LatestEntry 的 key/label 立即同步刷新（不等下一批 DataBatch，
     /// 否则改地址后 Start 失败/离线期间 UI 长期显示旧来源）。
+    /// P2：display_name 同步 replace；已有 LatestEntry 的展示名同样立即刷新
+    ///（改名后不等下一批即生效）。
     pub fn register_points(&self, endpoint_id: &str, defs: &[mesa_core_types::PointDefinition]) {
         let mut meta = self.point_meta.write().unwrap();
         meta.retain(|(ep, _), _| ep != endpoint_id);
         for d in defs {
             meta.insert(
                 (endpoint_id.to_string(), d.point_id),
-                (d.point_key.clone(), d.source_label.clone()),
+                (
+                    d.point_key.clone(),
+                    d.source_label.clone(),
+                    d.display_name.clone(),
+                ),
             );
         }
-        // 同步清理 latest 中已不在新点集的旧点；保留的立即刷新 key/label
+        // 同步清理 latest 中已不在新点集的旧点；保留的立即刷新 key/label/name
         let mut latest = self.latest.write().unwrap();
         latest.retain(|(ep, pid), _| ep != endpoint_id || meta.contains_key(&(ep.clone(), *pid)));
         for ((ep, _), entry) in latest.iter_mut() {
             if ep == endpoint_id
-                && let Some((k, label)) = meta.get(&(ep.clone(), entry.point_id))
+                && let Some((k, label, name)) = meta.get(&(ep.clone(), entry.point_id))
             {
                 entry.point_key = k.clone();
                 entry.key = k.clone();
                 entry.source_label = label.clone();
+                entry.display_name = name.clone();
             }
         }
     }
@@ -225,7 +236,7 @@ impl Snapshot {
         self.envelopes_total.fetch_add(1, Ordering::Relaxed);
         self.point_value_total
             .fetch_add(batch.values.len() as u64, Ordering::Relaxed);
-        // 预构建本批次所需的 key+label 映射快照（仅一次读锁，不新增锁）。
+        // 预构建本批次所需的 key+label+name 映射快照（仅一次读锁，不新增锁）。
         let meta_snapshot: HashMap<(String, u32), PointMeta> = {
             let meta = self.point_meta.read().unwrap();
             batch
@@ -241,7 +252,8 @@ impl Snapshot {
         let mut latest = self.latest.write().unwrap();
         for pv in &batch.values {
             let k = (endpoint_id.to_string(), pv.point_id);
-            let (point_key, source_label) = meta_snapshot.get(&k).cloned().unwrap_or_default();
+            let (point_key, source_label, display_name) =
+                meta_snapshot.get(&k).cloned().unwrap_or_default();
             // V1.2.1：透传 value_origin + source_timestamp，Placeholder 强制 source=None（已在解码层保证）
             let origin = pv
                 .value_origin
@@ -259,6 +271,7 @@ impl Snapshot {
                 point_key: point_key.clone(),
                 key: point_key,
                 source_label,
+                display_name,
                 value: value_to_json(&pv.value),
                 quality: pv.quality.as_str().to_string(),
                 quality_code: pv.quality_code.map(|c| c.to_string()).or_else(|| {
@@ -361,6 +374,23 @@ impl Snapshot {
         self.endpoints.write().unwrap().remove(endpoint_id);
     }
 
+    /// P2 改名同步（编辑 display_name 后调用）：更新 point_meta 与已有
+    /// LatestEntry 的展示名，point_id/key/label 不动，不等下一批即生效。
+    /// `name=None` = 清除（回落 point_key）。点不存在时静默无操作
+    ///（registry 已先校验活跃点，运行时缺席即尚未 register）。
+    pub fn update_display_name(&self, endpoint_id: &str, point_id: u32, name: Option<String>) {
+        {
+            let mut meta = self.point_meta.write().unwrap();
+            if let Some(m) = meta.get_mut(&(endpoint_id.to_string(), point_id)) {
+                m.2 = name.clone();
+            }
+        }
+        let mut latest = self.latest.write().unwrap();
+        if let Some(e) = latest.get_mut(&(endpoint_id.to_string(), point_id)) {
+            e.display_name = name;
+        }
+    }
+
     pub fn latest_all(&self) -> Vec<LatestEntry> {
         let mut v: Vec<_> = self.latest.read().unwrap().values().cloned().collect();
         v.sort_by(|a, b| {
@@ -390,6 +420,7 @@ mod tests {
                 data_type: DataType::F64,
                 unit: None,
                 source_label: None,
+                display_name: None,
             }],
         );
         let batch = DataBatch {
@@ -428,6 +459,7 @@ mod tests {
                 data_type: DataType::F64,
                 unit: None,
                 source_label: None,
+                display_name: None,
             }],
         );
         let pv_current = PointValue {
@@ -487,6 +519,7 @@ mod tests {
                 data_type: DataType::I32,
                 unit: None,
                 source_label: None,
+                display_name: None,
             }],
         );
         snap2.apply_batch(
@@ -527,6 +560,7 @@ mod tests {
                     data_type: DataType::F64,
                     unit: None,
                     source_label: Some("DB10.DBD20".into()),
+                    display_name: None,
                 },
                 PointDefinition {
                     point_id: 2,
@@ -534,6 +568,7 @@ mod tests {
                     data_type: DataType::F64,
                     unit: None,
                     source_label: None,
+                    display_name: None,
                 },
             ],
         );
@@ -587,6 +622,7 @@ mod tests {
                 data_type: DataType::F64,
                 unit: None,
                 source_label: label.map(|s| s.to_string()),
+                display_name: None,
             }]
         };
         let batch = || DataBatch {

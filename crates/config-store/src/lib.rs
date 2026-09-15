@@ -18,7 +18,7 @@ use mesa_core_types::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// 当前 schema 版本。增量迁移时递增并在 `meta` 中持久化（§6.1）。
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 // ---------------------------------------------------------------------------
 // 记录类型
@@ -212,8 +212,8 @@ fn aead_decrypt(ciphertext: &[u8], nonce: &[u8], key: &[u8; 32]) -> Result<Vec<u
 // Store
 // ---------------------------------------------------------------------------
 
-/// point_registry 行（诊断用）：key/id/类型/墓碑/来源标签。
-pub type RegistryRow = (String, u32, String, bool, Option<String>);
+/// point_registry 行（诊断用）：key/id/类型/墓碑/来源标签/展示名。
+pub type RegistryRow = (String, u32, String, bool, Option<String>, Option<String>);
 
 pub struct ConfigStore {
     conn: Mutex<Connection>,
@@ -339,6 +339,7 @@ impl ConfigStore {
                 unit TEXT,
                 deleted INTEGER NOT NULL DEFAULT 0,
                 source_label TEXT NULL,
+                display_name TEXT NULL,
                 PRIMARY KEY(endpoint_id, point_key)
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_point_registry_ep_pid
@@ -608,6 +609,45 @@ impl ConfigStore {
                 )?;
                 tx.commit()?;
                 cur_ver = 7;
+            }
+        }
+        // 008 迁移（Point Presentation Metadata P2）：point_registry 新增
+        // display_name（用户可编辑展示名，与 Driver 无关；configure 不覆盖）。
+        // 新库建表已含该列；旧库走迁移补列（ADD COLUMN，重入安全：列已存在即跳过）。
+        if cur_ver < 8 {
+            let has_8: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=8)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !has_8 {
+                Self::backup_file_db(&conn);
+                let has_col: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('point_registry') WHERE name='display_name')",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(false);
+                let sql8 = include_str!("../migrations/008_point_display_name.sql");
+                let tx = conn.transaction()?;
+                if !has_col {
+                    tx.execute_batch(sql8)?;
+                }
+                let checksum8 = format!("{:x}", sql8.len());
+                tx.execute(
+                    "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(8,'008_point_display_name',?1,?2)",
+                    params![checksum8, Self::now_ns()],
+                )?;
+                tx.execute("UPDATE meta SET value='8' WHERE key='schema_version'", [])?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','8')",
+                    [],
+                )?;
+                tx.commit()?;
+                cur_ver = 8;
             }
         }
         // 最终确保 meta 为最新
@@ -1436,25 +1476,27 @@ impl ConfigStore {
 
         let tx = conn.transaction()?;
 
-        // 已有映射
-        let mut existing: HashMap<String, (u32, bool)> = HashMap::new();
+        // 已有映射（含保留下来的 display_name：configure 不覆盖用户命名，
+        // 返回的定义即当前真值，运行时 register 可直接使用）
+        let mut existing: HashMap<String, (u32, bool, Option<String>)> = HashMap::new();
         {
             let mut stmt = tx.prepare(
-                "SELECT point_key, point_id, deleted FROM point_registry WHERE endpoint_id=?1",
+                "SELECT point_key, point_id, deleted, display_name FROM point_registry WHERE endpoint_id=?1",
             )?;
             let rows = stmt.query_map(params![endpoint_id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)? as u32,
                     r.get::<_, i32>(2)? != 0,
+                    r.get::<_, Option<String>>(3)?,
                 ))
             })?;
             for r in rows {
-                let (k, id, del) = r?;
-                existing.insert(k, (id, del));
+                let (k, id, del, name) = r?;
+                existing.insert(k, (id, del, name));
             }
         }
-        let max_id = existing.values().map(|(id, _)| *id).max().unwrap_or(0);
+        let max_id = existing.values().map(|(id, _, _)| *id).max().unwrap_or(0);
         let mut next_id = max_id + 1;
 
         // 标记本轮出现的 key，用于后续 tombstone 处理（删除的 key 保持墓碑，不复用 id）
@@ -1463,22 +1505,26 @@ impl ConfigStore {
 
         let mut out = Vec::with_capacity(descriptors.len());
         for d in descriptors {
-            let pid = if let Some((id, _del)) = existing.get(d.point_key.as_str()) {
-                *id
-            } else {
-                let id = next_id;
-                next_id += 1;
-                id
-            };
+            let (pid, kept_name) =
+                if let Some((id, _del, name)) = existing.get(d.point_key.as_str()) {
+                    (*id, name.clone())
+                } else {
+                    let id = next_id;
+                    next_id += 1;
+                    (id, None)
+                };
             // upsert：复用或新增均写入最新类型/unit/source_label 并清除 deleted。
             // source_label 是 configure 真值快照：Some 覆盖、None 清 NULL
             //（不得保留旧值，否则留下假来源）。
+            // display_name（P2）是用户元数据：configure 不得覆盖/清空，
+            // 显式保留旧值（新行默认 NULL = 未设置）。
             tx.execute(
                 "INSERT INTO point_registry(endpoint_id,point_key,point_id,data_type,unit,deleted,source_label)
                  VALUES(?1,?2,?3,?4,?5,0,?6)
                  ON CONFLICT(endpoint_id,point_key) DO UPDATE SET
                     point_id=excluded.point_id, data_type=excluded.data_type,
-                    unit=excluded.unit, deleted=0, source_label=excluded.source_label",
+                    unit=excluded.unit, deleted=0, source_label=excluded.source_label,
+                    display_name=point_registry.display_name",
                 params![
                     endpoint_id,
                     d.point_key,
@@ -1494,6 +1540,10 @@ impl ConfigStore {
                 data_type: d.data_type,
                 unit: d.unit.clone(),
                 source_label: d.source_label.clone(),
+                // P2：configure 不产生展示名，返回 registry 里保留的用户命名
+                //（保留由 upsert 的 display_name=point_registry.display_name
+                // 保证，此处读回即当前真值）。
+                display_name: kept_name,
             });
         }
 
@@ -1540,7 +1590,7 @@ impl ConfigStore {
     pub fn point_registry_all(&self, endpoint_id: &str) -> Result<Vec<RegistryRow>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT point_key, point_id, data_type, deleted, source_label FROM point_registry WHERE endpoint_id=?1 ORDER BY point_id",
+            "SELECT point_key, point_id, data_type, deleted, source_label, display_name FROM point_registry WHERE endpoint_id=?1 ORDER BY point_id",
         )?;
         let rows = stmt.query_map(params![endpoint_id], |r| {
             Ok((
@@ -1549,9 +1599,40 @@ impl ConfigStore {
                 r.get::<_, String>(2)?,
                 r.get::<_, i32>(3)? != 0,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 设置用户展示名（P2）：只碰 `display_name` 列，不碰 id/key/label。
+    /// - `Some(name)`：非空（trim 后）写入；空字符串拒绝（Validation），
+    ///   意图清空请传 None（语义 = 未设置，UI 回落 point_key）。
+    /// - 仅活跃点（deleted=0）可改名；墓碑/不存在 → NotFound。
+    pub fn set_point_display_name(
+        &self,
+        endpoint_id: &str,
+        point_key: &str,
+        display_name: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if let Some(n) = display_name
+            && n.trim().is_empty()
+        {
+            return Err(StoreError::Validation(
+                "display_name 不能为空字符串（清空请传 null）".into(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE point_registry SET display_name=?1 WHERE endpoint_id=?2 AND point_key=?3 AND deleted=0",
+            params![display_name, endpoint_id, point_key],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!(
+                "活跃点 `{endpoint_id}/{point_key}` 不存在"
+            )));
+        }
+        Ok(())
     }
 
     // ---- Secrets (§6.5) ----
@@ -1986,7 +2067,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "7");
+        assert_eq!(ver, "8");
         let has: bool = s
             .conn
             .lock()
@@ -2134,7 +2215,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "7");
+            assert_eq!(ver, "8");
             // 004：profile 列已删除，但设备行本身保留（仅去列，不丢行）
             let cols: Vec<String> = conn
                 .prepare("PRAGMA table_info(devices)")
@@ -2225,7 +2306,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "7");
+            assert_eq!(ver, "8");
             // 旧行以 id 回填 name，业务行保留
             let old_name: String = conn
                 .query_row("SELECT name FROM endpoints WHERE id='e1'", [], |r| r.get(0))
@@ -2328,7 +2409,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "7");
+            assert_eq!(ver, "8");
             // 006 幂等表已建
             let tbl: String = conn
                 .query_row(
@@ -2448,7 +2529,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "7");
+            assert_eq!(ver, "8");
             let has7: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7)",
@@ -2546,6 +2627,180 @@ mod tests {
         );
     }
 
+    /// P2：display_name 用户命名语义——set/清/校验 + assign 保留 + fixture 升级。
+    #[test]
+    fn point_display_name_user_semantics() {
+        let s = mem();
+        s.create_device(&dev("d1")).unwrap();
+        s.create_endpoint(&ep("e1", "d1")).unwrap();
+        let defs1 = s
+            .assign_point_ids("e1", &[desc("motor.speed", DataType::F64)])
+            .unwrap();
+        let id = defs1[0].point_id;
+        assert_eq!(defs1[0].display_name, None, "新点默认未设置");
+        // 改名：返回含名，id/key/label 不动
+        s.set_point_display_name("e1", "motor.speed", Some("主轴转速"))
+            .unwrap();
+        let all = s.point_registry_all("e1").unwrap();
+        assert_eq!(all[0].5.as_deref(), Some("主轴转速"));
+        // configure（assign）不得覆盖用户命名，但返回当前真值
+        let defs2 = s
+            .assign_point_ids(
+                "e1",
+                &[desc_label("motor.speed", DataType::F64, Some("DB10.DBD20"))],
+            )
+            .unwrap();
+        assert_eq!(defs2[0].point_id, id);
+        assert_eq!(defs2[0].display_name.as_deref(), Some("主轴转速"));
+        // 清空回 None
+        s.set_point_display_name("e1", "motor.speed", None).unwrap();
+        assert_eq!(
+            s.point_registry_all("e1").unwrap()[0].5,
+            None,
+            "None 清 NULL"
+        );
+        // 空字符串拒绝
+        assert!(matches!(
+            s.set_point_display_name("e1", "motor.speed", Some("  ")),
+            Err(StoreError::Validation(_))
+        ));
+        // 不存在/墓碑拒绝
+        assert!(matches!(
+            s.set_point_display_name("e1", "ghost", Some("x")),
+            Err(StoreError::NotFound(_))
+        ));
+        s.set_point_display_name("e1", "motor.speed", Some("名"))
+            .unwrap();
+        s.assign_point_ids("e1", &[desc("other", DataType::F64)])
+            .unwrap(); // motor.speed 成墓碑
+        assert!(matches!(
+            s.set_point_display_name("e1", "motor.speed", Some("名2")),
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    /// P2：真实 v7 形态库 open() → v8。v7 即 P1 合并后基线（007 已应用、
+    /// point_registry 无 display_name 列）：旧行无损、新列 NULL、008 记录存在。
+    #[test]
+    fn v7_file_db_upgrades_to_v8_with_null_names() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mesa-config-v7up-{}-{}.db",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE devices(id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE endpoints(
+                    id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE RESTRICT,
+                    driver_id TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    connection_json TEXT NOT NULL,
+                    desired_running INTEGER NOT NULL DEFAULT 0,
+                    updated_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE tasks(
+                    endpoint_id TEXT NOT NULL REFERENCES endpoints(id) ON DELETE CASCADE,
+                    id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    interval_ms INTEGER,
+                    binding_kind TEXT NOT NULL,
+                    binding_config_json TEXT NOT NULL,
+                    PRIMARY KEY(endpoint_id, id)
+                );
+                CREATE TABLE config_revision(
+                    endpoint_id TEXT PRIMARY KEY REFERENCES endpoints(id) ON DELETE CASCADE,
+                    revision INTEGER NOT NULL
+                );
+                CREATE TABLE schema_migrations(
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    applied_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE bootstrap_idempotency(
+                    key TEXT PRIMARY KEY,
+                    request_hash TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    endpoint_id TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE point_registry(
+                    endpoint_id TEXT NOT NULL,
+                    point_key TEXT NOT NULL,
+                    point_id INTEGER NOT NULL,
+                    data_type TEXT NOT NULL,
+                    unit TEXT,
+                    deleted INTEGER NOT NULL DEFAULT 0,
+                    source_label TEXT NULL,
+                    PRIMARY KEY(endpoint_id, point_key)
+                );
+                INSERT INTO meta(key,value) VALUES('schema_version','7');
+                INSERT INTO schema_migrations(version,name,checksum,applied_at_ns)
+                    VALUES(1,'001_initial','x',1),(2,'002_management_control','y',2),
+                    (3,'003_event_tasks','z',3),(4,'004_remove_device_profile','w',4),
+                    (5,'005_endpoint_name','v',5),(6,'006_bootstrap_idempotency','w',6),
+                    (7,'007_point_source_label','v',7);
+                INSERT INTO devices(id,name) VALUES('d1','D1');
+                INSERT INTO endpoints(id,device_id,driver_id,name,connection_json,desired_running,updated_at_ns)
+                    VALUES('e1','d1','simulator','E1','{}',1,7);
+                INSERT INTO point_registry(endpoint_id,point_key,point_id,data_type,unit,deleted,source_label)
+                    VALUES('e1','motor.speed',10,'F32',NULL,0,'DB10.DBD20');
+                "#,
+            )
+            .unwrap();
+        }
+        let s = ConfigStore::open(&path).unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            let ver: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ver, "8");
+            let has8: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=8)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(has8, "008 记录必须存在");
+            // 旧行无损：label 保留，name 为 NULL
+            let (pid, label, name): (i64, Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT point_id, source_label, display_name FROM point_registry WHERE endpoint_id='e1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(pid, 10);
+            assert_eq!(label.as_deref(), Some("DB10.DBD20"));
+            assert_eq!(name, None);
+        }
+        // 升级后 assign 延续 id 且 label 正常
+        let defs = s
+            .assign_point_ids(
+                "e1",
+                &[desc_label("motor.speed", DataType::F32, Some("DB20.DBD40"))],
+            )
+            .unwrap();
+        assert_eq!(defs[0].point_id, 10);
+        assert_eq!(defs[0].source_label.as_deref(), Some("DB20.DBD40"));
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn point_id_stable_and_tombstone_reuse() {
         let s = mem();
@@ -2582,7 +2837,7 @@ mod tests {
         s.assign_point_ids("e1", &[desc("a", DataType::F64), desc("c", DataType::I32)])
             .unwrap();
         let all = s.point_registry_all("e1").unwrap();
-        let b_entry = all.iter().find(|(k, _, _, _, _)| k == "b").unwrap();
+        let b_entry = all.iter().find(|(k, _, _, _, _, _)| k == "b").unwrap();
         assert!(b_entry.3, "b 应为墓碑");
         // 重新加入 b，必须复用原 id，且不复用已删 id 给新 key
         let defs3 = s
@@ -2778,7 +3033,7 @@ mod tests {
             .unwrap();
         // PR7 起 SCHEMA_VERSION=3，DeviceProfile 删除后升至 4，Endpoint.name 后升至 5；
         // 002/003 本身仍必须存在且已应用（增量链不断）
-        assert!(ver == "7", "新库应为 v7，got {ver}");
+        assert!(ver == "8", "新库应为 v8，got {ver}");
         let has2: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=2)",

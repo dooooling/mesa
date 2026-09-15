@@ -9,6 +9,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { formatAge, formatPointValue } from "../deviceModel";
 import { PointDetailDrawer } from "../components/PointDetailDrawer";
 import type { DevicePointView } from "../workspace/useDeviceWorkspaceData";
+import { PointNameCell } from "../workspace/PointNameCell";
 import { useLivePointsSource } from "../workspace/useLivePointsSource";
 
 type StatusFilter = "ALL" | "GOOD" | "BAD" | "STALE";
@@ -149,12 +150,9 @@ export function GlobalDataPage() {
               ),
             },
             {
+              // P2 双行（与设备页同口径）。
               title: "数据点",
-              render: (_: unknown, r: DevicePointView) => (
-                <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>
-                  {r.displayKey}
-                </span>
-              ),
+              render: (_: unknown, r: DevicePointView) => <PointNameCell point={r} />,
             },
             {
               // P1 来源列（与设备页同口径）
@@ -218,6 +216,12 @@ export function GlobalDataPage() {
         deviceName={drawerDeviceName}
         point={openPoint}
         onClose={() => setOpenPoint(null)}
+        onRenamed={(display_name) => {
+          if (!openPoint) return;
+          const key = openPoint.key ?? openPoint.point_key ?? "";
+          src.patchDisplayName(openPoint.endpoint_id, String(key), display_name);
+          setOpenPoint({ ...openPoint, display_name: display_name ?? undefined });
+        }}
       />
     </div>
   );
