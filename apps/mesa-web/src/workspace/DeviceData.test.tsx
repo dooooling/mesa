@@ -123,7 +123,8 @@ describe("M2 设备数据归属与过滤", () => {
     });
     expect(screen.getAllByText("f-key").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText("o-key").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByTestId("workspace-connection-context").textContent ?? "").toContain("全部连接");
+    // 扁平架构：无全局 Connection Context（连接筛选在本页 Select 内）。
+    expect(screen.queryByTestId("workspace-connection-context")).toBeNull();
   });
 
   it("P1. 来源列：有 source_label 显示标签，无则诚实显示未提供（绝不拿 point_key 反推）", async () => {
@@ -357,7 +358,7 @@ describe("M2 需要关注规则", () => {
 });
 
 describe("M2 Drawer 与跳转", () => {
-  it("6/7. 点击行开 Drawer，来源正确；配置/诊断保留 ?connection=", async () => {
+  it("6/7. 点击行开 Drawer，来源正确；采集/诊断保留 ?connection=", async () => {
     vi.useRealTimers();    mockWorkspace({
       points: () => ({ points: [pt("focas", "axis.z.position", "GOOD", 500, 83.12)] }),
     });
@@ -367,15 +368,14 @@ describe("M2 Drawer 与跳转", () => {
     await user.click(screen.getAllByText("axis.z.position")[0]);
     // Drawer：来源三段 + 跳转按钮（设备名在 Header/面包屑/占位多处重名，
     // 用 getAllBy 断言；endpoint 名/id 同理）
-    await screen.findByText("打开连接配置");
+    await screen.findByText("采集设置");
     expect(screen.getAllByText("CNC-01").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText("FOCAS").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText("focas").length).toBeGreaterThanOrEqual(1);
-    // 跳转配置：保留 connection=focas（URL 即 Workspace config tab）
-    await user.click(screen.getByText("打开连接配置"));
-    await waitFor(() => {
-      expect(screen.getByTestId("workspace-connection-context").textContent ?? "").toContain("FOCAS");
-    });
+    // 跳转采集：保留 connection=focas（采集页局部单选沿用 query；
+    // MemoryRouter 不写 window.location，用采集页内容断言导航成功）
+    await user.click(screen.getByText("采集设置"));
+    await screen.findByText("数据采集 · FOCAS", undefined, { timeout: 10000 });
     // 全量并行下轮询+Drawer 多轮异步易超时，显式放宽（同删除用例 30s 先例）。
   }, 30000);
 });
@@ -526,10 +526,10 @@ describe("RC2 ownership fail-closed", () => {
     await user.click(screen.getByText("go-a"));
     await waitFor(() => expect(screen.getAllByText("point-a").length).toBeGreaterThanOrEqual(1), { timeout: 10000 });
     await user.click(screen.getAllByText("point-a")[0]);
-    await screen.findByText("打开连接配置", undefined, { timeout: 10000 });
+    await screen.findByText("采集设置", undefined, { timeout: 10000 });
     // 切 B：Drawer 必须关闭（A 的 point 不得留在 B 页面）
     await user.click(screen.getByText("go-b"));
-    await waitFor(() => expect(screen.queryByText("打开连接配置")).toBeNull(), { timeout: 10000 });
+    await waitFor(() => expect(screen.queryByText("采集设置")).toBeNull(), { timeout: 10000 });
     // B 自己的点正常显示
     expect(screen.getAllByText("point-b").length).toBeGreaterThanOrEqual(1);
   }, 30000);

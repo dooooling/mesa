@@ -22,6 +22,7 @@ export function DeviceTabNav(props: { deviceId: string; active: string }) {
   const { deviceId, active } = props;
   return (
     <Tabs
+      data-testid="device-tab-nav"
       activeKey={isDeviceTab(active) ? active : "overview"}
       items={DEVICE_TABS.map((t) => ({
         key: t.key,

@@ -13,8 +13,8 @@ import { SystemPage } from "./system/SystemPage";
 const { Header, Sider, Content } = Layout;
 
 // M5.6 V2 导航（旧页面已删除）：总览 / 设备 / 实时数据 / 事件 / 系统。
-// Device 是唯一一级主体，Connection 退化为 Device Workspace 内的上下文
-//（`?connection=`），不再有导航层。外部旧书签仅保留 endpoint 深链重定向。
+// Device 是唯一一级主体，Connection 是各设备页内的局部筛选
+//（`?connection=` 各页独立），不再有导航层，不保留旧书签兼容。
 const items = [
   { key: "/overview", icon: <DashboardOutlined />, label: "总览" },
   { key: "/devices", icon: <ApiOutlined />, label: "设备" },

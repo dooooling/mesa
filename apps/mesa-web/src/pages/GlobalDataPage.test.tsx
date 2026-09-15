@@ -147,16 +147,15 @@ describe("M3.1 全局实时数据", () => {
     // P1 后数据点列与来源列文本相同（回落），用 AllBy。
     await screen.findAllByText("spindle.speed", undefined, { timeout: 10000 });
     await user.click(screen.getAllByText("spindle.speed")[0]);
-    await screen.findByText("打开连接配置", undefined, { timeout: 10000 });
+    await screen.findByText("采集设置", undefined, { timeout: 10000 });
     // 来源：设备 + 连接 + endpoint 三段
     expect(screen.getAllByText("CNC-01").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText("FOCAS").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText("focas").length).toBeGreaterThanOrEqual(1);
-    // Drawer 内“打开连接配置”闭环：进设备 Workspace config（上下文保留 FOCAS）。
-    // 表格行内“打开设备”与 Drawer 按钮重名，锚定 Drawer 的配置按钮。
-    await user.click(screen.getByText("打开连接配置"));
-    await waitFor(() => {
-      expect(screen.getByTestId("workspace-connection-context").textContent ?? "").toContain("FOCAS");
-    });
-  });
+    // Drawer 内“采集设置”闭环：进设备采集页（连接 query 保留 focas；
+    // MemoryRouter 不写 window.location，用采集页内容断言）。
+    // 表格行内“打开设备”与 Drawer 按钮重名，锚定 Drawer 的采集按钮。
+    await user.click(screen.getByText("采集设置"));
+    await screen.findByText("数据采集 · FOCAS", undefined, { timeout: 10000 });
+  }, 30000);
 });
