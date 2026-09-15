@@ -57,6 +57,19 @@ V2 导航按用户任务组织，不按后端对象层级。`Device` 是前端�
 - 后端：`cargo test -p mesa-config-store -p mesa-event-store -p mesa-core-api`；
 - 规范：`pnpm typecheck` + `pnpm lint`（前端），`cargo clippy`（后端）。
 
+## R4 性能基线（隔离实例实测）
+
+| 接口 | 规模 | 延迟 |
+|---|---|---|
+| `GET /devices` | 101 devices | 3–7ms |
+| `GET /endpoints` | 501 endpoints | 热 25–30ms；首次 549ms（driver session 冷启动，一次性） |
+| `GET /diagnostics` | — | 6ms |
+| `GET /points/latest` | 2005 points | 56–61ms / 413KB |
+| `GET /events?limit=100` | 10k rows（直写） | 14–21ms（含 `endpoint_ids`/`device_id`/`active` 过滤） |
+
+结论：API 侧无瓶颈；前端表格分页（20/页）已覆盖渲染规模，
+virtualization/memoization 暂不需要（按需引入，不提前复杂化）。
+
 ## V1 → V2 迁移
 
 - 旧页面（Dashboard/DeviceDetail/EndpointWorkspace/Onboarding/Monitor/
