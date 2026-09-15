@@ -92,12 +92,18 @@ function mockGlobalEvents() {
     if (url.startsWith("/api/v1/events?") || url.startsWith("/api/v1/events&")) {
       const u = new URL(url, "http://localhost");
       const ep = u.searchParams.get("endpoint_id");
+      const dev = u.searchParams.get("device_id");
       const table: Record<string, StoredEvent[]> = {
         focas: [ev(100, "focas", "cnc-alarm")],
         s7: [ev(90, "s7", "plc-alarm")],
         "": [ev(100, "focas", "cnc-alarm"), ev(90, "s7", "plc-alarm")],
       };
-      const events = table[ep ?? ""] ?? [];
+      // M7：device_id 走后端映射（mock 模拟后端行为：plc-01 → s7 事件）。
+      const devTable: Record<string, StoredEvent[]> = {
+        "plc-01": [ev(90, "s7", "plc-alarm")],
+        "cnc-01": [ev(100, "focas", "cnc-alarm")],
+      };
+      const events = dev ? (devTable[dev] ?? []) : (table[ep ?? ""] ?? []);
       return { ok: true, status: 200, json: async () => ({ events, next_cursor: null }) };
     }
     return { ok: false, status: 404, json: async () => ({}) };
@@ -115,7 +121,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("M3.4 全局事件", () => {
+describe("M7 全局事件（device 服务端过滤）", () => {
   it("跨设备聚合：两设备事件同屏", async () => {
     mockGlobalEvents();
     render(

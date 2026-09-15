@@ -57,6 +57,9 @@ function renderWorkspace(path: string) {
   );
 }
 
+// 并行 worker 负载下多轮 fetch 易超默认 1s waitFor；统一放宽等待（不断言）。
+const WAIT = { timeout: 10000 };
+
 describe("M1 Device Workspace", () => {
   it("设备身份常驻 + 观察 tab 默认全部连接", async () => {
     mockFetch(workspaceHandler);
@@ -65,7 +68,7 @@ describe("M1 Device Workspace", () => {
     // 元素拆分，直接按正则匹配会误报，必须锚定 testid）
     await waitFor(() => {
       expect(screen.getAllByText("CNC-01").length).toBeGreaterThanOrEqual(1);
-    });
+    }, WAIT);
     expect(screen.getByTestId("workspace-connection-context")?.textContent ?? "").toContain("当前上下文：全部连接");
     // 五 tab 全部存在（占位 Alert 标题与 tab 重名，用 getAllBy 断言至少出现）
     for (const t of ["概览", "实时数据", "事件", "配置", "诊断"]) {
@@ -80,12 +83,12 @@ describe("M1 Device Workspace", () => {
     // 回落到 focas：上下文行显示 FOCAS
     await waitFor(() => {
       expect(screen.getByTestId("workspace-connection-context")?.textContent ?? "").toContain("当前上下文：FOCAS");
-    });
+    }, WAIT);
     // 切到 OPC UA：按钮选中态跟随
     await user.click(screen.getByRole("button", { name: /OPC UA/ }));
     await waitFor(() => {
       expect(screen.getByTestId("workspace-connection-context")?.textContent ?? "").toContain("当前上下文：OPC UA");
-    });
+    }, WAIT);
   });
 
   it("config 优先沿用 URL 的合法连接", async () => {
@@ -93,7 +96,7 @@ describe("M1 Device Workspace", () => {
     renderWorkspace("/devices/cnc-01/config?connection=opcua");
     await waitFor(() => {
       expect(screen.getByTestId("workspace-connection-context")?.textContent ?? "").toContain("当前上下文：OPC UA");
-    });
+    }, WAIT);
   });
 
   it("config 的非法 connection 回落第一个，不漂移", async () => {
@@ -101,13 +104,13 @@ describe("M1 Device Workspace", () => {
     renderWorkspace("/devices/cnc-01/config?connection=ghost");
     await waitFor(() => {
       expect(screen.getByTestId("workspace-connection-context")?.textContent ?? "").toContain("当前上下文：FOCAS");
-    });
+    }, WAIT);
   });
 
   it("设备不存在显示 404 view", async () => {
     mockFetch(() => ({ ok: false, status: 404, json: async () => ({}) }));
     renderWorkspace("/devices/ghost/overview");
-    expect(await screen.findByText("设备不存在")).toBeTruthy();
+    expect(await screen.findByText("设备不存在", undefined, { timeout: 10000 })).toBeTruthy();
   });
 });
 
@@ -133,7 +136,7 @@ describe("M1 路由与兼容重定向", () => {
       </MemoryRouter>,
     );
     // 重定向成功：OverviewPage 内容出现（系统运行/需要关注卡片；标题含计数故用正则）。
-    await screen.findByText(/需要关注/);
+    await screen.findByText(/需要关注/, undefined, { timeout: 10000 });
     expect(screen.getByText("系统运行")).toBeTruthy();
     for (const label of ["总览", "设备", "实时数据", "事件", "系统"]) {
       expect(screen.getAllByText(label).length).toBeGreaterThanOrEqual(1);
@@ -150,7 +153,7 @@ describe("M1 路由与兼容重定向", () => {
     // Workspace 概览出现，且上下文为 FOCAS（connection 保留）
     await waitFor(() => {
       expect(screen.getByTestId("workspace-connection-context")?.textContent ?? "").toContain("当前上下文：FOCAS");
-    });
+    }, WAIT);
   });
 
   it("设备列表无进入按钮、整行点击进 Workspace", async () => {
@@ -161,13 +164,13 @@ describe("M1 路由与兼容重定向", () => {
         <App />
       </MemoryRouter>,
     );
-    await screen.findByText("CNC-01");
+    await screen.findByText("CNC-01", undefined, { timeout: 10000 });
     // “进入”按钮已删除
     expect(screen.queryByRole("button", { name: "进入" })).toBeNull();
     // 整行点击进入 Workspace（出现连接上下文 testid）
     await user.click(screen.getByText("CNC-01"));
     await waitFor(() => {
       expect(screen.getByTestId("workspace-connection-context")).toBeTruthy();
-    });
+    }, WAIT);
   });
 });

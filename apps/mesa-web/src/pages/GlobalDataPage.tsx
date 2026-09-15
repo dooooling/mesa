@@ -178,6 +178,10 @@ export function GlobalDataPage() {
               title: "操作",
               render: (_: unknown, r: DevicePointView) => (
                 <Space onClick={(e) => e.stopPropagation()}>
+                  {/* M7 可访问性：详情是 Drawer 的键盘路径（行 onClick 仅鼠标可达）。 */}
+                  <Button size="small" type="link" onClick={() => setOpenPoint(r)}>
+                    详情
+                  </Button>
                   <Button
                     size="small"
                     type="link"

@@ -3,7 +3,7 @@
 // - 设备/连接两级下拉进 URL（?device=&connection=，级联+归一，与 /data 同规则）；
 // - 其余过滤（Active/时间/高级）M3.5 与设备事件统一接入，此处先跑通聚合与跳转；
 // - 表格/Drawer 共用；行内“打开设备”闭环回所属设备事件页。
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Button, Card, Select, Space, Tag } from "antd";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api";
@@ -91,40 +91,48 @@ export function GlobalEventsPage() {
     setParams(next);
   };
 
-  // 后端过滤：connection 有值即 endpoint_id；其余全部来自 rest form。
-  // device 只做连接级联（后端无 device_id 过滤——全局页是单源查询，不存在
-  // 设备分页问题；device 已选而 connection 为 ALL 时后端查全局，前端按归属过滤）。
+  // 后端过滤：connection 有值即 endpoint_id；device 有值即 device_id
+  // （M5.3 后端映射为 endpoint 集合；M7 起全局页不再客户端归属过滤）。
   const form: EventFilterForm = useMemo(
     () => ({
       ...rest,
       endpoint_id: connectionParam !== "ALL" ? connectionParam : undefined,
+      device_id: deviceParam !== "ALL" ? deviceParam : undefined,
     }),
-    [rest, connectionParam],
+    [rest, connectionParam, deviceParam],
   );
-  const feed = useEventFeed(form);
-  const { history, nextCursor, loading, loadingMore, unavailable, error, liveOn } = feed;
-
-  // form 变化即 reload（与旧 EventsView 的 onFilterChange 语义一致）。
-  const onRestChange = (next: EventFilterForm) => {
-    setRest(next);
-    feed.reload({ ...next, endpoint_id: connectionParam !== "ALL" ? connectionParam : undefined });
-  };
-
-  // device 限定的前端归属过滤（后端无 device 过滤时）：endpoint→device 查表。
+  // deviceOf 映射：SSE live 行归属判定 + Drawer“打开设备”跳转用。
   const deviceOf = useMemo(() => {
     const m = new Map<string, string>();
     for (const e of endpoints) m.set(e.id, e.device_id ?? "");
     return m;
   }, [endpoints]);
-  const visible = useMemo(() => {
-    if (deviceParam === "ALL") return history;
-    return history.filter((ev) => {
-      const owner = deviceOf.get(ev.endpoint_id) ?? "";
-      // 归属未知时 fail-closed 保留（清单缺失），已知且非所选才排除。
-      if (!owner) return true;
-      return owner === deviceParam;
+  const feed = useEventFeed(form, { deviceOf: (id) => deviceOf.get(id) });
+  const { history, nextCursor, loading, loadingMore, unavailable, error, liveOn } = feed;
+
+  // device/connection（URL）变化即 reload（useEventFeed 首屏只查一次，
+  // 此前靠客户端 visible 过滤掩盖；M7 后端过滤后必须显式 reload）。
+  // 首屏跳过（首屏查询由 hook 承担，此处只响应后续变化，避免双查）。
+  const formKey = JSON.stringify(form);
+  const firstFormKey = useRef(true);
+  useEffect(() => {
+    if (firstFormKey.current) {
+      firstFormKey.current = false;
+      return;
+    }
+    feed.reload(form);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [formKey]);
+
+  // form 变化即 reload（与旧 EventsView 的 onFilterChange 语义一致）。
+  const onRestChange = (next: EventFilterForm) => {
+    setRest(next);
+    feed.reload({
+      ...next,
+      endpoint_id: connectionParam !== "ALL" ? connectionParam : undefined,
+      device_id: deviceParam !== "ALL" ? deviceParam : undefined,
     });
-  }, [history, deviceParam, deviceOf]);
+  };
 
   const statusTag = useMemo(() => {
     if (!liveOn) return <Tag>PAUSED</Tag>;
@@ -167,7 +175,16 @@ export function GlobalEventsPage() {
         {unavailable ? (
           <Alert type="error" showIcon message="Event service unavailable" description="EventStore 当前不可用。" />
         ) : null}
-        {error ? <Alert type="error" showIcon message="加载失败" description={error} style={{ marginTop: unavailable ? 8 : 0 }} /> : null}
+        {error ? (
+          <Alert
+            type="error"
+            showIcon
+            message="加载失败"
+            description={error}
+            style={{ marginTop: unavailable ? 8 : 0 }}
+            action={<Button size="small" onClick={() => feed.reload(form)}>重试</Button>}
+          />
+        ) : null}
         <div style={{ marginTop: 8 }}>
           <EventDiagnostics stats={feed.stats} />
         </div>
@@ -181,7 +198,7 @@ export function GlobalEventsPage() {
             connectionOptions={endpointOptions}
             onConnectionChange={setConnection}
           />
-          <EventTable events={visible} loading={loading} onSelect={setSelected} />
+          <EventTable events={history} loading={loading} onSelect={setSelected} />
           <div style={{ display: "flex", justifyContent: "center" }}>
             <Button onClick={feed.loadOlder} loading={loadingMore} disabled={nextCursor === null || nextCursor === undefined}>
               {nextCursor === null || nextCursor === undefined ? "没有更多" : "加载更早"}

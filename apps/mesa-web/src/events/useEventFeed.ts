@@ -31,8 +31,13 @@ export interface EventFeed {
 /**
  * 单事件源。form 为后端过滤（调用方保证对象身份稳定，否则每次渲染都 reload）。
  * 代际/pending-live/merge/SSE 冻结顺序与旧 EventsView 完全一致。
+ * M7：device 过滤走后端 device_id；SSE live 行的 device 归属需 deviceOf 映射
+ * （无映射时 live 行按其它条件判定，归属未知保留）。
  */
-export function useEventFeed(form: EventFilterForm, opts?: { statsPoll?: boolean }): EventFeed {
+export function useEventFeed(
+  form: EventFilterForm,
+  opts?: { statsPoll?: boolean; deviceOf?: (endpointId: string) => string | undefined },
+): EventFeed {
   const [history, setHistory] = useState<StoredEvent[]>([]);
   const [nextCursor, setNextCursor] = useState<number | null>(null);
   const [highWater, setHighWater] = useState<number>(0);
@@ -47,9 +52,11 @@ export function useEventFeed(form: EventFilterForm, opts?: { statsPoll?: boolean
   const pendingLiveRef = useRef<StoredEvent[]>([]);
   const formRef = useRef(form);
   formRef.current = form;
+  const deviceOfRef = useRef(opts?.deviceOf);
+  deviceOfRef.current = opts?.deviceOf;
 
   const drainPendingLive = (next: EventFilterForm): StoredEvent[] => {
-    const live = pendingLiveRef.current.filter((ev) => matchesLiveFilter(ev, next));
+    const live = pendingLiveRef.current.filter((ev) => matchesLiveFilter(ev, next, deviceOfRef.current));
     pendingLiveRef.current = [];
     return live;
   };
@@ -134,7 +141,7 @@ export function useEventFeed(form: EventFilterForm, opts?: { statsPoll?: boolean
   }, [nextCursor, loadingMore]);
 
   const onLive = useCallback((ev: StoredEvent) => {
-    if (!matchesLiveFilter(ev, formRef.current)) return;
+    if (!matchesLiveFilter(ev, formRef.current, deviceOfRef.current)) return;
     pendingLiveRef.current.push(ev);
     if (pendingLiveRef.current.length > 1000) {
       pendingLiveRef.current.splice(0, pendingLiveRef.current.length - 1000);

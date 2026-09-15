@@ -7,6 +7,10 @@ import { render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { DeviceWorkspacePage } from "./DeviceWorkspacePage";
 
+// 并行 worker 负载下多轮串行 fetch（devices→endpoints→diag/tasks）易超
+// 默认 1s findBy；统一放宽（只放宽等待，不放宽断言）。
+const FIND = { timeout: 10000 };
+
 function mockWorkspace(opts: {
   endpoints: Array<{ id: string; name: string; driver_id: string; device_id: string; state: string }>;
   diag?: Record<string, unknown>;
@@ -77,21 +81,22 @@ describe("M6 DeviceConfig", () => {
     mockWorkspace({ endpoints: EPS });
     renderTab("/devices/cnc-01/config?connection=focas");
     // 设备区（antd 双汉字按钮插空格，用正则；下挂计数确认设备区已渲染）
-    await screen.findByText(/下挂 1 个连接/);
+    await screen.findByText(/下挂 1 个连接/, undefined, FIND);
     expect(screen.getByRole("button", { name: /改\s?名/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: /删除设备/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: /新增连接/ })).toBeTruthy();
-    // 连接表有 FOCAS 行 + 启停操作（RUNNING → 停止按钮）
+    // 连接表有 FOCAS 行 + 启停操作（RUNNING → 停止按钮；设置区 Pane 内
+    // 可能有第二个停止按钮，用 All 断言，加载时序不影响）。
     expect(screen.getAllByText("FOCAS").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByRole("button", { name: /停\s?止/ })).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /停\s?止/ }).length).toBeGreaterThanOrEqual(1);
     // 单连接设置区（三 Pane 标题出现）
-    await screen.findByText(/连接设置/);
+    await screen.findByText(/连接设置/, undefined, FIND);
   });
 
   it("无连接：明确提示新增，不渲染空 Pane", async () => {
     mockWorkspace({ endpoints: [] });
     renderTab("/devices/cnc-01/config");
-    await screen.findByText("该设备暂无连接");
+    await screen.findByText("该设备暂无连接", undefined, FIND);
   });
 });
 
@@ -109,14 +114,16 @@ describe("M6 DeviceDiagnostics", () => {
       tasks: [{ id: "t1" }],
     });
     renderTab("/devices/cnc-01/diagnostics?connection=focas");
-    await screen.findByText(/连接状态/);
-    expect(screen.getByText("0.3.0")).toBeTruthy();
+    await screen.findByText(/连接状态/, undefined, FIND);
+    // 诊断数据是第二轮 fetch（endpoints 就绪 → diag/tasks），同步断言竞态；
+    // 等版本号出现再断言其余（只等一次，后续同批渲染已完成）。
+    await screen.findByText("0.3.0", undefined, FIND);
     expect(screen.getByText("高级诊断（原始 JSON）")).toBeTruthy();
   });
 
   it("无连接：明确提示新增", async () => {
     mockWorkspace({ endpoints: [] });
     renderTab("/devices/cnc-01/diagnostics");
-    await screen.findByText("该设备暂无连接");
+    await screen.findByText("该设备暂无连接", undefined, FIND);
   });
 });

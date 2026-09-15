@@ -1,5 +1,7 @@
 // PR8 事件表：固定基础列；顺序权威是 DB seq DESC（不用 occurred_at 重排）。
-import { Table, Tag } from "antd";
+// M7 可访问性：行点击保留（鼠标），另设“详情”按钮列（键盘可达；行 onClick
+// 的 div 对键盘用户不可操作，按钮是唯一键盘路径）。
+import { Button, Table, Tag } from "antd";
 import type { StoredEvent } from "../types";
 import { formatNsTime, formatSeverity } from "../events/format";
 
@@ -59,6 +61,15 @@ export function EventTable({
             ) : (
               "—"
             ),
+        },
+        {
+          title: "操作",
+          width: 80,
+          render: (_: unknown, r: StoredEvent) => (
+            <Button size="small" type="link" onClick={(e) => { e.stopPropagation(); onSelect(r); }}>
+              详情
+            </Button>
+          ),
         },
       ]}
     />

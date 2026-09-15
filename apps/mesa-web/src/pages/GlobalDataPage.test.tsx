@@ -143,9 +143,10 @@ describe("M3.1 全局实时数据", () => {
     mockGlobal();
     const user = userEvent.setup();
     renderApp("/data");
-    await screen.findByText("spindle.speed");
+    // 并行负载下表格渲染+轮询多轮，findBy 放宽（只放宽等待，不放宽断言）。
+    await screen.findByText("spindle.speed", undefined, { timeout: 10000 });
     await user.click(screen.getByText("spindle.speed"));
-    await screen.findByText("打开连接配置");
+    await screen.findByText("打开连接配置", undefined, { timeout: 10000 });
     // 来源：设备 + 连接 + endpoint 三段
     expect(screen.getAllByText("CNC-01").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText("FOCAS").length).toBeGreaterThanOrEqual(1);

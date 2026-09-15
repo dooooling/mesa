@@ -3,7 +3,7 @@
 // - 连接过滤复用 M1 的 connection 上下文，不另起 selection state；
 // - 行点击打开 PointDetailDrawer，不跳页面。
 import { useMemo, useState } from "react";
-import { Input, Select, Space, Table, Tag } from "antd";
+import { Button, Input, Select, Space, Table, Tag } from "antd";
 import { formatAge, formatPointValue } from "../deviceModel";
 import type { DevicePointView, WorkspaceEndpoint } from "./useDeviceWorkspaceData";
 
@@ -124,6 +124,16 @@ export function DeviceLiveData(props: {
           {
             title: "更新",
             render: (_: unknown, r: DevicePointView) => <span>{formatAge(r.ageMs)}</span>,
+          },
+          {
+            // M7 可访问性：键盘路径（行 onClick 仅鼠标可达）。
+            title: "操作",
+            width: 80,
+            render: (_: unknown, r: DevicePointView) => (
+              <Button size="small" type="link" onClick={(e) => { e.stopPropagation(); onOpenPoint(r); }}>
+                详情
+              </Button>
+            ),
           },
         ]}
         locale={{ emptyText: "暂无数据" }}

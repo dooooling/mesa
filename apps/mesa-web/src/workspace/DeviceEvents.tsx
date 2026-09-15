@@ -58,7 +58,15 @@ export function DeviceEvents(props: {
       {feed.unavailable ? (
         <Alert type="error" showIcon message="Event service unavailable" description="EventStore 当前不可用。" />
       ) : null}
-      {feed.error ? <Alert type="error" showIcon message="加载失败" description={feed.error} /> : null}
+      {feed.error ? (
+        <Alert
+          type="error"
+          showIcon
+          message="加载失败"
+          description={feed.error}
+          action={<Button size="small" onClick={() => feed.reload()}>重试</Button>}
+        />
+      ) : null}
       {!scopedEndpointIds.length && feed.booted ? (
         <Alert type="info" showIcon message="该设备暂无连接" description="事件随连接产生，先添加连接后再查看。" />
       ) : null}
