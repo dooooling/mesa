@@ -63,6 +63,8 @@ export default function App() {
             <Route path="/devices/new" element={<AddDeviceFlow />} />
             <Route path="/devices/:deviceId/:tab" element={<DeviceWorkspacePage />} />
             <Route path="/devices/:deviceId" element={<Navigate to="overview" replace />} />
+            {/* R1.4：已删除的旧设备详情入口显式回收（否则被 :tab 吞掉进 Workspace）。 */}
+            <Route path="/devices/:deviceId/legacy" element={<Navigate to="/overview" replace />} />
             <Route path="/devices/:deviceId/endpoints/:endpointId" element={<LegacyEndpointRedirect />} />
             <Route path="/data" element={<GlobalDataPage />} />
             <Route path="/events" element={<GlobalEventsPage />} />
