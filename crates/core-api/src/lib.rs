@@ -1170,24 +1170,35 @@ async fn list_endpoints(State(state): State<Arc<AppState>>) -> Json<serde_json::
         .into_iter()
         .map(|s| (s.endpoint_id.clone(), s))
         .collect();
+    // R4：descriptor 按 driver 缓存（同 driver 只拉一次；500 endpoints 同
+    // driver 时 N+1 await 是 541ms 的主因）。失败缓存 None（保守置空 connection）。
+    let mut desc_cache: HashMap<String, Option<Vec<String>>> = HashMap::new();
     let mut merged: Vec<serde_json::Value> = Vec::with_capacity(stored.len());
     for rec in stored {
         let runtime = live.get(&rec.id).cloned();
         let mut conn: serde_json::Value =
             serde_json::from_str(&rec.connection_json).unwrap_or(serde_json::json!({}));
         // 脱敏：同 get_endpoint，保持列表与详情一致（避免历史明文泄露）
-        match state.manager.get_descriptor(&rec.driver_id).await {
-            Ok(desc) => {
-                let secret_keys = secret_field_keys(&desc.connection);
-                if !secret_keys.is_empty() {
-                    conn =
-                        redact_connection_for_response(conn, &rec.id, &state.store, &secret_keys);
-                }
+        let secret_keys = match desc_cache.get(&rec.driver_id) {
+            Some(cached) => cached.clone(),
+            None => {
+                let keys = match state.manager.get_descriptor(&rec.driver_id).await {
+                    Ok(desc) => Some(secret_field_keys(&desc.connection)),
+                    Err(_) => None,
+                };
+                desc_cache.insert(rec.driver_id.clone(), keys.clone());
+                keys
             }
-            Err(_) => {
+        };
+        match secret_keys {
+            Some(keys) if !keys.is_empty() => {
+                conn = redact_connection_for_response(conn, &rec.id, &state.store, &keys);
+            }
+            None => {
                 // 保守策略：Descriptor 不可用则直接不返回 connection
                 conn = serde_json::Value::Null;
             }
+            _ => {}
         }
         merged.push(serde_json::json!({
             "id": rec.id,
