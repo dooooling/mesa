@@ -21,6 +21,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 pub mod certificates;
+pub mod bootstrap;
 use certificates::CertStore;
 
 // ---------------------------------------------------------------------------
@@ -2687,6 +2688,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/devices/{id}",
             get(get_device).put(update_device).delete(delete_device),
         )
+        // M5 device-bootstrap（原子创建 Device + Endpoint + Tasks + Start，幂等）
+        .route("/api/v1/device-bootstrap", post(bootstrap::device_bootstrap))
         // 启停
         .route("/api/v1/endpoints/{id}/start", post(start_endpoint))
         .route("/api/v1/endpoints/{id}/stop", post(stop_endpoint))

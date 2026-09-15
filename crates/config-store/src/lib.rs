@@ -18,7 +18,7 @@ use mesa_core_types::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// 当前 schema 版本。增量迁移时递增并在 `meta` 中持久化（§6.1）。
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 // ---------------------------------------------------------------------------
 // 记录类型
@@ -343,6 +343,14 @@ impl ConfigStore {
                 endpoint_id TEXT PRIMARY KEY REFERENCES endpoints(id) ON DELETE CASCADE,
                 revision INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS bootstrap_idempotency(
+                key TEXT PRIMARY KEY,
+                request_hash TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                endpoint_id TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at_ns INTEGER NOT NULL
+            );
             "#,
         )?;
         // 版本标记 + schema_migrations（§6.2-6.4）
@@ -488,8 +496,7 @@ impl ConfigStore {
         }
         // 005 迁移（PR25）：endpoints 增加展示名 name。
         // v5 不变量：所有 v5 库的 endpoints 表严格含 name 列（旧行默认为 ''）。
-        if cur_ver < 5 {
-            let has_5: bool = conn
+        if cur_ver < 5 {            let has_5: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=5)",
                     [],
@@ -528,6 +535,35 @@ impl ConfigStore {
                 )?;
                 tx.commit()?;
                 cur_ver = 5;
+            }
+        }
+        // 006 迁移（M5 device-bootstrap）：幂等键表。新库建表已含该表；
+        // 旧库走迁移补建（IF NOT EXISTS，重入安全）。
+        if cur_ver < 6 {
+            let has_6: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=6)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !has_6 {
+                Self::backup_file_db(&conn);
+                let sql6 = include_str!("../migrations/006_bootstrap_idempotency.sql");
+                let tx = conn.transaction()?;
+                tx.execute_batch(sql6)?;
+                let checksum6 = format!("{:x}", sql6.len());
+                tx.execute(
+                    "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(6,'006_bootstrap_idempotency',?1,?2)",
+                    params![checksum6, Self::now_ns()],
+                )?;
+                tx.execute("UPDATE meta SET value='6' WHERE key='schema_version'", [])?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','6')",
+                    [],
+                )?;
+                tx.commit()?;
+                cur_ver = 6;
             }
         }
         // 最终确保 meta 为最新
@@ -873,6 +909,186 @@ impl ConfigStore {
             params![running as i32, Self::now_ns(), endpoint_id],
         )?;
         Ok(n > 0)
+    }
+
+    // ---- Bootstrap（M5 device-bootstrap 原子事务）----
+    //
+    // 单事务完成 Device + Endpoint(+Secrets) + Tasks + revision：
+    // 要么全部落库，要么全部回滚，不存在“device 建了但 endpoint 没建”的半提交。
+    // Driver start 是 runtime side effect，不在 DB 事务内——由 API 层在事务
+    // 提交后执行，失败走补偿删除（endpoint → device）。幂等键见下组函数。
+
+    /// 原子 bootstrap：device + endpoint(with secrets) + tasks + revision。
+    /// 调用前 secrets 必须已加密（`&[(field, ct, nonce)]`），本函数只负责落库。
+    /// 成功返回新 revision。
+    #[allow(clippy::too_many_arguments)]
+    pub fn bootstrap_device_tx(
+        &self,
+        device: &DeviceRecord,
+        endpoint: &EndpointRecord,
+        secrets_enc: &[(String, Vec<u8>, Vec<u8>)],
+        tasks: &[AcquisitionTask],
+    ) -> Result<u64, StoreError> {
+        Self::validate_id(&device.id)?;
+        if device.name.trim().is_empty() {
+            return Err(StoreError::Validation("device name 不能为空".into()));
+        }
+        Self::validate_id(&endpoint.id)?;
+        Self::validate_id(&endpoint.device_id)?;
+        Self::validate_id(&endpoint.driver_id)?;
+        Self::validate_endpoint_name(&endpoint.name)?;
+        let v: serde_json::Value =
+            serde_json::from_str(&endpoint.connection_json).map_err(StoreError::Json)?;
+        if !v.is_object() {
+            return Err(StoreError::Validation("connection 必须为 JSON 对象".into()));
+        }
+        for t in tasks {
+            t.validate()
+                .map_err(|e| StoreError::Validation(e.to_string()))?;
+        }
+        {
+            let mut seen = HashSet::new();
+            for t in tasks {
+                if !seen.insert(&t.id) {
+                    return Err(StoreError::Validation(format!(
+                        "duplicate task id `{}`",
+                        t.id
+                    )));
+                }
+            }
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        // device（重复即 Duplicate，由 API 层转 409）
+        let n = tx.execute(
+            "INSERT INTO devices(id,name) VALUES(?1,?2)",
+            params![device.id, device.name],
+        );
+        match n {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(StoreError::Duplicate(format!(
+                    "device `{}` 已存在",
+                    device.id
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        // endpoint（device FK 由 SQLite 强制；重复即 Duplicate）
+        let n = tx.execute(
+            "INSERT INTO endpoints(id,device_id,driver_id,name,connection_json,desired_running,updated_at_ns)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![endpoint.id, endpoint.device_id, endpoint.driver_id, endpoint.name, endpoint.connection_json, endpoint.desired_running as i32, endpoint.updated_at_ns],
+        );
+        match n {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(StoreError::Duplicate(format!(
+                    "endpoint `{}` 已存在",
+                    endpoint.id
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO config_revision(endpoint_id,revision) VALUES(?1,0)",
+            params![endpoint.id],
+        )?;
+        for (field, ct, nonce) in secrets_enc {
+            tx.execute(
+                "INSERT INTO endpoint_secrets(endpoint_id,field_path,ciphertext,nonce,algorithm,key_id,updated_at_ns)
+                 VALUES(?1,?2,?3,?4,'xchacha20poly1305','master',?5)
+                 ON CONFLICT(endpoint_id,field_path) DO UPDATE SET ciphertext=excluded.ciphertext, nonce=excluded.nonce, algorithm=excluded.algorithm, key_id=excluded.key_id, updated_at_ns=excluded.updated_at_ns",
+                params![endpoint.id, field, ct, nonce, Self::now_ns()],
+            )?;
+        }
+        Self::replace_tasks_in_tx(&tx, &endpoint.id, tasks)?;
+        // bump revision（新 endpoint 从 0 → 1）
+        let cur: i64 = tx
+            .query_row(
+                "SELECT revision FROM config_revision WHERE endpoint_id=?1",
+                params![endpoint.id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let next = (cur + 1) as u64;
+        tx.execute(
+            "INSERT INTO config_revision(endpoint_id,revision) VALUES(?1,?2)
+             ON CONFLICT(endpoint_id) DO UPDATE SET revision=excluded.revision",
+            params![endpoint.id, next as i64],
+        )?;
+        tx.commit()?;
+        Ok(next)
+    }
+
+    /// 原子 bootstrap（明文 secrets 版）：内部先加密再调单事务入口，
+    /// 与 create_endpoint_with_secrets 同语义（无 Secret 时不初始化 master key）。
+    pub fn bootstrap_device_tx_with_plaintext(
+        &self,
+        device: &DeviceRecord,
+        endpoint: &EndpointRecord,
+        secrets_plain: &[(String, String)],
+        tasks: &[AcquisitionTask],
+    ) -> Result<u64, StoreError> {
+        let mut encs: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
+        if !secrets_plain.is_empty() {
+            let key = self.master_key_bytes()?;
+            for (field, pt) in secrets_plain {
+                let (ct, nonce) = aead_encrypt(pt.as_bytes(), &key)?;
+                encs.push((field.clone(), ct, nonce));
+            }
+        }
+        self.bootstrap_device_tx(device, endpoint, &encs, tasks)
+    }
+
+    /// 补偿删除：bootstrap 的 start side effect 失败时调用。
+    /// endpoint → device 顺序删除（device 有 RESTRICT，顺序不可反）；
+    /// endpoint 已不存在视为补偿成功（幂等删除）。
+    pub fn bootstrap_compensate(&self, device_id: &str, endpoint_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM endpoints WHERE id=?1", params![endpoint_id])?;
+        conn.execute("DELETE FROM devices WHERE id=?1", params![device_id])?;
+        Ok(())
+    }
+
+    /// 查幂等记录：Ok(Some((request_hash, result_json))) = 同 key 已有结果。
+    pub fn bootstrap_idempotency_get(
+        &self,
+        key: &str,
+    ) -> Result<Option<(String, String)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT request_hash,result_json FROM bootstrap_idempotency WHERE key=?1",
+                params![key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// 写幂等记录（成功 bootstrap 后调用；INSERT OR REPLACE 覆盖同 key 同指纹重放）。
+    pub fn bootstrap_idempotency_put(
+        &self,
+        key: &str,
+        request_hash: &str,
+        device_id: &str,
+        endpoint_id: &str,
+        result_json: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO bootstrap_idempotency(key,request_hash,device_id,endpoint_id,result_json,created_at_ns)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![key, request_hash, device_id, endpoint_id, result_json, Self::now_ns()],
+        )?;
+        Ok(())
     }
 
     // ---- Tasks（全量快照替换，§6.2）----
@@ -1696,7 +1912,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "5");
+        assert_eq!(ver, "6");
         let has: bool = s
             .conn
             .lock()
@@ -1844,7 +2060,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "5");
+            assert_eq!(ver, "6");
             // 004：profile 列已删除，但设备行本身保留（仅去列，不丢行）
             let cols: Vec<String> = conn
                 .prepare("PRAGMA table_info(devices)")
@@ -1935,7 +2151,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "5");
+            assert_eq!(ver, "6");
             // 旧行以 id 回填 name，业务行保留
             let old_name: String = conn
                 .query_row("SELECT name FROM endpoints WHERE id='e1'", [], |r| r.get(0))
@@ -2186,7 +2402,7 @@ mod tests {
             .unwrap();
         // PR7 起 SCHEMA_VERSION=3，DeviceProfile 删除后升至 4，Endpoint.name 后升至 5；
         // 002/003 本身仍必须存在且已应用（增量链不断）
-        assert!(ver == "5", "新库应为 v5，got {ver}");
+        assert!(ver == "6", "新库应为 v6，got {ver}");
         let has2: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=2)",
@@ -2216,5 +2432,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tbl2, "control_audit");
+    }
+
+    // ---- M5 device-bootstrap ----
+    //
+    // 中文注释（仓库规范）：原子事务 + 幂等键的单测，验证“要么全落库要么全回滚”。
+
+    fn bootstrap_ep(id: &str, device: &str) -> EndpointRecord {
+        EndpointRecord {
+            id: id.into(),
+            name: format!("{id} 名称"),
+            device_id: device.into(),
+            driver_id: "simulator".into(),
+            connection_json: "{}".into(),
+            desired_running: true,
+            updated_at_ns: 0,
+        }
+    }
+
+    #[test]
+    fn bootstrap_tx_all_or_nothing() {
+        let s = mem();
+        let rev = s
+            .bootstrap_device_tx_with_plaintext(&dev("d1"), &bootstrap_ep("e1", "d1"), &[], &[task("t1", 1000)])
+            .unwrap();
+        assert_eq!(rev, 1);
+        assert!(s.get_device("d1").unwrap().is_some());
+        assert!(s.get_endpoint("e1").unwrap().is_some());
+        assert_eq!(s.list_tasks("e1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bootstrap_tx_duplicate_device_rolls_back_endpoint() {
+        let s = mem();
+        // 先建 d1（占住 device id）
+        s.create_device(&dev("d1")).unwrap();
+        // bootstrap 同 device id 必须 Duplicate，且 endpoint 不得半落库
+        let r = s.bootstrap_device_tx_with_plaintext(&dev("d1"), &bootstrap_ep("e2", "d1"), &[], &[task("t1", 1000)]);
+        assert!(matches!(r, Err(StoreError::Duplicate(_))));
+        assert!(s.get_endpoint("e2").unwrap().is_none());
+        assert!(s.list_tasks("e2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn bootstrap_tx_bad_tasks_rolls_back_all() {
+        let s = mem();
+        // 非法 task（空 id）→ Validation，device/endpoint 同样不得残留
+        let mut bad = task("", 1000);
+        bad.id = "".into();
+        let r = s.bootstrap_device_tx_with_plaintext(&dev("d9"), &bootstrap_ep("e9", "d9"), &[], &[bad]);
+        assert!(matches!(r, Err(StoreError::Validation(_))));
+        assert!(s.get_device("d9").unwrap().is_none());
+        assert!(s.get_endpoint("e9").unwrap().is_none());
+    }
+
+    #[test]
+    fn bootstrap_idempotency_put_get_roundtrip() {
+        let s = mem();
+        assert!(s.bootstrap_idempotency_get("k1").unwrap().is_none());
+        s.bootstrap_idempotency_put("k1", "hash-a", "d1", "e1", r#"{"ok":true}"#).unwrap();
+        let row = s.bootstrap_idempotency_get("k1").unwrap().unwrap();
+        assert_eq!(row.0, "hash-a");
+        assert_eq!(row.1, r#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn bootstrap_compensate_removes_endpoint_then_device() {
+        let s = mem();
+        s.bootstrap_device_tx_with_plaintext(&dev("d1"), &bootstrap_ep("e1", "d1"), &[], &[task("t1", 1000)])
+            .unwrap();
+        s.bootstrap_compensate("d1", "e1").unwrap();
+        assert!(s.get_endpoint("e1").unwrap().is_none());
+        assert!(s.get_device("d1").unwrap().is_none());
+        // 幂等删除：重复补偿不报错
+        s.bootstrap_compensate("d1", "e1").unwrap();
     }
 }
