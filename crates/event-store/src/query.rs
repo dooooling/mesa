@@ -12,10 +12,15 @@ use rusqlite::{Connection, ToSql};
 use crate::EventStoreError;
 use crate::schema::{self, StoredEvent};
 
-/// 历史查询过滤器（v1.1 §16 全字段）。
+/// 历史查询过滤器（v1.1 §16 全字段 + M5 `endpoint_ids` 多选）。
+/// `endpoint_id`（单值）与 `endpoint_ids`（多值）同时给出时取交集；
+/// 调用方通常在 API 层合并为 `endpoint_ids`，此处保留两者以兼容旧调用。
 #[derive(Debug, Clone, Default)]
 pub struct EventFilter {
     pub endpoint_id: Option<String>,
+    /// 多 endpoint 过滤（设备事件页：一次查询代替 N 次逐 endpoint 查询）。
+    /// `Some(vec![])` = 明确无匹配（直接返回空，不拼非法 `IN ()`）。
+    pub endpoint_ids: Option<Vec<String>>,
     pub category: Option<String>,
     pub kind: Option<String>,
     pub severity_min: Option<u16>,
@@ -56,6 +61,27 @@ pub fn query_history(
     // 裸 `?` 按位置绑定（与 args 压入顺序一致），无需显式编号
     if let Some(v) = &filter.endpoint_id {
         cond!("endpoint_id = ?", v.clone());
+    }
+    if let Some(ids) = &filter.endpoint_ids {
+        if ids.is_empty() {
+            // 明确无匹配：短路空结果（`IN ()` 非法 SQL，不可拼接）
+            return Ok((Vec::new(), None));
+        }
+        // 数量上限与 history limit 同级（500）：调用方（device 下 endpoint 数）
+        // 通常远小于此；超限直接拒绝而非静默截断（截断会丢事件）。
+        if ids.len() > HISTORY_LIMIT_MAX as usize {
+            return Err(EventStoreError::InvalidRecord(format!(
+                "endpoint_ids 太多（{} > {}），请分批查询",
+                ids.len(),
+                HISTORY_LIMIT_MAX
+            )));
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let clause = format!("endpoint_id IN ({placeholders})");
+        conds.push(clause);
+        for id in ids {
+            args.push(Box::new(id.clone()));
+        }
     }
     if let Some(v) = &filter.category {
         cond!("category = ?", v.clone());

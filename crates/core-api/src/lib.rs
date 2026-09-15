@@ -1984,6 +1984,10 @@ fn stored_event_json(
 #[derive(Debug, Deserialize)]
 struct EventsQuery {
     endpoint_id: Option<String>,
+    /// 多 endpoint 过滤（CSV，如 `?endpoint_ids=a,b`；与单值同时给出取交集）。
+    endpoint_ids: Option<String>,
+    /// 按设备过滤：API 层映射为该设备下全部 endpoint id（事件表不动）。
+    device_id: Option<String>,
     category: Option<String>,
     kind: Option<String>,
     severity_min: Option<u16>,
@@ -2004,8 +2008,60 @@ async fn list_events(
     let Some(svc) = state.event_services() else {
         return events_unavailable();
     };
+    // M5 endpoint 范围过滤：CSV 解析 + device_id 映射 + 单值交集合并。
+    // device 下无 endpoint 时直接空结果（不查 DB，避免全表扫描后客户端过滤）。
+    let mut ids: Vec<String> = q
+        .endpoint_ids
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if let Some(dev) = &q.device_id {
+        match state.store.list_endpoints() {
+            Ok(eps) => {
+                let dev_ids: Vec<String> = eps
+                    .into_iter()
+                    .filter(|e| &e.device_id == dev)
+                    .map(|e| e.id)
+                    .collect();
+                if dev_ids.is_empty() {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "events": [], "next_cursor": null })),
+                    );
+                }
+                if ids.is_empty() {
+                    ids = dev_ids;
+                } else {
+                    ids.retain(|id| dev_ids.contains(id));
+                }
+            }
+            Err(e) => return store_err_to_response(e),
+        }
+    }
+    if let Some(single) = &q.endpoint_id {
+        if ids.is_empty() {
+            ids.push(single.clone());
+        } else if !ids.contains(single) {
+            // 单值与多值无交集：明确空结果
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({ "events": [], "next_cursor": null })),
+            );
+        } else {
+            ids = vec![single.clone()];
+        }
+    }
+    let endpoint_ids = if q.endpoint_ids.is_some() || q.device_id.is_some() || q.endpoint_id.is_some() {
+        Some(ids)
+    } else {
+        None
+    };
     let filter = EventFilter {
-        endpoint_id: q.endpoint_id,
+        endpoint_id: None,
+        endpoint_ids,
         category: q.category,
         kind: q.kind,
         severity_min: q.severity_min,
@@ -2025,6 +2081,10 @@ async fn list_events(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json_error("INTERNAL", &format!("query task failed: {e}"))),
+        ),
+        Ok(Err(mesa_event_store::EventStoreError::InvalidRecord(m))) => (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("VALIDATION_ERROR", &m)),
         ),
         Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
