@@ -1262,6 +1262,7 @@ async fn on_configure(session: &Session, req: pb::ConfigureTasks, msg_id: u64) {
                                         point_key: d.point_key,
                                         data_type: d.data_type.as_str().to_string(),
                                         unit: d.unit,
+                                        source_label: d.source_label,
                                     })
                                     .collect(),
                             },

@@ -47,6 +47,7 @@ fn point_key_duplicate_rejected() {
         point_key: k.into(),
         data_type: DataType::F64,
         unit: None,
+        source_label: None,
     };
     assert!(ensure_unique_point_keys(&[d("a"), d("b")]).is_ok());
     let err = ensure_unique_point_keys(&[d("a"), d("a")]).unwrap_err();
@@ -78,6 +79,7 @@ fn same_point_key_restores_same_point_id() {
         point_key: "k1".into(),
         data_type: DataType::U32,
         unit: None,
+        source_label: None,
     }];
     let defs1 = store.assign_point_ids("ep1", &descs).unwrap();
     let id1 = defs1[0].point_id;
@@ -112,11 +114,13 @@ fn deleted_point_id_never_reused() {
             point_key: "k1".into(),
             data_type: DataType::U32,
             unit: None,
+            source_label: None,
         },
         PointDescriptor {
             point_key: "k2".into(),
             data_type: DataType::U32,
             unit: None,
+            source_label: None,
         },
     ];
     let defs = store.assign_point_ids("ep1", &descs).unwrap();
@@ -128,11 +132,13 @@ fn deleted_point_id_never_reused() {
             point_key: "k2".into(),
             data_type: DataType::U32,
             unit: None,
+            source_label: None,
         },
         PointDescriptor {
             point_key: "k3".into(),
             data_type: DataType::U32,
             unit: None,
+            source_label: None,
         },
     ];
     let defs2 = store.assign_point_ids("ep1", &descs2).unwrap();
@@ -167,6 +173,7 @@ fn re_add_tombstone_restores_same_id() {
         point_key: "k1".into(),
         data_type: DataType::I32,
         unit: None,
+        source_label: None,
     }];
     let defs1 = store.assign_point_ids("ep1", &descs).unwrap();
     let id1 = defs1[0].point_id;
@@ -274,6 +281,7 @@ fn disconnect_preserves_typed_last_value() {
             point_key: "k1".into(),
             data_type: DataType::I32,
             unit: None,
+            source_label: None,
         }],
     );
     let batch = DataBatch {
@@ -306,6 +314,7 @@ fn disconnect_keeps_original_timestamp() {
             point_key: "k1".into(),
             data_type: DataType::U32,
             unit: None,
+            source_label: None,
         }],
     );
     let ts = now_unix_ns();
@@ -335,6 +344,7 @@ fn disconnect_sets_bad_communication_lost() {
             point_key: "k1".into(),
             data_type: DataType::Bool,
             unit: None,
+            source_label: None,
         }],
     );
     snap.apply_batch(
@@ -366,12 +376,14 @@ fn one_output_bad_does_not_poison_sibling() {
                 point_key: "k1".into(),
                 data_type: DataType::I32,
                 unit: None,
+                source_label: None,
             },
             mesa_core_types::PointDefinition {
                 point_id: 2,
                 point_key: "k2".into(),
                 data_type: DataType::I32,
                 unit: None,
+                source_label: None,
             },
         ],
     );
@@ -413,6 +425,7 @@ fn p0a_good_bad_good_platform_continuity() {
             point_key: "k1".into(),
             data_type: DataType::F64,
             unit: None,
+            source_label: None,
         }],
     );
     // GOOD Current 12.5 @ T1
@@ -507,6 +520,7 @@ fn p0a_first_bad_is_placeholder_no_source_timestamp() {
             point_key: "k1".into(),
             data_type: DataType::F64,
             unit: None,
+            source_label: None,
         }],
     );
     // 首次采样即 BAD，无 LastKnown → Placeholder + typed neutral + source None
@@ -554,6 +568,7 @@ fn p0a_snapshot_rest_value_origin_not_lost() {
             point_key: "k1".into(),
             data_type: DataType::I32,
             unit: None,
+            source_label: None,
         }],
     );
     // LastKnown

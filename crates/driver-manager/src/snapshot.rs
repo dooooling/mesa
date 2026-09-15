@@ -101,6 +101,10 @@ pub struct LatestEntry {
     pub point_key: String,
     // 兼容：同时输出 key，避免旧 UI 读取 point_key 为 undefined
     pub key: String,
+    /// P1 Point Presentation Metadata：Driver 给的人类可读来源（如 S7
+    /// `DB10.DBD20`）。None 即未支持，UI 回落技术坐标。纯展示，非 identity。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_label: Option<String>,
     #[serde(flatten)]
     pub value: ValueJson,
     pub quality: String,
@@ -117,14 +121,18 @@ pub struct LatestEntry {
     pub source_timestamp_ns: Option<i64>,
 }
 
-/// 进程级共享快照。锁粒度按用途拆分，REST 读路径互不阻塞；latest/keys 采用 RwLock
+/// P1 点元数据：(point_key, source_label)。热路径 apply_batch 一次读锁同时
+/// 取 key+label，不新增锁（50K/s 锁争用敏感）。
+type PointMeta = (String, Option<String>);
+
+/// 进程级共享快照。锁粒度按用途拆分，REST 读路径互不阻塞；latest/meta 采用 RwLock
 /// 以支持高频 DataBatch 写入与 REST 并发读取（§22 50K/s 下 apply_batch 与 latest_all 争用显著）。
 pub struct Snapshot {
     drivers: RwLock<Vec<DriverInfo>>,
     endpoints: RwLock<HashMap<String, EndpointStatus>>,
     latest: RwLock<HashMap<(String, u32), LatestEntry>>,
-    /// point_key -> data_type，用于 latest 输出补全类型信息。
-    keys: RwLock<HashMap<(String, u32), String>>,
+    /// (endpoint_id, point_id) -> (point_key, source_label)，register 时 replace。
+    point_meta: RwLock<HashMap<(String, u32), PointMeta>>,
     /// §22 精确计数：自启动以来的 envelope / point_value 总数（单调递增，跨 batch 累加）
     envelopes_total: AtomicU64,
     point_value_total: AtomicU64,
@@ -140,7 +148,7 @@ impl Default for Snapshot {
             drivers: RwLock::new(Vec::new()),
             endpoints: RwLock::new(HashMap::new()),
             latest: RwLock::new(HashMap::new()),
-            keys: RwLock::new(HashMap::new()),
+            point_meta: RwLock::new(HashMap::new()),
             envelopes_total: AtomicU64::new(0),
             point_value_total: AtomicU64::new(0),
             snapshot_apply_latencies_ns: RwLock::new(VecDeque::with_capacity(4096)),
@@ -179,23 +187,37 @@ impl Snapshot {
         self.endpoints.read().unwrap().get(id).cloned()
     }
 
-    /// 记录点元数据（ApplyPointMap 时）：point_id -> point_key，
-    /// 供 latest 输出回填可读键名；数据类型由值本身携带（ValueJson.type）。
+    /// 记录点元数据（ApplyPointMap 时）：point_id -> (point_key, source_label)，
+    /// 供 latest 输出回填可读键名与来源；数据类型由值本身携带（ValueJson.type）。
     /// 语义为 replace：先清理该 endpoint 的旧映射，再插入新集合，避免减少任务后旧点残留。
+    /// P1：source_label 同步 replace（含 None 清空，与 registry 快照语义一致）；
+    /// 已有 LatestEntry 的 key/label 立即同步刷新（不等下一批 DataBatch，
+    /// 否则改地址后 Start 失败/离线期间 UI 长期显示旧来源）。
     pub fn register_points(&self, endpoint_id: &str, defs: &[mesa_core_types::PointDefinition]) {
-        let mut keys = self.keys.write().unwrap();
-        keys.retain(|(ep, _), _| ep != endpoint_id);
+        let mut meta = self.point_meta.write().unwrap();
+        meta.retain(|(ep, _), _| ep != endpoint_id);
         for d in defs {
-            keys.insert((endpoint_id.to_string(), d.point_id), d.point_key.clone());
+            meta.insert(
+                (endpoint_id.to_string(), d.point_id),
+                (d.point_key.clone(), d.source_label.clone()),
+            );
         }
-        // 同步清理 latest 中已不在新点集的旧点
-        let valid_ids: std::collections::HashSet<u32> = defs.iter().map(|d| d.point_id).collect();
+        // 同步清理 latest 中已不在新点集的旧点；保留的立即刷新 key/label
         let mut latest = self.latest.write().unwrap();
-        latest.retain(|(ep, pid), _| ep != endpoint_id || valid_ids.contains(pid));
+        latest.retain(|(ep, pid), _| ep != endpoint_id || meta.contains_key(&(ep.clone(), *pid)));
+        for ((ep, _), entry) in latest.iter_mut() {
+            if ep == endpoint_id
+                && let Some((k, label)) = meta.get(&(ep.clone(), entry.point_id))
+            {
+                entry.point_key = k.clone();
+                entry.key = k.clone();
+                entry.source_label = label.clone();
+            }
+        }
     }
 
     /// 应用一个批次到 LatestValueCache。同点覆盖即"最新值胜出"的 Core 侧体现。
-    /// 优化：预先快照 keys 的读锁，避免在持有 latest 写锁期间逐点再次加锁 keys，显著降低 50K/s 下的锁争用（原实现为 latest 锁内嵌 keys 锁）。
+    /// 优化：预先快照 point_meta 的读锁，避免在持有 latest 写锁期间逐点再次加锁，显著降低 50K/s 下的锁争用（原实现为 latest 锁内嵌 keys 锁）。
     /// 同时以单调时钟记录 envelopes/points 计数，供 §22 精确吞吐与延迟百分位使用。
     pub fn apply_batch(&self, batch: &mesa_core_types::DataBatch, endpoint_id: &str) {
         // 业务时间戳为 UTC ns，性能用单调时钟（此处以 apply 时刻的 Instant 采样，非跨进程相减）
@@ -203,15 +225,15 @@ impl Snapshot {
         self.envelopes_total.fetch_add(1, Ordering::Relaxed);
         self.point_value_total
             .fetch_add(batch.values.len() as u64, Ordering::Relaxed);
-        // 预构建本批次所需的 key 映射快照（仅一次读锁）
-        let keys_snapshot: HashMap<(String, u32), String> = {
-            let keys = self.keys.read().unwrap();
+        // 预构建本批次所需的 key+label 映射快照（仅一次读锁，不新增锁）。
+        let meta_snapshot: HashMap<(String, u32), PointMeta> = {
+            let meta = self.point_meta.read().unwrap();
             batch
                 .values
                 .iter()
                 .map(|pv| {
                     let k = (endpoint_id.to_string(), pv.point_id);
-                    let v = keys.get(&k).cloned().unwrap_or_default();
+                    let v = meta.get(&k).cloned().unwrap_or_default();
                     (k, v)
                 })
                 .collect()
@@ -219,7 +241,7 @@ impl Snapshot {
         let mut latest = self.latest.write().unwrap();
         for pv in &batch.values {
             let k = (endpoint_id.to_string(), pv.point_id);
-            let point_key = keys_snapshot.get(&k).cloned().unwrap_or_default();
+            let (point_key, source_label) = meta_snapshot.get(&k).cloned().unwrap_or_default();
             // V1.2.1：透传 value_origin + source_timestamp，Placeholder 强制 source=None（已在解码层保证）
             let origin = pv
                 .value_origin
@@ -236,6 +258,7 @@ impl Snapshot {
                 point_id: pv.point_id,
                 point_key: point_key.clone(),
                 key: point_key,
+                source_label,
                 value: value_to_json(&pv.value),
                 quality: pv.quality.as_str().to_string(),
                 quality_code: pv.quality_code.map(|c| c.to_string()).or_else(|| {
@@ -327,7 +350,7 @@ impl Snapshot {
     }
 
     pub fn remove_endpoint(&self, endpoint_id: &str) {
-        self.keys
+        self.point_meta
             .write()
             .unwrap()
             .retain(|(ep, _), _| ep != endpoint_id);
@@ -366,6 +389,7 @@ mod tests {
                 point_key: "k1".into(),
                 data_type: DataType::F64,
                 unit: None,
+                source_label: None,
             }],
         );
         let batch = DataBatch {
@@ -403,6 +427,7 @@ mod tests {
                 point_key: "k1".into(),
                 data_type: DataType::F64,
                 unit: None,
+                source_label: None,
             }],
         );
         let pv_current = PointValue {
@@ -461,6 +486,7 @@ mod tests {
                 point_key: "k2".into(),
                 data_type: DataType::I32,
                 unit: None,
+                source_label: None,
             }],
         );
         snap2.apply_batch(
@@ -485,5 +511,115 @@ mod tests {
         let e3 = &snap2.latest_all()[0];
         assert_eq!(e3.value_origin, "PLACEHOLDER");
         assert_eq!(e3.source_timestamp_ns, None);
+    }
+
+    #[test]
+    fn source_label_flows_from_register_to_latest() {
+        // P1：register 的 source_label 经 apply_batch 透出到 LatestEntry，
+        // 未注册 label 的点为 None（UI 回落技术坐标）。
+        let snap = Snapshot::new();
+        snap.register_points(
+            "ep1",
+            &[
+                PointDefinition {
+                    point_id: 1,
+                    point_key: "k1".into(),
+                    data_type: DataType::F64,
+                    unit: None,
+                    source_label: Some("DB10.DBD20".into()),
+                },
+                PointDefinition {
+                    point_id: 2,
+                    point_key: "k2".into(),
+                    data_type: DataType::F64,
+                    unit: None,
+                    source_label: None,
+                },
+            ],
+        );
+        snap.apply_batch(
+            &DataBatch {
+                connection_handle: 1,
+                stream_epoch: 1,
+                sequence: 1,
+                timestamp_ns: 1_000_000,
+                values: vec![
+                    PointValue {
+                        point_id: 1,
+                        value: Value::F64(1.0),
+                        quality: Quality::Good,
+                        quality_code: None,
+                        source_timestamp_ns: None,
+                        value_origin: ValueOrigin::Current,
+                    },
+                    PointValue {
+                        point_id: 2,
+                        value: Value::F64(2.0),
+                        quality: Quality::Good,
+                        quality_code: None,
+                        source_timestamp_ns: None,
+                        value_origin: ValueOrigin::Current,
+                    },
+                ],
+                mono_ns: None,
+            },
+            "ep1",
+        );
+        let all = snap.latest_all();
+        let e1 = all.iter().find(|e| e.point_id == 1).unwrap();
+        let e2 = all.iter().find(|e| e.point_id == 2).unwrap();
+        assert_eq!(e1.source_label.as_deref(), Some("DB10.DBD20"));
+        assert_eq!(e2.source_label, None);
+        let json = serde_json::to_value(e1).unwrap();
+        assert_eq!(json["source_label"], "DB10.DBD20");
+    }
+
+    #[test]
+    fn register_refreshes_existing_latest_labels_without_new_batch() {
+        // 收2：改地址后已有 LatestEntry 必须立即同步（不等下一批），
+        // 含 Some 覆盖与 None 清空。
+        use mesa_core_types::PointDefinition;
+        let snap = Snapshot::new();
+        let def = |label: Option<&str>| {
+            vec![PointDefinition {
+                point_id: 1,
+                point_key: "motor.speed".into(),
+                data_type: DataType::F64,
+                unit: None,
+                source_label: label.map(|s| s.to_string()),
+            }]
+        };
+        let batch = || DataBatch {
+            connection_handle: 1,
+            stream_epoch: 1,
+            sequence: 1,
+            timestamp_ns: 1_000_000,
+            values: vec![PointValue {
+                point_id: 1,
+                value: Value::F64(1500.0),
+                quality: Quality::Good,
+                quality_code: None,
+                source_timestamp_ns: None,
+                value_origin: ValueOrigin::Current,
+            }],
+            mono_ns: None,
+        };
+        snap.register_points("ep1", &def(Some("DB10.DBD20")));
+        snap.apply_batch(&batch(), "ep1");
+        assert_eq!(
+            snap.latest_all()[0].source_label.as_deref(),
+            Some("DB10.DBD20")
+        );
+        // 改地址：无新 batch，latest 立即 = 新 label
+        snap.register_points("ep1", &def(Some("DB20.DBD40")));
+        assert_eq!(
+            snap.latest_all()[0].source_label.as_deref(),
+            Some("DB20.DBD40")
+        );
+        // Driver 回 None：立即清空
+        snap.register_points("ep1", &def(None));
+        assert_eq!(snap.latest_all()[0].source_label, None);
+        // 值本身不受影响
+        assert_eq!(snap.latest_all()[0].value.value, serde_json::json!(1500.0));
     }
 }

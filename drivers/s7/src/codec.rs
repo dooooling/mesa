@@ -84,6 +84,23 @@ impl S7Kind {
             _ => self.byte_len() as u16,
         }
     }
+
+    /// P1 来源标签的位宽档（address::display_label 输入）。
+    /// BOOL 无宽（位地址直接 `.bit`，档位被忽略）；Lreal/Dt 按 D 档显示
+    ///（S7 语法无 8 字节 DB 前缀，DBD 即 4 字节语义起点）。
+    pub fn display_width(self) -> crate::address::S7Width {
+        use crate::address::S7Width::*;
+        match self {
+            S7Kind::Real
+            | S7Kind::Dint
+            | S7Kind::Dword
+            | S7Kind::Lreal
+            | S7Kind::Time
+            | S7Kind::Dt => Dword,
+            S7Kind::Int | S7Kind::Word | S7Kind::S5Time | S7Kind::Date => Word,
+            S7Kind::Byte | S7Kind::String | S7Kind::WString | S7Kind::Bool => Byte,
+        }
+    }
 }
 
 /// 将用户在 binding 中填写的 `data_type` 字符串映射到 `(Core DataType, S7Kind)`。

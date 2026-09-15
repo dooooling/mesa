@@ -169,6 +169,10 @@ message PointDescriptorProto {
   // core_types::DataType::as_str()
   string data_type = 2;
   optional string unit = 3;
+  // P1 Point Presentation Metadata：Driver 生成的人类可读来源（如 S7 的
+  // DB10.DBD20）。纯展示元数据，不是 identity；缺失即 None，Core 回落。
+  // Additive optional：旧 Driver 不填、新 Core 忽略未知字段均兼容。
+  optional string source_label = 4;
 }
 
 // point_key -> point_id 稳定映射。point_id 由 Core 分配并持久化（tombstone 保证不复用）。

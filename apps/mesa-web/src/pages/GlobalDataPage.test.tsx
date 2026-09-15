@@ -94,8 +94,8 @@ describe("M3.1 全局实时数据", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(screen.getByText("spindle.speed")).toBeTruthy();
-    expect(screen.getByText("DB1.temp")).toBeTruthy();
+    expect(screen.getAllByText("spindle.speed").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("DB1.temp").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText("CNC-01").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText("PLC-01").length).toBeGreaterThanOrEqual(1);
   });
@@ -106,8 +106,8 @@ describe("M3.1 全局实时数据", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(screen.getByText("DB1.temp")).toBeTruthy();
-    expect(screen.queryByText("spindle.speed")).toBeNull();
+    expect(screen.getAllByText("DB1.temp").length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryAllByText("spindle.speed")).toHaveLength(0);
   });
 
   it("STALE 语义与设备页一致（旧点自然 STALE）", async () => {
@@ -134,7 +134,7 @@ describe("M3.1 全局实时数据", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(screen.getByText("old-k")).toBeTruthy();
+    expect(screen.getAllByText("old-k").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("STALE")).toBeTruthy();
   });
 
@@ -144,8 +144,9 @@ describe("M3.1 全局实时数据", () => {
     const user = userEvent.setup();
     renderApp("/data");
     // 并行负载下表格渲染+轮询多轮，findBy 放宽（只放宽等待，不放宽断言）。
-    await screen.findByText("spindle.speed", undefined, { timeout: 10000 });
-    await user.click(screen.getByText("spindle.speed"));
+    // P1 后数据点列与来源列文本相同（回落），用 AllBy。
+    await screen.findAllByText("spindle.speed", undefined, { timeout: 10000 });
+    await user.click(screen.getAllByText("spindle.speed")[0]);
     await screen.findByText("打开连接配置", undefined, { timeout: 10000 });
     // 来源：设备 + 连接 + endpoint 三段
     expect(screen.getAllByText("CNC-01").length).toBeGreaterThanOrEqual(1);

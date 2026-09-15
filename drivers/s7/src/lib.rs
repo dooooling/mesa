@@ -14,7 +14,7 @@ pub mod client; // Common SZL 直连诊断需对外暴露（V1 只读，不影�
 mod codec;
 mod s7any;
 
-pub use address::{S7Address, parse_address};
+pub use address::{S7Address, S7Width, parse_address};
 pub use codec::{S7Kind, decode_value, parse_data_type};
 
 use std::sync::Arc;
@@ -51,6 +51,12 @@ pub const CANONICAL_DATA_TYPES: [(&str, DataType, S7Kind); 9] = [
 /// 只有 byte_len==2 的 kind 语义成立（REAL 等 4 字节 kind 会错位）。
 fn counter_timer_kind_ok(kind: S7Kind) -> bool {
     matches!(kind, S7Kind::Word | S7Kind::Int)
+}
+
+/// S7Kind → display 位宽档（P1 来源标签唯一格式化入口的输入）。
+/// BOOL 无宽（位地址直接 `.bit`）；STRING/WSTRING 按字节档处理。
+fn width_of_kind(kind: S7Kind) -> S7Width {
+    kind.display_width()
 }
 
 use address::AddressError;
@@ -583,6 +589,14 @@ impl DriverConnection for S7Connection {
                                 ),
                             ));
                         }
+                        // PI/PQ + BOOL 明确拒绝：parse_peripheral 不支持位语义
+                        //（位后缀会被丢弃），静默接受会错读整字。fail-closed。
+                        if (area_u == "PI" || area_u == "PQ") && kind == S7Kind::Bool {
+                            return Err(SdkDriverError::configuration(
+                                "INVALID_ADDRESS",
+                                format!("point `{}` PI/PQ 区暂不支持 BOOL 位访问", out.point_key),
+                            ));
+                        }
                         // 合成标准 S7 地址（与 legacy parse_address 同语法）
                         let addr_str = if area_u == "DB" {
                             if kind == S7Kind::Bool {
@@ -743,6 +757,18 @@ impl DriverConnection for S7Connection {
                         format!("point `{key}` 非 BOOL 不应带位偏移"),
                     ));
                 }
+                // PI/PQ + BOOL 明确拒绝（同 generic 路径：位语义不支持，
+                // parse 会丢位后缀，静默接受即错读）。
+                if matches!(
+                    addr.area,
+                    crate::address::Area::PeripheralInput | crate::address::Area::PeripheralOutput
+                ) && kind == S7Kind::Bool
+                {
+                    return Err(SdkDriverError::configuration(
+                        "INVALID_ADDRESS",
+                        format!("point `{key}` PI/PQ 区暂不支持 BOOL 位访问"),
+                    ));
+                }
                 indices.push(new_points.len());
                 new_points.push(PointSpec {
                     key: key.to_string(),
@@ -765,6 +791,8 @@ impl DriverConnection for S7Connection {
                 point_key: p.key.clone(),
                 data_type: p.data_type,
                 unit: None,
+                // P1：来源标签走 S7Address 唯一格式化入口（configure/诊断同一实现）
+                source_label: Some(p.addr.display_label(width_of_kind(p.kind))),
             })
             .collect();
         ensure_unique_point_keys(&descriptors).map_err(|DuplicatePointKey(k)| {
@@ -1260,6 +1288,18 @@ mod tests {
                 .unwrap();
             assert_eq!(descs.len(), 1);
             assert_eq!(descs[0].data_type, expected, "{dt}");
+            // P1：configure 回填 canonical 来源标签
+            let want_label = if dt == "BOOL" {
+                "DB1.DBX0.3"
+            } else {
+                match dt {
+                    "REAL" => "DB1.DBD0",
+                    "DWORD" | "DINT" => "DB1.DBD0",
+                    "INT" | "WORD" => "DB1.DBW0",
+                    _ => "DB1.DBB0",
+                }
+            };
+            assert_eq!(descs[0].source_label.as_deref(), Some(want_label), "{dt}");
         }
     }
 
@@ -1322,6 +1362,16 @@ mod tests {
                 serde_json::json!({"area": "DB", "db": 1, "offset": 3000000, "data_type": "REAL"}),
                 "INVALID_ADDRESS",
             ),
+            (
+                "PI + BOOL 位语义不支持",
+                serde_json::json!({"area": "PI", "offset": 0, "data_type": "BOOL", "bit": 3}),
+                "INVALID_ADDRESS",
+            ),
+            (
+                "PQ + BOOL 位语义不支持",
+                serde_json::json!({"area": "PQ", "offset": 0, "data_type": "BOOL", "bit": 0}),
+                "INVALID_ADDRESS",
+            ),
         ];
         for (name, params, code) in cases {
             let mut conn = S7Connection {
@@ -1350,6 +1400,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(descs[0].data_type, mesa_core_types::DataType::U32);
+        // PI + BYTE/REAL 按档输出标签（拒绝固定 W）
+        for (dt, want) in [("BYTE", "PIB0"), ("WORD", "PIW0"), ("REAL", "PID0")] {
+            let mut conn = S7Connection {
+                cfg: S7ConnConfig::default(),
+                plan: None,
+            };
+            let descs = conn
+                .configure(
+                    1,
+                    vec![generic_task(memory_selection(
+                        "k",
+                        serde_json::json!({"area": "PI", "offset": 0, "data_type": dt}),
+                    ))],
+                )
+                .await
+                .unwrap();
+            assert_eq!(descs[0].source_label.as_deref(), Some(want), "{dt}");
+        }
+    }
+
+    /// legacy 路径同样拒绝 PI/PQ + BOOL（parse 丢位，静默接受即错读）。
+    #[tokio::test]
+    async fn legacy_rejects_peripheral_bool() {
+        let mut conn = S7Connection {
+            cfg: S7ConnConfig::default(),
+            plan: None,
+        };
+        let items = serde_json::json!([{"key":"k","address":"PI0.3","data_type":"BOOL"}]);
+        let err = conn
+            .configure(1, vec![task_with_items(items)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "INVALID_ADDRESS");
     }
 
     /// 按 parse_szl_module_id 的布局假设构造合成 SZL 载荷（自举一致性；

@@ -23,6 +23,8 @@ export interface WorkspacePoint {
   type: string;
   value: unknown;
   timestamp_ns: number;
+  /** P1 来源标签（Driver 人类可读来源，如 S7 DB10.DBD20）；缺失即未支持。 */
+  source_label?: string;
 }
 
 export interface WorkspaceEndpoint {
@@ -38,6 +40,13 @@ export type PointStale = "GOOD" | "BAD" | "STALE" | "UNKNOWN";
 export interface DevicePointView extends WorkspacePoint {
   /** 展示用点名（key 缺失回落 point_key，再缺失回落 point_id）。 */
   displayKey: string;
+  /**
+   * P1 来源展示（Name/Source 双字段口径）：
+   * - 有 source_label 即来源标签；
+   * - 缺失即 None（UI 诚实显示"未提供"，绝不拿 point_key 反推技术坐标——
+   *   point_key 是语义身份，不是 provenance）。
+   */
+  sourceText: string | null;
   /** 距 nowMs 的年龄（ms），非法时间戳为 null。 */
   ageMs: number | null;
   /** 派生状态：quality BAD 即 BAD；否则 age 超阈即 STALE；非法时间戳为 UNKNOWN。 */
@@ -87,6 +96,9 @@ function toView(
   return {
     ...p,
     displayKey: p.key ?? p.point_key ?? String(p.point_id),
+    // P1 Source：有 label 即标签；缺失为 None（UI 显示"未提供"，
+    // 不拿 point_key 反推——key 是"它是什么"，不是"它从哪里来"）。
+    sourceText: p.source_label ?? null,
     ageMs,
     derived: derivePointStale(p.quality, ageMs),
     endpointName: c?.endpointName ?? p.endpoint_id,

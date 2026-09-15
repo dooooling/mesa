@@ -75,14 +75,35 @@ export function PointDetailDrawer(props: {
             <Descriptions size="small" column={1} bordered>
               <Descriptions.Item label="设备">{deviceName}</Descriptions.Item>
               <Descriptions.Item label="连接">{point.endpointName}</Descriptions.Item>
+              {/* P1：来源标签优先；缺失诚实显示"未提供"，不拿 point_key 反推。
+                  正常返回标签时不标记。 */}
+              <Descriptions.Item label="来源">
+                <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>
+                  {point.sourceText ?? "—"}
+                </span>
+                {point.source_label ? null : (
+                  <span style={{ fontSize: 12, color: "#525252" }}>（Driver 未提供）</span>
+                )}
+              </Descriptions.Item>
               <Descriptions.Item label="Endpoint">
                 <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>
                   {point.endpoint_id}
                 </span>
               </Descriptions.Item>
-              <Descriptions.Item label="Point">
+            </Descriptions>
+          </section>
+
+          <section>
+            <h4>高级信息</h4>
+            <Descriptions size="small" column={1} bordered>
+              <Descriptions.Item label="Point Key">
                 <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>
                   {point.key ?? point.point_key ?? point.point_id}
+                </span>
+              </Descriptions.Item>
+              <Descriptions.Item label="Point ID">
+                <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>
+                  {point.point_id}
                 </span>
               </Descriptions.Item>
             </Descriptions>

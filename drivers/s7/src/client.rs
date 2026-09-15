@@ -173,7 +173,7 @@ impl S7Client {
             .map(|(r, it)| {
                 if r.return_code != mesa_s7_transport::S7_ITEM_OK {
                     tracing::warn!(
-                        addr = %format_addr(&it.addr),
+                        addr = %it.addr.display_label(it.kind.display_width()),
                         ret = r.return_code,
                         "S7 item 0x{:02X} 按项 BAD",
                         r.return_code
@@ -366,51 +366,6 @@ pub(crate) fn reassemble_ranges(
         }
     }
     out
-}
-
-fn format_addr(a: &S7Address) -> String {
-    use crate::address::Area;
-    match a.area {
-        Area::Db => {
-            if let Some(bit) = a.bit_offset {
-                format!("DB{}.DBX{}.{}", a.db_number, a.byte_offset, bit)
-            } else {
-                format!("DB{}.{}", a.db_number, a.byte_offset)
-            }
-        }
-        Area::Merker => {
-            if let Some(bit) = a.bit_offset {
-                format!("M{}.{}", a.byte_offset, bit)
-            } else {
-                format!("MB{}", a.byte_offset)
-            }
-        }
-        Area::Input => {
-            if let Some(bit) = a.bit_offset {
-                format!("I{}.{}", a.byte_offset, bit)
-            } else {
-                format!("IB{}", a.byte_offset)
-            }
-        }
-        Area::Output => {
-            if let Some(bit) = a.bit_offset {
-                format!("Q{}.{}", a.byte_offset, bit)
-            } else {
-                format!("QB{}", a.byte_offset)
-            }
-        }
-        Area::Counter => format!("C{}", a.byte_offset),
-        Area::Timer => format!("T{}", a.byte_offset),
-        Area::PeripheralInput => format!("PIW{}", a.byte_offset),
-        Area::PeripheralOutput => format!("PQW{}", a.byte_offset),
-        Area::Local => {
-            if let Some(bit) = a.bit_offset {
-                format!("L{}.{}", a.byte_offset, bit)
-            } else {
-                format!("LB{}", a.byte_offset)
-            }
-        }
-    }
 }
 
 #[cfg(test)]

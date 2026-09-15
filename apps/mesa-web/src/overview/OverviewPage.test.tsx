@@ -24,6 +24,8 @@ function pt(ep: string, key: string, quality: string, ageMs: number): DevicePoin
     value: 1,
     timestamp_ns: ts,
     displayKey: key,
+    // P1：测试构造同样带 sourceText（与 toView 同口径：无 label 即技术坐标）
+    sourceText: key,
     ageMs: age,
     derived: quality === "BAD" ? "BAD" : age > POINT_STALE_AFTER_MS ? "STALE" : "GOOD",
     endpointName: ep.toUpperCase(),

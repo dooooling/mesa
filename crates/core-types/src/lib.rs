@@ -463,11 +463,16 @@ pub enum TaskValidationError {
 pub type PointMap = std::collections::HashMap<String, u32>;
 
 /// Driver 在 ConfigureTasks 后上报的点描述，**不含 point_id**——ID 由 Core 分配（方案 §6.2）。
+/// `source_label`（P1）：Driver 生成的人类可读来源（如 S7 `DB10.DBD20`），纯展示
+/// 元数据，不是 identity；None 即未支持，Core 回落技术坐标。configure 返回即
+/// 当前真值快照（含 None 清空语义）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PointDescriptor {
     pub point_key: String,
     pub data_type: DataType,
     pub unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_label: Option<String>,
 }
 
 /// Core 为 Descriptor 分配稳定 point_id 后形成的正式定义（持久化于 PointRegistry）。
@@ -477,6 +482,8 @@ pub struct PointDefinition {
     pub point_key: String,
     pub data_type: DataType,
     pub unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_label: Option<String>,
 }
 
 /// 同一 Endpoint 全量配置内 point_key 必须唯一（方案 §6.2 双重保护）。
@@ -622,6 +629,7 @@ mod tests {
             point_key: k.into(),
             data_type: DataType::F64,
             unit: None,
+            source_label: None,
         };
         ensure_unique_point_keys(&[d("a"), d("b")]).unwrap();
         assert_eq!(

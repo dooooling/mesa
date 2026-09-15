@@ -21,7 +21,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// IPC 协议版本。Major 不兼容直接拒绝握手；Minor 取双方较小值。
 /// V1.2.1 新增 PointValue.value_origin（§5.5），Minor 1 保证新 Driver 的 typed BAD 语义可被新 Core 理解，旧端仍按 UNSPECIFIED 兼容解释
 pub const PROTOCOL_MAJOR: u32 = 1;
-pub const PROTOCOL_MINOR: u32 = 3;
+/// Minor 4：PointDescriptorProto 新增可选 source_label（Point Presentation
+/// Metadata P1）。纯 additive：旧 Driver 不填→None 回落；新 Driver→旧 Core
+/// 未知字段忽略。Core 不得因 minor 不同拒绝运行（无 hard gate）。
+pub const PROTOCOL_MINOR: u32 = 4;
 
 /// Dynamic Probe RPC 可用的最低协商 Minor（§8）。协商 Minor < 2 的旧 Driver
 /// 不识别 ProbeRequest（会静默忽略），Core 必须直接返回 Unsupported，
@@ -513,6 +516,7 @@ pub fn descriptor_from_pb(d: pb::PointDescriptorProto) -> Result<PointDescriptor
         point_key: d.point_key,
         data_type: data_type_from_pb(&d.data_type)?,
         unit: d.unit,
+        source_label: d.source_label,
     })
 }
 
@@ -594,6 +598,36 @@ impl ErrorDetailBox {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// P1 invariant：in-tree driver.toml 的 protocol_minor 必须与
+    /// PROTOCOL_MINOR 同步（管理面展示读 manifest，运行协商读常量；
+    /// bump 常量忘改 toml 即漂移）。Minor 只做展示一致性，不断言 gate。
+    #[test]
+    fn in_tree_manifest_minor_matches_protocol() {
+        // workspace 根 → drivers/<id>/driver.toml（5 个 in-tree 驱动）
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("drivers");
+        for id in ["s7", "simulator", "opcua", "focas2", "sinumerik-nck"] {
+            let p = root.join(id).join("driver.toml");
+            let text =
+                std::fs::read_to_string(&p).unwrap_or_else(|_| panic!("missing {}", p.display()));
+            let minor = text
+                .lines()
+                .find_map(|l| {
+                    let t = l.trim();
+                    t.strip_prefix("protocol_minor")
+                        .and_then(|v| v.trim().strip_prefix('='))
+                        .and_then(|v| v.trim().parse::<u32>().ok())
+                })
+                .unwrap_or_else(|| panic!("{id} driver.toml 缺 protocol_minor"));
+            assert_eq!(
+                minor, PROTOCOL_MINOR,
+                "{id} driver.toml minor {minor} != PROTOCOL_MINOR {PROTOCOL_MINOR}"
+            );
+        }
+    }
 
     /// 全部 Value 变体的编解码必须无损往返，这是高频通道正确性的根基。
     #[test]

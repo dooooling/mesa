@@ -410,6 +410,19 @@ enum SourceSpec {
 }
 
 impl SourceSpec {
+    /// P1 来源标签：simulator 的 canonical 形式 `sim.{kind}`（kind 即
+    /// resource_id，如 counter/sine/toggle/random/constant）。非 identity，
+    /// 同 kind 多点允许重复（key 仍唯一）。
+    fn source_label(&self) -> String {
+        let kind = match self {
+            SourceSpec::Counter { .. } => "counter",
+            SourceSpec::Sine { .. } => "sine",
+            SourceSpec::Toggle { .. } => "toggle",
+            SourceSpec::Constant { .. } => "constant",
+            SourceSpec::Random { .. } => "random",
+        };
+        format!("sim.{kind}")
+    }
     fn parse(key: &str, v: &serde_json::Value) -> Result<PointSpec, SdkDriverError> {
         let kind = v
             .get("kind")
@@ -802,6 +815,8 @@ impl DriverConnection for SimConnection {
                 point_key: p.key.clone(),
                 data_type: p.source.data_type(),
                 unit: None,
+                // P1：simulator canonical 来源标签（合同验证用）
+                source_label: Some(p.source.source_label()),
             })
             .collect();
         ensure_unique_point_keys(&descriptors).map_err(|DuplicatePointKey(k)| {
@@ -1367,6 +1382,12 @@ mod tests {
                 .unwrap();
             assert_eq!(descs.len(), 1);
             assert_eq!(descs[0].data_type, expected.unwrap(), "{resource_id}");
+            // P1：configure 回填 canonical 来源标签
+            assert_eq!(
+                descs[0].source_label.as_deref(),
+                Some(format!("sim.{resource_id}").as_str()),
+                "{resource_id}"
+            );
         }
     }
 

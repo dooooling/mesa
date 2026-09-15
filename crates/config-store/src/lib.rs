@@ -18,7 +18,7 @@ use mesa_core_types::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// 当前 schema 版本。增量迁移时递增并在 `meta` 中持久化（§6.1）。
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 // ---------------------------------------------------------------------------
 // 记录类型
@@ -212,6 +212,9 @@ fn aead_decrypt(ciphertext: &[u8], nonce: &[u8], key: &[u8; 32]) -> Result<Vec<u
 // Store
 // ---------------------------------------------------------------------------
 
+/// point_registry 行（诊断用）：key/id/类型/墓碑/来源标签。
+pub type RegistryRow = (String, u32, String, bool, Option<String>);
+
 pub struct ConfigStore {
     conn: Mutex<Connection>,
     /// master.key 目录：文件库 = DB 父目录（P0-1），内存库 = None（固定测试 key）。
@@ -335,6 +338,7 @@ impl ConfigStore {
                 data_type TEXT NOT NULL,
                 unit TEXT,
                 deleted INTEGER NOT NULL DEFAULT 0,
+                source_label TEXT NULL,
                 PRIMARY KEY(endpoint_id, point_key)
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_point_registry_ep_pid
@@ -565,6 +569,45 @@ impl ConfigStore {
                 )?;
                 tx.commit()?;
                 cur_ver = 6;
+            }
+        }
+        // 007 迁移（Point Presentation Metadata P1）：point_registry 新增
+        // source_label（纯展示，非 identity）。新库建表已含该列；旧库走迁移
+        // 补列（ADD COLUMN，重入安全：列已存在即跳过）。
+        if cur_ver < 7 {
+            let has_7: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !has_7 {
+                Self::backup_file_db(&conn);
+                let has_col: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('point_registry') WHERE name='source_label')",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(false);
+                let sql7 = include_str!("../migrations/007_point_source_label.sql");
+                let tx = conn.transaction()?;
+                if !has_col {
+                    tx.execute_batch(sql7)?;
+                }
+                let checksum7 = format!("{:x}", sql7.len());
+                tx.execute(
+                    "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(7,'007_point_source_label',?1,?2)",
+                    params![checksum7, Self::now_ns()],
+                )?;
+                tx.execute("UPDATE meta SET value='7' WHERE key='schema_version'", [])?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','7')",
+                    [],
+                )?;
+                tx.commit()?;
+                cur_ver = 7;
             }
         }
         // 最终确保 meta 为最新
@@ -1427,19 +1470,22 @@ impl ConfigStore {
                 next_id += 1;
                 id
             };
-            // upsert：复用或新增均写入最新类型/unit 并清除 deleted
+            // upsert：复用或新增均写入最新类型/unit/source_label 并清除 deleted。
+            // source_label 是 configure 真值快照：Some 覆盖、None 清 NULL
+            //（不得保留旧值，否则留下假来源）。
             tx.execute(
-                "INSERT INTO point_registry(endpoint_id,point_key,point_id,data_type,unit,deleted)
-                 VALUES(?1,?2,?3,?4,?5,0)
+                "INSERT INTO point_registry(endpoint_id,point_key,point_id,data_type,unit,deleted,source_label)
+                 VALUES(?1,?2,?3,?4,?5,0,?6)
                  ON CONFLICT(endpoint_id,point_key) DO UPDATE SET
                     point_id=excluded.point_id, data_type=excluded.data_type,
-                    unit=excluded.unit, deleted=0",
+                    unit=excluded.unit, deleted=0, source_label=excluded.source_label",
                 params![
                     endpoint_id,
                     d.point_key,
                     pid as i64,
                     d.data_type.as_str(),
-                    d.unit
+                    d.unit,
+                    d.source_label
                 ],
             )?;
             out.push(PointDefinition {
@@ -1447,6 +1493,7 @@ impl ConfigStore {
                 point_key: d.point_key.clone(),
                 data_type: d.data_type,
                 unit: d.unit.clone(),
+                source_label: d.source_label.clone(),
             });
         }
 
@@ -1490,13 +1537,10 @@ impl ConfigStore {
     }
 
     /// 全部（含墓碑），供诊断。
-    pub fn point_registry_all(
-        &self,
-        endpoint_id: &str,
-    ) -> Result<Vec<(String, u32, String, bool)>, StoreError> {
+    pub fn point_registry_all(&self, endpoint_id: &str) -> Result<Vec<RegistryRow>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT point_key, point_id, data_type, deleted FROM point_registry WHERE endpoint_id=?1 ORDER BY point_id",
+            "SELECT point_key, point_id, data_type, deleted, source_label FROM point_registry WHERE endpoint_id=?1 ORDER BY point_id",
         )?;
         let rows = stmt.query_map(params![endpoint_id], |r| {
             Ok((
@@ -1504,6 +1548,7 @@ impl ConfigStore {
                 r.get::<_, i64>(1)? as u32,
                 r.get::<_, String>(2)?,
                 r.get::<_, i32>(3)? != 0,
+                r.get::<_, Option<String>>(4)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1794,6 +1839,16 @@ mod tests {
             point_key: key.into(),
             data_type: ty,
             unit: None,
+            source_label: None,
+        }
+    }
+
+    fn desc_label(key: &str, ty: DataType, label: Option<&str>) -> PointDescriptor {
+        PointDescriptor {
+            point_key: key.into(),
+            data_type: ty,
+            unit: None,
+            source_label: label.map(|s| s.to_string()),
         }
     }
 
@@ -1931,7 +1986,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "6");
+        assert_eq!(ver, "7");
         let has: bool = s
             .conn
             .lock()
@@ -2079,7 +2134,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "6");
+            assert_eq!(ver, "7");
             // 004：profile 列已删除，但设备行本身保留（仅去列，不丢行）
             let cols: Vec<String> = conn
                 .prepare("PRAGMA table_info(devices)")
@@ -2170,7 +2225,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "6");
+            assert_eq!(ver, "7");
             // 旧行以 id 回填 name，业务行保留
             let old_name: String = conn
                 .query_row("SELECT name FROM endpoints WHERE id='e1'", [], |r| r.get(0))
@@ -2273,7 +2328,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "6");
+            assert_eq!(ver, "7");
             // 006 幂等表已建
             let tbl: String = conn
                 .query_row(
@@ -2304,6 +2359,191 @@ mod tests {
             .unwrap();
         assert!(s.bootstrap_idempotency_get("k").unwrap().is_some());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// P1：真实 v6 形态库 open() → v7。v6 即当前 main 基线（006 已应用、
+    /// point_registry 无 source_label 列）：旧行无损、新列 NULL、007 记录存在。
+    #[test]
+    fn v6_file_db_upgrades_to_v7_with_null_labels() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mesa-config-v6up-{}-{}.db",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE devices(id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE endpoints(
+                    id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE RESTRICT,
+                    driver_id TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    connection_json TEXT NOT NULL,
+                    desired_running INTEGER NOT NULL DEFAULT 0,
+                    updated_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE tasks(
+                    endpoint_id TEXT NOT NULL REFERENCES endpoints(id) ON DELETE CASCADE,
+                    id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    interval_ms INTEGER,
+                    binding_kind TEXT NOT NULL,
+                    binding_config_json TEXT NOT NULL,
+                    PRIMARY KEY(endpoint_id, id)
+                );
+                CREATE TABLE config_revision(
+                    endpoint_id TEXT PRIMARY KEY REFERENCES endpoints(id) ON DELETE CASCADE,
+                    revision INTEGER NOT NULL
+                );
+                CREATE TABLE schema_migrations(
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    applied_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE bootstrap_idempotency(
+                    key TEXT PRIMARY KEY,
+                    request_hash TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    endpoint_id TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE point_registry(
+                    endpoint_id TEXT NOT NULL,
+                    point_key TEXT NOT NULL,
+                    point_id INTEGER NOT NULL,
+                    data_type TEXT NOT NULL,
+                    unit TEXT,
+                    deleted INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(endpoint_id, point_key)
+                );
+                INSERT INTO meta(key,value) VALUES('schema_version','6');
+                INSERT INTO schema_migrations(version,name,checksum,applied_at_ns)
+                    VALUES(1,'001_initial','x',1),(2,'002_management_control','y',2),
+                    (3,'003_event_tasks','z',3),(4,'004_remove_device_profile','w',4),
+                    (5,'005_endpoint_name','v',5),(6,'006_bootstrap_idempotency','w',6);
+                INSERT INTO devices(id,name) VALUES('d1','D1');
+                INSERT INTO endpoints(id,device_id,driver_id,name,connection_json,desired_running,updated_at_ns)
+                    VALUES('e1','d1','simulator','E1','{}',1,7);
+                INSERT INTO point_registry(endpoint_id,point_key,point_id,data_type,unit,deleted)
+                    VALUES('e1','motor.speed',10,'F32',NULL,0);
+                "#,
+            )
+            .unwrap();
+        }
+        let s = ConfigStore::open(&path).unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            let ver: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ver, "7");
+            let has7: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(has7, "007 记录必须存在");
+            // 旧行无损且 label 为 NULL
+            let (pid, label): (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT point_id, source_label FROM point_registry WHERE endpoint_id='e1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(pid, 10);
+            assert_eq!(label, None);
+        }
+        // 升级后 assign 照常可用且 id 延续
+        let defs = s
+            .assign_point_ids(
+                "e1",
+                &[desc_label("motor.speed", DataType::F32, Some("DB10.DBD20"))],
+            )
+            .unwrap();
+        assert_eq!(defs[0].point_id, 10);
+        assert_eq!(defs[0].source_label.as_deref(), Some("DB10.DBD20"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P1：source_label 快照语义——Some 覆盖、None 清 NULL；point_id/key 不变。
+    #[test]
+    fn point_source_label_snapshot_semantics() {
+        let s = mem();
+        s.create_device(&dev("d1")).unwrap();
+        s.create_endpoint(&ep("e1", "d1")).unwrap();
+        let defs1 = s
+            .assign_point_ids(
+                "e1",
+                &[
+                    desc_label("a", DataType::F64, Some("DB10.DBD20")),
+                    desc_label("b", DataType::Bool, None),
+                ],
+            )
+            .unwrap();
+        let id_a = defs1.iter().find(|d| d.point_key == "a").unwrap().point_id;
+        assert_eq!(
+            defs1
+                .iter()
+                .find(|d| d.point_key == "a")
+                .unwrap()
+                .source_label
+                .as_deref(),
+            Some("DB10.DBD20")
+        );
+        // 改地址：label 更新，id 不变
+        let defs2 = s
+            .assign_point_ids(
+                "e1",
+                &[
+                    desc_label("a", DataType::F64, Some("DB20.DBD40")),
+                    desc_label("b", DataType::Bool, Some("M10.0")),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            defs2.iter().find(|d| d.point_key == "a").unwrap().point_id,
+            id_a
+        );
+        assert_eq!(
+            defs2
+                .iter()
+                .find(|d| d.point_key == "a")
+                .unwrap()
+                .source_label
+                .as_deref(),
+            Some("DB20.DBD40")
+        );
+        // Driver 回 None：必须清 NULL，不得保留旧值
+        let defs3 = s
+            .assign_point_ids("e1", &[desc_label("a", DataType::F64, None)])
+            .unwrap();
+        assert_eq!(
+            defs3.iter().find(|d| d.point_key == "a").unwrap().point_id,
+            id_a
+        );
+        assert_eq!(
+            defs3
+                .iter()
+                .find(|d| d.point_key == "a")
+                .unwrap()
+                .source_label,
+            None
+        );
     }
 
     #[test]
@@ -2342,7 +2582,7 @@ mod tests {
         s.assign_point_ids("e1", &[desc("a", DataType::F64), desc("c", DataType::I32)])
             .unwrap();
         let all = s.point_registry_all("e1").unwrap();
-        let b_entry = all.iter().find(|(k, _, _, _)| k == "b").unwrap();
+        let b_entry = all.iter().find(|(k, _, _, _, _)| k == "b").unwrap();
         assert!(b_entry.3, "b 应为墓碑");
         // 重新加入 b，必须复用原 id，且不复用已删 id 给新 key
         let defs3 = s
@@ -2538,7 +2778,7 @@ mod tests {
             .unwrap();
         // PR7 起 SCHEMA_VERSION=3，DeviceProfile 删除后升至 4，Endpoint.name 后升至 5；
         // 002/003 本身仍必须存在且已应用（增量链不断）
-        assert!(ver == "6", "新库应为 v6，got {ver}");
+        assert!(ver == "7", "新库应为 v7，got {ver}");
         let has2: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=2)",
@@ -2551,6 +2791,23 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
         assert!(cnt >= 4, "至少 4 条迁移");
+        // P1：007 记录存在且 point_registry 含 source_label 列
+        let has7: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has7, "007 迁移记录不得丢失");
+        let has_col: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('point_registry') WHERE name='source_label')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has_col, "point_registry 必须含 source_label 列");
         // 表存在
         let tbl: String = conn
             .query_row(
