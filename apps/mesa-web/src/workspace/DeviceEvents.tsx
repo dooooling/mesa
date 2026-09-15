@@ -16,23 +16,24 @@ import { EventTable } from "../components/EventTable";
 import { EventDetailDrawer } from "../components/EventDetailDrawer";
 
 export function DeviceEvents(props: {
+  /** scope 唯一身份（Drawer 清空用它，不用展示名——同名设备并存时名称不变）。 */
+  deviceId: string;
   deviceName: string;
   endpointIds: string[];
   endpointNames: Map<string, string>;
   /** M1 解析后的有效连接（null = 全部）。 */
   effectiveEndpointId: string | null;
 }) {
-  const { deviceName, endpointIds, endpointNames, effectiveEndpointId } = props;
+  const { deviceId, deviceName, endpointIds, endpointNames, effectiveEndpointId } = props;
   const [rest, setRest] = useState<EventFilterForm>(EMPTY_EVENT_FILTER_FORM);
   const [selected, setSelected] = useState<StoredEvent | null>(null);
 
   // RC2 修2：scope detail state 必须在 scope identity 变化时清空。
-  // DeviceEvents 的 scope 是 device（deviceName 变化即切设备）：不清的话
-  // A 的事件 Drawer 会留在 B 的页面上（EventDetailDrawer 无设备归属列，
-  // 用户无法察觉来源已错）。改名同 id 会误清一次，可接受（安全优先）。
+  // 用 deviceId（唯一身份），不用 deviceName（同名并存时 A→B 名称不变，
+  // effect 不执行，A 的 Drawer 会留在 B 页面）。
   useEffect(() => {
     setSelected(null);
-  }, [deviceName]);
+  }, [deviceId]);
 
   const scopedEndpointIds = useMemo(
     () => (effectiveEndpointId ? [effectiveEndpointId] : endpointIds),

@@ -193,3 +193,89 @@ describe("M5.4 设备事件", () => {
     expect(screen.getByText("加载更早")).toBeTruthy();
   });
 });
+
+describe("RC2 收口：Event Drawer scope 用 deviceId", () => {
+  // 同名设备并存（id 不同、name 相同）时 A→B 名称不变，Drawer 仍必须关闭。
+  it("同名 A→B：事件 Drawer 关闭（scope identity 是 deviceId 不是展示名）", async () => {
+    const user = (await import("@testing-library/user-event")).default.setup();
+    const { Link } = await import("react-router-dom");
+    (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string) => {
+      if (url === "/api/v1/devices/dev-a" || url === "/api/v1/devices/dev-b") {
+        const id = url.split("/").pop()!;
+        return { ok: true, status: 200, json: async () => ({ id, name: "CNC" }) };
+      }
+      if (url === "/api/v1/devices") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            devices: [
+              { id: "dev-a", name: "CNC" },
+              { id: "dev-b", name: "CNC" },
+            ],
+          }),
+        };
+      }
+      if (url === "/api/v1/endpoints") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            endpoints: [
+              { id: "ep-a", name: "EP-A", driver_id: "s7", device_id: "dev-a", state: "RUNNING" },
+              { id: "ep-b", name: "EP-B", driver_id: "s7", device_id: "dev-b", state: "RUNNING" },
+            ],
+          }),
+        };
+      }
+      if (url === "/api/v1/points/latest") {
+        return { ok: true, status: 200, json: async () => ({ points: [] }) };
+      }
+      if (url === "/api/v1/events?limit=1") {
+        return { ok: true, status: 200, json: async () => ({ events: [], next_cursor: null }) };
+      }
+      if (url.startsWith("/api/v1/events?") || url.startsWith("/api/v1/events&")) {
+        const u = new URL(url, "http://localhost");
+        const csv = u.searchParams.get("endpoint_ids") ?? "";
+        const msgs: Record<string, StoredEvent[]> = {
+          "ep-a": [ev(100, "ep-a", "alarm-a")],
+          "ep-b": [ev(90, "ep-b", "alarm-b")],
+        };
+        const merged = csv
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .flatMap((id) => msgs[id] ?? []);
+        merged.sort((a, b) => b.seq - a.seq);
+        return { ok: true, status: 200, json: async () => ({ events: merged, next_cursor: null }) };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    }) as unknown as typeof fetch;
+    function Nav() {
+      return (
+        <div>
+          <Link to="/devices/dev-a/events">go-a</Link>
+          <Link to="/devices/dev-b/events">go-b</Link>
+        </div>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <Nav />
+        <Routes>
+          <Route path="/" element={<div>home</div>} />
+          <Route path="/devices/:deviceId/:tab" element={<DeviceWorkspacePage />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await user.click(screen.getByText("go-a"));
+    await screen.findByText("alarm-a");
+    await user.click(screen.getByText("alarm-a"));
+    // 事件详情 Drawer 打开（标题 Event #100）
+    await screen.findByText("Event #100");
+    // 切到同名 B：Drawer 必须关闭，B 的事件正常显示
+    await user.click(screen.getByText("go-b"));
+    await waitFor(() => expect(screen.queryByText("Event #100")).toBeNull(), { timeout: 10000 });
+    expect(screen.getByText("alarm-b")).toBeTruthy();
+  }, 30000);
+});

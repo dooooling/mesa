@@ -31,8 +31,9 @@ export interface EventFeed {
 /**
  * 单事件源。form 为后端过滤（调用方保证对象身份稳定，否则每次渲染都 reload）。
  * 代际/pending-live/merge/SSE 冻结顺序与旧 EventsView 完全一致。
- * M7：device 过滤走后端 device_id；SSE live 行的 device 归属需 deviceOf 映射
- * （无映射时 live 行按其它条件判定，归属未知保留）。
+ * M7：device 过滤走后端 device_id；SSE live 行的 device 归属需 deviceOf 映射。
+ * RC2：device 归属 fail-closed——form 有 device_id 时 owner 必须可证明相等，
+ * 未知归属一律排除（liveFilter.matchesLiveFilter，语义与后端 SQL 对齐）。
  */
 export function useEventFeed(
   form: EventFilterForm,
@@ -69,6 +70,10 @@ export function useEventFeed(
     const id = ++histGen.current;
     const f = next ?? formRef.current;
     setLoading(true);
+    // RC2 收口：boot/reload 开始时复位 loadingMore（stale loadOlder 故意不碰
+    // 新代际状态；若此处不复位，“加载更早 pending 中改 filter”会把 loadingMore
+    // 永久留在 true）。
+    setLoadingMore(false);
     setError(null);
     setNextCursor(null);
     (async () => {

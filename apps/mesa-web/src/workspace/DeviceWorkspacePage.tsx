@@ -169,6 +169,7 @@ export function DeviceWorkspacePage() {
     if (t === "events") {
       return (
         <DeviceEvents
+          deviceId={deviceId}
           deviceName={device?.name ?? deviceId}
           endpointIds={endpointIds}
           endpointNames={new Map(deviceEndpoints.map((e) => [e.id, e.name ?? e.id]))}

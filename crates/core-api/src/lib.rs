@@ -1323,8 +1323,8 @@ async fn delete_device(
         // RC2 修3：删除设备同时清理其 bootstrap 幂等记录（第二层防御）。
         // 主防御是前端 per-operation key（删后重建即新 key）；此处防止表
         // 永久增长 + 旧 key 残留。清理失败不翻转删除成功（设备已删是事实），
-        // 只记日志（失败意味着幂等表不可写，后续同 key 重放会走真正执行，
-        // device 已不存在则 Duplicate/NotFound 路径保证无双建）。
+        // 只记日志（幂等表不可写时旧记录可能残留，同 key 仍可能 replay；
+        // V2 UI 已用 per-operation key，删后重建即新 key，不受此路径影响）。
         Ok(true) => {
             if let Err(e) = state.store.bootstrap_idempotency_delete_by_device(&id) {
                 tracing::warn!(device_id = %id, error = %e, "delete_device 成功但幂等记录清理失败");

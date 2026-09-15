@@ -256,3 +256,68 @@ describe("RC2 事件恢复与单 reload owner", () => {
     expect(eventsCalls() - before).toBe(2);
   }, 30000);
 });
+
+describe("RC2 收口：useEventFeed loadingMore 代际复位", () => {
+  // loadOlder pending 中改 filter → 新 boot → loadingMore=false；
+  // 旧请求随后成功/失败（stale return）也不得把它置回 true。
+  it("加载更早 pending 中改 filter：新代际复位，旧响应不碰状态", async () => {
+    let releaseOlder: (() => void) | null = null;
+    (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string) => {
+      if (url === "/api/v1/devices") {
+        return { ok: true, status: 200, json: async () => ({ devices: [{ id: "cnc-01", name: "CNC-01" }] }) };
+      }
+      if (url === "/api/v1/endpoints") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            endpoints: [{ id: "focas", name: "FOCAS", driver_id: "focas2", device_id: "cnc-01", state: "RUNNING" }],
+          }),
+        };
+      }
+      if (url === "/api/v1/devices/cnc-01") {
+        return { ok: true, status: 200, json: async () => ({ id: "cnc-01", name: "CNC-01" }) };
+      }
+      if (url === "/api/v1/points/latest") {
+        return { ok: true, status: 200, json: async () => ({ points: [] }) };
+      }
+      if (url === "/api/v1/events?limit=1") {
+        return { ok: true, status: 200, json: async () => ({ events: [], next_cursor: null }) };
+      }
+      if (url.startsWith("/api/v1/events?") || url.startsWith("/api/v1/events&")) {
+        const u = new URL(url, "http://localhost");
+        // loadOlder（带 before_seq）挂起，等调用方放行
+        if (u.searchParams.get("before_seq") !== null) {
+          await new Promise<void>((r) => {
+            releaseOlder = r;
+          });
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ events: [ev(100, "focas", "cnc-alarm")], next_cursor: 100 }),
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    });
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/events"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    await screen.findByText("cnc-alarm");
+    // 点“加载更早”：older 请求挂起，按钮进入 loading（无 jest-dom，用 className 直接断言）
+    const moreBtn = screen.getByRole("button", { name: /加载更早/ });
+    await user.click(moreBtn);
+    await waitFor(() => expect(moreBtn.className.includes("ant-btn-loading")).toBe(true), { timeout: 10000 });
+    // 改 filter（Code）→ 新 boot 复位 loadingMore
+    await user.click(screen.getByText(/高级筛选/));
+    await user.type(screen.getByPlaceholderText("Code"), "x");
+    await waitFor(() => expect(moreBtn.className.includes("ant-btn-loading")).toBe(false), { timeout: 10000 });
+    // 旧 older 请求随后回来（stale）：loadingMore 仍保持 false
+    (releaseOlder as (() => void) | null)?.();
+    await new Promise((r) => setTimeout(r, 500));
+    expect(moreBtn.className.includes("ant-btn-loading")).toBe(false);
+  }, 30000);
+});
