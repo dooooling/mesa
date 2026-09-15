@@ -87,7 +87,7 @@ export function GlobalDataPage() {
         p.endpoint_id.toLowerCase().includes(q) ||
         p.deviceName.toLowerCase().includes(q) ||
         p.endpointName.toLowerCase().includes(q) ||
-        p.sourceText.toLowerCase().includes(q)
+        (p.sourceText ?? "").toLowerCase().includes(q)
       );
     });
   }, [src.allPoints, deviceParam, connectionParam, status, search]);
@@ -161,10 +161,10 @@ export function GlobalDataPage() {
               title: "来源",
               render: (_: unknown, r: DevicePointView) => (
                 <span
-                  title={r.source_label ? `Driver 来源：${r.source_label}` : "Driver 未提供来源标签，显示技术坐标"}
+                  title={r.source_label ? `Driver 来源：${r.source_label}` : "Driver 未提供来源"}
                   style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}
                 >
-                  {r.sourceText}
+                  {r.sourceText ?? "—"}
                 </span>
               ),
             },

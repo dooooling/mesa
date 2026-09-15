@@ -599,6 +599,36 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    /// P1 invariant：in-tree driver.toml 的 protocol_minor 必须与
+    /// PROTOCOL_MINOR 同步（管理面展示读 manifest，运行协商读常量；
+    /// bump 常量忘改 toml 即漂移）。Minor 只做展示一致性，不断言 gate。
+    #[test]
+    fn in_tree_manifest_minor_matches_protocol() {
+        // workspace 根 → drivers/<id>/driver.toml（5 个 in-tree 驱动）
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("drivers");
+        for id in ["s7", "simulator", "opcua", "focas2", "sinumerik-nck"] {
+            let p = root.join(id).join("driver.toml");
+            let text =
+                std::fs::read_to_string(&p).unwrap_or_else(|_| panic!("missing {}", p.display()));
+            let minor = text
+                .lines()
+                .find_map(|l| {
+                    let t = l.trim();
+                    t.strip_prefix("protocol_minor")
+                        .and_then(|v| v.trim().strip_prefix('='))
+                        .and_then(|v| v.trim().parse::<u32>().ok())
+                })
+                .unwrap_or_else(|| panic!("{id} driver.toml 缺 protocol_minor"));
+            assert_eq!(
+                minor, PROTOCOL_MINOR,
+                "{id} driver.toml minor {minor} != PROTOCOL_MINOR {PROTOCOL_MINOR}"
+            );
+        }
+    }
+
     /// 全部 Value 变体的编解码必须无损往返，这是高频通道正确性的根基。
     #[test]
     fn value_roundtrip_all_variants() {

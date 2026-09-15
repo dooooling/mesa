@@ -2361,6 +2361,125 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// P1：真实 v6 形态库 open() → v7。v6 即当前 main 基线（006 已应用、
+    /// point_registry 无 source_label 列）：旧行无损、新列 NULL、007 记录存在。
+    #[test]
+    fn v6_file_db_upgrades_to_v7_with_null_labels() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mesa-config-v6up-{}-{}.db",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE devices(id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE endpoints(
+                    id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE RESTRICT,
+                    driver_id TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    connection_json TEXT NOT NULL,
+                    desired_running INTEGER NOT NULL DEFAULT 0,
+                    updated_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE tasks(
+                    endpoint_id TEXT NOT NULL REFERENCES endpoints(id) ON DELETE CASCADE,
+                    id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    interval_ms INTEGER,
+                    binding_kind TEXT NOT NULL,
+                    binding_config_json TEXT NOT NULL,
+                    PRIMARY KEY(endpoint_id, id)
+                );
+                CREATE TABLE config_revision(
+                    endpoint_id TEXT PRIMARY KEY REFERENCES endpoints(id) ON DELETE CASCADE,
+                    revision INTEGER NOT NULL
+                );
+                CREATE TABLE schema_migrations(
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    applied_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE bootstrap_idempotency(
+                    key TEXT PRIMARY KEY,
+                    request_hash TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    endpoint_id TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE point_registry(
+                    endpoint_id TEXT NOT NULL,
+                    point_key TEXT NOT NULL,
+                    point_id INTEGER NOT NULL,
+                    data_type TEXT NOT NULL,
+                    unit TEXT,
+                    deleted INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(endpoint_id, point_key)
+                );
+                INSERT INTO meta(key,value) VALUES('schema_version','6');
+                INSERT INTO schema_migrations(version,name,checksum,applied_at_ns)
+                    VALUES(1,'001_initial','x',1),(2,'002_management_control','y',2),
+                    (3,'003_event_tasks','z',3),(4,'004_remove_device_profile','w',4),
+                    (5,'005_endpoint_name','v',5),(6,'006_bootstrap_idempotency','w',6);
+                INSERT INTO devices(id,name) VALUES('d1','D1');
+                INSERT INTO endpoints(id,device_id,driver_id,name,connection_json,desired_running,updated_at_ns)
+                    VALUES('e1','d1','simulator','E1','{}',1,7);
+                INSERT INTO point_registry(endpoint_id,point_key,point_id,data_type,unit,deleted)
+                    VALUES('e1','motor.speed',10,'F32',NULL,0);
+                "#,
+            )
+            .unwrap();
+        }
+        let s = ConfigStore::open(&path).unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            let ver: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ver, "7");
+            let has7: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(has7, "007 记录必须存在");
+            // 旧行无损且 label 为 NULL
+            let (pid, label): (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT point_id, source_label FROM point_registry WHERE endpoint_id='e1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(pid, 10);
+            assert_eq!(label, None);
+        }
+        // 升级后 assign 照常可用且 id 延续
+        let defs = s
+            .assign_point_ids(
+                "e1",
+                &[desc_label("motor.speed", DataType::F32, Some("DB10.DBD20"))],
+            )
+            .unwrap();
+        assert_eq!(defs[0].point_id, 10);
+        assert_eq!(defs[0].source_label.as_deref(), Some("DB10.DBD20"));
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// P1：source_label 快照语义——Some 覆盖、None 清 NULL；point_id/key 不变。
     #[test]
     fn point_source_label_snapshot_semantics() {

@@ -132,8 +132,8 @@ export function useLivePointsSource(): LivePointsSource {
         return {
           ...p,
           displayKey: p.key ?? p.point_key ?? String(p.point_id),
-          // P1 Source：source_label ?? 技术坐标（与设备页同口径）
-          sourceText: p.source_label ?? p.key ?? p.point_key ?? String(p.point_id),
+          // P1 Source：与设备页同口径（缺失为 None，不反推）。
+          sourceText: p.source_label ?? null,
           ageMs,
           derived: derivePointStale(p.quality, ageMs),
           endpointName: c?.endpointName ?? p.endpoint_id,

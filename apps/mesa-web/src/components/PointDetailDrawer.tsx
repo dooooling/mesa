@@ -75,15 +75,14 @@ export function PointDetailDrawer(props: {
             <Descriptions size="small" column={1} bordered>
               <Descriptions.Item label="设备">{deviceName}</Descriptions.Item>
               <Descriptions.Item label="连接">{point.endpointName}</Descriptions.Item>
-              {/* P1：来源标签（Driver 人类可读来源）优先；缺失时回落技术坐标
-                  并标“自动回落”（source_label 是来源描述，不是用户名称，
-                  正常返回时不标记）。 */}
-              <Descriptions.Item label="来源地址">
+              {/* P1：来源标签优先；缺失诚实显示"未提供"，不拿 point_key 反推。
+                  正常返回标签时不标记。 */}
+              <Descriptions.Item label="来源">
                 <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}>
-                  {point.sourceText}
+                  {point.sourceText ?? "—"}
                 </span>
                 {point.source_label ? null : (
-                  <span style={{ fontSize: 12, color: "#525252" }}>（自动回落）</span>
+                  <span style={{ fontSize: 12, color: "#525252" }}>（Driver 未提供）</span>
                 )}
               </Descriptions.Item>
               <Descriptions.Item label="Endpoint">

@@ -28,11 +28,11 @@ export function DeviceLiveData(props: {
       if (effectiveEndpointId && p.endpoint_id !== effectiveEndpointId) return false;
       if (status !== "ALL" && p.derived !== status) return false;
       if (!q) return true;
-      // P1：搜索同时匹配名称与来源（DB10.DBD20 可搜）
+      // P1：搜索同时匹配名称与来源（DB10.DBD20 可搜；无来源时只 match 名称）
       return (
         p.displayKey.toLowerCase().includes(q) ||
         p.endpoint_id.toLowerCase().includes(q) ||
-        p.sourceText.toLowerCase().includes(q)
+        (p.sourceText ?? "").toLowerCase().includes(q)
       );
     });
   }, [points, effectiveEndpointId, status, search]);
@@ -106,15 +106,15 @@ export function DeviceLiveData(props: {
             ),
           },
           {
-            // P1 来源列（Name/Source 双字段口径）：source_label ?? 技术坐标。
-            // point_key 不再兼任"来自哪里"，来源归属只看这一列。
+            // P1 来源列：有标签即标签；缺失显示"—"。
+            // point_key 不再兼任来源。
             title: "来源",
             render: (_: unknown, r: DevicePointView) => (
               <span
-                title={r.source_label ? `Driver 来源：${r.source_label}` : "Driver 未提供来源标签，显示技术坐标"}
+                title={r.source_label ? `Driver 来源：${r.source_label}` : "Driver 未提供来源"}
                 style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}
               >
-                {r.sourceText}
+                {r.sourceText ?? "—"}
               </span>
             ),
           },

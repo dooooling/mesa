@@ -42,10 +42,11 @@ export interface DevicePointView extends WorkspacePoint {
   displayKey: string;
   /**
    * P1 来源展示（Name/Source 双字段口径）：
-   * - sourceText：source_label ?? 技术坐标（resource.output）。
-   * - 技术坐标由调用方按 endpoint 归属拼（此处只透出源字段）。
+   * - 有 source_label 即来源标签；
+   * - 缺失即 None（UI 诚实显示"未提供"，绝不拿 point_key 反推技术坐标——
+   *   point_key 是语义身份，不是 provenance）。
    */
-  sourceText: string;
+  sourceText: string | null;
   /** 距 nowMs 的年龄（ms），非法时间戳为 null。 */
   ageMs: number | null;
   /** 派生状态：quality BAD 即 BAD；否则 age 超阈即 STALE；非法时间戳为 UNKNOWN。 */
@@ -95,9 +96,9 @@ function toView(
   return {
     ...p,
     displayKey: p.key ?? p.point_key ?? String(p.point_id),
-    // P1 Source：source_label ?? 技术坐标（key 即 point_key，point_key 缺失
-    // 的异常态回落 point_id；与前面的 displayKey 口径一致）。
-    sourceText: p.source_label ?? p.key ?? p.point_key ?? String(p.point_id),
+    // P1 Source：有 label 即标签；缺失为 None（UI 显示"未提供"，
+    // 不拿 point_key 反推——key 是"它是什么"，不是"它从哪里来"）。
+    sourceText: p.source_label ?? null,
     ageMs,
     derived: derivePointStale(p.quality, ageMs),
     endpointName: c?.endpointName ?? p.endpoint_id,

@@ -126,27 +126,28 @@ describe("M2 设备数据归属与过滤", () => {
     expect(screen.getByTestId("workspace-connection-context").textContent ?? "").toContain("全部连接");
   });
 
-  it("P1. 来源列：有 source_label 显示标签，无则回落技术坐标", async () => {
+  it("P1. 来源列：有 source_label 显示标签，无则诚实显示未提供（绝不拿 point_key 反推）", async () => {
     vi.useRealTimers();
     mockWorkspace({
       points: () => ({
         points: [
           { ...pt("focas", "labeled", "GOOD", 500), source_label: "DB10.DBD20" },
-          pt("opcua", "unlabeled", "GOOD", 500),
+          // 用户语义 key + 无来源：来源列只能是"—"，不能出现 motor.speed
+          { ...pt("opcua", "motor.speed", "GOOD", 500) },
         ],
       }),
     });
     renderWorkspace("/devices/cnc-01/data");
     await screen.findAllByText("labeled");
     // 数据点列仍是 point_key
-    expect(screen.getAllByText("unlabeled").length).toBeGreaterThanOrEqual(1);
-    // 来源列：label 与回落坐标各一
-    expect(screen.getByText("DB10.DBD20")).toBeTruthy();
-    expect(screen.getAllByText("unlabeled").length).toBeGreaterThanOrEqual(2);
-    // Drawer 来源地址块同样展示
+    expect(screen.getAllByText("motor.speed").length).toBeGreaterThanOrEqual(1);
+    // 来源列：label 一处；motor.speed 只允许出现在数据点列（来源列是"—"）
+    expect(screen.getAllByText("DB10.DBD20").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(1);
+    // Drawer 来源块同样展示
     const user = userEvent.setup();
     await user.click(screen.getAllByText("labeled")[0]);
-    await screen.findByText("来源地址");
+    await screen.findAllByText("来源");
     expect(screen.getAllByText("DB10.DBD20").length).toBeGreaterThanOrEqual(2);
   });
 });

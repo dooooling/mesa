@@ -158,8 +158,32 @@ impl S7Address {
             // 不得用 Debug 名（Counter/PeripheralInput 与线缆语法不一致）。
             Counter => format!("C{}", self.byte_offset),
             Timer => format!("T{}", self.byte_offset),
-            PeripheralInput => format!("PIW{}", self.byte_offset),
-            PeripheralOutput => format!("PQW{}", self.byte_offset),
+            // PI/PQ 按位宽档输出（BYTE→PIB0，WORD→PIW0，DWORD→PID0）：
+            // 固定 W 会把 BYTE/REAL 来源标成字地址，是明确错误 label。
+            PeripheralInput => {
+                if let Some(b) = bit {
+                    format!("PI{}.{b}", self.byte_offset)
+                } else {
+                    let prefix = match width {
+                        S7Width::Dword => "PID",
+                        S7Width::Word => "PIW",
+                        S7Width::Byte => "PIB",
+                    };
+                    format!("{prefix}{}", self.byte_offset)
+                }
+            }
+            PeripheralOutput => {
+                if let Some(b) = bit {
+                    format!("PQ{}.{b}", self.byte_offset)
+                } else {
+                    let prefix = match width {
+                        S7Width::Dword => "PQD",
+                        S7Width::Word => "PQW",
+                        S7Width::Byte => "PQB",
+                    };
+                    format!("{prefix}{}", self.byte_offset)
+                }
+            }
             Local => {
                 if let Some(b) = bit {
                     format!("L{}.{b}", self.byte_offset)
@@ -881,6 +905,12 @@ mod tests {
         assert_eq!(label("PIW0", Word), "PIW0");
         assert_eq!(label("LB10", Byte), "LB10");
         assert_eq!(label("L0.0", Byte), "L0.0");
+        // PI/PQ 按位宽档输出（固定 W 是错误 label）
+        assert_eq!(label("PIB0", Byte), "PIB0");
+        assert_eq!(label("PIW0", Word), "PIW0");
+        assert_eq!(label("PID0", Dword), "PID0");
+        assert_eq!(label("PQB0", Byte), "PQB0");
+        assert_eq!(label("PQD0", Dword), "PQD0");
         // 位宽档决定前缀：同一地址不同类型显示不同后缀
         assert_eq!(label("DB10.DBW20", Dword), "DB10.DBD20");
     }
