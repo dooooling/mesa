@@ -8,6 +8,8 @@ import { Alert, Button, Card, Space, Tabs, Tag } from "antd";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { isRunningState } from "../deviceModel";
 import { PointDetailDrawer } from "../components/PointDetailDrawer";
+import { DeviceConfig } from "./DeviceConfig";
+import { DeviceDiagnostics } from "./DeviceDiagnostics";
 import { DeviceEvents } from "./DeviceEvents";
 import { DeviceLiveData } from "./DeviceLiveData";
 import { DeviceOverview } from "./DeviceOverview";
@@ -166,6 +168,28 @@ export function DeviceWorkspacePage() {
         />
       );
     }
+    // M6：config/diagnostics 已实现（设备改名/连接增删改/单连接设置/诊断）。
+    if (t === "config") {
+      return (
+        <DeviceConfig
+          deviceId={deviceId}
+          device={device}
+          endpoints={deviceEndpoints}
+          effectiveEndpointId={effectiveId}
+          onReload={data.reloadInventory}
+        />
+      );
+    }
+    if (t === "diagnostics") {
+      return (
+        <DeviceDiagnostics
+          endpoints={deviceEndpoints}
+          effectiveEndpointId={effectiveId}
+          points={data.devicePoints}
+          counts={data.counts}
+        />
+      );
+    }
     return (
       <WorkspaceTabPlaceholder
         tab={t}
@@ -280,8 +304,7 @@ export function DeviceWorkspacePage() {
   );
 }
 
-/** M1 占位：events/config/diagnostics 仍为框架。overview/data 已在 M2 实现，
- *  M3 填 events，M2/M4 填 config（含新增连接），M2 填 diagnostics。 */
+/** 兜底占位（理论不可达：五个 tab 均已实现；未知 tab 回 overview）。 */
 function WorkspaceTabPlaceholder(props: {
   tab: WorkspaceTab;
   deviceId: string;
@@ -298,11 +321,11 @@ function WorkspaceTabPlaceholder(props: {
         ? "暂无连接"
         : `全部连接（${endpoints.length} 个）`;
   const body: Record<WorkspaceTab, string> = {
-    overview: `不应出现：overview 已在 M2 实现。`,
-    data: `不应出现：data 已在 M2 实现。`,
-    events: `不应出现：events 已在 M3.3 实现。`,
-    config: `M2/M4 在此实现设备配置（设备改名 + 单连接设置/采集/事件订阅 + 新增连接）。`,
-    diagnostics: `M2 在此实现设备诊断（单连接状态 + 采集健康 + 高级诊断折叠）。`,
+    overview: `不应出现：overview 已实现。`,
+    data: `不应出现：data 已实现。`,
+    events: `不应出现：events 已实现。`,
+    config: `不应出现：config 已在 M6 实现。`,
+    diagnostics: `不应出现：diagnostics 已在 M6 实现。`,
   };
   return (
     <div style={{ display: "grid", gap: 8 }}>

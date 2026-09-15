@@ -63,6 +63,8 @@ export interface DeviceWorkspaceData {
   /** 当前设备的点位视图（含派生 STALE/归属名）。 */
   devicePoints: DevicePointView[];
   counts: { total: number; good: number; bad: number; stale: number; unknown: number };
+  /** M6：配置变更后立即刷新 inventory（不等 10s 轮询）。代际守卫内，安全。 */
+  reloadInventory: () => void;
 }
 
 export const DEVICE_POINTS_POLL_MS = 1000;
@@ -118,6 +120,8 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
   const [nowMs, setNowMs] = useState(() => Date.now());
   // 路由代际：deviceId 切换即新一代；旧请求的迟到响应一律丢弃。
   const gen = useRef(0);
+  // M6 reloadInventory 代际：手动刷新与轮询共享同一代际计数。
+  const reloadRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     const id = ++gen.current;
@@ -193,6 +197,7 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
 
     loadInventory();
     loadPoints();
+    reloadRef.current = loadInventory;
     let n = 0;
     const timer = window.setInterval(() => {
       if (gen.current !== id) return;
@@ -272,5 +277,6 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
     nowMs,
     devicePoints,
     counts,
+    reloadInventory: () => reloadRef.current(),
   };
 }
