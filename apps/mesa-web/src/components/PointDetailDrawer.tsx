@@ -6,6 +6,7 @@ import { Button, Descriptions, Drawer, Space, Tag } from "antd";
 import { useNavigate } from "react-router-dom";
 import { formatAge, formatPointValue } from "../deviceModel";
 import type { DevicePointView } from "../workspace/useDeviceWorkspaceData";
+import { DisplayNameEditor, type RenameTarget } from "./DisplayNameEditor";
 
 function formatNsTime(ns: unknown): string {
   const n = typeof ns === "number" ? ns : Number(ns);
@@ -22,8 +23,10 @@ export function PointDetailDrawer(props: {
   deviceName: string;
   point: DevicePointView | null;
   onClose: () => void;
+  /** P2 改名成功回调（永远回填 target；父组件判定是否刷新 Drawer）。 */
+  onRenamed?: (target: RenameTarget, display_name: string | null) => void;
 }) {
-  const { deviceId, deviceName, point, onClose } = props;
+  const { deviceId, deviceName, point, onClose, onRenamed } = props;
   const nav = useNavigate();
 
   const gotoConfig = () => {
@@ -46,9 +49,18 @@ export function PointDetailDrawer(props: {
     >
       {!point ? null : (
         <div style={{ display: "grid", gap: 16 }}>
+          {/* P2：第一行展示名（用户命名优先），第二行 point_key 语义身份。 */}
           <div style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12, color: "#525252" }}>
             {point.key ?? point.point_key ?? ""}
           </div>
+
+          <section>
+            <h4>展示名</h4>
+            <DisplayNameEditor
+              point={point}
+              onRenamed={(t, n) => onRenamed?.(t, n)}
+            />
+          </section>
 
           <section>
             <h4>当前值</h4>

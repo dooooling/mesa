@@ -1255,6 +1255,52 @@ struct UpdateDeviceReq {
     name: String,
 }
 
+/// P2 改名请求：Some(名) 设置；None 清除（回落 point_key）。
+/// 空字符串由 store 层拒绝（400）。
+/// fail-closed：字段缺失（`{}`）必须 400——`{}` 与 `{"display_name": null}`
+/// 都是“清除”将是隐式 destructive。双层 Option 显式区分：
+/// 缺失（None）→ 400，null（Some(None)）→ 清除，string → 设置。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdatePointDisplayNameReq {
+    #[serde(default, deserialize_with = "de_display_name_arg")]
+    display_name: Option<Option<String>>,
+}
+
+/// 反序列化显示名参数：null → Some(None)；string → Some(Some)；其他 → 400。
+/// 字段缺失不经过这里（`default` 给 None）。
+fn de_display_name_arg<'de, D>(d: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(d).map(Some)
+}
+
+#[cfg(test)]
+mod display_name_req_tests {
+    use super::*;
+
+    /// P2 收4：`{}`（缺失）与 `null`（明确清除）必须区分；其他类型 400。
+    #[test]
+    fn missing_null_string_other_are_distinct() {
+        let missing: UpdatePointDisplayNameReq = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.display_name, None, "{{}} 解析为缺失");
+        let null: UpdatePointDisplayNameReq =
+            serde_json::from_str(r#"{"display_name":null}"#).unwrap();
+        assert_eq!(null.display_name, Some(None), "null 解析为清除");
+        let set: UpdatePointDisplayNameReq =
+            serde_json::from_str(r#"{"display_name":"名"}"#).unwrap();
+        assert_eq!(
+            set.display_name,
+            Some(Some("名".to_string())),
+            "string 解析为设置"
+        );
+        assert!(
+            serde_json::from_str::<UpdatePointDisplayNameReq>(r#"{"display_name":123}"#).is_err()
+        );
+    }
+}
+
 async fn list_devices(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     match state.store.list_devices() {
         Ok(v) => Json(serde_json::json!({ "devices": v })),
@@ -1313,6 +1359,56 @@ async fn update_device(
         ),
         Err(e) => store_err_to_response(e),
     }
+}
+
+/// P2：点展示名改名（用户元数据）。
+/// - body `{"display_name": "名"}` 设置；`{"display_name": null}` 清除（回落 point_key）。
+/// - 空字符串 400（意图清空请传 null）；point 不存在/墓碑 404。
+/// - 只写 registry + 同步 snapshot；point_id/key/label 不动；Driver 无感知。
+async fn update_point_display_name(
+    State(state): State<Arc<AppState>>,
+    Path((endpoint_id, point_key)): Path<(String, String)>,
+    Json(body): Json<UpdatePointDisplayNameReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // 三态：Missing → 400（`{}` 不得隐式清除）；Null → 清除；String → 设置。
+    let name: Option<String> = match body.display_name {
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error(
+                    "VALIDATION_ERROR",
+                    "display_name 字段缺失（设置传 string，清除传 null）",
+                )),
+            );
+        }
+        Some(inner) => inner,
+    };
+    match state
+        .store
+        .set_point_display_name(&endpoint_id, &point_key, name.as_deref())
+    {
+        Ok(()) => {}
+        Err(e) => return store_err_to_response(e),
+    }
+    // 同步运行时快照（point 不存在于 snapshot 即尚未 register，update 静默无操作）。
+    let pid = state
+        .store
+        .point_map(&endpoint_id)
+        .ok()
+        .and_then(|m| m.get(&point_key).copied());
+    if let Some(id) = pid {
+        state
+            .snapshot
+            .update_display_name(&endpoint_id, id, name.clone());
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "endpoint_id": endpoint_id,
+            "point_key": point_key,
+            "display_name": name,
+        })),
+    )
 }
 
 async fn delete_device(
@@ -2763,6 +2859,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/control/audit", get(list_control_audit))
         .route("/api/v1/control/audit/{request_id}", get(get_control_audit))
         .route("/api/v1/points/latest", get(latest_points))
+        // P2：点展示名改名（用户元数据，Driver 无感知）
+        .route(
+            "/api/v1/endpoints/{endpoint_id}/points/{point_key}/display-name",
+            put(update_point_display_name),
+        )
         .route("/api/v1/diagnostics", get(diagnostics))
         // Devices CRUD
         .route("/api/v1/devices", get(list_devices).post(create_device))

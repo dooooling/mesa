@@ -35,6 +35,8 @@ export interface LivePointsSource {
   /** 全量点位视图（含设备/连接归属名；派生 STALE 与 M2 同规则）。 */
   allPoints: DevicePointView[];
   counts: { total: number; good: number; bad: number; stale: number; unknown: number };
+  /** P2：改名后本地即时更新（与设备页同语义）。 */
+  patchDisplayName: (endpoint_id: string, point_key: string, display_name: string | null) => void;
 }
 
 export function useLivePointsSource(): LivePointsSource {
@@ -131,7 +133,8 @@ export function useLivePointsSource(): LivePointsSource {
             : null;
         return {
           ...p,
-          displayKey: p.key ?? p.point_key ?? String(p.point_id),
+          // P2 Name：与设备页同口径（display_name 优先）。
+          displayKey: p.display_name?.trim() ? p.display_name : (p.key ?? p.point_key ?? String(p.point_id)),
           // P1 Source：与设备页同口径（缺失为 None，不反推）。
           sourceText: p.source_label ?? null,
           ageMs,
@@ -158,5 +161,15 @@ export function useLivePointsSource(): LivePointsSource {
     return { total: allPoints.length, good, bad, stale, unknown };
   }, [allPoints]);
 
-  return { devices, endpoints, endpointsReady, endpointsError, points, pointsError, nowMs, allPoints, counts };
+  const patchDisplayName = (endpoint_id: string, point_key: string, display_name: string | null) => {
+    setPoints((prev) =>
+      prev.map((p) =>
+        p.endpoint_id === endpoint_id && (p.key ?? p.point_key) === point_key
+          ? { ...p, display_name: display_name ?? undefined }
+          : p,
+      ),
+    );
+  };
+
+  return { devices, endpoints, endpointsReady, endpointsError, points, pointsError, nowMs, allPoints, counts, patchDisplayName };
 }

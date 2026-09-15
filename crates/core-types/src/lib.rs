@@ -476,6 +476,8 @@ pub struct PointDescriptor {
 }
 
 /// Core 为 Descriptor 分配稳定 point_id 后形成的正式定义（持久化于 PointRegistry）。
+/// `display_name`（P2）：用户可编辑展示名，与 Driver 无关。configure 路径
+/// 永远不产生它（Descriptor 无此字段）；运行时由 registry 回填，None = 未设置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PointDefinition {
     pub point_id: u32,
@@ -484,6 +486,8 @@ pub struct PointDefinition {
     pub unit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 /// 同一 Endpoint 全量配置内 point_key 必须唯一（方案 §6.2 双重保护）。

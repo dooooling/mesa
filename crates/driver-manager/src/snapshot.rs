@@ -102,9 +102,13 @@ pub struct LatestEntry {
     // 兼容：同时输出 key，避免旧 UI 读取 point_key 为 undefined
     pub key: String,
     /// P1 Point Presentation Metadata：Driver 给的人类可读来源（如 S7
-    /// `DB10.DBD20`）。None 即未支持，UI 回落技术坐标。纯展示，非 identity。
+    /// `DB10.DBD20`）。None 即未支持，UI 诚实显示未提供。纯展示，非 identity。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_label: Option<String>,
+    /// P2 用户展示名（registry 回填，configure 不产生）。None = 未设置，
+    /// UI 回落 point_key；改名不改变 point_id/key/label。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(flatten)]
     pub value: ValueJson,
     pub quality: String,
@@ -121,9 +125,9 @@ pub struct LatestEntry {
     pub source_timestamp_ns: Option<i64>,
 }
 
-/// P1 点元数据：(point_key, source_label)。热路径 apply_batch 一次读锁同时
-/// 取 key+label，不新增锁（50K/s 锁争用敏感）。
-type PointMeta = (String, Option<String>);
+/// P2 后点元数据：(point_key, source_label, display_name)。热路径 apply_batch
+/// 一次读锁同时取三者，不新增锁（50K/s 锁争用敏感）。
+type PointMeta = (String, Option<String>, Option<String>);
 
 /// 进程级共享快照。锁粒度按用途拆分，REST 读路径互不阻塞；latest/meta 采用 RwLock
 /// 以支持高频 DataBatch 写入与 REST 并发读取（§22 50K/s 下 apply_batch 与 latest_all 争用显著）。
@@ -133,6 +137,11 @@ pub struct Snapshot {
     latest: RwLock<HashMap<(String, u32), LatestEntry>>,
     /// (endpoint_id, point_id) -> (point_key, source_label)，register 时 replace。
     point_meta: RwLock<HashMap<(String, u32), PointMeta>>,
+    /// P2 用户改名 override（last-write-wins）：PUT 写入，独立于 configure
+    /// 生命周期。`Some(name)` = 命名，`Some(None)` = 明确清除，无条目 =
+    /// 从未改名（register 用 DB 回填）。解决 configure 与 PUT 并发窗口：
+    /// stale defs 的 display_name 永不覆盖用户最新意图。
+    name_overrides: RwLock<HashMap<(String, u32), Option<String>>>,
     /// §22 精确计数：自启动以来的 envelope / point_value 总数（单调递增，跨 batch 累加）
     envelopes_total: AtomicU64,
     point_value_total: AtomicU64,
@@ -149,6 +158,7 @@ impl Default for Snapshot {
             endpoints: RwLock::new(HashMap::new()),
             latest: RwLock::new(HashMap::new()),
             point_meta: RwLock::new(HashMap::new()),
+            name_overrides: RwLock::new(HashMap::new()),
             envelopes_total: AtomicU64::new(0),
             point_value_total: AtomicU64::new(0),
             snapshot_apply_latencies_ns: RwLock::new(VecDeque::with_capacity(4096)),
@@ -187,31 +197,43 @@ impl Snapshot {
         self.endpoints.read().unwrap().get(id).cloned()
     }
 
-    /// 记录点元数据（ApplyPointMap 时）：point_id -> (point_key, source_label)，
-    /// 供 latest 输出回填可读键名与来源；数据类型由值本身携带（ValueJson.type）。
+    /// 记录点元数据（ApplyPointMap 时）：point_id -> (point_key, source_label, display_name)，
+    /// 供 latest 输出回填可读键名、来源与展示名；数据类型由值本身携带（ValueJson.type）。
     /// 语义为 replace：先清理该 endpoint 的旧映射，再插入新集合，避免减少任务后旧点残留。
     /// P1：source_label 同步 replace（含 None 清空，与 registry 快照语义一致）；
     /// 已有 LatestEntry 的 key/label 立即同步刷新（不等下一批 DataBatch，
     /// 否则改地址后 Start 失败/离线期间 UI 长期显示旧来源）。
+    /// P2：display_name 同步 replace；已有 LatestEntry 的展示名同样立即刷新
+    ///（改名后不等下一批即生效）。
+    /// P2 并发：register 永不覆盖用户改名 override——有 override 的点只刷新
+    /// key/label（display_name 保留 override 值）；无 override（典型 restart）
+    /// 才用 d.display_name（DB 回填）。PUT → register 与 register → PUT
+    /// 任意顺序最终都是用户意图胜出（last-write-wins）。
     pub fn register_points(&self, endpoint_id: &str, defs: &[mesa_core_types::PointDefinition]) {
+        let overrides = self.name_overrides.read().unwrap();
         let mut meta = self.point_meta.write().unwrap();
         meta.retain(|(ep, _), _| ep != endpoint_id);
         for d in defs {
-            meta.insert(
-                (endpoint_id.to_string(), d.point_id),
-                (d.point_key.clone(), d.source_label.clone()),
-            );
+            let k = (endpoint_id.to_string(), d.point_id);
+            // override 存在即用户意图优先（Some=set / None=clear），
+            // stale defs 的 display_name 不得回滚它。
+            let name = overrides
+                .get(&k)
+                .cloned()
+                .unwrap_or_else(|| d.display_name.clone());
+            meta.insert(k, (d.point_key.clone(), d.source_label.clone(), name));
         }
-        // 同步清理 latest 中已不在新点集的旧点；保留的立即刷新 key/label
+        // 同步清理 latest 中已不在新点集的旧点；保留的立即刷新 key/label/name
         let mut latest = self.latest.write().unwrap();
         latest.retain(|(ep, pid), _| ep != endpoint_id || meta.contains_key(&(ep.clone(), *pid)));
         for ((ep, _), entry) in latest.iter_mut() {
             if ep == endpoint_id
-                && let Some((k, label)) = meta.get(&(ep.clone(), entry.point_id))
+                && let Some((k, label, name)) = meta.get(&(ep.clone(), entry.point_id))
             {
                 entry.point_key = k.clone();
                 entry.key = k.clone();
                 entry.source_label = label.clone();
+                entry.display_name = name.clone();
             }
         }
     }
@@ -225,7 +247,7 @@ impl Snapshot {
         self.envelopes_total.fetch_add(1, Ordering::Relaxed);
         self.point_value_total
             .fetch_add(batch.values.len() as u64, Ordering::Relaxed);
-        // 预构建本批次所需的 key+label 映射快照（仅一次读锁，不新增锁）。
+        // 预构建本批次所需的 key+label+name 映射快照（仅一次读锁，不新增锁）。
         let meta_snapshot: HashMap<(String, u32), PointMeta> = {
             let meta = self.point_meta.read().unwrap();
             batch
@@ -241,7 +263,8 @@ impl Snapshot {
         let mut latest = self.latest.write().unwrap();
         for pv in &batch.values {
             let k = (endpoint_id.to_string(), pv.point_id);
-            let (point_key, source_label) = meta_snapshot.get(&k).cloned().unwrap_or_default();
+            let (point_key, source_label, display_name) =
+                meta_snapshot.get(&k).cloned().unwrap_or_default();
             // V1.2.1：透传 value_origin + source_timestamp，Placeholder 强制 source=None（已在解码层保证）
             let origin = pv
                 .value_origin
@@ -259,6 +282,7 @@ impl Snapshot {
                 point_key: point_key.clone(),
                 key: point_key,
                 source_label,
+                display_name,
                 value: value_to_json(&pv.value),
                 quality: pv.quality.as_str().to_string(),
                 quality_code: pv.quality_code.map(|c| c.to_string()).or_else(|| {
@@ -354,11 +378,40 @@ impl Snapshot {
             .write()
             .unwrap()
             .retain(|(ep, _), _| ep != endpoint_id);
+        // endpoint 删除后改名意图一并失效（重建后从 DB 回填）。
+        self.name_overrides
+            .write()
+            .unwrap()
+            .retain(|(ep, _), _| ep != endpoint_id);
         self.latest
             .write()
             .unwrap()
             .retain(|(ep, _), _| ep != endpoint_id);
         self.endpoints.write().unwrap().remove(endpoint_id);
+    }
+
+    /// P2 改名同步（编辑 display_name 后调用）：写入 override 并更新
+    /// point_meta 与已有 LatestEntry 的展示名，point_id/key/label 不动，
+    /// 不等下一批即生效。`name=None` = 清除（回落 point_key）。
+    /// 点尚未 register 也记录 override（后续 register 保留用户意图，
+    /// 不被 stale defs 回滚）。点不存在时对 latest 部分静默无操作
+    ///（registry 已先校验活跃点）。
+    pub fn update_display_name(&self, endpoint_id: &str, point_id: u32, name: Option<String>) {
+        let k = (endpoint_id.to_string(), point_id);
+        self.name_overrides
+            .write()
+            .unwrap()
+            .insert(k.clone(), name.clone());
+        {
+            let mut meta = self.point_meta.write().unwrap();
+            if let Some(m) = meta.get_mut(&k) {
+                m.2 = name.clone();
+            }
+        }
+        let mut latest = self.latest.write().unwrap();
+        if let Some(e) = latest.get_mut(&k) {
+            e.display_name = name;
+        }
     }
 
     pub fn latest_all(&self) -> Vec<LatestEntry> {
@@ -390,6 +443,7 @@ mod tests {
                 data_type: DataType::F64,
                 unit: None,
                 source_label: None,
+                display_name: None,
             }],
         );
         let batch = DataBatch {
@@ -428,6 +482,7 @@ mod tests {
                 data_type: DataType::F64,
                 unit: None,
                 source_label: None,
+                display_name: None,
             }],
         );
         let pv_current = PointValue {
@@ -487,6 +542,7 @@ mod tests {
                 data_type: DataType::I32,
                 unit: None,
                 source_label: None,
+                display_name: None,
             }],
         );
         snap2.apply_batch(
@@ -527,6 +583,7 @@ mod tests {
                     data_type: DataType::F64,
                     unit: None,
                     source_label: Some("DB10.DBD20".into()),
+                    display_name: None,
                 },
                 PointDefinition {
                     point_id: 2,
@@ -534,6 +591,7 @@ mod tests {
                     data_type: DataType::F64,
                     unit: None,
                     source_label: None,
+                    display_name: None,
                 },
             ],
         );
@@ -587,6 +645,7 @@ mod tests {
                 data_type: DataType::F64,
                 unit: None,
                 source_label: label.map(|s| s.to_string()),
+                display_name: None,
             }]
         };
         let batch = || DataBatch {
@@ -621,5 +680,65 @@ mod tests {
         assert_eq!(snap.latest_all()[0].source_label, None);
         // 值本身不受影响
         assert_eq!(snap.latest_all()[0].value.value, serde_json::json!(1500.0));
+    }
+
+    #[test]
+    fn rename_override_survives_stale_register() {
+        // 收1：configure 与 PUT 并发窗口——stale defs（旧名）→ PUT 新名 →
+        // register stale defs → 用户意图必须胜出（meta + latest + 后续 batch）。
+        // 无需真线程：顺序即并发交错的精确抽象。
+        use mesa_core_types::PointDefinition;
+        let snap = Snapshot::new();
+        let def = |name: Option<&str>| {
+            vec![PointDefinition {
+                point_id: 1,
+                point_key: "motor.speed".into(),
+                data_type: DataType::F64,
+                unit: None,
+                source_label: None,
+                display_name: name.map(|s| s.to_string()),
+            }]
+        };
+        let batch = || DataBatch {
+            connection_handle: 1,
+            stream_epoch: 1,
+            sequence: 1,
+            timestamp_ns: 1_000_000,
+            values: vec![PointValue {
+                point_id: 1,
+                value: Value::F64(1.0),
+                quality: Quality::Good,
+                quality_code: None,
+                source_timestamp_ns: None,
+                value_origin: ValueOrigin::Current,
+            }],
+            mono_ns: None,
+        };
+        // configure 读到旧名并 register
+        snap.register_points("ep1", &def(Some("旧名")));
+        snap.apply_batch(&batch(), "ep1");
+        assert_eq!(snap.latest_all()[0].display_name.as_deref(), Some("旧名"));
+        // 用户 PUT 新名（DB 已是新名，snapshot 同步 override）
+        snap.update_display_name("ep1", 1, Some("新名".into()));
+        assert_eq!(snap.latest_all()[0].display_name.as_deref(), Some("新名"));
+        // configure 尾巴：stale defs（旧名）register → 不得回滚
+        snap.register_points("ep1", &def(Some("旧名")));
+        assert_eq!(
+            snap.latest_all()[0].display_name.as_deref(),
+            Some("新名"),
+            "stale register 不得覆盖用户改名"
+        );
+        // 后续 batch 同样用新名
+        snap.apply_batch(&batch(), "ep1");
+        assert_eq!(snap.latest_all()[0].display_name.as_deref(), Some("新名"));
+        // clear 同样 last-write-wins：PUT None 后 stale set 不得复活旧名
+        snap.update_display_name("ep1", 1, None);
+        snap.register_points("ep1", &def(Some("旧名")));
+        assert_eq!(snap.latest_all()[0].display_name, None);
+        // restart 路径（无 override 的新 Snapshot）仍用 DB 回填
+        let snap2 = Snapshot::new();
+        snap2.register_points("ep1", &def(Some("新名")));
+        snap2.apply_batch(&batch(), "ep1");
+        assert_eq!(snap2.latest_all()[0].display_name.as_deref(), Some("新名"));
     }
 }

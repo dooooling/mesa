@@ -150,6 +150,152 @@ describe("M2 设备数据归属与过滤", () => {
     await screen.findAllByText("来源");
     expect(screen.getAllByText("DB10.DBD20").length).toBeGreaterThanOrEqual(2);
   });
+
+  it("P2. 展示名优先 point_key，第二行显示 key；改名不改变 key/来源", async () => {
+    vi.useRealTimers();
+    mockWorkspace({
+      points: () => ({
+        points: [
+          { ...pt("focas", "motor.speed", "GOOD", 500), display_name: "主轴转速", source_label: "DB10.DBD20" },
+          pt("opcua", "plain.key", "GOOD", 500),
+        ],
+      }),
+    });
+    renderWorkspace("/devices/cnc-01/data");
+    await screen.findAllByText("主轴转速");
+    // 第一行展示名 + 第二行 key 双行；未命名点仍显示 key
+    expect(screen.getAllByText("motor.speed").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("plain.key").length).toBeGreaterThanOrEqual(1);
+    // 来源列不受改名影响
+    expect(screen.getAllByText("DB10.DBD20").length).toBeGreaterThanOrEqual(1);
+    // Drawer：标题为展示名，高级信息仍是原 key
+    const user = userEvent.setup();
+    await user.click(screen.getAllByText("主轴转速")[0]);
+    await screen.findAllByText("展示名");
+    expect(screen.getAllByText("motor.speed").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("P2. Drawer 改名调 PUT 并即时更新（id/key/来源不动）", async () => {
+    vi.useRealTimers();
+    const puts: Array<{ url: string; body: unknown }> = [];
+    (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string, init?: { method?: string; body?: string }) => {
+      if (url === "/api/v1/devices/cnc-01") {
+        return { ok: true, status: 200, json: async () => ({ id: "cnc-01", name: "CNC-01" }) };
+      }
+      if (url === "/api/v1/devices") {
+        return { ok: true, status: 200, json: async () => ({ devices: [{ id: "cnc-01", name: "CNC-01" }] }) };
+      }
+      if (url === "/api/v1/endpoints") {
+        return {
+          ok: true, status: 200,
+          json: async () => ({ endpoints: [{ id: "focas", name: "FOCAS", driver_id: "focas2", device_id: "cnc-01", state: "RUNNING" }] }),
+        };
+      }
+      if (url === "/api/v1/points/latest") {
+        return { ok: true, status: 200, json: async () => ({ points: [{ ...pt("focas", "motor.speed", "GOOD", 500), source_label: "DB10.DBD20" }] }) };
+      }
+      if (url.includes("/display-name") && init?.method === "PUT") {
+        puts.push({ url, body: JSON.parse(init.body ?? "{}") });
+        return { ok: true, status: 200, json: async () => ({}) };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    }) as unknown as typeof fetch;
+    renderWorkspace("/devices/cnc-01/data");
+    // 并行负载下表格渲染多轮，等待放宽（只放宽等待，不放宽断言）。
+    await screen.findAllByText("motor.speed", undefined, { timeout: 10000 });
+    const user = userEvent.setup();
+    await user.click(screen.getAllByText("motor.speed")[0]);
+    await screen.findAllByText("展示名", undefined, { timeout: 10000 });
+    // 输入新名并保存（Drawer 动画后 Input 才 mount，先等待）
+    const input = await screen.findByPlaceholderText("未设置（显示 point_key）", undefined, { timeout: 10000 });
+    await user.clear(input);
+    await user.type(input, "主轴转速");
+    await user.click(screen.getByRole("button", { name: "保 存" }));
+    await waitFor(() => expect(puts.length).toBe(1), { timeout: 10000 });
+    expect(puts[0].url).toContain("/api/v1/endpoints/focas/points/motor.speed/display-name");
+    expect(puts[0].body).toEqual({ display_name: "主轴转速" });
+    // 本地即时更新：第一行出现新名，第二行 key 与来源不动
+    await screen.findAllByText("主轴转速", undefined, { timeout: 10000 });
+    expect(screen.getAllByText("motor.speed").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("DB10.DBD20").length).toBeGreaterThanOrEqual(1);
+  }, 30000);
+
+  it("P2. 改名 pending 时切点：resolve 回填 A，不污染 B", async () => {
+    vi.useRealTimers();
+    let releasePut!: () => void;
+    const putGate = new Promise<void>((r) => { releasePut = r; });
+    (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string, init?: { method?: string; body?: string }) => {
+      if (url === "/api/v1/devices/cnc-01") {
+        return { ok: true, status: 200, json: async () => ({ id: "cnc-01", name: "CNC-01" }) };
+      }
+      if (url === "/api/v1/devices") {
+        return { ok: true, status: 200, json: async () => ({ devices: [{ id: "cnc-01", name: "CNC-01" }] }) };
+      }
+      if (url === "/api/v1/endpoints") {
+        return {
+          ok: true, status: 200,
+          json: async () => ({ endpoints: [{ id: "focas", name: "FOCAS", driver_id: "focas2", device_id: "cnc-01", state: "RUNNING" }] }),
+        };
+      }
+      if (url === "/api/v1/points/latest") {
+        return {
+          ok: true, status: 200,
+          json: async () => ({ points: [pt("focas", "point-a", "GOOD", 500), pt("focas", "point-b", "GOOD", 500)] }),
+        };
+      }
+      if (url.includes("/display-name") && init?.method === "PUT") {
+        await putGate; // 挂起：模拟 pending 期间切点
+        return { ok: true, status: 200, json: async () => ({}) };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    }) as unknown as typeof fetch;
+    renderWorkspace("/devices/cnc-01/data");
+    await screen.findAllByText("point-a", undefined, { timeout: 10000 });
+    const user = userEvent.setup();
+    // 开 A Drawer，输入新名，点保存（PUT 挂起中）
+    await user.click(screen.getAllByText("point-a")[0]);
+    const input = await screen.findByPlaceholderText("未设置（显示 point_key）", undefined, { timeout: 10000 });
+    await user.clear(input);
+    await user.type(input, "A的新名");
+    await user.click(screen.getByRole("button", { name: "保 存" }));
+    // 关 A Drawer 后再开 B（Drawer overlay 会遮挡表格行，直接点行切不到 B）
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryAllByPlaceholderText("未设置（显示 point_key）")).toHaveLength(0), { timeout: 10000 });
+    await user.click(screen.getAllByText("point-b")[0]);
+    await screen.findAllByText("展示名", undefined, { timeout: 10000 });
+    // A 的 PUT 返回：A 被回填，B Drawer 不变
+    releasePut();
+    await screen.findAllByText("A的新名", undefined, { timeout: 10000 });
+    // B 的 Drawer 输入框仍是空（未被污染）
+    const inputs = screen.getAllByPlaceholderText("未设置（显示 point_key）");
+    expect((inputs[inputs.length - 1] as HTMLInputElement).value).toBe("");
+  }, 30000);
+
+  it("P2. 改名后展示名与 point_key 都可搜（key 仍是稳定身份）", async () => {
+    vi.useRealTimers();
+    mockWorkspace({
+      points: () => ({
+        points: [
+          { ...pt("focas", "motor.speed", "GOOD", 500), display_name: "主轴转速" },
+          pt("focas", "other.key", "GOOD", 500),
+        ],
+      }),
+    });
+    renderWorkspace("/devices/cnc-01/data");
+    await screen.findAllByText("主轴转速", undefined, { timeout: 10000 });
+    const user = userEvent.setup();
+    const input = screen.getByPlaceholderText("搜索点位 / key");
+    // 按展示名搜到
+    await user.clear(input);
+    await user.type(input, "主轴转速");
+    await screen.findAllByText("主轴转速", undefined, { timeout: 10000 });
+    expect(screen.queryAllByText("other.key")).toHaveLength(0);
+    // 按 point_key 同样搜到（改名不丢身份）
+    await user.clear(input);
+    await user.type(input, "motor.speed");
+    await screen.findAllByText("主轴转速", undefined, { timeout: 10000 });
+    expect(screen.queryAllByText("other.key")).toHaveLength(0);
+  }, 30000);
 });
 
 describe("M2 fail-closed 与 STALE", () => {

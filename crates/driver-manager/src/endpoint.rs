@@ -65,6 +65,12 @@ pub trait PointIdSource: Send + Sync {
     fn known_map(&self, endpoint_id: &str) -> HashMap<String, u32>;
     /// 当前 revision（全量快照版本号），用于 Configure/Apply 的原子性标记。
     fn revision(&self, endpoint_id: &str) -> u64;
+    /// P2：已持久化的用户展示名（point_key -> display_name，未设置的不出现）。
+    /// 默认空（内存版无持久化）；持久版从 registry 回填。configure 流程
+    /// 用它把保留下来的命名合并进 PointDefinition，不经过 Driver。
+    fn display_names(&self, _endpoint_id: &str) -> HashMap<String, String> {
+        HashMap::new()
+    }
 }
 
 /// 内存版分配器：进程内稳定，同 key 复用既有 id。用于 Contract Test 与无库场景。
@@ -173,6 +179,18 @@ impl PointIdSource for StorePointIdSource {
 
     fn revision(&self, endpoint_id: &str) -> u64 {
         self.store.current_revision(endpoint_id).unwrap_or(0).max(1)
+    }
+
+    fn display_names(&self, endpoint_id: &str) -> HashMap<String, String> {
+        self.store
+            .point_registry_all(endpoint_id)
+            .map(|rows| {
+                rows.into_iter()
+                    .filter(|(_, _, _, deleted, _, name)| !deleted && name.is_some())
+                    .map(|(k, _, _, _, _, name)| (k, name.unwrap_or_default()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -745,6 +763,8 @@ async fn run_config_flow(
     for (d, &id) in parsed.iter().zip(ids.iter()) {
         id_map.insert(d.point_key.clone(), id);
     }
+    // P2：回填 registry 保留的用户展示名（assign 内部 upsert 不覆盖它）。
+    let names = source.display_names(&cfg.endpoint_id);
     let defs: Vec<PointDefinition> = parsed
         .iter()
         .zip(&ids)
@@ -754,6 +774,9 @@ async fn run_config_flow(
             data_type: d.data_type,
             unit: d.unit.clone(),
             source_label: d.source_label.clone(),
+            // P2：configure 不产生展示名；registry 里保留的用户命名
+            // 在此处回填（assign 内部 upsert 已保留旧值）。
+            display_name: names.get(d.point_key.as_str()).cloned(),
         })
         .collect();
     snapshot.register_points(&cfg.endpoint_id, &defs);

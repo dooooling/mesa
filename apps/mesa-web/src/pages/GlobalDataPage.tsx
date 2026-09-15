@@ -9,6 +9,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { formatAge, formatPointValue } from "../deviceModel";
 import { PointDetailDrawer } from "../components/PointDetailDrawer";
 import type { DevicePointView } from "../workspace/useDeviceWorkspaceData";
+import { PointNameCell } from "../workspace/PointNameCell";
 import { useLivePointsSource } from "../workspace/useLivePointsSource";
 
 type StatusFilter = "ALL" | "GOOD" | "BAD" | "STALE";
@@ -82,8 +83,11 @@ export function GlobalDataPage() {
       if (connectionParam !== "ALL" && p.endpoint_id !== connectionParam) return false;
       if (status !== "ALL" && p.derived !== status) return false;
       if (!q) return true;
+      // P2：展示名与 point_key 都可搜（改名不丢稳定身份）。
+      const pointKey = p.key ?? p.point_key ?? "";
       return (
         p.displayKey.toLowerCase().includes(q) ||
+        pointKey.toLowerCase().includes(q) ||
         p.endpoint_id.toLowerCase().includes(q) ||
         p.deviceName.toLowerCase().includes(q) ||
         p.endpointName.toLowerCase().includes(q) ||
@@ -149,12 +153,9 @@ export function GlobalDataPage() {
               ),
             },
             {
+              // P2 双行（与设备页同口径）。
               title: "数据点",
-              render: (_: unknown, r: DevicePointView) => (
-                <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>
-                  {r.displayKey}
-                </span>
-              ),
+              render: (_: unknown, r: DevicePointView) => <PointNameCell point={r} />,
             },
             {
               // P1 来源列（与设备页同口径）
@@ -218,6 +219,16 @@ export function GlobalDataPage() {
         deviceName={drawerDeviceName}
         point={openPoint}
         onClose={() => setOpenPoint(null)}
+        onRenamed={(target, display_name) => {
+          src.patchDisplayName(target.endpoint_id, target.point_key, display_name);
+          setOpenPoint((prev) =>
+            prev !== null &&
+            prev.endpoint_id === target.endpoint_id &&
+            (prev.key ?? prev.point_key) === target.point_key
+              ? { ...prev, display_name: display_name ?? undefined }
+              : prev,
+          );
+        }}
       />
     </div>
   );

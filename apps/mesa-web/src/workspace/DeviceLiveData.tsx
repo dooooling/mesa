@@ -6,6 +6,7 @@ import { useMemo, useState } from "react";
 import { Button, Input, Select, Space, Table, Tag } from "antd";
 import { formatAge, formatPointValue } from "../deviceModel";
 import type { DevicePointView, WorkspaceEndpoint } from "./useDeviceWorkspaceData";
+import { PointNameCell } from "./PointNameCell";
 
 type StatusFilter = "ALL" | "GOOD" | "BAD" | "STALE";
 
@@ -28,9 +29,11 @@ export function DeviceLiveData(props: {
       if (effectiveEndpointId && p.endpoint_id !== effectiveEndpointId) return false;
       if (status !== "ALL" && p.derived !== status) return false;
       if (!q) return true;
-      // P1：搜索同时匹配名称与来源（DB10.DBD20 可搜；无来源时只 match 名称）
+      // P2：搜索同时匹配展示名与 point_key（改名后 key 仍是稳定可查身份）。
+      const pointKey = p.key ?? p.point_key ?? "";
       return (
         p.displayKey.toLowerCase().includes(q) ||
+        pointKey.toLowerCase().includes(q) ||
         p.endpoint_id.toLowerCase().includes(q) ||
         (p.sourceText ?? "").toLowerCase().includes(q)
       );
@@ -98,12 +101,9 @@ export function DeviceLiveData(props: {
         onRow={(r) => ({ onClick: () => onOpenPoint(r as DevicePointView), style: { cursor: "pointer" } })}
         columns={[
           {
+            // P2 双行：第一行展示名，第二行 point_key（仅命名时）。
             title: "数据点",
-            render: (_: unknown, r: DevicePointView) => (
-              <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>
-                {r.displayKey}
-              </span>
-            ),
+            render: (_: unknown, r: DevicePointView) => <PointNameCell point={r} />,
           },
           {
             // P1 来源列：有标签即标签；缺失显示"—"。
