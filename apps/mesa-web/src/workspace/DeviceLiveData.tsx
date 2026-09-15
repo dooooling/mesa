@@ -29,9 +29,11 @@ export function DeviceLiveData(props: {
       if (effectiveEndpointId && p.endpoint_id !== effectiveEndpointId) return false;
       if (status !== "ALL" && p.derived !== status) return false;
       if (!q) return true;
-      // P1：搜索同时匹配名称与来源（DB10.DBD20 可搜；无来源时只 match 名称）
+      // P2：搜索同时匹配展示名与 point_key（改名后 key 仍是稳定可查身份）。
+      const pointKey = p.key ?? p.point_key ?? "";
       return (
         p.displayKey.toLowerCase().includes(q) ||
+        pointKey.toLowerCase().includes(q) ||
         p.endpoint_id.toLowerCase().includes(q) ||
         (p.sourceText ?? "").toLowerCase().includes(q)
       );

@@ -6,7 +6,7 @@ import { Button, Descriptions, Drawer, Space, Tag } from "antd";
 import { useNavigate } from "react-router-dom";
 import { formatAge, formatPointValue } from "../deviceModel";
 import type { DevicePointView } from "../workspace/useDeviceWorkspaceData";
-import { DisplayNameEditor } from "./DisplayNameEditor";
+import { DisplayNameEditor, type RenameTarget } from "./DisplayNameEditor";
 
 function formatNsTime(ns: unknown): string {
   const n = typeof ns === "number" ? ns : Number(ns);
@@ -23,8 +23,8 @@ export function PointDetailDrawer(props: {
   deviceName: string;
   point: DevicePointView | null;
   onClose: () => void;
-  /** P2 改名成功回调（父组件同步快照 + 刷新展示）。 */
-  onRenamed?: (display_name: string | null) => void;
+  /** P2 改名成功回调（永远回填 target；父组件判定是否刷新 Drawer）。 */
+  onRenamed?: (target: RenameTarget, display_name: string | null) => void;
 }) {
   const { deviceId, deviceName, point, onClose, onRenamed } = props;
   const nav = useNavigate();
@@ -58,7 +58,7 @@ export function PointDetailDrawer(props: {
             <h4>展示名</h4>
             <DisplayNameEditor
               point={point}
-              onRenamed={(n) => onRenamed?.(n)}
+              onRenamed={(t, n) => onRenamed?.(t, n)}
             />
           </section>
 

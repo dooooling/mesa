@@ -83,8 +83,11 @@ export function GlobalDataPage() {
       if (connectionParam !== "ALL" && p.endpoint_id !== connectionParam) return false;
       if (status !== "ALL" && p.derived !== status) return false;
       if (!q) return true;
+      // P2：展示名与 point_key 都可搜（改名不丢稳定身份）。
+      const pointKey = p.key ?? p.point_key ?? "";
       return (
         p.displayKey.toLowerCase().includes(q) ||
+        pointKey.toLowerCase().includes(q) ||
         p.endpoint_id.toLowerCase().includes(q) ||
         p.deviceName.toLowerCase().includes(q) ||
         p.endpointName.toLowerCase().includes(q) ||
@@ -216,11 +219,15 @@ export function GlobalDataPage() {
         deviceName={drawerDeviceName}
         point={openPoint}
         onClose={() => setOpenPoint(null)}
-        onRenamed={(display_name) => {
-          if (!openPoint) return;
-          const key = openPoint.key ?? openPoint.point_key ?? "";
-          src.patchDisplayName(openPoint.endpoint_id, String(key), display_name);
-          setOpenPoint({ ...openPoint, display_name: display_name ?? undefined });
+        onRenamed={(target, display_name) => {
+          src.patchDisplayName(target.endpoint_id, target.point_key, display_name);
+          setOpenPoint((prev) =>
+            prev !== null &&
+            prev.endpoint_id === target.endpoint_id &&
+            (prev.key ?? prev.point_key) === target.point_key
+              ? { ...prev, display_name: display_name ?? undefined }
+              : prev,
+          );
         }}
       />
     </div>

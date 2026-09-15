@@ -308,12 +308,17 @@ export function DeviceWorkspacePage() {
         deviceName={device?.name ?? deviceId}
         point={openPoint}
         onClose={() => setOpenPoint(null)}
-        // P2 改名：同步快照（表格双行即时更新）+ 刷新 Drawer 内展示。
-        onRenamed={(display_name) => {
-          if (!openPoint) return;
-          const key = openPoint.key ?? openPoint.point_key ?? "";
-          data.patchDisplayName(openPoint.endpoint_id, String(key), display_name);
-          setOpenPoint({ ...openPoint, display_name: display_name ?? undefined });
+        // P2 改名：永远 patch 回请求时的 target；只有 Drawer 当前仍是
+        // 同一点才刷新 openPoint（pending 期间切点不污染 B）。
+        onRenamed={(target, display_name) => {
+          data.patchDisplayName(target.endpoint_id, target.point_key, display_name);
+          setOpenPoint((prev) =>
+            prev !== null &&
+            prev.endpoint_id === target.endpoint_id &&
+            (prev.key ?? prev.point_key) === target.point_key
+              ? { ...prev, display_name: display_name ?? undefined }
+              : prev,
+          );
         }}
       />
     </div>
