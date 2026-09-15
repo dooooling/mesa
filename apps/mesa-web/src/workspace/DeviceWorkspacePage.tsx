@@ -4,7 +4,7 @@
 // Connection 选择各页局部管理（useConnectionQuery），无全局 Context。
 import { useEffect, useState } from "react";
 import { Alert, Button, Card } from "antd";
-import { useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { PointDetailDrawer } from "../components/PointDetailDrawer";
 import { DeviceAcquisition } from "./DeviceAcquisition";
 import { DeviceConnections } from "./DeviceConnections";
@@ -13,16 +13,18 @@ import { DeviceEvents } from "./DeviceEvents";
 import { DeviceHeader } from "./DeviceHeader";
 import { DeviceLiveData } from "./DeviceLiveData";
 import { DeviceOverview } from "./DeviceOverview";
-import { DeviceTabNav, isDeviceTab } from "./DeviceTabNav";
+import { DeviceTabNav } from "./DeviceTabNav";
 import {
   useDeviceWorkspaceData,
   type DevicePointView,
 } from "./useDeviceWorkspaceData";
 
 export function DeviceWorkspacePage() {
-  const { deviceId = "", tab = "overview" } = useParams();
-  // 非法 tab 诚实回 overview（路由层只接受六个一级 Tab，无 config）。
-  const activeTab = isDeviceTab(tab) ? tab : "overview";
+  // 六条显式路由无 :tab 参数（见 App.tsx），tab 从 pathname 尾段派生。
+  const { deviceId = "" } = useParams();
+  const loc = useLocation();
+  const segs = loc.pathname.split("/").filter(Boolean);
+  const activeTab = segs[segs.length - 1] ?? "overview";
   const nav = useNavigate();
   // M2：Overview 与 LiveData 共用同一快照源（单轮询/单 nowMs/单归属判定），
   // 不再各自 GET /endpoints + /points/latest。
@@ -31,7 +33,7 @@ export function DeviceWorkspacePage() {
     device,
     deviceNotFound: notFound,
     deviceError,
-    endpoints,
+    deviceEndpoints,
     endpointsReady: epReady,
     endpointsError: epError,
   } = data;
@@ -60,8 +62,8 @@ export function DeviceWorkspacePage() {
         <DeviceOverview
           deviceId={deviceId}
           deviceName={device?.name ?? deviceId}
-          endpoints={endpoints}
-          endpointIds={endpoints.map((e) => e.id)}
+          endpoints={deviceEndpoints}
+          endpointIds={deviceEndpoints.map((e) => e.id)}
           points={data.devicePoints}
           counts={data.counts}
           onOpenPoint={setOpenPoint}
@@ -71,7 +73,7 @@ export function DeviceWorkspacePage() {
     if (activeTab === "data") {
       return (
         <DeviceLiveData
-          endpoints={endpoints}
+          endpoints={deviceEndpoints}
           endpointsReady={epReady}
           points={data.devicePoints}
           pointsError={data.pointsError}
@@ -83,7 +85,7 @@ export function DeviceWorkspacePage() {
       return (
         <DeviceConnections
           deviceId={deviceId}
-          endpoints={endpoints}
+          endpoints={deviceEndpoints}
           onReload={data.reloadInventory}
         />
       );
@@ -91,7 +93,7 @@ export function DeviceWorkspacePage() {
     if (activeTab === "acquisition") {
       return (
         <DeviceAcquisition
-          endpoints={endpoints}
+          endpoints={deviceEndpoints}
           endpointsReady={epReady}
           onReload={data.reloadInventory}
         />
@@ -102,7 +104,7 @@ export function DeviceWorkspacePage() {
         <DeviceEvents
           deviceId={deviceId}
           deviceName={device?.name ?? deviceId}
-          endpoints={endpoints}
+          endpoints={deviceEndpoints}
           endpointsReady={epReady}
         />
       );
@@ -110,7 +112,7 @@ export function DeviceWorkspacePage() {
     // diagnostics
     return (
       <DeviceDiagnostics
-        endpoints={endpoints}
+        endpoints={deviceEndpoints}
         endpointsReady={epReady}
         points={data.devicePoints}
         counts={data.counts}
@@ -126,8 +128,7 @@ export function DeviceWorkspacePage() {
       <DeviceHeader
         deviceId={deviceId}
         deviceName={device?.name ?? deviceId}
-        endpoints={endpoints}
-        points={data.devicePoints}
+        endpoints={deviceEndpoints}
         onChanged={data.reloadInventory}
       />
 

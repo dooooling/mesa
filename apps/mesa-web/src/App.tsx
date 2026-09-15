@@ -56,13 +56,18 @@ export default function App() {
         </Header>
         <Content style={{ margin: 16 }}>
           <Routes>
-            {/* 扁平设备详情：Device = 唯一 Workspace，六个一级 Tab。
+            {/* 扁平设备详情：只存在六个 Device Tab（非法 tab 无路由，自然落 NotFound）。
                 config/legacy/endpoints 旧路由已删除，旧 URL 诚实 404。 */}
             <Route path="/" element={<Navigate to="/overview" replace />} />
             <Route path="/overview" element={<OverviewPage />} />
             <Route path="/devices" element={<DevicesPage />} />
             <Route path="/devices/new" element={<AddDeviceFlow />} />
-            <Route path="/devices/:deviceId/:tab" element={<DeviceWorkspacePage />} />
+            <Route path="/devices/:deviceId/overview" element={<DeviceWorkspacePage />} />
+            <Route path="/devices/:deviceId/data" element={<DeviceWorkspacePage />} />
+            <Route path="/devices/:deviceId/connections" element={<DeviceWorkspacePage />} />
+            <Route path="/devices/:deviceId/acquisition" element={<DeviceWorkspacePage />} />
+            <Route path="/devices/:deviceId/events" element={<DeviceWorkspacePage />} />
+            <Route path="/devices/:deviceId/diagnostics" element={<DeviceWorkspacePage />} />
             <Route path="/devices/:deviceId" element={<Navigate to="overview" replace />} />
             <Route path="/data" element={<GlobalDataPage />} />
             <Route path="/events" element={<GlobalEventsPage />} />
