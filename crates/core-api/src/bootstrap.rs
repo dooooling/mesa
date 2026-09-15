@@ -133,7 +133,15 @@ async fn start_created_endpoint(state: &AppState, endpoint_id: &str) -> Result<(
         event_tasks,
     };
     state.manager.start_endpoint(cfg)?;
-    let _ = state.store.set_desired_running(endpoint_id, true);
+    // 期望态落盘失败不翻转 start 成功（驱动已在运行，DB 期望态下次对账可纠）；
+    // 但必须记日志，否则重启恢复时该 endpoint 不会被自动拉起，静默丢运行态。
+    if let Err(e) = state.store.set_desired_running(endpoint_id, true) {
+        tracing::error!(
+            endpoint_id = %endpoint_id,
+            error = %e,
+            "device-bootstrap start 成功但期望态落盘失败，重启后可能不自动恢复"
+        );
+    }
     Ok(())
 }
 
@@ -292,15 +300,35 @@ async fn device_bootstrap_inner(
     let mut compensated = false;
     if want_start {
         if let Err(m) = start_created_endpoint(&state, &endpoint_rec.id).await {
-            // 补偿：删 endpoint → device（顺序不可反，device 有 RESTRICT）
-            let _ = state.store.bootstrap_compensate(&device_rec.id, &endpoint_rec.id);
+            // 补偿：删 endpoint → device（顺序不可反，device 有 RESTRICT）。
+            // R1.1：补偿结果必须检查——失败也写 compensated:true 是谎报；
+            // 如实报告，调用方凭 device_id/endpoint_id 定位残留。
+            match state.store.bootstrap_compensate(&device_rec.id, &endpoint_rec.id) {
+                Ok(()) => {
+                    compensated = true;
+                    tracing::warn!(
+                        device_id = %device_rec.id,
+                        endpoint_id = %endpoint_rec.id,
+                        reason = %m,
+                        "device-bootstrap start 失败，已补偿删除"
+                    );
+                }
+                Err(e) => {
+                    compensated = false;
+                    tracing::error!(
+                        device_id = %device_rec.id,
+                        endpoint_id = %endpoint_rec.id,
+                        reason = %m,
+                        compensate_error = %e,
+                        "device-bootstrap start 失败且补偿删除失败，存在残留，需人工处理"
+                    );
+                }
+            }
             state.snapshot.remove_endpoint(&endpoint_rec.id);
-            compensated = true;
             start_failed = Some(m);
         }
-    } else {
-        let _ = state.store.set_desired_running(&endpoint_rec.id, false);
     }
+    // 注：start=false 时 desired_running 已在事务内写 false，无需再写一次。
 
     if let Some(m) = start_failed {
         return (
@@ -320,9 +348,28 @@ async fn device_bootstrap_inner(
         "revision": revision,
         "started": want_start,
     });
+    // 幂等语义（R1.1 明确）：只记成功结果。失败（400/409/502/503）不记——
+    // 调用方重试即重新执行，事务回滚/补偿删除保证无残留；start 失败多为运行
+    // 时状态问题，稍后重试可能成功，重放旧失败会藏掉恢复机会。
     if let Some(key) = &idem_key {
         let result_str = serde_json::to_string(&result).unwrap_or_default();
-        let _ = state.store.bootstrap_idempotency_put(key, &fingerprint, &device_rec.id, &endpoint_rec.id, &result_str);
+        if let Err(e) = state.store.bootstrap_idempotency_put(key, &fingerprint, &device_rec.id, &endpoint_rec.id, &result_str) {
+            // 幂等记录写失败不影响本次成功（设备已建好并启动）；记日志，
+            // 调用方重试同 key 会重新执行到 device Duplicate 409（无双建）。
+            tracing::warn!(
+                device_id = %device_rec.id,
+                endpoint_id = %endpoint_rec.id,
+                error = %e,
+                "device-bootstrap 成功但幂等记录写入失败，重试可能返回 409 而非重放"
+            );
+        }
     }
+    tracing::info!(
+        device_id = %device_rec.id,
+        endpoint_id = %endpoint_rec.id,
+        revision = revision,
+        started = want_start,
+        "device-bootstrap 成功"
+    );
     (StatusCode::CREATED, Json(result))
 }
