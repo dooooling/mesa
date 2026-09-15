@@ -1096,6 +1096,20 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// 按 device 清理幂等记录（delete_device 第二层防御：防表永久增长 +
+    /// 旧 key 残留。主防御是前端 per-operation key）。
+    pub fn bootstrap_idempotency_delete_by_device(
+        &self,
+        device_id: &str,
+    ) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM bootstrap_idempotency WHERE device_id=?1",
+            params![device_id],
+        )?;
+        Ok(n as u64)
+    }
+
     // ---- Tasks（全量快照替换，§6.2）----
 
     /// 全量替换某 endpoint 的任务集合。空数组表示清空。
@@ -2649,5 +2663,27 @@ mod tests {
         assert!(s.get_device("d1").unwrap().is_none());
         // 幂等删除：重复补偿不报错
         s.bootstrap_compensate("d1", "e1").unwrap();
+    }
+
+    /// RC2 修3：按 device 清理幂等记录（delete_device 第二层防御）。
+    #[test]
+    fn bootstrap_idempotency_delete_by_device() {
+        let s = mem();
+        s.bootstrap_idempotency_put("k1", "h", "d1", "e1", "{}")
+            .unwrap();
+        s.bootstrap_idempotency_put("k2", "h", "d1", "e2", "{}")
+            .unwrap();
+        s.bootstrap_idempotency_put("k3", "h", "d9", "e9", "{}")
+            .unwrap();
+        assert_eq!(s.bootstrap_idempotency_delete_by_device("d1").unwrap(), 2);
+        assert!(s.bootstrap_idempotency_get("k1").unwrap().is_none());
+        assert!(s.bootstrap_idempotency_get("k2").unwrap().is_none());
+        // 它设备记录保留
+        assert!(s.bootstrap_idempotency_get("k3").unwrap().is_some());
+        // 不存在 device 清理返回 0，不报错
+        assert_eq!(
+            s.bootstrap_idempotency_delete_by_device("ghost").unwrap(),
+            0
+        );
     }
 }
