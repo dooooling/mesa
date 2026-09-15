@@ -114,6 +114,78 @@ impl S7Address {
                 reason: format!("位地址 {v} 超出 S7 ANY 24-bit 上限 {S7ANY_MAX_BIT_ADDRESS}"),
             })
     }
+
+    /// Canonical 来源标签（P1 Point Presentation Metadata）：地址 + 位宽语义，
+    /// 全仓唯一格式化入口（configure 回填、诊断日志都走这里，不得各写一套）。
+    /// `width` 为类型位宽档：`D`（4 字节：REAL/DINT/DWORD）、`W`（2 字节：
+    /// INT/WORD）、`B`（1 字节：BYTE/CHAR/STRING）、位地址（BOOL）直接 `.bit`。
+    /// 例：DB+REAL→`DB10.DBD20`，DB+INT→`DB10.DBW20`，DB+BOOL→`DB10.DBX20.3`，
+    /// M+REAL→`MD20`，M+INT→`MW20`，M+BOOL→`M20.3`。
+    pub fn display_label(&self, width: S7Width) -> String {
+        use Area::*;
+        let bit = self.bit_offset;
+        match self.area {
+            Db => {
+                if let Some(b) = bit {
+                    format!("DB{}.DBX{}.{}", self.db_number, self.byte_offset, b)
+                } else {
+                    let prefix = match width {
+                        S7Width::Dword => "DBD",
+                        S7Width::Word => "DBW",
+                        S7Width::Byte => "DBB",
+                    };
+                    format!("DB{}.{prefix}{}", self.db_number, self.byte_offset)
+                }
+            }
+            Merker | Input | Output => {
+                let a = match self.area {
+                    Merker => "M",
+                    Input => "I",
+                    _ => "Q",
+                };
+                if let Some(b) = bit {
+                    format!("{a}{}.{}", self.byte_offset, b)
+                } else {
+                    let prefix = match width {
+                        S7Width::Dword => "D",
+                        S7Width::Word => "W",
+                        S7Width::Byte => "B",
+                    };
+                    format!("{a}{prefix}{}", self.byte_offset)
+                }
+            }
+            // 其余区域沿用 parse_address 语法（C/T/PI/PQ/L）：显式前缀，
+            // 不得用 Debug 名（Counter/PeripheralInput 与线缆语法不一致）。
+            Counter => format!("C{}", self.byte_offset),
+            Timer => format!("T{}", self.byte_offset),
+            PeripheralInput => format!("PIW{}", self.byte_offset),
+            PeripheralOutput => format!("PQW{}", self.byte_offset),
+            Local => {
+                if let Some(b) = bit {
+                    format!("L{}.{b}", self.byte_offset)
+                } else {
+                    let prefix = match width {
+                        S7Width::Dword => "LD",
+                        S7Width::Word => "LW",
+                        S7Width::Byte => "LB",
+                    };
+                    format!("{prefix}{}", self.byte_offset)
+                }
+            }
+        }
+    }
+}
+
+/// `display_label` 的位宽档：由调用方按数据类型映射（S7Kind→档），
+/// address.rs 不懂类型语义，只懂格式化。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S7Width {
+    /// 4 字节（REAL/DINT/DWORD/TIME）
+    Dword,
+    /// 2 字节（INT/WORD/DATE/S5TIME）
+    Word,
+    /// 1 字节（BYTE/CHAR/STRING/WSTRING 按 B 处理）
+    Byte,
 }
 
 /// 解析用户提供的地址字符串（大小写不敏感，允许空格）。
@@ -786,6 +858,31 @@ mod tests {
         assert_eq!(a.db_number, db);
         assert_eq!(a.byte_offset, byte);
         assert_eq!(a.bit_offset, bit, "bit mismatch for {s}");
+    }
+
+    /// P1：display_label 是全仓唯一来源格式化入口。位宽档决定 DBx/Mx 前缀，
+    /// BOOL 走位分支（档位忽略）。
+    #[test]
+    fn display_label_canonical_forms() {
+        use S7Width::*;
+        let label = |s: &str, w: S7Width| parse_address(s).unwrap().display_label(w);
+        assert_eq!(label("DB10.DBD20", Dword), "DB10.DBD20");
+        assert_eq!(label("DB10.DBW20", Word), "DB10.DBW20");
+        assert_eq!(label("DB10.DBB20", Byte), "DB10.DBB20");
+        assert_eq!(label("DB10.DBX20.3", Byte), "DB10.DBX20.3");
+        assert_eq!(label("MD20", Dword), "MD20");
+        assert_eq!(label("MW20", Word), "MW20");
+        assert_eq!(label("MB20", Byte), "MB20");
+        assert_eq!(label("M20.3", Byte), "M20.3");
+        assert_eq!(label("IW10", Word), "IW10");
+        assert_eq!(label("QW10", Word), "QW10");
+        assert_eq!(label("C1", Word), "C1");
+        assert_eq!(label("T2", Word), "T2");
+        assert_eq!(label("PIW0", Word), "PIW0");
+        assert_eq!(label("LB10", Byte), "LB10");
+        assert_eq!(label("L0.0", Byte), "L0.0");
+        // 位宽档决定前缀：同一地址不同类型显示不同后缀
+        assert_eq!(label("DB10.DBW20", Dword), "DB10.DBD20");
     }
 
     #[test]

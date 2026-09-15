@@ -834,6 +834,8 @@ impl DriverConnection for FocasConnection {
                 point_key: p.key.clone(),
                 data_type: p.data_type,
                 unit: None,
+                // P1 未实现：回落 None（UI 显示技术坐标），不阻塞。
+                source_label: None,
             })
             .collect();
         ensure_unique_point_keys(&descriptors).map_err(|DuplicatePointKey(k)| {

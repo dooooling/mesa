@@ -14,7 +14,7 @@ pub mod client; // Common SZL 直连诊断需对外暴露（V1 只读，不影�
 mod codec;
 mod s7any;
 
-pub use address::{S7Address, parse_address};
+pub use address::{S7Address, S7Width, parse_address};
 pub use codec::{S7Kind, decode_value, parse_data_type};
 
 use std::sync::Arc;
@@ -51,6 +51,12 @@ pub const CANONICAL_DATA_TYPES: [(&str, DataType, S7Kind); 9] = [
 /// 只有 byte_len==2 的 kind 语义成立（REAL 等 4 字节 kind 会错位）。
 fn counter_timer_kind_ok(kind: S7Kind) -> bool {
     matches!(kind, S7Kind::Word | S7Kind::Int)
+}
+
+/// S7Kind → display 位宽档（P1 来源标签唯一格式化入口的输入）。
+/// BOOL 无宽（位地址直接 `.bit`）；STRING/WSTRING 按字节档处理。
+fn width_of_kind(kind: S7Kind) -> S7Width {
+    kind.display_width()
 }
 
 use address::AddressError;
@@ -765,6 +771,8 @@ impl DriverConnection for S7Connection {
                 point_key: p.key.clone(),
                 data_type: p.data_type,
                 unit: None,
+                // P1：来源标签走 S7Address 唯一格式化入口（configure/诊断同一实现）
+                source_label: Some(p.addr.display_label(width_of_kind(p.kind))),
             })
             .collect();
         ensure_unique_point_keys(&descriptors).map_err(|DuplicatePointKey(k)| {
@@ -1260,6 +1268,18 @@ mod tests {
                 .unwrap();
             assert_eq!(descs.len(), 1);
             assert_eq!(descs[0].data_type, expected, "{dt}");
+            // P1：configure 回填 canonical 来源标签
+            let want_label = if dt == "BOOL" {
+                "DB1.DBX0.3"
+            } else {
+                match dt {
+                    "REAL" => "DB1.DBD0",
+                    "DWORD" | "DINT" => "DB1.DBD0",
+                    "INT" | "WORD" => "DB1.DBW0",
+                    _ => "DB1.DBB0",
+                }
+            };
+            assert_eq!(descs[0].source_label.as_deref(), Some(want_label), "{dt}");
         }
     }
 
