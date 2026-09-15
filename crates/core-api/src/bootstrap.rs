@@ -11,13 +11,13 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
 use mesa_config_store::{DeviceRecord, EndpointRecord};
 use serde::{Deserialize, Serialize};
 
-use super::{json_error, secret_field_keys, store_err_to_response, AppState};
+use super::{AppState, json_error, secret_field_keys, store_err_to_response};
 
 /// Bootstrap 请求体。`acquisition.tasks` 为空表示不配置任务（纯连接设备）；
 /// `start` 为 false 时建完保持 STOPPED（不执行 start side effect）。
@@ -69,7 +69,13 @@ fn canonical_json(v: &serde_json::Value) -> String {
             keys.sort();
             let parts: Vec<String> = keys
                 .iter()
-                .map(|k| format!("{}:{}", serde_json::to_string(k).unwrap(), canonical_json(&m[*k])))
+                .map(|k| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).unwrap(),
+                        canonical_json(&m[*k])
+                    )
+                })
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
@@ -88,7 +94,10 @@ fn idempotency_key(headers: &HeaderMap, body: &BootstrapRequest) -> Option<Strin
             return Some(t.to_string());
         }
     }
-    body.idempotency_key.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    body.idempotency_key
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// 启动 side effect（`start_endpoint` 的核心逻辑抽出：DB 已落库后执行）。
@@ -99,9 +108,17 @@ async fn start_created_endpoint(state: &AppState, endpoint_id: &str) -> Result<(
         Ok(None) => return Err(format!("endpoint `{endpoint_id}` 不存在（事务后丢失）")),
         Err(e) => return Err(e.to_string()),
     };
-    let tasks = state.store.list_tasks(endpoint_id).map_err(|e| e.to_string())?;
+    let tasks = state
+        .store
+        .list_tasks(endpoint_id)
+        .map_err(|e| e.to_string())?;
     if let Err((_, j)) = super::gate_data_tasks(state, endpoint_id, &tasks).await {
-        return Err(j.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).unwrap_or("任务校验失败").to_string());
+        return Err(j
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("任务校验失败")
+            .to_string());
     }
     // Secret 还原（与 start_endpoint 同逻辑）
     let mut materialized_json = rec.connection_json.clone();
@@ -109,7 +126,12 @@ async fn start_created_endpoint(state: &AppState, endpoint_id: &str) -> Result<(
         Ok(desc) => {
             let secret_keys = secret_field_keys(&desc.connection);
             if !secret_keys.is_empty() {
-                match super::materialize_connection(&rec.connection_json, &rec.id, &state.store, &secret_keys) {
+                match super::materialize_connection(
+                    &rec.connection_json,
+                    &rec.id,
+                    &state.store,
+                    &secret_keys,
+                ) {
                     Ok(s) => materialized_json = s,
                     Err(e) => return Err(e.to_string()),
                 }
@@ -121,9 +143,17 @@ async fn start_created_endpoint(state: &AppState, endpoint_id: &str) -> Result<(
             }
         }
     }
-    let event_tasks = state.store.list_event_tasks(endpoint_id).map_err(|e| e.to_string())?;
+    let event_tasks = state
+        .store
+        .list_event_tasks(endpoint_id)
+        .map_err(|e| e.to_string())?;
     if let Err((_, j)) = super::gate_event_tasks(state, endpoint_id, &event_tasks).await {
-        return Err(j.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).unwrap_or("事件任务校验失败").to_string());
+        return Err(j
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("事件任务校验失败")
+            .to_string());
     }
     let cfg = mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: rec.id.clone(),
@@ -170,7 +200,8 @@ async fn device_bootstrap_inner(
     if let Some(key) = &idem_key {
         match state.store.bootstrap_idempotency_get(key) {
             Ok(Some((hash, result))) if hash == fingerprint => {
-                let mut v: serde_json::Value = serde_json::from_str(&result).unwrap_or(serde_json::json!({}));
+                let mut v: serde_json::Value =
+                    serde_json::from_str(&result).unwrap_or(serde_json::json!({}));
                 if let Some(o) = v.as_object_mut() {
                     o.insert("replayed".to_string(), serde_json::Value::Bool(true));
                 }
@@ -179,7 +210,10 @@ async fn device_bootstrap_inner(
             Ok(Some(_)) => {
                 return (
                     StatusCode::CONFLICT,
-                    Json(json_error("IDEMPOTENCY_CONFLICT", "同一幂等键对应不同请求内容，请更换幂等键")),
+                    Json(json_error(
+                        "IDEMPOTENCY_CONFLICT",
+                        "同一幂等键对应不同请求内容，请更换幂等键",
+                    )),
                 );
             }
             Ok(None) => {}
@@ -190,7 +224,10 @@ async fn device_bootstrap_inner(
     if !body.endpoint.connection.is_object() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json_error("VALIDATION_ERROR", "connection 必须为 JSON 对象")),
+            Json(json_error(
+                "VALIDATION_ERROR",
+                "connection 必须为 JSON 对象",
+            )),
         );
     }
 
@@ -219,7 +256,9 @@ async fn device_bootstrap_inner(
                                     StatusCode::BAD_REQUEST,
                                     Json(json_error(
                                         "VALIDATION_ERROR",
-                                        &format!("field `{sk}`: create 时需提供明文，marker 仅更新时可用"),
+                                        &format!(
+                                            "field `{sk}`: create 时需提供明文，marker 仅更新时可用"
+                                        ),
                                     )),
                                 );
                             }
@@ -230,7 +269,11 @@ async fn device_bootstrap_inner(
             // acquisition 集合校验（endpoint 尚未落库，直接用 descriptor 校验，
             // 与 gate_data_tasks 同规则；无 generic 任务直接放行）
             if let Some(acq) = &body.acquisition {
-                if acq.tasks.iter().any(|t| t.binding.kind == mesa_core_types::GENERIC_BINDING_KIND) {
+                if acq
+                    .tasks
+                    .iter()
+                    .any(|t| t.binding.kind == mesa_core_types::GENERIC_BINDING_KIND)
+                {
                     let mut parsed = Vec::new();
                     let mut issues = Vec::new();
                     for (i, task) in acq.tasks.iter().enumerate() {
@@ -252,8 +295,15 @@ async fn device_bootstrap_inner(
                             Json(serde_json::json!({ "valid": false, "issues": issues })),
                         );
                     }
-                    let roots: Vec<String> = parsed.iter().map(|(i, _)| format!("acquisition.tasks[{i}].selections")).collect();
-                    let inputs: Vec<(&mesa_core_types::TaskMode, &[mesa_core_types::ResourceSelection], &str)> = parsed
+                    let roots: Vec<String> = parsed
+                        .iter()
+                        .map(|(i, _)| format!("acquisition.tasks[{i}].selections"))
+                        .collect();
+                    let inputs: Vec<(
+                        &mesa_core_types::TaskMode,
+                        &[mesa_core_types::ResourceSelection],
+                        &str,
+                    )> = parsed
                         .iter()
                         .zip(roots.iter())
                         .map(|((i, b), r)| (&acq.tasks[*i].mode, &b.selections[..], r.as_str()))
@@ -278,7 +328,10 @@ async fn device_bootstrap_inner(
 
     // 2) 单事务落库（secrets 明文由 store 层在事务内加密落库，
     //    与 create_endpoint_with_secrets 同语义）
-    let device_rec = DeviceRecord { id: body.device.id.clone(), name: body.device.name.clone() };
+    let device_rec = DeviceRecord {
+        id: body.device.id.clone(),
+        name: body.device.name.clone(),
+    };
     let endpoint_rec = EndpointRecord {
         id: body.endpoint.id.clone(),
         name: body.endpoint.name.clone(),
@@ -288,8 +341,17 @@ async fn device_bootstrap_inner(
         desired_running: body.start.unwrap_or(true),
         updated_at_ns: mesa_core_types::now_unix_ns(),
     };
-    let tasks: &[mesa_core_types::AcquisitionTask] = body.acquisition.as_ref().map(|a| a.tasks.as_slice()).unwrap_or(&[]);
-    let revision = match state.store.bootstrap_device_tx_with_plaintext(&device_rec, &endpoint_rec, &secrets_plain, tasks) {
+    let tasks: &[mesa_core_types::AcquisitionTask] = body
+        .acquisition
+        .as_ref()
+        .map(|a| a.tasks.as_slice())
+        .unwrap_or(&[]);
+    let revision = match state.store.bootstrap_device_tx_with_plaintext(
+        &device_rec,
+        &endpoint_rec,
+        &secrets_plain,
+        tasks,
+    ) {
         Ok(r) => r,
         Err(e) => return store_err_to_response(e),
     };
@@ -303,7 +365,10 @@ async fn device_bootstrap_inner(
             // 补偿：删 endpoint → device（顺序不可反，device 有 RESTRICT）。
             // R1.1：补偿结果必须检查——失败也写 compensated:true 是谎报；
             // 如实报告，调用方凭 device_id/endpoint_id 定位残留。
-            match state.store.bootstrap_compensate(&device_rec.id, &endpoint_rec.id) {
+            match state
+                .store
+                .bootstrap_compensate(&device_rec.id, &endpoint_rec.id)
+            {
                 Ok(()) => {
                     compensated = true;
                     tracing::warn!(
@@ -353,7 +418,13 @@ async fn device_bootstrap_inner(
     // 时状态问题，稍后重试可能成功，重放旧失败会藏掉恢复机会。
     if let Some(key) = &idem_key {
         let result_str = serde_json::to_string(&result).unwrap_or_default();
-        if let Err(e) = state.store.bootstrap_idempotency_put(key, &fingerprint, &device_rec.id, &endpoint_rec.id, &result_str) {
+        if let Err(e) = state.store.bootstrap_idempotency_put(
+            key,
+            &fingerprint,
+            &device_rec.id,
+            &endpoint_rec.id,
+            &result_str,
+        ) {
             // 幂等记录写失败不影响本次成功（设备已建好并启动）；记日志，
             // 调用方重试同 key 会重新执行到 device Duplicate 409（无双建）。
             tracing::warn!(

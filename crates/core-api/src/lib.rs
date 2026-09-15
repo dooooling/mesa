@@ -20,8 +20,8 @@ use mesa_event_store::{EventFilter, EventServices, StoredEvent};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-pub mod certificates;
 pub mod bootstrap;
+pub mod certificates;
 use certificates::CertStore;
 
 // ---------------------------------------------------------------------------
@@ -2065,11 +2065,12 @@ async fn list_events(
             ids = vec![single.clone()];
         }
     }
-    let endpoint_ids = if q.endpoint_ids.is_some() || q.device_id.is_some() || q.endpoint_id.is_some() {
-        Some(ids)
-    } else {
-        None
-    };
+    let endpoint_ids =
+        if q.endpoint_ids.is_some() || q.device_id.is_some() || q.endpoint_id.is_some() {
+            Some(ids)
+        } else {
+            None
+        };
     let filter = EventFilter {
         endpoint_id: None,
         endpoint_ids,
@@ -2760,7 +2761,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(get_device).put(update_device).delete(delete_device),
         )
         // M5 device-bootstrap（原子创建 Device + Endpoint + Tasks + Start，幂等）
-        .route("/api/v1/device-bootstrap", post(bootstrap::device_bootstrap))
+        .route(
+            "/api/v1/device-bootstrap",
+            post(bootstrap::device_bootstrap),
+        )
         // 启停
         .route("/api/v1/endpoints/{id}/start", post(start_endpoint))
         .route("/api/v1/endpoints/{id}/stop", post(stop_endpoint))

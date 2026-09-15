@@ -320,7 +320,9 @@ impl SchemaDescriptor {
                     code: "INVALID_TYPE".into(),
                     message: format!(
                         "field `{}` expected {:?}, got {}",
-                        field.key, field.field_type, show(val)
+                        field.key,
+                        field.field_type,
+                        show(val)
                     ),
                 });
                 continue;

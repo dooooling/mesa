@@ -708,11 +708,12 @@ mod tests {
         let mode_issue = issues.iter().find(|i| i.path.contains("mode")).unwrap();
         assert!(mode_issue.message.contains("zzz"));
         // secret 类型错误（非 string）同样脱敏
-        let type_issues = schema.validate_instance(
-            "connection",
-            &serde_json::json!({"password": 12345}),
-        );
-        let pw = type_issues.iter().find(|i| i.path.contains("password")).unwrap();
+        let type_issues =
+            schema.validate_instance("connection", &serde_json::json!({"password": 12345}));
+        let pw = type_issues
+            .iter()
+            .find(|i| i.path.contains("password"))
+            .unwrap();
         assert!(!pw.message.contains("12345"));
         assert!(pw.message.contains("[redacted]"));
     }

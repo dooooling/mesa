@@ -496,7 +496,8 @@ impl ConfigStore {
         }
         // 005 迁移（PR25）：endpoints 增加展示名 name。
         // v5 不变量：所有 v5 库的 endpoints 表严格含 name 列（旧行默认为 ''）。
-        if cur_ver < 5 {            let has_5: bool = conn
+        if cur_ver < 5 {
+            let has_5: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=5)",
                     [],
@@ -1050,7 +1051,11 @@ impl ConfigStore {
     /// 补偿删除：bootstrap 的 start side effect 失败时调用。
     /// endpoint → device 顺序删除（device 有 RESTRICT，顺序不可反）；
     /// endpoint 已不存在视为补偿成功（幂等删除）。
-    pub fn bootstrap_compensate(&self, device_id: &str, endpoint_id: &str) -> Result<(), StoreError> {
+    pub fn bootstrap_compensate(
+        &self,
+        device_id: &str,
+        endpoint_id: &str,
+    ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM endpoints WHERE id=?1", params![endpoint_id])?;
         conn.execute("DELETE FROM devices WHERE id=?1", params![device_id])?;
@@ -2281,7 +2286,8 @@ mod tests {
         assert_eq!(s.current_revision("e1").unwrap(), 2);
         // 升级后幂等读写可用
         assert!(s.bootstrap_idempotency_get("k").unwrap().is_none());
-        s.bootstrap_idempotency_put("k", "h", "d1", "e1", "{}").unwrap();
+        s.bootstrap_idempotency_put("k", "h", "d1", "e1", "{}")
+            .unwrap();
         assert!(s.bootstrap_idempotency_get("k").unwrap().is_some());
         let _ = std::fs::remove_file(&path);
     }
@@ -2570,7 +2576,12 @@ mod tests {
     fn bootstrap_tx_all_or_nothing() {
         let s = mem();
         let rev = s
-            .bootstrap_device_tx_with_plaintext(&dev("d1"), &bootstrap_ep("e1", "d1"), &[], &[task("t1", 1000)])
+            .bootstrap_device_tx_with_plaintext(
+                &dev("d1"),
+                &bootstrap_ep("e1", "d1"),
+                &[],
+                &[task("t1", 1000)],
+            )
             .unwrap();
         assert_eq!(rev, 1);
         assert!(s.get_device("d1").unwrap().is_some());
@@ -2584,7 +2595,12 @@ mod tests {
         // 先建 d1（占住 device id）
         s.create_device(&dev("d1")).unwrap();
         // bootstrap 同 device id 必须 Duplicate，且 endpoint 不得半落库
-        let r = s.bootstrap_device_tx_with_plaintext(&dev("d1"), &bootstrap_ep("e2", "d1"), &[], &[task("t1", 1000)]);
+        let r = s.bootstrap_device_tx_with_plaintext(
+            &dev("d1"),
+            &bootstrap_ep("e2", "d1"),
+            &[],
+            &[task("t1", 1000)],
+        );
         assert!(matches!(r, Err(StoreError::Duplicate(_))));
         assert!(s.get_endpoint("e2").unwrap().is_none());
         assert!(s.list_tasks("e2").unwrap().is_empty());
@@ -2596,7 +2612,12 @@ mod tests {
         // 非法 task（空 id）→ Validation，device/endpoint 同样不得残留
         let mut bad = task("", 1000);
         bad.id = "".into();
-        let r = s.bootstrap_device_tx_with_plaintext(&dev("d9"), &bootstrap_ep("e9", "d9"), &[], &[bad]);
+        let r = s.bootstrap_device_tx_with_plaintext(
+            &dev("d9"),
+            &bootstrap_ep("e9", "d9"),
+            &[],
+            &[bad],
+        );
         assert!(matches!(r, Err(StoreError::Validation(_))));
         assert!(s.get_device("d9").unwrap().is_none());
         assert!(s.get_endpoint("e9").unwrap().is_none());
@@ -2606,7 +2627,8 @@ mod tests {
     fn bootstrap_idempotency_put_get_roundtrip() {
         let s = mem();
         assert!(s.bootstrap_idempotency_get("k1").unwrap().is_none());
-        s.bootstrap_idempotency_put("k1", "hash-a", "d1", "e1", r#"{"ok":true}"#).unwrap();
+        s.bootstrap_idempotency_put("k1", "hash-a", "d1", "e1", r#"{"ok":true}"#)
+            .unwrap();
         let row = s.bootstrap_idempotency_get("k1").unwrap().unwrap();
         assert_eq!(row.0, "hash-a");
         assert_eq!(row.1, r#"{"ok":true}"#);
@@ -2615,8 +2637,13 @@ mod tests {
     #[test]
     fn bootstrap_compensate_removes_endpoint_then_device() {
         let s = mem();
-        s.bootstrap_device_tx_with_plaintext(&dev("d1"), &bootstrap_ep("e1", "d1"), &[], &[task("t1", 1000)])
-            .unwrap();
+        s.bootstrap_device_tx_with_plaintext(
+            &dev("d1"),
+            &bootstrap_ep("e1", "d1"),
+            &[],
+            &[task("t1", 1000)],
+        )
+        .unwrap();
         s.bootstrap_compensate("d1", "e1").unwrap();
         assert!(s.get_endpoint("e1").unwrap().is_none());
         assert!(s.get_device("d1").unwrap().is_none());
