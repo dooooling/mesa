@@ -68,17 +68,25 @@ export function DeviceLiveData(props: {
       {
         title: "数据点",
         width: 240,
-        render: (_: unknown, r: DevicePointView) => <NameCell point={r} />,
+        render: (_: unknown, r: DevicePointView) => (
+          <NameCell
+            displayKey={r.displayKey}
+            pointKey={r.key ?? r.point_key ?? String(r.point_id)}
+            displayName={r.display_name}
+          />
+        ),
       },
       {
         title: "来源",
         width: 220,
-        render: (_: unknown, r: DevicePointView) => <SourceCell point={r} />,
+        render: (_: unknown, r: DevicePointView) => (
+          <SourceCell sourceText={r.sourceText} sourceLabel={r.source_label} />
+        ),
       },
       {
         title: "当前值",
         width: 180,
-        render: (_: unknown, r: DevicePointView) => <ValueCell point={r} />,
+        render: (_: unknown, r: DevicePointView) => <ValueCell value={r.value} />,
       },
       { title: "类型", width: 90, dataIndex: "type", render: (v: string) => <Tag>{v ?? "—"}</Tag> },
       {
@@ -96,7 +104,7 @@ export function DeviceLiveData(props: {
       {
         title: "更新",
         width: 90,
-        render: (_: unknown, r: DevicePointView) => <AgeCell timestampNs={r.timestamp_ns} ageMs={r.ageMs} />,
+        render: (_: unknown, r: DevicePointView) => <AgeCell timestampNs={r.timestamp_ns} />,
       },
       {
         // M7 可访问性：键盘路径（行 onClick 仅鼠标可达）。

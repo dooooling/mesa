@@ -6,6 +6,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { POINT_STALE_AFTER_MS } from "../deviceModel";
 import { DeviceWorkspacePage } from "./DeviceWorkspacePage";
+import { StaleClockProvider } from "./StaleClock";
 import { buildAttentionList } from "./DeviceOverview";
 
 const T0 = 1_700_000_000_000;
@@ -58,9 +59,11 @@ function mockWorkspace(opts: {
 function renderWorkspace(path: string) {
   return render(
     <MemoryRouter initialEntries={[path]}>
-      <Routes>
-        <Route path="/devices/:deviceId/:tab" element={<DeviceWorkspacePage />} />
-      </Routes>
+      <StaleClockProvider>
+        <Routes>
+          <Route path="/devices/:deviceId/:tab" element={<DeviceWorkspacePage />} />
+        </Routes>
+      </StaleClockProvider>
     </MemoryRouter>,
   );
 }
@@ -644,5 +647,74 @@ describe("RC2 ownership fail-closed", () => {
       { timeout: 10000 },
     );
     expect(screen.queryAllByText("ghost-point")).toHaveLength(0);
+  }, 30000);
+});
+
+describe("M2 reconcile 语义回归", () => {
+  it("source_label-only 变化必须显示（value/timestamp 不变不吞更新）", async () => {
+    let label = "DB10.DBD20";
+    mockWorkspace({
+      points: () => ({
+        points: [{ ...pt("focas", "k1", "GOOD", 500), source_label: label }],
+      }),
+    });
+    renderWorkspace("/devices/cnc-01/data");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getAllByText("DB10.DBD20").length).toBeGreaterThanOrEqual(1);
+    // Configure 改地址 → Core 刷新 source_label，但尚无新 DataBatch
+    label = "DB20.DBD40";
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(screen.getAllByText("DB20.DBD40").length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryAllByText("DB10.DBD20")).toHaveLength(0);
+  });
+
+  it("display_name-only 变化必须显示（跨客户端改名轮询可发现）", async () => {
+    let name: string | undefined;
+    mockWorkspace({
+      points: () => ({
+        points: [{ ...pt("focas", "k1", "GOOD", 500), display_name: name }],
+      }),
+    });
+    renderWorkspace("/devices/cnc-01/data");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getAllByText("k1").length).toBeGreaterThanOrEqual(1);
+    name = "新名字";
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(screen.getAllByText("新名字").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("timestamp 不变时 Age 文本照常推进（刚刚 → N秒前）", async () => {
+    vi.useRealTimers();
+    // 真 timers 下 Date.now() 是真实当前时间：timestamp 必须相对现在，
+    // 否则 age 直接落分钟级（与 T0 固定值的 fake timers 用例不同）。
+    const now = Date.now();
+    mockWorkspace({
+      points: () => ({
+        points: [
+          {
+            endpoint_id: "focas",
+            key: "k1",
+            point_id: 2,
+            quality: "GOOD",
+            type: "f64",
+            value: 1,
+            timestamp_ns: (now - 500) * 1e6,
+          },
+        ],
+      }),
+    });
+    renderWorkspace("/devices/cnc-01/data");
+    // timestamp 不变，真时间推进后共享秒钟独立重算年龄（不经过整表重建）。
+    // 真 timers 下首帧可能已过"刚刚"，直接等"N秒前"（值文本本身不动）。
+    await screen.findByText(/秒前/, undefined, { timeout: 10000 });
+    expect(screen.getAllByText("k1").length).toBeGreaterThanOrEqual(1);
   }, 30000);
 });

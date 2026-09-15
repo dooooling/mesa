@@ -4,7 +4,7 @@
 // - 无 deviceId 限定：全局聚合，全量 points 全部成视图（含设备/连接归属名）。
 // 设备页继续用 useDeviceWorkspaceData（内部复用本源 + 设备过滤），语义同源。
 import { useEffect, useMemo, useRef, useState } from "react";
-import { derivePointStale, pointsSnapshotSignature, resolveEndpointContexts, type Device } from "../deviceModel";
+import { derivePointStale, pointAgeMs, reconcilePointSnapshots, resolveEndpointContexts, type Device } from "../deviceModel";
 import {
   DEVICE_ENDPOINTS_POLL_MS,
   DEVICE_POINTS_POLL_MS,
@@ -30,7 +30,6 @@ export interface LivePointsSource {
   endpointsError: string;
   points: WorkspacePoint[];
   pointsError: boolean;
-  nowMs: number;
   /** 全量点位视图（含设备/连接归属名；派生 STALE 与 M2 同规则）。 */
   allPoints: DevicePointView[];
   counts: { total: number; good: number; bad: number; stale: number; unknown: number };
@@ -45,7 +44,7 @@ export function useLivePointsSource(): LivePointsSource {
   const [endpointsError, setEndpointsError] = useState("");
   const [points, setPoints] = useState<WorkspacePoint[]>([]);
   const [pointsError, setPointsError] = useState(false);
-  const [nowMs, setNowMs] = useState(() => Date.now());
+  // 无 nowMs state：interval 只拉取，不 tick 整页。
   const gen = useRef(0);
 
   useEffect(() => {
@@ -81,8 +80,8 @@ export function useLivePointsSource(): LivePointsSource {
         });
     };
 
-    // 签名门（与设备页同语义）：无变化不替换引用。
-    const sigRef = { current: "" };
+    const prevAtRef = { current: Date.now() };
+    // Row reconciliation（与设备页同语义）：不变行保引用。
     const loadPoints = () => {
       fetchJson("/api/v1/points/latest")
         .then((j) => {
@@ -90,11 +89,13 @@ export function useLivePointsSource(): LivePointsSource {
           const pts = (j as { points?: unknown }).points;
           if (!Array.isArray(pts)) throw new Error("points 形态非法");
           const arr = pts as WorkspacePoint[];
-          const sig = pointsSnapshotSignature(arr, Date.now());
-          if (sig !== sigRef.current) {
-            sigRef.current = sig;
-            setPoints(arr);
-          }
+          const at = Date.now();
+          const atPrev = prevAtRef.current;
+          prevAtRef.current = at;
+          setPoints((prev) => {
+            const { points: merged, changed } = reconcilePointSnapshots(prev, arr, at, atPrev);
+            return changed ? merged : prev;
+          });
           setPointsError(false);
         })
         .catch(() => {
@@ -109,7 +110,6 @@ export function useLivePointsSource(): LivePointsSource {
     const timer = window.setInterval(() => {
       if (gen.current !== id) return;
       n += 1;
-      setNowMs(Date.now());
       loadPoints();
       if (n % (DEVICE_ENDPOINTS_POLL_MS / DEVICE_POINTS_POLL_MS) === 0) loadInventory();
     }, DEVICE_POINTS_POLL_MS);
@@ -133,10 +133,8 @@ export function useLivePointsSource(): LivePointsSource {
     () =>
       points.map((p) => {
         const c = ctx.get(p.endpoint_id);
-        const ageMs =
-          typeof p.timestamp_ns === "number" && Number.isFinite(p.timestamp_ns) && p.timestamp_ns > 0
-            ? nowMs - Math.floor(Number(p.timestamp_ns) / 1e6)
-            : null;
+        const buildNow = Date.now();
+        const ageMs = pointAgeMs(p.timestamp_ns, buildNow);
         return {
           ...p,
           // P2 Name：与设备页同口径（display_name 优先）。
@@ -150,7 +148,8 @@ export function useLivePointsSource(): LivePointsSource {
           deviceName: c?.deviceName ?? "",
         };
       }),
-    [points, ctx, nowMs],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [points, ctx],
   );
 
   const counts = useMemo(() => {
@@ -177,5 +176,5 @@ export function useLivePointsSource(): LivePointsSource {
     );
   };
 
-  return { devices, endpoints, endpointsReady, endpointsError, points, pointsError, nowMs, allPoints, counts, patchDisplayName };
+  return { devices, endpoints, endpointsReady, endpointsError, points, pointsError, allPoints, counts, patchDisplayName };
 }

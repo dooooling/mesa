@@ -410,10 +410,12 @@ export function derivePointStale(quality: string, ageMs: number | null): PointSt
   return ageMs > POINT_STALE_AFTER_MS ? "STALE" : "GOOD";
 }
 // ---------------------------------------------------------------------------
-// 实时渲染稳定化：points 快照签名门。loadPoints 每秒到达，但值/质量/
-// 时间戳/派生状态全未变时不替换快照引用，下游 memo 整表零重渲染。
-// STALE 翻转属于签名一部分（derived 参与签名），语义无损，只是翻转
-// 时机对齐到轮询节拍（本来就是 1s 轮询，无额外延迟）。
+// 实时渲染稳定化：row 级 reconciliation（替代整快照签名门）。
+// 签名门只比较 value/quality/timestamp 会吞掉 metadata 变化
+//（source_label/display_name/key/type 独立刷新时 UI 永久不更新）。
+// 此处按 endpoint_id:point_id 逐行全字段比较：不变行返回旧对象引用
+//（React memo/行级 bailout 自然成立），变行/新行返回新对象。
+// derived 用 reconcile 时刻计算，STALE 翻转对齐轮询节拍（语义无损）。
 // ---------------------------------------------------------------------------
 
 export interface PointSnapshotLike {
@@ -424,14 +426,17 @@ export interface PointSnapshotLike {
   quality: string;
   value: unknown;
   timestamp_ns: number;
+  type?: string;
+  source_label?: string;
+  display_name?: string;
 }
 
-/** 稳定排序键（与后端 latest_all 的 endpoint_id+point_id 口径一致）。 */
-export function pointSortKey(p: PointSnapshotLike): string {
+/** 稳定行键（与后端 latest_all 的 endpoint_id+point_id 口径一致）。 */
+export function pointRowKey(p: PointSnapshotLike): string {
   return `${p.endpoint_id}:${p.point_id}`;
 }
 
-function signatureValue(v: unknown): string {
+function snapshotValueKey(v: unknown): string {
   if (v === null || v === undefined) return "vnull";
   if (typeof v === "number" || typeof v === "boolean" || typeof v === "string") {
     return `${typeof v}:${String(v)}`;
@@ -444,22 +449,77 @@ function signatureValue(v: unknown): string {
 }
 
 /**
- * 快照签名：每点 endpoint_id:point_id | quality | value | timestamp | derived(now)。
- * 调用方每轮询一次算一次，与上次相同即跳过 setState。
+ * 行级字段指纹：metadata 全字段 + value/quality/timestamp（与 now 无关）。
+ * 少任何一个都会吞更新（P1 source_label 可独立刷新，P2 display_name 可跨客户端改名）。
  */
-export function pointsSnapshotSignature(points: PointSnapshotLike[], nowMs: number): string {
-  const parts = new Array<string>(points.length);
-  for (let i = 0; i < points.length; i++) {
-    const p = points[i];
-    const age = pointAgeMs(p.timestamp_ns, nowMs);
-    parts[i] = [
-      pointSortKey(p),
-      (p.quality ?? "").toUpperCase(),
-      signatureValue(p.value),
-      String(p.timestamp_ns ?? 0),
-      derivePointStale(p.quality, age),
-    ].join("|");
+export function pointFieldFingerprint(p: PointSnapshotLike): string {
+  return [
+    pointRowKey(p),
+    p.key ?? "",
+    p.point_key ?? "",
+    p.type ?? "",
+    (p.quality ?? "").toUpperCase(),
+    snapshotValueKey(p.value),
+    String(p.timestamp_ns ?? 0),
+    p.source_label ?? "",
+    p.display_name ?? "",
+  ].join("|");
+}
+
+/**
+ * 行级 UI 可观察指纹 = 字段指纹 + derived(now)。
+ */
+export function pointRowFingerprint(p: PointSnapshotLike, nowMs: number): string {
+  const age = pointAgeMs(p.timestamp_ns, nowMs);
+  return `${pointFieldFingerprint(p)}|${derivePointStale(p.quality, age)}`;
+}
+
+/**
+ * 逐行合并：不变行保留旧引用（调用方 memo/Table 行级 bailout），
+ * 变行/新行取新对象。返回合并后数组与是否发生变化。
+ *
+ * 字段比较与 now 无关；derived 跨时刻比较（prevNow → now）：
+ * timestamp 不变但时间推进越过 STALE 阈值时同样视为变化
+ * （翻转时机对齐轮询节拍，语义无损）。
+ */
+export function reconcilePointSnapshots<T extends PointSnapshotLike>(
+  prev: T[],
+  next: T[],
+  nowMs: number,
+  prevNowMs?: number,
+): { points: T[]; changed: boolean } {
+  const prevByKey = new Map<string, T>();
+  for (const p of prev) prevByKey.set(pointRowKey(p), p);
+  const atPrev = prevNowMs ?? nowMs;
+  let changed = prev.length !== next.length;
+  const out = new Array<T>(next.length);
+  for (let i = 0; i < next.length; i++) {
+    const n = next[i];
+    const o = prevByKey.get(pointRowKey(n));
+    if (o === undefined) {
+      out[i] = n;
+      changed = true;
+      continue;
+    }
+    const sameFields = pointFieldFingerprint(o) === pointFieldFingerprint(n);
+    const oldDerived = derivePointStale(o.quality, pointAgeMs(o.timestamp_ns, atPrev));
+    const newDerived = derivePointStale(n.quality, pointAgeMs(n.timestamp_ns, nowMs));
+    if (sameFields && oldDerived === newDerived) {
+      out[i] = o;
+    } else {
+      out[i] = n;
+      changed = true;
+    }
   }
-  parts.sort();
-  return `${points.length}#${parts.join(";")}`;
+  return { points: out, changed };
+}
+
+/** 兼容保留：稳定排序键。 */
+export function pointSortKey(p: PointSnapshotLike): string {
+  return pointRowKey(p);
+}
+
+/** 兼容保留：整快照签名（测试/诊断用；生产 gating 走 reconcile）。 */
+export function pointsSnapshotSignature(points: PointSnapshotLike[], nowMs: number): string {
+  return points.map((p) => pointRowFingerprint(p, nowMs)).sort().join(";");
 }
