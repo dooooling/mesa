@@ -6,7 +6,7 @@
 //   （多连接设备需要区分来源），不加设备列（已在设备内）。
 // - M3.5：过滤栏升级为 EventFilterBar（常用 Active/时间 + 高级精确匹配，
 //   文本 400ms debounce），与全局页同一组件。
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Alert, Button, Space, Tag } from "antd";
 import type { StoredEvent } from "../types";
 import { EMPTY_EVENT_FILTER_FORM, type EventFilterForm } from "../events/filters";
@@ -16,15 +16,24 @@ import { EventTable } from "../components/EventTable";
 import { EventDetailDrawer } from "../components/EventDetailDrawer";
 
 export function DeviceEvents(props: {
+  /** scope 唯一身份（Drawer 清空用它，不用展示名——同名设备并存时名称不变）。 */
+  deviceId: string;
   deviceName: string;
   endpointIds: string[];
   endpointNames: Map<string, string>;
   /** M1 解析后的有效连接（null = 全部）。 */
   effectiveEndpointId: string | null;
 }) {
-  const { deviceName, endpointIds, endpointNames, effectiveEndpointId } = props;
+  const { deviceId, deviceName, endpointIds, endpointNames, effectiveEndpointId } = props;
   const [rest, setRest] = useState<EventFilterForm>(EMPTY_EVENT_FILTER_FORM);
   const [selected, setSelected] = useState<StoredEvent | null>(null);
+
+  // RC2 修2：scope detail state 必须在 scope identity 变化时清空。
+  // 用 deviceId（唯一身份），不用 deviceName（同名并存时 A→B 名称不变，
+  // effect 不执行，A 的 Drawer 会留在 B 页面）。
+  useEffect(() => {
+    setSelected(null);
+  }, [deviceId]);
 
   const scopedEndpointIds = useMemo(
     () => (effectiveEndpointId ? [effectiveEndpointId] : endpointIds),
@@ -56,7 +65,18 @@ export function DeviceEvents(props: {
       </div>
 
       {feed.unavailable ? (
-        <Alert type="error" showIcon message="Event service unavailable" description="EventStore 当前不可用。" />
+        <Alert
+          type="error"
+          showIcon
+          message="Event service unavailable"
+          description="EventStore 当前不可用。恢复后点重试重新建连（重建高水位，不会 replay 大量历史）。"
+          action={
+            // RC2 修4：unavailable 也有重试（完整 boot → 新 H → SSE 重建）。
+            <Button size="small" onClick={() => feed.reload()}>
+              重试
+            </Button>
+          }
+        />
       ) : null}
       {feed.error ? (
         <Alert

@@ -83,24 +83,18 @@ export interface BootstrapClient {
   ) => Promise<{ status: number; body: Record<string, unknown> }>;
 }
 
-/** 幂等键：draft 内容哈希（同 draft 重复提交 → 同 key → 后端重放）。 */
-export function draftIdempotencyKey(draft: {
-  device: DeviceDraft;
-  connection: ConnectionDraft;
-  acquisition: AcquisitionDraft;
-}): string {
-  const s = JSON.stringify({
-    d: [draft.device.deviceId, draft.device.deviceName],
-    c: [draft.connection.driverId, draft.connection.endpointId, draft.connection.endpointName, draft.connection.connection],
-    a: [draft.acquisition.intervalMs, draft.acquisition.selections, draft.acquisition.startAfterCreate],
-  });
-  let h1 = 0x811c9dc5;
-  let h2 = 0x01000193;
-  for (let i = 0; i < s.length; i++) {
-    h1 = Math.imul(h1 ^ s.charCodeAt(i), 0x01000193) >>> 0;
-    h2 = Math.imul(h2 + s.charCodeAt(i), 0x85ebca6b) >>> 0;
-  }
-  return `web-${h1.toString(16)}${h2.toString(16)}`;
+/**
+ * 幂等键语义（RC2 修3）：key 表示“这一次创建操作”，不是“这份配置内容”。
+ * - 同一 Flow 内重复提交（超时重试/双击）→ 复用同一 key → 后端重放；
+ * - 新 Flow（删除后重建/重新走一遍）→ 必须新 key → 后端真正执行。
+ * key 由调用方（AddDeviceFlow）持有：确认页进入生成，重试复用，reset 更新。
+ * 此处只提供生成器，绝不从 draft 内容派生（content-addressed 已退役：
+ * 相同配置删除后重建会命中几个月前的 replay，进入不存在的设备）。
+ */
+export function newOperationKey(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (c?.randomUUID) return `web-op-${c.randomUUID()}`;
+  return `web-op-${Date.now().toString(36)}-${Math.floor(Math.random() * 0xffffff).toString(16)}`;
 }
 
 /**
@@ -110,6 +104,7 @@ export function draftIdempotencyKey(draft: {
 export async function bootstrapDevice(
   client: BootstrapClient,
   draft: { device: DeviceDraft; connection: ConnectionDraft; acquisition: AcquisitionDraft },
+  opts?: { idempotencyKey?: string },
 ): Promise<BootstrapReport> {
   const { device, connection, acquisition } = draft;
   const res = await client.deviceBootstrap({
@@ -131,7 +126,7 @@ export async function bootstrapDevice(
       ],
     },
     start: acquisition.startAfterCreate,
-    idempotency_key: draftIdempotencyKey(draft),
+    idempotency_key: opts?.idempotencyKey ?? newOperationKey(),
   });
   const b = res.body ?? {};
   const err = (b as { error?: { code?: string; message?: string } }).error;

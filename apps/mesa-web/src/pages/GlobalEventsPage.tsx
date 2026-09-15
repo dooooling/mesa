@@ -124,14 +124,12 @@ export function GlobalEventsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [formKey]);
 
+  // RC2 修5：reload owner 唯一——formKey effect 是唯一的 reload 发起者。
+  // onRestChange 只改 rest（formKey 变化触发 effect reload）。之前两处都
+  // reload，用户改一个 filter 发两次请求（debounce 后仍 double）。
   // form 变化即 reload（与旧 EventsView 的 onFilterChange 语义一致）。
   const onRestChange = (next: EventFilterForm) => {
     setRest(next);
-    feed.reload({
-      ...next,
-      endpoint_id: connectionParam !== "ALL" ? connectionParam : undefined,
-      device_id: deviceParam !== "ALL" ? deviceParam : undefined,
-    });
   };
 
   const statusTag = useMemo(() => {
@@ -173,7 +171,18 @@ export function GlobalEventsPage() {
         }
       >
         {unavailable ? (
-          <Alert type="error" showIcon message="Event service unavailable" description="EventStore 当前不可用。" />
+          <Alert
+            type="error"
+            showIcon
+            message="Event service unavailable"
+            description="EventStore 当前不可用。恢复后点重试重新建连（重建高水位，不会 replay 大量历史）。"
+            action={
+              // RC2 修4：unavailable 也有重试（完整 boot → 新 H → SSE 重建）。
+              <Button size="small" onClick={() => feed.reload(form)}>
+                重试
+              </Button>
+            }
+          />
         ) : null}
         {error ? (
           <Alert

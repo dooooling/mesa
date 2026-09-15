@@ -17,7 +17,7 @@ import {
 } from "../deviceModel";
 import { DescriptorFields, materializeSchemaDefaults } from "../components/DescriptorFields";
 import { ResourcePickerAntd } from "../components/ResourcePickerAntd";
-import { bootstrapDevice, isDraftComplete, type AcquisitionDraft, type BootstrapReport, type ConnectionDraft, type DeviceDraft } from "./bootstrap";
+import { bootstrapDevice, isDraftComplete, newOperationKey, type AcquisitionDraft, type BootstrapReport, type ConnectionDraft, type DeviceDraft } from "./bootstrap";
 
 const FALLBACK_DRIVERS = [
   { value: "simulator", label: "Simulator" },
@@ -53,6 +53,9 @@ export function AddDeviceFlow() {
   // 提交状态
   const [submitting, setSubmitting] = useState(false);
   const [report, setReport] = useState<BootstrapReport | null>(null);
+  // RC2 修3：operation key（per-operation 幂等）。进入确认页生成一次，
+  // 同一 Flow 内重复提交（重试/双击）复用；reset（再建一个）即新操作新 key。
+  const [operationKey, setOperationKey] = useState("");
 
   useEffect(() => {
     api.listDrivers().then((j) => {
@@ -116,6 +119,7 @@ export function AddDeviceFlow() {
       return;
     }
     setAcquisition({ intervalMs, selections: sels, startAfterCreate });
+    setOperationKey(newOperationKey());
     setStep(3);
   };
 
@@ -125,6 +129,7 @@ export function AddDeviceFlow() {
     setReport(null);
     try {
       // M5.5：一次原子提交（后端单事务 + 幂等；前端不再分步编排/补偿）。
+      // RC2 修3：复用本 Flow 的 operationKey（重试同 key → 重放，不双建）。
       const r = await bootstrapDevice(
         {
           deviceBootstrap: async (b) => {
@@ -138,6 +143,7 @@ export function AddDeviceFlow() {
           },
         },
         { device, connection, acquisition },
+        { idempotencyKey: operationKey || undefined },
       );
       setReport(r);
       if (r.ok) {
@@ -161,6 +167,9 @@ export function AddDeviceFlow() {
     setReport(null);
     setProbe(null);
     setIssues([]);
+    // 新操作：旧 operationKey 作废（删除后重建相同配置必须真正执行，
+    // 不能命中旧 replay）。
+    setOperationKey("");
     deviceForm.resetFields();
     connForm.resetFields();
   };

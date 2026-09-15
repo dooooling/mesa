@@ -1,6 +1,7 @@
 // M5.5 原子提交单测：一次 POST + 结果映射 + 幂等键稳定。
+// RC2 修3：幂等键语义改为 per-operation（调用方持有，重试复用；新 Flow 新 key）。
 import { describe, expect, it, vi } from "vitest";
-import { bootstrapDevice, draftIdempotencyKey, isDraftComplete, type BootstrapClient } from "./bootstrap";
+import { bootstrapDevice, isDraftComplete, newOperationKey, type BootstrapClient } from "./bootstrap";
 
 const DRAFT = {
   device: { deviceId: "cnc-01", deviceName: "CNC-01" },
@@ -31,14 +32,24 @@ describe("isDraftComplete", () => {
   });
 });
 
-describe("draftIdempotencyKey", () => {
-  it("同 draft 同 key（重放），改任一字段即换 key", () => {
-    const k1 = draftIdempotencyKey(DRAFT);
-    const k2 = draftIdempotencyKey(structuredClone(DRAFT));
-    expect(k1).toBe(k2);
-    expect(k1.startsWith("web-")).toBe(true);
-    const k3 = draftIdempotencyKey({ ...DRAFT, acquisition: { ...DRAFT.acquisition, intervalMs: 500 } });
-    expect(k3).not.toBe(k1);
+describe("newOperationKey（per-operation 幂等）", () => {
+  it("每次生成唯一（新 Flow 新 key，删后重建不再命中旧 replay）", () => {
+    const k1 = newOperationKey();
+    const k2 = newOperationKey();
+    expect(k1.startsWith("web-op-")).toBe(true);
+    expect(k2).not.toBe(k1);
+  });
+
+  it("同 Flow 重试复用 key（调用方传入 opts.idempotencyKey）", async () => {
+    const c = client({ device_id: "cnc-01", endpoint_id: "sim-ep", revision: 1, started: true });
+    const key = newOperationKey();
+    await bootstrapDevice(c, DRAFT, { idempotencyKey: key });
+    await bootstrapDevice(c, DRAFT, { idempotencyKey: key });
+    expect(c.calls).toHaveLength(2);
+    const b0 = c.calls[0] as { idempotency_key?: unknown };
+    const b1 = c.calls[1] as { idempotency_key?: unknown };
+    expect(b0.idempotency_key).toBe(key);
+    expect(b1.idempotency_key).toBe(key);
   });
 });
 

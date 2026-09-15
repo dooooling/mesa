@@ -31,8 +31,9 @@ export interface EventFeed {
 /**
  * 单事件源。form 为后端过滤（调用方保证对象身份稳定，否则每次渲染都 reload）。
  * 代际/pending-live/merge/SSE 冻结顺序与旧 EventsView 完全一致。
- * M7：device 过滤走后端 device_id；SSE live 行的 device 归属需 deviceOf 映射
- * （无映射时 live 行按其它条件判定，归属未知保留）。
+ * M7：device 过滤走后端 device_id；SSE live 行的 device 归属需 deviceOf 映射。
+ * RC2：device 归属 fail-closed——form 有 device_id 时 owner 必须可证明相等，
+ * 未知归属一律排除（liveFilter.matchesLiveFilter，语义与后端 SQL 对齐）。
  */
 export function useEventFeed(
   form: EventFilterForm,
@@ -61,22 +62,32 @@ export function useEventFeed(
     return live;
   };
 
-  // 首屏：冻结 H → 历史完成 → 最后 setHighWater + setBooted（SSE 在历史后建连）。
-  useEffect(() => {
+  // RC2 修4：完整 boot（eventHead → 历史首屏 → 新 H）。recover 必须走完整
+  // boot 而不是只 reload history：失败时 highWater 可能仍是 0，SSE 从 0
+  // replay 会拉大量历史；且成功后必须显式 setUnavailable(false)，否则
+  // SSE enable 条件（booted && liveOn && !unavailable）永久不满足。
+  const boot = useCallback((next?: EventFilterForm) => {
     const id = ++histGen.current;
+    const f = next ?? formRef.current;
     setLoading(true);
+    // RC2 收口：boot/reload 开始时复位 loadingMore（stale loadOlder 故意不碰
+    // 新代际状态；若此处不复位，“加载更早 pending 中改 filter”会把 loadingMore
+    // 永久留在 true）。
+    setLoadingMore(false);
     setError(null);
+    setNextCursor(null);
     (async () => {
       try {
         const h = await api.eventHead();
-        const page = await api.listEvents(toEventFilter(formRef.current, { limit: EVENT_FIRST_PAGE_LIMIT }));
+        const page = await api.listEvents(toEventFilter(f, { limit: EVENT_FIRST_PAGE_LIMIT }));
         if (histGen.current !== id) return;
-        const live = drainPendingLive(formRef.current);
+        const live = drainPendingLive(f);
         setHistory(mergeEvents([...page.events].sort((a, b) => b.seq - a.seq), live));
         setNextCursor(page.next_cursor);
         setHighWater(h);
         setLoading(false);
         setBooted(true);
+        setUnavailable(false);
       } catch (e) {
         if (histGen.current !== id) return;
         if (isEventStoreUnavailable(e)) setUnavailable(true);
@@ -85,30 +96,22 @@ export function useEventFeed(
         setBooted(true);
       }
     })();
+  }, []);
+
+  // 首屏：完整 boot（SSE 在历史后建连）。
+  useEffect(() => {
+    boot();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const reload = useCallback((next: EventFilterForm) => {
-    const id = ++histGen.current;
-    setLoading(true);
-    setError(null);
-    setNextCursor(null);
-    api
-      .listEvents(toEventFilter(next, { limit: EVENT_FIRST_PAGE_LIMIT }))
-      .then((res) => {
-        if (histGen.current !== id) return;
-        const live = drainPendingLive(next);
-        setHistory(mergeEvents([...res.events].sort((a, b) => b.seq - a.seq), live));
-        setNextCursor(res.next_cursor);
-        setLoading(false);
-      })
-      .catch((e) => {
-        if (histGen.current !== id) return;
-        if (isEventStoreUnavailable(e)) setUnavailable(true);
-        else setError(e instanceof Error ? e.message : String(e));
-        setLoading(false);
-      });
-  }, []);
+  const reload = useCallback(
+    (next: EventFilterForm) => {
+      // RC2 修4+修5 相关：reload 即完整 boot（重建 H + 成功清 unavailable）。
+      // 调用方只改 form，不直接调 reload（reload owner 唯一，见 GlobalEventsPage）。
+      boot(next);
+    },
+    [boot],
+  );
 
   const loadOlder = useCallback(() => {
     if (nextCursor === null || nextCursor === undefined || loadingMore) return;
@@ -120,20 +123,16 @@ export function useEventFeed(
     api
       .listEvents(toEventFilter(snapshot, { before_seq: nextCursor, limit: EVENT_FIRST_PAGE_LIMIT }))
       .then((res) => {
-        if (id !== histGen.current || formRef.current !== snapshot) {
-          setLoadingMore(false);
-          return;
-        }
+        // RC2 修6 同理：stale 响应绝不碰新 generation 状态（loadingMore 由
+        // 当前代际自己的请求负责；boot/reload 开始时复位）。
+        if (id !== histGen.current || formRef.current !== snapshot) return;
         setHistory((cur) => mergeEvents(cur, res.events));
         setNextCursor(res.next_cursor);
         setLoadingMore(false);
       })
       .catch((e) => {
         // stale 失败同样丢弃：旧 filter 的错误绝不显示在新页面，也不碰 loadingMore 之外的状态
-        if (id !== histGen.current || formRef.current !== snapshot) {
-          setLoadingMore(false);
-          return;
-        }
+        if (id !== histGen.current || formRef.current !== snapshot) return;
         if (isEventStoreUnavailable(e)) setUnavailable(true);
         else setError(e instanceof Error ? e.message : String(e));
         setLoadingMore(false);
