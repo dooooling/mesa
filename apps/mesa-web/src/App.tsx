@@ -3,10 +3,10 @@ import { DashboardOutlined, ApiOutlined, EyeOutlined, BellOutlined, SettingOutli
 import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { DevicesPage } from "./pages/DevicesPage";
 import { DeviceWorkspacePage } from "./workspace/DeviceWorkspacePage";
-import { LegacyEndpointRedirect } from "./workspace/LegacyEndpointRedirect";
 import { AddDeviceFlow } from "./addDevice/AddDeviceFlow";
 import { GlobalDataPage } from "./pages/GlobalDataPage";
 import { GlobalEventsPage } from "./pages/GlobalEventsPage";
+import { NotFoundPage } from "./pages/NotFoundPage";
 import { OverviewPage } from "./overview/OverviewPage";
 import { SystemPage } from "./system/SystemPage";
 
@@ -56,20 +56,18 @@ export default function App() {
         </Header>
         <Content style={{ margin: 16 }}>
           <Routes>
-            {/* M5.6 V2 路由（旧页面已删除）。外部旧书签仅保留 endpoint 深链重定向。 */}
+            {/* 扁平设备详情：Device = 唯一 Workspace，六个一级 Tab。
+                config/legacy/endpoints 旧路由已删除，旧 URL 诚实 404。 */}
             <Route path="/" element={<Navigate to="/overview" replace />} />
             <Route path="/overview" element={<OverviewPage />} />
             <Route path="/devices" element={<DevicesPage />} />
             <Route path="/devices/new" element={<AddDeviceFlow />} />
             <Route path="/devices/:deviceId/:tab" element={<DeviceWorkspacePage />} />
             <Route path="/devices/:deviceId" element={<Navigate to="overview" replace />} />
-            {/* R1.4：已删除的旧设备详情入口显式回收（否则被 :tab 吞掉进 Workspace）。 */}
-            <Route path="/devices/:deviceId/legacy" element={<Navigate to="/overview" replace />} />
-            <Route path="/devices/:deviceId/endpoints/:endpointId" element={<LegacyEndpointRedirect />} />
             <Route path="/data" element={<GlobalDataPage />} />
             <Route path="/events" element={<GlobalEventsPage />} />
             <Route path="/system" element={<SystemPage />} />
-            <Route path="*" element={<Navigate to="/overview" replace />} />
+            <Route path="*" element={<NotFoundPage />} />
           </Routes>
         </Content>
       </Layout>

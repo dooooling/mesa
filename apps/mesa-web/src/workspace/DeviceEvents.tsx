@@ -1,11 +1,11 @@
 // M3.3 DeviceEvents：设备 Workspace「事件」tab。
 // - Device = 当前设备自动限定（用户不选设备，只选连接/状态/时间等）；
-// - 连接复用 M1 的 ?connection= 上下文：ALL 即全部连接，单选即该连接
-//   （query.endpointIds 由 Workspace 传入，不在本组件另起 state）；
+// - 连接筛选本页局部管理（useConnectionQuery allowAll + ConnectionSelect）；
 // - 表格/Drawer 共用（EventTable/EventDetailDrawer），endpoint 列保留
 //   （多连接设备需要区分来源），不加设备列（已在设备内）。
 // - M3.5：过滤栏升级为 EventFilterBar（常用 Active/时间 + 高级精确匹配，
 //   文本 400ms debounce），与全局页同一组件。
+// - 只读事件：订阅编辑在「采集」页，不在本页。
 import { useEffect, useMemo, useState } from "react";
 import { Alert, Button, Space, Tag } from "antd";
 import type { StoredEvent } from "../types";
@@ -14,17 +14,18 @@ import { useDeviceEventFeed } from "../events/useDeviceEventFeed";
 import { EventFilterBar } from "../components/EventFilterBar";
 import { EventTable } from "../components/EventTable";
 import { EventDetailDrawer } from "../components/EventDetailDrawer";
+import { ConnectionSelect } from "./ConnectionSelect";
+import { useConnectionQuery } from "./useConnectionQuery";
+import type { WorkspaceEndpoint } from "./useDeviceWorkspaceData";
 
 export function DeviceEvents(props: {
   /** scope 唯一身份（Drawer 清空用它，不用展示名——同名设备并存时名称不变）。 */
   deviceId: string;
   deviceName: string;
-  endpointIds: string[];
-  endpointNames: Map<string, string>;
-  /** M1 解析后的有效连接（null = 全部）。 */
-  effectiveEndpointId: string | null;
+  endpoints: WorkspaceEndpoint[];
+  endpointsReady: boolean;
 }) {
-  const { deviceId, deviceName, endpointIds, endpointNames, effectiveEndpointId } = props;
+  const { deviceId, deviceName, endpoints, endpointsReady } = props;
   const [rest, setRest] = useState<EventFilterForm>(EMPTY_EVENT_FILTER_FORM);
   const [selected, setSelected] = useState<StoredEvent | null>(null);
 
@@ -35,6 +36,13 @@ export function DeviceEvents(props: {
     setSelected(null);
   }, [deviceId]);
 
+  // 本页连接筛选（全部/单连接），URL 局部 ?connection=，不跨 Tab 同步。
+  const endpointIds = useMemo(() => endpoints.map((e) => e.id), [endpoints]);
+  const { selected: effectiveEndpointId, select: onSelectConnection } = useConnectionQuery({
+    endpointIds,
+    mode: "all",
+    ready: endpointsReady,
+  });
   const scopedEndpointIds = useMemo(
     () => (effectiveEndpointId ? [effectiveEndpointId] : endpointIds),
     [effectiveEndpointId, endpointIds],
@@ -49,7 +57,6 @@ export function DeviceEvents(props: {
     return <Tag>{feed.streamStatus.toUpperCase()}</Tag>;
   }, [feed.liveOn, feed.streamStatus]);
 
-  void endpointNames;
   void deviceName;
 
   return (
@@ -62,6 +69,9 @@ export function DeviceEvents(props: {
         <Button size="small" onClick={() => feed.reload()}>
           刷新
         </Button>
+        <span style={{ marginLeft: "auto" }}>
+          <ConnectionSelect endpoints={endpoints} value={effectiveEndpointId} allowAll onChange={onSelectConnection} />
+        </span>
       </div>
 
       {feed.unavailable ? (
