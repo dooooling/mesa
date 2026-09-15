@@ -305,13 +305,22 @@ impl SchemaDescriptor {
             // Secret 只有 JSON string 一种合法形态（SecretStore 的脱敏/持久化
             // 表示 {"secret_set": true} 由 core-api 在调用前 materialize，
             // 不得进 Contract 层）。
+            // R1.3：Secret 字段的值永不进错误消息（明文密码不得经 issues →
+            // 前端 message.error 展示）；统一显示 [redacted]。
+            let show = |v: &serde_json::Value| -> String {
+                if field.field_type == FieldType::Secret {
+                    "[redacted]".to_string()
+                } else {
+                    v.to_string()
+                }
+            };
             if !field_type_matches(field.field_type, val) {
                 issues.push(ValidationIssue {
                     path,
                     code: "INVALID_TYPE".into(),
                     message: format!(
                         "field `{}` expected {:?}, got {}",
-                        field.key, field.field_type, val
+                        field.key, field.field_type, show(val)
                     ),
                 });
                 continue;
@@ -323,7 +332,11 @@ impl SchemaDescriptor {
                 issues.push(ValidationIssue {
                     path: path.clone(),
                     code: "INVALID_ENUM".into(),
-                    message: format!("field `{}` value `{s}` not in {opts:?}", field.key),
+                    message: if field.field_type == FieldType::Secret {
+                        format!("field `{}` value not in enum options", field.key)
+                    } else {
+                        format!("field `{}` value `{s}` not in {opts:?}", field.key)
+                    },
                 });
             }
             if let Some(num) = val.as_f64() {
@@ -371,7 +384,11 @@ impl SchemaDescriptor {
                             issues.push(ValidationIssue {
                                 path: path.clone(),
                                 code: "PATTERN_MISMATCH".into(),
-                                message: format!("field `{}` value `{s}` 不匹配 {pat}", field.key),
+                                message: if field.field_type == FieldType::Secret {
+                                    format!("field `{}` value 不匹配 {pat}", field.key)
+                                } else {
+                                    format!("field `{}` value `{s}` 不匹配 {pat}", field.key)
+                                },
                             });
                         }
                     }
