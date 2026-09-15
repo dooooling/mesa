@@ -1,22 +1,19 @@
-// M3.3 设备事件源（方案 A）：同一设备下每 endpoint 独立历史分页，客户端
-// 按 seq merge。禁止“全局第一页再前端过滤”（分页错误：它设备事件会把本
-// 设备历史挤出第一页）。
-// - 每路独立 next_cursor：加载更早时各路按自己游标取一页再 merge；
-// - SSE 单连（服务端 live 无过滤参数）：onLive 按 endpoint 集合 + 其余过滤
-//   客户端判定归属后再合入；切换 device/filter 时旧上下文事件绝不混入
-//   （formRef 代际 + endpoint 集合校验）；
-// - 高水位 H 复用全局 eventHead（SSE replay 以全局 H 建连，历史按各路取）。
+// M5.4 设备事件源（服务端过滤版）：M5.3 后端 `endpoint_ids` 一次查询
+// 代替 M3.3 的 per-endpoint merge（N+1）。SSE live 仍是单连接无服务端
+// 过滤参数，onLive 按 endpoint 集合客户端判定归属后再合入；切换
+// device/filter 时旧上下文事件绝不混入（代际 + 集合校验）。
+// 高水位 H 复用全局 eventHead（SSE replay 以全局 H 建连）。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, isEventStoreUnavailable } from "../api";
 import type { StoredEvent } from "../types";
 import { EVENT_FIRST_PAGE_LIMIT, toEventFilter, type EventFilterForm } from "./filters";
 import { mergeEvents } from "./model";
 import { useEventStream } from "./useEventStream";
-import { matchesLiveFilter } from "../pages/EventsView";
+import { matchesLiveFilter } from "./liveFilter";
 
 export interface DeviceEventFeed {
   history: StoredEvent[];
-  /** 还有任一路可继续向前的游标时为 true（任一路 next_cursor 非 null 即可继续）。 */
+  /** 服务端还有更早页（next_cursor 非 null）时为 true。 */
   hasMore: boolean;
   booted: boolean;
   loading: boolean;
@@ -43,7 +40,7 @@ export interface DeviceEventQuery {
  */
 export function useDeviceEventFeed(query: DeviceEventQuery): DeviceEventFeed {
   const [history, setHistory] = useState<StoredEvent[]>([]);
-  const [cursors, setCursors] = useState<Record<string, number | null>>({});
+  const [cursor, setCursor] = useState<number | null>(null);
   const [highWater, setHighWater] = useState<number>(0);
   const [booted, setBooted] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -70,13 +67,29 @@ export function useDeviceEventFeed(query: DeviceEventQuery): DeviceEventFeed {
     return live;
   };
 
+  /** 单次服务端查询（endpoint_ids CSV；空集合直接空页，不发请求）。 */
+  const fetchPage = useCallback(
+    async (q: DeviceEventQuery, beforeSeq?: number | null) => {
+      const ids = [...q.endpointIds].sort().join(",");
+      // 空集合直接空页：绝不能把空字符串发给后端（toQuery 会丢弃空值，
+      // 后端收不到参数即全表查询—— fail-open 事故）。
+      if (!ids) return { events: [], next_cursor: null as number | null };
+      return api.listEvents({
+        ...toEventFilter({ ...q.filter }, { limit: EVENT_FIRST_PAGE_LIMIT }),
+        endpoint_ids: ids,
+        ...(beforeSeq !== undefined && beforeSeq !== null ? { before_seq: beforeSeq } : {}),
+      });
+    },
+    [],
+  );
+
   const boot = useCallback(() => {
     const id = ++gen.current;
     const q = queryRef.current;
     setLoading(true);
     setError(null);
     setHistory([]);
-    setCursors({});
+    setCursor(null);
     (async () => {
       try {
         const h = await api.eventHead();
@@ -90,25 +103,12 @@ export function useDeviceEventFeed(query: DeviceEventQuery): DeviceEventFeed {
           setBooted(true);
           return;
         }
-        const pages = await Promise.all(
-          q.endpointIds.map(async (endpointId) => {
-            const page = await api.listEvents(
-              toEventFilter({ ...q.filter, endpoint_id: endpointId }, { limit: EVENT_FIRST_PAGE_LIMIT }),
-            );
-            return { endpointId, page };
-          }),
-        );
+        const page = await fetchPage(q);
         if (gen.current !== id) return;
         const live = drainPendingLive(q);
-        let merged: StoredEvent[] = [];
-        const next: Record<string, number | null> = {};
-        for (const { endpointId, page } of pages) {
-          merged = mergeEvents(merged, [...page.events].sort((a, b) => b.seq - a.seq));
-          next[endpointId] = page.next_cursor;
-        }
-        merged = mergeEvents(merged, live);
+        const merged = mergeEvents([...page.events].sort((a, b) => b.seq - a.seq), live);
         setHistory(merged);
-        setCursors(next);
+        setCursor(page.next_cursor);
         setHighWater(h);
         setLoading(false);
         setBooted(true);
@@ -120,7 +120,8 @@ export function useDeviceEventFeed(query: DeviceEventQuery): DeviceEventFeed {
         setBooted(true);
       }
     })();
-  }, [matchesQuery]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fetchPage, matchesQuery]);
 
   // 首屏 + query 变化（device/连接/过滤）即新一代重查。
   useEffect(() => {
@@ -135,47 +136,19 @@ export function useDeviceEventFeed(query: DeviceEventQuery): DeviceEventFeed {
     if (loadingMore) return;
     const q = queryRef.current;
     const id = gen.current;
-    // 还有游标的路才继续；全部 null 即没有更多。
-    const active = q.endpointIds.filter((ep) => (cursors[ep] ?? null) !== null && cursors[ep] !== undefined);
-    // cursors 缺 key（首屏失败/无连接）时不发请求。
-    const known = q.endpointIds.filter((ep) => ep in cursors);
-    if (known.length === 0 || active.length === 0) return;
+    if (cursor === null || cursor === undefined) return;
     setLoadingMore(true);
-    Promise.all(
-      active.map(async (endpointId) => {
-        const page = await api.listEvents(
-          toEventFilter(
-            { ...q.filter, endpoint_id: endpointId },
-            { before_seq: cursors[endpointId] as number, limit: EVENT_FIRST_PAGE_LIMIT },
-          ),
-        );
-        return { endpointId, page };
-      }),
-    )
-      .then((pages) => {
+    fetchPage(q, cursor)
+      .then((page) => {
         if (id !== gen.current) {
           setLoadingMore(false);
           return;
         }
-        // 合入时再按当前 query 过一遍：期间 query 若变（代际已变直接丢弃，
-        // 此处代际一致只防 endpoint 集合收缩导致的归属外行）。
+        // 合入时再按当前 query 过一遍：防期间 endpoint 集合收缩导致的归属外行。
         const cur = queryRef.current;
-        let merged: StoredEvent[] | null = null;
-        setHistory((prev) => {
-          let next = prev;
-          for (const { page } of pages) {
-            const rows = page.events.filter((ev) => matchesQuery(ev, cur));
-            next = mergeEvents(next, rows);
-          }
-          merged = next;
-          return next;
-        });
-        void merged;
-        setCursors((prev) => {
-          const next = { ...prev };
-          for (const { endpointId, page } of pages) next[endpointId] = page.next_cursor;
-          return next;
-        });
+        const rows = page.events.filter((ev) => matchesQuery(ev, cur));
+        setHistory((prev) => mergeEvents(prev, rows));
+        setCursor(page.next_cursor);
         setLoadingMore(false);
       })
       .catch((e) => {
@@ -184,7 +157,7 @@ export function useDeviceEventFeed(query: DeviceEventQuery): DeviceEventFeed {
         else setError(e instanceof Error ? e.message : String(e));
         setLoadingMore(false);
       });
-  }, [cursors, loadingMore, matchesQuery]);
+  }, [cursor, loadingMore, fetchPage, matchesQuery]);
 
   const onLive = useCallback(
     (ev: StoredEvent) => {
@@ -200,10 +173,7 @@ export function useDeviceEventFeed(query: DeviceEventQuery): DeviceEventFeed {
 
   const stream = useEventStream({ afterSeq: highWater, enabled: booted && liveOn && !unavailable, onEvent: onLive });
 
-  const hasMore = useMemo(
-    () => Object.values(cursors).some((c) => c !== null && c !== undefined),
-    [cursors],
-  );
+  const hasMore = useMemo(() => cursor !== null && cursor !== undefined, [cursor]);
 
   return useMemo(
     () => ({

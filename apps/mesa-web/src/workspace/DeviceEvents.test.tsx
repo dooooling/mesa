@@ -1,5 +1,5 @@
-// M3.3 回归：设备事件（方案 A）。
-// - 多 endpoint 分查 + seq merge（B 的历史不被 A 挤掉——分页错误反例）；
+// M5.4 回归：设备事件（服务端 endpoint_ids 过滤，单查询）。
+// - endpoint_ids CSV 一次返回多路（B 的历史不被 A 挤掉——分页错误反例）；
 // - ?connection= 限定单连接；无参默认全部；
 // - live 行按 endpoint 集合归属合入，它设备事件不混入；
 // - device 切换时代际丢弃旧响应。
@@ -55,14 +55,22 @@ function mockDeviceEvents(opts: {
     }
     if (url.startsWith("/api/v1/events?") || url.startsWith("/api/v1/events&")) {
       const u = new URL(url, "http://localhost");
-      const ep = u.searchParams.get("endpoint_id") ?? "";
       const before = u.searchParams.get("before_seq");
       const table = before ? (opts.older ?? {}) : opts.pages;
-      const p = table[ep] ?? { events: [], next: null };
+      // M5.4：服务端过滤形态——endpoint_ids CSV 取并集（保持 seq DESC）；
+      // 旧 endpoint_id 单值保留兼容（全局页仍用单值）。
+      const csv = u.searchParams.get("endpoint_ids");
+      const ep = u.searchParams.get("endpoint_id") ?? "";
+      const wanted = csv ? csv.split(",").map((s) => s.trim()).filter(Boolean) : [ep];
+      const merged = wanted.flatMap((id) => (table[id] ?? { events: [] }).events);
+      merged.sort((a, b) => b.seq - a.seq);
+      // next_cursor：任一路还有游标即继续（取最小非 null 游标简化模拟）。
+      const nexts = wanted.map((id) => table[id]?.next ?? null).filter((n) => n !== null) as number[];
+      const next = nexts.length ? Math.min(...nexts) : null;
       return {
         ok: true,
         status: 200,
-        json: async () => ({ events: p.events, next_cursor: p.next }),
+        json: async () => ({ events: merged, next_cursor: next }),
       };
     }
     return { ok: false, status: 404, json: async () => ({}) };
@@ -127,7 +135,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("M3.3 设备事件", () => {
+describe("M5.4 设备事件", () => {
   it("多路合并：B 的历史不被 A 挤掉（分页错误反例）", async () => {
     mockDeviceEvents({
       endpoints: [

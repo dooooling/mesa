@@ -7,7 +7,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Button, Col, Collapse, Input, InputNumber, Row, Select, Space } from "antd";
 import type { ActiveFilter, EventFilterForm } from "../events/filters";
-import { localInputToNs, nsToLocalInput } from "./EventFilters";
+import { localInputToNs, nsToLocalInput } from "../events/filters";
 
 const TEXT_DEBOUNCE_MS = 400;
 

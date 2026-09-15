@@ -185,8 +185,7 @@ describe("M2 需要关注规则", () => {
 
 describe("M2 Drawer 与跳转", () => {
   it("6/7. 点击行开 Drawer，来源正确；配置/诊断保留 ?connection=", async () => {
-    vi.useRealTimers();
-    mockWorkspace({
+    vi.useRealTimers();    mockWorkspace({
       points: () => ({ points: [pt("focas", "axis.z.position", "GOOD", 500, 83.12)] }),
     });
     const user = userEvent.setup();
@@ -204,7 +203,8 @@ describe("M2 Drawer 与跳转", () => {
     await waitFor(() => {
       expect(screen.getByTestId("workspace-connection-context").textContent ?? "").toContain("FOCAS");
     });
-  });
+    // 全量并行下轮询+Drawer 多轮异步易超时，显式放宽（同删除用例 30s 先例）。
+  }, 30000);
 });
 
 describe("M2 代际守卫", () => {

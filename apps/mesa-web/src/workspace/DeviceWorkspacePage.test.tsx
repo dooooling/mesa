@@ -132,10 +132,9 @@ describe("M1 路由与兼容重定向", () => {
         <App />
       </MemoryRouter>,
     );
-    // “总览”在侧栏/标题/卡片三处重名，锚定页面卡片标题断言重定向成功
-    await waitFor(() => {
-      expect(document.querySelector(".ant-card-head-title")?.textContent ?? "").toContain("总览");
-    });
+    // 重定向成功：OverviewPage 内容出现（系统运行/需要关注卡片；标题含计数故用正则）。
+    await screen.findByText(/需要关注/);
+    expect(screen.getByText("系统运行")).toBeTruthy();
     for (const label of ["总览", "设备", "实时数据", "事件", "系统"]) {
       expect(screen.getAllByText(label).length).toBeGreaterThanOrEqual(1);
     }

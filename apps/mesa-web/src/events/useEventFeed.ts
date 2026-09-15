@@ -10,7 +10,7 @@ import type { EventStats, StoredEvent } from "../types";
 import { EVENT_FIRST_PAGE_LIMIT, toEventFilter, type EventFilterForm } from "./filters";
 import { mergeEvents } from "./model";
 import { useEventStream } from "./useEventStream";
-import { matchesLiveFilter } from "../pages/EventsView";
+import { matchesLiveFilter } from "./liveFilter";
 
 export interface EventFeed {
   history: StoredEvent[];

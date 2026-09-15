@@ -124,30 +124,26 @@ export function AddDeviceFlow() {
     setSubmitting(true);
     setReport(null);
     try {
+      // M5.5：一次原子提交（后端单事务 + 幂等；前端不再分步编排/补偿）。
       const r = await bootstrapDevice(
         {
-          createDevice: (b) => api.createDevice(b),
-          createEndpoint: (b) => api.createEndpoint(b),
-          putTasks: async (endpointId, tasks) => {
-            const res = await fetch(`/api/v1/tasks/${endpointId}`, {
-              method: "PUT",
+          deviceBootstrap: async (b) => {
+            const res = await fetch("/api/v1/device-bootstrap", {
+              method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({ tasks }),
+              body: JSON.stringify(b),
             });
             const body = await res.json().catch(() => ({}));
             return { status: res.status, body };
           },
-          startEndpoint: (id) => api.startEndpoint(id),
-          deleteEndpoint: (id) => api.deleteEndpoint(id),
-          deleteDevice: (id) => api.deleteDevice(id),
         },
         { device, connection, acquisition },
       );
       setReport(r);
       if (r.ok) {
-        message.success(`已添加设备 ${r.deviceId}`);
+        message.success(r.replayed ? `设备 ${r.deviceId} 已存在（幂等重放，未重复创建）` : `已添加设备 ${r.deviceId}`);
       } else if (r.residual) {
-        message.error("创建失败且自动回滚未完全成功，可能存在残留设备/连接，请到设备列表检查");
+        message.error("创建失败，可能存在残留设备/连接，请到设备列表检查");
       } else {
         message.error(`${r.failedMessage ?? "创建失败"}（已自动回滚）`);
       }
@@ -302,11 +298,11 @@ export function AddDeviceFlow() {
               type={report.residual ? "error" : "warning"}
               showIcon
               style={{ marginBottom: 12 }}
-              message={report.residual ? "创建失败，且自动回滚未完全成功" : "创建失败，已自动回滚"}
+              message={report.residual ? "创建失败，可能存在残留" : "创建失败，已自动回滚"}
               description={[
                 `失败步骤：${report.failedStep}（${report.failedMessage ?? ""}）`,
-                ...report.compensated.map((c) => `回滚 ${c.action}：${c.ok ? "成功" : `失败（${c.message ?? ""}）`}`),
-                report.residual ? "可能存在残留设备/连接，请到设备列表检查。" : null,
+                report.compensated ? "后端已补偿删除未启动的设备/连接。" : null,
+                report.residual ? "请到设备列表检查。" : null,
               ].filter(Boolean).join("；")}
             />
           )}
