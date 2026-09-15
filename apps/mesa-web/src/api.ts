@@ -32,6 +32,8 @@ function toQuery(filter: EventFilter): string {
     p.set(k, String(v));
   };
   put("endpoint_id", filter.endpoint_id);
+  put("endpoint_ids", filter.endpoint_ids);
+  put("device_id", filter.device_id);
   put("category", filter.category);
   put("kind", filter.kind);
   put("severity_min", filter.severity_min);

@@ -18,5 +18,10 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
+    // M7：重交互测试（user.click + 轮询 + SSE mock）在高并发 worker 下时序
+    // flaky；threads 池 2 并发是稳定与速度的折中（全量约 1 分钟）。
+    poolOptions: {
+      threads: { minThreads: 1, maxThreads: 2 },
+    },
   },
 });

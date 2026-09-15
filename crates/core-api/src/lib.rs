@@ -20,6 +20,7 @@ use mesa_event_store::{EventFilter, EventServices, StoredEvent};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+pub mod bootstrap;
 pub mod certificates;
 use certificates::CertStore;
 
@@ -1169,24 +1170,35 @@ async fn list_endpoints(State(state): State<Arc<AppState>>) -> Json<serde_json::
         .into_iter()
         .map(|s| (s.endpoint_id.clone(), s))
         .collect();
+    // R4：descriptor 按 driver 缓存（同 driver 只拉一次；500 endpoints 同
+    // driver 时 N+1 await 是 541ms 的主因）。失败缓存 None（保守置空 connection）。
+    let mut desc_cache: HashMap<String, Option<Vec<String>>> = HashMap::new();
     let mut merged: Vec<serde_json::Value> = Vec::with_capacity(stored.len());
     for rec in stored {
         let runtime = live.get(&rec.id).cloned();
         let mut conn: serde_json::Value =
             serde_json::from_str(&rec.connection_json).unwrap_or(serde_json::json!({}));
         // 脱敏：同 get_endpoint，保持列表与详情一致（避免历史明文泄露）
-        match state.manager.get_descriptor(&rec.driver_id).await {
-            Ok(desc) => {
-                let secret_keys = secret_field_keys(&desc.connection);
-                if !secret_keys.is_empty() {
-                    conn =
-                        redact_connection_for_response(conn, &rec.id, &state.store, &secret_keys);
-                }
+        let secret_keys = match desc_cache.get(&rec.driver_id) {
+            Some(cached) => cached.clone(),
+            None => {
+                let keys = match state.manager.get_descriptor(&rec.driver_id).await {
+                    Ok(desc) => Some(secret_field_keys(&desc.connection)),
+                    Err(_) => None,
+                };
+                desc_cache.insert(rec.driver_id.clone(), keys.clone());
+                keys
             }
-            Err(_) => {
+        };
+        match secret_keys {
+            Some(keys) if !keys.is_empty() => {
+                conn = redact_connection_for_response(conn, &rec.id, &state.store, &keys);
+            }
+            None => {
                 // 保守策略：Descriptor 不可用则直接不返回 connection
                 conn = serde_json::Value::Null;
             }
+            _ => {}
         }
         merged.push(serde_json::json!({
             "id": rec.id,
@@ -1983,6 +1995,10 @@ fn stored_event_json(
 #[derive(Debug, Deserialize)]
 struct EventsQuery {
     endpoint_id: Option<String>,
+    /// 多 endpoint 过滤（CSV，如 `?endpoint_ids=a,b`；与单值同时给出取交集）。
+    endpoint_ids: Option<String>,
+    /// 按设备过滤：API 层映射为该设备下全部 endpoint id（事件表不动）。
+    device_id: Option<String>,
     category: Option<String>,
     kind: Option<String>,
     severity_min: Option<u16>,
@@ -2003,8 +2019,61 @@ async fn list_events(
     let Some(svc) = state.event_services() else {
         return events_unavailable();
     };
+    // M5 endpoint 范围过滤：CSV 解析 + device_id 映射 + 单值交集合并。
+    // device 下无 endpoint 时直接空结果（不查 DB，避免全表扫描后客户端过滤）。
+    let mut ids: Vec<String> = q
+        .endpoint_ids
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if let Some(dev) = &q.device_id {
+        match state.store.list_endpoints() {
+            Ok(eps) => {
+                let dev_ids: Vec<String> = eps
+                    .into_iter()
+                    .filter(|e| &e.device_id == dev)
+                    .map(|e| e.id)
+                    .collect();
+                if dev_ids.is_empty() {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "events": [], "next_cursor": null })),
+                    );
+                }
+                if ids.is_empty() {
+                    ids = dev_ids;
+                } else {
+                    ids.retain(|id| dev_ids.contains(id));
+                }
+            }
+            Err(e) => return store_err_to_response(e),
+        }
+    }
+    if let Some(single) = &q.endpoint_id {
+        if ids.is_empty() {
+            ids.push(single.clone());
+        } else if !ids.contains(single) {
+            // 单值与多值无交集：明确空结果
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({ "events": [], "next_cursor": null })),
+            );
+        } else {
+            ids = vec![single.clone()];
+        }
+    }
+    let endpoint_ids =
+        if q.endpoint_ids.is_some() || q.device_id.is_some() || q.endpoint_id.is_some() {
+            Some(ids)
+        } else {
+            None
+        };
     let filter = EventFilter {
-        endpoint_id: q.endpoint_id,
+        endpoint_id: None,
+        endpoint_ids,
         category: q.category,
         kind: q.kind,
         severity_min: q.severity_min,
@@ -2024,6 +2093,10 @@ async fn list_events(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json_error("INTERNAL", &format!("query task failed: {e}"))),
+        ),
+        Ok(Err(mesa_event_store::EventStoreError::InvalidRecord(m))) => (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("VALIDATION_ERROR", &m)),
         ),
         Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2686,6 +2759,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/devices/{id}",
             get(get_device).put(update_device).delete(delete_device),
+        )
+        // M5 device-bootstrap（原子创建 Device + Endpoint + Tasks + Start，幂等）
+        .route(
+            "/api/v1/device-bootstrap",
+            post(bootstrap::device_bootstrap),
         )
         // 启停
         .route("/api/v1/endpoints/{id}/start", post(start_endpoint))

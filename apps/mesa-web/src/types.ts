@@ -167,6 +167,10 @@ export interface ListEventsResponse {
 
 export interface EventFilter {
   endpoint_id?: string;
+  /** M5.3 多 endpoint 过滤（CSV 传输，如 "a,b"；与单值同时给出取交集）。 */
+  endpoint_ids?: string;
+  /** M5.3 按设备过滤（后端映射为 endpoint 集合，事件表不动）。 */
+  device_id?: string;
   category?: string;
   kind?: string;
   severity_min?: number;

@@ -1,34 +1,39 @@
 import { Layout, Menu, theme } from "antd";
-import { DashboardOutlined, ApiOutlined, EyeOutlined, BellOutlined } from "@ant-design/icons";
-import { Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { Dashboard } from "./pages/Dashboard";
+import { DashboardOutlined, ApiOutlined, EyeOutlined, BellOutlined, SettingOutlined } from "@ant-design/icons";
+import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { DevicesPage } from "./pages/DevicesPage";
-import { DeviceDetailPage } from "./pages/DeviceDetailPage";
-import { EndpointWorkspacePage } from "./pages/EndpointWorkspacePage";
-import { OnboardingPage } from "./pages/OnboardingPage";
-import { MonitorView } from "./pages/MonitorView";
-import { EventsView } from "./pages/EventsView";
+import { DeviceWorkspacePage } from "./workspace/DeviceWorkspacePage";
+import { LegacyEndpointRedirect } from "./workspace/LegacyEndpointRedirect";
+import { AddDeviceFlow } from "./addDevice/AddDeviceFlow";
+import { GlobalDataPage } from "./pages/GlobalDataPage";
+import { GlobalEventsPage } from "./pages/GlobalEventsPage";
+import { OverviewPage } from "./overview/OverviewPage";
+import { SystemPage } from "./system/SystemPage";
 
 const { Header, Sider, Content } = Layout;
 
-// 导航以 Device 为管理入口：一级菜单只表达“管理什么”（domain），
-// 不表达“执行什么动作”。创建行为收进设备上下文（DevicesPage 的
-// “新建设备”/“新建向导”）；/onboarding 只是 workflow route，不占菜单。
-// Endpoint 是采集运行实体，只在设备详情内管理，不再有顶层入口。
+// M5.6 V2 导航（旧页面已删除）：总览 / 设备 / 实时数据 / 事件 / 系统。
+// Device 是唯一一级主体，Connection 退化为 Device Workspace 内的上下文
+//（`?connection=`），不再有导航层。外部旧书签仅保留 endpoint 深链重定向。
 const items = [
-  { key: "/", icon: <DashboardOutlined />, label: "看板" },
+  { key: "/overview", icon: <DashboardOutlined />, label: "总览" },
   { key: "/devices", icon: <ApiOutlined />, label: "设备" },
-  { key: "/monitor", icon: <EyeOutlined />, label: "监控" },
+  { key: "/data", icon: <EyeOutlined />, label: "实时数据" },
   { key: "/events", icon: <BellOutlined />, label: "事件" },
+  { key: "/system", icon: <SettingOutlined />, label: "系统" },
 ];
 
 export default function App() {
   const loc = useLocation();
   const nav = useNavigate();
   const { token } = theme.useToken();
-  // Endpoint Workspace 严格嵌套在 Device 下（无顶层入口），高亮仍归属 /devices
-  const selected = (loc.pathname === "/onboarding" || loc.pathname.startsWith("/devices/")) ? "/devices"
-    : (items.find((i) => i.key !== "/" && loc.pathname.startsWith(i.key))?.key ?? "/");
+  // 高亮归属：Workspace 严格嵌套在 Device 下（无顶层入口），高亮仍归属 /devices；
+  // 根路径与未知路径回总览。
+  const selected = loc.pathname === "/"
+    ? "/overview"
+    : (items.find((i) => i.key !== "/overview" && loc.pathname.startsWith(i.key))?.key
+      ?? (loc.pathname.startsWith("/devices/") ? "/devices" : "/overview"));
+  const headerLabel = items.find((i) => i.key === selected)?.label ?? "Mesa";
 
   return (
     <Layout style={{ minHeight: "100vh", background: token.colorBgLayout }}>
@@ -47,17 +52,24 @@ export default function App() {
       </Sider>
       <Layout style={{ background: token.colorBgLayout }}>
         <Header style={{ padding: "0 16px", background: "#ffffff", borderBottom: "1px solid #e0e0e0", display: "flex", alignItems: "center" }}>
-          <span style={{ fontWeight: 400, fontSize: 16 }}>{items.find((i) => i.key === selected)?.label ?? "Mesa"}</span>
+          <span style={{ fontWeight: 400, fontSize: 16 }}>{headerLabel}</span>
         </Header>
         <Content style={{ margin: 16 }}>
           <Routes>
-            <Route path="/" element={<Dashboard />} />
+            {/* M5.6 V2 路由（旧页面已删除）。外部旧书签仅保留 endpoint 深链重定向。 */}
+            <Route path="/" element={<Navigate to="/overview" replace />} />
+            <Route path="/overview" element={<OverviewPage />} />
             <Route path="/devices" element={<DevicesPage />} />
-            <Route path="/devices/:id" element={<DeviceDetailPage />} />
-            <Route path="/devices/:deviceId/endpoints/:endpointId" element={<EndpointWorkspacePage />} />
-            <Route path="/onboarding" element={<OnboardingPage />} />
-            <Route path="/monitor" element={<MonitorView />} />
-            <Route path="/events" element={<EventsView />} />
+            <Route path="/devices/new" element={<AddDeviceFlow />} />
+            <Route path="/devices/:deviceId/:tab" element={<DeviceWorkspacePage />} />
+            <Route path="/devices/:deviceId" element={<Navigate to="overview" replace />} />
+            {/* R1.4：已删除的旧设备详情入口显式回收（否则被 :tab 吞掉进 Workspace）。 */}
+            <Route path="/devices/:deviceId/legacy" element={<Navigate to="/overview" replace />} />
+            <Route path="/devices/:deviceId/endpoints/:endpointId" element={<LegacyEndpointRedirect />} />
+            <Route path="/data" element={<GlobalDataPage />} />
+            <Route path="/events" element={<GlobalEventsPage />} />
+            <Route path="/system" element={<SystemPage />} />
+            <Route path="*" element={<Navigate to="/overview" replace />} />
           </Routes>
         </Content>
       </Layout>

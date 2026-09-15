@@ -656,4 +656,65 @@ mod tests {
             serde_json::json!("DateTimeArray")
         );
     }
+
+    /// R1.3 回归：Secret 字段的值永不明文进入校验错误消息（明文密码不得
+    /// 经 issues → 前端展示）。非 Secret 字段保持原详尽消息（可排障）。
+    #[test]
+    fn secret_values_never_appear_in_validation_messages() {
+        use crate::schema::{FieldDescriptor, FieldType, FieldValidation, SchemaDescriptor};
+        let secret_field = FieldDescriptor {
+            key: "password".into(),
+            label: "Password".into(),
+            description: None,
+            field_type: FieldType::Secret,
+            required: false,
+            default: None,
+            validation: FieldValidation {
+                enum_options: Some(vec!["a".into(), "b".into()]),
+                pattern: Some("^x".into()),
+                ..Default::default()
+            },
+            ui: Default::default(),
+        };
+        let plain_field = FieldDescriptor {
+            key: "mode".into(),
+            label: "Mode".into(),
+            description: None,
+            field_type: FieldType::String,
+            required: false,
+            default: None,
+            validation: FieldValidation {
+                enum_options: Some(vec!["a".into(), "b".into()]),
+                ..Default::default()
+            },
+            ui: Default::default(),
+        };
+        let schema = SchemaDescriptor {
+            fields: vec![secret_field, plain_field],
+        };
+        // 明文密码触发 ENUM + PATTERN 两类错误：消息里不得出现密码
+        let issues = schema.validate_instance(
+            "connection",
+            &serde_json::json!({"password": "hunter2-secret", "mode": "zzz"}),
+        );
+        assert!(!issues.is_empty());
+        for i in &issues {
+            assert!(
+                !i.message.contains("hunter2-secret"),
+                "secret 明文泄漏进 issues: {i:?}"
+            );
+        }
+        // 非 secret 字段仍给详尽值（排障可用）
+        let mode_issue = issues.iter().find(|i| i.path.contains("mode")).unwrap();
+        assert!(mode_issue.message.contains("zzz"));
+        // secret 类型错误（非 string）同样脱敏
+        let type_issues =
+            schema.validate_instance("connection", &serde_json::json!({"password": 12345}));
+        let pw = type_issues
+            .iter()
+            .find(|i| i.path.contains("password"))
+            .unwrap();
+        assert!(!pw.message.contains("12345"));
+        assert!(pw.message.contains("[redacted]"));
+    }
 }

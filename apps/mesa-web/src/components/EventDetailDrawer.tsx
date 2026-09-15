@@ -3,9 +3,10 @@ import { Descriptions, Drawer, Table, Tag } from "antd";
 import type { StoredEvent } from "../types";
 import { formatMesaValue, formatNsTime, formatSeverity } from "../events/format";
 
-export function EventDetailDrawer({ event, onClose }: { event: StoredEvent | null; onClose: () => void }) {
+export function EventDetailDrawer({ event, onClose, extra }: { event: StoredEvent | null; onClose: () => void; extra?: React.ReactNode }) {
   return (
     <Drawer title={event ? `Event #${event.seq}` : "Event"} open={!!event} onClose={onClose} width={560}>
+      {extra ? <div style={{ marginBottom: 12 }}>{extra}</div> : null}
       {!event ? null : (
         <div style={{ display: "grid", gap: 16 }}>
           <section>

@@ -1,9 +1,13 @@
-// Device detail（P1-4 瘦身后）：只负责 Device 身份（改名/删除）与连接列表
-//（新增/启停/删除）+ 进入 Endpoint Workspace。连接的编辑/采集/事件/诊断
-// 已全部收敛到 EndpointWorkspacePage 的五个 tab，不再堆 Modal。
+// M6 DeviceConfig：设备 Workspace「配置」tab。
+// - 设备区：改名 + 删除设备（canDeleteDevice 预检，后端 RESTRICT 为最终裁决）；
+// - 连接区：归属本设备的连接表（状态/启停/删除）+ 新增连接 Modal
+//   （Descriptor-driven，校验/探测，buildEndpointCreatePayload 组装）；
+// - 单连接设置区：当前 ?connection= 上下文的连接 → Connection/Acquisition/
+//   EventTask 三个既有 Pane（key={endpointId} 强制 remount，pane 内代际守卫
+//   双保险，切连接旧快照绝不污染新窗格）。
 import { useEffect, useState } from "react";
 import { Alert, Button, Card, Form, Input, Modal, Select, Space, Table, Tag, message } from "antd";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import type { DriverDescriptor } from "../types";
 import {
@@ -11,12 +15,15 @@ import {
   canDeleteDevice,
   cleanConnection,
   isRunningState,
+  suggestEndpointId,
   type Device,
 } from "../deviceModel";
 import { DescriptorFields, materializeSchemaDefaults } from "../components/DescriptorFields";
+import { EndpointAcquisitionPane } from "../components/EndpointAcquisitionPane";
+import { EndpointConnectionPane } from "../components/EndpointConnectionPane";
+import { EventTaskEditor } from "../components/EventTaskEditor";
+import type { WorkspaceEndpoint } from "./useDeviceWorkspaceData";
 
-// 后端 discovery 不可用时的兜底（正常情况下拉来自 /api/v1/drivers，
-// 新驱动无需改前端即出现）。
 const FALLBACK_DRIVERS = [
   { value: "simulator", label: "Simulator" },
   { value: "s7", label: "Siemens S7" },
@@ -25,24 +32,27 @@ const FALLBACK_DRIVERS = [
   { value: "sinumerik-nck", label: "SINUMERIK NCK" },
 ];
 
-interface Endpoint {
-  id: string;
-  name?: string;
-  driver_id: string;
-  device_id?: string;
-  state?: string;
-}
-
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export function DeviceDetailPage() {
-  const { id: deviceId = "" } = useParams();
+export function DeviceConfig({
+  deviceId,
+  device,
+  endpoints,
+  effectiveEndpointId,
+  onReload,
+}: {
+  deviceId: string;
+  device: Device | null;
+  endpoints: WorkspaceEndpoint[];
+  /** 当前 ?connection= 上下文（配置类 tab 必单选；null = 无连接）。 */
+  effectiveEndpointId: string | null;
+  /** 变更后刷新 Workspace 快照（Header 连接数/状态实时跟上）。 */
+  onReload: () => void;
+}) {
   const nav = useNavigate();
-  const [device, setDevice] = useState<Device | null>(null);
-  const [notFound, setNotFound] = useState(false);
-  const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
+  const active = endpoints.find((e) => e.id === effectiveEndpointId) ?? null;
 
-  // 新建连接
+  // 新增连接
   const [addOpen, setAddOpen] = useState(false);
   const [addForm] = Form.useForm();
   const [driverId, setDriverId] = useState("simulator");
@@ -56,36 +66,6 @@ export function DeviceDetailPage() {
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameForm] = Form.useForm();
 
-  const load = async () => {
-    try {
-      const d = (await api.getDevice(deviceId)) as Device;
-      setDevice(d);
-      // 同一路由实例从不存在 ID 切到存在 ID 时，清掉旧的 404 view
-      setNotFound(false);
-    } catch (e) {
-      const err = e as { status?: number };
-      if (err?.status === 404) setNotFound(true);
-      else message.error("加载设备失败");
-      return;
-    }
-    try {
-      const j = (await api.listEndpoints()) as { endpoints?: Array<Endpoint & { runtime?: { state?: string } }> };
-      const eps = (j.endpoints ?? [])
-        .filter((e) => e.device_id === deviceId)
-        .map((e) => ({
-          id: e.id,
-          name: e.name ?? e.id,
-          driver_id: e.driver_id,
-          device_id: e.device_id,
-          state: e.state ?? e.runtime?.state,
-        }));
-      setEndpoints(eps);
-    } catch {
-      message.error("加载连接列表失败");
-    }
-  };
-  useEffect(() => { load(); }, [deviceId]); // eslint-disable-line react-hooks/exhaustive-deps
-
   useEffect(() => {
     api.listDrivers().then((j) => {
       const ds = ((j as { drivers?: Array<{ id: string; name: string }> }).drivers ?? [])
@@ -97,7 +77,6 @@ export function DeviceDetailPage() {
     }).catch(() => {});
   }, []);
 
-  // 新建连接弹窗打开 / 驱动切换时拉取 Descriptor 并物化默认值（显示即保存）
   useEffect(() => {
     if (!addOpen) return;
     fetch(`/api/v1/drivers/${driverId}/descriptor`).then((r) => r.json()).then((d) => {
@@ -108,6 +87,10 @@ export function DeviceDetailPage() {
     }).catch(() => setAddDesc(null));
   }, [driverId, addOpen]);
 
+  const changed = () => {
+    onReload();
+  };
+
   const openAdd = () => {
     setDriverId("simulator");
     setAddConn({});
@@ -115,31 +98,12 @@ export function DeviceDetailPage() {
     setAddOpen(true);
   };
 
-  const doAddValidate = async () => {
-    const r = await api.validateConnection(driverId, cleanConnection(addConn));
-    if (r.status === 200) {
-      setAddIssues([]);
-      message.success("校验通过");
-    } else {
-      setAddIssues(r.body.issues ?? []);
-      message.error(r.body?.error?.message ?? "校验失败");
-    }
-  };
-
-  const doAddProbe = async () => {
-    const r = await api.probe(driverId, cleanConnection(addConn));
-    const ok = !!r.body.reachable;
-    setAddProbe(ok ? { ok: true, msg: "可达" } : { ok: false, msg: r.body.error ?? "不可达" });
-    if (ok) message.success("探测可达");
-    else message.error(r.body.error ?? "探测不可达");
-  };
-
   const doAdd = async () => {
     try {
-      const v = (await addForm.validateFields()) as { id?: string; name: string };
+      const v = (await addForm.validateFields()) as { name: string; id?: string; driver_id: string };
       const payload = buildEndpointCreatePayload({
         deviceId,
-        driverId,
+        driverId: v.driver_id,
         name: v.name,
         connection: addConn,
         id: v.id,
@@ -149,22 +113,10 @@ export function DeviceDetailPage() {
         message.error(r.body?.error?.message ?? "创建连接失败");
         return;
       }
-      message.success(`已在 ${deviceId} 下创建连接 ${payload.id}（未新增设备）`);
+      message.success(`已添加连接 ${payload.id}（归属 ${deviceId}，未新增设备）`);
       setAddOpen(false);
-      load();
+      changed();
     } catch { /* antd 校验未通过 */ }
-  };
-
-  // 破坏性操作明确确认：先停采集再删配置，所属设备保留，不可恢复
-  const deleteEndpoint = (id: string, name?: string) => {
-    Modal.confirm({
-      title: `删除连接 ${name ?? id}？`,
-      content: "将先停止采集并删除该连接的配置与任务；所属设备保留。删除后不可恢复。",
-      okText: "删除",
-      okType: "danger",
-      cancelText: "取消",
-      onOk: () => act(id, "delete"),
-    });
   };
 
   const act = async (id: string, a: "start" | "stop" | "delete") => {
@@ -174,38 +126,32 @@ export function DeviceDetailPage() {
       const r = await api.deleteEndpoint(id);
       if (r.status !== 200) {
         message.error(r.body?.error?.message ?? "删除失败");
-        load();
+        changed();
         return;
       }
-      // 删除 Endpoint 后 Device 仍存在（由 load 刷新连接列表佐证）
       message.success("已删除连接，所属设备保留");
-      load();
+      changed();
       return;
     }
-    if (a === "stop") {
-      const r = await api.stopEndpoint(id);
-      if (r.status !== 200) {
-        message.error(r.body?.error?.message ?? "停止失败");
-        load();
-        return;
-      }
-      message.success("已停止");
-      load();
-      return;
-    }
-    const r = await api.startEndpoint(id);
+    const r = a === "stop" ? await api.stopEndpoint(id) : await api.startEndpoint(id);
     if (r.status !== 200) {
-      message.error(r.body?.error?.message ?? "启动失败");
-      load();
+      message.error(r.body?.error?.message ?? (a === "stop" ? "停止失败" : "启动失败"));
+      changed();
       return;
     }
-    message.success("已启动");
-    load();
+    message.success(a === "stop" ? "已停止" : "已启动");
+    changed();
   };
 
-  const openRename = () => {
-    renameForm.setFieldsValue({ name: device?.name ?? "" });
-    setRenameOpen(true);
+  const confirmDeleteEndpoint = (id: string, name?: string) => {
+    Modal.confirm({
+      title: `删除连接 ${name ?? id}？`,
+      content: "连接删除后其采集/事件配置一并清除，不可恢复；所属设备保留。",
+      okText: "删除",
+      okType: "danger",
+      cancelText: "取消",
+      onOk: () => act(id, "delete"),
+    });
   };
 
   const saveRename = async () => {
@@ -214,16 +160,15 @@ export function DeviceDetailPage() {
       await api.updateDevice(deviceId, { name: v.name.trim() });
       message.success("设备已改名");
       setRenameOpen(false);
-      load();
+      changed();
     } catch (e) {
       const err = e as { status?: number; message?: string };
-      // antd 校验失败时没有 status，直接吞掉；服务端错误才提示
       if (err?.status) message.error(err?.message ?? "改名失败");
     }
   };
 
-  const removeDevice = async () => {
-    const pre = canDeleteDevice(deviceId, endpoints.map((e) => ({ ...e, device_id: deviceId })));
+  const removeDevice = () => {
+    const pre = canDeleteDevice(deviceId, endpoints.map((e) => ({ id: e.id, driver_id: e.driver_id, device_id: deviceId })));
     if (!pre.ok) {
       message.warning(pre.reason);
       return;
@@ -238,7 +183,7 @@ export function DeviceDetailPage() {
         const r = await api.deleteDevice(deviceId);
         if (r.status !== 200) {
           message.error(r.body?.error?.message ?? "删除失败");
-          load();
+          changed();
           return;
         }
         message.success("已删除设备");
@@ -247,30 +192,20 @@ export function DeviceDetailPage() {
     });
   };
 
-  if (notFound) {
-    return (
-      <Card size="small" title="设备不存在">
-        <p style={{ color: "#525252" }}>设备 `{deviceId}` 不存在，可能已被删除。</p>
-        <Button type="primary" onClick={() => nav("/devices")}>返回设备列表</Button>
-      </Card>
-    );
-  }
-
   return (
     <div style={{ display: "grid", gap: 16 }}>
       <Card
         size="small"
-        title={<span>设备 · {device?.name ?? deviceId} <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12, color: "#525252" }}>{deviceId}</span></span>}
+        title={`设备 · ${device?.name ?? deviceId}`}
         extra={
           <Space>
-            <Button size="small" onClick={() => nav("/devices")}>返回</Button>
-            <Button size="small" onClick={openRename}>改名</Button>
+            <Button size="small" onClick={() => { renameForm.setFieldsValue({ name: device?.name ?? "" }); setRenameOpen(true); }}>改名</Button>
             <Button size="small" danger onClick={removeDevice}>删除设备</Button>
             <Button size="small" type="primary" onClick={openAdd}>新增连接</Button>
           </Space>
         }
       >
-        <div style={{ fontSize: 12, color: "#525252" }}>下挂 {endpoints.length} 个连接 · 点行进入 Endpoint 工作空间</div>
+        <div style={{ fontSize: 12, color: "#525252" }}>下挂 {endpoints.length} 个连接 · 连接的新增/启停/删除收敛于此</div>
       </Card>
 
       <Card size="small" title="连接">
@@ -278,7 +213,6 @@ export function DeviceDetailPage() {
           size="small"
           rowKey="id"
           dataSource={endpoints}
-          onRow={(r) => ({ onClick: () => nav(`/devices/${deviceId}/endpoints/${r.id}`), style: { cursor: "pointer" } })}
           columns={[
             { title: "名称", dataIndex: "name", render: (v: string) => v ?? "—" },
             { title: "ID", dataIndex: "id", render: (v: string) => <span style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12 }}>{v}</span> },
@@ -290,23 +224,48 @@ export function DeviceDetailPage() {
             },
             {
               title: "操作",
-              render: (_: unknown, r: Endpoint) => {
+              render: (_: unknown, r: WorkspaceEndpoint) => {
                 const running = isRunningState(r.state);
                 return (
                   <Space onClick={(e) => e.stopPropagation()}>
-                    <Button size="small" onClick={() => nav(`/devices/${deviceId}/endpoints/${r.id}`)}>进入</Button>
                     {!running
                       ? <Button size="small" type="primary" onClick={() => act(r.id, "start")}>启动</Button>
                       : <Button size="small" onClick={() => act(r.id, "stop")}>停止</Button>}
-                    <Button size="small" danger onClick={() => deleteEndpoint(r.id, r.name)}>删除</Button>
+                    <Button size="small" danger onClick={() => confirmDeleteEndpoint(r.id, r.name)}>删除</Button>
                   </Space>
                 );
               },
             },
           ]}
-          locale={{ emptyText: "该设备下暂无连接，点“新增连接”添加第一个 Endpoint（不会新增设备）" }}
+          locale={{ emptyText: "该设备下暂无连接，点“新增连接”添加第一个连接（不会新增设备）" }}
         />
       </Card>
+
+      {active ? (
+        <Card
+          size="small"
+          title={`连接设置 · ${active.name ?? active.id}`}
+          extra={<Tag>{active.driver_id}</Tag>}
+        >
+          {/* key 强制 remount：切连接时旧窗格（含未保存草稿/快照门）整体丢弃，
+              与 pane 内代际守卫双保险。 */}
+          <div key={active.id} style={{ display: "grid", gap: 16 }}>
+            <EndpointConnectionPane
+              endpointId={active.id}
+              deviceId={deviceId}
+              driverId={active.driver_id}
+              initialName={active.name ?? active.id}
+              onChanged={changed}
+            />
+            <EndpointAcquisitionPane endpointId={active.id} driverId={active.driver_id} onChanged={changed} />
+            <Card size="small" title="事件订阅">
+              <EventTaskEditor fixedEndpointId={active.id} />
+            </Card>
+          </div>
+        </Card>
+      ) : (
+        <Alert type="warning" showIcon message="该设备暂无连接" description="请先新增连接后再做连接设置。" />
+      )}
 
       <Modal title={`新增连接 · 归属 ${deviceId}`} open={addOpen} onOk={doAdd} onCancel={() => setAddOpen(false)} okText="创建" destroyOnHidden width={640}>
         <Form form={addForm} layout="vertical" initialValues={{ driver_id: "simulator" }}>
@@ -317,14 +276,24 @@ export function DeviceDetailPage() {
             <Input placeholder="如 PLC / NCK / OPC UA" />
           </Form.Item>
           <Form.Item name="id" label="连接 ID（可空自动生成，与设备 ID 独立）">
-            <Input placeholder={`${driverId}-xxxxxx`} style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }} />
+            <Input placeholder={suggestEndpointId(driverId)} style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }} />
           </Form.Item>
           {!addDesc ? <div style={{ color: "#525252", fontSize: 12 }}>加载连接参数…</div> : (
             <DescriptorFields schema={addDesc.connection} value={addConn} onChange={setAddConn} />
           )}
           <Space style={{ marginTop: 8 }}>
-            <Button onClick={doAddValidate}>校验</Button>
-            <Button onClick={doAddProbe}>探测</Button>
+            <Button onClick={async () => {
+              const r = await api.validateConnection(driverId, cleanConnection(addConn));
+              if (r.status === 200) { setAddIssues([]); message.success("校验通过"); }
+              else { setAddIssues(r.body.issues ?? []); message.error(r.body?.error?.message ?? "校验失败"); }
+            }}>校验</Button>
+            <Button onClick={async () => {
+              const r = await api.probe(driverId, cleanConnection(addConn));
+              const ok = !!r.body.reachable;
+              setAddProbe(ok ? { ok: true, msg: "可达" } : { ok: false, msg: r.body.error ?? "不可达" });
+              if (ok) message.success("探测可达");
+              else message.error(r.body.error ?? "探测不可达");
+            }}>探测</Button>
             {addProbe && <Tag color={addProbe.ok ? "green" : "red"}>{addProbe.msg}</Tag>}
           </Space>
           {!!addIssues.length && <Alert style={{ marginTop: 8 }} type="error" message={addIssues.map((i) => `${i.path}: ${i.message}`).join("； ")} />}

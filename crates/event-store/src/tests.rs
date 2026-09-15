@@ -486,3 +486,50 @@ async fn retention_sweep_count_and_time() {
     assert_eq!(sweep_once(&store2, &cfg).await.unwrap(), 2);
     assert_eq!(store2.stats().unwrap().rows, 0);
 }
+
+/// M5 `endpoint_ids` 多选过滤：一次查询代替 N 次逐 endpoint 查询。
+#[tokio::test]
+async fn endpoint_ids_filter_returns_union() {
+    let store = EventStore::open_in_memory().unwrap();
+    for (ep, id) in [("ep-a", "a1"), ("ep-b", "b1"), ("ep-c", "c1")] {
+        store
+            .commit_batch(CommitRequest {
+                endpoint_id: ep.into(),
+                batch: batch(1, 7, vec![record(id)]),
+                received_at_ns: now_unix_ns(),
+            })
+            .await
+            .unwrap();
+    }
+    // 多选取并集
+    let (rows, _) = store
+        .query_history(&EventFilter {
+            endpoint_ids: Some(vec!["ep-a".into(), ("ep-c".into())]),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut got: Vec<&str> = rows.iter().map(|r| r.endpoint_id.as_str()).collect();
+    got.sort();
+    assert_eq!(got, vec!["ep-a", "ep-c"]);
+
+    // 空 vec = 明确无匹配（不拼非法 `IN ()`，直接空结果）
+    let (rows, next) = store
+        .query_history(&EventFilter {
+            endpoint_ids: Some(vec![]),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(rows.is_empty());
+    assert_eq!(next, None);
+
+    // 单值 + 多值交集（SQL AND 语义）
+    let (rows, _) = store
+        .query_history(&EventFilter {
+            endpoint_id: Some("ep-a".into()),
+            endpoint_ids: Some(vec!["ep-a".into(), "ep-b".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].endpoint_id, "ep-a");
+}
