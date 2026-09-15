@@ -2170,6 +2170,122 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// R1.2 回归：现实 v5 文件库 open() 必须一次走到 v6，且 secret/tasks/
+    /// revision 业务行无损，006 幂等表已建。构造方式同 v2/v4 升级测试
+    ///（手写 v5 形态 + 业务行，再 ConfigStore::open()）。
+    #[test]
+    fn v5_file_db_upgrades_to_v6_without_data_loss() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mesa-config-v5up-{}-{}.db",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE devices(id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE endpoints(
+                    id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE RESTRICT,
+                    driver_id TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    connection_json TEXT NOT NULL,
+                    desired_running INTEGER NOT NULL DEFAULT 0,
+                    updated_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE tasks(
+                    endpoint_id TEXT NOT NULL REFERENCES endpoints(id) ON DELETE CASCADE,
+                    id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    interval_ms INTEGER,
+                    binding_kind TEXT NOT NULL,
+                    binding_config_json TEXT NOT NULL,
+                    PRIMARY KEY(endpoint_id, id)
+                );
+                CREATE TABLE config_revision(
+                    endpoint_id TEXT PRIMARY KEY REFERENCES endpoints(id) ON DELETE CASCADE,
+                    revision INTEGER NOT NULL
+                );
+                CREATE TABLE schema_migrations(
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    applied_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE endpoint_secrets(
+                    endpoint_id TEXT NOT NULL,
+                    field_path TEXT NOT NULL,
+                    ciphertext BLOB NOT NULL,
+                    nonce BLOB NOT NULL,
+                    algorithm TEXT NOT NULL,
+                    key_id TEXT NOT NULL,
+                    updated_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(endpoint_id, field_path)
+                );
+                INSERT INTO meta(key,value) VALUES('schema_version','5');
+                INSERT INTO schema_migrations(version,name,checksum,applied_at_ns)
+                    VALUES(1,'001_initial','x',1),(2,'002_management_control','y',2),
+                    (3,'003_event_tasks','z',3),(4,'004_remove_device_profile','w',4),
+                    (5,'005_endpoint_name','v',5);
+                INSERT INTO devices(id,name) VALUES('d1','D1');
+                INSERT INTO endpoints(id,device_id,driver_id,name,connection_json,desired_running,updated_at_ns)
+                    VALUES('e1','d1','simulator','E1','{"a":1}',1,7);
+                INSERT INTO tasks(endpoint_id,id,mode,interval_ms,binding_kind,binding_config_json)
+                    VALUES('e1','t1','poll',100,'simulator.points','{}');
+                INSERT INTO config_revision(endpoint_id,revision) VALUES('e1',2);
+                INSERT INTO endpoint_secrets(endpoint_id,field_path,ciphertext,nonce,algorithm,key_id,updated_at_ns)
+                    VALUES('e1','password',X'0102',X'09','aead','k1',8);
+                "#,
+            )
+            .unwrap();
+        }
+        let s = ConfigStore::open(&path).unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            let ver: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ver, "6");
+            // 006 幂等表已建
+            let tbl: String = conn
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='bootstrap_idempotency'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(tbl, "bootstrap_idempotency");
+            // secret 行无损
+            let blob: Vec<u8> = conn
+                .query_row(
+                    "SELECT ciphertext FROM endpoint_secrets WHERE endpoint_id='e1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(blob, vec![1u8, 2]);
+        }
+        // 公共 API：业务行全部可读（device/endpoint/tasks/revision）
+        assert_eq!(s.get_device("d1").unwrap().unwrap().name, "D1");
+        assert_eq!(s.get_endpoint("e1").unwrap().unwrap().name, "E1");
+        assert_eq!(s.list_tasks("e1").unwrap().len(), 1);
+        assert_eq!(s.current_revision("e1").unwrap(), 2);
+        // 升级后幂等读写可用
+        assert!(s.bootstrap_idempotency_get("k").unwrap().is_none());
+        s.bootstrap_idempotency_put("k", "h", "d1", "e1", "{}").unwrap();
+        assert!(s.bootstrap_idempotency_get("k").unwrap().is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn point_id_stable_and_tombstone_reuse() {
         let s = mem();
