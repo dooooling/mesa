@@ -25,7 +25,11 @@ def git_full():
 
 def is_clean_tree():
     try:
-        out = subprocess.check_output(["git", "status", "--porcelain"], text=True)
+        # 只看 tracked 变更：构建/测试副产品（untracked）不代表代码被改，
+        # 否则任何一次正常运行都会把证据标 dirty。
+        out = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"], text=True
+        )
         return out.strip() == ""
     except Exception:
         return False
