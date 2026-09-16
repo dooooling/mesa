@@ -105,6 +105,29 @@ async fn put_json(app: axum::Router, uri: &str, body: &str) -> (StatusCode, serd
     (status, v)
 }
 
+/// 控制面默认关闭门（P1 审计闭环前置）：未开闸时 write/command 一律
+/// 503 CONTROL_DISABLED，到不了鉴权与审计，更到不了驱动。
+#[tokio::test]
+async fn control_plane_disabled_by_default() {
+    let (app, _) = app().await;
+    let (s1, v1) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/nope/write",
+        r#"{"target":"x","value":1}"#,
+    )
+    .await;
+    assert_eq!(s1, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(v1["error"]["code"], "CONTROL_DISABLED");
+    let (s2, v2) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/nope/commands/reset",
+        r#"{}"#,
+    )
+    .await;
+    assert_eq!(s2, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(v2["error"]["code"], "CONTROL_DISABLED");
+}
+
 #[tokio::test]
 async fn probe_does_not_create_endpoint() {
     let (app, _) = app().await;

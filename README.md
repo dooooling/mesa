@@ -29,4 +29,4 @@ cargo test --workspace -- --test-threads=1
 
 ## 版本
 
-`feat/v2.1-impl` `rust 1.95.0` `Node 22.18 pnpm 10.28`
+`main` `rust 1.95.0` `Node 22.18 pnpm 10.28`

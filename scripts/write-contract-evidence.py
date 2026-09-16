@@ -3,47 +3,17 @@
 
 机器保证：本脚本先删除旧 contract.json，再依次执行
   1) cargo build --locked --workspace  （重编全部 Driver binaries，避免旧二进制）
-  2) cargo test --locked -p mesa-contract-tests --all-features
-两步均成功后才写出 contract.json。外部唯一入口即 `python scripts/write-contract-evidence.py`，
-无法通过参数跳过测试。
+  2) 名单与磁盘双向对拍（contract_suites.check_manifest；幽灵/遗漏直接失败）
+  3) cargo test --locked -p mesa-contract-tests --all-features（逐 suite 运行，
+     真实 pass/fail 逐项解析进 contract.json；任一失败不写证据）
+外部唯一入口即 `python scripts/write-contract-evidence.py`，无法通过参数跳过测试。
+套件名单唯一来源 scripts/contract_suites.py。
 """
-import json, pathlib, subprocess, sys, datetime
+import json, pathlib, re, subprocess, sys, datetime
 
-SUITES = [
-    "smoke",
-    "protocol_negotiation",
-    "session_lifecycle",
-    "data_plane",
-    "fault_tolerance",
-    "subprocess_recovery",
-    "discovery_contract",
-    "descriptor_contract",
-    "data_semantics",
-    "control_contract",
-    "management_api",
-    "profile_contract",
-    "resource_contract",
-    "subprocess_orphan_guard",
-    # PR10 Event Plane V1：事件面全部 contract suites（含 hardening gates）。
-    # cargo test 跑整个包（新二进制自动参跑）；此名单是证据manifest，
-    # 增删 suite 必须显式评审（与 stats 键冻结同理）。
-    "event_hardening_smoke",
-    "event_identity",
-    "event_lifecycle",
-    "event_persistence",
-    "event_pressure",
-    "event_retention_pressure",
-    "event_runtime",
-    "event_scheduler",
-    "event_soak",
-    "event_sse",
-    "event_store_faults",
-    # PR11 SINUMERIK Read-only V1：真子进程 Data E2E（fixture 种子，无需真机）。
-    "sinumerik_data_e2e",
-    # Hotfix Stop-during-reconnect lifecycle gate：重连退避中显式 Stop 有界显式。
-    "stop_lifecycle",
-]
-REQUIRED_SET = set(SUITES)
+from contract_suites import SUITES, SUITE_SET, check_manifest
+
+# 套件名单见 contract_suites.py（唯一来源）。
 
 def git_sha():
     try:
@@ -53,7 +23,11 @@ def git_sha():
 
 def is_clean_tree():
     try:
-        out = subprocess.check_output(["git", "status", "--porcelain"], text=True)
+        # 只看 tracked 变更：构建/测试副产品（untracked）不代表代码被改，
+        # 否则任何一次正常运行都会把证据标 dirty。
+        out = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"], text=True
+        )
         return out.strip() == ""
     except Exception:
         return False
@@ -69,6 +43,31 @@ def run_or_exit(cmd, label):
         print(f"cargo not found: {e}", file=sys.stderr)
         sys.exit(127)
 
+def run_capture(cmd, label):
+    """运行单 suite。返回 (ok, output)：失败不直接 exit，由主循环统一裁决
+    exit 码（测试失败 exit 5，输出不可解析 exit 4），证据一律不写。"""
+    print(f"running: {' '.join(cmd)} ...", flush=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        return r.returncode == 0, r.stdout + r.stderr
+    except FileNotFoundError as e:
+        print(f"cargo not found: {e}", file=sys.stderr)
+        sys.exit(127)
+
+
+def parse_suite_results(output):
+    """解析 `cargo test --test <suite>` 输出：(passed_tests, failed_tests)。
+
+    失败行形如 `test foo ... FAILED`；汇总行形如
+    `test result: ok. 12 passed; 0 failed; ...`。
+    """
+    failed_names = re.findall(r"^test (\S+) \.\.\. FAILED", output, re.M)
+    m = re.search(r"test result:\s+(ok|FAILED)\.\s+(\d+) passed;\s+(\d+) failed", output)
+    if not m:
+        return None
+    return int(m.group(2)), int(m.group(3)), failed_names
+
+
 def main():
     out = pathlib.Path("target/validation/contract.json")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -79,7 +78,41 @@ def main():
         pass
 
     run_or_exit(["cargo", "build", "--locked", "--workspace"], "cargo build")
-    run_or_exit(["cargo", "test", "--locked", "-p", "mesa-contract-tests", "--all-features"], "contract tests")
+
+    # 名单与磁盘双向对拍（幽灵/遗漏直接失败，不写证据）
+    ok, ghost, missing = check_manifest()
+    if not ok:
+        print(f"suite manifest mismatch: ghost={ghost} missing={missing}, not writing contract.json",
+              file=sys.stderr)
+        sys.exit(3)
+
+    # 逐 suite 运行并解析真实结果（任一失败即退出，不写证据）
+    suite_results = {}
+    total_passed = 0
+    total_failed = 0
+    for suite in SUITES:
+        ok, output = run_capture(
+            ["cargo", "test", "--locked", "-p", "mesa-contract-tests", "--all-features",
+             "--test", suite],
+            f"contract suite {suite}",
+        )
+        parsed = parse_suite_results(output)
+        if parsed is None:
+            # 含 cargo 非零退出但无汇总行（编译挂/ harness 崩）一律不可解析
+            print(f"suite {suite}: cannot parse test output (cargo ok={ok}), not writing contract.json",
+                  file=sys.stderr)
+            sys.exit(4)
+        passed, failed, failed_names = parsed
+        suite_results[suite] = {"passed": passed, "failed": failed, "failed_tests": failed_names}
+        total_passed += passed
+        total_failed += failed
+        if not ok or failed != 0:
+            print(f"suite {suite} failed, continuing to collect all suites (no evidence will be written)",
+                  file=sys.stderr)
+
+    if total_failed != 0:
+        print(f"contract suites failed: {total_failed} tests failed, not writing contract.json", file=sys.stderr)
+        sys.exit(5)
 
     sha = git_sha()
     doc = {
@@ -87,15 +120,15 @@ def main():
         "failed": 0,
         "total": len(SUITES),
         "suites": SUITES,
+        "suite_results": suite_results,
+        "test_counts": {"passed_tests": total_passed, "failed_tests": total_failed},
         "git_sha": sha,
         "git_sha_short": sha[:7] if len(sha) >= 7 else sha,
         "generated_at_ns": int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9),
         "dirty": not is_clean_tree(),
     }
-    # 防御：保证集合完整性（Contract Gate 验证行为契约，不含 build_profile）
-    assert set(doc["suites"]) == REQUIRED_SET and doc["total"] == len(SUITES) == 27
     out.write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"wrote {out} suites={len(SUITES)} sha={sha} dirty={doc['dirty']}")
+    print(f"wrote {out} suites={len(SUITES)} tests={total_passed} sha={sha} dirty={doc['dirty']}")
 
 if __name__ == "__main__":
     main()

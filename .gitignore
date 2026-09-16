@@ -8,7 +8,8 @@
 .idea/
 .vscode/
 
-# 本地运行时数据库（ConfigStore/SQLite）
+# 本地运行时数据库（ConfigStore/SQLite/EventStore，未跟踪的运行库一律忽略）
+*.db
 mesa*.db
 mesa*.db-wal
 mesa*.db-shm
