@@ -204,6 +204,62 @@ describe("扁平设备详情", () => {
     ).toBeTruthy();
   });
 
+  it("实时表固定布局：列宽固定，内容省略不推动整表", async () => {
+    mockAll();
+    renderApp("/devices/cnc-01/data");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const table = document.querySelector("table");
+    expect(table).toBeTruthy();
+    // fixed 布局：colgroup 每列有显式宽度
+    const cols = table!.querySelectorAll("col");
+    expect(cols.length).toBeGreaterThanOrEqual(8);
+    const widths = [...cols].map((c) => c.getAttribute("style") ?? "");
+    expect(widths.some((s) => s.includes("240"))).toBe(true);
+    expect(widths.some((s) => s.includes("180"))).toBe(true);
+  });
+
+  it("概览数据预览稳定顺序：时间错开不行位", async () => {
+    vi.useRealTimers();
+    let tick = 0;
+    (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string) => {
+      if (url === "/api/v1/devices/cnc-01") {
+        return { ok: true, status: 200, json: async () => ({ id: "cnc-01", name: "CNC-01" }) };
+      }
+      if (url === "/api/v1/devices") {
+        return { ok: true, status: 200, json: async () => ({ devices: [{ id: "cnc-01", name: "CNC-01" }] }) };
+      }
+      if (url === "/api/v1/endpoints") {
+        return { ok: true, status: 200, json: async () => ({ endpoints: EPS }) };
+      }
+      if (url === "/api/v1/points/latest") {
+        tick += 1;
+        // 两轮时间错开：第一轮 b 新，第二轮 a 新（旧逻辑会重排）
+        const tsA = (T0 - (tick === 1 ? 500 : 100)) * 1e6;
+        const tsB = (T0 - (tick === 1 ? 100 : 500)) * 1e6;
+        return {
+          ok: true, status: 200,
+          json: async () => ({ points: [
+            { endpoint_id: "focas", key: "b-key", point_id: 2, quality: "GOOD", type: "f64", value: 2, timestamp_ns: tsB },
+            { endpoint_id: "plc", key: "a-key", point_id: 1, quality: "GOOD", type: "f64", value: 1, timestamp_ns: tsA },
+          ] }),
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    }) as unknown as typeof fetch;
+    renderApp("/devices/cnc-01/overview");
+    await screen.findByText("数据预览", undefined, { timeout: 10000 });
+    const order = () => {
+      const preview = screen.getByText("数据预览").closest("section")!;
+      return [...preview.querySelectorAll("div")].map((d) => d.textContent ?? "").join("|");
+    };
+    const first = order();
+    // 等第二轮轮询（1s 间隔），行位必须不变
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(order()).toBe(first);
+  }, 30000);
+
   it("非法 connection 被正规化回 URL（页面与地址栏一致）", async () => {
     vi.useRealTimers();
     mockAll();

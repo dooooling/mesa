@@ -9,9 +9,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   POINT_STALE_AFTER_MS,
+  derivePointStale,
   pointAgeMs,
+  reconcilePointSnapshots,
   resolveEndpointContexts,
   type Device,
+  type PointStale,
 } from "../deviceModel";
 
 export interface WorkspacePoint {
@@ -40,7 +43,6 @@ export interface WorkspaceEndpoint {
   state?: string;
 }
 
-export type PointStale = "GOOD" | "BAD" | "STALE" | "UNKNOWN";
 
 export interface DevicePointView extends WorkspacePoint {
   /**
@@ -55,7 +57,11 @@ export interface DevicePointView extends WorkspacePoint {
    *   point_key 是语义身份，不是 provenance）。
    */
   sourceText: string | null;
-  /** 距 nowMs 的年龄（ms），非法时间戳为 null。 */
+  /**
+   * 构建时刻的年龄快照（ms），非法时间戳为 null。
+   * 实时“更新”文本不读它（AgeCell 从 timestamp_ns + 共享秒钟现算），
+   * 它只供非 tick 场景（导出/调试）使用。
+   */
   ageMs: number | null;
   /** 派生状态：quality BAD 即 BAD；否则 age 超阈即 STALE；非法时间戳为 UNKNOWN。 */
   derived: PointStale;
@@ -85,7 +91,6 @@ export interface DeviceWorkspaceData {
   /** 全局快照（未按设备过滤，调用方按需过滤；失败保留 last-known）。 */
   points: WorkspacePoint[];
   pointsError: boolean;
-  nowMs: number;
   /** 当前设备的点位视图（含派生 STALE/归属名）。 */
   devicePoints: DevicePointView[];
   counts: { total: number; good: number; bad: number; stale: number; unknown: number };
@@ -101,20 +106,15 @@ export interface DeviceWorkspaceData {
 export const DEVICE_POINTS_POLL_MS = 1000;
 export const DEVICE_ENDPOINTS_POLL_MS = 10_000;
 
-/** 派生点位状态：BAD 优先于 STALE；非法时间戳既不算 GOOD 也不算 STALE。 */
-export function derivePointStale(quality: string, ageMs: number | null): PointStale {
-  if ((quality ?? "").toUpperCase() === "BAD") return "BAD";
-  if (ageMs === null) return "UNKNOWN";
-  return ageMs > POINT_STALE_AFTER_MS ? "STALE" : "GOOD";
-}
+// derivePointStale / PointStale 已收敛到 deviceModel（签名门共用同一派生）。
 
 function toView(
   p: WorkspacePoint,
-  nowMs: number,
+  buildNow: number,
   ctx: Map<string, { endpointName: string; deviceId: string; deviceName: string }>,
 ): DevicePointView {
   const c = ctx.get(p.endpoint_id);
-  const ageMs = pointAgeMs(p.timestamp_ns, nowMs);
+  const ageMs = pointAgeMs(p.timestamp_ns, buildNow);
   return {
     ...p,
     // P2 Name：display_name ?? key（point_key） ?? point_id。
@@ -153,7 +153,7 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
   const [devices, setDevices] = useState<Device[]>([]);
   const [points, setPoints] = useState<WorkspacePoint[]>([]);
   const [pointsError, setPointsError] = useState(false);
-  const [nowMs, setNowMs] = useState(() => Date.now());
+  // 无 nowMs state：interval 只拉取，不 tick 整页。年龄由 AgeCell 独立消费共享秒钟。
   // 路由代际：deviceId 切换即新一代；旧请求的迟到响应一律丢弃。
   const gen = useRef(0);
   // M6 reloadInventory 代际：手动刷新与轮询共享同一代际计数。
@@ -220,19 +220,33 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
         });
     };
 
+    const prevAtRef = { current: Date.now() };
+    // Row reconciliation：逐行全字段比较（含 metadata），不变行保旧引用
+    // → 下游 memo/行级 bailout；变行/新行更新。derived 用到达时刻计算，
+    // STALE 翻转对齐轮询节拍（语义无损）。
     const loadPoints = () => {
       fetchJson("/api/v1/points/latest")
         .then((j) => {
           if (cancelled || gen.current !== id) return;
           const pts = (j as { points?: unknown }).points;
           if (!Array.isArray(pts)) throw new Error("points 形态非法");
-          setPoints(pts as WorkspacePoint[]);
+          const arr = pts as WorkspacePoint[];
+          const at = Date.now();
+          const atPrev = prevAtRef.current;
+          prevAtRef.current = at;
+          setPoints((prev) => {
+            // 代际内 prev 恒为本 effect 的快照（setPoints 函数式更新取最新）。
+            const { points: merged, changed } = reconcilePointSnapshots(prev, arr, at, atPrev);
+            return changed ? merged : prev;
+          });
           setPointsError(false);
         })
         .catch(() => {
-          // fail-closed：保留 last-known points，nowMs 独立推进使其自然 STALE。
+          // fail-closed：保留 last-known points；bump staleNonce 让派生
+          // STALE 按 nowMs 推进（异常路径才重算，正常时零 churn）。
           if (cancelled || gen.current !== id) return;
           setPointsError(true);
+          setStaleNonce((n) => n + 1);
         });
     };
 
@@ -243,8 +257,8 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
     const timer = window.setInterval(() => {
       if (gen.current !== id) return;
       n += 1;
-      // 时钟与拉取解耦：拉取失败也不阻止时钟推进（STALE 照常出现）。
-      setNowMs(Date.now());
+      // 无整页 tick：只拉取；年龄由 AgeCell 独立时钟，STALE 派生由
+      // reconcile（成功分支）/ staleNonce（失败分支）推进。
       loadPoints();
       if (n % (DEVICE_ENDPOINTS_POLL_MS / DEVICE_POINTS_POLL_MS) === 0) loadInventory();
     }, DEVICE_POINTS_POLL_MS);
@@ -276,7 +290,12 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
     [deviceEndpoints],
   );
 
+  // nowMs 不进 memo 依赖：正常轮询由签名门决定是否重建；
+  // 拉取失败时 staleNonce 推进 STALE（异常路径）。
+  const [staleNonce, setStaleNonce] = useState(0);
   const devicePoints = useMemo(() => {
+    void staleNonce;
+    const buildNow = Date.now();
     const views: DevicePointView[] = [];
     for (const p of points) {
       // RC2 修1：ownership 真正 fail-closed。能证明 endpoint 归属当前 device
@@ -288,10 +307,11 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
       //（配 empty 态，不展示别家数据）。
       const owner = ctx.get(p.endpoint_id)?.deviceId ?? "";
       if (owner !== deviceId) continue;
-      views.push(toView(p, nowMs, ctx));
+      views.push(toView(p, buildNow, ctx));
     }
     return views;
-  }, [points, ctx, deviceId, nowMs]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [points, ctx, deviceId, staleNonce]);
 
   const counts = useMemo(() => {
     let good = 0;
@@ -318,7 +338,6 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
     endpointIds,
     points,
     pointsError,
-    nowMs,
     devicePoints,
     counts,
     reloadInventory: () => reloadRef.current(),

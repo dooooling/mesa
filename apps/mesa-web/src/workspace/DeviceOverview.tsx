@@ -90,10 +90,19 @@ export function DeviceOverview(props: {
   const { deviceId, deviceName, endpoints, points, counts, onOpenPoint } = props;
   const nav = useNavigate();
   const attention = useMemo(() => buildAttentionList(endpoints, points), [endpoints, points]);
+  // 数据预览（稳定顺序）：按 endpoint_id+point_id 固定行位，只让
+  // value/status 原地变化。按时间重排会让行上下跳（Layout shift），
+  // “最近更新”如需流式语义应单独做事件列表，不占用固定摘要。
   const recent = useMemo(
     () =>
       [...points]
-        .sort((a, b) => (b.timestamp_ns || 0) - (a.timestamp_ns || 0))
+        .sort((a, b) =>
+          a.endpoint_id === b.endpoint_id
+            ? a.point_id - b.point_id
+            : a.endpoint_id < b.endpoint_id
+              ? -1
+              : 1,
+        )
         .slice(0, 5),
     [points],
   );
@@ -159,7 +168,7 @@ export function DeviceOverview(props: {
         )}
       </Section>
 
-      <Section title="最近数据">
+      <Section title="数据预览">
         {!recent.length ? (
           <div style={{ fontSize: 12, color: "#525252" }}>暂无数据</div>
         ) : (

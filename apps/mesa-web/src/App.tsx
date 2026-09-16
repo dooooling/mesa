@@ -8,6 +8,7 @@ import { GlobalDataPage } from "./pages/GlobalDataPage";
 import { GlobalEventsPage } from "./pages/GlobalEventsPage";
 import { NotFoundPage } from "./pages/NotFoundPage";
 import { OverviewPage } from "./overview/OverviewPage";
+import { StaleClockProvider } from "./workspace/StaleClock";
 import { SystemPage } from "./system/SystemPage";
 
 const { Header, Sider, Content } = Layout;
@@ -55,6 +56,8 @@ export default function App() {
           <span style={{ fontWeight: 400, fontSize: 16 }}>{headerLabel}</span>
         </Header>
         <Content style={{ margin: 16 }}>
+          {/* 共享秒钟：实时表 AgeCell 的唯一时间源（单 interval，多 AgeCell 订阅）。 */}
+          <StaleClockProvider>
           <Routes>
             {/* 扁平设备详情：只存在六个 Device Tab（非法 tab 无路由，自然落 NotFound）。
                 config/legacy/endpoints 旧路由已删除，旧 URL 诚实 404。 */}
@@ -74,6 +77,7 @@ export default function App() {
             <Route path="/system" element={<SystemPage />} />
             <Route path="*" element={<NotFoundPage />} />
           </Routes>
+          </StaleClockProvider>
         </Content>
       </Layout>
     </Layout>
