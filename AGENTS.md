@@ -43,7 +43,7 @@ Mesa：工业设备统一采集平台。Rust + Tokio + Protobuf IPC + SQLite。�
 - `point_id` 由 **Core 分配并持久化**，Driver/Core 重启后必须保持稳定（删除走 tombstone）；高频通道只传 `(connection_handle, point_id) + TypedValue`
 - 业务时间戳 = UTC Unix ns；性能测量用宿主机单调时钟，禁止两进程 UTC 相减
 - Driver 为独立进程：token 经 stdin 传入并持续监控该管道（EOF 即自杀退出）；Linux `PR_SET_PDEATHSIG`、Windows Job Object `KILL_ON_JOB_CLOSE` 防孤儿
-- V1 兼容基线严格只读；V2.1 Control 默认 `disabled`，仅 `mesad --enable-control` 显式开启时允许 Write/Command，否则 `CONTROL_DISABLED`
+- V1 只读基线（ADR 0003 澄清：指已冻结的数据/IPC 只读协议兼容，不意味着 legacy task binding 配置格式永久兼容；legacy binding 删除见 ADR 0003）；V2.1 Control 默认 `disabled`，仅 `mesad --enable-control` 显式开启时允许 Write/Command，否则 `CONTROL_DISABLED`
 - 配置变更为全量快照替换；运行中的 Endpoint 改任务必须走 Stop → ConfigureTasks → ApplyPointMap → Start（新 `stream_epoch`），不允许热 Apply
 - **配置真值只在 Core**：Driver 进程不持久化业务配置，重启后由 Core 重放（Handshake → OpenConnection → ConfigureTasks → restore PointMap → Start）
 - **管理边界**：CLI 仅作为 REST API 客户端，禁止直接读写 SQLite 或证书目录；REST 默认仅绑定 loopback

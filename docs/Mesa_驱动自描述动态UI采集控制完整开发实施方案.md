@@ -3954,3 +3954,25 @@ Release Artifact
 ```
 
 只有这些断言长期成立，Mesa 的 Driver 自描述、动态管理和未来控制架构才算真正建立完成。
+
+---
+
+# 37. Foundation 收口修订（ADR 0003，2026-09-16）
+
+> 本章为 Foundation-1 审计修订附录，与正文冻结章节冲突时以本章 + `docs/adr/0003-foundation-contract-stabilization.md` 为准。本章只记录决策，不修改已冻结的 Data Plane / IPC / point_id 语义。
+
+## 37.1 兼容边界澄清
+
+- "V1 兼容基线严格只读"指已冻结的数据/IPC 只读协议兼容，**不**意味着 legacy task binding 配置格式永久兼容。
+- GitHub Releases 为空（无正式 release），Foundation 阶段不承担 legacy task/binding 向后兼容：旧配置格式直接删除，不做 deprecated 双轨、不做 runtime migration shim。
+- 正文 §4.6（Legacy Binding 兼容）、§4.7（Binding Migration Tool）、§15 "Legacy 至少保留一个 Major Release" 的保留承诺即日起废止，删除动作由 Foundation-2 执行。
+
+## 37.2 删除清单（Foundation-2 执行）
+
+`s7.address-group` / `focas.data-block` / `opcua.node-group` / `opcua.subscription` / `opcua.browse` / `simulator.points` / `simulator.events`，以及 Core API 的 legacy bypass（无 generic 即放行）。生产路径只留 `mesa.resources.v1` / `mesa.events.v1`。
+
+## 37.3 变更方向（Foundation-2～4 设计冻结）
+
+- Acquisition Model 2.0：`AcquisitionTask{id, mode, options, binding}`，options 按 mode 区分（Poll: interval_ms；Subscribe: publishing/sampling/queue/discard），Task Mode 自身有 Descriptor/Schema。
+- Control Model：Write 回归 Resource 模型（`resource_id + parameters + output` 倾向方案），command 走 ControlCatalog；在 OPC UA Write / S7 Write / FOCAS Control 开工前冻结。
+- Lifecycle：`open_connection` = 创建逻辑对象 + 配置 fail-fast，不承诺物理会话；各 Driver 经统一 session factory 懒建/复用；改 SDK 契约文字，不改 S7 短会话 probe 行为。
