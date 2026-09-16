@@ -267,17 +267,22 @@ async fn device_bootstrap_inner(
                 }
             }
             // acquisition 集合校验（endpoint 尚未落库，直接用 descriptor 校验，
-            // 与 gate_data_tasks 同规则；无 generic 任务直接放行）
+            // 与 gate_data_tasks 同规则；Foundation-2 单路径：非 generic 即拒绝）
             if let Some(acq) = &body.acquisition {
-                if acq
-                    .tasks
-                    .iter()
-                    .any(|t| t.binding.kind == mesa_core_types::GENERIC_BINDING_KIND)
-                {
+                if !acq.tasks.is_empty() {
                     let mut parsed = Vec::new();
                     let mut issues = Vec::new();
                     for (i, task) in acq.tasks.iter().enumerate() {
                         if task.binding.kind != mesa_core_types::GENERIC_BINDING_KIND {
+                            issues.push(mesa_core_types::ValidationIssue {
+                                path: format!("acquisition.tasks[{i}].binding.kind"),
+                                code: "UNSUPPORTED_BINDING".into(),
+                                message: format!(
+                                    "binding kind `{}` 不再支持，仅允许 {}",
+                                    task.binding.kind,
+                                    mesa_core_types::GENERIC_BINDING_KIND,
+                                ),
+                            });
                             continue;
                         }
                         match mesa_core_types::GenericBinding::from_json(&task.binding.config) {
@@ -299,6 +304,8 @@ async fn device_bootstrap_inner(
                         .iter()
                         .map(|(i, _)| format!("acquisition.tasks[{i}].selections"))
                         .collect();
+                    let modes: Vec<mesa_core_types::TaskMode> =
+                        parsed.iter().map(|(i, _)| acq.tasks[*i].mode()).collect();
                     let inputs: Vec<(
                         &mesa_core_types::TaskMode,
                         &[mesa_core_types::ResourceSelection],
@@ -306,7 +313,8 @@ async fn device_bootstrap_inner(
                     )> = parsed
                         .iter()
                         .zip(roots.iter())
-                        .map(|((i, b), r)| (&acq.tasks[*i].mode, &b.selections[..], r.as_str()))
+                        .zip(modes.iter())
+                        .map(|(((_i, b), r), m)| (m, &b.selections[..], r.as_str()))
                         .collect();
                     issues.extend(mesa_core_types::validate_task_set_against(&desc, &inputs));
                     if !issues.is_empty() {

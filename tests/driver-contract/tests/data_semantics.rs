@@ -4,7 +4,7 @@
 use mesa_config_store::ConfigStore;
 use mesa_core_types::{
     AcquisitionTask, DataBatch, DataType, DriverBinding, PointDescriptor, PointValue, Quality,
-    TaskMode, Value, ValueOrigin, ensure_unique_point_keys, now_unix_ns,
+    TaskSchedule, Value, ValueOrigin, ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_manager::snapshot::Snapshot;
 
@@ -205,8 +205,7 @@ fn revision_success_plus_one() {
         .unwrap();
     let t = AcquisitionTask {
         id: "t1".into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(100),
+        schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
             kind: "k".into(),
             config: serde_json::json!({}),
@@ -246,19 +245,17 @@ fn revision_failure_unchanged() {
         .unwrap();
     let ok = AcquisitionTask {
         id: "t1".into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(100),
+        schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
             kind: "k".into(),
             config: serde_json::json!({}),
         },
     };
     let r1 = store.replace_tasks("ep1", &[ok]).unwrap();
-    // 无效任务（Poll 缺 interval）应失败且 revision 不变
+    // 无效任务（空 id）应失败且 revision 不变
     let bad = AcquisitionTask {
         id: "".into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(100),
+        schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
             kind: "k".into(),
             config: serde_json::json!({}),

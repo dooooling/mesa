@@ -1,13 +1,14 @@
 //! Siemens S7 Driver — 方案 §7.1 地址型（V1 只读）。
 //!
-//! - 绑定种类：`s7.address-group`
+//! - 绑定（Foundation-2 单路径）：`mesa.resources.v1`，resource `memory`
 //!   ```json
-//!   { "items": [
-//!       { "key": "motor.speed", "address": "DB10.DBD20", "data_type": "REAL" },
-//!       { "key": "motor.running", "address": "DB10.DBX24.0", "data_type": "BOOL" }
+//!   { "selections": [
+//!       { "resource_id": "memory",
+//!         "parameters": {"area":"DB","db":10,"offset":20,"data_type":"REAL"},
+//!         "outputs": [{"output":"value","point_key":"motor.speed"}] }
 //!   ]}
 //!   ```
-//! - 支持区域 DB / M / I / Q；类型见 `codec::S7Kind`；Core 不解析地址（硬约束）。
+//! - 支持区域 DB / M / I / Q；类型见 canonical 9 选项；Core 不解析地址（硬约束）。
 
 mod address;
 pub mod client; // Common SZL 直连诊断需对外暴露（V1 只读，不影响 Core 隔离）
@@ -23,17 +24,19 @@ use std::time::Duration;
 use mesa_core_types::{
     AcquisitionTask, CapabilityItem, CapabilityState, DataBatch, DataType, DriverMetadata,
     DuplicatePointKey, GENERIC_BINDING_KIND, GenericBinding, PointDescriptor, PointMap, PointValue,
-    ProbeReport, ProbeWarning, TaskMode, Value, ensure_unique_point_keys, now_unix_ns,
+    ProbeReport, ProbeWarning, TaskSchedule, Value, ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+/// Foundation-2 已删除的 legacy kind（保留常量名仅供错误信息引用，
+/// 不再是合法 binding；见 ADR 0003）。
 pub const BINDING_KIND: &str = "s7.address-group";
 
-/// S7 canonical data_type 公共契约（PR3）：generic `mesa.resources.v1` 路径
+/// S7 canonical data_type 公共契约（PR3）：`mesa.resources.v1` 路径
 /// 只接受这 9 个精确大写拼写；parser 的大小写 alias / LREAL / WSTRING /
-/// TIME 等只属于 legacy `s7.address-group` 兼容，不等于产品契约。
+/// TIME 等解析能力仅供地址解析内部使用，不等于产品契约。
 /// 本表是 descriptor mapping 与 generic 门禁的唯一来源（两处同源）。
 pub const CANONICAL_DATA_TYPES: [(&str, DataType, S7Kind); 9] = [
     ("BOOL", DataType::Bool, S7Kind::Bool),
@@ -449,14 +452,27 @@ impl DriverConnection for S7Connection {
         for task in &tasks {
             task.validate()
                 .map_err(|e| SdkDriverError::configuration("INVALID_TASK", e.to_string()))?;
-            if task.mode != TaskMode::Poll {
-                return Err(SdkDriverError::new(
-                    mesa_core_types::ErrorKind::Unsupported,
-                    "MODE_NOT_SUPPORTED",
-                    format!("task `{}`: s7 仅支持 poll", task.id),
+            // Foundation-2 单真值 + 单路径：S7 仅 Poll + 仅 mesa.resources.v1。
+            let interval_ms = match task.schedule {
+                TaskSchedule::Poll { interval_ms } => interval_ms,
+                TaskSchedule::Subscribe { .. } => {
+                    return Err(SdkDriverError::new(
+                        mesa_core_types::ErrorKind::Unsupported,
+                        "MODE_NOT_SUPPORTED",
+                        format!("task `{}`: s7 仅支持 poll", task.id),
+                    ));
+                }
+            };
+            if task.binding.kind != GENERIC_BINDING_KIND {
+                return Err(SdkDriverError::configuration(
+                    "UNSUPPORTED_BINDING",
+                    format!(
+                        "task `{}`: 期望 {GENERIC_BINDING_KIND}，实际 {}",
+                        task.id, task.binding.kind
+                    ),
                 ));
             }
-            if task.binding.kind == GENERIC_BINDING_KIND {
+            {
                 let binding: GenericBinding = serde_json::from_value(task.binding.config.clone())
                     .map_err(|e| {
                     SdkDriverError::configuration(
@@ -475,9 +491,8 @@ impl DriverConnection for S7Connection {
                         ));
                     }
                     for out in &sel.outputs {
-                        // PR3 canonical：generic 路径只接受结构化参数
-                        // area/db/offset/data_type/bit，拒绝 address 字符串
-                        //（address 只属于 legacy s7.address-group 兼容）。
+                        // PR3 canonical：只接受结构化参数 area/db/offset/data_type/bit，
+                        // 拒绝 address 字符串（legacy 形态已删除）。
                         if sel.parameters.get("address").is_some() {
                             return Err(SdkDriverError::configuration(
                                 "INVALID_BINDING_CONFIG",
@@ -597,7 +612,7 @@ impl DriverConnection for S7Connection {
                                 format!("point `{}` PI/PQ 区暂不支持 BOOL 位访问", out.point_key),
                             ));
                         }
-                        // 合成标准 S7 地址（与 legacy parse_address 同语法）
+                        // 合成标准 S7 地址（与 parse_address 同语法）
                         let addr_str = if area_u == "DB" {
                             if kind == S7Kind::Bool {
                                 format!("DB{db}.DBX{offset}.{}", bit.unwrap_or(0))
@@ -665,124 +680,10 @@ impl DriverConnection for S7Connection {
                 }
                 new_tasks.push(TaskPlan {
                     id: task.id.clone(),
-                    interval_ms: task.interval_ms.expect("validated above"),
+                    interval_ms,
                     point_indices: indices,
                 });
-                continue;
             }
-            if task.binding.kind != BINDING_KIND {
-                return Err(SdkDriverError::configuration(
-                    "UNSUPPORTED_BINDING",
-                    format!(
-                        "task `{}`: 期望 {BINDING_KIND} 或 {GENERIC_BINDING_KIND}，实际 {}",
-                        task.id, task.binding.kind
-                    ),
-                ));
-            }
-            let items = task
-                .binding
-                .config
-                .get("items")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| {
-                    SdkDriverError::configuration(
-                        "INVALID_BINDING_CONFIG",
-                        format!("task `{}`: 缺少 items 数组", task.id),
-                    )
-                })?;
-            if items.is_empty() {
-                return Err(SdkDriverError::configuration(
-                    "INVALID_BINDING_CONFIG",
-                    format!("task `{}`: items 不能为空", task.id),
-                ));
-            }
-            let mut indices = Vec::with_capacity(items.len());
-            for item in items {
-                let key = item.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
-                    SdkDriverError::configuration(
-                        "INVALID_POINT",
-                        format!("task `{}`: point 缺少 key", task.id),
-                    )
-                })?;
-                if key.trim().is_empty() {
-                    return Err(SdkDriverError::configuration(
-                        "INVALID_POINT",
-                        "key 不能为空",
-                    ));
-                }
-                let addr_str = item
-                    .get("address")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        SdkDriverError::configuration(
-                            "INVALID_POINT",
-                            format!("point `{key}` 缺少 address"),
-                        )
-                    })?;
-                let dt_str = item
-                    .get("data_type")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        SdkDriverError::configuration(
-                            "INVALID_POINT",
-                            format!("point `{key}` 缺少 data_type"),
-                        )
-                    })?;
-                let addr = parse_address(addr_str).map_err(|e| match e {
-                    AddressError::Empty => SdkDriverError::configuration(
-                        "INVALID_ADDRESS",
-                        format!("point `{key}` 地址为空"),
-                    ),
-                    AddressError::Invalid { reason, .. } => SdkDriverError::new(
-                        mesa_core_types::ErrorKind::Address,
-                        "INVALID_ADDRESS",
-                        format!("point `{key}` 地址 `{addr_str}` 非法: {reason}"),
-                    ),
-                })?;
-                let (data_type, kind) = parse_data_type(dt_str)?;
-                // 24-bit 同封（legacy 亦不得拖到 read）。
-                addr.wire_bit_address().map_err(|e| {
-                    SdkDriverError::configuration("INVALID_ADDRESS", format!("point `{key}`: {e}"))
-                })?;
-                // BOOL 必须带位
-                if kind == S7Kind::Bool && addr.bit_offset.is_none() {
-                    return Err(SdkDriverError::configuration(
-                        "INVALID_ADDRESS",
-                        format!("point `{key}` BOOL 必须使用位地址如 DB10.DBX0.0 或 M0.0"),
-                    ));
-                }
-                if kind != S7Kind::Bool && addr.bit_offset.is_some() {
-                    return Err(SdkDriverError::configuration(
-                        "INVALID_ADDRESS",
-                        format!("point `{key}` 非 BOOL 不应带位偏移"),
-                    ));
-                }
-                // PI/PQ + BOOL 明确拒绝（同 generic 路径：位语义不支持，
-                // parse 会丢位后缀，静默接受即错读）。
-                if matches!(
-                    addr.area,
-                    crate::address::Area::PeripheralInput | crate::address::Area::PeripheralOutput
-                ) && kind == S7Kind::Bool
-                {
-                    return Err(SdkDriverError::configuration(
-                        "INVALID_ADDRESS",
-                        format!("point `{key}` PI/PQ 区暂不支持 BOOL 位访问"),
-                    ));
-                }
-                indices.push(new_points.len());
-                new_points.push(PointSpec {
-                    key: key.to_string(),
-                    addr,
-                    kind,
-                    data_type,
-                });
-            }
-            let interval = task.interval_ms.expect("validated");
-            new_tasks.push(TaskPlan {
-                id: task.id.clone(),
-                interval_ms: interval,
-                point_indices: indices,
-            });
         }
 
         let descriptors: Vec<PointDescriptor> = new_points
@@ -1144,16 +1045,19 @@ impl DriverConnection for S7Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
+    use mesa_core_types::{AcquisitionTask, DriverBinding};
 
-    fn task_with_items(items: serde_json::Value) -> AcquisitionTask {
+    fn generic_task(selections: serde_json::Value) -> AcquisitionTask {
+        generic_task_with_id("t1", selections)
+    }
+
+    fn generic_task_with_id(id: &str, selections: serde_json::Value) -> AcquisitionTask {
         AcquisitionTask {
-            id: "t1".into(),
-            mode: TaskMode::Poll,
-            interval_ms: Some(100),
+            id: id.into(),
+            schedule: mesa_core_types::TaskSchedule::Poll { interval_ms: 100 },
             binding: DriverBinding {
-                kind: BINDING_KIND.into(),
-                config: serde_json::json!({"items": items}),
+                kind: GENERIC_BINDING_KIND.into(),
+                config: serde_json::json!({"selections": selections}),
             },
         }
     }
@@ -1164,24 +1068,36 @@ mod tests {
             cfg: S7ConnConfig::default(),
             plan: None,
         };
-        let items = serde_json::json!([
-            {"key":"a","address":"DB10.DBD0","data_type":"REAL"},
-            {"key":"b","address":"DB10.DBX0.0","data_type":"BOOL"}
+        // generic 双点：REAL + BOOL
+        let sel = serde_json::json!([
+            {"resource_id":"memory","parameters":{"area":"DB","db":10,"offset":0,"data_type":"REAL"},"outputs":[{"output":"value","point_key":"a"}]},
+            {"resource_id":"memory","parameters":{"area":"DB","db":10,"offset":4,"data_type":"BOOL","bit":0},"outputs":[{"output":"value","point_key":"b"}]},
         ]);
-        let t = task_with_items(items);
+        let t = generic_task(sel);
         let descs = conn.configure(1, vec![t]).await.unwrap();
         assert_eq!(descs.len(), 2);
         assert_eq!(descs[0].data_type, mesa_core_types::DataType::F32);
-        // 重复 key
-        let dup = serde_json::json!([
-            {"key":"a","address":"DB10.DBD0","data_type":"REAL"},
-            {"key":"a","address":"DB10.DBD4","data_type":"REAL"}
-        ]);
-        let err = conn
-            .configure(2, vec![task_with_items(dup)])
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, "DUPLICATE_POINT_KEY");
+        // 跨 revision 重复 key（不同 task 各带同一 point_key → 跨快照检查拒绝；
+        // 同一 task 内重复则早于此被结构级拒绝，见 generic 路径 validate_selections_structure）
+        for rev in [2u64, 3] {
+            let dup = serde_json::json!([
+                {"resource_id":"memory","parameters":{"area":"DB","db":10,"offset":0,"data_type":"REAL"},"outputs":[{"output":"value","point_key":"a"}]},
+            ]);
+            let other = serde_json::json!([
+                {"resource_id":"memory","parameters":{"area":"DB","db":10,"offset":4,"data_type":"REAL"},"outputs":[{"output":"value","point_key":"a"}]},
+            ]);
+            let err = conn
+                .configure(
+                    rev,
+                    vec![
+                        generic_task_with_id("t1", dup),
+                        generic_task_with_id("t2", other),
+                    ],
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, "DUPLICATE_POINT_KEY", "rev {rev}");
+        }
     }
 
     #[tokio::test]
@@ -1190,24 +1106,13 @@ mod tests {
             cfg: S7ConnConfig::default(),
             plan: None,
         };
-        let items = serde_json::json!([{"key":"a","address":"DB10.DBD0","data_type":"BOOL"}]);
+        // BOOL 缺 bit（generic canonical 参数面）
+        let sel = serde_json::json!([{"resource_id":"memory","parameters":{"area":"DB","db":10,"offset":0,"data_type":"BOOL"},"outputs":[{"output":"value","point_key":"a"}]}]);
         let err = conn
-            .configure(1, vec![task_with_items(items)])
+            .configure(1, vec![generic_task(sel)])
             .await
             .unwrap_err();
         assert_eq!(err.code, "INVALID_ADDRESS");
-    }
-
-    fn generic_task(selections: serde_json::Value) -> AcquisitionTask {
-        AcquisitionTask {
-            id: "t1".into(),
-            mode: TaskMode::Poll,
-            interval_ms: Some(100),
-            binding: DriverBinding {
-                kind: GENERIC_BINDING_KIND.into(),
-                config: serde_json::json!({"selections": selections}),
-            },
-        }
     }
 
     fn memory_selection(point_key: &str, params: serde_json::Value) -> serde_json::Value {
@@ -1420,19 +1325,21 @@ mod tests {
         }
     }
 
-    /// legacy 路径同样拒绝 PI/PQ + BOOL（parse 丢位，静默接受即错读）。
+    /// PI/PQ + BOOL 位语义不支持（generic canonical 参数面）。
     #[tokio::test]
-    async fn legacy_rejects_peripheral_bool() {
-        let mut conn = S7Connection {
-            cfg: S7ConnConfig::default(),
-            plan: None,
-        };
-        let items = serde_json::json!([{"key":"k","address":"PI0.3","data_type":"BOOL"}]);
-        let err = conn
-            .configure(1, vec![task_with_items(items)])
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, "INVALID_ADDRESS");
+    async fn generic_rejects_peripheral_bool() {
+        for area in ["PI", "PQ"] {
+            let mut conn = S7Connection {
+                cfg: S7ConnConfig::default(),
+                plan: None,
+            };
+            let sel = serde_json::json!([{"resource_id":"memory","parameters":{"area":area,"offset":0,"data_type":"BOOL","bit":3},"outputs":[{"output":"value","point_key":"k"}]}]);
+            let err = conn
+                .configure(1, vec![generic_task(sel)])
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, "INVALID_ADDRESS", "{area}");
+        }
     }
 
     /// 按 parse_szl_module_id 的布局假设构造合成 SZL 载荷（自举一致性；

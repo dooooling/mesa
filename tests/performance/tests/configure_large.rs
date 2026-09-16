@@ -3,20 +3,19 @@
 
 use std::time::Instant;
 
-use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
+use mesa_core_types::{AcquisitionTask, DriverBinding, TaskSchedule, GENERIC_BINDING_KIND};
 use mesa_driver_sdk::Driver;
 
 fn make_task(n: usize, id: &str) -> AcquisitionTask {
-    let points: Vec<serde_json::Value> = (0..n)
-        .map(|i| serde_json::json!({"key": format!("p{i}"), "kind": "counter"}))
+    let sels: Vec<serde_json::Value> = (0..n)
+        .map(|i| serde_json::json!({"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key": format!("p{i}")}]}))
         .collect();
     AcquisitionTask {
         id: id.into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(100),
+        schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
-            kind: mesa_driver_simulator::BINDING_KIND.into(),
-            config: serde_json::json!({"points": points}),
+            kind: GENERIC_BINDING_KIND.into(),
+            config: serde_json::json!({"selections": sels}),
         },
     }
 }

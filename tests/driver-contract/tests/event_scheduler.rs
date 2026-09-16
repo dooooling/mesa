@@ -59,10 +59,10 @@ async fn control_priority_under_event_and_data_flood() {
         endpoint_id: ep.into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
-        tasks: vec![common::poll_task(
+        tasks: vec![common::poll_task_legacy_points(
             "d",
             500,
-            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+            serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
         )],
         event_tasks: vec![generic_counter_task()],
     })

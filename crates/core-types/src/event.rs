@@ -193,6 +193,13 @@ impl EventTask {
         }
         Ok(())
     }
+
+    /// Foundation-2 说明：EventTask 本次只做 legacy removal，不引入 schedule
+    ///（ADR 0003 决策 5）；`mode()` 仅为与 AcquisitionTask 调用点对称的投影，
+    ///避免 gate 层为两种任务写两套 mode 提取逻辑。
+    pub fn mode(&self) -> TaskMode {
+        self.mode
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]

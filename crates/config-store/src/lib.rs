@@ -18,7 +18,9 @@ use mesa_core_types::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// 当前 schema 版本。增量迁移时递增并在 `meta` 中持久化（§6.1）。
-const SCHEMA_VERSION: i64 = 8;
+/// v9（Foundation-2）：tasks / event_tasks 表 mode + interval_ms 两列由
+/// schedule_json 单列替代（调度单真值，ADR 0003 §37.3）。
+const SCHEMA_VERSION: i64 = 9;
 
 // ---------------------------------------------------------------------------
 // 记录类型
@@ -329,6 +331,7 @@ impl ConfigStore {
                 interval_ms INTEGER,
                 binding_kind TEXT NOT NULL,
                 binding_config_json TEXT NOT NULL,
+                schedule_json TEXT NOT NULL DEFAULT '{"mode":"poll","interval_ms":0}',
                 PRIMARY KEY(endpoint_id, id)
             );
             CREATE TABLE IF NOT EXISTS point_registry(
@@ -648,6 +651,86 @@ impl ConfigStore {
                 )?;
                 tx.commit()?;
                 cur_ver = 8;
+            }
+        }
+        // 009 迁移（Foundation-2 调度单真值）：tasks / event_tasks 表
+        // mode + interval_ms 两列由 schedule_json 单列替代。
+        // 旧行回填：poll → {"mode":"poll","interval_ms":<n>}（缺失视为 0，
+        // 由 validate 在读取时拒绝，不在此静默修）；
+        // subscribe → {"mode":"subscribe"}（缺省订阅参数）。
+        if cur_ver < 9 {
+            let has_9: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=9)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !has_9 {
+                Self::backup_file_db(&conn);
+                let tx = conn.transaction()?;
+                for tbl in ["tasks", "event_tasks"] {
+                    // 旧库可能缺 event_tasks 表（v2/v4 形态）：不存在即跳过
+                    //（003 迁移会补建，补建后新表自带 schedule_json 列语义见建表语句）。
+                    let has_tbl: bool = tx
+                        .query_row(
+                            &format!(
+                                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='{tbl}')"
+                            ),
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(false);
+                    if !has_tbl {
+                        continue;
+                    }
+                    let has_col: bool = tx
+                        .query_row(
+                            &format!(
+                                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{tbl}') WHERE name='schedule_json')"
+                            ),
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(false);
+                    if !has_col {
+                        tx.execute_batch(&format!(
+                            "ALTER TABLE {tbl} ADD COLUMN schedule_json TEXT NULL;"
+                        ))?;
+                    }
+                    // 逐行回填（NULL 或空串才写，避免覆盖已迁移行）
+                    let mut stmt = tx.prepare(&format!(
+                        "SELECT rowid, mode, interval_ms FROM {tbl} WHERE schedule_json IS NULL OR trim(schedule_json)=''"
+                    ))?;
+                    let rows: Vec<(i64, String, Option<i64>)> = stmt
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    drop(stmt);
+                    for (rowid, mode, interval) in rows {
+                        let sched = if mode == "subscribe" {
+                            serde_json::json!({"mode": "subscribe"})
+                        } else {
+                            serde_json::json!({"mode": "poll", "interval_ms": interval.unwrap_or(0)})
+                        };
+                        tx.execute(
+                            &format!("UPDATE {tbl} SET schedule_json=?1 WHERE rowid=?2"),
+                            params![sched.to_string(), rowid],
+                        )?;
+                    }
+                }
+                let sql9 = include_str!("../migrations/009_task_schedule.sql");
+                let checksum9 = format!("{:x}", sql9.len());
+                tx.execute(
+                    "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(9,'009_task_schedule',?1,?2)",
+                    params![checksum9, Self::now_ns()],
+                )?;
+                tx.execute("UPDATE meta SET value='9' WHERE key='schema_version'", [])?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','9')",
+                    [],
+                )?;
+                tx.commit()?;
+                cur_ver = 9;
             }
         }
         // 最终确保 meta 为最新
@@ -1258,6 +1341,9 @@ impl ConfigStore {
         Ok(next)
     }
 
+    /// schedule → schedule_json 单列写入（Foundation-2 单真值）。
+    /// 旧 mode/interval_ms 列保留但不再写入（迁移期旧库可读；新库默认
+    /// schedule_json 列存在，mode/interval 列写入 NULL 由读取侧忽略）。
     fn replace_tasks_in_tx(
         tx: &Transaction<'_>,
         endpoint_id: &str,
@@ -1268,16 +1354,18 @@ impl ConfigStore {
             params![endpoint_id],
         )?;
         for t in tasks {
+            let sched_json = serde_json::to_string(&t.schedule).map_err(StoreError::Json)?;
             tx.execute(
-                "INSERT INTO tasks(endpoint_id,id,mode,interval_ms,binding_kind,binding_config_json)
-                 VALUES(?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO tasks(endpoint_id,id,mode,interval_ms,binding_kind,binding_config_json,schedule_json)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     endpoint_id,
                     t.id,
-                    t.mode.as_str(),
-                    t.interval_ms.map(|v| v as i64),
+                    t.mode().as_str(),
+                    t.interval_ms().map(|v| v as i64),
                     t.binding.kind,
                     serde_json::to_string(&t.binding.config).unwrap(),
+                    sched_json,
                 ],
             )?;
         }
@@ -1287,22 +1375,53 @@ impl ConfigStore {
     pub fn list_tasks(&self, endpoint_id: &str) -> Result<Vec<AcquisitionTask>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,mode,interval_ms,binding_kind,binding_config_json FROM tasks WHERE endpoint_id=?1 ORDER BY id",
+            "SELECT id,mode,interval_ms,binding_kind,binding_config_json,schedule_json FROM tasks WHERE endpoint_id=?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(params![endpoint_id], |r| {
-            let mode_s: String = r.get(1)?;
-            let mode = match mode_s.as_str() {
-                "poll" => mesa_core_types::TaskMode::Poll,
-                "subscribe" => mesa_core_types::TaskMode::Subscribe,
-                _ => mesa_core_types::TaskMode::Poll,
+            // Foundation-2 单真值：优先读 schedule_json；缺失（旧库未迁移行）
+            // 回落旧两列并按 009 迁移规则解读（poll 缺 interval 即硬失败，
+            // subscribe 归一缺省调度）。未知 mode 硬失败（静默回落 Poll 已删除）。
+            let sched_json: Option<String> = r.get(5).ok().flatten();
+            let schedule = match sched_json {
+                Some(s) if !s.trim().is_empty() => serde_json::from_str(&s).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        format!("corrupt task schedule_json: {e}").into(),
+                    )
+                })?,
+                _ => {
+                    let mode_s: String = r.get(1)?;
+                    let interval = r.get::<_, Option<i64>>(2)?.map(|v| v as u64);
+                    match mode_s.as_str() {
+                        "poll" => {
+                            let interval_ms = interval.unwrap_or(0);
+                            if interval_ms == 0 {
+                                return Err(rusqlite::Error::FromSqlConversionFailure(
+                                    2,
+                                    rusqlite::types::Type::Integer,
+                                    "poll task 缺少正整数 interval_ms".into(),
+                                ));
+                            }
+                            mesa_core_types::TaskSchedule::Poll { interval_ms }
+                        }
+                        "subscribe" => mesa_core_types::TaskSchedule::default_subscribe(),
+                        other => {
+                            return Err(rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                format!("unknown task mode `{other}`").into(),
+                            ));
+                        }
+                    }
+                }
             };
             let binding_config_json: String = r.get(4)?;
             let cfg: serde_json::Value =
                 serde_json::from_str(&binding_config_json).unwrap_or(serde_json::json!({}));
             Ok(AcquisitionTask {
                 id: r.get(0)?,
-                mode,
-                interval_ms: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                schedule,
                 binding: mesa_core_types::DriverBinding {
                     kind: r.get(3)?,
                     config: cfg,
@@ -1359,8 +1478,8 @@ impl ConfigStore {
         )?;
         for t in tasks {
             tx.execute(
-                "INSERT INTO event_tasks(endpoint_id,id,mode,interval_ms,binding_kind,binding_config_json)
-                 VALUES(?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO event_tasks(endpoint_id,id,mode,interval_ms,binding_kind,binding_config_json,schedule_json)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     endpoint_id,
                     t.id,
@@ -1368,6 +1487,9 @@ impl ConfigStore {
                     t.interval_ms.map(|v| v as i64),
                     t.binding.kind,
                     serde_json::to_string(&t.binding.config).unwrap(),
+                    // EventTask 本次不引入 schedule（ADR 0003 决策 5）；
+                    // schedule_json 列仅作迁移占位，固定写入 mode 派生值。
+                    serde_json::json!({"mode": t.mode.as_str()}).to_string(),
                 ],
             )?;
         }
@@ -1906,8 +2028,9 @@ mod tests {
     fn task(id: &str, interval: u64) -> AcquisitionTask {
         AcquisitionTask {
             id: id.into(),
-            mode: TaskMode::Poll,
-            interval_ms: Some(interval),
+            schedule: mesa_core_types::TaskSchedule::Poll {
+                interval_ms: interval,
+            },
             binding: DriverBinding {
                 kind: "simulator.points".into(),
                 config: serde_json::json!({}),
@@ -2020,8 +2143,7 @@ mod tests {
         s.create_endpoint(&ep("e1", "d1")).unwrap();
         let bad = AcquisitionTask {
             id: "t1".into(),
-            mode: TaskMode::Poll,
-            interval_ms: None,
+            schedule: mesa_core_types::TaskSchedule::Poll { interval_ms: 0 },
             binding: DriverBinding {
                 kind: "k".into(),
                 config: serde_json::json!({}),
@@ -2067,7 +2189,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "8");
+        assert_eq!(ver, "9");
         let has: bool = s
             .conn
             .lock()
@@ -2088,7 +2210,7 @@ mod tests {
         let tasks = s.list_event_tasks("e1").unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "al");
-        assert_eq!(tasks[0].mode, TaskMode::Subscribe);
+        assert_eq!(tasks[0].mode(), TaskMode::Subscribe);
         // revision 与 Data tasks 共用计数器
         s.replace_tasks("e1", &[task("t1", 100)]).unwrap();
         assert_eq!(s.current_revision("e1").unwrap(), 2);
@@ -2215,7 +2337,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "8");
+            assert_eq!(ver, "9");
             // 004：profile 列已删除，但设备行本身保留（仅去列，不丢行）
             let cols: Vec<String> = conn
                 .prepare("PRAGMA table_info(devices)")
@@ -2248,7 +2370,14 @@ mod tests {
             assert_eq!(blob, vec![1u8, 2, 3]);
         }
         // 公共 API 视角：endpoint/任务可读，event_tasks 可用
+        //（v2 旧任务为 legacy simulator.points：009 迁移只转 schedule，
+        // kind 原样保留；读取走 schedule_json 新路径，语义与旧两列一致）
         assert_eq!(s.list_tasks("e1").unwrap().len(), 1);
+        let t = &s.list_tasks("e1").unwrap()[0];
+        assert_eq!(
+            t.schedule,
+            mesa_core_types::TaskSchedule::Poll { interval_ms: 100 }
+        );
         assert!(s.list_event_tasks("e1").unwrap().is_empty());
         s.replace_event_tasks("e1", &[event_task("al")]).unwrap();
         assert_eq!(s.list_event_tasks("e1").unwrap().len(), 1);
@@ -2306,7 +2435,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "8");
+            assert_eq!(ver, "9");
             // 旧行以 id 回填 name，业务行保留
             let old_name: String = conn
                 .query_row("SELECT name FROM endpoints WHERE id='e1'", [], |r| r.get(0))
@@ -2409,7 +2538,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "8");
+            assert_eq!(ver, "9");
             // 006 幂等表已建
             let tbl: String = conn
                 .query_row(
@@ -2529,7 +2658,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "8");
+            assert_eq!(ver, "9");
             let has7: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7)",
@@ -2679,8 +2808,8 @@ mod tests {
         ));
     }
 
-    /// P2：真实 v7 形态库 open() → v8。v7 即 P1 合并后基线（007 已应用、
-    /// point_registry 无 display_name 列）：旧行无损、新列 NULL、008 记录存在。
+    /// P2：真实 v7 形态库 open() → v9。v7 即 P1 合并后基线（007 已应用、
+    /// point_registry 无 display_name 列）：旧行无损、新列 NULL、008/009 记录存在。
     #[test]
     fn v7_file_db_upgrades_to_v8_with_null_names() {
         let mut path = std::env::temp_dir();
@@ -2768,7 +2897,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "8");
+            assert_eq!(ver, "9");
             let has8: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=8)",
@@ -3032,8 +3161,8 @@ mod tests {
             )
             .unwrap();
         // PR7 起 SCHEMA_VERSION=3，DeviceProfile 删除后升至 4，Endpoint.name 后升至 5；
-        // 002/003 本身仍必须存在且已应用（增量链不断）
-        assert!(ver == "8", "新库应为 v8，got {ver}");
+        // 002/003 本身仍必须存在且已应用（增量链不断）；Foundation-2 后升至 9。
+        assert!(ver == "9", "新库应为 v9，got {ver}");
         let has2: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=2)",

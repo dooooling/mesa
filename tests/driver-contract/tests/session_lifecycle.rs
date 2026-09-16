@@ -6,7 +6,7 @@ mod common;
 
 use std::time::Duration;
 
-use mesa_core_types::{AcquisitionTask, PointDescriptor, TaskMode};
+use mesa_core_types::{AcquisitionTask, PointDescriptor};
 use mesa_driver_manager::session::Session;
 use mesa_driver_protocol::pb;
 
@@ -70,20 +70,29 @@ async fn invalid_config_returns_structured_error() {
 
     open_connection(&session, H, "{}").await;
 
-    // 1) 错误的 binding kind
+    // 1) 错误的 binding kind（legacy 已删除：非 generic 即拒绝）
     let bad_kind = vec![AcquisitionTask {
         id: "t".into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(50),
+        schedule: mesa_core_types::TaskSchedule::Poll { interval_ms: 50 },
         binding: mesa_core_types::DriverBinding {
-            kind: "s7.address-group".into(), // simulator 不支持
+            kind: "s7.address-group".into(), // legacy kind，simulator 不接受
             config: serde_json::json!({}),
         },
     }];
     configure_tasks_expect_error(&mut session, &mut events, &bad_kind, "UNSUPPORTED_BINDING").await;
 
-    // 2) 缺少 points 数组
-    let missing = vec![poll_task("t", 50, serde_json::json!({}))];
+    // 2) 空 selections（结构非法）
+    // NOTE：空 Vec 经 wire 往返后 tasks_to_pb 解码为 default_subscribe；
+    // 空 selections 在 Subscribe 语义下合法（零点快照），故此处直接构造
+    // Poll 空 selections，保证测的是"结构非法"而非"零点快照"。
+    let missing = vec![AcquisitionTask {
+        id: "t".into(),
+        schedule: mesa_core_types::TaskSchedule::Poll { interval_ms: 50 },
+        binding: mesa_core_types::DriverBinding {
+            kind: mesa_core_types::GENERIC_BINDING_KIND.into(),
+            config: serde_json::json!({"selections": []}),
+        },
+    }];
     configure_tasks_expect_error(
         &mut session,
         &mut events,
@@ -92,20 +101,19 @@ async fn invalid_config_returns_structured_error() {
     )
     .await;
 
-    // 3) Subscribe 模式不被支持
+    // 3) Subscribe 模式不被 simulator 支持
     let sub = vec![AcquisitionTask {
         id: "t".into(),
-        mode: TaskMode::Subscribe,
-        interval_ms: None,
+        schedule: mesa_core_types::TaskSchedule::default_subscribe(),
         binding: mesa_core_types::DriverBinding {
-            kind: mesa_driver_simulator::BINDING_KIND.into(),
-            config: serde_json::json!({"points": [{"key":"x","kind":"constant","value":1}]}),
+            kind: mesa_core_types::GENERIC_BINDING_KIND.into(),
+            config: serde_json::json!({"selections": [{"resource_id":"constant","parameters":{"value":1},"outputs":[{"output":"value","point_key":"x"}]}]}),
         },
     }];
     configure_tasks_expect_error(&mut session, &mut events, &sub, "MODE_NOT_SUPPORTED").await;
 
     // 4) 未知数据源 kind
-    let unknown = vec![poll_task(
+    let unknown = vec![poll_task_legacy_points(
         "t",
         50,
         serde_json::json!({"points":[{"key":"x","kind":"warp_drive"}]}),
@@ -169,12 +177,12 @@ async fn duplicate_point_key_rejected_over_ipc() {
 
     open_connection(&session, H, "{}").await;
     let dup = vec![
-        poll_task(
+        poll_task_legacy_points(
             "t1",
             100,
             serde_json::json!({"points":[{"key":"same.key","kind":"counter"}]}),
         ),
-        poll_task(
+        poll_task_legacy_points(
             "t2",
             100,
             serde_json::json!({"points":[{"key":"same.key","kind":"counter"}]}),
@@ -205,12 +213,17 @@ async fn failed_reconfigure_keeps_previous_snapshot() {
 
     open_connection(&session, H, "{}").await;
     // rev1 合法快照
-    let good: Vec<PointDescriptor> =
-        configure_tasks(&session, H, 1, &[poll_task("t", 40, two_points())]).await;
+    let good: Vec<PointDescriptor> = configure_tasks(
+        &session,
+        H,
+        1,
+        &[poll_task_legacy_points("t", 40, two_points())],
+    )
+    .await;
     assert_eq!(good.len(), 2);
 
     // rev2 非法快照 → 被拒绝
-    let broken = vec![poll_task(
+    let broken = vec![poll_task_legacy_points(
         "t",
         40,
         serde_json::json!({"points":[{"key":"b.x","kind":"black_hole"}]}),
@@ -249,8 +262,20 @@ async fn point_registration_stable_across_configures() {
     let (session, _events, _) = Session::connect(port, TOKEN).await.unwrap();
 
     open_connection(&session, H, "{}").await;
-    let d1 = configure_tasks(&session, H, 1, &[poll_task("t", 100, two_points())]).await;
-    let d2 = configure_tasks(&session, H, 2, &[poll_task("t", 100, two_points())]).await;
+    let d1 = configure_tasks(
+        &session,
+        H,
+        1,
+        &[poll_task_legacy_points("t", 100, two_points())],
+    )
+    .await;
+    let d2 = configure_tasks(
+        &session,
+        H,
+        2,
+        &[poll_task_legacy_points("t", 100, two_points())],
+    )
+    .await;
     assert_eq!(
         d1, d2,
         "descriptor set must be stable across identical reconfigures"
@@ -266,7 +291,13 @@ async fn start_stop_idempotent_without_leaks() {
     let (mut session, mut events, _) = Session::connect(port, TOKEN).await.unwrap();
 
     open_connection(&session, H, "{}").await;
-    let descriptors = configure_tasks(&session, H, 1, &[poll_task("t", 40, two_points())]).await;
+    let descriptors = configure_tasks(
+        &session,
+        H,
+        1,
+        &[poll_task_legacy_points("t", 40, two_points())],
+    )
+    .await;
     apply_point_map(&session, H, 1, sequential_ids(&descriptors, 1)).await;
 
     // 第一轮运行
@@ -302,7 +333,13 @@ async fn start_while_running_is_rejected() {
     let (session, mut events, _) = Session::connect(port, TOKEN).await.unwrap();
 
     open_connection(&session, H, "{}").await;
-    let descriptors = configure_tasks(&session, H, 1, &[poll_task("t", 50, two_points())]).await;
+    let descriptors = configure_tasks(
+        &session,
+        H,
+        1,
+        &[poll_task_legacy_points("t", 50, two_points())],
+    )
+    .await;
     apply_point_map(&session, H, 1, sequential_ids(&descriptors, 1)).await;
     start_connection(&session, H, 5).await;
     recv_batch(&mut events, 3).await; // 确认已在运行
@@ -344,8 +381,20 @@ async fn multiple_connections_and_partial_failure_isolation() {
     open_connection(&session, HA, "{}").await;
     open_connection(&session, HB, "{}").await;
 
-    let da = configure_tasks(&session, HA, 1, &[poll_task("ta", 50, two_points())]).await;
-    let db = configure_tasks(&session, HB, 1, &[poll_task("tb", 70, two_points())]).await;
+    let da = configure_tasks(
+        &session,
+        HA,
+        1,
+        &[poll_task_legacy_points("ta", 50, two_points())],
+    )
+    .await;
+    let db = configure_tasks(
+        &session,
+        HB,
+        1,
+        &[poll_task_legacy_points("tb", 70, two_points())],
+    )
+    .await;
     apply_point_map(&session, HA, 1, sequential_ids(&da, 100)).await;
     apply_point_map(&session, HB, 1, sequential_ids(&db, 200)).await;
     start_connection(&session, HA, 1).await;
@@ -371,7 +420,7 @@ async fn multiple_connections_and_partial_failure_isolation() {
     );
 
     // Partial failure：连接 B 配置一个非法任务被拒，A 不受影响继续出数
-    let broken = vec![poll_task(
+    let broken = vec![poll_task_legacy_points(
         "bad",
         50,
         serde_json::json!({"points":[{"key":"z","kind":"nope"}]}),
@@ -410,7 +459,13 @@ async fn runtime_reconfigure_swaps_epoch_and_points() {
     let (mut session, mut events, _) = Session::connect(port, TOKEN).await.unwrap();
 
     open_connection(&session, H, "{}").await;
-    let old = configure_tasks(&session, H, 1, &[poll_task("t", 40, two_points())]).await;
+    let old = configure_tasks(
+        &session,
+        H,
+        1,
+        &[poll_task_legacy_points("t", 40, two_points())],
+    )
+    .await;
     apply_point_map(&session, H, 1, sequential_ids(&old, 1)).await;
     start_connection(&session, H, 111).await;
     recv_batch(&mut events, 3).await;
@@ -418,7 +473,7 @@ async fn runtime_reconfigure_swaps_epoch_and_points() {
     // Stop -> Configure(新点集) -> Apply -> Start(new epoch)
     assert!(stop_connection(&session, H).await);
     drain_pre_barrier_events(&mut events);
-    let new_tasks = vec![poll_task(
+    let new_tasks = vec![poll_task_legacy_points(
         "t2",
         40,
         serde_json::json!({"points":[{"key":"n.only","kind":"constant","value":9}]}),

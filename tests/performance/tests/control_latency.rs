@@ -1,17 +1,16 @@
 //! Control 面 IPC 延迟（§22）：Write/Command 走可靠 Control 队列 p95≤20ms/p99≤50ms（单调时钟）
 //! 30 samples 取 p95/p99，Simulator 本地环路应远低于预算
 
-use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode, Value};
+use mesa_core_types::{AcquisitionTask, DriverBinding, TaskSchedule, Value, GENERIC_BINDING_KIND};
 use mesa_driver_sdk::Driver;
 
 fn poll_task(key: &str) -> AcquisitionTask {
     AcquisitionTask {
         id: "t".into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(100),
+        schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
-            kind: mesa_driver_simulator::BINDING_KIND.into(),
-            config: serde_json::json!({"points": [{"key": key, "kind": "counter"}]}),
+            kind: GENERIC_BINDING_KIND.into(),
+            config: serde_json::json!({"selections": [{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key": key}]}]}),
         },
     }
 }

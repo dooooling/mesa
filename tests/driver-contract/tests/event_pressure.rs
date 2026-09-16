@@ -43,10 +43,10 @@ fn generic_counter_task() -> EventTask {
 }
 
 fn data_task_20points() -> serde_json::Value {
-    let points: Vec<serde_json::Value> = (0..20)
-        .map(|i| serde_json::json!({"key": format!("k.{i}"), "kind": "counter"}))
+    let sels: Vec<serde_json::Value> = (0..20)
+        .map(|i| serde_json::json!({"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key": format!("k.{i}")}]}))
         .collect();
-    serde_json::json!({"points": points})
+    serde_json::Value::Array(sels)
 }
 
 struct Rig {
@@ -68,7 +68,11 @@ impl Rig {
         ));
         let mut tasks = vec![];
         if with_data {
-            tasks.push(common::poll_task("d", 10, data_task_20points()));
+            tasks.push(common::poll_task_legacy_points(
+                "d",
+                10,
+                data_task_20points(),
+            ));
         }
         mgr.start_endpoint(BuiltinEndpoint {
             endpoint_id: endpoint_id.into(),

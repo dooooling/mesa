@@ -36,16 +36,15 @@ use mesa_core_types::{
     AcquisitionTask, ConditionTransition, DataBatch, DataType, DriverMetadata, DuplicatePointKey,
     ErrorKind, EventCondition, EventRecord, EventTask, GENERIC_BINDING_KIND,
     GENERIC_EVENT_BINDING_KIND, GenericBinding, GenericEventBinding, PointDescriptor, PointMap,
-    PointValue, Quality, TaskMode, Value, ensure_unique_point_keys, now_unix_ns,
+    PointValue, Quality, TaskMode, TaskSchedule, Value, ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, EventSink, SdkDriverError};
 use tokio_util::sync::CancellationToken;
 
+/// Foundation-2 已删除的 legacy kind（保留常量名仅供错误信息与测试断言引用，
+/// 不再是合法 binding；见 ADR 0003）。
 pub const BINDING_KIND: &str = "simulator.points";
-/// 事件任务 binding kind（PR7 legacy，继续接受）：config 形如 `{ "stream": "sim.events.counter" }`，
-/// stream 取值见 [`SIM_EVENT_STREAM_COUNTER`] / [`SIM_EVENT_STREAM_ALARM`]。
-/// 新标准为 `mesa.events.v1`（[`GENERIC_EVENT_BINDING_KIND`]）；Web 只生成新标准。
-/// 语义完全由本驱动解释（Core 不懂协议）。
+/// Foundation-2 已删除的 legacy 事件 kind（同上）。
 pub const EVENT_BINDING_KIND: &str = "simulator.events";
 /// 计数器事件流：周期性瞬时事件（`counter.tick`），无 condition。
 pub const SIM_EVENT_STREAM_COUNTER: &str = "sim.events.counter";
@@ -713,91 +712,71 @@ impl DriverConnection for SimConnection {
         for task in &tasks {
             task.validate()
                 .map_err(|e| SdkDriverError::configuration("INVALID_TASK", e.to_string()))?;
-            // Simulator 仅支持 Poll；Subscribe 属于 OPC UA 能力（§5.5）
-            if task.mode != TaskMode::Poll {
-                return Err(SdkDriverError::new(
-                    ErrorKind::Unsupported,
-                    "MODE_NOT_SUPPORTED",
-                    format!("task `{}`: simulator only supports poll mode", task.id),
+            // Simulator 仅支持 Poll；Subscribe 属于 OPC UA 能力（§5.5）。
+            // Foundation-2 单真值：调度由 schedule 派生，不再读 mode 字段。
+            let interval_ms = match task.schedule {
+                TaskSchedule::Poll { interval_ms } => interval_ms,
+                TaskSchedule::Subscribe { .. } => {
+                    return Err(SdkDriverError::new(
+                        ErrorKind::Unsupported,
+                        "MODE_NOT_SUPPORTED",
+                        format!("task `{}`: simulator only supports poll mode", task.id),
+                    ));
+                }
+            };
+            // Foundation-2 单路径：仅接受 mesa.resources.v1（legacy 已删除）。
+            if task.binding.kind != GENERIC_BINDING_KIND {
+                return Err(SdkDriverError::configuration(
+                    "UNSUPPORTED_BINDING",
+                    format!(
+                        "task `{}`: binding kind `{}` unsupported, expected `{GENERIC_BINDING_KIND}`",
+                        task.id, task.binding.kind
+                    ),
                 ));
             }
-            if task.binding.kind == GENERIC_BINDING_KIND {
-                // 通用 ResourceSelection 路径（§15）：selections -> points
-                let binding: GenericBinding = serde_json::from_value(task.binding.config.clone())
-                    .map_err(|e| {
+            // 通用 ResourceSelection 路径（§15）：selections -> points
+            let binding: GenericBinding = serde_json::from_value(task.binding.config.clone())
+                .map_err(|e| {
                     SdkDriverError::configuration(
                         "INVALID_BINDING_CONFIG",
                         format!("task `{}`: invalid generic binding: {e}", task.id),
                     )
                 })?;
-                // 结构级校验（point_key 唯一等）
-                mesa_core_types::validate_selections_structure(&binding.selections)
-                    .map_err(|e| SdkDriverError::configuration("INVALID_BINDING_CONFIG", e))?;
-                let mut indices = Vec::new();
-                for sel in &binding.selections {
-                    // Simulator 资源映射：resource_id 即 SourceKind，parameters 即源参数
-                    for out in &sel.outputs {
-                        // 构造与 Legacy 兼容的 SourceSpec 解析输入：合并 kind 与 parameters
-                        let mut src_json = sel.parameters.clone();
-                        if src_json.is_null() {
-                            src_json = serde_json::json!({});
-                        }
-                        if let Some(obj) = src_json.as_object_mut() {
-                            obj.insert("kind".into(), serde_json::json!(sel.resource_id));
-                        } else {
-                            src_json = serde_json::json!({"kind": sel.resource_id});
-                        }
-                        indices.push(new_points.len());
-                        new_points.push(SourceSpec::parse(&out.point_key, &src_json)?);
-                    }
-                }
-                // 泛型路径的 indices 已收集，此处直接创建任务计划
-                new_tasks.push(TaskPlan {
-                    id: task.id.clone(),
-                    interval_ms: task.interval_ms.expect("validated above"),
-                    point_indices: indices,
-                    burst: task
-                        .binding
-                        .config
-                        .get("burst")
-                        .and_then(|b| b.as_u64())
-                        .unwrap_or(1)
-                        .max(1),
-                });
-                continue;
-            }
-            if task.binding.kind != BINDING_KIND {
+            // 结构级校验（point_key 唯一等；空 selections 即空快照，
+            // 与 tasks=[] 清空同语义，合法）
+            mesa_core_types::validate_selections_structure(&binding.selections)
+                .map_err(|e| SdkDriverError::configuration("INVALID_BINDING_CONFIG", e))?;
+            if binding.selections.is_empty() {
                 return Err(SdkDriverError::configuration(
-                    "UNSUPPORTED_BINDING",
-                    format!(
-                        "task `{}`: binding kind `{}` unsupported, expected `{BINDING_KIND}` or `{GENERIC_BINDING_KIND}`",
-                        task.id, task.binding.kind
-                    ),
+                    "INVALID_BINDING_CONFIG",
+                    format!("task `{}`: selections 不能为空", task.id),
                 ));
             }
-            let cfg_points = task
-                .binding
-                .config
-                .get("points")
-                .and_then(|p| p.as_array())
-                .ok_or_else(|| {
-                    SdkDriverError::configuration(
-                        "INVALID_BINDING_CONFIG",
-                        format!("task `{}`: missing array `points`", task.id),
-                    )
-                })?;
-            let mut indices = Vec::with_capacity(cfg_points.len());
-            for p in cfg_points {
-                let key = p
-                    .get("key")
-                    .and_then(|k| k.as_str())
-                    .ok_or_else(|| bad_point("<unnamed>", "missing `key`"))?;
-                indices.push(new_points.len());
-                new_points.push(SourceSpec::parse(key, p)?);
+            let mut indices = Vec::new();
+            for sel in &binding.selections {
+                // Simulator 资源映射：resource_id 即 SourceKind，parameters 即源参数
+                for out in &sel.outputs {
+                    // 构造 SourceSpec 解析输入：合并 kind 与 parameters
+                    let mut src_json = sel.parameters.clone();
+                    if src_json.is_null() {
+                        src_json = serde_json::json!({});
+                    }
+                    if let Some(obj) = src_json.as_object_mut() {
+                        obj.insert("kind".into(), serde_json::json!(sel.resource_id));
+                    } else {
+                        src_json = serde_json::json!({"kind": sel.resource_id});
+                    }
+                    indices.push(new_points.len());
+                    new_points.push(SourceSpec::parse(&out.point_key, &src_json)?);
+                }
+                // 任务级 burst 参数（GenericBinding 顶层 `burst`，与 selections
+                // 同级；缺省 1。背压/压测场景以 burst 保证产出速率，
+                // 与 Windows 定时器精度无关）。
             }
+            // 泛型路径的 indices 已收集，此处直接创建任务计划
             new_tasks.push(TaskPlan {
                 id: task.id.clone(),
-                interval_ms: task.interval_ms.expect("validated above"),
+                interval_ms,
                 point_indices: indices,
                 burst: task
                     .binding
@@ -862,83 +841,52 @@ impl DriverConnection for SimConnection {
                     format!("event task `{task}`: Poll 模式必须提供正整数 interval_ms"),
                 ),
             })?;
-            if task.binding.kind == GENERIC_EVENT_BINDING_KIND {
-                // PR8 标准路径：`mesa.events.v1 { stream_id, parameters }`。
-                // Core 不解释语义；本驱动 lookup stream_id 并校验 parameters。
-                let binding =
-                    GenericEventBinding::from_json(&task.binding.config).map_err(|e| {
-                        SdkDriverError::configuration(
-                            "INVALID_EVENT_BINDING_CONFIG",
-                            format!(
-                                "event task `{}`: invalid generic event binding: {e}",
-                                task.id
-                            ),
-                        )
-                    })?;
-                if binding.stream_id.trim().is_empty() {
-                    return Err(SdkDriverError::configuration(
-                        "INVALID_EVENT_BINDING_CONFIG",
-                        format!("event task `{}`: missing string `stream_id`", task.id),
-                    ));
-                }
-                // Simulator 当前流均无 parameters：只接受对象/空，拒绝数组等形态，
-                // 避免未来参数被静默吞掉；有字段的流在 PR9 风格扩展时再按 Schema 校验。
-                if !binding.parameters.is_object() && !binding.parameters.is_null() {
-                    return Err(SdkDriverError::configuration(
-                        "INVALID_EVENT_BINDING_CONFIG",
-                        format!("event task `{}`: `parameters` 需为对象", task.id),
-                    ));
-                }
-                let stream = SimEventStream::parse(&binding.stream_id).ok_or_else(|| {
-                    SdkDriverError::configuration(
-                        "UNKNOWN_EVENT_STREAM",
-                        format!(
-                            "event task `{}`: unknown stream `{}`",
-                            task.id, binding.stream_id
-                        ),
-                    )
-                })?;
-                let interval_ms = match task.mode {
-                    TaskMode::Poll => task.interval_ms.expect("validated above"),
-                    TaskMode::Subscribe => task.interval_ms.unwrap_or(100).max(1),
-                };
-                new_tasks.push(SimEventTask {
-                    id: task.id.clone(),
-                    stream,
-                    interval_ms,
-                });
-                continue;
-            }
-            if task.binding.kind != EVENT_BINDING_KIND {
+            // Foundation-2 事件单路径：仅接受 mesa.events.v1（simulator.events 已删除）。
+            if task.binding.kind != GENERIC_EVENT_BINDING_KIND {
                 return Err(SdkDriverError::configuration(
                     "UNSUPPORTED_EVENT_BINDING",
                     format!(
-                        "event task `{}`: binding kind `{}` unsupported, expected `{GENERIC_EVENT_BINDING_KIND}` or `{EVENT_BINDING_KIND}`",
+                        "event task `{}`: binding kind `{}` unsupported, expected `{GENERIC_EVENT_BINDING_KIND}`",
                         task.id, task.binding.kind
                     ),
                 ));
             }
-            let stream_name = task
-                .binding
-                .config
-                .get("stream")
-                .and_then(|s| s.as_str())
-                .ok_or_else(|| {
-                    SdkDriverError::configuration(
-                        "INVALID_EVENT_BINDING_CONFIG",
-                        format!(
-                            "event task `{}`: missing string `stream` (expected `{SIM_EVENT_STREAM_COUNTER}` or `{SIM_EVENT_STREAM_ALARM}`)",
-                            task.id
-                        ),
-                    )
-                })?;
-            let stream = SimEventStream::parse(stream_name).ok_or_else(|| {
+            // PR8 标准路径：`mesa.events.v1 { stream_id, parameters }`。
+            // Core 不解释语义；本驱动 lookup stream_id 并校验 parameters。
+            let binding = GenericEventBinding::from_json(&task.binding.config).map_err(|e| {
+                SdkDriverError::configuration(
+                    "INVALID_EVENT_BINDING_CONFIG",
+                    format!(
+                        "event task `{}`: invalid generic event binding: {e}",
+                        task.id
+                    ),
+                )
+            })?;
+            if binding.stream_id.trim().is_empty() {
+                return Err(SdkDriverError::configuration(
+                    "INVALID_EVENT_BINDING_CONFIG",
+                    format!("event task `{}`: missing string `stream_id`", task.id),
+                ));
+            }
+            // Simulator 当前流均无 parameters：只接受对象/空，拒绝数组等形态，
+            // 避免未来参数被静默吞掉；有字段的流在 PR9 风格扩展时再按 Schema 校验。
+            if !binding.parameters.is_object() && !binding.parameters.is_null() {
+                return Err(SdkDriverError::configuration(
+                    "INVALID_EVENT_BINDING_CONFIG",
+                    format!("event task `{}`: `parameters` 需为对象", task.id),
+                ));
+            }
+            let stream = SimEventStream::parse(&binding.stream_id).ok_or_else(|| {
                 SdkDriverError::configuration(
                     "UNKNOWN_EVENT_STREAM",
-                    format!("event task `{}`: unknown stream `{stream_name}`", task.id),
+                    format!(
+                        "event task `{}`: unknown stream `{}`",
+                        task.id, binding.stream_id
+                    ),
                 )
             })?;
             // Poll 用任务自带周期；Subscribe 用驱动默认 100ms 节奏
+            //（EventTask 本次只做 legacy removal，不引入 schedule，见 ADR 0003 决策 5）
             let interval_ms = match task.mode {
                 TaskMode::Poll => task.interval_ms.expect("validated above"),
                 TaskMode::Subscribe => task.interval_ms.unwrap_or(100).max(1),
@@ -1295,23 +1243,10 @@ mod tests {
     use super::*;
     use mesa_core_types::{AcquisitionTask, DriverBinding};
 
-    fn poll_task(id: &str, interval: u64, points: serde_json::Value) -> AcquisitionTask {
-        AcquisitionTask {
-            id: id.into(),
-            mode: TaskMode::Poll,
-            interval_ms: Some(interval),
-            binding: DriverBinding {
-                kind: BINDING_KIND.into(),
-                config: points,
-            },
-        }
-    }
-
     fn generic_task(id: &str, selections: serde_json::Value) -> AcquisitionTask {
         AcquisitionTask {
             id: id.into(),
-            mode: TaskMode::Poll,
-            interval_ms: Some(100),
+            schedule: TaskSchedule::Poll { interval_ms: 100 },
             binding: DriverBinding {
                 kind: GENERIC_BINDING_KIND.into(),
                 config: serde_json::json!({"selections": selections}),
@@ -1423,30 +1358,36 @@ mod tests {
         assert_eq!(err.code, "INVALID_POINT_SPEC");
     }
 
+    /// generic selections 快捷构造（含自定义 interval，供 Poll 节奏测试用）。
+    fn counter_selections(dup: bool) -> serde_json::Value {
+        let second = if dup { "a" } else { "b" };
+        serde_json::json!([
+            {"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"a"}]},
+            {"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":second}]},
+        ])
+    }
+
     #[tokio::test]
     async fn configure_rejects_duplicate_and_unknown_sources() {
         let mut conn = SimConnection::default();
-        let dup = poll_task(
-            "t",
-            100,
-            serde_json::json!({
-                "points": [
-                    {"key":"a","kind":"counter"},
-                    {"key":"a","kind":"counter"}
-                ]
-            }),
-        );
-        let err = conn.configure(1, vec![dup]).await.unwrap_err();
-        assert_eq!(err.code, "DUPLICATE_POINT_KEY");
+        // duplicate：同一 task 内 point_key 出现两次 → 结构级拒绝
+        //（validate_selections_structure 在 configure 内先执行，早于
+        // DUPLICATE_POINT_KEY 的跨快照检查）。
+        let err = conn
+            .configure(1, vec![generic_task("t", counter_selections(true))])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "INVALID_BINDING_CONFIG");
 
-        let unknown = poll_task(
-            "t",
-            100,
-            serde_json::json!({
-                "points": [{"key":"a","kind":"quantum_flux"}]
-            }),
-        );
-        let err = conn.configure(1, vec![unknown]).await.unwrap_err();
+        let unknown = serde_json::json!([{
+            "resource_id": "quantum_flux",
+            "parameters": {},
+            "outputs": [{"output": "value", "point_key": "a"}],
+        }]);
+        let err = conn
+            .configure(1, vec![generic_task("t", unknown)])
+            .await
+            .unwrap_err();
         assert_eq!(err.code, "UNSUPPORTED_SOURCE_KIND");
     }
 
@@ -1559,15 +1500,13 @@ mod tests {
     #[tokio::test]
     async fn full_plan_produces_mapped_point_ids() {
         let mut conn = SimConnection::default();
-        let task = poll_task(
+        // constant + toggle 的 generic selections（legacy points 信封已删除）
+        let task = generic_task(
             "t",
-            100,
-            serde_json::json!({
-                "points": [
-                    {"key":"k.a","kind":"constant","value":7},
-                    {"key":"k.b","kind":"toggle","initial":false}
-                ]
-            }),
+            serde_json::json!([
+                {"resource_id":"constant","parameters":{"value":7},"outputs":[{"output":"value","point_key":"k.a"}]},
+                {"resource_id":"toggle","parameters":{"initial":false},"outputs":[{"output":"value","point_key":"k.b"}]},
+            ]),
         );
         let descriptors = conn.configure(3, vec![task]).await.unwrap();
         assert_eq!(descriptors.len(), 2);
@@ -1620,18 +1559,6 @@ mod tests {
         }
     }
 
-    fn legacy_event_task(id: &str, stream: &str) -> EventTask {
-        EventTask {
-            id: id.into(),
-            mode: TaskMode::Subscribe,
-            interval_ms: None,
-            binding: DriverBinding {
-                kind: EVENT_BINDING_KIND.into(),
-                config: serde_json::json!({"stream": stream}),
-            },
-        }
-    }
-
     /// PR8 P0：新标准 `mesa.events.v1` 被接受（Subscribe 缺省节奏 / Poll 自带周期）。
     #[tokio::test]
     async fn simulator_accepts_mesa_events_v1() {
@@ -1653,20 +1580,29 @@ mod tests {
         assert_eq!(conn.event_plan.as_ref().unwrap().tasks.len(), 2);
     }
 
-    /// PR7 legacy `simulator.events` 继续可用（旧开发数据库无需 migration）。
+    /// Foundation-2：legacy `simulator.events` 已删除，未知 legacy 信封即拒绝。
     #[tokio::test]
-    async fn simulator_legacy_binding_still_accepted() {
+    async fn simulator_legacy_binding_rejected() {
         let mut conn = SimConnection::default();
-        conn.configure_events(
-            1,
-            vec![legacy_event_task("e-old", SIM_EVENT_STREAM_COUNTER)],
-        )
-        .await
-        .unwrap();
-        assert_eq!(conn.event_plan.as_ref().unwrap().tasks.len(), 1);
+        let err = conn
+            .configure_events(
+                1,
+                vec![EventTask {
+                    id: "e-old".into(),
+                    mode: TaskMode::Subscribe,
+                    interval_ms: None,
+                    binding: DriverBinding {
+                        kind: EVENT_BINDING_KIND.into(),
+                        config: serde_json::json!({"stream": SIM_EVENT_STREAM_COUNTER}),
+                    },
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "UNSUPPORTED_EVENT_BINDING");
     }
 
-    /// 未知流精确报错（新旧两种信封形态一致）。
+    /// 未知流精确报错。
     #[tokio::test]
     async fn unknown_event_stream_rejected() {
         let mut conn = SimConnection::default();
@@ -1683,12 +1619,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "UNKNOWN_EVENT_STREAM");
-        let err = conn
-            .configure_events(1, vec![legacy_event_task("e", "no.such.stream")])
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, "UNKNOWN_EVENT_STREAM");
-        // 非法 kind 精确报错（提示两种合法取值）
+        // 非法 kind 精确报错（提示唯一合法取值）
         let mut bad = generic_event_task("e", TaskMode::Subscribe, None, SIM_EVENT_STREAM_COUNTER);
         bad.binding.kind = "other.events".into();
         let err = conn.configure_events(1, vec![bad]).await.unwrap_err();

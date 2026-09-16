@@ -218,23 +218,40 @@ fn json_error(code: &str, message: &str) -> serde_json::Value {
 // Task 保存门禁：Core 统一 Descriptor 校验（PR4）
 // ---------------------------------------------------------------------------
 
-/// Data Task 保存门禁（generic 任务走集合级统一校验；legacy 种别是 Driver
-/// 私有，Core 只做结构校验，由 store 层 `task.validate()` 覆盖）。
-/// 无 generic 任务（含 `tasks=[]` 清空）直接放行，不碰 Descriptor——legacy
-/// 不依赖 Driver 可用性。issues 为空即通过；endpoint 缺失/descriptor 不可用
-/// 分别映射 404/503。
+/// Data Task 保存门禁（Foundation-2 单路径）：所有任务必须走 Descriptor
+/// 集合级统一校验（`mesa.resources.v1` 唯一合法 kind；空数组 `tasks=[]` 清空
+/// 直接放行，不碰 Descriptor）。issues 为空即通过；endpoint 缺失/descriptor
+/// 不可用分别映射 404/503。
 async fn gate_data_tasks(
     state: &AppState,
     endpoint_id: &str,
     tasks: &[mesa_core_types::AcquisitionTask],
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let err = |code: StatusCode, v: serde_json::Value| Err((code, Json(v)));
-    // legacy true bypass：无 generic 即无 Core 语义校验对象
-    if !tasks
-        .iter()
-        .any(|t| t.binding.kind == mesa_core_types::GENERIC_BINDING_KIND)
-    {
+    // 空快照 = 清空，直接放行
+    if tasks.is_empty() {
         return Ok(());
+    }
+    // 非 generic kind 即拒绝（legacy 已删除，无 bypass）
+    let mut issues = Vec::new();
+    for (i, task) in tasks.iter().enumerate() {
+        if task.binding.kind != mesa_core_types::GENERIC_BINDING_KIND {
+            issues.push(mesa_core_types::ValidationIssue {
+                path: format!("tasks[{i}].binding.kind"),
+                code: "UNSUPPORTED_BINDING".into(),
+                message: format!(
+                    "binding kind `{}` 不再支持，仅允许 {}",
+                    task.binding.kind,
+                    mesa_core_types::GENERIC_BINDING_KIND,
+                ),
+            });
+        }
+    }
+    if !issues.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "valid": false, "issues": issues }),
+        );
     }
     let rec = match state.store.get_endpoint(endpoint_id) {
         Ok(Some(r)) => r,
@@ -256,12 +273,9 @@ async fn gate_data_tasks(
         }
     };
     // 解析全部 generic 绑定，集合级一次校验（Endpoint-wide point_key 唯一）
+    //（前置 kind 门已保证全为 generic，此处不再跳过任何任务）
     let mut parsed: Vec<(usize, mesa_core_types::GenericBinding)> = Vec::new();
-    let mut issues = Vec::new();
     for (i, task) in tasks.iter().enumerate() {
-        if task.binding.kind != mesa_core_types::GENERIC_BINDING_KIND {
-            continue;
-        }
         match mesa_core_types::GenericBinding::from_json(&task.binding.config) {
             Ok(binding) => parsed.push((i, binding)),
             Err(e) => issues.push(mesa_core_types::ValidationIssue {
@@ -282,6 +296,10 @@ async fn gate_data_tasks(
         .iter()
         .map(|(i, _)| format!("tasks[{i}].selections"))
         .collect();
+    // Foundation-2 单真值：mode 由 schedule 派生（validate_task_set_against
+    // 取 &TaskMode 作能力投影；此处收集 owned 值避免借用 tasks 与 parsed 交叉）。
+    let modes: Vec<mesa_core_types::TaskMode> =
+        parsed.iter().map(|(i, _)| tasks[*i].mode()).collect();
     let set_inputs: Vec<(
         &mesa_core_types::TaskMode,
         &[mesa_core_types::ResourceSelection],
@@ -289,7 +307,8 @@ async fn gate_data_tasks(
     )> = parsed
         .iter()
         .zip(roots.iter())
-        .map(|((i, b), r)| (&tasks[*i].mode, &b.selections[..], r.as_str()))
+        .zip(modes.iter())
+        .map(|(((_i, b), r), m)| (m, &b.selections[..], r.as_str()))
         .collect();
     issues.extend(mesa_core_types::validate_task_set_against(
         &desc,
@@ -305,19 +324,37 @@ async fn gate_data_tasks(
     }
 }
 
-/// 事件 Task 保存门禁（同上，`mesa.events.v1` 走 `desc.events` 目录校验；
-/// 无 generic 事件任务直接放行，不碰 Descriptor）。
+/// 事件 Task 保存门禁（Foundation-2 单路径）：所有事件任务必须走
+/// `desc.events` 目录校验（`mesa.events.v1` 唯一合法 kind；空数组直接放行）。
 async fn gate_event_tasks(
     state: &AppState,
     endpoint_id: &str,
     tasks: &[mesa_core_types::EventTask],
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let err = |code: StatusCode, v: serde_json::Value| Err((code, Json(v)));
-    if !tasks
-        .iter()
-        .any(|t| t.binding.kind == mesa_core_types::GENERIC_EVENT_BINDING_KIND)
-    {
+    if tasks.is_empty() {
         return Ok(());
+    }
+    // 非 generic kind 即拒绝（legacy 已删除，无 bypass）
+    let mut issues = Vec::new();
+    for (i, task) in tasks.iter().enumerate() {
+        if task.binding.kind != mesa_core_types::GENERIC_EVENT_BINDING_KIND {
+            issues.push(mesa_core_types::ValidationIssue {
+                path: format!("event_tasks[{i}].binding.kind"),
+                code: "UNSUPPORTED_BINDING".into(),
+                message: format!(
+                    "binding kind `{}` 不再支持，仅允许 {}",
+                    task.binding.kind,
+                    mesa_core_types::GENERIC_EVENT_BINDING_KIND,
+                ),
+            });
+        }
+    }
+    if !issues.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "valid": false, "issues": issues }),
+        );
     }
     let rec = match state.store.get_endpoint(endpoint_id) {
         Ok(Some(r)) => r,
@@ -338,11 +375,8 @@ async fn gate_event_tasks(
             );
         }
     };
-    let mut issues = Vec::new();
+    //（前置 kind 门已保证全为 generic，此处不再跳过任何任务）
     for (i, task) in tasks.iter().enumerate() {
-        if task.binding.kind != mesa_core_types::GENERIC_EVENT_BINDING_KIND {
-            continue;
-        }
         let root = format!("event_tasks[{i}]");
         match mesa_core_types::GenericEventBinding::from_json(&task.binding.config) {
             Ok(binding) => issues.extend(mesa_core_types::validate_event_binding_against(

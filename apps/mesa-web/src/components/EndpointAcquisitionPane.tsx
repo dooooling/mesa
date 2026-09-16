@@ -75,7 +75,7 @@ export function EndpointAcquisitionPane({
         const { editable, preserved } = splitAcquisitionTasks(tasks);
         setPreservedTasks(preserved);
         if (editable) {
-          if (editable.mode === "poll") setIntervalMs(editable.interval_ms ?? 1000);
+          if (editable.schedule?.mode === "poll") setIntervalMs(editable.schedule.interval_ms ?? 1000);
           const s = selectionsOf(editable);
           if (s.length) setSels(s);
         }
@@ -217,7 +217,7 @@ export function EndpointAcquisitionPane({
         <div style={{ fontSize: 12, color: "#525252" }}>
           以下任务不在此编辑、保存时原样保留：
           {preservedTasks.map((t) => (
-            <Tag key={t.id} style={{ marginLeft: 6 }}>{t.id} · {t.binding.kind} · {t.mode}</Tag>
+            <Tag key={t.id} style={{ marginLeft: 6 }}>{t.id} · {t.binding.kind} · {t.schedule?.mode}</Tag>
           ))}
         </div>
       )}

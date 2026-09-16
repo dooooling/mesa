@@ -1,11 +1,12 @@
 //! FANUC FOCAS2 Driver — 方案 §7.2 资源型（V1 只读）。
 //!
-//! - 绑定种类：`focas.data-block`
+//! - 绑定（Foundation-2 单路径）：`mesa.resources.v1`
 //!   ```json
-//!   { "items": [
-//!       { "key": "cnc.status", "address": "status", "data_type": "U32" },
-//!       { "key": "axis.x", "address": "axis.abs.1", "data_type": "I32" },
-//!       { "key": "spindle.load", "address": "spindle.load.1", "data_type": "U32" }
+//!   { "selections": [
+//!       { "resource_id": "status", "parameters": {},
+//!         "outputs": [{"output":"value","point_key":"cnc.status"}] },
+//!       { "resource_id": "axis", "parameters": {"axis":1},
+//!         "outputs": [{"output":"value","point_key":"axis.x"}] }
 //!   ]}
 //!   ```
 //! - 地址解析见 `address::parse_address`；Core 不触及此文件（硬性约束）。
@@ -25,21 +26,23 @@ use std::time::Duration;
 use mesa_core_types::{
     AcquisitionTask, CapabilityItem, CapabilityState, DataBatch, DataType, DriverMetadata,
     DuplicatePointKey, GENERIC_BINDING_KIND, GenericBinding, PointDescriptor, PointMap, PointValue,
-    ProbeReport, ProbeWarning, Quality, TaskMode, Value, ValueOrigin, ensure_unique_point_keys,
+    ProbeReport, ProbeWarning, Quality, TaskSchedule, Value, ValueOrigin, ensure_unique_point_keys,
     now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio_util::sync::CancellationToken;
 
+/// Foundation-2 已删除的 legacy kind（保留常量名仅供错误信息引用，
+/// 不再是合法 binding；见 ADR 0003）。
 pub const BINDING_KIND: &str = "focas.data-block";
 
-/// PMC canonical kind 公共契约（PR3）：generic 只接受这 10 种；
-/// parser 另接受 M/N/E/Z/B（legacy 兼容）。descriptor 与门禁同源。
+/// PMC canonical kind 公共契约（PR3）：generic 只接受这 10 种。
+/// descriptor 与门禁同源。
 pub const PMC_KINDS: [char; 10] = ['G', 'R', 'X', 'Y', 'F', 'A', 'D', 'C', 'K', 'T'];
 
-/// PR3 canonical：generic `mesa.resources.v1` 按 (resource_id, output)
+/// PR3 canonical：`mesa.resources.v1` 按 (resource_id, output)
 /// 分发到固定 (FocasAddress, DataType)。未声明的 resource/output 直接拒绝；
-/// `address` 参数不接受（legacy 专属）；Fixed 资源不消费 `data_type`
+/// `address` 参数不接受；Fixed 资源不消费 `data_type`
 ///（类型由本表唯一确定，PR4 在 Task 保存时拒绝未知字段）。
 fn resolve_generic_point(
     resource_id: &str,
@@ -114,8 +117,7 @@ fn resolve_generic_point(
             )
         }
         ("pmc", "value") => {
-            // canonical 精确拼写（Descriptor Enum 同口径；"r"/"RABC" 等
-            // 大小写/前缀变体只属于 legacy parser，不进 generic）。
+            // canonical 精确拼写（Descriptor Enum 同口径；大小写/前缀变体不接受）。
             let kind_s = params.get("kind").and_then(|v| v.as_str()).ok_or_else(|| {
                 bad(
                     "INVALID_POINT",
@@ -661,6 +663,10 @@ fn value_fits_data_type(v: &Value, dt: DataType) -> bool {
     }
 }
 
+/// Foundation-2 已删除 legacy `items[]` 信封的数据类型解析；
+/// canonical 路径由 resolve_generic_point 分发固定类型。
+/// 本函数保留供单测锁定解析语义，不进产品契约。
+#[allow(dead_code)]
 fn parse_data_type(s: &str) -> Result<DataType, SdkDriverError> {
     match s.trim().to_ascii_uppercase().as_str() {
         "BOOL" | "BOOLEAN" => Ok(DataType::Bool),
@@ -699,14 +705,27 @@ impl DriverConnection for FocasConnection {
         for task in &tasks {
             task.validate()
                 .map_err(|e| SdkDriverError::configuration("INVALID_TASK", e.to_string()))?;
-            if task.mode != TaskMode::Poll {
-                return Err(SdkDriverError::new(
-                    mesa_core_types::ErrorKind::Unsupported,
-                    "MODE_NOT_SUPPORTED",
-                    format!("task `{}`: focas2 仅支持 poll", task.id),
+            // Foundation-2 单真值 + 单路径：FOCAS2 仅 Poll + 仅 mesa.resources.v1。
+            let interval_ms = match task.schedule {
+                TaskSchedule::Poll { interval_ms } => interval_ms,
+                TaskSchedule::Subscribe { .. } => {
+                    return Err(SdkDriverError::new(
+                        mesa_core_types::ErrorKind::Unsupported,
+                        "MODE_NOT_SUPPORTED",
+                        format!("task `{}`: focas2 仅支持 poll", task.id),
+                    ));
+                }
+            };
+            if task.binding.kind != GENERIC_BINDING_KIND {
+                return Err(SdkDriverError::configuration(
+                    "UNSUPPORTED_BINDING",
+                    format!(
+                        "task `{}`: 期望 {GENERIC_BINDING_KIND}，实际 {}",
+                        task.id, task.binding.kind
+                    ),
                 ));
             }
-            if task.binding.kind == GENERIC_BINDING_KIND {
+            {
                 let binding: GenericBinding = serde_json::from_value(task.binding.config.clone())
                     .map_err(|e| {
                     SdkDriverError::configuration(
@@ -736,96 +755,10 @@ impl DriverConnection for FocasConnection {
                 }
                 new_tasks.push(TaskPlan {
                     id: task.id.clone(),
-                    interval_ms: task.interval_ms.expect("validated above"),
+                    interval_ms,
                     point_indices: indices,
                 });
-                continue;
             }
-            if task.binding.kind != BINDING_KIND {
-                return Err(SdkDriverError::configuration(
-                    "UNSUPPORTED_BINDING",
-                    format!(
-                        "task `{}`: 期望 {BINDING_KIND} 或 {GENERIC_BINDING_KIND}，实际 {}",
-                        task.id, task.binding.kind
-                    ),
-                ));
-            }
-            let items = task
-                .binding
-                .config
-                .get("items")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| {
-                    SdkDriverError::configuration(
-                        "INVALID_BINDING_CONFIG",
-                        format!("task `{}`: 缺少 items 数组", task.id),
-                    )
-                })?;
-            if items.is_empty() {
-                return Err(SdkDriverError::configuration(
-                    "INVALID_BINDING_CONFIG",
-                    format!("task `{}`: items 不能为空", task.id),
-                ));
-            }
-            let mut indices = Vec::with_capacity(items.len());
-            for item in items {
-                let key = item.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
-                    SdkDriverError::configuration(
-                        "INVALID_POINT",
-                        format!("task `{}`: point 缺少 key", task.id),
-                    )
-                })?;
-                if key.trim().is_empty() {
-                    return Err(SdkDriverError::configuration(
-                        "INVALID_POINT",
-                        "key 不能为空",
-                    ));
-                }
-                let addr_str = item
-                    .get("address")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        SdkDriverError::configuration(
-                            "INVALID_POINT",
-                            format!("point `{key}` 缺少 address"),
-                        )
-                    })?;
-                let dt_str = item
-                    .get("data_type")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        SdkDriverError::configuration(
-                            "INVALID_POINT",
-                            format!("point `{key}` 缺少 data_type"),
-                        )
-                    })?;
-                let addr = parse_address(addr_str).map_err(|e| match e {
-                    AddressError::Empty => SdkDriverError::configuration(
-                        "INVALID_ADDRESS",
-                        format!("point `{key}` 地址为空"),
-                    ),
-                    AddressError::Invalid { reason, .. } => SdkDriverError::new(
-                        mesa_core_types::ErrorKind::Address,
-                        "INVALID_ADDRESS",
-                        format!("point `{key}` 地址 `{addr_str}` 非法: {reason}"),
-                    ),
-                })?;
-                let data_type = parse_data_type(dt_str)?;
-                // 预校验：Fake 下各地址的默认 Value 需匹配声明类型
-                // 仅在非严格场景跳过，避免过度约束用户
-                indices.push(new_points.len());
-                new_points.push(PointSpec {
-                    key: key.to_string(),
-                    addr,
-                    data_type,
-                });
-            }
-            let interval = task.interval_ms.expect("validated");
-            new_tasks.push(TaskPlan {
-                id: task.id.clone(),
-                interval_ms: interval,
-                point_indices: indices,
-            });
         }
 
         let descriptors: Vec<PointDescriptor> = new_points
@@ -1105,30 +1038,29 @@ fn coerce_value(v: Value, dt: DataType) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
-
-    fn task_with_items(items: serde_json::Value) -> AcquisitionTask {
-        AcquisitionTask {
-            id: "t1".into(),
-            mode: TaskMode::Poll,
-            interval_ms: Some(100),
-            binding: DriverBinding {
-                kind: BINDING_KIND.into(),
-                config: serde_json::json!({"items": items}),
-            },
-        }
-    }
+    use mesa_core_types::{AcquisitionTask, DriverBinding};
 
     fn generic_task(selections: serde_json::Value) -> AcquisitionTask {
+        generic_task_with_id("t1", selections)
+    }
+
+    fn generic_task_with_id(id: &str, selections: serde_json::Value) -> AcquisitionTask {
         AcquisitionTask {
-            id: "t1".into(),
-            mode: TaskMode::Poll,
-            interval_ms: Some(100),
+            id: id.into(),
+            schedule: mesa_core_types::TaskSchedule::Poll { interval_ms: 100 },
             binding: DriverBinding {
                 kind: GENERIC_BINDING_KIND.into(),
                 config: serde_json::json!({"selections": selections}),
             },
         }
+    }
+
+    fn status_axis_selections(dup_key: bool) -> serde_json::Value {
+        let second = if dup_key { "a" } else { "b" };
+        serde_json::json!([
+            {"resource_id":"status","parameters":{},"outputs":[{"output":"value","point_key":"a"}]},
+            {"resource_id":"axis","parameters":{"axis":1},"outputs":[{"output":"value","point_key":second}]},
+        ])
     }
 
     fn test_conn() -> FocasConnection {
@@ -1290,19 +1222,21 @@ mod tests {
             api: Arc::new(FakeFocasApi::new()),
             plan: None,
         };
-        let items = serde_json::json!([
-            {"key":"a","address":"status","data_type":"U32"},
-            {"key":"b","address":"axis.abs.1","data_type":"I32"}
-        ]);
-        let t = task_with_items(items);
+        let t = generic_task(status_axis_selections(false));
         let descs = conn.configure(1, vec![t]).await.unwrap();
         assert_eq!(descs.len(), 2);
-        let dup = serde_json::json!([
-            {"key":"a","address":"status","data_type":"U32"},
-            {"key":"a","address":"axis.abs.2","data_type":"I32"}
-        ]);
+        // 跨 task 重复 point_key → DUPLICATE_POINT_KEY（同一 task 内重复则
+        // 早于此被结构级拒绝，见 generic 路径 validate_selections_structure）
+        let dup_a = serde_json::json!([{"resource_id":"status","parameters":{},"outputs":[{"output":"value","point_key":"a"}]}]);
+        let dup_b = serde_json::json!([{"resource_id":"axis","parameters":{"axis":2},"outputs":[{"output":"value","point_key":"a"}]}]);
         let err = conn
-            .configure(2, vec![task_with_items(dup)])
+            .configure(
+                2,
+                vec![
+                    generic_task_with_id("t1", dup_a),
+                    generic_task_with_id("t2", dup_b),
+                ],
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, "DUPLICATE_POINT_KEY");
@@ -1315,12 +1249,14 @@ mod tests {
             api: Arc::new(FakeFocasApi::new()),
             plan: None,
         };
-        let items = serde_json::json!([{"key":"a","address":"axis.abs.0","data_type":"I32"}]);
+        // axis=0 越界（int_param fail-closed → INVALID_BINDING_CONFIG；
+        // INVALID_ADDRESS 保留给地址解析层，本层参数越界走绑定配置错）
+        let sel = serde_json::json!([{"resource_id":"axis","parameters":{"axis":0},"outputs":[{"output":"value","point_key":"a"}]}]);
         let err = conn
-            .configure(1, vec![task_with_items(items)])
+            .configure(1, vec![generic_task(sel)])
             .await
             .unwrap_err();
-        assert_eq!(err.code, "INVALID_ADDRESS");
+        assert_eq!(err.code, "INVALID_BINDING_CONFIG");
     }
 
     #[tokio::test]
@@ -1398,12 +1334,15 @@ mod tests {
             api: Arc::new(FakeFocasApi::new()),
             plan: None,
         };
-        let items: Vec<serde_json::Value> = (0..10)
-            .map(|i| {
-                serde_json::json!({"key": format!("p{}", i), "address": format!("pmc.R{}", 100+i*2), "data_type":"I32"})
-            })
-            .collect();
-        let t = task_with_items(serde_json::Value::Array(items));
+        // generic：10 个连续 pmc/R outputs 同一 task（canonical 参数面）
+        let selections = serde_json::Value::Array(
+            (0..10)
+                .map(|i| {
+                    serde_json::json!({"resource_id":"pmc","parameters":{"kind":"R","addr": 100+i*2},"outputs":[{"output":"value","point_key": format!("p{}", i)}]})
+                })
+                .collect(),
+        );
+        let t = generic_task(selections);
         let descs = conn.configure(1, vec![t]).await.unwrap();
         assert_eq!(descs.len(), 10);
         let api = FakeFocasApi::new();

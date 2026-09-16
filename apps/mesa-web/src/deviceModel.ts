@@ -209,11 +209,19 @@ export interface ResourceSelection {
 
 export const CANONICAL_RESOURCES_KIND = "mesa.resources.v1";
 
-/** 服务端任务形状（Web 只读 id/mode/interval/binding.kind，不解释其它 binding）。 */
-export interface AcquisitionTaskShape {
-  id: string;
+/** 服务端任务形状（Foundation-2 单真值：schedule；binding 仅 mesa.resources.v1）。 */
+export interface TaskScheduleShape {
   mode: string;
   interval_ms?: number | null;
+  publishing_interval_ms?: number | null;
+  sampling_interval_ms?: number | null;
+  queue_size?: number | null;
+  discard_oldest?: boolean | null;
+}
+
+export interface AcquisitionTaskShape {
+  id: string;
+  schedule: TaskScheduleShape;
   binding: {
     kind: string;
     config?: unknown;
@@ -266,8 +274,8 @@ export function isTaskSnapshotReady(
 /**
  * 合并回写：用编辑结果更新 canonical 任务，其余任务逐字保留。
  * - 沿用已存在的 canonical id（不增殖 id；无则用占位 t1，冲突时 t1-2/t1-3…避让）；
- * - 沿用已存在的 mode（外来 subscribe 任务不得被编辑器默默翻成 poll）；
- *   poll 任务写编辑器周期，非 poll 任务保留原周期。
+ * - 沿用已存在的 schedule（外来 subscribe 任务不得被编辑器默默翻成 poll）；
+ *   poll 任务写编辑器周期，非 poll 任务保留原 schedule。
  */
 export function mergeAcquisitionTasks(
   existing: AcquisitionTaskShape[],
@@ -283,11 +291,13 @@ export function mergeAcquisitionTasks(
       n += 1;
     }
   }
-  const mode = editable?.mode ?? "poll";
+  const schedule = editable?.schedule ?? { mode: "poll" };
   const canonical: AcquisitionTaskShape = {
     id,
-    mode,
-    interval_ms: mode === "poll" ? edited.interval_ms : (editable?.interval_ms ?? null),
+    schedule:
+      schedule.mode === "poll"
+        ? { ...schedule, mode: "poll", interval_ms: edited.interval_ms }
+        : schedule,
     binding: { kind: CANONICAL_RESOURCES_KIND, config: { selections: edited.selections } },
   };
   return [...preserved, canonical];

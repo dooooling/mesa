@@ -17,7 +17,7 @@ use mesa_core_types::{DriverBinding, EventBatch, EventRecord, EventTask, TaskMod
 use mesa_core_types::{GENERIC_EVENT_BINDING_KIND, GenericEventBinding};
 use mesa_driver_manager::MesaManager;
 use mesa_driver_manager::endpoint::BuiltinEndpoint;
-use mesa_driver_simulator::{EVENT_BINDING_KIND, SIM_EVENT_STREAM_ALARM, SIM_EVENT_STREAM_COUNTER};
+use mesa_driver_simulator::{SIM_EVENT_STREAM_ALARM, SIM_EVENT_STREAM_COUNTER};
 use mesa_event_store::{
     CommitRequest, EVENT_HUB_CAPACITY, EventFilter, EventHub, EventServices, EventStore,
 };
@@ -35,20 +35,14 @@ fn tmp_events_db(tag: &str) -> std::path::PathBuf {
     p
 }
 
+/// 标准 `mesa.events.v1` 报警任务（Foundation-2 单路径：legacy 已删除，
+/// alarm_task 即 generic 形态，不再保留 legacy/generic 双构造）。
 fn alarm_task() -> EventTask {
-    EventTask {
-        id: "al".into(),
-        mode: TaskMode::Subscribe,
-        interval_ms: None,
-        binding: DriverBinding {
-            kind: EVENT_BINDING_KIND.into(),
-            config: serde_json::json!({"stream": SIM_EVENT_STREAM_ALARM}),
-        },
-    }
+    generic_alarm_task()
 }
 
-/// PR8 P1-5：与 `alarm_task` 同语义的标准 `mesa.events.v1` 形态。
-/// 生产路径 Gate 必须走 generic 信封（legacy 兼容由 Simulator 单测保住）。
+/// PR8 P1-5：标准 `mesa.events.v1` 形态。
+/// 生产路径 Gate 必须走 generic 信封。
 fn generic_alarm_task() -> EventTask {
     let binding = GenericEventBinding {
         stream_id: SIM_EVENT_STREAM_ALARM.into(),
@@ -66,19 +60,18 @@ fn generic_alarm_task() -> EventTask {
 }
 
 /// Stop barrier 计数器（⑨ Gate 用）：Poll 50ms 节奏（~20/s，可持续速率）。
-/// 本测试是端到端锁（真实 Stop 路径 + 逐 epoch 连续 + 落盘），牙口不在速率：
-/// 确定性遗弃证明在单测 `ingress_cancel_drains_backlog`（旧行为 73/200）。
-/// 100/s 在 debug 构建下超过 ingress 单批 txn 吞吐，会正确触发 overflow
-/// fail-closed 换 epoch（由 event_pressure 冻结为 overload 域行为）——
-/// 此处必须用可持续速率，否则测的是"过载"而不是 Stop barrier。
+/// Foundation-2 单路径：通用 `mesa.events.v1` counter 流任务。
 fn flood_task() -> EventTask {
     EventTask {
         id: "cnt".into(),
         mode: TaskMode::Poll,
         interval_ms: Some(50),
         binding: DriverBinding {
-            kind: EVENT_BINDING_KIND.into(),
-            config: serde_json::json!({"stream": SIM_EVENT_STREAM_COUNTER}),
+            kind: GENERIC_EVENT_BINDING_KIND.into(),
+            config: serde_json::json!({
+                "stream_id": SIM_EVENT_STREAM_COUNTER,
+                "parameters": {},
+            }),
         },
     }
 }
@@ -101,10 +94,10 @@ async fn production_path_alarm_cycle_persists_before_visible() {
         endpoint_id: "ct-evt-001".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
-        tasks: vec![poll_task(
+        tasks: vec![poll_task_legacy_points(
             "t1",
             50,
-            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+            serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
         )],
         event_tasks: vec![generic_alarm_task()],
     })
@@ -203,10 +196,10 @@ async fn event_ids_unique_across_driver_process_restart() {
         endpoint_id: "ct-evt-restart".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
-        tasks: vec![poll_task(
+        tasks: vec![poll_task_legacy_points(
             "t1",
             50,
-            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+            serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
         )],
         event_tasks: vec![alarm_task()],
     };
@@ -465,7 +458,7 @@ async fn event_task_rest_crud_and_running_conflict() {
 
     let body = serde_json::json!({"event_tasks": [{
         "id": "al", "mode": "subscribe", "interval_ms": null,
-        "binding": {"kind": "simulator.events", "config": {"stream": "sim.events.alarm-cycle"}}
+        "binding": {"kind": "mesa.events.v1", "config": {"stream_id": "sim.events.alarm-cycle", "parameters": {}}}
     }]});
     let (st, v) = put(
         app.clone(),
@@ -492,10 +485,10 @@ async fn event_task_rest_crud_and_running_conflict() {
         endpoint_id: "ct-task-001".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
-        tasks: vec![poll_task(
+        tasks: vec![poll_task_legacy_points(
             "t1",
             50,
-            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+            serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
         )],
         event_tasks: vec![],
     })
@@ -532,10 +525,10 @@ async fn graceful_shutdown_publishes_every_commit() {
         endpoint_id: "ct-evt-grace".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
-        tasks: vec![poll_task(
+        tasks: vec![poll_task_legacy_points(
             "t1",
             50,
-            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+            serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
         )],
         event_tasks: vec![alarm_task()],
     })
@@ -613,10 +606,10 @@ async fn stop_barrier_drains_inflight_epoch_events() {
         endpoint_id: "ct-evt-stopgate".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
-        tasks: vec![poll_task(
+        tasks: vec![poll_task_legacy_points(
             "t1",
             50,
-            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+            serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
         )],
         event_tasks: vec![flood_task()],
     };
@@ -699,10 +692,10 @@ async fn data_only_path_unaffected() {
         endpoint_id: "ct-data-001".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
-        tasks: vec![poll_task(
+        tasks: vec![poll_task_legacy_points(
             "t1",
             50,
-            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+            serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
         )],
         event_tasks: vec![],
     })

@@ -13,7 +13,7 @@ use bytes::{BufMut, BytesMut};
 use mesa_core_types::{
     AcquisitionTask, ConditionTransition, ConnectionState, DataBatch, DataType, DriverBinding,
     ErrorKind, EventCondition, EventRecord, EventTask, PointDescriptor, PointValue, Quality,
-    TaskMode, UnknownDataType, Value, ValueOrigin,
+    TaskMode, TaskSchedule, UnknownDataType, Value, ValueOrigin,
 };
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -21,10 +21,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// IPC 协议版本。Major 不兼容直接拒绝握手；Minor 取双方较小值。
 /// V1.2.1 新增 PointValue.value_origin（§5.5），Minor 1 保证新 Driver 的 typed BAD 语义可被新 Core 理解，旧端仍按 UNSPECIFIED 兼容解释
 pub const PROTOCOL_MAJOR: u32 = 1;
-/// Minor 4：PointDescriptorProto 新增可选 source_label（Point Presentation
-/// Metadata P1）。纯 additive：旧 Driver 不填→None 回落；新 Driver→旧 Core
-/// 未知字段忽略。Core 不得因 minor 不同拒绝运行（无 hard gate）。
-pub const PROTOCOL_MINOR: u32 = 4;
+/// Minor 5（Foundation-2）：AcquisitionTask 调度单真值（`schedule`），
+/// Subscribe 参数由 schedule 承载（wire 仍传 mode 派生值 + Poll interval；
+/// Subscribe 反序列化归一为缺省调度，见 `task_from_pb`）。
+/// 同 Minor 4 一样纯 additive（新增字段/语义，老端按旧形态解读），
+/// Core 不得因 minor 不同拒绝运行（无 hard gate）。
+pub const PROTOCOL_MINOR: u32 = 5;
 
 /// Dynamic Probe RPC 可用的最低协商 Minor（§8）。协商 Minor < 2 的旧 Driver
 /// 不识别 ProbeRequest（会静默忽略），Core 必须直接返回 Unsupported，
@@ -467,23 +469,36 @@ fn check_event_batch_size(b: &pb::EventBatchMsg) -> Result<(), ConvertError> {
 pub fn task_to_pb(t: &AcquisitionTask) -> Result<pb::AcquisitionTaskProto, ConvertError> {
     Ok(pb::AcquisitionTaskProto {
         id: t.id.clone(),
-        mode: t.mode.as_str().to_string(),
-        interval_ms: t.interval_ms,
+        mode: t.mode().as_str().to_string(),
+        interval_ms: t.interval_ms(),
         binding_kind: t.binding.kind.clone(),
         binding_config_json: serde_json::to_string(&t.binding.config)?,
     })
 }
 
 pub fn task_from_pb(t: pb::AcquisitionTaskProto) -> Result<AcquisitionTask, ConvertError> {
+    // wire 只传 mode 派生值 + Poll interval（Subscribe 参数由 binding 承载）；
+    // 反序列化时 Subscribe 归一为缺省调度（Foundation-2 wire 形态，见 proto 注释）。
     let mode = match t.mode.as_str() {
         "poll" => TaskMode::Poll,
         "subscribe" => TaskMode::Subscribe,
         other => return Err(ConvertError::InvalidMode(other.to_string())),
     };
+    let schedule = match mode {
+        TaskMode::Poll => {
+            let interval_ms = t.interval_ms.unwrap_or(0);
+            if interval_ms == 0 {
+                return Err(ConvertError::InvalidMode(
+                    "poll task 缺少正整数 interval_ms".into(),
+                ));
+            }
+            TaskSchedule::Poll { interval_ms }
+        }
+        TaskMode::Subscribe => TaskSchedule::default_subscribe(),
+    };
     Ok(AcquisitionTask {
         id: t.id,
-        mode,
-        interval_ms: t.interval_ms,
+        schedule,
         binding: DriverBinding {
             kind: t.binding_kind,
             config: serde_json::from_str(&t.binding_config_json)?,
@@ -922,8 +937,7 @@ mod tests {
     fn task_conversion_preserves_binding_json() {
         let t = AcquisitionTask {
             id: "fast".into(),
-            mode: TaskMode::Poll,
-            interval_ms: Some(100),
+            schedule: TaskSchedule::Poll { interval_ms: 100 },
             binding: DriverBinding {
                 kind: "sim.points".into(),
                 config: serde_json::json!({ "points": [ { "key": "a", "kind": "counter" } ] }),

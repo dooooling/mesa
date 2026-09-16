@@ -149,7 +149,8 @@ message ConfigureTasks {
 
 message AcquisitionTaskProto {
   string id = 1;
-  // "poll" | "subscribe"
+  // "poll" | "subscribe"（TaskMode 派生值；Subscribe 参数由 schedule 承载，
+  // 反序列化归一为缺省调度——Foundation-2 wire 形态，见 task_from_pb）。
   string mode = 2;
   optional uint64 interval_ms = 3;
   string binding_kind = 4;

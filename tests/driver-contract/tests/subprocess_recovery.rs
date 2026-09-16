@@ -141,7 +141,7 @@ async fn driver_crash_restore_via_endpoint_runtime() {
         endpoint_id: "ct-crash".into(),
         driver_id: "simulator".into(),
         connection_json: r#"{"crash_after_batches":3}"#.into(),
-        tasks: vec![poll_task(
+        tasks: vec![poll_task_legacy_points(
             "t",
             40,
             serde_json::json!({

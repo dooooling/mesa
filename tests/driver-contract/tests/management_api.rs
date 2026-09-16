@@ -85,7 +85,13 @@ async fn post_json(app: axum::Router, uri: &str, body: &str) -> (StatusCode, ser
     let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap())
+    // 空 body（204/205/304 等）时给出 Null 而非 panic；其余必须为 JSON。
+    if bytes.is_empty() {
+        return (status, serde_json::Value::Null);
+    }
+    // 非 JSON body（如 axum 提取层 plain-text 拒绝）同样置 Null，只断状态码。
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, v)
 }
 
 async fn put_json(app: axum::Router, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
@@ -294,33 +300,33 @@ async fn task_save_gate_rejects_unknown_resource_and_connection_field() {
     .await;
     assert_eq!(s, StatusCode::CREATED, "create endpoint");
     // 未知 resource → 400
-    let bad = r#"{"endpoint_id":"e1","tasks":[{"id":"t1","mode":"poll","interval_ms":100,
+    let bad = r#"{"endpoint_id":"e1","tasks":[{"id":"t1","schedule":{"mode":"poll","interval_ms":100},
         "binding":{"kind":"mesa.resources.v1","config":{"selections":[
         {"resource_id":"nope","parameters":{},"outputs":[{"output":"value","point_key":"k"}]}]}}}]}"#;
     let (s, v) = post_json(app.clone(), "/api/v1/tasks", bad).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
     assert_eq!(v["valid"], false);
     // 未知参数字段 → 400
-    let bad2 = r#"{"endpoint_id":"e1","tasks":[{"id":"t1","mode":"poll","interval_ms":100,
+    let bad2 = r#"{"endpoint_id":"e1","tasks":[{"id":"t1","schedule":{"mode":"poll","interval_ms":100},
         "binding":{"kind":"mesa.resources.v1","config":{"selections":[
         {"resource_id":"counter","parameters":{"bogus":1},"outputs":[{"output":"value","point_key":"k"}]}]}}}]}"#;
     let (s, v) = post_json(app.clone(), "/api/v1/tasks", bad2).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
     // 合法 generic → 200
-    let good = r#"{"endpoint_id":"e1","tasks":[{"id":"t1","mode":"poll","interval_ms":100,
+    let good = r#"{"endpoint_id":"e1","tasks":[{"id":"t1","schedule":{"mode":"poll","interval_ms":100},
         "binding":{"kind":"mesa.resources.v1","config":{"selections":[
         {"resource_id":"counter","parameters":{"start":1},"outputs":[{"output":"value","point_key":"k"}]}]}}}]}"#;
     let (s, v) = post_json(app.clone(), "/api/v1/tasks", good).await;
     assert_eq!(s, StatusCode::OK, "body: {v}");
-    // 非法 mode（simulator counter 只报 Poll）→ 400
+    // 非法 schedule（simulator counter 只支持 Poll）→ 400
     let bad_mode = good.replace("\"mode\":\"poll\"", "\"mode\":\"subscribe\"");
     let (s, v) = post_json(app.clone(), "/api/v1/tasks", &bad_mode).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
     // 跨 Task point_key 重复 → 400（endpoint-wide 唯一，单 Task 内各自合法）
     let dup = r#"{"endpoint_id":"e1","tasks":[
-        {"id":"t1","mode":"poll","interval_ms":100,"binding":{"kind":"mesa.resources.v1","config":{"selections":[
+        {"id":"t1","schedule":{"mode":"poll","interval_ms":100},"binding":{"kind":"mesa.resources.v1","config":{"selections":[
         {"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k"}]}]}}},
-        {"id":"t2","mode":"poll","interval_ms":100,"binding":{"kind":"mesa.resources.v1","config":{"selections":[
+        {"id":"t2","schedule":{"mode":"poll","interval_ms":100},"binding":{"kind":"mesa.resources.v1","config":{"selections":[
         {"resource_id":"sine","parameters":{},"outputs":[{"output":"value","point_key":"k"}]}]}}}]}"#;
     let (s, v) = post_json(app.clone(), "/api/v1/tasks", dup).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");

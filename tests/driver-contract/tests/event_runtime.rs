@@ -26,7 +26,7 @@ use mesa_driver_sdk::{
     DataSink, Driver, DriverConnection, SdkDriverError, SdkFaults, serve_with_faults,
 };
 use mesa_driver_simulator::{
-    EVENT_BINDING_KIND, SIM_ALARM_CONDITION_ID, SIM_EVENT_STREAM_ALARM, SIM_EVENT_STREAM_COUNTER,
+    SIM_ALARM_CONDITION_ID, SIM_EVENT_STREAM_ALARM, SIM_EVENT_STREAM_COUNTER,
 };
 use mesa_event_store::{EventHub, EventServices, EventStore};
 use tokio_util::sync::CancellationToken;
@@ -37,25 +37,30 @@ use common::*;
 // 辅助
 // ---------------------------------------------------------------------------
 
-/// 构造 Simulator 事件任务（binding 语义由 Simulator 解释）。
-fn sim_event_task(id: &str, stream: &str, mode: TaskMode, interval_ms: Option<u64>) -> EventTask {
+/// 构造 Simulator 事件任务（Foundation-2 单路径：`mesa.events.v1`）。
+fn sim_event_task(
+    id: &str,
+    stream_id: &str,
+    mode: TaskMode,
+    interval_ms: Option<u64>,
+) -> EventTask {
     EventTask {
         id: id.into(),
         mode,
         interval_ms,
         binding: DriverBinding {
-            kind: EVENT_BINDING_KIND.into(),
-            config: serde_json::json!({"stream": stream}),
+            kind: mesa_core_types::GENERIC_EVENT_BINDING_KIND.into(),
+            config: serde_json::json!({"stream_id": stream_id, "parameters": {}}),
         },
     }
 }
 
 /// 最小数据任务（Simulator run() 的前置要求，与事件断言无关）。
 fn mini_data_task() -> AcquisitionTask {
-    poll_task(
+    poll_task_legacy_points(
         "t1",
         50,
-        serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+        serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
     )
 }
 

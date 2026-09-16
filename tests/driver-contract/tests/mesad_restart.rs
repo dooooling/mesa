@@ -148,7 +148,7 @@ async fn mesad_process_restart_recovers_events_and_history() {
         "PUT",
         "/api/v1/tasks/ep-restart",
         Some(
-            r#"{"tasks":[{"id":"t1","mode":"poll","interval_ms":50,"binding":{"kind":"simulator.points","config":{"points":[{"key":"k.counter","kind":"counter"}]}}}]}"#,
+            r#"{"tasks":[{"id":"t1","schedule":{"mode":"poll","interval_ms":50},"binding":{"kind":"mesa.resources.v1","config":{"selections":[{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]}}}]}"#,
         ),
     )
     .await;
@@ -158,7 +158,7 @@ async fn mesad_process_restart_recovers_events_and_history() {
         "PUT",
         "/api/v1/endpoints/ep-restart/event-tasks",
         Some(
-            r#"{"event_tasks":[{"id":"al","mode":"subscribe","interval_ms":null,"binding":{"kind":"simulator.events","config":{"stream":"sim.events.alarm-cycle"}}}]}"#,
+            r#"{"event_tasks":[{"id":"al","mode":"subscribe","interval_ms":null,"binding":{"kind":"mesa.events.v1","config":{"stream_id":"sim.events.alarm-cycle","parameters":{}}}}]}"#,
         ),
     )
     .await;

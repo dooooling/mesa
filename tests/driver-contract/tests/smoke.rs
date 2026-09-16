@@ -59,7 +59,7 @@ async fn databatch_epoch_sequence_semantics() {
         HANDLE,
         1,
         EPOCH,
-        &[poll_task(
+        &[poll_task_legacy_points(
             "t1",
             50,
             serde_json::json!({

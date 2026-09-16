@@ -206,8 +206,7 @@ describe("resolveEndpointContexts", () => {
 
 const canon = (id: string, extra?: Partial<AcquisitionTaskShape>): AcquisitionTaskShape => ({
   id,
-  mode: "poll",
-  interval_ms: 1000,
+  schedule: { mode: "poll", interval_ms: 1000 },
   binding: {
     kind: "mesa.resources.v1",
     config: { selections: [{ resource_id: "r", parameters: {}, outputs: [] }] },
@@ -217,8 +216,7 @@ const canon = (id: string, extra?: Partial<AcquisitionTaskShape>): AcquisitionTa
 
 const other = (id: string): AcquisitionTaskShape => ({
   id,
-  mode: "poll",
-  interval_ms: 500,
+  schedule: { mode: "poll", interval_ms: 500 },
   binding: { kind: "driver.native.v1", config: { op: "scan" } },
 });
 
@@ -252,7 +250,7 @@ describe("mergeAcquisitionTasks", () => {
     });
     expect(out.map((t) => t.id).sort()).toEqual(["task-a", "task-b", "task-c"]);
     const a = out.find((t) => t.id === "task-a")!;
-    expect(a.interval_ms).toBe(2000);
+    expect(a.schedule.interval_ms).toBe(2000);
     expect((a.binding.config as { selections: unknown }).selections).toEqual(sel);
     // 被保留任务逐字不动（含自定义 binding）
     expect(out.find((t) => t.id === "task-b")).toEqual(other("task-b"));
@@ -271,12 +269,12 @@ describe("mergeAcquisitionTasks", () => {
     expect(out.map((t) => t.id).sort()).toEqual(["t1", "t1-2"]);
   });
 
-  it("外来 subscribe canonical 不被默默翻成 poll，周期也保留", () => {
-    const sub = canon("sub-1", { mode: "subscribe", interval_ms: null });
+  it("外来 subscribe canonical 不被默默翻成 poll，schedule 也保留", () => {
+    const sub = canon("sub-1", { schedule: { mode: "subscribe" } });
     const out = mergeAcquisitionTasks([sub], { interval_ms: 1000, selections: sel });
     expect(out).toHaveLength(1);
-    expect(out[0].mode).toBe("subscribe");
-    expect(out[0].interval_ms).toBeNull();
+    expect(out[0].schedule.mode).toBe("subscribe");
+    expect(out[0].schedule.interval_ms).toBeUndefined();
   });
 });
 

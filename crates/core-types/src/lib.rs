@@ -395,7 +395,10 @@ pub struct DataBatch {
     pub mono_ns: Option<u64>,
 }
 
-/// 任务执行模式（方案 §5.5）：Poll 周期轮询；Subscribe 由服务端推送（OPC UA）。
+/// 任务执行模式（能力枚举）：Poll 周期轮询；Subscribe 由服务端推送（OPC UA）。
+///
+/// 仅用于 Descriptor modes / capabilities 交叉校验与 wire 兼容投影；
+/// 任务实例侧唯一真值是 [`TaskSchedule`]（`schedule.mode()` 投影出本枚举）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskMode {
@@ -412,6 +415,75 @@ impl TaskMode {
     }
 }
 
+/// 任务调度（Foundation-2 单真值）：Poll 周期轮询；Subscribe 由服务端推送（OPC UA）。
+///
+/// 替代旧 `mode + interval_ms` 双字段：`mode()` 只作能力枚举投影（Descriptor
+/// modes / capabilities 交叉校验用），实例侧唯一真值是本枚举（ADR 0003 §37.3）。
+///
+/// wire/REST 形态：内部 tagged（`{"mode":"poll","interval_ms":…}`），同时
+/// 接受旧扁平形态（`{"mode":"poll","interval_ms":…}` 与 schedule 字段二选一，
+/// 详见 AcquisitionTask）。Poll 缺 interval 即拒绝（零值不得默认）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", tag = "mode")]
+pub enum TaskSchedule {
+    Poll {
+        interval_ms: u64,
+    },
+    Subscribe {
+        #[serde(default = "default_publishing_interval")]
+        publishing_interval_ms: u64,
+        #[serde(default = "default_sampling_interval")]
+        sampling_interval_ms: u64,
+        #[serde(default = "default_queue_size")]
+        queue_size: u32,
+        #[serde(default = "default_discard_oldest")]
+        discard_oldest: bool,
+    },
+}
+
+fn default_publishing_interval() -> u64 {
+    500
+}
+
+fn default_sampling_interval() -> u64 {
+    250
+}
+
+fn default_queue_size() -> u32 {
+    10
+}
+
+fn default_discard_oldest() -> bool {
+    true
+}
+
+impl TaskSchedule {
+    /// 缺省 Subscribe 参数（旧 Subscribe 任务无参数可填时的归一值；
+    /// 与 OPC UA legacy `opcua.subscription` 历史默认值对齐）。
+    pub fn default_subscribe() -> Self {
+        TaskSchedule::Subscribe {
+            publishing_interval_ms: 500,
+            sampling_interval_ms: 250,
+            queue_size: 10,
+            discard_oldest: true,
+        }
+    }
+
+    pub fn mode(&self) -> TaskMode {
+        match self {
+            TaskSchedule::Poll { .. } => TaskMode::Poll,
+            TaskSchedule::Subscribe { .. } => TaskMode::Subscribe,
+        }
+    }
+
+    pub fn poll_interval_ms(&self) -> Option<u64> {
+        match self {
+            TaskSchedule::Poll { interval_ms } => Some(*interval_ms),
+            TaskSchedule::Subscribe { .. } => None,
+        }
+    }
+}
+
 /// Driver 私有绑定描述。Core 只做 Schema 校验和持久化，绝不解释 `config`
 /// （方案核心原则 #6：Core 不懂协议）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -420,12 +492,12 @@ pub struct DriverBinding {
     pub config: serde_json::Value,
 }
 
-/// 一个采集任务。`binding.kind` 的合法取值由各 Driver 自行定义并校验。
+/// 一个采集任务。调度唯一真值是 `schedule`（Foundation-2 单真值）；
+/// `binding.kind` 仅允许 `mesa.resources.v1`（legacy kind 已删除，ADR 0003）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AcquisitionTask {
     pub id: String,
-    pub mode: TaskMode,
-    pub interval_ms: Option<u64>,
+    pub schedule: TaskSchedule,
     pub binding: DriverBinding,
 }
 
@@ -435,18 +507,25 @@ impl AcquisitionTask {
         if self.id.trim().is_empty() {
             return Err(TaskValidationError::EmptyTaskId);
         }
-        match self.mode {
-            TaskMode::Poll => {
-                if self.interval_ms.unwrap_or(0) == 0 {
-                    return Err(TaskValidationError::PollRequiresInterval {
-                        task: self.id.clone(),
-                    });
-                }
-            }
-            // Subscribe 模式的节拍由订阅参数决定，interval 无意义
-            TaskMode::Subscribe => {}
+        // Poll 必须提供正整数 interval_ms；Subscribe 节拍由订阅参数决定
+        if let TaskSchedule::Poll { interval_ms } = self.schedule
+            && interval_ms == 0
+        {
+            return Err(TaskValidationError::PollRequiresInterval {
+                task: self.id.clone(),
+            });
         }
         Ok(())
+    }
+
+    /// 兼容投影：旧 `mode` 语义由 schedule 派生（Descriptor 校验 / wire 编码用）。
+    pub fn mode(&self) -> TaskMode {
+        self.schedule.mode()
+    }
+
+    /// 兼容投影：Poll 间隔；Subscribe 返回 None。
+    pub fn interval_ms(&self) -> Option<u64> {
+        self.schedule.poll_interval_ms()
     }
 }
 
@@ -591,34 +670,39 @@ mod tests {
 
     #[test]
     fn poll_task_requires_interval_but_subscribe_does_not() {
-        let mk = |mode, interval| AcquisitionTask {
+        let mk = |schedule| AcquisitionTask {
             id: "t1".into(),
-            mode,
-            interval_ms: interval,
+            schedule,
             binding: DriverBinding {
                 kind: "sim".into(),
                 config: serde_json::json!({}),
             },
         };
         assert_eq!(
-            mk(TaskMode::Poll, None).validate(),
+            mk(TaskSchedule::Poll { interval_ms: 0 }).validate(),
             Err(TaskValidationError::PollRequiresInterval { task: "t1".into() })
+        );
+        mk(TaskSchedule::Poll { interval_ms: 100 })
+            .validate()
+            .unwrap();
+        // Subscribe 节拍由订阅参数决定
+        mk(TaskSchedule::default_subscribe()).validate().unwrap();
+        // schedule 单真值投影
+        assert_eq!(
+            mk(TaskSchedule::Poll { interval_ms: 100 }).mode(),
+            TaskMode::Poll
         );
         assert_eq!(
-            mk(TaskMode::Poll, Some(0)).validate(),
-            Err(TaskValidationError::PollRequiresInterval { task: "t1".into() })
+            mk(TaskSchedule::default_subscribe()).mode(),
+            TaskMode::Subscribe
         );
-        mk(TaskMode::Poll, Some(100)).validate().unwrap();
-        // Subscribe 节拍由订阅参数决定，interval 缺省合法
-        mk(TaskMode::Subscribe, None).validate().unwrap();
     }
 
     #[test]
     fn empty_task_id_rejected() {
         let t = AcquisitionTask {
             id: "  ".into(),
-            mode: TaskMode::Subscribe,
-            interval_ms: None,
+            schedule: TaskSchedule::default_subscribe(),
             binding: DriverBinding {
                 kind: "k".into(),
                 config: serde_json::json!({}),
