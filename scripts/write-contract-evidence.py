@@ -40,14 +40,12 @@ def run_or_exit(cmd, label):
         sys.exit(127)
 
 def run_capture(cmd, label):
+    """运行单 suite。返回 (ok, output)：失败不直接 exit，由主循环统一裁决
+    exit 码（测试失败 exit 5，输出不可解析 exit 4），证据一律不写。"""
     print(f"running: {' '.join(cmd)} ...", flush=True)
     try:
-        r = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        return r.stdout + r.stderr
-    except subprocess.CalledProcessError as e:
-        print(f"{label} FAILED (exit {e.returncode}), not writing contract.json", file=sys.stderr)
-        print((e.stdout or "") + (e.stderr or ""), file=sys.stderr)
-        sys.exit(e.returncode)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        return r.returncode == 0, r.stdout + r.stderr
     except FileNotFoundError as e:
         print(f"cargo not found: {e}", file=sys.stderr)
         sys.exit(127)
@@ -89,19 +87,24 @@ def main():
     total_passed = 0
     total_failed = 0
     for suite in SUITES:
-        output = run_capture(
+        ok, output = run_capture(
             ["cargo", "test", "--locked", "-p", "mesa-contract-tests", "--all-features",
              "--test", suite],
             f"contract suite {suite}",
         )
         parsed = parse_suite_results(output)
         if parsed is None:
-            print(f"suite {suite}: cannot parse test output, not writing contract.json", file=sys.stderr)
+            # 含 cargo 非零退出但无汇总行（编译挂/ harness 崩）一律不可解析
+            print(f"suite {suite}: cannot parse test output (cargo ok={ok}), not writing contract.json",
+                  file=sys.stderr)
             sys.exit(4)
         passed, failed, failed_names = parsed
         suite_results[suite] = {"passed": passed, "failed": failed, "failed_tests": failed_names}
         total_passed += passed
         total_failed += failed
+        if not ok or failed != 0:
+            print(f"suite {suite} failed, continuing to collect all suites (no evidence will be written)",
+                  file=sys.stderr)
 
     if total_failed != 0:
         print(f"contract suites failed: {total_failed} tests failed, not writing contract.json", file=sys.stderr)

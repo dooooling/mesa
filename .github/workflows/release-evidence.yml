@@ -25,7 +25,7 @@ jobs:
         with:
           toolchain: '1.95.0'
 
-      - name: contract evidence (14 suites, exact SHA)
+      - name: contract evidence (all suites from contract_suites.py, exact SHA)
         run: python scripts/write-contract-evidence.py
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
