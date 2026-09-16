@@ -2,7 +2,7 @@
 
 ## 1. 访问范式
 
-- **绑定** `s7.address-group` `TaskMode Poll` `interval_ms`
+- **绑定**（Foundation-2 单路径）`mesa.resources.v1` resource `memory` + `TaskSchedule::Poll{interval_ms}`
 - **地址** `DB10.DBD20/DBX24.0/MB10/IB0/QB0/C0/T0/PIW0/PQW0/VB0/VW0/V0.0/SM0.0/SMB0/AIW0/AQW0/L0.0/LB0` `area DB 0x84/M 0x83/I 0x81/Q 0x82/C 0x1C/T 0x1D/PI 0x80/L 0x86` `V→DB1 SM→M AI→PI AQ→PQ L→0x86` `bit 0..7` `C/T 不×8`
 - **类型** `BOOL/BYTE/WORD/DWORD/INT/DINT/REAL/LREAL/STRING(256)/WSTRING(516)/S5TIME(T/C)/TIME/DATE/DT` 大端 `codec` `STRING cur截断 WSTRING UTF-16BE` `12 型+V/SM/AI/AQ/L别名`
 - **诊断** `SZL 0x0011 106B/0x0131` `CLOCK` `build_szl_req 0x07 UserData 0xFF09` `read_szl 97 106B GOOD`

@@ -1,24 +1,18 @@
 #![allow(clippy::collapsible_if)]
-//! OPC UA Driver — 方案 §7.3 节点/订阅/浏览型（V1 只读，44/44 2026-08-29）。
+//! OPC UA Driver — 方案 §7.3 节点/订阅型（V1 只读，44/44 2026-08-29）。
 //!
-//! - Poll 绑定：`opcua.node-group`
+//! - 绑定（Foundation-2 单路径）：`mesa.resources.v1`，resource `node`
 //!   ```json
-//!   { "nodes": [
-//!       { "key": "counter", "node_id": "nsu=http://example.com/MyModel/;s=Counter", "data_type": "U32" },
-//!       { "key": "sine",    "node_id": "nsu=http://example.com/MyModel/;i=2",        "data_type": "DOUBLE" }
+//!   { "selections": [
+//!       { "resource_id": "node",
+//!         "parameters": {"node_id":"nsu=http://example.com/MyModel/;s=Counter","data_type":"UINT32"},
+//!         "outputs": [{"output":"value","point_key":"counter"}] }
 //!   ]}
 //!   ```
 //!   node_id 一律 canonical `nsu=` 形态（`ns=<index>` 拒绝，见 `address`）；
 //!   运行期每次建会话后经 NamespaceArray 换算为当前 index（漂移自愈）。
-//! - Subscribe 绑定：`opcua.subscription`（publishing 500 sampling 30 queue10，§7.3）
-//!   ```json
-//!   { "publishing_interval_ms": 500, "sampling_interval_ms": 250, "queue_size": 10,
-//!     "discard_oldest": true, "nodes": [ {"key":"k","node_id":"nsu=http://example.com/MyModel/;i=2"} ] }
-//!   ```
-//! - Browse 绑定：`opcua.browse`（周期浏览，§7.3 V1 支持，父子一律 canonical）
-//!   ```json
-//!   { "nodes": [ {"key":"objects","node_id":"nsu=http://opcfoundation.org/UA/;i=85","data_type":"STRING"} ] }
-//!   ```
+//! - 调度（TaskSchedule 单真值）：Poll 取 interval_ms；Subscribe 取
+//!   publishing/sampling/queue/discard 四参数（Foundation-2 闭环）。
 //! - NodeId 解析见 `address::parse_address`；Core 不触及此文件（硬约束）。
 //! - SecurityPolicy/MessageSecurityMode 透传至 Native ClientBuilder pki_dir/own.der/key trust false verify true
 //! - SourceTimestamp 1601 ticks→Unix ns 精确保留，Quality GOOD/UNCERTAIN/BAD 按 StatusCode 映射，Array→Typed Array
@@ -46,19 +40,17 @@ use std::time::Duration;
 
 use mesa_core_types::{
     AcquisitionTask, DataBatch, DataType, DriverMetadata, DuplicatePointKey, GENERIC_BINDING_KIND,
-    GenericBinding, PointDescriptor, PointMap, PointValue, Quality, TaskMode, Value, ValueOrigin,
-    ensure_unique_point_keys, now_unix_ns,
+    GenericBinding, PointDescriptor, PointMap, PointValue, Quality, TaskSchedule, Value,
+    ValueOrigin, ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio_util::sync::CancellationToken;
 
-pub const BINDING_POLL: &str = "opcua.node-group";
-pub const BINDING_SUB: &str = "opcua.subscription";
-pub const BINDING_BROWSE: &str = "opcua.browse";
-
-/// OPC UA canonical data_type 公共契约（PR3）：generic `mesa.resources.v1`
-/// 只接受这 10 个精确大写拼写；parser 的大小写 alias（int/real/str/…）
-/// 只属于 legacy binding 兼容。descriptor mapping 与 generic 门禁同源。
+/// Foundation-2 已删除的 legacy kind（`opcua.node-group` / `opcua.subscription` /
+/// `opcua.browse` 统一由 `mesa.resources.v1` + TaskSchedule 替代，不再是合法
+/// binding；见 ADR 0003）。此处仅保留注释说明，不再导出常量.
+/// OPC UA canonical data_type 公共契约（PR3）：`mesa.resources.v1`
+/// 只接受这 10 个精确大写拼写。descriptor mapping 与门禁同源。
 /// NOTE：driver 只读 Value 属性；`attribute` 参数已删除（声明了但零消费
 /// 的死 knob 不进契约，需要读 BrowseName 等属性时另立 feature）。
 pub const CANONICAL_DATA_TYPES: [(&str, DataType); 10] = [
@@ -192,9 +184,10 @@ impl Driver for OpcUaDriver {
                     access: AccessMode::Read,
                 }],
                 modes: vec![
-                    // PR3：generic 当前只执行 Poll；Subscribe 只存在于 legacy
-                    // runtime，Descriptor 不报执行不了的 mode（设计后再加回）。
+                    // Foundation-2：canonical Subscribe 闭环（Poll + Subscribe
+                    // 双模式；schedule 参数由 TaskSchedule 承载）。
                     mesa_core_types::TaskMode::Poll,
+                    mesa_core_types::TaskMode::Subscribe,
                 ],
             }],
             controls: mesa_core_types::ControlCatalog::default(),
@@ -452,9 +445,8 @@ enum TaskKind {
         queue_size: u32,
         discard_oldest: bool,
     },
-    Browse {
-        interval_ms: u64,
-    },
+    // Foundation-2 已删除 legacy `opcua.browse`（周期浏览任务）；
+    // Browse 能力保留为 ResourceSelectionMethod（选点方式），不再是任务类型。
 }
 
 #[derive(Debug)]
@@ -494,6 +486,10 @@ impl std::fmt::Debug for OpcUaConnection {
     }
 }
 
+/// Foundation-2 已删除 legacy `nodes[]` 信封的数据类型别名解析；
+/// canonical 路径直接查 CANONICAL_DATA_TYPES 表（configure 内联）。
+/// 本函数保留供单测锁定解析语义（地址解析内部能力），不进产品契约。
+#[allow(dead_code)]
 fn parse_data_type(s: &str) -> Result<DataType, SdkDriverError> {
     match s.trim().to_ascii_uppercase().as_str() {
         "BOOL" | "BOOLEAN" => Ok(DataType::Bool),
@@ -802,7 +798,17 @@ impl DriverConnection for OpcUaConnection {
         for task in &tasks {
             task.validate()
                 .map_err(|e| SdkDriverError::configuration("INVALID_TASK", e.to_string()))?;
-            if task.binding.kind == GENERIC_BINDING_KIND {
+            // Foundation-2 单路径：仅接受 mesa.resources.v1（legacy 已删除）。
+            if task.binding.kind != GENERIC_BINDING_KIND {
+                return Err(SdkDriverError::configuration(
+                    "UNSUPPORTED_BINDING",
+                    format!(
+                        "task `{}`: 期望 {GENERIC_BINDING_KIND}，实际 {}",
+                        task.id, task.binding.kind
+                    ),
+                ));
+            }
+            {
                 let binding: GenericBinding = serde_json::from_value(task.binding.config.clone())
                     .map_err(|e| {
                     SdkDriverError::configuration(
@@ -812,13 +818,33 @@ impl DriverConnection for OpcUaConnection {
                 })?;
                 mesa_core_types::validate_selections_structure(&binding.selections)
                     .map_err(|e| SdkDriverError::configuration("INVALID_BINDING_CONFIG", e))?;
-                if task.mode != TaskMode::Poll {
-                    return Err(SdkDriverError::new(
-                        mesa_core_types::ErrorKind::Unsupported,
-                        "MODE_NOT_SUPPORTED",
-                        format!("task `{}`: generic opcua only supports poll", task.id),
-                    ));
+                // Foundation-2 Subscribe 闭环：schedule 单真值（Poll 取 interval，
+                // Subscribe 取订阅四参数；validate 已保证合法）。
+                enum ScheduleKind {
+                    Poll {
+                        interval_ms: u64,
+                    },
+                    Subscribe {
+                        publishing_interval_ms: u64,
+                        sampling_interval_ms: u64,
+                        queue_size: u32,
+                        discard_oldest: bool,
+                    },
                 }
+                let schedule_kind = match task.schedule {
+                    TaskSchedule::Poll { interval_ms } => ScheduleKind::Poll { interval_ms },
+                    TaskSchedule::Subscribe {
+                        publishing_interval_ms,
+                        sampling_interval_ms,
+                        queue_size,
+                        discard_oldest,
+                    } => ScheduleKind::Subscribe {
+                        publishing_interval_ms,
+                        sampling_interval_ms,
+                        queue_size,
+                        discard_oldest,
+                    },
+                };
                 let mut indices = Vec::new();
                 for sel in &binding.selections {
                     if sel.resource_id != "node" {
@@ -889,194 +915,41 @@ impl DriverConnection for OpcUaConnection {
                         });
                     }
                 }
-                let interval = task.interval_ms.expect("validated");
-                new_tasks.push(TaskPlan {
-                    id: task.id.clone(),
-                    kind: TaskKind::Poll {
-                        interval_ms: interval,
-                    },
-                    point_indices: indices,
-                });
-                continue;
-            }
-            // Poll / Subscribe / Browse 三分支
-            let is_poll = task.binding.kind == BINDING_POLL;
-            let is_sub = task.binding.kind == BINDING_SUB;
-            let is_browse = task.binding.kind == BINDING_BROWSE;
-            if !is_poll && !is_sub && !is_browse {
-                return Err(SdkDriverError::configuration(
-                    "UNSUPPORTED_BINDING",
-                    format!(
-                        "task `{}`: 期望 {BINDING_POLL}/{BINDING_SUB}/{BINDING_BROWSE} 或 {GENERIC_BINDING_KIND}，实际 {}",
-                        task.id, task.binding.kind
-                    ),
-                ));
-            }
-            if is_poll && task.mode != TaskMode::Poll {
-                return Err(SdkDriverError::new(
-                    mesa_core_types::ErrorKind::Unsupported,
-                    "MODE_NOT_SUPPORTED",
-                    format!("task `{}`: opcua.node-group 仅支持 poll", task.id),
-                ));
-            }
-            if is_sub && task.mode != TaskMode::Subscribe {
-                return Err(SdkDriverError::new(
-                    mesa_core_types::ErrorKind::Unsupported,
-                    "MODE_NOT_SUPPORTED",
-                    format!("task `{}`: opcua.subscription 仅支持 subscribe", task.id),
-                ));
-            }
-            if is_browse && task.mode != TaskMode::Poll {
-                return Err(SdkDriverError::new(
-                    mesa_core_types::ErrorKind::Unsupported,
-                    "MODE_NOT_SUPPORTED",
-                    format!("task `{}`: opcua.browse 仅支持 poll", task.id),
-                ));
-            }
-            // nodes 统一解析
-            let nodes = task
-                .binding
-                .config
-                .get("nodes")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| {
-                    SdkDriverError::configuration(
-                        "INVALID_BINDING_CONFIG",
-                        format!("task `{}`: 缺少 nodes 数组", task.id),
-                    )
-                })?;
-            if nodes.is_empty() {
-                return Err(SdkDriverError::configuration(
-                    "INVALID_BINDING_CONFIG",
-                    format!("task `{}`: nodes 不能为空", task.id),
-                ));
-            }
-            let mut indices = Vec::with_capacity(nodes.len());
-            for node in nodes {
-                let key = node.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
-                    SdkDriverError::configuration(
-                        "INVALID_POINT",
-                        format!("task `{}`: node 缺少 key", task.id),
-                    )
-                })?;
-                if key.trim().is_empty() {
-                    return Err(SdkDriverError::configuration(
-                        "INVALID_POINT",
-                        "key 不能为空",
-                    ));
-                }
-                let node_id = node
-                    .get("node_id")
-                    .or_else(|| node.get("nodeId"))
-                    .or_else(|| node.get("address"))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        SdkDriverError::configuration(
-                            "INVALID_POINT",
-                            format!("point `{key}` 缺少 node_id"),
-                        )
-                    })?;
-                let dt_str = node
-                    .get("data_type")
-                    .or_else(|| node.get("dataType"))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        SdkDriverError::configuration(
-                            "INVALID_POINT",
-                            format!("point `{key}` 缺少 data_type"),
-                        )
-                    })?;
-                let addr = parse_address(node_id).map_err(|e| match e {
-                    AddressError::Empty => SdkDriverError::configuration(
-                        "INVALID_ADDRESS",
-                        format!("point `{key}` node_id 为空"),
-                    ),
-                    AddressError::Invalid { reason, .. } => SdkDriverError::new(
-                        mesa_core_types::ErrorKind::Address,
-                        "INVALID_ADDRESS",
-                        format!("point `{key}` node_id `{node_id}` 非法: {reason}"),
-                    ),
-                })?;
-                let data_type = parse_data_type(dt_str)?;
-                indices.push(new_points.len());
-                new_points.push(PointSpec {
-                    key: key.to_string(),
-                    addr,
-                    data_type,
-                });
-            }
-            if is_poll {
-                let interval = task.interval_ms.expect("validated");
-                if interval == 0 {
-                    return Err(SdkDriverError::configuration(
-                        "INVALID_TASK",
-                        "interval_ms 需 >0",
-                    ));
-                }
-                new_tasks.push(TaskPlan {
-                    id: task.id.clone(),
-                    kind: TaskKind::Poll {
-                        interval_ms: interval,
-                    },
-                    point_indices: indices,
-                });
-            } else if is_browse {
-                let interval = task.interval_ms.expect("validated");
-                if interval == 0 {
-                    return Err(SdkDriverError::configuration(
-                        "INVALID_TASK",
-                        "interval_ms 需 >0",
-                    ));
-                }
-                new_tasks.push(TaskPlan {
-                    id: task.id.clone(),
-                    kind: TaskKind::Browse {
-                        interval_ms: interval,
-                    },
-                    point_indices: indices,
-                });
-            } else {
-                // Subscribe 参数：publishing_interval_ms / sampling_interval_ms / queue_size / discard_oldest
-                let publishing_interval_ms = task
-                    .binding
-                    .config
-                    .get("publishing_interval_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(500);
-                let sampling_interval_ms = task
-                    .binding
-                    .config
-                    .get("sampling_interval_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(250);
-                let queue_size = task
-                    .binding
-                    .config
-                    .get("queue_size")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(10) as u32;
-                let discard_oldest = task
-                    .binding
-                    .config
-                    .get("discard_oldest")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                if publishing_interval_ms == 0 || sampling_interval_ms == 0 || queue_size == 0 {
-                    return Err(SdkDriverError::configuration(
-                        "INVALID_BINDING_CONFIG",
-                        format!("task `{}`: publishing/sampling/queue 需 >0", task.id),
-                    ));
-                }
-                new_tasks.push(TaskPlan {
-                    id: task.id.clone(),
-                    kind: TaskKind::Subscribe {
+                match schedule_kind {
+                    ScheduleKind::Poll { interval_ms } => {
+                        new_tasks.push(TaskPlan {
+                            id: task.id.clone(),
+                            kind: TaskKind::Poll { interval_ms },
+                            point_indices: indices,
+                        });
+                    }
+                    ScheduleKind::Subscribe {
                         publishing_interval_ms,
                         sampling_interval_ms,
                         queue_size,
                         discard_oldest,
-                    },
-                    point_indices: indices,
-                });
+                    } => {
+                        if publishing_interval_ms == 0
+                            || sampling_interval_ms == 0
+                            || queue_size == 0
+                        {
+                            return Err(SdkDriverError::configuration(
+                                "INVALID_TASK",
+                                format!("task `{}`: publishing/sampling/queue 需 >0", task.id),
+                            ));
+                        }
+                        new_tasks.push(TaskPlan {
+                            id: task.id.clone(),
+                            kind: TaskKind::Subscribe {
+                                publishing_interval_ms,
+                                sampling_interval_ms,
+                                queue_size,
+                                discard_oldest,
+                            },
+                            point_indices: indices,
+                        });
+                    }
+                }
             }
         }
 
@@ -1385,84 +1258,6 @@ impl DriverConnection for OpcUaConnection {
                         Ok::<(), SdkDriverError>(())
                     });
                     }
-                    TaskKind::Browse { interval_ms } => {
-                        let interval = Duration::from_millis(interval_ms);
-                        let namespaces = Arc::clone(&namespaces);
-                        set.spawn(async move {
-                        let mut ticker = tokio::time::interval(interval);
-                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                        loop {
-                            tokio::select! {
-                                _ = ticker.tick() => {},
-                                _ = shutdown.cancelled() => break,
-                            }
-                            let mut batch_vals = Vec::with_capacity(points.len());
-                            for (spec, pid) in &points {
-                                match api.browse(&spec.addr).await {
-                                    Ok(refs) => {
-                                        // 子节点 canonical 身份（越界项跳过并告警，不杀整轮）。
-                                        let mut parts = Vec::with_capacity(refs.len());
-                                        for c in &refs {
-                                            match mesa_opcua_transport::OpcUaNodeId::from_index_ref(
-                                                &c.node,
-                                                &namespaces,
-                                            ) {
-                                                Some(id) => parts.push(format!(
-                                                    "{} {}",
-                                                    c.name,
-                                                    id.canonical_key()
-                                                )),
-                                                None => tracing::warn!(
-                                                    key = %spec.key,
-                                                    name = %c.name,
-                                                    ns = c.node.namespace,
-                                                    "Browse 子节点命名空间越界，已跳过",
-                                                ),
-                                            }
-                                        }
-                                        let val = Value::String(parts.join(";"));
-                                        batch_vals.push(PointValue {
-                                            point_id: *pid,
-                                            value: val,
-                                            quality: Quality::Good,
-                                            quality_code: None,
-                                            source_timestamp_ns: None,
-                                            value_origin: ValueOrigin::Current,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(key=%spec.key, error=%e, "Browse 单点 Bad");
-                                        // Browse 失败亦为 typed BAD + Placeholder（无 last-known 缓存，Browse 非连续信号）
-                                        batch_vals.push(PointValue {
-                                            point_id: *pid,
-                                            value: Value::typed_placeholder(spec.data_type),
-                                            quality: Quality::Bad,
-                                            quality_code: Some(
-                                                opcua_types::StatusCode::BadUnexpectedError.bits()
-                                                    as i32,
-                                            ),
-                                            source_timestamp_ns: None,
-                                            value_origin: ValueOrigin::Placeholder,
-                                        });
-                                    }
-                                }
-                            }
-                            if batch_vals.is_empty() {
-                                continue;
-                            }
-                            sink.publish(DataBatch {
-                                connection_handle: 0,
-                                stream_epoch: 0,
-                                sequence: seq.fetch_add(1, Ordering::Relaxed),
-                                timestamp_ns: now_unix_ns(),
-                                values: batch_vals,
-                                mono_ns: None,
-                            })
-                            .await;
-                        }
-                        Ok::<(), SdkDriverError>(())
-                    });
-                    }
                     TaskKind::Subscribe {
                         publishing_interval_ms,
                         sampling_interval_ms,
@@ -1602,25 +1397,28 @@ impl DriverConnection for OpcUaConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
-
-    fn task_with_nodes(nodes: serde_json::Value) -> AcquisitionTask {
-        AcquisitionTask {
-            id: "t1".into(),
-            mode: TaskMode::Poll,
-            interval_ms: Some(100),
-            binding: DriverBinding {
-                kind: BINDING_POLL.into(),
-                config: serde_json::json!({"nodes": nodes}),
-            },
-        }
-    }
+    use mesa_core_types::{AcquisitionTask, DriverBinding};
 
     fn generic_task(selections: serde_json::Value) -> AcquisitionTask {
         AcquisitionTask {
             id: "t1".into(),
-            mode: TaskMode::Poll,
-            interval_ms: Some(100),
+            schedule: TaskSchedule::Poll { interval_ms: 100 },
+            binding: DriverBinding {
+                kind: GENERIC_BINDING_KIND.into(),
+                config: serde_json::json!({"selections": selections}),
+            },
+        }
+    }
+
+    fn generic_subscribe_task(selections: serde_json::Value) -> AcquisitionTask {
+        AcquisitionTask {
+            id: "s1".into(),
+            schedule: TaskSchedule::Subscribe {
+                publishing_interval_ms: 500,
+                sampling_interval_ms: 250,
+                queue_size: 10,
+                discard_oldest: true,
+            },
             binding: DriverBinding {
                 kind: GENERIC_BINDING_KIND.into(),
                 config: serde_json::json!({"selections": selections}),
@@ -1644,25 +1442,24 @@ mod tests {
     }
 
     /// PR3 mode 门：descriptor 声明的每个 mode 都必须 generic configure 成功
-    ///（报执行不了的 mode 即 Descriptor lie；Subscribe 回归留待设计）。
+    ///（Foundation-2：Poll + Subscribe 双模式闭环，报执行不了即 Descriptor lie）。
     #[tokio::test]
     async fn declared_modes_all_configurable() {
         use mesa_core_types::TaskMode;
         let d = OpcUaDriver.descriptor();
         let node = d.resources.iter().find(|r| r.id == "node").unwrap();
-        assert_eq!(node.modes, vec![TaskMode::Poll]);
+        assert_eq!(node.modes, vec![TaskMode::Poll, TaskMode::Subscribe]);
+        let sel = node_selection(
+            "k",
+            serde_json::json!({
+                "node_id": "nsu=http://example.com/MyModel/;i=2",
+                "data_type": "STRING",
+            }),
+        );
         for mode in &node.modes {
-            let task = AcquisitionTask {
-                id: "t1".into(),
-                mode: *mode,
-                interval_ms: Some(100),
-                binding: DriverBinding {
-                    kind: GENERIC_BINDING_KIND.into(),
-                    config: serde_json::json!({"selections": node_selection("k", serde_json::json!({
-                        "node_id": "nsu=http://example.com/MyModel/;i=2",
-                        "data_type": "STRING",
-                    }))}),
-                },
+            let task = match mode {
+                TaskMode::Poll => generic_task(sel.clone()),
+                TaskMode::Subscribe => generic_subscribe_task(sel.clone()),
             };
             let mut conn = test_conn().await;
             let descs = conn.configure(1, vec![task]).await.unwrap();
@@ -1795,7 +1592,7 @@ mod tests {
             1,
             vec![EventTask {
                 id: "ev-only".into(),
-                mode: TaskMode::Subscribe,
+                mode: mesa_core_types::TaskMode::Subscribe,
                 interval_ms: None,
                 binding: DriverBinding {
                     kind: GENERIC_EVENT_BINDING_KIND.into(),
@@ -1842,21 +1639,22 @@ mod tests {
             plan: None,
             event_plan: None,
         };
-        let nodes = serde_json::json!([
-            {"key":"a","node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"U32"},
-            {"key":"b","node_id":"nsu=http://example.com/MyModel/;s=Motor.Speed","data_type":"F64"}
+        // generic 双点（canonical node_id + data_type）
+        let both = serde_json::json!([
+            {"resource_id":"node","parameters":{"node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"UINT32"},"outputs":[{"output":"value","point_key":"a"}]},
+            {"resource_id":"node","parameters":{"node_id":"nsu=http://example.com/MyModel/;s=Motor.Speed","data_type":"DOUBLE"},"outputs":[{"output":"value","point_key":"b"}]},
         ]);
-        let t = task_with_nodes(nodes);
-        let descs = conn.configure(1, vec![t]).await.unwrap();
+        let descs = conn.configure(1, vec![generic_task(both)]).await.unwrap();
         assert_eq!(descs.len(), 2);
-        let dup = serde_json::json!([
-            {"key":"a","node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"U32"},
-            {"key":"a","node_id":"nsu=http://example.com/MyModel/;i=3","data_type":"U32"}
-        ]);
-        let err = conn
-            .configure(2, vec![task_with_nodes(dup)])
-            .await
-            .unwrap_err();
+        // 跨 task 重复 point_key → DUPLICATE_POINT_KEY（同一 task 内重复则
+        // 早于此被结构级拒绝，见 generic 路径 validate_selections_structure）
+        let dup_a = serde_json::json!([{"resource_id":"node","parameters":{"node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"UINT32"},"outputs":[{"output":"value","point_key":"a"}]}]);
+        let dup_b = serde_json::json!([{"resource_id":"node","parameters":{"node_id":"nsu=http://example.com/MyModel/;i=3","data_type":"UINT32"},"outputs":[{"output":"value","point_key":"a"}]}]);
+        let mut t1 = generic_task(dup_a);
+        t1.id = "t1".into();
+        let mut t2 = generic_task(dup_b);
+        t2.id = "t2".into();
+        let err = conn.configure(2, vec![t1, t2]).await.unwrap_err();
         assert_eq!(err.code, "DUPLICATE_POINT_KEY");
     }
 
@@ -1869,9 +1667,10 @@ mod tests {
             plan: None,
             event_plan: None,
         };
-        let nodes = serde_json::json!([{"key":"a","node_id":"ns=2;x=1","data_type":"U32"}]);
+        // 非 canonical（ns= 拒绝）
+        let sel = serde_json::json!([{"resource_id":"node","parameters":{"node_id":"ns=2;x=1","data_type":"UINT32"},"outputs":[{"output":"value","point_key":"a"}]}]);
         let err = conn
-            .configure(1, vec![task_with_nodes(nodes)])
+            .configure(1, vec![generic_task(sel)])
             .await
             .unwrap_err();
         assert_eq!(err.code, "INVALID_ADDRESS");
@@ -1886,28 +1685,18 @@ mod tests {
             plan: None,
             event_plan: None,
         };
-        let t = AcquisitionTask {
-            id: "s1".into(),
-            mode: TaskMode::Subscribe,
-            interval_ms: None,
-            binding: DriverBinding {
-                kind: BINDING_SUB.into(),
-                config: serde_json::json!({"publishing_interval_ms":500,"sampling_interval_ms":250,"queue_size":10,"nodes":[{"key":"a","node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"U32"}]}),
-            },
-        };
-        let descs = conn.configure(1, vec![t]).await.unwrap();
+        // Foundation-2：Subscribe 参数由 schedule 承载（非 binding config）。
+        let sel_a = serde_json::json!([{"resource_id":"node","parameters":{"node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"UINT32"},"outputs":[{"output":"value","point_key":"a"}]}]);
+        let descs = conn
+            .configure(1, vec![generic_subscribe_task(sel_a)])
+            .await
+            .unwrap();
         assert_eq!(descs.len(), 1);
-        // Subscribe 默认参数容错
-        let t2 = AcquisitionTask {
-            id: "s2".into(),
-            mode: TaskMode::Subscribe,
-            interval_ms: None,
-            binding: DriverBinding {
-                kind: BINDING_SUB.into(),
-                config: serde_json::json!({"nodes":[{"key":"b","node_id":"nsu=http://example.com/MyModel/;s=MyVar","data_type":"STRING"}]}),
-            },
-        };
-        let descs2 = conn.configure(2, vec![t2]).await.unwrap();
+        let sel_b = serde_json::json!([{"resource_id":"node","parameters":{"node_id":"nsu=http://example.com/MyModel/;s=MyVar","data_type":"STRING"},"outputs":[{"output":"value","point_key":"b"}]}]);
+        let descs2 = conn
+            .configure(2, vec![generic_subscribe_task(sel_b)])
+            .await
+            .unwrap();
         assert_eq!(descs2.len(), 1);
     }
 
@@ -1920,16 +1709,15 @@ mod tests {
             plan: None,
             event_plan: None,
         };
-        let nodes = serde_json::json!([{"key":"a","node_id":"nsu=http://example.com/MyModel/;s=Counter","data_type":"U32"}]);
-        let t = task_with_nodes(nodes);
-        let descs = conn.configure(1, vec![t]).await.unwrap();
+        let sel = serde_json::json!([{"resource_id":"node","parameters":{"node_id":"nsu=http://example.com/MyModel/;s=Counter","data_type":"UINT32"},"outputs":[{"output":"value","point_key":"a"}]}]);
+        let descs = conn.configure(1, vec![generic_task(sel)]).await.unwrap();
         let mut map = std::collections::HashMap::new();
         map.insert(descs[0].point_key.clone(), 1u32);
         conn.apply_point_map(map).await.unwrap();
         // 能走到 apply 即代表 Poll 快照构建正确；run 的 DataSink 发布由集成测试覆盖
     }
 
-    // --- P0-A.9 GOOD→BAD→GOOD / first BAD / legacy / REST 契约测试（V1.2.1 Gate） ---
+    // --- P0-A.9 GOOD→BAD→GOOD / first BAD / 兼容别名 / REST 契约测试（V1.2.1 Gate） ---
 
     fn dv_good_f64(val: f64, ticks: i64) -> opcua_types::DataValue {
         use opcua_types::{DataValue, DateTime, StatusCode, Variant};

@@ -149,11 +149,19 @@ message ConfigureTasks {
 
 message AcquisitionTaskProto {
   string id = 1;
-  // "poll" | "subscribe"
+  // "poll" | "subscribe"（TaskMode 派生值；调度参数见下）。
   string mode = 2;
+  // Poll 调度：正整数轮询间隔（Subscribe 不用本字段）。
   optional uint64 interval_ms = 3;
   string binding_kind = 4;
   string binding_config_json = 5;
+  // Subscribe 调度（Foundation-2，IPC 1.5）：四参数完整 roundtrip。
+  // bool 必须 optional（区分 false 与字段缺席，缺席=用缺省调度语义拒绝，
+  // 见 TASK_SCHEDULE_MIN_MINOR 门控）。
+  optional uint64 publishing_interval_ms = 6;
+  optional uint64 sampling_interval_ms = 7;
+  optional uint32 queue_size = 8;
+  optional bool discard_oldest = 9;
 }
 
 // ConfigureTasks 的响应由 Driver 主动上报（而非 Ack 形态）：描述构建成功即返回；

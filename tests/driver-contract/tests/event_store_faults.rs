@@ -179,7 +179,7 @@ async fn faulted_endpoint_fails_observably_while_data_only_survives() {
         tasks: vec![common::poll_task(
             "d",
             50,
-            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+            serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
         )],
         event_tasks: vec![],
     })

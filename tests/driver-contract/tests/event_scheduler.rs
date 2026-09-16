@@ -62,7 +62,7 @@ async fn control_priority_under_event_and_data_flood() {
         tasks: vec![common::poll_task(
             "d",
             500,
-            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+            serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
         )],
         event_tasks: vec![generic_counter_task()],
     })

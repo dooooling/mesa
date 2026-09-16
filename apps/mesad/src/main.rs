@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use mesa_config_store::{ConfigStore, DeviceRecord, EndpointRecord};
-use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
+use mesa_core_types::{AcquisitionTask, DriverBinding, GENERIC_BINDING_KIND, TaskSchedule};
 use mesa_driver_manager::StorePointIdSource;
 
 /// 默认 HTTP 端口。仅 loopback 可见（§4.2）。
@@ -312,19 +312,19 @@ fn maybe_seed_demo(store: &ConfigStore) -> Result<bool, String> {
 }
 
 fn demo_tasks() -> Vec<AcquisitionTask> {
+    // Foundation-2 单路径：seed 直接走 mesa.resources.v1（legacy 已删除）。
     vec![AcquisitionTask {
         id: "default".into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(200),
+        schedule: TaskSchedule::Poll { interval_ms: 200 },
         binding: DriverBinding {
-            kind: "simulator.points".into(),
+            kind: GENERIC_BINDING_KIND.into(),
             config: serde_json::json!({
-                "points": [
-                    { "key": "sim.counter", "kind": "counter", "start": 0, "step": 1 },
-                    { "key": "sim.sine",    "kind": "sine", "amplitude": 100, "period_ms": 5000, "offset": 50 },
-                    { "key": "sim.toggle",  "kind": "toggle", "initial": false },
-                    { "key": "sim.const",   "kind": "constant", "value": 42 },
-                    { "key": "sim.random",  "kind": "random", "min": -5, "max": 5, "seed": 7 }
+                "selections": [
+                    { "resource_id": "counter", "parameters": {"start": 0, "step": 1}, "outputs": [{ "output": "value", "point_key": "sim.counter" }] },
+                    { "resource_id": "sine", "parameters": {"amplitude": 100, "period_ms": 5000, "offset": 50}, "outputs": [{ "output": "value", "point_key": "sim.sine" }] },
+                    { "resource_id": "toggle", "parameters": {"initial": false}, "outputs": [{ "output": "value", "point_key": "sim.toggle" }] },
+                    { "resource_id": "constant", "parameters": {"value": 42}, "outputs": [{ "output": "value", "point_key": "sim.const" }] },
+                    { "resource_id": "random", "parameters": {"min": -5, "max": 5, "seed": 7}, "outputs": [{ "output": "value", "point_key": "sim.random" }] }
                 ]
             }),
         },

@@ -80,7 +80,7 @@ async fn stop_while_reconnecting_is_bounded_and_explicit() {
         tasks: vec![common::poll_task(
             "d",
             50,
-            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+            serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
         )],
         event_tasks: vec![EventTask {
             id: "cnt".into(),

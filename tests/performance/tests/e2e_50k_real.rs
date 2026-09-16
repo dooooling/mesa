@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
+use mesa_core_types::{AcquisitionTask, DriverBinding, TaskSchedule, GENERIC_BINDING_KIND};
 use mesa_driver_manager::MesaManager;
 
 fn percentile(mut v: Vec<u64>, p: f64) -> u64 {
@@ -108,12 +108,11 @@ async fn e2e_50k_real_throughput() {
     let tasks: Vec<AcquisitionTask> = (0..4)
         .map(|i| AcquisitionTask {
             id: format!("t{i}"),
-            mode: TaskMode::Poll,
-            interval_ms: Some(20),
+            schedule: TaskSchedule::Poll { interval_ms: 20 },
             binding: DriverBinding {
-                kind: "simulator.points".into(),
+                kind: GENERIC_BINDING_KIND.into(),
                 config: serde_json::json!({
-                    "points": (0..5).map(|j| serde_json::json!({"key": format!("p{i}_{j}"), "kind":"counter", "start":0, "step":1})).collect::<Vec<_>>(),
+                    "selections": (0..5).map(|j| serde_json::json!({"resource_id":"counter","parameters":{"start":0,"step":1},"outputs":[{"output":"value","point_key": format!("p{i}_{j}")}]})).collect::<Vec<_>>(),
                     "burst": 125
                 }),
             },

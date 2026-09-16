@@ -62,12 +62,10 @@ async fn databatch_epoch_sequence_semantics() {
         &[poll_task(
             "t1",
             50,
-            serde_json::json!({
-                "points": [
-                    {"key":"k.counter","kind":"counter","step":2},
-                    {"key":"k.toggle","kind":"toggle","initial":true}
-                ]
-            }),
+            serde_json::json!([
+                {"resource_id":"counter","parameters":{"step":2},"outputs":[{"output":"value","point_key":"k.counter"}]},
+                {"resource_id":"toggle","parameters":{"initial":true},"outputs":[{"output":"value","point_key":"k.toggle"}]}
+            ]),
         )],
         11,
     )

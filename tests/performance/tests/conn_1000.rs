@@ -1,7 +1,7 @@
 //! Conn-1000 无 Task/Handle 泄漏预检（Simulator only）
 //! 20 Endpoints × 20 Driver Processes 低速 100ms，断言无泄漏（非单进程 1000 Handles）
 
-use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode};
+use mesa_core_types::{AcquisitionTask, DriverBinding, TaskSchedule, GENERIC_BINDING_KIND};
 use mesa_driver_manager::{MesaManager, PointIdAllocator};
 use std::sync::Arc;
 
@@ -19,11 +19,10 @@ async fn conn_1000_no_leak() {
             connection_json: "{}".into(),
             tasks: vec![AcquisitionTask {
                 id: format!("t{i}"),
-                mode: TaskMode::Poll,
-                interval_ms: Some(100),
+                schedule: TaskSchedule::Poll { interval_ms: 100 },
                 binding: DriverBinding {
-                    kind: "simulator.points".into(),
-                    config: serde_json::json!({"points":[{"key": format!("k{i}"), "kind":"counter"}]}),
+                    kind: GENERIC_BINDING_KIND.into(),
+                    config: serde_json::json!({"selections": [{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key": format!("k{i}")}]}]}),
                 },
             }],
             event_tasks: vec![],

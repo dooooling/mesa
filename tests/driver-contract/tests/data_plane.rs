@@ -25,14 +25,12 @@ async fn quality_injection_static_and_transition() {
         &[poll_task(
             "t",
             30,
-            serde_json::json!({
-                "points": [
-                    // 静态 BAD
-                    {"key":"q.bad","kind":"constant","value":1,"quality":"BAD"},
-                    // 第 3 批起坏，第 6 批起恢复
-                    {"key":"q.cycle","kind":"counter","bad_after_batches":3,"good_again_after":6}
-                ]
-            }),
+            serde_json::json!([
+                // 静态 BAD（quality 参数随 selection parameters 透传）
+                {"resource_id":"constant","parameters":{"value":1,"quality":"BAD"},"outputs":[{"output":"value","point_key":"q.bad"}]},
+                // 第 3 批起坏，第 6 批起恢复
+                {"resource_id":"counter","parameters":{"bad_after_batches":3,"good_again_after":6},"outputs":[{"output":"value","point_key":"q.cycle"}]}
+            ]),
         )],
     )
     .await;
@@ -85,28 +83,28 @@ async fn backpressure_coalesces_and_keeps_control_responsive() {
     let (mut session, mut events, _) = Session::connect(port, TOKEN).await.unwrap();
 
     open_connection(&session, H, "{}").await;
-    // burst 注入保证产出速率与 OS 定时器精度无关：
+    // burst 注入保证产出速率与 OS 定时器精度无关（burst 为 GenericBinding
+    // 顶层参数，与 selections 同级）：
     // 20ms tick × burst 200 ≈ 10000 批/s，700ms 停滞 ≈ 7000 批
     // 远超 出站队列(256) + Core 事件队列(512) 的总吸收量。
-    let descriptors = configure_tasks(
-        &session,
-        H,
-        1,
-        &[poll_task(
+    let task = {
+        let mut t = poll_task(
             "fast",
             20,
-            serde_json::json!({
-                "burst": 200,
-                "points": [
-                    {"key":"p.0","kind":"counter","step":1},
-                    {"key":"p.1","kind":"counter","step":1},
-                    {"key":"p.2","kind":"counter","step":1},
-                    {"key":"p.3","kind":"random"}
-                ]
-            }),
-        )],
-    )
-    .await;
+            serde_json::json!([
+                {"resource_id":"counter","parameters":{"step":1},"outputs":[{"output":"value","point_key":"p.0"}]},
+                {"resource_id":"counter","parameters":{"step":1},"outputs":[{"output":"value","point_key":"p.1"}]},
+                {"resource_id":"counter","parameters":{"step":1},"outputs":[{"output":"value","point_key":"p.2"}]},
+                {"resource_id":"random","parameters":{},"outputs":[{"output":"value","point_key":"p.3"}]}
+            ]),
+        );
+        // burst 与 selections 同级（GenericBinding 顶层扩展参数）
+        if let serde_json::Value::Object(ref mut m) = t.binding.config {
+            m.insert("burst".into(), serde_json::json!(200));
+        }
+        t
+    };
+    let descriptors = configure_tasks(&session, H, 1, &[task]).await;
     apply_point_map(&session, H, 1, sequential_ids(&descriptors, 1)).await;
     start_connection(&session, H, 9).await;
 

@@ -2,13 +2,14 @@
 
 > 依据 `mesa_Driver_MVP_实施方案.md §19.3 §7.3`，OPC UA 生产发布前必须闭环证书信任、SecurityPolicy、Poll/Subscribe 双路径与真机兼容矩阵。V1 严格只读，不引入写路径。
 
-## 1. 访问范式
+## 1. 访问范式（Foundation-2 单路径）
 
-| 绑定 | 任务模式 | 配置示例 | 语义 |
-|---|---|---|---|
-| `opcua.node-group` | `poll` | `{"nodes":[{"key":"counter","node_id":"ns=2;i=1","data_type":"I64"}]}` | `interval_ms` 轮询 `Session::read` 批量读 |
-| `opcua.subscription` | `subscribe` | `{"publishing_interval_ms":500,"sampling_interval_ms":250,"queue_size":10,"discard_oldest":true,"nodes":[...]}` | `DataChangeCallback → per-handle Latest-Wins slots → forwarder send().await` `KeepAlive` 不产批 |
-| `opcua.browse` | `poll` | `{"nodes":[{"key":"objs","node_id":"ns=0;i=85","data_type":"STRING"}]}` | `interval_ms` 周期 `Session::browse` 引用展开 `;` 拼接 |
+绑定统一为 `mesa.resources.v1`（resource `node`）+ `TaskSchedule` 调度单真值：
+
+| 调度 | 配置示例 | 语义 |
+|---|---|---|
+| `Poll{interval_ms}` | `{"selections":[{"resource_id":"node","parameters":{"node_id":"nsu=…;i=1","data_type":"UINT32"},"outputs":[…]}]}` | `interval_ms` 轮询 `Session::read` 批量读 |
+| `Subscribe{publishing/sampling/queue/discard}` | 同上 selections + schedule 四参数 | `DataChangeCallback → per-handle Latest-Wins slots → forwarder send().await` `KeepAlive` 不产批 |
 
 `NodeId` 解析见 `address.rs`：`ns=2;i/s/g/b 4型` `Core` 禁止解析。值映射 `Variant→Value` `§9.2`：`BOOL/I32/U32/I64/U64/F32/F64/STRING/Bytes/DateTime/DateTimeArray/TypedArray`；`StatusCode Good→GOOD Uncertain→UNCERTAIN Bad→BAD` `quality_code=bits()` 单点隔离；`SourceTimestamp 1601 ticks→Unix ns` 精确保留。
 

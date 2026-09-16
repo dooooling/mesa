@@ -1,10 +1,11 @@
-//! ResourceSelection 契约（V2.1 §15, Milestone C）
-//! 验证 mesa.resources.v1 通用绑定与 Legacy 兼容、point_key 唯一、资源/输出存在等。
+//! ResourceSelection 契约（V2.1 §15, Milestone C；Foundation-2 单路径收口）
+//! 验证 mesa.resources.v1 通用绑定、point_key 唯一、资源/输出存在等。
+//! legacy binding 已删除（ADR 0003），此处不再覆盖任何 legacy kind。
 
 mod common;
 
 use mesa_core_types::{
-    AcquisitionTask, DriverBinding, GenericBinding, ResourceSelection, SelectedOutput, TaskMode,
+    AcquisitionTask, DriverBinding, GenericBinding, ResourceSelection, SelectedOutput, TaskSchedule,
 };
 use mesa_driver_sdk::Driver;
 use serde_json::json;
@@ -13,8 +14,7 @@ use serde_json::json;
 fn generic_task(id: &str, selections: Vec<ResourceSelection>) -> AcquisitionTask {
     AcquisitionTask {
         id: id.into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(100),
+        schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
             kind: mesa_core_types::GENERIC_BINDING_KIND.into(),
             config: serde_json::to_value(GenericBinding { selections }).unwrap(),
@@ -167,70 +167,99 @@ async fn opcua_generic_node_ok() {
 }
 
 #[tokio::test]
-async fn legacy_still_works_for_all_drivers() {
-    // Simulator legacy
+async fn legacy_kinds_rejected_for_all_drivers() {
+    // Foundation-2：legacy kind 已删除，非 generic 即 UNSUPPORTED_BINDING。
+    // 被删 kind 字符串集中在此测试（生产 Driver 不再 export 相关常量）。
+    const LEGACY_KINDS: &[&str] = &[
+        "simulator.points",
+        "s7.address-group",
+        "focas.data-block",
+        "opcua.node-group",
+        "opcua.subscription",
+        "opcua.browse",
+        "simulator.events",
+    ];
     let mut sim = mesa_driver_simulator::SimulatorDriver
         .open_connection("ep1", "{}")
         .await
         .unwrap();
     let legacy_sim = AcquisitionTask {
         id: "t1".into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(100),
+        schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
-            kind: mesa_driver_simulator::BINDING_KIND.into(),
+            kind: LEGACY_KINDS[0].into(),
             config: json!({"points":[{"key":"a","kind":"counter"}]}),
         },
     };
-    assert!(sim.configure(1, vec![legacy_sim]).await.is_ok());
+    assert_eq!(
+        sim.configure(1, vec![legacy_sim]).await.unwrap_err().code,
+        "UNSUPPORTED_BINDING"
+    );
 
-    // S7 legacy
+    // S7
     let mut s7 = mesa_driver_s7::S7Driver
         .open_connection("ep1", r#"{"host":"127.0.0.1"}"#)
         .await
         .unwrap();
     let legacy_s7 = AcquisitionTask {
         id: "t1".into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(100),
+        schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
-            kind: mesa_driver_s7::BINDING_KIND.into(),
+            kind: LEGACY_KINDS[1].into(),
             config: json!({"items":[{"key":"a","address":"DB10.DBD0","data_type":"REAL"}]}),
         },
     };
-    assert!(s7.configure(1, vec![legacy_s7]).await.is_ok());
+    assert_eq!(
+        s7.configure(1, vec![legacy_s7]).await.unwrap_err().code,
+        "UNSUPPORTED_BINDING"
+    );
 
-    // FOCAS legacy
+    // FOCAS
     let mut focas = mesa_driver_focas2::FocasDriver
         .open_connection("ep1", "{}")
         .await
         .unwrap();
     let legacy_focas = AcquisitionTask {
         id: "t1".into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(100),
+        schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
-            kind: mesa_driver_focas2::BINDING_KIND.into(),
+            kind: LEGACY_KINDS[2].into(),
             config: json!({"items":[{"key":"a","address":"status","data_type":"U32"}]}),
         },
     };
-    assert!(focas.configure(1, vec![legacy_focas]).await.is_ok());
+    assert_eq!(
+        focas
+            .configure(1, vec![legacy_focas])
+            .await
+            .unwrap_err()
+            .code,
+        "UNSUPPORTED_BINDING"
+    );
 
-    // OPC UA legacy binding（地址契约已为 canonical nsu=，此处锁的是 binding kind 兼容）
+    // OPC UA legacy kinds
     let mut opcua = mesa_driver_opcua::OpcUaDriver
         .open_connection("ep1", "{}")
         .await
         .unwrap();
-    let legacy_opcua = AcquisitionTask {
-        id: "t1".into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(100),
-        binding: DriverBinding {
-            kind: mesa_driver_opcua::BINDING_POLL.into(),
-            config: json!({"nodes":[{"key":"a","node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"U32"}]}),
-        },
-    };
-    assert!(opcua.configure(1, vec![legacy_opcua]).await.is_ok());
+    for kind in [LEGACY_KINDS[3], LEGACY_KINDS[4], LEGACY_KINDS[5]] {
+        let legacy_opcua = AcquisitionTask {
+            id: "t1".into(),
+            schedule: TaskSchedule::Poll { interval_ms: 100 },
+            binding: DriverBinding {
+                kind: kind.into(),
+                config: json!({"nodes":[{"key":"a","node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"U32"}]}),
+            },
+        };
+        assert_eq!(
+            opcua
+                .configure(1, vec![legacy_opcua])
+                .await
+                .unwrap_err()
+                .code,
+            "UNSUPPORTED_BINDING",
+            "{kind}"
+        );
+    }
 }
 
 #[test]

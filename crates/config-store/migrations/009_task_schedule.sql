@@ -1,0 +1,12 @@
+-- 009_task_schedule.sql: Foundation-2 调度单真值（ADR 0003 §37.3）。
+-- tasks 表：mode + interval_ms 两列由 schedule_json 单列替代（重建表方式）。
+-- event_tasks 表：保持原结构（EventTask 不引入 schedule，P1-1）。
+--
+-- 旧行回填规则（Rust 迁移逻辑执行，本文件仅作版本标记载体）：
+--   mode=poll → {"mode":"poll","interval_ms":<n>}（缺失视为 0，由 validate 拒绝）；
+--   mode=subscribe → {"mode":"subscribe"}（缺省订阅参数，见 TaskSchedule 反序列化默认值）。
+-- 新库建表已为新形态（含 schedule_json 单列，无 mode/interval_ms 列）。
+--
+-- NOTE：本 SQL 不直接执行 DDL（重建表需逐行回填，由 Rust 侧在事务内完成）；
+-- checksum 仍用于 schema_migrations 记录。
+SELECT 1;

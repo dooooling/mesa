@@ -4,5 +4,5 @@ name = "OPC UA"
 version = "0.3.0"
 executable = "Mesa-driver-opcua"
 protocol_major = 1
-protocol_minor = 4
+protocol_minor = 5
 sdk = "rust"

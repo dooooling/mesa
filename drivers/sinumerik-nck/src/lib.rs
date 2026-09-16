@@ -394,7 +394,7 @@ impl DriverConnection for NckConnection {
         tasks: Vec<AcquisitionTask>,
     ) -> Result<Vec<PointDescriptor>, SdkDriverError> {
         use mesa_core_types::{
-            DuplicatePointKey, GENERIC_BINDING_KIND, GenericBinding, TaskMode,
+            DuplicatePointKey, GENERIC_BINDING_KIND, GenericBinding, TaskSchedule,
             ensure_unique_point_keys, validate_selections_structure,
         };
         let mut new_points: Vec<PointSpec> = Vec::new();
@@ -411,6 +411,17 @@ impl DriverConnection for NckConnection {
                     ),
                 ));
             }
+            // Foundation-2 单真值：schedule 已由 validate 保证 Poll interval 合法
+            let TaskSchedule::Poll { interval_ms } = task.schedule else {
+                return Err(SdkDriverError::new(
+                    mesa_core_types::ErrorKind::Unsupported,
+                    "MODE_NOT_SUPPORTED",
+                    format!(
+                        "task `{}`: sinumerik-nck 只支持 poll（不伪造 subscribe）",
+                        task.id
+                    ),
+                ));
+            };
             let binding: GenericBinding = serde_json::from_value(task.binding.config.clone())
                 .map_err(|e| {
                     SdkDriverError::configuration(
@@ -420,16 +431,6 @@ impl DriverConnection for NckConnection {
                 })?;
             validate_selections_structure(&binding.selections)
                 .map_err(|e| SdkDriverError::configuration("INVALID_BINDING_CONFIG", e))?;
-            if task.mode != TaskMode::Poll {
-                return Err(SdkDriverError::new(
-                    mesa_core_types::ErrorKind::Unsupported,
-                    "MODE_NOT_SUPPORTED",
-                    format!(
-                        "task `{}`: sinumerik-nck 只支持 poll（不伪造 subscribe）",
-                        task.id
-                    ),
-                ));
-            }
             let mut indices = Vec::new();
             for sel in &binding.selections {
                 if sel.resource_id != GENERIC_RESOURCE_ID {
@@ -494,21 +495,9 @@ impl DriverConnection for NckConnection {
                     });
                 }
             }
-            let interval = task.interval_ms.ok_or_else(|| {
-                SdkDriverError::configuration(
-                    "INVALID_TASK",
-                    format!("task `{}`: Poll 模式必须提供 interval_ms", task.id),
-                )
-            })?;
-            if interval == 0 {
-                return Err(SdkDriverError::configuration(
-                    "INVALID_TASK",
-                    format!("task `{}`: interval_ms 需 >0", task.id),
-                ));
-            }
             new_tasks.push(TaskPlan {
                 id: task.id.clone(),
-                interval_ms: interval,
+                interval_ms,
                 point_indices: indices,
             });
         }
@@ -882,8 +871,7 @@ mod tests {
     fn poll_task(id: &str, selections: serde_json::Value) -> AcquisitionTask {
         AcquisitionTask {
             id: id.into(),
-            mode: mesa_core_types::TaskMode::Poll,
-            interval_ms: Some(50),
+            schedule: mesa_core_types::TaskSchedule::Poll { interval_ms: 50 },
             binding: mesa_core_types::DriverBinding {
                 kind: mesa_core_types::GENERIC_BINDING_KIND.into(),
                 config: serde_json::json!({"selections": selections}),
@@ -963,8 +951,7 @@ mod tests {
 
         // 非 Poll 模式拒绝（不伪造 subscribe）。
         let mut t = poll_task("t3", speed_selection("k"));
-        t.mode = mesa_core_types::TaskMode::Subscribe;
-        t.interval_ms = None;
+        t.schedule = mesa_core_types::TaskSchedule::default_subscribe();
         let err = conn.configure(3, vec![t]).await.unwrap_err();
         assert_eq!(err.code, "MODE_NOT_SUPPORTED");
 

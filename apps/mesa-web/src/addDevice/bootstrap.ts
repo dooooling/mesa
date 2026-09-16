@@ -119,8 +119,7 @@ export async function bootstrapDevice(
       tasks: [
         {
           id: "t1",
-          mode: "poll",
-          interval_ms: acquisition.intervalMs,
+          schedule: { mode: "poll", interval_ms: acquisition.intervalMs },
           binding: { kind: "mesa.resources.v1", config: { selections: acquisition.selections } },
         },
       ],

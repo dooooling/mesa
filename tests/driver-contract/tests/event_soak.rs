@@ -46,7 +46,7 @@ async fn steady_state_soak(tag: &str, secs: u64, min_rows: usize) {
         tasks: vec![common::poll_task(
             "d",
             100,
-            serde_json::json!({"points": [{"key":"k.counter","kind":"counter"}]}),
+            serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
         )],
         event_tasks: vec![EventTask {
             id: "cnt".into(),

@@ -6,7 +6,7 @@ mod common;
 
 use std::time::Duration;
 
-use mesa_core_types::{AcquisitionTask, PointDescriptor, TaskMode};
+use mesa_core_types::{AcquisitionTask, PointDescriptor};
 use mesa_driver_manager::session::Session;
 use mesa_driver_protocol::pb;
 
@@ -14,13 +14,21 @@ use common::*;
 
 const H: u32 = 1;
 
+/// Foundation-2 单路径：通用 selections 形态（counter + toggle）。
 fn two_points() -> serde_json::Value {
-    serde_json::json!({
-        "points": [
-            {"key":"a.counter","kind":"counter","step":1},
-            {"key":"a.toggle","kind":"toggle"}
-        ]
-    })
+    serde_json::json!([
+        {"resource_id":"counter","parameters":{"step":1},"outputs":[{"output":"value","point_key":"a.counter"}]},
+        {"resource_id":"toggle","parameters":{},"outputs":[{"output":"value","point_key":"a.toggle"}]}
+    ])
+}
+
+/// 单点 selections 快捷构造（legacy points 信封已删除，用 resource_id + parameters）。
+fn one_point(key: &str, resource: &str, params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!([{
+        "resource_id": resource,
+        "parameters": params,
+        "outputs": [{"output": "value", "point_key": key}],
+    }])
 }
 
 /// Open / Close（§21 行 5）：句柄可开关复用；重复打开同句柄被拒；关闭未知句柄幂等。
@@ -70,20 +78,29 @@ async fn invalid_config_returns_structured_error() {
 
     open_connection(&session, H, "{}").await;
 
-    // 1) 错误的 binding kind
+    // 1) 错误的 binding kind（legacy 已删除：非 generic 即拒绝）
     let bad_kind = vec![AcquisitionTask {
         id: "t".into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(50),
+        schedule: mesa_core_types::TaskSchedule::Poll { interval_ms: 50 },
         binding: mesa_core_types::DriverBinding {
-            kind: "s7.address-group".into(), // simulator 不支持
+            kind: "s7.address-group".into(), // legacy kind，simulator 不接受
             config: serde_json::json!({}),
         },
     }];
     configure_tasks_expect_error(&mut session, &mut events, &bad_kind, "UNSUPPORTED_BINDING").await;
 
-    // 2) 缺少 points 数组
-    let missing = vec![poll_task("t", 50, serde_json::json!({}))];
+    // 2) 空 selections（结构非法）
+    // NOTE：空 Vec 经 wire 往返后 tasks_to_pb 解码为 default_subscribe；
+    // 空 selections 在 Subscribe 语义下合法（零点快照），故此处直接构造
+    // Poll 空 selections，保证测的是"结构非法"而非"零点快照"。
+    let missing = vec![AcquisitionTask {
+        id: "t".into(),
+        schedule: mesa_core_types::TaskSchedule::Poll { interval_ms: 50 },
+        binding: mesa_core_types::DriverBinding {
+            kind: mesa_core_types::GENERIC_BINDING_KIND.into(),
+            config: serde_json::json!({"selections": []}),
+        },
+    }];
     configure_tasks_expect_error(
         &mut session,
         &mut events,
@@ -92,14 +109,13 @@ async fn invalid_config_returns_structured_error() {
     )
     .await;
 
-    // 3) Subscribe 模式不被支持
+    // 3) Subscribe 模式不被 simulator 支持
     let sub = vec![AcquisitionTask {
         id: "t".into(),
-        mode: TaskMode::Subscribe,
-        interval_ms: None,
+        schedule: mesa_core_types::TaskSchedule::default_subscribe(),
         binding: mesa_core_types::DriverBinding {
-            kind: mesa_driver_simulator::BINDING_KIND.into(),
-            config: serde_json::json!({"points": [{"key":"x","kind":"constant","value":1}]}),
+            kind: mesa_core_types::GENERIC_BINDING_KIND.into(),
+            config: serde_json::json!({"selections": [{"resource_id":"constant","parameters":{"value":1},"outputs":[{"output":"value","point_key":"x"}]}]}),
         },
     }];
     configure_tasks_expect_error(&mut session, &mut events, &sub, "MODE_NOT_SUPPORTED").await;
@@ -108,7 +124,7 @@ async fn invalid_config_returns_structured_error() {
     let unknown = vec![poll_task(
         "t",
         50,
-        serde_json::json!({"points":[{"key":"x","kind":"warp_drive"}]}),
+        serde_json::json!([{"resource_id":"warp_drive","parameters":{},"outputs":[{"output":"value","point_key":"x"}]}]),
     )];
     configure_tasks_expect_error(
         &mut session,
@@ -172,12 +188,12 @@ async fn duplicate_point_key_rejected_over_ipc() {
         poll_task(
             "t1",
             100,
-            serde_json::json!({"points":[{"key":"same.key","kind":"counter"}]}),
+            one_point("same.key", "counter", serde_json::json!({})),
         ),
         poll_task(
             "t2",
             100,
-            serde_json::json!({"points":[{"key":"same.key","kind":"counter"}]}),
+            one_point("same.key", "counter", serde_json::json!({})),
         ),
     ];
     let tasks_pb = mesa_driver_protocol::tasks_to_pb(&dup).unwrap();
@@ -213,7 +229,7 @@ async fn failed_reconfigure_keeps_previous_snapshot() {
     let broken = vec![poll_task(
         "t",
         40,
-        serde_json::json!({"points":[{"key":"b.x","kind":"black_hole"}]}),
+        one_point("b.x", "black_hole", serde_json::json!({})),
     )];
     let tasks_pb = mesa_driver_protocol::tasks_to_pb(&broken).unwrap();
     let _ = session
@@ -374,7 +390,7 @@ async fn multiple_connections_and_partial_failure_isolation() {
     let broken = vec![poll_task(
         "bad",
         50,
-        serde_json::json!({"points":[{"key":"z","kind":"nope"}]}),
+        one_point("z", "nope", serde_json::json!({})),
     )];
     let tasks_pb = mesa_driver_protocol::tasks_to_pb(&broken).unwrap();
     let _ = session
@@ -421,7 +437,7 @@ async fn runtime_reconfigure_swaps_epoch_and_points() {
     let new_tasks = vec![poll_task(
         "t2",
         40,
-        serde_json::json!({"points":[{"key":"n.only","kind":"constant","value":9}]}),
+        one_point("n.only", "constant", serde_json::json!({"value":9})),
     )];
     let new_desc = configure_tasks(&session, H, 2, &new_tasks).await;
     assert_eq!(new_desc.len(), 1);

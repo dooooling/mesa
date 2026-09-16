@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use mesa_core_types::{AcquisitionTask, DriverBinding, PointDescriptor, TaskMode};
+use mesa_core_types::{
+    AcquisitionTask, DriverBinding, GENERIC_BINDING_KIND, PointDescriptor, TaskSchedule,
+};
 use mesa_driver_manager::session::{Session, SessionError, SessionEvent};
 use mesa_driver_protocol::pb;
 use mesa_driver_sdk::{SdkFaults, serve_with_faults};
@@ -123,15 +125,14 @@ pub async fn start_sim_server_with_faults(faults: SdkFaults) -> (u16, Cancellati
     panic!("bind retry exhausted: {:?}", last_err);
 }
 
-/// 构造一个 Poll 任务，binding 为 simulator.points。
-pub fn poll_task(id: &str, interval_ms: u64, points: serde_json::Value) -> AcquisitionTask {
+/// Foundation-2 单路径测试构造：`mesa.resources.v1` selections 数组形态。
+pub fn poll_task(id: &str, interval_ms: u64, selections: serde_json::Value) -> AcquisitionTask {
     AcquisitionTask {
         id: id.into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(interval_ms),
+        schedule: TaskSchedule::Poll { interval_ms },
         binding: DriverBinding {
-            kind: mesa_driver_simulator::BINDING_KIND.into(),
-            config: points,
+            kind: GENERIC_BINDING_KIND.into(),
+            config: serde_json::json!({"selections": selections}),
         },
     }
 }

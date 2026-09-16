@@ -1,16 +1,15 @@
 //! Control Plane 契约（§22）：可靠队列永不 Latest-Wins、默认 disabled、S7/OPC UA 能力分级。
 
-use mesa_core_types::{AcquisitionTask, DriverBinding, TaskMode, Value};
+use mesa_core_types::{AcquisitionTask, DriverBinding, GENERIC_BINDING_KIND, TaskSchedule, Value};
 use mesa_driver_sdk::Driver;
 
 fn poll_task_with_key(key: &str) -> AcquisitionTask {
     AcquisitionTask {
         id: "t".into(),
-        mode: TaskMode::Poll,
-        interval_ms: Some(100),
+        schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
-            kind: mesa_driver_simulator::BINDING_KIND.into(),
-            config: serde_json::json!({"points": [{"key": key, "kind": "counter"}]}),
+            kind: GENERIC_BINDING_KIND.into(),
+            config: serde_json::json!({"selections": [{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key": key}]}]}),
         },
     }
 }

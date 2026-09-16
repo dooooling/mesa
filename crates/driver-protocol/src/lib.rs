@@ -13,7 +13,7 @@ use bytes::{BufMut, BytesMut};
 use mesa_core_types::{
     AcquisitionTask, ConditionTransition, ConnectionState, DataBatch, DataType, DriverBinding,
     ErrorKind, EventCondition, EventRecord, EventTask, PointDescriptor, PointValue, Quality,
-    TaskMode, UnknownDataType, Value, ValueOrigin,
+    TaskMode, TaskSchedule, UnknownDataType, Value, ValueOrigin,
 };
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -21,10 +21,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// IPC 协议版本。Major 不兼容直接拒绝握手；Minor 取双方较小值。
 /// V1.2.1 新增 PointValue.value_origin（§5.5），Minor 1 保证新 Driver 的 typed BAD 语义可被新 Core 理解，旧端仍按 UNSPECIFIED 兼容解释
 pub const PROTOCOL_MAJOR: u32 = 1;
-/// Minor 4：PointDescriptorProto 新增可选 source_label（Point Presentation
-/// Metadata P1）。纯 additive：旧 Driver 不填→None 回落；新 Driver→旧 Core
-/// 未知字段忽略。Core 不得因 minor 不同拒绝运行（无 hard gate）。
-pub const PROTOCOL_MINOR: u32 = 4;
+/// Minor 5（Foundation-2）：AcquisitionTask 调度单真值（`schedule`），
+/// wire 完整 roundtrip（Poll: interval_ms；Subscribe: publishing/sampling/
+/// queue/discard 四字段，见 `task_to_pb`/`task_from_pb`）。
+/// 纯 additive（新增 proto 字段，老端未知字段忽略），
+/// Core 不得因 minor 不同拒绝运行（无 hard gate；Subscribe 非默认参数
+/// 遇旧端见 `TASK_SCHEDULE_MIN_MINOR` 门控）。
+pub const PROTOCOL_MINOR: u32 = 5;
 
 /// Dynamic Probe RPC 可用的最低协商 Minor（§8）。协商 Minor < 2 的旧 Driver
 /// 不识别 ProbeRequest（会静默忽略），Core 必须直接返回 Unsupported，
@@ -35,6 +38,11 @@ pub const PROBE_RPC_MIN_MINOR: u32 = 2;
 /// EventTask 存在但 negotiated_minor < 3 时，Core 必须回 EVENT_PLANE_UNSUPPORTED，
 /// 不得发未知消息干等 timeout。
 pub const EVENT_PLANE_MIN_MINOR: u32 = 3;
+
+/// TaskSchedule wire 支持的最低协商 Minor（Foundation-2，IPC 1.5）。
+/// negotiated_minor < 5 的旧端不识别 Subscribe 四字段：Core 侧
+/// `tasks_to_pb` 失败即整批拒绝（fail-closed，不静默降级为缺省调度）。
+pub const TASK_SCHEDULE_MIN_MINOR: u32 = 5;
 
 /// 单帧上限。防止恶意/异常长度前缀导致无界分配（有界原则在 IPC 层的体现）。
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -465,10 +473,33 @@ fn check_event_batch_size(b: &pb::EventBatchMsg) -> Result<(), ConvertError> {
 }
 
 pub fn task_to_pb(t: &AcquisitionTask) -> Result<pb::AcquisitionTaskProto, ConvertError> {
+    // Foundation-2 wire 形态（IPC 1.5）：Poll 传 interval_ms；
+    // Subscribe 传四参数完整 roundtrip（缺一不可，不做缺省回填——
+    // 缺字段的 wire 即违约，由 task_from_pb 拒绝）。
+    let (interval_ms, publishing_interval_ms, sampling_interval_ms, queue_size, discard_oldest) =
+        match t.schedule {
+            TaskSchedule::Poll { interval_ms } => (Some(interval_ms), None, None, None, None),
+            TaskSchedule::Subscribe {
+                publishing_interval_ms,
+                sampling_interval_ms,
+                queue_size,
+                discard_oldest,
+            } => (
+                None,
+                Some(publishing_interval_ms),
+                Some(sampling_interval_ms),
+                Some(queue_size),
+                Some(discard_oldest),
+            ),
+        };
     Ok(pb::AcquisitionTaskProto {
         id: t.id.clone(),
-        mode: t.mode.as_str().to_string(),
-        interval_ms: t.interval_ms,
+        mode: t.mode().as_str().to_string(),
+        interval_ms,
+        publishing_interval_ms,
+        sampling_interval_ms,
+        queue_size,
+        discard_oldest,
         binding_kind: t.binding.kind.clone(),
         binding_config_json: serde_json::to_string(&t.binding.config)?,
     })
@@ -480,10 +511,52 @@ pub fn task_from_pb(t: pb::AcquisitionTaskProto) -> Result<AcquisitionTask, Conv
         "subscribe" => TaskMode::Subscribe,
         other => return Err(ConvertError::InvalidMode(other.to_string())),
     };
+    let schedule = match mode {
+        TaskMode::Poll => {
+            let interval_ms = t.interval_ms.unwrap_or(0);
+            if interval_ms == 0 {
+                return Err(ConvertError::InvalidMode(
+                    "poll task 缺少正整数 interval_ms".into(),
+                ));
+            }
+            TaskSchedule::Poll { interval_ms }
+        }
+        TaskMode::Subscribe => {
+            // 四参数缺一即违约（零值同样拒绝：validate 与 Driver 双重确认，
+            // 此处先拦 wire 形态，避免 0 悄悄进调度）。
+            let (
+                Some(publishing_interval_ms),
+                Some(sampling_interval_ms),
+                Some(queue_size),
+                Some(discard_oldest),
+            ) = (
+                t.publishing_interval_ms,
+                t.sampling_interval_ms,
+                t.queue_size,
+                t.discard_oldest,
+            )
+            else {
+                return Err(ConvertError::InvalidMode(
+                    "subscribe task 缺少完整调度参数 (publishing/sampling/queue/discard_oldest)"
+                        .into(),
+                ));
+            };
+            if publishing_interval_ms == 0 || sampling_interval_ms == 0 || queue_size == 0 {
+                return Err(ConvertError::InvalidMode(
+                    "subscribe task 调度参数需 >0".into(),
+                ));
+            }
+            TaskSchedule::Subscribe {
+                publishing_interval_ms,
+                sampling_interval_ms,
+                queue_size,
+                discard_oldest,
+            }
+        }
+    };
     Ok(AcquisitionTask {
         id: t.id,
-        mode,
-        interval_ms: t.interval_ms,
+        schedule,
         binding: DriverBinding {
             kind: t.binding_kind,
             config: serde_json::from_str(&t.binding_config_json)?,
@@ -922,8 +995,7 @@ mod tests {
     fn task_conversion_preserves_binding_json() {
         let t = AcquisitionTask {
             id: "fast".into(),
-            mode: TaskMode::Poll,
-            interval_ms: Some(100),
+            schedule: TaskSchedule::Poll { interval_ms: 100 },
             binding: DriverBinding {
                 kind: "sim.points".into(),
                 config: serde_json::json!({ "points": [ { "key": "a", "kind": "counter" } ] }),
@@ -931,6 +1003,48 @@ mod tests {
         };
         let back = task_from_pb(task_to_pb(&t).unwrap()).unwrap();
         assert_eq!(back, t);
+    }
+
+    /// Foundation-2 P0 门：Subscribe 四参数完整 roundtrip（非默认参数
+    /// 不得在 IPC 中丢失为缺省值）。
+    #[test]
+    fn subscribe_schedule_roundtrips_exact_parameters() {
+        let t = AcquisitionTask {
+            id: "sub".into(),
+            schedule: TaskSchedule::Subscribe {
+                publishing_interval_ms: 1234,
+                sampling_interval_ms: 321,
+                queue_size: 77,
+                discard_oldest: false,
+            },
+            binding: DriverBinding {
+                kind: "mesa.resources.v1".into(),
+                config: serde_json::json!({"selections": []}),
+            },
+        };
+        let wire = task_to_pb(&t).unwrap();
+        assert_eq!(wire.publishing_interval_ms, Some(1234));
+        assert_eq!(wire.sampling_interval_ms, Some(321));
+        assert_eq!(wire.queue_size, Some(77));
+        assert_eq!(wire.discard_oldest, Some(false));
+        let back = task_from_pb(wire).unwrap();
+        assert_eq!(back, t);
+    }
+
+    /// 缺字段的 Subscribe wire 即违约（不得静默归一缺省调度）。
+    #[test]
+    fn subscribe_schedule_missing_fields_rejected() {
+        let mut wire = task_to_pb(&AcquisitionTask {
+            id: "sub".into(),
+            schedule: TaskSchedule::default_subscribe(),
+            binding: DriverBinding {
+                kind: "k".into(),
+                config: serde_json::json!({}),
+            },
+        })
+        .unwrap();
+        wire.queue_size = None;
+        assert!(task_from_pb(wire).is_err());
     }
 
     #[test]
