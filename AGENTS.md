@@ -5,7 +5,7 @@
 ## 仓库现状（先读这个）
 
 - 设计文档：`docs/Mesa_驱动自描述动态UI采集控制完整开发实施方案.md`（V2.1，36ch）是唯一事实来源，写任何代码前必须先读；`Mesa_Driver_MVP_实施方案.md`（V1.4）为历史 MVP 基线，仅作兼容参考
-- **V2.1 已落地**：`Mesa_Driver_MVP_实施方案.md V1.4` 基线上的动态 UI / Secret / Browse / Control / 原子事务 / 50K 验收等扩展；`feat/v2.1-impl` 为当前开发分支
+- **V2.1 已落地**：`Mesa_Driver_MVP_实施方案.md V1.4` 基线上的动态 UI / Secret / Browse / Control / 原子事务 / 50K 验收等扩展；`feat/v2.1-impl` 为当前开发分支（注：feat/v2.1-impl 已合并归档，当前以 main 为准）
 - `rust-toolchain.toml channel="1.95.0"` / `Node 22.18 pnpm 10.28` / `apps/mesa-web`（AntD 最小管理端）
 
 ## 常用命令（已验证，rust 1.95.0）
@@ -24,15 +24,15 @@ cargo test --workspace                                              # 全部测�
 - `http://127.0.0.1:8132/api/v1/endpoints` — 端点状态
 - `http://127.0.0.1:8132/api/v1/points/latest` — 最新值
 
-Contract Test 基线（§21 全部 20 项 + V2.1 扩展）共 14 suites 位于 `tests/driver-contract/tests/`：
+Contract Test 基线（§21 全部 20 项 + V2.1 扩展）共 27 suites（名单见 scripts/contract_suites.py；DeviceProfile 整链已删，无 profile_contract） 位于 `tests/driver-contract/tests/`：
 `smoke` / `protocol_negotiation` / `session_lifecycle` / `data_plane` / `fault_tolerance` /
 `subprocess_recovery` / `discovery_contract` / `descriptor_contract` / `data_semantics` /
-`control_contract` / `management_api` / `profile_contract` / `resource_contract` / `subprocess_orphan_guard`，
+`control_contract` / `management_api` / `resource_contract` / `subprocess_orphan_guard` / 事件面 12 suites / `mesad_restart` / `stop_lifecycle`（完整名单见 scripts/contract_suites.py），
 唯一可信 Evidence 为 `python scripts/write-contract-evidence.py`（内部依次 `cargo build --locked --workspace` → `cargo test --locked -p mesa-contract-tests --all-features`）产出的 `target/validation/contract.json`。任何新 Driver 必须全过该基线。
 
 ## 项目是什么
 
-Mesa：工业设备统一采集平台。Rust + Tokio + Protobuf IPC + SQLite。独立进程 Driver：S7（Siemens PLC）、FOCAS2（FANUC CNC）、OPC UA、Simulator（V2.1 四类）。
+Mesa：工业设备统一采集平台。Rust + Tokio + Protobuf IPC + SQLite。独立进程 Driver：S7（Siemens PLC）、FOCAS2（FANUC CNC）、OPC UA、Simulator，另有 SINUMERIK NCK（experimental，真机待确认，见 drivers/sinumerik-nck/GATE.md）。
 
 计划目录结构见文档 §23（10 个 crate 的 cargo workspace + `drivers/` + `apps/mesad`）。
 

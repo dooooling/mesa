@@ -187,6 +187,29 @@ impl AppState {
 // 通用响应辅助
 // ---------------------------------------------------------------------------
 
+/// 控制面鉴权 V1（最小实现）：REST 默认仅绑定 loopback，调用方恒为本机。
+/// 当前策略：actor 显式记录进审计，scope=control:execute 默认放行本机调用。
+/// V2 在此接入 PolicyProvider（非 loopback / 多租户 actor 时拒绝）。
+fn authorize_control(actor: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    // V1 loopback 默认放行，actor=local-api；空 actor 视为未知调用方，拒绝。
+    if actor.trim().is_empty() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json_error(
+                "FORBIDDEN",
+                "control:execute denied: empty actor",
+            )),
+        ));
+    }
+    Ok(())
+}
+
+/// 审计更新失败只告警不阻断（控制已执行、结果已产生；STARTED 记录仍在，
+/// 查询侧可识别为“未完成”，不得静默吞掉）。
+fn warn_audit_update(what: &str, request_id: &str, e: mesa_config_store::StoreError) {
+    tracing::warn!(request_id = %request_id, error = %e, "{what} 审计更新失败（控制结果不受影响）");
+}
+
 fn json_error(code: &str, message: &str) -> serde_json::Value {
     serde_json::json!({ "error": { "code": code, "message": message } })
 }
@@ -877,8 +900,12 @@ async fn control_write(
     } else {
         None
     };
-    // TODO: PolicyProvider scope=control:execute 鉴权（V1 loopback 默认放行，actor=local-api）
-    // 审计 STARTED（同步插入，失败不阻断控制）
+    // 控制面鉴权（V1 最小实现：本机 actor 放行并记录；见 authorize_control）。
+    if let Err(e) = authorize_control("local-api") {
+        return e;
+    }
+    // 审计 STARTED（同步插入；插入失败则拒绝控制——记不下来就不执行，
+    // 绝不产生“执行了但无审计”的控制）。
     let request_id = format!("api-wr-{}-{}", id, mesa_core_types::now_unix_ns());
     let audit_started = mesa_config_store::ControlAuditRecord {
         request_id: request_id.clone(),
@@ -893,7 +920,16 @@ async fn control_write(
         started_at_ns: mesa_core_types::now_unix_ns(),
         finished_at_ns: None,
     };
-    let _ = state.store.insert_control_audit(&audit_started);
+    if let Err(e) = state.store.insert_control_audit(&audit_started) {
+        tracing::error!(request_id = %request_id, error = %e, "控制审计 STARTED 写入失败，拒绝执行控制");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error(
+                "AUDIT_UNAVAILABLE",
+                "control audit store unavailable, control refused",
+            )),
+        );
+    }
     match state
         .manager
         .control_write(&id, target, value, expected, &request_id)
@@ -903,12 +939,14 @@ async fn control_write(
             let detail =
                 serde_json::json!({"readback": readback.as_ref().map(|v| format!("{v:?}"))})
                     .to_string();
-            let _ = state.store.update_control_audit(
+            if let Err(e) = state.store.update_control_audit(
                 &request_id,
                 "COMPLETED",
                 Some(&detail),
                 mesa_core_types::now_unix_ns(),
-            );
+            ) {
+                warn_audit_update("control_audit COMPLETED", &request_id, e);
+            }
             let rb_json =
                 readback.map(|v| serde_json::to_value(&v).unwrap_or(serde_json::Value::Null));
             (
@@ -919,12 +957,14 @@ async fn control_write(
             )
         }
         Err(e) => {
-            let _ = state.store.update_control_audit(
+            if let Err(e) = state.store.update_control_audit(
                 &request_id,
                 "FAILED",
                 Some(&e.message),
                 mesa_core_types::now_unix_ns(),
-            );
+            ) {
+                warn_audit_update("control_audit FAILED", &request_id, e);
+            }
             let status = if e.code == "ENDPOINT_NOT_RUNNING" {
                 StatusCode::CONFLICT
             } else {
@@ -995,6 +1035,10 @@ async fn control_command(
     } else {
         "{}".into()
     };
+    // 控制面鉴权（V1 最小实现，与 control_write 同策略）。
+    if let Err(e) = authorize_control("local-api") {
+        return e;
+    }
     let request_id = format!("api-cmd-{}-{}", id, mesa_core_types::now_unix_ns());
     let audit_started = mesa_config_store::ControlAuditRecord {
         request_id: request_id.clone(),
@@ -1008,7 +1052,16 @@ async fn control_command(
         started_at_ns: mesa_core_types::now_unix_ns(),
         finished_at_ns: None,
     };
-    let _ = state.store.insert_control_audit(&audit_started);
+    if let Err(e) = state.store.insert_control_audit(&audit_started) {
+        tracing::error!(request_id = %request_id, error = %e, "控制审计 STARTED 写入失败，拒绝执行控制");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error(
+                "AUDIT_UNAVAILABLE",
+                "control audit store unavailable, control refused",
+            )),
+        );
+    }
     match state
         .manager
         .control_command(&id, &command_id, &input_json, &request_id)
@@ -1021,12 +1074,14 @@ async fn control_command(
                 "FAILED"
             };
             let detail = format!("{status}:{result_json}:{error}");
-            let _ = state.store.update_control_audit(
+            if let Err(e) = state.store.update_control_audit(
                 &request_id,
                 audit_status,
                 Some(&detail),
                 mesa_core_types::now_unix_ns(),
-            );
+            ) {
+                warn_audit_update("control_audit result", &request_id, e);
+            }
             let result_val: serde_json::Value = serde_json::from_str(&result_json)
                 .unwrap_or(serde_json::Value::String(result_json.clone()));
             (
@@ -1037,12 +1092,14 @@ async fn control_command(
             )
         }
         Err(e) => {
-            let _ = state.store.update_control_audit(
+            if let Err(e) = state.store.update_control_audit(
                 &request_id,
                 "FAILED",
                 Some(&e.message),
                 mesa_core_types::now_unix_ns(),
-            );
+            ) {
+                warn_audit_update("control_audit FAILED", &request_id, e);
+            }
             let status = if e.code == "ENDPOINT_NOT_RUNNING" {
                 StatusCode::CONFLICT
             } else {
@@ -1274,6 +1331,21 @@ where
     D: serde::Deserializer<'de>,
 {
     Option::<String>::deserialize(d).map(Some)
+}
+
+#[cfg(test)]
+mod control_auth_tests {
+    use super::*;
+
+    /// 控制面鉴权 V1：本机 actor 放行，空 actor 拒绝（fail-closed）。
+    #[test]
+    fn local_actor_allowed_empty_denied() {
+        assert!(authorize_control("local-api").is_ok());
+        let err = authorize_control("").unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let err2 = authorize_control("   ").unwrap_err();
+        assert_eq!(err2.0, StatusCode::FORBIDDEN);
+    }
 }
 
 #[cfg(test)]

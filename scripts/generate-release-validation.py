@@ -9,6 +9,8 @@
 """
 import argparse, json, platform, subprocess, sys, pathlib, datetime
 
+from contract_suites import SUITE_SET
+
 def sh(cmd):
     try:
         return subprocess.check_output(cmd, shell=True, text=True).strip()
@@ -135,11 +137,12 @@ def main():
             suites = ct.get("suites", [])
             if not isinstance(suites, list) or not suites or not all(isinstance(s, str) for s in suites):
                 print(f"strict: contract_tests.suites 需为 string[] 当前 {suites}", file=sys.stderr); sys.exit(1)
-            required_suites = {"smoke","protocol_negotiation","session_lifecycle","data_plane","fault_tolerance","subprocess_recovery","discovery_contract","descriptor_contract","data_semantics","control_contract","management_api","profile_contract","resource_contract","subprocess_orphan_guard"}
+            # 套件名单唯一来源 scripts/contract_suites.py（与证据生成器同源，不再各自硬编码）。
+            required_suites = SUITE_SET
             if set(suites) != required_suites:
-                print(f"strict: contract_tests.suites 需为完整 14 suites {sorted(required_suites)} 当前 {sorted(suites)}", file=sys.stderr); sys.exit(1)
-            if ct.get("total") != len(suites) or ct.get("total") != 14 or ct.get("passed") != 14:
-                print(f"strict: contract_tests total/passed 需 ==14 当前 {ct}", file=sys.stderr); sys.exit(1)
+                print(f"strict: contract_tests.suites 需为完整 {len(required_suites)} suites {sorted(required_suites)} 当前 {sorted(suites)}", file=sys.stderr); sys.exit(1)
+            if ct.get("total") != len(suites) or ct.get("total") != len(required_suites) or ct.get("passed") != len(required_suites):
+                print(f"strict: contract_tests total/passed 需 =={len(required_suites)} 当前 {ct}", file=sys.stderr); sys.exit(1)
             # --- Evidence 与 commit 绑定（40位全量，兼容短 7 位）---
             def check_sha(name, obj):
                 if not isinstance(obj, dict):

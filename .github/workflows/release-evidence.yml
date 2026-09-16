@@ -1,7 +1,7 @@
 # Release Evidence（独立于 PR CI，手动触发）：
 # PR CI 只回答"能不能合并"；本 workflow 回答"这个 exact SHA 有什么发布证据"。
 # 唯一权威入口 scripts/write-contract-evidence.py：删旧 json → 全量 build →
-# 固定 14 suites 全过才写 contract.json。performance.json / soak.json /
+# 全 suites（contract_suites.py 名单）逐项全过才写 contract.json。performance.json / soak.json /
 # real-device.json 以后按需追加到此文件，不进 PR critical path。
 name: release-evidence
 on:
