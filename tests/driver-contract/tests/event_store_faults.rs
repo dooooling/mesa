@@ -176,7 +176,7 @@ async fn faulted_endpoint_fails_observably_while_data_only_survives() {
         endpoint_id: "hd-fault-b".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
-        tasks: vec![common::poll_task_legacy_points(
+        tasks: vec![common::poll_task(
             "d",
             50,
             serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),

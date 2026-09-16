@@ -68,11 +68,7 @@ impl Rig {
         ));
         let mut tasks = vec![];
         if with_data {
-            tasks.push(common::poll_task_legacy_points(
-                "d",
-                10,
-                data_task_20points(),
-            ));
+            tasks.push(common::poll_task("d", 10, data_task_20points()));
         }
         mgr.start_endpoint(BuiltinEndpoint {
             endpoint_id: endpoint_id.into(),

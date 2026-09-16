@@ -57,7 +57,7 @@ fn sim_event_task(
 
 /// 最小数据任务（Simulator run() 的前置要求，与事件断言无关）。
 fn mini_data_task() -> AcquisitionTask {
-    poll_task_legacy_points(
+    poll_task(
         "t1",
         50,
         serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),

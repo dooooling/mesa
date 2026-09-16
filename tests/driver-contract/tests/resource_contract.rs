@@ -169,7 +169,16 @@ async fn opcua_generic_node_ok() {
 #[tokio::test]
 async fn legacy_kinds_rejected_for_all_drivers() {
     // Foundation-2：legacy kind 已删除，非 generic 即 UNSUPPORTED_BINDING。
-    // Simulator
+    // 被删 kind 字符串集中在此测试（生产 Driver 不再 export 相关常量）。
+    const LEGACY_KINDS: &[&str] = &[
+        "simulator.points",
+        "s7.address-group",
+        "focas.data-block",
+        "opcua.node-group",
+        "opcua.subscription",
+        "opcua.browse",
+        "simulator.events",
+    ];
     let mut sim = mesa_driver_simulator::SimulatorDriver
         .open_connection("ep1", "{}")
         .await
@@ -178,7 +187,7 @@ async fn legacy_kinds_rejected_for_all_drivers() {
         id: "t1".into(),
         schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
-            kind: mesa_driver_simulator::BINDING_KIND.into(),
+            kind: LEGACY_KINDS[0].into(),
             config: json!({"points":[{"key":"a","kind":"counter"}]}),
         },
     };
@@ -196,7 +205,7 @@ async fn legacy_kinds_rejected_for_all_drivers() {
         id: "t1".into(),
         schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
-            kind: mesa_driver_s7::BINDING_KIND.into(),
+            kind: LEGACY_KINDS[1].into(),
             config: json!({"items":[{"key":"a","address":"DB10.DBD0","data_type":"REAL"}]}),
         },
     };
@@ -214,7 +223,7 @@ async fn legacy_kinds_rejected_for_all_drivers() {
         id: "t1".into(),
         schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
-            kind: mesa_driver_focas2::BINDING_KIND.into(),
+            kind: LEGACY_KINDS[2].into(),
             config: json!({"items":[{"key":"a","address":"status","data_type":"U32"}]}),
         },
     };
@@ -227,12 +236,12 @@ async fn legacy_kinds_rejected_for_all_drivers() {
         "UNSUPPORTED_BINDING"
     );
 
-    // OPC UA legacy kinds（常量已删除，直接用字符串）
+    // OPC UA legacy kinds
     let mut opcua = mesa_driver_opcua::OpcUaDriver
         .open_connection("ep1", "{}")
         .await
         .unwrap();
-    for kind in ["opcua.node-group", "opcua.subscription", "opcua.browse"] {
+    for kind in [LEGACY_KINDS[3], LEGACY_KINDS[4], LEGACY_KINDS[5]] {
         let legacy_opcua = AcquisitionTask {
             id: "t1".into(),
             schedule: TaskSchedule::Poll { interval_ms: 100 },

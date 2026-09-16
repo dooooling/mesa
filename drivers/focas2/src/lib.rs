@@ -32,10 +32,6 @@ use mesa_core_types::{
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio_util::sync::CancellationToken;
 
-/// Foundation-2 已删除的 legacy kind（保留常量名仅供错误信息引用，
-/// 不再是合法 binding；见 ADR 0003）。
-pub const BINDING_KIND: &str = "focas.data-block";
-
 /// PMC canonical kind 公共契约（PR3）：generic 只接受这 10 种。
 /// descriptor 与门禁同源。
 pub const PMC_KINDS: [char; 10] = ['G', 'R', 'X', 'Y', 'F', 'A', 'D', 'C', 'K', 'T'];

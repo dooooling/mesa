@@ -125,8 +125,7 @@ pub async fn start_sim_server_with_faults(faults: SdkFaults) -> (u16, Cancellati
     panic!("bind retry exhausted: {:?}", last_err);
 }
 
-/// Foundation-2 单路径测试构造：`mesa.resources.v1` selections 数组形态
-/// 直接透传（调用侧已迁移为 selections 的文件用 `poll_task`）。
+/// Foundation-2 单路径测试构造：`mesa.resources.v1` selections 数组形态。
 pub fn poll_task(id: &str, interval_ms: u64, selections: serde_json::Value) -> AcquisitionTask {
     AcquisitionTask {
         id: id.into(),
@@ -136,65 +135,6 @@ pub fn poll_task(id: &str, interval_ms: u64, selections: serde_json::Value) -> A
             config: serde_json::json!({"selections": selections}),
         },
     }
-}
-
-/// 迁移期兼容：调用侧仍传 legacy `{"points": [...]}` 信封或已迁移的
-/// selections 数组，两者都接受（数组元素含 `key/kind` 即按 legacy 转，
-/// 含 `resource_id` 即直接透传）。Foundation-2 收尾时调用侧统一为
-/// selections，本函数改回纯透传（见 TODO）。
-/// TODO(F2-cleanup)：调用侧 selections 统一后删除 legacy 分支，只留透传。
-pub fn poll_task_legacy_points(
-    id: &str,
-    interval_ms: u64,
-    points: serde_json::Value,
-) -> AcquisitionTask {
-    // 已是 selections 形态（首元素含 resource_id）即直接透传
-    let is_selections = points
-        .as_array()
-        .map(|a| {
-            a.first()
-                .and_then(|e| e.as_object())
-                .map(|o| o.contains_key("resource_id"))
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
-    let sels = if is_selections {
-        points
-    } else {
-        legacy_points_to_selections(&points)
-    };
-    poll_task(id, interval_ms, sels)
-}
-
-/// legacy `simulator.points` 信封 → 通用 selections 的测试迁移辅助：
-/// `{"points": [...]}` 或 `[...]` 转为 counter/sine/toggle/random/constant
-/// resource selections（parameters 透传除 key/kind 外字段；空对象/空数组
-/// 转为空 selections，由 Driver 报 INVALID_BINDING_CONFIG）。
-pub fn legacy_points_to_selections(points: &serde_json::Value) -> serde_json::Value {
-    let arr: Vec<serde_json::Value> = if let Some(a) = points.as_array() {
-        a.clone()
-    } else if let Some(a) = points.get("points").and_then(|v| v.as_array()) {
-        a.clone()
-    } else {
-        Vec::new()
-    };
-    let sels: Vec<serde_json::Value> = arr
-        .iter()
-        .filter_map(|p| {
-            let obj = p.as_object()?;
-            let key = obj.get("key").and_then(|k| k.as_str())?;
-            let kind = obj.get("kind").and_then(|k| k.as_str())?;
-            let mut params = obj.clone();
-            params.remove("key");
-            params.remove("kind");
-            Some(serde_json::json!({
-                "resource_id": kind,
-                "parameters": params,
-                "outputs": [{"output": "value", "point_key": key}],
-            }))
-        })
-        .collect();
-    serde_json::Value::Array(sels)
 }
 
 // ---------------------------------------------------------------------------

@@ -726,6 +726,21 @@ async fn run_config_flow(
 
     // ConfigureTasks：revision 来自持久源
     let revision = source.revision(&cfg.endpoint_id);
+    // Foundation-2 wire 门控（IPC 1.5）：Subscribe 任务要求协商 Minor >=
+    // TASK_SCHEDULE_MIN_MINOR；旧端不识别四字段，静默降级即改变用户语义，
+    // 故 fail-closed（ConfigurationFailed，不重试）。
+    if cfg
+        .tasks
+        .iter()
+        .any(|t| t.mode() == mesa_core_types::TaskMode::Subscribe)
+        && session.negotiated_minor() < mesa_driver_protocol::TASK_SCHEDULE_MIN_MINOR
+    {
+        return Err(AttemptOutcome::ConfigurationFailed(format!(
+            "TASK_SCHEDULE_UNSUPPORTED: negotiated minor {} < {} (Subscribe schedule 需要 IPC 1.5)",
+            session.negotiated_minor(),
+            mesa_driver_protocol::TASK_SCHEDULE_MIN_MINOR,
+        )));
+    }
     let tasks_pb = tasks_to_pb_checked(cfg)?;
     let reply = session
         .call(Body::ConfigureTasks(pb::ConfigureTasks {

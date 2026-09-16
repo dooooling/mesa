@@ -77,7 +77,7 @@ async fn stop_while_reconnecting_is_bounded_and_explicit() {
         driver_id: "simulator".into(),
         // 第 2 个 data 批后进程退出（50ms poll → 约 100ms 后死亡）。
         connection_json: r#"{"crash_after_batches":2}"#.into(),
-        tasks: vec![common::poll_task_legacy_points(
+        tasks: vec![common::poll_task(
             "d",
             50,
             serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),

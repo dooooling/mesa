@@ -40,12 +40,6 @@ use mesa_core_types::{
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, EventSink, SdkDriverError};
 use tokio_util::sync::CancellationToken;
-
-/// Foundation-2 已删除的 legacy kind（保留常量名仅供错误信息与测试断言引用，
-/// 不再是合法 binding；见 ADR 0003）。
-pub const BINDING_KIND: &str = "simulator.points";
-/// Foundation-2 已删除的 legacy 事件 kind（同上）。
-pub const EVENT_BINDING_KIND: &str = "simulator.events";
 /// 计数器事件流：周期性瞬时事件（`counter.tick`），无 condition。
 pub const SIM_EVENT_STREAM_COUNTER: &str = "sim.events.counter";
 /// 报警周期流：每次 run 走一遍 Raised → Updated → Acknowledged → Cleared，
@@ -1580,7 +1574,7 @@ mod tests {
         assert_eq!(conn.event_plan.as_ref().unwrap().tasks.len(), 2);
     }
 
-    /// Foundation-2：legacy `simulator.events` 已删除，未知 legacy 信封即拒绝。
+    /// Foundation-2：已删除的 legacy kind 即拒绝（字符串内联，生产侧无常量）。
     #[tokio::test]
     async fn simulator_legacy_binding_rejected() {
         let mut conn = SimConnection::default();
@@ -1592,7 +1586,7 @@ mod tests {
                     mode: TaskMode::Subscribe,
                     interval_ms: None,
                     binding: DriverBinding {
-                        kind: EVENT_BINDING_KIND.into(),
+                        kind: "simulator.events".into(),
                         config: serde_json::json!({"stream": SIM_EVENT_STREAM_COUNTER}),
                     },
                 }],

@@ -30,10 +30,6 @@ use mesa_driver_sdk::{DataSink, Driver, DriverConnection, SdkDriverError};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-/// Foundation-2 已删除的 legacy kind（保留常量名仅供错误信息引用，
-/// 不再是合法 binding；见 ADR 0003）。
-pub const BINDING_KIND: &str = "s7.address-group";
-
 /// S7 canonical data_type 公共契约（PR3）：`mesa.resources.v1` 路径
 /// 只接受这 9 个精确大写拼写；parser 的大小写 alias / LREAL / WSTRING /
 /// TIME 等解析能力仅供地址解析内部使用，不等于产品契约。

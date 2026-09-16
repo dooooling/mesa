@@ -94,7 +94,7 @@ async fn production_path_alarm_cycle_persists_before_visible() {
         endpoint_id: "ct-evt-001".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
-        tasks: vec![poll_task_legacy_points(
+        tasks: vec![poll_task(
             "t1",
             50,
             serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
@@ -196,7 +196,7 @@ async fn event_ids_unique_across_driver_process_restart() {
         endpoint_id: "ct-evt-restart".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
-        tasks: vec![poll_task_legacy_points(
+        tasks: vec![poll_task(
             "t1",
             50,
             serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
@@ -485,7 +485,7 @@ async fn event_task_rest_crud_and_running_conflict() {
         endpoint_id: "ct-task-001".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
-        tasks: vec![poll_task_legacy_points(
+        tasks: vec![poll_task(
             "t1",
             50,
             serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
@@ -525,7 +525,7 @@ async fn graceful_shutdown_publishes_every_commit() {
         endpoint_id: "ct-evt-grace".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
-        tasks: vec![poll_task_legacy_points(
+        tasks: vec![poll_task(
             "t1",
             50,
             serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
@@ -606,7 +606,7 @@ async fn stop_barrier_drains_inflight_epoch_events() {
         endpoint_id: "ct-evt-stopgate".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
-        tasks: vec![poll_task_legacy_points(
+        tasks: vec![poll_task(
             "t1",
             50,
             serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
@@ -692,7 +692,7 @@ async fn data_only_path_unaffected() {
         endpoint_id: "ct-data-001".into(),
         driver_id: "simulator".into(),
         connection_json: "{}".into(),
-        tasks: vec![poll_task_legacy_points(
+        tasks: vec![poll_task(
             "t1",
             50,
             serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
