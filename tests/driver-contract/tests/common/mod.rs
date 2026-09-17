@@ -137,6 +137,45 @@ pub fn poll_task(id: &str, interval_ms: u64, selections: serde_json::Value) -> A
     }
 }
 
+/// Foundation-3 #3 wire fail-closed 回归辅助：直发 structured WriteRequest。
+/// 返回 WriteResponse 的 result（ok 即 None，失败即 (code, message)）。
+/// 调用方先 open_connection(H, "{}")；不需要 configure（write 不依赖采集计划）。
+pub async fn write_raw(
+    session: &Session,
+    resource_id: &str,
+    parameters_json: &str,
+    output: &str,
+    value: Option<pb::ValueMsg>,
+    expected_value: Option<pb::ValueMsg>,
+) -> Result<(), (String, String)> {
+    let reply = session
+        .call(pb::envelope::Body::WriteRequest(pb::WriteRequest {
+            connection_handle: 1,
+            request_id: "wire-fail-closed".into(),
+            #[allow(deprecated)]
+            target: String::new(),
+            value,
+            expected_value,
+            resource_id: resource_id.into(),
+            parameters_json: parameters_json.into(),
+            output: output.into(),
+        }))
+        .await
+        .expect("write RPC 必须有响应");
+    match reply.body {
+        Some(pb::envelope::Body::WriteResponse(r)) => {
+            let result = r.result.expect("result present");
+            if result.ok {
+                Ok(())
+            } else {
+                let d = result.error.unwrap_or_default();
+                Err((d.code, d.message))
+            }
+        }
+        other => panic!("unexpected reply {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 协议化请求辅助：让测试以"Core 的方式"驱动完整配置闭环
 // ---------------------------------------------------------------------------

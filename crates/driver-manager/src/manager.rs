@@ -460,9 +460,11 @@ impl MesaManager {
     /// Control 队列转发结构化 WriteTarget，永不 Latest-Wins。
     /// 协商 minor < 6 的旧端直接 CONTROL_MODEL_UNSUPPORTED（不 fallback
     /// 旧字符串 target；wire 兼容 ≠ 产品双轨）。
-    /// 并发：只短暂持有 registry 读锁克隆 Arc，随即释放；`sess.write`
-    /// 经 session 内 writer 锁 + pending 表串行——与 event_loop 持有的
-    /// session_arc 全局锁无关（终审 #2 根因：全局锁串行致 RUNNING 超时）。
+    /// 并发模型（诚实版）：不同 Control 请求经同一 session 的 writer 锁 +
+    /// pending 表串行执行（可靠队列语义要求有序，不并发发帧）；与 Data 面
+    /// event_loop 不互斥（event_loop 不持 session 锁，只消费事件通道）。
+    /// 即 Control↔Control 串行、Control↔Data 并发——串行是设计选择，
+    /// 不是 #2 遗留缺陷。
     pub async fn control_write(
         &self,
         endpoint_id: &str,
@@ -481,10 +483,8 @@ impl MesaManager {
                 format!("endpoint `{endpoint_id}` not running"),
             )
         })?;
-        // 只读 negotiated_minor（&self 方法，无锁）后释放；write 本体经
-        // session 内 writer 锁 + pending 表串行——与 run_config_flow/event_loop
-        // 持有的 session_arc 全局锁无关（#2 根因即全局锁串行致 RUNNING 超时，
-        // 已改为细粒度 session 内锁；此处不再长持 session_arc）。
+        // 只读 negotiated_minor（&self 方法）后经 session 内 writer 锁串行
+        // 发送（见本函数文档：Control↔Control 串行是可靠队列的设计选择）。
         let minor = sess_arc.lock().await.negotiated_minor();
         if minor < mesa_driver_protocol::CONTROL_MODEL_MIN_MINOR {
             return Err(DescriptorError::new(

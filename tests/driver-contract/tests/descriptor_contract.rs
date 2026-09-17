@@ -355,7 +355,8 @@ fn control_gate_write_and_command_doors() {
 #[test]
 fn simulator_reference_control_descriptor_declares_write_and_reset() {
     // Foundation-3 Reference：Simulator 声明 writable(ReadWrite) + reset 命令 +
-    // capabilities.write/method；其余生产 Driver 保持只读（见下）。
+    // fail_once 回归命令 + capabilities.write/method；
+    // 其余生产 Driver 保持只读（见下）。
     let d = mesa_driver_simulator::SimulatorDriver.descriptor();
     d.validate().expect("simulator descriptor must be valid");
     assert!(d.capabilities.write, "simulator 声明 write");
@@ -363,6 +364,30 @@ fn simulator_reference_control_descriptor_declares_write_and_reset() {
     let w = d.resources.iter().find(|r| r.id == "writable").unwrap();
     assert_eq!(w.outputs[0].access, mesa_core_types::AccessMode::ReadWrite);
     assert!(d.controls.commands.iter().any(|c| c.id == "reset"));
+    // 终审 #2 回归命令存在且 input_schema 要求 flag 必填 bool。
+    let fo = d
+        .controls
+        .commands
+        .iter()
+        .find(|c| c.id == "fail_once")
+        .unwrap();
+    let issues =
+        mesa_core_types::gate_command_against(&d, "fail_once", &serde_json::json!({}), "command");
+    assert!(
+        issues.iter().any(|i| i.code == "REQUIRED"),
+        "fail_once 缺 flag 必须 REQUIRED: {issues:?}"
+    );
+    assert!(
+        mesa_core_types::gate_command_against(
+            &d,
+            "fail_once",
+            &serde_json::json!({"flag": false}),
+            "command",
+        )
+        .is_empty(),
+        "fail_once flag=false 应过 Core 门禁（业务失败由 Driver 判）"
+    );
+    let _ = fo;
     // S7/FOCAS2/OPCUA/NCK 保持只读（生产 Write 另立任务，不在本 PR）
     for desc in [
         mesa_driver_s7::S7Driver.descriptor(),

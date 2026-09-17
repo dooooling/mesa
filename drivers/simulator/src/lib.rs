@@ -281,6 +281,29 @@ impl Driver for SimulatorDriver {
                         timeout_ms: None,
                         idempotent: true,
                     },
+                    // 终审 #2 回归命令：input_schema 接受 {flag: bool}，
+                    // Driver 对 flag=false 返回业务失败 Err（Failed 终态），
+                    // Core 对 Failed 不得做 result_schema 门禁（无 VIOLATION）。
+                    mesa_core_types::capability::CommandDescriptor {
+                        id: "fail_once".into(),
+                        label: LocalizedText::new("Fail Once"),
+                        description: Some(
+                            "回归用：flag=false 即业务失败（终审 #2 门禁回归）".into(),
+                        ),
+                        input_schema: SchemaDescriptor::new(vec![
+                            mesa_core_types::FieldDescriptor::new(
+                                "flag",
+                                "Flag",
+                                mesa_core_types::FieldType::Boolean,
+                            )
+                            .required(true),
+                        ]),
+                        result_schema: SchemaDescriptor::default(),
+                        risk: mesa_core_types::capability::RiskLevel::Low,
+                        confirmation: false,
+                        timeout_ms: None,
+                        idempotent: false,
+                    },
                 ],
             },
             resource_selection_methods: vec![ResourceSelectionMethod::Manual],
@@ -892,8 +915,10 @@ impl DriverConnection for SimConnection {
             tasks = new_tasks.len(),
             "plan built"
         );
-        // configure 全量替换：control_state 按新快照重建（slot → initial；
-        // 新快照即新真值；旧写入值随旧快照作废）。先算后存（new_points 不 move）。
+        // configure 全量替换：只重建被采集 slot 的初值（slot → initial），
+        // 绝不清空 control_state——未被采集的 control slot（"只写、不采集"）
+        // 独立于 acquisition plan 存活，configure 不得删除它们。
+        // 先算后存（new_points 不 move）。
         let initial: Vec<(String, Value)> = new_points
             .iter()
             .filter_map(|p| match &p.source {
@@ -910,7 +935,7 @@ impl DriverConnection for SimConnection {
         });
         {
             let mut st = self.control_state.write().unwrap();
-            st.clear();
+            // merge 语义：被采集 slot 回到新快照初值；其他 control slot 原样保留。
             for (slot, value) in initial {
                 st.insert(slot, value);
             }
@@ -1195,10 +1220,14 @@ impl DriverConnection for SimConnection {
     /// 仅 `writable` resource 的 `value` output 可写（access=ReadWrite）；
     /// 其余 resource 即使存在也拒绝（OUTPUT_NOT_WRITABLE）。
     /// 实例身份 = parameters.slot（canonical Resource 实例参数，采集与写入
-    /// 同口径；point_key 只是采集投影，不是 Write 身份——"写但不采集"允许）。
-    /// 写入值原子更新 control_state（采集读数即时可见）；expected 为 Some 即
-    /// CAS：读-比-写在同一 RwLock 写守卫内完成，即真 CAS（control-handle 模型
-    /// 下 run 读与 control 写并发，std RwLock 短临界区保证原子性）。
+    /// 同口径；point_key 只是采集投影，不是 Write 身份）。
+    /// Control 资源空间与 Acquisition 投影解耦：control_state 是独立建模空间，
+    /// 未被任何采集任务选中的 slot 也可写（"只写、不采集"）；configure() 只
+    /// 重建被采集 slot 的初值，从不删除其他 slot（见 configure 注释）。
+    /// 写入值原子更新 control_state（被采集 slot 的读数即时可见）；expected
+    /// 为 Some 即 CAS：读-比-写在同一 RwLock 写守卫内完成，即真 CAS
+    ///（control-handle 模型下 run 读与 control 写并发，std RwLock 短临界区
+    /// 保证原子性）。
     async fn write(
         &self,
         target: &mesa_core_types::WriteTarget,
@@ -1243,20 +1272,12 @@ impl DriverConnection for SimConnection {
                     "writable target.parameters.slot required（Resource 实例身份）",
                 )
             })?;
-        // CAS + 更新原子（control-handle 并发模型）：
-        // 读-比-写同一 RwLock 写守卫内完成，即真 CAS（无 read-compare-write 竞争）。
+        // Control/Acquisition 解耦：control_state 是独立建模空间，
+        // 未被任何采集任务选中的 slot 也可写（"只写、不采集"）。
+        // 因此未知 slot 不再是 TARGET_NOT_FOUND——首次写入即创建该 slot
+        //（初值语义：从未写入时读为 F64(0.0)，与 run 侧缺省一致）。
         let mut st = self.control_state.write().unwrap();
         let current = st.get(slot).cloned().unwrap_or(Value::F64(0.0));
-        // 未配置的 slot 即 TARGET_NOT_FOUND（"写但不采集"指未被采集任务选中，
-        // 不是指从未 configure——寻址空间即 control_state 建模空间，configure
-        // 时按快照 writable 点的 slot 初始化）。
-        if !st.contains_key(slot) {
-            return Err(SdkDriverError::new(
-                ErrorKind::Internal,
-                "TARGET_NOT_FOUND",
-                format!("target slot `{slot}` not configured"),
-            ));
-        }
         if let Some(exp) = expected
             && current != exp
         {
@@ -1272,8 +1293,9 @@ impl DriverConnection for SimConnection {
 
     /// Foundation-3 Reference command：仅执行 Descriptor 声明的 `reset`
     ///（Core 已做存在性 + input 门禁；此处只做语义执行）。
-    /// reset 把 control_state 恢复为 configure 快照初值（实时生效，
-    /// 无 runtime copy、无需通知——run 循环直读 state），幂等。
+    /// reset 只恢复被采集 slot 的初值（configure 快照初值，实时生效，
+    /// 无 runtime copy、无需通知——run 循环直读 state）；未被采集的 control
+    /// slot 不受影响（与 configure 的 merge 语义一致）。幂等。
     /// 返回 `{}`（与 result_schema 空对象一致；多余字段即违反自身契约）。
     async fn command(
         &self,
@@ -1291,7 +1313,8 @@ impl DriverConnection for SimConnection {
                         "reset 不接受输入参数",
                     ));
                 }
-                // 初值 = 当前 plan 快照各 writable 点的 initial
+                // 初值 = 当前 plan 快照各 writable 点的 initial；
+                // 只恢复被采集 slot，未被采集的 control slot 原样保留
                 //（读锁下查快照；control_state 写锁内恢复——两锁分离，先后获取不嵌套）。
                 let initials: Vec<(String, Value)> = {
                     let guard = self.plan.read().unwrap();
@@ -1311,11 +1334,30 @@ impl DriverConnection for SimConnection {
                         .unwrap_or_default()
                 };
                 let mut st = self.control_state.write().unwrap();
-                st.clear();
                 for (slot, value) in initials {
                     st.insert(slot, value);
                 }
                 Ok(serde_json::json!({}))
+            }
+            // 终审 #2 回归命令：input_schema 已由 Core 门禁（flag 必填 bool）；
+            // flag=false 即业务失败 Err（Failed 终态 + 精确码），flag=true 即
+            // 成功返回 {}（过 result_schema）。Core 对 Failed 不得门禁 schema。
+            "fail_once" => {
+                let input: serde_json::Value =
+                    serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                match input.get("flag").and_then(|v| v.as_bool()) {
+                    Some(true) => Ok(serde_json::json!({})),
+                    Some(false) => Err(SdkDriverError::new(
+                        ErrorKind::Internal,
+                        "COMMAND_BUSINESS_FAILED",
+                        "fail_once flag=false 业务失败（回归用）",
+                    )),
+                    _ => Err(SdkDriverError::new(
+                        ErrorKind::Internal,
+                        "INVALID_COMMAND_INPUT",
+                        "fail_once 需要布尔 flag",
+                    )),
+                }
             }
             _ => Err(SdkDriverError::new(
                 ErrorKind::Unsupported,

@@ -828,12 +828,11 @@ async fn import_endpoint(
 #[serde(deny_unknown_fields)]
 struct ControlWriteReq {
     // Foundation-3 单真值：结构化三元组（旧 string target 已删除，不留 shim）。
+    // value 唯一入口（JSON 标量经 json_to_value 映射，tag-object 经 Value
+    // 反序列化；第二入口 value_typed 已删除——终审 #4：双 value 真值歧义）。
     target: mesa_core_types::WriteTarget,
     value: serde_json::Value,
     expected_value: Option<serde_json::Value>,
-    // 允许直接传 typed Value 的 tag 形式（兼容 Value 枚举序列化）
-    #[serde(default)]
-    value_typed: Option<mesa_core_types::Value>,
 }
 
 fn json_to_value(v: &serde_json::Value) -> Result<mesa_core_types::Value, String> {
@@ -912,17 +911,13 @@ async fn control_write(
             )),
         );
     }
-    let value = if let Some(v) = body.value_typed {
-        v
-    } else {
-        match json_to_value(&body.value) {
-            Ok(v) => v,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json_error("VALIDATION_ERROR", &e)),
-                );
-            }
+    let value = match json_to_value(&body.value) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("VALIDATION_ERROR", &e)),
+            );
         }
     };
     let expected = if let Some(ev) = body.expected_value {
@@ -1169,11 +1164,31 @@ async fn control_command(
         .await
     {
         Ok((status, result_json, error)) => {
-            // Foundation-3 结果门禁：Driver 返回违反自己 result_schema 即
-            // DRIVER_CONTRACT_VIOLATION（审计记 FAILED，不把坏结果当成功；
-            // #5 要求 fail-closed：HTTP 502 + 精确码，不返回 200 包坏 result）。
+            // Foundation-3 结果门禁（终审 #2 修正）：只有 Succeeded 才检查
+            // result_schema——Failed/TimedOut/Rejected/Cancelled 是 proto 定义
+            // 的正常终态（此时 result_json="" 为空），走正常失败审计/响应，
+            // 绝不能冒充 DRIVER_CONTRACT_VIOLATION。
+            // HTTP 语义：Succeeded(+schema 通过)→200；业务失败→200+status；
+            // schema 违反→502 DRIVER_CONTRACT_VIOLATION（fail-closed）。
             let result_val: serde_json::Value = serde_json::from_str(&result_json)
                 .unwrap_or(serde_json::Value::String(result_json.clone()));
+            if status != "Succeeded" {
+                let detail = format!("{status}:{result_json}:{error}");
+                if let Err(e) = state.store.update_control_audit(
+                    &request_id,
+                    "FAILED",
+                    Some(&detail),
+                    mesa_core_types::now_unix_ns(),
+                ) {
+                    warn_audit_update("control_audit result", &request_id, e);
+                }
+                return (
+                    StatusCode::OK,
+                    Json(
+                        serde_json::json!({"request_id": request_id, "status": status, "result": result_val, "error": error}),
+                    ),
+                );
+            }
             let result_issues = mesa_core_types::gate_command_result_against(
                 &desc,
                 &command_id,

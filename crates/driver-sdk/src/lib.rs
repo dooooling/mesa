@@ -1753,15 +1753,53 @@ async fn on_write(session: &Session, req: pb::WriteRequest, msg_id: u64) {
             return;
         }
     };
-    let expected = req
-        .expected_value
-        .and_then(|v| mesa_driver_protocol::value_from_pb(v).ok());
+    // Foundation-3 #3 wire fail-closed：expected 带了但解码失败，
+    // 绝不退化成无条件写（None）——直接 BAD_EXPECTED_VALUE 拒绝，
+    // 且不进入 Driver（原值不可能被修改）。
+    let expected = match req.expected_value {
+        Some(v) => match mesa_driver_protocol::value_from_pb(v) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                respond_write(
+                    session,
+                    msg_id,
+                    req.request_id.clone(),
+                    Err(SdkDriverError::new(
+                        ErrorKind::Internal,
+                        "BAD_EXPECTED_VALUE",
+                        format!("decode expected_value: {e}"),
+                    )),
+                )
+                .await;
+                return;
+            }
+        },
+        None => None,
+    };
     // Foundation-3 单真值：只消费 structured 三元组；旧 `target` 字符串
     // 保留仅作 wire 兼容——新 Driver 永不读取（空三元组即违约，fail-closed，
     // 不 fallback 旧字符串，避免"wire 向后兼容"滑成"产品双轨"）。
+    // Foundation-3 #3 wire fail-closed：parameters_json 非法 JSON 即
+    // INVALID_TARGET 拒绝，不静默变 Null（Null 会改变寻址语义）。
+    let parameters = match serde_json::from_str(&req.parameters_json) {
+        Ok(v) => v,
+        Err(e) => {
+            respond_write(
+                session,
+                msg_id,
+                req.request_id.clone(),
+                Err(SdkDriverError::configuration(
+                    "INVALID_TARGET",
+                    format!("parameters_json 非法 JSON: {e}"),
+                )),
+            )
+            .await;
+            return;
+        }
+    };
     let target = mesa_core_types::WriteTarget {
         resource_id: req.resource_id.clone(),
-        parameters: serde_json::from_str(&req.parameters_json).unwrap_or(serde_json::Value::Null),
+        parameters,
         output: req.output.clone(),
     };
     if target.resource_id.trim().is_empty() || target.output.trim().is_empty() {

@@ -106,6 +106,12 @@ pub struct ControlWrite {
 }
 
 /// Control 门禁错误（Core Descriptor 门禁的精确码，fail-closed）。
+/// NOTE（终审语义冻结）：REST/审计层实际透出的 input 门禁码是 schema
+/// validator 的细粒度码（UNKNOWN_FIELD / INVALID_TYPE / REQUIRED / …，
+/// path 带 `command.input.*` 前缀），本枚举的 `InvalidCommandInput` /
+/// `InvalidCommandResult` 仅为 Rust 侧聚合形态保留，不直接作为 wire 码。
+/// 二选一结论：冻结细粒度 schema codes（可路由、可定位字段），外层文档
+/// 不再宣称存在单一 `INVALID_COMMAND_INPUT` wire 码。
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum ControlGateError {
     #[error("driver 不支持写入 (capabilities.write=false)")]

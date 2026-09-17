@@ -2833,8 +2833,11 @@ IO-Link Parameter
 Core 门禁：enable_control → authorize → endpoint/descriptor →
 capabilities.method → controls.commands 查 command_id
 (COMMAND_NOT_DECLARED) → input 过 input_schema
-(INVALID_COMMAND_INPUT) → audit STARTED → Driver command →
-result 过 result_schema（违反即 DRIVER_CONTRACT_VIOLATION，审计 FAILED）→
+(细粒度 schema 码：UNKNOWN_FIELD / INVALID_TYPE / REQUIRED / …，
+path 前缀 command.input.*；无单一 INVALID_COMMAND_INPUT wire 码) →
+audit STARTED → Driver command →
+Succeeded 结果过 result_schema（违反即 DRIVER_CONTRACT_VIOLATION，审计 FAILED；
+Failed/TimedOut/Rejected/Cancelled 为正常终态，不做 schema 门禁）→
 audit COMPLETED / FAILED
 ```
 

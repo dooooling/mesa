@@ -250,7 +250,127 @@ async fn control_rest_gates_structured_target_and_single_truth_command() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    // 终审 #4 门：value 双真值已删除——value_typed 即未知字段（400/422），
+    // 绝不静默覆盖 value 执行。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/write",
+        r#"{"target":{"resource_id":"writable","parameters":{"slot":"a"},"output":"value"},"value":1.0,"value_typed":{"F64":99.0}}"#,
+    )
+    .await;
+    assert!(
+        s == StatusCode::BAD_REQUEST || s == StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {v}"
+    );
     drop(mgr);
+}
+
+/// 终审 #2 回归（REST 层）：Driver command 业务失败（Failed + 精确 error）
+/// 走正常失败响应（HTTP 200 + status=Failed），绝不冒充
+/// DRIVER_CONTRACT_VIOLATION 502。
+/// 注：reset 的 input_schema 为空对象，带参请求在 Core 门禁即被
+/// UNKNOWN_FIELD 拦截（400，不送 Driver）——这是正确的分层；
+/// "Failed 不进 schema 门禁"的回归由 control_contract 单元门锁定，
+/// 此处再锁定 REST 对 Core 门禁拒绝的形态（400 + issues，不送 Driver）。
+#[tokio::test]
+async fn control_command_business_failure_is_not_violation() {
+    use mesa_core_types::{AcquisitionTask, DriverBinding, GENERIC_BINDING_KIND, TaskSchedule};
+    let store = Arc::new(ConfigStore::open_in_memory().unwrap());
+    let drivers_dir = common::repo_root().join("drivers");
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
+    let state = mesa_core_api::AppState::try_new_with_control(
+        mgr.clone(),
+        store.clone(),
+        drivers_dir.to_string_lossy().to_string(),
+        true,
+    )
+    .unwrap();
+    store
+        .create_device(&mesa_config_store::DeviceRecord {
+            id: "d1".into(),
+            name: "D".into(),
+        })
+        .unwrap();
+    store
+        .create_endpoint(&mesa_config_store::EndpointRecord {
+            id: "e1".into(),
+            name: "E1".into(),
+            device_id: "d1".into(),
+            driver_id: "simulator".into(),
+            connection_json: "{}".into(),
+            desired_running: false,
+            updated_at_ns: 0,
+        })
+        .unwrap();
+    // 空 task 即可 Start（reset 不依赖采集计划）。
+    store
+        .replace_tasks(
+            "e1",
+            &[AcquisitionTask {
+                id: "t1".into(),
+                schedule: TaskSchedule::Poll { interval_ms: 50 },
+                binding: DriverBinding {
+                    kind: GENERIC_BINDING_KIND.into(),
+                    config: serde_json::json!({"selections": [{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"w.k"}]}]}),
+                },
+            }],
+        )
+        .unwrap();
+    let app = mesa_core_api::router(state);
+    mgr.start_endpoint(mesa_driver_manager::endpoint::BuiltinEndpoint {
+        endpoint_id: "e1".into(),
+        driver_id: "simulator".into(),
+        connection_json: "{}".into(),
+        tasks: store.list_tasks("e1").unwrap(),
+        event_tasks: vec![],
+    })
+    .unwrap();
+    common::wait_until(15, || {
+        mgr.snapshot()
+            .endpoint("e1")
+            .is_some_and(|s| s.state == "RUNNING")
+    })
+    .await;
+    // reset 带参 → Core input 门禁先拦（UNKNOWN_FIELD，400）；
+    // 让请求到达 Driver 的形态是 input={} 但 args 非空——不可能：
+    // Core 门禁与 Driver 输入同为 {} 语义。因此业务失败回归改走 fail_once
+    // 命令（input_schema 接受 flag，Driver 对 flag=false 返回业务失败）。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/commands/reset",
+        r#"{"input":{"x":1}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["issues"][0]["code"], "UNKNOWN_FIELD");
+    // fail_once flag=false → Driver 业务失败 → HTTP 200 + status=Failed，
+    // error 精确码直透，绝不是 502 DRIVER_CONTRACT_VIOLATION。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/commands/fail_once",
+        r#"{"input":{"flag":false}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["status"], "Failed");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("COMMAND_BUSINESS_FAILED"),
+        "body: {v}"
+    );
+    // fail_once flag=true → 成功 {}（过 result_schema，审计 COMPLETED）。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/commands/fail_once",
+        r#"{"input":{"flag":true}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["status"], "Succeeded");
+    assert_eq!(v["result"], serde_json::json!({}));
+    mgr.shutdown_all().await;
 }
 
 /// Foundation-3 #2 门：RUNNING 状态真实 REST → IPC → Driver write/command。
@@ -423,7 +543,7 @@ async fn control_running_e2e_broadcast_isolation_and_write_without_acquire() {
         })
         .unwrap();
     // 任务 t1 采 slot=a（point w.a），任务 t2 采 slot=b（point w.b）；
-    // slot=c 无任何采集任务（"写但不采集"）。
+    // slot=c 从不出现在任何 task（"只写、不采集"，终审 #1 指定形态）。
     let mk_task = |id: &str, slot: &str, key: &str| AcquisitionTask {
         id: id.into(),
         schedule: TaskSchedule::Poll { interval_ms: 50 },
@@ -435,11 +555,7 @@ async fn control_running_e2e_broadcast_isolation_and_write_without_acquire() {
     store
         .replace_tasks(
             "e1",
-            &[
-                mk_task("t1", "a", "w.a"),
-                mk_task("t2", "b", "w.b"),
-                mk_task("t3", "c", "w.c"),
-            ],
+            &[mk_task("t1", "a", "w.a"), mk_task("t2", "b", "w.b")],
         )
         .unwrap();
     let app = mesa_core_api::router(state);
@@ -484,10 +600,32 @@ async fn control_running_e2e_broadcast_isolation_and_write_without_acquire() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(isolated, "写 slot=b 不得串扰 slot=a");
-    // "写但不采集"：停掉 t3（含 slot=c 的任务全停）后写 slot=c 仍成功。
-    // （简化：直接写 slot=c——它虽被采集但证明寻址不依赖 point；
-    // 真正的"不采集"由 control_contract 的单元级 state 覆盖。）
-    // 此处改为：连续快速写 20 次 slot=b，无一次静默丢失（终审 #3：无 try_send 丢写）。
+    // 终审 #1 指定 Gate：运行中直接写从未出现在任何 task 的 slot=c=42，
+    // 再 expected=42 CAS 写成 43；同时 snapshot 始终没有 w.c。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/write",
+        r#"{"target":{"resource_id":"writable","parameters":{"slot":"c"},"output":"value"},"value":42.0}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["status"], "Succeeded");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/write",
+        r#"{"target":{"resource_id":"writable","parameters":{"slot":"c"},"output":"value"},"value":43.0,"expected_value":42.0}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["status"], "Succeeded");
+    assert!(
+        !mgr.snapshot()
+            .latest_all()
+            .iter()
+            .any(|e| e.point_key == "w.c"),
+        "从未采集的 slot 不得在 snapshot 中出现投影"
+    );
+    // 连续快速写 20 次 slot=b，无一次静默丢失（终审 #3：无 try_send 丢写）。
     for i in 0..20u32 {
         let (s, v) = post_json(
             app.clone(),
