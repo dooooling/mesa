@@ -12,7 +12,7 @@
 import { useEffect, useState } from "react";
 import { Button, Card, Checkbox, Input, Select, Tabs, Tag, message } from "antd";
 import type { ResourceDescriptor } from "../types";
-import { materializeSchemaDefaults } from "../resourceSelectionModel";
+import { materializeSchemaDefaults, missingRequiredParams } from "../resourceSelectionModel";
 import {
   allKnownPointKeys,
   outputOwnership,
@@ -104,6 +104,14 @@ export function ResourcePickerAntd({
 
   const res = resources.find((r) => r.id === rid);
   if (!res) return <div style={{ color: "#525252" }}>无可用资源</div>;
+
+  // required 前置（表单完整性预检，唯一允许的前端 required 判断）：
+  // 缺席的必填字段 key 列表（`0`/`false` 视为在场，不得 truthy 判）；
+  // 类型/enum/range/pattern 一律不判，交给 Core 唯一真值。
+  const missingRequired = missingRequiredParams(
+    { fields: res.parameters.fields ?? [] },
+    params,
+  );
 
   // Selection 层输入：reconciliation 用全对象（唯一真值）。
   const editableSels: ResourceSelectionLike[] = existingSelections;
@@ -230,10 +238,26 @@ export function ResourcePickerAntd({
           </div>
         </Card>
 
+        {missingRequired.length > 0 ? (
+          <div data-testid="missing-required" style={{ fontSize: 12, color: "#da1e28" }}>
+            缺少必填参数：{missingRequired.join(", ")}（补齐后可加入；类型/范围等由后端校验）
+          </div>
+        ) : null}
+
         <Button
           type="primary"
-          disabled={!outputs.length}
+          disabled={!outputs.length || missingRequired.length > 0}
           onClick={() => {
+            // required 前置防御（即使绕过 disabled，onClick 再判一次）：
+            // 缺席即拒绝，不发 onAdd；类型/enum/range/pattern 不判，交 Core。
+            const missing = missingRequiredParams(
+              { fields: res.parameters.fields ?? [] },
+              params,
+            );
+            if (missing.length > 0) {
+              message.error(`缺少必填参数：${missing.join(", ")}`);
+              return;
+            }
             // 冻结算法前置裁决（只读 protected，只改 editable；protected 永不动）。
             // Picker 只做即时 UX 预判，最终防御门在父层 onAdd（同一纯函数）。
             const decision = reconcileEditableSelection({
