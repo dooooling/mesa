@@ -12,7 +12,10 @@ pub mod probe;
 pub mod resource;
 pub mod schema;
 
-pub use capability::{ControlCatalog, DriverCapabilities, ResourceSelectionMethod};
+pub use capability::{
+    ControlCatalog, ControlGateError, ControlWrite, DriverCapabilities, ResourceSelectionMethod,
+    WriteTarget, gate_command_against, gate_command_result_against, gate_write_against,
+};
 pub use descriptor::{
     DESCRIPTOR_CONTRACT_MAJOR, DESCRIPTOR_CONTRACT_MINOR, DriverDescriptor, DriverIdentity,
 };

@@ -63,7 +63,7 @@ impl Harness {
             r#"{{"endpoint_url":"{}","timeout_ms":5000}}"#,
             srv.endpoint_url()
         );
-        let mut conn = Driver::open_connection(&OpcUaDriver, "e2e", &cfg)
+        let conn = Driver::open_connection(&OpcUaDriver, "e2e", &cfg)
             .await
             .expect("open 必须 Ok");
         conn.configure(1, vec![])

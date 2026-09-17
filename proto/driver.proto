@@ -340,9 +340,16 @@ message BrowseResponse {
 message WriteRequest {
   uint32 connection_handle = 1;
   string request_id = 2;
-  string target = 3;
+  // Foundation-3 structured target（IPC 1.6 单真值）：
+  // resource_id + parameters_json + output。旧 `target` 字段保留
+  // 仅作 wire 兼容（新 Core 永不生成，新 Driver 永不消费；见 task schedule
+  // 同款"wire 向后兼容、产品单轨"原则）。
+  string target = 3 [deprecated = true];
   ValueMsg value = 4;
   optional ValueMsg expected_value = 5;
+  string resource_id = 6;
+  string parameters_json = 7;
+  string output = 8;
 }
 
 message WriteResponse {

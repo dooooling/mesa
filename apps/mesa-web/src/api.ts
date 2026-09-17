@@ -121,10 +121,21 @@ export const api = {
   stopEndpoint: (id: string) => postJson(`/api/v1/endpoints/${id}/stop`, {}),
   diagnostics: () => getJson("/api/v1/diagnostics"),
   endpointDiagnostics: (id: string) => getJson(`/api/v1/endpoints/${id}/diagnostics`),
-  controlWrite: (endpointId: string, target: string, value: unknown, expected?: unknown) =>
-    postJson(`/api/v1/endpoints/${endpointId}/write`, { target, value, expected_value: expected }),
+  // Foundation-3 structured Control（单真值；Web 不提供控制 UI，
+  // 仅保留类型正确的 API 形状供未来使用——当前无调用方）。
+  controlWrite: (
+    endpointId: string,
+    target: { resource_id: string; parameters: Record<string, unknown>; output: string },
+    value: unknown,
+    expected?: unknown,
+  ) =>
+    postJson(`/api/v1/endpoints/${endpointId}/write`, {
+      target,
+      value,
+      expected_value: expected,
+    }),
   controlCommand: (endpointId: string, command: string, input: unknown) =>
-    postJson(`/api/v1/endpoints/${endpointId}/commands/${command}`, input && typeof input === "object" ? input as Record<string, unknown> : { input }),
+    postJson(`/api/v1/endpoints/${endpointId}/commands/${command}`, { input }),
   // PR8 Event Plane：历史/SSE 引导/订阅配置/诊断（后端已固定 seq DESC 分页，Web 不自创算法）
   listEvents: (filter: EventFilter): Promise<ListEventsResponse> =>
     getJson(`/api/v1/events${toQuery(filter)}`),

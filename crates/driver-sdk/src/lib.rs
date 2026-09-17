@@ -137,35 +137,42 @@ pub trait Driver: Send + Sync + 'static {
 /// `configure` 返回描述符 -> Core 回填 point_id -> `apply_point_map` 下发映射 ->
 /// 之后才允许 `run`。
 ///
+/// 并发模型（终审 #2 结论，Foundation-3 冻结）：DriverConnection 必须是
+/// `Send + Sync`。SDK 在 RUNNING 期间经 control-handle（`&self`）并发调用
+/// `write`/`command`/`probe`/`browse`，同时后台 `run(&self)` 独占持有采集
+/// 循环——两者永不互斥等待。`&mut self` 已删除：它迫使 SDK 在 Start 时
+/// `take()` 独占整个连接，导致运行期 control 必然 BUSY（STOPPED→
+/// ENDPOINT_NOT_RUNNING / RUNNING→BUSY，无成功窗口）。
+/// Driver 内部用细粒度锁分离状态：采集计划（run 读）与控制状态（write 写）
+/// 各自独立，禁止"一个大 Mutex 包住整个连接"（那只是把 BUSY 从 SDK 搬进
+/// Driver，一压测就串行超时）。
+///
 /// 生命周期语义（§21 Start/Stop 与 Runtime Reconfigure 行）：连接对象在
 /// run 结束后归还给会话，**同一连接可反复 Stop → Configure → Start**；
 /// 驱动应在 run 内部响应 shutdown 并保证设备资源不随单次运行泄漏
 /// （跨运行持有的资源由进程退出统一回收）。
 #[async_trait::async_trait]
-pub trait DriverConnection: Send {
+pub trait DriverConnection: Send + Sync {
     /// 校验任务合法性（含跨任务 point_key 唯一性），构建采集计划并上报点描述。
     /// 返回 ConfigurationError/DUPLICATE_POINT_KEY 表示拒绝该快照（§6.2 双重保护）。
     async fn configure(
-        &mut self,
+        &self,
         revision: u64,
         tasks: Vec<AcquisitionTask>,
     ) -> Result<Vec<PointDescriptor>, SdkDriverError>;
 
-    async fn apply_point_map(&mut self, map: PointMap) -> Result<(), SdkDriverError>;
+    async fn apply_point_map(&self, map: PointMap) -> Result<(), SdkDriverError>;
 
     /// 采集主循环。实现方必须响应 shutdown 并保证退出时释放本次运行占用的资源；
     /// 数据一律经 sink 发布，不得自行写 IPC。
-    async fn run(
-        &mut self,
-        sink: DataSink,
-        shutdown: CancellationToken,
-    ) -> Result<(), SdkDriverError>;
+    /// `&self` 共享：run 只读采集计划快照（Arc 交换），与 control 写路径无锁竞争。
+    async fn run(&self, sink: DataSink, shutdown: CancellationToken) -> Result<(), SdkDriverError>;
 
     /// 动态探测（§8）：复用本连接已建立的协议会话做纯查询，返回设备事实。
     /// 禁止在此走 Configure/ApplyPointMap/Start；Secret/PKI/会话建立全部
     /// 复用 OpenConnection 已完成的成果，不得另建第二套连接逻辑。
     /// 默认返回 Unsupported。
-    async fn probe(&mut self) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
+    async fn probe(&self) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
         Err(SdkDriverError::new(
             mesa_core_types::ErrorKind::Unsupported,
             "PROBE_UNSUPPORTED",
@@ -175,7 +182,7 @@ pub trait DriverConnection: Send {
 
     /// 浏览（§20）：仅 OPC UA 等支持，默认返回 Unsupported。
     async fn browse(
-        &mut self,
+        &self,
         _parent: &str,
         _filter: &str,
         _cursor: &str,
@@ -193,7 +200,7 @@ pub trait DriverConnection: Send {
     /// Unsupported（`EVENT_NOT_SUPPORTED`）。支持事件的 Driver 覆盖本方法，
     /// 校验 binding 语义（Core 永不解析 binding）并记住订阅计划供 run() 使用。
     async fn configure_events(
-        &mut self,
+        &self,
         revision: u64,
         tasks: Vec<EventTask>,
     ) -> Result<(), SdkDriverError> {
@@ -209,10 +216,15 @@ pub trait DriverConnection: Send {
         }
     }
 
-    /// 控制面写入（J §11）：默认 Unsupported，OPC UA 先行实现。
+    /// 控制面写入（Foundation-3 单真值）：结构化 [`WriteTarget`] 三元组。
+    /// Driver 私有地址字符串入口已删除——Core 理解 Resource/Output，
+    /// 永远不理解 `DB10.DBW2` / `ns=2;i=1001` / `macro.100`。
+    /// `expected` 为 Some 即 CAS 要求：协议无法原子保证时必须返回
+    /// `EXPECTED_VALUE_UNSUPPORTED`，禁止 read → compare → write 假装原子。
+    /// 默认 Unsupported。
     async fn write(
-        &mut self,
-        _target: &str,
+        &self,
+        _target: &mesa_core_types::WriteTarget,
         _value: mesa_core_types::Value,
         _expected: Option<mesa_core_types::Value>,
     ) -> Result<(), SdkDriverError> {
@@ -224,8 +236,10 @@ pub trait DriverConnection: Send {
     }
 
     /// 控制面命令（J §11）：默认 Unsupported，预留统一入口。
+    /// `command_id` 必须已在 Descriptor `controls.commands` 声明（Core 门禁），
+    /// Driver 只执行、不再做存在性二次裁决（参数语义仍由 Driver 终裁）。
     async fn command(
-        &mut self,
+        &self,
         _command: &str,
         _args_json: &str,
     ) -> Result<serde_json::Value, SdkDriverError> {
@@ -693,8 +707,12 @@ async fn stop_run_handle(rh: RunHandle, ctx: &'static str) {
 }
 
 struct ConnEntry {
-    /// configure 与 run 之间连接对象会被临时 take；None 表示正在运行中。
-    conn: Option<Box<dyn DriverConnection>>,
+    /// 连接对象：`Arc` 共享所有权——configure/apply（STOPPED 期独占）与
+    /// run/control（RUNNING 期共享）不再 `take()` 转移（终审 #2 根因）。
+    /// STOPPED 期经 entry 锁独占调用 configure/apply；RUNNING 期经
+    /// control-handle（`&self`）共享调用 run/write/command/probe/browse。
+    /// Driver 内部用细粒度锁分离，不存在"唯一 &mut"。
+    conn: Option<Arc<dyn DriverConnection>>,
     run: Option<RunHandle>,
     revision: u64,
     epoch: u64,
@@ -704,7 +722,8 @@ struct ConnEntry {
 struct Session {
     driver: Box<dyn Driver>,
     sink: DataSink,
-    /// Arc 化以便 run 任务结束时把连接对象归还回表（Stop→Start 可重复）。
+    /// 连接表：`ConnEntry.conn` 为 `Arc<dyn DriverConnection>` 常驻表内
+    /// （RUNNING 期 run 与 control 共享同一 Arc，各持 `&self` 并发调用）。
     entries: Arc<Mutex<HashMap<u32, ConnEntry>>>,
     /// 当前允许发送数据的 stream_epoch（handle -> active epoch）。
     /// Start 时插入，Stop/Close 时移除；writer 在真正写 socket 前检查，丢弃已停止/过期 epoch 的旧批次。
@@ -1184,7 +1203,7 @@ async fn on_open_connection(session: &Session, req: pb::OpenConnection, msg_id: 
                 session.entries.lock().unwrap().insert(
                     req.connection_handle,
                     ConnEntry {
-                        conn: Some(conn),
+                        conn: Some(Arc::from(conn)),
                         run: None,
                         revision: 0,
                         epoch: 0,
@@ -1210,15 +1229,17 @@ async fn on_open_connection(session: &Session, req: pb::OpenConnection, msg_id: 
 }
 
 async fn on_configure(session: &Session, req: pb::ConfigureTasks, msg_id: u64) {
-    // 先取出连接对象供 configure 使用；失败必须归还，避免泄漏成"打开但不可用"
-    let taken = session
-        .entries
-        .lock()
-        .unwrap()
-        .get_mut(&req.connection_handle)
-        .and_then(|e| e.conn.take());
+    // control-handle 语义：克隆 Arc（不 take），`&self` 并发调用。
+    // 运行中拒绝重配（§6.2：改任务走 Stop → Configure → Start，不热 Apply）。
+    let conn_opt = {
+        let m = session.entries.lock().unwrap();
+        match m.get(&req.connection_handle) {
+            Some(e) if e.run.is_none() => e.conn.clone(),
+            _ => None,
+        }
+    };
 
-    let Some(mut conn) = taken else {
+    let Some(conn) = conn_opt else {
         session
             .sink
             .send_control(pb::Envelope {
@@ -1228,7 +1249,7 @@ async fn on_configure(session: &Session, req: pb::ConfigureTasks, msg_id: u64) {
                     detail: Some(error_detail(
                         ErrorKind::Internal,
                         "NO_CONNECTION",
-                        "connection not open".to_string(),
+                        "connection not open or running".to_string(),
                     )),
                 })),
             })
@@ -1245,7 +1266,6 @@ async fn on_configure(session: &Session, req: pb::ConfigureTasks, msg_id: u64) {
                     .unwrap()
                     .get_mut(&req.connection_handle)
                 {
-                    e.conn = Some(conn);
                     e.revision = req.revision;
                 }
                 session
@@ -1271,14 +1291,6 @@ async fn on_configure(session: &Session, req: pb::ConfigureTasks, msg_id: u64) {
                     .await;
             }
             Err(err) => {
-                if let Some(e) = session
-                    .entries
-                    .lock()
-                    .unwrap()
-                    .get_mut(&req.connection_handle)
-                {
-                    e.conn = Some(conn);
-                }
                 session
                     .sink
                     .send_control(pb::Envelope {
@@ -1293,14 +1305,6 @@ async fn on_configure(session: &Session, req: pb::ConfigureTasks, msg_id: u64) {
         },
         Err(e) => {
             let err: SdkDriverError = e.into();
-            if let Some(e) = session
-                .entries
-                .lock()
-                .unwrap()
-                .get_mut(&req.connection_handle)
-            {
-                e.conn = Some(conn);
-            }
             session
                 .sink
                 .send_control(pb::Envelope {
@@ -1316,14 +1320,16 @@ async fn on_configure(session: &Session, req: pb::ConfigureTasks, msg_id: u64) {
 }
 
 async fn on_apply_point_map(session: &Session, req: pb::ApplyPointMap, msg_id: u64) {
-    let taken = session
-        .entries
-        .lock()
-        .unwrap()
-        .get_mut(&req.connection_handle)
-        .and_then(|e| e.conn.take());
+    // control-handle 语义：克隆 Arc（不 take）。运行中拒绝（与 configure 同门）。
+    let conn_opt = {
+        let m = session.entries.lock().unwrap();
+        match m.get(&req.connection_handle) {
+            Some(e) if e.run.is_none() => e.conn.clone(),
+            _ => None,
+        }
+    };
 
-    let Some(mut conn) = taken else {
+    let Some(conn) = conn_opt else {
         session
             .sink
             .send_control(pb::Envelope {
@@ -1333,7 +1339,7 @@ async fn on_apply_point_map(session: &Session, req: pb::ApplyPointMap, msg_id: u
                     detail: Some(error_detail(
                         ErrorKind::Internal,
                         "NO_CONNECTION",
-                        "connection not open".to_string(),
+                        "connection not open or running".to_string(),
                     )),
                 })),
             })
@@ -1342,14 +1348,6 @@ async fn on_apply_point_map(session: &Session, req: pb::ApplyPointMap, msg_id: u
     };
 
     let res = conn.apply_point_map(req.key_to_point_id).await;
-    if let Some(e) = session
-        .entries
-        .lock()
-        .unwrap()
-        .get_mut(&req.connection_handle)
-    {
-        e.conn = Some(conn);
-    }
     let result = match res {
         Ok(()) => ok_result(),
         Err(err) => err_result(err.kind, &err.code, err.message),
@@ -1370,15 +1368,16 @@ async fn on_apply_point_map(session: &Session, req: pb::ApplyPointMap, msg_id: u
 /// 事件任务配置（proto 42 → 43）：错误统一走 `EventConfigApplied.result`，
 /// 不另造 DriverError 分流——调用方只需看一处结果（PR6 接线约定）。
 async fn on_configure_events(session: &Session, req: pb::ConfigureEventTasks, msg_id: u64) {
-    // 取出连接对象供 configure_events 使用；失败必须归还，避免"打开但不可用"
-    let taken = session
-        .entries
-        .lock()
-        .unwrap()
-        .get_mut(&req.connection_handle)
-        .and_then(|e| e.conn.take());
+    // control-handle 语义：克隆 Arc（不 take）。运行中拒绝（与 configure 同门）。
+    let conn_opt = {
+        let m = session.entries.lock().unwrap();
+        match m.get(&req.connection_handle) {
+            Some(e) if e.run.is_none() => e.conn.clone(),
+            _ => None,
+        }
+    };
 
-    let Some(mut conn) = taken else {
+    let Some(conn) = conn_opt else {
         session
             .sink
             .send_control(pb::Envelope {
@@ -1412,15 +1411,7 @@ async fn on_configure_events(session: &Session, req: pb::ConfigureEventTasks, ms
             Err(err) => err_result(err.kind, &err.code, err.message),
         },
     };
-    // 归还连接（configure_events 不消耗连接对象）
-    if let Some(e) = session
-        .entries
-        .lock()
-        .unwrap()
-        .get_mut(&req.connection_handle)
-    {
-        e.conn = Some(conn);
-    }
+    // control-handle 语义：Arc 共享，无需归还。
     session
         .sink
         .send_control(pb::Envelope {
@@ -1437,22 +1428,18 @@ async fn on_configure_events(session: &Session, req: pb::ConfigureEventTasks, ms
 }
 
 async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
-    // 前置校验：必须已完成 configure 且未在运行
-    let ready = {
-        let mut m = session.entries.lock().unwrap();
-        match m.get_mut(&req.connection_handle) {
-            Some(entry) => {
-                if entry.run.is_some() {
-                    None
-                } else {
-                    entry.conn.take()
-                }
-            }
-            None => None,
+    // 前置校验：必须已完成 configure 且未在运行。
+    // control-handle 语义：只克隆 Arc（不 take）——连接对象 RUNNING 期仍在
+    // 表内，run 与 control 共享同一 Arc 各持 `&self` 并发调用（终审 #2 架构）。
+    let conn_opt = {
+        let m = session.entries.lock().unwrap();
+        match m.get(&req.connection_handle) {
+            Some(entry) if entry.run.is_none() => entry.conn.clone(),
+            _ => None,
         }
     };
 
-    let Some(conn) = ready else {
+    let Some(conn) = conn_opt else {
         // NOTE: 拒绝路径也必须回显请求 msg_id，否则 Core 侧请求无法关联回复
         session
             .send_control_ack_start(
@@ -1473,41 +1460,34 @@ async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
         .sink
         .for_connection(req.connection_handle, req.stream_epoch);
     let handle = req.connection_handle;
-    let entries = Arc::clone(&session.entries);
-    let mut conn = conn; // &mut 调用需要可变绑定
 
     // Start release gate（P0）：run 任务先 park，Ack 入队后才放行。
     // 否则首批 Data/Event 可能抢在 active_epochs.insert（SDK 门）或
     // StartConnectionAck（Core 门）之前产生，被当 stale 静默丢弃——
     // seq=1 的 occurrence 永久丢失，而连接显示 RUNNING。
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-    // 采集任务独立于请求循环运行；结束（含出错）时上报终态，
-    // 并把连接对象归还回表，使该连接可被再次 Configure/Start（§21 可重复启停）。
+    // 采集任务独立于请求循环运行；结束（含出错）时上报终态。
+    // control-handle 语义：run 持 Arc 克隆 `&self` 调用 `run()`，与 control
+    // 路径（write/command/probe/browse 同持 Arc `&self` 调用）天然并发——
+    // 无 take、无归还、无 BUSY（§21 可重复启停不受影响：Arc 表内常驻）。
+    let run_conn = Arc::clone(&conn);
     let join = tokio::spawn(async move {
-        // park 期被 Stop/Shutdown 取消：归还连接并静默退出（StopAck/Shutdown
-        // 本身即确认，不再上报终态，避免 Stop 后多出一条幽灵 Stopped）。
-        // release 端释放而未发送（on_start 未走完，如进程退出中）：同样归还退出。
+        // park 期被 Stop/Shutdown 取消：静默退出（StopAck/Shutdown 本身即确认，
+        // 不再上报终态，避免 Stop 后多出一条幽灵 Stopped）。
+        // release 端释放而未发送（on_start 未走完，如进程退出中）：同样退出。
         tokio::select! {
             r = release_rx => {
                 if r.is_err() {
-                    if let Some(entry) = entries.lock().unwrap().get_mut(&handle) {
-                        entry.conn = Some(conn);
-                    }
                     return;
                 }
             }
             _ = gate_cancel.cancelled() => {
-                if let Some(entry) = entries.lock().unwrap().get_mut(&handle) {
-                    entry.conn = Some(conn);
-                }
                 return;
             }
         }
-        let outcome = conn.run(sink_for_run.clone(), task_cancel).await;
-        // 先归还再上报：保证 Stop ack 返回时连接已可复用
-        if let Some(entry) = entries.lock().unwrap().get_mut(&handle) {
-            entry.conn = Some(conn);
-        }
+        // `&self` 共享调用：run 只读采集计划快照，与 control 写路径无锁竞争
+        //（Driver 内部细粒度锁保证；Simulator 以 RwLock control_state 满足）。
+        let outcome = run_conn.run(sink_for_run.clone(), task_cancel).await;
         let (final_state, detail) = match &outcome {
             Ok(()) => (ConnectionState::Stopped, String::new()),
             Err(err) => {
@@ -1526,6 +1506,8 @@ async fn on_start(session: &Session, req: pb::StartConnection, msg_id: u64) {
                 cancel: run_cancel,
                 join,
             });
+            // control-handle 语义：conn 留在表内（Arc 常驻），run 与 control
+            // 共享同一 Arc——无 take、无置空、无 running_shared 旁表。
         }
     }
     // 激活 epoch 门控：此后该 handle 的旧 epoch 批次将被 writer 丢弃
@@ -1614,20 +1596,20 @@ async fn on_close(session: &Session, req: pb::CloseConnection, msg_id: u64) {
         .await;
 }
 
-/// 动态探测（§8）：从 entries 取出 `connection_handle` 对应的连接，
-/// 调用 `DriverConnection::probe()`（复用其已建协议会话），用完归还。
+/// 动态探测（§8）：克隆 Arc 后 `&self` 调用 `probe()`（复用其已建协议会话）。
 /// 成功 → `ProbeResponse{report_json}`（64 KiB 上限内，发送前二次检查）；
 /// 失败（含 handle 未打开）→ 同 msg_id 的 `DriverErrorReport`（复用等待路由）。
 async fn on_probe(session: &Session, req: pb::ProbeRequest, msg_id: u64) {
+    // control-handle 语义：克隆 Arc（不 take），运行期与 run 并发安全。
     let conn_opt = {
         session
             .entries
             .lock()
             .unwrap()
-            .get_mut(&req.connection_handle)
-            .and_then(|e| e.conn.take())
+            .get(&req.connection_handle)
+            .and_then(|e| e.conn.clone())
     };
-    let Some(mut conn) = conn_opt else {
+    let Some(conn) = conn_opt else {
         session
             .sink
             .send_control(pb::Envelope {
@@ -1661,15 +1643,7 @@ async fn on_probe(session: &Session, req: pb::ProbeRequest, msg_id: u64) {
             detail: Some(error_detail(err.kind, &err.code, err.message)),
         }),
     };
-    // 归还连接（probe 不消耗连接对象）
-    if let Some(entry) = session
-        .entries
-        .lock()
-        .unwrap()
-        .get_mut(&req.connection_handle)
-    {
-        entry.conn = Some(conn);
-    }
+    // control-handle 语义：Arc 共享，无需归还。
     session
         .sink
         .send_control(pb::Envelope {
@@ -1680,26 +1654,19 @@ async fn on_probe(session: &Session, req: pb::ProbeRequest, msg_id: u64) {
 }
 
 async fn on_browse(session: &Session, req: pb::BrowseRequest, msg_id: u64) {
-    // 取对应连接，若 handle 为 0 则取任意已打开连接（兼容 probe 场景）
+    // control-handle 语义：克隆 Arc（不 take）。handle 为 0 取任意已打开连接。
     let conn_opt = {
-        let mut m = session.entries.lock().unwrap();
-        if let Some(entry) = m.get_mut(&req.connection_handle) {
-            entry.conn.take()
+        let m = session.entries.lock().unwrap();
+        if let Some(entry) = m.get(&req.connection_handle) {
+            entry.conn.clone()
         } else if req.connection_handle == 0 {
             // 取第一个可用连接
-            let mut found = None;
-            for (_, e) in m.iter_mut() {
-                if e.conn.is_some() {
-                    found = e.conn.take();
-                    break;
-                }
-            }
-            found
+            m.values().find_map(|e| e.conn.clone())
         } else {
             None
         }
     };
-    let Some(mut conn) = conn_opt else {
+    let Some(conn) = conn_opt else {
         session
             .sink
             .send_control(pb::Envelope {
@@ -1720,21 +1687,7 @@ async fn on_browse(session: &Session, req: pb::BrowseRequest, msg_id: u64) {
     let res = conn
         .browse(&req.parent, &req.filter, &req.cursor, req.limit)
         .await;
-    // 归还连接
-    {
-        let mut m = session.entries.lock().unwrap();
-        if let Some(entry) = m.get_mut(&req.connection_handle) {
-            entry.conn = Some(conn);
-        } else {
-            // 若原 handle 为 0，归还到任意
-            for (_, e) in m.iter_mut() {
-                if e.conn.is_none() {
-                    e.conn = Some(conn);
-                    break;
-                }
-            }
-        }
-    }
+    // control-handle 语义：Arc 共享，无需归还。
     match res {
         Ok((nodes, next)) => {
             session
@@ -1766,117 +1719,137 @@ async fn on_browse(session: &Session, req: pb::BrowseRequest, msg_id: u64) {
 }
 
 async fn on_write(session: &Session, req: pb::WriteRequest, msg_id: u64) {
-    let conn_opt = {
-        let mut m = session.entries.lock().unwrap();
-        if let Some(entry) = m.get_mut(&req.connection_handle) {
-            entry.conn.take()
-        } else {
-            None
-        }
-    };
-    let exists = {
-        let m = session.entries.lock().unwrap();
-        m.contains_key(&req.connection_handle)
-    };
-    if conn_opt.is_none() && !exists {
-        session
-            .sink
-            .send_control(pb::Envelope {
-                msg_id,
-                body: Some(pb::envelope::Body::WriteResponse(pb::WriteResponse {
-                    request_id: req.request_id,
-                    result: Some(err_result(
-                        ErrorKind::Internal,
-                        "NO_CONNECTION",
-                        "write: connection not open",
-                    )),
-                    readback: None,
-                })),
-            })
-            .await;
-        return;
-    }
-    let Some(mut conn) = conn_opt else {
-        session
-            .sink
-            .send_control(pb::Envelope {
-                msg_id,
-                body: Some(pb::envelope::Body::WriteResponse(pb::WriteResponse {
-                    request_id: req.request_id,
-                    result: Some(err_result(
-                        ErrorKind::Internal,
-                        "BUSY",
-                        "write: connection busy",
-                    )),
-                    readback: None,
-                })),
-            })
-            .await;
-        return;
-    };
+    // 参数解码先行（与连接状态无关，坏参数即拒，不占用 control 锁）。
     let value = match req.value {
         Some(v) => match mesa_driver_protocol::value_from_pb(v) {
             Ok(v) => v,
             Err(e) => {
-                {
-                    let mut m = session.entries.lock().unwrap();
-                    if let Some(e2) = m.get_mut(&req.connection_handle) {
-                        e2.conn = Some(conn);
-                    }
-                }
-                session
-                    .sink
-                    .send_control(pb::Envelope {
-                        msg_id,
-                        body: Some(pb::envelope::Body::WriteResponse(pb::WriteResponse {
-                            request_id: req.request_id,
-                            result: Some(err_result(
-                                ErrorKind::Internal,
-                                "BAD_VALUE",
-                                format!("decode value: {e}"),
-                            )),
-                            readback: None,
-                        })),
-                    })
-                    .await;
+                respond_write(
+                    session,
+                    msg_id,
+                    req.request_id.clone(),
+                    Err(SdkDriverError::new(
+                        ErrorKind::Internal,
+                        "BAD_VALUE",
+                        format!("decode value: {e}"),
+                    )),
+                )
+                .await;
                 return;
             }
         },
         None => {
-            {
-                let mut m = session.entries.lock().unwrap();
-                if let Some(e2) = m.get_mut(&req.connection_handle) {
-                    e2.conn = Some(conn);
-                }
-            }
-            session
-                .sink
-                .send_control(pb::Envelope {
-                    msg_id,
-                    body: Some(pb::envelope::Body::WriteResponse(pb::WriteResponse {
-                        request_id: req.request_id,
-                        result: Some(err_result(
-                            ErrorKind::Internal,
-                            "MISSING_VALUE",
-                            "write: missing value",
-                        )),
-                        readback: None,
-                    })),
-                })
-                .await;
+            respond_write(
+                session,
+                msg_id,
+                req.request_id.clone(),
+                Err(SdkDriverError::new(
+                    ErrorKind::Internal,
+                    "MISSING_VALUE",
+                    "write: missing value",
+                )),
+            )
+            .await;
             return;
         }
     };
-    let expected = req
-        .expected_value
-        .and_then(|v| mesa_driver_protocol::value_from_pb(v).ok());
-    let res = conn.write(&req.target, value, expected).await;
-    {
-        let mut m = session.entries.lock().unwrap();
-        if let Some(e2) = m.get_mut(&req.connection_handle) {
-            e2.conn = Some(conn);
+    // Foundation-3 #3 wire fail-closed：expected 带了但解码失败，
+    // 绝不退化成无条件写（None）——直接 BAD_EXPECTED_VALUE 拒绝，
+    // 且不进入 Driver（原值不可能被修改）。
+    let expected = match req.expected_value {
+        Some(v) => match mesa_driver_protocol::value_from_pb(v) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                respond_write(
+                    session,
+                    msg_id,
+                    req.request_id.clone(),
+                    Err(SdkDriverError::new(
+                        ErrorKind::Internal,
+                        "BAD_EXPECTED_VALUE",
+                        format!("decode expected_value: {e}"),
+                    )),
+                )
+                .await;
+                return;
+            }
+        },
+        None => None,
+    };
+    // Foundation-3 单真值：只消费 structured 三元组；旧 `target` 字符串
+    // 保留仅作 wire 兼容——新 Driver 永不读取（空三元组即违约，fail-closed，
+    // 不 fallback 旧字符串，避免"wire 向后兼容"滑成"产品双轨"）。
+    // Foundation-3 #3 wire fail-closed：parameters_json 非法 JSON 即
+    // INVALID_TARGET 拒绝，不静默变 Null（Null 会改变寻址语义）。
+    let parameters = match serde_json::from_str(&req.parameters_json) {
+        Ok(v) => v,
+        Err(e) => {
+            respond_write(
+                session,
+                msg_id,
+                req.request_id.clone(),
+                Err(SdkDriverError::configuration(
+                    "INVALID_TARGET",
+                    format!("parameters_json 非法 JSON: {e}"),
+                )),
+            )
+            .await;
+            return;
         }
+    };
+    let target = mesa_core_types::WriteTarget {
+        resource_id: req.resource_id.clone(),
+        parameters,
+        output: req.output.clone(),
+    };
+    if target.resource_id.trim().is_empty() || target.output.trim().is_empty() {
+        respond_write(
+            session,
+            msg_id,
+            req.request_id.clone(),
+            Err(SdkDriverError::new(
+                ErrorKind::Internal,
+                "CONTROL_MODEL_UNSUPPORTED",
+                "write: missing structured target (resource_id/output required; legacy string target retired)",
+            )),
+        )
+        .await;
+        return;
     }
+    // control-handle 语义：克隆 Arc 后 `&self` 直接调用——运行中与 run 并发，
+    // 未 Start 同样可调（Driver 自决，如 Simulator 允许停机写）。
+    let conn_opt = {
+        session
+            .entries
+            .lock()
+            .unwrap()
+            .get(&req.connection_handle)
+            .and_then(|e| e.conn.clone())
+    };
+    let Some(conn) = conn_opt else {
+        respond_write(
+            session,
+            msg_id,
+            req.request_id.clone(),
+            Err(SdkDriverError::new(
+                ErrorKind::Internal,
+                "NO_CONNECTION",
+                "write: connection not open",
+            )),
+        )
+        .await;
+        return;
+    };
+    let inner = conn.write(&target, value, expected).await;
+    respond_write(session, msg_id, req.request_id.clone(), inner).await;
+}
+
+async fn respond_write(
+    session: &Session,
+    msg_id: u64,
+    request_id: String,
+    res: Result<(), SdkDriverError>,
+) {
     match res {
         Ok(()) => {
             session
@@ -1884,7 +1857,7 @@ async fn on_write(session: &Session, req: pb::WriteRequest, msg_id: u64) {
                 .send_control(pb::Envelope {
                     msg_id,
                     body: Some(pb::envelope::Body::WriteResponse(pb::WriteResponse {
-                        request_id: req.request_id,
+                        request_id,
                         result: Some(mesa_driver_protocol::ok_result()),
                         readback: None,
                     })),
@@ -1897,7 +1870,7 @@ async fn on_write(session: &Session, req: pb::WriteRequest, msg_id: u64) {
                 .send_control(pb::Envelope {
                     msg_id,
                     body: Some(pb::envelope::Body::WriteResponse(pb::WriteResponse {
-                        request_id: req.request_id,
+                        request_id,
                         result: Some(err_result(e.kind, &e.code, e.message)),
                         readback: None,
                     })),
@@ -1908,55 +1881,40 @@ async fn on_write(session: &Session, req: pb::WriteRequest, msg_id: u64) {
 }
 
 async fn on_command(session: &Session, req: pb::CommandRequest, msg_id: u64) {
+    // control-handle 语义：克隆 Arc 后 `&self` 直接调用——运行中与 run 并发，
+    // 未 Start 同样可调（Driver 自决）。
     let conn_opt = {
-        let mut m = session.entries.lock().unwrap();
-        if let Some(entry) = m.get_mut(&req.connection_handle) {
-            entry.conn.take()
-        } else {
-            None
-        }
-    };
-    let exists = {
-        let m = session.entries.lock().unwrap();
-        m.contains_key(&req.connection_handle)
-    };
-    if conn_opt.is_none() && !exists {
         session
-            .sink
-            .send_control(pb::Envelope {
-                msg_id,
-                body: Some(pb::envelope::Body::CommandResponse(pb::CommandResponse {
-                    request_id: req.request_id,
-                    status: "Failed".into(),
-                    result_json: "".into(),
-                    error: "NO_CONNECTION: command: connection not open".into(),
-                })),
-            })
-            .await;
-        return;
-    }
-    let Some(mut conn) = conn_opt else {
-        session
-            .sink
-            .send_control(pb::Envelope {
-                msg_id,
-                body: Some(pb::envelope::Body::CommandResponse(pb::CommandResponse {
-                    request_id: req.request_id,
-                    status: "Failed".into(),
-                    result_json: "".into(),
-                    error: "BUSY: command: connection busy".into(),
-                })),
-            })
-            .await;
+            .entries
+            .lock()
+            .unwrap()
+            .get(&req.connection_handle)
+            .and_then(|e| e.conn.clone())
+    };
+    let Some(conn) = conn_opt else {
+        respond_command(
+            session,
+            msg_id,
+            req.request_id.clone(),
+            Err(SdkDriverError::new(
+                ErrorKind::Internal,
+                "NO_CONNECTION",
+                "command: connection not open",
+            )),
+        )
+        .await;
         return;
     };
-    let res = conn.command(&req.command_id, &req.input_json).await;
-    {
-        let mut m = session.entries.lock().unwrap();
-        if let Some(e2) = m.get_mut(&req.connection_handle) {
-            e2.conn = Some(conn);
-        }
-    }
+    let inner = conn.command(&req.command_id, &req.input_json).await;
+    respond_command(session, msg_id, req.request_id.clone(), inner).await;
+}
+
+async fn respond_command(
+    session: &Session,
+    msg_id: u64,
+    request_id: String,
+    res: Result<serde_json::Value, SdkDriverError>,
+) {
     match res {
         Ok(v) => {
             let json = serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
@@ -1965,7 +1923,7 @@ async fn on_command(session: &Session, req: pb::CommandRequest, msg_id: u64) {
                 .send_control(pb::Envelope {
                     msg_id,
                     body: Some(pb::envelope::Body::CommandResponse(pb::CommandResponse {
-                        request_id: req.request_id,
+                        request_id,
                         status: "Succeeded".into(),
                         result_json: json,
                         error: "".into(),
@@ -1979,7 +1937,7 @@ async fn on_command(session: &Session, req: pb::CommandRequest, msg_id: u64) {
                 .send_control(pb::Envelope {
                     msg_id,
                     body: Some(pb::envelope::Body::CommandResponse(pb::CommandResponse {
-                        request_id: req.request_id,
+                        request_id,
                         status: "Failed".into(),
                         result_json: "".into(),
                         error: format!("{}/{}: {}", e.kind.as_str(), e.code, e.message),
@@ -2370,24 +2328,20 @@ mod tests {
         #[async_trait::async_trait]
         impl DriverConnection for Stub {
             async fn configure(
-                &mut self,
+                &self,
                 _r: u64,
                 _t: Vec<AcquisitionTask>,
             ) -> Result<Vec<mesa_core_types::PointDescriptor>, SdkDriverError> {
                 Ok(vec![])
             }
-            async fn apply_point_map(&mut self, _m: PointMap) -> Result<(), SdkDriverError> {
+            async fn apply_point_map(&self, _m: PointMap) -> Result<(), SdkDriverError> {
                 Ok(())
             }
-            async fn run(
-                &mut self,
-                _s: DataSink,
-                _c: CancellationToken,
-            ) -> Result<(), SdkDriverError> {
+            async fn run(&self, _s: DataSink, _c: CancellationToken) -> Result<(), SdkDriverError> {
                 Ok(())
             }
         }
-        let mut stub = Stub;
+        let stub = Stub;
         assert!(stub.configure_events(1, vec![]).await.is_ok());
         let task = EventTask {
             id: "e1".into(),

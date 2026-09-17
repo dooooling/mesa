@@ -264,14 +264,14 @@ mod tests {
         // 127.0.0.1:9 预期关闭：经已打开的连接探测，建连失败 → Ok(unreachable)。
         // open 自身不建连（lazy），probe 内的 connect 触发失败。
         let d = crate::OpcUaDriver;
-        let mut conn = mesa_driver_sdk::Driver::open_connection(
+        let conn = mesa_driver_sdk::Driver::open_connection(
             &d,
             "t",
             r#"{"endpoint_url":"opc.tcp://127.0.0.1:9","timeout_ms":1000}"#,
         )
         .await
         .expect("open 只解析配置");
-        let r = mesa_driver_sdk::DriverConnection::probe(&mut *conn)
+        let r = mesa_driver_sdk::DriverConnection::probe(&*conn)
             .await
             .expect("不可达是探测结果");
         assert!(!r.reachable);

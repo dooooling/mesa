@@ -219,10 +219,10 @@ async fn main() {
     {
         let drv = mesa_driver_opcua::OpcUaDriver;
         let cfg = format!(r#"{{"endpoint_url":"{url}","timeout_ms":5000}}"#);
-        let mut conn = mesa_driver_sdk::Driver::open_connection(&drv, "smoke", &cfg)
+        let conn = mesa_driver_sdk::Driver::open_connection(&drv, "smoke", &cfg)
             .await
             .expect("open 必须 Ok");
-        let rep = mesa_driver_sdk::DriverConnection::probe(&mut *conn)
+        let rep = mesa_driver_sdk::DriverConnection::probe(&*conn)
             .await
             .expect("probe 必须 Ok");
         println!(

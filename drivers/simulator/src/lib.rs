@@ -238,11 +238,79 @@ impl Driver for SimulatorDriver {
                     }],
                     modes: vec![mesa_core_types::TaskMode::Poll],
                 },
+                // Foundation-3 Reference Control：可写槽位（ReadWrite）。
+                // Write 回归 Resource 模型的最小证明：同一 resource + 同一
+                // output，采集（Read）与写入（Write）共享 parameters 语义。
+                // slot 为 Resource 实例身份（canonical 参数，采集与写入同口径；
+                // point_key 只是该 selection 的采集投影，不是 Write 身份）。
+                ResourceDescriptor {
+                    id: "writable".into(),
+                    label: LocalizedText::new("Writable"),
+                    parameters: SchemaDescriptor {
+                        fields: vec![
+                            FieldDescriptor::new("initial", "Initial", FieldType::Number)
+                                .required(false)
+                                .default_value(serde_json::json!(0.0)),
+                            FieldDescriptor::new("slot", "Slot", FieldType::String).required(true),
+                        ],
+                    },
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Value"),
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::F64,
+                        },
+                        unit: None,
+                        access: AccessMode::ReadWrite,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
             ],
-            controls: mesa_core_types::ControlCatalog::default(),
+            controls: mesa_core_types::ControlCatalog {
+                commands: vec![
+                    // Reference command：reset（无输入，幂等；与 write 旧桩同名，
+                    // 语义收敛为 ControlCatalog 声明）。
+                    mesa_core_types::capability::CommandDescriptor {
+                        id: "reset".into(),
+                        label: LocalizedText::new("Reset"),
+                        description: Some("重置模拟器状态（幂等，无副作用）".into()),
+                        input_schema: SchemaDescriptor::default(),
+                        result_schema: SchemaDescriptor::default(),
+                        risk: mesa_core_types::capability::RiskLevel::Low,
+                        confirmation: false,
+                        timeout_ms: None,
+                        idempotent: true,
+                    },
+                    // 终审 #2 回归命令：input_schema 接受 {flag: bool}，
+                    // Driver 对 flag=false 返回业务失败 Err（Failed 终态），
+                    // Core 对 Failed 不得做 result_schema 门禁（无 VIOLATION）。
+                    mesa_core_types::capability::CommandDescriptor {
+                        id: "fail_once".into(),
+                        label: LocalizedText::new("Fail Once"),
+                        description: Some(
+                            "回归用：flag=false 即业务失败（终审 #2 门禁回归）".into(),
+                        ),
+                        input_schema: SchemaDescriptor::new(vec![
+                            mesa_core_types::FieldDescriptor::new(
+                                "flag",
+                                "Flag",
+                                mesa_core_types::FieldType::Boolean,
+                            )
+                            .required(true),
+                        ]),
+                        result_schema: SchemaDescriptor::default(),
+                        risk: mesa_core_types::capability::RiskLevel::Low,
+                        confirmation: false,
+                        timeout_ms: None,
+                        idempotent: false,
+                    },
+                ],
+            },
             resource_selection_methods: vec![ResourceSelectionMethod::Manual],
             capabilities: DriverCapabilities {
                 poll: true,
+                write: true,
+                method: true,
                 events: true,
                 ..Default::default()
             },
@@ -287,9 +355,10 @@ impl Driver for SimulatorDriver {
             .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.to_string()))?;
         let faults = parse_conn_faults(&cfg)?;
         Ok(Box::new(SimConnection {
-            plan: None,
+            plan: std::sync::RwLock::new(None),
             faults,
-            event_plan: None,
+            event_plan: std::sync::RwLock::new(None),
+            control_state: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         }))
     }
 }
@@ -400,6 +469,13 @@ enum SourceSpec {
         max: f64,
         seed: Option<u64>,
     },
+    // Foundation-3 Reference Control：可写槽位（writable resource 的运行时值）。
+    // 采集语义 = 当前值（初始 initial，可被 write 覆盖）；configure 期快照值
+    // 即初始值，write 后由连接级共享 state 更新（见 SimConnection.control_state）。
+    Writable {
+        slot: String,
+        value: Value,
+    },
 }
 
 impl SourceSpec {
@@ -413,6 +489,7 @@ impl SourceSpec {
             SourceSpec::Toggle { .. } => "toggle",
             SourceSpec::Constant { .. } => "constant",
             SourceSpec::Random { .. } => "random",
+            SourceSpec::Writable { .. } => "writable",
         };
         format!("sim.{kind}")
     }
@@ -462,6 +539,22 @@ impl SourceSpec {
                     min,
                     max,
                     seed: v.get("seed").and_then(|s| s.as_u64()),
+                }
+            }
+            // Foundation-3 Reference Control：可写槽位（writable resource）。
+            // 采集语义 = 当前值（初始 initial，可被 write 覆盖）；slot 为
+            // Resource 实例身份（required canonical 参数，采集与写入同口径）。
+            "writable" => {
+                let slot = v.get("slot").and_then(|s| s.as_str()).ok_or_else(|| {
+                    bad_point(key, "`writable.slot` required（Resource 实例身份）")
+                })?;
+                if slot.trim().is_empty() {
+                    return Err(bad_point(key, "`writable.slot` 不能为空"));
+                }
+                let initial = get_f("initial").unwrap_or(0.0);
+                SourceSpec::Writable {
+                    slot: slot.to_string(),
+                    value: Value::F64(initial),
                 }
             }
             other => {
@@ -565,6 +658,12 @@ impl SourceState {
                 Value::Bool(self.toggle)
             }
             SourceSpec::Constant { value } => value.clone(),
+            // Writable 采集语义 = 共享 state 当前值（run 循环经 control_state
+            // 实时读，不读快照；快照值仅为 configure 期初值）。
+            // sample() 无共享句柄（&mut self 纯函数），故 Writable 在此处
+            // 返回快照初值——真正的 live 读由 run 循环直读 control_state
+            //（见下），此处分支仅用于非 run 路径（如单测直调 sample）。
+            SourceSpec::Writable { value, .. } => value.clone(),
             SourceSpec::Random { min, max, .. } => {
                 // xorshift64* 生成 [0,1)，映射到 [min,max)
                 let mut x = self.lcg;
@@ -584,7 +683,7 @@ impl SourceState {
 // 连接生命周期
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TaskPlan {
     // TODO: PlanSnapshot 冻结字段，task id 用于诊断与任务级追踪，V1 仅内存使用未序列化但需保留
     #[allow(dead_code)]
@@ -598,7 +697,8 @@ struct TaskPlan {
 }
 
 /// configure 成功后的完整采集计划快照（§6.2 全量替换的原子单元）。
-#[derive(Debug)]
+/// control-handle 并发模型下 run 入口克隆整个快照，故需 Clone。
+#[derive(Debug, Clone)]
 struct PlanSnapshot {
     // TODO: PlanSnapshot 冻结字段，revision 为 §6.2 全量快照版本号，当前仅内存校验未持久化到 Driver 但需保留以备回放校验
     #[allow(dead_code)]
@@ -611,11 +711,20 @@ struct PlanSnapshot {
 
 #[derive(Debug, Default)]
 struct SimConnection {
-    plan: Option<PlanSnapshot>,
+    // 采集计划（control-handle 并发模型）：configure/apply 写锁替换，
+    // run 读锁克隆快照后释放再进循环，write/command 读锁查 slot。
+    // 快照整体 Clone（点位 Vec 小量，configure 低频）——禁止在 await 间持锁。
+    plan: std::sync::RwLock<Option<PlanSnapshot>>,
     faults: ConnFaults,
     /// 事件订阅计划（Event Plane V1 §6 全量快照，原子替换，与数据计划独立）。
     /// None/空 = 不发射任何事件；run() 只在有任务时起事件循环。
-    event_plan: Option<EventPlanSnapshot>,
+    event_plan: std::sync::RwLock<Option<EventPlanSnapshot>>,
+    /// Foundation-3 共享 control state：slot → 当前值（canonical Resource
+    /// 实例身份 → 值；采集与写入同口径，point_key 不进此处）。
+    /// configure 全量替换时重建（新快照即新真值）；write 原子 CAS 更新；
+    /// run 各任务循环实时读（Arc<RwLock> 广播语义，无单消费者抢消息）；
+    /// reset 恢复初值（实时生效，无需通知各 runtime copy——无 copy）。
+    control_state: Arc<std::sync::RwLock<std::collections::HashMap<String, Value>>>,
 }
 
 /// configure_events 成功后的事件订阅快照（revision 对应 ConfigureEventTasks.revision）。
@@ -630,7 +739,8 @@ struct EventPlanSnapshot {
 /// id 参与 event_id 构造（§2 去重键：同一 connection 的多个同流任务必须
 /// 生成互异 event_id，否则 PR7 的 UNIQUE(endpoint_id,event_id) 会把合法
 /// occurrence 当重复事件丢掉）。
-#[derive(Debug)]
+/// run 入口克隆事件计划，故需 Clone。
+#[derive(Debug, Clone)]
 struct SimEventTask {
     id: String,
     stream: SimEventStream,
@@ -663,7 +773,7 @@ impl SimEventStream {
 impl DriverConnection for SimConnection {
     /// Simulator 探测：无真实设备，返回确定性事实（合同基准）。
     /// 复用本连接（OpenConnection 已校验配置），不启动任何采集。
-    async fn probe(&mut self) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
+    async fn probe(&self) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
         use mesa_core_types::{CapabilityItem, CapabilityState};
         Ok(mesa_core_types::ProbeReport {
             reachable: true,
@@ -694,7 +804,7 @@ impl DriverConnection for SimConnection {
     }
 
     async fn configure(
-        &mut self,
+        &self,
         revision: u64,
         tasks: Vec<AcquisitionTask>,
     ) -> Result<Vec<PointDescriptor>, SdkDriverError> {
@@ -805,12 +915,31 @@ impl DriverConnection for SimConnection {
             tasks = new_tasks.len(),
             "plan built"
         );
-        self.plan = Some(PlanSnapshot {
+        // configure 全量替换：只重建被采集 slot 的初值（slot → initial），
+        // 绝不清空 control_state——未被采集的 control slot（"只写、不采集"）
+        // 独立于 acquisition plan 存活，configure 不得删除它们。
+        // 先算后存（new_points 不 move）。
+        let initial: Vec<(String, Value)> = new_points
+            .iter()
+            .filter_map(|p| match &p.source {
+                SourceSpec::Writable { slot, value } => Some((slot.clone(), value.clone())),
+                _ => None,
+            })
+            .collect();
+        // 写锁内整体替换（§6.2 原子切换；任一步失败在锁外早返回，旧计划不变）。
+        *self.plan.write().unwrap() = Some(PlanSnapshot {
             revision,
             points: new_points,
             tasks: new_tasks,
             map: None,
         });
+        {
+            let mut st = self.control_state.write().unwrap();
+            // merge 语义：被采集 slot 回到新快照初值；其他 control slot 原样保留。
+            for (slot, value) in initial {
+                st.insert(slot, value);
+            }
+        }
         Ok(descriptors)
     }
 
@@ -818,7 +947,7 @@ impl DriverConnection for SimConnection {
     /// （任务结构 + binding kind + stream 存在性），任一非法即整个 revision
     /// 失败且旧订阅保持不变（§35 原子切换）。
     async fn configure_events(
-        &mut self,
+        &self,
         revision: u64,
         tasks: Vec<EventTask>,
     ) -> Result<(), SdkDriverError> {
@@ -892,15 +1021,17 @@ impl DriverConnection for SimConnection {
             });
         }
         tracing::info!(revision, tasks = new_tasks.len(), "event plan built");
-        self.event_plan = Some(EventPlanSnapshot {
+        // 写锁内整体替换（失败路径在锁外早返回，旧订阅不变）。
+        *self.event_plan.write().unwrap() = Some(EventPlanSnapshot {
             revision,
             tasks: new_tasks,
         });
         Ok(())
     }
 
-    async fn apply_point_map(&mut self, map: PointMap) -> Result<(), SdkDriverError> {
-        let snapshot = self.plan.as_mut().ok_or_else(|| {
+    async fn apply_point_map(&self, map: PointMap) -> Result<(), SdkDriverError> {
+        let mut guard = self.plan.write().unwrap();
+        let snapshot = guard.as_mut().ok_or_else(|| {
             SdkDriverError::new(
                 ErrorKind::Internal,
                 "NOT_CONFIGURED",
@@ -920,15 +1051,23 @@ impl DriverConnection for SimConnection {
         Ok(())
     }
 
-    async fn run(
-        &mut self,
-        sink: DataSink,
-        shutdown: CancellationToken,
-    ) -> Result<(), SdkDriverError> {
-        let snapshot = self.plan.as_ref().ok_or_else(|| {
-            SdkDriverError::new(ErrorKind::Internal, "NO_PLAN", "run before configure+apply")
-        })?;
-        let map = snapshot.map.as_ref().ok_or_else(|| {
+    async fn run(&self, sink: DataSink, shutdown: CancellationToken) -> Result<(), SdkDriverError> {
+        // 读锁下克隆整个快照后立即释放（await 期间不持 std 锁；
+        // control 路径同期可并发读写，互不阻塞）。
+        let snapshot: PlanSnapshot = {
+            let guard = self.plan.read().unwrap();
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    SdkDriverError::new(
+                        ErrorKind::Internal,
+                        "NO_PLAN",
+                        "run before configure+apply",
+                    )
+                })?
+                .clone()
+        };
+        let map = snapshot.map.clone().ok_or_else(|| {
             SdkDriverError::new(
                 ErrorKind::Internal,
                 "NO_POINT_MAP",
@@ -937,11 +1076,16 @@ impl DriverConnection for SimConnection {
         })?;
 
         /// 组装某任务循环的 owned 运行单元（id + 规格 + 状态），不借用连接对象。
+        /// Writable 点的 live 值不走快照（run 循环经 control_state 实时读，
+        /// 广播语义，所有任务同见，无单消费者抢消息）。
         struct RuntimePoint {
             point_id: u32,
             spec: PointSpec,
             state: SourceState,
         }
+        // 共享 control state（Arc<RwLock> 广播：write/reset 原子更新，
+        // 各任务循环实时读；无 mpsc、无 capacity、无 try_send 丢写）。
+        let control_state = Arc::clone(&self.control_state);
         let build_runtime = |indices: &[usize]| -> Vec<RuntimePoint> {
             indices
                 .iter()
@@ -976,6 +1120,7 @@ impl DriverConnection for SimConnection {
             let faults = self.faults;
             let interval = Duration::from_millis(plan.interval_ms);
             let plan_burst = plan.burst;
+            let control_state = Arc::clone(&control_state);
             handles.push(tokio::spawn(async move {
                 // 本任务循环自身的批次序号：质量转换按"该任务第几批"计。
                 // 闭包返回 Result 以承载 SIMULATED_DISCONNECT 故障路径。
@@ -995,10 +1140,19 @@ impl DriverConnection for SimConnection {
                             let values: Vec<PointValue> = runtime
                                 .iter_mut()
                                 .map(|rp| {
-                                    let mut pv = PointValue::good(
-                                        rp.point_id,
-                                        rp.state.sample(&rp.spec.source, t_ms),
-                                    );
+                                    // Writable live 读：control_state 当前值
+                                    //（write/reset 原子更新，即时可见；reset
+                                    // 恢复初值同样实时生效，无 runtime copy）。
+                                    let v = match &rp.spec.source {
+                                        SourceSpec::Writable { slot, .. } => control_state
+                                            .read()
+                                            .unwrap()
+                                            .get(slot)
+                                            .cloned()
+                                            .unwrap_or(Value::F64(0.0)),
+                                        other => rp.state.sample(other, t_ms),
+                                    };
+                                    let mut pv = PointValue::good(rp.point_id, v);
                                     pv.quality = rp.spec.quality.at(batch_no);
                                     pv
                                 })
@@ -1040,19 +1194,21 @@ impl DriverConnection for SimConnection {
         }
         // 事件循环：仅当配置了非空事件计划才启动（无订阅不发射，
         // 避免无消费者的批次占用 Event Queue）。
-        if let Some(eplan) = &self.event_plan {
-            for task in &eplan.tasks {
-                let events = sink.events();
-                let shutdown = shutdown.clone();
-                let stream = task.stream;
-                let interval = Duration::from_millis(task.interval_ms);
-                let task_id = task.id.clone();
-                handles.push(tokio::spawn(async move {
-                    run_sim_event_task(events, shutdown, stream, event_epoch, task_id, interval)
-                        .await;
-                    Ok::<(), SdkDriverError>(())
-                }));
-            }
+        // 读锁下克隆事件任务后释放（await 期间不持锁）。
+        let event_tasks: Vec<SimEventTask> = {
+            let guard = self.event_plan.read().unwrap();
+            guard.as_ref().map(|e| e.tasks.clone()).unwrap_or_default()
+        };
+        for task in &event_tasks {
+            let events = sink.events();
+            let shutdown = shutdown.clone();
+            let stream = task.stream;
+            let interval = Duration::from_millis(task.interval_ms);
+            let task_id = task.id.clone();
+            handles.push(tokio::spawn(async move {
+                run_sim_event_task(events, shutdown, stream, event_epoch, task_id, interval).await;
+                Ok::<(), SdkDriverError>(())
+            }));
         }
         for h in handles {
             let _ = h.await;
@@ -1060,35 +1216,148 @@ impl DriverConnection for SimConnection {
         Ok(())
     }
 
+    /// Foundation-3 Reference Control：结构化 WriteTarget 三元组。
+    /// 仅 `writable` resource 的 `value` output 可写（access=ReadWrite）；
+    /// 其余 resource 即使存在也拒绝（OUTPUT_NOT_WRITABLE）。
+    /// 实例身份 = parameters.slot（canonical Resource 实例参数，采集与写入
+    /// 同口径；point_key 只是采集投影，不是 Write 身份）。
+    /// Control 资源空间与 Acquisition 投影解耦：control_state 是独立建模空间，
+    /// 未被任何采集任务选中的 slot 也可写（"只写、不采集"）；configure() 只
+    /// 重建被采集 slot 的初值，从不删除其他 slot（见 configure 注释）。
+    /// 写入值原子更新 control_state（被采集 slot 的读数即时可见）；expected
+    /// 为 Some 即 CAS：读-比-写在同一 RwLock 写守卫内完成，即真 CAS
+    ///（control-handle 模型下 run 读与 control 写并发，std RwLock 短临界区
+    /// 保证原子性）。
     async fn write(
-        &mut self,
-        target: &str,
-        _value: Value,
-        _expected: Option<Value>,
+        &self,
+        target: &mesa_core_types::WriteTarget,
+        value: Value,
+        expected: Option<Value>,
     ) -> Result<(), SdkDriverError> {
-        // Simulator 控制：若已配置则校验 target 合法性，否则直接成功（用于 probe 前的轻量校验）
-        if let Some(plan) = &self.plan
-            && !plan.points.iter().any(|p| p.key == target)
+        if target.resource_id != "writable" || target.output != "value" {
+            return Err(SdkDriverError::new(
+                ErrorKind::Unsupported,
+                "OUTPUT_NOT_WRITABLE",
+                format!(
+                    "target `{}/{}` 不可写（仅 writable/value 可写）",
+                    target.resource_id, target.output
+                ),
+            ));
+        }
+        // 值类型门：writable/value 恒 F64（与 Descriptor Fixed 一致）。
+        if value.data_type() != mesa_core_types::DataType::F64 {
+            return Err(SdkDriverError::new(
+                ErrorKind::Internal,
+                "VALUE_TYPE_MISMATCH",
+                format!("writable/value 期望 F64，实际 {:?}", value.data_type()),
+            ));
+        }
+        if let Some(exp) = &expected
+            && exp.data_type() != mesa_core_types::DataType::F64
         {
             return Err(SdkDriverError::new(
                 ErrorKind::Internal,
-                "TARGET_NOT_FOUND",
-                format!("target `{target}` not found"),
+                "VALUE_TYPE_MISMATCH",
+                format!("期望值期望 F64，实际 {:?}", exp.data_type()),
             ));
         }
+        // 实例身份：parameters.slot（required canonical 参数，Core 已过 schema）。
+        let slot = target
+            .parameters
+            .get("slot")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SdkDriverError::configuration(
+                    "INVALID_TARGET",
+                    "writable target.parameters.slot required（Resource 实例身份）",
+                )
+            })?;
+        // Control/Acquisition 解耦：control_state 是独立建模空间，
+        // 未被任何采集任务选中的 slot 也可写（"只写、不采集"）。
+        // 因此未知 slot 不再是 TARGET_NOT_FOUND——首次写入即创建该 slot
+        //（初值语义：从未写入时读为 F64(0.0)，与 run 侧缺省一致）。
+        let mut st = self.control_state.write().unwrap();
+        let current = st.get(slot).cloned().unwrap_or(Value::F64(0.0));
+        if let Some(exp) = expected
+            && current != exp
+        {
+            return Err(SdkDriverError::new(
+                ErrorKind::Internal,
+                "EXPECTED_MISMATCH",
+                format!("CAS 失败：当前 {current:?} ≠ 期望 {exp:?}"),
+            ));
+        }
+        st.insert(slot.to_string(), value);
         Ok(())
     }
 
+    /// Foundation-3 Reference command：仅执行 Descriptor 声明的 `reset`
+    ///（Core 已做存在性 + input 门禁；此处只做语义执行）。
+    /// reset 只恢复被采集 slot 的初值（configure 快照初值，实时生效，
+    /// 无 runtime copy、无需通知——run 循环直读 state）；未被采集的 control
+    /// slot 不受影响（与 configure 的 merge 语义一致）。幂等。
+    /// 返回 `{}`（与 result_schema 空对象一致；多余字段即违反自身契约）。
     async fn command(
-        &mut self,
+        &self,
         command: &str,
         args_json: &str,
     ) -> Result<serde_json::Value, SdkDriverError> {
         match command {
-            "reset" | "start" | "stop" | "fault" | "writable" => {
+            "reset" => {
                 let args: serde_json::Value =
                     serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
-                Ok(serde_json::json!({"command": command, "args": args, "status": "ok"}))
+                if !args.is_object() || !args.as_object().unwrap().is_empty() {
+                    return Err(SdkDriverError::new(
+                        ErrorKind::Internal,
+                        "INVALID_COMMAND_INPUT",
+                        "reset 不接受输入参数",
+                    ));
+                }
+                // 初值 = 当前 plan 快照各 writable 点的 initial；
+                // 只恢复被采集 slot，未被采集的 control slot 原样保留
+                //（读锁下查快照；control_state 写锁内恢复——两锁分离，先后获取不嵌套）。
+                let initials: Vec<(String, Value)> = {
+                    let guard = self.plan.read().unwrap();
+                    guard
+                        .as_ref()
+                        .map(|plan| {
+                            plan.points
+                                .iter()
+                                .filter_map(|p| match &p.source {
+                                    SourceSpec::Writable { slot, value } => {
+                                        Some((slot.clone(), value.clone()))
+                                    }
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let mut st = self.control_state.write().unwrap();
+                for (slot, value) in initials {
+                    st.insert(slot, value);
+                }
+                Ok(serde_json::json!({}))
+            }
+            // 终审 #2 回归命令：input_schema 已由 Core 门禁（flag 必填 bool）；
+            // flag=false 即业务失败 Err（Failed 终态 + 精确码），flag=true 即
+            // 成功返回 {}（过 result_schema）。Core 对 Failed 不得门禁 schema。
+            "fail_once" => {
+                let input: serde_json::Value =
+                    serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                match input.get("flag").and_then(|v| v.as_bool()) {
+                    Some(true) => Ok(serde_json::json!({})),
+                    Some(false) => Err(SdkDriverError::new(
+                        ErrorKind::Internal,
+                        "COMMAND_BUSINESS_FAILED",
+                        "fail_once flag=false 业务失败（回归用）",
+                    )),
+                    _ => Err(SdkDriverError::new(
+                        ErrorKind::Internal,
+                        "INVALID_COMMAND_INPUT",
+                        "fail_once 需要布尔 flag",
+                    )),
+                }
             }
             _ => Err(SdkDriverError::new(
                 ErrorKind::Unsupported,
@@ -1257,8 +1526,8 @@ mod tests {
         d.validate().expect("descriptor 必须合法");
         assert_eq!(
             d.resources.len(),
-            5,
-            "counter/sine/toggle/random/constant 全声明"
+            6,
+            "counter/sine/toggle/random/constant/writable 全声明"
         );
         // coverage 门：cases 必须覆盖全部 (resource, output) 声明对
         let declared: std::collections::BTreeSet<(String, String)> = d
@@ -1283,11 +1552,23 @@ mod tests {
                 serde_json::json!({"min": -5, "max": 5, "seed": 7}),
             ),
             ("constant", serde_json::json!({"value": 42})),
+            ("writable", serde_json::json!({"initial": 7, "slot": "a"})),
         ];
         let tested: std::collections::BTreeSet<(String, String)> = cases
             .iter()
             .map(|(r, _)| (r.to_string(), "value".to_string()))
             .collect();
+        // writable 空 parameters 即缺 slot（required）：单独断言拒绝，不进闭环表
+        {
+            let res = d.resources.iter().find(|r| r.id == "writable").unwrap();
+            let issues = res
+                .parameters
+                .validate_instance("parameters", &serde_json::json!({}));
+            assert!(
+                issues.iter().any(|i| i.path.contains("slot")),
+                "writable 缺 slot 必须拒绝: {issues:?}"
+            );
+        }
         assert_eq!(declared, tested, "测试必须覆盖全部声明对");
         for (resource_id, params) in cases {
             let res = d.resources.iter().find(|r| r.id == resource_id).unwrap();
@@ -1304,7 +1585,7 @@ mod tests {
                 "parameters": params,
                 "outputs": [{"output": "value", "point_key": format!("{resource_id}.value")}],
             }]);
-            let mut conn = SimConnection::default();
+            let conn = SimConnection::default();
             let descs = conn
                 .configure(1, vec![generic_task("t", sel)])
                 .await
@@ -1328,7 +1609,7 @@ mod tests {
             "parameters": {},
             "outputs": [{"output": "value", "point_key": "q.value"}],
         }]);
-        let mut conn = SimConnection::default();
+        let conn = SimConnection::default();
         let err = conn
             .configure(1, vec![generic_task("t", sel)])
             .await
@@ -1344,7 +1625,7 @@ mod tests {
             "parameters": {"min": 10, "max": -10},
             "outputs": [{"output": "value", "point_key": "r.value"}],
         }]);
-        let mut conn = SimConnection::default();
+        let conn = SimConnection::default();
         let err = conn
             .configure(1, vec![generic_task("t", sel)])
             .await
@@ -1363,7 +1644,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_rejects_duplicate_and_unknown_sources() {
-        let mut conn = SimConnection::default();
+        let conn = SimConnection::default();
         // duplicate：同一 task 内 point_key 出现两次 → 结构级拒绝
         //（validate_selections_structure 在 configure 内先执行，早于
         // DUPLICATE_POINT_KEY 的跨快照检查）。
@@ -1493,7 +1774,7 @@ mod tests {
     /// 高价值路径：configure -> apply -> 单次采样产出带正确 point_id 的值。
     #[tokio::test]
     async fn full_plan_produces_mapped_point_ids() {
-        let mut conn = SimConnection::default();
+        let conn = SimConnection::default();
         // constant + toggle 的 generic selections（legacy points 信封已删除）
         let task = generic_task(
             "t",
@@ -1515,7 +1796,8 @@ mod tests {
         .unwrap();
 
         // 直接驱动内部状态机验证映射结果（不起 IPC）
-        let snapshot = conn.plan.as_ref().unwrap();
+        let snapshot = conn.plan.read().unwrap();
+        let snapshot = snapshot.as_ref().unwrap();
         let mut states: Vec<(u32, SourceSpec, SourceState)> = snapshot
             .points
             .iter()
@@ -1556,7 +1838,7 @@ mod tests {
     /// PR8 P0：新标准 `mesa.events.v1` 被接受（Subscribe 缺省节奏 / Poll 自带周期）。
     #[tokio::test]
     async fn simulator_accepts_mesa_events_v1() {
-        let mut conn = SimConnection::default();
+        let conn = SimConnection::default();
         conn.configure_events(
             1,
             vec![
@@ -1571,13 +1853,22 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(conn.event_plan.as_ref().unwrap().tasks.len(), 2);
+        assert_eq!(
+            conn.event_plan
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .tasks
+                .len(),
+            2
+        );
     }
 
     /// Foundation-2：已删除的 legacy kind 即拒绝（字符串内联，生产侧无常量）。
     #[tokio::test]
     async fn simulator_legacy_binding_rejected() {
-        let mut conn = SimConnection::default();
+        let conn = SimConnection::default();
         let err = conn
             .configure_events(
                 1,
@@ -1599,7 +1890,7 @@ mod tests {
     /// 未知流精确报错。
     #[tokio::test]
     async fn unknown_event_stream_rejected() {
-        let mut conn = SimConnection::default();
+        let conn = SimConnection::default();
         let err = conn
             .configure_events(
                 1,

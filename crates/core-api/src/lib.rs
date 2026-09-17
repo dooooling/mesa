@@ -821,14 +821,18 @@ async fn import_endpoint(
     )
 }
 
+/// Foundation-3 #5.1 门：Control 请求入口比普通配置更 fail-closed。
+/// 未知字段（尤其 `expected_valeu` 这类 CAS 拼写错误）必须 400，
+/// 绝不静默退化为无条件写（expected=None）。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ControlWriteReq {
-    target: String,
+    // Foundation-3 单真值：结构化三元组（旧 string target 已删除，不留 shim）。
+    // value 唯一入口（JSON 标量经 json_to_value 映射，tag-object 经 Value
+    // 反序列化；第二入口 value_typed 已删除——终审 #4：双 value 真值歧义）。
+    target: mesa_core_types::WriteTarget,
     value: serde_json::Value,
     expected_value: Option<serde_json::Value>,
-    // 允许直接传 typed Value 的 tag 形式（兼容 Value 枚举序列化）
-    #[serde(default)]
-    value_typed: Option<mesa_core_types::Value>,
 }
 
 fn json_to_value(v: &serde_json::Value) -> Result<mesa_core_types::Value, String> {
@@ -897,25 +901,23 @@ async fn control_write(
         }
         Err(e) => return store_err_to_response(e),
     };
-    let _ = rec; // 已校验存在，具体 driver 能力由 Driver 二次校验
-    let target = body.target.trim();
-    if target.is_empty() {
+    let target = body.target;
+    if target.resource_id.trim().is_empty() || target.output.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json_error("VALIDATION_ERROR", "target required")),
+            Json(json_error(
+                "VALIDATION_ERROR",
+                "target.resource_id/output required",
+            )),
         );
     }
-    let value = if let Some(v) = body.value_typed {
-        v
-    } else {
-        match json_to_value(&body.value) {
-            Ok(v) => v,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json_error("VALIDATION_ERROR", &e)),
-                );
-            }
+    let value = match json_to_value(&body.value) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("VALIDATION_ERROR", &e)),
+            );
         }
     };
     let expected = if let Some(ev) = body.expected_value {
@@ -934,20 +936,43 @@ async fn control_write(
     } else {
         None
     };
+    // Foundation-3 Core Descriptor 门禁（结构化 WriteTarget）：
+    // descriptor → capabilities.write → resource/output/access →
+    // parameters schema → value/expected 类型。issues 非空即 400，
+    // 绝不把非法 target 送到 Driver。
+    let desc = match state.manager.get_descriptor(&rec.driver_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": { "code": e.code, "message": e.message } })),
+            );
+        }
+    };
+    let (issues, _) =
+        mesa_core_types::gate_write_against(&desc, &target, &value, &expected, "target");
+    if !issues.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "valid": false, "issues": issues })),
+        );
+    }
     // 控制面鉴权（V1 最小实现：本机 actor 放行并记录；见 authorize_control）。
     if let Err(e) = authorize_control("local-api") {
         return e;
     }
     // 审计 STARTED（同步插入；插入失败则拒绝控制——记不下来就不执行，
     // 绝不产生“执行了但无审计”的控制）。
+    // operation_id = resource_id/output 稳定身份（parameters 进 request_json）；
+    // Driver 私有地址字符串彻底退出审计。
     let request_id = format!("api-wr-{}-{}", id, mesa_core_types::now_unix_ns());
     let audit_started = mesa_config_store::ControlAuditRecord {
         request_id: request_id.clone(),
         endpoint_id: id.clone(),
         actor: "local-api".into(),
         operation_type: "write".into(),
-        operation_id: target.to_string(),
-        request_json: serde_json::json!({"target": target, "value": format!("{value:?}")})
+        operation_id: target.audit_id(),
+        request_json: serde_json::json!({"target": target, "value": format!("{value:?}"), "expected": expected.as_ref().map(|v| format!("{v:?}"))})
             .to_string(),
         result_json: None,
         status: "STARTED".into(),
@@ -966,7 +991,7 @@ async fn control_write(
     }
     match state
         .manager
-        .control_write(&id, target, value, expected, &request_id)
+        .control_write(&id, &target, value, expected, &request_id)
         .await
     {
         Ok(readback) => {
@@ -991,6 +1016,7 @@ async fn control_write(
             )
         }
         Err(e) => {
+            // write 路径：精确码直透（#5.2）。
             if let Err(e) = state.store.update_control_audit(
                 &request_id,
                 "FAILED",
@@ -999,10 +1025,16 @@ async fn control_write(
             ) {
                 warn_audit_update("control_audit FAILED", &request_id, e);
             }
+            // #5.2：精确码直透（EXPECTED_MISMATCH / EXPECTED_VALUE_UNSUPPORTED /
+            // TARGET_NOT_FOUND / OUTPUT_NOT_WRITABLE 等）；ENDPOINT_NOT_RUNNING
+            // 为 409；CONTROL_FAILED/CONTROL_MODEL_UNSUPPORTED 等传输/模型层
+            // 才为 502。客户端按 error.code 做 machine-readable 路由。
             let status = if e.code == "ENDPOINT_NOT_RUNNING" {
                 StatusCode::CONFLICT
-            } else {
+            } else if e.code == "CONTROL_FAILED" || e.code == "CONTROL_MODEL_UNSUPPORTED" {
                 StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
             };
             (
                 status,
@@ -1015,10 +1047,12 @@ async fn control_write(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ControlCommandReq {
-    command_id: Option<String>,
-    command: Option<String>,
-    input_json: Option<String>,
+    // Foundation-3 单真值：input 唯一合法形态（command_id 取 URL path）。
+    // 旧 command_id/command/input_json 形态已删除，不留 shim。
+    // 反序列化失败（含未知字段）即 400，不 fallback 为空 input（#5.1）。
+    #[serde(default)]
     input: Option<serde_json::Value>,
 }
 
@@ -1049,26 +1083,54 @@ async fn control_command(
         }
         Err(e) => return store_err_to_response(e),
     };
-    let _ = rec;
-    // 解析 body 中的 command_id / input
-    let parsed: ControlCommandReq =
-        serde_json::from_value(body.clone()).unwrap_or(ControlCommandReq {
-            command_id: None,
-            command: None,
-            input_json: None,
-            input: None,
-        });
-    let command_id = parsed.command_id.or(parsed.command).unwrap_or(cmd);
-    let input_json = if let Some(s) = parsed.input_json {
-        s
-    } else if let Some(v) = parsed.input {
-        serde_json::to_string(&v).unwrap_or("{}".into())
-    } else if body.is_object() && !body.as_object().unwrap().is_empty() {
-        // 将整个 body 当作 input（兼容前端直接传参对象）
-        serde_json::to_string(&body).unwrap_or("{}".into())
-    } else {
-        "{}".into()
+    // command_id 真值 = URL path；input 真值 = body.input（缺省 {}）。
+    // 旧 body 形态（command_id/command/input_json）整体拒绝——双真值已删除。
+    if let Some(obj) = body.as_object() {
+        for legacy in ["command_id", "command", "input_json"] {
+            if obj.contains_key(legacy) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_error(
+                        "VALIDATION_ERROR",
+                        &format!(
+                            "body.{legacy} 已删除：command_id 取 URL path，input 取 body.input"
+                        ),
+                    )),
+                );
+            }
+        }
+    }
+    let command_id = cmd;
+    // #5.1：反序列化失败（含未知字段/拼写错误）即 400，不 fallback 空 input。
+    let parsed: ControlCommandReq = match serde_json::from_value(body.clone()) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("VALIDATION_ERROR", &e.to_string())),
+            );
+        }
     };
+    let input = parsed.input.unwrap_or(serde_json::json!({}));
+    let input_json = serde_json::to_string(&input).unwrap_or("{}".into());
+    // Foundation-3 Core Descriptor 门禁：capabilities.method → command 声明 →
+    // input 过 input_schema。不存在的 command 绝不送 Driver。
+    let desc = match state.manager.get_descriptor(&rec.driver_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": { "code": e.code, "message": e.message } })),
+            );
+        }
+    };
+    let issues = mesa_core_types::gate_command_against(&desc, &command_id, &input, "command");
+    if !issues.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "valid": false, "issues": issues })),
+        );
+    }
     // 控制面鉴权（V1 最小实现，与 control_write 同策略）。
     if let Err(e) = authorize_control("local-api") {
         return e;
@@ -1102,28 +1164,94 @@ async fn control_command(
         .await
     {
         Ok((status, result_json, error)) => {
-            let audit_status = if status == "Succeeded" {
-                "COMPLETED"
-            } else {
-                "FAILED"
-            };
-            let detail = format!("{status}:{result_json}:{error}");
-            if let Err(e) = state.store.update_control_audit(
-                &request_id,
-                audit_status,
-                Some(&detail),
-                mesa_core_types::now_unix_ns(),
-            ) {
-                warn_audit_update("control_audit result", &request_id, e);
-            }
+            // Foundation-3 结果门禁（终审 #2 修正 + status 白名单 fail-closed）：
+            // 先验证 status（proto 只允许 Succeeded | Failed | TimedOut |
+            // Rejected | Cancelled）：未知 status 即 DRIVER_CONTRACT_VIOLATION
+            //（审计 FAILED，HTTP 502），不得当正常业务失败接受。
+            // 只有 Succeeded 才检查 result_schema；Failed 等正常终态直通。
+            // HTTP 语义：Succeeded(+schema 通过)→200；业务失败→200+status；
+            // schema 违反/未知 status→502 DRIVER_CONTRACT_VIOLATION。
             let result_val: serde_json::Value = serde_json::from_str(&result_json)
                 .unwrap_or(serde_json::Value::String(result_json.clone()));
-            (
-                StatusCode::OK,
-                Json(
-                    serde_json::json!({"request_id": request_id, "status": status, "result": result_val, "error": error}),
-                ),
-            )
+            match classify_command_status(&status) {
+                CommandStatusClass::BusinessFailure => {
+                    let detail = format!("{status}:{result_json}:{error}");
+                    if let Err(e) = state.store.update_control_audit(
+                        &request_id,
+                        "FAILED",
+                        Some(&detail),
+                        mesa_core_types::now_unix_ns(),
+                    ) {
+                        warn_audit_update("control_audit result", &request_id, e);
+                    }
+                    return (
+                        StatusCode::OK,
+                        Json(
+                            serde_json::json!({"request_id": request_id, "status": status, "result": result_val, "error": error}),
+                        ),
+                    );
+                }
+                CommandStatusClass::Unknown => {
+                    let detail = format!(
+                        "DRIVER_CONTRACT_VIOLATION:unknown command status `{status}`:{result_json}:{error}"
+                    );
+                    if let Err(e) = state.store.update_control_audit(
+                        &request_id,
+                        "FAILED",
+                        Some(&detail),
+                        mesa_core_types::now_unix_ns(),
+                    ) {
+                        warn_audit_update("control_audit result", &request_id, e);
+                    }
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(
+                            serde_json::json!({"error": {"code": "DRIVER_CONTRACT_VIOLATION", "message": detail}, "request_id": request_id}),
+                        ),
+                    );
+                }
+                CommandStatusClass::Succeeded => {}
+            }
+            let result_issues = mesa_core_types::gate_command_result_against(
+                &desc,
+                &command_id,
+                &result_val,
+                "command",
+            );
+            if result_issues.is_empty() {
+                // 能到这里 status 必为 Succeeded（白名单已分流），审计 COMPLETED。
+                let detail = format!("{status}:{result_json}:{error}");
+                if let Err(e) = state.store.update_control_audit(
+                    &request_id,
+                    "COMPLETED",
+                    Some(&detail),
+                    mesa_core_types::now_unix_ns(),
+                ) {
+                    warn_audit_update("control_audit result", &request_id, e);
+                }
+                (
+                    StatusCode::OK,
+                    Json(
+                        serde_json::json!({"request_id": request_id, "status": status, "result": result_val, "error": error}),
+                    ),
+                )
+            } else {
+                let detail = format!("DRIVER_CONTRACT_VIOLATION:{result_json}:{error}");
+                if let Err(e) = state.store.update_control_audit(
+                    &request_id,
+                    "FAILED",
+                    Some(&detail),
+                    mesa_core_types::now_unix_ns(),
+                ) {
+                    warn_audit_update("control_audit result", &request_id, e);
+                }
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(
+                        serde_json::json!({"error": {"code": "DRIVER_CONTRACT_VIOLATION", "message": detail}, "request_id": request_id}),
+                    ),
+                )
+            }
         }
         Err(e) => {
             if let Err(e) = state.store.update_control_audit(
@@ -1145,6 +1273,63 @@ async fn control_command(
                     serde_json::json!({"error": {"code": e.code, "message": e.message}, "request_id": request_id}),
                 ),
             )
+        }
+    }
+}
+
+/// Command status 白名单分类（终审 fail-closed）：proto 只允许
+/// `Succeeded | Failed | TimedOut | Rejected | Cancelled`。
+/// 未知 status（如 `""` / `"Failure"` / `"Bogus"`，含大小写漂移）即
+/// Driver contract violation，不得当正常业务失败接受（HTTP 200）。
+#[derive(Debug, PartialEq)]
+enum CommandStatusClass {
+    Succeeded,
+    BusinessFailure,
+    Unknown,
+}
+
+fn classify_command_status(status: &str) -> CommandStatusClass {
+    match status {
+        "Succeeded" => CommandStatusClass::Succeeded,
+        "Failed" | "TimedOut" | "Rejected" | "Cancelled" => CommandStatusClass::BusinessFailure,
+        _ => CommandStatusClass::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod command_status_tests {
+    use super::*;
+
+    /// 终审回归门：status 白名单 fail-closed。
+    /// `Bogus`/`""`/`"Failure"`（含大小写漂移）必须判 Unknown，
+    /// 绝不能按普通 Failed 返回 200。
+    #[test]
+    fn command_status_whitelist_is_fail_closed() {
+        assert_eq!(
+            classify_command_status("Succeeded"),
+            CommandStatusClass::Succeeded
+        );
+        for s in ["Failed", "TimedOut", "Rejected", "Cancelled"] {
+            assert_eq!(
+                classify_command_status(s),
+                CommandStatusClass::BusinessFailure,
+                "{s}"
+            );
+        }
+        for s in [
+            "",
+            "Failure",
+            "Bogus",
+            "succeeded",
+            "FAILED",
+            "Timeout",
+            "Cancel",
+        ] {
+            assert_eq!(
+                classify_command_status(s),
+                CommandStatusClass::Unknown,
+                "{s}"
+            );
         }
     }
 }
