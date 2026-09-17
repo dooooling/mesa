@@ -460,6 +460,9 @@ impl MesaManager {
     /// Control 队列转发结构化 WriteTarget，永不 Latest-Wins。
     /// 协商 minor < 6 的旧端直接 CONTROL_MODEL_UNSUPPORTED（不 fallback
     /// 旧字符串 target；wire 兼容 ≠ 产品双轨）。
+    /// 并发：只短暂持有 registry 读锁克隆 Arc，随即释放；`sess.write`
+    /// 经 session 内 writer 锁 + pending 表串行——与 event_loop 持有的
+    /// session_arc 全局锁无关（终审 #2 根因：全局锁串行致 RUNNING 超时）。
     pub async fn control_write(
         &self,
         endpoint_id: &str,
@@ -478,21 +481,37 @@ impl MesaManager {
                 format!("endpoint `{endpoint_id}` not running"),
             )
         })?;
-        let sess = sess_arc.lock().await;
-        if sess.negotiated_minor() < mesa_driver_protocol::CONTROL_MODEL_MIN_MINOR {
+        // 只读 negotiated_minor（&self 方法，无锁）后释放；write 本体经
+        // session 内 writer 锁 + pending 表串行——与 run_config_flow/event_loop
+        // 持有的 session_arc 全局锁无关（#2 根因即全局锁串行致 RUNNING 超时，
+        // 已改为细粒度 session 内锁；此处不再长持 session_arc）。
+        let minor = sess_arc.lock().await.negotiated_minor();
+        if minor < mesa_driver_protocol::CONTROL_MODEL_MIN_MINOR {
             return Err(DescriptorError::new(
                 "CONTROL_MODEL_UNSUPPORTED",
                 format!(
-                    "negotiated minor {} < {} (structured write 需要 IPC 1.6)",
-                    sess.negotiated_minor(),
+                    "structured write 需要 IPC 1.6 (negotiated minor < {})",
                     mesa_driver_protocol::CONTROL_MODEL_MIN_MINOR,
                 ),
             ));
         }
         // 约定 handle 1 为 Endpoint 主连接（endpoint.rs HANDLE=1），request_id 贯穿审计
-        sess.write(1, request_id, target, value, expected)
+        sess_arc
+            .lock()
             .await
-            .map_err(|e| DescriptorError::new("CONTROL_FAILED", format!("{e}")))
+            .write(1, request_id, target, value, expected)
+            .await
+            .map_err(|e| match e {
+                // #5.2：Driver 精确码原样保留（EXPECTED_MISMATCH /
+                // EXPECTED_VALUE_UNSUPPORTED / TARGET_NOT_FOUND 等直透 REST）；
+                // 传输层失败（Timeout/Closed/Handshake）才映射 CONTROL_FAILED。
+                crate::session::SessionError::Remote {
+                    kind: _,
+                    code,
+                    message,
+                } => DescriptorError::new(&code, message),
+                other => DescriptorError::new("CONTROL_FAILED", format!("{other}")),
+            })
     }
 
     /// Control Command（§22）：可靠转发，返回 (status, result_json, error)
@@ -516,7 +535,17 @@ impl MesaManager {
         let sess = sess_arc.lock().await;
         sess.command(1, request_id, command_id, input_json)
             .await
-            .map_err(|e| DescriptorError::new("CONTROL_FAILED", format!("{e}")))
+            .map_err(|e| match e {
+                // #5.2 同 write：传输失败才 CONTROL_FAILED；CommandResponse
+                // 自带 status/error 形态（Driver 语义错误走 status=Failed，
+                // 不经 SessionError），此处只映射传输层。
+                crate::session::SessionError::Remote {
+                    kind: _,
+                    code,
+                    message,
+                } => DescriptorError::new(&code, message),
+                other => DescriptorError::new("CONTROL_FAILED", format!("{other}")),
+            })
     }
 
     /// 供 Endpoint 运行时注册/注销活跃会话（§22 Control 面）

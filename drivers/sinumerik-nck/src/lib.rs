@@ -200,7 +200,7 @@ impl Driver for SinumerikNckDriver {
             cfg,
             catalog,
             topology: None,
-            plan: None,
+            plan: std::sync::RwLock::new(None),
         }))
     }
 }
@@ -226,7 +226,8 @@ struct TaskPlan {
     point_indices: Vec<usize>,
 }
 
-#[derive(Debug)]
+/// control-handle 并发模型下 run 入口克隆整个快照，故需 Clone。
+#[derive(Debug, Clone)]
 struct PlanSnapshot {
     revision: u64,
     points: Vec<PointSpec>,
@@ -238,8 +239,11 @@ pub struct NckConnection {
     cfg: NckConnConfig,
     catalog: NckCatalog,
     /// 拓扑快照（probe 回填；V1 恒 None，browse 退化为纯 Catalog 树）。
+    /// 只读（当前无回填写路径），control-handle 下天然 &self 兼容。
     topology: Option<NckTopology>,
-    plan: Option<PlanSnapshot>,
+    // 采集计划（control-handle 并发模型）：configure/apply 写锁替换，
+    // run 读锁克隆快照后释放；catalog/topology 只读。
+    plan: std::sync::RwLock<Option<PlanSnapshot>>,
 }
 
 impl NckConnection {
@@ -249,7 +253,7 @@ impl NckConnection {
             cfg,
             catalog,
             topology: None,
-            plan: None,
+            plan: std::sync::RwLock::new(None),
         }
     }
 }
@@ -382,14 +386,14 @@ fn pack_array(kind: NckDataKind, elems: Vec<mesa_core_types::Value>) -> mesa_cor
 impl DriverConnection for NckConnection {
     /// 探测：S7Comm 会话可达性（reachable），身份恒待确认
     /// （family/model 为 None + `NCK_ANCHOR_PENDING`，见 probe）。
-    async fn probe(&mut self) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
+    async fn probe(&self) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
         Ok(probe_with_session(&self.cfg).await)
     }
 
     /// 通用绑定 `mesa.resources.v1`（resource_id `variable`）→ Catalog →
     /// PointDescriptor。未知变量/非法参数即配置拒绝（fail-closed，不进运行期）。
     async fn configure(
-        &mut self,
+        &self,
         revision: u64,
         tasks: Vec<AcquisitionTask>,
     ) -> Result<Vec<PointDescriptor>, SdkDriverError> {
@@ -520,7 +524,8 @@ impl DriverConnection for NckConnection {
             tasks = new_tasks.len(),
             "NCK 采集计划构建完成"
         );
-        self.plan = Some(PlanSnapshot {
+        // 写锁内整体替换（§6.2 原子切换；失败路径在锁外早返回）。
+        *self.plan.write().unwrap() = Some(PlanSnapshot {
             revision,
             points: new_points,
             tasks: new_tasks,
@@ -529,8 +534,9 @@ impl DriverConnection for NckConnection {
         Ok(descriptors)
     }
 
-    async fn apply_point_map(&mut self, map: PointMap) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_mut().ok_or_else(|| {
+    async fn apply_point_map(&self, map: PointMap) -> Result<(), SdkDriverError> {
+        let mut guard = self.plan.write().unwrap();
+        let snap = guard.as_mut().ok_or_else(|| {
             SdkDriverError::new(
                 mesa_core_types::ErrorKind::Internal,
                 "NOT_CONFIGURED",
@@ -552,20 +558,27 @@ impl DriverConnection for NckConnection {
     /// Poll 数据面：建会话 → 每任务独立 ticker → MultiRead → 解码发布。
     /// 会话/整包失败即 Err（fail 当前 attempt，Manager 重建）；单点 BAD 隔离。
     async fn run(
-        &mut self,
+        &self,
         sink: mesa_driver_sdk::DataSink,
         shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<(), SdkDriverError> {
         use mesa_core_types::{DataBatch, PointValue, Value, now_unix_ns};
         use std::sync::atomic::{AtomicU64, Ordering};
-        let snap = self.plan.as_ref().ok_or_else(|| {
-            SdkDriverError::new(
-                mesa_core_types::ErrorKind::Internal,
-                "NO_PLAN",
-                "run 前未 configure+apply",
-            )
-        })?;
-        let map = snap.map.as_ref().ok_or_else(|| {
+        // 读锁下克隆整个快照后释放（await 期间不持 std 锁）。
+        let snapshot: PlanSnapshot = {
+            let guard = self.plan.read().unwrap();
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    SdkDriverError::new(
+                        mesa_core_types::ErrorKind::Internal,
+                        "NO_PLAN",
+                        "run 前未 configure+apply",
+                    )
+                })?
+                .clone()
+        };
+        let map = snapshot.map.clone().ok_or_else(|| {
             SdkDriverError::new(
                 mesa_core_types::ErrorKind::Internal,
                 "NO_POINT_MAP",
@@ -577,9 +590,9 @@ impl DriverConnection for NckConnection {
             e
         })?;
         tracing::info!(
-            revision = snap.revision,
-            points = snap.points.len(),
-            tasks = snap.tasks.len(),
+            revision = snapshot.revision,
+            points = snapshot.points.len(),
+            tasks = snapshot.tasks.len(),
             "NCK 数据面启动",
         );
         let client = std::sync::Arc::new(tokio::sync::Mutex::new(client));
@@ -588,12 +601,12 @@ impl DriverConnection for NckConnection {
         // 在多 task 下会饿死错误传播：健康的无限 Poll task 排在前面时，
         // 后面 task 的 Err 永远等不到 cancel，run() 不返回，Manager 不重建。
         let mut set: tokio::task::JoinSet<Result<(), SdkDriverError>> = tokio::task::JoinSet::new();
-        for task in &snap.tasks {
+        for task in &snapshot.tasks {
             let indices = task.point_indices.clone();
             let points: Vec<(PointSpec, u32)> = indices
                 .iter()
                 .map(|&i| {
-                    let p = snap.points[i].clone();
+                    let p = snapshot.points[i].clone();
                     let pid = map[&p.key];
                     (p, pid)
                 })
@@ -694,7 +707,7 @@ impl DriverConnection for NckConnection {
     /// 浏览：Catalog 虚拟树（纯函数，无需会话；topology 由 probe 回填，
     /// V1 为空即纯 Catalog 树）。未知 parent → 空页。
     async fn browse(
-        &mut self,
+        &self,
         parent: &str,
         filter: &str,
         cursor: &str,
@@ -805,7 +818,7 @@ mod tests {
     #[tokio::test]
     async fn probe_honest_and_browse_empty_catalog() {
         // 空 catalog：browse 根为空页（不伪造内容）；probe 可达但身份待确认。
-        let mut conn = NckConnection::with_catalog(
+        let conn = NckConnection::with_catalog(
             NckConnConfig::from_json(&serde_json::json!({
                 "host": "10.0.0.5", "family": "840d-sl",
                 "local_tsap": 256, "remote_tsap": 258,
@@ -902,7 +915,7 @@ mod tests {
             mesa_core_types::OutputTypeSpec::DriverResolved
         );
         // count=1 → F64（catalog data_type）
-        let mut conn = conn_with_synthetic();
+        let conn = conn_with_synthetic();
         let params = serde_json::json!({
             "area": "C", "area_no": 1, "block": "SEMA",
             "variable": "actFeedRate", "line": 3,
@@ -929,7 +942,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_ok_and_rejects() {
-        let mut conn = conn_with_synthetic();
+        let conn = conn_with_synthetic();
         // 合法：descriptor 类型 F64 + unit 回填。
         let descs = conn
             .configure(1, vec![poll_task("t1", speed_selection("axis3.speed"))])

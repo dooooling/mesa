@@ -535,7 +535,10 @@ async fn attempt_session(
         source.revision(&cfg.endpoint_id),
     );
 
-    // 事件循环期间保持会话注册，Control 请求通过同一 session_arc 的 Mutex 串行化
+    // 事件循环期间保持会话注册。Control 与 event_loop 并发执行：
+    // control_write/command 经 session 内 writer 锁 + pending 表串行，
+    // 不与 event_loop 抢同一 Core 侧 Mutex（此前 session_arc 全局锁是
+    // Control RUNNING 超时的根因——event_loop 持锁期间 write 排队 10s）。
     let outcome = event_loop(
         cfg,
         snapshot,

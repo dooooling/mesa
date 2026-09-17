@@ -215,7 +215,7 @@ impl Driver for S7Driver {
         let s7cfg = S7ConnConfig::from_json(&v)?;
         Ok(Box::new(S7Connection {
             cfg: s7cfg,
-            plan: None,
+            plan: std::sync::RwLock::new(None),
         }))
     }
 }
@@ -269,7 +269,7 @@ struct PointSpec {
     data_type: DataType,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TaskPlan {
     // TODO: PlanSnapshot 冻结字段，task id 用于诊断与多任务追踪，V1 仅内存使用但需保留
     #[allow(dead_code)]
@@ -278,7 +278,8 @@ struct TaskPlan {
     point_indices: Vec<usize>,
 }
 
-#[derive(Debug)]
+/// control-handle 并发模型下 run 入口克隆整个快照，故需 Clone。
+#[derive(Debug, Clone)]
 struct PlanSnapshot {
     // TODO: PlanSnapshot 冻结字段，revision 为 §6.2 全量快照版本号，需保留以备 Driver 侧原子校验与回放
     #[allow(dead_code)]
@@ -291,7 +292,9 @@ struct PlanSnapshot {
 #[derive(Debug)]
 struct S7Connection {
     cfg: S7ConnConfig,
-    plan: Option<PlanSnapshot>,
+    // 采集计划（control-handle 并发模型）：configure/apply 写锁替换，
+    // run 读锁克隆快照后释放再建会话；write 自建短连接，无 mutation。
+    plan: std::sync::RwLock<Option<PlanSnapshot>>,
 }
 
 // 连续区合并的批量结构，供 run 内合并与单元测试复用
@@ -371,7 +374,7 @@ impl DriverConnection for S7Connection {
     /// NOTE: 1200/1500 区分需正式 MLFB 映射依据，确认前 family 恒为 None，
     /// 可达但信息不足时不得过度推断（宁缺毋滥）。
     /// 配置已在 OpenConnection 校验；短连接随函数返回 drop，不进入采集计划。
-    async fn probe(&mut self) -> Result<ProbeReport, SdkDriverError> {
+    async fn probe(&self) -> Result<ProbeReport, SdkDriverError> {
         let cfg = self.cfg.clone();
         let mut client = match S7Client::connect(cfg).await {
             Ok(c) => c,
@@ -438,7 +441,7 @@ impl DriverConnection for S7Connection {
     }
 
     async fn configure(
-        &mut self,
+        &self,
         revision: u64,
         tasks: Vec<AcquisitionTask>,
     ) -> Result<Vec<PointDescriptor>, SdkDriverError> {
@@ -702,7 +705,8 @@ impl DriverConnection for S7Connection {
             tasks = new_tasks.len(),
             "S7 采集计划构建完成"
         );
-        self.plan = Some(PlanSnapshot {
+        // 写锁内整体替换（§6.2 原子切换；失败路径在锁外早返回）。
+        *self.plan.write().unwrap() = Some(PlanSnapshot {
             revision,
             points: new_points,
             tasks: new_tasks,
@@ -711,8 +715,9 @@ impl DriverConnection for S7Connection {
         Ok(descriptors)
     }
 
-    async fn apply_point_map(&mut self, map: PointMap) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_mut().ok_or_else(|| {
+    async fn apply_point_map(&self, map: PointMap) -> Result<(), SdkDriverError> {
+        let mut guard = self.plan.write().unwrap();
+        let snap = guard.as_mut().ok_or_else(|| {
             SdkDriverError::new(
                 mesa_core_types::ErrorKind::Internal,
                 "NOT_CONFIGURED",
@@ -731,19 +736,22 @@ impl DriverConnection for S7Connection {
         Ok(())
     }
 
-    async fn run(
-        &mut self,
-        sink: DataSink,
-        shutdown: CancellationToken,
-    ) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_ref().ok_or_else(|| {
-            SdkDriverError::new(
-                mesa_core_types::ErrorKind::Internal,
-                "NO_PLAN",
-                "run 前未 configure+apply",
-            )
-        })?;
-        let map = snap.map.as_ref().ok_or_else(|| {
+    async fn run(&self, sink: DataSink, shutdown: CancellationToken) -> Result<(), SdkDriverError> {
+        // 读锁下克隆整个快照后释放（await 期间不持 std 锁）。
+        let snapshot: PlanSnapshot = {
+            let guard = self.plan.read().unwrap();
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    SdkDriverError::new(
+                        mesa_core_types::ErrorKind::Internal,
+                        "NO_PLAN",
+                        "run 前未 configure+apply",
+                    )
+                })?
+                .clone()
+        };
+        let map = snapshot.map.clone().ok_or_else(|| {
             SdkDriverError::new(
                 mesa_core_types::ErrorKind::Internal,
                 "NO_POINT_MAP",
@@ -765,12 +773,12 @@ impl DriverConnection for S7Connection {
         // P1-1：JoinSet（哪个 task 先结束就先观察哪个；顺序 await 会在多 task
         // 下饿死错误传播，与 opcua/sinumerik-nck 同口径）。
         let mut set: tokio::task::JoinSet<Result<(), SdkDriverError>> = tokio::task::JoinSet::new();
-        for task in &snap.tasks {
+        for task in &snapshot.tasks {
             let indices = task.point_indices.clone();
             let points: Vec<(PointSpec, u32)> = indices
                 .iter()
                 .map(|&i| {
-                    let p = snap.points[i].clone();
+                    let p = snapshot.points[i].clone();
                     let pid = map[&p.key];
                     (p, pid)
                 })
@@ -959,7 +967,7 @@ impl DriverConnection for S7Connection {
     /// 直接地址字符串模式已删除（Core 永不传私有地址）。
     /// 完整 S7 Write（含全类型 bytes 编码 + 真机 Gate）另立任务。
     async fn write(
-        &mut self,
+        &self,
         target: &mesa_core_types::WriteTarget,
         value: mesa_core_types::Value,
         expected: Option<mesa_core_types::Value>,
@@ -1054,7 +1062,7 @@ impl DriverConnection for S7Connection {
     }
 
     async fn command(
-        &mut self,
+        &self,
         command: &str,
         _args_json: &str,
     ) -> Result<serde_json::Value, SdkDriverError> {
@@ -1088,9 +1096,9 @@ mod tests {
 
     #[tokio::test]
     async fn configure_ok_and_duplicate_rejected() {
-        let mut conn = S7Connection {
+        let conn = S7Connection {
             cfg: S7ConnConfig::default(),
-            plan: None,
+            plan: std::sync::RwLock::new(None),
         };
         // generic 双点：REAL + BOOL
         let sel = serde_json::json!([
@@ -1126,9 +1134,9 @@ mod tests {
 
     #[tokio::test]
     async fn bool_requires_bit() {
-        let mut conn = S7Connection {
+        let conn = S7Connection {
             cfg: S7ConnConfig::default(),
-            plan: None,
+            plan: std::sync::RwLock::new(None),
         };
         // BOOL 缺 bit（generic canonical 参数面）
         let sel = serde_json::json!([{"resource_id":"memory","parameters":{"area":"DB","db":10,"offset":0,"data_type":"BOOL"},"outputs":[{"output":"value","point_key":"a"}]}]);
@@ -1207,9 +1215,9 @@ mod tests {
                 "{dt}"
             );
             // ③ generic configure → PointDescriptor 一致
-            let mut conn = S7Connection {
+            let conn = S7Connection {
                 cfg: S7ConnConfig::default(),
-                plan: None,
+                plan: std::sync::RwLock::new(None),
             };
             let descs = conn
                 .configure(1, vec![generic_task(memory_selection("k", params))])
@@ -1303,9 +1311,9 @@ mod tests {
             ),
         ];
         for (name, params, code) in cases {
-            let mut conn = S7Connection {
+            let conn = S7Connection {
                 cfg: S7ConnConfig::default(),
-                plan: None,
+                plan: std::sync::RwLock::new(None),
             };
             let err = conn
                 .configure(1, vec![generic_task(memory_selection("k", params))])
@@ -1314,9 +1322,9 @@ mod tests {
             assert_eq!(err.code, code, "{name}");
         }
         // C 区 WORD 合法（2 字节语义成立）
-        let mut conn = S7Connection {
+        let conn = S7Connection {
             cfg: S7ConnConfig::default(),
-            plan: None,
+            plan: std::sync::RwLock::new(None),
         };
         let descs = conn
             .configure(
@@ -1331,9 +1339,9 @@ mod tests {
         assert_eq!(descs[0].data_type, mesa_core_types::DataType::U32);
         // PI + BYTE/REAL 按档输出标签（拒绝固定 W）
         for (dt, want) in [("BYTE", "PIB0"), ("WORD", "PIW0"), ("REAL", "PID0")] {
-            let mut conn = S7Connection {
+            let conn = S7Connection {
                 cfg: S7ConnConfig::default(),
-                plan: None,
+                plan: std::sync::RwLock::new(None),
             };
             let descs = conn
                 .configure(
@@ -1353,9 +1361,9 @@ mod tests {
     #[tokio::test]
     async fn generic_rejects_peripheral_bool() {
         for area in ["PI", "PQ"] {
-            let mut conn = S7Connection {
+            let conn = S7Connection {
                 cfg: S7ConnConfig::default(),
-                plan: None,
+                plan: std::sync::RwLock::new(None),
             };
             let sel = serde_json::json!([{"resource_id":"memory","parameters":{"area":area,"offset":0,"data_type":"BOOL","bit":3},"outputs":[{"output":"value","point_key":"k"}]}]);
             let err = conn
@@ -1429,13 +1437,13 @@ mod tests {
     #[tokio::test]
     async fn probe_refused_port_is_unreachable_not_error() {
         // 127.0.0.1:9 预期关闭：连接被拒 → Ok(unreachable)，不是 Err
-        let mut conn = S7Connection {
+        let conn = S7Connection {
             cfg: S7ConnConfig {
                 host: "127.0.0.1".into(),
                 port: 9,
                 ..Default::default()
             },
-            plan: None,
+            plan: std::sync::RwLock::new(None),
         };
         let r = conn.probe().await.expect("不可达是探测结果，不应 Err");
         assert!(!r.reachable);

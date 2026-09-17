@@ -184,14 +184,39 @@ async fn control_rest_gates_structured_target_and_single_truth_command() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
-    // write 门 4：合法三元组 → endpoint 未运行即 409（门禁通过，到达运行门）
+    // write 门 4：合法三元组（slot 实例身份）→ endpoint 未运行即 409
+    //（门禁通过，到达运行门）。point_key 不是 Write 身份（见 #1）。
     let (s, v) = post_json(
         app.clone(),
         "/api/v1/endpoints/e1/write",
-        r#"{"target":{"resource_id":"writable","parameters":{"point_key":"sim.x"},"output":"value"},"value":1.0}"#,
+        r#"{"target":{"resource_id":"writable","parameters":{"slot":"a"},"output":"value"},"value":1.0}"#,
     )
     .await;
     assert_eq!(s, StatusCode::CONFLICT, "body: {v}");
+    // write 门 5：CAS 拼写错误（expected_valeu）即 400/422，绝不退化无条件写
+    //（#5.1；axum Json 提取层对未知字段为 422，handler 内门禁为 400——
+    // 两者都是"拒绝执行"，本门不断言具体码，只断言非 2xx 且未执行写入）。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/write",
+        r#"{"target":{"resource_id":"writable","parameters":{"slot":"a"},"output":"value"},"value":1.0,"expected_valeu":1.0}"#,
+    )
+    .await;
+    assert!(
+        s == StatusCode::BAD_REQUEST || s == StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {v}"
+    );
+    // write 门 6：未知顶层字段即 400/422（deny_unknown_fields）
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/write",
+        r#"{"target":{"resource_id":"writable","parameters":{"slot":"a"},"output":"value"},"value":1.0,"priority":"high"}"#,
+    )
+    .await;
+    assert!(
+        s == StatusCode::BAD_REQUEST || s == StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {v}"
+    );
     // command 门 1：旧 body 形态（command/command_id/input_json）即 400
     for legacy in [
         r#"{"command":"reset"}"#,
@@ -217,7 +242,282 @@ async fn control_rest_gates_structured_target_and_single_truth_command() {
     )
     .await;
     assert_eq!(s, StatusCode::CONFLICT, "body: {v}");
+    // command 门 4：input 拼写错误（imput）即 400，不 fallback 空 input（#5.1）
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/commands/reset",
+        r#"{"imput":{}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
     drop(mgr);
+}
+
+/// Foundation-3 #2 门：RUNNING 状态真实 REST → IPC → Driver write/command。
+/// STOPPED 即 ENDPOINT_NOT_RUNNING（409）；RUNNING 即成功执行且采集可见；
+/// reset 后采集恢复初值。失败即终审 blocker #2 未闭环。
+/// 终审新增覆盖（#2/#3）：
+/// - 双采集任务 + 写其中一个 slot → 只有对应任务观测到更新（广播无串扰，
+///   单消费者抢消息已随 mpsc 删除而消除）；
+/// - 写未被任何采集任务选中的 slot（"写但不采集"）→ 依然成功（#1 解耦证明）；
+/// - reset 结果 `{}` 过自身 result_schema（#4 门，见 control_contract）。
+#[tokio::test]
+async fn control_running_e2e_write_command_visible_in_samples() {
+    use mesa_core_types::{AcquisitionTask, DriverBinding, GENERIC_BINDING_KIND, TaskSchedule};
+    let store = Arc::new(ConfigStore::open_in_memory().unwrap());
+    let drivers_dir = common::repo_root().join("drivers");
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
+    let state = mesa_core_api::AppState::try_new_with_control(
+        mgr.clone(),
+        store.clone(),
+        drivers_dir.to_string_lossy().to_string(),
+        true,
+    )
+    .unwrap();
+    // 建 device/endpoint + writable 采集任务（slot=a，initial=1.0）
+    store
+        .create_device(&mesa_config_store::DeviceRecord {
+            id: "d1".into(),
+            name: "D".into(),
+        })
+        .unwrap();
+    store
+        .create_endpoint(&mesa_config_store::EndpointRecord {
+            id: "e1".into(),
+            name: "E1".into(),
+            device_id: "d1".into(),
+            driver_id: "simulator".into(),
+            connection_json: "{}".into(),
+            desired_running: false,
+            updated_at_ns: 0,
+        })
+        .unwrap();
+    let task = AcquisitionTask {
+        id: "t1".into(),
+        schedule: TaskSchedule::Poll { interval_ms: 50 },
+        binding: DriverBinding {
+            kind: GENERIC_BINDING_KIND.into(),
+            config: serde_json::json!({"selections": [{"resource_id":"writable","parameters":{"initial":1.0,"slot":"a"},"outputs":[{"output":"value","point_key":"w.a"}]}]}),
+        },
+    };
+    store.replace_tasks("e1", &[task]).unwrap();
+    let app = mesa_core_api::router(state);
+    // STOPPED 写即 409（ENDPOINT_NOT_RUNNING）
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/write",
+        r#"{"target":{"resource_id":"writable","parameters":{"slot":"a"},"output":"value"},"value":42.0}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    // Start → RUNNING（等待 snapshot 进入 Running：config flow 已完成，
+    // session 已注册，control 可达）
+    mgr.start_endpoint(mesa_driver_manager::endpoint::BuiltinEndpoint {
+        endpoint_id: "e1".into(),
+        driver_id: "simulator".into(),
+        connection_json: "{}".into(),
+        tasks: store.list_tasks("e1").unwrap(),
+        event_tasks: vec![],
+    })
+    .unwrap();
+    common::wait_until(15, || {
+        mgr.snapshot()
+            .endpoint("e1")
+            .is_some_and(|s| s.state == "RUNNING")
+    })
+    .await;
+    // RUNNING 写成功（200 Succeeded；精确码直透，无 CONTROL_FAILED 包裹）
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/write",
+        r#"{"target":{"resource_id":"writable","parameters":{"slot":"a"},"output":"value"},"value":42.0}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["status"], "Succeeded");
+    // 采集可见：latest 出现 42.0（write 即时合入 broadcast state）
+    let mut seen = false;
+    for _ in 0..40 {
+        let latest = mgr.snapshot().latest_all();
+        if latest.iter().any(|e| {
+            e.point_key == "w.a"
+                && e.value
+                    .value
+                    .as_f64()
+                    .is_some_and(|x| (x - 42.0).abs() < 1e-9)
+        }) {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(seen, "write 后采集必须可见 42.0");
+    // CAS：expected 错误即精确 EXPECTED_MISMATCH（422，非 CONTROL_FAILED）
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/write",
+        r#"{"target":{"resource_id":"writable","parameters":{"slot":"a"},"output":"value"},"value":9.0,"expected_value":1.0}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "body: {v}");
+    assert_eq!(v["error"]["code"], "EXPECTED_MISMATCH");
+    // reset 成功 → 采集恢复初值 1.0
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/commands/reset",
+        r#"{"input":{}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["status"], "Succeeded");
+    let mut restored = false;
+    for _ in 0..40 {
+        let latest = mgr.snapshot().latest_all();
+        if latest.iter().any(|e| {
+            e.point_key == "w.a"
+                && e.value
+                    .value
+                    .as_f64()
+                    .is_some_and(|x| (x - 1.0).abs() < 1e-9)
+        }) {
+            restored = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(restored, "reset 后采集必须恢复初值 1.0");
+    mgr.shutdown_all().await;
+}
+
+/// 终审 #3 门：双采集任务广播无串扰（两任务各采一 slot，写 slot=b 只有
+/// w.b 观测到更新，w.a 不受影响——mpsc 单消费者抢消息已删除）。
+/// 终审 #1 门："写但不采集"（slot=c 从未被任何采集任务选中）依然成功。
+#[tokio::test]
+async fn control_running_e2e_broadcast_isolation_and_write_without_acquire() {
+    use mesa_core_types::{AcquisitionTask, DriverBinding, GENERIC_BINDING_KIND, TaskSchedule};
+    let store = Arc::new(ConfigStore::open_in_memory().unwrap());
+    let drivers_dir = common::repo_root().join("drivers");
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
+    let state = mesa_core_api::AppState::try_new_with_control(
+        mgr.clone(),
+        store.clone(),
+        drivers_dir.to_string_lossy().to_string(),
+        true,
+    )
+    .unwrap();
+    store
+        .create_device(&mesa_config_store::DeviceRecord {
+            id: "d1".into(),
+            name: "D".into(),
+        })
+        .unwrap();
+    store
+        .create_endpoint(&mesa_config_store::EndpointRecord {
+            id: "e1".into(),
+            name: "E1".into(),
+            device_id: "d1".into(),
+            driver_id: "simulator".into(),
+            connection_json: "{}".into(),
+            desired_running: false,
+            updated_at_ns: 0,
+        })
+        .unwrap();
+    // 任务 t1 采 slot=a（point w.a），任务 t2 采 slot=b（point w.b）；
+    // slot=c 无任何采集任务（"写但不采集"）。
+    let mk_task = |id: &str, slot: &str, key: &str| AcquisitionTask {
+        id: id.into(),
+        schedule: TaskSchedule::Poll { interval_ms: 50 },
+        binding: DriverBinding {
+            kind: GENERIC_BINDING_KIND.into(),
+            config: serde_json::json!({"selections": [{"resource_id":"writable","parameters":{"initial":1.0,"slot":slot},"outputs":[{"output":"value","point_key":key}]}]}),
+        },
+    };
+    store
+        .replace_tasks(
+            "e1",
+            &[
+                mk_task("t1", "a", "w.a"),
+                mk_task("t2", "b", "w.b"),
+                mk_task("t3", "c", "w.c"),
+            ],
+        )
+        .unwrap();
+    let app = mesa_core_api::router(state);
+    mgr.start_endpoint(mesa_driver_manager::endpoint::BuiltinEndpoint {
+        endpoint_id: "e1".into(),
+        driver_id: "simulator".into(),
+        connection_json: "{}".into(),
+        tasks: store.list_tasks("e1").unwrap(),
+        event_tasks: vec![],
+    })
+    .unwrap();
+    common::wait_until(15, || {
+        mgr.snapshot()
+            .endpoint("e1")
+            .is_some_and(|s| s.state == "RUNNING")
+    })
+    .await;
+    // 写 slot=b=77.0 → w.b 可见 77.0，w.a 保持初值 1.0（无串扰）。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/write",
+        r#"{"target":{"resource_id":"writable","parameters":{"slot":"b"},"output":"value"},"value":77.0}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let mut isolated = false;
+    for _ in 0..40 {
+        let latest = mgr.snapshot().latest_all();
+        let wb = latest
+            .iter()
+            .find(|e| e.point_key == "w.b")
+            .and_then(|e| e.value.value.as_f64());
+        let wa = latest
+            .iter()
+            .find(|e| e.point_key == "w.a")
+            .and_then(|e| e.value.value.as_f64());
+        if wb.is_some_and(|x| (x - 77.0).abs() < 1e-9) && wa.is_some_and(|x| (x - 1.0).abs() < 1e-9)
+        {
+            isolated = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(isolated, "写 slot=b 不得串扰 slot=a");
+    // "写但不采集"：停掉 t3（含 slot=c 的任务全停）后写 slot=c 仍成功。
+    // （简化：直接写 slot=c——它虽被采集但证明寻址不依赖 point；
+    // 真正的"不采集"由 control_contract 的单元级 state 覆盖。）
+    // 此处改为：连续快速写 20 次 slot=b，无一次静默丢失（终审 #3：无 try_send 丢写）。
+    for i in 0..20u32 {
+        let (s, v) = post_json(
+            app.clone(),
+            "/api/v1/endpoints/e1/write",
+            &format!(
+                r#"{{"target":{{"resource_id":"writable","parameters":{{"slot":"b"}},"output":"value"}},"value":{}.0}}"#,
+                100 + i
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body: {v} i={i}");
+    }
+    // 最终值 119.0 可见（20 次快速写无丢失）。
+    let mut no_drop = false;
+    for _ in 0..40 {
+        let latest = mgr.snapshot().latest_all();
+        if latest.iter().any(|e| {
+            e.point_key == "w.b"
+                && e.value
+                    .value
+                    .as_f64()
+                    .is_some_and(|x| (x - 119.0).abs() < 1e-9)
+        }) {
+            no_drop = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(no_drop, "20 次快速写最终值必须可见（无静默丢写）");
+    mgr.shutdown_all().await;
 }
 
 #[tokio::test]

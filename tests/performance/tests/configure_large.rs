@@ -22,7 +22,7 @@ fn make_task(n: usize, id: &str) -> AcquisitionTask {
 
 async fn bench(n: usize) -> u128 {
     let driver = mesa_driver_simulator::SimulatorDriver;
-    let mut conn = driver.open_connection("ep", "{}").await.unwrap();
+    let conn = driver.open_connection("ep", "{}").await.unwrap();
     // warmup
     for _ in 0..3 {
         let _ = conn.configure(1, vec![make_task(n, "t")]).await;

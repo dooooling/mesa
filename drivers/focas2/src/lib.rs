@@ -465,7 +465,7 @@ impl Driver for FocasDriver {
         Ok(Box::new(FocasConnection {
             cfg,
             api,
-            plan: None,
+            plan: std::sync::RwLock::new(None),
         }))
     }
 }
@@ -607,7 +607,7 @@ struct PointSpec {
     data_type: DataType,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TaskPlan {
     // TODO: PlanSnapshot 冻结字段，task id 用于诊断与多任务追踪，V1 仅内存使用但需保留
     #[allow(dead_code)]
@@ -616,7 +616,8 @@ struct TaskPlan {
     point_indices: Vec<usize>,
 }
 
-#[derive(Debug)]
+/// control-handle 并发模型下 run 入口克隆整个快照，故需 Clone。
+#[derive(Debug, Clone)]
 struct PlanSnapshot {
     // TODO: PlanSnapshot 冻结字段，revision 为 §6.2 全量快照版本号，需保留以备 Driver 侧原子校验与回放
     #[allow(dead_code)]
@@ -629,14 +630,16 @@ struct PlanSnapshot {
 struct FocasConnection {
     cfg: FocasConnConfig,
     api: Arc<dyn FocasApiTrait>,
-    plan: Option<PlanSnapshot>,
+    // 采集计划（control-handle 并发模型）：configure/apply 写锁替换，
+    // run 读锁克隆快照后释放；api 本就 Arc 共享。
+    plan: std::sync::RwLock<Option<PlanSnapshot>>,
 }
 
 impl std::fmt::Debug for FocasConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FocasConnection")
             .field("cfg", &self.cfg)
-            .field("has_plan", &self.plan.is_some())
+            .field("has_plan", &self.plan.read().unwrap().is_some())
             .finish()
     }
 }
@@ -686,12 +689,12 @@ impl DriverConnection for FocasConnection {
     ///   恒为 None + MODEL_UNDETECTED（等真机确认 series→model 映射）。
     /// 配置已在 OpenConnection 校验（含 use_native 门禁）；短连接的 disconnect
     /// 在返回前 best-effort 执行，不掩盖探测结论。
-    async fn probe(&mut self) -> Result<ProbeReport, SdkDriverError> {
+    async fn probe(&self) -> Result<ProbeReport, SdkDriverError> {
         await_probe_with_api(&self.api, &self.cfg).await
     }
 
     async fn configure(
-        &mut self,
+        &self,
         revision: u64,
         tasks: Vec<AcquisitionTask>,
     ) -> Result<Vec<PointDescriptor>, SdkDriverError> {
@@ -777,7 +780,8 @@ impl DriverConnection for FocasConnection {
             tasks = new_tasks.len(),
             "FOCAS2 采集计划构建完成"
         );
-        self.plan = Some(PlanSnapshot {
+        // 写锁内整体替换（§6.2 原子切换；失败路径在锁外早返回）。
+        *self.plan.write().unwrap() = Some(PlanSnapshot {
             revision,
             points: new_points,
             tasks: new_tasks,
@@ -786,8 +790,9 @@ impl DriverConnection for FocasConnection {
         Ok(descriptors)
     }
 
-    async fn apply_point_map(&mut self, map: PointMap) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_mut().ok_or_else(|| {
+    async fn apply_point_map(&self, map: PointMap) -> Result<(), SdkDriverError> {
+        let mut guard = self.plan.write().unwrap();
+        let snap = guard.as_mut().ok_or_else(|| {
             SdkDriverError::new(
                 mesa_core_types::ErrorKind::Internal,
                 "NOT_CONFIGURED",
@@ -806,19 +811,22 @@ impl DriverConnection for FocasConnection {
         Ok(())
     }
 
-    async fn run(
-        &mut self,
-        sink: DataSink,
-        shutdown: CancellationToken,
-    ) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_ref().ok_or_else(|| {
-            SdkDriverError::new(
-                mesa_core_types::ErrorKind::Internal,
-                "NO_PLAN",
-                "run 前未 configure+apply",
-            )
-        })?;
-        let map = snap.map.as_ref().ok_or_else(|| {
+    async fn run(&self, sink: DataSink, shutdown: CancellationToken) -> Result<(), SdkDriverError> {
+        // 读锁下克隆整个快照后释放（await 期间不持 std 锁）。
+        let snapshot: PlanSnapshot = {
+            let guard = self.plan.read().unwrap();
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    SdkDriverError::new(
+                        mesa_core_types::ErrorKind::Internal,
+                        "NO_PLAN",
+                        "run 前未 configure+apply",
+                    )
+                })?
+                .clone()
+        };
+        let map = snapshot.map.clone().ok_or_else(|| {
             SdkDriverError::new(
                 mesa_core_types::ErrorKind::Internal,
                 "NO_POINT_MAP",
@@ -850,13 +858,13 @@ impl DriverConnection for FocasConnection {
 
         // 捕获外层 api 供任务共享（避免与 task 变量同名遮蔽）
         let shared_api = Arc::clone(&self.api);
-        let mut handles = Vec::with_capacity(snap.tasks.len());
-        for task in &snap.tasks {
+        let mut handles = Vec::with_capacity(snapshot.tasks.len());
+        for task in &snapshot.tasks {
             let indices = task.point_indices.clone();
             let points: Vec<(PointSpec, u32)> = indices
                 .iter()
                 .map(|&i| {
-                    let p = snap.points[i].clone();
+                    let p = snapshot.points[i].clone();
                     let pid = map[&p.key];
                     (p, pid)
                 })
@@ -970,7 +978,7 @@ impl DriverConnection for FocasConnection {
     }
 
     async fn command(
-        &mut self,
+        &self,
         command: &str,
         args_json: &str,
     ) -> Result<serde_json::Value, SdkDriverError> {
@@ -1063,7 +1071,7 @@ mod tests {
         FocasConnection {
             cfg: FocasConnConfig::default(),
             api: Arc::new(FakeFocasApi::new()),
-            plan: None,
+            plan: std::sync::RwLock::new(None),
         }
     }
 
@@ -1149,7 +1157,7 @@ mod tests {
                 "parameters": params,
                 "outputs": [{"output": output, "point_key": "k"}],
             }]);
-            let mut conn = test_conn();
+            let conn = test_conn();
             let descs = conn.configure(1, vec![generic_task(sel)]).await.unwrap();
             assert_eq!(descs.len(), 1);
             assert_eq!(descs[0].data_type, expected, "{resource_id}/{output}");
@@ -1202,7 +1210,7 @@ mod tests {
             ),
         ];
         for (name, sel, code) in cases {
-            let mut conn = test_conn();
+            let conn = test_conn();
             let err = conn
                 .configure(1, vec![generic_task(sel)])
                 .await
@@ -1213,10 +1221,10 @@ mod tests {
 
     #[tokio::test]
     async fn configure_ok_and_duplicate_rejected() {
-        let mut conn = FocasConnection {
+        let conn = FocasConnection {
             cfg: FocasConnConfig::default(),
             api: Arc::new(FakeFocasApi::new()),
-            plan: None,
+            plan: std::sync::RwLock::new(None),
         };
         let t = generic_task(status_axis_selections(false));
         let descs = conn.configure(1, vec![t]).await.unwrap();
@@ -1240,10 +1248,10 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_address_rejected() {
-        let mut conn = FocasConnection {
+        let conn = FocasConnection {
             cfg: FocasConnConfig::default(),
             api: Arc::new(FakeFocasApi::new()),
-            plan: None,
+            plan: std::sync::RwLock::new(None),
         };
         // axis=0 越界（int_param fail-closed → INVALID_BINDING_CONFIG；
         // INVALID_ADDRESS 保留给地址解析层，本层参数越界走绑定配置错）
@@ -1259,10 +1267,10 @@ mod tests {
     async fn probe_fake_returns_deterministic_identity() {
         // Fake 身份是合同基准：FANUC / 0i-F / 固件 1.0，model 恒 None + MODEL_UNDETECTED。
         // 经已打开的连接调用（OpenConnection 阶段已做配置门禁），不碰进程级 env。
-        let mut conn = FocasConnection {
+        let conn = FocasConnection {
             cfg: FocasConnConfig::default(),
             api: Arc::new(FakeFocasApi::new()),
-            plan: None,
+            plan: std::sync::RwLock::new(None),
         };
         let r = conn.probe().await.expect("Fake probe 必须 Ok");
         assert!(r.reachable);
@@ -1293,14 +1301,14 @@ mod tests {
     async fn probe_native_without_dll_is_unreachable() {
         // CI 无 fwlib（Linux 下 load 失败干净返回，不再 SIGSEGV）：Native 建连失败
         // → Ok(unreachable)，不是 Err。经已打开的连接调用，不碰进程级 env。
-        let mut conn = FocasConnection {
+        let conn = FocasConnection {
             cfg: FocasConnConfig {
                 host: "127.0.0.1".into(),
                 port: 9,
                 timeout_ms: 1000,
             },
             api: Arc::new(NativeFocasApi::new()),
-            plan: None,
+            plan: std::sync::RwLock::new(None),
         };
         let r = conn.probe().await.expect("不可达是探测结果");
         assert!(!r.reachable);
@@ -1325,10 +1333,10 @@ mod tests {
     #[tokio::test]
     async fn explicit_planner_pmc_10_words_single_task() {
         // Milestone D: 10 连续 WORD(R) 同一任务应编译为 1 Range（逻辑 10 > 物理 1）
-        let mut conn = FocasConnection {
+        let conn = FocasConnection {
             cfg: FocasConnConfig::default(),
             api: Arc::new(FakeFocasApi::new()),
-            plan: None,
+            plan: std::sync::RwLock::new(None),
         };
         // generic：10 个连续 pmc/R outputs 同一 task（canonical 参数面）
         let selections = serde_json::Value::Array(

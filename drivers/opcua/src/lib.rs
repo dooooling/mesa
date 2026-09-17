@@ -257,8 +257,8 @@ impl Driver for OpcUaDriver {
             cfg,
             api,
             transport,
-            plan: None,
-            event_plan: None,
+            plan: std::sync::RwLock::new(None),
+            event_plan: std::sync::RwLock::new(None),
         }))
     }
 }
@@ -449,7 +449,7 @@ enum TaskKind {
     // Browse 能力保留为 ResourceSelectionMethod（选点方式），不再是任务类型。
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TaskPlan {
     id: String,
     kind: TaskKind,
@@ -457,7 +457,8 @@ struct TaskPlan {
 }
 
 #[allow(dead_code)]
-#[derive(Debug)]
+/// control-handle 并发模型下 run 入口克隆整个快照，故需 Clone。
+#[derive(Debug, Clone)]
 struct PlanSnapshot {
     revision: u64,
     points: Vec<PointSpec>,
@@ -471,17 +472,19 @@ struct OpcUaConnection {
     /// probe 复用的传输实例：与 api 背后的会话是同一个（open 时一次创建，
     /// 两处共享同一 Arc），绝不为探测另建第二会话。
     transport: Arc<dyn mesa_opcua_transport::OpcUaTransport>,
-    plan: Option<PlanSnapshot>,
+    // 采集计划（control-handle 并发模型）：configure/apply 写锁替换，
+    // run 读锁克隆快照后释放；api/transport 本就 Arc 共享。
+    plan: std::sync::RwLock<Option<PlanSnapshot>>,
     /// 事件计划快照（Stage ③）：`configure_events` 原子替换，供 run() 启动
     /// Event workers；空表/None = 无事件订阅。
-    event_plan: Option<OpcUaEventPlanSnapshot>,
+    event_plan: std::sync::RwLock<Option<OpcUaEventPlanSnapshot>>,
 }
 
 impl std::fmt::Debug for OpcUaConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpcUaConnection")
             .field("cfg", &self.cfg)
-            .field("has_plan", &self.plan.is_some())
+            .field("has_plan", &self.plan.read().unwrap().is_some())
             .finish()
     }
 }
@@ -783,12 +786,12 @@ fn decode_data_value(
 impl DriverConnection for OpcUaConnection {
     /// OPC UA 动态探测：复用本连接的 transport（open 时与 adapter 共享同一 Arc，
     /// 与采集同一会话），流程见 [`crate::probe::probe_with_transport`]。
-    async fn probe(&mut self) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
+    async fn probe(&self) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
         crate::probe::probe_with_transport(&*self.transport).await
     }
 
     async fn configure(
-        &mut self,
+        &self,
         revision: u64,
         tasks: Vec<AcquisitionTask>,
     ) -> Result<Vec<PointDescriptor>, SdkDriverError> {
@@ -973,7 +976,8 @@ impl DriverConnection for OpcUaConnection {
             tasks = new_tasks.len(),
             "OPC UA 采集计划构建完成"
         );
-        self.plan = Some(PlanSnapshot {
+        // 写锁内整体替换（§6.2 原子切换；失败路径在锁外早返回）。
+        *self.plan.write().unwrap() = Some(PlanSnapshot {
             revision,
             points: new_points,
             tasks: new_tasks,
@@ -982,8 +986,9 @@ impl DriverConnection for OpcUaConnection {
         Ok(descriptors)
     }
 
-    async fn apply_point_map(&mut self, map: PointMap) -> Result<(), SdkDriverError> {
-        let snap = self.plan.as_mut().ok_or_else(|| {
+    async fn apply_point_map(&self, map: PointMap) -> Result<(), SdkDriverError> {
+        let mut guard = self.plan.write().unwrap();
+        let snap = guard.as_mut().ok_or_else(|| {
             SdkDriverError::new(
                 mesa_core_types::ErrorKind::Internal,
                 "NOT_CONFIGURED",
@@ -1005,13 +1010,13 @@ impl DriverConnection for OpcUaConnection {
     /// 事件任务配置（PR9 Stage ③）：只接受 `mesa.events.v1` 标准 binding；
     /// 全部解析成功才原子替换旧计划（Stage ⑤ run() 按快照起 Event workers）。
     async fn configure_events(
-        &mut self,
+        &self,
         revision: u64,
         tasks: Vec<mesa_core_types::EventTask>,
     ) -> Result<(), SdkDriverError> {
         let plans = event::parse_event_tasks(&tasks)?;
         tracing::info!(revision, tasks = plans.len(), "opcua event plan built");
-        self.event_plan = Some(OpcUaEventPlanSnapshot {
+        *self.event_plan.write().unwrap() = Some(OpcUaEventPlanSnapshot {
             revision,
             tasks: plans,
         });
@@ -1019,7 +1024,7 @@ impl DriverConnection for OpcUaConnection {
     }
 
     async fn browse(
-        &mut self,
+        &self,
         parent: &str,
         filter: &str,
         cursor: &str,
@@ -1110,15 +1115,13 @@ impl DriverConnection for OpcUaConnection {
         Ok((nodes, next_cursor))
     }
 
-    async fn run(
-        &mut self,
-        sink: DataSink,
-        shutdown: CancellationToken,
-    ) -> Result<(), SdkDriverError> {
+    async fn run(&self, sink: DataSink, shutdown: CancellationToken) -> Result<(), SdkDriverError> {
         // §18：一等 Event-only——Data 计划缺席/空表不再是错误；PointMap 只在
         // 有 Data 任务时要求。Event-only 端点无需任何 Data point 即可 Start。
-        let has_data_tasks = self
-            .plan
+        // 读锁下克隆快照后释放（await 期间不持 std 锁；namespace resolve 的
+        // 写回在独立短临界区内完成，见下）。
+        let plan_snapshot: Option<PlanSnapshot> = self.plan.read().unwrap().clone();
+        let has_data_tasks = plan_snapshot
             .as_ref()
             .map(|s| !s.tasks.is_empty())
             .unwrap_or(false);
@@ -1152,21 +1155,29 @@ impl DriverConnection for OpcUaConnection {
                 format!("NamespaceArray 读取失败: {e}"),
             )
         })?;
-        if let Some(snap) = self.plan.as_mut() {
-            for p in &mut snap.points {
-                p.addr.resolve(&namespaces).map_err(|e| {
-                    SdkDriverError::new(
-                        mesa_core_types::ErrorKind::Address,
-                        "UNKNOWN_NAMESPACE",
-                        format!("point `{}`: {e}", p.key),
-                    )
-                })?;
+        // namespace resolve 写回：克隆快照→改地址→写锁整体换回
+        //（短临界区；resolve 失败即 fail-closed，不同 plan 混跑由 revision 门保证）。
+        let resolved_snapshot: Option<PlanSnapshot> = {
+            let mut owned = plan_snapshot;
+            if let Some(snap) = owned.as_mut() {
+                for p in &mut snap.points {
+                    p.addr.resolve(&namespaces).map_err(|e| {
+                        SdkDriverError::new(
+                            mesa_core_types::ErrorKind::Address,
+                            "UNKNOWN_NAMESPACE",
+                            format!("point `{}`: {e}", p.key),
+                        )
+                    })?;
+                }
+                // 写回表内（run 期后续 configure 会整体替换，不冲突）。
+                *self.plan.write().unwrap() = Some(snap.clone());
             }
-        }
+            owned
+        };
         let namespaces = Arc::new(namespaces);
 
         let data_plan = if has_data_tasks {
-            Some(self.plan.as_ref().ok_or_else(|| {
+            Some(resolved_snapshot.as_ref().ok_or_else(|| {
                 SdkDriverError::new(
                     mesa_core_types::ErrorKind::Internal,
                     "NO_PLAN",
@@ -1188,6 +1199,8 @@ impl DriverConnection for OpcUaConnection {
         };
         let event_tasks: Vec<event::OpcUaEventTaskPlan> = self
             .event_plan
+            .read()
+            .unwrap()
             .as_ref()
             .map(|e| e.tasks.clone())
             .unwrap_or_default();
@@ -1461,7 +1474,7 @@ mod tests {
                 TaskMode::Poll => generic_task(sel.clone()),
                 TaskMode::Subscribe => generic_subscribe_task(sel.clone()),
             };
-            let mut conn = test_conn().await;
+            let conn = test_conn().await;
             let descs = conn.configure(1, vec![task]).await.unwrap();
             assert_eq!(descs.len(), 1);
         }
@@ -1491,7 +1504,7 @@ mod tests {
                 Some(expected),
                 "{dt}"
             );
-            let mut conn = test_conn().await;
+            let conn = test_conn().await;
             let descs = conn
                 .configure(1, vec![generic_task(node_selection("k", params))])
                 .await
@@ -1532,7 +1545,7 @@ mod tests {
             ),
         ];
         for (name, params, code) in cases {
-            let mut conn = test_conn().await;
+            let conn = test_conn().await;
             let err = conn
                 .configure(1, vec![generic_task(node_selection("k", params))])
                 .await
@@ -1579,12 +1592,12 @@ mod tests {
                     fields,
                 }]),
         );
-        let mut conn = OpcUaConnection {
+        let conn = OpcUaConnection {
             cfg: OpcUaConnConfig::default(),
             api: Arc::new(FakeOpcUaApi::new()),
             transport: fake.clone(),
-            plan: None,
-            event_plan: None,
+            plan: std::sync::RwLock::new(None),
+            event_plan: std::sync::RwLock::new(None),
         };
         // 零 Data 任务 + 一个 generic 事件任务（configure_events 用 [] 语义清空亦可）。
         conn.configure(1, vec![]).await.unwrap();
@@ -1632,12 +1645,12 @@ mod tests {
 
     #[tokio::test]
     async fn configure_ok_and_duplicate_rejected() {
-        let mut conn = OpcUaConnection {
+        let conn = OpcUaConnection {
             cfg: OpcUaConnConfig::default(),
             api: Arc::new(FakeOpcUaApi::new()),
             transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
-            plan: None,
-            event_plan: None,
+            plan: std::sync::RwLock::new(None),
+            event_plan: std::sync::RwLock::new(None),
         };
         // generic 双点（canonical node_id + data_type）
         let both = serde_json::json!([
@@ -1660,12 +1673,12 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_node_id_rejected() {
-        let mut conn = OpcUaConnection {
+        let conn = OpcUaConnection {
             cfg: OpcUaConnConfig::default(),
             api: Arc::new(FakeOpcUaApi::new()),
             transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
-            plan: None,
-            event_plan: None,
+            plan: std::sync::RwLock::new(None),
+            event_plan: std::sync::RwLock::new(None),
         };
         // 非 canonical（ns= 拒绝）
         let sel = serde_json::json!([{"resource_id":"node","parameters":{"node_id":"ns=2;x=1","data_type":"UINT32"},"outputs":[{"output":"value","point_key":"a"}]}]);
@@ -1678,12 +1691,12 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_configure_ok() {
-        let mut conn = OpcUaConnection {
+        let conn = OpcUaConnection {
             cfg: OpcUaConnConfig::default(),
             api: Arc::new(FakeOpcUaApi::new()),
             transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
-            plan: None,
-            event_plan: None,
+            plan: std::sync::RwLock::new(None),
+            event_plan: std::sync::RwLock::new(None),
         };
         // Foundation-2：Subscribe 参数由 schedule 承载（非 binding config）。
         let sel_a = serde_json::json!([{"resource_id":"node","parameters":{"node_id":"nsu=http://example.com/MyModel/;i=2","data_type":"UINT32"},"outputs":[{"output":"value","point_key":"a"}]}]);
@@ -1702,12 +1715,12 @@ mod tests {
 
     #[tokio::test]
     async fn configure_apply_ok() {
-        let mut conn = OpcUaConnection {
+        let conn = OpcUaConnection {
             cfg: OpcUaConnConfig::default(),
             api: Arc::new(FakeOpcUaApi::new()),
             transport: Arc::new(mesa_opcua_transport::FakeOpcUaTransport::new()),
-            plan: None,
-            event_plan: None,
+            plan: std::sync::RwLock::new(None),
+            event_plan: std::sync::RwLock::new(None),
         };
         let sel = serde_json::json!([{"resource_id":"node","parameters":{"node_id":"nsu=http://example.com/MyModel/;s=Counter","data_type":"UINT32"},"outputs":[{"output":"value","point_key":"a"}]}]);
         let descs = conn.configure(1, vec![generic_task(sel)]).await.unwrap();

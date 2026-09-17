@@ -821,7 +821,11 @@ async fn import_endpoint(
     )
 }
 
+/// Foundation-3 #5.1 门：Control 请求入口比普通配置更 fail-closed。
+/// 未知字段（尤其 `expected_valeu` 这类 CAS 拼写错误）必须 400，
+/// 绝不静默退化为无条件写（expected=None）。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ControlWriteReq {
     // Foundation-3 单真值：结构化三元组（旧 string target 已删除，不留 shim）。
     target: mesa_core_types::WriteTarget,
@@ -1017,6 +1021,7 @@ async fn control_write(
             )
         }
         Err(e) => {
+            // write 路径：精确码直透（#5.2）。
             if let Err(e) = state.store.update_control_audit(
                 &request_id,
                 "FAILED",
@@ -1025,10 +1030,16 @@ async fn control_write(
             ) {
                 warn_audit_update("control_audit FAILED", &request_id, e);
             }
+            // #5.2：精确码直透（EXPECTED_MISMATCH / EXPECTED_VALUE_UNSUPPORTED /
+            // TARGET_NOT_FOUND / OUTPUT_NOT_WRITABLE 等）；ENDPOINT_NOT_RUNNING
+            // 为 409；CONTROL_FAILED/CONTROL_MODEL_UNSUPPORTED 等传输/模型层
+            // 才为 502。客户端按 error.code 做 machine-readable 路由。
             let status = if e.code == "ENDPOINT_NOT_RUNNING" {
                 StatusCode::CONFLICT
-            } else {
+            } else if e.code == "CONTROL_FAILED" || e.code == "CONTROL_MODEL_UNSUPPORTED" {
                 StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
             };
             (
                 status,
@@ -1041,9 +1052,11 @@ async fn control_write(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ControlCommandReq {
     // Foundation-3 单真值：input 唯一合法形态（command_id 取 URL path）。
     // 旧 command_id/command/input_json 形态已删除，不留 shim。
+    // 反序列化失败（含未知字段）即 400，不 fallback 为空 input（#5.1）。
     #[serde(default)]
     input: Option<serde_json::Value>,
 }
@@ -1093,8 +1106,16 @@ async fn control_command(
         }
     }
     let command_id = cmd;
-    let parsed: ControlCommandReq =
-        serde_json::from_value(body.clone()).unwrap_or(ControlCommandReq { input: None });
+    // #5.1：反序列化失败（含未知字段/拼写错误）即 400，不 fallback 空 input。
+    let parsed: ControlCommandReq = match serde_json::from_value(body.clone()) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("VALIDATION_ERROR", &e.to_string())),
+            );
+        }
+    };
     let input = parsed.input.unwrap_or(serde_json::json!({}));
     let input_json = serde_json::to_string(&input).unwrap_or("{}".into());
     // Foundation-3 Core Descriptor 门禁：capabilities.method → command 声明 →
@@ -1149,7 +1170,8 @@ async fn control_command(
     {
         Ok((status, result_json, error)) => {
             // Foundation-3 结果门禁：Driver 返回违反自己 result_schema 即
-            // DRIVER_CONTRACT_VIOLATION（审计记 FAILED，不把坏结果当成功）。
+            // DRIVER_CONTRACT_VIOLATION（审计记 FAILED，不把坏结果当成功；
+            // #5 要求 fail-closed：HTTP 502 + 精确码，不返回 200 包坏 result）。
             let result_val: serde_json::Value = serde_json::from_str(&result_json)
                 .unwrap_or(serde_json::Value::String(result_json.clone()));
             let result_issues = mesa_core_types::gate_command_result_against(
@@ -1158,34 +1180,44 @@ async fn control_command(
                 &result_val,
                 "command",
             );
-            let (audit_status, status) = if result_issues.is_empty() {
-                if status == "Succeeded" {
-                    ("COMPLETED", status)
+            if result_issues.is_empty() {
+                let audit_status = if status == "Succeeded" {
+                    "COMPLETED"
                 } else {
-                    ("FAILED", status)
+                    "FAILED"
+                };
+                let detail = format!("{status}:{result_json}:{error}");
+                if let Err(e) = state.store.update_control_audit(
+                    &request_id,
+                    audit_status,
+                    Some(&detail),
+                    mesa_core_types::now_unix_ns(),
+                ) {
+                    warn_audit_update("control_audit result", &request_id, e);
                 }
+                (
+                    StatusCode::OK,
+                    Json(
+                        serde_json::json!({"request_id": request_id, "status": status, "result": result_val, "error": error}),
+                    ),
+                )
             } else {
-                ("FAILED", "Failed".to_string())
-            };
-            let detail = if result_issues.is_empty() {
-                format!("{status}:{result_json}:{error}")
-            } else {
-                format!("DRIVER_CONTRACT_VIOLATION:{result_json}:{error}")
-            };
-            if let Err(e) = state.store.update_control_audit(
-                &request_id,
-                audit_status,
-                Some(&detail),
-                mesa_core_types::now_unix_ns(),
-            ) {
-                warn_audit_update("control_audit result", &request_id, e);
+                let detail = format!("DRIVER_CONTRACT_VIOLATION:{result_json}:{error}");
+                if let Err(e) = state.store.update_control_audit(
+                    &request_id,
+                    "FAILED",
+                    Some(&detail),
+                    mesa_core_types::now_unix_ns(),
+                ) {
+                    warn_audit_update("control_audit result", &request_id, e);
+                }
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(
+                        serde_json::json!({"error": {"code": "DRIVER_CONTRACT_VIOLATION", "message": detail}, "request_id": request_id}),
+                    ),
+                )
             }
-            (
-                StatusCode::OK,
-                Json(
-                    serde_json::json!({"request_id": request_id, "status": status, "result": result_val, "error": error}),
-                ),
-            )
         }
         Err(e) => {
             if let Err(e) = state.store.update_control_audit(

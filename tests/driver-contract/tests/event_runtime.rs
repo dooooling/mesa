@@ -654,20 +654,16 @@ struct LegacyConn;
 #[async_trait::async_trait]
 impl DriverConnection for LegacyConn {
     async fn configure(
-        &mut self,
+        &self,
         _r: u64,
         _t: Vec<AcquisitionTask>,
     ) -> Result<Vec<PointDescriptor>, SdkDriverError> {
         Ok(vec![])
     }
-    async fn apply_point_map(&mut self, _m: PointMap) -> Result<(), SdkDriverError> {
+    async fn apply_point_map(&self, _m: PointMap) -> Result<(), SdkDriverError> {
         Ok(())
     }
-    async fn run(
-        &mut self,
-        _s: DataSink,
-        shutdown: CancellationToken,
-    ) -> Result<(), SdkDriverError> {
+    async fn run(&self, _s: DataSink, shutdown: CancellationToken) -> Result<(), SdkDriverError> {
         shutdown.cancelled().await;
         Ok(())
     }

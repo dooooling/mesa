@@ -7,21 +7,23 @@ use mesa_core_types::{
 };
 use mesa_driver_sdk::Driver;
 
-fn poll_task(key: &str) -> AcquisitionTask {
+/// Foundation-3 #1：实例身份 = parameters.slot（canonical Resource 参数）。
+/// point_key 只是采集投影，永不进 WriteTarget（见终审 blocker #1）。
+fn poll_task(key: &str, slot: &str) -> AcquisitionTask {
     AcquisitionTask {
         id: "t".into(),
         schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
             kind: GENERIC_BINDING_KIND.into(),
-            config: serde_json::json!({"selections": [{"resource_id":"writable","parameters":{"initial":0},"outputs":[{"output":"value","point_key": key}]}]}),
+            config: serde_json::json!({"selections": [{"resource_id":"writable","parameters":{"initial":0,"slot":slot},"outputs":[{"output":"value","point_key": key}]}]}),
         },
     }
 }
 
-fn writable_target(key: &str) -> WriteTarget {
+fn writable_target(slot: &str) -> WriteTarget {
     WriteTarget {
         resource_id: "writable".into(),
-        parameters: serde_json::json!({"point_key": key}),
+        parameters: serde_json::json!({"slot": slot}),
         output: "value".into(),
     }
 }
@@ -38,8 +40,10 @@ fn percentile(mut v: Vec<u128>, p: f64) -> u128 {
 #[tokio::test]
 async fn control_write_p95_within_20ms() {
     let driver = mesa_driver_simulator::SimulatorDriver;
-    let mut conn = driver.open_connection("ep", "{}").await.unwrap();
-    conn.configure(1, vec![poll_task("sim.x")]).await.unwrap();
+    let conn = driver.open_connection("ep", "{}").await.unwrap();
+    conn.configure(1, vec![poll_task("sim.x", "a")])
+        .await
+        .unwrap();
     conn.apply_point_map([("sim.x".to_string(), 1)].into_iter().collect())
         .await
         .unwrap();
@@ -47,7 +51,7 @@ async fn control_write_p95_within_20ms() {
     let mut samples = Vec::with_capacity(30);
     for _ in 0..30 {
         let start = std::time::Instant::now();
-        conn.write(&writable_target("sim.x"), Value::F64(1.0), None)
+        conn.write(&writable_target("a"), Value::F64(1.0), None)
             .await
             .unwrap();
         samples.push(start.elapsed().as_micros() / 1000);
@@ -62,8 +66,10 @@ async fn control_write_p95_within_20ms() {
 #[tokio::test]
 async fn control_command_p95_within_20ms() {
     let driver = mesa_driver_simulator::SimulatorDriver;
-    let mut conn = driver.open_connection("ep", "{}").await.unwrap();
-    conn.configure(1, vec![poll_task("sim.x")]).await.unwrap();
+    let conn = driver.open_connection("ep", "{}").await.unwrap();
+    conn.configure(1, vec![poll_task("sim.x", "a")])
+        .await
+        .unwrap();
     conn.apply_point_map([("sim.x".to_string(), 1)].into_iter().collect())
         .await
         .unwrap();

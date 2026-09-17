@@ -24,7 +24,7 @@ fn generic_task(id: &str, selections: Vec<ResourceSelection>) -> AcquisitionTask
 
 #[tokio::test]
 async fn simulator_generic_single_point_ok() {
-    let mut conn = mesa_driver_simulator::SimulatorDriver
+    let conn = mesa_driver_simulator::SimulatorDriver
         .open_connection("ep1", "{}")
         .await
         .unwrap();
@@ -47,7 +47,7 @@ async fn simulator_generic_single_point_ok() {
 
 #[tokio::test]
 async fn simulator_generic_duplicate_point_key_rejected() {
-    let mut conn = mesa_driver_simulator::SimulatorDriver
+    let conn = mesa_driver_simulator::SimulatorDriver
         .open_connection("ep1", "{}")
         .await
         .unwrap();
@@ -82,7 +82,7 @@ async fn simulator_generic_duplicate_point_key_rejected() {
 
 #[tokio::test]
 async fn s7_generic_memory_ok() {
-    let mut conn = mesa_driver_s7::S7Driver
+    let conn = mesa_driver_s7::S7Driver
         .open_connection("ep1", r#"{"host":"127.0.0.1"}"#)
         .await
         .unwrap();
@@ -105,7 +105,7 @@ async fn s7_generic_memory_ok() {
 
 #[tokio::test]
 async fn focas_generic_status_ok() {
-    let mut conn = mesa_driver_focas2::FocasDriver
+    let conn = mesa_driver_focas2::FocasDriver
         .open_connection("ep1", "{}")
         .await
         .unwrap();
@@ -129,7 +129,7 @@ async fn focas_generic_status_ok() {
 
 #[tokio::test]
 async fn opcua_generic_node_ok() {
-    let mut conn = mesa_driver_opcua::OpcUaDriver
+    let conn = mesa_driver_opcua::OpcUaDriver
         .open_connection("ep1", "{}")
         .await
         .unwrap();
@@ -179,7 +179,7 @@ async fn legacy_kinds_rejected_for_all_drivers() {
         "opcua.browse",
         "simulator.events",
     ];
-    let mut sim = mesa_driver_simulator::SimulatorDriver
+    let sim = mesa_driver_simulator::SimulatorDriver
         .open_connection("ep1", "{}")
         .await
         .unwrap();
@@ -197,7 +197,7 @@ async fn legacy_kinds_rejected_for_all_drivers() {
     );
 
     // S7
-    let mut s7 = mesa_driver_s7::S7Driver
+    let s7 = mesa_driver_s7::S7Driver
         .open_connection("ep1", r#"{"host":"127.0.0.1"}"#)
         .await
         .unwrap();
@@ -215,7 +215,7 @@ async fn legacy_kinds_rejected_for_all_drivers() {
     );
 
     // FOCAS
-    let mut focas = mesa_driver_focas2::FocasDriver
+    let focas = mesa_driver_focas2::FocasDriver
         .open_connection("ep1", "{}")
         .await
         .unwrap();
@@ -237,7 +237,7 @@ async fn legacy_kinds_rejected_for_all_drivers() {
     );
 
     // OPC UA legacy kinds
-    let mut opcua = mesa_driver_opcua::OpcUaDriver
+    let opcua = mesa_driver_opcua::OpcUaDriver
         .open_connection("ep1", "{}")
         .await
         .unwrap();

@@ -109,6 +109,15 @@ pub enum SessionError {
         code: String,
         message: String,
     },
+    /// 运行期 control 远端错误（Foundation-3 #5.2：write/command 的 Driver
+    /// 精确错误码原样保留；Manager 按 code 精确路由，REST 透出 machine-readable
+    /// 码——不再拼成 `kind/code: message` 字符串后改名 CONTROL_FAILED）。
+    #[error("remote control error {kind}/{code}: {message}")]
+    Remote {
+        kind: String,
+        code: String,
+        message: String,
+    },
     /// Event Plane 不可用：非空 EventTask 要求协商 Minor >= EVENT_PLANE_MIN_MINOR，
     /// 老 Driver 直接精确失败（`EVENT_PLANE_UNSUPPORTED` 语义），禁止发未知 RPC
     /// 干等超时。调用方用 matches! 做精确路由。
@@ -694,6 +703,8 @@ impl Session {
     /// Write（§22 可靠控制，无 Latest-Wins；Foundation-3 单真值）：
     /// 发送 structured WriteRequest（三元组）并等待 WriteResponse。
     /// 旧 `target` 字符串不再生成（wire 保留仅作兼容，见 proto 注释）。
+    /// Foundation-3 #5.2：Driver 精确错误码原样保留（`SessionError::Remote`），
+    /// 不再拼成字符串——Manager 按 code 精确路由，REST 向客户端透出 machine-readable 码。
     pub async fn write(
         &self,
         connection_handle: u32,
@@ -738,10 +749,11 @@ impl Session {
                     && !result.ok
                 {
                     let d = result.error.unwrap_or_default();
-                    return Err(SessionError::Handshake(format!(
-                        "{}/{}: {}",
-                        d.kind, d.code, d.message
-                    )));
+                    return Err(SessionError::Remote {
+                        kind: d.kind,
+                        code: d.code,
+                        message: d.message,
+                    });
                 }
                 if let Some(v) = resp.readback {
                     Ok(Some(
