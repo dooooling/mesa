@@ -17,7 +17,7 @@ import {
   type ResourceSelection,
   type TaskSnapshotState,
 } from "../deviceModel";
-import { reconcileEditableSelection } from "../resourceSelectionModel";
+import { applySelectionAdd } from "../resourceSelectionModel";
 import { ApplyWithRestart } from "./ApplyWithRestart";
 import { ResourcePickerAntd } from "./ResourcePickerAntd";
 
@@ -200,53 +200,26 @@ export function EndpointAcquisitionPane({
         selectionMethods={desc.resource_selection_methods}
         endpointId={endpointId}
         onAdd={(s) => {
-          // 唯一防御门：同一纯函数裁决（终审 #3：父层不再手写 key 集合规则，
-          // point_key 检查由 reconcile 的 point-key-conflict 分支统一执行）。
+          // 唯一防御门：与 AddDeviceFlow 同一共享实现（终审：两调用方行为一致，
+          // protected 永不动；point_key 检查由 reconcile 统一执行）。
           const schemaOf = (resourceId: string) => {
             const found = desc.resources.find((r) => r.id === resourceId);
             return {
               fields: (found?.parameters.fields ?? []).map((f) => ({ key: f.key, default: f.default })),
             };
           };
-          const decision = reconcileEditableSelection({
+          const { next, message: msg } = applySelectionAdd({
             candidate: s,
             editable: sels,
             protectedSelections: preservedTasks.flatMap((t) => selectionsOf(t)),
             schemaOf,
           });
-          if (decision.kind === "duplicate-editable") {
-            message.warning(`已在采集中：${decision.outputs.join(", ")}，不会重复加入`);
+          if (msg) {
+            if (msg.startsWith("point_key")) message.error(msg);
+            else message.warning(msg);
             return false;
           }
-          if (decision.kind === "duplicate-protected") {
-            message.warning(`已在其他任务采集：${decision.outputs.join(", ")}，不会重复加入`);
-            return false;
-          }
-          if (decision.kind === "point-key-conflict") {
-            message.error(
-              `point_key 已被其他采集项使用：${decision.pointKeys.join(", ")}（请改名）`,
-            );
-            return false;
-          }
-          if (decision.kind === "merge") {
-            setSels((p) =>
-              p.map((sel, i) =>
-                i === decision.mergedIndex
-                  ? {
-                      ...sel,
-                      outputs: [
-                        ...sel.outputs,
-                        ...s.outputs.filter(
-                          (o) => !sel.outputs.some((e) => e.output === o.output),
-                        ),
-                      ],
-                    }
-                  : sel,
-              ),
-            );
-            return true;
-          }
-          setSels((p) => [...p, s]);
+          setSels(next);
           return true;
         }}
       />

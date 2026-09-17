@@ -222,6 +222,7 @@ const other = (id: string): AcquisitionTaskShape => ({
 
 import {
   reconcileEditableSelection,
+  applySelectionAdd,
   effectiveResourceParameters,
   resourceInstanceKey,
 } from "./resourceSelectionModel";
@@ -361,6 +362,51 @@ describe("selection reconciliation（冻结算法）", () => {
     });
     // 参数 JSON 不同 → 不是 exact duplicate；point_key 相同 → key 冲突
     expect(d.kind).toBe("point-key-conflict");
+  });
+});
+
+describe("applySelectionAdd（父层共享实现，两调用方行为一致）", () => {
+  // 终审指定回归：已有 register/value + 再加 register/raw
+  // → sels.length === 1，outputs === [value, raw]（merge，不是 append 两项）。
+  const regSchema = () => ({ fields: [] });
+  const regSel = (
+    params: Record<string, unknown>,
+    outputs: Array<{ output: string; point_key: string }>,
+  ) => ({ resource_id: "register", parameters: params, outputs });
+
+  it("同实例新 output → merge 进同一 selection（sels 长度不变）", () => {
+    const editable = [regSel({ unit: 3 }, [{ output: "value", point_key: "register.value" }])];
+    const { next, message } = applySelectionAdd({
+      candidate: regSel({ unit: 3 }, [{ output: "raw", point_key: "register.raw" }]),
+      editable,
+      protectedSelections: [],
+      schemaOf: regSchema,
+    });
+    expect(message).toBeNull();
+    expect(next).toHaveLength(1);
+    expect(next[0].outputs.map((o) => o.output).sort()).toEqual(["raw", "value"]);
+    // 输入数组不被原地修改（调用方 setSels(next) 语义）
+    expect(editable[0].outputs).toHaveLength(1);
+  });
+
+  it("duplicate / conflict → 数组不变 + 返回中文原因", () => {
+    const editable = [regSel({ unit: 3 }, [{ output: "value", point_key: "register.value" }])];
+    const dup = applySelectionAdd({
+      candidate: regSel({ unit: 3 }, [{ output: "value", point_key: "other" }]),
+      editable,
+      protectedSelections: [],
+      schemaOf: regSchema,
+    });
+    expect(dup.next).toBe(editable);
+    expect(dup.message).toMatch(/已在采集/);
+    const conflict = applySelectionAdd({
+      candidate: regSel({ unit: 9 }, [{ output: "raw", point_key: "register.value" }]),
+      editable,
+      protectedSelections: [],
+      schemaOf: regSchema,
+    });
+    expect(conflict.next).toBe(editable);
+    expect(conflict.message).toMatch(/point_key/);
   });
 });
 

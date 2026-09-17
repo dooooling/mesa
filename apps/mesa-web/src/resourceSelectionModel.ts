@@ -274,3 +274,63 @@ export function allKnownPointKeys(
   }
   return out;
 }
+
+/**
+ * 父层 onAdd 共享实现（冻结行为，两个 Picker 调用方必须一致）：
+ * 同一 reconcileEditableSelection 裁决 + 同一阵列变更语义。
+ * - duplicate-editable / duplicate-protected / point-key-conflict →
+ *   返回对应 message，数组不变；
+ * - merge → 只改 editable[mergedIndex].outputs（并入新 output，protected 不动）；
+ * - append → editable 追加 candidate。
+ * AddDeviceFlow 以 protectedSelections=[] 调用（无 preserved task）。
+ * 返回 null 表示成功（调用方直接 setSels(next)）；返回 string 为拒绝原因。
+ */
+export function applySelectionAdd(args: {
+  candidate: ResourceSelectionLike;
+  editable: ResourceSelectionLike[];
+  protectedSelections: ResourceSelectionLike[];
+  schemaOf: (resourceId: string) => SchemaDefaultsSource;
+}): { next: ResourceSelectionLike[]; message: string | null } {
+  const decision = reconcileEditableSelection({
+    candidate: args.candidate,
+    editable: args.editable,
+    protectedSelections: args.protectedSelections,
+    schemaOf: args.schemaOf,
+  });
+  switch (decision.kind) {
+    case "duplicate-editable":
+      return {
+        next: args.editable,
+        message: `已在采集中：${decision.outputs.join(", ")}，不会重复加入`,
+      };
+    case "duplicate-protected":
+      return {
+        next: args.editable,
+        message: `已在其他任务采集：${decision.outputs.join(", ")}，不会重复加入`,
+      };
+    case "point-key-conflict":
+      return {
+        next: args.editable,
+        message: `point_key 已被其他采集项使用：${decision.pointKeys.join(", ")}（请改名）`,
+      };
+    case "merge":
+      return {
+        next: args.editable.map((sel, i) =>
+          i === decision.mergedIndex
+            ? {
+                ...sel,
+                outputs: [
+                  ...sel.outputs,
+                  ...args.candidate.outputs.filter(
+                    (o) => !sel.outputs.some((e) => e.output === o.output),
+                  ),
+                ],
+              }
+            : sel,
+        ),
+        message: null,
+      };
+    case "append":
+      return { next: [...args.editable, args.candidate], message: null };
+  }
+}
