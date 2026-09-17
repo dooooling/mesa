@@ -29,6 +29,46 @@ export interface SchemaDefaultsSource {
   fields: Array<{ key: string; default?: unknown }>;
 }
 
+/** required 前置判断的最小字段形态（仅 key + required；无类型/range/enum）。
+ * Core REQUIRED 语义 = 字段 key 缺席（`obj.get(&key)` 为 None 即报），
+ * 与值 falsy 无关：`0` / `false` / `""` 都是“在场”，不得误判缺失。 */
+export interface RequiredFieldSource {
+  key: string;
+  required?: boolean;
+}
+
+export interface RequiredParamsSource {
+  fields: Array<RequiredFieldSource>;
+}
+
+/**
+ * Web required preflight（表单完整性预检，唯一允许的前端 required 判断）：
+ * 返回 required 但在 params 中**缺席**的字段 key 列表。
+ * - 缺席 = `!(key in params)` 或值为 `undefined`/`null`（控件清空态）；
+ * - `0` / `false` / `""` 视为在场（与 Core `obj.get` 语义对齐，不得用 truthy 判）；
+ * - secret marker（`{secret_set:true}` / `{clear_secret:true}` 对象）视为在场；
+ * - 只回答"缺不缺"，绝不判断类型/enum/range/pattern（那是 Core 唯一真值）。
+ */
+export function missingRequiredParams(
+  schema: RequiredParamsSource,
+  parameters: Record<string, unknown>,
+): string[] {
+  const params = parameters ?? {};
+  const out: string[] = [];
+  for (const f of schema.fields ?? []) {
+    if (!f.required) continue;
+    // hasOwn 优先（显式传入但 undefined 仍算缺席，与 removeUndefined 对齐）；
+    // in 不可用——原型链 key 会误判在场。
+    if (!Object.prototype.hasOwnProperty.call(params, f.key)) {
+      out.push(f.key);
+      continue;
+    }
+    const v = params[f.key];
+    if (v === undefined || v === null) out.push(f.key);
+  }
+  return out;
+}
+
 /**
  * P1-4（自 DescriptorFields.tsx 迁移，语义逐字保留）：将 schema 中带
  * `default` 的字段物化为参数初值，保证"UI 显示的 default 即实际保存值"。

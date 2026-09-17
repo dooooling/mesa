@@ -4,7 +4,7 @@
 import { useEffect, useState } from "react";
 import { Alert, Button, InputNumber, Tag, message } from "antd";
 import { api } from "../api";
-import type { DriverDescriptor } from "../types";
+import type { DriverDescriptor, ValidationIssue } from "../types";
 import {
   applyEndpointChange,
   isTaskSnapshotReady,
@@ -43,6 +43,9 @@ export function EndpointAcquisitionPane({
   const [tasksLoadState, setTasksLoadState] = useState<TaskSnapshotState>("idle");
   const [tasksLoadedEpId, setTasksLoadedEpId] = useState<string | null>(null);
   const [tasksLoadError, setTasksLoadError] = useState("");
+  // 保存失败的后端 issues 原样展示（`{valid:false, issues:[...]}`）：
+  // 不翻译、不重新判定；成功保存 / 重新发起保存时清掉旧值。
+  const [saveIssues, setSaveIssues] = useState<ValidationIssue[]>([]);
 
   useEffect(() => {
     // 切 Endpoint 时先复位：旧快照不得污染新窗格（fail-closed 默认禁用保存）。
@@ -54,6 +57,7 @@ export function EndpointAcquisitionPane({
     setTasksLoadState("loading");
     setTasksLoadedEpId(null);
     setTasksLoadError("");
+    setSaveIssues([]);
     let cancelled = false;
     // Descriptor + Task 快照并行加载；二者都成功才开放保存。
     Promise.all([
@@ -121,6 +125,8 @@ export function EndpointAcquisitionPane({
     const kept = (extra: string) =>
       preservedCount > 0 ? `点位已保存（另保留 ${preservedCount} 个任务）${extra}` : `点位已保存${extra}`;
     setSaving(true);
+    // 重新发起保存：清掉上一次的 issues（成功后同样清掉）。
+    setSaveIssues([]);
     try {
       // 统一生命周期：STOPPED 直接 apply（绝不自动 start）；RUNNING 经
       // executor 走 stop → apply →（可选）start，各步失败都有明确 outcome。
@@ -143,9 +149,25 @@ export function EndpointAcquisitionPane({
             body: JSON.stringify({ tasks }),
           });
           const j = await r.json().catch(() => ({}));
-          return r.ok
-            ? { ok: true }
-            : { ok: false, message: (j as { error?: { message?: string } })?.error?.message ?? "点位保存失败" };
+          if (r.ok) {
+            setSaveIssues([]);
+            return { ok: true };
+          }
+          // 后端 issues 原样保存并展示（`{valid:false, issues}`）；
+          // 普通 `{error:{message}}` / HTTP 异常仍走原 fallback，不退化。
+          const issues = (j as { issues?: ValidationIssue }) as { issues?: unknown };
+          if (Array.isArray(issues.issues)) {
+            const list = issues.issues as ValidationIssue[];
+            setSaveIssues(list);
+            const summary =
+              list.length > 0
+                ? `点位保存失败（${list.length} 项）：${list
+                    .map((i) => `${i.path} · ${i.code}`)
+                    .join("；")}`
+                : "点位保存失败";
+            return { ok: false, message: summary };
+          }
+          return { ok: false, message: (j as { error?: { message?: string } })?.error?.message ?? "点位保存失败" };
         },
         start: async (): Promise<LifecycleStepResult> => {
           const r = await api.startEndpoint(endpointId).catch((e) => ({
@@ -264,6 +286,21 @@ export function EndpointAcquisitionPane({
           onApply={save}
         />
       </div>
+      {saveIssues.length > 0 ? (
+        <Alert
+          type="error"
+          message={`保存被后端拒绝（${saveIssues.length} 项，原样展示）`}
+          description={
+            <ul style={{ margin: 0, paddingLeft: 18 }}>
+              {saveIssues.map((i, idx) => (
+                <li key={idx} style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}>
+                  {i.path} · {i.code} · {i.message}
+                </li>
+              ))}
+            </ul>
+          }
+        />
+      ) : null}
     </div>
   );
 }

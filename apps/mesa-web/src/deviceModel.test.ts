@@ -225,6 +225,7 @@ import {
   applySelectionAdd,
   effectiveResourceParameters,
   resourceInstanceKey,
+  missingRequiredParams,
 } from "./resourceSelectionModel";
 
 describe("selection reconciliation（冻结算法）", () => {
@@ -407,6 +408,46 @@ describe("applySelectionAdd（父层共享实现，两调用方行为一致）",
     });
     expect(conflict.next).toBe(editable);
     expect(conflict.message).toMatch(/point_key/);
+  });
+});
+
+describe("missingRequiredParams（Web required preflight，表单完整性唯一判断）", () => {
+  // 与 Core validate_instance REQUIRED 语义对齐：只看字段 key 缺不缺席，
+  // 不看类型/enum/range/pattern；`0`/`false`/`""` 视为在场。
+  const schema = () => ({
+    fields: [
+      { key: "axis", required: true },
+      { key: "count", required: true },
+      { key: "flag", required: true },
+      { key: "optional", required: false },
+    ],
+  });
+
+  it("required 缺席 → 逐个报出；选填缺席不报", () => {
+    expect(missingRequiredParams(schema(), {})).toEqual(["axis", "count", "flag"]);
+    expect(missingRequiredParams(schema(), { axis: 1 })).toEqual(["count", "flag"]);
+  });
+
+  it("required integer = 0 / boolean = false → 不算缺失（禁 truthy 判）", () => {
+    expect(missingRequiredParams(schema(), { axis: 0, count: 0, flag: false })).toEqual([]);
+  });
+
+  it("undefined / null 视为缺席（控件清空态）", () => {
+    expect(missingRequiredParams(schema(), { axis: undefined, count: null, flag: false })).toEqual([
+      "axis",
+      "count",
+    ]);
+  });
+
+  it("补齐 required → 空（按钮可恢复加入）", () => {
+    expect(missingRequiredParams(schema(), { axis: 1, count: 2, flag: true })).toEqual([]);
+  });
+
+  it("range/enum/type 错误不拦截（交给 Core issues 展示）", () => {
+    // 越界/错类型照样算"在场"：前端不自作主张，Core 会报 OUT_OF_RANGE/INVALID_TYPE。
+    expect(missingRequiredParams(schema(), { axis: "not-a-number", count: -999, flag: "x" })).toEqual(
+      [],
+    );
   });
 });
 
