@@ -44,7 +44,10 @@ export interface RequiredParamsSource {
 /**
  * Web required preflight（表单完整性预检，唯一允许的前端 required 判断）：
  * 返回 required 但在 params 中**缺席**的字段 key 列表。
- * - 缺席 = `!(key in params)` 或值为 `undefined`/`null`（控件清空态）；
+ * - 缺席 = key 不存在，或值为 `undefined`（JSON 序列化丢掉 undefined，
+ *   wire 上等价 key 不存在，故算缺席）；
+ * - `null` 是"存在但类型可能非法"：key 在场，Core 走 INVALID_TYPE，
+ *   Web 不得报缺席（InputNumber 清空产 null，真实可达）；
  * - `0` / `false` / `""` 视为在场（与 Core `obj.get` 语义对齐，不得用 truthy 判）；
  * - secret marker（`{secret_set:true}` / `{clear_secret:true}` 对象）视为在场；
  * - 只回答"缺不缺"，绝不判断类型/enum/range/pattern（那是 Core 唯一真值）。
@@ -57,14 +60,12 @@ export function missingRequiredParams(
   const out: string[] = [];
   for (const f of schema.fields ?? []) {
     if (!f.required) continue;
-    // hasOwn 优先（显式传入但 undefined 仍算缺席，与 removeUndefined 对齐）；
-    // in 不可用——原型链 key 会误判在场。
+    // hasOwn 优先（in 不可用——原型链 key 会误判在场）。
     if (!Object.prototype.hasOwnProperty.call(params, f.key)) {
       out.push(f.key);
       continue;
     }
-    const v = params[f.key];
-    if (v === undefined || v === null) out.push(f.key);
+    if (params[f.key] === undefined) out.push(f.key);
   }
   return out;
 }

@@ -432,10 +432,10 @@ describe("missingRequiredParams（Web required preflight，表单完整性唯一
     expect(missingRequiredParams(schema(), { axis: 0, count: 0, flag: false })).toEqual([]);
   });
 
-  it("undefined / null 视为缺席（控件清空态）", () => {
+  it("undefined 算缺席（wire 等价 key 不存在）；null 在场（交 Core INVALID_TYPE）", () => {
+    // null 是"存在但类型可能非法"，由 Core INVALID_TYPE 裁决，Web 不得报缺席。
     expect(missingRequiredParams(schema(), { axis: undefined, count: null, flag: false })).toEqual([
       "axis",
-      "count",
     ]);
   });
 
