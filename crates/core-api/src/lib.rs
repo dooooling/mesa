@@ -1164,30 +1164,53 @@ async fn control_command(
         .await
     {
         Ok((status, result_json, error)) => {
-            // Foundation-3 结果门禁（终审 #2 修正）：只有 Succeeded 才检查
-            // result_schema——Failed/TimedOut/Rejected/Cancelled 是 proto 定义
-            // 的正常终态（此时 result_json="" 为空），走正常失败审计/响应，
-            // 绝不能冒充 DRIVER_CONTRACT_VIOLATION。
+            // Foundation-3 结果门禁（终审 #2 修正 + status 白名单 fail-closed）：
+            // 先验证 status（proto 只允许 Succeeded | Failed | TimedOut |
+            // Rejected | Cancelled）：未知 status 即 DRIVER_CONTRACT_VIOLATION
+            //（审计 FAILED，HTTP 502），不得当正常业务失败接受。
+            // 只有 Succeeded 才检查 result_schema；Failed 等正常终态直通。
             // HTTP 语义：Succeeded(+schema 通过)→200；业务失败→200+status；
-            // schema 违反→502 DRIVER_CONTRACT_VIOLATION（fail-closed）。
+            // schema 违反/未知 status→502 DRIVER_CONTRACT_VIOLATION。
             let result_val: serde_json::Value = serde_json::from_str(&result_json)
                 .unwrap_or(serde_json::Value::String(result_json.clone()));
-            if status != "Succeeded" {
-                let detail = format!("{status}:{result_json}:{error}");
-                if let Err(e) = state.store.update_control_audit(
-                    &request_id,
-                    "FAILED",
-                    Some(&detail),
-                    mesa_core_types::now_unix_ns(),
-                ) {
-                    warn_audit_update("control_audit result", &request_id, e);
+            match classify_command_status(&status) {
+                CommandStatusClass::BusinessFailure => {
+                    let detail = format!("{status}:{result_json}:{error}");
+                    if let Err(e) = state.store.update_control_audit(
+                        &request_id,
+                        "FAILED",
+                        Some(&detail),
+                        mesa_core_types::now_unix_ns(),
+                    ) {
+                        warn_audit_update("control_audit result", &request_id, e);
+                    }
+                    return (
+                        StatusCode::OK,
+                        Json(
+                            serde_json::json!({"request_id": request_id, "status": status, "result": result_val, "error": error}),
+                        ),
+                    );
                 }
-                return (
-                    StatusCode::OK,
-                    Json(
-                        serde_json::json!({"request_id": request_id, "status": status, "result": result_val, "error": error}),
-                    ),
-                );
+                CommandStatusClass::Unknown => {
+                    let detail = format!(
+                        "DRIVER_CONTRACT_VIOLATION:unknown command status `{status}`:{result_json}:{error}"
+                    );
+                    if let Err(e) = state.store.update_control_audit(
+                        &request_id,
+                        "FAILED",
+                        Some(&detail),
+                        mesa_core_types::now_unix_ns(),
+                    ) {
+                        warn_audit_update("control_audit result", &request_id, e);
+                    }
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(
+                            serde_json::json!({"error": {"code": "DRIVER_CONTRACT_VIOLATION", "message": detail}, "request_id": request_id}),
+                        ),
+                    );
+                }
+                CommandStatusClass::Succeeded => {}
             }
             let result_issues = mesa_core_types::gate_command_result_against(
                 &desc,
@@ -1196,15 +1219,11 @@ async fn control_command(
                 "command",
             );
             if result_issues.is_empty() {
-                let audit_status = if status == "Succeeded" {
-                    "COMPLETED"
-                } else {
-                    "FAILED"
-                };
+                // 能到这里 status 必为 Succeeded（白名单已分流），审计 COMPLETED。
                 let detail = format!("{status}:{result_json}:{error}");
                 if let Err(e) = state.store.update_control_audit(
                     &request_id,
-                    audit_status,
+                    "COMPLETED",
                     Some(&detail),
                     mesa_core_types::now_unix_ns(),
                 ) {
@@ -1254,6 +1273,63 @@ async fn control_command(
                     serde_json::json!({"error": {"code": e.code, "message": e.message}, "request_id": request_id}),
                 ),
             )
+        }
+    }
+}
+
+/// Command status 白名单分类（终审 fail-closed）：proto 只允许
+/// `Succeeded | Failed | TimedOut | Rejected | Cancelled`。
+/// 未知 status（如 `""` / `"Failure"` / `"Bogus"`，含大小写漂移）即
+/// Driver contract violation，不得当正常业务失败接受（HTTP 200）。
+#[derive(Debug, PartialEq)]
+enum CommandStatusClass {
+    Succeeded,
+    BusinessFailure,
+    Unknown,
+}
+
+fn classify_command_status(status: &str) -> CommandStatusClass {
+    match status {
+        "Succeeded" => CommandStatusClass::Succeeded,
+        "Failed" | "TimedOut" | "Rejected" | "Cancelled" => CommandStatusClass::BusinessFailure,
+        _ => CommandStatusClass::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod command_status_tests {
+    use super::*;
+
+    /// 终审回归门：status 白名单 fail-closed。
+    /// `Bogus`/`""`/`"Failure"`（含大小写漂移）必须判 Unknown，
+    /// 绝不能按普通 Failed 返回 200。
+    #[test]
+    fn command_status_whitelist_is_fail_closed() {
+        assert_eq!(
+            classify_command_status("Succeeded"),
+            CommandStatusClass::Succeeded
+        );
+        for s in ["Failed", "TimedOut", "Rejected", "Cancelled"] {
+            assert_eq!(
+                classify_command_status(s),
+                CommandStatusClass::BusinessFailure,
+                "{s}"
+            );
+        }
+        for s in [
+            "",
+            "Failure",
+            "Bogus",
+            "succeeded",
+            "FAILED",
+            "Timeout",
+            "Cancel",
+        ] {
+            assert_eq!(
+                classify_command_status(s),
+                CommandStatusClass::Unknown,
+                "{s}"
+            );
         }
     }
 }
