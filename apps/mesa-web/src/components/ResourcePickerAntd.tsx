@@ -52,7 +52,6 @@ export function suggestPointKey(
 
 export function ResourcePickerAntd({
   resources,
-  existingKeys,
   existingSelections,
   protectedSelections,
   onAdd,
@@ -60,19 +59,17 @@ export function ResourcePickerAntd({
   endpointId,
 }: {
   resources: ResourceDescriptor[];
-  /** 已存在的 point_key（含当前已选）：用于自动命名去重，最终唯一性由 Core 门禁负责 */
-  existingKeys: string[];
   /**
-   * Selection 层 reconciliation 输入（冻结算法）：
+   * Selection 层 reconciliation 输入（冻结算法，唯一真值）：
    * - existingSelections：editable 全量（唯一允许 merge/append 的集合）；
    * - protectedSelections：preserved tasks 展开（永远只读，只参与
    *   反显/exact 检测/point_key 占用检测）。
-   * 未提供时回落为纯 key 检查（老行为），不得静默放行。
+   * knownKeys 完全由 selections 推导，不再接受外部 key 列表
+   * （终审 #2：删除 existingKeys 双真值/旧 fallback）。
    */
-  existingSelections?: ResourceSelectionLike[];
+  existingSelections: ResourceSelectionLike[];
   protectedSelections?: ResourceSelectionLike[];
-  /** 返回 true 表示父层已接收；成功后清空 outputs（保留 params），
-   * 再次勾选同 output 自然生成 .2/.3，连续加入形成闭环 */
+  /** 返回 true 表示父层已接收；成功后清空 outputs（保留 params） */
   onAdd: (sel: ResourceSelectionInput) => boolean;
   /** Descriptor.resource_selection_methods 声明；缺省即 manual（老驱动兼容） */
   selectionMethods?: Array<"manual" | "browse" | "import">;
@@ -108,18 +105,16 @@ export function ResourcePickerAntd({
   const res = resources.find((r) => r.id === rid);
   if (!res) return <div style={{ color: "#525252" }}>无可用资源</div>;
 
-  // Selection 层输入：reconciliation 用全对象，未提供时回落（老行为）。
-  const editableSels: ResourceSelectionLike[] = existingSelections ?? [];
+  // Selection 层输入：reconciliation 用全对象（唯一真值）。
+  const editableSels: ResourceSelectionLike[] = existingSelections;
   const protectedSels: ResourceSelectionLike[] = protectedSelections ?? [];
   const schemaOf = (resourceId: string) => {
     const found = resources.find((r) => r.id === resourceId);
     return { fields: (found?.parameters.fields ?? []).map((f) => ({ key: f.key, default: f.default })) };
   };
-  // 全集 point_key（editable + protected）：自动命名的唯一依据。
-  const knownKeys = new Set<string>([
-    ...existingKeys,
-    ...allKnownPointKeys(editableSels, protectedSels),
-  ]);
+  // 全集 point_key（editable + protected）：自动命名与冲突提示的唯一依据，
+  // 完全由 selections 推导（终审 #2：无外部 key 列表）。
+  const knownKeys = allKnownPointKeys(editableSels, protectedSels);
   // 当前表单归属反显（同 resource+params 的已选 outputs 呈 disabled）。
   const ownership = outputOwnership(
     res.id,
@@ -240,27 +235,26 @@ export function ResourcePickerAntd({
           disabled={!outputs.length}
           onClick={() => {
             // 冻结算法前置裁决（只读 protected，只改 editable；protected 永不动）。
-            if (existingSelections) {
-              const decision = reconcileEditableSelection({
-                candidate: { resource_id: res.id, parameters: params, outputs },
-                editable: existingSelections,
-                protectedSelections: protectedSels,
-                schemaOf,
-              });
-              if (decision.kind === "duplicate-editable") {
-                message.warning(`已在采集中：${decision.outputs.join(", ")}，不会重复加入`);
-                return;
-              }
-              if (decision.kind === "duplicate-protected") {
-                message.warning(`已在其他任务采集：${decision.outputs.join(", ")}，不会重复加入`);
-                return;
-              }
-              if (decision.kind === "point-key-conflict") {
-                message.error(`point_key 已被其他采集项使用：${decision.pointKeys.join(", ")}（请改名）`);
-                return;
-              }
-              // merge/append 的实际数组变更由父层 onAdd 执行（父层持有 sels）。
+            // Picker 只做即时 UX 预判，最终防御门在父层 onAdd（同一纯函数）。
+            const decision = reconcileEditableSelection({
+              candidate: { resource_id: res.id, parameters: params, outputs },
+              editable: editableSels,
+              protectedSelections: protectedSels,
+              schemaOf,
+            });
+            if (decision.kind === "duplicate-editable") {
+              message.warning(`已在采集中：${decision.outputs.join(", ")}，不会重复加入`);
+              return;
             }
+            if (decision.kind === "duplicate-protected") {
+              message.warning(`已在其他任务采集：${decision.outputs.join(", ")}，不会重复加入`);
+              return;
+            }
+            if (decision.kind === "point-key-conflict") {
+              message.error(`point_key 已被其他采集项使用：${decision.pointKeys.join(", ")}（请改名）`);
+              return;
+            }
+            // merge/append 的实际数组变更由父层 onAdd 执行（父层持有 sels）。
             if (onAdd({ resource_id: res.id, parameters: params, outputs })) setOutputs([]);
           }}
         >

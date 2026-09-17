@@ -195,28 +195,13 @@ export function EndpointAcquisitionPane({
       </div>
       <ResourcePickerAntd
         resources={desc.resources}
-        existingKeys={sels.flatMap((s) => s.outputs.map((o) => o.point_key))}
         existingSelections={sels}
         protectedSelections={preservedTasks.flatMap((t) => selectionsOf(t))}
         selectionMethods={desc.resource_selection_methods}
         endpointId={endpointId}
         onAdd={(s) => {
-          const keys = s.outputs.map((o) => o.point_key);
-          // point_key 全集检查（editable + preserved）：手改重名当场拒绝，
-          // 不故意等后端 400（Core 仍保留最后一道门，防并发修改）。
-          const known = new Set([
-            ...sels.flatMap((x) => x.outputs.map((o) => o.point_key)),
-            ...preservedTasks.flatMap((t) =>
-              selectionsOf(t).flatMap((x) => x.outputs.map((o) => o.point_key)),
-            ),
-          ]);
-          const keyDup = keys.filter((k) => known.has(k));
-          if (keyDup.length) {
-            message.error(`point_key 已被其他采集项使用：${keyDup.join(", ")}（请改名）`);
-            return false;
-          }
-          // 冻结算法：只允许改 editable（sels）；protected 永不动。
-          // 同 ResourceInstance → merge 进该 editable 项；否则 append。
+          // 唯一防御门：同一纯函数裁决（终审 #3：父层不再手写 key 集合规则，
+          // point_key 检查由 reconcile 的 point-key-conflict 分支统一执行）。
           const schemaOf = (resourceId: string) => {
             const found = desc.resources.find((r) => r.id === resourceId);
             return {

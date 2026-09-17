@@ -222,6 +222,8 @@ const other = (id: string): AcquisitionTaskShape => ({
 
 import {
   reconcileEditableSelection,
+  effectiveResourceParameters,
+  resourceInstanceKey,
 } from "./resourceSelectionModel";
 
 describe("selection reconciliation（冻结算法）", () => {
@@ -236,6 +238,21 @@ describe("selection reconciliation（冻结算法）", () => {
     parameters: Record<string, unknown>,
     outputs: Array<{ output: string; point_key: string }>,
   ) => ({ resource_id, parameters, outputs });
+
+  it("终审 #1：{} / {axis:1} / {axis:undefined} effective identity 一致", () => {
+    const eff = (p: Record<string, unknown>) =>
+      resourceInstanceKey("dynamic", effectiveResourceParameters(schemaOf("dynamic"), p));
+    expect(eff({})).toBe(eff({ axis: 1 }));
+    expect(eff({ axis: undefined })).toBe(eff({}));
+    // 且三者判成同一 exact duplicate
+    const d = reconcileEditableSelection({
+      candidate: sel("dynamic", { axis: undefined }, [{ output: "feed", point_key: "k" }]),
+      editable: [sel("dynamic", {}, [{ output: "feed", point_key: "k" }])],
+      protectedSelections: [],
+      schemaOf,
+    });
+    expect(d.kind).toBe("duplicate-editable");
+  });
 
   it("effective parameters：缺省经 defaults 物化后相等（{} ≡ {axis:1}）", () => {
     const d1 = reconcileEditableSelection({

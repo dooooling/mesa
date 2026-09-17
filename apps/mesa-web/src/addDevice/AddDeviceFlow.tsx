@@ -255,7 +255,7 @@ export function AddDeviceFlow() {
             <>
               <ResourcePickerAntd
                 resources={(desc.resources ?? []) as never[]}
-                existingKeys={[]}
+                existingSelections={sels as never}
                 selectionMethods={(desc.resource_selection_methods ?? ["manual"]) as never}
                 onAdd={(s) => {
                   setSels((cur) => [...cur, s as ResourceSelection]);

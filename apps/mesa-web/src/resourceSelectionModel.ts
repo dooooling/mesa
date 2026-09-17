@@ -44,8 +44,7 @@ export function materializeSchemaDefaults(
 }
 
 /** JSON 语义的稳定化：对象 key 排序，数组保序；undefined 丢弃。 */
-function stableJson(value: unknown): unknown {
-  if (value === undefined) return undefined;
+function stableJson(value: unknown): unknown {  if (value === undefined) return undefined;
   if (value === null) return null;
   if (Array.isArray(value)) {
     const out: unknown[] = [];
@@ -66,8 +65,22 @@ function stableJson(value: unknown): unknown {
   return value;
 }
 
+/** 显式参数去 undefined：控件清空值不得覆盖 Descriptor default。
+ * 必须先删再覆盖，否则 {axis:undefined} 会先盖掉 default 再被 stable 删掉，
+ * 导致与 {} / {axis:1} 判成不同实例（终审 blocker #1）。 */
+function removeUndefined(
+  parameters: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(parameters ?? {})) {
+    if (v !== undefined) out[k] = v;
+  }
+  return out;
+}
+
 /**
  * effective(parameters)：Descriptor defaults 被显式值覆盖后的生效参数。
+ * 顺序：先删 explicit 的 undefined → 再覆盖 defaults → 最后 stable。
  * 只做结构归一，不做任何值语义转换（类型保持原样）。
  */
 export function effectiveResourceParameters(
@@ -76,22 +89,23 @@ export function effectiveResourceParameters(
 ): Record<string, unknown> {
   const merged: Record<string, unknown> = {
     ...materializeSchemaDefaults(schema),
-    ...(parameters ?? {}),
+    ...removeUndefined(parameters),
   };
   return (stableJson(merged) ?? {}) as Record<string, unknown>;
 }
 
-/** ResourceInstance 签名：resource_id + effective(parameters) 规范 JSON。 */
+/** ResourceInstance 签名：[resource_id, effective(parameters)] 结构编码。
+ * 无歧义数组编码，不依赖分隔符（resource/output ID 含特殊字符仍安全）。 */
 export function resourceInstanceKey(
   resourceId: string,
   effectiveParameters: Record<string, unknown>,
 ): string {
-  return `${resourceId}\n${JSON.stringify(stableJson(effectiveParameters) ?? {})}`;
+  return JSON.stringify([resourceId, stableJson(effectiveParameters) ?? {}]);
 }
 
-/** ExactSelectionOutput 签名：ResourceInstance + output。 */
+/** ExactSelectionOutput 签名：[ResourceInstance, output] 结构编码。 */
 export function selectionOutputKey(instanceKey: string, output: string): string {
-  return `${instanceKey}\n${output}`;
+  return JSON.stringify([instanceKey, output]);
 }
 
 /** 候选 Selection 进入父层后的裁决结果（调用方据此 warning，不抛异常）。 */
