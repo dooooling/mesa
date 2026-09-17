@@ -220,6 +220,196 @@ const other = (id: string): AcquisitionTaskShape => ({
   binding: { kind: "driver.native.v1", config: { op: "scan" } },
 });
 
+import {
+  reconcileEditableSelection,
+  applySelectionAdd,
+  effectiveResourceParameters,
+  resourceInstanceKey,
+} from "./resourceSelectionModel";
+
+describe("selection reconciliation（冻结算法）", () => {
+  const schemaOf = (resourceId: string) => ({
+    fields:
+      resourceId === "dynamic"
+        ? [{ key: "axis", default: 1 }]
+        : [],
+  });
+  const sel = (
+    resource_id: string,
+    parameters: Record<string, unknown>,
+    outputs: Array<{ output: string; point_key: string }>,
+  ) => ({ resource_id, parameters, outputs });
+
+  it("终审 #1：{} / {axis:1} / {axis:undefined} effective identity 一致", () => {
+    const eff = (p: Record<string, unknown>) =>
+      resourceInstanceKey("dynamic", effectiveResourceParameters(schemaOf("dynamic"), p));
+    expect(eff({})).toBe(eff({ axis: 1 }));
+    expect(eff({ axis: undefined })).toBe(eff({}));
+    // 且三者判成同一 exact duplicate
+    const d = reconcileEditableSelection({
+      candidate: sel("dynamic", { axis: undefined }, [{ output: "feed", point_key: "k" }]),
+      editable: [sel("dynamic", {}, [{ output: "feed", point_key: "k" }])],
+      protectedSelections: [],
+      schemaOf,
+    });
+    expect(d.kind).toBe("duplicate-editable");
+  });
+
+  it("effective parameters：缺省经 defaults 物化后相等（{} ≡ {axis:1}）", () => {
+    const d1 = reconcileEditableSelection({
+      candidate: sel("dynamic", {}, [{ output: "feed", point_key: "dynamic.feed" }]),
+      editable: [sel("dynamic", { axis: 1 }, [{ output: "feed", point_key: "dynamic.feed" }])],
+      protectedSelections: [],
+      schemaOf,
+    });
+    expect(d1.kind).toBe("duplicate-editable");
+  });
+
+  it("exact output 在 editable 即 duplicate（拒绝，不 merge 不 append）", () => {
+    const d = reconcileEditableSelection({
+      candidate: sel("dynamic", { axis: 1 }, [{ output: "feed", point_key: "dynamic.feed" }]),
+      editable: [sel("dynamic", { axis: 1 }, [{ output: "feed", point_key: "dynamic.feed" }])],
+      protectedSelections: [],
+      schemaOf,
+    });
+    expect(d.kind).toBe("duplicate-editable");
+  });
+
+  it("exact output 在 protected 即拒绝（已在其他任务采集）", () => {
+    const d = reconcileEditableSelection({
+      candidate: sel("dynamic", { axis: 1 }, [{ output: "feed", point_key: "x" }]),
+      editable: [],
+      protectedSelections: [
+        sel("dynamic", { axis: 1 }, [{ output: "feed", point_key: "dynamic.feed" }]),
+      ],
+      schemaOf,
+    });
+    expect(d.kind).toBe("duplicate-protected");
+  });
+
+  it("同 ResourceInstance 新 output → merge 进 editable 该项（protected 不动）", () => {
+    const editable = [sel("dynamic", { axis: 1 }, [{ output: "feed", point_key: "dynamic.feed" }])];
+    const prot = [sel("dynamic", { axis: 1 }, [{ output: "position.absolute", point_key: "p" }])];
+    const d = reconcileEditableSelection({
+      candidate: sel("dynamic", { axis: 1 }, [{ output: "spindle.speed", point_key: "s" }]),
+      editable,
+      protectedSelections: prot,
+      schemaOf,
+    });
+    expect(d).toMatchObject({ kind: "merge", mergedIndex: 0 });
+    // 调用方按 merge 执行后 protected 深相等（回归：只读任务永不被改）
+    expect(prot).toEqual([
+      sel("dynamic", { axis: 1 }, [{ output: "position.absolute", point_key: "p" }]),
+    ]);
+  });
+
+  it("无同组 → append；point_key 冲突 → 拒绝（不碰后端 400）", () => {
+    const app = reconcileEditableSelection({
+      candidate: sel("status", {}, [{ output: "value", point_key: "k1" }]),
+      editable: [],
+      protectedSelections: [],
+      schemaOf,
+    });
+    expect(app.kind).toBe("append");
+    const conflict = reconcileEditableSelection({
+      candidate: sel("status", {}, [{ output: "value", point_key: "k1" }]),
+      editable: [sel("other", {}, [{ output: "value", point_key: "k1" }])],
+      protectedSelections: [],
+      schemaOf,
+    });
+    expect(conflict).toMatchObject({ kind: "point-key-conflict", pointKeys: ["k1"] });
+  });
+
+  it("preserved task 全程参与检测但深相等不变（核心回归）", () => {
+    const prot = [
+      sel("dynamic", { axis: 1 }, [{ output: "feed", point_key: "dynamic.feed" }]),
+    ];
+    const before = JSON.parse(JSON.stringify(prot));
+    const decisions = [
+      reconcileEditableSelection({
+        candidate: sel("dynamic", { axis: 1 }, [{ output: "feed", point_key: "other" }]),
+        editable: [],
+        protectedSelections: prot,
+        schemaOf,
+      }),
+      reconcileEditableSelection({
+        candidate: sel("dynamic", { axis: 2 }, [{ output: "feed", point_key: "dynamic.feed" }]),
+        editable: [],
+        protectedSelections: prot,
+        schemaOf,
+      }),
+      reconcileEditableSelection({
+        candidate: sel("status", {}, [{ output: "value", point_key: "new" }]),
+        editable: [],
+        protectedSelections: prot,
+        schemaOf,
+      }),
+    ];
+    expect(decisions.map((d) => d.kind)).toEqual([
+      "duplicate-protected",
+      "point-key-conflict",
+      "append",
+    ]);
+    expect(prot).toEqual(before);
+  });
+
+  it("绝不做值语义转换（'1' ≠ 1，大小写敏感）", () => {
+    const d = reconcileEditableSelection({
+      candidate: sel("r", { v: "1" }, [{ output: "o", point_key: "k" }]),
+      editable: [sel("r", { v: 1 }, [{ output: "o", point_key: "k" }])],
+      protectedSelections: [],
+      schemaOf: () => ({ fields: [] }),
+    });
+    // 参数 JSON 不同 → 不是 exact duplicate；point_key 相同 → key 冲突
+    expect(d.kind).toBe("point-key-conflict");
+  });
+});
+
+describe("applySelectionAdd（父层共享实现，两调用方行为一致）", () => {
+  // 终审指定回归：已有 register/value + 再加 register/raw
+  // → sels.length === 1，outputs === [value, raw]（merge，不是 append 两项）。
+  const regSchema = () => ({ fields: [] });
+  const regSel = (
+    params: Record<string, unknown>,
+    outputs: Array<{ output: string; point_key: string }>,
+  ) => ({ resource_id: "register", parameters: params, outputs });
+
+  it("同实例新 output → merge 进同一 selection（sels 长度不变）", () => {
+    const editable = [regSel({ unit: 3 }, [{ output: "value", point_key: "register.value" }])];
+    const { next, message } = applySelectionAdd({
+      candidate: regSel({ unit: 3 }, [{ output: "raw", point_key: "register.raw" }]),
+      editable,
+      protectedSelections: [],
+      schemaOf: regSchema,
+    });
+    expect(message).toBeNull();
+    expect(next).toHaveLength(1);
+    expect(next[0].outputs.map((o) => o.output).sort()).toEqual(["raw", "value"]);
+    // 输入数组不被原地修改（调用方 setSels(next) 语义）
+    expect(editable[0].outputs).toHaveLength(1);
+  });
+
+  it("duplicate / conflict → 数组不变 + 返回中文原因", () => {
+    const editable = [regSel({ unit: 3 }, [{ output: "value", point_key: "register.value" }])];
+    const dup = applySelectionAdd({
+      candidate: regSel({ unit: 3 }, [{ output: "value", point_key: "other" }]),
+      editable,
+      protectedSelections: [],
+      schemaOf: regSchema,
+    });
+    expect(dup.next).toBe(editable);
+    expect(dup.message).toMatch(/已在采集/);
+    const conflict = applySelectionAdd({
+      candidate: regSel({ unit: 9 }, [{ output: "raw", point_key: "register.value" }]),
+      editable,
+      protectedSelections: [],
+      schemaOf: regSchema,
+    });
+    expect(conflict.next).toBe(editable);
+    expect(conflict.message).toMatch(/point_key/);
+  });
+});
+
 describe("splitAcquisitionTasks", () => {
   it("首个 canonical 归编辑，其余归保留（task-a/b/c 场景）", () => {
     const { editable, preserved } = splitAcquisitionTasks([canon("task-a"), other("task-b"), other("task-c")]);

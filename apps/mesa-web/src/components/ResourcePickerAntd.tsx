@@ -12,7 +12,14 @@
 import { useEffect, useState } from "react";
 import { Button, Card, Checkbox, Input, Select, Tabs, Tag, message } from "antd";
 import type { ResourceDescriptor } from "../types";
-import { DescriptorFields, materializeSchemaDefaults } from "./DescriptorFields";
+import { materializeSchemaDefaults } from "../resourceSelectionModel";
+import {
+  allKnownPointKeys,
+  outputOwnership,
+  reconcileEditableSelection,
+  type ResourceSelectionLike,
+} from "../resourceSelectionModel";
+import { DescriptorFields } from "./DescriptorFields";
 import { ResourceBrowseAntd } from "./ResourceBrowseAntd";
 import type { BrowseSelection } from "../browseModel";
 
@@ -29,7 +36,8 @@ export interface PickerExternalFill {
   nonce: number;
 }
 
-/** point_key 自动命名：`resource.output`，冲突时 `.2/.3/...` 递增。 */
+/** point_key 自动命名：`resource.output`，冲突时 `.2/.3/...` 递增。
+ * 依据全集（editable + protected）：用户手改成已存在 key 也会被上游拦截。 */
 export function suggestPointKey(
   resourceId: string,
   outputId: string,
@@ -44,16 +52,24 @@ export function suggestPointKey(
 
 export function ResourcePickerAntd({
   resources,
-  existingKeys,
+  existingSelections,
+  protectedSelections,
   onAdd,
   selectionMethods,
   endpointId,
 }: {
   resources: ResourceDescriptor[];
-  /** 已存在的 point_key（含当前已选）：用于自动命名去重，最终唯一性由 Core 门禁负责 */
-  existingKeys: string[];
-  /** 返回 true 表示父层已接收；成功后清空 outputs（保留 params），
-   * 再次勾选同 output 自然生成 .2/.3，连续加入形成闭环 */
+  /**
+   * Selection 层 reconciliation 输入（冻结算法，唯一真值）：
+   * - existingSelections：editable 全量（唯一允许 merge/append 的集合）；
+   * - protectedSelections：preserved tasks 展开（永远只读，只参与
+   *   反显/exact 检测/point_key 占用检测）。
+   * knownKeys 完全由 selections 推导，不再接受外部 key 列表
+   * （终审 #2：删除 existingKeys 双真值/旧 fallback）。
+   */
+  existingSelections: ResourceSelectionLike[];
+  protectedSelections?: ResourceSelectionLike[];
+  /** 返回 true 表示父层已接收；成功后清空 outputs（保留 params） */
   onAdd: (sel: ResourceSelectionInput) => boolean;
   /** Descriptor.resource_selection_methods 声明；缺省即 manual（老驱动兼容） */
   selectionMethods?: Array<"manual" | "browse" | "import">;
@@ -89,6 +105,26 @@ export function ResourcePickerAntd({
   const res = resources.find((r) => r.id === rid);
   if (!res) return <div style={{ color: "#525252" }}>无可用资源</div>;
 
+  // Selection 层输入：reconciliation 用全对象（唯一真值）。
+  const editableSels: ResourceSelectionLike[] = existingSelections;
+  const protectedSels: ResourceSelectionLike[] = protectedSelections ?? [];
+  const schemaOf = (resourceId: string) => {
+    const found = resources.find((r) => r.id === resourceId);
+    return { fields: (found?.parameters.fields ?? []).map((f) => ({ key: f.key, default: f.default })) };
+  };
+  // 全集 point_key（editable + protected）：自动命名与冲突提示的唯一依据，
+  // 完全由 selections 推导（终审 #2：无外部 key 列表）。
+  const knownKeys = allKnownPointKeys(editableSels, protectedSels);
+  // 当前表单归属反显（同 resource+params 的已选 outputs 呈 disabled）。
+  const ownership = outputOwnership(
+    res.id,
+    params,
+    res.outputs.map((o) => o.id),
+    editableSels,
+    protectedSels,
+    schemaOf,
+  );
+
   const switchResource = (v: string) => {
     setRid(v);
     const next = resources.find((r) => r.id === v);
@@ -98,7 +134,7 @@ export function ResourcePickerAntd({
 
   const toggleOutput = (outputId: string, checked: boolean) => {
     if (checked) {
-      const taken = new Set([...existingKeys, ...outputs.map((o) => o.point_key)]);
+      const taken = new Set([...knownKeys, ...outputs.map((o) => o.point_key)]);
       setOutputs([...outputs, { output: outputId, point_key: suggestPointKey(res.id, outputId, taken) }]);
     } else {
       setOutputs(outputs.filter((x) => x.output !== outputId));
@@ -154,18 +190,25 @@ export function ResourcePickerAntd({
         <Card size="small" title={`输出 · ${outputs.length}/${res.outputs.length}`}>
           <div style={{ display: "grid", gap: 8 }}>
             {res.outputs.map((o) => {
-              const checked = outputs.some((x) => x.output === o.id);
+              const inForm = outputs.some((x) => x.output === o.id);
+              // 反显：exact 签名已在 editable/protected 即 disabled（只读提示，
+              // 不在此编辑；新增走 merge/拒绝路径，由加入时裁决）。
+              const owned = ownership.get(o.id);
+              const takenElsewhere = owned !== undefined && owned.state !== "free";
               return (
                 <label key={o.id} style={{ display: "flex", gap: 8, alignItems: "center" }}>
                   <Checkbox
                     aria-label={`output-${o.id}`}
-                    checked={checked}
+                    checked={inForm || takenElsewhere}
+                    disabled={takenElsewhere && !inForm}
                     onChange={(e) => toggleOutput(o.id, e.target.checked)}
                   />
                   <span style={{ flex: 1 }}>
                     {labelOf(o.label) ?? o.id}{" "}
                     <Tag>{o.type_spec.kind === "fixed" ? o.type_spec.data_type : o.type_spec.kind === "from_parameter" ? `←${o.type_spec.parameter}` : "driver"}</Tag>
                     {o.access !== "read" ? <Tag color="orange">{o.access}</Tag> : null}
+                    {owned?.state === "editable" ? <Tag color="blue">已采集</Tag> : null}
+                    {owned?.state === "protected" ? <Tag color="purple">其他任务已采集</Tag> : null}
                   </span>
                 </label>
               );
@@ -176,8 +219,14 @@ export function ResourcePickerAntd({
                 value={o.point_key}
                 onChange={(e) => setOutputs(outputs.map((x) => (x.output === o.output ? { ...x, point_key: e.target.value } : x)))}
                 prefix={<span style={{ fontSize: 11, color: "#525252" }}>{o.output}</span>}
+                status={knownKeys.has(o.point_key) ? "error" : undefined}
               />
             ))}
+            {outputs.some((o) => knownKeys.has(o.point_key)) ? (
+              <div style={{ fontSize: 12, color: "#da1e28" }}>
+                point_key 已被其他采集项使用，加入将被拒绝（请改名）。
+              </div>
+            ) : null}
           </div>
         </Card>
 
@@ -185,6 +234,27 @@ export function ResourcePickerAntd({
           type="primary"
           disabled={!outputs.length}
           onClick={() => {
+            // 冻结算法前置裁决（只读 protected，只改 editable；protected 永不动）。
+            // Picker 只做即时 UX 预判，最终防御门在父层 onAdd（同一纯函数）。
+            const decision = reconcileEditableSelection({
+              candidate: { resource_id: res.id, parameters: params, outputs },
+              editable: editableSels,
+              protectedSelections: protectedSels,
+              schemaOf,
+            });
+            if (decision.kind === "duplicate-editable") {
+              message.warning(`已在采集中：${decision.outputs.join(", ")}，不会重复加入`);
+              return;
+            }
+            if (decision.kind === "duplicate-protected") {
+              message.warning(`已在其他任务采集：${decision.outputs.join(", ")}，不会重复加入`);
+              return;
+            }
+            if (decision.kind === "point-key-conflict") {
+              message.error(`point_key 已被其他采集项使用：${decision.pointKeys.join(", ")}（请改名）`);
+              return;
+            }
+            // merge/append 的实际数组变更由父层 onAdd 执行（父层持有 sels）。
             if (onAdd({ resource_id: res.id, parameters: params, outputs })) setOutputs([]);
           }}
         >

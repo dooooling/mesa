@@ -17,6 +17,7 @@ import {
 } from "../deviceModel";
 import { DescriptorFields, materializeSchemaDefaults } from "../components/DescriptorFields";
 import { ResourcePickerAntd } from "../components/ResourcePickerAntd";
+import { applySelectionAdd } from "../resourceSelectionModel";
 import { bootstrapDevice, isDraftComplete, newOperationKey, type AcquisitionDraft, type BootstrapReport, type ConnectionDraft, type DeviceDraft } from "./bootstrap";
 
 const FALLBACK_DRIVERS = [
@@ -255,10 +256,37 @@ export function AddDeviceFlow() {
             <>
               <ResourcePickerAntd
                 resources={(desc.resources ?? []) as never[]}
-                existingKeys={[]}
+                existingSelections={sels as never}
                 selectionMethods={(desc.resource_selection_methods ?? ["manual"]) as never}
                 onAdd={(s) => {
-                  setSels((cur) => [...cur, s as ResourceSelection]);
+                  // 与 EndpointAcquisitionPane 同一共享实现（终审 blocker：
+                  // 两调用方 reconciliation 行为必须一致；此处无 preserved
+                  // task，故 protectedSelections=[]）。
+                  const resources = (desc.resources ?? []) as Array<{
+                    id: string;
+                    parameters: { fields: Array<{ key: string; default?: unknown }> };
+                  }>;
+                  const schemaOf = (resourceId: string) => {
+                    const found = resources.find((r) => r.id === resourceId);
+                    return {
+                      fields: (found?.parameters.fields ?? []).map((f) => ({
+                        key: f.key,
+                        default: f.default,
+                      })),
+                    };
+                  };
+                  const { next, message: msg } = applySelectionAdd({
+                    candidate: s as never,
+                    editable: sels as never,
+                    protectedSelections: [],
+                    schemaOf,
+                  });
+                  if (msg) {
+                    if (msg.startsWith("point_key")) message.error(msg);
+                    else message.warning(msg);
+                    return false;
+                  }
+                  setSels(next as ResourceSelection[]);
                   return true;
                 }}
               />

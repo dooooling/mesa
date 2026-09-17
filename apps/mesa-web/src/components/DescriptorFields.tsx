@@ -4,6 +4,7 @@
 import { useState } from "react";
 import { Button, Checkbox, Input, InputNumber, Select } from "antd";
 import type { FieldDescriptor, SchemaDescriptor } from "../types";
+import { materializeSchemaDefaults } from "../resourceSelectionModel";
 
 function isVisible(field: FieldDescriptor, values: Record<string, unknown>): boolean {
   const cond = field.ui.visible_if;
@@ -16,17 +17,10 @@ function isVisible(field: FieldDescriptor, values: Record<string, unknown>): boo
 }
 
 /**
- * P1-4：将 schema 中带 `default` 的字段物化为参数初值。调用方在新建任务、
- * 切换流、加载服务端任务时统一使用，保证“UI 显示的 default 即实际保存值”，
- * required + default 字段不再出现显示有值却禁保存的不一致。
+ * P1-4：re-export（实现已迁移至 resourceSelectionModel 纯函数文件，
+ * 避免 deviceModel 经本组件反向耦合 React/AntD；调用方逐步迁移 import 源）。
  */
-export function materializeSchemaDefaults(schema: SchemaDescriptor): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const f of schema.fields ?? []) {
-    if (f.default !== undefined) out[f.key] = f.default;
-  }
-  return out;
-}
+export { materializeSchemaDefaults } from "../resourceSelectionModel";
 
 function FieldControl({
   field,

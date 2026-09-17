@@ -17,6 +17,7 @@ import {
   type ResourceSelection,
   type TaskSnapshotState,
 } from "../deviceModel";
+import { applySelectionAdd } from "../resourceSelectionModel";
 import { ApplyWithRestart } from "./ApplyWithRestart";
 import { ResourcePickerAntd } from "./ResourcePickerAntd";
 
@@ -194,17 +195,31 @@ export function EndpointAcquisitionPane({
       </div>
       <ResourcePickerAntd
         resources={desc.resources}
-        existingKeys={sels.flatMap((s) => s.outputs.map((o) => o.point_key))}
+        existingSelections={sels}
+        protectedSelections={preservedTasks.flatMap((t) => selectionsOf(t))}
         selectionMethods={desc.resource_selection_methods}
         endpointId={endpointId}
         onAdd={(s) => {
-          const keys = s.outputs.map((o) => o.point_key);
-          const dup = sels.some((ex) => ex.outputs.some((o) => keys.includes(o.point_key)));
-          if (dup) {
-            message.warning(`point_key 重复：${keys.join(", ")} 已存在`);
+          // 唯一防御门：与 AddDeviceFlow 同一共享实现（终审：两调用方行为一致，
+          // protected 永不动；point_key 检查由 reconcile 统一执行）。
+          const schemaOf = (resourceId: string) => {
+            const found = desc.resources.find((r) => r.id === resourceId);
+            return {
+              fields: (found?.parameters.fields ?? []).map((f) => ({ key: f.key, default: f.default })),
+            };
+          };
+          const { next, message: msg } = applySelectionAdd({
+            candidate: s,
+            editable: sels,
+            protectedSelections: preservedTasks.flatMap((t) => selectionsOf(t)),
+            schemaOf,
+          });
+          if (msg) {
+            if (msg.startsWith("point_key")) message.error(msg);
+            else message.warning(msg);
             return false;
           }
-          setSels((p) => [...p, s]);
+          setSels(next);
           return true;
         }}
       />
@@ -215,10 +230,19 @@ export function EndpointAcquisitionPane({
       </div>
       {preservedTasks.length > 0 && (
         <div style={{ fontSize: 12, color: "#525252" }}>
-          以下任务不在此编辑、保存时原样保留：
-          {preservedTasks.map((t) => (
-            <Tag key={t.id} style={{ marginLeft: 6 }}>{t.id} · {t.binding.kind} · {t.schedule?.mode}</Tag>
-          ))}
+          以下任务不在此编辑、保存时原样保留（只读，reconciliation 仅检测不修改）：
+          {preservedTasks.map((t) => {
+            const ss = selectionsOf(t);
+            const keys = ss.flatMap((s) => s.outputs.map((o) => o.point_key));
+            return (
+              <div key={t.id} style={{ marginTop: 4 }}>
+                <Tag>{t.id} · {t.binding.kind} · {t.schedule?.mode}</Tag>
+                <span style={{ marginLeft: 6, fontFamily: "'IBM Plex Mono',monospace", fontSize: 11 }}>
+                  {keys.length ? keys.join(", ") : "（空任务）"}
+                </span>
+              </div>
+            );
+          })}
         </div>
       )}
       {!!sels.length && (
