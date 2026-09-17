@@ -823,7 +823,8 @@ async fn import_endpoint(
 
 #[derive(Debug, Deserialize)]
 struct ControlWriteReq {
-    target: String,
+    // Foundation-3 单真值：结构化三元组（旧 string target 已删除，不留 shim）。
+    target: mesa_core_types::WriteTarget,
     value: serde_json::Value,
     expected_value: Option<serde_json::Value>,
     // 允许直接传 typed Value 的 tag 形式（兼容 Value 枚举序列化）
@@ -897,12 +898,14 @@ async fn control_write(
         }
         Err(e) => return store_err_to_response(e),
     };
-    let _ = rec; // 已校验存在，具体 driver 能力由 Driver 二次校验
-    let target = body.target.trim();
-    if target.is_empty() {
+    let target = body.target;
+    if target.resource_id.trim().is_empty() || target.output.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json_error("VALIDATION_ERROR", "target required")),
+            Json(json_error(
+                "VALIDATION_ERROR",
+                "target.resource_id/output required",
+            )),
         );
     }
     let value = if let Some(v) = body.value_typed {
@@ -934,20 +937,43 @@ async fn control_write(
     } else {
         None
     };
+    // Foundation-3 Core Descriptor 门禁（结构化 WriteTarget）：
+    // descriptor → capabilities.write → resource/output/access →
+    // parameters schema → value/expected 类型。issues 非空即 400，
+    // 绝不把非法 target 送到 Driver。
+    let desc = match state.manager.get_descriptor(&rec.driver_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": { "code": e.code, "message": e.message } })),
+            );
+        }
+    };
+    let (issues, _) =
+        mesa_core_types::gate_write_against(&desc, &target, &value, &expected, "target");
+    if !issues.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "valid": false, "issues": issues })),
+        );
+    }
     // 控制面鉴权（V1 最小实现：本机 actor 放行并记录；见 authorize_control）。
     if let Err(e) = authorize_control("local-api") {
         return e;
     }
     // 审计 STARTED（同步插入；插入失败则拒绝控制——记不下来就不执行，
     // 绝不产生“执行了但无审计”的控制）。
+    // operation_id = resource_id/output 稳定身份（parameters 进 request_json）；
+    // Driver 私有地址字符串彻底退出审计。
     let request_id = format!("api-wr-{}-{}", id, mesa_core_types::now_unix_ns());
     let audit_started = mesa_config_store::ControlAuditRecord {
         request_id: request_id.clone(),
         endpoint_id: id.clone(),
         actor: "local-api".into(),
         operation_type: "write".into(),
-        operation_id: target.to_string(),
-        request_json: serde_json::json!({"target": target, "value": format!("{value:?}")})
+        operation_id: target.audit_id(),
+        request_json: serde_json::json!({"target": target, "value": format!("{value:?}"), "expected": expected.as_ref().map(|v| format!("{v:?}"))})
             .to_string(),
         result_json: None,
         status: "STARTED".into(),
@@ -966,7 +992,7 @@ async fn control_write(
     }
     match state
         .manager
-        .control_write(&id, target, value, expected, &request_id)
+        .control_write(&id, &target, value, expected, &request_id)
         .await
     {
         Ok(readback) => {
@@ -1016,9 +1042,9 @@ async fn control_write(
 
 #[derive(Debug, Deserialize)]
 struct ControlCommandReq {
-    command_id: Option<String>,
-    command: Option<String>,
-    input_json: Option<String>,
+    // Foundation-3 单真值：input 唯一合法形态（command_id 取 URL path）。
+    // 旧 command_id/command/input_json 形态已删除，不留 shim。
+    #[serde(default)]
     input: Option<serde_json::Value>,
 }
 
@@ -1049,26 +1075,46 @@ async fn control_command(
         }
         Err(e) => return store_err_to_response(e),
     };
-    let _ = rec;
-    // 解析 body 中的 command_id / input
+    // command_id 真值 = URL path；input 真值 = body.input（缺省 {}）。
+    // 旧 body 形态（command_id/command/input_json）整体拒绝——双真值已删除。
+    if let Some(obj) = body.as_object() {
+        for legacy in ["command_id", "command", "input_json"] {
+            if obj.contains_key(legacy) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_error(
+                        "VALIDATION_ERROR",
+                        &format!(
+                            "body.{legacy} 已删除：command_id 取 URL path，input 取 body.input"
+                        ),
+                    )),
+                );
+            }
+        }
+    }
+    let command_id = cmd;
     let parsed: ControlCommandReq =
-        serde_json::from_value(body.clone()).unwrap_or(ControlCommandReq {
-            command_id: None,
-            command: None,
-            input_json: None,
-            input: None,
-        });
-    let command_id = parsed.command_id.or(parsed.command).unwrap_or(cmd);
-    let input_json = if let Some(s) = parsed.input_json {
-        s
-    } else if let Some(v) = parsed.input {
-        serde_json::to_string(&v).unwrap_or("{}".into())
-    } else if body.is_object() && !body.as_object().unwrap().is_empty() {
-        // 将整个 body 当作 input（兼容前端直接传参对象）
-        serde_json::to_string(&body).unwrap_or("{}".into())
-    } else {
-        "{}".into()
+        serde_json::from_value(body.clone()).unwrap_or(ControlCommandReq { input: None });
+    let input = parsed.input.unwrap_or(serde_json::json!({}));
+    let input_json = serde_json::to_string(&input).unwrap_or("{}".into());
+    // Foundation-3 Core Descriptor 门禁：capabilities.method → command 声明 →
+    // input 过 input_schema。不存在的 command 绝不送 Driver。
+    let desc = match state.manager.get_descriptor(&rec.driver_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": { "code": e.code, "message": e.message } })),
+            );
+        }
     };
+    let issues = mesa_core_types::gate_command_against(&desc, &command_id, &input, "command");
+    if !issues.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "valid": false, "issues": issues })),
+        );
+    }
     // 控制面鉴权（V1 最小实现，与 control_write 同策略）。
     if let Err(e) = authorize_control("local-api") {
         return e;
@@ -1102,12 +1148,30 @@ async fn control_command(
         .await
     {
         Ok((status, result_json, error)) => {
-            let audit_status = if status == "Succeeded" {
-                "COMPLETED"
+            // Foundation-3 结果门禁：Driver 返回违反自己 result_schema 即
+            // DRIVER_CONTRACT_VIOLATION（审计记 FAILED，不把坏结果当成功）。
+            let result_val: serde_json::Value = serde_json::from_str(&result_json)
+                .unwrap_or(serde_json::Value::String(result_json.clone()));
+            let result_issues = mesa_core_types::gate_command_result_against(
+                &desc,
+                &command_id,
+                &result_val,
+                "command",
+            );
+            let (audit_status, status) = if result_issues.is_empty() {
+                if status == "Succeeded" {
+                    ("COMPLETED", status)
+                } else {
+                    ("FAILED", status)
+                }
             } else {
-                "FAILED"
+                ("FAILED", "Failed".to_string())
             };
-            let detail = format!("{status}:{result_json}:{error}");
+            let detail = if result_issues.is_empty() {
+                format!("{status}:{result_json}:{error}")
+            } else {
+                format!("DRIVER_CONTRACT_VIOLATION:{result_json}:{error}")
+            };
             if let Err(e) = state.store.update_control_audit(
                 &request_id,
                 audit_status,
@@ -1116,8 +1180,6 @@ async fn control_command(
             ) {
                 warn_audit_update("control_audit result", &request_id, e);
             }
-            let result_val: serde_json::Value = serde_json::from_str(&result_json)
-                .unwrap_or(serde_json::Value::String(result_json.clone()));
             (
                 StatusCode::OK,
                 Json(

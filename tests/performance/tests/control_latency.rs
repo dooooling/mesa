@@ -1,7 +1,10 @@
-//! Control 面 IPC 延迟（§22）：Write/Command 走可靠 Control 队列 p95≤20ms/p99≤50ms（单调时钟）
+//! Control 面 IPC 延迟（§22；Foundation-3 structured target 单真值）：
+//! Write/Command 走可靠 Control 队列 p95≤20ms/p99≤50ms（单调时钟）
 //! 30 samples 取 p95/p99，Simulator 本地环路应远低于预算
 
-use mesa_core_types::{AcquisitionTask, DriverBinding, TaskSchedule, Value, GENERIC_BINDING_KIND};
+use mesa_core_types::{
+    AcquisitionTask, DriverBinding, TaskSchedule, Value, WriteTarget, GENERIC_BINDING_KIND,
+};
 use mesa_driver_sdk::Driver;
 
 fn poll_task(key: &str) -> AcquisitionTask {
@@ -10,8 +13,16 @@ fn poll_task(key: &str) -> AcquisitionTask {
         schedule: TaskSchedule::Poll { interval_ms: 100 },
         binding: DriverBinding {
             kind: GENERIC_BINDING_KIND.into(),
-            config: serde_json::json!({"selections": [{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key": key}]}]}),
+            config: serde_json::json!({"selections": [{"resource_id":"writable","parameters":{"initial":0},"outputs":[{"output":"value","point_key": key}]}]}),
         },
+    }
+}
+
+fn writable_target(key: &str) -> WriteTarget {
+    WriteTarget {
+        resource_id: "writable".into(),
+        parameters: serde_json::json!({"point_key": key}),
+        output: "value".into(),
     }
 }
 
@@ -36,7 +47,9 @@ async fn control_write_p95_within_20ms() {
     let mut samples = Vec::with_capacity(30);
     for _ in 0..30 {
         let start = std::time::Instant::now();
-        conn.write("sim.x", Value::F64(1.0), None).await.unwrap();
+        conn.write(&writable_target("sim.x"), Value::F64(1.0), None)
+            .await
+            .unwrap();
         samples.push(start.elapsed().as_micros() / 1000);
     }
     let p95 = percentile(samples.clone(), 95.0);

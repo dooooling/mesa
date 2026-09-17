@@ -299,6 +299,85 @@ fn capabilities_gap_rejected_at_task_gate_not_descriptor() {
 }
 
 #[test]
+fn control_gate_write_and_command_doors() {
+    use mesa_core_types::{WriteTarget, gate_command_against, gate_write_against};
+    let mut d = synthetic_descriptor();
+    // 写门 1：capabilities.write=false 即拒绝（Simulator 未声明前同理）
+    let t = WriteTarget {
+        resource_id: "res1".into(),
+        parameters: serde_json::json!({}),
+        output: "value".into(),
+    };
+    let (issues, _) =
+        gate_write_against(&d, &t, &mesa_core_types::Value::F64(1.0), &None, "target");
+    assert!(
+        issues.iter().any(|i| i.code == "WRITE_NOT_SUPPORTED"),
+        "{issues:?}"
+    );
+    // 写门 2：声明 write 后，未知 resource / 只读 output / 类型不一致逐项拒绝
+    d.capabilities.write = true;
+    let (issues, _) = gate_write_against(
+        &d,
+        &WriteTarget {
+            resource_id: "nope".into(),
+            parameters: serde_json::json!({}),
+            output: "value".into(),
+        },
+        &mesa_core_types::Value::F64(1.0),
+        &None,
+        "target",
+    );
+    assert!(
+        issues.iter().any(|i| i.code == "UNKNOWN_RESOURCE"),
+        "{issues:?}"
+    );
+    let (issues, _) =
+        gate_write_against(&d, &t, &mesa_core_types::Value::F64(1.0), &None, "target");
+    // synthetic resources[0].outputs[0] 为 Read → 不可写
+    assert!(
+        issues.iter().any(|i| i.code == "ACCESS_NOT_SUPPORTED"),
+        "{issues:?}"
+    );
+    // 命令门：method=false 即拒绝；声明后未声明 command 不送 Driver
+    let issues = gate_command_against(&d, "reset", &serde_json::json!({}), "command");
+    assert!(
+        issues.iter().any(|i| i.code == "METHOD_NOT_SUPPORTED"),
+        "{issues:?}"
+    );
+    d.capabilities.method = true;
+    let issues = gate_command_against(&d, "reset", &serde_json::json!({}), "command");
+    assert!(
+        issues.iter().any(|i| i.code == "COMMAND_NOT_DECLARED"),
+        "{issues:?}"
+    );
+}
+
+#[test]
+fn simulator_reference_control_descriptor_declares_write_and_reset() {
+    // Foundation-3 Reference：Simulator 声明 writable(ReadWrite) + reset 命令 +
+    // capabilities.write/method；其余生产 Driver 保持只读（见下）。
+    let d = mesa_driver_simulator::SimulatorDriver.descriptor();
+    d.validate().expect("simulator descriptor must be valid");
+    assert!(d.capabilities.write, "simulator 声明 write");
+    assert!(d.capabilities.method, "simulator 声明 method");
+    let w = d.resources.iter().find(|r| r.id == "writable").unwrap();
+    assert_eq!(w.outputs[0].access, mesa_core_types::AccessMode::ReadWrite);
+    assert!(d.controls.commands.iter().any(|c| c.id == "reset"));
+    // S7/FOCAS2/OPCUA/NCK 保持只读（生产 Write 另立任务，不在本 PR）
+    for desc in [
+        mesa_driver_s7::S7Driver.descriptor(),
+        mesa_driver_focas2::FocasDriver.descriptor(),
+        mesa_driver_opcua::OpcUaDriver.descriptor(),
+        mesa_driver_sinumerik_nck::SinumerikNckDriver.descriptor(),
+    ] {
+        assert!(
+            !desc.capabilities.write,
+            "生产 Write 未开发前不得声明 write"
+        );
+    }
+}
+
+#[test]
 fn contract_version_must_be_present() {
     let mut d = synthetic_descriptor();
     d.contract_major = mesa_core_types::DESCRIPTOR_CONTRACT_MAJOR;

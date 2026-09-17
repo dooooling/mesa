@@ -2776,15 +2776,41 @@ Universal Machine Operation
 Universal Motion Control
 ```
 
-## 22.1 Write
+## 22.1 Write（Foundation-3 单真值修订，2026-09-17）
+
+> 本节替代正文旧 `WriteRequest{request_id, target, value, expected_value}`
+> 字符串 target 形态。旧形态 wire 字段保留仅作兼容（见 proto 注释），
+> 新运行路径只生成/消费结构化三元组。
 
 ```rust
-WriteRequest {
-    request_id,
-    target,
-    value,
-    expected_value,
+WriteTarget {
+    resource_id,   // 如 s7 "memory"、opcua "node"、simulator "writable"
+    parameters,    // 同 ResourceSelection.parameters（canonical 参数）
+    output,        // OutputDescriptor.id，且 access == Write | ReadWrite
 }
+
+ControlWrite {
+    target: WriteTarget,
+    value: Value,             // 须与 type_spec.resolve(parameters) 一致
+    expected: Option<Value>,  // CAS：协议无原子保证时 Driver 报 EXPECTED_VALUE_UNSUPPORTED
+}
+```
+
+```text
+REST POST /api/v1/endpoints/{id}/write
+body = {"target": WriteTarget, "value": …, "expected_value"?: …}
+
+Core 门禁：descriptor → capabilities.write → resource/output/access →
+parameters schema → value/expected 类型 → audit STARTED → Driver
+
+审计：operation_type=write，operation_id=resource_id/output，
+request_json=完整三元组 + value + expected（无 schema migration）
+```
+
+```text
+IPC 1.6 = Structured WriteTarget（WriteRequest 6-8 三元组字段；
+旧 target 字符串保留仅作 wire 兼容；negotiated_minor < 6 + structured
+write 即 CONTROL_MODEL_UNSUPPORTED，不 fallback 旧字符串）
 ```
 
 适用于：
@@ -2797,7 +2823,20 @@ CANopen Parameter
 IO-Link Parameter
 ```
 
-## 22.2 Command
+## 22.2 Command（Foundation-3 单真值修订，2026-09-17）
+
+> command_id 真值 = URL path（`POST /api/v1/endpoints/{id}/commands/{command_id}`），
+> input 真值 = `body.input`（缺省 `{}`）。旧 `command_id/command/input_json`
+> 三形态已删除，不留 shim。
+
+```text
+Core 门禁：enable_control → authorize → endpoint/descriptor →
+capabilities.method → controls.commands 查 command_id
+(COMMAND_NOT_DECLARED) → input 过 input_schema
+(INVALID_COMMAND_INPUT) → audit STARTED → Driver command →
+result 过 result_schema（违反即 DRIVER_CONTRACT_VIOLATION，审计 FAILED）→
+audit COMPLETED / FAILED
+```
 
 ```rust
 CommandDescriptor {

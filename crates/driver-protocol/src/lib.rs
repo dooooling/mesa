@@ -21,13 +21,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// IPC 协议版本。Major 不兼容直接拒绝握手；Minor 取双方较小值。
 /// V1.2.1 新增 PointValue.value_origin（§5.5），Minor 1 保证新 Driver 的 typed BAD 语义可被新 Core 理解，旧端仍按 UNSPECIFIED 兼容解释
 pub const PROTOCOL_MAJOR: u32 = 1;
-/// Minor 5（Foundation-2）：AcquisitionTask 调度单真值（`schedule`），
-/// wire 完整 roundtrip（Poll: interval_ms；Subscribe: publishing/sampling/
-/// queue/discard 四字段，见 `task_to_pb`/`task_from_pb`）。
-/// 纯 additive（新增 proto 字段，老端未知字段忽略），
-/// Core 不得因 minor 不同拒绝运行（无 hard gate；Subscribe 非默认参数
-/// 遇旧端见 `TASK_SCHEDULE_MIN_MINOR` 门控）。
-pub const PROTOCOL_MINOR: u32 = 5;
+/// Minor 6（Foundation-3）：WriteRequest structured target
+///（`resource_id + parameters_json + output` 三元组；旧 `target` 字符串
+/// 保留仅作 wire 兼容，新路径永不生成/消费）。
+/// 纯 additive，Core 不得因 minor 不同拒绝运行（structured write 遇旧端
+/// 走 CONTROL_MODEL 门控，见 driver-manager）。
+pub const PROTOCOL_MINOR: u32 = 6;
 
 /// Dynamic Probe RPC 可用的最低协商 Minor（§8）。协商 Minor < 2 的旧 Driver
 /// 不识别 ProbeRequest（会静默忽略），Core 必须直接返回 Unsupported，
@@ -43,6 +42,11 @@ pub const EVENT_PLANE_MIN_MINOR: u32 = 3;
 /// negotiated_minor < 5 的旧端不识别 Subscribe 四字段：Core 侧
 /// `tasks_to_pb` 失败即整批拒绝（fail-closed，不静默降级为缺省调度）。
 pub const TASK_SCHEDULE_MIN_MINOR: u32 = 5;
+
+/// Structured WriteTarget wire 支持的最低协商 Minor（Foundation-3，IPC 1.6）。
+/// negotiated_minor < 6 的旧端不识别三元组字段：Core 侧直接
+/// `CONTROL_MODEL_UNSUPPORTED` fail-closed，不 fallback 旧 `target` 字符串。
+pub const CONTROL_MODEL_MIN_MINOR: u32 = 6;
 
 /// 单帧上限。防止恶意/异常长度前缀导致无界分配（有界原则在 IPC 层的体现）。
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;

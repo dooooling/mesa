@@ -954,57 +954,85 @@ impl DriverConnection for S7Connection {
         Ok(())
     }
 
+    /// Foundation-3：S7 真实 Write 按"生产 Driver 等契约冻结后再开发"
+    /// 原则，本阶段仅做签名迁移——结构化三元组解析到协议地址，
+    /// 直接地址字符串模式已删除（Core 永不传私有地址）。
+    /// 完整 S7 Write（含全类型 bytes 编码 + 真机 Gate）另立任务。
     async fn write(
         &mut self,
-        target: &str,
+        target: &mesa_core_types::WriteTarget,
         value: mesa_core_types::Value,
         expected: Option<mesa_core_types::Value>,
     ) -> Result<(), SdkDriverError> {
-        // 查找 target 对应的地址（优先 plan，已配置时）或直接按 S7 地址解析（DB10.DBW0）
-        let (addr, kind) = if let Some(plan) = &self.plan {
-            if let Some(spec) = plan.points.iter().find(|p| p.key == target) {
-                (spec.addr.clone(), spec.kind)
-            } else {
-                // 兼容直接地址模式（DB10.DBW0 + data_type 从 Value 推断）
-                let dt = match &value {
-                    mesa_core_types::Value::Bool(_) => "BOOL",
-                    mesa_core_types::Value::I32(_) | mesa_core_types::Value::I64(_) => "INT",
-                    mesa_core_types::Value::U32(_) | mesa_core_types::Value::U64(_) => "WORD",
-                    mesa_core_types::Value::F32(_) => "REAL",
-                    mesa_core_types::Value::F64(_) => "LREAL",
-                    _ => "WORD",
-                };
-                let addr = crate::address::parse_address(target).map_err(|e| {
-                    SdkDriverError::new(
-                        mesa_core_types::ErrorKind::Address,
-                        "INVALID_ADDRESS",
-                        format!("target `{target}` 非法: {e:?}"),
-                    )
-                })?;
-                let (_, k) = crate::codec::parse_data_type(dt)?;
-                (addr, k)
-            }
-        } else {
-            let addr = crate::address::parse_address(target).map_err(|e| {
-                SdkDriverError::new(
-                    mesa_core_types::ErrorKind::Address,
-                    "INVALID_ADDRESS",
-                    format!("target `{target}` 非法: {e:?}"),
-                )
-            })?;
-            let (_, k) = crate::codec::parse_data_type("INT")?;
-            (addr, k)
-        };
-        // expected 校验（CAS 语义，Plan 存在时对比当前计划值类型）
-        if let Some(exp) = expected
-            && std::mem::discriminant(&exp) != std::mem::discriminant(&value)
-        {
+        // 三元组 → memory resource 参数 → S7 地址（与 configure 同解析入口）。
+        // 非 memory resource 即拒绝（S7 只写 memory）。
+        if target.resource_id != "memory" {
             return Err(SdkDriverError::new(
-                mesa_core_types::ErrorKind::Internal,
-                "EXPECTED_MISMATCH",
-                "expected_value 类型与写入值不一致",
+                mesa_core_types::ErrorKind::Unsupported,
+                "OUTPUT_NOT_WRITABLE",
+                format!("s7 仅支持 memory 写入，实际 {}", target.resource_id),
             ));
         }
+        if target.output != "value" {
+            return Err(SdkDriverError::new(
+                mesa_core_types::ErrorKind::Unsupported,
+                "OUTPUT_NOT_WRITABLE",
+                format!("s7 memory 仅支持 value 输出写入，实际 {}", target.output),
+            ));
+        }
+        // expected 真 CAS：S7 协议无原子 CAS，直接拒绝（禁止 read-compare-write
+        // 假装原子，见 ControlWrite 契约）。
+        if expected.is_some() {
+            return Err(SdkDriverError::new(
+                mesa_core_types::ErrorKind::Unsupported,
+                "EXPECTED_VALUE_UNSUPPORTED",
+                "s7 协议无原子 CAS，expected_value 不被支持",
+            ));
+        }
+        // parameters → 地址（复用 configure 的 canonical 参数语义；
+        // 此处最小实现：area/db/offset/data_type/bit，与 configure 同口径）。
+        let params = target.parameters.as_object().ok_or_else(|| {
+            SdkDriverError::configuration("INVALID_TARGET", "s7 write parameters 需为对象")
+        })?;
+        let area = params
+            .get("area")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| SdkDriverError::configuration("INVALID_TARGET", "s7 write 缺少 area"))?;
+        let db = params.get("db").and_then(|v| v.as_u64()).unwrap_or(10) as u16;
+        let offset = params
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                SdkDriverError::configuration("INVALID_TARGET", "s7 write 缺少 offset")
+            })? as u32;
+        let dt_str = params
+            .get("data_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SdkDriverError::configuration("INVALID_TARGET", "s7 write 缺少 data_type")
+            })?;
+        let bit = params.get("bit").and_then(|v| v.as_u64()).map(|b| b as u8);
+        // 合成标准地址字符串走统一解析（与 configure 同入口，不另建逻辑）。
+        let area_u = area.to_ascii_uppercase();
+        let addr_str = if area_u == "DB" {
+            match bit {
+                Some(b) => format!("DB{db}.DBX{offset}.{b}"),
+                None => format!("DB{db}.DBB{offset}"),
+            }
+        } else {
+            match bit {
+                Some(b) => format!("{area_u}{offset}.{b}"),
+                None => format!("{area_u}{offset}"),
+            }
+        };
+        let addr = crate::address::parse_address(&addr_str).map_err(|e| {
+            SdkDriverError::new(
+                mesa_core_types::ErrorKind::Address,
+                "INVALID_ADDRESS",
+                format!("write target 地址 `{addr_str}` 非法: {e:?}"),
+            )
+        })?;
+        let (_, kind) = crate::codec::parse_data_type(dt_str)?;
         // Value → bytes（仅 INT/WORD 2字节路径，DB10.DBW0 最小闭环）
         let data = match value {
             mesa_core_types::Value::I32(v) => (v as i16).to_be_bytes().to_vec(),

@@ -238,11 +238,59 @@ impl Driver for SimulatorDriver {
                     }],
                     modes: vec![mesa_core_types::TaskMode::Poll],
                 },
+                // Foundation-3 Reference Control：可写 constant（ReadWrite）。
+                // Write 回归 Resource 模型的最小证明：同一 resource + 同一
+                // output，采集（Read）与写入（Write）共享 parameters 语义。
+                // point_key 为实例身份（Driver 解释，不在 schema 内——
+                // Core 只校验 schema 已声明字段；point_key 透传供 Driver 寻址）。
+                // schema 声明 point_key 可选 String（文档化 + 类型约束，
+                // 不 required：采集 selections 无需携带）。
+                ResourceDescriptor {
+                    id: "writable".into(),
+                    label: LocalizedText::new("Writable"),
+                    parameters: SchemaDescriptor {
+                        fields: vec![
+                            FieldDescriptor::new("initial", "Initial", FieldType::Number)
+                                .required(false)
+                                .default_value(serde_json::json!(0.0)),
+                            FieldDescriptor::new("point_key", "Point Key", FieldType::String)
+                                .required(false),
+                        ],
+                    },
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Value"),
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::F64,
+                        },
+                        unit: None,
+                        access: AccessMode::ReadWrite,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
             ],
-            controls: mesa_core_types::ControlCatalog::default(),
+            controls: mesa_core_types::ControlCatalog {
+                commands: vec![
+                    // Reference command：reset（无输入，幂等；与 write 旧桩同名，
+                    // 语义收敛为 ControlCatalog 声明）。
+                    mesa_core_types::capability::CommandDescriptor {
+                        id: "reset".into(),
+                        label: LocalizedText::new("Reset"),
+                        description: Some("重置模拟器状态（幂等，无副作用）".into()),
+                        input_schema: SchemaDescriptor::default(),
+                        result_schema: SchemaDescriptor::default(),
+                        risk: mesa_core_types::capability::RiskLevel::Low,
+                        confirmation: false,
+                        timeout_ms: None,
+                        idempotent: true,
+                    },
+                ],
+            },
             resource_selection_methods: vec![ResourceSelectionMethod::Manual],
             capabilities: DriverCapabilities {
                 poll: true,
+                write: true,
+                method: true,
                 events: true,
                 ..Default::default()
             },
@@ -290,6 +338,8 @@ impl Driver for SimulatorDriver {
             plan: None,
             faults,
             event_plan: None,
+            write_overlay: std::collections::HashMap::new(),
+            overlay_tx: None,
         }))
     }
 }
@@ -400,6 +450,12 @@ enum SourceSpec {
         max: f64,
         seed: Option<u64>,
     },
+    // Foundation-3 Reference Control：可写槽位（writable resource 的运行时值）。
+    // 采集语义 = 当前值（初始 constant，可被 write 覆盖）；configure 期快照值
+    // 即初始值，write 后由连接级 overlay 更新（见 SimConnection.write_overlay）。
+    Writable {
+        value: Value,
+    },
 }
 
 impl SourceSpec {
@@ -413,6 +469,7 @@ impl SourceSpec {
             SourceSpec::Toggle { .. } => "toggle",
             SourceSpec::Constant { .. } => "constant",
             SourceSpec::Random { .. } => "random",
+            SourceSpec::Writable { .. } => "writable",
         };
         format!("sim.{kind}")
     }
@@ -463,6 +520,22 @@ impl SourceSpec {
                     max,
                     seed: v.get("seed").and_then(|s| s.as_u64()),
                 }
+            }
+            // Foundation-3 Reference Control：可写槽位（writable resource）。
+            // 采集语义 = constant（固定值，可被 write 覆盖）；parameters 透传
+            // initial/value（value 优先，缺省 initial，缺省 0）。
+            "writable" => {
+                let raw = v
+                    .get("value")
+                    .cloned()
+                    .or_else(|| v.get("initial").cloned())
+                    .unwrap_or(serde_json::json!(0));
+                let value = if let Some(f) = raw.as_f64() {
+                    Value::F64(f)
+                } else {
+                    return Err(bad_point(key, "`writable.value` must be number"));
+                };
+                SourceSpec::Writable { value }
             }
             other => {
                 return Err(SdkDriverError::configuration(
@@ -565,6 +638,9 @@ impl SourceState {
                 Value::Bool(self.toggle)
             }
             SourceSpec::Constant { value } => value.clone(),
+            // Writable 采集语义 = 当前值（write overlay 在外层替换 spec，
+            // 此处只读快照值；见 run 循环的 overlay 逻辑）。
+            SourceSpec::Writable { value } => value.clone(),
             SourceSpec::Random { min, max, .. } => {
                 // xorshift64* 生成 [0,1)，映射到 [min,max)
                 let mut x = self.lcg;
@@ -616,6 +692,13 @@ struct SimConnection {
     /// 事件订阅计划（Event Plane V1 §6 全量快照，原子替换，与数据计划独立）。
     /// None/空 = 不发射任何事件；run() 只在有任务时起事件循环。
     event_plan: Option<EventPlanSnapshot>,
+    /// Foundation-3 write overlay：point_key → 当前写入值。
+    /// writable resource 的采集读数优先取此处（write 后即时可见，
+    /// 不等下一次 configure）；configure 全量替换时清空（新快照即新真值）。
+    write_overlay: std::collections::HashMap<String, Value>,
+    /// run 启动时注入的 overlay 实时通道（启动后 write 经此即时合入各任务
+    /// 循环；run 未启动时为 None，write 仅更新 overlay 本体）。
+    overlay_tx: Option<tokio::sync::mpsc::Sender<(String, Value)>>,
 }
 
 /// configure_events 成功后的事件订阅快照（revision 对应 ConfigureEventTasks.revision）。
@@ -811,6 +894,8 @@ impl DriverConnection for SimConnection {
             tasks: new_tasks,
             map: None,
         });
+        // configure 全量替换：write overlay 随旧快照作废（新快照即新真值）
+        self.write_overlay.clear();
         Ok(descriptors)
     }
 
@@ -937,17 +1022,32 @@ impl DriverConnection for SimConnection {
         })?;
 
         /// 组装某任务循环的 owned 运行单元（id + 规格 + 状态），不借用连接对象。
+        /// write_overlay 在 run 启动时一次性合入快照（启动后 write 的新值
+        /// 由 overlay 通道即时可见——见下；此处合入的是"启动前已写入"的值）。
         struct RuntimePoint {
             point_id: u32,
             spec: PointSpec,
             state: SourceState,
         }
+        // run 启动时刻的 overlay 快照（启动后 write 经 overlay_tx 实时合入，
+        // 不等下一次 configure；overlay 通道容量 64，背压等待不丢写）。
+        let (overlay_tx, overlay_rx) = tokio::sync::mpsc::channel::<(String, Value)>(64);
+        let overlay_rx = Arc::new(tokio::sync::Mutex::new(overlay_rx));
+        let overlay_base: std::collections::HashMap<String, Value> = self.write_overlay.clone();
+        // 启动后 write 经此通道实时合入（write() 持 &mut 本连接，直接拿到 tx）。
+        self.overlay_tx = Some(overlay_tx);
         let build_runtime = |indices: &[usize]| -> Vec<RuntimePoint> {
             indices
                 .iter()
                 .enumerate()
                 .map(|(local, &idx)| {
-                    let spec = snapshot.points[idx].clone();
+                    let mut spec = snapshot.points[idx].clone();
+                    // 启动前 overlay 合入：Writable 快照值替换为已写入值
+                    if let Some(v) = overlay_base.get(&spec.key)
+                        && matches!(spec.source, SourceSpec::Writable { .. })
+                    {
+                        spec.source = SourceSpec::Writable { value: v.clone() };
+                    }
                     let point_id = map[&spec.key];
                     RuntimePoint {
                         point_id,
@@ -976,6 +1076,7 @@ impl DriverConnection for SimConnection {
             let faults = self.faults;
             let interval = Duration::from_millis(plan.interval_ms);
             let plan_burst = plan.burst;
+            let overlay_rx = Arc::clone(&overlay_rx);
             handles.push(tokio::spawn(async move {
                 // 本任务循环自身的批次序号：质量转换按"该任务第几批"计。
                 // 闭包返回 Result 以承载 SIMULATED_DISCONNECT 故障路径。
@@ -987,6 +1088,23 @@ impl DriverConnection for SimConnection {
                         tokio::select! {
                             _ = ticker.tick() => {}
                             _ = shutdown.cancelled() => return Ok(()),
+                        }
+                        // 启动后 write 即时可见：排空 overlay 通道，合入本任务
+                        // 的 Writable 快照（多任务各合入各的，互不干扰）。
+                        {
+                            let mut rx = overlay_rx.lock().await;
+                            while let Ok((key, val)) = rx.try_recv() {
+                                for rp in runtime.iter_mut() {
+                                    if rp.spec.key == key
+                                        && matches!(
+                                            rp.spec.source,
+                                            SourceSpec::Writable { .. }
+                                        )
+                                    {
+                                        rp.spec.source = SourceSpec::Writable { value: val.clone() };
+                                    }
+                                }
+                            }
                         }
                         let t_ms = started.elapsed().as_millis() as u64;
                         // burst：单次 tick 连续发布多批，绕开 Windows 定时器精度限制
@@ -1060,34 +1178,126 @@ impl DriverConnection for SimConnection {
         Ok(())
     }
 
+    /// Foundation-3 Reference Control：结构化 WriteTarget 三元组。
+    /// 仅 `writable` resource 的 `value` output 可写（access=ReadWrite）；
+    /// 其余 resource 即使存在也拒绝（OUTPUT_NOT_WRITABLE）。
+    /// 写入值覆盖 write_overlay（采集读数即时可见）；expected 为 Some 即
+    /// CAS：比对当前值（overlay 优先，快照次之），不等即 EXPECTED_MISMATCH。
+    /// Simulator 保证 overlay 更新原子（&mut 自身，无并发），即真 CAS。
+    /// overlay_tx 由 run() 在启动时注入（`set_overlay_tx`）；run 未启动时
+    /// write 仅更新 overlay（启动时合入快照），同样成功。
     async fn write(
         &mut self,
-        target: &str,
-        _value: Value,
-        _expected: Option<Value>,
+        target: &mesa_core_types::WriteTarget,
+        value: Value,
+        expected: Option<Value>,
     ) -> Result<(), SdkDriverError> {
-        // Simulator 控制：若已配置则校验 target 合法性，否则直接成功（用于 probe 前的轻量校验）
-        if let Some(plan) = &self.plan
-            && !plan.points.iter().any(|p| p.key == target)
+        // 三元组→快照点：resource 必须为 writable，output 必须为 value。
+        // parameters 的 initial/value 只影响 configure 期初值，不参与寻址
+        //（writable 单例语义：同 key 即同槽位，由 point_key 区分实例）。
+        if target.resource_id != "writable" || target.output != "value" {
+            return Err(SdkDriverError::new(
+                ErrorKind::Unsupported,
+                "OUTPUT_NOT_WRITABLE",
+                format!(
+                    "target `{}/{}` 不可写（仅 writable/value 可写）",
+                    target.resource_id, target.output
+                ),
+            ));
+        }
+        // 值类型门：writable/value 恒 F64（与 Descriptor Fixed 一致）。
+        if value.data_type() != mesa_core_types::DataType::F64 {
+            return Err(SdkDriverError::new(
+                ErrorKind::Internal,
+                "VALUE_TYPE_MISMATCH",
+                format!("writable/value 期望 F64，实际 {:?}", value.data_type()),
+            ));
+        }
+        if let Some(exp) = &expected
+            && exp.data_type() != mesa_core_types::DataType::F64
         {
             return Err(SdkDriverError::new(
                 ErrorKind::Internal,
-                "TARGET_NOT_FOUND",
-                format!("target `{target}` not found"),
+                "VALUE_TYPE_MISMATCH",
+                format!("期望值期望 F64，实际 {:?}", exp.data_type()),
             ));
+        }
+        // 寻址：writable 点必须已配置（point_key 即实例身份；"只写不采集"
+        // 允许的是"未被采集任务选中"，不是"未在快照中"——快照即寻址空间）。
+        // 本实现以 parameters.initial/value 区分实例语义较弱，故要求调用方
+        // 以 point_key 精确定位：parameters 须含 point_key（Core 透传，
+        // 不在 Resource schema 内，由本驱动解释）。
+        let point_key = target
+            .parameters
+            .get("point_key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SdkDriverError::configuration(
+                    "INVALID_TARGET",
+                    "writable target.parameters 须含 point_key（实例身份）",
+                )
+            })?;
+        let plan = self.plan.as_ref().ok_or_else(|| {
+            SdkDriverError::new(
+                ErrorKind::Internal,
+                "NOT_CONFIGURED",
+                "write before configure",
+            )
+        })?;
+        if !plan.points.iter().any(|p| p.key == point_key) {
+            return Err(SdkDriverError::new(
+                ErrorKind::Internal,
+                "TARGET_NOT_FOUND",
+                format!("target point `{point_key}` not configured"),
+            ));
+        }
+        // CAS：当前值 = overlay 优先，快照（initial/value）次之。
+        if let Some(exp) = expected {
+            let current = self
+                .write_overlay
+                .get(point_key)
+                .cloned()
+                .unwrap_or_else(|| {
+                    plan.points
+                        .iter()
+                        .find(|p| p.key == point_key)
+                        .and_then(|p| match &p.source {
+                            SourceSpec::Writable { value } => Some(value.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or(Value::F64(0.0))
+                });
+            if current != exp {
+                return Err(SdkDriverError::new(
+                    ErrorKind::Internal,
+                    "EXPECTED_MISMATCH",
+                    format!("CAS 失败：当前 {current:?} ≠ 期望 {exp:?}"),
+                ));
+            }
+        }
+        self.write_overlay
+            .insert(point_key.to_string(), value.clone());
+        // 启动后 write 即时合入各任务循环（try_send 满即等待，不丢写；
+        // 通道关闭=run 已退出，此时 overlay 本体已更新，启动时仍会合入）。
+        if let Some(tx) = &self.overlay_tx {
+            let _ = tx.try_send((point_key.to_string(), value));
         }
         Ok(())
     }
 
+    /// Foundation-3 Reference command：仅执行 Descriptor 声明的 `reset`
+    ///（Core 已做存在性 + input 门禁；此处只做语义执行）。
+    /// reset 清空 write_overlay（回到 configure 快照初值），幂等。
     async fn command(
         &mut self,
         command: &str,
         args_json: &str,
     ) -> Result<serde_json::Value, SdkDriverError> {
         match command {
-            "reset" | "start" | "stop" | "fault" | "writable" => {
+            "reset" => {
                 let args: serde_json::Value =
                     serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                self.write_overlay.clear();
                 Ok(serde_json::json!({"command": command, "args": args, "status": "ok"}))
             }
             _ => Err(SdkDriverError::new(
@@ -1257,8 +1467,8 @@ mod tests {
         d.validate().expect("descriptor 必须合法");
         assert_eq!(
             d.resources.len(),
-            5,
-            "counter/sine/toggle/random/constant 全声明"
+            6,
+            "counter/sine/toggle/random/constant/writable 全声明"
         );
         // coverage 门：cases 必须覆盖全部 (resource, output) 声明对
         let declared: std::collections::BTreeSet<(String, String)> = d
@@ -1283,6 +1493,8 @@ mod tests {
                 serde_json::json!({"min": -5, "max": 5, "seed": 7}),
             ),
             ("constant", serde_json::json!({"value": 42})),
+            ("writable", serde_json::json!({"initial": 7})),
+            ("writable", serde_json::json!({})),
         ];
         let tested: std::collections::BTreeSet<(String, String)> = cases
             .iter()

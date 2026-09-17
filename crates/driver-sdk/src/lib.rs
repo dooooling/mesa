@@ -209,10 +209,15 @@ pub trait DriverConnection: Send {
         }
     }
 
-    /// 控制面写入（J §11）：默认 Unsupported，OPC UA 先行实现。
+    /// 控制面写入（Foundation-3 单真值）：结构化 [`WriteTarget`] 三元组。
+    /// Driver 私有地址字符串入口已删除——Core 理解 Resource/Output，
+    /// 永远不理解 `DB10.DBW2` / `ns=2;i=1001` / `macro.100`。
+    /// `expected` 为 Some 即 CAS 要求：协议无法原子保证时必须返回
+    /// `EXPECTED_VALUE_UNSUPPORTED`，禁止 read → compare → write 假装原子。
+    /// 默认 Unsupported。
     async fn write(
         &mut self,
-        _target: &str,
+        _target: &mesa_core_types::WriteTarget,
         _value: mesa_core_types::Value,
         _expected: Option<mesa_core_types::Value>,
     ) -> Result<(), SdkDriverError> {
@@ -224,6 +229,8 @@ pub trait DriverConnection: Send {
     }
 
     /// 控制面命令（J §11）：默认 Unsupported，预留统一入口。
+    /// `command_id` 必须已在 Descriptor `controls.commands` 声明（Core 门禁），
+    /// Driver 只执行、不再做存在性二次裁决（参数语义仍由 Driver 终裁）。
     async fn command(
         &mut self,
         _command: &str,
@@ -1870,7 +1877,39 @@ async fn on_write(session: &Session, req: pb::WriteRequest, msg_id: u64) {
     let expected = req
         .expected_value
         .and_then(|v| mesa_driver_protocol::value_from_pb(v).ok());
-    let res = conn.write(&req.target, value, expected).await;
+    // Foundation-3 单真值：只消费 structured 三元组；旧 `target` 字符串
+    // 保留仅作 wire 兼容——新 Driver 永不读取（空三元组即违约，fail-closed，
+    // 不 fallback 旧字符串，避免"wire 向后兼容"滑成"产品双轨"）。
+    let target = mesa_core_types::WriteTarget {
+        resource_id: req.resource_id.clone(),
+        parameters: serde_json::from_str(&req.parameters_json).unwrap_or(serde_json::Value::Null),
+        output: req.output.clone(),
+    };
+    if target.resource_id.trim().is_empty() || target.output.trim().is_empty() {
+        {
+            let mut m = session.entries.lock().unwrap();
+            if let Some(e2) = m.get_mut(&req.connection_handle) {
+                e2.conn = Some(conn);
+            }
+        }
+        session
+            .sink
+            .send_control(pb::Envelope {
+                msg_id,
+                body: Some(pb::envelope::Body::WriteResponse(pb::WriteResponse {
+                    request_id: req.request_id,
+                    result: Some(err_result(
+                        ErrorKind::Internal,
+                        "CONTROL_MODEL_UNSUPPORTED",
+                        "write: missing structured target (resource_id/output required; legacy string target retired)",
+                    )),
+                    readback: None,
+                })),
+            })
+            .await;
+        return;
+    }
+    let res = conn.write(&target, value, expected).await;
     {
         let mut m = session.entries.lock().unwrap();
         if let Some(e2) = m.get_mut(&req.connection_handle) {

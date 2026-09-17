@@ -9,15 +9,23 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 async fn app() -> (axum::Router, Arc<mesa_driver_manager::MesaManager>) {
+    app_with_control(false).await
+}
+
+/// 开闸版 app（Foundation-3 Control REST 门禁测试用；audit 落 in-memory store）。
+async fn app_with_control(
+    enable_control: bool,
+) -> (axum::Router, Arc<mesa_driver_manager::MesaManager>) {
     let store = Arc::new(ConfigStore::open_in_memory().unwrap());
     let drivers_dir = common::repo_root().join("drivers");
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
-    #[allow(deprecated)]
-    let state = mesa_core_api::AppState::new(
+    let state = mesa_core_api::AppState::try_new_with_control(
         mgr.clone(),
         store,
         drivers_dir.to_string_lossy().to_string(),
-    );
+        enable_control,
+    )
+    .unwrap();
     let router = mesa_core_api::router(state);
     (router, mgr)
 }
@@ -113,13 +121,14 @@ async fn put_json(app: axum::Router, uri: &str, body: &str) -> (StatusCode, serd
 
 /// 控制面默认关闭门（P1 审计闭环前置）：未开闸时 write/command 一律
 /// 503 CONTROL_DISABLED，到不了鉴权与审计，更到不了驱动。
+///（新 structured target 在开闸前即被总闸拦截，形状不影响本门。）
 #[tokio::test]
 async fn control_plane_disabled_by_default() {
     let (app, _) = app().await;
     let (s1, v1) = post_json(
         app.clone(),
         "/api/v1/endpoints/nope/write",
-        r#"{"target":"x","value":1}"#,
+        r#"{"target":{"resource_id":"writable","parameters":{},"output":"value"},"value":1}"#,
     )
     .await;
     assert_eq!(s1, StatusCode::SERVICE_UNAVAILABLE);
@@ -127,11 +136,88 @@ async fn control_plane_disabled_by_default() {
     let (s2, v2) = post_json(
         app.clone(),
         "/api/v1/endpoints/nope/commands/reset",
-        r#"{}"#,
+        r#"{"input":{}}"#,
     )
     .await;
     assert_eq!(s2, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(v2["error"]["code"], "CONTROL_DISABLED");
+}
+
+/// Foundation-3 Control REST 门禁（开闸 app + Simulator Reference）：
+/// write 三元组门（capabilities/resource/access/parameters/value 类型）
+/// 与 command 单真值门（URL path + body.input；旧形态拒绝 +
+/// 未声明/非法输入拒绝 + 结果违反 schema 即 DRIVER_CONTRACT_VIOLATION）。
+#[tokio::test]
+async fn control_rest_gates_structured_target_and_single_truth_command() {
+    let (app, mgr) = app_with_control(true).await;
+    // 建 device/endpoint（simulator，Reference Control）
+    let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        r#"{"id":"e1","name":"E1","device_id":"d1","driver_id":"simulator","connection":{}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    // write 门 1：只读 output（counter/value）即 400（Core 门禁，不送 Driver）
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/write",
+        r#"{"target":{"resource_id":"counter","parameters":{},"output":"value"},"value":1}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    // write 门 2：未知 resource 即 400
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/write",
+        r#"{"target":{"resource_id":"nope","parameters":{},"output":"value"},"value":1}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    // write 门 3：值类型不一致（writable/value 恒 F64，传 string）即 400
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/write",
+        r#"{"target":{"resource_id":"writable","parameters":{},"output":"value"},"value":"oops"}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    // write 门 4：合法三元组 → endpoint 未运行即 409（门禁通过，到达运行门）
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/write",
+        r#"{"target":{"resource_id":"writable","parameters":{"point_key":"sim.x"},"output":"value"},"value":1.0}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "body: {v}");
+    // command 门 1：旧 body 形态（command/command_id/input_json）即 400
+    for legacy in [
+        r#"{"command":"reset"}"#,
+        r#"{"command_id":"reset"}"#,
+        r#"{"input_json":"{}"}"#,
+    ] {
+        let (s, v) = post_json(app.clone(), "/api/v1/endpoints/e1/commands/reset", legacy).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v} legacy: {legacy}");
+    }
+    // command 门 2：未声明 command 即 400（不送 Driver）
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/commands/nope",
+        r#"{"input":{}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    // command 门 3：合法 reset → endpoint 未运行即 409（门禁通过，到达运行门）
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/commands/reset",
+        r#"{"input":{}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "body: {v}");
+    drop(mgr);
 }
 
 #[tokio::test]

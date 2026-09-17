@@ -456,11 +456,14 @@ impl MesaManager {
         })
     }
 
-    /// Control Write（§22）：经由活跃会话的可靠 Control 队列转发，永不 Latest-Wins
+    /// Control Write（§22；Foundation-3 单真值）：经由活跃会话的可靠
+    /// Control 队列转发结构化 WriteTarget，永不 Latest-Wins。
+    /// 协商 minor < 6 的旧端直接 CONTROL_MODEL_UNSUPPORTED（不 fallback
+    /// 旧字符串 target；wire 兼容 ≠ 产品双轨）。
     pub async fn control_write(
         &self,
         endpoint_id: &str,
-        target: &str,
+        target: &mesa_core_types::WriteTarget,
         value: mesa_core_types::Value,
         expected: Option<mesa_core_types::Value>,
         request_id: &str,
@@ -476,6 +479,16 @@ impl MesaManager {
             )
         })?;
         let sess = sess_arc.lock().await;
+        if sess.negotiated_minor() < mesa_driver_protocol::CONTROL_MODEL_MIN_MINOR {
+            return Err(DescriptorError::new(
+                "CONTROL_MODEL_UNSUPPORTED",
+                format!(
+                    "negotiated minor {} < {} (structured write 需要 IPC 1.6)",
+                    sess.negotiated_minor(),
+                    mesa_driver_protocol::CONTROL_MODEL_MIN_MINOR,
+                ),
+            ));
+        }
         // 约定 handle 1 为 Endpoint 主连接（endpoint.rs HANDLE=1），request_id 贯穿审计
         sess.write(1, request_id, target, value, expected)
             .await

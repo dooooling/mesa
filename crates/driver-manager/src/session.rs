@@ -691,12 +691,14 @@ impl Session {
         }
     }
 
-    /// Write（§22 可靠控制，无 Latest-Wins）：发送 WriteRequest 并等待 WriteResponse
+    /// Write（§22 可靠控制，无 Latest-Wins；Foundation-3 单真值）：
+    /// 发送 structured WriteRequest（三元组）并等待 WriteResponse。
+    /// 旧 `target` 字符串不再生成（wire 保留仅作兼容，见 proto 注释）。
     pub async fn write(
         &self,
         connection_handle: u32,
         request_id: &str,
-        target: &str,
+        target: &mesa_core_types::WriteTarget,
         value: mesa_core_types::Value,
         expected: Option<mesa_core_types::Value>,
     ) -> Result<Option<mesa_core_types::Value>, SessionError> {
@@ -707,9 +709,15 @@ impl Session {
             body: Some(pb::envelope::Body::WriteRequest(pb::WriteRequest {
                 connection_handle,
                 request_id: request_id.to_string(),
-                target: target.to_string(),
+                // 旧 target 字符串已退役（wire 保留仅作兼容）：新路径恒空。
+                #[allow(deprecated)]
+                target: String::new(),
                 value: Some(mesa_driver_protocol::value_to_pb(&value)),
                 expected_value: expected.as_ref().map(mesa_driver_protocol::value_to_pb),
+                resource_id: target.resource_id.clone(),
+                parameters_json: serde_json::to_string(&target.parameters)
+                    .unwrap_or_else(|_| "null".into()),
+                output: target.output.clone(),
             })),
         };
         {
