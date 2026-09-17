@@ -17,6 +17,7 @@ import {
   type ResourceSelection,
   type TaskSnapshotState,
 } from "../deviceModel";
+import { reconcileEditableSelection } from "../resourceSelectionModel";
 import { ApplyWithRestart } from "./ApplyWithRestart";
 import { ResourcePickerAntd } from "./ResourcePickerAntd";
 
@@ -195,14 +196,70 @@ export function EndpointAcquisitionPane({
       <ResourcePickerAntd
         resources={desc.resources}
         existingKeys={sels.flatMap((s) => s.outputs.map((o) => o.point_key))}
+        existingSelections={sels}
+        protectedSelections={preservedTasks.flatMap((t) => selectionsOf(t))}
         selectionMethods={desc.resource_selection_methods}
         endpointId={endpointId}
         onAdd={(s) => {
           const keys = s.outputs.map((o) => o.point_key);
-          const dup = sels.some((ex) => ex.outputs.some((o) => keys.includes(o.point_key)));
-          if (dup) {
-            message.warning(`point_key 重复：${keys.join(", ")} 已存在`);
+          // point_key 全集检查（editable + preserved）：手改重名当场拒绝，
+          // 不故意等后端 400（Core 仍保留最后一道门，防并发修改）。
+          const known = new Set([
+            ...sels.flatMap((x) => x.outputs.map((o) => o.point_key)),
+            ...preservedTasks.flatMap((t) =>
+              selectionsOf(t).flatMap((x) => x.outputs.map((o) => o.point_key)),
+            ),
+          ]);
+          const keyDup = keys.filter((k) => known.has(k));
+          if (keyDup.length) {
+            message.error(`point_key 已被其他采集项使用：${keyDup.join(", ")}（请改名）`);
             return false;
+          }
+          // 冻结算法：只允许改 editable（sels）；protected 永不动。
+          // 同 ResourceInstance → merge 进该 editable 项；否则 append。
+          const schemaOf = (resourceId: string) => {
+            const found = desc.resources.find((r) => r.id === resourceId);
+            return {
+              fields: (found?.parameters.fields ?? []).map((f) => ({ key: f.key, default: f.default })),
+            };
+          };
+          const decision = reconcileEditableSelection({
+            candidate: s,
+            editable: sels,
+            protectedSelections: preservedTasks.flatMap((t) => selectionsOf(t)),
+            schemaOf,
+          });
+          if (decision.kind === "duplicate-editable") {
+            message.warning(`已在采集中：${decision.outputs.join(", ")}，不会重复加入`);
+            return false;
+          }
+          if (decision.kind === "duplicate-protected") {
+            message.warning(`已在其他任务采集：${decision.outputs.join(", ")}，不会重复加入`);
+            return false;
+          }
+          if (decision.kind === "point-key-conflict") {
+            message.error(
+              `point_key 已被其他采集项使用：${decision.pointKeys.join(", ")}（请改名）`,
+            );
+            return false;
+          }
+          if (decision.kind === "merge") {
+            setSels((p) =>
+              p.map((sel, i) =>
+                i === decision.mergedIndex
+                  ? {
+                      ...sel,
+                      outputs: [
+                        ...sel.outputs,
+                        ...s.outputs.filter(
+                          (o) => !sel.outputs.some((e) => e.output === o.output),
+                        ),
+                      ],
+                    }
+                  : sel,
+              ),
+            );
+            return true;
           }
           setSels((p) => [...p, s]);
           return true;
@@ -215,10 +272,19 @@ export function EndpointAcquisitionPane({
       </div>
       {preservedTasks.length > 0 && (
         <div style={{ fontSize: 12, color: "#525252" }}>
-          以下任务不在此编辑、保存时原样保留：
-          {preservedTasks.map((t) => (
-            <Tag key={t.id} style={{ marginLeft: 6 }}>{t.id} · {t.binding.kind} · {t.schedule?.mode}</Tag>
-          ))}
+          以下任务不在此编辑、保存时原样保留（只读，reconciliation 仅检测不修改）：
+          {preservedTasks.map((t) => {
+            const ss = selectionsOf(t);
+            const keys = ss.flatMap((s) => s.outputs.map((o) => o.point_key));
+            return (
+              <div key={t.id} style={{ marginTop: 4 }}>
+                <Tag>{t.id} · {t.binding.kind} · {t.schedule?.mode}</Tag>
+                <span style={{ marginLeft: 6, fontFamily: "'IBM Plex Mono',monospace", fontSize: 11 }}>
+                  {keys.length ? keys.join(", ") : "（空任务）"}
+                </span>
+              </div>
+            );
+          })}
         </div>
       )}
       {!!sels.length && (
