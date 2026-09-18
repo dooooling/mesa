@@ -2060,4 +2060,154 @@ mod tests {
         assert_eq!(offset_of!(OdbSys, version), 12);
         assert_eq!(offset_of!(OdbSys, axes), 16);
     }
+
+    /// Gate 0 证据采集参数：只从环境变量读，不碰生产配置。
+    /// - `MESA_FOCAS_GATE0_HOST` 必填（如 `192.168.15.165`）；
+    /// - `MESA_FOCAS_GATE0_PORT` 可选，默认 8193；
+    /// - `MESA_FOCAS_GATE0_TIMEOUT_MS` 可选，默认 5000（FOCAS 以秒为单位，向上取整）；
+    /// - `MESA_FOCAS_GATE0_OUT` 可选，缺席只 stdout，不自动建 fixture 目录。
+    #[cfg(test)]
+    fn gate0_params() -> (String, u16, u64, Option<String>) {
+        let host = std::env::var("MESA_FOCAS_GATE0_HOST").unwrap_or_else(|_| {
+            panic!(
+                "缺少 MESA_FOCAS_GATE0_HOST（如 192.168.15.165）；\
+                 本测试为 ignored 真机采集，CI 默认不跑"
+            )
+        });
+        let port: u16 = match std::env::var("MESA_FOCAS_GATE0_PORT") {
+            Ok(s) => s
+                .parse()
+                .unwrap_or_else(|_| panic!("MESA_FOCAS_GATE0_PORT 非法：{s}")),
+            Err(_) => 8193,
+        };
+        let timeout_ms: u64 = match std::env::var("MESA_FOCAS_GATE0_TIMEOUT_MS") {
+            Ok(s) => s
+                .parse()
+                .unwrap_or_else(|_| panic!("MESA_FOCAS_GATE0_TIMEOUT_MS 非法：{s}")),
+            Err(_) => 5000,
+        };
+        let out = std::env::var("MESA_FOCAS_GATE0_OUT").ok();
+        (host, port, timeout_ms, out)
+    }
+
+    /// Gate 0 输出：只有明确设置 `MESA_FOCAS_GATE0_OUT` 才写文件，
+    /// 否则只 stdout；绝不自动创建 `tests/fixtures/wire/`。
+    #[cfg(test)]
+    fn gate0_emit(doc_pretty: &str, out: &Option<String>) {
+        println!("{doc_pretty}");
+        if let Some(path) = out {
+            std::fs::write(path, doc_pretty)
+                .unwrap_or_else(|e| panic!("写入 {path} 失败：{e}"));
+            println!("已写入 {path}");
+        }
+    }
+
+    /// Gate 0 证据采集 A 组：`connect → cnc_sysinfo → disconnect`。
+    /// - 直接用私有 `NativeLib`，只调一次目标 API，不走 `read_batch`
+    ///   （后者已丢失完整结构语义）；
+    /// - 输出完整 7 字段语义，不只 `series/version`；
+    /// - ignored 真机测试：Wireshark 开始抓包后单次运行，
+    ///   一次命令只产生一个目标 FOCAS 调用（外加 OPEN/CLOSE）；
+    /// - 用 `--test-threads=1` 串行跑，避免与 B 组并发。
+    #[test]
+    #[ignore]
+    fn gate0_dump_sysinfo() {
+        let (host, port, timeout_ms, out) = gate0_params();
+        let timeout_secs = (timeout_ms.div_ceil(1000).max(1).min(i32::MAX as u64)) as i32;
+        let lib =
+            NativeLib::load().unwrap_or_else(|e| panic!("FWLIB 加载失败（{host}:{port}）：{e}"));
+        let hdl = lib
+            .cnc_allclibhndl3(&host, port, timeout_secs)
+            .unwrap_or_else(|e| panic!("cnc_allclibhndl3 失败（{host}:{port}）：{} {}", e as i16, e.message()));
+        let sys = match lib.cnc_sysinfo(hdl) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = lib.cnc_freelibhndl(hdl);
+                panic!("cnc_sysinfo 失败：{} {}", e as i16, e.message());
+            }
+        };
+        let _ = lib.cnc_freelibhndl(hdl);
+        // 字符区解码失败不断言整单失败：按空串如实输出，由采集人对照面板判断，
+        // 真机确认前不猜（失败只影响本字段，不伪造）。
+        for (name, raw) in [
+            ("cnc_type", &sys.cnc_type[..]),
+            ("mt_type", &sys.mt_type[..]),
+            ("series", &sys.series[..]),
+            ("version", &sys.version[..]),
+            ("axes", &sys.axes[..]),
+        ] {
+            if odbsys_field(raw).is_none() {
+                eprintln!("注意：ODBSYS.{name} 非可打印 ASCII，已按空串输出（raw={raw:?}）");
+            }
+        }
+        let doc = serde_json::json!({
+            "operation": "system_info",
+            "native": {
+                "addinfo": sys.addinfo,
+                "max_axis": sys.max_axis,
+                "cnc_type": odbsys_field(&sys.cnc_type).unwrap_or_default(),
+                "mt_type": odbsys_field(&sys.mt_type).unwrap_or_default(),
+                "series": odbsys_field(&sys.series).unwrap_or_default(),
+                "version": odbsys_field(&sys.version).unwrap_or_default(),
+                "axes": odbsys_field(&sys.axes).unwrap_or_default(),
+            }
+        });
+        let pretty = serde_json::to_string_pretty(&doc).expect("expected.json 序列化失败");
+        gate0_emit(&pretty, &out);
+    }
+
+    /// Gate 0 证据采集 B 组：`connect → cnc_statinfo → disconnect`。
+    /// - 直接用私有 `NativeLib`，只调一次目标 API，输出完整 9 字段；
+    /// - 运行时断言 `mesa.machine_status == native.aut`（产品合同：
+    ///   `machine/status` = raw `ODBST.aut`，不是 run/motion）；
+    /// - 每个 `aut` 模式各跑一次（如 MEM→MDI），现场记录面板模式后对照；
+    /// - ignored + `--test-threads=1`，与 A 组串行。
+    #[test]
+    #[ignore]
+    fn gate0_dump_statinfo() {
+        let (host, port, timeout_ms, out) = gate0_params();
+        let timeout_secs = (timeout_ms.div_ceil(1000).max(1).min(i32::MAX as u64)) as i32;
+        let lib =
+            NativeLib::load().unwrap_or_else(|e| panic!("FWLIB 加载失败（{host}:{port}）：{e}"));
+        let hdl = lib
+            .cnc_allclibhndl3(&host, port, timeout_secs)
+            .unwrap_or_else(|e| panic!("cnc_allclibhndl3 失败（{host}:{port}）：{} {}", e as i16, e.message()));
+        let st = match lib.cnc_statinfo(hdl) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = lib.cnc_freelibhndl(hdl);
+                panic!("cnc_statinfo 失败：{} {}", e as i16, e.message());
+            }
+        };
+        let _ = lib.cnc_freelibhndl(hdl);
+        // 产品合同：machine/status 取 raw ODBST.aut（与 focas_api 两条生产路径同源）。
+        let mesa_status = st.aut as u32;
+        let doc = serde_json::json!({
+            "operation": "status_info",
+            "native": {
+                "hdck": st.hdck,
+                "tmmode": st.tmmode,
+                "aut": st.aut,
+                "run": st.run,
+                "motion": st.motion,
+                "mstb": st.mstb,
+                "emergency": st.emergency,
+                "alarm": st.alarm,
+                "edit": st.edit,
+            },
+            "mesa": { "machine_status": mesa_status }
+        });
+        assert_eq!(
+            doc.pointer("/mesa/machine_status").and_then(|v| v.as_u64()),
+            Some(mesa_status as u64),
+            "mesa.machine_status 必须等于 native.aut"
+        );
+        assert_eq!(
+            doc.pointer("/native/aut").and_then(|v| v.as_i64()),
+            Some(st.aut as i64),
+            "native.aut 必须如实记录"
+        );
+        let pretty = serde_json::to_string_pretty(&doc).expect("expected.json 序列化失败");
+        gate0_emit(&pretty, &out);
+    }
 }
