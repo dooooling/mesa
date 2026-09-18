@@ -1,6 +1,6 @@
 // M2 共享快照层：同一台设备的 Overview 与 LiveData 使用同一个数据来源。
-// - points 1s 轮询：成功才替换快照；失败/坏形态保留 last-known，nowMs 独立
-//   推进让旧点自然进入 STALE（绝不把错误包解释成 []）；
+// - points 走 Point Live SSE：首帧全量 snapshot，后续 delta；
+//   断线保留 last-known，STALE 由 deadline 推进（绝不把错误包解释成 []）；
 // - endpoints 低频刷新（默认 10s），失败保留 last-known 上下文：过滤依据
 //   deviceId → endpointIds 绝不能因一次失败突然变空而把 points 过滤成空；
 // - 代际守卫：deviceId 切换即新一代，旧请求的迟到响应一律丢弃（A 不覆盖 B）；

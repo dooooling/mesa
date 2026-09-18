@@ -1,5 +1,6 @@
 // M3.1 全局实时点数据源：与 useDeviceWorkspaceData 共用同一快照语义。
-// - points 1s 轮询成功才替换，失败保留 last-known + nowMs 独立推进自然 STALE；
+// - points 走 Point Live SSE：首帧全量 snapshot，后续 delta；
+//   断线保留 last-known，STALE 由 deadline 推进；
 // - endpoints 10s 刷新，失败保留 last-known；
 // - 无 deviceId 限定：全局聚合，全量 points 全部成视图（含设备/连接归属名）。
 // 设备页继续用 useDeviceWorkspaceData（内部复用本源 + 设备过滤），语义同源。

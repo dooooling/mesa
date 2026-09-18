@@ -1,8 +1,9 @@
 // Point Live Stream 唯一入口（STATE STREAM，不是 EVENT STREAM）。
 // - transport：EventSource(`/api/v1/points/live`)，无 id/seq/replay；
 //   首帧 mesa-points-snapshot（全量替换），后续 mesa-points-delta（整行合并）；
-// - last-known：onerror/malformed 保留旧 points，只翻 pointsError；
-//   绝不 setPoints([])；重连后 fresh snapshot 自动收敛；
+// - last-known：onerror/malformed 保留旧 points；malformed 同时翻 pointsError
+//  （坏输入不伪装正常，下一合法帧自动恢复）；绝不 setPoints([])；
+//   重连后 fresh snapshot 自动收敛；
 // - STALE：无网络帧时由单次最近 deadline timer 翻转（无 1s 全表 tick）；
 //   AgeCell 文本仍由 StaleClock 独立刷新（只改显示，不改视图）；
 // - 与 useEventStream 无关：Point Live 不用 seq/Last-Event-ID/replay。
@@ -71,7 +72,12 @@ export function usePointLiveStream(): UsePointLiveStreamResult {
     const onSnapshot = (e: MessageEvent) => {
       if (cancelled || gen.current !== id) return;
       const rows = decodePoints(e.data);
-      if (!rows) return; // malformed 保留 last-known
+      // malformed：last-known 保留 + 错误态（坏输入不伪装正常）；
+      // 下一合法帧自动恢复（setPointsError(false)）。
+      if (!rows) {
+        setPointsError(true);
+        return;
+      }
       const at = Date.now();
       setPoints((prev) => {
         const { points: merged, changed } = reconcilePointSnapshots(prev, rows, at, at);
@@ -83,7 +89,10 @@ export function usePointLiveStream(): UsePointLiveStreamResult {
     const onDelta = (e: MessageEvent) => {
       if (cancelled || gen.current !== id) return;
       const rows = decodePoints(e.data);
-      if (!rows) return;
+      if (!rows) {
+        setPointsError(true);
+        return;
+      }
       setPoints((prev) => {
         const { points: merged, changed } = reconcilePointDelta(prev, rows);
         return changed ? merged : prev;

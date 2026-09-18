@@ -328,11 +328,12 @@ impl Snapshot {
             };
             latest.insert(k, entry);
         }
-        // 锁释放后通知：只传身份，消费方回读最终值（latest-wins）。
+        // 锁释放后通知：先判 subscriber 再构造 payload（无 consumer 时
+        // 热路径额外成本仅一次 receiver_count 原子读，不遍历/分配）。
         // 空 batch（values 为空）不发通知。
-        let changed: Vec<u32> = batch.values.iter().map(|pv| pv.point_id).collect();
         drop(latest);
-        if !changed.is_empty() {
+        if !batch.values.is_empty() && self.has_live_subscribers() {
+            let changed: Vec<u32> = batch.values.iter().map(|pv| pv.point_id).collect();
             self.emit_change(LatestChange::Upsert {
                 endpoint_id: endpoint_id.to_string(),
                 point_ids: changed,
@@ -513,9 +514,15 @@ impl Snapshot {
         v
     }
 
+    /// 内部：是否有 live 订阅者（热路径先判，再构造 payload）。
+    /// 无 channel（未初始化）或 receiver_count==0 即无订阅者。
+    fn has_live_subscribers(&self) -> bool {
+        self.live_tx.get().is_some_and(|tx| tx.receiver_count() > 0)
+    }
+
     /// 内部：锁释放后发送通知（调用方保证已 drop latest 写锁，避免 SSE
-    /// 消费方回读 `latest_for_keys` 时与写锁竞争）。无 subscriber 时零成本
-    ///（仅一次 `receiver_count` 原子读，不构造 Vec）。
+    /// 消费方回读 `latest_for_keys` 时与写锁竞争）。无 subscriber 时直接返回
+    ///（调用方已先判，此处再判一次防竞态）。
     fn emit_change(&self, change: LatestChange) {
         let Some(tx) = self.live_tx.get() else {
             return;
@@ -842,5 +849,52 @@ mod tests {
         snap2.register_points("ep1", &def(Some("新名")));
         snap2.apply_batch(&batch(), "ep1");
         assert_eq!(snap2.latest_all()[0].display_name.as_deref(), Some("新名"));
+    }
+
+    #[test]
+    fn no_subscriber_apply_batch_skips_notification_payload() {
+        // 热路径契约：无 live 订阅者时 apply_batch 不得构造通知 payload
+        //（仅一次 receiver_count 原子读）。485 断言行为：
+        // 未订阅 → has_live_subscribers() 为 false；
+        // 订阅后 drop → 再次为 false（broadcast receiver 释放即回落）。
+        use mesa_core_types::PointDefinition;
+        let snap = Snapshot::new();
+        assert!(!snap.has_live_subscribers());
+        snap.register_points(
+            "ep1",
+            &[PointDefinition {
+                point_id: 1,
+                point_key: "k1".into(),
+                data_type: DataType::F64,
+                unit: None,
+                source_label: None,
+                display_name: None,
+            }],
+        );
+        let batch = DataBatch {
+            connection_handle: 1,
+            stream_epoch: 1,
+            sequence: 1,
+            timestamp_ns: 1_000_000,
+            values: vec![PointValue {
+                point_id: 1,
+                value: Value::F64(1.0),
+                quality: Quality::Good,
+                quality_code: None,
+                source_timestamp_ns: None,
+                value_origin: ValueOrigin::Current,
+            }],
+            mono_ns: None,
+        };
+        // 无订阅者：apply 照常写 latest，但不经过通知分支。
+        snap.apply_batch(&batch, "ep1");
+        assert_eq!(snap.latest_all().len(), 1);
+        assert!(!snap.has_live_subscribers());
+        // 有订阅者：门打开。
+        let rx = snap.subscribe_latest_changes();
+        assert!(snap.has_live_subscribers());
+        // 订阅释放后门关闭（Receiver drop → receiver_count 回落）。
+        drop(rx);
+        assert!(!snap.has_live_subscribers());
     }
 }

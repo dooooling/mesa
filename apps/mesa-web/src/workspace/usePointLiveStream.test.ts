@@ -126,7 +126,7 @@ describe("usePointLiveStream", () => {
     expect(result.current.points).toHaveLength(3);
   });
 
-  it("malformed 帧保留 last-known；onerror 保留 last-known 只翻错态", () => {
+  it("malformed 帧保留 last-known + 翻错误态，下一合法帧恢复", () => {
     const { result } = renderHook(() => usePointLiveStream());
     act(() =>
       MockPointEventSource.instances[0].emit(
@@ -135,9 +135,29 @@ describe("usePointLiveStream", () => {
       ),
     );
     expect(result.current.points).toHaveLength(1);
+    // malformed snapshot：保留 + pointsError=true（坏输入不伪装正常）。
     act(() => MockPointEventSource.instances[0].emit("mesa-points-snapshot", "not-json"));
     expect(result.current.points).toHaveLength(1);
+    expect(result.current.pointsError).toBe(true);
     act(() => MockPointEventSource.instances[0].emit("mesa-points-delta", JSON.stringify({})));
+    expect(result.current.points).toHaveLength(1);
+    expect(result.current.pointsError).toBe(true);
+    // 下一合法帧：正常合并 + 错误态恢复。
+    act(() =>
+      MockPointEventSource.instances[0].emit("mesa-points-delta", snapshotFrame([row("ep", 1, 2)])),
+    );
+    expect(result.current.points.find((p) => p.point_id === 1)?.value).toBe(2);
+    expect(result.current.pointsError).toBe(false);
+  });
+
+  it("onerror 保留 last-known 只翻错态", () => {
+    const { result } = renderHook(() => usePointLiveStream());
+    act(() =>
+      MockPointEventSource.instances[0].emit(
+        "mesa-points-snapshot",
+        snapshotFrame([row("ep", 1, 1)]),
+      ),
+    );
     expect(result.current.points).toHaveLength(1);
     expect(result.current.pointsError).toBe(false);
     act(() => MockPointEventSource.instances[0].fail());
