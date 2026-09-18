@@ -42,6 +42,12 @@ pub enum FocasAddress {
     },
     /// 实际进给
     Feed,
+    /// 当前活动主轴速度（`cnc_acts`，无 spindle 实例语义）。
+    /// 绝不伪装成 `Spindle { spindle: 1, Speed }`：`cnc_acts` 根本不接受
+    /// spindle 号，label 若写 `spindle[1].speed` 就是假数据。
+    /// `parse_address()` 故意不支持本变体（无用户拼写形态），只由
+    /// Driver 内部 `machine/spindle_speed` 资源构造。
+    ActiveSpindleSpeed,
     /// 主轴
     Spindle {
         spindle: u8,
@@ -124,6 +130,82 @@ impl AxisKind {
             "srvdelay" | "srv" => Some(Self::SrvDelay),
             "accdecdly" | "acc" => Some(Self::AccDecDly),
             _ => None,
+        }
+    }
+
+    /// canonical 小写名（`source_label` 唯一拼写来源）。
+    fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Absolute => "absolute",
+            Self::Machine => "machine",
+            Self::Relative => "relative",
+            Self::Distance => "distance",
+            Self::Data => "data",
+            Self::SrvDelay => "srvdelay",
+            Self::AccDecDly => "accdecdly",
+        }
+    }
+}
+
+impl SpindleKind {
+    /// canonical 小写名（`source_label` 唯一拼写来源）。
+    fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Speed => "speed",
+            Self::Load => "load",
+            Self::Gear => "gear",
+            Self::MaxRpm => "maxrpm",
+        }
+    }
+}
+
+impl ToolKind {
+    /// canonical 小写名（`source_label` 唯一拼写来源）。
+    fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Number => "number",
+            Self::Offset => "offset",
+            Self::Zofs => "zofs",
+            Self::Length => "length",
+        }
+    }
+}
+
+impl FocasAddress {
+    /// 人类可读来源（PointDescriptor.source_label 唯一格式化入口）。
+    /// 纯展示元数据，不是 identity：configure 与诊断必须调同一函数，
+    /// 不得各写一套拼写。穷尽 match——新增变体不更新此处即编译失败。
+    pub fn source_label(&self) -> String {
+        match self {
+            Self::Status => "machine.status".into(),
+            Self::Feed => "machine.feed".into(),
+            Self::ActiveSpindleSpeed => "spindle.active.speed".into(),
+            Self::Alarm => "alarm.value".into(),
+            Self::OpMsg => "opmsg.value".into(),
+            Self::ProgramNumber => "program.number".into(),
+            Self::ProgramMain => "program.main".into(),
+            Self::ProgramName => "program.current".into(),
+            Self::ProgramDir => "program.dir".into(),
+            Self::ProgramInfo => "program.info".into(),
+            Self::ProgramUpload => "program.upload".into(),
+            Self::Axis { axis, kind } => {
+                format!("axis[{axis}].{}", kind.canonical_name())
+            }
+            Self::Spindle { spindle, kind } => {
+                format!("spindle[{spindle}].{}", kind.canonical_name())
+            }
+            Self::ServoLoad { axis } => format!("servo[{axis}].load"),
+            Self::MacroVar { number } => format!("macro[{number}]"),
+            Self::Pmc { kind, addr, bit } => match bit {
+                Some(b) => format!("pmc.{kind}{addr}.{b}"),
+                None => format!("pmc.{kind}{addr}"),
+            },
+            Self::Diagnosis { number } => format!("diagnosis[{number}]"),
+            Self::Tool { kind, number } => match kind {
+                ToolKind::Number => "tool.number".into(),
+                _ => format!("tool.{}[{number}]", kind.canonical_name()),
+            },
+            Self::Param { number } => format!("param[{number}]"),
         }
     }
 }
@@ -608,5 +690,75 @@ mod tests {
         assert!(parse_address("axis.abs.33").is_err());
         assert!(parse_address("spindle.foo.1").is_err());
         assert!(parse_address("unknown.xyz").is_err());
+    }
+
+    /// source_label 全分支回归（PointDescriptor 来源列唯一拼写来源）。
+    #[test]
+    fn source_label_forms() {
+        let label = |a: FocasAddress| a.source_label();
+        assert_eq!(label(FocasAddress::Status), "machine.status");
+        assert_eq!(label(FocasAddress::Feed), "machine.feed");
+        assert_eq!(
+            label(FocasAddress::ActiveSpindleSpeed),
+            "spindle.active.speed"
+        );
+        assert_eq!(label(FocasAddress::Alarm), "alarm.value");
+        assert_eq!(label(FocasAddress::OpMsg), "opmsg.value");
+        assert_eq!(label(FocasAddress::ProgramName), "program.current");
+        assert_eq!(
+            label(FocasAddress::Axis {
+                axis: 1,
+                kind: AxisKind::Absolute,
+            }),
+            "axis[1].absolute"
+        );
+        assert_eq!(
+            label(FocasAddress::Axis {
+                axis: 2,
+                kind: AxisKind::Machine,
+            }),
+            "axis[2].machine"
+        );
+        assert_eq!(
+            label(FocasAddress::Spindle {
+                spindle: 1,
+                kind: SpindleKind::Speed,
+            }),
+            "spindle[1].speed"
+        );
+        assert_eq!(
+            label(FocasAddress::Spindle {
+                spindle: 2,
+                kind: SpindleKind::Load,
+            }),
+            "spindle[2].load"
+        );
+        assert_eq!(label(FocasAddress::ServoLoad { axis: 2 }), "servo[2].load");
+        assert_eq!(label(FocasAddress::MacroVar { number: 100 }), "macro[100]");
+        assert_eq!(
+            label(FocasAddress::Pmc {
+                kind: 'R',
+                addr: 100,
+                bit: None,
+            }),
+            "pmc.R100"
+        );
+        assert_eq!(
+            label(FocasAddress::Pmc {
+                kind: 'R',
+                addr: 100,
+                bit: Some(3),
+            }),
+            "pmc.R100.3"
+        );
+        assert_eq!(label(FocasAddress::Diagnosis { number: 0 }), "diagnosis[0]");
+        assert_eq!(
+            label(FocasAddress::Tool {
+                kind: ToolKind::Offset,
+                number: 1,
+            }),
+            "tool.offset[1]"
+        );
+        assert_eq!(label(FocasAddress::Param { number: 100 }), "param[100]");
     }
 }

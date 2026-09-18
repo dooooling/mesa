@@ -3,10 +3,10 @@
 //! - 绑定（Foundation-2 单路径）：`mesa.resources.v1`
 //!   ```json
 //!   { "selections": [
-//!       { "resource_id": "status", "parameters": {},
-//!         "outputs": [{"output":"value","point_key":"cnc.status"}] },
+//!       { "resource_id": "machine", "parameters": {},
+//!         "outputs": [{"output":"status","point_key":"cnc.status"}] },
 //!       { "resource_id": "axis", "parameters": {"axis":1},
-//!         "outputs": [{"output":"value","point_key":"axis.x"}] }
+//!         "outputs": [{"output":"absolute","point_key":"axis.x"}] }
 //!   ]}
 //!   ```
 //! - 地址解析见 `address::parse_address`；Core 不触及此文件（硬性约束）。
@@ -36,17 +36,19 @@ use tokio_util::sync::CancellationToken;
 /// descriptor 与门禁同源。
 pub const PMC_KINDS: [char; 10] = ['G', 'R', 'X', 'Y', 'F', 'A', 'D', 'C', 'K', 'T'];
 
-/// PR3 canonical：`mesa.resources.v1` 按 (resource_id, output)
+/// Resource Model Cleanup：`mesa.resources.v1` 按 (resource_id, output)
 /// 分发到固定 (FocasAddress, DataType)。未声明的 resource/output 直接拒绝；
-/// `address` 参数不接受；Fixed 资源不消费 `data_type`
-///（类型由本表唯一确定，PR4 在 Task 保存时拒绝未知字段）。
+/// `address` 参数不接受。
+/// 冻结原则：Descriptor 只暴露当前读取语义真实、适合 Acquisition 的能力；
+/// `FocasAddress` 支持范围 ≠ Descriptor 产品能力范围（program 等未实现
+/// 可信读取的地址族不在此暴露，等真实实现后再加 output）。
 fn resolve_generic_point(
     resource_id: &str,
     output: &str,
     params: &serde_json::Value,
     point_key: &str,
 ) -> Result<(FocasAddress, DataType), SdkDriverError> {
-    use address::{AxisKind, SpindleKind};
+    use address::{SpindleKind, ToolKind};
     let bad = |code: &str, msg: String| SdkDriverError::configuration(code, msg);
     if params.get("address").is_some() {
         return Err(bad(
@@ -54,8 +56,8 @@ fn resolve_generic_point(
             format!("point `{point_key}` generic focas2 不接受 address，用声明式参数"),
         ));
     }
-    // 整数参数 fail-closed：None → default/required-missing；
-    // Some(非 u64 或越界) → 直接 reject，绝不当作不存在。
+    // 实例参数全部 fail-closed：required 缺席即 INVALID_POINT，不靠 Driver
+    // 默认猜实例；Some(非 u64 或越界) → 直接 reject，绝不当作不存在。
     let int_param =
         |key: &str, required: bool, default: u64, min: u64, max: u64| match params.get(key) {
             None if required => Err(bad(
@@ -71,38 +73,36 @@ fn resolve_generic_point(
                 )),
             },
         };
+    // pmc bit：optional 0..7，无 default；缺席即整字，绝不猜 bit 0。
+    let opt_bit = || match params.get("bit") {
+        None => Ok(None),
+        Some(v) => match v.as_u64() {
+            Some(n) if n <= 7 => Ok(Some(n as u8)),
+            _ => Err(bad(
+                "INVALID_BINDING_CONFIG",
+                format!("point `{point_key}` 参数 bit={v} 非法（需 0..=7 整数）"),
+            )),
+        },
+    };
+    // 注意：DataType 在此表唯一确定，除了 pmc（bit 有无决定 I32/Bool，
+    // 由 `DriverResolved` 在 Descriptor 声明，Core 放行、Driver 终裁）。
     let (addr, data_type) = match (resource_id, output) {
-        ("status", "value") => (FocasAddress::Status, DataType::U32),
-        ("dynamic", "feed") => (FocasAddress::Feed, DataType::U32),
-        ("dynamic", "spindle.speed") => (
-            FocasAddress::Spindle {
-                spindle: 1,
-                kind: SpindleKind::Speed,
-            },
-            DataType::I32,
-        ),
-        ("dynamic", "program.current") => (FocasAddress::ProgramName, DataType::String),
-        ("dynamic", "position.absolute") => {
-            let axis = int_param("axis", false, 1, 1, 32)? as u8;
-            (
-                FocasAddress::Axis {
-                    axis,
-                    kind: AxisKind::Absolute,
-                },
-                DataType::I32,
-            )
-        }
-        ("axis", "value") => {
+        ("machine", "status") => (FocasAddress::Status, DataType::U32),
+        ("machine", "feed") => (FocasAddress::Feed, DataType::U32),
+        // 当前活动主轴速度：`cnc_acts` 无 spindle 实例语义，绝不伪装成
+        // `Spindle { spindle: 1 }`（label 会变成假的 `spindle[1].speed`）。
+        ("machine", "spindle_speed") => (FocasAddress::ActiveSpindleSpeed, DataType::I32),
+        ("axis", "absolute") => {
             let axis = int_param("axis", true, 1, 1, 32)? as u8;
             (
                 FocasAddress::Axis {
                     axis,
-                    kind: AxisKind::Absolute,
+                    kind: address::AxisKind::Absolute,
                 },
                 DataType::I32,
             )
         }
-        ("spindle", "value") => {
+        ("spindle", "load") => {
             let spindle = int_param("spindle", true, 1, 1, 4)? as u8;
             (
                 FocasAddress::Spindle {
@@ -111,6 +111,30 @@ fn resolve_generic_point(
                 },
                 DataType::U32,
             )
+        }
+        ("spindle", "gear") => {
+            let spindle = int_param("spindle", true, 1, 1, 4)? as u8;
+            (
+                FocasAddress::Spindle {
+                    spindle,
+                    kind: SpindleKind::Gear,
+                },
+                DataType::I32,
+            )
+        }
+        ("spindle", "maxrpm") => {
+            let spindle = int_param("spindle", true, 1, 1, 4)? as u8;
+            (
+                FocasAddress::Spindle {
+                    spindle,
+                    kind: SpindleKind::MaxRpm,
+                },
+                DataType::I32,
+            )
+        }
+        ("servo", "load") => {
+            let axis = int_param("axis", true, 1, 1, 32)? as u8;
+            (FocasAddress::ServoLoad { axis }, DataType::U32)
         }
         ("pmc", "value") => {
             // canonical 精确拼写（Descriptor Enum 同口径；大小写/前缀变体不接受）。
@@ -136,13 +160,19 @@ fn resolve_generic_point(
                 ));
             }
             let addr_num = int_param("addr", true, 0, 0, u32::MAX as u64)? as u32;
+            let bit = opt_bit()?;
+            let data_type = if bit.is_some() {
+                DataType::Bool
+            } else {
+                DataType::I32
+            };
             (
                 FocasAddress::Pmc {
                     kind,
                     addr: addr_num,
-                    bit: None,
+                    bit,
                 },
-                DataType::I32,
+                data_type,
             )
         }
         ("macro", "value") => {
@@ -150,9 +180,58 @@ fn resolve_generic_point(
             (FocasAddress::MacroVar { number }, DataType::F64)
         }
         ("alarm", "value") => (FocasAddress::Alarm, DataType::String),
+        ("opmsg", "value") => (FocasAddress::OpMsg, DataType::String),
+        ("tool", "offset") => {
+            let number = int_param("number", true, 0, 0, u32::MAX as u64)? as u32;
+            (
+                FocasAddress::Tool {
+                    kind: ToolKind::Offset,
+                    number,
+                },
+                DataType::F64,
+            )
+        }
+        ("tool", "zofs") => {
+            let number = int_param("number", true, 0, 0, u32::MAX as u64)? as u32;
+            (
+                FocasAddress::Tool {
+                    kind: ToolKind::Zofs,
+                    number,
+                },
+                DataType::F64,
+            )
+        }
+        ("tool", "length") => {
+            let number = int_param("number", true, 0, 0, u32::MAX as u64)? as u32;
+            (
+                FocasAddress::Tool {
+                    kind: ToolKind::Length,
+                    number,
+                },
+                DataType::F64,
+            )
+        }
+        ("param", "value") => {
+            let number = int_param("number", true, 0, 0, u32::MAX as u64)? as u32;
+            (FocasAddress::Param { number }, DataType::I32)
+        }
+        ("diagnosis", "value") => {
+            let number = int_param("number", true, 0, 0, u32::MAX as u64)? as u32;
+            (FocasAddress::Diagnosis { number }, DataType::I32)
+        }
         (r, _)
             if ![
-                "status", "dynamic", "axis", "spindle", "pmc", "macro", "alarm",
+                "machine",
+                "axis",
+                "spindle",
+                "servo",
+                "pmc",
+                "macro",
+                "alarm",
+                "opmsg",
+                "tool",
+                "param",
+                "diagnosis",
             ]
             .contains(&r) =>
         {
@@ -221,20 +300,25 @@ impl Driver for FocasDriver {
                 ],
             },
             resources: vec![
+                // Resource Model Cleanup：只暴露当前读取语义真实、适合
+                // Acquisition 的能力。`FocasAddress` 支持范围 ≠ Descriptor
+                // 产品能力（program 等未实现可信读取的不暴露，等真实实现后再加）。
+                // 旧 `dynamic/status/value/axis/value/spindle/value` 已删除，
+                // 无 alias、无迁移：旧形态报 UNSUPPORTED_RESOURCE/UNKNOWN_OUTPUT。
                 ResourceDescriptor {
-                    id: "dynamic".into(),
-                    label: LocalizedText::new("Dynamic"),
-                    parameters: SchemaDescriptor {
-                        fields: vec![{
-                            let mut f = FieldDescriptor::new("axis", "Axis", FieldType::Integer)
-                                .required(false)
-                                .default_value(serde_json::json!(1));
-                            f.validation.min = Some(1.0);
-                            f.validation.max = Some(32.0);
-                            f
-                        }],
-                    },
+                    id: "machine".into(),
+                    label: LocalizedText::new("Machine"),
+                    parameters: SchemaDescriptor::default(),
                     outputs: vec![
+                        OutputDescriptor {
+                            id: "status".into(),
+                            label: LocalizedText::new("Status"),
+                            type_spec: OutputTypeSpec::Fixed {
+                                data_type: DataType::U32,
+                            },
+                            unit: None,
+                            access: AccessMode::Read,
+                        },
                         OutputDescriptor {
                             id: "feed".into(),
                             label: LocalizedText::new("Feed"),
@@ -245,52 +329,22 @@ impl Driver for FocasDriver {
                             access: AccessMode::Read,
                         },
                         OutputDescriptor {
-                            id: "spindle.speed".into(),
+                            // 当前活动主轴速度（`cnc_acts`，无 spindle 实例；
+                            // 参数化 `spindle/speed` 等 `cnc_acts2` 落地后再加）。
+                            id: "spindle_speed".into(),
                             label: LocalizedText::new("Spindle Speed"),
-                            // 真机 cnc_acts 返回 I32（Fake 同口径），旧 U32 声明错误
                             type_spec: OutputTypeSpec::Fixed {
                                 data_type: DataType::I32,
                             },
                             unit: Some("rpm".into()),
                             access: AccessMode::Read,
                         },
-                        OutputDescriptor {
-                            id: "program.current".into(),
-                            label: LocalizedText::new("Current Program"),
-                            type_spec: OutputTypeSpec::Fixed {
-                                data_type: DataType::String,
-                            },
-                            unit: None,
-                            access: AccessMode::Read,
-                        },
-                        OutputDescriptor {
-                            id: "position.absolute".into(),
-                            label: LocalizedText::new("Absolute Position"),
-                            type_spec: OutputTypeSpec::Fixed {
-                                data_type: DataType::I32,
-                            },
-                            unit: Some("pulse".into()),
-                            access: AccessMode::Read,
-                        },
                     ],
                     modes: vec![mesa_core_types::TaskMode::Poll],
                 },
                 ResourceDescriptor {
-                    id: "status".into(),
-                    label: LocalizedText::new("Status"),
-                    parameters: SchemaDescriptor::default(),
-                    outputs: vec![OutputDescriptor {
-                        id: "value".into(),
-                        label: LocalizedText::new("Status"),
-                        type_spec: OutputTypeSpec::Fixed {
-                            data_type: DataType::U32,
-                        },
-                        unit: None,
-                        access: AccessMode::Read,
-                    }],
-                    modes: vec![mesa_core_types::TaskMode::Poll],
-                },
-                ResourceDescriptor {
+                    // 只暴露 absolute：其余 6 kind 当前读路径并不可信
+                    //（kind 被忽略/回退 actf），不是删功能。
                     id: "axis".into(),
                     label: LocalizedText::new("Axis"),
                     parameters: SchemaDescriptor {
@@ -303,17 +357,18 @@ impl Driver for FocasDriver {
                         }],
                     },
                     outputs: vec![OutputDescriptor {
-                        id: "value".into(),
-                        label: LocalizedText::new("Position"),
+                        id: "absolute".into(),
+                        label: LocalizedText::new("Absolute Position"),
                         type_spec: OutputTypeSpec::Fixed {
                             data_type: DataType::I32,
                         },
-                        unit: None,
+                        unit: Some("pulse".into()),
                         access: AccessMode::Read,
                     }],
                     modes: vec![mesa_core_types::TaskMode::Poll],
                 },
                 ResourceDescriptor {
+                    // 无 speed：`cnc_acts` 不接受 spindle 号，暴露即造假。
                     id: "spindle".into(),
                     label: LocalizedText::new("Spindle"),
                     parameters: SchemaDescriptor {
@@ -326,8 +381,52 @@ impl Driver for FocasDriver {
                             f
                         }],
                     },
+                    outputs: vec![
+                        OutputDescriptor {
+                            id: "load".into(),
+                            label: LocalizedText::new("Load"),
+                            type_spec: OutputTypeSpec::Fixed {
+                                data_type: DataType::U32,
+                            },
+                            unit: None,
+                            access: AccessMode::Read,
+                        },
+                        OutputDescriptor {
+                            // 真机 `cnc_rdspgear` 返回 I16（Native I32 口径为准）。
+                            id: "gear".into(),
+                            label: LocalizedText::new("Gear"),
+                            type_spec: OutputTypeSpec::Fixed {
+                                data_type: DataType::I32,
+                            },
+                            unit: None,
+                            access: AccessMode::Read,
+                        },
+                        OutputDescriptor {
+                            id: "maxrpm".into(),
+                            label: LocalizedText::new("Max RPM"),
+                            type_spec: OutputTypeSpec::Fixed {
+                                data_type: DataType::I32,
+                            },
+                            unit: Some("rpm".into()),
+                            access: AccessMode::Read,
+                        },
+                    ],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
+                    id: "servo".into(),
+                    label: LocalizedText::new("Servo"),
+                    parameters: SchemaDescriptor {
+                        fields: vec![{
+                            let mut f = FieldDescriptor::new("axis", "Axis", FieldType::Integer)
+                                .required(true);
+                            f.validation.min = Some(1.0);
+                            f.validation.max = Some(32.0);
+                            f
+                        }],
+                    },
                     outputs: vec![OutputDescriptor {
-                        id: "value".into(),
+                        id: "load".into(),
                         label: LocalizedText::new("Load"),
                         type_spec: OutputTypeSpec::Fixed {
                             data_type: DataType::U32,
@@ -359,14 +458,22 @@ impl Driver for FocasDriver {
                                 f.validation.max = Some(4294967295.0);
                                 f
                             },
+                            {
+                                // 只有 bit 可选：无 default，缺席即整字，绝不猜 bit 0。
+                                let mut f = FieldDescriptor::new("bit", "Bit", FieldType::Integer)
+                                    .required(false);
+                                f.validation.min = Some(0.0);
+                                f.validation.max = Some(7.0);
+                                f
+                            },
                         ],
                     },
+                    // 单 output：bit 有无决定最终类型（DriverResolved 由
+                    // Driver 终裁，Core 放行），不搞 value/bit 互斥双 output。
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Value"),
-                        type_spec: OutputTypeSpec::Fixed {
-                            data_type: DataType::I32,
-                        },
+                        type_spec: OutputTypeSpec::DriverResolved,
                         unit: None,
                         access: AccessMode::Read,
                     }],
@@ -411,9 +518,118 @@ impl Driver for FocasDriver {
                     }],
                     modes: vec![mesa_core_types::TaskMode::Poll],
                 },
-                // NOTE(PR3 canonical)：独立 program 资源已删除——它与
-                // dynamic/program.current 同义（ProgramName/String），
-                // 双入口违反唯一 canonical；程序名只走 dynamic 家族。
+                ResourceDescriptor {
+                    id: "opmsg".into(),
+                    label: LocalizedText::new("Operator Message"),
+                    parameters: SchemaDescriptor::default(),
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Message"),
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::String,
+                        },
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
+                    // 无 `number` output（旧 Number 硬编码 U32(1)，不可暴露）；
+                    // number 必填后无需任何条件逻辑。
+                    id: "tool".into(),
+                    label: LocalizedText::new("Tool"),
+                    parameters: SchemaDescriptor {
+                        fields: vec![{
+                            let mut f =
+                                FieldDescriptor::new("number", "Number", FieldType::Integer)
+                                    .required(true);
+                            f.validation.min = Some(0.0);
+                            f.validation.max = Some(4294967295.0);
+                            f
+                        }],
+                    },
+                    outputs: vec![
+                        OutputDescriptor {
+                            id: "offset".into(),
+                            label: LocalizedText::new("Offset"),
+                            type_spec: OutputTypeSpec::Fixed {
+                                data_type: DataType::F64,
+                            },
+                            unit: None,
+                            access: AccessMode::Read,
+                        },
+                        OutputDescriptor {
+                            id: "zofs".into(),
+                            label: LocalizedText::new("Work Zero"),
+                            type_spec: OutputTypeSpec::Fixed {
+                                data_type: DataType::F64,
+                            },
+                            unit: None,
+                            access: AccessMode::Read,
+                        },
+                        OutputDescriptor {
+                            id: "length".into(),
+                            label: LocalizedText::new("Length"),
+                            type_spec: OutputTypeSpec::Fixed {
+                                data_type: DataType::F64,
+                            },
+                            unit: None,
+                            access: AccessMode::Read,
+                        },
+                    ],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
+                    id: "param".into(),
+                    label: LocalizedText::new("Parameter"),
+                    parameters: SchemaDescriptor {
+                        fields: vec![{
+                            let mut f =
+                                FieldDescriptor::new("number", "Number", FieldType::Integer)
+                                    .required(true);
+                            f.validation.min = Some(0.0);
+                            f.validation.max = Some(4294967295.0);
+                            f
+                        }],
+                    },
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Value"),
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::I32,
+                        },
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                ResourceDescriptor {
+                    id: "diagnosis".into(),
+                    label: LocalizedText::new("Diagnosis"),
+                    parameters: SchemaDescriptor {
+                        fields: vec![{
+                            let mut f =
+                                FieldDescriptor::new("number", "Number", FieldType::Integer)
+                                    .required(true);
+                            f.validation.min = Some(0.0);
+                            f.validation.max = Some(4294967295.0);
+                            f
+                        }],
+                    },
+                    outputs: vec![OutputDescriptor {
+                        id: "value".into(),
+                        label: LocalizedText::new("Value"),
+                        type_spec: OutputTypeSpec::Fixed {
+                            data_type: DataType::I32,
+                        },
+                        unit: None,
+                        access: AccessMode::Read,
+                    }],
+                    modes: vec![mesa_core_types::TaskMode::Poll],
+                },
+                // NOTE：program 本次不暴露——`ProgramName` 读路径返回占位
+                // `O1000`（与设备真实程序无关），dir/info/upload 更不适合
+                // Acquisition Poll。等真实 current program 实现后再加。
             ],
             controls: mesa_core_types::ControlCatalog {
                 commands: vec![mesa_core_types::capability::CommandDescriptor {
@@ -766,8 +982,8 @@ impl DriverConnection for FocasConnection {
                 point_key: p.key.clone(),
                 data_type: p.data_type,
                 unit: None,
-                // P1 未实现：回落 None（UI 显示技术坐标），不阻塞。
-                source_label: None,
+                // 来源标签走 FocasAddress 唯一格式化入口（configure/诊断同一实现）。
+                source_label: Some(p.addr.source_label()),
             })
             .collect();
         ensure_unique_point_keys(&descriptors).map_err(|DuplicatePointKey(k)| {
@@ -1062,8 +1278,8 @@ mod tests {
     fn status_axis_selections(dup_key: bool) -> serde_json::Value {
         let second = if dup_key { "a" } else { "b" };
         serde_json::json!([
-            {"resource_id":"status","parameters":{},"outputs":[{"output":"value","point_key":"a"}]},
-            {"resource_id":"axis","parameters":{"axis":1},"outputs":[{"output":"value","point_key":second}]},
+            {"resource_id":"machine","parameters":{},"outputs":[{"output":"status","point_key":"a"}]},
+            {"resource_id":"axis","parameters":{"axis":1},"outputs":[{"output":"absolute","point_key":second}]},
         ])
     }
 
@@ -1075,83 +1291,170 @@ mod tests {
         }
     }
 
-    /// PR3 闭环：7 个声明资源 × canonical 参数 → validate_instance PASS →
-    /// generic configure PASS → PointDescriptor == descriptor Fixed 类型。
+    /// Resource Model Cleanup 闭环：全部声明 (resource, output) × canonical
+    /// 参数 → validate_instance PASS → generic configure PASS →
+    /// PointDescriptor == 终裁类型 + source_label 断言。
+    /// coverage 门：测试集合必须 == Descriptor 全部 (resource, output)，
+    /// 新增 Resource 忘记 resolver 即红。pmc 是 DriverResolved，
+    /// Core resolve 为 None，由 Driver 终裁（bit 有无 → I32/Bool）。
     #[tokio::test]
     async fn generic_canonical_loop_closed_for_all_resources() {
         let d = FocasDriver.descriptor();
         d.validate().expect("descriptor 必须合法");
-        // coverage 门：测试集合必须 == Descriptor 全部 (resource, output)，
-        // 新增 Resource 忘记 resolver 即红（不再靠人工数“7 个”）。
         let declared: std::collections::BTreeSet<(String, String)> = d
             .resources
             .iter()
             .flat_map(|r| r.outputs.iter().map(move |o| (r.id.clone(), o.id.clone())))
             .collect();
-        let cases: Vec<(&str, &str, serde_json::Value, DataType)> = vec![
-            ("status", "value", serde_json::json!({}), DataType::U32),
+        let cases: Vec<(&str, &str, serde_json::Value, DataType, &str)> = vec![
             (
-                "dynamic",
-                "feed",
-                serde_json::json!({"axis": 1}),
+                "machine",
+                "status",
+                serde_json::json!({}),
                 DataType::U32,
+                "machine.status",
             ),
             (
-                "dynamic",
-                "spindle.speed",
+                "machine",
+                "feed",
+                serde_json::json!({}),
+                DataType::U32,
+                "machine.feed",
+            ),
+            (
+                "machine",
+                "spindle_speed",
                 serde_json::json!({}),
                 DataType::I32,
-            ),
-            (
-                "dynamic",
-                "program.current",
-                serde_json::json!({}),
-                DataType::String,
-            ),
-            (
-                "dynamic",
-                "position.absolute",
-                serde_json::json!({"axis": 2}),
-                DataType::I32,
+                "spindle.active.speed",
             ),
             (
                 "axis",
-                "value",
-                serde_json::json!({"axis": 3}),
+                "absolute",
+                serde_json::json!({"axis": 2}),
                 DataType::I32,
+                "axis[2].absolute",
             ),
             (
                 "spindle",
-                "value",
+                "load",
                 serde_json::json!({"spindle": 1}),
                 DataType::U32,
+                "spindle[1].load",
+            ),
+            (
+                "spindle",
+                "gear",
+                serde_json::json!({"spindle": 1}),
+                DataType::I32,
+                "spindle[1].gear",
+            ),
+            (
+                "spindle",
+                "maxrpm",
+                serde_json::json!({"spindle": 2}),
+                DataType::I32,
+                "spindle[2].maxrpm",
+            ),
+            (
+                "servo",
+                "load",
+                serde_json::json!({"axis": 2}),
+                DataType::U32,
+                "servo[2].load",
             ),
             (
                 "pmc",
                 "value",
                 serde_json::json!({"kind": "R", "addr": 100}),
                 DataType::I32,
+                "pmc.R100",
+            ),
+            (
+                "pmc",
+                "value",
+                serde_json::json!({"kind": "R", "addr": 100, "bit": 3}),
+                DataType::Bool,
+                "pmc.R100.3",
             ),
             (
                 "macro",
                 "value",
                 serde_json::json!({"number": 100}),
                 DataType::F64,
+                "macro[100]",
             ),
-            ("alarm", "value", serde_json::json!({}), DataType::String),
+            (
+                "alarm",
+                "value",
+                serde_json::json!({}),
+                DataType::String,
+                "alarm.value",
+            ),
+            (
+                "opmsg",
+                "value",
+                serde_json::json!({}),
+                DataType::String,
+                "opmsg.value",
+            ),
+            (
+                "tool",
+                "offset",
+                serde_json::json!({"number": 1}),
+                DataType::F64,
+                "tool.offset[1]",
+            ),
+            (
+                "tool",
+                "zofs",
+                serde_json::json!({"number": 2}),
+                DataType::F64,
+                "tool.zofs[2]",
+            ),
+            (
+                "tool",
+                "length",
+                serde_json::json!({"number": 1}),
+                DataType::F64,
+                "tool.length[1]",
+            ),
+            (
+                "param",
+                "value",
+                serde_json::json!({"number": 100}),
+                DataType::I32,
+                "param[100]",
+            ),
+            (
+                "diagnosis",
+                "value",
+                serde_json::json!({"number": 0}),
+                DataType::I32,
+                "diagnosis[0]",
+            ),
         ];
         let tested: std::collections::BTreeSet<(String, String)> = cases
             .iter()
-            .map(|(r, o, _, _)| (r.to_string(), o.to_string()))
+            .map(|(r, o, _, _, _)| (r.to_string(), o.to_string()))
             .collect();
         assert_eq!(declared, tested, "测试必须覆盖全部声明对");
-        for (resource_id, output, params, expected) in cases {
+        for (resource_id, output, params, expected, want_label) in cases {
             let res = d.resources.iter().find(|r| r.id == resource_id).unwrap();
             let issues = res.parameters.validate_instance("parameters", &params);
             assert!(issues.is_empty(), "{resource_id}/{output}: {issues:?}");
             let out = res.outputs.iter().find(|o| o.id == output).unwrap();
             let pmap = params.as_object().unwrap().clone();
-            assert_eq!(out.type_spec.resolve(&pmap), Some(expected));
+            // pmc DriverResolved 由 Driver 终裁：Core resolve 恒 None，
+            // 此处直接断言终裁类型（configure 的 PointDescriptor）。
+            if resource_id != "pmc" {
+                assert_eq!(out.type_spec.resolve(&pmap), Some(expected));
+            } else {
+                assert!(matches!(
+                    out.type_spec,
+                    mesa_core_types::OutputTypeSpec::DriverResolved
+                ));
+            }
             let sel = serde_json::json!([{
                 "resource_id": resource_id,
                 "parameters": params,
@@ -1161,31 +1464,82 @@ mod tests {
             let descs = conn.configure(1, vec![generic_task(sel)]).await.unwrap();
             assert_eq!(descs.len(), 1);
             assert_eq!(descs[0].data_type, expected, "{resource_id}/{output}");
+            assert_eq!(
+                descs[0].source_label.as_deref(),
+                Some(want_label),
+                "{resource_id}/{output}"
+            );
         }
     }
 
-    /// generic 拒绝：未声明资源/输出、address 参数、越界轴号、非 canonical pmc kind。
+    /// generic 拒绝：未声明资源/输出、address 参数、越界轴号、非 canonical pmc kind、
+    /// 旧 dynamic/status/value 形态、实例参数缺席、pmc bit 越界。
     #[tokio::test]
     async fn generic_rejects_non_canonical() {
         let cases: Vec<(&str, serde_json::Value, &str)> = vec![
             (
                 "未声明资源",
-                serde_json::json!([{"resource_id": "tool", "parameters": {}, "outputs": [{"output": "value", "point_key": "k"}]}]),
+                serde_json::json!([{"resource_id": "program", "parameters": {}, "outputs": [{"output": "value", "point_key": "k"}]}]),
                 "UNSUPPORTED_RESOURCE",
             ),
             (
-                "未声明输出",
-                serde_json::json!([{"resource_id": "status", "parameters": {}, "outputs": [{"output": "nope", "point_key": "k"}]}]),
+                "旧 dynamic 已删除",
+                serde_json::json!([{"resource_id": "dynamic", "parameters": {}, "outputs": [{"output": "feed", "point_key": "k"}]}]),
+                "UNSUPPORTED_RESOURCE",
+            ),
+            (
+                "旧 status/value 已删除（现 machine/status）",
+                serde_json::json!([{"resource_id": "status", "parameters": {}, "outputs": [{"output": "value", "point_key": "k"}]}]),
+                "UNSUPPORTED_RESOURCE",
+            ),
+            (
+                "旧 axis/value 已删除（现 axis/absolute）",
+                serde_json::json!([{"resource_id": "axis", "parameters": {"axis": 1}, "outputs": [{"output": "value", "point_key": "k"}]}]),
+                "UNKNOWN_OUTPUT",
+            ),
+            (
+                "旧 spindle/value 已删除（现 spindle/load）",
+                serde_json::json!([{"resource_id": "spindle", "parameters": {"spindle": 1}, "outputs": [{"output": "value", "point_key": "k"}]}]),
+                "UNKNOWN_OUTPUT",
+            ),
+            (
+                "machine 无 spindle_speed 外的非法输出",
+                serde_json::json!([{"resource_id": "machine", "parameters": {}, "outputs": [{"output": "nope", "point_key": "k"}]}]),
                 "UNKNOWN_OUTPUT",
             ),
             (
                 "address 参数不接受",
-                serde_json::json!([{"resource_id": "status", "parameters": {"address": "status"}, "outputs": [{"output": "value", "point_key": "k"}]}]),
+                serde_json::json!([{"resource_id": "machine", "parameters": {"address": "status"}, "outputs": [{"output": "status", "point_key": "k"}]}]),
                 "INVALID_BINDING_CONFIG",
             ),
             (
                 "轴号越界",
-                serde_json::json!([{"resource_id": "axis", "parameters": {"axis": 33}, "outputs": [{"output": "value", "point_key": "k"}]}]),
+                serde_json::json!([{"resource_id": "axis", "parameters": {"axis": 33}, "outputs": [{"output": "absolute", "point_key": "k"}]}]),
+                "INVALID_BINDING_CONFIG",
+            ),
+            (
+                "axis 缺实例参数",
+                serde_json::json!([{"resource_id": "axis", "parameters": {}, "outputs": [{"output": "absolute", "point_key": "k"}]}]),
+                "INVALID_POINT",
+            ),
+            (
+                "spindle 缺实例参数",
+                serde_json::json!([{"resource_id": "spindle", "parameters": {}, "outputs": [{"output": "load", "point_key": "k"}]}]),
+                "INVALID_POINT",
+            ),
+            (
+                "tool number 必填（不再可选）",
+                serde_json::json!([{"resource_id": "tool", "parameters": {}, "outputs": [{"output": "offset", "point_key": "k"}]}]),
+                "INVALID_POINT",
+            ),
+            (
+                "tool 无 number 输出",
+                serde_json::json!([{"resource_id": "tool", "parameters": {"number": 1}, "outputs": [{"output": "number", "point_key": "k"}]}]),
+                "UNKNOWN_OUTPUT",
+            ),
+            (
+                "pmc bit 越界",
+                serde_json::json!([{"resource_id": "pmc", "parameters": {"kind": "R", "addr": 100, "bit": 8}, "outputs": [{"output": "value", "point_key": "k"}]}]),
                 "INVALID_BINDING_CONFIG",
             ),
             (
@@ -1205,7 +1559,7 @@ mod tests {
             ),
             (
                 "axis 非法值不得回落 default",
-                serde_json::json!([{"resource_id": "axis", "parameters": {"axis": -1}, "outputs": [{"output": "value", "point_key": "k"}]}]),
+                serde_json::json!([{"resource_id": "axis", "parameters": {"axis": -1}, "outputs": [{"output": "absolute", "point_key": "k"}]}]),
                 "INVALID_BINDING_CONFIG",
             ),
         ];
@@ -1231,8 +1585,8 @@ mod tests {
         assert_eq!(descs.len(), 2);
         // 跨 task 重复 point_key → DUPLICATE_POINT_KEY（同一 task 内重复则
         // 早于此被结构级拒绝，见 generic 路径 validate_selections_structure）
-        let dup_a = serde_json::json!([{"resource_id":"status","parameters":{},"outputs":[{"output":"value","point_key":"a"}]}]);
-        let dup_b = serde_json::json!([{"resource_id":"axis","parameters":{"axis":2},"outputs":[{"output":"value","point_key":"a"}]}]);
+        let dup_a = serde_json::json!([{"resource_id":"machine","parameters":{},"outputs":[{"output":"status","point_key":"a"}]}]);
+        let dup_b = serde_json::json!([{"resource_id":"axis","parameters":{"axis":2},"outputs":[{"output":"absolute","point_key":"a"}]}]);
         let err = conn
             .configure(
                 2,
@@ -1255,7 +1609,7 @@ mod tests {
         };
         // axis=0 越界（int_param fail-closed → INVALID_BINDING_CONFIG；
         // INVALID_ADDRESS 保留给地址解析层，本层参数越界走绑定配置错）
-        let sel = serde_json::json!([{"resource_id":"axis","parameters":{"axis":0},"outputs":[{"output":"value","point_key":"a"}]}]);
+        let sel = serde_json::json!([{"resource_id":"axis","parameters":{"axis":0},"outputs":[{"output":"absolute","point_key":"a"}]}]);
         let err = conn
             .configure(1, vec![generic_task(sel)])
             .await
@@ -1313,6 +1667,41 @@ mod tests {
         let r = conn.probe().await.expect("不可达是探测结果");
         assert!(!r.reachable);
         assert!(r.warnings.iter().any(|w| w.code == "CONNECTION_FAILED"));
+    }
+
+    /// fail-closed 回归：Axis 非 Absolute 不得产出位置（双入口同语义）。
+    /// `configure` 层根本到不了读路径（resolver 只认 absolute），
+    /// 此处锁定读层最后一道门：Fake 与 Native 语义一致。
+    #[tokio::test]
+    async fn axis_non_absolute_never_produces_position() {
+        use crate::address::{AxisKind, FocasAddress};
+        // Fake：非 Absolute 即 ERR（run 层转单点 BAD，不污染同批）。
+        let api = FakeFocasApi::new();
+        // Fake：非 Absolute 即 ERR（run 层转单点 BAD，不污染同批）。
+        for kind in [
+            AxisKind::Machine,
+            AxisKind::Relative,
+            AxisKind::Distance,
+            AxisKind::Data,
+            AxisKind::SrvDelay,
+            AxisKind::AccDecDly,
+        ] {
+            let vals = api
+                .read_batch(&[FocasAddress::Axis { axis: 1, kind }])
+                .await
+                .unwrap();
+            assert_eq!(vals.len(), 1);
+            assert!(
+                matches!(&vals[0], mesa_core_types::Value::String(s) if s.starts_with("ERR:")),
+                "{kind:?} 必须 ERR，不得伪造位置"
+            );
+        }
+        // Native 单点入口（无 dll 即干净失败，绝不回退 feed）。
+        let r = NativeFocasApi::read_one_no_lib_for_test(&FocasAddress::Axis {
+            axis: 1,
+            kind: AxisKind::Machine,
+        });
+        assert!(r.is_err(), "Native 非 Absolute 必须 Err");
     }
 
     #[tokio::test]

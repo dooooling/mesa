@@ -161,7 +161,7 @@ GET /api/v1/drivers/{id}/descriptor   # 懒加载：临时spawn→handshake→Ge
 |---|---|---|
 | **Simulator** (§15) | `connection{fail_after_batches,crash_after_batches} / resources{counter,sine,toggle,random,constant}/outputs{value}`（PR4：connection `seed` 死 knob 删除，`faults` 嵌套打平为顶层整数） | 作为 Generic UI/Contract 测试Driver |
 | **S7** (§16,18) | `connection{host,port,rack,slot,timeout} / resource memory{area,db,offset,data_type,bit,length}` | `merge_paired_to_bulks_with_max / PDU negotiation / fragment/reassemble / BAD fallback` 保留，不参与Descriptor |
-| **FOCAS2** (§17) | `resources ≥9: dynamic/status/axis/spindle/pmc/macro/parameter/diagnosis/alarm/program`，`dynamic(axis)→feed/spindle.speed/program.current/position.absolute` 展示 **1 Resource多Outputs** | 后续 Milestone D 的 Planner 基础 |
+| **FOCAS2** (§17) | `resources 11: machine{status,feed,spindle_speed}/axis{absolute}/spindle{load,gear,maxrpm}/servo{load}/pmc{value:DriverResolved}/macro/alarm/opmsg/tool{offset,zofs,length}/param/diagnosis`（Resource Model Cleanup：只暴露读取语义真实、适合 Acquisition 的能力；旧 dynamic/status/value 已删除，无 program） | 后续 Milestone D 的 Planner 基础 |
 | **OPC UA** (§19) | `connection{endpointUrl,policy,mode,auth,CertificateRef} + resource node{NodeId,Attribute} + capabilities{poll,subscribe,browse,write,method}` | 订阅与Browse分离 |
 
 测试：各 `descriptor()合法/可序列化/唯一性/default合法` + `Descriptor改动不影响旧binding回归`。
