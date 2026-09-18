@@ -109,14 +109,14 @@ async fn focas_generic_status_ok() {
         .open_connection("ep1", "{}")
         .await
         .unwrap();
-    // canonical：resource status 无参数（address/data_type 只属于 legacy）
+    // Resource Model Cleanup：machine/status（旧 status/value 已删除）。
     let task = generic_task(
         "t1",
         vec![ResourceSelection {
-            resource_id: "status".into(),
+            resource_id: "machine".into(),
             parameters: json!({}),
             outputs: vec![SelectedOutput {
-                output: "value".into(),
+                output: "status".into(),
                 point_key: "cnc.status".into(),
             }],
         }],
@@ -125,6 +125,69 @@ async fn focas_generic_status_ok() {
     assert_eq!(descs.len(), 1);
     assert_eq!(descs[0].point_key, "cnc.status");
     assert_eq!(descs[0].data_type, mesa_core_types::DataType::U32);
+    assert_eq!(
+        descs[0].source_label.as_deref(),
+        Some("machine.status"),
+        "来源必须准确到真实地址"
+    );
+}
+
+#[tokio::test]
+async fn focas_generic_axis_absolute_ok() {
+    let conn = mesa_driver_focas2::FocasDriver
+        .open_connection("ep1", "{}")
+        .await
+        .unwrap();
+    // axis/absolute（旧 axis/value、dynamic/position.absolute 已删除）。
+    let task = generic_task(
+        "t1",
+        vec![ResourceSelection {
+            resource_id: "axis".into(),
+            parameters: json!({"axis": 1}),
+            outputs: vec![SelectedOutput {
+                output: "absolute".into(),
+                point_key: "cnc.x.absolute".into(),
+            }],
+        }],
+    );
+    let descs = conn.configure(1, vec![task]).await.unwrap();
+    assert_eq!(descs.len(), 1);
+    assert_eq!(descs[0].data_type, mesa_core_types::DataType::I32);
+    assert_eq!(descs[0].source_label.as_deref(), Some("axis[1].absolute"));
+}
+
+#[tokio::test]
+async fn focas_generic_legacy_shapes_rejected() {
+    let conn = mesa_driver_focas2::FocasDriver
+        .open_connection("ep1", "{}")
+        .await
+        .unwrap();
+    // 旧形态无 alias：dynamic、status/value、axis/value 一律拒绝。
+    for (resource_id, parameters, output) in [
+        ("dynamic", json!({}), "feed"),
+        ("status", json!({}), "value"),
+        ("axis", json!({"axis": 1}), "value"),
+        ("spindle", json!({"spindle": 1}), "value"),
+        ("program", json!({}), "value"),
+    ] {
+        let task = generic_task(
+            "t1",
+            vec![ResourceSelection {
+                resource_id: resource_id.into(),
+                parameters,
+                outputs: vec![SelectedOutput {
+                    output: output.into(),
+                    point_key: "k".into(),
+                }],
+            }],
+        );
+        let err = conn.configure(1, vec![task]).await.unwrap_err();
+        assert!(
+            err.code == "UNSUPPORTED_RESOURCE" || err.code == "UNKNOWN_OUTPUT",
+            "{resource_id}/{output} 必须拒绝，got {}",
+            err.code
+        );
+    }
 }
 
 #[tokio::test]

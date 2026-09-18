@@ -523,13 +523,52 @@ fn focas_descriptor_is_valid() {
     d.validate().expect("focas2 descriptor must be valid");
     assert_eq!(d.identity.driver_id, "focas2");
     assert!(serde_json::to_string(&d).unwrap().len() < 256 * 1024);
-    // 验收：1 Resource 多 Outputs
-    let dyn_res = d
-        .resources
-        .iter()
-        .find(|r| r.id == "dynamic")
-        .expect("dynamic");
-    assert!(dyn_res.outputs.len() >= 4, "dynamic must have >=4 outputs");
+    // Resource Model Cleanup：只暴露读取语义真实、适合 Acquisition 的能力；
+    // 旧 dynamic/status/value 已删除，无 program（ProgramName 读路径占位 O1000）。
+    assert!(
+        d.resources
+            .iter()
+            .all(|r| r.id != "dynamic" && r.id != "status"),
+        "dynamic/status 旧形态必须删除"
+    );
+    assert!(
+        d.resources.iter().all(|r| r.id != "program"),
+        "program 本次不暴露"
+    );
+    let ids: std::collections::BTreeSet<&str> = d.resources.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "alarm",
+            "axis",
+            "diagnosis",
+            "machine",
+            "macro",
+            "opmsg",
+            "param",
+            "pmc",
+            "servo",
+            "spindle",
+            "tool"
+        ]
+        .into_iter()
+        .collect(),
+        "11 资源闭环"
+    );
+    let outputs_of = |id: &str| -> Vec<&str> {
+        d.resources
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .outputs
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect()
+    };
+    assert_eq!(outputs_of("machine"), ["status", "feed", "spindle_speed"]);
+    assert_eq!(outputs_of("axis"), ["absolute"]);
+    assert_eq!(outputs_of("spindle"), ["load", "gear", "maxrpm"]);
+    assert_eq!(outputs_of("tool"), ["offset", "zofs", "length"]);
     assert!(d.resources.iter().any(|r| r.id == "pmc"));
 }
 

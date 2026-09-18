@@ -97,27 +97,36 @@ impl FakeFocasApi {
                 // 模拟位置：-10000..10000 带小数（以 0.001 为单位存储为 I32）
                 let base = (r % 20001) as i32 - 10000;
                 match kind {
-                    AxisKind::Absolute
-                    | AxisKind::Machine
-                    | AxisKind::Relative
-                    | AxisKind::Distance
-                    | AxisKind::Data
-                    | AxisKind::SrvDelay
-                    | AxisKind::AccDecDly => {
+                    AxisKind::Absolute => {
                         // 返回 I32 位置（单位 0.001mm），上层直接取 Value::I32
                         Value::I32(base * 100)
                     }
+                    // 其余 kind 当前无可信读路径：Fake 不得伪造位置，
+                    // 与 Native fail-closed 对齐（ERR → 单点 BAD）。
+                    _ => Value::String(format!("ERR:EW_NOOPT axis {kind:?} unsupported")),
                 }
             }
             FocasAddress::Feed => {
                 // 进给 0..5000
                 Value::U32(r % 5001)
             }
+            // 当前活动主轴速度（`cnc_acts`，与 machine/spindle_speed 资源对应）。
+            FocasAddress::ActiveSpindleSpeed => Value::I32((r % 3000) as i32),
+            // indexed speed fail-closed：parser 兼容保留，但 Fake 不得
+            // 用 active 速度冒充 spindle[n].speed（与 Native 同口径 ERR）。
+            FocasAddress::Spindle {
+                kind: SpindleKind::Speed,
+                ..
+            } => Value::String("ERR:EW_NOOPT indexed spindle speed unsupported".into()),
             FocasAddress::Spindle { spindle: _, kind } => match kind {
-                SpindleKind::Speed => Value::I32((r % 3000) as i32),
+                // Speed 不可达（上一臂已拦截 indexed speed，此臂仅 load/gear/maxrpm）。
                 SpindleKind::Load => Value::U32(r % 101), // 0..100%
-                SpindleKind::Gear => Value::U32((r % 4) + 1),
-                SpindleKind::MaxRpm => Value::U32(6000 + (r % 4000)),
+                // Native 真机口径 I16→I32（Fake 旧 U32 错误，对齐 Native）。
+                SpindleKind::Gear => Value::I32(((r % 4) + 1) as i32),
+                SpindleKind::MaxRpm => Value::I32((6000 + (r % 4000)) as i32),
+                SpindleKind::Speed => {
+                    Value::String("ERR:EW_NOOPT indexed spindle speed unsupported".into())
+                }
             },
             FocasAddress::ServoLoad { axis: _ } => Value::U32(r % 101),
             FocasAddress::MacroVar { number: _ } => {
@@ -201,6 +210,28 @@ impl Default for NativeFocasApi {
 impl NativeFocasApi {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 单测可达的 fail-closed 门（`read_one_blocking` 需要 `&NativeLib`；
+    /// 无 dll 环境下验证 fail-closed 语义，不碰 FFI）：
+    /// Axis 非 Absolute 即 Err；indexed Spindle Speed 即 Err（只有
+    /// ActiveSpindleSpeed 可调 cnc_acts）。
+    /// 有 dll 时生产路径同样先判，不会走到 FFI。
+    #[cfg(test)]
+    pub(crate) fn read_one_no_lib_for_test(
+        addr: &FocasAddress,
+    ) -> Result<mesa_core_types::Value, String> {
+        if let FocasAddress::Axis { kind, .. } = addr
+            && *kind != AxisKind::Absolute
+        {
+            return Err(format!("EW_NOOPT axis {kind:?} unsupported"));
+        }
+        if let FocasAddress::Spindle { kind, .. } = addr
+            && *kind == SpindleKind::Speed
+        {
+            return Err("EW_NOOPT indexed spindle speed unsupported".into());
+        }
+        Err("EW_NODLL test has no NativeLib".into())
     }
 
     // TODO: Native 库预检预留，V1 改为 get_or_init 懒加载后未单独调用，保留以备显式预检路径
@@ -337,29 +368,27 @@ impl FocasApi for NativeFocasApi {
                         }
                     }
                     FocasAddress::Axis { axis, kind } => {
-                        // 修复回归：与 read_one_blocking 保持一致，absolute 失败时回退 rddynamic2，并复用 dy_cache
+                        // fail-closed：只有 Absolute 有可信读路径（`cnc_absolute`）；
+                        // 其余 kind 不得用 absolute 值冒充，更不得用 feed 回退。
+                        // `axis_cache` 只服务 Absolute。
+                        if *kind != AxisKind::Absolute {
+                            return Err(format!("EW_NOOPT axis {kind:?} unsupported"));
+                        }
                         let r = axis_cache.entry(*axis).or_insert_with(|| {
                             match lib.cnc_absolute(hdl, *axis) {
                                 Ok(v) => Ok(v),
-                                Err(e)
-                                    if e == crate::native::FocasRet::Noopt
-                                        || e == crate::native::FocasRet::Param =>
-                                {
-                                    let dy =
-                                        dy_cache.get_or_insert_with(|| lib.cnc_rddynamic2(hdl));
-                                    match dy {
-                                        Ok(dy) => Ok(dy.actf),
-                                        Err(ee) => Err(*ee),
-                                    }
-                                }
                                 Err(e) => Err(e),
                             }
                         });
                         match r {
-                            Ok(v) => {
-                                let _ = kind;
-                                Ok(Value::I32(*v))
-                            }
+                            Ok(v) => Ok(Value::I32(*v)),
+                            Err(e) => Err(Self::map_ret_err(*e)),
+                        }
+                    }
+                    FocasAddress::ActiveSpindleSpeed => {
+                        let r = acts_cache.get_or_insert_with(|| lib.cnc_acts(hdl));
+                        match r {
+                            Ok(v) => Ok(Value::I32(v.data)),
                             Err(e) => Err(Self::map_ret_err(*e)),
                         }
                     }
@@ -367,11 +396,11 @@ impl FocasApi for NativeFocasApi {
                         kind: crate::address::SpindleKind::Speed,
                         ..
                     } => {
-                        let r = acts_cache.get_or_insert_with(|| lib.cnc_acts(hdl));
-                        match r {
-                            Ok(v) => Ok(Value::I32(v.data)),
-                            Err(e) => Err(Self::map_ret_err(*e)),
-                        }
+                        // fail-closed：indexed speed 已无可信读路径（`cnc_acts`
+                        // 不接受 spindle 号）；只有 `ActiveSpindleSpeed`
+                        //（machine/spindle_speed）可调 `cnc_acts`。
+                        // parser 兼容保留，但读到即 unsupported（ERR → BAD）。
+                        Err("EW_NOOPT indexed spindle speed unsupported (use machine/spindle_speed)".into())
                     }
                     _ => Self::read_one_blocking(lib, hdl, addr),
                 }
@@ -571,19 +600,15 @@ impl NativeFocasApi {
                 }
             }
             FocasAddress::Axis { axis, kind } => {
+                // fail-closed：只有 Absolute 有可信读路径（`cnc_absolute`）；
+                // 其余 kind 不得用 absolute 值冒充，更不得用 feed（actf）回退——
+                // actf 是进给，不是轴位置（BAD != GOOD，unknown != healthy）。
+                if *kind != AxisKind::Absolute {
+                    return Err(format!("EW_NOOPT axis {kind:?} unsupported"));
+                }
                 // 多机型 MAX_AXIS 差异：0i 8轴 30i 10/24轴，当前 OdbAxis 以 8 轴覆盖 0i-F 基准，真机 30i 超 8 轴时需扩展
-                // 优先用 cnc_absolute 精确单轴，fallback 到 rddynamic2
                 match lib.cnc_absolute(hdl, *axis) {
                     Ok(v) => Ok(Value::I32(v)),
-                    Err(e)
-                        if e == crate::native::FocasRet::Noopt
-                            || e == crate::native::FocasRet::Param =>
-                    {
-                        let dy = lib.cnc_rddynamic2(hdl).map_err(Self::map_ret_err)?;
-                        // 按 kind 仍以 actf 代理，保证 0i/30i 均可通
-                        let _ = kind;
-                        Ok(Value::I32(dy.actf))
-                    }
                     Err(e) => Err(Self::map_ret_err(e)),
                 }
             }
@@ -591,22 +616,34 @@ impl NativeFocasApi {
                 let dy = lib.cnc_rddynamic2(hdl).map_err(Self::map_ret_err)?;
                 Ok(Value::U32(dy.actf as u32))
             }
+            // 当前活动主轴速度（与 machine/spindle_speed 资源对应）。
+            FocasAddress::ActiveSpindleSpeed => {
+                let v = lib.cnc_acts(hdl).map_err(Self::map_ret_err)?;
+                Ok(Value::I32(v.data))
+            }
             FocasAddress::Spindle { spindle, kind } => {
                 match kind {
                     SpindleKind::Speed => {
-                        let v = lib.cnc_acts(hdl).map_err(Self::map_ret_err)?;
-                        Ok(Value::I32(v.data))
+                        // fail-closed（与 batch 缓存路径同口径）：indexed speed
+                        // 无可信读路径，只有 ActiveSpindleSpeed 可调 cnc_acts。
+                        Err("EW_NOOPT indexed spindle speed unsupported (use machine/spindle_speed)".into())
                     }
                     SpindleKind::Load => {
-                        // 主轴负载：优先 cnc_rdspmeter，缺失则回退 cnc_acts
+                        // 主轴负载：仅 cnc_rdspmeter；缺失即不支持（ERR → 单点 BAD），
+                        // 绝不用 cnc_acts 速度冒充负载。
+                        // 实例存在性：返回 num 即实际主轴数，requested > num
+                        // 即该主轴不存在（不得 clamp 读 data[3] 冒充 GOOD）。
                         let mut num: std::os::raw::c_short = 0;
                         let mut data = crate::native::SpLoad { data: [0; 4] };
-                        let idx = (*spindle as usize).saturating_sub(1).min(3);
                         match lib.cnc_rdspmeter(hdl, &mut num, &mut data) {
-                            Ok(()) => Ok(Value::U32((data.data[idx].abs() % 101) as u32)),
-                            Err(e) if e == crate::native::FocasRet::Noopt => {
-                                let v = lib.cnc_acts(hdl).map_err(Self::map_ret_err)?;
-                                Ok(Value::U32((v.data.abs() % 101) as u32))
+                            Ok(()) => {
+                                if *spindle == 0 || (*spindle as i16) > num {
+                                    return Err(format!(
+                                        "EW_PARAM spindle {spindle} not present (num={num})"
+                                    ));
+                                }
+                                let idx = (*spindle as usize).saturating_sub(1);
+                                Ok(Value::U32((data.data[idx].abs() % 101) as u32))
                             }
                             Err(e) => Err(Self::map_ret_err(e)),
                         }
@@ -628,17 +665,18 @@ impl NativeFocasApi {
                 }
             }
             FocasAddress::ServoLoad { axis } => {
-                // 伺服负载：优先 cnc_rdsvmeter，缺失（EW_NOOPT）则回退 cnc_acts 代理，保证跨机型不整批失败
+                // 伺服负载：仅 cnc_rdsvmeter；缺失即不支持（ERR → 单点 BAD），
+                // 绝不用 cnc_acts 速度冒充负载。
+                // 实例存在性：返回 num 即实际轴数（不得 clamp 读 data[3]）。
                 let mut num: std::os::raw::c_short = 0;
                 let mut data = crate::native::SpLoad { data: [0; 4] };
                 match lib.cnc_rdsvmeter(hdl, &mut num, &mut data) {
                     Ok(()) => {
-                        let idx = (*axis as usize).saturating_sub(1).min(3);
+                        if *axis == 0 || (*axis as i16) > num {
+                            return Err(format!("EW_PARAM servo {axis} not present (num={num})"));
+                        }
+                        let idx = (*axis as usize).saturating_sub(1);
                         Ok(Value::U32((data.data[idx].abs() % 101) as u32))
-                    }
-                    Err(e) if e == crate::native::FocasRet::Noopt => {
-                        let v = lib.cnc_acts(hdl).map_err(Self::map_ret_err)?;
-                        Ok(Value::U32((v.data.abs() % 101) as u32))
                     }
                     Err(e) => Err(Self::map_ret_err(e)),
                 }

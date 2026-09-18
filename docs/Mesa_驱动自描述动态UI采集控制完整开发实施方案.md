@@ -1997,10 +1997,8 @@ Profile 不允许任意脚本。
       },
       "selections": [
         {
-          "resource_id": "dynamic",
-          "parameters": {
-            "axis": 1
-          },
+          "resource_id": "machine",
+          "parameters": {},
           "rate_class": "realtime",
           "outputs": [
             {
@@ -2008,7 +2006,7 @@ Profile 不允许任意脚本。
               "point_key": "machine.feed"
             },
             {
-              "output": "spindle.speed",
+              "output": "spindle_speed",
               "point_key": "machine.spindle_speed"
             }
           ]
@@ -2111,7 +2109,7 @@ Profile MAJOR version change
 稳定 ID 永远不翻译：
 
 ```text
-dynamic
+machine
 feed
 machine.feed
 ```
@@ -2406,17 +2404,18 @@ execute plan
 
 # 17. FOCAS 可验收契约
 
-FOCAS 是 Multi-output Resource 的核心验收 Driver。
+FOCAS 是 Multi-output Resource 的核心验收 Driver（Resource Model Cleanup
+后：machine{status,feed,spindle_speed}、axis{absolute} 等只暴露读取语义
+真实、适合 Acquisition 的能力；旧 dynamic 已删除，无 program）。
 
 Descriptor：
 
 ```text
-Resource dynamic(axis)
+Resource machine
 Outputs:
+status
 feed
-spindle.speed
-program.current
-position.absolute
+spindle_speed
 ```
 
 配置：
