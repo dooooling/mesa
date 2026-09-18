@@ -2096,8 +2096,7 @@ mod tests {
     fn gate0_emit(doc_pretty: &str, out: &Option<String>) {
         println!("{doc_pretty}");
         if let Some(path) = out {
-            std::fs::write(path, doc_pretty)
-                .unwrap_or_else(|e| panic!("写入 {path} 失败：{e}"));
+            std::fs::write(path, doc_pretty).unwrap_or_else(|e| panic!("写入 {path} 失败：{e}"));
             println!("已写入 {path}");
         }
     }
@@ -2118,7 +2117,13 @@ mod tests {
             NativeLib::load().unwrap_or_else(|e| panic!("FWLIB 加载失败（{host}:{port}）：{e}"));
         let hdl = lib
             .cnc_allclibhndl3(&host, port, timeout_secs)
-            .unwrap_or_else(|e| panic!("cnc_allclibhndl3 失败（{host}:{port}）：{} {}", e as i16, e.message()));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
+                    e as i16,
+                    e.message()
+                )
+            });
         let sys = match lib.cnc_sysinfo(hdl) {
             Ok(v) => v,
             Err(e) => {
@@ -2171,7 +2176,13 @@ mod tests {
             NativeLib::load().unwrap_or_else(|e| panic!("FWLIB 加载失败（{host}:{port}）：{e}"));
         let hdl = lib
             .cnc_allclibhndl3(&host, port, timeout_secs)
-            .unwrap_or_else(|e| panic!("cnc_allclibhndl3 失败（{host}:{port}）：{} {}", e as i16, e.message()));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
+                    e as i16,
+                    e.message()
+                )
+            });
         let st = match lib.cnc_statinfo(hdl) {
             Ok(v) => v,
             Err(e) => {
