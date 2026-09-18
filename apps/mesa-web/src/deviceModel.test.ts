@@ -227,6 +227,11 @@ import {
   resourceInstanceKey,
   missingRequiredParams,
 } from "./resourceSelectionModel";
+import {
+  nextStaleDeadlineMs,
+  reconcilePointDelta,
+  POINT_STALE_AFTER_MS,
+} from "./deviceModel";
 
 describe("selection reconciliation（冻结算法）", () => {
   const schemaOf = (resourceId: string) => ({
@@ -762,5 +767,74 @@ describe("reconcilePointSnapshots", () => {
         pointRowFingerprint({ ...base, ...over }, T0),
       );
     }
+  });
+});
+
+describe("reconcilePointDelta（Point Live delta 整行合并）", () => {
+  const T = 1_700_000_000_000;
+  const row = (pid: number, value: unknown, extra?: Record<string, unknown>) => ({
+    endpoint_id: "ep",
+    point_id: pid,
+    point_key: `k${pid}`,
+    key: `k${pid}`,
+    quality: "GOOD",
+    value,
+    timestamp_ns: T * 1e6,
+    ...extra,
+  });
+
+  it("空 delta 不变（保引用）", () => {
+    const prev = [row(1, 1)];
+    const { points, changed } = reconcilePointDelta(prev, []);
+    expect(changed).toBe(false);
+    expect(points).toBe(prev);
+  });
+
+  it("已有整行替换（非 patch，不留脏字段）", () => {
+    const prev = [row(1, 1, { source_label: "A" })];
+    const next = row(1, 2, { source_label: "B" });
+    const { points, changed } = reconcilePointDelta(prev, [next]);
+    expect(changed).toBe(true);
+    expect(points).toHaveLength(1);
+    expect(points[0]).toEqual(next);
+  });
+
+  it("未变化行保引用，新点插入，未提及行不动", () => {
+    const prev = [row(1, 1), row(2, 2)];
+    const { points, changed } = reconcilePointDelta(prev, [row(1, 1), row(3, 3)]);
+    expect(changed).toBe(true);
+    expect(points).toHaveLength(3);
+    expect(points.find((p) => p.point_id === 2)).toBe(prev[1]);
+  });
+
+  it("delta 不删除行（删除只由 snapshot 表达）", () => {
+    const prev = [row(1, 1), row(2, 2)];
+    const { points } = reconcilePointDelta(prev, [row(1, 9)]);
+    expect(points).toHaveLength(2);
+  });
+});
+
+describe("nextStaleDeadlineMs（Point Live STALE 翻转调度）", () => {
+  const T = 1_700_000_000_000;
+  const row = (ageMs: number, quality = "GOOD") => ({
+    endpoint_id: "ep",
+    point_id: 1,
+    quality,
+    value: 1,
+    timestamp_ns: (T - ageMs) * 1e6,
+  });
+
+  it("最近翻转取最小剩余；BAD 不参与；空/全 BAD 即 null", () => {
+    // A 剩 8s，B 剩 15s → 8s。
+    expect(nextStaleDeadlineMs([row(22_000), { ...row(15_000), point_id: 2 }], T)).toBe(
+      POINT_STALE_AFTER_MS - 22_000,
+    );
+    // BAD 永不 STALE。
+    expect(nextStaleDeadlineMs([row(100_000, "BAD")], T)).toBeNull();
+    expect(nextStaleDeadlineMs([], T)).toBeNull();
+  });
+
+  it("已越界不等待（调用方立即重算收敛）", () => {
+    expect(nextStaleDeadlineMs([row(31_000)], T)).toBeNull();
   });
 });

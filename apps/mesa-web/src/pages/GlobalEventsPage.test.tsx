@@ -83,9 +83,7 @@ function mockGlobalEvents() {
     if (url === "/api/v1/devices/cnc-01") {
       return { ok: true, status: 200, json: async () => ({ id: "cnc-01", name: "CNC-01" }) };
     }
-    if (url === "/api/v1/points/latest") {
-      return { ok: true, status: 200, json: async () => ({ points: [] }) };
-    }
+    // 点值已走 Point Live SSE：事件页桩不再提供 points/latest。
     if (url === "/api/v1/events?limit=1") {
       return { ok: true, status: 200, json: async () => ({ events: [], next_cursor: null }) };
     }
@@ -185,9 +183,7 @@ describe("RC2 事件恢复与单 reload owner", () => {
       if (url === "/api/v1/devices/cnc-01") {
         return { ok: true, status: 200, json: async () => ({ id: "cnc-01", name: "CNC-01" }) };
       }
-      if (url === "/api/v1/points/latest") {
-        return { ok: true, status: 200, json: async () => ({ points: [] }) };
-      }
+      // 点值已走 Point Live SSE：事件页桩不再提供 points/latest。
       if (url === "/api/v1/events?limit=1") {
         return { ok: true, status: 200, json: async () => ({ events: [], next_cursor: null }) };
       }
@@ -279,9 +275,7 @@ describe("RC2 收口：useEventFeed loadingMore 代际复位", () => {
       if (url === "/api/v1/devices/cnc-01") {
         return { ok: true, status: 200, json: async () => ({ id: "cnc-01", name: "CNC-01" }) };
       }
-      if (url === "/api/v1/points/latest") {
-        return { ok: true, status: 200, json: async () => ({ points: [] }) };
-      }
+      // 点值已走 Point Live SSE：事件页桩不再提供 points/latest。
       if (url === "/api/v1/events?limit=1") {
         return { ok: true, status: 200, json: async () => ({ events: [], next_cursor: null }) };
       }

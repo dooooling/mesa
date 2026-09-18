@@ -533,3 +533,64 @@ export function pointSortKey(p: PointSnapshotLike): string {
 export function pointsSnapshotSignature(points: PointSnapshotLike[], nowMs: number): string {
   return points.map((p) => pointRowFingerprint(p, nowMs)).sort().join(";");
 }
+
+// ---------------------------------------------------------------------------
+// Point Live delta 合并（STATE STREAM 客户端侧）：delta 行是完整最新行，
+// 不是 patch——已有点直接整行替换（不留脏字段），新点插入；
+// delta 未提及的行完全不动；删除只由 snapshot/resync 表达。
+// ---------------------------------------------------------------------------
+
+/**
+ * delta 合并：按 endpoint_id:point_id 行 identity，已有即整行替换、
+ * 未有即插入；输入顺序不保证输出顺序（调用方按需排序）。
+ * 不变行保留旧引用（与 snapshot reconcile 同 bailout 语义）。
+ */
+export function reconcilePointDelta<T extends PointSnapshotLike>(
+  prev: T[],
+  delta: T[],
+): { points: T[]; changed: boolean } {
+  if (!delta.length) return { points: prev, changed: false };
+  const prevByKey = new Map<string, T>();
+  for (const p of prev) prevByKey.set(pointRowKey(p), p);
+  let changed = false;
+  const out = [...prev];
+  const idxByKey = new Map<string, number>();
+  out.forEach((p, i) => idxByKey.set(pointRowKey(p), i));
+  for (const d of delta) {
+    const k = pointRowKey(d);
+    const idx = idxByKey.get(k);
+    if (idx === undefined) {
+      idxByKey.set(k, out.length);
+      out.push(d);
+      changed = true;
+      continue;
+    }
+    // 整行替换（delta 即完整 current entry，不是 patch）。
+    if (pointFieldFingerprint(out[idx]) !== pointFieldFingerprint(d)) {
+      out[idx] = d;
+      changed = true;
+    }
+  }
+  return { points: out, changed };
+}
+
+/**
+ * STALE 最近 deadline（Point Live 无网络帧时的翻转调度）：
+ * 返回距 nowMs 最近的 GOOD→STALE 翻转剩余 ms；无待翻转即 null。
+ * BAD/UNKNOWN 不参与（BAD 永不 STALE，UNKNOWN 无合法时间戳）。
+ */
+export function nextStaleDeadlineMs<T extends PointSnapshotLike>(
+  points: T[],
+  nowMs: number,
+): number | null {
+  let best: number | null = null;
+  for (const p of points) {
+    if ((p.quality ?? "").toUpperCase() === "BAD") continue;
+    const age = pointAgeMs(p.timestamp_ns, nowMs);
+    if (age === null || age < 0) continue;
+    const remain = POINT_STALE_AFTER_MS - age;
+    if (remain <= 0) continue; // 已 STALE：应立即重算而非等待
+    if (best === null || remain < best) best = remain;
+  }
+  return best;
+}

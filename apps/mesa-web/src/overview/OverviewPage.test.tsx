@@ -98,7 +98,7 @@ describe("M4.1 OverviewPage 诚实语义", () => {
     vi.unstubAllGlobals();
   });
 
-  function mockOverview(opts: { failInventory?: boolean; failPoints?: boolean; failEvents?: boolean }) {
+  function mockOverview(opts: { failInventory?: boolean; failEvents?: boolean }) {
     (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string) => {
       if (url === "/api/v1/devices") {
         if (opts.failInventory) return { ok: false, status: 500, json: async () => ({ error: { message: "boom" } }) };
@@ -114,10 +114,6 @@ describe("M4.1 OverviewPage 诚实语义", () => {
           }),
         };
       }
-      if (url === "/api/v1/points/latest") {
-        if (opts.failPoints) return { ok: false, status: 500, json: async () => ({ error: { message: "boom" } }) };
-        return { ok: true, status: 200, json: async () => ({ points: [] }) };
-      }
       if (url.startsWith("/api/v1/events")) {
         if (opts.failEvents) return { ok: false, status: 500, json: async () => ({ error: { message: "boom" } }) };
         return { ok: true, status: 200, json: async () => ({ events: [], next_cursor: null }) };
@@ -127,7 +123,7 @@ describe("M4.1 OverviewPage 诚实语义", () => {
   }
 
   it("全部失败时标未知/警告，不写 0 假装正常", async () => {
-    mockOverview({ failInventory: true, failPoints: true, failEvents: true });
+    mockOverview({ failInventory: true, failEvents: true });
     render(
       <MemoryRouter initialEntries={["/overview"]}>
         <App />

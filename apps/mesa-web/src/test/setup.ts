@@ -28,3 +28,62 @@ if (typeof window !== "undefined" && !window.ResizeObserver) {
     disconnect() {}
   } as unknown as typeof window.ResizeObserver;
 }
+
+// Point Live Stream 测试桩：jsdom 无 EventSource，全局默认给一个惰性桩
+//（不自动发帧；各测试按需 emit snapshot/delta）。与 useEventStream.test.ts
+// 的用例级 Mock 不冲突（用例 stubGlobal 会覆盖全局）。
+class __PointLiveStubSource {
+  static instances: __PointLiveStubSource[] = [];
+  url: string;
+  onopen: ((e: unknown) => void) | null = null;
+  onerror: ((e: unknown) => void) | null = null;
+  closed = false;
+  private listeners = new Map<string, ((e: { data: string }) => void)[]>();
+
+  constructor(url: string) {
+    this.url = url;
+    __PointLiveStubSource.instances.push(this);
+  }
+
+  addEventListener(name: string, fn: (e: { data: string }) => void) {
+    const arr = this.listeners.get(name) ?? [];
+    arr.push(fn);
+    this.listeners.set(name, arr);
+  }
+
+  removeEventListener(name: string, fn: (e: { data: string }) => void) {
+    this.listeners.set(name, (this.listeners.get(name) ?? []).filter((f) => f !== fn));
+  }
+
+  emit(name: string, data: string) {
+    for (const fn of this.listeners.get(name) ?? []) fn({ data });
+  }
+
+  emitSnapshot(rows: Array<Record<string, unknown>>) {
+    const data = JSON.stringify({ points: rows });
+    for (const fn of this.listeners.get("mesa-points-snapshot") ?? []) fn({ data });
+  }
+
+  emitDelta(rows: Array<Record<string, unknown>>) {
+    const data = JSON.stringify({ points: rows });
+    for (const fn of this.listeners.get("mesa-points-delta") ?? []) fn({ data });
+  }
+
+  fail() {
+    this.onerror?.({});
+  }
+
+  close() {
+    this.closed = true;
+  }
+}
+
+if (
+  typeof window !== "undefined" &&
+  (window as unknown as { EventSource?: unknown }).EventSource === undefined
+) {
+  (window as unknown as { EventSource: unknown }).EventSource = __PointLiveStubSource;
+  (globalThis as unknown as { EventSource: unknown }).EventSource = __PointLiveStubSource;
+  (globalThis as unknown as { __PointLiveStubSource: unknown }).__PointLiveStubSource =
+    __PointLiveStubSource;
+}

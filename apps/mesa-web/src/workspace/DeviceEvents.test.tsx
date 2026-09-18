@@ -47,9 +47,7 @@ function mockDeviceEvents(opts: {
         }),
       };
     }
-    if (url === "/api/v1/points/latest") {
-      return { ok: true, status: 200, json: async () => ({ points: [] }) };
-    }
+    // 点值已走 Point Live SSE：此桩只管 events，points/latest 不再被调。
     if (url === "/api/v1/events?limit=1") {
       return { ok: true, status: 200, json: async () => ({ events: [], next_cursor: null }) };
     }
@@ -227,9 +225,6 @@ describe("RC2 收口：Event Drawer scope 用 deviceId", () => {
             ],
           }),
         };
-      }
-      if (url === "/api/v1/points/latest") {
-        return { ok: true, status: 200, json: async () => ({ points: [] }) };
       }
       if (url === "/api/v1/events?limit=1") {
         return { ok: true, status: 200, json: async () => ({ events: [], next_cursor: null }) };
