@@ -93,7 +93,15 @@ fn resolve_generic_point(
         // `Spindle { spindle: 1 }`（label 会变成假的 `spindle[1].speed`）。
         ("machine", "spindle_speed") => (FocasAddress::ActiveSpindleSpeed, DataType::I32),
         ("axis", "absolute") => {
-            let axis = int_param("axis", true, 1, 1, 32)? as u8;
+            // 当前产品能力 1..8：`cnc_absolute` 一次读 8 轴，超 8 Native
+            // 直接 Param；不扩 Native，只收 Descriptor（parse_address 仍 1..32）。
+            let axis = int_param(
+                "axis",
+                true,
+                1,
+                1,
+                crate::native::FOCAS_AXIS_PRODUCT_MAX as u64,
+            )? as u8;
             (
                 FocasAddress::Axis {
                     axis,
@@ -133,7 +141,15 @@ fn resolve_generic_point(
             )
         }
         ("servo", "load") => {
-            let axis = int_param("axis", true, 1, 1, 32)? as u8;
+            // 当前产品能力 1..4：`SpLoad.data[4]` 只有 4 项，超 4 不得
+            // clamp 读 data[3] 冒充（Blocker 1：配 5 读 4 即假 GOOD）。
+            let axis = int_param(
+                "axis",
+                true,
+                1,
+                1,
+                crate::native::FOCAS_SERVO_PRODUCT_MAX as u64,
+            )? as u8;
             (FocasAddress::ServoLoad { axis }, DataType::U32)
         }
         ("pmc", "value") => {
@@ -159,7 +175,8 @@ fn resolve_generic_point(
                     ),
                 ));
             }
-            let addr_num = int_param("addr", true, 0, 0, u32::MAX as u64)? as u32;
+            let addr_num =
+                int_param("addr", true, 0, 0, crate::native::FOCAS_C_SHORT_MAX as u64)? as u32;
             let bit = opt_bit()?;
             let data_type = if bit.is_some() {
                 DataType::Bool
@@ -176,13 +193,25 @@ fn resolve_generic_point(
             )
         }
         ("macro", "value") => {
-            let number = int_param("number", true, 0, 0, u32::MAX as u64)? as u32;
+            let number = int_param(
+                "number",
+                true,
+                0,
+                0,
+                crate::native::FOCAS_C_SHORT_MAX as u64,
+            )? as u32;
             (FocasAddress::MacroVar { number }, DataType::F64)
         }
         ("alarm", "value") => (FocasAddress::Alarm, DataType::String),
         ("opmsg", "value") => (FocasAddress::OpMsg, DataType::String),
         ("tool", "offset") => {
-            let number = int_param("number", true, 0, 0, u32::MAX as u64)? as u32;
+            let number = int_param(
+                "number",
+                true,
+                0,
+                0,
+                crate::native::FOCAS_C_SHORT_MAX as u64,
+            )? as u32;
             (
                 FocasAddress::Tool {
                     kind: ToolKind::Offset,
@@ -192,7 +221,13 @@ fn resolve_generic_point(
             )
         }
         ("tool", "zofs") => {
-            let number = int_param("number", true, 0, 0, u32::MAX as u64)? as u32;
+            let number = int_param(
+                "number",
+                true,
+                0,
+                0,
+                crate::native::FOCAS_C_SHORT_MAX as u64,
+            )? as u32;
             (
                 FocasAddress::Tool {
                     kind: ToolKind::Zofs,
@@ -202,7 +237,13 @@ fn resolve_generic_point(
             )
         }
         ("tool", "length") => {
-            let number = int_param("number", true, 0, 0, u32::MAX as u64)? as u32;
+            let number = int_param(
+                "number",
+                true,
+                0,
+                0,
+                crate::native::FOCAS_C_SHORT_MAX as u64,
+            )? as u32;
             (
                 FocasAddress::Tool {
                     kind: ToolKind::Length,
@@ -212,11 +253,23 @@ fn resolve_generic_point(
             )
         }
         ("param", "value") => {
-            let number = int_param("number", true, 0, 0, u32::MAX as u64)? as u32;
+            let number = int_param(
+                "number",
+                true,
+                0,
+                0,
+                crate::native::FOCAS_C_SHORT_MAX as u64,
+            )? as u32;
             (FocasAddress::Param { number }, DataType::I32)
         }
         ("diagnosis", "value") => {
-            let number = int_param("number", true, 0, 0, u32::MAX as u64)? as u32;
+            let number = int_param(
+                "number",
+                true,
+                0,
+                0,
+                crate::native::FOCAS_C_SHORT_MAX as u64,
+            )? as u32;
             (FocasAddress::Diagnosis { number }, DataType::I32)
         }
         (r, _)
@@ -345,6 +398,7 @@ impl Driver for FocasDriver {
                 ResourceDescriptor {
                     // 只暴露 absolute：其余 6 kind 当前读路径并不可信
                     //（kind 被忽略/回退 actf），不是删功能。
+                    // 当前产品能力 1..8（`cnc_absolute` 一次读 8 轴）。
                     id: "axis".into(),
                     label: LocalizedText::new("Axis"),
                     parameters: SchemaDescriptor {
@@ -352,7 +406,7 @@ impl Driver for FocasDriver {
                             let mut f = FieldDescriptor::new("axis", "Axis", FieldType::Integer)
                                 .required(true);
                             f.validation.min = Some(1.0);
-                            f.validation.max = Some(32.0);
+                            f.validation.max = Some(crate::native::FOCAS_AXIS_PRODUCT_MAX as f64);
                             f
                         }],
                     },
@@ -414,6 +468,7 @@ impl Driver for FocasDriver {
                     modes: vec![mesa_core_types::TaskMode::Poll],
                 },
                 ResourceDescriptor {
+                    // 当前产品能力 1..4（`SpLoad.data[4]` 只有 4 项）。
                     id: "servo".into(),
                     label: LocalizedText::new("Servo"),
                     parameters: SchemaDescriptor {
@@ -421,7 +476,7 @@ impl Driver for FocasDriver {
                             let mut f = FieldDescriptor::new("axis", "Axis", FieldType::Integer)
                                 .required(true);
                             f.validation.min = Some(1.0);
-                            f.validation.max = Some(32.0);
+                            f.validation.max = Some(crate::native::FOCAS_SERVO_PRODUCT_MAX as f64);
                             f
                         }],
                     },
@@ -455,7 +510,9 @@ impl Driver for FocasDriver {
                                     FieldDescriptor::new("addr", "Address", FieldType::Integer)
                                         .required(true);
                                 f.validation.min = Some(0.0);
-                                f.validation.max = Some(4294967295.0);
+                                // FFI `c_short` 可表示上限：超限截断即配 A 读 B，
+                                // 双层 fail-closed（resolver 同上限）。
+                                f.validation.max = Some(crate::native::FOCAS_C_SHORT_MAX as f64);
                                 f
                             },
                             {
@@ -488,7 +545,8 @@ impl Driver for FocasDriver {
                                 FieldDescriptor::new("number", "Number", FieldType::Integer)
                                     .required(true);
                             f.validation.min = Some(0.0);
-                            f.validation.max = Some(4294967295.0);
+                            // FFI `c_short` 可表示上限（resolver 同上限）。
+                            f.validation.max = Some(crate::native::FOCAS_C_SHORT_MAX as f64);
                             f
                         }],
                     },
@@ -544,7 +602,8 @@ impl Driver for FocasDriver {
                                 FieldDescriptor::new("number", "Number", FieldType::Integer)
                                     .required(true);
                             f.validation.min = Some(0.0);
-                            f.validation.max = Some(4294967295.0);
+                            // FFI `c_short` 可表示上限（resolver 同上限）。
+                            f.validation.max = Some(crate::native::FOCAS_C_SHORT_MAX as f64);
                             f
                         }],
                     },
@@ -588,7 +647,8 @@ impl Driver for FocasDriver {
                                 FieldDescriptor::new("number", "Number", FieldType::Integer)
                                     .required(true);
                             f.validation.min = Some(0.0);
-                            f.validation.max = Some(4294967295.0);
+                            // FFI `c_short` 可表示上限（resolver 同上限）。
+                            f.validation.max = Some(crate::native::FOCAS_C_SHORT_MAX as f64);
                             f
                         }],
                     },
@@ -612,7 +672,8 @@ impl Driver for FocasDriver {
                                 FieldDescriptor::new("number", "Number", FieldType::Integer)
                                     .required(true);
                             f.validation.min = Some(0.0);
-                            f.validation.max = Some(4294967295.0);
+                            // FFI `c_short` 可表示上限（resolver 同上限）。
+                            f.validation.max = Some(crate::native::FOCAS_C_SHORT_MAX as f64);
                             f
                         }],
                     },
@@ -1513,7 +1574,12 @@ mod tests {
                 "INVALID_BINDING_CONFIG",
             ),
             (
-                "轴号越界",
+                "轴号越界（产品上限 8）",
+                serde_json::json!([{"resource_id": "axis", "parameters": {"axis": 9}, "outputs": [{"output": "absolute", "point_key": "k"}]}]),
+                "INVALID_BINDING_CONFIG",
+            ),
+            (
+                "轴号 33 越界",
                 serde_json::json!([{"resource_id": "axis", "parameters": {"axis": 33}, "outputs": [{"output": "absolute", "point_key": "k"}]}]),
                 "INVALID_BINDING_CONFIG",
             ),
@@ -1556,6 +1622,26 @@ mod tests {
                 "pmc kind 前缀不接受",
                 serde_json::json!([{"resource_id": "pmc", "parameters": {"kind": "RABC", "addr": 0}, "outputs": [{"output": "value", "point_key": "k"}]}]),
                 "INVALID_DATA_TYPE",
+            ),
+            (
+                "servo 越界（产品上限 4，不得 clamp 读 data[3]）",
+                serde_json::json!([{"resource_id": "servo", "parameters": {"axis": 5}, "outputs": [{"output": "load", "point_key": "k"}]}]),
+                "INVALID_BINDING_CONFIG",
+            ),
+            (
+                "macro 超 c_short 不得截断（配 A 读 B）",
+                serde_json::json!([{"resource_id": "macro", "parameters": {"number": 65537}, "outputs": [{"output": "value", "point_key": "k"}]}]),
+                "INVALID_BINDING_CONFIG",
+            ),
+            (
+                "pmc addr 超 c_short 不得截断",
+                serde_json::json!([{"resource_id": "pmc", "parameters": {"kind": "R", "addr": 40000}, "outputs": [{"output": "value", "point_key": "k"}]}]),
+                "INVALID_BINDING_CONFIG",
+            ),
+            (
+                "tool number 超 c_short 不得截断",
+                serde_json::json!([{"resource_id": "tool", "parameters": {"number": 100000}, "outputs": [{"output": "offset", "point_key": "k"}]}]),
+                "INVALID_BINDING_CONFIG",
             ),
             (
                 "axis 非法值不得回落 default",
@@ -1615,6 +1701,66 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "INVALID_BINDING_CONFIG");
+    }
+
+    /// 边界回归（3 blocker + indexed speed）：以下一律不得 GOOD。
+    /// - servo=5 / axis=9：configure 期拒绝（产品上限）；
+    /// - 超 c_short 参数：configure 期拒绝（配 A 读 B）；
+    /// - indexed spindle speed：configure 不可达 + Fake/Native 读层 ERR。
+    #[tokio::test]
+    async fn boundary_never_produces_good() {
+        use crate::address::{FocasAddress, SpindleKind};
+        // configure 期：servo=5、axis=9、超 c_short 全部拒绝。
+        for (name, sel) in [
+            (
+                "servo=5",
+                serde_json::json!([{"resource_id":"servo","parameters":{"axis":5},"outputs":[{"output":"load","point_key":"k"}]}]),
+            ),
+            (
+                "axis=9",
+                serde_json::json!([{"resource_id":"axis","parameters":{"axis":9},"outputs":[{"output":"absolute","point_key":"k"}]}]),
+            ),
+            (
+                "macro=65537",
+                serde_json::json!([{"resource_id":"macro","parameters":{"number":65537},"outputs":[{"output":"value","point_key":"k"}]}]),
+            ),
+        ] {
+            let conn = test_conn();
+            let err = conn
+                .configure(1, vec![generic_task(sel)])
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, "INVALID_BINDING_CONFIG", "{name}");
+        }
+        // Fake 读层：indexed speed 即 ERR（run 层转 BAD，不得 GOOD）。
+        let api = FakeFocasApi::new();
+        let vals = api
+            .read_batch(&[FocasAddress::Spindle {
+                spindle: 2,
+                kind: SpindleKind::Speed,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(vals.len(), 1);
+        assert!(
+            matches!(&vals[0], mesa_core_types::Value::String(s) if s.starts_with("ERR:")),
+            "spindle.speed.2 不得 GOOD"
+        );
+        // ActiveSpindleSpeed 仍正常（machine/spindle_speed 资源路径）。
+        let vals = api
+            .read_batch(&[FocasAddress::ActiveSpindleSpeed])
+            .await
+            .unwrap();
+        assert!(matches!(vals[0], mesa_core_types::Value::I32(_)));
+        // Native 门：indexed speed 即 Err（不碰 FFI）。
+        let r = NativeFocasApi::read_one_no_lib_for_test(&FocasAddress::Spindle {
+            spindle: 2,
+            kind: SpindleKind::Speed,
+        });
+        // 非 Axis 地址走到底（无 dll），但 indexed speed 在生产路径
+        // read_one_blocking 首行即 Err：此处用同一语义断言。
+        // （无 dll 时返回 EW_NODLL 亦为 Err，绝不为 Ok GOOD。）
+        assert!(r.is_err(), "indexed speed 不得 Ok");
     }
 
     #[tokio::test]

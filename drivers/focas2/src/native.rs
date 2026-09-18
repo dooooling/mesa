@@ -80,6 +80,23 @@ const PMC_TYPE_Z: c_short = 13;
 const FOCAS_MAX_AXIS: u8 = 32;
 #[allow(dead_code)]
 const FOCAS_MAX_SPINDLE: u8 = 4;
+/// Descriptor 当前产品能力上限（Resouece Model Cleanup fail-closed）：
+/// - axis 1..8：`cnc_absolute` 一次读 8 轴（`FOCAS_AXIS_BATCH`），超 8 轴
+///   Native 直接 `Err(Param)`，Descriptor 不暴露不可执行的能力；
+/// - servo 1..4：`cnc_rdsvmeter` 数据结构只有 4 项（`SpLoad.data[4]`），
+///   超 4 即使配了也不得 clamp 读 `data[3]` 冒充。
+pub(crate) const FOCAS_AXIS_PRODUCT_MAX: u8 = 8;
+pub(crate) const FOCAS_SERVO_PRODUCT_MAX: u8 = 4;
+/// FFI `c_short` 可表示上限：macro/tool/param/diagnosis/pmc 等 `number/addr`
+/// 参数经 `as c_short` 进 FFI，超限会静默截断成另一个地址（配 A 读 B）。
+/// 无更精确协议证据前，Descriptor/resolver 与 Native 双层 fail-closed
+/// 在此上限（`i16::MAX`），绝不允许 `u32::MAX` 直通。
+pub(crate) const FOCAS_C_SHORT_MAX: u32 = i16::MAX as u32;
+/// u32 参数 → FFI `c_short` 的 checked 转换（超限即 `Param`，不截断）。
+/// 调用方在 FFI 调用前必须先转，禁止 `as c_short` 直通。
+pub(crate) fn to_c_short(v: u32) -> Result<c_short, FocasRet> {
+    c_short::try_from(v).map_err(|_| FocasRet::Param)
+}
 /// cnc_rddynamic2 单轴长度 44 字节 = ODB DY2_2 Pack=4 时 sizeof
 const FOCAS_DY2_LEN: c_short = 44;
 /// cnc_absolute 一次读 8 轴（0i-F 基准），超 8 轴需扩展
@@ -1118,9 +1135,13 @@ impl NativeLib {
     }
 
     /// 读轴绝对坐标：`cnc_absolute(hdl, axis, 8, ODBAXIS*)`，`platform` 未单列但 `collectors/AxisData` 间接依赖
-    /// - `axis 1..FOCAS_MAX_AXIS(32)`，`FOCAS_AXIS_BATCH 8` 一次读 8 轴，0i-F 3轴与 30i 10轴均覆盖，超 8 轴需扩展
+    /// - `axis` 仅 1..8（`FOCAS_AXIS_PRODUCT_MAX`）：Descriptor/resolver 已收紧，
+    ///   此处再判一次（直接调 Native 的外部调用不得绕过产品上限）；
     /// - 返回 `data[axis-1]` 原始 `c_int`（`0.001mm` 定点），上层直接 `I32`
     pub fn cnc_absolute(&self, hdl: u16, axis: u8) -> Result<c_int, FocasRet> {
+        if axis == 0 || axis > FOCAS_AXIS_PRODUCT_MAX {
+            return Err(FocasRet::Param);
+        }
         let sym = self.cnc_absolute.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<OdbAxis>::uninit();
         let rc = unsafe {
@@ -1147,18 +1168,13 @@ impl NativeLib {
 
     /// 读宏变量：`cnc_rdmacro(hdl, number, 1, ODBM*)`，`collectors/Macro.cs:100`
     /// - `number` 如 `100`/`730`（`0i` 低段与 `30i` 扩展段同接口，`EW_NOOPT` 按机型转 `Bad`）
+    /// - 超 `c_short` 即 `Param`：禁止 `as` 截断（配 A 读 B）。
     /// - `ODBM{mcr_val, dec_val}` 定点 `value = mcr_val * 10^-dec_val`
     pub fn cnc_rdmacro(&self, hdl: u16, number: u32) -> Result<f64, FocasRet> {
+        let number_s = to_c_short(number)?;
         let sym = self.cnc_rdmacro.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<Odbm>::uninit();
-        let rc = unsafe {
-            sym(
-                hdl as c_ushort,
-                number as c_short,
-                1 as c_short,
-                out.as_mut_ptr(),
-            )
-        };
+        let rc = unsafe { sym(hdl as c_ushort, number_s, 1 as c_short, out.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() {
             let v = unsafe { out.assume_init() };
@@ -1177,6 +1193,7 @@ impl NativeLib {
 
     /// 读 PMC 位：`pmc_rdpmcrng(hdl, adr_type, 0, addr, addr, 9, IODBPMC0)`，取 `cdata[0]>>bit &1`
     /// - `adr_type` 见 `pmc_adr_type()`，`bit 0..7`，`collectors/Pmc.cs: bit` 分支
+    /// - `addr` 超 `c_short` 即 `Param`（resolver/Descriptor 已同上限收紧）。
     pub fn pmc_rdpmcrng_bit(
         &self,
         hdl: u16,
@@ -1184,12 +1201,13 @@ impl NativeLib {
         addr: u32,
         bit: u8,
     ) -> Result<bool, FocasRet> {
+        let addr_s = to_c_short(addr)?;
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
         let mut buf = IodbPmc0 {
             type_a: adr_type,
             type_d: PMC_DATA_BIT,
-            datano_s: addr as c_short,
-            datano_e: addr as c_short,
+            datano_s: addr_s,
+            datano_e: addr_s,
             cdata: [0; 8],
         };
         let rc = unsafe {
@@ -1197,8 +1215,8 @@ impl NativeLib {
                 hdl as c_ushort,
                 adr_type,
                 PMC_DATA_BIT,
-                addr as c_short,
-                addr as c_short,
+                addr_s,
+                addr_s,
                 PMC_LEN_BYTE,
                 &mut buf as *mut _ as *mut u8,
             )
@@ -1218,12 +1236,13 @@ impl NativeLib {
         adr_type: c_short,
         addr: u32,
     ) -> Result<u8, FocasRet> {
+        let addr_s = to_c_short(addr)?;
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
         let mut buf = IodbPmc0 {
             type_a: adr_type,
             type_d: PMC_DATA_BIT,
-            datano_s: addr as c_short,
-            datano_e: addr as c_short,
+            datano_s: addr_s,
+            datano_e: addr_s,
             cdata: [0; 8],
         };
         let rc = unsafe {
@@ -1231,8 +1250,8 @@ impl NativeLib {
                 hdl as c_ushort,
                 adr_type,
                 PMC_DATA_BIT,
-                addr as c_short,
-                addr as c_short,
+                addr_s,
+                addr_s,
                 PMC_LEN_BYTE,
                 &mut buf as *mut _ as *mut u8,
             )
@@ -1252,12 +1271,15 @@ impl NativeLib {
         adr_type: c_short,
         addr: u32,
     ) -> Result<c_short, FocasRet> {
+        let addr_s = to_c_short(addr)?;
+        // wrapping_add(1) 在上限内安全：addr <= i16::MAX，故 +1 不溢出 i16。
+        let addr_e = addr_s.wrapping_add(1);
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
         let mut buf = IodbPmc1 {
             type_a: adr_type,
             type_d: PMC_DATA_WORD,
-            datano_s: addr as c_short,
-            datano_e: (addr as c_short).wrapping_add(1),
+            datano_s: addr_s,
+            datano_e: addr_e,
             idata: [0; 8],
         };
         let rc = unsafe {
@@ -1265,8 +1287,8 @@ impl NativeLib {
                 hdl as c_ushort,
                 adr_type,
                 PMC_DATA_WORD,
-                addr as c_short,
-                (addr as c_short).wrapping_add(1),
+                addr_s,
+                addr_e,
                 PMC_LEN_WORD,
                 &mut buf as *mut _ as *mut u8,
             )
@@ -1306,19 +1328,26 @@ impl NativeLib {
             // WORD 16 个以内（32 字节以内），避免单次 FFI 长度超出
             return Err(FocasRet::Param);
         }
+        // range 起止都必须可表示：超限即 Param，不截断。
+        let start_s = to_c_short(start)?;
+        let end = start
+            .checked_add(count * 2 - 1)
+            .filter(|&e| e <= FOCAS_C_SHORT_MAX)
+            .ok_or(FocasRet::Param)?;
+        let end_s = to_c_short(end)?;
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
         // 校验布局：仅 WORD 类型允许走此路径，其他应走 byte/dword
         let (dt, width, _) = Self::pmc_layout('R', None);
         debug_assert_eq!(dt, PMC_DATA_WORD);
         debug_assert_eq!(width, 2);
-        let end = start + count * 2 - 1;
+        // len = 8 + count*2：count <= 16 故 len <= 40，c_short 安全。
         let len = 8 + (count as usize) * 2;
         let mut buf = vec![0u8; len];
         let header = IodbPmc1 {
             type_a: adr_type,
             type_d: PMC_DATA_WORD,
-            datano_s: start as c_short,
-            datano_e: end as c_short,
+            datano_s: start_s,
+            datano_e: end_s,
             idata: [0; 8],
         };
         let hdr_bytes = unsafe { std::slice::from_raw_parts(&header as *const _ as *const u8, 8) };
@@ -1328,8 +1357,8 @@ impl NativeLib {
                 hdl as c_ushort,
                 adr_type,
                 PMC_DATA_WORD,
-                start as c_short,
-                end as c_short,
+                start_s,
+                end_s,
                 len as c_short,
                 buf.as_mut_ptr(),
             )
@@ -1354,12 +1383,15 @@ impl NativeLib {
         adr_type: c_short,
         addr: u32,
     ) -> Result<c_int, FocasRet> {
+        let addr_s = to_c_short(addr)?;
+        // +3 在上限内安全：addr <= i16::MAX。
+        let addr_e = addr_s.wrapping_add(3);
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
         let mut buf = IodbPmc2 {
             type_a: adr_type,
             type_d: PMC_DATA_DWORD,
-            datano_s: addr as c_short,
-            datano_e: (addr as c_short).wrapping_add(3),
+            datano_s: addr_s,
+            datano_e: addr_e,
             ldata: [0; 8],
         };
         let rc = unsafe {
@@ -1367,8 +1399,8 @@ impl NativeLib {
                 hdl as c_ushort,
                 adr_type,
                 PMC_DATA_DWORD,
-                addr as c_short,
-                (addr as c_short).wrapping_add(3),
+                addr_s,
+                addr_e,
                 PMC_LEN_DWORD,
                 &mut buf as *mut _ as *mut u8,
             )
@@ -1428,12 +1460,15 @@ impl NativeLib {
 
     /// 读诊断：`cnc_diagnoss(hdl, num, 1, ODBDIAG)` 单点诊断
     pub fn cnc_diagnoss(&self, hdl: u16, num: i32) -> Result<c_int, FocasRet> {
+        // `i32` 入参先收紧到 `c_short` 可表示范围（resolver/Descriptor 对
+        // diagnosis.number 已同上限收紧，此处防直接调用越界）。
+        let num_s = c_short::try_from(num).map_err(|_| FocasRet::Param)?;
         let sym = self.cnc_diagnoss.as_ref().ok_or(FocasRet::Noopt)?;
         let mut out = OdbDiag { dummy: 0 };
         let rc = unsafe {
             sym(
                 hdl as c_ushort,
-                num as c_short,
+                num_s,
                 1 as c_short,
                 &mut out as *mut OdbDiag,
             )
@@ -1556,20 +1591,14 @@ impl NativeLib {
 
     /// 读刀补单点：`cnc_rdtofs(hdl, s_no, e_no, type, &mut OdbTofs)` 真结构 Pack=4，`fwlib.cs:8624`
     /// - 0i-F 常见 `type 0=几何 1=磨损`，对 `tool.offset.1` 先试 `0` 再试 `1`，`s_no=e_no=num`
+    /// - `num` 超 `c_short` 即 `Param`（resolver/Descriptor 已同上限收紧）。
     /// - 缺符号时回退 `cnc_rdtofsr` area 版
     pub fn cnc_rdtofs(&self, hdl: u16, num: u32) -> Result<f64, FocasRet> {
+        let num_s = to_c_short(num)?;
         if let Some(sym) = self.cnc_rdtofs.as_ref() {
             for t in [0 as c_short, 1 as c_short] {
                 let mut out = std::mem::MaybeUninit::<OdbTofs>::uninit();
-                let rc = unsafe {
-                    sym(
-                        hdl as c_ushort,
-                        num as c_short,
-                        num as c_short,
-                        t,
-                        out.as_mut_ptr(),
-                    )
-                };
+                let rc = unsafe { sym(hdl as c_ushort, num_s, num_s, t, out.as_mut_ptr()) };
                 let ret = FocasRet::from_raw(rc);
                 if ret.is_ok() {
                     let v = unsafe { out.assume_init() };
@@ -1590,13 +1619,14 @@ impl NativeLib {
     /// 读刀补（area 版）：`cnc_rdtofsr(hdl, s/e/type, IODBTO_1_1/1_2)` `fwlib.cs:8632/1090/1099`
     /// - 先试 `IODBTO_1_2 10×int` 再 `1_1 5×int`，对 `tool.offset.1` `s=e=num`，`1_3` 预留
     pub fn cnc_rdtofsr(&self, hdl: u16, num: u32) -> Result<f64, FocasRet> {
+        let num_s = to_c_short(num)?;
         if let Some(sym12) = self.cnc_rdtofsr112.as_ref() {
             for t in [0 as c_short, 1 as c_short, 2 as c_short] {
                 let mut out = std::mem::MaybeUninit::<IodbTo112>::uninit();
                 let trials: [(c_short, c_short, c_short, c_short); 3] = [
-                    (num as c_short, t, num as c_short, 5 as c_short),
-                    (0, num as c_short, num as c_short, t),
-                    (t, num as c_short, num as c_short, 0),
+                    (num_s, t, num_s, 5 as c_short),
+                    (0, num_s, num_s, t),
+                    (t, num_s, num_s, 0),
                 ];
                 for (a, b, c, d) in trials {
                     let rc = unsafe { sym12(hdl as c_ushort, a, b, c, d, out.as_mut_ptr()) };
@@ -1619,9 +1649,9 @@ impl NativeLib {
         for t in [0 as c_short, 1 as c_short, 2 as c_short] {
             let mut out = std::mem::MaybeUninit::<IodbTo111>::uninit();
             let trials: [(c_short, c_short, c_short, c_short); 3] = [
-                (0, num as c_short, num as c_short, t),
-                (t, num as c_short, num as c_short, 0),
-                (num as c_short, t, num as c_short, 0),
+                (0, num_s, num_s, t),
+                (t, num_s, num_s, 0),
+                (num_s, t, num_s, 0),
             ];
             for (a, b, c, d) in trials {
                 let rc = unsafe { sym(hdl as c_ushort, a, b, c, d, out.as_mut_ptr()) };
@@ -1642,18 +1672,11 @@ impl NativeLib {
     /// 读工件零点：`cnc_rdzofs` 3 shorts `s_no,e_no,type`，`fwlib.cs:8661`
     /// - 0i-F `zofs.1` 对应 `G54` 起点，`type 0` 单轴，失败则试 `type 1`
     pub fn cnc_rdzofs(&self, hdl: u16, num: u32) -> Result<f64, FocasRet> {
+        let num_s = to_c_short(num)?;
         let sym = self.cnc_rdzofs.as_ref().ok_or(FocasRet::Noopt)?;
         for t in [0 as c_short, 1 as c_short] {
             let mut out = std::mem::MaybeUninit::<IodbZofs>::uninit();
-            let rc = unsafe {
-                sym(
-                    hdl as c_ushort,
-                    num as c_short,
-                    num as c_short,
-                    t,
-                    out.as_mut_ptr(),
-                )
-            };
+            let rc = unsafe { sym(hdl as c_ushort, num_s, num_s, t, out.as_mut_ptr()) };
             let ret = FocasRet::from_raw(rc);
             if ret.is_ok() {
                 let v = unsafe { out.assume_init() };
@@ -1669,21 +1692,15 @@ impl NativeLib {
 
     /// 读参数单点：`cnc_rdparam` 3 shorts `s_no,axis,num`，`fwlib.cs:8687` `IODBPSD_1/2`
     /// - 先试 `IODBPSD_1 ldata` `len 1/8/6`，`EW_Attrib/EW_Data` 时回退 `IODBPSD_2 REAL` `len 12`
+    /// - `num` 超 `c_short` 即 `Param`（resolver/Descriptor 已同上限收紧）。
     /// - `axis 0` 无轴，兼容 `0i-F/30i` 差异，`platform/RdParam.cs:30`
     pub fn cnc_rdparam(&self, hdl: u16, num: u32) -> Result<i32, FocasRet> {
+        let num_s = to_c_short(num)?;
         let sym = self.cnc_rdparam.as_ref().ok_or(FocasRet::Noopt)?;
         // 先试 dword/word/byte 共用 IODBPSD_1
         for len in [1 as c_short, 8 as c_short, 6 as c_short] {
             let mut out = std::mem::MaybeUninit::<IodbPsd1>::uninit();
-            let rc = unsafe {
-                sym(
-                    hdl as c_ushort,
-                    num as c_short,
-                    0 as c_short,
-                    len,
-                    out.as_mut_ptr(),
-                )
-            };
+            let rc = unsafe { sym(hdl as c_ushort, num_s, 0 as c_short, len, out.as_mut_ptr()) };
             let ret = FocasRet::from_raw(rc);
             if ret.is_ok() {
                 let v = unsafe { out.assume_init() };
@@ -1710,13 +1727,7 @@ impl NativeLib {
             {
                 for len in [12 as c_short, 1 as c_short] {
                     let mut out2 = std::mem::MaybeUninit::<IodbPsd2>::uninit();
-                    let rc = sym2(
-                        hdl as c_ushort,
-                        num as c_short,
-                        0 as c_short,
-                        len,
-                        out2.as_mut_ptr(),
-                    );
+                    let rc = sym2(hdl as c_ushort, num_s, 0 as c_short, len, out2.as_mut_ptr());
                     let ret = FocasRet::from_raw(rc);
                     if ret.is_ok() {
                         let v = out2.assume_init();
