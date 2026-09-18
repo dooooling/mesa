@@ -92,6 +92,10 @@ pub(crate) const FOCAS_SERVO_PRODUCT_MAX: u8 = 4;
 /// 无更精确协议证据前，Descriptor/resolver 与 Native 双层 fail-closed
 /// 在此上限（`i16::MAX`），绝不允许 `u32::MAX` 直通。
 pub(crate) const FOCAS_C_SHORT_MAX: u32 = i16::MAX as u32;
+/// PMC 产品地址上限：最大宽度 DWORD 占 4 地址（`addr..addr+3`），结束地址
+/// 同样不得回绕，故统一收紧到 `C_SHORT_MAX - 3`（32764）。
+/// BYTE 理论可多用 3 个地址，但不值得为此引入 kind-dependent 上限。
+pub(crate) const FOCAS_PMC_ADDR_PRODUCT_MAX: u32 = FOCAS_C_SHORT_MAX - 3;
 /// u32 参数 → FFI `c_short` 的 checked 转换（超限即 `Param`，不截断）。
 /// 调用方在 FFI 调用前必须先转，禁止 `as c_short` 直通。
 pub(crate) fn to_c_short(v: u32) -> Result<c_short, FocasRet> {
@@ -1272,8 +1276,12 @@ impl NativeLib {
         addr: u32,
     ) -> Result<c_short, FocasRet> {
         let addr_s = to_c_short(addr)?;
-        // wrapping_add(1) 在上限内安全：addr <= i16::MAX，故 +1 不溢出 i16。
-        let addr_e = addr_s.wrapping_add(1);
+        // 结束地址同样 checked：addr=32767 时 +1 回绕成 -32768 即配 A 读 B，
+        // 必须 Param（删除 wrapping_add）。
+        let addr_e = addr
+            .checked_add(1)
+            .and_then(|v| to_c_short(v).ok())
+            .ok_or(FocasRet::Param)?;
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
         let mut buf = IodbPmc1 {
             type_a: adr_type,
@@ -1384,8 +1392,12 @@ impl NativeLib {
         addr: u32,
     ) -> Result<c_int, FocasRet> {
         let addr_s = to_c_short(addr)?;
-        // +3 在上限内安全：addr <= i16::MAX。
-        let addr_e = addr_s.wrapping_add(3);
+        // 结束地址同样 checked：addr=32767 时 +3 回绕即配 A 读 B，
+        // 必须 Param（删除 wrapping_add）。
+        let addr_e = addr
+            .checked_add(3)
+            .and_then(|v| to_c_short(v).ok())
+            .ok_or(FocasRet::Param)?;
         let sym = self.pmc_rdpmcrng.as_ref().ok_or(FocasRet::Nodll)?;
         let mut buf = IodbPmc2 {
             type_a: adr_type,
@@ -1969,3 +1981,36 @@ impl NativeLib {
 // 保证 Send/Sync（Library 本身不是，但 FOCAS 句柄在单线程 blocking 中使用，跨线程仅共享只读函数指针）
 unsafe impl Send for NativeLib {}
 unsafe impl Sync for NativeLib {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PMC 回绕回归：word/dword 结束地址不得回绕（32767 → -32768）。
+    /// 无 dll 也可验证（to_c_short 前即 Param，不碰 FFI）。
+    #[test]
+    fn pmc_end_address_never_wraps() {
+        // word addr=32767：结束 32768 超 c_short → Param。
+        assert_eq!(to_c_short(32767).ok(), Some(32767));
+        assert!(
+            32767u32
+                .checked_add(1)
+                .and_then(|v| to_c_short(v).ok())
+                .is_none(),
+            "word 32767 结束地址必须 Param"
+        );
+        // dword addr=32765：结束 32768 → Param；32764 结束 32767 通过。
+        assert!(
+            32765u32
+                .checked_add(3)
+                .and_then(|v| to_c_short(v).ok())
+                .is_none(),
+            "dword 32765 结束地址必须 Param"
+        );
+        let ok_end = 32764u32.checked_add(3).and_then(|v| to_c_short(v).ok());
+        assert_eq!(ok_end, Some(32767), "dword 32764 结束 32767 必须通过");
+        // 产品上限常量即 DWORD 安全值。
+        assert_eq!(FOCAS_PMC_ADDR_PRODUCT_MAX, 32764);
+        assert_eq!(FOCAS_C_SHORT_MAX, 32767);
+    }
+}

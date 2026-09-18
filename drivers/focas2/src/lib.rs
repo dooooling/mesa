@@ -175,8 +175,15 @@ fn resolve_generic_point(
                     ),
                 ));
             }
-            let addr_num =
-                int_param("addr", true, 0, 0, crate::native::FOCAS_C_SHORT_MAX as u64)? as u32;
+            // PMC 产品上限用 DWORD 安全值（最大宽度 4，结束地址不回绕）；
+            // macro/tool/param/diagnosis 继续用 C_SHORT_MAX，不混常量。
+            let addr_num = int_param(
+                "addr",
+                true,
+                0,
+                0,
+                crate::native::FOCAS_PMC_ADDR_PRODUCT_MAX as u64,
+            )? as u32;
             let bit = opt_bit()?;
             let data_type = if bit.is_some() {
                 DataType::Bool
@@ -510,9 +517,10 @@ impl Driver for FocasDriver {
                                     FieldDescriptor::new("addr", "Address", FieldType::Integer)
                                         .required(true);
                                 f.validation.min = Some(0.0);
-                                // FFI `c_short` 可表示上限：超限截断即配 A 读 B，
-                                // 双层 fail-closed（resolver 同上限）。
-                                f.validation.max = Some(crate::native::FOCAS_C_SHORT_MAX as f64);
+                                // DWORD 安全上限（最大宽度 4，结束地址不回绕；
+                                // BYTE 理论可多 3 个地址，不值得 kind-dependent 上限）。
+                                f.validation.max =
+                                    Some(crate::native::FOCAS_PMC_ADDR_PRODUCT_MAX as f64);
                                 f
                             },
                             {
@@ -1639,6 +1647,16 @@ mod tests {
                 "INVALID_BINDING_CONFIG",
             ),
             (
+                "pmc D addr=32765 拒绝（结束地址回绕）",
+                serde_json::json!([{"resource_id": "pmc", "parameters": {"kind": "D", "addr": 32765}, "outputs": [{"output": "value", "point_key": "k"}]}]),
+                "INVALID_BINDING_CONFIG",
+            ),
+            (
+                "pmc word addr=32767 拒绝（结束地址回绕）",
+                serde_json::json!([{"resource_id": "pmc", "parameters": {"kind": "R", "addr": 32767}, "outputs": [{"output": "value", "point_key": "k"}]}]),
+                "INVALID_BINDING_CONFIG",
+            ),
+            (
                 "tool number 超 c_short 不得截断",
                 serde_json::json!([{"resource_id": "tool", "parameters": {"number": 100000}, "outputs": [{"output": "offset", "point_key": "k"}]}]),
                 "INVALID_BINDING_CONFIG",
@@ -1703,9 +1721,10 @@ mod tests {
         assert_eq!(err.code, "INVALID_BINDING_CONFIG");
     }
 
-    /// 边界回归（3 blocker + indexed speed）：以下一律不得 GOOD。
+    /// 边界回归（3 blocker + indexed speed + PMC 回绕）：以下一律不得 GOOD。
     /// - servo=5 / axis=9：configure 期拒绝（产品上限）；
     /// - 超 c_short 参数：configure 期拒绝（配 A 读 B）；
+    /// - pmc D addr=32764 通过（DWORD 安全上限），32765 拒绝（结束回绕）；
     /// - indexed spindle speed：configure 不可达 + Fake/Native 读层 ERR。
     #[tokio::test]
     async fn boundary_never_produces_good() {
@@ -1724,6 +1743,14 @@ mod tests {
                 "macro=65537",
                 serde_json::json!([{"resource_id":"macro","parameters":{"number":65537},"outputs":[{"output":"value","point_key":"k"}]}]),
             ),
+            (
+                "pmc D addr=32765",
+                serde_json::json!([{"resource_id":"pmc","parameters":{"kind":"D","addr":32765},"outputs":[{"output":"value","point_key":"k"}]}]),
+            ),
+            (
+                "pmc word addr=32767",
+                serde_json::json!([{"resource_id":"pmc","parameters":{"kind":"R","addr":32767},"outputs":[{"output":"value","point_key":"k"}]}]),
+            ),
         ] {
             let conn = test_conn();
             let err = conn
@@ -1731,6 +1758,21 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(err.code, "INVALID_BINDING_CONFIG", "{name}");
+        }
+        // pmc D addr=32764 通过（DWORD 安全上限，结束 32767 不回绕）。
+        {
+            let conn = test_conn();
+            let sel = serde_json::json!([{"resource_id":"pmc","parameters":{"kind":"D","addr":32764},"outputs":[{"output":"value","point_key":"k"}]}]);
+            let descs = conn
+                .configure(1, vec![generic_task(sel)])
+                .await
+                .expect("pmc D addr=32764 必须通过");
+            assert_eq!(descs.len(), 1);
+            assert_eq!(
+                descs[0].source_label.as_deref(),
+                Some("pmc.D32764"),
+                "来源必须准确"
+            );
         }
         // Fake 读层：indexed speed 即 ERR（run 层转 BAD，不得 GOOD）。
         let api = FakeFocasApi::new();
