@@ -4,14 +4,14 @@
 // - 无 deviceId 限定：全局聚合，全量 points 全部成视图（含设备/连接归属名）。
 // 设备页继续用 useDeviceWorkspaceData（内部复用本源 + 设备过滤），语义同源。
 import { useEffect, useMemo, useRef, useState } from "react";
-import { derivePointStale, pointAgeMs, reconcilePointSnapshots, resolveEndpointContexts, type Device } from "../deviceModel";
+import { derivePointStale, pointAgeMs, resolveEndpointContexts, type Device } from "../deviceModel";
 import {
   DEVICE_ENDPOINTS_POLL_MS,
-  DEVICE_POINTS_POLL_MS,
   type DevicePointView,
   type WorkspaceEndpoint,
   type WorkspacePoint,
 } from "./useDeviceWorkspaceData";
+import { usePointLiveStream } from "./usePointLiveStream";
 
 async function fetchJson(url: string): Promise<unknown> {
   const r = await fetch(url);
@@ -42,11 +42,11 @@ export function useLivePointsSource(): LivePointsSource {
   const [endpoints, setEndpoints] = useState<WorkspaceEndpoint[]>([]);
   const [endpointsReady, setEndpointsReady] = useState(false);
   const [endpointsError, setEndpointsError] = useState("");
-  const [points, setPoints] = useState<WorkspacePoint[]>([]);
-  const [pointsError, setPointsError] = useState(false);
-  // 失败分支 bump：与设备页 staleNonce 同构，失败才重派生 STALE。
-  const [staleNonce, setStaleNonce] = useState(0);
-  // 无 nowMs state：interval 只拉取，不 tick 整页。
+  // 点值唯一来源：Point Live Stream（1s REST 轮询已删除）。
+  const live = usePointLiveStream();
+  const points = live.points as WorkspacePoint[];
+  const pointsError = live.pointsError;
+  // 无 nowMs state：STALE 由 live hook 的 deadline 翻转推进。
   const gen = useRef(0);
 
   useEffect(() => {
@@ -82,40 +82,11 @@ export function useLivePointsSource(): LivePointsSource {
         });
     };
 
-    const prevAtRef = { current: Date.now() };
-    // Row reconciliation（与设备页同语义）：不变行保引用。
-    const loadPoints = () => {
-      fetchJson("/api/v1/points/latest")
-        .then((j) => {
-          if (cancelled || gen.current !== id) return;
-          const pts = (j as { points?: unknown }).points;
-          if (!Array.isArray(pts)) throw new Error("points 形态非法");
-          const arr = pts as WorkspacePoint[];
-          const at = Date.now();
-          const atPrev = prevAtRef.current;
-          prevAtRef.current = at;
-          setPoints((prev) => {
-            const { points: merged, changed } = reconcilePointSnapshots(prev, arr, at, atPrev);
-            return changed ? merged : prev;
-          });
-          setPointsError(false);
-        })
-        .catch(() => {
-          if (cancelled || gen.current !== id) return;
-          setPointsError(true);
-          setStaleNonce((n) => n + 1);
-        });
-    };
-
     loadInventory();
-    loadPoints();
-    let n = 0;
     const timer = window.setInterval(() => {
       if (gen.current !== id) return;
-      n += 1;
-      loadPoints();
-      if (n % (DEVICE_ENDPOINTS_POLL_MS / DEVICE_POINTS_POLL_MS) === 0) loadInventory();
-    }, DEVICE_POINTS_POLL_MS);
+      loadInventory();
+    }, DEVICE_ENDPOINTS_POLL_MS);
 
     return () => {
       cancelled = true;
@@ -134,8 +105,8 @@ export function useLivePointsSource(): LivePointsSource {
 
   const allPoints = useMemo<DevicePointView[]>(
     () => {
-      // 失败时 staleNonce 推进 STALE（异常路径才重算，正常零 churn）。
-      void staleNonce;
+      // STALE 由 live hook 的 deadline 翻转推进（无 1s tick、无网络请求）。
+      void live.staleRevision;
       return points.map((p) => {
         const c = ctx.get(p.endpoint_id);
         const buildNow = Date.now();
@@ -155,7 +126,7 @@ export function useLivePointsSource(): LivePointsSource {
       });
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [points, ctx, staleNonce],
+    [points, ctx, live.staleRevision],
   );
 
   const counts = useMemo(() => {
@@ -172,15 +143,7 @@ export function useLivePointsSource(): LivePointsSource {
     return { total: allPoints.length, good, bad, stale, unknown };
   }, [allPoints]);
 
-  const patchDisplayName = (endpoint_id: string, point_key: string, display_name: string | null) => {
-    setPoints((prev) =>
-      prev.map((p) =>
-        p.endpoint_id === endpoint_id && (p.key ?? p.point_key) === point_key
-          ? { ...p, display_name: display_name ?? undefined }
-          : p,
-      ),
-    );
-  };
+  const patchDisplayName = live.patchDisplayName;
 
   return { devices, endpoints, endpointsReady, endpointsError, points, pointsError, allPoints, counts, patchDisplayName };
 }

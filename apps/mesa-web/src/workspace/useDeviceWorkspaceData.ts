@@ -11,11 +11,11 @@ import {
   POINT_STALE_AFTER_MS,
   derivePointStale,
   pointAgeMs,
-  reconcilePointSnapshots,
   resolveEndpointContexts,
   type Device,
   type PointStale,
 } from "../deviceModel";
+import { usePointLiveStream } from "./usePointLiveStream";
 
 export interface WorkspacePoint {
   endpoint_id: string;
@@ -103,7 +103,6 @@ export interface DeviceWorkspaceData {
   patchDisplayName: (endpoint_id: string, point_key: string, display_name: string | null) => void;
 }
 
-export const DEVICE_POINTS_POLL_MS = 1000;
 export const DEVICE_ENDPOINTS_POLL_MS = 10_000;
 
 // derivePointStale / PointStale 已收敛到 deviceModel（签名门共用同一派生）。
@@ -151,8 +150,11 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
   const [endpointsReady, setEndpointsReady] = useState(false);
   const [endpointsError, setEndpointsError] = useState("");
   const [devices, setDevices] = useState<Device[]>([]);
-  const [points, setPoints] = useState<WorkspacePoint[]>([]);
-  const [pointsError, setPointsError] = useState(false);
+  // 点值唯一来源：Point Live Stream（SSE state stream；1s REST 轮询已删除）。
+  // inventory 仍 10s 轮询（本次只解决 point values）。
+  const live = usePointLiveStream();
+  const points = live.points as WorkspacePoint[];
+  const pointsError = live.pointsError;
   // 无 nowMs state：interval 只拉取，不 tick 整页。年龄由 AgeCell 独立消费共享秒钟。
   // 路由代际：deviceId 切换即新一代；旧请求的迟到响应一律丢弃。
   const gen = useRef(0);
@@ -220,48 +222,12 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
         });
     };
 
-    const prevAtRef = { current: Date.now() };
-    // Row reconciliation：逐行全字段比较（含 metadata），不变行保旧引用
-    // → 下游 memo/行级 bailout；变行/新行更新。derived 用到达时刻计算，
-    // STALE 翻转对齐轮询节拍（语义无损）。
-    const loadPoints = () => {
-      fetchJson("/api/v1/points/latest")
-        .then((j) => {
-          if (cancelled || gen.current !== id) return;
-          const pts = (j as { points?: unknown }).points;
-          if (!Array.isArray(pts)) throw new Error("points 形态非法");
-          const arr = pts as WorkspacePoint[];
-          const at = Date.now();
-          const atPrev = prevAtRef.current;
-          prevAtRef.current = at;
-          setPoints((prev) => {
-            // 代际内 prev 恒为本 effect 的快照（setPoints 函数式更新取最新）。
-            const { points: merged, changed } = reconcilePointSnapshots(prev, arr, at, atPrev);
-            return changed ? merged : prev;
-          });
-          setPointsError(false);
-        })
-        .catch(() => {
-          // fail-closed：保留 last-known points；bump staleNonce 让派生
-          // STALE 按 nowMs 推进（异常路径才重算，正常时零 churn）。
-          if (cancelled || gen.current !== id) return;
-          setPointsError(true);
-          setStaleNonce((n) => n + 1);
-        });
-    };
-
     loadInventory();
-    loadPoints();
     reloadRef.current = loadInventory;
-    let n = 0;
     const timer = window.setInterval(() => {
       if (gen.current !== id) return;
-      n += 1;
-      // 无整页 tick：只拉取；年龄由 AgeCell 独立时钟，STALE 派生由
-      // reconcile（成功分支）/ staleNonce（失败分支）推进。
-      loadPoints();
-      if (n % (DEVICE_ENDPOINTS_POLL_MS / DEVICE_POINTS_POLL_MS) === 0) loadInventory();
-    }, DEVICE_POINTS_POLL_MS);
+      loadInventory();
+    }, DEVICE_ENDPOINTS_POLL_MS);
 
     return () => {
       cancelled = true;
@@ -290,11 +256,10 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
     [deviceEndpoints],
   );
 
-  // nowMs 不进 memo 依赖：正常轮询由签名门决定是否重建；
-  // 拉取失败时 staleNonce 推进 STALE（异常路径）。
-  const [staleNonce, setStaleNonce] = useState(0);
+  // STALE 由 live hook 的 deadline 翻转（staleRevision 变化即重算 derived）；
+  // 无网络帧时同样翻转（不再依赖轮询节拍）。
   const devicePoints = useMemo(() => {
-    void staleNonce;
+    void live.staleRevision;
     const buildNow = Date.now();
     const views: DevicePointView[] = [];
     for (const p of points) {
@@ -311,7 +276,7 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
     }
     return views;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [points, ctx, deviceId, staleNonce]);
+  }, [points, ctx, deviceId, live.staleRevision]);
 
   const counts = useMemo(() => {
     let good = 0;
@@ -341,14 +306,6 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
     devicePoints,
     counts,
     reloadInventory: () => reloadRef.current(),
-    patchDisplayName: (endpoint_id, point_key, display_name) => {
-      setPoints((prev) =>
-        prev.map((p) =>
-          p.endpoint_id === endpoint_id && (p.key ?? p.point_key) === point_key
-            ? { ...p, display_name: display_name ?? undefined }
-            : p,
-        ),
-      );
-    },
+    patchDisplayName: live.patchDisplayName,
   };
 }

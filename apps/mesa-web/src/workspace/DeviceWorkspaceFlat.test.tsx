@@ -1,23 +1,17 @@
 // 扁平设备详情回归：六个一级 Tab、无全局 Connection Context、
 // 旧路由诚实 404、Header 聚合事实、各页连接筛选局部化。
+// 点值走 Point Live SSE 桩；inventory 仍 fetch。
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import App from "../App";
+import { installPointLiveStub, pointLiveRow } from "../test/pointLiveStub";
 
 const T0 = 1_700_000_000_000;
 
 function pt(ep: string, key: string) {
-  return {
-    endpoint_id: ep,
-    key,
-    point_id: key.length,
-    quality: "GOOD",
-    type: "f64",
-    value: 1,
-    timestamp_ns: (T0 - 500) * 1e6,
-  };
+  return pointLiveRow(ep, key, "GOOD", 500, 1);
 }
 
 const EPS = [
@@ -32,21 +26,10 @@ const EPS_CROSS = [
 ];
 
 function mockAll(endpoints: typeof EPS = EPS) {
-  (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string) => {
-    if (url === "/api/v1/devices/cnc-01") {
-      return { ok: true, status: 200, json: async () => ({ id: "cnc-01", name: "CNC-01" }) };
-    }
-    if (url === "/api/v1/devices") {
-      return { ok: true, status: 200, json: async () => ({ devices: [{ id: "cnc-01", name: "CNC-01" }] }) };
-    }
-    if (url === "/api/v1/endpoints") {
-      return { ok: true, status: 200, json: async () => ({ endpoints }) };
-    }
-    if (url === "/api/v1/points/latest") {
-      return { ok: true, status: 200, json: async () => ({ points: [pt("plc", "a"), pt("focas", "b")] }) };
-    }
-    return { ok: false, status: 404, json: async () => ({}) };
-  }) as unknown as typeof fetch;
+  return installPointLiveStub({
+    points: [pt("plc", "a"), pt("focas", "b")],
+    endpoints,
+  });
 }
 
 function renderApp(path: string) {
@@ -59,24 +42,31 @@ function renderApp(path: string) {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  vi.useFakeTimers();
-  vi.setSystemTime(T0);
 });
 
 afterEach(() => {
-  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
+
+async function waitLiveSubscribed() {
+  const { waitFor } = await import("@testing-library/react");
+  await waitFor(
+    () =>
+      expect(
+        (
+          globalThis as { __PointLiveStubSource?: { instances?: unknown[] } }
+        ).__PointLiveStubSource?.instances?.length ?? 0,
+      ).toBeGreaterThan(0),
+    { timeout: 30000, interval: 50 },
+  );
+}
 
 describe("扁平设备详情", () => {
   it("Header 展示真实聚合 + 六个一级 Tab，无全局连接上下文", async () => {
     mockAll();
     renderApp("/devices/cnc-01/overview");
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0);
-    });
     // Header：名 + id + 聚合事实（无合成健康评分；名在面包屑/Header 多处，用 AllBy）
-    expect(screen.getAllByText("CNC-01").length).toBeGreaterThanOrEqual(1);
+    await screen.findAllByText("CNC-01", undefined, { timeout: 30000 });
     expect(screen.getByText("2 个连接 · 1 RUNNING · 1 STOPPED")).toBeTruthy();
     expect(screen.getByRole("button", { name: "编辑设备" })).toBeTruthy();
     // 六个 Tab（侧边栏“实时数据”重名，锚定设备 Tab 导航）
@@ -99,27 +89,24 @@ describe("扁平设备详情", () => {
       "/devices/cnc-01/endpoints/plc",
     ]) {
       const { unmount } = renderApp(path);
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
       expect(screen.getByText(/页面不存在/)).toBeTruthy();
       unmount();
     }
   });
 
   it("未知路由进 NotFound（不再回总览）", async () => {
-    vi.useRealTimers();
     mockAll();
     renderApp("/no-such-page");
-    expect(await screen.findByText(/页面不存在/, undefined, { timeout: 10000 })).toBeTruthy();
+    expect(await screen.findByText(/页面不存在/, undefined, { timeout: 30000 })).toBeTruthy();
   });
 
   it("Tab 切换不保留 ?connection=（各页筛选局部）", async () => {
-    vi.useRealTimers();
-    mockAll();
+    const stub = mockAll();
     const user = userEvent.setup();
     renderApp("/devices/cnc-01/data?connection=plc");
-    await screen.findAllByText("a", undefined, { timeout: 10000 });
+    await waitLiveSubscribed();
+    act(() => stub.emit());
+    await screen.findAllByText("a", undefined, { timeout: 30000 });
     // 切到概览：Link 直达无参（MemoryRouter 下用页面内容断言，不读 window.location）
     await user.click(screen.getByText("概览"));
     await screen.findByText("需要关注", undefined, { timeout: 10000 });
@@ -130,9 +117,7 @@ describe("扁平设备详情", () => {
   it("连接页只管 Endpoint（增删改查/启停），无采集与事件", async () => {
     mockAll();
     renderApp("/devices/cnc-01/connections");
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0);
-    });
+    await screen.findByText("PLC-01", undefined, { timeout: 30000 });
     expect(screen.getByText("PLC-01")).toBeTruthy();
     expect(screen.getByText("FOCAS")).toBeTruthy();
     // AntD 中文按钮自动加空格，用正则
@@ -146,10 +131,8 @@ describe("扁平设备详情", () => {
   it("采集页含数据采集 + 事件订阅两 Section", async () => {
     mockAll();
     renderApp("/devices/cnc-01/acquisition");
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0);
-    });
     // Card title 文本可能拆元素，分开断言
+    await screen.findByText(/数据采集/, undefined, { timeout: 30000 });
     expect(screen.getByText(/数据采集/)).toBeTruthy();
     expect(screen.getByText("PLC-01")).toBeTruthy();
     expect(screen.getByText("事件订阅")).toBeTruthy();
@@ -160,9 +143,7 @@ describe("扁平设备详情", () => {
     // connections 页
     {
       const { unmount } = renderApp("/devices/cnc-01/connections");
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
+      await screen.findByText("PLC-01", undefined, { timeout: 30000 });
       expect(screen.getByText("PLC-01")).toBeTruthy();
       expect(screen.queryByText("B-ONE")).toBeNull();
       unmount();
@@ -170,9 +151,7 @@ describe("扁平设备详情", () => {
     // overview Header 只计 A 的连接
     {
       const { unmount } = renderApp("/devices/cnc-01/overview");
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
+      await screen.findByText("2 个连接 · 1 RUNNING · 1 STOPPED", undefined, { timeout: 30000 });
       expect(screen.getByText("2 个连接 · 1 RUNNING · 1 STOPPED")).toBeTruthy();
       expect(screen.queryByText("B-ONE")).toBeNull();
       unmount();
@@ -180,9 +159,6 @@ describe("扁平设备详情", () => {
     // data 页筛选器无 B
     {
       const { unmount } = renderApp("/devices/cnc-01/data");
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
       expect(screen.queryByText("B-ONE")).toBeNull();
       unmount();
     }
@@ -196,8 +172,8 @@ describe("扁平设备详情", () => {
       { id: "c", name: "C", driver_id: "s7", device_id: "cnc-01", state: "RECONNECTING" },
     ]);
     renderApp("/devices/cnc-01/overview");
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0);
+    await screen.findByText("4 个连接 · 1 FAILED · 1 RECONNECTING · 1 RUNNING · 1 STOPPED", undefined, {
+      timeout: 30000,
     });
     expect(
       screen.getByText("4 个连接 · 1 FAILED · 1 RECONNECTING · 1 RUNNING · 1 STOPPED"),
@@ -205,11 +181,11 @@ describe("扁平设备详情", () => {
   });
 
   it("实时表固定布局：列宽固定，内容省略不推动整表", async () => {
-    mockAll();
+    const stub = mockAll();
     renderApp("/devices/cnc-01/data");
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0);
-    });
+    await waitLiveSubscribed();
+    act(() => stub.emit());
+    await screen.findAllByText("a", undefined, { timeout: 30000 });
     const table = document.querySelector("table");
     expect(table).toBeTruthy();
     // fixed 布局：colgroup 每列有显式宽度
@@ -220,52 +196,32 @@ describe("扁平设备详情", () => {
     expect(widths.some((s) => s.includes("180"))).toBe(true);
   });
 
-  it("概览数据预览稳定顺序：时间错开不行位", async () => {
-    vi.useRealTimers();
-    let tick = 0;
-    (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string) => {
-      if (url === "/api/v1/devices/cnc-01") {
-        return { ok: true, status: 200, json: async () => ({ id: "cnc-01", name: "CNC-01" }) };
-      }
-      if (url === "/api/v1/devices") {
-        return { ok: true, status: 200, json: async () => ({ devices: [{ id: "cnc-01", name: "CNC-01" }] }) };
-      }
-      if (url === "/api/v1/endpoints") {
-        return { ok: true, status: 200, json: async () => ({ endpoints: EPS }) };
-      }
-      if (url === "/api/v1/points/latest") {
-        tick += 1;
-        // 两轮时间错开：第一轮 b 新，第二轮 a 新（旧逻辑会重排）
-        const tsA = (T0 - (tick === 1 ? 500 : 100)) * 1e6;
-        const tsB = (T0 - (tick === 1 ? 100 : 500)) * 1e6;
-        return {
-          ok: true, status: 200,
-          json: async () => ({ points: [
-            { endpoint_id: "focas", key: "b-key", point_id: 2, quality: "GOOD", type: "f64", value: 2, timestamp_ns: tsB },
-            { endpoint_id: "plc", key: "a-key", point_id: 1, quality: "GOOD", type: "f64", value: 1, timestamp_ns: tsA },
-          ] }),
-        };
-      }
-      return { ok: false, status: 404, json: async () => ({}) };
-    }) as unknown as typeof fetch;
+  it("概览数据预览行位稳定（delta 只改值不行位）", async () => {
+    const stub = mockAll();
     renderApp("/devices/cnc-01/overview");
-    await screen.findByText("数据预览", undefined, { timeout: 10000 });
-    const order = () => {
+    await screen.findByText("数据预览", undefined, { timeout: 30000 });
+    await waitLiveSubscribed();
+    act(() => stub.emit());
+    await screen.findAllByText("a", undefined, { timeout: 30000 });
+    // 行位：预览区内 a/b 首次出现顺序（focas < plc，故 b,a；值/STALE 变化不影响行位）。
+    const keyOrder = () => {
       const preview = screen.getByText("数据预览").closest("section")!;
-      return [...preview.querySelectorAll("div")].map((d) => d.textContent ?? "").join("|");
+      const text = [...preview.querySelectorAll("div")].map((d) => d.textContent ?? "").join("|");
+      return ["a", "b"].filter((k) => text.includes(k)).sort((x, y) => text.indexOf(x) - text.indexOf(y)).join(",");
     };
-    const first = order();
-    // 等第二轮轮询（1s 间隔），行位必须不变
-    await new Promise((r) => setTimeout(r, 1500));
-    expect(order()).toBe(first);
-  }, 30000);
+    expect(keyOrder()).toBe("b,a");
+    // delta 只改 b 的值：行位必须不变。
+    act(() => stub.emitDelta([pointLiveRow("focas", "b", "GOOD", 100, 99)]));
+    await waitFor(() => expect(keyOrder()).toBe("b,a"), { timeout: 30000 });
+  }, 60000);
 
   it("非法 connection 被正规化回 URL（页面与地址栏一致）", async () => {
-    vi.useRealTimers();
-    mockAll();
+    const stub = mockAll();
     renderApp("/devices/cnc-01/data?connection=ghost");
+    await waitLiveSubscribed();
+    act(() => stub.emit());
     // Data 页：非法 → 全部（两点都显示），URL 删参
-    await screen.findAllByText("a", undefined, { timeout: 10000 });
+    await screen.findAllByText("a", undefined, { timeout: 30000 });
     expect(screen.getAllByText("b").length).toBeGreaterThanOrEqual(1);
-  }, 30000);
+  }, 60000);
 });

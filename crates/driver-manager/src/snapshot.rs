@@ -2,13 +2,14 @@
 //!
 //! 全部驻留内存，不落盘——热路径最新值仅内存可达，持久化由 ConfigStore 负责。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     RwLock,
     atomic::{AtomicU64, Ordering},
 };
 
 use serde::Serialize;
+use std::sync::Arc;
 
 /// Value 的 JSON 视图：带类型标签，避免 REST 消费方猜测数值含义。
 #[derive(Debug, Clone, Serialize)]
@@ -129,6 +130,26 @@ pub struct LatestEntry {
 /// 一次读锁同时取三者，不新增锁（50K/s 锁争用敏感）。
 type PointMeta = (String, Option<String>, Option<String>);
 
+/// Point Live Stream（STATE STREAM，不是 EVENT STREAM）变更通知。
+/// 只传身份（endpoint + point_ids），不传 Value：
+/// `Upsert` 是这些点有了新状态，消费方经 `latest_for_keys` 取最终值
+/// （200ms 内同一点多次变化只发最后一次，即 latest-wins）；
+/// `Resync` 是结构变化（增删点/key/label 刷新/endpoint 删除），消费方
+/// 重新拉全量 snapshot（不用 tombstone 协议）。
+/// 无 subscriber 时不构造（`receiver_count()==0` 直接返回）。
+#[derive(Debug, Clone)]
+pub enum LatestChange {
+    Upsert {
+        endpoint_id: String,
+        point_ids: Vec<u32>,
+    },
+    Resync,
+}
+
+/// Point Live 通知容量（broadcast 有界）：一条 notice 对应一个 DataBatch，
+/// 不是一个 point。慢消费者 Lagged 即转 Resync（重发全量），不补 backlog。
+pub const POINT_LIVE_NOTICE_CAPACITY: usize = 1024;
+
 /// 进程级共享快照。锁粒度按用途拆分，REST 读路径互不阻塞；latest/meta 采用 RwLock
 /// 以支持高频 DataBatch 写入与 REST 并发读取（§22 50K/s 下 apply_batch 与 latest_all 争用显著）。
 pub struct Snapshot {
@@ -149,6 +170,9 @@ pub struct Snapshot {
     snapshot_apply_latencies_ns: RwLock<VecDeque<u64>>,
     /// P1：IPC/E2E 单调延迟样本（Driver mono_ns → Core 收到时的 wall 差值，>10s 视为不可比丢弃）
     ipc_latencies_ns: RwLock<VecDeque<u64>>,
+    /// Point Live 变更通知（broadcast 有界；Snapshot 是唯一真值，此处只发通知不存状态）。
+    /// `OnceLock` 懒建：无 SSE consumer 前不占 channel 资源。
+    live_tx: std::sync::OnceLock<tokio::sync::broadcast::Sender<Arc<LatestChange>>>,
 }
 
 impl Default for Snapshot {
@@ -163,6 +187,7 @@ impl Default for Snapshot {
             point_value_total: AtomicU64::new(0),
             snapshot_apply_latencies_ns: RwLock::new(VecDeque::with_capacity(4096)),
             ipc_latencies_ns: RwLock::new(VecDeque::with_capacity(4096)),
+            live_tx: std::sync::OnceLock::new(),
         }
     }
 }
@@ -236,6 +261,11 @@ impl Snapshot {
                 entry.display_name = name.clone();
             }
         }
+        // 锁释放后通知：结构变化走 Resync（增删点/key 刷新不用 tombstone，
+        // 消费方重拉全量 snapshot 收敛）。
+        drop(latest);
+        drop(meta);
+        self.emit_change(LatestChange::Resync);
     }
 
     /// 应用一个批次到 LatestValueCache。同点覆盖即"最新值胜出"的 Core 侧体现。
@@ -298,6 +328,16 @@ impl Snapshot {
             };
             latest.insert(k, entry);
         }
+        // 锁释放后通知：只传身份，消费方回读最终值（latest-wins）。
+        // 空 batch（values 为空）不发通知。
+        let changed: Vec<u32> = batch.values.iter().map(|pv| pv.point_id).collect();
+        drop(latest);
+        if !changed.is_empty() {
+            self.emit_change(LatestChange::Upsert {
+                endpoint_id: endpoint_id.to_string(),
+                point_ids: changed,
+            });
+        }
     }
 
     /// 记录 Snapshot apply 单调延迟样本，O(1)
@@ -357,6 +397,7 @@ impl Snapshot {
     /// ValueOrigin 跃迁：PLACEHOLDER 保持 PLACEHOLDER（source=None），其余 CURRENT/LAST_KNOWN → LAST_KNOWN
     pub fn mark_communication_lost(&self, endpoint_id: &str) {
         let mut latest = self.latest.write().unwrap();
+        let mut affected: Vec<u32> = Vec::new();
         for ((ep, _pid), entry) in latest.iter_mut() {
             if ep == endpoint_id {
                 entry.quality = "BAD".into();
@@ -367,9 +408,17 @@ impl Snapshot {
                 if entry.value_origin == "PLACEHOLDER" {
                     entry.source_timestamp_ns = None;
                 }
+                affected.push(entry.point_id);
                 // 保留 entry.value（typed last value）与 timestamp_ns 不变，不置 Null
                 // 契约：无论之前是 GOOD 还是 BAD/DECODE_FAILED，断线后统一置为 COMMUNICATION_LOST
             }
+        }
+        drop(latest);
+        if !affected.is_empty() {
+            self.emit_change(LatestChange::Upsert {
+                endpoint_id: endpoint_id.to_string(),
+                point_ids: affected,
+            });
         }
     }
 
@@ -388,6 +437,8 @@ impl Snapshot {
             .unwrap()
             .retain(|(ep, _), _| ep != endpoint_id);
         self.endpoints.write().unwrap().remove(endpoint_id);
+        // 结构删除走 Resync（消费方重拉全量，幽灵行自然消失）。
+        self.emit_change(LatestChange::Resync);
     }
 
     /// P2 改名同步（编辑 display_name 后调用）：写入 override 并更新
@@ -410,8 +461,14 @@ impl Snapshot {
         }
         let mut latest = self.latest.write().unwrap();
         if let Some(e) = latest.get_mut(&k) {
-            e.display_name = name;
+            e.display_name = name.clone();
         }
+        drop(latest);
+        // 改名即元数据变化：消费方回读该行（A 改名后 B/C 实时同步）。
+        self.emit_change(LatestChange::Upsert {
+            endpoint_id: endpoint_id.to_string(),
+            point_ids: vec![point_id],
+        });
     }
 
     pub fn latest_all(&self) -> Vec<LatestEntry> {
@@ -422,6 +479,51 @@ impl Snapshot {
                 .then(a.point_id.cmp(&b.point_id))
         });
         v
+    }
+
+    /// Point Live 订阅（SSE 建连第一步，读 snapshot 之前调用，不丢建连窗口）。
+    /// broadcast 懒建：首个订阅者触发 `channel(1024)`。
+    pub fn subscribe_latest_changes(&self) -> tokio::sync::broadcast::Receiver<Arc<LatestChange>> {
+        self.live_tx
+            .get_or_init(|| {
+                let (tx, _rx) = tokio::sync::broadcast::channel(POINT_LIVE_NOTICE_CAPACITY);
+                tx
+            })
+            .subscribe()
+    }
+
+    /// Point Live 增量读取：只取 dirty 集合的最终值（latest-wins），不扫描全表。
+    /// 结果按 (endpoint_id, point_id) 排序；已删除的 key 静默跳过（由 Resync 全量收敛）。
+    pub fn latest_for_keys(&self, keys: &HashSet<(String, u32)>) -> Vec<LatestEntry> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let latest = self.latest.read().unwrap();
+        let mut v: Vec<LatestEntry> = Vec::with_capacity(keys.len().min(1024));
+        for k in keys {
+            if let Some(e) = latest.get(k) {
+                v.push(e.clone());
+            }
+        }
+        v.sort_by(|a, b| {
+            a.endpoint_id
+                .cmp(&b.endpoint_id)
+                .then(a.point_id.cmp(&b.point_id))
+        });
+        v
+    }
+
+    /// 内部：锁释放后发送通知（调用方保证已 drop latest 写锁，避免 SSE
+    /// 消费方回读 `latest_for_keys` 时与写锁竞争）。无 subscriber 时零成本
+    ///（仅一次 `receiver_count` 原子读，不构造 Vec）。
+    fn emit_change(&self, change: LatestChange) {
+        let Some(tx) = self.live_tx.get() else {
+            return;
+        };
+        if tx.receiver_count() == 0 {
+            return;
+        }
+        let _ = tx.send(Arc::new(change));
     }
 }
 

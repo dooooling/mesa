@@ -1491,9 +1491,10 @@ async fn list_endpoints(State(state): State<Arc<AppState>>) -> Json<serde_json::
 }
 
 async fn latest_points(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(
-        serde_json::json!({ "points": state.snapshot.latest_all(), "count": state.snapshot.latest_all().len() }),
-    )
+    // 单次快照：points 与 count 同源（旧实现调了两次 latest_all，O(2N)）。
+    let points = state.snapshot.latest_all();
+    let count = points.len();
+    Json(serde_json::json!({ "points": points, "count": count }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2784,6 +2785,102 @@ async fn events_live(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Point Live Stream（STATE STREAM，不是 EVENT STREAM；§二十冻结语义）
+// ---------------------------------------------------------------------------
+
+/// Point Live SSE 合并窗口：每个连接最多约 5 数据帧/s；同一点 200ms 内
+/// N 次变化只发最终值（latest-wins）。
+const POINT_LIVE_FLUSH_MS: u64 = 200;
+
+fn point_snapshot_event(points: Vec<mesa_driver_manager::snapshot::LatestEntry>) -> SseItem {
+    Ok(axum::response::sse::Event::default()
+        .event("mesa-points-snapshot")
+        .json_data(serde_json::json!({ "points": points }))
+        .unwrap_or_else(|_| axum::response::sse::Event::default().event("mesa-points-snapshot")))
+}
+
+fn point_delta_event(points: Vec<mesa_driver_manager::snapshot::LatestEntry>) -> SseItem {
+    Ok(axum::response::sse::Event::default()
+        .event("mesa-points-delta")
+        .json_data(serde_json::json!({ "points": points }))
+        .unwrap_or_else(|_| axum::response::sse::Event::default().event("mesa-points-delta")))
+}
+
+/// `GET /api/v1/points/live`（STATE STREAM）：
+/// 建连顺序是先 subscribe change notifier，再读 snapshot.latest_all()，
+/// 然后首帧 mesa-points-snapshot，最后消费 notice（200ms 合并）。
+/// 先 subscribe 再读 snapshot：建连窗口的变化只会重复（snapshot 已含新值
+/// 加后续 delta 再发一次），绝不丢失。无 `id`/seq/replay，断线重连即新连接
+/// 加 fresh snapshot，Lagged 即 Resync（不补 backlog）。
+async fn points_live(
+    State(state): State<Arc<AppState>>,
+) -> axum::response::sse::Sse<impl tokio_stream::Stream<Item = SseItem>> {
+    use mesa_driver_manager::snapshot::LatestChange;
+    // ① 一定先 subscribe（一致性边界：不丢建连窗口）。
+    let mut rx = state.snapshot.subscribe_latest_changes();
+    // ② 再读全量（此后任何变化都有 notice 兜底）。
+    let initial = state.snapshot.latest_all();
+    let snapshot = state.snapshot.clone();
+    let s = async_stream::stream! {
+        // ③ 首帧一定是完整 snapshot（空库即 {points:[]}，合法）。
+        yield point_snapshot_event(initial);
+        let mut dirty: std::collections::HashSet<(String, u32)> =
+            std::collections::HashSet::new();
+        let mut resync = false;
+        let mut flush = tokio::time::interval(std::time::Duration::from_millis(
+            POINT_LIVE_FLUSH_MS,
+        ));
+        // 首 tick 立即消费（interval 首 tick 即就绪）：不引入 200ms 首帧延迟。
+        flush.tick().await;
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(change) => match &*change {
+                            LatestChange::Upsert { endpoint_id, point_ids } => {
+                                for id in point_ids {
+                                    dirty.insert((endpoint_id.clone(), *id));
+                                }
+                            }
+                            LatestChange::Resync => {
+                                dirty.clear();
+                                resync = true;
+                            }
+                        },
+                        // 慢消费者：不补 backlog，直接转全量（state stream 优势）。
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "point live slow consumer; resync");
+                            dirty.clear();
+                            resync = true;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                _ = flush.tick() => {
+                    if resync {
+                        yield point_snapshot_event(snapshot.latest_all());
+                        resync = false;
+                        dirty.clear();
+                    } else if !dirty.is_empty() {
+                        // delta = 变化点的完整最新行（不是 patch；字段留脏不可能）。
+                        let points = snapshot.latest_for_keys(&dirty);
+                        dirty.clear();
+                        if !points.is_empty() {
+                            yield point_delta_event(points);
+                        }
+                    }
+                }
+            }
+        }
+    };
+    axum::response::sse::Sse::new(s).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
 /// ⑧c 事件面诊断：SSE 计数（lagged/replay/reconcile）加 store 规模。
 /// P1-1 补全 ingress 全局计数、retention 累计 purge 与 hub live 订阅数。
 /// 计数是进程级累计（Relaxed 原子），各连接与 attempt 共同累加；
@@ -3150,6 +3247,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/control/audit", get(list_control_audit))
         .route("/api/v1/control/audit/{request_id}", get(get_control_audit))
         .route("/api/v1/points/latest", get(latest_points))
+        .route("/api/v1/points/live", get(points_live))
         // P2：点展示名改名（用户元数据，Driver 无感知）
         .route(
             "/api/v1/endpoints/{endpoint_id}/points/{point_key}/display-name",
