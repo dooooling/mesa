@@ -83,8 +83,12 @@ impl FakeFocasApi {
         let r = self.next_u32();
         match addr {
             FocasAddress::Status => {
-                // 0=MDI 1=AUTO 2=EDIT 3=HANDLE
-                Value::U32(r % 4)
+                // 产品合同：raw ODBST.aut 码（AUTOMATIC/MANUAL mode selection）。
+                // 公开码值（0i/30i 族）：0 MDI / 1 MEM / 3 EDIT / 4 HANDLE /
+                // 5 JOG / 9 REFERENCE / 10 REMOTE 等；Fake 只在其中抽样，
+                // 不自创码值（旧注释 1=AUTO/2=EDIT/3=HANDLE 已纠正）。
+                const MODES: [u32; 4] = [0, 1, 3, 4];
+                Value::U32(MODES[(r as usize) % MODES.len()])
             }
             FocasAddress::Alarm => {
                 // 报警文本（native 同口径 String；Fake 不得用 U32 伪造）
@@ -356,7 +360,9 @@ impl FocasApi for NativeFocasApi {
                     FocasAddress::Status => {
                         let r = stat_cache.get_or_insert_with(|| lib.cnc_statinfo(hdl));
                         match r {
-                            Ok(st) => Ok(Value::U32(st.mctype as u32)),
+                            // 产品合同：machine/status = ODBST.aut 原始码
+                            //（AUTOMATIC/MANUAL mode selection），不是 run/motion。
+                            Ok(st) => Ok(Value::U32(st.aut as u32)),
                             Err(e) => Err(Self::map_ret_err(*e)),
                         }
                     }
@@ -567,8 +573,9 @@ impl NativeFocasApi {
     fn read_one_blocking(lib: &NativeLib, hdl: u16, addr: &FocasAddress) -> Result<Value, String> {
         match addr {
             FocasAddress::Status => {
+                // 产品合同：machine/status = ODBST.aut 原始码（mode selection）。
                 let st = lib.cnc_statinfo(hdl).map_err(Self::map_ret_err)?;
-                Ok(Value::U32(st.mctype as u32))
+                Ok(Value::U32(st.aut as u32))
             }
             FocasAddress::Alarm => {
                 // 报警需 stateful 循环 cnc_rdalmmsg 至 EW_DATA，为保证批量不失败，此处先尝试真链路，失败则转 Bad 占位
