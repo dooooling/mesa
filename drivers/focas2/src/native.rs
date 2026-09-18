@@ -217,22 +217,34 @@ impl FocasRet {
 // 手册：FOCAS1/Ethernet B-64304EN 附录；结构体来源 fwlib.cs 对应类
 // ---------------------------------------------------------------------------
 
-/// `cnc_statinfo` 返回：`ODBST`，`fwlib.cs:3372` `collectors/StateData`
+/// `cnc_statinfo` 返回：`ODBST`（0i/30i 族），`fwlib.cs:3392` 非 FS15D 分支。
+/// - 布局：9 × `short` = 18 字节，按顺序
+///   `hdck/tmmode/aut/run/motion/mstb/emergency/alarm/edit`；
+///   Pack=4 下 short 数组无填充，`size_of == 18`（单测锁 size + offset 双重）。
+/// - `machine/status` 产品合同 = 原始 `aut` 码（AUTOMATIC/MANUAL mode
+///   selection），不是 run/motion/alarm；可读文本映射由展示层处理，不在此转。
+/// - Series 15 的 ODBST 为另一变体，本结构只覆盖 0i-F 等当前目标族；
+///   未来接 Series 15 时在 Operation 层处理 variant，不在此加 enum。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct OdbSt {
-    pub dummy: [c_short; 2], // 保留
-    pub tctype: c_short,     // 机床类型（车/铣）
-    pub dtype: c_short,      // 数据类型
-    pub mctype: c_short,     // 加工中心类型：0=MDI 1=AUTO 等（165 实测 1）
-    pub utime: c_int,        // 加工时间（分）
+    pub hdck: c_short,      // 保留
+    pub tmmode: c_short,    // T/M 模式
+    pub aut: c_short,       // 操作模式选择（machine/status 即此字段原始码）
+    pub run: c_short,       // 运行状态
+    pub motion: c_short,    // 轴/dwell 状态
+    pub mstb: c_short,      // M/S/T/B 状态
+    pub emergency: c_short, // 急停状态
+    pub alarm: c_short,     // 报警状态
+    pub edit: c_short,      // 编辑状态
 }
 
-/// `cnc_sysinfo` 返回：`ODBSYS`（20 字节），`B-64304EN 4.1` `fwlib.cs`
-/// - 布局：addinfo(2) max_axis(2) cnc_type(2) mt_type(2) series(4) version(4) axes(4)，
+/// `cnc_sysinfo` 返回：`ODBSYS`（0i/30i 族 18 字节），`B-64304EN 4.1` `fwlib.cs:3354`
+/// - 布局：addinfo(2) max_axis(2) cnc_type(2) mt_type(2) series(4) version(4) axes(2)，
 ///   字符区为 ASCII（不足补空格），`[u8; N]` 与 C `char[N]` 布局等价。
 /// - NOTE: series/version 偏移与真机确认前为待验证假设，调用方必须做回显无关的
 ///   严格校验（非空可打印 ASCII），失败只降级 IDENTITY_UNAVAILABLE，绝不误报。
+/// - Series 15 的 ODBSYS 为另一变体，本结构只覆盖当前目标族。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct OdbSys {
@@ -242,7 +254,7 @@ pub struct OdbSys {
     pub mt_type: [u8; 2],
     pub series: [u8; 4],
     pub version: [u8; 4],
-    pub axes: [u8; 4],
+    pub axes: [u8; 2],
 }
 
 /// ODBSYS 字符区解码（series/version/cnc_type 通用）：去 NUL/空格，
@@ -1071,9 +1083,11 @@ impl NativeLib {
         }
     }
 
-    /// 读 CNC 状态：`cnc_statinfo(hdl, ODBST*)`，`collectors/StateData` 与 `focas_api status` 用
-    /// - 返回 `mctype`（`0=MDI 1=AUTO` 等）等，`165` 实测 `1` 为 `AUTO`
-    /// - 手册：`B-64304EN 4.3`，`fwlib.cs:3372`
+    /// 读 CNC 状态：`cnc_statinfo(hdl, ODBST*)`，`fwlib.cs:3392` 非 FS15D 分支
+    /// - 产品合同：`machine/status = ODBST.aut` 原始码（AUTOMATIC/MANUAL mode
+    ///   selection）；run/motion/alarm 等是独立语义，未来加独立 output，
+    ///   绝不混进 `status`。
+    /// - 手册：`B-64304EN 4.3`
     pub fn cnc_statinfo(&self, hdl: u16) -> Result<OdbSt, FocasRet> {
         let sym = self.cnc_statinfo.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<OdbSt>::uninit();
@@ -2012,5 +2026,38 @@ mod tests {
         // 产品上限常量即 DWORD 安全值。
         assert_eq!(FOCAS_PMC_ADDR_PRODUCT_MAX, 32764);
         assert_eq!(FOCAS_C_SHORT_MAX, 32767);
+    }
+
+    /// PR0：`ODBST`（0i/30i 族）ABI 回归——9 × short = 18B，且字段顺序
+    /// 固定为 hdck/tmmode/aut/run/motion/mstb/emergency/alarm/edit。
+    /// 只测 size 不够（顺序错了也可能是 18B），必须同时锁 offset。
+    #[test]
+    fn odbst_abi_layout_locked() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<OdbSt>(), 18, "ODBST 必须 9×short=18B");
+        assert_eq!(offset_of!(OdbSt, hdck), 0);
+        assert_eq!(offset_of!(OdbSt, tmmode), 2);
+        assert_eq!(offset_of!(OdbSt, aut), 4);
+        assert_eq!(offset_of!(OdbSt, run), 6);
+        assert_eq!(offset_of!(OdbSt, motion), 8);
+        assert_eq!(offset_of!(OdbSt, mstb), 10);
+        assert_eq!(offset_of!(OdbSt, emergency), 12);
+        assert_eq!(offset_of!(OdbSt, alarm), 14);
+        assert_eq!(offset_of!(OdbSt, edit), 16);
+    }
+
+    /// PR0：`ODBSYS`（0i/30i 族）ABI 回归——2+2+2+2+4+4+2 = 18B。
+    /// 旧 `axes: [u8; 4]`（20B）与 `fwlib.cs ODBSYS` 不符，已修正为 `[u8; 2]`。
+    #[test]
+    fn odbsys_abi_layout_locked() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<OdbSys>(), 18, "ODBSYS 必须 18B");
+        assert_eq!(offset_of!(OdbSys, addinfo), 0);
+        assert_eq!(offset_of!(OdbSys, max_axis), 2);
+        assert_eq!(offset_of!(OdbSys, cnc_type), 4);
+        assert_eq!(offset_of!(OdbSys, mt_type), 6);
+        assert_eq!(offset_of!(OdbSys, series), 8);
+        assert_eq!(offset_of!(OdbSys, version), 12);
+        assert_eq!(offset_of!(OdbSys, axes), 16);
     }
 }
