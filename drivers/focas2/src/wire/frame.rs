@@ -49,6 +49,9 @@ impl PacketType {
     pub const GENERIC_RESPONSE: Self = Self(0x2102);
 
     /// 是否 GENERIC 族（`0x2101/0x2102` 才有 subpacket 层）。
+    /// PR2+ 的 operation 分发用；PR1 的 session 按显式 expected type 校验，
+    /// 此 helper 保留供未来分发（未使用告警允许）。
+    #[allow(dead_code)]
     pub fn is_generic(self) -> bool {
         self == Self::GENERIC_REQUEST || self == Self::GENERIC_RESPONSE
     }
@@ -211,8 +214,9 @@ pub fn request_subpacket(control_device: u16, function: u32, args: [i32; 5]) -> 
 }
 
 /// GENERIC payload 解码：`count + length 自描述 subpacket[]`。
-/// 每个 subpacket 按自身 length 切（不搜 magic、不假设等长），
-/// 数量/边界不符即 `Malformed`（调用方判 session 失效）。
+/// 每个 subpacket 按自身 length 切（不搜 magic、不假设等长）；
+/// 消费完 count 个后 payload 必须恰好耗尽（trailing garbage 即错）。
+/// 数量/边界/尾部任一不符即 `Malformed`（调用方判 session 失效）。
 pub fn decode_generic_payload(payload: &[u8]) -> Result<Vec<GenericSubpacket>, FrameError> {
     if payload.len() < 2 {
         return Err(FrameError::Malformed);
@@ -236,7 +240,9 @@ pub fn decode_generic_payload(payload: &[u8]) -> Result<Vec<GenericSubpacket>, F
         });
         off += len;
     }
-    if out.len() != count {
+    // count 个 subpacket 必须恰好耗尽 payload（frame length → count →
+    // subpacket length 精确闭合；trailing bytes 说明边界已错位）。
+    if out.len() != count || off != payload.len() {
         return Err(FrameError::Malformed);
     }
     Ok(out)
@@ -380,6 +386,20 @@ mod tests {
         let mut lied = encode_generic_request(&subs);
         lied[1] = 0x02;
         assert_eq!(decode_generic_payload(&lied), Err(FrameError::Malformed));
+    }
+
+    /// GENERIC 解码：trailing garbage 即错（frame length → count →
+    /// subpacket length 必须精确闭合；多余字节说明边界错位）。
+    #[test]
+    fn generic_trailing_bytes_rejected() {
+        let subs = vec![request_subpacket(0x0001, 0x0001_0018, [0, 0, 0, 0, 0])];
+        let mut payload = encode_generic_request(&subs);
+        payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            decode_generic_payload(&payload),
+            Err(FrameError::Malformed),
+            "count=1 的合法 subpacket 后跟 4B 垃圾必须拒绝"
+        );
     }
 
     /// `PacketType` 开放：未知类型可表示、可比较，不重构 parser。

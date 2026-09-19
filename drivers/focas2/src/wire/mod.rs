@@ -10,40 +10,51 @@
 
 use std::fmt;
 
+/// fixture 回归（`#[cfg(test)]`：crate 内部直测生产 codec，不出 crate）。
+/// `pub(crate)` 的 items 仅测试构建可见：`pub(crate) use` 重导出在非测试
+/// 构建下未使用是预期的（fixture 回归与 loopback/单测同属测试面）。
+#[cfg(test)]
+pub(crate) mod fixture_tests;
 /// frame 编解码（见 `frame.rs`）。
-pub mod frame;
+pub(crate) mod frame;
 /// TCP 会话（见 `session.rs`）。
-pub mod session;
+pub(crate) mod session;
 /// client + typed ops + adapter（见 `wire.rs`；与本模块同名是历史命名，
 /// 未来 operation 增多拆分子模块时再改名，现在不动）。
+/// `#[allow]` 压 inception（改名留待拆分时）。
 #[allow(clippy::module_inception)]
-pub mod wire;
+pub(crate) mod wire;
 
-pub use frame::PacketType;
 #[allow(unused_imports)]
-pub use frame::{FocasFrame, GenericSubpacket};
-pub use session::WireSession;
-pub use wire::{FocasClient, StatusInfo, SystemInfo, WireFocasApi};
+pub(crate) use frame::{FocasFrame, GenericSubpacket, PacketType};
+#[allow(unused_imports)]
+pub(crate) use session::WireSession;
+#[allow(unused_imports)]
+pub(crate) use wire::{FocasClient, StatusInfo, SystemInfo};
+// `WireFocasApi` 是 `wire_probe` 唯一需要的诊断入口（经 `wire_pub` 窄口出 crate）。
+pub use wire::WireFocasApi;
 
 // ---------------------------------------------------------------------------
-// Fixture 回归 helpers（tests + wire_probe 共用；生产路径不用）
+// Fixture 回归（`#[cfg(test)]`）：crate 内部直测生产 codec。
+// fixture 文件仍在 `tests/fixtures/wire/**`； helpers 不出 crate。
 // ---------------------------------------------------------------------------
 
-/// fixture 根（`drivers/focas2/tests/fixtures/wire/`，相对 workspace root）。
-/// 调用方（integration test / example）按需拼接组名。
-pub fn fixture_dir() -> std::path::PathBuf {
-    // cargo test 的 CWD = package 根（drivers/focas2），example 同理。
+/// fixture 根（相对 package 根 `drivers/focas2`）。
+#[cfg(test)]
+pub(crate) fn fixture_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("tests/fixtures/wire")
 }
 
 /// 读 fixture 二进制（`*.bin`）。
-pub fn read_fixture_bytes(path: &std::path::Path) -> Vec<u8> {
+#[cfg(test)]
+pub(crate) fn read_fixture_bytes(path: &std::path::Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| panic!("读 fixture {path:?} 失败：{e}"))
 }
 
 /// fixture 帧切分：按 `10B header + payload_len` 精确切（Gate 0 裁决：
 /// 绝不在拼接流里搜 `00 1c` 定界）。fixture 已清洗，应恰好 N 帧。
-pub fn cut_fixture_frames(raw: &[u8]) -> Vec<Vec<u8>> {
+#[cfg(test)]
+pub(crate) fn cut_fixture_frames(raw: &[u8]) -> Vec<Vec<u8>> {
     let first = raw
         .windows(4)
         .position(|w| w == [0xA0; 4])
@@ -94,6 +105,9 @@ pub enum WireError {
     /// 请求↔响应 function 对不上（保守致命）。
     CommandMismatch,
     /// CNC 返回业务错误（`cmd + i16 != 0`，如 `EW_NOOPT`；session 保留）。
+    /// PR1 的 `0x18/0x19` 均为成功路径，此变体为 PR2+（axis/pmc/macro 等
+    /// point-local 失败）预留，未使用告警允许。
+    #[allow(dead_code)]
     Remote(i16),
     /// 未实现能力（fail-closed，如 PR1 非 Status 地址）。
     Unsupported(&'static str),

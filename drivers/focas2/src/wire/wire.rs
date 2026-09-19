@@ -15,14 +15,14 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use crate::address::FocasAddress;
-use crate::focas_api::{FocasApi, FocasSysInfo};
-use crate::wire::WireError;
-use crate::wire::frame::{
+use super::WireError;
+use super::frame::{
     FocasFrame, GenericSubpacket, PacketType, decode_generic_payload, encode_generic_request,
     request_subpacket,
 };
-use crate::wire::session::WireSession;
+use super::session::WireSession;
+use crate::address::FocasAddress;
+use crate::focas_api::{FocasApi, FocasSysInfo};
 
 use mesa_core_types::Value;
 
@@ -232,12 +232,9 @@ impl FocasClient {
     }
 }
 
-/// `0x18` 响应解码：`count=1 + 0x22 + CNC + 0x00010018 + 6×00 +
-/// u16 len(=0x12) + 18B ODBSYS`（Gate 0 B1 精确布局：sub.length `0x22`
-/// 含自身 2B，故 sub body = 32B = CNC(2)+func(4)+p(26)，
-/// p = 6×00 + `00 12` + 18B）。字符区非可打印即 `Malformed`
-/// （绝不猜；调用方判 session 失效，由上层重连后复核）。
-fn decode_system_info(resp: &FocasFrame) -> Result<SystemInfo, WireError> {
+/// `0x18` 响应解码：sub.payload = 6×00 + u16 data_len + 18B ODBSYS
+/// （B1 实测，不假设 `5×i32`）。字符区非可打印即 `Malformed`（绝不猜）。
+pub(super) fn decode_system_info(resp: &FocasFrame) -> Result<SystemInfo, WireError> {
     let subs = decode_generic_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
     let sub = find_function(&subs, DEV_CNC, FUNC_SYSINFO).ok_or(WireError::CommandMismatch)?;
     let p = &sub.payload;
@@ -274,10 +271,9 @@ fn decode_system_info(resp: &FocasFrame) -> Result<SystemInfo, WireError> {
     })
 }
 
-/// `0x19` 响应解码：多 subpacket 中找 `0x19`，`6×00 + u16 len(>=14) +
-/// 14B(7×u16 BE)`。`0xe1/0x98` 存在性不强制（只验 framing），
-/// 缺 `0x19` 即 `CommandMismatch`。
-fn decode_status_info(resp: &FocasFrame) -> Result<StatusInfo, WireError> {
+/// `0x19` 响应解码：多 subpacket 中找 `0x19`，sub.payload =
+/// 6×00 + u16 data_len + 14B(7×u16 BE)。缺 `0x19` 即 `CommandMismatch`。
+pub(super) fn decode_status_info(resp: &FocasFrame) -> Result<StatusInfo, WireError> {
     let subs = decode_generic_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
     let sub = find_function(&subs, DEV_CNC, FUNC_STATINFO).ok_or(WireError::CommandMismatch)?;
     let p = &sub.payload;
@@ -434,8 +430,8 @@ impl FocasApi for WireFocasApi {
 
 #[cfg(test)]
 mod tests {
+    use super::super::frame::{GenericSubpacket, encode_generic_request, request_subpacket};
     use super::*;
-    use crate::wire::frame::GenericSubpacket;
 
     /// Gate 0 B1 精确帧：frame#2 请求编码必须 `0x56/count=3`。
     #[test]
@@ -448,6 +444,13 @@ mod tests {
         let payload = encode_generic_request(&subs);
         assert_eq!(payload.len(), 0x56, "frame#2 必须 86B（Gate 0 B1）");
         assert_eq!(&payload[0..2], &[0x00, 0x03]);
+    }
+
+    /// Fixture 级回归入口（`tests/fixtures/wire/**`）：生产 codec 直测，
+    /// 不经测试侧复刻 decoder（见 `super::super::fixture_tests`）。
+    #[test]
+    fn fixture_production_codec_locked() {
+        super::super::fixture_tests::run_all();
     }
 
     /// Gate 0 B1：sysinfo 响应解码 7/7（`02 02 00 20 33 30 …`）。
