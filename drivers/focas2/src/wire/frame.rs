@@ -35,17 +35,17 @@ pub const MAX_PAYLOAD_LEN: usize = u16::MAX as usize;
 pub struct PacketType(pub u16);
 
 impl PacketType {
-    /// OPEN 请求（Gate 0：`a0 a0 a0 a0 00 01 01 01 00 02 00 01`）。
+    /// OPEN request packet type (`0x0101`).
     pub const OPEN_REQUEST: Self = Self(0x0101);
-    /// OPEN 响应（Gate 0：`… 00 03 01 02 01 68 …`，370B）。
+    /// OPEN response packet type (`0x0102`, Gate 0: 370B).
     pub const OPEN_RESPONSE: Self = Self(0x0102);
-    /// CLOSE 请求（Gate 0：`a0 a0 a0 a0 00 01 02 01 00 00`，10B）。
+    /// CLOSE request packet type (`0x0201`, Gate 0: 10B empty payload).
     pub const CLOSE_REQUEST: Self = Self(0x0201);
-    /// CLOSE 响应（Gate 0：`a0 a0 a0 a0 00 03 02 02 00 00`，10B）。
+    /// CLOSE response packet type (`0x0202`, Gate 0: 10B empty payload).
     pub const CLOSE_RESPONSE: Self = Self(0x0202);
-    /// GENERIC 请求（Gate 0：`0x2101`，内含 subpacket 层）。
+    /// GENERIC request packet type (`0x2101`, carries subpacket layer).
     pub const GENERIC_REQUEST: Self = Self(0x2101);
-    /// GENERIC 响应（Gate 0：`0x2102`，内含 subpacket 层）。
+    /// GENERIC response packet type (`0x2102`, carries subpacket layer).
     pub const GENERIC_RESPONSE: Self = Self(0x2102);
 
     /// 是否 GENERIC 族（`0x2101/0x2102` 才有 subpacket 层）。
@@ -99,16 +99,16 @@ impl FocasFrame {
     /// OPEN has no subpacket layer.
     pub fn open_request() -> Self {
         Self {
-            origin: 0x0001,
+            origin: REQUEST_ORIGIN,
             packet_type: PacketType::OPEN_REQUEST,
-            payload: vec![0x00, 0x02],
+            payload: vec![0x00, OPEN_GENERIC_VARIANT as u8],
         }
     }
 
     /// CLOSE 请求帧（Gate 0：10B，payload 为空）。
     pub fn close_request() -> Self {
         Self {
-            origin: 0x0001,
+            origin: REQUEST_ORIGIN,
             packet_type: PacketType::CLOSE_REQUEST,
             payload: Vec::new(),
         }
@@ -158,6 +158,26 @@ pub fn assemble(header: FrameHeader, payload: Vec<u8>) -> Result<FocasFrame, Fra
 }
 
 // ---------------------------------------------------------------------------
+// Wire layout 常量：反复出现的 byte-layout offset/length 命名，
+// 避免阅读者在脑子里记 `6/2/18/14` 各自含义（PR1 review 要求）。
+// 不引入 BinaryReader/CodecBuilder（过度设计，PR1 不做）。
+// ---------------------------------------------------------------------------
+
+/// 请求 origin（C→S；响应 origin 透传不校验，见 Gate 0）。
+pub const REQUEST_ORIGIN: u16 = 0x0001;
+/// 经直接 wire parity 验证的 GENERIC-capable OPEN variant（165 / 0i-F）。
+/// `0x0001` 建连成功但随后 GENERIC 必 RST，用途未知，不命名。
+pub const OPEN_GENERIC_VARIANT: u16 = 0x0002;
+/// GENERIC 响应 subpacket 前导：`control_device(2) + function(4)`。
+pub const SUBPACKET_HEADER_LEN: usize = 6;
+/// subpacket length 字段长度（含自身 2B）。
+pub const SUBPACKET_LEN_FIELD_LEN: usize = 2;
+/// 单个请求 subpacket 参数个数（Gate 0 request 形态：`5×i32 BE`）。
+pub const REQUEST_ARG_COUNT: usize = 5;
+/// 请求参数字节数（`5×4`）。
+pub const REQUEST_ARGS_LEN: usize = REQUEST_ARG_COUNT * 4;
+
+// ---------------------------------------------------------------------------
 // Generic subpacket 层（仅 0x2101/0x2102 内）
 // ---------------------------------------------------------------------------
 
@@ -178,9 +198,9 @@ pub struct GenericSubpacket {
 impl GenericSubpacket {
     /// 编码单个 subpacket（含 2B length 前缀）。
     pub fn encode(&self) -> Vec<u8> {
-        let body_len = 2 + 4 + self.payload.len();
-        let mut out = Vec::with_capacity(2 + body_len);
-        out.extend_from_slice(&((body_len + 2) as u16).to_be_bytes());
+        let body_len = SUBPACKET_HEADER_LEN + self.payload.len();
+        let mut out = Vec::with_capacity(SUBPACKET_LEN_FIELD_LEN + body_len);
+        out.extend_from_slice(&((body_len + SUBPACKET_LEN_FIELD_LEN) as u16).to_be_bytes());
         out.extend_from_slice(&self.control_device.to_be_bytes());
         out.extend_from_slice(&self.function.to_be_bytes());
         out.extend_from_slice(&self.payload);
@@ -201,8 +221,12 @@ pub fn encode_generic_request(subpackets: &[GenericSubpacket]) -> Vec<u8> {
 
 /// 单个请求 subpacket 构造：`control_device + function + 5×i32 BE args`
 /// （Gate 0 sysinfo/statinfo 的 request 形态；response 侧不假设此布局）。
-pub fn request_subpacket(control_device: u16, function: u32, args: [i32; 5]) -> GenericSubpacket {
-    let mut payload = Vec::with_capacity(20);
+pub fn request_subpacket(
+    control_device: u16,
+    function: u32,
+    args: [i32; REQUEST_ARG_COUNT],
+) -> GenericSubpacket {
+    let mut payload = Vec::with_capacity(REQUEST_ARGS_LEN);
     for a in args {
         payload.extend_from_slice(&a.to_be_bytes());
     }
@@ -225,18 +249,18 @@ pub fn decode_generic_payload(payload: &[u8]) -> Result<Vec<GenericSubpacket>, F
     let mut out = Vec::with_capacity(count);
     let mut off = 2;
     for _ in 0..count {
-        if off + 2 > payload.len() {
+        if off + SUBPACKET_LEN_FIELD_LEN > payload.len() {
             return Err(FrameError::Malformed);
         }
         let len = u16::from_be_bytes([payload[off], payload[off + 1]]) as usize;
-        if len < 2 + 2 + 4 || off + len > payload.len() {
+        if len < SUBPACKET_LEN_FIELD_LEN + SUBPACKET_HEADER_LEN || off + len > payload.len() {
             return Err(FrameError::Malformed);
         }
-        let body = &payload[off + 2..off + len];
+        let body = &payload[off + SUBPACKET_LEN_FIELD_LEN..off + len];
         out.push(GenericSubpacket {
             control_device: u16::from_be_bytes([body[0], body[1]]),
             function: u32::from_be_bytes([body[2], body[3], body[4], body[5]]),
-            payload: body[6..].to_vec(),
+            payload: body[SUBPACKET_HEADER_LEN..].to_vec(),
         });
         off += len;
     }

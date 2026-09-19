@@ -17,8 +17,8 @@ use tokio::sync::Mutex;
 
 use super::WireError;
 use super::frame::{
-    FocasFrame, GenericSubpacket, PacketType, decode_generic_payload, encode_generic_request,
-    request_subpacket,
+    FocasFrame, GenericSubpacket, PacketType, REQUEST_ORIGIN, decode_generic_payload,
+    encode_generic_request, request_subpacket,
 };
 use super::session::WireSession;
 use crate::address::FocasAddress;
@@ -71,6 +71,20 @@ pub struct StatusInfo {
     /// 编辑状态。
     pub edit: u16,
 }
+
+// ---------------------------------------------------------------------------
+// Wire layout 常量（PR1 review：反复出现的 offset/length 命名；
+// 不引入 BinaryReader/CodecBuilder）。
+// ---------------------------------------------------------------------------
+
+/// GENERIC 响应 subpacket 前缀（`6×00`，B1 实测）。
+pub const RESPONSE_PREFIX_LEN: usize = 6;
+/// GENERIC 响应 `data_len` 字段（u16 BE）。
+pub const DATA_LEN_FIELD_LEN: usize = 2;
+/// SYSINFO 数据体（18B ODBSYS）。
+pub const SYSINFO_DATA_LEN: usize = 18;
+/// STATINFO 数据体（14B = 7×u16）。
+pub const STATINFO_DATA_LEN: usize = 14;
 
 // ---------------------------------------------------------------------------
 // Function id（Gate 0 实测 lead；response codec 以真机为准）
@@ -135,7 +149,7 @@ impl FocasClient {
     /// `system_info`（`0x18`，单次 exchange）。返回完整 7 字段。
     pub async fn system_info(&self) -> Result<SystemInfo, WireError> {
         let req = FocasFrame {
-            origin: 0x0001,
+            origin: REQUEST_ORIGIN,
             packet_type: PacketType::GENERIC_REQUEST,
             payload: encode_generic_request(&[request_subpacket(
                 DEV_CNC,
@@ -175,7 +189,7 @@ impl FocasClient {
     pub async fn status_info(&self) -> Result<StatusInfo, WireError> {
         // frame#1 的请求在 guard 外构造（纯字节，不碰 session）。
         let pre_req = FocasFrame {
-            origin: 0x0001,
+            origin: REQUEST_ORIGIN,
             packet_type: PacketType::GENERIC_REQUEST,
             payload: encode_generic_request(&[request_subpacket(
                 DEV_CNC,
@@ -184,7 +198,7 @@ impl FocasClient {
             )]),
         };
         let req = FocasFrame {
-            origin: 0x0001,
+            origin: REQUEST_ORIGIN,
             packet_type: PacketType::GENERIC_REQUEST,
             payload: encode_generic_request(&[
                 request_subpacket(DEV_CNC, FUNC_STATINFO, [0, 0, 0, 0, 0]),
@@ -238,18 +252,22 @@ pub(super) fn decode_system_info(resp: &FocasFrame) -> Result<SystemInfo, WireEr
     let subs = decode_generic_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
     let sub = find_function(&subs, DEV_CNC, FUNC_SYSINFO).ok_or(WireError::CommandMismatch)?;
     let p = &sub.payload;
-    // B1 实测：p = 6×00 + 00 12 + 18B = 26B。
-    if p.len() < 6 + 2 + 18 {
+    // B1 实测：p = 6×00 + 00 12 + 18B。
+    if p.len() < RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + SYSINFO_DATA_LEN {
         return Err(WireError::MalformedPayload);
     }
-    if p[0..6] != [0u8; 6] {
+    if p[0..RESPONSE_PREFIX_LEN] != [0u8; RESPONSE_PREFIX_LEN] {
         return Err(WireError::MalformedPayload);
     }
-    let data_len = u16::from_be_bytes([p[6], p[7]]) as usize;
-    if data_len != 18 || p.len() < 6 + 2 + 18 {
+    let data_len =
+        u16::from_be_bytes([p[RESPONSE_PREFIX_LEN], p[RESPONSE_PREFIX_LEN + 1]]) as usize;
+    if data_len != SYSINFO_DATA_LEN
+        || p.len() < RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + SYSINFO_DATA_LEN
+    {
         return Err(WireError::MalformedPayload);
     }
-    let d = &p[8..8 + 18];
+    let d = &p[RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN
+        ..RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + SYSINFO_DATA_LEN];
     let ascii = |b: &[u8]| -> Result<String, WireError> {
         let s = String::from_utf8_lossy(b)
             .trim_matches('\0')
@@ -277,17 +295,21 @@ pub(super) fn decode_status_info(resp: &FocasFrame) -> Result<StatusInfo, WireEr
     let subs = decode_generic_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
     let sub = find_function(&subs, DEV_CNC, FUNC_STATINFO).ok_or(WireError::CommandMismatch)?;
     let p = &sub.payload;
-    if p.len() < 6 + 2 + 14 {
+    if p.len() < RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + STATINFO_DATA_LEN {
         return Err(WireError::MalformedPayload);
     }
-    if p[0..6] != [0u8; 6] {
+    if p[0..RESPONSE_PREFIX_LEN] != [0u8; RESPONSE_PREFIX_LEN] {
         return Err(WireError::MalformedPayload);
     }
-    let data_len = u16::from_be_bytes([p[6], p[7]]) as usize;
-    if data_len < 14 || p.len() < 6 + 2 + data_len {
+    let data_len =
+        u16::from_be_bytes([p[RESPONSE_PREFIX_LEN], p[RESPONSE_PREFIX_LEN + 1]]) as usize;
+    if data_len < STATINFO_DATA_LEN || p.len() < RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + data_len
+    {
         return Err(WireError::MalformedPayload);
     }
-    let d = &p[8..8 + 14];
+    let d = &p[RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN
+        ..RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + STATINFO_DATA_LEN];
+    // 7×u16 BE：aut/run/motion/mstb/emergency/alarm/edit（Gate 0 B1/B2 双闭合）。
     let u = |i: usize| u16::from_be_bytes([d[i], d[i + 1]]);
     Ok(StatusInfo {
         aut: u(0),
