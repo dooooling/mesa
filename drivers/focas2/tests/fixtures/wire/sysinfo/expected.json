@@ -1,0 +1,12 @@
+{
+  "operation": "system_info",
+  "native": {
+    "addinfo": 514,
+    "max_axis": 32,
+    "cnc_type": "30",
+    "mt_type": "M",
+    "series": "G31Z",
+    "version": "10.0",
+    "axes": "03"
+  }
+}
