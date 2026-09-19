@@ -22,9 +22,10 @@ mod wire;
 
 pub use address::{AddressError, FocasAddress, parse_address};
 pub use focas_api::{FakeFocasApi, FocasApi, NativeFocasApi};
-/// Wire 测试/工具入口（fixture helpers + typed results 复用）：
-/// `wire_probe` 与 integration test 用；生产 `FocasDriver` 路径不用。
-/// `FocasFrame/GenericSubpacket` 由 frame 单测覆盖，此处不重复导出。
+/// Wire 开发诊断入口（`#[doc(hidden)]`：仅 `wire_probe` 与 fixture test 用，
+/// 非稳定 API；`FocasClient/WireSession/FocasFrame` 等内部协议类型不承诺
+/// 兼容，未来重构可改。生产 `FocasDriver` 路径不用此模块）。
+#[doc(hidden)]
 pub mod wire_pub {
     pub use crate::wire::{
         FocasClient, StatusInfo, SystemInfo, WireError, WireFocasApi, WireSession,

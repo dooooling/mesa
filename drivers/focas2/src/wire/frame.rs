@@ -87,9 +87,13 @@ impl FocasFrame {
         out
     }
 
-    /// OPEN 请求帧（Gate 0 修正：payload `00 02`；单流复现证实
-    /// `00 01` 后发 GENERIC 必 RST，`00 02` 才接受后续请求。
-    /// OPEN 无 subpacket 层）。
+    /// OPEN request payload 00 02 (verified GENERIC-capable variant).
+    ///
+    /// Evidence (165 / 0i-F): Gate 0 capture saw FWLIB emit both 00 01
+    /// and 00 02; PR1 single-stream experiment proved 00 01 connects
+    /// but RSTs on GENERIC while 00 02 serves SYSINFO/STATINFO.
+    /// Purpose of 00 01 stays unknown (no control/monitor naming).
+    /// OPEN has no subpacket layer.
     pub fn open_request() -> Self {
         Self {
             origin: 0x0001,
