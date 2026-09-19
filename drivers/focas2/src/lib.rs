@@ -16,9 +16,21 @@
 mod address;
 mod focas_api;
 mod native;
+/// FOCAS Ethernet Pure Rust Wire（PR1 foundation）：frame/session/
+/// typed operations，FOCAS-local 私有实现（`drivers/focas2` 外不可见）。
+mod wire;
 
 pub use address::{AddressError, FocasAddress, parse_address};
 pub use focas_api::{FakeFocasApi, FocasApi, NativeFocasApi};
+/// Wire 开发诊断入口（`#[doc(hidden)]` 非稳定、诊断专用）：
+/// 唯一出口是 `WireFocasApi`（`wire_probe` 所需）；`FocasClient/WireSession/
+/// FocasFrame/GenericSubpacket` 等内部协议类型不出 crate（fixture 回归已
+/// 移入 `wire::fixture_tests`，crate 内部直测生产 codec）。
+/// 生产 `FocasDriver` 路径不用此模块。
+#[doc(hidden)]
+pub mod wire_pub {
+    pub use crate::wire::WireFocasApi;
+}
 
 use std::sync::Arc;
 use std::time::Duration;
