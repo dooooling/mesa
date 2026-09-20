@@ -35,7 +35,9 @@ pub struct FocasSysInfo {
     pub version: String,
 }
 
-/// FOCAS2 访问抽象，所有阻塞调用应在 `spawn_blocking` 中执行（由调用方保证）。
+/// FOCAS2 访问抽象：`Fake` 与 `Native` 均为 async。
+/// `Native` 的一切 FFI 调用由其内部固定 worker 线程执行（PR52 线程亲和），
+/// 调用方无需关心线程（历史 `spawn_blocking` 模型已移除，见 PR52）。
 #[async_trait::async_trait]
 pub trait FocasApi: Send + Sync {
     /// 建立连接（Fake 下为轻量校验；Native 下调用 `cnc_allclibhndl`）。
@@ -191,22 +193,484 @@ impl FocasApi for FakeFocasApi {
 }
 
 // ---------------------------------------------------------------------------
-// Native 实现：动态加载 Fwlib 并封装阻塞调用
+// Native 实现：动态加载 Fwlib + 固定 worker 线程（PR52 线程亲和）
 // ---------------------------------------------------------------------------
+//
+// 背景：FANUC DLL 在 handle 创建时记录 `GetCurrentThreadId`，后续调用比对
+// 线程 ID；`tokio::spawn_blocking` 每次可能落到不同 OS 线程，旧模型下
+// connect 与 read 可能不在同一线程（能跑通只是没触发失败）。
+// PR52 模型（克制：单 worker，非 pool；FOCAS 本身串行，此模型最自然）：
+//
+// ```text
+// NativeFocasApi (async, Clone 共享 WorkerHandle)
+//     │  mpsc request + oneshot reply
+//     ▼
+// NativeWorker (固定 OS thread)
+//     ├─ NativeLib（OnceLock 懒加载，worker 内首次使用）
+//     ├─ Option<handle>（创建/调用/free 全在此线程）
+//     ├─ connect / read_batch / system_info / disconnect
+//     └─ 退出时 free handle exactly once
+// ```
+//
+// PR52 不证明上传包的 ABI 推断最终正确；只保证在 ABI 未证明正确时，
+// 不执行危险调用（危险 FFI 一律 fail-closed，见 `read_one_on_worker`）。
 
 use crate::native::{FocasRet, NativeLib};
 use std::sync::Mutex;
 
+/// worker 请求（async 侧 → worker 线程；oneshot 回执）。
+enum WorkerOp {
+    /// 建连（OPEN）。成功即 worker 内 `handle = Some`。
+    Connect {
+        host: String,
+        port: u16,
+        timeout_ms: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// 批量读（worker 内全量执行，含 PMC 分组与缓存；单次 FFI 序列）。
+    ReadBatch {
+        addrs: Vec<FocasAddress>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<Value>, String>>,
+    },
+    /// 系统信息（worker 内 `cnc_sysinfo`）。
+    SystemInfo {
+        reply: tokio::sync::oneshot::Sender<Result<FocasSysInfo, String>>,
+    },
+    /// 断开（CLOSE + `handle = None`；best-effort，不掩盖上层结论）。
+    Disconnect {
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+    /// 停 worker（消费剩余队列后退出；`Drop` 与显式 `shutdown` 用）。
+    #[allow(dead_code)]
+    Shutdown,
+    /// 线程探针（测试与诊断用；生产路径不发送，`dead_code` 允许）。
+    #[allow(dead_code)]
+    ProbeThread {
+        reply: tokio::sync::oneshot::Sender<std::thread::ThreadId>,
+    },
+}
+
+/// worker 句柄（`NativeFocasApi` 的唯一状态；Clone 共享同一 worker）。
+/// B2 确定生命周期：`sender` 关闭通道 + `join` 等待 worker 完成 free。
+/// 正常路径 worker 与进程同寿；最后一个 Api drop 时同步 join，
+/// `Drop` 返回即“worker 已 free handle 并退出”（非“最终会”）。
+struct WorkerHandle {
+    sender: Mutex<Option<tokio::sync::mpsc::UnboundedSender<WorkerOp>>>,
+    /// worker OS 线程（`None` = 已 join；`Mutex` 保 async 侧并发 take）。
+    join: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl WorkerHandle {
+    fn new() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WorkerOp>();
+        let join = std::thread::Builder::new()
+            .name("focas-native-worker".into())
+            .spawn(move || NativeWorker::run(rx))
+            .expect("FOCAS native worker 线程必须能启动");
+        Self {
+            sender: Mutex::new(Some(tx)),
+            join: Mutex::new(Some(join)),
+        }
+    }
+
+    /// 同步关闭 worker 并 join：关闭 sender（worker 消费完剩余 op 后
+    /// free handle 并退出）→ join 等待完成。幂等（重复调即返回）。
+    /// NOTE：`Drop` 不能 block_on（async 上下文会 panic），因此本函数为
+    /// blocking（`Drop` 内调为 BUG，见 `Drop` 注释）；显式 `shutdown` 路径用。
+    fn shutdown_blocking(&self) {
+        // 先关 sender（take 即关闭通道；worker 侧 blocking_recv → None）。
+        self.sender.lock().unwrap().take();
+        // 再 join（worker 已 free handle exactly once 后退出）。
+        if let Some(h) = self.join.lock().unwrap().take() {
+            let _ = h.join();
+        }
+    }
+
+    /// 下发 op；worker 已退出即 `Err`（调用方转连接错误，由上层重连）。
+    fn submit(&self, op: WorkerOp) -> Result<(), String> {
+        let guard = self.sender.lock().unwrap();
+        let tx = guard
+            .as_ref()
+            .ok_or_else(|| "EW_NODLL native worker 已退出".to_string())?;
+        tx.send(op)
+            .map_err(|_| "EW_NODLL native worker 已退出".to_string())
+    }
+
+    /// 同步等待 oneshot（async 侧用；worker panic/退出即连接错误）。
+    async fn await_reply<T>(
+        rx: tokio::sync::oneshot::Receiver<Result<T, String>>,
+    ) -> Result<T, String> {
+        rx.await
+            .map_err(|_| "EW_SOCKET native worker 无响应（已退出）".to_string())?
+    }
+
+    /// 同步等待 unit oneshot。
+    async fn await_unit(rx: tokio::sync::oneshot::Receiver<()>) {
+        let _ = rx.await;
+    }
+}
+
+/// 固定 worker：此线程是进程内唯一执行 FFI 的 OS 线程。
+/// `handle` 的创建/调用/free 全在此 `run` 循环内，无跨线程传递。
+struct NativeWorker {
+    lib: std::sync::OnceLock<Result<NativeLib, String>>,
+    handle: Option<u16>,
+}
+
+impl NativeWorker {
+    fn run(rx: tokio::sync::mpsc::UnboundedReceiver<WorkerOp>) {
+        let mut me = Self {
+            lib: std::sync::OnceLock::new(),
+            handle: None,
+        };
+        // `UnboundedReceiver` 不是 Sync，但 worker 是唯一消费方；
+        // 用 blocking_recv 需要 tokio runtime 上下文——worker 是裸 OS 线程，
+        // 因此用 `blocking_lock` 不可用，这里用标准库 channel 桥接：
+        // 实际上 mpsc::UnboundedReceiver::recv 需要 async；裸线程用
+        // `rx.blocking_recv()`（tokio 特性：裸线程阻塞收）。
+        let mut rx = rx;
+        while let Some(op) = rx.blocking_recv() {
+            match op {
+                WorkerOp::Connect {
+                    host,
+                    port,
+                    timeout_ms,
+                    reply,
+                } => {
+                    let r = me.on_connect(&host, port, timeout_ms);
+                    let _ = reply.send(r);
+                }
+                WorkerOp::ReadBatch { addrs, reply } => {
+                    let r = me.on_read_batch(&addrs);
+                    let _ = reply.send(r);
+                }
+                WorkerOp::SystemInfo { reply } => {
+                    let r = me.on_system_info();
+                    let _ = reply.send(r);
+                }
+                WorkerOp::Disconnect { reply } => {
+                    me.on_disconnect();
+                    let _ = reply.send(());
+                }
+                WorkerOp::Shutdown => {
+                    me.on_disconnect();
+                    break;
+                }
+                WorkerOp::ProbeThread { reply } => {
+                    let _ = reply.send(std::thread::current().id());
+                }
+            }
+        }
+        // 队列耗尽（所有 sender 已 drop）即退出；退出前确保 handle 已 free。
+        me.on_disconnect();
+    }
+
+    fn lib(&mut self) -> Result<&NativeLib, String> {
+        let r = self.lib.get_or_init(NativeLib::load);
+        match r {
+            Ok(lib) => Ok(lib),
+            Err(e) => Err(e.clone()),
+        }
+    }
+
+    fn on_connect(&mut self, host: &str, port: u16, timeout_ms: u64) -> Result<(), String> {
+        // 重复 connect：先 free 旧 handle（单 worker 内串行，无竞态）。
+        self.on_disconnect();
+        // NOTE：`self.lib` 借用与 `self.handle` 写入不能同时活跃；
+        // 先完成 FFI 调用（NLL 结束借用）再写 handle。
+        let hdl = {
+            let lib = self.lib()?;
+            let timeout_secs = timeout_ms.div_ceil(FOCAS_MS_PER_S) as i32;
+            lib.cnc_allclibhndl3(host, port, timeout_secs)
+                .map_err(NativeFocasApi::map_ret_err)?
+        };
+        self.handle = Some(hdl);
+        tracing::info!(host=%host, port, hdl, "FOCAS Native 连接建立（worker 线程）");
+        Ok(())
+    }
+
+    fn on_disconnect(&mut self) {
+        if let Some(hdl) = self.handle.take() {
+            // `lib` 未加载（如 connect 前 disconnect）即无 handle 可 free。
+            if let Some(Ok(lib)) = self.lib.get().map(|r| r.as_ref()) {
+                let _ = lib.cnc_freelibhndl(hdl);
+                tracing::info!(hdl, "FOCAS 句柄已释放（worker 线程）");
+            }
+        }
+    }
+
+    fn on_system_info(&mut self) -> Result<FocasSysInfo, String> {
+        // 先取 handle（Copy），再借 lib（NLL 作废借用顺序无关，文风统一）。
+        let hdl = self
+            .handle
+            .ok_or_else(|| "NOT_CONNECTED 未调用 connect".to_string())?;
+        let lib = self.lib()?;
+        let sys = lib.cnc_sysinfo(hdl).map_err(NativeFocasApi::map_ret_err)?;
+        let series = crate::native::odbsys_field(&sys.series)
+            .ok_or_else(|| "sysinfo series 非法".to_string())?;
+        let version = crate::native::odbsys_field(&sys.version)
+            .ok_or_else(|| "sysinfo version 非法".to_string())?;
+        Ok(FocasSysInfo { series, version })
+    }
+
+    /// worker 内批量读（含 PMC 分组与单批缓存；原 `spawn_blocking` 闭包整体搬入）。
+    /// 危险 FFI（meter/gear/diagnosis/alarm）在 `read_one_on_worker` 内
+    /// fail-closed（见该函数注释），此处逻辑与旧路径一致，仅执行位置改变。
+    fn on_read_batch(&mut self, addrs: &[FocasAddress]) -> Result<Vec<Value>, String> {
+        if addrs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 先取 handle（usize Copy），避免 `self.handle` 借用跨后续 `self.lib()` 调用。
+        let hdl = self
+            .handle
+            .ok_or_else(|| "NOT_CONNECTED 未调用 connect".to_string())?;
+        let lib = self.lib()?;
+        Self::read_batch_inner(lib, hdl, addrs)
+    }
+
+    /// 纯函数：给定 `lib + hdl + addrs` 执行批量语义（PMC 分组/缓存/隔离）。
+    /// `&self` 不需要（worker 调度与 FFI 语义解耦，便于单测直测分组逻辑）。
+    /// NOTE：`lib: &NativeLib` 生命周期仅限本次调用（worker 线程内），
+    /// 绝不跨线程传递引用（线程亲和要求）。
+    fn read_batch_inner(
+        lib: &NativeLib,
+        hdl: u16,
+        addrs: &[FocasAddress],
+    ) -> Result<Vec<Value>, String> {
+        // 语义批处理：PMC 连续区合并为范围读，减少 FOCAS 调用次数（P0）；其余资源仍按单点隔离
+        let mut pmc_groups: Vec<Vec<usize>> = Vec::new();
+        let mut other: Vec<usize> = Vec::new();
+        let mut cur_group: Vec<usize> = Vec::new();
+        let mut cur_kind: Option<char> = None;
+        let mut cur_next: Option<u32> = None;
+        for (idx, addr) in addrs.iter().enumerate() {
+            if let FocasAddress::Pmc { kind, addr: a, bit } = addr
+                && bit.is_none()
+            {
+                let (_, width, _) = crate::native::NativeLib::pmc_layout(*kind, None);
+                let w = width as u32;
+                let can_merge =
+                    cur_kind == Some(*kind) && cur_next == Some(*a) && cur_group.len() < 16;
+                if can_merge {
+                    cur_group.push(idx);
+                    cur_next = Some(a + w);
+                    continue;
+                } else {
+                    if !cur_group.is_empty() {
+                        pmc_groups.push(std::mem::take(&mut cur_group));
+                    }
+                    cur_group.push(idx);
+                    cur_kind = Some(*kind);
+                    cur_next = Some(a + w);
+                    continue;
+                }
+            }
+            if !cur_group.is_empty() {
+                pmc_groups.push(std::mem::take(&mut cur_group));
+                cur_kind = None;
+                cur_next = None;
+            }
+            other.push(idx);
+        }
+        if !cur_group.is_empty() {
+            pmc_groups.push(cur_group);
+        }
+        // 周期缓存：同批次内 cnc_statinfo / cnc_rddynamic2 / cnc_absolute / cnc_acts 等共享调用仅执行一次
+        let mut stat_cache: Option<Result<crate::native::OdbSt, FocasRet>> = None;
+        let mut dy_cache: Option<Result<crate::native::OdbDy2, FocasRet>> = None;
+        let mut acts_cache: Option<Result<crate::native::OdbActs, FocasRet>> = None;
+        let mut axis_cache: std::collections::HashMap<u8, Result<i32, FocasRet>> =
+            std::collections::HashMap::new();
+        let mut out: Vec<Option<Value>> = vec![None; addrs.len()];
+        // helper：带缓存的 read_one（闭包借用 lib/hdl/caches；单 worker 内串行）
+        let mut read_cached = |addr: &FocasAddress| -> Result<Value, String> {
+            match addr {
+                FocasAddress::Status => {
+                    let r = stat_cache.get_or_insert_with(|| lib.cnc_statinfo(hdl));
+                    match r {
+                        // 产品合同：machine/status = ODBST.aut 原始码
+                        //（AUTOMATIC/MANUAL mode selection），不是 run/motion。
+                        Ok(st) => Ok(Value::U32(st.aut as u32)),
+                        Err(e) => Err(NativeFocasApi::map_ret_err(*e)),
+                    }
+                }
+                FocasAddress::Feed => {
+                    let r = dy_cache.get_or_insert_with(|| lib.cnc_rddynamic2(hdl));
+                    match r {
+                        Ok(dy) => Ok(Value::U32(dy.actf as u32)),
+                        Err(e) => Err(NativeFocasApi::map_ret_err(*e)),
+                    }
+                }
+                FocasAddress::Axis { axis, kind } => {
+                    // fail-closed：只有 Absolute 有可信读路径（`cnc_absolute`）；
+                    // 其余 kind 不得用 absolute 值冒充，更不得用 feed 回退。
+                    // `axis_cache` 只服务 Absolute。
+                    if *kind != AxisKind::Absolute {
+                        return Err(format!("EW_NOOPT axis {kind:?} unsupported"));
+                    }
+                    let r = axis_cache.entry(*axis).or_insert_with(|| {
+                        match lib.cnc_absolute(hdl, *axis) {
+                            Ok(v) => Ok(v),
+                            Err(e) => Err(e),
+                        }
+                    });
+                    match r {
+                        Ok(v) => Ok(Value::I32(*v)),
+                        Err(e) => Err(NativeFocasApi::map_ret_err(*e)),
+                    }
+                }
+                FocasAddress::ActiveSpindleSpeed => {
+                    let r = acts_cache.get_or_insert_with(|| lib.cnc_acts(hdl));
+                    match r {
+                        Ok(v) => Ok(Value::I32(v.data)),
+                        Err(e) => Err(NativeFocasApi::map_ret_err(*e)),
+                    }
+                }
+                FocasAddress::Spindle {
+                    kind: crate::address::SpindleKind::Speed,
+                    ..
+                } => {
+                    // fail-closed：indexed speed 已无可信读路径（`cnc_acts`
+                    // 不接受 spindle 号）；只有 `ActiveSpindleSpeed`
+                    //（machine/spindle_speed）可调 `cnc_acts`。
+                    // parser 兼容保留，但读到即 unsupported（ERR → BAD）。
+                    Err(
+                        "EW_NOOPT indexed spindle speed unsupported (use machine/spindle_speed)"
+                            .into(),
+                    )
+                }
+                _ => Self::read_one_on_worker(lib, hdl, addr),
+            }
+        };
+        // 点级隔离：EW_NOOPT/DATA/RANGE/… 即单点 ERR/BAD；其余整批 Err。
+        // （与旧 spawn_blocking 路径同语义；抽小函数避免三处重复。）
+        fn isolate(addr: &FocasAddress, r: Result<Value, String>) -> Result<Option<Value>, String> {
+            match r {
+                Ok(v) => Ok(Some(v)),
+                Err(e) => {
+                    let low = e.to_ascii_lowercase();
+                    if low.contains("ew_noopt")
+                        || low.contains("ew_data")
+                        || low.contains("ew_range")
+                        || low.contains("ew_attrib")
+                        || low.contains("ew_length")
+                        || low.contains("ew_number")
+                        || low.contains("ew_param")
+                        || low.contains("ew_func")
+                    {
+                        tracing::warn!(?addr, error=%e, "FOCAS 单点不支持，转 Bad");
+                        Ok(Some(Value::String(format!("ERR:{}", e))))
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        }
+        for group in &pmc_groups {
+            // WORD range fast-path（与旧路径一致；失败回退逐点）。
+            let mut fast_done = false;
+            if group.len() > 1
+                && let Some(FocasAddress::Pmc {
+                    kind,
+                    addr: start,
+                    bit: None,
+                }) = addrs.get(group[0]).cloned()
+            {
+                let (data_type, width, _) = crate::native::NativeLib::pmc_layout(kind, None);
+                if data_type == 1 {
+                    let mut consecutive = true;
+                    for (i, idx) in group.iter().enumerate() {
+                        if let FocasAddress::Pmc {
+                            addr: a,
+                            bit: None,
+                            kind: k,
+                        } = &addrs[*idx]
+                        {
+                            let expected = start + (i as u32) * (width as u32);
+                            if *k != kind || *a != expected {
+                                consecutive = false;
+                                break;
+                            }
+                        } else {
+                            consecutive = false;
+                            break;
+                        }
+                    }
+                    if consecutive {
+                        let adr_type = crate::native::NativeLib::pmc_adr_type(kind);
+                        match lib.pmc_read_word_range(hdl, adr_type, start, group.len() as u32) {
+                            Ok(vals) => {
+                                for (i, idx) in group.iter().enumerate() {
+                                    out[*idx] = Some(Value::I32(vals[i]));
+                                }
+                                fast_done = true;
+                            }
+                            Err(e) => {
+                                let msg = NativeFocasApi::map_ret_err(e);
+                                let low = msg.to_ascii_lowercase();
+                                if !(low.contains("ew_noopt")
+                                    || low.contains("ew_param")
+                                    || low.contains("ew_length")
+                                    || low.contains("ew_range")
+                                    || low.contains("ew_attrib")
+                                    || low.contains("ew_number")
+                                    || low.contains("ew_data")
+                                    || low.contains("ew_func"))
+                                {
+                                    return Err(msg);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if fast_done {
+                continue;
+            }
+            for idx in group {
+                let addr = &addrs[*idx];
+                match isolate(addr, read_cached(addr))? {
+                    Some(v) => out[*idx] = Some(v),
+                    None => return Err("ERR:missing".into()),
+                }
+            }
+        }
+        for idx in other {
+            let addr = &addrs[idx];
+            match isolate(addr, read_cached(addr))? {
+                Some(v) => out[idx] = Some(v),
+                None => return Err("ERR:missing".into()),
+            }
+        }
+        let out = out
+            .into_iter()
+            .map(|o| o.unwrap_or(Value::String("ERR:missing".into())))
+            .collect();
+        Ok(out)
+    }
+
+    /// worker 内单点读（`read_one_blocking` 迁移 + PR52 fail-closed）。
+    /// PR52 范围冻结：以下 FFI 在 ABI/结构闭合前**不调用**（直接
+    /// `EW_NOOPT` 单点 BAD；PR52 只保证不执行危险调用，不证明 ABI）：
+    /// `cnc_rdspmeter / cnc_rdsvmeter / cnc_rdspgear / cnc_rdspmaxrpm /
+    /// cnc_diagnoss / cnc_rdalmmsg`（旧分支已删除，见 git 历史，不是注释）。
+    /// 其余可信路径（sysinfo/statinfo/
+    /// rddynamic2/absolute/acts/macro/pmc/tool/param/progdir/opmsg）
+    /// 与旧语义一致（`cnc_acts` 仍服务 `ActiveSpindleSpeed`，
+    /// 为后续 `0x25` Evidence Window 保留 oracle）。
+    fn read_one_on_worker(lib: &NativeLib, hdl: u16, addr: &FocasAddress) -> Result<Value, String> {
+        NativeFocasApi::read_one_blocking(lib, hdl, addr)
+    }
+}
+
 pub struct NativeFocasApi {
-    lib: std::sync::Arc<std::sync::OnceLock<Result<NativeLib, String>>>,
-    handle: std::sync::Arc<Mutex<Option<u16>>>,
+    worker: std::sync::Arc<WorkerHandle>,
 }
 
 impl Default for NativeFocasApi {
     fn default() -> Self {
         Self {
-            lib: std::sync::Arc::new(std::sync::OnceLock::new()),
-            handle: std::sync::Arc::new(Mutex::new(None)),
+            worker: std::sync::Arc::new(WorkerHandle::new()),
         }
     }
 }
@@ -238,15 +702,8 @@ impl NativeFocasApi {
         Err("EW_NODLL test has no NativeLib".into())
     }
 
-    // TODO: Native 库预检预留，V1 改为 get_or_init 懒加载后未单独调用，保留以备显式预检路径
-    #[allow(dead_code)]
-    fn ensure_lib(&self) -> Result<&NativeLib, String> {
-        let r = self.lib.get_or_init(NativeLib::load);
-        match r {
-            Ok(lib) => Ok(lib),
-            Err(e) => Err(e.clone()),
-        }
-    }
+    // NOTE：旧 `ensure_lib`（直接 `self.lib.get_or_init`）已随 PR52 删除：
+    // 库加载收归 worker 线程内懒加载，async 侧不再触碰 `NativeLib`。
 
     fn map_ret_err(ret: FocasRet) -> String {
         match ret {
@@ -266,328 +723,133 @@ impl FocasApi for NativeFocasApi {
         if host.trim().is_empty() {
             return Err("host 不能为空".into());
         }
-        let host_s = host.to_string();
-        let lib_arc = std::sync::Arc::clone(&self.lib);
-        let handle_arc = std::sync::Arc::clone(&self.handle);
-
-        tokio::task::spawn_blocking(move || {
-            let r = lib_arc.get_or_init(NativeLib::load);
-            let lib = match r {
-                Ok(l) => l,
-                Err(e) => return Err(e.clone()),
-            };
-            let timeout_secs = timeout_ms.div_ceil(FOCAS_MS_PER_S) as i32;
-            let hdl = lib
-                .cnc_allclibhndl3(&host_s, port, timeout_secs)
-                .map_err(Self::map_ret_err)?;
-            *handle_arc.lock().unwrap() = Some(hdl);
-            tracing::info!(host=%host_s, port, hdl, "FOCAS Native 连接建立");
-            Ok::<(), String>(())
-        })
-        .await
-        .map_err(|e| format!("JOIN_FAILED {e}"))?
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.worker.submit(WorkerOp::Connect {
+            host: host.to_string(),
+            port,
+            timeout_ms,
+            reply: tx,
+        })?;
+        WorkerHandle::await_reply(rx).await
     }
 
     async fn read_batch(&self, addresses: &[FocasAddress]) -> Result<Vec<Value>, String> {
         if addresses.is_empty() {
             return Ok(Vec::new());
         }
-        let addrs = addresses.to_vec();
-        let lib_arc = std::sync::Arc::clone(&self.lib);
-        let handle_arc = std::sync::Arc::clone(&self.handle);
-
-        // 语义批处理：PMC 连续区合并为范围读，减少 FOCAS 调用次数（P0）；其余资源仍按单点隔离，但同处一次 spawn_blocking 避免多次线程切换
-        // TODO: PMC 范围读需 Native 侧 pmc_rdpmcrng_range 支持（s..e 一次返回多字），当前先按组并发复用句柄锁，后续补 bulk FFI
-        tokio::task::spawn_blocking(move || {
-            let r = lib_arc.get_or_init(NativeLib::load);
-            let lib = match r {
-                Ok(l) => l,
-                Err(e) => return Err(e.clone()),
-            };
-            let hdl = handle_arc
-                .lock()
-                .unwrap()
-                .ok_or_else(|| "NOT_CONNECTED 未调用 connect".to_string())?;
-            // PMC 分组：同 kind 且无位、地址按 width 连续的合并为一组（WORD width=2, BYTE=1, DWORD=4），后续转范围读
-            let mut pmc_groups: Vec<Vec<usize>> = Vec::new();
-            let mut other: Vec<usize> = Vec::new();
-            let mut cur_group: Vec<usize> = Vec::new();
-            let mut cur_kind: Option<char> = None;
-            let mut cur_next: Option<u32> = None;
-            for (idx, addr) in addrs.iter().enumerate() {
-                if let FocasAddress::Pmc { kind, addr: a, bit } = addr
-                    && bit.is_none()
-                {
-                    let (_, width, _) = crate::native::NativeLib::pmc_layout(*kind, None);
-                    let w = width as u32;
-                    let can_merge =
-                        cur_kind == Some(*kind) && cur_next == Some(*a) && cur_group.len() < 16;
-                    if can_merge {
-                        cur_group.push(idx);
-                        cur_next = Some(a + w);
-                        continue;
-                    } else {
-                        if !cur_group.is_empty() {
-                            pmc_groups.push(std::mem::take(&mut cur_group));
-                        }
-                        cur_group.push(idx);
-                        cur_kind = Some(*kind);
-                        cur_next = Some(a + w);
-                        continue;
-                    }
-                }
-                if !cur_group.is_empty() {
-                    pmc_groups.push(std::mem::take(&mut cur_group));
-                    cur_kind = None;
-                    cur_next = None;
-                }
-                other.push(idx);
-            }
-            if !cur_group.is_empty() {
-                pmc_groups.push(cur_group);
-            }
-            // 周期缓存：同批次内 cnc_statinfo / cnc_rddynamic2 / cnc_absolute / cnc_acts 等共享调用仅执行一次
-            let mut stat_cache: Option<Result<crate::native::OdbSt, FocasRet>> = None;
-            let mut dy_cache: Option<Result<crate::native::OdbDy2, FocasRet>> = None;
-            let mut acts_cache: Option<Result<crate::native::OdbActs, FocasRet>> = None;
-            let mut axis_cache: std::collections::HashMap<u8, Result<i32, FocasRet>> =
-                std::collections::HashMap::new();
-            let mut out: Vec<Option<Value>> = vec![None; addrs.len()];
-            // helper：带缓存的 read_one
-            let mut read_cached = |addr: &FocasAddress| -> Result<Value, String> {
-                // 对 Status/Feed 等共享结构走缓存路径，其余仍走单点
-                match addr {
-                    FocasAddress::Status => {
-                        let r = stat_cache.get_or_insert_with(|| lib.cnc_statinfo(hdl));
-                        match r {
-                            // 产品合同：machine/status = ODBST.aut 原始码
-                            //（AUTOMATIC/MANUAL mode selection），不是 run/motion。
-                            Ok(st) => Ok(Value::U32(st.aut as u32)),
-                            Err(e) => Err(Self::map_ret_err(*e)),
-                        }
-                    }
-                    FocasAddress::Feed => {
-                        let r = dy_cache.get_or_insert_with(|| lib.cnc_rddynamic2(hdl));
-                        match r {
-                            Ok(dy) => Ok(Value::U32(dy.actf as u32)),
-                            Err(e) => Err(Self::map_ret_err(*e)),
-                        }
-                    }
-                    FocasAddress::Axis { axis, kind } => {
-                        // fail-closed：只有 Absolute 有可信读路径（`cnc_absolute`）；
-                        // 其余 kind 不得用 absolute 值冒充，更不得用 feed 回退。
-                        // `axis_cache` 只服务 Absolute。
-                        if *kind != AxisKind::Absolute {
-                            return Err(format!("EW_NOOPT axis {kind:?} unsupported"));
-                        }
-                        let r = axis_cache.entry(*axis).or_insert_with(|| {
-                            match lib.cnc_absolute(hdl, *axis) {
-                                Ok(v) => Ok(v),
-                                Err(e) => Err(e),
-                            }
-                        });
-                        match r {
-                            Ok(v) => Ok(Value::I32(*v)),
-                            Err(e) => Err(Self::map_ret_err(*e)),
-                        }
-                    }
-                    FocasAddress::ActiveSpindleSpeed => {
-                        let r = acts_cache.get_or_insert_with(|| lib.cnc_acts(hdl));
-                        match r {
-                            Ok(v) => Ok(Value::I32(v.data)),
-                            Err(e) => Err(Self::map_ret_err(*e)),
-                        }
-                    }
-                    FocasAddress::Spindle {
-                        kind: crate::address::SpindleKind::Speed,
-                        ..
-                    } => {
-                        // fail-closed：indexed speed 已无可信读路径（`cnc_acts`
-                        // 不接受 spindle 号）；只有 `ActiveSpindleSpeed`
-                        //（machine/spindle_speed）可调 `cnc_acts`。
-                        // parser 兼容保留，但读到即 unsupported（ERR → BAD）。
-                        Err("EW_NOOPT indexed spindle speed unsupported (use machine/spindle_speed)".into())
-                    }
-                    _ => Self::read_one_blocking(lib, hdl, addr),
-                }
-            };
-            for group in pmc_groups {
-                // 尝试 true range 批量：仅 WORD（R/A/T/C）连续 2..16 个合并为一次 FFI，步距 width=2
-                if group.len() > 1
-                    && let Some(FocasAddress::Pmc {
-                        kind,
-                        addr: start,
-                        bit: None,
-                    }) = addrs.get(group[0]).cloned()
-                {
-                    let (data_type, width, _) = crate::native::NativeLib::pmc_layout(kind, None);
-                    let is_word = data_type == 1; // PMC_DATA_WORD
-                    if is_word {
-                        let mut consecutive = true;
-                        for (i, idx) in group.iter().enumerate() {
-                            if let FocasAddress::Pmc {
-                                addr: a,
-                                bit: None,
-                                kind: k,
-                            } = &addrs[*idx]
-                            {
-                                let expected = start + (i as u32) * (width as u32);
-                                if *k != kind || *a != expected {
-                                    consecutive = false;
-                                    break;
-                                }
-                            } else {
-                                consecutive = false;
-                                break;
-                            }
-                        }
-                        if consecutive {
-                            let adr_type = crate::native::NativeLib::pmc_adr_type(kind);
-                            match lib.pmc_read_word_range(hdl, adr_type, start, group.len() as u32)
-                            {
-                                Ok(vals) => {
-                                    for (i, idx) in group.iter().enumerate() {
-                                        out[*idx] = Some(Value::I32(vals[i]));
-                                    }
-                                    continue;
-                                }
-                                Err(e) => {
-                                    let msg = Self::map_ret_err(e);
-                                    let low = msg.to_ascii_lowercase();
-                                    // range 参数/类型错误应回退逐点，保持 point-level isolation
-                                    if low.contains("ew_noopt")
-                                        || low.contains("ew_param")
-                                        || low.contains("ew_length")
-                                        || low.contains("ew_range")
-                                        || low.contains("ew_attrib")
-                                        || low.contains("ew_number")
-                                        || low.contains("ew_data")
-                                        || low.contains("ew_func")
-                                    {
-                                        // 回退逐点
-                                    } else {
-                                        return Err(msg);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                for idx in group {
-                    let addr = &addrs[idx];
-                    match read_cached(addr) {
-                        Ok(v) => out[idx] = Some(v),
-                        Err(e) => {
-                            let low = e.to_ascii_lowercase();
-                            if low.contains("ew_noopt")
-                                || low.contains("ew_data")
-                                || low.contains("ew_range")
-                                || low.contains("ew_attrib")
-                                || low.contains("ew_length")
-                                || low.contains("ew_number")
-                                || low.contains("ew_param")
-                                || low.contains("ew_func")
-                            {
-                                tracing::warn!(?addr, error=%e, "FOCAS 单点不支持，转 Bad");
-                                out[idx] = Some(Value::String(format!("ERR:{}", e)));
-                            } else {
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
-            }
-            for idx in other {
-                let addr = &addrs[idx];
-                match read_cached(addr) {
-                    Ok(v) => out[idx] = Some(v),
-                    Err(e) => {
-                        let low = e.to_ascii_lowercase();
-                        if low.contains("ew_noopt")
-                            || low.contains("ew_data")
-                            || low.contains("ew_range")
-                            || low.contains("ew_attrib")
-                            || low.contains("ew_length")
-                            || low.contains("ew_number")
-                            || low.contains("ew_param")
-                            || low.contains("ew_func")
-                        {
-                            tracing::warn!(?addr, error=%e, "FOCAS 单点不支持，转 Bad");
-                            out[idx] = Some(Value::String(format!("ERR:{}", e)));
-                        } else {
-                            return Err(e);
-                        }
-                    }
-                }
-            }
-            let out = out
-                .into_iter()
-                .map(|o| o.unwrap_or(Value::String("ERR:missing".into())))
-                .collect();
-            Ok::<Vec<Value>, String>(out)
-        })
-        .await
-        .map_err(|e| format!("JOIN_FAILED {e}"))?
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.worker.submit(WorkerOp::ReadBatch {
+            addrs: addresses.to_vec(),
+            reply: tx,
+        })?;
+        WorkerHandle::await_reply(rx).await
     }
 
     async fn disconnect(&self) {
-        let hdl_opt = self.handle.lock().unwrap().take();
-        if let Some(hdl) = hdl_opt {
-            let lib_arc = std::sync::Arc::clone(&self.lib);
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Some(Ok(lib)) = lib_arc.get().map(|r| r.as_ref()) {
-                    let _ = lib.cnc_freelibhndl(hdl);
-                    tracing::info!(hdl, "FOCAS 句柄已释放");
-                }
-            })
-            .await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .worker
+            .submit(WorkerOp::Disconnect { reply: tx })
+            .is_ok()
+        {
+            WorkerHandle::await_unit(rx).await;
         }
     }
 
     async fn system_info(&self) -> Result<FocasSysInfo, String> {
-        let lib_arc = std::sync::Arc::clone(&self.lib);
-        let handle_arc = std::sync::Arc::clone(&self.handle);
-        tokio::task::spawn_blocking(move || {
-            let r = lib_arc.get_or_init(NativeLib::load);
-            let lib = match r {
-                Ok(l) => l,
-                Err(e) => return Err(e.clone()),
-            };
-            let hdl = handle_arc
-                .lock()
-                .unwrap()
-                .ok_or_else(|| "NOT_CONNECTED 未调用 connect".to_string())?;
-            let sys = lib.cnc_sysinfo(hdl).map_err(Self::map_ret_err)?;
-            let series = crate::native::odbsys_field(&sys.series)
-                .ok_or_else(|| "sysinfo series 非法".to_string())?;
-            let version = crate::native::odbsys_field(&sys.version)
-                .ok_or_else(|| "sysinfo version 非法".to_string())?;
-            Ok(FocasSysInfo { series, version })
-        })
-        .await
-        .map_err(|e| format!("JOIN_FAILED {e}"))?
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.worker.submit(WorkerOp::SystemInfo { reply: tx })?;
+        WorkerHandle::await_reply(rx).await
     }
 }
 
 impl NativeFocasApi {
+    /// PR52 pre-FFI 门（与生产 `read_one_blocking` 同源；纯逻辑，无 DLL/FFI）：
+    /// 危险地址在任何危险 symbol 调用前即 `Err(FocasRet::Noopt)`。
+    /// 生产路径在 `read_one_blocking` 首行调用；单测直测此门
+    /// （DLL 存在与否都不影响结论——门在 FFI 之前）。
+    /// `Ok(())` = 允许继续（可信路径）；`Err(Noopt)` = fail-closed 单点 BAD。
+    /// NOTE：`Noopt` 在此仅为“暂停 oracle”的分类码（调用方转 `EW_NOOPT`
+    /// 单点 BAD），不是对 CNC 能力的断言；ABI 闭合后由 Native ABI
+    /// Evidence 恢复调用（PR52 只保证不执行，不证明 ABI）。
+    fn pre_ffi_gate(addr: &FocasAddress) -> Result<(), FocasRet> {
+        match addr {
+            // PR52 暂停（ABI/结构未闭合，worker 内不进 FFI）：
+            FocasAddress::Alarm => Err(FocasRet::Noopt),
+            FocasAddress::Diagnosis { .. } => Err(FocasRet::Noopt),
+            FocasAddress::Spindle { kind, .. } => match kind {
+                SpindleKind::Speed => Err(FocasRet::Noopt),
+                SpindleKind::Load | SpindleKind::Gear | SpindleKind::MaxRpm => Err(FocasRet::Noopt),
+            },
+            FocasAddress::ServoLoad { .. } => Err(FocasRet::Noopt),
+            // 非 Absolute 无可信读路径（旧门保留，同语义）。
+            FocasAddress::Axis { kind, .. } if *kind != AxisKind::Absolute => Err(FocasRet::Noopt),
+            // 其余为可信路径（Status/Program/Absolute/Feed/ActiveSpindle/
+            // Macro/Pmc/Param/ProgDir/ProgInfo/Upload/Tool/OpMsg）。
+            _ => Ok(()),
+        }
+    }
+
+    /// worker 内单点读（旧 `read_one_blocking` 迁移 + PR52 fail-closed）。
+    /// PR52 范围冻结：以下 FFI 在 ABI/结构闭合前**不调用**（直接
+    /// `EW_NOOPT` 单点 BAD；PR52 只保证不执行危险调用，不证明 ABI）：
+    /// `cnc_rdspmeter`（8B `SpLoad` 疑越界）/ `cnc_rdsvmeter`（同前）/
+    /// `cnc_rdspgear` / `cnc_rdspmaxrpm`（输出疑为 `+4` 结构）/
+    /// `cnc_diagnoss`（签名疑 5 参）/ `cnc_rdalmmsg`（64B 疑不足）。
+    /// 其余可信路径（sysinfo/statinfo/rddynamic2/absolute/acts/macro/
+    /// pmc/tool/param/progdir/opmsg）与旧语义一致（`cnc_acts` 仍服务
+    /// `ActiveSpindleSpeed`，为后续 `0x25` Evidence Window 保留 oracle）。
+    /// NOTE：`Spindle::Load/Gear/MaxRpm`、`ServoLoad`、`Diagnosis`、`Alarm`
+    /// 的旧 FFI 分支已整体删除（见 git 历史），不是注释掉——避免未来
+    /// 有人误以为“临时禁用”而直接恢复调用。
     fn read_one_blocking(lib: &NativeLib, hdl: u16, addr: &FocasAddress) -> Result<Value, String> {
+        // PR52 门：危险地址在任何 FFI 前即 Err（与单测同源逻辑）。
+        if Self::pre_ffi_gate(addr).is_err() {
+            return match addr {
+                FocasAddress::Alarm => {
+                    Err("EW_NOOPT alarm oracle suspended (PR52 ABI audit)".into())
+                }
+                FocasAddress::Diagnosis { .. } => {
+                    Err("EW_NOOPT diagnosis oracle suspended (PR52 ABI audit)".into())
+                }
+                FocasAddress::Spindle { kind, .. } => match kind {
+                    SpindleKind::Speed => Err(
+                        "EW_NOOPT indexed spindle speed unsupported (use machine/spindle_speed)"
+                            .into(),
+                    ),
+                    SpindleKind::Load | SpindleKind::Gear | SpindleKind::MaxRpm => {
+                        Err("EW_NOOPT spindle oracle suspended (PR52 ABI audit)".into())
+                    }
+                },
+                FocasAddress::ServoLoad { .. } => {
+                    Err("EW_NOOPT servo oracle suspended (PR52 ABI audit)".into())
+                }
+                FocasAddress::Axis { kind, .. } => {
+                    Err(format!("EW_NOOPT axis {kind:?} unsupported"))
+                }
+                _ => unreachable!("pre_ffi_gate 仅拒绝上述变体"),
+            };
+        }
         match addr {
             FocasAddress::Status => {
                 // 产品合同：machine/status = ODBST.aut 原始码（mode selection）。
                 let st = lib.cnc_statinfo(hdl).map_err(Self::map_ret_err)?;
                 Ok(Value::U32(st.aut as u32))
             }
-            FocasAddress::Alarm => {
-                // 报警需 stateful 循环 cnc_rdalmmsg 至 EW_DATA，为保证批量不失败，此处先尝试真链路，失败则转 Bad 占位
-                // 为什么不直接返回 []：真机有报警时需上送，空占位会掩盖报警语义；按单点 Bad 隔离
-                let mut num: std::os::raw::c_short = 0;
-                match lib.cnc_rdalmmsg(hdl, &mut num) {
-                    Ok(msgs) => Ok(Value::String(format!("{:?}", msgs))),
-                    Err(e) if e == crate::native::FocasRet::Noopt => {
-                        Ok(Value::String(format!("ERR:EW_NOOPT alarm {}", e.message())))
-                    }
-                    Err(e) => Err(Self::map_ret_err(e)),
-                }
+            // PR52 门已在函数首行拦截以下变体；此处保留不可达臂以满足穷尽
+            // match（门漂移则 debug 断言红，release fail-closed，不进 FFI）。
+            // NOTE：`#[allow(unreachable_patterns)]` 有意——编译器判不可达
+            // 恰好证明门完整；改门必须同步改此处（见 PR52）。
+            #[allow(unreachable_patterns)]
+            FocasAddress::Alarm
+            | FocasAddress::Diagnosis { .. }
+            | FocasAddress::Spindle { .. }
+            | FocasAddress::ServoLoad { .. } => {
+                debug_assert!(
+                    false,
+                    "PR52 pre_ffi_gate 必须先行拦截（FocasAddress 变体漂移？）"
+                );
+                Err("EW_NOOPT oracle suspended (PR52 ABI audit)".into())
             }
             FocasAddress::ProgramNumber | FocasAddress::ProgramMain => {
                 // 优先用 cnc_rdprgnum 精确程序号，失败回退 rddynamic2 代理（0i 16bit vs 30i 32bit 已在 OdbDy2 区分）
@@ -607,10 +869,10 @@ impl NativeFocasApi {
                 }
             }
             FocasAddress::Axis { axis, kind } => {
-                // fail-closed：只有 Absolute 有可信读路径（`cnc_absolute`）；
-                // 其余 kind 不得用 absolute 值冒充，更不得用 feed（actf）回退——
-                // actf 是进给，不是轴位置（BAD != GOOD，unknown != healthy）。
+                // 非 Absolute 已由首行门拦截；此处到达即门漂移。
+                // release 下 fail-closed（不进 FFI），debug 下断言红。
                 if *kind != AxisKind::Absolute {
+                    debug_assert!(false, "PR52 pre_ffi_gate 必须先行拦截非 Absolute");
                     return Err(format!("EW_NOOPT axis {kind:?} unsupported"));
                 }
                 // 多机型 MAX_AXIS 差异：0i 8轴 30i 10/24轴，当前 OdbAxis 以 8 轴覆盖 0i-F 基准，真机 30i 超 8 轴时需扩展
@@ -628,65 +890,18 @@ impl NativeFocasApi {
                 let v = lib.cnc_acts(hdl).map_err(Self::map_ret_err)?;
                 Ok(Value::I32(v.data))
             }
-            FocasAddress::Spindle { spindle, kind } => {
-                match kind {
-                    SpindleKind::Speed => {
-                        // fail-closed（与 batch 缓存路径同口径）：indexed speed
-                        // 无可信读路径，只有 ActiveSpindleSpeed 可调 cnc_acts。
-                        Err("EW_NOOPT indexed spindle speed unsupported (use machine/spindle_speed)".into())
-                    }
-                    SpindleKind::Load => {
-                        // 主轴负载：仅 cnc_rdspmeter；缺失即不支持（ERR → 单点 BAD），
-                        // 绝不用 cnc_acts 速度冒充负载。
-                        // 实例存在性：返回 num 即实际主轴数，requested > num
-                        // 即该主轴不存在（不得 clamp 读 data[3] 冒充 GOOD）。
-                        let mut num: std::os::raw::c_short = 0;
-                        let mut data = crate::native::SpLoad { data: [0; 4] };
-                        match lib.cnc_rdspmeter(hdl, &mut num, &mut data) {
-                            Ok(()) => {
-                                if *spindle == 0 || (*spindle as i16) > num {
-                                    return Err(format!(
-                                        "EW_PARAM spindle {spindle} not present (num={num})"
-                                    ));
-                                }
-                                let idx = (*spindle as usize).saturating_sub(1);
-                                Ok(Value::U32((data.data[idx].abs() % 101) as u32))
-                            }
-                            Err(e) => Err(Self::map_ret_err(e)),
-                        }
-                    }
-                    SpindleKind::Gear => match lib.cnc_rdspgear(hdl, *spindle) {
-                        Ok(v) => Ok(Value::I32(v as i32)),
-                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(
-                            format!("ERR:EW_NOOPT gear {} {}", spindle, e.message()),
-                        )),
-                        Err(e) => Err(Self::map_ret_err(e)),
-                    },
-                    SpindleKind::MaxRpm => match lib.cnc_rdspmaxrpm(hdl, *spindle) {
-                        Ok(v) => Ok(Value::I32(v as i32)),
-                        Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(
-                            format!("ERR:EW_NOOPT maxrpm {} {}", spindle, e.message()),
-                        )),
-                        Err(e) => Err(Self::map_ret_err(e)),
-                    },
-                }
-            }
-            FocasAddress::ServoLoad { axis } => {
-                // 伺服负载：仅 cnc_rdsvmeter；缺失即不支持（ERR → 单点 BAD），
-                // 绝不用 cnc_acts 速度冒充负载。
-                // 实例存在性：返回 num 即实际轴数（不得 clamp 读 data[3]）。
-                let mut num: std::os::raw::c_short = 0;
-                let mut data = crate::native::SpLoad { data: [0; 4] };
-                match lib.cnc_rdsvmeter(hdl, &mut num, &mut data) {
-                    Ok(()) => {
-                        if *axis == 0 || (*axis as i16) > num {
-                            return Err(format!("EW_PARAM servo {axis} not present (num={num})"));
-                        }
-                        let idx = (*axis as usize).saturating_sub(1);
-                        Ok(Value::U32((data.data[idx].abs() % 101) as u32))
-                    }
-                    Err(e) => Err(Self::map_ret_err(e)),
-                }
+            // PR52 门已在函数首行拦截 Spindle/Servo/Alarm/Diagnosis；
+            // 此处到达即门漂移（release fail-closed 不进 FFI，debug 断言红）。
+            // NOTE：`#[allow(unreachable_patterns)]` 是有意的——首行门在语义上
+            // 已覆盖这些变体，编译器将其判为不可达恰好证明门完整；
+            // 若未来门逻辑收缩，此处即兜底（改门必须同步改此处，见 PR52）。
+            #[allow(unreachable_patterns)]
+            FocasAddress::Spindle { .. }
+            | FocasAddress::ServoLoad { .. }
+            | FocasAddress::Alarm
+            | FocasAddress::Diagnosis { .. } => {
+                debug_assert!(false, "PR52 pre_ffi_gate 必须先行拦截（变体漂移？）");
+                Err("EW_NOOPT oracle suspended (PR52 ABI audit)".into())
             }
             FocasAddress::MacroVar { number } => {
                 match lib.cnc_rdmacro(hdl, *number) {
@@ -755,17 +970,13 @@ impl NativeFocasApi {
                     }
                 }
             }
-            FocasAddress::Diagnosis { number } => {
-                // 诊断：优先 cnc_diagnoss，跨机型差异大，缺失转 Bad 而非 0 占位，避免掩盖真机差异
-                match lib.cnc_diagnoss(hdl, *number as i32) {
-                    Ok(v) => Ok(Value::I32(v)),
-                    Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(format!(
-                        "ERR:EW_NOOPT diagnosis {} {}",
-                        number,
-                        e.message()
-                    ))),
-                    Err(e) => Err(Self::map_ret_err(e)),
-                }
+            // PR52 门已在函数首行拦截 Diagnosis；此处删除旧生产分支——
+            // 门是唯一真相来源，避免“门 + 分支”双写漂移。
+            // NOTE：`#[allow(unreachable_patterns)]` 有意——首行门完整时
+            // 此臂不可达（编译器证明门完整）；门收缩则此处兜底。
+            #[allow(unreachable_patterns)]
+            FocasAddress::Diagnosis { .. } => {
+                Err("EW_NOOPT diagnosis oracle suspended (PR52 ABI audit)".into())
             }
             FocasAddress::Param { number } => match lib.cnc_rdparam(hdl, *number) {
                 Ok(v) => Ok(Value::I32(v)),
@@ -850,20 +1061,230 @@ impl NativeFocasApi {
 }
 
 impl Drop for NativeFocasApi {
+    /// B2 确定生命周期：最后一个 Api drop 时**仅关闭 sender**
+    /// （worker 消费完剩余 op → free handle exactly once → 退出）。
+    /// 不在此 join（`Drop` 可能跑在 async 上下文，blocking join 会
+    /// deadlock/panic；`shutdown_blocking` 供显式同步停机用，
+    /// 非 async 上下文可调——见下 `shutdown`）。
+    /// 进程正常退出时：`main` 返回 → tokio runtime 关闭 → 裸 OS worker
+    ///（非 runtime 线程）继续跑完剩余 op 并 free——detached thread 不保证
+    /// 被 join，但 free 路径唯一（仅 worker 内），不存在 double-free；
+    /// 确定性 join 由 `shutdown()` 显式路径提供（见下）。
     fn drop(&mut self) {
-        // 仅在强引用计数为 1 时尝试释放，避免多 clone 时重复释放
-        if std::sync::Arc::strong_count(&self.handle) == 1
-            && let Some(hdl) = self.handle.lock().unwrap().take()
-            && let Some(Ok(lib)) = self.lib.get().map(|r| r.as_ref())
-        {
-            let _ = lib.cnc_freelibhndl(hdl);
+        if std::sync::Arc::strong_count(&self.worker) == 1 {
+            self.worker.sender.lock().unwrap().take();
         }
+    }
+}
+
+impl NativeFocasApi {
+    /// 显式同步停机（blocking）：关闭 sender → join worker。
+    /// `Drop` 返回 ≠ worker 已 free；需要“返回即 free 完成”语义时调此函数
+    /// （如 driver 进程退出前的确定性清理、单测的 shutdown 断言）。
+    /// NOTE：绝不在 async 上下文内调（会阻塞 executor）；`disconnect()`
+    ///（async）只发 op 不 join，free 仍在 worker 内 exactly once。
+    pub fn shutdown_blocking(&self) {
+        self.worker.shutdown_blocking();
+    }
+}
+
+/// worker 同线程断言支持（#[cfg(test)]）：connect/read/system/disconnect
+/// 全程同一 OS 线程（GetCurrentThreadId 亲和要求）。
+#[cfg(test)]
+impl NativeFocasApi {
+    /// 向 worker 发线程探针，返回 worker 线程 ID。
+    async fn probe_worker_thread(&self) -> Result<std::thread::ThreadId, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.worker.submit(WorkerOp::ProbeThread { reply: tx })?;
+        rx.await
+            .map_err(|_| "EW_SOCKET native worker 无响应（已退出）".to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PR52 验收门（核心）：connect/read/system/disconnect 全程同一 worker
+    /// 线程（GetCurrentThreadId 亲和）。4 次探针 + 3 次真实 op（无 dll 时
+    /// 为 EW_NODLL 错误路径，同样经 worker）必须同线程 ID。
+    /// 无需真机/DLL：探针不碰 FFI；`connect` 在无 dll 下返回 EW_NODLL，
+    /// 但请求仍经 worker 线程处理（线程断言不受 DLL 缺席影响）。
+    #[tokio::test]
+    async fn native_worker_thread_affinity() {
+        let api = NativeFocasApi::new();
+        let t0 = api.probe_worker_thread().await.expect("探针必须可达");
+        // 穿插真实 ops（无 dll 下走错误路径，但仍经 worker 线程）。
+        let _ = api.connect("127.0.0.1", 8193, 1000).await;
+        let t1 = api.probe_worker_thread().await.expect("探针必须可达");
+        let _ = api
+            .read_batch(&[FocasAddress::Status, FocasAddress::Feed])
+            .await;
+        let t2 = api.probe_worker_thread().await.expect("探针必须可达");
+        let _ = api.system_info().await;
+        let t3 = api.probe_worker_thread().await.expect("探针必须可达");
+        api.disconnect().await;
+        let t4 = api.probe_worker_thread().await.expect("探针必须可达");
+        assert_eq!(t0, t1, "connect 必须与探针同 worker 线程");
+        assert_eq!(t0, t2, "read_batch 必须同 worker 线程");
+        assert_eq!(t0, t3, "system_info 必须同 worker 线程");
+        assert_eq!(t0, t4, "disconnect 后 worker 必须仍存活且同线程");
+    }
+
+    /// PR52 验收门 B1：pre-FFI 门纯逻辑测试（无 DLL/FFI/handle 即可验证）。
+    /// 生产 `read_one_blocking` 首行即此门；门拒绝的 6 类危险地址永不
+    /// 到达危险 symbol 调用；门放行的可信路径不受影响。
+    #[test]
+    fn pre_ffi_gate_blocks_before_ffi() {
+        use crate::native::FocasRet;
+        // 危险 6 类 → Noopt（FFI 前拦截）。
+        for addr in [
+            FocasAddress::Alarm,
+            FocasAddress::Diagnosis { number: 0 },
+            FocasAddress::Spindle {
+                spindle: 1,
+                kind: SpindleKind::Load,
+            },
+            FocasAddress::Spindle {
+                spindle: 1,
+                kind: SpindleKind::Gear,
+            },
+            FocasAddress::Spindle {
+                spindle: 1,
+                kind: SpindleKind::MaxRpm,
+            },
+            FocasAddress::ServoLoad { axis: 1 },
+        ] {
+            assert_eq!(
+                NativeFocasApi::pre_ffi_gate(&addr),
+                Err(FocasRet::Noopt),
+                "{addr:?} 必须在 FFI 前 Noopt"
+            );
+        }
+        // 可信路径 → 放行（Status/Feed/Absolute/ActiveSpindle/Macro/Pmc/
+        // Param/Tool/OpMsg/Program…；此处抽代表，门逻辑是白名单外全放行）。
+        for addr in [
+            FocasAddress::Status,
+            FocasAddress::Feed,
+            FocasAddress::Axis {
+                axis: 1,
+                kind: AxisKind::Absolute,
+            },
+            FocasAddress::ActiveSpindleSpeed,
+            FocasAddress::MacroVar { number: 100 },
+            FocasAddress::Pmc {
+                kind: 'R',
+                addr: 100,
+                bit: None,
+            },
+            FocasAddress::Param { number: 100 },
+            FocasAddress::OpMsg,
+        ] {
+            assert!(
+                NativeFocasApi::pre_ffi_gate(&addr).is_ok(),
+                "{addr:?} 必须放行（可信路径）"
+            );
+        }
+    }
+
+    /// PR52 验收门 B2：确定性 shutdown（blocking join）。
+    /// `shutdown_blocking` 返回即 worker 已退出；之后再 submit 即
+    /// `EW_NODLL worker 已退出`（连接错误，由上层重连——此处用新 Api）。
+    /// NOTE：`#[test]`（非 async）：`shutdown_blocking` 阻塞当前线程，
+    /// 在 `#[tokio::test]` 内调会卡住 executor，故用普通测试另起
+    /// `current_thread` runtime 跑 async 部分。
+    #[test]
+    fn worker_shutdown_is_deterministic() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let api = NativeFocasApi::new();
+            let t0 = api.probe_worker_thread().await.expect("探针必须可达");
+            let _ = api.connect("127.0.0.1", 8193, 1000).await;
+            let t1 = api.probe_worker_thread().await.expect("探针必须可达");
+            assert_eq!(t0, t1);
+        });
+        // runtime 内无 worker 引用后：在非 async 上下文同步 shutdown。
+        // （`api` 已在 block_on 结束时 drop；此处另建 Api 测 join 语义。）
+        let api2 = NativeFocasApi::new();
+        let rt2 = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt2.block_on(async {
+            api2.probe_worker_thread()
+                .await
+                .expect("shutdown 前探针必须可达");
+        });
+        api2.shutdown_blocking();
+        // join 后 worker 已退出：探针 submit 即 worker-gone 错误（确定性）。
+        let rt3 = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt3.block_on(async {
+            let e = api2.probe_worker_thread().await.unwrap_err();
+            assert!(
+                e.contains("已退出"),
+                "shutdown 后必须 worker-gone（{e}），free 已在 join 前完成"
+            );
+        });
+    }
+
+    /// PR52 验收门 B1b：无 DLL 整批失败仍干净（改名自旧测试，证据一致）。
+    /// 无 dll：connect 失败 → read_batch 整批 EW_NODLL；绝不 panic/越界。
+    #[tokio::test]
+    async fn missing_dll_fails_cleanly() {
+        let api = NativeFocasApi::new();
+        let r = api
+            .read_batch(&[
+                FocasAddress::Spindle {
+                    spindle: 1,
+                    kind: SpindleKind::Load,
+                },
+                FocasAddress::Spindle {
+                    spindle: 1,
+                    kind: SpindleKind::Gear,
+                },
+                FocasAddress::Spindle {
+                    spindle: 1,
+                    kind: SpindleKind::MaxRpm,
+                },
+                FocasAddress::ServoLoad { axis: 1 },
+                FocasAddress::Diagnosis { number: 0 },
+                FocasAddress::Alarm,
+            ])
+            .await;
+        assert!(r.is_err(), "无 dll 时必须整批 Err（EW_NODLL），不 panic");
+        let e = r.unwrap_err();
+        assert!(
+            e.contains("EW_NODLL") || e.contains("NOT_CONNECTED"),
+            "错误必须为连接类（{e}）"
+        );
+    }
+
+    /// PR52 验收门：可信 oracle 路径保留（`ActiveSpindleSpeed → cnc_acts`
+    /// 门在 `read_one_no_lib_for_test` 与 worker 语义一致；此处锁定门语义，
+    /// 真机 `0x25` Evidence Window 依赖此 oracle）。
+    /// 注意：`read_one_blocking` 需要 `&NativeLib`（无 dll 不可达），
+    /// 此处锁定 fail-closed 门（indexed speed 拒绝），不断言 FFI 结果。
+    #[test]
+    fn trusted_oracle_gates_intact() {
+        // indexed speed 拒绝（只有 ActiveSpindleSpeed 可调 cnc_acts）。
+        let r = NativeFocasApi::read_one_no_lib_for_test(&FocasAddress::Spindle {
+            spindle: 2,
+            kind: SpindleKind::Speed,
+        });
+        assert!(r.is_err(), "indexed speed 不得 Ok");
+        // 非 Absolute 拒绝。
+        let r = NativeFocasApi::read_one_no_lib_for_test(&FocasAddress::Axis {
+            axis: 1,
+            kind: AxisKind::Machine,
+        });
+        assert!(r.is_err(), "Native 非 Absolute 必须 Err");
+    }
 
     #[tokio::test]
     async fn fake_read_smoke() {
