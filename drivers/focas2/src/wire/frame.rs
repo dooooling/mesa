@@ -101,7 +101,7 @@ impl FocasFrame {
         Self {
             origin: REQUEST_ORIGIN,
             packet_type: PacketType::OPEN_REQUEST,
-            payload: vec![0x00, OPEN_GENERIC_VARIANT as u8],
+            payload: OPEN_GENERIC_VARIANT.to_be_bytes().to_vec(),
         }
     }
 

@@ -126,8 +126,8 @@ pub const FEED_DATA_LEN: usize = 8;
 // Function id（Gate 0 实测 lead；response codec 以真机为准）
 // ---------------------------------------------------------------------------
 
-/// CNC 设备（Gate 0：`0x0001`；PMC=`0x0002`，PR1 未用）。
-const DEV_CNC: u16 = 0x0001;
+/// CNC 设备（Gate 0：`0x0001`；PMC=`0x0002`，PR2 feed 未用）。
+pub(super) const DEV_CNC: u16 = 0x0001;
 /// `system_info`（Gate 0：`00 01 00 18`）。
 const FUNC_SYSINFO: u32 = 0x0001_0018;
 /// `status_info`（Gate 0：`00 01 00 19`）。
@@ -137,7 +137,7 @@ const FUNC_UNKNOWN_E1: u32 = 0x0001_00e1;
 /// statinfo 序列伴随 function（未知语义；只验 framing 后跳过）。
 const FUNC_UNKNOWN_98: u32 = 0x0001_0098;
 /// `feed_rate`（feed 证据 PASS：`00 01 00 24`，`0x24-only` 真机冻结）。
-const FUNC_FEED: u32 = 0x0001_0024;
+pub(super) const FUNC_FEED: u32 = 0x0001_0024;
 
 // ---------------------------------------------------------------------------
 // FocasClient：typed operations（串行，session guard 覆盖完整 operation）
@@ -412,7 +412,10 @@ pub(super) fn decode_feed_rate(resp: &FocasFrame) -> Result<FeedRate, WireError>
     let subs = decode_generic_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
     let sub = find_function(&subs, DEV_CNC, FUNC_FEED).ok_or(WireError::CommandMismatch)?;
     let p = &sub.payload;
-    if p.len() < RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + FEED_DATA_LEN {
+    // 精确闭合：p 必须恰好 = 6×00 + u16 data_len(=8) + 8B（多 1B 即错，
+    // 与 frame length → count → subpacket length 同原则）。
+    let expected_len = RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + FEED_DATA_LEN;
+    if p.len() != expected_len {
         return Err(WireError::MalformedPayload);
     }
     if p[0..RESPONSE_PREFIX_LEN] != [0u8; RESPONSE_PREFIX_LEN] {
@@ -420,9 +423,7 @@ pub(super) fn decode_feed_rate(resp: &FocasFrame) -> Result<FeedRate, WireError>
     }
     let data_len =
         u16::from_be_bytes([p[RESPONSE_PREFIX_LEN], p[RESPONSE_PREFIX_LEN + 1]]) as usize;
-    if data_len != FEED_DATA_LEN
-        || p.len() < RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + FEED_DATA_LEN
-    {
+    if data_len != FEED_DATA_LEN {
         return Err(WireError::MalformedPayload);
     }
     let d = &p[RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN
@@ -507,39 +508,37 @@ impl FocasApi for WireFocasApi {
         }
         // 同一批共享请求：Status 走一次 status_info，Feed 走一次 feed_rate；
         // 其余 fail-closed（ERR 单点 BAD）。client 内部按 operation 持 guard。
+        // 致命 session 错误（Timeout/IO/Malformed/…）在预取阶段立即短路，
+        // 不继续碰已失效 session（point-local 的 Unsupported/Remote 才进批）。
         let need_status = addresses.iter().any(|a| matches!(a, FocasAddress::Status));
         let need_feed = addresses.iter().any(|a| matches!(a, FocasAddress::Feed));
         let status_r: Option<Result<u32, String>> = if need_status {
-            Some(
-                self.client
-                    .status_info()
-                    .await
-                    .map(|st| st.aut as u32)
-                    .map_err(|e| match Self::point_or_fatal(e) {
-                        Ok(v) => match v {
-                            Value::String(s) => s,
-                            _ => "ERR:unreachable".to_string(),
-                        },
-                        Err(fatal) => fatal,
-                    }),
-            )
+            match self.client.status_info().await {
+                Ok(st) => Some(Ok(st.aut as u32)),
+                Err(e) => match Self::point_or_fatal(e) {
+                    Ok(Value::String(s)) => Some(Err(s)),
+                    Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                    Err(fatal) => return Err(fatal),
+                },
+            }
         } else {
             None
         };
         let feed_r: Option<Result<Value, String>> = if need_feed {
-            Some(match self.client.feed_rate().await {
-                Ok(rate) => feed_to_value(&rate).map_err(|e| match Self::point_or_fatal(e) {
-                    Ok(v) => match v {
-                        Value::String(s) => s,
-                        _ => "ERR:unreachable".to_string(),
+            match self.client.feed_rate().await {
+                Ok(rate) => match feed_to_value(&rate) {
+                    Ok(v) => Some(Ok(v)),
+                    Err(e) => match Self::point_or_fatal(e) {
+                        Ok(Value::String(s)) => Some(Err(s)),
+                        Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                        Err(fatal) => return Err(fatal),
                     },
-                    Err(fatal) => fatal,
-                }),
-                Err(e) => match Self::point_or_fatal(e) {
-                    Ok(v) => Ok(v),
-                    Err(fatal) => Err(fatal),
                 },
-            })
+                Err(e) => match Self::point_or_fatal(e) {
+                    Ok(v) => Some(Ok(v)),
+                    Err(fatal) => return Err(fatal),
+                },
+            }
         } else {
             None
         };
@@ -814,5 +813,29 @@ mod tests {
             rate.scaled().unwrap_err(),
             WireError::Unsupported(_)
         ));
+    }
+
+    /// feed typed payload 内部精确闭合：trailing 4B 即使 data_len 正确也拒收
+    /// （与 frame length → count → subpacket length 同原则）。
+    #[test]
+    fn feed_trailing_payload_rejected() {
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x08]);
+        p.extend_from_slice(&[0x00, 0x00, 0x00, 0x64, 0x00, 0x0a, 0x00, 0x00]);
+        p.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_FEED,
+                payload: p,
+            }]),
+        };
+        assert_eq!(
+            decode_feed_rate(&frame).unwrap_err().to_string(),
+            WireError::MalformedPayload.to_string(),
+            "8B 后跟 4B 垃圾必须 Malformed"
+        );
     }
 }

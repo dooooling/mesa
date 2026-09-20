@@ -6,5 +6,10 @@
   "mesa": {
     "machine_feed": 100
   },
-  "note": "9pack \u540c\u6b21 Native actf=100\uff1bsingle \u63a2\u9488 mantissa=200\uff08\u4e32\u884c\u5ef6\u8fdf\u540e Native=300\uff0c\u975e\u540c\u6b21\uff09"
+  "note": "9pack \u540c\u6b21 Native actf=100\uff1bsingle \u63a2\u9488 mantissa=200\uff08\u4e32\u884c\u5ef6\u8fdf\u540e Native=300\uff0c\u975e\u540c\u6b21\uff09",
+  "source": {
+    "stream": 61043,
+    "open_variant": "00 02",
+    "capture": "feed.pcapng\u5b9a\u5411\u6293\u5305\uff08filter 165:8193\uff09\uff0c00 02 GENERIC-capable \u6570\u636e\u6d41"
+  }
 }

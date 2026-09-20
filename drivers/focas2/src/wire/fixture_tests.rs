@@ -158,17 +158,31 @@ fn feed_single_decodes() {
     assert_eq!(rate.exponent, 0);
 }
 
-/// feed 请求：生产形态 count=1/40B（`0x24-only` Gate 冻结）。
+/// feed 请求：生产编码器输出 == 捕获 fixture（`encode == request` 闭环）。
+/// 未来改坏 origin/type/args 任一字节，fixture 直接红。
 fn feed_request_locked() {
+    use super::frame::{encode_generic_request, request_subpacket};
+    use super::wire::{DEV_CNC, FUNC_FEED};
     let raw = read("feed", "feed_request.bin");
     let frames = cut_fixture_frames(&raw);
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].len(), 40, "feed 请求必须 40B（count=1）");
+    // 生产 builder 重建（与 `FocasClient::feed_rate` 同源）。
+    let built = {
+        use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+        FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_FEED,
+                [0, 0, 0, 0, 0],
+            )]),
+        }
+        .encode()
+    };
     assert_eq!(
-        &frames[0][..20],
-        &[
-            0xA0, 0xA0, 0xA0, 0xA0, 0x00, 0x01, 0x21, 0x01, 0x00, 0x1e, 0x00, 0x01, 0x00, 0x1c,
-            0x00, 0x01, 0x00, 0x01, 0x00, 0x24,
-        ]
+        frames[0], built,
+        "production encoder 必须 == captured fixture 全 40B"
     );
 }
