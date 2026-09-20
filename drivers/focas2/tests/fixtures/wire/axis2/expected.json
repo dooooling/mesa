@@ -1,0 +1,20 @@
+{
+  "operation": "axis_absolute",
+  "axis": 2,
+  "panel": {
+    "name": "Y",
+    "absolute": "-3.160"
+  },
+  "native": {
+    "value": -3160,
+    "data0": -3160,
+    "type": 2
+  },
+  "mesa": {
+    "axis_absolute": -3160
+  },
+  "source": {
+    "open_variant": "00 02",
+    "capture": "axis_a2\u5b9a\u5411\u6293\u5305\uff0c00 02 \u6570\u636e\u6d41"
+  }
+}

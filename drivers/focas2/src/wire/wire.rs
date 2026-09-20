@@ -106,6 +106,39 @@ impl FeedRate {
     }
 }
 
+/// FOCAS `axis_absolute`（`0x26`）typed 结果。axis 证据 PASS：
+/// 8B = `mantissa(i32 BE) + meta0 + base + meta1 + exponent`
+/// （与 feed 同构，但独立类型，不抽公共 `ScaledValue8`——门槛是 spindle
+/// 独立证明后再议；此处宁愿重复 15 行 decoder）。
+/// `meta0/meta1`（byte4/byte6）语义未知 → `raw` 保留，绝不命名。
+/// signed i32 完全合法（-2880/-2227/-3160/-10 均有真机证据），
+/// 与 feed 的 `mantissa < 0 → fail-closed` 无关，各自独立规则。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AxisPosition {
+    /// 原始 8B（未知字节保留，供未来机型差异对照）。
+    pub raw: [u8; 8],
+    /// 定点尾数（i32 BE；165 实测 `-2880` 等；Mesa 取此值）。
+    pub mantissa: i32,
+    /// 缩放基（165 实测 `10`）。
+    pub base: u8,
+    /// 缩放指数（165 实测 `3`）。
+    pub exponent: u8,
+}
+
+impl AxisPosition {
+    /// 有效性门：`base == 10` 且 `exponent <= 9`（165 实证范围；
+    /// N4 `exp=51` 即 `Unsupported` → ERR/BAD，codec 照常解出字段）。
+    pub fn validate(&self) -> Result<(), WireError> {
+        if self.base != 10 {
+            return Err(WireError::Unsupported("axis base != 10"));
+        }
+        if self.exponent > 9 {
+            return Err(WireError::Unsupported("axis exponent > 9"));
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire layout 常量（PR1 review：反复出现的 offset/length 命名；
 // 不引入 BinaryReader/CodecBuilder）。
@@ -121,12 +154,14 @@ pub const SYSINFO_DATA_LEN: usize = 18;
 pub const STATINFO_DATA_LEN: usize = 14;
 /// FEED 数据体（8B scaled value）。
 pub const FEED_DATA_LEN: usize = 8;
+/// AXIS 数据体（8B scaled value，与 feed 同构但独立常量，不共享语义）。
+pub const AXIS_DATA_LEN: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Function id（Gate 0 实测 lead；response codec 以真机为准）
 // ---------------------------------------------------------------------------
 
-/// CNC 设备（Gate 0：`0x0001`；PMC=`0x0002`，PR2 feed 未用）。
+/// CNC 设备（Gate 0：`0x0001`；PMC=`0x0002`，PR3 axis 未用）。
 pub(super) const DEV_CNC: u16 = 0x0001;
 /// `system_info`（Gate 0：`00 01 00 18`）。
 const FUNC_SYSINFO: u32 = 0x0001_0018;
@@ -138,6 +173,11 @@ const FUNC_UNKNOWN_E1: u32 = 0x0001_00e1;
 const FUNC_UNKNOWN_98: u32 = 0x0001_0098;
 /// `feed_rate`（feed 证据 PASS：`00 01 00 24`，`0x24-only` 真机冻结）。
 pub(super) const FUNC_FEED: u32 = 0x0001_0024;
+/// `axis_absolute`（axis 证据 PASS：`00 01 00 26`，`v0=4/v1=ordinal` 真机冻结；
+/// A0 `[2,3,1]` 为 FWLIB-local 历史异常，不复刻，fresh Wire 恒直透）。
+pub(super) const FUNC_AXIS_ABSOLUTE: u32 = 0x0001_0026;
+/// axis `0x26` 请求 kind（165 实测恒 `4`；语义未知，不命名）。
+pub(super) const AXIS_KIND_ABSOLUTE: i32 = 4;
 
 // ---------------------------------------------------------------------------
 // FocasClient：typed operations（串行，session guard 覆盖完整 operation）
@@ -320,6 +360,72 @@ impl FocasClient {
             }
         }
     }
+
+    /// `axis_absolute(axis)`（axis 证据 PASS：`0x18` preflight + `0x26`
+    /// count=1，`v0=4/v1=ordinal`；A0 `[2,3,1]` 为 FWLIB-local 历史异常，
+    /// fresh Wire 恒直透，不复刻）。响应单 8B position value。
+    pub async fn axis_absolute(&self, axis: u8) -> Result<AxisPosition, WireError> {
+        // `v1 = ordinal`（165 observed mapping；A0 乱序已定性为陈旧状态）。
+        // 产品上限外（0 或 >8）fail-closed，不发包（与 Native `Param` 同语义）。
+        if axis == 0 || axis > 8 {
+            return Err(WireError::Unsupported("axis ordinal 1..8"));
+        }
+        let pre_req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_SYSINFO,
+                [0, 0, 0, 0, 0],
+            )]),
+        };
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_AXIS_ABSOLUTE,
+                [AXIS_KIND_ABSOLUTE, axis as i32, 0, 0, 0],
+            )]),
+        };
+        let mut guard = self.session.lock().await;
+        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        // frame#1：sysinfo 自查（direct cnc_absolute 捕获形态，忠实复刻）。
+        let r = session
+            .exchange(&pre_req, PacketType::GENERIC_RESPONSE)
+            .await;
+        if let Err(e) = r {
+            let fatal = e.is_session_fatal();
+            drop(guard);
+            if fatal {
+                self.invalidate().await;
+            }
+            return Err(e);
+        }
+        // frame#2：0x26 count=1。
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                drop(guard);
+                if fatal {
+                    self.invalidate().await;
+                }
+                return Err(e);
+            }
+        };
+        drop(guard);
+        match decode_axis_position(&resp) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if e.is_session_fatal() {
+                    self.invalidate().await;
+                }
+                Err(e)
+            }
+        }
+    }
 }
 
 /// `0x18` 响应解码：sub.payload = 6×00 + u16 data_len + 18B ODBSYS
@@ -438,6 +544,38 @@ pub(super) fn decode_feed_rate(resp: &FocasFrame) -> Result<FeedRate, WireError>
     })
 }
 
+/// `0x26` 响应解码：单 subpacket，sub.payload =
+/// 6×00 + u16 data_len(=8) + 8B scaled value（与 feed 同构，独立 decoder，
+/// 不抽公共类型）。缺 `0x26` 即 `CommandMismatch`。
+pub(super) fn decode_axis_position(resp: &FocasFrame) -> Result<AxisPosition, WireError> {
+    let subs = decode_generic_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub =
+        find_function(&subs, DEV_CNC, FUNC_AXIS_ABSOLUTE).ok_or(WireError::CommandMismatch)?;
+    let p = &sub.payload;
+    let expected_len = RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + AXIS_DATA_LEN;
+    if p.len() != expected_len {
+        return Err(WireError::MalformedPayload);
+    }
+    if p[0..RESPONSE_PREFIX_LEN] != [0u8; RESPONSE_PREFIX_LEN] {
+        return Err(WireError::MalformedPayload);
+    }
+    let data_len =
+        u16::from_be_bytes([p[RESPONSE_PREFIX_LEN], p[RESPONSE_PREFIX_LEN + 1]]) as usize;
+    if data_len != AXIS_DATA_LEN {
+        return Err(WireError::MalformedPayload);
+    }
+    let d = &p[RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN
+        ..RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + AXIS_DATA_LEN];
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(d);
+    Ok(AxisPosition {
+        raw,
+        mantissa: i32::from_be_bytes([d[0], d[1], d[2], d[3]]),
+        base: d[5],
+        exponent: d[7],
+    })
+}
+
 /// Mesa `machine/feed` 无损映射：`(mantissa, denom)` →
 /// `Value::U32`。任一失败即 `Err`（fail-closed，不 truncate/round/clamp）：
 /// `mantissa < 0` / 分母为 0 / 不能整除 / 超 `u32::MAX`。
@@ -459,11 +597,32 @@ fn feed_to_value(rate: &FeedRate) -> Result<Value, WireError> {
     Ok(Value::U32(v as u32))
 }
 
+/// Mesa `axis.absolute` 映射：`validate(base/exp)` 通过即
+/// `Value::I32(mantissa)`（mantissa 可负，-2880 等均有真机证据；
+/// 与 feed 的 `mantissa<0` 拒绝无关，各自独立规则）。
+fn axis_to_value(pos: &AxisPosition) -> Result<Value, WireError> {
+    pos.validate()?;
+    Ok(Value::I32(pos.mantissa))
+}
+
+/// fixture/test 专用：生产 `axis_to_value` 同源入口（`#[cfg(test)]`，
+/// 不出 crate；fixture 回归与 N4 fail-closed 断言用）。
+#[cfg(test)]
+pub(super) fn axis_to_value_for_test(pos: &AxisPosition) -> Result<Value, WireError> {
+    axis_to_value(pos)
+}
+
+/// fixture/test 专用：`Value::I32` 构造子（断言可读性用）。
+#[cfg(test)]
+pub(super) fn axis_value_for_test(v: i32) -> Value {
+    Value::I32(v)
+}
+
 // ---------------------------------------------------------------------------
-// WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed：connect/system_info/read_batch）
+// WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed + PR3 axis）
 // ---------------------------------------------------------------------------
 
-/// Wire 版 `FocasApi`（PR2：`system_info` + `Status` + `Feed`；
+/// Wire 版 `FocasApi`（PR3：`system_info` + `Status` + `Feed` + `Axis/absolute`；
 /// 其余地址 `Unsupported`，fail-closed，不猜、不 fallback Native）。
 pub struct WireFocasApi {
     client: Arc<FocasClient>,
@@ -506,12 +665,26 @@ impl FocasApi for WireFocasApi {
         if addresses.is_empty() {
             return Ok(Vec::new());
         }
-        // 同一批共享请求：Status 走一次 status_info，Feed 走一次 feed_rate；
-        // 其余 fail-closed（ERR 单点 BAD）。client 内部按 operation 持 guard。
-        // 致命 session 错误（Timeout/IO/Malformed/…）在预取阶段立即短路，
-        // 不继续碰已失效 session（point-local 的 Unsupported/Remote 才进批）。
+        // 同一批共享请求：Status/Feed 各一次；Axis 按轴号各一次
+        // （`0x26` 单轴语义，无多轴数组）；其余 fail-closed。
+        // client 内部按 operation 持 guard。
+        // 致命 session 错误在预取阶段立即短路（point-local 才进批）。
+        // 非 Absolute 的 Axis kind（Machine/Relative/…）与 Native 同口径
+        // fail-closed（ERR → BAD），绝不用 absolute 冒充。
+        use crate::address::AxisKind;
+        use std::collections::BTreeMap;
         let need_status = addresses.iter().any(|a| matches!(a, FocasAddress::Status));
         let need_feed = addresses.iter().any(|a| matches!(a, FocasAddress::Feed));
+        // 去重后的 Absolute 轴号（保序；axis 0/超限在 operation 内 fail-closed）。
+        let mut axis_order: Vec<u8> = Vec::new();
+        for a in addresses {
+            if let FocasAddress::Axis { axis, kind } = a
+                && *kind == AxisKind::Absolute
+                && !axis_order.contains(axis)
+            {
+                axis_order.push(*axis);
+            }
+        }
         let status_r: Option<Result<u32, String>> = if need_status {
             match self.client.status_info().await {
                 Ok(st) => Some(Ok(st.aut as u32)),
@@ -542,6 +715,25 @@ impl FocasApi for WireFocasApi {
         } else {
             None
         };
+        // Axis 按轴号各一次 0x26（单轴语义；axis4 等无效轴 fail-closed 进批）。
+        let mut axis_map: BTreeMap<u8, Result<Value, String>> = BTreeMap::new();
+        for axis in &axis_order {
+            let r: Result<Value, String> = match self.client.axis_absolute(*axis).await {
+                Ok(pos) => match axis_to_value(&pos) {
+                    Ok(v) => Ok(v),
+                    Err(e) => match Self::point_or_fatal(e) {
+                        Ok(Value::String(s)) => Err(s),
+                        Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                        Err(fatal) => return Err(fatal),
+                    },
+                },
+                Err(e) => match Self::point_or_fatal(e) {
+                    Ok(v) => Ok(v),
+                    Err(fatal) => return Err(fatal),
+                },
+            };
+            axis_map.insert(*axis, r);
+        }
         let mut out = Vec::with_capacity(addresses.len());
         for addr in addresses {
             match addr {
@@ -555,9 +747,16 @@ impl FocasApi for WireFocasApi {
                     Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
                     Err(fatal) => return Err(fatal),
                 },
+                FocasAddress::Axis { axis, kind } if *kind == AxisKind::Absolute => {
+                    match axis_map.get(axis).cloned().unwrap() {
+                        Ok(v) => out.push(v),
+                        Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
+                        Err(fatal) => return Err(fatal),
+                    }
+                }
                 _ => out.push(Value::String(format!(
                     "ERR:{}",
-                    WireError::Unsupported("PR2 only Status/Feed")
+                    WireError::Unsupported("PR3 only Status/Feed/Absolute")
                 ))),
             }
         }
@@ -837,5 +1036,106 @@ mod tests {
             WireError::MalformedPayload.to_string(),
             "8B 后跟 4B 垃圾必须 Malformed"
         );
+    }
+
+    /// axis `0x26` 请求：`v0=4/v1=ordinal`（axis 证据 PASS 冻结形态）。
+    #[test]
+    fn axis_request_selector_locked() {
+        let payload = encode_generic_request(&[request_subpacket(
+            DEV_CNC,
+            FUNC_AXIS_ABSOLUTE,
+            [AXIS_KIND_ABSOLUTE, 2, 0, 0, 0],
+        )]);
+        // count=1 + 28B = 30 = 0x1e（与 sysinfo/feed 同长）。
+        assert_eq!(payload.len(), 0x1e);
+        assert_eq!(&payload[0..2], &[0x00, 0x01]);
+        let back = decode_generic_payload(&payload).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].function, FUNC_AXIS_ABSOLUTE);
+    }
+
+    /// axis 响应解码：A0' `ff ff f4 c0 00 0a 00 03` → mantissa=-2880。
+    #[test]
+    fn decode_axis_locked() {
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x08]);
+        p.extend_from_slice(&[0xFF, 0xFF, 0xF4, 0xC0, 0x00, 0x0A, 0x00, 0x03]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_AXIS_ABSOLUTE,
+                payload: p,
+            }]),
+        };
+        // 2 + 24 = 26 = 0x1a（direct cnc_absolute 捕获形态）。
+        assert_eq!(frame.payload.len(), 0x1a);
+        let pos = decode_axis_position(&frame).unwrap();
+        assert_eq!(pos.mantissa, -2880);
+        assert_eq!(pos.base, 10);
+        assert_eq!(pos.exponent, 3);
+        // adapter：负值合法 → I32（与 feed 的负值拒绝无关）。
+        assert_eq!(axis_to_value(&pos).unwrap(), Value::I32(-2880));
+    }
+
+    /// axis N4：`exp=51` codec 照常解出字段，但 validate fail-closed。
+    #[test]
+    fn axis_n4_exp51_fails_closed() {
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x08]);
+        p.extend_from_slice(&[0x20, 0x00, 0x02, 0x02, 0x00, 0x0A, 0x30, 0x33]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_AXIS_ABSOLUTE,
+                payload: p,
+            }]),
+        };
+        let pos = decode_axis_position(&frame).unwrap();
+        assert_eq!(pos.mantissa, 0x2000_0202);
+        assert_eq!(pos.exponent, 51);
+        // codec 成功，但语义层 fail-closed（ERR → BAD，不进 I32）。
+        assert!(matches!(
+            axis_to_value(&pos).unwrap_err(),
+            WireError::Unsupported(_)
+        ));
+    }
+
+    /// axis typed payload 内部精确闭合（与 feed 同原则）。
+    #[test]
+    fn axis_trailing_payload_rejected() {
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x08]);
+        p.extend_from_slice(&[0xFF, 0xFF, 0xF4, 0xC0, 0x00, 0x0A, 0x00, 0x03]);
+        p.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_AXIS_ABSOLUTE,
+                payload: p,
+            }]),
+        };
+        assert_eq!(
+            decode_axis_position(&frame).unwrap_err().to_string(),
+            WireError::MalformedPayload.to_string(),
+        );
+    }
+
+    /// axis ordinal 越界 fail-closed：0 与 >8 不发包（与 Native Param 同语义）。
+    #[tokio::test]
+    async fn axis_ordinal_out_of_range() {
+        let client = FocasClient::new(std::time::Duration::from_millis(10));
+        for axis in [0u8, 9u8] {
+            let e = client.axis_absolute(axis).await.unwrap_err();
+            assert!(
+                matches!(e, WireError::Unsupported(_)),
+                "axis={axis} 必须 Unsupported（不发包）"
+            );
+        }
     }
 }
