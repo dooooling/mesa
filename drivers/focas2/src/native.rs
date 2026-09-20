@@ -1481,9 +1481,10 @@ impl NativeLib {
         }
     }
 
-    /// 读报警：`cnc_rdalmmsg(hdl, -1, &mut num, ODBALMMSG)` stateful 循环至 `EW_DATA`
-    /// - 为什么循环：FANUC 报警为状态机，需 `num` 递增拉取至 `EW_DATA` 结束，单次仅得首批
-    /// - 返回 `Vec<String>` 仅用于诊断，上层转 `Quality::Bad` 隔离不丢批
+    /// 读报警：PR52 已暂停（`OdbAlmMsg` 64B / 多条 44B 结构未闭合）。
+    /// 保留符号加载（`from_library` 不动），但 worker 内不再调用；
+    /// 恢复条件见 `focas_api.rs read_one_on_worker`。旧实现见 git 历史。
+    #[allow(dead_code)]
     pub fn cnc_rdalmmsg(&self, hdl: u16, num: &mut c_short) -> Result<Vec<String>, FocasRet> {
         let sym = self.cnc_rdalmmsg.as_ref().ok_or(FocasRet::Noopt)?;
         let mut out = OdbAlmMsg { dummy: [0; 64] };
@@ -1504,7 +1505,9 @@ impl NativeLib {
         }
     }
 
-    /// 读诊断：`cnc_diagnoss(hdl, num, 1, ODBDIAG)` 单点诊断
+    /// 读诊断：PR52 已暂停（真实签名疑 5 参含 length，当前 4 参未闭合）。
+    /// 保留符号加载，但 worker 内不再调用；旧实现见 git 历史。
+    #[allow(dead_code)]
     pub fn cnc_diagnoss(&self, hdl: u16, num: i32) -> Result<c_int, FocasRet> {
         // `i32` 入参先收紧到 `c_short` 可表示范围（resolver/Descriptor 对
         // diagnosis.number 已同上限收紧，此处防直接调用越界）。
@@ -1536,7 +1539,9 @@ impl NativeLib {
         }
     }
 
-    /// 读主轴负载：`cnc_rdspmeter(hdl, 0, &mut num, &mut data)` 4 轴
+    /// 读主轴负载：PR52 已暂停（8B `SpLoad` 疑越界：每单元约 12B，
+    /// 复合约 24B）。保留符号加载，但 worker 内不再调用；旧实现见 git 历史。
+    #[allow(dead_code)]
     pub fn cnc_rdspmeter(
         &self,
         hdl: u16,
@@ -1562,7 +1567,9 @@ impl NativeLib {
         }
     }
 
-    /// 读伺服负载：`cnc_rdsvmeter(hdl, &mut num, &mut data)` 同主轴
+    /// 读伺服负载：PR52 已暂停（同主轴，缓冲区结构未闭合）。
+    /// 保留符号加载，但 worker 内不再调用；旧实现见 git 历史。
+    #[allow(dead_code)]
     pub fn cnc_rdsvmeter(
         &self,
         hdl: u16,
@@ -1597,7 +1604,9 @@ impl NativeLib {
         if ret.is_ok() { Ok(out) } else { Err(ret) }
     }
 
-    /// 读主轴齿轮比：`cnc_rdspgear(hdl, spindle, &mut gear)` 占位
+    /// 读主轴齿轮比：PR52 已暂停（输出疑为 `+4` 结构，单 `c_short`
+    /// 未闭合）。保留符号加载，但 worker 内不再调用；旧实现见 git 历史。
+    #[allow(dead_code)]
     pub fn cnc_rdspgear(&self, hdl: u16, spindle: u8) -> Result<i16, FocasRet> {
         let sym = self.cnc_rdspgear.as_ref().ok_or(FocasRet::Noopt)?;
         let mut gear: c_short = 0;
@@ -1616,7 +1625,9 @@ impl NativeLib {
         }
     }
 
-    /// 读主轴最大转速：`cnc_rdspmaxrpm(hdl, spindle, &mut rpm)` 占位
+    /// 读主轴最大转速：PR52 已暂停（同 gear，输出结构未闭合）。
+    /// 保留符号加载，但 worker 内不再调用；旧实现见 git 历史。
+    #[allow(dead_code)]
     pub fn cnc_rdspmaxrpm(&self, hdl: u16, spindle: u8) -> Result<i16, FocasRet> {
         let sym = self.cnc_rdspmaxrpm.as_ref().ok_or(FocasRet::Noopt)?;
         let mut rpm: c_short = 0;
