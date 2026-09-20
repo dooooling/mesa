@@ -1159,16 +1159,10 @@ impl NativeLib {
         out.data[0]
     }
 
-    /// 读轴绝对坐标：`cnc_absolute(hdl, axis, 8, ODBAXIS*)`，`platform` 未单列但 `collectors/AxisData` 间接依赖
-    /// - `axis` 仅 1..8（`FOCAS_AXIS_PRODUCT_MAX`）：Descriptor/resolver 已收紧，
-    ///   此处再判一次（直接调 Native 的外部调用不得绕过产品上限）；
-    /// - 单轴语义：`axis=N` 时有效值在 `data[0]`（ALL_AXES=-1 时才按轴序
-    ///   进 `data[]`；axis Evidence Window A0 在 165 上实证：`axis=2` 取
-    ///   `data[1]` 得 `0x80040000` 垃圾，而 Wire `0x26` mantissa 为有效值）。
-    ///   因此此处经 `single_axis_value` 取 `data[0]`，不再 `data[axis-1]`；
-    /// - 返回原始 `c_int`（定点），上层直接 `I32`（scaled 显示尺度由调用方定）。
-    /// - `length=8` 保持不动（已被真实 FWLIB 接受，避免一次改两个变量）。
-    pub fn cnc_absolute(&self, hdl: u16, axis: u8) -> Result<c_int, FocasRet> {
+    /// 生产/证据共用 raw 调用：`cnc_absolute(axis, 8, OdbAxis*)` 直调已加载
+    /// 的 typed 符号，返回完整 `OdbAxis`。生产经 `single_axis_value` 取
+    /// `data[0]`；证据工具同一次调用复用 full（单次 FFI，无时间差）。
+    fn cnc_absolute_raw_inner(&self, hdl: u16, axis: u8) -> Result<OdbAxis, FocasRet> {
         if axis == 0 || axis > FOCAS_AXIS_PRODUCT_MAX {
             return Err(FocasRet::Param);
         }
@@ -1184,34 +1178,33 @@ impl NativeLib {
         };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() {
-            let v = unsafe { out.assume_init() };
-            Ok(Self::single_axis_value(&v))
+            Ok(unsafe { out.assume_init() })
         } else {
             Err(ret)
         }
     }
 
-    /// `#[cfg(test)]` raw helper：同签名直调已加载的 typed 符号，返回完整
-    /// `OdbAxis`（`data[0..8]` 法证用）。规则冻结：经 `Deref` 取函数地址，
-    /// 绝不整体 `transmute_copy(Option<Symbol>)`（曾导致 AV）。
+    /// 读轴绝对坐标：`cnc_absolute(hdl, axis, 8, ODBAXIS*)`，`platform` 未单列但 `collectors/AxisData` 间接依赖
+    /// - `axis` 仅 1..8（`FOCAS_AXIS_PRODUCT_MAX`）：Descriptor/resolver 已收紧，
+    ///   此处再判一次（直接调 Native 的外部调用不得绕过产品上限）；
+    /// - 单轴语义：`axis=N` 时有效值在 `data[0]`（ALL_AXES=-1 时才按轴序
+    ///   进 `data[]`；axis Evidence Window A0 在 165 上实证：`axis=2` 取
+    ///   `data[1]` 得 `0x80040000` 垃圾，而 Wire `0x26` mantissa 为有效值）。
+    ///   因此此处经 `single_axis_value` 取 `data[0]`，不再 `data[axis-1]`；
+    /// - 返回原始 `c_int`（定点），上层直接 `I32`（scaled 显示尺度由调用方定）。
+    /// - `length=8` 保持不动（已被真实 FWLIB 接受，避免一次改两个变量）。
+    pub fn cnc_absolute(&self, hdl: u16, axis: u8) -> Result<c_int, FocasRet> {
+        let out = self.cnc_absolute_raw_inner(hdl, axis)?;
+        Ok(Self::single_axis_value(&out))
+    }
+
+    /// `#[cfg(test)]` raw helper：`cnc_absolute_raw_inner` 的测试可见别名，
+    /// 返回完整 `OdbAxis`（`data[0..8]` 法证用）。规则冻结：沿 typed symbol
+    /// 直接调用，绝不猜 `Symbol/Option<Symbol>` 内存布局、绝不整体
+    /// `transmute_copy`、绝不经 `usize` 重建函数指针（AV 教训）。
     #[cfg(test)]
     pub(crate) fn cnc_absolute_raw(&self, hdl: u16, axis: u8) -> Result<OdbAxis, FocasRet> {
-        use std::ops::Deref;
-        type RawFn = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OdbAxis) -> c_short;
-        let addr = {
-            let sym = self.cnc_absolute.as_ref().ok_or(FocasRet::Nodll)?;
-            let f: &RawFn = sym.deref();
-            *f as usize
-        };
-        let raw: RawFn = unsafe { std::mem::transmute(addr) };
-        let mut out_mem = std::mem::MaybeUninit::<OdbAxis>::uninit();
-        let rc = unsafe { raw(hdl as c_ushort, axis as c_short, 8, out_mem.as_mut_ptr()) };
-        let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() {
-            Ok(unsafe { out_mem.assume_init() })
-        } else {
-            Err(ret)
-        }
+        self.cnc_absolute_raw_inner(hdl, axis)
     }
 
     /// 读宏变量：`cnc_rdmacro(hdl, number, 1, ODBM*)`，`collectors/Macro.cs:100`
@@ -2071,15 +2064,11 @@ mod tests {
             type_: 2,
             data: [-99806, -2147418112, 123, 0, 0, 0, 0, 0],
         };
-        // axis=1/2/3 单轴调用 → 恒取 data[0]。
+        // 单轴调用的返回槽恒为 data[0]（与请求 axis 无关）。
         assert_eq!(NativeLib::single_axis_value(&out), -99806);
-        assert_eq!(NativeLib::single_axis_value(&out), -99806);
-        let _ = (1u8, 2u8, 3u8); // 轴号只影响请求，不影响返回槽
         assert_eq!(out.data[0], -99806);
-        assert_ne!(
-            out.data[1], out.data[0],
-            "data[1] 必须是另一槽位（回归锚点）"
-        );
+        assert_ne!(out.data[1], out.data[0]);
+        assert_ne!(out.data[2], out.data[0]);
     }
 
     /// PR0：`ODBST`（0i/30i 族）ABI 回归——9 × short = 18B，且字段顺序
@@ -2365,22 +2354,36 @@ mod tests {
                     e.message()
                 )
             });
-        // 法证：经 `#[cfg(test)]` raw helper 读 `OdbAxis` 全结构
-        // （`data[0..8]`），证明单轴调用的有效值位置。
-        let full: OdbAxis = match lib.cnc_absolute_raw(hdl, axis) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = lib.cnc_freelibhndl(hdl);
-                panic!("cnc_absolute raw 失败：{} {}", e as i16, e.message());
-            }
-        };
-        let result = lib.cnc_absolute(hdl, axis);
+        // 单次 FFI：同一份 `OdbAxis` 推出 full/value/Mesa（无时间差；
+        // A1/A2/A3 运动中采样尤其需要此保证）。
+        let (full, result): (Option<OdbAxis>, Result<c_int, FocasRet>) =
+            match lib.cnc_absolute_raw(hdl, axis) {
+                Ok(full) => {
+                    let v = NativeLib::single_axis_value(&full);
+                    (Some(full), Ok(v))
+                }
+                Err(e) => (None, Err(e)),
+            };
         let _ = lib.cnc_freelibhndl(hdl);
-        let (ok, value, err) = match result {
-            Ok(v) => (true, Some(v), None),
-            Err(e) => (false, None, Some(format!("{} {}", e as i16, e.message()))),
+        let (ok, value, err, full) = match (full, result) {
+            (Some(full), Ok(v)) => (true, Some(v), None, Some(full)),
+            (_, Err(e)) => (
+                false,
+                None,
+                Some(format!("{} {}", e as i16, e.message())),
+                None,
+            ),
+            // `cnc_absolute_raw` 成功则 `single_axis_value` 必成功（纯内存），
+            // 此臂不可达；若未来改动使其可达，fail-closed 比 panic 更安全。
+            (None, Ok(_)) => (
+                false,
+                None,
+                Some("unreachable raw/value split".into()),
+                None,
+            ),
         };
         // 产品合同：成功即 raw c_int → I32（不断言具体值，由现场对照面板）。
+        // 失败时 full 为 None（serde None → null），不伪造 data 数组。
         let doc = serde_json::json!({
             "operation": "absolute",
             "axis": axis,
@@ -2388,9 +2391,9 @@ mod tests {
                 "ok": ok,
                 "value": value,
                 "error": err,
-                "dummy": full.dummy,
-                "type": full.type_,
-                "data": full.data,
+                "dummy": full.as_ref().map(|f| f.dummy),
+                "type": full.as_ref().map(|f| f.type_),
+                "data": full.as_ref().map(|f| f.data),
             },
             "mesa": { "axis_absolute": value },
         });
