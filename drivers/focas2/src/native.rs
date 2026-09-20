@@ -2221,4 +2221,67 @@ mod tests {
         let pretty = serde_json::to_string_pretty(&doc).expect("expected.json 序列化失败");
         gate0_emit(&pretty, &out);
     }
+
+    /// PR2 feed 证据窗口：`connect → cnc_rddynamic2 → disconnect`。
+    /// - 直接用私有 `NativeLib`，只调一次目标 API，输出完整 `OdbDy2`
+    ///   全字段（`alarm/prgnum/prgmnum/seqnum/actf/acts/pos`），不只 `actf`；
+    /// - 运行时断言 `mesa.machine_feed == native.actf as u32`（产品合同：
+    ///   `machine/feed = OdbDy2.actf`，与 focas_api 两条生产路径同源）；
+    /// - 静止（F=0）与进给（F≠0）各跑一次，现场记录 F 值后对照；
+    /// - ignored + `--test-threads=1`，与 Gate 0 组串行；
+    /// - 不写 Wire 代码，不碰生产路径（PR2 证据窗口专用）。
+    #[test]
+    #[ignore]
+    fn pr2_dump_dynamic2() {
+        let (host, port, timeout_ms, out) = gate0_params();
+        let timeout_secs = (timeout_ms.div_ceil(1000).max(1).min(i32::MAX as u64)) as i32;
+        let lib =
+            NativeLib::load().unwrap_or_else(|e| panic!("FWLIB 加载失败（{host}:{port}）：{e}"));
+        let hdl = lib
+            .cnc_allclibhndl3(&host, port, timeout_secs)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
+                    e as i16,
+                    e.message()
+                )
+            });
+        let dy = match lib.cnc_rddynamic2(hdl) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = lib.cnc_freelibhndl(hdl);
+                panic!("cnc_rddynamic2 失败：{} {}", e as i16, e.message());
+            }
+        };
+        let _ = lib.cnc_freelibhndl(hdl);
+        // 产品合同：machine/feed 取 OdbDy2.actf（与 focas_api 同源）。
+        let mesa_feed = dy.actf as u32;
+        let doc = serde_json::json!({
+            "operation": "dynamic2",
+            "native": {
+                "dummy": dy.dummy,
+                "axis": dy.axis,
+                "alarm": dy.alarm,
+                "prgnum": dy.prgnum,
+                "prgmnum": dy.prgmnum,
+                "seqnum": dy.seqnum,
+                "actf": dy.actf,
+                "acts": dy.acts,
+                "pos": {
+                    "absolute": dy.pos.absolute,
+                    "machine": dy.pos.machine,
+                    "relative": dy.pos.relative,
+                    "distance": dy.pos.distance,
+                },
+            },
+            "mesa": { "machine_feed": mesa_feed }
+        });
+        assert_eq!(
+            doc.pointer("/mesa/machine_feed").and_then(|v| v.as_u64()),
+            Some(mesa_feed as u64),
+            "mesa.machine_feed 必须等于 native.actf"
+        );
+        let pretty = serde_json::to_string_pretty(&doc).expect("expected.json 序列化失败");
+        gate0_emit(&pretty, &out);
+    }
 }

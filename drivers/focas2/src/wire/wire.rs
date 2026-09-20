@@ -72,6 +72,40 @@ pub struct StatusInfo {
     pub edit: u16,
 }
 
+/// FOCAS `feed_rate`（`0x24`）typed 结果。feed 证据 PASS：
+/// 8B = `mantissa(i32 BE) + meta0 + base + meta1 + exponent`。
+/// 已知字段 typed；`meta0/meta1`（byte4/byte6）语义未知 → `raw` 保留，
+/// 绝不命名（pyfanuc 只用 `[0..4]/[5]/[7]`，`FF FF` sentinel 在 165
+/// 未见过，见过再加，不断言）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedRate {
+    /// 原始 8B（未知字节保留，供未来机型差异对照）。
+    pub raw: [u8; 8],
+    /// 定点尾数（i32 BE；165 实测 `100`）。
+    pub mantissa: i32,
+    /// 缩放基（165 实测 `10`；`2` 有外部佐证但 165 未见）。
+    pub base: u8,
+    /// 缩放指数（165 实测 `0`；非 0 已在公共 sample 见过，不假设）。
+    pub exponent: u8,
+}
+
+impl FeedRate {
+    /// 数值语义：`mantissa / base^exponent`（`base` 仅接受真机实证值）。
+    /// 当前 165 只实证 `base == 10`；`2` 有外部实现佐证但 165 未见，
+    /// PR2 极度保守：非 `10` 即 `Unsupported`（见过再放开，不猜）。
+    /// 返回 `(numer, denom)`（不做除法、不丢精度，由 adapter 判无损）。
+    pub fn scaled(&self) -> Result<(i64, i64), WireError> {
+        if self.base != 10 {
+            return Err(WireError::Unsupported("feed base != 10"));
+        }
+        if self.exponent > 9 {
+            return Err(WireError::Unsupported("feed exponent > 9"));
+        }
+        let denom = 10i64.pow(self.exponent as u32);
+        Ok((self.mantissa as i64, denom))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire layout 常量（PR1 review：反复出现的 offset/length 命名；
 // 不引入 BinaryReader/CodecBuilder）。
@@ -85,13 +119,15 @@ pub const DATA_LEN_FIELD_LEN: usize = 2;
 pub const SYSINFO_DATA_LEN: usize = 18;
 /// STATINFO 数据体（14B = 7×u16）。
 pub const STATINFO_DATA_LEN: usize = 14;
+/// FEED 数据体（8B scaled value）。
+pub const FEED_DATA_LEN: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Function id（Gate 0 实测 lead；response codec 以真机为准）
 // ---------------------------------------------------------------------------
 
-/// CNC 设备（Gate 0：`0x0001`；PMC=`0x0002`，PR1 未用）。
-const DEV_CNC: u16 = 0x0001;
+/// CNC 设备（Gate 0：`0x0001`；PMC=`0x0002`，PR2 feed 未用）。
+pub(super) const DEV_CNC: u16 = 0x0001;
 /// `system_info`（Gate 0：`00 01 00 18`）。
 const FUNC_SYSINFO: u32 = 0x0001_0018;
 /// `status_info`（Gate 0：`00 01 00 19`）。
@@ -100,6 +136,8 @@ const FUNC_STATINFO: u32 = 0x0001_0019;
 const FUNC_UNKNOWN_E1: u32 = 0x0001_00e1;
 /// statinfo 序列伴随 function（未知语义；只验 framing 后跳过）。
 const FUNC_UNKNOWN_98: u32 = 0x0001_0098;
+/// `feed_rate`（feed 证据 PASS：`00 01 00 24`，`0x24-only` 真机冻结）。
+pub(super) const FUNC_FEED: u32 = 0x0001_0024;
 
 // ---------------------------------------------------------------------------
 // FocasClient：typed operations（串行，session guard 覆盖完整 operation）
@@ -244,6 +282,44 @@ impl FocasClient {
             }
         }
     }
+
+    /// `feed_rate`（`0x24-only`：count=1，`0x24-only` Gate 真机冻结形态）。
+    /// 单次 exchange；响应 `count=1 + 0x24 / 6×00 / dlen=8 / 8B`。
+    pub async fn feed_rate(&self) -> Result<FeedRate, WireError> {
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_FEED,
+                [0, 0, 0, 0, 0],
+            )]),
+        };
+        let mut guard = self.session.lock().await;
+        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                drop(guard);
+                if fatal {
+                    self.invalidate().await;
+                }
+                return Err(e);
+            }
+        };
+        drop(guard);
+        match decode_feed_rate(&resp) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if e.is_session_fatal() {
+                    self.invalidate().await;
+                }
+                Err(e)
+            }
+        }
+    }
 }
 
 /// `0x18` 响应解码：sub.payload = 6×00 + u16 data_len + 18B ODBSYS
@@ -328,11 +404,66 @@ fn find_function(subs: &[GenericSubpacket], dev: u16, func: u32) -> Option<&Gene
         .find(|s| s.control_device == dev && s.function == func)
 }
 
+/// `0x24` 响应解码：单 subpacket，sub.payload =
+/// 6×00 + u16 data_len(=8) + 8B scaled value。
+/// 8B = `mantissa(i32 BE) + meta0 + base + meta1 + exponent`；
+/// `meta0/meta1` 不解释（进 `raw`）。缺 `0x24` 即 `CommandMismatch`。
+pub(super) fn decode_feed_rate(resp: &FocasFrame) -> Result<FeedRate, WireError> {
+    let subs = decode_generic_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub = find_function(&subs, DEV_CNC, FUNC_FEED).ok_or(WireError::CommandMismatch)?;
+    let p = &sub.payload;
+    // 精确闭合：p 必须恰好 = 6×00 + u16 data_len(=8) + 8B（多 1B 即错，
+    // 与 frame length → count → subpacket length 同原则）。
+    let expected_len = RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + FEED_DATA_LEN;
+    if p.len() != expected_len {
+        return Err(WireError::MalformedPayload);
+    }
+    if p[0..RESPONSE_PREFIX_LEN] != [0u8; RESPONSE_PREFIX_LEN] {
+        return Err(WireError::MalformedPayload);
+    }
+    let data_len =
+        u16::from_be_bytes([p[RESPONSE_PREFIX_LEN], p[RESPONSE_PREFIX_LEN + 1]]) as usize;
+    if data_len != FEED_DATA_LEN {
+        return Err(WireError::MalformedPayload);
+    }
+    let d = &p[RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN
+        ..RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + FEED_DATA_LEN];
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(d);
+    Ok(FeedRate {
+        raw,
+        mantissa: i32::from_be_bytes([d[0], d[1], d[2], d[3]]),
+        base: d[5],
+        exponent: d[7],
+    })
+}
+
+/// Mesa `machine/feed` 无损映射：`(mantissa, denom)` →
+/// `Value::U32`。任一失败即 `Err`（fail-closed，不 truncate/round/clamp）：
+/// `mantissa < 0` / 分母为 0 / 不能整除 / 超 `u32::MAX`。
+fn feed_to_value(rate: &FeedRate) -> Result<Value, WireError> {
+    let (numer, denom) = rate.scaled()?;
+    if denom <= 0 {
+        return Err(WireError::Unsupported("feed denom <= 0"));
+    }
+    if numer < 0 {
+        return Err(WireError::Unsupported("feed mantissa < 0"));
+    }
+    if numer % denom != 0 {
+        return Err(WireError::Unsupported("feed not integral"));
+    }
+    let v = numer / denom;
+    if v > u32::MAX as i64 {
+        return Err(WireError::Unsupported("feed > u32::MAX"));
+    }
+    Ok(Value::U32(v as u32))
+}
+
 // ---------------------------------------------------------------------------
-// WireFocasApi：Mesa adapter（PR1 最小：connect/system_info/read_batch）
+// WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed：connect/system_info/read_batch）
 // ---------------------------------------------------------------------------
 
-/// Wire 版 `FocasApi`（PR1 最小实现：`system_info` + `Status` 单地址；
+/// Wire 版 `FocasApi`（PR2：`system_info` + `Status` + `Feed`；
 /// 其余地址 `Unsupported`，fail-closed，不猜、不 fallback Native）。
 pub struct WireFocasApi {
     client: Arc<FocasClient>,
@@ -375,62 +506,58 @@ impl FocasApi for WireFocasApi {
         if addresses.is_empty() {
             return Ok(Vec::new());
         }
-        // PR1：同一批只锁一次 session（client 内部按 operation 持 guard），
-        // 当前仅 Status 有 typed 实现；其余 fail-closed（ERR → 单点 BAD）。
-        let mut out = Vec::with_capacity(addresses.len());
-        // 检查是否全为 Status：是则一次 status_info 服务整批（共享请求）。
-        let all_status = addresses.iter().all(|a| matches!(a, FocasAddress::Status));
-        if all_status {
+        // 同一批共享请求：Status 走一次 status_info，Feed 走一次 feed_rate；
+        // 其余 fail-closed（ERR 单点 BAD）。client 内部按 operation 持 guard。
+        // 致命 session 错误（Timeout/IO/Malformed/…）在预取阶段立即短路，
+        // 不继续碰已失效 session（point-local 的 Unsupported/Remote 才进批）。
+        let need_status = addresses.iter().any(|a| matches!(a, FocasAddress::Status));
+        let need_feed = addresses.iter().any(|a| matches!(a, FocasAddress::Feed));
+        let status_r: Option<Result<u32, String>> = if need_status {
             match self.client.status_info().await {
-                Ok(st) => {
-                    for _ in addresses {
-                        out.push(Value::U32(st.aut as u32));
-                    }
-                    return Ok(out);
-                }
-                Err(e) if matches!(e, WireError::Unsupported(_) | WireError::Remote(_)) => {
-                    for _ in addresses {
-                        out.push(Value::String(format!("ERR:{e}")));
-                    }
-                    return Ok(out);
-                }
-                Err(e) => return Err(e.to_string()),
+                Ok(st) => Some(Ok(st.aut as u32)),
+                Err(e) => match Self::point_or_fatal(e) {
+                    Ok(Value::String(s)) => Some(Err(s)),
+                    Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                    Err(fatal) => return Err(fatal),
+                },
             }
-        }
-        // 混合批：Status 走共享，其余 Unsupported（PR2+ 逐个实现）。
-        // `StatusInfo: Clone` 不派生（WireError 不可 Clone），缓存 String 化错误。
-        let mut status_cache: Option<Result<u32, String>> = None;
+        } else {
+            None
+        };
+        let feed_r: Option<Result<Value, String>> = if need_feed {
+            match self.client.feed_rate().await {
+                Ok(rate) => match feed_to_value(&rate) {
+                    Ok(v) => Some(Ok(v)),
+                    Err(e) => match Self::point_or_fatal(e) {
+                        Ok(Value::String(s)) => Some(Err(s)),
+                        Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                        Err(fatal) => return Err(fatal),
+                    },
+                },
+                Err(e) => match Self::point_or_fatal(e) {
+                    Ok(v) => Some(Ok(v)),
+                    Err(fatal) => return Err(fatal),
+                },
+            }
+        } else {
+            None
+        };
+        let mut out = Vec::with_capacity(addresses.len());
         for addr in addresses {
             match addr {
-                FocasAddress::Status => {
-                    let r: Result<u32, String> = match status_cache.clone() {
-                        Some(cached) => cached,
-                        None => {
-                            let fresh: Result<u32, String> = self
-                                .client
-                                .status_info()
-                                .await
-                                .map(|st| st.aut as u32)
-                                .map_err(|e| match Self::point_or_fatal(e) {
-                                    Ok(v) => match v {
-                                        Value::String(s) => s,
-                                        _ => "ERR:unreachable".to_string(),
-                                    },
-                                    Err(fatal) => fatal,
-                                });
-                            status_cache = Some(fresh.clone());
-                            fresh
-                        }
-                    };
-                    match r {
-                        Ok(aut) => out.push(Value::U32(aut)),
-                        Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
-                        Err(fatal) => return Err(fatal),
-                    }
-                }
+                FocasAddress::Status => match status_r.clone().unwrap() {
+                    Ok(aut) => out.push(Value::U32(aut)),
+                    Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
+                    Err(fatal) => return Err(fatal),
+                },
+                FocasAddress::Feed => match feed_r.clone().unwrap() {
+                    Ok(v) => out.push(v),
+                    Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
+                    Err(fatal) => return Err(fatal),
+                },
                 _ => out.push(Value::String(format!(
                     "ERR:{}",
-                    WireError::Unsupported("PR1 only Status")
+                    WireError::Unsupported("PR2 only Status/Feed")
                 ))),
             }
         }
@@ -598,5 +725,117 @@ mod tests {
             "缺 0x19 必须 CommandMismatch"
         );
         assert!(e.is_session_fatal(), "CommandMismatch 保守判致命");
+    }
+
+    /// feed `0x24` 请求：count=1（`0x24-only` Gate 冻结形态）。
+    #[test]
+    fn feed_request_single_locked() {
+        use super::super::frame::encode_generic_request as enc;
+        let payload = enc(&[request_subpacket(DEV_CNC, FUNC_FEED, [0, 0, 0, 0, 0])]);
+        // count=1 + 28B = 30 = 0x1e（与 sysinfo 同长，function 换 0x24）。
+        assert_eq!(payload.len(), 0x1e);
+        assert_eq!(&payload[0..2], &[0x00, 0x01]);
+        let back = super::super::frame::decode_generic_payload(&payload).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].function, FUNC_FEED);
+    }
+
+    /// feed 响应解码：`00 00 00 64 00 0a 00 00` → mantissa=100/base=10/exp=0。
+    #[test]
+    fn decode_feed_locked() {
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x08]);
+        p.extend_from_slice(&[0x00, 0x00, 0x00, 0x64, 0x00, 0x0a, 0x00, 0x00]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_FEED,
+                payload: p,
+            }]),
+        };
+        // 2 + 24 = 26 = 0x1a（0x24-only 探针实测）。
+        assert_eq!(frame.payload.len(), 0x1a);
+        let rate = decode_feed_rate(&frame).unwrap();
+        assert_eq!(rate.mantissa, 100);
+        assert_eq!(rate.base, 10);
+        assert_eq!(rate.exponent, 0);
+        assert_eq!(rate.raw, [0x00, 0x00, 0x00, 0x64, 0x00, 0x0a, 0x00, 0x00]);
+        // scaled 无损：100/1。
+        assert_eq!(rate.scaled().unwrap(), (100, 1));
+        // adapter 无损入 U32。
+        assert_eq!(feed_to_value(&rate).unwrap(), Value::U32(100));
+    }
+
+    /// feed 非整数 fail-closed：`12345/10^2 = 123.45` 不得 truncate 成 123。
+    #[test]
+    fn feed_fractional_is_bad() {
+        let rate = FeedRate {
+            raw: [0, 0, 0x30, 0x39, 0, 10, 0, 2],
+            mantissa: 12345,
+            base: 10,
+            exponent: 2,
+        };
+        assert_eq!(rate.scaled().unwrap(), (12345, 100));
+        let e = feed_to_value(&rate).unwrap_err();
+        assert!(
+            matches!(e, WireError::Unsupported(_)),
+            "非整数 feed 必须 fail-closed"
+        );
+    }
+
+    /// feed 负值 fail-closed：`mantissa < 0` 不得进 U32。
+    #[test]
+    fn feed_negative_is_bad() {
+        let rate = FeedRate {
+            raw: [0xFF, 0xFF, 0xFF, 0xFF, 0, 10, 0, 0],
+            mantissa: -1,
+            base: 10,
+            exponent: 0,
+        };
+        assert!(matches!(
+            feed_to_value(&rate).unwrap_err(),
+            WireError::Unsupported(_)
+        ));
+    }
+
+    /// feed 非实证 base fail-closed：`base=2` 有外部佐证但 165 未见，不猜。
+    #[test]
+    fn feed_unverified_base_is_bad() {
+        let rate = FeedRate {
+            raw: [0, 0, 0, 1, 0, 2, 0, 0],
+            mantissa: 1,
+            base: 2,
+            exponent: 0,
+        };
+        assert!(matches!(
+            rate.scaled().unwrap_err(),
+            WireError::Unsupported(_)
+        ));
+    }
+
+    /// feed typed payload 内部精确闭合：trailing 4B 即使 data_len 正确也拒收
+    /// （与 frame length → count → subpacket length 同原则）。
+    #[test]
+    fn feed_trailing_payload_rejected() {
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x08]);
+        p.extend_from_slice(&[0x00, 0x00, 0x00, 0x64, 0x00, 0x0a, 0x00, 0x00]);
+        p.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_FEED,
+                payload: p,
+            }]),
+        };
+        assert_eq!(
+            decode_feed_rate(&frame).unwrap_err().to_string(),
+            WireError::MalformedPayload.to_string(),
+            "8B 后跟 4B 垃圾必须 Malformed"
+        );
     }
 }
