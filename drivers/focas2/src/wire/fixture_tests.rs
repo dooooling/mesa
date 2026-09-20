@@ -1,15 +1,16 @@
-//! Fixture 回归（PR1 Level 2）：真机捕获 → 生产 codec 直测 → expected。
+//! Fixture 回归（PR1 Level 2 + PR2 feed）：真机捕获 → 生产 codec 直测。
 //!
 //! - 数据：165 定向抓包 → `10B header + payload_len` 精确切帧 → 去重传/
-//!   拼接残留（`tests/fixtures/wire/{sysinfo,statinfo_mem,statinfo_mdi}/`）。
+//!   拼接残留（`tests/fixtures/wire/{sysinfo,statinfo_mem,statinfo_mdi,feed}/`）。
 //! - Gate 0 证据：sysinfo 7/7 / statinfo MEM 7/7 / statinfo MDI 7/7。
-//! - 本模块 `#[cfg(test)]` 且 crate 内部：直接调生产
-//!   `decode_system_info/decode_status_info`，无测试侧复刻 decoder。
+//! - feed 证据：`0x24` mantissa=100 ↔ Native actf=100（同次）；`0x24-only`
+//!   生产形态真机冻结。
+//! - 本模块 `#[cfg(test)]` 且 crate 内部：直接调生产 decoder，无复刻。
 
 use std::path::PathBuf;
 
 use super::frame::{FRAME_HEADER_LEN, FocasFrame, PacketType, decode_header};
-use super::wire::{decode_status_info, decode_system_info};
+use super::wire::{decode_feed_rate, decode_status_info, decode_system_info};
 use super::{cut_fixture_frames, fixture_dir, read_fixture_bytes};
 
 fn dir(group: &str) -> PathBuf {
@@ -43,6 +44,9 @@ pub(crate) fn run_all() {
     statinfo_mem_decodes();
     statinfo_mdi_decodes();
     statinfo_request_stable();
+    feed_9pack_decodes();
+    feed_single_decodes();
+    feed_request_locked();
 }
 
 /// sysinfo：`sysinfo_response.bin` 经生产 codec 解码 == expected 7 字段。
@@ -120,4 +124,51 @@ fn statinfo_request_stable() {
     let fa = cut_fixture_frames(&a);
     assert_eq!(fa.len(), 1);
     assert_eq!(fa[0].len(), 10 + 0x56, "frame#2 必须 96B");
+}
+
+/// feed 9-pack：生产 `decode_feed_rate` 直解 220B 全帧 → mantissa=100。
+/// （生产 `find_function` 本就支持多 subpacket；同次 Native actf=100。）
+fn feed_9pack_decodes() {
+    let frame = assemble_frame(&read("feed", "feed_response_9pack.bin"));
+    assert_eq!(frame.packet_type, PacketType::GENERIC_RESPONSE);
+    let rate = decode_feed_rate(&frame).expect("生产 decode_feed_rate 必须成功");
+    assert_eq!(rate.mantissa, 100, "9-pack 同次 mantissa 必须 100");
+    assert_eq!(rate.base, 10);
+    assert_eq!(rate.exponent, 0);
+    assert_eq!(rate.scaled().expect("100/1 无损"), (100, 1));
+    let exp = expected("feed");
+    assert_eq!(
+        exp["native"]["actf"].as_i64().unwrap() as i32,
+        rate.mantissa,
+        "Wire mantissa ↔ Native actf 同次一致"
+    );
+    assert_eq!(
+        exp["mesa"]["machine_feed"].as_u64().unwrap(),
+        100,
+        "mesa machine_feed == 100"
+    );
+}
+
+/// feed single：`0x24-only` 探针响应 36B → mantissa=200（captured）。
+fn feed_single_decodes() {
+    let frame = assemble_frame(&read("feed", "feed_response_single.bin"));
+    let rate = decode_feed_rate(&frame).expect("single 形态必须解码");
+    assert_eq!(rate.mantissa, 200);
+    assert_eq!(rate.base, 10);
+    assert_eq!(rate.exponent, 0);
+}
+
+/// feed 请求：生产形态 count=1/40B（`0x24-only` Gate 冻结）。
+fn feed_request_locked() {
+    let raw = read("feed", "feed_request.bin");
+    let frames = cut_fixture_frames(&raw);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].len(), 40, "feed 请求必须 40B（count=1）");
+    assert_eq!(
+        &frames[0][..20],
+        &[
+            0xA0, 0xA0, 0xA0, 0xA0, 0x00, 0x01, 0x21, 0x01, 0x00, 0x1e, 0x00, 0x01, 0x00, 0x1c,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x24,
+        ]
+    );
 }
