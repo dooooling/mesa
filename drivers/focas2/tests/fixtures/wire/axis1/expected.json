@@ -1,0 +1,21 @@
+{
+  "operation": "axis_absolute",
+  "axis": 1,
+  "panel": {
+    "name": "X",
+    "absolute": "-2.880"
+  },
+  "native": {
+    "value": -2880,
+    "data0": -2880,
+    "type": 1
+  },
+  "mesa": {
+    "axis_absolute": -2880
+  },
+  "source": {
+    "open_variant": "00 02",
+    "capture": "axis_a0p.pcapng\u5b9a\u5411\u6293\u5305\uff08filter 165:8193\uff09\uff0c00 02 GENERIC-capable \u6570\u636e\u6d41",
+    "stream": 61096
+  }
+}

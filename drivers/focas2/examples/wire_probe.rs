@@ -1,11 +1,12 @@
-//! `wire_probe`（PR1 开发工具 + PR2 feed，非生产路径）：Wire 直连真机验证。
+//! `wire_probe`（PR1 开发工具 + PR2 feed + PR3 axis，非生产路径）：
+//! Wire 直连真机验证。
 //!
 //! - 用法：`MESA_WIRE_HOST=192.168.15.165 cargo run -p mesa-driver-focas2
 //!   --example wire_probe`（可选 `MESA_WIRE_PORT`，默认 8193）。
-//! - 只调 `system_info` + `status_info` + `feed_rate`，打印结果；不碰 Native、
+//! - 只调 `system_info` + `status/feed/axis.absolute`，打印结果；不碰 Native、
 //!   不改生产 backend、不写 fixture。
 //! - Gate 0 期望（165）：series=G31Z/version=10.0，
-//!   `StatusInfo.aut` 与面板 mode 一致（MEM=1/MDI=0）；feed 与 Native actf 一致。
+//!   `StatusInfo.aut` 与面板 mode 一致（MEM=1/MDI=0）；feed/axis 与 Native 一致。
 
 use std::time::Duration;
 
@@ -35,9 +36,12 @@ async fn main() {
     let addrs = vec![
         parse_address("status").expect("status 地址合法"),
         parse_address("feed").expect("feed 地址合法"),
+        parse_address("axis.abs.1").expect("axis1 地址合法"),
+        parse_address("axis.abs.2").expect("axis2 地址合法"),
+        parse_address("axis.abs.3").expect("axis3 地址合法"),
     ];
     match api.read_batch(&addrs).await {
-        Ok(vals) => println!("status+feed -> {vals:?}"),
+        Ok(vals) => println!("status+feed+axis123 -> {vals:?}"),
         Err(e) => eprintln!("read_batch 失败：{e}"),
     }
     api.disconnect().await;

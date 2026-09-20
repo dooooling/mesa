@@ -47,6 +47,11 @@ pub(crate) fn run_all() {
     feed_9pack_decodes();
     feed_single_decodes();
     feed_request_locked();
+    axis1_decodes();
+    axis2_decodes();
+    axis3_decodes();
+    axis4_fails_closed();
+    axis_request_locked();
 }
 
 /// sysinfo：`sysinfo_response.bin` 经生产 codec 解码 == expected 7 字段。
@@ -185,4 +190,117 @@ fn feed_request_locked() {
         frames[0], built,
         "production encoder 必须 == captured fixture 全 40B"
     );
+}
+
+/// axis1：生产 `decode_axis_position` 直解 36B 响应 → mantissa=-2880。
+/// （同次 Native data0=-2880，面板 X=-2.880。）
+fn axis1_decodes() {
+    use super::wire::{axis_to_value_for_test, axis_value_for_test, decode_axis_position};
+    let frame = assemble_frame(&read("axis1", "axis_response_frame2.bin"));
+    assert_eq!(frame.packet_type, PacketType::GENERIC_RESPONSE);
+    let pos = decode_axis_position(&frame).expect("生产 decode_axis_position 必须成功");
+    assert_eq!(pos.mantissa, -2880, "axis1 同次 mantissa 必须 -2880");
+    assert_eq!(pos.base, 10);
+    assert_eq!(pos.exponent, 3);
+    let exp = expected("axis1");
+    assert_eq!(
+        exp["native"]["data0"].as_i64().unwrap() as i32,
+        pos.mantissa,
+        "Wire mantissa ↔ Native data0 同次一致"
+    );
+    assert_eq!(
+        exp["mesa"]["axis_absolute"].as_i64().unwrap() as i32,
+        pos.mantissa
+    );
+    // adapter：负值合法 → I32（与 feed 的负值拒绝无关）。
+    assert_eq!(
+        axis_to_value_for_test(&pos).expect("负坐标必须 I32"),
+        axis_value_for_test(-2880),
+    );
+}
+
+/// axis2：mantissa=-3160（面板 Y=-3.160）。
+fn axis2_decodes() {
+    use super::wire::decode_axis_position;
+    let frame = assemble_frame(&read("axis2", "axis_response_frame2.bin"));
+    let pos = decode_axis_position(&frame).expect("axis2 必须解码");
+    assert_eq!(pos.mantissa, -3160);
+    assert_eq!(pos.base, 10);
+    assert_eq!(pos.exponent, 3);
+    let exp = expected("axis2");
+    assert_eq!(
+        exp["native"]["data0"].as_i64().unwrap() as i32,
+        pos.mantissa
+    );
+}
+
+/// axis3：mantissa=-10（面板 Z=-0.010，小值）。
+fn axis3_decodes() {
+    use super::wire::decode_axis_position;
+    let frame = assemble_frame(&read("axis3", "axis_response_frame2.bin"));
+    let pos = decode_axis_position(&frame).expect("axis3 必须解码");
+    assert_eq!(pos.mantissa, -10);
+    let exp = expected("axis3");
+    assert_eq!(
+        exp["native"]["data0"].as_i64().unwrap() as i32,
+        pos.mantissa
+    );
+}
+
+/// axis4 负控制：codec 照常解出字段（mantissa==Native），但 adapter
+/// fail-closed（exp=51 → Unsupported → ERR/BAD，不进 I32）。
+fn axis4_fails_closed() {
+    use super::wire::{axis_to_value_for_test, decode_axis_position};
+    let frame = assemble_frame(&read("axis4_nc", "axis_response_frame2.bin"));
+    let pos = decode_axis_position(&frame).expect("codec 必须解出字段");
+    assert_eq!(pos.mantissa, 0x2000_0202);
+    assert_eq!(pos.exponent, 51);
+    let exp = expected("axis4_nc");
+    assert_eq!(
+        exp["native"]["data0"].as_i64().unwrap() as i32,
+        pos.mantissa,
+        "无效轴 Native↔Wire mantissa 仍一致（错的是 CNC 值本身）"
+    );
+    assert!(
+        axis_to_value_for_test(&pos).is_err(),
+        "exp=51 必须 fail-closed"
+    );
+}
+
+/// axis 请求：生产编码器输出 == 捕获 fixture（`encode == request` 闭环）。
+/// 四组（axis1/2/3/4_nc）全部锁定 selector `1→1/2→2/3→3/4→4`；
+/// 每组 frame#1（`0x18` preflight）与 frame#2（`0x26`）双锁。
+fn axis_request_locked() {
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+    use super::frame::{encode_generic_request, request_subpacket};
+    use super::wire::{AXIS_ARG0_OBSERVED, DEV_CNC, FUNC_AXIS_ABSOLUTE, FUNC_SYSINFO};
+    let build = |func: u32, args: [i32; 5]| {
+        FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(DEV_CNC, func, args)]),
+        }
+        .encode()
+    };
+    for (group, axis) in [("axis1", 1), ("axis2", 2), ("axis3", 3), ("axis4_nc", 4)] {
+        // frame#2：0x26(axis) 全 40B。
+        let raw = read(group, "axis_request_frame2.bin");
+        let frames = cut_fixture_frames(&raw);
+        assert_eq!(frames.len(), 1, "{group} frame#2 必须恰好 1 帧");
+        assert_eq!(frames[0].len(), 40, "{group} frame#2 必须 40B");
+        assert_eq!(
+            frames[0],
+            build(FUNC_AXIS_ABSOLUTE, [AXIS_ARG0_OBSERVED, axis, 0, 0, 0]),
+            "{group} production encoder 必须 == captured fixture 全 40B"
+        );
+        // frame#1：0x18 preflight 全 40B（operation request evidence 闭环）。
+        let raw1 = read(group, "axis_request_frame1.bin");
+        let frames1 = cut_fixture_frames(&raw1);
+        assert_eq!(frames1.len(), 1, "{group} frame#1 必须恰好 1 帧");
+        assert_eq!(
+            frames1[0],
+            build(FUNC_SYSINFO, [0, 0, 0, 0, 0]),
+            "{group} frame#1 必须 == 0x18 preflight 全 40B"
+        );
+    }
 }

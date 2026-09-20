@@ -1,0 +1,21 @@
+{
+  "operation": "axis_absolute",
+  "axis": 3,
+  "panel": {
+    "name": "Z",
+    "absolute": "-0.010"
+  },
+  "native": {
+    "value": -10,
+    "data0": -10,
+    "type": 3
+  },
+  "mesa": {
+    "axis_absolute": -10
+  },
+  "source": {
+    "open_variant": "00 02",
+    "capture": "axis_a3.pcapng\u5b9a\u5411\u6293\u5305\uff08filter 165:8193\uff09\uff0c00 02 GENERIC-capable \u6570\u636e\u6d41",
+    "stream": 64998
+  }
+}

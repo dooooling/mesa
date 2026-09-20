@@ -1,0 +1,17 @@
+{
+  "operation": "axis_absolute",
+  "axis": 4,
+  "panel": null,
+  "native": {
+    "value": 536871426,
+    "data0": 536871426
+  },
+  "mesa": {
+    "axis_absolute": "ERR:fail-closed (exp=51)"
+  },
+  "source": {
+    "open_variant": "00 02",
+    "capture": "axis_n4.pcapng\u5b9a\u5411\u6293\u5305\uff08filter 165:8193\uff09\uff0c00 02 GENERIC-capable \u6570\u636e\u6d41",
+    "stream": 57136
+  }
+}
