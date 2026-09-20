@@ -268,29 +268,39 @@ fn axis4_fails_closed() {
 }
 
 /// axis 请求：生产编码器输出 == 捕获 fixture（`encode == request` 闭环）。
-/// axis1 frame#2：`v0=4/v1=1`（A0' observed；A0 乱序不复刻）。
+/// 四组（axis1/2/3/4_nc）全部锁定 selector `1→1/2→2/3→3/4→4`；
+/// 每组 frame#1（`0x18` preflight）与 frame#2（`0x26`）双锁。
 fn axis_request_locked() {
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
     use super::frame::{encode_generic_request, request_subpacket};
-    use super::wire::{AXIS_KIND_ABSOLUTE, DEV_CNC, FUNC_AXIS_ABSOLUTE};
-    let raw = read("axis1", "axis_request_frame2.bin");
-    let frames = cut_fixture_frames(&raw);
-    assert_eq!(frames.len(), 1);
-    assert_eq!(frames[0].len(), 40, "axis 请求必须 40B（count=1）");
-    let built = {
-        use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+    use super::wire::{AXIS_ARG0_OBSERVED, DEV_CNC, FUNC_AXIS_ABSOLUTE, FUNC_SYSINFO};
+    let build = |func: u32, args: [i32; 5]| {
         FocasFrame {
             origin: REQUEST_ORIGIN,
             packet_type: PacketType::GENERIC_REQUEST,
-            payload: encode_generic_request(&[request_subpacket(
-                DEV_CNC,
-                FUNC_AXIS_ABSOLUTE,
-                [AXIS_KIND_ABSOLUTE, 1, 0, 0, 0],
-            )]),
+            payload: encode_generic_request(&[request_subpacket(DEV_CNC, func, args)]),
         }
         .encode()
     };
-    assert_eq!(
-        frames[0], built,
-        "production encoder 必须 == captured fixture 全 40B"
-    );
+    for (group, axis) in [("axis1", 1), ("axis2", 2), ("axis3", 3), ("axis4_nc", 4)] {
+        // frame#2：0x26(axis) 全 40B。
+        let raw = read(group, "axis_request_frame2.bin");
+        let frames = cut_fixture_frames(&raw);
+        assert_eq!(frames.len(), 1, "{group} frame#2 必须恰好 1 帧");
+        assert_eq!(frames[0].len(), 40, "{group} frame#2 必须 40B");
+        assert_eq!(
+            frames[0],
+            build(FUNC_AXIS_ABSOLUTE, [AXIS_ARG0_OBSERVED, axis, 0, 0, 0]),
+            "{group} production encoder 必须 == captured fixture 全 40B"
+        );
+        // frame#1：0x18 preflight 全 40B（operation request evidence 闭环）。
+        let raw1 = read(group, "axis_request_frame1.bin");
+        let frames1 = cut_fixture_frames(&raw1);
+        assert_eq!(frames1.len(), 1, "{group} frame#1 必须恰好 1 帧");
+        assert_eq!(
+            frames1[0],
+            build(FUNC_SYSINFO, [0, 0, 0, 0, 0]),
+            "{group} frame#1 必须 == 0x18 preflight 全 40B"
+        );
+    }
 }

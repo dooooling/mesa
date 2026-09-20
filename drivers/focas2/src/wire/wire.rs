@@ -164,7 +164,7 @@ pub const AXIS_DATA_LEN: usize = 8;
 /// CNC 设备（Gate 0：`0x0001`；PMC=`0x0002`，PR3 axis 未用）。
 pub(super) const DEV_CNC: u16 = 0x0001;
 /// `system_info`（Gate 0：`00 01 00 18`）。
-const FUNC_SYSINFO: u32 = 0x0001_0018;
+pub(super) const FUNC_SYSINFO: u32 = 0x0001_0018;
 /// `status_info`（Gate 0：`00 01 00 19`）。
 const FUNC_STATINFO: u32 = 0x0001_0019;
 /// statinfo 序列伴随 function（未知语义；只验 framing 后跳过）。
@@ -174,10 +174,11 @@ const FUNC_UNKNOWN_98: u32 = 0x0001_0098;
 /// `feed_rate`（feed 证据 PASS：`00 01 00 24`，`0x24-only` 真机冻结）。
 pub(super) const FUNC_FEED: u32 = 0x0001_0024;
 /// `axis_absolute`（axis 证据 PASS：`00 01 00 26`，`v0=4/v1=ordinal` 真机冻结；
-/// A0 `[2,3,1]` 为 FWLIB-local 历史异常，不复刻，fresh Wire 恒直透）。
+/// A0 曾观测 `[2,3,1]`，原因未知；后续 fresh-process capture 稳定观测
+/// `v1 == ordinal`，Wire 按已闭合合同直透 ordinal，不复刻 A0 异常）。
 pub(super) const FUNC_AXIS_ABSOLUTE: u32 = 0x0001_0026;
-/// axis `0x26` 请求 kind（165 实测恒 `4`；语义未知，不命名）。
-pub(super) const AXIS_KIND_ABSOLUTE: i32 = 4;
+/// axis `0x26` 请求首个参数实测恒 `4`（165 observed；语义未知，不命名业务含义）。
+pub(super) const AXIS_ARG0_OBSERVED: i32 = 4;
 
 // ---------------------------------------------------------------------------
 // FocasClient：typed operations（串行，session guard 覆盖完整 operation）
@@ -362,10 +363,10 @@ impl FocasClient {
     }
 
     /// `axis_absolute(axis)`（axis 证据 PASS：`0x18` preflight + `0x26`
-    /// count=1，`v0=4/v1=ordinal`；A0 `[2,3,1]` 为 FWLIB-local 历史异常，
-    /// fresh Wire 恒直透，不复刻）。响应单 8B position value。
+    /// count=1，`v0=4/v1=ordinal`；A0 `[2,3,1]` 原因未知，不复刻）。
+    /// 响应单 8B position value。
     pub async fn axis_absolute(&self, axis: u8) -> Result<AxisPosition, WireError> {
-        // `v1 = ordinal`（165 observed mapping；A0 乱序已定性为陈旧状态）。
+        // `v1 = ordinal`（165 observed mapping；A0 异常原因未知，不复刻）。
         // 产品上限外（0 或 >8）fail-closed，不发包（与 Native `Param` 同语义）。
         if axis == 0 || axis > 8 {
             return Err(WireError::Unsupported("axis ordinal 1..8"));
@@ -385,7 +386,7 @@ impl FocasClient {
             payload: encode_generic_request(&[request_subpacket(
                 DEV_CNC,
                 FUNC_AXIS_ABSOLUTE,
-                [AXIS_KIND_ABSOLUTE, axis as i32, 0, 0, 0],
+                [AXIS_ARG0_OBSERVED, axis as i32, 0, 0, 0],
             )]),
         };
         let mut guard = self.session.lock().await;
@@ -1044,7 +1045,7 @@ mod tests {
         let payload = encode_generic_request(&[request_subpacket(
             DEV_CNC,
             FUNC_AXIS_ABSOLUTE,
-            [AXIS_KIND_ABSOLUTE, 2, 0, 0, 0],
+            [AXIS_ARG0_OBSERVED, 2, 0, 0, 0],
         )]);
         // count=1 + 28B = 30 = 0x1e（与 sysinfo/feed 同长）。
         assert_eq!(payload.len(), 0x1e);

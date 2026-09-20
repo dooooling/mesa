@@ -11,6 +11,7 @@
   },
   "source": {
     "open_variant": "00 02",
-    "capture": "axis_n4\u5b9a\u5411\u6293\u5305\uff0c00 02 \u6570\u636e\u6d41\uff0c\u8981\u6c42 adapter fail-closed"
+    "capture": "axis_n4.pcapng\u5b9a\u5411\u6293\u5305\uff08filter 165:8193\uff09\uff0c00 02 GENERIC-capable \u6570\u636e\u6d41",
+    "stream": 57136
   }
 }
