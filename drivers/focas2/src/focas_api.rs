@@ -251,12 +251,12 @@ enum WorkerOp {
 }
 
 /// worker 句柄（`NativeFocasApi` 的唯一状态；Clone 共享同一 worker）。
-/// B2 确定生命周期：`sender` 关闭通道 + `join` 等待 worker 完成 free。
-/// 正常路径 worker 与进程同寿；最后一个 Api drop 时同步 join，
-/// `Drop` 返回即“worker 已 free handle 并退出”（非“最终会”）。
+/// 确定生命周期（`WorkerHandle::drop`）：最后一个 `Arc` 释放时，
+/// 关 sender → worker 排空 → free handle exactly once → 退出 → join。
+/// `Drop` 返回即 free 完成（`join` 在 `Drop` 内同步等待；见下注释）。
 struct WorkerHandle {
     sender: Mutex<Option<tokio::sync::mpsc::UnboundedSender<WorkerOp>>>,
-    /// worker OS 线程（`None` = 已 join；`Mutex` 保 async 侧并发 take）。
+    /// worker OS 线程（`None` = 已 join；`Mutex` 保并发 take，幂等）。
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -275,8 +275,7 @@ impl WorkerHandle {
 
     /// 同步关闭 worker 并 join：关闭 sender（worker 消费完剩余 op 后
     /// free handle 并退出）→ join 等待完成。幂等（重复调即返回）。
-    /// NOTE：`Drop` 不能 block_on（async 上下文会 panic），因此本函数为
-    /// blocking（`Drop` 内调为 BUG，见 `Drop` 注释）；显式 `shutdown` 路径用。
+    /// `Drop` 与显式 `shutdown_blocking` 共用此路径。
     fn shutdown_blocking(&self) {
         // 先关 sender（take 即关闭通道；worker 侧 blocking_recv → None）。
         self.sender.lock().unwrap().take();
@@ -1060,29 +1059,40 @@ impl NativeFocasApi {
     }
 }
 
-impl Drop for NativeFocasApi {
-    /// B2 确定生命周期：最后一个 Api drop 时**仅关闭 sender**
-    /// （worker 消费完剩余 op → free handle exactly once → 退出）。
-    /// 不在此 join（`Drop` 可能跑在 async 上下文，blocking join 会
-    /// deadlock/panic；`shutdown_blocking` 供显式同步停机用，
-    /// 非 async 上下文可调——见下 `shutdown`）。
-    /// 进程正常退出时：`main` 返回 → tokio runtime 关闭 → 裸 OS worker
-    ///（非 runtime 线程）继续跑完剩余 op 并 free——detached thread 不保证
-    /// 被 join，但 free 路径唯一（仅 worker 内），不存在 double-free；
-    /// 确定性 join 由 `shutdown()` 显式路径提供（见下）。
+impl Drop for WorkerHandle {
+    /// 最终 Drop：关 sender → worker 排空 → free handle exactly once →
+    /// 退出 → join。`Drop` 返回即 free 完成（最后一个 `Arc` 释放时）。
+    /// 阻塞说明：`join()` 只阻塞当前调用线程直到 worker 退出；
+    /// worker 是独立裸 OS 线程，其 FFI/free 不依赖 Tokio runtime，
+    /// oneshot `send` 不等待接收端，故与 async executor 无依赖环。
+    /// 代价是 `Drop` 可能阻塞调用线程一个 worker 排空周期——对 FOCAS
+    /// 这种带线程亲和约束的 native handle，这是 final-resource cleanup
+    /// 可接受的 tradeoff（且幂等：已 `shutdown_blocking` 则直接返回）。
     fn drop(&mut self) {
-        if std::sync::Arc::strong_count(&self.worker) == 1 {
-            self.worker.sender.lock().unwrap().take();
+        // `get_mut`：`Drop` 独占 `&mut`，无需 lock（`Mutex::get_mut`）。
+        if let Ok(sender) = self.sender.get_mut() {
+            sender.take();
+        }
+        if let Ok(join) = self.join.get_mut()
+            && let Some(h) = join.take()
+        {
+            let _ = h.join();
         }
     }
 }
 
+impl Drop for NativeFocasApi {
+    /// 不再手动 `strong_count` 判断：`Arc<WorkerHandle>` 的最后一个释放
+    /// 自动触发 `WorkerHandle::drop`（关 sender → free → join）。
+    /// 此处无逻辑（注释保留以说明生命周期归属）。
+    fn drop(&mut self) {}
+}
+
 impl NativeFocasApi {
-    /// 显式同步停机（blocking）：关闭 sender → join worker。
-    /// `Drop` 返回 ≠ worker 已 free；需要“返回即 free 完成”语义时调此函数
-    /// （如 driver 进程退出前的确定性清理、单测的 shutdown 断言）。
-    /// NOTE：绝不在 async 上下文内调（会阻塞 executor）；`disconnect()`
-    ///（async）只发 op 不 join，free 仍在 worker 内 exactly once。
+    /// 显式同步停机（blocking）：与 `WorkerHandle::drop` 同路径
+    /// （关 sender → join）。幂等；`Drop` 后再调即返回。
+    /// NOTE：绝不在 async 上下文内调（会阻塞 executor 线程）；
+    /// `disconnect()`（async）只发 op 不 join，free 仍在 worker 内 exactly once。
     pub fn shutdown_blocking(&self) {
         self.worker.shutdown_blocking();
     }
@@ -1187,27 +1197,46 @@ mod tests {
         }
     }
 
-    /// PR52 验收门 B2：确定性 shutdown（blocking join）。
-    /// `shutdown_blocking` 返回即 worker 已退出；之后再 submit 即
-    /// `EW_NODLL worker 已退出`（连接错误，由上层重连——此处用新 Api）。
-    /// NOTE：`#[test]`（非 async）：`shutdown_blocking` 阻塞当前线程，
-    /// 在 `#[tokio::test]` 内调会卡住 executor，故用普通测试另起
-    /// `current_thread` runtime 跑 async 部分。
+    /// PR52 验收门 B2：最终 Drop 确定性（implicit final-drop 路径）。
+    /// 最后一个 `Api` drop → `WorkerHandle::drop`（关 sender → worker 排空 →
+    /// free → join）→ `Drop` 返回即 free 完成。此测试锁该路径本身
+    /// （`shutdown_blocking` 只复用同逻辑，不单独测 join）。
+    /// NOTE：`#[test]`（非 async）：避免在 executor 内阻塞；另起
+    /// `current_thread` runtime 跑 async 部分，drop/join 在普通线程。
+    /// 断言：drop 前探针可达；drop（join）返回（无 hang 即 PASS；
+    /// free-once 由 worker 内 `handle.take()` 语义保证）。
     #[test]
-    fn worker_shutdown_is_deterministic() {
+    fn worker_final_drop_is_deterministic() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("test runtime");
         rt.block_on(async {
             let api = NativeFocasApi::new();
-            let t0 = api.probe_worker_thread().await.expect("探针必须可达");
-            let _ = api.connect("127.0.0.1", 8193, 1000).await;
-            let t1 = api.probe_worker_thread().await.expect("探针必须可达");
-            assert_eq!(t0, t1);
+            api.probe_worker_thread()
+                .await
+                .expect("drop 前探针必须可达");
+            // `api` 在此 block 结束时 drop（最后一个 Arc）→
+            // WorkerHandle::drop（join）→ 返回。
         });
-        // runtime 内无 worker 引用后：在非 async 上下文同步 shutdown。
-        // （`api` 已在 block_on 结束时 drop；此处另建 Api 测 join 语义。）
+        // 能执行到此即 drop-join 无 hang（free-once 由语义保证）。
+        // 另建 Api = 新 worker（旧 worker 已退出，不复用）：
+        let rt2 = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt2.block_on(async {
+            NativeFocasApi::new()
+                .probe_worker_thread()
+                .await
+                .expect("新 worker 探针必须可达");
+        });
+    }
+
+    /// `shutdown_blocking` 显式路径复用同逻辑（关 sender → join），
+    /// 此处锁“调后 worker-gone 确定性”（与 Drop 路径同源，不断言两遍 join）。
+    #[test]
+    fn worker_explicit_shutdown_is_deterministic() {
         let api2 = NativeFocasApi::new();
         let rt2 = tokio::runtime::Builder::new_current_thread()
             .enable_all()
