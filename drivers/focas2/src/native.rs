@@ -1162,26 +1162,23 @@ impl NativeLib {
     /// 生产/证据共用 raw 调用：`cnc_absolute(axis, 8, OdbAxis*)` 直调已加载
     /// 的 typed 符号，返回完整 `OdbAxis`。生产经 `single_axis_value` 取
     /// `data[0]`；证据工具同一次调用复用 full（单次 FFI，无时间差）。
+    /// 安全要点：单轴 `length=8` 只覆盖 `dummy/type + data[0]`（8B），
+    /// FOCAS 只保证写前 8B；因此 `out` 先整体零初始化再传入，
+    /// `data[1..]` 保持 caller-initialized 0（不是 CNC 输出，不解释），
+    /// 全程无 `MaybeUninit::assume_init`。
     fn cnc_absolute_raw_inner(&self, hdl: u16, axis: u8) -> Result<OdbAxis, FocasRet> {
         if axis == 0 || axis > FOCAS_AXIS_PRODUCT_MAX {
             return Err(FocasRet::Param);
         }
         let sym = self.cnc_absolute.as_ref().ok_or(FocasRet::Nodll)?;
-        let mut out = std::mem::MaybeUninit::<OdbAxis>::uninit();
-        let rc = unsafe {
-            sym(
-                hdl as c_ushort,
-                axis as c_short,
-                FOCAS_AXIS_BATCH,
-                out.as_mut_ptr(),
-            )
+        let mut out = OdbAxis {
+            dummy: 0,
+            type_: 0,
+            data: [0; 8],
         };
+        let rc = unsafe { sym(hdl as c_ushort, axis as c_short, FOCAS_AXIS_BATCH, &mut out) };
         let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() {
-            Ok(unsafe { out.assume_init() })
-        } else {
-            Err(ret)
-        }
+        if ret.is_ok() { Ok(out) } else { Err(ret) }
     }
 
     /// 读轴绝对坐标：`cnc_absolute(hdl, axis, 8, ODBAXIS*)`，`platform` 未单列但 `collectors/AxisData` 间接依赖
@@ -2382,8 +2379,11 @@ mod tests {
                 None,
             ),
         };
-        // 产品合同：成功即 raw c_int → I32（不断言具体值，由现场对照面板）。
+        // 产品合同：成功即 data[0] → I32（不断言具体值，由现场对照面板）。
         // 失败时 full 为 None（serde None → null），不伪造 data 数组。
+        // 语义冻结：单轴 length=8 下只有 data[0] 是 FOCAS 合同有效 position；
+        // data[1..] 为 caller-initialized tail（本实现零初始化），不是 CNC
+        // 输出，不解释、不做法证材料（`dummy` 同理，文档即 Not used）。
         let doc = serde_json::json!({
             "operation": "absolute",
             "axis": axis,
@@ -2393,7 +2393,7 @@ mod tests {
                 "error": err,
                 "dummy": full.as_ref().map(|f| f.dummy),
                 "type": full.as_ref().map(|f| f.type_),
-                "data": full.as_ref().map(|f| f.data),
+                "data0": full.as_ref().map(|f| f.data[0]),
             },
             "mesa": { "axis_absolute": value },
         });
