@@ -144,9 +144,9 @@ impl FakeFocasApi {
                 if bit.is_some() {
                     Value::Bool((r & 1) != 0)
                 } else {
-                    // 字节/字范围
+                    // 字节/字范围（PR56 产品合同：无 bit 时 I32，与生产一致）。
                     let _ = addr;
-                    Value::U32(r % 256)
+                    Value::I32((r % 256) as i32)
                 }
             }
             FocasAddress::Diagnosis { number: _ } => Value::I32((r % 2001) as i32 - 1000),
@@ -956,7 +956,9 @@ impl NativeFocasApi {
                                 let b = lib
                                     .pmc_rdpmcrng_byte(hdl, adr_type, *addr)
                                     .map_err(Self::map_ret_err)?;
-                                Ok(Value::U32(b as u32))
+                                // PR56 产品合同修正：BYTE raw `u8` → `I32`
+                                //（Descriptor 无 bit 时为 I32；旧 `U32` 漂移）。
+                                Ok(Value::I32(b as i32))
                             }
                             Err(e) => Err(Self::map_ret_err(e)),
                         }
@@ -965,7 +967,8 @@ impl NativeFocasApi {
                         let b = lib
                             .pmc_rdpmcrng_byte(hdl, adr_type, *addr)
                             .map_err(Self::map_ret_err)?;
-                        Ok(Value::U32(b as u32))
+                        // PR56 产品合同修正：同上（底层 `u8` raw 不变，只改 adapter）。
+                        Ok(Value::I32(b as i32))
                     }
                 }
             }

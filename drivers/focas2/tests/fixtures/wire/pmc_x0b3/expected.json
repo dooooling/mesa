@@ -1,0 +1,26 @@
+{
+  "operation": "pmc_scalar",
+  "kind": "X",
+  "addr": 0,
+  "bit": 3,
+  "native": {
+    "adr_type": 3,
+    "data_type": 0,
+    "start": 0,
+    "end": 0,
+    "rc": 0
+  },
+  "mesa": {
+    "pmc_bit3": false
+  },
+  "source": {
+    "kind": "direct_socket_capture",
+    "target": "192.168.15.165:8193",
+    "open_variant": "00 02",
+    "evidence_point": "P1b",
+    "evidence_window": "pmc scalar P0~P3",
+    "request": "hand-built per frozen contract (device=2/path=1/cmd=0x8001/A0=start/A1=end/A2=adr/A3=dtype)",
+    "response": "live bytes, same-window as native pmc_rdpmcrng",
+    "note": "no pcap (direct probe); no stream id — do not fabricate"
+  }
+}

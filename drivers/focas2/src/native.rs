@@ -2528,4 +2528,146 @@ mod tests {
         let pretty = serde_json::to_string_pretty(&doc).expect("expected.json 序列化失败");
         gate0_emit(&pretty, &out);
     }
+
+    /// PMC Evidence Window P0（WORD identity，第一优先）：
+    /// `connect → pmc_rdpmcrng_word(kind, addr)（单次 FFI）→ disconnect`。
+    /// - kind/addr/bit 由 `MESA_FOCAS_PMC_KIND/ADDR/BIT` 决定
+    ///   （默认 `R/100`；P0 只做 WORD：R/A/T/C）；
+    /// - 直接调对应单次 FFI（bit 走 `pmc_rdpmcrng_bit` 同 BYTE 路径），
+    ///   不经 read_batch/planner（一次操作多个物理调用会污染抓包 identity）；
+    /// - 法证输出：`kind/addr/bit/adr_type/data_type/start/end/length` +
+    ///   `rc` + raw bytes + native/mesa value；
+    /// - 第一目标只回答 device/path/command/selector 布局，不猜 command ID；
+    /// - 不写 Wire 代码、不碰生产路径（PMC 证据窗口专用，codec/range BLOCKED）。
+    #[test]
+    #[ignore]
+    fn pmc_dump_rdpmcrng() {
+        let kind: char = std::env::var("MESA_FOCAS_PMC_KIND")
+            .ok()
+            .and_then(|s| s.chars().next())
+            .unwrap_or('R');
+        let addr: u32 = std::env::var("MESA_FOCAS_PMC_ADDR")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+        let bit: Option<u8> = std::env::var("MESA_FOCAS_PMC_BIT")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let (host, port, timeout_ms, out) = gate0_params();
+        let timeout_secs = (timeout_ms.div_ceil(1000).max(1).min(i32::MAX as u64)) as i32;
+        let lib =
+            NativeLib::load().unwrap_or_else(|e| panic!("FWLIB 加载失败（{host}:{port}）：{e}"));
+        let hdl = lib
+            .cnc_allclibhndl3(&host, port, timeout_secs)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
+                    e as i16,
+                    e.message()
+                )
+            });
+        // 单次 FFI（按产品布局选 width；bit 读 BYTE raw 后本地 projection——
+        // 不调 `pmc_rdpmcrng_bit` helper（它已返回 bool，raw byte 丢失），
+        // 直接 `pmc_rdpmcrng_byte` 取 raw，再本地 mask；仍单次 FFI）。
+        let adr_type = NativeLib::pmc_adr_type(kind);
+        let (data_type, width, base_len) = NativeLib::pmc_layout(kind, bit);
+        let doc = if let Some(b) = bit {
+            let (rc, raw): (i16, Option<u8>) = match lib.pmc_rdpmcrng_byte(hdl, adr_type, addr) {
+                Ok(v) => (0, Some(v)),
+                Err(e) => (e as i16, None),
+            };
+            let _ = lib.cnc_freelibhndl(hdl);
+            serde_json::json!({
+                "operation": "pmc_rdpmcrng",
+                "kind": kind.to_string(),
+                "addr": addr,
+                "bit": b,
+                "native": {
+                    "adr_type": adr_type,
+                    "data_type": data_type,
+                    "width": width,
+                    "length": base_len,
+                    "start": addr,
+                    "end": addr,
+                    "rc": rc,
+                    "ok": raw.is_some(),
+                    "raw_byte": raw,
+                },
+                "mesa": { "pmc_bit": raw.map(|v| ((v >> b) & 1) != 0) },
+            })
+        } else if width == 4 {
+            let (rc, raw): (i16, Option<c_int>) = match lib.pmc_rdpmcrng_dword(hdl, adr_type, addr)
+            {
+                Ok(v) => (0, Some(v)),
+                Err(e) => (e as i16, None),
+            };
+            let _ = lib.cnc_freelibhndl(hdl);
+            serde_json::json!({
+                "operation": "pmc_rdpmcrng",
+                "kind": kind.to_string(),
+                "addr": addr,
+                "native": {
+                    "adr_type": adr_type,
+                    "data_type": data_type,
+                    "width": width,
+                    "length": base_len,
+                    "start": addr,
+                    "end": addr + 3,
+                    "rc": rc,
+                    "ok": raw.is_some(),
+                    "raw_dword": raw,
+                },
+                "mesa": { "pmc_value": raw },
+            })
+        } else if width == 2 {
+            let (rc, raw): (i16, Option<c_short>) = match lib.pmc_rdpmcrng_word(hdl, adr_type, addr)
+            {
+                Ok(v) => (0, Some(v)),
+                Err(e) => (e as i16, None),
+            };
+            let _ = lib.cnc_freelibhndl(hdl);
+            serde_json::json!({
+                "operation": "pmc_rdpmcrng",
+                "kind": kind.to_string(),
+                "addr": addr,
+                "native": {
+                    "adr_type": adr_type,
+                    "data_type": data_type,
+                    "width": width,
+                    "length": base_len,
+                    "start": addr,
+                    "end": addr + 1,
+                    "rc": rc,
+                    "ok": raw.is_some(),
+                    "raw_word": raw,
+                },
+                "mesa": { "pmc_value": raw.map(|v| v as i32) },
+            })
+        } else {
+            let (rc, raw): (i16, Option<u8>) = match lib.pmc_rdpmcrng_byte(hdl, adr_type, addr) {
+                Ok(v) => (0, Some(v)),
+                Err(e) => (e as i16, None),
+            };
+            let _ = lib.cnc_freelibhndl(hdl);
+            serde_json::json!({
+                "operation": "pmc_rdpmcrng",
+                "kind": kind.to_string(),
+                "addr": addr,
+                "native": {
+                    "adr_type": adr_type,
+                    "data_type": data_type,
+                    "width": width,
+                    "length": base_len,
+                    "start": addr,
+                    "end": addr,
+                    "rc": rc,
+                    "ok": raw.is_some(),
+                    "raw_byte": raw,
+                },
+                "mesa": { "pmc_value": raw.map(|v| v as i32) },
+            })
+        };
+        let pretty = serde_json::to_string_pretty(&doc).expect("expected.json 序列化失败");
+        gate0_emit(&pretty, &out);
+    }
 }

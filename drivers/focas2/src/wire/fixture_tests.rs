@@ -1,4 +1,4 @@
-//! Fixture 回归（PR1 Level 2 + PR2 feed + PR54 spindle + PR55 macro）：
+//! Fixture 回归（PR1 Level 2 + PR2 feed + PR54 spindle + PR55 macro + PR56 pmc）：
 //! 真机捕获 → 生产 codec 直测。
 //!
 //! - 数据：165 定向抓包 → `10B header + payload_len` 精确切帧 → 去重传/
@@ -11,6 +11,8 @@
 //! - macro 证据（M0~M3）：`0x15` mcr=0/250000000/123450000/-750000000 +
 //!   dec=0/7/7/8 ↔ Native cnc_rdmacro 同次；request `args=[n,n,0,0]`；
 //!   Mesa 取 scaled F64（与 feed/spindle 取 mantissa 形成对照）。
+//! - pmc 证据（P0~P3）：`0x8001/device=2` scalar；BYTE/WORD/DWORD +
+//!   bit projection；Mesa BYTE→I32（PR56 产品合同修正）。
 //! - 本模块 `#[cfg(test)]` 且 crate 内部：直接调生产 decoder，无复刻。
 
 use std::path::PathBuf;
@@ -65,6 +67,8 @@ pub(crate) fn run_all() {
     spindle_request_locked();
     macro_m0m3_decodes();
     macro_request_locked();
+    pmc_scalar_decodes();
+    pmc_request_locked();
 }
 
 /// sysinfo：`sysinfo_response.bin` 经生产 codec 解码 == expected 7 字段。
@@ -447,6 +451,107 @@ fn macro_request_locked() {
         .encode();
         assert_eq!(build.len(), 40, "{group} 0x15 请求必须 40B");
         let raw = read(group, "macro_request_frame.bin");
+        let frames = cut_fixture_frames(&raw);
+        assert_eq!(frames.len(), 1, "{group} 必须恰好 1 帧");
+        assert_eq!(frames[0].len(), 40, "{group} 必须 40B");
+        assert_eq!(
+            frames[0], build,
+            "{group} production encoder 必须 == captured fixture 全 40B"
+        );
+    }
+}
+
+/// pmc scalar P0~P3：`pmc_response_frame.bin` 经生产 codec 解码 ==
+/// expected（BYTE/WORD/DWORD + bit projection；Mesa BYTE→I32）。
+fn pmc_scalar_decodes() {
+    use super::wire::{PmcArea, PmcScalarValue, decode_pmc_scalar, pmc_scalar_to_value};
+    for (group, kind, addr, want) in [
+        ("pmc_r100", 'R', 100u32, mesa_core_types::Value::I32(0)),
+        ("pmc_r110", 'R', 110, mesa_core_types::Value::I32(0)),
+        ("pmc_x0", 'X', 0, mesa_core_types::Value::I32(0)),
+        ("pmc_y0", 'Y', 0, mesa_core_types::Value::I32(4)),
+        ("pmc_f0", 'F', 0, mesa_core_types::Value::I32(192)),
+        ("pmc_g0", 'G', 0, mesa_core_types::Value::I32(0)),
+        ("pmc_a0", 'A', 0, mesa_core_types::Value::I32(0)),
+        ("pmc_t0", 'T', 0, mesa_core_types::Value::I32(0)),
+        ("pmc_c0", 'C', 0, mesa_core_types::Value::I32(0)),
+        ("pmc_k0", 'K', 0, mesa_core_types::Value::I32(0)),
+        ("pmc_d0", 'D', 0, mesa_core_types::Value::I32(4)),
+    ] {
+        let area = PmcArea::from_kind(kind).expect("{group} kind 必须 canonical");
+        let frame = assemble_frame(&read(group, "pmc_response_frame.bin"));
+        let v = decode_pmc_scalar(&frame, area).expect("{group} 必须解码");
+        assert_eq!(
+            pmc_scalar_to_value(&v),
+            want,
+            "{group} Mesa 映射（BYTE→I32 合同）"
+        );
+        let exp = expected(group);
+        assert_eq!(
+            exp["kind"].as_str().unwrap(),
+            kind.to_string(),
+            "{group} kind"
+        );
+        assert_eq!(exp["addr"].as_u64().unwrap() as u32, addr, "{group} addr");
+        // 非零点额外锁原始位型（Y0=0x04/F0=0xC0/D0=4）。
+        match (group, v) {
+            ("pmc_y0", PmcScalarValue::Byte(0x04))
+            | ("pmc_f0", PmcScalarValue::Byte(0xC0))
+            | ("pmc_d0", PmcScalarValue::Dword(4)) => {}
+            ("pmc_y0" | "pmc_f0" | "pmc_d0", _) => {
+                panic!("{group} 原始位型不符")
+            }
+            _ => {}
+        }
+    }
+    // P1b bit projection：X0=0x00 → bit3=false（本地 mask，不进 Wire）。
+    let frame = assemble_frame(&read("pmc_x0b3", "pmc_response_frame.bin"));
+    let v = decode_pmc_scalar(&frame, PmcArea::from_kind('X').unwrap()).expect("x0b3 必须解码");
+    assert_eq!(v, PmcScalarValue::Byte(0x00));
+    let byte = 0x00u8;
+    assert_eq!((byte >> 3) & 1, 0, "X0.3 必须 false");
+}
+
+/// pmc 请求：生产编码器输出 == 捕获 fixture（`encode == request` 闭环）。
+/// 12 组 request 各 40B（`device=2/[start,end,adr,dt]/aux=0`）。
+fn pmc_request_locked() {
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+    use super::frame::{encode_generic_request, request_subpacket};
+    use super::wire::{DEV_PMC, FUNC_PMC_READ, PmcArea};
+    for (group, kind, addr) in [
+        ("pmc_r100", 'R', 100u32),
+        ("pmc_r110", 'R', 110),
+        ("pmc_x0", 'X', 0),
+        ("pmc_x0b3", 'X', 0),
+        ("pmc_y0", 'Y', 0),
+        ("pmc_f0", 'F', 0),
+        ("pmc_g0", 'G', 0),
+        ("pmc_a0", 'A', 0),
+        ("pmc_t0", 'T', 0),
+        ("pmc_c0", 'C', 0),
+        ("pmc_k0", 'K', 0),
+        ("pmc_d0", 'D', 0),
+    ] {
+        let area = PmcArea::from_kind(kind).expect("{group} kind 必须 canonical");
+        let end = addr + (area.width() as u32).saturating_sub(1);
+        let build = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_PMC,
+                FUNC_PMC_READ,
+                [
+                    addr as i32,
+                    end as i32,
+                    area.adr_type() as i32,
+                    area.data_type() as i32,
+                    0,
+                ],
+            )]),
+        }
+        .encode();
+        assert_eq!(build.len(), 40, "{group} 0x8001 请求必须 40B");
+        let raw = read(group, "pmc_request_frame.bin");
         let frames = cut_fixture_frames(&raw);
         assert_eq!(frames.len(), 1, "{group} 必须恰好 1 帧");
         assert_eq!(frames[0].len(), 40, "{group} 必须 40B");
