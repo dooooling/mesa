@@ -526,10 +526,12 @@ impl FocasClient {
     /// `macro_value(number)`（macro Evidence PASS：`0x15` count=1，
     /// `args=[number,number,0,0]/aux=0`；单点语义，不做范围读）。
     /// 宏号超 `c_short` 即 `Unsupported`，不发包（与 Native `Param` 同语义，
-    /// 禁止 `as` 截断配 A 读 B）。
+    /// 禁止 `as` 截断配 A 读 B；Wire-local checked conversion，不依赖 Native）。
     /// 响应单 8B macro value。
     pub async fn macro_value(&self, number: u32) -> Result<MacroValue, WireError> {
-        let n = crate::native::to_c_short(number)
+        // Wire-local：`u32 → i16` checked（PR55 B1：wire.rs 不引用
+        // `crate::native`，ARM64 pure-Wire 不带 Native ABI 依赖）。
+        let n = i16::try_from(number)
             .map_err(|_| WireError::Unsupported("macro number out of c_short range"))?
             as i32;
         let req = FocasFrame {
@@ -1896,6 +1898,28 @@ mod tests {
             exponent: 7,
         };
         assert_eq!(macro_to_value(&m).unwrap(), Value::F64(25.0));
+    }
+
+    /// B4 scale authority 回归（macro）：`raw base=0x010A=266` 经 `as u8`
+    /// 截断成 `10`（兼容视图看起来合法），但生产 adapter 必须以 raw
+    /// full-width scale 为权威 → `Unsupported`（未知 scale 不输出假 F64）。
+    #[test]
+    fn macro_truncated_scale_must_fail() {
+        let m = MacroValue {
+            raw: [0, 0, 0, 1, 0x01, 0x0A, 0, 0], // raw base = 266
+            mantissa: 1,
+            base: 10, // 截断值（兼容视图看起来合法）
+            exponent: 0,
+        };
+        assert_eq!(
+            RawNumeric8::decode(&m.raw).unwrap().base,
+            266,
+            "raw 01 0A 必须解为 u16 266"
+        );
+        assert!(matches!(
+            macro_to_value(&m).unwrap_err(),
+            WireError::Unsupported(_)
+        ));
     }
 
     /// macro 缺 `0x15` 即 `CommandMismatch`（保守致命）。
