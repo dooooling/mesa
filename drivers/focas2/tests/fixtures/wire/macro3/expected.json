@@ -1,0 +1,24 @@
+{
+  "operation": "macro_value",
+  "number": 503,
+  "native": {
+    "rc": 0,
+    "datano": 503,
+    "mcr_val": -750000000,
+    "dec_val": 8,
+    "scaled": -7.5
+  },
+  "mesa": {
+    "macro_value": -7.5
+  },
+  "source": {
+    "kind": "direct_socket_capture",
+    "target": "192.168.15.165:8193",
+    "open_variant": "00 02",
+    "evidence_point": "M3",
+    "evidence_window": "macro M0~M3 (#500=0, #501=25.0, #502=12.345, #503=-7.5)",
+    "request": "hand-built per frozen contract (device=1/path=1/cmd=0x15/args=[n,n,0,0]/aux=0)",
+    "response": "live bytes, same-window as native cnc_rdmacro",
+    "note": "no pcap for M0~M3 (direct probe, not pktmon); no stream id — do not fabricate"
+  }
+}

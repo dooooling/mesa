@@ -218,6 +218,24 @@ impl AxisPosition {
     }
 }
 
+/// FOCAS `macro_value`（`0x15`）typed 结果。macro Evidence PASS。
+/// 旧 `{mantissa, base: u8, exponent: u8}` 在 M0~M3（`0x000A` + `0/7/8`）下
+/// 与 `RawNumeric8` 等价，保留为兼容视图；真实布局见 `RawNumeric8`。
+/// 与 feed/spindle/axis 的关键区别（证据结论，非猜测）：Mesa 取
+/// engineering/scaled F64（`mantissa / 10^exponent`），不是 native mantissa。
+/// signed mantissa 合法（M3 `-750000000` 真机证据）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacroValue {
+    /// 原始 8B。
+    pub raw: [u8; 8],
+    /// 定点尾数（i32 BE；M0~M3 实测 `0/250000000/123450000/-750000000`）。
+    pub mantissa: i32,
+    /// 缩放基（M0~M3 实测 `10`；真实为 u16，兼容视图截断）。
+    pub base: u8,
+    /// 缩放指数（M0~M3 实测 `0/7/7/8`；真实为 i16）。
+    pub exponent: u8,
+}
+
 /// FOCAS `spindle_speed`（`0x25`）typed 结果。spindle Evidence PASS。
 /// 旧 `{mantissa, base: u8, exponent: u8}` 在 S0~S4（`0x000A/0x0000`）下
 /// 与 `RawNumeric8` 等价，保留为兼容视图；真实布局见 `RawNumeric8`。
@@ -263,6 +281,10 @@ pub const AXIS_DATA_LEN: usize = 8;
 /// S0~S4 `data_len=8` 稳定，`RawNumeric8` 第三个独立 operation；
 /// 与 feed/axis 同构但独立常量，不抽公共语义）。
 pub const SPINDLE_DATA_LEN: usize = 8;
+/// MACRO 数据体（8B scaled value；macro Evidence PASS：
+/// M0~M3 `data_len=8` 稳定，`RawNumeric8` 第四个独立 operation；
+/// 与 feed/axis/spindle 同构但独立常量，不抽公共语义）。
+pub const MACRO_DATA_LEN: usize = 8;
 
 // ---------------------------------------------------------------------------
 // 路径/命令 id（PR53 真实模型）：`function u32 = path<<16|command`。
@@ -290,6 +312,10 @@ pub(super) const CMD_HDCK: u16 = 0x00e1;
 pub(super) const CMD_TMMODE: u16 = 0x0098;
 /// `feed_rate` 命令（`0x24`，`0x24-only` 真机冻结）。
 pub(super) const CMD_FEED: u16 = 0x0024;
+/// `macro_value` 命令（`0x15`，macro Evidence PASS：
+/// M0~M3 `device=1/path=1/args=[n,n,0,0]/aux=0`；单点语义，
+/// `start=end=number`，不做范围读）。
+pub(super) const CMD_MACRO: u16 = 0x0015;
 /// `spindle_speed` 命令（`0x25`，spindle Evidence PASS：
 /// S0~S4 `device=1/path=1/args=[0,0,0,0]/aux=0` 逐字节恒定，无 selector）。
 pub(super) const CMD_SPINDLE_SPEED: u16 = 0x0025;
@@ -306,6 +332,8 @@ const FUNC_UNKNOWN_E1: u32 = 0x0001_00e1;
 const FUNC_UNKNOWN_98: u32 = 0x0001_0098;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_FEED)`）。
 pub(super) const FUNC_FEED: u32 = 0x0001_0024;
+/// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_MACRO)`）。
+pub(super) const FUNC_MACRO: u32 = 0x0001_0015;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_SPINDLE_SPEED)`）。
 pub(super) const FUNC_SPINDLE_SPEED: u32 = 0x0001_0025;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_AXIS_ABSOLUTE)`）。
@@ -485,6 +513,50 @@ impl FocasClient {
         };
         drop(guard);
         match decode_feed_rate(&resp) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if e.is_session_fatal() {
+                    self.invalidate().await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// `macro_value(number)`（macro Evidence PASS：`0x15` count=1，
+    /// `args=[number,number,0,0]/aux=0`；单点语义，不做范围读）。
+    /// 宏号超 `c_short` 即 `Unsupported`，不发包（与 Native `Param` 同语义，
+    /// 禁止 `as` 截断配 A 读 B）。
+    /// 响应单 8B macro value。
+    pub async fn macro_value(&self, number: u32) -> Result<MacroValue, WireError> {
+        let n = crate::native::to_c_short(number)
+            .map_err(|_| WireError::Unsupported("macro number out of c_short range"))?
+            as i32;
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_MACRO,
+                [n, n, 0, 0, 0],
+            )]),
+        };
+        let mut guard = self.session.lock().await;
+        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                drop(guard);
+                if fatal {
+                    self.invalidate().await;
+                }
+                return Err(e);
+            }
+        };
+        drop(guard);
+        match decode_macro_value(&resp) {
             Ok(v) => Ok(v),
             Err(e) => {
                 if e.is_session_fatal() {
@@ -745,6 +817,42 @@ pub(super) fn decode_spindle_speed(resp: &FocasFrame) -> Result<SpindleSpeed, Wi
     })
 }
 
+/// `0x15` 响应解码：slot 匹配 `0x15`，成功数据精确 8B（与 feed/axis/spindle
+/// 同构，独立 decoder，不抽公共类型；`RawNumeric8` 第四个独立 operation）。
+/// 缺 `0x15` 即 `CommandMismatch`。
+pub(super) fn decode_macro_value(resp: &FocasFrame) -> Result<MacroValue, WireError> {
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub =
+        match_slot(&subs, DEV_CNC, PATH_CNC, CMD_MACRO, 0).ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    if d.len() != MACRO_DATA_LEN {
+        return Err(WireError::MalformedPayload);
+    }
+    let num = RawNumeric8::decode(d)?;
+    Ok(MacroValue {
+        raw: num.raw,
+        mantissa: num.mantissa,
+        base: num.base as u8,
+        exponent: num.exponent as u8,
+    })
+}
+
+/// Mesa `macro/value` 映射（macro Evidence PASS + B4 真实权威）：
+/// 以 `raw` 重建 `RawNumeric8` 为权威（`u16 base/i16 exponent`），不读
+/// 兼容视图截断值。**与 feed/spindle/axis 的关键区别（证据结论）**：
+/// Mesa 取 engineering/scaled F64（`mantissa / 10^exponent`），不是
+/// native mantissa（M1 `250000000/10^7=25.0`、M3 `-750000000/10^8=-7.5`
+/// 真机证据；`Value::F64(250000000.0)` 是错的）。
+/// fail-closed（不猜 scale）：走 `engineering_value()` 证据门
+/// （`base == 10` + exponent 可计算范围）；无法解释的 scale 即
+/// `Unsupported`（ERR → BAD），绝不输出看似正常的 F64。
+fn macro_to_value(m: &MacroValue) -> Result<Value, WireError> {
+    let num = RawNumeric8::decode(&m.raw)?;
+    let (numer, denom) = num.engineering_value()?;
+    // `denom = 10^exp > 0`（门内保证）；F64 除法（Mesa 产品合同 F64）。
+    Ok(Value::F64(numer as f64 / denom as f64))
+}
+
 /// Mesa `machine/spindle_speed` 映射（spindle Evidence PASS + PR53 B4）：
 /// 以 `raw` 重建 `RawNumeric8` 为权威（`u16 base/i16 exponent`），不读
 /// 兼容视图截断值。`native_value = mantissa` → `Value::I32`
@@ -803,6 +911,13 @@ pub(super) fn spindle_to_value_for_test(spd: &SpindleSpeed) -> Result<Value, Wir
     spindle_to_value(spd)
 }
 
+/// fixture/test 专用：生产 `macro_to_value` 同源入口（`#[cfg(test)]`，
+/// 不出 crate；macro M0~M3 fixture 回归用）。
+#[cfg(test)]
+pub(super) fn macro_to_value_for_test(m: &MacroValue) -> Result<Value, WireError> {
+    macro_to_value(m)
+}
+
 /// fixture/test 专用：`Value::I32` 构造子（断言可读性用）。
 #[cfg(test)]
 pub(super) fn axis_value_for_test(v: i32) -> Value {
@@ -810,11 +925,12 @@ pub(super) fn axis_value_for_test(v: i32) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed + PR3 axis + PR54 spindle）
+// WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed + PR3 axis + PR54 spindle
+// + PR55 macro）
 // ---------------------------------------------------------------------------
 
-/// Wire 版 `FocasApi`（PR54：`system_info` + `Status` + `Feed` +
-/// `Axis/absolute` + `ActiveSpindleSpeed`；其余地址 `Unsupported`，
+/// Wire 版 `FocasApi`（PR55：`system_info` + `Status` + `Feed` +
+/// `Axis/absolute` + `ActiveSpindleSpeed` + `MacroVar`；其余地址 `Unsupported`，
 /// fail-closed，不猜、不 fallback Native）。
 pub struct WireFocasApi {
     client: Arc<FocasClient>,
@@ -858,7 +974,8 @@ impl FocasApi for WireFocasApi {
             return Ok(Vec::new());
         }
         // 同一批共享请求：Status/Feed/ActiveSpindle 各一次；Axis 按轴号各一次
-        // （`0x26` 单轴语义，无多轴数组）；其余 fail-closed。
+        // （`0x26` 单轴语义，无多轴数组）；Macro 按宏号各一次（`0x15` 单点，
+        // 不做范围读）；其余 fail-closed。
         // client 内部按 operation 持 guard。
         // 致命 session 错误在预取阶段立即短路（point-local 才进批）。
         // 非 Absolute 的 Axis kind（Machine/Relative/…）与 Native 同口径
@@ -950,6 +1067,29 @@ impl FocasApi for WireFocasApi {
         } else {
             None
         };
+        // Macro 按宏号各一次 0x15（单点语义；超 c_short 在 operation 内 fail-closed）。
+        let mut macro_map: BTreeMap<u32, Result<Value, String>> = BTreeMap::new();
+        for a in addresses {
+            if let FocasAddress::MacroVar { number } = a
+                && !macro_map.contains_key(number)
+            {
+                let r: Result<Value, String> = match self.client.macro_value(*number).await {
+                    Ok(m) => match macro_to_value(&m) {
+                        Ok(v) => Ok(v),
+                        Err(e) => match Self::point_or_fatal(e) {
+                            Ok(Value::String(s)) => Err(s),
+                            Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                            Err(fatal) => return Err(fatal),
+                        },
+                    },
+                    Err(e) => match Self::point_or_fatal(e) {
+                        Ok(v) => Ok(v),
+                        Err(fatal) => return Err(fatal),
+                    },
+                };
+                macro_map.insert(*number, r);
+            }
+        }
         let mut out = Vec::with_capacity(addresses.len());
         for addr in addresses {
             match addr {
@@ -975,9 +1115,16 @@ impl FocasApi for WireFocasApi {
                     Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
                     Err(fatal) => return Err(fatal),
                 },
+                FocasAddress::MacroVar { number } => {
+                    match macro_map.get(number).cloned().unwrap() {
+                        Ok(v) => out.push(v),
+                        Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
+                        Err(fatal) => return Err(fatal),
+                    }
+                }
                 _ => out.push(Value::String(format!(
                     "ERR:{}",
-                    WireError::Unsupported("PR54 only Status/Feed/Absolute/ActiveSpindle")
+                    WireError::Unsupported("PR55 only Status/Feed/Absolute/ActiveSpindle/Macro")
                 ))),
             }
         }
@@ -1651,5 +1798,158 @@ mod tests {
                 "axis={axis} 必须 Unsupported（不发包）"
             );
         }
+    }
+
+    /// macro `0x15` 请求：count=1（Evidence M0~M3 冻结形态：
+    /// `args=[number,number,0,0]/aux=0`，单点语义，不做范围读）。
+    #[test]
+    fn macro_request_single_locked() {
+        use super::super::frame::encode_generic_request as enc;
+        let payload = enc(&[request_subpacket(DEV_CNC, FUNC_MACRO, [501, 501, 0, 0, 0])]);
+        // count=1 + 28B = 30 = 0x1e（与 sysinfo/feed/axis/spindle 同长）。
+        assert_eq!(payload.len(), 0x1e);
+        assert_eq!(&payload[0..2], &[0x00, 0x01]);
+        let back = decode_generic_payload(&payload).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].function, FUNC_MACRO);
+    }
+
+    /// macro M1 响应解码：`0e e6 b2 80 00 0a 00 07` → mantissa=250000000。
+    /// adapter 必须得 `Value::F64(25.0)`，绝不能得 `F64(250000000.0)`
+    /// （防以后误复用 feed/spindle 的 `native_value()`）。
+    #[test]
+    fn decode_macro_m1_scaled() {
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x08]);
+        p.extend_from_slice(&[0x0E, 0xE6, 0xB2, 0x80, 0x00, 0x0A, 0x00, 0x07]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_MACRO,
+                payload: p,
+            }]),
+        };
+        // 2 + 24 = 26 = 0x1a（M1 捕获形态，与 feed/axis/spindle 同尺寸）。
+        assert_eq!(frame.payload.len(), 0x1a);
+        let m = decode_macro_value(&frame).unwrap();
+        assert_eq!(m.mantissa, 250000000);
+        assert_eq!(m.base, 10);
+        assert_eq!(m.exponent, 7);
+        assert_eq!(m.raw, [0x0E, 0xE6, 0xB2, 0x80, 0x00, 0x0A, 0x00, 0x07]);
+        // RawNumeric8 真实值（第四个独立 operation）。
+        assert_eq!(RawNumeric8::decode(&m.raw).unwrap().base, 10);
+        assert_eq!(RawNumeric8::decode(&m.raw).unwrap().exponent, 7);
+        // adapter：scaled F64（与 Native scaled=25.0 同合同）。
+        assert_eq!(macro_to_value(&m).unwrap(), Value::F64(25.0));
+    }
+
+    /// macro M3 负值：`d3 4b e8 80 00 0a 00 08` → `Value::F64(-7.5)`（锁符号）。
+    #[test]
+    fn decode_macro_m3_negative() {
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x08]);
+        p.extend_from_slice(&[0xD3, 0x4B, 0xE8, 0x80, 0x00, 0x0A, 0x00, 0x08]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_MACRO,
+                payload: p,
+            }]),
+        };
+        let m = decode_macro_value(&frame).unwrap();
+        assert_eq!(m.mantissa, -750000000);
+        assert_eq!(macro_to_value(&m).unwrap(), Value::F64(-7.5));
+    }
+
+    /// macro M0 零值：mantissa=0 → F64(0.0)（不是 BAD）。
+    #[test]
+    fn decode_macro_m0_zero() {
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x08]);
+        p.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_MACRO,
+                payload: p,
+            }]),
+        };
+        let m = decode_macro_value(&frame).unwrap();
+        assert_eq!(m.mantissa, 0);
+        assert_eq!(macro_to_value(&m).unwrap(), Value::F64(0.0));
+    }
+
+    /// B4 authority 回归（macro 成功路径）：raw 与兼容视图故意矛盾——
+    /// 生产 adapter 必须读 raw，不读 `m.mantissa`。
+    #[test]
+    fn macro_adapter_uses_raw_value_authority() {
+        let m = MacroValue {
+            raw: [0x0E, 0xE6, 0xB2, 0x80, 0, 10, 0, 7], // raw = 250000000/10^7
+            mantissa: 1,                                // compat 故意错误
+            base: 10,
+            exponent: 7,
+        };
+        assert_eq!(macro_to_value(&m).unwrap(), Value::F64(25.0));
+    }
+
+    /// macro 缺 `0x15` 即 `CommandMismatch`（保守致命）。
+    #[test]
+    fn missing_macro_is_mismatch() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_FEED, // 故意放错槽
+                payload: {
+                    let mut p = vec![0x00; 6];
+                    p.extend_from_slice(&[0x00, 0x08]);
+                    p.extend_from_slice(&[0x00, 0x00, 0x00, 0x64, 0x00, 0x0A, 0x00, 0x00]);
+                    p
+                },
+            }]),
+        };
+        let e = decode_macro_value(&frame).unwrap_err();
+        assert!(matches!(e, WireError::CommandMismatch));
+        assert!(e.is_session_fatal());
+    }
+
+    /// macro typed payload 内部精确闭合（与 feed/axis/spindle 同原则）。
+    #[test]
+    fn macro_trailing_payload_rejected() {
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x08]);
+        p.extend_from_slice(&[0x0E, 0xE6, 0xB2, 0x80, 0x00, 0x0A, 0x00, 0x07]);
+        p.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_MACRO,
+                payload: p,
+            }]),
+        };
+        assert_eq!(
+            decode_macro_value(&frame).unwrap_err().to_string(),
+            WireError::MalformedPayload.to_string(),
+        );
+    }
+
+    /// macro number 越界 fail-closed：超 `c_short` 不发包（与 Native Param 同语义）。
+    #[tokio::test]
+    async fn macro_number_out_of_range() {
+        let client = FocasClient::new(std::time::Duration::from_millis(10));
+        let e = client.macro_value(40000).await.unwrap_err();
+        assert!(
+            matches!(e, WireError::Unsupported(_)),
+            "macro=40000 必须 Unsupported（不发包）"
+        );
     }
 }
