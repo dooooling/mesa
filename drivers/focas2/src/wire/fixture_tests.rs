@@ -1,5 +1,5 @@
-//! Fixture 回归（PR1 Level 2 + PR2 feed + PR54 spindle + PR55 macro + PR56 pmc）：
-//! 真机捕获 → 生产 codec 直测。
+//! Fixture 回归（PR1 Level 2 + PR2 feed + PR54 spindle + PR55 macro + PR56 pmc
+//! + PR57 param + PR58 opmsg）：真机捕获 → 生产 codec 直测。
 //!
 //! - 数据：165 定向抓包 → `10B header + payload_len` 精确切帧 → 去重传/
 //!   拼接残留（`tests/fixtures/wire/{sysinfo,statinfo_mem,statinfo_mdi,feed}/`）。
@@ -13,14 +13,16 @@
 //!   Mesa 取 scaled F64（与 feed/spindle 取 mantissa 形成对照）。
 //! - pmc 证据（P0~P3）：`0x8001/device=2` scalar；BYTE/WORD/DWORD +
 //!   bit projection；Mesa BYTE→I32（PR56 产品合同修正）。
+//! - param 证据（Q0/Q3/P-C）：`0x8D` integer-safe scalar；Mesa I32。
+//! - opmsg 证据（O0/O1）：`0x34 type=4` → #3006 文本；Mesa String。
 //! - 本模块 `#[cfg(test)]` 且 crate 内部：直接调生产 decoder，无复刻。
 
 use std::path::PathBuf;
 
 use super::frame::{FRAME_HEADER_LEN, FocasFrame, PacketType, decode_header};
 use super::wire::{
-    decode_feed_rate, decode_macro_value, decode_spindle_speed, decode_status_info,
-    decode_system_info,
+    decode_feed_rate, decode_macro_value, decode_opmsg_value, decode_spindle_speed,
+    decode_status_info, decode_system_info,
 };
 use super::{cut_fixture_frames, fixture_dir, read_fixture_bytes};
 
@@ -114,6 +116,8 @@ pub(crate) fn run_all() {
     param_decodes();
     param_q0_negative_evidence();
     param_request_locked();
+    opmsg_o1o0_decodes();
+    opmsg_request_locked();
 }
 
 /// sysinfo：`sysinfo_response.bin` 经生产 codec 解码 == expected 7 字段。
@@ -681,6 +685,60 @@ fn param_request_locked() {
         .encode();
         assert_eq!(build.len(), 40, "{group} 0x8D 请求必须 40B");
         let raw = read(group, "param_request_frame.bin");
+        let frames = cut_fixture_frames(&raw);
+        assert_eq!(frames.len(), 1, "{group} 必须恰好 1 帧");
+        assert_eq!(frames[0].len(), 40, "{group} 必须 40B");
+        assert_eq!(
+            frames[0], build,
+            "{group} production encoder 必须 == evidence request fixture 全 40B"
+        );
+    }
+}
+
+/// opmsg O1/O0：`opmsg_response_frame.bin` 经生产 codec 解码 ==
+/// expected（type4 → `OPMSG TEST 123` / type0 → `OP:empty`；Mesa String）。
+fn opmsg_o1o0_decodes() {
+    use super::wire::opmsg_to_value_for_test as to_value;
+    for (group, want) in [
+        ("opmsg_type4", "OPMSG TEST 123"),
+        ("opmsg_type0", "OP:empty"),
+    ] {
+        let frame = assemble_frame(&read(group, "opmsg_response_frame.bin"));
+        let m = decode_opmsg_value(&frame).expect("{group} 必须解码");
+        assert_eq!(m.text, want, "{group} text");
+        let exp = expected(group);
+        assert_eq!(
+            exp["mesa"]["opmsg_value"].as_str().unwrap(),
+            want,
+            "{group} Mesa↔Wire text 一致"
+        );
+        assert_eq!(
+            to_value(&m).expect("{group} adapter 必须通过"),
+            mesa_core_types::Value::String(want.to_string()),
+            "{group} Mesa String"
+        );
+    }
+}
+
+/// opmsg 请求：生产编码器输出 == evidence request fixture（`encode == request`）。
+/// type4/type0 各 40B（`args=[type,0,0,0]/aux=0`，产品固定 type=4）。
+fn opmsg_request_locked() {
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+    use super::frame::{encode_generic_request, request_subpacket};
+    use super::wire::{DEV_CNC, FUNC_OPMSG};
+    for (group, typ) in [("opmsg_type4", 4), ("opmsg_type0", 0)] {
+        let build = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_OPMSG,
+                [typ, 0, 0, 0, 0],
+            )]),
+        }
+        .encode();
+        assert_eq!(build.len(), 40, "{group} 0x34 请求必须 40B");
+        let raw = read(group, "opmsg_request_frame.bin");
         let frames = cut_fixture_frames(&raw);
         assert_eq!(frames.len(), 1, "{group} 必须恰好 1 帧");
         assert_eq!(frames[0].len(), 40, "{group} 必须 40B");

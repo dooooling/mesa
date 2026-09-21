@@ -367,6 +367,22 @@ pub struct ParamValue {
     pub value: i32,
 }
 
+/// FOCAS `opmsg_value`（`0x34`）typed 结果。opmsg Evidence PASS。
+/// 极简 typed（`raw 268B + header 12B opaque + text String`；header 字段
+/// `[4..8]=4/[8..12]=15` 候选不命名、不依赖——`text_len` 推测留后续窗口）。
+/// 产品固定 `type=4`（Mesa `opmsg/value` = FANUC #3006，不暴露 type 参数；
+/// `type=0..3` 空 / `type=5` Remote 只留 evidence/test；`0xD0` 不动）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorMessage {
+    /// 原始数据区（`data_len=268` 全量）。
+    pub raw: Vec<u8>,
+    /// header（12B opaque；语义未命名，只保留 raw）。
+    pub header: [u8; 12],
+    /// 文本（256B 区首 NUL 截断 + UTF-8 lossy + trim；空即 `OP:empty`，
+    /// 与 Native 产品合同同源）。
+    pub text: String,
+}
+
 /// param v1 已验证 identity-scale tail 形态（`value` 后 4B + 重复区头）。
 /// 只有 `00 0a 00 00`（Q3/6711 controlled 非零样本：`123/456/10027` 三点 +
 /// 恢复闭环）可输出 `I32`。Q0 的 `00 0a 00 03`（value=0，无辨别力——
@@ -410,6 +426,16 @@ pub const MACRO_DATA_LEN: usize = 8;
 /// tail 必须为已验证 identity-scale 形态（见 `PARAM_TAIL_VERIFIED`），
 /// 否则 fail-closed（REAL/未知 scale 留 Param REAL Evidence Window）。
 pub const PARAM_DATA_LEN: usize = 264;
+/// OPMSG 数据体（268B；opmsg Evidence PASS：
+/// O1 `type=4 → #3006` 非空 + O0 `type=0..3` 空 + `type=5` Remote；
+/// `data_len=268` 稳定）。布局：`header 12B opaque` + `text 256B`；
+/// header 字段（`[4..8]=4/[8..12]=15` 候选）不命名、不依赖，
+/// 只保留 raw（`text_len` 推测留后续窗口，不冻结）。
+pub const OPMSG_DATA_LEN: usize = 268;
+/// OPMSG 文本区（256B fixed；首 NUL 截断，UTF-8 lossy，trim）。
+pub const OPMSG_TEXT_LEN: usize = 256;
+/// OPMSG header（12B opaque；语义未命名，只保留 raw）。
+pub const OPMSG_HEADER_LEN: usize = 12;
 
 // ---------------------------------------------------------------------------
 // 路径/命令 id（PR53 真实模型）：`function u32 = path<<16|command`。
@@ -451,6 +477,13 @@ pub(super) const CMD_MACRO: u16 = 0x0015;
 /// `axis=0`（当前 observed；axis-dependent 留后续窗口），不做范围读。
 /// `0x0E` 在 target165 上不适用（Q0 非零 status），不兼容/不 fallback）。
 pub(super) const CMD_PARAM: u16 = 0x008D;
+/// `opmsg_value` 命令（`0x34`，opmsg Evidence PASS：
+/// O1 `type=4 → #3006` 非空 + O0 `type=0..3` 空 + `type=5` Remote；
+/// `device=1/path=1/args=[type,0,0,0]/aux=0`；产品固定 `type=4`
+///（Mesa `opmsg/value` = FANUC #3006，不暴露 type 参数；`0xD0` 不动）。
+pub(super) const CMD_OPMSG: u16 = 0x0034;
+/// `opmsg` 产品 type（`#3006` Operator Message；O1 真机证实）。
+pub(super) const OPMSG_TYPE_PRODUCT: i32 = 4;
 /// `spindle_speed` 命令（`0x25`，spindle Evidence PASS：
 /// S0~S4 `device=1/path=1/args=[0,0,0,0]/aux=0` 逐字节恒定，无 selector）。
 pub(super) const CMD_SPINDLE_SPEED: u16 = 0x0025;
@@ -476,6 +509,8 @@ pub(super) const FUNC_FEED: u32 = 0x0001_0024;
 pub(super) const FUNC_MACRO: u32 = 0x0001_0015;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_PARAM)`）。
 pub(super) const FUNC_PARAM: u32 = 0x0001_008D;
+/// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_OPMSG)`）。
+pub(super) const FUNC_OPMSG: u32 = 0x0001_0034;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_SPINDLE_SPEED)`）。
 pub(super) const FUNC_SPINDLE_SPEED: u32 = 0x0001_0025;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_AXIS_ABSOLUTE)`）。
@@ -748,6 +783,46 @@ impl FocasClient {
         };
         drop(guard);
         match decode_param_value(&resp, number) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if e.is_session_fatal() {
+                    self.invalidate().await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// `opmsg_value()`（opmsg Evidence PASS：`0x34` count=1，
+    /// `args=[4,0,0,0]/aux=0`；产品固定 `type=4` = FANUC #3006，
+    /// 不暴露 type 参数；`0xD0` 不动）。
+    /// 单次 exchange；响应 `data_len=268`（12B header opaque + 256B 文本）。
+    pub async fn opmsg_value(&self) -> Result<OperatorMessage, WireError> {
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_OPMSG,
+                [OPMSG_TYPE_PRODUCT, 0, 0, 0, 0],
+            )]),
+        };
+        let mut guard = self.session.lock().await;
+        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                drop(guard);
+                if fatal {
+                    self.invalidate().await;
+                }
+                return Err(e);
+            }
+        };
+        drop(guard);
+        match decode_opmsg_value(&resp) {
             Ok(v) => Ok(v),
             Err(e) => {
                 if e.is_session_fatal() {
@@ -1239,6 +1314,39 @@ pub(super) fn decode_param_value(resp: &FocasFrame, number: u32) -> Result<Param
     })
 }
 
+/// `0x34` 响应解码（opmsg Evidence PASS）：slot 匹配
+/// `(device=1, path=1, cmd=0x34)`，成功数据精确 `== 268`
+/// （O1 `type=4` 非空 + O0 `type=0..3` 空真机证实）。缺槽即
+/// `CommandMismatch`；`status != 0`（如 `type=5`）走共用 Remote。
+/// 布局：`header 12B opaque`（`[4..8]/[8..12]` 候选不命名、不依赖）+
+/// `text 256B`（首 NUL 截断，UTF-8 lossy，trim；空即 `OP:empty`）。
+pub(super) fn decode_opmsg_value(resp: &FocasFrame) -> Result<OperatorMessage, WireError> {
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub =
+        match_slot(&subs, DEV_CNC, PATH_CNC, CMD_OPMSG, 0).ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    if d.len() != OPMSG_DATA_LEN {
+        return Err(WireError::MalformedPayload);
+    }
+    let mut header = [0u8; OPMSG_HEADER_LEN];
+    header.copy_from_slice(&d[..OPMSG_HEADER_LEN]);
+    let text_area = &d[OPMSG_HEADER_LEN..OPMSG_HEADER_LEN + OPMSG_TEXT_LEN];
+    // 首 NUL 截断（不依赖 `[8..12]` 候选长度字段，见 PR58）。
+    let end = text_area
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(text_area.len());
+    let s = String::from_utf8_lossy(&text_area[..end])
+        .trim()
+        .to_string();
+    let text = if s.is_empty() { "OP:empty".into() } else { s };
+    Ok(OperatorMessage {
+        raw: d.to_vec(),
+        header,
+        text,
+    })
+}
+
 /// Mesa `macro/value` 映射（macro Evidence PASS + B4 真实权威）：
 /// 以 `raw` 重建 `RawNumeric8` 为权威（`u16 base/i16 exponent`），不读
 /// 兼容视图截断值。**与 feed/spindle/axis 的关键区别（证据结论）**：
@@ -1262,6 +1370,14 @@ fn macro_to_value(m: &MacroValue) -> Result<Value, WireError> {
 /// 此处只做类型映射（`i32 → I32`），不截断/不缩放/不猜 REAL。
 fn param_to_value(p: &ParamValue) -> Result<Value, WireError> {
     Ok(Value::I32(p.value))
+}
+
+/// Mesa `opmsg/value` 映射（opmsg Evidence PASS）：
+/// `text` → `Value::String`（decoder 已首 NUL 截断 + lossy + trim；
+/// 空即 `OP:empty`，与 Native 产品合同同源）。
+/// header opaque 不进 Mesa（保留 raw 供排错，不命名语义）。
+fn opmsg_to_value(m: &OperatorMessage) -> Result<Value, WireError> {
+    Ok(Value::String(m.text.clone()))
 }
 
 /// Mesa `pmc/value` 映射（PMC scalar Evidence PASS）：
@@ -1351,6 +1467,13 @@ pub(super) fn param_to_value_for_test(p: &ParamValue) -> Result<Value, WireError
     param_to_value(p)
 }
 
+/// fixture/test 专用：生产 `opmsg_to_value` 同源入口（`#[cfg(test)]`，
+/// 不出 crate；opmsg O1/O0 fixture 回归用）。
+#[cfg(test)]
+pub(super) fn opmsg_to_value_for_test(m: &OperatorMessage) -> Result<Value, WireError> {
+    opmsg_to_value(m)
+}
+
 /// fixture/test 专用：`Value::I32` 构造子（断言可读性用）。
 #[cfg(test)]
 pub(super) fn axis_value_for_test(v: i32) -> Value {
@@ -1359,12 +1482,12 @@ pub(super) fn axis_value_for_test(v: i32) -> Value {
 
 // ---------------------------------------------------------------------------
 // WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed + PR3 axis + PR54 spindle
-// + PR55 macro + PR56 pmc scalar + PR57 param）
+// + PR55 macro + PR56 pmc scalar + PR57 param + PR58 opmsg）
 // ---------------------------------------------------------------------------
 
-/// Wire 版 `FocasApi`（PR57：`system_info` + `Status` + `Feed` +
+/// Wire 版 `FocasApi`（PR58：`system_info` + `Status` + `Feed` +
 /// `Axis/absolute` + `ActiveSpindleSpeed` + `MacroVar` + `Pmc` scalar +
-/// `Param`；其余地址 `Unsupported`，fail-closed，不猜、不 fallback Native）。
+/// `Param` + `OpMsg`；其余地址 `Unsupported`，fail-closed，不猜、不 fallback Native）。
 pub struct WireFocasApi {
     client: Arc<FocasClient>,
     host: Mutex<Option<(String, u16)>>,
@@ -1406,7 +1529,7 @@ impl FocasApi for WireFocasApi {
         if addresses.is_empty() {
             return Ok(Vec::new());
         }
-        // 同一批共享请求：Status/Feed/ActiveSpindle 各一次；Axis 按轴号各一次
+        // 同一批共享请求：Status/Feed/ActiveSpindle/OpMsg 各一次；Axis 按轴号各一次
         // （`0x26` 单轴语义，无多轴数组）；Macro 按宏号各一次（`0x15` 单点，
         // 不做范围读）；Param 按参数号各一次（`0x8D` 单点，不做范围/axis）；
         // PMC scalar 按 (kind,addr) 去重各一次（`0x8001` 单点，
@@ -1549,6 +1672,26 @@ impl FocasApi for WireFocasApi {
                 param_map.insert(*number, r);
             }
         }
+        // OpMsg：同批一次 0x34（产品固定 type=4；batch 多个 OpMsg 去重一次）。
+        let need_opmsg = addresses.iter().any(|a| matches!(a, FocasAddress::OpMsg));
+        let opmsg_r: Option<Result<Value, String>> = if need_opmsg {
+            match self.client.opmsg_value().await {
+                Ok(m) => match opmsg_to_value(&m) {
+                    Ok(v) => Some(Ok(v)),
+                    Err(e) => match Self::point_or_fatal(e) {
+                        Ok(Value::String(s)) => Some(Err(s)),
+                        Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                        Err(fatal) => return Err(fatal),
+                    },
+                },
+                Err(e) => match Self::point_or_fatal(e) {
+                    Ok(v) => Some(Ok(v)),
+                    Err(fatal) => return Err(fatal),
+                },
+            }
+        } else {
+            None
+        };
         // PMC scalar 按 request shape 去重（B1 冻结）：
         // bit=None → (kind,addr,dt=kind width)；bit=Some → (kind,addr,dt=BYTE)。
         // 缓存 raw read result（`PmcScalarValue`），不缓存最终 Value——
@@ -1639,6 +1782,11 @@ impl FocasApi for WireFocasApi {
                     Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
                     Err(fatal) => return Err(fatal),
                 },
+                FocasAddress::OpMsg => match opmsg_r.clone().unwrap() {
+                    Ok(v) => out.push(v),
+                    Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
+                    Err(fatal) => return Err(fatal),
+                },
                 FocasAddress::Pmc { kind, addr, bit } => {
                     // 非法 bit（>=8）在 map 查找前直接 point-local（no packet；
                     // prefetch 阶段已跳过，见上——未连接下也不碰 session）。
@@ -1694,7 +1842,7 @@ impl FocasApi for WireFocasApi {
                 _ => out.push(Value::String(format!(
                     "ERR:{}",
                     WireError::Unsupported(
-                        "PR57 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc/Param"
+                        "PR58 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc/Param/OpMsg"
                     )
                 ))),
             }
@@ -2885,6 +3033,173 @@ mod tests {
         let key_r = ('R', 100u32, 1u32);
         let key_rb = ('R', 100u32, 0u32);
         assert_ne!(key_r, key_rb);
+    }
+
+    /// opmsg `0x34` 请求：count=1（Evidence O1 冻结形态：
+    /// `args=[4,0,0,0]/aux=0`，产品固定 `type=4` = FANUC #3006）。
+    #[test]
+    fn opmsg_request_type4_locked() {
+        use super::super::frame::encode_generic_request as enc;
+        let payload = enc(&[request_subpacket(
+            DEV_CNC,
+            FUNC_OPMSG,
+            [OPMSG_TYPE_PRODUCT, 0, 0, 0, 0],
+        )]);
+        // count=1 + 28B = 30 = 0x1e（与 CNC 系同长，function 换 0x34）。
+        assert_eq!(payload.len(), 0x1e);
+        assert_eq!(&payload[0..2], &[0x00, 0x01]);
+        let back = decode_generic_payload(&payload).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].function, FUNC_OPMSG);
+    }
+
+    /// opmsg O1 响应解码：`OPMSG TEST 123\0` → exact String（首 NUL 截断，
+    /// 不依赖 `[8..12]` 候选长度；header opaque 保留）。
+    #[test]
+    fn decode_opmsg_o1_locked() {
+        let mut data = vec![
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x0F,
+        ];
+        data.extend_from_slice(b"OPMSG TEST 123\0");
+        data.extend(vec![0x00; 256 - 15]);
+        assert_eq!(data.len(), OPMSG_DATA_LEN);
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x01, 0x0C]);
+        p.extend_from_slice(&data);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_OPMSG,
+                payload: p,
+            }]),
+        };
+        let m = decode_opmsg_value(&frame).unwrap();
+        assert_eq!(
+            m.header,
+            [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x0F
+            ]
+        );
+        assert_eq!(m.text, "OPMSG TEST 123");
+        assert_eq!(
+            opmsg_to_value(&m).unwrap(),
+            Value::String("OPMSG TEST 123".into())
+        );
+    }
+
+    /// opmsg O0 空：256B 全零 → `OP:empty`（与 Native 产品合同同源，不是空串）。
+    #[test]
+    fn decode_opmsg_o0_empty() {
+        let data = vec![0x00; OPMSG_DATA_LEN];
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x01, 0x0C]);
+        p.extend_from_slice(&data);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_OPMSG,
+                payload: p,
+            }]),
+        };
+        let m = decode_opmsg_value(&frame).unwrap();
+        assert_eq!(m.text, "OP:empty");
+        assert_eq!(
+            opmsg_to_value(&m).unwrap(),
+            Value::String("OP:empty".into())
+        );
+    }
+
+    /// opmsg 首 NUL 截断：embedded NUL 后字节不进 String（不依赖候选长度）。
+    #[test]
+    fn decode_opmsg_first_nul_terminates() {
+        let mut data = vec![0x00; 12];
+        data.extend_from_slice(b"AB\0CD\0");
+        data.extend(vec![0x00; 256 - 6]);
+        assert_eq!(data.len(), OPMSG_DATA_LEN);
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x01, 0x0C]);
+        p.extend_from_slice(&data);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_OPMSG,
+                payload: p,
+            }]),
+        };
+        let m = decode_opmsg_value(&frame).unwrap();
+        assert_eq!(m.text, "AB");
+    }
+
+    /// opmsg 缺 `0x34` 即 `CommandMismatch`（保守致命）。
+    #[test]
+    fn missing_opmsg_is_mismatch() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_FEED, // 故意放错槽
+                payload: {
+                    let mut p = vec![0x00; 6];
+                    p.extend_from_slice(&[0x00, 0x08]);
+                    p.extend_from_slice(&[0x00, 0x00, 0x00, 0x64, 0x00, 0x0A, 0x00, 0x00]);
+                    p
+                },
+            }]),
+        };
+        let e = decode_opmsg_value(&frame).unwrap_err();
+        assert!(matches!(e, WireError::CommandMismatch));
+        assert!(e.is_session_fatal());
+    }
+
+    /// opmsg typed payload 内部精确闭合：267B 截断 / 269B trailing 均拒绝。
+    #[test]
+    fn opmsg_length_closure_rejected() {
+        // 267B（少 1B）。
+        let data_short = vec![0x00; OPMSG_DATA_LEN - 1];
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x01, 0x0B]);
+        p.extend_from_slice(&data_short);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_OPMSG,
+                payload: p,
+            }]),
+        };
+        assert_eq!(
+            decode_opmsg_value(&frame).unwrap_err().to_string(),
+            WireError::MalformedPayload.to_string(),
+            "267B 截断必须 Malformed"
+        );
+        // 269B trailing（多 1B）。
+        let mut data_long = vec![0x00; OPMSG_DATA_LEN];
+        data_long.push(0x00);
+        let mut p2 = vec![0x00; 6];
+        p2.extend_from_slice(&[0x01, 0x0C]);
+        p2.extend_from_slice(&data_long);
+        let frame2 = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_OPMSG,
+                payload: p2,
+            }]),
+        };
+        assert_eq!(
+            decode_opmsg_value(&frame2).unwrap_err().to_string(),
+            WireError::MalformedPayload.to_string(),
+            "269B trailing 必须 Malformed"
+        );
     }
 
     /// param `0x8D` 请求：count=1（Evidence Q0/Q3/6711 冻结形态：

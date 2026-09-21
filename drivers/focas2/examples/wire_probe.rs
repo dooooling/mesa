@@ -1,12 +1,12 @@
 //! `wire_probe`（PR1 开发工具 + PR2 feed + PR3 axis + PR54 spindle + PR55 macro
-//! + PR56 pmc scalar + PR57 param，非生产路径）：Wire 直连真机验证。
+//! + PR56 pmc scalar + PR57 param + PR58 opmsg，非生产路径）：Wire 直连真机验证。
 //!
 //! - 用法：`MESA_WIRE_HOST=192.168.15.165 cargo run -p mesa-driver-focas2
 //!   --example wire_probe`（可选 `MESA_WIRE_PORT`，默认 8193）。
-//! - 只调 `system_info` + `status/feed/axis.absolute/spindle_speed/macro/pmc/param`，打印结果；
+//! - 只调 `system_info` + `status/feed/axis.absolute/spindle_speed/macro/pmc/param/opmsg`，打印结果；
 //!   不碰 Native、不改生产 backend、不写 fixture。
 //! - Gate 0 期望（165）：series=G31Z/version=10.0，
-//!   `StatusInfo.aut` 与面板 mode 一致（MEM=1/MDI=0）；feed/axis/spindle/macro/pmc/param 与 Native 一致。
+//!   `StatusInfo.aut` 与面板 mode 一致（MEM=1/MDI=0）；feed/axis/spindle/macro/pmc/param/opmsg 与 Native 一致。
 
 use std::time::Duration;
 
@@ -46,9 +46,12 @@ async fn main() {
         parse_address("pmc.F0").expect("pmc F0 地址合法"),
         parse_address("pmc.D0").expect("pmc D0 地址合法"),
         parse_address("param.6711").expect("param 地址合法"),
+        parse_address("opmsg").expect("opmsg 地址合法"),
     ];
     match api.read_batch(&addrs).await {
-        Ok(vals) => println!("status+feed+axis123+spindle+macro501+pmc+param6711 -> {vals:?}"),
+        Ok(vals) => {
+            println!("status+feed+axis123+spindle+macro501+pmc+param6711+opmsg -> {vals:?}")
+        }
         Err(e) => eprintln!("read_batch 失败：{e}"),
     }
     api.disconnect().await;
