@@ -33,8 +33,8 @@ pub struct WireSession {
 impl WireSession {
     /// 建连 + OPEN 握手（Gate 0 修正：req payload `00 02`；单流复现证实
     /// `00 01` 的流上发 GENERIC 必 RST，只有 `00 02` 的流接受后续请求）。
-    /// OPEN 响应 360B payload 按最小必要处理：只验 packet type，
-    /// 不猜字段（内容保留未知）。
+    /// OPEN 响应按 PR53 `validate_open_response` 校验长度闭合
+    /// （165 `spec=3/count=10 → 360B`；未知布局即 Malformed，不当正常）。
     pub async fn connect(host: &str, port: u16, timeout: Duration) -> Result<Self, WireError> {
         let addr = format!("{host}:{port}");
         let stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
@@ -45,9 +45,10 @@ impl WireSession {
         let resp = me
             .exchange(&FocasFrame::open_request(), PacketType::OPEN_RESPONSE)
             .await?;
-        // OPEN 响应长度以 Gate 0 实测 370B 为参考，但不硬断言具体值：
-        // 只要 type 正确即认为握手完成（机型差异不堵死）。
-        let _ = resp;
+        // PR53：OPEN 能力表长度闭合（spec/count → payload_len 公式）；
+        // 失败即 session 致命（上层重连），不猜字段内容。
+        super::frame::validate_open_response(&resp.payload, resp.origin)
+            .map_err(|_| WireError::MalformedPayload)?;
         Ok(me)
     }
 
@@ -121,6 +122,18 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
 
+    /// loopback OPEN 响应替身（PR53 长度闭合）：`spec=3/count=10 →
+    /// 40+32×10=360B`（165 真机形态；count 在 payload+10，能力表零填充）。
+    fn fake_open_response() -> Vec<u8> {
+        let mut out = vec![0xA0, 0xA0, 0xA0, 0xA0, 0x00, 0x03, 0x01, 0x02, 0x01, 0x68];
+        out.extend(std::iter::repeat_n(0x00, 0x168));
+        // count 字段在 payload+10（frame+20），与真机一致。
+        out[10 + 10] = 0x00;
+        out[10 + 11] = 0x0a;
+        debug_assert_eq!(out.len(), 10 + 0x168);
+        out
+    }
+
     /// 起一个 loopback 对端：按脚本收发原始字节（测试可精确控制分片）。
     async fn spawn_script(
         script: Vec<(Vec<u8>, Vec<Vec<u8>>)>,
@@ -144,10 +157,7 @@ mod tests {
     /// OPEN/CLOSE 最小往返（Gate 0 真机字节）。
     #[tokio::test]
     async fn open_close_roundtrip() {
-        let open_resp = [0xA0, 0xA0, 0xA0, 0xA0, 0x00, 0x03, 0x01, 0x02, 0x01, 0x68]
-            .into_iter()
-            .chain(std::iter::repeat_n(0x00, 0x168))
-            .collect::<Vec<u8>>();
+        let open_resp = fake_open_response();
         let close_resp = vec![0xA0, 0xA0, 0xA0, 0xA0, 0x00, 0x03, 0x02, 0x02, 0x00, 0x00];
         let (addr, h) = spawn_script(vec![
             (FocasFrame::open_request().encode(), vec![open_resp]),
@@ -185,8 +195,7 @@ mod tests {
             // 先消费 OPEN（12B 请求→370B 响应，保证 connect 通过）。
             let mut open_req = vec![0u8; 12];
             sock.read_exact(&mut open_req).await.unwrap();
-            let mut open_resp = vec![0xA0, 0xA0, 0xA0, 0xA0, 0x00, 0x03, 0x01, 0x02, 0x01, 0x68];
-            open_resp.extend(std::iter::repeat_n(0x00, 0x168));
+            let open_resp = fake_open_response();
             sock.write_all(&open_resp).await.unwrap();
             // 消费一条 GENERIC 请求（40B SYSINFO），分片回响应。
             let mut req = vec![0u8; 40];
@@ -229,8 +238,7 @@ mod tests {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut open_req = vec![0u8; 12];
             sock.read_exact(&mut open_req).await.unwrap();
-            let mut open_resp = vec![0xA0, 0xA0, 0xA0, 0xA0, 0x00, 0x03, 0x01, 0x02, 0x01, 0x68];
-            open_resp.extend(std::iter::repeat_n(0x00, 0x168));
+            let open_resp = fake_open_response();
             sock.write_all(&open_resp).await.unwrap();
             let mut req = vec![0u8; 10];
             sock.read_exact(&mut req).await.unwrap();
@@ -269,8 +277,7 @@ mod tests {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut open_req = vec![0u8; 12];
             sock.read_exact(&mut open_req).await.unwrap();
-            let mut open_resp = vec![0xA0, 0xA0, 0xA0, 0xA0, 0x00, 0x03, 0x01, 0x02, 0x01, 0x68];
-            open_resp.extend(std::iter::repeat_n(0x00, 0x168));
+            let open_resp = fake_open_response();
             sock.write_all(&open_resp).await.unwrap();
             // 收到 CLOSE 请求后故意不回。
             let mut req = vec![0u8; 10];

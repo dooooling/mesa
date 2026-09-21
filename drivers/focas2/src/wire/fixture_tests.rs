@@ -248,13 +248,19 @@ fn axis3_decodes() {
 }
 
 /// axis4 负控制：codec 照常解出字段（mantissa==Native），但 adapter
-/// fail-closed（exp=51 → Unsupported → ERR/BAD，不进 I32）。
+/// fail-closed（raw 指数 `30 33` → `i16 12339` → Unsupported → ERR/BAD，
+/// 不进 I32；`.bin` 字节不动，只修正语义描述）。
 fn axis4_fails_closed() {
-    use super::wire::{axis_to_value_for_test, decode_axis_position};
+    use super::wire::{RawNumeric8, axis_to_value_for_test, decode_axis_position};
     let frame = assemble_frame(&read("axis4_nc", "axis_response_frame2.bin"));
     let pos = decode_axis_position(&frame).expect("codec 必须解出字段");
     assert_eq!(pos.mantissa, 0x2000_0202);
-    assert_eq!(pos.exponent, 51);
+    assert_eq!(
+        RawNumeric8::decode(&pos.raw).expect("raw 必须 8B").exponent,
+        12339,
+        "raw 30 33 必须解为 i16 12339（不是 u8 51）"
+    );
+    assert_eq!(pos.exponent, 51, "兼容视图截断保留（旧断言）");
     let exp = expected("axis4_nc");
     assert_eq!(
         exp["native"]["data0"].as_i64().unwrap() as i32,
@@ -263,7 +269,7 @@ fn axis4_fails_closed() {
     );
     assert!(
         axis_to_value_for_test(&pos).is_err(),
-        "exp=51 必须 fail-closed"
+        "i16 exp=12339 必须 fail-closed"
     );
 }
 

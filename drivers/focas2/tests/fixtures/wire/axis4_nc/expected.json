@@ -7,7 +7,7 @@
     "data0": 536871426
   },
   "mesa": {
-    "axis_absolute": "ERR:fail-closed (exp=51)"
+    "axis_absolute": "ERR:fail-closed (raw exponent bytes 30 33, decoded i16 12339 unsupported)"
   },
   "source": {
     "open_variant": "00 02",
