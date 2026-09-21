@@ -109,8 +109,8 @@ impl RawNumeric8 {
 
     /// 有效性门（165 实证范围）：`base == 10` 且 `0 <= exponent <= 9`。
     /// N4（`exp=12339`）、负指数、非 10 基即 `Unsupported`（见过再放开）。
-    /// PR53：`RawNumeric8` 真实模型已落地；`FeedRate/AxisPosition` 兼容视图
-    /// 暂走各自旧门（行为等价），本门供 spindle/新 operation 用。
+    /// B4 后生产 adapter（`feed_to_value`/`axis_to_value`）均以 raw 重建的
+    /// 本门/本值为权威，不再走兼容视图旧门。
     #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), WireError> {
         if self.base != 10 {
@@ -1207,27 +1207,33 @@ mod tests {
         ));
     }
 
-    /// B4 截断逃逸回归（feed）：`raw base=0x010A=266` 经 `as u8` 变成 `10`，
-    /// 但 Native parity 语义下 adapter 本来就不设 base 门——此测试锁定
-    /// “adapter 读 raw 重建、不读截断值”：mantissa=1 ≥ 0 即通过。
-    /// （若未来 feed 重引入 base 门，必须检查 `num.base` 完整 u16，
-    /// 不能检查 `rate.base` 截断 u8——见 PR53 B4。）
+    /// B4 authority 回归（feed）：raw 与兼容视图故意矛盾——
+    /// 生产 adapter 必须读 raw，不读 `rate.mantissa` 截断/旧字段。
+    /// 若回退成 `rate.mantissa`，此测试必红（`-1` 进 U32 即错）。
     #[test]
-    fn feed_truncated_base_uses_raw() {
-        let raw = [0x00, 0x00, 0x00, 0x01, 0x01, 0x0A, 0x00, 0x00];
+    fn feed_adapter_uses_raw_authority() {
         let rate = FeedRate {
-            raw,
-            mantissa: 1,
-            base: 10, // 截断值
+            raw: [0, 0, 0, 1, 0, 10, 0, 0], // raw mantissa = 1
+            mantissa: -1,                   // compat 故意错误
+            base: 10,
             exponent: 0,
         };
-        assert_eq!(
-            RawNumeric8::decode(&raw).unwrap().base,
-            266,
-            "raw 01 0A 必须解为 u16 266"
-        );
-        // Native parity：mantissa=1 即通过（base 门已按 B1 移除）。
         assert_eq!(feed_to_value(&rate).unwrap(), Value::U32(1));
+    }
+
+    /// B4 authority 回归（axis 成功路径）：raw 与兼容视图故意矛盾——
+    /// 生产 adapter 必须读 raw mantissa，不读 `pos.mantissa`。
+    /// 与 `axis_truncated_exponent_must_fail`（锁 validation authority）
+    /// 职责互补：此测试锁 value authority。
+    #[test]
+    fn axis_adapter_uses_raw_value_authority() {
+        let pos = AxisPosition {
+            raw: [0xff, 0xff, 0xff, 0xf6, 0, 10, 0, 3], // raw = -10
+            mantissa: 123456,                           // compat 故意错误
+            base: 10,
+            exponent: 3,
+        };
+        assert_eq!(axis_to_value(&pos).unwrap(), Value::I32(-10));
     }
 
     /// axis `0x26` 请求：`v0=4/v1=ordinal`（axis 证据 PASS 冻结形态）。
