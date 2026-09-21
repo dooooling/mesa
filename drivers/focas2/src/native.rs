@@ -1204,26 +1204,38 @@ impl NativeLib {
         self.cnc_absolute_raw_inner(hdl, axis)
     }
 
-    /// 读宏变量：`cnc_rdmacro(hdl, number, 1, ODBM*)`，`collectors/Macro.cs:100`
+    /// 读宏变量：`cnc_rdmacro(hdl, number, length=10, ODBM*)`，
+    /// `collectors/Macro.cs:100`。
     /// - `number` 如 `100`/`730`（`0i` 低段与 `30i` 扩展段同接口，`EW_NOOPT` 按机型转 `Bad`）
     /// - 超 `c_short` 即 `Param`：禁止 `as` 截断（配 A 读 B）。
+    /// - `length` 必须为 `10`（ODBM 数据块规定长度；传 `1` 即 `EW_LENGTH=2`。
+    ///   逆向亦证 `a3 < 10 → return 2`。`repr(C)` 下 `size_of::<Odbm>()==12`
+    ///   是 Rust 尾部对齐，不是 FOCAS 合同——绝不用 `size_of` 当 length）。
     /// - `ODBM{mcr_val, dec_val}` 定点 `value = mcr_val * 10^-dec_val`
     pub fn cnc_rdmacro(&self, hdl: u16, number: u32) -> Result<f64, FocasRet> {
+        let v = self.cnc_rdmacro_raw(hdl, number)?;
+        let dec = v.dec_val as i32;
+        let raw = v.mcr_val as f64;
+        let val = if dec == 0 {
+            raw
+        } else {
+            raw / 10_f64.powi(dec)
+        };
+        Ok(val)
+    }
+
+    /// 生产/证据共用 raw 调用：`cnc_rdmacro(number, length=10, ODBM*)`
+    /// 单次 FFI，返回完整 `Odbm`。生产经 scaled 换算；证据同一次调用复用
+    /// full（单次 FFI，无时间差；与 `cnc_absolute_raw` 同模式）。
+    pub fn cnc_rdmacro_raw(&self, hdl: u16, number: u32) -> Result<Odbm, FocasRet> {
         let number_s = to_c_short(number)?;
         let sym = self.cnc_rdmacro.as_ref().ok_or(FocasRet::Nodll)?;
         let mut out = std::mem::MaybeUninit::<Odbm>::uninit();
-        let rc = unsafe { sym(hdl as c_ushort, number_s, 1 as c_short, out.as_mut_ptr()) };
+        // `length=10`：ODBM 数据块规定长度（`a3 < 10 → EW_LENGTH`）。
+        let rc = unsafe { sym(hdl as c_ushort, number_s, 10 as c_short, out.as_mut_ptr()) };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() {
-            let v = unsafe { out.assume_init() };
-            let dec = v.dec_val as i32;
-            let raw = v.mcr_val as f64;
-            let val = if dec == 0 {
-                raw
-            } else {
-                raw / 10_f64.powi(dec)
-            };
-            Ok(val)
+            Ok(unsafe { out.assume_init() })
         } else {
             Err(ret)
         }
@@ -2451,6 +2463,67 @@ mod tests {
                 "data": full.as_ref().map(|f| f.data),
             },
             "mesa": { "spindle_speed": full.as_ref().map(|f| f.data) },
+        });
+        let pretty = serde_json::to_string_pretty(&doc).expect("expected.json 序列化失败");
+        gate0_emit(&pretty, &out);
+    }
+
+    /// macro Evidence Window（M0 整数零 + M1 正整数 + M2 小数 + M3 负值）：
+    /// `connect → cnc_rdmacro(number)（单次 FFI）→ disconnect`。
+    /// - 宏号由 `MESA_FOCAS_MACRO` 决定（默认 100；本轮按 M0~M3 逐个采样）；
+    /// - 法证输出：`rc` + `Odbm` 全字段（`datano/dummy/mcr_val/dec_val`）+
+    ///   `native scaled value`（`mcr_val × 10^-dec_val`，不断言 Mesa 合同）；
+    /// - Native contract 待闭合：Mesa 取 raw integer 还是 scaled F64，
+    ///   由 M0~M3 对照 Wire `0x15` raw bytes 判定，此处只记录，不解释；
+    /// - 不写 Wire 代码、不碰生产路径（macro 证据窗口专用，codec BLOCKED）。
+    #[test]
+    #[ignore]
+    fn macro_dump_rdmacro() {
+        let number: u32 = std::env::var("MESA_FOCAS_MACRO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+        let (host, port, timeout_ms, out) = gate0_params();
+        let timeout_secs = (timeout_ms.div_ceil(1000).max(1).min(i32::MAX as u64)) as i32;
+        let lib =
+            NativeLib::load().unwrap_or_else(|e| panic!("FWLIB 加载失败（{host}:{port}）：{e}"));
+        let hdl = lib
+            .cnc_allclibhndl3(&host, port, timeout_secs)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
+                    e as i16,
+                    e.message()
+                )
+            });
+        // 单次 FFI：rc + Odbm full（生产 `cnc_rdmacro` 返回 scaled F64；
+        // 此处同时记录 raw mcr/dec 供 Wire parity 用，无时间差）。
+        let (rc, full): (i16, Option<Odbm>) = match lib.cnc_rdmacro_raw(hdl, number) {
+            Ok(v) => (0, Some(v)),
+            Err(e) => (e as i16, None),
+        };
+        let _ = lib.cnc_freelibhndl(hdl);
+        let scaled = full.as_ref().map(|v| {
+            let dec = v.dec_val as i32;
+            if dec == 0 {
+                v.mcr_val as f64
+            } else {
+                v.mcr_val as f64 / 10_f64.powi(dec)
+            }
+        });
+        let doc = serde_json::json!({
+            "operation": "rdmacro",
+            "number": number,
+            "native": {
+                "rc": rc,
+                "ok": full.is_some(),
+                "datano": full.as_ref().map(|f| f.datano),
+                "dummy": full.as_ref().map(|f| f.dummy),
+                "mcr_val": full.as_ref().map(|f| f.mcr_val),
+                "dec_val": full.as_ref().map(|f| f.dec_val),
+                "scaled": scaled,
+            },
+            "mesa": { "macro_value": scaled },
         });
         let pretty = serde_json::to_string_pretty(&doc).expect("expected.json 序列化失败");
         gate0_emit(&pretty, &out);

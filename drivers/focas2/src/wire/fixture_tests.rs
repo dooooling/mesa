@@ -1,4 +1,5 @@
-//! Fixture 回归（PR1 Level 2 + PR2 feed + PR54 spindle）：真机捕获 → 生产 codec 直测。
+//! Fixture 回归（PR1 Level 2 + PR2 feed + PR54 spindle + PR55 macro）：
+//! 真机捕获 → 生产 codec 直测。
 //!
 //! - 数据：165 定向抓包 → `10B header + payload_len` 精确切帧 → 去重传/
 //!   拼接残留（`tests/fixtures/wire/{sysinfo,statinfo_mem,statinfo_mdi,feed}/`）。
@@ -7,12 +8,18 @@
 //!   生产形态真机冻结。
 //! - spindle 证据（S0~S4）：`0x25` mantissa=0/500/1002/1500/800 ↔
 //!   Native cnc_acts 同次；request 5 点逐字节恒定（`args=[0,0,0,0]/aux=0`）。
+//! - macro 证据（M0~M3）：`0x15` mcr=0/250000000/123450000/-750000000 +
+//!   dec=0/7/7/8 ↔ Native cnc_rdmacro 同次；request `args=[n,n,0,0]`；
+//!   Mesa 取 scaled F64（与 feed/spindle 取 mantissa 形成对照）。
 //! - 本模块 `#[cfg(test)]` 且 crate 内部：直接调生产 decoder，无复刻。
 
 use std::path::PathBuf;
 
 use super::frame::{FRAME_HEADER_LEN, FocasFrame, PacketType, decode_header};
-use super::wire::{decode_feed_rate, decode_spindle_speed, decode_status_info, decode_system_info};
+use super::wire::{
+    decode_feed_rate, decode_macro_value, decode_spindle_speed, decode_status_info,
+    decode_system_info,
+};
 use super::{cut_fixture_frames, fixture_dir, read_fixture_bytes};
 
 fn dir(group: &str) -> PathBuf {
@@ -56,6 +63,8 @@ pub(crate) fn run_all() {
     axis_request_locked();
     spindle_s0s4_decodes();
     spindle_request_locked();
+    macro_m0m3_decodes();
+    macro_request_locked();
 }
 
 /// sysinfo：`sysinfo_response.bin` 经生产 codec 解码 == expected 7 字段。
@@ -364,6 +373,80 @@ fn spindle_request_locked() {
     assert_eq!(build.len(), 40, "0x25 请求必须 40B");
     for group in ["spindle0", "spindle1", "spindle2", "spindle3", "spindle4"] {
         let raw = read(group, "spindle_request_frame.bin");
+        let frames = cut_fixture_frames(&raw);
+        assert_eq!(frames.len(), 1, "{group} 必须恰好 1 帧");
+        assert_eq!(frames[0].len(), 40, "{group} 必须 40B");
+        assert_eq!(
+            frames[0], build,
+            "{group} production encoder 必须 == captured fixture 全 40B"
+        );
+    }
+}
+
+/// macro M0~M3：`macro_response_frame.bin` 经生产 codec 解码 ==
+/// expected（mcr=0/250000000/123450000/-750000000 + dec=0/7/7/8 ↔
+/// Native cnc_rdmacro 同次；Mesa 取 scaled F64）。
+fn macro_m0m3_decodes() {
+    use super::wire::macro_to_value_for_test as to_value;
+    for (group, mcr, dec, scaled) in [
+        ("macro0", 0, 0, 0.0),
+        ("macro1", 250000000, 7, 25.0),
+        ("macro2", 123450000, 7, 12.345),
+        ("macro3", -750000000, 8, -7.5),
+    ] {
+        let frame = assemble_frame(&read(group, "macro_response_frame.bin"));
+        let m = decode_macro_value(&frame).expect("{group} 必须解码");
+        assert_eq!(m.mantissa, mcr, "{group} mantissa==mcr_val");
+        assert_eq!(m.base, 10, "{group} base");
+        assert_eq!(m.exponent, dec as u8, "{group} exp==dec_val");
+        let exp = expected(group);
+        assert_eq!(
+            exp["native"]["mcr_val"].as_i64().unwrap() as i32,
+            m.mantissa,
+            "{group} Native↔Wire mantissa 同次一致"
+        );
+        assert_eq!(
+            exp["native"]["dec_val"].as_i64().unwrap() as i16,
+            super::wire::RawNumeric8::decode(&m.raw)
+                .expect("{group} raw 必须 8B")
+                .exponent,
+            "{group} Native↔Wire exponent 同次一致"
+        );
+        let got = to_value(&m).expect("{group} adapter 必须通过");
+        match got {
+            mesa_core_types::Value::F64(v) => assert!(
+                (v - scaled).abs() < 1e-9,
+                "{group} Mesa F64 {v} != {scaled}"
+            ),
+            _ => panic!("{group} 必须 F64"),
+        }
+    }
+}
+
+/// macro 请求：生产编码器输出 == 捕获 fixture（`encode == request` 闭环）。
+/// M0~M3 四组 request 各 40B（`args=[n,n,0,0]/aux=0`，单点语义）。
+fn macro_request_locked() {
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+    use super::frame::{encode_generic_request, request_subpacket};
+    use super::wire::{DEV_CNC, FUNC_MACRO};
+    for (group, num) in [
+        ("macro0", 500),
+        ("macro1", 501),
+        ("macro2", 502),
+        ("macro3", 503),
+    ] {
+        let build = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_MACRO,
+                [num, num, 0, 0, 0],
+            )]),
+        }
+        .encode();
+        assert_eq!(build.len(), 40, "{group} 0x15 请求必须 40B");
+        let raw = read(group, "macro_request_frame.bin");
         let frames = cut_fixture_frames(&raw);
         assert_eq!(frames.len(), 1, "{group} 必须恰好 1 帧");
         assert_eq!(frames[0].len(), 40, "{group} 必须 40B");
