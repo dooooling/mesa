@@ -652,8 +652,11 @@ fn param_q0_negative_evidence() {
     );
 }
 
-/// param 请求：生产编码器输出 == 捕获 fixture（`encode == request` 闭环）。
+/// param 请求：生产编码器输出 == evidence request fixture（`encode == request`）。
 /// Q0/Q3/P-C 各 40B（`args=[n,n,0,0]/aux=0`，单点语义）。
+/// NOTE：request 为 hand-built per frozen contract（非 socket capture），
+/// response 为 head16 live + 264B 按 framing 重建（见 expected.json source）。
+/// 此处锁“生产 encoder 与 evidence fixture 一致”，不夸大为 full capture。
 fn param_request_locked() {
     use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
     use super::frame::{encode_generic_request, request_subpacket};
@@ -683,7 +686,7 @@ fn param_request_locked() {
         assert_eq!(frames[0].len(), 40, "{group} 必须 40B");
         assert_eq!(
             frames[0], build,
-            "{group} production encoder 必须 == captured fixture 全 40B"
+            "{group} production encoder 必须 == evidence request fixture 全 40B"
         );
     }
 }
