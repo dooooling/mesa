@@ -204,9 +204,9 @@ pub struct AxisPosition {
 }
 
 impl AxisPosition {
-    /// 有效性门：`base == 10` 且 `exponent <= 9`（165 实证范围；
-    /// N4（真实 `exp=12339`，兼容视图 `51`）即 `Unsupported` → ERR/BAD，
-    /// codec 照常解出字段）。真实 `RawNumeric8::validate` 另含负指数拒绝。
+    /// 有效性门（兼容视图；生产 adapter 已改走 `RawNumeric8::validate`，
+    /// 见 `axis_to_value` B4）。保留供旧单测引用，未使用告警允许。
+    #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), WireError> {
         if self.base != 10 {
             return Err(WireError::Unsupported("axis base != 10"));
@@ -656,33 +656,33 @@ pub(super) fn decode_axis_position(resp: &FocasFrame) -> Result<AxisPosition, Wi
     })
 }
 
-/// Mesa `machine/feed` 映射（PR53 两层语义 + B1 冻结）：
+/// Mesa `machine/feed` 映射（PR53 两层语义 + B1 冻结 + B4 真实权威）：
 /// `native_value = mantissa` → `Value::U32`（与 `cnc_actf` 只复制前 4B
 /// 同合同；不因 `exponent != 0` 拒绝——否则 `mantissa=1234/exp=1` 将在
 /// Native 返回 `1234` 时 Wire 拒绝，重新产生 parity 漂移）。
 /// fail-closed（不 truncate/round/clamp）：`mantissa < 0` 即 `Unsupported`
-/// （ERR → BAD；产品合同非负 U32）。`base` 非 10 在 decoder 层已由
-/// `RawNumeric8` 模型保留，进 adapter 前按兼容视图 `u8` 检查
-/// （`0x000A` 通过；未来非 10 基见过再放开）。
+/// （ERR → BAD；产品合同非负 U32）。B4：判定以 `raw` 重建的 `RawNumeric8`
+/// 完整字段为权威，不读兼容视图截断值（`base 0x010A → u8 0x0A` 逃逸类）。
 /// NOTE：工程量 `mantissa/base^exponent` 为独立语义，不进此 adapter；
 /// 待独立 `engineering_value` 暴露后再议（见 PR53）。
 fn feed_to_value(rate: &FeedRate) -> Result<Value, WireError> {
-    // PR53 B1：只取 mantissa（native parity 目标），不依赖 exponent。
-    if rate.base != 10 {
-        return Err(WireError::Unsupported("feed base != 10"));
-    }
-    if rate.mantissa < 0 {
+    // PR53 B1+B4：Native contract 只依赖 mantissa；权威来自 raw 重建。
+    let num = RawNumeric8::decode(&rate.raw)?;
+    if num.native_value() < 0 {
         return Err(WireError::Unsupported("feed mantissa < 0"));
     }
-    Ok(Value::U32(rate.mantissa as u32))
+    Ok(Value::U32(num.native_value() as u32))
 }
 
-/// Mesa `axis.absolute` 映射：`validate(base/exp)` 通过即
-/// `Value::I32(mantissa)`（mantissa 可负，-2880 等均有真机证据；
+/// Mesa `axis.absolute` 映射（PR53 B4 真实权威）：以 `raw` 重建
+/// `RawNumeric8` 完整字段为权威（`u16 base/i16 exponent`），不读兼容视图
+/// 截断值（`exp 0x0103 → u8 3` 逃逸类）。`validate` 通过即
+/// `Value::I32(native_value)`（mantissa 可负，-2880 等均有真机证据；
 /// 与 feed 的 `mantissa<0` 拒绝无关，各自独立规则）。
 fn axis_to_value(pos: &AxisPosition) -> Result<Value, WireError> {
-    pos.validate()?;
-    Ok(Value::I32(pos.mantissa))
+    let num = RawNumeric8::decode(&pos.raw)?;
+    num.validate()?;
+    Ok(Value::I32(num.native_value()))
 }
 
 /// fixture/test 专用：生产 `axis_to_value` 同源入口（`#[cfg(test)]`，
@@ -1126,6 +1126,7 @@ mod tests {
     }
 
     /// feed 负值 fail-closed：`mantissa < 0` 不得进 U32。
+    /// B4：判定走 `raw` 重建（此处 raw 与兼容字段一致，双重锁定）。
     #[test]
     fn feed_negative_is_bad() {
         let rate = FeedRate {
@@ -1140,7 +1141,11 @@ mod tests {
         ));
     }
 
-    /// feed 非实证 base fail-closed：`base=2` 有外部佐证但 165 未见，不猜。
+    /// feed 非实证 base：B4 Native parity 下 adapter 不再设 base 门
+    /// （Native contract 只依赖 mantissa）；`scaled()` 兼容视图仍拒绝
+    /// （工程量语义未暴露，见过再放开）。
+    /// B4 回归：`raw base=0x010A`（`as u8 → 0x0A=10` 截断）不得影响 adapter——
+    /// adapter 以 raw 重建为权威，此处 mantissa=1 ≥ 0 即通过（Native 语义）。
     #[test]
     fn feed_unverified_base_is_bad() {
         let rate = FeedRate {
@@ -1177,6 +1182,52 @@ mod tests {
             WireError::MalformedPayload.to_string(),
             "8B 后跟 4B 垃圾必须 Malformed"
         );
+    }
+
+    /// B4 截断逃逸回归（axis）：`raw exp=0x0103=259` 经 `as u8` 变成 `3`
+    /// （兼容视图合法），但生产 adapter 必须以 raw 重建为权威 → Unsupported。
+    #[test]
+    fn axis_truncated_exponent_must_fail() {
+        let raw = [0x00, 0x00, 0x00, 0x64, 0x00, 0x0A, 0x01, 0x03];
+        let pos = AxisPosition {
+            raw,
+            mantissa: 100,
+            base: 10,
+            exponent: 3, // 截断值（兼容视图看起来合法）
+        };
+        // 真实值 259 不在 [0, 9]，生产 adapter 必须拒绝。
+        assert_eq!(
+            RawNumeric8::decode(&raw).unwrap().exponent,
+            259,
+            "raw 01 03 必须解为 i16 259"
+        );
+        assert!(matches!(
+            axis_to_value(&pos).unwrap_err(),
+            WireError::Unsupported(_)
+        ));
+    }
+
+    /// B4 截断逃逸回归（feed）：`raw base=0x010A=266` 经 `as u8` 变成 `10`，
+    /// 但 Native parity 语义下 adapter 本来就不设 base 门——此测试锁定
+    /// “adapter 读 raw 重建、不读截断值”：mantissa=1 ≥ 0 即通过。
+    /// （若未来 feed 重引入 base 门，必须检查 `num.base` 完整 u16，
+    /// 不能检查 `rate.base` 截断 u8——见 PR53 B4。）
+    #[test]
+    fn feed_truncated_base_uses_raw() {
+        let raw = [0x00, 0x00, 0x00, 0x01, 0x01, 0x0A, 0x00, 0x00];
+        let rate = FeedRate {
+            raw,
+            mantissa: 1,
+            base: 10, // 截断值
+            exponent: 0,
+        };
+        assert_eq!(
+            RawNumeric8::decode(&raw).unwrap().base,
+            266,
+            "raw 01 0A 必须解为 u16 266"
+        );
+        // Native parity：mantissa=1 即通过（base 门已按 B1 移除）。
+        assert_eq!(feed_to_value(&rate).unwrap(), Value::U32(1));
     }
 
     /// axis `0x26` 请求：`v0=4/v1=ordinal`（axis 证据 PASS 冻结形态）。
