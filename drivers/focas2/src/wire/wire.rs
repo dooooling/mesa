@@ -186,11 +186,6 @@ impl FeedRate {
     }
 }
 
-/// FOCAS `spindle_speed`（`0x25`）typed 结果。spindle Evidence PASS：
-/// S0~S4 `data_len=8` 稳定，8B 与 `RawNumeric8{i32,u16,i16}` 同构
-/// （第三个独立 operation；与 feed/axis 同构但独立类型，不抽公共语义）。
-/// 旧 `{mantissa, base: u8, exponent: u8}` 保留为兼容视图（S0~S4
-/// `0x000A/0x0000` 下与真实等价）；真实布局见 `RawNumeric8`。
 /// FOCAS `axis_absolute`（`0x26`）typed 结果。axis 证据 PASS。
 /// 旧 `{mantissa, base: u8, exponent: u8}` 在已验证值下与 `RawNumeric8`
 /// 等价，保留为兼容视图；真实布局见 `RawNumeric8`。
@@ -1008,6 +1003,30 @@ mod tests {
         GenericSubpacket, decode_generic_payload, encode_generic_request, request_subpacket,
     };
     use super::*;
+    use crate::address::SpindleKind;
+
+    /// PR54 产品边界：indexed `Spindle::Speed` 在 Wire 侧 fail-closed
+    /// （只有 `ActiveSpindleSpeed` 可调 `0x25`，与 PR52 Native 门同口径）。
+    /// 未连接 api 上只读 indexed speed：不得发包（`need_spindle=false`），
+    /// 直接 `ERR:` 单点（若误纳入预取，未连接下走 `spindle_speed()` 即
+    /// fatal `Closed` 整批 Err，测试必红）。
+    #[tokio::test]
+    async fn indexed_spindle_speed_stays_fail_closed() {
+        let api = WireFocasApi::new(std::time::Duration::from_millis(50));
+        let vals = api
+            .read_batch(&[FocasAddress::Spindle {
+                spindle: 1,
+                kind: SpindleKind::Speed,
+            }])
+            .await
+            .expect("indexed speed 必须单点 ERR，不整批 Err");
+        assert_eq!(vals.len(), 1);
+        assert!(
+            matches!(&vals[0], Value::String(s) if s.starts_with("ERR:")),
+            "indexed speed 必须 ERR 单点，实际：{:?}",
+            vals[0]
+        );
+    }
 
     /// Gate 0 B1 精确帧：frame#2 请求编码必须 `0x56/count=3`。
     #[test]
