@@ -1,14 +1,15 @@
-//! FOCAS Ethernet Wire Frame（PR1）：FOCAS application frame 编解码。
+//! FOCAS Ethernet Wire Frame（PR1 + PR53）：application frame 编解码。
 //!
 //! - 只解决字节 ↔ 帧的映射，不懂 TCP、不懂 Operation、不懂 Mesa Resource。
-//! - Gate 0（165 真机）锁定的协议事实：
-//!   `magic a0 a0 a0 a0` / origin 为 raw u16（C→S `0x0001`、S→C `0x0003`，
-//!   不断言、不推广）/ OPEN(`0x0101/0x0102`) 与 CLOSE(`0x0201/0x0202`)
-//!   无 GENERIC subpacket 层 / GENERIC(`0x2101/0x2102`) 内为
-//!   `u16 BE count + subpacket[]`，每个 subpacket 自带 `u16 BE length`
-//!   （含自身 2B），按 `10B header + payload_len` 精确切帧。
-//! - `PacketType` 为开放 `u16` 新类型（程序传输 `0x15xx/0x16xx/0x17xx`
-//!   等未来只加常量，不重构 parser）。
+//! - Gate 0（165 真机）锁定的协议事实：magic / 00 02 OPEN / GENERIC
+//!   `count + subpacket[]` / `10B header + payload_len` 精确切帧。
+//! - PR53（逆向证据 `docs/focas-reimplementation/`）：10B header 实际为
+//!   `spec(u16) + kind(u8) + direction(u8) + len(u16)`；GENERIC subpacket
+//!   实际为 `device/path/command + args/aux/data`（请求）与
+//!   `device/path/command + status/detail1/detail2 + data`（响应）。
+//!   旧 `origin: u16` / `packet_type: u16` / `function: u32` / `5×i32`
+//!   视图保留为兼容构造（已验证 bytes 100% 不变），新模型为真实协议模型。
+//! - `PacketType` 保持开放 `u16`（程序传输等未来只加常量）。
 
 use std::fmt;
 
@@ -68,9 +69,10 @@ impl fmt::Display for PacketType {
 // ---------------------------------------------------------------------------
 
 /// FOCAS 基础帧。不放 `FocasAddress/Value/Resource`（协议层不知道 Mesa）。
+/// `origin` 为 `spec` 兼容别名（历史代码用 `origin` 读写，字节相同）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocasFrame {
-    /// 原始 origin（Gate 0：C→S `0x0001`、S→C `0x0003`；透传，不校验）。
+    /// 规格字（请求写 1；响应透传，不校验具体值）。
     pub origin: u16,
     /// 开放 packet 类型。
     pub packet_type: PacketType,
@@ -115,31 +117,48 @@ impl FocasFrame {
     }
 }
 
-/// 10B header 解码结果（`payload_len` 已取，payload 另读）。
+// ---------------------------------------------------------------------------
+// 10B header 真实模型（PR53）：spec + kind + direction + len。
+// 旧 `origin(u16)/packet_type(u16)` 视图保留（字节等价），新字段为真实命名。
+// ---------------------------------------------------------------------------
+
+/// 10B header 解码结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
-    /// 原始 origin（透传）。
+    /// 规格字（请求构造写 1；165 响应实测 3；决定 OPEN 布局/接收预算）。
+    /// 旧名 `origin`（C→S `0x0001`、S→C `0x0003` 只是本机观测值）。
+    pub spec: u16,
+    /// 兼容旧视图：`spec` 的别名（历史代码用 `origin`，字节相同）。
     pub origin: u16,
-    /// 开放 packet 类型。
+    /// kind（`01` OPEN、`02` CLOSE、`21` GENERIC 等；u8）。
+    pub kind: u8,
+    /// direction（请求 1、成功响应 2；DLL 还处理 3、4）。
+    pub direction: u8,
+    /// 开放 packet 类型（`kind<<8|direction` 兼容视图，如 `0x2101`）。
     pub packet_type: PacketType,
     /// 其后 payload 字节数（`<= 65535`，超限即 `BadLength`）。
     pub payload_len: usize,
 }
 
-/// 解 10B header：验 magic + 取 origin/type/payload_len（全 BE）。
+/// 解 10B header：验 magic + 取 spec/kind/direction/payload_len（全 BE）。
 /// payload 本体由调用方 `read_exact(payload_len)` 读取（防 TCP 分片/粘包）。
 pub fn decode_header(raw: &[u8; FRAME_HEADER_LEN]) -> Result<FrameHeader, FrameError> {
     if raw[0..4] != SYNC_PREFIX {
         return Err(FrameError::BadMagic);
     }
-    let origin = u16::from_be_bytes([raw[4], raw[5]]);
+    let spec = u16::from_be_bytes([raw[4], raw[5]]);
+    let kind = raw[6];
+    let direction = raw[7];
     let packet_type = PacketType(u16::from_be_bytes([raw[6], raw[7]]));
     let payload_len = u16::from_be_bytes([raw[8], raw[9]]) as usize;
     if payload_len > MAX_PAYLOAD_LEN {
         return Err(FrameError::BadLength);
     }
     Ok(FrameHeader {
-        origin,
+        spec,
+        origin: spec,
+        kind,
+        direction,
         packet_type,
         payload_len,
     })
@@ -163,8 +182,12 @@ pub fn assemble(header: FrameHeader, payload: Vec<u8>) -> Result<FocasFrame, Fra
 // 不引入 BinaryReader/CodecBuilder（过度设计，PR1 不做）。
 // ---------------------------------------------------------------------------
 
-/// 请求 origin（C→S；响应 origin 透传不校验，见 Gate 0）。
+/// 请求 origin（C→S；响应 spec 透传，见 Gate 0）。
 pub const REQUEST_ORIGIN: u16 = 0x0001;
+/// CNC 默认路径（165 实测 1；纯网络 API 把 path 放不可变请求）。
+/// wire.rs 用 `PATH_CNC`（同值）；保留此名供 frame 层单测直引。
+#[allow(dead_code)]
+pub const PATH_CNC_DEFAULT: u16 = 0x0001;
 /// 经直接 wire parity 验证的 GENERIC-capable OPEN variant（165 / 0i-F）。
 /// `0x0001` 建连成功但随后 GENERIC 必 RST，用途未知，不命名。
 pub const OPEN_GENERIC_VARIANT: u16 = 0x0002;
@@ -178,9 +201,199 @@ pub const REQUEST_ARG_COUNT: usize = 5;
 pub const REQUEST_ARGS_LEN: usize = REQUEST_ARG_COUNT * 4;
 
 // ---------------------------------------------------------------------------
-// Generic subpacket 层（仅 0x2101/0x2102 内）
+// GENERIC subpacket 真实模型（PR53）：device/path/command + args/data（请求），
+// device/path/command + status/details + data（响应）。
+// 旧 `GenericSubpacket{control_device,function,payload}` 保留为兼容视图
+// （`function = path<<16|command`，`payload = args + data`；已验证 bytes
+// 100% 不变），新类型为真实协议模型。
 // ---------------------------------------------------------------------------
 
+/// GENERIC 请求 subpacket 真实布局（28B + data）：
+/// `size(2) + device(2) + path(2) + command(2) + args[4](4×u32 BE) +
+/// aux(2) + data_len(2) + data`。Gate 0 请求（path=1/无 data/aux=0）下，
+/// 旧 `5×i32` 视图字节等价（第 5 个 i32 = aux+data_len 全零）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestSubpacket {
+    /// 设备（CNC=1、PMC=2）。
+    pub device: u16,
+    /// 路径（CNC/PMC 各自当前路径；165 实测 1）。
+    pub path: u16,
+    /// 命令（如 sysinfo `0x18`、statinfo `0x19`、feed `0x24`）。
+    pub command: u16,
+    /// 4 个 u32 参数槽（BE；axis selector 等在此；无参即全零）。
+    pub args: [u32; 4],
+    /// 命令相关辅助参数（不擅自命名为 flags；Gate 0 请求全零）。
+    pub aux: u16,
+    /// 附加数据（Gate 0 请求为空；PMC/程序传输等在此带数据）。
+    pub data: Vec<u8>,
+}
+
+impl RequestSubpacket {
+    /// 编码（含 2B size 前缀；`size = 28 + data_len`）。
+    /// PR53：请求 builder 仍走旧 `request_subpacket`（已验证 bytes 不变）；
+    /// 此真实模型编码由单测锁定等价，Dynamic2/PMC(data) 时启用。
+    #[allow(dead_code)]
+    pub fn encode(&self) -> Vec<u8> {
+        let size = 28 + self.data.len();
+        let mut out = Vec::with_capacity(2 + size - 2 + 2);
+        out.extend_from_slice(&(size as u16).to_be_bytes());
+        out.extend_from_slice(&self.device.to_be_bytes());
+        out.extend_from_slice(&self.path.to_be_bytes());
+        out.extend_from_slice(&self.command.to_be_bytes());
+        for a in self.args {
+            out.extend_from_slice(&a.to_be_bytes());
+        }
+        out.extend_from_slice(&self.aux.to_be_bytes());
+        out.extend_from_slice(&(self.data.len() as u16).to_be_bytes());
+        out.extend_from_slice(&self.data);
+        out
+    }
+
+    /// 兼容视图：旧 `GenericSubpacket{control_device,function,payload}`。
+    /// Gate 0 请求下与旧 `5×i32` 字节完全等价（单测锁定）。
+    #[allow(dead_code)]
+    pub fn as_legacy(&self) -> GenericSubpacket {
+        let mut payload = Vec::with_capacity(20 + self.data.len());
+        for a in self.args {
+            payload.extend_from_slice(&a.to_be_bytes());
+        }
+        payload.extend_from_slice(&self.aux.to_be_bytes());
+        payload.extend_from_slice(&(self.data.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&self.data);
+        GenericSubpacket {
+            control_device: self.device,
+            function: ((self.path as u32) << 16) | (self.command as u32),
+            payload,
+        }
+    }
+}
+
+/// GENERIC 响应 subpacket 真实布局（16B + data）：
+/// `size(2) + device(2) + path(2) + command(2) + status(i16) +
+/// detail1(i16) + detail2(i16) + data_len(2) + data`。
+/// `status != 0` 为合法远端业务结果（`WireError::Remote`），不是坏包；
+/// 旧“6×00 前缀”检查只适用于成功路径，失败路径走 Remote（PR53 必修）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplySubpacket {
+    /// 设备（请求回显）。
+    pub device: u16,
+    /// 路径（请求回显）。
+    pub path: u16,
+    /// 命令（请求回显）。
+    pub command: u16,
+    /// 状态（i16 返回码；0 = 成功，非零 = 远端业务错误）。
+    pub status: i16,
+    /// 细节 1（保留原始位型，不解释）。
+    pub detail1: i16,
+    /// 细节 2（保留原始位型，不解释）。
+    pub detail2: i16,
+    /// 数据体（成功为数据；失败为错误上下文，不猜）。
+    pub data: Vec<u8>,
+}
+
+impl ReplySubpacket {
+    /// 成功时数据体引用（`status == 0` 才调；失败调即逻辑错）。
+    /// PR53：decoder 走 `reply_success_data`（含 Remote 转换）；此 helper
+    /// 保留供单测直断，未使用告警允许。
+    #[allow(dead_code)]
+    pub fn success_data(&self) -> Option<&[u8]> {
+        if self.status == 0 {
+            Some(&self.data)
+        } else {
+            None
+        }
+    }
+}
+
+/// GENERIC 响应解码（真实模型）：`count + ReplySubpacket[]`。
+/// 每包 `size == 16 + data_len` 精确闭合；count 包耗尽 payload；
+/// `device/path/command` 透传（slot 匹配由调用方做，见 `match_slot`）。
+pub fn decode_reply_payload(payload: &[u8]) -> Result<Vec<ReplySubpacket>, FrameError> {
+    if payload.len() < 2 {
+        return Err(FrameError::Malformed);
+    }
+    let count = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+    if count == 0 {
+        return Err(FrameError::Malformed);
+    }
+    let mut out = Vec::with_capacity(count);
+    let mut off = 2;
+    for _ in 0..count {
+        if off + 2 > payload.len() {
+            return Err(FrameError::Malformed);
+        }
+        let size = u16::from_be_bytes([payload[off], payload[off + 1]]) as usize;
+        if size < 16 || off + size > payload.len() {
+            return Err(FrameError::Malformed);
+        }
+        let body = &payload[off + 2..off + size];
+        let data_len = u16::from_be_bytes([body[12], body[13]]) as usize;
+        if 16 + data_len != size {
+            return Err(FrameError::Malformed);
+        }
+        out.push(ReplySubpacket {
+            device: u16::from_be_bytes([body[0], body[1]]),
+            path: u16::from_be_bytes([body[2], body[3]]),
+            command: u16::from_be_bytes([body[4], body[5]]),
+            status: i16::from_be_bytes([body[6], body[7]]),
+            detail1: i16::from_be_bytes([body[8], body[9]]),
+            detail2: i16::from_be_bytes([body[10], body[11]]),
+            data: body[14..14 + data_len].to_vec(),
+        });
+        off += size;
+    }
+    if out.len() != count || off != payload.len() {
+        return Err(FrameError::Malformed);
+    }
+    Ok(out)
+}
+
+/// 请求槽 ↔ 响应槽匹配（PR53 必修）：按 `(device, path, command)` 找第 N 个
+/// 匹配响应（保留重复 command，如 Dynamic2 的 `0x26×4`），而不是
+/// `find_function` 取第一个。`slot` 为请求中同 key 的第几个（0 起）。
+/// 不匹配即 `None`（调用方转 `CommandMismatch`，保守致命）。
+pub fn match_slot(
+    resps: &[ReplySubpacket],
+    device: u16,
+    path: u16,
+    command: u16,
+    slot: usize,
+) -> Option<&ReplySubpacket> {
+    resps
+        .iter()
+        .filter(|r| r.device == device && r.path == path && r.command == command)
+        .nth(slot)
+}
+
+/// OPEN 响应校验（PR53）：`spec/count → 16+8×count / 40+32×count`。
+/// 偏移以完整帧开头为零（逆向证据）：`frame+18`（`<=2`）/ `frame+20`
+/// （`>=3`，等价 `payload+10`）。已观测 `count=10`（Gate 0 捕获）与
+/// `count=7`（当前 live）；变化原因尚未建立，只验“用通告 count + 长度公式”
+/// 闭合，不断言固定 count 值。未知布局（spec 不在已实现版本）即 `Malformed`。
+/// 只校验长度闭合，不解释能力表字段（只命名已由使用点证明的字段）。
+pub fn validate_open_response(payload: &[u8], spec: u16) -> Result<(), FrameError> {
+    if payload.len() < 12 {
+        return Err(FrameError::Malformed);
+    }
+    let (count, expected) = if spec <= 2 {
+        let c = u16::from_be_bytes([payload[8], payload[9]]) as usize;
+        (c, 16usize.checked_add(8usize.saturating_mul(c)))
+    } else if spec <= 4 {
+        // spec=3（165）/ 4：count 在 payload+10（frame+20）。
+        let c = u16::from_be_bytes([payload[10], payload[11]]) as usize;
+        (c, 40usize.checked_add(32usize.saturating_mul(c)))
+    } else {
+        return Err(FrameError::Malformed);
+    };
+    let _ = count;
+    match expected {
+        Some(n) if n == payload.len() => Ok(()),
+        _ => Err(FrameError::Malformed),
+    }
+}
+
+/// 兼容视图（旧模型保留；已验证 bytes 100% 不变）：
+///
 /// GENERIC subpacket：`u16 BE length（含自身 2B）+ body`。
 /// `body` 前 6B 为 `control_device(2) + function(4)`（Gate 0：
 /// CNC=`0x0001`；`sysinfo=0x00010018`、`statinfo=0x00010019`），
@@ -237,10 +450,9 @@ pub fn request_subpacket(
     }
 }
 
-/// GENERIC payload 解码：`count + length 自描述 subpacket[]`。
-/// 每个 subpacket 按自身 length 切（不搜 magic、不假设等长）；
-/// 消费完 count 个后 payload 必须恰好耗尽（trailing garbage 即错）。
-/// 数量/边界/尾部任一不符即 `Malformed`（调用方判 session 失效）。
+/// GENERIC payload 解码（旧兼容视图；新代码走 `decode_reply_payload`）。
+/// 保留供兼容单测引用（PR53 约束：已验证 bytes 不变），未使用告警允许。
+#[allow(dead_code)]
 pub fn decode_generic_payload(payload: &[u8]) -> Result<Vec<GenericSubpacket>, FrameError> {
     if payload.len() < 2 {
         return Err(FrameError::Malformed);
@@ -433,5 +645,86 @@ mod tests {
         assert!(!future.is_generic());
         assert_ne!(future, PacketType::GENERIC_REQUEST);
         assert_eq!(format!("{future}"), "0x1501");
+    }
+
+    /// OPEN 响应布局校验（PR53）：`spec/count → 长度公式`。
+    /// count 在 payload+10（frame+20）；165 `spec=3/count=10 → 360`。
+    #[test]
+    fn open_response_layout_validated() {
+        // 构造 360B 合法体：payload[10:12] = count=10。
+        let mut payload = vec![0x00; 360];
+        payload[10] = 0x00;
+        payload[11] = 0x0a;
+        super::validate_open_response(&payload, 3).unwrap();
+        // 未知 spec 即 Malformed。
+        assert_eq!(
+            super::validate_open_response(&payload, 5),
+            Err(FrameError::Malformed)
+        );
+        // 长度不闭合即 Malformed（count=10 但体只有 102B）。
+        let mut short = vec![0x00; 102];
+        short[10] = 0x00;
+        short[11] = 0x0a;
+        assert_eq!(
+            super::validate_open_response(&short, 3),
+            Err(FrameError::Malformed)
+        );
+    }
+
+    /// 请求真实模型与旧 `5×i32` 字节等价（Gate 0 请求 path=1/aux=0/无 data）。
+    #[test]
+    fn request_subpacket_model_equivalent() {
+        use super::{RequestSubpacket, request_subpacket};
+        let legacy = request_subpacket(0x0001, 0x0001_0024, [0, 0, 0, 0, 0]);
+        let real = RequestSubpacket {
+            device: 0x0001,
+            path: 0x0001,
+            command: 0x0024,
+            args: [0, 0, 0, 0],
+            aux: 0,
+            data: vec![],
+        };
+        assert_eq!(real.as_legacy(), legacy, "真实模型必须字节等价旧模型");
+        assert_eq!(real.encode().len(), 28, "size 字段 = 28（含自身 2B）");
+    }
+
+    /// 响应真实模型：`status != 0` 透传 framing（旧“6×00 前缀”只覆盖成功）。
+    #[test]
+    fn reply_status_transparent() {
+        use super::decode_reply_payload;
+        // count=1 + 0x24 成功包（status=0/data 8B）。
+        let mut ok = vec![0x00, 0x01, 0x00, 0x18];
+        ok.extend_from_slice(&[0x00, 0x01, 0x00, 0x01, 0x00, 0x24]);
+        ok.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        ok.extend_from_slice(&[0x00, 0x08, 0x00, 0x00, 0x00, 0x64, 0x00, 0x0a, 0x00, 0x00]);
+        let subs = decode_reply_payload(&ok).unwrap();
+        assert_eq!(subs[0].status, 0);
+        assert_eq!(subs[0].data.len(), 8);
+        // count=1 + 0x24 失败包（status=2/data 4B）：framing 照常通过。
+        let mut er = vec![0x00, 0x01, 0x00, 0x14];
+        er.extend_from_slice(&[0x00, 0x01, 0x00, 0x01, 0x00, 0x24]);
+        er.extend_from_slice(&[0x00, 0x02, 0x00, 0x00, 0x00, 0x00]);
+        er.extend_from_slice(&[0x00, 0x04, 0x00, 0x00, 0x00, 0x00]);
+        let subs = decode_reply_payload(&er).unwrap();
+        assert_eq!(subs[0].status, 2);
+    }
+
+    /// slot 匹配保留重复 command（Dynamic2 `0x26×4` 前置）。
+    #[test]
+    fn slot_matching_keeps_duplicates() {
+        use super::{decode_reply_payload, match_slot};
+        let mut payload = vec![0x00, 0x03];
+        for v in [0xAAu8, 0xBB, 0xCC] {
+            payload.extend_from_slice(&[0x00, 0x11]); // size=17
+            payload.extend_from_slice(&[0x00, 0x01, 0x00, 0x01, 0x00, 0x26]);
+            payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            payload.extend_from_slice(&[0x00, 0x01, v]);
+        }
+        let subs = decode_reply_payload(&payload).unwrap();
+        assert_eq!(subs.len(), 3);
+        assert_eq!(match_slot(&subs, 1, 1, 0x26, 0).unwrap().data, vec![0xAA]);
+        assert_eq!(match_slot(&subs, 1, 1, 0x26, 1).unwrap().data, vec![0xBB]);
+        assert_eq!(match_slot(&subs, 1, 1, 0x26, 2).unwrap().data, vec![0xCC]);
+        assert!(match_slot(&subs, 1, 1, 0x26, 3).is_none());
     }
 }

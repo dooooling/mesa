@@ -17,8 +17,8 @@ use tokio::sync::Mutex;
 
 use super::WireError;
 use super::frame::{
-    FocasFrame, GenericSubpacket, PacketType, REQUEST_ORIGIN, decode_generic_payload,
-    encode_generic_request, request_subpacket,
+    FocasFrame, GenericSubpacket, PacketType, REQUEST_ORIGIN, ReplySubpacket, decode_reply_payload,
+    encode_generic_request, match_slot, request_subpacket,
 };
 use super::session::WireSession;
 use crate::address::FocasAddress;
@@ -72,6 +72,86 @@ pub struct StatusInfo {
     pub edit: u16,
 }
 
+/// 8B 数值单元真实布局（PR53）：`mantissa(i32 BE) + base(u16 BE) +
+/// exponent(i16 BE)`。旧 `FeedRate/AxisPosition{base: u8, exponent: u8}`
+/// 在已验证值（`0x000A/0x0003` 等）下结果相同，保留为兼容视图；
+/// 新 `RawNumeric8` 为真实协议模型（axis4 `30 33` 即 `i16 12339`，
+/// 不是 `u8 51`——fail-closed 结论不变，文档修正见 PR53）。
+/// `engineering = mantissa / base^exponent`（有理数，不转 f64）；
+/// `native_value = mantissa`（`cnc_actf/cnc_absolute/cnc_acts` 只取前 4B）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawNumeric8 {
+    /// 原始 8B。
+    pub raw: [u8; 8],
+    /// 定点尾数（i32 BE）。
+    pub mantissa: i32,
+    /// 缩放基（u16 BE；165 实测 `10`）。
+    pub base: u16,
+    /// 缩放指数（i16 BE，有符号；165 实测 `0/3`，axis4 `12339`）。
+    pub exponent: i16,
+}
+
+impl RawNumeric8 {
+    /// 解码 8B（精确 8B，不多不少）。
+    pub fn decode(raw: &[u8]) -> Result<Self, WireError> {
+        if raw.len() != 8 {
+            return Err(WireError::MalformedPayload);
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(raw);
+        Ok(Self {
+            raw: arr,
+            mantissa: i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]),
+            base: u16::from_be_bytes([raw[4], raw[5]]),
+            exponent: i16::from_be_bytes([raw[6], raw[7]]),
+        })
+    }
+
+    /// 有效性门（165 实证范围）：`base == 10` 且 `0 <= exponent <= 9`。
+    /// N4（`exp=12339`）、负指数、非 10 基即 `Unsupported`（见过再放开）。
+    /// B4 后生产 adapter（`feed_to_value`/`axis_to_value`）均以 raw 重建的
+    /// 本门/本值为权威，不再走兼容视图旧门。
+    #[allow(dead_code)]
+    pub fn validate(&self) -> Result<(), WireError> {
+        if self.base != 10 {
+            return Err(WireError::Unsupported("numeric base != 10"));
+        }
+        if !(0..=9).contains(&self.exponent) {
+            return Err(WireError::Unsupported("numeric exponent out of range"));
+        }
+        Ok(())
+    }
+
+    /// Native 值（B1 冻结）：`mantissa`（`cnc_actf/cnc_absolute/cnc_acts`
+    /// 只复制前 4B；与 `base/exponent` 无关，不因 `exp != 0` 拒绝）。
+    /// 单测直断（生产 adapter 经 `feed_to_value` 取 `mantissa` 同源语义）。
+    #[allow(dead_code)]
+    pub fn native_value(&self) -> i32 {
+        self.mantissa
+    }
+
+    /// 工程量有理数（`mantissa / base^exponent`，不转 f64、不丢精度）。
+    /// `base != 10` / 负指数 / `exponent > 18` 即 `Unsupported`（见过再放开；
+    /// `18` 为工程保护范围，不是 FANUC 协议限值）。
+    pub fn engineering_value(&self) -> Result<(i64, i64), WireError> {
+        if self.base != 10 {
+            return Err(WireError::Unsupported("numeric base != 10"));
+        }
+        if self.exponent < 0 || self.exponent > 18 {
+            return Err(WireError::Unsupported("numeric exponent out of range"));
+        }
+        let denom = 10i64.pow(self.exponent as u32);
+        Ok((self.mantissa as i64, denom))
+    }
+
+    /// 兼容别名（旧名单测引用；与 `engineering_value` 同语义）。
+    /// PR53 约束：已验证 bytes 不变；旧名单测逐步迁移到新名后删除。
+    #[allow(dead_code)]
+    pub fn engineering(&self) -> Result<(i64, i64), WireError> {
+        self.engineering_value()
+    }
+}
+
 /// FOCAS `feed_rate`（`0x24`）typed 结果。feed 证据 PASS：
 /// 8B = `mantissa(i32 BE) + meta0 + base + meta1 + exponent`。
 /// 已知字段 typed；`meta0/meta1`（byte4/byte6）语义未知 → `raw` 保留，
@@ -90,10 +170,10 @@ pub struct FeedRate {
 }
 
 impl FeedRate {
-    /// 数值语义：`mantissa / base^exponent`（`base` 仅接受真机实证值）。
-    /// 当前 165 只实证 `base == 10`；`2` 有外部实现佐证但 165 未见，
-    /// PR2 极度保守：非 `10` 即 `Unsupported`（见过再放开，不猜）。
+    /// 数值语义（兼容视图；新代码走 `RawNumeric8::engineering`）。
+    /// 当前 165 只实证 `base == 10`；非 `10` 即 `Unsupported`。
     /// 返回 `(numer, denom)`（不做除法、不丢精度，由 adapter 判无损）。
+    #[allow(dead_code)]
     pub fn scaled(&self) -> Result<(i64, i64), WireError> {
         if self.base != 10 {
             return Err(WireError::Unsupported("feed base != 10"));
@@ -106,11 +186,9 @@ impl FeedRate {
     }
 }
 
-/// FOCAS `axis_absolute`（`0x26`）typed 结果。axis 证据 PASS：
-/// 8B = `mantissa(i32 BE) + meta0 + base + meta1 + exponent`
-/// （与 feed 同构，但独立类型，不抽公共 `ScaledValue8`——门槛是 spindle
-/// 独立证明后再议；此处宁愿重复 15 行 decoder）。
-/// `meta0/meta1`（byte4/byte6）语义未知 → `raw` 保留，绝不命名。
+/// FOCAS `axis_absolute`（`0x26`）typed 结果。axis 证据 PASS。
+/// 旧 `{mantissa, base: u8, exponent: u8}` 在已验证值下与 `RawNumeric8`
+/// 等价，保留为兼容视图；真实布局见 `RawNumeric8`。
 /// signed i32 完全合法（-2880/-2227/-3160/-10 均有真机证据），
 /// 与 feed 的 `mantissa < 0 → fail-closed` 无关，各自独立规则。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,15 +197,16 @@ pub struct AxisPosition {
     pub raw: [u8; 8],
     /// 定点尾数（i32 BE；165 实测 `-2880` 等；Mesa 取此值）。
     pub mantissa: i32,
-    /// 缩放基（165 实测 `10`）。
+    /// 缩放基（165 实测 `10`；真实为 u16，兼容视图截断）。
     pub base: u8,
-    /// 缩放指数（165 实测 `3`）。
+    /// 缩放指数（165 实测 `3`；真实为 i16，N4 `12339` 在此截断为 51）。
     pub exponent: u8,
 }
 
 impl AxisPosition {
-    /// 有效性门：`base == 10` 且 `exponent <= 9`（165 实证范围；
-    /// N4 `exp=51` 即 `Unsupported` → ERR/BAD，codec 照常解出字段）。
+    /// 有效性门（兼容视图；生产 adapter 已改走 `RawNumeric8::validate`，
+    /// 见 `axis_to_value` B4）。保留供旧单测引用，未使用告警允许。
+    #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), WireError> {
         if self.base != 10 {
             return Err(WireError::Unsupported("axis base != 10"));
@@ -140,13 +219,17 @@ impl AxisPosition {
 }
 
 // ---------------------------------------------------------------------------
-// Wire layout 常量（PR1 review：反复出现的 offset/length 命名；
-// 不引入 BinaryReader/CodecBuilder）。
+// Wire layout 常量（PR1 review + PR53 真实模型）：
+// `RESPONSE_PREFIX_LEN/DATA_LEN_FIELD_LEN` 为旧成功路径视图（6×00 前缀），
+// 新 decoder 走 `ReplySubpacket{status, data}` 真实模型；旧常量保留供
+// 兼容单测引用（PR53 约束：已验证 bytes 不变），未使用告警允许。
 // ---------------------------------------------------------------------------
 
-/// GENERIC 响应 subpacket 前缀（`6×00`，B1 实测）。
+/// GENERIC 响应成功前缀（旧视图；新代码走 `reply_success_data`）。
+#[allow(dead_code)]
 pub const RESPONSE_PREFIX_LEN: usize = 6;
-/// GENERIC 响应 `data_len` 字段（u16 BE）。
+/// GENERIC 响应 `data_len` 字段（旧视图；新代码走 `ReplySubpacket.data`）。
+#[allow(dead_code)]
 pub const DATA_LEN_FIELD_LEN: usize = 2;
 /// SYSINFO 数据体（18B ODBSYS）。
 pub const SYSINFO_DATA_LEN: usize = 18;
@@ -158,24 +241,45 @@ pub const FEED_DATA_LEN: usize = 8;
 pub const AXIS_DATA_LEN: usize = 8;
 
 // ---------------------------------------------------------------------------
-// Function id（Gate 0 实测 lead；response codec 以真机为准）
+// 路径/命令 id（PR53 真实模型）：`function u32 = path<<16|command`。
+// 旧 `FUNC_*` 兼容视图保留（已验证 bytes 100% 不变）；新 decoder 用
+// `(device, path, command)` 三元组 + slot 匹配。
 // ---------------------------------------------------------------------------
 
-/// CNC 设备（Gate 0：`0x0001`；PMC=`0x0002`，PR3 axis 未用）。
+/// CNC 设备（Gate 0：`0x0001`；PMC=`0x0002`，PR53 未用）。
 pub(super) const DEV_CNC: u16 = 0x0001;
-/// `system_info`（Gate 0：`00 01 00 18`）。
+/// CNC 路径（165 实测 1；纯网络 API 把 path 放不可变请求，不模拟可变全局）。
+/// 真实模型的三元组一维；frame 层 `PATH_CNC_DEFAULT` 同值（wire 侧用此名）。
+pub(super) const PATH_CNC: u16 = 0x0001;
+/// `system_info` 命令（Gate 0：`path 1 + 0x18`）。
+pub(super) const CMD_SYSINFO: u16 = 0x0018;
+/// `status_info` 命令（`0x19`；`0xe1/0x98` 为 hdck/tmmode，已识别未暴露）。
+/// PR53：decoder 已用 slot 匹配；旧单测引用保留，未使用告警允许。
+#[allow(dead_code)]
+pub(super) const CMD_STATINFO: u16 = 0x0019;
+/// statinfo 伴随：hdck（已识别未暴露；旧名 `FUNC_UNKNOWN_E1`）。
+/// PR53：decoder 不再消费（framing 由 GENERIC 层保证），保留供文档/单测引用。
+#[allow(dead_code)]
+pub(super) const CMD_HDCK: u16 = 0x00e1;
+/// statinfo 伴随：tmmode（已识别未暴露；旧名 `FUNC_UNKNOWN_98`）。
+#[allow(dead_code)]
+pub(super) const CMD_TMMODE: u16 = 0x0098;
+/// `feed_rate` 命令（`0x24`，`0x24-only` 真机冻结）。
+pub(super) const CMD_FEED: u16 = 0x0024;
+/// `axis_absolute` 命令（`0x26`，`v0=4/v1=ordinal` 真机冻结）。
+pub(super) const CMD_AXIS_ABSOLUTE: u16 = 0x0026;
+/// 兼容视图：`function = path<<16|command`（旧代码用，字节等价）。
+/// （`FUNC_SYSINFO` 等保留供 fixture/request builder 兼容，见下。）
 pub(super) const FUNC_SYSINFO: u32 = 0x0001_0018;
-/// `status_info`（Gate 0：`00 01 00 19`）。
+/// 兼容视图（同上）。
 const FUNC_STATINFO: u32 = 0x0001_0019;
-/// statinfo 序列伴随 function（未知语义；只验 framing 后跳过）。
+/// 兼容视图（同上；新代码用 `CMD_HDCK`）。
 const FUNC_UNKNOWN_E1: u32 = 0x0001_00e1;
-/// statinfo 序列伴随 function（未知语义；只验 framing 后跳过）。
+/// 兼容视图（同上；新代码用 `CMD_TMMODE`）。
 const FUNC_UNKNOWN_98: u32 = 0x0001_0098;
-/// `feed_rate`（feed 证据 PASS：`00 01 00 24`，`0x24-only` 真机冻结）。
+/// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_FEED)`）。
 pub(super) const FUNC_FEED: u32 = 0x0001_0024;
-/// `axis_absolute`（axis 证据 PASS：`00 01 00 26`，`v0=4/v1=ordinal` 真机冻结；
-/// A0 曾观测 `[2,3,1]`，原因未知；后续 fresh-process capture 稳定观测
-/// `v1 == ordinal`，Wire 按已闭合合同直透 ordinal，不复刻 A0 异常）。
+/// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_AXIS_ABSOLUTE)`）。
 pub(super) const FUNC_AXIS_ABSOLUTE: u32 = 0x0001_0026;
 /// axis `0x26` 请求首个参数实测恒 `4`（165 observed；语义未知，不命名业务含义）。
 pub(super) const AXIS_ARG0_OBSERVED: i32 = 4;
@@ -429,28 +533,16 @@ impl FocasClient {
     }
 }
 
-/// `0x18` 响应解码：sub.payload = 6×00 + u16 data_len + 18B ODBSYS
-/// （B1 实测，不假设 `5×i32`）。字符区非可打印即 `Malformed`（绝不猜）。
+/// `0x18` 响应解码：slot 匹配 `0x18`，成功数据 = 18B ODBSYS
+/// （B1 实测）。字符区非可打印即 `Malformed`（绝不猜）。
 pub(super) fn decode_system_info(resp: &FocasFrame) -> Result<SystemInfo, WireError> {
-    let subs = decode_generic_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
-    let sub = find_function(&subs, DEV_CNC, FUNC_SYSINFO).ok_or(WireError::CommandMismatch)?;
-    let p = &sub.payload;
-    // B1 实测：p = 6×00 + 00 12 + 18B。
-    if p.len() < RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + SYSINFO_DATA_LEN {
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub =
+        match_slot(&subs, DEV_CNC, PATH_CNC, CMD_SYSINFO, 0).ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    if d.len() != SYSINFO_DATA_LEN {
         return Err(WireError::MalformedPayload);
     }
-    if p[0..RESPONSE_PREFIX_LEN] != [0u8; RESPONSE_PREFIX_LEN] {
-        return Err(WireError::MalformedPayload);
-    }
-    let data_len =
-        u16::from_be_bytes([p[RESPONSE_PREFIX_LEN], p[RESPONSE_PREFIX_LEN + 1]]) as usize;
-    if data_len != SYSINFO_DATA_LEN
-        || p.len() < RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + SYSINFO_DATA_LEN
-    {
-        return Err(WireError::MalformedPayload);
-    }
-    let d = &p[RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN
-        ..RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + SYSINFO_DATA_LEN];
     let ascii = |b: &[u8]| -> Result<String, WireError> {
         let s = String::from_utf8_lossy(b)
             .trim_matches('\0')
@@ -472,26 +564,20 @@ pub(super) fn decode_system_info(resp: &FocasFrame) -> Result<SystemInfo, WireEr
     })
 }
 
-/// `0x19` 响应解码：多 subpacket 中找 `0x19`，sub.payload =
-/// 6×00 + u16 data_len + 14B(7×u16 BE)。缺 `0x19` 即 `CommandMismatch`。
+/// `0x19` 响应解码：slot 匹配 `0x19`（`device/path/command`），
+/// 成功数据精确 14B(7×u16)。`status != 0` 即 `Remote`（由
+/// `reply_success_data` 先行返回，不到长度检查）。
+/// 缺 `0x19` 即 `CommandMismatch`。`0xe1/0x98`（hdck/tmmode，已识别未暴露）
+/// 不在此消费（framing 由 GENERIC 层保证）。
 pub(super) fn decode_status_info(resp: &FocasFrame) -> Result<StatusInfo, WireError> {
-    let subs = decode_generic_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
-    let sub = find_function(&subs, DEV_CNC, FUNC_STATINFO).ok_or(WireError::CommandMismatch)?;
-    let p = &sub.payload;
-    if p.len() < RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + STATINFO_DATA_LEN {
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub =
+        match_slot(&subs, DEV_CNC, PATH_CNC, CMD_STATINFO, 0).ok_or(WireError::CommandMismatch)?;
+    let reply = reply_success_data(sub)?;
+    if reply.len() != STATINFO_DATA_LEN {
         return Err(WireError::MalformedPayload);
     }
-    if p[0..RESPONSE_PREFIX_LEN] != [0u8; RESPONSE_PREFIX_LEN] {
-        return Err(WireError::MalformedPayload);
-    }
-    let data_len =
-        u16::from_be_bytes([p[RESPONSE_PREFIX_LEN], p[RESPONSE_PREFIX_LEN + 1]]) as usize;
-    if data_len < STATINFO_DATA_LEN || p.len() < RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + data_len
-    {
-        return Err(WireError::MalformedPayload);
-    }
-    let d = &p[RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN
-        ..RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + STATINFO_DATA_LEN];
+    let d = &reply[..STATINFO_DATA_LEN];
     // 7×u16 BE：aut/run/motion/mstb/emergency/alarm/edit（Gate 0 B1/B2 双闭合）。
     let u = |i: usize| u16::from_be_bytes([d[i], d[i + 1]]);
     Ok(StatusInfo {
@@ -505,105 +591,98 @@ pub(super) fn decode_status_info(resp: &FocasFrame) -> Result<StatusInfo, WireEr
     })
 }
 
-/// 在多 subpacket 响应中按 `(control_device, function)` 找目标。
+/// 请求槽 ↔ 响应槽匹配（PR53）：`match_slot` 按 `(device, path, command)`
+/// 取第 N 个（保留重复 command）。旧 `find_function`（取第一个）保留
+/// 作兼容（单 subpacket 下等价；fixture/单测引用），未使用告警允许。
+#[allow(dead_code)]
 fn find_function(subs: &[GenericSubpacket], dev: u16, func: u32) -> Option<&GenericSubpacket> {
     subs.iter()
         .find(|s| s.control_device == dev && s.function == func)
 }
 
-/// `0x24` 响应解码：单 subpacket，sub.payload =
-/// 6×00 + u16 data_len(=8) + 8B scaled value。
-/// 8B = `mantissa(i32 BE) + meta0 + base + meta1 + exponent`；
-/// `meta0/meta1` 不解释（进 `raw`）。缺 `0x24` 即 `CommandMismatch`。
+/// 响应成功数据提取（PR53 Remote 模型）：`status == 0` 即返回 `data`；
+/// `status != 0` 即 `WireError::Remote{status, detail1, detail2}`
+/// （合法业务失败，session 保留，单点 BAD——旧“6×00 前缀”检查只覆盖
+/// 成功路径，失败路径此前误判 `MalformedPayload` 丢连接，现修正）。
+fn reply_success_data(sub: &ReplySubpacket) -> Result<&[u8], WireError> {
+    if sub.status != 0 {
+        return Err(WireError::Remote {
+            status: sub.status,
+            detail1: sub.detail1,
+            detail2: sub.detail2,
+        });
+    }
+    Ok(&sub.data)
+}
+
+/// `0x24` 响应解码：slot 匹配 `0x24`，成功数据精确 8B scaled value。
+/// `RawNumeric8` 真实布局（`mantissa + base(u16) + exponent(i16)`）；
+/// 旧 `FeedRate{base: u8, exponent: u8}` 在已验证值下等价，保留为兼容视图。
+/// 缺 `0x24` 即 `CommandMismatch`。
 pub(super) fn decode_feed_rate(resp: &FocasFrame) -> Result<FeedRate, WireError> {
-    let subs = decode_generic_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
-    let sub = find_function(&subs, DEV_CNC, FUNC_FEED).ok_or(WireError::CommandMismatch)?;
-    let p = &sub.payload;
-    // 精确闭合：p 必须恰好 = 6×00 + u16 data_len(=8) + 8B（多 1B 即错，
-    // 与 frame length → count → subpacket length 同原则）。
-    let expected_len = RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + FEED_DATA_LEN;
-    if p.len() != expected_len {
-        return Err(WireError::MalformedPayload);
-    }
-    if p[0..RESPONSE_PREFIX_LEN] != [0u8; RESPONSE_PREFIX_LEN] {
-        return Err(WireError::MalformedPayload);
-    }
-    let data_len =
-        u16::from_be_bytes([p[RESPONSE_PREFIX_LEN], p[RESPONSE_PREFIX_LEN + 1]]) as usize;
-    if data_len != FEED_DATA_LEN {
-        return Err(WireError::MalformedPayload);
-    }
-    let d = &p[RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN
-        ..RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + FEED_DATA_LEN];
-    let mut raw = [0u8; 8];
-    raw.copy_from_slice(d);
-    Ok(FeedRate {
-        raw,
-        mantissa: i32::from_be_bytes([d[0], d[1], d[2], d[3]]),
-        base: d[5],
-        exponent: d[7],
-    })
-}
-
-/// `0x26` 响应解码：单 subpacket，sub.payload =
-/// 6×00 + u16 data_len(=8) + 8B scaled value（与 feed 同构，独立 decoder，
-/// 不抽公共类型）。缺 `0x26` 即 `CommandMismatch`。
-pub(super) fn decode_axis_position(resp: &FocasFrame) -> Result<AxisPosition, WireError> {
-    let subs = decode_generic_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
     let sub =
-        find_function(&subs, DEV_CNC, FUNC_AXIS_ABSOLUTE).ok_or(WireError::CommandMismatch)?;
-    let p = &sub.payload;
-    let expected_len = RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + AXIS_DATA_LEN;
-    if p.len() != expected_len {
+        match_slot(&subs, DEV_CNC, PATH_CNC, CMD_FEED, 0).ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    // 精确闭合：成功数据必须恰好 8B（多 1B 即错）。
+    if d.len() != FEED_DATA_LEN {
         return Err(WireError::MalformedPayload);
     }
-    if p[0..RESPONSE_PREFIX_LEN] != [0u8; RESPONSE_PREFIX_LEN] {
-        return Err(WireError::MalformedPayload);
-    }
-    let data_len =
-        u16::from_be_bytes([p[RESPONSE_PREFIX_LEN], p[RESPONSE_PREFIX_LEN + 1]]) as usize;
-    if data_len != AXIS_DATA_LEN {
-        return Err(WireError::MalformedPayload);
-    }
-    let d = &p[RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN
-        ..RESPONSE_PREFIX_LEN + DATA_LEN_FIELD_LEN + AXIS_DATA_LEN];
-    let mut raw = [0u8; 8];
-    raw.copy_from_slice(d);
-    Ok(AxisPosition {
-        raw,
-        mantissa: i32::from_be_bytes([d[0], d[1], d[2], d[3]]),
-        base: d[5],
-        exponent: d[7],
+    let num = RawNumeric8::decode(d)?;
+    Ok(FeedRate {
+        raw: num.raw,
+        mantissa: num.mantissa,
+        base: num.base as u8,
+        exponent: num.exponent as u8,
     })
 }
 
-/// Mesa `machine/feed` 无损映射：`(mantissa, denom)` →
-/// `Value::U32`。任一失败即 `Err`（fail-closed，不 truncate/round/clamp）：
-/// `mantissa < 0` / 分母为 0 / 不能整除 / 超 `u32::MAX`。
-fn feed_to_value(rate: &FeedRate) -> Result<Value, WireError> {
-    let (numer, denom) = rate.scaled()?;
-    if denom <= 0 {
-        return Err(WireError::Unsupported("feed denom <= 0"));
+/// `0x26` 响应解码：slot 匹配 `0x26`，成功数据精确 8B（与 feed 同构，
+/// 独立 decoder，不抽公共类型）。缺 `0x26` 即 `CommandMismatch`。
+pub(super) fn decode_axis_position(resp: &FocasFrame) -> Result<AxisPosition, WireError> {
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub = match_slot(&subs, DEV_CNC, PATH_CNC, CMD_AXIS_ABSOLUTE, 0)
+        .ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    if d.len() != AXIS_DATA_LEN {
+        return Err(WireError::MalformedPayload);
     }
-    if numer < 0 {
+    let num = RawNumeric8::decode(d)?;
+    Ok(AxisPosition {
+        raw: num.raw,
+        mantissa: num.mantissa,
+        base: num.base as u8,
+        exponent: num.exponent as u8,
+    })
+}
+
+/// Mesa `machine/feed` 映射（PR53 两层语义 + B1 冻结 + B4 真实权威）：
+/// `native_value = mantissa` → `Value::U32`（与 `cnc_actf` 只复制前 4B
+/// 同合同；不因 `exponent != 0` 拒绝——否则 `mantissa=1234/exp=1` 将在
+/// Native 返回 `1234` 时 Wire 拒绝，重新产生 parity 漂移）。
+/// fail-closed（不 truncate/round/clamp）：`mantissa < 0` 即 `Unsupported`
+/// （ERR → BAD；产品合同非负 U32）。B4：判定以 `raw` 重建的 `RawNumeric8`
+/// 完整字段为权威，不读兼容视图截断值（`base 0x010A → u8 0x0A` 逃逸类）。
+/// NOTE：工程量 `mantissa/base^exponent` 为独立语义，不进此 adapter；
+/// 待独立 `engineering_value` 暴露后再议（见 PR53）。
+fn feed_to_value(rate: &FeedRate) -> Result<Value, WireError> {
+    // PR53 B1+B4：Native contract 只依赖 mantissa；权威来自 raw 重建。
+    let num = RawNumeric8::decode(&rate.raw)?;
+    if num.native_value() < 0 {
         return Err(WireError::Unsupported("feed mantissa < 0"));
     }
-    if numer % denom != 0 {
-        return Err(WireError::Unsupported("feed not integral"));
-    }
-    let v = numer / denom;
-    if v > u32::MAX as i64 {
-        return Err(WireError::Unsupported("feed > u32::MAX"));
-    }
-    Ok(Value::U32(v as u32))
+    Ok(Value::U32(num.native_value() as u32))
 }
 
-/// Mesa `axis.absolute` 映射：`validate(base/exp)` 通过即
-/// `Value::I32(mantissa)`（mantissa 可负，-2880 等均有真机证据；
+/// Mesa `axis.absolute` 映射（PR53 B4 真实权威）：以 `raw` 重建
+/// `RawNumeric8` 完整字段为权威（`u16 base/i16 exponent`），不读兼容视图
+/// 截断值（`exp 0x0103 → u8 3` 逃逸类）。`validate` 通过即
+/// `Value::I32(native_value)`（mantissa 可负，-2880 等均有真机证据；
 /// 与 feed 的 `mantissa<0` 拒绝无关，各自独立规则）。
 fn axis_to_value(pos: &AxisPosition) -> Result<Value, WireError> {
-    pos.validate()?;
-    Ok(Value::I32(pos.mantissa))
+    let num = RawNumeric8::decode(&pos.raw)?;
+    num.validate()?;
+    Ok(Value::I32(num.native_value()))
 }
 
 /// fixture/test 专用：生产 `axis_to_value` 同源入口（`#[cfg(test)]`，
@@ -639,11 +718,11 @@ impl WireFocasApi {
         }
     }
 
-    /// 单点错误 ↔ 连接错误的分类：point-local（`Unsupported/Remote`）
+    /// 单点错误 ↔ 连接错误的分类：point-local（`Unsupported/Remote{..}`）
     /// 即 `ERR:` 占位（上层转单点 BAD）；session 致命即整批 `Err`（重连）。
     fn point_or_fatal(e: WireError) -> Result<Value, String> {
         match e {
-            WireError::Unsupported(_) | WireError::Remote(_) => {
+            WireError::Unsupported(_) | WireError::Remote { .. } => {
                 Ok(Value::String(format!("ERR:{e}")))
             }
             _ => Err(e.to_string()),
@@ -779,7 +858,9 @@ impl FocasApi for WireFocasApi {
 
 #[cfg(test)]
 mod tests {
-    use super::super::frame::{GenericSubpacket, encode_generic_request, request_subpacket};
+    use super::super::frame::{
+        GenericSubpacket, decode_generic_payload, encode_generic_request, request_subpacket,
+    };
     use super::*;
 
     /// Gate 0 B1 精确帧：frame#2 请求编码必须 `0x56/count=3`。
@@ -907,17 +988,30 @@ mod tests {
     }
 
     /// 缺 `0x19` 即 `CommandMismatch`（保守致命：响应与请求对不上时
-    /// 无法证明流还在边界上；point-local 的业务失败走 `Remote`）。
+    /// 无法证明流还在边界上；point-local 的业务失败走 `Remote{..}`）。
+    /// 注意：`0xe1` 载荷 `10×00` 在真实模型下是 `status=0` 的合法成功包，
+    /// 此测试用旧兼容 `GenericSubpacket` 构造，仅验证“无 0x19 槽”路径。
     #[test]
     fn missing_statinfo_is_mismatch() {
+        use super::super::frame::{ReplySubpacket, decode_reply_payload};
+        // 真实模型构造：count=1 + 0xe1 成功包（status=0），无 0x19。
+        let mut payload = vec![0x00, 0x01];
+        payload.extend_from_slice(&[0x00, 0x12]); // size=18
+        payload.extend_from_slice(&[0x00, 0x01]); // device
+        payload.extend_from_slice(&[0x00, 0x01]); // path
+        payload.extend_from_slice(&[0x00, 0xe1]); // command
+        payload.extend_from_slice(&[0x00, 0x00]); // status=0
+        payload.extend_from_slice(&[0x00, 0x00]); // detail1
+        payload.extend_from_slice(&[0x00, 0x00]); // detail2
+        payload.extend_from_slice(&[0x00, 0x02]); // data_len=2
+        payload.extend_from_slice(&[0x00, 0x00]); // data
+        let subs = decode_reply_payload(&payload).unwrap();
+        assert_eq!(subs.len(), 1);
+        let _: &ReplySubpacket = &subs[0];
         let frame = FocasFrame {
             origin: 0x0003,
             packet_type: PacketType::GENERIC_RESPONSE,
-            payload: encode_generic_request(&[GenericSubpacket {
-                control_device: DEV_CNC,
-                function: FUNC_UNKNOWN_E1,
-                payload: vec![0x00; 10],
-            }]),
+            payload,
         };
         let e = decode_status_info(&frame).unwrap_err();
         assert!(
@@ -925,6 +1019,42 @@ mod tests {
             "缺 0x19 必须 CommandMismatch"
         );
         assert!(e.is_session_fatal(), "CommandMismatch 保守判致命");
+    }
+
+    /// Remote 模型：`status != 0` 即业务失败（session 保留，单点 BAD）。
+    /// 构造 `0x19` 槽 `status=2`（size=16+14=30=0x1e；旧 `0x18` 是 6×00
+    /// 模型的 2+6+2+14=24，新模型为 2+6+6+2+14=30——尺寸本身即模型证据）。
+    #[test]
+    fn remote_status_is_point_local() {
+        let mut payload = vec![0x00, 0x01];
+        payload.extend_from_slice(&[0x00, 0x1e]); // size=30
+        payload.extend_from_slice(&[0x00, 0x01]); // device
+        payload.extend_from_slice(&[0x00, 0x01]); // path
+        payload.extend_from_slice(&[0x00, 0x19]); // command
+        payload.extend_from_slice(&[0x00, 0x02]); // status=2
+        payload.extend_from_slice(&[0x00, 0x01]); // detail1
+        payload.extend_from_slice(&[0x00, 0x02]); // detail2
+        payload.extend_from_slice(&[0x00, 0x0e]); // data_len=14
+        payload.extend_from_slice(&[0x00; 14]); // data（失败时不解释）
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload,
+        };
+        let e = decode_status_info(&frame).unwrap_err();
+        match e {
+            WireError::Remote {
+                status,
+                detail1,
+                detail2,
+            } => {
+                assert_eq!(status, 2);
+                assert_eq!(detail1, 1);
+                assert_eq!(detail2, 2);
+            }
+            _ => panic!("status=2 必须 Remote，实际：{e:?}"),
+        }
+        assert!(!e.is_session_fatal(), "Remote 不杀 session");
     }
 
     /// feed `0x24` 请求：count=1（`0x24-only` Gate 冻结形态）。
@@ -968,24 +1098,35 @@ mod tests {
         assert_eq!(feed_to_value(&rate).unwrap(), Value::U32(100));
     }
 
-    /// feed 非整数 fail-closed：`12345/10^2 = 123.45` 不得 truncate 成 123。
+    /// feed native 语义（PR53 B1 冻结）：`exp != 0` 不拒绝 adapter——
+    /// Mesa 取 `mantissa` 直透（与 `cnc_actf` 只复制前 4B 同合同）。
+    /// `mantissa=12345/exp=2` 即 `Value::U32(12345)`（工程量 123.45 为
+    /// 独立语义，不进此 adapter）。
     #[test]
-    fn feed_fractional_is_bad() {
+    fn feed_fractional_is_native_value() {
         let rate = FeedRate {
             raw: [0, 0, 0x30, 0x39, 0, 10, 0, 2],
             mantissa: 12345,
             base: 10,
             exponent: 2,
         };
-        assert_eq!(rate.scaled().unwrap(), (12345, 100));
-        let e = feed_to_value(&rate).unwrap_err();
-        assert!(
-            matches!(e, WireError::Unsupported(_)),
-            "非整数 feed 必须 fail-closed"
+        // RawNumeric8 层面可解（12345/100），adapter 取 native_value。
+        assert_eq!(
+            RawNumeric8::decode(&rate.raw)
+                .unwrap()
+                .engineering_value()
+                .unwrap(),
+            (12345, 100)
         );
+        assert_eq!(
+            RawNumeric8::decode(&rate.raw).unwrap().native_value(),
+            12345
+        );
+        assert_eq!(feed_to_value(&rate).unwrap(), Value::U32(12345));
     }
 
     /// feed 负值 fail-closed：`mantissa < 0` 不得进 U32。
+    /// B4：判定走 `raw` 重建（此处 raw 与兼容字段一致，双重锁定）。
     #[test]
     fn feed_negative_is_bad() {
         let rate = FeedRate {
@@ -1000,7 +1141,11 @@ mod tests {
         ));
     }
 
-    /// feed 非实证 base fail-closed：`base=2` 有外部佐证但 165 未见，不猜。
+    /// feed 非实证 base：B4 Native parity 下 adapter 不再设 base 门
+    /// （Native contract 只依赖 mantissa）；`scaled()` 兼容视图仍拒绝
+    /// （工程量语义未暴露，见过再放开）。
+    /// B4 回归：`raw base=0x010A`（`as u8 → 0x0A=10` 截断）不得影响 adapter——
+    /// adapter 以 raw 重建为权威，此处 mantissa=1 ≥ 0 即通过（Native 语义）。
     #[test]
     fn feed_unverified_base_is_bad() {
         let rate = FeedRate {
@@ -1037,6 +1182,58 @@ mod tests {
             WireError::MalformedPayload.to_string(),
             "8B 后跟 4B 垃圾必须 Malformed"
         );
+    }
+
+    /// B4 截断逃逸回归（axis）：`raw exp=0x0103=259` 经 `as u8` 变成 `3`
+    /// （兼容视图合法），但生产 adapter 必须以 raw 重建为权威 → Unsupported。
+    #[test]
+    fn axis_truncated_exponent_must_fail() {
+        let raw = [0x00, 0x00, 0x00, 0x64, 0x00, 0x0A, 0x01, 0x03];
+        let pos = AxisPosition {
+            raw,
+            mantissa: 100,
+            base: 10,
+            exponent: 3, // 截断值（兼容视图看起来合法）
+        };
+        // 真实值 259 不在 [0, 9]，生产 adapter 必须拒绝。
+        assert_eq!(
+            RawNumeric8::decode(&raw).unwrap().exponent,
+            259,
+            "raw 01 03 必须解为 i16 259"
+        );
+        assert!(matches!(
+            axis_to_value(&pos).unwrap_err(),
+            WireError::Unsupported(_)
+        ));
+    }
+
+    /// B4 authority 回归（feed）：raw 与兼容视图故意矛盾——
+    /// 生产 adapter 必须读 raw，不读 `rate.mantissa` 截断/旧字段。
+    /// 若回退成 `rate.mantissa`，此测试必红（`-1` 进 U32 即错）。
+    #[test]
+    fn feed_adapter_uses_raw_authority() {
+        let rate = FeedRate {
+            raw: [0, 0, 0, 1, 0, 10, 0, 0], // raw mantissa = 1
+            mantissa: -1,                   // compat 故意错误
+            base: 10,
+            exponent: 0,
+        };
+        assert_eq!(feed_to_value(&rate).unwrap(), Value::U32(1));
+    }
+
+    /// B4 authority 回归（axis 成功路径）：raw 与兼容视图故意矛盾——
+    /// 生产 adapter 必须读 raw mantissa，不读 `pos.mantissa`。
+    /// 与 `axis_truncated_exponent_must_fail`（锁 validation authority）
+    /// 职责互补：此测试锁 value authority。
+    #[test]
+    fn axis_adapter_uses_raw_value_authority() {
+        let pos = AxisPosition {
+            raw: [0xff, 0xff, 0xff, 0xf6, 0, 10, 0, 3], // raw = -10
+            mantissa: 123456,                           // compat 故意错误
+            base: 10,
+            exponent: 3,
+        };
+        assert_eq!(axis_to_value(&pos).unwrap(), Value::I32(-10));
     }
 
     /// axis `0x26` 请求：`v0=4/v1=ordinal`（axis 证据 PASS 冻结形态）。
@@ -1080,7 +1277,10 @@ mod tests {
         assert_eq!(axis_to_value(&pos).unwrap(), Value::I32(-2880));
     }
 
-    /// axis N4：`exp=51` codec 照常解出字段，但 validate fail-closed。
+    /// axis N4：raw 指数 `30 33` → `i16 0x3033 = 12339`（真实布局），
+    /// codec 照常解出字段，但 validate fail-closed（ERR → BAD，不进 I32）。
+    /// 兼容视图 `exponent: u8` 截断为 `51`（`12339 & 0xFF`），仅为旧断言保留；
+    /// 真实结论以 `RawNumeric8.exponent == 12339` 为准。
     #[test]
     fn axis_n4_exp51_fails_closed() {
         let mut p = vec![0x00; 6];
@@ -1097,7 +1297,13 @@ mod tests {
         };
         let pos = decode_axis_position(&frame).unwrap();
         assert_eq!(pos.mantissa, 0x2000_0202);
-        assert_eq!(pos.exponent, 51);
+        // 真实布局：`30 33` → `i16 12339`（不是 `u8 51`）。
+        assert_eq!(
+            RawNumeric8::decode(&pos.raw).unwrap().exponent,
+            12339,
+            "raw 30 33 必须解为 i16 12339"
+        );
+        assert_eq!(pos.exponent, 51, "兼容视图截断保留（旧断言）");
         // codec 成功，但语义层 fail-closed（ERR → BAD，不进 I32）。
         assert!(matches!(
             axis_to_value(&pos).unwrap_err(),

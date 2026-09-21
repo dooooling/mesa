@@ -104,11 +104,18 @@ pub enum WireError {
     MalformedPayload,
     /// 请求↔响应 function 对不上（保守致命）。
     CommandMismatch,
-    /// CNC 返回业务错误（`cmd + i16 != 0`，如 `EW_NOOPT`；session 保留）。
-    /// PR1 的 `0x18/0x19` 均为成功路径，此变体为 PR2+（axis/pmc/macro 等
-    /// point-local 失败）预留，未使用告警允许。
-    #[allow(dead_code)]
-    Remote(i16),
+    /// CNC 返回业务错误（真实模型：`status/detail1/detail2` 三槽；
+    /// 成功路径 `status == 0`，失败为合法业务结果，session 保留）。
+    /// 旧 `Remote(i16)` 已升级为结构化（已验证 bytes 不变：成功路径
+    /// `status/detail == 0` 即旧“6×00 前缀”）。
+    Remote {
+        /// 状态码（i16 返回码；如 `EW_NOOPT/EW_DATA`）。
+        status: i16,
+        /// 细节 1（保留原始位型，不解释）。
+        detail1: i16,
+        /// 细节 2（保留原始位型，不解释）。
+        detail2: i16,
+    },
     /// 未实现能力（fail-closed，如 PR1 非 Status 地址）。
     Unsupported(&'static str),
 }
@@ -126,7 +133,7 @@ impl WireError {
             | Self::UnexpectedPacket { .. }
             | Self::MalformedPayload
             | Self::CommandMismatch => true,
-            Self::Remote(_) | Self::Unsupported(_) => false,
+            Self::Remote { .. } | Self::Unsupported(_) => false,
         }
     }
 }
@@ -147,7 +154,11 @@ impl fmt::Display for WireError {
             }
             Self::MalformedPayload => write!(f, "FOCAS wire malformed payload"),
             Self::CommandMismatch => write!(f, "FOCAS wire command mismatch"),
-            Self::Remote(code) => write!(f, "FOCAS remote error {code}"),
+            Self::Remote {
+                status,
+                detail1,
+                detail2,
+            } => write!(f, "FOCAS remote error {status} ({detail1}/{detail2})"),
             Self::Unsupported(what) => write!(f, "FOCAS unsupported: {what}"),
         }
     }
