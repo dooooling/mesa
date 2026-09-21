@@ -7,7 +7,7 @@
     "data": 0
   },
   "mesa": {
-    "spindle_speed": null
+    "spindle_speed": 0
   },
   "source": {
     "kind": "direct_socket_capture",
