@@ -48,6 +48,50 @@ fn assemble_frame(raw: &[u8]) -> FocasFrame {
     super::frame::assemble(hdr, f[FRAME_HEADER_LEN..].to_vec()).expect("fixture assemble 必须成功")
 }
 
+/// param 单测装配 helper（`#[cfg(test)]`；wire.rs param 单测共用）：
+/// 按已验证形态构造 264B data（datano/attr/value + 已验证 tail）。
+/// unknown-tail 变体走 `assemble_param_frame_for_test_raw_tail`。
+#[cfg(test)]
+pub(super) fn assemble_param_frame_for_test(number: u32, attr: u32, value: i32) -> FocasFrame {
+    let tail: [u8; 4] = if attr == 4 {
+        super::wire::PARAM_TAIL_VERIFIED_0
+    } else {
+        super::wire::PARAM_TAIL_VERIFIED_1
+    };
+    assemble_param_frame_for_test_raw_tail(number, attr, value, tail)
+}
+
+/// param 未知 tail 变体（`#[cfg(test)]`；unknown-scale fail-closed 回归用）。
+#[cfg(test)]
+pub(super) fn assemble_param_frame_for_test_raw_tail(
+    number: u32,
+    attr: u32,
+    value: i32,
+    tail: [u8; 4],
+) -> FocasFrame {
+    let mut data = Vec::with_capacity(264);
+    data.extend_from_slice(&number.to_be_bytes());
+    data.extend_from_slice(&attr.to_be_bytes());
+    data.extend_from_slice(&value.to_be_bytes());
+    data.extend_from_slice(&tail);
+    while data.len() < 264 {
+        data.extend_from_slice(&[0x00, 0x0a, 0x00, 0x00]);
+    }
+    data.truncate(264);
+    // 真实模型构造：count=1 + size=280 + dev/path/cmd + status/details + dlen + data。
+    let mut payload = vec![0x00, 0x01];
+    payload.extend_from_slice(&[0x01, 0x18]); // size=280
+    payload.extend_from_slice(&[0x00, 0x01, 0x00, 0x01, 0x00, 0x8D]);
+    payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    payload.extend_from_slice(&[0x01, 0x08]); // dlen=264
+    payload.extend_from_slice(&data);
+    FocasFrame {
+        origin: 0x0003,
+        packet_type: PacketType::GENERIC_RESPONSE,
+        payload,
+    }
+}
+
 /// 全量回归入口（`wire.rs` 单测转调；失败即 production codec 与真机偏离）。
 pub(crate) fn run_all() {
     sysinfo_decodes();
@@ -69,6 +113,8 @@ pub(crate) fn run_all() {
     macro_request_locked();
     pmc_scalar_decodes();
     pmc_request_locked();
+    param_decodes();
+    param_request_locked();
 }
 
 /// sysinfo：`sysinfo_response.bin` 经生产 codec 解码 == expected 7 字段。
@@ -552,6 +598,72 @@ fn pmc_request_locked() {
         .encode();
         assert_eq!(build.len(), 40, "{group} 0x8001 请求必须 40B");
         let raw = read(group, "pmc_request_frame.bin");
+        let frames = cut_fixture_frames(&raw);
+        assert_eq!(frames.len(), 1, "{group} 必须恰好 1 帧");
+        assert_eq!(frames[0].len(), 40, "{group} 必须 40B");
+        assert_eq!(
+            frames[0], build,
+            "{group} production encoder 必须 == captured fixture 全 40B"
+        );
+    }
+}
+
+/// param Q0/Q3/P-C：`param_response_frame.bin` 经生产 codec 解码 ==
+/// expected（3410=0/3411=0/6711=10027/123/456/restored；Mesa I32）。
+fn param_decodes() {
+    use super::wire::{decode_param_value, param_to_value_for_test as to_value};
+    for (group, number, want) in [
+        ("param_3410", 3410u32, 0),
+        ("param_3411", 3411, 0),
+        ("param_6711_c0", 6711, 10027),
+        ("param_6711_c1", 6711, 123),
+        ("param_6711_c2", 6711, 456),
+        ("param_6711_c3", 6711, 10027),
+    ] {
+        let frame = assemble_frame(&read(group, "param_response_frame.bin"));
+        let p = decode_param_value(&frame, number).expect("{group} 必须解码");
+        assert_eq!(p.datano, number, "{group} datano echo");
+        assert_eq!(p.value, want, "{group} value slot");
+        let exp = expected(group);
+        assert_eq!(
+            exp["native"]["decoded"].as_i64().unwrap() as i32,
+            p.value,
+            "{group} Native↔Wire value 同次一致"
+        );
+        assert_eq!(
+            to_value(&p).expect("{group} adapter 必须通过"),
+            mesa_core_types::Value::I32(want),
+            "{group} Mesa I32"
+        );
+    }
+}
+
+/// param 请求：生产编码器输出 == 捕获 fixture（`encode == request` 闭环）。
+/// Q0/Q3/P-C 各 40B（`args=[n,n,0,0]/aux=0`，单点语义）。
+fn param_request_locked() {
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+    use super::frame::{encode_generic_request, request_subpacket};
+    use super::wire::{DEV_CNC, FUNC_PARAM};
+    for (group, num) in [
+        ("param_3410", 3410),
+        ("param_3411", 3411),
+        ("param_6711_c0", 6711),
+        ("param_6711_c1", 6711),
+        ("param_6711_c2", 6711),
+        ("param_6711_c3", 6711),
+    ] {
+        let build = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_PARAM,
+                [num, num, 0, 0, 0],
+            )]),
+        }
+        .encode();
+        assert_eq!(build.len(), 40, "{group} 0x8D 请求必须 40B");
+        let raw = read(group, "param_request_frame.bin");
         let frames = cut_fixture_frames(&raw);
         assert_eq!(frames.len(), 1, "{group} 必须恰好 1 帧");
         assert_eq!(frames[0].len(), 40, "{group} 必须 40B");

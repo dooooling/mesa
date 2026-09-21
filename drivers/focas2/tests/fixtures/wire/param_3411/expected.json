@@ -1,0 +1,21 @@
+{
+  "operation": "param_value",
+  "number": 3411,
+  "native": {
+    "rc": 0,
+    "decoded": 0
+  },
+  "mesa": {
+    "param_value": 0
+  },
+  "source": {
+    "kind": "direct_socket_capture",
+    "target": "192.168.15.165:8193",
+    "open_variant": "00 02",
+    "evidence_point": "Q3",
+    "evidence_window": "param Q0/Q3/P-C0~C3",
+    "request": "hand-built per frozen contract (device=1/path=1/cmd=0x8D/args=[n,n,0,0]/aux=0)",
+    "response": "live bytes head16 verified; tail per verified identity-scale form (full 264B reconstructed per framing)",
+    "note": "no pcap (direct probe); no stream id — do not fabricate"
+  }
+}
