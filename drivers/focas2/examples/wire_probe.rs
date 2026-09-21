@@ -1,17 +1,17 @@
-//! `wire_probe`（PR1 开发工具 + PR2 feed + PR3 axis，非生产路径）：
+//! `wire_probe`（PR1 开发工具 + PR2 feed + PR3 axis + PR54 spindle，非生产路径）：
 //! Wire 直连真机验证。
 //!
 //! - 用法：`MESA_WIRE_HOST=192.168.15.165 cargo run -p mesa-driver-focas2
 //!   --example wire_probe`（可选 `MESA_WIRE_PORT`，默认 8193）。
-//! - 只调 `system_info` + `status/feed/axis.absolute`，打印结果；不碰 Native、
-//!   不改生产 backend、不写 fixture。
+//! - 只调 `system_info` + `status/feed/axis.absolute/spindle_speed`，打印结果；
+//!   不碰 Native、不改生产 backend、不写 fixture。
 //! - Gate 0 期望（165）：series=G31Z/version=10.0，
-//!   `StatusInfo.aut` 与面板 mode 一致（MEM=1/MDI=0）；feed/axis 与 Native 一致。
+//!   `StatusInfo.aut` 与面板 mode 一致（MEM=1/MDI=0）；feed/axis/spindle 与 Native 一致。
 
 use std::time::Duration;
 
 use mesa_driver_focas2::wire_pub::WireFocasApi;
-use mesa_driver_focas2::{FocasApi, parse_address};
+use mesa_driver_focas2::{FocasAddress, FocasApi, parse_address};
 
 #[tokio::main]
 async fn main() {
@@ -39,9 +39,10 @@ async fn main() {
         parse_address("axis.abs.1").expect("axis1 地址合法"),
         parse_address("axis.abs.2").expect("axis2 地址合法"),
         parse_address("axis.abs.3").expect("axis3 地址合法"),
+        FocasAddress::ActiveSpindleSpeed,
     ];
     match api.read_batch(&addrs).await {
-        Ok(vals) => println!("status+feed+axis123 -> {vals:?}"),
+        Ok(vals) => println!("status+feed+axis123+spindle -> {vals:?}"),
         Err(e) => eprintln!("read_batch 失败：{e}"),
     }
     api.disconnect().await;

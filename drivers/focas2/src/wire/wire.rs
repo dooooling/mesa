@@ -218,6 +218,26 @@ impl AxisPosition {
     }
 }
 
+/// FOCAS `spindle_speed`（`0x25`）typed 结果。spindle Evidence PASS。
+/// 旧 `{mantissa, base: u8, exponent: u8}` 在 S0~S4（`0x000A/0x0000`）下
+/// 与 `RawNumeric8` 等价，保留为兼容视图；真实布局见 `RawNumeric8`。
+/// `cnc_acts` 无 spindle 实例语义（只有 ActiveSpindleSpeed 可调，
+/// indexed speed fail-closed，与 PR52 Native 门同口径）。
+/// mantissa 可为 0（S0 停转）；负值未观测，adapter 按 feed 同口径拒绝
+/// （产品合同非负 U32/I32？见 `spindle_to_value`——spindle 取 I32，
+/// 负值语义未闭合前 fail-closed，不猜）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpindleSpeed {
+    /// 原始 8B。
+    pub raw: [u8; 8],
+    /// 定点尾数（i32 BE；S1~S4 实测 `500/1002/1500/800`；Mesa 取此值）。
+    pub mantissa: i32,
+    /// 缩放基（S0~S4 实测 `10`；真实为 u16，兼容视图截断）。
+    pub base: u8,
+    /// 缩放指数（S0~S4 实测 `0`；真实为 i16；非零 exp 自然观测，不造数据）。
+    pub exponent: u8,
+}
+
 // ---------------------------------------------------------------------------
 // Wire layout 常量（PR1 review + PR53 真实模型）：
 // `RESPONSE_PREFIX_LEN/DATA_LEN_FIELD_LEN` 为旧成功路径视图（6×00 前缀），
@@ -239,6 +259,10 @@ pub const STATINFO_DATA_LEN: usize = 14;
 pub const FEED_DATA_LEN: usize = 8;
 /// AXIS 数据体（8B scaled value，与 feed 同构但独立常量，不共享语义）。
 pub const AXIS_DATA_LEN: usize = 8;
+/// SPINDLE 数据体（8B scaled value；spindle Evidence PASS：
+/// S0~S4 `data_len=8` 稳定，`RawNumeric8` 第三个独立 operation；
+/// 与 feed/axis 同构但独立常量，不抽公共语义）。
+pub const SPINDLE_DATA_LEN: usize = 8;
 
 // ---------------------------------------------------------------------------
 // 路径/命令 id（PR53 真实模型）：`function u32 = path<<16|command`。
@@ -266,6 +290,9 @@ pub(super) const CMD_HDCK: u16 = 0x00e1;
 pub(super) const CMD_TMMODE: u16 = 0x0098;
 /// `feed_rate` 命令（`0x24`，`0x24-only` 真机冻结）。
 pub(super) const CMD_FEED: u16 = 0x0024;
+/// `spindle_speed` 命令（`0x25`，spindle Evidence PASS：
+/// S0~S4 `device=1/path=1/args=[0,0,0,0]/aux=0` 逐字节恒定，无 selector）。
+pub(super) const CMD_SPINDLE_SPEED: u16 = 0x0025;
 /// `axis_absolute` 命令（`0x26`，`v0=4/v1=ordinal` 真机冻结）。
 pub(super) const CMD_AXIS_ABSOLUTE: u16 = 0x0026;
 /// 兼容视图：`function = path<<16|command`（旧代码用，字节等价）。
@@ -279,6 +306,8 @@ const FUNC_UNKNOWN_E1: u32 = 0x0001_00e1;
 const FUNC_UNKNOWN_98: u32 = 0x0001_0098;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_FEED)`）。
 pub(super) const FUNC_FEED: u32 = 0x0001_0024;
+/// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_SPINDLE_SPEED)`）。
+pub(super) const FUNC_SPINDLE_SPEED: u32 = 0x0001_0025;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_AXIS_ABSOLUTE)`）。
 pub(super) const FUNC_AXIS_ABSOLUTE: u32 = 0x0001_0026;
 /// axis `0x26` 请求首个参数实测恒 `4`（165 observed；语义未知，不命名业务含义）。
@@ -531,6 +560,46 @@ impl FocasClient {
             }
         }
     }
+
+    /// `spindle_speed`（spindle Evidence PASS：`0x25-only` count=1，
+    /// `device=1/path=1/args=[0,0,0,0]/aux=0`；S0~S4 逐字节恒定，无 selector、
+    /// 无 preflight——`0x25` 单次 exchange，不复刻 axis 的 `0x18` 前置）。
+    /// 响应单 8B speed value。
+    pub async fn spindle_speed(&self) -> Result<SpindleSpeed, WireError> {
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_SPINDLE_SPEED,
+                [0, 0, 0, 0, 0],
+            )]),
+        };
+        let mut guard = self.session.lock().await;
+        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                drop(guard);
+                if fatal {
+                    self.invalidate().await;
+                }
+                return Err(e);
+            }
+        };
+        drop(guard);
+        match decode_spindle_speed(&resp) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if e.is_session_fatal() {
+                    self.invalidate().await;
+                }
+                Err(e)
+            }
+        }
+    }
 }
 
 /// `0x18` 响应解码：slot 匹配 `0x18`，成功数据 = 18B ODBSYS
@@ -656,6 +725,41 @@ pub(super) fn decode_axis_position(resp: &FocasFrame) -> Result<AxisPosition, Wi
     })
 }
 
+/// `0x25` 响应解码：slot 匹配 `0x25`，成功数据精确 8B（与 feed/axis 同构，
+/// 独立 decoder，不抽公共类型；`RawNumeric8` 第三个独立 operation）。
+/// 缺 `0x25` 即 `CommandMismatch`。
+pub(super) fn decode_spindle_speed(resp: &FocasFrame) -> Result<SpindleSpeed, WireError> {
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub = match_slot(&subs, DEV_CNC, PATH_CNC, CMD_SPINDLE_SPEED, 0)
+        .ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    if d.len() != SPINDLE_DATA_LEN {
+        return Err(WireError::MalformedPayload);
+    }
+    let num = RawNumeric8::decode(d)?;
+    Ok(SpindleSpeed {
+        raw: num.raw,
+        mantissa: num.mantissa,
+        base: num.base as u8,
+        exponent: num.exponent as u8,
+    })
+}
+
+/// Mesa `machine/spindle_speed` 映射（spindle Evidence PASS + PR53 B4）：
+/// 以 `raw` 重建 `RawNumeric8` 为权威（`u16 base/i16 exponent`），不读
+/// 兼容视图截断值。`native_value = mantissa` → `Value::I32`
+/// （`cnc_acts` 只取 mantissa；S1~S4 `500/1002/1500/800` 全闭合）。
+/// fail-closed：`mantissa < 0` 即 `Unsupported`（ERR → BAD；S0~S4 未见负值，
+/// 语义未闭合前不猜）。`base/exponent` 不设门（Native parity 目标；
+/// 非零 exp 自然观测，不造规则——与 feed B1 同口径）。
+fn spindle_to_value(spd: &SpindleSpeed) -> Result<Value, WireError> {
+    let num = RawNumeric8::decode(&spd.raw)?;
+    if num.native_value() < 0 {
+        return Err(WireError::Unsupported("spindle mantissa < 0"));
+    }
+    Ok(Value::I32(num.native_value()))
+}
+
 /// Mesa `machine/feed` 映射（PR53 两层语义 + B1 冻结 + B4 真实权威）：
 /// `native_value = mantissa` → `Value::U32`（与 `cnc_actf` 只复制前 4B
 /// 同合同；不因 `exponent != 0` 拒绝——否则 `mantissa=1234/exp=1` 将在
@@ -692,6 +796,13 @@ pub(super) fn axis_to_value_for_test(pos: &AxisPosition) -> Result<Value, WireEr
     axis_to_value(pos)
 }
 
+/// fixture/test 专用：生产 `spindle_to_value` 同源入口（`#[cfg(test)]`，
+/// 不出 crate；spindle S0~S4 fixture 回归用）。
+#[cfg(test)]
+pub(super) fn spindle_to_value_for_test(spd: &SpindleSpeed) -> Result<Value, WireError> {
+    spindle_to_value(spd)
+}
+
 /// fixture/test 专用：`Value::I32` 构造子（断言可读性用）。
 #[cfg(test)]
 pub(super) fn axis_value_for_test(v: i32) -> Value {
@@ -699,11 +810,12 @@ pub(super) fn axis_value_for_test(v: i32) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed + PR3 axis）
+// WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed + PR3 axis + PR54 spindle）
 // ---------------------------------------------------------------------------
 
-/// Wire 版 `FocasApi`（PR3：`system_info` + `Status` + `Feed` + `Axis/absolute`；
-/// 其余地址 `Unsupported`，fail-closed，不猜、不 fallback Native）。
+/// Wire 版 `FocasApi`（PR54：`system_info` + `Status` + `Feed` +
+/// `Axis/absolute` + `ActiveSpindleSpeed`；其余地址 `Unsupported`，
+/// fail-closed，不猜、不 fallback Native）。
 pub struct WireFocasApi {
     client: Arc<FocasClient>,
     host: Mutex<Option<(String, u16)>>,
@@ -745,16 +857,21 @@ impl FocasApi for WireFocasApi {
         if addresses.is_empty() {
             return Ok(Vec::new());
         }
-        // 同一批共享请求：Status/Feed 各一次；Axis 按轴号各一次
+        // 同一批共享请求：Status/Feed/ActiveSpindle 各一次；Axis 按轴号各一次
         // （`0x26` 单轴语义，无多轴数组）；其余 fail-closed。
         // client 内部按 operation 持 guard。
         // 致命 session 错误在预取阶段立即短路（point-local 才进批）。
         // 非 Absolute 的 Axis kind（Machine/Relative/…）与 Native 同口径
         // fail-closed（ERR → BAD），绝不用 absolute 冒充。
+        // ActiveSpindleSpeed 与 indexed Spindle::Speed 同 PR52 Native 门：
+        // 只有前者可调 `0x25`，后者 fail-closed（ERR → BAD）。
         use crate::address::AxisKind;
         use std::collections::BTreeMap;
         let need_status = addresses.iter().any(|a| matches!(a, FocasAddress::Status));
         let need_feed = addresses.iter().any(|a| matches!(a, FocasAddress::Feed));
+        let need_spindle = addresses
+            .iter()
+            .any(|a| matches!(a, FocasAddress::ActiveSpindleSpeed));
         // 去重后的 Absolute 轴号（保序；axis 0/超限在 operation 内 fail-closed）。
         let mut axis_order: Vec<u8> = Vec::new();
         for a in addresses {
@@ -814,6 +931,25 @@ impl FocasApi for WireFocasApi {
             };
             axis_map.insert(*axis, r);
         }
+        // ActiveSpindleSpeed：同批一次 0x25（S0~S4 恒定请求，无 selector）。
+        let spindle_r: Option<Result<Value, String>> = if need_spindle {
+            match self.client.spindle_speed().await {
+                Ok(spd) => match spindle_to_value(&spd) {
+                    Ok(v) => Some(Ok(v)),
+                    Err(e) => match Self::point_or_fatal(e) {
+                        Ok(Value::String(s)) => Some(Err(s)),
+                        Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                        Err(fatal) => return Err(fatal),
+                    },
+                },
+                Err(e) => match Self::point_or_fatal(e) {
+                    Ok(v) => Some(Ok(v)),
+                    Err(fatal) => return Err(fatal),
+                },
+            }
+        } else {
+            None
+        };
         let mut out = Vec::with_capacity(addresses.len());
         for addr in addresses {
             match addr {
@@ -834,9 +970,14 @@ impl FocasApi for WireFocasApi {
                         Err(fatal) => return Err(fatal),
                     }
                 }
+                FocasAddress::ActiveSpindleSpeed => match spindle_r.clone().unwrap() {
+                    Ok(v) => out.push(v),
+                    Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
+                    Err(fatal) => return Err(fatal),
+                },
                 _ => out.push(Value::String(format!(
                     "ERR:{}",
-                    WireError::Unsupported("PR3 only Status/Feed/Absolute")
+                    WireError::Unsupported("PR54 only Status/Feed/Absolute/ActiveSpindle")
                 ))),
             }
         }
@@ -862,6 +1003,30 @@ mod tests {
         GenericSubpacket, decode_generic_payload, encode_generic_request, request_subpacket,
     };
     use super::*;
+    use crate::address::SpindleKind;
+
+    /// PR54 产品边界：indexed `Spindle::Speed` 在 Wire 侧 fail-closed
+    /// （只有 `ActiveSpindleSpeed` 可调 `0x25`，与 PR52 Native 门同口径）。
+    /// 未连接 api 上只读 indexed speed：不得发包（`need_spindle=false`），
+    /// 直接 `ERR:` 单点（若误纳入预取，未连接下走 `spindle_speed()` 即
+    /// fatal `Closed` 整批 Err，测试必红）。
+    #[tokio::test]
+    async fn indexed_spindle_speed_stays_fail_closed() {
+        let api = WireFocasApi::new(std::time::Duration::from_millis(50));
+        let vals = api
+            .read_batch(&[FocasAddress::Spindle {
+                spindle: 1,
+                kind: SpindleKind::Speed,
+            }])
+            .await
+            .expect("indexed speed 必须单点 ERR，不整批 Err");
+        assert_eq!(vals.len(), 1);
+        assert!(
+            matches!(&vals[0], Value::String(s) if s.starts_with("ERR:")),
+            "indexed speed 必须 ERR 单点，实际：{:?}",
+            vals[0]
+        );
+    }
 
     /// Gate 0 B1 精确帧：frame#2 请求编码必须 `0x56/count=3`。
     #[test]
@@ -1234,6 +1399,148 @@ mod tests {
             exponent: 3,
         };
         assert_eq!(axis_to_value(&pos).unwrap(), Value::I32(-10));
+    }
+
+    /// spindle `0x25` 请求：count=1（Evidence S0~S4 冻结形态：
+    /// `device=1/path=1/args=[0,0,0,0]/aux=0`，逐字节恒定，无 selector）。
+    #[test]
+    fn spindle_request_single_locked() {
+        use super::super::frame::encode_generic_request as enc;
+        let payload = enc(&[request_subpacket(
+            DEV_CNC,
+            FUNC_SPINDLE_SPEED,
+            [0, 0, 0, 0, 0],
+        )]);
+        // count=1 + 28B = 30 = 0x1e（与 sysinfo/feed/axis 同长，function 换 0x25）。
+        assert_eq!(payload.len(), 0x1e);
+        assert_eq!(&payload[0..2], &[0x00, 0x01]);
+        let back = decode_generic_payload(&payload).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].function, FUNC_SPINDLE_SPEED);
+    }
+
+    /// spindle S1 响应解码：`00 00 01 f4 00 0a 00 00` → mantissa=500。
+    /// production encoder == captured S1 request（见 fixture `spindle1`），
+    /// 此处锁 decoder + adapter（`Value::I32(500)`）。
+    #[test]
+    fn decode_spindle_s1_locked() {
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x08]);
+        p.extend_from_slice(&[0x00, 0x00, 0x01, 0xF4, 0x00, 0x0A, 0x00, 0x00]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_SPINDLE_SPEED,
+                payload: p,
+            }]),
+        };
+        // 2 + 24 = 26 = 0x1a（S1 捕获形态，与 feed/axis 同尺寸）。
+        assert_eq!(frame.payload.len(), 0x1a);
+        let spd = decode_spindle_speed(&frame).unwrap();
+        assert_eq!(spd.mantissa, 500);
+        assert_eq!(spd.base, 10);
+        assert_eq!(spd.exponent, 0);
+        assert_eq!(spd.raw, [0x00, 0x00, 0x01, 0xF4, 0x00, 0x0A, 0x00, 0x00]);
+        // RawNumeric8 真实值：base=10/exp=0（第三个独立 operation）。
+        assert_eq!(RawNumeric8::decode(&spd.raw).unwrap().base, 10);
+        assert_eq!(RawNumeric8::decode(&spd.raw).unwrap().exponent, 0);
+        // adapter：native_value → I32（与 Native cnc_acts=500 同合同）。
+        assert_eq!(spindle_to_value(&spd).unwrap(), Value::I32(500));
+    }
+
+    /// spindle S0 停转：mantissa=0 → I32(0)（不是 BAD，占位符也不猜）。
+    #[test]
+    fn decode_spindle_s0_zero() {
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x08]);
+        p.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_SPINDLE_SPEED,
+                payload: p,
+            }]),
+        };
+        let spd = decode_spindle_speed(&frame).unwrap();
+        assert_eq!(spd.mantissa, 0);
+        assert_eq!(spindle_to_value(&spd).unwrap(), Value::I32(0));
+    }
+
+    /// spindle 负值 fail-closed：`mantissa < 0` 不得进 I32（S0~S4 未见负值，
+    /// 语义未闭合前不猜；与 feed 同口径，axis 的负值合法无关）。
+    #[test]
+    fn spindle_negative_is_bad() {
+        let spd = SpindleSpeed {
+            raw: [0xFF, 0xFF, 0xFF, 0xFF, 0, 10, 0, 0],
+            mantissa: -1,
+            base: 10,
+            exponent: 0,
+        };
+        assert!(matches!(
+            spindle_to_value(&spd).unwrap_err(),
+            WireError::Unsupported(_)
+        ));
+    }
+
+    /// B4 authority 回归（spindle 成功路径）：raw 与兼容视图故意矛盾——
+    /// 生产 adapter 必须读 raw mantissa，不读 `spd.mantissa`。
+    #[test]
+    fn spindle_adapter_uses_raw_value_authority() {
+        let spd = SpindleSpeed {
+            raw: [0x00, 0x00, 0x01, 0xF4, 0, 10, 0, 0], // raw = 500
+            mantissa: 999999,                           // compat 故意错误
+            base: 10,
+            exponent: 0,
+        };
+        assert_eq!(spindle_to_value(&spd).unwrap(), Value::I32(500));
+    }
+
+    /// spindle 缺 `0x25` 即 `CommandMismatch`（保守致命）。
+    #[test]
+    fn missing_spindle_is_mismatch() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_FEED, // 故意放错槽
+                payload: {
+                    let mut p = vec![0x00; 6];
+                    p.extend_from_slice(&[0x00, 0x08]);
+                    p.extend_from_slice(&[0x00, 0x00, 0x00, 0x64, 0x00, 0x0A, 0x00, 0x00]);
+                    p
+                },
+            }]),
+        };
+        let e = decode_spindle_speed(&frame).unwrap_err();
+        assert!(matches!(e, WireError::CommandMismatch));
+        assert!(e.is_session_fatal());
+    }
+
+    /// spindle typed payload 内部精确闭合（与 feed/axis 同原则）。
+    #[test]
+    fn spindle_trailing_payload_rejected() {
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x08]);
+        p.extend_from_slice(&[0x00, 0x00, 0x01, 0xF4, 0x00, 0x0A, 0x00, 0x00]);
+        p.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_SPINDLE_SPEED,
+                payload: p,
+            }]),
+        };
+        assert_eq!(
+            decode_spindle_speed(&frame).unwrap_err().to_string(),
+            WireError::MalformedPayload.to_string(),
+        );
     }
 
     /// axis `0x26` 请求：`v0=4/v1=ordinal`（axis 证据 PASS 冻结形态）。

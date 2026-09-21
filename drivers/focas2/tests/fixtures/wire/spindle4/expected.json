@@ -1,0 +1,22 @@
+{
+  "operation": "spindle_speed",
+  "commanded_s": 800,
+  "panel_actual": 800,
+  "native": {
+    "rc": 0,
+    "data": 800
+  },
+  "mesa": {
+    "spindle_speed": 800
+  },
+  "source": {
+    "kind": "direct_socket_capture",
+    "target": "192.168.15.165:8193",
+    "open_variant": "00 02",
+    "evidence_point": "S4",
+    "evidence_window": "spindle S0~S4 (0 -> 500 -> 1002 -> 1500 -> 800, S4 descending)",
+    "request": "hand-built per frozen contract (device=1/path=1/cmd=0x25/args=[0,0,0,0]/aux=0); bytes identical across S0~S4",
+    "response": "live bytes, same-window as native cnc_acts",
+    "note": "no pcap for S0~S4 (direct probe, not pktmon); no stream id — do not fabricate"
+  }
+}
