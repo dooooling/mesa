@@ -956,7 +956,9 @@ impl NativeFocasApi {
                                 let b = lib
                                     .pmc_rdpmcrng_byte(hdl, adr_type, *addr)
                                     .map_err(Self::map_ret_err)?;
-                                Ok(Value::U32(b as u32))
+                                // PR56 产品合同修正：BYTE raw `u8` → `I32`
+                                //（Descriptor 无 bit 时为 I32；旧 `U32` 漂移）。
+                                Ok(Value::I32(b as i32))
                             }
                             Err(e) => Err(Self::map_ret_err(e)),
                         }
@@ -965,7 +967,8 @@ impl NativeFocasApi {
                         let b = lib
                             .pmc_rdpmcrng_byte(hdl, adr_type, *addr)
                             .map_err(Self::map_ret_err)?;
-                        Ok(Value::U32(b as u32))
+                        // PR56 产品合同修正：同上（底层 `u8` raw 不变，只改 adapter）。
+                        Ok(Value::I32(b as i32))
                     }
                 }
             }

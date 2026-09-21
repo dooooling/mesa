@@ -218,6 +218,101 @@ impl AxisPosition {
     }
 }
 
+/// PMC area 类型（canonical 10 kinds；P3 真机全 success，不再是 Native 候选）。
+/// `adr_type` 值即 Wire `A2`（`G=0/F=1/Y=2/X=3/A=4/R=5/T=6/K=7/C=8/D=9`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmcArea {
+    /// `G` 输入信号（BYTE）。
+    G,
+    /// `R` 内部继电器（WORD）。
+    R,
+    /// `X` 机床输入（BYTE）。
+    X,
+    /// `Y` 机床输出（BYTE）。
+    Y,
+    /// `F` CNC 输出（BYTE）。
+    F,
+    /// `A` 报警信息（WORD）。
+    A,
+    /// `D` 数据表（DWORD）。
+    D,
+    /// `C` 计数器（WORD）。
+    C,
+    /// `K` 保持继电器（BYTE）。
+    K,
+    /// `T` 定时器（WORD）。
+    T,
+}
+
+impl PmcArea {
+    /// canonical kind 字符 → area（Descriptor 外 kind 即 `None`→`Unsupported`，
+    /// 不猜、不 fallback `R`；旧 Native `_ => R` 别名不继承）。
+    pub fn from_kind(kind: char) -> Option<Self> {
+        match kind.to_ascii_uppercase() {
+            'G' => Some(Self::G),
+            'R' => Some(Self::R),
+            'X' => Some(Self::X),
+            'Y' => Some(Self::Y),
+            'F' => Some(Self::F),
+            'A' => Some(Self::A),
+            'D' => Some(Self::D),
+            'C' => Some(Self::C),
+            'K' => Some(Self::K),
+            'T' => Some(Self::T),
+            _ => None,
+        }
+    }
+
+    /// Wire `A2`（P3 真机证实）。
+    pub fn adr_type(self) -> u16 {
+        match self {
+            Self::G => 0,
+            Self::F => 1,
+            Self::Y => 2,
+            Self::X => 3,
+            Self::A => 4,
+            Self::R => 5,
+            Self::T => 6,
+            Self::K => 7,
+            Self::C => 8,
+            Self::D => 9,
+        }
+    }
+
+    /// 数据宽度（P0~P3 真机证实）：BYTE=1 / WORD=2 / DWORD=4。
+    pub fn width(self) -> usize {
+        match self {
+            Self::D => 4,
+            Self::R | Self::A | Self::T | Self::C => 2,
+            _ => 1,
+        }
+    }
+
+    /// Wire `A3`（`data_type`）：BYTE=0 / WORD=1 / DWORD=2。
+    pub fn data_type(self) -> u32 {
+        match self {
+            Self::D => 2,
+            Self::R | Self::A | Self::T | Self::C => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// FOCAS PMC scalar 读 typed 结果（scalar Evidence PASS：P0~P3）。
+/// 不做 `UniversalNumericValue` 抽象；PMC 语义留 PMC operation
+/// （`Byte(u8)/Word(i16)/Dword(i32)` 原始位型保留，Mesa 映射由 adapter 做）。
+/// NOTE：宽度权威在 `PmcArea::width`（请求 `end` + 响应 `data_len` 双重）；
+/// 不另设 `PmcWidth` enum（P0~P3 只有 1/2/4 三种，无需类型化，省一层抽象）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmcScalarValue {
+    /// BYTE 原始值（`u8`；Mesa → `I32(0..255)`，见 PR56 产品合同修正）。
+    Byte(u8),
+    /// WORD 原始值（`i16 BE`；Mesa → `I32`）。
+    Word(i16),
+    /// DWORD 原始值（`i32 BE`；Mesa → `I32`）。
+    Dword(i32),
+}
+
 /// FOCAS `macro_value`（`0x15`）typed 结果。macro Evidence PASS。
 /// 旧 `{mantissa, base: u8, exponent: u8}` 在 M0~M3（`0x000A` + `0/7/8`）下
 /// 与 `RawNumeric8` 等价，保留为兼容视图；真实布局见 `RawNumeric8`。
@@ -292,11 +387,16 @@ pub const MACRO_DATA_LEN: usize = 8;
 // `(device, path, command)` 三元组 + slot 匹配。
 // ---------------------------------------------------------------------------
 
-/// CNC 设备（Gate 0：`0x0001`；PMC=`0x0002`，PR53 未用）。
+/// CNC 设备（Gate 0：`0x0001`）。
 pub(super) const DEV_CNC: u16 = 0x0001;
+/// PMC 设备（P0a 真机证实：`device=2`；第一个非 1 的 device）。
+pub(super) const DEV_PMC: u16 = 0x0002;
 /// CNC 路径（165 实测 1；纯网络 API 把 path 放不可变请求，不模拟可变全局）。
 /// 真实模型的三元组一维；frame 层 `PATH_CNC_DEFAULT` 同值（wire 侧用此名）。
 pub(super) const PATH_CNC: u16 = 0x0001;
+/// PMC 路径（target165 observed 为 1；**不冻结为全局语义**——PMC path
+/// 独立状态尚未证实，此处只记录 target165 观测合同，不复用 `PATH_CNC` 名）。
+pub(super) const PATH_PMC_OBSERVED: u16 = 0x0001;
 /// `system_info` 命令（Gate 0：`path 1 + 0x18`）。
 pub(super) const CMD_SYSINFO: u16 = 0x0018;
 /// `status_info` 命令（`0x19`；`0xe1/0x98` 为 hdck/tmmode，已识别未暴露）。
@@ -321,6 +421,11 @@ pub(super) const CMD_MACRO: u16 = 0x0015;
 pub(super) const CMD_SPINDLE_SPEED: u16 = 0x0025;
 /// `axis_absolute` 命令（`0x26`，`v0=4/v1=ordinal` 真机冻结）。
 pub(super) const CMD_AXIS_ABSOLUTE: u16 = 0x0026;
+/// `pmc_rdpmcrng` 命令（`0x8001`，PMC scalar Evidence PASS：
+/// P0~P3 `device=2/path=1(args)/A0=start/A1=end/A2=adr_type/A3=data_type/aux=0`；
+/// 单点语义（BYTE `end=start` / WORD `end=start+1` / DWORD `end=start+3`），
+/// 不做范围读/multi-address/planner merge）。
+pub(super) const CMD_PMC_READ: u16 = 0x8001;
 /// 兼容视图：`function = path<<16|command`（旧代码用，字节等价）。
 /// （`FUNC_SYSINFO` 等保留供 fixture/request builder 兼容，见下。）
 pub(super) const FUNC_SYSINFO: u32 = 0x0001_0018;
@@ -338,6 +443,9 @@ pub(super) const FUNC_MACRO: u32 = 0x0001_0015;
 pub(super) const FUNC_SPINDLE_SPEED: u32 = 0x0001_0025;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_AXIS_ABSOLUTE)`）。
 pub(super) const FUNC_AXIS_ABSOLUTE: u32 = 0x0001_0026;
+/// 兼容视图（PMC：`function = path<<16|command` 字节等价；
+/// 新代码用 `(DEV_PMC, PATH_PMC_OBSERVED, CMD_PMC_READ)`）。
+pub(super) const FUNC_PMC_READ: u32 = 0x0001_8001;
 /// axis `0x26` 请求首个参数实测恒 `4`（165 observed；语义未知，不命名业务含义）。
 pub(super) const AXIS_ARG0_OBSERVED: i32 = 4;
 
@@ -674,6 +782,68 @@ impl FocasClient {
             }
         }
     }
+
+    /// `pmc_scalar(kind, addr)`（PMC scalar Evidence PASS：`0x8001` count=1，
+    /// `device=2/path=PATH_PMC_OBSERVED(args)/A0=start/A1=end/A2=adr_type/
+    /// A3=data_type/aux=0`；单点语义，不做范围读/multi-address/merge）。
+    /// 地址超 `c_short` 即 `Unsupported`，不发包（与 Native `Param` 同语义，
+    /// 禁止 `as` 截断；Wire-local checked，不依赖 Native）。
+    /// `end` 由 width 决定（BYTE `addr` / WORD `addr+1` / DWORD `addr+3`，
+    /// P0~P3 真机证实）。响应 `data_len` 必须 == width（exact length）。
+    pub async fn pmc_scalar(&self, kind: char, addr: u32) -> Result<PmcScalarValue, WireError> {
+        let area =
+            PmcArea::from_kind(kind).ok_or(WireError::Unsupported("pmc noncanonical kind"))?;
+        // Wire-local checked（PR56：wire.rs 不引用 `crate::native`）。
+        let start16 = u16::try_from(addr)
+            .ok()
+            .filter(|_| addr <= i16::MAX as u32)
+            .ok_or(WireError::Unsupported("pmc address out of c_short range"))?;
+        let width = area.width();
+        let end16 = addr
+            .checked_add((width as u32).saturating_sub(1))
+            .filter(|&e| e <= i16::MAX as u32)
+            .ok_or(WireError::Unsupported("pmc address end overflow"))?;
+        let _ = start16;
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_PMC,
+                FUNC_PMC_READ,
+                [
+                    addr as i32,
+                    end16 as i32,
+                    area.adr_type() as i32,
+                    area.data_type() as i32,
+                    0,
+                ],
+            )]),
+        };
+        let mut guard = self.session.lock().await;
+        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                drop(guard);
+                if fatal {
+                    self.invalidate().await;
+                }
+                return Err(e);
+            }
+        };
+        drop(guard);
+        match decode_pmc_scalar(&resp, area) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if e.is_session_fatal() {
+                    self.invalidate().await;
+                }
+                Err(e)
+            }
+        }
+    }
 }
 
 /// `0x18` 响应解码：slot 匹配 `0x18`，成功数据 = 18B ODBSYS
@@ -780,6 +950,33 @@ pub(super) fn decode_feed_rate(resp: &FocasFrame) -> Result<FeedRate, WireError>
     })
 }
 
+/// `0x8001` 响应解码：slot 匹配 `(device=2, path, cmd=0x8001)`，
+/// 成功数据精确 `== width`（BYTE=1 / WORD=2 / DWORD=4；P0~P3 真机证实）。
+/// 缺槽即 `CommandMismatch`；`status != 0` 走共用 Remote（point-local）。
+/// signedness 按 Native oracle 合同（`i16/i32 BE`；Wire 负值自然补证）。
+pub(super) fn decode_pmc_scalar(
+    resp: &FocasFrame,
+    area: PmcArea,
+) -> Result<PmcScalarValue, WireError> {
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub = match_slot(&subs, DEV_PMC, PATH_PMC_OBSERVED, CMD_PMC_READ, 0)
+        .ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    let width = area.width();
+    if d.len() != width {
+        return Err(WireError::MalformedPayload);
+    }
+    match area {
+        PmcArea::D => Ok(PmcScalarValue::Dword(i32::from_be_bytes([
+            d[0], d[1], d[2], d[3],
+        ]))),
+        PmcArea::R | PmcArea::A | PmcArea::T | PmcArea::C => {
+            Ok(PmcScalarValue::Word(i16::from_be_bytes([d[0], d[1]])))
+        }
+        _ => Ok(PmcScalarValue::Byte(d[0])),
+    }
+}
+
 /// `0x26` 响应解码：slot 匹配 `0x26`，成功数据精确 8B（与 feed 同构，
 /// 独立 decoder，不抽公共类型）。缺 `0x26` 即 `CommandMismatch`。
 pub(super) fn decode_axis_position(resp: &FocasFrame) -> Result<AxisPosition, WireError> {
@@ -855,6 +1052,21 @@ fn macro_to_value(m: &MacroValue) -> Result<Value, WireError> {
     Ok(Value::F64(numer as f64 / denom as f64))
 }
 
+/// Mesa `pmc/value` 映射（PMC scalar Evidence PASS）：
+/// `Byte(u8)` → `I32(0..255)` / `Word(i16)` → `I32` / `Dword(i32)` → `I32`
+/// （PR56 产品合同修正：BYTE 不再 `U32`，与 Descriptor `I32` 对齐；
+/// 底层 raw 语义不变，只改 adapter）。
+/// bit 由调用方本地 projection（`(byte>>n)&1 → Bool`），不进此函数。
+/// fixture 回归直调（`#[cfg(test)]` 可见性由模块内测试保证；生产 read_batch
+/// 同源调用，见下）。
+pub(super) fn pmc_scalar_to_value(v: &PmcScalarValue) -> Value {
+    match v {
+        PmcScalarValue::Byte(b) => Value::I32(*b as i32),
+        PmcScalarValue::Word(w) => Value::I32(*w as i32),
+        PmcScalarValue::Dword(d) => Value::I32(*d),
+    }
+}
+
 /// Mesa `machine/spindle_speed` 映射（spindle Evidence PASS + PR53 B4）：
 /// 以 `raw` 重建 `RawNumeric8` 为权威（`u16 base/i16 exponent`），不读
 /// 兼容视图截断值。`native_value = mantissa` → `Value::I32`
@@ -928,12 +1140,12 @@ pub(super) fn axis_value_for_test(v: i32) -> Value {
 
 // ---------------------------------------------------------------------------
 // WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed + PR3 axis + PR54 spindle
-// + PR55 macro）
+// + PR55 macro + PR56 pmc scalar）
 // ---------------------------------------------------------------------------
 
-/// Wire 版 `FocasApi`（PR55：`system_info` + `Status` + `Feed` +
-/// `Axis/absolute` + `ActiveSpindleSpeed` + `MacroVar`；其余地址 `Unsupported`，
-/// fail-closed，不猜、不 fallback Native）。
+/// Wire 版 `FocasApi`（PR56：`system_info` + `Status` + `Feed` +
+/// `Axis/absolute` + `ActiveSpindleSpeed` + `MacroVar` + `Pmc` scalar；
+/// 其余地址 `Unsupported`，fail-closed，不猜、不 fallback Native）。
 pub struct WireFocasApi {
     client: Arc<FocasClient>,
     host: Mutex<Option<(String, u16)>>,
@@ -977,7 +1189,8 @@ impl FocasApi for WireFocasApi {
         }
         // 同一批共享请求：Status/Feed/ActiveSpindle 各一次；Axis 按轴号各一次
         // （`0x26` 单轴语义，无多轴数组）；Macro 按宏号各一次（`0x15` 单点，
-        // 不做范围读）；其余 fail-closed。
+        // 不做范围读）；PMC scalar 按 (kind,addr) 去重各一次（`0x8001` 单点，
+        // 不做 range/merge）；其余 fail-closed。
         // client 内部按 operation 持 guard。
         // 致命 session 错误在预取阶段立即短路（point-local 才进批）。
         // 非 Absolute 的 Axis kind（Machine/Relative/…）与 Native 同口径
@@ -1092,6 +1305,49 @@ impl FocasApi for WireFocasApi {
                 macro_map.insert(*number, r);
             }
         }
+        // PMC scalar 按 (kind,addr) 去重各一次 0x8001（单点语义；bit 同 BYTE
+        // 路径，本地 projection；超界/非 canonical 在 operation 内 fail-closed）。
+        let mut pmc_order: Vec<(char, u32)> = Vec::new();
+        for a in addresses {
+            if let FocasAddress::Pmc { kind, addr, .. } = a
+                && !pmc_order.contains(&(*kind, *addr))
+            {
+                pmc_order.push((*kind, *addr));
+            }
+        }
+        let mut pmc_map: BTreeMap<(char, u32), Result<Value, String>> = BTreeMap::new();
+        for (kind, addr) in &pmc_order {
+            // bit 同 BYTE 读：先取同地址 BYTE scalar，再本地 projection。
+            let bit_opt = addresses.iter().find_map(|a| match a {
+                FocasAddress::Pmc {
+                    kind: k,
+                    addr: ad,
+                    bit: Some(b),
+                } if k == kind && ad == addr => Some(*b),
+                _ => None,
+            });
+            let r: Result<Value, String> = match self.client.pmc_scalar(*kind, *addr).await {
+                Ok(v) => match v {
+                    PmcScalarValue::Byte(b) => match bit_opt {
+                        Some(n) if n < 8 => Ok(Value::Bool(((b >> n) & 1) != 0)),
+                        Some(_) => {
+                            match Self::point_or_fatal(WireError::Unsupported("pmc bit 0..7")) {
+                                Ok(Value::String(s)) => Err(s),
+                                Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                                Err(fatal) => return Err(fatal),
+                            }
+                        }
+                        None => Ok(pmc_scalar_to_value(&v)),
+                    },
+                    _ => Ok(pmc_scalar_to_value(&v)),
+                },
+                Err(e) => match Self::point_or_fatal(e) {
+                    Ok(v) => Ok(v),
+                    Err(fatal) => return Err(fatal),
+                },
+            };
+            pmc_map.insert((*kind, *addr), r);
+        }
         let mut out = Vec::with_capacity(addresses.len());
         for addr in addresses {
             match addr {
@@ -1124,9 +1380,18 @@ impl FocasApi for WireFocasApi {
                         Err(fatal) => return Err(fatal),
                     }
                 }
+                FocasAddress::Pmc { kind, addr, .. } => {
+                    match pmc_map.get(&(*kind, *addr)).cloned().unwrap() {
+                        Ok(v) => out.push(v),
+                        Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
+                        Err(fatal) => return Err(fatal),
+                    }
+                }
                 _ => out.push(Value::String(format!(
                     "ERR:{}",
-                    WireError::Unsupported("PR55 only Status/Feed/Absolute/ActiveSpindle/Macro")
+                    WireError::Unsupported(
+                        "PR56 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc"
+                    )
                 ))),
             }
         }
@@ -1975,5 +2240,265 @@ mod tests {
             matches!(e, WireError::Unsupported(_)),
             "macro=40000 必须 Unsupported（不发包）"
         );
+    }
+
+    /// PMC kind mapping 10/10（P3 真机证实；Descriptor 外 kind 即 None）。
+    #[test]
+    fn pmc_kind_mapping_locked() {
+        use super::PmcArea;
+        for (kind, adr) in [
+            ('G', 0),
+            ('F', 1),
+            ('Y', 2),
+            ('X', 3),
+            ('A', 4),
+            ('R', 5),
+            ('T', 6),
+            ('K', 7),
+            ('C', 8),
+            ('D', 9),
+        ] {
+            let area = PmcArea::from_kind(kind).expect("canonical kind 必须映射");
+            assert_eq!(area.adr_type(), adr, "{kind} adr_type");
+        }
+        // 非 canonical kind 即 Unsupported（不猜、不 fallback R）。
+        assert!(PmcArea::from_kind('B').is_none());
+        assert!(PmcArea::from_kind('M').is_none());
+        assert!(PmcArea::from_kind('N').is_none());
+        assert!(PmcArea::from_kind('E').is_none());
+        assert!(PmcArea::from_kind('Z').is_none());
+    }
+
+    /// PMC `0x8001` 请求：`device=2/path=1/[start,end,adr,dt]/aux=0`（P0a 形态）。
+    #[test]
+    fn pmc_request_r100_locked() {
+        use super::super::frame::encode_generic_request as enc;
+        let payload = enc(&[request_subpacket(
+            DEV_PMC,
+            FUNC_PMC_READ,
+            [100, 101, 5, 1, 0],
+        )]);
+        // count=1 + 28B = 30 = 0x1e（与 CNC 系同长，device 换 2）。
+        assert_eq!(payload.len(), 0x1e);
+        assert_eq!(&payload[0..2], &[0x00, 0x01]);
+        let back = decode_generic_payload(&payload).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].control_device, DEV_PMC);
+        assert_eq!(back[0].function, FUNC_PMC_READ);
+    }
+
+    /// PMC WORD R100 响应解码：`00 00` → `Word(0)` → `I32(0)`。
+    #[test]
+    fn decode_pmc_r100_locked() {
+        use super::{PmcArea, PmcScalarValue};
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x02]);
+        p.extend_from_slice(&[0x00, 0x00]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_PMC,
+                function: FUNC_PMC_READ,
+                payload: p,
+            }]),
+        };
+        let v = decode_pmc_scalar(&frame, PmcArea::R).unwrap();
+        assert_eq!(v, PmcScalarValue::Word(0));
+        assert_eq!(pmc_scalar_to_value(&v), Value::I32(0));
+    }
+
+    /// PMC BYTE Y0/F0 非零：`0x04/0xC0` → `I32(4)/I32(192)`（产品类型锁：
+    /// BYTE 不得退回 `U32`，见 PR56 产品合同修正）。
+    #[test]
+    fn decode_pmc_byte_nonzero() {
+        use super::{PmcArea, PmcScalarValue};
+        for (area, byte, want) in [(PmcArea::Y, 0x04u8, 4), (PmcArea::F, 0xC0u8, 192)] {
+            let mut p = vec![0x00; 6];
+            p.extend_from_slice(&[0x00, 0x01, byte]);
+            let frame = FocasFrame {
+                origin: 0x0003,
+                packet_type: PacketType::GENERIC_RESPONSE,
+                payload: encode_generic_request(&[GenericSubpacket {
+                    control_device: DEV_PMC,
+                    function: FUNC_PMC_READ,
+                    payload: p,
+                }]),
+            };
+            let v = decode_pmc_scalar(&frame, area).unwrap();
+            assert_eq!(v, PmcScalarValue::Byte(byte));
+            assert_eq!(
+                pmc_scalar_to_value(&v),
+                Value::I32(want),
+                "BYTE 必须 I32（PR56 合同）"
+            );
+        }
+    }
+
+    /// PMC DWORD D0：`00 00 00 04` → `Dword(4)` → `I32(4)`（BE）。
+    #[test]
+    fn decode_pmc_dword_locked() {
+        use super::{PmcArea, PmcScalarValue};
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x04]);
+        p.extend_from_slice(&[0x00, 0x00, 0x00, 0x04]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_PMC,
+                function: FUNC_PMC_READ,
+                payload: p,
+            }]),
+        };
+        let v = decode_pmc_scalar(&frame, PmcArea::D).unwrap();
+        assert_eq!(v, PmcScalarValue::Dword(4));
+        assert_eq!(pmc_scalar_to_value(&v), Value::I32(4));
+    }
+
+    /// PMC WORD/DWORD signedness（构造 decoder 单测；Native oracle 合同
+    /// `i16/i32`，Wire 负值自然补证，不伪装真机证据）：
+    /// `FF FF → Word(-1)`，`FF FF FF FF → Dword(-1)`。
+    #[test]
+    fn decode_pmc_signedness_oracle() {
+        use super::{PmcArea, PmcScalarValue};
+        let mut pw = vec![0x00; 6];
+        pw.extend_from_slice(&[0x00, 0x02, 0xFF, 0xFF]);
+        let fw = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_PMC,
+                function: FUNC_PMC_READ,
+                payload: pw,
+            }]),
+        };
+        assert_eq!(
+            decode_pmc_scalar(&fw, PmcArea::R).unwrap(),
+            PmcScalarValue::Word(-1)
+        );
+        let mut pd = vec![0x00; 6];
+        pd.extend_from_slice(&[0x00, 0x04, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let fd = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_PMC,
+                function: FUNC_PMC_READ,
+                payload: pd,
+            }]),
+        };
+        assert_eq!(
+            decode_pmc_scalar(&fd, PmcArea::D).unwrap(),
+            PmcScalarValue::Dword(-1)
+        );
+    }
+
+    /// PMC bit projection：`(byte>>n)&1 → Bool`（Wire 无 bit operation；
+    /// `0xC0>>7=1/>>6=1/>>5=0`，与 Native 本地 mask 同构）。
+    #[test]
+    fn pmc_bit_projection_locked() {
+        // F0=0xC0：bit7=1/bit6=1/bit5=0/bit0=0。
+        let byte = 0xC0u8;
+        for (n, want) in [(7u8, true), (6, true), (5, false), (0, false)] {
+            assert_eq!(((byte >> n) & 1) != 0, want, "bit{n}");
+        }
+    }
+
+    /// PMC 缺 `0x8001` 即 `CommandMismatch`（保守致命）。
+    #[test]
+    fn missing_pmc_is_mismatch() {
+        use super::PmcArea;
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC, // 故意放错 device
+                function: FUNC_FEED,
+                payload: {
+                    let mut p = vec![0x00; 6];
+                    p.extend_from_slice(&[0x00, 0x08]);
+                    p.extend_from_slice(&[0x00, 0x00, 0x00, 0x64, 0x00, 0x0A, 0x00, 0x00]);
+                    p
+                },
+            }]),
+        };
+        let e = decode_pmc_scalar(&frame, PmcArea::R).unwrap_err();
+        assert!(matches!(e, WireError::CommandMismatch));
+        assert!(e.is_session_fatal());
+    }
+
+    /// PMC typed payload 内部精确闭合 + 宽度错配拒绝（与 CNC 系同原则）。
+    #[test]
+    fn pmc_trailing_and_width_rejected() {
+        use super::PmcArea;
+        // trailing 垃圾。
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x02, 0x00, 0x00, 0xDE, 0xAD]);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_PMC,
+                function: FUNC_PMC_READ,
+                payload: p,
+            }]),
+        };
+        assert_eq!(
+            decode_pmc_scalar(&frame, PmcArea::R)
+                .unwrap_err()
+                .to_string(),
+            WireError::MalformedPayload.to_string(),
+        );
+        // 宽度错配：WORD area 收 1B。
+        let mut p2 = vec![0x00; 6];
+        p2.extend_from_slice(&[0x00, 0x01, 0x00]);
+        let frame2 = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_PMC,
+                function: FUNC_PMC_READ,
+                payload: p2,
+            }]),
+        };
+        assert_eq!(
+            decode_pmc_scalar(&frame2, PmcArea::R)
+                .unwrap_err()
+                .to_string(),
+            WireError::MalformedPayload.to_string(),
+            "WORD area 收 1B 必须 Malformed"
+        );
+    }
+
+    /// PMC 地址越界 fail-closed：超 `c_short` / `end` 回绕不发包。
+    #[tokio::test]
+    async fn pmc_address_out_of_range() {
+        let client = FocasClient::new(std::time::Duration::from_millis(10));
+        // 超 c_short（32768）。
+        let e = client.pmc_scalar('R', 32768).await.unwrap_err();
+        assert!(
+            matches!(e, WireError::Unsupported(_)),
+            "addr=32768 必须 Unsupported（不发包）"
+        );
+        // DWORD end 回绕（32765+3=32768）。
+        let e = client.pmc_scalar('D', 32765).await.unwrap_err();
+        assert!(
+            matches!(e, WireError::Unsupported(_)),
+            "D32765 end 回绕必须 Unsupported"
+        );
+    }
+
+    /// PMC 非 canonical kind fail-closed：B/M/N/E/Z 不发包（不 fallback R）。
+    #[tokio::test]
+    async fn pmc_noncanonical_kind_unsupported() {
+        let client = FocasClient::new(std::time::Duration::from_millis(10));
+        for kind in ['B', 'M', 'N', 'E', 'Z'] {
+            let e = client.pmc_scalar(kind, 0).await.unwrap_err();
+            assert!(
+                matches!(e, WireError::Unsupported(_)),
+                "kind={kind} 必须 Unsupported（不发包）"
+            );
+        }
     }
 }
