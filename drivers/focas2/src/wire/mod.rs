@@ -31,8 +31,8 @@ pub(crate) use frame::{FocasFrame, GenericSubpacket, PacketType};
 pub(crate) use session::WireSession;
 #[allow(unused_imports)]
 pub(crate) use wire::{
-    AxisPosition, FocasClient, MacroValue, PmcArea, PmcScalarValue, SpindleSpeed, StatusInfo,
-    SystemInfo,
+    AxisPosition, FocasClient, MacroValue, ParamValue, PmcArea, PmcScalarValue, SpindleSpeed,
+    StatusInfo, SystemInfo,
 };
 // `WireFocasApi` 是 `wire_probe` 唯一需要的诊断入口（经 `wire_pub` 窄口出 crate）。
 pub use wire::WireFocasApi;

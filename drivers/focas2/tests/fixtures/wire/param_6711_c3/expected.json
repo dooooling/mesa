@@ -1,0 +1,21 @@
+{
+  "operation": "param_value",
+  "number": 6711,
+  "native": {
+    "rc": 0,
+    "decoded": 10027
+  },
+  "mesa": {
+    "param_value": 10027
+  },
+  "source": {
+    "kind": "direct_probe_partial_reconstruction",
+    "target": "192.168.15.165:8193",
+    "open_variant": "00 02",
+    "evidence_point": "P-C3",
+    "evidence_window": "param Q0/Q3/P-C0~C3",
+    "request": "hand-built per frozen contract (device=1/path=1/cmd=0x8D/args=[n,n,0,0]/aux=0)",
+    "response": "head16 live bytes verified; full 264B data reconstructed per verified framing (datano/attr/value/tail + repeat fill)",
+    "note": "no pcap (direct probe); no stream id — do not fabricate"
+  }
+}

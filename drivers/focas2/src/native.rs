@@ -2670,4 +2670,57 @@ mod tests {
         let pretty = serde_json::to_string_pretty(&doc).expect("expected.json 序列化失败");
         gate0_emit(&pretty, &out);
     }
+
+    /// Param Evidence Window（Q0 Native oracle）：
+    /// `connect → cnc_rdparam(number)（生产同源调用）→ disconnect`。
+    ///
+    /// 参数号由 `MESA_FOCAS_PARAM` 决定（默认 100；Q0 选面板可见普通只读参数）；
+    /// 法证输出：`rc` + 尝试的 `length` 序列 + 成功分支
+    /// （`IODBPSD_1/ldata` 或 `IODBPSD_2/prm_val+dec_val`）+ raw + decoded；
+    /// `length` 严格跟 FOCAS 合同/逆向分支（`1/8/6` + REAL `12/1`），
+    /// 不从 Rust `size_of` 猜（Macro `EW_LENGTH` 教训）；
+    /// Native contract（param v1 PASS）：Mesa 取 `I32`（identity-scale scalar）；
+    /// REAL/axis-dependent 留后续窗口，此处只记录，不解释；
+    /// 不写 Wire 代码、不碰生产路径（param 证据窗口专用）。
+    #[test]
+    #[ignore]
+    fn param_dump_rdparam() {
+        let number: u32 = std::env::var("MESA_FOCAS_PARAM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+        let (host, port, timeout_ms, out) = gate0_params();
+        let timeout_secs = (timeout_ms.div_ceil(1000).max(1).min(i32::MAX as u64)) as i32;
+        let lib =
+            NativeLib::load().unwrap_or_else(|e| panic!("FWLIB 加载失败（{host}:{port}）：{e}"));
+        let hdl = lib
+            .cnc_allclibhndl3(&host, port, timeout_secs)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
+                    e as i16,
+                    e.message()
+                )
+            });
+        // 生产同源调用（`cnc_rdparam` 内部 length 序列 + REAL 回退，不拆解，
+        // 避免证据与生产分叉；raw 细节由 Wire bytes 侧闭合）。
+        let (rc, decoded): (i16, Option<i32>) = match lib.cnc_rdparam(hdl, number) {
+            Ok(v) => (0, Some(v)),
+            Err(e) => (e as i16, None),
+        };
+        let _ = lib.cnc_freelibhndl(hdl);
+        let doc = serde_json::json!({
+            "operation": "rdparam",
+            "number": number,
+            "axis": 0,
+            "native": {
+                "rc": rc,
+                "ok": decoded.is_some(),
+                "decoded": decoded,
+            },
+            "mesa": { "param_value": decoded },
+        });
+        let pretty = serde_json::to_string_pretty(&doc).expect("expected.json 序列化失败");
+        gate0_emit(&pretty, &out);
+    }
 }

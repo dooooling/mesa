@@ -351,6 +351,30 @@ pub struct SpindleSpeed {
     pub exponent: u8,
 }
 
+/// FOCAS `param_value`（`0x8D`）typed 结果。param v1 Evidence PASS。
+/// 保留完整证据（不过早抽象成 `RawNumeric8`——尾部 scale 语义未闭合，
+/// REAL 留后续窗口；此处只冻结 identity-scale `I32` 单点读取）。
+/// `0x0E` 在 target165 上不适用，不兼容/不 fallback。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamValue {
+    /// 原始数据区（`data_len=264` 全量；尾部保留，不先命名 base/exponent）。
+    pub raw: Vec<u8>,
+    /// 参数号回显（`datano echo`；不符即 `Malformed/CommandMismatch`）。
+    pub datano: u32,
+    /// 属性/元数据（`attr` 字段边界；Q0=4/Q3=3/6711=3，随参数变化，不命名语义）。
+    pub attr: u32,
+    /// 参数值（`value slot` BE i32；Q0=0/Q3=0/P-C0=10027/P-C1=123/P-C2=456）。
+    pub value: i32,
+}
+
+/// param v1 已验证 identity-scale tail 形态（`value` 后 4B + 重复区头）。
+/// 只有 `00 0a 00 00`（Q3/6711 controlled 非零样本：`123/456/10027` 三点 +
+/// 恢复闭环）可输出 `I32`。Q0 的 `00 0a 00 03`（value=0，无辨别力——
+/// 无论 scale 语义是什么 0 都解成 0）**不 admit**，fixture 保留作负 evidence。
+/// 非 `00 0a 00 00` 即 `Unsupported`（REAL/未知 scale 留后续窗口，不猜）。
+/// NOTE：此处只锁已验证形态的**边界**，不解释字段语义；不由 `attr` 推 tail。
+pub const PARAM_TAIL_IDENTITY: [u8; 4] = [0x00, 0x0a, 0x00, 0x00];
+
 // ---------------------------------------------------------------------------
 // Wire layout 常量（PR1 review + PR53 真实模型）：
 // `RESPONSE_PREFIX_LEN/DATA_LEN_FIELD_LEN` 为旧成功路径视图（6×00 前缀），
@@ -380,6 +404,12 @@ pub const SPINDLE_DATA_LEN: usize = 8;
 /// M0~M3 `data_len=8` 稳定，`RawNumeric8` 第四个独立 operation；
 /// 与 feed/axis/spindle 同构但独立常量，不抽公共语义）。
 pub const MACRO_DATA_LEN: usize = 8;
+/// PARAM 数据体（264B；param v1 Evidence PASS：
+/// Q0/Q3/P-C0~C3 `data_len=264` 稳定；Q0 3410 / Q3 3411 / 6711 三号）。
+/// 布局（已闭合）：`datano(4B) + attr(4B) + value BE i32(4B) + tail`；
+/// tail 必须为已验证 identity-scale 形态（见 `PARAM_TAIL_VERIFIED`），
+/// 否则 fail-closed（REAL/未知 scale 留 Param REAL Evidence Window）。
+pub const PARAM_DATA_LEN: usize = 264;
 
 // ---------------------------------------------------------------------------
 // 路径/命令 id（PR53 真实模型）：`function u32 = path<<16|command`。
@@ -416,6 +446,11 @@ pub(super) const CMD_FEED: u16 = 0x0024;
 /// M0~M3 `device=1/path=1/args=[n,n,0,0]/aux=0`；单点语义，
 /// `start=end=number`，不做范围读）。
 pub(super) const CMD_MACRO: u16 = 0x0015;
+/// `param_value` 命令（`0x8D`，param v1 Evidence PASS：
+/// Q0/Q3/P-C0~C3 `device=1/path=1/args=[n,n,0,0]/aux=0`；单点语义，
+/// `axis=0`（当前 observed；axis-dependent 留后续窗口），不做范围读。
+/// `0x0E` 在 target165 上不适用（Q0 非零 status），不兼容/不 fallback）。
+pub(super) const CMD_PARAM: u16 = 0x008D;
 /// `spindle_speed` 命令（`0x25`，spindle Evidence PASS：
 /// S0~S4 `device=1/path=1/args=[0,0,0,0]/aux=0` 逐字节恒定，无 selector）。
 pub(super) const CMD_SPINDLE_SPEED: u16 = 0x0025;
@@ -439,6 +474,8 @@ const FUNC_UNKNOWN_98: u32 = 0x0001_0098;
 pub(super) const FUNC_FEED: u32 = 0x0001_0024;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_MACRO)`）。
 pub(super) const FUNC_MACRO: u32 = 0x0001_0015;
+/// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_PARAM)`）。
+pub(super) const FUNC_PARAM: u32 = 0x0001_008D;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_SPINDLE_SPEED)`）。
 pub(super) const FUNC_SPINDLE_SPEED: u32 = 0x0001_0025;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_AXIS_ABSOLUTE)`）。
@@ -667,6 +704,50 @@ impl FocasClient {
         };
         drop(guard);
         match decode_macro_value(&resp) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if e.is_session_fatal() {
+                    self.invalidate().await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// `param_value(number)`（param v1 Evidence PASS：`0x8D` count=1，
+    /// `args=[number,number,0,0]/aux=0`；单点语义，`axis=0` observed，
+    /// 不做范围读/axis-dependent/REAL。`0x0E` 不适用，不 fallback）。
+    /// 参数号超 `c_short` 即 `Unsupported`，不发包（Wire-local checked）。
+    /// 响应 `data_len=264`，`datano echo` + `value BE i32` + 已验证 tail。
+    pub async fn param_value(&self, number: u32) -> Result<ParamValue, WireError> {
+        let n = i16::try_from(number)
+            .map_err(|_| WireError::Unsupported("param number out of c_short range"))?
+            as i32;
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_PARAM,
+                [n, n, 0, 0, 0],
+            )]),
+        };
+        let mut guard = self.session.lock().await;
+        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                drop(guard);
+                if fatal {
+                    self.invalidate().await;
+                }
+                return Err(e);
+            }
+        };
+        drop(guard);
+        match decode_param_value(&resp, number) {
             Ok(v) => Ok(v),
             Err(e) => {
                 if e.is_session_fatal() {
@@ -1121,6 +1202,43 @@ pub(super) fn decode_macro_value(resp: &FocasFrame) -> Result<MacroValue, WireEr
     })
 }
 
+/// `0x8D` 响应解码（param v1 integer-safe scalar）：slot 匹配
+/// `(device=1, path=1, cmd=0x8D)`，成功数据精确 `== 264`
+/// （Q0/Q3/P-C0~C3 真机证实）。缺槽即 `CommandMismatch`；
+/// `status != 0` 走共用 Remote（point-local）。
+/// 字段（已闭合）：`datano echo`（必须 == 请求 number，否则
+/// `Malformed`——配 A 读 B 的回绕必须死）+ `attr`（边界）+
+/// `value BE i32` + 已验证 tail（非验证形态即 `Unsupported`，
+/// REAL/未知 scale 留后续窗口，不猜）。
+pub(super) fn decode_param_value(resp: &FocasFrame, number: u32) -> Result<ParamValue, WireError> {
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub =
+        match_slot(&subs, DEV_CNC, PATH_CNC, CMD_PARAM, 0).ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    if d.len() != PARAM_DATA_LEN {
+        return Err(WireError::MalformedPayload);
+    }
+    let datano = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+    if datano != number {
+        return Err(WireError::MalformedPayload);
+    }
+    let attr = u32::from_be_bytes([d[4], d[5], d[6], d[7]]);
+    let value = i32::from_be_bytes([d[8], d[9], d[10], d[11]]);
+    // tail gate：只有 `00 0a 00 00`（Q3/6711 controlled 非零 + 恢复闭环）
+    // 可输出 I32；Q0 `00 0a 00 03`（value=0 无辨别力）不 admit；
+    // 其他即未知 scale → Unsupported（REAL 留后续窗口）。
+    let tail: [u8; 4] = [d[12], d[13], d[14], d[15]];
+    if tail != PARAM_TAIL_IDENTITY {
+        return Err(WireError::Unsupported("param unverified scale tail"));
+    }
+    Ok(ParamValue {
+        raw: d.to_vec(),
+        datano,
+        attr,
+        value,
+    })
+}
+
 /// Mesa `macro/value` 映射（macro Evidence PASS + B4 真实权威）：
 /// 以 `raw` 重建 `RawNumeric8` 为权威（`u16 base/i16 exponent`），不读
 /// 兼容视图截断值。**与 feed/spindle/axis 的关键区别（证据结论）**：
@@ -1135,6 +1253,15 @@ fn macro_to_value(m: &MacroValue) -> Result<Value, WireError> {
     let (numer, denom) = num.engineering_value()?;
     // `denom = 10^exp > 0`（门内保证）；F64 除法（Mesa 产品合同 F64）。
     Ok(Value::F64(numer as f64 / denom as f64))
+}
+
+/// Mesa `param/value` 映射（param v1 integer-safe scalar）：
+/// `value slot` → `Value::I32`（Descriptor `I32`；Native `ldata` 同合同；
+/// Q0=0/Q3=0/P-C0=10027/P-C1=123/P-C2=456 全闭合）。
+/// tail gate 已在 decoder 内（未知 scale 不到 adapter）；
+/// 此处只做类型映射（`i32 → I32`），不截断/不缩放/不猜 REAL。
+fn param_to_value(p: &ParamValue) -> Result<Value, WireError> {
+    Ok(Value::I32(p.value))
 }
 
 /// Mesa `pmc/value` 映射（PMC scalar Evidence PASS）：
@@ -1217,6 +1344,13 @@ pub(super) fn macro_to_value_for_test(m: &MacroValue) -> Result<Value, WireError
     macro_to_value(m)
 }
 
+/// fixture/test 专用：生产 `param_to_value` 同源入口（`#[cfg(test)]`，
+/// 不出 crate；param Q0/Q3/P-C fixture 回归用）。
+#[cfg(test)]
+pub(super) fn param_to_value_for_test(p: &ParamValue) -> Result<Value, WireError> {
+    param_to_value(p)
+}
+
 /// fixture/test 专用：`Value::I32` 构造子（断言可读性用）。
 #[cfg(test)]
 pub(super) fn axis_value_for_test(v: i32) -> Value {
@@ -1225,12 +1359,12 @@ pub(super) fn axis_value_for_test(v: i32) -> Value {
 
 // ---------------------------------------------------------------------------
 // WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed + PR3 axis + PR54 spindle
-// + PR55 macro + PR56 pmc scalar）
+// + PR55 macro + PR56 pmc scalar + PR57 param）
 // ---------------------------------------------------------------------------
 
-/// Wire 版 `FocasApi`（PR56：`system_info` + `Status` + `Feed` +
-/// `Axis/absolute` + `ActiveSpindleSpeed` + `MacroVar` + `Pmc` scalar；
-/// 其余地址 `Unsupported`，fail-closed，不猜、不 fallback Native）。
+/// Wire 版 `FocasApi`（PR57：`system_info` + `Status` + `Feed` +
+/// `Axis/absolute` + `ActiveSpindleSpeed` + `MacroVar` + `Pmc` scalar +
+/// `Param`；其余地址 `Unsupported`，fail-closed，不猜、不 fallback Native）。
 pub struct WireFocasApi {
     client: Arc<FocasClient>,
     host: Mutex<Option<(String, u16)>>,
@@ -1274,7 +1408,8 @@ impl FocasApi for WireFocasApi {
         }
         // 同一批共享请求：Status/Feed/ActiveSpindle 各一次；Axis 按轴号各一次
         // （`0x26` 单轴语义，无多轴数组）；Macro 按宏号各一次（`0x15` 单点，
-        // 不做范围读）；PMC scalar 按 (kind,addr) 去重各一次（`0x8001` 单点，
+        // 不做范围读）；Param 按参数号各一次（`0x8D` 单点，不做范围/axis）；
+        // PMC scalar 按 (kind,addr) 去重各一次（`0x8001` 单点，
         // 不做 range/merge）；其余 fail-closed。
         // client 内部按 operation 持 guard。
         // 致命 session 错误在预取阶段立即短路（point-local 才进批）。
@@ -1390,6 +1525,30 @@ impl FocasApi for WireFocasApi {
                 macro_map.insert(*number, r);
             }
         }
+        // Param 按参数号各一次 0x8D（单点语义；超 c_short 在 operation 内
+        // fail-closed；未知 scale 在 decoder 内 fail-closed，不到 adapter）。
+        let mut param_map: BTreeMap<u32, Result<Value, String>> = BTreeMap::new();
+        for a in addresses {
+            if let FocasAddress::Param { number } = a
+                && !param_map.contains_key(number)
+            {
+                let r: Result<Value, String> = match self.client.param_value(*number).await {
+                    Ok(p) => match param_to_value(&p) {
+                        Ok(v) => Ok(v),
+                        Err(e) => match Self::point_or_fatal(e) {
+                            Ok(Value::String(s)) => Err(s),
+                            Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                            Err(fatal) => return Err(fatal),
+                        },
+                    },
+                    Err(e) => match Self::point_or_fatal(e) {
+                        Ok(v) => Ok(v),
+                        Err(fatal) => return Err(fatal),
+                    },
+                };
+                param_map.insert(*number, r);
+            }
+        }
         // PMC scalar 按 request shape 去重（B1 冻结）：
         // bit=None → (kind,addr,dt=kind width)；bit=Some → (kind,addr,dt=BYTE)。
         // 缓存 raw read result（`PmcScalarValue`），不缓存最终 Value——
@@ -1475,6 +1634,11 @@ impl FocasApi for WireFocasApi {
                         Err(fatal) => return Err(fatal),
                     }
                 }
+                FocasAddress::Param { number } => match param_map.get(number).cloned().unwrap() {
+                    Ok(v) => out.push(v),
+                    Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
+                    Err(fatal) => return Err(fatal),
+                },
                 FocasAddress::Pmc { kind, addr, bit } => {
                     // 非法 bit（>=8）在 map 查找前直接 point-local（no packet；
                     // prefetch 阶段已跳过，见上——未连接下也不碰 session）。
@@ -1530,7 +1694,7 @@ impl FocasApi for WireFocasApi {
                 _ => out.push(Value::String(format!(
                     "ERR:{}",
                     WireError::Unsupported(
-                        "PR56 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc"
+                        "PR57 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc/Param"
                     )
                 ))),
             }
@@ -2721,5 +2885,128 @@ mod tests {
         let key_r = ('R', 100u32, 1u32);
         let key_rb = ('R', 100u32, 0u32);
         assert_ne!(key_r, key_rb);
+    }
+
+    /// param `0x8D` 请求：count=1（Evidence Q0/Q3/6711 冻结形态：
+    /// `args=[number,number,0,0]/aux=0`，单点语义，不做范围/axis）。
+    #[test]
+    fn param_request_single_locked() {
+        use super::super::frame::encode_generic_request as enc;
+        let payload = enc(&[request_subpacket(
+            DEV_CNC,
+            FUNC_PARAM,
+            [3410, 3410, 0, 0, 0],
+        )]);
+        // count=1 + 28B = 30 = 0x1e（与 CNC 系同长，function 换 0x8D）。
+        assert_eq!(payload.len(), 0x1e);
+        assert_eq!(&payload[0..2], &[0x00, 0x01]);
+        let back = decode_generic_payload(&payload).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].function, FUNC_PARAM);
+    }
+
+    /// param Q3 响应解码：datano=3411 + value=0 + identity tail → `I32(0)`。
+    /// Q0（`00 0a 00 03`）不在此列——它走负 evidence（见下），不 admit。
+    #[test]
+    fn decode_param_q0_locked() {
+        let frame = super::super::fixture_tests::assemble_param_frame_for_test(3411, 3, 0);
+        let p = decode_param_value(&frame, 3411).unwrap();
+        assert_eq!(p.datano, 3411);
+        assert_eq!(p.attr, 3);
+        assert_eq!(p.value, 0);
+        assert_eq!(param_to_value(&p).unwrap(), Value::I32(0));
+    }
+
+    /// param Q0 负 evidence：`00 0a 00 03`（value=0 无辨别力）必须
+    /// `Unsupported`，不 admit（防“结果碰巧还是 0”误放行；fixture 保留）。
+    #[test]
+    fn decode_param_q0_negative() {
+        let frame = super::super::fixture_tests::assemble_param_frame_for_test_raw_tail(
+            3410,
+            4,
+            0,
+            [0x00, 0x0a, 0x00, 0x03],
+        );
+        let e = decode_param_value(&frame, 3410).unwrap_err();
+        assert!(
+            matches!(e, WireError::Unsupported(_)),
+            "Q0 tail=00 0a 00 03 必须 Unsupported，实际：{e:?}"
+        );
+    }
+
+    /// param P-C1/P-C2：6711=123/456 → `I32`（controlled diff 锚定 value slot）。
+    #[test]
+    fn decode_param_controlled_values() {
+        for (v, want) in [(123, 123), (456, 456), (10027, 10027)] {
+            let frame = super::super::fixture_tests::assemble_param_frame_for_test(6711, 3, v);
+            let p = decode_param_value(&frame, 6711).unwrap();
+            assert_eq!(p.value, want);
+            assert_eq!(param_to_value(&p).unwrap(), Value::I32(want));
+        }
+    }
+
+    /// param datano 回显错配即 `Malformed`（配 A 读 B 必须死，不进 I32）。
+    #[test]
+    fn param_datano_mismatch_rejected() {
+        let frame = super::super::fixture_tests::assemble_param_frame_for_test(3411, 3, 0);
+        let e = decode_param_value(&frame, 3410).unwrap_err();
+        assert_eq!(e.to_string(), WireError::MalformedPayload.to_string());
+    }
+
+    /// param 未知 scale tail 即 `Unsupported`（REAL/未知留后续窗口，不猜 F64）。
+    #[test]
+    fn param_unknown_tail_unsupported() {
+        let frame = super::super::fixture_tests::assemble_param_frame_for_test_raw_tail(
+            3410,
+            4,
+            0,
+            [0x00, 0x0b, 0x00, 0x01],
+        );
+        let e = decode_param_value(&frame, 3410).unwrap_err();
+        assert!(matches!(e, WireError::Unsupported(_)));
+    }
+
+    /// param 缺 `0x8D` 即 `CommandMismatch`（保守致命；`0x0E` 不适用）。
+    #[test]
+    fn missing_param_is_mismatch() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_FEED, // 故意放错槽
+                payload: {
+                    let mut p = vec![0x00; 6];
+                    p.extend_from_slice(&[0x00, 0x08]);
+                    p.extend_from_slice(&[0x00, 0x00, 0x00, 0x64, 0x00, 0x0A, 0x00, 0x00]);
+                    p
+                },
+            }]),
+        };
+        let e = decode_param_value(&frame, 3410).unwrap_err();
+        assert!(matches!(e, WireError::CommandMismatch));
+        assert!(e.is_session_fatal());
+    }
+
+    /// param typed payload 内部精确闭合（与 CNC 系同原则）。
+    #[test]
+    fn param_trailing_payload_rejected() {
+        let mut frame = super::super::fixture_tests::assemble_param_frame_for_test(3411, 3, 0);
+        frame.payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            decode_param_value(&frame, 3411).unwrap_err().to_string(),
+            WireError::MalformedPayload.to_string(),
+        );
+    }
+
+    /// param number 越界 fail-closed：超 `c_short` 不发包（与 Native Param 同语义）。
+    #[tokio::test]
+    async fn param_number_out_of_range() {
+        let client = FocasClient::new(std::time::Duration::from_millis(10));
+        let e = client.param_value(40000).await.unwrap_err();
+        assert!(
+            matches!(e, WireError::Unsupported(_)),
+            "param=40000 必须 Unsupported（不发包）"
+        );
     }
 }
