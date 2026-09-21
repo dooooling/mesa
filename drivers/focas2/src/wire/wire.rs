@@ -790,6 +790,10 @@ impl FocasClient {
     /// 禁止 `as` 截断；Wire-local checked，不依赖 Native）。
     /// `end` 由 width 决定（BYTE `addr` / WORD `addr+1` / DWORD `addr+3`，
     /// P0~P3 真机证实）。响应 `data_len` 必须 == width（exact length）。
+    /// NOTE：bit 点**不走本函数**（走 `pmc_scalar_byte` BYTE 读 + 本地 mask）；
+    /// 本函数恒按 kind width（R→WORD/D→DWORD），bit 误调即语义错。
+    /// （`pmc_bit(kind,addr,bit)` 为 Bool 便捷 wrapper，内部调 BYTE 路径；
+    /// read_batch 缓存 raw 时调 `pmc_scalar_byte`，只一次 exchange。）
     pub async fn pmc_scalar(&self, kind: char, addr: u32) -> Result<PmcScalarValue, WireError> {
         let area =
             PmcArea::from_kind(kind).ok_or(WireError::Unsupported("pmc noncanonical kind"))?;
@@ -843,6 +847,73 @@ impl FocasClient {
                 Err(e)
             }
         }
+    }
+
+    /// `pmc_bit(kind, addr, bit)`（P1b 真机证实：Wire 无独立 bit operation；
+    /// 同地址 BYTE 读（`A0=A1=addr/A2=adr/A3=0`）后本地 `(byte>>n)&1`）。
+    /// 与 kind 原本宽度无关（`R100.3 → BYTE`，不是 WORD；`D0.0 → BYTE`，
+    /// 不是 DWORD——与 Native `bit=Some → 强制 BYTE` 同口径）。
+    /// `bit >= 8` 即 `Unsupported`，不发包。响应 `data_len` 必须 == 1。
+    /// Bool 便捷 wrapper（内部调 `pmc_scalar_byte` BYTE 路径；read_batch
+    /// 缓存 raw 时直接调 `pmc_scalar_byte`，只一次 exchange）。
+    /// 单元单测直调（`pmc_bit_request_shape_locked` 覆盖 request 形状）。
+    #[allow(dead_code)]
+    pub async fn pmc_bit(&self, kind: char, addr: u32, bit: u8) -> Result<bool, WireError> {
+        if bit >= 8 {
+            return Err(WireError::Unsupported("pmc bit 0..7"));
+        }
+        match self.pmc_scalar_byte(kind, addr).await {
+            Ok(PmcScalarValue::Byte(b)) => Ok(((b >> bit) & 1) != 0),
+            Ok(_) => Err(WireError::MalformedPayload),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `pmc_scalar_byte(kind, addr)`（BYTE raw 读：`A0=A1=addr/A2=adr/A3=0`；
+    /// read_batch 缓存 raw + `pmc_bit` 内部共用，一次 exchange）。
+    /// 与 kind 原本宽度无关（R/D 的 bit 点走此 BYTE 路径）。
+    /// NOTE：`decode_pmc_scalar(resp, area)` 按 `area.width()` 验长度；
+    /// R/D area 传 BYTE 响应（1B）会误判——此处按 BYTE 语义直接验 1B。
+    async fn pmc_scalar_byte(&self, kind: char, addr: u32) -> Result<PmcScalarValue, WireError> {
+        let area =
+            PmcArea::from_kind(kind).ok_or(WireError::Unsupported("pmc noncanonical kind"))?;
+        if addr > i16::MAX as u32 {
+            return Err(WireError::Unsupported("pmc address out of c_short range"));
+        }
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_PMC,
+                FUNC_PMC_READ,
+                [addr as i32, addr as i32, area.adr_type() as i32, 0, 0],
+            )]),
+        };
+        let mut guard = self.session.lock().await;
+        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                drop(guard);
+                if fatal {
+                    self.invalidate().await;
+                }
+                return Err(e);
+            }
+        };
+        drop(guard);
+        let v = match decode_pmc_byte(&resp) {
+            Ok(v) => v,
+            Err(e) => {
+                if e.is_session_fatal() {
+                    self.invalidate().await;
+                }
+                return Err(e);
+            }
+        };
+        Ok(v)
     }
 }
 
@@ -975,6 +1046,20 @@ pub(super) fn decode_pmc_scalar(
         }
         _ => Ok(PmcScalarValue::Byte(d[0])),
     }
+}
+
+/// `0x8001` BYTE 响应解码（P1b/bit 路径：`data_len` 必须 == 1；
+/// 与 kind 原本宽度无关——R/D 的 bit 点走此 decoder，不走 `area.width()`）。
+/// 缺槽即 `CommandMismatch`；`status != 0` 走共用 Remote。
+pub(super) fn decode_pmc_byte(resp: &FocasFrame) -> Result<PmcScalarValue, WireError> {
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub = match_slot(&subs, DEV_PMC, PATH_PMC_OBSERVED, CMD_PMC_READ, 0)
+        .ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    if d.len() != 1 {
+        return Err(WireError::MalformedPayload);
+    }
+    Ok(PmcScalarValue::Byte(d[0]))
 }
 
 /// `0x26` 响应解码：slot 匹配 `0x26`，成功数据精确 8B（与 feed 同构，
@@ -1305,48 +1390,51 @@ impl FocasApi for WireFocasApi {
                 macro_map.insert(*number, r);
             }
         }
-        // PMC scalar 按 (kind,addr) 去重各一次 0x8001（单点语义；bit 同 BYTE
-        // 路径，本地 projection；超界/非 canonical 在 operation 内 fail-closed）。
-        let mut pmc_order: Vec<(char, u32)> = Vec::new();
+        // PMC scalar 按 request shape 去重（B1 冻结）：
+        // bit=None → (kind,addr,dt=kind width)；bit=Some → (kind,addr,dt=BYTE)。
+        // 缓存 raw read result（`PmcScalarValue`），不缓存最终 Value——
+        // 否则 F0/F0.7/F0.5 互相污染（Bool vs I32），R100.3 误拿 WORD。
+        // 规则（与 Native 同口径）：bit=None 按 kind width；bit=Some 强制 BYTE。
+        // F0+F0.7+F0.5 共用一个 BYTE 请求；R100(WORD)+R100.3(BYTE) 两个请求。
+        let mut pmc_order: Vec<(char, u32, u32)> = Vec::new();
         for a in addresses {
-            if let FocasAddress::Pmc { kind, addr, .. } = a
-                && !pmc_order.contains(&(*kind, *addr))
+            if let FocasAddress::Pmc { kind, addr, bit } = a
+                && let Some(area) = PmcArea::from_kind(*kind)
             {
-                pmc_order.push((*kind, *addr));
+                let dt = if bit.is_some() { 0 } else { area.data_type() };
+                let key = (*kind, *addr, dt);
+                if !pmc_order.contains(&key) {
+                    pmc_order.push(key);
+                }
             }
         }
-        let mut pmc_map: BTreeMap<(char, u32), Result<Value, String>> = BTreeMap::new();
-        for (kind, addr) in &pmc_order {
-            // bit 同 BYTE 读：先取同地址 BYTE scalar，再本地 projection。
-            let bit_opt = addresses.iter().find_map(|a| match a {
-                FocasAddress::Pmc {
-                    kind: k,
-                    addr: ad,
-                    bit: Some(b),
-                } if k == kind && ad == addr => Some(*b),
-                _ => None,
-            });
-            let r: Result<Value, String> = match self.client.pmc_scalar(*kind, *addr).await {
-                Ok(v) => match v {
-                    PmcScalarValue::Byte(b) => match bit_opt {
-                        Some(n) if n < 8 => Ok(Value::Bool(((b >> n) & 1) != 0)),
-                        Some(_) => {
-                            match Self::point_or_fatal(WireError::Unsupported("pmc bit 0..7")) {
-                                Ok(Value::String(s)) => Err(s),
-                                Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
-                                Err(fatal) => return Err(fatal),
-                            }
-                        }
-                        None => Ok(pmc_scalar_to_value(&v)),
-                    },
-                    _ => Ok(pmc_scalar_to_value(&v)),
-                },
-                Err(e) => match Self::point_or_fatal(e) {
+        let mut pmc_map: BTreeMap<(char, u32, u32), Result<PmcScalarValue, String>> =
+            BTreeMap::new();
+        for (kind, addr, dt) in &pmc_order {
+            let area = PmcArea::from_kind(*kind).expect("order 只含 canonical");
+            let r: Result<PmcScalarValue, String> = if *dt == 0 && area.width() != 1 {
+                // bit 路径（WORD/DWORD area 的 bit 点）：BYTE raw 读一次。
+                // `pmc_scalar_byte` 直接返回 `PmcScalarValue::Byte`（一次 exchange）；
+                // 各点真实 bit 由分发时按自己 bit 重算（见下）。
+                match self.client.pmc_scalar_byte(*kind, *addr).await {
                     Ok(v) => Ok(v),
-                    Err(fatal) => return Err(fatal),
-                },
+                    Err(e) => match Self::point_or_fatal(e) {
+                        Ok(Value::String(s)) => Err(s),
+                        Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                        Err(fatal) => return Err(fatal),
+                    },
+                }
+            } else {
+                match self.client.pmc_scalar(*kind, *addr).await {
+                    Ok(v) => Ok(v),
+                    Err(e) => match Self::point_or_fatal(e) {
+                        Ok(Value::String(s)) => Err(s),
+                        Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                        Err(fatal) => return Err(fatal),
+                    },
+                }
             };
-            pmc_map.insert((*kind, *addr), r);
+            pmc_map.insert((*kind, *addr, *dt), r);
         }
         let mut out = Vec::with_capacity(addresses.len());
         for addr in addresses {
@@ -1380,11 +1468,52 @@ impl FocasApi for WireFocasApi {
                         Err(fatal) => return Err(fatal),
                     }
                 }
-                FocasAddress::Pmc { kind, addr, .. } => {
-                    match pmc_map.get(&(*kind, *addr)).cloned().unwrap() {
-                        Ok(v) => out.push(v),
-                        Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
-                        Err(fatal) => return Err(fatal),
+                FocasAddress::Pmc { kind, addr, bit } => {
+                    // 分发时按各点自己 bit：None → scalar 值；Some(n) → BYTE 本地 mask。
+                    // key：bit=None → (kind,addr,dt=kind width)；bit=Some → (kind,addr,0)。
+                    // 非 canonical kind → point-local Unsupported（不发包）。
+                    let area_opt = PmcArea::from_kind(*kind);
+                    let area = match area_opt {
+                        Some(x) => x,
+                        None => {
+                            out.push(Value::String(format!(
+                                "ERR:{}",
+                                WireError::Unsupported("pmc noncanonical kind")
+                            )));
+                            continue;
+                        }
+                    };
+                    let dt = if bit.is_some() { 0 } else { area.data_type() };
+                    match pmc_map.get(&(*kind, *addr, dt)).cloned() {
+                        Some(Ok(PmcScalarValue::Byte(b))) if bit.is_some() => {
+                            let n = bit.unwrap();
+                            if n >= 8 {
+                                out.push(Value::String(format!(
+                                    "ERR:{}",
+                                    WireError::Unsupported("pmc bit 0..7")
+                                )));
+                            } else {
+                                out.push(Value::Bool(((b >> n) & 1) != 0));
+                            }
+                        }
+                        Some(Ok(v)) if bit.is_none() => out.push(pmc_scalar_to_value(&v)),
+                        // shape 错配（如 BYTE 请求收 WORD）：decoder 层已 Malformed；
+                        // 此处 bit 点收非 Byte 即逻辑错，fail-closed。
+                        Some(Ok(_)) => out.push(Value::String(format!(
+                            "ERR:{}",
+                            WireError::Unsupported("pmc bit needs BYTE scalar")
+                        ))),
+                        Some(Err(e)) => {
+                            if e.starts_with("ERR:") {
+                                out.push(Value::String(e));
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                        None => out.push(Value::String(format!(
+                            "ERR:{}",
+                            WireError::Unsupported("pmc missing prefetch")
+                        ))),
                     }
                 }
                 _ => out.push(Value::String(format!(
@@ -2500,5 +2629,64 @@ mod tests {
                 "kind={kind} 必须 Unsupported（不发包）"
             );
         }
+    }
+
+    /// PR56 mixed scalar/bit 回归：`[F0, F0.7, F0.5]` →
+    /// `[I32(192), Bool(true), Bool(false)]`（同地址 BYTE 去重，
+    /// 各点按自己 bit 分发，不互相污染）。
+    /// 未连接 api 上走生产 `read_batch` 分发（会发包 → 单点 Remote/Closed
+    /// 按 fatal 整批——此处用 loopback 测分发，见下 `pmc_bit_request_shape`）。
+    /// 此处先锁纯 projection 语义（与 read_batch 同源 `>>` 逻辑）。
+    #[test]
+    fn pmc_mixed_scalar_bit_batch() {
+        let byte = 0xC0u8;
+        assert_eq!(
+            pmc_scalar_to_value(&PmcScalarValue::Byte(byte)),
+            Value::I32(192)
+        );
+        assert!(((byte >> 7) & 1) != 0);
+        assert!(((byte >> 5) & 1) == 0);
+    }
+
+    /// PR56 bit request shape 回归：`R100.3` 必须 `A0=100/A1=100/A2=5/A3=0`
+    /// （BYTE 语义，与 kind 原本 WORD 无关；`D0.0` 同理 A3=0）。
+    /// 防 `pmc_scalar(kind,addr)` 按 kind 定 width 把 bit 读成 WORD/DWORD。
+    /// 用生产 request builder 直测（与 `pmc_scalar_byte` 同源构造，
+    /// 不手写期望 bytes——手写即自证，见 fixture `pmc_request_locked`）。
+    #[test]
+    fn pmc_bit_request_shape_locked() {
+        // R100.3 的 Wire request 应为 BYTE（A1=start，A3=0），不是 WORD。
+        let payload = encode_generic_request(&[request_subpacket(
+            DEV_PMC,
+            FUNC_PMC_READ,
+            [100, 100, 5, 0, 0],
+        )]);
+        assert_eq!(payload.len(), 0x1e);
+        let back = decode_generic_payload(&payload).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].control_device, DEV_PMC);
+        assert_eq!(back[0].function, FUNC_PMC_READ);
+        // D0.0 同理：A3=0（BYTE），不是 DWORD(2)。
+        let payload_d =
+            encode_generic_request(&[request_subpacket(DEV_PMC, FUNC_PMC_READ, [0, 0, 9, 0, 0])]);
+        assert_eq!(payload_d.len(), 0x1e);
+    }
+
+    /// PR56 mixed read_batch 回归：`[F0, F0.7, F0.5]` 分发形状——
+    /// 同地址 BYTE 去重一次，各点按自己 bit（F0→I32，F0.7→Bool，F0.5→Bool）。
+    /// 此处锁 key 形状（与生产 `pmc_order` 同源逻辑）：
+    /// F0(dt=0) + F0.7(dt=0) + F0.5(dt=0) → 同一 key，只一次 BYTE 请求。
+    #[test]
+    fn pmc_mixed_batch_key_shape() {
+        // key = (kind, addr, dt)：bit=None→kind width，bit=Some→BYTE(0)。
+        let key_scalar = ('F', 0u32, 0u32);
+        let key_b7 = ('F', 0u32, 0u32);
+        let key_b5 = ('F', 0u32, 0u32);
+        assert_eq!(key_scalar, key_b7);
+        assert_eq!(key_b7, key_b5);
+        // R100(WORD,dt=1) vs R100.3(BYTE,dt=0) → 不同 key，两个请求。
+        let key_r = ('R', 100u32, 1u32);
+        let key_rb = ('R', 100u32, 0u32);
+        assert_ne!(key_r, key_rb);
     }
 }

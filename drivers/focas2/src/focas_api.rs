@@ -144,9 +144,9 @@ impl FakeFocasApi {
                 if bit.is_some() {
                     Value::Bool((r & 1) != 0)
                 } else {
-                    // 字节/字范围
+                    // 字节/字范围（PR56 产品合同：无 bit 时 I32，与生产一致）。
                     let _ = addr;
-                    Value::U32(r % 256)
+                    Value::I32((r % 256) as i32)
                 }
             }
             FocasAddress::Diagnosis { number: _ } => Value::I32((r % 2001) as i32 - 1000),

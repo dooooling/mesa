@@ -2566,12 +2566,14 @@ mod tests {
                     e.message()
                 )
             });
-        // 单次 FFI（按产品布局选 width；bit 读 BYTE 后本地 projection）。
+        // 单次 FFI（按产品布局选 width；bit 读 BYTE raw 后本地 projection——
+        // 不调 `pmc_rdpmcrng_bit` helper（它已返回 bool，raw byte 丢失），
+        // 直接 `pmc_rdpmcrng_byte` 取 raw，再本地 mask；仍单次 FFI）。
         let adr_type = NativeLib::pmc_adr_type(kind);
         let (data_type, width, base_len) = NativeLib::pmc_layout(kind, bit);
         let doc = if let Some(b) = bit {
-            let (rc, raw): (i16, Option<u8>) = match lib.pmc_rdpmcrng_bit(hdl, adr_type, addr, b) {
-                Ok(v) => (0, Some(v as u8)),
+            let (rc, raw): (i16, Option<u8>) = match lib.pmc_rdpmcrng_byte(hdl, adr_type, addr) {
+                Ok(v) => (0, Some(v)),
                 Err(e) => (e as i16, None),
             };
             let _ = lib.cnc_freelibhndl(hdl);
