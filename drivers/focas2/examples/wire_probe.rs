@@ -6,7 +6,8 @@
 //! - 只调 `system_info` + `status/feed/axis.absolute/spindle_speed/macro/pmc/param/opmsg`，打印结果；
 //!   不碰 Native、不改生产 backend、不写 fixture。
 //! - Gate 0 期望（165）：series=G31Z/version=10.0，
-//!   `StatusInfo.aut` 与面板 mode 一致（MEM=1/MDI=0）；feed/axis/spindle/macro/pmc/param/opmsg 与 Native 一致。
+//!   `StatusInfo.aut` 与面板 mode 一致（MEM=1/MDI=0）；feed/axis/spindle/macro/pmc/param 与 Native 一致；
+//!   opmsg 与 panel #3006 一致（Native selector/ABI 待独立闭合，见 PR58）。
 
 use std::time::Duration;
 

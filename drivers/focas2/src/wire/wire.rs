@@ -3158,6 +3158,50 @@ mod tests {
         assert!(e.is_session_fatal());
     }
 
+    /// opmsg `type=5 → status=4` Remote 回归（O1 Evidence 真实边界：
+    /// 现场 `0x34 [5,0,0,0]` 返回 `status=4`；session 保留，单点 BAD）。
+    /// 锁：`decode → Remote{status:4}` + `!is_session_fatal()` +
+    /// `point_or_fatal → ERR:String`（共用 PR53 Remote 模型，不搭 TCP server；
+    /// 现场 reply bytes 形态见 O1 证据记录，此处测共用语义）。
+    #[test]
+    fn opmsg_type5_remote_is_point_local() {
+        // 真实模型构造：count=1 + 0x34 槽 status=4（现场 type=5 形态）。
+        let mut payload = vec![0x00, 0x01];
+        payload.extend_from_slice(&[0x01, 0x1c]); // size=284
+        payload.extend_from_slice(&[0x00, 0x01]); // device
+        payload.extend_from_slice(&[0x00, 0x01]); // path
+        payload.extend_from_slice(&[0x00, 0x34]); // command
+        payload.extend_from_slice(&[0x00, 0x04]); // status=4
+        payload.extend_from_slice(&[0x00, 0x00]); // detail1
+        payload.extend_from_slice(&[0x00, 0x00]); // detail2
+        payload.extend_from_slice(&[0x01, 0x0c]); // data_len=268
+        payload.extend_from_slice(&[0x00; OPMSG_DATA_LEN]); // data（失败时不解释）
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload,
+        };
+        let e = decode_opmsg_value(&frame).unwrap_err();
+        match e {
+            WireError::Remote {
+                status,
+                detail1,
+                detail2,
+            } => {
+                assert_eq!(status, 4);
+                assert_eq!(detail1, 0);
+                assert_eq!(detail2, 0);
+            }
+            _ => panic!("type=5 status=4 必须 Remote，实际：{e:?}"),
+        }
+        assert!(!e.is_session_fatal(), "Remote 不杀 session");
+        // point_or_fatal → ERR 单点（与 read_batch 同源分类）。
+        match WireFocasApi::point_or_fatal(e) {
+            Ok(Value::String(s)) => assert!(s.starts_with("ERR:")),
+            _ => panic!("Remote 必须转 ERR 单点"),
+        }
+    }
+
     /// opmsg typed payload 内部精确闭合：267B 截断 / 269B trailing 均拒绝。
     #[test]
     fn opmsg_length_closure_rejected() {
