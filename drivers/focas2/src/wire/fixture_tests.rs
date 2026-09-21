@@ -1,16 +1,18 @@
-//! Fixture 回归（PR1 Level 2 + PR2 feed）：真机捕获 → 生产 codec 直测。
+//! Fixture 回归（PR1 Level 2 + PR2 feed + PR54 spindle）：真机捕获 → 生产 codec 直测。
 //!
 //! - 数据：165 定向抓包 → `10B header + payload_len` 精确切帧 → 去重传/
 //!   拼接残留（`tests/fixtures/wire/{sysinfo,statinfo_mem,statinfo_mdi,feed}/`）。
 //! - Gate 0 证据：sysinfo 7/7 / statinfo MEM 7/7 / statinfo MDI 7/7。
 //! - feed 证据：`0x24` mantissa=100 ↔ Native actf=100（同次）；`0x24-only`
 //!   生产形态真机冻结。
+//! - spindle 证据（S0~S4）：`0x25` mantissa=0/500/1002/1500/800 ↔
+//!   Native cnc_acts 同次；request 5 点逐字节恒定（`args=[0,0,0,0]/aux=0`）。
 //! - 本模块 `#[cfg(test)]` 且 crate 内部：直接调生产 decoder，无复刻。
 
 use std::path::PathBuf;
 
 use super::frame::{FRAME_HEADER_LEN, FocasFrame, PacketType, decode_header};
-use super::wire::{decode_feed_rate, decode_status_info, decode_system_info};
+use super::wire::{decode_feed_rate, decode_spindle_speed, decode_status_info, decode_system_info};
 use super::{cut_fixture_frames, fixture_dir, read_fixture_bytes};
 
 fn dir(group: &str) -> PathBuf {
@@ -52,6 +54,8 @@ pub(crate) fn run_all() {
     axis3_decodes();
     axis4_fails_closed();
     axis_request_locked();
+    spindle_s0s4_decodes();
+    spindle_request_locked();
 }
 
 /// sysinfo：`sysinfo_response.bin` 经生产 codec 解码 == expected 7 字段。
@@ -307,6 +311,65 @@ fn axis_request_locked() {
             frames1[0],
             build(FUNC_SYSINFO, [0, 0, 0, 0, 0]),
             "{group} frame#1 必须 == 0x18 preflight 全 40B"
+        );
+    }
+}
+
+/// spindle S0~S4：`spindle_response_frame.bin` 经生产 codec 解码 ==
+/// expected（mantissa=0/500/1002/1500/800 ↔ Native cnc_acts 同次）。
+fn spindle_s0s4_decodes() {
+    use super::wire::spindle_to_value_for_test as to_value;
+    for (group, want) in [
+        ("spindle0", 0),
+        ("spindle1", 500),
+        ("spindle2", 1002),
+        ("spindle3", 1500),
+        ("spindle4", 800),
+    ] {
+        let frame = assemble_frame(&read(group, "spindle_response_frame.bin"));
+        let spd = decode_spindle_speed(&frame).expect("{group} 必须解码");
+        assert_eq!(spd.mantissa, want, "{group} mantissa");
+        assert_eq!(spd.base, 10, "{group} base");
+        assert_eq!(spd.exponent, 0, "{group} exp");
+        let exp = expected(group);
+        assert_eq!(
+            exp["native"]["data"].as_i64().unwrap() as i32,
+            spd.mantissa,
+            "{group} Native↔Wire mantissa 同次一致"
+        );
+        assert_eq!(
+            to_value(&spd).expect("{group} adapter 必须通过"),
+            mesa_core_types::Value::I32(want),
+            "{group} Mesa 映射"
+        );
+    }
+}
+
+/// spindle 请求：生产编码器输出 == 捕获 fixture（`encode == request` 闭环）。
+/// S0~S4 五组 request 全 40B 逐字节恒定（`args=[0,0,0,0]/aux=0`，无 selector）。
+fn spindle_request_locked() {
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+    use super::frame::{encode_generic_request, request_subpacket};
+    use super::wire::{DEV_CNC, FUNC_SPINDLE_SPEED};
+    let build = FocasFrame {
+        origin: REQUEST_ORIGIN,
+        packet_type: PacketType::GENERIC_REQUEST,
+        payload: encode_generic_request(&[request_subpacket(
+            DEV_CNC,
+            FUNC_SPINDLE_SPEED,
+            [0, 0, 0, 0, 0],
+        )]),
+    }
+    .encode();
+    assert_eq!(build.len(), 40, "0x25 请求必须 40B");
+    for group in ["spindle0", "spindle1", "spindle2", "spindle3", "spindle4"] {
+        let raw = read(group, "spindle_request_frame.bin");
+        let frames = cut_fixture_frames(&raw);
+        assert_eq!(frames.len(), 1, "{group} 必须恰好 1 帧");
+        assert_eq!(frames[0].len(), 40, "{group} 必须 40B");
+        assert_eq!(
+            frames[0], build,
+            "{group} production encoder 必须 == captured fixture 全 40B"
         );
     }
 }

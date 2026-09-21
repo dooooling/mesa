@@ -1,0 +1,17 @@
+{
+  "operation": "spindle_speed",
+  "commanded_s": 800,
+  "panel_actual": 800,
+  "native": {
+    "rc": 0,
+    "data": 800
+  },
+  "mesa": {
+    "spindle_speed": 800
+  },
+  "source": {
+    "open_variant": "00 02",
+    "capture": "spindle evidence window S0~S4 live (hand-built request per frozen contract, response live bytes)",
+    "note": "request bytes identical across S0~S4; response live-captured per point"
+  }
+}

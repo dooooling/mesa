@@ -2411,4 +2411,48 @@ mod tests {
         let pretty = serde_json::to_string_pretty(&doc).expect("expected.json 序列化失败");
         gate0_emit(&pretty, &out);
     }
+
+    /// spindle Evidence Window（S0 静止基线 + S1~S4 稳定非零点）：
+    /// `connect → cnc_acts（单次 FFI）→ disconnect`。
+    /// 法证输出：`rc`（FOCAS 返回码）+ `OdbActs` 全字段
+    /// （`dummy[2]` + `data`，不断言具体值，由现场对照面板 actual）；
+    /// Native contract（Evidence PASS）：`data == mantissa`（S0~S4 闭合），
+    /// 此处只记录，不解释；不写 Wire 代码、不碰生产路径（证据窗口专用）。
+    #[test]
+    #[ignore]
+    fn spindle_dump_acts() {
+        let (host, port, timeout_ms, out) = gate0_params();
+        let timeout_secs = (timeout_ms.div_ceil(1000).max(1).min(i32::MAX as u64)) as i32;
+        let lib =
+            NativeLib::load().unwrap_or_else(|e| panic!("FWLIB 加载失败（{host}:{port}）：{e}"));
+        let hdl = lib
+            .cnc_allclibhndl3(&host, port, timeout_secs)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
+                    e as i16,
+                    e.message()
+                )
+            });
+        // 单次 FFI：rc + OdbActs full（无时间差；S1~S4 稳定平台值采样）。
+        let (rc, full): (i16, Option<OdbActs>) = match lib.cnc_acts(hdl) {
+            Ok(v) => (0, Some(v)),
+            Err(e) => (e as i16, None),
+        };
+        let _ = lib.cnc_freelibhndl(hdl);
+        // 产品合同（待证据闭合）：成功即 data → I32（不断言是 RPM 还是
+        // mantissa，由 S0~S4 对照 0x25 raw bytes + 面板 actual 判定）。
+        let doc = serde_json::json!({
+            "operation": "acts",
+            "native": {
+                "rc": rc,
+                "ok": full.is_some(),
+                "dummy": full.as_ref().map(|f| f.dummy),
+                "data": full.as_ref().map(|f| f.data),
+            },
+            "mesa": { "spindle_speed": full.as_ref().map(|f| f.data) },
+        });
+        let pretty = serde_json::to_string_pretty(&doc).expect("expected.json 序列化失败");
+        gate0_emit(&pretty, &out);
+    }
 }
