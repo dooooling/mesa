@@ -49,16 +49,14 @@ fn assemble_frame(raw: &[u8]) -> FocasFrame {
 }
 
 /// param 单测装配 helper（`#[cfg(test)]`；wire.rs param 单测共用）：
-/// 按已验证形态构造 264B data（datano/attr/value + 已验证 tail）。
+/// 按 identity 形态构造 264B data（datano/attr/value + `00 0a 00 00`）。
+/// Q0 `00 0a 00 03` 变体与 unknown-tail 变体走
+/// `assemble_param_frame_for_test_raw_tail`（显式传 tail，不由 attr 推断——
+/// Evidence 只证明 Q0 同时出现 attr=4/tail=...03，未证明 attr 决定 tail）。
 /// unknown-tail 变体走 `assemble_param_frame_for_test_raw_tail`。
 #[cfg(test)]
 pub(super) fn assemble_param_frame_for_test(number: u32, attr: u32, value: i32) -> FocasFrame {
-    let tail: [u8; 4] = if attr == 4 {
-        super::wire::PARAM_TAIL_VERIFIED_0
-    } else {
-        super::wire::PARAM_TAIL_VERIFIED_1
-    };
-    assemble_param_frame_for_test_raw_tail(number, attr, value, tail)
+    assemble_param_frame_for_test_raw_tail(number, attr, value, super::wire::PARAM_TAIL_IDENTITY)
 }
 
 /// param 未知 tail 变体（`#[cfg(test)]`；unknown-scale fail-closed 回归用）。
@@ -114,6 +112,7 @@ pub(crate) fn run_all() {
     pmc_scalar_decodes();
     pmc_request_locked();
     param_decodes();
+    param_q0_negative_evidence();
     param_request_locked();
 }
 
@@ -609,12 +608,14 @@ fn pmc_request_locked() {
 }
 
 /// param Q0/Q3/P-C：`param_response_frame.bin` 经生产 codec 解码 ==
-/// expected（3410=0/3411=0/6711=10027/123/456/restored；Mesa I32）。
+/// param Q3/P-C（identity-scale GOOD）：`param_response_frame.bin` 经生产
+/// codec 解码 == expected（3411=0/6711=10027/123/456/restored；Mesa I32）。
+/// Q0（`00 0a 00 03`）不在此列——它走 `param_q0_negative_evidence`，
+/// fixture 保留但 decoder 必须 `Unsupported`（value=0 无辨别力，不 admit）。
 fn param_decodes() {
     use super::wire::{decode_param_value, param_to_value_for_test as to_value};
     for (group, number, want) in [
-        ("param_3410", 3410u32, 0),
-        ("param_3411", 3411, 0),
+        ("param_3411", 3411u32, 0),
         ("param_6711_c0", 6711, 10027),
         ("param_6711_c1", 6711, 123),
         ("param_6711_c2", 6711, 456),
@@ -636,6 +637,19 @@ fn param_decodes() {
             "{group} Mesa I32"
         );
     }
+}
+
+/// param Q0 负 evidence：fixture 保留（bytes 不动），但 decoder 必须
+/// `Unsupported`（`00 0a 00 03` 未闭合为 identity；value=0 碰巧解对不算证据）。
+/// 防以后因“结果碰巧还是 0”误放行。
+fn param_q0_negative_evidence() {
+    use super::wire::decode_param_value;
+    let frame = assemble_frame(&read("param_3410", "param_response_frame.bin"));
+    let e = decode_param_value(&frame, 3410).unwrap_err();
+    assert!(
+        matches!(e, super::WireError::Unsupported(_)),
+        "Q0 tail=00 0a 00 03 必须 Unsupported，实际：{e:?}"
+    );
 }
 
 /// param 请求：生产编码器输出 == 捕获 fixture（`encode == request` 闭环）。

@@ -367,15 +367,13 @@ pub struct ParamValue {
     pub value: i32,
 }
 
-/// param v1 已验证 identity-scale tail 形态（`value` 后 4B + 重复区头；
-/// Q0/Q3/6711 三样本一致：`00 0a 00 X` + `00 00 00 00`。
-/// Q0 `00 0a 00 03` / Q3 `00 0a 00 00` / 6711 `00 0a 00 00`——
-/// 第 4B 随参数变化（3/0/0），语义未命名，但边界已闭合；
-/// 非此形态即 `Unsupported`（REAL/未知 scale 留后续窗口，不猜）。
-/// NOTE：此处只锁已验证形态的**边界**，不解释字段语义。
-pub const PARAM_TAIL_VERIFIED_0: [u8; 4] = [0x00, 0x0a, 0x00, 0x03];
-/// Q3/6711 形态（第 4B = 0x00）。
-pub const PARAM_TAIL_VERIFIED_1: [u8; 4] = [0x00, 0x0a, 0x00, 0x00];
+/// param v1 已验证 identity-scale tail 形态（`value` 后 4B + 重复区头）。
+/// 只有 `00 0a 00 00`（Q3/6711 controlled 非零样本：`123/456/10027` 三点 +
+/// 恢复闭环）可输出 `I32`。Q0 的 `00 0a 00 03`（value=0，无辨别力——
+/// 无论 scale 语义是什么 0 都解成 0）**不 admit**，fixture 保留作负 evidence。
+/// 非 `00 0a 00 00` 即 `Unsupported`（REAL/未知 scale 留后续窗口，不猜）。
+/// NOTE：此处只锁已验证形态的**边界**，不解释字段语义；不由 `attr` 推 tail。
+pub const PARAM_TAIL_IDENTITY: [u8; 4] = [0x00, 0x0a, 0x00, 0x00];
 
 // ---------------------------------------------------------------------------
 // Wire layout 常量（PR1 review + PR53 真实模型）：
@@ -1226,10 +1224,11 @@ pub(super) fn decode_param_value(resp: &FocasFrame, number: u32) -> Result<Param
     }
     let attr = u32::from_be_bytes([d[4], d[5], d[6], d[7]]);
     let value = i32::from_be_bytes([d[8], d[9], d[10], d[11]]);
-    // tail gate：value 后 4B + 重复区头必须为已验证形态（Q0/Q3/6711）。
-    // Q0 `00 0a 00 03` / Q3·6711 `00 0a 00 00`；其他即未知 scale → Unsupported。
+    // tail gate：只有 `00 0a 00 00`（Q3/6711 controlled 非零 + 恢复闭环）
+    // 可输出 I32；Q0 `00 0a 00 03`（value=0 无辨别力）不 admit；
+    // 其他即未知 scale → Unsupported（REAL 留后续窗口）。
     let tail: [u8; 4] = [d[12], d[13], d[14], d[15]];
-    if tail != PARAM_TAIL_VERIFIED_0 && tail != PARAM_TAIL_VERIFIED_1 {
+    if tail != PARAM_TAIL_IDENTITY {
         return Err(WireError::Unsupported("param unverified scale tail"));
     }
     Ok(ParamValue {
@@ -2906,15 +2905,33 @@ mod tests {
         assert_eq!(back[0].function, FUNC_PARAM);
     }
 
-    /// param Q0 响应解码：datano=3410 + value=0 + 已验证 tail → `I32(0)`。
+    /// param Q3 响应解码：datano=3411 + value=0 + identity tail → `I32(0)`。
+    /// Q0（`00 0a 00 03`）不在此列——它走负 evidence（见下），不 admit。
     #[test]
     fn decode_param_q0_locked() {
-        let frame = super::super::fixture_tests::assemble_param_frame_for_test(3410, 4, 0);
-        let p = decode_param_value(&frame, 3410).unwrap();
-        assert_eq!(p.datano, 3410);
-        assert_eq!(p.attr, 4);
+        let frame = super::super::fixture_tests::assemble_param_frame_for_test(3411, 3, 0);
+        let p = decode_param_value(&frame, 3411).unwrap();
+        assert_eq!(p.datano, 3411);
+        assert_eq!(p.attr, 3);
         assert_eq!(p.value, 0);
         assert_eq!(param_to_value(&p).unwrap(), Value::I32(0));
+    }
+
+    /// param Q0 负 evidence：`00 0a 00 03`（value=0 无辨别力）必须
+    /// `Unsupported`，不 admit（防“结果碰巧还是 0”误放行；fixture 保留）。
+    #[test]
+    fn decode_param_q0_negative() {
+        let frame = super::super::fixture_tests::assemble_param_frame_for_test_raw_tail(
+            3410,
+            4,
+            0,
+            [0x00, 0x0a, 0x00, 0x03],
+        );
+        let e = decode_param_value(&frame, 3410).unwrap_err();
+        assert!(
+            matches!(e, WireError::Unsupported(_)),
+            "Q0 tail=00 0a 00 03 必须 Unsupported，实际：{e:?}"
+        );
     }
 
     /// param P-C1/P-C2：6711=123/456 → `I32`（controlled diff 锚定 value slot）。
@@ -2931,8 +2948,8 @@ mod tests {
     /// param datano 回显错配即 `Malformed`（配 A 读 B 必须死，不进 I32）。
     #[test]
     fn param_datano_mismatch_rejected() {
-        let frame = super::super::fixture_tests::assemble_param_frame_for_test(3410, 4, 0);
-        let e = decode_param_value(&frame, 3411).unwrap_err();
+        let frame = super::super::fixture_tests::assemble_param_frame_for_test(3411, 3, 0);
+        let e = decode_param_value(&frame, 3410).unwrap_err();
         assert_eq!(e.to_string(), WireError::MalformedPayload.to_string());
     }
 
@@ -2974,10 +2991,10 @@ mod tests {
     /// param typed payload 内部精确闭合（与 CNC 系同原则）。
     #[test]
     fn param_trailing_payload_rejected() {
-        let mut frame = super::super::fixture_tests::assemble_param_frame_for_test(3410, 4, 0);
+        let mut frame = super::super::fixture_tests::assemble_param_frame_for_test(3411, 3, 0);
         frame.payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(
-            decode_param_value(&frame, 3410).unwrap_err().to_string(),
+            decode_param_value(&frame, 3411).unwrap_err().to_string(),
             WireError::MalformedPayload.to_string(),
         );
     }

@@ -2671,60 +2671,6 @@ mod tests {
         gate0_emit(&pretty, &out);
     }
 
-    /// OpMsg Evidence Window（O0 文本基线）：
-    /// `connect → cnc_rdopmsg（单次 FFI）→ disconnect`。
-    /// - 法证输出：`rc` + `OpMsg` 64B raw + 本地文本解码（UTF-8 lossy，
-    ///   去 NUL/空白；空即 `OP:empty`，与生产同源）；
-    /// - Native contract 待闭合：Wire 文本 payload 布局（`0x34` 旧分支 vs
-    ///   `0xD0` 新分支）由同窗 Wire bytes 判定，此处只记录，不解释；
-    /// - 不写 Wire 代码、不碰生产路径（opmsg 证据窗口专用，codec BLOCKED）。
-    #[test]
-    #[ignore]
-    fn opmsg_dump_rdopmsg() {
-        let (host, port, timeout_ms, out) = gate0_params();
-        let timeout_secs = (timeout_ms.div_ceil(1000).max(1).min(i32::MAX as u64)) as i32;
-        let lib =
-            NativeLib::load().unwrap_or_else(|e| panic!("FWLIB 加载失败（{host}:{port}）：{e}"));
-        let hdl = lib
-            .cnc_allclibhndl3(&host, port, timeout_secs)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
-                    e as i16,
-                    e.message()
-                )
-            });
-        // 单次 FFI：rc + OpMsg full（生产 `cnc_rdopmsg` 同源；证据复用 full）。
-        let (rc, full): (i16, Option<OpMsg>) = match lib.cnc_rdopmsg(hdl) {
-            Ok(v) => (0, Some(v)),
-            Err(e) => (e as i16, None),
-        };
-        let _ = lib.cnc_freelibhndl(hdl);
-        let (raw, text) = match full.as_ref() {
-            Some(op) => {
-                let s = String::from_utf8_lossy(&op.dummy)
-                    .trim_matches('\0')
-                    .trim()
-                    .to_string();
-                let t = if s.is_empty() { "OP:empty".into() } else { s };
-                (Some(op.dummy.to_vec()), Some(t))
-            }
-            None => (None, None),
-        };
-        let doc = serde_json::json!({
-            "operation": "rdopmsg",
-            "native": {
-                "rc": rc,
-                "ok": full.is_some(),
-                "raw64": raw,
-                "text": text,
-            },
-            "mesa": { "opmsg_value": text.clone() },
-        });
-        let pretty = serde_json::to_string_pretty(&doc).expect("expected.json 序列化失败");
-        gate0_emit(&pretty, &out);
-    }
-
     /// Param Evidence Window（Q0 Native oracle）：
     /// `connect → cnc_rdparam(number)（生产同源调用）→ disconnect`。
     ///
