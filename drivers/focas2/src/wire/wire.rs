@@ -1401,6 +1401,13 @@ impl FocasApi for WireFocasApi {
             if let FocasAddress::Pmc { kind, addr, bit } = a
                 && let Some(area) = PmcArea::from_kind(*kind)
             {
+                // 非法 bit（>=8）不进 prefetch（no packet/session touch；
+                // 分发时直接 point-local ERR，见下）。
+                if let Some(b) = bit
+                    && *b >= 8
+                {
+                    continue;
+                }
                 let dt = if bit.is_some() { 0 } else { area.data_type() };
                 let key = (*kind, *addr, dt);
                 if !pmc_order.contains(&key) {
@@ -1469,6 +1476,17 @@ impl FocasApi for WireFocasApi {
                     }
                 }
                 FocasAddress::Pmc { kind, addr, bit } => {
+                    // 非法 bit（>=8）在 map 查找前直接 point-local（no packet；
+                    // prefetch 阶段已跳过，见上——未连接下也不碰 session）。
+                    if let Some(n) = bit
+                        && *n >= 8
+                    {
+                        out.push(Value::String(format!(
+                            "ERR:{}",
+                            WireError::Unsupported("pmc bit 0..7")
+                        )));
+                        continue;
+                    }
                     // 分发时按各点自己 bit：None → scalar 值；Some(n) → BYTE 本地 mask。
                     // key：bit=None → (kind,addr,dt=kind width)；bit=Some → (kind,addr,0)。
                     // 非 canonical kind → point-local Unsupported（不发包）。
@@ -1487,14 +1505,7 @@ impl FocasApi for WireFocasApi {
                     match pmc_map.get(&(*kind, *addr, dt)).cloned() {
                         Some(Ok(PmcScalarValue::Byte(b))) if bit.is_some() => {
                             let n = bit.unwrap();
-                            if n >= 8 {
-                                out.push(Value::String(format!(
-                                    "ERR:{}",
-                                    WireError::Unsupported("pmc bit 0..7")
-                                )));
-                            } else {
-                                out.push(Value::Bool(((b >> n) & 1) != 0));
-                            }
+                            out.push(Value::Bool(((b >> n) & 1) != 0));
                         }
                         Some(Ok(v)) if bit.is_none() => out.push(pmc_scalar_to_value(&v)),
                         // shape 错配（如 BYTE 请求收 WORD）：decoder 层已 Malformed；
@@ -2629,6 +2640,28 @@ mod tests {
                 "kind={kind} 必须 Unsupported（不发包）"
             );
         }
+    }
+
+    /// PR56 非法 bit no-packet 回归：未连接 `WireFocasApi` 上 `read_batch([F0.8])`
+    /// 必须 `Ok([ERR:Unsupported])`（point-local，不碰 session）。
+    /// 若 prefetch 先发包，未连接下即 fatal `Closed` 整批 Err，测试必红。
+    #[tokio::test]
+    async fn pmc_invalid_bit_no_packet() {
+        let api = WireFocasApi::new(std::time::Duration::from_millis(50));
+        let vals = api
+            .read_batch(&[FocasAddress::Pmc {
+                kind: 'F',
+                addr: 0,
+                bit: Some(8),
+            }])
+            .await
+            .expect("非法 bit 必须单点 ERR，不整批 Err");
+        assert_eq!(vals.len(), 1);
+        assert!(
+            matches!(&vals[0], Value::String(s) if s.contains("pmc bit 0..7")),
+            "F0.8 必须 ERR pmc bit 0..7，实际：{:?}",
+            vals[0]
+        );
     }
 
     /// PR56 mixed scalar/bit 回归：`[F0, F0.7, F0.5]` →
