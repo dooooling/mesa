@@ -601,8 +601,7 @@ type FnRdSpMaxRpm = unsafe extern "C" fn(c_ushort, c_ushort, *mut c_short) -> c_
 /// N02（复测修正）：`cnc_rdtofs(hdl, number, type, length=8, out)` 5 参
 /// （本批 FWLIB64 + fwlibe64 均为 `handle,number,type,length,output`；
 /// 不是范围接口 `cnc_rdtofsr`，没有 `e_no`。复测前 6 参把整数 8 当指针，
-/// 已回滚。证据：`entry/cnc_rdtofs.txt` + `ethernet/cnc_rdtofs.txt`
-/// `if (a4 < 8u) return 2` + 转发 `cnc_rdtofsr(a1,a2,a3+1000,a2,...)`）。
+/// 已回滚。证据见 `drivers/focas2/docs/n01-n02-abi-evidence.md` §2）。
 type FnRdTofs = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, *mut OdbTofs) -> c_short;
 type FnRdTofsr =
     unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, c_short, *mut IodbTo111) -> c_short;
