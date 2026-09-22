@@ -1,0 +1,20 @@
+{
+  "operation": "spindle_maxrpm",
+  "sp_no": 1,
+  "native": {
+    "rc": 0,
+    "datano": 1,
+    "type": 0,
+    "data0": 874
+  },
+  "mesa": {
+    "maxrpm": 874
+  },
+  "source": {
+    "kind": "pktmon_isolated_capture",
+    "target": "192.168.15.165:8193",
+    "request": "frame1 86B count=3 0xA4[1]+0x40[1,1]+0xA4[1]",
+    "response": "frame2 62B 0xA4(dlen2)+0x40(dlen8 036a)+0xA4(dlen2)",
+    "note": "874-672=202=0xCA 跨窗一致"
+  }
+}

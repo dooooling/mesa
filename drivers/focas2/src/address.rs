@@ -95,7 +95,7 @@ pub enum AxisKind {
     AccDecDly,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SpindleKind {
     Speed,
     Load,

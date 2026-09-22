@@ -351,6 +351,19 @@ pub struct SpindleSpeed {
     pub exponent: u8,
 }
 
+/// FOCAS spindle word（gear/maxrpm Evidence CLOSED，双窗差分）。
+/// 私有 helper `spindle_word(func, spindle)` 的 typed 结果（极窄共享，
+/// 只服务 `func=1/2` 已证实同族；不扩 Generic/Dispatcher，不塞 load/speed）。
+/// `0x40` reply `dlen=8` 全保留（`data[2..4]` BE16 外尾部不命名）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpindleWord {
+    /// 原始 8B（`0x40` reply 全量；以后他 target 尾部不同证据不丢）。
+    pub raw: [u8; 8],
+    /// 数值（`data[2..4]` BE16 → i16；Native `ODBSPN.data[0]` short 同合同，
+    /// 不因非负擅改 `u16`；gear=672/maxrpm=874 真机证据）。
+    pub value: i16,
+}
+
 /// FOCAS `param_value`（`0x8D`）typed 结果。param v1 Evidence PASS。
 /// 保留完整证据（不过早抽象成 `RawNumeric8`——尾部 scale 语义未闭合，
 /// REAL 留后续窗口；此处只冻结 identity-scale `I32` 单点读取）。
@@ -487,6 +500,23 @@ pub(super) const OPMSG_TYPE_PRODUCT: i32 = 4;
 /// `spindle_speed` 命令（`0x25`，spindle Evidence PASS：
 /// S0~S4 `device=1/path=1/args=[0,0,0,0]/aux=0` 逐字节恒定，无 selector）。
 pub(super) const CMD_SPINDLE_SPEED: u16 = 0x0025;
+/// spindle word 系命令（gear/maxrpm Evidence CLOSED，双窗差分）：
+/// `0xA4[1,0,0,0] + 0x40[func,sp,0,0] + 0xA4[1,0,0,0]` 三 slot；
+/// `func=2` gear / `func=1` maxrpm（A0 差分仅此一字，其余逐字节相同）。
+pub(super) const CMD_SPINDLE_WORD_HEAD: u16 = 0x00A4;
+/// spindle word 数值槽命令（`0x40[func,sp,0,0]`；与 Tool `0x40[n,0,0,0]` /
+/// spmeter `0x40[4/5,-1,0,0]` 同 command 不同 args——command 复用，
+/// operation identity = command + args + context，不单冻 command）。
+pub(super) const CMD_SPINDLE_WORD: u16 = 0x0040;
+/// spindle word func（gear；`0x40[A0=2,sp,0,0]`）。
+pub(super) const SPINDLE_WORD_FUNC_GEAR: i32 = 2;
+/// spindle word func（maxrpm；`0x40[A0=1,sp,0,0]`）。
+pub(super) const SPINDLE_WORD_FUNC_MAXRPM: i32 = 1;
+/// spindle word `0x40` reply（`dlen=8`；`data[0..4]` BE32 顶部 2B 为零、
+/// 低 2B 即 Native 值；有意只冻结 `data[2..4]` BE16（`02 a0`=672 /
+/// `03 6a`=874），`[0..2]/[4..8]` 不命名，不套 `RawNumeric8`，
+/// 不冻 `u16/i16`——672/874 非负，符号待定）。
+pub const SPINDLE_WORD_DATA_LEN: usize = 8;
 /// `axis_absolute` 命令（`0x26`，`v0=4/v1=ordinal` 真机冻结）。
 pub(super) const CMD_AXIS_ABSOLUTE: u16 = 0x0026;
 /// `pmc_rdpmcrng` 命令（`0x8001`，PMC scalar Evidence PASS：
@@ -513,6 +543,10 @@ pub(super) const FUNC_PARAM: u32 = 0x0001_008D;
 pub(super) const FUNC_OPMSG: u32 = 0x0001_0034;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_SPINDLE_SPEED)`）。
 pub(super) const FUNC_SPINDLE_SPEED: u32 = 0x0001_0025;
+/// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_SPINDLE_WORD_HEAD)`）。
+pub(super) const FUNC_SPINDLE_WORD_HEAD: u32 = 0x0001_00A4;
+/// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_SPINDLE_WORD)`）。
+pub(super) const FUNC_SPINDLE_WORD: u32 = 0x0001_0040;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_AXIS_ABSOLUTE)`）。
 pub(super) const FUNC_AXIS_ABSOLUTE: u32 = 0x0001_0026;
 /// 兼容视图（PMC：`function = path<<16|command` 字节等价；
@@ -1072,6 +1106,58 @@ impl FocasClient {
         }
     }
 
+    /// spindle word 私有 helper（Batch 1 极窄共享，只服务 `func=1/2`）：
+    /// request count=3（`0xA4[1,0,0,0] + 0x40[func,sp,0,0] + 0xA4[1,0,0,0]`，
+    /// `device=1/path=1/aux=0`），单次 guard 内一次 exchange（frame 内 3 slot）。
+    /// `spindle` 范围 `1..=4`（超限即 `Unsupported` 不发包；`0/-1` 不作
+    /// evidence，`sp_no=0` 已作废）。
+    /// 外层 `spindle_gear/spindle_maxrpm` 为明确 typed op（见下），不暴露 func。
+    async fn spindle_word(&self, func: i32, spindle: u8) -> Result<SpindleWord, WireError> {
+        if !(1..=4).contains(&spindle) {
+            return Err(WireError::Unsupported("spindle 1..4"));
+        }
+        let sp = spindle as i32;
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[
+                request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD_HEAD, [1, 0, 0, 0, 0]),
+                request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD, [func, sp, 0, 0, 0]),
+                request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD_HEAD, [1, 0, 0, 0, 0]),
+            ]),
+        };
+        let mut guard = self.guard().await?;
+        let session = guard.session();
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                return Err(e);
+            }
+        };
+        guard.complete();
+        match decode_spindle_word(&resp, func) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                Err(e)
+            }
+        }
+    }
+
+    /// `spindle_gear(spindle)`（gear Evidence CLOSED：`func=2`）。
+    pub async fn spindle_gear(&self, spindle: u8) -> Result<SpindleWord, WireError> {
+        self.spindle_word(SPINDLE_WORD_FUNC_GEAR, spindle).await
+    }
+
+    /// `spindle_maxrpm(spindle)`（maxrpm Evidence CLOSED：`func=1`）。
+    pub async fn spindle_maxrpm(&self, spindle: u8) -> Result<SpindleWord, WireError> {
+        self.spindle_word(SPINDLE_WORD_FUNC_MAXRPM, spindle).await
+    }
+
     /// `pmc_scalar(kind, addr)`（PMC scalar Evidence PASS：`0x8001` count=1，
     /// `device=2/path=PATH_PMC_OBSERVED(args)/A0=start/A1=end/A2=adr_type/
     /// A3=data_type/aux=0`；单点语义，不做范围读/multi-address/merge）。
@@ -1382,6 +1468,34 @@ pub(super) fn decode_spindle_speed(resp: &FocasFrame) -> Result<SpindleSpeed, Wi
     })
 }
 
+/// spindle word 响应解码（gear/maxrpm Evidence CLOSED）：
+/// 三 slot occurrence 锁死（`0xA4 occ#1 / 0x40 / 0xA4 occ#2`，不只按
+/// command 找 reply——两 `0xA4` 相同，错位即逻辑错）；
+/// 中间 `0x40` 成功数据精确 `== 8`，`data[2..4]` BE16 → i16
+/// （`data[0..4]` BE32 顶部 2B 为零、低 2B 即 Native `ODBSPN.data[0]` short；
+/// FWLIB `sub_18005A930` 用 `ntohl` DWORD 读后截断存 short，同合同，
+/// 不冻 `u16`）。
+/// 缺任一槽即 `CommandMismatch`（保守致命）；`status != 0` 走共用 Remote。
+pub(super) fn decode_spindle_word(resp: &FocasFrame, func: i32) -> Result<SpindleWord, WireError> {
+    let _ = func;
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    // occurrence 锁死：两 0xA4 必须都在（各 occ），中间 0x40 必须恰好对应。
+    let _head = match_slot(&subs, DEV_CNC, PATH_CNC, CMD_SPINDLE_WORD_HEAD, 0)
+        .ok_or(WireError::CommandMismatch)?;
+    let sub = match_slot(&subs, DEV_CNC, PATH_CNC, CMD_SPINDLE_WORD, 0)
+        .ok_or(WireError::CommandMismatch)?;
+    let _tail = match_slot(&subs, DEV_CNC, PATH_CNC, CMD_SPINDLE_WORD_HEAD, 1)
+        .ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    if d.len() != SPINDLE_WORD_DATA_LEN {
+        return Err(WireError::MalformedPayload);
+    }
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(d);
+    let value = i16::from_be_bytes([d[2], d[3]]);
+    Ok(SpindleWord { raw, value })
+}
+
 /// `0x15` 响应解码：slot 匹配 `0x15`，成功数据精确 8B（与 feed/axis/spindle
 /// 同构，独立 decoder，不抽公共类型；`RawNumeric8` 第四个独立 operation）。
 /// 缺 `0x15` 即 `CommandMismatch`。
@@ -1535,6 +1649,15 @@ fn spindle_to_value(spd: &SpindleSpeed) -> Result<Value, WireError> {
     Ok(Value::I32(num.native_value()))
 }
 
+/// Mesa `spindle/gear|spindle/maxrpm` 映射（Batch 1）：
+/// `value: i16` → `Value::I32`（Native `ODBSPN.data[0]` short 同合同；
+/// gear=672/maxrpm=874 真机证据；`i16` 不擅改 `u16`）。
+/// 此处只做类型映射（`i16 → I32`），不截断/不缩放/不猜 Panel 显示语义
+/// （gear Panel RATIO=0 对应关系 UNRESOLVED，非 Wire blocker）。
+fn spindle_word_to_value(w: &SpindleWord) -> Value {
+    Value::I32(w.value as i32)
+}
+
 /// Mesa `machine/feed` 映射（PR53 两层语义 + B1 冻结 + B4 真实权威）：
 /// `native_value = mantissa` → `Value::U32`（与 `cnc_actf` 只复制前 4B
 /// 同合同；不因 `exponent != 0` 拒绝——否则 `mantissa=1234/exp=1` 将在
@@ -1578,6 +1701,30 @@ pub(super) fn spindle_to_value_for_test(spd: &SpindleSpeed) -> Result<Value, Wir
     spindle_to_value(spd)
 }
 
+/// fixture/test 专用：生产 `spindle_word_to_value` 同源入口（`#[cfg(test)]`，
+/// 不出 crate；gear/maxrpm fixture 回归用）。
+#[cfg(test)]
+pub(super) fn spindle_word_to_value_for_test(w: &SpindleWord) -> Value {
+    spindle_word_to_value(w)
+}
+
+/// Batch 1 去重 helper（生产与测试共用）：
+/// `Spindle/Gear|MaxRpm` 按 `(kind, spindle)` 保序去重（生产 `sword_order`
+/// 即此函数；load/speed 不纳入——Batch 1 只服务 gear/maxrpm）。
+fn dedup_sword_keys(addresses: &[FocasAddress]) -> Vec<(crate::address::SpindleKind, u8)> {
+    use crate::address::SpindleKind;
+    let mut order: Vec<(SpindleKind, u8)> = Vec::new();
+    for a in addresses {
+        if let FocasAddress::Spindle { spindle, kind } = a
+            && matches!(kind, SpindleKind::Gear | SpindleKind::MaxRpm)
+            && !order.contains(&(*kind, *spindle))
+        {
+            order.push((*kind, *spindle));
+        }
+    }
+    order
+}
+
 /// fixture/test 专用：生产 `macro_to_value` 同源入口（`#[cfg(test)]`，
 /// 不出 crate；macro M0~M3 fixture 回归用）。
 #[cfg(test)]
@@ -1607,12 +1754,14 @@ pub(super) fn axis_value_for_test(v: i32) -> Value {
 
 // ---------------------------------------------------------------------------
 // WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed + PR3 axis + PR54 spindle
-// + PR55 macro + PR56 pmc scalar + PR57 param + PR58 opmsg）
+// + PR55 macro + PR56 pmc scalar + PR57 param + PR58 opmsg
+// + Batch 1 spindle gear/maxrpm）
 // ---------------------------------------------------------------------------
 
-/// Wire 版 `FocasApi`（PR58：`system_info` + `Status` + `Feed` +
+/// Wire 版 `FocasApi`（Batch 1：`system_info` + `Status` + `Feed` +
 /// `Axis/absolute` + `ActiveSpindleSpeed` + `MacroVar` + `Pmc` scalar +
-/// `Param` + `OpMsg`；其余地址 `Unsupported`，fail-closed，不猜、不 fallback Native）。
+/// `Param` + `OpMsg` + `Spindle/Gear|MaxRpm`；其余地址 `Unsupported`，
+/// fail-closed，不猜、不 fallback Native）。
 pub struct WireFocasApi {
     client: Arc<FocasClient>,
     host: Mutex<Option<(String, u16)>>,
@@ -1758,6 +1907,32 @@ impl FocasApi for WireFocasApi {
         } else {
             None
         };
+        // spindle Gear/MaxRpm：按 (kind,spindle) 去重各一次 spindle_word
+        // （同族三 slot 请求；batch 多个同 key 去重一次 exchange；
+        // 去重逻辑见 `dedup_sword_keys`，此处生产调用）。
+        use crate::address::SpindleKind;
+        let sword_order: Vec<(SpindleKind, u8)> = dedup_sword_keys(addresses);
+        let mut sword_map: BTreeMap<(SpindleKind, u8), Result<Value, String>> = BTreeMap::new();
+        for (kind, spindle) in &sword_order {
+            let r: Result<Value, String> = match *kind {
+                SpindleKind::Gear => match self.client.spindle_gear(*spindle).await {
+                    Ok(w) => Ok(spindle_word_to_value(&w)),
+                    Err(e) => match Self::point_or_fatal(e) {
+                        Ok(v) => Ok(v),
+                        Err(fatal) => return Err(fatal),
+                    },
+                },
+                SpindleKind::MaxRpm => match self.client.spindle_maxrpm(*spindle).await {
+                    Ok(w) => Ok(spindle_word_to_value(&w)),
+                    Err(e) => match Self::point_or_fatal(e) {
+                        Ok(v) => Ok(v),
+                        Err(fatal) => return Err(fatal),
+                    },
+                },
+                _ => unreachable!("order 只含 Gear/MaxRpm"),
+            };
+            sword_map.insert((*kind, *spindle), r);
+        }
         // Macro 按宏号各一次 0x15（单点语义；超 c_short 在 operation 内 fail-closed）。
         let mut macro_map: BTreeMap<u32, Result<Value, String>> = BTreeMap::new();
         for a in addresses {
@@ -1903,6 +2078,19 @@ impl FocasApi for WireFocasApi {
                     Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
                     Err(fatal) => return Err(fatal),
                 },
+                FocasAddress::Spindle { spindle, kind } => {
+                    match sword_map.get(&(*kind, *spindle)).cloned() {
+                        Some(Ok(v)) => out.push(v),
+                        Some(Err(e)) if e.starts_with("ERR:") => out.push(Value::String(e)),
+                        Some(Err(fatal)) => return Err(fatal),
+                        // 非 Gear/MaxRpm（如 indexed Speed/Load）与 Native 同口径
+                        // fail-closed（ERR → BAD；PR52 门，不猜）。
+                        None => out.push(Value::String(format!(
+                            "ERR:{}",
+                            WireError::Unsupported("spindle kind not in Wire Batch 1")
+                        ))),
+                    }
+                }
                 FocasAddress::MacroVar { number } => {
                     match macro_map.get(number).cloned().unwrap() {
                         Ok(v) => out.push(v),
@@ -1975,7 +2163,7 @@ impl FocasApi for WireFocasApi {
                 _ => out.push(Value::String(format!(
                     "ERR:{}",
                     WireError::Unsupported(
-                        "PR58 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc/Param/OpMsg"
+                        "Batch 1 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc/Param/OpMsg/SpindleGear/MaxRpm"
                     )
                 ))),
             }
@@ -3183,6 +3371,272 @@ mod tests {
         let key_r = ('R', 100u32, 1u32);
         let key_rb = ('R', 100u32, 0u32);
         assert_ne!(key_r, key_rb);
+    }
+
+    /// Batch 1 请求：gear/maxrpm 三 slot exact（`0xA4[1,0,0,0] +
+    /// 0x40[func,sp,0,0] + 0xA4[1,0,0,0]`；func=2 gear / func=1 maxrpm）。
+    #[test]
+    fn spindle_word_request_locked() {
+        use super::super::frame::encode_generic_request as enc;
+        for (func, sp) in [(SPINDLE_WORD_FUNC_GEAR, 1), (SPINDLE_WORD_FUNC_MAXRPM, 1)] {
+            let payload = enc(&[
+                request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD_HEAD, [1, 0, 0, 0, 0]),
+                request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD, [func, sp, 0, 0, 0]),
+                request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD_HEAD, [1, 0, 0, 0, 0]),
+            ]);
+            // count=3 + 3×28B = 86 = 0x56（与 statinfo frame#2 同长）。
+            assert_eq!(payload.len(), 0x56, "func={func} 请求必须 86B");
+            assert_eq!(&payload[0..2], &[0x00, 0x03]);
+            let back = decode_generic_payload(&payload).unwrap();
+            assert_eq!(back.len(), 3);
+            assert_eq!(back[0].function, FUNC_SPINDLE_WORD_HEAD);
+            assert_eq!(back[1].function, FUNC_SPINDLE_WORD);
+            assert_eq!(back[2].function, FUNC_SPINDLE_WORD_HEAD);
+        }
+    }
+
+    /// Batch 1 响应解码：gear `00 00 00 02 a0 00 0a 00` → `I32(672)`；
+    /// maxrpm `00 00 00 03 6a 00 0a 00` → `I32(874)`（双窗差分真机证据）。
+    #[test]
+    fn decode_spindle_word_gear_maxrpm_locked() {
+        // 三 slot 真实模型构造（生产 `spindle_word` 同源请求形状）。
+        fn frame_for(func: i32, data8: [u8; 8]) -> FocasFrame {
+            // 0xA4 空成功槽（dlen=2 `00 01`，真机形态）。
+            let head_slot = GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_SPINDLE_WORD_HEAD,
+                payload: {
+                    let mut p = vec![0x00; 6];
+                    p.extend_from_slice(&[0x00, 0x02, 0x00, 0x01]);
+                    p
+                },
+            };
+            let word_slot = GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_SPINDLE_WORD,
+                payload: {
+                    let mut p = vec![0x00; 6];
+                    p.extend_from_slice(&[0x00, 0x08]);
+                    p.extend_from_slice(&data8);
+                    p
+                },
+            };
+            let _ = func;
+            FocasFrame {
+                origin: 0x0003,
+                packet_type: PacketType::GENERIC_RESPONSE,
+                payload: encode_generic_request(&[head_slot.clone(), word_slot, head_slot]),
+            }
+        }
+        // gear：data[2..4]=02 a0 → 672。
+        let g = decode_spindle_word(
+            &frame_for(
+                SPINDLE_WORD_FUNC_GEAR,
+                [0x00, 0x00, 0x02, 0xa0, 0x00, 0x0a, 0x00, 0x00],
+            ),
+            SPINDLE_WORD_FUNC_GEAR,
+        )
+        .unwrap();
+        assert_eq!(g.value, 672);
+        assert_eq!(
+            spindle_word_to_value(&g),
+            Value::I32(672),
+            "Gear → I32(672)"
+        );
+        // maxrpm：data[2..4]=03 6a → 874。
+        let m = decode_spindle_word(
+            &frame_for(
+                SPINDLE_WORD_FUNC_MAXRPM,
+                [0x00, 0x00, 0x03, 0x6a, 0x00, 0x0a, 0x00, 0x00],
+            ),
+            SPINDLE_WORD_FUNC_MAXRPM,
+        )
+        .unwrap();
+        assert_eq!(m.value, 874);
+        assert_eq!(
+            spindle_word_to_value(&m),
+            Value::I32(874),
+            "MaxRpm → I32(874)"
+        );
+    }
+
+    /// Batch 1 exact dlen：`!= 8` 即 `MalformedPayload`（7B 截断 / 9B trailing）。
+    #[test]
+    fn spindle_word_length_closure_rejected() {
+        fn frame_with(data: &[u8]) -> FocasFrame {
+            let head_slot = GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_SPINDLE_WORD_HEAD,
+                payload: {
+                    let mut p = vec![0x00; 6];
+                    p.extend_from_slice(&[0x00, 0x02, 0x00, 0x01]);
+                    p
+                },
+            };
+            let word_slot = GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_SPINDLE_WORD,
+                payload: {
+                    let mut p = vec![0x00; 6];
+                    p.extend_from_slice(&(data.len() as u16).to_be_bytes());
+                    p.extend_from_slice(data);
+                    p
+                },
+            };
+            FocasFrame {
+                origin: 0x0003,
+                packet_type: PacketType::GENERIC_RESPONSE,
+                payload: encode_generic_request(&[head_slot.clone(), word_slot, head_slot]),
+            }
+        }
+        assert_eq!(
+            decode_spindle_word(&frame_with(&[0x00; 7]), SPINDLE_WORD_FUNC_GEAR)
+                .unwrap_err()
+                .to_string(),
+            WireError::MalformedPayload.to_string(),
+            "7B 截断必须 Malformed"
+        );
+        assert_eq!(
+            decode_spindle_word(&frame_with(&[0x00; 9]), SPINDLE_WORD_FUNC_GEAR)
+                .unwrap_err()
+                .to_string(),
+            WireError::MalformedPayload.to_string(),
+            "9B trailing 必须 Malformed"
+        );
+    }
+
+    /// Batch 1 occurrence：缺任一 slot 即 `CommandMismatch`（两 `0xA4` 相同，
+    /// 只按 command 找会错位；此处锁 occurrence 语义）。
+    #[test]
+    fn spindle_word_occurrence_locked() {
+        // 缺尾部 0xA4（occ#2）：只有 head occ#1 + 0x40。
+        let head_slot = GenericSubpacket {
+            control_device: DEV_CNC,
+            function: FUNC_SPINDLE_WORD_HEAD,
+            payload: {
+                let mut p = vec![0x00; 6];
+                p.extend_from_slice(&[0x00, 0x02, 0x00, 0x01]);
+                p
+            },
+        };
+        let word_slot = GenericSubpacket {
+            control_device: DEV_CNC,
+            function: FUNC_SPINDLE_WORD,
+            payload: {
+                let mut p = vec![0x00; 6];
+                p.extend_from_slice(&[0x00, 0x08, 0x00, 0x00, 0x02, 0xa0, 0x00, 0x0a, 0x00, 0x00]);
+                p
+            },
+        };
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[head_slot.clone(), word_slot]),
+        };
+        let e = decode_spindle_word(&frame, SPINDLE_WORD_FUNC_GEAR).unwrap_err();
+        assert!(matches!(e, WireError::CommandMismatch));
+        assert!(e.is_session_fatal());
+        // 缺 0x40（只有两 0xA4）：中间槽缺失。
+        let frame2 = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[head_slot.clone(), head_slot.clone()]),
+        };
+        let e2 = decode_spindle_word(&frame2, SPINDLE_WORD_FUNC_GEAR).unwrap_err();
+        assert!(matches!(e2, WireError::CommandMismatch));
+    }
+
+    /// Batch 1 wrong command：`0x40` 槽被 `0x25` 替换即 `CommandMismatch`。
+    #[test]
+    fn spindle_word_wrong_command_is_mismatch() {
+        let head_slot = GenericSubpacket {
+            control_device: DEV_CNC,
+            function: FUNC_SPINDLE_WORD_HEAD,
+            payload: {
+                let mut p = vec![0x00; 6];
+                p.extend_from_slice(&[0x00, 0x02, 0x00, 0x01]);
+                p
+            },
+        };
+        let wrong_slot = GenericSubpacket {
+            control_device: DEV_CNC,
+            function: FUNC_SPINDLE_SPEED, // 故意放错槽
+            payload: {
+                let mut p = vec![0x00; 6];
+                p.extend_from_slice(&[0x00, 0x08]);
+                p.extend_from_slice(&[0x00; 8]);
+                p
+            },
+        };
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[head_slot.clone(), wrong_slot, head_slot.clone()]),
+        };
+        let e = decode_spindle_word(&frame, SPINDLE_WORD_FUNC_GEAR).unwrap_err();
+        assert!(matches!(e, WireError::CommandMismatch));
+        assert!(e.is_session_fatal());
+    }
+
+    /// Batch 1 spindle range：`0/5`（及 `>4`）不发包（`sp_no=0` 作废，
+    /// 与 Native ODBSPN `1..MAX` 合同同口径；Wire-local checked）。
+    #[tokio::test]
+    async fn spindle_word_range_fail_closed() {
+        let client = FocasClient::new(std::time::Duration::from_millis(10));
+        for sp in [0u8, 5u8, 255u8] {
+            let e = client.spindle_gear(sp).await.unwrap_err();
+            assert!(
+                matches!(e, WireError::Unsupported(_)),
+                "spindle={sp} 必须 Unsupported（不发包）"
+            );
+            let e = client.spindle_maxrpm(sp).await.unwrap_err();
+            assert!(
+                matches!(e, WireError::Unsupported(_)),
+                "spindle={sp} 必须 Unsupported（不发包）"
+            );
+        }
+    }
+
+    /// Batch 1 batch 去重：相同 `(kind, spindle)` 只去重一次 exchange
+    ///（与生产 `sword_order` 同源 `dedup_sword_keys`；load/speed 不纳入）。
+    #[test]
+    fn spindle_word_batch_dedup_locked() {
+        use crate::address::SpindleKind;
+        let addrs = vec![
+            FocasAddress::Spindle {
+                spindle: 1,
+                kind: SpindleKind::Gear,
+            },
+            FocasAddress::Spindle {
+                spindle: 1,
+                kind: SpindleKind::Gear,
+            },
+            FocasAddress::Spindle {
+                spindle: 1,
+                kind: SpindleKind::MaxRpm,
+            },
+            FocasAddress::Spindle {
+                spindle: 2,
+                kind: SpindleKind::Gear,
+            },
+            // load/speed 不纳入 Batch 1（Native 同口径 fail-closed）。
+            FocasAddress::Spindle {
+                spindle: 1,
+                kind: SpindleKind::Load,
+            },
+            FocasAddress::Spindle {
+                spindle: 1,
+                kind: SpindleKind::Speed,
+            },
+        ];
+        assert_eq!(
+            dedup_sword_keys(&addrs),
+            vec![
+                (SpindleKind::Gear, 1),
+                (SpindleKind::MaxRpm, 1),
+                (SpindleKind::Gear, 2),
+            ]
+        );
     }
 
     /// opmsg `0x34` 请求：count=1（Evidence O1 冻结形态：

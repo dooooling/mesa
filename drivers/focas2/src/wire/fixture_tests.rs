@@ -1,5 +1,5 @@
 //! Fixture 回归（PR1 Level 2 + PR2 feed + PR54 spindle + PR55 macro + PR56 pmc
-//! + PR57 param + PR58 opmsg）：真机捕获 → 生产 codec 直测。
+//! + PR57 param + PR58 opmsg + Batch 1 spindle gear/maxrpm）：真机捕获 → 生产 codec 直测。
 //!
 //! - 数据：165 定向抓包 → `10B header + payload_len` 精确切帧 → 去重传/
 //!   拼接残留（`tests/fixtures/wire/{sysinfo,statinfo_mem,statinfo_mdi,feed}/`）。
@@ -8,6 +8,9 @@
 //!   生产形态真机冻结。
 //! - spindle 证据（S0~S4）：`0x25` mantissa=0/500/1002/1500/800 ↔
 //!   Native cnc_acts 同次；request 5 点逐字节恒定（`args=[0,0,0,0]/aux=0`）。
+//! - spindle word 证据（gear_s1/maxrpm_s1）：`0xA4[1]+0x40[func,1]+0xA4[1]`
+//!   三 slot；`0x40` dlen=8 `data[3..5]` BE16 ↔ Native ODBSPN.data[0]
+//!   （gear 672 / maxrpm 874；差值 202=0xCA 跨窗一致；隔离双窗差分）。
 //! - macro 证据（M0~M3）：`0x15` mcr=0/250000000/123450000/-750000000 +
 //!   dec=0/7/7/8 ↔ Native cnc_rdmacro 同次；request `args=[n,n,0,0]`；
 //!   Mesa 取 scaled F64（与 feed/spindle 取 mantissa 形成对照）。
@@ -22,7 +25,7 @@ use std::path::PathBuf;
 use super::frame::{FRAME_HEADER_LEN, FocasFrame, PacketType, decode_header};
 use super::wire::{
     decode_feed_rate, decode_macro_value, decode_opmsg_value, decode_spindle_speed,
-    decode_status_info, decode_system_info,
+    decode_spindle_word, decode_status_info, decode_system_info,
 };
 use super::{cut_fixture_frames, fixture_dir, read_fixture_bytes};
 
@@ -109,6 +112,8 @@ pub(crate) fn run_all() {
     axis_request_locked();
     spindle_s0s4_decodes();
     spindle_request_locked();
+    spindle_word_gear_maxrpm_decodes();
+    spindle_word_request_locked();
     macro_m0m3_decodes();
     macro_request_locked();
     pmc_scalar_decodes();
@@ -433,6 +438,89 @@ fn spindle_request_locked() {
             frames[0], build,
             "{group} production encoder 必须 == captured fixture 全 40B"
         );
+    }
+}
+
+/// spindle word G1/M1（Batch 1）：fixture 经生产 codec 解码 == expected
+///（gear 672 / maxrpm 874 ↔ Native ODBSPN.data[0] 同次；
+/// request 生产编码 == 捕获 fixture 全 96B）。
+fn spindle_word_gear_maxrpm_decodes() {
+    use super::wire::{
+        FUNC_SPINDLE_WORD, FUNC_SPINDLE_WORD_HEAD, SPINDLE_WORD_FUNC_GEAR,
+        SPINDLE_WORD_FUNC_MAXRPM, spindle_word_to_value_for_test as to_value,
+    };
+    for (group, func, want) in [
+        ("gear_s1", SPINDLE_WORD_FUNC_GEAR, 672),
+        ("maxrpm_s1", SPINDLE_WORD_FUNC_MAXRPM, 874),
+    ] {
+        // 响应：生产 decoder 直测。
+        let frame = assemble_frame(&read(group, "spindleword_response_frame.bin"));
+        let w = decode_spindle_word(&frame, func).expect("{group} 必须解码");
+        assert_eq!(w.value, want as i16, "{group} BE16 word");
+        assert_eq!(
+            w.raw,
+            if func == SPINDLE_WORD_FUNC_GEAR {
+                [0x00, 0x00, 0x02, 0xa0, 0x00, 0x0a, 0x00, 0x00]
+            } else {
+                [0x00, 0x00, 0x03, 0x6a, 0x00, 0x0a, 0x00, 0x00]
+            },
+            "{group} raw 8B 全保留"
+        );
+        let exp = expected(group);
+        assert_eq!(
+            exp["native"]["data0"].as_i64().unwrap() as i16,
+            w.value,
+            "{group} Native↔Wire 同次一致"
+        );
+        assert_eq!(
+            to_value(&w),
+            mesa_core_types::Value::I32(want),
+            "{group} Mesa 映射"
+        );
+        // 请求：生产编码器输出 == 捕获 fixture 全 96B。
+        use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+        use super::frame::{encode_generic_request, request_subpacket};
+        use super::wire::DEV_CNC;
+        let build = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[
+                request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD_HEAD, [1, 0, 0, 0, 0]),
+                request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD, [func, 1, 0, 0, 0]),
+                request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD_HEAD, [1, 0, 0, 0, 0]),
+            ]),
+        }
+        .encode();
+        assert_eq!(build.len(), 96, "{group} 请求必须 96B（10+86）");
+        let raw = read(group, "spindleword_request_frame.bin");
+        let frames = cut_fixture_frames(&raw);
+        assert_eq!(frames.len(), 1, "{group} 必须恰好 1 帧");
+        assert_eq!(frames[0].len(), 96, "{group} 必须 96B");
+        assert_eq!(
+            frames[0], build,
+            "{group} production encoder 必须 == captured fixture 全 96B"
+        );
+    }
+}
+
+/// spindle word 请求锁死（wire.rs 单测同源；fixture 侧只验全字节等价）。
+fn spindle_word_request_locked() {
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+    use super::frame::{encode_generic_request, request_subpacket};
+    use super::wire::{DEV_CNC, FUNC_SPINDLE_WORD, FUNC_SPINDLE_WORD_HEAD};
+    use super::wire::{SPINDLE_WORD_FUNC_GEAR, SPINDLE_WORD_FUNC_MAXRPM};
+    for func in [SPINDLE_WORD_FUNC_GEAR, SPINDLE_WORD_FUNC_MAXRPM] {
+        let build = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[
+                request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD_HEAD, [1, 0, 0, 0, 0]),
+                request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD, [func, 1, 0, 0, 0]),
+                request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD_HEAD, [1, 0, 0, 0, 0]),
+            ]),
+        }
+        .encode();
+        assert_eq!(build.len(), 96, "func={func} 必须 96B");
     }
 }
 
