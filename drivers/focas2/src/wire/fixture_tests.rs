@@ -9,8 +9,9 @@
 //! - spindle 证据（S0~S4）：`0x25` mantissa=0/500/1002/1500/800 ↔
 //!   Native cnc_acts 同次；request 5 点逐字节恒定（`args=[0,0,0,0]/aux=0`）。
 //! - spindle word 证据（gear_s1/maxrpm_s1）：`0xA4[1]+0x40[func,1]+0xA4[1]`
-//!   三 slot；`0x40` dlen=8 `data[3..5]` BE16 ↔ Native ODBSPN.data[0]
-//!   （gear 672 / maxrpm 874；差值 202=0xCA 跨窗一致；隔离双窗差分）。
+//!   三 slot；`0x40` dlen=8 `data[2..4]` BE16 ↔ Native ODBSPN.data[0]
+//!   （gear 672 / maxrpm 874；差值 202=0xCA 跨窗一致；隔离双窗差分；
+//!   位置锁死 `subs[0]=A4/subs[1]=0x40/subs[2]=A4`，三槽 status 全检查）。
 //! - macro 证据（M0~M3）：`0x15` mcr=0/250000000/123450000/-750000000 +
 //!   dec=0/7/7/8 ↔ Native cnc_rdmacro 同次；request `args=[n,n,0,0]`；
 //!   Mesa 取 scaled F64（与 feed/spindle 取 mantissa 形成对照）。
@@ -453,9 +454,9 @@ fn spindle_word_gear_maxrpm_decodes() {
         ("gear_s1", SPINDLE_WORD_FUNC_GEAR, 672),
         ("maxrpm_s1", SPINDLE_WORD_FUNC_MAXRPM, 874),
     ] {
-        // 响应：生产 decoder 直测。
+        // 响应：生产 decoder 直测（decoder 不取 func，操作身份由 request 决定）。
         let frame = assemble_frame(&read(group, "spindleword_response_frame.bin"));
-        let w = decode_spindle_word(&frame, func).expect("{group} 必须解码");
+        let w = decode_spindle_word(&frame).expect("{group} 必须解码");
         assert_eq!(w.value, want as i16, "{group} BE16 word");
         assert_eq!(
             w.raw,

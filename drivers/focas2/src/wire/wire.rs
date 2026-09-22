@@ -359,8 +359,10 @@ pub struct SpindleSpeed {
 pub struct SpindleWord {
     /// 原始 8B（`0x40` reply 全量；以后他 target 尾部不同证据不丢）。
     pub raw: [u8; 8],
-    /// 数值（`data[2..4]` BE16 → i16；Native `ODBSPN.data[0]` short 同合同，
-    /// 不因非负擅改 `u16`；gear=672/maxrpm=874 真机证据）。
+    /// 数值（`data[2..4]` BE16 → i16；Native `ODBSPN.data[0]` 为 C short，
+    /// 故 Mesa 侧取 `i16`（不是“非负即 u16”——672/874 恰为非负是观测值，
+    /// 不是类型依据；负值语义待自然观测，不造规则）。
+    /// `SpindleWord → Value::I32`（见 `spindle_word_to_value`）。
     pub value: i16,
 }
 
@@ -1138,7 +1140,7 @@ impl FocasClient {
             }
         };
         guard.complete();
-        match decode_spindle_word(&resp, func) {
+        match decode_spindle_word(&resp) {
             Ok(v) => Ok(v),
             Err(e) => {
                 let fatal = e.is_session_fatal();
@@ -1469,24 +1471,46 @@ pub(super) fn decode_spindle_speed(resp: &FocasFrame) -> Result<SpindleSpeed, Wi
 }
 
 /// spindle word 响应解码（gear/maxrpm Evidence CLOSED）：
-/// 三 slot occurrence 锁死（`0xA4 occ#1 / 0x40 / 0xA4 occ#2`，不只按
-/// command 找 reply——两 `0xA4` 相同，错位即逻辑错）；
+/// 位置锁死三 slot（`subs[0]=A4 / subs[1]=0x40 / subs[2]=A4`，`device=1/path=1`；
+/// 不用 `match_slot` occurrence——它只找“同 command 第 N 次出现”，过不了
+/// `[A4,A4,40]/[40,A4,A4]/[A4,40,A4,extra]` 错位；长度必须恰好 3，多 1 槽即错）；
+/// 三槽 status 全检查（`reply_success_data` 逐槽；任一 A4 非零即 Remote，
+/// 不得输出 value——false GOOD blocker）；
 /// 中间 `0x40` 成功数据精确 `== 8`，`data[2..4]` BE16 → i16
 /// （`data[0..4]` BE32 顶部 2B 为零、低 2B 即 Native `ODBSPN.data[0]` short；
 /// FWLIB `sub_18005A930` 用 `ntohl` DWORD 读后截断存 short，同合同，
 /// 不冻 `u16`）。
-/// 缺任一槽即 `CommandMismatch`（保守致命）；`status != 0` 走共用 Remote。
-pub(super) fn decode_spindle_word(resp: &FocasFrame, func: i32) -> Result<SpindleWord, WireError> {
-    let _ = func;
+/// 错位/缺槽即 `CommandMismatch`（保守致命）；`status != 0` 走共用 Remote。
+/// NOTE：A4 data 不强制 `00 01`（语义未命名，只锁 slot 身份 + status，
+/// 不过拟合 target165）。
+/// NOTE：操作身份由同步 request `0x40[func,spindle,0,0]` 决定；
+/// response 无 func 回显，decoder 只解析本次串行 operation 的 reply，
+/// 不验证 func（见 `spindle_word` 私有 helper）。
+pub(super) fn decode_spindle_word(resp: &FocasFrame) -> Result<SpindleWord, WireError> {
     let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
-    // occurrence 锁死：两 0xA4 必须都在（各 occ），中间 0x40 必须恰好对应。
-    let _head = match_slot(&subs, DEV_CNC, PATH_CNC, CMD_SPINDLE_WORD_HEAD, 0)
-        .ok_or(WireError::CommandMismatch)?;
-    let sub = match_slot(&subs, DEV_CNC, PATH_CNC, CMD_SPINDLE_WORD, 0)
-        .ok_or(WireError::CommandMismatch)?;
-    let _tail = match_slot(&subs, DEV_CNC, PATH_CNC, CMD_SPINDLE_WORD_HEAD, 1)
-        .ok_or(WireError::CommandMismatch)?;
-    let d = reply_success_data(sub)?;
+    // 位置锁死：恰好 3 槽，顺序固定（P1 blocker 真修）。
+    if subs.len() != 3 {
+        return Err(WireError::CommandMismatch);
+    }
+    let head = &subs[0];
+    let word = &subs[1];
+    let tail = &subs[2];
+    if head.device != DEV_CNC
+        || head.path != PATH_CNC
+        || head.command != CMD_SPINDLE_WORD_HEAD
+        || word.device != DEV_CNC
+        || word.path != PATH_CNC
+        || word.command != CMD_SPINDLE_WORD
+        || tail.device != DEV_CNC
+        || tail.path != PATH_CNC
+        || tail.command != CMD_SPINDLE_WORD_HEAD
+    {
+        return Err(WireError::CommandMismatch);
+    }
+    // 三槽 status 全检查（任一 A4 非零即 Remote）。
+    reply_success_data(head)?;
+    let d = reply_success_data(word)?;
+    reply_success_data(tail)?;
     if d.len() != SPINDLE_WORD_DATA_LEN {
         return Err(WireError::MalformedPayload);
     }
@@ -3395,12 +3419,13 @@ mod tests {
         }
     }
 
-    /// Batch 1 响应解码：gear `00 00 00 02 a0 00 0a 00` → `I32(672)`；
-    /// maxrpm `00 00 00 03 6a 00 0a 00` → `I32(874)`（双窗差分真机证据）。
+    /// Batch 1 响应解码：gear `00 00 02 a0 00 0a 00 00` → `I32(672)`；
+    /// maxrpm `00 00 03 6a 00 0a 00 00` → `I32(874)`（双窗差分真机证据；
+    /// decoder 不取 func——操作身份由 request 决定，见 `spindle_word`）。
     #[test]
     fn decode_spindle_word_gear_maxrpm_locked() {
-        // 三 slot 真实模型构造（生产 `spindle_word` 同源请求形状）。
-        fn frame_for(func: i32, data8: [u8; 8]) -> FocasFrame {
+        // 三 slot 真实模型构造（生产 `spindle_word` 同源三槽顺序）。
+        fn frame_for(data8: [u8; 8]) -> FocasFrame {
             // 0xA4 空成功槽（dlen=2 `00 01`，真机形态）。
             let head_slot = GenericSubpacket {
                 control_device: DEV_CNC,
@@ -3421,7 +3446,6 @@ mod tests {
                     p
                 },
             };
-            let _ = func;
             FocasFrame {
                 origin: 0x0003,
                 packet_type: PacketType::GENERIC_RESPONSE,
@@ -3429,14 +3453,8 @@ mod tests {
             }
         }
         // gear：data[2..4]=02 a0 → 672。
-        let g = decode_spindle_word(
-            &frame_for(
-                SPINDLE_WORD_FUNC_GEAR,
-                [0x00, 0x00, 0x02, 0xa0, 0x00, 0x0a, 0x00, 0x00],
-            ),
-            SPINDLE_WORD_FUNC_GEAR,
-        )
-        .unwrap();
+        let g = decode_spindle_word(&frame_for([0x00, 0x00, 0x02, 0xa0, 0x00, 0x0a, 0x00, 0x00]))
+            .unwrap();
         assert_eq!(g.value, 672);
         assert_eq!(
             spindle_word_to_value(&g),
@@ -3444,14 +3462,8 @@ mod tests {
             "Gear → I32(672)"
         );
         // maxrpm：data[2..4]=03 6a → 874。
-        let m = decode_spindle_word(
-            &frame_for(
-                SPINDLE_WORD_FUNC_MAXRPM,
-                [0x00, 0x00, 0x03, 0x6a, 0x00, 0x0a, 0x00, 0x00],
-            ),
-            SPINDLE_WORD_FUNC_MAXRPM,
-        )
-        .unwrap();
+        let m = decode_spindle_word(&frame_for([0x00, 0x00, 0x03, 0x6a, 0x00, 0x0a, 0x00, 0x00]))
+            .unwrap();
         assert_eq!(m.value, 874);
         assert_eq!(
             spindle_word_to_value(&m),
@@ -3490,14 +3502,14 @@ mod tests {
             }
         }
         assert_eq!(
-            decode_spindle_word(&frame_with(&[0x00; 7]), SPINDLE_WORD_FUNC_GEAR)
+            decode_spindle_word(&frame_with(&[0x00; 7]))
                 .unwrap_err()
                 .to_string(),
             WireError::MalformedPayload.to_string(),
             "7B 截断必须 Malformed"
         );
         assert_eq!(
-            decode_spindle_word(&frame_with(&[0x00; 9]), SPINDLE_WORD_FUNC_GEAR)
+            decode_spindle_word(&frame_with(&[0x00; 9]))
                 .unwrap_err()
                 .to_string(),
             WireError::MalformedPayload.to_string(),
@@ -3505,8 +3517,9 @@ mod tests {
         );
     }
 
-    /// Batch 1 occurrence：缺任一 slot 即 `CommandMismatch`（两 `0xA4` 相同，
-    /// 只按 command 找会错位；此处锁 occurrence 语义）。
+    /// Batch 1 位置锁死（P1 blocker 真修）：`[A4,A4,40] / [40,A4,A4] /
+    /// [A4,40,A4,extra]` 必须全部 `CommandMismatch`（旧 occurrence 实现会误收）；
+    /// 缺任一 slot 亦然。
     #[test]
     fn spindle_word_occurrence_locked() {
         // 缺尾部 0xA4（occ#2）：只有 head occ#1 + 0x40。
@@ -3531,9 +3544,9 @@ mod tests {
         let frame = FocasFrame {
             origin: 0x0003,
             packet_type: PacketType::GENERIC_RESPONSE,
-            payload: encode_generic_request(&[head_slot.clone(), word_slot]),
+            payload: encode_generic_request(&[head_slot.clone(), word_slot.clone()]),
         };
-        let e = decode_spindle_word(&frame, SPINDLE_WORD_FUNC_GEAR).unwrap_err();
+        let e = decode_spindle_word(&frame).unwrap_err();
         assert!(matches!(e, WireError::CommandMismatch));
         assert!(e.is_session_fatal());
         // 缺 0x40（只有两 0xA4）：中间槽缺失。
@@ -3542,8 +3555,112 @@ mod tests {
             packet_type: PacketType::GENERIC_RESPONSE,
             payload: encode_generic_request(&[head_slot.clone(), head_slot.clone()]),
         };
-        let e2 = decode_spindle_word(&frame2, SPINDLE_WORD_FUNC_GEAR).unwrap_err();
+        let e2 = decode_spindle_word(&frame2).unwrap_err();
         assert!(matches!(e2, WireError::CommandMismatch));
+        // 错位 [A4,A4,40]：旧 occurrence 会误收（两 A4 先出现），位置锁死必须拒。
+        let frame3 = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                head_slot.clone(),
+                head_slot.clone(),
+                word_slot.clone(),
+            ]),
+        };
+        let e3 = decode_spindle_word(&frame3).unwrap_err();
+        assert!(
+            matches!(e3, WireError::CommandMismatch),
+            "[A4,A4,40] 错位必须 CommandMismatch"
+        );
+        // 错位 [40,A4,A4]：同上。
+        let frame4 = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                word_slot.clone(),
+                head_slot.clone(),
+                head_slot.clone(),
+            ]),
+        };
+        let e4 = decode_spindle_word(&frame4).unwrap_err();
+        assert!(
+            matches!(e4, WireError::CommandMismatch),
+            "[40,A4,A4] 错位必须 CommandMismatch"
+        );
+        // 多余 extra 槽 [A4,40,A4,extra]：长度 != 3 必须拒。
+        let frame5 = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                head_slot.clone(),
+                word_slot.clone(),
+                head_slot.clone(),
+                head_slot.clone(),
+            ]),
+        };
+        let e5 = decode_spindle_word(&frame5).unwrap_err();
+        assert!(
+            matches!(e5, WireError::CommandMismatch),
+            "[A4,40,A4,extra] 必须 CommandMismatch"
+        );
+    }
+
+    /// Batch 1 A4 status 门（P1 blocker 真修）：任一 A4 `status != 0` 即
+    /// Remote，不得输出 value（旧实现只查 0x40，会 false GOOD 输出 I32）。
+    #[test]
+    fn spindle_word_head_status_is_remote() {
+        fn status_slot(func: u32, status: i16, dlen_data: &[u8]) -> GenericSubpacket {
+            GenericSubpacket {
+                control_device: DEV_CNC,
+                function: func,
+                payload: {
+                    let mut p = status.to_be_bytes().to_vec();
+                    p.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                    p.extend_from_slice(&(dlen_data.len() as u16).to_be_bytes());
+                    p.extend_from_slice(dlen_data);
+                    p
+                },
+            }
+        }
+        // 头 A4 status=2（Remote），中间 0x40 正常 672：必须 Remote，不得出值。
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                status_slot(FUNC_SPINDLE_WORD_HEAD, 2, &[0x00, 0x01]),
+                status_slot(
+                    FUNC_SPINDLE_WORD,
+                    0,
+                    &[0x00, 0x00, 0x02, 0xa0, 0x00, 0x0a, 0x00, 0x00],
+                ),
+                status_slot(FUNC_SPINDLE_WORD_HEAD, 0, &[0x00, 0x01]),
+            ]),
+        };
+        let e = decode_spindle_word(&frame).unwrap_err();
+        assert!(
+            matches!(e, WireError::Remote { status: 2, .. }),
+            "头 A4 status=2 必须 Remote，实际：{e:?}"
+        );
+        assert!(!e.is_session_fatal(), "Remote 必须 session 保留");
+        // 尾 A4 status=4：同上。
+        let frame2 = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                status_slot(FUNC_SPINDLE_WORD_HEAD, 0, &[0x00, 0x01]),
+                status_slot(
+                    FUNC_SPINDLE_WORD,
+                    0,
+                    &[0x00, 0x00, 0x02, 0xa0, 0x00, 0x0a, 0x00, 0x00],
+                ),
+                status_slot(FUNC_SPINDLE_WORD_HEAD, 4, &[0x00, 0x01]),
+            ]),
+        };
+        let e2 = decode_spindle_word(&frame2).unwrap_err();
+        assert!(
+            matches!(e2, WireError::Remote { status: 4, .. }),
+            "尾 A4 status=4 必须 Remote，实际：{e2:?}"
+        );
     }
 
     /// Batch 1 wrong command：`0x40` 槽被 `0x25` 替换即 `CommandMismatch`。
@@ -3573,7 +3690,7 @@ mod tests {
             packet_type: PacketType::GENERIC_RESPONSE,
             payload: encode_generic_request(&[head_slot.clone(), wrong_slot, head_slot.clone()]),
         };
-        let e = decode_spindle_word(&frame, SPINDLE_WORD_FUNC_GEAR).unwrap_err();
+        let e = decode_spindle_word(&frame).unwrap_err();
         assert!(matches!(e, WireError::CommandMismatch));
         assert!(e.is_session_fatal());
     }
