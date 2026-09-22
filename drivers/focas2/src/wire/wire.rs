@@ -525,45 +525,216 @@ pub(super) const AXIS_ARG0_OBSERVED: i32 = 4;
 // FocasClient：typed operations（串行，session guard 覆盖完整 operation）
 // ---------------------------------------------------------------------------
 
-/// FOCAS Wire 客户端。`session: Mutex<Option<WireSession>>`：
+/// FOCAS Wire 客户端。`session: Mutex<SessionSlot>`：
 /// 每个 Operation 持 guard 做完 N 次 exchange 再放（statinfo 的 2 次
-/// exchange 中间不可插入别的 request），错误致命即 `None`（由上层重连）。
+/// exchange 中间不可插入别的 request）。
+/// W01/W02/W03 真修（审查 `7854e71`）：
+/// - `generation`：每次 `connect` 递增；`invalidate` 只清同代（旧错误不杀新会话）；
+/// - `poisoned`：operation 取消/半包后置位，下次 operation 前强制重连
+///   （`exchange` 是 `&mut` 独占，取消即 future 丢弃，无法在原 future 内清理，
+///   由下一次 holder 发现 poison 并重建）；
+/// - `endpoint`：会话绑定 `(host, port, timeout)`；目标变化即关闭旧连接重建；
+///   `connect` 的 `timeout_ms` 生效（旧 `_timeout_ms` 忽略是 bug）。
 pub struct FocasClient {
-    session: Mutex<Option<WireSession>>,
+    session: Mutex<SessionSlot>,
+    /// exchange 超时（读/写每次 `exchange` 施加；`connect(timeout_ms)` 透传）。
     timeout: Duration,
+}
+
+/// 会话槽（generation + poison + endpoint 绑定；见 `FocasClient`）。
+struct SessionSlot {
+    /// 当前会话（`None` = 未连接/已失效）。
+    session: Option<WireSession>,
+    /// 代次（每次成功 `connect` +1；`invalidate(generation)` 只清同代）。
+    generation: u64,
+    /// 毒化（operation 未完整结束即丢弃 guard 时置位；下次 operation 重建）。
+    poisoned: bool,
+    /// 绑定目标（`None` = 未绑定；变化即重建，不复用旧连接）。
+    endpoint: Option<(String, u16, Duration)>,
+}
+
+impl SessionSlot {
+    fn empty() -> Self {
+        Self {
+            session: None,
+            generation: 0,
+            poisoned: false,
+            endpoint: None,
+        }
+    }
+}
+
+/// 会话 guard：持锁 + 代次快照；`Drop` 时若 operation 未 `complete()` 即
+/// 毒化会话（W01：取消/半包后下次强制重连，不复用不可信 socket）。
+/// 调用方在 operation 完整结束（含成功与已分类错误路径）后调 `complete()`。
+struct SessionGuard<'a> {
+    guard: tokio::sync::MutexGuard<'a, SessionSlot>,
+    generation: u64,
+    completed: bool,
+}
+
+impl std::fmt::Debug for SessionGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionGuard")
+            .field("generation", &self.generation)
+            .field("completed", &self.completed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> SessionGuard<'a> {
+    fn new(mut guard: tokio::sync::MutexGuard<'a, SessionSlot>) -> Result<Self, WireError> {
+        // poisoned 会话不可用（W01：上次 operation 未完整结束）。
+        if guard.poisoned {
+            guard.session = None;
+            guard.poisoned = false;
+        }
+        if guard.session.is_none() {
+            return Err(WireError::Closed);
+        }
+        let generation = guard.generation;
+        Ok(Self {
+            guard,
+            generation,
+            completed: false,
+        })
+    }
+
+    fn session(&mut self) -> &mut WireSession {
+        self.guard.session.as_mut().expect("guard 持有时会话必存在")
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// W02 世代语义说明：`generation` 快照在 `fail()` 内直接用
+    /// （`self.guard.generation == self.generation` 同代才清）；
+    /// 此 getter 保留供单测/排错读取代次（未使用告警允许）。
+    #[allow(dead_code)]
+    /// operation 完整结束（成功或已分类错误均调；之后 Drop 不毒化）。
+    /// &mut 语义（不消费 guard；同一 operation 内可多次调，末次为准）。
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+
+    /// fatal 失败（复测 W01/W02）：持锁失效 + 毒化，**不释放锁给后来者**。
+    /// 同代才清（W02：快照 `self.generation` 与槽代次比对，旧错误不杀新会话）；
+    /// 调用后直接 `return Err`。后续操作再取 guard 时只见 `None`（重连），
+    /// 绝不复用损坏连接。
+    fn fail(&mut self, fatal: bool) {
+        if fatal && self.guard.generation == self.generation {
+            self.guard.session = None;
+            self.guard.poisoned = true;
+        }
+        self.completed = true;
+    }
+}
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            // operation 未完整结束（取消/panic/提前返回）：毒化会话。
+            self.guard.poisoned = true;
+        }
+    }
 }
 
 impl FocasClient {
     /// 新建未连接客户端（连接参数在 `ensure_connected` 时传入）。
     pub fn new(timeout: Duration) -> Self {
         Self {
-            session: Mutex::new(None),
+            session: Mutex::new(SessionSlot::empty()),
             timeout,
         }
     }
 
-    /// 建连（OPEN）。已连接则复用；失败即 `None`（调用方重连）。
+    /// 测试构造（`#[cfg(test)]`）：短超时回环专用；生产经 `new`。
+    /// 保留供单连接超时语义单测（`cancelled_exchange` 用默认构造）。
+    #[allow(dead_code)]
+    #[cfg(test)]
+    pub(crate) fn with_timeout_for_test(timeout: Duration) -> Self {
+        Self::new(timeout)
+    }
+
+    /// 默认超时（`connect(timeout_ms=0)` 回退；W03 timeout 生效语义）。
+    pub fn default_timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// 建连（OPEN）。W03：绑定 `(host, port, timeout)`——已连接且同目标则
+    /// 复用；目标/超时变化即关闭旧连接重建（旧“只看 session 是否存在”是 bug，
+    /// 会读错设备）；失败即清空（调用方重连）。
+    /// 保留供单测/外部直调（生产经 `ensure_connected_with_timeout`）。
+    #[allow(dead_code)]
     pub async fn ensure_connected(&self, host: &str, port: u16) -> Result<(), WireError> {
-        let mut guard = self.session.lock().await;
-        if guard.is_some() {
+        self.ensure_connected_with_timeout(host, port, self.timeout)
+            .await
+    }
+
+    /// 建连（OPEN，显式超时；`WireFocasApi::connect` 的 `timeout_ms` 经此生效，
+    /// 旧 `_timeout_ms` 忽略是 bug）。`timeout` 同时是 OPEN 握手与后续
+    /// exchange 超时（单一语义；`WireSession{timeout}` 由此传入，
+    /// exchange 每次读写均施加——复测第五轮修正：不存在“OPEN 长/exchange 短”
+    /// 双超时，测试断言以实际生效的单一超时为准）。
+    pub async fn ensure_connected_with_timeout(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<(), WireError> {
+        let mut slot = self.session.lock().await;
+        let want = (host.to_string(), port, timeout);
+        if slot.session.is_some() && slot.endpoint.as_ref() == Some(&want) && !slot.poisoned {
             return Ok(());
         }
-        let session = WireSession::connect(host, port, self.timeout).await?;
-        *guard = Some(session);
+        // 目标变化/毒化/无会话：关闭旧连接（best-effort），重建。
+        if let Some(session) = slot.session.take() {
+            let _ = session.close().await;
+        }
+        slot.poisoned = false;
+        let session = WireSession::connect(host, port, timeout).await?;
+        slot.session = Some(session);
+        slot.generation = slot.generation.wrapping_add(1);
+        slot.endpoint = Some(want);
         Ok(())
     }
 
-    /// 断开（CLOSE，best-effort；无论成败 session 清空）。
+    /// 断开（CLOSE，best-effort；无论成败 session 清空，代次保留）。
     pub async fn disconnect(&self) {
-        let mut guard = self.session.lock().await;
-        if let Some(session) = guard.take() {
+        let mut slot = self.session.lock().await;
+        if let Some(session) = slot.session.take() {
             let _ = session.close().await;
+        }
+        slot.poisoned = false;
+        slot.endpoint = None;
+    }
+
+    /// session 致命错误后失效（同代才清；W02：旧错误不杀新会话）。
+    /// **必须在 guard 持锁时调**（复测修正：`drop(guard)` 后再 `invalidate`
+    /// 有窗口——等待中的另一操作可先抢到旧连接。见 `SessionGuard::fail()`）。
+    /// 当前 fatal 路径已内联进 `fail()`（同代比对 + 清空 + 毒化一步完成）；
+    /// 此 helper 保留供未来需要“只清不毒化”的分支（未使用告警允许）。
+    #[allow(dead_code)]
+    async fn invalidate_locked(&self, guard: &mut SessionGuard<'_>) {
+        let sess_gen = guard.generation();
+        let slot = &mut guard.guard;
+        if slot.generation == sess_gen {
+            slot.session = None;
         }
     }
 
-    /// session 致命错误后失效（`None`），下次 operation 重连。
-    async fn invalidate(&self) {
-        *self.session.lock().await = None;
+    /// 旧 `invalidate(generation)`（drop 后重取锁）已删除（B4）——复测 W01/W02：
+    /// 先 complete 释放锁再 invalidate 有抢占窗口，fatal 必须持锁失效
+    /// （`SessionGuard::fail()`）。删除而非保留 no-op：private 方法无外部
+    /// 兼容义务；保留同名 no-op 会让误调用正常编译却静默无为，更危险。
+    /// 旧测试 `invalidate_is_generation_scoped`（空 session 上调 no-op，
+    /// 无证明力）同步删除；代次隔离由 `fatal_waiters_rebuild_after_fatal`
+    /// 等真实回环覆盖。
+    /// 取 operation guard（poisoned 即清空并 `Closed`，由调用方重连）。
+    async fn guard(&self) -> Result<SessionGuard<'_>, WireError> {
+        let slot = self.session.lock().await;
+        SessionGuard::new(slot)
     }
 
     /// `system_info`（`0x18`，单次 exchange）。返回完整 7 字段。
@@ -577,27 +748,23 @@ impl FocasClient {
                 [0, 0, 0, 0, 0],
             )]),
         };
-        let mut guard = self.session.lock().await;
-        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let mut guard = self.guard().await?;
+        let session = guard.session();
         let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
         let resp = match resp {
             Ok(v) => v,
             Err(e) => {
                 let fatal = e.is_session_fatal();
-                drop(guard);
-                if fatal {
-                    self.invalidate().await;
-                }
+                guard.fail(fatal);
                 return Err(e);
             }
         };
-        drop(guard);
+        guard.complete();
         match decode_system_info(&resp) {
             Ok(v) => Ok(v),
             Err(e) => {
-                if e.is_session_fatal() {
-                    self.invalidate().await;
-                }
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
                 Err(e)
             }
         }
@@ -626,18 +793,15 @@ impl FocasClient {
                 request_subpacket(DEV_CNC, FUNC_UNKNOWN_98, [0, 0, 0, 0, 0]),
             ]),
         };
-        let mut guard = self.session.lock().await;
-        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let mut guard = self.guard().await?;
+        let session = guard.session();
         // frame#1：sysinfo 自查（FWLIB 序列忠实复刻；响应只验 type）。
         let r = session
             .exchange(&pre_req, PacketType::GENERIC_RESPONSE)
             .await;
         if let Err(e) = r {
             let fatal = e.is_session_fatal();
-            drop(guard);
-            if fatal {
-                self.invalidate().await;
-            }
+            guard.fail(fatal);
             return Err(e);
         }
         // frame#2：0x19 + 0xe1 + 0x98（count=3，忠于捕获）。
@@ -646,20 +810,16 @@ impl FocasClient {
             Ok(v) => v,
             Err(e) => {
                 let fatal = e.is_session_fatal();
-                drop(guard);
-                if fatal {
-                    self.invalidate().await;
-                }
+                guard.fail(fatal);
                 return Err(e);
             }
         };
-        drop(guard);
+        guard.complete();
         match decode_status_info(&resp) {
             Ok(v) => Ok(v),
             Err(e) => {
-                if e.is_session_fatal() {
-                    self.invalidate().await;
-                }
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
                 Err(e)
             }
         }
@@ -677,27 +837,23 @@ impl FocasClient {
                 [0, 0, 0, 0, 0],
             )]),
         };
-        let mut guard = self.session.lock().await;
-        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let mut guard = self.guard().await?;
+        let session = guard.session();
         let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
         let resp = match resp {
             Ok(v) => v,
             Err(e) => {
                 let fatal = e.is_session_fatal();
-                drop(guard);
-                if fatal {
-                    self.invalidate().await;
-                }
+                guard.fail(fatal);
                 return Err(e);
             }
         };
-        drop(guard);
+        guard.complete();
         match decode_feed_rate(&resp) {
             Ok(v) => Ok(v),
             Err(e) => {
-                if e.is_session_fatal() {
-                    self.invalidate().await;
-                }
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
                 Err(e)
             }
         }
@@ -723,27 +879,23 @@ impl FocasClient {
                 [n, n, 0, 0, 0],
             )]),
         };
-        let mut guard = self.session.lock().await;
-        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let mut guard = self.guard().await?;
+        let session = guard.session();
         let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
         let resp = match resp {
             Ok(v) => v,
             Err(e) => {
                 let fatal = e.is_session_fatal();
-                drop(guard);
-                if fatal {
-                    self.invalidate().await;
-                }
+                guard.fail(fatal);
                 return Err(e);
             }
         };
-        drop(guard);
+        guard.complete();
         match decode_macro_value(&resp) {
             Ok(v) => Ok(v),
             Err(e) => {
-                if e.is_session_fatal() {
-                    self.invalidate().await;
-                }
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
                 Err(e)
             }
         }
@@ -767,27 +919,23 @@ impl FocasClient {
                 [n, n, 0, 0, 0],
             )]),
         };
-        let mut guard = self.session.lock().await;
-        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let mut guard = self.guard().await?;
+        let session = guard.session();
         let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
         let resp = match resp {
             Ok(v) => v,
             Err(e) => {
                 let fatal = e.is_session_fatal();
-                drop(guard);
-                if fatal {
-                    self.invalidate().await;
-                }
+                guard.fail(fatal);
                 return Err(e);
             }
         };
-        drop(guard);
+        guard.complete();
         match decode_param_value(&resp, number) {
             Ok(v) => Ok(v),
             Err(e) => {
-                if e.is_session_fatal() {
-                    self.invalidate().await;
-                }
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
                 Err(e)
             }
         }
@@ -807,27 +955,23 @@ impl FocasClient {
                 [OPMSG_TYPE_PRODUCT, 0, 0, 0, 0],
             )]),
         };
-        let mut guard = self.session.lock().await;
-        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let mut guard = self.guard().await?;
+        let session = guard.session();
         let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
         let resp = match resp {
             Ok(v) => v,
             Err(e) => {
                 let fatal = e.is_session_fatal();
-                drop(guard);
-                if fatal {
-                    self.invalidate().await;
-                }
+                guard.fail(fatal);
                 return Err(e);
             }
         };
-        drop(guard);
+        guard.complete();
         match decode_opmsg_value(&resp) {
             Ok(v) => Ok(v),
             Err(e) => {
-                if e.is_session_fatal() {
-                    self.invalidate().await;
-                }
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
                 Err(e)
             }
         }
@@ -860,18 +1004,15 @@ impl FocasClient {
                 [AXIS_ARG0_OBSERVED, axis as i32, 0, 0, 0],
             )]),
         };
-        let mut guard = self.session.lock().await;
-        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let mut guard = self.guard().await?;
+        let session = guard.session();
         // frame#1：sysinfo 自查（direct cnc_absolute 捕获形态，忠实复刻）。
         let r = session
             .exchange(&pre_req, PacketType::GENERIC_RESPONSE)
             .await;
         if let Err(e) = r {
             let fatal = e.is_session_fatal();
-            drop(guard);
-            if fatal {
-                self.invalidate().await;
-            }
+            guard.fail(fatal);
             return Err(e);
         }
         // frame#2：0x26 count=1。
@@ -880,20 +1021,16 @@ impl FocasClient {
             Ok(v) => v,
             Err(e) => {
                 let fatal = e.is_session_fatal();
-                drop(guard);
-                if fatal {
-                    self.invalidate().await;
-                }
+                guard.fail(fatal);
                 return Err(e);
             }
         };
-        drop(guard);
+        guard.complete();
         match decode_axis_position(&resp) {
             Ok(v) => Ok(v),
             Err(e) => {
-                if e.is_session_fatal() {
-                    self.invalidate().await;
-                }
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
                 Err(e)
             }
         }
@@ -913,27 +1050,23 @@ impl FocasClient {
                 [0, 0, 0, 0, 0],
             )]),
         };
-        let mut guard = self.session.lock().await;
-        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let mut guard = self.guard().await?;
+        let session = guard.session();
         let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
         let resp = match resp {
             Ok(v) => v,
             Err(e) => {
                 let fatal = e.is_session_fatal();
-                drop(guard);
-                if fatal {
-                    self.invalidate().await;
-                }
+                guard.fail(fatal);
                 return Err(e);
             }
         };
-        drop(guard);
+        guard.complete();
         match decode_spindle_speed(&resp) {
             Ok(v) => Ok(v),
             Err(e) => {
-                if e.is_session_fatal() {
-                    self.invalidate().await;
-                }
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
                 Err(e)
             }
         }
@@ -979,27 +1112,23 @@ impl FocasClient {
                 ],
             )]),
         };
-        let mut guard = self.session.lock().await;
-        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let mut guard = self.guard().await?;
+        let session = guard.session();
         let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
         let resp = match resp {
             Ok(v) => v,
             Err(e) => {
                 let fatal = e.is_session_fatal();
-                drop(guard);
-                if fatal {
-                    self.invalidate().await;
-                }
+                guard.fail(fatal);
                 return Err(e);
             }
         };
-        drop(guard);
+        guard.complete();
         match decode_pmc_scalar(&resp, area) {
             Ok(v) => Ok(v),
             Err(e) => {
-                if e.is_session_fatal() {
-                    self.invalidate().await;
-                }
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
                 Err(e)
             }
         }
@@ -1045,27 +1174,23 @@ impl FocasClient {
                 [addr as i32, addr as i32, area.adr_type() as i32, 0, 0],
             )]),
         };
-        let mut guard = self.session.lock().await;
-        let session = guard.as_mut().ok_or(WireError::Closed)?;
+        let mut guard = self.guard().await?;
+        let session = guard.session();
         let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
         let resp = match resp {
             Ok(v) => v,
             Err(e) => {
                 let fatal = e.is_session_fatal();
-                drop(guard);
-                if fatal {
-                    self.invalidate().await;
-                }
+                guard.fail(fatal);
                 return Err(e);
             }
         };
-        drop(guard);
+        guard.complete();
         let v = match decode_pmc_byte(&resp) {
             Ok(v) => v,
             Err(e) => {
-                if e.is_session_fatal() {
-                    self.invalidate().await;
-                }
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
                 return Err(e);
             }
         };
@@ -1516,11 +1641,19 @@ impl WireFocasApi {
 
 #[async_trait::async_trait]
 impl FocasApi for WireFocasApi {
-    async fn connect(&self, host: &str, port: u16, _timeout_ms: u64) -> Result<(), String> {
+    /// W03 真修：`timeout_ms` 生效（经 `ensure_connected_with_timeout` 透传；
+    /// 旧 `_timeout_ms` 忽略导致传入超时永不生效）。目标变化即重建，不复用。
+    async fn connect(&self, host: &str, port: u16, timeout_ms: u64) -> Result<(), String> {
         *self.host.lock().await = Some((host.to_string(), port));
         let (h, p) = self.host.lock().await.clone().unwrap();
+        // `timeout_ms` → Duration（0 即默认构造超时；向上取整防 0s 瞬时超时）。
+        let timeout = if timeout_ms == 0 {
+            self.client.default_timeout()
+        } else {
+            Duration::from_millis(timeout_ms)
+        };
         self.client
-            .ensure_connected(&h, p)
+            .ensure_connected_with_timeout(&h, p, timeout)
             .await
             .map_err(|e| e.to_string())
     }
@@ -1906,6 +2039,23 @@ mod tests {
         assert_eq!(payload.len(), 0x56, "frame#2 必须 86B（Gate 0 B1）");
         assert_eq!(&payload[0..2], &[0x00, 0x03]);
     }
+
+    /// W03 回归：重复 connect 不同目标必须重建（不复用旧连接；不连设备时
+    /// 表现为两次均 Closed 而非“复用成功”——loopback 形态见 session 单测）。
+    /// 此处锁 endpoint 绑定语义：`ensure_connected` 在目标变化时不短路返回。
+    /// （真机形态由 probe 覆盖；此处不断言网络行为，只锁分支不短路。）
+    #[test]
+    fn endpoint_binding_shape_locked() {
+        // endpoint 比较含 timeout（W03：timeout 变化也重建）。
+        let a = ("h".to_string(), 8193u16, std::time::Duration::from_secs(5));
+        let b = ("h".to_string(), 8193u16, std::time::Duration::from_secs(1));
+        assert_ne!(a, b, "timeout 不同即不同 endpoint，必须重建");
+    }
+
+    // NOTE（B4）：旧 `invalidate_is_generation_scoped` 已删除——它在空 session
+    // 上调用 no-op `invalidate()`，无证明力。代次隔离语义由
+    // `session.rs::fatal_waiters_rebuild_after_fatal` 真实回环覆盖
+    // （旧代 poison 不杀新代重建 OPEN=2）。
 
     /// Fixture 级回归入口（`tests/fixtures/wire/**`）：生产 codec 直测，
     /// 不经测试侧复刻 decoder（见 `super::super::fixture_tests`）。

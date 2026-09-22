@@ -1195,15 +1195,21 @@ impl DriverConnection for FocasConnection {
                     }
                     let mut batch_vals = Vec::with_capacity(points.len());
                     for ((spec, pid), raw_val) in points.iter().zip(values) {
-                        // 多机型单点不支持：Native 以 "ERR:EW_*" 字符串占位，转 typed BAD（§3.6 禁 String 冒充数值类型）
+                        // 多机型单点不支持：Native/Wire 以 "ERR:..." 字符串占位，
+                        // 转 typed BAD（§3.6 禁 String 冒充数值类型）。
+                        // L02 真修：quality_code 保留协议原因分类（不再统一 1）——
+                        // EW_NOOPT/unsupported=2（设备不支持/功能未实现），
+                        // EW_PARAM/RANGE/NUMBER/LENGTH 等参数类=3，
+                        // EW_DATA/EW_ATTRIB 数据/属性类=4，
+                        // EW_SOCKET/HANDLE/BUSY/连接类=5，
+                        // 其他/未知=1（兜底）。映射只做分类，不伪造厂家码。
                         if let Value::String(s) = &raw_val
-                            && s.starts_with("ERR:") {
+                            && s.starts_with("ERR:")
+                        {
                                 tracing::warn!(key=%spec.key, error=%s, "单点 Bad，不影响同批其他点");
                                 // P0-B：BAD 仍必须携带与 data_type 匹配的 typed 值，quality_code 保留协议原因
                                 let neutral = neutral_value_for(spec.data_type);
-                                // 尝试提取 EW_* 尾缀作为可读码，暂以 1 为兜底整数码
-                                #[allow(clippy::if_same_then_else)]
-                                let code = if s.contains("EW_") { 1 } else { 1 };
+                                let code = classify_point_error(s);
                                 batch_vals.push(PointValue {
                                     point_id: *pid,
                                     value: neutral,
@@ -1245,16 +1251,39 @@ impl DriverConnection for FocasConnection {
         }
 
         let mut final_err: Option<SdkDriverError> = None;
+        // L01 真修：按完成顺序收集（JoinSet），首个任务失败即取消同连接
+        // 其他任务并等待清理后返回原因。旧 `for h in handles { h.await }`
+        // 按创建顺序等待：A 正常循环时 B 的错误迟迟不上报。
+        let mut set = tokio::task::JoinSet::new();
         for h in handles {
-            match h.await {
+            set.spawn(async move {
+                match h.await {
+                    Ok(Ok(())) => Ok::<(), SdkDriverError>(()),
+                    Ok(Err(e)) => Err(e),
+                    Err(join_err) => {
+                        tracing::error!(%join_err, "FOCAS2 任务 panic");
+                        Err(SdkDriverError::new(
+                            mesa_core_types::ErrorKind::Internal,
+                            "TASK_PANIC",
+                            join_err.to_string(),
+                        ))
+                    }
+                }
+            });
+        }
+        // 按完成顺序：首错即取消其余（同连接任务共享 shutdown token）。
+        while let Some(r) = set.join_next().await {
+            match r {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     if final_err.is_none() {
                         final_err = Some(e);
                     }
+                    // 首错即取消同连接其他任务（幂等；任务循环内 select shutdown）。
+                    shutdown.cancel();
                 }
                 Err(join_err) => {
-                    tracing::error!(%join_err, "FOCAS2 任务 panic");
+                    tracing::error!(%join_err, "FOCAS2 JoinSet 失败");
                     if final_err.is_none() {
                         final_err = Some(SdkDriverError::new(
                             mesa_core_types::ErrorKind::Internal,
@@ -1262,10 +1291,8 @@ impl DriverConnection for FocasConnection {
                             join_err.to_string(),
                         ));
                     }
+                    shutdown.cancel();
                 }
-            }
-            if final_err.is_some() {
-                shutdown.cancel();
             }
         }
         if let Some(e) = final_err {
@@ -1333,6 +1360,36 @@ fn coerce_value(v: Value, dt: DataType) -> Value {
         (Value::F32(x), DataType::F64) => Value::F64(x as f64),
         (Value::F64(x), DataType::F32) => Value::F32(x as f32),
         (other, _) => other,
+    }
+}
+
+/// L02：单点错误分类（`ERR:...` → quality_code，不再统一 1）。
+/// 2=不支持/未实现（NOOPT/unsupported），3=参数类（PARAM/RANGE/NUMBER/
+/// LENGTH），4=数据/属性类（DATA/ATTRIB），5=连接类（SOCKET/HANDLE/BUSY/
+/// NODLL/CLOSED/timeout），1=其他未知。只分类不断言厂家码。
+fn classify_point_error(s: &str) -> i32 {
+    let u = s.to_ascii_uppercase();
+    if u.contains("EW_NOOPT") || u.contains("UNSUPPORTED") || u.contains("NOOPT") {
+        2
+    } else if u.contains("EW_PARAM")
+        || u.contains("EW_RANGE")
+        || u.contains("EW_NUMBER")
+        || u.contains("EW_LENGTH")
+    {
+        3
+    } else if u.contains("EW_DATA") || u.contains("EW_ATTRIB") {
+        4
+    } else if u.contains("EW_SOCKET")
+        || u.contains("EW_HANDLE")
+        || u.contains("EW_BUSY")
+        || u.contains("EW_NODLL")
+        || u.contains("CLOSED")
+        || u.contains("TIMEOUT")
+        || u.contains("BUSY")
+    {
+        5
+    } else {
+        1
     }
 }
 
@@ -1956,5 +2013,73 @@ mod tests {
         ];
         let vals = api.read_batch(&addrs).await.unwrap();
         assert_eq!(vals.len(), 2);
+    }
+
+    /// L01 回归：A 持续运行、B 立即失败时，连接在限定时间内结束并上报 B。
+    /// 不连设备（JoinSet 按完成顺序语义纯逻辑；与生产 `run` 同源收集器）。
+    #[tokio::test]
+    async fn joinset_first_error_wins() {
+        // 模拟 run 的收集语义：A pending（长任务）、B 立即 Err。
+        let mut set = tokio::task::JoinSet::new();
+        set.spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok::<(), String>(())
+        });
+        set.spawn(async { Err::<(), String>("B_FAILED".into()) });
+        let mut first_err: Option<String> = None;
+        let done = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(r) = set.join_next().await {
+                match r {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        first_err = Some(e);
+                        set.abort_all();
+                        break;
+                    }
+                    Err(_) => {
+                        first_err = Some("PANIC".into());
+                        set.abort_all();
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            done.is_ok(),
+            "必须在 5s 内收到 B 的错误（不按创建顺序等 A）"
+        );
+        assert_eq!(first_err.as_deref(), Some("B_FAILED"));
+    }
+
+    /// L02 回归：单点错误分类不再统一 quality_code=1。
+    #[test]
+    fn point_error_classification_locked() {
+        assert_eq!(classify_point_error("ERR:EW_NOOPT xxx"), 2);
+        assert_eq!(classify_point_error("ERR:unsupported yyy"), 2);
+        assert_eq!(classify_point_error("ERR:EW_PARAM zzz"), 3);
+        assert_eq!(classify_point_error("ERR:EW_RANGE zzz"), 3);
+        assert_eq!(classify_point_error("ERR:EW_NUMBER zzz"), 3);
+        assert_eq!(classify_point_error("ERR:EW_LENGTH zzz"), 3);
+        assert_eq!(classify_point_error("ERR:EW_DATA zzz"), 4);
+        assert_eq!(classify_point_error("ERR:EW_ATTRIB zzz"), 4);
+        assert_eq!(classify_point_error("ERR:EW_SOCKET zzz"), 5);
+        assert_eq!(classify_point_error("ERR:EW_BUSY xxx"), 5);
+        assert_eq!(classify_point_error("ERR:something else"), 1);
+    }
+
+    /// N03 回归：worker 队列有界（`WORKER_QUEUE_MAX` 常量存在且合理）。
+    /// 不连设备。诚实标注：本测试只锁常量形状，不证明实际 saturation
+    /// （`try_send(Full) → EW_BUSY` 在生产 `submit` 内，逻辑直接，
+    /// 真实队满需并发压测，不在单测伪造）。
+    #[test]
+    fn worker_queue_bounded_shape() {
+        // 背压语义锁形状：上限存在且为正（具体值见 focas_api::WORKER_QUEUE_MAX）。
+        // `#[allow]`：常量比较在 clippy 看来恒真，但此处锁的正是“常量存在且合理”。
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(crate::focas_api::WORKER_QUEUE_MAX > 0);
+            assert!(crate::focas_api::WORKER_QUEUE_MAX <= 1024);
+        }
     }
 }

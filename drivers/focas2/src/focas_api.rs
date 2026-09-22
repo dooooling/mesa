@@ -252,17 +252,26 @@ enum WorkerOp {
 
 /// worker 句柄（`NativeFocasApi` 的唯一状态；Clone 共享同一 worker）。
 /// 确定生命周期（`WorkerHandle::drop`）：最后一个 `Arc` 释放时，
-/// 关 sender → worker 排空 → free handle exactly once → 退出 → join。
-/// `Drop` 返回即 free 完成（`join` 在 `Drop` 内同步等待；见下注释）。
+/// 关 sender → worker 消费完已入队 op 后 free handle exactly once → 退出 →
+/// join。`Drop` 返回即 free 完成（`join` 在 `Drop` 内同步等待；见下注释）。
+/// N03 真修：有界队列（`WORKER_QUEUE_MAX` 背压）；`submit` 在队满时直接
+/// `EW_BUSY`，不无界积压。关闭后 backlog 上界见 `shutdown_blocking` 注释
+/// （已入队仍 drain，不止等一个 FFI）。
 struct WorkerHandle {
-    sender: Mutex<Option<tokio::sync::mpsc::UnboundedSender<WorkerOp>>>,
+    sender: Mutex<Option<tokio::sync::mpsc::Sender<WorkerOp>>>,
     /// worker OS 线程（`None` = 已 join；`Mutex` 保并发 take，幂等）。
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+/// Native worker 请求队列上限（N03 背压；PR52 无界是 bug）。
+/// FOCAS 本身串行 + 采集周期远大于单次 FFI，16 足够；超限即 `EW_BUSY`
+///（调用方按连接错误重连/丢弃本批，不在本层排队放大内存）。
+/// `pub(crate)` 供 lib.rs 回归锁形状（值本身是工程选择，不是协议常量）。
+pub(crate) const WORKER_QUEUE_MAX: usize = 16;
+
 impl WorkerHandle {
     fn new() -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WorkerOp>();
+        let (tx, rx) = tokio::sync::mpsc::channel::<WorkerOp>(WORKER_QUEUE_MAX);
         let join = std::thread::Builder::new()
             .name("focas-native-worker".into())
             .spawn(move || NativeWorker::run(rx))
@@ -273,8 +282,13 @@ impl WorkerHandle {
         }
     }
 
-    /// 同步关闭 worker 并 join：关闭 sender（worker 消费完剩余 op 后
-    /// free handle 并退出）→ join 等待完成。幂等（重复调即返回）。
+    /// 同步关闭 worker 并 join：关闭 sender（worker 退出；N03 有界语义）→
+    /// join 等待完成。幂等（重复调即返回）。
+    /// 关闭语义（N03 注释修正）：sender 全部 drop 后，tokio bounded `mpsc`
+    /// 的 Receiver 仍会把**已缓存在 channel 中的消息消费完**，
+    /// `blocking_recv()` 才返回 `None`；因此最坏等待不是“单个 FFI timeout”，
+    /// 而是“当前 operation + 最多 `WORKER_QUEUE_MAX` 个已入队 operation”
+    /// 依次执行——仍有界（禁止无限积压的目标已实现），但不是单 FFI 上界。
     /// `Drop` 与显式 `shutdown_blocking` 共用此路径。
     fn shutdown_blocking(&self) {
         // 先关 sender（take 即关闭通道；worker 侧 blocking_recv → None）。
@@ -286,13 +300,21 @@ impl WorkerHandle {
     }
 
     /// 下发 op；worker 已退出即 `Err`（调用方转连接错误，由上层重连）。
+    /// N03 背压：队列满即 `EW_BUSY`（`try_send`，不阻塞 async 调用方，
+    /// 不无界积压；FOCAS 串行语义下调用方丢弃本批即可）。
     fn submit(&self, op: WorkerOp) -> Result<(), String> {
         let guard = self.sender.lock().unwrap();
         let tx = guard
             .as_ref()
             .ok_or_else(|| "EW_NODLL native worker 已退出".to_string())?;
-        tx.send(op)
-            .map_err(|_| "EW_NODLL native worker 已退出".to_string())
+        tx.try_send(op).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                "EW_BUSY native worker 队列已满".to_string()
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                "EW_NODLL native worker 已退出".to_string()
+            }
+        })
     }
 
     /// 同步等待 oneshot（async 侧用；worker panic/退出即连接错误）。
@@ -317,15 +339,15 @@ struct NativeWorker {
 }
 
 impl NativeWorker {
-    fn run(rx: tokio::sync::mpsc::UnboundedReceiver<WorkerOp>) {
+    /// N03：有界 `Receiver`（与 `WORKER_QUEUE_MAX` 配对；`blocking_recv`
+    /// 在 sender 关闭后返回 `None` 即退出，不无限排空——未送达的 op
+    /// 直接丢弃，调用方已收 `EW_BUSY`/连接错误）。
+    fn run(rx: tokio::sync::mpsc::Receiver<WorkerOp>) {
         let mut me = Self {
             lib: std::sync::OnceLock::new(),
             handle: None,
         };
-        // `UnboundedReceiver` 不是 Sync，但 worker 是唯一消费方；
-        // 用 blocking_recv 需要 tokio runtime 上下文——worker 是裸 OS 线程，
-        // 因此用 `blocking_lock` 不可用，这里用标准库 channel 桥接：
-        // 实际上 mpsc::UnboundedReceiver::recv 需要 async；裸线程用
+        // `Receiver` 不是 Sync，但 worker 是唯一消费方；裸 OS 线程用
         // `rx.blocking_recv()`（tokio 特性：裸线程阻塞收）。
         let mut rx = rx;
         while let Some(op) = rx.blocking_recv() {
