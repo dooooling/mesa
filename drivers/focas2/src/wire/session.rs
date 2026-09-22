@@ -298,4 +298,218 @@ mod tests {
         assert!(matches!(err, WireError::Timeout));
         h.abort();
     }
+
+    /// W01 regression (retest fix): true external cancel + next request refuses reuse.
+    /// Operation aborted mid-half-packet, then next operation on the same
+    /// FocasClient must rebuild (OPEN count 2). Internal timeout alone
+    /// does not prove cancel safety (retest item 4).
+    #[tokio::test]
+    async fn cancelled_exchange_must_not_be_reused() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let opens = Arc::new(AtomicUsize::new(0));
+        let opens_srv = Arc::clone(&opens);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let h = tokio::spawn(async move {
+            // Accept at most 2 connections (initial + rebuild after cancel).
+            for _ in 0..2 {
+                let accept_r = listener.accept().await;
+                let (mut sock, _) = match accept_r {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                let mut open_req = vec![0u8; 12];
+                if sock.read_exact(&mut open_req).await.is_err() {
+                    break;
+                }
+                sock.write_all(&fake_open_response()).await.unwrap();
+                opens_srv.fetch_add(1, Ordering::SeqCst);
+                // First connection: half header then stall (cancel trigger).
+                let mut req = vec![0u8; 40];
+                if sock.read_exact(&mut req).await.is_err() {
+                    break;
+                }
+                sock.write_all(&[0xA0, 0xA0, 0xA0]).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        let host = addr.split(':').next().unwrap();
+        let port: u16 = addr.split(':').nth(1).unwrap().parse().unwrap();
+        let client = super::super::FocasClient::new(Duration::from_secs(5));
+        client.ensure_connected(host, port).await.unwrap();
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        // First operation hangs on half packet: abort from outside.
+        // FocasClient is not Clone; wrap in Arc like production WireFocasApi.
+        let client = Arc::new(client);
+        let c2 = Arc::clone(&client);
+        let op = tokio::spawn(async move { c2.system_info().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        op.abort();
+        let _ = op.await;
+        // Next operation must not reuse old socket: poisoned guard clears on
+        // next acquire, caller reconnects, OPEN count becomes 2.
+        client.ensure_connected(host, port).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            2,
+            "must rebuild after cancel, no reuse of half-packet session"
+        );
+        h.abort();
+    }
+
+    /// W01/W02 调度回归（复测第三轮：真实回环——首个 fatal 持锁 poison，
+    /// 第二个等待者不得抢旧连接）。
+    ///
+    /// 本测试只验未连接调度形状（两并发均 Closed），不声称覆盖 fatal 窗口；
+    /// 真正的并发 fatal 窗口由下 `fatal_waiters_rebuild_after_fatal` 覆盖。
+    #[tokio::test]
+    async fn fatal_waiters_do_not_reuse_damaged_session() {
+        let client = super::super::FocasClient::new(Duration::from_millis(10));
+        let (r1, r2) = tokio::join!(client.system_info(), client.system_info());
+        assert!(r1.is_err() && r2.is_err());
+    }
+
+    /// W01/W02 真实并发回环（复测第五轮验收形状；单一超时语义）：
+    /// 1. 服务端确认首个 GENERIC 已收到（`got_first`），回半包并挂起；
+    ///    此后服务端进入**持续读取循环**：若旧实现让第二个复用损坏连接并发包，
+    ///    计数器会变为 2（复测第五轮修正：旧代码读完首包即 sleep，不再计数，
+    ///    `generics == 1` 无证明力——此处改为循环读取+计数）。
+    /// 2. 首个 operation 尚未结束时启动第二个，确保它正在等待会话锁；
+    /// 3. 首个因 exchange 超时 fatal（持锁 poison，不释放锁给后来者）；
+    /// 4. 断言第二个返回 `Closed`（只见 `None`），且旧连接 GENERIC 计数仍为 1；
+    /// 5. 显式重建（新 listener 连接），确认一次正常读取成功。
+    ///
+    /// 旧实现（先 complete 释放锁再 invalidate）下第二个会抢到旧连接并发出
+    /// 第二个 GENERIC（`generic_count == 2`），本测试锁该窗口已关闭。
+    /// 超时说明（单一语义，复测第五轮修正）：client 超时 `T=1500ms` 同时是
+    /// OPEN 握手与 exchange 超时（`WireSession{timeout}` 由建连超时传入）；
+    /// 回环 OPEN 远快于 T，首个在半包读上等待整整 T 后 fatal——测试约运行
+    /// T（~1.5s）而非 200ms，不断言“200ms 内失败”，只断言窗口语义。
+    #[tokio::test]
+    async fn fatal_waiters_rebuild_after_fatal() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+        let opens = Arc::new(AtomicUsize::new(0));
+        let generics = Arc::new(AtomicUsize::new(0));
+        let opens_srv = Arc::clone(&opens);
+        let generics_srv = Arc::clone(&generics);
+        let got_first = Arc::new(Notify::new());
+        let got_first_srv = Arc::clone(&got_first);
+        // 连接1 listener：OPEN → 首个 GENERIC → 半包后进入持续读取循环。
+        // 循环读取是关键：旧实现复用损坏连接发第二个 GENERIC 时计数变 2；
+        // 若读完首包即 sleep，计数恒 1，无证明力（复测第五轮第 2 项）。
+        let listener1 = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr1 = listener1.local_addr().unwrap().to_string();
+        let h1 = tokio::spawn(async move {
+            let (mut sock, _) = listener1.accept().await.unwrap();
+            let mut open_req = vec![0u8; 12];
+            sock.read_exact(&mut open_req).await.unwrap();
+            sock.write_all(&fake_open_response()).await.unwrap();
+            opens_srv.fetch_add(1, Ordering::SeqCst);
+            // 首个 GENERIC：确认收到，回半包。
+            let mut req = vec![0u8; 40];
+            sock.read_exact(&mut req).await.unwrap();
+            generics_srv.fetch_add(1, Ordering::SeqCst);
+            got_first_srv.notify_one();
+            sock.write_all(&[0xA0, 0xA0, 0xA0]).await.unwrap();
+            // 持续读取循环：旧连接上任何后续字节（第二个 GENERIC 头 40B）
+            // 都会被计数——旧实现此处计数变 2，新实现保持 1 后超时退出。
+            loop {
+                let mut more = vec![0u8; 40];
+                let got =
+                    tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut more)).await;
+                match got {
+                    Ok(Ok(_)) => {
+                        generics_srv.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => break,
+                }
+            }
+        });
+        let host1 = addr1.split(':').next().unwrap();
+        let port1: u16 = addr1.split(':').nth(1).unwrap().parse().unwrap();
+        // 单一超时 T=1500ms（OPEN 与 exchange 同值；回环 OPEN 远快于 T）。
+        let client = super::super::FocasClient::new(Duration::from_millis(1500));
+        client
+            .ensure_connected_with_timeout(host1, port1, Duration::from_millis(1500))
+            .await
+            .unwrap();
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        // 首个 operation（持锁 exchange，半包处挂起→超时 fatal）。
+        let client = Arc::new(client);
+        let c1 = Arc::clone(&client);
+        let first = tokio::spawn(async move { c1.system_info().await });
+        // 等服务端确认首个 GENERIC 已收到（首个已持锁进入 exchange）。
+        tokio::time::timeout(Duration::from_secs(5), got_first.notified())
+            .await
+            .expect("服务端必须收到首个 GENERIC");
+        // 再启动第二个：此时首个仍挂起（T=1500ms 超时未到），第二个阻塞在 guard()。
+        let c2 = Arc::clone(&client);
+        let waiter_started = Arc::new(Notify::new());
+        let waiter_started_srv = Arc::clone(&waiter_started);
+        let second = tokio::spawn(async move {
+            waiter_started_srv.notify_one();
+            c2.system_info().await
+        });
+        tokio::time::timeout(Duration::from_secs(5), waiter_started.notified())
+            .await
+            .expect("第二个必须已启动");
+        // 给第二个留足时间阻塞在会话锁上（首个超时 T=1500ms，第二个此时必等待）。
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // 首个超时 fatal（持锁 poison，约 T 后）；第二个随后只见 None → Closed。
+        let r1 = first.await.expect("首个 JoinHandle 不 panic");
+        assert!(r1.is_err(), "首个半包必须失败");
+        let r2 = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("第二个必须在首个失败后及时返回")
+            .expect("第二个 JoinHandle 不 panic");
+        // 关键断言：第二个是 Closed（poison 后只见 None），不是复用旧连接的
+        // 超时/成功；且旧连接 GENERIC 计数仍为 1（服务端持续读取循环已验证
+        // 无第二个 40B 请求；旧实现此处计数为 2）。
+        assert!(
+            matches!(r2, Err(super::super::WireError::Closed)),
+            "第二个必须 Closed（poison 后只见 None），实际：{r2:?}"
+        );
+        // 给服务端循环留时间消费任何迟到字节（若旧实现复用，40B 必达）。
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            generics.load(Ordering::SeqCst),
+            1,
+            "旧连接不得收到第二个 GENERIC（旧实现此处为 2）"
+        );
+        h1.abort();
+        // 显式重建：新 listener + 正常 sysinfo 响应，确认一次读取成功。
+        let listener2 = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr2 = listener2.local_addr().unwrap().to_string();
+        let h2 = tokio::spawn(async move {
+            let (mut sock, _) = listener2.accept().await.unwrap();
+            let mut open_req = vec![0u8; 12];
+            sock.read_exact(&mut open_req).await.unwrap();
+            sock.write_all(&fake_open_response()).await.unwrap();
+            // 正常 sysinfo 响应：真机 sysinfo_response.bin 46B 全帧逐字节
+            //（不手造 framing；与 fixture_tests::sysinfo_decodes 同源）。
+            let mut req = vec![0u8; 40];
+            sock.read_exact(&mut req).await.unwrap();
+            let frame: &[u8] = &[
+                0xA0, 0xA0, 0xA0, 0xA0, 0x00, 0x03, 0x21, 0x02, 0x00, 0x24, 0x00, 0x01, 0x00, 0x22,
+                0x00, 0x01, 0x00, 0x01, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12,
+                0x02, 0x02, 0x00, 0x20, 0x33, 0x30, 0x20, 0x4D, 0x47, 0x33, 0x31, 0x5A, 0x31, 0x30,
+                0x2E, 0x30, 0x30, 0x33,
+            ];
+            sock.write_all(frame).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let host2 = addr2.split(':').next().unwrap();
+        let port2: u16 = addr2.split(':').nth(1).unwrap().parse().unwrap();
+        client
+            .ensure_connected_with_timeout(host2, port2, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let ok = client.system_info().await.expect("重建后必须读取成功");
+        assert_eq!(ok.series, "G31Z");
+        h2.abort();
+    }
 }

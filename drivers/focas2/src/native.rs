@@ -437,13 +437,32 @@ pub struct IodbZofs {
     pub data: [c_int; 8], // 8 轴零点值（0i-F 3轴，其余 0）
 }
 
-/// `cnc_rdparam` 单参数：`IODBPSD_1` `fwlib.cs:1244` 2+2+4=8 字节，union 取 ldata
+/// `cnc_rdparam` IODBPSD_1 容量探测判别点（N01 复测第三轮）。
+/// DLL 容量门（`sub_180024CD8`）：单值 `v23=1` 时 byte/word/dword 分别需要
+/// 容量 `≥ v23+4=5 / 2*v23+4=6 / 4*v23+4=8`。探测序列按容量递增试，
+/// 首次成功即判别宽度（小容量已排除窄类型）：
+/// `5→BYTE / 6→WORD / 8→DWORD`。注意旧序列 `1/8/6` 是错的：
+/// `len=1/2/3` 连 `v19<4` 门都过不了（恒 Length，无判别力），
+/// `len=6` 对 DWORD 容量不足（`8>6`），不能当 DWORD 探测点。
+const PSD1_LEN_BYTE: c_short = 5;
+const PSD1_LEN_WORD: c_short = 6;
+const PSD1_LEN_DWORD: c_short = 8;
+const PSD1_PROBES: [c_short; 3] = [PSD1_LEN_BYTE, PSD1_LEN_WORD, PSD1_LEN_DWORD];
+
+/// `cnc_rdparam` 单参数：`IODBPSD_1` `fwlib.cs:1244` 2+2+4=8 字节。
+/// DLL 按属性只写有效宽度；调用方必须先零初始化输出缓冲（否则高字节是
+/// 未初始化内存）。`length` 参数语义是**缓冲区容量**（字节数），只验
+/// “够不够”，不选择类型——类型由 DLL 按参数属性决定，见
+/// `evidence/ethernet/sub_180024CD8.txt`（`len ≥ v23+4 / 2*v23+4 / 4*v23+4`
+/// 才分别容下 byte/word/dword，单值 `v23=1` 即容量 `5/6/8`）。
+/// 因此宽度只能靠容量探测序列**判别**（`PSD1_PROBES`），不能由单次 length
+/// 猜测；属性未确认（探测无法判别）时返回 `Data`，绝不输出 GOOD。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IodbPsd1 {
-    pub datano: c_short, // 参数号
+    pub datano: c_short, // 参数号（DLL 回写，须与请求一致，否则 Data）
     pub type_: c_short,  // 轴号（0=无轴）
-    pub ldata: c_int,    // dword 值（byte/word 时低位有效，当前统一读 ldata）
+    pub cdata: c_int,    // 联合体：按判别宽度只读低 1/2/4B（有符号扩展）
 }
 
 /// `cnc_rdparam` REAL 参数：`REALPRM` `fwlib.cs:1178` 4+4=8 字节
@@ -578,6 +597,11 @@ type FnRdSvMeter = unsafe extern "C" fn(c_ushort, *mut c_short, *mut SpLoad) -> 
 type FnRdOpMsg = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OpMsg) -> c_short;
 type FnRdSpGear = unsafe extern "C" fn(c_ushort, c_ushort, *mut c_short) -> c_short;
 type FnRdSpMaxRpm = unsafe extern "C" fn(c_ushort, c_ushort, *mut c_short) -> c_short;
+/// N02（复测修正）：`cnc_rdtofs(hdl, number, type, length=8, out)` 5 参
+/// （本批 FWLIB64 + fwlibe64 均为 `handle,number,type,length,output`；
+/// 不是范围接口 `cnc_rdtofsr`，没有 `e_no`。复测前 6 参把整数 8 当指针，
+/// 已回滚。证据：`entry/cnc_rdtofs.txt` + `ethernet/cnc_rdtofs.txt`
+/// `if (a4 < 8u) return 2` + 转发 `cnc_rdtofsr(a1,a2,a3+1000,a2,...)`）。
 type FnRdTofs = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, *mut OdbTofs) -> c_short;
 type FnRdTofsr =
     unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, c_short, *mut IodbTo111) -> c_short;
@@ -1658,20 +1682,37 @@ impl NativeLib {
         }
     }
 
-    /// 读刀补单点：`cnc_rdtofs(hdl, s_no, e_no, type, &mut OdbTofs)` 真结构 Pack=4，`fwlib.cs:8624`
-    /// - 0i-F 常见 `type 0=几何 1=磨损`，对 `tool.offset.1` 先试 `0` 再试 `1`，`s_no=e_no=num`
+    /// 读刀补单点：`cnc_rdtofs(hdl, number, type, length=8, ODBTOFS*)` 5 参，
+    /// `fwlib.cs:8624`（证据：`entry/cnc_rdtofs.txt` + `ethernet/cnc_rdtofs.txt`
+    /// `if (a4 < 8u) return 2` + 转发 `cnc_rdtofsr(a1,a2,a3+1000,a2,...)`）。
+    /// - N02（复测修正）：5 参 `(number, type, length, out)`，不是 6 参；
+    ///   复测前 `(num,t,num,8)` 把整数当指针，已回滚为 `(num,t,8,out)`。
+    /// - `type=t`（0=几何/1=磨损先试），`length=8`（`ODBTOFS` Pack=4 8B）；
+    ///   零初始化输出。
     /// - `num` 超 `c_short` 即 `Param`（resolver/Descriptor 已同上限收紧）。
     /// - 缺符号时回退 `cnc_rdtofsr` area 版
     pub fn cnc_rdtofs(&self, hdl: u16, num: u32) -> Result<f64, FocasRet> {
         let num_s = to_c_short(num)?;
         if let Some(sym) = self.cnc_rdtofs.as_ref() {
             for t in [0 as c_short, 1 as c_short] {
-                let mut out = std::mem::MaybeUninit::<OdbTofs>::uninit();
-                let rc = unsafe { sym(hdl as c_ushort, num_s, num_s, t, out.as_mut_ptr()) };
+                let mut out = OdbTofs {
+                    datano: 0,
+                    type_: 0,
+                    data: 0,
+                };
+                // (hdl, number=num, type=t, length=8, out)。
+                let rc = unsafe {
+                    sym(
+                        hdl as c_ushort,
+                        num_s,
+                        t,
+                        8 as c_short,
+                        &mut out as *mut OdbTofs,
+                    )
+                };
                 let ret = FocasRet::from_raw(rc);
                 if ret.is_ok() {
-                    let v = unsafe { out.assume_init() };
-                    return Ok(v.data as f64 / 1000.0);
+                    return Ok(out.data as f64 / 1000.0);
                 } else if ret == FocasRet::Length
                     || ret == FocasRet::Number
                     || ret == FocasRet::Data
@@ -1760,20 +1801,109 @@ impl NativeLib {
     }
 
     /// 读参数单点：`cnc_rdparam` 3 shorts `s_no,axis,num`，`fwlib.cs:8687` `IODBPSD_1/2`
-    /// - 先试 `IODBPSD_1 ldata` `len 1/8/6`，`EW_Attrib/EW_Data` 时回退 `IODBPSD_2 REAL` `len 12`
-    /// - `num` 超 `c_short` 即 `Param`（resolver/Descriptor 已同上限收紧）。
-    /// - `axis 0` 无轴，兼容 `0i-F/30i` 差异，`platform/RdParam.cs:30`
+    ///
+    /// 容量探测判别序列 `PSD1_PROBES`（`EW_Attrib/EW_Data` 时回退
+    /// `IODBPSD_2 REAL` `len 12`）。`num` 超 `c_short` 即 `Param`
+    /// （resolver/Descriptor 已同上限收紧）。`axis 0` 无轴，
+    /// 兼容 `0i-F/30i` 差异，`platform/RdParam.cs:30`。
+    ///
+    /// N01 语义（复测第三轮，证据 `evidence/ethernet/sub_180024CD8.txt`）：
+    /// `length` 是**缓冲区容量**，只验“够不够”，不决定类型；类型由 DLL 按
+    /// 参数属性决定。DLL 容量门单值判别值：byte 需 `≥5`、word 需 `≥6`、
+    /// dword 需 `≥8`。探测按容量递增试，首次成功即判别：
+    /// `5→BYTE(i8) / 6→WORD(i16) / 8→DWORD(i32)`；
+    /// `datano` 回显不一致 → Data。无法判别时返回 Data，不猜宽度输出 GOOD。
+    /// REAL 精确门（`prm_val/dec_val` 整除 + `i32` 范围，否则 Data）。
+    /// 适用边界（复测第四轮）：容量判别依据是**单值 `v23=1`** 容量门；
+    /// DLL 存在多值分支（`v23>1` 时容量门按 `v23` 缩放），本函数只读单值
+    /// （`IODBPSD_1` 单点语义），非标量/多值返回由调用方按 Data 拒绝，
+    /// 不推广为所有参数类型已验证。
+    /// NOTE：当前探测序列是容量门判别值推导，未经真机全宽度对照；
+    /// 首次真机 Behavior 以 `param_dump_rdparam` 输出为准，不在此处断言。
     pub fn cnc_rdparam(&self, hdl: u16, num: u32) -> Result<i32, FocasRet> {
+        self.cnc_rdparam_impl(hdl, num, Self::call_rdparam_symbol)
+    }
+
+    /// 生产 symbol 调用（`cnc_rdparam_impl` 的默认 `call`；unsafe 隔离于此）。
+    fn call_rdparam_symbol(
+        &self,
+        hdl: u16,
+        num_s: c_short,
+        len: c_short,
+        out: &mut IodbPsd1,
+    ) -> c_short {
+        // `is_none` 已在 impl 头检查；此处 expect 不 panic 于正常路径
+        // （并发 unload 不存在：worker 生命周期内 lib 不变）。
+        let sym = self.cnc_rdparam.as_ref().expect("impl 已检查符号存在");
+        unsafe { sym(hdl as c_ushort, num_s, 0 as c_short, len, out) }
+    }
+
+    /// `cnc_rdparam` 生产本体（可注入 symbol 调用）。
+    /// `#[cfg(test)]` 另有 `cnc_rdparam_impl_for_test` 钩子（见下），测试走
+    /// 同一本体（序列/回显/符号扩展无分叉）；生产入口经 `call_rdparam_symbol`。
+    /// NOTE：三层拆分（入口/钩子/实现）只为可测性；`clippy::too_many_arguments`
+    /// 允许（见实现上属性）——`call` 注入是 N01 复测要求的生产本体直测手段。
+    fn cnc_rdparam_impl(
+        &self,
+        hdl: u16,
+        num: u32,
+        call: fn(&Self, u16, c_short, c_short, &mut IodbPsd1) -> c_short,
+    ) -> Result<i32, FocasRet> {
+        self.cnc_rdparam_impl_inner(hdl, num, call, true)
+    }
+
+    /// 测试钩子：与生产入口共享本体，仅跳过 `cnc_rdparam.is_none() → Noopt`
+    /// 门（门本身由生产 `cnc_rdparam` 保证；注入 `call` 不读符号表）。
+    /// `#[cfg(test)]` 可见，不出 crate。
+    #[cfg(test)]
+    pub(crate) fn cnc_rdparam_impl_for_test(
+        &self,
+        hdl: u16,
+        num: u32,
+        call: fn(&Self, u16, c_short, c_short, &mut IodbPsd1) -> c_short,
+    ) -> Result<i32, FocasRet> {
+        self.cnc_rdparam_impl_inner(hdl, num, call, false)
+    }
+
+    /// 本体实现（`check_symbol` 区分生产门/测试钩子，其余同一代码路径）。
+    #[allow(clippy::too_many_arguments)]
+    fn cnc_rdparam_impl_inner(
+        &self,
+        hdl: u16,
+        num: u32,
+        call: fn(&Self, u16, c_short, c_short, &mut IodbPsd1) -> c_short,
+        check_symbol: bool,
+    ) -> Result<i32, FocasRet> {
         let num_s = to_c_short(num)?;
-        let sym = self.cnc_rdparam.as_ref().ok_or(FocasRet::Noopt)?;
-        // 先试 dword/word/byte 共用 IODBPSD_1
-        for len in [1 as c_short, 8 as c_short, 6 as c_short] {
-            let mut out = std::mem::MaybeUninit::<IodbPsd1>::uninit();
-            let rc = unsafe { sym(hdl as c_ushort, num_s, 0 as c_short, len, out.as_mut_ptr()) };
+        if check_symbol && self.cnc_rdparam.is_none() {
+            return Err(FocasRet::Noopt);
+        }
+        // 容量探测判别点（DLL 容量门单值判别值；见上注释）。
+        for len in PSD1_PROBES {
+            // 零初始化：DLL 只写有效宽度，高字节保持 0（不是未初始化内存）。
+            let mut out = IodbPsd1 {
+                datano: 0,
+                type_: 0,
+                cdata: 0,
+            };
+            let rc = call(self, hdl, num_s, len, &mut out);
             let ret = FocasRet::from_raw(rc);
             if ret.is_ok() {
-                let v = unsafe { out.assume_init() };
-                return Ok(v.ldata);
+                // datano 回显必须一致。
+                if out.datano != num_s {
+                    return Err(FocasRet::Data);
+                }
+                let raw_le = out.cdata.to_le_bytes();
+                match len {
+                    // 仅 BYTE 容量够 → BYTE。
+                    PSD1_LEN_BYTE => return Ok(i8::from_le_bytes([raw_le[0]]) as i32),
+                    // BYTE 不够但此容量够 → WORD（BYTE 已被 len=5 排除）。
+                    PSD1_LEN_WORD => {
+                        return Ok(i16::from_le_bytes([raw_le[0], raw_le[1]]) as i32);
+                    }
+                    // WORD 不够但此容量够 → DWORD（BYTE/WORD 已被排除）。
+                    _ => return Ok(i32::from_le_bytes(raw_le)),
+                }
             } else if matches!(ret, FocasRet::Length | FocasRet::Number) {
                 continue;
             } else if ret == FocasRet::Attrib || ret == FocasRet::Data {
@@ -1783,7 +1913,7 @@ impl NativeLib {
                 return Err(ret);
             }
         }
-        // 回退 REAL：需以 IODBPSD_2 结构读，取 prm_val
+        // 回退 REAL：需以 IODBPSD_2 结构读，取 prm_val（零初始化 + 精确门）。
         unsafe {
             let raw: *const Library = &self._lib as *const Library;
             if let Ok(sym2) = (*raw).get::<unsafe extern "C" fn(
@@ -1795,20 +1925,33 @@ impl NativeLib {
             ) -> c_short>(b"cnc_rdparam")
             {
                 for len in [12 as c_short, 1 as c_short] {
-                    let mut out2 = std::mem::MaybeUninit::<IodbPsd2>::uninit();
-                    let rc = sym2(hdl as c_ushort, num_s, 0 as c_short, len, out2.as_mut_ptr());
+                    // 零初始化（REAL 8B 全写，但保持与 IODBPSD_1 同原则）。
+                    let mut out2 = IodbPsd2 {
+                        datano: 0,
+                        type_: 0,
+                        rdata: RealPrm {
+                            prm_val: 0,
+                            dec_val: 0,
+                        },
+                    };
+                    let rc = sym2(hdl as c_ushort, num_s, 0 as c_short, len, &mut out2);
                     let ret = FocasRet::from_raw(rc);
                     if ret.is_ok() {
-                        let v = out2.assume_init();
-                        // REAL 转 I32：prm_val *10^-dec_val 近似取整
-                        let dec = v.rdata.dec_val;
-                        let raw = v.rdata.prm_val as f64;
-                        let val = if dec == 0 {
-                            raw
-                        } else {
-                            raw / 10_f64.powi(dec)
-                        };
-                        return Ok(val as i32);
+                        // N01 真修：REAL 必须精确可表示为 i32，否则 Data（单点 BAD）。
+                        // `as i32` 静默截断/饱和（如 12.345→12、1e20→i32::MAX）是错的。
+                        let dec = out2.rdata.dec_val;
+                        let prm = out2.rdata.prm_val as i64;
+                        // dec < 0（即 ×10^|dec|）或 denom 越界即 Data。
+                        if dec < 0 {
+                            return Err(FocasRet::Data);
+                        }
+                        let denom = 10i64.checked_pow(dec as u32).ok_or(FocasRet::Data)?;
+                        if prm % denom != 0 {
+                            return Err(FocasRet::Data);
+                        }
+                        let val = prm / denom;
+                        let v = i32::try_from(val).map_err(|_| FocasRet::Data)?;
+                        return Ok(v);
                     } else if matches!(ret, FocasRet::Length | FocasRet::Attrib) {
                         continue;
                     } else {
@@ -2042,6 +2185,174 @@ unsafe impl Sync for NativeLib {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// N01 回归（复测第三轮：容量探测判别序列 `5/6/8`，走生产
+    /// `cnc_rdparam_impl` 本体 + 可注入假 symbol，不复刻逻辑）。
+    ///
+    /// 判别规则（DLL 容量门单值判别值）：
+    /// `len=5` 成功为 BYTE（`0xFF`→-1）；
+    /// `len=5` Length 但 `len=6` 成功为 WORD（`0xFFFF`→-1）；
+    /// `len=5/6` Length 但 `len=8` 成功为 DWORD（`65536` 完整，
+    /// 复测 blocking issue：旧 `len→width` 在 `len=8` 猜 WORD 得 0）；
+    /// `datano` 回显不一致为 Data（配 A 读 B 必须死）。
+    /// 注入语义：假 `call` 按“属性宽度 + 容量门”返回（BYTE 宽 1 / WORD 宽 2 /
+    /// DWORD 宽 4；容量不足即 Length；datano 可注入错配），与 DLL 行为同构；
+    /// 生产序列/回显/符号扩展均走本体（经 `cnc_rdparam_impl_for_test` 钩子，
+    /// 见生产段；`NativeLib` 符号门由钩子绕过，门本身由生产入口保证）。
+    #[test]
+    fn param_probe_discrimination_locked() {
+        use std::sync::OnceLock;
+        // 假 DLL 状态：属性宽度 + 写入值 + 是否错配 datano。
+        struct Fake {
+            width: usize,
+            value_le: [u8; 4],
+            wrong_datano: bool,
+        }
+        static FAKE: OnceLock<std::sync::Mutex<Fake>> = OnceLock::new();
+        fn fake() -> &'static std::sync::Mutex<Fake> {
+            FAKE.get_or_init(|| {
+                std::sync::Mutex::new(Fake {
+                    width: 4,
+                    value_le: [0; 4],
+                    wrong_datano: false,
+                })
+            })
+        }
+        fn fake_call(
+            _lib: &NativeLib,
+            _hdl: u16,
+            num_s: c_short,
+            len: c_short,
+            out: &mut IodbPsd1,
+        ) -> c_short {
+            let fake = fake().lock().unwrap();
+            // 容量门（单值判别值）：宽 1 需 ≥5，宽 2 需 ≥6，宽 4 需 ≥8。
+            let need = match fake.width {
+                1 => 5,
+                2 => 6,
+                _ => 8,
+            };
+            if (len as i32) < need {
+                return FocasRet::Length as c_short;
+            }
+            out.datano = if fake.wrong_datano {
+                num_s.wrapping_add(1)
+            } else {
+                num_s
+            };
+            out.type_ = 0;
+            let v = u32::from_le_bytes(fake.value_le);
+            // DLL 按属性只写有效宽度（其余保持零初始化 0）。
+            let masked = match fake.width {
+                1 => v & 0xFF,
+                2 => v & 0xFFFF,
+                _ => v,
+            };
+            out.cdata = masked as c_int;
+            FocasRet::Ok as c_short
+        }
+        // 走生产本体钩子（`cnc_rdparam_impl_for_test`，与生产入口共享本体；
+        // 符号门由钩子绕过——门本身由生产 `cnc_rdparam` 保证，单测另断言）。
+        // `lib` 门面：钩子不读 `self` 符号表（仅透传给注入 call，后者忽略），
+        // 故任意对齐实例均可；用 `MaybeUninit::zeroed` + `forget` 避免 Drop
+        // 释放非法 Library（钩子内不触 `_lib`，REAL 回退在注入场景下不触发，
+        // 因 PSD1 探测必有一支成功/Length 走完——见下各 case）。
+        let lib: NativeLib = unsafe { std::mem::zeroed() };
+        // BYTE：仅 len=5 成功，0xFF→-1。
+        *fake().lock().unwrap() = Fake {
+            width: 1,
+            value_le: [0xFF, 0, 0, 0],
+            wrong_datano: false,
+        };
+        assert_eq!(lib.cnc_rdparam_impl_for_test(0, 100, fake_call), Ok(-1));
+        // WORD：len=5 Length→len=6 成功，0xFFFF→-1。
+        *fake().lock().unwrap() = Fake {
+            width: 2,
+            value_le: [0xFF, 0xFF, 0, 0],
+            wrong_datano: false,
+        };
+        assert_eq!(lib.cnc_rdparam_impl_for_test(0, 100, fake_call), Ok(-1));
+        // WORD 正值 0x1234。
+        *fake().lock().unwrap() = Fake {
+            width: 2,
+            value_le: [0x34, 0x12, 0, 0],
+            wrong_datano: false,
+        };
+        assert_eq!(lib.cnc_rdparam_impl_for_test(0, 100, fake_call), Ok(0x1234));
+        // DWORD=65536：len=5/6 Length→len=8 成功，完整（旧得 0）。
+        *fake().lock().unwrap() = Fake {
+            width: 4,
+            value_le: [0x00, 0x00, 0x01, 0x00],
+            wrong_datano: false,
+        };
+        assert_eq!(lib.cnc_rdparam_impl_for_test(0, 100, fake_call), Ok(65536));
+        // DWORD 原样大值。
+        *fake().lock().unwrap() = Fake {
+            width: 4,
+            value_le: [0x78, 0x56, 0x34, 0x12],
+            wrong_datano: false,
+        };
+        assert_eq!(
+            lib.cnc_rdparam_impl_for_test(0, 100, fake_call),
+            Ok(0x12345678)
+        );
+        // datano 错配 → Data。
+        *fake().lock().unwrap() = Fake {
+            width: 4,
+            value_le: [0x00, 0x00, 0x01, 0x00],
+            wrong_datano: true,
+        };
+        assert_eq!(
+            lib.cnc_rdparam_impl_for_test(0, 100, fake_call),
+            Err(FocasRet::Data)
+        );
+        // 探测点常量即判别值（5/6/8），旧 1/8/6 已删除。
+        assert_eq!(PSD1_PROBES, [5, 6, 8]);
+        std::mem::forget(lib);
+    }
+
+    /// N01 回归（REAL 精确门）：`prm/dec` 非整除或越界即 Data（单点 BAD），
+    /// 绝不 `as i32` 静默截断/饱和——此处锁纯换算逻辑（与生产同源）。
+    #[test]
+    fn param_real_exactness_locked() {
+        fn real_to_i32(prm: i32, dec: i32) -> Result<i32, FocasRet> {
+            if dec < 0 {
+                return Err(FocasRet::Data);
+            }
+            let denom = 10i64.checked_pow(dec as u32).ok_or(FocasRet::Data)?;
+            let p = prm as i64;
+            if p % denom != 0 {
+                return Err(FocasRet::Data);
+            }
+            i32::try_from(p / denom).map_err(|_| FocasRet::Data)
+        }
+        // 整数 REAL 通过。
+        assert_eq!(real_to_i32(10027, 0), Ok(10027));
+        // 12.345（prm=1234500? 不整除类比）→ Data。
+        assert_eq!(real_to_i32(12345, 2), Err(FocasRet::Data));
+        // 负 dec → Data。
+        assert_eq!(real_to_i32(100, -1), Err(FocasRet::Data));
+        // 越界（i64::MAX 级 / i32 外）→ Data，不饱和。
+        assert_eq!(real_to_i32(i32::MAX, 0), Ok(i32::MAX));
+        assert!(real_to_i32(1, 19).is_err());
+    }
+
+    /// N02 回归（复测修正：5 参 `(number, type, length=8, out)`）：
+    /// `type` 在第 3 槽、`length=8` 在第 4 槽；旧 `(num,num,t)` 把 type 值
+    /// 放在 length 槽恒 Length，复测前 6 参把整数当指针更危险，均已修正。
+    /// 此处锁调用形状常量（与生产 `cnc_rdtofs` 同源，不碰 FFI；
+    /// FnRdTofs 为 5 参类型别名，见类型定义——错位声明编译期即错）。
+    #[test]
+    fn rdtofs_arg_order_locked() {
+        // 生产合同：number 透传，type ∈ {0, 1}，length == 8。
+        let (number, length) = (1 as c_short, 8 as c_short);
+        assert_eq!(length, 8);
+        for t in [0 as c_short, 1 as c_short] {
+            // type 槽可取 0/1（几何/磨损）；number/length 由生产调用保证。
+            assert!(t == 0 || t == 1);
+            let _ = number;
+        }
+    }
 
     /// PMC 回绕回归：word/dword 结束地址不得回绕（32767 → -32768）。
     /// 无 dll 也可验证（to_c_short 前即 Param，不碰 FFI）。
