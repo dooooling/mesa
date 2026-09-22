@@ -724,15 +724,13 @@ impl FocasClient {
         }
     }
 
-    /// 旧 `invalidate(generation)`（drop 后重取锁）已删除——复测 W01/W02：
-    /// 先 complete 释放锁再 invalidate 有抢占窗口，fatal 必须持锁失效。
-    /// 保留名以防外部引用，编译期即错优于静默错误语义。
-    #[allow(dead_code)]
-    async fn invalidate(&self, _generation: u64) {
-        // 已废弃：fatal 路径一律走 `invalidate_locked`（持锁）。
-        // 此函数不再被调用（`dead_code` 允许，防外部误用时编译通过）。
-    }
-
+    /// 旧 `invalidate(generation)`（drop 后重取锁）已删除（B4）——复测 W01/W02：
+    /// 先 complete 释放锁再 invalidate 有抢占窗口，fatal 必须持锁失效
+    /// （`SessionGuard::fail()`）。删除而非保留 no-op：private 方法无外部
+    /// 兼容义务；保留同名 no-op 会让误调用正常编译却静默无为，更危险。
+    /// 旧测试 `invalidate_is_generation_scoped`（空 session 上调 no-op，
+    /// 无证明力）同步删除；代次隔离由 `fatal_waiters_rebuild_after_fatal`
+    /// 等真实回环覆盖。
     /// 取 operation guard（poisoned 即清空并 `Closed`，由调用方重连）。
     async fn guard(&self) -> Result<SessionGuard<'_>, WireError> {
         let slot = self.session.lock().await;
@@ -2042,22 +2040,6 @@ mod tests {
         assert_eq!(&payload[0..2], &[0x00, 0x03]);
     }
 
-    /// W02 回归：旧代错误不杀新代会话（generation 隔离；不连设备纯逻辑）。
-    /// `invalidate(old_gen)` 后新代会话保留；同代才清。
-    #[tokio::test]
-    async fn invalidate_is_generation_scoped() {
-        let client = FocasClient::new(std::time::Duration::from_millis(10));
-        // 未连接时代次为 0；invalidate(0) 即清（空会话无影响，不 panic）。
-        client.invalidate(0).await;
-        // 代次 999（未来代）不得清当前（空）会话——语义为“只清同代”。
-        client.invalidate(999).await;
-        // guard 在无会话时即 Closed（poison 语义不干扰）。
-        assert!(matches!(
-            client.guard().await.unwrap_err(),
-            WireError::Closed
-        ));
-    }
-
     /// W03 回归：重复 connect 不同目标必须重建（不复用旧连接；不连设备时
     /// 表现为两次均 Closed 而非“复用成功”——loopback 形态见 session 单测）。
     /// 此处锁 endpoint 绑定语义：`ensure_connected` 在目标变化时不短路返回。
@@ -2069,6 +2051,11 @@ mod tests {
         let b = ("h".to_string(), 8193u16, std::time::Duration::from_secs(1));
         assert_ne!(a, b, "timeout 不同即不同 endpoint，必须重建");
     }
+
+    // NOTE（B4）：旧 `invalidate_is_generation_scoped` 已删除——它在空 session
+    // 上调用 no-op `invalidate()`，无证明力。代次隔离语义由
+    // `session.rs::fatal_waiters_rebuild_after_fatal` 真实回环覆盖
+    // （旧代 poison 不杀新代重建 OPEN=2）。
 
     /// Fixture 级回归入口（`tests/fixtures/wire/**`）：生产 codec 直测，
     /// 不经测试侧复刻 decoder（见 `super::super::fixture_tests`）。

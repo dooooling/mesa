@@ -2068,8 +2068,10 @@ mod tests {
         assert_eq!(classify_point_error("ERR:something else"), 1);
     }
 
-    /// N03 回归：worker 队列有界（`WORKER_QUEUE_MAX`），队满即 `EW_BUSY`。
-    /// 不连设备（`submit` 纯背压语义；与生产 `WorkerHandle` 同源）。
+    /// N03 回归：worker 队列有界（`WORKER_QUEUE_MAX` 常量存在且合理）。
+    /// 不连设备。诚实标注：本测试只锁常量形状，不证明实际 saturation
+    /// （`try_send(Full) → EW_BUSY` 在生产 `submit` 内，逻辑直接，
+    /// 真实队满需并发压测，不在单测伪造）。
     #[test]
     fn worker_queue_bounded_shape() {
         // 背压语义锁形状：上限存在且为正（具体值见 focas_api::WORKER_QUEUE_MAX）。

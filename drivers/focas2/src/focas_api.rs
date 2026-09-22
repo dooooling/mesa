@@ -252,11 +252,11 @@ enum WorkerOp {
 
 /// worker 句柄（`NativeFocasApi` 的唯一状态；Clone 共享同一 worker）。
 /// 确定生命周期（`WorkerHandle::drop`）：最后一个 `Arc` 释放时，
-/// 关 sender → worker 排空 → free handle exactly once → 退出 → join。
-/// `Drop` 返回即 free 完成（`join` 在 `Drop` 内同步等待；见下注释）。
-/// N03 真修：有界队列（`MAX_QUEUE` 背压）+ 关闭时不再无限排空——
-/// `shutdown_blocking` 先关 sender 再 join，worker 按“已收即处理、
-/// 未收即弃”退出；`submit` 在队满时直接 `EW_BUSY`，不无界积压。
+/// 关 sender → worker 消费完已入队 op 后 free handle exactly once → 退出 →
+/// join。`Drop` 返回即 free 完成（`join` 在 `Drop` 内同步等待；见下注释）。
+/// N03 真修：有界队列（`WORKER_QUEUE_MAX` 背压）；`submit` 在队满时直接
+/// `EW_BUSY`，不无界积压。关闭后 backlog 上界见 `shutdown_blocking` 注释
+/// （已入队仍 drain，不止等一个 FFI）。
 struct WorkerHandle {
     sender: Mutex<Option<tokio::sync::mpsc::Sender<WorkerOp>>>,
     /// worker OS 线程（`None` = 已 join；`Mutex` 保并发 take，幂等）。
@@ -282,10 +282,14 @@ impl WorkerHandle {
         }
     }
 
-    /// 同步关闭 worker 并 join：关闭 sender（worker 处理完已收 op 后
-    /// free handle 并退出；**未送达的 op 不再等待**，N03 有界语义）→
-    /// join 等待完成（上限：worker 单 op 最长阻塞一个 FFI 超时，不无限排空）。
-    /// 幂等（重复调即返回）。`Drop` 与显式 `shutdown_blocking` 共用此路径。
+    /// 同步关闭 worker 并 join：关闭 sender（worker 退出；N03 有界语义）→
+    /// join 等待完成。幂等（重复调即返回）。
+    /// 关闭语义（N03 注释修正）：sender 全部 drop 后，tokio bounded `mpsc`
+    /// 的 Receiver 仍会把**已缓存在 channel 中的消息消费完**，
+    /// `blocking_recv()` 才返回 `None`；因此最坏等待不是“单个 FFI timeout”，
+    /// 而是“当前 operation + 最多 `WORKER_QUEUE_MAX` 个已入队 operation”
+    /// 依次执行——仍有界（禁止无限积压的目标已实现），但不是单 FFI 上界。
+    /// `Drop` 与显式 `shutdown_blocking` 共用此路径。
     fn shutdown_blocking(&self) {
         // 先关 sender（take 即关闭通道；worker 侧 blocking_recv → None）。
         self.sender.lock().unwrap().take();
