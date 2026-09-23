@@ -18,6 +18,8 @@
 //! - pmc 证据（P0~P3）：`0x8001/device=2` scalar；BYTE/WORD/DWORD +
 //!   bit projection；Mesa BYTE→I32（PR56 产品合同修正）。
 //! - param 证据（Q0/Q3/P-C）：`0x8D` integer-safe scalar；Mesa I32。
+//! - diagnosis 证据（D301）：`0x93[301,301,3,0]` → type=5 REAL →
+//!   `RawNumeric8(-10,10,3)` → Mesa F64(-0.010)；Batch 2 只 admit REAL。
 //! - opmsg 证据（O0/O1）：`0x34 type=4` → #3006 文本；Mesa String。
 //! - 本模块 `#[cfg(test)]` 且 crate 内部：直接调生产 decoder，无复刻。
 
@@ -25,8 +27,8 @@ use std::path::PathBuf;
 
 use super::frame::{FRAME_HEADER_LEN, FocasFrame, PacketType, decode_header};
 use super::wire::{
-    decode_feed_rate, decode_macro_value, decode_opmsg_value, decode_spindle_speed,
-    decode_spindle_word, decode_status_info, decode_system_info,
+    decode_diagnosis_value, decode_feed_rate, decode_macro_value, decode_opmsg_value,
+    decode_spindle_speed, decode_spindle_word, decode_status_info, decode_system_info,
 };
 use super::{cut_fixture_frames, fixture_dir, read_fixture_bytes};
 
@@ -122,6 +124,8 @@ pub(crate) fn run_all() {
     param_decodes();
     param_q0_negative_evidence();
     param_request_locked();
+    diagnosis_301a3_decodes();
+    diagnosis_request_locked();
     opmsg_o1o0_decodes();
     opmsg_request_locked();
 }
@@ -782,6 +786,78 @@ fn param_request_locked() {
             "{group} production encoder 必须 == evidence request fixture 全 40B"
         );
     }
+}
+
+/// diagnosis D301（Batch 2）：fixture 经生产 codec 解码 == expected
+///（`datano=301/attr=3/type=5/(-10,10,3)` ↔ Native dgn/dec 同次；
+/// request 生产编码 == 捕获 fixture 全 40B）。
+fn diagnosis_301a3_decodes() {
+    use super::wire::diagnosis_to_value_for_test as to_value;
+    let frame = assemble_frame(&read("diagnosis_301a3", "diagnosis_response_frame.bin"));
+    let v = decode_diagnosis_value(&frame, 301).expect("diagnosis_301a3 必须解码");
+    assert_eq!(v.datano, 301);
+    assert_eq!(v.attr, 3);
+    assert_eq!(v.diag_type, 5);
+    assert_eq!(v.numeric.mantissa, -10);
+    assert_eq!(v.numeric.base, 10);
+    assert_eq!(v.numeric.exponent, 3);
+    let exp = expected("diagnosis_301a3");
+    assert_eq!(
+        exp["native"]["dgn_val"].as_i64().unwrap() as i32,
+        v.numeric.mantissa,
+        "Native↔Wire mantissa 同次一致"
+    );
+    assert_eq!(
+        exp["native"]["dec_val"].as_i64().unwrap() as i16,
+        v.numeric.exponent,
+        "Native↔Wire dec 同次一致"
+    );
+    assert_eq!(
+        to_value(&v).expect("adapter 必须通过"),
+        mesa_core_types::Value::F64(-0.010),
+        "Mesa engineering F64"
+    );
+    // 请求：生产编码器输出 == 捕获 fixture 全 40B。
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+    use super::frame::{encode_generic_request, request_subpacket};
+    use super::wire::{DEV_CNC, FUNC_DIAGNOSIS};
+    let build = FocasFrame {
+        origin: REQUEST_ORIGIN,
+        packet_type: PacketType::GENERIC_REQUEST,
+        payload: encode_generic_request(&[request_subpacket(
+            DEV_CNC,
+            FUNC_DIAGNOSIS,
+            [301, 301, 3, 0, 0],
+        )]),
+    }
+    .encode();
+    assert_eq!(build.len(), 40, "0x93 请求必须 40B");
+    let raw = read("diagnosis_301a3", "diagnosis_request_frame.bin");
+    let frames = cut_fixture_frames(&raw);
+    assert_eq!(frames.len(), 1, "必须恰好 1 帧");
+    assert_eq!(frames[0].len(), 40, "必须 40B");
+    assert_eq!(
+        frames[0], build,
+        "production encoder 必须 == captured fixture 全 40B"
+    );
+}
+
+/// diagnosis 请求锁死（wire.rs 单测同源；fixture 侧只验全字节等价）。
+fn diagnosis_request_locked() {
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+    use super::frame::{encode_generic_request, request_subpacket};
+    use super::wire::{DEV_CNC, FUNC_DIAGNOSIS};
+    let build = FocasFrame {
+        origin: REQUEST_ORIGIN,
+        packet_type: PacketType::GENERIC_REQUEST,
+        payload: encode_generic_request(&[request_subpacket(
+            DEV_CNC,
+            FUNC_DIAGNOSIS,
+            [301, 301, 3, 0, 0],
+        )]),
+    }
+    .encode();
+    assert_eq!(build.len(), 40, "0x93 请求必须 40B");
 }
 
 /// opmsg O1/O0：`opmsg_response_frame.bin` 经生产 codec 解码 ==
