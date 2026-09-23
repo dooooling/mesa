@@ -398,6 +398,39 @@ pub struct OperatorMessage {
     pub text: String,
 }
 
+/// B3-A Alarm typed result（`id="alarm_contract_v1"`；只定义产品模型，
+/// 不接 Wire——B3-B 才做 `0x23` codec）。
+/// 分层（与 diagnosis 同原则）：`protocol truth → typed result →
+/// Mesa public Value`；Mesa 取 `texts: StringArray`（collection 语义，
+/// 不用 String + 分隔符冒充）。
+/// NOTE：B3-A 只冻结产品模型（contract 先行）；B3-B codec 落地前无生产
+/// 调用方（`#[allow(dead_code)]` 为合同先行标记；非废弃代码）。
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlarmMessage {
+    /// 报警号 raw（如 PS0010 → 10；`u16`？`i32`？——B3-B 按 Wire 实证定，
+    /// 此处先 `i32` 占位，不冻结宽度；PS0010=10 已闭合）。
+    pub number: i32,
+    /// 报警类型 raw（PS0010=3；对照用，不命名语义）。
+    pub alarm_type: i16,
+    /// 轴 raw（PS0010=0；对照用）。
+    pub axis: i16,
+    /// 文本（ASCII-compatible payload → UTF-8 String；非 UTF-8 bytes 即
+    /// replacement（lossy）——CNC HMI 历史编码（SJIS/本地）未闭合前不承诺
+    /// 严格解码；`raw` 全保留，以后不用重新抓包）。
+    pub text: String,
+    /// 原始条目 bytes（Wire 44B 条目全量 / Native msg[32] 全量，按来源保留）。
+    pub raw: Vec<u8>,
+}
+
+/// B3-A Alarm collection（`alarm/value → StringArray` 的 typed 源）。
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlarmResult {
+    /// 报警条目（有序；空=[] / 单条 1 元 / 多条 N 元；顺序按 CNC 返回序）。
+    pub alarms: Vec<AlarmMessage>,
+}
+
 /// FOCAS `diagnosis_value`（`0x93`）typed 结果。diagnosis REAL Evidence PASS：
 /// `device=1/path=1/args=[n,n,axis,0]/aux=0`；单点语义，不做范围读。
 /// 布局：`[0..4]` BE32 datano + `[4..6]` attr（observed，不命名 axis echo——
@@ -550,6 +583,29 @@ pub(super) const SPINDLE_WORD_FUNC_MAXRPM: i32 = 1;
 /// `03 6a`=874），`[0..2]/[4..8]` 不命名，不套 `RawNumeric8`，
 /// 不冻 `u16/i16`——672/874 非负，符号待定）。
 pub const SPINDLE_WORD_DATA_LEN: usize = 8;
+/// `alarm` 命令（`0x23`，alarm Evidence PASS：PS0010 controlled
+/// `device=1/path=1/args=[-1,29,2,32]/aux=0`；collection 语义，单点读全量；
+/// `args` 后三字 observed 不命名，不按号 hardcode）。
+pub(super) const CMD_ALARM: u16 = 0x0023;
+/// alarm request args（A3 controlled 冻结形态；只锁 command identity，
+/// 不命名 `-1/29/2/32` 各字语义）。
+pub(super) const ALARM_ARG0_OBSERVED: i32 = -1;
+pub(super) const ALARM_ARG1_OBSERVED: i32 = 29;
+pub(super) const ALARM_ARG2_OBSERVED: i32 = 2;
+pub(super) const ALARM_ARG3_OBSERVED: i32 = 32;
+/// alarm 单条 reply 数据体（`data_len=48`；`44B AlmMsgElm + 4B 零填充`；
+/// `!= 48` 即 Malformed/Unsupported，不猜 `>= 48` 多条布局——B3-C）。
+pub const ALARM_DATA_LEN: usize = 48;
+/// alarm 条目 wire 长度（`44B`：`no4/type2/axis2/rsv2/len2/msg32`；
+/// 反编译 44B 步进；`48-44=4` 零填充不命名语义）。
+pub const ALARM_ENTRY_LEN: usize = 44;
+/// alarm 文本区长度（`msg[32]`；`msg_len` 截断 + 首 NUL 截断 + lossy + trim）。
+pub const ALARM_MSG_LEN: usize = 32;
+/// `diagnosis` 产品 axis（B2-C2；`0` non-axis / `1..32` one axis）。
+/// NOTE：decoder 不直接用（axis 由 request args 透传，reply attr 不命名）；
+/// `#[allow(dead_code)]` 为合同常量标记（Descriptor max=32.0 同源）。
+#[allow(dead_code)]
+pub(super) const DIAGNOSIS_AXIS_MAX: u8 = 32;
 /// `axis_absolute` 命令（`0x26`，`v0=4/v1=ordinal` 真机冻结）。
 pub(super) const CMD_AXIS_ABSOLUTE: u16 = 0x0026;
 /// `pmc_rdpmcrng` 命令（`0x8001`，PMC scalar Evidence PASS：
@@ -576,6 +632,8 @@ pub(super) const FUNC_PARAM: u32 = 0x0001_008D;
 pub(super) const FUNC_OPMSG: u32 = 0x0001_0034;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_DIAGNOSIS)`）。
 pub(super) const FUNC_DIAGNOSIS: u32 = 0x0001_0093;
+/// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_ALARM)`）。
+pub(super) const FUNC_ALARM: u32 = 0x0001_0023;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_SPINDLE_SPEED)`）。
 pub(super) const FUNC_SPINDLE_SPEED: u32 = 0x0001_0025;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_SPINDLE_WORD_HEAD)`）。
@@ -1087,6 +1145,51 @@ impl FocasClient {
         };
         guard.complete();
         match decode_opmsg_value(&resp) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                Err(e)
+            }
+        }
+    }
+
+    /// B3-B `alarm_value()`（alarm Evidence PASS：`0x23` count=1，
+    /// `device=1/path=1/args=[-1,29,2,32]/aux=0`；collection 语义单点读全量；
+    /// `args` observed 不命名，不按号 hardcode）。
+    /// 单次 exchange；响应 `data_len` 精确 `== 48`（`44B` 条目 + `4B` 零填充；
+    /// `!= 48` 即 Malformed——不猜 `>= 48` 多条布局，B3-C）。
+    /// `data_len=0`（空报警）→ `AlarmResult{alarms: []}`；
+    /// `data_len=48` 单条 → 1 元；其余（多条候选）即 `Unsupported`（B3-C）。
+    pub async fn alarm_value(&self) -> Result<AlarmResult, WireError> {
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_ALARM,
+                [
+                    ALARM_ARG0_OBSERVED,
+                    ALARM_ARG1_OBSERVED,
+                    ALARM_ARG2_OBSERVED,
+                    ALARM_ARG3_OBSERVED,
+                    0,
+                ],
+            )]),
+        };
+        let mut guard = self.guard().await?;
+        let session = guard.session();
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                return Err(e);
+            }
+        };
+        guard.complete();
+        match decode_alarm_value(&resp) {
             Ok(v) => Ok(v),
             Err(e) => {
                 let fatal = e.is_session_fatal();
@@ -1660,6 +1763,51 @@ pub(super) fn decode_param_value(resp: &FocasFrame, number: u32) -> Result<Param
     })
 }
 
+/// B3-B `AlarmMessageCodec`（`0x23` single-alarm；不叫 `AlarmCodec`——
+/// multi 证据未闭合前不承诺 collection wire 语义）。
+/// slot 匹配 `(device=1, path=1, cmd=0x23)`；`status != 0` 走共用 Remote。
+/// `data_len` 精确门：`0` → 空（`alarms: []`）；`48` → 单条
+/// （`[0..44]` 条目 + `[44..48]` 零填充，不命名填充语义）；
+/// 其余长度（含多条候选）即 `Unsupported`（B3-C，不猜第二条位置）。
+/// 条目：`[0..4]` BE32 no + `[4..6]` BE16 type + `[6..8]` BE16 axis +
+/// `[8..10]` reserve（opaque）+ `[10..12]` BE16 msg_len +
+/// `[12..44]` msg[32]（`msg_len` 截断 + 首 NUL 截断 + lossy + trim；
+/// ASCII-compatible → UTF-8；`raw` 44B 全保留）。
+pub(super) fn decode_alarm_value(resp: &FocasFrame) -> Result<AlarmResult, WireError> {
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub =
+        match_slot(&subs, DEV_CNC, PATH_CNC, CMD_ALARM, 0).ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    if d.is_empty() {
+        return Ok(AlarmResult { alarms: vec![] });
+    }
+    if d.len() != ALARM_DATA_LEN {
+        return Err(WireError::Unsupported("alarm non-single payload"));
+    }
+    let entry = &d[..ALARM_ENTRY_LEN];
+    let number = i32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]);
+    let alarm_type = i16::from_be_bytes([entry[4], entry[5]]);
+    let axis = i16::from_be_bytes([entry[6], entry[7]]);
+    let msg_len = u16::from_be_bytes([entry[10], entry[11]]) as usize;
+    let msg_area = &entry[12..12 + ALARM_MSG_LEN];
+    // `msg_len` 截断（防越界 clamp）+ 首 NUL 截断 + lossy + trim。
+    let bounded = msg_len.min(msg_area.len());
+    let end = msg_area[..bounded]
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(bounded);
+    let text = String::from_utf8_lossy(&msg_area[..end]).trim().to_string();
+    Ok(AlarmResult {
+        alarms: vec![AlarmMessage {
+            number,
+            alarm_type,
+            axis,
+            text,
+            raw: entry.to_vec(),
+        }],
+    })
+}
+
 /// `0x93` 响应解码（diagnosis REAL scalar，Batch 2）：slot 匹配
 /// `(device=1, path=1, cmd=0x93)`，成功数据精确 `== 264`
 /// （`#301/axis3` 真机证实；与 param 同长是观测值，不作同构依据）。
@@ -1780,6 +1928,16 @@ fn diagnosis_to_value(v: &DiagnosisValue) -> Result<Value, WireError> {
 /// header opaque 不进 Mesa（保留 raw 供排错，不命名语义）。
 fn opmsg_to_value(m: &OperatorMessage) -> Result<Value, WireError> {
     Ok(Value::String(m.text.clone()))
+}
+
+/// Mesa `alarm/value` 映射（B3-A 合同 `id="alarm_contract_v1"`）：
+/// `AlarmResult → Value::StringArray(texts)`（collection 语义；
+/// 空=[] / 单条 1 元 / 多条 N 元有序；B3-B multi codec 落地前，
+/// typed 层可先承载多条，Wire 侧 single-alarm 外即 `Unsupported`）。
+/// NOTE：B3-B 落地前无生产调用方（`#[allow(dead_code)]` 合同先行标记）。
+#[allow(dead_code)]
+fn alarm_to_value(r: &AlarmResult) -> Value {
+    Value::StringArray(r.alarms.iter().map(|a| a.text.clone()).collect())
 }
 
 /// Mesa `pmc/value` 映射（PMC scalar Evidence PASS）：
@@ -1916,6 +2074,13 @@ pub(super) fn diagnosis_to_value_for_test(v: &DiagnosisValue) -> Result<Value, W
     diagnosis_to_value(v)
 }
 
+/// fixture/test 专用：生产 `alarm_to_value` 同源入口（`#[cfg(test)]`，
+/// 不出 crate；alarm empty/PS0010 fixture 回归用）。
+#[cfg(test)]
+pub(super) fn alarm_to_value_for_test(r: &AlarmResult) -> Value {
+    alarm_to_value(r)
+}
+
 /// fixture/test 专用：`Value::I32` 构造子（断言可读性用）。
 #[cfg(test)]
 pub(super) fn axis_value_for_test(v: i32) -> Value {
@@ -1925,13 +2090,13 @@ pub(super) fn axis_value_for_test(v: i32) -> Value {
 // ---------------------------------------------------------------------------
 // WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed + PR3 axis + PR54 spindle
 // + PR55 macro + PR56 pmc scalar + PR57 param + PR58 opmsg
-// + Batch 1 spindle gear/maxrpm + Batch 2 diagnosis REAL）
+// + Batch 1 spindle gear/maxrpm + Batch 2 diagnosis REAL + Batch 3 alarm）
 // ---------------------------------------------------------------------------
 
-/// Wire 版 `FocasApi`（Batch 2：`system_info` + `Status` + `Feed` +
+/// Wire 版 `FocasApi`（Batch 3：`system_info` + `Status` + `Feed` +
 /// `Axis/absolute` + `ActiveSpindleSpeed` + `MacroVar` + `Pmc` scalar +
-/// `Param` + `OpMsg` + `Spindle/Gear|MaxRpm` + `Diagnosis/REAL`；其余地址
-/// `Unsupported`，
+/// `Param` + `OpMsg` + `Spindle/Gear|MaxRpm` + `Diagnosis/REAL` + `Alarm`；
+/// 其余地址 `Unsupported`，
 /// fail-closed，不猜、不 fallback Native）。
 pub struct WireFocasApi {
     client: Arc<FocasClient>,
@@ -2197,6 +2362,19 @@ impl FocasApi for WireFocasApi {
         } else {
             None
         };
+        // Alarm：同批一次 0x23（collection 单点读全量；batch 多个 Alarm 去重一次）。
+        let need_alarm = addresses.iter().any(|a| matches!(a, FocasAddress::Alarm));
+        let alarm_r: Option<Result<Value, String>> = if need_alarm {
+            match self.client.alarm_value().await {
+                Ok(r) => Some(Ok(alarm_to_value(&r))),
+                Err(e) => match Self::point_or_fatal(e) {
+                    Ok(v) => Some(Ok(v)),
+                    Err(fatal) => return Err(fatal),
+                },
+            }
+        } else {
+            None
+        };
         // PMC scalar 按 request shape 去重（B1 冻结）：
         // bit=None → (kind,addr,dt=kind width)；bit=Some → (kind,addr,dt=BYTE)。
         // 缓存 raw read result（`PmcScalarValue`），不缓存最终 Value——
@@ -2312,6 +2490,11 @@ impl FocasApi for WireFocasApi {
                     Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
                     Err(fatal) => return Err(fatal),
                 },
+                FocasAddress::Alarm => match alarm_r.clone().unwrap() {
+                    Ok(v) => out.push(v),
+                    Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
+                    Err(fatal) => return Err(fatal),
+                },
                 FocasAddress::Pmc { kind, addr, bit } => {
                     // 非法 bit（>=8）在 map 查找前直接 point-local（no packet；
                     // prefetch 阶段已跳过，见上——未连接下也不碰 session）。
@@ -2367,7 +2550,7 @@ impl FocasApi for WireFocasApi {
                 _ => out.push(Value::String(format!(
                     "ERR:{}",
                     WireError::Unsupported(
-                        "Batch 2 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc/Param/OpMsg/SpindleGear/MaxRpm/Diagnosis"
+                        "Batch 2 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc/Param/OpMsg/SpindleGear/MaxRpm/Diagnosis/Alarm"
                     )
                 ))),
             }
@@ -4014,6 +4197,202 @@ mod tests {
         );
     }
 
+    /// B3-B `0x23` 请求：count=1（Evidence A3 controlled 冻结形态：
+    /// `args=[-1,29,2,32]/aux=0`；`args` observed 不命名，不按号 hardcode）。
+    #[test]
+    fn alarm_request_single_locked() {
+        use super::super::frame::encode_generic_request as enc;
+        let payload = enc(&[request_subpacket(
+            DEV_CNC,
+            FUNC_ALARM,
+            [
+                ALARM_ARG0_OBSERVED,
+                ALARM_ARG1_OBSERVED,
+                ALARM_ARG2_OBSERVED,
+                ALARM_ARG3_OBSERVED,
+                0,
+            ],
+        )]);
+        // count=1 + 28B = 30 = 0x1e（与 CNC 系同长，function 换 0x23）。
+        assert_eq!(payload.len(), 0x1e);
+        assert_eq!(&payload[0..2], &[0x00, 0x01]);
+        let back = decode_generic_payload(&payload).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].function, FUNC_ALARM);
+    }
+
+    /// B3-B PS0010 解码：`no=10/type=3/axis=0/len=15/"IMPROPER G-CODE"` →
+    /// `StringArray(["IMPROPER G-CODE"])`（A3 controlled 三方证据）。
+    #[test]
+    fn decode_alarm_ps0010_locked() {
+        // 真机 reply data 48B（`44B` 条目 + `4B` 零填充）。
+        let mut data = vec![
+            0x00, 0x00, 0x00, 0x0a, // [0..4] no=10
+            0x00, 0x03, // [4..6] type=3
+            0x00, 0x00, // [6..8] axis=0
+            0x00, 0x00, // [8..10] reserve
+            0x00, 0x0f, // [10..12] len=15
+        ];
+        data.extend_from_slice(b"IMPROPER G-CODE"); // 15B 文本（I-M-P-R-O-P-E-R-space-G---C-O-D-E）
+        data.extend(vec![0x00; 32 - 15]); // msg[32]：NUL + 16B 零填充
+        data.extend(vec![0x00; 4]); // [44..48] 零填充（44B 条目 + 4B 填充）
+        assert_eq!(data.len(), ALARM_DATA_LEN);
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x30]); // dlen=48
+        p.extend_from_slice(&data);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_ALARM,
+                payload: p,
+            }]),
+        };
+        let r = decode_alarm_value(&frame).unwrap();
+        assert_eq!(r.alarms.len(), 1);
+        let a = &r.alarms[0];
+        assert_eq!(a.number, 10);
+        assert_eq!(a.alarm_type, 3);
+        assert_eq!(a.axis, 0);
+        assert_eq!(a.text, "IMPROPER G-CODE");
+        assert_eq!(a.raw.len(), ALARM_ENTRY_LEN);
+        assert_eq!(
+            alarm_to_value(&r),
+            Value::StringArray(vec!["IMPROPER G-CODE".into()]),
+            "PS0010 → StringArray 1 元"
+        );
+    }
+
+    /// B3-B 空报警：`data_len=0` → `alarms: []` → `StringArray([])`
+    ///（A0 empty baseline；`NO ALARM` 是 UI 文本，不进 Value）。
+    #[test]
+    fn decode_alarm_empty_locked() {
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x00]); // dlen=0
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_ALARM,
+                payload: p,
+            }]),
+        };
+        let r = decode_alarm_value(&frame).unwrap();
+        assert!(r.alarms.is_empty());
+        assert_eq!(alarm_to_value(&r), Value::StringArray(vec![]));
+    }
+
+    /// B3-B exact dlen：`!= 48` 非空即 `Unsupported`（不猜多条布局，B3-C；
+    /// `47B` 截断 / `49B` trailing 同理）。
+    #[test]
+    fn alarm_length_closure_rejected() {
+        for len in [47usize, 49usize, 96usize] {
+            let mut p = vec![0x00; 6];
+            p.extend_from_slice(&(len as u16).to_be_bytes());
+            p.extend_from_slice(&vec![0x00; len]);
+            let frame = FocasFrame {
+                origin: 0x0003,
+                packet_type: PacketType::GENERIC_RESPONSE,
+                payload: encode_generic_request(&[GenericSubpacket {
+                    control_device: DEV_CNC,
+                    function: FUNC_ALARM,
+                    payload: p,
+                }]),
+            };
+            let e = decode_alarm_value(&frame).unwrap_err();
+            assert!(
+                matches!(e, WireError::Unsupported(_)),
+                "dlen={len} 必须 Unsupported（不猜多条），实际：{e:?}"
+            );
+        }
+    }
+
+    /// B3-B 缺 `0x23` 即 `CommandMismatch`（保守致命）。
+    #[test]
+    fn missing_alarm_is_mismatch() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_FEED, // 故意放错槽
+                payload: {
+                    let mut p = vec![0x00; 6];
+                    p.extend_from_slice(&[0x00, 0x08]);
+                    p.extend_from_slice(&[0x00; 8]);
+                    p
+                },
+            }]),
+        };
+        let e = decode_alarm_value(&frame).unwrap_err();
+        assert!(matches!(e, WireError::CommandMismatch));
+        assert!(e.is_session_fatal());
+    }
+
+    /// B3-B 文本截断：`msg_len` 越界 clamp + 首 NUL 截断 + trim
+    ///（不依赖候选长度；embedded NUL 后字节不进 String）。
+    #[test]
+    fn alarm_text_truncate_locked() {
+        // msg_len=99（越界）+ msg 区 "AB\0CD..."：clamp 32 + 首 NUL → "AB"。
+        let mut data = vec![
+            0x00, 0x00, 0x00, 0x0a, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x63,
+        ];
+        let mut msg = vec![0x00; 32];
+        msg[0] = b'A';
+        msg[1] = b'B';
+        msg[2] = 0x00;
+        msg[3] = b'C';
+        msg[4] = b'D';
+        data.extend_from_slice(&msg);
+        data.extend(vec![0x00; 4]);
+        assert_eq!(data.len(), ALARM_DATA_LEN);
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x00, 0x30]);
+        p.extend_from_slice(&data);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_ALARM,
+                payload: p,
+            }]),
+        };
+        let r = decode_alarm_value(&frame).unwrap();
+        assert_eq!(r.alarms[0].text, "AB");
+    }
+
+    /// B3-B status error：`status != 0` 走共用 Remote（point-local，
+    /// session 保留；与 param/opmsg 同原则）。
+    #[test]
+    fn alarm_status_is_remote() {
+        let payload = GenericSubpacket {
+            control_device: DEV_CNC,
+            function: FUNC_ALARM,
+            payload: {
+                let mut p = 2i16.to_be_bytes().to_vec(); // status=2
+                p.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                p.extend_from_slice(&[0x00, 0x00]);
+                p
+            },
+        };
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[payload]),
+        };
+        let e = decode_alarm_value(&frame).unwrap_err();
+        assert!(matches!(e, WireError::Remote { .. }));
+        assert!(!e.is_session_fatal(), "Remote 必须 session 保留");
+        // point_or_fatal → ERR 单点（与 read_batch 同源分类）。
+        match WireFocasApi::point_or_fatal(e) {
+            Ok(Value::String(s)) => assert!(s.starts_with("ERR:")),
+            _ => panic!("Remote 必须转 ERR 单点"),
+        }
+    }
+
     /// opmsg 首 NUL 截断：embedded NUL 后字节不进 String（不依赖候选长度）。
     #[test]
     fn decode_opmsg_first_nul_terminates() {
@@ -4101,6 +4480,54 @@ mod tests {
             Ok(Value::String(s)) => assert!(s.starts_with("ERR:")),
             _ => panic!("Remote 必须转 ERR 单点"),
         }
+    }
+
+    /// B3-A Alarm contract（`id="alarm_contract_v1"`；只锁产品模型，不接 Wire）：
+    /// 空=[] / 单条 1 元（PS0010）/ 多条有序；`AlarmMessage` 字段 widths
+    /// （number `i32` 占位）待 B3-B Wire 实证收紧，不冻结。
+    #[test]
+    fn alarm_contract_v1_locked() {
+        use super::alarm_to_value;
+        // 空：[]。
+        let empty = super::AlarmResult { alarms: vec![] };
+        assert_eq!(alarm_to_value(&empty), Value::StringArray(vec![]));
+        // 单条：PS0010（no=10/type=3/axis=0/text；raw 44B 条目占位）。
+        let single = super::AlarmResult {
+            alarms: vec![super::AlarmMessage {
+                number: 10,
+                alarm_type: 3,
+                axis: 0,
+                text: "IMPROPER G-CODE".into(),
+                raw: vec![0x00; 44],
+            }],
+        };
+        assert_eq!(
+            alarm_to_value(&single),
+            Value::StringArray(vec!["IMPROPER G-CODE".into()])
+        );
+        // 多条：有序（typed 层可承载；Wire single-alarm 外即 Unsupported，B3-C）。
+        let multi = super::AlarmResult {
+            alarms: vec![
+                super::AlarmMessage {
+                    number: 10,
+                    alarm_type: 3,
+                    axis: 0,
+                    text: "IMPROPER G-CODE".into(),
+                    raw: vec![0x00; 44],
+                },
+                super::AlarmMessage {
+                    number: 20,
+                    alarm_type: 1,
+                    axis: 1,
+                    text: "SECOND".into(),
+                    raw: vec![0x00; 44],
+                },
+            ],
+        };
+        assert_eq!(
+            alarm_to_value(&multi),
+            Value::StringArray(vec!["IMPROPER G-CODE".into(), "SECOND".into()])
+        );
     }
 
     /// opmsg typed payload 内部精确闭合：267B 截断 / 269B trailing 均拒绝。

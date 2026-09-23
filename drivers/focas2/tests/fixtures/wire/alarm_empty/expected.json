@@ -1,0 +1,15 @@
+{
+  "operation": "alarm_value",
+  "alarms": [],
+  "mesa": {
+    "alarm": []
+  },
+  "source": {
+    "kind": "natural_empty_baseline",
+    "target": "192.168.15.165:8193",
+    "note": "MESSAGE->ALARM NO ALARM 同窗"
+  },
+  "wire": {
+    "data_len": 0
+  }
+}

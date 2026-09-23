@@ -56,11 +56,12 @@ async fn main() {
             number: 301,
             axis: 3,
         },
+        FocasAddress::Alarm,
     ];
     match api.read_batch(&addrs).await {
         Ok(vals) => {
             println!(
-                "status+feed+axis123+spindle+macro501+pmc+param6711+opmsg+gear1+maxrpm1+diag301a3 -> {vals:?}"
+                "status+feed+axis123+spindle+macro501+pmc+param6711+opmsg+gear1+maxrpm1+diag301a3+alarm -> {vals:?}"
             )
         }
         Err(e) => eprintln!("read_batch 失败：{e}"),
