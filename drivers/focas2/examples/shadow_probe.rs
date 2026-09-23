@@ -6,14 +6,16 @@
 //! - 范围：`docs/wire-cutover-matrix.md` 的 12 ready 点；servo/spindle load
 //!   value、tool/zofs 不纳入（HOLD，按 cutover matrix 记 documented）。
 //! - 比较语义：`Value` 全等（含变体；`F64` 按位比较，不做 epsilon）；
-//!   Native PR52 `ERR:` 占位（Gear/MaxRpm/Diagnosis/Alarm）与 Wire 真实值
-//!   的差异为已知生产边界，记 `KnownBoundary`，不计 mismatch。
-//! - 动态漂移（axis 位置、diagnosis REAL、spindle speed 等随现场变化的值）
-//!   只要两侧同窗先后、差值在现场变化解释内，记 `Drift`，不计 mismatch。
+//!   Native PR52 `ERR:` 占位与 Wire 真实值的差异，只对白名单地址记
+//!   `KnownNativeUnsupported`（gear/maxrpm/diagnosis/alarm），其他地址的
+//!   新 `ERR:` 一律暴露为 `Mismatch`（防误绿，后见 `judge`）。
+//! - 动态漂移：仅已知动态点（axis/spindle-speed/feed/macro/diagnosis）且
+//!   两侧 `Value` 变体一致时才记 `Drift`；变体不一致即 `Mismatch`
+//!   （如 `I32` 对 `U32/F64/String` 不得漂移，防类型错误误绿）。
 //!   真正同窗同地址 `Value` 不等且非动态，记 `Mismatch`（blocker）。
 //! - 用法：`MESA_SHADOW_HOST=192.168.15.165 cargo run -p mesa-driver-focas2
 //!   --example shadow_probe`（可选 `MESA_SHADOW_PORT`，默认 8193）。
-//!   退出码：`Mismatch>0 → 2`；仅 Drift/KnownBoundary → 0。
+//!   退出码：`Mismatch>0 → 2`；仅 Drift/Known → 0。
 
 use std::time::Duration;
 
@@ -50,19 +52,81 @@ fn is_dynamic(addr: &FocasAddress) -> bool {
     )
 }
 
+/// `Value` 变体判别（Shadow Phase 1 review：Drift 前必须先确认变体一致，
+/// 防 `I32` 对 `U32/F64/String` 的类型错误被当成正常漂移误绿）。
+fn value_variant(v: &Value) -> &'static str {
+    match v {
+        Value::Bool(_) => "Bool",
+        Value::I32(_) => "I32",
+        Value::U32(_) => "U32",
+        Value::I64(_) => "I64",
+        Value::U64(_) => "U64",
+        Value::F32(_) => "F32",
+        Value::F64(_) => "F64",
+        Value::String(_) => "String",
+        Value::Bytes(_) => "Bytes",
+        Value::DateTime(_) => "DateTime",
+        Value::BoolArray(_) => "BoolArray",
+        Value::I32Array(_) => "I32Array",
+        Value::U32Array(_) => "U32Array",
+        Value::I64Array(_) => "I64Array",
+        Value::U64Array(_) => "U64Array",
+        Value::F32Array(_) => "F32Array",
+        Value::F64Array(_) => "F64Array",
+        Value::StringArray(_) => "StringArray",
+        Value::DateTimeArray(_) => "DateTimeArray",
+    }
+}
+
 fn judge(addr: &FocasAddress, native: &Value, wire: &Value) -> Verdict {
     if native == wire {
         return Verdict::Equal;
     }
-    // Native PR52 占位 vs Wire 真实值：已知边界（Batch 1/2/3 豁免项）；
-    // opmsg 另归 Native debt（`EW_Length(2)` vs 有效结果，不伪造 Native 值）。
+    // Blocker 1 真修：`KnownNativeUnsupported/DEBT` 只对白名单地址开放。
+    // 白名单外任何地址的 Native `ERR:`（如 status/feed/axis/pmc/param 未来
+    // 出现新错误）一律落到 `Mismatch`，不得豁免（防误绿）。
     if let Value::String(s) = native
         && s.starts_with("ERR:")
     {
+        // opmsg debt：只接受当前已观测形态（`EW_Length(2)` 家族），其他新
+        // `ERR:` 暴露为 Mismatch（debt 不得成为万能豁免）。
         if matches!(addr, FocasAddress::OpMsg) {
-            return Verdict::KnownNativeDebt { native: s.clone() };
+            let u = s.to_ascii_uppercase();
+            if u.contains("EW_LENGTH") || u.contains("EW_UNKNOWN") {
+                return Verdict::KnownNativeDebt { native: s.clone() };
+            }
+            return Verdict::Mismatch {
+                native: format!("{native:?}"),
+                wire: format!("{wire:?}"),
+            };
         }
-        return Verdict::KnownNativeUnsupported { native: s.clone() };
+        // PR52 豁免白名单：gear / maxrpm / diagnosis / alarm（Batch 1/2/3）。
+        let whitelisted = matches!(
+            addr,
+            FocasAddress::Spindle {
+                kind: mesa_driver_focas2::SpindleKind::Gear,
+                ..
+            } | FocasAddress::Spindle {
+                kind: mesa_driver_focas2::SpindleKind::MaxRpm,
+                ..
+            } | FocasAddress::Diagnosis { .. }
+                | FocasAddress::Alarm
+        );
+        if whitelisted {
+            return Verdict::KnownNativeUnsupported { native: s.clone() };
+        }
+        return Verdict::Mismatch {
+            native: format!("{native:?}"),
+            wire: format!("{wire:?}"),
+        };
+    }
+    // Blocker 2 真修：Drift 前必须变体一致（`I32` 对 `U32/F64/String` 即
+    // Mismatch，不得漂移）；变体一致 + 已知动态点才允许 Drift。
+    if value_variant(native) != value_variant(wire) {
+        return Verdict::Mismatch {
+            native: format!("{native:?}"),
+            wire: format!("{wire:?}"),
+        };
     }
     if is_dynamic(addr) {
         return Verdict::Drift {
