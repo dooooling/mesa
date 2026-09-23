@@ -1,0 +1,48 @@
+{
+  "operation": "alarm_value",
+  "alarms": [
+    {
+      "no": 10,
+      "type": 3,
+      "axis": 0,
+      "len": 15,
+      "text": "IMPROPER G-CODE"
+    }
+  ],
+  "mesa": {
+    "alarm": [
+      "IMPROPER G-CODE"
+    ]
+  },
+  "source": {
+    "kind": "NCGuide_controlled_PS0010",
+    "target": "192.168.15.165:8193",
+    "request": "frame1 30B count=1 0x23[-1,29,2,32]",
+    "response": "frame2 dlen=48 no10/type3/axis0/len15/text",
+    "note": "controlled 已清除"
+  },
+  "wire": {
+    "data_len": 48,
+    "entry_len": 44,
+    "msg_len": 15,
+    "text_bytes": [
+      73,
+      77,
+      80,
+      82,
+      79,
+      80,
+      69,
+      82,
+      32,
+      71,
+      45,
+      67,
+      79,
+      68,
+      69,
+      0
+    ],
+    "text_encoding": "ASCII-compatible -> UTF-8 lossy (SJIS/local 未闭合，raw 保留)"
+  }
+}

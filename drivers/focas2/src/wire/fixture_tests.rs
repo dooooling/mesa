@@ -21,14 +21,18 @@
 //! - diagnosis 证据（D301）：`0x93[301,301,3,0]` → type=5 REAL →
 //!   `RawNumeric8(-10,10,3)` → Mesa F64(-0.010)；Batch 2 只 admit REAL。
 //! - opmsg 证据（O0/O1）：`0x34 type=4` → #3006 文本；Mesa String。
+//! - alarm 证据（empty/PS0010）：`0x23[-1,29,2,32]` → 空=[] /
+//!   单条 `no=10/type=3/axis=0/"IMPROPER G-CODE"` → StringArray 1 元；
+//!   非 single 即 Unsupported（B3-C）。
 //! - 本模块 `#[cfg(test)]` 且 crate 内部：直接调生产 decoder，无复刻。
 
 use std::path::PathBuf;
 
 use super::frame::{FRAME_HEADER_LEN, FocasFrame, PacketType, decode_header};
 use super::wire::{
-    decode_diagnosis_value, decode_feed_rate, decode_macro_value, decode_opmsg_value,
-    decode_spindle_speed, decode_spindle_word, decode_status_info, decode_system_info,
+    decode_alarm_value, decode_diagnosis_value, decode_feed_rate, decode_macro_value,
+    decode_opmsg_value, decode_spindle_speed, decode_spindle_word, decode_status_info,
+    decode_system_info,
 };
 use super::{cut_fixture_frames, fixture_dir, read_fixture_bytes};
 
@@ -126,6 +130,8 @@ pub(crate) fn run_all() {
     param_request_locked();
     diagnosis_301a3_decodes();
     diagnosis_request_locked();
+    alarm_empty_ps0010_decodes();
+    alarm_request_locked();
     opmsg_o1o0_decodes();
     opmsg_request_locked();
 }
@@ -858,6 +864,98 @@ fn diagnosis_request_locked() {
     }
     .encode();
     assert_eq!(build.len(), 40, "0x93 请求必须 40B");
+}
+
+/// alarm empty/PS0010（B3-B）：fixture 经生产 codec 解码 == expected
+///（空=[] / 单条 `no=10/type=3/axis=0/"IMPROPER G-CODE"` → StringArray 1 元；
+/// request 生产编码 == 捕获 fixture 全 40B）。
+fn alarm_empty_ps0010_decodes() {
+    use super::wire::alarm_to_value_for_test as to_value;
+    // 空：dlen=0 → []。
+    let frame0 = assemble_frame(&read("alarm_empty", "alarm_response_frame.bin"));
+    let r0 = decode_alarm_value(&frame0).expect("alarm_empty 必须解码");
+    assert!(r0.alarms.is_empty());
+    assert_eq!(
+        to_value(&r0),
+        mesa_core_types::Value::StringArray(vec![]),
+        "空报警 → StringArray([])"
+    );
+    // PS0010：三方同次一致。
+    let frame1 = assemble_frame(&read("alarm_ps0010", "alarm_response_frame.bin"));
+    let r1 = decode_alarm_value(&frame1).expect("alarm_ps0010 必须解码");
+    assert_eq!(r1.alarms.len(), 1);
+    assert_eq!(r1.alarms[0].number, 10);
+    assert_eq!(r1.alarms[0].alarm_type, 3);
+    assert_eq!(r1.alarms[0].axis, 0);
+    assert_eq!(r1.alarms[0].text, "IMPROPER G-CODE");
+    let exp = expected("alarm_ps0010");
+    assert_eq!(
+        exp["alarms"][0]["text"].as_str().unwrap(),
+        r1.alarms[0].text,
+        "Wire↔expected 文本同次一致"
+    );
+    assert_eq!(
+        to_value(&r1),
+        mesa_core_types::Value::StringArray(vec!["IMPROPER G-CODE".into()]),
+        "Mesa StringArray 1 元"
+    );
+    // 请求：生产编码器输出 == 捕获 fixture 全 40B（empty/PS0010 同请求）。
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+    use super::frame::{encode_generic_request, request_subpacket};
+    use super::wire::{ALARM_ARG0_OBSERVED, ALARM_ARG1_OBSERVED, ALARM_ARG2_OBSERVED};
+    use super::wire::{ALARM_ARG3_OBSERVED, DEV_CNC, FUNC_ALARM};
+    let build = FocasFrame {
+        origin: REQUEST_ORIGIN,
+        packet_type: PacketType::GENERIC_REQUEST,
+        payload: encode_generic_request(&[request_subpacket(
+            DEV_CNC,
+            FUNC_ALARM,
+            [
+                ALARM_ARG0_OBSERVED,
+                ALARM_ARG1_OBSERVED,
+                ALARM_ARG2_OBSERVED,
+                ALARM_ARG3_OBSERVED,
+                0,
+            ],
+        )]),
+    }
+    .encode();
+    assert_eq!(build.len(), 40, "0x23 请求必须 40B");
+    for group in ["alarm_empty", "alarm_ps0010"] {
+        let raw = read(group, "alarm_request_frame.bin");
+        let frames = cut_fixture_frames(&raw);
+        assert_eq!(frames.len(), 1, "{group} 必须恰好 1 帧");
+        assert_eq!(frames[0].len(), 40, "{group} 必须 40B");
+        assert_eq!(
+            frames[0], build,
+            "{group} production encoder 必须 == captured fixture 全 40B"
+        );
+    }
+}
+
+/// alarm 请求锁死（wire.rs 单测同源；fixture 侧只验全字节等价）。
+fn alarm_request_locked() {
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+    use super::frame::{encode_generic_request, request_subpacket};
+    use super::wire::{ALARM_ARG0_OBSERVED, ALARM_ARG1_OBSERVED, ALARM_ARG2_OBSERVED};
+    use super::wire::{ALARM_ARG3_OBSERVED, DEV_CNC, FUNC_ALARM};
+    let build = FocasFrame {
+        origin: REQUEST_ORIGIN,
+        packet_type: PacketType::GENERIC_REQUEST,
+        payload: encode_generic_request(&[request_subpacket(
+            DEV_CNC,
+            FUNC_ALARM,
+            [
+                ALARM_ARG0_OBSERVED,
+                ALARM_ARG1_OBSERVED,
+                ALARM_ARG2_OBSERVED,
+                ALARM_ARG3_OBSERVED,
+                0,
+            ],
+        )]),
+    }
+    .encode();
+    assert_eq!(build.len(), 40, "0x23 请求必须 40B");
 }
 
 /// opmsg O1/O0：`opmsg_response_frame.bin` 经生产 codec 解码 ==

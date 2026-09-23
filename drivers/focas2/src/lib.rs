@@ -221,7 +221,11 @@ fn resolve_generic_point(
             )? as u32;
             (FocasAddress::MacroVar { number }, DataType::F64)
         }
-        ("alarm", "value") => (FocasAddress::Alarm, DataType::String),
+        ("alarm", "value") => {
+            // B3-A：collection 语义（空=[] / 单条 1 元 / 多条 N 元有序；
+            // 不用 String + 分隔符冒充 collection）。
+            (FocasAddress::Alarm, DataType::StringArray)
+        }
         ("opmsg", "value") => (FocasAddress::OpMsg, DataType::String),
         ("tool", "offset") => {
             let number = int_param(
@@ -594,7 +598,9 @@ impl Driver for FocasDriver {
                         id: "value".into(),
                         label: LocalizedText::new("Alarm"),
                         type_spec: OutputTypeSpec::Fixed {
-                            data_type: DataType::String,
+                            // B3-A：collection 语义（空=[] / 单条 1 元 /
+                            // 多条 N 元有序；历史 String 占位已修正）。
+                            data_type: DataType::StringArray,
                         },
                         unit: None,
                         access: AccessMode::Read,
@@ -1545,7 +1551,7 @@ mod tests {
                 "alarm",
                 "value",
                 serde_json::json!({}),
-                DataType::String,
+                DataType::StringArray,
                 "alarm.value",
             ),
             (
