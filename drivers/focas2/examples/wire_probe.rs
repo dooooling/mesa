@@ -52,11 +52,15 @@ async fn main() {
         parse_address("opmsg").expect("opmsg 地址合法"),
         parse_address("spindle.gear.1").expect("gear 地址合法"),
         parse_address("spindle.maxrpm.1").expect("maxrpm 地址合法"),
+        FocasAddress::Diagnosis {
+            number: 301,
+            axis: 3,
+        },
     ];
     match api.read_batch(&addrs).await {
         Ok(vals) => {
             println!(
-                "status+feed+axis123+spindle+macro501+pmc+param6711+opmsg+gear1+maxrpm1 -> {vals:?}"
+                "status+feed+axis123+spindle+macro501+pmc+param6711+opmsg+gear1+maxrpm1+diag301a3 -> {vals:?}"
             )
         }
         Err(e) => eprintln!("read_batch 失败：{e}"),

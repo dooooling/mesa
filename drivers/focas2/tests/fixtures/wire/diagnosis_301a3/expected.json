@@ -1,0 +1,28 @@
+{
+  "operation": "diagnosis_value",
+  "number": 301,
+  "axis": 3,
+  "native": {
+    "rc": 0,
+    "datano": 301,
+    "type": 3,
+    "dgn_val": -10,
+    "dec_val": 3
+  },
+  "mesa": {
+    "diagnosis": -0.01
+  },
+  "source": {
+    "kind": "pktmon_isolated_capture",
+    "target": "192.168.15.165:8193",
+    "request": "frame1 30B count=1 0x93[301,301,3,0]",
+    "response": "frame2 dlen=264 datano301/attr3/type5REAL/(-10,10,3)",
+    "note": "Panel 301 Z=-0.010 同窗"
+  },
+  "wire": {
+    "type": 5,
+    "mantissa": -10,
+    "base": 10,
+    "exponent": 3
+  }
+}

@@ -398,6 +398,27 @@ pub struct OperatorMessage {
     pub text: String,
 }
 
+/// FOCAS `diagnosis_value`（`0x93`）typed 结果。diagnosis REAL Evidence PASS：
+/// `device=1/path=1/args=[n,n,axis,0]/aux=0`；单点语义，不做范围读。
+/// 布局：`[0..4]` BE32 datano + `[4..6]` attr（observed，不命名 axis echo——
+/// 至少需 axis=1/2 同 diagnosis 确认随 selector 变化后才冻结）+
+/// `[6..8]` BE16 type（`5` = REAL，公开定义；Batch 2 只支持 REAL）+
+/// `[8..16]` `RawNumeric8` 数值单元（`mantissa/base/exponent`）。
+/// `data_len=264`（与 param 同长是观测值，不作同构依据）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosisValue {
+    /// 原始数据区（`data_len=264` 全量；type 非 REAL 时的尾部不命名）。
+    pub raw: Vec<u8>,
+    /// 诊断号回显（`datano echo`；不符即 `Malformed`——配 A 读 B 必须死）。
+    pub datano: u32,
+    /// 属性/元数据（`[4..6]` 边界；`#301` observed=3，随 selector 变化前不命名）。
+    pub attr: u16,
+    /// 类型（`[6..8]` BE16；`5` = REAL；Batch 2 只 admit REAL）。
+    pub diag_type: u16,
+    /// 数值单元（`[8..16]`；`#301` = `(-10, 10, 3)` → `-0.010`）。
+    pub numeric: RawNumeric8,
+}
+
 /// param v1 已验证 identity-scale tail 形态（`value` 后 4B + 重复区头）。
 /// 只有 `00 0a 00 00`（Q3/6711 controlled 非零样本：`123/456/10027` 三点 +
 /// 恢复闭环）可输出 `I32`。Q0 的 `00 0a 00 03`（value=0，无辨别力——
@@ -499,6 +520,16 @@ pub(super) const CMD_PARAM: u16 = 0x008D;
 pub(super) const CMD_OPMSG: u16 = 0x0034;
 /// `opmsg` 产品 type（`#3006` Operator Message；O1 真机证实）。
 pub(super) const OPMSG_TYPE_PRODUCT: i32 = 4;
+/// `diagnosis_value` 命令（`0x93`，diagnosis REAL Evidence PASS：
+/// `#301/axis3` `device=1/path=1/args=[301,301,3,0]/aux=0`；单点语义，
+/// 不做范围读/ALL_AXES。`0x40/0x08` 未出现，独立 command，隔离）。
+pub(super) const CMD_DIAGNOSIS: u16 = 0x0093;
+/// diagnosis REAL 类型（公开定义 `type=5`；Batch 2 只 admit REAL，
+/// 其余 type 即 `Unsupported`，不猜 BYTE/WORD/DWORD）。
+pub(super) const DIAGNOSIS_TYPE_REAL: u16 = 5;
+/// diagnosis 响应数据体（`data_len=264`；`[0..16]` 头+数值已命名，
+/// 其余尾部保留，不先命名其他 index 语义）。
+pub const DIAGNOSIS_DATA_LEN: usize = 264;
 /// `spindle_speed` 命令（`0x25`，spindle Evidence PASS：
 /// S0~S4 `device=1/path=1/args=[0,0,0,0]/aux=0` 逐字节恒定，无 selector）。
 pub(super) const CMD_SPINDLE_SPEED: u16 = 0x0025;
@@ -543,6 +574,8 @@ pub(super) const FUNC_MACRO: u32 = 0x0001_0015;
 pub(super) const FUNC_PARAM: u32 = 0x0001_008D;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_OPMSG)`）。
 pub(super) const FUNC_OPMSG: u32 = 0x0001_0034;
+/// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_DIAGNOSIS)`）。
+pub(super) const FUNC_DIAGNOSIS: u32 = 0x0001_0093;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_SPINDLE_SPEED)`）。
 pub(super) const FUNC_SPINDLE_SPEED: u32 = 0x0001_0025;
 /// 兼容视图（同上；新代码用 `(DEV_CNC, PATH_CNC, CMD_SPINDLE_WORD_HEAD)`）。
@@ -968,6 +1001,56 @@ impl FocasClient {
         };
         guard.complete();
         match decode_param_value(&resp, number) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                Err(e)
+            }
+        }
+    }
+
+    /// `diagnosis_value(number, axis)`（diagnosis REAL Evidence PASS：
+    /// `0x93` count=1，`device=1/path=1/args=[n,n,axis,0]/aux=0`；单点语义，
+    /// 不做范围读/ALL_AXES。`number` 超 `c_short`、`axis > 32` 即
+    /// `Unsupported` 不发包（Wire-local checked；`axis=0` non-axis /
+    /// `1..32` one axis，与 Descriptor `0..32` 同合同；`-1` 不暴露，无 scalar 语义）。
+    /// 响应 `data_len=264`，`datano echo` + `attr` + `type=5 REAL` +
+    /// `RawNumeric8`；非 REAL 即 `Unsupported`（BYTE/WORD/DWORD 留后续窗口）。
+    pub async fn diagnosis_value(
+        &self,
+        number: u32,
+        axis: u8,
+    ) -> Result<DiagnosisValue, WireError> {
+        let n = i16::try_from(number)
+            .map_err(|_| WireError::Unsupported("diagnosis number out of c_short range"))?
+            as i32;
+        if axis > 32 {
+            return Err(WireError::Unsupported("diagnosis axis 0..32"));
+        }
+        let a = axis as i32;
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_DIAGNOSIS,
+                [n, n, a, 0, 0],
+            )]),
+        };
+        let mut guard = self.guard().await?;
+        let session = guard.session();
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                return Err(e);
+            }
+        };
+        guard.complete();
+        match decode_diagnosis_value(&resp, number) {
             Ok(v) => Ok(v),
             Err(e) => {
                 let fatal = e.is_session_fatal();
@@ -1577,6 +1660,45 @@ pub(super) fn decode_param_value(resp: &FocasFrame, number: u32) -> Result<Param
     })
 }
 
+/// `0x93` 响应解码（diagnosis REAL scalar，Batch 2）：slot 匹配
+/// `(device=1, path=1, cmd=0x93)`，成功数据精确 `== 264`
+/// （`#301/axis3` 真机证实；与 param 同长是观测值，不作同构依据）。
+/// 缺槽即 `CommandMismatch`；`status != 0` 走共用 Remote（point-local）。
+/// 字段：`datano echo`（必须 == 请求 number，否则 `Malformed`）+
+/// `attr [4..6]`（observed 边界，不命名 axis echo）+
+/// `type [6..8]`（必须 `== 5 REAL`，否则 `Unsupported`——BYTE/WORD/DWORD
+/// 留后续窗口，不猜）+ `RawNumeric8 [8..16]`（`validate` 门内才 admit）。
+pub(super) fn decode_diagnosis_value(
+    resp: &FocasFrame,
+    number: u32,
+) -> Result<DiagnosisValue, WireError> {
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub =
+        match_slot(&subs, DEV_CNC, PATH_CNC, CMD_DIAGNOSIS, 0).ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    if d.len() != DIAGNOSIS_DATA_LEN {
+        return Err(WireError::MalformedPayload);
+    }
+    let datano = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+    if datano != number {
+        return Err(WireError::MalformedPayload);
+    }
+    let attr = u16::from_be_bytes([d[4], d[5]]);
+    let diag_type = u16::from_be_bytes([d[6], d[7]]);
+    if diag_type != DIAGNOSIS_TYPE_REAL {
+        return Err(WireError::Unsupported("diagnosis non-REAL type"));
+    }
+    let numeric = RawNumeric8::decode(&d[8..16])?;
+    numeric.validate()?;
+    Ok(DiagnosisValue {
+        raw: d.to_vec(),
+        datano,
+        attr,
+        diag_type,
+        numeric,
+    })
+}
+
 /// `0x34` 响应解码（opmsg Evidence PASS）：slot 匹配
 /// `(device=1, path=1, cmd=0x34)`，成功数据精确 `== 268`
 /// （O1 `type=4` 非空 + O0 `type=0..3` 空真机证实）。缺槽即
@@ -1633,6 +1755,23 @@ fn macro_to_value(m: &MacroValue) -> Result<Value, WireError> {
 /// 此处只做类型映射（`i32 → I32`），不截断/不缩放/不猜 REAL。
 fn param_to_value(p: &ParamValue) -> Result<Value, WireError> {
     Ok(Value::I32(p.value))
+}
+
+/// Mesa `diagnosis/value` 映射（Batch 2 合同 B2-C1：engineering F64）。
+/// `DiagnosisValue.numeric → numer/denom → F64`（与 `macro_to_value` 同分层：
+/// typed result 保留 raw/datano/attr/type/numeric，Mesa 取 engineering；
+/// `#301: -10/10^3 = -0.010` Panel/Native/Wire 三方闭合证据）。
+/// fail-closed：`validate` 门已在 decoder 内；此处只做 `engineering_value` →
+/// F64（门外 scale 到不了 adapter）。
+/// NOTE：Descriptor 侧 `diagnosis/value` 历史占位为 `I32`；Batch 2 落地须
+/// 同步改为 `F64`（`lib.rs` 已改，此处不再脱节）。
+/// NOTE：codec 未落地前本函数无生产调用方（`#[allow(dead_code)]` 为合同
+/// 先行标记，调用方在 Batch 2 第二阶段接入；非废弃代码）。
+#[allow(dead_code)]
+fn diagnosis_to_value(v: &DiagnosisValue) -> Result<Value, WireError> {
+    let (numer, denom) = v.numeric.engineering_value()?;
+    // `denom = 10^exp > 0`（门内保证）；F64 除法（Mesa 产品合同 F64）。
+    Ok(Value::F64(numer as f64 / denom as f64))
 }
 
 /// Mesa `opmsg/value` 映射（opmsg Evidence PASS）：
@@ -1770,6 +1909,13 @@ pub(super) fn opmsg_to_value_for_test(m: &OperatorMessage) -> Result<Value, Wire
     opmsg_to_value(m)
 }
 
+/// fixture/test 专用：生产 `diagnosis_to_value` 同源入口（`#[cfg(test)]`，
+/// 不出 crate；diagnosis D301 fixture 回归用）。
+#[cfg(test)]
+pub(super) fn diagnosis_to_value_for_test(v: &DiagnosisValue) -> Result<Value, WireError> {
+    diagnosis_to_value(v)
+}
+
 /// fixture/test 专用：`Value::I32` 构造子（断言可读性用）。
 #[cfg(test)]
 pub(super) fn axis_value_for_test(v: i32) -> Value {
@@ -1779,12 +1925,13 @@ pub(super) fn axis_value_for_test(v: i32) -> Value {
 // ---------------------------------------------------------------------------
 // WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed + PR3 axis + PR54 spindle
 // + PR55 macro + PR56 pmc scalar + PR57 param + PR58 opmsg
-// + Batch 1 spindle gear/maxrpm）
+// + Batch 1 spindle gear/maxrpm + Batch 2 diagnosis REAL）
 // ---------------------------------------------------------------------------
 
-/// Wire 版 `FocasApi`（Batch 1：`system_info` + `Status` + `Feed` +
+/// Wire 版 `FocasApi`（Batch 2：`system_info` + `Status` + `Feed` +
 /// `Axis/absolute` + `ActiveSpindleSpeed` + `MacroVar` + `Pmc` scalar +
-/// `Param` + `OpMsg` + `Spindle/Gear|MaxRpm`；其余地址 `Unsupported`，
+/// `Param` + `OpMsg` + `Spindle/Gear|MaxRpm` + `Diagnosis/REAL`；其余地址
+/// `Unsupported`，
 /// fail-closed，不猜、不 fallback Native）。
 pub struct WireFocasApi {
     client: Arc<FocasClient>,
@@ -2004,6 +2151,32 @@ impl FocasApi for WireFocasApi {
                 param_map.insert(*number, r);
             }
         }
+        // Diagnosis 按 (number,axis) 去重各一次 0x93（REAL path；
+        // 超 c_short/axis>31 在 operation 内 fail-closed；
+        // 非 REAL 在 decoder 内 fail-closed，不到 adapter）。
+        let mut diag_map: BTreeMap<(u32, u8), Result<Value, String>> = BTreeMap::new();
+        for a in addresses {
+            if let FocasAddress::Diagnosis { number, axis } = a
+                && !diag_map.contains_key(&(*number, *axis))
+            {
+                let r: Result<Value, String> =
+                    match self.client.diagnosis_value(*number, *axis).await {
+                        Ok(v) => match diagnosis_to_value(&v) {
+                            Ok(val) => Ok(val),
+                            Err(e) => match Self::point_or_fatal(e) {
+                                Ok(Value::String(s)) => Err(s),
+                                Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                                Err(fatal) => return Err(fatal),
+                            },
+                        },
+                        Err(e) => match Self::point_or_fatal(e) {
+                            Ok(v) => Ok(v),
+                            Err(fatal) => return Err(fatal),
+                        },
+                    };
+                diag_map.insert((*number, *axis), r);
+            }
+        }
         // OpMsg：同批一次 0x34（产品固定 type=4；batch 多个 OpMsg 去重一次）。
         let need_opmsg = addresses.iter().any(|a| matches!(a, FocasAddress::OpMsg));
         let opmsg_r: Option<Result<Value, String>> = if need_opmsg {
@@ -2127,6 +2300,13 @@ impl FocasApi for WireFocasApi {
                     Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
                     Err(fatal) => return Err(fatal),
                 },
+                FocasAddress::Diagnosis { number, axis } => {
+                    match diag_map.get(&(*number, *axis)).cloned().unwrap() {
+                        Ok(v) => out.push(v),
+                        Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
+                        Err(fatal) => return Err(fatal),
+                    }
+                }
                 FocasAddress::OpMsg => match opmsg_r.clone().unwrap() {
                     Ok(v) => out.push(v),
                     Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
@@ -2187,7 +2367,7 @@ impl FocasApi for WireFocasApi {
                 _ => out.push(Value::String(format!(
                     "ERR:{}",
                     WireError::Unsupported(
-                        "Batch 1 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc/Param/OpMsg/SpindleGear/MaxRpm"
+                        "Batch 2 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc/Param/OpMsg/SpindleGear/MaxRpm/Diagnosis"
                     )
                 ))),
             }
@@ -4087,6 +4267,362 @@ mod tests {
         assert!(
             matches!(e, WireError::Unsupported(_)),
             "param=40000 必须 Unsupported（不发包）"
+        );
+    }
+
+    /// diagnosis `0x93` 请求：count=1（Evidence `#301/axis3` 冻结形态：
+    /// `args=[301,301,3,0]/aux=0`，单点语义，不做范围/ALL_AXES）。
+    #[test]
+    fn diagnosis_request_single_locked() {
+        use super::super::frame::encode_generic_request as enc;
+        let payload = enc(&[request_subpacket(
+            DEV_CNC,
+            FUNC_DIAGNOSIS,
+            [301, 301, 3, 0, 0],
+        )]);
+        // count=1 + 28B = 30 = 0x1e（与 CNC 系同长，function 换 0x93）。
+        assert_eq!(payload.len(), 0x1e);
+        assert_eq!(&payload[0..2], &[0x00, 0x01]);
+        let back = decode_generic_payload(&payload).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].function, FUNC_DIAGNOSIS);
+    }
+
+    /// diagnosis `#301/axis3` REAL 解码：`datano=301/attr=3/type=5/
+    /// (-10,10,3)` → `F64(-0.010)`（隔离抓包 + Native + Panel 三方证据）。
+    #[test]
+    fn decode_diagnosis_301_real_locked() {
+        // 真机 reply data 前 16B（`[0..16]` 已命名区；其余 248B 零填充）。
+        let mut data = vec![
+            0x00, 0x00, 0x01, 0x2d, // [0..4] datano=301
+            0x00, 0x03, // [4..6] attr observed=3
+            0x00, 0x05, // [6..8] type=5 REAL
+            0xff, 0xff, 0xff, 0xf6, // [8..12] mantissa=-10
+            0x00, 0x0a, // [12..14] base=10
+            0x00, 0x03, // [14..16] exponent=3
+        ];
+        data.extend(vec![0x00; DIAGNOSIS_DATA_LEN - 16]);
+        assert_eq!(data.len(), DIAGNOSIS_DATA_LEN);
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x01, 0x08]); // dlen=264
+        p.extend_from_slice(&data);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_DIAGNOSIS,
+                payload: p,
+            }]),
+        };
+        let v = decode_diagnosis_value(&frame, 301).unwrap();
+        assert_eq!(v.datano, 301);
+        assert_eq!(v.attr, 3);
+        assert_eq!(v.diag_type, DIAGNOSIS_TYPE_REAL);
+        assert_eq!(v.numeric.mantissa, -10);
+        assert_eq!(v.numeric.base, 10);
+        assert_eq!(v.numeric.exponent, 3);
+        assert_eq!(
+            diagnosis_to_value(&v).unwrap(),
+            Value::F64(-0.010),
+            "#301 → F64(-0.010)（B2-C1 engineering 合同）"
+        );
+    }
+
+    /// diagnosis 非 REAL 即 `Unsupported`（BYTE/WORD/DWORD 留后续窗口，不猜）。
+    #[test]
+    fn diagnosis_non_real_unsupported() {
+        let mut data = vec![
+            0x00, 0x00, 0x01, 0x2d, 0x00, 0x03, 0x00, 0x04, // type=4 非 REAL
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00,
+        ];
+        data.extend(vec![0x00; DIAGNOSIS_DATA_LEN - 16]);
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x01, 0x08]);
+        p.extend_from_slice(&data);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_DIAGNOSIS,
+                payload: p,
+            }]),
+        };
+        let e = decode_diagnosis_value(&frame, 301).unwrap_err();
+        assert!(
+            matches!(e, WireError::Unsupported(_)),
+            "type=4 必须 Unsupported，实际：{e:?}"
+        );
+    }
+
+    /// diagnosis datano 回显错配即 `Malformed`（配 A 读 B 必须死）。
+    #[test]
+    fn diagnosis_datano_mismatch_rejected() {
+        let mut data = vec![
+            0x00, 0x00, 0x01, 0x2d, 0x00, 0x03, 0x00, 0x05, 0xff, 0xff, 0xff, 0xf6, 0x00, 0x0a,
+            0x00, 0x03,
+        ];
+        data.extend(vec![0x00; DIAGNOSIS_DATA_LEN - 16]);
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x01, 0x08]);
+        p.extend_from_slice(&data);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_DIAGNOSIS,
+                payload: p,
+            }]),
+        };
+        let e = decode_diagnosis_value(&frame, 300).unwrap_err();
+        assert_eq!(e.to_string(), WireError::MalformedPayload.to_string());
+    }
+
+    /// diagnosis 缺 `0x93` 即 `CommandMismatch`（保守致命）。
+    #[test]
+    fn missing_diagnosis_is_mismatch() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_FEED, // 故意放错槽
+                payload: {
+                    let mut p = vec![0x00; 6];
+                    p.extend_from_slice(&[0x00, 0x08]);
+                    p.extend_from_slice(&[0x00; 8]);
+                    p
+                },
+            }]),
+        };
+        let e = decode_diagnosis_value(&frame, 301).unwrap_err();
+        assert!(matches!(e, WireError::CommandMismatch));
+        assert!(e.is_session_fatal());
+    }
+
+    /// diagnosis typed payload 内部精确闭合（263B 截断 / 265B trailing 均拒绝）。
+    #[test]
+    fn diagnosis_trailing_payload_rejected() {
+        // 263B 截断（少 1B）。
+        let mut data_short = vec![0x00; DIAGNOSIS_DATA_LEN - 1];
+        data_short[3] = 0x2d;
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x01, 0x07]);
+        p.extend_from_slice(&data_short);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_DIAGNOSIS,
+                payload: p,
+            }]),
+        };
+        assert_eq!(
+            decode_diagnosis_value(&frame, 301).unwrap_err().to_string(),
+            WireError::MalformedPayload.to_string(),
+            "263B 截断必须 Malformed"
+        );
+        // 265B trailing（多 1B）。
+        let mut data_long = vec![0x00; DIAGNOSIS_DATA_LEN];
+        data_long.push(0x00);
+        let mut p2 = vec![0x00; 6];
+        p2.extend_from_slice(&[0x01, 0x09]);
+        p2.extend_from_slice(&data_long);
+        let frame2 = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_DIAGNOSIS,
+                payload: p2,
+            }]),
+        };
+        assert_eq!(
+            decode_diagnosis_value(&frame2, 301)
+                .unwrap_err()
+                .to_string(),
+            WireError::MalformedPayload.to_string(),
+            "265B trailing 必须 Malformed"
+        );
+    }
+
+    /// diagnosis number/axis 越界 fail-closed：超 `c_short` / `axis>32` 不发包。
+    #[tokio::test]
+    async fn diagnosis_range_fail_closed() {
+        let client = FocasClient::new(std::time::Duration::from_millis(10));
+        let e = client.diagnosis_value(40000, 0).await.unwrap_err();
+        assert!(
+            matches!(e, WireError::Unsupported(_)),
+            "number=40000 必须 Unsupported（不发包）"
+        );
+        let e = client.diagnosis_value(301, 33).await.unwrap_err();
+        assert!(
+            matches!(e, WireError::Unsupported(_)),
+            "axis=33 必须 Unsupported（不发包）"
+        );
+    }
+
+    /// diagnosis batch 去重：相同 `(number,axis)` 只去重一次 exchange
+    ///（与生产 `diag_map` 同源 key 形状；不同 axis 即不同 key）。
+    #[test]
+    fn diagnosis_batch_dedup_locked() {
+        use crate::address::FocasAddress;
+        let addrs = vec![
+            FocasAddress::Diagnosis {
+                number: 301,
+                axis: 3,
+            },
+            FocasAddress::Diagnosis {
+                number: 301,
+                axis: 3,
+            },
+            FocasAddress::Diagnosis {
+                number: 301,
+                axis: 1,
+            },
+            FocasAddress::Diagnosis {
+                number: 300,
+                axis: 0,
+            },
+        ];
+        // 生产同源去重逻辑（BTreeMap key 形状锁死）。
+        use std::collections::BTreeSet;
+        let mut keys = BTreeSet::new();
+        let mut order = Vec::new();
+        for a in &addrs {
+            if let FocasAddress::Diagnosis { number, axis } = a
+                && keys.insert((*number, *axis))
+            {
+                order.push((*number, *axis));
+            }
+        }
+        assert_eq!(order, vec![(301, 3), (301, 1), (300, 0)]);
+    }
+
+    /// diagnosis axis isolation（B2-C2 核心产品合同）：
+    /// `(301,3) != (301,1) != (301,0)`，三者 label 互异、解析互异、
+    /// batch 不合并（axis 是独立语义维度，不拼进 number）。
+    #[test]
+    fn diagnosis_axis_isolation_locked() {
+        use crate::address::{FocasAddress, parse_address};
+        let a3 = FocasAddress::Diagnosis {
+            number: 301,
+            axis: 3,
+        };
+        let a1 = FocasAddress::Diagnosis {
+            number: 301,
+            axis: 1,
+        };
+        let a0 = FocasAddress::Diagnosis {
+            number: 301,
+            axis: 0,
+        };
+        // 三者互不相等（axis 参与 identity）。
+        assert_ne!(a3, a1);
+        assert_ne!(a3, a0);
+        assert_ne!(a1, a0);
+        // label 互异（axis=0 收敛旧形，axis!=0 后缀区分）。
+        assert_eq!(a3.source_label(), "diagnosis[301]@axis3");
+        assert_eq!(a1.source_label(), "diagnosis[301]@axis1");
+        assert_eq!(a0.source_label(), "diagnosis[301]");
+        // 旧调试语法：纯 number 解析得 axis=0；后缀形态拒收（不扩语法）。
+        assert_eq!(
+            parse_address("diagnosis.301").unwrap(),
+            FocasAddress::Diagnosis {
+                number: 301,
+                axis: 0
+            }
+        );
+        assert!(parse_address("diagnosis.301.3").is_err());
+        assert!(parse_address("diagnosis.301:3").is_err());
+    }
+
+    /// diagnosis REAL 零值：`mantissa=0/base=10/exp=3` → `F64(0.0)`
+    ///（零值正常通过 engineering 门，不因 mantissa=0 拒绝）。
+    #[test]
+    fn diagnosis_real_zero_locked() {
+        let mut data = vec![
+            0x00, 0x00, 0x01, 0x2d, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a,
+            0x00, 0x03,
+        ];
+        data.extend(vec![0x00; DIAGNOSIS_DATA_LEN - 16]);
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x01, 0x08]);
+        p.extend_from_slice(&data);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_DIAGNOSIS,
+                payload: p,
+            }]),
+        };
+        let v = decode_diagnosis_value(&frame, 301).unwrap();
+        assert_eq!(v.numeric.mantissa, 0);
+        assert_eq!(
+            diagnosis_to_value(&v).unwrap(),
+            Value::F64(0.0),
+            "mantissa=0 → F64(0.0)"
+        );
+    }
+
+    /// diagnosis 非 10 基拒绝：`base=100` 即 `Unsupported`，不得输出 F64
+    ///（无 base=100 合同；`0.0001` 看似正常但语义未闭合，fail-closed）。
+    #[test]
+    fn diagnosis_base100_unsupported() {
+        let mut data = vec![
+            0x00, 0x00, 0x01, 0x2d, 0x00, 0x03, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x64,
+            0x00, 0x04,
+        ];
+        data.extend(vec![0x00; DIAGNOSIS_DATA_LEN - 16]);
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x01, 0x08]);
+        p.extend_from_slice(&data);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_DIAGNOSIS,
+                payload: p,
+            }]),
+        };
+        let v = decode_diagnosis_value(&frame, 301).unwrap_err();
+        assert!(
+            matches!(v, WireError::Unsupported(_)),
+            "base=100 必须在 decoder validate 门拒绝，实际：{v:?}"
+        );
+    }
+
+    /// diagnosis 负指数拒绝：`exponent=-1` 即 `Unsupported`（协议 `i16`
+    /// 允许表达负值，但当前 `0..=9` 门外语义未闭合；不得 `powi` 放行未知语义）。
+    #[test]
+    fn diagnosis_negative_exponent_unsupported() {
+        let mut data = vec![
+            0x00, 0x00, 0x01, 0x2d, 0x00, 0x03, 0x00, 0x05, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x0a,
+            0xff, 0xff,
+        ];
+        data.extend(vec![0x00; DIAGNOSIS_DATA_LEN - 16]);
+        let mut p = vec![0x00; 6];
+        p.extend_from_slice(&[0x01, 0x08]);
+        p.extend_from_slice(&data);
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[GenericSubpacket {
+                control_device: DEV_CNC,
+                function: FUNC_DIAGNOSIS,
+                payload: p,
+            }]),
+        };
+        let v = decode_diagnosis_value(&frame, 301).unwrap_err();
+        assert!(
+            matches!(v, WireError::Unsupported(_)),
+            "exponent=-1 必须 Unsupported，实际：{v:?}"
         );
     }
 }

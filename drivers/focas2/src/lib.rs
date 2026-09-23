@@ -289,7 +289,12 @@ fn resolve_generic_point(
                 0,
                 crate::native::FOCAS_C_SHORT_MAX as u64,
             )? as u32;
-            (FocasAddress::Diagnosis { number }, DataType::I32)
+            // B2-C2：`axis` 独立可选参数（`0` non-axis / `1..N` one axis；
+            // Batch 2 不支持 ALL_AXES；不编码进 number，不按号 hardcode）。
+            // 上限取 32（含 0i-F 3 轴余量；Wire 侧 `1..=31` 再门，见 codec）。
+            let axis = int_param("axis", false, 0, 0, 32).unwrap_or(0) as u8;
+            // B2-C1：Mesa 输出 engineering F64（REAL path；raw 只留 typed）。
+            (FocasAddress::Diagnosis { number, axis }, DataType::F64)
         }
         (r, _)
             if ![
@@ -687,21 +692,35 @@ impl Driver for FocasDriver {
                     id: "diagnosis".into(),
                     label: LocalizedText::new("Diagnosis"),
                     parameters: SchemaDescriptor {
-                        fields: vec![{
-                            let mut f =
-                                FieldDescriptor::new("number", "Number", FieldType::Integer)
-                                    .required(true);
-                            f.validation.min = Some(0.0);
-                            // FFI `c_short` 可表示上限（resolver 同上限）。
-                            f.validation.max = Some(crate::native::FOCAS_C_SHORT_MAX as f64);
-                            f
-                        }],
+                        fields: vec![
+                            {
+                                let mut f =
+                                    FieldDescriptor::new("number", "Number", FieldType::Integer)
+                                        .required(true);
+                                f.validation.min = Some(0.0);
+                                // FFI `c_short` 可表示上限（resolver 同上限）。
+                                f.validation.max = Some(crate::native::FOCAS_C_SHORT_MAX as f64);
+                                f
+                            },
+                            {
+                                // B2-C2：axis 独立可选参数（0 non-axis /
+                                // 1..N one axis；Batch 2 不支持 ALL_AXES）。
+                                let mut f =
+                                    FieldDescriptor::new("axis", "Axis", FieldType::Integer)
+                                        .required(false);
+                                f.validation.min = Some(0.0);
+                                f.validation.max = Some(32.0);
+                                f
+                            },
+                        ],
                     },
                     outputs: vec![OutputDescriptor {
                         id: "value".into(),
                         label: LocalizedText::new("Value"),
                         type_spec: OutputTypeSpec::Fixed {
-                            data_type: DataType::I32,
+                            // B2-C1：engineering F64（REAL path；历史 I32 占位
+                            // 从未经真实 FANUC 行为验证，Batch 2 修正）。
+                            data_type: DataType::F64,
                         },
                         unit: None,
                         access: AccessMode::Read,
@@ -1568,8 +1587,16 @@ mod tests {
                 "diagnosis",
                 "value",
                 serde_json::json!({"number": 0}),
-                DataType::I32,
+                DataType::F64,
                 "diagnosis[0]",
+            ),
+            // B2-C2：axis 独立参数（默认 0；301:3 走 axis=3，不拼进 number）。
+            (
+                "diagnosis",
+                "value",
+                serde_json::json!({"number": 301, "axis": 3}),
+                DataType::F64,
+                "diagnosis[301]@axis3",
             ),
         ];
         let tested: std::collections::BTreeSet<(String, String)> = cases

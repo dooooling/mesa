@@ -67,9 +67,13 @@ pub enum FocasAddress {
         addr: u32,
         bit: Option<u8>,
     },
-    /// 诊断（预留）
+    /// 诊断（B2-C2 已冻结：`number` 必选 + `axis` 可选独立参数；
+    /// `axis=0` non-axis / `1..N` one axis；Batch 2 不支持 `ALL_AXES(-1)`——
+    /// scalar `diagnosis/value → F64` 合同装不下多轴数组语义；
+    /// 不 hardcode、不拼进 number、不按号静态规则）。
     Diagnosis {
         number: u32,
+        axis: u8,
     },
     /// 刀具（TOOL 8：number/offset/zofs）
     Tool {
@@ -200,7 +204,13 @@ impl FocasAddress {
                 Some(b) => format!("pmc.{kind}{addr}.{b}"),
                 None => format!("pmc.{kind}{addr}"),
             },
-            Self::Diagnosis { number } => format!("diagnosis[{number}]"),
+            Self::Diagnosis { number, axis } => {
+                if *axis == 0 {
+                    format!("diagnosis[{number}]")
+                } else {
+                    format!("diagnosis[{number}]@axis{axis}")
+                }
+            }
             Self::Tool { kind, number } => match kind {
                 ToolKind::Number => "tool.number".into(),
                 _ => format!("tool.{}[{number}]", kind.canonical_name()),
@@ -529,15 +539,24 @@ fn parse_pmc(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
 }
 
 fn parse_diagnosis(s: &str, raw: &str) -> Result<FocasAddress, AddressError> {
+    // B2-C2 已冻结：旧调试语法只收 `diagnosis` / `diagnosis.<number>`
+    // （`axis` 默认为 0 = non-axis；`diagnosis.301.xxx` 仍 Invalid——
+    // axis 不编码进 number 字符串，产品层走 Descriptor 独立 `axis` 参数）。
     let rest = s.trim_start_matches("diagnosis").trim_start_matches('.');
     if rest.is_empty() {
-        return Ok(FocasAddress::Diagnosis { number: 0 });
+        return Ok(FocasAddress::Diagnosis { number: 0, axis: 0 });
+    }
+    if rest.contains('.') || rest.contains(':') {
+        return Err(AddressError::Invalid {
+            input: raw.to_string(),
+            reason: "diagnosis axis 不编码进地址字符串（走 Descriptor axis 参数）".into(),
+        });
     }
     let n: u32 = rest.parse().map_err(|_| AddressError::Invalid {
         input: raw.to_string(),
         reason: format!("诊断号 `{rest}` 非法"),
     })?;
-    Ok(FocasAddress::Diagnosis { number: n })
+    Ok(FocasAddress::Diagnosis { number: n, axis: 0 })
 }
 
 #[cfg(test)]
@@ -751,7 +770,10 @@ mod tests {
             }),
             "pmc.R100.3"
         );
-        assert_eq!(label(FocasAddress::Diagnosis { number: 0 }), "diagnosis[0]");
+        assert_eq!(
+            label(FocasAddress::Diagnosis { number: 0, axis: 0 }),
+            "diagnosis[0]"
+        );
         assert_eq!(
             label(FocasAddress::Tool {
                 kind: ToolKind::Offset,

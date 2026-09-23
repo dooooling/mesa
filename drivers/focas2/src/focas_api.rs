@@ -149,7 +149,15 @@ impl FakeFocasApi {
                     Value::I32((r % 256) as i32)
                 }
             }
-            FocasAddress::Diagnosis { number: _ } => Value::I32((r % 2001) as i32 - 1000),
+            FocasAddress::Diagnosis { number: _, axis: _ } => {
+                // Diagnosis 不进入 Fake random 模拟。
+                // Native/Wire 合同需要真实 ABI evidence；
+                // Fake 若未来支持，必须复用 diagnosis REAL contract
+                // （engineering F64；见 `diagnosis_to_value` B2-C1），
+                // 不得回退 `Value::I32(random)` 伪协议。
+                // 当前 PR52 前门 fail-closed，此分支不可达。
+                unreachable!("diagnosis fake must stay fail-closed (PR52)")
+            }
             FocasAddress::Param { number: _ } => Value::I32((r % 1000) as i32),
             FocasAddress::ProgramDir => Value::String(format!("DIR{}", r % 10)),
             FocasAddress::ProgramUpload => Value::String(format!("UP{}", r % 10)),
@@ -1175,7 +1183,7 @@ mod tests {
         // 危险 6 类 → Noopt（FFI 前拦截）。
         for addr in [
             FocasAddress::Alarm,
-            FocasAddress::Diagnosis { number: 0 },
+            FocasAddress::Diagnosis { number: 0, axis: 0 },
             FocasAddress::Spindle {
                 spindle: 1,
                 kind: SpindleKind::Load,
@@ -1307,7 +1315,7 @@ mod tests {
                     kind: SpindleKind::MaxRpm,
                 },
                 FocasAddress::ServoLoad { axis: 1 },
-                FocasAddress::Diagnosis { number: 0 },
+                FocasAddress::Diagnosis { number: 0, axis: 0 },
                 FocasAddress::Alarm,
             ])
             .await;
