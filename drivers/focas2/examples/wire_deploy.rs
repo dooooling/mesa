@@ -17,8 +17,10 @@
 //!   point count drift=0 / sequence 异常=0`（首批 `sequence==1`，后续 `>last`；
 //!   缺口允许，回退/停滞 fail）。无 Native 并行（不是 Shadow）。
 //! D2 生命周期（fresh recreate 口径）：`MESA_DEPLOY_ROUNDS`（默认 5）轮
-//!   `open→configure→apply→run→cancel→join→drop重建`；门：Wire session 正确关闭 +
-//!   重启可重连 + 无僵尸 task + 无旧 session 污染 + point map/sequence 正常。
+//!   `open→configure→apply→run→cancel→join→drop重建`；门：每轮 run clean join +
+//!   下一轮重新 open/connect/read 成功 + 无 join timeout/zombie observed +
+//!   point map/sequence 正常。不声称“run 明确调用了 disconnect”
+//!   （当前可证明的是轮次干净交接，不是显式 session 关闭调用）。
 //! D3 真实 reconnect：本 harness 默认 NOT-PROVEN（无安全窗口不制造故障，
 //!   不为绿表制造假证据；live 主 READ_FAILED 待 CNC 配合，见 Gate 1 canary 口径）。
 //! D4 ARM / Raspberry Pi 3B：独立 deployment gate；本 harness 只打印本机
@@ -312,7 +314,9 @@ async fn main() {
                     }
                     // sequence 门（轮内；Core 合同：新流首批 `sequence==1`，
                     // 后续 `>last_seq`；缺口允许，回退/停滞 fail）。
-                    if got == 0 {
+                    // NOTE：`got` 已在上文 `+= 1`，首批对应 `got == 1`
+                    //（此前 `got == 0` 分支永不可达，首批门实际漏检，见 PR #67）。
+                    if got == 1 {
                         if b.sequence != 1 {
                             total.sequence_anomaly += 1;
                             total.bad_log.push(format!(
@@ -359,8 +363,8 @@ async fn main() {
             }
         }
         last_seq_by_round.push(last_seq);
-        // D2 stop：cancel 即 run 退出（Wire session 正确关闭由 run 语义保证；
-        // 僵尸 task 由 join 超时发现）。
+        // D2 stop：cancel 后 15s 内 join 成功即 clean（可证明：轮次干净交接 +
+        // 无 join timeout/zombie observed；不声称显式 disconnect 调用，见文件头）。
         shutdown.cancel();
         match tokio::time::timeout(Duration::from_secs(15), run_handle).await {
             Ok(Ok(Ok(()))) => println!("[DEPLOY] round {round} stop OK（run 正常退出）"),
