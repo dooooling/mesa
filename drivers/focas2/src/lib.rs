@@ -32,6 +32,22 @@ pub mod wire_pub {
     pub use crate::wire::WireFocasApi;
 }
 
+/// Cutover Gate 1 canary 专用窄口（`#[doc(hidden)]` 非稳定、诊断专用）：
+/// 允许 canary 在持有 `Arc<WireFocasApi>` 时只断其自有 Wire session
+/// （read-time fatal 用；不碰对端/CNC，不碰其他实例，不碰 Native/FWLIB）。
+/// 生产 `FocasDriver` 路径不用此模块。
+#[doc(hidden)]
+pub mod canary_pub {
+    use std::sync::Arc;
+
+    use crate::wire::WireFocasApi;
+
+    /// 只断给定 Wire 实例的自有 session（canary Gate 6 用）。
+    pub async fn disconnect_wire_session(api: &Arc<WireFocasApi>) {
+        api.disconnect_session_for_canary().await;
+    }
+}
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -779,10 +795,21 @@ impl Driver for FocasDriver {
                 "use_native=false 仅在测试环境 MESA_ALLOW_FAKE_NATIVE=1 时允许",
             ));
         }
-        let api: Arc<dyn FocasApiTrait> = if use_native {
-            Arc::new(NativeFocasApi::new())
-        } else {
-            Arc::new(FakeFocasApi::new())
+        // Cutover Gate 1：显式 opt-in 路由（默认 Native；无 fallback/hybrid）。
+        // `use_native=false`（Fake）与 `backend=wire` 互斥：Fake 只用于测试骨架，
+        // 不得与 production Wire 混用（混用即 BAD_CONFIG）。
+        if !use_native && cfg.backend == FocasBackend::Wire {
+            return Err(SdkDriverError::configuration(
+                "BAD_CONFIG",
+                "use_native=false 与 backend=wire 互斥（Fake 仅测试骨架）",
+            ));
+        }
+        let api: Arc<dyn FocasApiTrait> = match (use_native, cfg.backend) {
+            (false, _) => Arc::new(FakeFocasApi::new()),
+            (true, FocasBackend::Native) => Arc::new(NativeFocasApi::new()),
+            (true, FocasBackend::Wire) => Arc::new(crate::wire_pub::WireFocasApi::new(
+                std::time::Duration::from_millis(cfg.timeout_ms),
+            )),
         };
         Ok(Box::new(FocasConnection {
             cfg,
@@ -877,6 +904,38 @@ struct FocasConnConfig {
     host: String,
     port: u16,
     timeout_ms: u64,
+    /// Cutover Gate 1：生产后端显式 opt-in（`native` 默认 / `wire` 显式）。
+    /// 不做 fallback、不做 hybrid、不按地址猜后端（见 open_connection）。
+    backend: FocasBackend,
+}
+
+/// Cutover Gate 1 后端选择（显式 opt-in；默认 Native）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum FocasBackend {
+    /// 默认生产后端（Fwlib FFI；全部可信路径以此为准）。
+    #[default]
+    Native,
+    /// 显式 opt-in 的纯 Wire 后端（`WireFocasApi`；READY allowlist 外
+    /// configure 即拒；失败不 fallback Native，见 Gate 3 错误语义）。
+    Wire,
+}
+
+impl FocasBackend {
+    fn parse(v: &serde_json::Value) -> Result<Self, SdkDriverError> {
+        match v
+            .get("backend")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+        {
+            None => Ok(Self::Native),
+            Some(s) if s == "native" => Ok(Self::Native),
+            Some(s) if s == "wire" => Ok(Self::Wire),
+            Some(other) => Err(SdkDriverError::configuration(
+                "BAD_CONFIG",
+                format!("backend `{other}` 非法，期望 native|wire"),
+            )),
+        }
+    }
 }
 
 impl Default for FocasConnConfig {
@@ -885,6 +944,7 @@ impl Default for FocasConnConfig {
             host: "127.0.0.1".into(),
             port: 8193,
             timeout_ms: 3000,
+            backend: FocasBackend::Native,
         }
     }
 }
@@ -910,10 +970,12 @@ impl FocasConnConfig {
         if port == 0 {
             return Err(SdkDriverError::configuration("BAD_CONFIG", "port 非法"));
         }
+        let backend = FocasBackend::parse(v)?;
         Ok(Self {
             host,
             port,
             timeout_ms,
+            backend,
         })
     }
 }
@@ -967,20 +1029,72 @@ impl std::fmt::Debug for FocasConnection {
 }
 
 // 将 Value 校验为期望的 DataType（用于 configure 阶段快速失败）
+// Cutover Gate 2 真修：与 `DataType` 完整对齐（含 Bytes/DateTime/全部 Array）。
+// alarm `StringArray` 在此之前会误判 BAD（Wire codec 正确但 adapter 错杀）。
 fn value_fits_data_type(v: &Value, dt: DataType) -> bool {
     match (v, dt) {
         (Value::Bool(_), DataType::Bool) => true,
         (Value::U32(_), DataType::U32) => true,
         (Value::I32(_), DataType::I32) => true,
+        (Value::I64(_), DataType::I64) => true,
+        (Value::U64(_), DataType::U64) => true,
         (Value::F32(_), DataType::F32) => true,
         (Value::F64(_), DataType::F64) => true,
         (Value::String(_), DataType::String) => true,
+        (Value::Bytes(_), DataType::Bytes) => true,
+        (Value::DateTime(_), DataType::DateTime) => true,
+        (Value::BoolArray(_), DataType::BoolArray) => true,
+        (Value::I32Array(_), DataType::I32Array) => true,
+        (Value::U32Array(_), DataType::U32Array) => true,
+        (Value::I64Array(_), DataType::I64Array) => true,
+        (Value::U64Array(_), DataType::U64Array) => true,
+        (Value::F32Array(_), DataType::F32Array) => true,
+        (Value::F64Array(_), DataType::F64Array) => true,
+        (Value::StringArray(_), DataType::StringArray) => true,
+        (Value::DateTimeArray(_), DataType::DateTimeArray) => true,
         // 允许一定宽容：U32/I32 互通，F32/F64 互通
         (Value::U32(_), DataType::I32) => true,
         (Value::I32(_), DataType::U32) => true,
         (Value::F32(_), DataType::F64) => true,
         (Value::F64(_), DataType::F32) => true,
         _ => false,
+    }
+}
+
+/// Cutover Gate 1：Wire backend READY allowlist（configure-time fail-closed）。
+/// READY 12 类（machine/status+feed+spindle_speed、axis/absolute、
+/// spindle/gear+maxrpm、macro/pmc/param/diagnosis/opmsg/alarm）→ `Ok(())`；
+/// HOLD（servo/spindle load、tool 系）→ `Err(reason)`，configure 直接拒绝。
+///program 系（ProgramNumber/Main/Name/Dir/Info/Upload）Wire 未实现 → 拒绝。
+fn wire_ready_gate(addr: &FocasAddress) -> Result<(), &'static str> {
+    use address::{AxisKind, SpindleKind, ToolKind};
+    match addr {
+        FocasAddress::Status
+        | FocasAddress::Feed
+        | FocasAddress::ActiveSpindleSpeed
+        | FocasAddress::OpMsg
+        | FocasAddress::Alarm => Ok(()),
+        FocasAddress::Axis { kind, .. } => {
+            if *kind == AxisKind::Absolute {
+                Ok(())
+            } else {
+                Err("Wire 未实现非 Absolute 轴读路径")
+            }
+        }
+        FocasAddress::Spindle { kind, .. } => match kind {
+            SpindleKind::Gear | SpindleKind::MaxRpm => Ok(()),
+            _ => Err("Wire spindle 仅支持 gear/maxrpm（load/speed HOLD）"),
+        },
+        FocasAddress::MacroVar { .. }
+        | FocasAddress::Pmc { .. }
+        | FocasAddress::Param { .. }
+        | FocasAddress::Diagnosis { .. } => Ok(()),
+        FocasAddress::ServoLoad { .. } => Err("Wire servo/load HOLD（等非零 evidence）"),
+        FocasAddress::Tool { kind, .. } => match kind {
+            ToolKind::Number => Err("Wire tool.number 未实现"),
+            _ => Err("Wire tool 系 HOLD（offset/length/zofs 语义债）"),
+        },
+        _ => Err("Wire 未实现该地址族"),
     }
 }
 
@@ -1066,6 +1180,22 @@ impl DriverConnection for FocasConnection {
                             &sel.parameters,
                             &out.point_key,
                         )?;
+                        // Cutover Gate 1：Wire backend configure-time allowlist。
+                        // READY 12 类外（servo/spindle load、tool 系 HOLD）直接
+                        // configure 拒绝，不等启动后单点 BAD（见 wire_ready_gate）。
+                        if self.cfg.backend == FocasBackend::Wire
+                            && let Err(reason) = wire_ready_gate(&addr)
+                        {
+                            return Err(SdkDriverError::configuration(
+                                "UNSUPPORTED_POINT",
+                                format!(
+                                    "point `{}` backend=wire 不支持 {}（{}）",
+                                    out.point_key,
+                                    addr.source_label(),
+                                    reason
+                                ),
+                            ));
+                        }
                         indices.push(new_points.len());
                         new_points.push(PointSpec {
                             key: out.point_key.clone(),
@@ -1175,6 +1305,9 @@ impl DriverConnection for FocasConnection {
             }
         }
 
+        // canary 诊断钩子已移除（Gate 1 canary 改用“同进程双连接”法，
+        // 见 wire_canary.rs Gate 6：不断开被测连接，另建对照连接做 fault
+        // 侧写；生产 run() 无注入点，保持 E1 形态）。
         use std::sync::atomic::{AtomicU64, Ordering};
         let seq = Arc::new(AtomicU64::new(1));
 
@@ -1451,6 +1584,161 @@ mod tests {
             cfg: FocasConnConfig::default(),
             api: Arc::new(FakeFocasApi::new()),
             plan: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Cutover Gate 1 回归：`backend` 解析 + Wire READY allowlist。
+    /// - 缺省/非法 backend：缺省 Native；非法 BAD_CONFIG。
+    /// - Wire + 12 READY：configure PASS；Wire + 5 HOLD
+    ///  （servo/spindle load、tool 系）configure 即 UNSUPPORTED_POINT。
+    #[tokio::test]
+    async fn wire_backend_gate1_locked() {
+        // backend 解析。
+        let native_cfg = FocasConnConfig::from_json(&serde_json::json!({})).unwrap();
+        assert_eq!(native_cfg.backend, FocasBackend::Native);
+        let wire_cfg = FocasConnConfig::from_json(&serde_json::json!({"backend": "wire"})).unwrap();
+        assert_eq!(wire_cfg.backend, FocasBackend::Wire);
+        assert!(FocasConnConfig::from_json(&serde_json::json!({"backend": "bogus"})).is_err());
+        // allowlist：READY 12 类全过。
+        for addr in [
+            FocasAddress::Status,
+            FocasAddress::Feed,
+            FocasAddress::ActiveSpindleSpeed,
+            FocasAddress::Axis {
+                axis: 1,
+                kind: address::AxisKind::Absolute,
+            },
+            FocasAddress::Spindle {
+                spindle: 1,
+                kind: address::SpindleKind::Gear,
+            },
+            FocasAddress::Spindle {
+                spindle: 1,
+                kind: address::SpindleKind::MaxRpm,
+            },
+            FocasAddress::MacroVar { number: 501 },
+            FocasAddress::Pmc {
+                kind: 'R',
+                addr: 100,
+                bit: None,
+            },
+            FocasAddress::Param { number: 6711 },
+            FocasAddress::Diagnosis {
+                number: 301,
+                axis: 3,
+            },
+            FocasAddress::OpMsg,
+            FocasAddress::Alarm,
+        ] {
+            assert!(wire_ready_gate(&addr).is_ok(), "{addr:?} 必须 READY",);
+        }
+        // HOLD 5 类：configure 即拒。
+        for addr in [
+            FocasAddress::ServoLoad { axis: 1 },
+            FocasAddress::Spindle {
+                spindle: 1,
+                kind: address::SpindleKind::Load,
+            },
+            FocasAddress::Spindle {
+                spindle: 1,
+                kind: address::SpindleKind::Speed,
+            },
+            FocasAddress::Tool {
+                kind: address::ToolKind::Offset,
+                number: 1,
+            },
+            FocasAddress::Tool {
+                kind: address::ToolKind::Length,
+                number: 1,
+            },
+            FocasAddress::Tool {
+                kind: address::ToolKind::Zofs,
+                number: 1,
+            },
+        ] {
+            assert!(wire_ready_gate(&addr).is_err(), "{addr:?} 必须 HOLD 拒绝",);
+        }
+        // configure 端到端：backend=wire + HOLD 即 UNSUPPORTED_POINT。
+        let conn = FocasConnection {
+            cfg: FocasConnConfig {
+                backend: FocasBackend::Wire,
+                ..FocasConnConfig::default()
+            },
+            api: Arc::new(FakeFocasApi::new()),
+            plan: std::sync::RwLock::new(None),
+        };
+        let task =
+            |resource_id: &str, parameters: serde_json::Value, output: &str| AcquisitionTask {
+                id: format!("t-{resource_id}-{output}"),
+                schedule: TaskSchedule::Poll { interval_ms: 1000 },
+                binding: DriverBinding {
+                    kind: GENERIC_BINDING_KIND.into(),
+                    config: serde_json::json!({
+                        "selections": [{
+                            "resource_id": resource_id,
+                            "parameters": parameters,
+                            "outputs": [{"output": output, "point_key": "k"}],
+                        }],
+                    }),
+                },
+            };
+        // READY：alarm configure PASS。
+        conn.configure(1, vec![task("alarm", serde_json::json!({}), "value")])
+            .await
+            .expect("backend=wire + alarm 必须 PASS");
+        // HOLD：servo/spindle load、tool 系 configure 即拒。
+        for (r, p, o) in [
+            ("servo", serde_json::json!({"axis": 1}), "load"),
+            ("spindle", serde_json::json!({"spindle": 1}), "load"),
+            ("tool", serde_json::json!({"number": 1}), "offset"),
+            ("tool", serde_json::json!({"number": 1}), "length"),
+            ("tool", serde_json::json!({"number": 1}), "zofs"),
+        ] {
+            let e = conn
+                .configure(2, vec![task(r, p, o)])
+                .await
+                .expect_err(&format!("backend=wire + {r}/{o} 必须拒绝"));
+            assert_eq!(e.code, "UNSUPPORTED_POINT", "必须 fail-closed 在 configure");
+        }
+    }
+
+    /// Cutover Gate 2 回归：`value_fits_data_type` 与 `DataType` 完整对齐
+    /// （alarm `StringArray` 不再错杀；全部 Array/Bytes/DateTime 全覆盖）。
+    #[test]
+    fn value_fits_all_data_types_locked() {
+        use mesa_core_types::Value;
+        // alarm 生产路径：StringArray([]) 必须 fits（Gate 2 blocker 真修）。
+        assert!(value_fits_data_type(
+            &Value::StringArray(vec![]),
+            DataType::StringArray
+        ));
+        assert!(value_fits_data_type(
+            &Value::StringArray(vec!["IMPROPER G-CODE".into()]),
+            DataType::StringArray
+        ));
+        // 其余 Array/Bytes/DateTime 全覆盖（以后每出新类型不再逐个补）。
+        assert!(value_fits_data_type(&Value::Bool(true), DataType::Bool));
+        assert!(value_fits_data_type(&Value::I64(1), DataType::I64));
+        assert!(value_fits_data_type(&Value::U64(1), DataType::U64));
+        assert!(value_fits_data_type(
+            &Value::Bytes(vec![1]),
+            DataType::Bytes
+        ));
+        assert!(value_fits_data_type(
+            &Value::DateTime(1),
+            DataType::DateTime
+        ));
+        for v in [
+            Value::BoolArray(vec![true]),
+            Value::I32Array(vec![1]),
+            Value::U32Array(vec![1]),
+            Value::I64Array(vec![1]),
+            Value::U64Array(vec![1]),
+            Value::F32Array(vec![1.0]),
+            Value::F64Array(vec![1.0]),
+            Value::DateTimeArray(vec![1]),
+        ] {
+            assert!(value_fits_data_type(&v, v.data_type()));
         }
     }
 
@@ -1950,6 +2238,7 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: 9,
                 timeout_ms: 1000,
+                backend: FocasBackend::Native,
             },
             api: Arc::new(NativeFocasApi::new()),
             plan: std::sync::RwLock::new(None),
@@ -2050,6 +2339,69 @@ mod tests {
 
     /// L01 回归：A 持续运行、B 立即失败时，连接在限定时间内结束并上报 B。
     /// 不连设备（JoinSet 按完成顺序语义纯逻辑；与生产 `run` 同源收集器）。
+    ///
+    /// Cutover G3 回归（生产路径单测证据，不连真机）：
+    /// - point-local：`ERR:` → 单点 `Bad`（typed neutral + quality_code），
+    ///   同批其他点不受影响（canary Gate 3/5 接受本单测为 point-local 证据，
+    ///   不要求在 165 上故意制造业务错误）。
+    /// - session-fatal：`read_batch Err` → 整批 `Err("READ_FAILED ...")`
+    ///   （canary Gate 6 live 只补 read-time fatal 码；本单测锁“整批 Err”
+    ///   语义，fatal 码由 live 锁定）。
+    #[tokio::test]
+    async fn production_error_semantics_locked() {
+        use mesa_core_types::{Quality, Value};
+        // point-local：ERR: → Bad（typed neutral + 分类码），同批 GOOD 不动。
+        let bad_raw = Value::String("ERR:EW_NOOPT diagnosis oracle suspended".into());
+        let good_raw = Value::U32(1);
+        let bad_dt = DataType::StringArray;
+        let good_dt = DataType::U32;
+        // 与 run() 生产分支同源逻辑（ERR: 前缀 → Bad；否则 coerce + fits → Good）。
+        let bad_pv = if let Value::String(s) = &bad_raw
+            && s.starts_with("ERR:")
+        {
+            Some((
+                neutral_value_for(bad_dt),
+                Quality::Bad,
+                classify_point_error(s),
+            ))
+        } else {
+            None
+        };
+        let (bad_val, bad_q, bad_code) = bad_pv.expect("ERR: 必须转 Bad");
+        assert_eq!(
+            bad_val,
+            Value::StringArray(Vec::new()),
+            "BAD 必须 typed neutral"
+        );
+        assert_eq!(bad_q, Quality::Bad);
+        assert_eq!(bad_code, 2, "EW_NOOPT → quality_code 2");
+        let coerced = coerce_value(good_raw.clone(), good_dt);
+        assert!(value_fits_data_type(&coerced, good_dt), "GOOD 必须 fits");
+        assert_eq!(coerced, Value::U32(1));
+        // session-fatal：read_batch 整批 Err 即 run 整批 Err（READ_FAILED 码
+        // 由 run() 构造；此处锁“整批 Err 不转单点 Bad”语义）。
+        struct FatalApi;
+        #[async_trait::async_trait]
+        impl FocasApi for FatalApi {
+            async fn connect(&self, _h: &str, _p: u16, _t: u64) -> Result<(), String> {
+                Ok(())
+            }
+            async fn read_batch(&self, _: &[FocasAddress]) -> Result<Vec<Value>, String> {
+                Err("EW_SOCKET native worker 无响应（已退出）".into())
+            }
+            async fn system_info(&self) -> Result<FocasSysInfo, String> {
+                Err("unreachable".into())
+            }
+        }
+        use crate::focas_api::FocasSysInfo;
+        let fatal = FatalApi;
+        let r = fatal
+            .read_batch(&[FocasAddress::Status])
+            .await
+            .map(|_| "must not Ok".to_string());
+        assert!(r.is_err(), "session-fatal 必须整批 Err，不得转单点 Bad");
+    }
+
     #[tokio::test]
     async fn joinset_first_error_wins() {
         // 模拟 run 的收集语义：A pending（长任务）、B 立即 Err。
