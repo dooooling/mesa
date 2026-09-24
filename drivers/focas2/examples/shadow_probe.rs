@@ -78,47 +78,65 @@ fn value_variant(v: &Value) -> &'static str {
     }
 }
 
+/// Shadow 期望元数据（诊断工具自带，不扩大 crate 公共 API）：
+/// 每个 shadow 地址携带其 Native 侧期望形态；`judge` 只认本表，不认
+/// 全局 `ERR:` 前缀（防误绿；见 PR #64 review blocker）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeExpect {
+    /// Native 与 Wire 应全等（status/feed/axis/spindle-speed/macro/pmc/param）。
+    Exact,
+    /// Native PR52 占位（gear/maxrpm/diagnosis/alarm；Batch 1/2/3）。
+    NativeUnsupported,
+    /// Native 实现 debt（opmsg `EW_Length(2)`；见 cutover matrix debt 项）。
+    NativeDebt,
+}
+
+fn native_expect(addr: &FocasAddress) -> NativeExpect {
+    match addr {
+        FocasAddress::Spindle { .. } => NativeExpect::NativeUnsupported,
+        FocasAddress::Diagnosis { .. } => NativeExpect::NativeUnsupported,
+        FocasAddress::Alarm => NativeExpect::NativeUnsupported,
+        FocasAddress::OpMsg => NativeExpect::NativeDebt,
+        _ => NativeExpect::Exact,
+    }
+}
+
 fn judge(addr: &FocasAddress, native: &Value, wire: &Value) -> Verdict {
     if native == wire {
         return Verdict::Equal;
     }
-    // Blocker 1 真修：`KnownNativeUnsupported/DEBT` 只对白名单地址开放。
+    // 新 blocker 真修：豁免按地址期望元数据发放，不按 `ERR:` 前缀发放。
     // 白名单外任何地址的 Native `ERR:`（如 status/feed/axis/pmc/param 未来
     // 出现新错误）一律落到 `Mismatch`，不得豁免（防误绿）。
     if let Value::String(s) = native
         && s.starts_with("ERR:")
     {
-        // opmsg debt：只接受当前已观测形态（`EW_Length(2)` 家族），其他新
-        // `ERR:` 暴露为 Mismatch（debt 不得成为万能豁免）。
-        if matches!(addr, FocasAddress::OpMsg) {
-            let u = s.to_ascii_uppercase();
-            if u.contains("EW_LENGTH") || u.contains("EW_UNKNOWN") {
-                return Verdict::KnownNativeDebt { native: s.clone() };
+        match native_expect(addr) {
+            // opmsg debt：只接受当前已观测的明确特征（`EW_Length(2)`；
+            // 裸 `EW_UNKNOWN` 不得豁免——`FocasRet::message()` 对未单独映射的
+            // 错误都返回它，未来 OpMsg 新错误会被误归 debt）。
+            NativeExpect::NativeDebt => {
+                let u = s.to_ascii_uppercase();
+                if u.contains("EW_LENGTH(2)") {
+                    return Verdict::KnownNativeDebt { native: s.clone() };
+                }
+                return Verdict::Mismatch {
+                    native: format!("{native:?}"),
+                    wire: format!("{wire:?}"),
+                };
             }
-            return Verdict::Mismatch {
-                native: format!("{native:?}"),
-                wire: format!("{wire:?}"),
-            };
+            // PR52 豁免白名单：gear / maxrpm / diagnosis / alarm（Batch 1/2/3）。
+            NativeExpect::NativeUnsupported => {
+                return Verdict::KnownNativeUnsupported { native: s.clone() };
+            }
+            // Exact 地址的任何 ERR: 都不是已知边界。
+            NativeExpect::Exact => {
+                return Verdict::Mismatch {
+                    native: format!("{native:?}"),
+                    wire: format!("{wire:?}"),
+                };
+            }
         }
-        // PR52 豁免白名单：gear / maxrpm / diagnosis / alarm（Batch 1/2/3）。
-        let whitelisted = matches!(
-            addr,
-            FocasAddress::Spindle {
-                kind: mesa_driver_focas2::SpindleKind::Gear,
-                ..
-            } | FocasAddress::Spindle {
-                kind: mesa_driver_focas2::SpindleKind::MaxRpm,
-                ..
-            } | FocasAddress::Diagnosis { .. }
-                | FocasAddress::Alarm
-        );
-        if whitelisted {
-            return Verdict::KnownNativeUnsupported { native: s.clone() };
-        }
-        return Verdict::Mismatch {
-            native: format!("{native:?}"),
-            wire: format!("{wire:?}"),
-        };
     }
     // Blocker 2 真修：Drift 前必须变体一致（`I32` 对 `U32/F64/String` 即
     // Mismatch，不得漂移）；变体一致 + 已知动态点才允许 Drift。

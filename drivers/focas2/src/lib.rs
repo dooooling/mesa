@@ -20,7 +20,7 @@ mod native;
 /// typed operations，FOCAS-local 私有实现（`drivers/focas2` 外不可见）。
 mod wire;
 
-pub use address::{AddressError, AxisKind, FocasAddress, SpindleKind, ToolKind, parse_address};
+pub use address::{AddressError, FocasAddress, parse_address};
 pub use focas_api::{FakeFocasApi, FocasApi, NativeFocasApi};
 /// Wire 开发诊断入口（`#[doc(hidden)]` 非稳定、诊断专用）：
 /// 唯一出口是 `WireFocasApi`（`wire_probe` 所需）；`FocasClient/WireSession/
