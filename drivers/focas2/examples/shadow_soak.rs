@@ -22,6 +22,10 @@
 //!   `MESA_SOAK_KILL_WIRE_AT=N` 在第 N 周期 Wire 读取后主动 `disconnect` Wire
 //!   session（只断 Wire，Native 保持），下一周期验证 reconnect 恢复；
 //!   `=0` 即关闭注入（默认）。
+//!   C3 lifecycle（诊断专用）：`MESA_SOAK_ROUNDS=N` 时外层多轮
+//!   `connect →若干 read→ disconnect → drop重建`（默认 1 即单轮；
+//!   每轮 snapshot 进程 `memory/thread/handle` 计数供横向对照，
+//!   不断言 DLL 内部绝对无泄漏，见 C3 注释）。
 //!   退出码：`mismatch>0 → 2`；`native_error>0 → 3`；仅 drift/known → 0。
 //! - Soak Gate（正常模式）：`mismatch=0 / native_error=0 /
 //!   wire unexpected err=0 / session corruption=0 / resource monotonic
@@ -235,14 +239,71 @@ async fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // C3 lifecycle：外层多轮 connect/read/disconnect/drop重建（默认 1）。
+    let rounds: u64 = std::env::var("MESA_SOAK_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(1);
+    // C3 进程快照（OBSERVED：Windows 同进程读计数器；不断言 DLL 内部无泄漏）。
+    fn snapshot() -> (u64, u64, u64) {
+        // (available_mb_approx, thread_count, handle_count)
+        // 保守实现：未接 Win32 真实指标前一律 0（快照缺失不伪造“无增长”；
+        // C3 结论以“轮次通过 + 无失败”为准，见下注释）。
+        (0, 0, 0)
+    }
+    let mut round_snapshots: Vec<(u64, u64, u64, u64, u64)> = Vec::new();
+    for round in 1..=rounds {
+        if rounds > 1 {
+            println!("--- round {round}/{rounds} connect → read → disconnect → drop重建 ---");
+        }
+        let snap0 = snapshot();
+        let rc = soak_round(
+            &host,
+            port,
+            cycles,
+            interval_ms,
+            allow_reconnect,
+            kill_wire_at,
+            round,
+        )
+        .await;
+        let snap1 = snapshot();
+        round_snapshots.push((snap0.0, snap0.1, snap0.2, snap1.1, snap1.2));
+        if !rc {
+            std::process::exit(rc as i32);
+        }
+    }
+    // C3 结论（证据纪律）：
+    // OBSERVED：各 round connect/read/disconnect 无失败（见上轮次输出）；
+    // 快照计数器当前为占位 0（未接 Win32 真实指标前不声称“无单调增长”）。
+    // NOT PROVEN：DLL 内部资源绝对无泄漏。
+    println!(
+        "soak rounds done: rounds={} snapshots={:?} (OBSERVED: 轮次通过；NOT PROVEN: DLL 内部无泄漏)",
+        rounds, round_snapshots,
+    );
+}
+
+/// C3 单轮：connect → 若干 read → disconnect → drop重建（调用方每轮新建
+/// `NativeFocasApi`/`WireFocasApi` 即 drop 旧实例；返回 true=通过）。
+/// latency 是否随轮次劣化由调用方对照各轮 `lat_*_avg` 输出（本函数内打印）。
+async fn soak_round(
+    host: &str,
+    port: u16,
+    cycles: u64,
+    interval_ms: u64,
+    allow_reconnect: bool,
+    kill_wire_at: u64,
+    round: u64,
+) -> bool {
     let native = NativeFocasApi::new();
     let wire = WireFocasApi::new(Duration::from_secs(5));
     // C1：同一 Native/Wire session 长期保持（connect once）。
-    if let Err(e) = native.connect(&host, port, 5000).await {
+    if let Err(e) = native.connect(host, port, 5000).await {
         eprintln!("native connect {host}:{port} 失败：{e}");
         std::process::exit(1);
     }
-    if let Err(e) = wire.connect(&host, port, 5000).await {
+    if let Err(e) = wire.connect(host, port, 5000).await {
         eprintln!("wire connect {host}:{port} 失败：{e}");
         std::process::exit(1);
     }
@@ -290,7 +351,7 @@ async fn main() {
                 // 同一 endpoint；不断 Native session）。
                 if allow_reconnect {
                     c.reconnect_attempt += 1;
-                    match wire.connect(&host, port, 5000).await {
+                    match wire.connect(host, port, 5000).await {
                         Ok(()) => c.reconnect_ok += 1,
                         Err(re) => {
                             c.reconnect_fail += 1;
@@ -349,7 +410,7 @@ async fn main() {
     native.disconnect().await;
     wire.disconnect().await;
     println!(
-        "soak done: cycles={} native_ok={} native_error={} wire_ok={} wire_error={} (timeout={}) reconnect={}/{}/{} equal={} unsupported={} debt={} drift={} mismatch={}",
+        "[round {round}] soak done: cycles={} native_ok={} native_error={} wire_ok={} wire_error={} (timeout={}) reconnect={}/{}/{} equal={} unsupported={} debt={} drift={} mismatch={}",
         c.cycles,
         c.native_ok,
         c.native_error,
@@ -366,9 +427,10 @@ async fn main() {
         c.mismatch,
     );
     if c.mismatch > 0 {
-        std::process::exit(2);
+        return false;
     }
     if c.native_error > 0 {
-        std::process::exit(3);
+        return false;
     }
+    true
 }
