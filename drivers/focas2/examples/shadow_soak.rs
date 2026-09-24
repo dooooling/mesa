@@ -18,6 +18,10 @@
 //!   MESA_SOAK_INTERVAL_MS=1000 cargo run -p mesa-driver-focas2
 //!   --example shadow_soak`（可选 `MESA_SOAK_PORT` 默认 8193；
 //!   `MESA_SOAK_RECONNECT=1` 允许 Wire 断线重连，默认 1）。
+//!   C2 deterministic fault injection（诊断专用，不碰生产 session）：
+//!   `MESA_SOAK_KILL_WIRE_AT=N` 在第 N 周期 Wire 读取后主动 `disconnect` Wire
+//!   session（只断 Wire，Native 保持），下一周期验证 reconnect 恢复；
+//!   `=0` 即关闭注入（默认）。
 //!   退出码：`mismatch>0 → 2`；`native_error>0 → 3`；仅 drift/known → 0。
 //! - Soak Gate（正常模式）：`mismatch=0 / native_error=0 /
 //!   wire unexpected err=0 / session corruption=0 / resource monotonic
@@ -224,6 +228,13 @@ async fn main() {
         .ok()
         .map(|s| s != "0")
         .unwrap_or(true);
+    // C2 deterministic fault injection：第 N 周期 Wire 读取后主动断 Wire
+    // session（`disconnect` 只影响 Wire client，不碰 Native worker/handle；
+    // 不改生产 `WireSession`，诊断专用）。
+    let kill_wire_at: u64 = std::env::var("MESA_SOAK_KILL_WIRE_AT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let native = NativeFocasApi::new();
     let wire = WireFocasApi::new(Duration::from_secs(5));
     // C1：同一 Native/Wire session 长期保持（connect once）。
@@ -305,6 +316,13 @@ async fn main() {
                     );
                 }
             }
+        }
+        // C2 deterministic fault injection：本周期 Wire 读取完成后主动断 Wire
+        // session（`disconnect` 为 `FocasApi` 公共语义，只影响 Wire client；
+        // Native worker/handle 不动；下一周期 Wire 侧按 reconnect 策略恢复）。
+        if kill_wire_at != 0 && n == kill_wire_at {
+            wire.disconnect().await;
+            eprintln!("[cycle {n}] FAULT-INJECT wire disconnect（只断 Wire，Native 保持）");
         }
         if n % 10 == 0 || n == cycles {
             println!(
