@@ -250,16 +250,24 @@ async fn main() {
         }
     };
     println!("[CANARY] READY configure PASS descs={}", descs.len());
-    // descriptor 类型 + source_label 与期望一致。
-    for ((_, _, _, key, want_dt), desc) in ready.iter().zip(descs.iter()) {
+    // descriptor 类型 + source_label 精确比对（只查 Some 不够，必须证明“正确”）。
+    // 期望 label 由 `FocasAddress::source_label` 唯一格式化入口产生（与生产同源）。
+    for ((r, p, o, key, want_dt), desc) in ready.iter().zip(descs.iter()) {
         if &desc.data_type != want_dt {
             failures.push(format!(
                 "descriptor {key}: want {want_dt:?} got {:?}",
                 desc.data_type
             ));
         }
-        if desc.source_label.is_none() {
-            failures.push(format!("descriptor {key}: source_label 缺失"));
+        // 精确 label：用生产 resolver 同源重算（不手写字符串，避免漂移）。
+        let (want_addr, _) = mesa_driver_focas2::canary_resolver_pub::resolve_point(r, o, p, key)
+            .unwrap_or_else(|e| panic!("canary resolver 同源失败 {key}: {e}"));
+        let want_label = want_addr.source_label();
+        match &desc.source_label {
+            Some(got) if got == &want_label => {}
+            other => failures.push(format!(
+                "descriptor {key}: source_label 应 {want_label:?}，实际 {other:?}"
+            )),
         }
         println!(
             "[CANARY] desc {key} dt={:?} label={:?}",
@@ -327,9 +335,26 @@ async fn main() {
         batch.values.len(),
         batch.sequence
     );
+    // Blocker #4 真修：false-green 硬门（READY 正常窗口必须全 GOOD）。
+    // - batch 必须 14 点完整（`values.len == 14`；丢点/多点即 fail）。
+    // - 期望 point_id 全齐（map 14 个全在批内；缺 id 即 fail）。
+    // - GOOD 必须 14，BAD 必须 0（READY 出现 BAD 即 fail，不再“计数待确认”）。
+    if batch.values.len() != 14 {
+        failures.push(format!("首批必须 14 点完整，实际 {}", batch.values.len()));
+    }
+    {
+        let got_ids: std::collections::BTreeSet<u32> =
+            batch.values.iter().map(|pv| pv.point_id).collect();
+        let want_ids: std::collections::BTreeSet<u32> = map.values().copied().collect();
+        if got_ids != want_ids {
+            failures.push(format!(
+                "point_id 必须全齐 want={want_ids:?} got={got_ids:?}"
+            ));
+        }
+    }
     // Gate 3/4：Value variant + Quality::Good + point_id/map；alarm 不再错杀。
     let mut n_good = 0;
-    let mut n_bad_expected = 0;
+    let mut n_bad = 0;
     for pv in &batch.values {
         let key = map
             .iter()
@@ -364,12 +389,12 @@ async fn main() {
                         pv.value, pv.quality_code
                     );
                 } else {
-                    // 正常窗口下 READY 不应 BAD（除非现场动态，如 diagnosis 非 REAL 切号）。
-                    n_bad_expected += 1;
-                    eprintln!(
-                        "[CANARY] BAD {key} want={want_v} got={got_v} val={:?} code={:?}（计入 expected-BAD 待人工确认）",
+                    // Blocker #4：READY 正常窗口 BAD 即 fail（不再计数待确认）。
+                    n_bad += 1;
+                    failures.push(format!(
+                        "{key} BAD（READY 正常窗口不允许）：want={want_v} got={got_v} val={:?} code={:?}",
                         pv.value, pv.quality_code
-                    );
+                    ));
                 }
             }
         }
@@ -383,12 +408,10 @@ async fn main() {
     // 经 canary 窄口只断自身 session 再读，锁 read 期 fatal 形态
     // （不碰被测 run、不碰 CNC/对端）。
     {
-        use mesa_driver_focas2::canary_pub::disconnect_wire_session;
         use mesa_driver_focas2::wire_pub::WireFocasApi;
         use mesa_driver_focas2::{FocasApi, parse_address};
-        use std::sync::Arc;
         use std::time::Duration as StdDuration;
-        let shadow = Arc::new(WireFocasApi::new(StdDuration::from_secs(5)));
+        let shadow = WireFocasApi::new(StdDuration::from_secs(5));
         match shadow.connect(&host, port, 5000).await {
             Ok(()) => println!("[CANARY] readtime-fatal 影子 session connect OK"),
             Err(e) => {
@@ -400,8 +423,9 @@ async fn main() {
             Ok(v) => println!("[CANARY] readtime-fatal 影子首读 GOOD {v:?}"),
             Err(e) => failures.push(format!("readtime-fatal 影子首读失败：{e}")),
         }
-        // 只断影子实例自有 session（canary 窄口；被测 run()/CNC 不动）。
-        disconnect_wire_session(&shadow).await;
+        // 只断影子实例自有 session（`FocasApi::disconnect` 公共语义，已有；
+        // 被测 run()/CNC 不动；不新增生产窄口，见 PR #66 review blocker #2）。
+        shadow.disconnect().await;
         match shadow.read_batch(std::slice::from_ref(&probe_addr)).await {
             Ok(v) => {
                 println!(
@@ -475,9 +499,9 @@ async fn main() {
     println!("--- CANARY GATE TABLE ---");
     println!("READY configure   14/14 (12 类，axis×3)");
     println!("HOLD reject       {hold_rejected}/5");
-    println!("GOOD              {n_good}");
-    println!("BAD expected      {n_bad_expected}");
-    println!("unexpected BAD    {}", failures.len());
+    println!("GOOD              {n_good}/14");
+    println!("BAD               {n_bad} (must be 0)");
+    println!("failures          {}", failures.len());
     for f in &failures {
         eprintln!("[CANARY-FAIL] {f}");
     }

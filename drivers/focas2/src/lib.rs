@@ -32,19 +32,23 @@ pub mod wire_pub {
     pub use crate::wire::WireFocasApi;
 }
 
-/// Cutover Gate 1 canary 专用窄口（`#[doc(hidden)]` 非稳定、诊断专用）：
-/// 允许 canary 在持有 `Arc<WireFocasApi>` 时只断其自有 Wire session
-/// （read-time fatal 用；不碰对端/CNC，不碰其他实例，不碰 Native/FWLIB）。
-/// 生产 `FocasDriver` 路径不用此模块。
+/// canary 诊断专用窄口（`#[doc(hidden)]` 非稳定、诊断专用）：
+/// 暴露生产同源 resolver 供 canary 精确比对 `source_label`
+/// （不手写期望字符串，避免漂移；生产路径不用此模块）。
 #[doc(hidden)]
-pub mod canary_pub {
-    use std::sync::Arc;
+pub mod canary_resolver_pub {
+    use mesa_core_types::DataType;
 
-    use crate::wire::WireFocasApi;
+    use crate::address::FocasAddress;
 
-    /// 只断给定 Wire 实例的自有 session（canary Gate 6 用）。
-    pub async fn disconnect_wire_session(api: &Arc<WireFocasApi>) {
-        api.disconnect_session_for_canary().await;
+    /// 生产同源 `(resource_id, output, params)` → `(FocasAddress, DataType)`。
+    pub fn resolve_point(
+        resource_id: &str,
+        output: &str,
+        params: &serde_json::Value,
+        point_key: &str,
+    ) -> Result<(FocasAddress, DataType), mesa_driver_sdk::SdkDriverError> {
+        crate::resolve_generic_point(resource_id, output, params, point_key)
     }
 }
 
@@ -394,6 +398,15 @@ impl Driver for FocasDriver {
                     FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
                         .required(false)
                         .default_value(serde_json::json!(3000)),
+                    {
+                        // Cutover Gate 1：backend 显式 opt-in（default native）。
+                        // required(false) + default "native"（缺省→Native，UI 可见）。
+                        let mut f = FieldDescriptor::new("backend", "Backend", FieldType::Enum)
+                            .required(false)
+                            .default_value(serde_json::json!("native"));
+                        f.validation.enum_options = Some(vec!["native".into(), "wire".into()]);
+                        f
+                    },
                 ],
             },
             resources: vec![
@@ -921,16 +934,23 @@ enum FocasBackend {
 }
 
 impl FocasBackend {
+    /// 缺省 → Native；字段存在但类型/值非法（`123/true/"bogus"` 等）
+    /// → BAD_CONFIG（不得静默当 Native；见 PR #66 review blocker #1）。
     fn parse(v: &serde_json::Value) -> Result<Self, SdkDriverError> {
-        match v
-            .get("backend")
-            .and_then(|x| x.as_str())
-            .map(|s| s.trim().to_ascii_lowercase())
-        {
-            None => Ok(Self::Native),
-            Some(s) if s == "native" => Ok(Self::Native),
-            Some(s) if s == "wire" => Ok(Self::Wire),
-            Some(other) => Err(SdkDriverError::configuration(
+        let raw = match v.get("backend") {
+            None => return Ok(Self::Native),
+            Some(x) => x,
+        };
+        let s = raw.as_str().ok_or_else(|| {
+            SdkDriverError::configuration(
+                "BAD_CONFIG",
+                format!("backend `{raw}` 非法，期望 native|wire"),
+            )
+        })?;
+        match s.trim().to_ascii_lowercase().as_str() {
+            "native" => Ok(Self::Native),
+            "wire" => Ok(Self::Wire),
+            other => Err(SdkDriverError::configuration(
                 "BAD_CONFIG",
                 format!("backend `{other}` 非法，期望 native|wire"),
             )),
@@ -2340,66 +2360,107 @@ mod tests {
     /// L01 回归：A 持续运行、B 立即失败时，连接在限定时间内结束并上报 B。
     /// 不连设备（JoinSet 按完成顺序语义纯逻辑；与生产 `run` 同源收集器）。
     ///
-    /// Cutover G3 回归（生产路径单测证据，不连真机）：
-    /// - point-local：`ERR:` → 单点 `Bad`（typed neutral + quality_code），
-    ///   同批其他点不受影响（canary Gate 3/5 接受本单测为 point-local 证据，
+    /// Cutover G3 回归（生产路径单测证据，不连真机；真正穿
+    /// `FocasConnection::configure/apply/run`，不是复刻分支）：
+    /// - point-local：`[ERR, GOOD]` → 单点 `Bad`（typed neutral + quality_code）
+    ///   + 同批 `Good`（canary Gate 3/5 接受本单测为 point-local 证据，
     ///   不要求在 165 上故意制造业务错误）。
-    /// - session-fatal：`read_batch Err` → 整批 `Err("READ_FAILED ...")`
-    ///   （canary Gate 6 live 只补 read-time fatal 码；本单测锁“整批 Err”
-    ///   语义，fatal 码由 live 锁定）。
+    /// - session-fatal：`read_batch Err` → `run()` 返回 `READ_FAILED`
+    ///   （live 主 READ_FAILED 另记 NOT-PROVEN；本单测锁生产码）。
     #[tokio::test]
     async fn production_error_semantics_locked() {
         use mesa_core_types::{Quality, Value};
-        // point-local：ERR: → Bad（typed neutral + 分类码），同批 GOOD 不动。
-        let bad_raw = Value::String("ERR:EW_NOOPT diagnosis oracle suspended".into());
-        let good_raw = Value::U32(1);
-        let bad_dt = DataType::StringArray;
-        let good_dt = DataType::U32;
-        // 与 run() 生产分支同源逻辑（ERR: 前缀 → Bad；否则 coerce + fits → Good）。
-        let bad_pv = if let Value::String(s) = &bad_raw
-            && s.starts_with("ERR:")
-        {
-            Some((
-                neutral_value_for(bad_dt),
-                Quality::Bad,
-                classify_point_error(s),
-            ))
-        } else {
-            None
-        };
-        let (bad_val, bad_q, bad_code) = bad_pv.expect("ERR: 必须转 Bad");
-        assert_eq!(
-            bad_val,
-            Value::StringArray(Vec::new()),
-            "BAD 必须 typed neutral"
-        );
-        assert_eq!(bad_q, Quality::Bad);
-        assert_eq!(bad_code, 2, "EW_NOOPT → quality_code 2");
-        let coerced = coerce_value(good_raw.clone(), good_dt);
-        assert!(value_fits_data_type(&coerced, good_dt), "GOOD 必须 fits");
-        assert_eq!(coerced, Value::U32(1));
-        // session-fatal：read_batch 整批 Err 即 run 整批 Err（READ_FAILED 码
-        // 由 run() 构造；此处锁“整批 Err 不转单点 Bad”语义）。
-        struct FatalApi;
+        use mesa_driver_sdk::DataSink;
+
+        // scripted api：首批 `[ERR, GOOD]`（point-local 隔离），随后整批 Err
+        //（session-fatal）。connect 恒 Ok；陌生地址回 GOOD 占位。
+        struct ScriptedApi {
+            calls: std::sync::Mutex<u64>,
+        }
         #[async_trait::async_trait]
-        impl FocasApi for FatalApi {
+        impl FocasApi for ScriptedApi {
             async fn connect(&self, _h: &str, _p: u16, _t: u64) -> Result<(), String> {
                 Ok(())
             }
-            async fn read_batch(&self, _: &[FocasAddress]) -> Result<Vec<Value>, String> {
-                Err("EW_SOCKET native worker 无响应（已退出）".into())
+            async fn read_batch(&self, addrs: &[FocasAddress]) -> Result<Vec<Value>, String> {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                if *n == 1 {
+                    // 首批：status → ERR（point-local），axis → GOOD。
+                    Ok(addrs
+                        .iter()
+                        .map(|a| match a {
+                            FocasAddress::Status => {
+                                Value::String("ERR:EW_NOOPT scripted point-local".into())
+                            }
+                            _ => Value::U32(7),
+                        })
+                        .collect())
+                } else {
+                    Err("EW_SOCKET scripted session-fatal".into())
+                }
             }
             async fn system_info(&self) -> Result<FocasSysInfo, String> {
                 Err("unreachable".into())
             }
         }
         use crate::focas_api::FocasSysInfo;
-        let fatal = FatalApi;
-        let r = fatal
-            .read_batch(&[FocasAddress::Status])
+
+        // point-local 批：穿完整生产链路（configure/apply/run 首批）。
+        let conn = FocasConnection {
+            cfg: FocasConnConfig::default(),
+            api: Arc::new(ScriptedApi {
+                calls: std::sync::Mutex::new(0),
+            }),
+            plan: std::sync::RwLock::new(None),
+        };
+        let sel = serde_json::json!([
+            {"resource_id":"machine","parameters":{},"outputs":[{"output":"status","point_key":"s"}]},
+            {"resource_id":"axis","parameters":{"axis":1},"outputs":[{"output":"absolute","point_key":"a"}]},
+        ]);
+        let descs = conn
+            .configure(1, vec![generic_task(sel)])
             .await
-            .map(|_| "must not Ok".to_string());
-        assert!(r.is_err(), "session-fatal 必须整批 Err，不得转单点 Bad");
+            .expect("scripted configure 应 PASS");
+        assert_eq!(descs.len(), 2);
+        let mut map = std::collections::HashMap::new();
+        map.insert("s".to_string(), 11u32);
+        map.insert("a".to_string(), 12u32);
+        conn.apply_point_map(map).await.unwrap();
+        let (data_tx, mut data_rx) = tokio::sync::mpsc::channel::<mesa_core_types::DataBatch>(16);
+        let (ctrl_tx, _ctrl_rx) =
+            tokio::sync::mpsc::channel::<mesa_driver_protocol::pb::Envelope>(8);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<mesa_driver_sdk::EventBatch>(8);
+        let sink = DataSink::for_test(ctrl_tx, data_tx, event_tx);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let sd = shutdown.clone();
+        let run_handle = tokio::spawn(async move { conn.run(sink, sd).await });
+        // 首批：status Bad + axis Good（同批隔离）。
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(10), data_rx.recv())
+            .await
+            .expect("首批必须到达")
+            .expect("通道不断");
+        assert_eq!(batch.values.len(), 2, "首批必须 2 点完整");
+        let by_id: std::collections::HashMap<u32, _> =
+            batch.values.iter().map(|pv| (pv.point_id, pv)).collect();
+        let bad = by_id.get(&11).expect("status point 11 必须在批内");
+        assert_eq!(bad.quality, Quality::Bad, "ERR: 必须单点 Bad");
+        assert_eq!(
+            bad.value,
+            Value::U32(0),
+            "BAD 必须 typed neutral（status U32）"
+        );
+        assert_eq!(bad.quality_code, Some(2), "EW_NOOPT → code 2");
+        let good = by_id.get(&12).expect("axis point 12 必须在批内");
+        assert_eq!(good.quality, Quality::Good, "同批 GOOD 不受污染");
+        // session-fatal：第二批 read_batch Err → run 返回 READ_FAILED。
+        // run 为无限循环任务：第二周期 fatal 即任务 Err → run() Err。
+        match tokio::time::timeout(std::time::Duration::from_secs(15), run_handle).await {
+            Ok(Ok(Err(e))) => assert_eq!(e.code, "READ_FAILED", "session-fatal 必须 READ_FAILED"),
+            Ok(Ok(Ok(()))) => panic!("fatal 后 run 不应 Ok 退出"),
+            Ok(Err(join_e)) => panic!("run join 失败：{join_e}"),
+            Err(_) => panic!("fatal 后 run 15s 未返回"),
+        }
     }
 
     #[tokio::test]

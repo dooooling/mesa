@@ -2112,13 +2112,6 @@ impl WireFocasApi {
         }
     }
 
-    /// canary 诊断专用：只断本实例 Wire session（`disconnect` 公共语义；
-    /// 不碰对端/CNC，不碰其他实例，不碰 Native/FWLIB）。
-    /// 生产代码永不调用（canary Gate 6 read-time fatal 用；见 wire_canary.rs）。
-    pub async fn disconnect_session_for_canary(&self) {
-        self.disconnect().await;
-    }
-
     /// 单点错误 ↔ 连接错误的分类：point-local（`Unsupported/Remote{..}`）
     /// 即 `ERR:` 占位（上层转单点 BAD）；session 致命即整批 `Err`（重连）。
     fn point_or_fatal(e: WireError) -> Result<Value, String> {
