@@ -210,7 +210,13 @@ struct SoakCounters {
     drift: u64,
     mismatch: u64,
     native_latency_ms_total: u128,
+    native_latency_ms_min: u128,
+    native_latency_ms_max: u128,
     wire_latency_ms_total: u128,
+    wire_latency_ms_min: u128,
+    wire_latency_ms_max: u128,
+    /// mismatch 明细（`cycle/label/native/wire`；不提前退出，跑完再判）。
+    mismatch_log: Vec<String>,
 }
 
 #[tokio::main]
@@ -245,6 +251,16 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .filter(|v| *v >= 1)
         .unwrap_or(1);
+    // Final steady soak 纪律（S7-C 最终 evidence）：`MESA_SOAK_STEADY=1` 时
+    // 关闭自动 reconnect（Wire unexpected error 即记数，不恢复；C2 已单独
+    // 证明恢复路径；final 只回答“无人为故障下双 session 能否稳定维持”）；
+    // mismatch 不提前退出（记录 cycle/address/native/wire 后继续跑完，
+    // 最终 exit != 0；见下 `mismatch_log`）。
+    let steady = std::env::var("MESA_SOAK_STEADY")
+        .ok()
+        .map(|s| s == "1")
+        .unwrap_or(false);
+    let allow_reconnect_eff = allow_reconnect && !steady;
     // C3 进程快照（OBSERVED：Windows 同进程读计数器；不断言 DLL 内部无泄漏）。
     fn snapshot() -> (u64, u64, u64) {
         // (available_mb_approx, thread_count, handle_count)
@@ -258,15 +274,16 @@ async fn main() {
             println!("--- round {round}/{rounds} connect → read → disconnect → drop重建 ---");
         }
         let snap0 = snapshot();
-        let rc = soak_round(
-            &host,
+        let rc = soak_round(SoakRoundParams {
+            host: &host,
             port,
             cycles,
             interval_ms,
-            allow_reconnect,
+            allow_reconnect: allow_reconnect_eff,
             kill_wire_at,
             round,
-        )
+            steady,
+        })
         .await;
         let snap1 = snapshot();
         round_snapshots.push((snap0.0, snap0.1, snap0.2, snap1.1, snap1.2));
@@ -284,18 +301,32 @@ async fn main() {
     );
 }
 
-/// C3 单轮：connect → 若干 read → disconnect → drop重建（调用方每轮新建
-/// `NativeFocasApi`/`WireFocasApi` 即 drop 旧实例；返回 true=通过）。
-/// latency 是否随轮次劣化由调用方对照各轮 `lat_*_avg` 输出（本函数内打印）。
-async fn soak_round(
-    host: &str,
+/// `soak_round` 参数束（clippy `too_many_arguments` 门；诊断工具内部用）。
+struct SoakRoundParams<'a> {
+    host: &'a str,
     port: u16,
     cycles: u64,
     interval_ms: u64,
     allow_reconnect: bool,
     kill_wire_at: u64,
     round: u64,
-) -> bool {
+    steady: bool,
+}
+
+/// C3 单轮：connect → 若干 read → disconnect → drop重建（调用方每轮新建
+/// `NativeFocasApi`/`WireFocasApi` 即 drop 旧实例；返回 true=通过）。
+/// latency 是否随轮次劣化由调用方对照各轮 `lat_*_avg` 输出（本函数内打印）。
+async fn soak_round(p: SoakRoundParams<'_>) -> bool {
+    let SoakRoundParams {
+        host,
+        port,
+        cycles,
+        interval_ms,
+        allow_reconnect,
+        kill_wire_at,
+        round,
+        steady,
+    } = p;
     let native = NativeFocasApi::new();
     let wire = WireFocasApi::new(Duration::from_secs(5));
     // C1：同一 Native/Wire session 长期保持（connect once）。
@@ -318,6 +349,13 @@ async fn soak_round(
         let natives = native.read_batch(&keys).await;
         let native_ms = t0.elapsed().as_millis();
         c.native_latency_ms_total += native_ms;
+        if c.cycles == 1 {
+            c.native_latency_ms_min = native_ms;
+            c.native_latency_ms_max = native_ms;
+        } else {
+            c.native_latency_ms_min = c.native_latency_ms_min.min(native_ms);
+            c.native_latency_ms_max = c.native_latency_ms_max.max(native_ms);
+        }
         let natives = match natives {
             Ok(v) => {
                 c.native_ok += 1;
@@ -332,10 +370,19 @@ async fn soak_round(
             }
         };
         // Wire 旁路比较（timeout/error 只记数，不改 Native 结果）。
+        // Final steady 纪律：`steady=1` 时不自动 reconnect（C2 已单独证明
+        // 恢复路径；final 只记录 unexpected error 并判 Gate fail）。
         let t1 = Instant::now();
         let wires = wire.read_batch(&keys).await;
         let wire_ms = t1.elapsed().as_millis();
         c.wire_latency_ms_total += wire_ms;
+        if c.cycles == 1 {
+            c.wire_latency_ms_min = wire_ms;
+            c.wire_latency_ms_max = wire_ms;
+        } else {
+            c.wire_latency_ms_min = c.wire_latency_ms_min.min(wire_ms);
+            c.wire_latency_ms_max = c.wire_latency_ms_max.max(wire_ms);
+        }
         let wires = match wires {
             Ok(v) => {
                 c.wire_ok += 1;
@@ -347,9 +394,9 @@ async fn soak_round(
                     c.wire_timeout += 1;
                 }
                 eprintln!("[cycle {n}] wire_error={e}（不改 Native 结果）");
-                // 下一周期按 reconnect 策略恢复 Wire（C2 预留：当前仅重连
-                // 同一 endpoint；不断 Native session）。
-                if allow_reconnect {
+                // 下一周期按 reconnect 策略恢复 Wire（final steady 模式
+                // `steady=1` 时关闭：C2 已单独证明恢复路径；final 只记录）。
+                if allow_reconnect && !steady {
                     c.reconnect_attempt += 1;
                     match wire.connect(host, port, 5000).await {
                         Ok(()) => c.reconnect_ok += 1,
@@ -371,6 +418,11 @@ async fn soak_round(
                 Verdict::Drift { .. } => c.drift += 1,
                 Verdict::Mismatch { .. } => {
                     c.mismatch += 1;
+                    // Final 纪律：mismatch 不提前退出，记录明细后继续跑完。
+                    c.mismatch_log.push(format!(
+                        "cycle {n} {label} native={:?} wire={:?}",
+                        natives[i], wires[i]
+                    ));
                     eprintln!(
                         "[cycle {n}] [MISMATCH] {label} native={:?} wire={:?}",
                         natives[i], wires[i]
@@ -387,7 +439,7 @@ async fn soak_round(
         }
         if n % 10 == 0 || n == cycles {
             println!(
-                "[cycle {n}/{cycles}] native_ok={} native_err={} wire_ok={} wire_err={} (timeout={}) reconnect={}/{}/{} equal={} unsup={} debt={} drift={} mismatch={} lat_native_avg={}ms lat_wire_avg={}ms",
+                "[cycle {n}/{cycles}] native_ok={} native_err={} wire_ok={} wire_err={} (timeout={}) reconnect={}/{}/{} equal={} unsup={} debt={} drift={} mismatch={} lat_native_avg={}ms(min={}ms,max={}ms) lat_wire_avg={}ms(min={}ms,max={}ms)",
                 c.native_ok,
                 c.native_error,
                 c.wire_ok,
@@ -402,7 +454,11 @@ async fn soak_round(
                 c.drift,
                 c.mismatch,
                 c.native_latency_ms_total / c.cycles.max(1) as u128,
+                c.native_latency_ms_min,
+                c.native_latency_ms_max,
                 c.wire_latency_ms_total / c.cycles.max(1) as u128,
+                c.wire_latency_ms_min,
+                c.wire_latency_ms_max,
             );
         }
         tokio::time::sleep(Duration::from_millis(interval_ms)).await;
@@ -410,7 +466,7 @@ async fn soak_round(
     native.disconnect().await;
     wire.disconnect().await;
     println!(
-        "[round {round}] soak done: cycles={} native_ok={} native_error={} wire_ok={} wire_error={} (timeout={}) reconnect={}/{}/{} equal={} unsupported={} debt={} drift={} mismatch={}",
+        "[round {round}] soak done: cycles={} native_ok={} native_error={} wire_ok={} wire_error={} (timeout={}) reconnect={}/{}/{} equal={} unsupported={} debt={} drift={} mismatch={} lat_native_avg={}ms(min={}ms,max={}ms) lat_wire_avg={}ms(min={}ms,max={}ms)",
         c.cycles,
         c.native_ok,
         c.native_error,
@@ -425,11 +481,27 @@ async fn soak_round(
         c.native_debt,
         c.drift,
         c.mismatch,
+        c.native_latency_ms_total / c.cycles.max(1) as u128,
+        c.native_latency_ms_min,
+        c.native_latency_ms_max,
+        c.wire_latency_ms_total / c.cycles.max(1) as u128,
+        c.wire_latency_ms_min,
+        c.wire_latency_ms_max,
     );
+    // Final 纪律：mismatch 明细已在 mismatch_log（跑完再判，不提前退出，
+    // 调用方 `soak_round` 返回 false 即轮次 fail）。
+    for m in &c.mismatch_log {
+        eprintln!("[round {round}] MISMATCH-LOG {m}");
+    }
     if c.mismatch > 0 {
         return false;
     }
     if c.native_error > 0 {
+        return false;
+    }
+    // Final steady 门：steady=1 时 wire_error/reconnect 必须全零
+    //（无人为故障下双 session 稳定维持；C2 注入窗口不用 steady 门）。
+    if steady && (c.wire_error > 0 || c.reconnect_attempt > 0) {
         return false;
     }
     true
