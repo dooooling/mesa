@@ -24,3 +24,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 getrandom = { workspace = true }
 libloading = "0.8"
+
+[dev-dependencies]
+# canary example 专用（生产 lib 不用；见 PR #66 review blocker #5）。
+mesa-driver-protocol = { workspace = true }
