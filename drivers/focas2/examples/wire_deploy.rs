@@ -1,28 +1,28 @@
 //! Cutover Gate 2 — READY-only Production Deployment（诊断专用，不改生产 backend）。
 //!
 //! 目标：证明 `backend=wire` 能作为真实运行后端长期使用（不是再测 codec）。
-//! 穿完整生产生命周期：`Mesa Manager → open_connection(backend=wire) →
-//! configure/apply → run → DataBatch → 持续采集 → stop → restart → reconnect`。
+//! 证据路径（诚实口径，见 PR #67 review blocker #4 收口）：
+//! `FocasDriver::open_connection(backend=wire)` → `configure/apply` →
+//! `DriverConnection::run` → `DataBatch`（经 `DataSink::for_test` 直收）。
+//! 未经过 Manager / Driver IPC / Core stream_epoch；D2 为“每轮 fresh
+//! connection recreate”，不是“同一 connection Stop→Configure→Start”。
 //!
-//! 范围（冻结）：`backend=wire` + READY 12 类（axis 拆 3 轴共 14 点）+ 真实
-//! Mesa runtime + 真实 target165 + 持续运行。不补 load、不补 tool、不改
+//! 范围（冻结）：`backend=wire` + READY 12 类（axis 拆 3 轴共 14 点）+
+//! 真实 target165 + 持续运行。不补 load、不补 tool、不改
 //! default、不删 Native、不做 fallback。
 //!
 //! 四门（显式，不混统计）：
 //! D1 正常持续运行：`MESA_DEPLOY_MINUTES`（默认 30）× 1s poll × 14 点；
 //!   门：`unexpected BAD=0 / READ_FAILED=0 / crash=0 / session corruption=0 /
-//!   point count drift=0 / sequence 异常=0`。无 Native 并行（不是 Shadow）。
-//! D2 Mesa 生命周期：`MESA_DEPLOY_ROUNDS`（默认 5）轮
-//!   `start→采集→stop→start`；门：Wire session 正确关闭 + 重启可重连 +
-//!   无僵尸 task + 无旧 session 污染 + point map/sequence 正常。
-//! D3 真实 reconnect：有安全窗口则测（Mesa run 正常采集 → 只中断 Wire TCP
-//!   条件 → read-time fatal → run 返回 READ_FAILED → Manager reconnect →
-//!   恢复正常采集）；无安全窗口则 NOT-PROVEN（不为绿表制造假证据）。
-//!   本 harness 默认不自动制造 D3（`MESA_DEPLOY_KILL_WIRE_AT=0` 关闭；
-//!   `>0` 时在第 N 分钟边界只断 Wire session，不碰被测 run 的其他部分——
-//!   与 S7-C C2 同纪律，诊断专用）。
-//! D4 ARM / Raspberry Pi 3B：独立 deployment gate（本 harness 只记录结论位，
-//!   不在此伪造 ARM 证据；`MESA_DEPLOY_ARM=proven|pending`，默认 pending）。
+//!   point count drift=0 / sequence 异常=0`（首批 `sequence==1`，后续 `>last`；
+//!   缺口允许，回退/停滞 fail）。无 Native 并行（不是 Shadow）。
+//! D2 生命周期（fresh recreate 口径）：`MESA_DEPLOY_ROUNDS`（默认 5）轮
+//!   `open→configure→apply→run→cancel→join→drop重建`；门：Wire session 正确关闭 +
+//!   重启可重连 + 无僵尸 task + 无旧 session 污染 + point map/sequence 正常。
+//! D3 真实 reconnect：本 harness 默认 NOT-PROVEN（无安全窗口不制造故障，
+//!   不为绿表制造假证据；live 主 READ_FAILED 待 CNC 配合，见 Gate 1 canary 口径）。
+//! D4 ARM / Raspberry Pi 3B：独立 deployment gate；本 harness 只打印本机
+//!   `std::env::consts::ARCH`，结论恒为 pending（不接受环境变量自报 proven）。
 //!
 //! 用法：`MESA_DEPLOY_HOST=192.168.15.165 MESA_DEPLOY_MINUTES=30
 //! MESA_DEPLOY_ROUNDS=5 cargo run -p mesa-driver-focas2 --example wire_deploy`
@@ -206,7 +206,6 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .filter(|v| *v >= 1)
         .unwrap_or(5);
-    let arm = std::env::var("MESA_DEPLOY_ARM").unwrap_or_else(|_| "pending".into());
     let mut failures: Vec<String> = Vec::new();
     let driver = FocasDriver;
     let wire_cfg = serde_json::json!({
@@ -311,17 +310,22 @@ async fn main() {
                             .bad_log
                             .push(format!("round {round} point_id 不全 {got_ids:?}"));
                     }
-                    // sequence 单调门（轮内）。
-                    if last_seq != 0 && b.sequence != last_seq + 1 {
-                        // Latest-Wins 合并允许缺口（见 DataSink 注释），只记异常不判 fail；
-                        // 真正的“回退/停滞”才判 fail（见下）。
-                        if b.sequence <= last_seq {
+                    // sequence 门（轮内；Core 合同：新流首批 `sequence==1`，
+                    // 后续 `>last_seq`；缺口允许，回退/停滞 fail）。
+                    if got == 0 {
+                        if b.sequence != 1 {
                             total.sequence_anomaly += 1;
                             total.bad_log.push(format!(
-                                "round {round} sequence 回退/停滞 {last_seq}→{}",
+                                "round {round} 首批 sequence 应为 1，实际 {}",
                                 b.sequence
                             ));
                         }
+                    } else if b.sequence <= last_seq {
+                        total.sequence_anomaly += 1;
+                        total.bad_log.push(format!(
+                            "round {round} sequence 回退/停滞 {last_seq}→{}",
+                            b.sequence
+                        ));
                     }
                     last_seq = b.sequence;
                     for pv in &b.values {
@@ -384,8 +388,9 @@ async fn main() {
 
     // D3：本 harness 默认 NOT-PROVEN（无安全窗口不制造故障；见文件头）。
     let d3 = "NOT-PROVEN（无安全窗口；live 主 READ_FAILED 待 CNC 配合，见 Gate 1 canary 口径）";
-    // D4：ARM 结论位（本机不伪造；由环境变量传入）。
-    let d4_ok = arm.trim().eq_ignore_ascii_case("proven");
+    // D4：只打印本机 ARCH，结论恒 pending（不接受环境变量自报 proven）。
+    let arch = std::env::consts::ARCH;
+    let d4 = "pending（本机 ARCH 仅记录，不作 ARM 证据）";
 
     println!("--- DEPLOY GATE TABLE ---");
     println!("READY/HOLD        HOLD 5/5（上文）");
@@ -400,7 +405,7 @@ async fn main() {
     );
     println!("D2 rounds         {rounds} last_seq={last_seq_by_round:?}");
     println!("D3 reconnect      {d3}");
-    println!("D4 arm            {arm} (proven 才算过；否则 pending 不 fail)");
+    println!("D4 arm            {d4} host_arch={arch}");
     for b in total.bad_log.iter().take(20) {
         eprintln!("[DEPLOY-BAD] {b}");
     }
@@ -425,6 +430,5 @@ async fn main() {
         eprintln!("[DEPLOY] FAIL");
         std::process::exit(2);
     }
-    println!("[DEPLOY] PASS (D3 {d3}; D4 {arm})");
-    let _ = d4_ok;
+    println!("[DEPLOY] PASS (D3 {d3}; D4 {d4} host_arch={arch})");
 }
