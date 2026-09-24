@@ -23,14 +23,21 @@
 //!   session（只断 Wire，Native 保持），下一周期验证 reconnect 恢复；
 //!   `=0` 即关闭注入（默认）。
 //!   C3 lifecycle（诊断专用）：`MESA_SOAK_ROUNDS=N` 时外层多轮
-//!   `connect →若干 read→ disconnect → drop重建`（默认 1 即单轮；
-//!   每轮 snapshot 进程 `memory/thread/handle` 计数供横向对照，
-//!   不断言 DLL 内部绝对无泄漏，见 C3 注释）。
-//!   退出码：`mismatch>0 → 2`；`native_error>0 → 3`；仅 drift/known → 0。
-//! - Soak Gate（正常模式）：`mismatch=0 / native_error=0 /
-//!   wire unexpected err=0 / session corruption=0 / resource monotonic
-//!   growth=0`。故障恢复模式（人为断 Wire）另计：Native interruption=0 +
-//!   Wire reconnect 成功 + 恢复后 parity，不与正常模式混统计。
+//!   `connect →若干 read→ disconnect → drop重建`（默认 1 即单轮）。
+//!   快照说明：进程 `memory/thread/handle` 计数当前为占位 0（未接 Win32
+//!   真实指标），C3 只结论“轮次通过 + 无失败”，不断言资源无增长、不写
+//!   `resource monotonic growth=0` Gate（见轮次输出注释）。
+//!   退出码（统一）：任何轮次 fail → `exit(2)`；connect 建连失败 → `exit(1)`。
+//!   轮次 fail 判据见 `soak_round` 尾部三模式门（C1 normal / C2 injected /
+//!   Final steady），mismatch 明细见 `mismatch_log`。
+//! - Soak Gate（三模式显式，不混统计）：
+//!   C1 normal（`kill_wire_at == 0 && !steady`）：`mismatch=0 / native_error=0 /
+//!   wire_error=0 / reconnect_attempt=0`（Wire 真出错即 fail，哪怕随后重连成功）。
+//!   C2 injected（`kill_wire_at != 0`）：现有 recovery 门（native_error=0 +
+//!   attempt>=1 + ok>=1 + fail=0 + 注入后 wire_ok/compare 各>=1；注入点须
+//!   `<= cycles-2`）。
+//!   Final steady（`steady == 1`）：`mismatch=0 / native_error=0 / wire_error=0 /
+//!   reconnect_attempt=0`（无人为故障下双 session 稳定维持）。
 
 use std::time::{Duration, Instant};
 
@@ -547,15 +554,29 @@ async fn soak_round(p: SoakRoundParams<'_>) -> bool {
             return false;
         }
     }
+    // 三模式门（显式，不混统计）：
+    // C1 normal（`kill_wire_at == 0 && !steady`）：`mismatch=0 / native_error=0 /
+    // wire_error=0 / reconnect_attempt=0`（Wire 真出错即 fail，哪怕随后重连成功；
+    // 与文件头冻结的正常模式 Gate 一致）。
+    // C2 injected（`kill_wire_at != 0`）：下 recovery 门。
+    // Final steady（`steady == 1`）：`mismatch=0 / native_error=0 / wire_error=0 /
+    // reconnect_attempt=0`。
+    let is_c1 = kill_wire_at == 0 && !steady;
+    let is_steady = steady && kill_wire_at == 0;
     if c.mismatch > 0 {
         return false;
     }
     if c.native_error > 0 {
         return false;
     }
-    // Final steady 门：steady=1 时 wire_error/reconnect 必须全零
-    //（无人为故障下双 session 稳定维持；C2 注入窗口不用 steady 门）。
-    if steady && (c.wire_error > 0 || c.reconnect_attempt > 0) {
+    if is_c1 && (c.wire_error > 0 || c.reconnect_attempt > 0) {
+        eprintln!(
+            "[round {round}] C1-GATE-FAIL: wire_error={} reconnect_attempt={}（C1 normal 要求全零）",
+            c.wire_error, c.reconnect_attempt,
+        );
+        return false;
+    }
+    if is_steady && (c.wire_error > 0 || c.reconnect_attempt > 0) {
         return false;
     }
     true
