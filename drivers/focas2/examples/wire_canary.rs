@@ -33,13 +33,17 @@ use mesa_driver_focas2::FocasDriver;
 use mesa_driver_sdk::{DataSink, Driver};
 use tokio_util::sync::CancellationToken;
 
-/// READY 12 类的 (resource_id, parameters, output, point_key, 期望 DataType)。
+/// READY 12 类的
+/// (resource_id, parameters, output, point_key, 期望 DataType, 期望 source_label)。
+/// expected label 独立冻结（手写字符串；不得走生产 resolver 自证——resolver 与
+/// `source_label()` 若一起漂移会同错同绿；见 PR #66 review）。
 fn ready_points() -> Vec<(
     &'static str,
     serde_json::Value,
     &'static str,
     &'static str,
     DataType,
+    &'static str,
 )> {
     vec![
         (
@@ -48,6 +52,7 @@ fn ready_points() -> Vec<(
             "status",
             "canary.status",
             DataType::U32,
+            "machine.status",
         ),
         (
             "machine",
@@ -55,6 +60,7 @@ fn ready_points() -> Vec<(
             "feed",
             "canary.feed",
             DataType::U32,
+            "machine.feed",
         ),
         (
             "machine",
@@ -62,6 +68,7 @@ fn ready_points() -> Vec<(
             "spindle_speed",
             "canary.spindle_speed",
             DataType::I32,
+            "spindle.active.speed",
         ),
         (
             "axis",
@@ -69,6 +76,7 @@ fn ready_points() -> Vec<(
             "absolute",
             "canary.axis1",
             DataType::I32,
+            "axis[1].absolute",
         ),
         (
             "axis",
@@ -76,6 +84,7 @@ fn ready_points() -> Vec<(
             "absolute",
             "canary.axis2",
             DataType::I32,
+            "axis[2].absolute",
         ),
         (
             "axis",
@@ -83,6 +92,7 @@ fn ready_points() -> Vec<(
             "absolute",
             "canary.axis3",
             DataType::I32,
+            "axis[3].absolute",
         ),
         (
             "spindle",
@@ -90,6 +100,7 @@ fn ready_points() -> Vec<(
             "gear",
             "canary.gear1",
             DataType::I32,
+            "spindle[1].gear",
         ),
         (
             "spindle",
@@ -97,6 +108,7 @@ fn ready_points() -> Vec<(
             "maxrpm",
             "canary.maxrpm1",
             DataType::I32,
+            "spindle[1].maxrpm",
         ),
         (
             "macro",
@@ -104,6 +116,7 @@ fn ready_points() -> Vec<(
             "value",
             "canary.macro501",
             DataType::F64,
+            "macro[501]",
         ),
         (
             "pmc",
@@ -111,6 +124,7 @@ fn ready_points() -> Vec<(
             "value",
             "canary.pmcR100",
             DataType::I32,
+            "pmc.R100",
         ),
         (
             "param",
@@ -118,6 +132,7 @@ fn ready_points() -> Vec<(
             "value",
             "canary.param6711",
             DataType::I32,
+            "param[6711]",
         ),
         (
             "diagnosis",
@@ -125,6 +140,7 @@ fn ready_points() -> Vec<(
             "value",
             "canary.diag301a3",
             DataType::F64,
+            "diagnosis[301]@axis3",
         ),
         (
             "opmsg",
@@ -132,6 +148,7 @@ fn ready_points() -> Vec<(
             "value",
             "canary.opmsg",
             DataType::String,
+            "opmsg.value",
         ),
         (
             "alarm",
@@ -139,6 +156,7 @@ fn ready_points() -> Vec<(
             "value",
             "canary.alarm",
             DataType::StringArray,
+            "alarm.value",
         ),
     ]
 }
@@ -233,7 +251,7 @@ async fn main() {
         "schedule": {"mode": "poll", "interval_ms": 500},
         "binding": {
             "kind": GENERIC_BINDING_KIND,
-            "config": {"selections": ready.iter().map(|(r, p, o, k, _)| {
+            "config": {"selections": ready.iter().map(|(r, p, o, k, _, _)| {
                 serde_json::json!({
                     "resource_id": r, "parameters": p,
                     "outputs": [{"output": o, "point_key": k}],
@@ -250,21 +268,17 @@ async fn main() {
         }
     };
     println!("[CANARY] READY configure PASS descs={}", descs.len());
-    // descriptor 类型 + source_label 精确比对（只查 Some 不够，必须证明“正确”）。
-    // 期望 label 由 `FocasAddress::source_label` 唯一格式化入口产生（与生产同源）。
-    for ((r, p, o, key, want_dt), desc) in ready.iter().zip(descs.iter()) {
+    // descriptor 类型 + source_label 精确比对（独立冻结字符串；不得走生产
+    // resolver 自证——同错同绿，见 PR #66 review）。
+    for ((_, _, _, key, want_dt, want_label), desc) in ready.iter().zip(descs.iter()) {
         if &desc.data_type != want_dt {
             failures.push(format!(
                 "descriptor {key}: want {want_dt:?} got {:?}",
                 desc.data_type
             ));
         }
-        // 精确 label：用生产 resolver 同源重算（不手写字符串，避免漂移）。
-        let (want_addr, _) = mesa_driver_focas2::canary_resolver_pub::resolve_point(r, o, p, key)
-            .unwrap_or_else(|e| panic!("canary resolver 同源失败 {key}: {e}"));
-        let want_label = want_addr.source_label();
         match &desc.source_label {
-            Some(got) if got == &want_label => {}
+            Some(got) if got == want_label => {}
             other => failures.push(format!(
                 "descriptor {key}: source_label 应 {want_label:?}，实际 {other:?}"
             )),
@@ -363,8 +377,8 @@ async fn main() {
             .unwrap_or_else(|| format!("<unknown:{}>", pv.point_id));
         let want_dt = ready
             .iter()
-            .find(|(_, _, _, k, _)| k == &key)
-            .map(|(_, _, _, _, dt)| *dt);
+            .find(|(_, _, _, k, _, _)| k == &key)
+            .map(|(_, _, _, _, dt, _)| *dt);
         match want_dt {
             None => failures.push(format!("未知 point {key} id={}", pv.point_id)),
             Some(dt) => {

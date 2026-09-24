@@ -32,26 +32,6 @@ pub mod wire_pub {
     pub use crate::wire::WireFocasApi;
 }
 
-/// canary 诊断专用窄口（`#[doc(hidden)]` 非稳定、诊断专用）：
-/// 暴露生产同源 resolver 供 canary 精确比对 `source_label`
-/// （不手写期望字符串，避免漂移；生产路径不用此模块）。
-#[doc(hidden)]
-pub mod canary_resolver_pub {
-    use mesa_core_types::DataType;
-
-    use crate::address::FocasAddress;
-
-    /// 生产同源 `(resource_id, output, params)` → `(FocasAddress, DataType)`。
-    pub fn resolve_point(
-        resource_id: &str,
-        output: &str,
-        params: &serde_json::Value,
-        point_key: &str,
-    ) -> Result<(FocasAddress, DataType), mesa_driver_sdk::SdkDriverError> {
-        crate::resolve_generic_point(resource_id, output, params, point_key)
-    }
-}
-
 use std::sync::Arc;
 use std::time::Duration;
 
