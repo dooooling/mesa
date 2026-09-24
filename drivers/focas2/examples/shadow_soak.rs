@@ -217,6 +217,10 @@ struct SoakCounters {
     wire_latency_ms_max: u128,
     /// mismatch 明细（`cycle/label/native/wire`；不提前退出，跑完再判）。
     mismatch_log: Vec<String>,
+    /// C2 恢复验证计数：注入周期之后成功读 Wire 的周期数。
+    wire_ok_after_kill: u64,
+    /// C2 恢复验证计数：注入周期之后完成 parity compare 的周期数。
+    compared_after_kill: u64,
 }
 
 #[tokio::main]
@@ -269,6 +273,9 @@ async fn main() {
         (0, 0, 0)
     }
     let mut round_snapshots: Vec<(u64, u64, u64, u64, u64)> = Vec::new();
+    // #1 真修：轮次 fail 必须以非零码退出（`rc=false → exit(0)` 会把
+    // mismatch/native_error/steady wire error 全部“失败但进程成功”）。
+    let mut any_round_failed = false;
     for round in 1..=rounds {
         if rounds > 1 {
             println!("--- round {round}/{rounds} connect → read → disconnect → drop重建 ---");
@@ -288,17 +295,23 @@ async fn main() {
         let snap1 = snapshot();
         round_snapshots.push((snap0.0, snap0.1, snap0.2, snap1.1, snap1.2));
         if !rc {
-            std::process::exit(rc as i32);
+            // 不提前退出：跑完所有 rounds 再统一判（mismatch 明细已在轮内打印）。
+            any_round_failed = true;
         }
     }
     // C3 结论（证据纪律）：
     // OBSERVED：各 round connect/read/disconnect 无失败（见上轮次输出）；
-    // 快照计数器当前为占位 0（未接 Win32 真实指标前不声称“无单调增长”）。
-    // NOT PROVEN：DLL 内部资源绝对无泄漏。
+    // 快照计数器当前为占位 0（未接 Win32 真实指标前不声称“无单调增长”，
+    // 更不写 `resource monotonic growth=0` Gate；见下 C3 门注释）。
+    // NOT PROVEN：DLL 内部资源绝对无泄漏；内存/线程/句柄无增长。
     println!(
-        "soak rounds done: rounds={} snapshots={:?} (OBSERVED: 轮次通过；NOT PROVEN: DLL 内部无泄漏)",
+        "soak rounds done: rounds={} snapshots={:?} (OBSERVED: 轮次通过；NOT PROVEN: DLL 内部无泄漏/资源无增长)",
         rounds, round_snapshots,
     );
+    if any_round_failed {
+        eprintln!("soak FAILED: 至少一轮未通过（见上 MISMATCH-LOG / error 行）");
+        std::process::exit(2);
+    }
 }
 
 /// `soak_round` 参数束（clippy `too_many_arguments` 门；诊断工具内部用）。
@@ -386,6 +399,10 @@ async fn soak_round(p: SoakRoundParams<'_>) -> bool {
         let wires = match wires {
             Ok(v) => {
                 c.wire_ok += 1;
+                // C2 恢复验证：注入周期之后每次成功读都计数。
+                if kill_wire_at != 0 && n > kill_wire_at {
+                    c.wire_ok_after_kill += 1;
+                }
                 v
             }
             Err(e) => {
@@ -411,6 +428,10 @@ async fn soak_round(p: SoakRoundParams<'_>) -> bool {
             }
         };
         for (i, (label, addr)) in addrs.iter().enumerate() {
+            // C2 恢复验证：注入周期之后每次完成 compare 都计数（无论 verdict）。
+            if kill_wire_at != 0 && n > kill_wire_at {
+                c.compared_after_kill += 1;
+            }
             match judge(addr, &natives[i], &wires[i]) {
                 Verdict::Equal => c.equal += 1,
                 Verdict::KnownNativeUnsupported { .. } => c.native_unsupported += 1,
@@ -492,6 +513,39 @@ async fn soak_round(p: SoakRoundParams<'_>) -> bool {
     // 调用方 `soak_round` 返回 false 即轮次 fail）。
     for m in &c.mismatch_log {
         eprintln!("[round {round}] MISMATCH-LOG {m}");
+    }
+    // #2 真修：C2 recovery 的通过门必须显式验证“真正恢复”，不只“执行过重连”。
+    // 注入窗口（`kill_wire_at != 0`）要求：native_error=0 + reconnect_attempt>=1
+    // + reconnect_ok>=1 + reconnect_fail=0 + 注入后至少再成功读一次 Wire
+    // （`wire_ok_after_kill >= 1`）+ 注入后至少再完成一次 parity compare
+    // （`compared_after_kill >= 1`）；`kill` 落在最后两周期则直接判 fail
+    // （无足够周期验证恢复；调用方应把注入点前移，见下）。
+    if kill_wire_at != 0 {
+        if kill_wire_at + 2 > cycles {
+            eprintln!(
+                "[round {round}] C2-GATE-FAIL: kill_wire_at={kill_wire_at} 落在最后两周期，无足够周期验证恢复（应 <= cycles-2={})",
+                cycles.saturating_sub(2)
+            );
+            return false;
+        }
+        if !(c.native_error == 0
+            && c.reconnect_attempt >= 1
+            && c.reconnect_ok >= 1
+            && c.reconnect_fail == 0
+            && c.wire_ok_after_kill >= 1
+            && c.compared_after_kill >= 1)
+        {
+            eprintln!(
+                "[round {round}] C2-GATE-FAIL: native_error={} reconnect={}/{}/{} wire_ok_after_kill={} compared_after_kill={}（要求 0/>=1/>=1/0/>=1/>=1）",
+                c.native_error,
+                c.reconnect_attempt,
+                c.reconnect_ok,
+                c.reconnect_fail,
+                c.wire_ok_after_kill,
+                c.compared_after_kill,
+            );
+            return false;
+        }
     }
     if c.mismatch > 0 {
         return false;
