@@ -17,6 +17,9 @@
 //!   Mesa 取 scaled F64（与 feed/spindle 取 mantissa 形成对照）。
 //! - pmc 证据（P0~P3）：`0x8001/device=2` scalar；BYTE/WORD/DWORD +
 //!   bit projection；Mesa BYTE→I32（PR56 产品合同修正）。
+//! - pmc 写证据（R100）：`0x8002/device=2` BYTE single-address 1B
+//!   （W-PMC-3/4：R100 `0x00→0x01→0x00`；`size=29/data_len=1/data=[XX]`；
+//!   成功响应 `status=0/data_len=0` 无 value echo；只 admit BYTE single 1B）。
 //! - param 证据（Q0/Q3/P-C）：`0x8D` integer-safe scalar；Mesa I32。
 //! - diagnosis 证据（D301）：`0x93[301,301,3,0]` → type=5 REAL →
 //!   `RawNumeric8(-10,10,3)` → Mesa F64(-0.010)；Batch 2 只 admit REAL。
@@ -125,6 +128,7 @@ pub(crate) fn run_all() {
     macro_request_locked();
     pmc_scalar_decodes();
     pmc_request_locked();
+    pmc_write_byte_locked();
     param_decodes();
     param_q0_negative_evidence();
     param_request_locked();
@@ -710,7 +714,132 @@ fn pmc_request_locked() {
     }
 }
 
-/// param Q0/Q3/P-C：`param_response_frame.bin` 经生产 codec 解码 ==
+/// pmc 写 R100（W-PMC-5）：捕获 fixture 精确回放 + 负测试（clone/mutate）。
+///
+/// 正：`req_write_s1_01/s3_00` 经生产 encoder byte-for-byte == 捕获 41B；
+/// `resp_write_s1/s3` 经生产 decoder == `Ok(())`.
+///
+/// 负：成功响应 clone 后 mutate（非 evidence fixture，synthetic negative）：
+/// wrong command echo → `CommandMismatch`；truncated → `MalformedPayload`；
+/// non-zero status → `Remote`.
+///
+/// 第一层锁死 `size=29/command=8002/start=end=100/area=5/dtype=0/aux=0/`
+/// `data_len=1/value=01·00`；只 admit BYTE single-address 1B.
+fn pmc_write_byte_locked() {
+    use super::WireError;
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN, RequestSubpacket};
+    use super::frame::{decode_reply_payload, encode_generic_request, match_slot};
+    use super::wire::decode_pmc_write_response as decode_write;
+    use super::wire::{CMD_PMC_WRITE, DEV_PMC, PATH_PMC_OBSERVED, PmcArea};
+    // 正：encoder byte-for-byte（41B frame 全等；含 10B header）。
+    for (name, value) in [("req_write_s1_01", 0x01u8), ("req_write_s3_00", 0x00u8)] {
+        let area = PmcArea::from_kind('R').expect("R 必须 canonical");
+        let real = RequestSubpacket {
+            device: DEV_PMC,
+            path: PATH_PMC_OBSERVED,
+            command: CMD_PMC_WRITE,
+            args: [100, 100, area.adr_type() as u32, 0],
+            aux: 0,
+            data: vec![value],
+        };
+        let build = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[real.as_legacy()]),
+        }
+        .encode();
+        assert_eq!(build.len(), 41, "{name} 0x8002 请求必须 41B");
+        let raw = read("pmc_write_byte", &format!("{name}.bin"));
+        let frames = cut_fixture_frames(&raw);
+        assert_eq!(frames.len(), 1, "{name} 必须恰好 1 帧");
+        assert_eq!(
+            frames[0], build,
+            "{name} production encoder 必须 == captured fixture 全 41B"
+        );
+    }
+    // 正：decoder == Ok(())（成功响应 28B frame / 16B subpacket / data 空）。
+    for name in ["resp_write_s1", "resp_write_s3"] {
+        let frame = assemble_frame(&read("pmc_write_byte", &format!("{name}.bin")));
+        assert_eq!(frame.packet_type, PacketType::GENERIC_RESPONSE);
+        decode_write(&frame).expect("{name} 必须解码 Ok(())");
+    }
+    // 负：captured positive clone/mutate（synthetic，非 evidence）。
+    let base = assemble_frame(&read("pmc_write_byte", "resp_write_s1.bin"));
+    // wrong command echo → CommandMismatch（8002 → 8001）。
+    {
+        let mut payload = base.payload.clone();
+        // GENERIC payload: count[0:2] + size[2:4] + dev[4:6] + path[6:8] + cmd[8:10]。
+        payload[8] = 0x80;
+        payload[9] = 0x01;
+        let mutated = FocasFrame {
+            origin: base.origin,
+            packet_type: base.packet_type,
+            payload,
+        };
+        assert!(
+            matches!(
+                decode_write(&mutated),
+                Err(super::WireError::CommandMismatch)
+            ),
+            "wrong command echo 必须 CommandMismatch"
+        );
+    }
+    // truncated response → MalformedPayload（去尾 1B）。
+    {
+        let mut payload = base.payload.clone();
+        payload.truncate(payload.len() - 1);
+        let mutated = FocasFrame {
+            origin: base.origin,
+            packet_type: base.packet_type,
+            payload,
+        };
+        assert!(
+            matches!(
+                decode_write(&mutated),
+                Err(super::WireError::MalformedPayload)
+            ),
+            "truncated 必须 MalformedPayload"
+        );
+    }
+    // non-zero status → Remote（status[8:10] 置 2；detail 保留）。
+    {
+        let mut payload = base.payload.clone();
+        // reply subpacket: count[0:2]+size[2:4]+dev[4:6]+path[6:8]+cmd[8:10]+
+        // status[10:12]+detail1[12:14]+detail2[14:16]+dlen[16:18]。
+        payload[10] = 0x00;
+        payload[11] = 0x02;
+        let mutated = FocasFrame {
+            origin: base.origin,
+            packet_type: base.packet_type,
+            payload,
+        };
+        match decode_write(&mutated) {
+            Err(WireError::Remote {
+                status,
+                detail1,
+                detail2,
+            }) => {
+                assert_eq!(status, 2);
+                assert_eq!((detail1, detail2), (0, 0));
+            }
+            other => panic!("non-zero status 必须 Remote，实际 {other:?}"),
+        }
+    }
+    // 合同形状锁（与 EVIDENCE.md §5 同源断言，不重复 handler 逻辑）：
+    // 写请求 subpacket size=29 / 读请求 28；成功响应 subpacket size=16 / dlen=0。
+    {
+        let w = read("pmc_write_byte", "req_write_s1_01.bin");
+        assert_eq!(w.len(), 41);
+        let subs = super::frame::decode_generic_payload(&w[10..]).expect("写请求 GENERIC 必须合法");
+        assert_eq!(subs.len(), 1);
+        let r = read("pmc_write_byte", "resp_write_s1.bin");
+        let subs = decode_reply_payload(&r[10..]).expect("写响应 GENERIC 必须合法");
+        let sub = match_slot(&subs, DEV_PMC, PATH_PMC_OBSERVED, CMD_PMC_WRITE, 0)
+            .expect("写响应必须含 0x8002 槽");
+        assert_eq!(sub.status, 0);
+        assert!(sub.data.is_empty(), "成功响应无 value echo");
+    }
+}
 /// param Q3/P-C（identity-scale GOOD）：`param_response_frame.bin` 经生产
 /// codec 解码 == expected（3411=0/6711=10027/123/456/restored；Mesa I32）。
 /// Q0（`00 0a 00 03`）不在此列——它走 `param_q0_negative_evidence`，

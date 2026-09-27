@@ -8,7 +8,9 @@
 //!   frame#2(`0x19+0xe1+0x98` count=3)，忠于已捕获组合，不做 `0x19-only`
 //!   优化；响应只消费 `0x19` subpacket，`0xe1/0x98` 验证 framing 后跳过
 //!   （unknown by design，不命名、不映射）。
-//! - V1 只读：本文件无任何 write/program/control 路径。
+//! - V1 读路径全量 + `0x8002` PMC BYTE 写 codec（W-PMC-5；只 admit
+//!   BYTE single-address 1B，不接生产控制面；见 `pmc_write_byte`）。
+//!   其余 program/control 路径仍无。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,8 +19,8 @@ use tokio::sync::Mutex;
 
 use super::WireError;
 use super::frame::{
-    FocasFrame, GenericSubpacket, PacketType, REQUEST_ORIGIN, ReplySubpacket, decode_reply_payload,
-    encode_generic_request, match_slot, request_subpacket,
+    FocasFrame, GenericSubpacket, PacketType, REQUEST_ORIGIN, ReplySubpacket, RequestSubpacket,
+    decode_reply_payload, encode_generic_request, match_slot, request_subpacket,
 };
 use super::session::WireSession;
 use crate::address::FocasAddress;
@@ -613,6 +615,14 @@ pub(super) const CMD_AXIS_ABSOLUTE: u16 = 0x0026;
 /// 单点语义（BYTE `end=start` / WORD `end=start+1` / DWORD `end=start+3`），
 /// 不做范围读/multi-address/planner merge）。
 pub(super) const CMD_PMC_READ: u16 = 0x8001;
+/// `pmc_wrpmcrng` 命令（`0x8002`，W-PMC-3/4 Evidence PASS：
+/// `device=2/path=1/arg0=start/arg1=end/arg2=area/arg3=dtype(BYTE=0)/aux=0/
+/// data_len=1/data=[value]`；第一版只 admit BYTE single-address 1B，
+/// 不做 WORD/DWORD/range/bit-native/multi-address/RMW）。
+/// NOTE：W-PMC-6 接生产控制面前本常量无生产调用方
+/// （`#[allow(dead_code)]` 合同先行标记，与 `DIAGNOSIS_AXIS_MAX` 同例）。
+#[allow(dead_code)]
+pub(super) const CMD_PMC_WRITE: u16 = 0x8002;
 /// 兼容视图：`function = path<<16|command`（旧代码用，字节等价）。
 /// （`FUNC_SYSINFO` 等保留供 fixture/request builder 兼容，见下。）
 pub(super) const FUNC_SYSINFO: u32 = 0x0001_0018;
@@ -1470,6 +1480,59 @@ impl FocasClient {
         };
         Ok(v)
     }
+
+    /// `pmc_write_byte(kind, addr, value)`（W-PMC-5：`0x8002` BYTE single-address
+    /// 1B；W-PMC-3/4 Evidence PASS：`device=2/path=PATH_PMC_OBSERVED/
+    /// arg0=arg1=addr/arg2=adr/arg3=0(BYTE)/aux=0/data=[value]`）。
+    /// 只 admit：canonical kind + `addr <= c_short` + BYTE + single + 1B。
+    /// 不做 WORD/DWORD/range/bit-native/multi-address/RMW
+    /// （R100.0 的 RMW 属上层 controlled operation，不进 wire codec）。
+    /// NOTE：W-PMC-6 接生产控制面前无生产调用方（fixture 直测覆盖）。
+    #[allow(dead_code)]
+    pub async fn pmc_write_byte(&self, kind: char, addr: u32, value: u8) -> Result<(), WireError> {
+        let area =
+            PmcArea::from_kind(kind).ok_or(WireError::Unsupported("pmc noncanonical kind"))?;
+        if addr > i16::MAX as u32 {
+            return Err(WireError::Unsupported("pmc address out of c_short range"));
+        }
+        // 真实模型 builder（`size = 28 + data.len()`；`aux=0/data_len=1/data=[v]`；
+        // 与捕获 41B frame byte-for-byte 同构，见 fixture `req_write_*`；
+        // 经 `as_legacy()` 走旧 `GenericSubpacket` 编码路径（已验证 bytes 不变）。
+        let real = RequestSubpacket {
+            device: DEV_PMC,
+            path: PATH_PMC_OBSERVED,
+            command: CMD_PMC_WRITE,
+            args: [addr, addr, area.adr_type() as u32, 0],
+            aux: 0,
+            data: vec![value],
+        };
+        let legacy = real.as_legacy();
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[legacy]),
+        };
+        let mut guard = self.guard().await?;
+        let session = guard.session();
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                return Err(e);
+            }
+        };
+        guard.complete();
+        match decode_pmc_write_response(&resp) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                Err(e)
+            }
+        }
+    }
 }
 
 /// `0x18` 响应解码：slot 匹配 `0x18`，成功数据 = 18B ODBSYS
@@ -1615,6 +1678,22 @@ pub(super) fn decode_pmc_byte(resp: &FocasFrame) -> Result<PmcScalarValue, WireE
         return Err(WireError::MalformedPayload);
     }
     Ok(PmcScalarValue::Byte(d[0]))
+}
+
+/// `0x8002` 写响应解码（W-PMC-5：slot 匹配 `(device=2, path, cmd=0x8002)`；
+/// 成功即 `status == 0 && data_len == 0`，返回 `Ok(())`）。
+/// 缺槽即 `CommandMismatch`；`status != 0` 走共用 Remote（不重复写 status
+/// parser）；`data` 非空即 `MalformedPayload`（成功响应无 value echo，
+/// W-PMC-3/4 Evidence PASS）。
+pub(super) fn decode_pmc_write_response(resp: &FocasFrame) -> Result<(), WireError> {
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub = match_slot(&subs, DEV_PMC, PATH_PMC_OBSERVED, CMD_PMC_WRITE, 0)
+        .ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    if !d.is_empty() {
+        return Err(WireError::MalformedPayload);
+    }
+    Ok(())
 }
 
 /// `0x26` 响应解码：slot 匹配 `0x26`，成功数据精确 8B（与 feed 同构，
