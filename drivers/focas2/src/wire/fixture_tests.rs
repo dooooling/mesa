@@ -17,7 +17,7 @@
 //!   Mesa 取 scaled F64（与 feed/spindle 取 mantissa 形成对照）。
 //! - pmc 证据（P0~P3）：`0x8001/device=2` scalar；BYTE/WORD/DWORD +
 //!   bit projection；Mesa BYTE→I32（PR56 产品合同修正）。
-//! - pmc 写证据（W100）：`0x8002/device=2` BYTE single-address 1B
+//! - pmc 写证据（R100）：`0x8002/device=2` BYTE single-address 1B
 //!   （W-PMC-3/4：R100 `0x00→0x01→0x00`；`size=29/data_len=1/data=[XX]`；
 //!   成功响应 `status=0/data_len=0` 无 value echo；只 admit BYTE single 1B）。
 //! - param 证据（Q0/Q3/P-C）：`0x8D` integer-safe scalar；Mesa I32。
@@ -714,7 +714,7 @@ fn pmc_request_locked() {
     }
 }
 
-/// pmc 写 W100（W-PMC-5）：捕获 fixture 精确回放 + 负测试（clone/mutate）。
+/// pmc 写 R100（W-PMC-5）：捕获 fixture 精确回放 + 负测试（clone/mutate）。
 ///
 /// 正：`req_write_s1_01/s3_00` 经生产 encoder byte-for-byte == 捕获 41B；
 /// `resp_write_s1/s3` 经生产 decoder == `Ok(())`.

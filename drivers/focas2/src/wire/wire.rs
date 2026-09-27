@@ -8,7 +8,9 @@
 //!   frame#2(`0x19+0xe1+0x98` count=3)，忠于已捕获组合，不做 `0x19-only`
 //!   优化；响应只消费 `0x19` subpacket，`0xe1/0x98` 验证 framing 后跳过
 //!   （unknown by design，不命名、不映射）。
-//! - V1 只读：本文件无任何 write/program/control 路径。
+//! - V1 读路径全量 + `0x8002` PMC BYTE 写 codec（W-PMC-5；只 admit
+//!   BYTE single-address 1B，不接生产控制面；见 `pmc_write_byte`）。
+//!   其余 program/control 路径仍无。
 
 use std::sync::Arc;
 use std::time::Duration;

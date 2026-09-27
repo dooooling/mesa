@@ -135,5 +135,6 @@ WRITE-1 vs WRITE-0 仅 `byte30: 01 ↔ 00`。
   （代码服从证据；fixture 为准）。
 - W-PMC-5 第一版只 admit：PMC BYTE + single address + `start == end` +
   1-byte payload；不扩 WORD/DWORD/range write（无写证据）。
-- 负 fixture（W-PMC-4 产出时补）：wrong command echo / truncated
-  response / non-zero remote status。
+- 负测试（synthetic，非 evidence fixture；W-PMC-5 已冻结）：
+  captured positive clone/mutate → wrong command echo / truncated
+  response / non-zero remote status（见 `pmc_write_byte_locked`）。
