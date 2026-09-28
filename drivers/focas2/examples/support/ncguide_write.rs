@@ -355,15 +355,18 @@ pub fn run_byte(host: &str, port: u16, timeout_ms: u64, target: Option<u8>) -> R
     }
 }
 
-/// W-PMC-2 controlled ladder signal（run 内嵌套定义见 run_byte；此处为冗余旧定义，删除）。
+/// W-PMC-2 controlled ladder signal（run_byte 内嵌套定义见 run_byte；此处为冗余旧定义，删除）。
+#[cfg(any(test, all(target_os = "windows", target_pointer_width = "64")))]
 #[allow(dead_code)]
 fn experiment_ladder_outer_unused() {}
 
+#[cfg(any(test, all(target_os = "windows", target_pointer_width = "64")))]
 #[allow(dead_code)]
 fn experiment(_io: &mut impl ByteIo) -> Result<(), String> {
     Err("已由 experiment_ladder 替代（R100.0──R101.0 最小链）".into())
 }
 
+#[cfg(any(test, all(target_os = "windows", target_pointer_width = "64")))]
 #[allow(dead_code)]
 fn experiment_bit0(_io: &mut impl ByteIo, _original: u8) -> Result<(), String> {
     Err("已由 experiment_ladder 替代（R100.0──R101.0 最小链）".into())
