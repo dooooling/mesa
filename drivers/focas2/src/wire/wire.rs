@@ -368,6 +368,30 @@ pub struct SpindleWord {
     pub value: i16,
 }
 
+/// FOCAS tool offset/length（Gate 3-C2 Evidence PASS，single-point `0x08`）。
+/// 独立 typed（不复用 spindle word / macro / param decoder——command 不同，
+/// operation identity = command + args，一个 operation 一个 layout）。
+/// 请求：`device=1/path=1/arg0=arg1=tool/arg2=1001(offset)·1003(length)/
+/// arg3=0/aux=0/dlen=0`；响应 `dlen=8/data[0..4] BE32`（`[4..8]=000a0003`
+/// 恒定，不命名）；Mesa 取 engineering F64（`value/1000`，3-C1 语义证据）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolCompValue {
+    /// 原始 8B（`0x08` reply 全量；以后他 target 尾部不同证据不丢）。
+    pub raw: [u8; 8],
+    /// 定点值（i32 BE `data[0..4]`；5000/10000 双窗证据；负值语义待自然观测）。
+    pub value: i32,
+}
+
+/// `tofs` selector（Gate 3-C2：`1001 ↔ Native type=1 offset` /
+/// `1003 ↔ Native type=3 length`；observed 对应，不命名 `1000+type` 语义）。
+pub(super) const TOFS_ARG_OFFSET: u32 = 1001;
+/// 同上（length）。
+pub(super) const TOFS_ARG_LENGTH: u32 = 1003;
+/// `0x08` 命令（Gate 3-C2 single-point tool offset/length）。
+pub(super) const CMD_TOFS: u16 = 0x0008;
+/// `0x08` 响应数据体（`dlen=8`；`data[0..4]` BE32 value + `[4..8]` 恒定尾）。
+pub const TOFS_DATA_LEN: usize = 8;
+
 /// FOCAS `param_value`（`0x8D`）typed 结果。param v1 Evidence PASS。
 /// 保留完整证据（不过早抽象成 `RawNumeric8`——尾部 scale 语义未闭合，
 /// REAL 留后续窗口；此处只冻结 identity-scale `I32` 单点读取）。
@@ -655,6 +679,9 @@ pub(super) const FUNC_AXIS_ABSOLUTE: u32 = 0x0001_0026;
 /// 兼容视图（PMC：`function = path<<16|command` 字节等价；
 /// 新代码用 `(DEV_PMC, PATH_PMC_OBSERVED, CMD_PMC_READ)`）。
 pub(super) const FUNC_PMC_READ: u32 = 0x0001_8001;
+/// 兼容视图（tool：`function = path<<16|command` 字节等价；
+/// 新代码用 `(DEV_CNC, PATH_CNC, CMD_TOFS)`）。
+pub(super) const FUNC_TOFS: u32 = 0x0001_0008;
 /// axis `0x26` 请求首个参数实测恒 `4`（165 observed；语义未知，不命名业务含义）。
 pub(super) const AXIS_ARG0_OBSERVED: i32 = 4;
 
@@ -1029,6 +1056,56 @@ impl FocasClient {
         };
         guard.complete();
         match decode_macro_value(&resp) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                Err(e)
+            }
+        }
+    }
+
+    /// `tofs_value(kind, number)`（Gate 3-C2 Evidence PASS：single-point
+    /// `0x08` count=1，`device=1/path=1/arg0=arg1=number/arg2=1001(offset)·
+    /// 1003(length)/arg3=0/aux=0/dlen=0；单点语义，不做 area/range）。
+    /// tool 号超 `c_short` 即 `Unsupported`，不发包（Wire-local checked）。
+    /// 响应 `dlen=8`，`data[0..4] BE32` + `[4..8]` 恒定尾（见 `TOFS_DATA_LEN`）。
+    pub async fn tofs_value(
+        &self,
+        kind: crate::address::ToolKind,
+        number: u32,
+    ) -> Result<ToolCompValue, WireError> {
+        use crate::address::ToolKind;
+        let selector = match kind {
+            ToolKind::Offset => TOFS_ARG_OFFSET,
+            ToolKind::Length => TOFS_ARG_LENGTH,
+            _ => return Err(WireError::Unsupported("tofs kind must be Offset/Length")),
+        };
+        let n = i16::try_from(number)
+            .map_err(|_| WireError::Unsupported("tofs number out of c_short range"))?
+            as i32;
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_TOFS,
+                [n, n, selector as i32, 0, 0],
+            )]),
+        };
+        let mut guard = self.guard().await?;
+        let session = guard.session();
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                return Err(e);
+            }
+        };
+        guard.complete();
+        match decode_tofs_value(&resp) {
             Ok(v) => Ok(v),
             Err(e) => {
                 let fatal = e.is_session_fatal();
@@ -1785,6 +1862,24 @@ pub(super) fn decode_spindle_word(resp: &FocasFrame) -> Result<SpindleWord, Wire
     Ok(SpindleWord { raw, value })
 }
 
+/// `0x08` 响应解码（Gate 3-C2 single-point tool offset/length，独立 decoder，
+/// 不复用 spindle word/macro/param——command 不同，一个 operation 一个 layout）。
+/// slot 匹配 `0x08`；成功数据精确 8B（`data[0..4] BE32 value + [4..8]` 恒定尾；
+/// `!= 8` 即 Malformed，不猜 area/range 形态）。缺 `0x08` 即 `CommandMismatch`。
+pub(super) fn decode_tofs_value(resp: &FocasFrame) -> Result<ToolCompValue, WireError> {
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub =
+        match_slot(&subs, DEV_CNC, PATH_CNC, CMD_TOFS, 0).ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    if d.len() != TOFS_DATA_LEN {
+        return Err(WireError::MalformedPayload);
+    }
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(d);
+    let value = i32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+    Ok(ToolCompValue { raw, value })
+}
+
 /// `0x15` 响应解码：slot 匹配 `0x15`，成功数据精确 8B（与 feed/axis/spindle
 /// 同构，独立 decoder，不抽公共类型；`RawNumeric8` 第四个独立 operation）。
 /// 缺 `0x15` 即 `CommandMismatch`。
@@ -2058,6 +2153,15 @@ fn spindle_word_to_value(w: &SpindleWord) -> Value {
     Value::I32(w.value as i32)
 }
 
+/// Mesa `tool.offset/tool.length` 映射（Gate 3-C3）：
+/// `value: i32` → `Value::F64(value/1000.0)`（3-C1 semantic evidence：
+/// Native `data/1000.0` 同合同；5000→5.0/10000→10.0 双窗证据）。
+/// 此处只做 scale 映射，不截断/不猜 Panel 列语义（offset=RADIUS GEOM /
+/// length=LENGTH GEOM 由 request selector 决定，不由 adapter 定）。
+fn tofs_to_value(v: &ToolCompValue) -> Value {
+    Value::F64(v.value as f64 / 1000.0)
+}
+
 /// Mesa `machine/feed` 映射（PR53 两层语义 + B1 冻结 + B4 真实权威）：
 /// `native_value = mantissa` → `Value::U32`（与 `cnc_actf` 只复制前 4B
 /// 同合同；不因 `exponent != 0` 拒绝——否则 `mantissa=1234/exp=1` 将在
@@ -2125,11 +2229,35 @@ fn dedup_sword_keys(addresses: &[FocasAddress]) -> Vec<(crate::address::SpindleK
     order
 }
 
+/// Gate 3-C3 去重 helper（生产与测试共用）：
+/// `Tool/Offset|Length` 按 `(kind, number)` 保序去重（生产 `tofs_order`
+/// 即此函数；Number/Zofs 不纳入——3-C3 只服务 offset/length）。
+fn dedup_tofs_keys(addresses: &[FocasAddress]) -> Vec<(crate::address::ToolKind, u32)> {
+    use crate::address::ToolKind;
+    let mut order: Vec<(ToolKind, u32)> = Vec::new();
+    for a in addresses {
+        if let FocasAddress::Tool { kind, number } = a
+            && matches!(kind, ToolKind::Offset | ToolKind::Length)
+            && !order.contains(&(*kind, *number))
+        {
+            order.push((*kind, *number));
+        }
+    }
+    order
+}
+
 /// fixture/test 专用：生产 `macro_to_value` 同源入口（`#[cfg(test)]`，
 /// 不出 crate；macro M0~M3 fixture 回归用）。
 #[cfg(test)]
 pub(super) fn macro_to_value_for_test(m: &MacroValue) -> Result<Value, WireError> {
     macro_to_value(m)
+}
+
+/// fixture/test 专用：生产 `tofs_to_value` 同源入口（`#[cfg(test)]`，
+/// 不出 crate；tool offset/length fixture 回归用）。
+#[cfg(test)]
+pub(super) fn tofs_to_value_for_test(v: &ToolCompValue) -> Value {
+    tofs_to_value(v)
 }
 
 /// fixture/test 专用：生产 `param_to_value` 同源入口（`#[cfg(test)]`，
@@ -2169,13 +2297,14 @@ pub(super) fn axis_value_for_test(v: i32) -> Value {
 // ---------------------------------------------------------------------------
 // WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed + PR3 axis + PR54 spindle
 // + PR55 macro + PR56 pmc scalar + PR57 param + PR58 opmsg
-// + Batch 1 spindle gear/maxrpm + Batch 2 diagnosis REAL + Batch 3 alarm）
+// + Batch 1 spindle gear/maxrpm + Batch 2 diagnosis REAL + Batch 3 alarm
+// + Gate 3-C3 tool offset/length）
 // ---------------------------------------------------------------------------
 
-/// Wire 版 `FocasApi`（Batch 3：`system_info` + `Status` + `Feed` +
+/// Wire 版 `FocasApi`（Gate 3-C3：`system_info` + `Status` + `Feed` +
 /// `Axis/absolute` + `ActiveSpindleSpeed` + `MacroVar` + `Pmc` scalar +
-/// `Param` + `OpMsg` + `Spindle/Gear|MaxRpm` + `Diagnosis/REAL` + `Alarm`；
-/// 其余地址 `Unsupported`，
+/// `Param` + `OpMsg` + `Spindle/Gear|MaxRpm` + `Diagnosis/REAL` + `Alarm` +
+/// `Tool/Offset|Length`；其余地址 `Unsupported`，
 /// fail-closed，不猜、不 fallback Native）。
 pub struct WireFocasApi {
     client: Arc<FocasClient>,
@@ -2227,7 +2356,9 @@ impl FocasApi for WireFocasApi {
             return Ok(Vec::new());
         }
         // 同一批共享请求：Status/Feed/ActiveSpindle/OpMsg 各一次；Axis 按轴号各一次
-        // （`0x26` 单轴语义，无多轴数组）；Macro 按宏号各一次（`0x15` 单点，
+        // （`0x26` 单轴语义，无多轴数组）；Spindle Gear/MaxRpm 按 (kind,spindle)
+        // 去重（Batch 1 三 slot）；Tool offset/length 按 (kind,number) 去重
+        // （Gate 3-C3 single-point `0x08`）；Macro 按宏号各一次（`0x15` 单点，
         // 不做范围读）；Param 按参数号各一次（`0x8D` 单点，不做范围/axis）；
         // PMC scalar 按 (kind,addr) 去重各一次（`0x8001` 单点，
         // 不做 range/merge）；其余 fail-closed。
@@ -2347,6 +2478,23 @@ impl FocasApi for WireFocasApi {
                 _ => unreachable!("order 只含 Gear/MaxRpm"),
             };
             sword_map.insert((*kind, *spindle), r);
+        }
+        // Tool offset/length：按 (kind,number) 去重各一次 `tofs_value`
+        // （single-point `0x08`；offset→1001/length→1003；batch 多个同 key
+        // 去重一次 exchange；去重逻辑见 `dedup_tofs_keys`，此处生产调用）。
+        use crate::address::ToolKind;
+        let tofs_order: Vec<(ToolKind, u32)> = dedup_tofs_keys(addresses);
+        let mut tofs_map: BTreeMap<(ToolKind, u32), Result<Value, String>> = BTreeMap::new();
+        for (kind, number) in &tofs_order {
+            let r: Result<Value, String> = match self.client.tofs_value(*kind, *number).await {
+                Ok(v) => Ok(tofs_to_value(&v)),
+                Err(e) => match Self::point_or_fatal(e) {
+                    Ok(Value::String(s)) => Err(s),
+                    Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                    Err(fatal) => return Err(fatal),
+                },
+            };
+            tofs_map.insert((*kind, *number), r);
         }
         // Macro 按宏号各一次 0x15（单点语义；超 c_short 在 operation 内 fail-closed）。
         let mut macro_map: BTreeMap<u32, Result<Value, String>> = BTreeMap::new();
@@ -2545,6 +2693,19 @@ impl FocasApi for WireFocasApi {
                         ))),
                     }
                 }
+                FocasAddress::Tool { kind, number } => {
+                    match tofs_map.get(&(*kind, *number)).cloned() {
+                        Some(Ok(v)) => out.push(v),
+                        Some(Err(e)) if e.starts_with("ERR:") => out.push(Value::String(e)),
+                        Some(Err(fatal)) => return Err(fatal),
+                        // 非 Offset/Length（如 Number/Zofs）与 Native 同口径
+                        // fail-closed（ERR → BAD；Gate 3-C3 只服务 offset/length）。
+                        None => out.push(Value::String(format!(
+                            "ERR:{}",
+                            WireError::Unsupported("tool kind not in Wire Gate 3-C3")
+                        ))),
+                    }
+                }
                 FocasAddress::MacroVar { number } => {
                     match macro_map.get(number).cloned().unwrap() {
                         Ok(v) => out.push(v),
@@ -2629,7 +2790,7 @@ impl FocasApi for WireFocasApi {
                 _ => out.push(Value::String(format!(
                     "ERR:{}",
                     WireError::Unsupported(
-                        "Batch 2 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc/Param/OpMsg/SpindleGear/MaxRpm/Diagnosis/Alarm"
+                        "Gate 3-C3 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc/Param/OpMsg/SpindleGear/MaxRpm/Diagnosis/Alarm/ToolOffset/ToolLength"
                     )
                 ))),
             }

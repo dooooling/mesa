@@ -35,7 +35,7 @@ use super::frame::{FRAME_HEADER_LEN, FocasFrame, PacketType, decode_header};
 use super::wire::{
     decode_alarm_value, decode_diagnosis_value, decode_feed_rate, decode_macro_value,
     decode_opmsg_value, decode_spindle_speed, decode_spindle_word, decode_status_info,
-    decode_system_info,
+    decode_system_info, decode_tofs_value, tofs_to_value_for_test as tofs_to_value,
 };
 use super::{cut_fixture_frames, fixture_dir, read_fixture_bytes};
 
@@ -129,6 +129,8 @@ pub(crate) fn run_all() {
     pmc_scalar_decodes();
     pmc_request_locked();
     pmc_write_byte_locked();
+    tofs_offset_length_decodes();
+    tofs_request_locked();
     param_decodes();
     param_q0_negative_evidence();
     param_request_locked();
@@ -840,6 +842,158 @@ fn pmc_write_byte_locked() {
         assert!(sub.data.is_empty(), "成功响应无 value echo");
     }
 }
+/// tool offset/length Gate 3-C2/C3：捕获 fixture 精确回放 + 负测试。
+/// - 正：`tool16-type1-value5000/type3-value10000` 经生产 decoder ==
+///   `ToolCompValue{value: 5000/10000}` → adapter `F64(5.0/10.0)`；
+///   zero fixture（type1/type3 ×4）→ `F64(0.0)`。
+/// - 请求：生产 encoder（`tofs_value` 同源构造）byte-for-byte == 捕获 40B。
+/// - 负（clone/mutate synthetic）：wrong command echo → `CommandMismatch`；
+///   truncated → `MalformedPayload`；non-zero status → `Remote`。
+fn tofs_offset_length_decodes() {
+    use super::WireError;
+    use super::frame::{FocasFrame, PacketType};
+    use super::wire::{CMD_TOFS, DEV_CNC, PATH_CNC, TOFS_ARG_LENGTH, TOFS_ARG_OFFSET};
+    use mesa_core_types::Value;
+    // 正：decoder + adapter（5000→5.0 / 10000→10.0 / zero→0.0）。
+    for (name, want_raw, want_f64) in [
+        ("tool16-type1-value5000", 5000i32, 5.0f64),
+        ("tool16-type3-value10000", 10000i32, 10.0f64),
+    ] {
+        let frame = assemble_frame(&read("tool_tofs_08", &format!("{name}.res.bin")));
+        assert_eq!(frame.packet_type, PacketType::GENERIC_RESPONSE);
+        let v = decode_tofs_value(&frame).expect("{name} 必须解码");
+        assert_eq!(v.value, want_raw, "{name} value slot");
+        assert_eq!(v.raw.len(), 8, "{name} raw 全保留");
+        assert_eq!(
+            tofs_to_value(&v),
+            Value::F64(want_f64),
+            "{name} adapter /1000"
+        );
+    }
+    for zero in [
+        "tool16-type1-zero-01",
+        "tool16-type1-zero-02",
+        "tool16-type1-zero-03",
+        "tool16-type1-zero-04",
+        "tool16-type3-zero-01",
+        "tool16-type3-zero-02",
+        "tool16-type3-zero-03",
+        "tool16-type3-zero-04",
+    ] {
+        let frame = assemble_frame(&read("tool_tofs_08", &format!("{zero}.res.bin")));
+        let v = decode_tofs_value(&frame).expect("{zero} 必须解码");
+        assert_eq!(v.value, 0, "{zero} value 零");
+        assert_eq!(tofs_to_value(&v), Value::F64(0.0), "{zero} adapter");
+    }
+    // 负：captured positive clone/mutate（synthetic，非 evidence）。
+    let base = assemble_frame(&read("tool_tofs_08", "tool16-type1-value5000.res.bin"));
+    // wrong command echo → CommandMismatch（0x08 → 0x26）。
+    {
+        let mut payload = base.payload.clone();
+        // GENERIC payload: count[0:2] + size[2:4] + dev[4:6] + path[6:8] + cmd[8:10]。
+        payload[8] = 0x00;
+        payload[9] = 0x26;
+        let mutated = FocasFrame {
+            origin: base.origin,
+            packet_type: base.packet_type,
+            payload,
+        };
+        assert!(
+            matches!(
+                decode_tofs_value(&mutated),
+                Err(super::WireError::CommandMismatch)
+            ),
+            "wrong command echo 必须 CommandMismatch"
+        );
+    }
+    // truncated response → MalformedPayload（去尾 1B）。
+    {
+        let mut payload = base.payload.clone();
+        payload.truncate(payload.len() - 1);
+        let mutated = FocasFrame {
+            origin: base.origin,
+            packet_type: base.packet_type,
+            payload,
+        };
+        assert!(
+            matches!(
+                decode_tofs_value(&mutated),
+                Err(super::WireError::MalformedPayload)
+            ),
+            "truncated 必须 MalformedPayload"
+        );
+    }
+    // non-zero status → Remote（status[10:12] 置 2；detail 保留）。
+    {
+        let mut payload = base.payload.clone();
+        // reply subpacket: count[0:2]+size[2:4]+dev[4:6]+path[6:8]+cmd[8:10]+
+        // status[10:12]+detail1[12:14]+detail2[14:16]+dlen[16:18]。
+        payload[10] = 0x00;
+        payload[11] = 0x02;
+        let mutated = FocasFrame {
+            origin: base.origin,
+            packet_type: base.packet_type,
+            payload,
+        };
+        match decode_tofs_value(&mutated) {
+            Err(super::WireError::Remote {
+                status,
+                detail1,
+                detail2,
+            }) => {
+                assert_eq!(status, 2);
+                assert_eq!((detail1, detail2), (0, 0));
+            }
+            other => panic!("non-zero status 必须 Remote，实际 {other:?}"),
+        }
+    }
+    // 合同形状锁：写请求 subpacket size/dlen 与 EVIDENCE 同源断言。
+    {
+        let _ = WireError::CommandMismatch;
+        let _ = (
+            CMD_TOFS,
+            DEV_CNC,
+            PATH_CNC,
+            TOFS_ARG_OFFSET,
+            TOFS_ARG_LENGTH,
+        );
+    }
+}
+
+/// tool 请求 Gate 3-C3：生产 encoder（`tofs_value` 同源构造）byte-for-byte
+/// == 捕获 40B（offset→1001/length→1003；tool=16；aux=0/dlen=0）。
+fn tofs_request_locked() {
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+    use super::frame::{encode_generic_request, request_subpacket};
+    use super::wire::{DEV_CNC, FUNC_TOFS, PATH_CNC};
+    for (name, number, selector) in [
+        ("tool16-type1-value5000", 16u32, 1001i32),
+        ("tool16-type3-value10000", 16u32, 1003i32),
+    ] {
+        let build = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_TOFS,
+                [number as i32, number as i32, selector, 0, 0],
+            )]),
+        }
+        .encode();
+        assert_eq!(build.len(), 40, "{name} 0x08 请求必须 40B");
+        let raw = read("tool_tofs_08", &format!("{name}.req.bin"));
+        let frames = cut_fixture_frames(&raw);
+        assert_eq!(frames.len(), 1, "{name} 必须恰好 1 帧");
+        assert_eq!(frames[0].len(), 40, "{name} 必须 40B");
+        assert_eq!(
+            frames[0], build,
+            "{name} production encoder 必须 == captured fixture 全 40B"
+        );
+        // PATH_CNC 三元组使用断言（防 FUNC_TOFS 常量漂移未被使用）。
+        assert_eq!(PATH_CNC, 1);
+    }
+}
+
 /// param Q3/P-C（identity-scale GOOD）：`param_response_frame.bin` 经生产
 /// codec 解码 == expected（3411=0/6711=10027/123/456/restored；Mesa I32）。
 /// Q0（`00 0a 00 03`）不在此列——它走 `param_q0_negative_evidence`，

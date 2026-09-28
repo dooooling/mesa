@@ -7,12 +7,11 @@
 //! 未经过 Manager / Driver IPC / Core stream_epoch；D2 为“每轮 fresh
 //! connection recreate”，不是“同一 connection Stop→Configure→Start”。
 //!
-//! 范围（冻结）：`backend=wire` + READY 12 类（axis 拆 3 轴共 14 点）+
-//! 真实 target165 + 持续运行。不补 load、不补 tool、不改
-//! default、不删 Native、不做 fallback。
+//! 范围（冻结，Gate 3-C3 更新）：`backend=wire` + READY（含新增 tool offset/length，axis 拆 3 轴）
+//! + 真实 target165 + 持续运行。不补 load、不补 zofs、不改 default、不删 Native、不做 fallback。
 //!
 //! 四门（显式，不混统计）：
-//! D1 正常持续运行：`MESA_DEPLOY_MINUTES`（默认 30）× 1s poll × 14 点；
+//! D1 正常持续运行：`MESA_DEPLOY_MINUTES`（默认 30）× 1s poll × 16 点；
 //!   门：`unexpected BAD=0 / READ_FAILED=0 / crash=0 / session corruption=0 /
 //!   point count drift=0 / sequence 异常=0`（首批 `sequence==1`，后续 `>last`；
 //!   缺口允许，回退/停滞 fail）。无 Native 并行（不是 Shadow）。
@@ -31,8 +30,8 @@
 //! （可选 `MESA_DEPLOY_PORT` 默认 8193；`MESA_DEPLOY_INTERVAL_MS` 默认 1000）。
 //! 退出码：任一硬门 fail → 非零；D3/D4 NOT-PROVEN 不 fail（诚实口径）。
 //!
-//! HOLD（正确行为）：`backend=wire` + servo/spindle load、tool 系 →
-//! configure `UNSUPPORTED_POINT`（本 harness 开头即验 5/5，不进 run）。
+//! HOLD（正确行为）：`backend=wire` + servo/spindle load、tool number/zofs →
+//! configure `UNSUPPORTED_POINT`（本 harness 开头即验 3/3，不进 run）。
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
@@ -42,7 +41,7 @@ use mesa_driver_focas2::FocasDriver;
 use mesa_driver_sdk::{DataSink, Driver};
 use tokio_util::sync::CancellationToken;
 
-/// READY 14 点（12 类，axis×3）：(resource, params, output, key, dt, label)。
+/// READY（含新增 tool offset/length，axis 拆 3 轴）：(resource, params, output, key, dt, label)。
 fn ready_points() -> Vec<(
     &'static str,
     serde_json::Value,
@@ -164,6 +163,23 @@ fn ready_points() -> Vec<(
             DataType::StringArray,
             "alarm.value",
         ),
+        // Gate 3-C3：tool offset/length 进入 READY（现场零窗；只验链路）。
+        (
+            "tool",
+            serde_json::json!({"number": 16}),
+            "offset",
+            "deploy.tool16offset",
+            DataType::F64,
+            "tool.offset[16]",
+        ),
+        (
+            "tool",
+            serde_json::json!({"number": 16}),
+            "length",
+            "deploy.tool16length",
+            DataType::F64,
+            "tool.length[16]",
+        ),
     ]
 }
 
@@ -171,8 +187,6 @@ fn hold_points() -> Vec<(&'static str, serde_json::Value, &'static str)> {
     vec![
         ("servo", serde_json::json!({"axis": 1}), "load"),
         ("spindle", serde_json::json!({"spindle": 1}), "load"),
-        ("tool", serde_json::json!({"number": 1}), "offset"),
-        ("tool", serde_json::json!({"number": 1}), "length"),
         ("tool", serde_json::json!({"number": 1}), "zofs"),
     ]
 }
@@ -215,7 +229,7 @@ async fn main() {
     })
     .to_string();
 
-    // HOLD 正确行为（5/5 configure 即拒，不进 run）。
+    // HOLD 正确行为（3/3 configure 即拒，不进 run）。
     {
         let conn = driver
             .open_connection("deploy-hold", &wire_cfg)
@@ -241,9 +255,9 @@ async fn main() {
                 )),
             }
         }
-        println!("[DEPLOY] HOLD reject {rejected}/5");
-        if rejected != 5 {
-            failures.push("HOLD 必须 5/5 拒绝".into());
+        println!("[DEPLOY] HOLD reject {rejected}/{}", hold_points().len());
+        if rejected != hold_points().len() {
+            failures.push("HOLD 必须 3/3 拒绝".into());
         }
     }
 
@@ -276,7 +290,7 @@ async fn main() {
             .configure(round, vec![task])
             .await
             .expect("READY configure 应 PASS");
-        assert_eq!(descs.len(), 14, "READY 必须 14 点");
+        assert_eq!(descs.len(), ready.len(), "READY 必须点数完整");
         let mut map = HashMap::new();
         for (i, d) in descs.iter().enumerate() {
             map.insert(d.point_key.clone(), 1000 + i as u32);
@@ -299,7 +313,7 @@ async fn main() {
                     got += 1;
                     total.batches += 1;
                     // point count drift 门。
-                    if b.values.len() != 14 {
+                    if b.values.len() != ready.len() {
                         total.point_count_drift += 1;
                         total
                             .bad_log
@@ -397,7 +411,11 @@ async fn main() {
     let d4 = "pending（本机 ARCH 仅记录，不作 ARM 证据）";
 
     println!("--- DEPLOY GATE TABLE ---");
-    println!("READY/HOLD        HOLD 5/5（上文）");
+    println!(
+        "READY/HOLD        HOLD {}/{}（上文）",
+        hold_points().len(),
+        hold_points().len()
+    );
     println!("D1 batches        {}", total.batches);
     println!("D1 points_good    {}", total.points_good);
     println!("D1 points_bad     {} (must be 0)", total.points_bad);
