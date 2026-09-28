@@ -49,8 +49,9 @@ offset = cnc_rdtofs(type=1)
 type=0/2 excluded（两线皆零）
 ```
 
-函数相同 ≠ 语义相同：`command + request selector/type + response slot +
-scale + Mesa semantic` 已分一半（slot/scale 待 3-C2 Wire 差分补齐）。
+函数相同 ≠ 语义相同。Native operation identity 已分：
+selector/type + semantic scale + Mesa semantic CLOSED；
+Wire request selector encoding + 32B response slot/value encoding 待 3-C2。
 
 ## 5. production debt（3-C3 前必须修）
 
