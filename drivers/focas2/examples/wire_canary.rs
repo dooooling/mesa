@@ -158,16 +158,32 @@ fn ready_points() -> Vec<(
             DataType::StringArray,
             "alarm.value",
         ),
+        // Gate 3-C3：tool offset/length 进入 READY（#16 当前全零；只验链路，
+        // 不断言非零值——非零语义由 3-C1/C2 证据覆盖）。
+        (
+            "tool",
+            serde_json::json!({"number": 16}),
+            "offset",
+            "canary.tool16offset",
+            DataType::F64,
+            "tool.offset[16]",
+        ),
+        (
+            "tool",
+            serde_json::json!({"number": 16}),
+            "length",
+            "canary.tool16length",
+            DataType::F64,
+            "tool.length[16]",
+        ),
     ]
 }
 
-/// HOLD 5 类（configure 即拒，不进 run）。
+/// HOLD 3 类（configure 即拒，不进 run；Gate 3-C3 后 offset/length 移出 HOLD）。
 fn hold_points() -> Vec<(&'static str, serde_json::Value, &'static str)> {
     vec![
         ("servo", serde_json::json!({"axis": 1}), "load"),
         ("spindle", serde_json::json!({"spindle": 1}), "load"),
-        ("tool", serde_json::json!({"number": 1}), "offset"),
-        ("tool", serde_json::json!({"number": 1}), "length"),
         ("tool", serde_json::json!({"number": 1}), "zofs"),
     ]
 }
@@ -244,7 +260,7 @@ async fn main() {
     };
     println!("[CANARY] backend=wire open_connection OK");
 
-    // Gate 1：12 READY（文档口径 12 类；axis 拆 3 轴共 14 点）configure PASS。
+    // Gate 3-C3：14 READY（文档口径 14 类；axis 拆 3 轴 + tool offset/length 共 16 点）configure PASS。
     let ready = ready_points();
     let task = serde_json::json!({
         "id": "canary",
@@ -350,11 +366,11 @@ async fn main() {
         batch.sequence
     );
     // Blocker #4 真修：false-green 硬门（READY 正常窗口必须全 GOOD）。
-    // - batch 必须 14 点完整（`values.len == 14`；丢点/多点即 fail）。
-    // - 期望 point_id 全齐（map 14 个全在批内；缺 id 即 fail）。
-    // - GOOD 必须 14，BAD 必须 0（READY 出现 BAD 即 fail，不再“计数待确认”）。
-    if batch.values.len() != 14 {
-        failures.push(format!("首批必须 14 点完整，实际 {}", batch.values.len()));
+    // - batch 必须 16 点完整（`values.len == 16`；丢点/多点即 fail）。
+    // - 期望 point_id 全齐（map 16 个全在批内；缺 id 即 fail）。
+    // - GOOD 必须 16，BAD 必须 0（READY 出现 BAD 即 fail，不再“计数待确认”）。
+    if batch.values.len() != 16 {
+        failures.push(format!("首批必须 16 点完整，实际 {}", batch.values.len()));
     }
     {
         let got_ids: std::collections::BTreeSet<u32> =
@@ -511,15 +527,15 @@ async fn main() {
     let _ = tokio::time::timeout(Duration::from_secs(15), run_handle).await;
 
     println!("--- CANARY GATE TABLE ---");
-    println!("READY configure   14/14 (12 类，axis×3)");
-    println!("HOLD reject       {hold_rejected}/5");
-    println!("GOOD              {n_good}/14");
+    println!("READY configure   16/16 (14 类，axis×3 + tool offset/length)");
+    println!("HOLD reject       {hold_rejected}/3");
+    println!("GOOD              {n_good}/16");
     println!("BAD               {n_bad} (must be 0)");
     println!("failures          {}", failures.len());
     for f in &failures {
         eprintln!("[CANARY-FAIL] {f}");
     }
-    if hold_rejected != 5 || !failures.is_empty() {
+    if hold_rejected != 3 || !failures.is_empty() {
         eprintln!("[CANARY] FAIL");
         std::process::exit(2);
     }

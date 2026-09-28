@@ -1063,7 +1063,7 @@ impl NativeFocasApi {
                         )),
                         Err(e) => Err(Self::map_ret_err(e)),
                     },
-                    crate::address::ToolKind::Length => match lib.cnc_rdtofs(hdl, *number) {
+                    crate::address::ToolKind::Length => match lib.cnc_rdtofs_length(hdl, *number) {
                         Ok(v) => Ok(Value::F64(v)),
                         Err(e) if e == crate::native::FocasRet::Noopt => Ok(Value::String(
                             format!("ERR:EW_NOOPT tool.length {} {}", number, e.message()),

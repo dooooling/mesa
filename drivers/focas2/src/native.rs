@@ -428,6 +428,13 @@ pub struct OdbTofs {
     pub data: c_int,     // 定点刀补值（0.001mm）
 }
 
+/// `cnc_rdtofs` tool selector（Gate 3-C1/C3：`1 ↔ offset(RADIUS GEOM)` /
+/// `3 ↔ length(LENGTH GEOM)`；3-C1 双窗 controlled 证据；`0/2` 两线皆零排除）。
+/// 生产按 selector 分流，禁 `type=0` 试探（首个 rc=0 即返回会 silent wrong-value）。
+pub const TOFS_TYPE_OFFSET: c_short = 1;
+/// 同上（length）。
+pub const TOFS_TYPE_LENGTH: c_short = 3;
+
 /// `cnc_rdzofs` 单点工件零点：`IODBZOFS` `fwlib.cs:1137` 单轴 1 点（多轴时 data[axis-1]）
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -1692,38 +1699,65 @@ impl NativeLib {
     /// - `num` 超 `c_short` 即 `Param`（resolver/Descriptor 已同上限收紧）。
     /// - 缺符号时回退 `cnc_rdtofsr` area 版
     pub fn cnc_rdtofs(&self, hdl: u16, num: u32) -> Result<f64, FocasRet> {
+        // Gate 3-C3 真修：按 selector 分流（offset→type=1/length→type=3）。
+        // 旧 `type=[0,1]` 试探已删除——首个 rc=0 即返回会在非零窗 silent
+        // wrong-value（3-C1：length 10.000/type=0 读 0.0 不报错）。
+        // NOTE：本函数保留 offset 旧语义（tool.offset）；length 走
+        // `cnc_rdtofs_length`（同 ABI 不同 selector，一个 operation 一个入口）。
         let num_s = to_c_short(num)?;
         if let Some(sym) = self.cnc_rdtofs.as_ref() {
-            for t in [0 as c_short, 1 as c_short] {
-                let mut out = OdbTofs {
-                    datano: 0,
-                    type_: 0,
-                    data: 0,
-                };
-                // (hdl, number=num, type=t, length=8, out)。
-                let rc = unsafe {
-                    sym(
-                        hdl as c_ushort,
-                        num_s,
-                        t,
-                        8 as c_short,
-                        &mut out as *mut OdbTofs,
-                    )
-                };
-                let ret = FocasRet::from_raw(rc);
-                if ret.is_ok() {
-                    return Ok(out.data as f64 / 1000.0);
-                } else if ret == FocasRet::Length
-                    || ret == FocasRet::Number
-                    || ret == FocasRet::Data
-                {
-                    continue;
-                } else {
-                    return Err(ret);
-                }
+            let mut out = OdbTofs {
+                datano: 0,
+                type_: 0,
+                data: 0,
+            };
+            // (hdl, number=num, type=1, length=8, out)。
+            let rc = unsafe {
+                sym(
+                    hdl as c_ushort,
+                    num_s,
+                    TOFS_TYPE_OFFSET,
+                    8 as c_short,
+                    &mut out as *mut OdbTofs,
+                )
+            };
+            let ret = FocasRet::from_raw(rc);
+            if ret.is_ok() {
+                return Ok(out.data as f64 / 1000.0);
+            } else {
+                return Err(ret);
             }
         }
         self.cnc_rdtofsr(hdl, num)
+    }
+
+    /// 读刀长（Gate 3-C3）：`cnc_rdtofs(hdl, num, type=3, length=8)` single
+    /// selector（与 `cnc_rdtofs` 同 ABI 不同 selector；禁试探禁回退混读）。
+    /// 缺符号即 `Noopt`（不回退 area 版——area 版 trials 语义未按 selector
+    /// 拆分，回退会重引入 silent wrong-value；待 area 证据后再议）。
+    pub fn cnc_rdtofs_length(&self, hdl: u16, num: u32) -> Result<f64, FocasRet> {
+        let num_s = to_c_short(num)?;
+        let sym = self.cnc_rdtofs.as_ref().ok_or(FocasRet::Noopt)?;
+        let mut out = OdbTofs {
+            datano: 0,
+            type_: 0,
+            data: 0,
+        };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                num_s,
+                TOFS_TYPE_LENGTH,
+                8 as c_short,
+                &mut out as *mut OdbTofs,
+            )
+        };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() {
+            Ok(out.data as f64 / 1000.0)
+        } else {
+            Err(ret)
+        }
     }
 
     /// 读刀补（area 版）：`cnc_rdtofsr(hdl, s/e/type, IODBTO_1_1/1_2)` `fwlib.cs:8632/1090/1099`
