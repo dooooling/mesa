@@ -20,7 +20,7 @@
 > 不是 Pure Rust Wire write。Pure Rust `0x8002` codec 由 W-PMC-5
 > （PR #68）单独证明。二者组合后才进入 W-PMC-6。
 
-## 3. stdout（完整，8/8 gate PASS）
+## 3. stdout（完整，10/10 gate PASS）
 
 ```text
 受控写测试 192.168.15.165:8193，仅 R100.0，BYTE length=9
@@ -38,10 +38,10 @@ pmc_rdpmcrng R101 BYTE start=101 end=101 length=9 rc=0 value=0x00
 restore: write rc=0；R100 raw = 0x00 / bit0 = 0；R101 raw = 0x00 / bit0 = 0（期望 R101.0=0）
 ```
 
-## 4. 通过门（8/8）
+## 4. 通过门（10/10）
 
 ```text
-before 双端快照（不假设 original）                ✅ 0x00 / 0x00
+before 双端快照 R100.0==0 && R101.0==0（fail-closed，不写 PMC） ✅
 RMW 只置位 R100.0（new = original | 0x01）        ✅
 R100 回读 bit0==1 + 其他 bit 与 original 一致    ✅
 ≥1 scan 等待（100ms）后 R101.0==1                ✅（核心 propagation 证据）
@@ -49,7 +49,7 @@ restore 完整 original BYTE（禁硬编码 0x00）       ✅
 restore 后双端 readback（R100==original）         ✅ 0x00 / 0x00
 original bit0==0 → R101.0==0                     ✅
 finally restore（本次一次通过，未触发失败路径）   ✅
-FOCAS rc 全程 0（10 次调用）                     ✅
+FOCAS 调用：connect 成功 + 8 次 PMC rc=0 + close 无错误 observed ✅
 R101 全程只读（无 R101 写调用）                   ✅
 ```
 

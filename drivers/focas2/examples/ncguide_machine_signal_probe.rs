@@ -6,12 +6,12 @@ use std::process::ExitCode;
 #[path = "support/ncguide_write.rs"]
 mod ncguide_write;
 
-const HELP: &str = "NCGuide PMC 测试（默认只读；--test-r100-bit0 显式启用翻转及恢复测试）
+const HELP: &str = "NCGuide PMC 测试（默认只读；--test-r100-bit0 显式启用 R100.0──R101.0 ladder 受控验证及恢复测试）
 用法：ncguide_machine_signal_probe [--host IP] [--port PORT] [--timeout-ms MS]
-默认：192.168.15.165:8193，超时 5000 ms；依次读取 R100、D0。
+默认：192.168.15.165:8193，超时 5000 ms；依次 BYTE 读取 R100、R101 并输出 bit0。
 请从 Mesa 仓库根目录运行，以便找到 drivers/focas2/libs/win 下的 FOCAS DLL。
-R100 按 WORD、D0 按 DWORD 请求；Native 接口可能降级重试较小宽度。
-数值仅为当前读数，不断言 R100=0 或 D0=4。";
+R100/R101 走 BYTE raw + 本地 mask bit0（与 W-PMC-2 ladder harness 同口径）。
+数值仅为当前读数，不断言 R100=0 或 R101=0（ladder 起点由 harness fail-closed 判定）。";
 
 #[derive(Debug, PartialEq)]
 struct Options {
@@ -99,29 +99,29 @@ async fn probe(api: &impl FocasApi, options: &Options) -> Result<(), String> {
     let mut failed = false;
     // 分别读取：一个地址失败仍展示另一个地址的结果；连接成功后不提前返回，
     // 保证读取错误也会走统一 disconnect，FOCAS 调用仍由同一工作线程执行。
-    // R100/R101 走 BYTE raw + 本地 mask bit0（与 W-PMC-2 ladder harness 同口径）。
+    // R100/R101 走 BYTE raw + 本地 mask bit0（与 W-PMC-2 ladder harness 同口径；
+    // 生产 read_batch 的 R→WORD 合同见 PR #69 B3，此处用 bit param 直达 BYTE）。
     for (kind, addr) in [('R', 100), ('R', 101)] {
         let address = FocasAddress::Pmc {
             kind,
             addr,
-            bit: None,
+            bit: Some(0),
         };
-        // NOTE：生产 read_batch 按 kind 定宽度（R→WORD）；此处只要 bit0，
-        // 用 BYTE 语义需直调 Native byte 路径。probe 走生产口径时 R 系返回
-        // WORD I32，bit0 取 `value & 1`（低字节即 R100 本体；R 为小端 WORD）。
         match api.read_batch(&[address]).await {
-            Ok(values) if values.len() == 1 => {
-                let (raw, bit0) = match &values[0] {
-                    mesa_core_types::Value::I32(v) => (*v, (v & 1) as u8),
-                    mesa_core_types::Value::U32(v) => (*v as i32, (v & 1) as u8),
-                    other => {
-                        failed = true;
-                        eprintln!("{kind}{addr} 读取失败：非数值 {other:?}");
-                        continue;
-                    }
-                };
-                println!("{kind}{addr} raw = {raw}；{kind}{addr}.0 = {bit0}");
-            }
+            Ok(values) if values.len() == 1 => match &values[0] {
+                mesa_core_types::Value::Bool(b) => {
+                    println!(
+                        "{kind}{addr} raw = {}；{kind}{addr}.0 = {}",
+                        u8::from(*b),
+                        u8::from(*b)
+                    )
+                }
+                other => {
+                    failed = true;
+                    eprintln!("{kind}{addr} 读取失败：期望 Bool(bit0)，实际 {other:?}");
+                    continue;
+                }
+            },
             Ok(values) => {
                 failed = true;
                 eprintln!(
