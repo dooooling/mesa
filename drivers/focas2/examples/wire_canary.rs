@@ -6,7 +6,7 @@
 //! （含 `coerce_value` / `value_fits_data_type` / `Quality` /
 //! `quality_code` / `source_label` / `point_id`）。
 //!
-//! 范围（冻结）：12 READY configure+run PASS；5 HOLD configure 即
+//! 范围（冻结，Gate 3-C3 更新）：READY configure+run PASS（含新增 tool offset/length）；HOLD configure 即
 //! `UNSUPPORTED_POINT`（不等 run 后 BAD）；alarm `StringArray` 不再错杀；
 //! point-local → 仅该点 BAD；read 期整批 Err 语义由 G3 单测锁定，live 主
 //! run() 的 READ_FAILED 需 CNC 配合，本轮记 NOT-PROVEN。
@@ -33,7 +33,7 @@ use mesa_driver_focas2::FocasDriver;
 use mesa_driver_sdk::{DataSink, Driver};
 use tokio_util::sync::CancellationToken;
 
-/// READY 12 类的
+/// READY 的
 /// (resource_id, parameters, output, point_key, 期望 DataType, 期望 source_label)。
 /// expected label 独立冻结（手写字符串；不得走生产 resolver 自证——resolver 与
 /// `source_label()` 若一起漂移会同错同绿；见 PR #66 review）。
@@ -179,7 +179,7 @@ fn ready_points() -> Vec<(
     ]
 }
 
-/// HOLD 3 类（configure 即拒，不进 run；Gate 3-C3 后 offset/length 移出 HOLD）。
+/// HOLD（configure 即拒，不进 run；Gate 3-C3 后 offset/length 移出 HOLD）。
 fn hold_points() -> Vec<(&'static str, serde_json::Value, &'static str)> {
     vec![
         ("servo", serde_json::json!({"axis": 1}), "load"),
@@ -260,7 +260,7 @@ async fn main() {
     };
     println!("[CANARY] backend=wire open_connection OK");
 
-    // Gate 3-C3：14 READY（文档口径 14 类；axis 拆 3 轴 + tool offset/length 共 16 点）configure PASS。
+    // Gate 3-C3：READY configure PASS（axis 拆 3 轴 + tool offset/length 在内）。
     let ready = ready_points();
     let task = serde_json::json!({
         "id": "canary",
@@ -305,7 +305,7 @@ async fn main() {
         );
     }
 
-    // Gate 2：5 HOLD configure 即 UNSUPPORTED_POINT（不进 run）。
+    // Gate 3-C3：HOLD configure 即 UNSUPPORTED_POINT（不进 run）。
     let mut hold_rejected = 0;
     for (r, p, o) in hold_points() {
         let t: mesa_core_types::AcquisitionTask = serde_json::from_value(serde_json::json!({
@@ -366,11 +366,15 @@ async fn main() {
         batch.sequence
     );
     // Blocker #4 真修：false-green 硬门（READY 正常窗口必须全 GOOD）。
-    // - batch 必须 16 点完整（`values.len == 16`；丢点/多点即 fail）。
-    // - 期望 point_id 全齐（map 16 个全在批内；缺 id 即 fail）。
-    // - GOOD 必须 16，BAD 必须 0（READY 出现 BAD 即 fail，不再“计数待确认”）。
-    if batch.values.len() != 16 {
-        failures.push(format!("首批必须 16 点完整，实际 {}", batch.values.len()));
+    // - batch 必须点数完整（`values.len == ready 点数`；丢点/多点即 fail）。
+    // - 期望 point_id 全齐（map 全在批内；缺 id 即 fail）。
+    // - GOOD 必须全数，BAD 必须 0（READY 出现 BAD 即 fail，不再“计数待确认”）。
+    if batch.values.len() != ready.len() {
+        failures.push(format!(
+            "首批必须 {} 点完整，实际 {}",
+            ready.len(),
+            batch.values.len()
+        ));
     }
     {
         let got_ids: std::collections::BTreeSet<u32> =
@@ -527,15 +531,19 @@ async fn main() {
     let _ = tokio::time::timeout(Duration::from_secs(15), run_handle).await;
 
     println!("--- CANARY GATE TABLE ---");
-    println!("READY configure   16/16 (14 类，axis×3 + tool offset/length)");
-    println!("HOLD reject       {hold_rejected}/3");
-    println!("GOOD              {n_good}/16");
+    println!(
+        "READY configure   {}/{} (axis 拆 3 轴 + tool offset/length 在内)",
+        descs.len(),
+        ready.len()
+    );
+    println!("HOLD reject       {hold_rejected}/{}", hold_points().len());
+    println!("GOOD              {n_good}/{}", ready.len());
     println!("BAD               {n_bad} (must be 0)");
     println!("failures          {}", failures.len());
     for f in &failures {
         eprintln!("[CANARY-FAIL] {f}");
     }
-    if hold_rejected != 3 || !failures.is_empty() {
+    if hold_rejected != hold_points().len() || !failures.is_empty() {
         eprintln!("[CANARY] FAIL");
         std::process::exit(2);
     }

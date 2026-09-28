@@ -1062,7 +1062,7 @@ fn value_fits_data_type(v: &Value, dt: DataType) -> bool {
 }
 
 /// Cutover Gate 1+3-C3：Wire backend READY allowlist（configure-time fail-closed）。
-/// READY 14 类（machine/status+feed+spindle_speed、axis/absolute、
+/// READY（machine/status+feed+spindle_speed、axis/absolute、
 /// spindle/gear+maxrpm、macro/pmc/param/diagnosis/opmsg/alarm、
 /// tool/offset+length）→ `Ok(())`；
 /// HOLD（servo/spindle load、tool number/zofs）→ `Err(reason)`，configure 直接拒绝。
@@ -1182,8 +1182,8 @@ impl DriverConnection for FocasConnection {
                             &sel.parameters,
                             &out.point_key,
                         )?;
-                        // Cutover Gate 1：Wire backend configure-time allowlist。
-                        // READY 12 类外（servo/spindle load、tool 系 HOLD）直接
+                        // Cutover Gate 1+3-C3：Wire backend configure-time allowlist。
+                        // READY 外（servo/spindle load、tool number/zofs HOLD）直接
                         // configure 拒绝，不等启动后单点 BAD（见 wire_ready_gate）。
                         if self.cfg.backend == FocasBackend::Wire
                             && let Err(reason) = wire_ready_gate(&addr)
@@ -1591,8 +1591,8 @@ mod tests {
 
     /// Cutover Gate 1+3-C3 回归：`backend` 解析 + Wire READY allowlist。
     /// - 缺省/非法 backend：缺省 Native；非法 BAD_CONFIG。
-    /// - Wire + 14 READY：configure PASS；Wire + 3 HOLD
-    ///  （servo/spindle load、tool number/zofs）configure 即 UNSUPPORTED_POINT。
+    /// - Wire + READY（含 Gate 3-C3 新增 tool offset/length）：configure PASS；
+    ///   Wire + HOLD（servo/spindle load、tool number/zofs）configure 即 UNSUPPORTED_POINT。
     #[tokio::test]
     async fn wire_backend_gate1_locked() {
         // backend 解析。
@@ -1601,7 +1601,7 @@ mod tests {
         let wire_cfg = FocasConnConfig::from_json(&serde_json::json!({"backend": "wire"})).unwrap();
         assert_eq!(wire_cfg.backend, FocasBackend::Wire);
         assert!(FocasConnConfig::from_json(&serde_json::json!({"backend": "bogus"})).is_err());
-        // allowlist：READY 14 类全过（Gate 3-C3 后 offset/length 移入 READY）。
+        // allowlist：READY 全过（Gate 3-C3 后 offset/length 移入 READY）。
         for addr in [
             FocasAddress::Status,
             FocasAddress::Feed,
@@ -1642,7 +1642,7 @@ mod tests {
         ] {
             assert!(wire_ready_gate(&addr).is_ok(), "{addr:?} 必须 READY",);
         }
-        // HOLD 4 类：configure 即拒（Gate 3-C3 后 offset/length 移出 HOLD）。
+        // HOLD：configure 即拒（Gate 3-C3 后 offset/length 移出 HOLD）。
         for addr in [
             FocasAddress::ServoLoad { axis: 1 },
             FocasAddress::Spindle {
