@@ -26,7 +26,9 @@
 ```text
 cnc_rdzofs(hdl, worknum, axis, len, out)
   worknum = 1 → G54 ✅（回显 raw[0:2]=01 00）
-  axis    = 1 → X ✅ / 2 → Y / 3 → Z（回显 raw[2:4]）
+  axis    = 1 → X ✅（controlled 双非零 + restore 已证明）
+  a3=2/3  → rc=0/value=0 in this window（Y/Z 本窗皆零，
+            具体 2/3 ↔ Y/Z 映射 ⏳ NOT-PROVEN）
   len     = 8 → 单轴容量门 ✅（公式 4*v12+4，见反编译）
 ```
 
@@ -36,8 +38,7 @@ cnc_rdzofs(hdl, worknum, axis, len, out)
 R2-A len=7 → rc=2（EW_LENGTH）✅ / len=8 → rc=0 ✅
 R2-B a3=0 → rc=4（EW_NUMBER；0 非法 axis）✅
 R2-B a3=1 → rc=0 raw[4:8]=39300000 → LE32 12345 ✅
-R2-B a3=2 → rc=0 raw=0 ✅（Y=0）
-R2-B a3=3 → rc=0 raw=0 ✅（Z=0）
+R2-B a3=2/3 → rc=0 raw=0（本窗值零；2/3 ↔ Y/Z ⏳ NOT-PROVEN）
 R2-C a3=-1 len=15/16 → rc=2 ⏳（全轴分支未触发，NOT-PROVEN，不猜）
 ```
 
@@ -57,7 +58,8 @@ D2-B：   G54 X=0.000  → (1,1)=0 / (1,2)=0 / (2,1)=0 ✅
 ```
 
 - number mapping：`worknum=1 → G54` ✅（回显 + G55X 全程零对照）。
-- axis mapping：`axis=1 → X` ✅（Y 同槽零对照）。
+- axis mapping：`axis=1 → X` ✅（controlled 双非零 + restore；
+  `a3=2/3` 本窗 rc0/value0，具体 Y/Z 映射 ⏳ NOT-PROVEN）。
 - scale：`raw / 1000` ✅（12345/23456 双点单调）。
 - restore ✅（三零）。
 
@@ -71,10 +73,13 @@ not used for scale/monotonic evidence（与 3-C2 同例）。
 ## 5. production debt（D4 前必须修）
 
 ```text
-当前生产 cnc_rdzofs() 传 type=[0,1] 给第 4 参；第 4 参实际是 length。
-→ production tool.zofs 当前 loud fail（全 Length；与 tofs silent
-  wrong-value 不同形态，同属 selector debt）。
-→ D4 必须按 worknum/axis/len 分流，禁 type 试探。
+Native evidence 真正证明：cnc_rdzofs(hdl, worknum, axis, len, out)。
+当前生产 cnc_rdzofs() 把 [0,1] 当 type 传给第 4 参；第 4 参实际是 length。
+→ production tool.zofs 当前 loud fail（全 EW_LENGTH；与 tofs silent
+  wrong-value 不同根因，记 ABI / parameter-role debt，不叫 selector debt）。
+NOTE：当前 Mesa `Tool{kind: Zofs, number}` 无 axis 字段；D4 取
+  A（标量 number 固定 axis=1 X）还是 B（扩地址模型暴露 axis），
+  由 D4 决定，本 evidence 文档不提前定义。
 ```
 
 ## 6. 边界（明确 NOT-PROVEN / 不冻结）
