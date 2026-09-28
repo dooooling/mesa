@@ -373,6 +373,7 @@ fn experiment_bit0(_io: &mut impl ByteIo, _original: u8) -> Result<(), String> {
 }
 
 #[cfg(not(all(target_os = "windows", target_pointer_width = "64")))]
+#[allow(dead_code)]
 pub fn run(_: &str, _: u16, _: u64) -> Result<(), String> {
     Err("写测试当前仅支持 Windows 64 位与仓库 FWLIB64.dll".into())
 }
