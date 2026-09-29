@@ -50,10 +50,13 @@ OPEN handle once（场首）→ CLOSE once（场尾）；窗间无 reconnect。
 
 - 输入形如 `"<value> [ref]"`（servo 记录轴标识原文，不解释语义；
   同 family 四窗必须同一 ref，漂移即整场作废）。
+- SERVO ref 不能为空（空 ref 即使四窗一致亦无轴 provenance，FFI 前 fail-closed）；
+  spindle 空输入自动记 `"S1"`（prompt 已固定 S1）。
 - 值须 `is_finite`（NaN/inf 即作废，不落非法 JSONL）。
 - L1/L2 必须非零且互异（FFI 前预检；无效档位不发证据窗）。
 - L0/L0R 不设 tolerance（baseline/recovery 由 Panel+Native+Wire 三方 review 判定）。
-- JSONL 独占整场持有（`create_new`；文件已存在即 fail-closed，禁复用 append）。
+- JSONL `create_new` 在 connect/FFI 前先占（误复用 seq 不得多一次 OPEN/CLOSE 污染抓包）；
+  文件已存在即 fail-closed，禁复用 append。
 - rc 非零即整场 INVALID（本窗落盘后立即终止，不进下一窗）。
 - panic（含 panel/guard/rc 路径）经 RAII handle guard free exactly once。
 - 任何失败/误操作/负载未落定：本 session 作废，下一次必须新 seq，
@@ -63,7 +66,7 @@ OPEN handle once（场首）→ CLOSE once（场尾）；窗间无 reconnect。
 
 - stdout：`>>> BEGIN RUN=… HANDLE=…` / `<<< END RUN=… RC=…`（切 ETL 对账用）。
 - JSONL：`target/focas-load-evidence/load-<seq>.jsonl`，每 RUN 一行
-  （`run_id/family/phase/handle/panel_value/num_in/num_out/rc/
+  （`run_id/family/phase/handle/panel_value/panel_ref/num_in/num_out/rc/
   raw_0_512_hex/pre_guard_ok/post_guard_ok/tail_after_512_clean/unix_ms`）。
 - raw 只保留 `payload[0..512]` hex；不转 `i16/LOADELM/%`（PR52 教训）。
 

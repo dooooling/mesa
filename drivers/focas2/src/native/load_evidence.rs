@@ -268,8 +268,10 @@ impl Drop for HandleGuard<'_> {
 }
 
 /// panel 输入解析（`"<value> [ref]"`；如 servo `"27 X"`→值 27 + ref `X`；
-/// spindle `"27"`→值 27 + ref `""`。非法/非有限即整 session 作废）。
-fn parse_panel_input(line: &str) -> Result<(f64, String), String> {
+/// spindle `"27"`→值 27 + ref 自动记 `"S1"`（prompt 已固定 S1）。
+/// 非法/非有限即整 session 作废；SERVO 空 ref 即 FFI 前 fail-closed
+/// （四窗空串“一致”不能证明轴 provenance）。
+fn parse_panel_input(family: LoadFamily, line: &str) -> Result<(f64, String), String> {
     let mut parts = line.split_whitespace();
     let value_raw = parts
         .next()
@@ -284,7 +286,18 @@ fn parse_panel_input(line: &str) -> Result<(f64, String), String> {
     if pref.len() > 1 {
         return Err(format!("面板引用至多一段：{line:?}"));
     }
-    Ok((value, pref.first().unwrap_or(&"").to_string()))
+    let mut pref = pref.first().unwrap_or(&"").to_string();
+    if pref.is_empty() {
+        match family {
+            // spindle prompt 已固定 S1：空输入自动记 S1。
+            LoadFamily::Spindle => pref = "S1".to_string(),
+            // servo 必须显式轴标识（空 ref 即使四窗一致亦无 provenance）。
+            LoadFamily::Servo => {
+                return Err(format!("SERVO 面板引用不能为空（如 `27 X`）：{line:?}"));
+            }
+        }
+    }
+    Ok((value, pref))
 }
 
 /// 同 family panel_ref 一致性（四窗必须同一 ref；漂移即 session 作废；
@@ -363,6 +376,9 @@ pub fn run_live_harness() {
         (host, port, timeout_ms)
     };
     let timeout_secs = (timeout_ms.div_ceil(1000).max(1).min(i32::MAX as u64)) as i32;
+    // JSONL 独占先占（create_new；已存在即 connect/FFI 前 fail-closed——
+    // 误复用 seq 不得多一次 OPEN/CLOSE 污染抓包）。
+    let mut writer = JsonlWriter::create(&seq).unwrap_or_else(|e| panic!("{e}"));
     let lib = NativeLib::load().unwrap_or_else(|e| panic!("FWLIB 加载失败（{host}:{port}）：{e}"));
     let hdl = lib
         .cnc_allclibhndl3(&host, port, timeout_secs)
@@ -370,8 +386,6 @@ pub fn run_live_harness() {
     // RAII：panic 路径亦 free exactly once（test-only guard；drop 忽略 free 错误）。
     let mut guard = HandleGuard::new(&lib, hdl);
     println!(">>> LOAD SESSION seq={seq} handle={hdl} families={families:?} (single handle)");
-    // JSONL 独占整场持有（create_new；已存在即 fail-closed，禁复用 append）。
-    let mut writer = JsonlWriter::create(&seq).unwrap_or_else(|e| panic!("{e}"));
     // panel L1/L2 互异门需跨窗比较（同 family 内）；panel_ref 四窗同一性同 map。
     let mut levels: std::collections::BTreeMap<String, (f64, f64, Option<String>)> =
         std::collections::BTreeMap::new();
@@ -397,7 +411,7 @@ pub fn run_live_harness() {
             std::io::stdin()
                 .read_line(&mut line)
                 .expect("stdin 读取失败");
-            let (panel, panel_ref) = parse_panel_input(&line)
+            let (panel, panel_ref) = parse_panel_input(*family, &line)
                 .unwrap_or_else(|e| panic!("RUN={id} {e}（本 session 作废，下次用新 seq）"));
             check_panel_gate(phase, panel).unwrap_or_else(|e| panic!("RUN={id} {e}"));
             // panel_ref 四窗同一性（同 family；漂移即作废；不推断 X↔slot）。
@@ -568,13 +582,21 @@ mod tests {
 
     #[test]
     fn panel_input_and_ref_locked() {
-        // `"<value> [ref]"`：servo `"27 X"`→(27, "X")；spindle `"27"`→(27, "")。
-        assert_eq!(parse_panel_input("27").unwrap(), (27.0, String::new()));
-        assert_eq!(parse_panel_input("27 X").unwrap(), (27.0, "X".to_string()));
-        assert!(parse_panel_input("").is_err());
-        assert!(parse_panel_input("NaN").is_err());
-        assert!(parse_panel_input("inf").is_err());
-        assert!(parse_panel_input("27 X Y").is_err());
+        // `"<value> [ref]"`：spindle `"27"`→(27, "S1")；servo `"27 X"`→(27, "X")。
+        assert_eq!(
+            parse_panel_input(LoadFamily::Spindle, "27").unwrap(),
+            (27.0, "S1".to_string())
+        );
+        assert_eq!(
+            parse_panel_input(LoadFamily::Servo, "27 X").unwrap(),
+            (27.0, "X".to_string())
+        );
+        // SERVO 空 ref 即 fail-closed（四窗空串“一致”无 provenance）。
+        assert!(parse_panel_input(LoadFamily::Servo, "27").is_err());
+        assert!(parse_panel_input(LoadFamily::Spindle, "").is_err());
+        assert!(parse_panel_input(LoadFamily::Servo, "NaN X").is_err());
+        assert!(parse_panel_input(LoadFamily::Servo, "inf X").is_err());
+        assert!(parse_panel_input(LoadFamily::Servo, "27 X Y").is_err());
         // ref 四窗同一性：漂移即作废；不推断 X↔slot。
         assert!(check_panel_ref_stable(&None, "X", "SERVO-L0-001").is_ok());
         assert!(check_panel_ref_stable(&Some("X".to_string()), "X", "SERVO-L1-001").is_ok());
