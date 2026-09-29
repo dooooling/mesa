@@ -22,7 +22,8 @@ jobs:
       - name: Rust setup
         uses: ./.github/actions/rust-ci-setup
         with:
-          cache-key: perf
+          cache-domain: linux-x64
+          cache-writer: "false"
           install-nextest: "false"
 
       # B1：perf 依赖外部 Simulator 二进制（conn_1000/soak/e2e 经 Manager

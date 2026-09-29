@@ -24,7 +24,8 @@ jobs:
         uses: ./.github/actions/rust-ci-setup
         with:
           components: "rustfmt,clippy"
-          cache-key: quality
+          cache-domain: linux-x64
+          cache-writer: "false"
           install-nextest: "false"
 
       - name: fmt

@@ -31,7 +31,8 @@ jobs:
       - name: Rust setup
         uses: ./.github/actions/rust-ci-setup
         with:
-          cache-key: canonical
+          cache-domain: linux-x64
+          cache-writer: "true"
           install-nextest: "true"
 
       - name: build workspace bins

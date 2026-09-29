@@ -1,32 +1,33 @@
-# 共享 Rust CI 环境（CI v2）：所有 Rust job 唯一 setup 入口。
+# 共享 Rust CI 环境（CI v2 cache topology v2）：所有 Rust job 唯一 setup 入口。
 #
-# 职责（职责分离，不 tar 整个 target/）：
-# - rust-toolchain.toml 唯一真值：composite 解析 channel 传给
-#   dtolnay/rust-toolchain（action 内不硬编码版本号）；
-# - Cargo registry cache：只缓存 registry/git（cache-targets=false），
-#   key 按 job 隔离；
-# - sccache：rustc 编译结果层（SCCACHE_GHA_ENABLED + RUSTC_WRAPPER +
-#   CARGO_INCREMENTAL=0），GHA cache 按 cache-key 隔离 namespace，
-#   PR 只读、main 读写；
-# - 可选装 nextest 0.9.146（taiki-e/install-action）。
-# 每个 Rust job 末尾必须 sccache --show-stats（量化，不猜）。
+# 拓扑（local sccache + archive save；GHA remote backend 已废弃）：
+# - sccache 只写本地盘（SCCACHE_DIR=$RUNNER_TEMP/mesa-sccache，512M）；
+#   job 结束时由 actions/cache 一次性归档——不再对 cache service 发几百次 PUT。
+# - Cargo registry cache：shared-key 按兼容域（add-job-id-key=false），
+#   只缓存 registry/git（cache-targets/bin=false）。
+# - 兼容域（4 个）：linux-x64 / windows-x64 / windows-arm64 / linux-arm64；
+#   同域 job 共用 archive。每域仅 1 writer（main 才 save），其余 restore-only。
 #
 # 输入：
 #   components: 额外 toolchain 组件（默认空；quality 传 rustfmt,clippy）
-#   cache-key:  job 隔离 key（canonical / quality / perf /
-#               platform-<runs-on> / stress-<runs-on>；同时隔离
-#               rust-cache 与 sccache GHA namespace）
+#   cache-domain: 兼容域（linux-x64/windows-x64/windows-arm64/linux-arm64；
+#                 同时决定 sccache archive 与 registry key）
+#   cache-writer: 是否为该域 writer（main 成功时 save；reader 永不 save）
 #   install-nextest: 是否安装 nextest（test job true；quality false）
 name: rust-ci-setup
-description: "Mesa CI v2 共享 Rust 环境：toolchain + registry cache + sccache + nextest（可选）"
+description: "Mesa CI v2 共享 Rust 环境：toolchain + registry cache + local sccache archive + nextest（可选）"
 inputs:
   components:
     description: "额外 rust-toolchain 组件（逗号分隔）"
     required: false
     default: ""
-  cache-key:
-    description: "rust-cache + sccache 隔离 key"
+  cache-domain:
+    description: "兼容域（linux-x64/windows-x64/windows-arm64/linux-arm64）"
     required: true
+  cache-writer:
+    description: "是否为该域 writer（main save；reader 永不 save）"
+    required: false
+    default: "false"
   install-nextest:
     description: "是否安装 cargo-nextest 0.9.146"
     required: false
@@ -49,17 +50,18 @@ runs:
         toolchain: ${{ steps.toolchain.outputs.channel }}
         components: ${{ inputs.components }}
 
-    # Cargo registry cache（只缓存 registry/git；不缓存 target/）。
+    # Cargo registry cache（shared-key 按兼容域；不缓存 target/bin；
+    # save 仅 main + writer——与 sccache archive 同策略）。
     - name: Rust cache
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
-        key: ${{ inputs.cache-key }}
+        shared-key: cargo-${{ inputs.cache-domain }}
+        add-job-id-key: "false"
         cache-bin: "false"
         cache-targets: "false"
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        save-if: ${{ github.ref == 'refs/heads/main' && inputs.cache-writer == 'true' }}
 
-    # sccache（compiler-result 层；GHA namespace 按 job key 隔离；
-    # PR 只读、main 读写——与 rust-cache save-if 同策略）。
+    # sccache 安装（只装二进制；不再用 GHA remote backend）。
     - name: sccache
       uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       with:
@@ -71,23 +73,35 @@ runs:
       with:
         tool: cargo-nextest@0.9.146
 
-    - name: sccache env (isolated namespace + RO/RW mode)
+    # 本地 sccache 环境（local disk；512M；writer/reader 同环境，
+    # 区别只在 archive save 侧）。
+    - name: sccache env (local disk archive)
       shell: bash
       run: |
-        # NOTE（sccache 0.18 上游行为）：PR READ_ONLY 下 `sccache --show-stats`
-        # 仍显示 Cache write errors——READ_ONLY 包成 ReadOnlyStorage 后，
-        # 本地编译 miss 仍生成 write future，put() 在本地被拒并计数，
-        # 不会继续调用底层 GHA write。write_errors 在 PR 下为统计噪声，
-        # 以 namespace 隔离 + RW mode 日志为准，不以该计数判缓存坏。
-        if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-          echo "SCCACHE_GHA_RW_MODE=READ_WRITE" >> "$GITHUB_ENV"
-        else
-          echo "SCCACHE_GHA_RW_MODE=READ_ONLY" >> "$GITHUB_ENV"
-        fi
-        echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-        echo "SCCACHE_GHA_VERSION=${{ inputs.cache-key }}" >> "$GITHUB_ENV"
+        echo "SCCACHE_DIR=$RUNNER_TEMP/mesa-sccache" >> "$GITHUB_ENV"
+        echo "SCCACHE_CACHE_SIZE=512M" >> "$GITHUB_ENV"
         echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
         echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
-        echo "sccache namespace: ${{ inputs.cache-key }}"
-        echo "sccache rw-mode: $([ "${{ github.ref }}" = "refs/heads/main" ] && echo READ_WRITE || echo READ_ONLY)"
+        echo "sccache domain: ${{ inputs.cache-domain }}"
+        echo "sccache writer: ${{ inputs.cache-writer }}"
+        echo "sccache remote backend: disabled (local archive topology v2)"
         sccache --version
+        sccache --show-config || true
+
+    # sccache archive restore（全 job；key 不含源码 SHA——content key 由
+    # sccache 自管；exact 优先，fallback 同域上一版）。
+    - name: Restore sccache archive
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ runner.temp }}/mesa-sccache
+        key: mesa-sccache-v1-${{ inputs.cache-domain }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
+        restore-keys: |
+          mesa-sccache-v1-${{ inputs.cache-domain }}-
+
+    # sccache archive save（仅 main + writer；reader 永不 save）。
+    - name: Save sccache archive
+      if: github.ref == 'refs/heads/main' && inputs.cache-writer == 'true'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ runner.temp }}/mesa-sccache
+        key: mesa-sccache-v1-${{ inputs.cache-domain }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
