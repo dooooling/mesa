@@ -51,7 +51,9 @@ jobs:
                   capture_output=True, text=True, check=True).stdout.splitlines()
           except subprocess.CalledProcessError as e:
               print(f'diff failed, fallback full CI: {e}', file=sys.stderr)
-              print('heavy=true'); open(os.environ['GITHUB_OUTPUT'], 'a').write('heavy=true\n'); return
+              print('heavy=true')
+              open(os.environ['GITHUB_OUTPUT'], 'a').write('heavy=true\n')
+              sys.exit(0)
           # fail-safe 白名单：只有这些才 fast（其余一律 heavy）。
           def fast(p):
               pl = p.lower()
