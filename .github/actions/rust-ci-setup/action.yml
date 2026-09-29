@@ -74,6 +74,11 @@ runs:
     - name: sccache env (isolated namespace + RO/RW mode)
       shell: bash
       run: |
+        # NOTE（sccache 0.18 上游行为）：PR READ_ONLY 下 `sccache --show-stats`
+        # 仍显示 Cache write errors——READ_ONLY 包成 ReadOnlyStorage 后，
+        # 本地编译 miss 仍生成 write future，put() 在本地被拒并计数，
+        # 不会继续调用底层 GHA write。write_errors 在 PR 下为统计噪声，
+        # 以 namespace 隔离 + RW mode 日志为准，不以该计数判缓存坏。
         if [ "${{ github.ref }}" = "refs/heads/main" ]; then
           echo "SCCACHE_GHA_RW_MODE=READ_WRITE" >> "$GITHUB_ENV"
         else
