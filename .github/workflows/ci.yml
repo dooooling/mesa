@@ -106,8 +106,12 @@ jobs:
       runs-on: windows-latest
 
   # 唯一 Merge Gate：依赖全部 success 才 success。
-  # CI-1：fast path 下 heavy jobs 为 skipped；skipped 视为满足（fail-safe 白名单
-  # 之外一律 heavy；skipped≠failure，显式允许）。
+  # CI-1 fail-safe（blocker 真修）：
+  # - changes 必须 success（checkout/脚本异常/GITHUB_OUTPUT 失败即 gate FAIL，
+  #   不得因 heavy jobs 全 skipped 而 SUCCESS——skipped 的 heavy 输出不可信）；
+  # - heavy=true → 4 heavy jobs 必须 success；
+  # - heavy=false → 4 heavy jobs 必须 skipped（跑了即路由错误）；
+  # - heavy 缺失/未知 → FAIL CLOSED。
   ci-gate:
     needs: [changes, rust-primary, rust-native, web, runtime-stress]
     if: always()
@@ -118,4 +122,28 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          python3 -c "import json,os,sys; n=json.loads(os.environ['NEEDS_JSON']); bad={k:v.get('result') for k,v in n.items() if k!='changes' and v.get('result') not in ('success','skipped')}; print(json.dumps(n,indent=1)); print('GATE FAILED: %s' % bad if bad else 'GATE OK'); sys.exit(1 if bad else 0)"
+          python3 - <<'EOF'
+          import json, os, sys
+          n = json.loads(os.environ['NEEDS_JSON'])
+          print(json.dumps(n, indent=1))
+          fail = []
+          ch = n.get('changes', {})
+          if ch.get('result') != 'success':
+              fail.append(f"changes 必须 success（实际 {ch.get('result')}）")
+              print('GATE FAILED: %s' % fail)
+              sys.exit(1)
+          heavy = (ch.get('outputs') or {}).get('heavy')
+          heavies = ['rust-primary', 'rust-native', 'web', 'runtime-stress']
+          if heavy == 'true':
+              for k in heavies:
+                  if n.get(k, {}).get('result') != 'success':
+                      fail.append(f'{k} 必须 success（实际 {n.get(k, {}).get("result")}）')
+          elif heavy == 'false':
+              for k in heavies:
+                  if n.get(k, {}).get('result') != 'skipped':
+                      fail.append(f'{k} 应 skipped（实际 {n.get(k, {}).get("result")}）')
+          else:
+              fail.append(f'heavy 输出未知（{heavy!r}）→ FAIL CLOSED')
+          print('GATE FAILED: %s' % fail if fail else 'GATE OK')
+          sys.exit(1 if fail else 0)
+          EOF
