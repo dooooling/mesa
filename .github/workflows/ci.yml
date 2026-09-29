@@ -1,12 +1,18 @@
-# CI 统一入口/调度：本文件是唯一监听 PR/push 的 workflow，
-# 实际工作下沉到 _rust-primary/_rust-native/_web（均为 workflow_call，
-# 不各自监听 pull_request）。Branch Protection 只绑定最后的 `ci-gate`，
-# 内部增删 job 不需要再改保护规则。
+# CI 统一入口/调度（CI v2）：本文件是唯一监听 PR/push 的 workflow，
+# 实际工作下沉到 _rust-quality/_rust-canonical/_rust-platform/_rust-stress/
+# _rust-perf/_web（均为 workflow_call，不各自监听 pull_request）。
+# Branch Protection 只绑定最后的 `ci-gate`，内部增删 job 不需要再改保护规则。
 #
-# 成本模型（相对旧单 matrix 四平台全量）：
-#   fmt ×1 / clippy ×1 / web ×1 / fast-perf ×1 / correctness ×4
-#   + stress ×1（稳定化阶段：win-x64 关键场景重复采样，见 _runtime-stress.yml）
-# 四平台正确性（build/test/IPC/子进程/孤儿）一点没少。
+# 模型（CI v2）：
+#   planner（tools/ci/plan.py，唯一调度真值）
+#   ├─ docs-only → gate
+#   ├─ web
+#   ├─ rust-quality（fmt/clippy/planner 自测，与 canonical 并行）
+#   ├─ rust-canonical（Linux x64 语义正确性主平台，nextest + doctest）
+#   ├─ rust-platform ×3（全 workspace 编译 + smoke；main 上 full）
+#   ├─ rust-stress（风险触发；main Rust change 必跑）
+#   └─ rust-perf（风险触发；与 canonical 并行）
+# PR 快速反馈 + main 全集成安全网（不再机械完全重复）。
 name: CI
 on:
   push:
@@ -24,14 +30,21 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # CI-1 fast-path 路由：纯非代码改动（docs/.gitignore/md-only）跳过 heavy jobs。
-  # fail-safe：只有白名单内文件才 fast；任何未知路径/代码/workflow/lock
-  # 即 full CI。workflow 永远启动、ci-gate 永远出现（Branch Protection 只绑 gate）。
-  changes:
+  # CI v2 planner：变更路径 → 执行计划（tools/ci/plan.py）。
+  # fail-safe：未知路径/空 diff/diff 失败 → FULL；main Rust change → 全集成。
+  # workflow 永远启动、ci-gate 永远出现（Branch Protection 只绑 gate）。
+  plan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      heavy: ${{ steps.route.outputs.heavy }}
+      plan: ${{ steps.route.outputs.plan }}
+      quality: ${{ steps.route.outputs.quality }}
+      canonical: ${{ steps.route.outputs.canonical }}
+      canonical_filter: ${{ steps.route.outputs.canonical_filter }}
+      platform_mode: ${{ steps.route.outputs.platform_mode }}
+      stress: ${{ steps.route.outputs.stress }}
+      perf: ${{ steps.route.outputs.perf }}
+      web: ${{ steps.route.outputs.web }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -41,44 +54,36 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          IS_MAIN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
-          python3 - <<'EOF'
-          import os, subprocess, sys
-          base, head = os.environ['BASE'], os.environ['HEAD']
-          try:
-              out = subprocess.run(
-                  ['git', 'diff', '--name-only', f'{base}...{head}'],
-                  capture_output=True, text=True, check=True).stdout.splitlines()
-          except subprocess.CalledProcessError as e:
-              print(f'diff failed, fallback full CI: {e}', file=sys.stderr)
-              print('heavy=true')
-              open(os.environ['GITHUB_OUTPUT'], 'a').write('heavy=true\n')
-              sys.exit(0)
-          # fail-safe 白名单：只有这些才 fast（其余一律 heavy）。
-          def fast(p):
-              pl = p.lower()
-              if p == '.gitignore':
-                  return True
-              if p == 'docs/' or p.startswith('docs/'):
-                  return True
-              if pl.endswith('.md'):
-                  return True
-              return False
-          heavy = 'false' if (out and all(fast(p) for p in out)) else 'true'
-          print(f'files={len(out)} heavy={heavy}')
-          for p in out[:20]:
-              print(f'  {p}')
-          open(os.environ['GITHUB_OUTPUT'], 'a').write(f'heavy={heavy}\n')
-          EOF
+          CI_BASE="$BASE" CI_HEAD="$HEAD" CI_IS_MAIN="$([ "$IS_MAIN" = "true" ] && echo 1 || echo 0)" python3 tools/ci/plan.py > plan.json
+          cat plan.json
+          {
+            echo "plan=$(cat plan.json | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)))')"
+            echo "quality=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["quality"]).lower())')"
+            echo "canonical=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["canonical"]).lower())')"
+            echo "canonical_filter=$(python3 -c 'import json; print(json.load(open("plan.json"))["canonical_filter"])')"
+            echo "platform_mode=$(python3 -c 'import json; print(json.load(open("plan.json"))["platform_mode"])')"
+            echo "stress=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["stress"]).lower())')"
+            echo "perf=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["perf"]).lower())')"
+            echo "web=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["web"]).lower())')"
+          } >> "$GITHUB_OUTPUT"
 
-  rust-primary:
-    needs: [changes]
-    if: needs.changes.outputs.heavy == 'true'
-    uses: ./.github/workflows/_rust-primary.yml
+  rust-quality:
+    needs: [plan]
+    if: needs.plan.outputs.quality == 'true'
+    uses: ./.github/workflows/_rust-quality.yml
 
-  rust-native:
-    needs: [changes]
-    if: needs.changes.outputs.heavy == 'true'
+  rust-canonical:
+    needs: [plan]
+    if: needs.plan.outputs.canonical == 'true'
+    uses: ./.github/workflows/_rust-canonical.yml
+    with:
+      filter: ${{ needs.plan.outputs.canonical_filter }}
+
+  rust-platform:
+    needs: [plan]
+    if: needs.plan.outputs.platform_mode != 'skip'
     strategy:
       # 工业跨平台：一次 run 给出完整平台分布，不为省几分钟开 fail-fast
       fail-fast: false
@@ -87,38 +92,38 @@ jobs:
           - runs-on: ubuntu-24.04-arm
           - runs-on: windows-latest
           - runs-on: windows-11-arm
-    uses: ./.github/workflows/_rust-native.yml
+    uses: ./.github/workflows/_rust-platform.yml
     with:
       runs-on: ${{ matrix.runs-on }}
+      mode: ${{ needs.plan.outputs.platform_mode }}
 
   web:
-    needs: [changes]
-    if: needs.changes.outputs.heavy == 'true'
+    needs: [plan]
+    if: needs.plan.outputs.web == 'true'
     uses: ./.github/workflows/_web.yml
 
-  # Runtime Stress（稳定化阶段 merge-required）：见 _runtime-stress.yml。
-  # 只跑 Windows x64 关键场景重复采样，与 native job 并行。
-  runtime-stress:
-    needs: [changes]
-    if: needs.changes.outputs.heavy == 'true'
-    uses: ./.github/workflows/_runtime-stress.yml
+  # Stress：PR 按 planner 风险触发；main Rust change 必跑（plan 已升级）。
+  rust-stress:
+    needs: [plan]
+    if: needs.plan.outputs.stress == 'true'
+    uses: ./.github/workflows/_rust-stress.yml
     with:
       runs-on: windows-latest
 
-  # 唯一 Merge Gate：依赖全部 success 才 success。
-  # CI-1 fail-safe（blocker 真修）：
-  # - changes 必须 success（checkout/脚本异常/GITHUB_OUTPUT 失败即 gate FAIL，
-  #   不得因 heavy jobs 全 skipped 而 SUCCESS——skipped 的 heavy 输出不可信）；
-  # - heavy=true → 4 heavy jobs 必须 success；
-  # - heavy=false → 4 heavy jobs 必须 skipped（跑了即路由错误）；
-  # - heavy 缺失/未知 → FAIL CLOSED。
+  # Perf：PR 按 planner 风险触发；与 canonical 并行。
+  rust-perf:
+    needs: [plan]
+    if: needs.plan.outputs.perf == 'true'
+    uses: ./.github/workflows/_rust-perf.yml
+
+  # 唯一 Merge Gate：plan 驱动 fail-closed（plan_version/bool/mode 全校验）。
   ci-gate:
-    needs: [changes, rust-primary, rust-native, web, runtime-stress]
+    needs: [plan, rust-quality, rust-canonical, rust-platform, web, rust-stress, rust-perf]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: all required jobs must succeed
+      - name: plan-driven gate (fail-closed)
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
@@ -127,23 +132,46 @@ jobs:
           n = json.loads(os.environ['NEEDS_JSON'])
           print(json.dumps(n, indent=1))
           fail = []
-          ch = n.get('changes', {})
-          if ch.get('result') != 'success':
-              fail.append(f"changes 必须 success（实际 {ch.get('result')}）")
+          pl = n.get('plan', {})
+          if pl.get('result') != 'success':
+              fail.append(f"plan 必须 success（实际 {pl.get('result')}）")
               print('GATE FAILED: %s' % fail)
               sys.exit(1)
-          heavy = (ch.get('outputs') or {}).get('heavy')
-          heavies = ['rust-primary', 'rust-native', 'web', 'runtime-stress']
-          if heavy == 'true':
-              for k in heavies:
-                  if n.get(k, {}).get('result') != 'success':
-                      fail.append(f'{k} 必须 success（实际 {n.get(k, {}).get("result")}）')
-          elif heavy == 'false':
-              for k in heavies:
-                  if n.get(k, {}).get('result') != 'skipped':
-                      fail.append(f'{k} 应 skipped（实际 {n.get(k, {}).get("result")}）')
+          out = pl.get('outputs') or {}
+          try:
+              plan = json.loads(out.get('plan', '{}'))
+          except Exception as e:
+              fail.append(f'plan 输出不可解析（{e}）→ FAIL CLOSED')
+              print('GATE FAILED: %s' % fail)
+              sys.exit(1)
+          if plan.get('plan_version') != 2:
+              fail.append(f"plan_version 必须 2（实际 {plan.get('plan_version')}）")
+          def need(job, want_run, want_skip=False):
+              r = n.get(job, {}).get('result')
+              if want_run and r != 'success':
+                  fail.append(f'{job} 必须 success（实际 {r}）')
+              if want_skip and r != 'skipped':
+                  fail.append(f'{job} 应 skipped（实际 {r}）')
+          def asbool(v):
+              if isinstance(v, bool):
+                  return v
+              return str(v).lower() == 'true'
+          # quality / canonical / web / stress / perf：bool 驱动。
+          for key, job in [('quality', 'rust-quality'), ('canonical', 'rust-canonical'),
+                           ('web', 'web'), ('stress', 'rust-stress'), ('perf', 'rust-perf')]:
+              v = plan.get(key)
+              if not isinstance(v, bool):
+                  fail.append(f'{key} 必须 bool（实际 {v!r}）→ FAIL CLOSED')
+                  continue
+              need(job, v, not v)
+          # platform：mode 驱动。
+          mode = plan.get('platform_mode')
+          if mode == 'skip':
+              need('rust-platform', False, True)
+          elif mode in ('smoke', 'full'):
+              need('rust-platform', True)
           else:
-              fail.append(f'heavy 输出未知（{heavy!r}）→ FAIL CLOSED')
+              fail.append(f'platform_mode 未知（{mode!r}）→ FAIL CLOSED')
           print('GATE FAILED: %s' % fail if fail else 'GATE OK')
           sys.exit(1 if fail else 0)
           EOF

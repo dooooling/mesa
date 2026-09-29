@@ -1,0 +1,46 @@
+# Rust Perf（Linux x64，与 canonical 并行）：7 项秒级性能门，不删减。
+# 暂继续 cargo test（不 nextest 并行跑 benchmark/SLO，避免 CPU/IO 争用失真）。
+# soak_short（60s）不在 PR 路径（nightly/manual）。
+name: rust-perf
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Rust setup
+        uses: ./.github/actions/rust-ci-setup
+        with:
+          cache-key: perf
+          install-nextest: "false"
+
+      # B1：perf 依赖外部 Simulator 二进制（conn_1000/soak/e2e 经 Manager
+      # 启动它）；独立 job 不再有 workspace 全构建，精准前置单包构建。
+      - name: build simulator binary
+        run: cargo build --locked -p mesa-driver-simulator --bin mesa-driver-simulator
+
+      - name: fast performance (PR set, soak_short excluded)
+        run: >
+          cargo test --locked -p mesa-performance-tests
+          --test backpressure
+          --test configure_large
+          --test conn_1000
+          --test control_latency
+          --test data_plane_soak
+          --test e2e_50k_real
+          --test ipc_latency
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

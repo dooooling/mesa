@@ -1,0 +1,61 @@
+# Rust Canonical（Linux x64，语义正确性主平台）：bins 构建 + nextest
+# deterministic 全量（planner filter）+ doctest。
+#
+# bins 构建暂不能删：contract tests 依赖 target/debug/mesad、
+# mesa-driver-simulator、orphan_helper/hang_helper（缺失会静默降覆盖）。
+# nextest 不执行 doctest，故另跑 cargo test --doc。
+name: rust-canonical
+on:
+  workflow_call:
+    inputs:
+      filter:
+        description: "nextest filterset（all() 或 rdeps 联合）"
+        required: false
+        default: "all()"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  canonical:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Rust setup
+        uses: ./.github/actions/rust-ci-setup
+        with:
+          cache-key: canonical
+          install-nextest: "true"
+
+      - name: build workspace bins
+        run: cargo build --locked --workspace --bins
+
+      - name: nextest (profile ci)
+        run: >
+          cargo nextest run
+          --locked
+          --workspace
+          --all-features
+          --exclude mesa-performance-tests
+          --profile ci
+          -E "${{ inputs.filter }}"
+
+      - name: doctest
+        run: >
+          cargo test
+          --locked
+          --doc
+          --workspace
+          --all-features
+          --exclude mesa-performance-tests
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
