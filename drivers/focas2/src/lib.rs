@@ -1612,6 +1612,32 @@ mod tests {
         // 缺省 Wire 回归（Native 退役第一阶段：默认生产后端为 Wire）。
         let default_cfg = FocasConnConfig::default();
         assert_eq!(default_cfg.backend, FocasBackend::Wire);
+        // Descriptor/UI 默认同步（parse / Default cfg / Descriptor 三处同源冻结）。
+        {
+            use mesa_driver_sdk::Driver;
+            let desc = FocasDriver.descriptor();
+            let backend_field = desc
+                .connection
+                .fields
+                .iter()
+                .find(|f| f.key == "backend")
+                .expect("Descriptor 必须有 backend 字段");
+            assert_eq!(
+                backend_field.default,
+                Some(serde_json::json!("wire")),
+                "Descriptor backend 默认必须 wire"
+            );
+            let options = backend_field
+                .validation
+                .enum_options
+                .as_ref()
+                .expect("backend 必须有 enum options");
+            assert!(options.contains(&"wire".to_string()), "enum 必须含 wire");
+            assert!(
+                options.contains(&"native".to_string()),
+                "enum 必须含 native（oracle 保留）"
+            );
+        }
         // allowlist：READY 全过（Gate 3-C3 offset/length、Gate 3-D4 zofs 移入 READY）。
         for addr in [
             FocasAddress::Status,
