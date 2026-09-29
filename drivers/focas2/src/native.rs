@@ -435,13 +435,20 @@ pub const TOFS_TYPE_OFFSET: c_short = 1;
 /// 同上（length）。
 pub const TOFS_TYPE_LENGTH: c_short = 3;
 
-/// `cnc_rdzofs` 单点工件零点：`IODBZOFS` `fwlib.cs:1137` 单轴 1 点（多轴时 data[axis-1]）
+/// `cnc_rdzofs` 工件零点缓冲（`fwlib.cs:1137`；ABI layout 36B）。
+/// 前 4B 字段具体语义未冻结（evidence-safe；不写“type_=轴数”——3-D1 只冻结
+/// `value @ raw[4:8] LE`，字段名待定）。single-point value 使用 `data[0]`
+/// （contract A 固定 axis=1 X；显式 axis DEFERRED）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IodbZofs {
-    pub datano: c_short,  // 工件系号（1=G54 等）
-    pub type_: c_short,   // 轴数
-    pub data: [c_int; 8], // 8 轴零点值（0i-F 3轴，其余 0）
+    // NOTE（evidence-safe）：前 4B 两字段语义未冻结——不写“工件系号/轴数”
+    // （3-D1 只冻结 `value @ raw[4:8] LE`；回显值对照用，不命名）。
+    pub datano: c_short,
+    pub type_: c_short,
+    // single-point value 取 `data[0]`（contract A 固定 axis=1 X；
+    // 其余槽位本入口不解释，显式 axis DEFERRED）。
+    pub data: [c_int; 8],
 }
 
 /// `cnc_rdparam` IODBPSD_1 容量探测判别点（N01 复测第三轮）。
@@ -1813,25 +1820,44 @@ impl NativeLib {
         Err(FocasRet::Number)
     }
 
-    /// 读工件零点：`cnc_rdzofs` 3 shorts `s_no,e_no,type`，`fwlib.cs:8661`
-    /// - 0i-F `zofs.1` 对应 `G54` 起点，`type 0` 单轴，失败则试 `type 1`
+    /// zofs single-point selector（Gate 3-D4 contract A：scalar-X 固定）。
+    /// `axis=1`（X；显式 axis DEFERRED）/`len=8`（单轴容量门 `4*1+4`）。
+    /// 生产 single selector，禁旧 `type=[0,1]` 试探（第 4 参是 length，
+    /// 试探即全 EW_LENGTH loud fail，见 3-D1-R1）。
+    pub const ZOFS_AXIS_X: c_short = 1;
+    /// 同上（single-point length）。
+    pub const ZOFS_SINGLE_LEN: c_short = 8;
+
+    /// 读工件零点 X（Gate 3-D4 contract A：scalar-X）：
+    /// `cnc_rdzofs(hdl, worknum=num, axis=1, len=8, out)` single selector
+    /// （反编译 fwlibe64 `0x34cf8` + 3-D1-R2/3-D2 实证；旧 `s_no/e_no/type`
+    /// 模型与 `type=[0,1]` 试探已删除）。
+    /// 输出零初始化（`len=8` 只保证前 8B 有效，struct 36B 不得
+    /// `MaybeUninit + assume_init()`——D4 review blocker）。
+    /// 取 `data[0]`（X；Y/Z 由 axis 决定，本入口固定 axis=1）。
     pub fn cnc_rdzofs(&self, hdl: u16, num: u32) -> Result<f64, FocasRet> {
         let num_s = to_c_short(num)?;
         let sym = self.cnc_rdzofs.as_ref().ok_or(FocasRet::Noopt)?;
-        for t in [0 as c_short, 1 as c_short] {
-            let mut out = std::mem::MaybeUninit::<IodbZofs>::uninit();
-            let rc = unsafe { sym(hdl as c_ushort, num_s, num_s, t, out.as_mut_ptr()) };
-            let ret = FocasRet::from_raw(rc);
-            if ret.is_ok() {
-                let v = unsafe { out.assume_init() };
-                return Ok(v.data[0] as f64 / 1000.0);
-            } else if ret == FocasRet::Length || ret == FocasRet::Number {
-                continue;
-            } else {
-                return Err(ret);
-            }
+        let mut out = IodbZofs {
+            datano: 0,
+            type_: 0,
+            data: [0; 8],
+        };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                num_s,
+                Self::ZOFS_AXIS_X,
+                Self::ZOFS_SINGLE_LEN,
+                &mut out,
+            )
+        };
+        let ret = FocasRet::from_raw(rc);
+        if ret.is_ok() {
+            Ok(out.data[0] as f64 / 1000.0)
+        } else {
+            Err(ret)
         }
-        Err(FocasRet::Length)
     }
 
     /// 读参数单点：`cnc_rdparam` 3 shorts `s_no,axis,num`，`fwlib.cs:8687` `IODBPSD_1/2`

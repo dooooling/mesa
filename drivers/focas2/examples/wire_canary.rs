@@ -176,15 +176,24 @@ fn ready_points() -> Vec<(
             DataType::F64,
             "tool.length[16]",
         ),
+        // Gate 3-D4 contract A：tool zofs 进入 READY（#1 当前零；scalar-X，
+        // 只验链路——非零语义由 3-D2/D3 证据覆盖）。
+        (
+            "tool",
+            serde_json::json!({"number": 1}),
+            "zofs",
+            "canary.tool1zofs",
+            DataType::F64,
+            "tool.zofs[1]",
+        ),
     ]
 }
 
-/// HOLD（configure 即拒，不进 run；Gate 3-C3 后 offset/length 移出 HOLD）。
+/// HOLD（configure 即拒，不进 run；Gate 3-D4 后 zofs 移出 HOLD）。
 fn hold_points() -> Vec<(&'static str, serde_json::Value, &'static str)> {
     vec![
         ("servo", serde_json::json!({"axis": 1}), "load"),
         ("spindle", serde_json::json!({"spindle": 1}), "load"),
-        ("tool", serde_json::json!({"number": 1}), "zofs"),
     ]
 }
 

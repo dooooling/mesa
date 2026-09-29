@@ -35,7 +35,8 @@ use super::frame::{FRAME_HEADER_LEN, FocasFrame, PacketType, decode_header};
 use super::wire::{
     decode_alarm_value, decode_diagnosis_value, decode_feed_rate, decode_macro_value,
     decode_opmsg_value, decode_spindle_speed, decode_spindle_word, decode_status_info,
-    decode_system_info, decode_tofs_value, tofs_to_value_for_test as tofs_to_value,
+    decode_system_info, decode_tofs_value, decode_zofs_value,
+    tofs_to_value_for_test as tofs_to_value, zofs_to_value_for_test as zofs_to_value,
 };
 use super::{cut_fixture_frames, fixture_dir, read_fixture_bytes};
 
@@ -131,6 +132,8 @@ pub(crate) fn run_all() {
     pmc_write_byte_locked();
     tofs_offset_length_decodes();
     tofs_request_locked();
+    zofs_g54x_decodes();
+    zofs_request_locked();
     param_decodes();
     param_q0_negative_evidence();
     param_request_locked();
@@ -992,6 +995,156 @@ fn tofs_request_locked() {
         // PATH_CNC 三元组使用断言（防 FUNC_TOFS 常量漂移未被使用）。
         assert_eq!(PATH_CNC, 1);
     }
+}
+
+/// zofs Gate 3-D3/D4：捕获 fixture 精确回放 + 负测试。
+/// - 正：`g54x-12345/23456/zero` 经生产 decoder == `ZofsValue{value}` →
+///   adapter `F64(12.345/23.456/0.0)`；selector 对照（axis2/axis3/g55x zero）
+///   只证 decoder 可处理，不新增 Y/Z 产品语义。
+/// - `len7` fixture 回放断言（Wire 成功；production 不加 length 参数）。
+/// - 真实负：`axis0-status4.res.bin` → `Remote{status: 4}`。
+/// - synthetic：wrong command echo → `CommandMismatch`；truncated/wrong dlen
+///   → `MalformedPayload`。
+fn zofs_g54x_decodes() {
+    use super::WireError;
+    use super::frame::{FocasFrame, PacketType};
+    use super::wire::{ZOFS_AXIS_X, ZOFS_DATA_LEN};
+    use mesa_core_types::Value;
+    assert_eq!((ZOFS_AXIS_X, ZOFS_DATA_LEN), (1, 8));
+    // 正：decoder + adapter（12345→12.345 / 23456→23.456 / zero→0.0）。
+    for (name, want_raw, want_f64) in [
+        ("g54x-12345", 12345i32, 12.345f64),
+        ("g54x-23456", 23456i32, 23.456f64),
+        ("g54x-zero", 0i32, 0.0f64),
+    ] {
+        let frame = assemble_frame(&read("tool_zofs_0b", &format!("{name}.res.bin")));
+        assert_eq!(frame.packet_type, PacketType::GENERIC_RESPONSE);
+        let v = decode_zofs_value(&frame).expect("{name} 必须解码");
+        assert_eq!(v.value, want_raw, "{name} value slot");
+        assert_eq!(v.raw.len(), 8, "{name} raw 全保留");
+        assert_eq!(
+            zofs_to_value(&v),
+            Value::F64(want_f64),
+            "{name} adapter /1000"
+        );
+    }
+    // selector 对照：decoder 可处理，不新增产品语义。
+    for name in [
+        "g54-axis2-zero",
+        "g54-axis3-zero",
+        "g55x-zero",
+        "g54x-len7-native-ewlength-wire-ok",
+    ] {
+        let frame = assemble_frame(&read("tool_zofs_0b", &format!("{name}.res.bin")));
+        let v = decode_zofs_value(&frame).expect("{name} 必须解码");
+        let want = if name.starts_with("g54x-len7") {
+            12345i32
+        } else {
+            0i32
+        };
+        assert_eq!(v.value, want, "{name} value");
+    }
+    // 真实负：axis0 → Remote{status: 4}（ captured，非 synthetic）。
+    {
+        let frame = assemble_frame(&read("tool_zofs_0b", "axis0-status4.res.bin"));
+        match decode_zofs_value(&frame) {
+            Err(WireError::Remote {
+                status,
+                detail1,
+                detail2,
+            }) => {
+                assert_eq!(status, 4);
+                assert_eq!((detail1, detail2), (0, 0));
+            }
+            other => panic!("axis0 必须 Remote{{status: 4}}，实际 {other:?}"),
+        }
+    }
+    // synthetic 负：wrong command / truncated / wrong dlen。
+    let base = assemble_frame(&read("tool_zofs_0b", "g54x-12345.res.bin"));
+    {
+        let mut payload = base.payload.clone();
+        payload[8] = 0x00;
+        payload[9] = 0x26;
+        let mutated = FocasFrame {
+            origin: base.origin,
+            packet_type: base.packet_type,
+            payload,
+        };
+        assert!(
+            matches!(decode_zofs_value(&mutated), Err(WireError::CommandMismatch)),
+            "wrong command echo 必须 CommandMismatch"
+        );
+    }
+    {
+        let mut payload = base.payload.clone();
+        payload.truncate(payload.len() - 1);
+        let mutated = FocasFrame {
+            origin: base.origin,
+            packet_type: base.packet_type,
+            payload,
+        };
+        assert!(
+            matches!(
+                decode_zofs_value(&mutated),
+                Err(WireError::MalformedPayload)
+            ),
+            "truncated 必须 MalformedPayload"
+        );
+    }
+    {
+        // wrong dlen：data 追加 1B（dlen 8→9；decoder 只 admit 8）。
+        let mut payload = base.payload.clone();
+        // reply subpacket dlen 位 [16:18]：0x0008 → 0x0009。
+        payload[17] = 0x09;
+        payload.push(0x00);
+        let mutated = FocasFrame {
+            origin: base.origin,
+            packet_type: base.packet_type,
+            payload,
+        };
+        assert!(
+            matches!(
+                decode_zofs_value(&mutated),
+                Err(WireError::MalformedPayload)
+            ),
+            "wrong dlen 必须 MalformedPayload"
+        );
+    }
+}
+
+/// zofs 请求 Gate 3-D4：production encoder（`zofs_value` 同源构造）
+/// byte-for-byte == 捕获 40B（number=1→`g54x-12345.req` / number=2→`g55x-zero.req`；
+/// 直接证明 `[1,1,1,0]/[2,2,1,0]`）。
+fn zofs_request_locked() {
+    use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+    use super::frame::{encode_generic_request, request_subpacket};
+    use super::wire::{DEV_CNC, FUNC_ZOFS, PATH_CNC, ZOFS_AXIS_X};
+    for (name, number) in [("g54x-12345", 1u32), ("g55x-zero", 2u32)] {
+        let build = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_ZOFS,
+                [number as i32, number as i32, ZOFS_AXIS_X, 0, 0],
+            )]),
+        }
+        .encode();
+        assert_eq!(build.len(), 40, "{name} 0x0B 请求必须 40B");
+        let raw = read("tool_zofs_0b", &format!("{name}.req.bin"));
+        let frames = cut_fixture_frames(&raw);
+        assert_eq!(frames.len(), 1, "{name} 必须恰好 1 帧");
+        assert_eq!(frames[0].len(), 40, "{name} 必须 40B");
+        assert_eq!(
+            frames[0], build,
+            "{name} production encoder 必须 == captured fixture 全 40B"
+        );
+        assert_eq!(PATH_CNC, 1);
+    }
+    // `g54x-23456.req` 与 `g54x-12345.req` 同形（selector 无 value 耦合）。
+    let r1 = read("tool_zofs_0b", "g54x-12345.req.bin");
+    let r2 = read("tool_zofs_0b", "g54x-23456.req.bin");
+    assert_eq!(r1, r2, "同 selector 请求必须逐字节相同");
 }
 
 /// param Q3/P-C（identity-scale GOOD）：`param_response_frame.bin` 经生产
