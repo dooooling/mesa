@@ -24,10 +24,61 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # CI-1 fast-path 路由：纯非代码改动（docs/.gitignore/md-only）跳过 heavy jobs。
+  # fail-safe：只有白名单内文件才 fast；任何未知路径/代码/workflow/lock
+  # 即 full CI。workflow 永远启动、ci-gate 永远出现（Branch Protection 只绑 gate）。
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      heavy: ${{ steps.route.outputs.heavy }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # PR 取 base..head 全量变更；main push 取前后 commit。
+          fetch-depth: 0
+      - id: route
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python3 - <<'EOF'
+          import os, subprocess, sys
+          base, head = os.environ['BASE'], os.environ['HEAD']
+          try:
+              out = subprocess.run(
+                  ['git', 'diff', '--name-only', f'{base}...{head}'],
+                  capture_output=True, text=True, check=True).stdout.splitlines()
+          except subprocess.CalledProcessError as e:
+              print(f'diff failed, fallback full CI: {e}', file=sys.stderr)
+              print('heavy=true')
+              open(os.environ['GITHUB_OUTPUT'], 'a').write('heavy=true\n')
+              sys.exit(0)
+          # fail-safe 白名单：只有这些才 fast（其余一律 heavy）。
+          def fast(p):
+              pl = p.lower()
+              if p == '.gitignore':
+                  return True
+              if p == 'docs/' or p.startswith('docs/'):
+                  return True
+              if pl.endswith('.md'):
+                  return True
+              return False
+          heavy = 'false' if (out and all(fast(p) for p in out)) else 'true'
+          print(f'files={len(out)} heavy={heavy}')
+          for p in out[:20]:
+              print(f'  {p}')
+          open(os.environ['GITHUB_OUTPUT'], 'a').write(f'heavy={heavy}\n')
+          EOF
+
   rust-primary:
+    needs: [changes]
+    if: needs.changes.outputs.heavy == 'true'
     uses: ./.github/workflows/_rust-primary.yml
 
   rust-native:
+    needs: [changes]
+    if: needs.changes.outputs.heavy == 'true'
     strategy:
       # 工业跨平台：一次 run 给出完整平台分布，不为省几分钟开 fail-fast
       fail-fast: false
@@ -41,18 +92,28 @@ jobs:
       runs-on: ${{ matrix.runs-on }}
 
   web:
+    needs: [changes]
+    if: needs.changes.outputs.heavy == 'true'
     uses: ./.github/workflows/_web.yml
 
   # Runtime Stress（稳定化阶段 merge-required）：见 _runtime-stress.yml。
   # 只跑 Windows x64 关键场景重复采样，与 native job 并行。
   runtime-stress:
+    needs: [changes]
+    if: needs.changes.outputs.heavy == 'true'
     uses: ./.github/workflows/_runtime-stress.yml
     with:
       runs-on: windows-latest
 
   # 唯一 Merge Gate：依赖全部 success 才 success。
+  # CI-1 fail-safe（blocker 真修）：
+  # - changes 必须 success（checkout/脚本异常/GITHUB_OUTPUT 失败即 gate FAIL，
+  #   不得因 heavy jobs 全 skipped 而 SUCCESS——skipped 的 heavy 输出不可信）；
+  # - heavy=true → 4 heavy jobs 必须 success；
+  # - heavy=false → 4 heavy jobs 必须 skipped（跑了即路由错误）；
+  # - heavy 缺失/未知 → FAIL CLOSED。
   ci-gate:
-    needs: [rust-primary, rust-native, web, runtime-stress]
+    needs: [changes, rust-primary, rust-native, web, runtime-stress]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -61,4 +122,28 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          python3 -c "import json,os,sys; n=json.loads(os.environ['NEEDS_JSON']); bad={k:v.get('result') for k,v in n.items() if v.get('result')!='success'}; print(json.dumps(n,indent=1)); print('GATE FAILED: %s' % bad if bad else 'GATE OK'); sys.exit(1 if bad else 0)"
+          python3 - <<'EOF'
+          import json, os, sys
+          n = json.loads(os.environ['NEEDS_JSON'])
+          print(json.dumps(n, indent=1))
+          fail = []
+          ch = n.get('changes', {})
+          if ch.get('result') != 'success':
+              fail.append(f"changes 必须 success（实际 {ch.get('result')}）")
+              print('GATE FAILED: %s' % fail)
+              sys.exit(1)
+          heavy = (ch.get('outputs') or {}).get('heavy')
+          heavies = ['rust-primary', 'rust-native', 'web', 'runtime-stress']
+          if heavy == 'true':
+              for k in heavies:
+                  if n.get(k, {}).get('result') != 'success':
+                      fail.append(f'{k} 必须 success（实际 {n.get(k, {}).get("result")}）')
+          elif heavy == 'false':
+              for k in heavies:
+                  if n.get(k, {}).get('result') != 'skipped':
+                      fail.append(f'{k} 应 skipped（实际 {n.get(k, {}).get("result")}）')
+          else:
+              fail.append(f'heavy 输出未知（{heavy!r}）→ FAIL CLOSED')
+          print('GATE FAILED: %s' % fail if fail else 'GATE OK')
+          sys.exit(1 if fail else 0)
+          EOF
