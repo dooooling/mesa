@@ -379,12 +379,13 @@ impl Driver for FocasDriver {
                         .required(false)
                         .default_value(serde_json::json!(3000)),
                     {
-                        // Cutover Gate 1：backend 显式 opt-in（default native）。
-                        // required(false) + default "native"（缺省→Native，UI 可见）。
+                        // Native 退役第一阶段：backend 默认 wire（生产主路径）。
+                        // required(false) + default "wire"（缺省→Wire，UI 可见）；
+                        // "native" 显式保留作 evidence/oracle。
                         let mut f = FieldDescriptor::new("backend", "Backend", FieldType::Enum)
                             .required(false)
-                            .default_value(serde_json::json!("native"));
-                        f.validation.enum_options = Some(vec!["native".into(), "wire".into()]);
+                            .default_value(serde_json::json!("wire"));
+                        f.validation.enum_options = Some(vec!["wire".into(), "native".into()]);
                         f
                     },
                 ],
@@ -788,13 +789,13 @@ impl Driver for FocasDriver {
                 "use_native=false 仅在测试环境 MESA_ALLOW_FAKE_NATIVE=1 时允许",
             ));
         }
-        // Cutover Gate 1：显式 opt-in 路由（默认 Native；无 fallback/hybrid）。
-        // `use_native=false`（Fake）与 `backend=wire` 互斥：Fake 只用于测试骨架，
-        // 不得与 production Wire 混用（混用即 BAD_CONFIG）。
-        if !use_native && cfg.backend == FocasBackend::Wire {
+        // Native 退役第一阶段：默认 Wire；无 fallback/hybrid。
+        // `use_native=false`（Fake）与 `backend=native` 互斥：Fake 只用于测试骨架，
+        // 不得与 evidence Native 混用（混用即 BAD_CONFIG）。
+        if !use_native && cfg.backend == FocasBackend::Native {
             return Err(SdkDriverError::configuration(
                 "BAD_CONFIG",
-                "use_native=false 与 backend=wire 互斥（Fake 仅测试骨架）",
+                "use_native=false 与 backend=native 互斥（Fake 仅测试骨架）",
             ));
         }
         let api: Arc<dyn FocasApiTrait> = match (use_native, cfg.backend) {
@@ -897,34 +898,35 @@ struct FocasConnConfig {
     host: String,
     port: u16,
     timeout_ms: u64,
-    /// Cutover Gate 1：生产后端显式 opt-in（`native` 默认 / `wire` 显式）。
-    /// 不做 fallback、不做 hybrid、不按地址猜后端（见 open_connection）。
+    /// Native 退役第一阶段：生产默认后端为 Wire（Pure Rust；15/17 READY）。
+    /// `native` 显式保留，仅作 evidence/oracle（#76 harness、parity 对照、
+    /// 真机 load 取证）；不做 fallback、不做 hybrid、不按地址猜后端（见 open_connection）。
     backend: FocasBackend,
 }
 
-/// Cutover Gate 1 后端选择（显式 opt-in；默认 Native）。
+/// Native 退役第一阶段后端选择（默认 Wire；Native 仅 evidence/oracle）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum FocasBackend {
-    /// 默认生产后端（Fwlib FFI；全部可信路径以此为准）。
+    /// 生产默认后端（Pure Rust Wire；15/17 READY，load 两项 HOLD fail-closed）。
     #[default]
-    Native,
-    /// 显式 opt-in 的纯 Wire 后端（`WireFocasApi`；READY allowlist 外
-    /// configure 即拒；失败不 fallback Native，见 Gate 3 错误语义）。
     Wire,
+    /// evidence/oracle 后端（Fwlib FFI；#76 harness、parity 对照、load 取证专用；
+    /// 非生产主路径；失败不 fallback Wire，见 Gate 3 错误语义）。
+    Native,
 }
 
 impl FocasBackend {
-    /// 缺省 → Native；字段存在但类型/值非法（`123/true/"bogus"` 等）
-    /// → BAD_CONFIG（不得静默当 Native；见 PR #66 review blocker #1）。
+    /// 缺省 → Wire；字段存在但类型/值非法（`123/true/"bogus"` 等）
+    /// → BAD_CONFIG（不得静默当 Wire；见 PR #66 review blocker #1）。
     fn parse(v: &serde_json::Value) -> Result<Self, SdkDriverError> {
         let raw = match v.get("backend") {
-            None => return Ok(Self::Native),
+            None => return Ok(Self::Wire),
             Some(x) => x,
         };
         let s = raw.as_str().ok_or_else(|| {
             SdkDriverError::configuration(
                 "BAD_CONFIG",
-                format!("backend `{raw}` 非法，期望 native|wire"),
+                format!("backend `{raw}` 非法，期望 wire|native"),
             )
         })?;
         match s.trim().to_ascii_lowercase().as_str() {
@@ -932,7 +934,7 @@ impl FocasBackend {
             "wire" => Ok(Self::Wire),
             other => Err(SdkDriverError::configuration(
                 "BAD_CONFIG",
-                format!("backend `{other}` 非法，期望 native|wire"),
+                format!("backend `{other}` 非法，期望 wire|native"),
             )),
         }
     }
@@ -944,7 +946,7 @@ impl Default for FocasConnConfig {
             host: "127.0.0.1".into(),
             port: 8193,
             timeout_ms: 3000,
-            backend: FocasBackend::Native,
+            backend: FocasBackend::Wire,
         }
     }
 }
@@ -1581,25 +1583,35 @@ mod tests {
     }
 
     fn test_conn() -> FocasConnection {
+        // Native 退役第一阶段：单测默认连接显式走 Native（canonical 全资源
+        // 含 load 等 HOLD 点；默认 Wire 下 HOLD 点 configure 即拒，
+        // 全资源闭环单测必须用 evidence/oracle 后端）。
         FocasConnection {
-            cfg: FocasConnConfig::default(),
+            cfg: FocasConnConfig {
+                backend: FocasBackend::Native,
+                ..FocasConnConfig::default()
+            },
             api: Arc::new(FakeFocasApi::new()),
             plan: std::sync::RwLock::new(None),
         }
     }
 
-    /// Cutover Gate 1+3-C3+3-D4 回归：`backend` 解析 + Wire READY allowlist。
-    /// - 缺省/非法 backend：缺省 Native；非法 BAD_CONFIG。
+    /// Cutover Gate 1+3-C3+3-D4 回归 + Native 退役第一阶段：`backend` 解析 + Wire READY allowlist。
+    /// - 缺省/非法 backend：缺省 Wire；非法 BAD_CONFIG。
     /// - Wire + READY（含 Gate 3-C3 offset/length、Gate 3-D4 zofs）：configure PASS；
     ///   Wire + HOLD（servo/spindle load、tool number）configure 即 UNSUPPORTED_POINT。
     #[tokio::test]
     async fn wire_backend_gate1_locked() {
         // backend 解析。
-        let native_cfg = FocasConnConfig::from_json(&serde_json::json!({})).unwrap();
-        assert_eq!(native_cfg.backend, FocasBackend::Native);
-        let wire_cfg = FocasConnConfig::from_json(&serde_json::json!({"backend": "wire"})).unwrap();
+        let wire_cfg = FocasConnConfig::from_json(&serde_json::json!({})).unwrap();
         assert_eq!(wire_cfg.backend, FocasBackend::Wire);
+        let native_cfg =
+            FocasConnConfig::from_json(&serde_json::json!({"backend": "native"})).unwrap();
+        assert_eq!(native_cfg.backend, FocasBackend::Native);
         assert!(FocasConnConfig::from_json(&serde_json::json!({"backend": "bogus"})).is_err());
+        // 缺省 Wire 回归（Native 退役第一阶段：默认生产后端为 Wire）。
+        let default_cfg = FocasConnConfig::default();
+        assert_eq!(default_cfg.backend, FocasBackend::Wire);
         // allowlist：READY 全过（Gate 3-C3 offset/length、Gate 3-D4 zofs 移入 READY）。
         for addr in [
             FocasAddress::Status,
