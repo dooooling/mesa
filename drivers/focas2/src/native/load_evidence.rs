@@ -91,9 +91,13 @@ pub fn check_phase_order(phases: &[LoadPhase]) -> Result<(), String> {
     }
 }
 
-/// panel 门（L1/L2 必须非零且互异；L0/L0R 不设 tolerance——recovery 由
-/// Panel+Native+Wire 三方 review 判定，不由 harness 发明阈值）。
+/// panel 门（全 phase 先过 `is_finite`——NaN/inf 不得绕过 gate、不落非法 JSONL；
+/// L1/L2 必须非零；L0/L0R 不设 tolerance——recovery 由 Panel+Native+Wire
+/// 三方 review 判定，不由 harness 发明阈值）。
 pub fn check_panel_gate(phase: LoadPhase, panel: f64) -> Result<(), String> {
+    if !panel.is_finite() {
+        return Err(format!("{phase:?} 面板值必须有限（实际 {panel}）"));
+    }
     match phase {
         LoadPhase::L1 | LoadPhase::L2 => {
             if panel == 0.0 {
@@ -168,7 +172,9 @@ impl GuardedLoadBuffer {
     }
 }
 
-/// 单窗采样记录（`jsonl_line` 输入；10 参打包，防 clippy 超参）。
+/// 单窗采样记录（`jsonl_line` 输入；打包防 clippy 超参）。
+/// `panel_ref` 为不解释语义的面板引用（如 servo 轴标识 `"X"`；同 family
+/// 四窗必须同一 ref——跨窗 ref 漂移即 session 作废，不推断 `X↔slot0`）。
 pub struct LoadSample<'a> {
     /// `SPINDLE-L1-001`。
     pub run_id: &'a str,
@@ -180,6 +186,8 @@ pub struct LoadSample<'a> {
     pub handle: u16,
     /// 面板当前实际值。
     pub panel_value: f64,
+    /// 面板引用（servo 轴标识等；原文记录，不解释语义）。
+    pub panel_ref: &'a str,
     /// 请求数（当前恒 4）。
     pub num_in: i16,
     /// DLL 回显数。
@@ -201,7 +209,7 @@ pub fn jsonl_line(s: &LoadSample<'_>) -> String {
     // 手工拼 JSONL（单文件 harness，不引入新依赖；panel f64 用 {:?} 保持精度）。
     format!(
         "{{\"run_id\":{run_id:?},\"family\":{fam:?},\"phase\":{phase:?},\
-         \"handle\":{handle},\"panel_value\":{panel_value:?},\
+         \"handle\":{handle},\"panel_value\":{panel_value:?},\"panel_ref\":{panel_ref:?},\
          \"num_in\":{num_in},\"num_out\":{num_out},\"rc\":{rc},\
          \"raw_0_512_hex\":{raw:?},\"pre_guard_ok\":{pre_ok},\
          \"post_guard_ok\":{post_ok},\"tail_after_512_clean\":{tail_ok},\
@@ -210,6 +218,7 @@ pub fn jsonl_line(s: &LoadSample<'_>) -> String {
         phase = s.phase.tag(),
         handle = s.handle,
         panel_value = s.panel_value,
+        panel_ref = s.panel_ref,
         num_in = s.num_in,
         num_out = s.num_out,
         rc = s.rc,
@@ -224,6 +233,103 @@ pub fn jsonl_line(s: &LoadSample<'_>) -> String {
 /// JSONL 输出路径（`target/focas-load-evidence/load-<seq>.jsonl`）。
 pub fn jsonl_path(seq: &str) -> PathBuf {
     PathBuf::from(format!("target/focas-load-evidence/load-{seq}.jsonl"))
+}
+
+/// test-only RAII handle guard（unwind 亦 free exactly once；panic 不泄漏句柄）。
+/// `Drop` 内忽略 free 错误（已在 panic 路径时不二次 panic）。
+struct HandleGuard<'a> {
+    lib: &'a crate::native::NativeLib,
+    hdl: u16,
+    disarmed: bool,
+}
+
+impl<'a> HandleGuard<'a> {
+    fn new(lib: &'a crate::native::NativeLib, hdl: u16) -> Self {
+        Self {
+            lib,
+            hdl,
+            disarmed: false,
+        }
+    }
+
+    /// 正常收尾时调用（显式 free 成功后 disarm，避免 `Drop` 二次 free）。
+    fn close(&mut self) {
+        let _ = self.lib.cnc_freelibhndl(self.hdl);
+        self.disarmed = true;
+    }
+}
+
+impl Drop for HandleGuard<'_> {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            let _ = self.lib.cnc_freelibhndl(self.hdl);
+        }
+    }
+}
+
+/// panel 输入解析（`"<value> [ref]"`；如 servo `"27 X"`→值 27 + ref `X`；
+/// spindle `"27"`→值 27 + ref `""`。非法/非有限即整 session 作废）。
+fn parse_panel_input(line: &str) -> Result<(f64, String), String> {
+    let mut parts = line.split_whitespace();
+    let value_raw = parts
+        .next()
+        .ok_or_else(|| format!("面板输入为空：{line:?}"))?;
+    let value: f64 = value_raw
+        .parse()
+        .map_err(|_| format!("面板值非法：{line:?}"))?;
+    if !value.is_finite() {
+        return Err(format!("面板值必须有限（实际 {value}）"));
+    }
+    let pref: Vec<&str> = parts.collect();
+    if pref.len() > 1 {
+        return Err(format!("面板引用至多一段：{line:?}"));
+    }
+    Ok((value, pref.first().unwrap_or(&"").to_string()))
+}
+
+/// 同 family panel_ref 一致性（四窗必须同一 ref；漂移即 session 作废；
+/// 不推断 `X↔slot0`，只锁 provenance）。
+fn check_panel_ref_stable(known: &Option<String>, current: &str, run: &str) -> Result<(), String> {
+    if let Some(k) = known
+        && k != current
+    {
+        return Err(format!(
+            "RUN={run} panel_ref 漂移（{k:?} → {current:?}；四窗必须同一 ref）"
+        ));
+    }
+    Ok(())
+}
+
+/// JSONL writer（`create_new` 独占整场持有；文件已存在即 fail-closed——
+/// 禁止复用 seq append 伪造唯一性）。
+struct JsonlWriter {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl JsonlWriter {
+    fn create(seq: &str) -> Result<Self, String> {
+        let path = jsonl_path(seq);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("jsonl 目录创建失败：{e}"))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| {
+                format!(
+                    "jsonl {} 已存在或不可建（RUN 序号必须唯一递增，禁复用补跑）：{e}",
+                    path.display()
+                )
+            })?;
+        Ok(Self { file, path })
+    }
+
+    fn append_line(&mut self, line: &str) -> Result<(), String> {
+        use std::io::Write;
+        writeln!(self.file, "{line}").map_err(|e| format!("jsonl 追加失败：{e}"))
+    }
 }
 
 /// live harness 入口（Evidence Day 用；`#[ignore]` 真机 only）。
@@ -261,11 +367,13 @@ pub fn run_live_harness() {
     let hdl = lib
         .cnc_allclibhndl3(&host, port, timeout_secs)
         .unwrap_or_else(|e| panic!("cnc_allclibhndl3 失败：{} {}", e as i16, e.message()));
+    // RAII：panic 路径亦 free exactly once（test-only guard；drop 忽略 free 错误）。
+    let mut guard = HandleGuard::new(&lib, hdl);
     println!(">>> LOAD SESSION seq={seq} handle={hdl} families={families:?} (single handle)");
-    let out_path = jsonl_path(&seq);
-    std::fs::create_dir_all(out_path.parent().unwrap()).expect("jsonl 目录创建失败");
-    // panel L1/L2 互异门需跨窗比较（同 family 内）。
-    let mut levels: std::collections::BTreeMap<String, (f64, f64)> =
+    // JSONL 独占整场持有（create_new；已存在即 fail-closed，禁复用 append）。
+    let mut writer = JsonlWriter::create(&seq).unwrap_or_else(|e| panic!("{e}"));
+    // panel L1/L2 互异门需跨窗比较（同 family 内）；panel_ref 四窗同一性同 map。
+    let mut levels: std::collections::BTreeMap<String, (f64, f64, Option<String>)> =
         std::collections::BTreeMap::new();
     let mut seen_runs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for phase in LoadPhase::order() {
@@ -276,22 +384,33 @@ pub fn run_live_harness() {
                 "duplicate run-id {id}（禁止复用）"
             );
             println!(">>> BEGIN RUN={id} HANDLE={hdl}");
-            // panel 交互门（操作员输入当前实际 load；L1/L2 零值即中止整场）。
+            // panel 交互门（`"<value> [ref]"`；servo 如 `"27 X"`；L1/L2 零值
+            // 即中止整场；FFI 前先过 L1/L2 互异预检，无效档位不发证据窗）。
             println!(
-                "[WAIT] RUN={id} 请输入面板 {} 当前值：",
+                "[WAIT] RUN={id} 请输入面板 {} 当前值（servo 附轴标识如 `27 X`）：",
                 match family {
                     LoadFamily::Spindle => "SPINDLE LOAD S1",
-                    LoadFamily::Servo => "SERVO LOAD（记录轴号/值）",
+                    LoadFamily::Servo => "SERVO LOAD",
                 }
             );
             let mut line = String::new();
             std::io::stdin()
                 .read_line(&mut line)
                 .expect("stdin 读取失败");
-            let panel: f64 = line.trim().parse().unwrap_or_else(|_| {
-                panic!("RUN={id} 面板值非法：{line:?}（本 session 作废，下次用新 seq）")
-            });
+            let (panel, panel_ref) = parse_panel_input(&line)
+                .unwrap_or_else(|e| panic!("RUN={id} {e}（本 session 作废，下次用新 seq）"));
             check_panel_gate(phase, panel).unwrap_or_else(|e| panic!("RUN={id} {e}"));
+            // panel_ref 四窗同一性（同 family；漂移即作废；不推断 X↔slot）。
+            let fam_key = format!("{:?}", family);
+            let known_ref = levels.get(&fam_key).and_then(|(_, _, r)| r.clone());
+            check_panel_ref_stable(&known_ref, &panel_ref, &id).unwrap_or_else(|e| panic!("{e}"));
+            // L2 FFI 前互异预检（已知档位无效即不发窗，直接作废）。
+            if phase == LoadPhase::L2
+                && let Some((l1, _, _)) = levels.get(&fam_key)
+            {
+                check_levels_distinct(*l1, panel)
+                    .unwrap_or_else(|er| panic!("RUN={id} {er}（FFI 前预检，不发无效窗）"));
+            }
             // raw FFI（同 handle；selector=0/num_in=4 仅复现 identity window）。
             let mut buf = GuardedLoadBuffer::sentinel();
             let mut num: c_short = 4;
@@ -316,7 +435,6 @@ pub fn run_live_harness() {
                     }
                 }
             };
-            let ret_ok = FocasRet::from_raw(rc).is_ok();
             let guards_ok = buf.guards_ok();
             let tail_ok = buf.tail_clean();
             let num_sane = (0..=4).contains(&num);
@@ -326,7 +444,7 @@ pub fn run_live_harness() {
                     "RUN={id} HOLD：guard/tail/num 异常（guards={guards_ok} tail={tail_ok} num={num}）——不推 layout，本 session 作废"
                 );
             }
-            let _ = ret_ok;
+            // rc 非零即整场 INVALID（先落盘本窗 raw+rc，再立即终止，不进下一窗）。
             let unix_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
@@ -337,6 +455,7 @@ pub fn run_live_harness() {
                 phase,
                 handle: hdl,
                 panel_value: panel,
+                panel_ref: &panel_ref,
                 num_in: 4,
                 num_out: num,
                 rc,
@@ -344,20 +463,16 @@ pub fn run_live_harness() {
                 unix_ms,
             });
             println!("{line}");
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&out_path)
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    writeln!(f, "{line}")
-                })
-                .expect("jsonl 追加失败");
-            // L1/L2 互异门（同 family；读回 levels 累积）。
-            let fam_key = format!("{:?}", family);
+            writer
+                .append_line(&line)
+                .unwrap_or_else(|e| panic!("RUN={id} {e}"));
+            if !FocasRet::from_raw(rc).is_ok() {
+                panic!("RUN={id} HOLD：rc={rc} 非零（本窗已落盘，不进下一窗，本 session 作废）");
+            }
+            // L1/L2 互异门（同 family；读回 levels 累积；L2 已 FFI 前预检，此处复核）。
             match phase {
                 LoadPhase::L1 => {
-                    levels.insert(fam_key, (panel, f64::NAN));
+                    levels.insert(fam_key, (panel, f64::NAN, Some(panel_ref)));
                 }
                 LoadPhase::L2 => {
                     if let Some(e) = levels.get_mut(&fam_key) {
@@ -366,14 +481,20 @@ pub fn run_live_harness() {
                             .unwrap_or_else(|er| panic!("RUN={id} {er}"));
                     }
                 }
-                _ => {}
+                _ => {
+                    // L0/L0R 亦记录 ref（四窗同一性ต่อเนื่อง）。
+                    levels
+                        .entry(fam_key)
+                        .or_insert((panel, f64::NAN, Some(panel_ref)));
+                }
             }
         }
     }
-    let _ = lib.cnc_freelibhndl(hdl);
+    // 正常收尾：显式 free（RAII disarm；panic 路径由 Drop 兜底）。
+    guard.close();
     println!(
         "<<< LOAD SESSION seq={seq} done (jsonl: {})",
-        out_path.display()
+        writer.path.display()
     );
 }
 
@@ -438,8 +559,50 @@ mod tests {
         assert!(check_panel_gate(LoadPhase::L2, 0.0).is_err());
         assert!(check_panel_gate(LoadPhase::L0, 0.0).is_ok());
         assert!(check_panel_gate(LoadPhase::L0r, 5.0).is_ok());
+        // 非有限值不得绕过 gate、不落非法 JSONL。
+        assert!(check_panel_gate(LoadPhase::L1, f64::NAN).is_err());
+        assert!(check_panel_gate(LoadPhase::L0, f64::INFINITY).is_err());
         assert!(check_levels_distinct(27.0, 31.0).is_ok());
         assert!(check_levels_distinct(27.0, 27.0).is_err());
+    }
+
+    #[test]
+    fn panel_input_and_ref_locked() {
+        // `"<value> [ref]"`：servo `"27 X"`→(27, "X")；spindle `"27"`→(27, "")。
+        assert_eq!(parse_panel_input("27").unwrap(), (27.0, String::new()));
+        assert_eq!(parse_panel_input("27 X").unwrap(), (27.0, "X".to_string()));
+        assert!(parse_panel_input("").is_err());
+        assert!(parse_panel_input("NaN").is_err());
+        assert!(parse_panel_input("inf").is_err());
+        assert!(parse_panel_input("27 X Y").is_err());
+        // ref 四窗同一性：漂移即作废；不推断 X↔slot。
+        assert!(check_panel_ref_stable(&None, "X", "SERVO-L0-001").is_ok());
+        assert!(check_panel_ref_stable(&Some("X".to_string()), "X", "SERVO-L1-001").is_ok());
+        assert!(check_panel_ref_stable(&Some("X".to_string()), "Z", "SERVO-L2-001").is_err());
+    }
+
+    #[test]
+    fn jsonl_writer_create_new_locked() {
+        // create_new：已存在即 fail-closed（禁复用 append）。
+        let dir = std::env::temp_dir().join("mesa-load-evidence-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let seq = format!(
+            "t{:03}",
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                % 1000) as u32
+        );
+        let _ = seq;
+        // 同进程内占位后二次 create 必须失败（create_new 语义）。
+        let p1 = dir.join("probe.jsonl");
+        std::fs::write(&p1, b"x").unwrap();
+        let twice = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p1);
+        assert!(twice.is_err(), "已存在文件必须 create_new 失败");
     }
 
     /// live harness（Evidence Day 用；ignored 真机 only，CI 默认不跑）。

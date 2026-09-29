@@ -37,18 +37,27 @@ SPINDLE-L0-001 → SERVO-L0-001
 
 OPEN handle once（场首）→ CLOSE once（场尾）；窗间无 reconnect。
 
-## 4. 每窗交互（操作员输入面板当前实际值）
+## 4. 每窗交互（操作员输入面板当前实际值 + 可选引用）
 
 ```text
 [WAIT] RUN=SPINDLE-L1-001
 请输入面板 SPINDLE LOAD S1 当前值：
 > 27
+[WAIT] RUN=SERVO-L1-001
+请输入面板 SERVO LOAD 当前值（servo 附轴标识如 `27 X`）：
+> 27 X
 ```
 
-- L1/L2 必须非零且互异（harness 强制；零/同值即整场 panic 中止）。
+- 输入形如 `"<value> [ref]"`（servo 记录轴标识原文，不解释语义；
+  同 family 四窗必须同一 ref，漂移即整场作废）。
+- 值须 `is_finite`（NaN/inf 即作废，不落非法 JSONL）。
+- L1/L2 必须非零且互异（FFI 前预检；无效档位不发证据窗）。
 - L0/L0R 不设 tolerance（baseline/recovery 由 Panel+Native+Wire 三方 review 判定）。
-- 任何失败/误操作/负载未落定：本 session 作废，下一次必须 `002`，
-  **禁止复用 `001` 补跑某窗**。
+- JSONL 独占整场持有（`create_new`；文件已存在即 fail-closed，禁复用 append）。
+- rc 非零即整场 INVALID（本窗落盘后立即终止，不进下一窗）。
+- panic（含 panel/guard/rc 路径）经 RAII handle guard free exactly once。
+- 任何失败/误操作/负载未落定：本 session 作废，下一次必须新 seq，
+  **禁止复用序号补跑某窗**。
 
 ## 5. 输出
 
