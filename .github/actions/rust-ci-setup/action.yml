@@ -92,10 +92,10 @@ runs:
         sccache --version
         sccache --show-config || true
 
-    # sccache archive restore（全 job；primary key 含 SHA generation 后缀——
-    # Actions Cache entry immutable，exact 优先命中同 SHA 世代，
-    # fallback 同域 env-hash / 同域任意；content 兼容由 sccache 自管）。
+    # sccache archive restore（reader/PR 全 job；main writer 走下步完整
+    # actions/cache——互斥，避免同 archive restore 两次）。
     - name: Restore sccache archive
+      if: ${{ !(github.ref == 'refs/heads/main' && inputs.cache-writer == 'true') }}
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ runner.temp }}/mesa-sccache
@@ -104,11 +104,14 @@ runs:
           mesa-sccache-v2-${{ inputs.cache-domain }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}-
           mesa-sccache-v2-${{ inputs.cache-domain }}-
 
-    # sccache archive save（仅 main + writer；key 含 SHA generation——
-    # 每次 main 产生新世代 archive；reader 永不 save）。
-    - name: Save sccache archive
+    # sccache archive restore+save（仅 main + writer；完整 actions/cache
+    # 先 restore（含 restore-keys warm-start）再 post save；reader 永不进此步）。
+    - name: Restore and save sccache archive
       if: github.ref == 'refs/heads/main' && inputs.cache-writer == 'true'
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ runner.temp }}/mesa-sccache
         key: mesa-sccache-v2-${{ inputs.cache-domain }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}-${{ github.sha }}
+        restore-keys: |
+          mesa-sccache-v2-${{ inputs.cache-domain }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}-
+          mesa-sccache-v2-${{ inputs.cache-domain }}-
