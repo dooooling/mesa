@@ -102,3 +102,8 @@ Native / Panel / Wire 三方可对齐
 - 不恢复 production `cnc_rdspmeter/rdsvmeter`；不改 `SpLoad` layout；
   不写 spindle/servo codec；不改 Wire gate/canary；不碰 `pre_ffi_gate`；
   不提交 ETL/pcapng；coverage 保持 15/17。
+
+## 10. CI fast-path probe（本节仅验证 `heavy=false` 路径；无语义变更）
+
+本节存在即证明 docs-only 改动触发 fast CI（changes → heavy=false →
+heavy jobs skipped → ci-gate SUCCESS）。验证后 CI-1 正式 CLOSED。
