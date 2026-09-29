@@ -90,11 +90,15 @@ jobs:
       matrix:
         include:
           - runs-on: ubuntu-24.04-arm
+            cache-domain: linux-arm64
           - runs-on: windows-latest
+            cache-domain: windows-x64
           - runs-on: windows-11-arm
+            cache-domain: windows-arm64
     uses: ./.github/workflows/_rust-platform.yml
     with:
       runs-on: ${{ matrix.runs-on }}
+      cache-domain: ${{ matrix.cache-domain }}
       mode: ${{ needs.plan.outputs.platform_mode }}
 
   web:

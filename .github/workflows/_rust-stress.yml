@@ -27,7 +27,8 @@ jobs:
       - name: Rust setup
         uses: ./.github/actions/rust-ci-setup
         with:
-          cache-key: stress-${{ inputs.runs-on }}
+          cache-domain: windows-x64
+          cache-writer: "false"
           install-nextest: "true"
 
       - name: build workspace

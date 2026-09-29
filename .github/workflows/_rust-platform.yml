@@ -11,6 +11,10 @@ on:
       runs-on:
         required: true
         type: string
+      cache-domain:
+        description: "兼容域（ci.yml matrix 显式传入；fail-closed）"
+        required: true
+        type: string
       mode:
         description: "smoke（PR）或 full（main）"
         required: false
@@ -34,7 +38,8 @@ jobs:
       - name: Rust setup
         uses: ./.github/actions/rust-ci-setup
         with:
-          cache-key: platform-${{ inputs.runs-on }}
+          cache-domain: ${{ inputs.cache-domain }}
+          cache-writer: "true"
           install-nextest: "true"
 
       - name: build workspace bins
