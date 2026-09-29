@@ -27,6 +27,17 @@ jobs:
           toolchain: '1.95.0'
           components: rustfmt, clippy
 
+      # CI-2 canonical Rust build cache：只缓存 registry/git 依赖与依赖
+      # artifacts（默认不含 workspace crate）；main 保存、PR 只恢复；
+      # key 由 action 按 OS/arch/rustc/lockfile/job 自动隔离，此处再按
+      # primary 显式隔离（native/stress 另有各自 key）。
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: primary
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: fmt
         run: cargo fmt --check
 

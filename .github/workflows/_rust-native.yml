@@ -27,6 +27,15 @@ jobs:
         with:
           toolchain: '1.95.0'
 
+      # CI-2 canonical Rust build cache（key 按 runs-on 隔离；
+      # main 保存、PR 只恢复；默认不含 workspace crate）。
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: native-${{ inputs.runs-on }}
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: build workspace
         run: cargo build --locked --workspace
 
