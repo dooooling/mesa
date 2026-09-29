@@ -392,6 +392,28 @@ pub(super) const CMD_TOFS: u16 = 0x0008;
 /// `0x08` 响应数据体（`dlen=8`；`data[0..4]` BE32 value + `[4..8]` 恒定尾）。
 pub const TOFS_DATA_LEN: usize = 8;
 
+/// FOCAS tool zofs（Gate 3-D3 Evidence PASS，single-point `0x0B`）。
+/// 独立 typed（不复用 `ToolCompValue`——command 不同，一个 operation
+/// 一个 layout；虽同为 8B 亦不共享）。
+/// 请求：`device=1/path=1/arg0=arg1=number/arg2=1(scalar-X)/arg3=0/
+/// aux=0/dlen=0`；响应 `dlen=8/data[0..4] BE32`（`[4..8]=000a0003`
+/// 恒定，不命名）；Mesa 取 engineering F64（`value/1000`，3-D2 语义证据）。
+/// contract A：`tool.zofs.N ≡ work offset N 的 X 值`（显式 axis ⏳ DEFERRED）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZofsValue {
+    /// 原始 8B（`0x0B` reply 全量；以后他 target 尾部不同证据不丢）。
+    pub raw: [u8; 8],
+    /// 定点值（i32 BE `data[0..4]`；12345/23456/0 三窗证据；负值语义待自然观测）。
+    pub value: i32,
+}
+
+/// `0x0B` axis（Gate 3-D4 contract A：scalar-X 固定 `1`；显式 axis DEFERRED）。
+pub(super) const ZOFS_AXIS_X: i32 = 1;
+/// `0x0B` 命令（Gate 3-D3 single-point tool zofs）。
+pub(super) const CMD_ZOFS: u16 = 0x000B;
+/// `0x0B` 响应数据体（`dlen=8`；`data[0..4]` BE32 value + `[4..8]` 恒定尾）。
+pub const ZOFS_DATA_LEN: usize = 8;
+
 /// FOCAS `param_value`（`0x8D`）typed 结果。param v1 Evidence PASS。
 /// 保留完整证据（不过早抽象成 `RawNumeric8`——尾部 scale 语义未闭合，
 /// REAL 留后续窗口；此处只冻结 identity-scale `I32` 单点读取）。
@@ -682,6 +704,9 @@ pub(super) const FUNC_PMC_READ: u32 = 0x0001_8001;
 /// 兼容视图（tool：`function = path<<16|command` 字节等价；
 /// 新代码用 `(DEV_CNC, PATH_CNC, CMD_TOFS)`）。
 pub(super) const FUNC_TOFS: u32 = 0x0001_0008;
+/// 兼容视图（zofs：`function = path<<16|command` 字节等价；
+/// 新代码用 `(DEV_CNC, PATH_CNC, CMD_ZOFS)`）。
+pub(super) const FUNC_ZOFS: u32 = 0x0001_000B;
 /// axis `0x26` 请求首个参数实测恒 `4`（165 observed；语义未知，不命名业务含义）。
 pub(super) const AXIS_ARG0_OBSERVED: i32 = 4;
 
@@ -1106,6 +1131,48 @@ impl FocasClient {
         };
         guard.complete();
         match decode_tofs_value(&resp) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                Err(e)
+            }
+        }
+    }
+
+    /// `zofs_value(number)`（Gate 3-D3 Evidence PASS：single-point
+    /// `0x0B` count=1，`device=1/path=1/arg0=arg1=number/arg2=1(scalar-X)/
+    /// arg3=0/aux=0/dlen=0；单点语义，不做 area/range；contract A 固定
+    /// axis=1，显式 axis DEFERRED）。
+    /// 工件系号超 `c_short` 即 `Unsupported`，不发包（Wire-local checked；
+    /// 不另发明 G54~G59 范围限制）。
+    /// 响应 `dlen=8`，`data[0..4] BE32` + `[4..8]` 恒定尾（见 `ZOFS_DATA_LEN`）。
+    pub async fn zofs_value(&self, number: u32) -> Result<ZofsValue, WireError> {
+        let n = i16::try_from(number)
+            .map_err(|_| WireError::Unsupported("zofs number out of c_short range"))?
+            as i32;
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[request_subpacket(
+                DEV_CNC,
+                FUNC_ZOFS,
+                [n, n, ZOFS_AXIS_X, 0, 0],
+            )]),
+        };
+        let mut guard = self.guard().await?;
+        let session = guard.session();
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                return Err(e);
+            }
+        };
+        guard.complete();
+        match decode_zofs_value(&resp) {
             Ok(v) => Ok(v),
             Err(e) => {
                 let fatal = e.is_session_fatal();
@@ -1880,6 +1947,25 @@ pub(super) fn decode_tofs_value(resp: &FocasFrame) -> Result<ToolCompValue, Wire
     Ok(ToolCompValue { raw, value })
 }
 
+/// `0x0B` 响应解码（Gate 3-D3 single-point tool zofs，独立 decoder，
+/// 不复用 `ToolCompValue`——command 不同，一个 operation 一个 layout）。
+/// slot 匹配 `0x0B`；成功数据精确 8B（`data[0..4] BE32 value + [4..8]`
+/// 恒定尾 `000a0003` 只保留 raw，不校验语义不命名字段；
+/// `!= 8` 即 Malformed，不猜 area/range 形态）。缺 `0x0B` 即 `CommandMismatch`。
+pub(super) fn decode_zofs_value(resp: &FocasFrame) -> Result<ZofsValue, WireError> {
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    let sub =
+        match_slot(&subs, DEV_CNC, PATH_CNC, CMD_ZOFS, 0).ok_or(WireError::CommandMismatch)?;
+    let d = reply_success_data(sub)?;
+    if d.len() != ZOFS_DATA_LEN {
+        return Err(WireError::MalformedPayload);
+    }
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(d);
+    let value = i32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+    Ok(ZofsValue { raw, value })
+}
+
 /// `0x15` 响应解码：slot 匹配 `0x15`，成功数据精确 8B（与 feed/axis/spindle
 /// 同构，独立 decoder，不抽公共类型；`RawNumeric8` 第四个独立 operation）。
 /// 缺 `0x15` 即 `CommandMismatch`。
@@ -2162,6 +2248,15 @@ fn tofs_to_value(v: &ToolCompValue) -> Value {
     Value::F64(v.value as f64 / 1000.0)
 }
 
+/// Mesa `tool.zofs` 映射（Gate 3-D4 contract A：scalar-X）：
+/// `value: i32` → `Value::F64(value/1000.0)`（3-D2 semantic evidence：
+/// Native `data[0]/1000.0` 同合同；12345→12.345/23456→23.456/0→0.0 三窗证据）。
+/// 此处只做 scale 映射；`tool.zofs.N ≡ work offset N 的 X 值`
+/// （axis 固定 1；显式 axis DEFERRED，不由 adapter 定）。
+fn zofs_to_value(v: &ZofsValue) -> Value {
+    Value::F64(v.value as f64 / 1000.0)
+}
+
 /// Mesa `machine/feed` 映射（PR53 两层语义 + B1 冻结 + B4 真实权威）：
 /// `native_value = mantissa` → `Value::U32`（与 `cnc_actf` 只复制前 4B
 /// 同合同；不因 `exponent != 0` 拒绝——否则 `mantissa=1234/exp=1` 将在
@@ -2246,6 +2341,23 @@ fn dedup_tofs_keys(addresses: &[FocasAddress]) -> Vec<(crate::address::ToolKind,
     order
 }
 
+/// Gate 3-D4 去重 helper（生产与测试共用）：
+/// `Tool/Zofs` 按 `number` 保序去重（生产 `zofs_order` 即此函数；
+/// Offset/Length/Number 不纳入——`0x0B` 独立 family）。
+fn dedup_zofs_numbers(addresses: &[FocasAddress]) -> Vec<u32> {
+    use crate::address::ToolKind;
+    let mut order: Vec<u32> = Vec::new();
+    for a in addresses {
+        if let FocasAddress::Tool { kind, number } = a
+            && matches!(kind, ToolKind::Zofs)
+            && !order.contains(number)
+        {
+            order.push(*number);
+        }
+    }
+    order
+}
+
 /// fixture/test 专用：生产 `macro_to_value` 同源入口（`#[cfg(test)]`，
 /// 不出 crate；macro M0~M3 fixture 回归用）。
 #[cfg(test)]
@@ -2258,6 +2370,13 @@ pub(super) fn macro_to_value_for_test(m: &MacroValue) -> Result<Value, WireError
 #[cfg(test)]
 pub(super) fn tofs_to_value_for_test(v: &ToolCompValue) -> Value {
     tofs_to_value(v)
+}
+
+/// fixture/test 专用：生产 `zofs_to_value` 同源入口（`#[cfg(test)]`，
+/// 不出 crate；tool zofs fixture 回归用）。
+#[cfg(test)]
+pub(super) fn zofs_to_value_for_test(v: &ZofsValue) -> Value {
+    zofs_to_value(v)
 }
 
 /// fixture/test 专用：生产 `param_to_value` 同源入口（`#[cfg(test)]`，
@@ -2298,13 +2417,13 @@ pub(super) fn axis_value_for_test(v: i32) -> Value {
 // WireFocasApi：Mesa adapter（PR1 最小 + PR2 feed + PR3 axis + PR54 spindle
 // + PR55 macro + PR56 pmc scalar + PR57 param + PR58 opmsg
 // + Batch 1 spindle gear/maxrpm + Batch 2 diagnosis REAL + Batch 3 alarm
-// + Gate 3-C3 tool offset/length）
+// + Gate 3-C3 tool offset/length + Gate 3-D4 tool zofs）
 // ---------------------------------------------------------------------------
 
-/// Wire 版 `FocasApi`（Gate 3-C3：`system_info` + `Status` + `Feed` +
+/// Wire 版 `FocasApi`（Gate 3-D4：`system_info` + `Status` + `Feed` +
 /// `Axis/absolute` + `ActiveSpindleSpeed` + `MacroVar` + `Pmc` scalar +
 /// `Param` + `OpMsg` + `Spindle/Gear|MaxRpm` + `Diagnosis/REAL` + `Alarm` +
-/// `Tool/Offset|Length`；其余地址 `Unsupported`，
+/// `Tool/Offset|Length|Zofs`；其余地址 `Unsupported`，
 /// fail-closed，不猜、不 fallback Native）。
 pub struct WireFocasApi {
     client: Arc<FocasClient>,
@@ -2482,6 +2601,7 @@ impl FocasApi for WireFocasApi {
         // Tool offset/length：按 (kind,number) 去重各一次 `tofs_value`
         // （single-point `0x08`；offset→1001/length→1003；batch 多个同 key
         // 去重一次 exchange；去重逻辑见 `dedup_tofs_keys`，此处生产调用）。
+        // `0x0B` 不进此 map（work zero 独立 family，见下 `zofs_map`）。
         use crate::address::ToolKind;
         let tofs_order: Vec<(ToolKind, u32)> = dedup_tofs_keys(addresses);
         let mut tofs_map: BTreeMap<(ToolKind, u32), Result<Value, String>> = BTreeMap::new();
@@ -2495,6 +2615,22 @@ impl FocasApi for WireFocasApi {
                 },
             };
             tofs_map.insert((*kind, *number), r);
+        }
+        // Tool zofs：按 number 去重各一次 `zofs_value`（single-point `0x0B`；
+        // contract A scalar-X；batch 多个同号去重一次 exchange；
+        // 去重逻辑见 `dedup_zofs_numbers`，此处生产调用）。
+        let zofs_order: Vec<u32> = dedup_zofs_numbers(addresses);
+        let mut zofs_map: BTreeMap<u32, Result<Value, String>> = BTreeMap::new();
+        for number in &zofs_order {
+            let r: Result<Value, String> = match self.client.zofs_value(*number).await {
+                Ok(v) => Ok(zofs_to_value(&v)),
+                Err(e) => match Self::point_or_fatal(e) {
+                    Ok(Value::String(s)) => Err(s),
+                    Ok(_) => unreachable!("point_or_fatal Ok 必为 String"),
+                    Err(fatal) => return Err(fatal),
+                },
+            };
+            zofs_map.insert(*number, r);
         }
         // Macro 按宏号各一次 0x15（单点语义；超 c_short 在 operation 内 fail-closed）。
         let mut macro_map: BTreeMap<u32, Result<Value, String>> = BTreeMap::new();
@@ -2694,15 +2830,38 @@ impl FocasApi for WireFocasApi {
                     }
                 }
                 FocasAddress::Tool { kind, number } => {
-                    match tofs_map.get(&(*kind, *number)).cloned() {
-                        Some(Ok(v)) => out.push(v),
-                        Some(Err(e)) if e.starts_with("ERR:") => out.push(Value::String(e)),
-                        Some(Err(fatal)) => return Err(fatal),
-                        // 非 Offset/Length（如 Number/Zofs）与 Native 同口径
-                        // fail-closed（ERR → BAD；Gate 3-C3 只服务 offset/length）。
-                        None => out.push(Value::String(format!(
+                    use crate::address::ToolKind;
+                    match kind {
+                        // Offset/Length → `tofs_map`（`0x08` family）。
+                        ToolKind::Offset | ToolKind::Length => {
+                            match tofs_map.get(&(*kind, *number)).cloned() {
+                                Some(Ok(v)) => out.push(v),
+                                Some(Err(e)) if e.starts_with("ERR:") => {
+                                    out.push(Value::String(e))
+                                }
+                                Some(Err(fatal)) => return Err(fatal),
+                                None => out.push(Value::String(format!(
+                                    "ERR:{}",
+                                    WireError::Unsupported("tool tofs missing prefetch")
+                                ))),
+                            }
+                        }
+                        // Zofs → `zofs_map`（`0x0B` family；contract A scalar-X）。
+                        ToolKind::Zofs => match zofs_map.get(number).cloned() {
+                            Some(Ok(v)) => out.push(v),
+                            Some(Err(e)) if e.starts_with("ERR:") => {
+                                out.push(Value::String(e))
+                            }
+                            Some(Err(fatal)) => return Err(fatal),
+                            None => out.push(Value::String(format!(
+                                "ERR:{}",
+                                WireError::Unsupported("tool zofs missing prefetch")
+                            ))),
+                        },
+                        // Number 与 Native 同口径 fail-closed（ERR → BAD）。
+                        ToolKind::Number => out.push(Value::String(format!(
                             "ERR:{}",
-                            WireError::Unsupported("tool kind not in Wire Gate 3-C3")
+                            WireError::Unsupported("tool number not in Wire Gate 3-D4")
                         ))),
                     }
                 }
@@ -2790,7 +2949,7 @@ impl FocasApi for WireFocasApi {
                 _ => out.push(Value::String(format!(
                     "ERR:{}",
                     WireError::Unsupported(
-                        "Gate 3-C3 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc/Param/OpMsg/SpindleGear/MaxRpm/Diagnosis/Alarm/ToolOffset/ToolLength"
+                        "Gate 3-D4 only Status/Feed/Absolute/ActiveSpindle/Macro/Pmc/Param/OpMsg/SpindleGear/MaxRpm/Diagnosis/Alarm/ToolOffset/ToolLength/ToolZofs"
                     )
                 ))),
             }
