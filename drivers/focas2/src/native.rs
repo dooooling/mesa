@@ -442,9 +442,13 @@ pub const TOFS_TYPE_LENGTH: c_short = 3;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IodbZofs {
-    pub datano: c_short,  // 工件系号（1=G54 等）
-    pub type_: c_short,   // 轴数
-    pub data: [c_int; 8], // 8 轴零点值（0i-F 3轴，其余 0）
+    // NOTE（evidence-safe）：前 4B 两字段语义未冻结——不写“工件系号/轴数”
+    // （3-D1 只冻结 `value @ raw[4:8] LE`；回显值对照用，不命名）。
+    pub datano: c_short,
+    pub type_: c_short,
+    // single-point value 取 `data[0]`（contract A 固定 axis=1 X；
+    // 其余槽位本入口不解释，显式 axis DEFERRED）。
+    pub data: [c_int; 8],
 }
 
 /// `cnc_rdparam` IODBPSD_1 容量探测判别点（N01 复测第三轮）。
