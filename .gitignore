@@ -58,5 +58,5 @@ tests/driver-contract/data/
 # 权威证据为 tests/fixtures/** 的 req/res bin + EVIDENCE/SHA256SUMS）
 *.etl
 *.pcapng
-evidence/
-*_flows/
+/evidence/
+/*_flows/
