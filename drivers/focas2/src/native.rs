@@ -2224,6 +2224,12 @@ impl NativeLib {
 unsafe impl Send for NativeLib {}
 unsafe impl Sync for NativeLib {}
 
+/// 真实机床 load evidence harness（PR C test-only；`native/load_evidence.rs`）。
+/// `#[cfg(test)]` 门内挂载——生产编译零影响；live harness 自带 `#[ignore]`。
+#[cfg(test)]
+#[path = "native/load_evidence.rs"]
+mod load_evidence;
+
 #[cfg(test)]
 mod tests {
     use super::*;
