@@ -104,6 +104,21 @@ def main():
     p = plan_for_files([], pkgs())
     check("empty FULL", p["canonical_filter"] == "all()", p)
 
+    # missing base/head fallback → 单 JSON FULL（B4：双 print bug 回归）。
+    import json as _json
+    import subprocess as _sp
+    r = _sp.run([sys.executable, "-c",
+                 "import os,sys; sys.path.insert(0,'tools/ci'); "
+                 "os.environ.pop('CI_BASE',None); os.environ.pop('CI_HEAD',None); "
+                 "import plan; plan.main()"],
+                capture_output=True, text=True)
+    try:
+        doc = _json.loads(r.stdout.strip())
+        check("fallback single JSON FULL",
+              doc["canonical_filter"] == "all()" and doc["platform_mode"] == "full", r.stdout[:200])
+    except Exception as e:
+        check("fallback single JSON FULL", False, f"{e}: {r.stdout[:200]!r}")
+
     # multi-package → deterministic union。
     p = plan_for_files(
         ["drivers/focas2/src/x.rs", "drivers/s7/src/y.rs"], pkgs())
@@ -119,7 +134,7 @@ def main():
     # 18/18 workspace member 均 package 可发现（planner 自动认识）。
     check("members>=18", len(pkgs()) >= 18, str(len(pkgs())))
 
-    # root rust-version == toolchain channel（major.minor）。
+    # root rust-version == toolchain channel（精确 major.minor 比较；B3）。
     import tomllib
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     with open(os.path.join(root, "Cargo.toml"), "rb") as f:
@@ -130,7 +145,13 @@ def main():
             line = line.strip()
             if line.startswith("channel"):
                 chan = line.split("=")[1].strip().strip('"').strip("'")
-    check("toolchain==rust-version", rv.rsplit(".", 1)[0] in chan, f"{rv} vs {chan}")
+    def _mm(v):
+        # "1.95" / "1.95.0" → (1, 95)；精确比较，禁 substring。
+        parts = v.split(".")
+        return (int(parts[0]), int(parts[1]))
+    check("toolchain==rust-version", _mm(rv) == _mm(chan), f"{rv} vs {chan}")
+    # 回归：旧 substring 检查会对 1.94 误 PASS（B3 blocker 证据）。
+    check("toolchain exact (1.94 must fail)", _mm("1.94") != _mm(chan), chan)
 
     # 18/18 member 均 rust-version.workspace=true。
     import tomllib as tl

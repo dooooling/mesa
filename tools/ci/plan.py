@@ -253,7 +253,6 @@ def main() -> int:
     head = os.environ.get("CI_HEAD", "")
     is_main = os.environ.get("CI_IS_MAIN", "") == "1"
     if not base or not head:
-        print(full_plan("missing base/head → FULL (fail-closed)").__repr__())
         import json
 
         print(json.dumps(full_plan("missing base/head → FULL (fail-closed)")))
