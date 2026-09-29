@@ -1,4 +1,5 @@
-# 锁版：与 CI 1.95.0 一致，防本地/CI 漂移
+# 锁版：与 workspace rust-version 1.95 同源（CI v2 planner 自测锁定一致性）
 [toolchain]
 channel = "1.95.0"
+profile = "minimal"
 components = ["rustfmt", "clippy"]

@@ -1,0 +1,76 @@
+# Rust Platform（Linux ARM / Win x64 / Win ARM）：跨平台编译保证 + smoke。
+#
+# PR smoke mode：全 workspace compile/link（bins + --no-run 全 targets）+
+# platform-sensitive suites（nextest ci-platform）。
+# main full mode：同编译 + nextest ci-platform 全量（不做 filterset 裁剪）。
+# 平台无关逻辑不重复全量——由 Linux canonical 覆盖。
+name: rust-platform
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        required: true
+        type: string
+      mode:
+        description: "smoke（PR）或 full（main）"
+        required: false
+        default: "smoke"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  platform:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Rust setup
+        uses: ./.github/actions/rust-ci-setup
+        with:
+          cache-key: platform-${{ inputs.runs-on }}
+          install-nextest: "true"
+
+      - name: build workspace bins
+        run: cargo build --locked --workspace --bins
+
+      - name: compile all test targets (link coverage)
+        run: >
+          cargo test
+          --locked
+          --workspace
+          --all-features
+          --exclude mesa-performance-tests
+          --no-run
+
+      # PR smoke：只执行 platform-sensitive suites。
+      - name: nextest platform smoke
+        if: inputs.mode == 'smoke'
+        run: >
+          cargo nextest run
+          --locked
+          -p mesa-contract-tests
+          --all-features
+          --profile ci-platform
+          -E 'package(=mesa-contract-tests) & (binary(=smoke) | binary(=protocol_negotiation) | binary(=fault_tolerance) | binary(=discovery_contract) | binary(=session_lifecycle) | binary(=stop_lifecycle) | binary(=subprocess_orphan_guard) | binary(=subprocess_recovery) | binary(=mesad_restart))'
+
+      # main full：ci-platform 全量（不裁剪）。
+      - name: nextest platform full
+        if: inputs.mode != 'smoke'
+        run: >
+          cargo nextest run
+          --locked
+          --workspace
+          --all-features
+          --exclude mesa-performance-tests
+          --profile ci-platform
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

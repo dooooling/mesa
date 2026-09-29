@@ -1,0 +1,68 @@
+# Rust Stress（Windows x64）：event 60s soak / stop / pressure / management
+# 关键场景重复采样。PR 按 planner 触发（runtime-sensitive 才跑），main
+# Rust change 必跑。内容不削减（与旧 _runtime-stress.yml 同集合），执行器
+# 切 nextest ci-stress（分类见 .config/nextest.toml）。
+name: rust-stress
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  stress:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Rust setup
+        uses: ./.github/actions/rust-ci-setup
+        with:
+          cache-key: stress-${{ inputs.runs-on }}
+          install-nextest: "true"
+
+      - name: build workspace
+        run: cargo build --locked --workspace
+
+      # 最易抖场景 ×2：60s 稳态 soak（Stop/drain 全链路 + 溢出边界）。
+      - name: stress event_soak 60s x2
+        run: >
+          cargo nextest run --locked -p mesa-contract-tests --all-features
+          --profile ci-stress --test event_soak sim_steady_state_soak_60s_no_loss_no_drift
+          && cargo nextest run --locked -p mesa-contract-tests --all-features
+          --profile ci-stress --test event_soak sim_steady_state_soak_60s_no_loss_no_drift
+
+      # Stop/drain 确定性 Gates ×2（含 in-flight 判别 hold）。
+      - name: stress stop_lifecycle x2
+        run: >
+          cargo nextest run --locked -p mesa-contract-tests --all-features
+          --profile ci-stress --test stop_lifecycle
+          && cargo nextest run --locked -p mesa-contract-tests --all-features
+          --profile ci-stress --test stop_lifecycle
+
+      # 容量公式 Gates ×1（速率 SLO + stall 恢复 + 溢出边界，内含长 hold）。
+      - name: stress event_pressure x1
+        run: >
+          cargo nextest run --locked -p mesa-contract-tests --all-features
+          --profile ci-stress --test event_pressure
+
+      # 并发 Probe ×2（startup spawn/租约/建连并发正确性）。
+      - name: stress management_api x2
+        run: >
+          cargo nextest run --locked -p mesa-contract-tests --all-features
+          --profile ci-stress --test management_api
+          && cargo nextest run --locked -p mesa-contract-tests --all-features
+          --profile ci-stress --test management_api
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

@@ -1,0 +1,65 @@
+# 共享 Rust CI 环境（CI v2）：所有 Rust job 唯一 setup 入口。
+#
+# 职责（职责分离，不 tar 整个 target/）：
+# - 读 rust-toolchain.toml 装 1.95.0（rustfmt/clippy 由调用方按需）；
+# - Cargo registry cache：只缓存 registry/git（cache-targets=false）；
+# - sccache：rustc 编译结果层（SCCACHE_GHA_ENABLED + RUSTC_WRAPPER +
+#   CARGO_INCREMENTAL=0）；
+# - 可选装 nextest 0.9.146（taiki-e/install-action）。
+# 每个 Rust job 末尾必须 sccache --show-stats（量化，不猜）。
+#
+# 输入：
+#   components: 额外 toolchain 组件（默认空；quality 传 rustfmt,clippy）
+#   cache-key:  job 隔离 key（primary / native-<runs-on> / stress-<runs-on>）
+#   install-nextest: 是否安装 nextest（test job true；quality false）
+name: rust-ci-setup
+description: "Mesa CI v2 共享 Rust 环境：toolchain + registry cache + sccache + nextest（可选）"
+inputs:
+  components:
+    description: "额外 rust-toolchain 组件（逗号分隔）"
+    required: false
+    default: ""
+  cache-key:
+    description: "rust-cache 隔离 key"
+    required: true
+  install-nextest:
+    description: "是否安装 cargo-nextest 0.9.146"
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Rust toolchain (from rust-toolchain.toml)
+      uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master@2026-09-05
+      with:
+        toolchain: '1.95.0'
+        components: ${{ inputs.components }}
+
+    # Cargo registry cache（只缓存 registry/git；不缓存 target/）。
+    - name: Rust cache
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: ${{ inputs.cache-key }}
+        cache-bin: "false"
+        cache-targets: "false"
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    # sccache（compiler-result 层；四平台发行物已核）。
+    - name: sccache
+      uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      with:
+        version: "v0.18.0"
+
+    - name: Install nextest
+      if: inputs.install-nextest == 'true'
+      uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29
+      with:
+        tool: cargo-nextest@0.9.146
+
+    - name: sccache env
+      shell: bash
+      run: |
+        echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+        echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+        sccache --version

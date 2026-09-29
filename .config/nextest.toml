@@ -1,0 +1,67 @@
+# nextest CI profiles（CI v2）：执行调度正式分类，不靠砍测试提速。
+#
+# 原则：
+# - retries = 0：flaky 必须暴露，不得“重试绿”。
+# - 平台无关逻辑由 Linux canonical 全量验证；platform job 只跑敏感 smoke。
+# - serial-process：真实 helper/杀父进程/全局进程扫描（一次一个）。
+# - process：端口/env/DB/生命周期类（限 2 并发）。
+# - 60s soak 独占 slots（threads-required），避免 CPU/IO 噪声。
+# - doctest 不由 nextest 执行，canonical 另跑 cargo test --doc。
+
+[profile.ci]
+fail-fast = false
+retries = 0
+slow-timeout = { period = "30s", terminate-after = 6 }
+
+[profile.ci-platform]
+inherits = "ci"
+test-threads = 2
+
+[profile.ci-stress]
+inherits = "ci"
+test-threads = 2
+global-timeout = "20m"
+
+[test-groups]
+serial-process = { max-threads = 1 }
+process = { max-threads = 2 }
+
+# subprocess_orphan_guard：真实 helper + 杀父 + Job/PDEATHSIG + 全局扫描。
+[[profile.ci.overrides]]
+filter = 'package(=mesa-contract-tests) & binary(=subprocess_orphan_guard)'
+test-group = "serial-process"
+slow-timeout = { period = "30s", terminate-after = 6 }
+
+# 进程/生命周期/端口类：限 2 并发。
+[[profile.ci.overrides]]
+filter = '''
+package(=mesa-contract-tests) &
+(
+  binary(=subprocess_recovery) |
+  binary(=mesad_restart) |
+  binary(=stop_lifecycle) |
+  binary(=session_lifecycle) |
+  binary(=protocol_negotiation) |
+  binary(=fault_tolerance)
+)
+'''
+test-group = "process"
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# 60s soak：独占 slots + 低优先级 + 70s slow-timeout。
+[[profile.ci.overrides]]
+filter = 'package(=mesa-contract-tests) & binary(=event_soak)'
+threads-required = "num-test-threads"
+priority = -10
+slow-timeout = { period = "70s", terminate-after = 3 }
+
+# event_pressure：2 slots。
+[[profile.ci.overrides]]
+filter = 'package(=mesa-contract-tests) & binary(=event_pressure)'
+threads-required = 2
+slow-timeout = { period = "30s", terminate-after = 6 }
+
+# event_store_faults：60s failure/recovery wait。
+[[profile.ci.overrides]]
+filter = 'package(=mesa-contract-tests) & binary(=event_store_faults)'
+slow-timeout = { period = "60s", terminate-after = 3 }

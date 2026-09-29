@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+rust-version.workspace = true
 [dependencies]
 mesa-core-types = { workspace = true }
 mesa-driver-sdk = { workspace = true }
