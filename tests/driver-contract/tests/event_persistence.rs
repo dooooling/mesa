@@ -17,10 +17,10 @@ use mesa_core_types::{DriverBinding, EventBatch, EventRecord, EventTask, TaskMod
 use mesa_core_types::{GENERIC_EVENT_BINDING_KIND, GenericEventBinding};
 use mesa_driver_manager::MesaManager;
 use mesa_driver_manager::endpoint::BuiltinEndpoint;
-use mesa_driver_simulator::{SIM_EVENT_STREAM_ALARM, SIM_EVENT_STREAM_COUNTER};
 use mesa_event_store::{
     CommitRequest, EVENT_HUB_CAPACITY, EventFilter, EventHub, EventServices, EventStore,
 };
+use mesa_test_driver::{SIM_EVENT_STREAM_ALARM, SIM_EVENT_STREAM_COUNTER};
 use tower::ServiceExt;
 
 use common::*;
@@ -87,12 +87,13 @@ async fn production_path_alarm_cycle_persists_before_visible() {
     let store = Arc::new(EventStore::open(&db).unwrap());
     let hub = EventHub::new(EVENT_HUB_CAPACITY);
     let mut live = hub.subscribe();
-    let mgr = MesaManager::discover(&repo_root().join("drivers"));
+    let _staged = common::staged_drivers_with_test_driver();
+    let mgr = MesaManager::discover(_staged.path());
     mgr.set_event_services(EventServices::new(store.clone(), hub));
 
     mgr.start_endpoint(BuiltinEndpoint {
         endpoint_id: "ct-evt-001".into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks: vec![poll_task(
             "t1",
@@ -187,14 +188,15 @@ async fn event_ids_unique_across_driver_process_restart() {
     let _ = std::fs::remove_file(&db);
 
     let store = Arc::new(EventStore::open(&db).unwrap());
-    let mgr = MesaManager::discover(&repo_root().join("drivers"));
+    let _staged = common::staged_drivers_with_test_driver();
+    let mgr = MesaManager::discover(_staged.path());
     mgr.set_event_services(EventServices::new(
         store.clone(),
         EventHub::new(EVENT_HUB_CAPACITY),
     ));
     let cfg = || BuiltinEndpoint {
         endpoint_id: "ct-evt-restart".into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks: vec![poll_task(
             "t1",
@@ -286,7 +288,8 @@ async fn event_history_rest_pagination_filters_and_detail() {
     assert_eq!(res.inserted.len(), 5);
     let first_seq = res.inserted[0].seq;
 
-    let drivers_dir = repo_root().join("drivers");
+    let _staged = common::staged_drivers_with_test_driver();
+    let drivers_dir = _staged.path().clone();
     let cfg_store = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
     let mgr = Arc::new(MesaManager::discover(&drivers_dir));
     #[allow(deprecated)]
@@ -375,14 +378,12 @@ async fn event_history_rest_pagination_filters_and_detail() {
     assert_eq!(st, StatusCode::NOT_FOUND);
 
     // 无服务 → 503 精确码
-    let mgr2 = Arc::new(MesaManager::discover(&repo_root().join("drivers")));
+    let _staged2 = common::staged_drivers_with_test_driver();
+    let mgr2 = Arc::new(MesaManager::discover(_staged2.path()));
     let cfg2 = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
     #[allow(deprecated)]
-    let state2 = mesa_core_api::AppState::new(
-        mgr2,
-        cfg2,
-        repo_root().join("drivers").to_string_lossy().to_string(),
-    );
+    let state2 =
+        mesa_core_api::AppState::new(mgr2, cfg2, _staged2.path().to_string_lossy().to_string());
     let app2 = mesa_core_api::router(state2);
     let (st, v) = get(app2, "/api/v1/events").await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
@@ -399,7 +400,8 @@ async fn event_task_rest_crud_and_running_conflict() {
     let _ = std::fs::remove_file(&db);
     let store = Arc::new(EventStore::open(&db).unwrap());
 
-    let drivers_dir = repo_root().join("drivers");
+    let _staged = common::staged_drivers_with_test_driver();
+    let drivers_dir = _staged.path().clone();
     let cfg_store = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
     cfg_store
         .create_device(&mesa_config_store::DeviceRecord {
@@ -412,7 +414,7 @@ async fn event_task_rest_crud_and_running_conflict() {
             id: "ct-task-001".into(),
             name: "CT".into(),
             device_id: "d1".into(),
-            driver_id: "simulator".into(),
+            driver_id: "test-driver".into(),
             connection_json: "{}".into(),
             desired_running: false,
             updated_at_ns: 0,
@@ -483,7 +485,7 @@ async fn event_task_rest_crud_and_running_conflict() {
     // 直接经 manager 启动（带 data task），再 PUT 事件任务 → 409
     mgr.start_endpoint(BuiltinEndpoint {
         endpoint_id: "ct-task-001".into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks: vec![poll_task(
             "t1",
@@ -518,12 +520,13 @@ async fn graceful_shutdown_publishes_every_commit() {
     let hub = EventHub::new(EVENT_HUB_CAPACITY);
     // 早订阅：Start 前即位，不漏任何已提交行
     let mut live = hub.subscribe();
-    let mgr = MesaManager::discover(&repo_root().join("drivers"));
+    let _staged = common::staged_drivers_with_test_driver();
+    let mgr = MesaManager::discover(_staged.path());
     mgr.set_event_services(EventServices::new(store.clone(), hub));
 
     mgr.start_endpoint(BuiltinEndpoint {
         endpoint_id: "ct-evt-grace".into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks: vec![poll_task(
             "t1",
@@ -597,14 +600,15 @@ async fn stop_barrier_drains_inflight_epoch_events() {
     let _ = std::fs::remove_file(&db);
 
     let store = Arc::new(EventStore::open(&db).unwrap());
-    let mgr = MesaManager::discover(&repo_root().join("drivers"));
+    let _staged = common::staged_drivers_with_test_driver();
+    let mgr = MesaManager::discover(_staged.path());
     mgr.set_event_services(EventServices::new(
         store.clone(),
         EventHub::new(EVENT_HUB_CAPACITY),
     ));
     let cfg = || BuiltinEndpoint {
         endpoint_id: "ct-evt-stopgate".into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks: vec![poll_task(
             "t1",
@@ -682,7 +686,8 @@ async fn data_only_path_unaffected() {
     let db = tmp_events_db("dataonly");
     let _ = std::fs::remove_file(&db);
     let store = Arc::new(EventStore::open(&db).unwrap());
-    let mgr = MesaManager::discover(&repo_root().join("drivers"));
+    let _staged = common::staged_drivers_with_test_driver();
+    let mgr = MesaManager::discover(_staged.path());
     mgr.set_event_services(EventServices::new(
         store.clone(),
         EventHub::new(EVENT_HUB_CAPACITY),
@@ -690,7 +695,7 @@ async fn data_only_path_unaffected() {
 
     mgr.start_endpoint(BuiltinEndpoint {
         endpoint_id: "ct-data-001".into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks: vec![poll_task(
             "t1",

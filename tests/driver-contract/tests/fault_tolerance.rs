@@ -57,13 +57,7 @@ async fn shutdown_message_ends_server_cleanly() {
     let cancel = tokio_util::sync::CancellationToken::new();
     let c = cancel.clone();
     let server = tokio::spawn(async move {
-        mesa_driver_sdk::serve(
-            mesa_driver_simulator::SimulatorDriver,
-            listener,
-            TOKEN.into(),
-            c,
-        )
-        .await
+        mesa_driver_sdk::serve(mesa_test_driver::TestDriver, listener, TOKEN.into(), c).await
     });
 
     let (mut session, _events, _) = Session::connect(port, TOKEN).await.unwrap();

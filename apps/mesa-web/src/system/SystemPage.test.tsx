@@ -27,7 +27,7 @@ function mockSystem(opts: { failDiag?: boolean; failDrivers?: boolean; events503
       return {
         ok: true,
         status: 200,
-        json: async () => ({ drivers: [{ id: "simulator", name: "Simulator", version: "0.3.0" }] }),
+        json: async () => ({ drivers: [{ id: "s7", name: "Siemens S7", version: "0.3.0" }] }),
       };
     }
     if (url === "/api/v1/events/stats") {
@@ -57,7 +57,7 @@ describe("M4.3 SystemPage", () => {
       </MemoryRouter>,
     );
     await screen.findByText("2.1.0");
-    expect(screen.getByText("simulator")).toBeTruthy();
+    expect(screen.getByText("s7")).toBeTruthy();
     expect(screen.getAllByText("AVAILABLE").length).toBeGreaterThanOrEqual(2);
     // 不写 HEALTHY（API 证明不了健康，只证明已发现/可用）
     expect(screen.queryByText("HEALTHY")).toBeNull();

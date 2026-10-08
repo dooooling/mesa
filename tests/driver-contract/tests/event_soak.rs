@@ -16,11 +16,10 @@ use mesa_driver_manager::MesaManager;
 use mesa_driver_manager::endpoint::BuiltinEndpoint;
 use mesa_event_store::{EVENT_HUB_CAPACITY, EventHub, EventServices, EventStore};
 
-fn drivers_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("drivers")
+/// staged drivers 目录（含 test-driver；正式 drivers/ 已无 test-driver）。
+/// 返回 guard 必须由调用方持有（drop 即删目录；soak 常驻 60s+，guard 与 mgr 同寿）。
+fn drivers_dir() -> common::StagedDriversDir {
+    common::staged_drivers_with_test_driver()
 }
 
 /// 稳态 soak 本体：`secs` 秒 counter（50ms）+ data（100ms）混合负载后，
@@ -32,16 +31,17 @@ async fn steady_state_soak(tag: &str, secs: u64, min_rows: usize) {
     let _ = std::fs::remove_file(&db);
     let store = std::sync::Arc::new(EventStore::open(&db).unwrap());
     let services = EventServices::new(store.clone(), EventHub::new(EVENT_HUB_CAPACITY));
-    let mgr = std::sync::Arc::new(MesaManager::discover(&drivers_dir()));
+    let _staged = drivers_dir();
+    let mgr = std::sync::Arc::new(MesaManager::discover(_staged.path()));
     mgr.set_event_services(std::sync::Arc::clone(&services));
     let ep = format!("hd-soak-{tag}");
     let binding = mesa_core_types::GenericEventBinding {
-        stream_id: mesa_driver_simulator::SIM_EVENT_STREAM_COUNTER.into(),
+        stream_id: mesa_test_driver::SIM_EVENT_STREAM_COUNTER.into(),
         parameters: serde_json::json!({}),
     };
     mgr.start_endpoint(BuiltinEndpoint {
         endpoint_id: ep.clone(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks: vec![common::poll_task(
             "d",

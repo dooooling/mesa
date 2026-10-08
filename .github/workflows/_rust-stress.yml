@@ -31,8 +31,10 @@ jobs:
           cache-writer: "false"
           install-nextest: "true"
 
+      # test-driver 等子进程类测试需要真实 executable（cargo build 默认
+      # 只构建 lib，不产出 [[bin]]；--bins 保证 mesa-test-driver 可 launch）。
       - name: build workspace
-        run: cargo build --locked --workspace
+        run: cargo build --locked --workspace --bins
 
       # 最易抖场景 ×2：60s 稳态 soak（Stop/drain 全链路 + 溢出边界）。
       - name: stress event_soak 60s x2

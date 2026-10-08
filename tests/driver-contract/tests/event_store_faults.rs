@@ -155,12 +155,8 @@ async fn faulted_endpoint_fails_observably_while_data_only_survives() {
         store.clone(),
         mesa_event_store::EventHub::new(mesa_event_store::EVENT_HUB_CAPACITY),
     );
-    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(
-        &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("drivers"),
-    ));
+    let _staged = common::staged_drivers_with_test_driver();
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(_staged.path()));
     mgr.set_event_services(Arc::clone(&services));
 
     // A：事件 endpoint（alarm，每 Start 若干 commits；第 3 个 commit 起全失败）
@@ -174,7 +170,7 @@ async fn faulted_endpoint_fails_observably_while_data_only_survives() {
     // B：data-only endpoint（无事件任务，永不碰 Store）
     mgr.start_endpoint(mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: "hd-fault-b".into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks: vec![common::poll_task(
             "d",

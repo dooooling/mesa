@@ -24,7 +24,7 @@ fn generic_task(id: &str, selections: Vec<ResourceSelection>) -> AcquisitionTask
 
 #[tokio::test]
 async fn simulator_generic_single_point_ok() {
-    let conn = mesa_driver_simulator::SimulatorDriver
+    let conn = mesa_test_driver::TestDriver
         .open_connection("ep1", "{}")
         .await
         .unwrap();
@@ -36,18 +36,18 @@ async fn simulator_generic_single_point_ok() {
             parameters: json!({}),
             outputs: vec![SelectedOutput {
                 output: "value".into(),
-                point_key: "sim.counter".into(),
+                point_key: "test.counter".into(),
             }],
         }],
     );
     let descs = conn.configure(1, vec![task]).await.unwrap();
     assert_eq!(descs.len(), 1);
-    assert_eq!(descs[0].point_key, "sim.counter");
+    assert_eq!(descs[0].point_key, "test.counter");
 }
 
 #[tokio::test]
 async fn simulator_generic_duplicate_point_key_rejected() {
-    let conn = mesa_driver_simulator::SimulatorDriver
+    let conn = mesa_test_driver::TestDriver
         .open_connection("ep1", "{}")
         .await
         .unwrap();
@@ -234,15 +234,15 @@ async fn legacy_kinds_rejected_for_all_drivers() {
     // Foundation-2：legacy kind 已删除，非 generic 即 UNSUPPORTED_BINDING。
     // 被删 kind 字符串集中在此测试（生产 Driver 不再 export 相关常量）。
     const LEGACY_KINDS: &[&str] = &[
-        "simulator.points",
+        "test-driver.points",
         "s7.address-group",
         "focas.data-block",
         "opcua.node-group",
         "opcua.subscription",
         "opcua.browse",
-        "simulator.events",
+        "test-driver.events",
     ];
-    let sim = mesa_driver_simulator::SimulatorDriver
+    let sim = mesa_test_driver::TestDriver
         .open_connection("ep1", "{}")
         .await
         .unwrap();

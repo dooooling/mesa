@@ -12,6 +12,12 @@
 //!
 //! 纪律：只测冻结语义，不碰 `event-store` / Core / Web / 驱动生产代码。
 
+// common 经各测试 target 的 `mod common` 挂载，此处复用同一文件需压住
+// clippy duplicate-mod（各 target 独立编译，语义无冲突）。
+#[allow(clippy::duplicate_mod)]
+#[path = "../common/mod.rs"]
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -260,7 +266,7 @@ pub async fn wait_diagnostics(
     }
 }
 
-/// Simulator 源：manager + 真 simulator 子进程（`mesa.events.v1` alarm 流）。
+/// test-driver 源：manager + 真 test-driver 子进程（`mesa.events.v1` alarm 流）。
 /// 发射是驱动自主的（每 Start 跑一遍四态）；`emit_round` 要求已 start。
 pub struct SimulatorEventSource {
     endpoint_id: String,
@@ -269,19 +275,14 @@ pub struct SimulatorEventSource {
     services: Arc<mesa_event_store::EventServices>,
     db: std::path::PathBuf,
     running: bool,
+    _staged_guard: common::StagedDriversDir,
 }
 
-fn repo_drivers_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("drivers")
-}
-
-fn sim_alarm_task() -> mesa_core_types::EventTask {
+/// test-driver alarm 任务（`mesa.events.v1` alarm 流订阅）。
+fn common_sim_alarm_task() -> mesa_core_types::EventTask {
     use mesa_core_types::{DriverBinding, EventTask, GENERIC_EVENT_BINDING_KIND, TaskMode};
     let binding = mesa_core_types::GenericEventBinding {
-        stream_id: mesa_driver_simulator::SIM_EVENT_STREAM_ALARM.into(),
+        stream_id: mesa_test_driver::SIM_EVENT_STREAM_ALARM.into(),
         parameters: serde_json::json!({}),
     };
     EventTask {
@@ -297,6 +298,8 @@ fn sim_alarm_task() -> mesa_core_types::EventTask {
 
 impl SimulatorEventSource {
     /// 挂接到调用方自建的 manager/store（fault-injection 等需共享 Store 时用）。
+    /// NOTE：调用方 manager 必须能发现 test-driver（如经 staged 目录构建），
+    /// 否则 start_endpoint 会 `not found or not launchable`。
     pub fn attach(
         endpoint_id: &str,
         mgr: Arc<mesa_driver_manager::MesaManager>,
@@ -304,6 +307,7 @@ impl SimulatorEventSource {
         services: Arc<mesa_event_store::EventServices>,
         db: std::path::PathBuf,
     ) -> Self {
+        let guard = common::staged_drivers_with_test_driver();
         Self {
             endpoint_id: endpoint_id.into(),
             mgr,
@@ -311,6 +315,7 @@ impl SimulatorEventSource {
             services,
             db,
             running: false,
+            _staged_guard: guard,
         }
     }
 }
@@ -321,15 +326,22 @@ impl EventTestSource for SimulatorEventSource {
         let db = tmp_db("sim");
         let _ = std::fs::remove_file(&db);
         let store = open_store(&db);
-        let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(
-            &repo_drivers_dir(),
-        ));
+        let guard = common::staged_drivers_with_test_driver();
+        let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(guard.path()));
         let services = mesa_event_store::EventServices::new(
             store.clone(),
             mesa_event_store::EventHub::new(mesa_event_store::EVENT_HUB_CAPACITY),
         );
         mgr.set_event_services(std::sync::Arc::clone(&services));
-        Self::attach(endpoint_id, mgr, store, services, db)
+        Self {
+            endpoint_id: endpoint_id.into(),
+            mgr,
+            store,
+            services,
+            db,
+            running: false,
+            _staged_guard: guard,
+        }
     }
 
     async fn start_endpoint(&mut self) {
@@ -338,17 +350,17 @@ impl EventTestSource for SimulatorEventSource {
         self.mgr
             .start_endpoint(BuiltinEndpoint {
                 endpoint_id: self.endpoint_id.clone(),
-                driver_id: "simulator".into(),
+                driver_id: "test-driver".into(),
                 connection_json: "{}".into(),
                 tasks: vec![],
-                event_tasks: vec![sim_alarm_task()],
+                event_tasks: vec![common_sim_alarm_task()],
             })
             .unwrap();
         self.running = true;
     }
 
     async fn emit_round(&mut self, _round: u32) -> Vec<String> {
-        // round 被忽略：Simulator 每次 Start 都是新 epoch + 新 ids（epoch 作用域）。
+        // round 被忽略：test-driver 每次 Start 都是新 epoch + 新 ids（epoch 作用域）。
         assert!(self.running, "先 start_endpoint 再 emit（无隐藏启动）");
         let before = rows_of(&self.store, &self.endpoint_id).len();
         // alarm-cycle 每轮恰 4 条（Raised/Updated/Acknowledged/Cleared）。
@@ -473,7 +485,7 @@ impl EventTestSource for OpcUaEventSource {
         let _ = std::fs::remove_file(&db);
         let store = open_store(&db);
         let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(
-            &repo_drivers_dir(),
+            &common::repo_root().join("drivers"),
         ));
         let services = mesa_event_store::EventServices::new(
             store.clone(),

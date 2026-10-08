@@ -25,10 +25,8 @@ use mesa_driver_protocol::{PROTOCOL_MAJOR, PROTOCOL_MINOR, pb, read_envelope, wr
 use mesa_driver_sdk::{
     DataSink, Driver, DriverConnection, SdkDriverError, SdkFaults, serve_with_faults,
 };
-use mesa_driver_simulator::{
-    SIM_ALARM_CONDITION_ID, SIM_EVENT_STREAM_ALARM, SIM_EVENT_STREAM_COUNTER,
-};
 use mesa_event_store::{EventHub, EventServices, EventStore};
+use mesa_test_driver::{SIM_ALARM_CONDITION_ID, SIM_EVENT_STREAM_ALARM, SIM_EVENT_STREAM_COUNTER};
 use tokio_util::sync::CancellationToken;
 
 use common::*;
@@ -473,7 +471,7 @@ async fn event_flood_neither_starves_data_nor_control() {
         .await
         .expect("control RPC must not starve under event flood")
         .expect("metadata ok");
-    assert_eq!(driver_id, "simulator");
+    assert_eq!(driver_id, "test-driver");
 
     teardown(&mut session, Some(server_cancel));
 }

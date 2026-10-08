@@ -29,11 +29,10 @@ use mesa_driver_manager::MesaManager;
 use mesa_driver_manager::endpoint::BuiltinEndpoint;
 use mesa_event_store::{EVENT_HUB_CAPACITY, EventHub, EventServices, EventStore, StoreFaults};
 
-fn drivers_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("drivers")
+/// staged drivers 目录（含 test-driver；正式 drivers/ 已无 test-driver）。
+/// 返回 guard 必须由调用方持有（drop 即删目录）。
+fn drivers_dir() -> common::StagedDriversDir {
+    common::staged_drivers_with_test_driver()
 }
 
 /// Stop 错误码冻结集合：`stop_endpoint` 的 `Err(String)` 必须是以下精确码之一
@@ -63,18 +62,19 @@ async fn stop_while_reconnecting_is_bounded_and_explicit() {
     let _ = std::fs::remove_file(&db);
     let store = std::sync::Arc::new(EventStore::open(&db).unwrap());
     let services = EventServices::new(store.clone(), EventHub::new(EVENT_HUB_CAPACITY));
-    let mgr = std::sync::Arc::new(MesaManager::discover(&drivers_dir()));
+    let _staged = drivers_dir();
+    let mgr = std::sync::Arc::new(MesaManager::discover(_staged.path()));
     mgr.set_event_services(std::sync::Arc::clone(&services));
     let snapshot = mgr.snapshot();
     let ep = "hd-stop-reconnect";
 
     let binding = mesa_core_types::GenericEventBinding {
-        stream_id: mesa_driver_simulator::SIM_EVENT_STREAM_COUNTER.into(),
+        stream_id: mesa_test_driver::SIM_EVENT_STREAM_COUNTER.into(),
         parameters: serde_json::json!({}),
     };
     mgr.start_endpoint(BuiltinEndpoint {
         endpoint_id: ep.into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         // 第 2 个 data 批后进程退出（50ms poll → 约 100ms 后死亡）。
         connection_json: r#"{"crash_after_batches":2}"#.into(),
         tasks: vec![common::poll_task(
@@ -161,7 +161,8 @@ async fn stop_waits_for_inflight_commit_then_drains_exact() {
     );
     let hub = EventHub::new(EVENT_HUB_CAPACITY);
     let services = EventServices::new(store.clone(), std::sync::Arc::clone(&hub));
-    let mgr = std::sync::Arc::new(MesaManager::discover(&drivers_dir()));
+    let _staged = drivers_dir();
+    let mgr = std::sync::Arc::new(MesaManager::discover(_staged.path()));
     mgr.set_event_services(std::sync::Arc::clone(&services));
     let ep = "hd-stop-gate";
 
@@ -171,12 +172,12 @@ async fn stop_waits_for_inflight_commit_then_drains_exact() {
     let mut hub_rx = hub.subscribe();
 
     let binding = mesa_core_types::GenericEventBinding {
-        stream_id: mesa_driver_simulator::SIM_EVENT_STREAM_COUNTER.into(),
+        stream_id: mesa_test_driver::SIM_EVENT_STREAM_COUNTER.into(),
         parameters: serde_json::json!({}),
     };
     mgr.start_endpoint(BuiltinEndpoint {
         endpoint_id: ep.into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks: vec![],
         event_tasks: vec![EventTask {

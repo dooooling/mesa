@@ -34,6 +34,58 @@ fn sim_task(
     }
 }
 
+/// staged drivers 目录（含 test-driver 二进制 + manifest；perf 用）。
+/// guard 由调用方持有（drop 即删目录）。
+struct PerfStagedDir(std::path::PathBuf);
+impl PerfStagedDir {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+impl Drop for PerfStagedDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+fn staged_drivers_with_test_driver() -> PerfStagedDir {
+    let exe_candidates = [
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug/mesa-test-driver.exe"),
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug/mesa-test-driver"),
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/release/mesa-test-driver.exe"),
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/release/mesa-test-driver"),
+    ];
+    let exe = exe_candidates
+        .iter()
+        .find(|p| p.is_file())
+        .cloned()
+        .expect("mesa-test-driver binary not built");
+    let root = std::env::temp_dir().join(format!(
+        "mesa-perf-drivers-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("test-driver");
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = exe.file_name().unwrap().to_string_lossy().to_string();
+    std::fs::copy(&exe, dir.join(&name)).unwrap();
+    // 单真值：复制 canonical manifest（tests/support/test-driver/driver.toml）。
+    std::fs::copy(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../support/test-driver/driver.toml"),
+        dir.join("driver.toml"),
+    )
+    .unwrap();
+    PerfStagedDir(root)
+}
+
 #[tokio::test]
 async fn soak_60s_multi_endpoint_no_leak() {
     let dur = if std::env::var("SOAK_LONG").is_ok() {
@@ -41,7 +93,8 @@ async fn soak_60s_multi_endpoint_no_leak() {
     } else {
         Duration::from_secs(60)
     };
-    let drivers_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../drivers");
+    let _staged = staged_drivers_with_test_driver();
+    let drivers_dir = _staged.path().to_path_buf();
     let mgr = MesaManager::discover(&drivers_dir);
     // 2 endpoints：fast 100ms + slow 1s，覆盖不同 poll + backpressure
     for idx in 0..2 {
@@ -56,7 +109,7 @@ async fn soak_60s_multi_endpoint_no_leak() {
         )];
         let ep = mesa_driver_manager::endpoint::BuiltinEndpoint {
             endpoint_id: format!("soak-{idx}"),
-            driver_id: "simulator".into(),
+            driver_id: "test-driver".into(),
             connection_json: "{}".into(),
             tasks,
             event_tasks: vec![],
@@ -77,7 +130,7 @@ async fn soak_60s_multi_endpoint_no_leak() {
     )];
     let ep = mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: "soak-0".into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks,
         event_tasks: vec![],

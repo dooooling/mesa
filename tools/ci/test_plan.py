@@ -154,9 +154,15 @@ def main():
     check("manager selective build", p["build_targets"]
           == {"kind": "packages", "packages": ["mesa-driver-manager"]}, p)
 
-    # contract-tests 受影响 → 全 bins（helper/mesad/sim 需要）。
+    # contract-tests 受影响 → 全 bins（helper + mesad + test-driver）。
     p = plan_for_files(["tests/driver-contract/tests/smoke.rs"], pkgs())
     check("contract bins build", p["build_targets"] == {"kind": "bins"}, p)
+
+    # test-driver 改动 → stress + perf（contract/perf 基线能力）。
+    p = plan_for_files(["tests/support/test-driver/src/lib.rs"], pkgs())
+    check("test-driver stress", p["stress"] is True, p)
+    check("test-driver perf", p["perf"] is True, p)
+    check("test-driver contract bins", p["canonical_contract_bins"] is True, p)
 
     # soak 默认归 stress（CI v3 第三刀；canonical/platform 默认 skip）。
     p = plan_for_files(["drivers/focas2/src/x.rs"], pkgs())

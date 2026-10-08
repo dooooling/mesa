@@ -39,7 +39,7 @@ fn percentile(mut v: Vec<u128>, p: f64) -> u128 {
 
 #[tokio::test]
 async fn control_write_p95_within_20ms() {
-    let driver = mesa_driver_simulator::SimulatorDriver;
+    let driver = mesa_test_driver::TestDriver;
     let conn = driver.open_connection("ep", "{}").await.unwrap();
     conn.configure(1, vec![poll_task("sim.x", "a")])
         .await
@@ -65,7 +65,7 @@ async fn control_write_p95_within_20ms() {
 
 #[tokio::test]
 async fn control_command_p95_within_20ms() {
-    let driver = mesa_driver_simulator::SimulatorDriver;
+    let driver = mesa_test_driver::TestDriver;
     let conn = driver.open_connection("ep", "{}").await.unwrap();
     conn.configure(1, vec![poll_task("sim.x", "a")])
         .await

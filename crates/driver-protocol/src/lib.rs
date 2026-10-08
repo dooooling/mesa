@@ -681,13 +681,20 @@ mod tests {
     /// bump 常量忘改 toml 即漂移）。Minor 只做展示一致性，不断言 gate。
     #[test]
     fn in_tree_manifest_minor_matches_protocol() {
-        // workspace 根 → drivers/<id>/driver.toml（5 个 in-tree 驱动）
+        // workspace 根 → drivers/<id>/driver.toml（4 个正式 in-tree 驱动）+
+        // tests/support/test-driver/driver.toml（test-driver 虽退役产品身份，
+        // 仍是 IPC participant，manifest minor 不允许漂移）。
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("..")
-            .join("drivers");
-        for id in ["s7", "simulator", "opcua", "focas2", "sinumerik-nck"] {
-            let p = root.join(id).join("driver.toml");
+            .join("..");
+        for rel in [
+            "drivers/s7",
+            "drivers/opcua",
+            "drivers/focas2",
+            "drivers/sinumerik-nck",
+            "tests/support/test-driver",
+        ] {
+            let p = root.join(rel).join("driver.toml");
             let text =
                 std::fs::read_to_string(&p).unwrap_or_else(|_| panic!("missing {}", p.display()));
             let minor = text
@@ -698,10 +705,10 @@ mod tests {
                         .and_then(|v| v.trim().strip_prefix('='))
                         .and_then(|v| v.trim().parse::<u32>().ok())
                 })
-                .unwrap_or_else(|| panic!("{id} driver.toml 缺 protocol_minor"));
+                .unwrap_or_else(|| panic!("{rel} driver.toml 缺 protocol_minor"));
             assert_eq!(
                 minor, PROTOCOL_MINOR,
-                "{id} driver.toml minor {minor} != PROTOCOL_MINOR {PROTOCOL_MINOR}"
+                "{rel} driver.toml minor {minor} != PROTOCOL_MINOR {PROTOCOL_MINOR}"
             );
         }
     }

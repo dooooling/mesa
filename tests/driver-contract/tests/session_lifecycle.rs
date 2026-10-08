@@ -531,7 +531,7 @@ async fn session_probe_simulator_returns_identity() {
     let r = session.probe(7).await.expect("probe ok");
     assert!(r.reachable);
     assert_eq!(r.vendor.as_deref(), Some("Mesa"));
-    assert_eq!(r.family.as_deref(), Some("Simulator"));
+    assert_eq!(r.family.as_deref(), Some("TestDriver"));
     assert_eq!(r.model.as_deref(), Some("Basic"));
     assert_eq!(r.firmware.as_deref(), Some("1.0"));
     let state = |id: &str| r.capabilities.iter().find(|c| c.id == id).map(|c| c.state);

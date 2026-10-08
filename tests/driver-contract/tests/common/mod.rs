@@ -2,7 +2,7 @@
 //!
 //! 两类测试形态（§20 四层中的两层）：
 //! - 进程内：SDK `serve_with_faults` + Core `Session` 对连真实 TCP，快速覆盖协议语义；
-//! - 子进程：拉起真实 simulator 二进制 + `run_endpoint` 运行时，覆盖孤儿防护、
+//! - 子进程：拉起真实 test-driver 二进制 + `run_endpoint` 运行时，覆盖孤儿防护、
 //!   Crash Restore 等进程级行为。
 
 #![allow(dead_code)]
@@ -17,7 +17,7 @@ use mesa_core_types::{
 use mesa_driver_manager::session::{Session, SessionError, SessionEvent};
 use mesa_driver_protocol::pb;
 use mesa_driver_sdk::{SdkFaults, serve_with_faults};
-use mesa_driver_simulator::SimulatorDriver;
+use mesa_test_driver::TestDriver;
 use tokio_util::sync::CancellationToken;
 
 pub const TOKEN: &str = "contract-test-token";
@@ -41,14 +41,14 @@ pub fn repo_root() -> PathBuf {
         .join("..")
 }
 
-/// 已构建的 simulator 可执行文件路径。
+/// 已构建的 test-driver 可执行文件路径。
 ///
 /// NOTE(cargo 行为): `cargo test -p mesa-contract-tests` 只构建依赖包的 lib，
-/// **不会**重编 simulator 的 bin。子进程类测试前若改过驱动代码，
-/// 必须先 `cargo build -p mesa-driver-simulator`（或 `--workspace`），
+/// **不会**重编 test-driver 的 bin。子进程类测试前若改过驱动代码，
+/// 必须先 `cargo build -p mesa-test-driver`（或 `--workspace`），
 /// 否则拉起的是旧二进制、故障注入不生效。
-pub fn sim_exe() -> PathBuf {
-    find_built_binary("mesa-driver-simulator")
+pub fn test_driver_exe() -> PathBuf {
+    find_built_binary("mesa-test-driver")
 }
 
 /// 已构建的 mesad 可执行文件路径（P1-2 进程级 restart Gate 用；
@@ -70,6 +70,117 @@ fn find_built_binary(name: &str) -> PathBuf {
     panic!("{name} binary not built; run cargo build/test first");
 }
 
+/// staged drivers 目录守卫（test-driver 退役产品身份后，凡需启动 test-driver
+/// 的测试均走此目录：正式 drivers/ manifest 复制 + 已构建二进制 hardlink +
+/// test-driver 子目录；temp dir 向上查不到 workspace target/，故必须自带
+/// executable；Windows 优先 .exe）。
+pub struct StagedDriversDir(PathBuf);
+impl StagedDriversDir {
+    pub fn path(&self) -> &PathBuf {
+        &self.0
+    }
+}
+impl Drop for StagedDriversDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+/// 组装 staged drivers 目录（含 test-driver）。调用方 manager 必须
+/// `MesaManager::discover(guard.path())`，AppState 的 drivers_dir 同理。
+pub fn staged_drivers_with_test_driver() -> StagedDriversDir {
+    let root = std::env::temp_dir().join(format!(
+        "mesa-test-drivers-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    for driver in ["s7", "focas2", "opcua", "sinumerik-nck"] {
+        let src = repo_root().join("drivers").join(driver);
+        if let Ok(raw) = std::fs::read(src.join("driver.toml")) {
+            let dir = root.join(driver);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("driver.toml"), raw).unwrap();
+            link_built_exe(&src, &dir);
+        }
+    }
+    let exe = test_driver_exe();
+    let dir = root.join("test-driver");
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = exe.file_name().unwrap().to_string_lossy().to_string();
+    std::fs::copy(&exe, dir.join(&name)).unwrap();
+    // 单真值：直接复制 canonical manifest（tests/support/test-driver/driver.toml），
+    // 不手写 version/protocol——可执行文件名与 canonical 一致（mesa-test-driver），
+    // resolve_executable 原生支持（Windows 下 .exe 兜底）。
+    let canonical = std::fs::read(repo_root().join("tests/support/test-driver/driver.toml"))
+        .expect("canonical test-driver driver.toml must exist");
+    std::fs::write(dir.join("driver.toml"), canonical).unwrap();
+    StagedDriversDir(root)
+}
+
+/// 从 target/ 找已构建二进制，hardlink 到 staged 子目录（Windows 优先 .exe；
+/// 无扩展名 Unix 产物在 Windows 下不可执行）。
+fn link_built_exe(src_manifest_dir: &std::path::Path, staged_dir: &std::path::Path) {
+    let toml = std::fs::read_to_string(src_manifest_dir.join("driver.toml")).unwrap_or_default();
+    let exe_base = toml
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("executable"))
+        .and_then(|v| v.split('=').nth(1))
+        .map(|v| v.trim().trim_matches('"').trim().to_string())
+        .unwrap_or_default();
+    if exe_base.is_empty() {
+        return;
+    }
+    let target = repo_root().join("target");
+    for profile in ["debug", "release"] {
+        // Windows 必须优先 .exe（无扩展名 Unix 产物在 Windows 下不可执行）；
+        // cfg! 运行时分支保证两平台都不产生 unused_mut。
+        let cands = if cfg!(windows) {
+            vec![
+                target.join(profile).join(format!("{exe_base}.exe")),
+                target.join(profile).join(&exe_base),
+            ]
+        } else {
+            vec![
+                target.join(profile).join(&exe_base),
+                target.join(profile).join(format!("{exe_base}.exe")),
+            ]
+        };
+        for cand in cands {
+            if cand.is_file() {
+                let name = cand.file_name().unwrap();
+                if std::fs::hard_link(&cand, staged_dir.join(name)).is_err() {
+                    std::fs::copy(&cand, staged_dir.join(name)).ok();
+                }
+                return;
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(target.join(profile)) {
+            let want = exe_base.to_ascii_lowercase();
+            for e in entries.flatten() {
+                let p = e.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let n = p
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_ascii_lowercase();
+                if n == want || n == format!("{want}.exe") {
+                    let name = p.file_name().unwrap().to_owned();
+                    if std::fs::hard_link(&p, staged_dir.join(&name)).is_err() {
+                        std::fs::copy(&p, staged_dir.join(&name)).ok();
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// 找一个空闲 loopback 端口（bind :0 取号即释放；TOCTOU 下被占则调用方重试）。
 pub async fn free_port() -> u16 {
     tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -80,12 +191,12 @@ pub async fn free_port() -> u16 {
         .port()
 }
 
-/// 启动进程内 Simulator SDK 服务（无故障注入），返回 (端口, 停机句柄)。
+/// 启动进程内 test-driver SDK 服务（无故障注入），返回 (端口, 停机句柄)。
 pub async fn start_sim_server() -> (u16, CancellationToken) {
     start_sim_server_with_faults(SdkFaults::new()).await
 }
 
-/// 启动进程内 Simulator SDK 服务并暴露故障注入开关。
+/// 启动进程内 test-driver SDK 服务并暴露故障注入开关。
 /// 10055/10048 缓冲区耗尽时重试，避免并行 cargo test 抖动。
 pub async fn start_sim_server_with_faults(faults: SdkFaults) -> (u16, CancellationToken) {
     let mut last_err = None;
@@ -97,7 +208,7 @@ pub async fn start_sim_server_with_faults(faults: SdkFaults) -> (u16, Cancellati
                 let c = cancel.clone();
                 tokio::spawn(async move {
                     if let Err(e) = serve_with_faults(
-                        SimulatorDriver,
+                        TestDriver,
                         listener,
                         TOKEN.into(),
                         c.clone(),
@@ -105,7 +216,7 @@ pub async fn start_sim_server_with_faults(faults: SdkFaults) -> (u16, Cancellati
                     )
                     .await
                     {
-                        eprintln!("sim server ended: {e}");
+                        eprintln!("test-driver server ended: {e}");
                     }
                 });
                 return (port, cancel);

@@ -1,6 +1,8 @@
 # Mesa（V2.1）
 
-工业设备统一采集平台，Rust + Tokio + Protobuf IPC + SQLite，单进程 Core + 独立进程 Driver（S7 / FOCAS2 / OPC UA / Simulator），V2.1 在 V1 只读基线上扩展动态 UI / Secret / Browse / Control / 原子事务。
+工业设备统一采集平台，Rust + Tokio + Protobuf IPC + SQLite，单进程 Core + 独立进程 Driver（S7 / FOCAS2 / OPC UA / SINUMERIK NCK），V2.1 在 V1 只读基线上扩展动态 UI / Secret / Browse / Control / 原子事务。
+
+> 测试基础设施：`mesa-test-driver`（`tests/support/test-driver`，Contract/Performance 基线专用，不属于正式设备协议，不出现在生产 discovery）。
 
 ## 快速开始
 

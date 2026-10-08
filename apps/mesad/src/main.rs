@@ -1,12 +1,12 @@
 //! Mesad：Mesa Core 的唯一运行入口（方案 §25）。
 //!
-//! SQLite 配置持久化 + REST CRUD + 开机恢复（配置真值只在 Core）。`sim-001` 仅在空库时作为演示种子
-//! 后续以库为准（配置真值只在 Core）。
+//! SQLite 配置持久化 + REST CRUD + 开机恢复（配置真值只在 Core）。空库不再
+//! seeding 任何演示 endpoint（含历史 `sim-001` test-driver 演示种子，已随
+//! test-driver 退役产品身份删除）；后续以 REST 为准。
 
 use std::sync::Arc;
 
-use mesa_config_store::{ConfigStore, DeviceRecord, EndpointRecord};
-use mesa_core_types::{AcquisitionTask, DriverBinding, GENERIC_BINDING_KIND, TaskSchedule};
+use mesa_config_store::ConfigStore;
 use mesa_driver_manager::StorePointIdSource;
 
 /// 默认 HTTP 端口。仅 loopback 可见（§4.2）。
@@ -37,7 +37,8 @@ async fn main() {
         }
     };
 
-    // 空库时写入演示种子（仅一次，保持开箱可用；后续以 REST 为准）
+    // 空库不再 seeding（test-driver 退役产品身份后，无演示种子；
+    // 后续以 REST 为准）。
     if let Err(e) = maybe_seed_demo(&store) {
         tracing::warn!("seed demo failed: {e}");
     }
@@ -277,56 +278,13 @@ async fn wait_for_interrupt() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// 空库时写入演示种子：device + endpoint + tasks，desired_running=true。
-/// 若库已有任意 endpoint 则不操作。
+/// 空库 seeding 已删除（历史 `sim-001` test-driver 演示种子随退役移除）。
+/// 若库已有任意 endpoint 则不操作；空库直接返回 false，不写任何种子。
 fn maybe_seed_demo(store: &ConfigStore) -> Result<bool, String> {
     let eps = store.list_endpoints().map_err(|e| e.to_string())?;
     if !eps.is_empty() {
         return Ok(false);
     }
-    // 幂等：device 已存在则复用
-    let dev = DeviceRecord {
-        id: "sim-device".into(),
-        name: "Simulator Device".into(),
-    };
-    let _ = store.create_device(&dev);
-    let rec = EndpointRecord {
-        id: "sim-001".into(),
-        name: "Simulator".into(),
-        device_id: "sim-device".into(),
-        driver_id: "simulator".into(),
-        connection_json: "{}".into(),
-        desired_running: true,
-        updated_at_ns: mesa_core_types::now_unix_ns(),
-    };
-    match store.create_endpoint(&rec) {
-        Ok(()) => {}
-        Err(e) if e.to_string().contains("已存在") => return Ok(false),
-        Err(e) => return Err(e.to_string()),
-    }
-    store
-        .replace_tasks("sim-001", &demo_tasks())
-        .map_err(|e| e.to_string())?;
-    tracing::info!("seeded demo endpoint `sim-001` (first run only)");
-    Ok(true)
-}
-
-fn demo_tasks() -> Vec<AcquisitionTask> {
-    // Foundation-2 单路径：seed 直接走 mesa.resources.v1（legacy 已删除）。
-    vec![AcquisitionTask {
-        id: "default".into(),
-        schedule: TaskSchedule::Poll { interval_ms: 200 },
-        binding: DriverBinding {
-            kind: GENERIC_BINDING_KIND.into(),
-            config: serde_json::json!({
-                "selections": [
-                    { "resource_id": "counter", "parameters": {"start": 0, "step": 1}, "outputs": [{ "output": "value", "point_key": "sim.counter" }] },
-                    { "resource_id": "sine", "parameters": {"amplitude": 100, "period_ms": 5000, "offset": 50}, "outputs": [{ "output": "value", "point_key": "sim.sine" }] },
-                    { "resource_id": "toggle", "parameters": {"initial": false}, "outputs": [{ "output": "value", "point_key": "sim.toggle" }] },
-                    { "resource_id": "constant", "parameters": {"value": 42}, "outputs": [{ "output": "value", "point_key": "sim.const" }] },
-                    { "resource_id": "random", "parameters": {"min": -5, "max": 5, "seed": 7}, "outputs": [{ "output": "value", "point_key": "sim.random" }] }
-                ]
-            }),
-        },
-    }]
+    tracing::info!("empty store: no demo seed (test-driver retired from production)");
+    Ok(false)
 }

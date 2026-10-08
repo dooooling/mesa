@@ -34,10 +34,10 @@ describe("groupEndpointsByDevice", () => {
       { id: "a-nck", driver_id: "sinumerik-nck", device_id: "device-a" },
       { id: "a-plc", driver_id: "s7", device_id: "device-a" },
       { id: "a-opc", driver_id: "opcua", device_id: "device-a" },
-      { id: "b-sim", driver_id: "simulator", device_id: "device-b" },
+      { id: "b-s7", driver_id: "s7", device_id: "device-b" },
     ]);
     expect(groups.get("device-a")?.map((e) => e.id)).toEqual(["a-nck", "a-plc", "a-opc"]);
-    expect(groups.get("device-b")?.map((e) => e.id)).toEqual(["b-sim"]);
+    expect(groups.get("device-b")?.map((e) => e.id)).toEqual(["b-s7"]);
   });
 
   it("device_id 缺失的 Endpoint 归入未归属组，不并入任一 Device", () => {
@@ -57,7 +57,7 @@ describe("deviceCounts", () => {
         { id: "a-nck", driver_id: "sinumerik-nck", device_id: "device-a" },
         { id: "a-plc", driver_id: "s7", device_id: "device-a" },
         { id: "a-opc", driver_id: "opcua", device_id: "device-a" },
-        { id: "b-sim", driver_id: "simulator", device_id: "device-b" },
+        { id: "b-focas", driver_id: "focas2", device_id: "device-b" },
       ],
     );
     expect(c).toEqual({ deviceCount: 2, endpointCount: 4 });
@@ -172,13 +172,13 @@ describe("isRunningState", () => {  it("RUNNING/CONNECTING/RECONNECTING 视为�
 describe("resolveEndpointContexts", () => {
   const devices = [
     { id: "device-a", name: "CNC-01" },
-    { id: "device-b", name: "Simulator" },
+    { id: "device-b", name: "Test Bench" },
   ];
   it("endpoint 经 device_id 反查设备名（Device → Endpoint → Point）", () => {
     const ctx = resolveEndpointContexts(
       [
         { id: "a-nck", name: "NCK", device_id: "device-a" },
-        { id: "b-sim", device_id: "device-b" },
+        { id: "b-s7", device_id: "device-b" },
       ],
       devices,
     );
@@ -189,8 +189,8 @@ describe("resolveEndpointContexts", () => {
       deviceName: "CNC-01",
     });
     // endpoint 名缺失回落 id
-    expect(ctx.get("b-sim")?.endpointName).toBe("b-sim");
-    expect(ctx.get("b-sim")?.deviceName).toBe("Simulator");
+    expect(ctx.get("b-s7")?.endpointName).toBe("b-s7");
+    expect(ctx.get("b-s7")?.deviceName).toBe("Test Bench");
   });
 
   it("Device 缺失时回落显示 device_id，不编造归属", () => {

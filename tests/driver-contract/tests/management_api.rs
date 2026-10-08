@@ -8,16 +8,28 @@ use mesa_config_store::ConfigStore;
 use std::sync::Arc;
 use tower::ServiceExt;
 
-async fn app() -> (axum::Router, Arc<mesa_driver_manager::MesaManager>) {
+async fn app() -> (
+    axum::Router,
+    Arc<mesa_driver_manager::MesaManager>,
+    common::StagedDriversDir,
+) {
     app_with_control(false).await
 }
 
 /// 开闸版 app（Foundation-3 Control REST 门禁测试用；audit 落 in-memory store）。
+/// 返回 staged guard——调用方必须持有到测试结束，否则 spawn 时二进制路径失效。
 async fn app_with_control(
     enable_control: bool,
-) -> (axum::Router, Arc<mesa_driver_manager::MesaManager>) {
+) -> (
+    axum::Router,
+    Arc<mesa_driver_manager::MesaManager>,
+    common::StagedDriversDir,
+) {
     let store = Arc::new(ConfigStore::open_in_memory().unwrap());
-    let drivers_dir = common::repo_root().join("drivers");
+    // staged drivers 目录：正式 drivers/ + test-driver（已退役产品身份，
+    // 由测试在 temp dir 组装，不污染正式目录）。
+    let staged = common::staged_drivers_with_test_driver();
+    let drivers_dir = staged.path().clone();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
     let state = mesa_core_api::AppState::try_new_with_control(
         mgr.clone(),
@@ -27,15 +39,15 @@ async fn app_with_control(
     )
     .unwrap();
     let router = mesa_core_api::router(state);
-    (router, mgr)
+    (router, mgr, staged)
 }
 
 #[tokio::test]
 async fn validate_connection_ok_and_field_error() {
-    let (app, _) = app().await;
-    // 正确连接：simulator 空连接（未知字段会被统一校验拒绝）
+    let (app, _, _staged) = app().await;
+    // 正确连接：test-driver 空连接（未知字段会被统一校验拒绝）
     let req = Request::builder()
-        .uri("/api/v1/drivers/simulator/validate-connection")
+        .uri("/api/v1/drivers/test-driver/validate-connection")
         .method("POST")
         .header("content-type", "application/json")
         .body(Body::from(r#"{"connection":{}}"#))
@@ -63,10 +75,10 @@ async fn validate_connection_ok_and_field_error() {
 
 #[tokio::test]
 async fn descriptor_and_unknown_driver() {
-    let (app, _) = app().await;
+    let (app, _, _staged) = app().await;
     // 已知驱动
     let req = Request::builder()
-        .uri("/api/v1/drivers/simulator/descriptor")
+        .uri("/api/v1/drivers/test-driver/descriptor")
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -124,7 +136,7 @@ async fn put_json(app: axum::Router, uri: &str, body: &str) -> (StatusCode, serd
 ///（新 structured target 在开闸前即被总闸拦截，形状不影响本门。）
 #[tokio::test]
 async fn control_plane_disabled_by_default() {
-    let (app, _) = app().await;
+    let (app, _, _staged) = app().await;
     let (s1, v1) = post_json(
         app.clone(),
         "/api/v1/endpoints/nope/write",
@@ -149,14 +161,14 @@ async fn control_plane_disabled_by_default() {
 /// 未声明/非法输入拒绝 + 结果违反 schema 即 DRIVER_CONTRACT_VIOLATION）。
 #[tokio::test]
 async fn control_rest_gates_structured_target_and_single_truth_command() {
-    let (app, mgr) = app_with_control(true).await;
-    // 建 device/endpoint（simulator，Reference Control）
+    let (app, mgr, _staged) = app_with_control(true).await;
+    // 建 device/endpoint（test-driver，Reference Control）
     let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
     assert_eq!(s, StatusCode::CREATED);
     let (s, _) = post_json(
         app.clone(),
         "/api/v1/endpoints",
-        r#"{"id":"e1","name":"E1","device_id":"d1","driver_id":"simulator","connection":{}}"#,
+        r#"{"id":"e1","name":"E1","device_id":"d1","driver_id":"test-driver","connection":{}}"#,
     )
     .await;
     assert_eq!(s, StatusCode::CREATED);
@@ -276,7 +288,8 @@ async fn control_rest_gates_structured_target_and_single_truth_command() {
 async fn control_command_business_failure_is_not_violation() {
     use mesa_core_types::{AcquisitionTask, DriverBinding, GENERIC_BINDING_KIND, TaskSchedule};
     let store = Arc::new(ConfigStore::open_in_memory().unwrap());
-    let drivers_dir = common::repo_root().join("drivers");
+    let _staged = common::staged_drivers_with_test_driver();
+    let drivers_dir = _staged.path().clone();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
     let state = mesa_core_api::AppState::try_new_with_control(
         mgr.clone(),
@@ -296,7 +309,7 @@ async fn control_command_business_failure_is_not_violation() {
             id: "e1".into(),
             name: "E1".into(),
             device_id: "d1".into(),
-            driver_id: "simulator".into(),
+            driver_id: "test-driver".into(),
             connection_json: "{}".into(),
             desired_running: false,
             updated_at_ns: 0,
@@ -319,7 +332,7 @@ async fn control_command_business_failure_is_not_violation() {
     let app = mesa_core_api::router(state);
     mgr.start_endpoint(mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: "e1".into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks: store.list_tasks("e1").unwrap(),
         event_tasks: vec![],
@@ -385,7 +398,8 @@ async fn control_command_business_failure_is_not_violation() {
 async fn control_running_e2e_write_command_visible_in_samples() {
     use mesa_core_types::{AcquisitionTask, DriverBinding, GENERIC_BINDING_KIND, TaskSchedule};
     let store = Arc::new(ConfigStore::open_in_memory().unwrap());
-    let drivers_dir = common::repo_root().join("drivers");
+    let _staged = common::staged_drivers_with_test_driver();
+    let drivers_dir = _staged.path().clone();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
     let state = mesa_core_api::AppState::try_new_with_control(
         mgr.clone(),
@@ -406,7 +420,7 @@ async fn control_running_e2e_write_command_visible_in_samples() {
             id: "e1".into(),
             name: "E1".into(),
             device_id: "d1".into(),
-            driver_id: "simulator".into(),
+            driver_id: "test-driver".into(),
             connection_json: "{}".into(),
             desired_running: false,
             updated_at_ns: 0,
@@ -434,7 +448,7 @@ async fn control_running_e2e_write_command_visible_in_samples() {
     // session 已注册，control 可达）
     mgr.start_endpoint(mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: "e1".into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks: store.list_tasks("e1").unwrap(),
         event_tasks: vec![],
@@ -516,7 +530,8 @@ async fn control_running_e2e_write_command_visible_in_samples() {
 async fn control_running_e2e_broadcast_isolation_and_write_without_acquire() {
     use mesa_core_types::{AcquisitionTask, DriverBinding, GENERIC_BINDING_KIND, TaskSchedule};
     let store = Arc::new(ConfigStore::open_in_memory().unwrap());
-    let drivers_dir = common::repo_root().join("drivers");
+    let _staged = common::staged_drivers_with_test_driver();
+    let drivers_dir = _staged.path().clone();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
     let state = mesa_core_api::AppState::try_new_with_control(
         mgr.clone(),
@@ -536,7 +551,7 @@ async fn control_running_e2e_broadcast_isolation_and_write_without_acquire() {
             id: "e1".into(),
             name: "E1".into(),
             device_id: "d1".into(),
-            driver_id: "simulator".into(),
+            driver_id: "test-driver".into(),
             connection_json: "{}".into(),
             desired_running: false,
             updated_at_ns: 0,
@@ -561,7 +576,7 @@ async fn control_running_e2e_broadcast_isolation_and_write_without_acquire() {
     let app = mesa_core_api::router(state);
     mgr.start_endpoint(mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: "e1".into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks: store.list_tasks("e1").unwrap(),
         event_tasks: vec![],
@@ -660,10 +675,10 @@ async fn control_running_e2e_broadcast_isolation_and_write_without_acquire() {
 
 #[tokio::test]
 async fn probe_does_not_create_endpoint() {
-    let (app, _) = app().await;
-    // probe simulator with dummy connection (simulator always reachable via Fake)
+    let (app, _, _staged) = app().await;
+    // probe test-driver with dummy connection (always reachable via Fake)
     let req = Request::builder()
-        .uri("/api/v1/drivers/simulator/probe")
+        .uri("/api/v1/drivers/test-driver/probe")
         .method("POST")
         .header("content-type", "application/json")
         .body(Body::from(r#"{"connection":{}}"#))
@@ -685,20 +700,20 @@ async fn probe_does_not_create_endpoint() {
 
 /// §8 REST 冻结形状：device/capabilities/warnings（Probe 只返回事实）。
 #[tokio::test]
-async fn probe_simulator_returns_frozen_shape() {
-    let (app, _) = app().await;
+async fn probe_test_driver_returns_frozen_shape() {
+    let (app, _, _staged) = app().await;
     let (status, v) = post_json(
         app,
-        "/api/v1/drivers/simulator/probe",
+        "/api/v1/drivers/test-driver/probe",
         r#"{"connection":{}}"#,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "probe body: {v}");
     assert_eq!(v["reachable"], true, "probe body: {v}");
     assert_eq!(v["device"]["vendor"], "Mesa");
-    assert_eq!(v["device"]["family"], "Simulator");
+    assert_eq!(v["device"]["family"], "TestDriver");
     assert_eq!(v["device"]["model"], "Basic");
-    // P0-1：capabilities 为 CapabilityItem 数组（四态），simulator 为 poll-only
+    // P0-1：capabilities 为 CapabilityItem 数组（四态），test-driver 为 poll-only
     let caps = v["capabilities"].as_array().unwrap();
     let state_of = |id: &str| {
         caps.iter()
@@ -714,7 +729,7 @@ async fn probe_simulator_returns_frozen_shape() {
 
 #[tokio::test]
 async fn probe_unknown_driver_is_404() {
-    let (app, _) = app().await;
+    let (app, _, _staged) = app().await;
     let (status, v) = post_json(app, "/api/v1/drivers/nope/probe", r#"{"connection":{}}"#).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(v["error"]["code"], "NOT_FOUND");
@@ -722,10 +737,10 @@ async fn probe_unknown_driver_is_404() {
 
 #[tokio::test]
 async fn probe_non_object_connection_is_400() {
-    let (app, _) = app().await;
+    let (app, _, _staged) = app().await;
     let (status, v) = post_json(
         app,
-        "/api/v1/drivers/simulator/probe",
+        "/api/v1/drivers/test-driver/probe",
         r#"{"connection":42}"#,
     )
     .await;
@@ -738,14 +753,14 @@ async fn probe_non_object_connection_is_400() {
 /// 不断言时序，只断言并发正确性；临时进程由 probe attempt 单出口回收。
 #[tokio::test]
 async fn probe_concurrent_same_driver_all_succeed() {
-    let (app, _) = app().await;
+    let (app, _, _staged) = app().await;
     let mut handles = Vec::new();
     for _ in 0..8 {
         let app = app.clone();
         handles.push(tokio::spawn(async move {
             post_json(
                 app,
-                "/api/v1/drivers/simulator/probe",
+                "/api/v1/drivers/test-driver/probe",
                 r#"{"connection":{}}"#,
             )
             .await
@@ -761,7 +776,7 @@ async fn probe_concurrent_same_driver_all_succeed() {
 /// JSON 是 object 但驱动配置非法 → 400，code 透出驱动原因码（P1-2 结构化）。
 #[tokio::test]
 async fn probe_invalid_driver_config_is_400_with_driver_code() {
-    let (app, _) = app().await;
+    let (app, _, _staged) = app().await;
     let (status, v) = post_json(
         app,
         "/api/v1/drivers/s7/probe",
@@ -778,14 +793,14 @@ async fn probe_invalid_driver_config_is_400_with_driver_code() {
 /// 合法选择 200；endpoint connection 未知字段创建即 400。
 #[tokio::test]
 async fn task_save_gate_rejects_unknown_resource_and_connection_field() {
-    let (app, _) = app().await;
+    let (app, _, _staged) = app().await;
     let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
     assert_eq!(s, StatusCode::CREATED, "create device");
     // connection 未知字段 → 400（统一校验，未声明即拒绝）
     let (s, v) = post_json(
         app.clone(),
         "/api/v1/endpoints",
-        r#"{"id":"e1","name":"E1","device_id":"d1","driver_id":"simulator","connection":{"seed":1}}"#,
+        r#"{"id":"e1","name":"E1","device_id":"d1","driver_id":"test-driver","connection":{"seed":1}}"#,
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
@@ -797,7 +812,7 @@ async fn task_save_gate_rejects_unknown_resource_and_connection_field() {
         .method("POST")
         .header("content-type", "application/json")
         .body(Body::from(
-            r#"{"id":"e1","device_id":"d1","driver_id":"simulator","connection":{}}"#,
+            r#"{"id":"e1","device_id":"d1","driver_id":"test-driver","connection":{}}"#,
         ))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -811,7 +826,7 @@ async fn task_save_gate_rejects_unknown_resource_and_connection_field() {
     let (s, _) = post_json(
         app.clone(),
         "/api/v1/endpoints",
-        r#"{"id":"e1","name":"  ","device_id":"d1","driver_id":"simulator","connection":{}}"#,
+        r#"{"id":"e1","name":"  ","device_id":"d1","driver_id":"test-driver","connection":{}}"#,
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
@@ -819,7 +834,7 @@ async fn task_save_gate_rejects_unknown_resource_and_connection_field() {
     let (s, _) = post_json(
         app.clone(),
         "/api/v1/endpoints",
-        r#"{"id":"e1","name":"E1","device_id":"d1","driver_id":"simulator","connection":{}}"#,
+        r#"{"id":"e1","name":"E1","device_id":"d1","driver_id":"test-driver","connection":{}}"#,
     )
     .await;
     assert_eq!(s, StatusCode::CREATED, "create endpoint");
@@ -892,14 +907,14 @@ async fn task_save_gate_rejects_unknown_resource_and_connection_field() {
         .unwrap();
     let ep: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(ep["name"], "PLC-1", "get 可见新名: {ep}");
-    assert_eq!(ep["driver_id"], "simulator", "driver 未动: {ep}");
+    assert_eq!(ep["driver_id"], "test-driver", "driver 未动: {ep}");
 }
 
 /// PR4 Secret 正式语义：缺失保留旧值、marker 保留、显式 clear 删除。
 ///（opcua password 为 optional Secret；marker 复用可观测保留/删除。）
 #[tokio::test]
 async fn secret_update_missing_keeps_and_clear_deletes() {
-    let (app, _) = app().await;
+    let (app, _, _staged) = app().await;
     let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
     assert_eq!(s, StatusCode::CREATED);
     let conn = r#"{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":"pw1"}"#;
@@ -951,7 +966,7 @@ async fn secret_update_missing_keeps_and_clear_deletes() {
 /// 设备不可达是 200 + reachable:false（不是 5xx）：s7 连关闭端口。
 #[tokio::test]
 async fn probe_s7_closed_port_is_unreachable_200() {
-    let (app, _) = app().await;
+    let (app, _, _staged) = app().await;
     let (status, v) = post_json(
         app,
         "/api/v1/drivers/s7/probe",

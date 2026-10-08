@@ -25,9 +25,9 @@ function mockFlow(opts: { failAt?: string } = {}) {
     }
     calls.push({ method, url, body });
     if (url === "/api/v1/drivers") {
-      return { ok: true, status: 200, json: async () => ({ drivers: [{ id: "simulator", name: "Simulator" }] }) };
+      return { ok: true, status: 200, json: async () => ({ drivers: [{ id: "s7", name: "Siemens S7" }] }) };
     }
-    if (url === "/api/v1/drivers/simulator/descriptor") {
+    if (url === "/api/v1/drivers/s7/descriptor") {
       return { ok: true, status: 200, json: async () => DESC };
     }
     if (url === "/api/v1/devices" && method === "POST") {

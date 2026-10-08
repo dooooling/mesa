@@ -10,7 +10,7 @@ fn main() {
         Some(arg) => arg
             .parse()
             .unwrap_or_else(|_| panic!("invalid --port value")),
-        None => panic!("usage: Mesa-driver-simulator --port <u16>"),
+        None => panic!("usage: mesa-test-driver --port <u16>"),
     };
 
     // token 必须先于 liveness 守护读取：守护线程会消费 stdin 剩余字节直到 EOF
@@ -39,14 +39,14 @@ fn main() {
         }
 
         if let Err(e) = mesa_driver_sdk::serve(
-            mesa_driver_simulator::SimulatorDriver,
+            mesa_test_driver::TestDriver,
             listener,
             session_token,
             shutdown,
         )
         .await
         {
-            eprintln!("simulator driver exited with error: {e}");
+            eprintln!("test-driver exited with error: {e}");
             std::process::exit(1);
         }
     });

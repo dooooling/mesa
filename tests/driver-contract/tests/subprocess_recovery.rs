@@ -19,19 +19,43 @@ use mesa_driver_manager::session::{HeartbeatParams, Session};
 use mesa_driver_manager::snapshot::Snapshot;
 use tokio_util::sync::CancellationToken;
 
+/// staged test-driver 目录：从已构建 test-driver 二进制拷贝 + canonical
+/// driver.toml（单真值，不手写 version/protocol），供 discovery/launch
+/// 测试（不依赖正式 drivers/ 目录）。
+fn staged_test_driver_dir() -> PathBuf {
+    let exe = common::test_driver_exe();
+    let root = std::env::temp_dir().join(format!(
+        "mesa-test-driver-discover-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let dir = root.join("test-driver");
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = exe.file_name().unwrap().to_string_lossy().to_string();
+    std::fs::copy(&exe, dir.join(&name)).unwrap();
+    std::fs::copy(
+        common::repo_root().join("tests/support/test-driver/driver.toml"),
+        dir.join("driver.toml"),
+    )
+    .unwrap();
+    root
+}
+
 use common::*;
 
-/// Manifest Discovery（§21 行 1）：仓库 drivers/ 目录扫描能发现 simulator，
-/// 字段合法且可启动。
+/// Manifest Discovery（§21 行 1）：staged test-driver 目录能发现 test-driver，
+/// 字段合法且可启动（不再扫描正式 drivers/ 目录——test-driver 已退役产品身份）。
 #[test]
-fn manifest_discovery_finds_simulator() {
-    let root = repo_root().join("drivers");
+fn manifest_discovery_finds_test_driver() {
+    let root = staged_test_driver_dir();
     let found = scan_drivers(&root);
     let sim = found
         .iter()
-        .find(|d| d.manifest.id == "simulator")
-        .expect("simulator must be discovered");
-    assert_eq!(sim.manifest.name, "Mesa Simulator");
+        .find(|d| d.manifest.id == "test-driver")
+        .expect("test-driver must be discovered");
+    assert_eq!(sim.manifest.name, "Mesa Test Driver");
     assert!(
         sim.manifest.version.split('.').count() == 3,
         "version must be x.y.z shaped"
@@ -49,11 +73,11 @@ fn manifest_discovery_finds_simulator() {
 
 /// 手工构造指向已构建二进制的 DiscoveredDriver（跳过目录扫描，聚焦行为本身）。
 fn sim_discovered() -> DiscoveredDriver {
-    let exe = sim_exe();
+    let exe = test_driver_exe();
     DiscoveredDriver {
         manifest: mesa_driver_manager::manifest::DriverManifest {
-            id: "simulator".into(),
-            name: "Mesa Simulator".into(),
+            id: "test-driver".into(),
+            name: "Mesa Test Driver".into(),
             version: "0.0.0".into(), // 测试桩版本，仅用于 Hello 展示
             executable: exe.file_name().unwrap().to_string_lossy().to_string(),
             protocol_major: mesa_driver_protocol::PROTOCOL_MAJOR,
@@ -76,7 +100,7 @@ fn sim_discovered() -> DiscoveredDriver {
 async fn orphan_guard_stdin_eof_exits_child_quickly() {
     let process = mesa_driver_manager::process::DriverProcess::spawn(&sim_discovered())
         .await
-        .expect("spawn simulator");
+        .expect("spawn test-driver");
     let mut process = process;
     let pid = process.pid;
 
@@ -113,7 +137,7 @@ async fn subprocess_token_handshake_paths() {
         .await
         .expect("handshake with injected token");
     let (driver_id, _, _) = session.metadata().await.expect("metadata");
-    assert_eq!(driver_id, "simulator");
+    assert_eq!(driver_id, "test-driver");
     teardown(&mut session, None);
     p.terminate().await;
 }
@@ -139,7 +163,7 @@ async fn driver_crash_restore_via_endpoint_runtime() {
     // 第 3 批后进程退出（interval 40ms ⇒ ~120ms 时崩溃）
     let cfg = BuiltinEndpoint {
         endpoint_id: "ct-crash".into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: r#"{"crash_after_batches":3}"#.into(),
         tasks: vec![poll_task(
             "t",

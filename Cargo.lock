@@ -1324,9 +1324,9 @@ dependencies = [
  "mesa-driver-protocol",
  "mesa-driver-s7",
  "mesa-driver-sdk",
- "mesa-driver-simulator",
  "mesa-driver-sinumerik-nck",
  "mesa-event-store",
+ "mesa-test-driver",
  "rusqlite",
  "serde_json",
  "tokio",
@@ -1481,19 +1481,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mesa-driver-simulator"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "mesa-core-types",
- "mesa-driver-sdk",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "mesa-driver-sinumerik-nck"
 version = "0.3.0"
 dependencies = [
@@ -1556,7 +1543,7 @@ dependencies = [
  "mesa-core-types",
  "mesa-driver-manager",
  "mesa-driver-sdk",
- "mesa-driver-simulator",
+ "mesa-test-driver",
  "serde_json",
  "sysinfo",
  "tempfile",
@@ -1570,6 +1557,19 @@ version = "0.3.0"
 dependencies = [
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mesa-test-driver"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "mesa-core-types",
+ "mesa-driver-sdk",
+ "serde_json",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 

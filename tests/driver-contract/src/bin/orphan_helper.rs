@@ -7,10 +7,10 @@ fn repo_root() -> PathBuf {
         .join("..")
 }
 
-fn sim_exe() -> PathBuf {
+fn test_driver_exe() -> PathBuf {
     let target = repo_root().join("target");
     for profile in ["debug", "release"] {
-        for name in ["mesa-driver-simulator.exe", "mesa-driver-simulator"] {
+        for name in ["mesa-test-driver.exe", "mesa-test-driver"] {
             let p = target.join(profile).join(name);
             if p.is_file() {
                 return p;
@@ -23,11 +23,11 @@ fn sim_exe() -> PathBuf {
 #[tokio::main]
 async fn main() {
     // 发现 simulator（手工构造，避免 scan 依赖）
-    let exe = sim_exe();
+    let exe = test_driver_exe();
     let disc = mesa_driver_manager::manifest::DiscoveredDriver {
         manifest: mesa_driver_manager::manifest::DriverManifest {
-            id: "simulator".into(),
-            name: "Mesa Simulator".into(),
+            id: "test-driver".into(),
+            name: "Mesa Test Driver".into(),
             version: "0.0.0".into(),
             executable: exe.file_name().unwrap().to_string_lossy().to_string(),
             protocol_major: mesa_driver_protocol::PROTOCOL_MAJOR,

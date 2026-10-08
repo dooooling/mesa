@@ -42,6 +42,16 @@ async fn app_with_endpoint(
     driver_id: &str,
     connection: serde_json::Value,
 ) -> (axum::Router, String) {
+    app_with_endpoint_in_dir(&common::repo_root().join("drivers"), driver_id, connection).await
+}
+
+/// 指定 drivers 目录的 endpoint app（test-driver 用 staged 目录；
+/// 正式 drivers/ 不再含 test-driver）。
+async fn app_with_endpoint_in_dir(
+    drivers_dir: &std::path::Path,
+    driver_id: &str,
+    connection: serde_json::Value,
+) -> (axum::Router, String) {
     let store = Arc::new(ConfigStore::open_in_memory().unwrap());
     store
         .create_device(&mesa_config_store::DeviceRecord {
@@ -61,8 +71,7 @@ async fn app_with_endpoint(
             updated_at_ns: 0,
         })
         .unwrap();
-    let drivers_dir = common::repo_root().join("drivers");
-    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(drivers_dir));
     #[allow(deprecated)]
     let state = mesa_core_api::AppState::new(mgr, store, drivers_dir.to_string_lossy().to_string());
     let router = mesa_core_api::router(state);
@@ -119,23 +128,53 @@ async fn browse_opcua_pagination_and_filter() {
 #[tokio::test]
 async fn browse_unsupported_for_s7_and_simulator() {
     let _guard = BROWSE_SERIAL.lock().await;
-    // 防假绿：先证 s7/simulator 确实被发现且可拉起——否则 DRIVER_UNAVAILABLE
-    // 的 503 也会让下面的 503||400 断言通过（CI v3.1 probe 实证）。
+    // 防假绿：s7 必须在正式 drivers/ 可发现；test-driver 走 staged 目录
+    //（已退役产品身份，不再要求正式目录可发现）。
     let drivers_dir = common::repo_root().join("drivers");
     let mgr = mesa_driver_manager::MesaManager::discover(&drivers_dir);
-    for driver in ["s7", "simulator"] {
-        assert!(
-            mgr.find_driver(driver).is_some(),
-            "driver `{driver}` 必须可被发现（否则 503 假绿）"
-        );
-    }
-    for driver in ["s7", "simulator"] {
+    assert!(
+        mgr.find_driver("s7").is_some(),
+        "driver `s7` 必须可被发现（否则 503 假绿）"
+    );
+    assert!(
+        mgr.find_driver("test-driver").is_none(),
+        "test-driver 不得出现在正式 drivers/ discovery"
+    );
+    // staged test-driver：从已构建二进制拷贝 + canonical driver.toml（单真值）。
+    let exe = common::test_driver_exe();
+    let root = std::env::temp_dir().join(format!(
+        "mesa-test-driver-browse-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let dir = root.join("test-driver");
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = exe.file_name().unwrap().to_string_lossy().to_string();
+    std::fs::copy(&exe, dir.join(&name)).unwrap();
+    std::fs::copy(
+        common::repo_root().join("tests/support/test-driver/driver.toml"),
+        dir.join("driver.toml"),
+    )
+    .unwrap();
+    let staged = mesa_driver_manager::MesaManager::discover(&root);
+    assert!(
+        staged.find_driver("test-driver").is_some(),
+        "staged test-driver 必须可被发现"
+    );
+    for driver in ["s7", "test-driver"] {
         let conn = if driver == "s7" {
             serde_json::json!({"host":"127.0.0.1","port":102})
         } else {
             serde_json::json!({})
         };
-        let (app, ep_id) = app_with_endpoint(driver, conn).await;
+        // test-driver 走 staged 目录；s7 走正式 drivers/。
+        let (app, ep_id) = if driver == "test-driver" {
+            app_with_endpoint_in_dir(&root, driver, conn).await
+        } else {
+            app_with_endpoint(driver, conn).await
+        };
         let req = Request::builder()
             .uri(format!("/api/v1/endpoints/{ep_id}/browse"))
             .method("POST")
@@ -143,7 +182,7 @@ async fn browse_unsupported_for_s7_and_simulator() {
             .body(Body::from(r#"{"parent":"","limit":5}"#))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // S7/Simulator 不支持 browse，应返回 503 或 400；且 body 不得是
+        // S7/test-driver 不支持 browse，应返回 503 或 400；且 body 不得是
         // DRIVER_UNAVAILABLE（binary 缺失的假绿出口，前置 find_driver 已先拦一道）。
         assert!(
             resp.status() == StatusCode::SERVICE_UNAVAILABLE
@@ -162,6 +201,7 @@ async fn browse_unsupported_for_s7_and_simulator() {
             );
         }
     }
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[tokio::test]

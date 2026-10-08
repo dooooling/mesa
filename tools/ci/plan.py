@@ -52,6 +52,7 @@ def workspace_packages() -> dict[str, str]:
 # --- 静态路由表（路径前缀 → package；特殊路径单独处理） ---
 
 # runtime-sensitive packages（改动触发 stress）。
+# test-driver 改动同样触发（contract/perf 基线能力）。
 STRESS_PACKAGES = {
     "mesa-core-types",
     "mesa-driver-protocol",
@@ -61,7 +62,7 @@ STRESS_PACKAGES = {
     "mesa-event-store",
     "mesa-core-api",
     "mesad",
-    "mesa-driver-simulator",
+    "mesa-test-driver",
 }
 
 # performance-sensitive packages（改动触发 perf）。
@@ -72,7 +73,7 @@ PERF_PACKAGES = {
     "mesa-driver-manager",
     "mesa-config-store",
     "mesa-core-api",
-    "mesa-driver-simulator",
+    "mesa-test-driver",
     "mesa-performance-tests",
 }
 
@@ -313,14 +314,14 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
 
     # selective build：受影响 packages + 其 rdeps 需要的 bins。
     # driver-only（如 focas2）只构建该驱动与其测试，不全 workspace bins。
-    # contract-tests/mesad 受影响时才需要全 bins（helper + mesad + simulator）。
+    # contract-tests/mesad 受影响时才需要全 bins（helper + mesad + test-driver）。
     if pkgs & {"mesa-contract-tests", "mesad"}:
         build_targets: dict = {"kind": "bins"}
     else:
         build_targets = {"kind": "packages", "packages": sorted(pkgs)}
 
     # contract runtime bins：canonical filter 的 rdeps 若含 mesa-contract-tests，
-    # 则 canonical 必须先补 mesad + simulator + contract --bins。
+    # 则 canonical 必须先补 mesad + test-driver + contract --bins。
     # 不解析 filter 字符串：直接用 workspace dependency graph 求 rdeps 闭包。
     contract_bins = needs_contract_bins(pkgs, packages)
 

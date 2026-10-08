@@ -26,10 +26,10 @@ jobs:
           cache-writer: "false"
           install-nextest: "false"
 
-      # B1：perf 依赖外部 Simulator 二进制（conn_1000/soak/e2e 经 Manager
+      # B1：perf 依赖外部 test-driver 二进制（conn_1000/soak/e2e 经 Manager
       # 启动它）；独立 job 不再有 workspace 全构建，精准前置单包构建。
-      - name: build simulator binary
-        run: cargo build --locked -p mesa-driver-simulator --bin mesa-driver-simulator
+      - name: build test-driver binary
+        run: cargo build --locked -p mesa-test-driver --bin mesa-test-driver
 
       - name: fast performance (PR set, soak_short excluded)
         run: >

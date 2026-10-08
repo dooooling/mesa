@@ -3,7 +3,7 @@
 #
 # selective build（CI v3 第一刀）：planner build_targets 决定构建范围——
 # packages 只构建受影响包（driver-only 不全 workspace bins）；
-# bins 仅 contract-tests/mesad 受影响时用（helper + mesad + simulator）。
+# bins 仅 contract-tests/mesad 受影响时用（helper + mesad + test-driver）。
 # nextest 不执行 doctest，故 doctest 仍全 workspace 另跑。
 # soak（event_soak/event_pressure）归 stress：canonical 默认排除，
 # soak=run 时才追加独立 step（main full / nightly）。
@@ -81,7 +81,7 @@ jobs:
       # 也不漏；false 时不补 bins（防退化成全补）。
       - name: build contract runtime bins
         if: inputs.contract-bins == 'true'
-        run: cargo build --locked -p mesad -p mesa-driver-simulator -p mesa-contract-tests --bins
+        run: cargo build --locked -p mesad -p mesa-test-driver -p mesa-contract-tests --bins
 
       - name: nextest (profile ci, soak excluded)
         run: >
