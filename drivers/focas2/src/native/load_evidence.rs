@@ -1,15 +1,17 @@
 //! 真实机床 load evidence harness（PR C，test-only guarded raw FFI）。
 //!
-//! 口径（冻结）：
+//! 口径（冻结，v2 更新）：
 //! - 本模块 `#[cfg(test)]`，只出 ignored live harness + 无 CNC 纯单测；
 //!   不碰 `pre_ffi_gate`、不恢复 production `cnc_rdspmeter/rdsvmeter`、
-//!   不改 `SpLoad` production layout、不写 load codec、不改 Wire gate/canary、
-//!   coverage 保持 15/17。
+//!   不写 load codec、不改 Wire gate/canary、coverage 保持 15/17。
+//! - v2：`SpLoad`（8B）已证与 FOCAS ABI 不一致并封存；harness 改借
+//!   `OdbSpLoad`（24B/spindle）/`OdbSvLoad`（12B/axis）满足函数指针 ABI，
+//!   并**旁路解析** `LoadElem{data,dec,unit,name,suff1,suff2}`（只落盘证据，
+//!   不进 production 语义；`value = data/10^dec` 不在此冻结，只记录候选）。
 //! - 同一进程/同一 OS thread/同一 `NativeLib`/同一 FOCAS handle 顺序执行整场
 //!   （stream order = RUN order；3-C2 跨流错位教训）。
 //! - raw FFI：`GuardedLoadBuffer`（64B guard + 4096B payload + 64B guard，
-//!   全 sentinel）；只借 `SpLoad*` 满足函数指针 ABI，**不把 payload 解释成
-//!   `SpLoad`**（PR52 暂停原因）；每次必查 guard + tail + num_out。
+//!   全 sentinel）；每次必查 guard + tail + num_out。
 //! - run-id 唯一：`MESA_FOCAS_LOAD_RUN` 三位数字；失败/误操作即本 session 作废，
 //!   下一次必须递增，禁止复用补跑。
 //! - `selector=0/num_in=4` 仅为复现 identity window 的 harness 输入，不冻结语义。
@@ -122,7 +124,8 @@ pub fn check_levels_distinct(l1: f64, l2: f64) -> Result<(), String> {
 /// sentinel（guard/payload 预填；`0xCC`——与 zofs/tofs dumper 同值，
 /// DLL 写范围一目了然，不拿零初始化冒充返回）。
 pub const LOAD_SENTINEL: u8 = 0xCC;
-/// payload 容量（4096B 上界；`SpLoad` 8B 远小于此，越界写入可被 guard 捕获）。
+/// payload 容量（4096B 上界；单 spindle 24B/单 axis 12B 远小于此，
+/// 越界写入可被 guard 捕获）。
 pub const LOAD_PAYLOAD_LEN: usize = 4096;
 /// guard 宽度（前后各 64B）。
 pub const LOAD_GUARD_LEN: usize = 64;
@@ -134,7 +137,8 @@ pub const LOAD_RAW_KEEP: usize = 512;
 pub struct GuardedLoadBuffer {
     /// 前 guard（sentinel；变化即 HOLD）。
     pub pre_guard: [u8; LOAD_GUARD_LEN],
-    /// 真实输出区（sentinel 预填；`SpLoad*` 借此址，不解释为 `SpLoad`）。
+    /// 真实输出区（sentinel 预填；`OdbSpLoad*`/`OdbSvLoad*` 借此址；
+    /// v2 旁路解析见 `decode_load_elems`）。
     pub payload: [u8; LOAD_PAYLOAD_LEN],
     /// 后 guard（sentinel；变化即 HOLD）。
     pub post_guard: [u8; LOAD_GUARD_LEN],
@@ -172,6 +176,76 @@ impl GuardedLoadBuffer {
     }
 }
 
+/// 解码后单个 `LoadElem` 证据（v2 旁路解析；只落盘，不进 production）。
+/// `eng_candidate` 为 `data/10^dec` 候选（dec 越界即 `None`，不冻结换算）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadElemEvidence {
+    /// 在 payload 中的 record 序号（spindle：偶数=load，奇数=speed）。
+    pub slot: usize,
+    pub data: i32,
+    pub dec: i16,
+    pub unit: i16,
+    /// `name` 原始字节（如 b'X'/b'S'；不可打印即原文 hex）。
+    pub name: u8,
+    pub suff1: u8,
+    pub suff2: u8,
+    pub eng_candidate: Option<f64>,
+}
+
+/// 旁路解析 `payload[0..num*stride]` 为 `LoadElem` 数组（v2）。
+/// spindle 用 `stride=24`（`OdbSpLoad`，偶 slot=load、奇 slot=speed）；
+/// servo 用 `stride=12`（`OdbSvLoad`，每 slot 一轴）。
+/// 一律小端读（Windows FOCAS ABI）；`dec` 越界（`<0/>9`）即 `None`，
+/// 不冻结 `value = data/10^dec`。
+pub fn decode_load_elems(
+    payload: &[u8],
+    num_records: usize,
+    stride: usize,
+) -> Vec<LoadElemEvidence> {
+    let mut out = Vec::new();
+    for r in 0..num_records {
+        let base = r * stride;
+        // stride 非 12 倍数即布局未知：整 record 跳过（不猜半个 elem）。
+        if !stride.is_multiple_of(12) {
+            break;
+        }
+        let elems = stride / 12;
+        for e in 0..elems {
+            let off = base + e * 12;
+            if payload.len() < off + 12 {
+                break;
+            }
+            let data = i32::from_le_bytes([
+                payload[off],
+                payload[off + 1],
+                payload[off + 2],
+                payload[off + 3],
+            ]);
+            let dec = i16::from_le_bytes([payload[off + 4], payload[off + 5]]);
+            let unit = i16::from_le_bytes([payload[off + 6], payload[off + 7]]);
+            let name = payload[off + 8];
+            let suff1 = payload[off + 9];
+            let suff2 = payload[off + 10];
+            let eng_candidate = if (0..=9).contains(&dec) {
+                Some(data as f64 / 10f64.powi(dec as i32))
+            } else {
+                None
+            };
+            out.push(LoadElemEvidence {
+                slot: r * elems + e,
+                data,
+                dec,
+                unit,
+                name,
+                suff1,
+                suff2,
+                eng_candidate,
+            });
+        }
+    }
+    out
+}
+
 /// 单窗采样记录（`jsonl_line` 输入；打包防 clippy 超参）。
 /// `panel_ref` 为不解释语义的面板引用（如 servo 轴标识 `"X"`；同 family
 /// 四窗必须同一 ref——跨窗 ref 漂移即 session 作废，不推断 `X↔slot0`）。
@@ -200,12 +274,40 @@ pub struct LoadSample<'a> {
     pub unix_ms: i64,
 }
 
-/// JSONL 行（每 RUN 一行；`handle` 仅证同 session 未换 handle）。
+/// JSONL 行（每 RUN 一行；`handle` 仅证同 session 未换 handle；
+/// v2 追加 `elems` 旁路解析数组）。
 pub fn jsonl_line(s: &LoadSample<'_>) -> String {
     let fam = match s.family {
         LoadFamily::Spindle => "SPINDLE",
         LoadFamily::Servo => "SERVO",
     };
+    // stride：spindle 24（load+speed），servo 12（单轴）。
+    let stride = match s.family {
+        LoadFamily::Spindle => 24,
+        LoadFamily::Servo => 12,
+    };
+    let elems = decode_load_elems(&s.buf.payload, s.num_out.max(0) as usize, stride);
+    let elems_json = elems
+        .iter()
+        .map(|e| {
+            format!(
+                "{{\"slot\":{},\"data\":{},\"dec\":{},\"unit\":{},\
+                 \"name\":{},\"suff1\":{},\"suff2\":{},\"eng_candidate\":{}}}",
+                e.slot,
+                e.data,
+                e.dec,
+                e.unit,
+                e.name,
+                e.suff1,
+                e.suff2,
+                match e.eng_candidate {
+                    Some(v) => format!("{v:?}"),
+                    None => "null".to_string(),
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     // 手工拼 JSONL（单文件 harness，不引入新依赖；panel f64 用 {:?} 保持精度）。
     format!(
         "{{\"run_id\":{run_id:?},\"family\":{fam:?},\"phase\":{phase:?},\
@@ -213,6 +315,7 @@ pub fn jsonl_line(s: &LoadSample<'_>) -> String {
          \"num_in\":{num_in},\"num_out\":{num_out},\"rc\":{rc},\
          \"raw_0_512_hex\":{raw:?},\"pre_guard_ok\":{pre_ok},\
          \"post_guard_ok\":{post_ok},\"tail_after_512_clean\":{tail_ok},\
+         \"elems\":[{elems}],\
          \"unix_ms\":{unix_ms}}}",
         run_id = s.run_id,
         phase = s.phase.tag(),
@@ -226,6 +329,7 @@ pub fn jsonl_line(s: &LoadSample<'_>) -> String {
         pre_ok = s.buf.pre_guard.iter().all(|&b| b == LOAD_SENTINEL),
         post_ok = s.buf.post_guard.iter().all(|&b| b == LOAD_SENTINEL),
         tail_ok = s.buf.tail_clean(),
+        elems = elems_json,
         unix_ms = s.unix_ms,
     )
 }
@@ -352,7 +456,7 @@ impl JsonlWriter {
 /// 禁止继续推 layout；下一次必须新 seq）。
 #[cfg(test)]
 pub fn run_live_harness() {
-    use crate::native::{FocasRet, NativeLib, SpLoad};
+    use crate::native::{FocasRet, NativeLib, OdbSpLoad, OdbSvLoad};
     use std::os::raw::c_ushort;
 
     let seq = std::env::var("MESA_FOCAS_LOAD_RUN")
@@ -425,7 +529,8 @@ pub fn run_live_harness() {
                 check_levels_distinct(*l1, panel)
                     .unwrap_or_else(|er| panic!("RUN={id} {er}（FFI 前预检，不发无效窗）"));
             }
-            // raw FFI（同 handle；selector=0/num_in=4 仅复现 identity window）。
+            // raw FFI（同 handle；selector=0/num_in=4 仅复现 identity window；
+            // v2 按正确 ABI 借址：spindle 24B OdbSpLoad / servo 12B OdbSvLoad）。
             let mut buf = GuardedLoadBuffer::sentinel();
             let mut num: c_short = 4;
             let rc: c_short = unsafe {
@@ -436,7 +541,7 @@ pub fn run_live_harness() {
                             hdl as c_ushort,
                             0 as c_short,
                             &mut num as *mut c_short,
-                            buf.payload.as_mut_ptr().cast::<SpLoad>(),
+                            buf.payload.as_mut_ptr().cast::<OdbSpLoad>(),
                         )
                     }
                     LoadFamily::Servo => {
@@ -444,7 +549,7 @@ pub fn run_live_harness() {
                         sym(
                             hdl as c_ushort,
                             &mut num as *mut c_short,
-                            buf.payload.as_mut_ptr().cast::<SpLoad>(),
+                            buf.payload.as_mut_ptr().cast::<OdbSvLoad>(),
                         )
                     }
                 }
@@ -515,6 +620,61 @@ pub fn run_live_harness() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::{LoadElem, OdbSpLoad, OdbSvLoad};
+
+    /// v2 ABI 尺寸冻结：LoadElem 12B / OdbSvLoad 12B / OdbSpLoad 24B；
+    /// offset 冻结（Windows FOCAS ABI + Pack=4）。
+    #[test]
+    fn load_abi_sizes_locked() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<LoadElem>(), 12);
+        assert_eq!(size_of::<OdbSvLoad>(), 12);
+        assert_eq!(size_of::<OdbSpLoad>(), 24);
+        assert_eq!(offset_of!(LoadElem, data), 0);
+        assert_eq!(offset_of!(LoadElem, dec), 4);
+        assert_eq!(offset_of!(LoadElem, unit), 6);
+        assert_eq!(offset_of!(LoadElem, name), 8);
+        assert_eq!(offset_of!(LoadElem, suff1), 9);
+        assert_eq!(offset_of!(LoadElem, suff2), 10);
+        assert_eq!(offset_of!(LoadElem, reserve), 11);
+    }
+
+    /// v2 旁路解析：spindle 24B record 拆 load+speed；dec 正常即候选。
+    #[test]
+    fn decode_spindle_elems_locked() {
+        let mut payload = vec![0xCCu8; 64];
+        // record0.load：data=2700 LE，dec=2，unit=0，name='S'，suff1='1'。
+        payload[0..4].copy_from_slice(&2700i32.to_le_bytes());
+        payload[4..6].copy_from_slice(&2i16.to_le_bytes());
+        payload[6..8].copy_from_slice(&0i16.to_le_bytes());
+        payload[8] = b'S';
+        payload[9] = b'1';
+        // record0.speed：data=1500，dec=0（同 record 内 +12B）。
+        payload[12..16].copy_from_slice(&1500i32.to_le_bytes());
+        payload[16..18].copy_from_slice(&0i16.to_le_bytes());
+        let elems = decode_load_elems(&payload, 1, 24);
+        assert_eq!(elems.len(), 2);
+        assert_eq!(elems[0].data, 2700);
+        assert_eq!(elems[0].dec, 2);
+        assert_eq!(elems[0].name, b'S');
+        assert_eq!(elems[0].eng_candidate, Some(27.0));
+        assert_eq!(elems[1].slot, 1);
+        assert_eq!(elems[1].data, 1500);
+        assert_eq!(elems[1].eng_candidate, Some(1500.0));
+    }
+
+    /// v2 旁路解析：servo 12B record；dec 越界即 None（不冻结换算）。
+    #[test]
+    fn decode_servo_elems_locked() {
+        let mut payload = vec![0xCCu8; 32];
+        payload[0..4].copy_from_slice(&(-500i32).to_le_bytes());
+        payload[4..6].copy_from_slice(&99i16.to_le_bytes());
+        payload[8] = b'X';
+        let elems = decode_load_elems(&payload, 1, 12);
+        assert_eq!(elems.len(), 1);
+        assert_eq!(elems[0].name, b'X');
+        assert_eq!(elems[0].eng_candidate, None);
+    }
 
     #[test]
     fn family_parser_locked() {
