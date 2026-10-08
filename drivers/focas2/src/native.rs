@@ -1640,61 +1640,11 @@ impl NativeLib {
         }
     }
 
-    /// 读主轴负载：PR52 已暂停（8B `SpLoad` 与 12B LOADELM ABI 不一致，
-    /// 已坐实越界风险）。符号加载保留供 evidence harness 旁路解析；
-    /// production 经 `pre_ffi_gate` 拦截，worker 内不再调用。
-    #[allow(dead_code)]
-    pub fn cnc_rdspmeter(
-        &self,
-        hdl: u16,
-        num: &mut c_short,
-        data: &mut OdbSpLoad,
-    ) -> Result<(), FocasRet> {
-        let sym = self.cnc_rdspmeter.as_ref().ok_or(FocasRet::Noopt)?;
-        let mut n: c_short = 4;
-        let rc = unsafe {
-            sym(
-                hdl as c_ushort,
-                0 as c_short,
-                &mut n as *mut c_short,
-                data as *mut OdbSpLoad,
-            )
-        };
-        let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() {
-            *num = n;
-            Ok(())
-        } else {
-            Err(ret)
-        }
-    }
-
-    /// 读伺服负载：PR52 已暂停（同主轴，`OdbSvLoad` 12B/axis）。
-    /// 符号加载保留供 evidence harness 旁路解析；production 经 gate 拦截。
-    #[allow(dead_code)]
-    pub fn cnc_rdsvmeter(
-        &self,
-        hdl: u16,
-        num: &mut c_short,
-        data: &mut OdbSvLoad,
-    ) -> Result<(), FocasRet> {
-        let sym = self.cnc_rdsvmeter.as_ref().ok_or(FocasRet::Noopt)?;
-        let mut n: c_short = 4;
-        let rc = unsafe {
-            sym(
-                hdl as c_ushort,
-                &mut n as *mut c_short,
-                data as *mut OdbSvLoad,
-            )
-        };
-        let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() {
-            *num = n;
-            Ok(())
-        } else {
-            Err(ret)
-        }
-    }
+    // 读主轴/伺服负载 safe helper 已删除（v2 blocker 真修）：
+    // 旧单-object + `num=4` 写法会让 DLL 最多写 96B/48B 到 24B/12B 缓冲，
+    // 构成不安全 safe API。production 经 `pre_ffi_gate` 拦截不调用；
+    // evidence harness 直接调用 raw `Symbol` + guarded 4096B buffer。
+    // 符号加载（`NativeLib.cnc_rdspmeter/rdsvmeter`）保留供 harness 旁路解析.
 
     /// 读操作信息：`cnc_rdopmsg(hdl, 0, 64, OPMSG)` 64 字节操作提示
     pub fn cnc_rdopmsg(&self, hdl: u16) -> Result<OpMsg, FocasRet> {

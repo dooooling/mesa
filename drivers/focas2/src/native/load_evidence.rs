@@ -622,12 +622,21 @@ mod tests {
     use super::*;
     use crate::native::{LoadElem, OdbSpLoad, OdbSvLoad};
 
-    /// v2 ABI 尺寸冻结：LoadElem 12B / OdbSvLoad 12B / OdbSpLoad 24B。
+    /// v2 ABI 尺寸冻结：LoadElem 12B / OdbSvLoad 12B / OdbSpLoad 24B；
+    /// offset 冻结（Windows FOCAS ABI + Pack=4）。
     #[test]
     fn load_abi_sizes_locked() {
-        assert_eq!(std::mem::size_of::<LoadElem>(), 12);
-        assert_eq!(std::mem::size_of::<OdbSvLoad>(), 12);
-        assert_eq!(std::mem::size_of::<OdbSpLoad>(), 24);
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<LoadElem>(), 12);
+        assert_eq!(size_of::<OdbSvLoad>(), 12);
+        assert_eq!(size_of::<OdbSpLoad>(), 24);
+        assert_eq!(offset_of!(LoadElem, data), 0);
+        assert_eq!(offset_of!(LoadElem, dec), 4);
+        assert_eq!(offset_of!(LoadElem, unit), 6);
+        assert_eq!(offset_of!(LoadElem, name), 8);
+        assert_eq!(offset_of!(LoadElem, suff1), 9);
+        assert_eq!(offset_of!(LoadElem, suff2), 10);
+        assert_eq!(offset_of!(LoadElem, reserve), 11);
     }
 
     /// v2 旁路解析：spindle 24B record 拆 load+speed；dec 正常即候选。
