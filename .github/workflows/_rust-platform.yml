@@ -24,6 +24,11 @@ on:
         required: false
         default: "smoke"
         type: string
+      build-targets:
+        description: "planner build_targets JSON（smoke 叠加受影响驱动 bins）"
+        required: false
+        default: '{"kind":"bins"}'
+        type: string
       soak:
         description: "run 或 skip（长 soak 归属 stress）"
         required: false
@@ -62,10 +67,36 @@ jobs:
           --all-features
           --exclude mesa-performance-tests
 
-      # 必要 binary link：contract smoke 需要 mesad + simulator；
-      # helper bins 随 contract-tests 测试构建自动产出（cargo 按需）。
+      # 必要 binary link（CI v3.1 B+）：discovery 用 MesaManager::discover
+      # 扫描 drivers/*/driver.toml 并 resolve executable——opcua/sinumerik
+      # 缺 binary 即 DRIVER_UNAVAILABLE 真红；s7/sim 缺 binary 则存在 503
+      # 假绿出口（已由 discovery_contract 前置 find_driver + body 断言双拦）。
+      # 固定 runtime prerequisites + 当前 planner 受影响驱动（selective 意图保留，
+      # 不退回全 workspace bins；FOCAS-link 覆盖仍在）。
       - name: build required binaries
-        run: cargo build --locked -p mesad -p mesa-driver-simulator --bins
+        shell: bash
+        env:
+          BUILD_TARGETS: ${{ inputs.build-targets }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, subprocess
+          fixed = ['mesad', 'mesa-driver-simulator', 'mesa-driver-s7',
+                   'mesa-driver-opcua', 'mesa-driver-sinumerik-nck',
+                   'mesa-contract-tests']
+          try:
+              spec = json.loads(os.environ.get('BUILD_TARGETS') or '{}')
+          except Exception:
+              spec = {}
+          extra = []
+          if isinstance(spec, dict) and spec.get('kind') == 'packages':
+              for p in spec.get('packages', []):
+                  if isinstance(p, str) and p and p.startswith('mesa-driver-') and p not in fixed:
+                      extra.append(p)
+          pkgs = fixed + sorted(set(extra) - set(fixed))
+          cmd = ['cargo', 'build', '--locked'] + [x for p in pkgs for x in ('-p', p)] + ['--bins']
+          print('prereq:', ' '.join(cmd))
+          subprocess.run(cmd, check=True)
+          EOF
 
       # PR smoke：只执行 platform-sensitive suites（soak 除外）。
       - name: nextest platform smoke

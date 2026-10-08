@@ -119,6 +119,16 @@ async fn browse_opcua_pagination_and_filter() {
 #[tokio::test]
 async fn browse_unsupported_for_s7_and_simulator() {
     let _guard = BROWSE_SERIAL.lock().await;
+    // 防假绿：先证 s7/simulator 确实被发现且可拉起——否则 DRIVER_UNAVAILABLE
+    // 的 503 也会让下面的 503||400 断言通过（CI v3.1 probe 实证）。
+    let drivers_dir = common::repo_root().join("drivers");
+    let mgr = mesa_driver_manager::MesaManager::discover(&drivers_dir);
+    for driver in ["s7", "simulator"] {
+        assert!(
+            mgr.find_driver(driver).is_some(),
+            "driver `{driver}` 必须可被发现（否则 503 假绿）"
+        );
+    }
     for driver in ["s7", "simulator"] {
         let conn = if driver == "s7" {
             serde_json::json!({"host":"127.0.0.1","port":102})
@@ -133,13 +143,24 @@ async fn browse_unsupported_for_s7_and_simulator() {
             .body(Body::from(r#"{"parent":"","limit":5}"#))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // S7/Simulator 不支持 browse，应返回 503 或 400
+        // S7/Simulator 不支持 browse，应返回 503 或 400；且 body 不得是
+        // DRIVER_UNAVAILABLE（binary 缺失的假绿出口，前置 find_driver 已先拦一道）。
         assert!(
             resp.status() == StatusCode::SERVICE_UNAVAILABLE
                 || resp.status() == StatusCode::BAD_REQUEST,
             "driver {driver} browse should be unsupported, got {}",
             resp.status()
         );
+        if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                !text.contains("DRIVER_UNAVAILABLE"),
+                "driver {driver} browse 503 必须是不支持语义，不得是驱动缺失：{text}"
+            );
+        }
     }
 }
 
