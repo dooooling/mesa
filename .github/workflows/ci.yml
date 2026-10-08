@@ -108,7 +108,6 @@ jobs:
       runs-on: ${{ matrix.runs-on }}
       cache-domain: ${{ matrix.cache-domain }}
       mode: ${{ needs.plan.outputs.platform_mode }}
-      build-targets: ${{ needs.plan.outputs.build_targets }}
       soak: ${{ needs.plan.outputs.platform_soak }}
 
   web:
