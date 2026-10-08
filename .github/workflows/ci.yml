@@ -41,7 +41,10 @@ jobs:
       quality: ${{ steps.route.outputs.quality }}
       canonical: ${{ steps.route.outputs.canonical }}
       canonical_filter: ${{ steps.route.outputs.canonical_filter }}
+      canonical_soak: ${{ steps.route.outputs.canonical_soak }}
       platform_mode: ${{ steps.route.outputs.platform_mode }}
+      platform_soak: ${{ steps.route.outputs.platform_soak }}
+      build_targets: ${{ steps.route.outputs.build_targets }}
       stress: ${{ steps.route.outputs.stress }}
       perf: ${{ steps.route.outputs.perf }}
       web: ${{ steps.route.outputs.web }}
@@ -63,7 +66,10 @@ jobs:
             echo "quality=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["quality"]).lower())')"
             echo "canonical=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["canonical"]).lower())')"
             echo "canonical_filter=$(python3 -c 'import json; print(json.load(open("plan.json"))["canonical_filter"])')"
+            echo "canonical_soak=$(python3 -c 'import json; print(json.load(open("plan.json"))["canonical_soak"])')"
             echo "platform_mode=$(python3 -c 'import json; print(json.load(open("plan.json"))["platform_mode"])')"
+            echo "platform_soak=$(python3 -c 'import json; print(json.load(open("plan.json"))["platform_soak"])')"
+            echo "build_targets=$(python3 -c 'import json; print(json.dumps(json.load(open("plan.json"))["build_targets"]))')"
             echo "stress=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["stress"]).lower())')"
             echo "perf=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["perf"]).lower())')"
             echo "web=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["web"]).lower())')"
@@ -80,6 +86,8 @@ jobs:
     uses: ./.github/workflows/_rust-canonical.yml
     with:
       filter: ${{ needs.plan.outputs.canonical_filter }}
+      build-targets: ${{ needs.plan.outputs.build_targets }}
+      soak: ${{ needs.plan.outputs.canonical_soak }}
 
   rust-platform:
     needs: [plan]
@@ -100,6 +108,8 @@ jobs:
       runs-on: ${{ matrix.runs-on }}
       cache-domain: ${{ matrix.cache-domain }}
       mode: ${{ needs.plan.outputs.platform_mode }}
+      build-targets: ${{ needs.plan.outputs.build_targets }}
+      soak: ${{ needs.plan.outputs.platform_soak }}
 
   web:
     needs: [plan]
@@ -148,8 +158,8 @@ jobs:
               fail.append(f'plan 输出不可解析（{e}）→ FAIL CLOSED')
               print('GATE FAILED: %s' % fail)
               sys.exit(1)
-          if plan.get('plan_version') != 2:
-              fail.append(f"plan_version 必须 2（实际 {plan.get('plan_version')}）")
+          if plan.get('plan_version') != 3:
+              fail.append(f"plan_version 必须 3（实际 {plan.get('plan_version')}）")
           def need(job, want_run, want_skip=False):
               r = n.get(job, {}).get('result')
               if want_run and r != 'success':

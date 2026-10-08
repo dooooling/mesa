@@ -3,16 +3,24 @@
 
 输入：变更文件列表（git diff --name-only），输出 JSON 计划：
 {
-  "plan_version": 2,
+  "plan_version": 3,
   "quality": true,            # rust-quality（fmt/clippy）
   "canonical": true,          # rust-canonical（Linux x64 完整语义）
   "canonical_filter": ...,    # nextest filterset：all() 或 rdeps(=pkg) 联合
+  "canonical_soak": "skip",   # run / skip（长 soak 归属 stress）
   "platform_mode": "smoke",   # skip / smoke / full
+  "platform_soak": "skip",    # run / skip（main full 才跑长 soak）
+  "build_targets": ...,       # selective cargo 构建目标（见下）
   "stress": false,            # rust-stress
   "perf": false,              # rust-perf
   "web": true,                # web build/test
   "reason": "...",            # 人类可读路由原因
 }
+
+build_targets（selective compile，CI v3）：
+- {"kind": "bins"}：cargo build --workspace --bins（FULL/未知影响用）
+- {"kind": "packages", "packages": [...]}：cargo build -p ...（driver-only 用）
+- {"kind": "none"}：不单独构建（docs-only/web-only 用）
 
 fail-closed：任何无法识别的非文档路径 → FULL；空 diff → FULL；
 diff 失败 → FULL。
@@ -23,7 +31,7 @@ import os
 import sys
 import tomllib
 
-PLAN_VERSION = 2
+PLAN_VERSION = 3
 
 # --- workspace members（从 Cargo.toml 自动发现，不手写） ---
 
@@ -118,7 +126,10 @@ def full_plan(reason: str) -> dict:
         "quality": True,
         "canonical": True,
         "canonical_filter": "all()",
+        "canonical_soak": "run",
         "platform_mode": "full",
+        "platform_soak": "run",
+        "build_targets": {"kind": "bins"},
         "stress": True,
         "perf": True,
         "web": True,
@@ -133,7 +144,10 @@ def empty_plan(reason: str) -> dict:
         "quality": False,
         "canonical": False,
         "canonical_filter": "none()",
+        "canonical_soak": "skip",
         "platform_mode": "skip",
+        "platform_soak": "skip",
+        "build_targets": {"kind": "none"},
         "stress": False,
         "perf": False,
         "web": False,
@@ -155,7 +169,10 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
             "quality": False,
             "canonical": False,
             "canonical_filter": "none()",
+            "canonical_soak": "skip",
             "platform_mode": "skip",
+            "platform_soak": "skip",
+            "build_targets": {"kind": "none"},
             "stress": False,
             "perf": False,
             "web": True,
@@ -207,12 +224,23 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
 
     perf = bool(pkgs & PERF_PACKAGES)
 
+    # selective build：受影响 packages + 其 rdeps 需要的 bins。
+    # driver-only（如 focas2）只构建该驱动与其测试，不全 workspace bins。
+    # contract-tests/mesad 受影响时才需要全 bins（helper + mesad + simulator）。
+    if pkgs & {"mesa-contract-tests", "mesad"}:
+        build_targets: dict = {"kind": "bins"}
+    else:
+        build_targets = {"kind": "packages", "packages": sorted(pkgs)}
+
     plan = {
         "plan_version": PLAN_VERSION,
         "quality": True,
         "canonical": True,
         "canonical_filter": filt,
+        "canonical_soak": "skip",
         "platform_mode": "smoke",
+        "platform_soak": "skip",
+        "build_targets": build_targets,
         "stress": stress,
         "perf": perf,
         "web": True,
@@ -222,14 +250,9 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
         not is_docs_only(p) and not (p == "apps/mesa-web/" or p.startswith("apps/mesa-web/"))
         for p in files
     ):
-        # main Rust/code change → 全集成安全网。
-        if plan["canonical"] or plan["platform_mode"] != "skip" or stress or perf:
-            plan["canonical_filter"] = "all()"
-            plan["platform_mode"] = "full"
-            plan["stress"] = True
-            plan["perf"] = True
-            plan["web"] = True
-            plan["reason"] += "; main push → FULL integration"
+        # main Rust/code change → 选择性集成（CI v3：不再无脑 FULL）。
+        # main 跑 planner 同一计划（selective），FULL 只放 nightly/manual。
+        pass
     return plan
 
 

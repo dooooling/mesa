@@ -1,9 +1,12 @@
-# Rust Canonical（Linux x64，语义正确性主平台）：bins 构建 + nextest
-# deterministic 全量（planner filter）+ doctest。
+# Rust Canonical（Linux x64，语义正确性主平台）：selective 构建 + nextest
+# deterministic（planner filter，soak 除外）+ doctest。
 #
-# bins 构建暂不能删：contract tests 依赖 target/debug/mesad、
-# mesa-driver-simulator、orphan_helper/hang_helper（缺失会静默降覆盖）。
-# nextest 不执行 doctest，故另跑 cargo test --doc。
+# selective build（CI v3 第一刀）：planner build_targets 决定构建范围——
+# packages 只构建受影响包（driver-only 不全 workspace bins）；
+# bins 仅 contract-tests/mesad 受影响时用（helper + mesad + simulator）。
+# nextest 不执行 doctest，故 doctest 仍全 workspace 另跑。
+# soak（event_soak/event_pressure）归 stress：canonical 默认排除，
+# soak=run 时才追加独立 step（main full / nightly）。
 name: rust-canonical
 on:
   workflow_call:
@@ -12,6 +15,16 @@ on:
         description: "nextest filterset（all() 或 rdeps 联合）"
         required: false
         default: "all()"
+        type: string
+      build-targets:
+        description: "planner build_targets JSON（bins 或 packages）"
+        required: false
+        default: '{"kind":"bins"}'
+        type: string
+      soak:
+        description: "run 或 skip（长 soak 归属 stress）"
+        required: false
+        default: "skip"
         type: string
 
 permissions:
@@ -35,10 +48,27 @@ jobs:
           cache-writer: "true"
           install-nextest: "true"
 
-      - name: build workspace bins
-        run: cargo build --locked --workspace --bins
+      # selective bins：packages 只构建受影响包；bins 全 workspace。
+      - name: build targets
+        env:
+          BUILD_TARGETS: ${{ inputs.build-targets }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, subprocess, sys
+          spec = json.loads(os.environ['BUILD_TARGETS'])
+          if spec.get('kind') == 'packages':
+              pkgs = spec.get('packages', [])
+              if not pkgs:
+                  print('no packages → skip bins build')
+                  sys.exit(0)
+              cmd = ['cargo', 'build', '--locked', '--all-features'] + [x for p in pkgs for x in ('-p', p)]
+          else:
+              cmd = ['cargo', 'build', '--locked', '--workspace', '--bins']
+          print('build:', ' '.join(cmd))
+          subprocess.run(cmd, check=True)
+          EOF
 
-      - name: nextest (profile ci)
+      - name: nextest (profile ci, soak excluded)
         run: >
           cargo nextest run
           --locked
@@ -46,7 +76,20 @@ jobs:
           --all-features
           --exclude mesa-performance-tests
           --profile ci
-          -E "${{ inputs.filter }}"
+          -E "(${{
+            inputs.filter
+          }}) and (not (package(=mesa-contract-tests) and (binary(=event_soak) or binary(=event_pressure))))"
+
+      # soak 独占 step：默认 skip；run 时才执行（main full / nightly）。
+      - name: nextest soak (stress-owned)
+        if: inputs.soak == 'run'
+        run: >
+          cargo nextest run
+          --locked
+          -p mesa-contract-tests
+          --all-features
+          --profile ci
+          -E 'package(=mesa-contract-tests) and (binary(=event_soak) or binary(=event_pressure))'
 
       - name: doctest
         run: >
