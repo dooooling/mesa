@@ -47,7 +47,7 @@ pub fn repo_root() -> PathBuf {
 /// **不会**重编 test-driver 的 bin。子进程类测试前若改过驱动代码，
 /// 必须先 `cargo build -p mesa-test-driver`（或 `--workspace`），
 /// 否则拉起的是旧二进制、故障注入不生效。
-pub fn sim_exe() -> PathBuf {
+pub fn test_driver_exe() -> PathBuf {
     find_built_binary("mesa-test-driver")
 }
 
@@ -106,19 +106,17 @@ pub fn staged_drivers_with_test_driver() -> StagedDriversDir {
             link_built_exe(&src, &dir);
         }
     }
-    let exe = sim_exe();
+    let exe = test_driver_exe();
     let dir = root.join("test-driver");
     std::fs::create_dir_all(&dir).unwrap();
     let name = exe.file_name().unwrap().to_string_lossy().to_string();
     std::fs::copy(&exe, dir.join(&name)).unwrap();
-    std::fs::write(
-        dir.join("driver.toml"),
-        "id=\"test-driver\"\nname=\"Mesa Test Driver\"\nversion=\"0.1.0\"\nexecutable=\""
-            .to_string()
-            + &name
-            + "\"\nprotocol_major=1\nprotocol_minor=2\n",
-    )
-    .unwrap();
+    // 单真值：直接复制 canonical manifest（tests/support/test-driver/driver.toml），
+    // 不手写 version/protocol——可执行文件名与 canonical 一致（mesa-test-driver），
+    // resolve_executable 原生支持（Windows 下 .exe 兜底）。
+    let canonical = std::fs::read(repo_root().join("tests/support/test-driver/driver.toml"))
+        .expect("canonical test-driver driver.toml must exist");
+    std::fs::write(dir.join("driver.toml"), canonical).unwrap();
     StagedDriversDir(root)
 }
 
@@ -137,12 +135,19 @@ fn link_built_exe(src_manifest_dir: &std::path::Path, staged_dir: &std::path::Pa
     }
     let target = repo_root().join("target");
     for profile in ["debug", "release"] {
-        let mut cands = vec![
-            target.join(profile).join(&exe_base),
-            target.join(profile).join(format!("{exe_base}.exe")),
-        ];
-        #[cfg(windows)]
-        cands.reverse();
+        // Windows 必须优先 .exe（无扩展名 Unix 产物在 Windows 下不可执行）；
+        // cfg! 运行时分支保证两平台都不产生 unused_mut。
+        let cands = if cfg!(windows) {
+            vec![
+                target.join(profile).join(format!("{exe_base}.exe")),
+                target.join(profile).join(&exe_base),
+            ]
+        } else {
+            vec![
+                target.join(profile).join(&exe_base),
+                target.join(profile).join(format!("{exe_base}.exe")),
+            ]
+        };
         for cand in cands {
             if cand.is_file() {
                 let name = cand.file_name().unwrap();

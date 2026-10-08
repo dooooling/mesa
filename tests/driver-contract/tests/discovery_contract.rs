@@ -140,8 +140,8 @@ async fn browse_unsupported_for_s7_and_simulator() {
         mgr.find_driver("test-driver").is_none(),
         "test-driver 不得出现在正式 drivers/ discovery"
     );
-    // staged test-driver：从已构建二进制拷贝 + driver.toml（与 recovery 同模式）。
-    let exe = common::sim_exe();
+    // staged test-driver：从已构建二进制拷贝 + canonical driver.toml（单真值）。
+    let exe = common::test_driver_exe();
     let root = std::env::temp_dir().join(format!(
         "mesa-test-driver-browse-{}",
         std::time::SystemTime::now()
@@ -153,12 +153,9 @@ async fn browse_unsupported_for_s7_and_simulator() {
     std::fs::create_dir_all(&dir).unwrap();
     let name = exe.file_name().unwrap().to_string_lossy().to_string();
     std::fs::copy(&exe, dir.join(&name)).unwrap();
-    std::fs::write(
+    std::fs::copy(
+        common::repo_root().join("tests/support/test-driver/driver.toml"),
         dir.join("driver.toml"),
-        format!(
-            "id=\"test-driver\"\nname=\"Mesa Test Driver\"\nversion=\"0.1.0\"\nexecutable=\"{name}\"\nprotocol_major={}\nprotocol_minor=2\n",
-            mesa_driver_protocol::PROTOCOL_MAJOR
-        ),
     )
     .unwrap();
     let staged = mesa_driver_manager::MesaManager::discover(&root);
@@ -185,7 +182,7 @@ async fn browse_unsupported_for_s7_and_simulator() {
             .body(Body::from(r#"{"parent":"","limit":5}"#))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // S7/Simulator 不支持 browse，应返回 503 或 400；且 body 不得是
+        // S7/test-driver 不支持 browse，应返回 503 或 400；且 body 不得是
         // DRIVER_UNAVAILABLE（binary 缺失的假绿出口，前置 find_driver 已先拦一道）。
         assert!(
             resp.status() == StatusCode::SERVICE_UNAVAILABLE

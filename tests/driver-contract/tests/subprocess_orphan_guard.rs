@@ -15,16 +15,16 @@ use mesa_driver_manager::manifest::DiscoveredDriver;
 use mesa_driver_manager::process::TERMINATE_GRACE;
 use mesa_driver_manager::session::Session;
 
-use common::{assert_handshake_error, repo_root, sim_exe};
+use common::{assert_handshake_error, repo_root, test_driver_exe};
 use mesa_driver_manager::MesaManager;
 use mesa_driver_manager::probe::ProbeError;
 
 fn sim_discovered() -> DiscoveredDriver {
-    let exe = sim_exe();
+    let exe = test_driver_exe();
     DiscoveredDriver {
         manifest: mesa_driver_manager::manifest::DriverManifest {
             id: "test-driver".into(),
-            name: "Mesa Simulator".into(),
+            name: "Mesa Test Driver".into(),
             version: "0.0.0".into(),
             executable: exe.file_name().unwrap().to_string_lossy().to_string(),
             protocol_major: mesa_driver_protocol::PROTOCOL_MAJOR,
@@ -325,14 +325,23 @@ fn stage_drivers_dir(tag: &str, src_exe: &Path, unique_base: &str) -> (PathBuf, 
     if let Ok(d) = std::fs::File::open(&dir) {
         let _ = d.sync_all();
     }
-    std::fs::write(
-        dir.join("driver.toml"),
-        format!(
-            "id=\"test-driver\"\nname=\"Mesa Test Driver\"\nversion=\"0.1.0\"\nexecutable=\"{unique_base}\"\nprotocol_major={}\nprotocol_minor=2\n",
-            mesa_driver_protocol::PROTOCOL_MAJOR
-        ),
-    )
-    .unwrap();
+    // 单真值：canonical manifest 仅替换 executable 为本次唯一名
+    //（version/protocol 与仓库 canonical 一致，不手写）。
+    let canonical =
+        std::fs::read_to_string(repo_root().join("tests/support/test-driver/driver.toml")).unwrap();
+    let patched = canonical
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("executable") {
+                format!("executable = \"{unique_base}\"")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(dir.join("driver.toml"), patched).unwrap();
     (root, unique_base.to_string())
 }
 
@@ -355,7 +364,7 @@ fn cleanup_dir(root: &Path) {
 
 #[tokio::test]
 async fn manager_probe_success_reports_facts_and_cleans_child() {
-    let (root, unique) = stage_drivers_dir("ok", &sim_exe(), "pb-sim-guard");
+    let (root, unique) = stage_drivers_dir("ok", &test_driver_exe(), "pb-sim-guard");
     let before = live_pids(&exe_name(&unique));
     let mgr = MesaManager::discover(&root);
     let res = mgr.probe("test-driver", "{}").await.expect("probe ok");
@@ -367,7 +376,7 @@ async fn manager_probe_success_reports_facts_and_cleans_child() {
 
 #[tokio::test]
 async fn manager_probe_bad_config_fails_and_cleans_child() {
-    let (root, unique) = stage_drivers_dir("bad", &sim_exe(), "pb-sim-guard");
+    let (root, unique) = stage_drivers_dir("bad", &test_driver_exe(), "pb-sim-guard");
     let before = live_pids(&exe_name(&unique));
     let mgr = MesaManager::discover(&root);
     let err = mgr

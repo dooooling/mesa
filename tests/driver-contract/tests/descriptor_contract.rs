@@ -1026,8 +1026,9 @@ fn driver_version_identity_toml_metadata_package_agree() {
 
 #[tokio::test]
 async fn manager_lazy_load_descriptor_via_temp_process() {
-    // staged test-driver（与 subprocess_recovery 同理，不扫正式 drivers/）。
-    let exe = common::sim_exe();
+    // staged test-driver（与 subprocess_recovery 同理，不扫正式 drivers/；
+    // manifest 用 canonical 单真值）。
+    let exe = common::test_driver_exe();
     let root = std::env::temp_dir().join(format!(
         "mesa-test-driver-lazy-{}",
         std::time::SystemTime::now()
@@ -1039,12 +1040,9 @@ async fn manager_lazy_load_descriptor_via_temp_process() {
     std::fs::create_dir_all(&dir).unwrap();
     let name = exe.file_name().unwrap().to_string_lossy().to_string();
     std::fs::copy(&exe, dir.join(&name)).unwrap();
-    std::fs::write(
+    std::fs::copy(
+        common::repo_root().join("tests/support/test-driver/driver.toml"),
         dir.join("driver.toml"),
-        format!(
-            "id=\"test-driver\"\nname=\"Mesa Test Driver\"\nversion=\"0.1.0\"\nexecutable=\"{name}\"\nprotocol_major={}\nprotocol_minor=2\n",
-            mesa_driver_protocol::PROTOCOL_MAJOR
-        ),
     )
     .unwrap();
     let mgr = std::sync::Arc::new(mesa_driver_manager::MesaManager::discover(&root));

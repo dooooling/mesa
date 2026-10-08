@@ -71,7 +71,9 @@ jobs:
       # MesaManager::discover 扫描 drivers/*/driver.toml 并 resolve executable——
       # opcua/sinumerik 缺 binary 即 DRIVER_UNAVAILABLE 真红；s7 缺 binary 则
       # 存在 503 假绿出口（已由 discovery_contract 前置 find_driver + body 断言双拦）。
-      # test-driver 由 contract-tests 按测试依赖构建，不再作为生产 discovery 前置。
+      # mesa-test-driver 是 test-only runtime prerequisite（contract smoke 拉起
+      # 真实 test-driver 子进程必需；cargo 只构建其 lib，不产出 executable）——
+      # 不恢复其产品身份（不在 drivers/、不被生产 discover、不进 UI）。
       # 固定 runtime prerequisites + 当前 planner 受影响驱动（selective 意图保留，
       # 不退回全 workspace bins；FOCAS-link 覆盖仍在）。
       - name: build required binaries
@@ -81,7 +83,8 @@ jobs:
         run: |
           python3 - <<'EOF'
           import json, os, subprocess
-          fixed = ['mesad', 'mesa-driver-s7',
+          fixed = ['mesad', 'mesa-test-driver',
+                   'mesa-driver-s7',
                    'mesa-driver-opcua', 'mesa-driver-sinumerik-nck',
                    'mesa-contract-tests']
           try:

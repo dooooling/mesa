@@ -76,11 +76,11 @@ fn staged_drivers_with_test_driver() -> PerfStagedDir {
     std::fs::create_dir_all(&dir).unwrap();
     let name = exe.file_name().unwrap().to_string_lossy().to_string();
     std::fs::copy(&exe, dir.join(&name)).unwrap();
-    std::fs::write(
+    // 单真值：复制 canonical manifest（tests/support/test-driver/driver.toml）。
+    std::fs::copy(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../support/test-driver/driver.toml"),
         dir.join("driver.toml"),
-        format!(
-            "id=\"test-driver\"\nname=\"Mesa Test Driver\"\nversion=\"0.1.0\"\nexecutable=\"{name}\"\nprotocol_major=1\nprotocol_minor=2\n"
-        ),
     )
     .unwrap();
     PerfStagedDir(root)
