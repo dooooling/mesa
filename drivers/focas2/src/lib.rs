@@ -153,8 +153,8 @@ fn resolve_generic_point(
             )
         }
         ("servo", "load") => {
-            // 当前产品能力 1..4：`SpLoad.data[4]` 只有 4 项，超 4 不得
-            // clamp 读 data[3] 冒充（Blocker 1：配 5 读 4 即假 GOOD）。
+            // 当前产品能力 1..4（v2：servo 每轴 12B `OdbSvLoad`，定标中）：
+            // 超 4 不得 clamp 读旧项冒充（Blocker 1：配 5 读 4 即假 GOOD）。
             let axis = int_param(
                 "axis",
                 true,
@@ -506,7 +506,7 @@ impl Driver for FocasDriver {
                     modes: vec![mesa_core_types::TaskMode::Poll],
                 },
                 ResourceDescriptor {
-                    // 当前产品能力 1..4（`SpLoad.data[4]` 只有 4 项）。
+                    // 当前产品能力 1..4（v2：`OdbSvLoad` 12B/axis 定标中）。
                     id: "servo".into(),
                     label: LocalizedText::new("Servo"),
                     parameters: SchemaDescriptor {

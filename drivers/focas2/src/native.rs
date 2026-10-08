@@ -83,8 +83,8 @@ const FOCAS_MAX_SPINDLE: u8 = 4;
 /// Descriptor 当前产品能力上限（Resouece Model Cleanup fail-closed）：
 /// - axis 1..8：`cnc_absolute` 一次读 8 轴（`FOCAS_AXIS_BATCH`），超 8 轴
 ///   Native 直接 `Err(Param)`，Descriptor 不暴露不可执行的能力；
-/// - servo 1..4：`cnc_rdsvmeter` 数据结构只有 4 项（`SpLoad.data[4]`），
-///   超 4 即使配了也不得 clamp 读 `data[3]` 冒充。
+/// - servo 1..4：v2 每轴 12B `OdbSvLoad`（定标中），超 4 即使配了也不得
+///   clamp 冒充旧项。
 pub(crate) const FOCAS_AXIS_PRODUCT_MAX: u8 = 8;
 pub(crate) const FOCAS_SERVO_PRODUCT_MAX: u8 = 4;
 /// FFI `c_short` 可表示上限：macro/tool/param/diagnosis/pmc 等 `number/addr`
@@ -373,10 +373,61 @@ pub struct OdbPrgNum {
 }
 
 /// `cnc_rdspmeter/cnc_rdsvmeter` 主轴/伺服负载 `fwlib.cs:6200`
+/// PR52 暂停原因已坐实：公开 FOCAS ABI 的基本单元是 12B `LOADELM`，
+/// 不是 8B `SpLoad`——旧 `SpLoad.data[c_short;4]` 与 ABI 不一致，不得再用。
+/// 本 struct 仅作历史封存（`#[deprecated]`），production 不得引用。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+#[deprecated(note = "ABI 错误：真实单元是 12B LoadElem；见 LoadElem/OdbSvLoad/OdbSpLoad")]
 pub struct SpLoad {
     pub data: [c_short; 4], // 4 主轴/伺服负载 %
+}
+
+/// `cnc_rdspmeter/cnc_rdsvmeter` 基本负载单元 `LOADELM`（公开 FOCAS ABI）。
+///
+/// ```c
+/// typedef struct loadelm {
+///     long  data;    // load value（engineering 换算需结合 dec，见 evidence）
+///     short dec;     // decimal-point position（小数点位置）
+///     short unit;    // unit code
+///     char  name;    // axis/spindle name（如 'X'/'S'）
+///     char  suff1;   // name suffix 1（如轴号 '1'）
+///     char  suff2;   // name suffix 2
+///     char  reserve; // reserved
+/// } LOADELM;
+/// ```
+///
+/// Windows FOCAS ABI：`long`=4B + `short`×2=4B + `char`×4=4B = **12B**；
+/// 公开 C# FWLIB 定义 `Pack=4`，`data` 为 32-bit `int`（非 `short`）。
+/// packing 按 FWLIB ABI 最终确认前，evidence harness 只做 size 断言 +
+/// 旁路字段解析，不进 production。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct LoadElem {
+    pub data: c_int,   // 4B：load raw value
+    pub dec: c_short,  // 2B：小数点位置
+    pub unit: c_short, // 2B：单位码
+    pub name: u8,      // 1B：轴/主轴名（如 b'X'/b'S'）
+    pub suff1: u8,     // 1B：后缀 1
+    pub suff2: u8,     // 1B：后缀 2
+    pub reserve: u8,   // 1B：保留
+}
+
+/// servo 单轴负载 `ODBSVLOAD`：每轴一个 `LOADELM`（12B/axis）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OdbSvLoad {
+    pub svload: LoadElem,
+}
+
+/// spindle 单主轴负载 `ODBSPLOAD`：每主轴两个 `LOADELM`
+///（24B/spindle = 12B load + 12B speed）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OdbSpLoad {
+    pub spload: LoadElem,  // load
+    pub spspeed: LoadElem, // motor speed
 }
 
 /// `cnc_rdopmsg` 操作信息 `OPMSG`（`fwlib.cs:3300`）
@@ -607,8 +658,8 @@ type FnCncActs2 = unsafe extern "C" fn(c_ushort, c_short, *mut OdbActs) -> c_sho
 type FnRdAlmMsg = unsafe extern "C" fn(c_ushort, c_short, *mut c_short, *mut OdbAlmMsg) -> c_short;
 type FnDiagnoss = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OdbDiag) -> c_short;
 type FnRdPrgNum = unsafe extern "C" fn(c_ushort, *mut OdbPrgNum) -> c_short;
-type FnRdSpMeter = unsafe extern "C" fn(c_ushort, c_short, *mut c_short, *mut SpLoad) -> c_short;
-type FnRdSvMeter = unsafe extern "C" fn(c_ushort, *mut c_short, *mut SpLoad) -> c_short;
+type FnRdSpMeter = unsafe extern "C" fn(c_ushort, c_short, *mut c_short, *mut OdbSpLoad) -> c_short;
+type FnRdSvMeter = unsafe extern "C" fn(c_ushort, *mut c_short, *mut OdbSvLoad) -> c_short;
 type FnRdOpMsg = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OpMsg) -> c_short;
 type FnRdSpGear = unsafe extern "C" fn(c_ushort, c_ushort, *mut c_short) -> c_short;
 type FnRdSpMaxRpm = unsafe extern "C" fn(c_ushort, c_ushort, *mut c_short) -> c_short;
@@ -1589,14 +1640,15 @@ impl NativeLib {
         }
     }
 
-    /// 读主轴负载：PR52 已暂停（8B `SpLoad` 疑越界：每单元约 12B，
-    /// 复合约 24B）。保留符号加载，但 worker 内不再调用；旧实现见 git 历史。
+    /// 读主轴负载：PR52 已暂停（8B `SpLoad` 与 12B LOADELM ABI 不一致，
+    /// 已坐实越界风险）。符号加载保留供 evidence harness 旁路解析；
+    /// production 经 `pre_ffi_gate` 拦截，worker 内不再调用。
     #[allow(dead_code)]
     pub fn cnc_rdspmeter(
         &self,
         hdl: u16,
         num: &mut c_short,
-        data: &mut SpLoad,
+        data: &mut OdbSpLoad,
     ) -> Result<(), FocasRet> {
         let sym = self.cnc_rdspmeter.as_ref().ok_or(FocasRet::Noopt)?;
         let mut n: c_short = 4;
@@ -1605,7 +1657,7 @@ impl NativeLib {
                 hdl as c_ushort,
                 0 as c_short,
                 &mut n as *mut c_short,
-                data as *mut SpLoad,
+                data as *mut OdbSpLoad,
             )
         };
         let ret = FocasRet::from_raw(rc);
@@ -1617,18 +1669,24 @@ impl NativeLib {
         }
     }
 
-    /// 读伺服负载：PR52 已暂停（同主轴，缓冲区结构未闭合）。
-    /// 保留符号加载，但 worker 内不再调用；旧实现见 git 历史。
+    /// 读伺服负载：PR52 已暂停（同主轴，`OdbSvLoad` 12B/axis）。
+    /// 符号加载保留供 evidence harness 旁路解析；production 经 gate 拦截。
     #[allow(dead_code)]
     pub fn cnc_rdsvmeter(
         &self,
         hdl: u16,
         num: &mut c_short,
-        data: &mut SpLoad,
+        data: &mut OdbSvLoad,
     ) -> Result<(), FocasRet> {
         let sym = self.cnc_rdsvmeter.as_ref().ok_or(FocasRet::Noopt)?;
         let mut n: c_short = 4;
-        let rc = unsafe { sym(hdl as c_ushort, &mut n as *mut c_short, data as *mut SpLoad) };
+        let rc = unsafe {
+            sym(
+                hdl as c_ushort,
+                &mut n as *mut c_short,
+                data as *mut OdbSvLoad,
+            )
+        };
         let ret = FocasRet::from_raw(rc);
         if ret.is_ok() {
             *num = n;

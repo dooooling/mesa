@@ -823,7 +823,8 @@ impl NativeFocasApi {
     /// worker 内单点读（旧 `read_one_blocking` 迁移 + PR52 fail-closed）。
     /// PR52 范围冻结：以下 FFI 在 ABI/结构闭合前**不调用**（直接
     /// `EW_NOOPT` 单点 BAD；PR52 只保证不执行危险调用，不证明 ABI）：
-    /// `cnc_rdspmeter`（8B `SpLoad` 疑越界）/ `cnc_rdsvmeter`（同前）/
+    /// `cnc_rdspmeter`/`cnc_rdsvmeter`（旧 8B `SpLoad` 已证与 12B LOADELM
+    /// ABI 不一致并封存；v2 evidence-only `OdbSpLoad`24B/`OdbSvLoad`12B 定标中）/
     /// `cnc_rdspgear` / `cnc_rdspmaxrpm`（输出疑为 `+4` 结构）/
     /// `cnc_diagnoss`（签名疑 5 参）/ `cnc_rdalmmsg`（64B 疑不足）。
     /// 其余可信路径（sysinfo/statinfo/rddynamic2/absolute/acts/macro/
