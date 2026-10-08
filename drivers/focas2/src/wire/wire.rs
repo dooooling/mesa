@@ -431,8 +431,7 @@ pub struct ParamValue {
 }
 
 /// FOCAS `opmsg_value`（`0x34`）typed 结果。opmsg Evidence PASS。
-/// 极简 typed（`raw 268B + header 12B opaque + text String`；header 字段
-/// `[4..8]=4/[8..12]=15` 候选不命名、不依赖——`text_len` 推测留后续窗口）。
+/// 极简 typed（CI smoke probe2：纯注释改动，无语义变更）。
 /// 产品固定 `type=4`（Mesa `opmsg/value` = FANUC #3006，不暴露 type 参数；
 /// `type=0..3` 空 / `type=5` Remote 只留 evidence/test；`0xD0` 不动）。
 #[derive(Debug, Clone, PartialEq, Eq)]
