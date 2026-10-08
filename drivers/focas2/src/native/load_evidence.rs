@@ -178,6 +178,9 @@ impl GuardedLoadBuffer {
 
 /// 解码后单个 `LoadElem` 证据（v2 旁路解析；只落盘，不进 production）。
 /// `eng_candidate` 为 `data/10^dec` 候选（dec 越界即 `None`，不冻结换算）。
+/// `written`：该 slot 是否被本次 selector `type` 选中写入（P1 review：
+/// `type=0` 只保证 load 侧，speed 槽可能 sentinel——读 JSONL 时不得把
+/// `written=false` 当 DLL 有效输出）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadElemEvidence {
     /// 在 payload 中的 record 序号（spindle：偶数=load，奇数=speed）。
@@ -190,17 +193,22 @@ pub struct LoadElemEvidence {
     pub suff1: u8,
     pub suff2: u8,
     pub eng_candidate: Option<f64>,
+    pub written: bool,
 }
 
 /// 旁路解析 `payload[0..num*stride]` 为 `LoadElem` 数组（v2）。
 /// spindle 用 `stride=24`（`OdbSpLoad`，偶 slot=load、奇 slot=speed）；
 /// servo 用 `stride=12`（`OdbSvLoad`，每 slot 一轴）。
-/// 一律小端读（Windows FOCAS ABI）；`dec` 越界（`<0/>9`）即 `None`，
-/// 不冻结 `value = data/10^dec`。
+/// `selector_type`：harness 本次 `cnc_rdspmeter` 的 `type`（0=load / 1=speed /
+/// -1=all；servo harness 传 -1 即全写）。`written` 判定：
+/// spindle `type=0` 仅偶 slot 有效，`type=1` 仅奇 slot 有效，`-1` 全有效；
+/// servo 全有效。一律小端读（Windows FOCAS ABI）；`dec` 越界（`<0/>9`）
+/// 即 `None`，不冻结 `value = data/10^dec`。
 pub fn decode_load_elems(
     payload: &[u8],
     num_records: usize,
     stride: usize,
+    selector_type: i16,
 ) -> Vec<LoadElemEvidence> {
     let mut out = Vec::new();
     for r in 0..num_records {
@@ -231,6 +239,16 @@ pub fn decode_load_elems(
             } else {
                 None
             };
+            // written：spindle 按 type 区分 load/speed 侧；servo 全写。
+            let written = if stride == 24 {
+                match selector_type {
+                    0 => e % 2 == 0,
+                    1 => e % 2 == 1,
+                    _ => true,
+                }
+            } else {
+                true
+            };
             out.push(LoadElemEvidence {
                 slot: r * elems + e,
                 data,
@@ -240,6 +258,7 @@ pub fn decode_load_elems(
                 suff1,
                 suff2,
                 eng_candidate,
+                written,
             });
         }
     }
@@ -282,17 +301,24 @@ pub fn jsonl_line(s: &LoadSample<'_>) -> String {
         LoadFamily::Servo => "SERVO",
     };
     // stride：spindle 24（load+speed），servo 12（单轴）。
-    let stride = match s.family {
-        LoadFamily::Spindle => 24,
-        LoadFamily::Servo => 12,
+    // selector：当前 harness spindle 恒 type=0（只保证 load 侧），servo 传 -1。
+    let (stride, selector_type) = match s.family {
+        LoadFamily::Spindle => (24, 0),
+        LoadFamily::Servo => (12, -1),
     };
-    let elems = decode_load_elems(&s.buf.payload, s.num_out.max(0) as usize, stride);
+    let elems = decode_load_elems(
+        &s.buf.payload,
+        s.num_out.max(0) as usize,
+        stride,
+        selector_type,
+    );
     let elems_json = elems
         .iter()
         .map(|e| {
             format!(
                 "{{\"slot\":{},\"data\":{},\"dec\":{},\"unit\":{},\
-                 \"name\":{},\"suff1\":{},\"suff2\":{},\"eng_candidate\":{}}}",
+                 \"name\":{},\"suff1\":{},\"suff2\":{},\"eng_candidate\":{},\
+                 \"written\":{}}}",
                 e.slot,
                 e.data,
                 e.dec,
@@ -304,6 +330,7 @@ pub fn jsonl_line(s: &LoadSample<'_>) -> String {
                     Some(v) => format!("{v:?}"),
                     None => "null".to_string(),
                 },
+                e.written,
             )
         })
         .collect::<Vec<_>>()
@@ -652,7 +679,7 @@ mod tests {
         // record0.speed：data=1500，dec=0（同 record 内 +12B）。
         payload[12..16].copy_from_slice(&1500i32.to_le_bytes());
         payload[16..18].copy_from_slice(&0i16.to_le_bytes());
-        let elems = decode_load_elems(&payload, 1, 24);
+        let elems = decode_load_elems(&payload, 1, 24, 0);
         assert_eq!(elems.len(), 2);
         assert_eq!(elems[0].data, 2700);
         assert_eq!(elems[0].dec, 2);
@@ -661,6 +688,23 @@ mod tests {
         assert_eq!(elems[1].slot, 1);
         assert_eq!(elems[1].data, 1500);
         assert_eq!(elems[1].eng_candidate, Some(1500.0));
+        // P1：harness 本次 type=0 → speed 槽 written=false（sentinel 伪记录禁当输出）。
+        assert!(elems[0].written);
+        assert!(!elems[1].written);
+    }
+
+    /// P1 written 语义：type=1 仅奇 slot；-1 全写；servo 全写。
+    #[test]
+    fn decode_written_flags_locked() {
+        let payload = vec![0u8; 48];
+        let t0 = decode_load_elems(&payload, 1, 24, 0);
+        assert_eq!([t0[0].written, t0[1].written], [true, false]);
+        let t1 = decode_load_elems(&payload, 1, 24, 1);
+        assert_eq!([t1[0].written, t1[1].written], [false, true]);
+        let ta = decode_load_elems(&payload, 1, 24, -1);
+        assert_eq!([ta[0].written, ta[1].written], [true, true]);
+        let sv = decode_load_elems(&payload, 2, 12, -1);
+        assert!(sv.iter().all(|e| e.written));
     }
 
     /// v2 旁路解析：servo 12B record；dec 越界即 None（不冻结换算）。
@@ -670,7 +714,7 @@ mod tests {
         payload[0..4].copy_from_slice(&(-500i32).to_le_bytes());
         payload[4..6].copy_from_slice(&99i16.to_le_bytes());
         payload[8] = b'X';
-        let elems = decode_load_elems(&payload, 1, 12);
+        let elems = decode_load_elems(&payload, 1, 12, -1);
         assert_eq!(elems.len(), 1);
         assert_eq!(elems[0].name, b'X');
         assert_eq!(elems[0].eng_candidate, None);
