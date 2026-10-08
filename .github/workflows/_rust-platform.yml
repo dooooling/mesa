@@ -24,11 +24,6 @@ on:
         required: false
         default: "smoke"
         type: string
-      build-targets:
-        description: "planner build_targets JSON（smoke 下 selective 用）"
-        required: false
-        default: '{"kind":"bins"}'
-        type: string
       soak:
         description: "run 或 skip（长 soak 归属 stress）"
         required: false
@@ -56,9 +51,16 @@ jobs:
           cache-writer: "true"
           install-nextest: "true"
 
-      # 全 workspace 类型/条件编译正确（check，不 link 全量）。
+      # 全 workspace 类型/条件编译正确（check，不 link 全量；
+      # performance-tests 与旧行为一致，继续 exclude）。
       - name: check workspace
-        run: cargo check --locked --workspace --all-targets --all-features
+        run: >
+          cargo check
+          --locked
+          --workspace
+          --all-targets
+          --all-features
+          --exclude mesa-performance-tests
 
       # 必要 binary link：contract smoke 需要 mesad + simulator；
       # helper bins 随 contract-tests 测试构建自动产出（cargo 按需）。

@@ -186,6 +186,33 @@ jobs:
               need('rust-platform', True)
           else:
               fail.append(f'platform_mode 未知（{mode!r}）→ FAIL CLOSED')
+          # CI v3 新 schema：soak/build_targets 全校验（BLOCKER 真修）。
+          # soak 非 run/skip 即 fail；reusable 内 if==run 会静默跳过，
+          # gate 必须先拦，否则 "oops" 也能 GATE OK。
+          for key in ('canonical_soak', 'platform_soak'):
+              v = plan.get(key)
+              if v not in ('run', 'skip'):
+                  fail.append(f'{key} 必须 run/skip（实际 {v!r}）→ FAIL CLOSED')
+          bt = plan.get('build_targets')
+          if not isinstance(bt, dict):
+              fail.append(f'build_targets 必须 object（实际 {bt!r}）→ FAIL CLOSED')
+          else:
+              kind = bt.get('kind')
+              if kind not in ('none', 'bins', 'packages'):
+                  fail.append(f'build_targets.kind 非法（{kind!r}）→ FAIL CLOSED')
+              elif kind == 'packages':
+                  pkgs = bt.get('packages')
+                  if (not isinstance(pkgs, list) or not pkgs
+                          or any(not isinstance(p, str) or not p for p in pkgs)
+                          or len(set(pkgs)) != len(pkgs)):
+                      fail.append(f'build_targets.packages 必须非空唯一 string[]（实际 {pkgs!r}）→ FAIL CLOSED')
+          # 关系约束：false/skip 侧的附属字段必须无意义值。
+          if plan.get('canonical') is False and plan.get('canonical_soak') != 'skip':
+              fail.append('canonical=false 时 canonical_soak 必须 skip → FAIL CLOSED')
+          if plan.get('platform_mode') == 'skip' and plan.get('platform_soak') != 'skip':
+              fail.append('platform skip 时 platform_soak 必须 skip → FAIL CLOSED')
+          if plan.get('canonical') is True and isinstance(bt, dict) and bt.get('kind') == 'none':
+              fail.append('canonical=true 时 build_targets 不能 none → FAIL CLOSED')
           print('GATE FAILED: %s' % fail if fail else 'GATE OK')
           sys.exit(1 if fail else 0)
           EOF

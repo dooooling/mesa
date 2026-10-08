@@ -152,6 +152,12 @@ def main():
     check("soak skip by default", p["canonical_soak"] == "skip"
           and p["platform_soak"] == "skip", p)
 
+    # v3 gate schema：soak/build_targets 非法即后续 gate 可判（planner 自测锁形状）。
+    p = plan_for_files(["drivers/focas2/src/x.rs"], pkgs())
+    check("v3 schema kinds", p["build_targets"]["kind"] in ("none", "bins", "packages")
+          and p["canonical_soak"] in ("run", "skip")
+          and p["platform_soak"] in ("run", "skip"), p)
+
     # 18/18 workspace member 均 package 可发现（planner 自动认识）。
     check("members>=18", len(pkgs()) >= 18, str(len(pkgs())))
 
