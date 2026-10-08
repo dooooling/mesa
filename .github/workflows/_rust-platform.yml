@@ -74,6 +74,7 @@ jobs:
       # 固定 runtime prerequisites + 当前 planner 受影响驱动（selective 意图保留，
       # 不退回全 workspace bins；FOCAS-link 覆盖仍在）。
       - name: build required binaries
+        shell: bash
         env:
           BUILD_TARGETS: ${{ inputs.build-targets }}
         run: |
