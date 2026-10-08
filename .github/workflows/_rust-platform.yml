@@ -1,8 +1,12 @@
 # Rust Platform（Linux ARM / Win x64 / Win ARM）：跨平台编译保证 + smoke。
 #
-# PR smoke mode：全 workspace compile/link（bins + --no-run 全 targets）+
-# platform-sensitive suites（nextest ci-platform）。
-# main full mode：同编译 + nextest ci-platform 全量（不做 filterset 裁剪）。
+# CI v3 瘦身：
+# - smoke（PR）：cargo check 全 workspace（类型/条件编译正确）+
+#   必要 binary link（contract smoke 真正需要的 bins）+
+#   platform-sensitive suites（nextest ci-platform，soak 除外）。
+#   不再全 workspace bins + 全 targets --no-run。
+# - full（main）：check 全 workspace + bins 全 link + ci-platform 全量
+#   （soak 除外；soak 归 stress）。
 # 平台无关逻辑不重复全量——由 Linux canonical 覆盖。
 name: rust-platform
 on:
@@ -19,6 +23,11 @@ on:
         description: "smoke（PR）或 full（main）"
         required: false
         default: "smoke"
+        type: string
+      soak:
+        description: "run 或 skip（长 soak 归属 stress）"
+        required: false
+        default: "skip"
         type: string
 
 permissions:
@@ -42,19 +51,23 @@ jobs:
           cache-writer: "true"
           install-nextest: "true"
 
-      - name: build workspace bins
-        run: cargo build --locked --workspace --bins
-
-      - name: compile all test targets (link coverage)
+      # 全 workspace 类型/条件编译正确（check，不 link 全量；
+      # performance-tests 与旧行为一致，继续 exclude）。
+      - name: check workspace
         run: >
-          cargo test
+          cargo check
           --locked
           --workspace
+          --all-targets
           --all-features
           --exclude mesa-performance-tests
-          --no-run
 
-      # PR smoke：只执行 platform-sensitive suites。
+      # 必要 binary link：contract smoke 需要 mesad + simulator；
+      # helper bins 随 contract-tests 测试构建自动产出（cargo 按需）。
+      - name: build required binaries
+        run: cargo build --locked -p mesad -p mesa-driver-simulator --bins
+
+      # PR smoke：只执行 platform-sensitive suites（soak 除外）。
       - name: nextest platform smoke
         if: inputs.mode == 'smoke'
         run: >
@@ -63,10 +76,14 @@ jobs:
           -p mesa-contract-tests
           --all-features
           --profile ci-platform
-          -E 'package(=mesa-contract-tests) & (binary(=smoke) | binary(=protocol_negotiation) | binary(=fault_tolerance) | binary(=discovery_contract) | binary(=session_lifecycle) | binary(=stop_lifecycle) | binary(=subprocess_orphan_guard) | binary(=subprocess_recovery) | binary(=mesad_restart))'
+          -E 'package(=mesa-contract-tests) and (binary(=smoke) or binary(=protocol_negotiation) or binary(=fault_tolerance) or binary(=discovery_contract) or binary(=session_lifecycle) or binary(=stop_lifecycle) or binary(=subprocess_orphan_guard) or binary(=subprocess_recovery) or binary(=mesad_restart)) and (not (binary(=event_soak) or binary(=event_pressure)))'
 
-      # main full：ci-platform 全量（不裁剪）。
-      - name: nextest platform full
+      # main full：bins 全 link + ci-platform 全量（soak 除外；soak 归 stress）。
+      - name: build all bins (full only)
+        if: inputs.mode != 'smoke'
+        run: cargo build --locked --workspace --bins
+
+      - name: nextest platform full (soak excluded)
         if: inputs.mode != 'smoke'
         run: >
           cargo nextest run
@@ -75,6 +92,18 @@ jobs:
           --all-features
           --exclude mesa-performance-tests
           --profile ci-platform
+          -E 'not (package(=mesa-contract-tests) and (binary(=event_soak) or binary(=event_pressure)))'
+
+      # soak 独占 step：默认 skip；run 时才执行（main full / nightly）。
+      - name: nextest soak (stress-owned)
+        if: inputs.soak == 'run'
+        run: >
+          cargo nextest run
+          --locked
+          -p mesa-contract-tests
+          --all-features
+          --profile ci-platform
+          -E 'package(=mesa-contract-tests) and (binary(=event_soak) or binary(=event_pressure))'
 
       - name: sccache stats
         if: always()

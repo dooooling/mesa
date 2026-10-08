@@ -41,7 +41,11 @@ jobs:
       quality: ${{ steps.route.outputs.quality }}
       canonical: ${{ steps.route.outputs.canonical }}
       canonical_filter: ${{ steps.route.outputs.canonical_filter }}
+      canonical_soak: ${{ steps.route.outputs.canonical_soak }}
+      canonical_contract_bins: ${{ steps.route.outputs.canonical_contract_bins }}
       platform_mode: ${{ steps.route.outputs.platform_mode }}
+      platform_soak: ${{ steps.route.outputs.platform_soak }}
+      build_targets: ${{ steps.route.outputs.build_targets }}
       stress: ${{ steps.route.outputs.stress }}
       perf: ${{ steps.route.outputs.perf }}
       web: ${{ steps.route.outputs.web }}
@@ -63,7 +67,11 @@ jobs:
             echo "quality=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["quality"]).lower())')"
             echo "canonical=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["canonical"]).lower())')"
             echo "canonical_filter=$(python3 -c 'import json; print(json.load(open("plan.json"))["canonical_filter"])')"
+            echo "canonical_soak=$(python3 -c 'import json; print(json.load(open("plan.json"))["canonical_soak"])')"
+            echo "canonical_contract_bins=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["canonical_contract_bins"]).lower())')"
             echo "platform_mode=$(python3 -c 'import json; print(json.load(open("plan.json"))["platform_mode"])')"
+            echo "platform_soak=$(python3 -c 'import json; print(json.load(open("plan.json"))["platform_soak"])')"
+            echo "build_targets=$(python3 -c 'import json; print(json.dumps(json.load(open("plan.json"))["build_targets"]))')"
             echo "stress=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["stress"]).lower())')"
             echo "perf=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["perf"]).lower())')"
             echo "web=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["web"]).lower())')"
@@ -80,6 +88,9 @@ jobs:
     uses: ./.github/workflows/_rust-canonical.yml
     with:
       filter: ${{ needs.plan.outputs.canonical_filter }}
+      build-targets: ${{ needs.plan.outputs.build_targets }}
+      contract-bins: ${{ needs.plan.outputs.canonical_contract_bins }}
+      soak: ${{ needs.plan.outputs.canonical_soak }}
 
   rust-platform:
     needs: [plan]
@@ -100,6 +111,7 @@ jobs:
       runs-on: ${{ matrix.runs-on }}
       cache-domain: ${{ matrix.cache-domain }}
       mode: ${{ needs.plan.outputs.platform_mode }}
+      soak: ${{ needs.plan.outputs.platform_soak }}
 
   web:
     needs: [plan]
@@ -148,8 +160,8 @@ jobs:
               fail.append(f'plan 输出不可解析（{e}）→ FAIL CLOSED')
               print('GATE FAILED: %s' % fail)
               sys.exit(1)
-          if plan.get('plan_version') != 2:
-              fail.append(f"plan_version 必须 2（实际 {plan.get('plan_version')}）")
+          if plan.get('plan_version') != 3:
+              fail.append(f"plan_version 必须 3（实际 {plan.get('plan_version')}）")
           def need(job, want_run, want_skip=False):
               r = n.get(job, {}).get('result')
               if want_run and r != 'success':
@@ -176,6 +188,37 @@ jobs:
               need('rust-platform', True)
           else:
               fail.append(f'platform_mode 未知（{mode!r}）→ FAIL CLOSED')
+          # CI v3 新 schema：soak/build_targets/contract_bins 全校验（BLOCKER 真修）。
+          # soak 非 run/skip 即 fail；contract_bins 非 bool 即 fail。
+          for key in ('canonical_soak', 'platform_soak'):
+              v = plan.get(key)
+              if v not in ('run', 'skip'):
+                  fail.append(f'{key} 必须 run/skip（实际 {v!r}）→ FAIL CLOSED')
+          v = plan.get('canonical_contract_bins')
+          if not isinstance(v, bool):
+              fail.append(f'canonical_contract_bins 必须 bool（实际 {v!r}）→ FAIL CLOSED')
+          bt = plan.get('build_targets')
+          if not isinstance(bt, dict):
+              fail.append(f'build_targets 必须 object（实际 {bt!r}）→ FAIL CLOSED')
+          else:
+              kind = bt.get('kind')
+              if kind not in ('none', 'bins', 'packages'):
+                  fail.append(f'build_targets.kind 非法（{kind!r}）→ FAIL CLOSED')
+              elif kind == 'packages':
+                  pkgs = bt.get('packages')
+                  if (not isinstance(pkgs, list) or not pkgs
+                          or any(not isinstance(p, str) or not p for p in pkgs)
+                          or len(set(pkgs)) != len(pkgs)):
+                      fail.append(f'build_targets.packages 必须非空唯一 string[]（实际 {pkgs!r}）→ FAIL CLOSED')
+          # 关系约束：false/skip 侧的附属字段必须无意义值。
+          if plan.get('canonical') is False and plan.get('canonical_soak') != 'skip':
+              fail.append('canonical=false 时 canonical_soak 必须 skip → FAIL CLOSED')
+          if plan.get('canonical') is False and plan.get('canonical_contract_bins') is not False:
+              fail.append('canonical=false 时 canonical_contract_bins 必须 false → FAIL CLOSED')
+          if plan.get('platform_mode') == 'skip' and plan.get('platform_soak') != 'skip':
+              fail.append('platform skip 时 platform_soak 必须 skip → FAIL CLOSED')
+          if plan.get('canonical') is True and isinstance(bt, dict) and bt.get('kind') == 'none':
+              fail.append('canonical=true 时 build_targets 不能 none → FAIL CLOSED')
           print('GATE FAILED: %s' % fail if fail else 'GATE OK')
           sys.exit(1 if fail else 0)
           EOF

@@ -31,14 +31,16 @@ def pkgs():
 
 
 def main():
-    # plan_version 冻结。
-    check("plan_version==2", plan.PLAN_VERSION == 2)
+    # plan_version 冻结（CI v3 → 3）。
+    check("plan_version==3", plan.PLAN_VERSION == 3)
 
     # docs-only → all skip。
     p = plan_for_files(["docs/a.md", "drivers/focas2/docs/x.md"], pkgs())
     check("docs-only skip", p["quality"] is False and p["canonical"] is False
           and p["platform_mode"] == "skip" and p["stress"] is False
-          and p["perf"] is False and p["web"] is False, p)
+          and p["perf"] is False and p["web"] is False
+          and p["build_targets"] == {"kind": "none"}
+          and p["canonical_soak"] == "skip" and p["platform_soak"] == "skip", p)
 
     # .gitignore → all skip。
     p = plan_for_files([".gitignore"], pkgs())
@@ -49,13 +51,13 @@ def main():
     check("web-only", p["web"] is True and p["canonical"] is False
           and p["platform_mode"] == "skip" and p["stress"] is False, p)
 
-    # focas2 source → rdeps(focas2), smoke, no stress/perf, web true。
+    # focas2 source → rdeps(focas2), smoke, no stress/perf, no web（CI v3）。
     p = plan_for_files(["drivers/focas2/src/wire/codec.rs"], pkgs())
     check("focas2 filter", p["canonical_filter"] == "rdeps(=mesa-driver-focas2)", p)
     check("focas2 smoke", p["platform_mode"] == "smoke", p)
     check("focas2 no stress", p["stress"] is False, p)
     check("focas2 no perf", p["perf"] is False, p)
-    check("focas2 web", p["web"] is True, p)
+    check("focas2 web", p["web"] is False, p)
 
     # driver-manager → canonical+platform+stress+perf。
     p = plan_for_files(["crates/driver-manager/src/x.rs"], pkgs())
@@ -125,11 +127,47 @@ def main():
     check("multi union", p["canonical_filter"]
           == "rdeps(=mesa-driver-focas2) | rdeps(=mesa-driver-s7)", p)
 
-    # main Rust push → FULL integration。
+    # main Rust push → 选择性集成（CI v3：不再无脑 FULL；FULL 只放 nightly）。
     p = plan_for_files(["drivers/focas2/src/x.rs"], pkgs(), is_main=True)
-    check("main FULL", p["canonical_filter"] == "all()"
-          and p["platform_mode"] == "full" and p["stress"] is True
-          and p["perf"] is True, p)
+    check("main selective", p["canonical_filter"] == "rdeps(=mesa-driver-focas2)"
+          and p["platform_mode"] == "smoke" and p["stress"] is False
+          and p["perf"] is False, p)
+
+    # FOCAS-only：filter + selective build + contract bins（graph 判定）。
+    p = plan_for_files(["drivers/focas2/src/x.rs"], pkgs())
+    check("focas2 filter", p["canonical_filter"] == "rdeps(=mesa-driver-focas2)", p)
+    check("focas2 selective build", p["build_targets"]
+          == {"kind": "packages", "packages": ["mesa-driver-focas2"]}, p)
+    check("focas2 contract bins", p["canonical_contract_bins"] is True, p)
+    # Rust-only 不带 web（CI v3：web 仅 apps/mesa-web 受影响才跑）。
+    check("focas2 no web", p["web"] is False, p)
+
+    # 反例（graph 级）：mesa-nck-emulator 的 rdeps 不含 contract-tests
+    # → bins=false（防退化成“所有 canonical 都补 bins”；经 SPECIAL_PACKAGES
+    # 映射的 tools/nck-emulator 路径因含 contract-tests 而为 true，不冲突）。
+    check("nck-emulator no contract bins",
+          plan.needs_contract_bins({"mesa-nck-emulator"}, pkgs()) is False,
+          plan.rdeps_closure({"mesa-nck-emulator"}))
+
+    # driver-manager 不牵连 contract-tests/mesad → selective packages。
+    p = plan_for_files(["crates/driver-manager/src/x.rs"], pkgs())
+    check("manager selective build", p["build_targets"]
+          == {"kind": "packages", "packages": ["mesa-driver-manager"]}, p)
+
+    # contract-tests 受影响 → 全 bins（helper/mesad/sim 需要）。
+    p = plan_for_files(["tests/driver-contract/tests/smoke.rs"], pkgs())
+    check("contract bins build", p["build_targets"] == {"kind": "bins"}, p)
+
+    # soak 默认归 stress（CI v3 第三刀；canonical/platform 默认 skip）。
+    p = plan_for_files(["drivers/focas2/src/x.rs"], pkgs())
+    check("soak skip by default", p["canonical_soak"] == "skip"
+          and p["platform_soak"] == "skip", p)
+
+    # v3 gate schema：soak/build_targets 非法即后续 gate 可判（planner 自测锁形状）。
+    p = plan_for_files(["drivers/focas2/src/x.rs"], pkgs())
+    check("v3 schema kinds", p["build_targets"]["kind"] in ("none", "bins", "packages")
+          and p["canonical_soak"] in ("run", "skip")
+          and p["platform_soak"] in ("run", "skip"), p)
 
     # 18/18 workspace member 均 package 可发现（planner 自动认识）。
     check("members>=18", len(pkgs()) >= 18, str(len(pkgs())))

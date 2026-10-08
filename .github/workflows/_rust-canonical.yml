@@ -1,9 +1,12 @@
-# Rust Canonical（Linux x64，语义正确性主平台）：bins 构建 + nextest
-# deterministic 全量（planner filter）+ doctest。
+# Rust Canonical（Linux x64，语义正确性主平台）：selective 构建 + nextest
+# deterministic（planner filter，soak 除外）+ doctest。
 #
-# bins 构建暂不能删：contract tests 依赖 target/debug/mesad、
-# mesa-driver-simulator、orphan_helper/hang_helper（缺失会静默降覆盖）。
-# nextest 不执行 doctest，故另跑 cargo test --doc。
+# selective build（CI v3 第一刀）：planner build_targets 决定构建范围——
+# packages 只构建受影响包（driver-only 不全 workspace bins）；
+# bins 仅 contract-tests/mesad 受影响时用（helper + mesad + simulator）。
+# nextest 不执行 doctest，故 doctest 仍全 workspace 另跑。
+# soak（event_soak/event_pressure）归 stress：canonical 默认排除，
+# soak=run 时才追加独立 step（main full / nightly）。
 name: rust-canonical
 on:
   workflow_call:
@@ -12,6 +15,21 @@ on:
         description: "nextest filterset（all() 或 rdeps 联合）"
         required: false
         default: "all()"
+        type: string
+      build-targets:
+        description: "planner build_targets JSON（bins 或 packages）"
+        required: false
+        default: '{"kind":"bins"}'
+        type: string
+      contract-bins:
+        description: "filter 的 rdeps 是否含 contract-tests（planner graph 判定）"
+        required: false
+        default: "true"
+        type: string
+      soak:
+        description: "run 或 skip（长 soak 归属 stress）"
+        required: false
+        default: "skip"
         type: string
 
 permissions:
@@ -35,10 +53,37 @@ jobs:
           cache-writer: "true"
           install-nextest: "true"
 
-      - name: build workspace bins
-        run: cargo build --locked --workspace --bins
+      # selective bins：packages 只构建受影响包；bins 全 workspace。
+      # contract runtime 前置由下步 contract-bins 保障，此处不重复构建。
+      - name: build targets
+        env:
+          BUILD_TARGETS: ${{ inputs.build-targets }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, subprocess
+          spec = json.loads(os.environ['BUILD_TARGETS'])
+          if spec.get('kind') == 'packages':
+              pkgs = spec.get('packages', [])
+              if not pkgs:
+                  print('no packages → skip bins build')
+              else:
+                  cmd = ['cargo', 'build', '--locked', '--all-features'] + [x for p in pkgs for x in ('-p', p)]
+                  print('build:', ' '.join(cmd))
+                  subprocess.run(cmd, check=True)
+          else:
+              cmd = ['cargo', 'build', '--locked', '--workspace', '--bins']
+              print('build:', ' '.join(cmd))
+              subprocess.run(cmd, check=True)
+          EOF
 
-      - name: nextest (profile ci)
+      # contract runtime prerequisites（BLOCKER 真修 v2）：planner graph
+      # 输出 canonical_contract_bins，不解析 filter 字符串——filter 写法变了
+      # 也不漏；false 时不补 bins（防退化成全补）。
+      - name: build contract runtime bins
+        if: inputs.contract-bins == 'true'
+        run: cargo build --locked -p mesad -p mesa-driver-simulator -p mesa-contract-tests --bins
+
+      - name: nextest (profile ci, soak excluded)
         run: >
           cargo nextest run
           --locked
@@ -46,7 +91,20 @@ jobs:
           --all-features
           --exclude mesa-performance-tests
           --profile ci
-          -E "${{ inputs.filter }}"
+          -E "(${{
+            inputs.filter
+          }}) and (not (package(=mesa-contract-tests) and (binary(=event_soak) or binary(=event_pressure))))"
+
+      # soak 独占 step：默认 skip；run 时才执行（main full / nightly）。
+      - name: nextest soak (stress-owned)
+        if: inputs.soak == 'run'
+        run: >
+          cargo nextest run
+          --locked
+          -p mesa-contract-tests
+          --all-features
+          --profile ci
+          -E 'package(=mesa-contract-tests) and (binary(=event_soak) or binary(=event_pressure))'
 
       - name: doctest
         run: >

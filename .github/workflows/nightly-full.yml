@@ -1,0 +1,95 @@
+# Nightly FULL（manual/schedule）：全集成安全网，不阻塞日常 PR。
+#
+# 组成（CI v3 分层）：
+# - canonical all + soak run（Linux x64 全语义 + 长 soak）
+# - platform full ×3 + soak run（全 workspace link + 全量 tests）
+# - stress（Windows x64 重复采样）
+# - perf（7 项秒级门）
+# - web
+# 日常 PR 只跑 selective；FULL 只放这里 + 手动触发。
+name: nightly-full
+on:
+  schedule:
+    # 每日 02:00 UTC（GitHub schedule 最小粒度；仓库无 TZ 需求）。
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      plan: '{"plan_version":3,"full":true}'
+    steps:
+      - run: echo "nightly FULL plan"
+
+  rust-quality:
+    needs: [plan]
+    uses: ./.github/workflows/_rust-quality.yml
+
+  rust-canonical:
+    needs: [plan]
+    uses: ./.github/workflows/_rust-canonical.yml
+    with:
+      filter: all()
+      build-targets: '{"kind":"bins"}'
+      soak: run
+
+  rust-platform:
+    needs: [plan]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: ubuntu-24.04-arm
+            cache-domain: linux-arm64
+          - runs-on: windows-latest
+            cache-domain: windows-x64
+          - runs-on: windows-11-arm
+            cache-domain: windows-arm64
+    uses: ./.github/workflows/_rust-platform.yml
+    with:
+      runs-on: ${{ matrix.runs-on }}
+      cache-domain: ${{ matrix.cache-domain }}
+      mode: full
+      soak: run
+
+  web:
+    needs: [plan]
+    uses: ./.github/workflows/_web.yml
+
+  rust-stress:
+    needs: [plan]
+    uses: ./.github/workflows/_rust-stress.yml
+    with:
+      runs-on: windows-latest
+
+  rust-perf:
+    needs: [plan]
+    uses: ./.github/workflows/_rust-perf.yml
+
+  nightly-gate:
+    needs: [plan, rust-quality, rust-canonical, rust-platform, web, rust-stress, rust-perf]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: all nightly jobs must succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys
+          n = json.loads(os.environ['NEEDS_JSON'])
+          bad = {k: v.get('result') for k, v in n.items()
+                 if k != 'plan' and v.get('result') != 'success'}
+          print('NIGHTLY FAILED: %s' % bad if bad else 'NIGHTLY OK')
+          sys.exit(1 if bad else 0)
+          EOF
