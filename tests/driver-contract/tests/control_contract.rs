@@ -35,7 +35,7 @@ fn writable_target(slot: &str) -> WriteTarget {
 }
 
 async fn configured_conn(key: &str, slot: &str) -> Box<dyn mesa_driver_sdk::DriverConnection> {
-    let driver = mesa_driver_simulator::SimulatorDriver;
+    let driver = mesa_test_driver::TestDriver;
     let conn = driver.open_connection("ep", "{}").await.unwrap();
     conn.configure(1, vec![poll_task_with_key(key, slot)])
         .await
@@ -79,7 +79,7 @@ async fn simulator_write_unknown_target_fails() {
 async fn simulator_write_without_acquire_succeeds() {
     // 终审 #1 单元门：从未出现在任何 acquisition task 的 slot 直接写成功，
     // 且 CAS 链可观测（42 → 43）。Control 资源空间独立于 Acquisition 投影。
-    let driver = mesa_driver_simulator::SimulatorDriver;
+    let driver = mesa_test_driver::TestDriver;
     let conn = driver.open_connection("ep", "{}").await.unwrap();
     conn.write(&writable_target("never-acquired"), Value::F64(42.0), None)
         .await
@@ -185,7 +185,7 @@ async fn simulator_command_reset_succeeds() {
     // #4 门：reset 结果必须通过自身 result_schema（空对象 {}）。
     let v = res.unwrap();
     assert_eq!(v, serde_json::json!({}), "reset result 必须为 {{}}");
-    let desc = mesa_driver_simulator::SimulatorDriver.descriptor();
+    let desc = mesa_test_driver::TestDriver.descriptor();
     let issues = mesa_core_types::gate_command_result_against(&desc, "reset", &v, "command");
     assert!(issues.is_empty(), "{issues:?}");
     // reset 后 CAS 期望回到初值 1.0 才能成功（state 已恢复）
@@ -348,7 +348,7 @@ async fn driver_command_business_failure_is_failed_not_violation() {
     // Core 门禁规则：非 Succeeded 不调用 gate_command_result_against。
     // 此处锁定"空 result 不进门禁"——若未来有人改成无条件门禁，
     // 空字符串过空对象 schema 必产生 DRIVER_CONTRACT_VIOLATION 误报。
-    let desc = mesa_driver_simulator::SimulatorDriver.descriptor();
+    let desc = mesa_test_driver::TestDriver.descriptor();
     if resp.status == "Succeeded" {
         let v: serde_json::Value =
             serde_json::from_str(&resp.result_json).unwrap_or(serde_json::Value::Null);

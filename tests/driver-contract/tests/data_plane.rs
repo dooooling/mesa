@@ -117,7 +117,7 @@ async fn backpressure_coalesces_and_keeps_control_responsive() {
         meta.is_ok(),
         "control plane must stay responsive under data flood"
     );
-    assert_eq!(meta.unwrap().unwrap().0, "simulator");
+    assert_eq!(meta.unwrap().unwrap().0, "test-driver");
 
     // 恢复消费：批次继续到达且出现 sequence 缺口（丢弃/合并的可观测证据）。
     // 积压按序排队，缺口位于事件队列容量(~512)之后，需扫描足够深。

@@ -16,16 +16,15 @@ use mesa_driver_manager::MesaManager;
 use mesa_driver_manager::endpoint::BuiltinEndpoint;
 use mesa_event_store::{EVENT_HUB_CAPACITY, EventHub, EventServices, EventStore, StoreFaults};
 
-fn drivers_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("drivers")
+/// staged drivers 目录（含 test-driver；正式 drivers/ 已无 test-driver）。
+/// 返回 guard 必须由调用方持有（drop 即删目录）。
+fn drivers_dir() -> common::StagedDriversDir {
+    common::staged_drivers_with_test_driver()
 }
 
 fn generic_counter_task() -> EventTask {
     let binding = mesa_core_types::GenericEventBinding {
-        stream_id: mesa_driver_simulator::SIM_EVENT_STREAM_COUNTER.into(),
+        stream_id: mesa_test_driver::SIM_EVENT_STREAM_COUNTER.into(),
         parameters: serde_json::json!({}),
     };
     EventTask {
@@ -54,6 +53,7 @@ struct Rig {
     store: std::sync::Arc<EventStore>,
     db: std::path::PathBuf,
     endpoint_id: String,
+    _staged: common::StagedDriversDir,
 }
 
 impl Rig {
@@ -61,7 +61,10 @@ impl Rig {
         let db = tmp_db("pressure");
         let _ = std::fs::remove_file(&db);
         let store = std::sync::Arc::new(EventStore::open(&db).unwrap());
-        let mgr = std::sync::Arc::new(MesaManager::discover(&drivers_dir()));
+        // NOTE：guard 必须存活到 start 之后——manager 启动时解析 executable
+        // 路径并 spawn，二进制路径必须持续有效，故 guard 并入 Rig。
+        let staged = drivers_dir();
+        let mgr = std::sync::Arc::new(MesaManager::discover(staged.path()));
         mgr.set_event_services(EventServices::new(
             store.clone(),
             EventHub::new(EVENT_HUB_CAPACITY),
@@ -72,7 +75,7 @@ impl Rig {
         }
         mgr.start_endpoint(BuiltinEndpoint {
             endpoint_id: endpoint_id.into(),
-            driver_id: "simulator".into(),
+            driver_id: "test-driver".into(),
             connection_json: "{}".into(),
             tasks,
             event_tasks: vec![generic_counter_task()],
@@ -83,6 +86,7 @@ impl Rig {
             store,
             db,
             endpoint_id: endpoint_id.into(),
+            _staged: staged,
         }
     }
 
@@ -162,6 +166,7 @@ struct StallRig {
     services: std::sync::Arc<EventServices>,
     db: std::path::PathBuf,
     endpoint_id: String,
+    _staged: common::StagedDriversDir,
 }
 
 impl StallRig {
@@ -170,7 +175,8 @@ impl StallRig {
         let _ = std::fs::remove_file(&db);
         let store = std::sync::Arc::new(EventStore::open_with_faults(&db, faults).unwrap());
         let services = EventServices::new(store.clone(), EventHub::new(EVENT_HUB_CAPACITY));
-        let mgr = std::sync::Arc::new(MesaManager::discover(&drivers_dir()));
+        let staged = drivers_dir();
+        let mgr = std::sync::Arc::new(MesaManager::discover(staged.path()));
         mgr.set_event_services(std::sync::Arc::clone(&services));
         Self {
             mgr,
@@ -178,18 +184,19 @@ impl StallRig {
             services,
             db,
             endpoint_id: endpoint_id.into(),
+            _staged: staged,
         }
     }
 
     fn start_counter(&self, interval_ms: u64) {
         let binding = mesa_core_types::GenericEventBinding {
-            stream_id: mesa_driver_simulator::SIM_EVENT_STREAM_COUNTER.into(),
+            stream_id: mesa_test_driver::SIM_EVENT_STREAM_COUNTER.into(),
             parameters: serde_json::json!({}),
         };
         self.mgr
             .start_endpoint(BuiltinEndpoint {
                 endpoint_id: self.endpoint_id.clone(),
-                driver_id: "simulator".into(),
+                driver_id: "test-driver".into(),
                 connection_json: "{}".into(),
                 tasks: vec![],
                 event_tasks: vec![EventTask {

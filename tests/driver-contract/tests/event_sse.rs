@@ -14,7 +14,7 @@ use mesa_core_types::{EventBatch, EventRecord, Value};
 use mesa_event_store::{CommitRequest, EVENT_HUB_CAPACITY, EventHub, EventServices, EventStore};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use common::*;
+use common::{StagedDriversDir, init_log, staged_drivers_with_test_driver};
 
 fn tmp_db(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
@@ -77,6 +77,7 @@ async fn commit(
 struct TestServer {
     port: u16,
     _handle: tokio::task::JoinHandle<()>,
+    _staged: StagedDriversDir,
 }
 
 async fn serve(store: Arc<EventStore>, hub: Arc<EventHub>) -> TestServer {
@@ -84,7 +85,8 @@ async fn serve(store: Arc<EventStore>, hub: Arc<EventHub>) -> TestServer {
 }
 
 async fn serve_with_services(services: Arc<EventServices>) -> TestServer {
-    let drivers_dir = repo_root().join("drivers");
+    let staged = staged_drivers_with_test_driver();
+    let drivers_dir = staged.path().clone();
     let cfg = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
     #[allow(deprecated)]
@@ -101,6 +103,7 @@ async fn serve_with_services(services: Arc<EventServices>) -> TestServer {
     TestServer {
         port,
         _handle: handle,
+        _staged: staged,
     }
 }
 
@@ -245,7 +248,7 @@ async fn get_json(port: u16, path: &str) -> (u16, serde_json::Value) {
 /// live-only 默认：无游标不灌历史，首帧即新提交行。
 #[tokio::test]
 async fn sse_live_only_by_default() {
-    common::init_log();
+    init_log();
     let db = tmp_db("live");
     let _ = std::fs::remove_file(&db);
     let store = Arc::new(EventStore::open(&db).unwrap());
@@ -270,7 +273,7 @@ async fn sse_live_only_by_default() {
 /// replay → live：after_seq 回放旧行，新提交行续上，无重复、无遗漏。
 #[tokio::test]
 async fn sse_replay_then_live_no_duplicates() {
-    common::init_log();
+    init_log();
     let db = tmp_db("replay");
     let _ = std::fs::remove_file(&db);
     let store = Arc::new(EventStore::open(&db).unwrap());
@@ -305,7 +308,7 @@ async fn sse_replay_then_live_no_duplicates() {
 /// 通知可丢——恢复的唯一真相是 DB + Last-Event-ID 游标。
 #[tokio::test]
 async fn sse_consumer_kill_reconnects_with_last_event_id() {
-    common::init_log();
+    init_log();
     let db = tmp_db("kill");
     let _ = std::fs::remove_file(&db);
     let store = Arc::new(EventStore::open(&db).unwrap());
@@ -359,25 +362,26 @@ async fn sse_consumer_kill_reconnects_with_last_event_id() {
 /// 直接锁定；此处锁暴露形状 + 基本自洽。零生产改动。
 #[tokio::test]
 async fn events_stats_contract_keys_and_values() {
-    common::init_log();
+    init_log();
     let db = tmp_db("stats");
     let _ = std::fs::remove_file(&db);
     let store = Arc::new(EventStore::open(&db).unwrap());
     let hub = EventHub::new(EVENT_HUB_CAPACITY);
     let services = EventServices::new(store.clone(), hub.clone());
 
-    // 真 ingress 流量：manager + Sim counter（与 pressure 同形状），
+    // 真 ingress 流量：manager + test-driver counter（与 pressure 同形状），
     // 计数器落在同一个 services Arc 上，stats 读同一份。
-    let drivers_dir = repo_root().join("drivers");
+    let _staged = staged_drivers_with_test_driver();
+    let drivers_dir = _staged.path().clone();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
     mgr.set_event_services(Arc::clone(&services));
     let binding = mesa_core_types::GenericEventBinding {
-        stream_id: mesa_driver_simulator::SIM_EVENT_STREAM_COUNTER.into(),
+        stream_id: mesa_test_driver::SIM_EVENT_STREAM_COUNTER.into(),
         parameters: serde_json::json!({}),
     };
     mgr.start_endpoint(mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: "hd-stats".into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks: vec![],
         event_tasks: vec![mesa_core_types::EventTask {
@@ -464,7 +468,7 @@ async fn events_stats_contract_keys_and_values() {
 /// 游标合并：max(query.after_seq, Last-Event-ID)；非法 header 400。
 #[tokio::test]
 async fn sse_cursor_max_rule_and_bad_header() {
-    common::init_log();
+    init_log();
     let db = tmp_db("cursor");
     let _ = std::fs::remove_file(&db);
     let store = Arc::new(EventStore::open(&db).unwrap());
@@ -502,7 +506,7 @@ async fn sse_cursor_max_rule_and_bad_header() {
 /// 无论服务端调度如何交错，输出必须是 1,2 各一次（hub 顺序≠交付顺序）。
 #[tokio::test]
 async fn sse_hub_reorder_recovers_from_db() {
-    common::init_log();
+    init_log();
     // 空库连接（high-water=0），再入库、再倒序 publish
     let db = tmp_db("reorder");
     let _ = std::fs::remove_file(&db);
@@ -547,7 +551,7 @@ async fn sse_hub_reorder_recovers_from_db() {
 /// 断言 2010 帧精确升序全覆盖（少一行/错一序即失败）。
 #[tokio::test]
 async fn sse_lagged_catch_up_from_db() {
-    common::init_log();
+    init_log();
     let db = tmp_db("lag");
     let _ = std::fs::remove_file(&db);
     let store = Arc::new(EventStore::open(&db).unwrap());

@@ -9,7 +9,7 @@ members = [
     "crates/event-store",
     "crates/core-api",
     "apps/mesad",
-    "drivers/simulator",
+    "tests/support/test-driver",
     "drivers/s7",
     "drivers/focas2",
     "drivers/opcua",

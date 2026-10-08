@@ -32,8 +32,8 @@ async fn handshake_and_metadata_roundtrip() {
     assert!(!unresponsive.load(std::sync::atomic::Ordering::Relaxed));
 
     let (driver_id, name, version) = session.metadata().await.expect("metadata");
-    assert_eq!(driver_id, "simulator");
-    assert_eq!(name, "Mesa Simulator");
+    assert_eq!(driver_id, "test-driver");
+    assert_eq!(name, "Mesa Test Driver");
     assert!(!version.is_empty());
 
     teardown(&mut session_drop_guard(session), Some(cancel));

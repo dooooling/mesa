@@ -1,16 +1,16 @@
 [package]
-name = "mesa-driver-simulator"
+name = "mesa-test-driver"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 rust-version.workspace = true
 [lib]
-name = "mesa_driver_simulator"
+name = "mesa_test_driver"
 path = "src/lib.rs"
 
 [[bin]]
-name = "mesa-driver-simulator"
+name = "mesa-test-driver"
 path = "src/main.rs"
 
 [dependencies]

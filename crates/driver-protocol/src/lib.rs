@@ -681,12 +681,13 @@ mod tests {
     /// bump 常量忘改 toml 即漂移）。Minor 只做展示一致性，不断言 gate。
     #[test]
     fn in_tree_manifest_minor_matches_protocol() {
-        // workspace 根 → drivers/<id>/driver.toml（5 个 in-tree 驱动）
+        // workspace 根 → drivers/<id>/driver.toml（4 个正式 in-tree 驱动；
+        // test-driver 已退役产品身份，不在此列）。
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
             .join("drivers");
-        for id in ["s7", "simulator", "opcua", "focas2", "sinumerik-nck"] {
+        for id in ["s7", "opcua", "focas2", "sinumerik-nck"] {
             let p = root.join(id).join("driver.toml");
             let text =
                 std::fs::read_to_string(&p).unwrap_or_else(|_| panic!("missing {}", p.display()));

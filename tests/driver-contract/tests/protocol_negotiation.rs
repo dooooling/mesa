@@ -79,13 +79,7 @@ async fn driver_rejects_core_major_downgrade() {
     let cancel = CancellationToken::new();
     let c = cancel.clone();
     let server = tokio::spawn(async move {
-        mesa_driver_sdk::serve(
-            mesa_driver_simulator::SimulatorDriver,
-            sim_listener,
-            TOKEN.into(),
-            c,
-        )
-        .await
+        mesa_driver_sdk::serve(mesa_test_driver::TestDriver, sim_listener, TOKEN.into(), c).await
     });
 
     // 裸 Core 客户端：读 Hello 后回一个 Major 不一致的 Welcome

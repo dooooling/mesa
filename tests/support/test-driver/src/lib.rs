@@ -1,4 +1,4 @@
-//! Mesa Simulator Driver（方案附录 A）。
+//! Mesa Test Driver Driver（方案附录 A）。
 //!
 //! 定位：Driver Framework 的参考实现与 Contract/Performance Test 基线，
 //! 不属于正式设备协议范围。行为配置属于测试配置，不进入生产采集模板。
@@ -48,18 +48,18 @@ pub const SIM_EVENT_STREAM_ALARM: &str = "sim.events.alarm-cycle";
 /// 报警流的 condition 身份（四条记录共享）。
 pub const SIM_ALARM_CONDITION_ID: &str = "SIM-ALARM-100";
 
-/// Simulator 驱动实例。无连接级共享状态——每个连接独立持有采集计划。
+/// Test Driver 驱动实例。无连接级共享状态——每个连接独立持有采集计划。
 #[derive(Default)]
-pub struct SimulatorDriver;
+pub struct TestDriver;
 
 #[async_trait::async_trait]
-impl Driver for SimulatorDriver {
+impl Driver for TestDriver {
     fn metadata(&self) -> DriverMetadata {
         DriverMetadata {
-            driver_id: "simulator".into(),
-            name: "Mesa Simulator".into(),
+            driver_id: "test-driver".into(),
+            name: "Mesa Test Driver".into(),
             version: env!("CARGO_PKG_VERSION").into(),
-            // 与 drivers/simulator/driver.toml 保持一致
+            // 与 tests/support/test-driver/driver.toml 保持一致
             protocol_major: 1,
             protocol_minor: 0,
         }
@@ -314,7 +314,7 @@ impl Driver for SimulatorDriver {
                 events: true,
                 ..Default::default()
             },
-            // Event Plane V1 §5：Simulator 是第一个 Reference Event Driver，
+            // Event Plane V1 §5：Test Driver 是第一个 Reference Event Driver，
             // 声明 counter（瞬时）+ alarm-cycle（Condition 四态）两个事件流
             events: EventCatalog {
                 streams: vec![
@@ -479,7 +479,7 @@ enum SourceSpec {
 }
 
 impl SourceSpec {
-    /// P1 来源标签：simulator 的 canonical 形式 `sim.{kind}`（kind 即
+    /// P1 来源标签：test-driver 的 canonical 形式 `sim.{kind}`（kind 即
     /// resource_id，如 counter/sine/toggle/random/constant）。非 identity，
     /// 同 kind 多点允许重复（key 仍唯一）。
     fn source_label(&self) -> String {
@@ -771,14 +771,14 @@ impl SimEventStream {
 
 #[async_trait::async_trait]
 impl DriverConnection for SimConnection {
-    /// Simulator 探测：无真实设备，返回确定性事实（合同基准）。
+    /// Test Driver 探测：无真实设备，返回确定性事实（合同基准）。
     /// 复用本连接（OpenConnection 已校验配置），不启动任何采集。
     async fn probe(&self) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
         use mesa_core_types::{CapabilityItem, CapabilityState};
         Ok(mesa_core_types::ProbeReport {
             reachable: true,
             vendor: Some("Mesa".into()),
-            family: Some("Simulator".into()),
+            family: Some("TestDriver".into()),
             model: Some("Basic".into()),
             firmware: Some("1.0".into()),
             model_confidence: Some("high".into()),
@@ -791,12 +791,12 @@ impl DriverConnection for SimConnection {
                 CapabilityItem {
                     id: "subscribe".into(),
                     state: CapabilityState::NotPresent,
-                    detail: Some("simulator only supports poll mode".into()),
+                    detail: Some("test-driver only supports poll mode".into()),
                 },
                 CapabilityItem {
                     id: "browse".into(),
                     state: CapabilityState::NotPresent,
-                    detail: Some("simulator has no browse space".into()),
+                    detail: Some("test-driver has no browse space".into()),
                 },
             ],
             warnings: vec![],
@@ -816,7 +816,7 @@ impl DriverConnection for SimConnection {
         for task in &tasks {
             task.validate()
                 .map_err(|e| SdkDriverError::configuration("INVALID_TASK", e.to_string()))?;
-            // Simulator 仅支持 Poll；Subscribe 属于 OPC UA 能力（§5.5）。
+            // Test Driver 仅支持 Poll；Subscribe 属于 OPC UA 能力（§5.5）。
             // Foundation-2 单真值：调度由 schedule 派生，不再读 mode 字段。
             let interval_ms = match task.schedule {
                 TaskSchedule::Poll { interval_ms } => interval_ms,
@@ -824,7 +824,7 @@ impl DriverConnection for SimConnection {
                     return Err(SdkDriverError::new(
                         ErrorKind::Unsupported,
                         "MODE_NOT_SUPPORTED",
-                        format!("task `{}`: simulator only supports poll mode", task.id),
+                        format!("task `{}`: test-driver only supports poll mode", task.id),
                     ));
                 }
             };
@@ -858,7 +858,7 @@ impl DriverConnection for SimConnection {
             }
             let mut indices = Vec::new();
             for sel in &binding.selections {
-                // Simulator 资源映射：resource_id 即 SourceKind，parameters 即源参数
+                // Test Driver 资源映射：resource_id 即 SourceKind，parameters 即源参数
                 for out in &sel.outputs {
                     // 构造 SourceSpec 解析输入：合并 kind 与 parameters
                     let mut src_json = sel.parameters.clone();
@@ -898,7 +898,7 @@ impl DriverConnection for SimConnection {
                 point_key: p.key.clone(),
                 data_type: p.source.data_type(),
                 unit: None,
-                // P1：simulator canonical 来源标签（合同验证用）
+                // P1：test-driver canonical 来源标签（合同验证用）
                 source_label: Some(p.source.source_label()),
             })
             .collect();
@@ -964,7 +964,7 @@ impl DriverConnection for SimConnection {
                     format!("event task `{task}`: Poll 模式必须提供正整数 interval_ms"),
                 ),
             })?;
-            // Foundation-2 事件单路径：仅接受 mesa.events.v1（simulator.events 已删除）。
+            // Foundation-2 事件单路径：仅接受 mesa.events.v1（test-driver.events 已删除）。
             if task.binding.kind != GENERIC_EVENT_BINDING_KIND {
                 return Err(SdkDriverError::configuration(
                     "UNSUPPORTED_EVENT_BINDING",
@@ -991,7 +991,7 @@ impl DriverConnection for SimConnection {
                     format!("event task `{}`: missing string `stream_id`", task.id),
                 ));
             }
-            // Simulator 当前流均无 parameters：只接受对象/空，拒绝数组等形态，
+            // Test Driver 当前流均无 parameters：只接受对象/空，拒绝数组等形态，
             // 避免未来参数被静默吞掉；有字段的流在 PR9 风格扩展时再按 Schema 校验。
             if !binding.parameters.is_object() && !binding.parameters.is_null() {
                 return Err(SdkDriverError::configuration(
@@ -1173,7 +1173,7 @@ impl DriverConnection for SimConnection {
                                 let n = published.fetch_add(1, Ordering::Relaxed) + 1;
                                 if faults.crash_after_batches == Some(n) {
                                     eprintln!(
-                                        "simulator: fault injection crash_after_batches={n}, exiting"
+                                        "test-driver: fault injection crash_after_batches={n}, exiting"
                                     );
                                     std::process::exit(101);
                                 }
@@ -1522,7 +1522,7 @@ mod tests {
     /// == type_spec.resolve(parameters)。
     #[tokio::test]
     async fn golden_descriptor_selection_configure_point_type_closed() {
-        let d = SimulatorDriver.descriptor();
+        let d = TestDriver.descriptor();
         d.validate().expect("descriptor 必须合法");
         assert_eq!(
             d.resources.len(),
@@ -1749,7 +1749,7 @@ mod tests {
     #[tokio::test]
     async fn conn_faults_parse_and_default_config_ok() {
         // 无故障字段的空配置照常工作（兼容空配置）
-        let conn = SimulatorDriver.open_connection("e", "{}").await.unwrap();
+        let conn = TestDriver.open_connection("e", "{}").await.unwrap();
         let _ = conn;
 
         let f = parse_conn_faults(
@@ -1761,7 +1761,7 @@ mod tests {
 
         // 阈值非法 → 结构化配置错误
         // （Box<dyn DriverConnection> 非 Debug，不能用 unwrap_err，需手动匹配）
-        let err = match SimulatorDriver
+        let err = match TestDriver
             .open_connection("e", "{\"crash_after_batches\": \"x\"}")
             .await
         {
@@ -1837,7 +1837,7 @@ mod tests {
 
     /// PR8 P0：新标准 `mesa.events.v1` 被接受（Subscribe 缺省节奏 / Poll 自带周期）。
     #[tokio::test]
-    async fn simulator_accepts_mesa_events_v1() {
+    async fn test_driver_accepts_mesa_events_v1() {
         let conn = SimConnection::default();
         conn.configure_events(
             1,
@@ -1867,7 +1867,7 @@ mod tests {
 
     /// Foundation-2：已删除的 legacy kind 即拒绝（字符串内联，生产侧无常量）。
     #[tokio::test]
-    async fn simulator_legacy_binding_rejected() {
+    async fn test_driver_legacy_binding_rejected() {
         let conn = SimConnection::default();
         let err = conn
             .configure_events(
@@ -1877,7 +1877,7 @@ mod tests {
                     mode: TaskMode::Subscribe,
                     interval_ms: None,
                     binding: DriverBinding {
-                        kind: "simulator.events".into(),
+                        kind: "test-driver.events".into(),
                         config: serde_json::json!({"stream": SIM_EVENT_STREAM_COUNTER}),
                     },
                 }],

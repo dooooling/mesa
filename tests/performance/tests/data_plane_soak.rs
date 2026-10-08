@@ -8,6 +8,58 @@ use mesa_core_types::{AcquisitionTask, DriverBinding, TaskSchedule, GENERIC_BIND
 use mesa_driver_manager::{MesaManager, PointIdAllocator};
 use std::sync::Arc;
 
+/// staged drivers 目录（含 test-driver 二进制 + manifest；perf 用）。
+/// guard 由调用方持有（drop 即删目录）。
+struct PerfStagedDir(std::path::PathBuf);
+impl PerfStagedDir {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+impl Drop for PerfStagedDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+fn staged_drivers_with_test_driver() -> PerfStagedDir {
+    let exe_candidates = [
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug/mesa-test-driver.exe"),
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug/mesa-test-driver"),
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/release/mesa-test-driver.exe"),
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/release/mesa-test-driver"),
+    ];
+    let exe = exe_candidates
+        .iter()
+        .find(|p| p.is_file())
+        .cloned()
+        .expect("mesa-test-driver binary not built");
+    let root = std::env::temp_dir().join(format!(
+        "mesa-perf-drivers-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("test-driver");
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = exe.file_name().unwrap().to_string_lossy().to_string();
+    std::fs::copy(&exe, dir.join(&name)).unwrap();
+    std::fs::write(
+        dir.join("driver.toml"),
+        format!(
+            "id=\"test-driver\"\nname=\"Mesa Test Driver\"\nversion=\"0.1.0\"\nexecutable=\"{name}\"\nprotocol_major=1\nprotocol_minor=2\n"
+        ),
+    )
+    .unwrap();
+    PerfStagedDir(root)
+}
+
 #[tokio::test]
 async fn data_plane_50k_10s_ci() {
     let long_3000 = std::env::var("PERF_3000").is_ok();
@@ -24,7 +76,8 @@ async fn data_plane_50k_10s_ci() {
     };
     // 使用内存 PointId 分配（与 conn_1000 一致），避免 SQLite 存量校验阻塞 Data Plane
     let source = Arc::new(PointIdAllocator::default());
-    let drivers_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../drivers");
+    let _staged = staged_drivers_with_test_driver();
+    let drivers_dir = _staged.path().to_path_buf();
     let mgr = MesaManager::with_source(&drivers_dir, source);
     // 注册一个高吞吐 endpoint：Simulator burst 模拟
     //（burst 为 GenericBinding 顶层参数，与 selections 同级）
@@ -41,7 +94,7 @@ async fn data_plane_50k_10s_ci() {
     }).collect();
     let ep = mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: "perf-50k".into(),
-        driver_id: "simulator".into(),
+        driver_id: "test-driver".into(),
         connection_json: "{}".into(),
         tasks,
         event_tasks: vec![],

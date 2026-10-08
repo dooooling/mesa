@@ -1,0 +1,15 @@
+# mesa-test-driver — Contract/Performance Test 专用测试驱动（非正式设备协议）。
+#
+# 前身为 `drivers/simulator`（mesa-driver-simulator / SimulatorDriver /
+# driver_id = "simulator"）。退役产品身份后迁移至此：不再出现在正式
+# `drivers/` discovery 目录；`driver_id` 固定为 "test-driver"。
+#
+# 用途：故障注入 / 高吞吐 / lifecycle / control / deterministic 测试基线。
+# 正式驱动只保留真实工业协议（S7 / FOCAS2 / OPC UA / SINUMERIK NCK）。
+id = "test-driver"
+name = "Mesa Test Driver"
+version = "0.3.0"
+executable = "mesa-test-driver"
+protocol_major = 1
+protocol_minor = 6
+sdk = "rust"

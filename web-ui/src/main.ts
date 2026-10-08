@@ -60,7 +60,7 @@ async function loadEndpoints(){
     const eps = d.endpoints||[]
     let html = `<div class="card"><h3>创建 Endpoint</h3>
       <input id="epId" placeholder="ep-001"> <input id="epDev" placeholder="device_id dev-001"> 
-      <select id="epDrv"><option value="simulator">simulator</option><option value="s7">s7</option><option value="focas2">focas2</option><option value="opcua">opcua</option></select><br>
+      <select id="epDrv"><option value="s7">s7</option><option value="focas2">focas2</option><option value="opcua">opcua</option><option value="sinumerik-nck">sinumerik-nck</option></select><br>
       <textarea id="epConn" rows="3" placeholder='connection JSON e.g. {"host":"192.168.15.165","port":8193,"timeout_ms":3000,"use_native":true} or {"endpoint_url":"opc.tcp://127.0.0.1:4840"}'></textarea><br>
       <button id="addEp">+ endpoint</button></div>`
     html += eps.map((e:any)=>`<div class="card"><b>${e.id}</b> ${e.driver_id} ${e.device_id} <span class="badge ${e.runtime?.state}">${e.runtime?.state||e.state||''}</span> epoch:${e.runtime?.epoch||''} pts:${e.runtime?.points||0}<br><small>${JSON.stringify(e.connection)}</small><br>

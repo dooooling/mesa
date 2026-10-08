@@ -10,7 +10,7 @@ fn repo_root() -> PathBuf {
 fn sim_exe() -> PathBuf {
     let target = repo_root().join("target");
     for profile in ["debug", "release"] {
-        for name in ["mesa-driver-simulator.exe", "mesa-driver-simulator"] {
+        for name in ["mesa-test-driver.exe", "mesa-test-driver"] {
             let p = target.join(profile).join(name);
             if p.is_file() {
                 return p;
@@ -26,7 +26,7 @@ async fn main() {
     let exe = sim_exe();
     let disc = mesa_driver_manager::manifest::DiscoveredDriver {
         manifest: mesa_driver_manager::manifest::DriverManifest {
-            id: "simulator".into(),
+            id: "test-driver".into(),
             name: "Mesa Simulator".into(),
             version: "0.0.0".into(),
             executable: exe.file_name().unwrap().to_string_lossy().to_string(),

@@ -5,7 +5,7 @@ import { bootstrapDevice, isDraftComplete, newOperationKey, type BootstrapClient
 
 const DRAFT = {
   device: { deviceId: "cnc-01", deviceName: "CNC-01" },
-  connection: { driverId: "simulator", endpointId: "sim-ep", endpointName: "SIM", connection: {} },
+  connection: { driverId: "s7", endpointId: "s7-ep", endpointName: "S7", connection: {} },
   acquisition: { intervalMs: 1000, selections: [{ resource_id: "r1", parameters: {}, outputs: [] }], startAfterCreate: true },
 };
 
@@ -55,7 +55,7 @@ describe("newOperationKey（per-operation 幂等）", () => {
 
 describe("bootstrapDevice（原子接口）", () => {
   it("201：一次 POST，请求体含 device/endpoint/tasks/start/幂等键", async () => {
-    const c = client({ device_id: "cnc-01", endpoint_id: "sim-ep", revision: 1, started: true });
+    const c = client({ device_id: "cnc-01", endpoint_id: "s7-ep", revision: 1, started: true });
     const r = await bootstrapDevice(c, DRAFT);
     expect(r.ok).toBe(true);
     expect(r.failedStep).toBeNull();
@@ -64,7 +64,7 @@ describe("bootstrapDevice（原子接口）", () => {
     const b = c.calls[0] as Record<string, unknown>;
     expect(b).toMatchObject({
       device: { id: "cnc-01", name: "CNC-01" },
-      endpoint: { id: "sim-ep", driver_id: "simulator" },
+      endpoint: { id: "s7-ep", driver_id: "s7" },
       start: true,
     });
     expect(typeof (b as { idempotency_key?: unknown }).idempotency_key).toBe("string");
@@ -74,7 +74,7 @@ describe("bootstrapDevice（原子接口）", () => {
   });
 
   it("200 + replayed：幂等重放（未重复创建）", async () => {
-    const c = client({ device_id: "cnc-01", endpoint_id: "sim-ep", replayed: true }, 200);
+    const c = client({ device_id: "cnc-01", endpoint_id: "s7-ep", replayed: true }, 200);
     const r = await bootstrapDevice(c, DRAFT);
     expect(r.ok).toBe(true);
     expect(r.replayed).toBe(true);

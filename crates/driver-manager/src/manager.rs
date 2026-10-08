@@ -634,7 +634,7 @@ mod tests {
     fn endpoint_with_events() -> BuiltinEndpoint {
         BuiltinEndpoint {
             endpoint_id: "ep-evt".into(),
-            driver_id: "simulator".into(),
+            driver_id: "test-driver".into(),
             connection_json: "{}".into(),
             tasks: vec![],
             event_tasks: vec![mesa_core_types::EventTask {
@@ -642,8 +642,8 @@ mod tests {
                 mode: mesa_core_types::TaskMode::Subscribe,
                 interval_ms: None,
                 binding: mesa_core_types::DriverBinding {
-                    kind: "simulator.events".into(),
-                    config: serde_json::json!({"stream": "sim.events.alarm-cycle"}),
+                    kind: "test-driver.events".into(),
+                    config: serde_json::json!({"stream": "test.events.alarm-cycle"}),
                 },
             }],
         }

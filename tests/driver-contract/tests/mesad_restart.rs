@@ -98,12 +98,16 @@ async fn wait_ready(port: u16) {
     panic!("mesad on {port} not ready in 30s");
 }
 
-fn spawn_mesad(dir: &std::path::Path, port: u16) -> tokio::process::Child {
+fn spawn_mesad(
+    dir: &std::path::Path,
+    port: u16,
+    drivers_dir: &std::path::Path,
+) -> tokio::process::Child {
     tokio::process::Command::new(mesad_exe())
         .arg("--db")
         .arg(dir.join("mesa.db"))
         .arg("--drivers-dir")
-        .arg(repo_root().join("drivers"))
+        .arg(drivers_dir)
         .arg("--http-port")
         .arg(port.to_string())
         .kill_on_drop(true)
@@ -122,9 +126,12 @@ async fn mesad_process_restart_recovers_events_and_history() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
+    // staged drivers 目录（含 test-driver；mesad 子进程全程需要，guard 与子进程同寿）。
+    let _staged = common::staged_drivers_with_test_driver();
+
     // ---- Phase 1：全新目录拉起，配齐 device/endpoint/tasks/event-tasks 并启动
     let port1 = free_port().await;
-    let mut mesad1 = spawn_mesad(&dir, port1);
+    let mut mesad1 = spawn_mesad(&dir, port1, _staged.path());
     wait_ready(port1).await;
 
     let (st, _) = http(
@@ -139,7 +146,7 @@ async fn mesad_process_restart_recovers_events_and_history() {
         port1,
         "POST",
         "/api/v1/endpoints",
-        Some(r#"{"id":"ep-restart","name":"Restart","device_id":"d1","driver_id":"simulator","connection":{}}"#),
+        Some(r#"{"id":"ep-restart","name":"Restart","device_id":"d1","driver_id":"test-driver","connection":{}}"#),
     )
     .await;
     assert!(st == 200 || st == 201, "create endpoint, got {st}");
@@ -206,10 +213,10 @@ async fn mesad_process_restart_recovers_events_and_history() {
     mesad1.kill().await.unwrap();
     let _ = mesad1.wait().await;
 
-    // ---- Phase 2：同一数据目录拉起新进程
+    // ---- Phase 2：同一数据目录拉起新进程（同 staged drivers 目录）
     let port2 = free_port().await;
     assert_ne!(port1, port2);
-    let mut mesad2 = spawn_mesad(&dir, port2);
+    let mut mesad2 = spawn_mesad(&dir, port2, _staged.path());
     wait_ready(port2).await;
 
     // desired_running + EventTask 恢复：endpoint 自动回到 running

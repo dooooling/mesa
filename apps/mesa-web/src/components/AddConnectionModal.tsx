@@ -13,7 +13,6 @@ import {
 import { DescriptorFields, materializeSchemaDefaults } from "./DescriptorFields";
 
 const FALLBACK_DRIVERS = [
-  { value: "simulator", label: "Simulator" },
   { value: "s7", label: "Siemens S7" },
   { value: "focas2", label: "FANUC FOCAS2" },
   { value: "opcua", label: "OPC UA" },
@@ -28,7 +27,7 @@ export function AddConnectionModal(props: {
 }) {
   const { deviceId, open, onClose, onCreated } = props;
   const [form] = Form.useForm();
-  const [driverId, setDriverId] = useState("simulator");
+  const [driverId, setDriverId] = useState("s7");
   const [driverOptions, setDriverOptions] = useState(FALLBACK_DRIVERS);
   const [desc, setDesc] = useState<DriverDescriptor | null>(null);
   const [conn, setConn] = useState<Record<string, unknown>>({});
@@ -57,7 +56,7 @@ export function AddConnectionModal(props: {
   }, [driverId, open]);
 
   const openFresh = () => {
-    setDriverId("simulator");
+    setDriverId("s7");
     setConn({});
     form.resetFields();
   };
@@ -90,7 +89,7 @@ export function AddConnectionModal(props: {
 
   return (
     <Modal title={`新增连接 · 归属 ${deviceId}`} open={open} onOk={doAdd} onCancel={onClose} okText="创建" destroyOnHidden width={640}>
-      <Form form={form} layout="vertical" initialValues={{ driver_id: "simulator" }}>
+      <Form form={form} layout="vertical" initialValues={{ driver_id: "s7" }}>
         <Form.Item name="driver_id" label="驱动（创建后不可改）" rules={[{ required: true }]}>
           <Select options={driverOptions} onChange={(v) => { setDriverId(v); setConn({}); }} />
         </Form.Item>

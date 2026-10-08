@@ -23,7 +23,7 @@ fn sim_discovered() -> DiscoveredDriver {
     let exe = sim_exe();
     DiscoveredDriver {
         manifest: mesa_driver_manager::manifest::DriverManifest {
-            id: "simulator".into(),
+            id: "test-driver".into(),
             name: "Mesa Simulator".into(),
             version: "0.0.0".into(),
             executable: exe.file_name().unwrap().to_string_lossy().to_string(),
@@ -303,7 +303,7 @@ fn assert_no_orphan(before: &HashSet<u32>, name: &str) {
 fn stage_drivers_dir(tag: &str, src_exe: &Path, unique_base: &str) -> (PathBuf, String) {
     use std::io::Write;
     let root = std::env::temp_dir().join(format!("fl-probe-{tag}-{}", now_ns()));
-    let dir = root.join("simulator");
+    let dir = root.join("test-driver");
     std::fs::create_dir_all(&dir).unwrap();
     let name = exe_name(unique_base);
     let final_path = dir.join(&name);
@@ -328,7 +328,7 @@ fn stage_drivers_dir(tag: &str, src_exe: &Path, unique_base: &str) -> (PathBuf, 
     std::fs::write(
         dir.join("driver.toml"),
         format!(
-            "id=\"simulator\"\nname=\"Mesa Simulator\"\nversion=\"0.1.0\"\nexecutable=\"{unique_base}\"\nprotocol_major={}\nprotocol_minor=2\n",
+            "id=\"test-driver\"\nname=\"Mesa Test Driver\"\nversion=\"0.1.0\"\nexecutable=\"{unique_base}\"\nprotocol_major={}\nprotocol_minor=2\n",
             mesa_driver_protocol::PROTOCOL_MAJOR
         ),
     )
@@ -358,7 +358,7 @@ async fn manager_probe_success_reports_facts_and_cleans_child() {
     let (root, unique) = stage_drivers_dir("ok", &sim_exe(), "pb-sim-guard");
     let before = live_pids(&exe_name(&unique));
     let mgr = MesaManager::discover(&root);
-    let res = mgr.probe("simulator", "{}").await.expect("probe ok");
+    let res = mgr.probe("test-driver", "{}").await.expect("probe ok");
     assert!(res.reachable);
     assert_eq!(res.vendor.as_deref(), Some("Mesa"));
     assert_no_orphan(&before, &exe_name(&unique));
@@ -371,7 +371,7 @@ async fn manager_probe_bad_config_fails_and_cleans_child() {
     let before = live_pids(&exe_name(&unique));
     let mgr = MesaManager::discover(&root);
     let err = mgr
-        .probe("simulator", "not-json")
+        .probe("test-driver", "not-json")
         .await
         .expect_err("非法 JSON 必须 Err");
     assert!(
@@ -387,7 +387,7 @@ async fn manager_probe_timeout_cleans_hang_child() {
     // hang 桩：握手成功但永不回包 → 内层 RPC 10s 超时 → 同一清理尾回收子进程。
     let (root, unique) = stage_drivers_dir("hang", &hang_exe(), "pb-hang-guard");
     // hang 桩的 manifest id 需改写为 hang（stage 函数写死 simulator，覆写 toml）
-    let dir = root.join("simulator");
+    let dir = root.join("test-driver");
     std::fs::write(
         dir.join("driver.toml"),
         format!(

@@ -357,7 +357,7 @@ fn simulator_reference_control_descriptor_declares_write_and_reset() {
     // Foundation-3 Reference：Simulator 声明 writable(ReadWrite) + reset 命令 +
     // fail_once 回归命令 + capabilities.write/method；
     // 其余生产 Driver 保持只读（见下）。
-    let d = mesa_driver_simulator::SimulatorDriver.descriptor();
+    let d = mesa_test_driver::TestDriver.descriptor();
     d.validate().expect("simulator descriptor must be valid");
     assert!(d.capabilities.write, "simulator 声明 write");
     assert!(d.capabilities.method, "simulator 声明 method");
@@ -498,7 +498,7 @@ fn visible_if_reference_must_exist() {
 
 #[test]
 fn simulator_descriptor_is_valid_and_small() {
-    let driver = mesa_driver_simulator::SimulatorDriver;
+    let driver = mesa_test_driver::TestDriver;
     let d = driver.descriptor();
     d.validate().expect("simulator descriptor must be valid");
     let json = serde_json::to_string(&d).unwrap();
@@ -981,65 +981,88 @@ fn validate_instance_covers_required_type_enum_range_pattern_unknown() {
 fn driver_version_identity_toml_metadata_package_agree() {
     // §4.1 门禁：driver.toml.version == DriverMetadata.version == package version；
     // Descriptor/公开行为变化必须同步三处，禁止同一 version 对应不同语义。
+    // test-driver 的 manifest 随测试 staged（不在正式 drivers/），此处用其
+    // 仓库内 driver.toml（tests/support/test-driver/driver.toml）校验。
     use mesa_driver_sdk::Driver;
     let drivers: Vec<(&str, String)> = vec![
         (
-            "simulator",
-            mesa_driver_simulator::SimulatorDriver.metadata().version,
+            "tests/support/test-driver",
+            mesa_test_driver::TestDriver.metadata().version,
         ),
-        ("s7", mesa_driver_s7::S7Driver.metadata().version),
-        ("focas2", mesa_driver_focas2::FocasDriver.metadata().version),
-        ("opcua", mesa_driver_opcua::OpcUaDriver.metadata().version),
+        ("drivers/s7", mesa_driver_s7::S7Driver.metadata().version),
         (
-            "sinumerik-nck",
+            "drivers/focas2",
+            mesa_driver_focas2::FocasDriver.metadata().version,
+        ),
+        (
+            "drivers/opcua",
+            mesa_driver_opcua::OpcUaDriver.metadata().version,
+        ),
+        (
+            "drivers/sinumerik-nck",
             mesa_driver_sinumerik_nck::SinumerikNckDriver
                 .metadata()
                 .version,
         ),
     ];
-    for (dir, meta_version) in drivers {
-        let toml_text = std::fs::read_to_string(
-            common::repo_root()
-                .join("drivers")
-                .join(dir)
-                .join("driver.toml"),
-        )
-        .unwrap();
+    for (rel, meta_version) in drivers {
+        let toml_text =
+            std::fs::read_to_string(common::repo_root().join(rel).join("driver.toml")).unwrap();
         let toml_version = toml_text
             .lines()
             .find_map(|l| l.strip_prefix("version = \"")?.strip_suffix('"'))
             .expect("driver.toml 必须有 version");
         assert_eq!(
             toml_version, meta_version,
-            "{dir}: driver.toml 与 metadata 版本不一致"
+            "{rel}: driver.toml 与 metadata 版本不一致"
         );
         assert_eq!(
             meta_version,
             env!("CARGO_PKG_VERSION"),
-            "{dir}: metadata 与 package 版本不一致"
+            "{rel}: metadata 与 package 版本不一致"
         );
     }
 }
 
 #[tokio::test]
 async fn manager_lazy_load_descriptor_via_temp_process() {
-    // cargo build 需先产出 simulator 二进制（与 subprocess_recovery 同理）
-    let mgr = std::sync::Arc::new(mesa_driver_manager::MesaManager::discover(
-        &common::repo_root().join("drivers"),
+    // staged test-driver（与 subprocess_recovery 同理，不扫正式 drivers/）。
+    let exe = common::sim_exe();
+    let root = std::env::temp_dir().join(format!(
+        "mesa-test-driver-lazy-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
-    // 若环境未编译 simulator，跳过而非失败
-    if mgr.find_driver("simulator").is_none() {
-        eprintln!("simulator not discovered, skip lazy descriptor test");
+    let dir = root.join("test-driver");
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = exe.file_name().unwrap().to_string_lossy().to_string();
+    std::fs::copy(&exe, dir.join(&name)).unwrap();
+    std::fs::write(
+        dir.join("driver.toml"),
+        format!(
+            "id=\"test-driver\"\nname=\"Mesa Test Driver\"\nversion=\"0.1.0\"\nexecutable=\"{name}\"\nprotocol_major={}\nprotocol_minor=2\n",
+            mesa_driver_protocol::PROTOCOL_MAJOR
+        ),
+    )
+    .unwrap();
+    let mgr = std::sync::Arc::new(mesa_driver_manager::MesaManager::discover(&root));
+    // 若环境未编译 test-driver，跳过而非失败
+    if mgr.find_driver("test-driver").is_none() {
+        eprintln!("test-driver not discovered, skip lazy descriptor test");
+        std::fs::remove_dir_all(&root).ok();
         return;
     }
     let desc = mgr
-        .get_descriptor("simulator")
+        .get_descriptor("test-driver")
         .await
         .expect("lazy descriptor must succeed");
     desc.validate().expect("fetched descriptor must be valid");
-    assert_eq!(desc.identity.driver_id, "simulator");
+    assert_eq!(desc.identity.driver_id, "test-driver");
     assert!(desc.contract_major >= 1);
     // 二次命中缓存
-    let desc2 = mgr.get_descriptor("simulator").await.unwrap();
+    let desc2 = mgr.get_descriptor("test-driver").await.unwrap();
     assert_eq!(desc, desc2);
+    std::fs::remove_dir_all(&root).ok();
 }

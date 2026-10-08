@@ -21,10 +21,10 @@ import { applySelectionAdd } from "../resourceSelectionModel";
 import { bootstrapDevice, isDraftComplete, newOperationKey, type AcquisitionDraft, type BootstrapReport, type ConnectionDraft, type DeviceDraft } from "./bootstrap";
 
 const FALLBACK_DRIVERS = [
-  { value: "simulator", label: "Simulator" },
   { value: "s7", label: "Siemens S7" },
   { value: "focas2", label: "FANUC FOCAS2" },
   { value: "opcua", label: "OPC UA" },
+  { value: "sinumerik-nck", label: "SINUMERIK NCK" },
 ];
 
 export function AddDeviceFlow() {
@@ -37,7 +37,7 @@ export function AddDeviceFlow() {
   const [acquisition, setAcquisition] = useState<AcquisitionDraft | null>(null);
 
   // 连接步状态（Descriptor-driven，与 Onboarding/DeviceDetail 同源逻辑）
-  const [driverId, setDriverId] = useState("simulator");
+  const [driverId, setDriverId] = useState("s7");
   const [driverOptions, setDriverOptions] = useState(FALLBACK_DRIVERS);
   const [desc, setDesc] = useState<DriverDescriptor | null>(null);
   const [conn, setConn] = useState<Record<string, unknown>>({});
