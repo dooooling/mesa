@@ -90,7 +90,6 @@ runs:
         echo "sccache writer: ${{ inputs.cache-writer }}"
         echo "sccache remote backend: disabled (local archive topology v2)"
         sccache --version
-        sccache --show-config || true
 
     # sccache archive restore（reader/PR 全 job；main writer 走下步完整
     # actions/cache——互斥，避免同 archive restore 两次）。
