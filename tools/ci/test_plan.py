@@ -51,13 +51,13 @@ def main():
     check("web-only", p["web"] is True and p["canonical"] is False
           and p["platform_mode"] == "skip" and p["stress"] is False, p)
 
-    # focas2 source → rdeps(focas2), smoke, no stress/perf, web true。
+    # focas2 source → rdeps(focas2), smoke, no stress/perf, no web（CI v3）。
     p = plan_for_files(["drivers/focas2/src/wire/codec.rs"], pkgs())
     check("focas2 filter", p["canonical_filter"] == "rdeps(=mesa-driver-focas2)", p)
     check("focas2 smoke", p["platform_mode"] == "smoke", p)
     check("focas2 no stress", p["stress"] is False, p)
     check("focas2 no perf", p["perf"] is False, p)
-    check("focas2 web", p["web"] is True, p)
+    check("focas2 web", p["web"] is False, p)
 
     # driver-manager → canonical+platform+stress+perf。
     p = plan_for_files(["crates/driver-manager/src/x.rs"], pkgs())
@@ -133,10 +133,21 @@ def main():
           and p["platform_mode"] == "smoke" and p["stress"] is False
           and p["perf"] is False, p)
 
-    # focas2 selective build：只构建受影响包（CI v3 第一刀）。
+    # FOCAS-only：filter + selective build + contract bins（graph 判定）。
     p = plan_for_files(["drivers/focas2/src/x.rs"], pkgs())
+    check("focas2 filter", p["canonical_filter"] == "rdeps(=mesa-driver-focas2)", p)
     check("focas2 selective build", p["build_targets"]
           == {"kind": "packages", "packages": ["mesa-driver-focas2"]}, p)
+    check("focas2 contract bins", p["canonical_contract_bins"] is True, p)
+    # Rust-only 不带 web（CI v3：web 仅 apps/mesa-web 受影响才跑）。
+    check("focas2 no web", p["web"] is False, p)
+
+    # 反例（graph 级）：mesa-nck-emulator 的 rdeps 不含 contract-tests
+    # → bins=false（防退化成“所有 canonical 都补 bins”；经 SPECIAL_PACKAGES
+    # 映射的 tools/nck-emulator 路径因含 contract-tests 而为 true，不冲突）。
+    check("nck-emulator no contract bins",
+          plan.needs_contract_bins({"mesa-nck-emulator"}, pkgs()) is False,
+          plan.rdeps_closure({"mesa-nck-emulator"}))
 
     # driver-manager 不牵连 contract-tests/mesad → selective packages。
     p = plan_for_files(["crates/driver-manager/src/x.rs"], pkgs())

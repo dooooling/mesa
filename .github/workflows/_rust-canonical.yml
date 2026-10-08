@@ -21,6 +21,11 @@ on:
         required: false
         default: '{"kind":"bins"}'
         type: string
+      contract-bins:
+        description: "filter 的 rdeps 是否含 contract-tests（planner graph 判定）"
+        required: false
+        default: "true"
+        type: string
       soak:
         description: "run 或 skip（长 soak 归属 stress）"
         required: false
@@ -49,19 +54,14 @@ jobs:
           install-nextest: "true"
 
       # selective bins：packages 只构建受影响包；bins 全 workspace。
-      # contract runtime prerequisites（BLOCKER 真修）：只要 filter 可能带入
-      # mesa-contract-tests，就必须先保证 mesad / simulator / helpers bins
-      # 存在——否则 orphan_guard 静默 skip、sim/mesad 测试直接 panic。
-      # 不退回全 workspace bins：只补最小 prerequisite。
+      # contract runtime 前置由下步 contract-bins 保障，此处不重复构建。
       - name: build targets
         env:
           BUILD_TARGETS: ${{ inputs.build-targets }}
-          CANONICAL_FILTER: ${{ inputs.filter }}
         run: |
           python3 - <<'EOF'
-          import json, os, subprocess, sys
+          import json, os, subprocess
           spec = json.loads(os.environ['BUILD_TARGETS'])
-          filt = os.environ.get('CANONICAL_FILTER', 'all()')
           if spec.get('kind') == 'packages':
               pkgs = spec.get('packages', [])
               if not pkgs:
@@ -74,14 +74,14 @@ jobs:
               cmd = ['cargo', 'build', '--locked', '--workspace', '--bins']
               print('build:', ' '.join(cmd))
               subprocess.run(cmd, check=True)
-          # contract prerequisites：filter 含 contract-tests 即补 bins
-          #（mesad + simulator + helpers；helper bins 随 contract-tests --bins 产出）。
-          if 'mesa-contract-tests' in filt:
-              cmd = ['cargo', 'build', '--locked', '-p', 'mesad',
-                     '-p', 'mesa-driver-simulator', '-p', 'mesa-contract-tests', '--bins']
-              print('prereq:', ' '.join(cmd))
-              subprocess.run(cmd, check=True)
           EOF
+
+      # contract runtime prerequisites（BLOCKER 真修 v2）：planner graph
+      # 输出 canonical_contract_bins，不解析 filter 字符串——filter 写法变了
+      # 也不漏；false 时不补 bins（防退化成全补）。
+      - name: build contract runtime bins
+        if: inputs.contract-bins == 'true'
+        run: cargo build --locked -p mesad -p mesa-driver-simulator -p mesa-contract-tests --bins
 
       - name: nextest (profile ci, soak excluded)
         run: >

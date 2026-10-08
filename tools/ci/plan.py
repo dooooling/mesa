@@ -115,6 +115,90 @@ FULL_PATHS = (
 )
 
 
+# --- workspace rdeps（Cargo metadata 反向依赖闭包；不解析 filter 字符串） ---
+
+_RDEPS_CACHE: dict[str, set[str]] | None = None
+
+
+def reverse_deps() -> dict[str, set[str]]:
+    """package → 被哪些 packages 直接依赖（workspace 内，含 dev-deps）。
+
+    从 Cargo.toml 的 [dependencies]/[dev-dependencies]/[build-dependencies]
+    path 依赖解析；workspace = true 的 path 依赖回查 member 名。
+    缓存一次（planner 进程内多次调用共用）。
+    """
+    global _RDEPS_CACHE
+    if _RDEPS_CACHE is not None:
+        return _RDEPS_CACHE
+    members = workspace_packages()  # dir → name
+    # 正向：path → package 名（归一化，对大小写/分隔符不敏感比对用）。
+    def _norm(p: str) -> str:
+        return os.path.normpath(p).replace("\\", "/").lower()
+
+    norm_to_name = {_norm(m): name for m, name in members.items()}
+    # package name → 直接依赖的 workspace package names。
+    deps: dict[str, set[str]] = {name: set() for name in members.values()}
+    for member_dir, pkg_name in members.items():
+        with open(os.path.join(REPO_ROOT, member_dir, "Cargo.toml"), "rb") as f:
+            doc = tomllib.load(f)
+        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+            table = doc.get(section, {})
+            if not isinstance(table, dict):
+                continue
+            for dep_name, spec in table.items():
+                target: str | None = None
+                if isinstance(spec, dict):
+                    if "path" not in spec and "workspace" not in spec:
+                        continue
+                    if "path" in spec and "workspace" not in spec:
+                        # 纯 path 依赖：归一化后回查 member。
+                        p = os.path.normpath(os.path.join(member_dir, spec["path"]))
+                        target = norm_to_name.get(_norm(p))
+                    else:
+                        # workspace = true（含 workspace.path 双写）：
+                        # dep 名即 package 名。
+                        target = dep_name
+                # 字符串 spec 无 path（如 serde = "1"），跳过。
+                if target is None:
+                    continue
+                if target in deps:
+                    deps[pkg_name].add(target)
+    # 反转：dep → dependents（dep 名按 TOML key；workspace members 的
+    # package 名与 key 一致时直接命中——path 依赖的 key 即 package 名）。
+    rdeps: dict[str, set[str]] = {name: set() for name in members.values()}
+    for pkg, ds in deps.items():
+        for d in ds:
+            if d in rdeps:
+                rdeps[d].add(pkg)
+            # 非 workspace 外部依赖（如 serde/tokio）不在图中，跳过。
+    _RDEPS_CACHE = rdeps
+    return rdeps
+
+
+def rdeps_closure(pkgs: set[str]) -> set[str]:
+    """pkgs 的反向依赖传递闭包（含自身）。"""
+    graph = reverse_deps()
+    seen = set(pkgs)
+    stack = list(pkgs)
+    while stack:
+        cur = stack.pop()
+        for dep in graph.get(cur, ()):
+            if dep not in seen:
+                seen.add(dep)
+                stack.append(dep)
+    return seen
+
+
+def needs_contract_bins(pkgs: set[str], packages: dict[str, str]) -> bool:
+    """canonical 是否需要 contract runtime bins。
+
+    rdeps(pkgs) 含 mesa-contract-tests 即 true——filter 字符串只是
+    rdeps 的渲染，不作为判断依据（filter 写法变了也不漏）。
+    """
+    _ = packages  # 签名保留 packages 以便未来扩展；当前用 workspace graph。
+    return "mesa-contract-tests" in rdeps_closure(pkgs)
+
+
 def is_docs_only(path: str) -> bool:
     pl = path.lower()
     return path == ".gitignore" or path == "docs/" or path.startswith("docs/") or pl.endswith(".md")
@@ -127,6 +211,7 @@ def full_plan(reason: str) -> dict:
         "canonical": True,
         "canonical_filter": "all()",
         "canonical_soak": "run",
+        "canonical_contract_bins": True,
         "platform_mode": "full",
         "platform_soak": "run",
         "build_targets": {"kind": "bins"},
@@ -145,6 +230,7 @@ def empty_plan(reason: str) -> dict:
         "canonical": False,
         "canonical_filter": "none()",
         "canonical_soak": "skip",
+        "canonical_contract_bins": False,
         "platform_mode": "skip",
         "platform_soak": "skip",
         "build_targets": {"kind": "none"},
@@ -170,6 +256,7 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
             "canonical": False,
             "canonical_filter": "none()",
             "canonical_soak": "skip",
+            "canonical_contract_bins": False,
             "platform_mode": "skip",
             "platform_soak": "skip",
             "build_targets": {"kind": "none"},
@@ -232,18 +319,29 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
     else:
         build_targets = {"kind": "packages", "packages": sorted(pkgs)}
 
+    # contract runtime bins：canonical filter 的 rdeps 若含 mesa-contract-tests，
+    # 则 canonical 必须先补 mesad + simulator + contract --bins。
+    # 不解析 filter 字符串：直接用 workspace dependency graph 求 rdeps 闭包。
+    contract_bins = needs_contract_bins(pkgs, packages)
+
+    # web：只有 apps/mesa-web 受影响才跑（Rust-only 不带 web）。
+    web = any(
+        p == "apps/mesa-web/" or p.startswith("apps/mesa-web/") for p in files
+    )
+
     plan = {
         "plan_version": PLAN_VERSION,
         "quality": True,
         "canonical": True,
         "canonical_filter": filt,
         "canonical_soak": "skip",
+        "canonical_contract_bins": contract_bins,
         "platform_mode": "smoke",
         "platform_soak": "skip",
         "build_targets": build_targets,
         "stress": stress,
         "perf": perf,
-        "web": True,
+        "web": web,
         "reason": "; ".join(reasons),
     }
     if is_main and any(
