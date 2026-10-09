@@ -647,16 +647,16 @@ pub fn run_live_harness() {
 }
 
 /// 165 Spindle Load Native 零负载对照（单窗探针，与四窗 harness 独立）。
-///
-/// - 只调 `cnc_rdspmeter(type=0, num_in=2)`（与 Wire 取证参数一致），单次
-///   OPEN → 单次 FFI → CLOSE；不跑 L0/L1/L2/L0R，不要求面板非零（165 空载）。
-/// - 记录 `rc/num_in/num_out` + ABI 缓冲原始区 + 实际写入范围 + guard/tail；
-///   sentinel 未写入区不得解释为真实值；`rc≠0`/越界/`num_out` 异常即停。
-/// - 同步抓 DLL 请求/响应（Wireshark/pktmon 由操作方并行抓取，本探针只输出
-///   FFI 侧证据；网络分支归属待抓包对照）。
-/// - `#[ignore]` 真机 only；CI 默认不跑；不碰 production gate/Wire decoder。
-/// - 用法：`MESA_FOCAS_GATE0_HOST=192.168.15.165 cargo test -p mesa-driver-focas2
-///   --lib -- --ignored spindle_load_zero_probe --nocapture`。
+/// 只调 `cnc_rdspmeter(type=0, num_in=2)`（与 Wire 取证参数一致），单次
+/// OPEN 到单次 FFI 到 CLOSE；不跑 L0/L1/L2/L0R，不要求面板非零（165 空载）。
+/// 记录 `rc/num_in/num_out` 加 ABI 缓冲原始区加实际写入范围加 guard/tail；
+/// sentinel 未写入区不得解释为真实值；`rc≠0`/越界/`num_out` 异常即停。
+/// 同步抓 DLL 请求/响应（Wireshark/pktmon 由操作方并行抓取，本探针只输出
+/// FFI 侧证据；网络分支归属待抓包对照）。
+/// `#[ignore]` 真机 only；CI 默认不跑；不碰 production gate/Wire decoder。
+/// 用法：`MESA_FOCAS_GATE0_HOST=192.168.15.165 cargo test -p mesa-driver-focas2
+/// --lib spindle_load_zero_live -- --ignored --nocapture --test-threads=1`
+/// （过滤名为注册测试 `spindle_load_zero_live`；须见 `1 test` 运行）。
 #[cfg(test)]
 pub fn spindle_load_zero_probe() {
     use crate::native::{FocasRet, NativeLib, OdbSpLoad};
@@ -742,6 +742,16 @@ pub fn spindle_load_zero_probe() {
                 e.slot
             );
         }
+    }
+    // 记录跨度外 sentinel 确认（`abi_span..512` 全为 0xCC；DLL 越 record 写即 HOLD）。
+    {
+        let abi_span = (num.max(0) as usize) * 24;
+        assert!(
+            buf.payload[abi_span..LOAD_RAW_KEEP]
+                .iter()
+                .all(|&b| b == LOAD_SENTINEL),
+            "HOLD：DLL 写超返回 record 跨度（span 后残留被改）"
+        );
     }
     guard.close();
     println!("<<< ZERO-PROBE done (num_out={num})");
