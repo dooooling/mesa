@@ -479,6 +479,117 @@ pub struct AlarmResult {
     pub alarms: Vec<AlarmMessage>,
 }
 
+/// Load 数值单元（阶段 A v2：Wire 8B = raw BE32 @0 + aux @4 保留 + dec BE16 @6）。
+/// B3 修正：`@4` 不命名 unit——ABI `unit` 由 typed converter 按 DLL 规则产生，
+/// 不直接等于网络 `@4`。typed 只到 Raw+Decimal；换算与 unit 映射在各自
+/// converter（生产数值语义未闭合，P0）。
+/// NOTE：阶段 A 无生产调用方（`#[allow(dead_code)]` 为合同先行标记；
+/// Evidence Day 闭合后接入 production，Gate 3-A/3-B 前 HOLD）。
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadNumeric {
+    /// 原始整数（i32 BE；servo 侧 DLL 取绝对值，spindle 侧保留符号——
+    /// 符号处理在各自 typed op，不在此共用）。
+    pub raw: i32,
+    /// `@4` 保留原始位型（不命名 unit，见 B3）。
+    pub aux4: [u8; 2],
+    /// 小数位（BE16 @6；`0..=9` 外即 `Unsupported`，不猜）。
+    pub dec_bits: u16,
+}
+
+impl LoadNumeric {
+    /// 解码 8B（精确 8B，不多不少）。
+    #[allow(dead_code)]
+    pub fn decode(raw: &[u8]) -> Result<Self, WireError> {
+        if raw.len() != LOAD_ELEM_DATA_LEN {
+            return Err(WireError::MalformedPayload);
+        }
+        Ok(Self {
+            raw: i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]),
+            aux4: [raw[4], raw[5]],
+            dec_bits: u16::from_be_bytes([raw[6], raw[7]]),
+        })
+    }
+
+    /// dec 门（`0..=9`；之外即 `Unsupported`）。
+    #[allow(dead_code)]
+    pub fn validate_dec(&self) -> Result<(), WireError> {
+        if self.dec_bits > 9 {
+            return Err(WireError::Unsupported("load dec out of range"));
+        }
+        Ok(())
+    }
+
+    /// servo 侧 ABI 转换（DLL 规则：`abs(raw)` + `unit=0`％）。
+    /// `INT32_MIN` 即溢出拒绝，不 panic。
+    #[allow(dead_code)]
+    pub fn to_servo_abi(self) -> Result<(i32, i16), WireError> {
+        self.validate_dec()?;
+        let abs_raw = self
+            .raw
+            .checked_abs()
+            .ok_or(WireError::Unsupported("servo raw INT32_MIN overflow"))?;
+        Ok((abs_raw, 0))
+    }
+
+    /// spindle 侧 ABI 转换（DLL 规则：保留符号；load 侧 `unit=0`％）。
+    /// speed 侧 `unit=1`rpm 由调用方按 type 决定（decoder 已分 load/speed 槽，
+    /// 此处统一给 load 语义；speed unit 待 Evidence Day 接入时在 converter 落定，
+    /// 当前离线 raw 阶段不声称已完整转换）。
+    #[allow(dead_code)]
+    pub fn to_spindle_abi(self) -> Result<(i32, i16), WireError> {
+        self.validate_dec()?;
+        Ok((self.raw, 0))
+    }
+}
+
+/// Servo load 记录（阶段 A v2：数值 + 轴名；轴名来自 `0x89` 名称数组，
+/// 每项 4B，保留前三原始字节，不推断 `data[i] = 轴i`）。
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServoLoadRecord {
+    /// 轴名前三原始字节（如 `X\0\0`；`suff2` 保留原始值，不赋业务语义）。
+    pub axis_raw: [u8; 3],
+    /// 数值单元。
+    pub numeric: LoadNumeric,
+}
+
+/// Servo load 新分支 typed 结果（阶段 A v2：`A4[2]+89[0]+56[1]+A4[2]` 四槽；
+/// `89` = 名称数组 N×4B，`56` = 负载数组 N×8B；N=min(num_in,before,after)）。
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServoLoadNew {
+    /// 每轴记录（按名称/数值配对顺序；前后数量可不同，不声称原子快照）。
+    pub records: Vec<ServoLoadRecord>,
+}
+
+/// Spindle 单主轴记录（阶段 A v2：load/speed 按 type 以 `Option` 承载；
+/// 未选择侧为 `None`，不用零值冒充）。
+/// `name_raw` 为 `8A` 名称数组每项前三原始字节（与 Servo `axis_raw` 一致；
+/// 有损 `lossy` 转换会丢非 UTF-8 字节，而旧回退按第三字节选 scale，
+/// 故证据层必须无损保留；显示名由上层按需派生）。
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpindleRecord {
+    /// 主轴名前三原始字节（如 `S1\0`；`8A` 名称槽归属，不推断序号语义）。
+    pub name_raw: [u8; 3],
+    /// load 数值（`type=0/-1` 时 `Some`；`type=1` 时 `None`）。
+    pub load: Option<LoadNumeric>,
+    /// speed 数值（`type=1/-1` 时 `Some`；`type=0` 时 `None`）。
+    pub speed: Option<LoadNumeric>,
+}
+
+/// Spindle load typed 结果（阶段 A v2：`A4[1]+8A[0]+40[type]+A4[1]`；
+/// `type=-1` 时两个独立 `40[4]`/`40[5]` 请求，非单槽 16B）。
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpindleMeter {
+    /// 请求 type 回显（0=load / 1=speed / -1=all；不符即 `CommandMismatch`）。
+    pub req_type: i32,
+    /// 主轴记录（含名称归属；单主轴即 1 元）。
+    pub records: Vec<SpindleRecord>,
+}
+
 /// FOCAS `diagnosis_value`（`0x93`）typed 结果。diagnosis REAL Evidence PASS：
 /// `device=1/path=1/args=[n,n,axis,0]/aux=0`；单点语义，不做范围读。
 /// 布局：`[0..4]` BE32 datano + `[4..6]` attr（observed，不命名 axis echo——
@@ -669,6 +780,80 @@ pub(super) const CMD_PMC_READ: u16 = 0x8001;
 /// （`#[allow(dead_code)]` 合同先行标记，与 `DIAGNOSIS_AXIS_MAX` 同例）。
 #[allow(dead_code)]
 pub(super) const CMD_PMC_WRITE: u16 = 0x8002;
+// ---------------------------------------------------------------------------
+// Load 离线协议（阶段 A v2：synthetic evidence，不连机床，不改 production gate）。
+//
+// DLL 逆向模型（review 冻结，待 Evidence Day 真机验证；RVA/常量表/全部分支
+// 不标已独立复核）：
+// - 新 servo：`A4[2] + 89[0] + 56[1] + A4[2]`（四槽；`89` = 名称数组 N×4B，
+//   `56` = 负载数组 N×8B；前后数量可不同，N=min(num_in,before,after)）；
+// - 新 spindle：`A4[1] + 8A[0] + 40[type] + A4[1]`（type 0/1；`-1` 时两个
+//   独立 `40[4]`/`40[5]` 请求）；`8A` = 名称槽；多主轴记录 + 名称归属；
+// - 旧 servo：`0x56 + 0x89`；旧 spindle：`0x40[0/1,-1] + 比例参数 0x0E` 回退。
+// 8B numeric：raw BE32 @0 + aux @4（保留，不命名 unit）+ dec BE16 @6。
+// ABI unit 由 typed converter 按 DLL 规则产生，不直接等于网络 @4。
+// 回退算术：`trunc(abs(raw) × scale / div)`（load /32767，speed /16383；
+// scale 由名称第三字节选 4127/4274、4020/4196）。
+// 生产数值语义（U32/F64/换算）尚未闭合——typed 只到 Raw+Decimal，unit 转换
+// 在各自 converter；Gate 3-A/3-B 继续 HOLD。
+// ---------------------------------------------------------------------------
+/// load 旧/新分支头尾命令（`0xA4`；与 spindle word 头同 command 不同语境，
+/// operation identity = command + args + context，不单冻 command）。
+#[allow(dead_code)]
+pub(super) const CMD_LOAD_HEAD: u16 = 0x00A4;
+/// servo 新分支名称槽（`0x89[0,0]`；名称数组 N×4B，保留前三原始字节）。
+#[allow(dead_code)]
+pub(super) const CMD_SERVO_LOAD_NAMES: u16 = 0x0089;
+/// servo load 数值槽（`0x56[1,0]`；负载数组 N×8B。旧分支亦用 `0x56` 作数值
+/// 槽——context 区分：四槽新分支 vs `0x56+0x89` 旧分支）。
+#[allow(dead_code)]
+pub(super) const CMD_SERVO_LOAD: u16 = 0x0056;
+/// spindle 名称槽（`0x8A[0]`；多主轴名称归属）。
+#[allow(dead_code)]
+pub(super) const CMD_SPINDLE_NAMES: u16 = 0x008A;
+/// spindle load 数值槽（`0x40[4/5,-1,0,0]` 新分支；旧分支 `[0/1,-1]`；与
+/// spindle word `0x40[func,sp]` 同 command 不同 args——context 区分）。
+#[allow(dead_code)]
+pub(super) const CMD_SPINDLE_METER: u16 = 0x0040;
+/// spindle 新分支 load type（`0x40[4,-1,0,0]`）。
+#[allow(dead_code)]
+pub(super) const SPINDLE_METER_FUNC_LOAD: i32 = 4;
+/// spindle 新分支 speed type（`0x40[5,-1,0,0]`）。
+#[allow(dead_code)]
+pub(super) const SPINDLE_METER_FUNC_SPEED: i32 = 5;
+/// spindle 旧分支 load func（`0x40[0,-1,0,0]` raw load）。
+#[allow(dead_code)]
+pub(super) const SPINDLE_METER_FUNC_LEGACY_LOAD: i32 = 0;
+/// spindle 旧分支 speed func（`0x40[1,-1,0,0]` raw speed）。
+#[allow(dead_code)]
+pub(super) const SPINDLE_METER_FUNC_LEGACY_SPEED: i32 = 1;
+/// spindle type=-1（all：两个独立请求 `40[4]` + `40[5]`，非单槽 16B）。
+#[allow(dead_code)]
+pub(super) const SPINDLE_METER_TYPE_ALL: i32 = -1;
+/// 比例参数命令（旧 spindle 回退 `0x0E[4127/4274/4020/4196]`）。
+#[allow(dead_code)]
+pub(super) const CMD_RATIO_PARAM: u16 = 0x000E;
+/// 旧 spindle 回退 scale 选择（名称第三字节：`'2'` 与否决定 load/speed scale）。
+/// 非“分子/分母配对”——load 与 speed 各一 scale，除数固定（load /32767，
+/// speed /16383）。
+#[allow(dead_code)]
+pub(super) const RATIO_SCALE_LOAD_STD: i32 = 4127;
+#[allow(dead_code)]
+pub(super) const RATIO_SCALE_LOAD_ALT: i32 = 4274;
+#[allow(dead_code)]
+pub(super) const RATIO_SCALE_SPEED_STD: i32 = 4020;
+#[allow(dead_code)]
+pub(super) const RATIO_SCALE_SPEED_ALT: i32 = 4196;
+/// 旧 spindle 回退除数（load /32767；speed /16383）。
+#[allow(dead_code)]
+pub(super) const RATIO_DIV_LOAD: i32 = 32767;
+#[allow(dead_code)]
+pub(super) const RATIO_DIV_SPEED: i32 = 16383;
+/// load 数值单元 8B（raw BE32 @0 + aux @4 保留 + dec BE16 @6；
+/// 与 `RawNumeric8` 不同布局；`@4` 不命名 unit，见 B3）。
+pub const LOAD_ELEM_DATA_LEN: usize = 8;
+/// servo 名称项宽度（4B/项，保留前三原始字节）。
+pub const SERVO_NAME_STRIDE: usize = 4;
 /// 兼容视图：`function = path<<16|command`（旧代码用，字节等价）。
 /// （`FUNC_SYSINFO` 等保留供 fixture/request builder 兼容，见下。）
 pub(super) const FUNC_SYSINFO: u32 = 0x0001_0018;
@@ -2138,6 +2323,267 @@ pub(super) fn decode_opmsg_value(resp: &FocasFrame) -> Result<OperatorMessage, W
         header,
         text,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Load decoder（阶段 A v2：离线可测，不连机床，不接 production gate）。
+// ---------------------------------------------------------------------------
+
+/// A4 数量解析（B1 数量合同）：A4 数据体首 BE16 即 count；
+/// 不足 2B 即 `MalformedPayload`（不猜数量语义）。
+#[allow(dead_code)]
+pub(super) fn decode_head_count(data: &[u8]) -> Result<usize, WireError> {
+    if data.len() < 2 {
+        return Err(WireError::MalformedPayload);
+    }
+    Ok(u16::from_be_bytes([data[0], data[1]]) as usize)
+}
+
+/// servo 新分支解码（B1 v2：`A4[2] + 89[0] + 56[1] + A4[2]` 四槽固定）。
+/// `89` = 名称数组（N×4B，每项保留前三原始字节）；`56` = 负载数组（N×8B）。
+/// N=`min(num_in, count_before, count_after)`——首尾 A4 数据体由本函数读取，
+/// 调用方传入 `num_in`（请求轴数上限 8），decoder 内部取 min，不信任传入值。
+/// 前后数量可不同，不要求相等，不自动重试；`min=0` 即返回空记录（不伪造）。
+/// 容量检查：名称 `len >= N*4` 且负载 `len >= N*8`，不足即 `Malformed`（不越界）。
+/// 四槽 status 全检查（任一非零即 Remote，保 detail 透传）。
+/// servo 符号：`to_servo_abi`（abs；INT32_MIN 拒绝）。
+#[allow(dead_code)]
+pub(super) fn decode_servo_load_new(
+    resp: &FocasFrame,
+    num_in: usize,
+) -> Result<ServoLoadNew, WireError> {
+    if num_in == 0 || num_in > 8 {
+        return Err(WireError::Unsupported("servo axes 1..8"));
+    }
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    if subs.len() != 4 {
+        return Err(WireError::CommandMismatch);
+    }
+    let head = &subs[0];
+    let names = &subs[1];
+    let values = &subs[2];
+    let tail = &subs[3];
+    if head.device != DEV_CNC
+        || head.path != PATH_CNC
+        || head.command != CMD_LOAD_HEAD
+        || names.device != DEV_CNC
+        || names.path != PATH_CNC
+        || names.command != CMD_SERVO_LOAD_NAMES
+        || values.device != DEV_CNC
+        || values.path != PATH_CNC
+        || values.command != CMD_SERVO_LOAD
+        || tail.device != DEV_CNC
+        || tail.path != PATH_CNC
+        || tail.command != CMD_LOAD_HEAD
+    {
+        return Err(WireError::CommandMismatch);
+    }
+    let head_data = reply_success_data(head)?;
+    let name_data = reply_success_data(names)?;
+    let val_data = reply_success_data(values)?;
+    let tail_data = reply_success_data(tail)?;
+    // 数量合同：N=min(num_in, before, after)（首尾 A4 数据体首 BE16）。
+    let count_before = decode_head_count(head_data)?;
+    let count_after = decode_head_count(tail_data)?;
+    let num_axes = num_in.min(count_before).min(count_after);
+    // 容量门：名称 N×4B，负载 N×8B（不足即 Malformed，不越界读）。
+    if name_data.len() < num_axes * SERVO_NAME_STRIDE
+        || val_data.len() < num_axes * LOAD_ELEM_DATA_LEN
+    {
+        return Err(WireError::MalformedPayload);
+    }
+    let mut records = Vec::with_capacity(num_axes);
+    for i in 0..num_axes {
+        let n = LoadNumeric::decode(&val_data[i * 8..i * 8 + 8])?;
+        let (abs_raw, _unit) = n.to_servo_abi()?;
+        let mut axis_raw = [0u8; 3];
+        axis_raw.copy_from_slice(&name_data[i * 4..i * 4 + 3]);
+        records.push(ServoLoadRecord {
+            axis_raw,
+            numeric: LoadNumeric {
+                raw: abs_raw,
+                aux4: n.aux4,
+                dec_bits: n.dec_bits,
+            },
+        });
+    }
+    Ok(ServoLoadNew { records })
+}
+
+/// spindle 新分支解码（B2 v2：同批次 `A4[1] + 8A[0] + 40… + A4[1]`）。
+/// `req_type=0/1` 用 4 槽（单 `40[type]`；`8A` 名称 N×4B，`40` 数值 M×8B，
+/// N 取 min 值，M 不足即 `Malformed`）；`req_type=-1` 用 5 槽
+/// （`40[4]` + `40[5]` 双槽同批次；load/speed 按槽配对，错位即 `CommandMismatch`）。
+/// `8A` 名称每项 4B（与 servo 同布局；保留前三原始字节，不做空格/NUL 切分）。
+/// 未选择侧为 `None`（不用零值冒充）。
+/// 各槽 status 全检查（任一非零即 Remote，保 detail 透传）。
+/// spindle 符号：保留（不 abs；INT32_MIN 合法值，直传）。
+#[allow(dead_code)]
+pub(super) fn decode_spindle_meter(
+    resp: &FocasFrame,
+    req_type: i32,
+    num_in: usize,
+) -> Result<SpindleMeter, WireError> {
+    if ![0, 1, SPINDLE_METER_TYPE_ALL].contains(&req_type) {
+        return Err(WireError::Unsupported("spindle meter type 0/1/-1"));
+    }
+    if num_in == 0 || num_in > 4 {
+        return Err(WireError::Unsupported("spindle count 1..4"));
+    }
+    let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
+    // 槽数门：type=0/1 → 4 槽；type=-1 → 5 槽（双 40 同批次）。
+    let want_slots = if req_type == SPINDLE_METER_TYPE_ALL {
+        5
+    } else {
+        4
+    };
+    if subs.len() != want_slots {
+        return Err(WireError::CommandMismatch);
+    }
+    let head = &subs[0];
+    let names = &subs[1];
+    let tail = &subs[want_slots - 1];
+    if head.device != DEV_CNC
+        || head.path != PATH_CNC
+        || head.command != CMD_LOAD_HEAD
+        || names.device != DEV_CNC
+        || names.path != PATH_CNC
+        || names.command != CMD_SPINDLE_NAMES
+        || tail.device != DEV_CNC
+        || tail.path != PATH_CNC
+        || tail.command != CMD_LOAD_HEAD
+    {
+        return Err(WireError::CommandMismatch);
+    }
+    let head_data = reply_success_data(head)?;
+    let name_data = reply_success_data(names)?;
+    let tail_data = reply_success_data(tail)?;
+    // 数量合同：N=min(num_in, before, after)。
+    let count_before = decode_head_count(head_data)?;
+    let count_after = decode_head_count(tail_data)?;
+    let n = num_in.min(count_before).min(count_after);
+    if name_data.len() < n * SERVO_NAME_STRIDE {
+        return Err(WireError::MalformedPayload);
+    }
+    // 名称数组（每项 4B，保留前三原始字节；无损，不做 lossy 转换。
+    // 旧回退按第三字节选 scale，非 UTF-8 字节经 lossy 即无法恢复）。
+    let spindle_names: Vec<[u8; 3]> = (0..n)
+        .map(|i| {
+            let mut raw = [0u8; 3];
+            raw.copy_from_slice(&name_data[i * 4..i * 4 + 3]);
+            raw
+        })
+        .collect();
+    if req_type == SPINDLE_METER_TYPE_ALL {
+        // 五槽：subs[2]=40[4] load 数组，subs[3]=40[5] speed 数组（各 N×8B）。
+        let load_sub = &subs[2];
+        let speed_sub = &subs[3];
+        if load_sub.device != DEV_CNC
+            || load_sub.path != PATH_CNC
+            || load_sub.command != CMD_SPINDLE_METER
+            || speed_sub.device != DEV_CNC
+            || speed_sub.path != PATH_CNC
+            || speed_sub.command != CMD_SPINDLE_METER
+        {
+            return Err(WireError::CommandMismatch);
+        }
+        let load_data = reply_success_data(load_sub)?;
+        let speed_data = reply_success_data(speed_sub)?;
+        if load_data.len() < n * LOAD_ELEM_DATA_LEN || speed_data.len() < n * LOAD_ELEM_DATA_LEN {
+            return Err(WireError::MalformedPayload);
+        }
+        let mut records = Vec::with_capacity(n);
+        for i in 0..n {
+            let l = LoadNumeric::decode(&load_data[i * 8..i * 8 + 8])?;
+            l.validate_dec()?;
+            let s = LoadNumeric::decode(&speed_data[i * 8..i * 8 + 8])?;
+            s.validate_dec()?;
+            records.push(SpindleRecord {
+                name_raw: spindle_names[i],
+                load: Some(l),
+                speed: Some(s),
+            });
+        }
+        return Ok(SpindleMeter { req_type, records });
+    }
+    // 四槽：subs[2]=40 单数组（N×8B）。
+    let meter = &subs[2];
+    if meter.device != DEV_CNC || meter.path != PATH_CNC || meter.command != CMD_SPINDLE_METER {
+        return Err(WireError::CommandMismatch);
+    }
+    let d = reply_success_data(meter)?;
+    if d.len() < n * LOAD_ELEM_DATA_LEN {
+        return Err(WireError::MalformedPayload);
+    }
+    let mut records = Vec::with_capacity(n);
+    for i in 0..n {
+        let m = LoadNumeric::decode(&d[i * 8..i * 8 + 8])?;
+        m.validate_dec()?;
+        let (load, speed) = if req_type == 0 {
+            (Some(m), None)
+        } else {
+            (None, Some(m))
+        };
+        records.push(SpindleRecord {
+            name_raw: spindle_names[i],
+            load,
+            speed,
+        });
+    }
+    Ok(SpindleMeter { req_type, records })
+}
+
+/// 旧 spindle 首槽 status 分支（B4：`status=4` 即进入七槽回退，
+/// 其余非零即 Remote 传播（保 `detail1/detail2` 透传，不填 0），不误触发回退）。
+/// 返回 `Ok(true)` = 应进入回退；`Ok(false)` = 成功路径（status=0）；
+/// `Err(Remote)` = 其他 status，直接传播。
+/// 调用方传入首槽完整 `status/detail1/detail2`（远端错误上下文不丢）。
+#[allow(dead_code)]
+pub(super) fn spindle_legacy_branch(
+    status: i16,
+    detail1: i16,
+    detail2: i16,
+) -> Result<bool, WireError> {
+    match status {
+        0 => Ok(false),
+        4 => Ok(true),
+        other => Err(WireError::Remote {
+            status: other,
+            detail1,
+            detail2,
+        }),
+    }
+}
+
+/// 旧 spindle 回退算术（B4：`trunc(abs(raw) × scale / div)`，checked，不 panic）。
+/// load 用 `div=32767`；speed 用 `div=16383`。
+/// `scale` 由名称第三字节选（`'2'` 与否 → 4274/4127、4196/4020）。
+/// `abs` 溢出（`INT32_MIN`）、乘加溢出、`div == 0` 即 `Unsupported`。
+/// C 截断语义：Rust `i64 /` 即 trunc（与 C 一致，不做 floor）。
+#[allow(dead_code)]
+pub(super) fn legacy_scaled(raw: i32, scale: i32, div: i32) -> Result<i32, WireError> {
+    if div == 0 {
+        return Err(WireError::Unsupported("legacy scale div == 0"));
+    }
+    let a = raw
+        .checked_abs()
+        .ok_or(WireError::Unsupported("legacy raw INT32_MIN overflow"))?;
+    let m = (a as i64)
+        .checked_mul(scale as i64)
+        .ok_or(WireError::Unsupported("legacy scale mul overflow"))?;
+    let v = m / div as i64;
+    i32::try_from(v).map_err(|_| WireError::Unsupported("legacy scale overflow"))
+}
+
+/// 旧 spindle scale 选择（B4：名称第三字节是否为 `'2'`）。
+#[allow(dead_code)]
+pub(super) fn legacy_scale_for(name_third: u8, load: bool) -> i32 {
+    match (name_third == b'2', load) {
+        (false, true) => RATIO_SCALE_LOAD_STD,
+        (true, true) => RATIO_SCALE_LOAD_ALT,
+        (false, false) => RATIO_SCALE_SPEED_STD,
+        (true, false) => RATIO_SCALE_SPEED_ALT,
+    }
 }
 
 /// Mesa `macro/value` 映射（macro Evidence PASS + B4 真实权威）：
@@ -5450,5 +5896,388 @@ mod tests {
             matches!(v, WireError::Unsupported(_)),
             "exponent=-1 必须 Unsupported，实际：{v:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Load 离线合成回归（阶段 A v2：不连机床，不冒充 DLL 真机 parity；
+    // 只锁 DLL 模型一致性：槽位/名称归属/Numeric 偏移/容量/回退算术；
+    // production gate 不动）。
+    // -----------------------------------------------------------------------
+
+    /// Load 合成 reply 槽（新三元组模型手工构造；与 `status_slot` 同布局）。
+    fn load_slot(cmd: u16, status: i16, data: &[u8]) -> GenericSubpacket {
+        GenericSubpacket {
+            control_device: DEV_CNC,
+            // function = path<<16|command（path=1）。
+            function: (0x0001u32 << 16) | cmd as u32,
+            payload: {
+                let mut p = status.to_be_bytes().to_vec();
+                p.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                p.extend_from_slice(&(data.len() as u16).to_be_bytes());
+                p.extend_from_slice(data);
+                p
+            },
+        }
+    }
+
+    /// Load 8B 数值单元合成（v2：raw BE32 @0 + aux @4 + dec BE16 @6）。
+    fn load_elem_bytes(raw: i32, aux4: [u8; 2], dec: u16) -> Vec<u8> {
+        let mut v = Vec::with_capacity(8);
+        v.extend_from_slice(&raw.to_be_bytes());
+        v.extend_from_slice(&aux4);
+        v.extend_from_slice(&dec.to_be_bytes());
+        v
+    }
+
+    /// Servo 四槽：`89` 名称 N×4B + `56` 负载 N×8B；raw=-270 → ABI 270（abs）。
+    /// A4 数据体首 BE16 即 count（此处 before=after=2）。
+    #[test]
+    fn servo_load_new_names_values_locked() {
+        // 名称数组：X\0\0\0 + Y\0\0\0（每项 4B，保留前三字节）。
+        let names = b"X\0\0\0Y\0\0\0";
+        let mut vals = load_elem_bytes(-270, [0xAA, 0xBB], 1);
+        vals.extend_from_slice(&load_elem_bytes(560, [0x00, 0x00], 1));
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
+                load_slot(super::CMD_SERVO_LOAD_NAMES, 0, names),
+                load_slot(super::CMD_SERVO_LOAD, 0, &vals),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
+            ]),
+        };
+        let r = super::decode_servo_load_new(&frame, 2).unwrap();
+        assert_eq!(r.records.len(), 2);
+        assert_eq!(r.records[0].axis_raw, [b'X', 0, 0]);
+        assert_eq!(r.records[0].numeric.raw, 270);
+        assert_eq!(r.records[0].numeric.dec_bits, 1);
+        assert_eq!(r.records[0].numeric.aux4, [0xAA, 0xBB]);
+        assert_eq!(r.records[1].axis_raw, [b'Y', 0, 0]);
+        assert_eq!(r.records[1].numeric.raw, 560);
+    }
+
+    /// B1 数量合同：`N=min(num_in, before, after)`。
+    /// num_in=2, before=1, after=1 → 只返回 1 条（不伪造第二条）。
+    #[test]
+    fn servo_load_count_min_locked() {
+        let names = b"X\0\0\0Y\0\0\0";
+        let mut vals = load_elem_bytes(-270, [0x00, 0x00], 1);
+        vals.extend_from_slice(&load_elem_bytes(560, [0x00, 0x00], 1));
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+                load_slot(super::CMD_SERVO_LOAD_NAMES, 0, names),
+                load_slot(super::CMD_SERVO_LOAD, 0, &vals),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+            ]),
+        };
+        let r = super::decode_servo_load_new(&frame, 2).unwrap();
+        assert_eq!(r.records.len(), 1);
+        assert_eq!(r.records[0].axis_raw, [b'X', 0, 0]);
+    }
+
+    /// B1 数量合同：`num_in=4, before=3, after=2` → 返回 2 条。
+    #[test]
+    fn servo_load_count_min_4_3_2_locked() {
+        let names = b"X\0\0\0Y\0\0\0Z\0\0\0";
+        let mut vals = load_elem_bytes(100, [0x00, 0x00], 1);
+        vals.extend_from_slice(&load_elem_bytes(200, [0x00, 0x00], 1));
+        vals.extend_from_slice(&load_elem_bytes(300, [0x00, 0x00], 1));
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x03]),
+                load_slot(super::CMD_SERVO_LOAD_NAMES, 0, names),
+                load_slot(super::CMD_SERVO_LOAD, 0, &vals),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
+            ]),
+        };
+        let r = super::decode_servo_load_new(&frame, 4).unwrap();
+        assert_eq!(r.records.len(), 2);
+    }
+
+    /// B1 数量合同：`before=0` → 空记录（不伪造有效负载）。
+    #[test]
+    fn servo_load_count_zero_locked() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x00]),
+                load_slot(super::CMD_SERVO_LOAD_NAMES, 0, b"X\0\0\0Y\0\0\0"),
+                load_slot(super::CMD_SERVO_LOAD, 0, &[0x00; 16]),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
+            ]),
+        };
+        let r = super::decode_servo_load_new(&frame, 2).unwrap();
+        assert!(r.records.is_empty());
+    }
+
+    /// B1 数量合同：A4 数据体不足 2B → `MalformedPayload`。
+    #[test]
+    fn servo_load_count_short_locked() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00]),
+                load_slot(super::CMD_SERVO_LOAD_NAMES, 0, b"X\0\0\0"),
+                load_slot(super::CMD_SERVO_LOAD, 0, &[0x00; 8]),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+            ]),
+        };
+        let e = super::decode_servo_load_new(&frame, 1).unwrap_err();
+        assert!(matches!(e, WireError::MalformedPayload));
+    }
+
+    /// Spindle 四槽：`8A` 名称（4B/项） + `40[4]` load；raw=-270 保留符号。
+    #[test]
+    fn spindle_meter_names_sign_locked() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+                load_slot(super::CMD_SPINDLE_NAMES, 0, b"S1\0\0"),
+                load_slot(
+                    super::CMD_SPINDLE_METER,
+                    0,
+                    &load_elem_bytes(-270, [0x00, 0x00], 1),
+                ),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+            ]),
+        };
+        let r = super::decode_spindle_meter(&frame, 0, 1).unwrap();
+        assert_eq!(r.req_type, 0);
+        assert_eq!(r.records.len(), 1);
+        assert_eq!(r.records[0].name_raw, [b'S', b'1', 0]);
+        assert_eq!(r.records[0].load.as_ref().unwrap().raw, -270);
+        assert!(r.records[0].speed.is_none());
+    }
+
+    /// B2 多主轴：N=2（名称 2×4B + 数值 2×8B），按序配对。
+    #[test]
+    fn spindle_meter_multi_locked() {
+        let names = b"S1\0\0S2\0\0";
+        let mut vals = load_elem_bytes(270, [0x00, 0x00], 1);
+        vals.extend_from_slice(&load_elem_bytes(560, [0x00, 0x00], 1));
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
+                load_slot(super::CMD_SPINDLE_NAMES, 0, names),
+                load_slot(super::CMD_SPINDLE_METER, 0, &vals),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
+            ]),
+        };
+        let r = super::decode_spindle_meter(&frame, 0, 2).unwrap();
+        assert_eq!(r.records.len(), 2);
+        assert_eq!(r.records[0].name_raw, [b'S', b'1', 0]);
+        assert_eq!(r.records[0].load.as_ref().unwrap().raw, 270);
+        assert_eq!(r.records[1].name_raw, [b'S', b'2', 0]);
+        assert_eq!(r.records[1].load.as_ref().unwrap().raw, 560);
+    }
+
+    /// B2 五槽 `type=-1`：同批次 `40[4]` load 数组 + `40[5]` speed 数组。
+    #[test]
+    fn spindle_meter_type_all_five_slots_locked() {
+        let names = b"S1\0\0S2\0\0";
+        let mut loads = load_elem_bytes(270, [0x00, 0x00], 1);
+        loads.extend_from_slice(&load_elem_bytes(560, [0x00, 0x00], 1));
+        let mut speeds = load_elem_bytes(1500, [0x00, 0x00], 0);
+        speeds.extend_from_slice(&load_elem_bytes(1600, [0x00, 0x00], 0));
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
+                load_slot(super::CMD_SPINDLE_NAMES, 0, names),
+                load_slot(super::CMD_SPINDLE_METER, 0, &loads),
+                load_slot(super::CMD_SPINDLE_METER, 0, &speeds),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
+            ]),
+        };
+        let r = super::decode_spindle_meter(&frame, -1, 2).unwrap();
+        assert_eq!(r.records.len(), 2);
+        assert_eq!(r.records[0].load.as_ref().unwrap().raw, 270);
+        assert_eq!(r.records[0].speed.as_ref().unwrap().raw, 1500);
+        assert_eq!(r.records[1].load.as_ref().unwrap().raw, 560);
+        assert_eq!(r.records[1].speed.as_ref().unwrap().raw, 1600);
+    }
+
+    /// 非 UTF-8 名称无损（第三字节选 scale 依赖原始字节；lossy 会丢）。
+    #[test]
+    fn spindle_meter_non_utf8_name_locked() {
+        // 名称 "S\xFF\0"：第二字节非 UTF-8，第三字节 0（scale 选 STD）。
+        let names = [b'S', 0xFF, 0, 0];
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+                load_slot(super::CMD_SPINDLE_NAMES, 0, &names),
+                load_slot(
+                    super::CMD_SPINDLE_METER,
+                    0,
+                    &load_elem_bytes(270, [0x00, 0x00], 1),
+                ),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+            ]),
+        };
+        let r = super::decode_spindle_meter(&frame, 0, 1).unwrap();
+        assert_eq!(r.records[0].name_raw, [b'S', 0xFF, 0]);
+        // 第三字节 0 → load scale STD（4127）。
+        assert_eq!(
+            super::legacy_scale_for(r.records[0].name_raw[2], true),
+            4127
+        );
+    }
+
+    /// Spindle type=1 → speed `Some`、load `None`（不用零值冒充）。
+    #[test]
+    fn spindle_meter_type1_option_locked() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+                load_slot(super::CMD_SPINDLE_NAMES, 0, b"S1\0\0"),
+                load_slot(
+                    super::CMD_SPINDLE_METER,
+                    0,
+                    &load_elem_bytes(1500, [0x00, 0x00], 0),
+                ),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+            ]),
+        };
+        let r = super::decode_spindle_meter(&frame, 1, 1).unwrap();
+        assert!(r.records[0].load.is_none());
+        assert_eq!(r.records[0].speed.as_ref().unwrap().raw, 1500);
+    }
+
+    /// Servo raw=INT32_MIN → 明确拒绝溢出，不 panic。
+    #[test]
+    fn servo_load_int32_min_rejected() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+                load_slot(super::CMD_SERVO_LOAD_NAMES, 0, b"X\0\0\0"),
+                load_slot(
+                    super::CMD_SERVO_LOAD,
+                    0,
+                    &load_elem_bytes(i32::MIN, [0x00, 0x00], 1),
+                ),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+            ]),
+        };
+        let e = super::decode_servo_load_new(&frame, 1).unwrap_err();
+        assert!(
+            matches!(e, WireError::Unsupported(_)),
+            "INT32_MIN 必须 Unsupported，实际：{e:?}"
+        );
+    }
+
+    /// 容量不足：名称 `len < N*4` 即 Malformed（N 由 min 得 2，但只给 1 项）。
+    #[test]
+    fn servo_load_name_capacity_locked() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
+                // N=2 声明但只给 4B（1 项）。
+                load_slot(super::CMD_SERVO_LOAD_NAMES, 0, b"X\0\0\0"),
+                load_slot(super::CMD_SERVO_LOAD, 0, &[0x00; 16]),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
+            ]),
+        };
+        let e = super::decode_servo_load_new(&frame, 2).unwrap_err();
+        assert!(matches!(e, WireError::MalformedPayload));
+        assert!(e.is_session_fatal());
+    }
+
+    /// 槽数 != 4 即 CommandMismatch（致命，不猜旧分支）。
+    #[test]
+    fn servo_load_slot_count_locked() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+                load_slot(super::CMD_SERVO_LOAD, 0, &[0x00; 8]),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+            ]),
+        };
+        let e = super::decode_servo_load_new(&frame, 1).unwrap_err();
+        assert!(matches!(e, WireError::CommandMismatch));
+        assert!(e.is_session_fatal());
+    }
+
+    /// 旧 spindle 首槽 status=4 → 进入回退；status=6 → Remote 保 detail。
+    #[test]
+    fn spindle_legacy_branch_locked() {
+        assert!(!super::spindle_legacy_branch(0, 0, 0).unwrap());
+        assert!(super::spindle_legacy_branch(4, 0, 0).unwrap());
+        let e = super::spindle_legacy_branch(6, 7, 8).unwrap_err();
+        assert!(matches!(
+            e,
+            WireError::Remote {
+                status: 6,
+                detail1: 7,
+                detail2: 8
+            }
+        ));
+        assert!(!e.is_session_fatal());
+    }
+
+    /// B4 回退算术：`trunc(abs(raw) × scale / div)`；scale 由名称第三字节选。
+    #[test]
+    fn legacy_scaled_locked() {
+        // load：abs(-270) × 4127 / 32767 = 34（trunc）。
+        assert_eq!(super::legacy_scaled(-270, 4127, 32767).unwrap(), 34);
+        // speed：abs(-1000) × 4020 / 16383 = 245（trunc）。
+        assert_eq!(super::legacy_scaled(-1000, 4020, 16383).unwrap(), 245);
+        // scale 选择：第三字节 '2' 与否。
+        assert_eq!(super::legacy_scale_for(b'2', true), 4274);
+        assert_eq!(super::legacy_scale_for(b'X', true), 4127);
+        assert_eq!(super::legacy_scale_for(b'2', false), 4196);
+        assert_eq!(super::legacy_scale_for(b'X', false), 4020);
+        // div=0 / INT32_MIN / 溢出即 Unsupported。
+        assert!(matches!(
+            super::legacy_scaled(100, 4127, 0).unwrap_err(),
+            WireError::Unsupported(_)
+        ));
+        assert!(matches!(
+            super::legacy_scaled(i32::MIN, 4127, 32767).unwrap_err(),
+            WireError::Unsupported(_)
+        ));
+    }
+
+    /// 重复 0xA4：尾槽 status=4 → Remote（证明消费 slot3 而非 slot0）。
+    #[test]
+    fn spindle_meter_head_tail_slots_locked() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+                load_slot(super::CMD_SPINDLE_NAMES, 0, b"S1\0\0"),
+                load_slot(
+                    super::CMD_SPINDLE_METER,
+                    0,
+                    &load_elem_bytes(270, [0x00, 0x00], 1),
+                ),
+                load_slot(super::CMD_LOAD_HEAD, 4, &[0x00, 0x01]),
+            ]),
+        };
+        let e = super::decode_spindle_meter(&frame, 0, 1).unwrap_err();
+        assert!(matches!(e, WireError::Remote { status: 4, .. }));
     }
 }
