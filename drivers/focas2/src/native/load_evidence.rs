@@ -646,6 +646,117 @@ pub fn run_live_harness() {
     );
 }
 
+/// 165 Spindle Load Native 零负载对照（单窗探针，与四窗 harness 独立）。
+/// 只调 `cnc_rdspmeter(type=0, num_in=2)`（与 Wire 取证参数一致），单次
+/// OPEN 到单次 FFI 到 CLOSE；不跑 L0/L1/L2/L0R，不要求面板非零（165 空载）。
+/// 记录 `rc/num_in/num_out` 加 ABI 缓冲原始区加实际写入范围加 guard/tail；
+/// sentinel 未写入区不得解释为真实值；`rc≠0`/越界/`num_out` 异常即停。
+/// 同步抓 DLL 请求/响应（Wireshark/pktmon 由操作方并行抓取，本探针只输出
+/// FFI 侧证据；网络分支归属待抓包对照）。
+/// `#[ignore]` 真机 only；CI 默认不跑；不碰 production gate/Wire decoder。
+/// 用法：`MESA_FOCAS_GATE0_HOST=192.168.15.165 cargo test -p mesa-driver-focas2
+/// --lib spindle_load_zero_live -- --ignored --nocapture --test-threads=1`
+/// （过滤名为注册测试 `spindle_load_zero_live`；须见 `1 test` 运行）。
+#[cfg(test)]
+pub fn spindle_load_zero_probe() {
+    use crate::native::{FocasRet, NativeLib, OdbSpLoad};
+    use std::os::raw::c_ushort;
+
+    let (host, port, timeout_ms) = {
+        let host = std::env::var("MESA_FOCAS_GATE0_HOST").unwrap_or_else(|_| {
+            panic!("缺少 MESA_FOCAS_GATE0_HOST；本测试为 ignored 真机采集，CI 默认不跑")
+        });
+        let port: u16 = std::env::var("MESA_FOCAS_GATE0_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8193);
+        let timeout_ms: u64 = std::env::var("MESA_FOCAS_GATE0_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5000);
+        (host, port, timeout_ms)
+    };
+    let timeout_secs = (timeout_ms.div_ceil(1000).max(1).min(i32::MAX as u64)) as i32;
+    let lib = NativeLib::load().unwrap_or_else(|e| panic!("FWLIB 加载失败（{host}:{port}）：{e}"));
+    let hdl = lib
+        .cnc_allclibhndl3(&host, port, timeout_secs)
+        .unwrap_or_else(|e| panic!("cnc_allclibhndl3 失败：{} {}", e as i16, e.message()));
+    let mut guard = HandleGuard::new(&lib, hdl);
+    println!(">>> ZERO-PROBE SPINDLE type=0 num_in=2 HANDLE={hdl} host={host}:{port}");
+    // guarded 缓冲（与四窗 harness 同规格；FFI 只写前 num_out×24B）。
+    let mut buf = GuardedLoadBuffer::sentinel();
+    let mut num: c_short = 2;
+    let rc: c_short = unsafe {
+        let sym = lib.cnc_rdspmeter.as_ref().expect("缺符号 cnc_rdspmeter");
+        sym(
+            hdl as c_ushort,
+            0 as c_short,
+            &mut num as *mut c_short,
+            buf.payload.as_mut_ptr().cast::<OdbSpLoad>(),
+        )
+    };
+    let guards_ok = buf.guards_ok();
+    let tail_ok = buf.tail_clean();
+    println!("<<< ZERO-PROBE RC={rc} num_in=2 num_out={num} guards={guards_ok} tail={tail_ok}");
+    // 第一门：guard/tail 异常即 HOLD（ABI 安全优先，不看 num）。
+    assert!(
+        guards_ok && tail_ok,
+        "HOLD：guard/tail 异常（ABI 越界嫌疑，不继续）"
+    );
+    // 第二门：rc 非零即停（先查 DLL 请求/能力/参数，不碰 Wire）。
+    assert!(
+        FocasRet::from_raw(rc).is_ok(),
+        "HOLD：rc={rc} 非零（先调查 DLL 侧，不继续）"
+    );
+    // 第三门：num_out 范围（0..=2；与 num_in=2 一致，不编造）。
+    assert!(
+        (0..=2).contains(&num),
+        "HOLD：num_out={num} 超出 num_in=2 范围"
+    );
+    // ABI record 跨度（num_out×24B；一条 OdbSpLoad 结构跨度，不代表 DLL
+    // 改了全部字节——type=0 的 speed 半区可能仍 sentinel，见 written 判定）。
+    let abi_span = (num.max(0) as usize) * 24;
+    let hex: String = buf.payload[..abi_span]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    println!("ABI_RECORD_SPAN_BYTES={abi_span} hex={hex}");
+    // 逐 record LOADELM 原始字节（load+speed 双 elem；written=false 侧标出但不解释）。
+    let elems = decode_load_elems(&buf.payload, num.max(0) as usize, 24, 0);
+    for e in &elems {
+        println!(
+            "REC slot={} data={} dec={} unit={} name=0x{:02x} suff1=0x{:02x} suff2=0x{:02x} written={} eng={:?}",
+            e.slot, e.data, e.dec, e.unit, e.name, e.suff1, e.suff2, e.written, e.eng_candidate,
+        );
+    }
+    // 未选择半区完整 sentinel 确认（written=false 的 12B 全为 0xCC，
+    // 首字节不够——DLL 半写亦属多写）。
+    for e in &elems {
+        if !e.written {
+            let off = e.slot * 12;
+            assert!(
+                buf.payload[off..off + 12]
+                    .iter()
+                    .all(|&b| b == LOAD_SENTINEL),
+                "HOLD：slot={} 标 written=false 但半区被改（DLL 多写？）",
+                e.slot
+            );
+        }
+    }
+    // 记录跨度外 sentinel 确认（`abi_span..512` 全为 0xCC；DLL 越 record 写即 HOLD）。
+    {
+        let abi_span = (num.max(0) as usize) * 24;
+        assert!(
+            buf.payload[abi_span..LOAD_RAW_KEEP]
+                .iter()
+                .all(|&b| b == LOAD_SENTINEL),
+            "HOLD：DLL 写超返回 record 跨度（span 后残留被改）"
+        );
+    }
+    guard.close();
+    println!("<<< ZERO-PROBE done (num_out={num})");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,5 +950,12 @@ mod tests {
     #[ignore]
     fn load_evidence_harness() {
         run_live_harness();
+    }
+
+    /// 165 零负载对照（单窗 type=0/num_in=2；ignored 真机 only，CI 默认不跑）。
+    #[test]
+    #[ignore]
+    fn spindle_load_zero_live() {
+        super::spindle_load_zero_probe();
     }
 }

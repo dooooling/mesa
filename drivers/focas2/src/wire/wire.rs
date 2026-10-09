@@ -2458,13 +2458,21 @@ pub(super) fn decode_spindle_meter(
     let head_data = reply_success_data(head)?;
     let name_data = reply_success_data(names)?;
     let tail_data = reply_success_data(tail)?;
-    // 数量合同：N=min(num_in, before, after)。
-    let count_before = decode_head_count(head_data)?;
-    let count_after = decode_head_count(tail_data)?;
-    let n = num_in.min(count_before).min(count_after);
-    if name_data.len() < n * SERVO_NAME_STRIDE {
+    // 数量合同（165 真机证据修正）：A4 数量暂仅作已观测的数量约束，
+    // 不解释为真实有效主轴数（165 上 before/after=3 而 DLL num_out=1）。
+    let a4_limit = num_in
+        .min(decode_head_count(head_data)?)
+        .min(decode_head_count(tail_data)?);
+    // 8A 名称记录以 4B 为完整单位；非整单位即 Malformed（不猜半条名称）。
+    if name_data.len() % SERVO_NAME_STRIDE != 0 {
         return Err(WireError::MalformedPayload);
     }
+    let name_count = name_data.len() / SERVO_NAME_STRIDE;
+    // A4 通告非零但无完整名称：保守拒绝（名称缺失不得伪造记录）。
+    if a4_limit > 0 && name_count == 0 {
+        return Err(WireError::MalformedPayload);
+    }
+    let n = a4_limit.min(name_count);
     // 名称数组（每项 4B，保留前三原始字节；无损，不做 lossy 转换。
     // 旧回退按第三字节选 scale，非 UTF-8 字节经 lossy 即无法恢复）。
     let spindle_names: Vec<[u8; 3]> = (0..n)
@@ -6279,5 +6287,68 @@ mod tests {
         };
         let e = super::decode_spindle_meter(&frame, 0, 1).unwrap_err();
         assert!(matches!(e, WireError::Remote { status: 4, .. }));
+    }
+
+    /// 名称非整 4B 即 Malformed（不猜半条名称；A4 非零亦拒）。
+    #[test]
+    fn spindle_name_unaligned_rejected() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+                load_slot(super::CMD_SPINDLE_NAMES, 0, b"S1\0"),
+                load_slot(
+                    super::CMD_SPINDLE_METER,
+                    0,
+                    &load_elem_bytes(0, [0x00, 0x00], 0),
+                ),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+            ]),
+        };
+        let e = super::decode_spindle_meter(&frame, 0, 1).unwrap_err();
+        assert!(matches!(e, WireError::MalformedPayload));
+    }
+
+    /// A4 非零但名称为空即 Malformed（名称缺失不得伪造记录）。
+    #[test]
+    fn spindle_name_empty_rejected() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+                load_slot(super::CMD_SPINDLE_NAMES, 0, b""),
+                load_slot(
+                    super::CMD_SPINDLE_METER,
+                    0,
+                    &load_elem_bytes(0, [0x00, 0x00], 0),
+                ),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+            ]),
+        };
+        let e = super::decode_spindle_meter(&frame, 0, 1).unwrap_err();
+        assert!(matches!(e, WireError::MalformedPayload));
+    }
+
+    /// 名称 2 条但数值只够 1 条即 Malformed（不静默截断第二条）。
+    #[test]
+    fn spindle_name_two_value_one_rejected() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
+                load_slot(super::CMD_SPINDLE_NAMES, 0, b"S1\0\0S2\0\0"),
+                load_slot(
+                    super::CMD_SPINDLE_METER,
+                    0,
+                    &load_elem_bytes(0, [0x00, 0x00], 0),
+                ),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
+            ]),
+        };
+        let e = super::decode_spindle_meter(&frame, 0, 2).unwrap_err();
+        assert!(matches!(e, WireError::MalformedPayload));
     }
 }

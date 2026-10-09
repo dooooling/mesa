@@ -34,8 +34,8 @@ use std::path::PathBuf;
 use super::frame::{FRAME_HEADER_LEN, FocasFrame, PacketType, decode_header};
 use super::wire::{
     decode_alarm_value, decode_diagnosis_value, decode_feed_rate, decode_macro_value,
-    decode_opmsg_value, decode_spindle_speed, decode_spindle_word, decode_status_info,
-    decode_system_info, decode_tofs_value, decode_zofs_value,
+    decode_opmsg_value, decode_spindle_meter, decode_spindle_speed, decode_spindle_word,
+    decode_status_info, decode_system_info, decode_tofs_value, decode_zofs_value,
     tofs_to_value_for_test as tofs_to_value, zofs_to_value_for_test as zofs_to_value,
 };
 use super::{cut_fixture_frames, fixture_dir, read_fixture_bytes};
@@ -137,6 +137,7 @@ pub(crate) fn run_all() {
     param_decodes();
     param_q0_negative_evidence();
     param_request_locked();
+    spindle_load_165_decodes();
     diagnosis_301a3_decodes();
     diagnosis_request_locked();
     alarm_empty_ps0010_decodes();
@@ -1228,6 +1229,135 @@ fn param_request_locked() {
             "{group} production encoder 必须 == evidence request fixture 全 40B"
         );
     }
+}
+
+/// spindle load 165 真机（`spindle_load_165/type{0,1,all}`）：原始响应经生产
+/// `decode_spindle_meter` 直测（165 G31Z/10.0，`num_in=2`，A4 `3/3`）。
+/// 数量取 `n=min(2,3,3,1)=1`（名称 4B 即 1 条；`8A` 不足不得伪造）。
+/// 有效性只解析 unit0（`raw=0/dec=0`）；unit1 不得影响结果，
+/// 原始字节保留（fixture 全 64B 不裁剪）。
+/// `type=-1` 五槽双 `40` 各 64B，load/speed 按槽配对。
+/// Native 对照：`num_out=1`，24B 单 `OdbSpLoad`（见 `spindle_load_zero_probe`）。
+fn spindle_load_165_decodes() {
+    use sha2::{Digest, Sha256};
+    for (group, req_type) in [("type0", 0), ("type1", 1), ("type_all", -1)] {
+        let dir = format!("spindle_load_165/{group}");
+        // SHA-256 真校验：request/response .bin 实算对照归档。
+        for name in ["request_frame.bin", "response_frame.bin"] {
+            let raw = read(&dir, name);
+            let mut h = Sha256::new();
+            h.update(&raw);
+            let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+            let exp = expected(&dir);
+            assert_eq!(
+                hex,
+                exp["sha256"][name].as_str().unwrap(),
+                "{group}/{name} SHA-256 与归档不一致（fixture 被改动？）"
+            );
+        }
+        // 请求报文回归：fixture request 即探针请求编码（type/num_in 一致）。
+        // function = path<<16|command（path=1；与探针同源，不依赖 FUNC 兼容常量）。
+        {
+            use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
+            use super::frame::{encode_generic_request, request_subpacket};
+            use super::wire::{
+                CMD_LOAD_HEAD, CMD_SPINDLE_METER, CMD_SPINDLE_NAMES, DEV_CNC,
+                SPINDLE_METER_FUNC_LOAD, SPINDLE_METER_FUNC_SPEED,
+            };
+            let f = |cmd: u16| (0x0001u32 << 16) | cmd as u32;
+            let n = 2;
+            let mut subs = vec![
+                request_subpacket(DEV_CNC, f(CMD_LOAD_HEAD), [n, 0, 0, 0, 0]),
+                request_subpacket(DEV_CNC, f(CMD_SPINDLE_NAMES), [0, 0, 0, 0, 0]),
+            ];
+            if req_type == -1 {
+                subs.push(request_subpacket(
+                    DEV_CNC,
+                    f(CMD_SPINDLE_METER),
+                    [SPINDLE_METER_FUNC_LOAD, -1, 0, 0, 0],
+                ));
+                subs.push(request_subpacket(
+                    DEV_CNC,
+                    f(CMD_SPINDLE_METER),
+                    [SPINDLE_METER_FUNC_SPEED, -1, 0, 0, 0],
+                ));
+            } else {
+                let func = if req_type == 0 {
+                    SPINDLE_METER_FUNC_LOAD
+                } else {
+                    SPINDLE_METER_FUNC_SPEED
+                };
+                subs.push(request_subpacket(
+                    DEV_CNC,
+                    f(CMD_SPINDLE_METER),
+                    [func, -1, 0, 0, 0],
+                ));
+            }
+            subs.push(request_subpacket(
+                DEV_CNC,
+                f(CMD_LOAD_HEAD),
+                [n, 0, 0, 0, 0],
+            ));
+            let build = FocasFrame {
+                origin: REQUEST_ORIGIN,
+                packet_type: PacketType::GENERIC_REQUEST,
+                payload: encode_generic_request(&subs),
+            }
+            .encode();
+            let raw = read(&dir, "request_frame.bin");
+            assert_eq!(
+                raw, build,
+                "{group} 请求 fixture 必须 == 生产探针编码（type={req_type} num_in=2）"
+            );
+        }
+        let frame = assemble_frame(&read(&dir, "response_frame.bin"));
+        let m = decode_spindle_meter(&frame, req_type, 2)
+            .unwrap_or_else(|e| panic!("{group} 165 真机必须解码：{e}"));
+        assert_eq!(m.req_type, req_type, "{group} req_type 回显");
+        assert_eq!(m.records.len(), 1, "{group} 165 有效记录必须 1 条");
+        assert_eq!(
+            m.records[0].name_raw,
+            [b'S', b'1', 0],
+            "{group} 名称归属 S1"
+        );
+        let exp = expected(&dir);
+        assert_eq!(
+            exp["req_type"].as_i64().unwrap() as i32,
+            req_type,
+            "{group} expected req_type 一致"
+        );
+        assert_eq!(
+            exp["num_in"].as_u64().unwrap() as usize,
+            2,
+            "{group} expected num_in 一致"
+        );
+    }
+    // type=0 有效性：unit0 raw=0/dec=0；load Some（type=0），speed None。
+    let frame0 = assemble_frame(&read("spindle_load_165/type0", "response_frame.bin"));
+    let m0 = decode_spindle_meter(&frame0, 0, 2).unwrap();
+    let l0 = m0.records[0].load.as_ref().expect("type=0 load 有效");
+    assert_eq!((l0.raw, l0.dec_bits), (0, 0), "type=0 unit0 零负载");
+    assert!(m0.records[0].speed.is_none(), "type=0 speed 为 None");
+    // type=1 有效性：speed Some（零负载残留位型），load None；
+    // 64B 尾部残留不参与解析（只取 unit0；不断言残留语义）。
+    let frame1 = assemble_frame(&read("spindle_load_165/type1", "response_frame.bin"));
+    let m1 = decode_spindle_meter(&frame1, 1, 2).unwrap();
+    assert_eq!(m1.records.len(), 1, "type=1 有效记录 1 条");
+    assert!(m1.records[0].load.is_none(), "type=1 load 为 None");
+    let s1 = m1.records[0].speed.as_ref().expect("type=1 speed 有效");
+    assert_eq!(
+        (s1.raw, s1.dec_bits),
+        (0, 0),
+        "type=1 unit0 零负载（speed 侧）"
+    );
+    // type=-1 有效性：load/speed 双 Some（同批次双 40 按槽配对）。
+    let framea = assemble_frame(&read("spindle_load_165/type_all", "response_frame.bin"));
+    let ma = decode_spindle_meter(&framea, -1, 2).unwrap();
+    assert_eq!(ma.records.len(), 1, "type=-1 有效记录 1 条");
+    let la = ma.records[0].load.as_ref().expect("type=-1 load 有效");
+    let sa = ma.records[0].speed.as_ref().expect("type=-1 speed 有效");
+    assert_eq!((la.raw, la.dec_bits), (0, 0), "type=-1 load unit0 零负载");
+    assert_eq!((sa.raw, sa.dec_bits), (0, 0), "type=-1 speed unit0 零负载");
 }
 
 /// diagnosis D301（Batch 2）：fixture 经生产 codec 解码 == expected

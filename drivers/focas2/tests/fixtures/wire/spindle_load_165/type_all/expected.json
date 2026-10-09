@@ -1,0 +1,18 @@
+{
+  "operation": "spindle_meter",
+  "req_type": -1,
+  "num_in": 2,
+  "mesa_commit": "7f9f847",
+  "unix_s": 1791534654,
+  "decode": "OK records=1 (n=min(num_in=2,before=3,after=3,name_count=1); first failure was 8A name capacity 4B<8B, fixed in PR #91)",
+  "source": {
+    "kind": "load_probe capture (A diagnostic, read-only single shot, no retry)",
+    "target": "192.168.15.165:8193",
+    "machine": "G31Z version 10.0",
+    "note": "no pcap; request/response frame hex archived; do not fabricate stream id"
+  },
+  "sha256": {
+    "request_frame.bin": "b51be937ed412d72ac605a6fa7d5e8bc4eb06272bb379eac096d5d538429bf2a",
+    "response_frame.bin": "96d898c9eab58caa01322430f73f4a7186e6779b8e1539988d0ac6adb7468d5c"
+  }
+}
