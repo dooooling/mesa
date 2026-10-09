@@ -37,6 +37,8 @@ pub(crate) use wire::{
 };
 // `WireFocasApi` 是 `wire_probe` 唯一需要的诊断入口（经 `wire_pub` 窄口出 crate）。
 pub use wire::WireFocasApi;
+// Load 探针 typed（`load_probe` 诊断用；经 `wire_pub` 出 crate，不接 adapter）。
+pub use wire::{ServoLoadNew, SpindleCapture, SpindleMeter};
 
 // ---------------------------------------------------------------------------
 // Fixture 回归（`#[cfg(test)]`）：crate 内部直测生产 codec。

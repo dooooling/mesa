@@ -30,6 +30,7 @@ pub use focas_api::{FakeFocasApi, FocasApi, NativeFocasApi};
 #[doc(hidden)]
 pub mod wire_pub {
     pub use crate::wire::WireFocasApi;
+    pub use crate::wire::{ServoLoadNew, SpindleCapture, SpindleMeter};
 }
 
 use std::sync::Arc;

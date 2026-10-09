@@ -892,6 +892,14 @@ pub(super) const FUNC_TOFS: u32 = 0x0001_0008;
 /// 兼容视图（zofs：`function = path<<16|command` 字节等价；
 /// 新代码用 `(DEV_CNC, PATH_CNC, CMD_ZOFS)`）。
 pub(super) const FUNC_ZOFS: u32 = 0x0001_000B;
+/// 兼容视图（load 探针用；新代码建议 `(DEV_CNC, PATH_CNC, CMD_*)` 三元组）。
+pub(super) const FUNC_SPINDLE_NAMES: u32 = 0x0001_008A;
+/// 兼容视图（同上）。
+pub(super) const FUNC_SPINDLE_METER: u32 = 0x0001_0040;
+/// 兼容视图（同上）。
+pub(super) const FUNC_SERVO_LOAD_NAMES: u32 = 0x0001_0089;
+/// 兼容视图（同上）。
+pub(super) const FUNC_SERVO_LOAD: u32 = 0x0001_0056;
 /// axis `0x26` 请求首个参数实测恒 `4`（165 observed；语义未知，不命名业务含义）。
 pub(super) const AXIS_ARG0_OBSERVED: i32 = 4;
 
@@ -1683,6 +1691,225 @@ impl FocasClient {
     /// `spindle_maxrpm(spindle)`（maxrpm Evidence CLOSED：`func=1`）。
     pub async fn spindle_maxrpm(&self, spindle: u8) -> Result<SpindleWord, WireError> {
         self.spindle_word(SPINDLE_WORD_FUNC_MAXRPM, spindle).await
+    }
+
+    /// Load 只读探针（阶段 A live probe：`A4[1]+8A[0]+40[type]+A4[1]` 四槽；
+    /// `type=-1` 时同批次五槽双 `40`。只读 exchange，不接 adapter/gate，
+    /// 不进 production；Evidence Day 前的 live 定标用）。
+    /// `num_in` 为请求数量上限（spindle 1..4；decoder 内部取 min）。
+    pub async fn spindle_meter(
+        &self,
+        req_type: i32,
+        num_in: usize,
+    ) -> Result<SpindleMeter, WireError> {
+        if ![0, 1, SPINDLE_METER_TYPE_ALL].contains(&req_type) {
+            return Err(WireError::Unsupported("spindle meter type 0/1/-1"));
+        }
+        if num_in == 0 || num_in > 4 {
+            return Err(WireError::Unsupported("spindle count 1..4"));
+        }
+        let n = num_in as i32;
+        // A4/8A 头：count 语义（before=num_in；8A 固定 0）。
+        let mut subs = vec![
+            request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD_HEAD, [n, 0, 0, 0, 0]),
+            request_subpacket(DEV_CNC, FUNC_SPINDLE_NAMES, [0, 0, 0, 0, 0]),
+        ];
+        if req_type == SPINDLE_METER_TYPE_ALL {
+            subs.push(request_subpacket(
+                DEV_CNC,
+                FUNC_SPINDLE_METER,
+                [SPINDLE_METER_FUNC_LOAD, -1, 0, 0, 0],
+            ));
+            subs.push(request_subpacket(
+                DEV_CNC,
+                FUNC_SPINDLE_METER,
+                [SPINDLE_METER_FUNC_SPEED, -1, 0, 0, 0],
+            ));
+        } else {
+            let func = if req_type == 0 {
+                SPINDLE_METER_FUNC_LOAD
+            } else {
+                SPINDLE_METER_FUNC_SPEED
+            };
+            subs.push(request_subpacket(
+                DEV_CNC,
+                FUNC_SPINDLE_METER,
+                [func, -1, 0, 0, 0],
+            ));
+        }
+        subs.push(request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD_HEAD, [n, 0, 0, 0, 0]));
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&subs),
+        };
+        let mut guard = self.guard().await?;
+        let session = guard.session();
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                return Err(e);
+            }
+        };
+        guard.complete();
+        match decode_spindle_meter(&resp, req_type, num_in) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                Err(e)
+            }
+        }
+    }
+
+    /// Spindle load raw 抓包（A 诊断：同 `spindle_meter` 请求，但返回完整
+    /// request/response frame hex + decoder 结果；不猜协议，只保留证据。
+    /// 任一 session-fatal 即丢弃会话（`guard.fail`），不复用。）
+    pub async fn capture_spindle_meter(
+        &self,
+        req_type: i32,
+        num_in: usize,
+    ) -> SpindleCapture {
+        fn hex(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+        // 请求构造（与 spindle_meter 同源；参数非法即直接返回空抓包）。
+        if ![0, 1, SPINDLE_METER_TYPE_ALL].contains(&req_type) || num_in == 0 || num_in > 4 {
+            return SpindleCapture {
+                req_origin: REQUEST_ORIGIN,
+                req_packet_type: PacketType::GENERIC_REQUEST.0,
+                req_frame_hex: String::new(),
+                resp_origin: None,
+                resp_packet_type: None,
+                resp_frame_hex: None,
+                decode: "request not sent: bad type/num".into(),
+            };
+        }
+        let n = num_in as i32;
+        let mut subs = vec![
+            request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD_HEAD, [n, 0, 0, 0, 0]),
+            request_subpacket(DEV_CNC, FUNC_SPINDLE_NAMES, [0, 0, 0, 0, 0]),
+        ];
+        if req_type == SPINDLE_METER_TYPE_ALL {
+            subs.push(request_subpacket(
+                DEV_CNC,
+                FUNC_SPINDLE_METER,
+                [SPINDLE_METER_FUNC_LOAD, -1, 0, 0, 0],
+            ));
+            subs.push(request_subpacket(
+                DEV_CNC,
+                FUNC_SPINDLE_METER,
+                [SPINDLE_METER_FUNC_SPEED, -1, 0, 0, 0],
+            ));
+        } else {
+            let func = if req_type == 0 {
+                SPINDLE_METER_FUNC_LOAD
+            } else {
+                SPINDLE_METER_FUNC_SPEED
+            };
+            subs.push(request_subpacket(
+                DEV_CNC,
+                FUNC_SPINDLE_METER,
+                [func, -1, 0, 0, 0],
+            ));
+        }
+        subs.push(request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD_HEAD, [n, 0, 0, 0, 0]));
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&subs),
+        };
+        let req_hex = hex(&req.encode());
+        let mut guard = match self.guard().await {
+            Ok(g) => g,
+            Err(e) => {
+                return SpindleCapture {
+                    req_origin: req.origin,
+                    req_packet_type: req.packet_type.0,
+                    req_frame_hex: req_hex,
+                    resp_origin: None,
+                    resp_packet_type: None,
+                    resp_frame_hex: None,
+                    decode: format!("guard failed: {e}"),
+                };
+            }
+        };
+        let session = guard.session();
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                return SpindleCapture {
+                    req_origin: req.origin,
+                    req_packet_type: req.packet_type.0,
+                    req_frame_hex: req_hex,
+                    resp_origin: None,
+                    resp_packet_type: None,
+                    resp_frame_hex: None,
+                    decode: format!("exchange failed: {e}"),
+                };
+            }
+        };
+        guard.complete();
+        let decode = match decode_spindle_meter(&resp, req_type, num_in) {
+            Ok(v) => format!("OK records={} req_type={}", v.records.len(), v.req_type),
+            Err(e) => format!("{e}"),
+        };
+        SpindleCapture {
+            req_origin: req.origin,
+            req_packet_type: req.packet_type.0,
+            req_frame_hex: req_hex,
+            resp_origin: Some(resp.origin),
+            resp_packet_type: Some(resp.packet_type.0),
+            resp_frame_hex: Some(hex(&resp.encode())),
+            decode,
+        }
+    }
+
+    /// Servo load 只读探针（阶段 A live probe：`A4[2]+89[0]+56[1]+A4[2]` 四槽；
+    /// 只读 exchange，不接 adapter/gate）。
+    /// `num_in` 为请求轴数上限（1..8；decoder 内部取 min）。
+    pub async fn servo_load_new(&self, num_in: usize) -> Result<ServoLoadNew, WireError> {
+        if num_in == 0 || num_in > 8 {
+            return Err(WireError::Unsupported("servo axes 1..8"));
+        }
+        let n = num_in as i32;
+        let req = FocasFrame {
+            origin: REQUEST_ORIGIN,
+            packet_type: PacketType::GENERIC_REQUEST,
+            payload: encode_generic_request(&[
+                request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD_HEAD, [2, 0, 0, 0, 0]),
+                request_subpacket(DEV_CNC, FUNC_SERVO_LOAD_NAMES, [0, 0, 0, 0, 0]),
+                request_subpacket(DEV_CNC, FUNC_SERVO_LOAD, [1, 0, 0, 0, 0]),
+                request_subpacket(DEV_CNC, FUNC_SPINDLE_WORD_HEAD, [2, 0, 0, 0, 0]),
+            ]),
+        };
+        let _ = n;
+        let mut guard = self.guard().await?;
+        let session = guard.session();
+        let resp = session.exchange(&req, PacketType::GENERIC_RESPONSE).await;
+        let resp = match resp {
+            Ok(v) => v,
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                return Err(e);
+            }
+        };
+        guard.complete();
+        match decode_servo_load_new(&resp, num_in) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let fatal = e.is_session_fatal();
+                guard.fail(fatal);
+                Err(e)
+            }
+        }
     }
 
     /// `pmc_scalar(kind, addr)`（PMC scalar Evidence PASS：`0x8001` count=1，
@@ -2903,6 +3130,61 @@ impl WireFocasApi {
             _ => Err(e.to_string()),
         }
     }
+
+    /// Load 只读探针透传（`load_probe` 诊断用；只读 exchange，不接 adapter/gate）。
+    /// `#[doc(hidden)]` 非稳定、诊断专用。
+    #[doc(hidden)]
+    pub async fn probe_spindle_meter(
+        &self,
+        req_type: i32,
+        num_in: usize,
+    ) -> Result<SpindleMeter, String> {
+        self.client
+            .spindle_meter(req_type, num_in)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Load raw 抓包透传（`load_probe` A 诊断用）。
+    /// `#[doc(hidden)]` 非稳定、诊断专用。
+    #[doc(hidden)]
+    pub async fn capture_spindle_meter(
+        &self,
+        req_type: i32,
+        num_in: usize,
+    ) -> SpindleCapture {
+        self.client
+            .capture_spindle_meter(req_type, num_in)
+            .await
+    }
+
+    /// Servo load 只读探针透传（同上）。
+    #[doc(hidden)]
+    pub async fn probe_servo_load_new(&self, num_in: usize) -> Result<ServoLoadNew, String> {
+        self.client
+            .servo_load_new(num_in)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Spindle load 原始抓包（A 诊断：REQUEST/RESPONSE/decode 三段完整保留）。
+#[derive(Debug, Clone)]
+pub struct SpindleCapture {
+    /// 请求帧 origin。
+    pub req_origin: u16,
+    /// 请求帧 packet_type（`0x2101` GENERIC_REQUEST）。
+    pub req_packet_type: u16,
+    /// 请求帧完整编码 hex（含帧头；第一优先级证据）。
+    pub req_frame_hex: String,
+    /// 响应帧 origin（exchange 失败即 `None`，区分传输层/业务层错误）。
+    pub resp_origin: Option<u16>,
+    /// 响应帧 packet_type。
+    pub resp_packet_type: Option<u16>,
+    /// 响应帧完整编码 hex（含帧头；失败即 `None`）。
+    pub resp_frame_hex: Option<String>,
+    /// decoder 结果（`Ok` 摘要 / `Err` 字符串；不丢原始字节）。
+    pub decode: String,
 }
 
 #[async_trait::async_trait]
