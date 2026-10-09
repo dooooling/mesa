@@ -565,11 +565,14 @@ pub struct ServoLoadNew {
 
 /// Spindle 单主轴记录（阶段 A v2：load/speed 按 type 以 `Option` 承载；
 /// 未选择侧为 `None`，不用零值冒充）。
+/// `name_raw` 为 `8A` 名称数组每项前三原始字节（与 Servo `axis_raw` 一致；
+/// 有损 `lossy` 转换会丢非 UTF-8 字节，而旧回退按第三字节选 scale，
+/// 故证据层必须无损保留；显示名由上层按需派生）。
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpindleRecord {
-    /// 主轴名原文（如 `"S1"`；`8A` 名称槽归属，不推断序号语义）。
-    pub name: String,
+    /// 主轴名前三原始字节（如 `S1\0`；`8A` 名称槽归属，不推断序号语义）。
+    pub name_raw: [u8; 3],
     /// load 数值（`type=0/-1` 时 `Some`；`type=1` 时 `None`）。
     pub load: Option<LoadNumeric>,
     /// speed 数值（`type=1/-1` 时 `Some`；`type=0` 时 `None`）。
@@ -2462,12 +2465,13 @@ pub(super) fn decode_spindle_meter(
     if name_data.len() < n * SERVO_NAME_STRIDE {
         return Err(WireError::MalformedPayload);
     }
-    // 名称数组（每项 4B，保留前三字节；lossy 转 String 配对）。
-    let spindle_names: Vec<String> = (0..n)
+    // 名称数组（每项 4B，保留前三原始字节；无损，不做 lossy 转换。
+    // 旧回退按第三字节选 scale，非 UTF-8 字节经 lossy 即无法恢复）。
+    let spindle_names: Vec<[u8; 3]> = (0..n)
         .map(|i| {
-            String::from_utf8_lossy(&name_data[i * 4..i * 4 + 3])
-                .trim_matches('\0')
-                .to_string()
+            let mut raw = [0u8; 3];
+            raw.copy_from_slice(&name_data[i * 4..i * 4 + 3]);
+            raw
         })
         .collect();
     if req_type == SPINDLE_METER_TYPE_ALL {
@@ -2495,7 +2499,7 @@ pub(super) fn decode_spindle_meter(
             let s = LoadNumeric::decode(&speed_data[i * 8..i * 8 + 8])?;
             s.validate_dec()?;
             records.push(SpindleRecord {
-                name: spindle_names[i].clone(),
+                name_raw: spindle_names[i],
                 load: Some(l),
                 speed: Some(s),
             });
@@ -2521,7 +2525,7 @@ pub(super) fn decode_spindle_meter(
             (None, Some(m))
         };
         records.push(SpindleRecord {
-            name: spindle_names[i].clone(),
+            name_raw: spindle_names[i],
             load,
             speed,
         });
@@ -6050,7 +6054,7 @@ mod tests {
         let r = super::decode_spindle_meter(&frame, 0, 1).unwrap();
         assert_eq!(r.req_type, 0);
         assert_eq!(r.records.len(), 1);
-        assert_eq!(r.records[0].name, "S1");
+        assert_eq!(r.records[0].name_raw, [b'S', b'1', 0]);
         assert_eq!(r.records[0].load.as_ref().unwrap().raw, -270);
         assert!(r.records[0].speed.is_none());
     }
@@ -6073,9 +6077,9 @@ mod tests {
         };
         let r = super::decode_spindle_meter(&frame, 0, 2).unwrap();
         assert_eq!(r.records.len(), 2);
-        assert_eq!(r.records[0].name, "S1");
+        assert_eq!(r.records[0].name_raw, [b'S', b'1', 0]);
         assert_eq!(r.records[0].load.as_ref().unwrap().raw, 270);
-        assert_eq!(r.records[1].name, "S2");
+        assert_eq!(r.records[1].name_raw, [b'S', b'2', 0]);
         assert_eq!(r.records[1].load.as_ref().unwrap().raw, 560);
     }
 
@@ -6104,6 +6108,34 @@ mod tests {
         assert_eq!(r.records[0].speed.as_ref().unwrap().raw, 1500);
         assert_eq!(r.records[1].load.as_ref().unwrap().raw, 560);
         assert_eq!(r.records[1].speed.as_ref().unwrap().raw, 1600);
+    }
+
+    /// 非 UTF-8 名称无损（第三字节选 scale 依赖原始字节；lossy 会丢）。
+    #[test]
+    fn spindle_meter_non_utf8_name_locked() {
+        // 名称 "S\xFF\0"：第二字节非 UTF-8，第三字节 0（scale 选 STD）。
+        let names = [b'S', 0xFF, 0, 0];
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+                load_slot(super::CMD_SPINDLE_NAMES, 0, &names),
+                load_slot(
+                    super::CMD_SPINDLE_METER,
+                    0,
+                    &load_elem_bytes(270, [0x00, 0x00], 1),
+                ),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+            ]),
+        };
+        let r = super::decode_spindle_meter(&frame, 0, 1).unwrap();
+        assert_eq!(r.records[0].name_raw, [b'S', 0xFF, 0]);
+        // 第三字节 0 → load scale STD（4127）。
+        assert_eq!(
+            super::legacy_scale_for(r.records[0].name_raw[2], true),
+            4127
+        );
     }
 
     /// Spindle type=1 → speed `Some`、load `None`（不用零值冒充）。
