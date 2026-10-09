@@ -4,7 +4,7 @@
   "num_in": 2,
   "mesa_commit": "7f9f847",
   "unix_s": 1791534654,
-  "decode": "FOCAS wire malformed payload (first-checkpoint TBD)",
+  "decode": "OK records=1 (n=min(num_in=2,before=3,after=3,name_count=1); first failure was 8A name capacity 4B<8B, fixed in PR #91)",
   "source": {
     "kind": "load_probe capture (A diagnostic, read-only single shot, no retry)",
     "target": "192.168.15.165:8193",

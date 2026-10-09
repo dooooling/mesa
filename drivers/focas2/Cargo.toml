@@ -29,3 +29,5 @@ libloading = "0.8"
 [dev-dependencies]
 # canary example 专用（生产 lib 不用；见 PR #66 review blocker #5）。
 mesa-driver-protocol = { workspace = true }
+# fixture SHA-256 完整性回归专用（生产 lib 不用）。
+sha2 = { workspace = true }

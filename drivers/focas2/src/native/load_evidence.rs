@@ -713,13 +713,14 @@ pub fn spindle_load_zero_probe() {
         (0..=2).contains(&num),
         "HOLD：num_out={num} 超出 num_in=2 范围"
     );
-    // 实际写入范围 hex（num_out×24B；之外 sentinel 不得解释）。
-    let written = (num.max(0) as usize) * 24;
-    let hex: String = buf.payload[..written]
+    // ABI record 跨度（num_out×24B；一条 OdbSpLoad 结构跨度，不代表 DLL
+    // 改了全部字节——type=0 的 speed 半区可能仍 sentinel，见 written 判定）。
+    let abi_span = (num.max(0) as usize) * 24;
+    let hex: String = buf.payload[..abi_span]
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    println!("WRITTEN_BYTES={written} hex={hex}");
+    println!("ABI_RECORD_SPAN_BYTES={abi_span} hex={hex}");
     // 逐 record LOADELM 原始字节（load+speed 双 elem；written=false 侧标出但不解释）。
     let elems = decode_load_elems(&buf.payload, num.max(0) as usize, 24, 0);
     for e in &elems {
@@ -728,13 +729,16 @@ pub fn spindle_load_zero_probe() {
             e.slot, e.data, e.dec, e.unit, e.name, e.suff1, e.suff2, e.written, e.eng_candidate,
         );
     }
-    // 未写入区 sentinel 确认（written=false 槽首字节必须仍为 0xCC，否则 DLL 多写）。
+    // 未选择半区完整 sentinel 确认（written=false 的 12B 全为 0xCC，
+    // 首字节不够——DLL 半写亦属多写）。
     for e in &elems {
         if !e.written {
             let off = e.slot * 12;
-            assert_eq!(
-                buf.payload[off], LOAD_SENTINEL,
-                "HOLD：slot={} 标 written=false 但首字节被改（DLL 多写？）",
+            assert!(
+                buf.payload[off..off + 12]
+                    .iter()
+                    .all(|&b| b == LOAD_SENTINEL),
+                "HOLD：slot={} 标 written=false 但半区被改（DLL 多写？）",
                 e.slot
             );
         }

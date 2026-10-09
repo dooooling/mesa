@@ -6288,4 +6288,67 @@ mod tests {
         let e = super::decode_spindle_meter(&frame, 0, 1).unwrap_err();
         assert!(matches!(e, WireError::Remote { status: 4, .. }));
     }
+
+    /// 名称非整 4B 即 Malformed（不猜半条名称；A4 非零亦拒）。
+    #[test]
+    fn spindle_name_unaligned_rejected() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+                load_slot(super::CMD_SPINDLE_NAMES, 0, b"S1\0"),
+                load_slot(
+                    super::CMD_SPINDLE_METER,
+                    0,
+                    &load_elem_bytes(0, [0x00, 0x00], 0),
+                ),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+            ]),
+        };
+        let e = super::decode_spindle_meter(&frame, 0, 1).unwrap_err();
+        assert!(matches!(e, WireError::MalformedPayload));
+    }
+
+    /// A4 非零但名称为空即 Malformed（名称缺失不得伪造记录）。
+    #[test]
+    fn spindle_name_empty_rejected() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+                load_slot(super::CMD_SPINDLE_NAMES, 0, b""),
+                load_slot(
+                    super::CMD_SPINDLE_METER,
+                    0,
+                    &load_elem_bytes(0, [0x00, 0x00], 0),
+                ),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
+            ]),
+        };
+        let e = super::decode_spindle_meter(&frame, 0, 1).unwrap_err();
+        assert!(matches!(e, WireError::MalformedPayload));
+    }
+
+    /// 名称 2 条但数值只够 1 条即 Malformed（不静默截断第二条）。
+    #[test]
+    fn spindle_name_two_value_one_rejected() {
+        let frame = FocasFrame {
+            origin: 0x0003,
+            packet_type: PacketType::GENERIC_RESPONSE,
+            payload: encode_generic_request(&[
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
+                load_slot(super::CMD_SPINDLE_NAMES, 0, b"S1\0\0S2\0\0"),
+                load_slot(
+                    super::CMD_SPINDLE_METER,
+                    0,
+                    &load_elem_bytes(0, [0x00, 0x00], 0),
+                ),
+                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
+            ]),
+        };
+        let e = super::decode_spindle_meter(&frame, 0, 2).unwrap_err();
+        assert!(matches!(e, WireError::MalformedPayload));
+    }
 }
