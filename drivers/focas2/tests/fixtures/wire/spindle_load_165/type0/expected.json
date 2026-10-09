@@ -1,0 +1,18 @@
+{
+  "operation": "spindle_meter",
+  "req_type": 0,
+  "num_in": 2,
+  "mesa_commit": "7f9f847",
+  "unix_s": 1791534654,
+  "decode": "FOCAS wire malformed payload (first-checkpoint TBD)",
+  "source": {
+    "kind": "load_probe capture (A diagnostic, read-only single shot, no retry)",
+    "target": "192.168.15.165:8193",
+    "machine": "G31Z version 10.0",
+    "note": "no pcap; request/response frame hex archived; do not fabricate stream id"
+  },
+  "sha256": {
+    "request_frame.bin": "bca52156cb17246d3aafa44ae778535f8506ee16cb880cce9d5fa69ca5e7e7a4",
+    "response_frame.bin": "48fa0db5b572819259c9b80ebb6888ecbc2978c726c8f435da8ff4b7854a9869"
+  }
+}
