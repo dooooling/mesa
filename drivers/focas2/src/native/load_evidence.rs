@@ -234,11 +234,6 @@ pub fn decode_load_elems(
             let name = payload[off + 8];
             let suff1 = payload[off + 9];
             let suff2 = payload[off + 10];
-            let eng_candidate = if (0..=9).contains(&dec) {
-                Some(data as f64 / 10f64.powi(dec as i32))
-            } else {
-                None
-            };
             // written：spindle 按 type 区分 load/speed 侧；servo 全写。
             let written = if stride == 24 {
                 match selector_type {
@@ -248,6 +243,13 @@ pub fn decode_load_elems(
                 }
             } else {
                 true
+            };
+            // 收紧：written=false 时 eng_candidate 置 null（防 JSONL 消费者
+            // 忽略 written 读到 sentinel 伪工程量）。
+            let eng_candidate = if written && (0..=9).contains(&dec) {
+                Some(data as f64 / 10f64.powi(dec as i32))
+            } else {
+                None
             };
             out.push(LoadElemEvidence {
                 slot: r * elems + e,
@@ -687,10 +689,11 @@ mod tests {
         assert_eq!(elems[0].eng_candidate, Some(27.0));
         assert_eq!(elems[1].slot, 1);
         assert_eq!(elems[1].data, 1500);
-        assert_eq!(elems[1].eng_candidate, Some(1500.0));
-        // P1：harness 本次 type=0 → speed 槽 written=false（sentinel 伪记录禁当输出）。
+        // P1：harness 本次 type=0 → speed 槽 written=false（sentinel 伪记录禁当输出；
+        // 收紧后 eng_candidate 同步 null）。
         assert!(elems[0].written);
         assert!(!elems[1].written);
+        assert_eq!(elems[1].eng_candidate, None);
     }
 
     /// P1 written 语义：type=1 仅奇 slot；-1 全写；servo 全写。
