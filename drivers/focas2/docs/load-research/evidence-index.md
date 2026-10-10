@@ -50,6 +50,34 @@ pktmon etl2pcap "$outDir\native-spindle-type0.etl" `
 要求：`1 test` 实际执行；`rc=0`；TCP 流重组后按 10B 帧头拆帧；
 OPEN/GENERIC/CLOSE 逐帧归档 SHA；原始 ETL/pcapng 本地暂存，不进仓。
 
+## pcapng → 可比较帧（离线，不连 CNC）
+
+`pktmon etl2pcap` 只产 pcapng，不做 TCP 重组/FOCAS 拆帧。按以下步骤离线提取：
+
+```text
+1. Wireshark 打开 pcapng，按 `ip.addr==192.168.15.165 && tcp.port==8193`
+   过滤，确认唯一 TCP 会话（client 端口 + server 8193；多会话即分流，
+   不得混流——TCP 流归属以 (client_ip:port ↔ server_ip:port) 四元组为准）。
+2. 选中会话 → Follow → TCP Stream，分别导出 client→server、
+   server→client 两个方向的原始 payload（Raw 字节）。
+3. 按 10B 帧头切分：`magic a0a0a0a0 + origin(2) + type(2) + len(2)`，
+   `len` 即后续 payload 字节数；切分后必须恰好耗尽（多余尾部即会话污染）。
+4. 帧文件命名：`open_req.bin/open_resp.bin/generic_req_N.bin/...`，
+   存入独立 frames 目录（本地暂存，不进仓）。
+5. 差分（逐字节 + 退出码；一致 0，不一致/损坏非零）：
+   python3 tools/ci/focas_diff.py scan <frames-dir>
+   python3 tools/ci/focas_diff.py compare \
+     --native <frames-dir>/generic_req_1.bin \
+     --wire drivers/focas2/tests/fixtures/wire/spindle_load_165/type0/request_frame.bin
+```
+
+不自己实现 PCAP 解析器；会话归属错误、方向混淆、跨连接拼接一律视为证据污染。
+
+## 24B 说明
+
+Native `num_out=1` 对应一条 `OdbSpLoad` 的 24B ABI record span
+（结构跨度；type=0 的 speed 半区 sentinel 未写，不代表 DLL 改了全部字节）。
+
 ## DLL 身份冻结
 
 ```powershell
