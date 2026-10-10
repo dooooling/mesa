@@ -93,6 +93,22 @@ def parse_generic_request(frame: bytes) -> dict:
     return {'count': count, 'subs': subs}
 
 
+def read_valid_request(path: str) -> bytes:
+    """单帧 GENERIC 请求严格校验（compare 输入门）。
+
+    - 恰好 1 帧；ptype 必须 0x2101；子包严格闭合；
+    - 任一不满足即 ValueError（调用方转非零退出，不输出 match=true）。
+    """
+    frames = cut_frames(path)
+    if len(frames) != 1:
+        raise ValueError(f'{path}: expected exactly one FOCAS frame, got {len(frames)}')
+    frame = frames[0]
+    if frame[6:8] != b'\x21\x01':
+        raise ValueError(f'{path}: expected GENERIC request (0x2101)')
+    parse_generic_request(frame)
+    return frame
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     names = sorted(
         n for n in os.listdir(args.frames_dir)
@@ -101,13 +117,15 @@ def cmd_scan(args: argparse.Namespace) -> int:
     if not names:
         print(json.dumps({'error': 'no .bin inputs'}))
         return 1
+    failed = False
     for name in names:
         p = os.path.join(args.frames_dir, name)
         try:
             frames = cut_frames(p)
         except ValueError as e:
             print(json.dumps({'file': name, 'error': str(e)}))
-            return 1
+            failed = True
+            continue
         for i, f in enumerate(frames):
             doc = {
                 'file': name,
@@ -117,21 +135,24 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 'ptype': f'{struct.unpack(">H", f[6:8])[0]:#06x}',
                 'len': struct.unpack('>H', f[8:10])[0],
             }
-            # GENERIC 请求才解析子包；OPEN/CLOSE 只留帧级元数据。
+            # GENERIC 请求子包非法即整批失败（fail-closed；不输出
+            # generic_error 后继续报成功）。
             if doc['ptype'] == '0x2101':
                 try:
                     doc['generic'] = parse_generic_request(f)
                 except ValueError as e:
-                    doc['generic_error'] = str(e)
+                    print(json.dumps({'file': name, 'index': i, 'error': str(e)}))
+                    failed = True
+                    continue
             print(json.dumps(doc))
-    return 0
+    return 1 if failed else 0
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
     try:
-        native = open(args.native, 'rb').read()
-        wire = open(args.wire, 'rb').read()
-    except OSError as e:
+        native = read_valid_request(args.native)
+        wire = read_valid_request(args.wire)
+    except (OSError, ValueError) as e:
         print(json.dumps({'match': False, 'error': str(e)}))
         return 1
     doc: dict = {

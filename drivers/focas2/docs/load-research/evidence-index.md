@@ -32,6 +32,7 @@ pktmon filter remove
 pktmon filter add FOCAS165 -i 192.168.15.165 -p 8193 -t tcp
 
 $outDir = "D:\Mine\Project\mesa\target\focas-load-research"
+New-Item -ItemType Directory -Force $outDir | Out-Null
 pktmon start --capture --pkt-size 0 --comp nics `
     --file-name "$outDir\native-spindle-type0.etl"
 try {
