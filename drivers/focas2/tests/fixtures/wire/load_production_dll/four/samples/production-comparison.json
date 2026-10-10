@@ -1,0 +1,242 @@
+[
+  {
+    "actual": {
+      "F64": 70.0
+    },
+    "address": "spindle[1].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": 70.0,
+    "index": 0
+  },
+  {
+    "actual": {
+      "F64": 0.99
+    },
+    "address": "spindle[2].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": 0.99,
+    "index": 1
+  },
+  {
+    "actual": {
+      "F64": -0.123
+    },
+    "address": "spindle[3].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": -0.123,
+    "index": 2
+  },
+  {
+    "actual": {
+      "F64": 2.147483647
+    },
+    "address": "spindle[4].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": 2.147483647,
+    "index": 3
+  },
+  {
+    "actual": {
+      "F64": 70.0
+    },
+    "address": "servo[1].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": 70.0,
+    "index": 4
+  },
+  {
+    "actual": {
+      "F64": 0.99
+    },
+    "address": "servo[2].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": 0.99,
+    "index": 5
+  },
+  {
+    "actual": {
+      "F64": 0.123
+    },
+    "address": "servo[3].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": 0.123,
+    "index": 6
+  },
+  {
+    "actual": {
+      "F64": -2147483648.0
+    },
+    "address": "servo[4].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": -2147483648.0,
+    "index": 7
+  },
+  {
+    "actual": {
+      "F64": 70.0
+    },
+    "address": "spindle[1].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": 70.0,
+    "index": 8
+  },
+  {
+    "actual": {
+      "F64": 70.0
+    },
+    "address": "servo[1].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": 70.0,
+    "index": 9
+  },
+  {
+    "actual": {
+      "String": "ERR:load index must be 1..4"
+    },
+    "address": "servo[0].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 10
+  },
+  {
+    "actual": {
+      "String": "ERR:load index must be 1..4"
+    },
+    "address": "spindle[5].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 11
+  },
+  {
+    "actual": {
+      "F64": 70.0
+    },
+    "address": "spindle[1].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": 70.0,
+    "index": 0
+  },
+  {
+    "actual": {
+      "F64": 0.99
+    },
+    "address": "spindle[2].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": 0.99,
+    "index": 1
+  },
+  {
+    "actual": {
+      "F64": -0.123
+    },
+    "address": "spindle[3].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": -0.123,
+    "index": 2
+  },
+  {
+    "actual": {
+      "F64": 2.147483647
+    },
+    "address": "spindle[4].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": 2.147483647,
+    "index": 3
+  },
+  {
+    "actual": {
+      "F64": 70.0
+    },
+    "address": "servo[1].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": 70.0,
+    "index": 4
+  },
+  {
+    "actual": {
+      "F64": 0.99
+    },
+    "address": "servo[2].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": 0.99,
+    "index": 5
+  },
+  {
+    "actual": {
+      "F64": 0.123
+    },
+    "address": "servo[3].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": 0.123,
+    "index": 6
+  },
+  {
+    "actual": {
+      "F64": -2147483648.0
+    },
+    "address": "servo[4].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": -2147483648.0,
+    "index": 7
+  },
+  {
+    "actual": {
+      "F64": 70.0
+    },
+    "address": "spindle[1].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": 70.0,
+    "index": 8
+  },
+  {
+    "actual": {
+      "F64": 70.0
+    },
+    "address": "servo[1].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": 70.0,
+    "index": 9
+  },
+  {
+    "actual": {
+      "String": "ERR:load index must be 1..4"
+    },
+    "address": "servo[0].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 10
+  },
+  {
+    "actual": {
+      "String": "ERR:load index must be 1..4"
+    },
+    "address": "spindle[5].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 11
+  }
+]

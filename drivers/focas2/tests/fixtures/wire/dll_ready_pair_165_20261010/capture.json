@@ -1,0 +1,28 @@
+{
+  "host": "192.168.15.165",
+  "port": 8193,
+  "local": "192.168.15.82",
+  "interface": "\\Device\\NPF_{B29D11AA-BFD2-4849-87D5-1F91207DF5C2}",
+  "gateway": "0.0.0.0",
+  "test_exe": "D:\\Mine\\Project\\mesa\\target\\debug\\deps\\mesa_driver_focas2-f8e8a4dde81ba43f.exe",
+  "test_exe_sha256": "c854c503969c17d4dd3980164137f06be420418a795a6126a39430a43d01575f",
+  "command": [
+    "D:\\Mine\\Project\\mesa\\target\\debug\\deps\\mesa_driver_focas2-f8e8a4dde81ba43f.exe",
+    "--exact",
+    "wire::opmsg_parity::guarded_ready_dll_pair_live",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "packet_limit": 20000,
+  "dropped_packets": null,
+  "drop_note": "未获取 Npcap 内核丢包统计；需另外核对 TCP 流闭合与预期调用覆盖",
+  "git_sha": "a9b3690d2748a7046a1d7f430d90da0c87ca22a8",
+  "started_unix_ns": 1791609173308336700,
+  "production_gate_changed": false,
+  "test_exit_code": 0,
+  "finished_unix_ns": 1791609174239554400,
+  "packets": 54,
+  "overflow": false,
+  "capture_sha256": "64481b6679445c93b1072072977f50703337095dbc88a642b3e707306a0c1826"
+}

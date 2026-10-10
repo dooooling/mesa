@@ -2,9 +2,8 @@
 //!
 //! - 目标：同机（`MESA_SHADOW_HOST`，默认 `192.168.15.165`）同任务先后跑
 //!   Native（`NativeFocasApi`，生产值唯一来源）与 Wire（`WireFocasApi`，
-//!   旁路比较），输出 12/17 parity sweep 对照；不改生产 backend、不写 fixture。
-//! - 范围：`docs/wire-cutover-matrix.md` 的 12 ready 点；servo/spindle load
-//!   value、tool/zofs 不纳入（HOLD，按 cutover matrix 记 documented）。
+//!   旁路比较），覆盖 15/17 READY 类别；不改生产 backend、不写 fixture。
+//! - 范围：READY 读点及单值工具补偿；servo/spindle load 仍为 HOLD。
 //! - 比较语义：`Value` 全等（含变体；`F64` 按位比较，不做 epsilon）；
 //!   Native PR52 `ERR:` 占位与 Wire 真实值的差异，只对白名单地址记
 //!   `KnownNativeUnsupported`（gear/maxrpm/diagnosis/alarm），其他地址的
@@ -30,9 +29,6 @@ enum Verdict {
     /// 已知生产边界（Native PR52 `ERR:` vs Wire 真实值；
     /// gear/maxrpm/diagnosis/alarm）。
     KnownNativeUnsupported { native: String },
-    /// Native 实现 debt（opmsg：Native `ERR:`（当前 `EW_Length(2)`）vs Wire
-    /// 有效结果；不记 mismatch，不伪造 Native 值；见 cutover matrix debt 项）。
-    KnownNativeDebt { native: String },
     /// 动态值漂移（两侧都成功但值不等，且该点为已知动态点）。
     Drift { native: String, wire: String },
     /// 真 mismatch（blocker）。
@@ -87,8 +83,6 @@ enum NativeExpect {
     Exact,
     /// Native PR52 占位（gear/maxrpm/diagnosis/alarm；Batch 1/2/3）。
     NativeUnsupported,
-    /// Native 实现 debt（opmsg `EW_Length(2)`；见 cutover matrix debt 项）。
-    NativeDebt,
 }
 
 fn native_expect(addr: &FocasAddress) -> NativeExpect {
@@ -96,7 +90,6 @@ fn native_expect(addr: &FocasAddress) -> NativeExpect {
         FocasAddress::Spindle { .. } => NativeExpect::NativeUnsupported,
         FocasAddress::Diagnosis { .. } => NativeExpect::NativeUnsupported,
         FocasAddress::Alarm => NativeExpect::NativeUnsupported,
-        FocasAddress::OpMsg => NativeExpect::NativeDebt,
         _ => NativeExpect::Exact,
     }
 }
@@ -112,19 +105,6 @@ fn judge(addr: &FocasAddress, native: &Value, wire: &Value) -> Verdict {
         && s.starts_with("ERR:")
     {
         match native_expect(addr) {
-            // opmsg debt：只接受当前已观测的明确特征（`EW_Length(2)`；
-            // 裸 `EW_UNKNOWN` 不得豁免——`FocasRet::message()` 对未单独映射的
-            // 错误都返回它，未来 OpMsg 新错误会被误归 debt）。
-            NativeExpect::NativeDebt => {
-                let u = s.to_ascii_uppercase();
-                if u.contains("EW_LENGTH(2)") {
-                    return Verdict::KnownNativeDebt { native: s.clone() };
-                }
-                return Verdict::Mismatch {
-                    native: format!("{native:?}"),
-                    wire: format!("{wire:?}"),
-                };
-            }
             // PR52 豁免白名单：gear / maxrpm / diagnosis / alarm（Batch 1/2/3）。
             NativeExpect::NativeUnsupported => {
                 return Verdict::KnownNativeUnsupported { native: s.clone() };
@@ -176,6 +156,15 @@ fn shadow_addrs() -> Vec<(String, FocasAddress)> {
         ("pmc.D0".into(), parse_address("pmc.D0").unwrap()),
         ("param.6711".into(), parse_address("param.6711").unwrap()),
         ("opmsg".into(), parse_address("opmsg").unwrap()),
+        (
+            "tool.offset.16".into(),
+            parse_address("tool.offset.16").unwrap(),
+        ),
+        (
+            "tool.length.16".into(),
+            parse_address("tool.length.16").unwrap(),
+        ),
+        ("tool.zofs.1".into(), parse_address("tool.zofs.1").unwrap()),
         (
             "spindle.gear.1".into(),
             parse_address("spindle.gear.1").unwrap(),
@@ -231,7 +220,6 @@ async fn main() {
     let mut n_mismatch = 0;
     let mut n_drift = 0;
     let mut n_unsup = 0;
-    let mut n_debt = 0;
     for (i, (label, addr)) in addrs.iter().enumerate() {
         let (nv, wv) = (&natives[i], &wires[i]);
         match judge(addr, nv, wv) {
@@ -239,12 +227,6 @@ async fn main() {
             Verdict::KnownNativeUnsupported { native } => {
                 n_unsup += 1;
                 println!("[KNOWN_NATIVE_UNSUPPORTED] {label} native={native} wire={wv:?}");
-            }
-            Verdict::KnownNativeDebt { native } => {
-                n_debt += 1;
-                println!(
-                    "[KNOWN_NATIVE_DEBT] {label} native={native} wire={wv:?}（Native debt，不伪造）"
-                );
             }
             Verdict::Drift { native, wire } => {
                 n_drift += 1;
@@ -259,14 +241,30 @@ async fn main() {
     native.disconnect().await;
     wire.disconnect().await;
     println!(
-        "shadow done: equal={} unsupported={} debt={} drift={} mismatch={}",
-        addrs.len() - n_mismatch - n_drift - n_unsup - n_debt,
+        "shadow done: equal={} unsupported={} drift={} mismatch={}",
+        addrs.len() - n_mismatch - n_drift - n_unsup,
         n_unsup,
-        n_debt,
         n_drift,
         n_mismatch
     );
     if n_mismatch > 0 {
         std::process::exit(2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opmsg_length_error_is_no_longer_exempt() {
+        assert!(matches!(
+            judge(
+                &FocasAddress::OpMsg,
+                &Value::String("ERR:EW_Length(2)".into()),
+                &Value::String("OP:empty".into())
+            ),
+            Verdict::Mismatch { .. }
+        ));
     }
 }

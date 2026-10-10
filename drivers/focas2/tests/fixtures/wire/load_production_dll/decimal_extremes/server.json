@@ -1,0 +1,159 @@
+{
+  "records": [
+    {
+      "tag": "open1",
+      "peer": [
+        "127.0.0.1",
+        54124
+      ],
+      "request": "00.request.bin",
+      "response": "00.response.bin",
+      "request_sha256": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff",
+      "response_sha256": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b"
+    },
+    {
+      "tag": "open2",
+      "peer": [
+        "127.0.0.1",
+        54125
+      ],
+      "request": "01.request.bin",
+      "response": "01.response.bin",
+      "request_sha256": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+      "response_sha256": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b"
+    },
+    {
+      "tag": "sysinfo",
+      "peer": [
+        "127.0.0.1",
+        54125
+      ],
+      "request": "02.request.bin",
+      "response": "02.response.bin",
+      "request_sha256": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+      "response_sha256": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474"
+    },
+    {
+      "tag": "type0",
+      "peer": [
+        "127.0.0.1",
+        54125
+      ],
+      "request": "03.request.bin",
+      "response": "03.response.bin",
+      "request_sha256": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+      "response_sha256": "735df01a63cd59a9d73e67e36ccacacf6a4b4153120ac0d378eacd5410f0343a"
+    },
+    {
+      "tag": "type0",
+      "peer": [
+        "127.0.0.1",
+        54125
+      ],
+      "request": "04.request.bin",
+      "response": "04.response.bin",
+      "request_sha256": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+      "response_sha256": "735df01a63cd59a9d73e67e36ccacacf6a4b4153120ac0d378eacd5410f0343a"
+    },
+    {
+      "tag": "servo",
+      "peer": [
+        "127.0.0.1",
+        54125
+      ],
+      "request": "05.request.bin",
+      "response": "05.response.bin",
+      "request_sha256": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+      "response_sha256": "f203ce61e5e91eac5243f6592aa51bf374123f869dbabe2896335170c57c1fb3"
+    },
+    {
+      "tag": "close",
+      "peer": [
+        "127.0.0.1",
+        54124
+      ],
+      "request": "06.request.bin",
+      "response": "06.response.bin",
+      "request_sha256": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+      "response_sha256": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+    },
+    {
+      "tag": "close",
+      "peer": [
+        "127.0.0.1",
+        54125
+      ],
+      "request": "07.request.bin",
+      "response": "07.response.bin",
+      "request_sha256": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+      "response_sha256": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+    },
+    {
+      "tag": "open2",
+      "peer": [
+        "127.0.0.1",
+        54126
+      ],
+      "request": "08.request.bin",
+      "response": "08.response.bin",
+      "request_sha256": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+      "response_sha256": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b"
+    },
+    {
+      "tag": "type0",
+      "peer": [
+        "127.0.0.1",
+        54126
+      ],
+      "request": "09.request.bin",
+      "response": "09.response.bin",
+      "request_sha256": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+      "response_sha256": "735df01a63cd59a9d73e67e36ccacacf6a4b4153120ac0d378eacd5410f0343a"
+    },
+    {
+      "tag": "servo",
+      "peer": [
+        "127.0.0.1",
+        54126
+      ],
+      "request": "10.request.bin",
+      "response": "10.response.bin",
+      "request_sha256": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+      "response_sha256": "f203ce61e5e91eac5243f6592aa51bf374123f869dbabe2896335170c57c1fb3"
+    },
+    {
+      "tag": "type0",
+      "peer": [
+        "127.0.0.1",
+        54126
+      ],
+      "request": "11.request.bin",
+      "response": "11.response.bin",
+      "request_sha256": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+      "response_sha256": "735df01a63cd59a9d73e67e36ccacacf6a4b4153120ac0d378eacd5410f0343a"
+    },
+    {
+      "tag": "servo",
+      "peer": [
+        "127.0.0.1",
+        54126
+      ],
+      "request": "12.request.bin",
+      "response": "12.response.bin",
+      "request_sha256": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+      "response_sha256": "f203ce61e5e91eac5243f6592aa51bf374123f869dbabe2896335170c57c1fb3"
+    },
+    {
+      "tag": "close",
+      "peer": [
+        "127.0.0.1",
+        54126
+      ],
+      "request": "13.request.bin",
+      "response": "13.response.bin",
+      "request_sha256": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+      "response_sha256": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+    }
+  ],
+  "errors": []
+}

@@ -129,7 +129,7 @@ fn resolve_generic_point(
                     spindle,
                     kind: SpindleKind::Load,
                 },
-                DataType::U32,
+                DataType::F64,
             )
         }
         ("spindle", "gear") => {
@@ -162,7 +162,7 @@ fn resolve_generic_point(
                 1,
                 crate::native::FOCAS_SERVO_PRODUCT_MAX as u64,
             )? as u8;
-            (FocasAddress::ServoLoad { axis }, DataType::U32)
+            (FocasAddress::ServoLoad { axis }, DataType::F64)
         }
         ("pmc", "value") => {
             // canonical 精确拼写（Descriptor Enum 同口径；大小写/前缀变体不接受）。
@@ -478,9 +478,9 @@ impl Driver for FocasDriver {
                             id: "load".into(),
                             label: LocalizedText::new("Load"),
                             type_spec: OutputTypeSpec::Fixed {
-                                data_type: DataType::U32,
+                                data_type: DataType::F64,
                             },
-                            unit: None,
+                            unit: Some("%".into()),
                             access: AccessMode::Read,
                         },
                         OutputDescriptor {
@@ -506,7 +506,7 @@ impl Driver for FocasDriver {
                     modes: vec![mesa_core_types::TaskMode::Poll],
                 },
                 ResourceDescriptor {
-                    // 当前产品能力 1..4（v2：`OdbSvLoad` 12B/axis 定标中）。
+                    // 产品索引1..4；实际返回数量不足时采集为 BAD。
                     id: "servo".into(),
                     label: LocalizedText::new("Servo"),
                     parameters: SchemaDescriptor {
@@ -522,9 +522,9 @@ impl Driver for FocasDriver {
                         id: "load".into(),
                         label: LocalizedText::new("Load"),
                         type_spec: OutputTypeSpec::Fixed {
-                            data_type: DataType::U32,
+                            data_type: DataType::F64,
                         },
-                        unit: None,
+                        unit: Some("%".into()),
                         access: AccessMode::Read,
                     }],
                     modes: vec![mesa_core_types::TaskMode::Poll],
@@ -1065,9 +1065,9 @@ fn value_fits_data_type(v: &Value, dt: DataType) -> bool {
 
 /// Cutover Gate 1+3-C3+3-D4：Wire backend READY allowlist（configure-time fail-closed）。
 /// READY（machine/status+feed+spindle_speed、axis/absolute、
-/// spindle/gear+maxrpm、macro/pmc/param/diagnosis/opmsg/alarm、
+/// spindle/load+gear+maxrpm、servo/load、macro/pmc/param/diagnosis/opmsg/alarm、
 /// tool/offset+length+zofs）→ `Ok(())`；
-/// HOLD（servo/spindle load、tool number）→ `Err(reason)`，configure 直接拒绝。
+/// 负载支持百分比 F64；未声明的 tool number 和 indexed speed 继续拒绝。
 ///program 系（ProgramNumber/Main/Name/Dir/Info/Upload）Wire 未实现 → 拒绝。
 fn wire_ready_gate(addr: &FocasAddress) -> Result<(), &'static str> {
     use address::{AxisKind, SpindleKind, ToolKind};
@@ -1085,14 +1085,14 @@ fn wire_ready_gate(addr: &FocasAddress) -> Result<(), &'static str> {
             }
         }
         FocasAddress::Spindle { kind, .. } => match kind {
-            SpindleKind::Gear | SpindleKind::MaxRpm => Ok(()),
-            _ => Err("Wire spindle 仅支持 gear/maxrpm（load/speed HOLD）"),
+            SpindleKind::Load | SpindleKind::Gear | SpindleKind::MaxRpm => Ok(()),
+            _ => Err("Wire indexed spindle speed 未实现"),
         },
         FocasAddress::MacroVar { .. }
         | FocasAddress::Pmc { .. }
         | FocasAddress::Param { .. }
         | FocasAddress::Diagnosis { .. } => Ok(()),
-        FocasAddress::ServoLoad { .. } => Err("Wire servo/load HOLD（等非零 evidence）"),
+        FocasAddress::ServoLoad { .. } => Ok(()),
         FocasAddress::Tool { kind, .. } => match kind {
             ToolKind::Number => Err("Wire tool.number 未实现"),
             ToolKind::Offset | ToolKind::Length | ToolKind::Zofs => Ok(()),
@@ -1184,7 +1184,7 @@ impl DriverConnection for FocasConnection {
                             &out.point_key,
                         )?;
                         // Cutover Gate 1+3-C3+3-D4：Wire backend configure-time allowlist。
-                        // READY 外（servo/spindle load、tool number HOLD）直接
+                        // READY 外的未实现地址直接
                         // configure 拒绝，不等启动后单点 BAD（见 wire_ready_gate）。
                         if self.cfg.backend == FocasBackend::Wire
                             && let Err(reason) = wire_ready_gate(&addr)
@@ -1220,7 +1220,18 @@ impl DriverConnection for FocasConnection {
             .map(|p| PointDescriptor {
                 point_key: p.key.clone(),
                 data_type: p.data_type,
-                unit: None,
+                unit: if matches!(
+                    p.addr,
+                    FocasAddress::ServoLoad { .. }
+                        | FocasAddress::Spindle {
+                            kind: address::SpindleKind::Load,
+                            ..
+                        }
+                ) {
+                    Some("%".into())
+                } else {
+                    None
+                },
                 // 来源标签走 FocasAddress 唯一格式化入口（configure/诊断同一实现）。
                 source_label: Some(p.addr.source_label()),
             })
@@ -1683,13 +1694,16 @@ mod tests {
         ] {
             assert!(wire_ready_gate(&addr).is_ok(), "{addr:?} 必须 READY",);
         }
+        assert!(wire_ready_gate(&FocasAddress::ServoLoad { axis: 1 }).is_ok());
+        assert!(
+            wire_ready_gate(&FocasAddress::Spindle {
+                spindle: 1,
+                kind: address::SpindleKind::Load
+            })
+            .is_ok()
+        );
         // HOLD：configure 即拒（Gate 3-C3 offset/length、Gate 3-D4 zofs 移出 HOLD）。
         for addr in [
-            FocasAddress::ServoLoad { axis: 1 },
-            FocasAddress::Spindle {
-                spindle: 1,
-                kind: address::SpindleKind::Load,
-            },
             FocasAddress::Spindle {
                 spindle: 1,
                 kind: address::SpindleKind::Speed,
@@ -1747,18 +1761,14 @@ mod tests {
         )
         .await
         .expect("backend=wire + tool/zofs 必须 PASS");
-        // HOLD：servo/spindle load configure 即拒
-        // （tool number/zofs 注：number 无 resolver 输出形态不进表；
-        // zofs 已 READY，此处仅 servo/spindle load）。
+        // 负载配置与正式百分比输出合同一致，不受旧整数声明影响。
         for (r, p, o) in [
             ("servo", serde_json::json!({"axis": 1}), "load"),
             ("spindle", serde_json::json!({"spindle": 1}), "load"),
         ] {
-            let e = conn
-                .configure(2, vec![task(r, p, o)])
-                .await
-                .expect_err(&format!("backend=wire + {r}/{o} 必须拒绝"));
-            assert_eq!(e.code, "UNSUPPORTED_POINT", "必须 fail-closed 在 configure");
+            let points = conn.configure(2, vec![task(r, p, o)]).await.unwrap();
+            assert_eq!(points[0].data_type, DataType::F64);
+            assert_eq!(points[0].unit.as_deref(), Some("%"));
         }
     }
 
@@ -1850,7 +1860,7 @@ mod tests {
                 "spindle",
                 "load",
                 serde_json::json!({"spindle": 1}),
-                DataType::U32,
+                DataType::F64,
                 "spindle[1].load",
             ),
             (
@@ -1871,7 +1881,7 @@ mod tests {
                 "servo",
                 "load",
                 serde_json::json!({"axis": 2}),
-                DataType::U32,
+                DataType::F64,
                 "servo[2].load",
             ),
             (

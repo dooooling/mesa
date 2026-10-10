@@ -1,0 +1,62 @@
+{
+  "backend": "native",
+  "candidates": [
+    {
+      "data": 1,
+      "decimal": -309,
+      "name": [
+        88,
+        0,
+        0
+      ],
+      "slot": 0,
+      "unit": 0
+    },
+    {
+      "data": 1,
+      "decimal": 32767,
+      "name": [
+        89,
+        0,
+        0
+      ],
+      "slot": 1,
+      "unit": 0
+    },
+    {
+      "data": 0,
+      "decimal": -32768,
+      "name": [
+        90,
+        0,
+        0
+      ],
+      "slot": 2,
+      "unit": 0
+    },
+    {
+      "data": 1,
+      "decimal": 309,
+      "name": [
+        65,
+        0,
+        0
+      ],
+      "slot": 3,
+      "unit": 0
+    }
+  ],
+  "finished_ns": 1791618290109102500,
+  "guards_ok": true,
+  "num_in": 4,
+  "num_out": 4,
+  "pid": 48132,
+  "raw_0_512_hex": "01000000cbfe0000580000cc01000000ff7f0000590000cc00000000008000005a0000cc0100000035010000410000cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "rc": 0,
+  "selector": -1,
+  "servo": true,
+  "span_tail_ok": true,
+  "started_ns": 1791618290108185800,
+  "tail_ok": true,
+  "untouched_half_ok": true
+}

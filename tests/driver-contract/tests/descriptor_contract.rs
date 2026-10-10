@@ -1005,6 +1005,18 @@ fn driver_version_identity_toml_metadata_package_agree() {
                 .version,
         ),
     ];
+    // 驱动允许按公开行为独立升级版本，不能用合同测试包自身版本代替。
+    // Cargo metadata 同时解析显式 version 与 version.workspace，仍严格核对实际包身份。
+    let metadata = std::process::Command::new(env!("CARGO"))
+        .args(["metadata", "--locked", "--no-deps", "--format-version", "1"])
+        .current_dir(common::repo_root())
+        .output()
+        .expect("读取实际 Cargo package 版本");
+    assert!(
+        metadata.status.success(),
+        "Cargo metadata 失败，不能跳过版本检查"
+    );
+    let packages: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
     for (rel, meta_version) in drivers {
         let toml_text =
             std::fs::read_to_string(common::repo_root().join(rel).join("driver.toml")).unwrap();
@@ -1016,9 +1028,25 @@ fn driver_version_identity_toml_metadata_package_agree() {
             toml_version, meta_version,
             "{rel}: driver.toml 与 metadata 版本不一致"
         );
+        let manifest = common::repo_root()
+            .join(rel)
+            .join("Cargo.toml")
+            .canonicalize()
+            .unwrap();
+        let package = packages["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| {
+                std::path::Path::new(package["manifest_path"].as_str().unwrap())
+                    .canonicalize()
+                    .unwrap()
+                    == manifest
+            })
+            .expect("每个驱动必须是实际 workspace package");
         assert_eq!(
             meta_version,
-            env!("CARGO_PKG_VERSION"),
+            package["version"].as_str().unwrap(),
             "{rel}: metadata 与 package 版本不一致"
         );
     }

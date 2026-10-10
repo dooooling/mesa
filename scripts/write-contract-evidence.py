@@ -23,10 +23,9 @@ def git_sha():
 
 def is_clean_tree():
     try:
-        # 只看 tracked 变更：构建/测试副产品（untracked）不代表代码被改，
-        # 否则任何一次正常运行都会把证据标 dirty。
+        # 未跟踪的非忽略源文件也属于工作区；target 等构建产物由 .gitignore 排除。
         out = subprocess.check_output(
-            ["git", "status", "--porcelain", "--untracked-files=no"], text=True
+            ["git", "status", "--porcelain", "--untracked-files=normal"], text=True
         )
         return out.strip() == ""
     except Exception:
@@ -48,7 +47,9 @@ def run_capture(cmd, label):
     exit 码（测试失败 exit 5，输出不可解析 exit 4），证据一律不写。"""
     print(f"running: {' '.join(cmd)} ...", flush=True)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        # Rust 测试输出为 UTF-8；Windows 默认 GBK 会让读管道线程在中文诊断处崩溃。
+        # 汇总与测试名称使用 ASCII，异常日志字节替换不改变 pass/fail 的解析结果。
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         return r.returncode == 0, r.stdout + r.stderr
     except FileNotFoundError as e:
         print(f"cargo not found: {e}", file=sys.stderr)
@@ -90,6 +91,7 @@ def main():
     suite_results = {}
     total_passed = 0
     total_failed = 0
+    any_suite_failure = False
     for suite in SUITES:
         ok, output = run_capture(
             ["cargo", "test", "--locked", "-p", "mesa-contract-tests", "--all-features",
@@ -107,10 +109,14 @@ def main():
         total_passed += passed
         total_failed += failed
         if not ok or failed != 0:
+            any_suite_failure = True
+            # 保留失败套件完整诊断；最终准入仍失败，不能只留下被汇总掩盖的失败计数。
+            failure_log = out.parent / f"contract-{suite}-failed.log"
+            failure_log.write_text(output, encoding="utf-8")
             print(f"suite {suite} failed, continuing to collect all suites (no evidence will be written)",
                   file=sys.stderr)
 
-    if total_failed != 0:
+    if any_suite_failure:
         print(f"contract suites failed: {total_failed} tests failed, not writing contract.json", file=sys.stderr)
         sys.exit(5)
 

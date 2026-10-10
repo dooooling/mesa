@@ -28,6 +28,7 @@ use super::frame::{
 pub struct WireSession {
     stream: TcpStream,
     timeout: Duration,
+    pub(super) load: super::load::Capabilities,
 }
 
 impl WireSession {
@@ -41,7 +42,11 @@ impl WireSession {
             .await
             .map_err(|_| WireError::Timeout)?
             .map_err(WireError::Io)?;
-        let mut me = Self { stream, timeout };
+        let mut me = Self {
+            stream,
+            timeout,
+            load: super::load::Capabilities::default(),
+        };
         let resp = me
             .exchange(&FocasFrame::open_request(), PacketType::OPEN_RESPONSE)
             .await?;
@@ -49,6 +54,7 @@ impl WireSession {
         // 失败即 session 致命（上层重连），不猜字段内容。
         super::frame::validate_open_response(&resp.payload, resp.origin)
             .map_err(|_| WireError::MalformedPayload)?;
+        me.load = super::load::Capabilities::from_open(&resp);
         Ok(me)
     }
 

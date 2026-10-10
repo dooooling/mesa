@@ -479,13 +479,8 @@ pub struct AlarmResult {
     pub alarms: Vec<AlarmMessage>,
 }
 
-/// Load 数值单元（阶段 A v2：Wire 8B = raw BE32 @0 + aux @4 保留 + dec BE16 @6）。
-/// B3 修正：`@4` 不命名 unit——ABI `unit` 由 typed converter 按 DLL 规则产生，
-/// 不直接等于网络 `@4`。typed 只到 Raw+Decimal；换算与 unit 映射在各自
-/// converter（生产数值语义未闭合，P0）。
-/// NOTE：阶段 A 无生产调用方（`#[allow(dead_code)]` 为合同先行标记；
-/// Evidence Day 闭合后接入 production，Gate 3-A/3-B 前 HOLD）。
-#[allow(dead_code)]
+/// 负载网络单元：有符号 BE32 raw、两字节辅助位型、有符号 BE16 小数位。
+/// 辅助字段不是单位；DLL 将负载单位写为百分比，工程换算在 load::percent。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoadNumeric {
     /// 原始整数（i32 BE；servo 侧 DLL 取绝对值，spindle 侧保留符号——
@@ -493,7 +488,7 @@ pub struct LoadNumeric {
     pub raw: i32,
     /// `@4` 保留原始位型（不命名 unit，见 B3）。
     pub aux4: [u8; 2],
-    /// 小数位（BE16 @6；`0..=9` 外即 `Unsupported`，不猜）。
+    /// 有符号小数位的完整16位位型，换算时解释为 i16。
     pub dec_bits: u16,
 }
 
@@ -511,39 +506,22 @@ impl LoadNumeric {
         })
     }
 
-    /// dec 门（`0..=9`；之外即 `Unsupported`）。
-    #[allow(dead_code)]
-    pub fn validate_dec(&self) -> Result<(), WireError> {
-        if self.dec_bits > 9 {
-            return Err(WireError::Unsupported("load dec out of range"));
-        }
-        Ok(())
-    }
-
     /// servo 侧 ABI 转换（DLL 规则：`abs(raw)` + `unit=0`％）。
-    /// `INT32_MIN` 即溢出拒绝，不 panic。
+    /// DLL 的32位绝对值在 INT32_MIN 上保留该位型；不钳位为正常正负载。
     #[allow(dead_code)]
     pub fn to_servo_abi(self) -> Result<(i32, i16), WireError> {
-        self.validate_dec()?;
-        let abs_raw = self
-            .raw
-            .checked_abs()
-            .ok_or(WireError::Unsupported("servo raw INT32_MIN overflow"))?;
+        let abs_raw = self.raw.wrapping_abs();
         Ok((abs_raw, 0))
     }
 
-    /// spindle 侧 ABI 转换（DLL 规则：保留符号；load 侧 `unit=0`％）。
-    /// speed 侧 `unit=1`rpm 由调用方按 type 决定（decoder 已分 load/speed 槽，
-    /// 此处统一给 load 语义；speed unit 待 Evidence Day 接入时在 converter 落定，
-    /// 当前离线 raw 阶段不声称已完整转换）。
+    /// 主轴 ABI 保留符号，负载单位0；速度半区由调用者使用单位1。
     #[allow(dead_code)]
     pub fn to_spindle_abi(self) -> Result<(i32, i16), WireError> {
-        self.validate_dec()?;
         Ok((self.raw, 0))
     }
 }
 
-/// Servo load 记录（阶段 A v2：数值 + 轴名；轴名来自 `0x89` 名称数组，
+/// Servo load 记录（数值 + 轴名；轴名来自 `0x89` 名称数组，
 /// 每项 4B，保留前三原始字节，不推断 `data[i] = 轴i`）。
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,7 +532,7 @@ pub struct ServoLoadRecord {
     pub numeric: LoadNumeric,
 }
 
-/// Servo load 新分支 typed 结果（阶段 A v2：`A4[2]+89[0]+56[1]+A4[2]` 四槽；
+/// Servo load 新分支 typed 结果（`A4[2]+89[0]+56[1]+A4[2]` 四槽；
 /// `89` = 名称数组 N×4B，`56` = 负载数组 N×8B；N=min(num_in,before,after)）。
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -563,7 +541,7 @@ pub struct ServoLoadNew {
     pub records: Vec<ServoLoadRecord>,
 }
 
-/// Spindle 单主轴记录（阶段 A v2：load/speed 按 type 以 `Option` 承载；
+/// Spindle 单主轴记录（load/speed 按 type 以 `Option` 承载；
 /// 未选择侧为 `None`，不用零值冒充）。
 /// `name_raw` 为 `8A` 名称数组每项前三原始字节（与 Servo `axis_raw` 一致；
 /// 有损 `lossy` 转换会丢非 UTF-8 字节，而旧回退按第三字节选 scale，
@@ -579,7 +557,7 @@ pub struct SpindleRecord {
     pub speed: Option<LoadNumeric>,
 }
 
-/// Spindle load typed 结果（阶段 A v2：`A4[1]+8A[0]+40[type]+A4[1]`；
+/// Spindle load typed 结果（`A4[1]+8A[0]+40[type]+A4[1]`；
 /// `type=-1` 时两个独立 `40[4]`/`40[5]` 请求，非单槽 16B）。
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -752,12 +730,11 @@ pub(super) const ALARM_ARG0_OBSERVED: i32 = -1;
 pub(super) const ALARM_ARG1_OBSERVED: i32 = 29;
 pub(super) const ALARM_ARG2_OBSERVED: i32 = 2;
 pub(super) const ALARM_ARG3_OBSERVED: i32 = 32;
-/// alarm 单条 reply 数据体（`data_len=48`；`44B AlmMsgElm + 4B 零填充`；
+/// alarm 单条网络数据体（四个 BE32 + 文本32，48B）；
 /// `!= 48` 即 Malformed/Unsupported，不猜 `>= 48` 多条布局——B3-C）。
 pub const ALARM_DATA_LEN: usize = 48;
-/// alarm 条目 wire 长度（`44B`：`no4/type2/axis2/rsv2/len2/msg32`；
-/// 反编译 44B 步进；`48-44=4` 零填充不命名语义）。
-pub const ALARM_ENTRY_LEN: usize = 44;
+/// 网络条目长度；DLL 输出 ABI 为44B，不能用于此处网络步进。
+pub const ALARM_ENTRY_LEN: usize = 48;
 /// alarm 文本区长度（`msg[32]`；`msg_len` 截断 + 首 NUL 截断 + lossy + trim）。
 pub const ALARM_MSG_LEN: usize = 32;
 /// `diagnosis` 产品 axis（B2-C2；`0` non-axis / `1..32` one axis）。
@@ -781,21 +758,8 @@ pub(super) const CMD_PMC_READ: u16 = 0x8001;
 #[allow(dead_code)]
 pub(super) const CMD_PMC_WRITE: u16 = 0x8002;
 // ---------------------------------------------------------------------------
-// Load 离线协议（阶段 A v2：synthetic evidence，不连机床，不改 production gate）。
-//
-// DLL 逆向模型（review 冻结，待 Evidence Day 真机验证；RVA/常量表/全部分支
-// 不标已独立复核）：
-// - 新 servo：`A4[2] + 89[0] + 56[1] + A4[2]`（四槽；`89` = 名称数组 N×4B，
-//   `56` = 负载数组 N×8B；前后数量可不同，N=min(num_in,before,after)）；
-// - 新 spindle：`A4[1] + 8A[0] + 40[type] + A4[1]`（type 0/1；`-1` 时两个
-//   独立 `40[4]`/`40[5]` 请求）；`8A` = 名称槽；多主轴记录 + 名称归属；
-// - 旧 servo：`0x56 + 0x89`；旧 spindle：`0x40[0/1,-1] + 比例参数 0x0E` 回退。
-// 8B numeric：raw BE32 @0 + aux @4（保留，不命名 unit）+ dec BE16 @6。
-// ABI unit 由 typed converter 按 DLL 规则产生，不直接等于网络 @4。
-// 回退算术：`trunc(abs(raw) × scale / div)`（load /32767，speed /16383；
-// scale 由名称第三字节选 4127/4274、4020/4196）。
-// 生产数值语义（U32/F64/换算）尚未闭合——typed 只到 Raw+Decimal，unit 转换
-// 在各自 converter；Gate 3-A/3-B 继续 HOLD。
+// 负载协议：A4 数量、89/8A 名称、56/40 数值；旧主轴在首槽状态4后
+// 改用七槽参数缩放，状态记忆只属于当前 TCP 会话。合成差分不代表设备验收。
 // ---------------------------------------------------------------------------
 /// load 旧/新分支头尾命令（`0xA4`；与 spindle word 头同 command 不同语境，
 /// operation identity = command + args + context，不单冻 command）。
@@ -1935,7 +1899,7 @@ fn find_function(subs: &[GenericSubpacket], dev: u16, func: u32) -> Option<&Gene
 /// `status != 0` 即 `WireError::Remote{status, detail1, detail2}`
 /// （合法业务失败，session 保留，单点 BAD——旧“6×00 前缀”检查只覆盖
 /// 成功路径，失败路径此前误判 `MalformedPayload` 丢连接，现修正）。
-fn reply_success_data(sub: &ReplySubpacket) -> Result<&[u8], WireError> {
+pub(super) fn reply_success_data(sub: &ReplySubpacket) -> Result<&[u8], WireError> {
     if sub.status != 0 {
         return Err(WireError::Remote {
             status: sub.status,
@@ -2208,16 +2172,9 @@ pub(super) fn decode_param_value(resp: &FocasFrame, number: u32) -> Result<Param
     })
 }
 
-/// B3-B `AlarmMessageCodec`（`0x23` single-alarm；不叫 `AlarmCodec`——
-/// multi 证据未闭合前不承诺 collection wire 语义）。
-/// slot 匹配 `(device=1, path=1, cmd=0x23)`；`status != 0` 走共用 Remote。
-/// `data_len` 精确门：`0` → 空（`alarms: []`）；`48` → 单条
-/// （`[0..44]` 条目 + `[44..48]` 零填充，不命名填充语义）；
-/// 其余长度（含多条候选）即 `Unsupported`（B3-C，不猜第二条位置）。
-/// 条目：`[0..4]` BE32 no + `[4..6]` BE16 type + `[6..8]` BE16 axis +
-/// `[8..10]` reserve（opaque）+ `[10..12]` BE16 msg_len +
-/// `[12..44]` msg[32]（`msg_len` 截断 + 首 NUL 截断 + lossy + trim；
-/// ASCII-compatible → UTF-8；`raw` 44B 全保留）。
+/// 单报警网络条目为四个 BE32 元数据 + 32B 文本，恰好48B；不是44B Native ABI。
+/// FWLIBE64 RVA 0x68A24 将 type/axis/length 截成 short 后写入44B ABI。
+/// 空/单条以外不开放；异常长度拒绝，避免把 ABI 布局误当报文仍返回 GOOD。
 pub(super) fn decode_alarm_value(resp: &FocasFrame) -> Result<AlarmResult, WireError> {
     let subs = decode_reply_payload(&resp.payload).map_err(|_| WireError::MalformedPayload)?;
     let sub =
@@ -2231,10 +2188,14 @@ pub(super) fn decode_alarm_value(resp: &FocasFrame) -> Result<AlarmResult, WireE
     }
     let entry = &d[..ALARM_ENTRY_LEN];
     let number = i32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]);
-    let alarm_type = i16::from_be_bytes([entry[4], entry[5]]);
-    let axis = i16::from_be_bytes([entry[6], entry[7]]);
-    let msg_len = u16::from_be_bytes([entry[10], entry[11]]) as usize;
-    let msg_area = &entry[12..12 + ALARM_MSG_LEN];
+    let alarm_type = i32::from_be_bytes(entry[4..8].try_into().unwrap()) as i16;
+    let axis = i32::from_be_bytes(entry[8..12].try_into().unwrap()) as i16;
+    let msg_len = i32::from_be_bytes(entry[12..16].try_into().unwrap());
+    if !(0..=ALARM_MSG_LEN as i32).contains(&msg_len) {
+        return Err(WireError::Unsupported("alarm invalid message length"));
+    }
+    let msg_len = msg_len as usize;
+    let msg_area = &entry[16..16 + ALARM_MSG_LEN];
     // `msg_len` 截断（防越界 clamp）+ 首 NUL 截断 + lossy + trim。
     let bounded = msg_len.min(msg_area.len());
     let end = msg_area[..bounded]
@@ -2326,7 +2287,7 @@ pub(super) fn decode_opmsg_value(resp: &FocasFrame) -> Result<OperatorMessage, W
 }
 
 // ---------------------------------------------------------------------------
-// Load decoder（阶段 A v2：离线可测，不连机床，不接 production gate）。
+// 负载解码：严格校验槽位、数量、容量及各槽状态。
 // ---------------------------------------------------------------------------
 
 /// A4 数量解析（B1 数量合同）：A4 数据体首 BE16 即 count；
@@ -2346,7 +2307,7 @@ pub(super) fn decode_head_count(data: &[u8]) -> Result<usize, WireError> {
 /// 前后数量可不同，不要求相等，不自动重试；`min=0` 即返回空记录（不伪造）。
 /// 容量检查：名称 `len >= N*4` 且负载 `len >= N*8`，不足即 `Malformed`（不越界）。
 /// 四槽 status 全检查（任一非零即 Remote，保 detail 透传）。
-/// servo 符号：`to_servo_abi`（abs；INT32_MIN 拒绝）。
+/// servo 符号：`to_servo_abi`（32位 abs；INT32_MIN 位型保留，仅证据层）。
 #[allow(dead_code)]
 pub(super) fn decode_servo_load_new(
     resp: &FocasFrame,
@@ -2458,8 +2419,7 @@ pub(super) fn decode_spindle_meter(
     let head_data = reply_success_data(head)?;
     let name_data = reply_success_data(names)?;
     let tail_data = reply_success_data(tail)?;
-    // 数量合同（165 真机证据修正）：A4 数量暂仅作已观测的数量约束，
-    // 不解释为真实有效主轴数（165 上 before/after=3 而 DLL num_out=1）。
+    // 与实际 DLL 新分支一致：首尾 A4 约束返回数量，名称不足应拒绝而非缩减。
     let a4_limit = num_in
         .min(decode_head_count(head_data)?)
         .min(decode_head_count(tail_data)?);
@@ -2472,7 +2432,10 @@ pub(super) fn decode_spindle_meter(
     if a4_limit > 0 && name_count == 0 {
         return Err(WireError::MalformedPayload);
     }
-    let n = a4_limit.min(name_count);
+    if name_count < a4_limit {
+        return Err(WireError::MalformedPayload);
+    }
+    let n = a4_limit;
     // 名称数组（每项 4B，保留前三原始字节；无损，不做 lossy 转换。
     // 旧回退按第三字节选 scale，非 UTF-8 字节经 lossy 即无法恢复）。
     let spindle_names: Vec<[u8; 3]> = (0..n)
@@ -2503,9 +2466,7 @@ pub(super) fn decode_spindle_meter(
         let mut records = Vec::with_capacity(n);
         for i in 0..n {
             let l = LoadNumeric::decode(&load_data[i * 8..i * 8 + 8])?;
-            l.validate_dec()?;
             let s = LoadNumeric::decode(&speed_data[i * 8..i * 8 + 8])?;
-            s.validate_dec()?;
             records.push(SpindleRecord {
                 name_raw: spindle_names[i],
                 load: Some(l),
@@ -2526,7 +2487,6 @@ pub(super) fn decode_spindle_meter(
     let mut records = Vec::with_capacity(n);
     for i in 0..n {
         let m = LoadNumeric::decode(&d[i * 8..i * 8 + 8])?;
-        m.validate_dec()?;
         let (load, speed) = if req_type == 0 {
             (Some(m), None)
         } else {
@@ -2563,29 +2523,22 @@ pub(super) fn spindle_legacy_branch(
     }
 }
 
-/// 旧 spindle 回退算术（B4：`trunc(abs(raw) × scale / div)`，checked，不 panic）。
-/// load 用 `div=32767`；speed 用 `div=16383`。
-/// `scale` 由名称第三字节选（`'2'` 与否 → 4274/4127、4196/4020）。
-/// `abs` 溢出（`INT32_MIN`）、乘加溢出、`div == 0` 即 `Unsupported`。
-/// C 截断语义：Rust `i64 /` 即 trunc（与 C 一致，不做 floor）。
+/// 旧主轴缩放：abs与乘法均为32位回绕，再按有符号整数截断除法。
+/// scale 是读取的参数值，不是4127等参数号；load除数32767，speed除数16383。
 #[allow(dead_code)]
 pub(super) fn legacy_scaled(raw: i32, scale: i32, div: i32) -> Result<i32, WireError> {
     if div == 0 {
         return Err(WireError::Unsupported("legacy scale div == 0"));
     }
-    let a = raw
-        .checked_abs()
-        .ok_or(WireError::Unsupported("legacy raw INT32_MIN overflow"))?;
-    let m = (a as i64)
-        .checked_mul(scale as i64)
-        .ok_or(WireError::Unsupported("legacy scale mul overflow"))?;
-    let v = m / div as i64;
-    i32::try_from(v).map_err(|_| WireError::Unsupported("legacy scale overflow"))
+    let product = raw.wrapping_abs().wrapping_mul(scale);
+    product
+        .checked_div(div)
+        .ok_or(WireError::Unsupported("legacy divide overflow"))
 }
 
-/// 旧 spindle scale 选择（B4：名称第三字节是否为 `'2'`）。
+/// 旧主轴缩放参数号选择（名称第三字节是否为 `'2'`）。
 #[allow(dead_code)]
-pub(super) fn legacy_scale_for(name_third: u8, load: bool) -> i32 {
+pub(super) fn legacy_parameter_for(name_third: u8, load: bool) -> i32 {
     match (name_third == b'2', load) {
         (false, true) => RATIO_SCALE_LOAD_STD,
         (true, true) => RATIO_SCALE_LOAD_ALT,
@@ -2673,14 +2626,10 @@ pub(super) fn pmc_scalar_to_value(v: &PmcScalarValue) -> Value {
 /// 以 `raw` 重建 `RawNumeric8` 为权威（`u16 base/i16 exponent`），不读
 /// 兼容视图截断值。`native_value = mantissa` → `Value::I32`
 /// （`cnc_acts` 只取 mantissa；S1~S4 `500/1002/1500/800` 全闭合）。
-/// fail-closed：`mantissa < 0` 即 `Unsupported`（ERR → BAD；S0~S4 未见负值，
-/// 语义未闭合前不猜）。`base/exponent` 不设门（Native parity 目标；
-/// 非零 exp 自然观测，不造规则——与 feed B1 同口径）。
+/// 本机实际 DLL 差分确认整个有符号 I32 域，包括 INT32_MIN；不按转向推断符号。
+/// `base/exponent` 不设门：产品输出与 cnc_acts 的原始整数口径一致。
 fn spindle_to_value(spd: &SpindleSpeed) -> Result<Value, WireError> {
     let num = RawNumeric8::decode(&spd.raw)?;
-    if num.native_value() < 0 {
-        return Err(WireError::Unsupported("spindle mantissa < 0"));
-    }
     Ok(Value::I32(num.native_value()))
 }
 
@@ -2715,17 +2664,14 @@ fn zofs_to_value(v: &ZofsValue) -> Value {
 /// `native_value = mantissa` → `Value::U32`（与 `cnc_actf` 只复制前 4B
 /// 同合同；不因 `exponent != 0` 拒绝——否则 `mantissa=1234/exp=1` 将在
 /// Native 返回 `1234` 时 Wire 拒绝，重新产生 parity 漂移）。
-/// fail-closed（不 truncate/round/clamp）：`mantissa < 0` 即 `Unsupported`
-/// （ERR → BAD；产品合同非负 U32）。B4：判定以 `raw` 重建的 `RawNumeric8`
+/// 本机实际 DLL 差分确认按32位位型转 U32，最高位亦保留。判定以 `raw` 重建的 `RawNumeric8`
 /// 完整字段为权威，不读兼容视图截断值（`base 0x010A → u8 0x0A` 逃逸类）。
 /// NOTE：工程量 `mantissa/base^exponent` 为独立语义，不进此 adapter；
 /// 待独立 `engineering_value` 暴露后再议（见 PR53）。
 fn feed_to_value(rate: &FeedRate) -> Result<Value, WireError> {
     // PR53 B1+B4：Native contract 只依赖 mantissa；权威来自 raw 重建。
     let num = RawNumeric8::decode(&rate.raw)?;
-    if num.native_value() < 0 {
-        return Err(WireError::Unsupported("feed mantissa < 0"));
-    }
+    // 与 Native actf as u32 一致，保留原始32位位型；不把它解释成工程量。
     Ok(Value::U32(num.native_value() as u32))
 }
 
@@ -2733,7 +2679,7 @@ fn feed_to_value(rate: &FeedRate) -> Result<Value, WireError> {
 /// `RawNumeric8` 完整字段为权威（`u16 base/i16 exponent`），不读兼容视图
 /// 截断值（`exp 0x0103 → u8 3` 逃逸类）。`validate` 通过即
 /// `Value::I32(native_value)`（mantissa 可负，-2880 等均有真机证据；
-/// 与 feed 的 `mantissa<0` 拒绝无关，各自独立规则）。
+/// 原始整数与工程量缩放是独立合同）。
 fn axis_to_value(pos: &AxisPosition) -> Result<Value, WireError> {
     let num = RawNumeric8::decode(&pos.raw)?;
     num.validate()?;
@@ -2941,7 +2887,7 @@ impl FocasApi for WireFocasApi {
         // fail-closed（ERR → BAD），绝不用 absolute 冒充。
         // ActiveSpindleSpeed 与 indexed Spindle::Speed 同 PR52 Native 门：
         // 只有前者可调 `0x25`，后者 fail-closed（ERR → BAD）。
-        use crate::address::AxisKind;
+        use crate::address::{AxisKind, SpindleKind};
         use std::collections::BTreeMap;
         let need_status = addresses.iter().any(|a| matches!(a, FocasAddress::Status));
         let need_feed = addresses.iter().any(|a| matches!(a, FocasAddress::Feed));
@@ -3026,10 +2972,33 @@ impl FocasApi for WireFocasApi {
         } else {
             None
         };
+        // 同一批次各读取一次整组负载，按 DLL 的数组序号选择轴/主轴。
+        // 数量缩减或缺失记录必须报告 BAD，不用零值填充；无有效索引不发包。
+        let mut load_groups: [Option<Result<Vec<LoadNumeric>, String>>; 2] = [None, None];
+        for (group, servo) in [(0, false), (1, true)] {
+            let needed = addresses.iter().any(|a| match a {
+                FocasAddress::ServoLoad { axis } => servo && (1..=4).contains(axis),
+                FocasAddress::Spindle {
+                    spindle,
+                    kind: SpindleKind::Load,
+                } => !servo && (1..=4).contains(spindle),
+                _ => false,
+            });
+            if needed {
+                let result = self.client.load_values(servo).await;
+                load_groups[group] = Some(match result {
+                    Ok(values) => Ok(values),
+                    Err(error) => match Self::point_or_fatal(error) {
+                        Ok(Value::String(message)) => Err(message),
+                        Ok(_) => unreachable!("负载错误仅产生错误文本"),
+                        Err(fatal) => return Err(fatal),
+                    },
+                });
+            }
+        }
         // spindle Gear/MaxRpm：按 (kind,spindle) 去重各一次 spindle_word
         // （同族三 slot 请求；batch 多个同 key 去重一次 exchange；
         // 去重逻辑见 `dedup_sword_keys`，此处生产调用）。
-        use crate::address::SpindleKind;
         let sword_order: Vec<(SpindleKind, u8)> = dedup_sword_keys(addresses);
         let mut sword_map: BTreeMap<(SpindleKind, u8), Result<Value, String>> = BTreeMap::new();
         for (kind, spindle) in &sword_order {
@@ -3270,6 +3239,12 @@ impl FocasApi for WireFocasApi {
                     Err(e) if e.starts_with("ERR:") => out.push(Value::String(e)),
                     Err(fatal) => return Err(fatal),
                 },
+                FocasAddress::ServoLoad { axis } => {
+                    out.push(load_selected_value(&load_groups[1], *axis));
+                }
+                FocasAddress::Spindle { spindle, kind: SpindleKind::Load } => {
+                    out.push(load_selected_value(&load_groups[0], *spindle));
+                }
                 FocasAddress::Spindle { spindle, kind } => {
                     match sword_map.get(&(*kind, *spindle)).cloned() {
                         Some(Ok(v)) => out.push(v),
@@ -3422,6 +3397,97 @@ impl FocasApi for WireFocasApi {
     async fn disconnect(&self) {
         self.client.disconnect().await;
     }
+}
+
+impl FocasClient {
+    /// 能力选择与状态4记忆在同一 guard/会话内；重连自然清除回退状态。
+    pub(super) async fn load_values(&self, servo: bool) -> Result<Vec<LoadNumeric>, WireError> {
+        let mut guard = self.guard().await?;
+        let result = async {
+            let session = guard.session();
+            if !session.load.legacy {
+                if !servo && session.load.spindles == 0 {
+                    return Err(WireError::Remote {
+                        status: 6,
+                        detail1: 0,
+                        detail2: 0,
+                    });
+                }
+                let response = session
+                    .exchange(&super::load::request(servo), PacketType::GENERIC_RESPONSE)
+                    .await?;
+                return if servo {
+                    decode_servo_load_new(&response, 4)
+                        .map(|m| m.records.into_iter().map(|r| r.numeric).collect())
+                } else {
+                    decode_spindle_meter(&response, 0, 4)
+                        .map(|m| m.records.into_iter().map(|r| r.load.unwrap()).collect())
+                };
+            }
+            if servo && session.load.family == 2 && session.load.global_axes.is_none() {
+                let response = session
+                    .exchange(
+                        &super::load::global_axes_request(),
+                        PacketType::GENERIC_RESPONSE,
+                    )
+                    .await?;
+                session.load.global_axes = Some(super::load::decode_global_axes(&response)?);
+            }
+            let count = if servo {
+                session
+                    .load
+                    .global_axes
+                    .filter(|n| *n > 0)
+                    .unwrap_or(session.load.axes)
+            } else {
+                session.load.spindles
+            };
+            let mut scaled = !servo && session.load.scaled;
+            let mut response = session
+                .exchange(
+                    &super::load::legacy_request(servo, scaled),
+                    PacketType::GENERIC_RESPONSE,
+                )
+                .await?;
+            if !servo && !scaled && super::load::legacy_needs_scale(&response)? {
+                // 与 DLL 一致：首槽状态4记忆即使后续缩放失败也保留，直到断线。
+                session.load.scaled = true;
+                scaled = true;
+                response = session
+                    .exchange(
+                        &super::load::legacy_request(false, true),
+                        PacketType::GENERIC_RESPONSE,
+                    )
+                    .await?;
+            }
+            super::load::decode_legacy(&response, servo, scaled, count)
+        }
+        .await;
+        match &result {
+            Ok(_) => guard.complete(),
+            Err(error) => guard.fail(error.is_session_fatal()),
+        }
+        result
+    }
+}
+
+/// 先校验产品索引，再访问本批次数据；错误仅影响所选点，不污染同组有效值。
+fn load_selected_value(group: &Option<Result<Vec<LoadNumeric>, String>>, index: u8) -> Value {
+    let result = if !(1..=4).contains(&index) {
+        Err("ERR:load index must be 1..4".to_string())
+    } else {
+        match group {
+            Some(Ok(values)) => values
+                .get(index as usize - 1)
+                .ok_or_else(|| "ERR:load record missing".to_string())
+                .and_then(|numeric| {
+                    super::load::percent(*numeric).map_err(|error| format!("ERR:{error}"))
+                }),
+            Some(Err(error)) => Err(error.clone()),
+            None => Err("ERR:load group missing".to_string()),
+        }
+    };
+    result.unwrap_or_else(Value::String)
 }
 
 #[cfg(test)]
@@ -3734,20 +3800,16 @@ mod tests {
         assert_eq!(feed_to_value(&rate).unwrap(), Value::U32(12345));
     }
 
-    /// feed 负值 fail-closed：`mantissa < 0` 不得进 U32。
-    /// B4：判定走 `raw` 重建（此处 raw 与兼容字段一致，双重锁定）。
+    /// feed 的 U32 合同保持 Native 的32位转换，不能丢掉最高位。
     #[test]
-    fn feed_negative_is_bad() {
+    fn feed_signed_bits_preserved() {
         let rate = FeedRate {
             raw: [0xFF, 0xFF, 0xFF, 0xFF, 0, 10, 0, 0],
             mantissa: -1,
             base: 10,
             exponent: 0,
         };
-        assert!(matches!(
-            feed_to_value(&rate).unwrap_err(),
-            WireError::Unsupported(_)
-        ));
+        assert_eq!(feed_to_value(&rate).unwrap(), Value::U32(u32::MAX));
     }
 
     /// feed 非实证 base：B4 Native parity 下 adapter 不再设 base 门
@@ -3914,20 +3976,16 @@ mod tests {
         assert_eq!(spindle_to_value(&spd).unwrap(), Value::I32(0));
     }
 
-    /// spindle 负值 fail-closed：`mantissa < 0` 不得进 I32（S0~S4 未见负值，
-    /// 语义未闭合前不猜；与 feed 同口径，axis 的负值合法无关）。
+    /// 有符号转速不能凭未见过负样本就截掉 DLL 可以返回的值。
     #[test]
-    fn spindle_negative_is_bad() {
+    fn spindle_negative_preserved() {
         let spd = SpindleSpeed {
             raw: [0xFF, 0xFF, 0xFF, 0xFF, 0, 10, 0, 0],
             mantissa: -1,
             base: 10,
             exponent: 0,
         };
-        assert!(matches!(
-            spindle_to_value(&spd).unwrap_err(),
-            WireError::Unsupported(_)
-        ));
+        assert_eq!(spindle_to_value(&spd).unwrap(), Value::I32(-1));
     }
 
     /// B4 authority 回归（spindle 成功路径）：raw 与兼容视图故意矛盾——
@@ -5078,17 +5136,13 @@ mod tests {
     /// `StringArray(["IMPROPER G-CODE"])`（A3 controlled 三方证据）。
     #[test]
     fn decode_alarm_ps0010_locked() {
-        // 真机 reply data 48B（`44B` 条目 + `4B` 零填充）。
-        let mut data = vec![
-            0x00, 0x00, 0x00, 0x0a, // [0..4] no=10
-            0x00, 0x03, // [4..6] type=3
-            0x00, 0x00, // [6..8] axis=0
-            0x00, 0x00, // [8..10] reserve
-            0x00, 0x0f, // [10..12] len=15
-        ];
-        data.extend_from_slice(b"IMPROPER G-CODE"); // 15B 文本（I-M-P-R-O-P-E-R-space-G---C-O-D-E）
-        data.extend(vec![0x00; 32 - 15]); // msg[32]：NUL + 16B 零填充
-        data.extend(vec![0x00; 4]); // [44..48] 零填充（44B 条目 + 4B 填充）
+        // 独立 DLL 差分确认的网络格式；四个 BE32，不是 Native short 布局。
+        let mut data = Vec::new();
+        for field in [10i32, 3, 0, 15] {
+            data.extend_from_slice(&field.to_be_bytes());
+        }
+        data.extend_from_slice(b"IMPROPER G-CODE");
+        data.resize(48, 0);
         assert_eq!(data.len(), ALARM_DATA_LEN);
         let mut p = vec![0x00; 6];
         p.extend_from_slice(&[0x00, 0x30]); // dlen=48
@@ -5184,22 +5238,15 @@ mod tests {
         assert!(e.is_session_fatal());
     }
 
-    /// B3-B 文本截断：`msg_len` 越界 clamp + 首 NUL 截断 + trim
-    ///（不依赖候选长度；embedded NUL 后字节不进 String）。
+    /// 正确网络布局中的长度截断与 NUL：文本区域尾部不得进入产品字符串。
     #[test]
     fn alarm_text_truncate_locked() {
-        // msg_len=99（越界）+ msg 区 "AB\0CD..."：clamp 32 + 首 NUL → "AB"。
-        let mut data = vec![
-            0x00, 0x00, 0x00, 0x0a, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x63,
-        ];
-        let mut msg = vec![0x00; 32];
-        msg[0] = b'A';
-        msg[1] = b'B';
-        msg[2] = 0x00;
-        msg[3] = b'C';
-        msg[4] = b'D';
-        data.extend_from_slice(&msg);
-        data.extend(vec![0x00; 4]);
+        let mut data = Vec::new();
+        for field in [10i32, 3, 0, 5] {
+            data.extend_from_slice(&field.to_be_bytes());
+        }
+        data.extend_from_slice(b"AB\0CD");
+        data.resize(48, 0);
         assert_eq!(data.len(), ALARM_DATA_LEN);
         let mut p = vec![0x00; 6];
         p.extend_from_slice(&[0x00, 0x30]);
@@ -5907,7 +5954,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Load 离线合成回归（阶段 A v2：不连机床，不冒充 DLL 真机 parity；
+    // Load 离线合成回归（不连机床，不冒充 DLL 真机 parity；
     // 只锁 DLL 模型一致性：槽位/名称归属/Numeric 偏移/容量/回退算术；
     // production gate 不动）。
     // -----------------------------------------------------------------------
@@ -6141,7 +6188,7 @@ mod tests {
         assert_eq!(r.records[0].name_raw, [b'S', 0xFF, 0]);
         // 第三字节 0 → load scale STD（4127）。
         assert_eq!(
-            super::legacy_scale_for(r.records[0].name_raw[2], true),
+            super::legacy_parameter_for(r.records[0].name_raw[2], true),
             4127
         );
     }
@@ -6168,9 +6215,9 @@ mod tests {
         assert_eq!(r.records[0].speed.as_ref().unwrap().raw, 1500);
     }
 
-    /// Servo raw=INT32_MIN → 明确拒绝溢出，不 panic。
+    /// Servo INT32_MIN 的32位 abs 与独立 DLL 极限值样本一致，不 panic。
     #[test]
-    fn servo_load_int32_min_rejected() {
+    fn servo_load_int32_min_preserved() {
         let frame = FocasFrame {
             origin: 0x0003,
             packet_type: PacketType::GENERIC_RESPONSE,
@@ -6185,11 +6232,8 @@ mod tests {
                 load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
             ]),
         };
-        let e = super::decode_servo_load_new(&frame, 1).unwrap_err();
-        assert!(
-            matches!(e, WireError::Unsupported(_)),
-            "INT32_MIN 必须 Unsupported，实际：{e:?}"
-        );
+        let decoded = super::decode_servo_load_new(&frame, 1).unwrap();
+        assert_eq!(decoded.records[0].numeric.raw, i32::MIN);
     }
 
     /// 容量不足：名称 `len < N*4` 即 Malformed（N 由 min 得 2，但只给 1 项）。
@@ -6248,24 +6292,17 @@ mod tests {
     /// B4 回退算术：`trunc(abs(raw) × scale / div)`；scale 由名称第三字节选。
     #[test]
     fn legacy_scaled_locked() {
-        // load：abs(-270) × 4127 / 32767 = 34（trunc）。
-        assert_eq!(super::legacy_scaled(-270, 4127, 32767).unwrap(), 34);
-        // speed：abs(-1000) × 4020 / 16383 = 245（trunc）。
-        assert_eq!(super::legacy_scaled(-1000, 4020, 16383).unwrap(), 245);
+        // 系数是参数的返回值；参数号不是乘数。
+        assert_eq!(super::legacy_scaled(-32767, 100, 32767).unwrap(), 100);
+        assert_eq!(super::legacy_scaled(-16383, 6000, 16383).unwrap(), 6000);
         // scale 选择：第三字节 '2' 与否。
-        assert_eq!(super::legacy_scale_for(b'2', true), 4274);
-        assert_eq!(super::legacy_scale_for(b'X', true), 4127);
-        assert_eq!(super::legacy_scale_for(b'2', false), 4196);
-        assert_eq!(super::legacy_scale_for(b'X', false), 4020);
-        // div=0 / INT32_MIN / 溢出即 Unsupported。
-        assert!(matches!(
-            super::legacy_scaled(100, 4127, 0).unwrap_err(),
-            WireError::Unsupported(_)
-        ));
-        assert!(matches!(
-            super::legacy_scaled(i32::MIN, 4127, 32767).unwrap_err(),
-            WireError::Unsupported(_)
-        ));
+        assert_eq!(super::legacy_parameter_for(b'2', true), 4274);
+        assert_eq!(super::legacy_parameter_for(b'X', true), 4127);
+        assert_eq!(super::legacy_parameter_for(b'2', false), 4196);
+        assert_eq!(super::legacy_parameter_for(b'X', false), 4020);
+        assert!(super::legacy_scaled(100, 4127, 0).is_err());
+        assert_eq!(super::legacy_scaled(i32::MIN, 4127, 32767).unwrap(), -65538);
+        assert_eq!(super::legacy_scaled(i32::MAX, 2, 32767).unwrap(), 0);
     }
 
     /// 重复 0xA4：尾槽 status=4 → Remote（证明消费 slot3 而非 slot0）。

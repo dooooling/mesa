@@ -1,0 +1,35 @@
+{
+  "kind": "captured-handshake-for-local-synthetic-server",
+  "capture_sha256": "a676038fa1e907b94c231b66f9cb836f05a074165691630eaebec30cf2314651",
+  "files": {
+    "open2_request.bin": {
+      "source_frame": "flow-001/c2s-000.bin",
+      "sha256": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f"
+    },
+    "open_response.bin": {
+      "source_frame": "flow-001/s2c-000.bin",
+      "sha256": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b"
+    },
+    "sysinfo_request.bin": {
+      "source_frame": "flow-001/c2s-001.bin",
+      "sha256": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3"
+    },
+    "sysinfo_response.bin": {
+      "source_frame": "flow-001/s2c-001.bin",
+      "sha256": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474"
+    },
+    "close_request.bin": {
+      "source_frame": "flow-001/c2s-006.bin",
+      "sha256": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8"
+    },
+    "close_response.bin": {
+      "source_frame": "flow-001/s2c-006.bin",
+      "sha256": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+    },
+    "open1_request.bin": {
+      "source_frame": "flow-000/c2s-000.bin",
+      "sha256": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff"
+    }
+  },
+  "scope": "仅本机合成响应测试，不是完整 FOCAS 服务端"
+}

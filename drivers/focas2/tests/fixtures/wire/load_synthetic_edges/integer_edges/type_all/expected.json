@@ -1,0 +1,55 @@
+{
+  "tag": "type_all",
+  "kind": "synthetic-derived",
+  "candidates": [
+    {
+      "slot": 0,
+      "data": -2147483648,
+      "decimal": 0,
+      "unit": 0,
+      "name": [
+        83,
+        49,
+        0
+      ]
+    },
+    {
+      "slot": 1,
+      "data": -2147483648,
+      "decimal": 0,
+      "unit": 1,
+      "name": [
+        83,
+        49,
+        0
+      ]
+    },
+    {
+      "slot": 2,
+      "data": 2147483647,
+      "decimal": 0,
+      "unit": 0,
+      "name": [
+        83,
+        50,
+        0
+      ]
+    },
+    {
+      "slot": 3,
+      "data": 2147483647,
+      "decimal": 0,
+      "unit": 1,
+      "name": [
+        83,
+        50,
+        0
+      ]
+    }
+  ],
+  "native_wire_expected_equal": true,
+  "num_out": 2,
+  "original_response_sha256": "53419581b0e8bff21b208616ece0e8f1163cf9e4144a1bf3fa85b151f79e6505",
+  "request_sha256": "f0b0337d8ebafc1b88ea263941d1a84601defc39d2e266b53d813d6cf3b58995",
+  "response_sha256": "2d95c40f19cc0cb06229fbb57433068b7d757f6240921f4cb502c0ab944942ea"
+}

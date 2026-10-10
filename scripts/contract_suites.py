@@ -15,6 +15,7 @@ BASELINE = [
     "protocol_negotiation",
     "session_lifecycle",
     "data_plane",
+    "point_live",
     "fault_tolerance",
     "subprocess_recovery",
     "discovery_contract",

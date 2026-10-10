@@ -127,7 +127,7 @@ impl FakeFocasApi {
             } => Value::String("ERR:EW_NOOPT indexed spindle speed unsupported".into()),
             FocasAddress::Spindle { spindle: _, kind } => match kind {
                 // Speed 不可达（上一臂已拦截 indexed speed，此臂仅 load/gear/maxrpm）。
-                SpindleKind::Load => Value::U32(r % 101), // 0..100%
+                SpindleKind::Load => Value::F64((r % 1001) as f64 / 10.0), // 百分比保留小数
                 // Native 真机口径 I16→I32（Fake 旧 U32 错误，对齐 Native）。
                 SpindleKind::Gear => Value::I32(((r % 4) + 1) as i32),
                 SpindleKind::MaxRpm => Value::I32((6000 + (r % 4000)) as i32),
@@ -135,7 +135,7 @@ impl FakeFocasApi {
                     Value::String("ERR:EW_NOOPT indexed spindle speed unsupported".into())
                 }
             },
-            FocasAddress::ServoLoad { axis: _ } => Value::U32(r % 101),
+            FocasAddress::ServoLoad { axis: _ } => Value::F64((r % 1001) as f64 / 10.0),
             FocasAddress::MacroVar { number: _ } => {
                 // 宏变量：返回 F64
                 let v = (r as f64) / 100.0 - 100.0;
@@ -742,7 +742,7 @@ impl NativeFocasApi {
             FocasRet::Socket => format!("EW_SOCKET {}", ret.message()),
             FocasRet::Handle => format!("EW_HANDLE {}", ret.message()),
             FocasRet::Noopt => format!("EW_NOOPT {}", ret.message()),
-            _ => format!("EW_{:?}({}) {}", ret, ret as i16, ret.message()),
+            _ => format!("{}({})", ret.message(), ret.code()),
         }
     }
 }
@@ -833,6 +833,16 @@ impl NativeFocasApi {
     /// NOTE：`Spindle::Load/Gear/MaxRpm`、`ServoLoad`、`Diagnosis`、`Alarm`
     /// 的旧 FFI 分支已整体删除（见 git 历史），不是注释掉——避免未来
     /// 有人误以为“临时禁用”而直接恢复调用。
+    #[cfg(all(test, windows))]
+    pub(crate) fn read_for_dll_evidence(
+        lib: &NativeLib,
+        hdl: u16,
+        addr: &FocasAddress,
+    ) -> Result<Value, String> {
+        // 证据入口复用产品转换；调用方负责在创建句柄的同一 OS 线程执行。
+        Self::read_one_blocking(lib, hdl, addr)
+    }
+
     fn read_one_blocking(lib: &NativeLib, hdl: u16, addr: &FocasAddress) -> Result<Value, String> {
         // PR52 门：危险地址在任何 FFI 前即 Err（与单测同源逻辑）。
         if Self::pre_ffi_gate(addr).is_err() {
@@ -1074,17 +1084,7 @@ impl NativeFocasApi {
                 }
             }
             FocasAddress::OpMsg => match lib.cnc_rdopmsg(hdl) {
-                Ok(op) => {
-                    let s = String::from_utf8_lossy(&op.dummy)
-                        .trim_matches('\0')
-                        .trim()
-                        .to_string();
-                    if s.is_empty() {
-                        Ok(Value::String("OP:empty".into()))
-                    } else {
-                        Ok(Value::String(s))
-                    }
-                }
+                Ok(op) => Ok(Value::String(op.value_text())),
                 Err(e) if e == crate::native::FocasRet::Noopt => {
                     Ok(Value::String(format!("ERR:EW_NOOPT opmsg {}", e.message())))
                 }

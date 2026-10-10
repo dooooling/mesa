@@ -1,0 +1,51 @@
+{
+  "backend": "native",
+  "candidates": [
+    {
+      "data": 270,
+      "decimal": 1,
+      "name": [
+        88,
+        0,
+        0
+      ],
+      "slot": 0,
+      "unit": 0
+    },
+    {
+      "data": 560,
+      "decimal": 1,
+      "name": [
+        89,
+        0,
+        0
+      ],
+      "slot": 1,
+      "unit": 0
+    },
+    {
+      "data": 123,
+      "decimal": 2,
+      "name": [
+        90,
+        0,
+        0
+      ],
+      "slot": 2,
+      "unit": 0
+    }
+  ],
+  "finished_ns": 1791618289337620400,
+  "guards_ok": true,
+  "num_in": 4,
+  "num_out": 3,
+  "pid": 42456,
+  "raw_0_512_hex": "0e01000001000000580000cc3002000001000000590000cc7b000000020000005a0000cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "rc": 0,
+  "selector": -1,
+  "servo": true,
+  "span_tail_ok": true,
+  "started_ns": 1791618289336771300,
+  "tail_ok": true,
+  "untouched_half_ok": true
+}

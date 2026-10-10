@@ -1,0 +1,242 @@
+[
+  {
+    "actual": {
+      "F64": 1.2345e-6
+    },
+    "address": "spindle[1].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": 1.2345e-6,
+    "index": 0
+  },
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "spindle[2].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 1
+  },
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "spindle[3].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 2
+  },
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "spindle[4].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 3
+  },
+  {
+    "actual": {
+      "F64": 1.2345e-6
+    },
+    "address": "servo[1].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": 1.2345e-6,
+    "index": 4
+  },
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "servo[2].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 5
+  },
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "servo[3].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 6
+  },
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "servo[4].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 7
+  },
+  {
+    "actual": {
+      "F64": 1.2345e-6
+    },
+    "address": "spindle[1].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": 1.2345e-6,
+    "index": 8
+  },
+  {
+    "actual": {
+      "F64": 1.2345e-6
+    },
+    "address": "servo[1].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": 1.2345e-6,
+    "index": 9
+  },
+  {
+    "actual": {
+      "String": "ERR:load index must be 1..4"
+    },
+    "address": "servo[0].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 10
+  },
+  {
+    "actual": {
+      "String": "ERR:load index must be 1..4"
+    },
+    "address": "spindle[5].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 11
+  },
+  {
+    "actual": {
+      "F64": 1.2345e-6
+    },
+    "address": "spindle[1].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": 1.2345e-6,
+    "index": 0
+  },
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "spindle[2].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 1
+  },
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "spindle[3].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 2
+  },
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "spindle[4].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 3
+  },
+  {
+    "actual": {
+      "F64": 1.2345e-6
+    },
+    "address": "servo[1].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": 1.2345e-6,
+    "index": 4
+  },
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "servo[2].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 5
+  },
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "servo[3].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 6
+  },
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "servo[4].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 7
+  },
+  {
+    "actual": {
+      "F64": 1.2345e-6
+    },
+    "address": "spindle[1].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": 1.2345e-6,
+    "index": 8
+  },
+  {
+    "actual": {
+      "F64": 1.2345e-6
+    },
+    "address": "servo[1].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": 1.2345e-6,
+    "index": 9
+  },
+  {
+    "actual": {
+      "String": "ERR:load index must be 1..4"
+    },
+    "address": "servo[0].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 10
+  },
+  {
+    "actual": {
+      "String": "ERR:load index must be 1..4"
+    },
+    "address": "spindle[5].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 11
+  }
+]

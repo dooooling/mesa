@@ -1231,13 +1231,8 @@ fn param_request_locked() {
     }
 }
 
-/// spindle load 165 真机（`spindle_load_165/type{0,1,all}`）：原始响应经生产
-/// `decode_spindle_meter` 直测（165 G31Z/10.0，`num_in=2`，A4 `3/3`）。
-/// 数量取 `n=min(2,3,3,1)=1`（名称 4B 即 1 条；`8A` 不足不得伪造）。
-/// 有效性只解析 unit0（`raw=0/dec=0`）；unit1 不得影响结果，
-/// 原始字节保留（fixture 全 64B 不裁剪）。
-/// `type=-1` 五槽双 `40` 各 64B，load/speed 按槽配对。
-/// Native 对照：`num_out=1`，24B 单 `OdbSpLoad`（见 `spindle_load_zero_probe`）。
+/// 历史双 A4[2] 误请求与原始哈希保留作负回归；计数和名称不闭合必须拒绝。
+/// 正确双 A4[1] 与实际 DLL 对照另见 load_research/load_replay。
 fn spindle_load_165_decodes() {
     use sha2::{Digest, Sha256};
     for (group, req_type) in [("type0", 0), ("type1", 1), ("type_all", -1)] {
@@ -1255,109 +1250,29 @@ fn spindle_load_165_decodes() {
                 "{group}/{name} SHA-256 与归档不一致（fixture 被改动？）"
             );
         }
-        // 请求报文回归：fixture request 即探针请求编码（type/num_in 一致）。
-        // function = path<<16|command（path=1；与探针同源，不依赖 FUNC 兼容常量）。
+        // 仅校验历史误请求的归档身份；不把 A4 的选择参数误命名为 num_in。
         {
-            use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
-            use super::frame::{encode_generic_request, request_subpacket};
-            use super::wire::{
-                CMD_LOAD_HEAD, CMD_SPINDLE_METER, CMD_SPINDLE_NAMES, DEV_CNC,
-                SPINDLE_METER_FUNC_LOAD, SPINDLE_METER_FUNC_SPEED,
-            };
-            let f = |cmd: u16| (0x0001u32 << 16) | cmd as u32;
-            let n = 2;
-            let mut subs = vec![
-                request_subpacket(DEV_CNC, f(CMD_LOAD_HEAD), [n, 0, 0, 0, 0]),
-                request_subpacket(DEV_CNC, f(CMD_SPINDLE_NAMES), [0, 0, 0, 0, 0]),
-            ];
-            if req_type == -1 {
-                subs.push(request_subpacket(
-                    DEV_CNC,
-                    f(CMD_SPINDLE_METER),
-                    [SPINDLE_METER_FUNC_LOAD, -1, 0, 0, 0],
-                ));
-                subs.push(request_subpacket(
-                    DEV_CNC,
-                    f(CMD_SPINDLE_METER),
-                    [SPINDLE_METER_FUNC_SPEED, -1, 0, 0, 0],
-                ));
-            } else {
-                let func = if req_type == 0 {
-                    SPINDLE_METER_FUNC_LOAD
-                } else {
-                    SPINDLE_METER_FUNC_SPEED
-                };
-                subs.push(request_subpacket(
-                    DEV_CNC,
-                    f(CMD_SPINDLE_METER),
-                    [func, -1, 0, 0, 0],
-                ));
-            }
-            subs.push(request_subpacket(
-                DEV_CNC,
-                f(CMD_LOAD_HEAD),
-                [n, 0, 0, 0, 0],
-            ));
-            let build = FocasFrame {
-                origin: REQUEST_ORIGIN,
-                packet_type: PacketType::GENERIC_REQUEST,
-                payload: encode_generic_request(&subs),
-            }
-            .encode();
+            let mut historical = super::load_research::spindle_request(req_type)
+                .unwrap()
+                .encode();
+            let tail_offset = historical.len() - 17;
+            historical[23] = 2;
+            historical[tail_offset] = 2;
             let raw = read(&dir, "request_frame.bin");
             assert_eq!(
-                raw, build,
-                "{group} 请求 fixture 必须 == 生产探针编码（type={req_type} num_in=2）"
+                raw, historical,
+                "{group} 历史误请求必须保留，不得改成正确请求后继续声称是原始采集"
             );
         }
         let frame = assemble_frame(&read(&dir, "response_frame.bin"));
-        let m = decode_spindle_meter(&frame, req_type, 2)
-            .unwrap_or_else(|e| panic!("{group} 165 真机必须解码：{e}"));
-        assert_eq!(m.req_type, req_type, "{group} req_type 回显");
-        assert_eq!(m.records.len(), 1, "{group} 165 有效记录必须 1 条");
-        assert_eq!(
-            m.records[0].name_raw,
-            [b'S', b'1', 0],
-            "{group} 名称归属 S1"
-        );
-        let exp = expected(&dir);
-        assert_eq!(
-            exp["req_type"].as_i64().unwrap() as i32,
-            req_type,
-            "{group} expected req_type 一致"
-        );
-        assert_eq!(
-            exp["num_in"].as_u64().unwrap() as usize,
-            2,
-            "{group} expected num_in 一致"
+        assert!(
+            matches!(
+                decode_spindle_meter(&frame, req_type, 2),
+                Err(super::WireError::MalformedPayload)
+            ),
+            "历史误请求的数量与名称不闭合，不能据此缩减成正常单主轴"
         );
     }
-    // type=0 有效性：unit0 raw=0/dec=0；load Some（type=0），speed None。
-    let frame0 = assemble_frame(&read("spindle_load_165/type0", "response_frame.bin"));
-    let m0 = decode_spindle_meter(&frame0, 0, 2).unwrap();
-    let l0 = m0.records[0].load.as_ref().expect("type=0 load 有效");
-    assert_eq!((l0.raw, l0.dec_bits), (0, 0), "type=0 unit0 零负载");
-    assert!(m0.records[0].speed.is_none(), "type=0 speed 为 None");
-    // type=1 有效性：speed Some（零负载残留位型），load None；
-    // 64B 尾部残留不参与解析（只取 unit0；不断言残留语义）。
-    let frame1 = assemble_frame(&read("spindle_load_165/type1", "response_frame.bin"));
-    let m1 = decode_spindle_meter(&frame1, 1, 2).unwrap();
-    assert_eq!(m1.records.len(), 1, "type=1 有效记录 1 条");
-    assert!(m1.records[0].load.is_none(), "type=1 load 为 None");
-    let s1 = m1.records[0].speed.as_ref().expect("type=1 speed 有效");
-    assert_eq!(
-        (s1.raw, s1.dec_bits),
-        (0, 0),
-        "type=1 unit0 零负载（speed 侧）"
-    );
-    // type=-1 有效性：load/speed 双 Some（同批次双 40 按槽配对）。
-    let framea = assemble_frame(&read("spindle_load_165/type_all", "response_frame.bin"));
-    let ma = decode_spindle_meter(&framea, -1, 2).unwrap();
-    assert_eq!(ma.records.len(), 1, "type=-1 有效记录 1 条");
-    let la = ma.records[0].load.as_ref().expect("type=-1 load 有效");
-    let sa = ma.records[0].speed.as_ref().expect("type=-1 speed 有效");
-    assert_eq!((la.raw, la.dec_bits), (0, 0), "type=-1 load unit0 零负载");
-    assert_eq!((sa.raw, sa.dec_bits), (0, 0), "type=-1 speed unit0 零负载");
 }
 
 /// diagnosis D301（Batch 2）：fixture 经生产 codec 解码 == expected
@@ -1432,9 +1347,7 @@ fn diagnosis_request_locked() {
     assert_eq!(build.len(), 40, "0x93 请求必须 40B");
 }
 
-/// alarm empty/PS0010（B3-B）：fixture 经生产 codec 解码 == expected
-///（空=[] / 单条 `no=10/type=3/axis=0/"IMPROPER G-CODE"` → StringArray 1 元；
-/// request 生产编码 == 捕获 fixture 全 40B）。
+/// 空报警回归、历史错误 ABI 帧拒绝；读取请求仍与归档全字节相等。
 fn alarm_empty_ps0010_decodes() {
     use super::wire::alarm_to_value_for_test as to_value;
     // 空：dlen=0 → []。
@@ -1446,25 +1359,13 @@ fn alarm_empty_ps0010_decodes() {
         mesa_core_types::Value::StringArray(vec![]),
         "空报警 → StringArray([])"
     );
-    // PS0010：三方同次一致。
+    // 历史 PS0010 文件把44B ABI误当网络结构；独立 DLL 差分已否定此布局。
+    // 保留原件作为负例，禁止修补原件后继续宣称它是原始抓包证据。
     let frame1 = assemble_frame(&read("alarm_ps0010", "alarm_response_frame.bin"));
-    let r1 = decode_alarm_value(&frame1).expect("alarm_ps0010 必须解码");
-    assert_eq!(r1.alarms.len(), 1);
-    assert_eq!(r1.alarms[0].number, 10);
-    assert_eq!(r1.alarms[0].alarm_type, 3);
-    assert_eq!(r1.alarms[0].axis, 0);
-    assert_eq!(r1.alarms[0].text, "IMPROPER G-CODE");
-    let exp = expected("alarm_ps0010");
-    assert_eq!(
-        exp["alarms"][0]["text"].as_str().unwrap(),
-        r1.alarms[0].text,
-        "Wire↔expected 文本同次一致"
-    );
-    assert_eq!(
-        to_value(&r1),
-        mesa_core_types::Value::StringArray(vec!["IMPROPER G-CODE".into()]),
-        "Mesa StringArray 1 元"
-    );
+    assert!(matches!(
+        decode_alarm_value(&frame1),
+        Err(super::WireError::Unsupported(_))
+    ));
     // 请求：生产编码器输出 == 捕获 fixture 全 40B（empty/PS0010 同请求）。
     use super::frame::{FocasFrame, PacketType, REQUEST_ORIGIN};
     use super::frame::{encode_generic_request, request_subpacket};

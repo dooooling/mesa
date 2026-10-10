@@ -1,0 +1,77 @@
+{
+  "kind": "synthetic-derived",
+  "name": "zero",
+  "spec": {
+    "spindle": [
+      [
+        0,
+        0
+      ]
+    ],
+    "servo": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ]
+    ]
+  },
+  "rows": 24,
+  "all_equal": true,
+  "loaded_modules": [
+    {
+      "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+      "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+    },
+    {
+      "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+      "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+    }
+  ],
+  "files": {
+    "server.json": "81a9d16192d1ed2e78c17b6be1c6a79f26f655074aaa052f552952a82dfe5aa6",
+    "test.log": "345ba2708902116f25eea1685c0f0b26465a30eafd39436e36d7a0e032d9f9b4",
+    "samples/modules-servo.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+    "samples/modules-type0-repeat.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+    "samples/modules-type0.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+    "samples/native-servo.json": "2813001cc1866e161fe5c9ad1d646a0d02f0abdda944994ed56a7407cf7a19e1",
+    "samples/native-type0-repeat.json": "abacebf0ca52bda55930942efafb2b0886ec12394abab1ee37858b6c50412e46",
+    "samples/native-type0.json": "1d684519d9c7923c6c9b5e935774fdd860d7209dde306576410432c8f3c448d1",
+    "samples/production-comparison.json": "a0c6d1ecb429b3a298e8591e043dfa254edb7f7f798a64b6600a257ead1376a6",
+    "traffic/00.request.bin": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff",
+    "traffic/00.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+    "traffic/01.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+    "traffic/01.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+    "traffic/02.request.bin": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+    "traffic/02.response.bin": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474",
+    "traffic/03.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+    "traffic/03.response.bin": "69e77a8864e88762da6aa4d94d3e37c39362c8dc089d15e34836e7a5f52cfff3",
+    "traffic/04.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+    "traffic/04.response.bin": "69e77a8864e88762da6aa4d94d3e37c39362c8dc089d15e34836e7a5f52cfff3",
+    "traffic/05.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+    "traffic/05.response.bin": "708489d53a43cc73ba74579757eaa37f6e458f94fe109e6b76f6bce728d707be",
+    "traffic/06.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+    "traffic/06.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+    "traffic/07.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+    "traffic/07.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+    "traffic/08.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+    "traffic/08.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+    "traffic/09.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+    "traffic/09.response.bin": "69e77a8864e88762da6aa4d94d3e37c39362c8dc089d15e34836e7a5f52cfff3",
+    "traffic/10.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+    "traffic/10.response.bin": "708489d53a43cc73ba74579757eaa37f6e458f94fe109e6b76f6bce728d707be",
+    "traffic/11.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+    "traffic/11.response.bin": "69e77a8864e88762da6aa4d94d3e37c39362c8dc089d15e34836e7a5f52cfff3",
+    "traffic/12.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+    "traffic/12.response.bin": "708489d53a43cc73ba74579757eaa37f6e458f94fe109e6b76f6bce728d707be",
+    "traffic/13.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+    "traffic/13.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+  }
+}

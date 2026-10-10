@@ -1,0 +1,922 @@
+{
+  "scope": "新旧分支生产百分比/批次读取/状态4回退",
+  "kind": "synthetic-derived",
+  "all_equal": true,
+  "cases": [
+    {
+      "kind": "synthetic-derived",
+      "name": "zero",
+      "spec": {
+        "spindle": [
+          [
+            0,
+            0
+          ]
+        ],
+        "servo": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            0
+          ]
+        ]
+      },
+      "rows": 24,
+      "all_equal": true,
+      "loaded_modules": [
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+          "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+        },
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+          "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+        }
+      ],
+      "files": {
+        "server.json": "412ef6fb697477aae969199f1ed9fe74b57d37f6aa3a4856157d2dce0d1427b7",
+        "test.log": "947116e09b2392f0fbd1271d53909abcef0f6f38963f6496c4cc36a2747e5ac3",
+        "samples/modules-servo.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0-repeat.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/native-servo.json": "8dde1f0117bc9b3f47b3f2fbba0dfb5e02e0aa4983a02e034436552a89952584",
+        "samples/native-type0-repeat.json": "27dede86b535e1a3813b23ef0894a28fa8126559574db25fdbf4e185267a5a93",
+        "samples/native-type0.json": "bd7434f4601801d4fb23dfbfe6174a8548f4a4f8693283950deecf41c2064741",
+        "samples/production-comparison.json": "a0c6d1ecb429b3a298e8591e043dfa254edb7f7f798a64b6600a257ead1376a6",
+        "traffic/00.request.bin": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff",
+        "traffic/00.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/01.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/01.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/02.request.bin": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+        "traffic/02.response.bin": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474",
+        "traffic/03.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/03.response.bin": "69e77a8864e88762da6aa4d94d3e37c39362c8dc089d15e34836e7a5f52cfff3",
+        "traffic/04.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/04.response.bin": "69e77a8864e88762da6aa4d94d3e37c39362c8dc089d15e34836e7a5f52cfff3",
+        "traffic/05.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/05.response.bin": "708489d53a43cc73ba74579757eaa37f6e458f94fe109e6b76f6bce728d707be",
+        "traffic/06.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/06.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/07.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/07.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/08.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/08.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/09.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/09.response.bin": "69e77a8864e88762da6aa4d94d3e37c39362c8dc089d15e34836e7a5f52cfff3",
+        "traffic/10.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/10.response.bin": "708489d53a43cc73ba74579757eaa37f6e458f94fe109e6b76f6bce728d707be",
+        "traffic/11.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/11.response.bin": "69e77a8864e88762da6aa4d94d3e37c39362c8dc089d15e34836e7a5f52cfff3",
+        "traffic/12.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/12.response.bin": "708489d53a43cc73ba74579757eaa37f6e458f94fe109e6b76f6bce728d707be",
+        "traffic/13.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/13.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+      }
+    },
+    {
+      "kind": "synthetic-derived",
+      "name": "fractional",
+      "spec": {
+        "spindle": [
+          [
+            -125,
+            1
+          ],
+          [
+            875,
+            1
+          ]
+        ],
+        "servo": [
+          [
+            -270,
+            1
+          ],
+          [
+            560,
+            1
+          ],
+          [
+            -123,
+            2
+          ]
+        ]
+      },
+      "rows": 24,
+      "all_equal": true,
+      "loaded_modules": [
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+          "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+        },
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+          "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+        }
+      ],
+      "files": {
+        "server.json": "c7be7be5f707c26fe1de3f8ed9ce0b71c1593fdde34a306dc6b80b36733d090e",
+        "test.log": "f0c64eda55fb83e5b956a58dbecde0ecd60baae8287cf5239399a7b3aeae623c",
+        "samples/modules-servo.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0-repeat.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/native-servo.json": "05b8af1d1dd90c7a5e559325ad4431ead2daa9b5f3b4d18f561a4052390c6133",
+        "samples/native-type0-repeat.json": "a011cc2a3b5076b5afe48122ee8113564ab2f3677fbd6e28a9b5b9bfc8376c9c",
+        "samples/native-type0.json": "f7e52d0a6b99bdfa18aa35a645844ee699a413e4eac6f642c4af392e6bc3068b",
+        "samples/production-comparison.json": "24b52b2a2d34a4060ddb59ea9d20cd20cab3cc0565ab8a5d3ff8a431299ee1e7",
+        "traffic/00.request.bin": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff",
+        "traffic/00.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/01.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/01.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/02.request.bin": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+        "traffic/02.response.bin": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474",
+        "traffic/03.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/03.response.bin": "b3c417559d11aa9827052a14e8ad21128231b1132cab20978c3dd753b9a139d6",
+        "traffic/04.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/04.response.bin": "b3c417559d11aa9827052a14e8ad21128231b1132cab20978c3dd753b9a139d6",
+        "traffic/05.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/05.response.bin": "5807fa6bddb565c60dce24cc0a202f7fe853f091451de29fd43e34ab16f980cc",
+        "traffic/06.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/06.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/07.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/07.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/08.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/08.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/09.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/09.response.bin": "b3c417559d11aa9827052a14e8ad21128231b1132cab20978c3dd753b9a139d6",
+        "traffic/10.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/10.response.bin": "5807fa6bddb565c60dce24cc0a202f7fe853f091451de29fd43e34ab16f980cc",
+        "traffic/11.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/11.response.bin": "b3c417559d11aa9827052a14e8ad21128231b1132cab20978c3dd753b9a139d6",
+        "traffic/12.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/12.response.bin": "5807fa6bddb565c60dce24cc0a202f7fe853f091451de29fd43e34ab16f980cc",
+        "traffic/13.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/13.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+      }
+    },
+    {
+      "kind": "synthetic-derived",
+      "name": "four",
+      "spec": {
+        "spindle": [
+          [
+            7,
+            -1
+          ],
+          [
+            99,
+            2
+          ],
+          [
+            -123,
+            3
+          ],
+          [
+            2147483647,
+            9
+          ]
+        ],
+        "servo": [
+          [
+            -7,
+            -1
+          ],
+          [
+            99,
+            2
+          ],
+          [
+            -123,
+            3
+          ],
+          [
+            -2147483648,
+            0
+          ]
+        ]
+      },
+      "rows": 24,
+      "all_equal": true,
+      "loaded_modules": [
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+          "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+        },
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+          "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+        }
+      ],
+      "files": {
+        "server.json": "7e8412aeccd67e93fec8eca60954a43489ae5e1d88481b33b75124c95d64c323",
+        "test.log": "f0c64eda55fb83e5b956a58dbecde0ecd60baae8287cf5239399a7b3aeae623c",
+        "samples/modules-servo.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0-repeat.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/native-servo.json": "31da220a331c2a2da35c6331ceee613f9b9451447420f62c50e9a1bff0eacfd3",
+        "samples/native-type0-repeat.json": "4ee8e4f89f15907c7718233213df99c3ea3606b3f5c24b0249c68c24df22b1ac",
+        "samples/native-type0.json": "befeed51bdb1ce06d479efecbf0ca4dafcf466dfabda1e22404b39e8b9b33a39",
+        "samples/production-comparison.json": "d66e008882fe48cda077a84ae44d2652c10f05c97487ac76909f20822fc47b78",
+        "traffic/00.request.bin": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff",
+        "traffic/00.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/01.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/01.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/02.request.bin": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+        "traffic/02.response.bin": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474",
+        "traffic/03.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/03.response.bin": "bcb2ff5fe2009f2aaeee668763ba1b47577b2172bdf2c5bd21945ab6a12e8f25",
+        "traffic/04.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/04.response.bin": "bcb2ff5fe2009f2aaeee668763ba1b47577b2172bdf2c5bd21945ab6a12e8f25",
+        "traffic/05.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/05.response.bin": "d69efd490603b62f63f568bb637d6bcc25ac5334860ecf68ace4b538b22b90c7",
+        "traffic/06.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/06.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/07.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/07.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/08.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/08.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/09.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/09.response.bin": "bcb2ff5fe2009f2aaeee668763ba1b47577b2172bdf2c5bd21945ab6a12e8f25",
+        "traffic/10.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/10.response.bin": "d69efd490603b62f63f568bb637d6bcc25ac5334860ecf68ace4b538b22b90c7",
+        "traffic/11.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/11.response.bin": "bcb2ff5fe2009f2aaeee668763ba1b47577b2172bdf2c5bd21945ab6a12e8f25",
+        "traffic/12.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/12.response.bin": "d69efd490603b62f63f568bb637d6bcc25ac5334860ecf68ace4b538b22b90c7",
+        "traffic/13.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/13.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+      }
+    },
+    {
+      "kind": "synthetic-derived",
+      "name": "decimal10",
+      "spec": {
+        "spindle": [
+          [
+            12345,
+            10
+          ]
+        ],
+        "servo": [
+          [
+            -12345,
+            10
+          ]
+        ]
+      },
+      "rows": 24,
+      "all_equal": true,
+      "loaded_modules": [
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+          "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+        },
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+          "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+        }
+      ],
+      "files": {
+        "server.json": "dd1f1765fa75ca2ae0434077aa307922b9bc2b2d86766ffa65f5abdfc51ca8c9",
+        "test.log": "5d285c3dce3ca4a2ace76386c3254626fd282a7577db0a01ca3488b4eb6bc65a",
+        "samples/modules-servo.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0-repeat.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/native-servo.json": "f9e7b9d67b6a9bfea1ab59f16c48af5570836c0140ae016eabeb106776895e3b",
+        "samples/native-type0-repeat.json": "61c30859506a901cf3713c5836e144393f05e25c5ac76a2109199c69a82789e4",
+        "samples/native-type0.json": "b5f9ed297917c7c8be9025d5b4cac9df1f10c4f0b76177cdee0e55c4e23f1a95",
+        "samples/production-comparison.json": "1528a99f1212042ba54d8f720bbc091341a38428f2d86c4c562e7c6eedf7c5c6",
+        "traffic/00.request.bin": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff",
+        "traffic/00.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/01.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/01.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/02.request.bin": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+        "traffic/02.response.bin": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474",
+        "traffic/03.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/03.response.bin": "051cbe723ab9ea4e9670257da9dfded75f9377ade17fb5b42d27c16f2fbf489e",
+        "traffic/04.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/04.response.bin": "051cbe723ab9ea4e9670257da9dfded75f9377ade17fb5b42d27c16f2fbf489e",
+        "traffic/05.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/05.response.bin": "9656900051794a1d6d04a2abfc114027824eac75d9a130c5f3ca5d48008dd452",
+        "traffic/06.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/06.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/07.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/07.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/08.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/08.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/09.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/09.response.bin": "051cbe723ab9ea4e9670257da9dfded75f9377ade17fb5b42d27c16f2fbf489e",
+        "traffic/10.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/10.response.bin": "9656900051794a1d6d04a2abfc114027824eac75d9a130c5f3ca5d48008dd452",
+        "traffic/11.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/11.response.bin": "051cbe723ab9ea4e9670257da9dfded75f9377ade17fb5b42d27c16f2fbf489e",
+        "traffic/12.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/12.response.bin": "9656900051794a1d6d04a2abfc114027824eac75d9a130c5f3ca5d48008dd452",
+        "traffic/13.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/13.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+      }
+    },
+    {
+      "kind": "synthetic-derived",
+      "name": "decimal_extremes",
+      "spec": {
+        "spindle": [
+          [
+            1,
+            -32768
+          ],
+          [
+            1,
+            32767
+          ],
+          [
+            0,
+            -32768
+          ],
+          [
+            1,
+            308
+          ]
+        ],
+        "servo": [
+          [
+            1,
+            -309
+          ],
+          [
+            -1,
+            32767
+          ],
+          [
+            0,
+            -32768
+          ],
+          [
+            -1,
+            308
+          ]
+        ]
+      },
+      "rows": 24,
+      "all_equal": true,
+      "loaded_modules": [
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+          "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+        },
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+          "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+        }
+      ],
+      "files": {
+        "server.json": "3fb654c99bcfd8a9d03b66026addfeb03afffa2b274a66606eb9f6fc38c99bb4",
+        "test.log": "f0c64eda55fb83e5b956a58dbecde0ecd60baae8287cf5239399a7b3aeae623c",
+        "samples/modules-servo.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0-repeat.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/native-servo.json": "55a7d2cb028743b6975b95e8fd1b8c87ce12ca6e3e7a96d2044867527f3e7518",
+        "samples/native-type0-repeat.json": "3ee9208b916ce397cb3d5510afddcd39eaa221d514104bab26f371584aab489e",
+        "samples/native-type0.json": "e899206b0531f9b6092d8d61fcd684c6026eda00ae836145020de4185a125ddb",
+        "samples/production-comparison.json": "b0b124fcbece6a9d7d77eee9ae64cc595651800904a018a95e535615d3815d9c",
+        "traffic/00.request.bin": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff",
+        "traffic/00.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/01.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/01.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/02.request.bin": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+        "traffic/02.response.bin": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474",
+        "traffic/03.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/03.response.bin": "735df01a63cd59a9d73e67e36ccacacf6a4b4153120ac0d378eacd5410f0343a",
+        "traffic/04.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/04.response.bin": "735df01a63cd59a9d73e67e36ccacacf6a4b4153120ac0d378eacd5410f0343a",
+        "traffic/05.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/05.response.bin": "f203ce61e5e91eac5243f6592aa51bf374123f869dbabe2896335170c57c1fb3",
+        "traffic/06.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/06.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/07.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/07.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/08.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/08.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/09.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/09.response.bin": "735df01a63cd59a9d73e67e36ccacacf6a4b4153120ac0d378eacd5410f0343a",
+        "traffic/10.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/10.response.bin": "f203ce61e5e91eac5243f6592aa51bf374123f869dbabe2896335170c57c1fb3",
+        "traffic/11.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/11.response.bin": "735df01a63cd59a9d73e67e36ccacacf6a4b4153120ac0d378eacd5410f0343a",
+        "traffic/12.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/12.response.bin": "f203ce61e5e91eac5243f6592aa51bf374123f869dbabe2896335170c57c1fb3",
+        "traffic/13.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/13.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+      }
+    },
+    {
+      "kind": "synthetic-derived",
+      "name": "shrinking",
+      "spec": {
+        "spindle": [
+          [
+            270,
+            1
+          ],
+          [
+            123,
+            1
+          ]
+        ],
+        "servo": [
+          [
+            -270,
+            1
+          ],
+          [
+            123,
+            1
+          ]
+        ],
+        "before": 2,
+        "after": 1
+      },
+      "rows": 24,
+      "all_equal": true,
+      "loaded_modules": [
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+          "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+        },
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+          "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+        }
+      ],
+      "files": {
+        "server.json": "052a511b440e33fd9d4749dbd1992c2319072729437a51f2c4cd4592e78b49b5",
+        "test.log": "5d285c3dce3ca4a2ace76386c3254626fd282a7577db0a01ca3488b4eb6bc65a",
+        "samples/modules-servo.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0-repeat.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/native-servo.json": "e63205158e48e3bde26e8c77f425de90496ec7a62de14f3affb39d2fecdd23fb",
+        "samples/native-type0-repeat.json": "726eba7a125c3395c55d0bd8cabf9fb1812a1de4ac275354ff2ef22078e790c2",
+        "samples/native-type0.json": "c828c5f535bf5948a5766aa35570913cf438aa01b026643ae0cfa46f47a7f651",
+        "samples/production-comparison.json": "230ab4f7e7ad73c5351c06cd257cd525502764432bf1c36b63b1dbc53523265c",
+        "traffic/00.request.bin": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff",
+        "traffic/00.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/01.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/01.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/02.request.bin": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+        "traffic/02.response.bin": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474",
+        "traffic/03.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/03.response.bin": "8ca1adb4db5db14c3d66d7e04f3ad4429676e584f3a6db8c4496e07454b5d2f4",
+        "traffic/04.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/04.response.bin": "8ca1adb4db5db14c3d66d7e04f3ad4429676e584f3a6db8c4496e07454b5d2f4",
+        "traffic/05.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/05.response.bin": "517ff59f47e0a3da374f2527a3c8d5ee61b4b9598fb9f0fbece6c46fd532328d",
+        "traffic/06.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/06.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/07.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/07.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/08.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/08.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/09.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/09.response.bin": "8ca1adb4db5db14c3d66d7e04f3ad4429676e584f3a6db8c4496e07454b5d2f4",
+        "traffic/10.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/10.response.bin": "517ff59f47e0a3da374f2527a3c8d5ee61b4b9598fb9f0fbece6c46fd532328d",
+        "traffic/11.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/11.response.bin": "8ca1adb4db5db14c3d66d7e04f3ad4429676e584f3a6db8c4496e07454b5d2f4",
+        "traffic/12.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/12.response.bin": "517ff59f47e0a3da374f2527a3c8d5ee61b4b9598fb9f0fbece6c46fd532328d",
+        "traffic/13.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/13.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+      }
+    },
+    {
+      "kind": "synthetic-derived",
+      "name": "empty",
+      "spec": {
+        "spindle": [],
+        "servo": []
+      },
+      "rows": 24,
+      "all_equal": true,
+      "loaded_modules": [
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+          "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+        },
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+          "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+        }
+      ],
+      "files": {
+        "server.json": "e987f0319397f96262f90fdac240399c5919603e88ef4e1b0357f1e8d26d4481",
+        "test.log": "5d285c3dce3ca4a2ace76386c3254626fd282a7577db0a01ca3488b4eb6bc65a",
+        "samples/modules-servo.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0-repeat.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/native-servo.json": "4e722b6935a43b47c89036fce350aa87c8df9de89eb992324819036810c40c11",
+        "samples/native-type0-repeat.json": "b2f587983f61f88ed640d6685ebe4cb8f584ba54caab0f979675d8b597ad5de2",
+        "samples/native-type0.json": "852714aa8b682633cfc35c5c691f5a917e0b30ad1af6638f202b482088ef2166",
+        "samples/production-comparison.json": "540831fd6a9ccd9491f8fa42db8973c79911161ab2051b1afd372de21fa382b0",
+        "traffic/00.request.bin": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff",
+        "traffic/00.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/01.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/01.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/02.request.bin": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+        "traffic/02.response.bin": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474",
+        "traffic/03.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/03.response.bin": "2326b8265da1418a5aa118f21e67a78e289630d7caa2b3e31e5a96320bb89100",
+        "traffic/04.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/04.response.bin": "2326b8265da1418a5aa118f21e67a78e289630d7caa2b3e31e5a96320bb89100",
+        "traffic/05.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/05.response.bin": "24608b6d64c4b112f3d70752b6a8dac417db6a70514e542a6628b470eff36a60",
+        "traffic/06.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/06.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/07.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/07.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/08.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/08.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+        "traffic/09.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/09.response.bin": "2326b8265da1418a5aa118f21e67a78e289630d7caa2b3e31e5a96320bb89100",
+        "traffic/10.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/10.response.bin": "24608b6d64c4b112f3d70752b6a8dac417db6a70514e542a6628b470eff36a60",
+        "traffic/11.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+        "traffic/11.response.bin": "2326b8265da1418a5aa118f21e67a78e289630d7caa2b3e31e5a96320bb89100",
+        "traffic/12.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+        "traffic/12.response.bin": "24608b6d64c4b112f3d70752b6a8dac417db6a70514e542a6628b470eff36a60",
+        "traffic/13.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/13.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+      }
+    },
+    {
+      "kind": "synthetic-derived",
+      "name": "legacy_direct",
+      "spec": {
+        "legacy": true,
+        "spindle": [
+          [
+            -125,
+            1
+          ],
+          [
+            875,
+            1
+          ]
+        ],
+        "servo": [
+          [
+            -270,
+            1
+          ],
+          [
+            560,
+            1
+          ],
+          [
+            -123,
+            2
+          ]
+        ]
+      },
+      "rows": 24,
+      "all_equal": true,
+      "loaded_modules": [
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+          "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+        },
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+          "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+        }
+      ],
+      "files": {
+        "server.json": "ea8ec222498a19773081b63397c832b78622ef698440f65d2ebe043c852cb10a",
+        "test.log": "5d285c3dce3ca4a2ace76386c3254626fd282a7577db0a01ca3488b4eb6bc65a",
+        "samples/modules-servo.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0-repeat.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/native-servo.json": "cbe2b6bc8ce0048270814e2046c4033699933eb27cbc043e615762965a21b4c0",
+        "samples/native-type0-repeat.json": "a2d6f5cba5a560c3ea95c4ce6961375f6e62d41b44c6a5008fe8c21a070ba5b9",
+        "samples/native-type0.json": "12969293681d81223429190c120bfc292f9f78866591b37985929c9e65f45920",
+        "samples/production-comparison.json": "24b52b2a2d34a4060ddb59ea9d20cd20cab3cc0565ab8a5d3ff8a431299ee1e7",
+        "traffic/00.request.bin": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff",
+        "traffic/00.response.bin": "e60cddffbc62964046acdb314d49f2a009dd38f47a5e23ccd342b974935d197e",
+        "traffic/01.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/01.response.bin": "e60cddffbc62964046acdb314d49f2a009dd38f47a5e23ccd342b974935d197e",
+        "traffic/02.request.bin": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+        "traffic/02.response.bin": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474",
+        "traffic/03.request.bin": "bd6cf840be1bf243ed6e8eef8f3dcce41464b99d2458e91a088d0b09c7097006",
+        "traffic/03.response.bin": "c94f6199b0ba76cf3d2874b21301f925405fa2ae9b63ce4fc4df3189c0af47a7",
+        "traffic/04.request.bin": "bd6cf840be1bf243ed6e8eef8f3dcce41464b99d2458e91a088d0b09c7097006",
+        "traffic/04.response.bin": "c94f6199b0ba76cf3d2874b21301f925405fa2ae9b63ce4fc4df3189c0af47a7",
+        "traffic/05.request.bin": "c7e5cd20d541fbe905e8d63b36ff480a4bb3cc53aa0c79d3f23c5fde74854fd2",
+        "traffic/05.response.bin": "eac7557deaaf6613dd667edf341f5bc0110b2507c688cbb1db352e188c6d36a4",
+        "traffic/06.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/06.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/07.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/07.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/08.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/08.response.bin": "e60cddffbc62964046acdb314d49f2a009dd38f47a5e23ccd342b974935d197e",
+        "traffic/09.request.bin": "bd6cf840be1bf243ed6e8eef8f3dcce41464b99d2458e91a088d0b09c7097006",
+        "traffic/09.response.bin": "c94f6199b0ba76cf3d2874b21301f925405fa2ae9b63ce4fc4df3189c0af47a7",
+        "traffic/10.request.bin": "c7e5cd20d541fbe905e8d63b36ff480a4bb3cc53aa0c79d3f23c5fde74854fd2",
+        "traffic/10.response.bin": "eac7557deaaf6613dd667edf341f5bc0110b2507c688cbb1db352e188c6d36a4",
+        "traffic/11.request.bin": "bd6cf840be1bf243ed6e8eef8f3dcce41464b99d2458e91a088d0b09c7097006",
+        "traffic/11.response.bin": "c94f6199b0ba76cf3d2874b21301f925405fa2ae9b63ce4fc4df3189c0af47a7",
+        "traffic/12.request.bin": "c7e5cd20d541fbe905e8d63b36ff480a4bb3cc53aa0c79d3f23c5fde74854fd2",
+        "traffic/12.response.bin": "eac7557deaaf6613dd667edf341f5bc0110b2507c688cbb1db352e188c6d36a4",
+        "traffic/13.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/13.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+      }
+    },
+    {
+      "kind": "synthetic-derived",
+      "name": "legacy_scaled",
+      "spec": {
+        "legacy": true,
+        "scaled": true,
+        "spindle": [
+          [
+            -270,
+            0
+          ],
+          [
+            30000,
+            0
+          ]
+        ],
+        "servo": [
+          [
+            -270,
+            1
+          ],
+          [
+            560,
+            1
+          ],
+          [
+            -123,
+            2
+          ]
+        ],
+        "std": [
+          100,
+          200
+        ],
+        "alt": [
+          200,
+          100
+        ]
+      },
+      "rows": 24,
+      "all_equal": true,
+      "loaded_modules": [
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+          "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+        },
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+          "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+        }
+      ],
+      "files": {
+        "server.json": "ba38ad13763740624358bf31c402004353ef4a4a816748e36bc88e42a1724ffc",
+        "test.log": "f0c64eda55fb83e5b956a58dbecde0ecd60baae8287cf5239399a7b3aeae623c",
+        "samples/modules-servo.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0-repeat.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/native-servo.json": "933b129a2cf623f41241dcf757454a78077d45c27667b0f000edaf38e8d2e213",
+        "samples/native-type0-repeat.json": "7aa6504d7b748faa161f4b38c06e581d617b97f6b49fb8061843b292c8ebd2c3",
+        "samples/native-type0.json": "02f5a7abfc1886d5a6e3ff2b2b628c7aa36390ea6e1c5ae67a56b874db093784",
+        "samples/production-comparison.json": "004d2d83aa2cbf9e6283463e8b301a12c31a1a94700f39373795a435591a2b66",
+        "traffic/00.request.bin": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff",
+        "traffic/00.response.bin": "e60cddffbc62964046acdb314d49f2a009dd38f47a5e23ccd342b974935d197e",
+        "traffic/01.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/01.response.bin": "e60cddffbc62964046acdb314d49f2a009dd38f47a5e23ccd342b974935d197e",
+        "traffic/02.request.bin": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+        "traffic/02.response.bin": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474",
+        "traffic/03.request.bin": "bd6cf840be1bf243ed6e8eef8f3dcce41464b99d2458e91a088d0b09c7097006",
+        "traffic/03.response.bin": "081f38a95d88f76cac3df61e15657235d67f7f5e3fa0d5b1cf09b27b1820e8ab",
+        "traffic/04.request.bin": "d17c173569be40700c3294f26a661266dda1857a4adffd9c019532e46b52f4d5",
+        "traffic/04.response.bin": "d9d07cda95454ecd56fd0c755bab12c67863d929002a4296b66fd350a71b7d54",
+        "traffic/05.request.bin": "d17c173569be40700c3294f26a661266dda1857a4adffd9c019532e46b52f4d5",
+        "traffic/05.response.bin": "d9d07cda95454ecd56fd0c755bab12c67863d929002a4296b66fd350a71b7d54",
+        "traffic/06.request.bin": "c7e5cd20d541fbe905e8d63b36ff480a4bb3cc53aa0c79d3f23c5fde74854fd2",
+        "traffic/06.response.bin": "eac7557deaaf6613dd667edf341f5bc0110b2507c688cbb1db352e188c6d36a4",
+        "traffic/07.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/07.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/08.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/08.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/09.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/09.response.bin": "e60cddffbc62964046acdb314d49f2a009dd38f47a5e23ccd342b974935d197e",
+        "traffic/10.request.bin": "bd6cf840be1bf243ed6e8eef8f3dcce41464b99d2458e91a088d0b09c7097006",
+        "traffic/10.response.bin": "081f38a95d88f76cac3df61e15657235d67f7f5e3fa0d5b1cf09b27b1820e8ab",
+        "traffic/11.request.bin": "d17c173569be40700c3294f26a661266dda1857a4adffd9c019532e46b52f4d5",
+        "traffic/11.response.bin": "d9d07cda95454ecd56fd0c755bab12c67863d929002a4296b66fd350a71b7d54",
+        "traffic/12.request.bin": "c7e5cd20d541fbe905e8d63b36ff480a4bb3cc53aa0c79d3f23c5fde74854fd2",
+        "traffic/12.response.bin": "eac7557deaaf6613dd667edf341f5bc0110b2507c688cbb1db352e188c6d36a4",
+        "traffic/13.request.bin": "d17c173569be40700c3294f26a661266dda1857a4adffd9c019532e46b52f4d5",
+        "traffic/13.response.bin": "d9d07cda95454ecd56fd0c755bab12c67863d929002a4296b66fd350a71b7d54",
+        "traffic/14.request.bin": "c7e5cd20d541fbe905e8d63b36ff480a4bb3cc53aa0c79d3f23c5fde74854fd2",
+        "traffic/14.response.bin": "eac7557deaaf6613dd667edf341f5bc0110b2507c688cbb1db352e188c6d36a4",
+        "traffic/15.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/15.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+      }
+    },
+    {
+      "kind": "synthetic-derived",
+      "name": "legacy_global_axes",
+      "spec": {
+        "legacy": true,
+        "family": 2,
+        "global_axes": 3,
+        "path_axes": 2,
+        "spindle": [
+          [
+            270,
+            1
+          ],
+          [
+            30000,
+            0
+          ]
+        ],
+        "servo": [
+          [
+            -270,
+            1
+          ],
+          [
+            560,
+            1
+          ],
+          [
+            -123,
+            2
+          ],
+          [
+            99,
+            0
+          ]
+        ]
+      },
+      "rows": 24,
+      "all_equal": true,
+      "loaded_modules": [
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+          "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+        },
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+          "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+        }
+      ],
+      "files": {
+        "server.json": "bcb729c68643555dd5fbbfaa42e11262bacc9939e642ab63b13c9f0e05647b81",
+        "test.log": "947116e09b2392f0fbd1271d53909abcef0f6f38963f6496c4cc36a2747e5ac3",
+        "samples/modules-servo.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0-repeat.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/native-servo.json": "fa40afd998e848921c66dca22cf10a8137166cf190c2df9c79fd931b6c9b96a4",
+        "samples/native-type0-repeat.json": "156b5c2797ec14a74124e749615f0843cbaf7030828893041465fc3d287f5d78",
+        "samples/native-type0.json": "39cbf59987de38085cc5e570b718f42b78684821e788698e8f3a91d089adb0e3",
+        "samples/production-comparison.json": "f937f4cd6ad0b2d8a22064b1983d3229e7359398f572f8fa0a669e23db2dbc54",
+        "traffic/00.request.bin": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff",
+        "traffic/00.response.bin": "17f3ab34f8f5f0837c1b0f70e5c6e8ba849da6d2a952c7cc1bb30e562af20992",
+        "traffic/01.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/01.response.bin": "17f3ab34f8f5f0837c1b0f70e5c6e8ba849da6d2a952c7cc1bb30e562af20992",
+        "traffic/02.request.bin": "f2fdf49ad62d6f1c9149a3c785303f6ac46de9982b9c908cca0fd7cdd9ea642f",
+        "traffic/02.response.bin": "e8457364292b857d4fe66c677132db487f6e69b93ccde1edc5d73f4cbed62376",
+        "traffic/03.request.bin": "892db66415936ee04ce41226ace5b4b7d2453cfb5d3374bb9e914d3d72bb2dc9",
+        "traffic/03.response.bin": "566c16a2b1145bdc2af6087bc16caad155ee3f9bb4233acc6f0f43da0927429e",
+        "traffic/04.request.bin": "bd6cf840be1bf243ed6e8eef8f3dcce41464b99d2458e91a088d0b09c7097006",
+        "traffic/04.response.bin": "5f513081c515b3b256bf32350b103298703a2c45628d6579b23820d869112f96",
+        "traffic/05.request.bin": "bd6cf840be1bf243ed6e8eef8f3dcce41464b99d2458e91a088d0b09c7097006",
+        "traffic/05.response.bin": "5f513081c515b3b256bf32350b103298703a2c45628d6579b23820d869112f96",
+        "traffic/06.request.bin": "c7e5cd20d541fbe905e8d63b36ff480a4bb3cc53aa0c79d3f23c5fde74854fd2",
+        "traffic/06.response.bin": "ee8795b0138ba204a1c8c1b6c3c45db33f9008712ad8a4349e3132d12a0bd196",
+        "traffic/07.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/07.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/08.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/08.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/09.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/09.response.bin": "17f3ab34f8f5f0837c1b0f70e5c6e8ba849da6d2a952c7cc1bb30e562af20992",
+        "traffic/10.request.bin": "bd6cf840be1bf243ed6e8eef8f3dcce41464b99d2458e91a088d0b09c7097006",
+        "traffic/10.response.bin": "5f513081c515b3b256bf32350b103298703a2c45628d6579b23820d869112f96",
+        "traffic/11.request.bin": "808987962f531909e76c2aa992b4cea930a7ad661692f0f02b7318c8fda5b041",
+        "traffic/11.response.bin": "64e9383d1250d3c14923f4f3481677b5b6b8c5abbb75547a6e76714db1b63137",
+        "traffic/12.request.bin": "c7e5cd20d541fbe905e8d63b36ff480a4bb3cc53aa0c79d3f23c5fde74854fd2",
+        "traffic/12.response.bin": "ee8795b0138ba204a1c8c1b6c3c45db33f9008712ad8a4349e3132d12a0bd196",
+        "traffic/13.request.bin": "bd6cf840be1bf243ed6e8eef8f3dcce41464b99d2458e91a088d0b09c7097006",
+        "traffic/13.response.bin": "5f513081c515b3b256bf32350b103298703a2c45628d6579b23820d869112f96",
+        "traffic/14.request.bin": "c7e5cd20d541fbe905e8d63b36ff480a4bb3cc53aa0c79d3f23c5fde74854fd2",
+        "traffic/14.response.bin": "ee8795b0138ba204a1c8c1b6c3c45db33f9008712ad8a4349e3132d12a0bd196",
+        "traffic/15.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/15.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+      }
+    },
+    {
+      "kind": "synthetic-derived",
+      "name": "legacy_wrapping",
+      "spec": {
+        "legacy": true,
+        "scaled": true,
+        "spindle": [
+          [
+            -2147483648,
+            0
+          ],
+          [
+            2147483647,
+            0
+          ]
+        ],
+        "servo": [
+          [
+            -2147483648,
+            0
+          ],
+          [
+            2147483647,
+            0
+          ]
+        ],
+        "std": [
+          3,
+          3
+        ],
+        "alt": [
+          2,
+          2
+        ]
+      },
+      "rows": 24,
+      "all_equal": true,
+      "loaded_modules": [
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+          "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+        },
+        {
+          "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+          "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+        }
+      ],
+      "files": {
+        "server.json": "ef7a30a511d7ceb163b36d7f1b4c506f26917e401ba23e4fe404dd8fbd8b7028",
+        "test.log": "5d285c3dce3ca4a2ace76386c3254626fd282a7577db0a01ca3488b4eb6bc65a",
+        "samples/modules-servo.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0-repeat.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/modules-type0.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+        "samples/native-servo.json": "e3c657454c17e9bf57ca92e13eeb656f958330004c9918147ed9cf9dba3ea714",
+        "samples/native-type0-repeat.json": "e960cf65901dd28404a406fc9190852e5b9d338e437d4f149792329a440a9d58",
+        "samples/native-type0.json": "28f72681dccf87c1f41f5e57c4acc08674ae36c4409d89447d7a5175b5dd732b",
+        "samples/production-comparison.json": "db97851b5f7c7858d208d309f05f47f3c5424e3e52968fdae2d6941776c1f8f2",
+        "traffic/00.request.bin": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff",
+        "traffic/00.response.bin": "c2ef91fcf824711021df1280e1f6c188dbd26d0218497308afc8ae573e4d226d",
+        "traffic/01.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/01.response.bin": "c2ef91fcf824711021df1280e1f6c188dbd26d0218497308afc8ae573e4d226d",
+        "traffic/02.request.bin": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+        "traffic/02.response.bin": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474",
+        "traffic/03.request.bin": "bd6cf840be1bf243ed6e8eef8f3dcce41464b99d2458e91a088d0b09c7097006",
+        "traffic/03.response.bin": "0ba61e5ed9db35afcfcd0a498a0880e5a585d8643400680a8150126aca737f76",
+        "traffic/04.request.bin": "d17c173569be40700c3294f26a661266dda1857a4adffd9c019532e46b52f4d5",
+        "traffic/04.response.bin": "59f68d2c5a87f9a0110343659df48c27506ff4f2337fb40809f7841727f4c090",
+        "traffic/05.request.bin": "d17c173569be40700c3294f26a661266dda1857a4adffd9c019532e46b52f4d5",
+        "traffic/05.response.bin": "59f68d2c5a87f9a0110343659df48c27506ff4f2337fb40809f7841727f4c090",
+        "traffic/06.request.bin": "c7e5cd20d541fbe905e8d63b36ff480a4bb3cc53aa0c79d3f23c5fde74854fd2",
+        "traffic/06.response.bin": "e0e9633f7bd6d4ffd4cfc807a42cbde436a13a97e4038c450377da79bace1fb0",
+        "traffic/07.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/07.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/08.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/08.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+        "traffic/09.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+        "traffic/09.response.bin": "c2ef91fcf824711021df1280e1f6c188dbd26d0218497308afc8ae573e4d226d",
+        "traffic/10.request.bin": "bd6cf840be1bf243ed6e8eef8f3dcce41464b99d2458e91a088d0b09c7097006",
+        "traffic/10.response.bin": "0ba61e5ed9db35afcfcd0a498a0880e5a585d8643400680a8150126aca737f76",
+        "traffic/11.request.bin": "d17c173569be40700c3294f26a661266dda1857a4adffd9c019532e46b52f4d5",
+        "traffic/11.response.bin": "59f68d2c5a87f9a0110343659df48c27506ff4f2337fb40809f7841727f4c090",
+        "traffic/12.request.bin": "c7e5cd20d541fbe905e8d63b36ff480a4bb3cc53aa0c79d3f23c5fde74854fd2",
+        "traffic/12.response.bin": "e0e9633f7bd6d4ffd4cfc807a42cbde436a13a97e4038c450377da79bace1fb0",
+        "traffic/13.request.bin": "d17c173569be40700c3294f26a661266dda1857a4adffd9c019532e46b52f4d5",
+        "traffic/13.response.bin": "59f68d2c5a87f9a0110343659df48c27506ff4f2337fb40809f7841727f4c090",
+        "traffic/14.request.bin": "c7e5cd20d541fbe905e8d63b36ff480a4bb3cc53aa0c79d3f23c5fde74854fd2",
+        "traffic/14.response.bin": "e0e9633f7bd6d4ffd4cfc807a42cbde436a13a97e4038c450377da79bace1fb0",
+        "traffic/15.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+        "traffic/15.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+      }
+    }
+  ],
+  "limits": [
+    "不证明真实设备生成非零负载"
+  ]
+}

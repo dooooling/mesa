@@ -1,0 +1,33 @@
+{
+  "tag": "type_all",
+  "kind": "synthetic-derived",
+  "candidates": [
+    {
+      "slot": 0,
+      "data": 270,
+      "decimal": 1,
+      "unit": 0,
+      "name": [
+        83,
+        49,
+        0
+      ]
+    },
+    {
+      "slot": 1,
+      "data": 1500,
+      "decimal": 0,
+      "unit": 1,
+      "name": [
+        83,
+        49,
+        0
+      ]
+    }
+  ],
+  "native_wire_expected_equal": true,
+  "num_out": 1,
+  "original_response_sha256": "53419581b0e8bff21b208616ece0e8f1163cf9e4144a1bf3fa85b151f79e6505",
+  "request_sha256": "f0b0337d8ebafc1b88ea263941d1a84601defc39d2e266b53d813d6cf3b58995",
+  "response_sha256": "c92e801fce008d30562bd4b28449f74110363ee0a6a396ed029bd8916b5d73cb"
+}

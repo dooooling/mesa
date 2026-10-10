@@ -1,0 +1,52 @@
+{
+  "tag": "type1",
+  "num_in": 2,
+  "before": 1,
+  "after": 1,
+  "num_out": 1,
+  "native_connection": [
+    "192.168.15.82",
+    55595,
+    "192.168.15.165",
+    8193
+  ],
+  "wire_connection": [
+    "192.168.15.82",
+    55596,
+    "192.168.15.165",
+    8193
+  ],
+  "request_bytes_equal": true,
+  "native_candidates": [
+    {
+      "data": 0,
+      "decimal": 0,
+      "name": [
+        83,
+        49,
+        0
+      ],
+      "slot": 1,
+      "unit": 1
+    }
+  ],
+  "wire_candidates": [
+    {
+      "data": 0,
+      "decimal": 0,
+      "name": [
+        83,
+        49,
+        0
+      ],
+      "slot": 1,
+      "unit": 1
+    }
+  ],
+  "sha256": {
+    "native_request.bin": "507dfc200baad3b660af16c5ec14da7cd3310410a3cb35815a383285b3d3cf81",
+    "native_response.bin": "1e101043e1618414d5a62376f7aac61629f2546e5bc0ae3833f25a0091a388ef",
+    "wire_request.bin": "507dfc200baad3b660af16c5ec14da7cd3310410a3cb35815a383285b3d3cf81",
+    "wire_response.bin": "1e101043e1618414d5a62376f7aac61629f2546e5bc0ae3833f25a0091a388ef"
+  }
+}

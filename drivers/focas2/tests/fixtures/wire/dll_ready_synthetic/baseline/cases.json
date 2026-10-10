@@ -1,0 +1,148 @@
+[
+  {
+    "name": "status",
+    "address": "status",
+    "expected": {
+      "U32": 1
+    },
+    "guarded": null
+  },
+  {
+    "name": "feed",
+    "address": "feed",
+    "expected": {
+      "U32": 100
+    },
+    "guarded": null
+  },
+  {
+    "name": "speed",
+    "address": "active_spindle",
+    "expected": {
+      "I32": 1002
+    },
+    "guarded": null
+  },
+  {
+    "name": "absolute",
+    "address": "axis.abs.1",
+    "expected": {
+      "I32": -2880
+    },
+    "guarded": null
+  },
+  {
+    "name": "gear",
+    "address": "spindle.gear.1",
+    "expected": {
+      "I32": 672
+    },
+    "guarded": "gear"
+  },
+  {
+    "name": "maxrpm",
+    "address": "spindle.maxrpm.1",
+    "expected": {
+      "I32": 874
+    },
+    "guarded": "maxrpm"
+  },
+  {
+    "name": "macro",
+    "address": "macro.501",
+    "expected": {
+      "F64": 25.0
+    },
+    "guarded": null
+  },
+  {
+    "name": "pmc-byte",
+    "address": "pmc.Y0",
+    "expected": {
+      "I32": 4
+    },
+    "guarded": null
+  },
+  {
+    "name": "pmc-word",
+    "address": "pmc.R100",
+    "expected": {
+      "I32": 0
+    },
+    "guarded": null
+  },
+  {
+    "name": "pmc-dword",
+    "address": "pmc.D0",
+    "expected": {
+      "I32": 4
+    },
+    "guarded": null
+  },
+  {
+    "name": "pmc-bit",
+    "address": "pmc.X0.3",
+    "expected": {
+      "Bool": false
+    },
+    "guarded": null
+  },
+  {
+    "name": "param",
+    "address": "param.6711",
+    "expected": {
+      "I32": 456
+    },
+    "guarded": null
+  },
+  {
+    "name": "diagnosis",
+    "address": "diagnosis301axis3",
+    "expected": {
+      "F64": -0.01
+    },
+    "guarded": "diagnosis"
+  },
+  {
+    "name": "opmsg",
+    "address": "opmsg",
+    "expected": {
+      "String": "OPMSG TEST 123"
+    },
+    "guarded": null
+  },
+  {
+    "name": "alarm",
+    "address": "alarm",
+    "expected": {
+      "StringArray": [
+        "IMPROPER G-CODE"
+      ]
+    },
+    "guarded": "alarm"
+  },
+  {
+    "name": "offset",
+    "address": "tool.offset.16",
+    "expected": {
+      "F64": 5.0
+    },
+    "guarded": null
+  },
+  {
+    "name": "length",
+    "address": "tool.length.16",
+    "expected": {
+      "F64": 10.0
+    },
+    "guarded": null
+  },
+  {
+    "name": "zofs",
+    "address": "tool.zofs.1",
+    "expected": {
+      "F64": 12.345
+    },
+    "guarded": null
+  }
+]

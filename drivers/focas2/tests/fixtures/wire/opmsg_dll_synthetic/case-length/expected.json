@@ -1,0 +1,12 @@
+{
+  "kind": "synthetic-derived",
+  "rc": 2,
+  "text": null,
+  "native": {
+    "guards_ok": true,
+    "rc": 2,
+    "tail_clean": true
+  },
+  "request_sha256": "79c866d67c8954b2a34e7c2d356f2b309c40de82828906cf68fa181ffef660f2",
+  "response_sha256": "5eaae704443b8ab216a6bb6424a0254754c7596b2fef62744e8bbcb3491fd134"
+}

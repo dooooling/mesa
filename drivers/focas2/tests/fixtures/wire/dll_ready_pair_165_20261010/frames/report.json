@@ -1,0 +1,496 @@
+{
+  "source": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\capture.pcapng",
+  "sha256": "64481b6679445c93b1072072977f50703337095dbc88a642b3e707306a0c1826",
+  "link_layers": {
+    "Ether": 54
+  },
+  "flows": [
+    {
+      "connection": [
+        "192.168.15.82",
+        50833,
+        "192.168.15.165",
+        8193
+      ],
+      "epoch": 0,
+      "directions": {
+        "c2s": {
+          "segments": 2,
+          "reassembly_errors": [],
+          "bytes": 22,
+          "frames": [
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-000\\c2s-000.bin",
+              "type": "0101",
+              "bytes": 12,
+              "sha256": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-000\\c2s-001.bin",
+              "type": "0201",
+              "bytes": 10,
+              "sha256": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8"
+            }
+          ]
+        },
+        "s2c": {
+          "segments": 2,
+          "reassembly_errors": [],
+          "bytes": 380,
+          "frames": [
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-000\\s2c-000.bin",
+              "type": "0102",
+              "bytes": 370,
+              "sha256": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-000\\s2c-001.bin",
+              "type": "0202",
+              "bytes": 10,
+              "sha256": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "connection": [
+        "192.168.15.82",
+        50834,
+        "192.168.15.165",
+        8193
+      ],
+      "epoch": 0,
+      "directions": {
+        "c2s": {
+          "segments": 7,
+          "reassembly_errors": [],
+          "bytes": 334,
+          "frames": [
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-001\\c2s-000.bin",
+              "type": "0101",
+              "bytes": 12,
+              "sha256": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-001\\c2s-001.bin",
+              "type": "2101",
+              "bytes": 40,
+              "sha256": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+              "request": {
+                "count": 1,
+                "subs": [
+                  {
+                    "dev": 1,
+                    "func": "0x00010018",
+                    "args": [
+                      0,
+                      0,
+                      0,
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-001\\c2s-002.bin",
+              "type": "2101",
+              "bytes": 96,
+              "sha256": "e21577909319a9587aabbb30cabeb18f03c44efcecdf9024b38f23bf55159523",
+              "request": {
+                "count": 3,
+                "subs": [
+                  {
+                    "dev": 1,
+                    "func": "0x000100a4",
+                    "args": [
+                      1,
+                      0,
+                      0,
+                      0,
+                      0
+                    ]
+                  },
+                  {
+                    "dev": 1,
+                    "func": "0x00010040",
+                    "args": [
+                      2,
+                      1,
+                      0,
+                      0,
+                      0
+                    ]
+                  },
+                  {
+                    "dev": 1,
+                    "func": "0x000100a4",
+                    "args": [
+                      1,
+                      0,
+                      0,
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-001\\c2s-003.bin",
+              "type": "2101",
+              "bytes": 96,
+              "sha256": "aee143e6ece933efa6b1fa69c4c2e03891cab641aeec07ee90148a2069973f76",
+              "request": {
+                "count": 3,
+                "subs": [
+                  {
+                    "dev": 1,
+                    "func": "0x000100a4",
+                    "args": [
+                      1,
+                      0,
+                      0,
+                      0,
+                      0
+                    ]
+                  },
+                  {
+                    "dev": 1,
+                    "func": "0x00010040",
+                    "args": [
+                      1,
+                      1,
+                      0,
+                      0,
+                      0
+                    ]
+                  },
+                  {
+                    "dev": 1,
+                    "func": "0x000100a4",
+                    "args": [
+                      1,
+                      0,
+                      0,
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-001\\c2s-004.bin",
+              "type": "2101",
+              "bytes": 40,
+              "sha256": "3deee60c7ea90d2979f6f7d2447656f4961e36da297a5867517dcb1aee93d8d6",
+              "request": {
+                "count": 1,
+                "subs": [
+                  {
+                    "dev": 1,
+                    "func": "0x00010093",
+                    "args": [
+                      301,
+                      301,
+                      3,
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-001\\c2s-005.bin",
+              "type": "2101",
+              "bytes": 40,
+              "sha256": "8b29685956e63a896b846bc3e4af6c3d7381f89c458fd8b04be2c5309f454fa8",
+              "request": {
+                "count": 1,
+                "subs": [
+                  {
+                    "dev": 1,
+                    "func": "0x00010023",
+                    "args": [
+                      -1,
+                      1,
+                      2,
+                      32,
+                      0
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-001\\c2s-006.bin",
+              "type": "0201",
+              "bytes": 10,
+              "sha256": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8"
+            }
+          ]
+        },
+        "s2c": {
+          "segments": 7,
+          "reassembly_errors": [],
+          "bytes": 890,
+          "frames": [
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-001\\s2c-000.bin",
+              "type": "0102",
+              "bytes": 370,
+              "sha256": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-001\\s2c-001.bin",
+              "type": "2102",
+              "bytes": 46,
+              "sha256": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-001\\s2c-002.bin",
+              "type": "2102",
+              "bytes": 72,
+              "sha256": "336b82ea3445ef70c879116be26c6d889b9e938ef391b4f4bfd403f9596d8b06"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-001\\s2c-003.bin",
+              "type": "2102",
+              "bytes": 72,
+              "sha256": "c463c60c342bf127e9a58134993b5fdd303fb3691385ac1fb64032f63412bc81"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-001\\s2c-004.bin",
+              "type": "2102",
+              "bytes": 292,
+              "sha256": "ee768ff8b1b2b6d5cc055f09caa468544dfb6032809a3153805e870e54352850"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-001\\s2c-005.bin",
+              "type": "2102",
+              "bytes": 28,
+              "sha256": "b875161f1323d26c7d48788ec439d29bbcb76975fc3d2a7e59fa8d1984a484b1"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-001\\s2c-006.bin",
+              "type": "0202",
+              "bytes": 10,
+              "sha256": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "connection": [
+        "192.168.15.82",
+        50835,
+        "192.168.15.165",
+        8193
+      ],
+      "epoch": 0,
+      "directions": {
+        "c2s": {
+          "segments": 6,
+          "reassembly_errors": [],
+          "bytes": 294,
+          "frames": [
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-002\\c2s-000.bin",
+              "type": "0101",
+              "bytes": 12,
+              "sha256": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-002\\c2s-001.bin",
+              "type": "2101",
+              "bytes": 96,
+              "sha256": "e21577909319a9587aabbb30cabeb18f03c44efcecdf9024b38f23bf55159523",
+              "request": {
+                "count": 3,
+                "subs": [
+                  {
+                    "dev": 1,
+                    "func": "0x000100a4",
+                    "args": [
+                      1,
+                      0,
+                      0,
+                      0,
+                      0
+                    ]
+                  },
+                  {
+                    "dev": 1,
+                    "func": "0x00010040",
+                    "args": [
+                      2,
+                      1,
+                      0,
+                      0,
+                      0
+                    ]
+                  },
+                  {
+                    "dev": 1,
+                    "func": "0x000100a4",
+                    "args": [
+                      1,
+                      0,
+                      0,
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-002\\c2s-002.bin",
+              "type": "2101",
+              "bytes": 96,
+              "sha256": "aee143e6ece933efa6b1fa69c4c2e03891cab641aeec07ee90148a2069973f76",
+              "request": {
+                "count": 3,
+                "subs": [
+                  {
+                    "dev": 1,
+                    "func": "0x000100a4",
+                    "args": [
+                      1,
+                      0,
+                      0,
+                      0,
+                      0
+                    ]
+                  },
+                  {
+                    "dev": 1,
+                    "func": "0x00010040",
+                    "args": [
+                      1,
+                      1,
+                      0,
+                      0,
+                      0
+                    ]
+                  },
+                  {
+                    "dev": 1,
+                    "func": "0x000100a4",
+                    "args": [
+                      1,
+                      0,
+                      0,
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-002\\c2s-003.bin",
+              "type": "2101",
+              "bytes": 40,
+              "sha256": "3deee60c7ea90d2979f6f7d2447656f4961e36da297a5867517dcb1aee93d8d6",
+              "request": {
+                "count": 1,
+                "subs": [
+                  {
+                    "dev": 1,
+                    "func": "0x00010093",
+                    "args": [
+                      301,
+                      301,
+                      3,
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-002\\c2s-004.bin",
+              "type": "2101",
+              "bytes": 40,
+              "sha256": "18dabb7aa9f9437ab76c9042585bcc7b8a0a729286c5a97bfad1197116b3d8ee",
+              "request": {
+                "count": 1,
+                "subs": [
+                  {
+                    "dev": 1,
+                    "func": "0x00010023",
+                    "args": [
+                      -1,
+                      29,
+                      2,
+                      32,
+                      0
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-002\\c2s-005.bin",
+              "type": "0201",
+              "bytes": 10,
+              "sha256": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8"
+            }
+          ]
+        },
+        "s2c": {
+          "segments": 6,
+          "reassembly_errors": [],
+          "bytes": 844,
+          "frames": [
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-002\\s2c-000.bin",
+              "type": "0102",
+              "bytes": 370,
+              "sha256": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-002\\s2c-001.bin",
+              "type": "2102",
+              "bytes": 72,
+              "sha256": "336b82ea3445ef70c879116be26c6d889b9e938ef391b4f4bfd403f9596d8b06"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-002\\s2c-002.bin",
+              "type": "2102",
+              "bytes": 72,
+              "sha256": "c463c60c342bf127e9a58134993b5fdd303fb3691385ac1fb64032f63412bc81"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-002\\s2c-003.bin",
+              "type": "2102",
+              "bytes": 292,
+              "sha256": "ee768ff8b1b2b6d5cc055f09caa468544dfb6032809a3153805e870e54352850"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-002\\s2c-004.bin",
+              "type": "2102",
+              "bytes": 28,
+              "sha256": "b875161f1323d26c7d48788ec439d29bbcb76975fc3d2a7e59fa8d1984a484b1"
+            },
+            {
+              "file": "D:\\Mine\\Project\\mesa\\target\\focas-load-research\\ready-guarded-20261010-001\\frames\\flow-002\\s2c-005.bin",
+              "type": "0202",
+              "bytes": 10,
+              "sha256": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
