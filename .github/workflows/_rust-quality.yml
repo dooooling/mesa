@@ -1,4 +1,4 @@
-# Rust Quality（Linux x64，唯一）：fmt / clippy / planner 自测。
+# Rust Quality（Linux x64，唯一）：fmt / clippy / planner 自测 / offline 工具自测。
 # 与 canonical 并行启动，不堵测试。
 # protoc：全部走 protoc-bin-vendored（Cargo.lock 锁定），不 apt install，
 # 不设 PROTOC（build.rs 无 PROTOC 时自动用 vendored，更确定性）。
@@ -36,6 +36,9 @@ jobs:
 
       - name: CI planner self-test
         run: python3 tools/ci/test_plan.py
+
+      - name: FOCAS offline diff self-test
+        run: python3 tools/ci/test_focas_diff.py
 
       - name: sccache stats
         if: always()
