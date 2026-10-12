@@ -186,6 +186,62 @@ fn quality_oracle(
     Some(false)
 }
 
+/// Acceptance inputs parser shared by live gate and unit tests.
+pub(super) type AcceptanceInputs = (bool, Option<[i32; 5]>, (Vec<(i32, i32)>, Vec<(i32, i32)>));
+pub(super) fn parse_acceptance_inputs(
+    mode: Option<&str>,
+    scaled_raw: Option<&str>,
+    spec_raw: Option<&str>,
+) -> Result<AcceptanceInputs, String> {
+    let scaled_mode = match mode {
+        Some("scaled") => true,
+        Some("unscaled") => false,
+        other => return Err(format!("MESA_FOCAS_LOAD_MODE illegal: {other:?}")),
+    };
+    let scaled_ctx = match (scaled_mode, scaled_raw) {
+        (false, None) | (false, Some("")) => None,
+        (false, Some(s)) => {
+            return Err(format!("unscaled must not carry SCALED: {s:?}"));
+        }
+        (true, None) | (true, Some("")) => {
+            return Err("scaled missing MESA_FOCAS_LOAD_SCALED".to_string());
+        }
+        (true, Some(s)) => {
+            let v: Vec<i32> = s
+                .split(',')
+                .map(|x| {
+                    x.trim()
+                        .parse()
+                        .map_err(|_| format!("MESA_FOCAS_LOAD_SCALED bad format: {s:?}"))
+                })
+                .collect::<Result<_, _>>()?;
+            if v.len() != 5 {
+                return Err(format!("MESA_FOCAS_LOAD_SCALED must be 5 ints: {s:?}"));
+            }
+            Some([v[0], v[1], v[2], v[3], v[4]])
+        }
+    };
+    fn parse_side(side: &str) -> Option<Vec<(i32, i32)>> {
+        if side.is_empty() {
+            return Some(Vec::new());
+        }
+        side.split(';')
+            .map(|part| {
+                let (a, b) = part.split_once(',')?;
+                Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+            })
+            .collect()
+    }
+    type RawPair = Vec<(i32, i32)>;
+    let spec_ctx: Option<(RawPair, RawPair)> = spec_raw.and_then(|s| {
+        let (sp, sv) = s.split_once('|')?;
+        let (sp_side, sv_side) = (sp.strip_prefix("spindle=")?, sv.strip_prefix("servo=")?);
+        Some((parse_side(sp_side)?, parse_side(sv_side)?))
+    });
+    let spec_ctx = spec_ctx.ok_or_else(|| "missing legal MESA_FOCAS_LOAD_SPEC".to_string())?;
+    Ok((scaled_mode, scaled_ctx, spec_ctx))
+}
+
 #[cfg(windows)]
 pub(crate) mod live {
     use super::*;
@@ -494,69 +550,13 @@ pub(crate) mod live {
             },
         ]);
         expected.extend([expected[0], expected[4], None, None]);
-        // scaled 上下文独立输入（P1-2 v3 + C 门 P1 显式模式）：
-        // `MESA_FOCAS_LOAD_MODE` 必填（`scaled`/`unscaled`），杜绝空串推断。
-        // scaled 模式必须同时带合法 SCALED + SPEC，缺一即整批 panic；
-        // unscaled 模式不得带 SCALED（带即 panic，防系数意外丢失的误判）。
-        let mode = std::env::var("MESA_FOCAS_LOAD_MODE")
-            .unwrap_or_else(|_| panic!("缺 MESA_FOCAS_LOAD_MODE（scaled/unscaled 必填）"));
-        let scaled_mode = match mode.as_str() {
-            "scaled" => true,
-            "unscaled" => false,
-            _ => panic!("MESA_FOCAS_LOAD_MODE 非法：{mode:?}"),
-        };
-        // `MESA_FOCAS_LOAD_SCALED` `std0,std1,alt0,alt1,div`。由场景生成器写入。
-        let scaled_raw = std::env::var("MESA_FOCAS_LOAD_SCALED").ok();
-        let scaled_ctx: Option<[i32; 5]> = match (scaled_mode, scaled_raw.as_deref()) {
-            (false, None) | (false, Some("")) => None,
-            (false, Some(s)) => {
-                panic!("unscaled 场景不得带 SCALED 系数：{s:?}（防误判）")
-            }
-            (true, None) | (true, Some("")) => {
-                panic!("scaled 场景缺 MESA_FOCAS_LOAD_SCALED（系数丢失，拒绝验收）")
-            }
-            (true, Some(s)) => {
-                let v: Vec<i32> = s
-                    .split(',')
-                    .map(|x| {
-                        x.trim()
-                            .parse()
-                            .unwrap_or_else(|_| panic!("MESA_FOCAS_LOAD_SCALED 格式错误：{s:?}"))
-                    })
-                    .collect();
-                assert!(v.len() == 5, "MESA_FOCAS_LOAD_SCALED 必须 5 个整数：{s:?}");
-                Some([v[0], v[1], v[2], v[3], v[4]])
-            }
-        };
-        // spec 原始输入（P1-2 v4）：类型别名降复杂度。
-        type RawPair = Vec<(i32, i32)>;
-        // `MESA_FOCAS_LOAD_SPEC`
-        // `spindle=raw,dec;...|servo=raw,dec;...`（缩放前原始值；scaled 场景必填，
-        // 缺失即整批失败——不从已回绕 ABI 反推）。
-        // 格式错误 → None → comparisons 直接失败（fail-closed）。
-        // SPEC 严格解析（C 门 P1）：格式错误即 None（fail-closed）。
-        let spec_ctx: Option<(RawPair, RawPair)> =
-            std::env::var("MESA_FOCAS_LOAD_SPEC").ok().and_then(|s| {
-                fn parse(side: &str) -> Option<Vec<(i32, i32)>> {
-                    if side.is_empty() {
-                        return Some(Vec::new());
-                    }
-                    side.split(';')
-                        .map(|p| {
-                            let (a, b) = p.split_once(',')?;
-                            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-                        })
-                        .collect()
-                }
-                let (sp, sv) = s.split_once('|')?;
-                let (sp_side, sv_side) = (sp.strip_prefix("spindle=")?, sv.strip_prefix("servo=")?);
-                Some((parse(sp_side)?, parse(sv_side)?))
-            });
-        // scaled 场景缺 SPEC 即整批失败；unscaled 场景 SPEC 缺失亦失败
-        //（SPEC 为 oracle 必填输入，不分模式）。
-        if spec_ctx.is_none() {
-            panic!("缺合法 MESA_FOCAS_LOAD_SPEC（oracle 无源值，拒绝验收）");
-        }
+        let (scaled_mode, scaled_ctx, spec_ctx) = parse_acceptance_inputs(
+            std::env::var("MESA_FOCAS_LOAD_MODE").ok().as_deref(),
+            std::env::var("MESA_FOCAS_LOAD_SCALED").ok().as_deref(),
+            std::env::var("MESA_FOCAS_LOAD_SPEC").ok().as_deref(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let _ = scaled_mode;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -598,10 +598,7 @@ pub(crate) mod live {
                                 // spec 原始值（P1-2 v4）：缩放前输入，不读已回绕 ABI。
                                 // 缺 SPEC 即 None（fail-closed）；scaled 场景缺 SPEC
                                 // 已在上方整批 panic。
-                                let (spec_sp, spec_sv) = match &spec_ctx {
-                                    Some((sp, sv)) => (sp.clone(), sv.clone()),
-                                    None => (Vec::new(), Vec::new()),
-                                };
+                                let (spec_sp, spec_sv) = spec_ctx.clone();
                                 // scaled 系数选择与场景生成器同规则
                                 //（py: `alt if index==1 else std`，index 从 0 起；
                                 // Rust index 从 1 起：spindle1→std[0]，
@@ -757,35 +754,57 @@ mod tests {
         );
     }
 
-    /// C 门 P1：SPEC 解析 fail-closed（缺失/非法即 None）。
+    /// C 门 P1 真实负向回归：共用 parse_acceptance_inputs（与 live 同源）。
+    /// 缺 MODE / 非法 MODE / scaled 缺系数 / unscaled 带系数 / 缺 SPEC。
     #[test]
     fn load_mode_parsing_locked() {
-        type RawPair = Vec<(i32, i32)>;
-        fn parse_spec(s: &str) -> Option<(RawPair, RawPair)> {
-            fn parse(side: &str) -> Option<Vec<(i32, i32)>> {
-                if side.is_empty() {
-                    return Some(Vec::new());
-                }
-                side.split(';')
-                    .map(|p| {
-                        let (a, b) = p.split_once(',')?;
-                        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-                    })
-                    .collect()
-            }
-            let (sp, sv) = s.split_once('|')?;
-            let (sp_side, sv_side) = (sp.strip_prefix("spindle=")?, sv.strip_prefix("servo=")?);
-            Some((parse(sp_side)?, parse(sv_side)?))
-        }
-        assert!(parse_spec("spindle=7,-1|servo=").is_some());
-        assert!(parse_spec("spindle=7,-1").is_none());
-        assert!(parse_spec("bad").is_none());
-        assert!(parse_spec("spindle=x,-1|servo=").is_none());
-        assert_eq!(
-            parse_spec("spindle=|servo="),
-            Some((Vec::new(), Vec::new()))
+        // 合法 scaled。
+        assert!(
+            parse_acceptance_inputs(
+                Some("scaled"),
+                Some("100,200,200,100,32767"),
+                Some("spindle=-270,0|servo=-270,1"),
+            )
+            .is_ok()
+        );
+        // 合法 unscaled。
+        assert!(parse_acceptance_inputs(Some("unscaled"), None, Some("spindle=|servo="),).is_ok());
+        // 缺 MODE。
+        assert!(parse_acceptance_inputs(None, None, Some("spindle=|servo="),).is_err());
+        // 非法 MODE。
+        assert!(parse_acceptance_inputs(Some("auto"), None, Some("spindle=|servo="),).is_err());
+        // scaled 缺系数。
+        assert!(
+            parse_acceptance_inputs(Some("scaled"), None, Some("spindle=-270,0|servo="),).is_err()
+        );
+        // scaled 系数格式错误。
+        assert!(
+            parse_acceptance_inputs(
+                Some("scaled"),
+                Some("100,x,200,100,32767"),
+                Some("spindle=-270,0|servo="),
+            )
+            .is_err()
+        );
+        // unscaled 带非空系数。
+        assert!(
+            parse_acceptance_inputs(
+                Some("unscaled"),
+                Some("100,200,200,100,32767"),
+                Some("spindle=|servo="),
+            )
+            .is_err()
+        );
+        // 缺 SPEC。
+        assert!(
+            parse_acceptance_inputs(Some("scaled"), Some("100,200,200,100,32767"), None,).is_err()
+        );
+        // SPEC 格式错误。
+        assert!(
+            parse_acceptance_inputs(Some("unscaled"), None, Some("spindle=x|servo="),).is_err()
         );
     }
+
     /// 历史误请求仍完整保留；正确构造必须只改首尾 A4 的选择字节。
     #[test]
     fn spindle_request_corrects_archived_selector() {
