@@ -1,262 +1,266 @@
 [
- {
-  "actual": {
-   "String": "ERR:FOCAS unsupported: load percentage outside physical range"
+  {
+    "actual": {
+      "String": "ERR:FOCAS unsupported: legacy wrapping changed value"
+    },
+    "address": "spindle[1].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": {
+      "String": "ERR:FOCAS unsupported: legacy wrapping changed value"
+    },
+    "index": 0
   },
-  "address": "spindle[1].load",
-  "batch": 0,
-  "equal": true,
-  "expected_percent": {
-   "String": "ERR:FOCAS unsupported: load percentage outside physical range"
+  {
+    "actual": {
+      "String": "ERR:FOCAS unsupported: legacy wrapping changed value"
+    },
+    "address": "spindle[2].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": {
+      "String": "ERR:FOCAS unsupported: legacy wrapping changed value"
+    },
+    "index": 1
   },
-  "index": 0
- },
- {
-  "actual": {
-   "F64": 0.0
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "spindle[3].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 2
   },
-  "address": "spindle[2].load",
-  "batch": 0,
-  "equal": true,
-  "expected_percent": 0.0,
-  "index": 1
- },
- {
-  "actual": {
-   "String": "ERR:load record missing"
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "spindle[4].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 3
   },
-  "address": "spindle[3].load",
-  "batch": 0,
-  "equal": true,
-  "expected_percent": null,
-  "index": 2
- },
- {
-  "actual": {
-   "String": "ERR:load record missing"
+  {
+    "actual": {
+      "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
+    },
+    "address": "servo[1].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": {
+      "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
+    },
+    "index": 4
   },
-  "address": "spindle[4].load",
-  "batch": 0,
-  "equal": true,
-  "expected_percent": null,
-  "index": 3
- },
- {
-  "actual": {
-   "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
+  {
+    "actual": {
+      "String": "ERR:FOCAS unsupported: load percentage outside physical range"
+    },
+    "address": "servo[2].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": {
+      "String": "ERR:FOCAS unsupported: load percentage outside physical range"
+    },
+    "index": 5
   },
-  "address": "servo[1].load",
-  "batch": 0,
-  "equal": true,
-  "expected_percent": {
-   "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "servo[3].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 6
   },
-  "index": 4
- },
- {
-  "actual": {
-   "String": "ERR:FOCAS unsupported: load percentage outside physical range"
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "servo[4].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 7
   },
-  "address": "servo[2].load",
-  "batch": 0,
-  "equal": true,
-  "expected_percent": {
-   "String": "ERR:FOCAS unsupported: load percentage outside physical range"
+  {
+    "actual": {
+      "String": "ERR:FOCAS unsupported: legacy wrapping changed value"
+    },
+    "address": "spindle[1].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": {
+      "String": "ERR:FOCAS unsupported: legacy wrapping changed value"
+    },
+    "index": 8
   },
-  "index": 5
- },
- {
-  "actual": {
-   "String": "ERR:load record missing"
+  {
+    "actual": {
+      "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
+    },
+    "address": "servo[1].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": {
+      "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
+    },
+    "index": 9
   },
-  "address": "servo[3].load",
-  "batch": 0,
-  "equal": true,
-  "expected_percent": null,
-  "index": 6
- },
- {
-  "actual": {
-   "String": "ERR:load record missing"
+  {
+    "actual": {
+      "String": "ERR:load index must be 1..4"
+    },
+    "address": "servo[0].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 10
   },
-  "address": "servo[4].load",
-  "batch": 0,
-  "equal": true,
-  "expected_percent": null,
-  "index": 7
- },
- {
-  "actual": {
-   "String": "ERR:FOCAS unsupported: load percentage outside physical range"
+  {
+    "actual": {
+      "String": "ERR:load index must be 1..4"
+    },
+    "address": "spindle[5].load",
+    "batch": 0,
+    "equal": true,
+    "expected_percent": null,
+    "index": 11
   },
-  "address": "spindle[1].load",
-  "batch": 0,
-  "equal": true,
-  "expected_percent": {
-   "String": "ERR:FOCAS unsupported: load percentage outside physical range"
+  {
+    "actual": {
+      "String": "ERR:FOCAS unsupported: legacy wrapping changed value"
+    },
+    "address": "spindle[1].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": {
+      "String": "ERR:FOCAS unsupported: legacy wrapping changed value"
+    },
+    "index": 0
   },
-  "index": 8
- },
- {
-  "actual": {
-   "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
+  {
+    "actual": {
+      "String": "ERR:FOCAS unsupported: legacy wrapping changed value"
+    },
+    "address": "spindle[2].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": {
+      "String": "ERR:FOCAS unsupported: legacy wrapping changed value"
+    },
+    "index": 1
   },
-  "address": "servo[1].load",
-  "batch": 0,
-  "equal": true,
-  "expected_percent": {
-   "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "spindle[3].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 2
   },
-  "index": 9
- },
- {
-  "actual": {
-   "String": "ERR:load index must be 1..4"
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "spindle[4].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 3
   },
-  "address": "servo[0].load",
-  "batch": 0,
-  "equal": true,
-  "expected_percent": null,
-  "index": 10
- },
- {
-  "actual": {
-   "String": "ERR:load index must be 1..4"
+  {
+    "actual": {
+      "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
+    },
+    "address": "servo[1].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": {
+      "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
+    },
+    "index": 4
   },
-  "address": "spindle[5].load",
-  "batch": 0,
-  "equal": true,
-  "expected_percent": null,
-  "index": 11
- },
- {
-  "actual": {
-   "String": "ERR:FOCAS unsupported: load percentage outside physical range"
+  {
+    "actual": {
+      "String": "ERR:FOCAS unsupported: load percentage outside physical range"
+    },
+    "address": "servo[2].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": {
+      "String": "ERR:FOCAS unsupported: load percentage outside physical range"
+    },
+    "index": 5
   },
-  "address": "spindle[1].load",
-  "batch": 1,
-  "equal": true,
-  "expected_percent": {
-   "String": "ERR:FOCAS unsupported: load percentage outside physical range"
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "servo[3].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 6
   },
-  "index": 0
- },
- {
-  "actual": {
-   "F64": 0.0
+  {
+    "actual": {
+      "String": "ERR:load record missing"
+    },
+    "address": "servo[4].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 7
   },
-  "address": "spindle[2].load",
-  "batch": 1,
-  "equal": true,
-  "expected_percent": 0.0,
-  "index": 1
- },
- {
-  "actual": {
-   "String": "ERR:load record missing"
+  {
+    "actual": {
+      "String": "ERR:FOCAS unsupported: legacy wrapping changed value"
+    },
+    "address": "spindle[1].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": {
+      "String": "ERR:FOCAS unsupported: legacy wrapping changed value"
+    },
+    "index": 8
   },
-  "address": "spindle[3].load",
-  "batch": 1,
-  "equal": true,
-  "expected_percent": null,
-  "index": 2
- },
- {
-  "actual": {
-   "String": "ERR:load record missing"
+  {
+    "actual": {
+      "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
+    },
+    "address": "servo[1].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": {
+      "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
+    },
+    "index": 9
   },
-  "address": "spindle[4].load",
-  "batch": 1,
-  "equal": true,
-  "expected_percent": null,
-  "index": 3
- },
- {
-  "actual": {
-   "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
+  {
+    "actual": {
+      "String": "ERR:load index must be 1..4"
+    },
+    "address": "servo[0].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 10
   },
-  "address": "servo[1].load",
-  "batch": 1,
-  "equal": true,
-  "expected_percent": {
-   "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
-  },
-  "index": 4
- },
- {
-  "actual": {
-   "String": "ERR:FOCAS unsupported: load percentage outside physical range"
-  },
-  "address": "servo[2].load",
-  "batch": 1,
-  "equal": true,
-  "expected_percent": {
-   "String": "ERR:FOCAS unsupported: load percentage outside physical range"
-  },
-  "index": 5
- },
- {
-  "actual": {
-   "String": "ERR:load record missing"
-  },
-  "address": "servo[3].load",
-  "batch": 1,
-  "equal": true,
-  "expected_percent": null,
-  "index": 6
- },
- {
-  "actual": {
-   "String": "ERR:load record missing"
-  },
-  "address": "servo[4].load",
-  "batch": 1,
-  "equal": true,
-  "expected_percent": null,
-  "index": 7
- },
- {
-  "actual": {
-   "String": "ERR:FOCAS unsupported: load percentage outside physical range"
-  },
-  "address": "spindle[1].load",
-  "batch": 1,
-  "equal": true,
-  "expected_percent": {
-   "String": "ERR:FOCAS unsupported: load percentage outside physical range"
-  },
-  "index": 8
- },
- {
-  "actual": {
-   "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
-  },
-  "address": "servo[1].load",
-  "batch": 1,
-  "equal": true,
-  "expected_percent": {
-   "String": "ERR:FOCAS unsupported: load raw INT32_MIN rejected"
-  },
-  "index": 9
- },
- {
-  "actual": {
-   "String": "ERR:load index must be 1..4"
-  },
-  "address": "servo[0].load",
-  "batch": 1,
-  "equal": true,
-  "expected_percent": null,
-  "index": 10
- },
- {
-  "actual": {
-   "String": "ERR:load index must be 1..4"
-  },
-  "address": "spindle[5].load",
-  "batch": 1,
-  "equal": true,
-  "expected_percent": null,
-  "index": 11
- }
+  {
+    "actual": {
+      "String": "ERR:load index must be 1..4"
+    },
+    "address": "spindle[5].load",
+    "batch": 1,
+    "equal": true,
+    "expected_percent": null,
+    "index": 11
+  }
 ]

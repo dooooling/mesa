@@ -167,13 +167,31 @@ pub(super) fn decode_legacy(
                 let at = 8 + i * 4;
                 let coefficient = i32::from_be_bytes(coefficients[at..at + 4].try_into().unwrap());
                 // DLL 先取32位 abs，再32位乘法回绕，最后有符号截断除法。
-                numeric.raw = super::wire::legacy_scaled(numeric.raw, coefficient, 32767)?;
+                // P0-2：回绕标记随记录下发（wrapped==true 蕴含源值非零）；
+                // parity 值仍按 DLL 回绕语义计算（对照不改），质量门在取值侧单点 BAD。
+                let src = numeric.raw;
+                let (scaled_v, wrapped) =
+                    super::wire::legacy_scaled_tracked(numeric.raw, coefficient, 32767)?;
+                numeric.raw = scaled_v;
                 numeric.dec_bits = 0;
+                // P0-1：legacy 同样绑定名称（servo 0x89 / spindle 0x8a，每项 4B 前三字节）。
+                let mut name = [0u8; 3];
+                name.copy_from_slice(&names[i * 4..i * 4 + 3]);
+                Ok(super::wire::NamedLoad {
+                    name,
+                    numeric,
+                    wrapped: src != 0 && wrapped,
+                })
+            } else {
+                // P0-1：legacy 同样绑定名称（servo 0x89 / spindle 0x8a，每项 4B 前三字节）。
+                let mut name = [0u8; 3];
+                name.copy_from_slice(&names[i * 4..i * 4 + 3]);
+                Ok(super::wire::NamedLoad {
+                    name,
+                    numeric,
+                    wrapped: false,
+                })
             }
-            // P0-1：legacy 同样绑定名称（servo 0x89 / spindle 0x8a，每项 4B 前三字节）。
-            let mut name = [0u8; 3];
-            name.copy_from_slice(&names[i * 4..i * 4 + 3]);
-            Ok(super::wire::NamedLoad { name, numeric })
         })
         .collect()
 }

@@ -2525,15 +2525,35 @@ pub(super) fn spindle_legacy_branch(
 
 /// 旧主轴缩放：abs与乘法均为32位回绕，再按有符号整数截断除法。
 /// scale 是读取的参数值，不是4127等参数号；load除数32767，speed除数16383。
+/// P0-2 remediation：返回 `(value, wrapped)`——`wrapped` 表示回绕路径是否
+/// 改变了数学真值（`wrapping_abs` 翻转符号或 `wrapping_mul` 溢出）；
+/// 调用方对非零源值的 `wrapped==true` 必须 BAD（回绕伪零不得 GOOD）。
+/// DLL parity 需要原始回绕值时仍可用 `value`（对照不改），质量门另判。
 #[allow(dead_code)]
 pub(super) fn legacy_scaled(raw: i32, scale: i32, div: i32) -> Result<i32, WireError> {
+    legacy_scaled_tracked(raw, scale, div).map(|(v, _)| v)
+}
+
+/// `legacy_scaled` 的回绕追踪版（P0-2；parity 值 + 质量标记分离）。
+#[allow(dead_code)]
+pub(super) fn legacy_scaled_tracked(
+    raw: i32,
+    scale: i32,
+    div: i32,
+) -> Result<(i32, bool), WireError> {
     if div == 0 {
         return Err(WireError::Unsupported("legacy scale div == 0"));
     }
-    let product = raw.wrapping_abs().wrapping_mul(scale);
-    product
+    let abs = raw.wrapping_abs();
+    // wrapping_abs 翻转（MIN）或改变符号即回绕。
+    let abs_wrapped = raw != 0 && (abs < 0 || (raw < 0 && abs == raw));
+    let product = abs.wrapping_mul(scale);
+    // wrapping_mul 溢出检测：数学真值超出 i32 即 wrapped（经 i64 复算）。
+    let mul_wrapped = (abs as i64) * (scale as i64) != product as i64;
+    let value = product
         .checked_div(div)
-        .ok_or(WireError::Unsupported("legacy divide overflow"))
+        .ok_or(WireError::Unsupported("legacy divide overflow"))?;
+    Ok((value, abs_wrapped || mul_wrapped))
 }
 
 /// 旧主轴缩放参数号选择（名称第三字节是否为 `'2'`）。
@@ -3424,6 +3444,7 @@ impl FocasClient {
                             .map(|r| NamedLoad {
                                 name: r.axis_raw,
                                 numeric: r.numeric,
+                                wrapped: false,
                             })
                             .collect()
                     })
@@ -3438,6 +3459,7 @@ impl FocasClient {
                                     .map(|numeric| NamedLoad {
                                         name: r.name_raw,
                                         numeric,
+                                        wrapped: false,
                                     })
                                     .ok_or(WireError::MalformedPayload)
                             })
@@ -3494,59 +3516,103 @@ impl FocasClient {
 
 /// Load 命名记录（P0-1 remediation：数值 + 原始名称绑定；取值时校验
 /// 名称-序号一致，不一致即单点 BAD，不冒充他轴/他主轴 GOOD）。
+/// P0-2 remediation：`wrapped` 标记旧缩放回绕（源值非零但回绕路径改变真值）；
+/// 取值侧单点 BAD（不污染同组他点，不冒充 0% GOOD）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct NamedLoad {
     /// 原始名称前三字节（servo `axis_raw` / spindle `name_raw` 同源）。
     pub name: [u8; 3],
     /// 数值单元。
     pub numeric: LoadNumeric,
+    /// 旧缩放回绕标记（新分支恒 false；wrapped==true 蕴含源值非零）。
+    pub wrapped: bool,
 }
 
 /// 先校验产品索引，再校验名称-序号绑定，最后访问本批次数据；
 /// 错误仅影响所选点，不污染同组有效值。
-/// 绑定规则（P0-1）：servo `index` 期望名首字节 `X/Y/Z/A`（1..4）；
-/// spindle `index` 期望名前缀 `S{index}`（如 `S1`）；不一致即 BAD。
+/// 绑定规则（P0-1 v2）：同一批次内名称必须唯一且形态一致——
+/// servo 首字节须为 X/Y/Z/A 之一且批内不重复；spindle 首字节须为 S
+/// 且批内三字节全名不重复。乱序/错位/重复/未知形态即 BAD。
+/// suff1（轴下标）/suff2（主副区分）不解释为序号，只要求批内一致性；
+/// 无可信映射机型保持 BAD（不猜）。
 fn load_selected_value(
     group: &Option<Result<Vec<NamedLoad>, String>>,
     index: u8,
     servo: bool,
 ) -> Value {
-    // 期望名前缀（servo：X/Y/Z/A；spindle：S{index}）。
-    fn expected(servo: bool, index: u8) -> [u8; 2] {
-        if servo {
-            match index {
-                1 => [b'X', 0],
-                2 => [b'Y', 0],
-                3 => [b'Z', 0],
-                _ => [b'A', 0],
+    // 批内名称一致性：首字节域 + 全名唯一（乱序/重复即整组不可信）。
+    // 空组不判 inconsistent（N=0 合法空，取值侧报 record missing）。
+    fn batch_ok(values: &[NamedLoad], servo: bool) -> bool {
+        if values.len() > 4 {
+            return false;
+        }
+        let mut seen = [[0u8; 3]; 4];
+        for (i, v) in values.iter().enumerate() {
+            // 首字节域：servo X/Y/Z/A；spindle S。
+            let head_ok = if servo {
+                matches!(v.name[0], b'X' | b'Y' | b'Z' | b'A')
+            } else {
+                v.name[0] == b'S'
+            };
+            if !head_ok {
+                return false;
             }
+            // 全名唯一（重复名即错位/复读）。
+            for s in seen.iter().take(i) {
+                if *s == v.name {
+                    return false;
+                }
+            }
+            seen[i] = v.name;
+        }
+        true
+    }
+    // 序号→期望首字节（servo X/Y/Z/A；spindle S + 数字序号ставка）。
+    fn expected_head(servo: bool, index: u8) -> (u8, Option<u8>) {
+        if servo {
+            let b = match index {
+                1 => b'X',
+                2 => b'Y',
+                3 => b'Z',
+                _ => b'A',
+            };
+            (b, None)
         } else {
-            [b'S', b'0' + index]
+            (b'S', Some(b'0' + index))
         }
     }
     let result = if !(1..=4).contains(&index) {
         Err("ERR:load index must be 1..4".to_string())
     } else {
         match group {
-            Some(Ok(values)) => values
-                .get(index as usize - 1)
-                .ok_or_else(|| "ERR:load record missing".to_string())
-                .and_then(|named| {
-                    // P0-1：名称-序号绑定校验（乱序/错位即 BAD，不 mislabel GOOD）。
-                    let exp = expected(servo, index);
-                    let ok = if servo {
-                        named.name[0] == exp[0]
-                    } else {
-                        named.name[0] == exp[0] && named.name[1] == exp[1]
-                    };
-                    if !ok {
-                        return Err(format!(
-                            "ERR:load identity mismatch (index {index} name {:02x?})",
-                            named.name
-                        ));
-                    }
-                    super::load::percent(named.numeric).map_err(|error| format!("ERR:{error}"))
-                }),
+            Some(Ok(values)) => {
+                if !batch_ok(values, servo) {
+                    Err("ERR:load identity batch inconsistent".to_string())
+                } else {
+                    values
+                        .get(index as usize - 1)
+                        .ok_or_else(|| "ERR:load record missing".to_string())
+                        .and_then(|named| {
+                            // P0-1 v2：序号-名称绑定（首字节 + spindle 数字位）。
+                            let (h, d) = expected_head(servo, index);
+                            let ok =
+                                named.name[0] == h && d.map(|x| named.name[1] == x).unwrap_or(true);
+                            if !ok {
+                                return Err(format!(
+                                    "ERR:load identity mismatch (index {index} name {:02x?})",
+                                    named.name
+                                ));
+                            }
+                            // P0-2：回绕源值单点 BAD（不污染同组他点）。
+                            if named.wrapped {
+                                return Err("ERR:FOCAS unsupported: legacy wrapping changed value"
+                                    .to_string());
+                            }
+                            super::load::percent(named.numeric)
+                                .map_err(|error| format!("ERR:{error}"))
+                        })
+                }
+            }
             Some(Err(error)) => Err(error.clone()),
             None => Err("ERR:load group missing".to_string()),
         }
@@ -3567,6 +3633,7 @@ mod load_identity_tests {
                 aux4: [0, 0],
                 dec_bits,
             },
+            wrapped: false,
         }
     }
 
@@ -3628,6 +3695,22 @@ mod load_identity_tests {
             dec_bits: 1,
         });
         assert!(v.is_err(), "MIN 必须 BAD，实际：{v:?}");
+    }
+
+    /// P0-2：legacy_scaled_tracked 回绕标记（MAX×2 溢出即 wrapped）。
+    #[test]
+    fn legacy_scaled_tracked_flags_overflow() {
+        let (v, wrapped) = super::legacy_scaled_tracked(i32::MAX, 2, 32767).unwrap();
+        assert_eq!(v, 0, "parity 值仍按 DLL 回绕语义为 0");
+        assert!(wrapped, "非零源值回绕必须标记");
+    }
+
+    /// P0-2：未回绕路径不标记（小值正常换算）。
+    #[test]
+    fn legacy_scaled_tracked_clean_path() {
+        let (v, wrapped) = super::legacy_scaled_tracked(270, 2, 32767).unwrap();
+        assert_eq!(v, 0, "270*2/32767 截断为 0（parity）");
+        assert!(!wrapped, "未溢出不得标记");
     }
 }
 
