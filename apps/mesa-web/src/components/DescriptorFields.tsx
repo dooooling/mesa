@@ -22,6 +22,31 @@ function isVisible(field: FieldDescriptor, values: Record<string, unknown>): boo
  */
 export { materializeSchemaDefaults } from "../resourceSelectionModel";
 
+/**
+ * TSAP 双格式解析（NCK local_tsap/remote_tsap）：十进制（256）或十六进制
+ * （0x0100/0X0100/0100h/0100H，允许前后空白）→ 同一 number；
+ * 非法（空串原样返回由 required 门裁决；格式错/越界返回原字符串，前端标红，
+ * 后端 from_json 亦拒绝）。Core schema 只见 number。
+ */
+export function parseTsapInput(s: string): number | string {
+  const t = s.trim();
+  if (t === "") return s;
+  if (/^[0-9]+$/.test(t)) {
+    const n = Number(t);
+    return Number.isInteger(n) && n >= 0 && n <= 65535 ? n : s;
+  }
+  const hex =
+    t.startsWith("0x") || t.startsWith("0X")
+      ? t.slice(2)
+      : /[hH]$/.test(t)
+        ? t.slice(0, -1)
+        : null;
+  if (hex !== null && /^[0-9a-fA-F]{1,4}$/.test(hex)) {
+    return parseInt(hex, 16);
+  }
+  return s;
+}
+
 function FieldControl({
   field,
   value,
@@ -123,6 +148,35 @@ function FieldControl({
               撤销
             </Button>
           </div>
+        ) : null}
+      </div>
+    );
+  }
+  // TSAP 双格式（NCK local_tsap/remote_tsap 为 string 型）：接受十进制
+  // （256）或十六进制（0x0100/0100h），统一换算为 number 提交；
+  // Core schema 只见 number（validate_instance 不拦），后端双解析兜底。
+  if (field.key === "local_tsap" || field.key === "remote_tsap") {
+    const toDisplay = (v: unknown): string => {
+      if (typeof v === "number") return `0x${v.toString(16).toUpperCase().padStart(4, "0")}`;
+      if (typeof v === "string") return v;
+      return typeof field.default === "string" ? field.default : "";
+    };
+    const raw = toDisplay(value);
+    const parsed = parseTsapInput(raw);
+    const invalid = typeof parsed === "string" && raw.trim() !== "";
+    return (
+      <div style={{ display: "grid", gap: 4 }}>
+        <span style={{ fontSize: 12 }}>{label}</span>
+        <Input
+          disabled={disabled}
+          value={raw}
+          onChange={(e) => onChange(parseTsapInput(e.target.value))}
+          placeholder={field.ui.placeholder ?? "如 0x0100 或 256"}
+          status={invalid ? "error" : undefined}
+          style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}
+        />
+        {invalid ? (
+          <span style={{ fontSize: 12, color: "#da1e28" }}>TSAP 格式非法（十进制 0~65535 或十六进制 0x0000~0xFFFF）</span>
         ) : null}
       </div>
     );

@@ -93,10 +93,29 @@ impl Driver for SinumerikNckDriver {
                         f
                     },
                     // TSAP 显式必填（NCK 无 rack/slot 推导；远端值由真机 Gate 定）。
-                    FieldDescriptor::new("local_tsap", "Local TSAP", FieldType::Integer)
-                        .required(true),
-                    FieldDescriptor::new("remote_tsap", "Remote TSAP", FieldType::Integer)
-                        .required(true),
+                    // String 双格式：十进制（256）或十六进制（0x0100/0100h）；
+                    // 后端 config 双解析为同一 u16，前端 hex→number 提交，
+                    // Core schema 只见 number（validate_instance 不拦）。
+                    {
+                        let mut f =
+                            FieldDescriptor::new("local_tsap", "Local TSAP", FieldType::String)
+                                .required(true);
+                        f.validation.pattern = Some(
+                            "^(0[xX][0-9a-fA-F]{1,4}|[0-9a-fA-F]{1,4}[hH]|[0-9]{1,5})$".into(),
+                        );
+                        f.ui.placeholder = Some("如 0x0100 或 256".into());
+                        f.default_value(serde_json::json!("0x0100"))
+                    },
+                    {
+                        let mut f =
+                            FieldDescriptor::new("remote_tsap", "Remote TSAP", FieldType::String)
+                                .required(true);
+                        f.validation.pattern = Some(
+                            "^(0[xX][0-9a-fA-F]{1,4}|[0-9a-fA-F]{1,4}[hH]|[0-9]{1,5})$".into(),
+                        );
+                        f.ui.placeholder = Some("如 0x0102 或 258".into());
+                        f.default_value(serde_json::json!("0x0102"))
+                    },
                     FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
                         .required(false)
                         .default_value(serde_json::json!(5000)),
@@ -752,6 +771,18 @@ mod tests {
         assert!(fam.required);
         let opts = fam.validation.enum_options.clone().unwrap();
         assert_eq!(opts, vec!["840d-sl".to_string(), "828d".to_string()]);
+        // TSAP 双格式：String 型 + pattern（十进制/十六进制），默认 hex 示例。
+        for key in ["local_tsap", "remote_tsap"] {
+            let f = d
+                .connection
+                .fields
+                .iter()
+                .find(|f| f.key == key)
+                .unwrap_or_else(|| panic!("缺 {key}"));
+            assert!(f.required, "{key} 必须必填");
+            assert_eq!(f.field_type, mesa_core_types::FieldType::String);
+            assert!(f.validation.pattern.is_some(), "{key} 必须带 pattern 约束");
+        }
         assert!(!d.capabilities.write, "NCK V1 只读");
         assert!(!d.capabilities.method, "NCK V1 无 command");
         assert!(!d.capabilities.events, "NCK V1 无事件");
@@ -803,6 +834,14 @@ mod tests {
             )
             .await;
         assert!(ok.is_ok());
+        // 十六进制字符串等价（0x0100 == 256；直接调 API 亦可）。
+        let ok_hex = d
+            .open_connection(
+                "t",
+                r#"{"host":"10.0.0.5","family":"840d-sl","local_tsap":"0x0100","remote_tsap":"0x0102"}"#,
+            )
+            .await;
+        assert!(ok_hex.is_ok());
         // 未知 family 拒绝（P1-3：绝不全系列合并）。
         assert_eq!(
             err_of(
