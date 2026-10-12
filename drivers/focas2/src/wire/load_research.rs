@@ -126,8 +126,11 @@ fn quality_oracle(
     if !(-32768..=32767).contains(&decimal) {
         return None;
     }
-    // P0-2：先回绕（scaled 上下文独立复算；源值非零 + wrapped 即 BAD，
-    // 即使回绕后 ABI 为 0 也不得判真零 GOOD）。
+    // P0-2 + blocking3: scaled 上下文先复算回绕与缩放值。
+    // 回绕即 BAD；无回绕时后续 F64/物理门改判缩放值（dec=0），
+    // 不用原始值直接判（30000+coef100→91% GOOD，不得误判 BAD）。
+    let mut eff_raw = raw;
+    let mut eff_dec = decimal;
     if let Some((coefficient, div)) = scaled {
         if div == 0 {
             return Some(true);
@@ -139,21 +142,31 @@ fn quality_oracle(
         if raw != 0 && (abs_wrapped || mul_wrapped) {
             return Some(true);
         }
+        // 无回绕：DLL 缩放值（截断除，dec=0）进入后续判定。
+        eff_raw = product.checked_div(div).unwrap_or(i32::MIN);
+        eff_dec = 0;
+        // checked_div 失败（MIN/-1）即 BAD。
+        if eff_raw == i32::MIN && !(raw == i32::MIN && product == i32::MIN) {
+            // product==MIN/div==1 的合法 MIN 穿透除外（下由 MIN 门接管）。
+            if !(product == i32::MIN && div == 1) {
+                return Some(true);
+            }
+        }
     }
-    if raw == 0 {
+    if eff_raw == 0 {
         return Some(false);
     }
-    // P0-3：MIN 直接 BAD。
-    if raw == i32::MIN {
+    // P0-3
+    if eff_raw == i32::MIN {
         return Some(true);
     }
-    // F64 换算独立复算（分段 10^308，不调用生产 percent）。
-    let mut value = raw as f64;
-    let mut remaining = decimal.abs();
+    // F64（判定对象为缩放后有效值）。
+    let mut value = eff_raw as f64;
+    let mut remaining = eff_dec.abs();
     while remaining > 0 {
         let step = remaining.min(308);
         let scale = 10f64.powi(step);
-        value = if decimal >= 0 {
+        value = if eff_dec >= 0 {
             value / scale
         } else {
             value * scale
@@ -482,21 +495,25 @@ pub(crate) mod live {
         ]);
         expected.extend([expected[0], expected[4], None, None]);
         // scaled 上下文独立输入（P1-2 v3）：`MESA_FOCAS_LOAD_SCALED`
-        // `std0,std1,alt0,alt1,div`（spindle index1 用 alt，其余 std；
-        // servo 在 scaled 场景恒 None——servo legacy 无回退）。
-        // 空/缺失 = 新分支无缩放。由场景生成器写入，不读被测输出。
-        // 解析失败（数量≠5/非整数）即 None——与非缩放不可区分时调用方
-        // 按 scaled=None 处理；严格区分由 MESA_FOCAS_LOAD_SPEC presence 保证
-        //（scaled 场景必须同时带 SPEC，缺 SPEC 即整批失败，见下）。
-        let scaled_ctx: Option<[i32; 5]> =
-            std::env::var("MESA_FOCAS_LOAD_SCALED").ok().and_then(|s| {
-                let v: Vec<i32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-                if v.len() == 5 {
-                    Some([v[0], v[1], v[2], v[3], v[4]])
-                } else {
-                    None
-                }
-            });
+        // `std0,std1,alt0,alt1,div`。由场景生成器写入，不读被测输出。
+        // 严格解析（blocking 3）：变量存在但格式错误（数量≠5/非整数）
+        // 即整批 panic——不静默退回 None（None 专属真正的非缩放场景）。
+        let scaled_raw = std::env::var("MESA_FOCAS_LOAD_SCALED").ok();
+        let scaled_ctx: Option<[i32; 5]> = match scaled_raw.as_deref() {
+            None | Some("") => None,
+            Some(s) => {
+                let v: Vec<i32> = s
+                    .split(',')
+                    .map(|x| {
+                        x.trim()
+                            .parse()
+                            .unwrap_or_else(|_| panic!("MESA_FOCAS_LOAD_SCALED 格式错误：{s:?}"))
+                    })
+                    .collect();
+                assert!(v.len() == 5, "MESA_FOCAS_LOAD_SCALED 必须 5 个整数：{s:?}");
+                Some([v[0], v[1], v[2], v[3], v[4]])
+            }
+        };
         // spec 原始输入（P1-2 v4）：类型别名降复杂度。
         type RawPair = Vec<(i32, i32)>;
         // `MESA_FOCAS_LOAD_SPEC`
@@ -572,8 +589,8 @@ pub(crate) mod live {
                                 };
                                 // scaled 系数选择与场景生成器同规则
                                 //（py: `alt if index==1 else std`，index 从 0 起；
-                                // Rust index 从 1 起：spindle1→alt[0]，
-                                // spindle2→std[1]，spindle3/4 无 spec 条目→oracle None；
+                                // Rust index 从 1 起：spindle1→std[0]，
+                                // spindle2→alt[1]，spindle3/4 无 spec 条目→oracle None；
                                 // servo 恒 None）。
                                 let scaled = match addr {
                                     crate::address::FocasAddress::Spindle {
@@ -581,9 +598,10 @@ pub(crate) mod live {
                                         ..
                                     } => scaled_ctx.and_then(|c| {
                                         // c=[std0,std1,alt0,alt1,div]。
+                                        // py 同规则（index 从 0：sp1→std[0]，sp2→alt[1]）。
                                         let coef = match *spindle {
-                                            1 => *c.get(2)?,
-                                            2 => *c.get(1)?,
+                                            1 => *c.first()?,
+                                            2 => *c.get(3)?,
                                             _ => return None,
                                         };
                                         Some((coef, c[4]))
@@ -693,9 +711,26 @@ mod tests {
             ),
             None
         );
-        // 系数选择：spindle1→alt[0]=2（wrapping spec alt=[2,2]）。
+        // 系数选择：spindle1→std[0]（legacy_scaled spec std=[100,200]）。
+        // 30000 + coef100 → 91% GOOD（缩放后物理门，不得用原始值误判 BAD）。
         assert_eq!(
-            quality_oracle(&sp(1), &[(2147483647, 0)], &spec_sv, Some((2, 32767))),
+            quality_oracle(&sp(1), &[(30000, 0)], &spec_sv, Some((100, 32767))),
+            Some(false)
+        );
+        // spindle2→alt[1]（legacy_scaled spec alt=[200,100]）。
+        // 30000*200/32767=183 → GOOD。
+        assert_eq!(
+            quality_oracle(&sp(2), &[(0, 0), (30000, 0)], &spec_sv, Some((100, 32767))),
+            Some(false)
+        );
+        // wrapping：spindle2 MAX + coef2 → 回绕 BAD。
+        assert_eq!(
+            quality_oracle(
+                &sp(2),
+                &[(0, 0), (2147483647, 0)],
+                &spec_sv,
+                Some((2, 32767))
+            ),
             Some(true)
         );
     }

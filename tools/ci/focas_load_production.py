@@ -120,14 +120,15 @@ def run_case(exe, root, name, spec, handshake):
                     (spec.get('std', [0, 0]) + spec.get('alt', [0, 0]) + [32767]))
             else:
                 scaled_env = ''
-            env = dict(os.environ, MESA_FOCAS_GATE0_HOST='127.0.0.1', MESA_FOCAS_GATE0_PORT=str(server.server_address[1]),
-                       MESA_FOCAS_LOAD_PAIR_OUT=str(out/'samples'), MESA_FOCAS_LOAD_SCALED=scaled_env, MESA_FOCAS_LOAD_SPEC=spec_env)
             # spec 原始输入（P1-2 v4）：spindle|servo 缩放前原始值；
             # scaled 场景必填（缺失即 Rust 侧整批 panic）。
+            # 先构造 spec_env，再构造 env（顺序不可换）。
             def spec_side(values):
                 return ';'.join(f'{raw},{dec}' for raw, dec in values)
             spec_env = ('spindle=' + spec_side(spec.get('spindle', []))
                         + '|servo=' + spec_side(spec.get('servo', [])))
+            env = dict(os.environ, MESA_FOCAS_GATE0_HOST='127.0.0.1', MESA_FOCAS_GATE0_PORT=str(server.server_address[1]),
+                       MESA_FOCAS_LOAD_PAIR_OUT=str(out/'samples'), MESA_FOCAS_LOAD_SCALED=scaled_env, MESA_FOCAS_LOAD_SPEC=spec_env)
             process = subprocess.run([str(exe), '--exact', 'wire::load_research::tests::load_production_pair_live',
                                       '--ignored', '--nocapture', '--test-threads=1'], cwd=ROOT, env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
