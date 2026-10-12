@@ -112,8 +112,16 @@ def run_case(exe, root, name, spec, handshake):
         thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05})
         thread.start()
         try:
+            # scaled 上下文独立输入（P1-2 v3）：std0,std1,alt0,alt1,div；
+            # 非 scaled 场景传空（新分支无缩放）。由场景 spec 写入，
+            # 不读被测输出，不从已回绕 ABI 反推。
+            if spec.get('scaled'):
+                scaled_env = ','.join(str(n) for n in
+                    (spec.get('std', [0, 0]) + spec.get('alt', [0, 0]) + [32767]))
+            else:
+                scaled_env = ''
             env = dict(os.environ, MESA_FOCAS_GATE0_HOST='127.0.0.1', MESA_FOCAS_GATE0_PORT=str(server.server_address[1]),
-                       MESA_FOCAS_LOAD_PAIR_OUT=str(out/'samples'))
+                       MESA_FOCAS_LOAD_PAIR_OUT=str(out/'samples'), MESA_FOCAS_LOAD_SCALED=scaled_env)
             process = subprocess.run([str(exe), '--exact', 'wire::load_research::tests::load_production_pair_live',
                                       '--ignored', '--nocapture', '--test-threads=1'], cwd=ROOT, env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)

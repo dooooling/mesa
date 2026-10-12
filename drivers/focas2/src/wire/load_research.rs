@@ -97,7 +97,7 @@ fn wire_candidates(
 /// 不得默认放行 GOOD（fail-closed：None 即判失败）。
 /// 规则与生产门同源但输入侧独立：MIN / F64 溢出下溢 / |v|>1000% / 回绕。
 /// 顺序：先回绕（源值非零 + wrapped 即 BAD），再真零（raw==0 即 GOOD）。
-#[cfg(windows)]
+/// 纯计算函数：跨平台可用（整个模块已 #[cfg(test)]；live 调用方另有 windows 门）。
 fn quality_oracle(
     addr: &crate::address::FocasAddress,
     baseline_spindle: &serde_json::Value,
@@ -420,6 +420,10 @@ pub(crate) mod live {
     }
     /// 使用受保护的实际 DLL ABI 作为基准，比较正式适配器的百分比输出。
     /// 仅可连接本机报文替身；重复批次用于验证没有跨批次残留负载缓存。
+    /// P1-2 v3：scaled 上下文由环境变量 `MESA_FOCAS_LOAD_SCALED`
+    /// （`std0,std1,alt0,alt1,div` CSV；空=新分支无缩放）独立输入，
+    /// 由 `focas_load_production.py` 按场景 spec 写入——不读被测输出，
+    /// 不从已回绕 DLL ABI 反推。
     pub(super) fn run_production() {
         use crate::address::{FocasAddress, SpindleKind};
         use crate::focas_api::FocasApi;
@@ -484,7 +488,19 @@ pub(crate) mod live {
             },
         ]);
         expected.extend([expected[0], expected[4], None, None]);
-        // spindle_rows / servo_rows 已在上方 for 中留存（见 quality oracle 输入副本）。
+        // scaled 上下文独立输入（P1-2 v3）：`MESA_FOCAS_LOAD_SCALED`
+        // `std0,std1,alt0,alt1,div`（spindle index1 用 alt，其余 std；
+        // servo 在 scaled 场景恒 None——servo legacy 无回退）。
+        // 空/缺失 = 新分支无缩放。由场景生成器写入，不读被测输出。
+        let scaled_ctx: Option<[i32; 5]> =
+            std::env::var("MESA_FOCAS_LOAD_SCALED").ok().and_then(|s| {
+                let v: Vec<i32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if v.len() == 5 {
+                    Some([v[0], v[1], v[2], v[3], v[4]])
+                } else {
+                    None
+                }
+            });
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -528,9 +544,24 @@ pub(crate) mod live {
                                     serde_json::json!({"candidates": spindle_rows}),
                                     serde_json::json!({"candidates": servo_rows}),
                                 );
-                                // scaled 回绕：本生成器为新分支路径（type0/servo），
-                                // legacy scaled 不经过此函数 → None。
-                                quality_oracle(addr, &bl_sp, &bl_sv, None)
+                                // scaled 上下文独立输入（P1-2 v3）：spindle 按
+                                // focas_load_production.py 同规则取系数
+                                //（`alt if index==1 else std`，index 从 1 起；
+                                // servo 恒 None——servo legacy 无缩放回退）。
+                                let scaled = match addr {
+                                    crate::address::FocasAddress::Spindle {
+                                        spindle,
+                                        ..
+                                    } => scaled_ctx.map(|c| {
+                                        // c=[std0,std1,alt0,alt1,div]。
+                                        let coef = if *spindle == 1 { c[2] } else { c[0] };
+                                        // index2 → std[1]。
+                                        let coef = if *spindle == 2 { c[1] } else { coef };
+                                        (coef, c[4])
+                                    }),
+                                    _ => None,
+                                };
+                                quality_oracle(addr, &bl_sp, &bl_sv, scaled)
                             }
                         }
                     };
