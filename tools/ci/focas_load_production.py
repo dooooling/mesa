@@ -138,6 +138,8 @@ def run_case(exe, root, name, spec, handshake):
     if len(rows) != 24 or not all(row['equal'] for row in rows):
         raise ValueError('正式适配器输出存在不一致')
     # 独立设定值再次与 DLL 比较，避免两侧共同解错小数位还通过差分。
+    # parity 轨：DLL ABI 精确对照（对照不改）；quality 轨（wrapped/MIN/超限 BAD）
+    # 由生产质量门独立判定，此处只核对 ABI，不复判 GOOD/BAD。
     for tag, key in [('type0', 'spindle'), ('servo', 'servo')]:
         sample = json.loads((out/f'samples/native-{tag}.json').read_text(encoding='utf-8'))
         count = min(4, len(spec[key]), spec.get('before', len(spec[key])), spec.get('after', len(spec[key])))

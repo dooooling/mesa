@@ -112,12 +112,28 @@ async fn load_dll_evidence_replays_production_batches() {
                 .filter(|r| r["batch"] == batch)
                 .map(|r| serde_json::from_value(r["actual"].clone()).unwrap())
                 .collect();
+            let actual = api.read_batch(&addresses()).await.unwrap();
+            // F64 按相对 1e-14 + 1 subnormal 容差（与 focas_load_production.py
+            // 独立验收约定一致）；字符串 ERR/顺序/数量/类型严格相等。
             assert_eq!(
-                api.read_batch(&addresses()).await.unwrap(),
-                expected,
-                "{} batch{batch}",
+                actual.len(),
+                expected.len(),
+                "{} batch{batch} 数量",
                 dir.display()
             );
+            for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                match (a, e) {
+                    (Value::F64(x), Value::F64(y)) => {
+                        let tol = 1e-14 * x.abs().max(y.abs()).max(1.0) + f64::MIN_POSITIVE;
+                        assert!(
+                            (x - y).abs() <= tol,
+                            "{} batch{batch}[{i}] F64 超差：{x} vs {y}",
+                            dir.display()
+                        );
+                    }
+                    _ => assert_eq!(a, e, "{} batch{batch}[{i}] 非 F64 严格相等", dir.display()),
+                }
+            }
         }
         api.disconnect().await;
         tokio::time::timeout(Duration::from_secs(5), worker)

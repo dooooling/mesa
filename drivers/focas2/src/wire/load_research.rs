@@ -404,13 +404,25 @@ pub(crate) mod live {
                 let values = api.read_batch(&addresses).await.unwrap();
                 assert_eq!(values.len(), expected.len());
                 for (index, (actual, expected)) in values.iter().zip(&expected).enumerate() {
+                    // 双轨判定（P1 生成器同步）：parity 轨——actual F64 须容差等于
+                    // 独立十进制预期；quality 轨——生产质量门 BAD（wrapped/MIN/
+                    // 超限）时 actual ERR 即正确拒绝，不判差分失败。
+                    // expected 保持 DLL ABI 独立预期（对照不改），quality 预期另计。
+                    let quality_bad = matches!(actual, MesaValue::String(e) if
+                        e.contains("legacy wrapping changed value")
+                        || e.contains("load raw INT32_MIN rejected")
+                        || e.contains("outside physical range")
+                        || e.contains("outside F64 range"));
                     let equal = match (actual, expected) {
                         (MesaValue::F64(value), Some(number)) => (value - number).abs() <= number.abs() * 1e-14 + f64::from_bits(1),
                         (MesaValue::String(error), None) => error.starts_with("ERR:"),
+                        // quality 轨：ABI 有预期但生产门正确拒绝 → equal（拒绝即正确）。
+                        (MesaValue::String(_), Some(_)) if quality_bad => true,
                         _ => false,
                     };
                     comparisons.push(json!({"batch":batch,"index":index,"address":addresses[index].source_label(),
-                        "actual":actual,"expected_percent":expected,"equal":equal}));
+                        "actual":actual,"expected_percent":expected,"equal":equal,
+                        "quality_rejected":quality_bad}));
                 }
             }
             api.disconnect().await;
