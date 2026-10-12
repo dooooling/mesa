@@ -124,7 +124,15 @@ async fn load_dll_evidence_replays_production_batches() {
             for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
                 match (a, e) {
                     (Value::F64(x), Value::F64(y)) => {
-                        let tol = 1e-14 * x.abs().max(y.abs()).max(1.0) + f64::MIN_POSITIVE;
+                        // P1-1 remediation：相对 1e-14 + 1 subnormal；
+                        // 先断有限（伪零/无穷不得通过），不设 .max(1.0) 兜底
+                        //（1e-309 误解成 0.0 必须失败）。
+                        assert!(
+                            x.is_finite() && y.is_finite(),
+                            "{} batch{batch}[{i}] F64 非有限：{x} vs {y}",
+                            dir.display()
+                        );
+                        let tol = 1e-14 * x.abs().max(y.abs()) + f64::from_bits(1);
                         assert!(
                             (x - y).abs() <= tol,
                             "{} batch{batch}[{i}] F64 超差：{x} vs {y}",

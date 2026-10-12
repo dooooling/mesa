@@ -88,6 +88,76 @@ fn wire_candidates(
     Ok(candidates)
 }
 
+/// 独立生产质量 oracle（P1-2 remediation）：由输入侧规则判定某地址点
+/// 应 GOOD（false）还是 BAD（true），不读被测 `read_batch` 输出文本。
+/// 输入：`addr`（序号/轴）+ `baseline`（Native candidates raw/decimal）；
+/// `scaled_wrapped` 为 legacy scaled 回绕标记（调用方按 spec 独立复算；
+/// 本函数内对 legacy 路径按 DLL 回绕语义复算，不调用生产 `percent`）。
+/// 返回 None = 无记录（序号越界/缺失），由 BAD/ERR 覆盖。
+/// 规则与生产门同源但输入侧独立：MIN / F64 溢出下溢 / |v|>1000% / 回绕。
+fn quality_oracle(
+    addr: &crate::address::FocasAddress,
+    baseline_spindle: &serde_json::Value,
+    baseline_servo: &serde_json::Value,
+    scaled_wrapped: bool,
+) -> Option<bool> {
+    use crate::address::{FocasAddress, SpindleKind};
+    let (is_servo, index) = match addr {
+        FocasAddress::ServoLoad { axis } => (true, *axis as usize),
+        FocasAddress::Spindle {
+            spindle,
+            kind: SpindleKind::Load,
+        } => (false, *spindle as usize),
+        _ => return None,
+    };
+    if !(1..=4).contains(&index) {
+        return None;
+    }
+    let rows = if is_servo {
+        baseline_servo["candidates"].as_array()
+    } else {
+        baseline_spindle["candidates"].as_array()
+    }?;
+    let r = rows.get(index - 1)?;
+    let raw = r["data"].as_i64()? as i32;
+    let decimal = r["decimal"].as_u64()? as u16 as i16 as i32;
+    if raw == 0 {
+        return Some(false);
+    }
+    // P0-3：MIN 直接 BAD。
+    if raw == i32::MIN {
+        return Some(true);
+    }
+    // P0-2：回绕标记即 BAD。
+    if scaled_wrapped {
+        return Some(true);
+    }
+    // F64 换算独立复算（分段 10^308，不调用生产 percent）。
+    let mut value = raw as f64;
+    let mut remaining = decimal.abs();
+    while remaining > 0 {
+        let step = remaining.min(308);
+        let scale = 10f64.powi(step);
+        value = if decimal >= 0 {
+            value / scale
+        } else {
+            value * scale
+        };
+        remaining -= step;
+        if !value.is_finite() || value == 0.0 {
+            break;
+        }
+    }
+    if !value.is_finite() || value == 0.0 {
+        return Some(true);
+    }
+    // 物理上限门。
+    if value.abs() > 1000.0 {
+        return Some(true);
+    }
+    Some(false)
+}
+
 #[cfg(windows)]
 pub(crate) mod live {
     use super::*;
@@ -360,8 +430,16 @@ pub(crate) mod live {
         drop(handle);
         let mut addresses = Vec::new();
         let mut expected = Vec::new();
+        // quality oracle 输入副本（baseline 在 for 中被 move，先留 rows）。
+        let mut spindle_rows = Vec::new();
+        let mut servo_rows = Vec::new();
         for (is_servo, baseline) in [(false, spindle), (true, servo)] {
-            let rows = baseline["candidates"].as_array().unwrap();
+            let rows = baseline["candidates"].as_array().unwrap().clone();
+            if is_servo {
+                servo_rows = rows.clone();
+            } else {
+                spindle_rows = rows.clone();
+            }
             for index in 1..=4 {
                 addresses.push(if is_servo {
                     FocasAddress::ServoLoad { axis: index }
@@ -392,6 +470,7 @@ pub(crate) mod live {
             },
         ]);
         expected.extend([expected[0], expected[4], None, None]);
+        // spindle_rows / servo_rows 已在上方 for 中留存（见 quality oracle 输入副本）。
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -404,25 +483,64 @@ pub(crate) mod live {
                 let values = api.read_batch(&addresses).await.unwrap();
                 assert_eq!(values.len(), expected.len());
                 for (index, (actual, expected)) in values.iter().zip(&expected).enumerate() {
-                    // 双轨判定（P1 生成器同步）：parity 轨——actual F64 须容差等于
-                    // 独立十进制预期；quality 轨——生产质量门 BAD（wrapped/MIN/
-                    // 超限）时 actual ERR 即正确拒绝，不判差分失败。
-                    // expected 保持 DLL ABI 独立预期（对照不改），quality 预期另计。
-                    let quality_bad = matches!(actual, MesaValue::String(e) if
-                        e.contains("legacy wrapping changed value")
-                        || e.contains("load raw INT32_MIN rejected")
-                        || e.contains("outside physical range")
-                        || e.contains("outside F64 range"));
+                    // 独立 quality oracle（P1-2 remediation）：先由输入规则算出
+                    // 该点应 GOOD 还是 BAD，再与 actual 比较——不读被测输出文本。
+                    // scaled 回绕标记：legacy scaled 路径按 spec 系数独立复算。
+                    let addr = &addresses[index];
+                    let quality_expected_bad: Option<bool> = {
+                        use crate::address::FocasAddress;
+                        // 扩展地址（重复/越界）无 oracle 记录。
+                        let base = match addr {
+                            FocasAddress::ServoLoad { axis }
+                                if (1..=4).contains(axis) =>
+                            {
+                                Some(false)
+                            }
+                            FocasAddress::Spindle { spindle, kind }
+                                if matches!(kind, crate::address::SpindleKind::Load)
+                                    && (1..=4).contains(spindle) =>
+                            {
+                                Some(false)
+                            }
+                            _ => None,
+                        };
+                        match base {
+                            None => None,
+                            Some(_) => {
+                                // baseline 按地址族取（前 4 spindle / 次 4 servo）。
+                                let (bl_sp, bl_sv) = (
+                                    serde_json::json!({"candidates": spindle_rows}),
+                                    serde_json::json!({"candidates": servo_rows}),
+                                );
+                                // scaled 回绕：本生成器为新分支路径（type0/servo），
+                                // legacy scaled 不经过此函数 → 恒 false。
+                                quality_oracle(addr, &bl_sp, &bl_sv, false)
+                            }
+                        }
+                    };
                     let equal = match (actual, expected) {
-                        (MesaValue::F64(value), Some(number)) => (value - number).abs() <= number.abs() * 1e-14 + f64::from_bits(1),
+                        (MesaValue::F64(value), Some(number)) => {
+                            // parity 轨：F64 有限 + 容差相等；且 oracle 不得判 BAD
+                            //（27% 误报 BAD 文本即失败，不因输出 F64 而通过——
+                            // 此处 actual 已是 F64，若 oracle 判 BAD 则为误放行）。
+                            value.is_finite() && number.is_finite()
+                                && (value - number).abs()
+                                    <= number.abs() * 1e-14 + f64::from_bits(1)
+                                && quality_expected_bad != Some(true)
+                        }
                         (MesaValue::String(error), None) => error.starts_with("ERR:"),
-                        // quality 轨：ABI 有预期但生产门正确拒绝 → equal（拒绝即正确）。
-                        (MesaValue::String(_), Some(_)) if quality_bad => true,
+                        // quality 轨：oracle 独立判 BAD 且 actual 为 ERR 即正确拒绝。
+                        (MesaValue::String(error), Some(_))
+                            if quality_expected_bad == Some(true)
+                                && error.starts_with("ERR:") =>
+                        {
+                            true
+                        }
                         _ => false,
                     };
                     comparisons.push(json!({"batch":batch,"index":index,"address":addresses[index].source_label(),
                         "actual":actual,"expected_percent":expected,"equal":equal,
-                        "quality_rejected":quality_bad}));
+                        "quality_oracle_bad":quality_expected_bad}));
                 }
             }
             api.disconnect().await;
