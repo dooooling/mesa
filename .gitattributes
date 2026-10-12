@@ -1,0 +1,4 @@
+# 冻结证据按原始字节校验，禁止 Git 换行转换使 Windows/Linux 回放哈希不同。
+drivers/focas2/tests/fixtures/wire/dll_ready_synthetic/** -text
+drivers/focas2/tests/fixtures/wire/load_production_dll/** -text
+drivers/focas2/tests/fixtures/wire/load_production_dll_v2/** -text

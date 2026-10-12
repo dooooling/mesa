@@ -1,0 +1,609 @@
+{
+  "kind": "synthetic-derived",
+  "scope": "本机派生报文 → 实际 Native DLL / 既有 Wire 解码器",
+  "test_exe_sha256": "3b293bf14e396052931c8dd2c9dff79701df5af412c24b6a5dbd532ed0c7eb84",
+  "cases": [
+    {
+      "name": "single",
+      "spec": {
+        "load": [
+          [
+            270,
+            1
+          ]
+        ],
+        "speed": [
+          [
+            1500,
+            0
+          ]
+        ],
+        "servo": [
+          [
+            -270,
+            1
+          ],
+          [
+            560,
+            1
+          ],
+          [
+            -123,
+            2
+          ]
+        ]
+      },
+      "records": [
+        {
+          "tag": "type0",
+          "kind": "synthetic-derived",
+          "candidates": [
+            {
+              "slot": 0,
+              "data": 270,
+              "decimal": 1,
+              "unit": 0,
+              "name": [
+                83,
+                49,
+                0
+              ]
+            }
+          ],
+          "native_wire_expected_equal": true,
+          "num_out": 1,
+          "original_response_sha256": "d897fe00cc99d537bc0ae39b14624646061de0eb0ce50ccce5ed919bb1b82473",
+          "request_sha256": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+          "response_sha256": "55cf9b3228da7e46f806d7ae11806f3afe1fdd55fa99d19835a5fbff71311ff6"
+        },
+        {
+          "tag": "type1",
+          "kind": "synthetic-derived",
+          "candidates": [
+            {
+              "slot": 1,
+              "data": 1500,
+              "decimal": 0,
+              "unit": 1,
+              "name": [
+                83,
+                49,
+                0
+              ]
+            }
+          ],
+          "native_wire_expected_equal": true,
+          "num_out": 1,
+          "original_response_sha256": "1e101043e1618414d5a62376f7aac61629f2546e5bc0ae3833f25a0091a388ef",
+          "request_sha256": "507dfc200baad3b660af16c5ec14da7cd3310410a3cb35815a383285b3d3cf81",
+          "response_sha256": "15e07e2c8397bdf327a73c3eff2631aa5dbe99e6e4b1b4f5714c5598e792c74f"
+        },
+        {
+          "tag": "type_all",
+          "kind": "synthetic-derived",
+          "candidates": [
+            {
+              "slot": 0,
+              "data": 270,
+              "decimal": 1,
+              "unit": 0,
+              "name": [
+                83,
+                49,
+                0
+              ]
+            },
+            {
+              "slot": 1,
+              "data": 1500,
+              "decimal": 0,
+              "unit": 1,
+              "name": [
+                83,
+                49,
+                0
+              ]
+            }
+          ],
+          "native_wire_expected_equal": true,
+          "num_out": 1,
+          "original_response_sha256": "53419581b0e8bff21b208616ece0e8f1163cf9e4144a1bf3fa85b151f79e6505",
+          "request_sha256": "f0b0337d8ebafc1b88ea263941d1a84601defc39d2e266b53d813d6cf3b58995",
+          "response_sha256": "c92e801fce008d30562bd4b28449f74110363ee0a6a396ed029bd8916b5d73cb"
+        },
+        {
+          "tag": "servo",
+          "kind": "synthetic-derived",
+          "candidates": [
+            {
+              "slot": 0,
+              "data": 270,
+              "decimal": 1,
+              "unit": 0,
+              "name": [
+                88,
+                0,
+                68
+              ]
+            },
+            {
+              "slot": 1,
+              "data": 560,
+              "decimal": 1,
+              "unit": 0,
+              "name": [
+                89,
+                0,
+                68
+              ]
+            },
+            {
+              "slot": 2,
+              "data": 123,
+              "decimal": 2,
+              "unit": 0,
+              "name": [
+                90,
+                0,
+                68
+              ]
+            }
+          ],
+          "native_wire_expected_equal": true,
+          "num_out": 3,
+          "original_response_sha256": "ef723fc72a0284d819a714d16ec75b6b709d9410224f2e6e25bd4074437f0327",
+          "request_sha256": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+          "response_sha256": "0f6aa9ecf0376bac1a557db93380c09110e740c785cfee3382d90c419eda7402"
+        }
+      ],
+      "runtime_modules": [
+        {
+          "name": "FWLIB64.dll",
+          "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+        },
+        {
+          "name": "FWLIBE64.DLL",
+          "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+        }
+      ]
+    },
+    {
+      "name": "multi_signed",
+      "spec": {
+        "load": [
+          [
+            -125,
+            1
+          ],
+          [
+            875,
+            1
+          ]
+        ],
+        "speed": [
+          [
+            12345,
+            1
+          ],
+          [
+            6789,
+            1
+          ]
+        ],
+        "servo": [
+          [
+            7,
+            2
+          ],
+          [
+            -999,
+            1
+          ],
+          [
+            1001,
+            2
+          ]
+        ]
+      },
+      "records": [
+        {
+          "tag": "type0",
+          "kind": "synthetic-derived",
+          "candidates": [
+            {
+              "slot": 0,
+              "data": -125,
+              "decimal": 1,
+              "unit": 0,
+              "name": [
+                83,
+                49,
+                0
+              ]
+            },
+            {
+              "slot": 2,
+              "data": 875,
+              "decimal": 1,
+              "unit": 0,
+              "name": [
+                83,
+                50,
+                0
+              ]
+            }
+          ],
+          "native_wire_expected_equal": true,
+          "num_out": 2,
+          "original_response_sha256": "d897fe00cc99d537bc0ae39b14624646061de0eb0ce50ccce5ed919bb1b82473",
+          "request_sha256": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+          "response_sha256": "024e913b940a92600d1788a74af01f1d041f4d028211e1fd2af45b068bcc0994"
+        },
+        {
+          "tag": "type1",
+          "kind": "synthetic-derived",
+          "candidates": [
+            {
+              "slot": 1,
+              "data": 12345,
+              "decimal": 1,
+              "unit": 1,
+              "name": [
+                83,
+                49,
+                0
+              ]
+            },
+            {
+              "slot": 3,
+              "data": 6789,
+              "decimal": 1,
+              "unit": 1,
+              "name": [
+                83,
+                50,
+                0
+              ]
+            }
+          ],
+          "native_wire_expected_equal": true,
+          "num_out": 2,
+          "original_response_sha256": "1e101043e1618414d5a62376f7aac61629f2546e5bc0ae3833f25a0091a388ef",
+          "request_sha256": "507dfc200baad3b660af16c5ec14da7cd3310410a3cb35815a383285b3d3cf81",
+          "response_sha256": "a91cac3f38900480642cd6c2bb8ec95e386b0b52463f700c9f592a6575ff655e"
+        },
+        {
+          "tag": "type_all",
+          "kind": "synthetic-derived",
+          "candidates": [
+            {
+              "slot": 0,
+              "data": -125,
+              "decimal": 1,
+              "unit": 0,
+              "name": [
+                83,
+                49,
+                0
+              ]
+            },
+            {
+              "slot": 1,
+              "data": 12345,
+              "decimal": 1,
+              "unit": 1,
+              "name": [
+                83,
+                49,
+                0
+              ]
+            },
+            {
+              "slot": 2,
+              "data": 875,
+              "decimal": 1,
+              "unit": 0,
+              "name": [
+                83,
+                50,
+                0
+              ]
+            },
+            {
+              "slot": 3,
+              "data": 6789,
+              "decimal": 1,
+              "unit": 1,
+              "name": [
+                83,
+                50,
+                0
+              ]
+            }
+          ],
+          "native_wire_expected_equal": true,
+          "num_out": 2,
+          "original_response_sha256": "53419581b0e8bff21b208616ece0e8f1163cf9e4144a1bf3fa85b151f79e6505",
+          "request_sha256": "f0b0337d8ebafc1b88ea263941d1a84601defc39d2e266b53d813d6cf3b58995",
+          "response_sha256": "58473acb527419eac1b16128b44da18fa98c5b9c350c368a70a25b4d2a3a2184"
+        },
+        {
+          "tag": "servo",
+          "kind": "synthetic-derived",
+          "candidates": [
+            {
+              "slot": 0,
+              "data": 7,
+              "decimal": 2,
+              "unit": 0,
+              "name": [
+                88,
+                0,
+                68
+              ]
+            },
+            {
+              "slot": 1,
+              "data": 999,
+              "decimal": 1,
+              "unit": 0,
+              "name": [
+                89,
+                0,
+                68
+              ]
+            },
+            {
+              "slot": 2,
+              "data": 1001,
+              "decimal": 2,
+              "unit": 0,
+              "name": [
+                90,
+                0,
+                68
+              ]
+            }
+          ],
+          "native_wire_expected_equal": true,
+          "num_out": 3,
+          "original_response_sha256": "ef723fc72a0284d819a714d16ec75b6b709d9410224f2e6e25bd4074437f0327",
+          "request_sha256": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+          "response_sha256": "3e21a22a784439c401dcff8f14abffb424c31a268cd171b34ca12b111e657980"
+        }
+      ],
+      "runtime_modules": [
+        {
+          "name": "FWLIB64.dll",
+          "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+        },
+        {
+          "name": "FWLIBE64.DLL",
+          "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+        }
+      ]
+    },
+    {
+      "name": "integer_edges",
+      "spec": {
+        "load": [
+          [
+            -2147483648,
+            0
+          ],
+          [
+            2147483647,
+            0
+          ]
+        ],
+        "speed": [
+          [
+            -2147483648,
+            0
+          ],
+          [
+            2147483647,
+            0
+          ]
+        ],
+        "servo": [
+          [
+            -2147483648,
+            0
+          ],
+          [
+            2147483647,
+            0
+          ],
+          [
+            0,
+            0
+          ]
+        ]
+      },
+      "records": [
+        {
+          "tag": "type0",
+          "kind": "synthetic-derived",
+          "candidates": [
+            {
+              "slot": 0,
+              "data": -2147483648,
+              "decimal": 0,
+              "unit": 0,
+              "name": [
+                83,
+                49,
+                0
+              ]
+            },
+            {
+              "slot": 2,
+              "data": 2147483647,
+              "decimal": 0,
+              "unit": 0,
+              "name": [
+                83,
+                50,
+                0
+              ]
+            }
+          ],
+          "native_wire_expected_equal": true,
+          "num_out": 2,
+          "original_response_sha256": "d897fe00cc99d537bc0ae39b14624646061de0eb0ce50ccce5ed919bb1b82473",
+          "request_sha256": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+          "response_sha256": "db0418147d2c32da9dce1f85134fed3ae18f1f51069a0ad090345d8a010f3544"
+        },
+        {
+          "tag": "type1",
+          "kind": "synthetic-derived",
+          "candidates": [
+            {
+              "slot": 1,
+              "data": -2147483648,
+              "decimal": 0,
+              "unit": 1,
+              "name": [
+                83,
+                49,
+                0
+              ]
+            },
+            {
+              "slot": 3,
+              "data": 2147483647,
+              "decimal": 0,
+              "unit": 1,
+              "name": [
+                83,
+                50,
+                0
+              ]
+            }
+          ],
+          "native_wire_expected_equal": true,
+          "num_out": 2,
+          "original_response_sha256": "1e101043e1618414d5a62376f7aac61629f2546e5bc0ae3833f25a0091a388ef",
+          "request_sha256": "507dfc200baad3b660af16c5ec14da7cd3310410a3cb35815a383285b3d3cf81",
+          "response_sha256": "acae34153d95a0b2c8981bc21dbb22c078f7505f5d90b57eb5f9f19b0a25ef47"
+        },
+        {
+          "tag": "type_all",
+          "kind": "synthetic-derived",
+          "candidates": [
+            {
+              "slot": 0,
+              "data": -2147483648,
+              "decimal": 0,
+              "unit": 0,
+              "name": [
+                83,
+                49,
+                0
+              ]
+            },
+            {
+              "slot": 1,
+              "data": -2147483648,
+              "decimal": 0,
+              "unit": 1,
+              "name": [
+                83,
+                49,
+                0
+              ]
+            },
+            {
+              "slot": 2,
+              "data": 2147483647,
+              "decimal": 0,
+              "unit": 0,
+              "name": [
+                83,
+                50,
+                0
+              ]
+            },
+            {
+              "slot": 3,
+              "data": 2147483647,
+              "decimal": 0,
+              "unit": 1,
+              "name": [
+                83,
+                50,
+                0
+              ]
+            }
+          ],
+          "native_wire_expected_equal": true,
+          "num_out": 2,
+          "original_response_sha256": "53419581b0e8bff21b208616ece0e8f1163cf9e4144a1bf3fa85b151f79e6505",
+          "request_sha256": "f0b0337d8ebafc1b88ea263941d1a84601defc39d2e266b53d813d6cf3b58995",
+          "response_sha256": "2d95c40f19cc0cb06229fbb57433068b7d757f6240921f4cb502c0ab944942ea"
+        },
+        {
+          "tag": "servo",
+          "kind": "synthetic-derived",
+          "candidates": [
+            {
+              "slot": 0,
+              "data": -2147483648,
+              "decimal": 0,
+              "unit": 0,
+              "name": [
+                88,
+                0,
+                68
+              ]
+            },
+            {
+              "slot": 1,
+              "data": 2147483647,
+              "decimal": 0,
+              "unit": 0,
+              "name": [
+                89,
+                0,
+                68
+              ]
+            },
+            {
+              "slot": 2,
+              "data": 0,
+              "decimal": 0,
+              "unit": 0,
+              "name": [
+                90,
+                0,
+                68
+              ]
+            }
+          ],
+          "native_wire_expected_equal": true,
+          "num_out": 3,
+          "original_response_sha256": "ef723fc72a0284d819a714d16ec75b6b709d9410224f2e6e25bd4074437f0327",
+          "request_sha256": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+          "response_sha256": "b60b360b8855eb8e30968256cdc169a8eae8a69bca166f40a5bc68074a76d8d9"
+        }
+      ],
+      "runtime_modules": [
+        {
+          "name": "FWLIB64.dll",
+          "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+        },
+        {
+          "name": "FWLIBE64.DLL",
+          "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+        }
+      ]
+    }
+  ],
+  "production_gate_changed": false,
+  "limits": [
+    "不证明真实设备能生成非零负载",
+    "不覆盖传统分支和状态 4 回退",
+    "不验证完整 FOCAS 协议"
+  ]
+}

@@ -110,81 +110,53 @@ const FOCAS_AXIS_BATCH: c_short = 8;
 // FOCAS 返回码（与 fwlib.cs focas_ret 一致）
 // ---------------------------------------------------------------------------
 
-#[repr(i16)]
+/// 保留 DLL 的完整 short 返回码；未知值不能被折叠成 EW_SYSTEM。
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FocasRet {
-    Ok = 0,
-    Busy = -1,
-    Reset = -2,
-    Mmcsys = -3,
-    Parity = -4,
-    System = -5,
-    Unexp = -6,
-    Version = -7,
-    Handle = -8,
-    Hssb = -9,
-    System2 = -10,
-    Bus = -11,
-    Nodll = -15,
-    Socket = -16,
-    Protocol = -17,
-    Func = 1,
-    Length = 2,
-    Number = 3,
-    Attrib = 4,
-    Data = 5,
-    Noopt = 6,
-    Prot = 7,
-    Overflow = 8,
-    Param = 9,
-    Buffer = 10,
-    Path = 11,
-    Mode = 12,
-    Reject = 13,
-    Dtsvr = 14,
-    Alarm = 15,
-    Stop = 16,
-    // TODO: B-64304EN 全量封装预留，Passwd(17) 为鉴权类返回码，V1 未触发但需保留以完整映射 fwlib.cs
-    #[allow(dead_code)]
-    Passwd = 17,
-}
+pub struct FocasRet(c_short);
 
+// 沿用旧名称以保留调用处的错误分支；数值以 fwlib.cs focas_ret 为准。
+#[allow(non_upper_case_globals, dead_code)]
 impl FocasRet {
+    pub const Ok: Self = Self(0);
+    pub const Busy: Self = Self(-1);
+    pub const Reset: Self = Self(-2);
+    pub const Mmcsys: Self = Self(-3);
+    pub const Parity: Self = Self(-4);
+    pub const System: Self = Self(-5);
+    pub const Unexp: Self = Self(-6);
+    pub const Version: Self = Self(-7);
+    pub const Handle: Self = Self(-8);
+    pub const Hssb: Self = Self(-9);
+    pub const System2: Self = Self(-10);
+    pub const Bus: Self = Self(-11);
+    pub const Nodll: Self = Self(-15);
+    pub const Socket: Self = Self(-16);
+    pub const Protocol: Self = Self(-17);
+    pub const Func: Self = Self(1);
+    pub const Length: Self = Self(2);
+    pub const Number: Self = Self(3);
+    pub const Attrib: Self = Self(4);
+    pub const Data: Self = Self(5);
+    pub const Noopt: Self = Self(6);
+    pub const Prot: Self = Self(7);
+    pub const Overflow: Self = Self(8);
+    pub const Param: Self = Self(9);
+    pub const Buffer: Self = Self(10);
+    pub const Path: Self = Self(11);
+    pub const Mode: Self = Self(12);
+    pub const Reject: Self = Self(13);
+    pub const Dtsvr: Self = Self(14);
+    pub const Alarm: Self = Self(15);
+    pub const Stop: Self = Self(16);
+    pub const Passwd: Self = Self(17);
+
     pub fn from_raw(v: c_short) -> Self {
-        match v {
-            0 => Self::Ok,
-            -1 => Self::Busy,
-            -2 => Self::Reset,
-            -3 => Self::Mmcsys,
-            -4 => Self::Parity,
-            -5 => Self::System,
-            -6 => Self::Unexp,
-            -7 => Self::Version,
-            -8 => Self::Handle,
-            -9 => Self::Hssb,
-            -10 => Self::System2,
-            -11 => Self::Bus,
-            -15 => Self::Nodll,
-            -16 => Self::Socket,
-            -17 => Self::Protocol,
-            1 => Self::Func,
-            2 => Self::Length,
-            3 => Self::Number,
-            4 => Self::Attrib,
-            5 => Self::Data,
-            6 => Self::Noopt,
-            7 => Self::Prot,
-            8 => Self::Overflow,
-            9 => Self::Param,
-            10 => Self::Buffer,
-            11 => Self::Path,
-            12 => Self::Mode,
-            13 => Self::Reject,
-            14 => Self::Dtsvr,
-            15 => Self::Alarm,
-            16 => Self::Stop,
-            _ => Self::System,
-        }
+        Self(v)
+    }
+
+    pub fn code(self) -> c_short {
+        self.0
     }
 
     pub fn is_ok(self) -> bool {
@@ -207,6 +179,28 @@ impl FocasRet {
             Self::Noopt => "EW_NOOPT",
             Self::Overflow => "EW_OVRFLOW",
             Self::Param => "EW_PARAM",
+            Self::Passwd => "EW_PASSWD",
+            Self::Mmcsys => "EW_MMCSYS",
+            Self::Parity => "EW_PARITY",
+            Self::System => "EW_SYSTEM",
+            Self::Unexp => "EW_UNEXP",
+            Self::Version => "EW_VERSION",
+            Self::Hssb => "EW_HSSB",
+            Self::System2 => "EW_SYSTEM2",
+            Self::Bus => "EW_BUS",
+            Self::Func => "EW_FUNC",
+            Self::Length => "EW_LENGTH",
+            Self::Number => "EW_NUMBER",
+            Self::Attrib => "EW_ATTRIB",
+            Self::Data => "EW_DATA",
+            Self::Prot => "EW_PROT",
+            Self::Buffer => "EW_BUFFER",
+            Self::Path => "EW_PATH",
+            Self::Mode => "EW_MODE",
+            Self::Reject => "EW_REJECT",
+            Self::Dtsvr => "EW_DTSRVR",
+            Self::Alarm => "EW_ALARM",
+            Self::Stop => "EW_STOP",
             _ => "EW_UNKNOWN",
         }
     }
@@ -351,20 +345,6 @@ pub struct Odbm {
     pub dec_val: c_short, // 小数位 `value = mcr_val * 10^-dec_val`
 }
 
-/// `cnc_rdalmmsg` 返回：报警 `ODBALMMSG`（`fwlib.cs:3420` stateful，需 `cnc_rdalmmsg2` 循环至 `EW_DATA`）
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct OdbAlmMsg {
-    pub dummy: [u8; 64], // 占位：真机按 `alarm_type` 循环取 `msg_len`
-}
-
-/// `cnc_diagnoss` 诊断 `ODBDIAG`（`fwlib.cs:4520`，`diagnosis` 用）
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct OdbDiag {
-    pub dummy: c_int, // 诊断值
-}
-
 /// `cnc_rdprgnum` 程序号 `ODBPRGNUM`（`fwlib.cs:2100`）
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -430,11 +410,34 @@ pub struct OdbSpLoad {
     pub spspeed: LoadElem, // motor speed
 }
 
-/// `cnc_rdopmsg` 操作信息 `OPMSG`（`fwlib.cs:3300`）
+/// `cnc_rdopmsg3` 单条消息 ABI：三个 short 元数据后紧接 256B 文本。
+/// fwlibe64 RVA 0x6964C 按 262B 步进；网络的三个 BE32 字段不能直接当文本。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct OpMsg {
-    pub dummy: [u8; 64],
+    pub datano: c_short,
+    pub msg_type: c_short,
+    pub char_num: c_short,
+    pub text: [u8; 256],
+}
+
+impl OpMsg {
+    /// 与 Wire 单消息语义一致：首 NUL 截断，再进行有损 UTF-8 转换和空白裁剪。
+    pub fn value_text(&self) -> String {
+        let end = self
+            .text
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.text.len());
+        let value = String::from_utf8_lossy(&self.text[..end])
+            .trim()
+            .to_string();
+        if value.is_empty() {
+            "OP:empty".into()
+        } else {
+            value
+        }
+    }
 }
 
 /// `pmc_rdpmcrng` 返回：`IODBPMC0` 位/字节，`fwlib.cs:7132` `collectors/Pmc.cs: bit/byte`
@@ -655,14 +658,16 @@ type FnCncActs = unsafe extern "C" fn(c_ushort, *mut OdbActs) -> c_short;
 #[allow(dead_code)]
 type FnCncActs2 = unsafe extern "C" fn(c_ushort, c_short, *mut OdbActs) -> c_short;
 // 全读扩展：报警/诊断/程序/主轴/伺服/操作信息（V1 仅 8 组时以占位转 Bad，Gate 闭环后逐个打通）
-type FnRdAlmMsg = unsafe extern "C" fn(c_ushort, c_short, *mut c_short, *mut OdbAlmMsg) -> c_short;
-type FnDiagnoss = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OdbDiag) -> c_short;
+// 仅保留原始符号；容量依 num/axis/数据类型变化，不提供未经验证的 safe 包装。
+type FnRdAlmMsg = unsafe extern "C" fn(c_ushort, c_short, *mut c_short, *mut u8) -> c_short;
+// fwlib.cs:9367 明确包含 length；旧四参声明会把输出地址当作 length。
+type FnDiagnoss = unsafe extern "C" fn(c_ushort, c_short, c_short, c_short, *mut u8) -> c_short;
 type FnRdPrgNum = unsafe extern "C" fn(c_ushort, *mut OdbPrgNum) -> c_short;
 type FnRdSpMeter = unsafe extern "C" fn(c_ushort, c_short, *mut c_short, *mut OdbSpLoad) -> c_short;
 type FnRdSvMeter = unsafe extern "C" fn(c_ushort, *mut c_short, *mut OdbSvLoad) -> c_short;
-type FnRdOpMsg = unsafe extern "C" fn(c_ushort, c_short, c_short, *mut OpMsg) -> c_short;
-type FnRdSpGear = unsafe extern "C" fn(c_ushort, c_ushort, *mut c_short) -> c_short;
-type FnRdSpMaxRpm = unsafe extern "C" fn(c_ushort, c_ushort, *mut c_short) -> c_short;
+type FnRdOpMsg3 = unsafe extern "C" fn(c_ushort, c_short, *mut c_short, *mut OpMsg) -> c_short;
+type FnRdSpGear = unsafe extern "C" fn(c_ushort, c_short, *mut u8) -> c_short;
+type FnRdSpMaxRpm = unsafe extern "C" fn(c_ushort, c_short, *mut u8) -> c_short;
 /// N02（复测修正）：`cnc_rdtofs(hdl, number, type, length=8, out)` 5 参
 /// （本批 FWLIB64 + fwlibe64 均为 `handle,number,type,length,output`；
 /// 不是范围接口 `cnc_rdtofsr`，没有 `e_no`。复测前 6 参把整数 8 当指针，
@@ -711,7 +716,7 @@ pub struct NativeLib {
     pub cnc_rdprgnum: Option<Symbol<'static, FnRdPrgNum>>,
     pub cnc_rdspmeter: Option<Symbol<'static, FnRdSpMeter>>,
     pub cnc_rdsvmeter: Option<Symbol<'static, FnRdSvMeter>>,
-    pub cnc_rdopmsg: Option<Symbol<'static, FnRdOpMsg>>,
+    pub cnc_rdopmsg3: Option<Symbol<'static, FnRdOpMsg3>>,
     pub cnc_rdspgear: Option<Symbol<'static, FnRdSpGear>>,
     pub cnc_rdspmaxrpm: Option<Symbol<'static, FnRdSpMaxRpm>>,
     pub cnc_rdtofs: Option<Symbol<'static, FnRdTofs>>,
@@ -986,7 +991,7 @@ impl NativeLib {
             cnc_rdprgnum: None,
             cnc_rdspmeter: None,
             cnc_rdsvmeter: None,
-            cnc_rdopmsg: None,
+            cnc_rdopmsg3: None,
             cnc_rdspgear: None,
             cnc_rdspmaxrpm: None,
             cnc_rdtofs: None,
@@ -1062,8 +1067,8 @@ impl NativeLib {
                 .get::<FnRdSvMeter>(b"cnc_rdsvmeter")
                 .ok()
                 .map(|s| std::mem::transmute(s));
-            me.cnc_rdopmsg = (*raw)
-                .get::<FnRdOpMsg>(b"cnc_rdopmsg")
+            me.cnc_rdopmsg3 = (*raw)
+                .get::<FnRdOpMsg3>(b"cnc_rdopmsg3")
                 .ok()
                 .map(|s| std::mem::transmute(s));
             me.cnc_rdspgear = (*raw)
@@ -1582,51 +1587,6 @@ impl NativeLib {
         }
     }
 
-    /// 读报警：PR52 已暂停（`OdbAlmMsg` 64B / 多条 44B 结构未闭合）。
-    /// 保留符号加载（`from_library` 不动），但 worker 内不再调用；
-    /// 恢复条件见 `focas_api.rs read_one_on_worker`。旧实现见 git 历史。
-    #[allow(dead_code)]
-    pub fn cnc_rdalmmsg(&self, hdl: u16, num: &mut c_short) -> Result<Vec<String>, FocasRet> {
-        let sym = self.cnc_rdalmmsg.as_ref().ok_or(FocasRet::Noopt)?;
-        let mut out = OdbAlmMsg { dummy: [0; 64] };
-        let rc = unsafe {
-            sym(
-                hdl as c_ushort,
-                -1 as c_short,
-                num as *mut c_short,
-                &mut out as *mut OdbAlmMsg,
-            )
-        };
-        let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() {
-            // 占位解析：真机需按 `msg_len` 解 `alm_msg`，此处仅证明链路可达
-            Ok(vec![format!("alarm:{}", num)])
-        } else {
-            Err(ret)
-        }
-    }
-
-    /// 读诊断：PR52 已暂停（真实签名疑 5 参含 length，当前 4 参未闭合）。
-    /// 保留符号加载，但 worker 内不再调用；旧实现见 git 历史。
-    #[allow(dead_code)]
-    pub fn cnc_diagnoss(&self, hdl: u16, num: i32) -> Result<c_int, FocasRet> {
-        // `i32` 入参先收紧到 `c_short` 可表示范围（resolver/Descriptor 对
-        // diagnosis.number 已同上限收紧，此处防直接调用越界）。
-        let num_s = c_short::try_from(num).map_err(|_| FocasRet::Param)?;
-        let sym = self.cnc_diagnoss.as_ref().ok_or(FocasRet::Noopt)?;
-        let mut out = OdbDiag { dummy: 0 };
-        let rc = unsafe {
-            sym(
-                hdl as c_ushort,
-                num_s,
-                1 as c_short,
-                &mut out as *mut OdbDiag,
-            )
-        };
-        let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() { Ok(out.dummy) } else { Err(ret) }
-    }
-
     /// 读程序号：`cnc_rdprgnum(hdl, ODBPRGNUM)` 主/运行程序
     pub fn cnc_rdprgnum(&self, hdl: u16) -> Result<OdbPrgNum, FocasRet> {
         let sym = self.cnc_rdprgnum.as_ref().ok_or(FocasRet::Noopt)?;
@@ -1646,63 +1606,32 @@ impl NativeLib {
     // evidence harness 直接调用 raw `Symbol` + guarded 4096B buffer。
     // 符号加载（`NativeLib.cnc_rdspmeter/rdsvmeter`）保留供 harness 旁路解析.
 
-    /// 读操作信息：`cnc_rdopmsg(hdl, 0, 64, OPMSG)` 64 字节操作提示
+    /// 读产品声明的 #3006 消息（type=4），容量为一条完整 OPMSG3。
+    /// 旧 rdopmsg 的 length 参数与消息类型依机型变化，不能作为统一的 64B API。
+    /// 不回退到旧接口；DLL 缺少 rdopmsg3 时明确返回 Noopt。
     pub fn cnc_rdopmsg(&self, hdl: u16) -> Result<OpMsg, FocasRet> {
-        let sym = self.cnc_rdopmsg.as_ref().ok_or(FocasRet::Noopt)?;
-        let mut out = OpMsg { dummy: [0; 64] };
-        let rc = unsafe {
-            sym(
-                hdl as c_ushort,
-                0 as c_short,
-                64 as c_short,
-                &mut out as *mut OpMsg,
-            )
+        let sym = self.cnc_rdopmsg3.as_ref().ok_or(FocasRet::Noopt)?;
+        let mut out = OpMsg {
+            datano: 0,
+            msg_type: 0,
+            char_num: 0,
+            text: [0; 256],
         };
+        let mut count: c_short = 1;
+        let rc = unsafe { sym(hdl, 4, &mut count, &mut out) };
         let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() { Ok(out) } else { Err(ret) }
+        if !ret.is_ok() {
+            return Err(ret);
+        }
+        if !(0..=1).contains(&count) {
+            return Err(FocasRet::Data);
+        }
+        Ok(out)
     }
 
-    /// 读主轴齿轮比：PR52 已暂停（输出疑为 `+4` 结构，单 `c_short`
-    /// 未闭合）。保留符号加载，但 worker 内不再调用；旧实现见 git 历史。
-    #[allow(dead_code)]
-    pub fn cnc_rdspgear(&self, hdl: u16, spindle: u8) -> Result<i16, FocasRet> {
-        let sym = self.cnc_rdspgear.as_ref().ok_or(FocasRet::Noopt)?;
-        let mut gear: c_short = 0;
-        let rc = unsafe {
-            sym(
-                hdl as c_ushort,
-                spindle as c_ushort,
-                &mut gear as *mut c_short,
-            )
-        };
-        let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() {
-            Ok(gear as i16)
-        } else {
-            Err(ret)
-        }
-    }
-
-    /// 读主轴最大转速：PR52 已暂停（同 gear，输出结构未闭合）。
-    /// 保留符号加载，但 worker 内不再调用；旧实现见 git 历史。
-    #[allow(dead_code)]
-    pub fn cnc_rdspmaxrpm(&self, hdl: u16, spindle: u8) -> Result<i16, FocasRet> {
-        let sym = self.cnc_rdspmaxrpm.as_ref().ok_or(FocasRet::Noopt)?;
-        let mut rpm: c_short = 0;
-        let rc = unsafe {
-            sym(
-                hdl as c_ushort,
-                spindle as c_ushort,
-                &mut rpm as *mut c_short,
-            )
-        };
-        let ret = FocasRet::from_raw(rc);
-        if ret.is_ok() {
-            Ok(rpm as i16)
-        } else {
-            Err(ret)
-        }
-    }
+    // 报警、诊断、齿轮比、最高转速的旧 safe helper 已移除：签名或输出容量
+    // 不满足 DLL ABI，不能仅依赖 worker 的 pre_ffi_gate 避免越界。
+    // 原始 unsafe 符号仍可用于有 guard 的证据采集；生产 Native 门禁保持关闭。
 
     /// 读刀补单点：`cnc_rdtofs(hdl, number, type, length=8, ODBTOFS*)` 5 参，
     /// `fwlib.cs:8624`（证据见 `drivers/focas2/docs/n01-n02-abi-evidence.md` §2：
@@ -2236,11 +2165,42 @@ unsafe impl Sync for NativeLib {}
 /// `#[cfg(test)]` 门内挂载——生产编译零影响；live harness 自带 `#[ignore]`。
 #[cfg(test)]
 #[path = "native/load_evidence.rs"]
-mod load_evidence;
+pub(crate) mod load_evidence;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 全 short 空间可无损往返，避免新增/未知设备错误被误判成系统错误。
+    #[test]
+    fn return_codes_preserve_full_short_domain() {
+        for code in i16::MIN..=i16::MAX {
+            let ret = FocasRet::from_raw(code);
+            assert_eq!(ret.code(), code);
+            assert_eq!(ret.is_ok(), code == 0);
+        }
+        assert_ne!(FocasRet::from_raw(12345), FocasRet::System);
+        assert_eq!(FocasRet::from_raw(12345).message(), "EW_UNKNOWN");
+    }
+
+    #[test]
+    fn opmsg_abi_and_text_boundaries() {
+        assert_eq!(std::mem::size_of::<OpMsg>(), 262);
+        assert_eq!(std::mem::offset_of!(OpMsg, text), 6);
+        let mut msg = OpMsg {
+            datano: 3006,
+            msg_type: 4,
+            char_num: 256,
+            text: [b'A'; 256],
+        };
+        assert_eq!(msg.value_text(), "A".repeat(256));
+        msg.text[..8].copy_from_slice(b" hi\0tail");
+        assert_eq!(msg.value_text(), "hi");
+        msg.text[0] = 0;
+        assert_eq!(msg.value_text(), "OP:empty");
+        assert_eq!(FocasRet::from_raw(17), FocasRet::Passwd);
+        assert_eq!(FocasRet::from_raw(17).message(), "EW_PASSWD");
+    }
 
     /// N01 回归（B1：生产 `probe_param_scalar` 状态机 + 假 `call` 闭包，
     /// 不伪造 `NativeLib`，不复刻生产逻辑）。
@@ -2272,7 +2232,7 @@ mod tests {
                     _ => 8,
                 };
                 if (len as i32) < need {
-                    return FocasRet::Length as c_short;
+                    return FocasRet::Length.code();
                 }
                 out.datano = if fake.wrong_datano {
                     num_s.wrapping_add(1)
@@ -2288,7 +2248,7 @@ mod tests {
                     _ => v,
                 };
                 out.cdata = masked as c_int;
-                FocasRet::Ok as c_short
+                FocasRet::Ok.code()
             })
         }
         // BYTE：仅 len=5 成功，0xFF→-1。
@@ -2538,7 +2498,7 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!(
                     "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
-                    e as i16,
+                    e.code(),
                     e.message()
                 )
             });
@@ -2546,7 +2506,7 @@ mod tests {
             Ok(v) => v,
             Err(e) => {
                 let _ = lib.cnc_freelibhndl(hdl);
-                panic!("cnc_sysinfo 失败：{} {}", e as i16, e.message());
+                panic!("cnc_sysinfo 失败：{} {}", e.code(), e.message());
             }
         };
         let _ = lib.cnc_freelibhndl(hdl);
@@ -2597,7 +2557,7 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!(
                     "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
-                    e as i16,
+                    e.code(),
                     e.message()
                 )
             });
@@ -2605,7 +2565,7 @@ mod tests {
             Ok(v) => v,
             Err(e) => {
                 let _ = lib.cnc_freelibhndl(hdl);
-                panic!("cnc_statinfo 失败：{} {}", e as i16, e.message());
+                panic!("cnc_statinfo 失败：{} {}", e.code(), e.message());
             }
         };
         let _ = lib.cnc_freelibhndl(hdl);
@@ -2660,7 +2620,7 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!(
                     "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
-                    e as i16,
+                    e.code(),
                     e.message()
                 )
             });
@@ -2668,7 +2628,7 @@ mod tests {
             Ok(v) => v,
             Err(e) => {
                 let _ = lib.cnc_freelibhndl(hdl);
-                panic!("cnc_rddynamic2 失败：{} {}", e as i16, e.message());
+                panic!("cnc_rddynamic2 失败：{} {}", e.code(), e.message());
             }
         };
         let _ = lib.cnc_freelibhndl(hdl);
@@ -2725,7 +2685,7 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!(
                     "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
-                    e as i16,
+                    e.code(),
                     e.message()
                 )
             });
@@ -2745,7 +2705,7 @@ mod tests {
             (_, Err(e)) => (
                 false,
                 None,
-                Some(format!("{} {}", e as i16, e.message())),
+                Some(format!("{} {}", e.code(), e.message())),
                 None,
             ),
             // `cnc_absolute_raw` 成功则 `single_axis_value` 必成功（纯内存），
@@ -2797,14 +2757,14 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!(
                     "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
-                    e as i16,
+                    e.code(),
                     e.message()
                 )
             });
         // 单次 FFI：rc + OdbActs full（无时间差；S1~S4 稳定平台值采样）。
         let (rc, full): (i16, Option<OdbActs>) = match lib.cnc_acts(hdl) {
             Ok(v) => (0, Some(v)),
-            Err(e) => (e as i16, None),
+            Err(e) => (e.code(), None),
         };
         let _ = lib.cnc_freelibhndl(hdl);
         // 产品合同（待证据闭合）：成功即 data → I32（不断言是 RPM 还是
@@ -2847,7 +2807,7 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!(
                     "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
-                    e as i16,
+                    e.code(),
                     e.message()
                 )
             });
@@ -2855,7 +2815,7 @@ mod tests {
         // 此处同时记录 raw mcr/dec 供 Wire parity 用，无时间差）。
         let (rc, full): (i16, Option<Odbm>) = match lib.cnc_rdmacro_raw(hdl, number) {
             Ok(v) => (0, Some(v)),
-            Err(e) => (e as i16, None),
+            Err(e) => (e.code(), None),
         };
         let _ = lib.cnc_freelibhndl(hdl);
         let scaled = full.as_ref().map(|v| {
@@ -2917,7 +2877,7 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!(
                     "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
-                    e as i16,
+                    e.code(),
                     e.message()
                 )
             });
@@ -2929,7 +2889,7 @@ mod tests {
         let doc = if let Some(b) = bit {
             let (rc, raw): (i16, Option<u8>) = match lib.pmc_rdpmcrng_byte(hdl, adr_type, addr) {
                 Ok(v) => (0, Some(v)),
-                Err(e) => (e as i16, None),
+                Err(e) => (e.code(), None),
             };
             let _ = lib.cnc_freelibhndl(hdl);
             serde_json::json!({
@@ -2954,7 +2914,7 @@ mod tests {
             let (rc, raw): (i16, Option<c_int>) = match lib.pmc_rdpmcrng_dword(hdl, adr_type, addr)
             {
                 Ok(v) => (0, Some(v)),
-                Err(e) => (e as i16, None),
+                Err(e) => (e.code(), None),
             };
             let _ = lib.cnc_freelibhndl(hdl);
             serde_json::json!({
@@ -2978,7 +2938,7 @@ mod tests {
             let (rc, raw): (i16, Option<c_short>) = match lib.pmc_rdpmcrng_word(hdl, adr_type, addr)
             {
                 Ok(v) => (0, Some(v)),
-                Err(e) => (e as i16, None),
+                Err(e) => (e.code(), None),
             };
             let _ = lib.cnc_freelibhndl(hdl);
             serde_json::json!({
@@ -3001,7 +2961,7 @@ mod tests {
         } else {
             let (rc, raw): (i16, Option<u8>) = match lib.pmc_rdpmcrng_byte(hdl, adr_type, addr) {
                 Ok(v) => (0, Some(v)),
-                Err(e) => (e as i16, None),
+                Err(e) => (e.code(), None),
             };
             let _ = lib.cnc_freelibhndl(hdl);
             serde_json::json!({
@@ -3056,7 +3016,7 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!(
                     "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
-                    e as i16,
+                    e.code(),
                     e.message()
                 )
             });
@@ -3064,7 +3024,7 @@ mod tests {
         // 避免证据与生产分叉；raw 细节由 Wire bytes 侧闭合）。
         let (rc, decoded): (i16, Option<i32>) = match lib.cnc_rdparam(hdl, number) {
             Ok(v) => (0, Some(v)),
-            Err(e) => (e as i16, None),
+            Err(e) => (e.code(), None),
         };
         let _ = lib.cnc_freelibhndl(hdl);
         let doc = serde_json::json!({
@@ -3103,14 +3063,14 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!(
                     "cnc_allclibhndl3 失败（{host}:{port}）：{} {}",
-                    e as i16,
+                    e.code(),
                     e.message()
                 )
             });
         // 生产同源调用（5 参修正后直接路径；不拆解，不碰回退语义）。
         let (rc, decoded): (i16, Option<f64>) = match lib.cnc_rdtofs(hdl, number) {
             Ok(v) => (0, Some(v)),
-            Err(e) => (e as i16, None),
+            Err(e) => (e.code(), None),
         };
         let _ = lib.cnc_freelibhndl(hdl);
         let doc = serde_json::json!({

@@ -10,6 +10,10 @@
 
 use std::fmt;
 
+#[cfg(all(test, windows))]
+mod dll_parity;
+#[cfg(test)]
+mod dll_replay;
 /// fixture 回归（`#[cfg(test)]`：crate 内部直测生产 codec，不出 crate）。
 /// `pub(crate)` 的 items 仅测试构建可见：`pub(crate) use` 重导出在非测试
 /// 构建下未使用是预期的（fixture 回归与 loopback/单测同属测试面）。
@@ -17,6 +21,14 @@ use std::fmt;
 pub(crate) mod fixture_tests;
 /// frame 编解码（见 `frame.rs`）。
 pub(crate) mod frame;
+mod load;
+#[cfg(test)]
+mod load_replay;
+/// DLL 请求复核与只读采集只在测试构建中存在，不能绕过生产负载门禁。
+#[cfg(test)]
+pub(crate) mod load_research;
+#[cfg(all(test, windows))]
+mod opmsg_parity;
 /// TCP 会话（见 `session.rs`）。
 pub(crate) mod session;
 /// client + typed ops + adapter（见 `wire.rs`；与本模块同名是历史命名，

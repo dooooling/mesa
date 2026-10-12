@@ -1,0 +1,50 @@
+[
+  {
+    "equal": true,
+    "native": {
+      "count": 1,
+      "guards_ok": true,
+      "rc": 0,
+      "tag": "gear",
+      "value": 672
+    },
+    "tag": "gear",
+    "wire": 672
+  },
+  {
+    "equal": true,
+    "native": {
+      "count": 1,
+      "guards_ok": true,
+      "rc": 0,
+      "tag": "maxrpm",
+      "value": 0
+    },
+    "tag": "maxrpm",
+    "wire": 0
+  },
+  {
+    "equal": true,
+    "native": {
+      "count": 1,
+      "guards_ok": true,
+      "rc": 0,
+      "tag": "diagnosis",
+      "value": -1.0
+    },
+    "tag": "diagnosis",
+    "wire": -1.0
+  },
+  {
+    "equal": true,
+    "native": {
+      "count": 0,
+      "guards_ok": true,
+      "rc": 0,
+      "tag": "alarm",
+      "value": []
+    },
+    "tag": "alarm",
+    "wire": []
+  }
+]

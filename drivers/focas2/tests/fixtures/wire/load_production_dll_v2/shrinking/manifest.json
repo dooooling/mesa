@@ -1,0 +1,79 @@
+{
+  "kind": "synthetic-derived",
+  "name": "shrinking",
+  "spec": {
+    "spindle": [
+      [
+        270,
+        1
+      ],
+      [
+        123,
+        1
+      ]
+    ],
+    "servo": [
+      [
+        -270,
+        1
+      ],
+      [
+        123,
+        1
+      ]
+    ],
+    "before": 2,
+    "after": 1
+  },
+  "rows": 24,
+  "all_equal": true,
+  "loaded_modules": [
+    {
+      "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+      "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+    },
+    {
+      "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+      "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+    }
+  ],
+  "files": {
+    "server.json": "e6aa6b410eb4ae8131e513fd5f00722b75f63c5b6d99daffb238bf2301f653ce",
+    "test.log": "345ba2708902116f25eea1685c0f0b26465a30eafd39436e36d7a0e032d9f9b4",
+    "samples/modules-servo.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+    "samples/modules-type0-repeat.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+    "samples/modules-type0.json": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9",
+    "samples/native-servo.json": "fa0e8166b5d97a2c3248e5cea1a99b12b766c20fd06e2ab59737cb07d1934fa6",
+    "samples/native-type0-repeat.json": "14397995580c80f78617851c9a5f75ab5182e068349bf0042420a2c17c52cd7d",
+    "samples/native-type0.json": "b11ec7aa817f384c27eddf7551459ed253fde12690c5b97a14f9f636b904c235",
+    "samples/production-comparison.json": "230ab4f7e7ad73c5351c06cd257cd525502764432bf1c36b63b1dbc53523265c",
+    "traffic/00.request.bin": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff",
+    "traffic/00.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+    "traffic/01.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+    "traffic/01.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+    "traffic/02.request.bin": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+    "traffic/02.response.bin": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474",
+    "traffic/03.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+    "traffic/03.response.bin": "8ca1adb4db5db14c3d66d7e04f3ad4429676e584f3a6db8c4496e07454b5d2f4",
+    "traffic/04.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+    "traffic/04.response.bin": "8ca1adb4db5db14c3d66d7e04f3ad4429676e584f3a6db8c4496e07454b5d2f4",
+    "traffic/05.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+    "traffic/05.response.bin": "517ff59f47e0a3da374f2527a3c8d5ee61b4b9598fb9f0fbece6c46fd532328d",
+    "traffic/06.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+    "traffic/06.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+    "traffic/07.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+    "traffic/07.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+    "traffic/08.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+    "traffic/08.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+    "traffic/09.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+    "traffic/09.response.bin": "8ca1adb4db5db14c3d66d7e04f3ad4429676e584f3a6db8c4496e07454b5d2f4",
+    "traffic/10.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+    "traffic/10.response.bin": "517ff59f47e0a3da374f2527a3c8d5ee61b4b9598fb9f0fbece6c46fd532328d",
+    "traffic/11.request.bin": "f7fd6b4a02d81d23da945610613d23224cb91f7a6b07cee8707fa55a74f5d6f3",
+    "traffic/11.response.bin": "8ca1adb4db5db14c3d66d7e04f3ad4429676e584f3a6db8c4496e07454b5d2f4",
+    "traffic/12.request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+    "traffic/12.response.bin": "517ff59f47e0a3da374f2527a3c8d5ee61b4b9598fb9f0fbece6c46fd532328d",
+    "traffic/13.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+    "traffic/13.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+  }
+}

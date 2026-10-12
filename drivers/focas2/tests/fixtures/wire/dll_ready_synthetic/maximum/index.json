@@ -1,0 +1,587 @@
+{
+  "kind": "synthetic-derived",
+  "profile": "maximum",
+  "ready_categories": 15,
+  "cases": 18,
+  "all_equal": true,
+  "hardware_acceptance": false,
+  "loaded_modules": [
+    {
+      "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+      "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+    },
+    {
+      "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+      "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+    }
+  ],
+  "replay": [
+    {
+      "tag": "open2",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "25.request.bin",
+      "response": "25.response.bin",
+      "request_sha256": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+      "response_sha256": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b"
+    },
+    {
+      "tag": "sysinfo",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "26.request.bin",
+      "response": "26.response.bin",
+      "request_sha256": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+      "response_sha256": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "27.request.bin",
+      "response": "27.response.bin",
+      "request_sha256": "1a30276c5ff9ec512732bae332a063b340f8489225bb10634ffd20fc13c2089d",
+      "response_sha256": "35ae58eea1ca6f3a015d650af9b96f293aa277763a04d3b0d3046ae4d70b9960"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "28.request.bin",
+      "response": "28.response.bin",
+      "request_sha256": "b5eb3b650125d374fce25fb1bb3fd6b21d94b6862109775dd53ea422600df213",
+      "response_sha256": "628946aad12a5341c2beb18e1eb36943bf642fd90f57744b48641a9c6dce80a7"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "29.request.bin",
+      "response": "29.response.bin",
+      "request_sha256": "505877ebd5be7b276fab849a71f42bb0411043aa922a8f6791af886d635ff003",
+      "response_sha256": "1c39798ddc570152dac01712e453d802fd1ce957121db9cffeaa9450a4f01bac"
+    },
+    {
+      "tag": "sysinfo",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "30.request.bin",
+      "response": "30.response.bin",
+      "request_sha256": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+      "response_sha256": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "31.request.bin",
+      "response": "31.response.bin",
+      "request_sha256": "762d16ced728550145403a99bde5dcd7895dc8f06efee09b9bfabce9239bfe89",
+      "response_sha256": "3477f1b5aa38dcb2fcc50a15e029a02d86966810a540b4820d36a02e790b849c"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "32.request.bin",
+      "response": "32.response.bin",
+      "request_sha256": "e21577909319a9587aabbb30cabeb18f03c44efcecdf9024b38f23bf55159523",
+      "response_sha256": "2c6fd6c02d7617e283d21bd0b696f6f9ab33eb5e16e080efdd26286b81a6f614"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "33.request.bin",
+      "response": "33.response.bin",
+      "request_sha256": "aee143e6ece933efa6b1fa69c4c2e03891cab641aeec07ee90148a2069973f76",
+      "response_sha256": "2c6fd6c02d7617e283d21bd0b696f6f9ab33eb5e16e080efdd26286b81a6f614"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "34.request.bin",
+      "response": "34.response.bin",
+      "request_sha256": "50cbe4c05aac502907d498f2f8bb299d0a561f1bf462a480b095ea76298e2440",
+      "response_sha256": "7387b98f91cf003bb711bc5d217e5015d0633b5ec5012c224f441d2500148e2e"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "35.request.bin",
+      "response": "35.response.bin",
+      "request_sha256": "2c325ec0947f1ddbc0f7585a2fb85528fca99613b3d2010d6c96eeae844780fd",
+      "response_sha256": "a940bfa90866b847544741c899465b84165b71269c9c742b927c2d10a50004b2"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "36.request.bin",
+      "response": "36.response.bin",
+      "request_sha256": "4269cd593348f8774031d58f7dab482ef57253453c9e078c83e1ca2cf277605e",
+      "response_sha256": "481bd6efdda024baca5484c2b727a5689e0c78cf9ed89da54f90bf8c8894374a"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "37.request.bin",
+      "response": "37.response.bin",
+      "request_sha256": "6afcd9b8a7702d91c0cd3f6b2fd892b8482b8b315756406573d7a3581fda3516",
+      "response_sha256": "5f01dfc13b44c95f9f7583b3e5fc0ca4b3f7c96472cfafbe6609ef639d9ab984"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "38.request.bin",
+      "response": "38.response.bin",
+      "request_sha256": "fdfee6d3639caa3e7d7a3fc84ff5bc4d9175703f2a5889c1fd9eda7fdd694519",
+      "response_sha256": "a940bfa90866b847544741c899465b84165b71269c9c742b927c2d10a50004b2"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "39.request.bin",
+      "response": "39.response.bin",
+      "request_sha256": "3d8e6740fc53085a48957599d75c1ac24f3d4e10f8e2bbedf009d280c9ab64bc",
+      "response_sha256": "1afb8058c5f39503f34821fdc034c64f3b5d6984a5e5728ff7f45dca41bcfc70"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "40.request.bin",
+      "response": "40.response.bin",
+      "request_sha256": "3deee60c7ea90d2979f6f7d2447656f4961e36da297a5867517dcb1aee93d8d6",
+      "response_sha256": "3abb16952a0840e587119272bc20d723fd7ac3df48f20fa6269992736e7eed25"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "41.request.bin",
+      "response": "41.response.bin",
+      "request_sha256": "79c866d67c8954b2a34e7c2d356f2b309c40de82828906cf68fa181ffef660f2",
+      "response_sha256": "ae225972a21d0774a6fbb73d24a893443b5e9dae0bcc624129ab2e54bb8fc52b"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "42.request.bin",
+      "response": "42.response.bin",
+      "request_sha256": "18dabb7aa9f9437ab76c9042585bcc7b8a0a729286c5a97bfad1197116b3d8ee",
+      "response_sha256": "ec3ad0ca9fa6caedb25079d66e32964699306cadb8c2948f767dfa1a4a437daf"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "43.request.bin",
+      "response": "43.response.bin",
+      "request_sha256": "69edd0cd50abc912f6de0d9adedbdc1fbff42861564137f0cc8f2c22fbf000f2",
+      "response_sha256": "8dae2835dbe5a7e4cc2989be7a0fbfd66680430bbca61175c226c1820cae2ce5"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "44.request.bin",
+      "response": "44.response.bin",
+      "request_sha256": "c644352a011e13a83afdb980629f3871f34c8e665913b21e2c159392b84edca1",
+      "response_sha256": "8dae2835dbe5a7e4cc2989be7a0fbfd66680430bbca61175c226c1820cae2ce5"
+    },
+    {
+      "tag": "ready-read",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "45.request.bin",
+      "response": "45.response.bin",
+      "request_sha256": "1c814b7793ad6d0a65e8ce14abb66b438c6610184b01b3a09b74d8968f0a1416",
+      "response_sha256": "d77d4c1dc23ae233056e36074729316d16124e5bec37c6d1736036fd95e2fa69"
+    },
+    {
+      "tag": "close",
+      "peer": [
+        "127.0.0.1",
+        56128
+      ],
+      "request": "46.request.bin",
+      "response": "46.response.bin",
+      "request_sha256": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+      "response_sha256": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+    }
+  ],
+  "comparisons": [
+    {
+      "address": "status",
+      "equal": true,
+      "expected": {
+        "U32": 1
+      },
+      "guarded": null,
+      "name": "status",
+      "native": {
+        "U32": 1
+      },
+      "wire": {
+        "U32": 1
+      }
+    },
+    {
+      "address": "feed",
+      "equal": true,
+      "expected": {
+        "U32": 2147483647
+      },
+      "guarded": null,
+      "name": "feed",
+      "native": {
+        "U32": 2147483647
+      },
+      "wire": {
+        "U32": 2147483647
+      }
+    },
+    {
+      "address": "active_spindle",
+      "equal": true,
+      "expected": {
+        "I32": 2147483647
+      },
+      "guarded": null,
+      "name": "speed",
+      "native": {
+        "I32": 2147483647
+      },
+      "wire": {
+        "I32": 2147483647
+      }
+    },
+    {
+      "address": "axis.abs.1",
+      "equal": true,
+      "expected": {
+        "I32": 2147483647
+      },
+      "guarded": null,
+      "name": "absolute",
+      "native": {
+        "I32": 2147483647
+      },
+      "wire": {
+        "I32": 2147483647
+      }
+    },
+    {
+      "address": "spindle.gear.1",
+      "equal": true,
+      "expected": {
+        "I32": 32767
+      },
+      "guarded": "gear",
+      "name": "gear",
+      "native": {
+        "I32": 32767
+      },
+      "wire": {
+        "I32": 32767
+      }
+    },
+    {
+      "address": "spindle.maxrpm.1",
+      "equal": true,
+      "expected": {
+        "I32": 32767
+      },
+      "guarded": "maxrpm",
+      "name": "maxrpm",
+      "native": {
+        "I32": 32767
+      },
+      "wire": {
+        "I32": 32767
+      }
+    },
+    {
+      "address": "macro.501",
+      "equal": true,
+      "expected": {
+        "F64": 214.7483647
+      },
+      "guarded": null,
+      "name": "macro",
+      "native": {
+        "F64": 214.7483647
+      },
+      "wire": {
+        "F64": 214.7483647
+      }
+    },
+    {
+      "address": "pmc.Y0",
+      "equal": true,
+      "expected": {
+        "I32": 255
+      },
+      "guarded": null,
+      "name": "pmc-byte",
+      "native": {
+        "I32": 255
+      },
+      "wire": {
+        "I32": 255
+      }
+    },
+    {
+      "address": "pmc.R100",
+      "equal": true,
+      "expected": {
+        "I32": 32767
+      },
+      "guarded": null,
+      "name": "pmc-word",
+      "native": {
+        "I32": 32767
+      },
+      "wire": {
+        "I32": 32767
+      }
+    },
+    {
+      "address": "pmc.D0",
+      "equal": true,
+      "expected": {
+        "I32": 2147483647
+      },
+      "guarded": null,
+      "name": "pmc-dword",
+      "native": {
+        "I32": 2147483647
+      },
+      "wire": {
+        "I32": 2147483647
+      }
+    },
+    {
+      "address": "pmc.X0.3",
+      "equal": true,
+      "expected": {
+        "Bool": true
+      },
+      "guarded": null,
+      "name": "pmc-bit",
+      "native": {
+        "Bool": true
+      },
+      "wire": {
+        "Bool": true
+      }
+    },
+    {
+      "address": "param.6711",
+      "equal": true,
+      "expected": {
+        "I32": 2147483647
+      },
+      "guarded": null,
+      "name": "param",
+      "native": {
+        "I32": 2147483647
+      },
+      "wire": {
+        "I32": 2147483647
+      }
+    },
+    {
+      "address": "diagnosis301axis3",
+      "equal": true,
+      "expected": {
+        "F64": 2147483.647
+      },
+      "guarded": "diagnosis",
+      "name": "diagnosis",
+      "native": {
+        "F64": 2147483.647
+      },
+      "wire": {
+        "F64": 2147483.647
+      }
+    },
+    {
+      "address": "opmsg",
+      "equal": true,
+      "expected": {
+        "String": "OPMSG TEST 123"
+      },
+      "guarded": null,
+      "name": "opmsg",
+      "native": {
+        "String": "OPMSG TEST 123"
+      },
+      "wire": {
+        "String": "OPMSG TEST 123"
+      }
+    },
+    {
+      "address": "alarm",
+      "equal": true,
+      "expected": {
+        "StringArray": [
+          "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ]
+      },
+      "guarded": "alarm",
+      "name": "alarm",
+      "native": {
+        "StringArray": [
+          "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ]
+      },
+      "wire": {
+        "StringArray": [
+          "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ]
+      }
+    },
+    {
+      "address": "tool.offset.16",
+      "equal": true,
+      "expected": {
+        "F64": 2147483.647
+      },
+      "guarded": null,
+      "name": "offset",
+      "native": {
+        "F64": 2147483.647
+      },
+      "wire": {
+        "F64": 2147483.647
+      }
+    },
+    {
+      "address": "tool.length.16",
+      "equal": true,
+      "expected": {
+        "F64": 2147483.647
+      },
+      "guarded": null,
+      "name": "length",
+      "native": {
+        "F64": 2147483.647
+      },
+      "wire": {
+        "F64": 2147483.647
+      }
+    },
+    {
+      "address": "tool.zofs.1",
+      "equal": true,
+      "expected": {
+        "F64": 2147483.647
+      },
+      "guarded": null,
+      "name": "zofs",
+      "native": {
+        "F64": 2147483.647
+      },
+      "wire": {
+        "F64": 2147483.647
+      }
+    }
+  ],
+  "files": {
+    "25.request.bin": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f",
+    "25.response.bin": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b",
+    "26.request.bin": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+    "26.response.bin": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474",
+    "27.request.bin": "1a30276c5ff9ec512732bae332a063b340f8489225bb10634ffd20fc13c2089d",
+    "27.response.bin": "35ae58eea1ca6f3a015d650af9b96f293aa277763a04d3b0d3046ae4d70b9960",
+    "28.request.bin": "b5eb3b650125d374fce25fb1bb3fd6b21d94b6862109775dd53ea422600df213",
+    "28.response.bin": "628946aad12a5341c2beb18e1eb36943bf642fd90f57744b48641a9c6dce80a7",
+    "29.request.bin": "505877ebd5be7b276fab849a71f42bb0411043aa922a8f6791af886d635ff003",
+    "29.response.bin": "1c39798ddc570152dac01712e453d802fd1ce957121db9cffeaa9450a4f01bac",
+    "30.request.bin": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3",
+    "30.response.bin": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474",
+    "31.request.bin": "762d16ced728550145403a99bde5dcd7895dc8f06efee09b9bfabce9239bfe89",
+    "31.response.bin": "3477f1b5aa38dcb2fcc50a15e029a02d86966810a540b4820d36a02e790b849c",
+    "32.request.bin": "e21577909319a9587aabbb30cabeb18f03c44efcecdf9024b38f23bf55159523",
+    "32.response.bin": "2c6fd6c02d7617e283d21bd0b696f6f9ab33eb5e16e080efdd26286b81a6f614",
+    "33.request.bin": "aee143e6ece933efa6b1fa69c4c2e03891cab641aeec07ee90148a2069973f76",
+    "33.response.bin": "2c6fd6c02d7617e283d21bd0b696f6f9ab33eb5e16e080efdd26286b81a6f614",
+    "34.request.bin": "50cbe4c05aac502907d498f2f8bb299d0a561f1bf462a480b095ea76298e2440",
+    "34.response.bin": "7387b98f91cf003bb711bc5d217e5015d0633b5ec5012c224f441d2500148e2e",
+    "35.request.bin": "2c325ec0947f1ddbc0f7585a2fb85528fca99613b3d2010d6c96eeae844780fd",
+    "35.response.bin": "a940bfa90866b847544741c899465b84165b71269c9c742b927c2d10a50004b2",
+    "36.request.bin": "4269cd593348f8774031d58f7dab482ef57253453c9e078c83e1ca2cf277605e",
+    "36.response.bin": "481bd6efdda024baca5484c2b727a5689e0c78cf9ed89da54f90bf8c8894374a",
+    "37.request.bin": "6afcd9b8a7702d91c0cd3f6b2fd892b8482b8b315756406573d7a3581fda3516",
+    "37.response.bin": "5f01dfc13b44c95f9f7583b3e5fc0ca4b3f7c96472cfafbe6609ef639d9ab984",
+    "38.request.bin": "fdfee6d3639caa3e7d7a3fc84ff5bc4d9175703f2a5889c1fd9eda7fdd694519",
+    "38.response.bin": "a940bfa90866b847544741c899465b84165b71269c9c742b927c2d10a50004b2",
+    "39.request.bin": "3d8e6740fc53085a48957599d75c1ac24f3d4e10f8e2bbedf009d280c9ab64bc",
+    "39.response.bin": "1afb8058c5f39503f34821fdc034c64f3b5d6984a5e5728ff7f45dca41bcfc70",
+    "40.request.bin": "3deee60c7ea90d2979f6f7d2447656f4961e36da297a5867517dcb1aee93d8d6",
+    "40.response.bin": "3abb16952a0840e587119272bc20d723fd7ac3df48f20fa6269992736e7eed25",
+    "41.request.bin": "79c866d67c8954b2a34e7c2d356f2b309c40de82828906cf68fa181ffef660f2",
+    "41.response.bin": "ae225972a21d0774a6fbb73d24a893443b5e9dae0bcc624129ab2e54bb8fc52b",
+    "42.request.bin": "18dabb7aa9f9437ab76c9042585bcc7b8a0a729286c5a97bfad1197116b3d8ee",
+    "42.response.bin": "ec3ad0ca9fa6caedb25079d66e32964699306cadb8c2948f767dfa1a4a437daf",
+    "43.request.bin": "69edd0cd50abc912f6de0d9adedbdc1fbff42861564137f0cc8f2c22fbf000f2",
+    "43.response.bin": "8dae2835dbe5a7e4cc2989be7a0fbfd66680430bbca61175c226c1820cae2ce5",
+    "44.request.bin": "c644352a011e13a83afdb980629f3871f34c8e665913b21e2c159392b84edca1",
+    "44.response.bin": "8dae2835dbe5a7e4cc2989be7a0fbfd66680430bbca61175c226c1820cae2ce5",
+    "45.request.bin": "1c814b7793ad6d0a65e8ce14abb66b438c6610184b01b3a09b74d8968f0a1416",
+    "45.response.bin": "d77d4c1dc23ae233056e36074729316d16124e5bec37c6d1736036fd95e2fa69",
+    "46.request.bin": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8",
+    "46.response.bin": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a",
+    "cases.json": "53abcd4798c1292c6134bf45811d83ed7b6642fa18070db70bab66c37f71e718"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "backend": "native",
+  "candidates": [
+    {
+      "data": 12345,
+      "decimal": 10,
+      "name": [
+        83,
+        49,
+        0
+      ],
+      "slot": 0,
+      "unit": 0
+    }
+  ],
+  "finished_ns": 1791618004029674000,
+  "guards_ok": true,
+  "num_in": 4,
+  "num_out": 1,
+  "pid": 49008,
+  "raw_0_512_hex": "393000000a000000533100cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "rc": 0,
+  "selector": 0,
+  "servo": false,
+  "span_tail_ok": true,
+  "started_ns": 1791618004028880200,
+  "tail_ok": true,
+  "untouched_half_ok": true
+}

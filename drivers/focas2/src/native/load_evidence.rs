@@ -515,7 +515,7 @@ pub fn run_live_harness() {
     let lib = NativeLib::load().unwrap_or_else(|e| panic!("FWLIB 加载失败（{host}:{port}）：{e}"));
     let hdl = lib
         .cnc_allclibhndl3(&host, port, timeout_secs)
-        .unwrap_or_else(|e| panic!("cnc_allclibhndl3 失败：{} {}", e as i16, e.message()));
+        .unwrap_or_else(|e| panic!("cnc_allclibhndl3 失败：{} {}", e.code(), e.message()));
     // RAII：panic 路径亦 free exactly once（test-only guard；drop 忽略 free 错误）。
     let mut guard = HandleGuard::new(&lib, hdl);
     println!(">>> LOAD SESSION seq={seq} handle={hdl} families={families:?} (single handle)");
@@ -680,7 +680,7 @@ pub fn spindle_load_zero_probe() {
     let lib = NativeLib::load().unwrap_or_else(|e| panic!("FWLIB 加载失败（{host}:{port}）：{e}"));
     let hdl = lib
         .cnc_allclibhndl3(&host, port, timeout_secs)
-        .unwrap_or_else(|e| panic!("cnc_allclibhndl3 失败：{} {}", e as i16, e.message()));
+        .unwrap_or_else(|e| panic!("cnc_allclibhndl3 失败：{} {}", e.code(), e.message()));
     let mut guard = HandleGuard::new(&lib, hdl);
     println!(">>> ZERO-PROBE SPINDLE type=0 num_in=2 HANDLE={hdl} host={host}:{port}");
     // guarded 缓冲（与四窗 harness 同规格；FFI 只写前 num_out×24B）。

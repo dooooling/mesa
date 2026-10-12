@@ -1,0 +1,96 @@
+{
+  "tag": "servo",
+  "num_in": 4,
+  "before": 3,
+  "after": 3,
+  "num_out": 3,
+  "native_connection": [
+    "192.168.15.82",
+    55595,
+    "192.168.15.165",
+    8193
+  ],
+  "wire_connection": [
+    "192.168.15.82",
+    55596,
+    "192.168.15.165",
+    8193
+  ],
+  "request_bytes_equal": true,
+  "native_candidates": [
+    {
+      "data": 0,
+      "decimal": 0,
+      "name": [
+        88,
+        0,
+        68
+      ],
+      "slot": 0,
+      "unit": 0
+    },
+    {
+      "data": 0,
+      "decimal": 0,
+      "name": [
+        89,
+        0,
+        68
+      ],
+      "slot": 1,
+      "unit": 0
+    },
+    {
+      "data": 0,
+      "decimal": 0,
+      "name": [
+        90,
+        0,
+        68
+      ],
+      "slot": 2,
+      "unit": 0
+    }
+  ],
+  "wire_candidates": [
+    {
+      "data": 0,
+      "decimal": 0,
+      "name": [
+        88,
+        0,
+        68
+      ],
+      "slot": 0,
+      "unit": 0
+    },
+    {
+      "data": 0,
+      "decimal": 0,
+      "name": [
+        89,
+        0,
+        68
+      ],
+      "slot": 1,
+      "unit": 0
+    },
+    {
+      "data": 0,
+      "decimal": 0,
+      "name": [
+        90,
+        0,
+        68
+      ],
+      "slot": 2,
+      "unit": 0
+    }
+  ],
+  "sha256": {
+    "native_request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+    "native_response.bin": "ef723fc72a0284d819a714d16ec75b6b709d9410224f2e6e25bd4074437f0327",
+    "wire_request.bin": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+    "wire_response.bin": "ef723fc72a0284d819a714d16ec75b6b709d9410224f2e6e25bd4074437f0327"
+  }
+}

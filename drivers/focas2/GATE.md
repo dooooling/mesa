@@ -1,5 +1,12 @@
 # FOCAS2 Gate 闭环文档（§19.2）
 
+> 当前代码校核（2026-10-10）：FOCAS 0.4.0 的生产 Wire 已实现17类声明读取输出，负载为 F64 百分比。
+> 下文 44 项和早期 Native 结果为历史记录，不是当前 DLL 等价或真机验收结论。
+> 最新逐项对照与剩余边界见 [Wire Cutover Matrix](docs/wire-cutover-matrix.md#2026-10-10-当前声明功能与现有-dll-对照)。
+> 软件验收入口：`python -B tools/ci/focas_equivalence_gate.py --out <全新目录>`；
+> 覆盖17类声明范围的固定报文实际 DLL 差分与正式合同基线；真机与SDK发布门禁单独保留。
+> 历史PS0010报文布局已被独立DLL差分否定，当前报警以48B网络条目/44B ABI为准。
+
 > 依据 `mesa_Driver_MVP_实施方案.md §19.2`，FOCAS2 生产发布前必须书面闭环 SDK 合法获取/许可/平台/函数支持，否则仅允许 Fake 演示。
 
 ## 1. SDK 来源
@@ -71,3 +78,26 @@
 - [x] 真机联调（`192.168.15.165` 已通，单 CNC 满足 `§19.2`；`192.168.15.60` 非 CNC 已更正）
 
 > 本文档即 Gate 凭证，随 `61f1111` 之后提交入仓，`192.168.15.165` 已满足 `§19.2` 真机要求。`NOTE 2026-08-29：192.168.15.60 前期误记为 CNC，实际非 FOCAS 目标，已更正不纳入兼容矩阵。`
+
+
+## 2026-10-10 FOCAS 0.4.0 负载软件补齐
+
+以 `target/validation/focas-equivalence-20261010-003/equivalence.json` 的本次实际执行结果为准。
+负载准入从历史 HOLD 改为已实现：新/旧协议、状态4七槽回退、按参数返回值缩放、
+32位回绕、有符号小数位、多轴与批内去重；指数中间幂溢出采用分段计算，
+真正超出 F64 或非零下溢返回 BAD。负载不钳位，保持 DLL 原始符号及 INT32_MIN 位型语义。
+
+`spindle/load` 与 `servo/load` 类型从 U32 改为 **F64，单位 `%`**。
+Driver package 与二进制版本同时升至0.4.0，Descriptor结构/IPC版本不变。
+已有端点须通过管理 API 执行 Stop → ConfigureTasks → ApplyPointMap → Start，
+由 Core 更新类型与单位；相同 point_key 继续保留 point_id，禁止直接改 SQLite。
+
+实际 DLL 身份仍为 FWLIB64 7.3.0.1 + FWLIBE64 5.3.0.1，差分入口
+`tools/ci/focas_load_production.py`；11组/264行覆盖当前正式百分比适配器，
+CI 回放 `tests/fixtures/wire/load_production_dll_v2/`。旧 v1 归档为首次实验历史，
+v2 补上指数309/317的可表示 subnormal 边界，以 v2 为当前默认回归。
+
+本节的软件范围不包含 DLL 全部导出函数。Native backend 保留为取证兼容入口，
+历史安全门禁不因此开放；正式采集使用默认 Wire backend。
+192.168.15.165 是 NCGuide 虚拟机，本文历史“真机通过”叙述已被纠正，
+不能据此勾选真实 FANUC 设备验收。实际设备、其他平台/固件和发布许可不由合成差分解除。

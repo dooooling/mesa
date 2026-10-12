@@ -1,0 +1,148 @@
+[
+  {
+    "name": "status",
+    "address": "status",
+    "expected": {
+      "U32": 1
+    },
+    "guarded": null
+  },
+  {
+    "name": "feed",
+    "address": "feed",
+    "expected": {
+      "U32": 2147483647
+    },
+    "guarded": null
+  },
+  {
+    "name": "speed",
+    "address": "active_spindle",
+    "expected": {
+      "I32": 2147483647
+    },
+    "guarded": null
+  },
+  {
+    "name": "absolute",
+    "address": "axis.abs.1",
+    "expected": {
+      "I32": 2147483647
+    },
+    "guarded": null
+  },
+  {
+    "name": "gear",
+    "address": "spindle.gear.1",
+    "expected": {
+      "I32": 32767
+    },
+    "guarded": "gear"
+  },
+  {
+    "name": "maxrpm",
+    "address": "spindle.maxrpm.1",
+    "expected": {
+      "I32": 32767
+    },
+    "guarded": "maxrpm"
+  },
+  {
+    "name": "macro",
+    "address": "macro.501",
+    "expected": {
+      "F64": 214.7483647
+    },
+    "guarded": null
+  },
+  {
+    "name": "pmc-byte",
+    "address": "pmc.Y0",
+    "expected": {
+      "I32": 255
+    },
+    "guarded": null
+  },
+  {
+    "name": "pmc-word",
+    "address": "pmc.R100",
+    "expected": {
+      "I32": 32767
+    },
+    "guarded": null
+  },
+  {
+    "name": "pmc-dword",
+    "address": "pmc.D0",
+    "expected": {
+      "I32": 2147483647
+    },
+    "guarded": null
+  },
+  {
+    "name": "pmc-bit",
+    "address": "pmc.X0.3",
+    "expected": {
+      "Bool": true
+    },
+    "guarded": null
+  },
+  {
+    "name": "param",
+    "address": "param.6711",
+    "expected": {
+      "I32": 2147483647
+    },
+    "guarded": null
+  },
+  {
+    "name": "diagnosis",
+    "address": "diagnosis301axis3",
+    "expected": {
+      "F64": 2147483.647
+    },
+    "guarded": "diagnosis"
+  },
+  {
+    "name": "opmsg",
+    "address": "opmsg",
+    "expected": {
+      "String": "OPMSG TEST 123"
+    },
+    "guarded": null
+  },
+  {
+    "name": "alarm",
+    "address": "alarm",
+    "expected": {
+      "StringArray": [
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      ]
+    },
+    "guarded": "alarm"
+  },
+  {
+    "name": "offset",
+    "address": "tool.offset.16",
+    "expected": {
+      "F64": 2147483.647
+    },
+    "guarded": null
+  },
+  {
+    "name": "length",
+    "address": "tool.length.16",
+    "expected": {
+      "F64": 2147483.647
+    },
+    "guarded": null
+  },
+  {
+    "name": "zofs",
+    "address": "tool.zofs.1",
+    "expected": {
+      "F64": 2147483.647
+    },
+    "guarded": null
+  }
+]

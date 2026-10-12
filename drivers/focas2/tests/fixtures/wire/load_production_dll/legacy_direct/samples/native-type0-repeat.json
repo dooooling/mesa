@@ -1,0 +1,40 @@
+{
+  "backend": "native",
+  "candidates": [
+    {
+      "data": -125,
+      "decimal": 1,
+      "name": [
+        83,
+        49,
+        0
+      ],
+      "slot": 0,
+      "unit": 0
+    },
+    {
+      "data": 875,
+      "decimal": 1,
+      "name": [
+        83,
+        50,
+        50
+      ],
+      "slot": 2,
+      "unit": 0
+    }
+  ],
+  "finished_ns": 1791618005074748000,
+  "guards_ok": true,
+  "num_in": 4,
+  "num_out": 2,
+  "pid": 43828,
+  "raw_0_512_hex": "83ffffff01000000533100cccccccccccccccccccccccccc6b03000001000000533232cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "rc": 0,
+  "selector": 0,
+  "servo": false,
+  "span_tail_ok": true,
+  "started_ns": 1791618005073743700,
+  "tail_ok": true,
+  "untouched_half_ok": true
+}

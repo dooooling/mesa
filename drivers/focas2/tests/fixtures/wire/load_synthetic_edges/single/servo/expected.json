@@ -1,0 +1,44 @@
+{
+  "tag": "servo",
+  "kind": "synthetic-derived",
+  "candidates": [
+    {
+      "slot": 0,
+      "data": 270,
+      "decimal": 1,
+      "unit": 0,
+      "name": [
+        88,
+        0,
+        68
+      ]
+    },
+    {
+      "slot": 1,
+      "data": 560,
+      "decimal": 1,
+      "unit": 0,
+      "name": [
+        89,
+        0,
+        68
+      ]
+    },
+    {
+      "slot": 2,
+      "data": 123,
+      "decimal": 2,
+      "unit": 0,
+      "name": [
+        90,
+        0,
+        68
+      ]
+    }
+  ],
+  "native_wire_expected_equal": true,
+  "num_out": 3,
+  "original_response_sha256": "ef723fc72a0284d819a714d16ec75b6b709d9410224f2e6e25bd4074437f0327",
+  "request_sha256": "4c96956d2b15b46bc9056b74073c74675a3b564ae9549d41676ed72bfa7f8eae",
+  "response_sha256": "0f6aa9ecf0376bac1a557db93380c09110e740c785cfee3382d90c419eda7402"
+}

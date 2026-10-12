@@ -1,0 +1,43 @@
+{
+  "kind": "synthetic-derived",
+  "cases": [
+    {
+      "name": "full256",
+      "folder": "case-full256"
+    },
+    {
+      "name": "nul",
+      "folder": "case-nul"
+    },
+    {
+      "name": "empty",
+      "folder": "case-empty"
+    },
+    {
+      "name": "lossy",
+      "folder": "case-lossy"
+    },
+    {
+      "name": "password",
+      "folder": "case-password"
+    },
+    {
+      "name": "length",
+      "folder": "case-length"
+    }
+  ],
+  "source_sha256": "ae225972a21d0774a6fbb73d24a893443b5e9dae0bcc624129ab2e54bb8fc52b",
+  "source": "target\\focas-load-research\\opmsg-synthetic-20261010-004",
+  "loaded_modules": [
+    {
+      "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIB64.dll",
+      "sha256": "7b3837e3925902d1e06c5c7e4f9ce39fe7f39aa9caed029096187f5641ec04ab"
+    },
+    {
+      "path": "C:\\Users\\34268\\AppData\\Local\\Temp\\mesa_focas_embed\\FWLIBE64.DLL",
+      "sha256": "d3341b43bf3945bdb49d03d1d96436a75911bf3c8d1cdf4f30b9167ef935bfd6"
+    }
+  ],
+  "hardware_acceptance": false,
+  "production_load_gate_changed": false
+}

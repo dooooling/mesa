@@ -1,0 +1,199 @@
+{
+  "production_native_gate_changed": false,
+  "kind": "ncguide-native-wire-read-only",
+  "source": "target/focas-load-research/ready-guarded-20261010-001",
+  "families": [
+    "spindle/gear",
+    "spindle/maxrpm",
+    "diagnosis/value REAL",
+    "alarm/value empty"
+  ],
+  "hardware_acceptance": false,
+  "files": [
+    {
+      "file": "capture.json",
+      "sha256": "9f3890f0a09394972d258605e7a0941c2f147ae81af7b58391cf222b7b0b3ccd"
+    },
+    {
+      "file": "capture.pcapng",
+      "sha256": "64481b6679445c93b1072072977f50703337095dbc88a642b3e707306a0c1826"
+    },
+    {
+      "file": "test.log",
+      "sha256": "2246d169dbd7cdc6ec0e108e8703b7bd249c378986b080a854be79c2479d19c7"
+    },
+    {
+      "file": "frames/report.json",
+      "sha256": "9e0299925c8181dff613930116553dc944dca8d9f8c870c63ced0e35e7b0b145"
+    },
+    {
+      "file": "frames/flow-000/c2s-000.bin",
+      "sha256": "b048f0fc5fea40f52542131153038613514a283a7f9147761aa4be21f8821cff"
+    },
+    {
+      "file": "frames/flow-000/c2s-001.bin",
+      "sha256": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8"
+    },
+    {
+      "file": "frames/flow-000/c2s.bin",
+      "sha256": "120c1b71bb9ef7bfeb481971bce175023aeaea1e2c1c11181f3d6d7b256c1387"
+    },
+    {
+      "file": "frames/flow-000/s2c-000.bin",
+      "sha256": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b"
+    },
+    {
+      "file": "frames/flow-000/s2c-001.bin",
+      "sha256": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+    },
+    {
+      "file": "frames/flow-000/s2c.bin",
+      "sha256": "741a9f805f14a14d91b10d69483d2dd99609a076c5cd3c078d350d3a05510a4b"
+    },
+    {
+      "file": "frames/flow-001/c2s-000.bin",
+      "sha256": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f"
+    },
+    {
+      "file": "frames/flow-001/c2s-001.bin",
+      "sha256": "146a2987e543b4d2e7c6a038f7c6a57eef9a56b4854569c2344db14fbdd0bee3"
+    },
+    {
+      "file": "frames/flow-001/c2s-002.bin",
+      "sha256": "e21577909319a9587aabbb30cabeb18f03c44efcecdf9024b38f23bf55159523"
+    },
+    {
+      "file": "frames/flow-001/c2s-003.bin",
+      "sha256": "aee143e6ece933efa6b1fa69c4c2e03891cab641aeec07ee90148a2069973f76"
+    },
+    {
+      "file": "frames/flow-001/c2s-004.bin",
+      "sha256": "3deee60c7ea90d2979f6f7d2447656f4961e36da297a5867517dcb1aee93d8d6"
+    },
+    {
+      "file": "frames/flow-001/c2s-005.bin",
+      "sha256": "8b29685956e63a896b846bc3e4af6c3d7381f89c458fd8b04be2c5309f454fa8"
+    },
+    {
+      "file": "frames/flow-001/c2s-006.bin",
+      "sha256": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8"
+    },
+    {
+      "file": "frames/flow-001/c2s.bin",
+      "sha256": "3367c637a0f1b08fdac85baa581c1704a160155f31098e87cac25008a787393c"
+    },
+    {
+      "file": "frames/flow-001/s2c-000.bin",
+      "sha256": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b"
+    },
+    {
+      "file": "frames/flow-001/s2c-001.bin",
+      "sha256": "d085af3edb01ecaeedf9c193ccbb9f9c9ae4b8cfd09e75d72d473ceb3d10c474"
+    },
+    {
+      "file": "frames/flow-001/s2c-002.bin",
+      "sha256": "336b82ea3445ef70c879116be26c6d889b9e938ef391b4f4bfd403f9596d8b06"
+    },
+    {
+      "file": "frames/flow-001/s2c-003.bin",
+      "sha256": "c463c60c342bf127e9a58134993b5fdd303fb3691385ac1fb64032f63412bc81"
+    },
+    {
+      "file": "frames/flow-001/s2c-004.bin",
+      "sha256": "ee768ff8b1b2b6d5cc055f09caa468544dfb6032809a3153805e870e54352850"
+    },
+    {
+      "file": "frames/flow-001/s2c-005.bin",
+      "sha256": "b875161f1323d26c7d48788ec439d29bbcb76975fc3d2a7e59fa8d1984a484b1"
+    },
+    {
+      "file": "frames/flow-001/s2c-006.bin",
+      "sha256": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+    },
+    {
+      "file": "frames/flow-001/s2c.bin",
+      "sha256": "796a368e156bb4fff6a76c97a851f538b5c84c0be802c679ee290d315c5e9b23"
+    },
+    {
+      "file": "frames/flow-002/c2s-000.bin",
+      "sha256": "95ac15a058692e59d8aeb6a753b57458cf6fd78fae10363775577ad055b02f3f"
+    },
+    {
+      "file": "frames/flow-002/c2s-001.bin",
+      "sha256": "e21577909319a9587aabbb30cabeb18f03c44efcecdf9024b38f23bf55159523"
+    },
+    {
+      "file": "frames/flow-002/c2s-002.bin",
+      "sha256": "aee143e6ece933efa6b1fa69c4c2e03891cab641aeec07ee90148a2069973f76"
+    },
+    {
+      "file": "frames/flow-002/c2s-003.bin",
+      "sha256": "3deee60c7ea90d2979f6f7d2447656f4961e36da297a5867517dcb1aee93d8d6"
+    },
+    {
+      "file": "frames/flow-002/c2s-004.bin",
+      "sha256": "18dabb7aa9f9437ab76c9042585bcc7b8a0a729286c5a97bfad1197116b3d8ee"
+    },
+    {
+      "file": "frames/flow-002/c2s-005.bin",
+      "sha256": "b550034a715dfe607ada686b4c7686ef16ecfda82b16e18adc9be0650295c8d8"
+    },
+    {
+      "file": "frames/flow-002/c2s.bin",
+      "sha256": "04602e42ecb3e235b270db3aaf2638b77547be76c0acc57a4bab9c1cbfa50b48"
+    },
+    {
+      "file": "frames/flow-002/s2c-000.bin",
+      "sha256": "32c9bc0bf5ded4ad1f68d2c1cfcd7080eb3f8a26562b0fb82d955f74c4c72e1b"
+    },
+    {
+      "file": "frames/flow-002/s2c-001.bin",
+      "sha256": "336b82ea3445ef70c879116be26c6d889b9e938ef391b4f4bfd403f9596d8b06"
+    },
+    {
+      "file": "frames/flow-002/s2c-002.bin",
+      "sha256": "c463c60c342bf127e9a58134993b5fdd303fb3691385ac1fb64032f63412bc81"
+    },
+    {
+      "file": "frames/flow-002/s2c-003.bin",
+      "sha256": "ee768ff8b1b2b6d5cc055f09caa468544dfb6032809a3153805e870e54352850"
+    },
+    {
+      "file": "frames/flow-002/s2c-004.bin",
+      "sha256": "b875161f1323d26c7d48788ec439d29bbcb76975fc3d2a7e59fa8d1984a484b1"
+    },
+    {
+      "file": "frames/flow-002/s2c-005.bin",
+      "sha256": "9c84a55d1c55c60296da04f607c1361226bf27f301f442f9417fe642ef90734a"
+    },
+    {
+      "file": "frames/flow-002/s2c.bin",
+      "sha256": "84e17b1a38ca9875e66dd8947a1600c0cff35b42a93fd64b704627ca37fae1bb"
+    },
+    {
+      "file": "samples/comparison.json",
+      "sha256": "0eff0e6fb1aa234a01c2a39a8f49a8836541f85bab72621c51070f10b6ed2d7a"
+    },
+    {
+      "file": "samples/modules.json",
+      "sha256": "5857727cff82759b3e1d7562ed97814d17c10234a20a59b87337f2f1faacdbe9"
+    },
+    {
+      "file": "samples/native-alarm.abi.bin",
+      "sha256": "16da1e97ac6e07f5b2c20e0d0eb3dcda692f32344528f698aab2c07373ab538e"
+    },
+    {
+      "file": "samples/native-diagnosis.abi.bin",
+      "sha256": "4db2012068a5d53d1130846305df937804a81cb5dd04d7ab9705a8b26fbd801f"
+    },
+    {
+      "file": "samples/native-gear.abi.bin",
+      "sha256": "fe1ee5adef14d11bcb55146bd80fd06d0a8b8b962d7576c8165222549b46e8e3"
+    },
+    {
+      "file": "samples/native-maxrpm.abi.bin",
+      "sha256": "7eb8f5bcfd6a7d3fb0b6292daa1b9ab99cd846da6c940590eb2a934b0e668f17"
+    }
+  ],
+  "target": "192.168.15.165:8193"
+}

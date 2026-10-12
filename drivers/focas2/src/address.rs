@@ -84,7 +84,7 @@ pub enum FocasAddress {
     Param {
         number: u32,
     },
-    /// 操作信息 `cnc_rdopmsg` 64B
+    /// #3006 操作消息，单条 256B 文本（Native 使用 cnc_rdopmsg3）。
     OpMsg,
 }
 
