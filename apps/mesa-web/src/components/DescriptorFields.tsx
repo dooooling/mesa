@@ -6,6 +6,59 @@ import { Button, Checkbox, Input, InputNumber, Select } from "antd";
 import type { FieldDescriptor, SchemaDescriptor } from "../types";
 import { materializeSchemaDefaults } from "../resourceSelectionModel";
 
+/**
+ * TSAP 文本编辑态：本地 draft（输入 0x010 不格式化打断），失焦/回车时
+ * 合法值规范化为 number 提交；非法保留 draft 标红，由 required/Core 门裁决。
+ * number 回显 0xXXXX。
+ */
+function TsapField({
+  field,
+  value,
+  disabled,
+  onChange,
+  label,
+}: {
+  field: FieldDescriptor;
+  value: unknown;
+  disabled?: boolean;
+  onChange: (v: unknown) => void;
+  label: React.ReactNode;
+}) {
+  const toDisplay = (v: unknown): string => {
+    if (typeof v === "number") return `0x${v.toString(16).toUpperCase().padStart(4, "0")}`;
+    if (typeof v === "string") return v;
+    return "";
+  };
+  const [draft, setDraft] = useState<string | null>(null);
+  const shown = draft ?? toDisplay(value);
+  const parsed = parseTsapInput(shown);
+  const invalid = typeof parsed === "string" && shown.trim() !== "";
+  const commit = (s: string) => {
+    setDraft(null);
+    const p = parseTsapInput(s);
+    // 合法→number；非法→原字符串（Core 门拒绝，不静默吞掉）。
+    onChange(typeof p === "number" ? p : s);
+  };
+  return (
+    <div style={{ display: "grid", gap: 4 }}>
+      <span style={{ fontSize: 12 }}>{label}</span>
+      <Input
+        disabled={disabled}
+        value={shown}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={(e) => commit(e.target.value)}
+        onPressEnter={(e) => commit((e.target as HTMLInputElement).value)}
+        placeholder={field.ui.placeholder ?? "如 0x0100 或 256"}
+        status={invalid ? "error" : undefined}
+        style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}
+      />
+      {invalid ? (
+        <span style={{ fontSize: 12, color: "#da1e28" }}>TSAP 格式非法（十进制 0~65535 或十六进制 0x0000~0xFFFF）</span>
+      ) : null}
+    </div>
+  );
+}
+
 function isVisible(field: FieldDescriptor, values: Record<string, unknown>): boolean {
   const cond = field.ui.visible_if;
   if (!cond) return true;
@@ -21,6 +74,31 @@ function isVisible(field: FieldDescriptor, values: Record<string, unknown>): boo
  * 避免 deviceModel 经本组件反向耦合 React/AntD；调用方逐步迁移 import 源）。
  */
 export { materializeSchemaDefaults } from "../resourceSelectionModel";
+
+/**
+ * TSAP 双格式解析（NCK local_tsap/remote_tsap）：十进制（256）或十六进制
+ * （0x0100/0X0100/0100h/0100H，允许前后空白）→ 同一 number；
+ * 非法（空串原样返回由 required 门裁决；格式错/越界返回原字符串，前端标红，
+ * 后端 from_json 亦拒绝）。Core schema 只见 number。
+ */
+export function parseTsapInput(s: string): number | string {
+  const t = s.trim();
+  if (t === "") return s;
+  if (/^[0-9]+$/.test(t)) {
+    const n = Number(t);
+    return Number.isInteger(n) && n >= 0 && n <= 65535 ? n : s;
+  }
+  const hex =
+    t.startsWith("0x") || t.startsWith("0X")
+      ? t.slice(2)
+      : /[hH]$/.test(t)
+        ? t.slice(0, -1)
+        : null;
+  if (hex !== null && /^[0-9a-fA-F]{1,4}$/.test(hex)) {
+    return parseInt(hex, 16);
+  }
+  return s;
+}
 
 function FieldControl({
   field,
@@ -126,6 +204,13 @@ function FieldControl({
         ) : null}
       </div>
     );
+  }
+  // TSAP 双格式（NCK local_tsap/remote_tsap，Integer 契约保持）：
+  // 文本编辑态（useState 本地 draft，失焦/回车才规范化提交，不打断输入
+  // 如 0x010 的连续键入）；合法 hex/十进制→number，非法保留 draft 标红
+  // 由 required/Core 门裁决；number 回显 0xXXXX。
+  if (field.key === "local_tsap" || field.key === "remote_tsap") {
+    return <TsapField field={field} value={value} disabled={disabled} onChange={onChange} label={label} />;
   }
   if (field.field_type === "integer" || field.field_type === "port") {
     const v = typeof value === "number" ? value : typeof field.default === "number" ? field.default : undefined;
