@@ -91,15 +91,18 @@ fn wire_candidates(
 /// 独立生产质量 oracle（P1-2 remediation）：由输入侧规则判定某地址点
 /// 应 GOOD（false）还是 BAD（true），不读被测 `read_batch` 输出文本。
 /// 输入：`addr`（序号/轴）+ `baseline`（Native candidates raw/decimal）；
-/// `scaled_wrapped` 为 legacy scaled 回绕标记（调用方按 spec 独立复算；
-/// 本函数内对 legacy 路径按 DLL 回绕语义复算，不调用生产 `percent`）。
-/// 返回 None = 无记录（序号越界/缺失），由 BAD/ERR 覆盖。
+/// `scaled` 为 legacy scaled 上下文（Some((coefficient, div)) 时按 DLL 回绕
+/// 语义独立复算 wrapped；None 为新分支无缩放）。
+/// 返回 None = 无记录/输入非法（序号越界/缺失/decimal 超 i16），调用方
+/// 不得默认放行 GOOD（fail-closed：None 即判失败）。
 /// 规则与生产门同源但输入侧独立：MIN / F64 溢出下溢 / |v|>1000% / 回绕。
+/// 顺序：先回绕（源值非零 + wrapped 即 BAD），再真零（raw==0 即 GOOD）。
+#[cfg(windows)]
 fn quality_oracle(
     addr: &crate::address::FocasAddress,
     baseline_spindle: &serde_json::Value,
     baseline_servo: &serde_json::Value,
-    scaled_wrapped: bool,
+    scaled: Option<(i32, i32)>,
 ) -> Option<bool> {
     use crate::address::{FocasAddress, SpindleKind};
     let (is_servo, index) = match addr {
@@ -120,16 +123,27 @@ fn quality_oracle(
     }?;
     let r = rows.get(index - 1)?;
     let raw = r["data"].as_i64()? as i32;
-    let decimal = r["decimal"].as_u64()? as u16 as i16 as i32;
+    // decimal 有符号（负小数位合法，如 four raw=7/dec=-1 → 70% GOOD）。
+    let decimal = i16::try_from(r["decimal"].as_i64()?).ok()? as i32;
+    // P0-2：先回绕（scaled 上下文独立复算；源值非零 + wrapped 即 BAD，
+    // 即使回绕后 raw 为 0 也不得判真零 GOOD）。
+    if let Some((coefficient, div)) = scaled {
+        if div == 0 {
+            return Some(true);
+        }
+        let abs = raw.wrapping_abs();
+        let abs_wrapped = raw != 0 && (abs < 0 || (raw < 0 && abs == raw));
+        let product = abs.wrapping_mul(coefficient);
+        let mul_wrapped = (abs as i64) * (coefficient as i64) != product as i64;
+        if raw != 0 && (abs_wrapped || mul_wrapped) {
+            return Some(true);
+        }
+    }
     if raw == 0 {
         return Some(false);
     }
     // P0-3：MIN 直接 BAD。
     if raw == i32::MIN {
-        return Some(true);
-    }
-    // P0-2：回绕标记即 BAD。
-    if scaled_wrapped {
         return Some(true);
     }
     // F64 换算独立复算（分段 10^308，不调用生产 percent）。
@@ -487,6 +501,8 @@ pub(crate) mod live {
                     // 该点应 GOOD 还是 BAD，再与 actual 比较——不读被测输出文本。
                     // scaled 回绕标记：legacy scaled 路径按 spec 系数独立复算。
                     let addr = &addresses[index];
+                    // P1-2 v2：oracle None（无记录/非法输入）不得默认放行 GOOD。
+                    // F64 + oracle None → 失败；ERR + oracle None → 失败。
                     let quality_expected_bad: Option<bool> = {
                         use crate::address::FocasAddress;
                         // 扩展地址（重复/越界）无 oracle 记录。
@@ -513,20 +529,20 @@ pub(crate) mod live {
                                     serde_json::json!({"candidates": servo_rows}),
                                 );
                                 // scaled 回绕：本生成器为新分支路径（type0/servo），
-                                // legacy scaled 不经过此函数 → 恒 false。
-                                quality_oracle(addr, &bl_sp, &bl_sv, false)
+                                // legacy scaled 不经过此函数 → None。
+                                quality_oracle(addr, &bl_sp, &bl_sv, None)
                             }
                         }
                     };
                     let equal = match (actual, expected) {
                         (MesaValue::F64(value), Some(number)) => {
-                            // parity 轨：F64 有限 + 容差相等；且 oracle 不得判 BAD
-                            //（27% 误报 BAD 文本即失败，不因输出 F64 而通过——
-                            // 此处 actual 已是 F64，若 oracle 判 BAD 则为误放行）。
+                            // parity 轨：F64 有限 + 容差相等；且 oracle 必须明确 GOOD
+                            //（None/ BAD 均不得放行：27% 误报 BAD 文本即失败；
+                            // oracle 缺失即失败，不默认 GOOD）。
                             value.is_finite() && number.is_finite()
                                 && (value - number).abs()
                                     <= number.abs() * 1e-14 + f64::from_bits(1)
-                                && quality_expected_bad != Some(true)
+                                && quality_expected_bad == Some(false)
                         }
                         (MesaValue::String(error), None) => error.starts_with("ERR:"),
                         // quality 轨：oracle 独立判 BAD 且 actual 为 ERR 即正确拒绝。
@@ -553,6 +569,61 @@ pub(crate) mod live {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P1-2 v2 回归：独立 quality oracle（跨平台覆盖，兼 fix dead-code）。
+    /// 正常 27% / 负小数位 / 真零 / MAX×2 伪零 / MIN / 超范围 /
+    /// GOOD 误报 ERR / BAD 误放 F64。
+    #[test]
+    fn quality_oracle_locked() {
+        use crate::address::{FocasAddress, SpindleKind};
+        use serde_json::json;
+        // baseline：spindle[1] raw=7/dec=-1（four，70% GOOD）。
+        let bl_sp = json!({"candidates": [
+            {"data": 7, "decimal": -1, "unit": 0},
+            {"data": 27, "decimal": 0, "unit": 0},
+            {"data": 0, "decimal": 0, "unit": 0},
+            {"data": 0, "decimal": 0, "unit": 0},
+        ]});
+        let bl_sv = json!({"candidates": []});
+        let sp = |n: u8| FocasAddress::Spindle {
+            spindle: n,
+            kind: SpindleKind::Load,
+        };
+        // 正常 27% GOOD。
+        assert_eq!(quality_oracle(&sp(2), &bl_sp, &bl_sv, None), Some(false));
+        // 负小数位 raw=7/dec=-1 → 70% GOOD（as_i64 路径）。
+        assert_eq!(quality_oracle(&sp(1), &bl_sp, &bl_sv, None), Some(false));
+        // 真零 GOOD。
+        assert_eq!(quality_oracle(&sp(3), &bl_sp, &bl_sv, None), Some(false));
+        // MAX×2 伪零：scaled 回绕即 BAD（即使回绕后为 0）。
+        let bl_wrap = json!({"candidates": [{"data": 2147483647, "decimal": 0, "unit": 0}]});
+        assert_eq!(
+            quality_oracle(&sp(1), &bl_wrap, &bl_sv, Some((2, 32767))),
+            Some(true)
+        );
+        // MIN 直接 BAD。
+        let bl_min = json!({"candidates": [{"data": -2147483648i64, "decimal": 1, "unit": 0}]});
+        assert_eq!(quality_oracle(&sp(1), &bl_min, &bl_sv, None), Some(true));
+        // 超范围 BAD（30000%）。
+        let bl_big = json!({"candidates": [{"data": 30000, "decimal": 0, "unit": 0}]});
+        assert_eq!(quality_oracle(&sp(1), &bl_big, &bl_sv, None), Some(true));
+        // 非法 decimal（超 i16）→ None（调用方不得放行）。
+        let bl_baddec = json!({"candidates": [{"data": 7, "decimal": 99999, "unit": 0}]});
+        assert_eq!(quality_oracle(&sp(1), &bl_baddec, &bl_sv, None), None);
+        // 越界序号 → None。
+        assert_eq!(
+            quality_oracle(
+                &FocasAddress::Spindle {
+                    spindle: 5,
+                    kind: SpindleKind::Load
+                },
+                &bl_sp,
+                &bl_sv,
+                None
+            ),
+            None
+        );
+    }
 
     /// 历史误请求仍完整保留；正确构造必须只改首尾 A4 的选择字节。
     #[test]
