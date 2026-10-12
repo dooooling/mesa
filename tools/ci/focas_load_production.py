@@ -127,8 +127,10 @@ def run_case(exe, root, name, spec, handshake):
                 return ';'.join(f'{raw},{dec}' for raw, dec in values)
             spec_env = ('spindle=' + spec_side(spec.get('spindle', []))
                         + '|servo=' + spec_side(spec.get('servo', [])))
+            # 显式模式标识（C 门 P1）：scaled/unscaled 必填，不靠空串推断。
+            mode_env = 'scaled' if spec.get('scaled') else 'unscaled'
             env = dict(os.environ, MESA_FOCAS_GATE0_HOST='127.0.0.1', MESA_FOCAS_GATE0_PORT=str(server.server_address[1]),
-                       MESA_FOCAS_LOAD_PAIR_OUT=str(out/'samples'), MESA_FOCAS_LOAD_SCALED=scaled_env, MESA_FOCAS_LOAD_SPEC=spec_env)
+                       MESA_FOCAS_LOAD_PAIR_OUT=str(out/'samples'), MESA_FOCAS_LOAD_MODE=mode_env, MESA_FOCAS_LOAD_SCALED=scaled_env, MESA_FOCAS_LOAD_SPEC=spec_env)
             process = subprocess.run([str(exe), '--exact', 'wire::load_research::tests::load_production_pair_live',
                                       '--ignored', '--nocapture', '--test-threads=1'], cwd=ROOT, env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
