@@ -88,11 +88,12 @@ fn wire_candidates(
     Ok(candidates)
 }
 
-/// 独立生产质量 oracle（P1-2 remediation）：由输入侧规则判定某地址点
-/// 应 GOOD（false）还是 BAD（true），不读被测 `read_batch` 输出文本。
-/// 输入：`addr`（序号/轴）+ `baseline`（Native candidates raw/decimal）；
-/// `scaled` 为 legacy scaled 上下文（Some((coefficient, div)) 时按 DLL 回绕
-/// 语义独立复算 wrapped；None 为新分支无缩放）。
+/// 独立生产质量 oracle（P1-2 remediation v4）：由场景 spec 原始输入判定
+/// 某地址点应 GOOD（false）还是 BAD（true），不读被测 `read_batch` 输出，
+/// 也不读已回绕 DLL ABI（回绕后 raw=0 已丢信息，必须用缩放前原始值）。
+/// 输入：`addr`（序号/轴）+ `spec_raw`（场景原始 `(raw, decimal)` 数组，
+/// 与 baseline candidates 同序）+ `scaled`（legacy scaled 上下文：
+/// Some((coefficient, div)) 按 DLL 回绕语义独立复算；None 为新分支无缩放）。
 /// 返回 None = 无记录/输入非法（序号越界/缺失/decimal 超 i16），调用方
 /// 不得默认放行 GOOD（fail-closed：None 即判失败）。
 /// 规则与生产门同源但输入侧独立：MIN / F64 溢出下溢 / |v|>1000% / 回绕。
@@ -100,8 +101,8 @@ fn wire_candidates(
 /// 纯计算函数：跨平台可用（整个模块已 #[cfg(test)]；live 调用方另有 windows 门）。
 fn quality_oracle(
     addr: &crate::address::FocasAddress,
-    baseline_spindle: &serde_json::Value,
-    baseline_servo: &serde_json::Value,
+    spec_spindle: &[(i32, i32)],
+    spec_servo: &[(i32, i32)],
     scaled: Option<(i32, i32)>,
 ) -> Option<bool> {
     use crate::address::{FocasAddress, SpindleKind};
@@ -116,17 +117,17 @@ fn quality_oracle(
     if !(1..=4).contains(&index) {
         return None;
     }
-    let rows = if is_servo {
-        baseline_servo["candidates"].as_array()
+    // spec 原始值（缩放前；与 candidates 同序 index-1）。
+    let (raw, decimal) = if is_servo {
+        *spec_servo.get(index - 1)?
     } else {
-        baseline_spindle["candidates"].as_array()
-    }?;
-    let r = rows.get(index - 1)?;
-    let raw = r["data"].as_i64()? as i32;
-    // decimal 有符号（负小数位合法，如 four raw=7/dec=-1 → 70% GOOD）。
-    let decimal = i16::try_from(r["decimal"].as_i64()?).ok()? as i32;
+        *spec_spindle.get(index - 1)?
+    };
+    if !(-32768..=32767).contains(&decimal) {
+        return None;
+    }
     // P0-2：先回绕（scaled 上下文独立复算；源值非零 + wrapped 即 BAD，
-    // 即使回绕后 raw 为 0 也不得判真零 GOOD）。
+    // 即使回绕后 ABI 为 0 也不得判真零 GOOD）。
     if let Some((coefficient, div)) = scaled {
         if div == 0 {
             return Some(true);
@@ -448,16 +449,8 @@ pub(crate) mod live {
         drop(handle);
         let mut addresses = Vec::new();
         let mut expected = Vec::new();
-        // quality oracle 输入副本（baseline 在 for 中被 move，先留 rows）。
-        let mut spindle_rows = Vec::new();
-        let mut servo_rows = Vec::new();
         for (is_servo, baseline) in [(false, spindle), (true, servo)] {
             let rows = baseline["candidates"].as_array().unwrap().clone();
-            if is_servo {
-                servo_rows = rows.clone();
-            } else {
-                spindle_rows = rows.clone();
-            }
             for index in 1..=4 {
                 addresses.push(if is_servo {
                     FocasAddress::ServoLoad { axis: index }
@@ -492,6 +485,9 @@ pub(crate) mod live {
         // `std0,std1,alt0,alt1,div`（spindle index1 用 alt，其余 std；
         // servo 在 scaled 场景恒 None——servo legacy 无回退）。
         // 空/缺失 = 新分支无缩放。由场景生成器写入，不读被测输出。
+        // 解析失败（数量≠5/非整数）即 None——与非缩放不可区分时调用方
+        // 按 scaled=None 处理；严格区分由 MESA_FOCAS_LOAD_SPEC presence 保证
+        //（scaled 场景必须同时带 SPEC，缺 SPEC 即整批失败，见下）。
         let scaled_ctx: Option<[i32; 5]> =
             std::env::var("MESA_FOCAS_LOAD_SCALED").ok().and_then(|s| {
                 let v: Vec<i32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -501,6 +497,34 @@ pub(crate) mod live {
                     None
                 }
             });
+        // spec 原始输入（P1-2 v4）：类型别名降复杂度。
+        type RawPair = Vec<(i32, i32)>;
+        // `MESA_FOCAS_LOAD_SPEC`
+        // `spindle=raw,dec;...|servo=raw,dec;...`（缩放前原始值；scaled 场景必填，
+        // 缺失即整批失败——不从已回绕 ABI 反推）。
+        // 格式错误 → None → comparisons 直接失败（fail-closed）。
+        let spec_ctx: Option<(RawPair, RawPair)> =
+            std::env::var("MESA_FOCAS_LOAD_SPEC").ok().and_then(|s| {
+                fn parse(side: &str) -> Option<Vec<(i32, i32)>> {
+                    if side.is_empty() {
+                        return Some(Vec::new());
+                    }
+                    side.split(';')
+                        .map(|p| {
+                            let (a, b) = p.split_once(',')?;
+                            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+                        })
+                        .collect()
+                }
+                let (sp, sv) = s.split_once('|')?;
+                let (sp_side, sv_side) = (sp.strip_prefix("spindle=")?, sv.strip_prefix("servo=")?);
+                Some((parse(sp_side)?, parse(sv_side)?))
+            });
+        // scaled 场景缺 SPEC 即整批失败（fail-closed：系数无源值不可判）。
+        let scaled_without_spec = scaled_ctx.is_some() && spec_ctx.is_none();
+        if scaled_without_spec {
+            panic!("scaled 场景缺 MESA_FOCAS_LOAD_SPEC（系数无源值，拒绝验收）");
+        }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -539,29 +563,34 @@ pub(crate) mod live {
                         match base {
                             None => None,
                             Some(_) => {
-                                // baseline 按地址族取（前 4 spindle / 次 4 servo）。
-                                let (bl_sp, bl_sv) = (
-                                    serde_json::json!({"candidates": spindle_rows}),
-                                    serde_json::json!({"candidates": servo_rows}),
-                                );
-                                // scaled 上下文独立输入（P1-2 v3）：spindle 按
-                                // focas_load_production.py 同规则取系数
-                                //（`alt if index==1 else std`，index 从 1 起；
-                                // servo 恒 None——servo legacy 无缩放回退）。
+                                // spec 原始值（P1-2 v4）：缩放前输入，不读已回绕 ABI。
+                                // 缺 SPEC 即 None（fail-closed）；scaled 场景缺 SPEC
+                                // 已在上方整批 panic。
+                                let (spec_sp, spec_sv) = match &spec_ctx {
+                                    Some((sp, sv)) => (sp.clone(), sv.clone()),
+                                    None => (Vec::new(), Vec::new()),
+                                };
+                                // scaled 系数选择与场景生成器同规则
+                                //（py: `alt if index==1 else std`，index 从 0 起；
+                                // Rust index 从 1 起：spindle1→alt[0]，
+                                // spindle2→std[1]，spindle3/4 无 spec 条目→oracle None；
+                                // servo 恒 None）。
                                 let scaled = match addr {
                                     crate::address::FocasAddress::Spindle {
                                         spindle,
                                         ..
-                                    } => scaled_ctx.map(|c| {
+                                    } => scaled_ctx.and_then(|c| {
                                         // c=[std0,std1,alt0,alt1,div]。
-                                        let coef = if *spindle == 1 { c[2] } else { c[0] };
-                                        // index2 → std[1]。
-                                        let coef = if *spindle == 2 { c[1] } else { coef };
-                                        (coef, c[4])
+                                        let coef = match *spindle {
+                                            1 => *c.get(2)?,
+                                            2 => *c.get(1)?,
+                                            _ => return None,
+                                        };
+                                        Some((coef, c[4]))
                                     }),
                                     _ => None,
                                 };
-                                quality_oracle(addr, &bl_sp, &bl_sv, scaled)
+                                quality_oracle(addr, &spec_sp, &spec_sv, scaled)
                             }
                         }
                     };
@@ -601,46 +630,56 @@ pub(crate) mod live {
 mod tests {
     use super::*;
 
-    /// P1-2 v2 回归：独立 quality oracle（跨平台覆盖，兼 fix dead-code）。
-    /// 正常 27% / 负小数位 / 真零 / MAX×2 伪零 / MIN / 超范围 /
-    /// GOOD 误报 ERR / BAD 误放 F64。
+    /// P1-2 v4 回归：独立 quality oracle（spec 原始输入，不读已回绕 ABI）。
+    /// 正常 27% / 负小数位 70% / 真零 / MAX×2 伪零 BAD / MIN BAD / 超范围 BAD /
+    /// 非法 decimal None / 越界 None / 系数选择（sp1→alt0/sp2→std1）。
     #[test]
     fn quality_oracle_locked() {
         use crate::address::{FocasAddress, SpindleKind};
-        use serde_json::json;
-        // baseline：spindle[1] raw=7/dec=-1（four，70% GOOD）。
-        let bl_sp = json!({"candidates": [
-            {"data": 7, "decimal": -1, "unit": 0},
-            {"data": 27, "decimal": 0, "unit": 0},
-            {"data": 0, "decimal": 0, "unit": 0},
-            {"data": 0, "decimal": 0, "unit": 0},
-        ]});
-        let bl_sv = json!({"candidates": []});
         let sp = |n: u8| FocasAddress::Spindle {
             spindle: n,
             kind: SpindleKind::Load,
         };
-        // 正常 27% GOOD。
-        assert_eq!(quality_oracle(&sp(2), &bl_sp, &bl_sv, None), Some(false));
-        // 负小数位 raw=7/dec=-1 → 70% GOOD（as_i64 路径）。
-        assert_eq!(quality_oracle(&sp(1), &bl_sp, &bl_sv, None), Some(false));
-        // 真零 GOOD。
-        assert_eq!(quality_oracle(&sp(3), &bl_sp, &bl_sv, None), Some(false));
-        // MAX×2 伪零：scaled 回绕即 BAD（即使回绕后为 0）。
-        let bl_wrap = json!({"candidates": [{"data": 2147483647, "decimal": 0, "unit": 0}]});
+        // spec 原始值（four：spindle (7,-1)/(99,2)/(-123,3)/(MAX,9)）。
+        let spec_sp = vec![(7, -1), (99, 2), (-123, 3), (2147483647, 9)];
+        let spec_sv: Vec<(i32, i32)> = Vec::new();
+        // 正常 27% GOOD（99/100=0.99？此处只判门：99,dec=2 → 0.99 GOOD）。
         assert_eq!(
-            quality_oracle(&sp(1), &bl_wrap, &bl_sv, Some((2, 32767))),
+            quality_oracle(&sp(2), &spec_sp, &spec_sv, None),
+            Some(false)
+        );
+        // 负小数位 raw=7/dec=-1 → 70% GOOD。
+        assert_eq!(
+            quality_oracle(&sp(1), &spec_sp, &spec_sv, None),
+            Some(false)
+        );
+        // 真零 GOOD。
+        assert_eq!(
+            quality_oracle(&sp(3), &[(0, 0), (0, 0), (0, 0)], &spec_sv, None),
+            Some(false)
+        );
+        // MAX×2 伪零：spec 原始 MAX + 系数 2 → 回绕 BAD（不读 ABI 的 0）。
+        assert_eq!(
+            quality_oracle(
+                &sp(2),
+                &[(0, 0), (2147483647, 0)],
+                &spec_sv,
+                Some((2, 32767))
+            ),
             Some(true)
         );
         // MIN 直接 BAD。
-        let bl_min = json!({"candidates": [{"data": -2147483648i64, "decimal": 1, "unit": 0}]});
-        assert_eq!(quality_oracle(&sp(1), &bl_min, &bl_sv, None), Some(true));
+        assert_eq!(
+            quality_oracle(&sp(1), &[(-2147483648, 0)], &spec_sv, None),
+            Some(true)
+        );
         // 超范围 BAD（30000%）。
-        let bl_big = json!({"candidates": [{"data": 30000, "decimal": 0, "unit": 0}]});
-        assert_eq!(quality_oracle(&sp(1), &bl_big, &bl_sv, None), Some(true));
+        assert_eq!(
+            quality_oracle(&sp(1), &[(30000, 0)], &spec_sv, None),
+            Some(true)
+        );
         // 非法 decimal（超 i16）→ None（调用方不得放行）。
-        let bl_baddec = json!({"candidates": [{"data": 7, "decimal": 99999, "unit": 0}]});
-        assert_eq!(quality_oracle(&sp(1), &bl_baddec, &bl_sv, None), None);
+        assert_eq!(quality_oracle(&sp(1), &[(7, 99999)], &spec_sv, None), None);
         // 越界序号 → None。
         assert_eq!(
             quality_oracle(
@@ -648,14 +687,18 @@ mod tests {
                     spindle: 5,
                     kind: SpindleKind::Load
                 },
-                &bl_sp,
-                &bl_sv,
+                &spec_sp,
+                &spec_sv,
                 None
             ),
             None
         );
+        // 系数选择：spindle1→alt[0]=2（wrapping spec alt=[2,2]）。
+        assert_eq!(
+            quality_oracle(&sp(1), &[(2147483647, 0)], &spec_sv, Some((2, 32767))),
+            Some(true)
+        );
     }
-
     /// 历史误请求仍完整保留；正确构造必须只改首尾 A4 的选择字节。
     #[test]
     fn spindle_request_corrects_archived_selector() {
