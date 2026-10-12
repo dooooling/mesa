@@ -2974,7 +2974,8 @@ impl FocasApi for WireFocasApi {
         };
         // 同一批次各读取一次整组负载，按 DLL 的数组序号选择轴/主轴。
         // 数量缩减或缺失记录必须报告 BAD，不用零值填充；无有效索引不发包。
-        let mut load_groups: [Option<Result<Vec<LoadNumeric>, String>>; 2] = [None, None];
+        // P0-1：组内记录带原始名称，取值时校验名称-序号绑定（见 load_selected_value）。
+        let mut load_groups: [Option<Result<Vec<NamedLoad>, String>>; 2] = [None, None];
         for (group, servo) in [(0, false), (1, true)] {
             let needed = addresses.iter().any(|a| match a {
                 FocasAddress::ServoLoad { axis } => servo && (1..=4).contains(axis),
@@ -3240,10 +3241,10 @@ impl FocasApi for WireFocasApi {
                     Err(fatal) => return Err(fatal),
                 },
                 FocasAddress::ServoLoad { axis } => {
-                    out.push(load_selected_value(&load_groups[1], *axis));
+                    out.push(load_selected_value(&load_groups[1], *axis, true));
                 }
                 FocasAddress::Spindle { spindle, kind: SpindleKind::Load } => {
-                    out.push(load_selected_value(&load_groups[0], *spindle));
+                    out.push(load_selected_value(&load_groups[0], *spindle, false));
                 }
                 FocasAddress::Spindle { spindle, kind } => {
                     match sword_map.get(&(*kind, *spindle)).cloned() {
@@ -3401,7 +3402,7 @@ impl FocasApi for WireFocasApi {
 
 impl FocasClient {
     /// 能力选择与状态4记忆在同一 guard/会话内；重连自然清除回退状态。
-    pub(super) async fn load_values(&self, servo: bool) -> Result<Vec<LoadNumeric>, WireError> {
+    pub(super) async fn load_values(&self, servo: bool) -> Result<Vec<NamedLoad>, WireError> {
         let mut guard = self.guard().await?;
         let result = async {
             let session = guard.session();
@@ -3417,11 +3418,31 @@ impl FocasClient {
                     .exchange(&super::load::request(servo), PacketType::GENERIC_RESPONSE)
                     .await?;
                 return if servo {
-                    decode_servo_load_new(&response, 4)
-                        .map(|m| m.records.into_iter().map(|r| r.numeric).collect())
+                    decode_servo_load_new(&response, 4).map(|m| {
+                        m.records
+                            .into_iter()
+                            .map(|r| NamedLoad {
+                                name: r.axis_raw,
+                                numeric: r.numeric,
+                            })
+                            .collect()
+                    })
                 } else {
-                    decode_spindle_meter(&response, 0, 4)
-                        .map(|m| m.records.into_iter().map(|r| r.load.unwrap()).collect())
+                    decode_spindle_meter(&response, 0, 4).and_then(|m| {
+                        m.records
+                            .into_iter()
+                            .map(|r| {
+                                // P0-1：type=0 load 必 Some；None 即结构异常→整组 Err（BAD），
+                                // 不用零哨兵冒充（零哨兵 + 名称通过会出 0% GOOD）。
+                                r.load
+                                    .map(|numeric| NamedLoad {
+                                        name: r.name_raw,
+                                        numeric,
+                                    })
+                                    .ok_or(WireError::MalformedPayload)
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
                 };
             }
             if servo && session.load.family == 2 && session.load.global_axes.is_none() {
@@ -3471,8 +3492,38 @@ impl FocasClient {
     }
 }
 
-/// 先校验产品索引，再访问本批次数据；错误仅影响所选点，不污染同组有效值。
-fn load_selected_value(group: &Option<Result<Vec<LoadNumeric>, String>>, index: u8) -> Value {
+/// Load 命名记录（P0-1 remediation：数值 + 原始名称绑定；取值时校验
+/// 名称-序号一致，不一致即单点 BAD，不冒充他轴/他主轴 GOOD）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NamedLoad {
+    /// 原始名称前三字节（servo `axis_raw` / spindle `name_raw` 同源）。
+    pub name: [u8; 3],
+    /// 数值单元。
+    pub numeric: LoadNumeric,
+}
+
+/// 先校验产品索引，再校验名称-序号绑定，最后访问本批次数据；
+/// 错误仅影响所选点，不污染同组有效值。
+/// 绑定规则（P0-1）：servo `index` 期望名首字节 `X/Y/Z/A`（1..4）；
+/// spindle `index` 期望名前缀 `S{index}`（如 `S1`）；不一致即 BAD。
+fn load_selected_value(
+    group: &Option<Result<Vec<NamedLoad>, String>>,
+    index: u8,
+    servo: bool,
+) -> Value {
+    // 期望名前缀（servo：X/Y/Z/A；spindle：S{index}）。
+    fn expected(servo: bool, index: u8) -> [u8; 2] {
+        if servo {
+            match index {
+                1 => [b'X', 0],
+                2 => [b'Y', 0],
+                3 => [b'Z', 0],
+                _ => [b'A', 0],
+            }
+        } else {
+            [b'S', b'0' + index]
+        }
+    }
     let result = if !(1..=4).contains(&index) {
         Err("ERR:load index must be 1..4".to_string())
     } else {
@@ -3480,14 +3531,104 @@ fn load_selected_value(group: &Option<Result<Vec<LoadNumeric>, String>>, index: 
             Some(Ok(values)) => values
                 .get(index as usize - 1)
                 .ok_or_else(|| "ERR:load record missing".to_string())
-                .and_then(|numeric| {
-                    super::load::percent(*numeric).map_err(|error| format!("ERR:{error}"))
+                .and_then(|named| {
+                    // P0-1：名称-序号绑定校验（乱序/错位即 BAD，不 mislabel GOOD）。
+                    let exp = expected(servo, index);
+                    let ok = if servo {
+                        named.name[0] == exp[0]
+                    } else {
+                        named.name[0] == exp[0] && named.name[1] == exp[1]
+                    };
+                    if !ok {
+                        return Err(format!(
+                            "ERR:load identity mismatch (index {index} name {:02x?})",
+                            named.name
+                        ));
+                    }
+                    super::load::percent(named.numeric).map_err(|error| format!("ERR:{error}"))
                 }),
             Some(Err(error)) => Err(error.clone()),
             None => Err("ERR:load group missing".to_string()),
         }
     };
     result.unwrap_or_else(Value::String)
+}
+
+#[cfg(test)]
+mod load_identity_tests {
+    use super::*;
+    use mesa_core_types::Value;
+
+    fn named(name: [u8; 3], raw: i32, dec_bits: u16) -> NamedLoad {
+        NamedLoad {
+            name,
+            numeric: LoadNumeric {
+                raw,
+                aux4: [0, 0],
+                dec_bits,
+            },
+        }
+    }
+
+    /// P0-1：servo 乱序（index=1 取到 Y）即 BAD，不 mislabel GOOD。
+    #[test]
+    fn servo_identity_mismatch_is_bad() {
+        let group = Some(Ok(vec![
+            named([b'Y', 0, 0], 270, 1),
+            named([b'X', 0, 0], 100, 1),
+        ]));
+        let v = load_selected_value(&group, 1, true);
+        assert!(
+            matches!(&v, Value::String(s) if s.contains("identity mismatch")),
+            "乱序必须 BAD，实际：{v:?}"
+        );
+    }
+
+    /// P0-1：spindle 错位（index=1 取到 S2）即 BAD。
+    #[test]
+    fn spindle_identity_mismatch_is_bad() {
+        let group = Some(Ok(vec![
+            named([b'S', b'2', 0], 270, 1),
+            named([b'S', b'1', 0], 100, 1),
+        ]));
+        let v = load_selected_value(&group, 1, false);
+        assert!(
+            matches!(&v, Value::String(s) if s.contains("identity mismatch")),
+            "错位必须 BAD，实际：{v:?}"
+        );
+    }
+
+    /// P0-1：顺序一致即 GOOD（回归正常路径）。
+    #[test]
+    fn identity_match_is_good() {
+        let group = Some(Ok(vec![named([b'X', 0, 0], 270, 1)]));
+        let v = load_selected_value(&group, 1, true);
+        assert!(matches!(v, Value::F64(_)), "一致必须 GOOD，实际：{v:?}");
+    }
+
+    /// P0-2：回绕伪零不得 GOOD（raw=MAX 经 wrapping 路径得 0 即 BAD）。
+    #[test]
+    fn percent_wrapping_pseudo_zero_is_bad() {
+        // legacy_scaled(MAX,2,32767) 回绕得 0 的形态：percent(0) 本身合法，
+        // 此处锁 percent 门对超限工程值的拒绝（30000%）。
+        let v = super::super::load::percent(LoadNumeric {
+            raw: 30000,
+            aux4: [0, 0],
+            dec_bits: 0,
+        });
+        assert!(v.is_err(), "30000% 必须 BAD，实际：{v:?}");
+    }
+
+    /// P0-3：INT32_MIN 不得 GOOD。
+    #[test]
+    fn percent_int32_min_is_bad() {
+        let v = super::super::load::percent(LoadNumeric {
+            raw: i32::MIN,
+            aux4: [0, 0],
+            dec_bits: 1,
+        });
+        assert!(v.is_err(), "MIN 必须 BAD，实际：{v:?}");
+    }
 }
 
 #[cfg(test)]

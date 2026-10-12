@@ -1065,9 +1065,11 @@ fn value_fits_data_type(v: &Value, dt: DataType) -> bool {
 
 /// Cutover Gate 1+3-C3+3-D4：Wire backend READY allowlist（configure-time fail-closed）。
 /// READY（machine/status+feed+spindle_speed、axis/absolute、
-/// spindle/load+gear+maxrpm、servo/load、macro/pmc/param/diagnosis/opmsg/alarm、
+/// spindle/gear+maxrpm、macro/pmc/param/diagnosis/opmsg/alarm、
 /// tool/offset+length+zofs）→ `Ok(())`；
-/// 负载支持百分比 F64；未声明的 tool number 和 indexed speed 继续拒绝。
+/// HOLD（spindle/load、servo/load：P0-4 remediation——未经真机硬件验收，
+/// 默认生产配置拒绝；decoder/对照研究继续，不经本门开放）→ `Err(reason)`；
+/// 未声明的 tool number 和 indexed speed 继续拒绝。
 ///program 系（ProgramNumber/Main/Name/Dir/Info/Upload）Wire 未实现 → 拒绝。
 fn wire_ready_gate(addr: &FocasAddress) -> Result<(), &'static str> {
     use address::{AxisKind, SpindleKind, ToolKind};
@@ -1085,14 +1087,19 @@ fn wire_ready_gate(addr: &FocasAddress) -> Result<(), &'static str> {
             }
         }
         FocasAddress::Spindle { kind, .. } => match kind {
-            SpindleKind::Load | SpindleKind::Gear | SpindleKind::MaxRpm => Ok(()),
-            _ => Err("Wire indexed spindle speed 未实现"),
+            SpindleKind::Gear | SpindleKind::MaxRpm => Ok(()),
+            // P0-4：spindle/load 回 HOLD（B 门审计：误归属/回绕/大负/P0-4
+            // 门禁无隔离；真机硬件验收前默认生产不得开放）。
+            _ => Err("Wire spindle/load HOLD（P0 remediation，真机验收前不开放）"),
         },
         FocasAddress::MacroVar { .. }
         | FocasAddress::Pmc { .. }
         | FocasAddress::Param { .. }
         | FocasAddress::Diagnosis { .. } => Ok(()),
-        FocasAddress::ServoLoad { .. } => Ok(()),
+        // P0-4：servo/load 回 HOLD（同上）。
+        FocasAddress::ServoLoad { .. } => {
+            Err("Wire servo/load HOLD（P0 remediation，真机验收前不开放）")
+        }
         FocasAddress::Tool { kind, .. } => match kind {
             ToolKind::Number => Err("Wire tool.number 未实现"),
             ToolKind::Offset | ToolKind::Length | ToolKind::Zofs => Ok(()),
@@ -1694,13 +1701,15 @@ mod tests {
         ] {
             assert!(wire_ready_gate(&addr).is_ok(), "{addr:?} 必须 READY",);
         }
-        assert!(wire_ready_gate(&FocasAddress::ServoLoad { axis: 1 }).is_ok());
+        // P0-4 remediation：spindle/servo load 回 HOLD（B 门审计；
+        // decoder/对照研究继续，不经本门开放）。
+        assert!(wire_ready_gate(&FocasAddress::ServoLoad { axis: 1 }).is_err());
         assert!(
             wire_ready_gate(&FocasAddress::Spindle {
                 spindle: 1,
                 kind: address::SpindleKind::Load
             })
-            .is_ok()
+            .is_err()
         );
         // HOLD：configure 即拒（Gate 3-C3 offset/length、Gate 3-D4 zofs 移出 HOLD）。
         for addr in [
@@ -1761,14 +1770,20 @@ mod tests {
         )
         .await
         .expect("backend=wire + tool/zofs 必须 PASS");
-        // 负载配置与正式百分比输出合同一致，不受旧整数声明影响。
+        // P0-4 remediation：负载 HOLD（configure 即 UNSUPPORTED_POINT；
+        // decoder/对照研究继续，不经生产门开放）。
         for (r, p, o) in [
             ("servo", serde_json::json!({"axis": 1}), "load"),
             ("spindle", serde_json::json!({"spindle": 1}), "load"),
         ] {
-            let points = conn.configure(2, vec![task(r, p, o)]).await.unwrap();
-            assert_eq!(points[0].data_type, DataType::F64);
-            assert_eq!(points[0].unit.as_deref(), Some("%"));
+            let err = conn
+                .configure(2, vec![task(r, p, o)])
+                .await
+                .expect_err("backend=wire + load 必须 HOLD 拒绝");
+            assert_eq!(
+                err.code, "UNSUPPORTED_POINT",
+                "load HOLD 必须 UNSUPPORTED_POINT，实际：{err}"
+            );
         }
     }
 

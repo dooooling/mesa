@@ -129,7 +129,12 @@ pub(super) fn decode_legacy(
     servo: bool,
     scaled: bool,
     count: usize,
-) -> Result<Vec<LoadNumeric>, WireError> {
+) -> Result<Vec<super::wire::NamedLoad>, WireError> {
+    // P1-1 remediation（B 门审计）：servo+scaled 组合 decoder 不支持
+    //（生产恒 servo→scaled=false；直接调用即 Unsupported，不切片 panic）。
+    if servo && scaled {
+        return Err(WireError::Unsupported("legacy servo scaled unsupported"));
+    }
     let commands: &[u16] = if servo {
         &[0x56, 0x89]
     } else if scaled {
@@ -165,7 +170,10 @@ pub(super) fn decode_legacy(
                 numeric.raw = super::wire::legacy_scaled(numeric.raw, coefficient, 32767)?;
                 numeric.dec_bits = 0;
             }
-            Ok(numeric)
+            // P0-1：legacy 同样绑定名称（servo 0x89 / spindle 0x8a，每项 4B 前三字节）。
+            let mut name = [0u8; 3];
+            name.copy_from_slice(&names[i * 4..i * 4 + 3]);
+            Ok(super::wire::NamedLoad { name, numeric })
         })
         .collect()
 }
@@ -208,9 +216,19 @@ pub(super) fn request(servo: bool) -> FocasFrame {
 
 /// 小数位属于有符号 short。仅接受可无溢出、无非零下溢表示的工程值；
 /// 超出 F64 范围时返回 BAD，绝不钳位或转换成正常的零负载。
+/// P0-2/P0-3 remediation：回绕伪零与 INT32_MIN 大负不得 GOOD——
+/// raw 经 wrapping  path 产生的 0（而真实 raw 非零）即 BAD；
+/// 工程值绝对值超物理上限（1000%，即 10 倍满量程余量）即 BAD。
+/// DLL parity 层保留原始位型（to_servo_abi/wrapping 路径不动），
+/// 此处只判生产质量门（GOOD/BAD 分层）。
 pub(super) fn percent(n: LoadNumeric) -> Result<Value, WireError> {
     if n.raw == 0 {
         return Ok(Value::F64(0.0));
+    }
+    // P0-3：INT32_MIN 经 wrapping_abs 仍为 MIN（负）——直接 BAD，
+    // 不经换算产生 -2.1e8 GOOD。
+    if n.raw == i32::MIN {
+        return Err(WireError::Unsupported("load raw INT32_MIN rejected"));
     }
     let decimal = n.dec_bits as i16 as i32;
     let mut value = n.raw as f64;
@@ -232,6 +250,13 @@ pub(super) fn percent(n: LoadNumeric) -> Result<Value, WireError> {
     }
     if !value.is_finite() || (n.raw != 0 && value == 0.0) {
         return Err(WireError::Unsupported("load percentage outside F64 range"));
+    }
+    // P0-2/P0-3：物理上限门（1000% = 10 倍满量程余量；回绕伪零/大负不得 GOOD）。
+    // 0% 本身合法（raw==0 早返）；此处只拦非零 raw 算出的超限工程值。
+    if value.abs() > 1000.0 {
+        return Err(WireError::Unsupported(
+            "load percentage outside physical range",
+        ));
     }
     Ok(Value::F64(value))
 }
