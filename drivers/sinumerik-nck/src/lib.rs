@@ -93,28 +93,28 @@ impl Driver for SinumerikNckDriver {
                         f
                     },
                     // TSAP 显式必填（NCK 无 rack/slot 推导；远端值由真机 Gate 定）。
-                    // String 双格式：十进制（256）或十六进制（0x0100/0100h）；
-                    // 后端 config 双解析为同一 u16，前端 hex→number 提交，
-                    // Core schema 只见 number（validate_instance 不拦）。
+                    // Integer 契约保持：前端文本编辑态接受十进制（256）或
+                    // 十六进制（0x0100/0100h），编辑完成规范化为整数提交；
+                    // Core schema 只见 number；后端 from_json 双格式兜底
+                    // （直接 API 调 string 亦可）。默认值待真机 Gate 冻结，
+                    // 此处不预填（placeholder 只作格式示例）。
                     {
                         let mut f =
-                            FieldDescriptor::new("local_tsap", "Local TSAP", FieldType::String)
+                            FieldDescriptor::new("local_tsap", "Local TSAP", FieldType::Integer)
                                 .required(true);
-                        f.validation.pattern = Some(
-                            "^(0[xX][0-9a-fA-F]{1,4}|[0-9a-fA-F]{1,4}[hH]|[0-9]{1,5})$".into(),
-                        );
+                        f.validation.min = Some(0.0);
+                        f.validation.max = Some(65535.0);
                         f.ui.placeholder = Some("如 0x0100 或 256".into());
-                        f.default_value(serde_json::json!("0x0100"))
+                        f
                     },
                     {
                         let mut f =
-                            FieldDescriptor::new("remote_tsap", "Remote TSAP", FieldType::String)
+                            FieldDescriptor::new("remote_tsap", "Remote TSAP", FieldType::Integer)
                                 .required(true);
-                        f.validation.pattern = Some(
-                            "^(0[xX][0-9a-fA-F]{1,4}|[0-9a-fA-F]{1,4}[hH]|[0-9]{1,5})$".into(),
-                        );
+                        f.validation.min = Some(0.0);
+                        f.validation.max = Some(65535.0);
                         f.ui.placeholder = Some("如 0x0102 或 258".into());
-                        f.default_value(serde_json::json!("0x0102"))
+                        f
                     },
                     FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
                         .required(false)
@@ -771,7 +771,8 @@ mod tests {
         assert!(fam.required);
         let opts = fam.validation.enum_options.clone().unwrap();
         assert_eq!(opts, vec!["840d-sl".to_string(), "828d".to_string()]);
-        // TSAP 双格式：String 型 + pattern（十进制/十六进制），默认 hex 示例。
+        // TSAP 双格式：Integer 契约保持（前端文本态→整数提交），
+        // 0..=65535 范围 + 占位示例；无默认值（待真机 Gate 冻结）。
         for key in ["local_tsap", "remote_tsap"] {
             let f = d
                 .connection
@@ -780,8 +781,10 @@ mod tests {
                 .find(|f| f.key == key)
                 .unwrap_or_else(|| panic!("缺 {key}"));
             assert!(f.required, "{key} 必须必填");
-            assert_eq!(f.field_type, mesa_core_types::FieldType::String);
-            assert!(f.validation.pattern.is_some(), "{key} 必须带 pattern 约束");
+            assert_eq!(f.field_type, mesa_core_types::FieldType::Integer);
+            assert_eq!(f.validation.min, Some(0.0));
+            assert_eq!(f.validation.max, Some(65535.0));
+            assert!(f.default.is_none(), "{key} 不得预填默认值");
         }
         assert!(!d.capabilities.write, "NCK V1 只读");
         assert!(!d.capabilities.method, "NCK V1 无 command");
@@ -842,6 +845,23 @@ mod tests {
             )
             .await;
         assert!(ok_hex.is_ok());
+        // 集成回归：Descriptor(Integer 契约) → Core validate_instance →
+        // NCK from_json 全链（hex 文本→整数提交→解析同值）。
+        {
+            let desc = SinumerikNckDriver.descriptor();
+            // 前端提交形态（整数，已由 TsapField 规范化）。
+            let conn = serde_json::json!({
+                "host": "10.0.0.5", "family": "840d-sl",
+                "local_tsap": 256, "remote_tsap": 258,
+            });
+            let issues = desc.connection.validate_instance("connection", &conn);
+            assert!(issues.is_empty(), "整数 TSAP 必须过 Core 门：{issues:?}");
+            let cfg = NckConnConfig::from_json(&conn).expect("Core 通过后 NCK 必须解析");
+            assert_eq!((cfg.local_tsap, cfg.remote_tsap), (256, 258));
+            // 旧整数配置修改重载链（向后兼容：整数直通不变）。
+            let issues2 = desc.connection.validate_instance("connection", &conn);
+            assert!(issues2.is_empty());
+        }
         // 未知 family 拒绝（P1-3：绝不全系列合并）。
         assert_eq!(
             err_of(
