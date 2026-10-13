@@ -86,6 +86,60 @@ impl Drop for StagedDriversDir {
     }
 }
 
+/// 有界重试（递增退避），供共享冲突下的文件复制使用。
+///
+/// 抽成独立函数是为了能被确定性测试：真实的 ERROR_SHARING_VIOLATION 需要
+/// Win32 `CreateFileW(share_mode=0)` 才能稳定复现（std 在 Windows 上默认
+/// 共享读写删），为它引入新依赖不划算，因此这里测“重试语义”本身：
+/// 前几次失败后成功必须返回 Ok，始终失败必须返回最后一次错误。
+pub fn retry_io<T, F>(attempts: u32, mut op: F) -> Result<T, std::io::Error>
+where
+    F: FnMut(u32) -> Result<T, std::io::Error>,
+{
+    let mut last = None;
+    for attempt in 0..attempts {
+        match op(attempt) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last = Some(e);
+                // 递增退避（20ms→200ms），默认 10 次时总上限约 1.1s：
+                // 足够让上一轮 driver 子进程退出、或安全软件释放句柄。
+                std::thread::sleep(std::time::Duration::from_millis(
+                    20 * u64::from(attempt + 1),
+                ));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("retry_io: attempts 必须 ≥ 1")))
+}
+
+/// 把已构建的二进制放进 staged 目录。
+///
+/// 为什么需要它：staged 目录在 `temp_dir()`（Windows 通常 C:），而构建产物在
+/// 仓库的 `target/`（可能 D: 等其它卷）——**跨卷无法 hardlink**，只能复制。
+/// 而 `std::fs::copy` 在 Windows 上会因共享冲突失败：
+/// `Os { code: 32, message: "另一个程序正在使用此文件，进程无法访问。" }`
+/// （ERROR_SHARING_VIOLATION）。套件虽然串行，但上一个用例拉起的 driver 子进程
+/// 可能仍在退出，或被安全软件短暂持有，命中即整条套件 panic。
+///
+/// 因此这里：先试 hardlink（同卷时零拷贝、且对**正在运行**的可执行文件也允许），
+/// 失败再对有界重试的 copy 兜底，重试耗尽才 panic——并只在这里 panic 一次，
+/// 避免调用方用 `.ok()` 静默吞掉失败（那会让 manager 起来后报无关的
+/// “descriptor 不可用”，排查成本极高）。
+fn stage_binary(src: &std::path::Path, dst_dir: &std::path::Path) {
+    let name = src
+        .file_name()
+        .unwrap_or_else(|| panic!("二进制路径缺少文件名: {src:?}"));
+    let dst = dst_dir.join(name);
+    if std::fs::hard_link(src, &dst).is_ok() {
+        return;
+    }
+    match retry_io(10, |_| std::fs::copy(src, &dst).map(|_| ())) {
+        Ok(()) => {}
+        Err(e) => panic!("复制 {name:?} 到 staged 目录失败（10 次重试后）: {e:?}"),
+    }
+}
+
 /// 组装 staged drivers 目录（含 test-driver）。调用方 manager 必须
 /// `MesaManager::discover(guard.path())`，AppState 的 drivers_dir 同理。
 pub fn staged_drivers_with_test_driver() -> StagedDriversDir {
@@ -109,8 +163,9 @@ pub fn staged_drivers_with_test_driver() -> StagedDriversDir {
     let exe = test_driver_exe();
     let dir = root.join("test-driver");
     std::fs::create_dir_all(&dir).unwrap();
-    let name = exe.file_name().unwrap().to_string_lossy().to_string();
-    std::fs::copy(&exe, dir.join(&name)).unwrap();
+    // 与正式驱动同一套 staging（hardlink → 重试 copy）：test-driver 也必须
+    // 在共享冲突下重试，不能 `copy().unwrap()` 直接 panic 掉整条套件。
+    stage_binary(&exe, &dir);
     // 单真值：直接复制 canonical manifest（tests/support/test-driver/driver.toml），
     // 不手写 version/protocol——可执行文件名与 canonical 一致（mesa-test-driver），
     // resolve_executable 原生支持（Windows 下 .exe 兜底）。
@@ -150,10 +205,7 @@ fn link_built_exe(src_manifest_dir: &std::path::Path, staged_dir: &std::path::Pa
         };
         for cand in cands {
             if cand.is_file() {
-                let name = cand.file_name().unwrap();
-                if std::fs::hard_link(&cand, staged_dir.join(name)).is_err() {
-                    std::fs::copy(&cand, staged_dir.join(name)).ok();
-                }
+                stage_binary(&cand, staged_dir);
                 return;
             }
         }
@@ -170,10 +222,7 @@ fn link_built_exe(src_manifest_dir: &std::path::Path, staged_dir: &std::path::Pa
                     .to_string_lossy()
                     .to_ascii_lowercase();
                 if n == want || n == format!("{want}.exe") {
-                    let name = p.file_name().unwrap().to_owned();
-                    if std::fs::hard_link(&p, staged_dir.join(&name)).is_err() {
-                        std::fs::copy(&p, staged_dir.join(&name)).ok();
-                    }
+                    stage_binary(&p, staged_dir);
                     return;
                 }
             }
