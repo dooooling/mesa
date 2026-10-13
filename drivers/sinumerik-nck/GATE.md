@@ -27,6 +27,19 @@
   - G5 旧 NCK Task JSON 被明确拒绝，无自动迁移。✅
   - G6 transport 语义按实测修正：NCK 响应为 `0x05/0x06/0x07/0x09` +
     **字节**长度；早期脚手架用的 `0x04`+位长度（PLC S7ANY 习惯）已更正。✅
+- Gate G-C（独立验收与发布闭环，PR-C）：用**删除前的冻结数据**与**实体机**
+  独立验证，而不是用新代码自证。
+  - GC1 旧→新寻址等价门：`tests/legacy_equivalence.rs` 逐条断言原生路径复现
+    62 条冻结目录地址字节（42 NC 变量 + 20 驱动对象），并断言两条入口不折叠。✅
+  - GC2 实体机只读对照：`docs/evidence/nck-live-native-probe.txt` —— 用**新的**
+    原生地址 + 内建探针在实体 828D 上取值，与旧目录路径一致
+    （轴名/通道映射/驱动号/主轴归属/两条入口 `p0199`/候选参数）。✅
+  - GC3 决策与来源留档：`docs/adr/0004-nck-native-addressing.md`（决策、取舍、
+    被否决方案）、`presets/PROVENANCE.md`（42 条保留/弃用与来源 + 未纳入项）。✅
+  - GC4 升级路径写实：`CONTRACT.md` §升级与迁移 记录备份→停止→重建→核对
+    四步与“无自动迁移”的明确承诺。✅
+  - GC5 全量回归 + 契约证据 + CI（含 stress/perf/web/三平台）在最终 SHA 上全绿。⬜
+    待 #96/#97 合并后在合并后的 SHA 上重跑并留档。
 - Gate F（外部无真机验证，ADR 0002）：真机到手前可证明项的上限。
   - F1 source provenance pinned（`docs/evidence/nck-external-sources.lock.json`，
     三源 commit 锁定）。✅
