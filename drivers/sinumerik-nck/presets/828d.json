@@ -1,0 +1,1252 @@
+{
+  "version": 1,
+  "scope": "配置预填模板；不参与 Configure/Poll 准入，不构成硬件验证结论",
+  "templates": [
+    {
+      "id": "828d.C.S.progStatus.nc_variable",
+      "family": "828d",
+      "label": "S/progStatus U16_LE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 127,
+        "column": 13,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U16_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.B.S.opMode.nc_variable",
+      "family": "828d",
+      "label": "S/opMode U16_LE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "B",
+        "module": 127,
+        "column": 3,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U16_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.C.SPARPP.progName.nc_variable",
+      "family": "828d",
+      "label": "SPARPP/progName UTF8_NUL_LAST_32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 122,
+        "column": 5,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "UTF8_NUL_LAST_32",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.C.SPARP.progName.nc_variable",
+      "family": "828d",
+      "label": "SPARP/progName UTF8_NUL_LAST_32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 125,
+        "column": 3,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "UTF8_NUL_LAST_32",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.C.SPARP.actLineNumber.nc_variable",
+      "family": "828d",
+      "label": "SPARP/actLineNumber I32_LE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 125,
+        "column": 9,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "I32_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.C.SPARP.actBlock.nc_variable",
+      "family": "828d",
+      "label": "SPARP/actBlock UTF8_NUL_FIRST_66",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 125,
+        "column": 31,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "UTF8_NUL_FIRST_66",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.C.SGA.actToolBasePos.nc_variable",
+      "family": "828d",
+      "label": "SGA/actToolBasePos F64_LE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 115,
+        "column": 2,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "LX coordinate label is preserved in imported point keys; use the official setpoint/MCS or actual/BCS meaning, not a guessed encoder/WCS value"
+    },
+    {
+      "id": "828d.C.SEGA.actProgPosBKS.nc_variable",
+      "family": "828d",
+      "label": "SEGA/actProgPosBKS F64_LE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 112,
+        "column": 33,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "LX coordinate label is preserved in imported point keys; use the official setpoint/MCS or actual/BCS meaning, not a guessed encoder/WCS value"
+    },
+    {
+      "id": "828d.C.S.actFeedRateIpo.nc_variable",
+      "family": "828d",
+      "label": "S/actFeedRateIpo F64_LE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 127,
+        "column": 1,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.C.S.cmdFeedRateIpo.nc_variable",
+      "family": "828d",
+      "label": "S/cmdFeedRateIpo F64_LE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 127,
+        "column": 2,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.C.S.feedRateIpoOvr.nc_variable",
+      "family": "828d",
+      "label": "S/feedRateIpoOvr F64_LE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 127,
+        "column": 3,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09",
+        "unit": "%"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.C.SSP.actSpeed.nc_variable",
+      "family": "828d",
+      "label": "SSP/actSpeed F64_LE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 114,
+        "column": 2,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.C.SSP.cmdSpeed.nc_variable",
+      "family": "828d",
+      "label": "SSP/cmdSpeed F64_LE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 114,
+        "column": 3,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.C.SSP.speedOvr.nc_variable",
+      "family": "828d",
+      "label": "SSP/speedOvr F64_LE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 114,
+        "column": 4,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09",
+        "unit": "%"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.C.S.actTNumber.nc_variable",
+      "family": "828d",
+      "label": "S/actTNumber U16_LE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 127,
+        "column": 23,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U16_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.C.RP.rpa.nc_variable",
+      "family": "828d",
+      "label": "RP/rpa F64_LE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 21,
+        "column": 1,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.V.M.r0021.nc_variable",
+      "family": "828d",
+      "label": "M/r0021 F32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 21,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.V.M.r0021.drive_object",
+      "family": "828d",
+      "label": "M/r0021 F32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 21,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.V.M.r0027.nc_variable",
+      "family": "828d",
+      "label": "M/r0027 F32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 27,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.V.M.r0027.drive_object",
+      "family": "828d",
+      "label": "M/r0027 F32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 27,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.V.M.r0035.nc_variable",
+      "family": "828d",
+      "label": "M/r0035 F32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 35,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.V.M.r0035.drive_object",
+      "family": "828d",
+      "label": "M/r0035 F32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 35,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+    },
+    {
+      "id": "828d.V.M.r0033.nc_variable",
+      "family": "828d",
+      "label": "M/r0033 F32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 33,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07",
+        "unit": "%"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "828D NC variable list does not list r0033; real-controller availability remains unconfirmed LX ReadLoad: V/M/unit=index,column=33,line=1,count=1,byte_order=1; VM readback accepted"
+    },
+    {
+      "id": "828d.V.M.r0033.drive_object",
+      "family": "828d",
+      "label": "M/r0033 F32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 33,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07",
+        "unit": "%"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "828D NC variable list does not list r0033; real-controller availability remains unconfirmed LX ReadLoad: V/M/unit=index,column=33,line=1,count=1,byte_order=1; VM readback accepted"
+    },
+    {
+      "id": "828d.V.M.r0031.nc_variable",
+      "family": "828d",
+      "label": "M/r0031 F32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 31,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07",
+        "unit": "Nm"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "828D NC variable list does not list r0031; no successful network readback; VM returned item 0x85 SINAMICS r0031 definition plus V/M drive parameter addressing candidate"
+    },
+    {
+      "id": "828d.V.M.r0031.drive_object",
+      "family": "828d",
+      "label": "M/r0031 F32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 31,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07",
+        "unit": "Nm"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "828D NC variable list does not list r0031; no successful network readback; VM returned item 0x85 SINAMICS r0031 definition plus V/M drive parameter addressing candidate"
+    },
+    {
+      "id": "828d.V.M.r0062.nc_variable",
+      "family": "828d",
+      "label": "M/r0062 F32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 62,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0062.drive_object",
+      "family": "828d",
+      "label": "M/r0062 F32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 62,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0063.nc_variable",
+      "family": "828d",
+      "label": "M/r0063 F32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 63,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0063.drive_object",
+      "family": "828d",
+      "label": "M/r0063 F32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 63,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0064.nc_variable",
+      "family": "828d",
+      "label": "M/r0064 F32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 64,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0064.drive_object",
+      "family": "828d",
+      "label": "M/r0064 F32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 64,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0077.nc_variable",
+      "family": "828d",
+      "label": "M/r0077 F32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 77,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0077.drive_object",
+      "family": "828d",
+      "label": "M/r0077 F32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 77,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0078.nc_variable",
+      "family": "828d",
+      "label": "M/r0078 F32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 78,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0078.drive_object",
+      "family": "828d",
+      "label": "M/r0078 F32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 78,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0079.nc_variable",
+      "family": "828d",
+      "label": "M/r0079 F32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 79,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0079.drive_object",
+      "family": "828d",
+      "label": "M/r0079 F32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 79,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0080.nc_variable",
+      "family": "828d",
+      "label": "M/r0080 F32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 80,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0080.drive_object",
+      "family": "828d",
+      "label": "M/r0080 F32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 80,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0081.nc_variable",
+      "family": "828d",
+      "label": "M/r0081 F32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 81,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0081.drive_object",
+      "family": "828d",
+      "label": "M/r0081 F32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 81,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0082.nc_variable",
+      "family": "828d",
+      "label": "M/r0082 F32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 82,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0082.drive_object",
+      "family": "828d",
+      "label": "M/r0082 F32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 82,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0103.nc_variable",
+      "family": "828d",
+      "label": "M/r0103 U16_BE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 103,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U16_BE",
+        "transport_size": "0x06"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0103.drive_object",
+      "family": "828d",
+      "label": "M/r0103 U16_BE（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 103,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U16_BE",
+        "transport_size": "0x06"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.p0105.nc_variable",
+      "family": "828d",
+      "label": "M/p0105 I16_BE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 105,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "I16_BE",
+        "transport_size": "0x05"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.p0105.drive_object",
+      "family": "828d",
+      "label": "M/p0105 I16_BE（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 105,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "I16_BE",
+        "transport_size": "0x05"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0106.nc_variable",
+      "family": "828d",
+      "label": "M/r0106 I16_BE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 106,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "I16_BE",
+        "transport_size": "0x05"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "828D SINAMICS参数手册08/2018确认Integer16活跃/不活跃状态；simDrive03/2025未单列该参数。当前软件控制器及实体828D只读响应已分别核对。 只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0106.drive_object",
+      "family": "828d",
+      "label": "M/r0106 I16_BE（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 106,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "I16_BE",
+        "transport_size": "0x05"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "828D SINAMICS参数手册08/2018确认Integer16活跃/不活跃状态；simDrive03/2025未单列该参数。当前软件控制器及实体828D只读响应已分别核对。 只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0107.nc_variable",
+      "family": "828d",
+      "label": "M/r0107 I16_BE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 107,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "I16_BE",
+        "transport_size": "0x05"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0107.drive_object",
+      "family": "828d",
+      "label": "M/r0107 I16_BE（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 107,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "I16_BE",
+        "transport_size": "0x05"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0108.nc_variable",
+      "family": "828d",
+      "label": "M/r0108 U32",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 108,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U32_BE",
+        "transport_size": "0x06"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.r0108.drive_object",
+      "family": "828d",
+      "label": "M/r0108 U32（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 108,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U32_BE",
+        "transport_size": "0x06"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.p0199.nc_variable",
+      "family": "828d",
+      "label": "M/p0199 UTF16_BE",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 199,
+        "count": 25,
+        "unit_mode": "current",
+        "decode": "UTF16_BE",
+        "transport_size": "0x06"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.V.M.p0199.drive_object",
+      "family": "828d",
+      "label": "M/p0199 UTF16_BE（驱动对象入口 module130）",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 199,
+        "count": 25,
+        "unit_mode": "current",
+        "decode": "UTF16_BE",
+        "transport_size": "0x06"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.N.M.MDSA_AXCONF_MACHAX_NAME_TAB.nc_variable",
+      "family": "828d",
+      "label": "M/MDSA_AXCONF_MACHAX_NAME_TAB UTF8_FIXED_16",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "N",
+        "module": 26,
+        "column": 10000,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "UTF8_FIXED_16",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.A.M.MDCA_CTRLOUT_MODULE_NR.nc_variable",
+      "family": "828d",
+      "label": "M/MDCA_CTRLOUT_MODULE_NR U8",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "A",
+        "module": 26,
+        "column": 30110,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U8",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.A.M.MDCA_ENC_MODULE_NR.nc_variable",
+      "family": "828d",
+      "label": "M/MDCA_ENC_MODULE_NR U8",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "A",
+        "module": 26,
+        "column": 30220,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U8",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.A.M.MDCA_CTRLOUT_TYPE.nc_variable",
+      "family": "828d",
+      "label": "M/MDCA_CTRLOUT_TYPE U8",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "A",
+        "module": 26,
+        "column": 30130,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U8",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.C.M.AXCONF_MACHAX_USED.nc_variable",
+      "family": "828d",
+      "label": "M/AXCONF_MACHAX_USED U8",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 26,
+        "column": 20070,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U8",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "只读软件控制器记录及独立原始响应向量；非真机支持声明"
+    },
+    {
+      "id": "828d.A.M.SPIND_ASSIGN_TO_MACHAX.nc_variable",
+      "family": "828d",
+      "label": "M/SPIND_ASSIGN_TO_MACHAX U8",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "A",
+        "module": 26,
+        "column": 35000,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U8",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "description": "实体828D只读返回：C轴的主轴编号为1；完整硬件Gate仍待完成"
+    }
+  ]
+}

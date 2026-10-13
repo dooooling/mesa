@@ -84,7 +84,9 @@ fn item(linecount: u8) -> NckReadItem {
             line_count: linecount,
         },
         expected_data_len: linecount as usize * 8,
-        expected_transport_size: 0x04,
+        // 模拟器缺省响应 transport 为 0x09，长度字段为字节数
+        // （与实体机捕获一致；PLC S7ANY 的位长度规则不适用于 NCK）。
+        expected_transport_size: 0x09,
     }
 }
 
@@ -128,7 +130,8 @@ async fn e2e_wrong_transport() {
     let out = c.read_vars(&[item(1)]).await.expect("读返回");
     assert!(out[0].data.is_none(), "transport 不符必须 BAD");
     assert_eq!(out[0].return_code, 0xFF);
-    assert_eq!(out[0].transport_size, 0x07);
+    // 注入的合法错配 transport：期望 0x09 → 实际 0x05。
+    assert_eq!(out[0].transport_size, 0x05);
 }
 
 #[tokio::test]

@@ -10,8 +10,10 @@
 //!   当包第 k 项返回 `0x05` 无数据；`truncate` 模式返回截断包（畸形测试）；
 //! - 收到的规范字节原样记录（`received_specs`），测试断言 exact 发送字节。
 //!
-//! NOTE: 响应 transport_size 取 `0x04`（NCK 真实回传值待抓包确认；传输层
-//! 切片只看 len_bits，非 0x03 均同途，驱动侧 V1 不校验该字段，待 Gate 确认）。
+//! NOTE: 响应 transport 由 `NckFixtureState::transport_size` 指定（缺省
+//! `0x09`），长度字段为**字节**数。实体机与虚拟控制器捕获均为
+//! `0x05/0x06/0x07/0x09` + 字节长度（`docs/evidence/nck-drive-object-readback.json`）；
+//! 早期脚手架用的 `0x04`+位长度是 PLC S7ANY 习惯，不得套用到 NCK。
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -33,6 +35,12 @@ pub struct NckFixtureState {
     pub max_pdu: u16,
     /// 单元素字节数（响应数据长度 = linecount × element_size）。
     pub element_size: usize,
+    /// 响应 transport 字段（0 = 缺省 `0x09`）。
+    ///
+    /// 实体机与虚拟控制器捕获均为 `0x05/0x06/0x07/0x09` 且长度字段是**字节**数
+    /// （见 `docs/evidence/nck-drive-object-readback.json`）；早期脚手架用
+    /// `0x04`+位长度是 S7ANY 习惯，**不得**套用到 NCK。
+    pub transport_size: u8,
     /// 当包内注入 BAD 的项索引（0 起，每请求重新计数）。
     pub fail_items: HashSet<usize>,
     /// 畸形模式：读响应截断（malformed 测试）。
@@ -54,6 +62,15 @@ pub struct NckFixtureState {
 }
 
 impl NckFixtureState {
+    /// 实际使用的响应 transport（0 视为缺省 `0x09`）。
+    pub fn effective_transport(&self) -> u8 {
+        if self.transport_size == 0 {
+            0x09
+        } else {
+            self.transport_size
+        }
+    }
+
     pub fn with_max_pdu(max_pdu: u16) -> Self {
         Self {
             max_pdu,
@@ -278,7 +295,7 @@ fn read_ack(req: &[u8], state: &NckFixtureState, ordinal: &mut u64) -> Vec<u8> {
             if !valid {
                 return Vec::new();
             }
-            data.extend_from_slice(&[0x05, 0x04, 0x00, 0x00]);
+            data.extend_from_slice(&[0x05, state.effective_transport(), 0x00, 0x00]);
             continue;
         }
         if let Some(code) = state.recorded_jobs.get(spec) {
@@ -303,22 +320,19 @@ fn read_ack(req: &[u8], state: &NckFixtureState, ordinal: &mut u64) -> Vec<u8> {
             continue;
         }
         // 数据长度 = linecount × element_size；pattern 全字节为序号 tag。
-        // P1-4 注入：wrong_transport 改 transport（长度按 byte 自洽）；
-        // short_payload 减半数据（长度字段同步减半，自洽短包）。
+        // NCK 响应 transport ∈ {0x05,0x06,0x07,0x09}，长度字段为**字节**数。
+        // P1-4 注入：wrong_transport 换成另一个合法 transport（长度自洽，
+        // 仍按字节）；short_payload 减半数据（长度字段同步减半，自洽短包）。
         let linecount = spec[9] as usize;
         let len = linecount * state.element_size;
-        let (transport, wire_len) = if state.wrong_transport {
-            (0x07u8, len)
-        } else if state.short_payload {
-            (0x04u8, len / 2)
+        let want = state.effective_transport();
+        let transport = if state.wrong_transport {
+            if want == 0x05 { 0x07 } else { 0x05 }
         } else {
-            (0x04u8, len)
+            want
         };
-        let len_field = if transport == 0x04 {
-            (wire_len * 8) as u16
-        } else {
-            wire_len as u16
-        };
+        let wire_len = if state.short_payload { len / 2 } else { len };
+        let len_field = wire_len as u16;
         data.push(0xFF);
         data.push(transport);
         data.extend_from_slice(&len_field.to_be_bytes());
@@ -383,7 +397,8 @@ mod tests {
                 line_count: linecount,
             },
             expected_data_len: linecount as usize * 8,
-            expected_transport_size: 0x04,
+            // 脚手架缺省响应 transport 为 0x09（实体机见过的字节长度类型）。
+            expected_transport_size: 0x09,
         }
     }
 
@@ -635,7 +650,7 @@ mod tests {
 
     #[tokio::test]
     async fn nck_transport_size_mismatch_is_bad() {
-        // P1-4：return_code FF 但 transport 0x07≠期望 0x04 → 按项 BAD
+        // P1-4：return_code FF 但 transport 0x05≠期望 0x09 → 按项 BAD
         // （错误类型的数据绝不能标 GOOD），不整体失败。
         let fx = NckFixture::spawn(NckFixtureState {
             wrong_transport: true,
@@ -650,7 +665,7 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(out[0].data.is_none(), "transport 不符必须 BAD");
         assert_eq!(out[0].return_code, 0xFF);
-        assert_eq!(out[0].transport_size, 0x07);
+        assert_eq!(out[0].transport_size, 0x05);
         assert!(out[1].data.is_none());
     }
 
@@ -685,7 +700,7 @@ mod tests {
                 line_count: 255,
             },
             expected_data_len: 255 * 8,
-            expected_transport_size: 0x04,
+            expected_transport_size: 0x09,
         };
         let err = c.read_vars(&[huge]).await.unwrap_err();
         assert_eq!(err.code, "READ_ITEM_TOO_LARGE");

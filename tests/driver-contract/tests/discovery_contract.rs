@@ -222,9 +222,10 @@ async fn browse_pagination_does_not_return_all_at_once() {
 
 #[tokio::test]
 async fn browse_sinumerik_nck_catalog_tree_e2e() {
-    // ADR 0001 Commit E：`sinumerik-nck` browse 是 Catalog 虚拟树（纯函数，
-    // 无需会话）——子进程 E2E：驱动被发现、二进制可拉起、browse 200。
-    // 随仓 catalog 为空（真机回填前），根即空页；身份形态为 `nck://` canonical。
+    // 原生寻址重构后：browse 只有两类入口——可选模板预填 与 只读身份核对。
+    // 子进程 E2E：驱动被发现、二进制可拉起、browse 200。
+    // `840d-sl` 暂无模板且未取得身份探针证据，因此根 = 模板目录 + 明确诊断
+    // （不得伪装成空目录，也不得套用 828D 探针）。
     // 注意：改过驱动代码后须先 cargo build --workspace（旧二进制静默失效）。
     let _guard = BROWSE_SERIAL.lock().await;
     let drivers_dir = common::repo_root().join("drivers");
@@ -248,9 +249,26 @@ async fn browse_sinumerik_nck_catalog_tree_e2e() {
         .header("content-type", "application/json")
         .body(Body::from(r#"{"parent":"","limit":10}"#))
         .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
     let v = assert_browse_ok(resp, "sinumerik-nck").await;
     let nodes = v["nodes"].as_array().expect("nodes 数组");
-    // 空 catalog → 空根（不伪造内容）；未知 parent 同样空页。
-    assert!(nodes.is_empty(), "空 catalog 根必须为空，实际: {v}");
+    assert_eq!(nodes.len(), 2, "模板入口 + 系列提示，实际: {v}");
+    assert_eq!(nodes[0]["id"], "nck://presets");
+    assert_eq!(
+        nodes[1]["kind"], "diagnostic",
+        "无探针系列必须明确提示身份浏览待验证"
+    );
+    // 根目录不访问控制器；未知 parent 同样空页（不伪造内容）。
+    let req = Request::builder()
+        .uri(format!("/api/v1/endpoints/{ep_id}/browse"))
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"parent":"nck://unknown","limit":10}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let v = assert_browse_ok(resp, "sinumerik-nck").await;
+    assert!(
+        v["nodes"].as_array().expect("nodes 数组").is_empty(),
+        "未知 parent 必须为空页，实际: {v}"
+    );
 }

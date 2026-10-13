@@ -13,8 +13,20 @@
   ✅ 已过（Commit D；评审 P1-1/P1-2/P1-4/P2-1 修复后 exact gates 重验通过，
   含 JoinSet 双 task 回归 + transport/length 逐项校验 + 单 item 超 PDU 拒绝）。
 - Gate E（topology+browse）：probe（会话可达 + 身份诚实待确认）/
-  topology 类型 / Catalog 虚拟浏览树（binding 回环可用）/ 管理面 E2E。
-  ✅ 已过（Commit E）。probe anchor 与 topology 实例回填待真机 PR7。
+  管理面 E2E。✅ 已过（Commit E）。probe anchor 待真机 PR7。
+  （注：原“Catalog 虚拟浏览树”已由原生寻址重构移除，见 Gate G。）
+- Gate G（原生寻址重构，PR-A/PR-B）：Catalog 退出采集准入，改为唯一
+  `NativeNckAddress` 严格解析 + 内建身份探针 + 可选 Preset 预填。
+  - G1 原生字段严格解析（未知字段/旧字段/别名/越界/非整数一律拒绝），
+    `resolve_native` 不读任何文件即可产出 wire 规格。✅
+  - G2 独立 golden：R394 `12 08 82 41 00 01 01 8B 15 01`；原候选目录的
+    17 条 wire 向量改经「模板 + 用户输入」复现。✅
+  - G3 身份浏览改用内建 `IdentityProbeSpec`；`p0199` 两条入口各有捕获
+    字节 golden；分页/拒绝/表尾/过滤语义不减覆盖。✅
+  - G4 模板缺失或非法**不影响** Configure/Poll（空/坏模板 + 采集回归）。✅
+  - G5 旧 NCK Task JSON 被明确拒绝，无自动迁移。✅
+  - G6 transport 语义按实测修正：NCK 响应为 `0x05/0x06/0x07/0x09` +
+    **字节**长度；早期脚手架用的 `0x04`+位长度（PLC S7ANY 习惯）已更正。✅
 - Gate F（外部无真机验证，ADR 0002）：真机到手前可证明项的上限。
   - F1 source provenance pinned（`docs/evidence/nck-external-sources.lock.json`，
     三源 commit 锁定）。✅
@@ -39,19 +51,43 @@ connect / probe / channel+axis topology / 轴实际值与速度 / R 参数 /
 
 ## 状态
 
-- 当前：experimental（828d随仓目录提供公共候选映射，common/840d-sl仍为空；
-  候选可解析与只读验证，不等于通过硬件Gate；生产probe身份恒待确认）。
-- 真机前恒为 ❌（Gate F 通过也不翻转）：`NCK_ANCHOR_PENDING` / TSAP confirmed /
-  Catalog mapping / 840D supported。
+- 当前：experimental（828d 随仓提供公共候选**模板**，840d-sl 暂无模板；
+  模板可预填与只读验证，不等于通过硬件 Gate；生产 probe 身份恒待确认）。
+- 真机前恒为 ❌（Gate F/G 通过也不翻转）：`NCK_ANCHOR_PENDING` / TSAP confirmed /
+  地址语义已确认 / 840D supported。
 - `supported` 需全部真机门通过后翻转。
+- 原生寻址重构**不提升**支持等级：能读一个结构合法的地址，只证明该地址
+  在该目标上可读，不等于该变量的工程语义已确认（见 CONTRACT「三种真实性」）。
+
+## 剩余 20 点对账（2026-10-13 基线，全部 HOLD）
+
+见 `docs/evidence/nck-remaining-20-reconciliation.md`。要点：
+
+- 实体机 8 轴实测名为 `MX1/MY1/MZ1/MSP1/MA1/MB1/MC1/MQ1`；**Y 轴存在**，
+  先前依据点位键名推断的“无 Y 轴”不成立（已撤销）。
+- 轴 4 为唯一主轴（`MD35000=1`）；轴 6 无驱动输出（`MD30130=0`），
+  与 module-26 `V/6` 恰为唯一被拒对象吻合。
+- **驱动对象↔机床轴归属仍无法用只读手段建立**：catalog 参数集内无轴归属
+  读数，`r0103/p0105/r0106/r0107/r0108` 在各 `V/n` 取值均匀，
+  跨路径 `r0035` 全为同一值，`p0199` 名称不编码轴名。
+  故 `V/2`、`V/5`、`V/6` 相关点位保持 HOLD。
+- 重构后“旧 catalog 白名单”不再存在：这些结论只影响**语义标签可信度**，
+  不阻塞原生地址的结构化只读测试。
+
 
 ## 软件控制器的驱动对象证据
 
-模块130是显式候选入口，正式入口名及硬件适用性待确认。新增目录、UTF-16
+模块 130 是显式候选入口，正式入口名及硬件适用性待确认。模板、UTF-16
 对象名和整数响应长度修复可由独立软件控制器向量及测试验证；不改变真机门。
-对象浏览通过MD30110/MD30130与p0199呈现身份，NC轴入口及候选对象入口分开
-展示，不因相同编号推断关联。r0027/r0031仍可能被设备拒绝，不能以r0078/r0080
-成功替代其验收。
+对象浏览通过 MD30110/MD30130/MD35000 与 p0199 呈现身份，NC 轴入口及候选
+对象入口分开展示，不因相同编号推断关联。r0027/r0031 仍可能被设备拒绝，
+不能以 r0078/r0080 成功替代其验收。
+
+实体机只读实测记录见 `docs/evidence/nck-live-identity-probe.txt`
+（探针 `tests/live_identity_probe.rs`，`#[ignore]`，显式 `--ignored` 运行；
+只读、单会话、不写参数）。该探针**直接使用生产身份探针常量**，
+因此同时验证 `src/identity_spec.rs` 的探针数值与实体机一致。
+
 
 ## 实体828D的有限只读验证（2026-10-13）
 

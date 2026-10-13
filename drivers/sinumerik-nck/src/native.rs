@@ -38,6 +38,25 @@ pub const MAX_UNIT_LEN: usize = 32;
 /// PLC S7ANY 的同名字段。
 pub const TRANSPORT_SIZES: [u8; 4] = [0x05, 0x06, 0x07, 0x09];
 
+/// 规范 `decode` 词表（Descriptor Enum 与严格解析共用同一来源）。
+pub const DECODE_NAMES: [&str; 15] = [
+    "F64_BE",
+    "F64_LE",
+    "F32_BE",
+    "I32_BE",
+    "I32_LE",
+    "U32_BE",
+    "U16_BE",
+    "U16_LE",
+    "I16_BE",
+    "U8",
+    "BOOL",
+    "UTF8_FIXED_16",
+    "UTF8_NUL_LAST_32",
+    "UTF8_NUL_FIRST_66",
+    "UTF16_BE",
+];
+
 /// 无效工程值规则（显式配置，不靠目录隐式继承）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InvalidRule {
