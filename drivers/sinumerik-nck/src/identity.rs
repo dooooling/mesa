@@ -1,9 +1,14 @@
 //! 轴与驱动对象的有界只读浏览。临时Browse连接不保留跨请求缓存。
 //! 根目录纯本地，列表按实例编号分页，展开时仅重新核对选中对象。
-use crate::{
-    NckArea, NckCatalog, NckClient, NckConnConfig, NckReadItem, NckVariableRef, decode_value,
-    resolve_wire,
+//!
+//! 身份探针是**驱动内建诊断程序**（`identity_spec`），不查变量目录、
+//! 不依赖模板文件存在，也不构成“允许采集哪些地址”的白名单。
+use crate::identity_spec::{
+    AXIS_CTRLOUT_MODULE_NR, AXIS_CTRLOUT_TYPE, AXIS_NAME, AXIS_SPIND_ASSIGN, DRIVE_OBJECT_NAME,
+    DRIVE_OBJECT_NAME_M130, IdentityProbeSpec, probes_for_family,
 };
+use crate::presets::{PresetRegistry, leaf_node_with};
+use crate::{NckClient, NckConnConfig, decode_value};
 use mesa_core_types::{ErrorKind, Value};
 use mesa_driver_protocol::pb::BrowseNode;
 use mesa_driver_sdk::SdkDriverError;
@@ -24,11 +29,9 @@ struct AxisIdentity {
     notes: Vec<String>,
 }
 
-pub fn supported(catalog: &NckCatalog) -> bool {
-    catalog
-        .lookup(NckArea::Nck, "M", "MDSA_AXCONF_MACHAX_NAME_TAB")
-        .is_ok()
-        && catalog.lookup(NckArea::FeedDrive, "M", "p0199").is_ok()
+/// 该系列是否有已核对的探针集合（未取得真实证据的系列不得套用 828D 探针）。
+pub fn supported(family: &str) -> bool {
+    probes_for_family(family).is_some()
 }
 
 fn folder(id: &str, label: &str) -> BrowseNode {
@@ -63,31 +66,19 @@ fn device_rejected(error: &SdkDriverError) -> bool {
     error.code.starts_with("S7_JOB_") || error.code.starts_with("S7_ITEM_")
 }
 
-fn parameters(area: &str, unit: u16, variable: &str, line: u16, path: &str) -> serde_json::Value {
-    serde_json::json!({"area":area,"area_no":unit,"block":"M","variable":variable,
-        "line":line,"count":if variable == "p0199" {25} else {1},"access_path":path})
-}
-
 /// 只有成功解码的空名称代表表尾；作业/单项拒绝与本地解码失败均保留为错误。
+///
+/// `target` 填入探针的可变槽位（`ProbeSlot::TargetIndex`）；探针是内建常量，
+/// 不查目录、不依赖模板。
 async fn read(
     client: &mut NckClient,
-    catalog: &NckCatalog,
-    parameters: serde_json::Value,
+    spec: &IdentityProbeSpec,
+    target: u16,
 ) -> Result<Value, SdkDriverError> {
-    let reference = NckVariableRef::from_parameters(parameters.as_object().unwrap())
+    let (_, item) = spec
+        .resolve(target)
         .map_err(|e| SdkDriverError::configuration("IDENTITY_ADDRESS", e.to_string()))?;
-    let def = catalog
-        .lookup(reference.area, "M", &reference.variable)
-        .map_err(|e| SdkDriverError::configuration("IDENTITY_CATALOG", e.to_string()))?;
-    let resolved = resolve_wire(&reference, def)
-        .map_err(|e| SdkDriverError::configuration("IDENTITY_ADDRESS", e.to_string()))?;
-    let results = client
-        .read_vars(&[NckReadItem {
-            wire: resolved.wire,
-            expected_data_len: resolved.expected_data_len,
-            expected_transport_size: resolved.expected_transport_size,
-        }])
-        .await?;
+    let results = client.read_vars(&[item]).await?;
     let result = results.first().ok_or_else(|| {
         SdkDriverError::new(
             ErrorKind::Protocol,
@@ -100,8 +91,8 @@ async fn read(
             ErrorKind::Address,
             format!("S7_ITEM_0x{:02X}", result.return_code),
             format!(
-                "变量{}被设备拒绝，原始单项码0x{:02X}",
-                reference.variable, result.return_code
+                "身份探针{}被设备拒绝，原始单项码0x{:02X}",
+                spec.name, result.return_code
             ),
         ));
     }
@@ -112,7 +103,7 @@ async fn read(
             "响应类型或长度不符，不能当作未定义对象",
         )
     })?;
-    decode_value(bytes, resolved.kind)
+    decode_value(bytes, spec.decode)
         .map_err(|e| SdkDriverError::new(ErrorKind::Protocol, "IDENTITY_DECODE", e.to_string()))
 }
 
@@ -138,58 +129,22 @@ fn as_u32(value: Value) -> Result<u32, SdkDriverError> {
     }
 }
 
-async fn axis(
-    client: &mut NckClient,
-    catalog: &NckCatalog,
-    index: u16,
-) -> Result<Option<AxisIdentity>, SdkDriverError> {
-    let name = as_string(
-        read(
-            client,
-            catalog,
-            parameters("N", 1, "MDSA_AXCONF_MACHAX_NAME_TAB", index, "nc_variable"),
-        )
-        .await?,
-    )?;
+async fn axis(client: &mut NckClient, index: u16) -> Result<Option<AxisIdentity>, SdkDriverError> {
+    let name = as_string(read(client, &AXIS_NAME, index).await?)?;
     if name.is_empty() {
         return Ok(None);
     }
-    let number = as_u32(
-        read(
-            client,
-            catalog,
-            parameters("A", index, "MDCA_CTRLOUT_MODULE_NR", 1, "nc_variable"),
-        )
-        .await?,
-    )?;
+    let number = as_u32(read(client, &AXIS_CTRLOUT_MODULE_NR, index).await?)?;
     let drive = (1..=u32::from(MAX_INSTANCE))
         .contains(&number)
         .then_some(number as u16);
-    let output_type = as_u32(
-        read(
-            client,
-            catalog,
-            parameters("A", index, "MDCA_CTRLOUT_TYPE", 1, "nc_variable"),
-        )
-        .await?,
-    )?;
-    let spindle = as_u32(
-        read(
-            client,
-            catalog,
-            parameters("A", index, "SPIND_ASSIGN_TO_MACHAX", 1, "nc_variable"),
-        )
-        .await?,
-    )?;
+    let output_type = as_u32(read(client, &AXIS_CTRLOUT_TYPE, index).await?)?;
+    let spindle = as_u32(read(client, &AXIS_SPIND_ASSIGN, index).await?)?;
     let mut notes = Vec::new();
     let object_name = if let Some(drive) = drive.filter(|_| output_type == 1) {
-        match read(
-            client,
-            catalog,
-            parameters("V", drive, "p0199", 1, "nc_variable"),
-        )
-        .await
-        {
+        // NC 变量入口（module 26）读驱动对象名；与 module 130 入口编号不同，
+        // 因此这里只核对该入口自身的对象身份，不做跨入口换算。
+        match read(client, &DRIVE_OBJECT_NAME, drive).await {
             Ok(value) => {
                 let name = as_string(value)?;
                 (!name.is_empty()).then_some(name)
@@ -253,18 +208,24 @@ fn object_node(unit: u16, name: &str) -> BrowseNode {
     )
 }
 
-fn variable_nodes(catalog: &NckCatalog, unit: u16, path: &str, label: &str) -> Vec<BrowseNode> {
-    let preset = serde_json::json!({"area_no":unit,"line":1,"access_path":path});
-    catalog
-        .variables()
+/// 变量叶：可选模板 + **已确认实例**填充 `area_no`；
+/// `line` 仍留给使用者确认（不按变量名猜行索引语义）。
+///
+/// 模板缺失时返回空集合——身份核对结果照常显示，不会被模板缺失阻断。
+fn variable_nodes(
+    presets: &PresetRegistry,
+    family: &str,
+    unit: u16,
+    label: &str,
+) -> Vec<BrowseNode> {
+    presets
+        .for_family(family)
         .into_iter()
-        .filter(|def| {
-            def.area == NckArea::FeedDrive
-                && def.block == "M"
-                && (path == "nc_variable" || def.wire.drive_object_module.is_some())
-        })
-        .map(|def| {
-            let mut node = crate::browse::leaf_node(def, preset.as_object().unwrap());
+        // 身份节点代表「驱动对象」，因此只列驱动区（area=V）模板。
+        // 这是**浏览作用域**选择，不是地址准入：手动填写任意 area 都不受影响。
+        .filter(|t| t.parameters.get("area").and_then(|v| v.as_str()) == Some("V"))
+        .map(|t| {
+            let mut node = leaf_node_with(t, &[("area_no", serde_json::Value::from(unit))]);
             node.label = format!("{label} · {}", node.label);
             node
         })
@@ -329,7 +290,6 @@ fn instance_cursor(cursor: &str) -> Result<u16, SdkDriverError> {
 /// 即使无匹配节点仍返回后续游标，避免一次搜索隐式扫描整个控制器。
 async fn instance_page(
     client: &mut NckClient,
-    catalog: &NckCatalog,
     axes: bool,
     filter: &str,
     cursor: &str,
@@ -339,18 +299,16 @@ async fn instance_page(
     let mut nodes = Vec::new();
     for _ in 0..limit_size(limit).min(usize::from(MAX_INSTANCE)) {
         let result = if axes {
-            axis(client, catalog, index)
+            axis(client, index)
                 .await
                 .map(|axis| axis.map(|value| axis_node(&value)))
         } else {
-            read(
-                client,
-                catalog,
-                parameters("V", index, "p0199", 1, "drive_object"),
-            )
-            .await
-            .and_then(as_string)
-            .map(|name| (!name.is_empty()).then(|| object_node(index, &name)))
+            // 驱动对象列表走**显式驱动对象入口**（module 130）；它与 NC 变量
+            // 入口（module 26）编号不同，两者不得互相换算。
+            read(client, &DRIVE_OBJECT_NAME_M130, index)
+                .await
+                .and_then(as_string)
+                .map(|name| (!name.is_empty()).then(|| object_node(index, &name)))
         };
         match result {
             Ok(Some(node)) => {
@@ -423,7 +381,7 @@ fn target(parent: &str) -> Result<Option<Target>, SdkDriverError> {
 /// 单次请求仅读取目标页或选中身份；不遍历另一入口，不推断两个入口编号相同。
 pub async fn browse(
     cfg: &NckConnConfig,
-    catalog: &NckCatalog,
+    presets: &PresetRegistry,
     parent: &str,
     filter: &str,
     cursor: &str,
@@ -448,16 +406,16 @@ pub async fn browse(
     }
     let mut client = NckClient::connect(cfg).await?;
     match target {
-        Target::Axes => instance_page(&mut client, catalog, true, filter, cursor, limit).await,
-        Target::Objects => instance_page(&mut client, catalog, false, filter, cursor, limit).await,
-        Target::Axis(index) => match axis(&mut client, catalog, index).await {
+        Target::Axes => instance_page(&mut client, true, filter, cursor, limit).await,
+        Target::Objects => instance_page(&mut client, false, filter, cursor, limit).await,
+        Target::Axis(index) => match axis(&mut client, index).await {
             Ok(Some(axis)) => {
                 // 身份复核被拒绝后不存在可翻页的变量列表；旧游标不能跳过诊断。
                 if !axis.notes.is_empty() {
                     return Ok((vec![diagnostic(parent, axis.notes.join("；"))], None));
                 }
                 let nodes = if let Some(drive) = axis.drive.filter(|_| axis.object_name.is_some()) {
-                    variable_nodes(catalog, drive, "nc_variable", &axis.name)
+                    variable_nodes(presets, &cfg.family, drive, &axis.name)
                 } else {
                     Vec::new()
                 };
@@ -473,20 +431,14 @@ pub async fn browse(
             )),
             Err(error) => Err(error),
         },
-        Target::Object(unit) => match read(
-            &mut client,
-            catalog,
-            parameters("V", unit, "p0199", 1, "drive_object"),
-        )
-        .await
-        {
+        Target::Object(unit) => match read(&mut client, &DRIVE_OBJECT_NAME_M130, unit).await {
             Ok(value) => {
                 let name = as_string(value)?;
                 local_page(
                     if name.is_empty() {
                         Vec::new()
                     } else {
-                        variable_nodes(catalog, unit, "drive_object", &name)
+                        variable_nodes(presets, &cfg.family, unit, &name)
                     },
                     filter,
                     cursor,

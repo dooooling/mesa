@@ -1,6 +1,6 @@
 //! 每次重建连接模拟管理面临时Browse；断言实际请求，防止隐式全量扫描和拒绝码丢失。
 use mesa_driver_sdk::DriverConnection;
-use mesa_driver_sinumerik_nck::{CatalogRegistry, NckConnConfig, NckConnection};
+use mesa_driver_sinumerik_nck::{NckConnConfig, NckConnection, PresetRegistry};
 use mesa_driver_sinumerik_nck::{NckFixture, NckFixtureState};
 use serde_json::json;
 
@@ -64,11 +64,8 @@ fn connection(fixture: &NckFixture) -> NckConnection {
     let cfg = NckConnConfig::from_json(&json!({"host":"127.0.0.1","port":fixture.addr.port(),
         "family":"828d","local_tsap":256,"remote_tsap":258,"max_read_items":1}))
     .unwrap();
-    let catalog = CatalogRegistry::load_dir(&format!("{}/catalog", env!("CARGO_MANIFEST_DIR")))
-        .unwrap()
-        .resolve("828d")
-        .unwrap();
-    NckConnection::with_catalog(cfg, catalog)
+    // 身份浏览只用内建探针；模板仅用于变量叶预填（可选）。
+    NckConnection::with_presets(cfg, PresetRegistry::embedded())
 }
 
 fn reset_reads(fixture: &NckFixture) {
@@ -150,7 +147,14 @@ async fn fresh_requests_browse_root_pages_axis_object_and_leaf_pages_without_ful
     assert!(next.is_some());
     let binding: serde_json::Value = serde_json::from_str(&leaves[0].binding_json).unwrap();
     assert_eq!(binding["parameters"]["area_no"], 4);
-    assert_eq!(binding["parameters"]["access_path"], "nc_variable");
+    // 身份核对只填 area_no；line 仍需使用者确认（不按变量名猜行索引）。
+    assert!(binding["parameters"].get("line").is_none());
+    assert!(
+        binding["parameters"].get("access_path").is_none(),
+        "新模型不再有访问路径字段，入口由 module 显式表达"
+    );
+    let module = binding["parameters"]["module"].as_u64().unwrap();
+    assert!(module == 26 || module == 130, "module 必须显式可见");
     assert_eq!(fixture.received_specs().len(), 5);
     assert!(fixture.received_specs().iter().all(|s| s[8] == 0x1a));
     reset_reads(&fixture);
@@ -165,9 +169,19 @@ async fn fresh_requests_browse_root_pages_axis_object_and_leaf_pages_without_ful
         .browse("nck://identity/object/6", "r0080", "", 100)
         .await
         .unwrap();
-    let binding: serde_json::Value = serde_json::from_str(&leaves[0].binding_json).unwrap();
-    assert_eq!(binding["parameters"]["area_no"], 6);
-    assert_eq!(binding["parameters"]["access_path"], "drive_object");
+    // 两条入口编号不同，各自一个模板，都必须显式携带自己的 module。
+    assert_eq!(leaves.len(), 2, "module26 与 module130 各一个模板");
+    let mut modules: Vec<u64> = leaves
+        .iter()
+        .map(|n| {
+            let b: serde_json::Value = serde_json::from_str(&n.binding_json).unwrap();
+            assert_eq!(b["parameters"]["area_no"], 6);
+            assert!(b["parameters"].get("access_path").is_none());
+            b["parameters"]["module"].as_u64().unwrap()
+        })
+        .collect();
+    modules.sort_unstable();
+    assert_eq!(modules, vec![26, 130], "入口编号由 module 显式表达");
     assert_eq!(
         fixture.received_specs(),
         vec![bytes("12 08 82 a6 00 c7 00 01 82 19")]

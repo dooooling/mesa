@@ -3,6 +3,10 @@
 //! 目的：为「剩余 20 点对账」补齐实体机的驱动对象身份证据——
 //! `V/5`、`V/6` 是否存在及其 `p0199` 对象名，并复核机床轴名与轴号映射。
 //!
+//! 本探针**直接使用驱动内建的 `IdentityProbeSpec`**（`src/identity_spec.rs`），
+//! 因此同时验证生产身份浏览用的探针数值与实体机一致；其余临时读数走
+//! 原生地址（`NativeNckAddress`），不再依赖任何变量目录。
+//!
 //! 边界：只读；单会话；每次请求项数受 `max_read_items` 限制；
 //! 不写参数、不发控制、不新增点位、不改协议实现。
 //! 用法：
@@ -10,8 +14,9 @@
 //!  --test live_identity_probe -- --ignored --nocapture`
 
 use mesa_driver_sinumerik_nck::{
-    CatalogRegistry, NckClient, NckConnConfig, NckReadItem, NckVariableRef, decode_value,
-    resolve_wire,
+    AXIS_CTRLOUT_MODULE_NR, AXIS_CTRLOUT_TYPE, AXIS_NAME, AXIS_SPIND_ASSIGN, CHANNEL_MACHAX_USED,
+    DRIVE_OBJECT_NAME, DRIVE_OBJECT_NAME_M130, IdentityProbeSpec, NativeNckAddress, NckClient,
+    NckConnConfig, decode_value, resolve_native,
 };
 use serde_json::json;
 
@@ -37,28 +42,36 @@ fn cfg_from_env() -> NckConnConfig {
     .expect("连接参数合法")
 }
 
+/// V 区原生地址（缺省 NC 变量入口 module 26；`module130=true` 走驱动对象入口）。
+fn v_address(
+    area_no: u16,
+    column: u16,
+    decode: &str,
+    transport: &str,
+    count: u8,
+) -> NativeNckAddress {
+    NativeNckAddress::from_parameters(
+        json!({
+            "area": "V", "area_no": area_no, "module": 26, "column": column,
+            "line": 1, "count": count, "unit_mode": "current",
+            "decode": decode, "transport_size": transport,
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .expect("V 区原生地址合法")
+}
+
 /// 单次只读：解析 → 读取 → 解码，返回可打印字符串。
-async fn read_one(
-    client: &mut NckClient,
-    catalog: &mesa_driver_sinumerik_nck::NckCatalog,
-    params: serde_json::Value,
-) -> String {
-    let reference = match NckVariableRef::from_parameters(params.as_object().unwrap()) {
-        Ok(r) => r,
-        Err(e) => return format!("ADDRESS_ERR {e}"),
-    };
-    let def = match catalog.lookup(reference.area, "M", &reference.variable) {
-        Ok(d) => d,
-        Err(e) => return format!("CATALOG_ERR {e}"),
-    };
-    let resolved = match resolve_wire(&reference, def) {
+async fn read_native(client: &mut NckClient, addr: NativeNckAddress) -> String {
+    let rp = match resolve_native(addr) {
         Ok(r) => r,
         Err(e) => return format!("WIRE_ERR {e}"),
     };
-    let item = NckReadItem {
-        wire: resolved.wire,
-        expected_data_len: resolved.expected_data_len,
-        expected_transport_size: resolved.expected_transport_size,
+    let item = mesa_driver_sinumerik_nck::NckReadItem {
+        wire: rp.wire,
+        expected_data_len: rp.expected_data_len,
+        expected_transport_size: rp.expected_transport_size,
     };
     match client.read_vars(&[item]).await {
         Err(e) => format!("JOB_ERR {} {}", e.code, e.message),
@@ -71,7 +84,33 @@ async fn read_one(
             }
             match r.data.as_deref() {
                 None => "NO_DATA".into(),
-                Some(bytes) => match decode_value(bytes, resolved.kind) {
+                Some(bytes) => match decode_value(bytes, rp.kind) {
+                    Ok(value) => format!("OK {value:?}"),
+                    Err(e) => format!("DECODE_ERR {e}"),
+                },
+            }
+        }
+    }
+}
+
+/// 单次只读（内建身份探针路径）。
+async fn read_probe(client: &mut NckClient, spec: &IdentityProbeSpec, target: u16) -> String {
+    let (_, item) = match spec.resolve(target) {
+        Ok(v) => v,
+        Err(e) => return format!("PROBE_ERR {e}"),
+    };
+    match client.read_vars(&[item]).await {
+        Err(e) => format!("JOB_ERR {} {}", e.code, e.message),
+        Ok(results) => {
+            let Some(r) = results.first() else {
+                return "NO_RESULT".into();
+            };
+            if r.return_code != 0xff {
+                return format!("ITEM_REJECTED 0x{:02X}", r.return_code);
+            }
+            match r.data.as_deref() {
+                None => "NO_DATA".into(),
+                Some(bytes) => match decode_value(bytes, spec.decode) {
                     Ok(value) => format!("OK {value:?}"),
                     Err(e) => format!("DECODE_ERR {e}"),
                 },
@@ -84,9 +123,6 @@ async fn read_one(
 #[ignore = "只读真实机床身份核对；需显式 --ignored 运行"]
 async fn live_identity_probe() {
     let cfg = cfg_from_env();
-    let catalog = CatalogRegistry::load_shipped()
-        .and_then(|r| r.resolve("828d"))
-        .expect("828d catalog 装载");
     let mut client = NckClient::connect(&cfg).await.expect("连接失败");
     println!(
         ">>> 已连接 {}:{} pdu={}",
@@ -95,137 +131,69 @@ async fn live_identity_probe() {
         client.negotiated_pdu_length()
     );
 
-    println!("=== 机床轴名 N/1/MDSA_AXCONF_MACHAX_NAME_TAB line=1..8 ===");
+    println!("=== 机床轴名（内建探针 AXIS_NAME）line=1..8 ===");
     for line in 1..=8u16 {
-        let s = read_one(
-            &mut client,
-            &catalog,
-            json!({
-                "area": "N", "area_no": 1, "block": "M",
-                "variable": "MDSA_AXCONF_MACHAX_NAME_TAB",
-                "line": line, "count": 1, "access_path": "nc_variable",
-            }),
-        )
-        .await;
+        let s = read_probe(&mut client, &AXIS_NAME, line).await;
         println!("  机床轴{line}: {s}");
     }
 
-    println!("=== 通道1 位置→机床轴号 C/1/M/AXCONF_MACHAX_USED line=1..8 ===");
+    println!("=== 通道1 位置→机床轴号（内建探针 CHANNEL_MACHAX_USED）line=1..8 ===");
     for line in 1..=8u16 {
-        let s = read_one(
-            &mut client,
-            &catalog,
-            json!({
-                "area": "C", "area_no": 1, "block": "M",
-                "variable": "AXCONF_MACHAX_USED",
-                "line": line, "count": 1, "access_path": "nc_variable",
-            }),
-        )
-        .await;
+        let s = read_probe(&mut client, &CHANNEL_MACHAX_USED, line).await;
         println!("  通道位置{line}: {s}");
     }
 
-    println!("=== 轴驱动号 A/n/M/MDCA_CTRLOUT_MODULE_NR line=1 ===");
+    println!("=== 轴驱动号（内建探针 AXIS_CTRLOUT_MODULE_NR）轴=1..8 ===");
     for n in 1..=8u16 {
-        let s = read_one(
-            &mut client,
-            &catalog,
-            json!({
-                "area": "A", "area_no": n, "block": "M",
-                "variable": "MDCA_CTRLOUT_MODULE_NR",
-                "line": 1, "count": 1, "access_path": "nc_variable",
-            }),
-        )
-        .await;
+        let s = read_probe(&mut client, &AXIS_CTRLOUT_MODULE_NR, n).await;
         println!("  机床轴{n}: {s}");
     }
 
-    println!("=== 轴输出类型 A/n/M/MDCA_CTRLOUT_TYPE ===");
+    println!("=== 轴输出类型（内建探针 AXIS_CTRLOUT_TYPE）轴=1..8 ===");
     for n in 1..=8u16 {
-        let s = read_one(
-            &mut client,
-            &catalog,
-            json!({
-                "area": "A", "area_no": n, "block": "M",
-                "variable": "MDCA_CTRLOUT_TYPE",
-                "line": 1, "count": 1, "access_path": "nc_variable",
-            }),
-        )
-        .await;
+        let s = read_probe(&mut client, &AXIS_CTRLOUT_TYPE, n).await;
         println!("  机床轴{n}: {s}");
     }
 
-    println!("=== 主轴归属 A/n/M/SPIND_ASSIGN_TO_MACHAX（非0=该轴为第n主轴）===");
+    println!("=== 主轴归属（内建探针 AXIS_SPIND_ASSIGN；非0=该轴为第n主轴）===");
     for n in 1..=8u16 {
-        let s = read_one(
-            &mut client,
-            &catalog,
-            json!({
-                "area": "A", "area_no": n, "block": "M",
-                "variable": "SPIND_ASSIGN_TO_MACHAX",
-                "line": 1, "count": 1, "access_path": "nc_variable",
-            }),
-        )
-        .await;
+        let s = read_probe(&mut client, &AXIS_SPIND_ASSIGN, n).await;
         println!("  机床轴{n}: {s}");
     }
 
-    println!("=== 驱动对象名 V/n/M/p0199 count=25（nc_variable 路径 module26）===");
+    println!("=== 驱动对象名（内建探针 DRIVE_OBJECT_NAME，NC变量入口 module26）===");
     for n in 1..=8u16 {
-        let s = read_one(
-            &mut client,
-            &catalog,
-            json!({
-                "area": "V", "area_no": n, "block": "M", "variable": "p0199",
-                "line": 1, "count": 25, "access_path": "nc_variable",
-            }),
-        )
-        .await;
+        let s = read_probe(&mut client, &DRIVE_OBJECT_NAME, n).await;
         println!("  V/{n}: {s}");
     }
 
-    println!("=== 驱动对象名 V/n/M/p0199 count=25（drive_object 路径 module130）===");
+    println!("=== 驱动对象名（内建探针 DRIVE_OBJECT_NAME_M130，驱动对象入口 module130）===");
     for n in 1..=8u16 {
-        let s = read_one(
-            &mut client,
-            &catalog,
-            json!({
-                "area": "V", "area_no": n, "block": "M", "variable": "p0199",
-                "line": 1, "count": 25, "access_path": "drive_object",
-            }),
-        )
-        .await;
+        let s = read_probe(&mut client, &DRIVE_OBJECT_NAME_M130, n).await;
         println!("  V/{n}(130): {s}");
     }
 
-    // 跨路径同值校验：若两条路径的 V/n 指向同一物理驱动对象，
-    // 则同一参数的读回值必须相等。用于把 p0199 名称关联从假设升级为实测。
+    // 跨路径同值校验：同一参数的读回值必须相等，否则两条入口的 V/n
+    // 不是同一物理对象（用于检验“编号可否沿用”的假设）。
     println!("=== 跨路径同值校验 r0035（电机温度；静态值，同一对象必相等）===");
     let mut m26 = Vec::new();
     for n in 1..=8u16 {
-        let s = read_one(
-            &mut client,
-            &catalog,
-            json!({
-                "area": "V", "area_no": n, "block": "M", "variable": "r0035",
-                "line": 1, "count": 1, "access_path": "nc_variable",
-            }),
-        )
-        .await;
-        m26.push(s);
+        m26.push(read_native(&mut client, v_address(n, 35, "F32_BE", "0x07", 1)).await);
     }
     let mut m130 = Vec::new();
     for n in 1..=8u16 {
-        let s = read_one(
-            &mut client,
-            &catalog,
+        // module 130：驱动对象入口（同一列，不同 module）。
+        let addr = NativeNckAddress::from_parameters(
             json!({
-                "area": "V", "area_no": n, "block": "M", "variable": "r0035",
-                "line": 1, "count": 1, "access_path": "drive_object",
-            }),
+                "area": "V", "area_no": n, "module": 130, "column": 35,
+                "line": 1, "count": 1, "unit_mode": "current",
+                "decode": "F32_BE", "transport_size": "0x07",
+            })
+            .as_object()
+            .unwrap(),
         )
-        .await;
-        m130.push(s);
+        .unwrap();
+        m130.push(read_native(&mut client, addr).await);
     }
     for n in 1..=8usize {
         println!(
@@ -236,18 +204,24 @@ async fn live_identity_probe() {
     }
 
     // 候选身份参数：寻找能直接编码「驱动对象↔机床轴」归属的读数。
-    for var in ["r0103", "p0105", "r0106", "r0107", "r0108"] {
-        println!("=== 身份候选参数 V/n/M/{var}（nc_variable module26）===");
+    for (var, decode, transport) in [
+        ("r0103", "U16_BE", "0x06"),
+        ("p0105", "I16_BE", "0x05"),
+        ("r0106", "I16_BE", "0x05"),
+        ("r0107", "I16_BE", "0x05"),
+        ("r0108", "U32_BE", "0x06"),
+    ] {
+        println!("=== 身份候选参数 V/n/M/{var}（NC变量入口 module26）===");
         for n in 1..=8u16 {
-            let s = read_one(
-                &mut client,
-                &catalog,
-                json!({
-                    "area": "V", "area_no": n, "block": "M", "variable": var,
-                    "line": 1, "count": 1, "access_path": "nc_variable",
-                }),
-            )
-            .await;
+            let column: u16 = match var {
+                "r0103" => 103,
+                "p0105" => 105,
+                "r0106" => 106,
+                "r0107" => 107,
+                "r0108" => 108,
+                _ => unreachable!(),
+            };
+            let s = read_native(&mut client, v_address(n, column, decode, transport, 1)).await;
             println!("  V/{n}: {s}");
         }
     }

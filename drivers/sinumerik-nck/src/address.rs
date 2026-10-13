@@ -1,12 +1,14 @@
-//! NCK 地址模型（ADR 0001 §9：`NckVariableRef`）。
+//! NCK 基础地址类型（Area 字母表 / Unit 模式）。
 //!
-//! 用户侧是 Siemens 原生语义（Area / Area No. / Block / Variable / Line /
-//! Column），不是地址字符串；线缆侧（area 索引、unit/mode→syntax）是 S7Comm
-//! 协议知识。字母↔索引映射以 Wireshark `packet-s7comm.c`
-//! `nck_area_names`（0=N 1=B 2=C 3=A 4=T 5=V 6=H 7=MMC）为依据；
+//! 只保留**协议基础枚举**：采集地址本身的组装与校验在 `native.rs`，
+//! 本模块不再承载变量引用模型。
+//!
+//! 线缆侧（area 索引、unit/mode→syntax）是 S7Comm 协议知识。字母↔索引
+//! 映射以 Wireshark `packet-s7comm.c` `nck_area_names`
+//! （0=N 1=B 2=C 3=A 4=T 5=V 6=H 7=MMC）为依据；
 //! unit/mode↔syntax 以 `SYNTAXID_NCK(0x82)/_METRIC(0x83)/_INCH(0x84)` 为依据。
 //!
-//! NOTE: MMC（索引 7）的用户侧字母待文档/真机确认，V1 不接受；线缆结构
+//! NOTE: MMC（索引 7）的用户侧字母待文档/真机确认，暂不接受；线缆结构
 //! 以 u8 索引承载，未来确认后只扩展字母表，不改 Resource API。
 
 use thiserror::Error;
@@ -95,28 +97,6 @@ pub enum NckUnitMode {
     Inch,
 }
 
-/// 访问入口与单位模式是不同字段；默认入口保持已有点位地址不变。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NckAccessPath {
-    #[default]
-    NcVariable,
-    /// 驱动对象入口仅用于目录明确声明的候选映射，不由轴名或IP推断。
-    DriveObject,
-}
-
-impl NckAccessPath {
-    pub fn parse(s: &str) -> Result<Self, AddressError> {
-        match s {
-            "nc_variable" => Ok(Self::NcVariable),
-            "drive_object" => Ok(Self::DriveObject),
-            _ => Err(AddressError::Invalid {
-                input: s.into(),
-                reason: "access_path需为nc_variable或drive_object".into(),
-            }),
-        }
-    }
-}
-
 impl NckUnitMode {
     /// 线缆 Syntax ID。
     pub fn syntax_id(self) -> u8 {
@@ -141,7 +121,7 @@ impl NckUnitMode {
 }
 
 // ---------------------------------------------------------------------------
-// 变量引用（用户语义）
+// 解析错误
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -152,260 +132,39 @@ pub enum AddressError {
     Invalid { input: String, reason: String },
 }
 
-/// NCK 变量引用（Siemens 原生参数模型；`data_type` 永不在此，由 Catalog 给出）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NckVariableRef {
-    pub area: NckArea,
-    pub area_no: Option<u16>,
-    /// Block 名（如 SEMA；原样保留大小写，Siemens 大小写敏感）。
-    pub block: String,
-    /// 变量名（如 actFeedRate；原样保留大小写）。
-    pub variable: String,
-    pub line: Option<u16>,
-    pub column: Option<u16>,
-    /// 连续个数（line_count，缺省 1）。
-    pub count: u16,
-    pub unit_mode: NckUnitMode,
-    pub access_path: NckAccessPath,
-}
-
-impl NckVariableRef {
-    /// 内部稳定身份键（browse 节点 ID / 缓存键 / 诊断 / 测试 golden 用；
-    /// 不是用户主要配置接口，配置走结构化 parameters）。
-    ///
-    /// 规则唯一：`nck://<AREA>/<NO>/<BLOCK>/<VAR>?line=&column=&count=&unit=`，
-    /// area 取大写字母，无值字段省略（count=1、unit=current 省略）。
-    pub fn canonical_key(&self) -> String {
-        let mut s = format!(
-            "nck://{}/{}/{}/{}",
-            self.area.letter(),
-            self.area_no.map(|n| n.to_string()).unwrap_or_default(),
-            self.block,
-            self.variable
-        );
-        let mut q = Vec::new();
-        if self.access_path == NckAccessPath::DriveObject {
-            q.push("access_path=drive_object".to_string());
-        }
-        if let Some(l) = self.line {
-            q.push(format!("line={l}"));
-        }
-        if let Some(c) = self.column {
-            q.push(format!("column={c}"));
-        }
-        if self.count != 1 {
-            q.push(format!("count={}", self.count));
-        }
-        if self.unit_mode != NckUnitMode::Current {
-            let u = match self.unit_mode {
-                NckUnitMode::Current => "current",
-                NckUnitMode::Metric => "metric",
-                NckUnitMode::Inch => "inch",
-            };
-            q.push(format!("unit={u}"));
-        }
-        if !q.is_empty() {
-            s.push('?');
-            s.push_str(&q.join("&"));
-        }
-        s
-    }
-
-    /// 从 `ResourceSelection.parameters` 解析（结构化参数，不接受字符串地址）。
-    pub fn from_parameters(
-        p: &serde_json::Map<String, serde_json::Value>,
-    ) -> Result<Self, AddressError> {
-        let allowed = [
-            "area",
-            "area_no",
-            "block",
-            "variable",
-            "line",
-            "column",
-            "count",
-            "unit_mode",
-            "access_path",
-        ];
-        if let Some(key) = p.keys().find(|key| !allowed.contains(&key.as_str())) {
-            return Err(AddressError::Invalid {
-                input: key.clone(),
-                reason: "不支持该参数；模块号由目录和访问路径决定".into(),
-            });
-        }
-        let area = p
-            .get("area")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AddressError::Invalid {
-                input: String::new(),
-                reason: "缺少 area（N/B/C/A/T/V/H）".into(),
-            })
-            .and_then(NckArea::parse)?;
-        let block = p
-            .get("block")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| AddressError::Invalid {
-                input: String::new(),
-                reason: "缺少 block（如 SEMA）".into(),
-            })?
-            .to_string();
-        let variable = p
-            .get("variable")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| AddressError::Invalid {
-                input: String::new(),
-                reason: "缺少 variable（如 actFeedRate）".into(),
-            })?
-            .to_string();
-        let opt_u16 = |key: &str| -> Result<Option<u16>, AddressError> {
-            match p.get(key) {
-                None => Ok(None),
-                Some(v) => v
-                    .as_u64()
-                    .and_then(|n| u16::try_from(n).ok())
-                    .map(Some)
-                    .ok_or_else(|| AddressError::Invalid {
-                        input: key.to_string(),
-                        reason: format!("`{key}` 需为 u16"),
-                    }),
-            }
-        };
-        let area_no = opt_u16("area_no")?;
-        let line = opt_u16("line")?;
-        let column = opt_u16("column")?;
-        // P2-2：count 全层冻结 1..=255（wire line_count 单字节；配置期即拒绝，
-        // 不拖到 codec 深层。codec 侧 CountOutOfRange 作为纵深保留）。
-        let count = p
-            .get("count")
-            .and_then(|v| v.as_u64())
-            .map(|n| {
-                u16::try_from(n)
-                    .ok()
-                    .filter(|c| (1..=255).contains(c))
-                    .ok_or_else(|| AddressError::Invalid {
-                        input: "count".into(),
-                        reason: "count 需为 1..=255（line_count 单字节）".into(),
-                    })
-            })
-            .transpose()?
-            .unwrap_or(1);
-        let unit_mode = p
-            .get("unit_mode")
-            .and_then(|v| v.as_str())
-            .map(NckUnitMode::parse)
-            .transpose()?
-            .unwrap_or_default();
-        let access_path = match p.get("access_path") {
-            None => NckAccessPath::default(),
-            Some(v) => NckAccessPath::parse(v.as_str().ok_or_else(|| AddressError::Invalid {
-                input: "access_path".into(),
-                reason: "access_path需为字符串".into(),
-            })?)?,
-        };
-        Ok(Self {
-            area,
-            area_no,
-            block,
-            variable,
-            line,
-            column,
-            count,
-            unit_mode,
-            access_path,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn area_letters_and_indices_match_wireshark() {
-        // Wireshark nck_area_names：N=0 B=1 C=2 A=3 T=4 V=5 H=6。
-        for (letter, idx) in [
-            ('N', 0),
-            ('B', 1),
-            ('C', 2),
-            ('A', 3),
-            ('T', 4),
-            ('V', 5),
-            ('H', 6),
+    fn area_letter_and_index_round_trip() {
+        // 线缆索引以 Wireshark nck_area_names 为依据：N=0 B=1 C=2 A=3 T=4 V=5 H=6。
+        for (letter, index) in [
+            ("N", 0u8),
+            ("B", 1),
+            ("C", 2),
+            ("A", 3),
+            ("T", 4),
+            ("V", 5),
+            ("H", 6),
         ] {
-            let a = NckArea::parse(&letter.to_string()).expect("字母合法");
-            assert_eq!(a.index(), idx);
-            assert_eq!(a.letter(), letter);
+            let area = NckArea::parse(letter).unwrap();
+            assert_eq!(area.letter(), letter.chars().next().unwrap());
+            assert_eq!(area.index(), index);
         }
-        // 小写容忍；M 归属未确认，拒绝。
+        // 大小写不敏感；M/MMC 归属未经确认，必须拒绝。
         assert_eq!(NckArea::parse("c").unwrap(), NckArea::Channel);
-        assert!(NckArea::parse("M").is_err());
-        assert!(NckArea::parse("X").is_err());
+        for bad in ["M", "MMC", "8", ""] {
+            assert!(NckArea::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
-    fn unit_mode_syntax_ids_match_wireshark() {
+    fn unit_mode_maps_to_syntax() {
         assert_eq!(NckUnitMode::Current.syntax_id(), 0x82);
         assert_eq!(NckUnitMode::Metric.syntax_id(), 0x83);
         assert_eq!(NckUnitMode::Inch.syntax_id(), 0x84);
-    }
-
-    fn params(json: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
-        json.as_object().cloned().expect("对象参数")
-    }
-
-    #[test]
-    fn canonical_key_rules_are_unique() {
-        // Siemens 官方示例形态：C / 1 / SEMA / actFeedRate / line=3。
-        let r = NckVariableRef::from_parameters(&params(serde_json::json!({
-            "area": "C", "area_no": 1, "block": "SEMA",
-            "variable": "actFeedRate", "line": 3,
-        })))
-        .expect("示例参数合法");
-        assert_eq!(r.canonical_key(), "nck://C/1/SEMA/actFeedRate?line=3");
-        // 默认 count=1、unit=current 省略；metric 显式。
-        let m = NckVariableRef::from_parameters(&params(serde_json::json!({
-            "area": "N", "block": "N", "variable": "sysVar", "unit_mode": "metric",
-        })))
-        .unwrap();
-        assert_eq!(m.canonical_key(), "nck://N//N/sysVar?unit=metric");
-    }
-
-    #[test]
-    fn parameters_reject_missing_and_bad_shapes() {
-        assert!(NckVariableRef::from_parameters(&params(serde_json::json!({}))).is_err());
-        assert!(
-            NckVariableRef::from_parameters(&params(serde_json::json!({
-                "area": "C", "block": "", "variable": "x",
-            })))
-            .is_err()
-        );
-        assert!(
-            NckVariableRef::from_parameters(&params(serde_json::json!({
-                "area": "C", "block": "B", "variable": "x", "count": 0,
-            })))
-            .is_err()
-        );
-        // P2-2：count 上限 255（line_count 单字节），256 即拒绝。
-        assert!(
-            NckVariableRef::from_parameters(&params(serde_json::json!({
-                "area": "C", "block": "B", "variable": "x", "count": 256,
-            })))
-            .is_err()
-        );
-        assert!(
-            NckVariableRef::from_parameters(&params(serde_json::json!({
-                "area": "C", "block": "B", "variable": "x", "count": 255,
-            })))
-            .is_ok()
-        );
-        assert!(
-            NckVariableRef::from_parameters(&params(serde_json::json!({
-                "area": "C", "block": "B", "variable": "x", "unit_mode": "kelvin",
-            })))
-            .is_err()
-        );
+        assert_eq!(NckUnitMode::parse("INCH").unwrap(), NckUnitMode::Inch);
+        assert!(NckUnitMode::parse("mm").is_err());
     }
 }

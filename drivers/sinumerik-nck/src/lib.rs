@@ -13,8 +13,6 @@
 //! - probe 诚实语义：会话可达≠身份确认（family 待 anchor，真机 PR7）。
 
 mod address;
-mod browse;
-mod catalog;
 mod client;
 mod codec;
 mod config;
@@ -22,19 +20,13 @@ mod fixture;
 mod identity;
 mod identity_spec;
 mod native;
+mod presets;
 mod probe;
-mod topology;
 mod value;
 
-pub use address::{AddressError, NckAccessPath, NckArea, NckUnitMode, NckVariableRef};
-pub use browse::build_tree;
-pub use catalog::{
-    CatalogError, CatalogRegistry, NckCatalog, NckShape, NckVariableDefinition, NckWireDefinition,
-};
+pub use address::{AddressError, NckArea, NckUnitMode};
 pub use client::{NckClient, NckReadItem, NckReadResult};
-pub use codec::{
-    CodecError, NckWireAddress, ResolvedVariable, encode_var_spec, resolve as resolve_wire,
-};
+pub use codec::{CodecError, NckWireAddress, encode_var_spec};
 pub use config::{NCK_DEFAULT_PORT, NckConnConfig};
 pub use fixture::{NckFixture, NckFixtureState};
 pub use identity_spec::{
@@ -43,11 +35,12 @@ pub use identity_spec::{
     ProbeSlot, probes_for_family,
 };
 pub use native::{
-    InvalidRule, MAX_AREA_NO, MAX_COUNT, NativeError, NativeNckAddress, ResolvedPoint,
-    TRANSPORT_SIZES, parse_transport_size, resolve_native, transport_size_name, unit_mode_name,
+    DECODE_NAMES, InvalidRule, MAX_AREA_NO, MAX_COUNT, NativeError, NativeNckAddress,
+    ResolvedPoint, TRANSPORT_SIZES, parse_transport_size, resolve_native, transport_size_name,
+    unit_mode_name,
 };
+pub use presets::{PresetRegistry, PresetTemplate};
 pub use probe::{NCK_ANCHOR_PENDING, probe_with_session};
-pub use topology::{NckAxis, NckChannel, NckTopology, axis_path, channel_path};
 pub use value::{NckDataKind, NckSample, ValueError, decode_value};
 
 use mesa_core_types::{AcquisitionTask, DriverMetadata, PointDescriptor, PointMap};
@@ -57,6 +50,12 @@ use mesa_driver_sdk::{Driver, DriverConnection, SdkDriverError};
 pub const DRIVER_ID: &str = "sinumerik-nck";
 /// 通用轮询绑定（`mesa.resources.v1`，resource_id `variable`）。
 pub const GENERIC_RESOURCE_ID: &str = "variable";
+/// 已声明系列（与 Descriptor Enum 同源）。
+///
+/// `family` **不是**读取许可：任何结构合法的原生地址都能 Configure，
+/// 与系列无关。但未声明的系列意味着模板与身份探针都不可用，必须在连接
+/// 阶段明确拒绝，而不是静默接受后什么都不显示。
+pub const DECLARED_FAMILIES: [&str; 2] = ["828d", "840d-sl"];
 
 #[derive(Default)]
 pub struct SinumerikNckDriver;
@@ -101,7 +100,8 @@ impl Driver for SinumerikNckDriver {
                     {
                         let mut f = FieldDescriptor::new("family", "Family", FieldType::Enum)
                             .required(true);
-                        f.validation.enum_options = Some(vec!["840d-sl".into(), "828d".into()]);
+                        f.validation.enum_options =
+                            Some(DECLARED_FAMILIES.iter().map(|s| (*s).to_string()).collect());
                         f
                     },
                     // TSAP 显式必填（NCK 无 rack/slot 推导；远端值由真机 Gate 定）。
@@ -152,11 +152,14 @@ impl Driver for SinumerikNckDriver {
                 id: GENERIC_RESOURCE_ID.into(),
                 label: LocalizedText::new("NC Variable"),
                 parameters: SchemaDescriptor {
+                    // 原生只读地址（V2.0 §2.2）：字段即协议字段，不存在
+                    // 变量名目录、不存在 access_path 入口切换、不存在
+                    // 按名称推导地址的回退。旧 block/variable/access_path
+                    // 由 Core Schema（未知字段）与 Driver 双重拒绝。
                     fields: vec![
                         {
                             let mut f = FieldDescriptor::new("area", "Area", FieldType::Enum)
-                                .required(true)
-                                .default_value(serde_json::json!("C"));
+                                .required(true);
                             f.validation.enum_options = Some(vec![
                                 "N".into(),
                                 "B".into(),
@@ -166,45 +169,124 @@ impl Driver for SinumerikNckDriver {
                                 "V".into(),
                                 "H".into(),
                             ]);
+                            f.ui.placeholder = Some("NCK Area（M/MMC 尚未确认，不开放）".into());
                             f
                         },
-                        FieldDescriptor::new("area_no", "Area No.", FieldType::Integer)
-                            .required(false),
                         {
-                            let mut f = FieldDescriptor::new(
-                                "access_path",
-                                "访问路径（nc_variable=NC变量；drive_object=驱动对象候选）",
-                                FieldType::Enum,
-                            )
-                            .required(false)
-                            .default_value(serde_json::json!("nc_variable"));
-                            f.validation.enum_options =
-                                Some(vec!["nc_variable".into(), "drive_object".into()]);
+                            let mut f =
+                                FieldDescriptor::new("area_no", "Area No.", FieldType::Integer)
+                                    .required(true);
+                            f.validation.min = Some(0.0);
+                            f.validation.max = Some(31.0);
+                            f.ui.placeholder = Some("VarSpec unit 低 5 位（0..31）".into());
                             f
                         },
-                        FieldDescriptor::new("block", "Block", FieldType::String).required(true),
-                        FieldDescriptor::new("variable", "Variable", FieldType::String)
-                            .required(true),
-                        FieldDescriptor::new("line", "Line", FieldType::Integer).required(false),
-                        FieldDescriptor::new("column", "Column", FieldType::Integer)
-                            .required(false),
-                        // P2-2：count 全层 1..=255（UI 层 min/max 只是指引，
-                        // 真正拒绝在 address 解析）。
                         {
+                            let mut f =
+                                FieldDescriptor::new("module", "Module", FieldType::Integer)
+                                    .required(true);
+                            f.validation.min = Some(0.0);
+                            f.validation.max = Some(255.0);
+                            f.ui.placeholder = Some("VarSpec module（0..255）".into());
+                            f
+                        },
+                        {
+                            let mut f =
+                                FieldDescriptor::new("column", "Column", FieldType::Integer)
+                                    .required(true);
+                            f.validation.min = Some(0.0);
+                            f.validation.max = Some(65535.0);
+                            f.ui.placeholder = Some("VarSpec column（0..65535，含 0）".into());
+                            f
+                        },
+                        {
+                            let mut f = FieldDescriptor::new("line", "Line", FieldType::Integer)
+                                .required(true);
+                            f.validation.min = Some(0.0);
+                            f.validation.max = Some(65535.0);
+                            f.ui.placeholder = Some("VarSpec line（0..65535，含 0）".into());
+                            f
+                        },
+                        {
+                            // count 是线缆 line_count（元素个数），不是字节数。
                             let mut f = FieldDescriptor::new("count", "Count", FieldType::Integer)
-                                .required(false)
+                                .required(true)
                                 .default_value(serde_json::json!(1));
                             f.validation.min = Some(1.0);
                             f.validation.max = Some(255.0);
+                            f.ui.placeholder = Some("线缆 line_count（元素个数，非字节数）".into());
                             f
                         },
                         {
                             let mut f =
                                 FieldDescriptor::new("unit_mode", "Unit mode", FieldType::Enum)
-                                    .required(false)
+                                    .required(true)
                                     .default_value(serde_json::json!("current"));
                             f.validation.enum_options =
                                 Some(vec!["current".into(), "metric".into(), "inch".into()]);
+                            f.ui.placeholder = Some("选择 NCK syntax 0x82/0x83/0x84".into());
+                            f
+                        },
+                        {
+                            // 规范词表：显式字节序与宽度，不接受 REAL/DINT 等别名。
+                            let mut f = FieldDescriptor::new("decode", "Decode", FieldType::Enum)
+                                .required(true);
+                            f.validation.enum_options = Some(
+                                crate::native::DECODE_NAMES
+                                    .iter()
+                                    .map(|s| (*s).to_string())
+                                    .collect(),
+                            );
+                            f.ui.placeholder =
+                                Some("显式大小端与类型；协议读取成功不等于工程量已确认".into());
+                            f
+                        },
+                        {
+                            // 响应 transport 期望：用枚举字符串让十六进制语义显式可见。
+                            let mut f = FieldDescriptor::new(
+                                "transport_size",
+                                "Transport size",
+                                FieldType::Enum,
+                            )
+                            .required(true);
+                            f.validation.enum_options = Some(vec![
+                                "0x05".into(),
+                                "0x06".into(),
+                                "0x07".into(),
+                                "0x09".into(),
+                            ]);
+                            f.ui.placeholder = Some("期望设备响应 transport 字段".into());
+                            f
+                        },
+                        {
+                            // 无效工程值哨兵：显式规则，不再从目录隐式继承。
+                            let mut f = FieldDescriptor::new(
+                                "invalid_value",
+                                "Invalid value",
+                                FieldType::Number,
+                            )
+                            .required(false);
+                            f.ui.placeholder =
+                                Some("可选；与 invalid_tolerance 成对（如 -200）".into());
+                            f
+                        },
+                        {
+                            let mut f = FieldDescriptor::new(
+                                "invalid_tolerance",
+                                "Invalid tolerance",
+                                FieldType::Number,
+                            )
+                            .required(false);
+                            f.validation.min = Some(0.0);
+                            f.validation.max = Some(1.0);
+                            f.ui.placeholder = Some("可选；0..=1，与 invalid_value 成对".into());
+                            f
+                        },
+                        {
+                            let mut f = FieldDescriptor::new("unit", "Unit", FieldType::String)
+                                .required(false);
+                            f.ui.placeholder =
+                                Some("可选展示单位（仅注释，不作为工程语义已核验的证据）".into());
                             f
                         },
                     ],
@@ -244,19 +326,20 @@ impl Driver for SinumerikNckDriver {
             SdkDriverError::configuration("BAD_CONFIG", format!("connection JSON 非法: {e}"))
         })?;
         let cfg = NckConnConfig::from_json(&v)?;
-        // P1-3：common + exactly one family（未知 family 即 BAD_CONFIG，
-        // 绝不把全系列合并成一个视图）。
-        let catalog = CatalogRegistry::load_shipped()
-            .and_then(|r| r.resolve(&cfg.family))
-            .map_err(|e| {
-                SdkDriverError::configuration("BAD_CONFIG", format!("NCK catalog 装载失败: {e}"))
-            })?;
-        Ok(Box::new(NckConnection {
-            cfg,
-            catalog,
-            topology: None,
-            plan: std::sync::RwLock::new(None),
-        }))
+        // 连接只决定「连哪台设备」（host/TSAP/family/PDU），不再装载任何
+        // 变量目录：地址合法性完全由 Configure 的原生字段校验决定。
+        // 内嵌模板解析失败只影响 Browse，不阻塞采集（PresetRegistry 自带降级）。
+        if !DECLARED_FAMILIES.contains(&cfg.family.as_str()) {
+            return Err(SdkDriverError::configuration(
+                "BAD_CONFIG",
+                format!(
+                    "未声明的 family `{}`（已声明：{}）",
+                    cfg.family,
+                    DECLARED_FAMILIES.join("/")
+                ),
+            ));
+        }
+        Ok(Box::new(NckConnection::new(cfg)))
     }
 }
 
@@ -273,8 +356,8 @@ struct PointSpec {
     expected_transport_size: u8,
     data_type: mesa_core_types::DataType,
     unit: Option<String>,
-    invalid_values: Vec<f64>,
-    invalid_tolerance: f64,
+    /// 显式无效工程值规则（可选；不再从目录隐式继承）。
+    invalid_rule: Option<InvalidRule>,
 }
 
 #[derive(Debug, Clone)]
@@ -295,22 +378,24 @@ struct PlanSnapshot {
 
 pub struct NckConnection {
     cfg: NckConnConfig,
-    catalog: NckCatalog,
-    /// 拓扑快照（probe 回填；V1 恒 None，browse 退化为纯 Catalog 树）。
-    /// 只读（当前无回填写路径），control-handle 下天然 &self 兼容。
-    topology: Option<NckTopology>,
+    /// 可选配置预填模板（只影响 Browse；不参与 Configure/Poll 准入）。
+    presets: PresetRegistry,
     // 采集计划（control-handle 并发模型）：configure/apply 写锁替换，
-    // run 读锁克隆快照后释放；catalog/topology 只读。
+    // run 读锁克隆快照后释放；presets 只读。
     plan: std::sync::RwLock<Option<PlanSnapshot>>,
 }
 
 impl NckConnection {
-    /// 测试或现场注入已审计目录；生产默认按系列加载公共目录，不提供连接级外部文件入口。
-    pub fn with_catalog(cfg: NckConnConfig, catalog: NckCatalog) -> Self {
+    /// 生产构造：内嵌模板。
+    pub fn new(cfg: NckConnConfig) -> Self {
+        Self::with_presets(cfg, PresetRegistry::embedded())
+    }
+
+    /// 注入模板集合（测试模拟模板缺失/非法场景；不影响采集路径）。
+    pub fn with_presets(cfg: NckConnConfig, presets: PresetRegistry) -> Self {
         Self {
             cfg,
-            catalog,
-            topology: None,
+            presets,
             plan: std::sync::RwLock::new(None),
         }
     }
@@ -360,20 +445,23 @@ fn decode_point(
         })
     });
     let good_value = good_value.filter(|value| {
+        // 无效工程值规则覆盖数值标量、数值数组与可安全投影的整型
+        // （整数按 f64 比较；i32/u32 在 f64 精度内无损）。
         let numbers: Vec<f64> = match value {
             Value::F32(v) => vec![*v as f64],
             Value::F64(v) => vec![*v],
+            Value::I32(v) => vec![*v as f64],
+            Value::U32(v) => vec![*v as f64],
             Value::F32Array(values) => values.iter().map(|v| *v as f64).collect(),
             Value::F64Array(values) => values.clone(),
+            Value::I32Array(values) => values.iter().map(|v| *v as f64).collect(),
+            Value::U32Array(values) => values.iter().map(|v| *v as f64).collect(),
             _ => Vec::new(),
         };
-        let valid = numbers.iter().all(|v| {
-            v.is_finite()
-                && !spec
-                    .invalid_values
-                    .iter()
-                    .any(|sentinel| (*v - *sentinel).abs() <= spec.invalid_tolerance)
-        });
+        let rule = spec.invalid_rule;
+        let valid = numbers
+            .iter()
+            .all(|v| v.is_finite() && !rule.map(|r| r.hits(*v)).unwrap_or(false));
         if !valid {
             tracing::warn!(key=%spec.key, "NCK返回设备无效工程值标记，按BAD处理，不伪造协议错误码");
         }
@@ -540,30 +628,33 @@ impl DriverConnection for NckConnection {
                     ));
                 }
                 for out in &sel.outputs {
+                    // 纵深校验：Driver 不依赖 UI 自动填充，也不依赖 Core
+                    // 前置 Schema 校验；输出必须正好是 value。
+                    if out.output != "value" {
+                        return Err(SdkDriverError::configuration(
+                            "UNSUPPORTED_OUTPUT",
+                            format!(
+                                "point `{}`: sinumerik-nck 只支持 output `value`",
+                                out.point_key
+                            ),
+                        ));
+                    }
                     let params = sel.parameters.as_object().ok_or_else(|| {
                         SdkDriverError::configuration(
                             "INVALID_VARIABLE",
                             format!("point `{}`: parameters 需为对象", out.point_key),
                         )
                     })?;
-                    let var_ref = NckVariableRef::from_parameters(params).map_err(|e| {
+                    // 唯一解析链：原生字段 → 校验 → wire/类型/规则。
+                    // 不查目录、不按名称推导、不做旧配置迁移。
+                    let addr = NativeNckAddress::from_parameters(params).map_err(|e| {
                         SdkDriverError::new(
                             mesa_core_types::ErrorKind::Address,
                             "INVALID_VARIABLE",
                             format!("point `{}`: {e}", out.point_key),
                         )
                     })?;
-                    let def = self
-                        .catalog
-                        .lookup(var_ref.area, &var_ref.block, &var_ref.variable)
-                        .map_err(|e| {
-                            SdkDriverError::new(
-                                mesa_core_types::ErrorKind::Address,
-                                "INVALID_VARIABLE",
-                                format!("point `{}`: {e}", out.point_key),
-                            )
-                        })?;
-                    let rv = resolve_wire(&var_ref, def).map_err(|e| {
+                    let rp = resolve_native(addr).map_err(|e| {
                         SdkDriverError::new(
                             mesa_core_types::ErrorKind::Address,
                             "INVALID_VARIABLE",
@@ -573,27 +664,19 @@ impl DriverConnection for NckConnection {
                     indices.push(new_points.len());
                     tracing::debug!(
                         key = %out.point_key,
-                        canonical = %var_ref.canonical_key(),
-                        "NCK 点位已解析",
+                        canonical = %rp.address.source_label(),
+                        "NCK 原生地址已解析",
                     );
-                    // count>1 运行时发 typed array（pack_array），
-                    // PointDescriptor 必须同口径，否则 GOOD 值类型对不上声明
-                    let data_type = if var_ref.count > 1 {
-                        rv.kind.core_array_type()
-                    } else {
-                        rv.kind.core_type()
-                    };
                     new_points.push(PointSpec {
                         key: out.point_key.clone(),
-                        source_label: var_ref.canonical_key(),
-                        wire: rv.wire,
-                        kind: rv.kind,
-                        expected_len: rv.expected_data_len,
-                        expected_transport_size: rv.expected_transport_size,
-                        data_type,
-                        unit: def.unit.clone(),
-                        invalid_values: def.invalid_values.clone(),
-                        invalid_tolerance: def.invalid_tolerance,
+                        source_label: rp.address.source_label(),
+                        wire: rp.wire,
+                        kind: rp.kind,
+                        expected_len: rp.expected_data_len,
+                        expected_transport_size: rp.expected_transport_size,
+                        data_type: rp.data_type,
+                        unit: rp.address.unit.clone(),
+                        invalid_rule: rp.invalid_rule,
                     });
                 }
             }
@@ -802,8 +885,10 @@ impl DriverConnection for NckConnection {
         Ok(())
     }
 
-    /// 浏览：Catalog 虚拟树（纯函数，无需会话；topology 由 probe 回填，
-    /// V1 为空即纯 Catalog 树）。未知 parent → 空页。
+    /// 浏览：只有两类入口——**可选模板预填**与**只读身份核对**。
+    ///
+    /// 不再有 Catalog 虚拟树：模板缺失/非法只让模板入口显示诊断，
+    /// 手动原生地址与身份核对都不依赖它。未知 parent → 空页。
     async fn browse(
         &self,
         parent: &str,
@@ -811,13 +896,14 @@ impl DriverConnection for NckConnection {
         cursor: &str,
         limit: u32,
     ) -> Result<(Vec<mesa_driver_protocol::pb::BrowseNode>, Option<String>), SdkDriverError> {
-        if identity::supported(&self.catalog)
+        let identity_ok = identity::supported(&self.cfg.family);
+        if identity_ok
             && (parent == identity::ROOT || parent.starts_with(&format!("{}/", identity::ROOT)))
         {
             // 临时Browse连接无跨请求缓存；按页/节点读取并保留整次操作时限。
             return tokio::time::timeout(
                 std::time::Duration::from_secs(15),
-                identity::browse(&self.cfg, &self.catalog, parent, filter, cursor, limit),
+                identity::browse(&self.cfg, &self.presets, parent, filter, cursor, limit),
             )
             .await
             .map_err(|_| {
@@ -828,66 +914,105 @@ impl DriverConnection for NckConnection {
                 )
             })?;
         }
-        if parent.is_empty() && identity::supported(&self.catalog) {
-            let (mut nodes, _) = build_tree(&self.catalog, self.topology.as_ref(), "", "", "", 31);
-            nodes.push(identity::root_node());
-            if !filter.is_empty() {
-                nodes.retain(|node| node.label.contains(filter) || node.id.contains(filter));
+        if parent.is_empty() {
+            let mut nodes = vec![presets::folder_node(
+                PRESETS_ROOT,
+                "常用预设模板（可选预填，需确认实例与行）",
+            )];
+            if identity_ok {
+                nodes.push(identity::root_node());
+            } else {
+                nodes.push(presets::diagnostic(format!(
+                    "该系列（{}）暂无可信身份探针，身份浏览待验证；仍可手动填写原生地址",
+                    self.cfg.family
+                )));
             }
-            let start = cursor.parse::<usize>().unwrap_or(0).min(nodes.len());
-            let end = (start
-                + if limit == 0 {
-                    50
-                } else {
-                    limit.min(500) as usize
-                })
-            .min(nodes.len());
-            return Ok((
-                nodes[start..end].to_vec(),
-                (end < nodes.len()).then(|| end.to_string()),
-            ));
+            return Ok(paginate(nodes, filter, cursor, limit));
         }
-        Ok(build_tree(
-            &self.catalog,
-            self.topology.as_ref(),
-            parent,
-            filter,
-            cursor,
-            limit,
-        ))
+        if parent == PRESETS_ROOT {
+            let mut nodes: Vec<_> = self
+                .presets
+                .for_family(&self.cfg.family)
+                .into_iter()
+                .map(presets::leaf_node)
+                .collect();
+            // 模板不可用时明确提示，而不是伪装成“没有模板”。
+            if let Some(err) = self.presets.error() {
+                nodes.insert(0, presets::diagnostic(err.to_string()));
+            }
+            if nodes.is_empty() && self.presets.error().is_none() {
+                nodes.push(presets::diagnostic(format!(
+                    "系列 {} 暂无预填模板；可直接手动填写原生地址",
+                    self.cfg.family
+                )));
+            }
+            return Ok(paginate(nodes, filter, cursor, limit));
+        }
+        Ok((Vec::new(), None))
     }
+}
+
+/// 模板入口根（身份入口为 `identity::ROOT`）。
+const PRESETS_ROOT: &str = "nck://presets";
+
+/// 本地节点分页（纯函数；顺序稳定，游标为十进制偏移）。
+fn paginate(
+    mut nodes: Vec<mesa_driver_protocol::pb::BrowseNode>,
+    filter: &str,
+    cursor: &str,
+    limit: u32,
+) -> (Vec<mesa_driver_protocol::pb::BrowseNode>, Option<String>) {
+    if !filter.is_empty() {
+        nodes.retain(|node| node.label.contains(filter) || node.id.contains(filter));
+    }
+    let start = cursor.parse::<usize>().unwrap_or(0).min(nodes.len());
+    let end = (start
+        + if limit == 0 {
+            50
+        } else {
+            limit.min(500) as usize
+        })
+    .min(nodes.len());
+    (
+        nodes[start..end].to_vec(),
+        (end < nodes.len()).then(|| end.to_string()),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 无效工程值规则由**绑定显式携带**（不再从目录继承）。
+    /// 同一地址未配置哨兵时不得假装具有同等工程语义保护。
+    fn r0035_spec(invalid: bool) -> PointSpec {
+        let mut params = serde_json::json!({
+            "area": "V", "area_no": 1, "module": 26, "column": 35, "line": 1,
+            "count": 1, "unit_mode": "current", "decode": "F32_BE",
+            "transport_size": "0x07",
+        });
+        if invalid {
+            params["invalid_value"] = serde_json::json!(-200.0);
+            params["invalid_tolerance"] = serde_json::json!(0.001);
+        }
+        let addr = NativeNckAddress::from_parameters(params.as_object().unwrap()).unwrap();
+        let rp = resolve_native(addr).unwrap();
+        PointSpec {
+            key: "temperature".into(),
+            source_label: rp.address.source_label(),
+            wire: rp.wire,
+            kind: rp.kind,
+            expected_len: rp.expected_data_len,
+            expected_transport_size: rp.expected_transport_size,
+            data_type: rp.data_type,
+            unit: rp.address.unit.clone(),
+            invalid_rule: rp.invalid_rule,
+        }
+    }
+
     #[test]
     fn invalid_temperature_is_bad_and_does_not_forge_a_protocol_error() {
-        let catalog = CatalogRegistry::load_dir(&format!("{}/catalog", env!("CARGO_MANIFEST_DIR")))
-            .unwrap()
-            .resolve("828d")
-            .unwrap();
-        let reference = NckVariableRef::from_parameters(
-            serde_json::json!({"area":"V","area_no":1,"block":"M","variable":"r0035","line":1})
-                .as_object()
-                .unwrap(),
-        )
-        .unwrap();
-        let def = catalog.lookup(reference.area, "M", "r0035").unwrap();
-        let resolved = resolve_wire(&reference, def).unwrap();
-        let spec = PointSpec {
-            key: "temperature".into(),
-            source_label: reference.canonical_key(),
-            wire: resolved.wire,
-            kind: resolved.kind,
-            expected_len: 4,
-            expected_transport_size: 7,
-            data_type: mesa_core_types::DataType::F32,
-            unit: None,
-            invalid_values: def.invalid_values.clone(),
-            invalid_tolerance: def.invalid_tolerance,
-        };
+        let spec = r0035_spec(true);
         let mut cache = std::collections::HashMap::new();
         let good = decode_point(&spec, 1, Some(&[0x41, 0x98, 0, 0]), Some(0xff), &mut cache);
         assert_eq!(good.quality, mesa_core_types::Quality::Good);
@@ -921,6 +1046,69 @@ mod tests {
         );
     }
 
+    /// §6.3 诚实边界：未配置哨兵的同地址不享受无效值保护（仍按协议 GOOD）。
+    #[test]
+    fn same_address_without_explicit_rule_has_no_invalid_value_protection() {
+        let spec = r0035_spec(false);
+        assert!(spec.invalid_rule.is_none());
+        let mut cache = std::collections::HashMap::new();
+        let v = decode_point(
+            &spec,
+            1,
+            Some(&[0xc3, 0x47, 0xff, 0xfe]),
+            Some(0xff),
+            &mut cache,
+        );
+        assert_eq!(
+            v.quality,
+            mesa_core_types::Quality::Good,
+            "未声明规则时不做工程语义判定"
+        );
+    }
+
+    /// 无效值规则覆盖整型与数组（此前只检查浮点）。
+    #[test]
+    fn invalid_rule_covers_integers_and_arrays() {
+        let mut params = serde_json::json!({
+            "area": "V", "area_no": 1, "module": 26, "column": 35, "line": 1,
+            "count": 2, "unit_mode": "current", "decode": "I32_BE",
+            "transport_size": "0x07",
+            "invalid_value": -200.0, "invalid_tolerance": 0.5,
+        });
+        params["decode"] = serde_json::json!("I32_BE");
+        let addr = NativeNckAddress::from_parameters(params.as_object().unwrap()).unwrap();
+        let rp = resolve_native(addr).unwrap();
+        let spec = PointSpec {
+            key: "ints".into(),
+            source_label: rp.address.source_label(),
+            wire: rp.wire,
+            kind: rp.kind,
+            expected_len: rp.expected_data_len,
+            expected_transport_size: rp.expected_transport_size,
+            data_type: rp.data_type,
+            unit: None,
+            invalid_rule: rp.invalid_rule,
+        };
+        assert_eq!(spec.data_type, mesa_core_types::DataType::I32Array);
+        let mut cache = std::collections::HashMap::new();
+        // 两个元素都正常 → GOOD。
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&10i32.to_be_bytes());
+        ok.extend_from_slice(&(-20i32).to_be_bytes());
+        assert_eq!(
+            decode_point(&spec, 1, Some(&ok), Some(0xff), &mut cache).quality,
+            mesa_core_types::Quality::Good
+        );
+        // 数组任一元素命中哨兵 → BAD。
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&10i32.to_be_bytes());
+        bad.extend_from_slice(&(-200i32).to_be_bytes());
+        assert_eq!(
+            decode_point(&spec, 1, Some(&bad), Some(0xff), &mut cache).quality,
+            mesa_core_types::Quality::Bad
+        );
+    }
+
     #[test]
     fn descriptor_is_valid_and_read_only() {
         let d = SinumerikNckDriver.descriptor();
@@ -944,7 +1132,13 @@ mod tests {
             .unwrap();
         assert!(fam.required);
         let opts = fam.validation.enum_options.clone().unwrap();
-        assert_eq!(opts, vec!["840d-sl".to_string(), "828d".to_string()]);
+        assert_eq!(
+            opts,
+            DECLARED_FAMILIES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>()
+        );
         // TSAP 双格式：Integer 契约保持（前端文本态→整数提交），
         // 0..=65535 范围 + 占位示例；无默认值（待真机 Gate 冻结）。
         for key in ["local_tsap", "remote_tsap"] {
@@ -963,7 +1157,8 @@ mod tests {
         assert!(!d.capabilities.write, "NCK V1 只读");
         assert!(!d.capabilities.method, "NCK V1 无 command");
         assert!(!d.capabilities.events, "NCK V1 无事件");
-        // variable 资源参数与 address.rs 口径一致。
+        // variable 资源参数与 native.rs 口径一致：只有原生协议字段，
+        // 不含 block/variable/access_path 等旧模型字段。
         let res = d
             .resources
             .iter()
@@ -978,14 +1173,24 @@ mod tests {
         for k in [
             "area",
             "area_no",
-            "block",
-            "variable",
-            "line",
+            "module",
             "column",
+            "line",
             "count",
             "unit_mode",
+            "decode",
+            "transport_size",
+            "invalid_value",
+            "invalid_tolerance",
+            "unit",
         ] {
             assert!(keys.contains(&k), "缺参数 {k}");
+        }
+        for legacy in ["block", "variable", "access_path"] {
+            assert!(
+                !keys.contains(&legacy),
+                "旧字段 {legacy} 不得出现在新 Schema"
+            );
         }
     }
 
@@ -1048,70 +1253,74 @@ mod tests {
         );
     }
 
+    /// Browse 根在“模板缺失/非法”时仍可导航：模板入口给诊断，系列无探针时
+    /// 明确提示身份浏览待验证——绝不伪装成空目录，也绝不阻塞采集。
     #[tokio::test]
-    async fn probe_honest_and_browse_empty_catalog() {
-        // 空 catalog：browse 根为空页（不伪造内容）；probe 可达但身份待确认。
-        let conn = NckConnection::with_catalog(
+    async fn browse_root_degrades_honestly_without_presets() {
+        let conn = NckConnection::with_presets(
             NckConnConfig::from_json(&serde_json::json!({
                 "host": "10.0.0.5", "family": "840d-sl",
                 "local_tsap": 256, "remote_tsap": 258,
             }))
             .unwrap(),
-            NckCatalog::empty(),
+            PresetRegistry::load("{not json"),
         );
-        let (nodes, next) = conn.browse("", "", "", 0).await.unwrap();
-        assert!(nodes.is_empty());
+        let (root, next) = conn.browse("", "", "", 0).await.unwrap();
+        assert_eq!(root.len(), 2, "模板入口 + 系列提示");
+        assert_eq!(root[0].id, "nck://presets");
+        assert_eq!(root[1].kind, "diagnostic", "无探针系列必须明示");
         assert!(next.is_none());
+        // 模板入口给出加载诊断，而不是假装“没有模板”。
+        let (leaves, _) = conn.browse("nck://presets", "", "", 0).await.unwrap();
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].kind, "diagnostic");
         // probe 打不可达桩（10.0.0.5 无真机）→ 不可达规范报告。
         let report = conn.probe().await.unwrap();
         assert!(!report.reachable, "无真机时 probe 必须不可达");
     }
 
+    /// 828d：模板入口可列举候选模板（仍是 candidate 且缺必填）。
     #[tokio::test]
-    async fn browse_synthetic_tree_and_probe_reachable() {
-        // 合成 catalog：browse 树可导航；fixture 可达且身份待确认。
+    async fn browse_presets_lists_candidates_and_probe_reachable() {
         let fx = NckFixture::spawn(NckFixtureState::default()).await;
-        let mut conn = NckConnection::with_catalog(
+        let mut conn = NckConnection::with_presets(
             NckConnConfig::from_json(&serde_json::json!({
-                "host": "127.0.0.1", "family": "840d-sl",
+                "host": "127.0.0.1", "family": "828d",
                 "local_tsap": 256, "remote_tsap": 258,
             }))
             .unwrap(),
-            synthetic_catalog(),
+            PresetRegistry::embedded(),
         );
         conn.cfg.port = fx.addr.port();
         let (root, _) = conn.browse("", "", "", 0).await.unwrap();
-        assert_eq!(root.len(), 1);
-        assert_eq!(root[0].id, "nck://C");
-        let (leaves, _) = conn.browse("nck://C/SEMA", "", "", 0).await.unwrap();
-        assert_eq!(leaves.len(), 1);
-        assert!(leaves[0].id.starts_with("nck://C/"));
+        assert_eq!(root.len(), 2);
+        assert_eq!(root[0].id, "nck://presets");
+        assert_eq!(root[1].id, "nck://identity");
+        let (leaves, next) = conn.browse("nck://presets", "", "", 0).await.unwrap();
+        assert!(!leaves.is_empty());
+        assert!(next.is_some(), "模板多于 50 条时必须分页");
+        assert!(leaves.iter().all(|n| n.label.contains("candidate")));
+        assert!(leaves.iter().all(|n| n.label.contains("待确认")));
         let report = conn.probe().await.unwrap();
         assert!(report.reachable);
         assert!(report.family.is_none(), "无 anchor 不得断言 family");
         assert!(report.warnings.iter().any(|w| w.code == NCK_ANCHOR_PENDING));
     }
 
-    /// 合成 catalog（脚手架数值，非 Siemens 语义； wired module/column 仅测机器）。
-    fn synthetic_catalog() -> NckCatalog {
-        NckCatalog::from_json(&serde_json::json!({"variables": [
-            {"area": "C", "block": "SEMA", "variable": "actFeedRate",
-             "data_type": "F64", "shape": "lines", "unit": "mm/min",
-             "wire": {"module": 18, "column": 42, "transport_size": 4, "element_size": 8},
-             "supported_families": ["test"]},
-        ]}))
-        .expect("合成 catalog 合法")
-    }
-
-    fn conn_with_synthetic() -> NckConnection {
-        NckConnection::with_catalog(
+    /// 采集用连接：注入模板集合（Gate B：模板缺失/非法**不得**影响数据面）。
+    fn conn_with_presets(presets: PresetRegistry) -> NckConnection {
+        NckConnection::with_presets(
             NckConnConfig::from_json(&serde_json::json!({
                 "host": "127.0.0.1", "family": "840d-sl",
                 "local_tsap": 256, "remote_tsap": 258,
             }))
             .unwrap(),
-            synthetic_catalog(),
+            presets,
         )
+    }
+
+    fn conn_with_synthetic() -> NckConnection {
+        conn_with_presets(PresetRegistry::embedded())
     }
 
     fn poll_task(id: &str, selections: serde_json::Value) -> AcquisitionTask {
@@ -1125,21 +1334,25 @@ mod tests {
         }
     }
 
+    /// 原生地址选择项（脚手架数值，非 Siemens 语义：C/1/module18/column42，
+    /// line=3，F64_BE/0x09，与 fixture 缺省响应自洽）。
     fn speed_selection(point_key: &str) -> serde_json::Value {
         serde_json::json!([{
             "resource_id": "variable",
             "parameters": {
-                "area": "C", "area_no": 1, "block": "SEMA",
-                "variable": "actFeedRate", "line": 3,
+                "area": "C", "area_no": 1, "module": 18, "column": 42,
+                "line": 3, "count": 1, "unit_mode": "current",
+                "decode": "F64_BE", "transport_size": "0x09",
+                "unit": "mm/min",
             },
             "outputs": [{"output": "value", "point_key": point_key}],
         }])
     }
 
-    /// PR3 闭环（DriverResolved）：catalog 条目类型 → configure →
+    /// DriverResolved 闭环：原生 `decode + count` → configure →
     /// PointDescriptor；count=1 标量、count>1 同口径 array（pack_array 一致）。
     #[tokio::test]
-    async fn driver_resolved_type_matches_catalog_and_count() {
+    async fn driver_resolved_type_matches_decode_and_count() {
         let d = SinumerikNckDriver.descriptor();
         d.validate().expect("descriptor 必须合法");
         let var = d.resources.iter().find(|r| r.id == "variable").unwrap();
@@ -1147,11 +1360,12 @@ mod tests {
             var.outputs[0].type_spec,
             mesa_core_types::OutputTypeSpec::DriverResolved
         );
-        // count=1 → F64（catalog data_type）
+        // count=1 → F64（decode=F64_BE）
         let conn = conn_with_synthetic();
         let params = serde_json::json!({
-            "area": "C", "area_no": 1, "block": "SEMA",
-            "variable": "actFeedRate", "line": 3,
+            "area": "C", "area_no": 1, "module": 18, "column": 42,
+            "line": 3, "count": 1, "unit_mode": "current",
+            "decode": "F64_BE", "transport_size": "0x09",
         });
         let issues = var.parameters.validate_instance("parameters", &params);
         assert!(issues.is_empty(), "{issues:?}");
@@ -1186,7 +1400,7 @@ mod tests {
         assert_eq!(descs[0].data_type, mesa_core_types::DataType::F64);
         assert_eq!(descs[0].unit.as_deref(), Some("mm/min"));
 
-        // 未知变量 fail-closed。
+        // 旧模型字段 fail-closed（不迁移、不隐式推导）。
         let mut bad_sel = speed_selection("k");
         bad_sel[0]["parameters"]["variable"] = serde_json::json!("noSuchVar");
         let err = conn
@@ -1194,6 +1408,24 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "INVALID_VARIABLE");
+
+        // 非法原生字段（未知 transport）同样 fail-closed。
+        let mut bad_ts = speed_selection("k");
+        bad_ts[0]["parameters"]["transport_size"] = serde_json::json!("0x04");
+        let err = conn
+            .configure(7, vec![poll_task("t7", bad_ts)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "INVALID_VARIABLE");
+
+        // output 不是 value：Driver 纵深拒绝。
+        let mut bad_out = speed_selection("k");
+        bad_out[0]["outputs"][0]["output"] = serde_json::json!("other");
+        let err = conn
+            .configure(8, vec![poll_task("t8", bad_out)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "UNSUPPORTED_OUTPUT");
 
         // 非 Poll 模式拒绝（不伪造 subscribe）。
         let mut t = poll_task("t3", speed_selection("k"));
