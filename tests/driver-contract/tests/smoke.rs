@@ -113,3 +113,41 @@ async fn databatch_epoch_sequence_semantics() {
 
 // 引用 SessionError 以确认公共断言工具与类型匹配（防止 common 演进时静默失配）
 const _: fn(SessionError) = assert_handshake_error;
+
+/// staged driver 二进制的有界重试语义（Windows 共享冲突修复的确定性回归）。
+///
+/// 背景：staged 目录在 `temp_dir()`、构建产物在仓库 `target/`，跨卷无法
+/// hardlink，只能复制；而 `fs::copy` 在 Windows 上会因 ERROR_SHARING_VIOLATION
+/// 失败（上一个用例的 driver 子进程仍在退出）。真实的共享冲突需要 Win32
+/// `CreateFileW(share_mode=0)` 才能稳定复现（std 默认共享读写删），为它引入
+/// 新依赖不划算，因此这里锁住**重试语义**：成功后立即停止、失败次数有界、
+/// 耗尽时返回最后一次错误。
+#[test]
+fn staged_copy_retry_is_bounded_and_stops_on_success() {
+    use std::cell::Cell;
+    use std::io::Error;
+
+    let attempts = Cell::new(0u32);
+    let ok: Result<i32, Error> = retry_io(10, |_| {
+        attempts.set(attempts.get() + 1);
+        if attempts.get() < 4 {
+            Err(Error::other("sharing violation"))
+        } else {
+            Ok(7)
+        }
+    });
+    assert_eq!(ok.expect("第 4 次必须成功"), 7);
+    assert_eq!(attempts.get(), 4, "成功后必须立即停止重试");
+
+    let tries = Cell::new(0u32);
+    let err = retry_io::<(), _>(3, |_| {
+        tries.set(tries.get() + 1);
+        Err(Error::other(format!("try {}", tries.get())))
+    })
+    .expect_err("始终失败必须返回错误");
+    assert_eq!(tries.get(), 3, "尝试次数必须受 attempts 限制");
+    assert!(
+        err.to_string().contains("try 3"),
+        "必须返回最后一次错误，实际: {err}"
+    );
+}
