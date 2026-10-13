@@ -94,6 +94,74 @@ impl NckDataKind {
         }
     }
 
+    /// 规范解码名（`decode` 字段的唯一合法词表；大小写敏感，拒绝别名）。
+    ///
+    /// 与 [`Self::parse`] 的区别：`parse` 兼容历史 catalog 别名
+    /// （`REAL`/`DINT`/`LREAL` 等），仅用于迁移期的 catalog 装载；
+    /// 新 Resource 配置一律走本函数，别名与未知值都必须失败，
+    /// 避免用户用 `REAL` 猜测字节序或宽度。
+    pub fn decode_name(self) -> &'static str {
+        match self {
+            NckDataKind::F64 => "F64_BE",
+            NckDataKind::F64Le => "F64_LE",
+            NckDataKind::F32 => "F32_BE",
+            NckDataKind::I32 => "I32_BE",
+            NckDataKind::I32Le => "I32_LE",
+            NckDataKind::U32 => "U32_BE",
+            NckDataKind::U16Be => "U16_BE",
+            NckDataKind::U16Le => "U16_LE",
+            NckDataKind::I16Be => "I16_BE",
+            NckDataKind::U8 => "U8",
+            NckDataKind::Bool => "BOOL",
+            NckDataKind::Utf8Fixed16 => "UTF8_FIXED_16",
+            NckDataKind::Utf8NulLast32 => "UTF8_NUL_LAST_32",
+            NckDataKind::Utf8NulFirst66 => "UTF8_NUL_FIRST_66",
+            NckDataKind::Utf16Be => "UTF16_BE",
+        }
+    }
+
+    /// 严格规范解码解析（新 Resource 唯一入口）。
+    pub fn parse_decode(s: &str) -> Result<Self, ValueError> {
+        match s {
+            "F64_BE" => Ok(NckDataKind::F64),
+            "F64_LE" => Ok(NckDataKind::F64Le),
+            "F32_BE" => Ok(NckDataKind::F32),
+            "I32_BE" => Ok(NckDataKind::I32),
+            "I32_LE" => Ok(NckDataKind::I32Le),
+            "U32_BE" => Ok(NckDataKind::U32),
+            "U16_BE" => Ok(NckDataKind::U16Be),
+            "U16_LE" => Ok(NckDataKind::U16Le),
+            "I16_BE" => Ok(NckDataKind::I16Be),
+            "U8" => Ok(NckDataKind::U8),
+            "BOOL" => Ok(NckDataKind::Bool),
+            "UTF8_FIXED_16" => Ok(NckDataKind::Utf8Fixed16),
+            "UTF8_NUL_LAST_32" => Ok(NckDataKind::Utf8NulLast32),
+            "UTF8_NUL_FIRST_66" => Ok(NckDataKind::Utf8NulFirst66),
+            "UTF16_BE" => Ok(NckDataKind::Utf16Be),
+            _ => Err(ValueError::UnsupportedType {
+                name: s.to_string(),
+            }),
+        }
+    }
+
+    /// 是否可投影为数值（无效工程值规则只允许用于这些解码）。
+    /// 文本与 BOOL 不参与数值无效值判定。
+    pub fn is_numeric(self) -> bool {
+        matches!(
+            self,
+            NckDataKind::F64
+                | NckDataKind::F64Le
+                | NckDataKind::F32
+                | NckDataKind::I32
+                | NckDataKind::I32Le
+                | NckDataKind::U32
+                | NckDataKind::U16Be
+                | NckDataKind::U16Le
+                | NckDataKind::I16Be
+                | NckDataKind::U8
+        )
+    }
+
     /// 解析catalog类型；小端变体必须显式声明，不能根据数值大小猜字节序。
     pub fn parse(s: &str) -> Result<Self, ValueError> {
         match s.trim().to_ascii_uppercase().as_str() {
