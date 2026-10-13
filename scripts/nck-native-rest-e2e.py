@@ -54,7 +54,33 @@ def wait_http(base, seconds=40):
     return False
 
 
+def driver_binary_is_fresh():
+    """驱动二进制必须比其源码新。
+
+    切分支后忘记重编会拉起**另一份源码**构建的驱动：原生字段被判成非法（400）、
+    identity/浏览直接 503，报错与真实缺陷高度相似。AGENTS.md 已就此警告过
+    （“旧二进制让故障注入静默失效”），这里把它变成启动前的硬检查。
+    """
+    exe = os.path.join(ROOT, 'target', 'debug', 'mesa-driver-sinumerik-nck.exe')
+    if not os.path.isfile(exe):
+        return False, '缺少 %s（先 cargo build --workspace）' % exe
+    exe_mtime = os.path.getmtime(exe)
+    src_dir = os.path.join(ROOT, 'drivers', 'sinumerik-nck', 'src')
+    newest = 0.0
+    for name in os.listdir(src_dir):
+        if name.endswith('.rs'):
+            newest = max(newest, os.path.getmtime(os.path.join(src_dir, name)))
+    if newest > exe_mtime:
+        return False, ('%s 比 drivers/sinumerik-nck/src 旧；先 cargo build --workspace'
+                       '（否则跑的是另一份源码的驱动）' % os.path.basename(exe))
+    return True, 'ok'
+
+
 def main():
+    fresh, why = driver_binary_is_fresh()
+    if not fresh:
+        print('FAIL(前置): ' + why)
+        return 2
     tmp = tempfile.mkdtemp(prefix='nck-e2e-')
     emu = mesad = None
     results = []
@@ -158,7 +184,62 @@ def main():
             dtype = got.get('data_type') or got.get('value_type')
             print('data_type:', dtype, 'value:', got.get('value'))
 
-        # 3) 负例：旧目录字段必须被明确拒绝
+        # 3) 模板路径：经 REST Browse 取模板 → 只预填固定字段 → 使用者补实例/行
+        #    → 保存 → 采集。这是 Web 实际走的路径（与上面手写参数不同）。
+        req(base + '/api/v1/endpoints/%s/stop' % ep, 'POST')
+        code, body = req(base + '/api/v1/endpoints/%s/browse' % ep, 'POST',
+                         {'parent': '', 'limit': 10})
+        root_ids = [n.get('id') for n in (body or {}).get('nodes', [])]
+        print('browse 根 ->', code, root_ids)
+        results.append(('Browse 根为模板+身份两类入口',
+                        code == 200 and 'nck://presets' in root_ids
+                        and 'nck://identity' in root_ids))
+
+        # filter 精确取一个 8 字节模板（模拟器 --element-size 8）。
+        code, body = req(base + '/api/v1/endpoints/%s/browse' % ep, 'POST',
+                         {'parent': 'nck://presets', 'filter': 'rpa', 'limit': 10})
+        nodes = [n for n in (body or {}).get('nodes', []) if n.get('kind') == 'variable']
+        print('browse 模板(filter=rpa) ->', code, '命中', len(nodes))
+        if not nodes:
+            print('FAIL: 未取到模板叶', body)
+            results.append(('取到模板叶', False))
+            return 1
+        leaf = nodes[0]
+        print('leaf label:', leaf.get('label'))
+        binding = json.loads(leaf['binding_json'])
+        bparams = binding['parameters']
+        results.append(('模板只预填固定字段（不含 area_no/line）',
+                        'area_no' not in bparams and 'line' not in bparams
+                        and binding.get('resource_id') == 'variable'))
+        results.append(('模板标注 candidate 且列出待确认项',
+                        'candidate' in (leaf.get('label') or '')
+                        and '待确认' in (leaf.get('label') or '')))
+
+        bparams['area_no'] = 1
+        bparams['line'] = 1
+        task2 = json.loads(json.dumps(task))
+        task2['id'] = 't2'
+        task2['binding']['config']['selections'][0]['parameters'] = bparams
+        task2['binding']['config']['selections'][0]['outputs'] = [
+            {'output': 'value', 'point_key': 'e2e.preset'}]
+        code, body = req(base + '/api/v1/tasks/' + ep, 'PUT', [task2])
+        print('PUT /tasks (模板+确认) ->', code)
+        results.append(('模板补必填后可保存', code in (200, 201)))
+        req(base + '/api/v1/endpoints/%s/start' % ep, 'POST')
+        got2 = None
+        for _ in range(40):
+            time.sleep(0.5)
+            _, latest = req(base + '/api/v1/points/latest')
+            for p in ((latest or {}).get('points') or []):
+                if p.get('key') == 'e2e.preset':
+                    got2 = p
+                    break
+            if got2:
+                break
+        print('preset point:', json.dumps(got2, ensure_ascii=False) if got2 else None)
+        results.append(('模板任务采到 GOOD', (got2 or {}).get('quality') == 'GOOD'))
+
+        # 4) 负例：旧目录字段必须被明确拒绝
         req(base + '/api/v1/endpoints/%s/stop' % ep, 'POST')
         legacy_task = json.loads(json.dumps(task))
         legacy_task['binding']['config']['selections'][0]['parameters'] = {

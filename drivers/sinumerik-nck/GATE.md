@@ -45,8 +45,10 @@
     `source_label=nck://read/C/1/18/42/1/1?mode=current&decode=F64_BE&transport=0x09`、
     `value_origin=CURRENT`）；旧目录字段任务在**保存时**即被 Core Schema
     以 `REQUIRED module/column/decode` 拒绝（400），不会静默接受。✅
-  - GC6 全量回归 + 契约证据 + CI（含 stress/perf/web/三平台）在最终 SHA 上全绿。⬜
-    待 #96/#97/#98 合并后在合并后的 SHA 上重跑并留档。
+  - GC6 发布闭环：`docs/releases/nck-native-addressing-2026-10-13.md` 已起草
+    （变更摘要、PR 与提交、验证清单、本机迁移、未决的驱动功能版本号），
+    并在最终 SHA 上重跑全量回归 + 契约证据 + CI（含 stress/perf/web/三平台）。
+    ⬜ 最终 SHA 待 #96/#97/#98/#99 合并后补入。
 - Gate F（外部无真机验证，ADR 0002）：真机到手前可证明项的上限。
   - F1 source provenance pinned（`docs/evidence/nck-external-sources.lock.json`，
     三源 commit 锁定）。✅
