@@ -103,6 +103,12 @@ module 130 两个独立模板）。
 
 ## 检查
 
+- `EXAMPLES.md`：**可直接复制**的工程配置示例（普通 NC 变量 / R 参数 / 轴变量 /
+  SINAMICS 只读参数 / `p0199` 对象名，两条驱动入口都有）；其中的请求字节与
+  地址标识由 `tests/examples_828d.rs` 逐条复核，数据源 `examples-828d.json`，
+  文档不会与代码漂移。
+- `PROVENANCE.md`：42 条候选定义的保留/弃用与来源、7 项未纳入项。
 - `src/presets.rs` 单测：模板合法性、拆分入口、非法/空模板降级；
 - `tests/native_address.rs`：原生地址严格解析与 golden 字节；
+- `tests/legacy_equivalence.rs`：与删除前冻结的目录映射逐条对拍；
 - 完整准入执行 `scripts/write-contract-evidence.py`；真实 828D Gate 见 `../GATE.md`。

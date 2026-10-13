@@ -27,6 +27,33 @@
   - G5 旧 NCK Task JSON 被明确拒绝，无自动迁移。✅
   - G6 transport 语义按实测修正：NCK 响应为 `0x05/0x06/0x07/0x09` +
     **字节**长度；早期脚手架用的 `0x04`+位长度（PLC S7ANY 习惯）已更正。✅
+- Gate G-C（独立验收与发布闭环，PR-C）：用**删除前的冻结数据**与**实体机**
+  独立验证，而不是用新代码自证。
+  - GC1 旧→新寻址等价门：`tests/legacy_equivalence.rs` 逐条断言原生路径复现
+    62 条冻结目录地址字节（42 NC 变量 + 20 驱动对象），并断言两条入口不折叠。✅
+  - GC2 实体机只读对照：`docs/evidence/nck-live-native-probe.txt` —— 用**新的**
+    原生地址 + 内建探针在实体 828D 上取值，与旧目录路径一致
+    （轴名/通道映射/驱动号/主轴归属/两条入口 `p0199`/候选参数）。✅
+  - GC3 决策与来源留档：`docs/adr/0004-nck-native-addressing.md`（决策、取舍、
+    被否决方案）、`presets/PROVENANCE.md`（42 条保留/弃用与来源 + 未纳入项）。✅
+  - GC4 升级路径写实：`CONTRACT.md` §升级与迁移 记录备份→停止→重建→核对
+    四步与“无自动迁移”的明确承诺。✅
+  - GC5 集成回归（REST/Core 全链）：`scripts/nck-native-rest-e2e.py` +
+    `docs/evidence/nck-rest-e2e.txt`（12 项断言）—— 模拟器真实 TCP +
+    mesad（临时 DB/独立端口），不触碰本机配置。覆盖：
+    - 手写原生字段：保存→启动→采到 **GOOD**（`type=f64`、
+      `source_label=nck://read/C/1/18/42/1/1?mode=current&decode=F64_BE&transport=0x09`）；
+    - **任务往返一致**：读回参数与提交参数逐字节相同，无隐藏回填或静默重解释；
+    - **模板路径**：Browse 根 = `nck://presets` + `nck://identity`；模板叶只含固定字段、
+      标注 `candidate`/`待确认：area_no/line`；补实例与行后可保存并采到 GOOD；
+    - **端点重启 / PointMap**：两条任务同时存在，Stop→Start 后两点都在且 `point_id`
+      不变（`e2e.value=1`、`e2e.preset=2`）；
+    - 旧目录字段任务在**保存时**即被 Core Schema 以 `REQUIRED module/column/decode`
+      拒绝（400），不会静默接受。✅
+  - GC6 发布闭环：`docs/releases/nck-native-addressing-2026-10-13.md` 已起草
+    （变更摘要、PR 与提交、验证清单、本机迁移、未决的驱动功能版本号），
+    并在最终 SHA 上重跑全量回归 + 契约证据 + CI（含 stress/perf/web/三平台）。
+    ⬜ 最终 SHA 待 #96/#97/#98/#99 合并后补入。
 - Gate F（外部无真机验证，ADR 0002）：真机到手前可证明项的上限。
   - F1 source provenance pinned（`docs/evidence/nck-external-sources.lock.json`，
     三源 commit 锁定）。✅
@@ -100,3 +127,44 @@ r0035接近-200的无效标记按BAD处理，不以ReadVar返回FF判为有效�
 这些结果只证明该目标与所选地址的只读行为；HMI逐项语义对照、全部动态
 工况、multi-read、断线重连等完整硬件Gate未完成。模块130仍保留候选状态，
 不据部分参数或对象名成功将整个目录标成supported。
+
+## 实体828D原生绑定采样复测（2026-10-14，只读）
+
+用**新的原生绑定**（模板 + 使用者确认的 `area_no`/`line`）复测代表性点位，
+逐条记录请求字节、设备返回与质量：`docs/evidence/nck-live-samples-probe.txt`
+（探针 `tests/live_samples_probe.rs`，`#[ignore]`，只读、单会话）。
+
+**可读（GOOD）**
+
+| 点位 | 结果 |
+|---|---|
+| `C/S/progStatus` | `U32(3)` |
+| `C/S/actFeedRateIpo` | `F64(0.0)` |
+| `C/RP/rpa` R0 / R1 / R99（line=R号+1） | `F64(0.0)` |
+| `C/SGA/actToolBasePos` 轴1/2/3 | `-1.967` / `-3.515` / `25.551` |
+| `C/SGA/actToolBasePos` 轴4..8 | `0.0` |
+| `C/SEGA/actProgPosBKS` 轴1..8 | 与同轴设定位置相同（静止、无偏置时可预期） |
+| `C/SSP/cmdSpeed` 主轴1 / 主轴2 | `10000.0` / `0.0` |
+| `V/M` `r0033`、`r0035`（module 26 与 130） | 见证据文件 |
+| `V/M` `r0078`、`r0080`（module 26） | `0.0` / `-3.55e-7` |
+
+**当前被设备拒绝**
+
+- `V/M` `r0027`、`r0031`：在 **module 26 与 module 130 两条入口**、
+  `V/1`..`V/4` 上均返回**单项码 `0x85`**（8 次尝试一致，非偶发）。
+- `C/RP/rpa` 的 R425：返回单项码 `0x03`（该 R 参数在此机上不存在）。
+  注意这不影响 R0/R1/R99 可读。
+
+**与 2026-10-13 记录不一致，以本次为准**
+
+上文「实体828D通过模块26读取r0027/r0031」是 2026-10-13 的记录；本次在同一台
+实体机上复测，两条入口均被拒，**该结论不再成立**。可能原因（机床配置/选项/
+固件变化，或该参数未经 NC 入口开放）尚未确认，因此：
+
+- **不得**据此断言 `r0027`/`r0031` 在 828D 上普遍可读或普遍不可读；
+- `r0078`/`r0080` 可读**不能**替代 `r0027`/`r0031` 的验收（物理量不同）；
+- 相关点位维持 HOLD，直到有可复现的设备侧解释。
+
+轴位置在轴1..3 有值、轴4..8 为零，与 `line=机床轴索引` 的说法**一致**，
+但单次静止采样不足以据此确认轴身份映射（参见上一节的归属未证明结论）。
+
