@@ -53,7 +53,15 @@
   - GC6 发布闭环：`docs/releases/nck-native-addressing-2026-10-13.md` 已起草
     （变更摘要、PR 与提交、验证清单、本机迁移、未决的驱动功能版本号），
     并在最终 SHA 上重跑全量回归 + 契约证据 + CI（含 stress/perf/web/三平台）。
-    ⬜ 最终 SHA 待 #96/#97/#98/#99 合并后补入。
+  - **GC6 ✅ 已闭环**：合并后最终 SHA = **`d29c944`**（`main`，
+    由 #96 → #97 → #98 依序普通 merge，前置 #99 已先合）。
+    在该 SHA 上重跑：`cargo build --locked --workspace`、
+    `cargo fmt --all --check`、`cargo clippy --locked --workspace --all-targets
+    --all-features -D warnings` 全部干净；`scripts/write-contract-evidence.py`
+    **28/28 套件、187/187 测试、`dirty=false`、sha=`d29c944`**；
+    非契约包（core-types/config-store/driver-sdk/manager/s7/focas2/opcua/
+    sinumerik-nck/s7-transport/nck-emulator）全通过；
+    `main` 上 push 触发的 CI 全部 success。
 - Gate F（外部无真机验证，ADR 0002）：真机到手前可证明项的上限。
   - F1 source provenance pinned（`docs/evidence/nck-external-sources.lock.json`，
     三源 commit 锁定）。✅
