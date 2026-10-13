@@ -20,6 +20,8 @@ mod codec;
 mod config;
 mod fixture;
 mod identity;
+mod identity_spec;
+mod native;
 mod probe;
 mod topology;
 mod value;
@@ -35,6 +37,15 @@ pub use codec::{
 };
 pub use config::{NCK_DEFAULT_PORT, NckConnConfig};
 pub use fixture::{NckFixture, NckFixtureState};
+pub use identity_spec::{
+    AXIS_CTRLOUT_MODULE_NR, AXIS_CTRLOUT_TYPE, AXIS_ENC_MODULE_NR, AXIS_NAME, AXIS_SPIND_ASSIGN,
+    CHANNEL_MACHAX_USED, DRIVE_OBJECT_NAME, DRIVE_OBJECT_NAME_M130, IdentityProbeSpec, PROBES_828D,
+    ProbeSlot, probes_for_family,
+};
+pub use native::{
+    InvalidRule, MAX_AREA_NO, MAX_COUNT, NativeError, NativeNckAddress, ResolvedPoint,
+    TRANSPORT_SIZES, parse_transport_size, resolve_native, transport_size_name, unit_mode_name,
+};
 pub use probe::{NCK_ANCHOR_PENDING, probe_with_session};
 pub use topology::{NckAxis, NckChannel, NckTopology, axis_path, channel_path};
 pub use value::{NckDataKind, NckSample, ValueError, decode_value};
@@ -252,8 +263,9 @@ impl Driver for SinumerikNckDriver {
 #[derive(Debug, Clone)]
 struct PointSpec {
     key: String,
-    /// 用户语义回显（canonical key 进诊断）。
-    var_ref: NckVariableRef,
+    /// 稳定地址标识（诊断/回显用）。PR-A 起不再持有 `NckVariableRef`：
+    /// 采集面只需要标签字符串，地址模型可独立演进为原生字段。
+    source_label: String,
     wire: NckWireAddress,
     kind: NckDataKind,
     expected_len: usize,
@@ -324,7 +336,7 @@ fn decode_point(
         let count = spec.expected_len / elem;
         // P1-4：client 已保证 exact，此处再收一道（exact，不猜不补）。
         if bytes.len() != spec.expected_len || count == 0 {
-            tracing::warn!(key = %spec.key, canonical = %spec.var_ref.canonical_key(), got = bytes.len(), need = spec.expected_len, "NCK 数据长度不符，按 BAD 隔离");
+            tracing::warn!(key = %spec.key, canonical = %spec.source_label, got = bytes.len(), need = spec.expected_len, "NCK 数据长度不符，按 BAD 隔离");
             return None;
         }
         if matches!(spec.kind, NckDataKind::Utf8NulLast32 | NckDataKind::Utf8NulFirst66 | NckDataKind::Utf16Be) {
@@ -336,7 +348,7 @@ fn decode_point(
             match decode_value(&bytes[i * elem..(i + 1) * elem], spec.kind) {
                 Ok(v) => elems.push(v),
                 Err(e) => {
-                    tracing::warn!(key = %spec.key, canonical = %spec.var_ref.canonical_key(), error = %e, "NCK 元素解码失败，按 BAD 隔离");
+                    tracing::warn!(key = %spec.key, canonical = %spec.source_label, error = %e, "NCK 元素解码失败，按 BAD 隔离");
                     return None;
                 }
             }
@@ -573,7 +585,7 @@ impl DriverConnection for NckConnection {
                     };
                     new_points.push(PointSpec {
                         key: out.point_key.clone(),
-                        var_ref,
+                        source_label: var_ref.canonical_key(),
                         wire: rv.wire,
                         kind: rv.kind,
                         expected_len: rv.expected_data_len,
@@ -598,7 +610,7 @@ impl DriverConnection for NckConnection {
                 data_type: p.data_type,
                 unit: p.unit.clone(),
                 // 通用地址回显仅用于诊断，不能据此断言业务轴身份。
-                source_label: Some(p.var_ref.canonical_key()),
+                source_label: Some(p.source_label.clone()),
             })
             .collect();
         ensure_unique_point_keys(&descriptors).map_err(|DuplicatePointKey(k)| {
@@ -866,7 +878,7 @@ mod tests {
         let resolved = resolve_wire(&reference, def).unwrap();
         let spec = PointSpec {
             key: "temperature".into(),
-            var_ref: reference,
+            source_label: reference.canonical_key(),
             wire: resolved.wire,
             kind: resolved.kind,
             expected_len: 4,
