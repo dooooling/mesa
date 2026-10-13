@@ -69,6 +69,7 @@ fn cfg(port: u16) -> NckConnConfig {
         remote_tsap: 0x0100,
         timeout_ms: 5000,
         requested_pdu_length: 480,
+        ..NckConnConfig::default()
     }
 }
 

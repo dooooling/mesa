@@ -244,7 +244,6 @@ impl Driver for SinumerikNckDriver {
             cfg,
             catalog,
             topology: None,
-            identity_cache: tokio::sync::Mutex::new(None),
             plan: std::sync::RwLock::new(None),
         }))
     }
@@ -288,8 +287,6 @@ pub struct NckConnection {
     /// 拓扑快照（probe 回填；V1 恒 None，browse 退化为纯 Catalog 树）。
     /// 只读（当前无回填写路径），control-handle 下天然 &self 兼容。
     topology: Option<NckTopology>,
-    /// 浏览专用有界快照；不参与采集计划，不持久化对象推断。
-    identity_cache: tokio::sync::Mutex<Option<(std::time::Instant, identity::IdentityMap)>>,
     // 采集计划（control-handle 并发模型）：configure/apply 写锁替换，
     // run 读锁克隆快照后释放；catalog/topology 只读。
     plan: std::sync::RwLock<Option<PlanSnapshot>>,
@@ -302,7 +299,6 @@ impl NckConnection {
             cfg,
             catalog,
             topology: None,
-            identity_cache: tokio::sync::Mutex::new(None),
             plan: std::sync::RwLock::new(None),
         }
     }
@@ -803,35 +799,22 @@ impl DriverConnection for NckConnection {
         cursor: &str,
         limit: u32,
     ) -> Result<(Vec<mesa_driver_protocol::pb::BrowseNode>, Option<String>), SdkDriverError> {
-        if identity::supported(&self.catalog) && parent.starts_with(identity::ROOT) {
-            let mut cache = self.identity_cache.lock().await;
-            if cache
-                .as_ref()
-                .is_none_or(|(stamp, _)| stamp.elapsed() > std::time::Duration::from_secs(30))
-            {
-                // 网络枚举设总时限；请求超时或协议畸形不会变成伪造的空成功。
-                let map = tokio::time::timeout(
-                    std::time::Duration::from_secs(15),
-                    identity::load(&self.cfg, &self.catalog),
+        if identity::supported(&self.catalog)
+            && (parent == identity::ROOT || parent.starts_with(&format!("{}/", identity::ROOT)))
+        {
+            // 临时Browse连接无跨请求缓存；按页/节点读取并保留整次操作时限。
+            return tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                identity::browse(&self.cfg, &self.catalog, parent, filter, cursor, limit),
+            )
+            .await
+            .map_err(|_| {
+                SdkDriverError::new(
+                    mesa_core_types::ErrorKind::Timeout,
+                    "IDENTITY_TIMEOUT",
+                    "目标页或对象核对超过15秒",
                 )
-                .await
-                .map_err(|_| {
-                    SdkDriverError::new(
-                        mesa_core_types::ErrorKind::Timeout,
-                        "IDENTITY_TIMEOUT",
-                        "对象核对超过15秒",
-                    )
-                })??;
-                *cache = Some((std::time::Instant::now(), map));
-            }
-            return Ok(identity::nodes(
-                &cache.as_ref().unwrap().1,
-                &self.catalog,
-                parent,
-                filter,
-                cursor,
-                limit,
-            ));
+            })?;
         }
         if parent.is_empty() && identity::supported(&self.catalog) {
             let (mut nodes, _) = build_tree(&self.catalog, self.topology.as_ref(), "", "", "", 31);

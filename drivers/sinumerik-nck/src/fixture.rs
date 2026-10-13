@@ -19,11 +19,14 @@ use std::sync::{Arc, Mutex};
 
 use tokio::net::TcpListener;
 
+/// 请求规范到原始单项返回码、传输类型和载荷的固定记录。
+pub type RecordedItems = HashMap<Vec<u8>, (u8, u8, Vec<u8>)>;
+
 /// 脚手架状态（多连接共享，测试按需配置）。
 #[derive(Debug, Clone, Default)]
 pub struct NckFixtureState {
     /// 固定现场只读向量：按完整请求规范回放，不由待测解码器反推响应。
-    pub recorded_items: Option<HashMap<Vec<u8>, (u8, u8, Vec<u8>)>>,
+    pub recorded_items: Option<RecordedItems>,
     /// 作业级拒绝也按完整请求匹配，保留对象目录边界的原始错误码。
     pub recorded_jobs: HashMap<Vec<u8>, u16>,
     /// Setup 协商上限（0 → 480）。

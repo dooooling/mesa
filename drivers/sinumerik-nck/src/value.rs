@@ -185,7 +185,7 @@ pub fn decode_value(raw: &[u8], kind: NckDataKind) -> Result<Value, ValueError> 
         NckDataKind::U16Be => Value::U32(u16::from_be_bytes([raw[0], raw[1]]) as u32),
         NckDataKind::I16Be => Value::I32(i16::from_be_bytes([raw[0], raw[1]]) as i32),
         NckDataKind::Utf16Be => {
-            if raw.len() % 2 != 0 {
+            if !raw.len().is_multiple_of(2) {
                 return Err(ValueError::InvalidUtf16 {
                     reason: "字节长度必须为偶数".into(),
                 });

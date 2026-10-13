@@ -602,7 +602,7 @@ mod tests {
         };
         let response = ack_resp(&[0xff, 5, 0, 2, 0, 11], &[4, 1]);
         assert_eq!(
-            parse_read_response(&response, &[nck.clone()]).unwrap()[0].data,
+            parse_read_response(&response, std::slice::from_ref(&nck)).unwrap()[0].data,
             [0, 11]
         );
         // 同一字节载荷的PLC ANY响应使用16位，不能被NCK规则污染。
