@@ -38,8 +38,15 @@
     被否决方案）、`presets/PROVENANCE.md`（42 条保留/弃用与来源 + 未纳入项）。✅
   - GC4 升级路径写实：`CONTRACT.md` §升级与迁移 记录备份→停止→重建→核对
     四步与“无自动迁移”的明确承诺。✅
-  - GC5 全量回归 + 契约证据 + CI（含 stress/perf/web/三平台）在最终 SHA 上全绿。⬜
-    待 #96/#97 合并后在合并后的 SHA 上重跑并留档。
+  - GC5 集成回归（REST/Core 全链）：`scripts/nck-native-rest-e2e.py` +
+    `docs/evidence/nck-rest-e2e.txt` —— 模拟器真实 TCP + mesad（临时 DB/独立端口）
+    走 `POST /devices → POST /endpoints → PUT /tasks → POST /start →
+    GET /points/latest`。原生字段任务保存→启动→采到 **GOOD**（`type=f64`、
+    `source_label=nck://read/C/1/18/42/1/1?mode=current&decode=F64_BE&transport=0x09`、
+    `value_origin=CURRENT`）；旧目录字段任务在**保存时**即被 Core Schema
+    以 `REQUIRED module/column/decode` 拒绝（400），不会静默接受。✅
+  - GC6 全量回归 + 契约证据 + CI（含 stress/perf/web/三平台）在最终 SHA 上全绿。⬜
+    待 #96/#97/#98 合并后在合并后的 SHA 上重跑并留档。
 - Gate F（外部无真机验证，ADR 0002）：真机到手前可证明项的上限。
   - F1 source provenance pinned（`docs/evidence/nck-external-sources.lock.json`，
     三源 commit 锁定）。✅
