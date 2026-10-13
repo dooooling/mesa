@@ -5,6 +5,19 @@
 - 冻结标签 `nck-v0.5.0-freeze-20261013` → `80a8c81`：**未移动**（本次不触碰）
 - 性质：**破坏性**——旧 NCK 配置不再兼容，且不提供自动迁移
 
+## 交付物
+
+| 交付物 | 位置 |
+|---|---|
+| 原生地址 Resource（Descriptor/解析器/唯一 Configure-Run 管道） | `src/native.rs`、`src/lib.rs` |
+| 内建身份探针 + 有界 Browse 回归 | `src/identity_spec.rs`、`src/identity.rs` |
+| 可选预填模板与来源清单 | `presets/828d.json`、`presets/PROVENANCE.md` |
+| **可直接复制的工程配置示例**（R 参数/普通 NC 变量/SINAMICS 只读参数/`p0199`） | `presets/EXAMPLES.md`（数据源 `presets/examples-828d.json`，由 `tests/examples_828d.rs` 逐条复核） |
+| 契约与门禁 | `CONTRACT.md`、`GATE.md`（Gate G / G-C） |
+| 决策记录 | `docs/adr/0004-nck-native-addressing.md` |
+| 真实硬件与迁移证据 | `docs/evidence/nck-live-native-probe.txt`、`nck-local-migration-2026-10-13.md`、`nck-rest-e2e.txt` |
+| 独立验收入口 | `tests/legacy_equivalence.rs`、`scripts/nck-native-rest-e2e.py` |
+
 ## 变更摘要
 
 1. **Catalog 退出采集准入**：删 `catalog.rs`、`browse.rs`、`topology.rs`、
