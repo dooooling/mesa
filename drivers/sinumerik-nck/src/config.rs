@@ -38,6 +38,8 @@ pub struct NckConnConfig {
     pub remote_tsap: u16,
     pub timeout_ms: u64,
     pub requested_pdu_length: u16,
+    /// 每个ReadVar请求的项数上限，与PDU长度分片同时生效。
+    pub max_read_items: usize,
 }
 
 impl Default for NckConnConfig {
@@ -52,6 +54,7 @@ impl Default for NckConnConfig {
             remote_tsap: 0x0100,
             timeout_ms: NCK_DEFAULT_TIMEOUT_MS,
             requested_pdu_length: S7_PDU_DEFAULT,
+            max_read_items: mesa_s7_transport::S7_MAX_ITEMS_PER_PDU,
         }
     }
 }
@@ -60,6 +63,26 @@ impl NckConnConfig {
     /// 从 Endpoint connection JSON 解析（fail-closed：非法一律 BAD_CONFIG）。
     pub fn from_json(v: &serde_json::Value) -> Result<Self, SdkDriverError> {
         let mut cfg = Self::default();
+        // 删除的实验字段不得被静默忽略；直接调用配置解析也遵守同一字段集合。
+        let fields = [
+            "host",
+            "port",
+            "family",
+            "local_tsap",
+            "remote_tsap",
+            "timeout_ms",
+            "pdu_length",
+            "max_read_items",
+        ];
+        let object = v
+            .as_object()
+            .ok_or_else(|| SdkDriverError::configuration("BAD_CONFIG", "connection需为对象"))?;
+        if let Some(key) = object.keys().find(|key| !fields.contains(&key.as_str())) {
+            return Err(SdkDriverError::configuration(
+                "BAD_CONFIG",
+                format!("不支持的连接字段 `{key}`"),
+            ));
+        }
         if let Some(h) = v.get("host").and_then(|x| x.as_str()) {
             cfg.host = h.to_string();
         }
@@ -128,6 +151,14 @@ impl NckConnConfig {
                 SdkDriverError::configuration("BAD_CONFIG", "family 必填（如 840d-sl/828d）")
             })?;
         cfg.family = family.to_string();
+        if let Some(value) = v.get("max_read_items") {
+            cfg.max_read_items = value
+                .as_u64()
+                .filter(|n| (1..=mesa_s7_transport::S7_MAX_ITEMS_PER_PDU as u64).contains(n))
+                .ok_or_else(|| {
+                    SdkDriverError::configuration("BAD_CONFIG", "max_read_items需为1..=19的整数")
+                })? as usize;
+        }
         if cfg.host.trim().is_empty() {
             return Err(SdkDriverError::configuration("BAD_CONFIG", "host 不能为空"));
         }
@@ -223,6 +254,33 @@ mod tests {
         let o = c.to_transport();
         assert_eq!((o.local_tsap, o.remote_tsap), (300, 400));
         assert_eq!(o.dial_addr(), "h:102");
+    }
+
+    #[test]
+    fn read_limit_is_shared_and_obsolete_fields_are_rejected() {
+        for family in ["828d", "840d-sl"] {
+            let base = serde_json::json!({"host":"h", "family":family,
+                "local_tsap":1024, "remote_tsap":3332});
+            assert_eq!(cfg(base.clone()).unwrap().max_read_items, 19);
+            let mut single = base.clone();
+            single["max_read_items"] = serde_json::json!(1);
+            assert_eq!(cfg(single).unwrap().max_read_items, 1);
+            for value in [
+                serde_json::json!(0),
+                serde_json::json!(20),
+                serde_json::json!(1.5),
+                serde_json::json!("1"),
+            ] {
+                let mut bad = base.clone();
+                bad["max_read_items"] = value;
+                assert!(cfg(bad).is_err());
+            }
+            for key in ["catalog_file", "retain_unresolved_points"] {
+                let mut obsolete = base.clone();
+                obsolete[key] = serde_json::json!(true);
+                assert_eq!(cfg(obsolete).unwrap_err().code, "BAD_CONFIG");
+            }
+        }
     }
 
     /// TSAP 双格式：十六进制字符串与十进制整数等价（u16 同值）。

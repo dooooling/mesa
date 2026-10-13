@@ -43,6 +43,7 @@ pub struct NckReadResult {
 /// NCK 客户端：持有已建立的 S7Comm 会话。
 pub struct NckClient {
     session: S7Session,
+    max_read_items: usize,
 }
 
 impl NckClient {
@@ -61,7 +62,12 @@ impl NckClient {
             pdu = session.negotiated_pdu_length(),
             "NCK 会话建立"
         );
-        Ok(Self { session })
+        Ok(Self {
+            session,
+            max_read_items: cfg
+                .max_read_items
+                .clamp(1, mesa_s7_transport::S7_MAX_ITEMS_PER_PDU),
+        })
     }
 
     /// 批量读。返回与 items 等长的逐项结果；任一 mismatch（return code /
@@ -81,11 +87,16 @@ impl NckClient {
                 expected_data_len: it.expected_data_len,
             })
             .collect();
-        let results = self
-            .session
-            .read_var(&encoded)
-            .await
-            .map_err(map_transport_error)?;
+        // 顺序分块保持响应与输入配对；作业级错误立即返回，不按系列隔离或继续。
+        let mut results = Vec::with_capacity(encoded.len());
+        for chunk in encoded.chunks(self.max_read_items) {
+            results.extend(
+                self.session
+                    .read_var(chunk)
+                    .await
+                    .map_err(map_transport_error)?,
+            );
+        }
         Ok(results
             .into_iter()
             .zip(items.iter())

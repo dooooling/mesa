@@ -144,6 +144,12 @@ pub fn resolve(
     }
     // shape 校验（column 缺省计入：catalog 默认 column 视为已提供）。
     let column = r.column.unwrap_or(def.wire.column);
+    if def.wire.fixed_column && column != def.wire.column {
+        return Err(bad_shape(
+            def,
+            "Column与所选变量的固定参数列不一致；请改选正确Variable",
+        ));
+    }
     let column_given = r.column.is_some() || def.wire.column != 0;
     match def.shape {
         NckShape::Scalar => {
@@ -172,7 +178,13 @@ pub fn resolve(
         area_unit,
         column,
         line: r.line.unwrap_or(0),
-        module: def.wire.module,
+        module: match r.access_path {
+            crate::address::NckAccessPath::NcVariable => def.wire.module,
+            crate::address::NckAccessPath::DriveObject => def
+                .wire
+                .drive_object_module
+                .ok_or_else(|| bad_shape(def, "目录未声明drive_object访问入口"))?,
+        },
         line_count: r.count as u8,
     };
     let expected_data_len = (r.count as usize)
@@ -210,11 +222,15 @@ mod tests {
             unit: None,
             wire: crate::catalog::NckWireDefinition {
                 module: 0x12,
+                drive_object_module: None,
+                fixed_column: false,
                 column,
                 transport_size: 0x04,
                 element_size: 8,
             },
             supported_families: vec![],
+            invalid_values: Vec::new(),
+            invalid_tolerance: 0.0,
         }
     }
 

@@ -33,6 +33,8 @@ pub struct FixtureState {
     pub fail_write: bool,
     /// SZL 回传负载。
     pub szl_payload: Vec<u8>,
+    /// 分段响应注入：空非 EOT 帧 + 两段载荷，覆盖整条会话接收链。
+    pub fragment_responses: bool,
 }
 
 impl Default for FixtureState {
@@ -42,6 +44,7 @@ impl Default for FixtureState {
             fail_items: HashSet::new(),
             fail_write: false,
             szl_payload: vec![0xFF, 0x09, 0x00, 0x24, 0x00, 0x11, 0x00, 0x01],
+            fragment_responses: false,
         }
     }
 }
@@ -106,6 +109,25 @@ async fn serve_conn(mut stream: tokio::net::TcpStream, shared: Arc<Mutex<Fixture
         } else {
             break;
         };
+        if state.fragment_responses {
+            let split = resp_s7.len() / 2;
+            let fragments = [
+                (&[][..], false),
+                (&resp_s7[..split], false),
+                (&resp_s7[split..], true),
+            ];
+            for (payload, end) in fragments {
+                let mut data = vec![2, crate::cotp::COTP_DT, if end { 0x80 } else { 0 }];
+                data.extend_from_slice(payload);
+                if send_packet(&mut stream, &crate::tpkt::encode_tpkt(&data))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            continue;
+        }
         let mut pkt = vec![0x03, 0x00, 0x00, 0x00, 0x02, crate::cotp::COTP_DT, 0x80];
         pkt.extend_from_slice(&resp_s7);
         let len = pkt.len() as u16;
@@ -265,6 +287,26 @@ mod tests {
         assert_eq!(out[0].data, vec![0x01; 4]);
         s.disconnect().await.unwrap();
         h.abort();
+    }
+
+    #[tokio::test]
+    async fn loopback_fragmented_setup_read_write_and_szl() {
+        let (mut session, handle) = connect(FixtureState {
+            fragment_responses: true,
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(session.negotiated_pdu_length(), 480);
+        let values = session.read_var(&[byte_item(0, 4)]).await.unwrap();
+        assert_eq!(values[0].data, vec![1; 4]);
+        session
+            .write_var(&test_s7any_spec(0x02, 2, 10, 0x84, 0), &[0, 123])
+            .await
+            .unwrap();
+        let szl = session.read_szl(0x0011, 1).await.unwrap();
+        assert!(szl.ends_with(&[0xff, 9, 0, 0x24, 0, 0x11, 0, 1]));
+        session.disconnect().await.unwrap();
+        handle.abort();
     }
 
     #[tokio::test]

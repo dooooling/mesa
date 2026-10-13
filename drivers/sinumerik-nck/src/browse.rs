@@ -55,6 +55,9 @@ fn leaf_binding(
     params.insert("block".into(), serde_json::json!(def.block));
     params.insert("variable".into(), serde_json::json!(def.variable));
     params.insert("count".into(), serde_json::json!(1));
+    if def.variable == "p0199" && def.data_type == "UTF16_BE" {
+        params.insert("count".into(), serde_json::json!(25));
+    }
     params.insert("unit_mode".into(), serde_json::json!("current"));
     if def.wire.column != 0 {
         params.insert("column".into(), serde_json::json!(def.wire.column));
@@ -65,7 +68,7 @@ fn leaf_binding(
     serde_json::json!({"resource_id": "variable", "parameters": params}).to_string()
 }
 
-fn leaf_node(
+pub(crate) fn leaf_node(
     def: &NckVariableDefinition,
     preset: &serde_json::Map<String, serde_json::Value>,
 ) -> BrowseNode {
@@ -78,6 +81,9 @@ fn leaf_node(
     full.insert("block".into(), serde_json::json!(def.block));
     full.insert("variable".into(), serde_json::json!(def.variable));
     full.insert("count".into(), serde_json::json!(1));
+    if def.variable == "p0199" && def.data_type == "UTF16_BE" {
+        full.insert("count".into(), serde_json::json!(25));
+    }
     full.insert("unit_mode".into(), serde_json::json!("current"));
     if def.wire.column != 0 && !full.contains_key("column") {
         full.insert("column".into(), serde_json::json!(def.wire.column));
@@ -87,13 +93,41 @@ fn leaf_node(
         .unwrap_or_else(|_| format!("{}/{}/{}", def.area.letter(), def.block, def.variable));
     BrowseNode {
         id,
-        label: format!("{}/{} {}", def.block, def.variable, def.data_type),
+        label: format!(
+            "{}/{} {}{}",
+            def.block,
+            def.variable,
+            def.data_type,
+            if def.wire.drive_object_module.is_some() {
+                if full.get("access_path").and_then(|v| v.as_str()) == Some("drive_object") {
+                    " [驱动对象入口·候选]"
+                } else {
+                    " [NC变量入口]"
+                }
+            } else {
+                ""
+            }
+        ),
         kind: "variable".into(),
         data_type: def.data_type.clone(),
         access: "read".into(),
         has_children: false,
         binding_json: leaf_binding(def, preset),
     }
+}
+
+/// 两条入口必须有独立节点身份和完整binding，避免仅改展示名导致读错对象。
+fn leaf_nodes(
+    def: &NckVariableDefinition,
+    preset: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<BrowseNode> {
+    let mut nodes = vec![leaf_node(def, preset)];
+    if def.wire.drive_object_module.is_some() {
+        let mut object = preset.clone();
+        object.insert("access_path".into(), serde_json::json!("drive_object"));
+        nodes.push(leaf_node(def, &object));
+    }
+    nodes
 }
 
 /// 建树（纯函数；未知 parent → 空页，不报错——浏览是探索，不是寻址）。
@@ -248,7 +282,9 @@ fn block_nodes(
         .filter(|d| d.area == area && d.block == block)
         .collect();
     defs.sort_by(|a, b| a.variable.cmp(&b.variable));
-    defs.into_iter().map(|d| leaf_node(d, preset)).collect()
+    defs.into_iter()
+        .flat_map(|d| leaf_nodes(d, preset))
+        .collect()
 }
 
 /// 实例下：该 Area 全部变量，binding 预填实例字段。
@@ -262,7 +298,9 @@ fn instance_nodes(
     preset.insert(field.into(), value);
     let mut defs: Vec<&&NckVariableDefinition> = vars.iter().filter(|d| d.area == area).collect();
     defs.sort_by(|a, b| (&a.block, &a.variable).cmp(&(&b.block, &b.variable)));
-    defs.into_iter().map(|d| leaf_node(d, &preset)).collect()
+    defs.into_iter()
+        .flat_map(|d| leaf_nodes(d, &preset))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

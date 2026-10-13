@@ -13,7 +13,7 @@
 //! NOTE: 响应 transport_size 取 `0x04`（NCK 真实回传值待抓包确认；传输层
 //! 切片只看 len_bits，非 0x03 均同途，驱动侧 V1 不校验该字段，待 Gate 确认）。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +22,10 @@ use tokio::net::TcpListener;
 /// 脚手架状态（多连接共享，测试按需配置）。
 #[derive(Debug, Clone, Default)]
 pub struct NckFixtureState {
+    /// 固定现场只读向量：按完整请求规范回放，不由待测解码器反推响应。
+    pub recorded_items: Option<HashMap<Vec<u8>, (u8, u8, Vec<u8>)>>,
+    /// 作业级拒绝也按完整请求匹配，保留对象目录边界的原始错误码。
+    pub recorded_jobs: HashMap<Vec<u8>, u16>,
     /// Setup 协商上限（0 → 480）。
     pub max_pdu: u16,
     /// 单元素字节数（响应数据长度 = linecount × element_size）。
@@ -39,6 +43,9 @@ pub struct NckFixtureState {
     /// 读 N 次后主动断开当连接（`disconnect_after_n_reads` 场景；
     /// `None` = 永不主动断开）。计数按连接独立。
     pub disconnect_after_reads: Option<usize>,
+    /// 注入作业拒绝及错误引用号，验证统一的失败与关联校验规则。
+    pub reject_column: Option<u16>,
+    pub wrong_pdu_ref: bool,
     /// 已收规范记录（测试断言 exact 发送字节用）。
     pub received: Arc<Mutex<Vec<Vec<u8>>>>,
 }
@@ -227,6 +234,20 @@ fn build_setup_ack(s7req: &[u8], max_pdu: u16) -> Vec<u8> {
 /// 构造 NCK 读响应：标准 Ack_Data 信封（12 字节头 + plen=2 + `[04 count]`），
 /// 逐项 `[ret, transport, len16, data]`（NCK 差异仅 var-spec syntax）。
 fn read_ack(req: &[u8], state: &NckFixtureState, ordinal: &mut u64) -> Vec<u8> {
+    if req.len() >= 22 && state.reject_column == Some(u16::from_be_bytes([req[16], req[17]])) {
+        // 被拒绝的请求也需要留痕，才能验证失败后没有继续读取其他项。
+        state
+            .received
+            .lock()
+            .expect("fixture 记录")
+            .push(req[12..22].to_vec());
+        let reference =
+            u16::from_be_bytes([req[4], req[5]]).wrapping_add(u16::from(state.wrong_pdu_ref));
+        let mut ack = vec![0x32, 2, 0, 0];
+        ack.extend_from_slice(&reference.to_be_bytes());
+        ack.extend_from_slice(&[0, 0, 0, 0, 0x82, 1]);
+        return ack;
+    }
     if state.fail_reads {
         // 致命短包：驱动侧整包 fatal（fail 当前 attempt，Manager 重建会话）。
         return vec![0x32, 0x03];
@@ -255,6 +276,27 @@ fn read_ack(req: &[u8], state: &NckFixtureState, ordinal: &mut u64) -> Vec<u8> {
                 return Vec::new();
             }
             data.extend_from_slice(&[0x05, 0x04, 0x00, 0x00]);
+            continue;
+        }
+        if let Some(code) = state.recorded_jobs.get(spec) {
+            state
+                .received
+                .lock()
+                .expect("fixture记录")
+                .extend(specs.clone());
+            let mut ack = vec![0x32, 2, 0, 0, req[4], req[5], 0, 0, 0, 0];
+            ack.extend_from_slice(&code.to_be_bytes());
+            return ack;
+        }
+        if let Some(recorded) = &state.recorded_items {
+            let (ret, transport, payload) =
+                recorded.get(spec).cloned().unwrap_or((0x0a, 0, Vec::new()));
+            data.extend_from_slice(&[ret, transport]);
+            data.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            data.extend_from_slice(&payload);
+            if payload.len() % 2 == 1 && k + 1 < specs.len() {
+                data.push(0);
+            }
             continue;
         }
         // 数据长度 = linecount × element_size；pattern 全字节为序号 tag。
@@ -315,6 +357,7 @@ mod tests {
             remote_tsap: 0x0100,
             timeout_ms: 3000,
             requested_pdu_length: 480,
+            ..Default::default()
         };
         NckClient::connect(&cfg).await.expect("NCK 建连")
     }
@@ -379,6 +422,73 @@ mod tests {
                 0x12, 0x08, 0x82, 0x41, 0x00, 0x2A, 0x00, 0x03, 0x12, 0x01
             ]]
         );
+    }
+
+    #[tokio::test]
+    async fn single_item_limit_avoids_peer_multi_item_rejection_and_preserves_order() {
+        let fx = NckFixture::spawn(NckFixtureState {
+            // 第二项故障仅在同一个请求包含多个变量时触发。
+            fail_items: [1].into_iter().collect(),
+            ..state()
+        })
+        .await;
+        let cfg = NckConnConfig {
+            host: "127.0.0.1".into(),
+            port: fx.addr.port(),
+            max_read_items: 1,
+            ..Default::default()
+        };
+        let mut client = NckClient::connect(&cfg).await.unwrap();
+        let items: Vec<_> = (0..3).map(|line| item(0x82, 0x41, 42, line, 1)).collect();
+        let values = client.read_vars(&items).await.unwrap();
+        assert_eq!(values.len(), 3);
+        for (index, value) in values.iter().enumerate() {
+            assert_eq!(value.data.as_ref().unwrap(), &vec![index as u8 + 1; 8]);
+        }
+        assert_eq!(
+            fx.received_specs(),
+            items
+                .iter()
+                .map(|item| crate::encode_var_spec(&item.wire))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn job_rejection_and_wrong_reference_fail_without_reading_later_items() {
+        for family in ["828d", "840d-sl"] {
+            for wrong_ref in [false, true] {
+                let fx = NckFixture::spawn(NckFixtureState {
+                    reject_column: Some(41),
+                    wrong_pdu_ref: wrong_ref,
+                    ..state()
+                })
+                .await;
+                let cfg = NckConnConfig {
+                    host: "127.0.0.1".into(),
+                    port: fx.addr.port(),
+                    family: family.into(),
+                    max_read_items: 1,
+                    ..Default::default()
+                };
+                let mut client = NckClient::connect(&cfg).await.unwrap();
+                let items = [
+                    item(0x82, 0x41, 40, 1, 1),
+                    item(0x82, 0x41, 41, 1, 1),
+                    item(0x82, 0x41, 42, 1, 1),
+                ];
+                let error = client.read_vars(&items).await.unwrap_err();
+                assert_eq!(
+                    error.code,
+                    if wrong_ref {
+                        "READ_PDU_REF_MISMATCH"
+                    } else {
+                        "S7_JOB_0x8201"
+                    }
+                );
+                assert_eq!(fx.received_specs().len(), 2, "作业失败后不继续后续项");
+            }
+        }
     }
 
     #[tokio::test]
