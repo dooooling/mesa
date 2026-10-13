@@ -214,13 +214,16 @@ async fn rejected_axis_drive_name_is_visible_even_when_variable_filter_is_presen
     assert_eq!(axes.len(), 1);
     assert!(!axes[0].has_children);
     assert!(axes[0].label.contains("S7_JOB_0x8201"));
-    let (nodes, _) = connection(&fixture)
-        .browse("nck://identity/axis/4", "r0080", "", 10)
-        .await
-        .unwrap();
-    assert_eq!(nodes.len(), 1);
-    assert_eq!(nodes[0].kind, "diagnostic");
-    assert!(nodes[0].label.contains("S7_JOB_0x8201"));
+    for cursor in ["", "1"] {
+        let (nodes, next) = connection(&fixture)
+            .browse("nck://identity/axis/4", "r0080", cursor, 10)
+            .await
+            .unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].kind, "diagnostic");
+        assert!(nodes[0].label.contains("S7_JOB_0x8201"));
+        assert!(next.is_none());
+    }
 }
 
 #[tokio::test]

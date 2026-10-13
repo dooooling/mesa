@@ -452,10 +452,12 @@ pub async fn browse(
         Target::Objects => instance_page(&mut client, catalog, false, filter, cursor, limit).await,
         Target::Axis(index) => match axis(&mut client, catalog, index).await {
             Ok(Some(axis)) => {
+                // 身份复核被拒绝后不存在可翻页的变量列表；旧游标不能跳过诊断。
+                if !axis.notes.is_empty() {
+                    return Ok((vec![diagnostic(parent, axis.notes.join("；"))], None));
+                }
                 let nodes = if let Some(drive) = axis.drive.filter(|_| axis.object_name.is_some()) {
                     variable_nodes(catalog, drive, "nc_variable", &axis.name)
-                } else if !axis.notes.is_empty() {
-                    vec![diagnostic(parent, axis.notes.join("；"))]
                 } else {
                     Vec::new()
                 };
