@@ -95,6 +95,28 @@ pub enum NckUnitMode {
     Inch,
 }
 
+/// 访问入口与单位模式是不同字段；默认入口保持已有点位地址不变。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NckAccessPath {
+    #[default]
+    NcVariable,
+    /// 驱动对象入口仅用于目录明确声明的候选映射，不由轴名或IP推断。
+    DriveObject,
+}
+
+impl NckAccessPath {
+    pub fn parse(s: &str) -> Result<Self, AddressError> {
+        match s {
+            "nc_variable" => Ok(Self::NcVariable),
+            "drive_object" => Ok(Self::DriveObject),
+            _ => Err(AddressError::Invalid {
+                input: s.into(),
+                reason: "access_path需为nc_variable或drive_object".into(),
+            }),
+        }
+    }
+}
+
 impl NckUnitMode {
     /// 线缆 Syntax ID。
     pub fn syntax_id(self) -> u8 {
@@ -144,6 +166,7 @@ pub struct NckVariableRef {
     /// 连续个数（line_count，缺省 1）。
     pub count: u16,
     pub unit_mode: NckUnitMode,
+    pub access_path: NckAccessPath,
 }
 
 impl NckVariableRef {
@@ -161,6 +184,9 @@ impl NckVariableRef {
             self.variable
         );
         let mut q = Vec::new();
+        if self.access_path == NckAccessPath::DriveObject {
+            q.push("access_path=drive_object".to_string());
+        }
         if let Some(l) = self.line {
             q.push(format!("line={l}"));
         }
@@ -189,6 +215,23 @@ impl NckVariableRef {
     pub fn from_parameters(
         p: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<Self, AddressError> {
+        let allowed = [
+            "area",
+            "area_no",
+            "block",
+            "variable",
+            "line",
+            "column",
+            "count",
+            "unit_mode",
+            "access_path",
+        ];
+        if let Some(key) = p.keys().find(|key| !allowed.contains(&key.as_str())) {
+            return Err(AddressError::Invalid {
+                input: key.clone(),
+                reason: "不支持该参数；模块号由目录和访问路径决定".into(),
+            });
+        }
         let area = p
             .get("area")
             .and_then(|v| v.as_str())
@@ -255,6 +298,13 @@ impl NckVariableRef {
             .map(NckUnitMode::parse)
             .transpose()?
             .unwrap_or_default();
+        let access_path = match p.get("access_path") {
+            None => NckAccessPath::default(),
+            Some(v) => NckAccessPath::parse(v.as_str().ok_or_else(|| AddressError::Invalid {
+                input: "access_path".into(),
+                reason: "access_path需为字符串".into(),
+            })?)?,
+        };
         Ok(Self {
             area,
             area_no,
@@ -264,6 +314,7 @@ impl NckVariableRef {
             column,
             count,
             unit_mode,
+            access_path,
         })
     }
 }

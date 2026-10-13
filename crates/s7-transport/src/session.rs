@@ -8,7 +8,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::config::S7ConnectOptions;
-use crate::cotp::{build_cotp_cr, check_cc};
+use crate::cotp::{build_cotp_cr, check_cc, recv_data};
 use crate::error::{S7TransportError, map_connect_error};
 use crate::pdu::{build_s7_setup, parse_setup_ack};
 use crate::read_var::{
@@ -97,7 +97,7 @@ impl S7Session {
             .await
             .map_err(|_| S7TransportError::timeout("S7_SETUP_TIMEOUT", "S7 Setup 超时"))?
             .map_err(|e| map_io_error(e, "S7_SETUP_SEND_FAIL"))?;
-        let resp = timeout(self.options.timeout(), recv_packet(&mut self.stream))
+        let resp = timeout(self.options.timeout(), recv_data(&mut self.stream))
             .await
             .map_err(|_| S7TransportError::timeout("S7_SETUP_TIMEOUT", "S7 Setup 响应超时"))?
             .map_err(|e| map_io_error(e, "S7_SETUP_RECV_FAIL"))?;
@@ -142,7 +142,8 @@ impl S7Session {
             if chunk.len() == 1 {
                 check_single_item_fits(&chunk[0], self.negotiated_pdu, bulk)?;
             }
-            let pkt = build_read_request(self.pdu_ref, chunk);
+            let expected_ref = self.pdu_ref;
+            let pkt = build_read_request(expected_ref, chunk);
             self.bump_pdu_ref();
             timeout(self.options.timeout(), send_packet(&mut self.stream, &pkt))
                 .await
@@ -157,7 +158,7 @@ impl S7Session {
                     )
                 })?
                 .map_err(|e| map_io_error(e, "READ_SEND_FAIL"))?;
-            let resp = timeout(self.options.timeout(), recv_packet(&mut self.stream))
+            let resp = timeout(self.options.timeout(), recv_data(&mut self.stream))
                 .await
                 .map_err(|_| {
                     S7TransportError::timeout(
@@ -170,6 +171,12 @@ impl S7Session {
                     )
                 })?
                 .map_err(|e| map_io_error(e, "READ_RECV_FAIL"))?;
+            if resp.len() >= 13 && u16::from_be_bytes([resp[11], resp[12]]) != expected_ref {
+                return Err(S7TransportError::protocol(
+                    "READ_PDU_REF_MISMATCH",
+                    "ReadVar响应引用号与请求不匹配",
+                ));
+            }
             let mut part = if bulk {
                 parse_bulk_response(&resp, chunk)?
             } else {
@@ -192,7 +199,7 @@ impl S7Session {
             .await
             .map_err(|_| S7TransportError::timeout("WRITE_TIMEOUT", "Write 请求超时"))?
             .map_err(|e| map_io_error(e, "WRITE_SEND_FAIL"))?;
-        let resp = timeout(self.options.timeout(), recv_packet(&mut self.stream))
+        let resp = timeout(self.options.timeout(), recv_data(&mut self.stream))
             .await
             .map_err(|_| S7TransportError::timeout("WRITE_TIMEOUT", "Write 响应超时"))?
             .map_err(|e| map_io_error(e, "WRITE_RECV_FAIL"))?;
@@ -213,7 +220,7 @@ impl S7Session {
                 S7TransportError::timeout("SZL_TIMEOUT", format!("SZL 0x{szl_id:04X} 请求超时"))
             })?
             .map_err(|e| map_io_error(e, "SZL_SEND_FAIL"))?;
-        let resp = timeout(self.options.timeout(), recv_packet(&mut self.stream))
+        let resp = timeout(self.options.timeout(), recv_data(&mut self.stream))
             .await
             .map_err(|_| {
                 S7TransportError::timeout("SZL_TIMEOUT", format!("SZL 0x{szl_id:04X} 响应超时"))

@@ -19,11 +19,12 @@ mod client;
 mod codec;
 mod config;
 mod fixture;
+mod identity;
 mod probe;
 mod topology;
 mod value;
 
-pub use address::{AddressError, NckArea, NckUnitMode, NckVariableRef};
+pub use address::{AddressError, NckAccessPath, NckArea, NckUnitMode, NckVariableRef};
 pub use browse::build_tree;
 pub use catalog::{
     CatalogError, CatalogRegistry, NckCatalog, NckShape, NckVariableDefinition, NckWireDefinition,
@@ -122,6 +123,18 @@ impl Driver for SinumerikNckDriver {
                     FieldDescriptor::new("pdu_length", "PDU length", FieldType::Integer)
                         .required(false)
                         .default_value(serde_json::json!(480)),
+                    {
+                        let mut f = FieldDescriptor::new(
+                            "max_read_items",
+                            "每次读取项数上限",
+                            FieldType::Integer,
+                        )
+                        .required(false)
+                        .default_value(serde_json::json!(19));
+                        f.validation.min = Some(1.0);
+                        f.validation.max = Some(19.0);
+                        f
+                    },
                 ],
             },
             resources: vec![ResourceDescriptor {
@@ -146,6 +159,18 @@ impl Driver for SinumerikNckDriver {
                         },
                         FieldDescriptor::new("area_no", "Area No.", FieldType::Integer)
                             .required(false),
+                        {
+                            let mut f = FieldDescriptor::new(
+                                "access_path",
+                                "访问路径（nc_variable=NC变量；drive_object=驱动对象候选）",
+                                FieldType::Enum,
+                            )
+                            .required(false)
+                            .default_value(serde_json::json!("nc_variable"));
+                            f.validation.enum_options =
+                                Some(vec!["nc_variable".into(), "drive_object".into()]);
+                            f
+                        },
                         FieldDescriptor::new("block", "Block", FieldType::String).required(true),
                         FieldDescriptor::new("variable", "Variable", FieldType::String)
                             .required(true),
@@ -236,6 +261,8 @@ struct PointSpec {
     expected_transport_size: u8,
     data_type: mesa_core_types::DataType,
     unit: Option<String>,
+    invalid_values: Vec<f64>,
+    invalid_tolerance: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -266,7 +293,7 @@ pub struct NckConnection {
 }
 
 impl NckConnection {
-    /// 测试/现场覆盖 catalog 注入（随仓 catalog 为空，真机回填前用合成目录验证数据面）。
+    /// 测试或现场注入已审计目录；生产默认按系列加载公共目录，不提供连接级外部文件入口。
     pub fn with_catalog(cfg: NckConnConfig, catalog: NckCatalog) -> Self {
         Self {
             cfg,
@@ -300,6 +327,10 @@ fn decode_point(
             tracing::warn!(key = %spec.key, canonical = %spec.var_ref.canonical_key(), got = bytes.len(), need = spec.expected_len, "NCK 数据长度不符，按 BAD 隔离");
             return None;
         }
+        if matches!(spec.kind, NckDataKind::Utf8NulLast32 | NckDataKind::Utf8NulFirst66 | NckDataKind::Utf16Be) {
+            // 目录声明的文本组成行整体解码；无效UTF-8仍按项BAD。
+            return decode_value(bytes, spec.kind).ok();
+        }
         let mut elems = Vec::with_capacity(count);
         for i in 0..count {
             match decode_value(&bytes[i * elem..(i + 1) * elem], spec.kind) {
@@ -315,6 +346,26 @@ fn decode_point(
         } else {
             pack_array(spec.kind, elems)
         })
+    });
+    let good_value = good_value.filter(|value| {
+        let numbers: Vec<f64> = match value {
+            Value::F32(v) => vec![*v as f64],
+            Value::F64(v) => vec![*v],
+            Value::F32Array(values) => values.iter().map(|v| *v as f64).collect(),
+            Value::F64Array(values) => values.clone(),
+            _ => Vec::new(),
+        };
+        let valid = numbers.iter().all(|v| {
+            v.is_finite()
+                && !spec
+                    .invalid_values
+                    .iter()
+                    .any(|sentinel| (*v - *sentinel).abs() <= spec.invalid_tolerance)
+        });
+        if !valid {
+            tracing::warn!(key=%spec.key, "NCK返回设备无效工程值标记，按BAD处理，不伪造协议错误码");
+        }
+        valid
     });
     match good_value {
         Some(v) => {
@@ -356,7 +407,10 @@ fn decode_point(
 fn pack_array(kind: NckDataKind, elems: Vec<mesa_core_types::Value>) -> mesa_core_types::Value {
     use mesa_core_types::Value;
     match kind {
-        NckDataKind::F64 => Value::F64Array(
+        NckDataKind::Utf8NulLast32 | NckDataKind::Utf8NulFirst66 | NckDataKind::Utf16Be => {
+            unreachable!("文本组成行必须在pack_array前完成投影")
+        }
+        NckDataKind::F64 | NckDataKind::F64Le => Value::F64Array(
             elems
                 .into_iter()
                 .map(|v| match v {
@@ -374,7 +428,7 @@ fn pack_array(kind: NckDataKind, elems: Vec<mesa_core_types::Value>) -> mesa_cor
                 })
                 .collect(),
         ),
-        NckDataKind::I32 => Value::I32Array(
+        NckDataKind::I32 | NckDataKind::I32Le | NckDataKind::I16Be => Value::I32Array(
             elems
                 .into_iter()
                 .map(|v| match v {
@@ -383,12 +437,23 @@ fn pack_array(kind: NckDataKind, elems: Vec<mesa_core_types::Value>) -> mesa_cor
                 })
                 .collect(),
         ),
-        NckDataKind::U32 => Value::U32Array(
+        NckDataKind::U32 | NckDataKind::U16Le | NckDataKind::U16Be | NckDataKind::U8 => {
+            Value::U32Array(
+                elems
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::U32(x) => x,
+                        _ => 0,
+                    })
+                    .collect(),
+            )
+        }
+        NckDataKind::Utf8Fixed16 => Value::StringArray(
             elems
                 .into_iter()
                 .map(|v| match v {
-                    Value::U32(x) => x,
-                    _ => 0,
+                    Value::String(s) => s,
+                    _ => unreachable!("轴名元素已按目录解码为字符串"),
                 })
                 .collect(),
         ),
@@ -515,6 +580,8 @@ impl DriverConnection for NckConnection {
                         expected_transport_size: rv.expected_transport_size,
                         data_type,
                         unit: def.unit.clone(),
+                        invalid_values: def.invalid_values.clone(),
+                        invalid_tolerance: def.invalid_tolerance,
                     });
                 }
             }
@@ -530,8 +597,8 @@ impl DriverConnection for NckConnection {
                 point_key: p.key.clone(),
                 data_type: p.data_type,
                 unit: p.unit.clone(),
-                // P1 未实现：回落 None（UI 显示技术坐标），不阻塞。
-                source_label: None,
+                // 通用地址回显仅用于诊断，不能据此断言业务轴身份。
+                source_label: Some(p.var_ref.canonical_key()),
             })
             .collect();
         ensure_unique_point_keys(&descriptors).map_err(|DuplicatePointKey(k)| {
@@ -732,6 +799,42 @@ impl DriverConnection for NckConnection {
         cursor: &str,
         limit: u32,
     ) -> Result<(Vec<mesa_driver_protocol::pb::BrowseNode>, Option<String>), SdkDriverError> {
+        if identity::supported(&self.catalog)
+            && (parent == identity::ROOT || parent.starts_with(&format!("{}/", identity::ROOT)))
+        {
+            // 临时Browse连接无跨请求缓存；按页/节点读取并保留整次操作时限。
+            return tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                identity::browse(&self.cfg, &self.catalog, parent, filter, cursor, limit),
+            )
+            .await
+            .map_err(|_| {
+                SdkDriverError::new(
+                    mesa_core_types::ErrorKind::Timeout,
+                    "IDENTITY_TIMEOUT",
+                    "目标页或对象核对超过15秒",
+                )
+            })?;
+        }
+        if parent.is_empty() && identity::supported(&self.catalog) {
+            let (mut nodes, _) = build_tree(&self.catalog, self.topology.as_ref(), "", "", "", 31);
+            nodes.push(identity::root_node());
+            if !filter.is_empty() {
+                nodes.retain(|node| node.label.contains(filter) || node.id.contains(filter));
+            }
+            let start = cursor.parse::<usize>().unwrap_or(0).min(nodes.len());
+            let end = (start
+                + if limit == 0 {
+                    50
+                } else {
+                    limit.min(500) as usize
+                })
+            .min(nodes.len());
+            return Ok((
+                nodes[start..end].to_vec(),
+                (end < nodes.len()).then(|| end.to_string()),
+            ));
+        }
         Ok(build_tree(
             &self.catalog,
             self.topology.as_ref(),
@@ -746,6 +849,65 @@ impl DriverConnection for NckConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_temperature_is_bad_and_does_not_forge_a_protocol_error() {
+        let catalog = CatalogRegistry::load_dir(&format!("{}/catalog", env!("CARGO_MANIFEST_DIR")))
+            .unwrap()
+            .resolve("828d")
+            .unwrap();
+        let reference = NckVariableRef::from_parameters(
+            serde_json::json!({"area":"V","area_no":1,"block":"M","variable":"r0035","line":1})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        let def = catalog.lookup(reference.area, "M", "r0035").unwrap();
+        let resolved = resolve_wire(&reference, def).unwrap();
+        let spec = PointSpec {
+            key: "temperature".into(),
+            var_ref: reference,
+            wire: resolved.wire,
+            kind: resolved.kind,
+            expected_len: 4,
+            expected_transport_size: 7,
+            data_type: mesa_core_types::DataType::F32,
+            unit: None,
+            invalid_values: def.invalid_values.clone(),
+            invalid_tolerance: def.invalid_tolerance,
+        };
+        let mut cache = std::collections::HashMap::new();
+        let good = decode_point(&spec, 1, Some(&[0x41, 0x98, 0, 0]), Some(0xff), &mut cache);
+        assert_eq!(good.quality, mesa_core_types::Quality::Good);
+        assert_eq!(good.value, mesa_core_types::Value::F32(19.0));
+        // 实体机独立响应值接近-200；不能因为返回FF就显示为正常电机温度。
+        let invalid = decode_point(
+            &spec,
+            1,
+            Some(&[0xc3, 0x47, 0xff, 0xfe]),
+            Some(0xff),
+            &mut cache,
+        );
+        assert_eq!(invalid.quality, mesa_core_types::Quality::Bad);
+        assert_eq!(invalid.quality_code, None);
+        assert_eq!(
+            invalid.value_origin,
+            mesa_core_types::ValueOrigin::LastKnown
+        );
+        assert_eq!(invalid.value, mesa_core_types::Value::F32(19.0));
+        let negative = decode_point(
+            &spec,
+            1,
+            Some(&(-20.0f32).to_be_bytes()),
+            Some(0xff),
+            &mut cache,
+        );
+        assert_eq!(
+            negative.quality,
+            mesa_core_types::Quality::Good,
+            "正常负温度不能误判"
+        );
+    }
 
     #[test]
     fn descriptor_is_valid_and_read_only() {

@@ -192,7 +192,15 @@ pub fn parse_read_response(
         let len_field = u16::from_be_bytes([data[off + 2], data[off + 3]]) as usize;
         off += 4;
         // wire payload 长度按 transport 解释（P1-2：0x06/0x07/0x09 按 byte）。
-        let wire_len = wire_data_len(transport, len_field);
+        // SINAMICS入口的NCK整数0x05实测按字节声明长度；PLC ANY仍按位。
+        // 只根据请求语法区分，不能根据响应数值或剩余包长猜测。
+        let spec = &items[idx].var_spec;
+        let nck = spec.len() == 10 && spec[0..2] == [0x12, 0x08] && matches!(spec[2], 0x82..=0x84);
+        let wire_len = if nck && transport == 0x05 {
+            len_field
+        } else {
+            wire_data_len(transport, len_field)
+        };
         if ret != S7_ITEM_OK {
             // 按项 BAD：仍完整跳过该项数据区以对齐下一项（错误时 len 可能为 0）。
             tracing::warn!(idx, ret, "S7 ReadVar item 按项 BAD");
@@ -583,6 +591,32 @@ mod tests {
         resp[2..4].copy_from_slice(&len.to_be_bytes());
         let err = parse_read_response(&resp, &[item(12, 1)]).unwrap_err();
         assert_eq!(err.code, "S7_LEN_MISMATCH");
+    }
+
+    #[test]
+    fn nck_integer_byte_length_does_not_change_plc_integer_bit_length() {
+        // 独立只读记录：r0107返回FF 05 0002 000B；请求是NCK语法。
+        let nck = S7ReadVarItem {
+            var_spec: vec![0x12, 8, 0x82, 0xA6, 0, 107, 0, 1, 0x82, 1],
+            expected_data_len: 2,
+        };
+        let response = ack_resp(&[0xff, 5, 0, 2, 0, 11], &[4, 1]);
+        assert_eq!(
+            parse_read_response(&response, std::slice::from_ref(&nck)).unwrap()[0].data,
+            [0, 11]
+        );
+        // 同一字节载荷的PLC ANY响应使用16位，不能被NCK规则污染。
+        let plc = item(12, 2);
+        let response = ack_resp(&[0xff, 5, 0, 16, 0, 11], &[4, 1]);
+        assert_eq!(
+            parse_read_response(&response, &[plc]).unwrap()[0].data,
+            [0, 11]
+        );
+        let truncated = ack_resp(&[0xff, 5, 0, 4, 0, 11], &[4, 1]);
+        assert_eq!(
+            parse_read_response(&truncated, &[nck]).unwrap_err().code,
+            "READ_DATA_SHORT"
+        );
     }
 
     #[test]

@@ -5,8 +5,8 @@
 //! 系列 mapping 变化只换 Catalog，不动 Resource API / Core / Data Plane。
 //!
 //! 铁律（CONTRACT.md）：wire 数值必须由官方变量定义 + 确定性协议测试 +
-//! 真机三方确认后方可进入 `supported` catalog；本模块只定 schema 与解析规则，
-//! 空 catalog 合法（未知变量 fail-closed，不是猜类型）。
+//! 真机三方确认后方可标记为 `supported`；公共候选映射明确记录证据与未确认边界，
+//! 不构成硬件支持声明。空 catalog 合法，未知变量仍 fail-closed。
 
 use std::collections::HashMap;
 
@@ -29,11 +29,15 @@ pub enum NckShape {
     LinesAndColumns,
 }
 
-/// 线缆定义（真机确认前不得填写真实值，见 catalog/*.json）。
+/// 线缆定义（候选与已验证映射的证据由 catalog/*.json 记录）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NckWireDefinition {
     /// NCK module 字节。
     pub module: u8,
+    /// 显式候选入口；缺失时拒绝drive_object路径，不能自动改模块或编号。
+    pub drive_object_module: Option<u8>,
+    /// 已发布固定参数列不能被表单覆盖为另一参数，以免值与名称不一致。
+    pub fixed_column: bool,
     /// NCK column（u16BE）。
     pub column: u16,
     /// 响应 transport_size 期望（校验用）。
@@ -43,7 +47,7 @@ pub struct NckWireDefinition {
 }
 
 /// 单个变量定义。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NckVariableDefinition {
     pub area: NckArea,
     pub block: String,
@@ -54,6 +58,9 @@ pub struct NckVariableDefinition {
     pub unit: Option<String>,
     pub wire: NckWireDefinition,
     pub supported_families: Vec<String>,
+    /// 设备工程值的无效标记独立于协议返回码；不把读取成功等同于有效测量。
+    pub invalid_values: Vec<f64>,
+    pub invalid_tolerance: f64,
 }
 
 /// Catalog 查询键（Area + Block + Variable，大小写敏感原样）。
@@ -346,6 +353,21 @@ fn parse_entry(e: &serde_json::Value) -> Result<NckVariableDefinition, String> {
         .and_then(|v| v.as_u64())
         .and_then(|n| u16::try_from(n).ok())
         .ok_or("wire.column 需为 u16")?;
+    let drive_object_module = match wire.get("drive_object_module") {
+        None => None,
+        Some(v) => Some(
+            v.as_u64()
+                .and_then(|n| u8::try_from(n).ok())
+                .ok_or("wire.drive_object_module需为u8")?,
+        ),
+    };
+    let fixed_column = match wire.get("fixed_column") {
+        None => false,
+        Some(value) => value.as_bool().ok_or("wire.fixed_column需为布尔值")?,
+    };
+    if drive_object_module.is_some() && (area != NckArea::FeedDrive || block != "M") {
+        return Err("drive_object候选入口仅允许V/M目录条目".into());
+    }
     let transport_size = wire
         .get("transport_size")
         .and_then(|v| v.as_u64())
@@ -372,6 +394,26 @@ fn parse_entry(e: &serde_json::Value) -> Result<NckVariableDefinition, String> {
                 .collect::<Result<Vec<_>, _>>()?
         }
     };
+    let invalid_values = match e.get("invalid_values") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or("invalid_values需为数值数组")?
+            .iter()
+            .map(|v| {
+                v.as_f64()
+                    .filter(|v| v.is_finite())
+                    .ok_or("invalid_values必须是有限数值")
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let invalid_tolerance = match e.get("invalid_tolerance") {
+        None => 0.0,
+        Some(value) => value
+            .as_f64()
+            .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+            .ok_or("invalid_tolerance需为0..1的有限数值")?,
+    };
     Ok(NckVariableDefinition {
         area,
         block,
@@ -381,11 +423,15 @@ fn parse_entry(e: &serde_json::Value) -> Result<NckVariableDefinition, String> {
         unit,
         wire: NckWireDefinition {
             module,
+            drive_object_module,
+            fixed_column,
             column,
             transport_size,
             element_size,
         },
         supported_families,
+        invalid_values,
+        invalid_tolerance,
     })
 }
 
@@ -442,8 +488,8 @@ mod tests {
     }
 
     #[test]
-    fn shipped_catalog_files_parse_and_hold_no_memory_numbers() {
-        // 随仓 catalog 必须可解析；真机确认前 variables 为空（铁律）。
+    fn shipped_catalogs_keep_candidate_evidence_and_family_boundaries() {
+        // 候选目录可用于解析与只读验证，不能把系列归属提升为硬件支持。
         // NOTE：刻意走 `load_dir` 直传目录，不碰 `MESA_NCK_CATALOG_DIR`
         // （进程全局 env 曾导致 CI #115 并行 race；测试零 env mutation，
         // 构造性无 race，见 CatalogRegistry::load_shipped 注释）。
@@ -453,9 +499,20 @@ mod tests {
             let text = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("缺 {path}"));
             let v: serde_json::Value = serde_json::from_str(&text).expect("合法 JSON");
             let cat = NckCatalog::from_json(&v).expect("schema 合法");
-            assert!(cat.is_empty(), "{f}.json 真机确认前必须为空");
+            if f == "828d" {
+                assert_eq!(cat.len(), 42);
+                assert_eq!(v["validation_status"], "candidate");
+                assert_eq!(v["hardware_validated"], false);
+                for entry in v["variables"].as_array().unwrap() {
+                    assert_eq!(entry["evidence"]["validation_status"], "candidate");
+                    assert_eq!(entry["evidence"]["hardware_validated"], false);
+                    assert!(entry["evidence"]["official_definition"]["url"].is_string());
+                }
+            } else {
+                assert!(cat.is_empty(), "{f}.json 不得继承828D候选映射");
+            }
         }
-        // 随仓注册表：两系列已知，空系列可解析。
+        // 随仓注册表按系列选择，840D sl 不继承828D候选条目。
         let reg = CatalogRegistry::load_dir(&dir).expect("随仓注册表合法");
         assert_eq!(reg.families(), vec!["828d", "840d-sl"]);
         assert!(reg.resolve("840d-sl").unwrap().is_empty());

@@ -149,6 +149,28 @@ pub fn check_ack(s7: &[u8], ctx: &str) -> Result<(), S7TransportError> {
     if s7.len() < S7_HEADER_LEN_ACK_DATA {
         return Err(S7TransportError::protocol("S7_SHORT", "S7 头部缺失"));
     }
+    // ACK（ROSCTR=2）的拒绝码在头部10..12；没有ReadVar item，不能
+    // 从不存在的参数区取码。仅完整的无载荷拒绝ACK可被上层按单请求隔离。
+    if s7[1] == 0x02 {
+        let (parameters, data) = check_lengths(s7)?;
+        if parameters != 0 || data != 0 {
+            return Err(S7TransportError::protocol(
+                "S7_ACK_SHAPE",
+                "拒绝ACK不能携带参数或数据",
+            ));
+        }
+        let error = u16::from_be_bytes([s7[10], s7[11]]);
+        if error != 0 {
+            return Err(S7TransportError::protocol(
+                format!("S7_JOB_0x{error:04X}"),
+                format!("{ctx} 请求被拒绝，原始头部码0x{error:04X}"),
+            ));
+        }
+        return Err(S7TransportError::protocol(
+            "S7_ACK_NO_DATA",
+            "收到无数据ACK，不能作为读结果",
+        ));
+    }
     if s7[1] != S7_ROSCTR_ACK_DATA {
         let err_class = s7.get(17).copied().unwrap_or(0);
         return Err(s7_cpu_error(err_class, ctx));
@@ -196,6 +218,14 @@ pub fn check_lengths(s7: &[u8]) -> Result<(usize, usize), S7TransportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_ack_preserves_header_code_and_rejects_trailing_payload() {
+        let mut ack = vec![0x32, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0x82, 1];
+        assert_eq!(check_ack(&ack, "Read").unwrap_err().code, "S7_JOB_0x8201");
+        ack.push(0);
+        assert_eq!(check_ack(&ack, "Read").unwrap_err().code, "S7_LEN_MISMATCH");
+    }
 
     #[test]
     fn setup_exact_bytes_match_legacy() {
