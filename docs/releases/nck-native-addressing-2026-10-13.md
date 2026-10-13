@@ -51,10 +51,12 @@
   `mesa-nck-emulator` 13 项（含 9 场景独立进程 E2E）。
 - **旧→新寻址等价门**：`tests/legacy_equivalence.rs` 用 `main@78e23ec` 删除前冻结的
   62 条地址字节逐条断言原生路径复现。**等价只覆盖地址，不覆盖工程语义。**
-- **REST/Core 端到端**：`scripts/nck-native-rest-e2e.py`（9 项断言全过）
+- **REST/Core 端到端**：`scripts/nck-native-rest-e2e.py`（12 项断言全过）
   - 手写原生字段：保存→启动→GOOD，`source_label=nck://read/C/1/18/42/1/1?…`
+  - **任务往返一致**：读回参数与提交参数逐字节相同（无隐藏回填/静默重解释）
   - 模板路径：Browse 根 = `nck://presets` + `nck://identity`；取模板叶（只含固定字段、
     标注 `candidate` 与 `待确认：area_no/line`）→ 补实例/行 → 保存 → GOOD
+  - **端点重启 / PointMap**：两条任务同时存在，Stop→Start 后两点都在且 `point_id` 不变
   - 旧目录字段：**保存时**被 Core Schema 以 `REQUIRED module/column/decode` 拒绝
 - **实体机只读**：`docs/evidence/nck-live-native-probe.txt`（实体 828D，内建探针
   取值与旧目录路径一致；`V/6` module 26 仍被 `0x8201` 拒绝）。

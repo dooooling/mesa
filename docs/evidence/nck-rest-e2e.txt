@@ -1,20 +1,25 @@
-emulator ready: 127.0.0.1:56176
+emulator ready: 127.0.0.1:53989
 mesad ready on http://127.0.0.1:18133
 POST /devices -> 201
 POST /endpoints -> 201
 PUT /tasks (原生字段) -> 200
+读回参数是否一致: True
 POST /start -> 200
-latest point: {"endpoint_id": "e2e-nck", "key": "e2e.value", "point_id": 1, "point_key": "e2e.value", "quality": "GOOD", "source_label": "nck://read/C/1/18/42/1/1?mode=current&decode=F64_BE&transport=0x09", "timestamp_ns": 1791917339245225400, "type": "f64", "value": 3.7209743448696e-294, "value_origin": "CURRENT"}
+latest point: {"endpoint_id": "e2e-nck", "key": "e2e.value", "point_id": 1, "point_key": "e2e.value", "quality": "GOOD", "source_label": "nck://read/C/1/18/42/1/1?mode=current&decode=F64_BE&transport=0x09", "timestamp_ns": 1791919876993282000, "type": "f64", "value": 3.7209743448696e-294, "value_origin": "CURRENT"}
 data_type: None value: 3.7209743448696e-294
 browse 根 -> 200 ['nck://presets', 'nck://identity']
 browse 模板(filter=rpa) -> 200 命中 1
 leaf label: RP/rpa F64_LE · candidate · 待确认：area_no/line
 PUT /tasks (模板+确认) -> 200
-preset point: {"endpoint_id": "e2e-nck", "key": "e2e.preset", "point_id": 2, "point_key": "e2e.preset", "quality": "GOOD", "source_label": "nck://read/C/1/21/1/1/1?mode=current&decode=F64_LE&transport=0x09", "timestamp_ns": 1791917341332120000, "type": "f64", "value": 3.7209743448696e-294, "value_origin": "CURRENT"}
+preset point: {"endpoint_id": "e2e-nck", "key": "e2e.preset", "point_id": 2, "point_key": "e2e.preset", "quality": "GOOD", "source_label": "nck://read/C/1/21/1/1/1?mode=current&decode=F64_LE&transport=0x09", "timestamp_ns": 1791919879070757500, "type": "f64", "value": 3.7209743448696e-294, "value_origin": "CURRENT"}
+PUT /tasks (两条任务) -> 200
+重启前: {'e2e.value': 1, 'e2e.preset': 2}
+重启后: {'e2e.value': 1, 'e2e.preset': 2}
 PUT /tasks (旧字段) -> 400 {"issues": [{"code": "REQUIRED", "message": "field `module` is required", "path": "tasks[0].selections[0].parameters.module"}, {"code": "REQUIRED", "message": "field `column` is required", "path": "tasks[0].selections[0].parameters.column"}, {"code": "REQUIRED", "message": "field `decode` is require
 
 === 结果 ===
 PASS  保存原生字段任务
+PASS  任务往返参数逐字节一致（无静默重解释）
 PASS  启动端点
 PASS  原生任务采到 GOOD
 PASS  Browse 根为模板+身份两类入口
@@ -22,4 +27,6 @@ PASS  模板只预填固定字段（不含 area_no/line）
 PASS  模板标注 candidate 且列出待确认项
 PASS  模板补必填后可保存
 PASS  模板任务采到 GOOD
+PASS  两条任务可同时保存
+PASS  端点重启后两个点都在且 point_id 不变（PointMap 稳定）
 PASS  旧字段在保存时被拒

@@ -39,12 +39,17 @@
   - GC4 升级路径写实：`CONTRACT.md` §升级与迁移 记录备份→停止→重建→核对
     四步与“无自动迁移”的明确承诺。✅
   - GC5 集成回归（REST/Core 全链）：`scripts/nck-native-rest-e2e.py` +
-    `docs/evidence/nck-rest-e2e.txt` —— 模拟器真实 TCP + mesad（临时 DB/独立端口）
-    走 `POST /devices → POST /endpoints → PUT /tasks → POST /start →
-    GET /points/latest`。原生字段任务保存→启动→采到 **GOOD**（`type=f64`、
-    `source_label=nck://read/C/1/18/42/1/1?mode=current&decode=F64_BE&transport=0x09`、
-    `value_origin=CURRENT`）；旧目录字段任务在**保存时**即被 Core Schema
-    以 `REQUIRED module/column/decode` 拒绝（400），不会静默接受。✅
+    `docs/evidence/nck-rest-e2e.txt`（12 项断言）—— 模拟器真实 TCP +
+    mesad（临时 DB/独立端口），不触碰本机配置。覆盖：
+    - 手写原生字段：保存→启动→采到 **GOOD**（`type=f64`、
+      `source_label=nck://read/C/1/18/42/1/1?mode=current&decode=F64_BE&transport=0x09`）；
+    - **任务往返一致**：读回参数与提交参数逐字节相同，无隐藏回填或静默重解释；
+    - **模板路径**：Browse 根 = `nck://presets` + `nck://identity`；模板叶只含固定字段、
+      标注 `candidate`/`待确认：area_no/line`；补实例与行后可保存并采到 GOOD；
+    - **端点重启 / PointMap**：两条任务同时存在，Stop→Start 后两点都在且 `point_id`
+      不变（`e2e.value=1`、`e2e.preset=2`）；
+    - 旧目录字段任务在**保存时**即被 Core Schema 以 `REQUIRED module/column/decode`
+      拒绝（400），不会静默接受。✅
   - GC6 发布闭环：`docs/releases/nck-native-addressing-2026-10-13.md` 已起草
     （变更摘要、PR 与提交、验证清单、本机迁移、未决的驱动功能版本号），
     并在最终 SHA 上重跑全量回归 + 契约证据 + CI（含 stress/perf/web/三平台）。

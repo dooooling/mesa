@@ -161,6 +161,24 @@ def main():
         print('PUT /tasks (原生字段) ->', code)
         results.append(('保存原生字段任务', code in (200, 201)))
 
+        # 往返一致性：读回的任务参数必须与提交的**逐字节一致**，
+        # 不允许任何隐藏回填或静默重解释（§7.3 第 5 条）。
+        code, body = req(base + '/api/v1/tasks?endpoint=' + ep)
+        stored = None
+        for t in (body or {}).get('tasks', []):
+            if t.get('id') == 't1':
+                stored = t
+        if stored is None:
+            print('FAIL: 读回任务为空', body)
+            results.append(('任务往返可读回', False))
+            return 1
+        stored_params = stored['binding']['config']['selections'][0]['parameters']
+        results.append(('任务往返参数逐字节一致（无静默重解释）',
+                        stored_params == native_params
+                        and stored['binding']['config']['selections'][0]['outputs']
+                        == task['binding']['config']['selections'][0]['outputs']))
+        print('读回参数是否一致:', stored_params == native_params)
+
         code, body = req(base + '/api/v1/endpoints/%s/start' % ep, 'POST')
         print('POST /start ->', code)
         results.append(('启动端点', code in (200, 202)))
@@ -239,7 +257,39 @@ def main():
         print('preset point:', json.dumps(got2, ensure_ascii=False) if got2 else None)
         results.append(('模板任务采到 GOOD', (got2 or {}).get('quality') == 'GOOD'))
 
-        # 4) 负例：旧目录字段必须被明确拒绝
+        # 端点重启 + PointMap 稳定性：先把两条任务一起提交，让两个点**同时存在**；
+        # 点身份（point_id）由 Core 分配并持久化，重启后必须保持不变且继续 GOOD。
+        # 注意：运行中的端点改任务必须先 Stop（否则 409 CONFLICT）。
+        req(base + '/api/v1/endpoints/%s/stop' % ep, 'POST')
+        code, body = req(base + '/api/v1/tasks/' + ep, 'PUT', [task, task2])
+        print('PUT /tasks (两条任务) ->', code)
+        results.append(('两条任务可同时保存', code in (200, 201)))
+        req(base + '/api/v1/endpoints/%s/start' % ep, 'POST')
+        ids_before = {}
+        for _ in range(40):
+            time.sleep(0.5)
+            _, latest = req(base + '/api/v1/points/latest')
+            pts = (latest or {}).get('points') or []
+            if len(pts) >= 2 and all(p.get('quality') == 'GOOD' for p in pts):
+                ids_before = {p.get('key'): p.get('point_id') for p in pts}
+                break
+        req(base + '/api/v1/endpoints/%s/stop' % ep, 'POST')
+        code, body = req(base + '/api/v1/endpoints/%s/start' % ep, 'POST')
+        time.sleep(3)
+        ids_after = {}
+        for _ in range(30):
+            _, latest = req(base + '/api/v1/points/latest')
+            pts = (latest or {}).get('points') or []
+            if len(pts) >= 2 and all(p.get('quality') == 'GOOD' for p in pts):
+                ids_after = {p.get('key'): p.get('point_id') for p in pts}
+                break
+            time.sleep(0.5)
+        print('重启前:', ids_before)
+        print('重启后:', ids_after)
+        results.append(('端点重启后两个点都在且 point_id 不变（PointMap 稳定）',
+                        len(ids_before) >= 2 and ids_after == ids_before))
+
+        # 5) 负例：旧目录字段必须被明确拒绝
         req(base + '/api/v1/endpoints/%s/stop' % ep, 'POST')
         legacy_task = json.loads(json.dumps(task))
         legacy_task['binding']['config']['selections'][0]['parameters'] = {
