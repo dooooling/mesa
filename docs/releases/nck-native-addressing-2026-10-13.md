@@ -58,8 +58,18 @@
     标注 `candidate` 与 `待确认：area_no/line`）→ 补实例/行 → 保存 → GOOD
   - **端点重启 / PointMap**：两条任务同时存在，Stop→Start 后两点都在且 `point_id` 不变
   - 旧目录字段：**保存时**被 Core Schema 以 `REQUIRED module/column/decode` 拒绝
-- **实体机只读**：`docs/evidence/nck-live-native-probe.txt`（实体 828D，内建探针
-  取值与旧目录路径一致；`V/6` module 26 仍被 `0x8201` 拒绝）。
+- **实体机只读**：
+  - `docs/evidence/nck-live-identity-probe.txt`：内建探针取值与旧目录路径一致；
+    `V/6` module 26 仍被 `0x8201` 拒绝。
+  - `docs/evidence/nck-live-samples-probe.txt`（**新绑定采样**，71 行）：用模板 +
+    确认 `area_no`/`line` 逐条记录请求字节/设备返回/质量。可读：
+    `progStatus`、`actFeedRateIpo`、`rpa`(R0/R1/R99)、`actToolBasePos` 轴1..3
+    （`-1.967`/`-3.515`/`25.551`）、`actProgPosBKS`、`cmdSpeed`(主轴1=10000)、
+    `r0033`、`r0035`、`r0078`、`r0080`。
+  - ⚠️ **与历史记录不一致，以本次为准**：`r0027`/`r0031` 在 **module 26 与 130**
+    两条入口、`V/1`..`V/4` 上均返回单项码 `0x85`（8 次一致）。2026-10-13 记录的
+    “实体828D通过模块26读取r0027/r0031”**不再成立**，相关点位维持 HOLD；
+    不得据此断言该参数在 828D 上普遍可读或普遍不可读。详见 `GATE.md`。
 - **Web**：`pnpm test` 230 项（含“不完整模板不绕过 required 前置”）、lint、build 通过。
 - **CI**：#96/#97/#98/#99 在各自 HEAD 上全绿（含 stress / perf / web / 三平台）。
 
