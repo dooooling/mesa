@@ -79,12 +79,42 @@
 （`未知字段 block`）→ 经 REST 停用（`desired_running=false`、`state=STOPPED`）。
 240 点**未自动重建**：重建需人工确认 `area_no`/`line`，且 20 点语义仍为 HOLD。
 
-## 待办（GC6，依赖合并）
+## 合并与最终 SHA
 
-- ⬜ 在四个 PR 合并后的最终 SHA 上重跑契约证据与 CI，并把该 SHA 补入本文件。
-- ⬜ 未完成或仍 HOLD 的项不得在本记录中升格为已验证：
-  `NCK_ANCHOR_PENDING`、TSAP confirmed、地址语义已确认、840D supported、
-  剩余 20 点对账（7 项未定义资源 / 12 项轴归属未证明 / 1 项无效主轴温度）。
+四个 PR 按普通 merge commit 依序合并（保留各自独立追溯）：
+
+| 顺序 | PR | 合并后 main |
+|---|---|---|
+| 1 | #99 契约门稳定性（独立） | `5f085b8` |
+| 2 | #96 PR-A | `cac6f45` |
+| 3 | #97 PR-B | `ea29aa7` |
+| 4 | #98 PR-C | **`d29c944`（最终 SHA）** |
+
+分支保护要求 head 与 base 同步，故 #96/#97/#98 各自先做一次 `update-branch`
+（把 main 并入 head）、等其 CI 通过后再合并。
+
+### 最终 SHA 上的门禁复跑（GC6）
+
+```text
+cargo build --locked --workspace                                   完成
+cargo fmt --all --check                                            干净
+cargo clippy --workspace --all-targets --all-features -D warnings   干净
+scripts/write-contract-evidence.py    28/28 套件、187/187 测试、dirty=false、sha=d29c944
+非契约包测试（10 个 crate）                                          全通过
+main push CI（d29c944）                                             全部 success
+```
+
+（187 项 = 186 项 + #99 新增的 staged 复制重试语义单测。）
+
+## 待办
+
+- ✅ GC6 已在最终 SHA `d29c944` 上重跑契约证据与 CI，并记录于上一节。
+- ⬜ **未完成/HOLD 的项不得升格为已验证**：`NCK_ANCHOR_PENDING`、
+  TSAP confirmed、地址语义已确认、840D supported、剩余 20 点对账
+  （7 项未定义资源 / 12 项轴归属未证明 / 1 项无效主轴温度），
+  以及 2026-10-14 复测发现的 `r0027`/`r0031` 被拒（两条入口，`0x85`）。
+- ⬜ 本机 240 点仍未重建（需人工确认 `area_no`/`line`；重建配方见
+  `drivers/sinumerik-nck/presets/EXAMPLES.md`）。
 
 ## 未决：驱动功能版本号
 
