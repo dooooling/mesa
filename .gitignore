@@ -54,6 +54,12 @@ tests/driver-contract/data/
 /release-validation.json
 /target/validation/
 
+# Python 解释器缓存（证据脚本 `scripts/write-contract-evidence.py` 会 import
+# `contract_suites.py` 并生成 scripts/__pycache__/；不忽略会让 `git status`
+# 变脏、使官方证据恒为 dirty=true，从而无法产出干净工作树的证据）
+__pycache__/
+*.pyc
+
 # 本地取证包（pktmon ETL/pcapng：provenance 源，存 evidence/ 本地备查，不进仓；
 # 权威证据为 tests/fixtures/** 的 req/res bin + EVIDENCE/SHA256SUMS）
 *.etl
