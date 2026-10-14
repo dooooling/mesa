@@ -131,6 +131,34 @@ fn load_master_key(
     load_or_create_master_key_file(&target, db_has_secrets)
 }
 
+/// 读取并校验一个已存在的 `master.key`（32 字节原始 / base64 32 字节）。
+///
+/// 内容非法时**报错而不修复、不重写**——静默替换会毁掉用备份或人工修复
+/// 恢复原 Secret 的唯一线索（见 [`load_or_create_master_key_file`]）。
+fn read_master_key_file(target: &PathBuf) -> Result<[u8; 32], StoreError> {
+    let raw = std::fs::read(target)
+        .map_err(|e| StoreError::Validation(format!("read master.key: {e}")))?;
+    if raw.len() == 32 {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&raw);
+        return Ok(k);
+    }
+    if let Ok(s) = String::from_utf8(raw.clone())
+        && let Ok(decoded) =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s.trim())
+        && decoded.len() == 32
+    {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&decoded);
+        return Ok(k);
+    }
+    Err(StoreError::Validation(format!(
+        "master.key 内容非法（{} 字节，既非 32 字节原始密钥也非合法 base64）；\
+         拒绝自动生成或覆盖，请从备份恢复原密钥或人工修复该文件",
+        raw.len()
+    )))
+}
+
 /// 读取（必要时创建）`master.key`。
 ///
 /// **P0：绝不覆盖已有密钥材料。** 三条规则：
@@ -142,34 +170,19 @@ fn load_master_key(
 ///    - 库中**已有加密 Secret**（`db_has_secrets`）→ 报错，不自动生成
 ///      （新密钥解不开旧密文，只会把"密钥丢失"伪装成"解密失败"）；
 ///    - 库中没有任何加密 Secret → 才允许生成新密钥（全新存储）。
+///
+/// **并发首次初始化（跨进程）**：生成走「唯一临时文件 → fsync → `hard_link`
+/// 原子发布」。`hard_link` 在目标已存在时**必然失败**，因此不存在覆盖窗口；
+/// 且链接建立的一刻目标内容已完整（临时文件已 fsync 并关闭），读取方不可能
+/// 看到半截密钥。若发现目标已由其它进程创建，则**读取并校验对方那把密钥**，
+/// 而不是把自己这把写进去——两个进程最终必须得到同一把密钥。
+/// 原先的固定名 `master.tmp` 已废弃：多进程共用同一临时名会互相截断。
 fn load_or_create_master_key_file(
     target: &PathBuf,
     db_has_secrets: bool,
 ) -> Result<[u8; 32], StoreError> {
     if target.is_file() {
-        let raw = std::fs::read(target)
-            .map_err(|e| StoreError::Validation(format!("read master.key: {e}")))?;
-        // 支持 base64 或原始 32 字节
-        if raw.len() == 32 {
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&raw);
-            return Ok(k);
-        }
-        if let Ok(s) = String::from_utf8(raw.clone())
-            && let Ok(decoded) =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s.trim())
-            && decoded.len() == 32
-        {
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&decoded);
-            return Ok(k);
-        }
-        // 非法内容：fail-closed，保持文件原样（字节不变）。
-        return Err(StoreError::Validation(format!(
-            "master.key 内容非法（{} 字节，既非 32 字节原始密钥也非合法 base64）；\
-             拒绝自动生成或覆盖，请从备份恢复原密钥或人工修复该文件",
-            raw.len()
-        )));
+        return read_master_key_file(target);
     }
     if db_has_secrets {
         return Err(StoreError::Validation(format!(
@@ -185,11 +198,25 @@ fn load_or_create_master_key_file(
         std::fs::create_dir_all(parent)
             .map_err(|e| StoreError::Validation(format!("create master.key dir: {e}")))?;
     }
-    // fail-closed：临时文件 + fsync + 0600 + 原子重命名，避免“加密成功但密钥未落盘”导致重启后永久无法解密
-    let tmp = target.with_extension("tmp");
+    // fail-closed：临时文件 + fsync + 0600 + **原子且不覆盖**的发布，避免
+    // “加密成功但密钥未落盘”导致重启后永久无法解密。
+    //
+    // 临时文件名必须**唯一**：固定名 `master.tmp` 在并发首次初始化时会被另一个
+    // 进程截断/覆盖，导致「内存里的 key ≠ 落盘 key」。
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base_name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("master.key");
+    let tmp = target.with_file_name(format!("{base_name}.{}.{seq}.tmp", std::process::id()));
     {
         use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)
+        // create_new：连临时文件也不复用别人可能残留的同名文件
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
             .map_err(|e| StoreError::Validation(format!("create master.key tmp: {e}")))?;
         f.write_all(&key)
             .map_err(|e| StoreError::Validation(format!("write master.key tmp: {e}")))?;
@@ -202,8 +229,27 @@ fn load_or_create_master_key_file(
                 .map_err(|e| StoreError::Validation(format!("chmod master.key tmp: {e}")))?;
         }
     }
-    std::fs::rename(&tmp, target)
-        .map_err(|e| StoreError::Validation(format!("rename master.key: {e}")))?;
+    // 原子发布：`hard_link` 在目标已存在时**必然失败** → 不存在覆盖窗口；
+    // 且链接可见的一刻内容已完整（临时文件已 fsync + 关闭）。
+    // 不用 `rename`：POSIX rename 会**替换**已存在的目标，正是要避免的覆盖。
+    let we_published = match std::fs::hard_link(&tmp, target) {
+        Ok(()) => true,
+        // 目标已由其它进程创建：改用**它的**密钥（内容此时已完整）
+        Err(_) if target.is_file() => false,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(StoreError::Validation(format!(
+                "publish master.key（hard_link 到 {}）失败: {e}",
+                target.display()
+            )));
+        }
+    };
+    // 发布成功后 tmp 只是同一 inode 的第二个名字，删除它不影响 target。
+    let _ = std::fs::remove_file(&tmp);
+    if !we_published {
+        // 另一进程先创建：读取并校验**它**的密钥，绝不把自己这把写进去。
+        return read_master_key_file(target);
+    }
     // 确保父目录落盘（尽力）
     if let Some(parent) = target.parent()
         && let Ok(dir) = std::fs::File::open(parent)
@@ -3295,6 +3341,112 @@ mod tests {
             "写入路径同样不得自动生成新密钥"
         );
         assert!(!key_path.exists(), "写入路径也不得创建 master.key");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// C1 P0：**跨进程**并发首次初始化必须只产生一把密钥。
+    ///
+    /// 为什么必须真起进程：进程内的 `INIT_LOCK` 只能串行化同进程调用，
+    /// 两个 mesad 进程同时首次初始化同一密钥目录时不受它保护。旧实现用
+    /// 固定名 `master.tmp` + `rename`（POSIX 下会**替换**已存在目标），
+    /// 存在「两个进程各写一把、后写者覆盖先写者」的窗口。
+    ///
+    /// 测试手法：父进程以 `--exact` 重新执行本测试二进制两次（子进程通过
+    /// 环境变量走"只做初始化并写出结果"的分支），随后断言：
+    /// 1. 两个进程拿到的密钥**完全相同**（败者必须读取胜者那把，而不是自己写）；
+    /// 2. 落盘 `master.key` 与返回的密钥一致（内存 key == 落盘 key）；
+    /// 3. 目录内**没有残留** `.tmp` 文件；
+    /// 4. 用该密钥能正常加解密（重启后 Secret 仍可解）。
+    #[test]
+    fn concurrent_first_init_across_two_processes_keeps_one_key() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+
+        // ---- 子进程分支：只做一次初始化并把结果写到指定文件 ----
+        if let Ok(dir) = std::env::var("MESA_KEY_RACE_DIR") {
+            let out = std::env::var("MESA_KEY_RACE_OUT").expect("child needs OUT");
+            let key =
+                load_or_create_master_key_file(&PathBuf::from(&dir).join("master.key"), false)
+                    .expect("子进程初始化必须成功");
+            std::fs::write(&out, key).expect("child writes key");
+            return;
+        }
+
+        // ---- 父进程分支 ----
+        let base = std::env::temp_dir().join(format!(
+            "mesa-keyrace-{}-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("master.key");
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut children = Vec::new();
+        for i in 0..2 {
+            let out = base.join(format!("child-{i}.key"));
+            let child = std::process::Command::new(&exe)
+                // 只跑本测试（子进程会走上面的环境变量分支后返回）
+                .args([
+                    "--exact",
+                    "tests::concurrent_first_init_across_two_processes_keeps_one_key",
+                    "--nocapture",
+                ])
+                .env("MESA_KEY_RACE_DIR", &base)
+                .env("MESA_KEY_RACE_OUT", &out)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn child");
+            children.push((child, out));
+        }
+        for (child, out) in &mut children {
+            let st = child.wait().expect("wait child");
+            assert!(
+                st.success(),
+                "子进程初始化失败（{st}）；产物 {} 是否存在={}",
+                out.display(),
+                out.exists()
+            );
+        }
+
+        let k0 = std::fs::read(base.join("child-0.key")).expect("child-0 结果缺失");
+        let k1 = std::fs::read(base.join("child-1.key")).expect("child-1 结果缺失");
+        assert_eq!(k0.len(), 32, "密钥长度必须为 32 字节");
+        assert_eq!(
+            k0, k1,
+            "两个进程必须得到同一把密钥（败者应读取胜者那把，而不是自己写一把）"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            k0,
+            "落盘密钥必须与两个进程返回的密钥一致（内存 key == 落盘 key）"
+        );
+
+        // 无残留临时文件（唯一临时名 + 发布后删除）
+        let leftovers: Vec<String> = std::fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "不得残留临时文件，实际 {leftovers:?}");
+
+        // 该密钥可用：写入并读回（等价重启后 Secret 仍可解）。
+        let db = base.join("mesa.db");
+        let s = ConfigStore::open(&db).unwrap();
+        s.create_device(&dev("d1")).unwrap();
+        s.create_endpoint(&ep("e1", "d1")).unwrap();
+        s.put_secret("e1", "password", "race-value", "k1").unwrap();
+        drop(s);
+        let s2 = ConfigStore::open(&db).unwrap();
+        assert_eq!(
+            s2.get_secret("e1", "password").unwrap().as_deref(),
+            Some("race-value"),
+            "并发初始化产出的密钥必须能正常加解密"
+        );
 
         std::fs::remove_dir_all(&base).ok();
     }
