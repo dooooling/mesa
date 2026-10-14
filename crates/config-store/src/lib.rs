@@ -95,7 +95,10 @@ pub enum StoreError {
 /// 内 in-memory 库（固定测试 key）与多个文件库（各目录独立 key）共存时，
 /// 全局缓存会把先访问者的 key 串给后访问者（文件库 key 文件甚至不生成，
 /// 进程重启后旧 Secret 永久无法解密）。
-fn load_master_key(key_dir: Option<&PathBuf>) -> Result<[u8; 32], StoreError> {
+fn load_master_key(
+    key_dir: Option<&PathBuf>,
+    db_has_secrets: bool,
+) -> Result<[u8; 32], StoreError> {
     // 1) 环境变量覆盖（支持 base64 或 32 字节原始字符串，适配离线工控机）
     if let Ok(env) = std::env::var("MESA_MASTER_KEY") {
         let env = env.trim();
@@ -125,10 +128,24 @@ fn load_master_key(key_dir: Option<&PathBuf>) -> Result<[u8; 32], StoreError> {
     } else {
         dir.join("master.key")
     };
-    load_or_create_master_key_file(&target)
+    load_or_create_master_key_file(&target, db_has_secrets)
 }
 
-fn load_or_create_master_key_file(target: &PathBuf) -> Result<[u8; 32], StoreError> {
+/// 读取（必要时创建）`master.key`。
+///
+/// **P0：绝不覆盖已有密钥材料。** 三条规则：
+///
+/// 1. 文件存在且内容合法（32 字节原始 / base64 32 字节）→ 使用它；
+/// 2. 文件存在但内容**非法** → 直接报错，**不生成、不覆盖、不轮换**。
+///    静默重新生成会永久毁掉用备份或人工修复恢复原 Secret 的可能；
+/// 3. 文件缺失：
+///    - 库中**已有加密 Secret**（`db_has_secrets`）→ 报错，不自动生成
+///      （新密钥解不开旧密文，只会把"密钥丢失"伪装成"解密失败"）；
+///    - 库中没有任何加密 Secret → 才允许生成新密钥（全新存储）。
+fn load_or_create_master_key_file(
+    target: &PathBuf,
+    db_has_secrets: bool,
+) -> Result<[u8; 32], StoreError> {
     if target.is_file() {
         let raw = std::fs::read(target)
             .map_err(|e| StoreError::Validation(format!("read master.key: {e}")))?;
@@ -147,8 +164,21 @@ fn load_or_create_master_key_file(target: &PathBuf) -> Result<[u8; 32], StoreErr
             k.copy_from_slice(&decoded);
             return Ok(k);
         }
+        // 非法内容：fail-closed，保持文件原样（字节不变）。
+        return Err(StoreError::Validation(format!(
+            "master.key 内容非法（{} 字节，既非 32 字节原始密钥也非合法 base64）；\
+             拒绝自动生成或覆盖，请从备份恢复原密钥或人工修复该文件",
+            raw.len()
+        )));
     }
-    // 不存在则生成并写入目标路径
+    if db_has_secrets {
+        return Err(StoreError::Validation(format!(
+            "master.key 缺失（{}）但库中已有加密 Secret；拒绝自动生成新密钥\
+             （新密钥无法解开旧密文，会永久丢失原 Secret），请从备份恢复原密钥",
+            target.display()
+        )));
+    }
+    // 全新存储：不存在则生成并写入目标路径
     let mut key = [0u8; 32];
     getrandom::getrandom(&mut key).map_err(|e| StoreError::Validation(e.to_string()))?;
     if let Some(parent) = target.parent() {
@@ -269,7 +299,12 @@ impl ConfigStore {
     /// desync 不可能）。并发首次访问由初始化锁串行化——同实例双生成会产生
     /// "缓存 key ≠ 落盘 key"；锁是进程共享的，但只保护初始化路径，缓存仍
     /// 是实例级（`OnceLock::get_or_try_init` 仍为 nightly 特性，不可用）。
-    fn master_key_bytes(&self) -> Result<[u8; 32], StoreError> {
+    ///
+    /// `db_has_secrets` 由调用方给出（C1 P0）：密钥文件缺失时，只有
+    /// **库中没有任何加密 Secret** 的存储才允许新建密钥。该标志必须由
+    /// 调用方提供而不能在此查询——`get_secret` 等路径已经持有 `conn` 锁，
+    /// 而 `std::sync::Mutex` 不可重入，在此查询会自锁。
+    fn master_key_bytes(&self, db_has_secrets: bool) -> Result<[u8; 32], StoreError> {
         if let Some(k) = self.master_key.get() {
             return Ok(*k);
         }
@@ -278,9 +313,17 @@ impl ConfigStore {
         if let Some(k) = self.master_key.get() {
             return Ok(*k);
         }
-        let key = load_master_key(self.key_dir.as_ref())?;
+        let key = load_master_key(self.key_dir.as_ref(), db_has_secrets)?;
         let _ = self.master_key.set(key);
         Ok(key)
+    }
+
+    /// 库中是否已存在加密 Secret（master key 缺失时的 fail-closed 判定依据）。
+    /// 自行短锁查询并立即释放；**不得**在持有 `conn` 锁时调用。
+    fn count_secrets(&self) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let n: u64 = conn.query_row("SELECT COUNT(*) FROM endpoint_secrets", [], |r| r.get(0))?;
+        Ok(n)
     }
 
     /// 迁移前的文件拷贝兜底（仅文件库；生产应使用 rusqlite backup API）。
@@ -921,7 +964,8 @@ impl ConfigStore {
         // 预先加密所有 secrets，避免事务中途失败；无 Secret 时不初始化 master key
         let mut encs: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
         if !secrets.is_empty() {
-            let key = self.master_key_bytes()?;
+            let has = self.count_secrets()? > 0;
+            let key = self.master_key_bytes(has)?;
             for (field, pt) in secrets {
                 let (ct, nonce) = aead_encrypt(pt.as_bytes(), &key)?;
                 encs.push((field.clone(), ct, nonce));
@@ -988,7 +1032,8 @@ impl ConfigStore {
         }
         let mut encs: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
         if !secrets_to_upsert.is_empty() {
-            let key = self.master_key_bytes()?;
+            let has = self.count_secrets()? > 0;
+            let key = self.master_key_bytes(has)?;
             for (field, pt) in secrets_to_upsert {
                 let (ct, nonce) = aead_encrypt(pt.as_bytes(), &key)?;
                 encs.push((field.clone(), ct, nonce));
@@ -1224,7 +1269,8 @@ impl ConfigStore {
     ) -> Result<u64, StoreError> {
         let mut encs: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
         if !secrets_plain.is_empty() {
-            let key = self.master_key_bytes()?;
+            let has = self.count_secrets()? > 0;
+            let key = self.master_key_bytes(has)?;
             for (field, pt) in secrets_plain {
                 let (ct, nonce) = aead_encrypt(pt.as_bytes(), &key)?;
                 encs.push((field.clone(), ct, nonce));
@@ -1752,7 +1798,10 @@ impl ConfigStore {
         plaintext: &str,
         key_id: &str,
     ) -> Result<(), StoreError> {
-        let key = self.master_key_bytes()?;
+        // 先短锁判断库中是否已有 Secret，再取 key（顺序不可反：master_key_bytes
+        // 内部不做查询，避免与 conn 锁形成重入）。
+        let has = self.count_secrets()? > 0;
+        let key = self.master_key_bytes(has)?;
         let (ciphertext, nonce) = aead_encrypt(plaintext.as_bytes(), &key)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1776,27 +1825,31 @@ impl ConfigStore {
         endpoint_id: &str,
         field_path: &str,
     ) -> Result<Option<String>, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let row: Option<(Vec<u8>, Vec<u8>, String, String)> = conn
-            .query_row(
+        // 短锁取出密文行后**立即释放**：`master_key_bytes` 在密钥文件缺失时
+        // 需要区分「全新存储」与「已有 Secret 的存储」，而 conn 锁不可重入。
+        let row: Option<(Vec<u8>, Vec<u8>, String, String)> = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
                 "SELECT ciphertext, nonce, algorithm, key_id FROM endpoint_secrets WHERE endpoint_id=?1 AND field_path=?2",
                 params![endpoint_id, field_path],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
-            .optional()?;
-        if let Some((ct, nonce, alg, key_id)) = row {
-            // 兼容旧 xor-demo 数据（迁移期）
-            if alg == "xor-demo" {
-                let key_byte = key_id.bytes().fold(0xAAu8, |a, b| a ^ b);
-                let pt: Vec<u8> = ct.iter().map(|b| b ^ key_byte).collect();
-                return Ok(Some(String::from_utf8_lossy(&pt).into_owned()));
-            }
-            let key = self.master_key_bytes()?;
-            let pt = aead_decrypt(&ct, &nonce, &key)?;
-            Ok(Some(String::from_utf8_lossy(&pt).into_owned()))
-        } else {
-            Ok(None)
+            .optional()?
+        };
+        let Some((ct, nonce, alg, key_id)) = row else {
+            return Ok(None);
+        };
+        // 兼容旧 xor-demo 数据（迁移期）
+        if alg == "xor-demo" {
+            let key_byte = key_id.bytes().fold(0xAAu8, |a, b| a ^ b);
+            let pt: Vec<u8> = ct.iter().map(|b| b ^ key_byte).collect();
+            return Ok(Some(String::from_utf8_lossy(&pt).into_owned()));
         }
+        // 能读到 Secret 行 ⇒ 库中确实存在加密 Secret ⇒ db_has_secrets = true：
+        // 此时若 master.key 缺失，必须报错（绝不新生成一把解不开旧密文的密钥）。
+        let key = self.master_key_bytes(true)?;
+        let pt = aead_decrypt(&ct, &nonce, &key)?;
+        Ok(Some(String::from_utf8_lossy(&pt).into_owned()))
     }
 
     pub fn delete_secret(&self, endpoint_id: &str, field_path: &str) -> Result<bool, StoreError> {
@@ -3167,23 +3220,156 @@ mod tests {
 
         // ② key 文件损坏（既非 32 字节，也非合法 base64）。
         //
-        // 实测行为：`load_or_create_master_key_file` 对「存在但非法」的 key 文件
-        // **不会报错**，而是重新生成一把新密钥并覆盖写回；随后读取旧密文
-        // 因密钥不匹配而失败。因此**读取路径是 fail-closed 的**（本断言成立），
-        // 但损坏事件本身被静默吞掉、旧 Secret 变成永久不可解密。
-        //
-        // NOTE: 这是可诊断性缺口——运维看到的是 `decrypt: aead::Error`，
-        // 而不是「master.key 已损坏/被替换」。是否改为「非法 key 文件直接
-        // 拒绝启动」属于 config-store 的独立决策（会影响可恢复性策略），
-        // 未在本轮 C1 内改动；如需收敛应单独评审并补运维指引。
-        std::fs::write(&key_path, b"not-a-valid-key").unwrap();
+        // C1 P0 修复后的行为：**直接报错，绝不重新生成、覆盖或自动轮换**。
+        // 关键断言是文件字节**保持原样**——静默覆盖会永久毁掉用备份或人工
+        // 修复恢复原 Secret 的机会。
+        let corrupted = b"not-a-valid-key".to_vec();
+        std::fs::write(&key_path, &corrupted).unwrap();
         {
             let s = ConfigStore::open(&db).unwrap();
+            let err = s
+                .get_secret("e1", "password")
+                .expect_err("损坏的 master.key 必须 fail-closed（不得静默重新生成）");
             assert!(
-                s.get_secret("e1", "password").is_err(),
-                "损坏/被替换的 master key 必须导致 Secret 读取失败（不得返回垃圾明文）"
+                err.to_string().contains("master.key"),
+                "错误信息必须指向 master.key 以便定位：{err}"
             );
         }
+        assert_eq!(
+            std::fs::read(&key_path).unwrap(),
+            corrupted,
+            "非法 master.key 的字节必须保持原样，绝不能被新生成的密钥覆盖"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// C1 P0：`master.key` 缺失但库中已有加密 Secret 时，必须**拒绝自动生成**
+    /// 新密钥，且不得创建任何密钥文件。
+    ///
+    /// 为什么：新密钥解不开旧密文，自动生成会把「密钥丢失」伪装成「解密失败」，
+    /// 同时覆盖掉人工恢复的唯一线索（原密钥文件本应仍在备份里，但新文件会
+    /// 让人误以为密钥已轮换成功）。
+    #[test]
+    fn missing_master_key_with_existing_secrets_refuses_to_generate() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "mesa-keymissing-{}-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let db = base.join("mesa.db");
+        let key_path = base.join("master.key");
+
+        // 建库 + 写入 Secret（此时 master.key 被真实创建）。
+        {
+            let s = ConfigStore::open(&db).unwrap();
+            s.create_device(&dev("d1")).unwrap();
+            s.create_endpoint(&ep("e1", "d1")).unwrap();
+            s.put_secret("e1", "password", "must-survive", "k1")
+                .unwrap();
+        }
+        assert!(key_path.is_file(), "前置：密钥文件应已生成");
+
+        // 模拟密钥文件丢失（误删 / 备份未恢复）。
+        std::fs::remove_file(&key_path).unwrap();
+
+        let s = ConfigStore::open(&db).unwrap();
+        let err = s
+            .get_secret("e1", "password")
+            .expect_err("密钥缺失且已有 Secret 时必须拒绝，而不是新生成一把密钥");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("master.key") && msg.contains("已有加密 Secret"),
+            "错误信息必须说明原因（密钥缺失 + 库中已有 Secret）：{msg}"
+        );
+        assert!(
+            !key_path.exists(),
+            "拒绝路径**不得**创建 master.key（否则等于静默轮换密钥）"
+        );
+        // 写入路径同样必须拒绝（不得给旧库写一把新密钥）。
+        assert!(
+            s.put_secret("e1", "password", "another", "k1").is_err(),
+            "写入路径同样不得自动生成新密钥"
+        );
+        assert!(!key_path.exists(), "写入路径也不得创建 master.key");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 反向保护：**全新存储**（库中没有任何加密 Secret）仍必须能正常创建密钥
+    /// 并完成加解密——修复不得把「首次使用」一起挡死。
+    #[test]
+    fn fresh_store_without_secrets_still_creates_master_key() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "mesa-keyfresh-{}-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let db = base.join("mesa.db");
+        let key_path = base.join("master.key");
+
+        let s = ConfigStore::open(&db).unwrap();
+        s.create_device(&dev("d1")).unwrap();
+        s.create_endpoint(&ep("e1", "d1")).unwrap();
+        // 空库（无 Secret）→ 允许创建密钥。
+        s.put_secret("e1", "password", "fresh-value", "k1").unwrap();
+        assert!(key_path.is_file(), "全新存储必须创建 master.key");
+        assert_eq!(
+            s.get_secret("e1", "password").unwrap().as_deref(),
+            Some("fresh-value")
+        );
+        drop(s);
+
+        // 重开后仍可解密（密钥稳定）。
+        let s2 = ConfigStore::open(&db).unwrap();
+        assert_eq!(
+            s2.get_secret("e1", "password").unwrap().as_deref(),
+            Some("fresh-value")
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 合法 base64 形式的 `master.key` 仍被接受（修复只拒绝**非法**内容，
+    /// 不改变既有合法格式的支持）。
+    #[test]
+    fn base64_master_key_is_still_accepted() {
+        use base64::Engine as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "mesa-keyb64-{}-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let db = base.join("mesa.db");
+        let key_path = base.join("master.key");
+        let raw = [0x11u8; 32];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        std::fs::write(&key_path, b64.as_bytes()).unwrap();
+        let before = std::fs::read(&key_path).unwrap();
+
+        let s = ConfigStore::open(&db).unwrap();
+        s.create_device(&dev("d1")).unwrap();
+        s.create_endpoint(&ep("e1", "d1")).unwrap();
+        s.put_secret("e1", "password", "b64-value", "k1").unwrap();
+        assert_eq!(
+            s.get_secret("e1", "password").unwrap().as_deref(),
+            Some("b64-value")
+        );
+        assert_eq!(
+            std::fs::read(&key_path).unwrap(),
+            before,
+            "合法的 base64 密钥文件不得被改写"
+        );
 
         std::fs::remove_dir_all(&base).ok();
     }

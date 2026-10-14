@@ -195,6 +195,11 @@ scripts/write-contract-evidence.py                                 见末节
   需要人工调整到范围内；调整前应先确认设备侧真实响应时间。
 - 旧配置中的 `host` 若为字符串但指向出厂占位地址（如 `192.168.0.1`），
   新版本**不会**改写它，仍会按原值连接——这是有意的：不替用户改连接目标。
+- **`master.key` 必须与数据库一起备份**（第 7 节）。密钥文件缺失而库中已有
+  加密 Secret 时，新版本会**明确拒绝**而不是自动生成新密钥；此时唯一正确的
+  动作是从备份恢复原 `master.key`，而不是让程序"重新开始"。
+  由于 `.gitignore` 忽略 `**/master.key`，`git clean` / 重新克隆会删掉它——
+  请把密钥文件纳入独立的密钥备份流程，不要只依赖工作区副本。
 
 ## 6. 最终提交与干净工作树证据
 
@@ -226,3 +231,45 @@ scripts/write-contract-evidence.py
 
 **尚未完成的前置检查**：本证据只覆盖仓库内可自动化部分。A22 的**实体设备**
 分阶段量测、以及第 4 节列出的可诊断性缺口，均不包含在上述 190 项之内。
+
+## 7. `master.key` 不可逆覆盖风险修复（C1 合并前 P0）
+
+**原缺陷**：`load_or_create_master_key_file()` 对「已存在但内容非法」的
+`master.key` **不报错**，而是继续走生成流程——在多数文件系统上会**替换掉**
+原文件。后果不是"读不出来"，而是**原始密钥材料被销毁**：备份或人工修复
+恢复原 Secret 的唯一线索被覆盖。读取路径本身是 fail-closed 的（A31 断言
+成立），但"拒绝解密"不等于"保护了密钥材料"。
+
+**修复后的规则**（`crates/config-store/src/lib.rs`）：
+
+| 情形 | 行为 |
+|---|---|
+| 文件存在且合法（32 字节原始 / base64 32 字节） | 使用它；**不改写文件** |
+| 文件存在但内容非法 | **报错**，不生成、不覆盖、不轮换；文件字节保持原样 |
+| 文件缺失，且库中**已有**加密 Secret | **报错**，不自动生成（新密钥解不开旧密文） |
+| 文件缺失，且库中**没有**加密 Secret（全新存储） | 生成新密钥（原行为） |
+| `MESA_MASTER_KEY` 环境变量已设 | 按原语义使用（显式覆盖，不涉及文件） |
+| in-memory 库 | 固定测试 key，不碰磁盘（原行为） |
+
+**实现要点**：判定「库中是否已有加密 Secret」需要查询 `endpoint_secrets`，
+但 `get_secret()` 原本在**持有 `conn` 锁**时调用 `master_key_bytes()`，
+而 `std::sync::Mutex` 不可重入——在 `master_key_bytes()` 内部查询会自锁。
+因此改为由调用方传入 `db_has_secrets`：写路径先 `count_secrets()`（短锁查询
+后立即释放）再取 key；`get_secret()` 改为**先短锁取出密文行、释放锁后**
+再取 key（此时已知存在 Secret 行，直接传 `true`）。
+
+**回归测试**（`crates/config-store`）：
+
+- `secret_decrypt_failure_is_fail_closed_and_does_not_leak`（已更新）：
+  非法密钥 → 报错且错误信息指向 `master.key`，并**断言文件字节未被修改**；
+- `missing_master_key_with_existing_secrets_refuses_to_generate`（新增）：
+  删除密钥文件后读/写路径都必须拒绝，且**不得创建** `master.key`；
+- `fresh_store_without_secrets_still_creates_master_key`（新增）：
+  反向保护——全新存储仍能正常创建密钥并完成加解密；
+- `base64_master_key_is_still_accepted`（新增）：
+  合法 base64 形式仍被接受且**文件不被改写**。
+
+**运维影响（重要）**：本修复把"静默换钥匙"变成"明确拒绝"。若某台机器的
+数据库已有加密 Secret 而 `master.key` 丢失，升级后相关端点会**明确失败**
+（而不是用一个新密钥继续跑、让所有旧凭据永久无法解密）。此时唯一正确的
+动作是从备份恢复原 `master.key`。
