@@ -407,7 +407,7 @@
     {
       "id": "828d.V.M.r0035.nc_variable",
       "family": "828d",
-      "label": "M/r0035 F32",
+      "label": "M/r0035 F32（含 -200 无效温度规则）",
       "validation_status": "candidate",
       "parameters": {
         "area": "V",
@@ -416,18 +416,20 @@
         "count": 1,
         "unit_mode": "current",
         "decode": "F32_BE",
-        "transport_size": "0x07"
+        "transport_size": "0x07",
+        "invalid_value": -200.0,
+        "invalid_tolerance": 0.001
       },
       "required_user_inputs": [
         "area_no",
         "line"
       ],
-      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+      "description": "候选模板：实例与行索引须由使用者按设备确认。r0035 的 -200 是本资源已知的无效温度哨兵，作为普通参数显式预填并随配置保存；不填则不生效，驱动不会隐式继承。"
     },
     {
       "id": "828d.V.M.r0035.drive_object",
       "family": "828d",
-      "label": "M/r0035 F32（驱动对象入口 module130）",
+      "label": "M/r0035 F32（驱动对象入口 module130，含 -200 无效温度规则）",
       "validation_status": "candidate",
       "parameters": {
         "area": "V",
@@ -436,13 +438,15 @@
         "count": 1,
         "unit_mode": "current",
         "decode": "F32_BE",
-        "transport_size": "0x07"
+        "transport_size": "0x07",
+        "invalid_value": -200.0,
+        "invalid_tolerance": 0.001
       },
       "required_user_inputs": [
         "area_no",
         "line"
       ],
-      "description": "候选模板：实例与行索引须由使用者按设备确认。"
+      "description": "候选模板：实例与行索引须由使用者按设备确认。r0035 的 -200 是本资源已知的无效温度哨兵，作为普通参数显式预填并随配置保存；不填则不生效，驱动不会隐式继承。"
     },
     {
       "id": "828d.V.M.r0033.nc_variable",

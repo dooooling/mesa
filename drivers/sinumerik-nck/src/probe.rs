@@ -4,11 +4,16 @@
 //! V1 不能证明的：对端是 SINUMERIK（family/model 置 None，绝不按端口/TSAP
 //! 脑补身份；旧 `sinumerik` 驱动的 `UNCONFIRMED` 教训在此 recast）。
 //!
-//! 身份确认路径（PR7/真机，全部前置）：
+//! 身份确认路径（真机，全部前置）：
 //!
-//! 1. 官方变量表选永久只读跨版本稳定 anchor → 填 catalog；
-//! 2. anchor 0x82 读成功 → vendor/family 置值 + topology 实例回填；
+//! 1. 从官方变量表选一个**永久只读、跨版本稳定**的 anchor 变量，并像
+//!    `identity_spec` 那样把它固化成内建常量（数值入代码、留证据出处）；
+//! 2. anchor 0x82 读成功 → vendor/family 置值；
 //! 3. SZL 模块标识作为交叉证据（transport 已有 `szl`，语义待确认）。
+//!
+//! 说明：早期设计曾计划把 anchor 回填进运行时变量目录（`catalog`）与实例
+//! 拓扑（`topology`）。两者已在原生寻址重构中删除，身份能力改由内建探针
+//! （`identity_spec`）承担，因此这里不再有「回填目录/拓扑」这一步。
 //!
 //! 在此之前 probe 永远携带 `NCK_ANCHOR_PENDING` warning。
 
@@ -53,7 +58,7 @@ pub async fn probe_with_session(cfg: &NckConnConfig) -> ProbeReport {
             code: NCK_ANCHOR_PENDING.into(),
             message: format!(
                 "S7Comm 会话已建立（协商 PDU {pdu}），但 SINUMERIK 身份未确认：\
-                 anchor 变量待官方变量表 + 真机回填 catalog，在此之前 family/model 恒为 None"
+                 anchor 变量待官方变量表核对后固化为内建常量，在此之前 family/model 恒为 None"
             ),
         }],
     }

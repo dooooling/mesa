@@ -6,7 +6,7 @@
 use mesa_driver_sinumerik_nck::{
     NativeNckAddress, PresetRegistry, PresetTemplate, encode_var_spec, resolve_native,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 
 /// 按 area + block + 变量名（+ 入口 module）定位模板。
 ///
@@ -257,24 +257,49 @@ fn drive_object_area_splits_into_two_explicit_entries() {
     assert_eq!(m26, m130);
 }
 
-/// `r0035` 的无效工程值规则**不在模板里自动生效**：它必须作为普通字段
-/// 被复制进任务，缺失时不提供工程语义保护（诚实边界）。
+/// `r0035` 的无效温度哨兵必须**显式可见**：模板直接带上这两个普通字段，
+/// 使用者从模板建立的点位即受保护，不再依赖"记得手填"。
+///
+/// 同时锁住边界：规则永远来自**配置本身**，驱动不会在缺字段时凭空生效。
+#[test]
+fn r0035_presets_carry_the_known_invalid_temperature_rule_explicitly() {
+    for module in [26, 130] {
+        let t = preset("V", "M", "r0035", module);
+        assert_eq!(
+            t.parameters.get("invalid_value").and_then(|v| v.as_f64()),
+            Some(-200.0),
+            "module {module} 的 r0035 模板必须显式携带 -200 哨兵"
+        );
+        assert_eq!(
+            t.parameters
+                .get("invalid_tolerance")
+                .and_then(|v| v.as_f64()),
+            Some(0.001),
+            "module {module} 的 r0035 模板必须显式携带容差"
+        );
+        // 规则随 binding 一起进入配置（不是驱动隐式继承）。
+        let mut p = t.parameters.clone();
+        p.insert("area_no".into(), Value::from(1));
+        p.insert("line".into(), Value::from(1));
+        let rp = resolve_native(NativeNckAddress::from_parameters(&p).unwrap()).unwrap();
+        let rule = rp.invalid_rule.expect("模板字段应随配置生效");
+        assert!(rule.hits(-200.0), "-200 必须命中");
+        assert!(!rule.hits(33.0), "正常温度不得误判");
+    }
+}
+
+/// 规则不来自模板"特权"：删掉字段后同一地址不再有工程语义保护。
 #[test]
 fn invalid_rule_is_explicit_configuration_not_a_template_privilege() {
     let t = preset("V", "M", "r0035", 26);
-    assert!(
-        !t.parameters.contains_key("invalid_value"),
-        "模板不隐式携带无效值规则"
-    );
     let mut p = t.parameters.clone();
+    p.remove("invalid_value");
+    p.remove("invalid_tolerance");
     p.insert("area_no".into(), Value::from(1));
     p.insert("line".into(), Value::from(1));
     let rp = resolve_native(NativeNckAddress::from_parameters(&p).unwrap()).unwrap();
-    assert!(rp.invalid_rule.is_none(), "未配置即无规则");
-    // 显式配置后才生效。
-    p.insert("invalid_value".into(), json!(-200.0));
-    p.insert("invalid_tolerance".into(), json!(0.001));
-    let rp = resolve_native(NativeNckAddress::from_parameters(&p).unwrap()).unwrap();
-    let rule = rp.invalid_rule.expect("显式配置后规则随绑定");
-    assert!(rule.hits(-200.0) && !rule.hits(33.0));
+    assert!(
+        rp.invalid_rule.is_none(),
+        "未配置即无规则（不隐式继承、不按变量名猜哨兵）"
+    );
 }
