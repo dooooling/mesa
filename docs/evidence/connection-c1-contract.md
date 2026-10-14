@@ -211,14 +211,20 @@ scripts/write-contract-evidence.py                                 见末节
 | `c41cd8f` | 补齐 A21/A22/A31/A32 验收 + **修正 Probe 阶段预算方向**（`opcua_auth_restart_e2e` 新套件） |
 | `e818caf` | 忽略 `__pycache__`：证据脚本自身 import `contract_suites.py` 会弄脏工作树，导致官方证据恒为 `dirty=true`；不修则无法产出干净工作树证据 |
 | `61aed30` | 修正 A21 的 epoch 断言（见下） |
+| `b58be17` | 记录 `61aed30` 的干净工作树证据 |
+| `43ccff4` | **`master.key` 不可逆覆盖风险修复**（第 7 节，C1 合并前 P0） |
+| `6458c99` | A22 只读量测方案（`docs/design/a22-probe-timing-measurement.md`） |
 
 **干净工作树证据（最终）**：
 
 ```text
 scripts/write-contract-evidence.py
   → target/validation/contract.json
-    suites=29  tests=190  sha=61aed30fed148a48ba2864722a319349d3dc2194  dirty=False
+    suites=29  tests=190  sha=6458c997f73147c2845c90e7b4d249bd0ae76e2f  dirty=False
 ```
+
+（`master.key` 修复新增的 4 条 config-store 用例位于该 crate 的单测，
+不计入 contract 套件数；故套件数仍为 29、契约项仍为 190。）
 
 在此之前同一命令在 `c41cd8f` 上曾两次出现**单套件偶发失败**（分别落在
 `event_pressure` 与 `opcua_auth_restart_e2e`），逐项定位后确认：
