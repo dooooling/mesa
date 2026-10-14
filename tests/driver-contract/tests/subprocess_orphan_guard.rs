@@ -279,7 +279,13 @@ fn live_pids(name: &str) -> HashSet<u32> {
 }
 
 /// 断言 `name` 的存活 PID 最终回落到 `before` 子集（无孤儿）。
-fn assert_no_orphan(before: &HashSet<u32>, name: &str) {
+///
+/// **必须是异步轮询**：调用方是 `#[tokio::test]`（默认单线程运行时）。
+/// 若在此用 `std::thread::sleep` 阻塞运行时线程，Tokio 在 `kill_on_drop` 之后
+/// 的**异步子进程回收**就没有机会被调度——Linux 上表现为「进程已退出但仍是
+/// 僵尸、PID 迟迟不消失」，而 Windows 侧不依赖该回收路径，于是同一用例
+/// 只在 Linux 失败。改为 `tokio::time::sleep` 让回收任务得以推进。
+async fn assert_no_orphan(before: &HashSet<u32>, name: &str) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let cur = live_pids(name);
@@ -287,10 +293,39 @@ fn assert_no_orphan(before: &HashSet<u32>, name: &str) {
             return;
         }
         if Instant::now() >= deadline {
-            let leaked: Vec<u32> = cur.difference(before).copied().collect();
+            let mut leaked: Vec<u32> = cur.difference(before).copied().collect();
+            leaked.sort_unstable();
+            dump_process_state(&leaked);
             panic!("probe 残留子进程 {name} pids={leaked:?}");
         }
-        std::thread::sleep(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// 失败时的进程状态诊断：打印残留 PID 的 `/proc/<pid>/status` 关键行，
+/// 用于区分「真存活（S/R）」「僵尸未回收（Z）」「父进程/命名空间异常（PPid/NSpid）」。
+/// 非 Linux 平台为空实现（Windows 用 tasklist，无同等状态字段）。
+fn dump_process_state(pids: &[u32]) {
+    #[cfg(target_os = "linux")]
+    for pid in pids {
+        let path = format!("/proc/{pid}/status");
+        match std::fs::read_to_string(&path) {
+            Ok(status) => {
+                for line in status.lines() {
+                    if ["Name:", "State:", "PPid:", "NSpid:"]
+                        .iter()
+                        .any(|prefix| line.starts_with(prefix))
+                    {
+                        eprintln!("[orphan-diag] PID {pid}: {line}");
+                    }
+                }
+            }
+            Err(e) => eprintln!("[orphan-diag] PID {pid}: 读取 {path} 失败: {e}"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pids;
     }
 }
 
@@ -371,7 +406,7 @@ async fn manager_probe_success_reports_facts_and_cleans_child() {
     let res = mgr.probe("test-driver", "{}").await.expect("probe ok");
     assert!(res.reachable);
     assert_eq!(res.vendor.as_deref(), Some("Mesa"));
-    assert_no_orphan(&before, &exe_name(&unique));
+    assert_no_orphan(&before, &exe_name(&unique)).await;
     cleanup_dir(&root);
 }
 
@@ -388,7 +423,7 @@ async fn manager_probe_bad_config_fails_and_cleans_child() {
         matches!(err, ProbeError::InvalidInput { .. }),
         "simulator BAD_CONFIG 应结构化映射 InvalidInput，实际: {err}"
     );
-    assert_no_orphan(&before, &exe_name(&unique));
+    assert_no_orphan(&before, &exe_name(&unique)).await;
     cleanup_dir(&root);
 }
 
@@ -418,7 +453,7 @@ async fn manager_probe_timeout_cleans_hang_child() {
         matches!(err, ProbeError::RpcTimeout),
         "Probe RPC 超时应映射 RpcTimeout，实际: {err}"
     );
-    assert_no_orphan(&before, &exe_name(&unique));
+    assert_no_orphan(&before, &exe_name(&unique)).await;
     cleanup_dir(&root);
 }
 
@@ -507,7 +542,7 @@ async fn slow_but_successful_probe_is_not_truncated_by_management_budget() {
         elapsed >= Duration::from_millis(11_000),
         "必须真的等满驱动侧延迟（证明没有被 10s IPC / 12s 外层截断），实际 {elapsed:?}"
     );
-    assert_no_orphan(&before, &name);
+    assert_no_orphan(&before, &name).await;
     cleanup_dir(&root);
 }
 
@@ -541,12 +576,37 @@ async fn cancelled_probe_releases_child_process_and_port_lease() {
     wait_for_new_pid(&before, &name).await;
     let port = wait_for_new_claim(&claims_before).await;
 
+    // 诊断留痕（A32 排查）：记录取消前后的子进程 PID 与端口租约状态，
+    // 便于在 CI 日志里直接看出「是进程没死」还是「进程死了但租约没放」。
+    let pids_before_abort: Vec<u32> = {
+        let mut v: Vec<u32> = live_pids(&name).difference(&before).copied().collect();
+        v.sort_unstable();
+        v
+    };
+    eprintln!(
+        "[a32-diag] before abort: child_pids={pids_before_abort:?} port={port} \
+         lock_exists={}",
+        claim_dir().join(format!("port-{port}.lock")).exists()
+    );
+
     // 取消：drop 整个 probe future。
     probing.abort();
     let _ = probing.await;
 
+    eprintln!(
+        "[a32-diag] after abort (immediate): child_pids={:?} lock_exists={}",
+        {
+            let mut v: Vec<u32> = live_pids(&name).difference(&before).copied().collect();
+            v.sort_unstable();
+            v
+        },
+        claim_dir().join(format!("port-{port}.lock")).exists()
+    );
+
     // 1) 子进程退出：唯一命名二进制的存活 PID 回落到基线。
-    assert_no_orphan(&before, &name);
+    // 失败时会打印残留 PID 的 /proc/<pid>/status（Linux），用于区分
+    // 真存活 / 僵尸未回收 / 父进程异常。
+    assert_no_orphan(&before, &name).await;
     // 2) 端口租约释放：声明文件被删除（否则该端口对本进程永久不可用）。
     common::wait_until(15, || {
         !claim_dir().join(format!("port-{port}.lock")).exists()
@@ -565,6 +625,6 @@ async fn cancelled_probe_releases_child_process_and_port_lease() {
         .await
         .expect("取消后的新探测必须成功");
     assert!(report.reachable, "新探测必须可达");
-    assert_no_orphan(&before, &name);
+    assert_no_orphan(&before, &name).await;
     cleanup_dir(&root);
 }
