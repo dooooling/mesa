@@ -106,7 +106,7 @@ async fn s7_generic_memory_ok() {
 #[tokio::test]
 async fn focas_generic_status_ok() {
     let conn = mesa_driver_focas2::FocasDriver
-        .open_connection("ep1", "{}")
+        .open_connection("ep1", r#"{"host":"127.0.0.1"}"#)
         .await
         .unwrap();
     // Resource Model Cleanup：machine/status（旧 status/value 已删除）。
@@ -135,7 +135,7 @@ async fn focas_generic_status_ok() {
 #[tokio::test]
 async fn focas_generic_axis_absolute_ok() {
     let conn = mesa_driver_focas2::FocasDriver
-        .open_connection("ep1", "{}")
+        .open_connection("ep1", r#"{"host":"127.0.0.1"}"#)
         .await
         .unwrap();
     // axis/absolute（旧 axis/value、dynamic/position.absolute 已删除）。
@@ -159,7 +159,7 @@ async fn focas_generic_axis_absolute_ok() {
 #[tokio::test]
 async fn focas_generic_legacy_shapes_rejected() {
     let conn = mesa_driver_focas2::FocasDriver
-        .open_connection("ep1", "{}")
+        .open_connection("ep1", r#"{"host":"127.0.0.1"}"#)
         .await
         .unwrap();
     // 旧形态无 alias：dynamic、status/value、axis/value 一律拒绝。
@@ -193,7 +193,7 @@ async fn focas_generic_legacy_shapes_rejected() {
 #[tokio::test]
 async fn opcua_generic_node_ok() {
     let conn = mesa_driver_opcua::OpcUaDriver
-        .open_connection("ep1", "{}")
+        .open_connection("ep1", r#"{"endpoint_url":"opc.tcp://127.0.0.1:4840"}"#)
         .await
         .unwrap();
     // canonical data_type（旧 "U32" 拼写只属于 legacy，不进 generic）
@@ -279,7 +279,7 @@ async fn legacy_kinds_rejected_for_all_drivers() {
 
     // FOCAS
     let focas = mesa_driver_focas2::FocasDriver
-        .open_connection("ep1", "{}")
+        .open_connection("ep1", r#"{"host":"127.0.0.1"}"#)
         .await
         .unwrap();
     let legacy_focas = AcquisitionTask {
@@ -301,7 +301,7 @@ async fn legacy_kinds_rejected_for_all_drivers() {
 
     // OPC UA legacy kinds
     let opcua = mesa_driver_opcua::OpcUaDriver
-        .open_connection("ep1", "{}")
+        .open_connection("ep1", r#"{"endpoint_url":"opc.tcp://127.0.0.1:4840"}"#)
         .await
         .unwrap();
     for kind in [LEGACY_KINDS[3], LEGACY_KINDS[4], LEGACY_KINDS[5]] {

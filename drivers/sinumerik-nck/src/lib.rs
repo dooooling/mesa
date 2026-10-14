@@ -89,9 +89,12 @@ impl Driver for SinumerikNckDriver {
             },
             connection: SchemaDescriptor {
                 fields: vec![
-                    FieldDescriptor::new("host", "Host", FieldType::Host)
-                        .required(true)
-                        .default_value(serde_json::json!("192.168.0.1")),
+                    {
+                        let mut f =
+                            FieldDescriptor::new("host", "Host", FieldType::Host).required(true);
+                        f.ui.placeholder = Some("输入控制器 IP 或主机名".into());
+                        f
+                    },
                     FieldDescriptor::new("port", "Port", FieldType::Port)
                         .required(false)
                         .default_value(serde_json::json!(102)),
@@ -128,9 +131,16 @@ impl Driver for SinumerikNckDriver {
                         f.ui.placeholder = Some("如 0x0102 或 258".into());
                         f
                     },
-                    FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
-                        .required(false)
-                        .default_value(serde_json::json!(5000)),
+                    {
+                        // C1 §6.2：Descriptor 与 Driver Parser 同一套范围。
+                        let mut f =
+                            FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
+                                .required(false)
+                                .default_value(serde_json::json!(5000));
+                        f.validation.min = Some(mesa_core_types::CONNECTION_TIMEOUT_MIN_MS as f64);
+                        f.validation.max = Some(mesa_core_types::CONNECTION_TIMEOUT_MAX_MS as f64);
+                        f
+                    },
                     FieldDescriptor::new("pdu_length", "PDU length", FieldType::Integer)
                         .required(false)
                         .default_value(serde_json::json!(480)),

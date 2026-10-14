@@ -102,66 +102,15 @@ fn idempotency_key(headers: &HeaderMap, body: &BootstrapRequest) -> Option<Strin
 
 /// 启动 side effect（`start_endpoint` 的核心逻辑抽出：DB 已落库后执行）。
 /// 失败返回 message（调用方补偿删除并报告）。
+///
+/// C1 P0：连接构造（Descriptor / Secret 物化 / 任务门禁）**不得**在本文件里
+/// 再实现一遍——它与 REST Start、Mesad 开机恢复共用
+/// [`super::runtime::build_runtime_endpoint`]，否则三条入口的 Secret 语义会
+/// 再次分叉。
 async fn start_created_endpoint(state: &AppState, endpoint_id: &str) -> Result<(), String> {
-    let rec = match state.store.get_endpoint(endpoint_id) {
-        Ok(Some(r)) => r,
-        Ok(None) => return Err(format!("endpoint `{endpoint_id}` 不存在（事务后丢失）")),
-        Err(e) => return Err(e.to_string()),
-    };
-    let tasks = state
-        .store
-        .list_tasks(endpoint_id)
+    let cfg = super::runtime::build_runtime_endpoint(state, endpoint_id)
+        .await
         .map_err(|e| e.to_string())?;
-    if let Err((_, j)) = super::gate_data_tasks(state, endpoint_id, &tasks).await {
-        return Err(j
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .unwrap_or("任务校验失败")
-            .to_string());
-    }
-    // Secret 还原（与 start_endpoint 同逻辑）
-    let mut materialized_json = rec.connection_json.clone();
-    match state.manager.get_descriptor(&rec.driver_id).await {
-        Ok(desc) => {
-            let secret_keys = secret_field_keys(&desc.connection);
-            if !secret_keys.is_empty() {
-                match super::materialize_connection(
-                    &rec.connection_json,
-                    &rec.id,
-                    &state.store,
-                    &secret_keys,
-                ) {
-                    Ok(s) => materialized_json = s,
-                    Err(e) => return Err(e.to_string()),
-                }
-            }
-        }
-        Err(e) => {
-            if rec.connection_json.contains("secret_set") {
-                return Err(e.message);
-            }
-        }
-    }
-    let event_tasks = state
-        .store
-        .list_event_tasks(endpoint_id)
-        .map_err(|e| e.to_string())?;
-    if let Err((_, j)) = super::gate_event_tasks(state, endpoint_id, &event_tasks).await {
-        return Err(j
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .unwrap_or("事件任务校验失败")
-            .to_string());
-    }
-    let cfg = mesa_driver_manager::endpoint::BuiltinEndpoint {
-        endpoint_id: rec.id.clone(),
-        driver_id: rec.driver_id.clone(),
-        connection_json: materialized_json,
-        tasks,
-        event_tasks,
-    };
     state.manager.start_endpoint(cfg)?;
     // 期望态落盘失败不翻转 start 成功（驱动已在运行，DB 期望态下次对账可纠）；
     // 但必须记日志，否则重启恢复时该 endpoint 不会被自动拉起，静默丢运行态。

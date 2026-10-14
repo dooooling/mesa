@@ -17,7 +17,8 @@ pub use capability::{
     WriteTarget, gate_command_against, gate_command_result_against, gate_write_against,
 };
 pub use descriptor::{
-    DESCRIPTOR_CONTRACT_MAJOR, DESCRIPTOR_CONTRACT_MINOR, DriverDescriptor, DriverIdentity,
+    CONNECTION_TIMEOUT_MAX_MS, CONNECTION_TIMEOUT_MIN_MS, DESCRIPTOR_CONTRACT_MAJOR,
+    DESCRIPTOR_CONTRACT_MINOR, DriverDescriptor, DriverIdentity,
 };
 pub use event::{
     ConditionTransition, EVENT_ATTRIBUTES_MAX_FIELDS, EVENT_BATCH_MAX_BYTES,

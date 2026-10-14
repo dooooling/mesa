@@ -104,9 +104,16 @@ impl Driver for OpcUaDriver {
             },
             connection: SchemaDescriptor {
                 fields: vec![
-                    FieldDescriptor::new("endpoint_url", "Endpoint URL", FieldType::Url)
-                        .required(true)
-                        .default_value(serde_json::json!("opc.tcp://127.0.0.1:4840")),
+                    // C1 §4：URL 必须显式给出，不提供有效默认目标
+                    //（删除原 opc.tcp://127.0.0.1:4840 默认值，避免误连本机）。
+                    {
+                        let mut f =
+                            FieldDescriptor::new("endpoint_url", "Endpoint URL", FieldType::Url)
+                                .required(true);
+                        f.ui.placeholder =
+                            Some("如 opc.tcp://192.0.2.10:4840（示例，需按现场填写）".into());
+                        f
+                    },
                     {
                         let mut f = FieldDescriptor::new(
                             "security_policy",
@@ -136,9 +143,16 @@ impl Driver for OpcUaDriver {
                     },
                     FieldDescriptor::new("username", "Username", FieldType::String).required(false),
                     FieldDescriptor::new("password", "Password", FieldType::Secret).required(false),
-                    FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
-                        .required(false)
-                        .default_value(serde_json::json!(5000)),
+                    {
+                        // C1 §6.2：Descriptor 与 Driver Parser 同一套范围。
+                        let mut f =
+                            FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
+                                .required(false)
+                                .default_value(serde_json::json!(5000));
+                        f.validation.min = Some(mesa_core_types::CONNECTION_TIMEOUT_MIN_MS as f64);
+                        f.validation.max = Some(mesa_core_types::CONNECTION_TIMEOUT_MAX_MS as f64);
+                        f
+                    },
                     FieldDescriptor::new("use_native", "Use Native Client", FieldType::Boolean)
                         .required(false)
                         .default_value(serde_json::json!(true)),
@@ -215,10 +229,9 @@ impl Driver for OpcUaDriver {
             SdkDriverError::configuration("BAD_CONFIG", format!("connection JSON 非法: {e}"))
         })?;
         let cfg = OpcUaConnConfig::from_json(&v)?;
-        let use_native = v
-            .get("use_native")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(true);
+        // C1：use_native 由 `OpcUaConnConfig::from_json` 统一严格解析，
+        // 不再在此重复读取并 `unwrap_or(true)`（那会把非法类型静默当默认）。
+        let use_native = cfg.use_native;
         if !use_native && std::env::var("MESA_ALLOW_FAKE_NATIVE").ok().as_deref() != Some("1") {
             return Err(SdkDriverError::configuration(
                 "BAD_CONFIG",
@@ -266,6 +279,17 @@ impl Driver for OpcUaDriver {
 // 连接配置
 // ---------------------------------------------------------------------------
 
+/// Secret marker 形状判定（`{"secret_set": true}`）。
+///
+/// 为什么驱动需要认识它：marker 只能由 Core 的 Secret 物化路径解析成明文，
+/// 一旦原样传到 Driver，说明启动/恢复链路漏了物化。此处识别它是为了给出
+/// **明确的 fail-closed 诊断**，而不是把它当字符串密码或静默降级为匿名连接。
+fn is_secret_marker_shape(v: &serde_json::Value) -> bool {
+    v.as_object()
+        .map(|m| m.get("secret_set") == Some(&serde_json::Value::Bool(true)))
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone)]
 struct OpcUaConnConfig {
     endpoint_url: String,
@@ -276,17 +300,23 @@ struct OpcUaConnConfig {
     security_mode: String,
     username: Option<String>,
     password: Option<String>,
+    /// 是否使用 Native 客户端（C1：由本解析器统一严格校验，
+    /// 不再在 `open_connection` 里用 `unwrap_or(true)` 静默兜底）。
+    use_native: bool,
 }
 
 impl Default for OpcUaConnConfig {
     fn default() -> Self {
         Self {
+            // NOTE: 该默认值仅供测试夹具构造，**不是**可接受的连接目标：
+            // `from_json` 要求显式 `endpoint_url`，绝不回落到本机回环。
             endpoint_url: "opc.tcp://127.0.0.1:4840".into(),
             timeout_ms: 5000,
             security_policy: "None".into(),
             security_mode: "None".into(),
             username: None,
             password: None,
+            use_native: true,
         }
     }
 }
@@ -314,39 +344,109 @@ impl OpcUaConnConfig {
         }
     }
 
+    /// 从 JSON 解析连接参数（C1 §6.2「缺席 vs 存在但非法」契约）。
+    ///
+    /// 兼容别名（有明确定义的 legacy 形态）：
+    /// `endpoint_url` / `endpoint` / `url` / `host`+`port`；`timeout` = `timeout_ms`。
+    /// 规则：
+    /// - 主字段**缺席**时才允许读取别名；
+    /// - 主字段存在但类型非法 → 直接 `BAD_CONFIG`，**不得**退回别名或默认 URL；
+    /// - 多个等价字段同时存在且取值冲突 → 拒绝（不做无说明的任选）；
+    /// - `endpoint_url` 必须显式给出，绝不回落 `opc.tcp://127.0.0.1:4840`；
+    /// - 端口先判范围再窄化，禁止 `as u16` 截断。
     fn from_json(v: &serde_json::Value) -> Result<Self, SdkDriverError> {
-        // 兼容多种写法：endpoint_url / endpoint / url / host+port
-        let endpoint_url = if let Some(s) = v
-            .get("endpoint_url")
-            .or_else(|| v.get("endpoint"))
-            .or_else(|| v.get("url"))
-            .and_then(|x| x.as_str())
-        {
-            s.to_string()
-        } else if let Some(host) = v.get("host").and_then(|x| x.as_str()) {
-            let port = v
-                .get("port")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(DEFAULT_OPCUA_PORT as u64) as u16;
-            format!("opc.tcp://{host}:{port}")
-        } else {
-            "opc.tcp://127.0.0.1:4840".to_string()
+        fn bad(message: impl Into<String>) -> SdkDriverError {
+            SdkDriverError::configuration("BAD_CONFIG", message)
+        }
+        let object = v.as_object().ok_or_else(|| bad("connection 需为对象"))?;
+
+        // ---- endpoint_url（别名 endpoint / url / host+port）----
+        let mut url_candidates: Vec<(&str, String)> = Vec::new();
+        for key in ["endpoint_url", "endpoint", "url"] {
+            if let Some(value) = object.get(key) {
+                let s = value
+                    .as_str()
+                    .ok_or_else(|| bad(format!("{key} 必须为字符串")))?;
+                url_candidates.push((key, s.to_string()));
+            }
+        }
+        // host+port 形态：host 存在但类型非法同样拒绝（不静默当作缺失）。
+        if let Some(value) = object.get("host") {
+            let host = value
+                .as_str()
+                .ok_or_else(|| bad("host 必须为字符串"))?
+                .trim();
+            if host.is_empty() {
+                return Err(bad("host 不能为空"));
+            }
+            let port = match object.get("port") {
+                None => DEFAULT_OPCUA_PORT as u64,
+                Some(p) => {
+                    let n = p
+                        .as_u64()
+                        .ok_or_else(|| bad("port 必须为 1..=65535 的整数"))?;
+                    if !(1..=65535).contains(&n) {
+                        return Err(bad(format!("port {n} 非法，需 1..=65535")));
+                    }
+                    n
+                }
+            };
+            url_candidates.push(("host+port", format!("opc.tcp://{host}:{port}")));
+        }
+        // 冲突检测：同一语义给出多个不同取值时拒绝，而不是任选其一。
+        let endpoint_url = match url_candidates.first() {
+            None => {
+                return Err(bad(
+                    "endpoint_url 必填（不从默认目标 opc.tcp://127.0.0.1:4840 隐式连接）",
+                ));
+            }
+            Some((_, first)) => {
+                if let Some((key, other)) = url_candidates.iter().skip(1).find(|(_, u)| u != first)
+                {
+                    return Err(bad(format!(
+                        "连接目标字段冲突：`{key}`=`{other}` 与首字段取值不一致，拒绝隐式任选"
+                    )));
+                }
+                first.clone()
+            }
         };
-        let timeout_ms = v
-            .get("timeout_ms")
-            .or_else(|| v.get("timeout"))
-            .and_then(|x| x.as_u64())
-            .unwrap_or(5000);
-        let security_policy = v
-            .get("security_policy")
-            .and_then(|x| x.as_str())
-            .unwrap_or("None")
-            .to_string();
-        let security_mode = v
-            .get("security_mode")
-            .and_then(|x| x.as_str())
-            .unwrap_or("None")
-            .to_string();
+
+        // ---- timeout_ms（别名 timeout）----
+        let timeout_ms = match (object.get("timeout_ms"), object.get("timeout")) {
+            (None, None) => 5000u64,
+            (Some(value), None) => value
+                .as_u64()
+                .ok_or_else(|| bad("timeout_ms 必须为非负整数"))?,
+            (None, Some(value)) => value
+                .as_u64()
+                .ok_or_else(|| bad("timeout 必须为非负整数"))?,
+            (Some(m), Some(a)) => {
+                let mv = m.as_u64().ok_or_else(|| bad("timeout_ms 必须为非负整数"))?;
+                let av = a.as_u64().ok_or_else(|| bad("timeout 必须为非负整数"))?;
+                if mv != av {
+                    return Err(bad(format!(
+                        "timeout_ms 与别名 timeout 同时存在但取值冲突（{mv} vs {av}），拒绝隐式任选"
+                    )));
+                }
+                mv
+            }
+        };
+
+        // ---- 枚举字段：存在但类型非法即拒绝，不静默当默认 ----
+        let security_policy = match object.get("security_policy") {
+            None => "None".to_string(),
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| bad("security_policy 必须为字符串"))?
+                .to_string(),
+        };
+        let security_mode = match object.get("security_mode") {
+            None => "None".to_string(),
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| bad("security_mode 必须为字符串"))?
+                .to_string(),
+        };
         if endpoint_url.trim().is_empty() {
             return Err(SdkDriverError::configuration(
                 "BAD_CONFIG",
@@ -359,10 +459,22 @@ impl OpcUaConnConfig {
                 format!("endpoint_url `{endpoint_url}` 非法，需 opc.tcp://host:port"),
             ));
         }
-        if timeout_ms == 0 {
+        if timeout_ms < mesa_core_types::CONNECTION_TIMEOUT_MIN_MS {
             return Err(SdkDriverError::configuration(
                 "BAD_CONFIG",
-                "timeout_ms 需 >0",
+                format!(
+                    "timeout_ms {timeout_ms} 非法，最小值为 {}",
+                    mesa_core_types::CONNECTION_TIMEOUT_MIN_MS
+                ),
+            ));
+        }
+        if timeout_ms > mesa_core_types::CONNECTION_TIMEOUT_MAX_MS {
+            return Err(SdkDriverError::configuration(
+                "BAD_CONFIG",
+                format!(
+                    "timeout_ms {timeout_ms} 超出支持上限 {}（Probe 分阶段预算按该值推导）",
+                    mesa_core_types::CONNECTION_TIMEOUT_MAX_MS
+                ),
             ));
         }
         // 校验 SecurityPolicy
@@ -393,14 +505,33 @@ impl OpcUaConnConfig {
                 ),
             ));
         }
-        let username = v
-            .get("username")
-            .and_then(|x| x.as_str())
-            .map(|s| s.to_string());
-        let password = v
-            .get("password")
-            .and_then(|x| x.as_str())
-            .map(|s| s.to_string());
+        // ---- 凭据：类型非法即拒绝；Secret marker 明确报错（不得当密码用） ----
+        let username = match object.get("username") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| bad("username 必须为字符串"))?
+                    .to_string(),
+            ),
+        };
+        let password = match object.get("password") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => {
+                if value.is_string() {
+                    Some(value.as_str().unwrap_or_default().to_string())
+                } else if crate::is_secret_marker_shape(value) {
+                    // P0 诊断：marker 只能由 Core 的 Secret 物化路径解析，
+                    // 传到 Driver 说明恢复/启动链路漏了物化。明确 fail-closed，
+                    // 绝不把 marker 当密码、也不静默降级为匿名连接。
+                    return Err(bad(
+                        "password 收到 Secret marker 而非明文：调用方必须先经 Secret 物化（缺 Secret 时 fail-closed），驱动不接受 marker",
+                    ));
+                } else {
+                    return Err(bad("password 必须为字符串"));
+                }
+            }
+        };
         // 部分凭据必须拒绝而非静默 Anonymous
         match (&username, &password) {
             (Some(_), None) | (None, Some(_)) => {
@@ -411,6 +542,13 @@ impl OpcUaConnConfig {
             }
             _ => {}
         }
+        // use_native：存在但类型非法即拒绝（此前 `unwrap_or(true)` 会静默当默认）。
+        let use_native = match object.get("use_native") {
+            None => true,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| bad("use_native 必须为布尔值"))?,
+        };
         // 禁止生产默认忽略校验：若 policy/mode 为 None 则 trust_server_certs 需显式，但此处仅校验，实际连接由证书目录决定
         Ok(Self {
             endpoint_url,
@@ -419,6 +557,7 @@ impl OpcUaConnConfig {
             security_mode,
             username,
             password,
+            use_native,
         })
     }
 }
@@ -1412,6 +1551,210 @@ mod tests {
     use super::*;
     use mesa_core_types::{AcquisitionTask, DriverBinding};
 
+    // -----------------------------------------------------------------------
+    // C1 §6.2 / P0：连接字段「缺席 vs 存在但非法」+ Secret marker 诊断
+    // -----------------------------------------------------------------------
+
+    /// endpoint_url 必填：缺席/类型非法/空一律拒绝，绝不回落本机回环默认值。
+    #[test]
+    fn endpoint_url_is_explicit_and_never_defaults_to_loopback() {
+        assert_eq!(
+            OpcUaConnConfig::from_json(&serde_json::json!({}))
+                .unwrap_err()
+                .code,
+            "BAD_CONFIG",
+            "缺 endpoint_url 必须拒绝（不得连 opc.tcp://127.0.0.1:4840）"
+        );
+        for bad in [
+            serde_json::json!(123),
+            serde_json::json!(true),
+            serde_json::json!(null),
+            serde_json::json!(""),
+            serde_json::json!("   "),
+            serde_json::json!("http://host:4840"),
+        ] {
+            assert_eq!(
+                OpcUaConnConfig::from_json(&serde_json::json!({"endpoint_url": bad}))
+                    .unwrap_err()
+                    .code,
+                "BAD_CONFIG",
+                "endpoint_url={bad} 必须拒绝"
+            );
+        }
+    }
+
+    /// 等价目标字段冲突必须拒绝，而不是任选其一。
+    #[test]
+    fn conflicting_target_fields_are_rejected() {
+        assert_eq!(
+            OpcUaConnConfig::from_json(&serde_json::json!({
+                "endpoint_url": "opc.tcp://a:4840",
+                "endpoint": "opc.tcp://b:4840",
+            }))
+            .unwrap_err()
+            .code,
+            "BAD_CONFIG"
+        );
+        // host+port 与 endpoint_url 冲突同样拒绝。
+        assert_eq!(
+            OpcUaConnConfig::from_json(&serde_json::json!({
+                "endpoint_url": "opc.tcp://a:4840",
+                "host": "b",
+                "port": 4840,
+            }))
+            .unwrap_err()
+            .code,
+            "BAD_CONFIG"
+        );
+        // 取值一致 → 接受。
+        assert!(
+            OpcUaConnConfig::from_json(&serde_json::json!({
+                "endpoint_url": "opc.tcp://a:4840",
+                "endpoint": "opc.tcp://a:4840",
+            }))
+            .is_ok()
+        );
+    }
+
+    /// 端口先判范围再窄化；类型非法一律拒绝。
+    #[test]
+    fn host_port_form_validates_port_before_narrowing() {
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(70000),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("4840"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ] {
+            assert!(
+                OpcUaConnConfig::from_json(&serde_json::json!({"host": "a", "port": bad})).is_err(),
+                "port={bad} 必须拒绝"
+            );
+        }
+        let cfg =
+            OpcUaConnConfig::from_json(&serde_json::json!({"host": "a", "port": 4840})).unwrap();
+        assert_eq!(cfg.endpoint_url, "opc.tcp://a:4840");
+    }
+
+    /// Secret marker 传到 Driver 必须 fail-closed 并给出明确诊断，
+    /// 绝不当作密码、也不静默降级为匿名连接（C1 P0）。
+    #[test]
+    fn secret_marker_reaching_driver_is_fail_closed_with_diagnosis() {
+        let err = OpcUaConnConfig::from_json(&serde_json::json!({
+            "endpoint_url": "opc.tcp://a:4840",
+            "username": "u",
+            "password": {"secret_set": true},
+        }))
+        .unwrap_err();
+        assert_eq!(err.code, "BAD_CONFIG");
+        assert!(
+            err.message.contains("Secret marker"),
+            "错误消息必须指明 marker 未物化，实际: {}",
+            err.message
+        );
+        // 只有 marker、没有 username 时同样不能匿名降级。
+        assert_eq!(
+            OpcUaConnConfig::from_json(&serde_json::json!({
+                "endpoint_url": "opc.tcp://a:4840",
+                "password": {"secret_set": true},
+            }))
+            .unwrap_err()
+            .code,
+            "BAD_CONFIG"
+        );
+    }
+
+    /// 凭据类型非法 / use_native 类型非法一律拒绝（不静默用默认值）。
+    #[test]
+    fn ill_typed_credential_and_use_native_are_rejected() {
+        for bad in [
+            serde_json::json!(123),
+            serde_json::json!(true),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                OpcUaConnConfig::from_json(&serde_json::json!({
+                    "endpoint_url": "opc.tcp://a:4840",
+                    "password": bad,
+                }))
+                .is_err(),
+                "password={bad} 必须拒绝"
+            );
+        }
+        assert!(
+            OpcUaConnConfig::from_json(&serde_json::json!({
+                "endpoint_url": "opc.tcp://a:4840",
+                "use_native": "yes",
+            }))
+            .is_err()
+        );
+        // 枚举字段类型非法同样拒绝。
+        assert!(
+            OpcUaConnConfig::from_json(&serde_json::json!({
+                "endpoint_url": "opc.tcp://a:4840",
+                "security_policy": 7,
+            }))
+            .is_err()
+        );
+    }
+
+    /// timeout 范围与 Descriptor 同源，超限在网络前拒绝。
+    #[test]
+    fn timeout_bounds_match_descriptor() {
+        use mesa_driver_sdk::Driver;
+        let with = |t: serde_json::Value| {
+            OpcUaConnConfig::from_json(
+                &serde_json::json!({"endpoint_url": "opc.tcp://a:4840", "timeout_ms": t}),
+            )
+        };
+        assert!(
+            with(serde_json::json!(
+                mesa_core_types::CONNECTION_TIMEOUT_MIN_MS - 1
+            ))
+            .is_err()
+        );
+        assert!(
+            with(serde_json::json!(
+                mesa_core_types::CONNECTION_TIMEOUT_MAX_MS + 1
+            ))
+            .is_err()
+        );
+        assert!(
+            with(serde_json::json!(
+                mesa_core_types::CONNECTION_TIMEOUT_MAX_MS
+            ))
+            .is_ok()
+        );
+        let desc = OpcUaDriver.descriptor();
+        let f = desc
+            .connection
+            .fields
+            .iter()
+            .find(|f| f.key == "timeout_ms")
+            .expect("Descriptor 必须有 timeout_ms");
+        assert_eq!(
+            f.validation.min,
+            Some(mesa_core_types::CONNECTION_TIMEOUT_MIN_MS as f64)
+        );
+        assert_eq!(
+            f.validation.max,
+            Some(mesa_core_types::CONNECTION_TIMEOUT_MAX_MS as f64)
+        );
+        let url = desc
+            .connection
+            .fields
+            .iter()
+            .find(|f| f.key == "endpoint_url")
+            .expect("Descriptor 必须有 endpoint_url");
+        assert!(url.required);
+        assert_eq!(
+            url.default, None,
+            "endpoint_url 不得有有效默认目标（C1 §4 硬要求）"
+        );
+    }
+
     fn generic_task(selections: serde_json::Value) -> AcquisitionTask {
         AcquisitionTask {
             id: "t1".into(),
@@ -1448,8 +1791,9 @@ mod tests {
     }
 
     async fn test_conn() -> Box<dyn DriverConnection> {
+        // C1 后 endpoint_url 必填：测试夹具显式给目标（不再依赖默认回环值）。
         OpcUaDriver
-            .open_connection("ep1", "{}")
+            .open_connection("ep1", r#"{"endpoint_url":"opc.tcp://127.0.0.1:4840"}"#)
             .await
             .expect("open")
     }

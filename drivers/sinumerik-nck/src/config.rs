@@ -45,7 +45,7 @@ pub struct NckConnConfig {
 impl Default for NckConnConfig {
     fn default() -> Self {
         Self {
-            host: "192.168.0.1".into(),
+            host: String::new(),
             port: NCK_DEFAULT_PORT,
             // NOTE: family 无默认值（显式必填，from_json 拒绝缺失）；
             // TSAP 默认值待真机 Gate 冻结（ADR 0001 §7），生产配置必须显式填写。
@@ -83,11 +83,19 @@ impl NckConnConfig {
                 format!("不支持的连接字段 `{key}`"),
             ));
         }
-        if let Some(h) = v.get("host").and_then(|x| x.as_str()) {
-            cfg.host = h.to_string();
-        }
-        if let Some(p) = v.get("port").and_then(|x| x.as_u64()) {
-            if p == 0 || p > 65535 {
+        cfg.host = object
+            .get("host")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                SdkDriverError::configuration("BAD_CONFIG", "host 必填且必须为非空字符串")
+            })?
+            .to_string();
+        if let Some(value) = object.get("port") {
+            let p = value.as_u64().ok_or_else(|| {
+                SdkDriverError::configuration("BAD_CONFIG", "port 必须为 1..=65535 的整数")
+            })?;
+            if !(1..=65535).contains(&p) {
                 return Err(SdkDriverError::configuration(
                     "BAD_CONFIG",
                     format!("port {p} 非法，需 1..=65535"),
@@ -135,32 +143,54 @@ impl NckConnConfig {
         let remote = parse_tsap(v, "remote_tsap")?;
         cfg.local_tsap = local;
         cfg.remote_tsap = remote;
-        if let Some(t) = v.get("timeout_ms").and_then(|x| x.as_u64()) {
-            cfg.timeout_ms = t.max(NCK_MIN_TIMEOUT_MS);
+        if let Some(value) = object.get("timeout_ms") {
+            let t = value.as_u64().ok_or_else(|| {
+                SdkDriverError::configuration("BAD_CONFIG", "timeout_ms 必须为非负整数")
+            })?;
+            if t < NCK_MIN_TIMEOUT_MS {
+                return Err(SdkDriverError::configuration(
+                    "BAD_CONFIG",
+                    format!("timeout_ms {t} 非法，最小值为 {NCK_MIN_TIMEOUT_MS}"),
+                ));
+            }
+            // 上限与 Descriptor 的 validation.max 同源（C1 §6.2）：超限在
+            // 访问网络之前拒绝，而不是被 Probe 外层预算静默截断。
+            if t > mesa_core_types::CONNECTION_TIMEOUT_MAX_MS {
+                return Err(SdkDriverError::configuration(
+                    "BAD_CONFIG",
+                    format!(
+                        "timeout_ms {t} 超出支持上限 {}（Probe 分阶段预算按该值推导）",
+                        mesa_core_types::CONNECTION_TIMEOUT_MAX_MS
+                    ),
+                ));
+            }
+            cfg.timeout_ms = t;
         }
-        if let Some(pdu) = v.get("pdu_length").and_then(|x| x.as_u64()) {
+        if let Some(value) = object.get("pdu_length") {
+            let pdu = value.as_u64().ok_or_else(|| {
+                SdkDriverError::configuration("BAD_CONFIG", "pdu_length 必须为整数")
+            })?;
             cfg.pdu_length_set(pdu)?;
         }
         // family：显式必填（common + 单 family 装载，无静默默认系列）。
-        let family = v
-            .get("family")
-            .and_then(|x| x.as_str())
+        let family_value = object.get("family").ok_or_else(|| {
+            SdkDriverError::configuration("BAD_CONFIG", "family 必填（如 840d-sl/828d）")
+        })?;
+        let family = family_value
+            .as_str()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
-                SdkDriverError::configuration("BAD_CONFIG", "family 必填（如 840d-sl/828d）")
+                SdkDriverError::configuration("BAD_CONFIG", "family 必须为非空字符串")
             })?;
         cfg.family = family.to_string();
-        if let Some(value) = v.get("max_read_items") {
+        if let Some(value) = object.get("max_read_items") {
             cfg.max_read_items = value
                 .as_u64()
                 .filter(|n| (1..=mesa_s7_transport::S7_MAX_ITEMS_PER_PDU as u64).contains(n))
                 .ok_or_else(|| {
                     SdkDriverError::configuration("BAD_CONFIG", "max_read_items需为1..=19的整数")
                 })? as usize;
-        }
-        if cfg.host.trim().is_empty() {
-            return Err(SdkDriverError::configuration("BAD_CONFIG", "host 不能为空"));
         }
         Ok(cfg)
     }
@@ -236,13 +266,99 @@ mod tests {
 
     #[test]
     fn timeout_floor_and_pdu_range() {
-        let c = cfg(
-            serde_json::json!({"host": "h", "family": "f", "local_tsap": 1, "remote_tsap": 1, "timeout_ms": 10}),
-        )
-        .unwrap();
-        assert_eq!(c.timeout_ms, NCK_MIN_TIMEOUT_MS);
+        let base =
+            serde_json::json!({"host": "h", "family": "f", "local_tsap": 1, "remote_tsap": 1});
+        // 缺席 → 驱动默认；恰好等于下限 → 通过。
+        assert_eq!(
+            cfg(base.clone()).unwrap().timeout_ms,
+            NCK_DEFAULT_TIMEOUT_MS
+        );
+        let mut at_floor = base.clone();
+        at_floor["timeout_ms"] = serde_json::json!(NCK_MIN_TIMEOUT_MS);
+        assert_eq!(cfg(at_floor).unwrap().timeout_ms, NCK_MIN_TIMEOUT_MS);
+        // 存在但非法（过小/字符串/布尔/null）一律拒绝，不得静默回落默认值。
+        for bad in [
+            serde_json::json!(10),
+            serde_json::json!("5000"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ] {
+            let mut invalid = base.clone();
+            invalid["timeout_ms"] = bad.clone();
+            assert_eq!(
+                cfg(invalid).unwrap_err().code,
+                "BAD_CONFIG",
+                "timeout_ms={bad} 必须拒绝"
+            );
+        }
         assert!(cfg(serde_json::json!({"host": "h", "family": "f", "local_tsap": 1, "remote_tsap": 1, "pdu_length": 100})).is_err());
         assert!(cfg(serde_json::json!({"host": "h", "family": "f", "local_tsap": 1, "remote_tsap": 1, "pdu_length": 960})).is_ok());
+    }
+
+    /// C1 §6.2：字段「缺席」与「存在但类型非法」必须区分。
+    /// Host 缺席或类型非法一律拒绝，绝不落回内置默认目标。
+    #[test]
+    fn host_must_be_explicit_and_well_typed() {
+        let tsap = serde_json::json!({"local_tsap": 256, "remote_tsap": 258});
+        let with = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({"family": "828d"});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v
+        };
+        // 缺席 → 拒绝（无隐式默认目标）。
+        assert_eq!(cfg(with(tsap.clone())).unwrap_err().code, "BAD_CONFIG");
+        // 存在但类型非法 → 拒绝。
+        for bad in [
+            serde_json::json!(123),
+            serde_json::json!(true),
+            serde_json::json!(null),
+            serde_json::json!([1]),
+        ] {
+            let mut v = tsap.clone();
+            v["host"] = bad.clone();
+            assert_eq!(
+                cfg(with(v)).unwrap_err().code,
+                "BAD_CONFIG",
+                "host={bad} 必须拒绝"
+            );
+        }
+        // 空/纯空白 → 拒绝。
+        for bad in [serde_json::json!(""), serde_json::json!("   ")] {
+            let mut v = tsap.clone();
+            v["host"] = bad.clone();
+            assert_eq!(cfg(with(v)).unwrap_err().code, "BAD_CONFIG", "host={bad}");
+        }
+        // port 存在但类型非法 → 拒绝（此前会被静默忽略并回落 102）。
+        for bad in [
+            serde_json::json!("102"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+            serde_json::json!(1.5),
+        ] {
+            let mut v = tsap.clone();
+            v["host"] = serde_json::json!("10.0.0.5");
+            v["port"] = bad.clone();
+            assert_eq!(
+                cfg(with(v)).unwrap_err().code,
+                "BAD_CONFIG",
+                "port={bad} 必须拒绝"
+            );
+        }
+        // family 存在但类型非法 → 拒绝（此前会被当作缺失）。
+        let mut v = tsap.clone();
+        v["host"] = serde_json::json!("10.0.0.5");
+        let mut with_bad_family = v.clone();
+        with_bad_family["family"] = serde_json::json!(828);
+        assert_eq!(
+            cfg(with_bad_family).unwrap_err().code,
+            "BAD_CONFIG",
+            "family 类型非法必须拒绝"
+        );
+        // 合法显式 Host 仍通过（不回归）。
+        v["host"] = serde_json::json!("10.0.0.5");
+        assert_eq!(cfg(with(v)).unwrap().host, "10.0.0.5");
     }
 
     #[test]

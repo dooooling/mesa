@@ -126,7 +126,14 @@ async fn main() {
     }
 
     // ---- 恢复期望运行的 Endpoint（已保证 PKI/证书就绪，避免 Secure Endpoint 竞态）----
-    let stored_eps = store.list_endpoints().unwrap_or_default();
+    // 读取失败不得伪装成“空库”：否则所有 desired_running 端点会静默不恢复。
+    let stored_eps = match store.list_endpoints() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("读取 Endpoint 列表失败，跳过本次开机恢复: {e}");
+            Vec::new()
+        }
+    };
     if stored_eps.is_empty() {
         tracing::warn!("no endpoints in store; create one via REST POST /api/v1/endpoints");
     }
@@ -134,26 +141,18 @@ async fn main() {
         if !rec.desired_running {
             continue;
         }
-        let tasks = store.list_tasks(&rec.id).unwrap_or_default();
-        // PR7 v1.1 §13：Data 与 Event 任务一起恢复（空 = 老行为）。
-        // P0-2 fail-closed：事件配置读失败不得按 Data-only 启动该 Endpoint，
-        // 跳过并记录（下次重启/手动 Start 重试），禁止 silent downgrade。
-        let event_tasks = match store.list_event_tasks(&rec.id) {
-            Ok(v) => v,
+        // C1 P0：开机恢复必须与 REST Start / Bootstrap start 走**同一条**
+        // 运行期构造路径（Descriptor + Secret 物化 + Data/Event 任务门禁）。
+        // 此前这里直接传持久化的 `connection_json`，其中的 Secret 字段是
+        // `{"secret_set": true}` marker，会被当作密码交给 Driver：带认证的
+        // 连接重启后必然 BAD_CONFIG，而配置类失败是终态，端点永久 FAILED。
+        let cfg = match mesa_core_api::runtime::build_runtime_endpoint(&app_state, &rec.id).await {
+            Ok(cfg) => cfg,
             Err(e) => {
-                tracing::error!(
-                    endpoint = %rec.id,
-                    "skip restore: list_event_tasks failed: {e}"
-                );
+                // fail-closed：单个端点构造失败只跳过该端点，不影响其它端点。
+                tracing::error!(endpoint = %rec.id, "skip restore: {e}");
                 continue;
             }
-        };
-        let cfg = mesa_driver_manager::endpoint::BuiltinEndpoint {
-            endpoint_id: rec.id.clone(),
-            driver_id: rec.driver_id.clone(),
-            connection_json: rec.connection_json.clone(),
-            tasks,
-            event_tasks,
         };
         match manager.start_endpoint(cfg) {
             Ok(()) => tracing::info!(endpoint = %rec.id, "restored endpoint (desired=running)"),

@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 pub mod bootstrap;
 pub mod certificates;
+pub mod runtime;
 use certificates::CertStore;
 
 // ---------------------------------------------------------------------------
@@ -489,14 +490,24 @@ fn redact_connection_for_response(
     conn
 }
 
-/// 启动/探测时：将 marker 临时还原为明文（仅内存，不写盘）
+/// 启动/探测时：将 marker 临时还原为明文（仅内存，不写盘）。
+///
+/// fail-closed（C1 P0）：`connection_json` 必须是**合法 JSON 对象**。此前用
+/// `unwrap_or(json!({}))` 把解析失败悄悄变成空对象，等于把一份坏配置当成
+/// “没有连接参数”继续启动——既掩盖了存储损坏，也可能让 Driver 回落到自己的
+/// 默认连接目标。坏 JSON / 非对象一律明确失败。
 fn materialize_connection(
     conn_str: &str,
     endpoint_id: &str,
     store: &ConfigStore,
     secret_keys: &[String],
 ) -> Result<String, StoreError> {
-    let mut v: serde_json::Value = serde_json::from_str(conn_str).unwrap_or(serde_json::json!({}));
+    let mut v: serde_json::Value = serde_json::from_str(conn_str).map_err(StoreError::Json)?;
+    if !v.is_object() {
+        return Err(StoreError::Validation(format!(
+            "connection_json 必须是 JSON 对象（endpoint `{endpoint_id}`）"
+        )));
+    }
     if let Some(obj) = v.as_object_mut() {
         for key in secret_keys {
             if let Some(cur) = obj.get(key).cloned() {
@@ -697,7 +708,7 @@ async fn probe_driver(
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(json_error("PROBE_FAILED", &e.to_string())),
                 ),
-                ProbeError::RpcTimeout | ProbeError::Timeout => (
+                ProbeError::RpcTimeout | ProbeError::Timeout { .. } => (
                     StatusCode::GATEWAY_TIMEOUT,
                     Json(json_error("PROBE_TIMEOUT", &e.to_string())),
                 ),
@@ -736,32 +747,12 @@ async fn browse_endpoint(
     let filter = body.filter.unwrap_or_default();
     let cursor = body.cursor.unwrap_or_default();
     let limit = body.limit.unwrap_or(50).min(1000);
-    // Browse 同 Start 一样需 materialize Secret，避免把 marker 交给 Driver
-    let mut browse_conn = rec.connection_json.clone();
-    match state.manager.get_descriptor(&rec.driver_id).await {
-        Ok(desc) => {
-            let secret_keys = secret_field_keys(&desc.connection);
-            if !secret_keys.is_empty() {
-                match materialize_connection(
-                    &rec.connection_json,
-                    &rec.id,
-                    &state.store,
-                    &secret_keys,
-                ) {
-                    Ok(s) => browse_conn = s,
-                    Err(e) => return store_err_to_response(e),
-                }
-            }
-        }
-        Err(e) => {
-            if rec.connection_json.contains("secret_set") {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({ "error": { "code": e.code, "message": e.message } })),
-                );
-            }
-        }
-    }
+    // Browse 同 Start 一样需 materialize Secret，避免把 marker 交给 Driver。
+    // 复用运行期构造的同一物化语义（含坏 JSON / 缺 Secret 的 fail-closed）。
+    let browse_conn = match runtime::materialize_for_runtime(&state, &rec).await {
+        Ok(s) => s,
+        Err(e) => return (e.status, e.to_json()),
+    };
     match state
         .manager
         .browse(
@@ -2055,73 +2046,18 @@ async fn start_endpoint(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let rec = match state.store.get_endpoint(&id) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
-            );
-        }
-        Err(e) => return store_err_to_response(e),
-    };
     if state.manager.is_running(&id) {
         return (
             StatusCode::CONFLICT,
             Json(json_error("CONFLICT", "endpoint 已在运行")),
         );
     }
-    // 构造 BuiltinEndpoint
-    let tasks = match state.store.list_tasks(&id) {
-        Ok(v) => v,
-        Err(e) => return store_err_to_response(e),
-    };
-    // PR4 门禁：启动前同样过统一校验（存量脏配置在此拦截，不进 Runtime 碰运气）
-    if let Err(r) = gate_data_tasks(&state, &id, &tasks).await {
-        return r;
-    }
-    // Secret 集成：启动时临时还原明文（仅内存），fail-closed
-    let mut materialized_json = rec.connection_json.clone();
-    match state.manager.get_descriptor(&rec.driver_id).await {
-        Ok(desc) => {
-            let secret_keys = secret_field_keys(&desc.connection);
-            if !secret_keys.is_empty() {
-                match materialize_connection(
-                    &rec.connection_json,
-                    &rec.id,
-                    &state.store,
-                    &secret_keys,
-                ) {
-                    Ok(s) => materialized_json = s,
-                    Err(e) => return store_err_to_response(e),
-                }
-            }
-        }
-        Err(e) => {
-            // 若存储的 connection 包含 secret marker，则 Descriptor 不可用视为安全失败
-            if rec.connection_json.contains("secret_set") {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({ "error": { "code": e.code, "message": e.message } })),
-                );
-            }
-        }
-    }
-    // PR7 v1.1 §11：REST 启动同样带上已持久化的事件任务（与开机恢复一致）。
-    // P0-2 fail-closed：读取失败不得静默降级为 Data-only，直接返回存储错误。
-    let event_tasks = match state.store.list_event_tasks(&id) {
-        Ok(v) => v,
-        Err(e) => return store_err_to_response(e),
-    };
-    if let Err(r) = gate_event_tasks(&state, &id, &event_tasks).await {
-        return r;
-    }
-    let cfg = mesa_driver_manager::endpoint::BuiltinEndpoint {
-        endpoint_id: rec.id.clone(),
-        driver_id: rec.driver_id.clone(),
-        connection_json: materialized_json,
-        tasks,
-        event_tasks,
+    // C1 P0：运行期 Endpoint 只能经共享构造路径生成（REST Start、
+    // Bootstrap start、Mesad 开机恢复三者同源），否则重启恢复会把
+    // Secret marker 当密码交给 Driver。
+    let cfg = match runtime::build_runtime_endpoint(&state, &id).await {
+        Ok(cfg) => cfg,
+        Err(e) => return (e.status, e.to_json()),
     };
     match state.manager.start_endpoint(cfg) {
         Ok(()) => {
