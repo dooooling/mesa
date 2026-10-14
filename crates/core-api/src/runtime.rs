@@ -111,10 +111,29 @@ fn gate_error((status, Json(body)): (StatusCode, Json<serde_json::Value>)) -> Ru
 /// Descriptor 不可用时的处理是**有意保守**的：无法判断哪些字段是 Secret，
 /// 因此只要配置里出现 marker 就 fail-closed（`503`），而不是把 marker
 /// 当明文交给 Driver。
+///
+/// 无论是否存在 Secret 字段，配置都必须先是**合法 JSON 对象**：坏配置在
+/// Core 侧即被挡住（`INVALID_JSON`），避免把不可解析的文本交给 Driver，
+/// 也避免「配置损坏」被静默当作「没有连接参数」。Secret 读回失败
+/// （缺记录 / 密钥不匹配 / 密文损坏）同样原样上抛，绝不降级为匿名连接。
 pub(crate) async fn materialize_for_runtime(
     state: &AppState,
     rec: &EndpointRecord,
 ) -> Result<String, RuntimeBuildError> {
+    let parsed: serde_json::Value = serde_json::from_str(&rec.connection_json).map_err(|e| {
+        RuntimeBuildError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_JSON",
+            format!("endpoint `{}` 的 connection_json 非法: {e}", rec.id),
+        )
+    })?;
+    if !parsed.is_object() {
+        return Err(RuntimeBuildError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_JSON",
+            format!("endpoint `{}` 的 connection_json 必须是 JSON 对象", rec.id),
+        ));
+    }
     match state.manager.get_descriptor(&rec.driver_id).await {
         Ok(desc) => {
             let secret_keys = secret_field_keys(&desc.connection);
@@ -266,6 +285,41 @@ mod tests {
         assert_eq!(cfg.connection_json, conn);
         assert!(cfg.tasks.is_empty());
         assert!(cfg.event_tasks.is_empty());
+    }
+
+    /// A31 / 配置损坏（两层防线）：
+    /// (1) 写入侧：`create_endpoint` 拒绝非法/非对象的 `connection_json`，
+    ///     因此坏配置无法经正常 API 落库；
+    /// (2) 读取侧：运行期构造仍独立校验一次（纵深防御，覆盖直改 SQLite、
+    ///     未来迁移等旁路），失败码为 `INVALID_JSON`，绝不把不可解析文本
+    ///     交给 Driver，也不伪装成「没有连接参数」。
+    ///
+    /// 这里断言 (1)；(2) 的纯函数分支由 `malformed_connection_json_is_rejected`
+    /// 直接覆盖（经 API 不可达，属于防御性代码）。
+    #[test]
+    fn store_rejects_malformed_connection_json_at_write_time() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        store
+            .create_device(&DeviceRecord {
+                id: "dev-1".into(),
+                name: "dev".into(),
+            })
+            .unwrap();
+        for bad in ["{not json", "[1,2,3]", "\"just-a-string\"", "null", "42"] {
+            let r = store.create_endpoint(&mesa_config_store::EndpointRecord {
+                id: format!("ep-{bad}"),
+                name: "ep".into(),
+                device_id: "dev-1".into(),
+                driver_id: "opcua".into(),
+                connection_json: bad.to_string(),
+                desired_running: false,
+                updated_at_ns: 0,
+            });
+            assert!(
+                r.is_err(),
+                "connection_json={bad} 必须在写入侧被拒绝，实际 Ok"
+            );
+        }
     }
 
     /// 坏 JSON 不再被 `unwrap_or({})` 悄悄变成空对象。

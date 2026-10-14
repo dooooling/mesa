@@ -9,6 +9,7 @@ mod common;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mesa_driver_manager::manifest::DiscoveredDriver;
@@ -407,11 +408,163 @@ async fn manager_probe_timeout_cleans_hang_child() {
     .unwrap();
     let before = live_pids(&exe_name(&unique));
     let mgr = MesaManager::discover(&root);
-    let err = mgr.probe("hang", "{}").await.expect_err("挂起必须超时 Err");
+    // 显式给一个能推出较短 Query 预算的 timeout_ms（500 → Query=5s），
+    // 让「挂起 → RPC 超时」的判定保持在秒级而不是等满默认预算。
+    let err = mgr
+        .probe("hang", r#"{"timeout_ms":500}"#)
+        .await
+        .expect_err("挂起必须超时 Err");
     assert!(
         matches!(err, ProbeError::RpcTimeout),
-        "内层 10s RPC 超时应映射 RpcTimeout，实际: {err}"
+        "Probe RPC 超时应映射 RpcTimeout，实际: {err}"
     );
     assert_no_orphan(&before, &exe_name(&unique));
+    cleanup_dir(&root);
+}
+
+// ---------------------------------------------------------------------------
+// C1 §6.3：Probe 阶段预算（A22）与取消清理（A32）
+// ---------------------------------------------------------------------------
+
+/// 跨进程端口声明目录（与 `driver_manager::process::port_claim_dir` 同源）。
+///
+/// 该路径是驱动的端口租约唯一可外部观测的载体：spawn 时 `create_new` 建
+/// `port-<n>.lock`，`PortLease::drop` 时删除。因此「租约是否释放」可以在
+/// 测试进程里直接断言，不需要访问 manager 私有状态。
+fn claim_dir() -> PathBuf {
+    std::env::temp_dir().join("mesa-driver-ports")
+}
+
+/// 当前被认领的端口集合。
+fn claimed_ports() -> HashSet<u16> {
+    let mut set = HashSet::new();
+    let Ok(rd) = std::fs::read_dir(claim_dir()) else {
+        return set;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if let Some(rest) = name.strip_prefix("port-")
+            && let Some(num) = rest.strip_suffix(".lock")
+            && let Ok(p) = num.parse::<u16>()
+        {
+            set.insert(p);
+        }
+    }
+    set
+}
+
+/// 轮询等待「出现一个不在 `before` 中的存活 PID」。
+async fn wait_for_new_pid(before: &HashSet<u32>, name: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if live_pids(name).difference(before).next().is_some() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "等待子进程 {name} 启动超时");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// 轮询等待「出现一个不在 `before` 中的端口租约」，返回该端口。
+async fn wait_for_new_claim(before: &HashSet<u16>) -> u16 {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(p) = claimed_ports().difference(before).next().copied() {
+            return p;
+        }
+        assert!(Instant::now() < deadline, "等待端口租约出现超时");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A22：**慢但成功**的探测不得被管理面的固定预算提前掐断。
+///
+/// 用例刻意让 `probe()` 内部耗时 11s（> 旧的通用 `REQUEST_TIMEOUT` 10s 与
+/// 旧外层 12s），而 `timeout_ms=5000` 推出的 Query 预算为
+/// `4×5000+3000 = 23s`。旧实现必然在此失败；新实现必须真的等满延迟并返回可达。
+///
+/// NOTE: 这是**可控模拟**验证，不代替真机分阶段量测（A22 的实体设备部分
+/// 仍需在授权设备上单独执行并另行记录）。
+#[tokio::test]
+async fn slow_but_successful_probe_is_not_truncated_by_management_budget() {
+    let (root, unique) = stage_drivers_dir("slow", &test_driver_exe(), "pb-slow-guard");
+    let name = exe_name(&unique);
+    let before = live_pids(&name);
+    let mgr = MesaManager::discover(&root);
+
+    let started = Instant::now();
+    let report = mgr
+        .probe(
+            "test-driver",
+            r#"{"probe_delay_ms":11000,"timeout_ms":5000}"#,
+        )
+        .await
+        .expect("慢但合法的探测不得被 IPC/外层预算截断");
+    let elapsed = started.elapsed();
+
+    assert!(report.reachable, "延迟后仍应判定可达");
+    assert!(
+        elapsed >= Duration::from_millis(11_000),
+        "必须真的等满驱动侧延迟（证明没有被 10s IPC / 12s 外层截断），实际 {elapsed:?}"
+    );
+    assert_no_orphan(&before, &name);
+    cleanup_dir(&root);
+}
+
+/// A32：Probe future 被取消（等价 HTTP 客户端断开 / 服务端请求取消）后，
+/// **临时驱动子进程必须退出、端口租约必须释放**，随后再次 Probe 不受影响。
+///
+/// 与 `manager_probe_timeout_cleans_hang_child` 的区别：那条走的是「RPC 自己
+/// 超时后正常回收」，本条走的是「调用方直接 drop 掉整个 probe future」——
+/// 清理代码没有机会执行到尾部，只能依赖 `TempDriver`/`DriverProcess` 的 Drop
+/// 语义（`kill_on_drop` + `PortLease::drop`）。这正是 HTTP 层取消的真实形态。
+#[tokio::test]
+async fn cancelled_probe_releases_child_process_and_port_lease() {
+    let (root, unique) = stage_drivers_dir("cancel", &test_driver_exe(), "pb-cancel-guard");
+    let name = exe_name(&unique);
+    let before = live_pids(&name);
+    let claims_before = claimed_ports();
+    let mgr = Arc::new(MesaManager::discover(&root));
+
+    // 让驱动在 probe() 内停留足够久，以便我们在 RPC 进行中取消。
+    let probing = {
+        let m = Arc::clone(&mgr);
+        tokio::spawn(async move {
+            m.probe(
+                "test-driver",
+                r#"{"probe_delay_ms":30000,"timeout_ms":5000}"#,
+            )
+            .await
+        })
+    };
+    // 先确认临时子进程确实起来了，并抓到它认领的端口。
+    wait_for_new_pid(&before, &name).await;
+    let port = wait_for_new_claim(&claims_before).await;
+
+    // 取消：drop 整个 probe future。
+    probing.abort();
+    let _ = probing.await;
+
+    // 1) 子进程退出：唯一命名二进制的存活 PID 回落到基线。
+    assert_no_orphan(&before, &name);
+    // 2) 端口租约释放：声明文件被删除（否则该端口对本进程永久不可用）。
+    common::wait_until(15, || {
+        !claim_dir().join(format!("port-{port}.lock")).exists()
+    })
+    .await;
+    // 3) 该端口不再被监听 → 子进程的监听套接字确实已关闭，而不是仅对象被 drop。
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "取消后临时驱动必须已退出：端口 {port} 不应仍被监听"
+    );
+    // 4) 随后再次 Probe 不受影响（无端口冲突、无残留会话）。
+    let report = mgr
+        .probe("test-driver", "{}")
+        .await
+        .expect("取消后的新探测必须成功");
+    assert!(report.reachable, "新探测必须可达");
+    assert_no_orphan(&before, &name);
     cleanup_dir(&root);
 }

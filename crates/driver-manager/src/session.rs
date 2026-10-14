@@ -26,15 +26,20 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Probe 路径单次 RPC 上限（C1 §6.3）。
 ///
-/// 为什么单独开一个更大的值：`OpenConnection` 会触发 Driver 内部的真实协议
-/// 建连，其耗时由该连接的 `timeout_ms` 决定（S7/NCK 还分 COTP + Setup 多阶段）。
+/// 为什么单独开一个更大的值：探测路径上**协议握手发生在 `Probe` RPC 内**
+/// （四个驱动的 `open_connection` 都只做配置解析，见 `probe::ProbeBudgets`），
+/// 且握手是串行的多响应阶段，每段各受连接的 `timeout_ms` 约束。
 /// 用通用的 10s `REQUEST_TIMEOUT` 去卡它，等于「用户填了合法超时，却被管理面
 /// 提前掐断」。
 ///
 /// 为什么不能直接全局拉长 `REQUEST_TIMEOUT`：它同时约束 Configure / Stop /
 /// Write 等所有管理 RPC，拉长会让故障检测普遍变慢。因此只有 Probe 的三个
 /// RPC（Open / Probe / Close）走本上限。
-pub const PROBE_RPC_TIMEOUT: Duration = Duration::from_secs(15);
+///
+/// 取值依据：`ProbeBudgets` 按「4 个串行响应阶段 × timeout_ms + 3s 余量」推导，
+/// 而 `timeout_ms` 上限为 10s（`CONNECTION_TIMEOUT_MAX_MS`），
+/// 故 4×10s+3s = 43s；本常量取 45s 作为硬封顶。
+pub const PROBE_RPC_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// 心跳默认参数（§14.4）。
 const PING_PERIOD: Duration = Duration::from_secs(5);

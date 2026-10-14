@@ -22,20 +22,39 @@ use crate::session::{
 const PROBE_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
 /// 未配置 `timeout_ms` 时假定的协议超时（与四驱动默认值同量级）。
 const PROBE_ASSUMED_TIMEOUT_MS: u64 = 5_000;
+/// `OpenConnection` RPC 预算。
+///
+/// **四个驱动的 `open_connection` 都不做协议 I/O**，只做配置解析与对象构造
+/// （S7/FOCAS2/NCK 解析 JSON 后直接返回连接对象；OPC UA 只构造 transport），
+/// 真正的 TCP/COTP/Setup/OPEN 握手全部发生在随后的 `Probe` RPC 内。
+/// 因此这里是**本地解析预算**，不是协议预算。
+const PROBE_OPEN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// `CloseConnection` RPC 预算（best-effort：失败只诊断，不掩盖探测结论）。
+const PROBE_CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 一次 Probe 的分阶段预算（C1 §6.3）。
 ///
-/// 阶段模型：`startup(spawn + IPC 握手)` → `OpenConnection` → `Probe` →
-/// `CloseConnection` → `cleanup(terminate)`。
+/// 阶段模型：`startup(spawn + IPC 握手)` → `OpenConnection`（本地解析）→
+/// `Probe`（**协议握手 + 探测查询**）→ `CloseConnection` → `cleanup(terminate)`。
 ///
-/// 为什么不再用固定 12s：`OpenConnection` 会触发 Driver 内部真实协议建连，
-/// 其单阶段耗时由连接的 `timeout_ms` 决定，而 S7/NCK 一次建连要串多个阶段。
-/// 固定外层预算会把「用户填的合法超时」提前掐断，表现为不可诊断的
-/// `ProbeError::Timeout`——用户看到的超时和实际配置对不上。
+/// 为什么不再用固定 12s：合法的慢设备会被外层预算提前掐断，表现为不可诊断的
+/// `ProbeError::Timeout`——用户看到的超时与实际配置对不上。
 ///
-/// 为什么仍然有界：预算由 `timeout_ms` 推导并逐段取 min，`timeout_ms` 本身
-/// 由 Descriptor 与各 Driver parser 双侧限幅（≤10s），因此总预算有确定上界；
-/// 正常连接仍在毫秒级返回，本预算是**上限**而非等待时长。
+/// 为什么 Query 才是大预算：探测路径上，协议建连发生在 **`Probe` RPC 内**，
+/// 且是串行的多阶段（S7 实测路径：TCP connect → COTP CC → S7 Setup → SZL；
+/// NCK 为前三段；OPC UA 为 connect → 读命名空间 → 读节点）。每个响应阶段各自
+/// 受 `timeout_ms` 约束，因此 `Probe` RPC 的预算必须按
+/// `阶段数 × timeout_ms` 估算，而不是 1×。
+///
+/// 阶段数取 4 而不是 5：S7 的 COTP CR 与 Setup 请求是「发送」阶段，不等待响应；
+/// 等待响应的串行阶段为 TCP connect / COTP CC / Setup resp / SZL resp。
+/// 更重要的是**任一等待阶段失败即整链中止**（`?` 提前返回），
+/// 所以「每个阶段都耗尽自己的 timeout」只可能发生在部分阶段上；
+/// 4× 是对「慢但成功」路径的保守上界。
+///
+/// 有界性：预算由 `timeout_ms` 推导并受 `PROBE_RPC_TIMEOUT` 封顶，
+/// `timeout_ms` 又由 Descriptor 与各 Driver parser 双侧限幅，
+/// 因此总预算有确定上界。正常连接仍在毫秒级返回，本预算是**上限**而非等待时长。
 ///
 /// NOTE: 各阶段的真实耗时分布仍需真机分阶段量测（A22）；本函数给出的是
 /// 由阶段数与 `timeout_ms` 推出的工程上界，不是实测结论。
@@ -46,23 +65,28 @@ struct ProbeBudgets {
     close: std::time::Duration,
 }
 
+/// `Probe` RPC 内可能串行等待响应的协议阶段数（见 [`ProbeBudgets`] 文档）。
+const PROBE_PROTOCOL_PHASES: u64 = 4;
+
 impl ProbeBudgets {
     fn from_connection_json(connection_json: &str) -> Self {
         let configured_ms = serde_json::from_str::<serde_json::Value>(connection_json)
             .ok()
             .and_then(|v| v.get("timeout_ms").and_then(|t| t.as_u64()))
             .unwrap_or(PROBE_ASSUMED_TIMEOUT_MS);
-        // Open：协议建连可能串 2 个阶段（如 TCP + COTP/Setup），给 2× 超时 + 余量。
-        let open = std::time::Duration::from_millis(configured_ms.saturating_mul(2) + 2_000)
-            .min(PROBE_RPC_TIMEOUT)
-            .max(std::time::Duration::from_secs(3));
-        // Query：建连完成后的探测查询，给 1× 超时 + 余量。
-        let query = std::time::Duration::from_millis(configured_ms + 2_000)
-            .min(PROBE_RPC_TIMEOUT)
-            .max(std::time::Duration::from_secs(2));
-        // Close：best-effort，短预算即可。
-        let close = PROBE_RPC_TIMEOUT.min(std::time::Duration::from_secs(5));
-        Self { open, query, close }
+        // Query（= 协议握手 + 探测查询）：阶段数 × timeout + 3s 余量。
+        let query = std::time::Duration::from_millis(
+            configured_ms
+                .saturating_mul(PROBE_PROTOCOL_PHASES)
+                .saturating_add(3_000),
+        )
+        .min(PROBE_RPC_TIMEOUT)
+        .max(std::time::Duration::from_secs(5));
+        Self {
+            open: PROBE_OPEN_BUDGET,
+            query,
+            close: PROBE_CLOSE_BUDGET,
+        }
     }
 
     /// 外层总预算 = 各阶段预算之和（不再有“外层比内层短”的截断）。
@@ -316,22 +340,72 @@ mod tests {
             // 外层总预算必然覆盖所有内层阶段之和（不再出现“外层抢先截断”）。
             let stages = DRIVER_STARTUP_TIMEOUT + b.open + b.query + b.close + PROBE_CLEANUP_BUDGET;
             assert_eq!(b.total(), stages);
-            assert!(b.total() < std::time::Duration::from_secs(60));
+            assert!(
+                b.total() < std::time::Duration::from_secs(90),
+                "总预算必须有确定上界，实际 {:?}",
+                b.total()
+            );
         }
         // 非法/缺失的 timeout_ms 不改变有界性（回落到假定值）。
         let bogus = ProbeBudgets::from_connection_json(r#"{"timeout_ms":"abc"}"#);
         assert_eq!(bogus.total(), default.total());
     }
 
-    /// 合法的慢设备配置不应被通用 10s IPC 上限截断：
-    /// Open 阶段预算必须能覆盖一个完整的协议建连超时。
+    /// C1 修正点：协议握手发生在 **Probe RPC** 内，因此 Query 才是承载多阶段
+    /// 握手的大预算，Open 只是本地配置解析。
     #[test]
-    fn open_budget_covers_a_full_protocol_timeout() {
+    fn query_budget_carries_the_protocol_handshake_not_open() {
         let b = ProbeBudgets::from_connection_json(r#"{"timeout_ms":5000}"#);
+        // Query 必须能覆盖多阶段串行握手（≥ 4 × timeout），而不是 1 × timeout。
         assert!(
-            b.open > std::time::Duration::from_secs(10),
-            "Open 阶段必须长于通用 IPC 上限，否则合法慢连接仍被截断"
+            b.query >= std::time::Duration::from_secs(20),
+            "Query 必须按阶段数 × timeout 估算，实际 {:?}",
+            b.query
         );
+        // Open 是本地解析，不应被协议超时放大。
+        assert!(
+            b.open <= std::time::Duration::from_secs(5),
+            "Open 只做配置解析，不应随 timeout_ms 膨胀，实际 {:?}",
+            b.open
+        );
+        assert!(
+            b.query > b.open,
+            "Query 必须显著大于 Open：握手在 Probe RPC 内"
+        );
+    }
+
+    /// 用户可配置的最大 `timeout_ms` 必须能被 Query 预算完整承载，
+    /// 否则就是「配置合法但永远不生效」。
+    #[test]
+    fn max_supported_timeout_is_fully_covered_by_query_budget() {
+        let b = ProbeBudgets::from_connection_json(&format!(
+            r#"{{"timeout_ms":{}}}"#,
+            mesa_core_types::CONNECTION_TIMEOUT_MAX_MS
+        ));
+        let needed = std::time::Duration::from_millis(
+            mesa_core_types::CONNECTION_TIMEOUT_MAX_MS * PROBE_PROTOCOL_PHASES,
+        );
+        assert!(
+            b.query >= needed,
+            "支持上限 {}ms 的 {PROBE_PROTOCOL_PHASES} 阶段握手需要 {needed:?}，\
+             但 Query 只有 {:?}（且必须 ≤ PROBE_RPC_TIMEOUT）",
+            mesa_core_types::CONNECTION_TIMEOUT_MAX_MS,
+            b.query
+        );
+    }
+
+    /// 一个「慢但成功」的合法探测不能被旧口径的 10s IPC / 12s 外层提前打断：
+    /// 以 timeout_ms=5000 为例，两个各耗时 7s 的响应阶段合计 14s > 12s。
+    #[test]
+    fn slow_but_successful_multi_phase_probe_fits_the_budget() {
+        let b = ProbeBudgets::from_connection_json(r#"{"timeout_ms":5000}"#);
+        let slow_two_phase = std::time::Duration::from_secs(14);
+        assert!(
+            b.query > slow_two_phase,
+            "两个 7s 响应阶段的慢路径合计 {slow_two_phase:?}，Query 必须更长，实际 {:?}",
+            b.query
+        );
+        assert!(b.total() > slow_two_phase, "外层总预算也必须覆盖该慢路径");
     }
 
     #[test]

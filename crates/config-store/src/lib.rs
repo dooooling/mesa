@@ -3113,6 +3113,81 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// A31（C1 §9.4 / V2.1 §5.10）：master key 不可用或与密文不匹配时，
+    /// `get_secret` 必须 **fail-closed**：
+    /// - 不得返回 Ok(垃圾明文) 让 Driver 拿错误凭据去连设备；
+    /// - 不得 panic；
+    /// - 不得在错误信息里回显密文或明文。
+    ///
+    /// 覆盖两种不可用形态：① key 文件被换成另一把合法密钥（解密认证失败）；
+    /// ② key 文件被损坏成非法长度（既非 32 字节也不是合法 base64）。
+    #[test]
+    fn secret_decrypt_failure_is_fail_closed_and_does_not_leak() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "mesa-secretfail-{}-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let db = base.join("mesa.db");
+        let key_path = base.join("master.key");
+
+        // 建库并写入一条 Secret。
+        {
+            let s = ConfigStore::open(&db).unwrap();
+            s.create_device(&dev("d1")).unwrap();
+            s.create_endpoint(&ep("e1", "d1")).unwrap();
+            s.put_secret("e1", "password", "top-secret-value", "k1")
+                .unwrap();
+            assert_eq!(
+                s.get_secret("e1", "password").unwrap().as_deref(),
+                Some("top-secret-value")
+            );
+        }
+
+        // ① 换成另一把**合法**密钥：AEAD 认证失败 → 必须 Err。
+        std::fs::write(&key_path, [0x5Au8; 32]).unwrap();
+        {
+            let s = ConfigStore::open(&db).unwrap();
+            let err = s
+                .get_secret("e1", "password")
+                .expect_err("密钥不匹配必须 fail-closed，而不是返回垃圾明文");
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("top-secret-value"),
+                "错误信息不得回显明文：{msg}"
+            );
+            assert!(
+                !msg.contains("password"),
+                "错误信息不应回显敏感字段内容：{msg}"
+            );
+        }
+
+        // ② key 文件损坏（既非 32 字节，也非合法 base64）。
+        //
+        // 实测行为：`load_or_create_master_key_file` 对「存在但非法」的 key 文件
+        // **不会报错**，而是重新生成一把新密钥并覆盖写回；随后读取旧密文
+        // 因密钥不匹配而失败。因此**读取路径是 fail-closed 的**（本断言成立），
+        // 但损坏事件本身被静默吞掉、旧 Secret 变成永久不可解密。
+        //
+        // NOTE: 这是可诊断性缺口——运维看到的是 `decrypt: aead::Error`，
+        // 而不是「master.key 已损坏/被替换」。是否改为「非法 key 文件直接
+        // 拒绝启动」属于 config-store 的独立决策（会影响可恢复性策略），
+        // 未在本轮 C1 内改动；如需收敛应单独评审并补运维指引。
+        std::fs::write(&key_path, b"not-a-valid-key").unwrap();
+        {
+            let s = ConfigStore::open(&db).unwrap();
+            assert!(
+                s.get_secret("e1", "password").is_err(),
+                "损坏/被替换的 master key 必须导致 Secret 读取失败（不得返回垃圾明文）"
+            );
+        }
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn control_audit_insert_and_query() {
         let s = mem();
