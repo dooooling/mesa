@@ -8,7 +8,8 @@
 //! 2. 建 Endpoint 时提交明文口令 → Core 写 SecretStore 并把 connection 换成 marker；
 //! 3. 启动后必须采到 `ns=0;i=2258`（ServerStatus CurrentTime）的 GOOD/CURRENT 值；
 //! 4. **非优雅 kill** 整个 mesad → 同一 db 目录拉起第二个进程；
-//! 5. 断言恢复后：仍是 RUNNING、`epoch` 增长（新数据流）、`point_id` 不变，
+//! 5. 断言恢复后：仍是 RUNNING、`epoch` **变为另一个值**（新数据流标识；
+//!    该值是无序混合值，只能比较是否不同）、`point_id` 不变，
 //!    并且出现 `timestamp_ns > 重启前` 的新采样——这才是「真的又采到了」；
 //! 6. 负例：同一 fixture 上换**错误口令**的 Endpoint 必须拿不到数据
 //!    （RECONNECTING + CONNECT_FAILED），反证 fixture 没有静默放行匿名。
@@ -339,9 +340,14 @@ async fn authenticated_opcua_endpoint_recovers_secret_and_new_data_after_restart
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
 
-    assert!(
-        epoch2 > epoch1,
-        "重启必须产生新的 stream epoch（epoch1={epoch1} epoch2={epoch2}）"
+    // NOTE: epoch 由 `now_unix_ns ^ pid << 32 ^ counter * 黄金比` 混合而成，
+    // **不是单调序列**（XOR 破坏有序性），因此只能断言「换了一个新流标识」，
+    // 不能断言大小。真正证明「重启后采到了新数据」的是上面的
+    // `timestamp_ns > t1` + `value_origin == CURRENT`。
+    assert_ne!(
+        epoch2, epoch1,
+        "重启必须产生新的 stream epoch（沿用旧 epoch 等于没有新数据流；\
+         该值无序，只可比较是否不同）"
     );
     assert_eq!(
         point_id2, point_id1,
