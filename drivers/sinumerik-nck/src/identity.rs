@@ -17,6 +17,15 @@ pub const ROOT: &str = "nck://identity";
 const AXES: &str = "nck://identity/axes";
 const OBJECTS: &str = "nck://identity/objects";
 const MAX_INSTANCE: u16 = 31;
+
+/// 身份实例页的**驱动侧**上限（不依赖调用方传对 `limit`）。
+///
+/// 为什么要独立设限：轴实例每项最多 5 次身份读取（轴名/驱动号/输出类型/主轴
+/// 分配/对象名），若沿用 Browse 的通用 `limit`（Web 默认 50），一次请求就会
+/// 在 15 秒预算内顺序读约 `31 × 5` 项——分页等于没有生效。这里把每页钉在
+/// 个位数，使单次请求的读取量可观测、有上界；后续页由 `next_cursor` 驱动
+/// （Web 已有「下一页」入口）。
+const IDENTITY_PAGE_MAX: usize = 8;
 type Page = (Vec<BrowseNode>, Option<String>);
 
 struct AxisIdentity {
@@ -211,22 +220,36 @@ fn object_node(unit: u16, name: &str) -> BrowseNode {
 /// 变量叶：可选模板 + **已确认实例**填充 `area_no`；
 /// `line` 仍留给使用者确认（不按变量名猜行索引语义）。
 ///
+/// `entry` 是**核对该编号时实际使用的探针**。实例编号只能用于它被核对过的
+/// 那条入口：`module 26`（NC 变量）与 `module 130`（驱动对象）的编号在实机上
+/// 并不相同，把经 A 入口核对的编号填进 B 入口的模板，等于凭空制造一个未经
+/// 证明的地址归属。因此这里按 `entry.module` 做第二重过滤。
+///
 /// 模板缺失时返回空集合——身份核对结果照常显示，不会被模板缺失阻断。
 fn variable_nodes(
     presets: &PresetRegistry,
     family: &str,
+    entry: &IdentityProbeSpec,
     unit: u16,
     label: &str,
 ) -> Vec<BrowseNode> {
     presets
         .for_family(family)
         .into_iter()
-        // 身份节点代表「驱动对象」，因此只列驱动区（area=V）模板。
+        // 身份节点代表「本入口的驱动对象」，因此只列驱动区（area=V）模板。
         // 这是**浏览作用域**选择，不是地址准入：手动填写任意 area 都不受影响。
         .filter(|t| t.parameters.get("area").and_then(|v| v.as_str()) == Some("V"))
+        // 入口过滤：只列 module 与本次核对入口一致的模板（编号不跨入口复用）。
+        .filter(|t| {
+            t.parameters.get("module").and_then(|v| v.as_u64()) == Some(u64::from(entry.module))
+        })
         .map(|t| {
             let mut node = leaf_node_with(t, &[("area_no", serde_json::Value::from(unit))]);
-            node.label = format!("{label} · {}", node.label);
+            // 标签显式标出编号出处，避免使用者误以为两条入口编号等价。
+            node.label = format!(
+                "{label} · module{}入口编号{unit} · {}",
+                entry.module, node.label
+            );
             node
         })
         .collect()
@@ -297,7 +320,11 @@ async fn instance_page(
 ) -> Result<Page, SdkDriverError> {
     let mut index = instance_cursor(cursor)?;
     let mut nodes = Vec::new();
-    for _ in 0..limit_size(limit).min(usize::from(MAX_INSTANCE)) {
+    // 双重收敛：调用方 limit 与服务端上限取小；并以实例总数封顶。
+    let page = limit_size(limit)
+        .min(IDENTITY_PAGE_MAX)
+        .min(usize::from(MAX_INSTANCE));
+    for _ in 0..page {
         let result = if axes {
             axis(client, index)
                 .await
@@ -415,7 +442,9 @@ pub async fn browse(
                     return Ok((vec![diagnostic(parent, axis.notes.join("；"))], None));
                 }
                 let nodes = if let Some(drive) = axis.drive.filter(|_| axis.object_name.is_some()) {
-                    variable_nodes(presets, &cfg.family, drive, &axis.name)
+                    // 轴路径的驱动编号来自 MD30110，且已用 **module 26**
+                    // （`DRIVE_OBJECT_NAME`）核对过对象名，故只列该入口模板。
+                    variable_nodes(presets, &cfg.family, &DRIVE_OBJECT_NAME, drive, &axis.name)
                 } else {
                     Vec::new()
                 };
@@ -438,7 +467,9 @@ pub async fn browse(
                     if name.is_empty() {
                         Vec::new()
                     } else {
-                        variable_nodes(presets, &cfg.family, unit, &name)
+                        // 对象路径的编号由 **module 130**（`DRIVE_OBJECT_NAME_M130`）
+                        // 核对，只列该入口模板；不得据此生成 module 26 采集地址。
+                        variable_nodes(presets, &cfg.family, &DRIVE_OBJECT_NAME_M130, unit, &name)
                     },
                     filter,
                     cursor,

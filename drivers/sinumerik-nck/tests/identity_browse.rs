@@ -153,8 +153,15 @@ async fn fresh_requests_browse_root_pages_axis_object_and_leaf_pages_without_ful
         binding["parameters"].get("access_path").is_none(),
         "新模型不再有访问路径字段，入口由 module 显式表达"
     );
+    // 轴路径的编号来自 MD30110 且由 module 26 入口核对，因此只能给出
+    // module 26 模板；给出 module 130 模板等于暗示两条入口编号可互换。
     let module = binding["parameters"]["module"].as_u64().unwrap();
-    assert!(module == 26 || module == 130, "module 必须显式可见");
+    assert_eq!(module, 26, "轴路径只列 NC 变量入口（module 26）模板");
+    assert!(
+        leaves[0].label.contains("module26入口编号4"),
+        "叶标签必须标出编号出处：{}",
+        leaves[0].label
+    );
     assert_eq!(fixture.received_specs().len(), 5);
     assert!(fixture.received_specs().iter().all(|s| s[8] == 0x1a));
     reset_reads(&fixture);
@@ -169,23 +176,107 @@ async fn fresh_requests_browse_root_pages_axis_object_and_leaf_pages_without_ful
         .browse("nck://identity/object/6", "r0080", "", 100)
         .await
         .unwrap();
-    // 两条入口编号不同，各自一个模板，都必须显式携带自己的 module。
-    assert_eq!(leaves.len(), 2, "module26 与 module130 各一个模板");
-    let mut modules: Vec<u64> = leaves
-        .iter()
-        .map(|n| {
-            let b: serde_json::Value = serde_json::from_str(&n.binding_json).unwrap();
-            assert_eq!(b["parameters"]["area_no"], 6);
-            assert!(b["parameters"].get("access_path").is_none());
-            b["parameters"]["module"].as_u64().unwrap()
-        })
-        .collect();
-    modules.sort_unstable();
-    assert_eq!(modules, vec![26, 130], "入口编号由 module 显式表达");
+    // 对象路径的编号由 module 130 入口核对，因此**只能**给出 module 130 模板；
+    // 不得用它生成 module 26 采集地址（两条入口编号在实机上并不相同）。
+    assert_eq!(leaves.len(), 1, "对象路径只列 module 130 模板");
+    let binding: serde_json::Value = serde_json::from_str(&leaves[0].binding_json).unwrap();
+    assert_eq!(binding["parameters"]["area_no"], 6);
+    assert!(binding["parameters"].get("access_path").is_none());
+    assert_eq!(
+        binding["parameters"]["module"].as_u64().unwrap(),
+        130,
+        "入口编号由 module 显式表达"
+    );
+    assert!(
+        leaves[0].label.contains("module130入口编号6"),
+        "叶标签必须标出编号出处：{}",
+        leaves[0].label
+    );
     assert_eq!(
         fixture.received_specs(),
         vec![bytes("12 08 82 a6 00 c7 00 01 82 19")]
     );
+}
+
+/// 两条身份入口的实例编号不得交叉复用（审计 P1-A 回归）。
+///
+/// 轴路径用 module 26 核对编号、对象路径用 module 130 核对编号；若把两者
+/// 混填，浏览器就会给出一个"编号来自另一条入口"的采集地址——地址结构合法、
+/// 却带着未经证明的归属。
+#[tokio::test]
+async fn identity_entries_never_cross_fill_instance_numbers() {
+    let fixture = NckFixture::spawn(recorded_state()).await;
+
+    let (axis_leaves, _) = connection(&fixture)
+        .browse("nck://identity/axis/4", "", "", 200)
+        .await
+        .unwrap();
+    assert!(!axis_leaves.is_empty(), "轴 4 应有模板叶");
+    for node in &axis_leaves {
+        let b: serde_json::Value = serde_json::from_str(&node.binding_json).unwrap();
+        assert_eq!(b["parameters"]["area_no"], 4);
+        assert_eq!(
+            b["parameters"]["module"].as_u64().unwrap(),
+            26,
+            "轴入口不得给出 module 130 模板：{}",
+            node.id
+        );
+    }
+
+    let (object_leaves, _) = connection(&fixture)
+        .browse("nck://identity/object/6", "", "", 200)
+        .await
+        .unwrap();
+    assert!(!object_leaves.is_empty(), "对象 6 应有模板叶");
+    for node in &object_leaves {
+        let b: serde_json::Value = serde_json::from_str(&node.binding_json).unwrap();
+        assert_eq!(b["parameters"]["area_no"], 6);
+        assert_eq!(
+            b["parameters"]["module"].as_u64().unwrap(),
+            130,
+            "对象入口不得给出 module 26 模板：{}",
+            node.id
+        );
+    }
+}
+
+/// 身份实例页必须有**驱动侧**上限，不依赖调用方传对 limit（审计 P1-B 回归）。
+///
+/// Web 默认 `limit=50`，而实例总数上限 31；若照单全收，一次请求就会顺序读
+/// 约 `31 × 5` 项身份数据，分页形同虚设。
+#[tokio::test]
+async fn identity_instance_page_is_bounded_regardless_of_client_limit() {
+    let fixture = NckFixture::spawn(recorded_state()).await;
+    // 客户端按 Web 默认值要 50 个；服务端仍必须只读一页的量。
+    let (axes, next) = connection(&fixture).browse(AXES, "", "", 50).await.unwrap();
+    assert!(
+        axes.len() <= 8,
+        "单页实例数必须受驱动侧上限约束，实际 {}",
+        axes.len()
+    );
+    assert_eq!(
+        next.as_deref(),
+        Some("9"),
+        "受上限约束后必须返回后续游标，否则界面无法翻页"
+    );
+    let reads = fixture.received_specs();
+    assert!(
+        reads.len() <= 8 * 5,
+        "单页读取量必须可观测有上界，实际 {}",
+        reads.len()
+    );
+    assert!(
+        reads.len() < 31 * 5,
+        "不得在一次请求里扫描全部实例（实际 {}）",
+        reads.len()
+    );
+    // 后续页从游标继续，而不是重扫。
+    reset_reads(&fixture);
+    let (_, next2) = connection(&fixture)
+        .browse(AXES, "", next.as_deref().unwrap(), 50)
+        .await
+        .unwrap();
+    assert!(next2.is_none(), "游标 9 起已到表尾");
 }
 
 #[tokio::test]

@@ -96,7 +96,7 @@ impl Driver for SinumerikNckDriver {
                         .required(false)
                         .default_value(serde_json::json!(102)),
                     // P1-3：系列显式必填（common + 单 family，无静默默认；
-                    // 选项与 catalog/ 目录的系列文件对应，新增系列需同步加枚举）。
+                    // 选项与 `DECLARED_FAMILIES` 对应，新增系列需同步加枚举与模板）。
                     {
                         let mut f = FieldDescriptor::new("family", "Family", FieldType::Enum)
                             .required(true);
@@ -294,7 +294,7 @@ impl Driver for SinumerikNckDriver {
                 outputs: vec![OutputDescriptor {
                     id: "value".into(),
                     label: LocalizedText::new("Value"),
-                    // 类型来自 catalog 条目，只能 Configure 时确定。
+                    // 类型来自地址上的 `decode`，只能 Configure 时确定。
                     type_spec: OutputTypeSpec::DriverResolved,
                     unit: None,
                     access: AccessMode::Read,
@@ -574,8 +574,9 @@ impl DriverConnection for NckConnection {
         Ok(probe_with_session(&self.cfg).await)
     }
 
-    /// 通用绑定 `mesa.resources.v1`（resource_id `variable`）→ Catalog →
-    /// PointDescriptor。未知变量/非法参数即配置拒绝（fail-closed，不进运行期）。
+    /// 通用绑定 `mesa.resources.v1`（resource_id `variable`）→ 原生地址解析 →
+    /// PointDescriptor。未知变量/非法参数/单项超 PDU 即配置拒绝
+    /// （fail-closed，不进运行期；不查任何目录）。
     async fn configure(
         &self,
         revision: u64,
@@ -659,6 +660,37 @@ impl DriverConnection for NckConnection {
                             mesa_core_types::ErrorKind::Address,
                             "INVALID_VARIABLE",
                             format!("point `{}`: {e}", out.point_key),
+                        )
+                    })?;
+                    // P2-1：Configure 期提前拦截「单项装不下」的配置，避免
+                    // 「配置成功、启动后才在读取时报 READ_ITEM_TOO_LARGE」。
+                    //
+                    // 判定用**请求的** PDU：协商只向下取 min（见 s7-transport
+                    // `parse_setup_ack`），所以这里判失败 ⇒ 协商后必然也失败，
+                    // 是可靠的必要条件；判通过仍可能在协商到更小 PDU 后失败，
+                    // 权威检查因此保留在读取时（fail-closed，不静默发超长请求）。
+                    mesa_s7_transport::read_var::check_single_item_fits(
+                        &mesa_s7_transport::S7ReadVarItem {
+                            var_spec: encode_var_spec(&rp.wire),
+                            expected_data_len: rp.expected_data_len,
+                        },
+                        self.cfg.requested_pdu_length,
+                        false,
+                    )
+                    .map_err(|e| {
+                        SdkDriverError::new(
+                            mesa_core_types::ErrorKind::Configuration,
+                            e.code,
+                            format!(
+                                "point `{}`: count={} × {} 字节装不进请求 PDU {}（{}）；\
+                                 请减小 count 或增大连接 `pdu_length`——协商 PDU 只会更小，\
+                                 该配置在当前连接参数下无法读取",
+                                out.point_key,
+                                rp.wire.line_count,
+                                rp.kind.byte_len(),
+                                self.cfg.requested_pdu_length,
+                                e.message
+                            ),
                         )
                     })?;
                     indices.push(new_points.len());
@@ -1121,7 +1153,7 @@ mod tests {
             d.resource_selection_methods
                 .contains(&mesa_core_types::ResourceSelectionMethod::Browse)
         );
-        // P1-3：连接 family 显式必填（选项与 catalog 系列文件对应）。
+        // P1-3：连接 family 显式必填（选项与 `DECLARED_FAMILIES` 对应）。
         let conn_keys: Vec<_> = d.connection.fields.iter().map(|f| f.key.as_str()).collect();
         assert!(conn_keys.contains(&"family"), "缺 family");
         let fam = d
@@ -1678,22 +1710,61 @@ mod tests {
         h.await.expect("join").expect("run Ok 退出");
     }
 
+    /// P2-1 回归：单项装不进 PDU 的配置必须在 **Configure 期**被拒绝，
+    /// 而不是"配置成功、启动后才在第一次读取时报错"。
+    ///
+    /// 判定基准是**请求的** PDU：协商只向下取 min，故此处判失败 ⇒ 协商后
+    /// 必然也失败（可靠的必要条件）。
+    #[tokio::test]
+    async fn oversized_count_is_rejected_at_configure() {
+        let conn = conn_with_synthetic();
+        let mut huge = speed_selection("big");
+        // F64 × 255 = 2040 字节，远超缺省请求 PDU 480。
+        huge[0]["parameters"]["count"] = serde_json::json!(255);
+        let err = conn
+            .configure(1, vec![poll_task("tB", huge)])
+            .await
+            .expect_err("超 PDU 的 count 必须在 Configure 期拒绝");
+        assert_eq!(err.code, "READ_ITEM_TOO_LARGE");
+        assert!(
+            err.message.contains("count=255"),
+            "错误须点明 count：{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("480"),
+            "错误须点明请求 PDU：{}",
+            err.message
+        );
+        // 同一配置里合法点位不受影响：拒绝是整包 fail-closed，不留下半份计划。
+        let ok = conn
+            .configure(1, vec![poll_task("tA", speed_selection("healthy"))])
+            .await;
+        assert!(ok.is_ok(), "合法配置仍必须可提交");
+    }
+
     #[tokio::test]
     async fn nck_second_poll_task_failure_fails_whole_attempt() {
-        // P1-1 回归：task A（前）永久健康 + task B（后）每 tick 致命
-        // （F64 count=255 → 单 item 超 PDU，发送前拒绝）。
+        // P1-1 回归：task A（前）永久健康 + task B（后）每 tick 致命。
         // 顺序 await 下 B 的 Err 会被 A 的无限 Poll 饿死，run 永不返回；
         // JoinSet 下 run 必须 bounded time 内 Err。
+        //
+        // 致命机制用「协商 PDU < 请求 PDU」：count 在配置期按请求值 960 合法，
+        // 协商到 240 后单项装不下 → 读取时 fail-closed。这同时说明 Configure
+        // 期检查是**必要非充分**条件，权威判定仍在读取时。
         use mesa_driver_sdk::DataSink;
         let fx = NckFixture::spawn(NckFixtureState {
             element_size: 8,
+            max_pdu: 240,
             ..Default::default()
         })
         .await;
         let mut conn = conn_with_synthetic();
         conn.cfg.port = fx.addr.port();
+        conn.cfg.requested_pdu_length = mesa_s7_transport::S7_PDU_MAX;
         let mut huge_sel = speed_selection("big");
-        huge_sel[0]["parameters"]["count"] = serde_json::json!(255);
+        // 12(var_spec) + 8×40 + 32(余量) = 364：装得进 960，装不进 240。
+        huge_sel[0]["parameters"]["count"] = serde_json::json!(40);
         conn.configure(
             1,
             vec![

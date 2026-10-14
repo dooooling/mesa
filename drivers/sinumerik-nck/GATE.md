@@ -126,6 +126,10 @@ connect / probe / channel+axis topology / 轴实际值与速度 / R 参数 /
 
 ## 实体828D的有限只读验证（2026-10-13）
 
+> ⚠️ **本段第 1 句已被 2026-10-14 复测推翻**：`r0027`/`r0031` 在同一台机上经
+> **module 26 与 module 130 两条入口**均被拒（单项码 `0x85`）。原文保留为历史
+> 记录，结论以「实体828D原生绑定采样复测（2026-10-14）」一节为准。
+
 用户确认的实体828D通过模块26读取r0027/r0031；X/Z/C/A的有效驱动输出
 分别由MD30110、MD30130、MD35000及p0199核对。选定240个点通过Mesa
 连续3轮完整采集，包含原表170点、18个独立驱动参数及52个身份核对点。
@@ -175,4 +179,45 @@ r0035接近-200的无效标记按BAD处理，不以ReadVar返回FF判为有效�
 
 轴位置在轴1..3 有值、轴4..8 为零，与 `line=机床轴索引` 的说法**一致**，
 但单次静止采样不足以据此确认轴身份映射（参见上一节的归属未证明结论）。
+
+
+## 合并后独立代码审计与修复（2026-10-14）
+
+对 `main` 的合并差分做静态审查（原生寻址、类型/协议校验、错误隔离、身份浏览、
+配置生命周期、PR #99 公共测试设施），结论与处置如下。**CI 全绿不等于语义审查通过**，
+以下问题均由人工审查发现，不是 CI 捕获的。
+
+### 已修复
+
+- **P1-A 身份浏览跨入口填号**：`identity.rs::variable_nodes()` 原先只按
+  `area=V` 过滤，而轴路径的编号由 module 26 核对、对象路径的编号由 module 130
+  核对，两者最终都填入同一批模板——从 module 130 核对出的编号会被填进
+  module 26 模板（反向亦然），浏览器因此能给出"编号来自另一条入口"的采集地址。
+  现按**核对时实际使用的探针 `module`** 二次过滤，并在叶标签标出编号出处
+  （`module26入口编号4`）。回归：`tests/identity_browse.rs`
+  `identity_entries_never_cross_fill_instance_numbers`。
+- **P1-B 身份实例页没有驱动侧上限**：Web 默认 `limit=50` 而实例上限 31，
+  一次请求最多顺序读约 `31 × 5` 项身份数据，分页形同虚设。现由驱动侧
+  `IDENTITY_PAGE_MAX = 8` 独立封顶（不依赖调用方传对 `limit`），后续页走
+  `next_cursor`。回归：`identity_instance_page_is_bounded_regardless_of_client_limit`。
+- **P1-C `r0035` 无效温度哨兵可能重新变 GOOD**：两个 `r0035` 模板原先都不带
+  `invalid_value`/`invalid_tolerance`，使用者从模板建点而未手填规则时，设备返回
+  `-200` 会被标 GOOD。现两个模板**显式携带** `-200 ± 0.001`（普通字段，随配置保存、
+  可见可改）。边界不变：规则只来自配置本身，驱动不隐式继承。回归：
+  `tests/presets_828d.rs` `r0035_presets_carry_the_known_invalid_temperature_rule_explicitly`
+  与 `invalid_rule_is_explicit_configuration_not_a_template_privilege`。
+- **P2-1 `count` 超 PDU 只在读取时报错**：现在 Configure 期即用
+  `s7-transport::read_var::check_single_item_fits` 按**请求的** PDU 判定并拒绝
+  （协商只向下取 min，故此处判失败 ⇒ 必然失败），避免"配置成功、启动失败"。
+  权威检查仍保留在读取时（协商值可能更小），并保留一条覆盖该路径的回归。
+- **P2-2 过期表述**：`probe.rs` 不再提"回填 catalog/topology"（两者已删除）；
+  `lib.rs` 的 Catalog 注释改为原生地址解析；`GATE.md` 2026-10-13 段就地标注失效。
+
+### 审计确认无新阻塞的部分
+
+原生地址解析（必填/范围/类型/枚举/未知字段）、Catalog 退场（Configure 不再调用）、
+ReadVar 仍复用公共 S7 transport、解码的类型/长度/transport 校验、单项错误隔离
+（拒绝码进 BAD、不伪造 GOOD）、配置原子替换（全部解析成功才替换计划）、
+PR #99 的 staged 二进制复制（hardlink + 有界重试）、Core/IPC/SQLite 未改。
+
 
