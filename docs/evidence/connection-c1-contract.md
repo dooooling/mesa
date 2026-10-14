@@ -195,3 +195,34 @@ scripts/write-contract-evidence.py                                 见末节
   需要人工调整到范围内；调整前应先确认设备侧真实响应时间。
 - 旧配置中的 `host` 若为字符串但指向出厂占位地址（如 `192.168.0.1`），
   新版本**不会**改写它，仍会按原值连接——这是有意的：不替用户改连接目标。
+
+## 6. 最终提交与干净工作树证据
+
+本分支的提交序列（`main` 未改动）：
+
+| 提交 | 内容 |
+|---|---|
+| `b714a25` | 四驱动连接契约严格化 + Secret 统一构造路径 + Probe 分层超时（首轮） |
+| `c41cd8f` | 补齐 A21/A22/A31/A32 验收 + **修正 Probe 阶段预算方向**（`opcua_auth_restart_e2e` 新套件） |
+| `e818caf` | 忽略 `__pycache__`：证据脚本自身 import `contract_suites.py` 会弄脏工作树，导致官方证据恒为 `dirty=true`；不修则无法产出干净工作树证据 |
+| `61aed30` | 修正 A21 的 epoch 断言（见下） |
+
+**干净工作树证据（最终）**：
+
+```text
+scripts/write-contract-evidence.py
+  → target/validation/contract.json
+    suites=29  tests=190  sha=61aed30fed148a48ba2864722a319349d3dc2194  dirty=False
+```
+
+在此之前同一命令在 `c41cd8f` 上曾两次出现**单套件偶发失败**（分别落在
+`event_pressure` 与 `opcua_auth_restart_e2e`），逐项定位后确认：
+
+- `opcua_auth_restart_e2e` 的失败是**本测试自身的缺陷**——`epoch2 > epoch1` 断言无效，
+  因为 `new_stream_epoch()` 是 `now_unix_ns ^ (pid<<32) ^ (counter*黄金比)` 的 XOR
+  混合值，**不是单调序列**；重启后进程 pid 变化会让大小关系随机。已改为
+  `assert_ne!`，并用 4 实例并行复现验证（修正前 4/4 失败 → 修正后 4/4 通过）。
+- `event_pressure` 单独重跑与序列重跑均通过，未能复现，按环境偶发处理。
+
+**尚未完成的前置检查**：本证据只覆盖仓库内可自动化部分。A22 的**实体设备**
+分阶段量测、以及第 4 节列出的可诊断性缺口，均不包含在上述 190 项之内。
