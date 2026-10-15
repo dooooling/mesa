@@ -13,3 +13,8 @@ path = "src/lib.rs"
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# A22 阶段计时回归：捕获 tracing 事件以断言握手链各阶段都被记录。
+# 该包已在工作区依赖图中（mesad / 契约测试使用），不引入新依赖。
+tracing-subscriber = { workspace = true }

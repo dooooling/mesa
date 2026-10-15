@@ -419,4 +419,108 @@ mod tests {
         };
         assert_eq!(err.code, "CONNECT_FAIL");
     }
+
+    // -----------------------------------------------------------------------
+    // A22：分阶段单调计时的**观测能力**回归
+    // -----------------------------------------------------------------------
+
+    /// 捕获 tracing 输出到内存，供断言使用。
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CaptureWriter {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// 全局捕获缓冲（进程内只安装一次订阅者）。
+    ///
+    /// 为什么不用线程局部的 `set_default`：libtest 默认并行执行测试，
+    /// 每个测试在自己的线程与自己的 current-thread 运行时上跑；线程局部
+    /// 订阅者在并行场景下观测不到事件（实测：单独跑通过、全量跑捕获为空）。
+    /// 全局订阅者对所有线程生效，因此并行下稳定。
+    static CAPTURE: std::sync::OnceLock<CaptureWriter> = std::sync::OnceLock::new();
+
+    fn capture_buffer() -> CaptureWriter {
+        CAPTURE
+            .get_or_init(|| {
+                let w = CaptureWriter::default();
+                let sub = tracing_subscriber::fmt()
+                    .with_writer(w.clone())
+                    .with_max_level(tracing::Level::INFO)
+                    .finish();
+                // 若本进程已有全局订阅者（其它测试装的），忽略错误；
+                // 此时捕获可能为空，测试会以明确的失败信息暴露该前提。
+                let _ = tracing::subscriber::set_global_default(sub);
+                w
+            })
+            .clone()
+    }
+
+    /// 一次成功握手必须发出**全部 5 个阶段**的结构化计时事件。
+    ///
+    /// 这是纯观测能力的回归保护：A22 真机量测依赖这些事件分阶段汇总，
+    /// 若将来有人删掉某个 `StageTimer` 调用点，量测会**静默缺失该阶段数据**
+    /// （日志还在、只是少一段），而本测试会直接失败。
+    ///
+    /// 注意：只断言「事件与字段被发出」，不断言耗时数值——本机回环耗时
+    /// 无意义，真实分布由现场量测提供。
+    #[tokio::test]
+    async fn handshake_emits_all_stage_timings() {
+        let buf = capture_buffer();
+
+        // 捕获装置自检：确认订阅者真的在工作（否则后面的断言没有意义）。
+        tracing::info!(stage = "sanity_probe", elapsed_ms = 0u64, "S7 阶段耗时");
+        let sanity = buf.contents();
+        assert!(
+            sanity.contains("sanity_probe"),
+            "捕获装置自检失败（全局订阅者未生效），捕获长度={}；内容:\n{sanity}",
+            sanity.len()
+        );
+
+        let (session, h) = connect(FixtureState::default()).await;
+        session.disconnect().await.unwrap();
+        h.abort();
+
+        let logs = buf.contents();
+        for stage in [
+            "tcp_connect",
+            "cotp_cr_send",
+            "cotp_cc_recv",
+            "s7_setup_send",
+            "s7_setup_recv",
+        ] {
+            assert!(
+                logs.contains(stage),
+                "缺少阶段 `{stage}` 的计时事件；实际日志:\n{logs}"
+            );
+        }
+        assert!(
+            logs.contains("elapsed_ms"),
+            "阶段事件必须携带 elapsed_ms 字段；实际日志:\n{logs}"
+        );
+        // 安全边界：阶段日志不得包含连接目标（A22 证据要求可脱敏）。
+        assert!(
+            !logs.contains("local_tsap") && !logs.contains("remote_tsap"),
+            "阶段日志不得输出 TSAP 等连接配置；实际日志:\n{logs}"
+        );
+    }
 }
