@@ -169,3 +169,45 @@ C3-D 采用 **(A)**；如需 (B) 请明确指示。（本文档按 (A) 冻结。
   C3-C 只把**编辑态的检查入口**换到 Endpoint-bound 路径，其余保持不变。
 - **C2 的"编辑态含 marker 即禁用测试"限制在本轮解除**——但**仅在** Endpoint-bound
   路径真正可用（C3-A/C3-B 通过验收）之后解除；在此之前保持禁用，不得显示虚假成功。
+
+## 10. C3-C 必须闭合的接缝：`touched + 空 Secret` 必须显式表达为 `clear_secret`
+
+评审确认的待办，先落进文档以免丢失。**本节只登记要求，不在 C3-A 修复轮实施，前端零改动。**
+
+### 10.1 缺口：空值在前端被丢弃，服务端把"缺席"读成"继承"
+
+- C2 的归一化/清洗会**丢弃空值**：
+  - `normalizeConnection`（`apps/mesa-web/src/connection/connectionSetupModel.ts:322-328`）
+    对 `null` / `undefined` / `""` 直接 `continue`，该 key **不进入** canonical；
+  - `cleanConnection`（`apps/mesa-web/src/deviceModel.ts:110-119`）再次剔除
+    `undefined` / `null` / `""`（`false` / `0` 保留）。
+- 服务端契约（本文档 §4）把**字段缺失**定义为"按现有 PUT 契约继承旧值"，把
+  `{"clear_secret": true}` 定义为"明确清除，**不得**继承旧值"。
+- ⇒ 用户在**可见的 Secret 字段**里清空密码时，线上负载表现为 **key 缺席**，服务端
+  于是**继承旧密码**——正好命中契约 §2 明令禁止的"偷偷回退到旧密码"。
+  根因是 `touched` 目前只在前端内部使用，**从不进入请求体**，服务端看不到"用户清空"这一意图。
+
+### 10.2 两个出口都必须修（缺一个就会自相矛盾）
+
+| 出口 | 当前行为 | C3-C 要求 |
+|---|---|---|
+| ① 编辑态**连接检查** `POST /api/v1/endpoints/{id}/connection-check` | 缺席 → 继承旧值 → 拿旧密码去检查 | `touched + 空 Secret` → 显式 `{"clear_secret": true}`，走"清除优先" |
+| ② 编辑态**正式保存** `PUT /api/v1/endpoints/{id}` | 缺席 → 保留旧值（`crates/core-api/src/lib.rs:2033-2050` 的 `None =>` 分支） | 同上，否则"用户清了密码、保存后旧密码仍在" |
+
+只修①会让"检查说不需要密码"与"保存后旧密码还在"互相矛盾；只修②则用户测试时仍被旧
+凭据蒙骗（测试通过不代表保存后生效）。因此两个出口必须**成对**修为同一口径。
+
+### 10.3 转换规则（严格限定范围，禁止扩大）
+
+- **只**针对 Descriptor 声明为 Secret（`FieldType::Secret`）的字段；
+- **只**在 `Draft.touched` 命中且当前值为空（`isEmptyConnectionValue`）时转换；
+- **未触碰**的空值（程序初始化 / 快照装载物化出来的空）**不得**当作清除——C2 的
+  `preserveHiddenFields`（`connectionSetupModel.ts:540-543`）已经是这个口径，C3-C 与之保持一致；
+- **不要**修改所有字段的空值处理规则：非 Secret 字段走"整体替换 + `required` 裁决"，
+  改动全局空值规则会波及隐藏字段补齐语义与既有 347 项前端测试；
+- 转换出来的 `{"clear_secret": true}` 在服务端 Secret 字段上是**合法形态**
+  （C3-A 的 `classify_secret_value` 已支持），因此 C3-C **不得**再以"含 marker 即禁用
+  测试"（`secretMarkerKeys`，`useConnectionSetup.ts:471/608/687`）为由拦住检查入口；
+  该限制的解除前提仍是 C3-A/C3-B 通过验收；
+- 必须补专门测试（契约 §4 已要求）：`touched + 空 Secret` → 线上负载含 `clear_secret`，
+  且①检查与②保存两侧都不再回退到旧凭据。

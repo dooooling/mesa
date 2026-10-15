@@ -510,11 +510,18 @@ pub(crate) enum SecretRefError {
     Store(StoreError),
 }
 
-/// SecretStore 读取的**唯一**底层入口（C1 运行期构造与 C3 草稿检查共用）。
+/// SecretStore 读取的**唯一**底层入口（C1 运行期构造、PUT 的 Secret 分支与 C3
+/// 草稿检查共用）。
 ///
 /// 为什么值得单独抽一层：调用方需要区分的是「没有这条 Secret」（`Ok(None)`，
 /// 语义由调用方决定）与「读不出来」（`Err`，一律基础设施故障），而
 /// `StoreError` 自身无法表达这个区别（缺记录与解密失败在业务语义上完全不同）。
+///
+/// 为什么 PUT 也要走这里：`update_endpoint()` 的「marker 保留」与「缺失继承」
+/// 两个分支都直接查 SecretStore，而 C3 的 `connection-check` 必须与它逐字段
+/// 同源（否则会出现「PUT 会继承、检查却不继承」的偏差）。让两侧共用同一个函数
+/// 后，这种对齐是**代码级事实**而不是两段相似代码的巧合；函数体是直通的
+/// `get_secret`，行为与错误类型完全不变。
 pub(crate) fn read_stored_secret(
     store: &ConfigStore,
     endpoint_id: &str,
@@ -1989,7 +1996,8 @@ async fn update_endpoint(
                         }
                         Some(v) if is_secret_marker(&v) => {
                             // marker：须存在旧值；logical 物化真实旧值参检
-                            match state.store.get_secret(&id, sk) {
+                            //（走唯一读入口 `read_stored_secret`，与 C3 检查同源）
+                            match read_stored_secret(&state.store, &id, sk) {
                                 Ok(Some(pt)) => {
                                     if let Some(lo) = logical_obj.as_mut() {
                                         lo.insert(sk.clone(), serde_json::Value::String(pt));
@@ -2025,8 +2033,11 @@ async fn update_endpoint(
                         None => {
                             // 缺失 → 保留旧值：旧值存在则 logical 继承真实值参检，
                             // persistence 保持 marker；无旧值则两侧都缺失
-                            //（required 与否由统一校验裁决）
-                            match state.store.get_secret(&id, sk) {
+                            //（required 与否由统一校验裁决）。
+                            // 这里是 C3 `connection-check` 的缺失继承**对齐基准**：
+                            // 直接查 SecretStore（唯一读入口）而不是解析
+                            // `connection_json`，因此连接检查必须同样先查 SecretStore。
+                            match read_stored_secret(&state.store, &id, sk) {
                                 Ok(Some(pt)) => {
                                     if let Some(lo) = logical_obj.as_mut() {
                                         lo.insert(sk.clone(), serde_json::Value::String(pt));

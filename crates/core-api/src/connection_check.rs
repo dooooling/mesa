@@ -20,6 +20,18 @@
 //! `desired_running` / 任务 / 运行态，不启停 Endpoint，不连接真实设备。
 //! 明文只允许在本进程内存中短暂存在（C3-B 交给临时 Driver 用），**绝不**进入
 //! HTTP 响应体、`tracing` 日志或错误文本。
+//!
+//! # Secret 继承（与 PUT 同源，两条 fail-closed 边界）
+//!
+//! 草稿省略某个 Secret 字段时的继承**逐步对齐** `update_endpoint()` 的缺失分支：
+//! 先按 Descriptor 字段名查 SecretStore（唯一读入口 [`read_stored_secret`]，恒定带
+//! `endpoint_id`），**查无记录才**回退历史 `connection_json`（兼容明文残留/marker）。
+//! 两条 fail-closed 边界：
+//! ① 「确实需要继承」而已保存 `connection_json` 不是合法 JSON 对象 → 503
+//!    `PERSISTED_CONNECTION_INVALID`，绝不把「读不到已保存配置」当成「没有旧凭据」
+//!    继续匿名检查/探测（C1 `materialize_connection()` 同款口径）；
+//! ② SecretStore 读不出来 → 503 `SECRET_STORE_UNAVAILABLE`，不得降级为匿名连接。
+//! 反之，草稿已给全所有 Secret 字段时不需要继承，损坏的历史记录**不得**拦下检查。
 
 use std::sync::Arc;
 
@@ -31,7 +43,8 @@ use mesa_core_types::SchemaDescriptor;
 use serde::Deserialize;
 
 use crate::{
-    AppState, SecretRefError, json_error, materialize_secret_markers_in_place, secret_field_keys,
+    AppState, SecretRefError, json_error, materialize_secret_markers_in_place, read_stored_secret,
+    secret_field_keys,
 };
 
 // ---------------------------------------------------------------------------
@@ -309,46 +322,120 @@ fn resolve_connection_draft(
         }
     }
 
-    // ③ 草稿省略的 Secret 字段：按 PUT 契约继承旧值（SecretStore 优先；兼容
-    //    历史记录里的明文残留）。无旧值就保持缺失，由统一校验按 required 裁决
-    //    （必填凭据缺失 → REQUIRED → 400）。
+    // ③ 草稿省略的 Secret 字段：与 PUT **完全一致**地继承旧值。
+    //
+    //    对齐依据是 `update_endpoint()` 的缺失分支（`lib.rs:2033-2050` 原文）：
+    //
+    //    ```ignore
+    //    None => {                                   // 草稿里该 Secret 字段缺失
+    //        match state.store.get_secret(&id, sk) { // ← 直接查 SecretStore，且 sk
+    //            Ok(Some(pt)) => { /* 继承真实值参检；落盘写回 marker */ }  // 取自
+    //            Ok(None) => {}                       // secret_field_keys(desc)
+    //            Err(e) => return store_err_to_response(e),
+    //        }
+    //    }
+    //    ```
+    //
+    //    ⇒ PUT **不解析 `connection_json`**。因此这里也必须**先查 SecretStore**
+    //    （同一入口 [`crate::read_stored_secret`]、同一参数 `(endpoint_id, field_path)`、
+    //    同一字段名来源 `secret_field_keys()`），旧 `connection_json` **只**在
+    //    SecretStore 查无记录时作为历史明文/marker 的兼容回退。C3-A 早期实现只依赖
+    //    旧 JSON 里存在 marker，于是出现「SecretStore 有记录、旧 JSON 无 marker ⇒
+    //    PUT 会继承、检查却不继承」的偏差：同一份草稿在两条路径上结论不同。
     //
     //    被 ② 明确清除的字段**不参与**继承：清除是用户的显式意图，若允许它从
     //    已保存记录里回填，就等于「用户清了密码，服务端偷偷拿旧密码去连」——
-    //    契约 §2/§4 明令禁止。这一条是「清除优先」真正落地的地方。
+    //    契约 §2/§4 明令禁止。这一条是「清除优先」真正落地的地方（红线①）。
     let missing: Vec<&String> = secret_keys
         .iter()
         .filter(|k| !obj.contains_key(*k) && !cleared_fields.contains(*k))
         .collect();
     if !missing.is_empty() {
-        // 只有确实需要继承时才解析已保存记录：草稿完整时它不参与检查，
-        // 一份损坏的历史记录也就不该拦下「用户已经填全」的检查。
+        // 需要继承 ⇒ 已保存记录必须是一份**可信的合法 JSON 对象**，否则 fail-closed
+        // （503），绝不退化成「读不到旧凭据 ⇒ 本次不带凭据去连」。
+        //
+        // 为什么不能沿用旧的 `.ok()` 静默吞掉：那会把「已保存配置损坏」降级成
+        // 「没有旧凭据」，随后以**空凭据**继续校验/探测——即匿名连接，与 C1
+        // `materialize_connection()` 在坏 JSON 上的 fail-closed 口径相矛盾，也正是
+        // 评审指出的安全边界缺口。注意 Secret 可能是**可选**字段，此时匿名形态本身
+        // 就是合法配置，只有 fail-closed 才拦得住。
+        //
+        // 为什么只在 `missing` 非空时解析：草稿已给全所有 Secret 字段时，历史记录的
+        // 好坏与被检查的连接无关，不该拦下「用户已经填全」的检查。
+        //
+        // 为什么错误文本不回显原始 JSON：历史 `connection_json` 可能含明文残留，
+        // 回显等于把凭据带进响应/日志（脱敏红线）；这里只报「损坏」这一事实。
         let persisted = serde_json::from_str::<serde_json::Value>(persisted_connection_json)
             .ok()
             .filter(serde_json::Value::is_object);
-        if let Some(persisted_obj) = persisted.as_ref().and_then(|p| p.as_object()) {
-            for key in missing {
-                let Some(v) = persisted_obj.get(key) else {
+        let Some(persisted_obj) = persisted.as_ref().and_then(|p| p.as_object()) else {
+            return Err(CheckError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PERSISTED_CONNECTION_INVALID",
+                format!(
+                    "endpoint `{endpoint_id}` 已保存的连接配置损坏（非法 JSON 或非对象），\
+                     无法安全继承凭据；请在本次请求中显式提供相关 Secret 字段后重试"
+                ),
+            ));
+        };
+
+        for key in missing {
+            // ③-1 SecretStore 优先（PUT 同款查询，恒定带 endpoint_id ⇒ C3-07 隔离）。
+            match read_stored_secret(store, endpoint_id, key) {
+                Ok(Some(_)) => {
+                    // 保留 marker 形态交给 ④ 统一物化，而不是把明文直接塞进草稿：
+                    // ①「引用 → 明文」只有一处实现，不会与运行期/C1 分叉；② 与 PUT
+                    // 继承时写回的落盘形态一致；③ `stored_fields` 因此天然记录到本次
+                    // 由 SecretStore 提供的字段（只有字段名、无明文）。多发一次同一条
+                    // 记录的读请求没有任何副作用（本接口全程只读）。
+                    obj.insert(key.clone(), serde_json::json!({ "secret_set": true }));
                     continue;
-                };
-                match classify_secret_value(v) {
-                    SecretValue::Plaintext => {
-                        obj.insert(key.clone(), v.clone());
-                    }
-                    // 历史记录里的引用同样是「必须能解析」的引用：读不到就
-                    // 明确失败，绝不退化成「本次不带凭据去连」。
-                    SecretValue::Reference => {
-                        obj.insert(key.clone(), v.clone());
-                    }
-                    // 旧记录本身就是空的 → 没有可继承的值。
-                    SecretValue::Clear => {}
-                    SecretValue::Invalid(reason) => {
-                        return Err(CheckError::new(
-                            StatusCode::BAD_REQUEST,
-                            "INVALID_SECRET_MARKER",
-                            format!("field `{key}`（已保存记录）: {reason}"),
-                        ));
-                    }
+                }
+                // 查无记录 → 与 PUT 的 `Ok(None) => {}` 一致：**不报错**，保持缺失，
+                // 是否合法交由 ④ 之后的统一校验（required 等）裁决；这里转去做历史
+                // JSON 兼容回退。
+                Ok(None) => {}
+                // 读不出来（master.key 丢失、AEAD 解密失败、SQLite 故障）→ 503
+                // （红线②）：绝不当作「没有旧凭据」。
+                //
+                // NOTE（与 PUT 的**一处刻意差异**）：PUT 在同情形走
+                // `store_err_to_response()`——AEAD 解密失败是 `StoreError::Validation`，
+                // 会被映射成 400 VALIDATION_ERROR。这里保持契约 §5 冻结的 503
+                // `SECRET_STORE_UNAVAILABLE`：密钥丢失既不是参数错误也不是设备不可达，
+                // 报 400 会把用户引向改参数，而不是去修密钥。差异点与理由记录在此，
+                // 以便日后统一时不会误判为遗漏。
+                Err(e) => {
+                    return Err(CheckError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "SECRET_STORE_UNAVAILABLE",
+                        format!("SecretStore 不可用，拒绝以不明凭据状态检查连接: {e}"),
+                    ));
+                }
+            }
+
+            // ③-2 历史兼容回退（**仅** SecretStore 查无记录时生效）：兼容 C1 之前的
+            //      明文落盘形态，以及旧记录里留下的 marker。
+            let Some(v) = persisted_obj.get(key) else {
+                continue;
+            };
+            match classify_secret_value(v) {
+                // 历史明文残留：只用在本次内存草稿里，不写回任何地方。
+                SecretValue::Plaintext => {
+                    obj.insert(key.clone(), v.clone());
+                }
+                // 历史记录里的引用同样是「必须能解析」的引用：交给 ④；读不到就
+                // 明确失败，绝不退化成「本次不带凭据去连」。
+                SecretValue::Reference => {
+                    obj.insert(key.clone(), v.clone());
+                }
+                // 旧记录本身就是空的 → 没有可继承的值。
+                SecretValue::Clear => {}
+                SecretValue::Invalid(reason) => {
+                    return Err(CheckError::new(
+                        StatusCode::BAD_REQUEST,
+                        "INVALID_SECRET_MARKER",
+                        format!("field `{key}`（已保存记录）: {reason}"),
+                    ));
                 }
             }
         }
@@ -780,6 +867,294 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.code, "SECRET_NOT_FOUND");
+    }
+
+    // -----------------------------------------------------------------------
+    // 修复 1：需要继承而 connection_json 损坏 ⇒ fail-closed（不得匿名降级）
+    // -----------------------------------------------------------------------
+
+    /// 需要继承 Secret，而持久化 `connection_json` 损坏（非法 JSON / 非对象）时
+    /// 必须 503 `PERSISTED_CONNECTION_INVALID`：**不得**把「读不到旧配置」当成
+    /// 「没有旧凭据」继续走匿名校验/探测。
+    ///
+    /// 「没有走匿名路径」的断言方式：匿名形态在这份 Schema（Secret 可选）下**本身
+    /// 合法**，因此唯一的拦截点就是这里——每个用例都要求 `Err`；而在 `run_check`
+    /// 中只有拿到 `Ok(draft)` 才可能返回 200 `{"valid": true}`（匿名检查成功的
+    /// 形态）。预置断言把这一点钉死，避免日后有人「顺手」把错误吞掉后测试仍然绿。
+    ///
+    /// 为什么坏串直接作为参数传入而不是写进库：`config-store` 的三条写路径都会
+    /// 校验 `connection_json` 必须是合法 JSON 对象（`lib.rs:951-1075` 等），坏记录
+    /// 只可能来自**历史遗留行**（早于写时校验）/带外修改/存储损坏——这正是 C1
+    /// `materialize_connection()` 在坏 JSON 上 fail-closed 的理由。这里按
+    /// `run_check()` 的真实形态，把坏串当作 `rec.connection_json` 交给解析函数。
+    #[test]
+    fn persisted_json_invalid_and_secret_needs_inheritance_fails_closed() {
+        const LEAK_MARKER: &str = "leak-marker";
+        const OLD_PW: &str = "old-pw";
+        /// 库中那一行仍是合法对象：只读路径必须保持它逐字节不变。
+        const STORED: &str = r#"{"endpoint_url":"opc.tcp://a:4840"}"#;
+
+        let schema = test_schema(false);
+        let draft = serde_json::json!({ "endpoint_url": "opc.tcp://a:4840" });
+        assert!(
+            schema.validate_instance("connection", &draft).is_empty(),
+            "预置：匿名形态是合法配置，只能靠 fail-closed 拦住，不能指望校验兜底"
+        );
+
+        // 损坏形态 × SecretStore 有无记录：每一种都必须失败（有记录时更不能因为
+        // 「凭据其实读得到」就放行——需要继承即代表已保存配置必须可信）。
+        for (label, broken, has_record) in [
+            (
+                "非法 JSON（截断）",
+                r#"{"endpoint_url":"opc.tcp://leak-marker:4840","password":"old-pw"#,
+                true,
+            ),
+            (
+                "非法 JSON（多余括号）",
+                r#"{"endpoint_url":"opc.tcp://leak-marker:4840"}}"#,
+                true,
+            ),
+            ("非对象（数组）", r#"[{"password":"old-pw"}]"#, true),
+            ("非对象（字符串）", r#""old-pw""#, true),
+            ("非对象（null）", "null", true),
+            ("空字符串", "", true),
+            ("非法 JSON 且无记录", "{oops", false),
+        ] {
+            let store = store_with_endpoint("e1", STORED);
+            if has_record {
+                store
+                    .put_secret("e1", "password", OLD_PW, "master")
+                    .unwrap();
+            }
+            let err = resolve_connection_draft(&draft, "e1", broken, &schema, &store).expect_err(
+                &format!("{label}: 需要继承 + 已保存配置损坏 ⇒ 必须 fail-closed，不得匿名放行"),
+            );
+            assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE, "{label}");
+            assert_eq!(err.code, "PERSISTED_CONNECTION_INVALID", "{label}");
+            // 脱敏：错误文本不得回显历史配置的任何内容（可能含明文残留）。
+            assert!(
+                !err.message.contains(LEAK_MARKER) && !err.message.contains(OLD_PW),
+                "{label}: 错误文本不得回显已保存配置内容: {}",
+                err.message
+            );
+            // 无副作用：拒绝路径不得「顺手修好」或改写持久化记录。
+            assert_eq!(
+                store.get_endpoint("e1").unwrap().unwrap().connection_json,
+                STORED,
+                "{label}: 检查失败也不得写入 connection_json"
+            );
+        }
+    }
+
+    /// 反向用例：草稿已给全**所有** Secret 字段（明文 / 明确清除 / 可用引用）时
+    /// 不需要继承，损坏的历史记录**不得**拦下检查——保持「只有确实需要继承时才
+    /// 解析已保存记录」的既有设计意图。
+    #[test]
+    fn corrupt_persisted_json_does_not_block_check_when_draft_supplies_all_secrets() {
+        const STORED: &str = r#"{"endpoint_url":"opc.tcp://a:4840"}"#;
+        let schema = test_schema(true);
+        for (label, broken) in [
+            ("非法 JSON", "{oops"),
+            ("非对象（数组）", "[1,2]"),
+            ("空字符串", ""),
+        ] {
+            for (what, draft) in [
+                (
+                    "草稿给新明文",
+                    serde_json::json!({"endpoint_url": "opc.tcp://a:4840", "password": "new-pw"}),
+                ),
+                (
+                    "草稿明确清除",
+                    serde_json::json!({"endpoint_url": "opc.tcp://a:4840", "password": {"clear_secret": true}}),
+                ),
+                (
+                    "草稿引用已存 Secret",
+                    serde_json::json!({"endpoint_url": "opc.tcp://a:4840", "password": {"secret_set": true}}),
+                ),
+            ] {
+                let store = store_with_endpoint("e1", STORED);
+                store
+                    .put_secret("e1", "password", "old-pw", "master")
+                    .unwrap();
+                let out = resolve_connection_draft(&draft, "e1", broken, &schema, &store)
+                    .unwrap_or_else(|e| {
+                        panic!("{label} + {what}: 不需要继承时损坏记录不得拦下检查: {e:?}")
+                    });
+                match what {
+                    "草稿给新明文" => assert_eq!(out.connection["password"], "new-pw"),
+                    "草稿明确清除" => {
+                        assert!(out.connection.get("password").is_none());
+                        assert_eq!(out.cleared_fields, vec!["password".to_string()]);
+                    }
+                    // 引用由 ④ 统一物化，与损坏的历史记录无关。
+                    _ => assert_eq!(out.connection["password"], "old-pw"),
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 修复 2：缺失继承必须与 PUT 的缺失分支逐条一致
+    // -----------------------------------------------------------------------
+
+    /// SecretStore 有记录、而旧 `connection_json` 里**没有**该字段（评审指出的
+    /// 偏差场景）时，缺失继承必须成功：PUT 的缺失分支就是直接查 SecretStore。
+    #[test]
+    fn missing_secret_inherits_from_store_even_when_old_json_lacks_the_field() {
+        // 旧 JSON 完全没有 password key，也没有任何 marker。
+        let persisted = r#"{"endpoint_url":"opc.tcp://a:4840"}"#;
+        let store = store_with_endpoint("e1", persisted);
+        store
+            .put_secret("e1", "password", "old-pw", "master")
+            .unwrap();
+
+        let out = resolve_connection_draft(
+            &serde_json::json!({"endpoint_url": "opc.tcp://a:4840"}),
+            "e1",
+            persisted,
+            &test_schema(false),
+            &store,
+        )
+        .expect("SecretStore 有记录就必须继承，不得依赖旧 JSON 里是否留了 marker");
+
+        assert_eq!(
+            out.connection["password"], "old-pw",
+            "继承来源是 SecretStore，而不是旧 connection_json"
+        );
+        assert_eq!(out.stored_fields, vec!["password".to_string()]);
+        assert!(out.inline_fields.is_empty());
+        // 只读：SecretStore 与持久化行都逐值不变。
+        assert_eq!(
+            store.get_secret("e1", "password").unwrap().as_deref(),
+            Some("old-pw")
+        );
+        assert_eq!(
+            store.get_endpoint("e1").unwrap().unwrap().connection_json,
+            persisted
+        );
+    }
+
+    /// 对齐性测试：同一场景下 connection-check 的缺失继承与 PUT 缺失分支结论一致。
+    ///
+    /// 为什么不去直接驱动 PUT handler：`update_endpoint()` 取 Descriptor 依赖
+    /// `MesaManager::get_descriptor()`，而它必须**临时 spawn 真实驱动进程**；core-api
+    /// 单测环境里没有可启动的驱动二进制（既有 `runtime.rs` 测试正是靠「Descriptor
+    /// 必然失败」验证 fail-closed 分支），强行拉起 PUT 只能得到 503
+    /// `DRIVER_UNAVAILABLE`，根本走不到 Secret 分支。
+    ///
+    /// 因此这里改为断言**两侧的继承来源是同一个调用**：PUT 缺失分支（`lib.rs:2040`）
+    /// 的原文是 `match read_stored_secret(&state.store, &id, sk)`，`sk` 取自
+    /// `secret_field_keys(&desc.connection)`；测试用同一 `(endpoint_id, field_path)`、
+    /// 同一字段名来源执行它，并与 connection-check 的解析结果逐值比对。两侧自本次
+    /// 修复起共用 `read_stored_secret`，因此「读到/读不到」的分支归属也必然一致。
+    #[test]
+    fn missing_secret_inheritance_matches_put_missing_branch() {
+        // 预置：两侧的字段名来源都是 Descriptor 的 `secret_field_keys()`。
+        assert_eq!(
+            secret_field_keys(&test_schema(false)),
+            vec!["password".to_string()],
+            "PUT 与 connection-check 的字段名都必须取自 Descriptor"
+        );
+        let persisted = r#"{"endpoint_url":"opc.tcp://a:4840"}"#;
+        let draft = serde_json::json!({"endpoint_url": "opc.tcp://a:4840"});
+
+        // 场景 1：旧 JSON 无该字段 + SecretStore 有记录 → 两侧都继承同一个值。
+        let store = store_with_endpoint("e1", persisted);
+        store
+            .put_secret("e1", "password", "old-pw", "master")
+            .unwrap();
+        let put_inherits = read_stored_secret(&store, "e1", "password").unwrap();
+        assert_eq!(
+            put_inherits.as_deref(),
+            Some("old-pw"),
+            "预置：PUT 的缺失分支（lib.rs:2041 `Ok(Some(pt))`）会继承该值"
+        );
+        let check = resolve_connection_draft(&draft, "e1", persisted, &test_schema(false), &store)
+            .expect("检查侧必须继承");
+        assert_eq!(
+            check.connection["password"], "old-pw",
+            "同一场景下 PUT 与 connection-check 必须继承同一个值"
+        );
+
+        // 场景 2：PUT 保存**之后**的落盘形态（缺失继承会把 marker 写回
+        // connection_json）再喂给检查，仍必须解析出同一个值——这是
+        // 「PUT 保存 → 再检查」的真实序列，两侧不得有落差。
+        let after_put = r#"{"endpoint_url":"opc.tcp://a:4840","password":{"secret_set":true}}"#;
+        let check_after_put =
+            resolve_connection_draft(&draft, "e1", after_put, &test_schema(false), &store)
+                .expect("PUT 落盘的 marker 形态必须能被检查解析");
+        assert_eq!(check_after_put.connection["password"], "old-pw");
+
+        // 场景 3（反向对齐）：SecretStore 无记录 ⇒ PUT 的 `Ok(None) => {}` 什么都不
+        // 继承；检查侧同样保持缺失而**不报错**（是否必填由统一校验裁决）。
+        let store2 = store_with_endpoint("e9", persisted);
+        let put_inherits_nothing = read_stored_secret(&store2, "e9", "password").unwrap();
+        assert!(
+            put_inherits_nothing.is_none(),
+            "预置：PUT 侧 `Ok(None)`，无旧值可继承"
+        );
+        let check2 =
+            resolve_connection_draft(&draft, "e9", persisted, &test_schema(false), &store2)
+                .expect("无旧值不是错误：与 PUT 的 Ok(None) 分支一致");
+        assert!(
+            check2.connection.get("password").is_none(),
+            "与 PUT 一致：无旧值就保持缺失，绝不发明凭据"
+        );
+    }
+
+    /// 红线②（继承路径）：**缺失继承**读 SecretStore 失败时同样是 503，绝不当作
+    /// 「没有旧凭据」继续匿名检查。旧实现只解析旧 JSON，这条路径根本不读
+    /// SecretStore，因此坏密钥会被静默忽略——本用例把该缺口钉死。
+    #[test]
+    fn store_failure_during_inheritance_is_503_not_anonymous() {
+        let base = std::env::temp_dir().join(format!(
+            "mesa-c3-check-inherit-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        let db = base.join("mesa.db");
+        // 旧 JSON **不含** password：继承只能来自 SecretStore。
+        let persisted = r#"{"endpoint_url":"opc.tcp://a:4840"}"#;
+        {
+            let s = ConfigStore::open(&db).unwrap();
+            s.create_device(&DeviceRecord {
+                id: "d1".into(),
+                name: "D".into(),
+            })
+            .unwrap();
+            s.create_endpoint(&EndpointRecord {
+                id: "e1".into(),
+                name: "e1".into(),
+                device_id: "d1".into(),
+                driver_id: "opcua".into(),
+                connection_json: persisted.into(),
+                desired_running: false,
+                updated_at_ns: 0,
+            })
+            .unwrap();
+            s.put_secret("e1", "password", "top-secret-pw", "master")
+                .unwrap();
+        }
+        // 换成另一把**合法**密钥 → AEAD 认证失败（密钥丢失/轮换的典型形态）。
+        std::fs::write(base.join("master.key"), [0x5Au8; 32]).unwrap();
+        let broken = ConfigStore::open(&db).unwrap();
+
+        let err = resolve_connection_draft(
+            &serde_json::json!({"endpoint_url": "opc.tcp://a:4840"}),
+            "e1",
+            persisted,
+            &test_schema(false),
+            &broken,
+        )
+        .expect_err("SecretStore 读失败时不得退化成「没有旧凭据」的匿名检查");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code, "SECRET_STORE_UNAVAILABLE");
+        assert!(
+            !err.message.contains("top-secret-pw"),
+            "错误文本不得回显明文: {}",
+            err.message
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     // -----------------------------------------------------------------------
