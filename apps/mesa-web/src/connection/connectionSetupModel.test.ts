@@ -2,16 +2,24 @@ import { describe, expect, it } from "vitest";
 
 import {
   classifyProbeOutcome,
+  containsSecretMarker,
   describeOutcome,
   groupFields,
   initialSetupState,
+  isBooleanField,
+  isIntegerField,
+  isFieldVisible,
   isResultCurrent,
+  isSecretField,
+  isSecretMarker,
   missingRequiredAdvanced,
   networkFailureOutcome,
   normalizeConnection,
   outcomeTone,
   parseIntInput,
   safeText,
+  secretMarkerKeys,
+  secretUnavailableOutcome,
   withDriverChange,
   withFieldChange,
   type FieldDescriptor,
@@ -230,8 +238,7 @@ describe("探测结果分类与展示（A09/A10/A11/A26）", () => {
   });
 });
 
-describe("预设分级（V1.1 §5.2/§5.3）", () => {
-  it("单台 828D 实测值只能是 site_tested_example，不得自动预填", () => {
+describe("预设分级（V1.1 §5.2/§5.3）", () => {  it("单台 828D 实测值只能是 site_tested_example，不得自动预填", () => {
     expect(NCK_828D_SITE_TESTED.scope).toBe("site_tested_example");
     expect(autoApplicablePreset("sinumerik-nck", "828d")).toBeNull();
   });
@@ -258,5 +265,163 @@ describe("预设分级（V1.1 §5.2/§5.3）", () => {
   it("没有 family 时不返回任何预设（不跨系列猜测）", () => {
     expect(autoApplicablePreset("sinumerik-nck", null)).toBeNull();
     expect(selectablePresets("sinumerik-nck", null)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 字段类型判定：wire 形态是小写（core-types `#[serde(rename_all="lowercase")]`）
+// ---------------------------------------------------------------------------
+
+describe("条件可见字段（ui.visible_if）", () => {
+  const fields: FieldDescriptor[] = [
+    { key: "use_native", label: "Use native", field_type: "boolean", required: false, default: false, ui: { order: 1 } },
+    {
+      key: "native_pdu",
+      label: "PDU",
+      field_type: "integer",
+      required: true,
+      default: 8192,
+      validation: { min: 512, max: 8192 },
+      ui: { order: 10, advanced: true, visible_if: { field: "use_native", op: "eq", value: true } },
+    },
+  ];
+
+  it("条件不满足时：既不提交该字段，也不报必填（否则用户永远无法提交）", () => {
+    const { connection, issues } = normalizeConnection({ use_native: false }, fields);
+    expect(issues).toEqual([]);
+    expect(connection.use_native).toBe(false);
+    expect("native_pdu" in connection).toBe(false);
+    expect(missingRequiredAdvanced(fields, { use_native: false })).toEqual([]);
+  });
+
+  it("条件满足时：按正常规则校验与提交", () => {
+    const ok = normalizeConnection({ use_native: true, native_pdu: "4096" }, fields);
+    expect(ok.issues).toEqual([]);
+    expect(ok.connection.native_pdu).toBe(4096);
+    expect(missingRequiredAdvanced(fields, { use_native: true })).toEqual([]);
+
+    // 可见且缺失 → 必须报必填并出现在「高级缺失」里（触发自动展开）
+    const missing = normalizeConnection({ use_native: true }, fields);
+    expect(missing.connection.native_pdu).toBe(8192); // 有默认值则物化
+    expect(missingRequiredAdvanced(fields, { use_native: true, native_pdu: "" })).toEqual([
+      "native_pdu",
+    ]);
+  });
+
+  it("isFieldVisible 与 DescriptorFields 的可见性判定同源（eq/neq/in/无条件）", () => {
+    expect(isFieldVisible(fields[1], { use_native: true })).toBe(true);
+    expect(isFieldVisible(fields[1], { use_native: false })).toBe(false);
+    expect(isFieldVisible(fields[0], {})).toBe(true);
+    const neq: FieldDescriptor = { key: "x", ui: { visible_if: { field: "mode", op: "neq", value: "a" } } };
+    expect(isFieldVisible(neq, { mode: "b" })).toBe(true);
+    expect(isFieldVisible(neq, { mode: "a" })).toBe(false);
+    const inOp: FieldDescriptor = { key: "y", ui: { visible_if: { field: "mode", op: "in", value: ["a", "b"] } } };
+    expect(isFieldVisible(inOp, { mode: "b" })).toBe(true);
+    expect(isFieldVisible(inOp, { mode: "c" })).toBe(false);
+  });
+});
+
+describe("字段类型判定（wire 小写）", () => {  it("小写 integer/port/duration 必须做范围校验（不能因为大小写漏掉）", () => {
+    expect(isIntegerField("integer")).toBe(true);
+    expect(isIntegerField("port")).toBe(true);
+    expect(isIntegerField("duration")).toBe(true);
+    // 历史 PascalCase 写法继续容忍
+    expect(isIntegerField("Integer")).toBe(true);
+    expect(isIntegerField("string")).toBe(false);
+    expect(isBooleanField("boolean")).toBe(true);
+    expect(isSecretField("secret")).toBe(true);
+
+    const fields: FieldDescriptor[] = [
+      { key: "port", label: "Port", field_type: "port", required: true, validation: { min: 1, max: 65535 } },
+      { key: "timeout_ms", label: "Timeout", field_type: "duration", required: true, validation: { min: 500, max: 10000 } },
+    ];
+    const { issues } = normalizeConnection({ port: 70000, timeout_ms: 10 }, fields);
+    expect(issues.map((i) => i.code).sort()).toEqual(["OUT_OF_RANGE", "OUT_OF_RANGE"]);
+  });
+
+  it("小写 boolean 必须为布尔值（字符串 true 不得混过）", () => {
+    const fields: FieldDescriptor[] = [
+      { key: "use_native", label: "Use native", field_type: "boolean", required: false },
+    ];
+    expect(normalizeConnection({ use_native: true }, fields).issues).toEqual([]);
+    expect(normalizeConnection({ use_native: "true" }, fields).issues[0].code).toBe("NOT_BOOLEAN");
+  });
+
+  it("小写 secret 原样透传：marker 保留，供保存时「不更新凭据」", () => {
+    const fields: FieldDescriptor[] = [
+      { key: "api_token", label: "Token", field_type: "secret", required: false },
+    ];
+    const { connection, issues } = normalizeConnection(
+      { api_token: { secret_set: true } },
+      fields,
+    );
+    expect(issues).toEqual([]);
+    expect(connection.api_token).toEqual({ secret_set: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Secret-safe 边界（V1.1 §9.4 / C2 约束）
+// ---------------------------------------------------------------------------
+
+describe("Secret marker 形状识别与阻断集合", () => {
+  it("isSecretMarker 只认 marker 形状，不把明文/普通对象误判", () => {
+    expect(isSecretMarker({ secret_set: true })).toBe(true);
+    expect(isSecretMarker({ clear_secret: true })).toBe(true);
+    expect(isSecretMarker("plain-password")).toBe(false);
+    expect(isSecretMarker({ other: 1 })).toBe(false);
+    expect(isSecretMarker(null)).toBe(false);
+    expect(isSecretMarker([{ secret_set: true }])).toBe(false);
+  });
+
+  it("containsSecretMarker 递归识别嵌套 marker", () => {
+    expect(containsSecretMarker({ auth: { password: { secret_set: true } } })).toBe(true);
+    expect(containsSecretMarker([{ x: 1 }, { clear_secret: true }])).toBe(true);
+    expect(containsSecretMarker({ auth: { password: "plain" } })).toBe(false);
+  });
+
+  it("按**形状**命中，不依赖字段名（api_token 也必须被识别）", () => {
+    const fields: FieldDescriptor[] = [
+      { key: "host", label: "Host", field_type: "host", required: true },
+      { key: "api_token", label: "Token", field_type: "secret", required: false },
+    ];
+    expect(secretMarkerKeys(fields, { host: "h", api_token: { secret_set: true } })).toEqual([
+      "api_token",
+    ]);
+  });
+
+  it("字段类型未声明为 secret，但值仍是 marker → 同样命中（形状优先）", () => {
+    const fields: FieldDescriptor[] = [
+      { key: "credentials", label: "Credentials", field_type: "string", required: false },
+    ];
+    expect(secretMarkerKeys(fields, { credentials: { secret_set: true } })).toEqual([
+      "credentials",
+    ]);
+  });
+
+  it("Secret 字段出现无法识别的对象值 → 保守阻断（对象不可能是密码）", () => {
+    const fields: FieldDescriptor[] = [
+      { key: "password", label: "Password", field_type: "secret", required: false },
+    ];
+    expect(secretMarkerKeys(fields, { password: { something: "new" } })).toEqual(["password"]);
+  });
+
+  it("用户重新输入明文后不再命中（测试随之解禁）", () => {
+    const fields: FieldDescriptor[] = [
+      { key: "password", label: "Password", field_type: "secret", required: false },
+    ];
+    expect(secretMarkerKeys(fields, { password: "new-secret" })).toEqual([]);
+    expect(secretMarkerKeys(fields, {})).toEqual([]);
+  });
+
+  it("secret_unavailable 是独立 outcome：不冒充设备不可达，也不冒充驱动不支持", () => {
+    const outcome = secretUnavailableOutcome("凭据未重新输入");
+    expect(outcome.kind).toBe("secret_unavailable");
+    const text = describeOutcome(outcome);
+    expect(text).toContain("未执行探测");
+    expect(text).toContain("凭据未重新输入");
+    expect(text).not.toContain("设备不可达");
+    expect(text).not.toContain("不支持此探测");
+    expect(outcomeTone(outcome)).toBe("warning");
   });
 });

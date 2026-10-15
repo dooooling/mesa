@@ -25,7 +25,9 @@ function mockFlow(opts: { failAt?: string } = {}) {
     }
     calls.push({ method, url, body });
     if (url === "/api/v1/drivers") {
-      return { ok: true, status: 200, json: async () => ({ drivers: [{ id: "s7", name: "Siemens S7" }] }) };
+      // C2：驱动清单必须显式给出 launchable（真实 DriverInfo 契约字段）。
+      // 面板只把 launchable=true 的驱动列为可选，缺字段即视为不可启动。
+      return { ok: true, status: 200, json: async () => ({ drivers: [{ id: "s7", name: "Siemens S7", launchable: true }] }) };
     }
     if (url === "/api/v1/drivers/s7/descriptor") {
       return { ok: true, status: 200, json: async () => DESC };

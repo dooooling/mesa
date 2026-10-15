@@ -22,6 +22,14 @@ export interface UiHints {
   order?: number | null;
   advanced?: boolean | null;
   placeholder?: string | null;
+  /** 条件可见：与 `DescriptorFields` 的渲染判定同源（同一套语义，不得两处各写一份） */
+  visible_if?: VisibilityCondition | null;
+}
+
+export interface VisibilityCondition {
+  field: string;
+  op: "eq" | "neq" | "in";
+  value: unknown;
 }
 
 export interface FieldValidation {
@@ -47,6 +55,98 @@ export interface Issue {
   path: string;
   code: string;
   message: string;
+}
+
+// ---------------------------------------------------------------------------
+// 字段类型判定
+//
+// 事实来源：`crates/core-types/src/schema.rs` 的 `FieldType` 用
+// `#[serde(rename_all = "lowercase")]`，因此 **wire 形态是小写**
+// （`integer` / `port` / `boolean` / `secret` / `duration` …），
+// `apps/mesa-web/src/types.ts` 与之对齐。
+// 这里统一按小写比较并容忍历史 PascalCase 写法，避免「模型认不出真实
+// Descriptor 的字段类型 → 跳过范围校验 / 把 Secret 当普通字符串」。
+// ---------------------------------------------------------------------------
+
+/** 是否整数类字段（需要按 min/max 做范围校验）。 */
+export function isIntegerField(fieldType: string | undefined): boolean {
+  const t = String(fieldType ?? "").toLowerCase();
+  return t === "integer" || t === "port" || t === "duration";
+}
+/** 是否布尔字段。 */
+export function isBooleanField(fieldType: string | undefined): boolean {
+  return String(fieldType ?? "").toLowerCase() === "boolean";
+}
+
+/** 是否 Secret 字段（凭据）。 */
+export function isSecretField(fieldType: string | undefined): boolean {
+  return String(fieldType ?? "").toLowerCase() === "secret";
+}
+
+/**
+ * Secret 的 **marker 形态**：后端持有旧凭据但不回显明文。
+ *
+ * `{secret_set:true}` = 已存有凭据；`{clear_secret:true}` = 已标记清除。
+ * 两者都不是密码，**绝不能**当作连接参数发给 probe / validate-connection
+ * （会把 marker 当口令去连设备，并把失败误报成「设备不可达」）。
+ */
+export function isSecretMarker(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const obj = value as Record<string, unknown>;
+  return obj.secret_set === true || obj.clear_secret === true;
+}
+
+/**
+ * 递归探测 marker 形状（对象/数组，深度受限）。
+ *
+ * 为什么按**形状**而不是按字段名/字段类型判断：凭据字段的命名会演进
+ * （`password` / `api_token` / `credentials` …），靠白名单必然漏；只要值里
+ * 出现 marker 形状，就说明它**不是可用的明文**，不能进 Probe 请求。
+ */
+export function containsSecretMarker(value: unknown, depth = 0): boolean {
+  if (depth > 4) return false;
+  if (isSecretMarker(value)) return true;
+  if (Array.isArray(value)) {
+    return value.some((item) => containsSecretMarker(item, depth + 1));
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.values(value as Record<string, unknown>).some((item) =>
+      containsSecretMarker(item, depth + 1),
+    );
+  }
+  return false;
+}
+
+/**
+ * 不能进入 probe / validate-connection 请求的字段。
+ *
+ * 判定规则（形状优先，与字段名无关）：
+ * 1. 值里（含嵌套）出现 marker 形状 → 命中；
+ * 2. 声明为 Secret 类型的字段出现任何对象值 → 一律命中（对象不可能是密码，
+ *    保守阻断优于把未知结构当明文发出去）。
+ *
+ * 注意：这些字段**可以保存**——marker 原样回传是「不更新凭据」的正确语义，
+ * 限制只针对需要真实凭据的 Probe/Validate（C3 的 Endpoint-bound
+ * `connection-check` 才解决「用已存凭据测试」的场景）。
+ */
+export function secretMarkerKeys(
+  fields: FieldDescriptor[],
+  raw: ConnectionValues,
+): string[] {
+  const declared = new Set(
+    fields.filter((f) => isSecretField(f.field_type)).map((f) => f.key),
+  );
+  const keys: string[] = [];
+  for (const [key, value] of Object.entries(raw)) {
+    if (containsSecretMarker(value)) {
+      keys.push(key);
+      continue;
+    }
+    if (declared.has(key) && value !== null && typeof value === "object") {
+      keys.push(key);
+    }
+  }
+  return keys;
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +233,27 @@ function rangeCheck(value: number, min: number, max: number): ParsedInt {
   return { ok: true, value };
 }
 
+/**
+ * 字段当前是否可见（`ui.visible_if`）。
+ *
+ * 为什么模型必须自己判一次：`normalizeConnection` 决定「提交什么」，
+ * `missingRequiredAdvanced` 决定「是否阻断提交」。若不看可见性，一个
+ * 条件不满足而**根本不会渲染**的必填字段会永远报「缺少必填」，让用户
+ * 无法提交；同时它的默认值还会被塞进请求体。判定规则与
+ * `components/DescriptorFields.tsx` 的 `isVisible` 保持一致。
+ */
+export function isFieldVisible(field: FieldDescriptor, raw: ConnectionValues): boolean {
+  const cond = field.ui?.visible_if;
+  if (!cond) return true;
+  const current = raw[cond.field];
+  if (cond.op === "eq") return current === cond.value;
+  if (cond.op === "neq") return current !== cond.value;
+  if (cond.op === "in") {
+    return Array.isArray(cond.value) && (cond.value as unknown[]).includes(current);
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // raw draft → canonical 请求快照
 // ---------------------------------------------------------------------------
@@ -159,6 +280,8 @@ export function normalizeConnection(
 
   for (const field of fields) {
     const path = `connection.${field.key}`;
+    // 条件不可见的字段既不提交也不报必填（用户看不到它，无法对它负责）
+    if (!isFieldVisible(field, raw)) continue;
     const hasRaw = Object.prototype.hasOwnProperty.call(raw, field.key);
     const value = hasRaw ? raw[field.key] : field.default;
 
@@ -186,7 +309,7 @@ export function normalizeConnection(
       continue;
     }
 
-    if (field.field_type === "Boolean") {
+    if (isBooleanField(field.field_type)) {
       if (typeof value !== "boolean") {
         issues.push({ path, code: "NOT_BOOLEAN", message: "需为布尔值" });
         continue;
@@ -209,8 +332,9 @@ export function normalizeConnection(
       continue;
     }
 
-    if (field.field_type === "Secret") {
-      // Secret 原样透传（marker 或明文由后端处理），前端不做类型改写
+    if (isSecretField(field.field_type)) {
+      // Secret 原样透传（marker 或明文由后端处理），前端不做类型改写。
+      // 注意：marker 可以保存，但**不得**用于 probe/validate（见 secretMarkerKeys）。
       connection[field.key] = value;
       continue;
     }
@@ -219,10 +343,6 @@ export function normalizeConnection(
   }
 
   return { connection, issues };
-}
-
-function isIntegerField(fieldType: string | undefined): boolean {
-  return fieldType === "Integer" || fieldType === "Port" || fieldType === "Duration";
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +384,7 @@ export function missingRequiredAdvanced(
 ): string[] {
   return fields
     .filter((f) => f.ui?.advanced === true && f.required === true)
+    .filter((f) => isFieldVisible(f, raw))
     .filter((f) => {
       const hasRaw = Object.prototype.hasOwnProperty.call(raw, f.key);
       const value = hasRaw ? raw[f.key] : f.default;
@@ -365,7 +486,14 @@ export type ProbeOutcome =
   | { kind: "unsupported"; detail: string }
   | { kind: "infrastructure"; detail: string }
   | { kind: "timeout"; detail: string }
-  | { kind: "network"; detail: string };
+  | { kind: "network"; detail: string }
+  /**
+   * 未做探测：连接里存在**未重新输入明文**的 Secret marker。
+   *
+   * 这不是「设备不可达」，也不是「参数非法」，而是「本次测试被安全边界拦下」。
+   * 单独成类是为了避免把安全边界伪装成网络/设备结论（V1.1 §9.4）。
+   */
+  | { kind: "secret_unavailable"; detail: string };
 
 export interface DeviceIdentity {
   vendor?: string | null;
@@ -384,10 +512,12 @@ export function safeText(value: unknown): string {
   }
   if (typeof value === "object") {
     const obj = value as Record<string, unknown>;
-    // 结构化错误体：只取已知的 code/message，其余不渲染
+    // 结构化错误体/字段 issue：取已知的 path/code/message，其余不渲染。
+    // path 必须保留——它是「哪个字段出错」的唯一线索（丢了就只能靠后端原文猜）。
+    const path = safeText(obj.path);
     const code = safeText(obj.code);
     const message = safeText(obj.message);
-    const parts = [code, message].filter((s) => s !== "");
+    const parts = [path, code, message].filter((s) => s !== "");
     if (parts.length > 0) return parts.join(": ");
     try {
       return JSON.stringify(obj);
@@ -485,6 +615,18 @@ export function networkFailureOutcome(reason: unknown): ProbeOutcome {
 }
 
 /**
+ * 因 Secret marker 而**未发起**探测的结果。
+ *
+ * C2 复用既有的 `POST /drivers/{id}/probe`，它只接受明文连接参数；把
+ * `{secret_set:true}` 当密码发出去既连不上、又会把「凭据未回显」误报成
+ * 「设备不可达」。Endpoint-bound 的 Secret-safe `connection-check` 属 C3，
+ * 因此这里显式表达「本场景暂不支持测试」。
+ */
+export function secretUnavailableOutcome(detail: string): ProbeOutcome {
+  return { kind: "secret_unavailable", detail };
+}
+
+/**
  * outcome → 可安全渲染的字符串。
  *
  * 纪律：**不得**根据单个 `reachable` 布尔值宣称"连接成功"；也不得把
@@ -510,6 +652,8 @@ export function describeOutcome(outcome: ProbeOutcome): string {
       return `探测超时：${outcome.detail}`;
     case "network":
       return `无法访问 Mesa API：${outcome.detail}`;
+    case "secret_unavailable":
+      return `未执行探测（已保存的凭据不会回显）：${outcome.detail}`;
   }
 }
 
@@ -522,6 +666,7 @@ export function outcomeTone(outcome: ProbeOutcome): "neutral" | "positive" | "wa
       return "neutral";
     case "unreachable":
     case "invalid":
+    case "secret_unavailable":
       return "warning";
     case "not_found":
     case "unsupported":
