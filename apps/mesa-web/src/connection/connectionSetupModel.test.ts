@@ -3,10 +3,12 @@ import { describe, expect, it } from "vitest";
 import {
   classifyProbeOutcome,
   containsSecretMarker,
+  describeIssue,
   describeOutcome,
   groupFields,
   initialSetupState,
   isBooleanField,
+  isDurationField,
   isIntegerField,
   isFieldVisible,
   isResultCurrent,
@@ -17,12 +19,15 @@ import {
   normalizeConnection,
   outcomeTone,
   parseIntInput,
+  preserveHiddenFields,
   safeText,
   secretMarkerKeys,
   secretUnavailableOutcome,
+  submitBlockReason,
   withDriverChange,
   withFieldChange,
   type FieldDescriptor,
+  type SubmitGateInput,
 } from "./connectionSetupModel";
 import {
   autoApplicablePreset,
@@ -423,5 +428,268 @@ describe("Secret marker 形状识别与阻断集合", () => {
     expect(text).not.toContain("设备不可达");
     expect(text).not.toContain("不支持此探测");
     expect(outcomeTone(outcome)).toBe("warning");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P0：提交前置门（按钮 disabled 与提交函数守卫共用同一判定）
+// ---------------------------------------------------------------------------
+
+describe("提交前置门 submitBlockReason（P0）", () => {
+  const ready: SubmitGateInput = {
+    active: true,
+    driverSelectable: true,
+    driversStatus: "ready",
+    usableDriverIds: ["s7"],
+    driverId: "s7",
+    descriptorStatus: "ready",
+  };
+
+  it("只有「面板可见 + 清单就绪 + 驱动可用 + 描述符就绪」才放行", () => {
+    expect(submitBlockReason(ready)).toBeNull();
+  });
+
+  it("清单失败/未就绪一律挡住（不回退到内置驱动列表）", () => {
+    for (const status of ["idle", "loading", "error"] as const) {
+      expect(submitBlockReason({ ...ready, driversStatus: status })).toBe("catalog-unavailable");
+    }
+  });
+
+  it("无可用驱动（含选中的驱动不在 launchable 集合里）一律挡住", () => {
+    expect(submitBlockReason({ ...ready, usableDriverIds: [] })).toBe("no-usable-driver");
+    expect(submitBlockReason({ ...ready, driverId: null })).toBe("no-usable-driver");
+    expect(
+      submitBlockReason({ ...ready, driverId: "dead", usableDriverIds: ["s7"] }),
+    ).toBe("no-usable-driver");
+  });
+
+  it("描述符未就绪/失败一律挡住", () => {
+    for (const status of ["idle", "loading", "error"] as const) {
+      expect(submitBlockReason({ ...ready, descriptorStatus: status })).toBe(
+        "descriptor-unavailable",
+      );
+    }
+  });
+
+  it("面板不可见时一律挡住（弹窗关闭 / 非当前步骤不得发请求）", () => {
+    expect(submitBlockReason({ ...ready, active: false })).toBe("inactive");
+  });
+
+  it("edit 模式（driverSelectable=false）不看清单，但描述符仍必须就绪", () => {
+    const edit: SubmitGateInput = {
+      active: true,
+      driverSelectable: false,
+      driversStatus: "idle",
+      usableDriverIds: [],
+      driverId: "opcua",
+      descriptorStatus: "ready",
+    };
+    expect(submitBlockReason(edit)).toBeNull();
+    expect(submitBlockReason({ ...edit, descriptorStatus: "error" })).toBe(
+      "descriptor-unavailable",
+    );
+    expect(submitBlockReason({ ...edit, driverId: null })).toBe("no-driver");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1：编辑态 visible_if 隐藏字段不得丢失（后端整体替换 connection）
+// ---------------------------------------------------------------------------
+
+describe("编辑态隐藏字段保留 preserveHiddenFields（P1）", () => {
+  const FIELDS: FieldDescriptor[] = [
+    { key: "host", label: "Host", field_type: "host", required: true },
+    { key: "use_native", label: "Use native", field_type: "boolean", default: false },
+    {
+      key: "native_pdu",
+      label: "PDU",
+      field_type: "integer",
+      validation: { min: 1, max: 65535 },
+      ui: { visible_if: { field: "use_native", op: "eq", value: true } },
+    },
+    { key: "api_token", label: "Token", field_type: "secret" },
+  ];
+
+  it("正向：visible_if 不满足的字段保留服务端快照原值", () => {
+    const raw = { host: "10.0.0.2", use_native: false, native_pdu: 8192 };
+    const canonical = normalizeConnection(raw, FIELDS);
+    // 前提：归一化确实把隐藏字段排除了（否则本测试无意义）
+    expect("native_pdu" in canonical.connection).toBe(false);
+
+    const out = preserveHiddenFields(canonical.connection, raw, FIELDS);
+    expect(out.native_pdu).toBe(8192);
+    expect(out.host).toBe("10.0.0.2");
+    expect(out.use_native).toBe(false);
+  });
+
+  it("负例：旧 connection 里不属于当前 Descriptor 的字段不得被带回", () => {
+    const raw = {
+      host: "10.0.0.2",
+      use_native: false,
+      native_pdu: 8192,
+      legacy_field: "old",
+      gone_object: { a: 1 },
+    };
+    const canonical = normalizeConnection(raw, FIELDS);
+    const out = preserveHiddenFields(canonical.connection, raw, FIELDS);
+
+    expect("legacy_field" in out).toBe(false);
+    expect("gone_object" in out).toBe(false);
+    // 精确断言：只可能是 Descriptor 内的字段（证明不是无脑整体合并）
+    expect(Object.keys(out).sort()).toEqual(["host", "native_pdu", "use_native"]);
+  });
+
+  it("用户显式修改的值以用户输入为准，不被旧值覆盖", () => {
+    // 用户在字段仍可见时把它改成 4096，随后切换条件使其隐藏
+    const raw = { host: "10.0.0.2", use_native: false, native_pdu: 4096 };
+    const canonical = normalizeConnection(raw, FIELDS);
+    const out = preserveHiddenFields(canonical.connection, raw, FIELDS);
+    expect(out.native_pdu).toBe(4096);
+  });
+
+  it("用户显式清除（null/空串）以用户输入为准，不得恢复旧值", () => {
+    const raw = { host: "10.0.0.2", use_native: false, native_pdu: null };
+    const canonical = normalizeConnection(raw, FIELDS);
+    const out = preserveHiddenFields(canonical.connection, raw, FIELDS);
+    // 保留的是用户的「空」，随后 cleanConnection 会把它从请求体剔除 = 删除该字段
+    expect(out.native_pdu).toBeNull();
+    expect(out.native_pdu).not.toBe(8192);
+  });
+
+  it("可见字段缺席是校验问题：不得用旧值掩盖", () => {
+    // native_pdu 可见但值非法 → 归一化产生 issue 且不写入 canonical
+    const raw = { host: "10.0.0.2", use_native: true, native_pdu: "abc" };
+    const canonical = normalizeConnection(raw, FIELDS);
+    expect(canonical.issues.map((i) => i.code)).toContain("NOT_INTEGER");
+
+    const out = preserveHiddenFields(canonical.connection, raw, FIELDS);
+    expect("native_pdu" in out).toBe(false);
+  });
+
+  it("raw 里没有的 key 不凭空补值（不替 Descriptor 发明默认值）", () => {
+    const raw = { host: "10.0.0.2", use_native: false };
+    const canonical = normalizeConnection(raw, FIELDS);
+    const out = preserveHiddenFields(canonical.connection, raw, FIELDS);
+    expect("native_pdu" in out).toBe(false);
+  });
+
+  it("Secret 的 marker 语义不受影响：原样随负载回传", () => {
+    const raw = { host: "10.0.0.2", use_native: false, api_token: { secret_set: true } };
+    const canonical = normalizeConnection(raw, FIELDS);
+    const out = preserveHiddenFields(canonical.connection, raw, FIELDS);
+    expect(out.api_token).toEqual({ secret_set: true });
+    // 清除标记同样原样透传
+    const cleared = { host: "10.0.0.2", use_native: false, api_token: { clear_secret: true } };
+    const canonical2 = normalizeConnection(cleared, FIELDS);
+    expect(preserveHiddenFields(canonical2.connection, cleared, FIELDS).api_token).toEqual({
+      clear_secret: true,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1 附带：duration / integer / port 的类型语义一致性
+//
+// 契约核查（以代码为准）：
+// - Core Schema：`Number | Duration => val.is_number()`（duration 允许小数、无上界）；
+// - Driver Parser：`timeout_ms` 一律 `as_u64()`（要求非负整数，小数报 BAD_CONFIG）；
+// - 前端：与 Driver 对齐（拒绝小数），并去掉「整数/端口 65535 兜底」对 duration 的误用。
+// ---------------------------------------------------------------------------
+
+describe("duration 与 integer/port 的类型语义一致性", () => {
+  const fields: FieldDescriptor[] = [
+    { key: "n", label: "N", field_type: "integer", required: true, validation: { min: 0, max: 65535 } },
+    { key: "port", label: "Port", field_type: "port", required: true, validation: { min: 1, max: 65535 } },
+    { key: "timeout_ms", label: "Timeout", field_type: "duration", required: true, validation: { min: 500, max: 10000 } },
+  ];
+
+  it("duration 与 integer/port 一样拒绝小数（Driver Parser 用 as_u64() 读取）", () => {
+    expect(isDurationField("duration")).toBe(true);
+    expect(isDurationField("Duration")).toBe(true);
+    expect(isDurationField("integer")).toBe(false);
+
+    const cases: Array<Record<string, unknown>> = [
+      { n: 1.5, port: 102, timeout_ms: 5000 },
+      { n: 1, port: 102.5, timeout_ms: 5000 },
+      { n: 1, port: 102, timeout_ms: 5000.5 },
+      { n: 1, port: 102, timeout_ms: "5000.5" },
+    ];
+    for (const raw of cases) {
+      const { issues } = normalizeConnection(raw, fields);
+      expect(issues.map((i) => i.code)).toEqual(["NOT_INTEGER"]);
+    }
+    // 整数形态照常通过
+    expect(normalizeConnection({ n: 1, port: 102, timeout_ms: 5000 }, fields).issues).toEqual([]);
+  });
+
+  it("duration 没有 16 位上界：未声明 max 时不得用 65535 兜底（前端拒绝/后端接受的矛盾）", () => {
+    const dur: FieldDescriptor[] = [
+      { key: "timeout_ms", label: "Timeout", field_type: "duration", required: false },
+    ];
+    expect(normalizeConnection({ timeout_ms: 60000 }, dur)).toEqual({
+      connection: { timeout_ms: 60000 },
+      issues: [],
+    });
+    // 负数仍被拒：Core Schema 对 Duration 的内禀范围是 >= 0
+    expect(normalizeConnection({ timeout_ms: -1 }, dur).issues[0].code).toBe("OUT_OF_RANGE");
+    // integer/port 沿用既有 65535 兜底，行为不变
+    const int: FieldDescriptor[] = [
+      { key: "n", label: "N", field_type: "integer", required: false },
+    ];
+    expect(normalizeConnection({ n: 70000 }, int).issues[0].code).toBe("OUT_OF_RANGE");
+    // Descriptor 显式声明的 min/max 仍然生效（duration 也不例外）
+    const bounded: FieldDescriptor[] = [
+      { key: "timeout_ms", label: "T", field_type: "duration", required: false, validation: { min: 500, max: 10000 } },
+    ];
+    expect(normalizeConnection({ timeout_ms: 10001 }, bounded).issues[0].code).toBe("OUT_OF_RANGE");
+    expect(normalizeConnection({ timeout_ms: 499 }, bounded).issues[0].code).toBe("OUT_OF_RANGE");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2：safeText 对带 path 的 issue 不得重复前缀
+// ---------------------------------------------------------------------------
+
+describe("safeText：issue path 前缀去重（P2）", () => {
+  it("message 已自带同一 path 前缀时裁掉重复段", () => {
+    expect(
+      safeText({ path: "connection.host", code: "REQUIRED", message: "connection.host 缺少必填" }),
+    ).toBe("connection.host: REQUIRED: 缺少必填");
+    expect(safeText({ path: "connection.host", code: "REQUIRED", message: "connection.host" })).toBe(
+      "connection.host: REQUIRED",
+    );
+    expect(
+      safeText({ path: "connection.host", code: "REQUIRED", message: "connection.host：缺少必填" }),
+    ).toBe("connection.host: REQUIRED: 缺少必填");
+  });
+
+  it("只是恰好同前缀的另一个词不得误裁（向后兼容）", () => {
+    expect(
+      safeText({ path: "connection.host", code: "C", message: "connection.hostname 非法" }),
+    ).toBe("connection.host: C: connection.hostname 非法");
+    // 不含前缀时输出逐字不变
+    expect(safeText({ path: "connection.host", code: "REQUIRED", message: "缺少必填" })).toBe(
+      "connection.host: REQUIRED: 缺少必填",
+    );
+    expect(safeText({ code: "C", message: "M" })).toBe("C: M");
+  });
+
+  it("describeIssue：path 与 message 分开渲染的那一处同样不重复前缀", () => {
+    // 重复前缀真正发生的位置：渲染层把 path 与 message 拼成一行
+    expect(
+      describeIssue({
+        path: "connection.host",
+        code: "REQUIRED",
+        message: "connection.host 缺少必填",
+      }),
+    ).toBe("connection.host：缺少必填（REQUIRED）");
+    // 不含重复时输出与既有格式逐字一致（向后兼容）
+    expect(
+      describeIssue({ path: "connection.host", code: "REQUIRED", message: "缺少必填" }),
+    ).toBe("connection.host：缺少必填（REQUIRED）");
+    // code 缺失时不渲染空括号
+    expect(describeIssue({ path: "connection.host", code: "", message: "缺少必填" })).toBe(
+      "connection.host：缺少必填",
+    );
   });
 });

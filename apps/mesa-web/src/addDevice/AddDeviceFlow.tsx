@@ -69,6 +69,13 @@ export function AddDeviceFlow() {
     driverId: string;
     connection: ConnectionValues;
   }) => {
+    // ---------------------------------------------------------------------
+    // P0 提交守卫：连接步的「下一步」只可能在面板前置门通过后被回调（面板
+    // handleSubmit 首行守卫 + hook 的 submitSnapshot 前置门）。这里再判一次入参，
+    // 保证**本函数自身**不会在驱动清单/描述符不可用时把连接写进草稿并推进流程
+    // ——草稿一旦被污染，第 ④ 步的 /api/v1/device-bootstrap 就会带着不可信连接落库。
+    // ---------------------------------------------------------------------
+    if (!args?.driverId) return;
     let values: { name?: string; id?: string };
     try {
       values = (await connForm.validateFields()) as { name?: string; id?: string };
@@ -103,6 +110,11 @@ export function AddDeviceFlow() {
   };
 
   const submit = async () => {
+    // ---------------------------------------------------------------------
+    // P0 提交守卫：`connection` 只可能由上面已守卫的连接步产出，因此「清单失败 /
+    // 无可用驱动 / 描述符失败」时这里必然为 null。即便确认页按钮的 disabled 被
+    // 回归移除，也绝不发出 POST /api/v1/device-bootstrap。
+    // ---------------------------------------------------------------------
     if (!device || !connection || !acquisition) return;
     setSubmitting(true);
     setReport(null);

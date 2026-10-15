@@ -251,7 +251,30 @@ function FieldControl({
       </div>
     );
   }
-  if (field.field_type === "number" || field.field_type === "duration") {
+  if (field.field_type === "duration") {
+    // duration 与 integer/port 同语义（见 connectionSetupModel.isDurationField 的
+    // 三方契约核查）：具体 Driver 的毫秒参数一律 as_u64() 读取，小数必被拒为
+    // BAD_CONFIG。这里用 precision=0 让界面只能产生整数，消除此前
+    // 「界面允许输入小数、模型/后端才拒绝」的自相矛盾。
+    const v = typeof value === "number" ? value : typeof field.default === "number" ? field.default : undefined;
+    return (
+      <div style={{ display: "grid", gap: 4 }}>
+        <span style={{ fontSize: 12 }}>{label}</span>
+        <InputNumber
+          disabled={disabled}
+          value={v}
+          min={field.validation.min}
+          max={field.validation.max}
+          precision={0}
+          step={1}
+          onChange={(n) => onChange(n)}
+          placeholder={field.ui.placeholder}
+          style={{ width: "100%" }}
+        />
+      </div>
+    );
+  }
+  if (field.field_type === "number") {
     const v = typeof value === "number" ? value : typeof field.default === "number" ? field.default : undefined;
     return (
       <div style={{ display: "grid", gap: 4 }}>

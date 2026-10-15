@@ -68,11 +68,45 @@ export interface Issue {
 // Descriptor 的字段类型 → 跳过范围校验 / 把 Secret 当普通字符串」。
 // ---------------------------------------------------------------------------
 
-/** 是否整数类字段（需要按 min/max 做范围校验）。 */
+/**
+ * 是否整数类字段（需要按 min/max 做范围校验）。
+ *
+ * `duration` **刻意包含在内**：见 [`isDurationField`] 的契约核查——具体 Driver
+ * 的毫秒参数一律用 `as_u64()` 读取，小数必被拒。三者在此同语义，不再区分。
+ */
 export function isIntegerField(fieldType: string | undefined): boolean {
   const t = String(fieldType ?? "").toLowerCase();
   return t === "integer" || t === "port" || t === "duration";
 }
+
+/**
+ * 是否 `duration` 字段（毫秒/时长）。
+ *
+ * **三方契约核查结论（本轮实测，以代码为准）**：
+ * 1. Core Schema（`crates/core-types/src/schema.rs::field_type_matches`）：
+ *    `Number | Duration => val.is_number()` → **允许小数**；内禀范围仅 `>= 0`，**无上界**。
+ * 2. 具体 Driver Parser（`timeout_ms` 在 s7 / opcua / sinumerik-nck / focas2 中
+ *    是唯一的 Duration 字段）：一律 `as_u64()`，**要求非负整数**，小数报
+ *    `timeout_ms 必须为非负整数`（BAD_CONFIG）。
+ * 3. 前端此前自相矛盾：`DescriptorFields` 用允许小数的 InputNumber 渲染，
+ *    而 `normalizeConnection` 又按整数字段校验 → 用户能输入 5000.5，提交时才被拒。
+ *
+ * **取舍：以 Driver Parser 为准（duration 与 integer/port 同语义，要求整数）。**
+ * 理由：Driver 是该值的最终消费者，放行小数必然在 OpenConnection/Probe 阶段失败；
+ * 前端提前给出明确错误优于把后端 BAD_CONFIG 抛给用户（fail-closed）。同时渲染层
+ * 改为整数输入，消除「界面允许、模型拒绝」的自相矛盾。
+ *
+ * NOTE: Core Schema 允许 `Duration` 为 JSON number 与 Driver 要求整数的不一致属
+ * Rust 侧问题，本轮不修改 `crates/`、`drivers/`。若后端后续统一（例如 Duration
+ * 也要求整数，或 Driver 改读 `as_f64`），前端只需放宽本判定与 `numericBounds`。
+ */
+export function isDurationField(fieldType: string | undefined): boolean {
+  return String(fieldType ?? "").toLowerCase() === "duration";
+}
+
+/** 异步资源加载状态（驱动清单 / 描述符共用）。 */
+export type LoadStatus = "idle" | "loading" | "ready" | "error";
+
 /** 是否布尔字段。 */
 export function isBooleanField(fieldType: string | undefined): boolean {
   return String(fieldType ?? "").toLowerCase() === "boolean";
@@ -319,11 +353,7 @@ export function normalizeConnection(
     }
 
     if (isTsapKey(field.key) || isIntegerField(field.field_type)) {
-      const parsed = parseIntInput(value, {
-        allowHex: isTsapKey(field.key),
-        min: validation.min ?? 0,
-        max: validation.max ?? 65535,
-      });
+      const parsed = parseIntInput(value, numericBounds(field));
       if (!parsed.ok) {
         issues.push({ path, code: parsed.code, message: parsed.message });
         continue;
@@ -343,6 +373,140 @@ export function normalizeConnection(
   }
 
   return { connection, issues };
+}
+
+/**
+ * 数值字段的解析边界（allowHex / min / max）。
+ *
+ * 为什么不能一律用 65535 兜底：`Duration` 在 Core Schema 里**没有 16 位上界**
+ * （内禀范围只有 `>= 0`），用端口/整数的 65535 兜底会把合法时长误判为越界，
+ * 形成「前端拒绝、后端接受」的矛盾。因此按字段类型分别取默认边界：
+ * - TSAP：16 位协议字段，允许十六进制；
+ * - Port / Integer：沿用 65535 兜底（既有行为，不改）；
+ * - Duration：默认只受下界 0 约束，上界**只在 Descriptor 显式声明时**生效。
+ */
+function numericBounds(field: FieldDescriptor): {
+  allowHex: boolean;
+  min: number;
+  max: number;
+} {
+  const validation = field.validation ?? {};
+  const allowHex = isTsapKey(field.key);
+  if (isDurationField(field.field_type) && !allowHex) {
+    return {
+      allowHex,
+      min: validation.min ?? 0,
+      max: validation.max ?? Number.POSITIVE_INFINITY,
+    };
+  }
+  return {
+    allowHex,
+    min: validation.min ?? 0,
+    max: validation.max ?? 65535,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 提交前置门（P0）：三个入口共用**唯一**判定
+// ---------------------------------------------------------------------------
+
+/**
+ * 提交被挡下的原因；`null` 表示可提交。
+ *
+ * 为什么必须唯一：P0 要求「驱动清单失败 / 无可用驱动 / 描述符失败时，所有提交
+ * 路径都必须失效」。若按钮的 `disabled` 与提交函数里的守卫各写一套判定，两者
+ * 迟早漂移（回归出「禁用被绕过」）。这里让「按钮 disabled」与「提交函数首行守卫」
+ * 读同一个纯函数，任何一侧改动都会同时影响另一侧。
+ */
+export type SubmitBlockReason =
+  | "inactive"
+  | "catalog-unavailable"
+  | "no-usable-driver"
+  | "no-driver"
+  | "descriptor-unavailable";
+
+export interface SubmitGateInput {
+  /** 面板是否可见（弹窗关闭 / 非当前步骤 → 不发任何请求） */
+  active: boolean;
+  /**
+   * 驱动是否允许用户切换。edit 模式为 false：既不需要驱动清单
+   * （`driver_id` 由服务端快照给定），也不能用清单失败去否决编辑保存。
+   */
+  driverSelectable: boolean;
+  driversStatus: LoadStatus;
+  /** 清单中 `launchable === true` 的驱动 id（其余一律不可用） */
+  usableDriverIds: string[];
+  driverId: string | null;
+  descriptorStatus: LoadStatus;
+}
+
+/**
+ * 提交前置门判定。**不修改任何状态**，因此可完整单测。
+ *
+ * 判定顺序即「先决条件链」：面板可见 → 清单可用 → 驱动可用 → 描述符可用。
+ * 任一步不满足都返回具体原因，调用方据此禁用按钮并（作为第二道防线）在提交
+ * 函数首行直接 return。
+ */
+export function submitBlockReason(input: SubmitGateInput): SubmitBlockReason | null {
+  if (!input.active) return "inactive";
+  if (input.driverSelectable) {
+    if (input.driversStatus !== "ready") return "catalog-unavailable";
+    if (!input.driverId || !input.usableDriverIds.includes(input.driverId)) {
+      return "no-usable-driver";
+    }
+  }
+  if (!input.driverId) return "no-driver";
+  if (input.descriptorStatus !== "ready") return "descriptor-unavailable";
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// 编辑态补齐：`visible_if` 隐藏字段不得丢失（P1）
+// ---------------------------------------------------------------------------
+
+/**
+ * 编辑态提交补齐：把「**当前 Descriptor 内**、本次因 `visible_if` 不满足而未被
+ * 渲染、因而未进入 canonical」的字段，按原值补回提交负载。
+ *
+ * 为什么必须补：后端 `update_endpoint()` 用请求里的 connection **整体替换**旧
+ * JSON，只有 Secret 字段有「缺失即保留」语义。编辑态若省略这些字段，它们会真的
+ * 从服务端消失（不是理论风险，是已核对后端源码的结论）。
+ *
+ * **边界（评审要求：不得无脑整体合并旧 connection）**
+ * - **保留**：key 属于当前 Descriptor，且 `visible_if` 当前不满足，且 `raw` 里有值。
+ *   值取自 `raw`（= 服务端快照 + 用户本次编辑），因此
+ *   ①未触碰的字段保留服务端原值；②用户显式修改/清除的值以用户输入为准
+ *   （清除为 `null`/`""` 时同样以用户输入为准，后续 `cleanConnection` 会把它
+ *   从请求体里剔除，等于删除该字段——这正是「用户明确清除」的语义）。
+ * - **丢弃**：`raw` 中**不属于当前 Descriptor** 的 key（已过期/未知字段）。它们
+ *   既不在 canonical 里，也不会被本函数补回；Core 的 `UNKNOWN_FIELD` 同样拒绝，
+ *   无脑整体合并会把废弃配置重新写回。
+ * - **丢弃**：`visible_if` 满足但未进入 canonical 的字段——那是「可见字段校验
+ *   失败/必填缺失」，必须由校验阻断提交，绝不能用旧值掩盖。
+ * - **丢弃**：`raw` 中不存在的 key——不替 Descriptor 发明默认值。
+ *
+ * Secret 不受影响：Secret 字段的值同样取自 `raw`，marker（`{secret_set:true}` /
+ * `{clear_secret:true}`）原样透传，既有 marker 保留语义不变。
+ */
+export function preserveHiddenFields(
+  connection: ConnectionValues,
+  raw: ConnectionValues,
+  fields: FieldDescriptor[],
+): ConnectionValues {
+  const out: ConnectionValues = { ...connection };
+  for (const field of fields) {
+    const key = field.key;
+    // 已进入 canonical（可见且校验通过）→ 不动
+    if (Object.prototype.hasOwnProperty.call(out, key)) continue;
+    // 可见却缺席 → 是校验问题，必须由校验阻断，不得用旧值掩盖
+    if (isFieldVisible(field, raw)) continue;
+    // 快照/草稿里本来就没有这个 key → 不凭空造值
+    if (!Object.prototype.hasOwnProperty.call(raw, key)) continue;
+    const value = raw[key];
+    if (value === undefined) continue;
+    out[key] = value;
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +666,26 @@ export interface DeviceIdentity {
   firmware?: string | null;
 }
 
+/**
+ * 结构化 issue 的 `path` 前缀去重（P2）。
+ *
+ * 后端/本地 issue 的 `message` 有时**自带同一个 path 前缀**（如
+ * `path: "connection.host"` + `message: "connection.host 缺少必填"`）；渲染层
+ * 又会单独展示 path，拼起来就成了「connection.host：connection.host 缺少必填」。
+ *
+ * 去重规则（**向后兼容**，只在能确定是重复时才裁）：
+ * - `message` 必须以**同一个** path 开头；
+ * - 其后必须紧跟分隔符（空白 / 冒号 / 逗号 / 句号 / 分号 / 顿号 / 连字符）或直接结束，
+ *   否则视为「只是恰好同前缀的另一个词」（如 `connection.hostname`）→ 原样保留。
+ */
+function stripDuplicatedPathPrefix(path: string, message: string): string {
+  if (path === "" || message === "" || !message.startsWith(path)) return message;
+  const rest = message.slice(path.length);
+  if (rest === "") return rest;
+  if (!/^[\s:：,，.。;；、-]/.test(rest)) return message;
+  return rest.replace(/^[\s:：,，.。;；、-]+/, "");
+}
+
 /** 把任意后端字段安全地转成字符串——**绝不**返回对象给渲染层。 */
 export function safeText(value: unknown): string {
   if (value === null || value === undefined) return "";
@@ -516,7 +700,7 @@ export function safeText(value: unknown): string {
     // path 必须保留——它是「哪个字段出错」的唯一线索（丢了就只能靠后端原文猜）。
     const path = safeText(obj.path);
     const code = safeText(obj.code);
-    const message = safeText(obj.message);
+    const message = stripDuplicatedPathPrefix(path, safeText(obj.message));
     const parts = [path, code, message].filter((s) => s !== "");
     if (parts.length > 0) return parts.join(": ");
     try {
@@ -531,6 +715,23 @@ export function safeText(value: unknown): string {
 function stringList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.map(safeText).filter((s) => s !== "");
+}
+
+/**
+ * 把字段级 issue 渲染成一行可读文本：`path：message（code）`。
+ *
+ * 为什么要单独有这个函数（P2）：这是「path 与 message 分开渲染」的**唯一**位置，
+ * 也正是重复前缀真正发生的地方——后端的 `message` 有时自带同一个 path 前缀
+ * （如 `path: "connection.host"` + `message: "connection.host 缺少必填"`），
+ * 直接拼接会渲染成「connection.host：connection.host 缺少必填」。
+ * 这里复用 `stripDuplicatedPathPrefix` 做幂等去重，且**不改变**不含重复时的输出。
+ */
+export function describeIssue(issue: Issue): string {
+  const path = safeText(issue.path);
+  const code = safeText(issue.code);
+  const message = stripDuplicatedPathPrefix(path, safeText(issue.message));
+  const head = path !== "" && message !== "" ? `${path}：${message}` : path || message;
+  return code !== "" ? `${head}（${code}）` : head;
 }
 
 function errorDetail(body: unknown): string {

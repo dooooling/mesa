@@ -13,10 +13,11 @@
  * - Secret marker（非 password 命名）不得进入探测请求。
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ConnectionValues } from "./connectionSetupModel";
 import { ConnectionSetupPanel } from "./ConnectionSetupPanel";
+import { invokeDisabledButton } from "../test/bypassDisabled";
 
 interface Call {
   url: string;
@@ -279,6 +280,54 @@ describe("C2 面板：驱动清单失败（A02）", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// P0：提交函数自身的前置守卫
+//
+// 为什么需要「绕过 disabled」的探针：React + AntD 双重拦截禁用按钮的 click，
+// 普通交互测试无法触发被禁用的提交函数，守卫是否存在就成了不可验证的假绿。
+// 探针直接调用按钮组件级 onClick，精确模拟「disabled 被回归移除」的场景。
+// ---------------------------------------------------------------------------
+
+describe("C2 面板：P0 提交守卫（禁用被绕过也不发写请求）", () => {
+  it("驱动清单失败：绕过 disabled 触发「下一步」，onSubmit 仍不被调用", async () => {
+    installFetch({ driversFail: true });
+    const view = renderPanel();
+    await screen.findByText("驱动清单加载失败");
+
+    const submit = screen.getByRole("button", { name: /下一步/ }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    await act(async () => {
+      // 探针必须真的调用到处理函数，否则本用例是假绿
+      expect(invokeDisabledButton(submit)).toBe(true);
+    });
+    expect(view.onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("描述符失败：绕过 disabled 触发「测试连接」与「下一步」，零请求", async () => {
+    const srv = installFetch({ drivers: NCK_DRIVER, descriptors: {} });
+    const view = renderPanel();
+    await screen.findByText("驱动描述符加载失败");
+    expect(screen.getByRole("button", { name: /重\s*试/ })).toBeTruthy();
+
+    const probeBtn = screen.getByRole("button", { name: /测试连接/ }) as HTMLButtonElement;
+    const validateBtn = screen.getByRole("button", { name: /校验参数/ }) as HTMLButtonElement;
+    const submitBtn = screen.getByRole("button", { name: /下一步/ }) as HTMLButtonElement;
+    expect([probeBtn.disabled, validateBtn.disabled, submitBtn.disabled]).toEqual([true, true, true]);
+
+    await act(async () => {
+      expect(invokeDisabledButton(probeBtn)).toBe(true);
+      expect(invokeDisabledButton(validateBtn)).toBe(true);
+      expect(invokeDisabledButton(submitBtn)).toBe(true);
+    });
+
+    expect(view.onSubmit).not.toHaveBeenCalled();
+    expect(probeCalls(srv.calls).length).toBe(0);
+    expect(srv.calls.some((c) => c.url.endsWith("/validate-connection"))).toBe(false);
+    // 任何写请求都不得发出（面板自身不发写请求，这里做全量兜底断言）
+    expect(srv.calls.some((c) => c.method !== "GET")).toBe(false);
+  });
+});
+
 describe("C2 面板：探测结果分层（A08/A09/A10/A11/A26）", () => {
   async function probeAndReadTitle(opts: ServerOpts): Promise<string> {
     const srv = await readyPanel(opts);
@@ -336,7 +385,6 @@ describe("C2 面板：探测结果分层（A08/A09/A10/A11/A26）", () => {
     expect(title).toContain("无法访问 Mesa API");
     expect(title).not.toContain("目标设备不可达");
   });
-
   it("200 + reachable=false：才是设备不可达", async () => {
     const title = await probeAndReadTitle({
       probe: () => ({ status: 200, body: { reachable: false, error: "no route to host" } }),
@@ -368,6 +416,37 @@ describe("C2 面板：探测结果分层（A08/A09/A10/A11/A26）", () => {
     });
     expect(title).toContain("设备返回身份信息");
     expect(screen.getByText(/Siemens/)).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2：字段级 issue 的 path 不得重复渲染
+// （后端 message 有时自带同一个 path 前缀，而渲染层又会单独展示 path）
+// ---------------------------------------------------------------------------
+
+describe("C2 面板：issue path 前缀去重（P2）", () => {
+  it("服务端 message 已含 connection. 前缀时不出现重复前缀", async () => {
+    await readyPanel({
+      validate: () => ({
+        status: 400,
+        body: {
+          error: { code: "BAD_CONFIG", message: "连接参数非法" },
+          issues: [
+            {
+              path: "connection.host",
+              code: "REQUIRED",
+              message: "connection.host 缺少必填",
+            },
+          ],
+        },
+      }),
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /校验参数/ }));
+    await screen.findByText(/参数校验未通过/);
+
+    expect(screen.getByText("connection.host：缺少必填（REQUIRED）")).toBeTruthy();
+    expect(document.body.textContent ?? "").not.toContain("connection.host：connection.host");
   });
 });
 
@@ -464,5 +543,82 @@ describe("C2 面板：Secret-safe 边界（编辑态）", () => {
     await waitFor(() => expect(probeCalls(srv.calls).length).toBe(1));
     const body = probeCalls(srv.calls)[0].body as { connection: ConnectionValues };
     expect(body.connection.api_token).toBe("new-token");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1：编辑态 visible_if 隐藏字段不得丢失
+//
+// 后端 update_endpoint() 用请求中的 connection **整体替换**旧 JSON（只有 Secret
+// 有「缺失即保留」语义），因此编辑态省略隐藏字段 = 该字段真的丢失。
+// ---------------------------------------------------------------------------
+
+describe("C2 面板：编辑态 visible_if 隐藏字段保留（P1）", () => {
+  const VIS_FIELDS = [
+    { key: "host", label: "Host", field_type: "host", required: true, validation: {}, ui: { order: 1 } },
+    { key: "use_native", label: "Use native", field_type: "boolean", required: false, default: false, validation: {}, ui: { order: 2 } },
+    {
+      key: "native_pdu",
+      label: "PDU",
+      field_type: "integer",
+      required: false,
+      validation: { min: 1, max: 65535 },
+      ui: { order: 3, visible_if: { field: "use_native", op: "eq", value: true } },
+    },
+    { key: "api_token", label: "API Token", field_type: "secret", required: false, validation: {}, ui: { order: 4 } },
+  ];
+
+  function renderEdit(initialValues: ConnectionValues) {
+    installFetch({ descriptors: { opcua: { fields: VIS_FIELDS } } });
+    const onSubmit = vi.fn();
+    render(
+      <ConnectionSetupPanel
+        mode="edit"
+        driverSelectable={false}
+        initialDriverId="opcua"
+        initialValues={initialValues}
+        onSubmit={onSubmit}
+      />,
+    );
+    return { onSubmit };
+  }
+
+  it("正向：visible_if 不满足的字段以快照原值进入保存负载", async () => {
+    const { onSubmit } = renderEdit({
+      host: "10.0.0.2",
+      use_native: false,
+      native_pdu: 8192,
+      api_token: { secret_set: true },
+    });
+    await screen.findByDisplayValue("10.0.0.2");
+    // 隐藏字段不渲染（用户看不到它，但它的值必须原样保留）
+    expect(document.querySelector('[data-field-key="native_pdu"]')).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /保\s*存/ }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    const payload = onSubmit.mock.calls[0][0] as { connection: ConnectionValues };
+    expect(payload.connection.native_pdu).toBe(8192);
+    expect(payload.connection.host).toBe("10.0.0.2");
+    // Secret 的 marker 保留语义不受本改动影响
+    expect(payload.connection.api_token).toEqual({ secret_set: true });
+  });
+
+  it("负例：旧 connection 中不属于当前 Descriptor 的字段不得出现在保存负载里", async () => {
+    const { onSubmit } = renderEdit({
+      host: "10.0.0.2",
+      use_native: false,
+      native_pdu: 8192,
+      legacy_field: "old",
+      gone_object: { a: 1 },
+    });
+    await screen.findByDisplayValue("10.0.0.2");
+
+    fireEvent.click(screen.getByRole("button", { name: /保\s*存/ }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    const payload = onSubmit.mock.calls[0][0] as { connection: ConnectionValues };
+    // 证明不是无脑整体合并旧 connection
+    expect("legacy_field" in payload.connection).toBe(false);
+    expect("gone_object" in payload.connection).toBe(false);
+    expect(Object.keys(payload.connection).sort()).toEqual(["host", "native_pdu", "use_native"]);
   });
 });

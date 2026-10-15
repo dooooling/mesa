@@ -13,6 +13,7 @@
  */
 import { Alert, Tag } from "antd";
 import {
+  describeIssue,
   describeOutcome,
   outcomeTone,
   safeText,
@@ -100,11 +101,7 @@ function ValidationBlock({ validation }: { validation: ValidationState }) {
     <div>
       {validation.detail ? <div>{safeText(validation.detail)}</div> : null}
       {validation.issues.length > 0 ? (
-        <Bullets
-          items={validation.issues.map(
-            (issue) => `${safeText(issue.path)}：${safeText(issue.message)}（${safeText(issue.code)}）`,
-          )}
-        />
+        <Bullets items={validation.issues.map(describeIssue)} />
       ) : null}
       <div style={{ marginTop: 4 }}>请修正后重试；Mesa 不会自动改写为上一次的合法值。</div>
     </div>

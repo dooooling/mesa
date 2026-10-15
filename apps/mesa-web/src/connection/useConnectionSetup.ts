@@ -28,17 +28,25 @@ import {
   isResultCurrent,
   networkFailureOutcome,
   normalizeConnection,
+  preserveHiddenFields,
   safeText,
   secretMarkerKeys,
   secretUnavailableOutcome,
+  submitBlockReason,
   withDriverChange,
   withFieldChange,
   type ConnectionValues,
   type Issue,
+  type LoadStatus,
   type NormalizeResult,
   type ProbeOutcome,
   type SetupState,
+  type SubmitBlockReason,
+  type SubmitGateInput,
 } from "./connectionSetupModel";
+
+/** 异步资源加载状态（驱动清单 / 描述符共用，定义在模型层以便纯函数判定复用）。 */
+export type { LoadStatus };
 
 /** 驱动清单条目：只把服务端真实返回的 `launchable` 当作可选依据。 */
 export interface DriverOption {
@@ -48,8 +56,6 @@ export interface DriverOption {
   /** 不可启动的原因（服务端 `reason`），必须原样展示给用户 */
   reason: string | null;
 }
-
-export type LoadStatus = "idle" | "loading" | "ready" | "error";
 
 /** 参数校验结果（本地归一化 或 服务端 validate-connection 的结论）。 */
 export interface ValidationState {
@@ -86,6 +92,15 @@ export interface UseConnectionSetupOptions {
    * 否则每次渲染都会被当成一次新的快照而重置草稿。
    */
   initialValues?: ConnectionValues | null;
+  /**
+   * 编辑态专用（`mode="edit"`）：提交快照里补齐「当前 Descriptor 内、因
+   * `visible_if` 不满足而未渲染」的字段原值。
+   *
+   * 为什么只在编辑态开：后端 `update_endpoint()` 整体替换 connection，缺失即真丢；
+   * 而新建/新增路径的 raw 只由 Descriptor 默认值物化，隐藏字段**不应**被提交
+   * （用户看不到它，无法对它负责）。详见 `preserveHiddenFields` 的边界说明。
+   */
+  preserveHiddenValues?: boolean;
   /** 描述符加载结果上报（新建流程的数据步需要 resources 目录） */
   onDescriptorChange?: (descriptor: DriverDescriptor | null) => void;
 }
@@ -115,6 +130,15 @@ export interface ConnectionSetupController {
   busy: "validate" | "probe" | null;
 
   /**
+   * 提交前置门的判定结果（`null` = 可提交）。
+   *
+   * **唯一真值来源**：按钮的 `disabled` 与提交函数首行守卫必须都读它，
+   * 不得各写一套判定（否则会漂移出「禁用被绕过」的回归）。判定逻辑见
+   * `connectionSetupModel.submitBlockReason`（纯函数，可单测）。
+   */
+  blockReason: SubmitBlockReason | null;
+
+  /**
    * 仍处于 marker 态、未重新输入明文的 Secret 字段。
    * 非空时 `canTestConnection` 为 false：marker 不是密码，禁止发给
    * probe / validate-connection（C3 的 Endpoint-bound connection-check 尚未实现）。
@@ -125,6 +149,11 @@ export interface ConnectionSetupController {
 
   /** 现场归一化（不改状态）：提交前的 canonical 快照来源 */
   snapshot: () => NormalizeResult;
+  /**
+   * **提交用** canonical 快照。前置门未过时返回 `null`，调用方必须据此中止，
+   * 不得改用 `snapshot()` 绕过（那是给 probe/validate 用的，且不做隐藏字段补齐）。
+   */
+  submitSnapshot: () => NormalizeResult | null;
   /** 只做本地归一化；有 issue 时写入结果区并返回 ok=false（不阻断式静默） */
   validateLocal: () => ValidateOutcome;
   /** 本地归一化 + 服务端 validate-connection */
@@ -170,6 +199,7 @@ export function useConnectionSetup(
     sessionKey,
     initialDriverId,
     initialValues,
+    preserveHiddenValues = false,
     onDescriptorChange,
   } = options;
 
@@ -416,10 +446,68 @@ export function useConnectionSetup(
   );
   const canTestConnection = secretMarkers.length === 0;
 
+  // -------------------------------------------------------------------------
+  // 提交前置门（P0）：按钮 disabled 与提交函数守卫共用同一判定
+  // -------------------------------------------------------------------------
+  const usableDriverIds = useMemo(
+    () => drivers.filter((d) => d.launchable).map((d) => d.id),
+    [drivers],
+  );
+  // 动作路径必须读**最新**的可用驱动集合（与 stateRef 同理：异步回调里渲染期
+  // 闭包可能已过期），故同时保留一份 ref。
+  const usableDriverIdsRef = useRef<string[]>(usableDriverIds);
+  usableDriverIdsRef.current = usableDriverIds;
+
+  const blockReason = submitBlockReason({
+    active,
+    driverSelectable,
+    driversStatus,
+    usableDriverIds,
+    driverId: state.driverId,
+    descriptorStatus,
+  });
+
   const snapshot = useCallback(
     () => normalizeConnection(stateRef.current.draft.raw, fieldsRef.current),
     [],
   );
+
+  /**
+   * 现场构造前置门输入。
+   *
+   * 动作路径必须读 **ref** 里的最新 driverId / 可用驱动集合，而不是渲染期闭包，
+   * 否则「禁用被绕过」的调用会拿到过期判定。
+   */
+  const gateInput = useCallback(
+    (): SubmitGateInput => ({
+      active,
+      driverSelectable,
+      driversStatus,
+      usableDriverIds: usableDriverIdsRef.current,
+      driverId: stateRef.current.driverId,
+      descriptorStatus,
+    }),
+    [active, driverSelectable, driversStatus, descriptorStatus],
+  );
+
+  /**
+   * 提交用快照：先过前置门（未过直接返回 `null`，不发也不构造），再现场归一化；
+   * 编辑态额外补齐 `visible_if` 隐藏字段的原值（`preserveHiddenFields`）。
+   *
+   * 门禁放在这里而不是只放在组件里，是为了让「提交函数本身」拥有守卫：即便
+   * 按钮的 `disabled` 被回归移除、或将来新增程序化提交入口，也拿不到可提交的负载。
+   */
+  const submitSnapshot = useCallback((): NormalizeResult | null => {
+    if (submitBlockReason(gateInput()) !== null) return null;
+    const raw = stateRef.current.draft.raw;
+    const currentFields = fieldsRef.current;
+    const result = normalizeConnection(raw, currentFields);
+    if (!preserveHiddenValues) return result;
+    return {
+      issues: result.issues,
+      connection: preserveHiddenFields(result.connection, raw, currentFields),
+    };
+  }, [gateInput, preserveHiddenValues]);
 
   const validateLocal = useCallback((): ValidateOutcome => {
     const result = snapshot();
@@ -439,6 +527,19 @@ export function useConnectionSetup(
     const targetDriver = current.driverId;
     const revision = current.draft.revision;
     const result = snapshot();
+    // ---------------------------------------------------------------------
+    // P0 守卫：驱动清单 / 可用驱动 / 描述符任一不可用即**不发请求**。
+    // 与提交路径共用同一判定（submitBlockReason）：按钮的 disabled 只是 UI 表达，
+    // 一旦被回归移除，没有这道守卫就会把请求发到一个字段集合不可信的驱动上。
+    // ---------------------------------------------------------------------
+    if (submitBlockReason(gateInput()) !== null) {
+      setValidation({
+        kind: "error",
+        issues: [],
+        detail: "驱动清单或连接参数描述未就绪，未发起校验请求。",
+      });
+      return { normalize: result, ok: false };
+    }
     if (result.issues.length > 0) {
       setValidation({
         kind: "invalid",
@@ -498,13 +599,27 @@ export function useConnectionSetup(
     } finally {
       if (!ac.signal.aborted) setBusy(null);
     }
-  }, [snapshot]);
+  }, [snapshot, gateInput]);
 
   const probeConnection = useCallback(async (): Promise<ProbeOutcome | null> => {
     const current = stateRef.current;
     const targetDriver = current.driverId;
     const revision = current.draft.revision;
     const result = snapshot();
+    // ---------------------------------------------------------------------
+    // P0 守卫：与 validate / 提交同一判定。驱动清单或描述符不可用时**不发探测**：
+    // 此时字段集合不可信，探出来的结论只会误导用户（按钮 disabled 之外的防线）。
+    // ---------------------------------------------------------------------
+    if (submitBlockReason(gateInput()) !== null) {
+      const blocked = classifyProbeOutcome(503, {
+        error: {
+          code: "SETUP_NOT_READY",
+          message: "驱动清单或连接参数描述未就绪，未发起探测",
+        },
+      });
+      setProbe(blocked);
+      return blocked;
+    }
     if (result.issues.length > 0) {
       // 参数非法时不发请求，但仍然产出结构化的 invalid 结果：
       // 复用 classifyProbeOutcome 而不是另造一套文案（A26：不把对象交给 React）。
@@ -546,7 +661,7 @@ export function useConnectionSetup(
     } finally {
       if (!ac.signal.aborted) setBusy(null);
     }
-  }, [snapshot]);
+  }, [snapshot, gateInput]);
 
   return {
     drivers,
@@ -566,9 +681,11 @@ export function useConnectionSetup(
     validation,
     probe,
     busy,
+    blockReason,
     secretMarkers,
     canTestConnection,
     snapshot,
+    submitSnapshot,
     validateLocal,
     validate,
     probeConnection,

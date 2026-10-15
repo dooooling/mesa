@@ -11,7 +11,11 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import type { ConnectionValues, ProbeOutcome } from "./connectionSetupModel";
-import { useConnectionSetup, type UseConnectionSetupOptions } from "./useConnectionSetup";
+import {
+  useConnectionSetup,
+  type UseConnectionSetupOptions,
+  type ValidateOutcome,
+} from "./useConnectionSetup";
 
 interface Call {
   url: string;
@@ -273,5 +277,127 @@ describe("C2 Hook：Secret-safe 与结果失效", () => {
     const bad = result.current.snapshot();
     expect(bad.connection.local_tsap).toBeUndefined();
     expect(bad.issues.map((i) => i.path)).toContain("connection.local_tsap");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P0：Hook 级前置门 —— 清单/描述符不可用时 validate / probe / 提交快照全被挡住
+// （按钮的 disabled 只是 UI 表达；这里是「提交函数自身」的守卫）
+// ---------------------------------------------------------------------------
+
+describe("C2 Hook：P0 前置门（不发任何请求）", () => {
+  it("驱动清单失败：blockReason 明确，validate/probe/submitSnapshot 全部拒绝且零写请求", async () => {
+    const srv = installFetch({ driversFail: true });
+    const { result } = renderSetup({ active: true, driverSelectable: true, sessionKey: "s" });
+    await waitFor(() => expect(result.current.driversStatus).toBe("error"));
+
+    expect(result.current.blockReason).toBe("catalog-unavailable");
+    const validations: ValidateOutcome[] = [];
+    const probes: Array<ProbeOutcome | null> = [];
+    await act(async () => {
+      validations.push(await result.current.validate());
+    });
+    await act(async () => {
+      probes.push(await result.current.probeConnection());
+    });
+
+    expect(validations[0].ok).toBe(false);
+    // 明确表达「未发起探测」，不得伪装成设备不可达
+    expect(probes[0]?.kind).toBe("infrastructure");
+    expect(result.current.submitSnapshot()).toBeNull();
+    // 除了清单 GET，一个请求都没发出去
+    expect(srv.calls.filter((c) => c.method !== "GET")).toEqual([]);
+    expect(srv.calls.some((c) => c.url.endsWith("/probe"))).toBe(false);
+    expect(srv.calls.some((c) => c.url.endsWith("/validate-connection"))).toBe(false);
+  });
+
+  it("描述符失败：同样零请求，submitSnapshot 为 null", async () => {
+    const srv = installFetch({
+      drivers: [{ id: "s7", name: "S7", launchable: true }],
+      descriptors: {},
+    });
+    const { result } = renderSetup({ active: true, driverSelectable: true, sessionKey: "s" });
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("error"));
+
+    expect(result.current.blockReason).toBe("descriptor-unavailable");
+    await act(async () => {
+      expect((await result.current.validate()).ok).toBe(false);
+    });
+    await act(async () => {
+      expect((await result.current.probeConnection())?.kind).toBe("infrastructure");
+    });
+    expect(result.current.submitSnapshot()).toBeNull();
+    expect(srv.calls.filter((c) => c.method !== "GET")).toEqual([]);
+  });
+
+  it("清单恢复后 submitSnapshot 才产出负载（门是活的，不是永久关闭）", async () => {
+    const srv = installFetch({
+      drivers: [{ id: "s7", name: "S7", launchable: true }],
+      descriptors: { s7: { fields: S7_FIELDS } },
+    });
+    const { result } = renderSetup({ active: true, driverSelectable: true, sessionKey: "s" });
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("ready"));
+    expect(result.current.blockReason).toBeNull();
+    act(() => result.current.setField("host", "10.0.0.9"));
+
+    const snap = result.current.submitSnapshot();
+    expect(snap).not.toBeNull();
+    expect(snap?.connection.host).toBe("10.0.0.9");
+    // 新建/新增路径不做隐藏字段补齐（preserveHiddenValues 默认 false）
+    expect(srv.calls.some((c) => c.url.endsWith("/probe"))).toBe(false);
+  });
+
+  it("edit 模式（driverSelectable=false）不看清单，但描述符失败仍挡住提交快照", async () => {
+    installFetch({ descriptors: { opcua: { fields: OPCUA_FIELDS } } });
+    const { result } = renderSetup({
+      active: true,
+      driverSelectable: false,
+      sessionKey: "edit",
+      initialDriverId: "opcua",
+      initialValues: OPCUA_INITIAL,
+    });
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("ready"));
+    expect(result.current.blockReason).toBeNull();
+
+    installFetch({ descriptors: {} });
+    act(() => result.current.reloadDescriptor());
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("error"));
+    expect(result.current.blockReason).toBe("descriptor-unavailable");
+    expect(result.current.submitSnapshot()).toBeNull();
+  });
+
+  it("submitSnapshot：编辑态补齐 visible_if 隐藏字段，并丢弃 Descriptor 之外的字段", async () => {
+    const FIELDS = [
+      { key: "host", label: "Host", field_type: "host", required: true, validation: {}, ui: { order: 1 } },
+      { key: "use_native", label: "Use native", field_type: "boolean", required: false, default: false, validation: {}, ui: { order: 2 } },
+      {
+        key: "native_pdu",
+        label: "PDU",
+        field_type: "integer",
+        required: false,
+        validation: { min: 1, max: 65535 },
+        ui: { order: 3, visible_if: { field: "use_native", op: "eq", value: true } },
+      },
+    ];
+    installFetch({ descriptors: { opcua: { fields: FIELDS } } });
+    const initial: ConnectionValues = {
+      host: "10.0.0.2",
+      use_native: false,
+      native_pdu: 8192,
+      legacy_field: "old",
+    };
+    const { result } = renderSetup({
+      active: true,
+      driverSelectable: false,
+      sessionKey: "edit",
+      initialDriverId: "opcua",
+      initialValues: initial,
+      preserveHiddenValues: true,
+    });
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("ready"));
+
+    const snap = result.current.submitSnapshot();
+    expect(snap?.connection.native_pdu).toBe(8192);
+    expect("legacy_field" in (snap?.connection ?? {})).toBe(false);
   });
 });

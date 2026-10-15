@@ -46,6 +46,10 @@ export function ConnectionEditorModal(props: {
   const [connLoadedEpId, setConnLoadedEpId] = useState<string | null>(null);
   const [connLoading, setConnLoading] = useState(false);
   const [connError, setConnError] = useState("");
+  // 驱动描述符就绪门（P0）：描述符失败时字段集合不可信（visible_if / 类型 / 范围
+  // 都无从判断），此时 PUT 出去的 connection 可能是残缺的，必须挡住。
+  // 由共享面板的 onDescriptorChange 上报（成功给 descriptor、失败给 null）。
+  const [descriptorReady, setDescriptorReady] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -54,6 +58,7 @@ export function ConnectionEditorModal(props: {
     setName(initialName);
     setConnLoadedEpId(null);
     setConnError("");
+    setDescriptorReady(false);
     setConnLoading(true);
     let cancelled = false;
     fetch(`/api/v1/endpoints/${endpointId}`)
@@ -99,6 +104,17 @@ export function ConnectionEditorModal(props: {
     if (!connReady) {
       if (connError) return message.error("连接快照加载失败，禁止保存以防用旧连接覆盖。请关闭重试。");
       return message.warning("连接快照加载中，禁止保存以防串改另一连接。请稍候。");
+    }
+    // ---------------------------------------------------------------------
+    // P0 提交守卫：驱动描述符未就绪（加载失败 / 尚未返回）时**本函数自身**也拒绝
+    // 发写请求。面板在描述符不可用时不会回调到这里，这里再判一次是为了防止
+    // 按钮 disabled 被回归移除、或将来新增程序化保存入口时直接发出
+    // PUT /endpoints/{id}（Stop→Apply→Restart 全链都不得启动）。
+    // ---------------------------------------------------------------------
+    if (!descriptorReady) {
+      return message.error(
+        "驱动描述符未就绪，已阻止保存（字段集合不可信，不会用残缺连接覆盖服务端）。请重试加载描述符。",
+      );
     }
     const cleaned = cleanConnection(connection);
     if (!Object.keys(cleaned).length) return message.warning("请填写连接参数");
@@ -200,6 +216,7 @@ export function ConnectionEditorModal(props: {
           submitLabel="保存"
           // 快照未就绪 / 加载失败：保存与校验/测试一律禁用（fail-closed）
           actionsDisabled={!connReady}
+          onDescriptorChange={(desc) => setDescriptorReady(desc !== null)}
           onSubmit={async ({ connection, restart }) => {
             await save(restart, connection);
           }}

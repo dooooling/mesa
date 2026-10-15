@@ -29,6 +29,16 @@ export function AddConnectionModal(props: {
     driverId: string;
     connection: ConnectionValues;
   }) => {
+    // ---------------------------------------------------------------------
+    // P0 提交守卫：面板在「驱动清单失败 / 无可用驱动 / 描述符失败」时不会回调
+    // 到这里（按钮 disabled + 面板 handleSubmit 首行守卫 + hook 的 submitSnapshot
+    // 前置门三重），这里再判一次入参，确保**本函数自身**也拒绝发出
+    // POST /api/v1/endpoints —— 防止将来新增程序化提交入口时绕过禁用状态。
+    // ---------------------------------------------------------------------
+    if (!args?.driverId) {
+      message.error("驱动未就绪，已阻止创建连接（不会回退到内置驱动列表）");
+      return;
+    }
     let values: { name?: string; id?: string };
     try {
       values = (await form.validateFields()) as { name?: string; id?: string };

@@ -4,6 +4,7 @@
 import { describe, expect, it, vi, beforeEach, type Mock } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { api } from "../api";
+import { invokeDisabledButton } from "../test/bypassDisabled";
 import { ConnectionEditorModal } from "./ConnectionEditorModal";
 
 vi.mock("../api", () => ({
@@ -277,5 +278,81 @@ describe("C2 ConnectionEditorModal：生命周期顺序与失败语义", () => {
     await waitFor(() =>
       expect(screen.getByText(/配置已保存，但恢复运行失败：start boom/)).toBeTruthy(),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P0：描述符失败时编辑保存的所有出口都必须失效
+//
+// 编辑保存的完整出口是「PUT /endpoints/{id} + Stop→Apply→（可选）Restart」，
+// 描述符失败意味着字段集合不可信（visible_if / 类型 / 范围都无从判断），
+// 此时写出去可能是残缺连接 —— 按钮 disabled 之外，提交函数自身也必须挡住。
+// ---------------------------------------------------------------------------
+
+describe("C2 ConnectionEditorModal：P0 描述符失败（提交出口全失效）", () => {
+  /** 记录所有 fetch 调用（含方法），用于「零写请求」的全量兜底断言。 */
+  function mockDescriptorFailure(state: string) {
+    const fetchCalls: Array<{ method: string; url: string }> = [];
+    (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ method: init?.method ?? "GET", url });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "ep-a", name: "A", connection: { host: "10.0.0.1" } }),
+      };
+    });
+    mocked.getDescriptor.mockRejectedValue(
+      new Error("500 /api/v1/drivers/drv/descriptor: 描述符挂了"),
+    );
+    mocked.listEndpoints.mockResolvedValue({ endpoints: [{ id: "ep-a", state }] });
+    mocked.stopEndpoint.mockResolvedValue({ status: 200, body: {} });
+    mocked.updateEndpoint.mockResolvedValue({});
+    mocked.startEndpoint.mockResolvedValue({ status: 200, body: {} });
+    mocked.probe.mockResolvedValue({ status: 200, body: { reachable: true } });
+    mocked.validateConnection.mockResolvedValue({ status: 200, body: {} });
+    return fetchCalls;
+  }
+
+  it("STOPPED：显示错误 + 重试、三条路径禁用，绕过 disabled 也不发 PUT / 不 probe", async () => {
+    const fetchCalls = mockDescriptorFailure("STOPPED");
+    renderModal("ep-a", "A");
+
+    await screen.findByText("驱动描述符加载失败");
+    expect(screen.getByText(/描述符挂了/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /重\s*试/ })).toBeTruthy();
+
+    const save = screen.getByRole("button", { name: /保\s*存/ }) as HTMLButtonElement;
+    const probeBtn = screen.getByRole("button", { name: /测试连接/ }) as HTMLButtonElement;
+    const validateBtn = screen.getByRole("button", { name: /校验参数/ }) as HTMLButtonElement;
+    expect([save.disabled, probeBtn.disabled, validateBtn.disabled]).toEqual([true, true, true]);
+
+    await act(async () => {
+      // 探针必须真的调用到处理函数（否则用例是假绿）
+      expect(invokeDisabledButton(save)).toBe(true);
+      expect(invokeDisabledButton(probeBtn)).toBe(true);
+      expect(invokeDisabledButton(validateBtn)).toBe(true);
+    });
+
+    expect(mocked.updateEndpoint).not.toHaveBeenCalled();
+    expect(mocked.probe).not.toHaveBeenCalled();
+    expect(mocked.validateConnection).not.toHaveBeenCalled();
+    expect(fetchCalls.filter((c) => c.method !== "GET")).toEqual([]);
+  });
+
+  it("RUNNING：Stop → Apply → Restart 整条链都不得启动", async () => {
+    const fetchCalls = mockDescriptorFailure("RUNNING");
+    renderModal("ep-a", "A");
+
+    await screen.findByText("驱动描述符加载失败");
+    const apply = screen.getByRole("button", { name: /停止并应用/ }) as HTMLButtonElement;
+    expect(apply.disabled).toBe(true);
+    await act(async () => {
+      expect(invokeDisabledButton(apply)).toBe(true);
+    });
+
+    expect(mocked.stopEndpoint).not.toHaveBeenCalled();
+    expect(mocked.updateEndpoint).not.toHaveBeenCalled();
+    expect(mocked.startEndpoint).not.toHaveBeenCalled();
+    expect(fetchCalls.filter((c) => c.method !== "GET")).toEqual([]);
   });
 });

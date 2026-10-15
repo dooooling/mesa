@@ -83,6 +83,8 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
     sessionKey: sessionKey ?? mode,
     initialDriverId,
     initialValues,
+    // P1：编辑态必须保留 visible_if 隐藏字段的原值（后端整体替换 connection）
+    preserveHiddenValues: mode === "edit",
     onDescriptorChange,
   });
 
@@ -147,33 +149,42 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
   };
 
   const handleSubmit = async (restart: boolean) => {
+    // ---------------------------------------------------------------------
+    // P0 提交守卫（**必须是第一行**）：驱动清单 / 可用驱动 / 描述符 / 入口侧
+    // 任一不可用即拒绝提交。
+    //
+    // 为什么按钮已经 disabled 了还要在这里再判一次：`disabled` 只是 UI 表达，
+    // 一旦被回归移除（或将来新增程序化提交入口、或有人直接调用 onSubmit），
+    // 没有这道守卫就会真的发出 POST /endpoints 或 PUT /endpoints/{id}。
+    // 判定与按钮读的是**同一个** `setup.blockReason`（纯函数 submitBlockReason），
+    // 因此两侧不可能漂移。
+    // ---------------------------------------------------------------------
+    if (setup.blockReason !== null || actionsDisabled) return;
     const advancedOk = guardAdvanced();
     // 上一次服务端校验已判非法且参数未改动：不允许绕过校验直接提交
     const priorInvalid = setup.validation?.kind === "invalid";
     const local = setup.validateLocal();
     if (!advancedOk || !local.ok || priorInvalid) return;
     if (!setup.driverId) return;
+    // 第二道：hook 侧同一判定 + 编辑态隐藏字段补齐；返回 null 即前置门未过
+    const submit = setup.submitSnapshot();
+    if (!submit) return;
     await onSubmit({
       driverId: setup.driverId,
-      connection: local.normalize.connection,
+      connection: submit.connection,
       restart,
     });
   };
 
   // 驱动清单/描述符任一不可用即禁止**全部**提交路径（校验/测试/下一步/保存）：
   // 清单失败时既没有可选驱动，也没有可信的参数集合，任何请求都只会误导用户。
-  const catalogBlocked = driverSelectable && setup.driversStatus !== "ready";
-  const noUsableDriver =
-    driverSelectable &&
-    setup.driversStatus === "ready" &&
-    !usableDrivers.some((d) => d.id === setup.driverId);
-  const descriptorBlocked = setup.descriptorStatus !== "ready";
-  const driverBlocked = catalogBlocked || noUsableDriver || !setup.driverId;
+  // 注意：判定本身在模型层（submitBlockReason），这里只叠加入口侧条件。
+  const driverBlocked = setup.blockReason !== null;
   /** 校验/测试是否可用：驱动与描述符就绪、入口侧就绪，且没有未重新输入的 Secret marker */
-  const canTest = !driverBlocked && !descriptorBlocked && !actionsDisabled && setup.canTestConnection;
+  const canTest = !driverBlocked && !actionsDisabled && setup.canTestConnection;
   // 保存不受 Secret marker 限制：marker 必须原样回传，后端据此保留历史凭据
   //（若在此处禁用保存，就无法编辑含已存凭据连接的其它字段——属既有能力回归）。
-  const canSubmit = !driverBlocked && !descriptorBlocked && !actionsDisabled;
+  const canSubmit = !driverBlocked && !actionsDisabled;
 
   const primaryLabel = submitLabel ?? (mode === "add" ? "创建" : "下一步");
 
