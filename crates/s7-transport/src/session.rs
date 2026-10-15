@@ -27,6 +27,40 @@ pub struct S7Session {
     options: S7ConnectOptions,
 }
 
+/// 单阶段单调计时守卫（A22 真机量测用，**纯观测**）。
+///
+/// 为什么用 Drop 而不是在每步之后手写日志：握手链上任何一步失败都会 `?`
+/// 提前返回，手写日志会漏掉**恰好最需要计时的那一步**（超时/错误阶段）。
+/// Drop 语义保证成功与失败都记录，且不需要改动任何错误分支。
+///
+/// 为什么用 `Instant`：性能/耗时测量必须用宿主单调时钟，禁止用 UTC 相减。
+///
+/// 安全：只输出 `stage` 与 `elapsed_ms`，**不输出 host / TSAP / 凭据**等
+/// 连接配置（A22 要求证据可脱敏）。
+struct StageTimer {
+    stage: &'static str,
+    started: std::time::Instant,
+}
+
+impl StageTimer {
+    fn new(stage: &'static str) -> Self {
+        Self {
+            stage,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for StageTimer {
+    fn drop(&mut self) {
+        tracing::info!(
+            stage = self.stage,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            "S7 阶段耗时"
+        );
+    }
+}
+
 impl S7Session {
     /// 协商后的 PDU（后续分片以上限为准）。
     pub fn negotiated_pdu_length(&self) -> u16 {
@@ -41,18 +75,22 @@ impl S7Session {
     /// 建立连接并完成 `COTP + S7 Setup` 握手。
     pub async fn connect(options: S7ConnectOptions) -> Result<Self, S7TransportError> {
         let addr = options.dial_addr();
-        let stream = timeout(options.timeout(), TcpStream::connect(&addr))
-            .await
-            .map_err(|_| {
-                S7TransportError::timeout(
-                    "CONNECT_TIMEOUT",
-                    format!(
-                        "连接 {addr} 超时（{}ms），检查 PLC 是否可达、端口 102 是否放通",
-                        options.timeout_ms
-                    ),
-                )
-            })?
-            .map_err(|e| map_connect_error(e, &addr, options.port))?;
+        // A22：`tcp_connect` 阶段计时（块作用域限定窗口；Drop 时输出）。
+        let stream = {
+            let _stage = StageTimer::new("tcp_connect");
+            timeout(options.timeout(), TcpStream::connect(&addr))
+                .await
+                .map_err(|_| {
+                    S7TransportError::timeout(
+                        "CONNECT_TIMEOUT",
+                        format!(
+                            "连接 {addr} 超时（{}ms），检查 PLC 是否可达、端口 102 是否放通",
+                            options.timeout_ms
+                        ),
+                    )
+                })?
+                .map_err(|e| map_connect_error(e, &addr, options.port))?
+        };
 
         let mut session = Self {
             stream,
@@ -79,28 +117,42 @@ impl S7Session {
 
     async fn iso_connect(&mut self) -> Result<(), S7TransportError> {
         let pkt = build_cotp_cr(self.options.local_tsap, self.options.remote_tsap);
-        timeout(self.options.timeout(), send_packet(&mut self.stream, &pkt))
-            .await
-            .map_err(|_| S7TransportError::timeout("COTP_TIMEOUT", "COTP CR 超时"))?
-            .map_err(|e| map_io_error(e, "COTP_SEND_FAIL"))?;
-        let resp = timeout(self.options.timeout(), recv_packet(&mut self.stream))
-            .await
-            .map_err(|_| S7TransportError::timeout("COTP_TIMEOUT", "COTP CC 超时"))?
-            .map_err(|e| map_io_error(e, "COTP_RECV_FAIL"))?;
+        // A22：COTP CR 发送 / CC 接收分阶段计时（超时也记录）。
+        {
+            let _stage = StageTimer::new("cotp_cr_send");
+            timeout(self.options.timeout(), send_packet(&mut self.stream, &pkt))
+                .await
+                .map_err(|_| S7TransportError::timeout("COTP_TIMEOUT", "COTP CR 超时"))?
+                .map_err(|e| map_io_error(e, "COTP_SEND_FAIL"))?;
+        }
+        let resp = {
+            let _stage = StageTimer::new("cotp_cc_recv");
+            timeout(self.options.timeout(), recv_packet(&mut self.stream))
+                .await
+                .map_err(|_| S7TransportError::timeout("COTP_TIMEOUT", "COTP CC 超时"))?
+                .map_err(|e| map_io_error(e, "COTP_RECV_FAIL"))?
+        };
         check_cc(&resp)
     }
 
     async fn s7_setup(&mut self) -> Result<(), S7TransportError> {
         let pkt = build_s7_setup(self.pdu_ref, self.options.requested_pdu_length);
         self.bump_pdu_ref();
-        timeout(self.options.timeout(), send_packet(&mut self.stream, &pkt))
-            .await
-            .map_err(|_| S7TransportError::timeout("S7_SETUP_TIMEOUT", "S7 Setup 超时"))?
-            .map_err(|e| map_io_error(e, "S7_SETUP_SEND_FAIL"))?;
-        let resp = timeout(self.options.timeout(), recv_data(&mut self.stream))
-            .await
-            .map_err(|_| S7TransportError::timeout("S7_SETUP_TIMEOUT", "S7 Setup 响应超时"))?
-            .map_err(|e| map_io_error(e, "S7_SETUP_RECV_FAIL"))?;
+        // A22：S7 Setup 发送 / 响应分阶段计时（超时也记录）。
+        {
+            let _stage = StageTimer::new("s7_setup_send");
+            timeout(self.options.timeout(), send_packet(&mut self.stream, &pkt))
+                .await
+                .map_err(|_| S7TransportError::timeout("S7_SETUP_TIMEOUT", "S7 Setup 超时"))?
+                .map_err(|e| map_io_error(e, "S7_SETUP_SEND_FAIL"))?;
+        }
+        let resp = {
+            let _stage = StageTimer::new("s7_setup_recv");
+            timeout(self.options.timeout(), recv_data(&mut self.stream))
+                .await
+                .map_err(|_| S7TransportError::timeout("S7_SETUP_TIMEOUT", "S7 Setup 响应超时"))?
+                .map_err(|e| map_io_error(e, "S7_SETUP_RECV_FAIL"))?
+        };
         let negotiated = parse_setup_ack(&resp, self.options.requested_pdu_length)?;
         if negotiated != self.negotiated_pdu {
             tracing::info!(negotiated, "S7 PDU 已协商");

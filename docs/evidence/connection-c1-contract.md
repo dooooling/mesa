@@ -214,17 +214,38 @@ scripts/write-contract-evidence.py                                 见末节
 | `b58be17` | 记录 `61aed30` 的干净工作树证据 |
 | `43ccff4` | **`master.key` 不可逆覆盖风险修复**（第 7 节，C1 合并前 P0） |
 | `6458c99` | A22 只读量测方案（`docs/design/a22-probe-timing-measurement.md`） |
+| `6644477` | 记录 `6458c99` 的干净工作树证据 |
+| `4b02b4f` | **密钥并发首次初始化防覆盖**（唯一临时文件 + `hard_link` 原子发布 + 跨进程测试，第 7 节补充） |
+| `cea5dc5` | **A32 的 Linux CI 修复**：`assert_no_orphan` 改异步轮询 + Linux 进程状态诊断（原同步 `std::thread::sleep` 阻塞 Tokio 运行时，妨碍子进程异步回收；该改动后 Linux x64 与 ARM64 均通过） |
+| `d5a95f2` | **A22 分阶段单调计时**（`StageTimer` RAII Drop 输出 5 阶段 + 捕获式回归测试；纯观测，协议与超时语义零改动） |
+| `37938fd` | 同步 `Cargo.lock`（`d5a95f2` 为 s7-transport 加了 dev-dependency；`--locked` 构建必需）。**并更正 `d5a95f2` 提交信息中「不改 Cargo.lock」的错误陈述** |
 
-**干净工作树证据（最终）**：
+### 6.1 被测试提交 SHA 与文档提交 SHA 的区分（重要）
+
+本文档记录的证据对应**被测试提交** `37938fd`；而更新本文档本身会产生一个新提交，
+两者**不是同一个 SHA**。禁止把被测试 SHA 冒充为文档提交后 HEAD 的测试结果。
+
+- **被测试提交 SHA**：`37938fda854e6ef1b1fc766a9e6da223ab690cb9`
+- **证据文档提交 SHA**：本文档更新后新产生的提交（见 `git log`）
+- 约定：文档提交后**不再反复改文档制造 SHA 循环**；最终 HEAD 的机器证据
+  以「在干净工作树上再跑一次脚本」的结果记录到 PR #103 的验收评论 / CI 证据中。
+
+### 6.2 干净工作树证据（被测试提交 `37938fd`）
 
 ```text
 scripts/write-contract-evidence.py
   → target/validation/contract.json
-    suites=29  tests=190  sha=6458c997f73147c2845c90e7b4d249bd0ae76e2f  dirty=False
+    suites=29  tests=190  sha=37938fda854e6ef1b1fc766a9e6da223ab690cb9  dirty=False
 ```
 
-（`master.key` 修复新增的 4 条 config-store 用例位于该 crate 的单测，
-不计入 contract 套件数；故套件数仍为 29、契约项仍为 190。）
+全部契约套件 PASS、无失败测试；`dirty=False` 表示该结果取自干净工作树。
+
+**独立单测证据**（不混入契约套件的 190 项计数）：
+
+```text
+cargo test --locked -p mesa-s7-transport    57 passed   （含 A22 五阶段计时回归）
+cargo test --locked -p mesa-config-store    31 passed   （含 master.key 保护与并发防覆盖）
+```
 
 在此之前同一命令在 `c41cd8f` 上曾两次出现**单套件偶发失败**（分别落在
 `event_pressure` 与 `opcua_auth_restart_e2e`），逐项定位后确认：
@@ -279,3 +300,21 @@ scripts/write-contract-evidence.py
 数据库已有加密 Secret 而 `master.key` 丢失，升级后相关端点会**明确失败**
 （而不是用一个新密钥继续跑、让所有旧凭据永久无法解密）。此时唯一正确的
 动作是从备份恢复原 `master.key`。
+
+### 7.1 补充：跨进程并发首次初始化的防覆盖（`4b02b4f`）
+
+7 节的修复只堵住了"文件已存在但非法"的路径；**并发首次初始化**仍有独立窗口：
+原实现用固定名 `master.tmp` + `rename`，而 POSIX `rename` 会**替换**已存在目标，
+两个 mesad 进程同时首次初始化同一密钥目录时可能互相截断、甚至后写者覆盖先写者，
+造成「内存 key ≠ 落盘 key」。
+
+现改为：**唯一临时文件**（`pid` + 单调序号，`create_new` 不复用残留）→ `fsync`
+→ **`hard_link` 原子发布**。`hard_link` 在目标已存在时必然失败，因此不存在覆盖
+窗口；链接可见的一刻内容已完整（临时文件已 fsync 并关闭），读取方不可能看到
+半截密钥。若发现目标已由其它进程创建，则**读取并校验对方那把**密钥，而不是把
+自己这把写进去——两个进程最终必须得到同一把密钥。
+
+回归测试 `concurrent_first_init_across_two_processes_keeps_one_key`：父进程以
+`--exact` 重新执行本测试二进制两次（子进程经环境变量走"只做初始化"的分支），
+断言两进程密钥完全相同、落盘与返回一致、无 `.tmp` 残留、且该密钥可正常加解密。
+**必须真起进程**：进程内的 `INIT_LOCK` 只串行化同进程调用，无法覆盖该场景。

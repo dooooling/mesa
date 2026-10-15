@@ -123,6 +123,20 @@ cargo build --workspace
 ## 6. 当前状态
 
 - [x] 方案设计（本文）
-- [ ] 阶段计时最小改动（第 2 节）
+- [x] **阶段计时最小改动（第 2 节）—— 已实施**
+  - `crates/s7-transport/src/session.rs`：新增 `StageTimer`（RAII 守卫，**Drop 时**输出
+    `stage` + `elapsed_ms`），因此成功与失败（含 `?` 提前返回）都会记录——
+    手写"每步之后打日志"会恰好漏掉最需要计时的超时/错误阶段；
+  - 阶段名固定为 `tcp_connect` / `cotp_cr_send` / `cotp_cc_recv` /
+    `s7_setup_send` / `s7_setup_recv`，与第 2 节一致；
+  - 用 `Instant`（宿主单调时钟）；**不输出 host / TSAP / 凭据**；
+  - 协议行为与超时语义**零改动**（只加计时与日志）；
+  - 回归保护：`crates/s7-transport/src/fixture.rs` 新增
+    `handshake_emits_all_stage_timings`——捕获 tracing 事件并断言 5 个阶段
+    全部出现、带 `elapsed_ms`、且不含 TSAP。若将来有人删掉某个计时点，
+    真机量测会静默缺一段数据，而该测试会失败。
+    NOTE: 捕获必须用**全局**订阅者（`set_global_default`，进程内装一次）：
+    线程局部的 `set_default` 在 libtest 并行执行下观测不到事件
+    （实测单独跑通过、全量跑捕获为空）。
 - [ ] 现场只读量测执行（需授权窗口）
 - [ ] 证据落盘与常量复核
