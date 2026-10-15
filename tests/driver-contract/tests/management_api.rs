@@ -1257,22 +1257,31 @@ async fn connection_check_secret_semantics_are_endpoint_bound_and_side_effect_fr
     assert_eq!(s, StatusCode::NOT_FOUND, "body: {v}");
     assert_eq!(v["error"]["code"], "NOT_FOUND");
 
-    // ⑨ mode=probe 在 C3-B 之前必须明确「未实现」，绝不返回模拟成功。
+    // ⑨ mode=probe 已接入真实探测链（C3-B）：证据是它和 validate 一样先过统一
+    //    Schema 校验——非法草稿在此报 400 `{valid:false,issues}`，而不再返回旧的
+    //    501 `PROBE_NOT_IMPLEMENTED`；且**不发起探测**（耗时远小于任何 Probe 路径）。
+    //    真实探测的 200/400/501/503 分层由下方 C3-B 专测覆盖。
+    let started = std::time::Instant::now();
     let (s, v) = post_json(
         app.clone(),
         uri_e1,
-        r#"{"mode":"probe","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":{"secret_set":true}}}"#,
+        r#"{"mode":"probe","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":{"secret_set":true},"timeout_ms":"not-an-int"}}"#,
     )
     .await;
-    assert_eq!(s, StatusCode::NOT_IMPLEMENTED, "body: {v}");
-    assert_eq!(v["error"]["code"], "PROBE_NOT_IMPLEMENTED");
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["valid"], false, "body: {v}");
     assert!(
-        v["error"]["message"].as_str().unwrap().contains("C3-B"),
-        "必须写明待 C3-B 接入: {v}"
+        v["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["code"] == "INVALID_TYPE"),
+        "body: {v}"
     );
     assert!(
-        v.get("reachable").is_none(),
-        "未实现的 probe 不得给出任何可达性结论: {v}"
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "Schema 不合法时必须不发起探测（实际 {:?}）",
+        started.elapsed()
     );
     assert_no_plaintext(&v, &plaintexts);
 
@@ -1429,5 +1438,578 @@ async fn connection_check_never_logs_secret_plaintext() {
     assert!(
         !logged.contains(INLINE),
         "日志不得出现本次输入的明文凭据: {logged}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C3-B：mode=probe 的真实探测执行链
+// （契约 §3 处理链 / §5 错误边界 / §6 验收矩阵 C3-04/07/08/10）
+// ---------------------------------------------------------------------------
+
+/// 测试专属临时目录（存放 Driver 侧落盘的探测证据，Drop 时清理）。
+struct ProbeTempDir(std::path::PathBuf);
+
+impl ProbeTempDir {
+    fn new(tag: &str) -> Self {
+        let p = std::env::temp_dir().join(format!(
+            "mesa-c3-probe-{tag}-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        Self(p)
+    }
+
+    fn file(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for ProbeTempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+/// 构造 connection-check 的 `mode=probe` 请求体（路径转义交给 serde_json）。
+fn probe_body(connection: serde_json::Value) -> String {
+    serde_json::json!({ "mode": "probe", "connection": connection }).to_string()
+}
+
+/// C3-04（本轮核心证据）：实际送到临时 Driver 的是**解密后的正确明文**，
+/// 而不是 `{"secret_set": true}` marker。
+///
+/// 证据怎么拿：HTTP 响应被 Core 脱敏（同一次请求里 Driver 把收到的凭据回灌进
+/// warning，响应中必须只看到 `[redacted]`），所以明文不可能从响应里证明。唯一的
+/// 直接证据是 Driver 夹具自己落盘的 `capture_path`——文件内容是临时 Driver 进程
+/// **实际收到的**原始 connection JSON。两条断言同时成立才完整：
+/// ① Driver 落盘的是明文（且不含任何 marker）；② 同一份明文没有出现在 HTTP 响应里。
+#[tokio::test]
+async fn connection_check_probe_sends_plaintext_not_marker() {
+    const STORED: &str = "pw-c3-stored-plaintext";
+    const INLINE: &str = "pw-c3-inline-plaintext";
+    let tmp = ProbeTempDir::new("plaintext");
+    let (app, store, mgr, _staged) = app_for_connection_check().await;
+    let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
+    assert_eq!(s, StatusCode::CREATED);
+    // 已保存凭据走 SecretStore（connection_json 落盘是 marker 形态）。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        &format!(
+            r#"{{"id":"e1","name":"E1","device_id":"d1","driver_id":"test-driver","connection":{{"password":"{STORED}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "body: {v}");
+    assert!(
+        store
+            .get_endpoint("e1")
+            .unwrap()
+            .unwrap()
+            .connection_json
+            .contains("secret_set"),
+        "预置：落盘必须是 marker（明文只在 SecretStore 的密文里）"
+    );
+
+    // 预热 Descriptor（临时进程 + 缓存），把一次性 spawn 成本移出断言区。
+    let req = Request::builder()
+        .uri("/api/v1/drivers/test-driver/descriptor")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let before = persisted_state(&store, "e1");
+
+    // ① 引用已存凭据 + 让 Driver 把收到的凭据回灌进 warning（验证出口脱敏）。
+    let cap_ref = tmp.file("probe-ref.json");
+    let body = probe_body(serde_json::json!({
+        "password": {"secret_set": true},
+        "secret_echo": "warning",
+        "capture_path": cap_ref.to_string_lossy(),
+    }));
+    let (s, v) = post_json(app.clone(), "/api/v1/endpoints/e1/connection-check", &body).await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["reachable"], true, "body: {v}");
+
+    // 出口脱敏：warning 里必须有 [redacted]（说明 Driver 确实回灌了明文，Core 擦掉了）
+    let warnings = v["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "body: {v}");
+    assert_eq!(warnings[0]["code"], "SECRET_ECHO", "body: {v}");
+    let msg = warnings[0]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("[redacted]"),
+        "Driver 回灌的凭据必须被 Core 擦除: {msg}"
+    );
+    assert_no_plaintext(&v, &[STORED]);
+
+    // ② 核心证据：临时 Driver 实际收到的 connection 里，password 是**明文**。
+    let captured = std::fs::read_to_string(&cap_ref)
+        .expect("Driver 必须落盘它实际收到的 connection（否则本断言是空断言）");
+    assert!(
+        !captured.contains("secret_set") && !captured.contains("clear_secret"),
+        "marker 绝不进入 Driver 的 OpenConnection: {captured}"
+    );
+    let cv: serde_json::Value = serde_json::from_str(&captured).unwrap();
+    assert_eq!(
+        cv["password"], STORED,
+        "送到 Driver 的必须是 SecretStore 里的明文，实际: {captured}"
+    );
+
+    // ③ 草稿新明文优先于已存值（同样以 Driver 收到的内容为准）。
+    let cap_inline = tmp.file("probe-inline.json");
+    let body = probe_body(serde_json::json!({
+        "password": INLINE,
+        "capture_path": cap_inline.to_string_lossy(),
+    }));
+    let (s, v) = post_json(app.clone(), "/api/v1/endpoints/e1/connection-check", &body).await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    let inline_captured = std::fs::read_to_string(&cap_inline).unwrap();
+    let iv: serde_json::Value = serde_json::from_str(&inline_captured).unwrap();
+    assert_eq!(
+        iv["password"], INLINE,
+        "本次草稿明文必须优先: {inline_captured}"
+    );
+    assert!(
+        !inline_captured.contains(STORED),
+        "草稿有新明文时不得再拼上已存凭据: {inline_captured}"
+    );
+
+    // ④ 无副作用：探测前后持久化面逐字一致，且没有 Endpoint 被启动。
+    assert_eq!(
+        persisted_state(&store, "e1"),
+        before,
+        "probe 不得修改任何持久化状态"
+    );
+    // SecretStore 里的凭据仍是原值（草稿新明文绝不写回）。
+    assert_eq!(
+        store.get_secret("e1", "password").unwrap().as_deref(),
+        Some(STORED)
+    );
+    assert!(
+        mgr.snapshot()
+            .endpoint("e1")
+            .is_none_or(|s| s.state != "RUNNING"),
+        "连接检查不得启动 Endpoint"
+    );
+    // 临时探测进程不得残留（详细进程/租约取证见 subprocess_orphan_guard）。
+    assert!(
+        mgr.snapshot().endpoints().is_empty(),
+        "临时探测不得产生任何运行态 Endpoint"
+    );
+}
+
+/// C3-07（HTTP 层）：同一驱动、同一 Secret 字段的两个 Endpoint **不得交叉读取**
+/// 凭据。以「Driver 实际收到的明文」为判据，而不是响应文本（响应已被脱敏）。
+#[tokio::test]
+async fn connection_check_probe_secret_is_endpoint_bound() {
+    const PW1: &str = "pw-e1-isolation";
+    const PW2: &str = "pw-e2-isolation";
+    let tmp = ProbeTempDir::new("isolation");
+    let (app, _store, _mgr, _staged) = app_for_connection_check().await;
+    let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
+    assert_eq!(s, StatusCode::CREATED);
+    // e1/e2：同驱动、同 Secret 字段，各存各的凭据；e3：同驱动但没有凭据。
+    for (id, pw) in [("e1", Some(PW1)), ("e2", Some(PW2)), ("e3", None)] {
+        let conn = match pw {
+            Some(pw) => format!(r#"{{"password":"{pw}"}}"#),
+            None => "{}".to_string(),
+        };
+        let (s, v) = post_json(
+            app.clone(),
+            "/api/v1/endpoints",
+            &format!(
+                r#"{{"id":"{id}","name":"{id}","device_id":"d1","driver_id":"test-driver","connection":{conn}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "body: {v}");
+    }
+
+    let req = Request::builder()
+        .uri("/api/v1/drivers/test-driver/descriptor")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    // 各 Endpoint 使用**不同的** capture 文件：交叉读取会在文件内容里直接暴露。
+    for (uri, cap_name, expect, other) in [
+        ("/api/v1/endpoints/e1/connection-check", "e1.json", PW1, PW2),
+        ("/api/v1/endpoints/e2/connection-check", "e2.json", PW2, PW1),
+    ] {
+        let cap = tmp.file(cap_name);
+        let body = probe_body(serde_json::json!({
+            "password": {"secret_set": true},
+            "capture_path": cap.to_string_lossy(),
+        }));
+        let (s, v) = post_json(app.clone(), uri, &body).await;
+        assert_eq!(s, StatusCode::OK, "{uri} body: {v}");
+        let captured = std::fs::read_to_string(&cap).unwrap();
+        let cv: serde_json::Value = serde_json::from_str(&captured).unwrap();
+        assert_eq!(
+            cv["password"], expect,
+            "{uri}: 必须是本 Endpoint 的凭据，实际: {captured}"
+        );
+        assert!(
+            !captured.contains(other),
+            "{uri}: 绝不能读到另一个 Endpoint 的凭据: {captured}"
+        );
+        assert_no_plaintext(&v, &[PW1, PW2]);
+    }
+
+    // e3 没有该 Secret：marker 引用无效 → 400，且**不发起探测**
+    //（capture 文件不存在即证明临时 Driver 根本没起来）。
+    let cap3 = tmp.file("e3-must-not-exist.json");
+    let body = probe_body(serde_json::json!({
+        "password": {"secret_set": true},
+        "capture_path": cap3.to_string_lossy(),
+    }));
+    let (s, v) = post_json(app.clone(), "/api/v1/endpoints/e3/connection-check", &body).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], "SECRET_NOT_FOUND", "body: {v}");
+    assert!(!cap3.exists(), "凭据引用无效必须在发起探测之前被拒绝");
+    assert_no_plaintext(&v, &[PW1, PW2]);
+}
+
+/// C3-10（HTTP 分层）：`mode=probe` 与既有 `/drivers/{id}/probe` 共用同一映射
+/// （`probe_result_to_response`），因此分层口径必须逐条正确：
+/// 400 输入（Schema / Driver ConfigurationError）、404 Endpoint 不存在、
+/// 501 Driver 不支持探测、503 探测基础设施失败、200 可达与不可达。
+///
+/// NOTE（504）：真实超时需要耗满 Driver 侧预算（Query 下限 5s + Close 5s + 启动
+/// 与清理预算，单例 ≥ 20s），放进合同套件不划算；超时分类由 `mesa-core-api`
+/// 单测在**同一个映射函数**上逐分支锁定（`probe_http_layering_classification`），
+/// 再加上既有 A32 用例对真实 RpcTimeout 的回收验证——两者合起来覆盖该分支。
+#[tokio::test]
+async fn connection_check_probe_http_layering_classification() {
+    const PW: &str = "pw-c3-layering";
+    let (app, _store, _mgr, _staged) = app_for_connection_check().await;
+    let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        &format!(
+            r#"{{"id":"e1","name":"E1","device_id":"d1","driver_id":"test-driver","connection":{{"password":"{PW}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "body: {v}");
+    let req = Request::builder()
+        .uri("/api/v1/drivers/test-driver/descriptor")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let uri = "/api/v1/endpoints/e1/connection-check";
+
+    // ① 400（Core Schema 门）：类型非法 → `{valid:false,issues}`，且不发起探测。
+    let started = std::time::Instant::now();
+    let (s, v) = post_json(
+        app.clone(),
+        uri,
+        &probe_body(serde_json::json!({"probe_delay_ms": "not-an-int"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["valid"], false, "body: {v}");
+    assert!(
+        v["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["code"] == "INVALID_TYPE"),
+        "body: {v}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "Schema 不合法时不得发起探测（实际 {:?}）",
+        started.elapsed()
+    );
+
+    // ② 200 可达：默认行为。
+    let (s, v) = post_json(
+        app.clone(),
+        uri,
+        &probe_body(serde_json::json!({"password": {"secret_set": true}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["reachable"], true, "body: {v}");
+    assert_eq!(v["device"]["vendor"], "Mesa", "body: {v}");
+    assert_no_plaintext(&v, &[PW]);
+
+    // ③ 200 不可达：**探测结果**，不是错误（不得是 5xx）。
+    let (s, v) = post_json(
+        app.clone(),
+        uri,
+        &probe_body(serde_json::json!({"probe_mode": "unreachable"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["reachable"], false, "body: {v}");
+    assert_eq!(v["warnings"][0]["code"], "CONNECTION_FAILED", "body: {v}");
+
+    // ④ 501：Driver 声明不支持探测。
+    let (s, v) = post_json(
+        app.clone(),
+        uri,
+        &probe_body(serde_json::json!({"probe_mode": "unsupported"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_IMPLEMENTED, "body: {v}");
+    assert_eq!(v["error"]["code"], "PROBE_UNSUPPORTED", "body: {v}");
+
+    // ⑤ 503：探测基础设施/链路失败（不是参数错误，也不是「设备不可达」）。
+    let (s, v) = post_json(
+        app.clone(),
+        uri,
+        &probe_body(serde_json::json!({"probe_mode": "connection_error"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "body: {v}");
+    assert_eq!(v["error"]["code"], "PROBE_FAILED", "body: {v}");
+
+    // ⑥ 400（Driver ConfigurationError）：Driver 返回的错误文本里带着收到的凭据
+    //    → 必须原样透出**分类**，但凭据必须被 Core 擦除。
+    let (s, v) = post_json(
+        app.clone(),
+        uri,
+        &probe_body(serde_json::json!({
+            "password": {"secret_set": true},
+            "secret_echo": "error",
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], "PROBE_REJECTED_BY_DRIVER", "body: {v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("[redacted]"),
+        "Driver 错误文本里的凭据必须被擦除: {v}"
+    );
+    assert_no_plaintext(&v, &[PW]);
+
+    // ⑦ 404：Endpoint 不存在（URL 是唯一 Endpoint 来源）。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/nope/connection-check",
+        &probe_body(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "body: {v}");
+    assert_eq!(v["error"]["code"], "NOT_FOUND", "body: {v}");
+}
+
+/// 评审追加边界：**Probe 返回的错误文本与 warnings 也必须脱敏**，且日志同样不得
+/// 出现明文。
+///
+/// 为什么单独一条：进入 Driver 前不泄漏只解决了半条边界——Driver 会把收到的凭据
+/// 写进 warning / 认证失败消息，而这两条路都能回到 HTTP 响应与 Core 日志。
+/// 这里让夹具把凭据原样回灌（`secret_echo`），再在 **trace 级**全量日志下断言：
+/// 响应体与日志里都只有 `[redacted]`。
+#[tokio::test]
+async fn connection_check_probe_never_leaks_secret_in_response_or_logs() {
+    const STORED: &str = "pw-probe-never-leak";
+    let (app, _store, _mgr, _staged) = app_for_connection_check().await;
+    let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        &format!(
+            r#"{{"id":"e1","name":"E1","device_id":"d1","driver_id":"test-driver","connection":{{"password":"{STORED}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "body: {v}");
+    let req = Request::builder()
+        .uri("/api/v1/drivers/test-driver/descriptor")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("trace"))
+        .with_writer({
+            let b = Arc::clone(&buf);
+            move || CaptureWriter(Arc::clone(&b))
+        })
+        .finish();
+    // `set_default` 是线程级：`#[tokio::test]` 默认单线程运行时，请求处理与断言
+    // 在同一线程上，因此捕获范围正好覆盖被测路径。
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    // ① warning 回灌：200 + 全量 warnings 里只能看到 [redacted]。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/connection-check",
+        &probe_body(serde_json::json!({
+            "password": {"secret_set": true},
+            "secret_echo": "warning",
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["warnings"][0]["code"], "SECRET_ECHO", "body: {v}");
+    assert_no_plaintext(&v, &[STORED]);
+    // 预置：擦除必须真的发生过（否则这条断言在「驱动没回灌」时也会绿）。
+    assert!(
+        v["warnings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("[redacted]"),
+        "body: {v}"
+    );
+
+    // ② 错误文本回灌：400 + 驱动原因码透出，凭据被擦除。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/connection-check",
+        &probe_body(serde_json::json!({
+            "password": {"secret_set": true},
+            "secret_echo": "error",
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["error"]["code"], "PROBE_REJECTED_BY_DRIVER", "body: {v}");
+    assert_no_plaintext(&v, &[STORED]);
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("[redacted]"),
+        "body: {v}"
+    );
+    drop(guard);
+
+    let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        !logged.is_empty(),
+        "预置：trace 级必须实际产出日志（否则本测试是空断言）"
+    );
+    assert!(
+        !logged.contains(STORED),
+        "probe 日志不得出现明文凭据: {logged}"
+    );
+}
+
+/// 可选用例（任务书 §测试要求）：HTTP 层 `PERSISTED_CONNECTION_INVALID`。
+///
+/// 用 `rusqlite`（dev-dep）绕过写时校验直接改行，模拟**历史遗留/带外修改**的
+/// 损坏 `connection_json`——这正是 C1/C3 在坏 JSON 上 fail-closed 的适用场景。
+/// 两半都要成立：需要继承凭据时 503 且不探测；草稿自己给全凭据时损坏记录不得拦下
+/// 探测（否则「只在确实需要继承时才解析已保存记录」的设计就退化了）。
+#[tokio::test]
+async fn connection_check_probe_persisted_connection_invalid_is_503() {
+    use mesa_config_store::{DeviceRecord, EndpointRecord};
+    let tmp = ProbeTempDir::new("persisted-invalid");
+    let db = tmp.file("mesa.db");
+    {
+        let s = ConfigStore::open(&db).unwrap();
+        s.create_device(&DeviceRecord {
+            id: "d1".into(),
+            name: "D".into(),
+        })
+        .unwrap();
+        s.create_endpoint(&EndpointRecord {
+            id: "e1".into(),
+            name: "E1".into(),
+            device_id: "d1".into(),
+            driver_id: "test-driver".into(),
+            connection_json: r#"{"password":{"secret_set":true}}"#.into(),
+            desired_running: false,
+            updated_at_ns: 0,
+        })
+        .unwrap();
+        s.put_secret("e1", "password", "pw-persisted-broken", "master")
+            .unwrap();
+    }
+    // 带外改行：`{oops` 连合法 JSON 都不是（写时校验存在时不可能落库）。
+    {
+        let raw = rusqlite::Connection::open(&db).unwrap();
+        let n = raw
+            .execute(
+                "UPDATE endpoints SET connection_json = ?1 WHERE id = 'e1'",
+                ["{oops"],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "预置：必须真的改动了那一行");
+    }
+    let store = Arc::new(ConfigStore::open(&db).unwrap());
+    let staged = common::staged_drivers_with_test_driver();
+    let drivers_dir = staged.path().clone();
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
+    let state = mesa_core_api::AppState::try_new_with_control(
+        mgr,
+        store,
+        drivers_dir.to_string_lossy().to_string(),
+        false,
+    )
+    .unwrap();
+    let app = mesa_core_api::router(state);
+
+    // ① 草稿省略 password ⇒ 需要继承 ⇒ 已保存记录损坏必须 fail-closed（503）。
+    let cap = tmp.file("must-not-exist.json");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/connection-check",
+        &probe_body(serde_json::json!({"capture_path": cap.to_string_lossy()})),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "需要继承而记录损坏必须 fail-closed: {v}"
+    );
+    assert_eq!(
+        v["error"]["code"], "PERSISTED_CONNECTION_INVALID",
+        "body: {v}"
+    );
+    assert_no_plaintext(&v, &["pw-persisted-broken"]);
+    assert!(!cap.exists(), "fail-closed 路径不得发起探测");
+    // 损坏行不得被「顺手修好」。
+    let raw = rusqlite::Connection::open(&db).unwrap();
+    let stored: String = raw
+        .query_row(
+            "SELECT connection_json FROM endpoints WHERE id='e1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "{oops", "检查失败也不得写回 connection_json");
+
+    // ② 草稿显式清除凭据 ⇒ 不需要继承 ⇒ 同一份损坏记录**不得**拦下探测。
+    let cap2 = tmp.file("cleared.json");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/connection-check",
+        &probe_body(serde_json::json!({
+            "password": {"clear_secret": true},
+            "capture_path": cap2.to_string_lossy(),
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "不需要继承时损坏记录不得拦下探测: {v}");
+    assert_eq!(v["reachable"], true, "body: {v}");
+    let captured = std::fs::read_to_string(&cap2).unwrap();
+    assert!(
+        !captured.contains("password"),
+        "明确清除后送到 Driver 的连接不得带该字段: {captured}"
     );
 }

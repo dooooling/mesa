@@ -628,3 +628,296 @@ async fn cancelled_probe_releases_child_process_and_port_lease() {
     assert_no_orphan(&before, &name).await;
     cleanup_dir(&root);
 }
+
+// ---------------------------------------------------------------------------
+// C3-08：Endpoint-bound 连接检查（mode=probe）的临时进程清理与旁路影响
+// ---------------------------------------------------------------------------
+
+/// C3 探测请求（与既有用例同形，但入口是 Endpoint-bound 的 connection-check）。
+async fn post_connection_check(
+    app: axum::Router,
+    uri: &str,
+    body: &str,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use axum::body::Body;
+    use tower::ServiceExt;
+    let req = axum::http::Request::builder()
+        .uri(uri)
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// 持久化面快照（`connection_json` / `endpoint_secrets` / `desired_running` /
+/// 任务面 / 事件任务面 / point_map）。逐字比对而不是逐字段断言，避免「看漏了
+/// 某一列改了没改」。
+fn c3_persisted_snapshot(store: &mesa_config_store::ConfigStore) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for id in ["e-run", "e-probe"] {
+        let rec = store.get_endpoint(id).unwrap().unwrap();
+        out.insert(
+            id.to_string(),
+            serde_json::json!({
+                "endpoint": rec,
+                "secret_fields": store.list_secret_fields(id).unwrap(),
+                "password": store.get_secret(id, "password").unwrap(),
+                "tasks": store.list_tasks(id).unwrap(),
+                "event_tasks": store.list_event_tasks(id).unwrap(),
+                "point_map": store.point_map(id).unwrap(),
+            }),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+/// 该 Endpoint 的采集当前值（用于证明「运行实例仍在出数」）。
+fn latest_value(mgr: &MesaManager, point_key: &str) -> Option<f64> {
+    mgr.snapshot()
+        .latest_all()
+        .iter()
+        .find(|e| e.point_key == point_key)
+        .and_then(|e| e.value.value.as_f64())
+}
+
+/// C3-08：`mode=probe` 完成后**临时探测进程必须回收**（PID 回落 + 端口租约释放 +
+/// 无孤儿），且**不影响既有运行实例**（不被重启、不断流、持久化面零改动）。
+///
+/// 判据为什么是「唯一命名的二进制 + 精确 PID 集合」：本用例把测试驱动 stage 成
+/// `pb-c3-guard`，因此按进程名看到的 PID 只可能来自本用例——不存在把别的用例
+/// 的 driver 误算成自己孤儿的可能。
+#[tokio::test]
+async fn c3_connection_check_probe_cleans_up_and_spares_running_endpoint() {
+    use mesa_config_store::{ConfigStore, DeviceRecord, EndpointRecord};
+    use mesa_core_types::{AcquisitionTask, DriverBinding, GENERIC_BINDING_KIND, TaskSchedule};
+
+    const PW: &str = "pw-c3-orphan-guard";
+    let (root, unique) = stage_drivers_dir("c3check", &test_driver_exe(), "pb-c3-guard");
+    let name = exe_name(&unique);
+    let store = Arc::new(ConfigStore::open_in_memory().unwrap());
+    store
+        .create_device(&DeviceRecord {
+            id: "d1".into(),
+            name: "D".into(),
+        })
+        .unwrap();
+    // e-run：真实运行中的采集实例（counter，50ms 一跳）。
+    store
+        .create_endpoint(&EndpointRecord {
+            id: "e-run".into(),
+            name: "e-run".into(),
+            device_id: "d1".into(),
+            driver_id: "test-driver".into(),
+            connection_json: "{}".into(),
+            desired_running: true,
+            updated_at_ns: 0,
+        })
+        .unwrap();
+    store
+        .replace_tasks(
+            "e-run",
+            &[AcquisitionTask {
+                id: "t1".into(),
+                schedule: TaskSchedule::Poll { interval_ms: 50 },
+                binding: DriverBinding {
+                    kind: GENERIC_BINDING_KIND.into(),
+                    config: serde_json::json!({"selections":[{
+                        "resource_id":"counter",
+                        "parameters":{"start":0.0,"step":1.0},
+                        "outputs":[{"output":"value","point_key":"c3.counter"}]
+                    }]}),
+                },
+            }],
+        )
+        .unwrap();
+    // e-probe：只有被检查的连接草稿（凭据在 SecretStore，落盘是 marker）。
+    store
+        .create_endpoint(&EndpointRecord {
+            id: "e-probe".into(),
+            name: "e-probe".into(),
+            device_id: "d1".into(),
+            driver_id: "test-driver".into(),
+            connection_json: r#"{"password":{"secret_set":true}}"#.into(),
+            desired_running: false,
+            updated_at_ns: 0,
+        })
+        .unwrap();
+    store
+        .put_secret("e-probe", "password", PW, "master")
+        .unwrap();
+
+    let mgr = Arc::new(MesaManager::discover(&root));
+    mgr.start_endpoint(mesa_driver_manager::endpoint::BuiltinEndpoint {
+        endpoint_id: "e-run".into(),
+        driver_id: "test-driver".into(),
+        connection_json: "{}".into(),
+        tasks: store.list_tasks("e-run").unwrap(),
+        event_tasks: vec![],
+    })
+    .unwrap();
+    common::wait_until(15, || {
+        mgr.snapshot()
+            .endpoint("e-run")
+            .is_some_and(|s| s.state == "RUNNING")
+    })
+    .await;
+    common::wait_until(15, || latest_value(&mgr, "c3.counter").is_some()).await;
+
+    // 运行实例的 PID 集合：探测前建立基线，探测后必须**原样存活**。
+    let run_pids: HashSet<u32> = {
+        let p = live_pids(&name);
+        assert!(
+            !p.is_empty(),
+            "预置：运行中的 Endpoint 必须有一个 driver 进程"
+        );
+        p
+    };
+    let claims_before = claimed_ports();
+    let value_before = latest_value(&mgr, "c3.counter").expect("预置：已开始出数");
+    let persisted_before = c3_persisted_snapshot(&store);
+
+    let state = mesa_core_api::AppState::try_new_with_control(
+        Arc::clone(&mgr),
+        Arc::clone(&store),
+        root.to_string_lossy().to_string(),
+        false,
+    )
+    .unwrap();
+    let app = mesa_core_api::router(state);
+    let uri = "/api/v1/endpoints/e-probe/connection-check";
+    let tmp = std::env::temp_dir().join(format!("mesa-c3-orphan-{}", now_ns()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let capture = tmp.join("probe.json");
+    // probe_delay_ms：让驱动在 Probe RPC 内停留数秒，便于在**探测进行中**抓到
+    // 临时子进程与被它认领的端口。
+    let body = serde_json::json!({
+        "mode": "probe",
+        "connection": {
+            "password": {"secret_set": true},
+            "probe_delay_ms": 3000,
+            "capture_path": capture.to_string_lossy(),
+        }
+    })
+    .to_string();
+
+    let probing = {
+        let app = app.clone();
+        let body = body.clone();
+        tokio::spawn(async move { post_connection_check(app, uri, &body).await })
+    };
+
+    // ① 探测进行中：临时 driver 进程确实起来了（与运行实例并存）。
+    wait_for_new_pid(&run_pids, &name).await;
+    let temp_pids: Vec<u32> = {
+        let mut v: Vec<u32> = live_pids(&name).difference(&run_pids).copied().collect();
+        v.sort_unstable();
+        v
+    };
+    // ② 它同时认领了一个新的端口租约。
+    //
+    // NOTE（诚实说明）：`mesa-driver-ports` 是**全局**目录，cargo 并行跑
+    // 同一套件的其它用例时也会短暂认领端口，因此"新出现的租约"严格来说不保证
+    // 就是本次探测的（A32 用例沿用同一手法，这里保持一致）。为降低误判，先等
+    // 唯一命名的临时子进程彻底消失，再对这一租约做有界等待。
+    let temp_port = wait_for_new_claim(&claims_before).await;
+    let new_claims: Vec<u16> = {
+        let mut v: Vec<u16> = claimed_ports()
+            .difference(&claims_before)
+            .copied()
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    eprintln!(
+        "[c3-08-diag] temp_pids={temp_pids:?} temp_port={temp_port} \
+         new_claims={new_claims:?} run_pids={run_pids:?}"
+    );
+
+    let (status, v) = probing.await.expect("探测请求任务不得 panic");
+    assert_eq!(status, axum::http::StatusCode::OK, "body: {v}");
+    assert_eq!(v["reachable"], true, "body: {v}");
+
+    // ③ 临时进程回收：PID 回落到基线（运行实例仍在），且端口租约释放。
+    assert_no_orphan(&run_pids, &name).await;
+    common::wait_until(15, || {
+        !claim_dir().join(format!("port-{temp_port}.lock")).exists()
+    })
+    .await;
+    // 运行实例的进程必须**还是原来那个**（不是被杀后重启出来的新 PID）。
+    assert!(
+        run_pids.is_subset(&live_pids(&name)),
+        "连接检查不得重启/停止既有运行实例: {:?}",
+        live_pids(&name)
+    );
+
+    // ④ 运行实例仍在出数：探测之后必须看到新的采集值（断流/重启都会失败）。
+    let mut advanced = false;
+    for _ in 0..100 {
+        if let Some(v) = latest_value(&mgr, "c3.counter")
+            && v > value_before
+        {
+            advanced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        advanced,
+        "连接检查后既有运行实例必须继续出数（前值 {value_before}）"
+    );
+    assert_eq!(
+        mgr.snapshot().endpoint("e-run").map(|s| s.state.clone()),
+        Some("RUNNING".to_string()),
+        "运行实例状态必须保持 RUNNING"
+    );
+
+    // ⑤ 无副作用：持久化面（connection_json / endpoint_secrets / desired_running /
+    //    任务 / 事件任务 / point_map）逐字一致。
+    assert_eq!(
+        c3_persisted_snapshot(&store),
+        persisted_before,
+        "连接检查不得修改任何持久化状态"
+    );
+    // 临时 Driver 实际收到的仍是明文（顺带锁定 C3-04 在运行实例并存时同样成立）。
+    let captured = std::fs::read_to_string(&capture).expect("临时 Driver 必须落盘收到的连接");
+    assert!(
+        !captured.contains("secret_set") && captured.contains(PW),
+        "送到临时 Driver 的必须是明文: {captured}"
+    );
+
+    // ⑥ 失败路径同样必须回收：501（Driver 不支持探测）之后不得留下任何临时进程。
+    let (status, v) = post_connection_check(
+        app.clone(),
+        uri,
+        &serde_json::json!({
+            "mode": "probe",
+            "connection": {"password": {"secret_set": true}, "probe_mode": "unsupported"}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED, "body: {v}");
+    assert_no_orphan(&run_pids, &name).await;
+    assert!(
+        run_pids.is_subset(&live_pids(&name)),
+        "失败路径也不得影响既有运行实例"
+    );
+    assert_eq!(
+        c3_persisted_snapshot(&store),
+        persisted_before,
+        "失败的连接检查同样不得修改任何持久化状态"
+    );
+
+    mgr.shutdown_all().await;
+    std::fs::remove_dir_all(&tmp).ok();
+    cleanup_dir(&root);
+}

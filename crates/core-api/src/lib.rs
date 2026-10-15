@@ -709,31 +709,27 @@ async fn validate_connection(
     }
 }
 
-/// 动态探测（§8）：纯 HTTP 映射，编排（临时进程/Probe RPC/匹配/清理）
-/// 全部收敛在 `MesaManager::probe()`，本层只做形状转换与状态码映射。
-/// - 200：探测完成（含设备不可达 `reachable:false`，那是探测结果）；
-/// - 404/400：输入问题；501：Driver 不支持；503：基础设施失败；504：超时。
-async fn probe_driver(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<serde_json::Value>,
+/// 探测结果的**唯一** HTTP 映射点（既有 `/drivers/{id}/probe` 与 C3
+/// `POST /endpoints/{id}/connection-check` 的 `mode=probe` 共用）。
+///
+/// 为什么必须共用而不是各写一套：状态码分层是冻结契约（§5：200 可达/不可达、
+/// 400 输入、404 驱动不存在、501 不支持探测、503 基础设施、504 超时）。两份
+/// 相似代码迟早会在某个分支上分叉，而分叉的表现是「同一个探测在两个入口给出
+/// 不同诊断」，用户与运维都会据此得出错误结论。
+///
+/// 分层口径：
+/// - 200：探测**完成**（`reachable:false` 也是探测结果，不是错误）；
+/// - 404/400：Driver 不存在 / 输入问题（含 Driver 侧 ConfigurationError）；
+/// - 501：Driver 不支持探测；503：spawn/握手/RPC 等基础设施失败；504：超时。
+///
+/// NOTE（脱敏职责不在这里）：本函数只做形状与状态码映射，**不做**凭据擦除。
+/// 调用方（C3 路径）负责在下发前按 Descriptor 的 Secret 字段做值级擦除——
+/// 因为只有它同时掌握 Schema 与本次物化出来的明文；既有 `/drivers/{id}/probe`
+/// 的调用方自带明文（无 SecretStore 参与），返回值也只回到该调用方。
+pub(crate) fn probe_result_to_response(
+    result: Result<mesa_core_types::ProbeReport, mesa_driver_manager::probe::ProbeError>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let conn_val = if let Some(c) = body.get("connection") {
-        c.clone()
-    } else {
-        body.clone()
-    };
-    if !conn_val.is_object() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json_error(
-                "VALIDATION_ERROR",
-                "connection must be an object",
-            )),
-        );
-    }
-    let conn_str = serde_json::to_string(&conn_val).unwrap();
-    match state.manager.probe(&id, &conn_str).await {
+    match result {
         Ok(r) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -778,6 +774,33 @@ async fn probe_driver(
             }
         }
     }
+}
+
+/// 动态探测（§8）：纯 HTTP 映射，编排（临时进程/Probe RPC/匹配/清理）
+/// 全部收敛在 `MesaManager::probe()`，本层只做形状转换与状态码映射。
+/// - 200：探测完成（含设备不可达 `reachable:false`，那是探测结果）；
+/// - 404/400：输入问题；501：Driver 不支持；503：基础设施失败；504：超时。
+async fn probe_driver(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let conn_val = if let Some(c) = body.get("connection") {
+        c.clone()
+    } else {
+        body.clone()
+    };
+    if !conn_val.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "VALIDATION_ERROR",
+                "connection must be an object",
+            )),
+        );
+    }
+    let conn_str = serde_json::to_string(&conn_val).unwrap();
+    probe_result_to_response(state.manager.probe(&id, &conn_str).await)
 }
 
 #[derive(Debug, serde::Deserialize)]

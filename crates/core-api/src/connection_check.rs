@@ -21,6 +21,27 @@
 //! 明文只允许在本进程内存中短暂存在（C3-B 交给临时 Driver 用），**绝不**进入
 //! HTTP 响应体、`tracing` 日志或错误文本。
 //!
+//! # C3-B：`mode=probe` 的执行路径（复用 C1 编排，不另建生命周期）
+//!
+//! 两种模式共用同一条前缀链（读 Endpoint → Descriptor → 草稿解析 → 统一校验），
+//! 只有在**校验通过之后**才分叉：[`run_probe`] 把内存中已物化的连接序列化后交给
+//! [`MesaManager::probe()`]，即 C1 的临时进程 / Probe RPC / 分层预算（Open 5s、
+//! Query `4×timeout_ms+3s` 上限 45s、Close 5s、清理 6s）/ 进程回收。
+//! Core 这一层只做三件事：守住「载荷中不得残留 marker」的红线、序列化、映射结果。
+//!
+//! 出口脱敏（本轮评审新增的边界）：进入 Driver 前的脱敏**不足以**保证不泄漏——
+//! 真实驱动会把收到的凭据写进认证失败的错误/警告文本（`auth failed for
+//! password=...`），而这类文本一路透传到 HTTP 响应。因此映射之后还要按
+//! Descriptor 的 Secret 字段做**值级擦除**（[`redact_plaintext`]）。
+//!
+//! NOTE（已核查的残留日志路径，本轮未改动其行为）：`driver-manager` 的
+//! `probe.rs` 在 `CloseConnection` 失败时会把 Driver 的原始错误文本以 debug
+//! 记入日志（`probe close temp connection failed (ignored)`）。该文本理论上可能
+//! 含凭据，但它既不属于 Probe 报告也不属于错误响应，且真实驱动的关闭错误是
+//! 传输级诊断（不含凭据）。C3 的值级擦除只作用于 HTTP 响应体，不接管 C1 的
+//! 日志文案——无证据就改动 C1 的排障输出不划算。若后续真机发现驱动在关闭错误里
+//! 回显凭据，应在 `driver-manager` 侧按同一个「值级擦除」思路处理。
+//!
 //! # Secret 继承（与 PUT 同源，两条 fail-closed 边界）
 //!
 //! 草稿省略某个 Secret 字段时的继承**逐步对齐** `update_endpoint()` 的缺失分支：
@@ -475,14 +496,73 @@ fn resolve_connection_draft(
 }
 
 // ---------------------------------------------------------------------------
+// 出口脱敏：Probe 结果里的凭据明文
+// ---------------------------------------------------------------------------
+
+/// 收集本次草稿中所有 Secret 字段的**明文值**（只有值，不含字段名以外的信息）。
+///
+/// 为什么按 Descriptor 的 Secret 字段取值而不是全文搜索：擦除必须是**值级**的，
+/// 只有 Schema 知道哪些字段是凭据。全文猜密文形态会把 URL、型号等正常内容也误伤。
+///
+/// 为什么排除空字符串：空串在 [`redact_plaintext`] 里会匹配任何位置，把整份响应
+/// 打成碎片（而空串本身不构成凭据泄漏——契约里它就是「明确清除」）。
+fn secret_plaintexts(connection: &serde_json::Value, schema: &SchemaDescriptor) -> Vec<String> {
+    let Some(obj) = connection.as_object() else {
+        return Vec::new();
+    };
+    secret_field_keys(schema)
+        .into_iter()
+        .filter_map(|k| {
+            obj.get(&k)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// 值级擦除：把 JSON 中每个字符串里出现的凭据明文替换为 `[redacted]`。
+///
+/// 为什么是「包含即替换」而不是「相等才替换」：驱动常把凭据拼进更长的诊断文本
+/// （`"open failed: bad password 'pw1'"`），只比对整串会漏掉最典型的泄漏形态。
+///
+/// 只遍历**值**、不改 key：响应体的键集合是我们自己固定的形状（`error.code`、
+/// `warnings[].message` 等），改动键会破坏既有契约；凭据不可能出现在键上。
+fn redact_plaintext(v: &mut serde_json::Value, plaintexts: &[String]) {
+    match v {
+        serde_json::Value::String(s) => {
+            for p in plaintexts {
+                if s.contains(p.as_str()) {
+                    *s = s.replace(p.as_str(), "[redacted]");
+                }
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for item in a.iter_mut() {
+                redact_plaintext(item, plaintexts);
+            }
+        }
+        serde_json::Value::Object(m) => {
+            for item in m.values_mut() {
+                redact_plaintext(item, plaintexts);
+            }
+        }
+        // 数字/布尔/null 不承载凭据：Secret 在 Schema 里只有 string 一种合法形态，
+        // 而且把数字节点改成字符串会破坏响应形状（如 `capabilities` 四态）。
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
 
 /// `POST /api/v1/endpoints/{endpoint_id}/connection-check`
 ///
-/// 状态码口径（冻结 §5）：200 校验通过；400 参数/Secret 引用/必填凭据问题；
-/// 404 Endpoint 不存在；501 `probe` 待 C3-B 接入（Driver 不支持探测同码）；
-/// 503 Driver / SecretStore / 探测基础设施不可用；504 探测超时（C3-B）。
+/// 状态码口径（冻结 §5）：200 校验通过 / 探测完成（含 `reachable:false`）；
+/// 400 参数、Secret 引用或必填凭据问题（含 Driver 侧 ConfigurationError）；
+/// 404 Endpoint 不存在；501 Driver 不支持探测；503 Driver / SecretStore /
+/// 探测基础设施不可用；504 探测超时。
 pub(crate) async fn connection_check(
     State(state): State<Arc<AppState>>,
     Path(endpoint_id): Path<String>,
@@ -585,20 +665,89 @@ async fn run_check(
             StatusCode::OK,
             Json(serde_json::json!({ "valid": true, "issues": [] })),
         ),
-        // TODO(C3-B)：接入 `MesaManager::probe()` 的**临时**探测（复用 C1 分层
-        // 预算），并回归「凭据归属、超时、进程回收、对持久化状态零影响」。
+        // `probe`：把**已通过统一校验**的内存连接交给 C1 的临时探测编排。
         //
-        // 在那之前这里必须明确返回「未实现」，绝不返回模拟成功：C3-B 未落地时
-        // 任何 `reachable` 结论都是假的。也**绝不**改道既有的
-        // `POST /api/v1/drivers/{id}/probe`——那条路径不接受 Secret marker，
-        // 改道等于绕过本接口刚建立的 Secret 安全边界。
-        CheckMode::Probe => CheckError::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "PROBE_NOT_IMPLEMENTED",
-            "mode=probe 的临时探测尚未接入（待 C3-B）；本轮不返回模拟结果",
-        )
-        .into_error_response(),
+        // 为什么绝不改道既有的 `POST /api/v1/drivers/{id}/probe`：那条路径接受
+        // 原始 connection JSON 且不做 Secret 物化，改道等于绕过本接口刚建立的
+        // Secret 安全边界（marker 直接进 Driver）。这里复用它的**编排与映射**，
+        // 而不是它的入口。
+        CheckMode::Probe => {
+            run_probe(
+                state,
+                endpoint_id,
+                &rec.driver_id,
+                &desc.connection,
+                resolved,
+            )
+            .await
+        }
     }
+}
+
+/// `mode=probe` 的真实执行路径（C3-B）。
+///
+/// 与 `validate` 的分工是冻结的：前四步（读 Endpoint → Descriptor → 草稿解析 →
+/// 统一 Schema 校验）完全共用，只有校验**通过之后**才分叉——「Schema 不合法就
+/// 绝不发起探测」因此是结构上的事实，而不是在探测侧再判一次。
+async fn run_probe(
+    state: &AppState,
+    endpoint_id: &str,
+    driver_id: &str,
+    schema: &SchemaDescriptor,
+    resolved: ResolvedDraft,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // ① 红线复核（纵深防御）：交给 Driver 的载荷里**不允许**残留任何 marker
+    //    形状。`resolve_connection_draft` 已从结构上排除它，这里再核一次：日后
+    //    若有人在解析链上加了新分支而漏了物化，宁可 500（内部不变量被破坏）
+    //    也绝不把 marker 当密码送给设备，更不能报成「设备不可达」。
+    if contains_marker_shape(&resolved.connection, 0) {
+        return CheckError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SECRET_MARKER_LEAK",
+            "内存连接草稿中仍存在 Secret 标记，拒绝发起探测（内部不变量被破坏）",
+        )
+        .into_error_response();
+    }
+
+    // ② 序列化**已物化**的连接：明文只从本进程内存流向临时 Driver 进程的 IPC，
+    //    不经过任何持久化与日志。
+    let conn_json = match serde_json::to_string(&resolved.connection) {
+        Ok(s) => s,
+        // `serde_json::Value` 的序列化在实践中不会失败（无 NaN / 非字符串 key）；
+        // 真失败说明值形态异常，报 500 而不是 panic 掉整个 worker。
+        Err(e) => {
+            return CheckError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                format!("连接草稿无法序列化: {e}"),
+            )
+            .into_error_response();
+        }
+    };
+
+    // ③ 复用 C1 编排：临时进程 / Probe RPC / 分层预算 / 进程回收全部收敛在
+    //    `MesaManager::probe()`，本层不另建探测生命周期（契约 §5 冻结）。
+    let result = state.manager.probe(driver_id, &conn_json).await;
+
+    // ④ 复用既有映射：状态码与响应形状与 `/drivers/{id}/probe` 同源（唯一实现
+    //    在 `probe_result_to_response`），因此 C3-10 的分层不会与既有入口分叉。
+    let (status, Json(mut body)) = crate::probe_result_to_response(result);
+
+    // ⑤ 出口脱敏：Driver 回传的 warning / 错误文本里可能带着它收到的凭据明文
+    //    （真实驱动同样会把密码写进认证失败消息）。这里是**唯一**能擦掉它的位置，
+    //    因为只有本层同时掌握 Schema 与本次物化出来的明文。
+    let plaintexts = secret_plaintexts(&resolved.connection, schema);
+    redact_plaintext(&mut body, &plaintexts);
+
+    // 只记录分类与字段名，绝不记录响应体（可能含 Driver 回传的诊断文本）。
+    tracing::debug!(
+        endpoint = %endpoint_id,
+        driver = %driver_id,
+        status = %status,
+        redacted_secret_fields = plaintexts.len(),
+        "endpoint connection probe finished"
+    );
+    (status, Json(body))
 }
 
 // ---------------------------------------------------------------------------
@@ -1500,5 +1649,238 @@ mod tests {
         assert!(crate::is_clear_secret_marker(
             &serde_json::json!({"clear_secret": true})
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // C3-B：探测载荷与结果映射（HTTP 层见 management_api 契约测试）
+    // -----------------------------------------------------------------------
+
+    /// C3-10（分层，映射级）：`probe` 的状态码分类是**唯一实现**
+    /// （`crate::probe_result_to_response`），既有 `/drivers/{id}/probe` 与 C3
+    /// 入口共用它。504 只在这里覆盖是刻意的取舍：真实超时至少要耗满 Query 下限
+    /// 5s + Close 5s + 启动/清理预算（单例 ≥ 20s），放进合同套件不划算；而真实
+    /// RpcTimeout 的**进程回收**已由 A32 用例覆盖。两条合起来才是完整证据。
+    #[test]
+    fn probe_http_layering_classification() {
+        use mesa_core_types::{CapabilityItem, CapabilityState, ProbeReport, ProbeWarning};
+        use mesa_driver_manager::probe::ProbeError;
+        use mesa_driver_manager::session::StartupStage;
+
+        // 200：可达（含完整事实形状）
+        let reachable = ProbeReport {
+            reachable: true,
+            vendor: Some("Mesa".into()),
+            family: None,
+            model: None,
+            firmware: None,
+            model_confidence: Some("high".into()),
+            capabilities: vec![CapabilityItem {
+                id: "read".into(),
+                state: CapabilityState::Available,
+                detail: None,
+            }],
+            warnings: vec![ProbeWarning {
+                code: "W".into(),
+                message: "m".into(),
+            }],
+        };
+        let (s, Json(v)) = crate::probe_result_to_response(Ok(reachable));
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["reachable"], true);
+        assert_eq!(v["device"]["vendor"], "Mesa");
+        assert_eq!(v["model_confidence"], "high");
+        assert_eq!(v["capabilities"][0]["id"], "read");
+        assert_eq!(v["warnings"][0]["code"], "W");
+
+        // 200：不可达是**探测结果**（不是错误，因此不得是 5xx）
+        let (s, Json(v)) = crate::probe_result_to_response(Ok(ProbeReport::unreachable(
+            "CONNECTION_FAILED",
+            "refused",
+        )));
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["reachable"], false);
+        assert_eq!(v["warnings"][0]["code"], "CONNECTION_FAILED");
+
+        // 逐分支锁定状态码与错误码（与既有 handler 契约逐字一致）
+        for (err, want_status, want_code) in [
+            (
+                ProbeError::DriverNotFound("x".into()),
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+            ),
+            (
+                ProbeError::Unsupported("minor 1".into()),
+                StatusCode::NOT_IMPLEMENTED,
+                "PROBE_UNSUPPORTED",
+            ),
+            (
+                ProbeError::InvalidInput {
+                    code: "BAD_CONFIG".into(),
+                    message: "m".into(),
+                },
+                StatusCode::BAD_REQUEST,
+                "BAD_CONFIG",
+            ),
+            (
+                ProbeError::Spawn("boom".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DRIVER_UNAVAILABLE",
+            ),
+            (
+                ProbeError::Handshake {
+                    stage: StartupStage::Connect,
+                    message: "reset".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DRIVER_UNAVAILABLE",
+            ),
+            (
+                ProbeError::Rpc("ConnectionError/CONNECT_FAIL: m".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PROBE_FAILED",
+            ),
+            (
+                ProbeError::RpcTimeout,
+                StatusCode::GATEWAY_TIMEOUT,
+                "PROBE_TIMEOUT",
+            ),
+            (
+                ProbeError::Timeout { budget_ms: 27_000 },
+                StatusCode::GATEWAY_TIMEOUT,
+                "PROBE_TIMEOUT",
+            ),
+        ] {
+            let (s, Json(v)) = crate::probe_result_to_response(Err(err));
+            assert_eq!(s, want_status, "body: {v}");
+            assert_eq!(v["error"]["code"], want_code, "body: {v}");
+            assert!(
+                v.get("reachable").is_none(),
+                "错误分支不得携带任何可达性结论: {v}"
+            );
+        }
+    }
+
+    /// 出口脱敏（评审特别点出）：Driver 返回的 **warning 与错误文本**都可能带着
+    /// 它收到的凭据明文。这里锁定两条：值级擦除覆盖「子串」形态（驱动常把凭据拼
+    /// 进更长的诊断句），且空串不做替换（否则整份响应会被打成碎片）。
+    #[test]
+    fn probe_result_redacts_secret_plaintext_in_warnings_and_errors() {
+        use mesa_core_types::{ProbeReport, ProbeWarning};
+        use mesa_driver_manager::probe::ProbeError;
+
+        const PW: &str = "pw-echo-never-return";
+        let secret_keys = vec!["password".to_string()];
+
+        // 预置：Driver 真的把明文回灌了（否则本用例是空断言）。
+        let report = ProbeReport {
+            reachable: true,
+            vendor: Some("Mesa".into()),
+            family: None,
+            model: None,
+            firmware: None,
+            model_confidence: None,
+            capabilities: vec![],
+            warnings: vec![ProbeWarning {
+                code: "SECRET_ECHO".into(),
+                message: format!("driver received secret: {PW} (auth rejected)"),
+            }],
+        };
+        let connection = serde_json::json!({"password": PW});
+        let plaintexts = secret_plaintexts(&connection, &test_schema(false));
+        assert_eq!(
+            plaintexts,
+            vec![PW.to_string()],
+            "Secret 字段的明文必须被收集（且只收集 Secret 字段）"
+        );
+
+        let (s, Json(mut body)) = crate::probe_result_to_response(Ok(report));
+        assert_eq!(s, StatusCode::OK);
+        assert!(
+            body.to_string().contains(PW),
+            "预置：未脱敏前 warning 文本里确实带着明文（本用例才有意义）"
+        );
+        redact_plaintext(&mut body, &plaintexts);
+        let text = body.to_string();
+        assert!(!text.contains(PW), "warning 不得回显凭据明文: {text}");
+        assert!(text.contains("[redacted]"), "必须留下脱敏标记: {text}");
+        assert!(
+            text.contains("driver received secret: [redacted] (auth rejected)"),
+            "只擦凭据本身，保留其余诊断（否则排障信息全丢）: {text}"
+        );
+
+        // 错误文本同样必须擦除（400 分支最容易把密码带回响应）。
+        let (s, Json(mut body)) = crate::probe_result_to_response(Err(ProbeError::InvalidInput {
+            code: "PROBE_REJECTED_BY_DRIVER".into(),
+            message: format!("open failed: bad password '{PW}'"),
+        }));
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        redact_plaintext(&mut body, &plaintexts);
+        let text = body.to_string();
+        assert_eq!(body["error"]["code"], "PROBE_REJECTED_BY_DRIVER");
+        assert!(!text.contains(PW), "错误文本不得回显凭据明文: {text}");
+        assert!(text.contains("[redacted]"), "{text}");
+
+        // 空串不参与擦除：`{"password": ""}` 是「明确清除」，若把空串当明文
+        // 会让每个字符之间都插入 [redacted]，响应直接不可读。
+        let cleared = serde_json::json!({"password": ""});
+        assert!(secret_plaintexts(&cleared, &test_schema(false)).is_empty());
+        let mut body = serde_json::json!({"error": {"message": "abc"}});
+        redact_plaintext(&mut body, &secret_plaintexts(&cleared, &test_schema(false)));
+        assert_eq!(body["error"]["message"], "abc");
+
+        // 非 Secret 字段即便与凭据同值也不参与（值级擦除只认 Descriptor 的
+        // Secret 字段；这里锁住收集函数的来源）。
+        let other = serde_json::json!({"endpoint_url": PW, "password": "pw2"});
+        assert_eq!(
+            secret_plaintexts(&other, &test_schema(false)),
+            vec!["pw2".to_string()]
+        );
+        let _ = secret_keys;
+    }
+
+    /// 红线：**marker 绝不进入 Driver**。四种 Secret 语义（引用 / 新明文 /
+    /// 明确清除 / 缺失继承）解析完成后，即将序列化给 Driver 的载荷里都不得残留
+    /// 任何 marker 形状——[`run_probe`] 的纵深防御守卫正是用同一判据。
+    #[test]
+    fn probe_payload_never_contains_marker_shape() {
+        let persisted = r#"{"endpoint_url":"opc.tcp://a:4840","password":{"secret_set":true}}"#;
+        let store = store_with_endpoint("e1", persisted);
+        store
+            .put_secret("e1", "password", "pw-marker-guard", "master")
+            .unwrap();
+
+        for (label, draft) in [
+            (
+                "引用已存凭据",
+                serde_json::json!({"endpoint_url": "opc.tcp://a:4840", "password": {"secret_set": true}}),
+            ),
+            (
+                "本次新明文",
+                serde_json::json!({"endpoint_url": "opc.tcp://a:4840", "password": "pw-inline"}),
+            ),
+            (
+                "明确清除",
+                serde_json::json!({"endpoint_url": "opc.tcp://a:4840", "password": {"clear_secret": true}}),
+            ),
+            (
+                "字段缺失（继承）",
+                serde_json::json!({"endpoint_url": "opc.tcp://a:4840"}),
+            ),
+        ] {
+            let out =
+                resolve_connection_draft(&draft, "e1", persisted, &test_schema(false), &store)
+                    .unwrap_or_else(|e| panic!("{label}: 应解析成功: {e:?}"));
+            assert!(
+                !contains_marker_shape(&out.connection, 0),
+                "{label}: 即将发给 Driver 的载荷不得含 marker 形状: {:?}",
+                out.connection
+            );
+            // 文本级再核一次：marker 的两种键名都不得出现在序列化结果里。
+            let payload = serde_json::to_string(&out.connection).unwrap();
+            assert!(
+                !payload.contains("secret_set") && !payload.contains("clear_secret"),
+                "{label}: 序列化载荷不得含 marker: {payload}"
+            );
+        }
     }
 }

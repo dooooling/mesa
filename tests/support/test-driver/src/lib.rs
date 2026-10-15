@@ -29,6 +29,19 @@
 //!   不会被外层/IPC 预算提前掐断（A22），以及取消时临时子进程与端口租约
 //!   被回收（A32）。
 //!
+//! C3-B（Endpoint-bound 连接检查）追加的夹具字段，全部可选：
+//!
+//! - `"password"`（Secret）：唯一目的就是让 Core 的 Secret 物化链真正介入，
+//!   从而可以断言「送到临时 Driver 的是**明文**而不是 `{"secret_set": true}`
+//!   marker」。`open_connection()` 收到 marker/非字符串时直接以
+//!   `SECRET_MARKER_RECEIVED` 失败（红线由夹具侧强制）。
+//! - `"capture_path"`：把**实际收到的** connection JSON 原样落盘（C3-04/C3-07
+//!   证据通道；HTTP 响应被脱敏后，明文只能由 Driver 进程自己留证）。
+//! - `"secret_echo"` ∈ {none,warning,error}：把收到的凭据明文回灌到 Probe 的
+//!   warning/错误文本里，用于验证 Core 侧**出口**脱敏。
+//! - `"probe_mode"` ∈ {normal,unreachable,unsupported,connection_error}：
+//!   Probe 行为注入，为 C3-10 的 200/501/503 分层提供确定性输入。
+//!
 //! TODO: 附录 A 其余能力（jitter/burst/silent_interval）待性能预算阶段（§22）
 //! 按压测需要补齐。
 
@@ -40,7 +53,8 @@ use mesa_core_types::{
     AcquisitionTask, ConditionTransition, DataBatch, DataType, DriverMetadata, DuplicatePointKey,
     ErrorKind, EventCondition, EventRecord, EventTask, GENERIC_BINDING_KIND,
     GENERIC_EVENT_BINDING_KIND, GenericBinding, GenericEventBinding, PointDescriptor, PointMap,
-    PointValue, Quality, TaskMode, TaskSchedule, Value, ensure_unique_point_keys, now_unix_ns,
+    PointValue, ProbeReport, ProbeWarning, Quality, TaskMode, TaskSchedule, Value,
+    ensure_unique_point_keys, now_unix_ns,
 };
 use mesa_driver_sdk::{DataSink, Driver, DriverConnection, EventSink, SdkDriverError};
 use tokio_util::sync::CancellationToken;
@@ -112,6 +126,48 @@ impl Driver for TestDriver {
                         )
                         .required(false);
                         f.validation.min = Some(0.0);
+                        f
+                    },
+                    // C3-B：Secret 形态测试字段。
+                    //
+                    // 为什么 Test Driver 需要一条真正的 Secret 字段：C3 的
+                    // Endpoint-bound 连接检查必须证明「送到临时 Driver 的是**明文**
+                    // 而不是 `{"secret_set": true}` marker」。这条断言只有在
+                    // Descriptor 把某字段声明为 `FieldType::Secret` 时才成立——
+                    // 否则 Core 的物化链根本不会介入，测试也就证明不了任何东西。
+                    // 该字段不参与采集，只作为「凭据是否原样送达」的观测点。
+                    FieldDescriptor::new("password", "Password", FieldType::Secret).required(false),
+                    // C3-B：观测通道。设置后，Driver 在 `open_connection()` 里把
+                    // **实际收到的** connection JSON 原样写到该路径。
+                    //
+                    // 为什么用文件而不是返回值：C3 要求「HTTP 响应与日志都不得出现
+                    // 明文」，因此明文不可能经由 Probe 报告回到测试进程；唯一的证据
+                    // 通道就是 Driver 进程自己落盘的原始输入（测试夹具行为，仅测试
+                    // 环境使用，路径由测试提供的临时目录给出）。
+                    FieldDescriptor::new("capture_path", "Capture Path", FieldType::String)
+                        .required(false),
+                    // C3-B：把收到的凭据明文回灌到 Probe 结果里，用于验证 **Core 侧
+                    // 出口脱敏**（只保证入口不泄漏是不够的：Driver 的错误/warning
+                    // 会原样回到 HTTP 响应）。
+                    {
+                        let mut f =
+                            FieldDescriptor::new("secret_echo", "Secret Echo", FieldType::Enum)
+                                .required(false);
+                        f.validation.enum_options =
+                            Some(vec!["none".into(), "warning".into(), "error".into()]);
+                        f
+                    },
+                    // C3-B：Probe 行为注入，供 C3-10（400/501/503/200 分层）取证。
+                    {
+                        let mut f =
+                            FieldDescriptor::new("probe_mode", "Probe Mode", FieldType::Enum)
+                                .required(false);
+                        f.validation.enum_options = Some(vec![
+                            "normal".into(),
+                            "unreachable".into(),
+                            "unsupported".into(),
+                            "connection_error".into(),
+                        ]);
                         f
                     },
                 ],
@@ -368,7 +424,32 @@ impl Driver for TestDriver {
         // connection 配置仅含可选 faults 注入项；整体必须为合法 JSON
         let cfg: serde_json::Value = serde_json::from_str(config_json)
             .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.to_string()))?;
+        // C3-04 红线（夹具侧强制）：Core 只允许把**明文**交给 Driver。
+        // 收到 marker 形状（或任何非字符串）说明服务端物化/脱敏链被绕过，
+        // 必须显式失败——绝不能"把 marker 当密码去连设备"。
+        //
+        // 顺序上必须先于 `parse_conn_faults`：后者按"字符串字段"解析，
+        // 若先解析会把 marker 报成普通 BAD_CONFIG，掩盖真正的原因。
+        if let Some(v) = cfg.get("password")
+            && !v.is_string()
+        {
+            return Err(SdkDriverError::configuration(
+                "SECRET_MARKER_RECEIVED",
+                "connection.password 必须是明文字符串（收到 secret_set/clear_secret marker 或其他类型）",
+            ));
+        }
         let faults = parse_conn_faults(&cfg)?;
+        // C3-04/C3-07 证据通道：把**实际收到的** connection JSON 原样落盘。
+        // 写失败即报错（而不是静默继续）：否则「收到了正确明文」这类断言会
+        // 因为文件不存在而变成空断言。
+        if let Some(path) = &faults.capture_path {
+            std::fs::write(path, config_json).map_err(|e| {
+                SdkDriverError::configuration(
+                    "CAPTURE_FAILED",
+                    format!("写入 capture_path `{path}` 失败: {e}"),
+                )
+            })?;
+        }
         Ok(Box::new(SimConnection {
             plan: std::sync::RwLock::new(None),
             faults,
@@ -600,7 +681,7 @@ fn bad_point(key: &str, why: &str) -> SdkDriverError {
 
 /// 连接级故障注入（附录 A.3）。从 connection 顶层可选整数解析
 ///（canonical 单形态；嵌套 `faults` 已删除）。
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 struct ConnFaults {
     /// 第 N 批发布后连接以 ConnectionError/SIMULATED_DISCONNECT 结束，
     /// 驱动进程存活——用于验证 Core 侧重连与断线数据语义。
@@ -617,6 +698,67 @@ struct ConnFaults {
     /// NOTE: 该延迟发生在 `probe()` 内部，等价于真实驱动「握手在 Probe RPC 内」
     /// 的形态，因此可以用于验证阶段预算模型本身。
     probe_delay_ms: Option<u64>,
+    /// C3-B：Driver 实际收到的凭据明文（Core 物化后经 IPC 传入）。
+    ///
+    /// 只用于 (a) 把收到的值回灌到 Probe 结果以验证 Core 出口脱敏，
+    /// (b) 断言「收到的是明文而不是 marker」。marker 在 `open_connection()`
+    /// 就被显式拒绝，永远到不了这里。
+    password: Option<String>,
+    /// C3-B：把实际收到的 connection JSON 原样落盘的观测路径（证据通道）。
+    capture_path: Option<String>,
+    /// C3-B：凭据回灌方式（见 [`SecretEcho`]）。
+    secret_echo: SecretEcho,
+    /// C3-B：Probe 行为注入（见 [`ProbeMode`]）。
+    probe_mode: ProbeMode,
+}
+
+/// 手写 `Debug`：本结构持有收到的**凭据明文**，绝不能经 `{:?}` 泄漏到测试
+/// 失败输出、panic 消息或日志里（与 Core 侧 `ResolvedDraft` 同一口径）。
+impl std::fmt::Debug for ConnFaults {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnFaults")
+            .field("fail_after_batches", &self.fail_after_batches)
+            .field("crash_after_batches", &self.crash_after_batches)
+            .field("probe_delay_ms", &self.probe_delay_ms)
+            .field("password", &self.password.as_ref().map(|_| "[redacted]"))
+            .field("capture_path", &self.capture_path)
+            .field("secret_echo", &self.secret_echo)
+            .field("probe_mode", &self.probe_mode)
+            .finish()
+    }
+}
+
+/// C3-B：把收到的凭据明文回灌到 Probe 结果的方式（用于 Core 侧出口脱敏验证）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SecretEcho {
+    /// 不回灌（默认）。
+    #[default]
+    None,
+    /// 在 `probe()` 的 warnings 里原样带上收到的凭据。
+    ///
+    /// 为什么连 warning 也要测：warning 是**跨能力/全局**诊断，最容易在排障时
+    /// 被驱动作者写成 "auth failed for password=xxx"，而它一路透传到 HTTP 响应。
+    Warning,
+    /// 以 ConfigurationError 返回，错误文本里原样带上收到的凭据。
+    ///
+    /// 这条走 `InvalidInput` → HTTP 400 的路径，是「Driver 返回的错误消息把密码
+    /// 带回响应」最典型的形态。
+    Error,
+}
+
+/// C3-B：`probe()` 行为注入（为 C3-10 的 HTTP 状态码分层提供可控输入）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ProbeMode {
+    /// 正常探测：可达。
+    #[default]
+    Normal,
+    /// 规范不可达报告 → HTTP 200 + `reachable:false`（不可达是**探测结果**，
+    /// 不是错误）。
+    Unreachable,
+    /// 驱动声明不支持探测（`PROBE_UNSUPPORTED`）→ HTTP 501。
+    Unsupported,
+    /// 连接类失败（`CONNECT_FAIL`）→ HTTP 503（基础设施/链路，不是参数错误）。
+    ConnectionError,
 }
 
 fn parse_conn_faults(cfg: &serde_json::Value) -> Result<ConnFaults, SdkDriverError> {
@@ -627,7 +769,68 @@ fn parse_conn_faults(cfg: &serde_json::Value) -> Result<ConnFaults, SdkDriverErr
             .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?,
         probe_delay_ms: parse_batch_threshold(cfg, "probe_delay_ms")
             .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?,
+        password: parse_optional_string(cfg, "password")?,
+        capture_path: parse_optional_string(cfg, "capture_path")?,
+        secret_echo: parse_secret_echo(cfg)?,
+        probe_mode: parse_probe_mode(cfg)?,
     })
+}
+
+/// 可选字符串字段：缺失/null → None；字符串 → Some；其他类型 → 结构化配置错误。
+///
+/// 为什么非字符串一律报错而不是忽略：这些字段是 C3 的证据通道，静默忽略会让
+/// 「凭据未泄漏」之类的断言变成空断言（测试仍然绿，但什么也没验证）。
+fn parse_optional_string(
+    cfg: &serde_json::Value,
+    key: &str,
+) -> Result<Option<String>, SdkDriverError> {
+    match cfg.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(SdkDriverError::configuration(
+            "BAD_CONFIG",
+            format!("`{key}` must be a string, got {other}"),
+        )),
+    }
+}
+
+fn parse_secret_echo(cfg: &serde_json::Value) -> Result<SecretEcho, SdkDriverError> {
+    match cfg.get("secret_echo") {
+        None => Ok(SecretEcho::None),
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "none" => Ok(SecretEcho::None),
+            "warning" => Ok(SecretEcho::Warning),
+            "error" => Ok(SecretEcho::Error),
+            other => Err(SdkDriverError::configuration(
+                "BAD_CONFIG",
+                format!("unknown secret_echo `{other}`"),
+            )),
+        },
+        Some(other) => Err(SdkDriverError::configuration(
+            "BAD_CONFIG",
+            format!("`secret_echo` must be a string, got {other}"),
+        )),
+    }
+}
+
+fn parse_probe_mode(cfg: &serde_json::Value) -> Result<ProbeMode, SdkDriverError> {
+    match cfg.get("probe_mode") {
+        None => Ok(ProbeMode::Normal),
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "normal" => Ok(ProbeMode::Normal),
+            "unreachable" => Ok(ProbeMode::Unreachable),
+            "unsupported" => Ok(ProbeMode::Unsupported),
+            "connection_error" => Ok(ProbeMode::ConnectionError),
+            other => Err(SdkDriverError::configuration(
+                "BAD_CONFIG",
+                format!("unknown probe_mode `{other}`"),
+            )),
+        },
+        Some(other) => Err(SdkDriverError::configuration(
+            "BAD_CONFIG",
+            format!("`probe_mode` must be a string, got {other}"),
+        )),
+    }
 }
 
 /// 运行期可变状态。与点位一一对应，由各任务循环独占持有，无跨任务共享。
@@ -797,15 +1000,58 @@ impl SimEventStream {
 impl DriverConnection for SimConnection {
     /// Test Driver 探测：无真实设备，返回确定性事实（合同基准）。
     /// 复用本连接（OpenConnection 已校验配置），不启动任何采集。
-    async fn probe(&self) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
+    async fn probe(&self) -> Result<ProbeReport, SdkDriverError> {
         use mesa_core_types::{CapabilityItem, CapabilityState};
+        // C3-10：驱动侧拒绝分类。必须在任何延迟之前返回，否则「不支持探测」
+        // 也会白等一个完整预算。
+        match self.faults.probe_mode {
+            ProbeMode::Unsupported => {
+                return Err(SdkDriverError::new(
+                    ErrorKind::Unsupported,
+                    "PROBE_UNSUPPORTED",
+                    "probe disabled by probe_mode=unsupported",
+                ));
+            }
+            ProbeMode::ConnectionError => {
+                return Err(SdkDriverError::new(
+                    ErrorKind::Connection,
+                    "CONNECT_FAIL",
+                    "simulated probe connection failure",
+                ));
+            }
+            ProbeMode::Normal | ProbeMode::Unreachable => {}
+        }
         // C1 §6.3：慢设备模拟。延迟发生在 probe() 内部，与真实驱动
         // 「协议握手在 Probe RPC 内」的形态一致，因此可用于验证阶段预算
         // 是否会被外层/IPC 预算提前掐断，以及取消时是否回收临时进程。
         if let Some(ms) = self.faults.probe_delay_ms {
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
-        Ok(mesa_core_types::ProbeReport {
+        // C3-10：不可达是**探测结果**（unreachable 报告），不是错误。
+        if self.faults.probe_mode == ProbeMode::Unreachable {
+            return Ok(ProbeReport::unreachable(
+                "CONNECTION_FAILED",
+                "simulated unreachable device (probe_mode=unreachable)",
+            ));
+        }
+        // C3-B 出口脱敏验证：把**收到的凭据明文**回灌进 Probe 结果。
+        // 驱动自己不会脱敏（真实驱动同样不会），因此 Core 必须负责在下发前擦除。
+        let received = self.faults.password.as_deref().unwrap_or("<none>");
+        let mut warnings = Vec::new();
+        match self.faults.secret_echo {
+            SecretEcho::Error => {
+                return Err(SdkDriverError::configuration(
+                    "PROBE_REJECTED_BY_DRIVER",
+                    format!("driver rejected credential: {received}"),
+                ));
+            }
+            SecretEcho::Warning => warnings.push(ProbeWarning {
+                code: "SECRET_ECHO".into(),
+                message: format!("driver received secret: {received}"),
+            }),
+            SecretEcho::None => {}
+        }
+        Ok(ProbeReport {
             reachable: true,
             vendor: Some("Mesa".into()),
             family: Some("TestDriver".into()),
@@ -829,7 +1075,7 @@ impl DriverConnection for SimConnection {
                     detail: Some("test-driver has no browse space".into()),
                 },
             ],
-            warnings: vec![],
+            warnings,
         })
     }
 
@@ -1147,7 +1393,7 @@ impl DriverConnection for SimConnection {
             let shutdown = shutdown.clone();
             let seq = Arc::clone(&seq);
             let published = Arc::clone(&published);
-            let faults = self.faults;
+            let faults = self.faults.clone();
             let interval = Duration::from_millis(plan.interval_ms);
             let plan_burst = plan.burst;
             let control_state = Arc::clone(&control_state);
@@ -1199,7 +1445,7 @@ impl DriverConnection for SimConnection {
         })
                             .await;
 
-                            if !faults_eq_default(faults) {
+                            if !faults_eq_default(&faults) {
                                 let n = published.fetch_add(1, Ordering::Relaxed) + 1;
                                 if faults.crash_after_batches == Some(n) {
                                     eprintln!(
@@ -1399,8 +1645,8 @@ impl DriverConnection for SimConnection {
 }
 
 /// 仅在有注入项时才走计数路径，避免正常采集承担原子开销。
-fn faults_eq_default(f: ConnFaults) -> bool {
-    f == ConnFaults::default()
+fn faults_eq_default(f: &ConnFaults) -> bool {
+    *f == ConnFaults::default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1799,6 +2045,126 @@ mod tests {
             Ok(_) => panic!("invalid fault threshold must be rejected"),
         };
         assert_eq!(err.code, "BAD_CONFIG");
+    }
+
+    // -----------------------------------------------------------------------
+    // C3-B：Secret 形态 / Probe 行为注入（夹具侧语义）
+    // -----------------------------------------------------------------------
+
+    /// 按 connection JSON 构造连接（测试内直取私有 faults，避免走 IPC）。
+    fn conn_with(json: &str) -> SimConnection {
+        let cfg: serde_json::Value = serde_json::from_str(json).unwrap();
+        SimConnection {
+            faults: parse_conn_faults(&cfg).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    /// C3-04 红线（夹具侧）：**只有明文**能进入 Driver 的 OpenConnection。
+    /// marker 形状（或任何非字符串）必须显式失败——否则「Driver 收到的是明文」
+    /// 这条断言就没有任何约束力（收到 marker 也会被当成"凭据"继续走）。
+    #[tokio::test]
+    async fn secret_marker_or_non_string_credential_is_rejected() {
+        for bad in [
+            r#"{"password":{"secret_set":true}}"#,
+            r#"{"password":{"clear_secret":true}}"#,
+            r#"{"password":{"secret_set":true,"x":1}}"#,
+            r#"{"password":123}"#,
+            r#"{"password":["pw"]}"#,
+            r#"{"password":null}"#,
+        ] {
+            let err = match TestDriver.open_connection("e", bad).await {
+                Err(e) => e,
+                Ok(_) => panic!("{bad} 必须被拒绝（marker/非字符串不得当凭据使用）"),
+            };
+            assert_eq!(err.code, "SECRET_MARKER_RECEIVED", "输入 {bad}");
+        }
+        // 明文（含空串）是合法形态：空串由 Core 侧按「明确清除」处理，
+        // 到不了 Driver 也无所谓——这里只锁定"字符串即合法"。
+        assert!(
+            TestDriver
+                .open_connection("e", r#"{"password":"pw"}"#)
+                .await
+                .is_ok()
+        );
+    }
+
+    /// C3-04：capture_path 落盘的是 Driver **实际收到**的原始 connection JSON。
+    /// 这条通道是「HTTP 响应脱敏」与「证明收到明文」能同时成立的唯一办法。
+    #[tokio::test]
+    async fn capture_path_records_received_connection_verbatim() {
+        let path =
+            std::env::temp_dir().join(format!("mesa-test-driver-capture-{}.json", now_unix_ns()));
+        let raw = format!(
+            r#"{{"password":"pw-capture","capture_path":{}}}"#,
+            serde_json::to_string(&path.to_string_lossy().to_string()).unwrap()
+        );
+        let _ = TestDriver.open_connection("e", &raw).await.unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, raw, "落盘内容必须是收到的原始 JSON（逐字一致）");
+        std::fs::remove_file(&path).ok();
+
+        // 写不进去必须报错，不能静默继续（否则证据文件缺失会让断言空转）
+        let bad = r#"{"capture_path":"<nonexistent-dir>/x/y.json"}"#;
+        let err = match TestDriver.open_connection("e", bad).await {
+            Err(e) => e,
+            Ok(_) => panic!("capture 写失败必须显式报错"),
+        };
+        assert_eq!(err.code, "CAPTURE_FAILED");
+    }
+
+    /// C3-10：probe_mode 四态映射到夹具行为（Core 侧状态码分层见契约测试）。
+    #[tokio::test]
+    async fn probe_mode_injection_matches_documented_behavior() {
+        // 正常：可达 + 无 warning
+        let r = conn_with("{}").probe().await.unwrap();
+        assert!(r.reachable && r.warnings.is_empty());
+        // 不可达：规范不可达报告（身份为空、有 warning），必须过自校验
+        let r = conn_with(r#"{"probe_mode":"unreachable"}"#)
+            .probe()
+            .await
+            .unwrap();
+        r.validate().expect("unreachable 报告必须自洽");
+        assert!(!r.reachable);
+        assert_eq!(r.warnings[0].code, "CONNECTION_FAILED");
+        // 不支持 → PROBE_UNSUPPORTED（Core 501）
+        let e = conn_with(r#"{"probe_mode":"unsupported"}"#)
+            .probe()
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, "PROBE_UNSUPPORTED");
+        assert_eq!(e.kind, ErrorKind::Unsupported);
+        // 连接类失败 → CONNECT_FAIL（Core 503）
+        let e = conn_with(r#"{"probe_mode":"connection_error"}"#)
+            .probe()
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, "CONNECT_FAIL");
+        assert_eq!(e.kind, ErrorKind::Connection);
+        // 非法取值必须报错（静默回落会让分类测试假绿）
+        let cfg = serde_json::json!({"probe_mode": "nope"});
+        assert_eq!(parse_conn_faults(&cfg).unwrap_err().code, "BAD_CONFIG");
+        let cfg = serde_json::json!({"secret_echo": "nope"});
+        assert_eq!(parse_conn_faults(&cfg).unwrap_err().code, "BAD_CONFIG");
+        let cfg = serde_json::json!({"capture_path": 1});
+        assert_eq!(parse_conn_faults(&cfg).unwrap_err().code, "BAD_CONFIG");
+    }
+
+    /// C3-B：secret_echo 确实把**明文**回灌到结果里——这是 Core 侧出口脱敏
+    /// 测试有意义的前提（驱动真的会泄漏，Core 必须擦掉）。夹具自己不做脱敏。
+    #[tokio::test]
+    async fn secret_echo_replays_plaintext_to_core() {
+        const PW: &str = "pw-echo-fixture";
+        let json = format!(r#"{{"password":"{PW}","secret_echo":"warning"}}"#);
+        let r = conn_with(&json).probe().await.unwrap();
+        assert!(
+            r.warnings[0].message.contains(PW),
+            "夹具必须原样回灌收到的明文（Core 侧才有东西可擦）: {r:?}"
+        );
+        let json = format!(r#"{{"password":"{PW}","secret_echo":"error"}}"#);
+        let e = conn_with(&json).probe().await.unwrap_err();
+        assert_eq!(e.code, "PROBE_REJECTED_BY_DRIVER");
+        assert!(e.message.contains(PW), "错误文本同样回灌明文: {e:?}");
     }
 
     /// 高价值路径：configure -> apply -> 单次采样产出带正确 point_id 的值。
