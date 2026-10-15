@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   classifyProbeOutcome,
+  clearedHiddenRequiredIssues,
   containsSecretMarker,
   describeIssue,
   describeOutcome,
@@ -24,6 +25,7 @@ import {
   secretMarkerKeys,
   secretUnavailableOutcome,
   submitBlockReason,
+  touchedKeys,
   withDriverChange,
   withFieldChange,
   type FieldDescriptor,
@@ -584,6 +586,116 @@ describe("编辑态隐藏字段保留 preserveHiddenFields（P1）", () => {
     expect(preserveHiddenFields(canonical2.connection, cleared, FIELDS).api_token).toEqual({
       clear_secret: true,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1-2：「用户明确清除」与「程序初始化得到的空值」必须区分
+//
+// 产品语义（已定案）：
+// - 仅因条件变化而隐藏、用户未清除 → 保留原值；
+// - 用户在字段可见时明确清空、随后隐藏 → 删除原值；
+// - **程序初始化得到的空字符串 ≠ 用户明确清除**（不得据此误删旧值）；
+// - 必填字段被清除 → 校验失败，不得静默删除。
+// ---------------------------------------------------------------------------
+
+describe("用户清除 vs 程序初始化为空（P1-2）", () => {
+  const FIELDS: FieldDescriptor[] = [
+    { key: "host", label: "Host", field_type: "host", required: true },
+    { key: "use_native", label: "Use native", field_type: "boolean", default: false },
+    {
+      key: "native_pdu",
+      label: "PDU",
+      field_type: "integer",
+      validation: { min: 1, max: 65535 },
+      ui: { visible_if: { field: "use_native", op: "eq", value: true } },
+    },
+    {
+      key: "note",
+      label: "备注",
+      field_type: "string",
+      required: true,
+      ui: { visible_if: { field: "use_native", op: "eq", value: true } },
+    },
+  ];
+
+  it("touchedKeys：只有值真的变了才算用户改动（含清空；undefined 等同缺席）", () => {
+    expect(touchedKeys({ host: "a", port: 102 }, { host: "a", port: 102 })).toEqual([]);
+    expect(touchedKeys({ host: "a" }, { host: "a", note: "" })).toEqual(["note"]);
+    expect(touchedKeys({ note: "keep-me" }, { note: "" })).toEqual(["note"]);
+    expect(touchedKeys({ a: 1 }, { a: 1, b: undefined })).toEqual([]);
+    expect(touchedKeys({ a: 1, b: 2 }, { a: 1 })).toEqual(["b"]);
+  });
+
+  it("状态机：程序物化（切驱动）的默认值不算用户改动，字段改动才算", () => {
+    let s = initialSetupState();
+    s = withDriverChange(s, "s7", FIELDS);
+    // 程序物化：default=false 写入草稿，但**不是**用户改动
+    expect(s.draft.raw.use_native).toBe(false);
+    expect(s.draft.touched).toEqual([]);
+
+    s = withFieldChange(s, "native_pdu", "");
+    expect(s.draft.touched).toEqual(["native_pdu"]);
+    // 同一字段反复改动不重复登记
+    s = withFieldChange(s, "native_pdu", "");
+    expect(s.draft.touched).toEqual(["native_pdu"]);
+
+    // 切驱动后用户改动记录一并作废（旧驱动的改动不得带到新驱动）
+    s = withDriverChange(s, "opcua", FIELDS);
+    expect(s.draft.touched).toEqual([]);
+  });
+
+  it("③ 初始化为空但未修改：不是清除，key 保留（不得当作删除）", () => {
+    // raw 里的空串来自程序初始化（默认物化/装载），用户从未碰过该字段
+    const raw = { host: "10.0.0.2", use_native: false, native_pdu: "", note: "填好了" };
+    const canonical = normalizeConnection(raw, FIELDS);
+    expect("native_pdu" in canonical.connection).toBe(false);
+
+    const out = preserveHiddenFields(canonical.connection, raw, FIELDS, { touched: [] });
+    expect("native_pdu" in out).toBe(true);
+    expect(out.native_pdu).toBe("");
+  });
+
+  it("③ 初始化为空但有服务端快照旧值：用旧值兜底，绝不误删", () => {
+    const raw = { host: "10.0.0.2", use_native: false, native_pdu: "", note: "填好了" };
+    const canonical = normalizeConnection(raw, FIELDS);
+    const out = preserveHiddenFields(canonical.connection, raw, FIELDS, {
+      touched: [],
+      fallback: { host: "10.0.0.2", use_native: false, native_pdu: 8192, note: "填好了" },
+    });
+    expect(out.native_pdu).toBe(8192);
+  });
+
+  it("② 用户显式清除（touched 命中且为空）→ 删除，且不被快照旧值兜底", () => {
+    const raw = { host: "10.0.0.2", use_native: false, native_pdu: null, note: "填好了" };
+    const canonical = normalizeConnection(raw, FIELDS);
+    const out = preserveHiddenFields(canonical.connection, raw, FIELDS, {
+      touched: ["native_pdu"],
+      fallback: { host: "10.0.0.2", use_native: false, native_pdu: 8192, note: "填好了" },
+    });
+    // key 缺席 ⇒ 下游 cleanConnection 后即从服务端删除：用户明确清除优先
+    expect("native_pdu" in out).toBe(false);
+  });
+
+  it("④ 必填字段被清除且已隐藏 → REQUIRED_CLEARED（本地校验失败），未清除则不报", () => {
+    const raw = { host: "10.0.0.2", use_native: false, note: "" };
+    // 程序初始化得到的空值不是清除 → 不报错（交给「不得误删」分支处理）
+    expect(clearedHiddenRequiredIssues(FIELDS, raw, [])).toEqual([]);
+
+    const issues = clearedHiddenRequiredIssues(FIELDS, raw, ["note"]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].path).toBe("connection.note");
+    expect(issues[0].code).toBe("REQUIRED_CLEARED");
+
+    // 字段可见时由 normalizeConnection 报常规 REQUIRED，此处不重复报
+    expect(clearedHiddenRequiredIssues(FIELDS, { ...raw, use_native: true }, ["note"])).toEqual([]);
+    // 非必填字段被清除不算校验失败（删除是合法语义）
+    const optional = clearedHiddenRequiredIssues(
+      FIELDS.map((f) => (f.key === "note" ? { ...f, required: false } : f)),
+      raw,
+      ["note"],
+    );
+    expect(optional).toEqual([]);
   });
 });
 

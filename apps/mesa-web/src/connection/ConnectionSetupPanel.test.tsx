@@ -622,3 +622,145 @@ describe("C2 面板：编辑态 visible_if 隐藏字段保留（P1）", () => {
     expect(Object.keys(payload.connection).sort()).toEqual(["host", "native_pdu", "use_native"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// P1-2：「用户明确清除」与「自动隐藏」的语义区分（已定案的产品语义）
+//
+// | 情形 | 保存行为 |
+// | 条件变化导致隐藏、用户没清除 | 保留原值 |
+// | 可见时明确清空、随后隐藏 | 删除原值 |
+// | 初始化为空但未修改 | 不得误删 |
+// | 必填被清除 | 校验失败，不得静默删除 |
+//
+// 关键：**程序初始化得到的空字符串 ≠ 用户明确清除**。草稿里的空值两种来源在
+// 一起比对时长得一样，因此这里全部用真实交互（改条件、清空输入框）验证负载。
+// ---------------------------------------------------------------------------
+
+describe("C2 面板：用户清除 vs 自动隐藏（P1-2）", () => {
+  const OPTIONAL_FIELDS = [
+    { key: "host", label: "Host", field_type: "host", required: true, validation: {}, ui: { order: 1 } },
+    {
+      key: "use_pdu",
+      label: "启用 PDU 协商",
+      field_type: "boolean",
+      required: false,
+      default: true,
+      validation: {},
+      ui: { order: 2 },
+    },
+    {
+      key: "pdu_size",
+      label: "PDU 长度",
+      field_type: "integer",
+      required: false,
+      validation: { min: 240, max: 960 },
+      ui: { order: 3, visible_if: { field: "use_pdu", op: "eq", value: true } },
+    },
+    {
+      key: "note",
+      label: "备注",
+      field_type: "string",
+      required: false,
+      validation: {},
+      ui: { order: 4, visible_if: { field: "use_pdu", op: "eq", value: true } },
+    },
+  ];
+
+  /** 必填的 `note`：用于验证「必填被清除不得静默删除」。 */
+  const REQUIRED_NOTE_FIELDS = OPTIONAL_FIELDS.map((f) =>
+    f.key === "note" ? { ...f, required: true } : f,
+  );
+
+  const SNAPSHOT: ConnectionValues = {
+    host: "10.0.0.2",
+    use_pdu: true,
+    pdu_size: 512,
+    note: "keep-me",
+  };
+
+  function renderEdit(fields: unknown[], initialValues: ConnectionValues) {
+    installFetch({ descriptors: { s7: { fields } } });
+    const onSubmit = vi.fn();
+    const view = render(
+      <ConnectionSetupPanel
+        mode="edit"
+        driverSelectable={false}
+        initialDriverId="s7"
+        initialValues={initialValues}
+        onSubmit={onSubmit}
+      />,
+    );
+    return { ...view, onSubmit };
+  }
+
+  const anchor = (c: HTMLElement, key: string) => c.querySelector(`[data-field-key="${key}"]`);
+  const checkboxOf = (c: HTMLElement, key: string) =>
+    c.querySelector(`[data-field-key="${key}"] input[type="checkbox"]`) as HTMLInputElement;
+  const inputOf = (c: HTMLElement, key: string) =>
+    c.querySelector(`[data-field-key="${key}"] input`) as HTMLInputElement;
+  const save = () => screen.getByRole("button", { name: /保\s*存/ });
+
+  it("① 字段仅因条件变化而隐藏、用户未清除 → 保存负载保留原值", async () => {
+    const { container, onSubmit } = renderEdit(OPTIONAL_FIELDS, { ...SNAPSHOT });
+    await screen.findByDisplayValue("10.0.0.2");
+    // 前提：改动条件前字段确实可见（否则本用例证明不了「自动隐藏」）
+    expect(anchor(container, "pdu_size")).not.toBeNull();
+
+    fireEvent.click(checkboxOf(container, "use_pdu")); // 仅改条件，未清除任何字段
+    expect(anchor(container, "pdu_size")).toBeNull(); // 字段被条件隐藏
+
+    fireEvent.click(save());
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    const payload = onSubmit.mock.calls[0][0] as { connection: ConnectionValues };
+    expect(payload.connection.pdu_size).toBe(512);
+    expect(payload.connection.use_pdu).toBe(false);
+    expect(payload.connection.note).toBe("keep-me");
+  });
+
+  it("② 用户在字段可见时明确清空、随后字段隐藏 → 保存负载删除该字段", async () => {
+    const { container, onSubmit } = renderEdit(OPTIONAL_FIELDS, { ...SNAPSHOT });
+    await screen.findByDisplayValue("keep-me");
+
+    const note = inputOf(container, "note");
+    fireEvent.change(note, { target: { value: "" } }); // 可见时明确清空
+    expect(note.value).toBe("");
+    fireEvent.click(checkboxOf(container, "use_pdu")); // 之后字段才隐藏
+    expect(anchor(container, "note")).toBeNull();
+
+    fireEvent.click(save());
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    const payload = onSubmit.mock.calls[0][0] as { connection: ConnectionValues };
+    // 明确清除优先：字段从负载中消失（后端整体替换 ⇒ 服务端删除该值）
+    expect("note" in payload.connection).toBe(false);
+    // 未被清除的另一个隐藏字段不受牵连
+    expect(payload.connection.pdu_size).toBe(512);
+  });
+
+  it("④a 必填字段（可见）被清空 → 校验失败，不提交、不静默删除", async () => {
+    const { container, onSubmit } = renderEdit(OPTIONAL_FIELDS, { ...SNAPSHOT });
+    await screen.findByDisplayValue("10.0.0.2");
+
+    fireEvent.change(inputOf(container, "host"), { target: { value: "" } });
+    fireEvent.click(save());
+
+    await screen.findByText("参数校验未通过");
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(screen.getByText(/connection\.host/)).toBeTruthy();
+  });
+
+  it("④b 必填字段在可见时被清空、随后条件隐藏 → 校验失败（REQUIRED_CLEARED），不静默删除", async () => {
+    const { container, onSubmit } = renderEdit(REQUIRED_NOTE_FIELDS, { ...SNAPSHOT });
+    await screen.findByDisplayValue("keep-me");
+
+    fireEvent.change(inputOf(container, "note"), { target: { value: "" } }); // 可见时清空
+    fireEvent.click(checkboxOf(container, "use_pdu")); // 再隐藏
+    expect(anchor(container, "note")).toBeNull();
+
+    fireEvent.click(save());
+    await screen.findByText("参数校验未通过");
+    // 既没有发出保存负载，也没有把「用户清空必填」静默变成删除
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(screen.getByText(/connection\.note/)).toBeTruthy();
+    expect(screen.getByText(/REQUIRED_CLEARED/)).toBeTruthy();
+  });
+});

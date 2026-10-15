@@ -15,6 +15,11 @@
  * - **提交前一律用 `normalizeConnection` 现场归一化**：TSAP 从 raw 文本解析，
  *   因此「未失焦就点保存」提交的也是最新输入；非法值产生 issue 并阻止提交，
  *   绝不静默回退为上一次的合法值。
+ * - **「用户清除」与「程序初始化得到的空值」必须区分**（P1-2）：草稿里显式记录
+ *   用户改动过的 key（`Draft.touched`），只有「用户动过且当前为空」才算删除意图；
+ *   程序物化/快照装载得到的空值一律不算，隐藏字段补齐时会用服务端快照兜底旧值。
+ *   另：用户清空**必填**字段后再让条件隐藏它 → 本地校验失败（不再静默删除，
+ *   Core 的 `validate_instance` 不看 `visible_if`，缺必填必定 400）。
  *
  * 本 Hook 只做状态与请求编排，不做任何协议语义判断（分类交给
  * `connectionSetupModel.classifyProbeOutcome`）。
@@ -24,6 +29,7 @@ import { api } from "../api";
 import type { DriverDescriptor, FieldDescriptor } from "../types";
 import {
   classifyProbeOutcome,
+  clearedHiddenRequiredIssues,
   initialSetupState,
   isResultCurrent,
   networkFailureOutcome,
@@ -33,6 +39,7 @@ import {
   secretMarkerKeys,
   secretUnavailableOutcome,
   submitBlockReason,
+  touchedKeys,
   withDriverChange,
   withFieldChange,
   type ConnectionValues,
@@ -224,6 +231,12 @@ export function useConnectionSetup(
   const fieldsRef = useRef<FieldDescriptor[]>(fields);
   fieldsRef.current = fields;
 
+  // 服务端快照（编辑态 initialValues）：隐藏字段提交补齐时的**旧值来源**。
+  // 为什么要单独留一份引用：草稿 raw 可能被程序按新 Schema 重新物化（`withDriverChange`）
+  // 而丢掉快照里的旧值；此时只有快照能证明「这个字段原本有值」，
+  // 从而区分「用户清空」与「程序初始化得到的空值」（见 preserveHiddenFields）。
+  const snapshotRef = useRef<ConnectionValues | null>(null);
+
   const commitState = useCallback((next: SetupState) => {
     stateRef.current = next;
     setState(next);
@@ -267,7 +280,7 @@ export function useConnectionSetup(
       ...base,
       driverId: initialDriverId ?? null,
       draft: initialValues
-        ? { raw: { ...initialValues }, revision: base.draft.revision }
+        ? { raw: { ...initialValues }, revision: base.draft.revision, touched: [] }
         : base.draft,
     });
     // initialValues / initialDriverId 只在会话建立时取初值；后续变化由各自
@@ -277,12 +290,18 @@ export function useConnectionSetup(
 
   // edit 模式的服务端快照到达（引用变化即视为新快照）
   useEffect(() => {
+    snapshotRef.current = initialValues ? { ...initialValues } : null;
     if (!initialValues) return;
     setValidation(null);
     setProbe(null);
     updateState((current) => ({
       ...current,
-      draft: { raw: { ...initialValues }, revision: current.draft.revision + 1 },
+      // 快照装载是**程序写入**，不得登记为用户改动（touched 清空）
+      draft: {
+        raw: { ...initialValues },
+        revision: current.draft.revision + 1,
+        touched: [],
+      },
       lastValidatedRevision: null,
       probeRevision: null,
     }));
@@ -402,8 +421,9 @@ export function useConnectionSetup(
       actionAbort.current?.abort();
       // 先切 driverId（清空旧驱动的 raw，避免旧参数在新驱动下短暂可见）；
       // 新 Schema 到达后 withDriverChange 会按新默认值重新物化。
+      // touched 一并清空：旧驱动的「用户改动」不得带到新驱动上当作清除依据。
       commitState({
-        draft: { raw: {}, revision: stateRef.current.draft.revision + 1 },
+        draft: { raw: {}, revision: stateRef.current.draft.revision + 1, touched: [] },
         driverId: next,
         lastValidatedRevision: null,
         probeRevision: null,
@@ -425,9 +445,16 @@ export function useConnectionSetup(
     (next: ConnectionValues) => {
       clearResults();
       const current = stateRef.current;
+      // 整份替换（DescriptorFields 的 onChange 语义）：按值差异登记用户真正
+      // 改动过的 key（含把字段清空），供「用户清除 vs 程序初始化为空」判定使用。
+      const changed = touchedKeys(current.draft.raw, next);
+      const touched =
+        changed.length === 0
+          ? current.draft.touched
+          : Array.from(new Set([...current.draft.touched, ...changed]));
       commitState({
         ...current,
-        draft: { raw: { ...next }, revision: current.draft.revision + 1 },
+        draft: { raw: { ...next }, revision: current.draft.revision + 1, touched },
         lastValidatedRevision: null,
         probeRevision: null,
       });
@@ -467,10 +494,28 @@ export function useConnectionSetup(
     descriptorStatus,
   });
 
-  const snapshot = useCallback(
-    () => normalizeConnection(stateRef.current.draft.raw, fieldsRef.current),
-    [],
-  );
+  /**
+   * 现场归一化 + 「必填被显式清除」的本地校验（P1-3）。
+   *
+   * 为什么把「清除必填」并入归一化：可见字段被清空时 `normalizeConnection` 已报
+   * REQUIRED；但用户在**可见时**清空、随后条件变化让该字段隐藏时，归一化会因
+   * 「不可见即不报必填」而放行，隐藏字段补齐又会把空值剔除 —— 结果是静默删除，
+   * 而 Core 的 `validate_instance` 不看 visible_if，必定回 400。这里补上该缺口，
+   * 让校验失败发生在本地、并明确指向字段。
+   */
+  const normalizeDraft = useCallback((): NormalizeResult => {
+    const { raw, touched } = stateRef.current.draft;
+    const currentFields = fieldsRef.current;
+    const result = normalizeConnection(raw, currentFields);
+    const cleared = clearedHiddenRequiredIssues(currentFields, raw, touched);
+    if (cleared.length === 0) return result;
+    return {
+      connection: result.connection,
+      issues: [...result.issues, ...cleared],
+    };
+  }, []);
+
+  const snapshot = useCallback(() => normalizeDraft(), [normalizeDraft]);
 
   /**
    * 现场构造前置门输入。
@@ -496,18 +541,24 @@ export function useConnectionSetup(
    *
    * 门禁放在这里而不是只放在组件里，是为了让「提交函数本身」拥有守卫：即便
    * 按钮的 `disabled` 被回归移除、或将来新增程序化提交入口，也拿不到可提交的负载。
+   *
+   * 隐藏字段补齐的上下文（P1-2）：
+   * - `touched`：用户显式改动过的 key → 空值即「明确清除」，删除该字段；
+   * - `fallback`：服务端快照 → 未触碰的空值不算清除，用旧值兜底，绝不误删。
    */
   const submitSnapshot = useCallback((): NormalizeResult | null => {
     if (submitBlockReason(gateInput()) !== null) return null;
-    const raw = stateRef.current.draft.raw;
-    const currentFields = fieldsRef.current;
-    const result = normalizeConnection(raw, currentFields);
+    const result = normalizeDraft();
     if (!preserveHiddenValues) return result;
+    const { raw, touched } = stateRef.current.draft;
     return {
       issues: result.issues,
-      connection: preserveHiddenFields(result.connection, raw, currentFields),
+      connection: preserveHiddenFields(result.connection, raw, fieldsRef.current, {
+        touched,
+        fallback: snapshotRef.current,
+      }),
     };
-  }, [gateInput, preserveHiddenValues]);
+  }, [gateInput, preserveHiddenValues, normalizeDraft]);
 
   const validateLocal = useCallback((): ValidateOutcome => {
     const result = snapshot();

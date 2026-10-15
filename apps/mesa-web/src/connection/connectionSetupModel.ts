@@ -464,6 +464,31 @@ export function submitBlockReason(input: SubmitGateInput): SubmitBlockReason | n
 // 编辑态补齐：`visible_if` 隐藏字段不得丢失（P1）
 // ---------------------------------------------------------------------------
 
+/** 视为「空」的取值：与 `cleanConnection` 剔除的形态保持一致（undefined/null/""）。 */
+export function isEmptyConnectionValue(value: unknown): boolean {
+  return value === undefined || value === null || value === "";
+}
+
+/**
+ * `preserveHiddenFields` 的上下文（P1-2：区分「用户清除」与「程序初始化」）。
+ */
+export interface PreserveHiddenOptions {
+  /**
+   * 用户本次会话**显式改动过**的 key（含清空，见 [`Draft.touched`]）。
+   *
+   * 为什么必须由外部显式给出而不是从值推断：`raw` 里的空值有两种来源——
+   * ①用户在字段可见时把它清空（= 删除意图）；②程序初始化/按新 Schema 物化
+   * 默认值时写进去的空值（**不是**删除意图）。只看 `raw[key] === ""` 无法区分
+   * 二者，会把 ② 误判成删除并静默丢掉服务端旧值。
+   */
+  touched?: readonly string[];
+  /**
+   * 服务端快照（编辑态 `initialValues`）：用于给「未触碰却为空」的隐藏字段
+   * 保住旧值。缺省表示没有更权威的旧值来源，此时保留 `raw` 原样。
+   */
+  fallback?: ConnectionValues | null;
+}
+
 /**
  * 编辑态提交补齐：把「**当前 Descriptor 内**、本次因 `visible_if` 不满足而未被
  * 渲染、因而未进入 canonical」的字段，按原值补回提交负载。
@@ -473,17 +498,22 @@ export function submitBlockReason(input: SubmitGateInput): SubmitBlockReason | n
  * 从服务端消失（不是理论风险，是已核对后端源码的结论）。
  *
  * **边界（评审要求：不得无脑整体合并旧 connection）**
- * - **保留**：key 属于当前 Descriptor，且 `visible_if` 当前不满足，且 `raw` 里有值。
- *   值取自 `raw`（= 服务端快照 + 用户本次编辑），因此
- *   ①未触碰的字段保留服务端原值；②用户显式修改/清除的值以用户输入为准
- *   （清除为 `null`/`""` 时同样以用户输入为准，后续 `cleanConnection` 会把它
- *   从请求体里剔除，等于删除该字段——这正是「用户明确清除」的语义）。
+ * - **保留**：key 属于当前 Descriptor，且 `visible_if` 当前不满足，且 `raw` 里有
+ *   非空值 → 原样保留（未触碰即服务端原值；用户显式改过则以用户值为准）。
+ * - **保留（不误删）**：`raw` 里是空值但**用户从未触碰**该字段时，空值来自程序
+ *   初始化（默认物化/装载），**不构成清除**：若 `opts.fallback`（服务端快照）里
+ *   还有该字段的旧值，一律以旧值补回；否则保留 `raw` 的空值原样（由下游
+ *   `cleanConnection` 决定是否剔除），**绝不**在此把它当作删除。
+ * - **删除**：用户**显式清除**（`opts.touched` 命中且当前为空）→ 不补回，该 key
+ *   缺席提交负载，下游 `cleanConnection` 后即从服务端删除。这正是「用户明确
+ *   清除优先」的语义。
  * - **丢弃**：`raw` 中**不属于当前 Descriptor** 的 key（已过期/未知字段）。它们
  *   既不在 canonical 里，也不会被本函数补回；Core 的 `UNKNOWN_FIELD` 同样拒绝，
  *   无脑整体合并会把废弃配置重新写回。
  * - **丢弃**：`visible_if` 满足但未进入 canonical 的字段——那是「可见字段校验
  *   失败/必填缺失」，必须由校验阻断提交，绝不能用旧值掩盖。
- * - **丢弃**：`raw` 中不存在的 key——不替 Descriptor 发明默认值。
+ * - **丢弃**：`raw` 中不存在的 key——不替 Descriptor 发明默认值（也不从
+ *   `fallback` 里凭空补回草稿没有的字段）。
  *
  * Secret 不受影响：Secret 字段的值同样取自 `raw`，marker（`{secret_set:true}` /
  * `{clear_secret:true}`）原样透传，既有 marker 保留语义不变。
@@ -492,8 +522,11 @@ export function preserveHiddenFields(
   connection: ConnectionValues,
   raw: ConnectionValues,
   fields: FieldDescriptor[],
+  opts: PreserveHiddenOptions = {},
 ): ConnectionValues {
   const out: ConnectionValues = { ...connection };
+  const touched = new Set(opts.touched ?? []);
+  const fallback = opts.fallback ?? null;
   for (const field of fields) {
     const key = field.key;
     // 已进入 canonical（可见且校验通过）→ 不动
@@ -503,10 +536,67 @@ export function preserveHiddenFields(
     // 快照/草稿里本来就没有这个 key → 不凭空造值
     if (!Object.prototype.hasOwnProperty.call(raw, key)) continue;
     const value = raw[key];
-    if (value === undefined) continue;
-    out[key] = value;
+
+    if (touched.has(key)) {
+      // 用户本次显式改动过：以用户输入为准。清空即删除意图，
+      // **不得**用旧值/快照兜底（否则「用户明确清除优先」被推翻）。
+      if (isEmptyConnectionValue(value)) continue;
+      out[key] = value;
+      continue;
+    }
+
+    if (!isEmptyConnectionValue(value)) {
+      out[key] = value;
+      continue;
+    }
+
+    // 未触碰却为空：程序初始化得到的空值 ≠ 用户清除，不得据此删除旧值。
+    const hasFallback =
+      fallback !== null && Object.prototype.hasOwnProperty.call(fallback, key);
+    const fallbackValue = hasFallback ? fallback[key] : undefined;
+    if (hasFallback && !isEmptyConnectionValue(fallbackValue)) {
+      out[key] = fallbackValue;
+      continue;
+    }
+    if (value !== undefined) out[key] = value;
   }
   return out;
+}
+
+/**
+ * 「必填字段被用户显式清空，且当前因 `visible_if` 不满足而隐藏」→ 本地校验失败。
+ *
+ * 为什么必须拦而不是静默删除：Core 的 `validate_instance` **完全不看
+ * `visible_if`**（见 `crates/core-types/src/schema.rs`），缺失的必填字段一律
+ * `REQUIRED`（400）。若前端把用户清空的值从负载里剔除，用户看到的是「点了保存
+ * 才莫名 400」，而清空这个动作本身从未被校验拒绝——属于静默删除。
+ *
+ * 判定只针对「用户显式清除」（`touched` 命中且当前为空）：
+ * 程序初始化得到的空值不是清除，因此**不**在这里报错（那属于
+ * `preserveHiddenFields` 的「不得误删」分支）。
+ * 字段可见时由 `normalizeConnection` 报常规 `REQUIRED`，此处不重复报。
+ */
+export function clearedHiddenRequiredIssues(
+  fields: FieldDescriptor[],
+  raw: ConnectionValues,
+  touched: readonly string[],
+): Issue[] {
+  const touchedSet = new Set(touched);
+  const issues: Issue[] = [];
+  for (const field of fields) {
+    if (field.required !== true) continue;
+    if (isFieldVisible(field, raw)) continue;
+    if (!touchedSet.has(field.key)) continue;
+    const hasRaw = Object.prototype.hasOwnProperty.call(raw, field.key);
+    const value = hasRaw ? raw[field.key] : undefined;
+    if (!isEmptyConnectionValue(value)) continue;
+    issues.push({
+      path: `connection.${field.key}`,
+      code: "REQUIRED_CLEARED",
+      message: `必填字段 ${field.label ?? field.key} 在可见时被清空；条件隐藏不免除必填（Core 校验不看 visible_if），已阻止提交，不会静默删除该字段`,
+    });
+  }
+  return issues;
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +656,15 @@ export interface Draft {
   raw: ConnectionValues;
   /** 每次有效改动 +1；用于丢弃迟到的异步结果 */
   revision: number;
+  /**
+   * 用户本次会话**显式改动过**的 key（含把字段清空）。
+   *
+   * 存在的唯一理由（P1-2）：`raw` 里的空值有两种来源——用户清除，或程序初始化
+   * （快照装载 / 按新 Schema 物化默认值）。只凭「值是空的」无法区分删除意图与
+   * 「本来就没有值」，因此把「用户动过」这件事显式记录在状态里。程序侧写入
+   * （`withDriverChange`、会话复位、快照装载）一律**不**登记为 touched。
+   */
+  touched: string[];
 }
 
 export interface SetupState {
@@ -579,14 +678,37 @@ export interface SetupState {
 
 export function initialSetupState(): SetupState {
   return {
-    draft: { raw: {}, revision: 0 },
+    draft: { raw: {}, revision: 0, touched: [] },
     driverId: null,
     lastValidatedRevision: null,
     probeRevision: null,
   };
 }
 
-/** 字段变更：revision+1，并让既有校验/探测结果失效。 */
+/**
+ * 从「整份 raw 替换」里推导用户实际改动过的 key。
+ *
+ * 为什么需要：`DescriptorFields` 的受控语义是「浅合并后的完整对象」回调
+ * （见 `useConnectionSetup.setRaw`），无法逐字段得知用户动的是哪一个；但按值
+ * 比较可以精确得到**值真的变了**的 key（含被清空、被新增的 key），而重新选中
+ * 同一个值不会产生 touched——这正是 [`Draft.touched`] 想要的语义。
+ */
+export function touchedKeys(
+  prev: ConnectionValues,
+  next: ConnectionValues,
+): string[] {
+  const out: string[] = [];
+  for (const key of Object.keys(prev)) {
+    if (prev[key] !== next[key]) out.push(key);
+  }
+  for (const key of Object.keys(next)) {
+    if (Object.prototype.hasOwnProperty.call(prev, key)) continue;
+    if (next[key] !== undefined) out.push(key);
+  }
+  return out;
+}
+
+/** 字段变更：revision+1，登记为「用户显式改动」，并让既有校验/探测结果失效。 */
 export function withFieldChange(
   state: SetupState,
   key: string,
@@ -597,6 +719,9 @@ export function withFieldChange(
     draft: {
       raw: { ...state.draft.raw, [key]: value },
       revision: state.draft.revision + 1,
+      touched: state.draft.touched.includes(key)
+        ? state.draft.touched
+        : [...state.draft.touched, key],
     },
     lastValidatedRevision: null,
     probeRevision: null,
@@ -609,6 +734,9 @@ export function withFieldChange(
  * 为什么必须重建而不是合并：不同驱动的字段名/类型/默认值都不同，合并会
  * 产生「新驱动上残留旧驱动参数」甚至把旧值当新驱动的有效配置提交
  * （V1.1 §8.3 与 A01/A02）。
+ *
+ * 注意 `touched` 一并清空：这里的值是**程序物化的默认值**，不是用户输入，
+ * 因此不得登记为用户改动（否则「用户明确清除」会被凭空构造出来）。
  */
 export function withDriverChange(
   state: SetupState,
@@ -620,7 +748,7 @@ export function withDriverChange(
     if (f.default !== undefined && f.default !== null) raw[f.key] = f.default;
   }
   return {
-    draft: { raw, revision: state.draft.revision + 1 },
+    draft: { raw, revision: state.draft.revision + 1, touched: [] },
     driverId,
     lastValidatedRevision: null,
     probeRevision: null,

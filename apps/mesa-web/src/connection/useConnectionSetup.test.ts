@@ -401,3 +401,68 @@ describe("C2 Hook：P0 前置门（不发任何请求）", () => {
     expect("legacy_field" in (snap?.connection ?? {})).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// P1-2：隐藏字段补齐的上下文 —— 「用户清除」与「程序初始化为空」必须区分
+//
+// 场景构造：`driverSelectable=true` 时描述符到达会按新 Schema **程序物化**默认值
+// （`withDriverChange`），因此草稿里可能出现「用户从未触碰、却是空值」的字段。
+// 这与「用户在字段可见时明确清空」在草稿里长得一模一样，只能靠显式的用户改动
+// 记录（`Draft.touched`）区分。
+// ---------------------------------------------------------------------------
+
+describe("C2 Hook：隐藏字段的清除判定（P1-2）", () => {
+  const FIELDS = [
+    { key: "host", label: "Host", field_type: "host", required: true, validation: {}, ui: { order: 1 } },
+    { key: "use_native", label: "Use native", field_type: "boolean", required: false, default: false, validation: {}, ui: { order: 2 } },
+    {
+      key: "note",
+      label: "备注",
+      field_type: "string",
+      required: false,
+      // default "" 让「程序物化出空值」这一情形真实可达
+      default: "",
+      validation: {},
+      ui: { order: 3, visible_if: { field: "use_native", op: "eq", value: true } },
+    },
+  ];
+
+  function renderPreserve() {
+    installFetch({
+      drivers: [{ id: "s7", name: "S7", launchable: true }],
+      descriptors: { s7: { fields: FIELDS } },
+    });
+    return renderSetup({
+      active: true,
+      driverSelectable: true,
+      sessionKey: "s",
+      initialDriverId: "s7",
+      initialValues: { use_native: false, note: "服务端旧值" },
+      preserveHiddenValues: true,
+    });
+  }
+
+  it("③ 初始化得到的空值不是清除：用服务端快照旧值兜底，不得误删", async () => {
+    const { result } = renderPreserve();
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("ready"));
+    // 程序物化（默认值）写出的空串——用户从未触碰 note
+    expect(result.current.raw.note).toBe("");
+
+    const snap = result.current.submitSnapshot();
+    expect(snap?.connection.note).toBe("服务端旧值");
+  });
+
+  it("② 用户在字段可见时明确清空、随后隐藏 → 明确清除优先，删除该字段", async () => {
+    const { result } = renderPreserve();
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("ready"));
+
+    act(() => result.current.setField("use_native", true)); // 字段变为可见
+    act(() => result.current.setField("note", "临时输入")); // 用户输入
+    act(() => result.current.setField("note", "")); // 可见时明确清空
+    act(() => result.current.setField("use_native", false)); // 之后再让条件隐藏它
+
+    const snap = result.current.submitSnapshot();
+    // key 缺席 → 下游 cleanConnection 后即从服务端删除（不被快照旧值兜底）
+    expect(snap && "note" in snap.connection).toBe(false);
+  });
+});
