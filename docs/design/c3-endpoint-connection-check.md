@@ -211,3 +211,61 @@ C3-D 采用 **(A)**；如需 (B) 请明确指示。（本文档按 (A) 冻结。
   该限制的解除前提仍是 C3-A/C3-B 通过验收；
 - 必须补专门测试（契约 §4 已要求）：`touched + 空 Secret` → 线上负载含 `clear_secret`，
   且①检查与②保存两侧都不再回退到旧凭据。
+
+## 11. C3-E 收口核对（**注记，只追加**；§1–§10 冻结条款一字未改）
+
+本节记录 §6 十二条与可复跑测试的对应关系，以及验收中核实的两处事实。
+
+### 11.1 逐项覆盖对照
+
+| 编号 | 覆盖情况 | 证据入口（测试名） |
+|---|---|---|
+| C3-01 | 覆盖 | `management_api::c3e_unreachable_device_offline_save_is_zero_probe_and_zero_start`（夹具注入不可达 + 真实 s7 关闭端口：保存 201、capture 文件不存在、<3s、无运行态；随后显式探测确认真不可达）；`connection_check_validate_uses_draft_and_never_probes`（validate 零探测） |
+| C3-02 | 覆盖 | `management_api::c3e_full_chain_offline_save_probe_start_data_stop` 段1（`tasks=[]`、`started=false`、`desired_running=false`、无运行态对象、列表 `runtime=null`）；字面 `STOPPED` 由同用例段5 锁定（停止后 `state=STOPPED`） |
+| C3-03 | 覆盖 | `connection_check_secret_semantics_are_endpoint_bound_and_side_effect_free` ①（opcua + marker）；`connection_check_probe_sends_plaintext_not_marker`；主链路段3 |
+| C3-04 | 覆盖 | `connection_check_probe_sends_plaintext_not_marker`；`connection_check_probe_secret_is_endpoint_bound`；`subprocess_orphan_guard::c3_connection_check_probe_cleans_up_and_spares_running_endpoint`；主链路段3/4/4b（Driver 侧落盘的原始 connection 为判据） |
+| C3-05 | 覆盖 | `connection_check_secret_semantics...` ③；`connection_check_probe_sends_plaintext_not_marker` ③；主链路段3（直查磁盘 `endpoint_secrets` 行逐字一致，含 nonce） |
+| C3-06 | 覆盖 | `connection_check_secret_semantics...` ④；`connection_check_secret_store_failure_is_503`；`connection_check_probe_persisted_connection_invalid_is_503`；`core-api::connection_check::tests` 的必填 Secret 清除用例 |
+| C3-07 | 覆盖 | `connection_check_secret_semantics...` ②；`connection_check_probe_secret_is_endpoint_bound` |
+| C3-08 | 覆盖 | `connection_check_validate_uses_draft_and_never_probes`；`c3_connection_check_probe_cleans_up_and_spares_running_endpoint`（PID 集合 + 端口租约）；主链路段3（持久化面与磁盘 Secret 行逐字不变、无运行态）与段4b（`stream_epoch` 不变 + 采集值继续推进） |
+| C3-09 | 覆盖（前端） | `useConnectionSetup.test.ts`（归属 Endpoint 变化 / 迟到描述符 / 参数变化失效）；`connectionSetupModel.test.ts` A03；`ConnectionEditorModal.test.tsx`（A 的迟到响应不得污染 B）。服务端不持有跨请求状态，无 Rust 侧对应路径 |
+| C3-10 | 覆盖，**504 端到端除外** | `connection_check_probe_http_layering_classification`（400/200 可达/200 不可达/501/503/400-by-driver/404）+ 同一映射函数的 504 分支单测；前端 `ConnectionSetupPanel.test.tsx` 七条分层用例。真机 504 未端到端覆盖（单例 ≥20s，合同套件不划算） |
+| C3-11 | 覆盖 | `cargo test -p mesa-core-api`（38）、`-p mesa-config-store`（31）、`cargo test --locked -p mesa-contract-tests --all-features`（202）全绿；前端 `pnpm test` 33 文件 / 373 项全绿 |
+| C3-12 | **本地覆盖，远程 CI 未跑** | `connection_check_never_logs_secret_plaintext`；`connection_check_probe_never_leaks_secret_in_response_or_logs`；主链路（响应/日志脱敏 + 全程逐字比对）。远程 CI 需推送后由 CI 产生 |
+
+### 11.2 验收中核实的两处事实（影响后续用例写法）
+
+1. **`point_map` 是否落盘取决于 Manager 的装配方式**：`MesaManager::discover()` 用内存版
+   `PointIdAllocator`（Contract Test 兼容），只有 `apps/mesad/src/main.rs` 用
+   `MesaManager::with_source(..., StorePointIdSource)` 接持久版。`AppState` 不参与该装配，
+   且 `MesaManager.source` 构造后不可替换 ⇒ 「进程内 `AppState` + `discover()`」的用例
+   **看不到** `point_id` 落库（表现为运行态 `points=1` 而 `/diagnostics.point_count=0`）。
+   C3-E 链路用例因此复刻 mesad 装配。
+2. **非 Secret 字段不做缺省继承**（`resolve_connection_draft` 的 NOTE）：草稿省略可见必填
+   字段按 `required` 报 400，而不是回填已保存值；`connection-check` 的缺省继承**只**适用于
+   §4 规定的 Secret 字段。这与 PUT「非 Secret 整体替换」同源，不是缺陷。
+
+### 11.3 测试装配要求（**硬性**，防止假绿）
+
+> 需要验证 **Point ID 持久化**及 **`/diagnostics.point_count`** 的集成测试，**必须**使用与
+> mesad 一致的 `MesaManager::with_source(StorePointIdSource)` 装配；`discover()` 仅提供
+> **内存型** ID 源，**不得**用它验证持久化点位。测试应**同时**断言实际出数与 ConfigStore
+> 中的 Point ID 映射，防止假绿。
+
+理由与处置（评审裁决：本轮**不改生产代码**）：
+
+- `MesaManager::discover()` 默认内存 `PointIdAllocator`；`with_source()` 才接持久化
+  `PointIdSource`；`apps/mesad/src/main.rs` 用的是后者；`/endpoints/{id}/diagnostics` 的
+  `point_count` 来自 ConfigStore 的 `point_map`。
+- 因此该问题是**集成测试装配容易失真**，**不是生产装配缺陷**——生产路径正确。
+- 不做 (a)「让 `/diagnostics` 暴露 ID 源类型」：需扩展运行期状态/类型信息并改动公共 API，
+  为提醒测试编写者而引入公共 API 变更，收益不足。
+- 不做 (b)「新增 `MesaManager::set_source()`」：**运行中的 Manager 不应为补救测试初始化
+  错误而支持启动后替换 ID 源**。
+- 故以本条**硬性装配要求**替代代码改动：后续任何涉及 Point ID 持久化的集成用例按其执行。
+
+### 11.4 C3-10 的明确例外（口径不得模糊）
+
+**504 的 HTTP 端到端用例未覆盖**，使用**分层替代证据**：同一映射函数的
+`RpcTimeout` / `Timeout` → 504 逐分支单测 + 既有 A32 对真实 `RpcTimeout` 的进程与端口租约
+回收用例。**不得**据此声称该路径已完成 HTTP E2E。

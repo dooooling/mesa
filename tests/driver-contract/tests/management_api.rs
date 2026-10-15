@@ -2013,3 +2013,728 @@ async fn connection_check_probe_persisted_connection_invalid_is_503() {
         "明确清除后送到 Driver 的连接不得带该字段: {captured}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// C3-E：全链路验收
+//
+// 链路：配置设备 → 零采集点离线保存 → 后续补采集点 → 复用已存凭据做
+//       Endpoint-bound 连接检查（mode=probe）→ 手动启动 → 产出数据 → 停止。
+//
+// 跨层（刻意不用 mock 短路任何一层）：
+// - Core API：真实 HTTP 路由（`mesa_core_api::router` + `tower::ServiceExt::oneshot`）；
+// - config-store：**文件型** SQLite（真实落盘），既走 Store API 也直查磁盘行；
+// - driver-manager：临时探测子进程与常驻采集子进程都是真实 test-driver 进程。
+//
+// 契约：docs/design/c3-endpoint-connection-check.md §6（C3-01/02/03/04/08）。
+// ---------------------------------------------------------------------------
+
+async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, v)
+}
+
+/// 链路快照：只取「连接检查 / 启动 / 停止不得修改」的持久化面 + 运行态判据字段。
+///
+/// 为什么用快照逐字比对而不是逐字段断言：逐字段断言最容易「看漏了某一列」；
+/// 快照 + [`c3e_changed_keys`] 能同时给出「红线字段一字未改」与「到底哪一列被
+/// 合法改变」两个结论。`updated_at_ns` 一并纳入（不隐藏任何列），但不作为差异
+/// 的**必需**项——系统时钟粒度可能让两次写落在同一纳秒。
+fn c3e_state(store: &ConfigStore, endpoint_id: &str) -> serde_json::Value {
+    let rec = store.get_endpoint(endpoint_id).unwrap().unwrap();
+    serde_json::json!({
+        "connection_json": rec.connection_json,
+        "device_id": rec.device_id,
+        "driver_id": rec.driver_id,
+        "name": rec.name,
+        "desired_running": rec.desired_running,
+        "updated_at_ns": rec.updated_at_ns,
+        "secret_fields": store.list_secret_fields(endpoint_id).unwrap(),
+        "password_secret": store.get_secret(endpoint_id, "password").unwrap(),
+        "tasks": store.list_tasks(endpoint_id).unwrap(),
+        "event_tasks": store.list_event_tasks(endpoint_id).unwrap(),
+        "point_map": store.point_map(endpoint_id).unwrap(),
+        "revision": store.current_revision(endpoint_id).unwrap(),
+    })
+}
+
+/// 两个快照之间发生变化的键（已排序）。
+fn c3e_changed_keys(before: &serde_json::Value, after: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for (k, v) in before.as_object().unwrap() {
+        if after.get(k.as_str()) != Some(v) {
+            out.push(k.clone());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 断言两快照的差异**只**出现在 `allowed` 内：既钉住红线字段不变，又不放过任何
+/// 意料之外的列（例如 `connection_json` 被顺手重写）。
+fn assert_changed_within(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+    allowed: &[&str],
+    ctx: &str,
+) {
+    let changed = c3e_changed_keys(before, after);
+    let unexpected: Vec<&String> = changed
+        .iter()
+        .filter(|k| !allowed.contains(&k.as_str()))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "{ctx}: 出现意料之外的持久化变更 {unexpected:?}（允许的合法变化只有 {allowed:?}，实际变化 {changed:?}）"
+    );
+}
+
+/// 直读磁盘上的 `endpoint_secrets` 行（密文 / nonce / 时间戳）。
+///
+/// 为什么绕过 ConfigStore 直查：AEAD 每次写入都换新随机 nonce，因此**任何**一次
+/// Secret 重写（哪怕明文一模一样）都会让本函数的结果变化——这是「连接检查不得
+/// 改动 `endpoint_secrets`」最严格的观测口径；Store API 只能证明解密后的明文相同。
+fn c3e_raw_secret_rows(db: &std::path::Path) -> serde_json::Value {
+    let raw = rusqlite::Connection::open(db).unwrap();
+    let mut stmt = raw
+        .prepare(
+            "SELECT endpoint_id, field_path, ciphertext, nonce, algorithm, key_id, updated_at_ns
+             FROM endpoint_secrets ORDER BY endpoint_id, field_path",
+        )
+        .unwrap();
+    let rows: Vec<serde_json::Value> = stmt
+        .query_map([], |r| {
+            Ok(serde_json::json!({
+                "endpoint_id": r.get::<_, String>(0)?,
+                "field_path": r.get::<_, String>(1)?,
+                "ciphertext": r.get::<_, Vec<u8>>(2)?,
+                "nonce": r.get::<_, Vec<u8>>(3)?,
+                "algorithm": r.get::<_, String>(4)?,
+                "key_id": r.get::<_, String>(5)?,
+                "updated_at_ns": r.get::<_, i64>(6)?,
+            }))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    serde_json::Value::Array(rows)
+}
+
+/// 该点的最新采集值（只接受 f64；用于证明数值在推进，而不是一次性静态样本）。
+fn c3e_latest(mgr: &mesa_driver_manager::MesaManager, point_key: &str) -> Option<f64> {
+    mgr.snapshot()
+        .latest_all()
+        .into_iter()
+        .find(|e| e.point_key == point_key)
+        .and_then(|e| e.value.value.as_f64())
+}
+
+/// 预热 Descriptor（临时进程 + 缓存）：把一次性 spawn 成本移出「保存不探测」的
+/// 计时区（既有 C3-A 用例同一手法，否则耗时断言会被 descriptor 冷启动污染）。
+async fn warm_descriptor(app: &axum::Router, driver_id: &str) {
+    let req = Request::builder()
+        .uri(format!("/api/v1/drivers/{driver_id}/descriptor"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "预置：{driver_id} descriptor 必须可用"
+    );
+}
+
+/// C3-E 主链路：离线保存 → 补采集点 → 复用已存凭据探测 → 手动启动出数 → 停止。
+#[tokio::test]
+async fn c3e_full_chain_offline_save_probe_start_data_stop() {
+    const PW: &str = "pw-c3e-chain-plaintext";
+    const EID: &str = "c3e-e1";
+    let tmp = ProbeTempDir::new("c3e-chain");
+    let db = tmp.file("mesa.db");
+    let start_cap = tmp.file("start-open.json");
+    let probe_cap = tmp.file("probe-open.json");
+    let running_probe_cap = tmp.file("probe-running-open.json");
+    let uri_check = format!("/api/v1/endpoints/{EID}/connection-check");
+
+    // 文件型 ConfigStore：本用例要证明的是**真实持久化**面（含磁盘上的密文），
+    // 后面的 raw SQL 断言也直接读这份 DB。
+    let store = Arc::new(ConfigStore::open(&db).unwrap());
+    let staged = common::staged_drivers_with_test_driver();
+    let drivers_dir = staged.path().clone();
+    // 与 `apps/mesad/src/main.rs:47-51` **同一条装配**：point_id 由持久版
+    // `StorePointIdSource` 分配并落库。`MesaManager::discover()` 用的是内存版
+    // 分配器（Contract Test 兼容用），那样 `point_map` 根本不会落盘，「point_id
+    // 持久化」也就无从验证——链路验收必须复刻生产装配。
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::with_source(
+        &drivers_dir,
+        Arc::new(mesa_driver_manager::StorePointIdSource::new(Arc::clone(
+            &store,
+        ))),
+    ));
+    let state = mesa_core_api::AppState::try_new_with_control(
+        Arc::clone(&mgr),
+        Arc::clone(&store),
+        drivers_dir.to_string_lossy().to_string(),
+        false,
+    )
+    .unwrap();
+    let app = mesa_core_api::router(state);
+    warm_descriptor(&app, "test-driver").await;
+
+    // === 段 1：零采集点离线保存（C3-02 创建半条 + C3-01 的零 Probe/零 Start） ===
+    let boot_started = std::time::Instant::now();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/device-bootstrap",
+        &serde_json::json!({
+            "device": { "id": "c3e-d1", "name": "C3E Device" },
+            "endpoint": {
+                "id": EID,
+                "name": "C3E Endpoint",
+                "driver_id": "test-driver",
+                "connection": {
+                    "password": PW,
+                    "capture_path": start_cap.to_string_lossy(),
+                },
+            },
+            "acquisition": { "tasks": [] },
+            "start": false,
+            "idempotency_key": "c3e-chain-1",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "段1 离线保存: {v}");
+    assert_eq!(v["started"], false, "段1 必须不启动: {v}");
+    assert_eq!(v["endpoint_id"], EID, "段1: {v}");
+    assert!(v["revision"].as_u64().is_some(), "段1 revision: {v}");
+
+    let st1 = c3e_state(&store, EID);
+    assert_eq!(st1["tasks"], serde_json::json!([]), "段1 tasks 必须为空");
+    assert_eq!(
+        st1["point_map"],
+        serde_json::json!({}),
+        "段1 未启动不得分配 point_id"
+    );
+    assert_eq!(st1["desired_running"], false, "段1 期望态必须为 false");
+    assert_eq!(st1["secret_fields"], serde_json::json!(["password"]));
+    assert_eq!(st1["password_secret"], PW, "段1 凭据必须已入 SecretStore");
+    // 落盘只有 marker；磁盘行与 Store API 一致，且密文里不得出现明文。
+    let conn_json = st1["connection_json"].as_str().unwrap();
+    assert!(
+        conn_json.contains("\"secret_set\":true"),
+        "段1 落盘必须是 marker: {conn_json}"
+    );
+    assert!(
+        !conn_json.contains(PW),
+        "段1 connection_json 不得含明文: {conn_json}"
+    );
+    let (db_conn_json, ct): (String, Vec<u8>) = {
+        let raw = rusqlite::Connection::open(&db).unwrap();
+        raw.query_row(
+            "SELECT e.connection_json, s.ciphertext FROM endpoints e
+             JOIN endpoint_secrets s ON s.endpoint_id = e.id
+             WHERE e.id = ?1 AND s.field_path = 'password'",
+            [EID],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(db_conn_json, conn_json, "段1 磁盘行必须与 Store API 一致");
+    assert!(
+        !ct.windows(PW.len()).any(|w| w == PW.as_bytes()),
+        "段1 磁盘密文不得包含明文"
+    );
+    // Endpoint 状态：从未启动 ⇒ 没有运行态对象、不在运行、列表里 runtime 为 null
+    //（这正是 UI「非运行 / STOPPED」的判据：`isRunningState(runtime?.state)` 为假）。
+    assert!(
+        mgr.snapshot().endpoint(EID).is_none(),
+        "段1 不得有运行态对象"
+    );
+    assert!(!mgr.is_running(EID), "段1 不得在运行");
+    let (s, v) = get_json(app.clone(), "/api/v1/endpoints").await;
+    assert_eq!(s, StatusCode::OK, "段1 列表: {v}");
+    let listed = v["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == EID)
+        .cloned()
+        .unwrap_or_else(|| panic!("段1 endpoint 必须在列表里: {v}"));
+    assert!(
+        listed["runtime"].is_null(),
+        "段1 runtime 必须为空（保持 STOPPED）: {listed}"
+    );
+    assert_eq!(listed["desired_running"], false, "段1: {listed}");
+    // 零 Probe / 零 Start 的结构证据：保存路径若发起过任何 OpenConnection，
+    // 夹具（test-driver）必然把收到的连接落盘到 capture_path。
+    assert!(
+        !start_cap.exists(),
+        "段1 保存路径不得接触设备（零 Probe / 零 Start）"
+    );
+    assert!(
+        boot_started.elapsed() < std::time::Duration::from_secs(3),
+        "段1 保存不得探测设备（耗时 {:?}；探测路径 Open 预算 5s 起）",
+        boot_started.elapsed()
+    );
+
+    // === 段 2：后续为该 Endpoint 补采集点（既有任务 API） ===
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/tasks",
+        &serde_json::json!({
+            "endpoint_id": EID,
+            "tasks": [{
+                "id": "t1",
+                "schedule": { "mode": "poll", "interval_ms": 50 },
+                "binding": {
+                    "kind": "mesa.resources.v1",
+                    "config": { "selections": [{
+                        "resource_id": "counter",
+                        "parameters": { "start": 0.0, "step": 1.0 },
+                        "outputs": [{ "output": "value", "point_key": "c3e.counter" }],
+                    }]},
+                },
+            }],
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "段2 补采集点: {v}");
+    let st2 = c3e_state(&store, EID);
+    assert_eq!(
+        st2["tasks"].as_array().unwrap().len(),
+        1,
+        "段2 任务必须落库"
+    );
+    assert_eq!(st2["tasks"][0]["id"], "t1", "段2: {st2}");
+    let (s, v) = get_json(app.clone(), &format!("/api/v1/tasks?endpoint={EID}")).await;
+    assert_eq!(s, StatusCode::OK, "段2 GET tasks: {v}");
+    assert_eq!(v["tasks"], st2["tasks"], "段2 GET 面必须与落库一致");
+    // 合法变化只有任务面（附带 revision / updated_at_ns 两个记账列）；
+    // **Secret 与 connection_json 一字未改**（这是「补任务不该动凭据」的逐字证据）。
+    assert_changed_within(
+        &st1,
+        &st2,
+        &["tasks", "revision", "updated_at_ns"],
+        "段2 补采集点",
+    );
+    assert!(
+        st2["revision"].as_u64().unwrap() > st1["revision"].as_u64().unwrap(),
+        "段2 revision 必须自增: {} → {}",
+        st1["revision"],
+        st2["revision"]
+    );
+    assert_eq!(
+        st2["password_secret"], st1["password_secret"],
+        "段2 不得改动 Secret"
+    );
+    assert_eq!(
+        st2["point_map"],
+        serde_json::json!({}),
+        "段2 未启动不得分配 point_id"
+    );
+    assert!(!start_cap.exists(), "段2 只改配置，仍不得接触设备");
+
+    // === 段 3：复用已存凭据做 Endpoint-bound 连接检查（mode=probe） ===
+    let before_probe = c3e_state(&store, EID);
+    let raw_secrets_before = c3e_raw_secret_rows(&db);
+    // 日志捕获：trace 级全量，断言链路上没有任何明文凭据进入日志。
+    let log_buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("trace"))
+        .with_writer({
+            let b = Arc::clone(&log_buf);
+            move || CaptureWriter(Arc::clone(&b))
+        })
+        .finish();
+    // `set_default` 是线程级：`#[tokio::test]` 默认单线程运行时，请求处理与被测
+    // 的常驻 Endpoint 任务都在同一线程上，因此捕获范围正好覆盖被测链路。
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    // 草稿只带「引用已存凭据」的 marker（= 编辑态不回显密码时的线上形态）。
+    let (s, v) = post_json(
+        app.clone(),
+        &uri_check,
+        &probe_body(serde_json::json!({
+            "password": { "secret_set": true },
+            "capture_path": probe_cap.to_string_lossy(),
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "段3 探测: {v}");
+    assert_eq!(v["reachable"], true, "段3 探测必须可达: {v}");
+    assert_eq!(v["device"]["vendor"], "Mesa", "段3: {v}");
+    assert_no_plaintext(&v, &[PW]);
+    // C3-03 / C3-04：临时 Driver **实际收到**的连接里，password 是 SecretStore 明文
+    // 且不含任何 marker（响应已被 Core 脱敏，明文不可能从响应里证明）。
+    let received: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&probe_cap).expect("临时 Driver 必须落盘它实际收到的连接"),
+    )
+    .unwrap();
+    assert_eq!(
+        received["password"], PW,
+        "段3 送到临时 Driver 的必须是已存明文: {received}"
+    );
+    assert!(
+        !received.to_string().contains("secret_set"),
+        "段3 marker 绝不进入 Driver: {received}"
+    );
+    // C3-08 零副作用：持久化面（含磁盘 Secret 行）与运行态都必须一字不变。
+    assert_eq!(
+        c3e_state(&store, EID),
+        before_probe,
+        "段3 连接检查不得修改任何持久化状态"
+    );
+    assert_eq!(
+        c3e_raw_secret_rows(&db),
+        raw_secrets_before,
+        "段3 连接检查不得重写 endpoint_secrets（含 nonce）"
+    );
+    assert!(
+        mgr.snapshot().endpoint(EID).is_none(),
+        "段3 连接检查不得产生运行态"
+    );
+
+    // === 段 4：手动启动（复用已存凭据） ===
+    let (s, v) = post_json(app.clone(), &format!("/api/v1/endpoints/{EID}/start"), "{}").await;
+    assert_eq!(s, StatusCode::OK, "段4 手动启动: {v}");
+    assert_eq!(v["started"], EID, "段4: {v}");
+    common::wait_until(15, || {
+        mgr.snapshot()
+            .endpoint(EID)
+            .is_some_and(|s| s.state == "RUNNING")
+    })
+    .await;
+    // 常驻 Driver 同样是真实子进程：它的 OpenConnection 也落盘 ⇒ 启动复用的仍是明文。
+    let started_recv: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&start_cap).expect("常驻 Driver 的 OpenConnection 必须落盘"),
+    )
+    .unwrap();
+    assert_eq!(
+        started_recv["password"], PW,
+        "段4 启动送到常驻 Driver 的必须是明文: {started_recv}"
+    );
+    assert!(
+        !started_recv.to_string().contains("secret_set"),
+        "段4 marker 绝不进入 Driver: {started_recv}"
+    );
+
+    // 数据确实产出（证据形式：REST 最新值面出现该点，且数值持续推进）。
+    let (s, v) = get_json(app.clone(), "/api/v1/points/latest").await;
+    assert_eq!(s, StatusCode::OK, "段4 最新值: {v}");
+    let point = v["points"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["point_key"] == "c3e.counter")
+        .cloned()
+        .unwrap_or_else(|| panic!("段4 启动后必须产出采集数据: {v}"));
+    assert_eq!(point["endpoint_id"], EID, "段4: {point}");
+    assert_eq!(point["type"], "f64", "段4: {point}");
+    assert_eq!(point["quality"], "GOOD", "段4: {point}");
+    let first = point["value"].as_f64().expect("段4 最新值必须是数值");
+    common::wait_until(15, || {
+        c3e_latest(&mgr, "c3e.counter").is_some_and(|x| x > first)
+    })
+    .await;
+    let (s, v) = get_json(app.clone(), &format!("/api/v1/endpoints/{EID}/diagnostics")).await;
+    assert_eq!(s, StatusCode::OK, "段4 诊断: {v}");
+    assert_eq!(v["point_count"], 1, "段4 点表必须已分配: {v}");
+    assert_eq!(v["connection_state"], "RUNNING", "段4: {v}");
+    // 持久化面：启动的合法变化只有期望态 / point_map / updated_at_ns。
+    let st4 = c3e_state(&store, EID);
+    assert_eq!(st4["desired_running"], true, "段4 期望态必须置 true");
+    let pm = st4["point_map"].as_object().unwrap();
+    assert_eq!(pm.len(), 1, "段4 只应有一个采集点: {pm:?}");
+    assert_eq!(
+        pm["c3e.counter"].as_u64(),
+        Some(1),
+        "段4 point_id 由 Core 分配并持久化: {pm:?}"
+    );
+    assert_changed_within(
+        &st2,
+        &st4,
+        &["desired_running", "point_map", "updated_at_ns"],
+        "段4 手动启动",
+    );
+    assert_eq!(st4["tasks"], st2["tasks"], "段4 启动不得改动任务面");
+    assert_eq!(st4["password_secret"], PW, "段4 启动不得改动 Secret");
+    assert_eq!(
+        c3e_raw_secret_rows(&db),
+        raw_secrets_before,
+        "段4 启动不得重写 endpoint_secrets"
+    );
+
+    // === 段 4b：运行中的连接检查（C3-08：不得停止/重启既有 Endpoint） ===
+    let before_running_probe = c3e_state(&store, EID);
+    let value_before_probe = c3e_latest(&mgr, "c3e.counter").expect("段4b 预置：已开始出数");
+    // 「不重启」的判据用 **stream_epoch**：每次成功 Start 都会拿到新 epoch
+    //（§10/§17），因此 epoch 不变 = 这个 Endpoint 的运行会话从未被停掉重起。
+    // 这比 PID 集合更稳且更有语义；PID 级证据见 subprocess_orphan_guard 的 C3-08。
+    let epoch_before_probe = mgr
+        .snapshot()
+        .endpoint(EID)
+        .expect("段4b 预置：运行态必须存在")
+        .epoch;
+    assert!(
+        epoch_before_probe > 0,
+        "段4b 预置：成功 Start 后 epoch 必须非 0（否则下面的「epoch 不变」是空断言）"
+    );
+    let (s, v) = post_json(
+        app.clone(),
+        &uri_check,
+        &probe_body(serde_json::json!({
+            "password": { "secret_set": true },
+            "capture_path": running_probe_cap.to_string_lossy(),
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "段4b 运行中探测: {v}");
+    assert_eq!(v["reachable"], true, "段4b: {v}");
+    assert_eq!(
+        mgr.snapshot().endpoint(EID).map(|s| s.state),
+        Some("RUNNING".to_string()),
+        "段4b 连接检查不得停止/重启既有 Endpoint"
+    );
+    assert_eq!(
+        mgr.snapshot().endpoint(EID).map(|s| s.epoch),
+        Some(epoch_before_probe),
+        "段4b 连接检查不得重启既有 Endpoint（stream_epoch 必须不变）"
+    );
+    // 未被重启/断流：采集值必须继续推进（重启会重置 epoch 并断流）。
+    common::wait_until(15, || {
+        c3e_latest(&mgr, "c3e.counter").is_some_and(|x| x > value_before_probe)
+    })
+    .await;
+    let running_recv: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&running_probe_cap).expect("运行中探测也必须落盘"),
+    )
+    .unwrap();
+    assert_eq!(
+        running_recv["password"], PW,
+        "段4b 运行中探测同样必须送明文: {running_recv}"
+    );
+    assert_eq!(
+        c3e_state(&store, EID),
+        before_running_probe,
+        "段4b 连接检查不得修改任何持久化状态"
+    );
+    assert_eq!(
+        c3e_raw_secret_rows(&db),
+        raw_secrets_before,
+        "段4b 连接检查不得重写 endpoint_secrets"
+    );
+
+    drop(guard);
+    let logged = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        !logged.is_empty(),
+        "预置：trace 级必须实际产出日志（否则本断言是空断言）"
+    );
+    assert!(!logged.contains(PW), "链路上任何日志都不得出现明文 Secret");
+
+    // === 段 5：停止 ===
+    let (s, v) = post_json(app.clone(), &format!("/api/v1/endpoints/{EID}/stop"), "{}").await;
+    assert_eq!(s, StatusCode::OK, "段5 停止: {v}");
+    assert_eq!(v["was_running"], true, "段5: {v}");
+    assert!(!mgr.is_running(EID), "段5 停止后不得仍在运行");
+    common::wait_until(15, || {
+        mgr.snapshot()
+            .endpoint(EID)
+            .is_some_and(|s| s.state == "STOPPED")
+    })
+    .await;
+    let (s, v) = get_json(app.clone(), &format!("/api/v1/endpoints/{EID}/state")).await;
+    assert_eq!(s, StatusCode::OK, "段5 状态: {v}");
+    assert_eq!(v["state"], "STOPPED", "段5 状态必须为 STOPPED: {v}");
+    let st5 = c3e_state(&store, EID);
+    assert_eq!(st5["desired_running"], false, "段5 期望态必须回落 false");
+    assert_changed_within(
+        &st4,
+        &st5,
+        &["desired_running", "updated_at_ns"],
+        "段5 停止",
+    );
+    assert_eq!(
+        st5["connection_json"], st4["connection_json"],
+        "段5 不得改动连接"
+    );
+    assert_eq!(st5["password_secret"], PW, "段5 不得改动 Secret");
+    assert_eq!(st5["point_map"], st4["point_map"], "段5 不得改动 point_map");
+    assert_eq!(st5["tasks"], st4["tasks"], "段5 不得改动任务面");
+    assert_eq!(
+        c3e_raw_secret_rows(&db),
+        raw_secrets_before,
+        "段5 停止不得重写 endpoint_secrets"
+    );
+
+    mgr.shutdown_all().await;
+}
+
+/// C3-01：设备不可达时仍可仅保存合法配置，**零 Probe、零 Start**。
+///
+/// 两半证据：
+/// ① 夹具级「会连不上」的设备（test-driver `probe_mode=unreachable` +
+///    `probe_delay_ms=60000` + `capture_path`）：保存请求必须快速返回 201，且
+///    capture 文件不存在 ⇒ 保存路径没有发起任何 OpenConnection（零 Probe），
+///    也没有启动（零 Start）；
+/// ② 真实网络不可达（s7 → loopback 关闭端口，非夹具注入）：保存同样放通，
+///    事后显式探测确认「不可达」不是假象。
+///
+/// ①的耗时 + 落盘证据能代表两个创建入口：`POST /api/v1/device-bootstrap` 与
+/// `POST /api/v1/endpoints` 都不含任何探测调用（探测只存在于 connection-check
+/// 与 `/drivers/{id}/probe`），②再补一条真实网络不可达的保存证据。
+#[tokio::test]
+async fn c3e_unreachable_device_offline_save_is_zero_probe_and_zero_start() {
+    const PW: &str = "pw-c3e-unreachable";
+    let tmp = ProbeTempDir::new("c3e-unreachable");
+    let db = tmp.file("mesa.db");
+    let save_cap = tmp.file("must-not-exist-after-save.json");
+    let probe_cap = tmp.file("unreachable-probe.json");
+
+    let store = Arc::new(ConfigStore::open(&db).unwrap());
+    let staged = common::staged_drivers_with_test_driver();
+    let drivers_dir = staged.path().clone();
+    // 同上：复刻生产装配（持久版 ID 源），否则「离线保存」之外的一切都与 mesad 不同源。
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::with_source(
+        &drivers_dir,
+        Arc::new(mesa_driver_manager::StorePointIdSource::new(Arc::clone(
+            &store,
+        ))),
+    ));
+    let state = mesa_core_api::AppState::try_new_with_control(
+        Arc::clone(&mgr),
+        Arc::clone(&store),
+        drivers_dir.to_string_lossy().to_string(),
+        false,
+    )
+    .unwrap();
+    let app = mesa_core_api::router(state);
+    warm_descriptor(&app, "test-driver").await;
+
+    // ① 夹具注入的不可达设备：离线保存必须成功，且全程不接触设备。
+    let started = std::time::Instant::now();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/device-bootstrap",
+        &serde_json::json!({
+            "device": { "id": "c3e-ud1", "name": "UD1" },
+            "endpoint": {
+                "id": "c3e-u1",
+                "name": "U1",
+                "driver_id": "test-driver",
+                "connection": {
+                    "password": PW,
+                    "probe_mode": "unreachable",
+                    "probe_delay_ms": 60000,
+                    "capture_path": save_cap.to_string_lossy(),
+                },
+            },
+            "acquisition": { "tasks": [] },
+            "start": false,
+            "idempotency_key": "c3e-ud-1",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "① 不可达设备必须能离线保存: {v}");
+    assert_eq!(v["started"], false, "① 必须不启动: {v}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "① 保存不得探测设备（耗时 {:?}；探测路径 Open 预算 5s 起，且本设备注入 60s 延迟）",
+        started.elapsed()
+    );
+    assert!(
+        !save_cap.exists(),
+        "① 零 Probe / 零 Start 的结构证据：没有任何 OpenConnection"
+    );
+    assert!(
+        store.list_tasks("c3e-u1").unwrap().is_empty(),
+        "① 零采集点：tasks 必须为空"
+    );
+    assert!(
+        !store
+            .get_endpoint("c3e-u1")
+            .unwrap()
+            .unwrap()
+            .desired_running,
+        "① 期望态必须为 false"
+    );
+    assert!(
+        mgr.snapshot().endpoint("c3e-u1").is_none(),
+        "① 保存不得产生运行态"
+    );
+
+    // ② 同一 Endpoint 在**显式请求探测**时确实不可达 —— 证明①保存成功的设备真的连不上。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/c3e-u1/connection-check",
+        &probe_body(serde_json::json!({
+            "probe_mode": "unreachable",
+            "probe_delay_ms": 0,
+            "capture_path": probe_cap.to_string_lossy(),
+        })),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "② 不可达是 200 + reachable:false（不是 5xx）: {v}"
+    );
+    assert_eq!(v["reachable"], false, "②: {v}");
+    assert_eq!(v["warnings"][0]["code"], "CONNECTION_FAILED", "②: {v}");
+    assert!(
+        probe_cap.exists(),
+        "② 显式探测确实建立了临时连接（与①的零接触形成对照）"
+    );
+    assert!(
+        mgr.snapshot().endpoint("c3e-u1").is_none(),
+        "② 连接检查不得产生运行态"
+    );
+
+    // ③ 真实网络不可达（loopback 关闭端口）：走另一条创建入口（device + endpoint）。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/devices",
+        r#"{"id":"c3e-ud2","name":"UD2"}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "③ 建设备: {v}");
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        r#"{"id":"c3e-u2","name":"U2","device_id":"c3e-ud2","driver_id":"s7","connection":{"host":"127.0.0.1","port":9}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "③ 不可达设备必须能离线保存: {v}");
+    let rec = store.get_endpoint("c3e-u2").unwrap().unwrap();
+    assert!(!rec.desired_running, "③ 创建即保持 STOPPED");
+    assert!(
+        store.list_tasks("c3e-u2").unwrap().is_empty(),
+        "③ 零采集点：tasks 必须为空"
+    );
+    assert!(
+        mgr.snapshot().endpoint("c3e-u2").is_none(),
+        "③ 不得产生运行态"
+    );
+    // 事后显式探测确认它确实不可达。草稿必须自带**非 Secret** 字段：按
+    // `resolve_connection_draft` 的 NOTE「非 Secret 字段不做继承」，缺省继承只
+    // 适用于契约 §4 的 Secret 字段，可见字段走整体替换 + required 裁决——空草稿
+    // 会得到 400 `REQUIRED host`，这不是缺陷而是与 PUT 同源的语义。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/c3e-u2/connection-check",
+        &probe_body(serde_json::json!({"host": "127.0.0.1", "port": 9})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "③ 探测: {v}");
+    assert_eq!(v["reachable"], false, "③ s7 关闭端口必须不可达: {v}");
+    assert_eq!(v["warnings"][0]["code"], "CONNECTION_FAILED", "③: {v}");
+
+    mgr.shutdown_all().await;
+}
