@@ -391,12 +391,18 @@ describe("M4.2 AddDeviceFlow：正向 bootstrap 请求体（C2）", () => {
     };
   }
 
-  /** 从设备步一路走到确认页（④），返回过程中截获的请求记录。 */
-  async function walkToConfirmPage() {
+  /** 从设备步一路走到确认页（④），返回过程中截获的请求记录。
+   *  `withPoints=false`：不加入任何采集点（C3-D 零采集点离线保存路径）。
+   *  `startWhenPoints`：在数据步**明确勾选**「创建后启动」（默认不勾选）。
+   *  `reuse`：复用已挂载的流程容器（用于「再建一个」之后在同一实例上再走一遍）。 */
+  async function walkToConfirmPage(
+    opts: { withPoints?: boolean; startWhenPoints?: boolean; reuse?: { container: HTMLElement } } = {},
+  ) {
+    const withPoints = opts.withPoints ?? true;
     const calls = mockFlow({ descriptor: DESC_C2 });
     const user = userEvent.setup();
     const mark = makeStageMarker();
-    const { container } = renderFlow();
+    const container = opts.reuse ? opts.reuse.container : renderFlow().container;
     mark("rendered");
 
     // ① 设备：ID 与显示名都要落进 device.id / device.name（断言在下面的请求体里）
@@ -423,34 +429,62 @@ describe("M4.2 AddDeviceFlow：正向 bootstrap 请求体（C2）", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: /下一步：数据/ }));
 
-    // ③ 数据：选资源参数 + 输出，加入采集项（required 的 offset 无默认值必须填）
+    // ③ 数据
     await screen.findByText("③ 数据");
     mark("③ 数据就绪");
-    fireEvent.change(container.querySelector('[data-field-key="offset"] input')!, {
-      target: { value: "4" },
-    });
-    const outputBox = screen.getByRole("checkbox", { name: "output-value" });
-    fireEvent.click(outputBox.querySelector("input") ?? outputBox);
-    const flagBox = screen.getByRole("checkbox", { name: "output-flag" });
-    fireEvent.click(flagBox.querySelector("input") ?? flagBox);
-    // 注意：antd 会给「两个汉字」的按钮自动插入空格，故用 /加\s*入/ 而不是精确串
-    fireEvent.click(screen.getByRole("button", { name: /加\s*入/ }));
-    // 采集项确实进了草稿（加入成功后 picker 会清空输出表单，改看流程自身的已选计数）
-    expect(screen.getByText(/已选 1 项/)).toBeTruthy();
-    fireEvent.change(screen.getByText("采集周期").parentElement!.querySelector("input")!, {
-      target: { value: "2000" },
-    });
+    if (withPoints) {
+      // 选资源参数 + 输出，加入采集项（required 的 offset 无默认值必须填）
+      fireEvent.change(container.querySelector('[data-field-key="offset"] input')!, {
+        target: { value: "4" },
+      });
+      const outputBox = screen.getByRole("checkbox", { name: "output-value" });
+      fireEvent.click(outputBox.querySelector("input") ?? outputBox);
+      const flagBox = screen.getByRole("checkbox", { name: "output-flag" });
+      fireEvent.click(flagBox.querySelector("input") ?? flagBox);
+      // 注意：antd 会给「两个汉字」的按钮自动插入空格，故用 /加\s*入/ 而不是精确串
+      fireEvent.click(screen.getByRole("button", { name: /加\s*入/ }));
+      // 采集项确实进了草稿（加入成功后 picker 会清空输出表单，改看流程自身的已选计数）
+      expect(screen.getByText(/已选 1 项/)).toBeTruthy();
+      fireEvent.change(screen.getByText("采集周期").parentElement!.querySelector("input")!, {
+        target: { value: "2000" },
+      });
+      // C3-D：默认**不启动**（复选框未勾选且可用）——启动必须是用户的明确动作
+      const startBox = screen.getByRole("checkbox", { name: /创建后启动/ }) as HTMLInputElement;
+      expect(startBox.checked).toBe(false);
+      expect(startBox.disabled).toBe(false);
+      if (opts.startWhenPoints) {
+        fireEvent.click(startBox.querySelector("input") ?? startBox);
+        expect(
+          (screen.getByRole("checkbox", { name: /创建后启动/ }) as HTMLInputElement).checked,
+        ).toBe(true);
+        // 勾选后才出现「立即开始采集」的提示
+        expect(screen.getByText(/创建成功后立即开始采集/)).toBeTruthy();
+      }
+    } else {
+      // 零采集点：界面必须明确「仅保存、不启动、不立即采集」，且启动开关不可用
+      await screen.findByText(/未选择数据点：将按「仅保存」创建/);
+      const startBox = screen.getByRole("checkbox", { name: /创建后启动/ }) as HTMLInputElement;
+      expect(startBox.disabled).toBe(true);
+      expect(startBox.checked).toBe(false);
+    }
     fireEvent.click(screen.getByRole("button", { name: /下一步：确认/ }));
 
     // ④ 确认页（此前不可达）
     await screen.findByText("④ 确认 · 最终按钮才真正提交");
     mark("④ 确认页就绪");
-    expect(screen.getByText(/1 个数据点 · 2000ms/)).toBeTruthy();
-    return { calls, user };
+    if (withPoints) {
+      expect(screen.getByText(/1 个数据点 · 2000ms/)).toBeTruthy();
+    } else {
+      expect(screen.getByText(/零采集点（仅保存连接）/)).toBeTruthy();
+      expect(screen.getByText(/仅保存（不启动、不立即采集）/)).toBeTruthy();
+    }
+    return { calls, user, container };
   }
 
   it("走到确认页后提交：请求体含 Device / Endpoint / Connection(canonical, 含 TSAP) / 采集任务", async () => {
-    const { calls, user } = await walkToConfirmPage();
+    // C3-D：启动是**用户的明确动作**——在数据步显式勾选「创建后启动」
+    //（walker 已断言初始未勾选；零采集点路径另有用例）
+    const { calls, user } = await walkToConfirmPage({ startWhenPoints: true });
 
     await user.click(screen.getByRole("button", { name: "添加设备" }));
     await waitFor(() =>
@@ -538,4 +572,53 @@ describe("M4.2 AddDeviceFlow：正向 bootstrap 请求体（C2）", () => {
     // 重试必须复用同一 operation key（后端据此重放而不是再建一台设备）
     expect(key(bootstraps()[1])).toBe(key(bootstraps()[0]));
   }, FULL_FLOW_TIMEOUT_MS);
+
+  // -------------------------------------------------------------------------
+  // C3-D：零采集点离线保存 + 默认不启动
+  // -------------------------------------------------------------------------
+
+  it("零采集点 + 未勾选启动：请求体 acquisition.tasks=[] 且 start=false（只保存，不启动）", async () => {
+    const { calls, user } = await walkToConfirmPage({ withPoints: false });
+
+    await user.click(screen.getByRole("button", { name: "添加设备" }));
+    await waitFor(() =>
+      expect(calls.some((c) => c.url === "/api/v1/device-bootstrap")).toBe(true),
+    );
+
+    const writes = calls.filter((c) => c.method !== "GET");
+    // 只发一次原子创建请求（不得退化成 create device / endpoint / tasks 分步编排）
+    expect(writes.map((c) => c.url)).toEqual(["/api/v1/device-bootstrap"]);
+    const body = writes[0].body as {
+      device: { id: string };
+      endpoint: { id: string; driver_id: string; connection: Record<string, unknown> };
+      acquisition: { tasks: unknown[] };
+      start: boolean;
+    };
+    // 设备与连接照常提供（跳过采集点**不**绕过连接校验/Secret 物化）
+    expect(body.device.id).toBe("CNC-01");
+    expect(body.endpoint.id).toBe("s7-ep-01");
+    expect(body.endpoint.driver_id).toBe("s7");
+    expect(body.endpoint.connection).toMatchObject({ host: "10.0.0.5", local_tsap: 1280 });
+    // 关键：零采集点 = tasks: []，而不是「一个 selections 为空的假任务」
+    expect(body.acquisition.tasks).toEqual([]);
+    expect(body.start).toBe(false);
+
+    // 成功路径照常（设备已建好、保持停止）
+    await screen.findByText(/已添加设备 CNC-01/);
+  }, FULL_FLOW_TIMEOUT_MS);
+
+  it("再建一个设备：Reset 后「创建后启动」回到默认不勾选（不继承上次状态）", async () => {
+    // 第一次：用户在数据步明确勾选启动
+    const { user, container } = await walkToConfirmPage({ startWhenPoints: true });
+
+    // 回到确认页操作区点「再建一个」
+    await screen.findByText("④ 确认 · 最终按钮才真正提交");
+    await user.click(screen.getByRole("button", { name: "再建一个" }));
+    await screen.findByText("① 设备");
+
+    // 第二遍走到数据步：walker 内置断言「复选框未勾选且可用」——即默认不启动
+    await walkToConfirmPage({ reuse: { container } });
+    // 确认页文案也必须是「仅保存」，不得因为上次勾过就启动
+    expect(screen.getByText(/仅保存（不启动、不立即采集）/)).toBeTruthy();
+  }, 30_000);
 });

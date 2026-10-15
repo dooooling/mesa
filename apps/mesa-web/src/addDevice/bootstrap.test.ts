@@ -21,13 +21,16 @@ function client(body: Record<string, unknown>, status = 201): BootstrapClient & 
 }
 
 describe("isDraftComplete", () => {
-  it("三步齐全才可提交", () => {
+  it("设备与连接齐全才可提交；采集点可以为空（C3-D 离线保存）", () => {
     expect(isDraftComplete({ device: null, connection: null, acquisition: null })).toBe(false);
     expect(isDraftComplete({ ...DRAFT, device: { deviceId: "", deviceName: "" } } as never)).toBe(false);
     expect(isDraftComplete({ device: DRAFT.device, connection: null, acquisition: DRAFT.acquisition })).toBe(false);
+    // C3-D：零采集点**不再**阻断提交（跳过采集点不得绕过设备/连接两道硬前置）
     expect(
       isDraftComplete({ device: DRAFT.device, connection: DRAFT.connection, acquisition: { ...DRAFT.acquisition, selections: [] } }),
-    ).toBe(false);
+    ).toBe(true);
+    // 但没有 acquisition 草稿（数据步未提交）仍然不可提交
+    expect(isDraftComplete({ device: DRAFT.device, connection: DRAFT.connection, acquisition: null })).toBe(false);
     expect(isDraftComplete(DRAFT)).toBe(true);
   });
 });
@@ -99,5 +102,44 @@ describe("bootstrapDevice（原子接口）", () => {
     expect(r.ok).toBe(false);
     expect(r.failedStep).toBe("create-device");
     expect(r.residual).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // C3-D：零采集点（仅保存）与「默认不启动」
+  // -------------------------------------------------------------------------
+
+  it("零采集点：acquisition.tasks 必须是空数组，且绝不生成空 selections 的假任务", async () => {
+    const c = client({ device_id: "cnc-01", endpoint_id: "s7-ep", revision: 1, started: false });
+    const draft = {
+      ...DRAFT,
+      acquisition: { intervalMs: 1000, selections: [], startAfterCreate: false },
+    };
+    const r = await bootstrapDevice(c, draft);
+    expect(r.ok).toBe(true);
+    const b = c.calls[0] as { acquisition: { tasks: unknown[] }; start: unknown };
+    // 后端契约：tasks=[] 表示「本次不建任务」（bootstrap.rs 的 !acq.tasks.is_empty() 分支）
+    expect(b.acquisition.tasks).toEqual([]);
+    expect(b.start).toBe(false);
+  });
+
+  it("零采集点 + 草稿里误置 start=true：仍然只发 start=false（不发自相矛盾的组合）", async () => {
+    const c = client({ device_id: "cnc-01", endpoint_id: "s7-ep", revision: 1, started: false });
+    const draft = {
+      ...DRAFT,
+      acquisition: { intervalMs: 1000, selections: [], startAfterCreate: true },
+    };
+    await bootstrapDevice(c, draft);
+    const b = c.calls[0] as { acquisition: { tasks: unknown[] }; start: unknown };
+    expect(b.acquisition.tasks).toEqual([]);
+    expect(b.start).toBe(false);
+  });
+
+  it("有采集点但未勾选启动：tasks 正常、start=false（默认不启动）", async () => {
+    const c = client({ device_id: "cnc-01", endpoint_id: "s7-ep", revision: 1, started: false });
+    const draft = { ...DRAFT, acquisition: { ...DRAFT.acquisition, startAfterCreate: false } };
+    await bootstrapDevice(c, draft);
+    const b = c.calls[0] as { acquisition: { tasks: unknown[] }; start: unknown };
+    expect(b.acquisition.tasks).toHaveLength(1);
+    expect(b.start).toBe(false);
   });
 });

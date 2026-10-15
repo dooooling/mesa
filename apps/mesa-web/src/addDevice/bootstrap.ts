@@ -20,8 +20,15 @@ export interface ConnectionDraft {
 
 export interface AcquisitionDraft {
   intervalMs: number;
+  /** 采集点选择；**允许为空**（C3-D：零采集点 = 仅保存设备与连接）。 */
   selections: ResourceSelection[];
-  /** 创建后启动（默认 true；关闭则建完保持 STOPPED）。 */
+  /**
+   * 创建后启动。
+   *
+   * C3-D 起默认 **false**（离线保存优先）：只有用户在数据步**明确勾选**才发送
+   * `start: true`。理由是「设备还没开机/采集点还没定」是常态，默认启动会把
+   * 用户推到一个必然失败或空转的运行态。
+   */
   startAfterCreate: boolean;
 }
 
@@ -37,11 +44,18 @@ export const EMPTY_ADD_DEVICE_DRAFT: AddDeviceDraft = {
   acquisition: null,
 };
 
-/** draft 完整性：确认页“添加设备”按钮的启用条件。 */
+/**
+ * draft 完整性：确认页「添加设备」按钮的启用条件。
+ *
+ * C3-D：**采集点可以为空**（离线保存：先建好设备与连接，采集点稍后补），因此不再
+ * 要求 `selections.length > 0`。但设备与连接仍是硬前置——连接参数缺失或未通过
+ * 描述符/Secret 校验时，本函数依旧返回 false，跳过采集点**不会**绕过这些门禁
+ * （ConnectionSetupPanel 的前置门与 `commitConnection` 的守卫都在更前面）。
+ */
 export function isDraftComplete(d: AddDeviceDraft): boolean {
   if (!d.device || !d.device.deviceId.trim()) return false;
   if (!d.connection || !d.connection.driverId || !d.connection.endpointId.trim()) return false;
-  if (!d.acquisition || d.acquisition.selections.length === 0) return false;
+  if (!d.acquisition) return false;
   return true;
 }
 
@@ -100,6 +114,12 @@ export function newOperationKey(): string {
 /**
  * 原子提交：一次 POST /device-bootstrap。connection/acquisition 的请求体
  * 构造沿用 deviceModel（cleanConnection 由调用方完成，此处只组装）。
+ *
+ * C3-D 零采集点：`selections` 为空时发送 `acquisition.tasks = []`，
+ * **绝不**生成「selections 为空」的假任务——那是一条真实任务，后端会把它入库，
+ * 而空 selections 在驱动侧 `configure` 里必然被拒（`test-driver` 即
+ * `INVALID_BINDING_CONFIG: selections 不能为空`），等于把创建失败推迟到启动时。
+ * 后端对 `tasks: []` 的支持见 `crates/core-api/src/bootstrap.rs`（`if !acq.tasks.is_empty()`）。
  */
 export async function bootstrapDevice(
   client: BootstrapClient,
@@ -107,6 +127,17 @@ export async function bootstrapDevice(
   opts?: { idempotencyKey?: string },
 ): Promise<BootstrapReport> {
   const { device, connection, acquisition } = draft;
+  // 零采集点：空数组，不是「一个空任务」。
+  const tasks =
+    acquisition.selections.length === 0
+      ? []
+      : [
+          {
+            id: "t1",
+            schedule: { mode: "poll", interval_ms: acquisition.intervalMs },
+            binding: { kind: "mesa.resources.v1", config: { selections: acquisition.selections } },
+          },
+        ];
   const res = await client.deviceBootstrap({
     device: { id: device.deviceId, name: device.deviceName || device.deviceId },
     endpoint: {
@@ -115,16 +146,11 @@ export async function bootstrapDevice(
       driver_id: connection.driverId,
       connection: connection.connection,
     },
-    acquisition: {
-      tasks: [
-        {
-          id: "t1",
-          schedule: { mode: "poll", interval_ms: acquisition.intervalMs },
-          binding: { kind: "mesa.resources.v1", config: { selections: acquisition.selections } },
-        },
-      ],
-    },
-    start: acquisition.startAfterCreate,
+    acquisition: { tasks },
+    // 零采集点时**必然**不发启动：没有采集点的运行态是空转，且会与「仅保存」的
+    // 用户意图矛盾。这里再兜一道（UI 已强制 false），确保任何调用方都发不出
+    // 「tasks=[] + start=true」这种自相矛盾的组合。
+    start: tasks.length > 0 && acquisition.startAfterCreate,
     idempotency_key: opts?.idempotencyKey ?? newOperationKey(),
   });
   const b = res.body ?? {};
