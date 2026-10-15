@@ -132,9 +132,17 @@ Content-Type: application/json
 - **Secret 表按 Endpoint 维度**：`endpoint_secrets(endpoint_id, field_path, ...)`
   （`crates/config-store/src/lib.rs`：写入 1056/1100/1281/1854，删除 1108，读取 `get_secret` 1869）。
   ⇒ **C3-07 的跨 Endpoint 隔离有 schema 层面的支撑**，实现时只需保证查询始终带 `endpoint_id`。
-- **可复用的物化入口**：`crates/core-api/src/runtime.rs` 的 `build_runtime_endpoint`（C1 建立的
-  统一构造路径，`materialize_connection` 在坏 JSON 上 fail-closed）。C3 必须复用它，
-  不另写一套 Secret/connection 物化。
+- **可复用的边界（重要，勿误用）**：C3 **不得**直接调用
+  `crates/core-api/src/runtime.rs` 的 `build_runtime_endpoint()`。
+  该函数读取的是**已持久化**的完整 Endpoint 配置，并施加 **Data Tasks / Event Tasks 门禁**，
+  而 C3 检查的对象是**尚未保存的连接草稿**。直接调用会导致两个错误：
+  1. 测试的是**旧持久化参数**，而不是用户刚修改的草稿；
+  2. 已保存任务的合法性会**干扰**本来只需要检查连接的操作。
+
+  正确做法：复用 C1 的 **Secret 物化底层能力**（`runtime.rs` 中
+  `materialize_connection()` 一类的原语，在坏 JSON 上 fail-closed），
+  必要时在 Core 内提取一个**小型共享辅助函数**，使其能处理**内存中的草稿配置**。
+  不得为此新建 SecretStore、通用 Resolver 框架或第二套连接模型。
 - **bootstrap 已支持离线保存**：
   - `crates/core-api/src/bootstrap.rs:29` `start: Option<bool>`；
   - `:221` `if !acq.tasks.is_empty()` ⇒ **`tasks=[]` 可用**；
