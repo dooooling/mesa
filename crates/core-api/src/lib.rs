@@ -22,6 +22,8 @@ use tokio_util::sync::CancellationToken;
 
 pub mod bootstrap;
 pub mod certificates;
+/// C3-A：Endpoint-bound 连接检查（尚未保存的连接草稿，只读、无副作用）。
+pub(crate) mod connection_check;
 pub mod runtime;
 use certificates::CertStore;
 
@@ -490,6 +492,69 @@ fn redact_connection_for_response(
     conn
 }
 
+/// Secret 引用失败的两种语义。**必须分开映射，不得合并**：
+///
+/// - [`SecretRefError::Missing`]：`{"secret_set": true}` 指向的 Secret 在**该
+///   Endpoint、该字段**上不存在。调用方按「引用无效」处理（REST 400）。用户在
+///   界面上看到「已保存凭据」而服务端却查无记录时必须明说，绝不能静默降级成
+///   不带凭据的连接（那会把「凭据丢了」伪装成「设备不需要认证」）。
+/// - [`SecretRefError::Store`]：SecretStore 基础设施故障（`master.key` 缺失或
+///   内容非法、AEAD 解密失败、SQLite 错误）。调用方**一律**映射 503，这是硬
+///   红线：密钥丢失/密文损坏既不是参数错误也不是设备不可达，把它显示成后者会
+///   引导用户去查网络，而真正要修的是密钥；更不允许降级为匿名连接。
+#[derive(Debug)]
+pub(crate) enum SecretRefError {
+    /// 引用无效：marker 存在但该 Endpoint 上没有这条 Secret（字段名不含明文）。
+    Missing(String),
+    /// SecretStore 不可用（原因保留在 StoreError 内，绝不篡改分类）。
+    Store(StoreError),
+}
+
+/// SecretStore 读取的**唯一**底层入口（C1 运行期构造与 C3 草稿检查共用）。
+///
+/// 为什么值得单独抽一层：调用方需要区分的是「没有这条 Secret」（`Ok(None)`，
+/// 语义由调用方决定）与「读不出来」（`Err`，一律基础设施故障），而
+/// `StoreError` 自身无法表达这个区别（缺记录与解密失败在业务语义上完全不同）。
+pub(crate) fn read_stored_secret(
+    store: &ConfigStore,
+    endpoint_id: &str,
+    field: &str,
+) -> Result<Option<String>, StoreError> {
+    store.get_secret(endpoint_id, field)
+}
+
+/// C1 Secret 物化原语（仅内存）：把对象上 `{"secret_set": true}` marker 就地
+/// 还原为明文，返回被物化的字段名（**只有字段名，不含明文**，供诊断与测试）。
+///
+/// 为什么是共享函数而不是各自实现：运行期 Endpoint 构造
+/// （[`materialize_connection`]）与 C3 的**内存草稿**检查必须使用完全相同的
+/// marker 语义。两处各写一遍，迟早会在「什么算 marker」「marker 缺 Secret 时
+/// 算失败还是算空」上分叉，而这类分叉的后果就是把 marker 当密码发给 Driver，
+/// 或把丢凭证伪装成匿名连接。本函数只做物化、不做策略：缺记录与读失败一律
+/// 上抛，由调用方映射状态码。
+pub(crate) fn materialize_secret_markers_in_place(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    endpoint_id: &str,
+    store: &ConfigStore,
+    secret_keys: &[String],
+) -> Result<Vec<String>, SecretRefError> {
+    let mut materialized = Vec::new();
+    for key in secret_keys {
+        if let Some(cur) = obj.get(key).cloned() {
+            if is_secret_marker(&cur) {
+                match read_stored_secret(store, endpoint_id, key).map_err(SecretRefError::Store)? {
+                    Some(pt) => {
+                        obj.insert(key.clone(), serde_json::Value::String(pt));
+                        materialized.push(key.clone());
+                    }
+                    None => return Err(SecretRefError::Missing(key.clone())),
+                }
+            }
+        }
+    }
+    Ok(materialized)
+}
+
 /// 启动/探测时：将 marker 临时还原为明文（仅内存，不写盘）。
 ///
 /// fail-closed（C1 P0）：`connection_json` 必须是**合法 JSON 对象**。此前用
@@ -503,29 +568,20 @@ fn materialize_connection(
     secret_keys: &[String],
 ) -> Result<String, StoreError> {
     let mut v: serde_json::Value = serde_json::from_str(conn_str).map_err(StoreError::Json)?;
-    if !v.is_object() {
+    let Some(obj) = v.as_object_mut() else {
         return Err(StoreError::Validation(format!(
             "connection_json 必须是 JSON 对象（endpoint `{endpoint_id}`）"
         )));
-    }
-    if let Some(obj) = v.as_object_mut() {
-        for key in secret_keys {
-            if let Some(cur) = obj.get(key).cloned() {
-                if is_secret_marker(&cur) {
-                    match store.get_secret(endpoint_id, key) {
-                        Ok(Some(pt)) => {
-                            obj.insert(key.clone(), serde_json::Value::String(pt));
-                        }
-                        Ok(None) => {
-                            return Err(StoreError::Validation(format!(
-                                "secret `{key}` marker 存在但 SecretStore 无记录 (endpoint `{endpoint_id}`)"
-                            )));
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
+    };
+    match materialize_secret_markers_in_place(obj, endpoint_id, store, secret_keys) {
+        Ok(_) => {}
+        // 错误映射逐字保持 C1 既有行为（错误文本被既有测试与运维检索依赖）
+        Err(SecretRefError::Missing(key)) => {
+            return Err(StoreError::Validation(format!(
+                "secret `{key}` marker 存在但 SecretStore 无记录 (endpoint `{endpoint_id}`)"
+            )));
         }
+        Err(SecretRefError::Store(e)) => return Err(e),
     }
     serde_json::to_string(&v).map_err(StoreError::Json)
 }
@@ -3169,6 +3225,12 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .delete(delete_endpoint),
         )
         .route("/api/v1/endpoints/{id}/state", get(endpoint_state))
+        // C3-A：Endpoint-bound 连接检查。endpoint_id 只来自 URL，driver_id 只读
+        // 已保存记录；请求体形状由 handler 内 deny_unknown_fields 拒绝覆盖。
+        .route(
+            "/api/v1/endpoints/{endpoint_id}/connection-check",
+            post(connection_check::connection_check),
+        )
         .route(
             "/api/v1/endpoints/{id}/diagnostics",
             get(endpoint_diagnostics),

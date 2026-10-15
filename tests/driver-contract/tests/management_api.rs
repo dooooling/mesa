@@ -981,3 +981,453 @@ async fn probe_s7_closed_port_is_unreachable_200() {
     assert_eq!(warnings.len(), 1);
     assert_eq!(warnings[0]["code"], "CONNECTION_FAILED");
 }
+
+// ---------------------------------------------------------------------------
+// C3-A：Endpoint-bound 连接检查（契约 §3/§4/§5）
+// ---------------------------------------------------------------------------
+
+/// C3 专用 app：额外把 store 交回测试，用于逐字比对「检查前后持久化面不变」。
+async fn app_for_connection_check() -> (
+    axum::Router,
+    Arc<ConfigStore>,
+    Arc<mesa_driver_manager::MesaManager>,
+    common::StagedDriversDir,
+) {
+    let store = Arc::new(ConfigStore::open_in_memory().unwrap());
+    let staged = common::staged_drivers_with_test_driver();
+    let drivers_dir = staged.path().clone();
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
+    let state = mesa_core_api::AppState::try_new_with_control(
+        mgr.clone(),
+        Arc::clone(&store),
+        drivers_dir.to_string_lossy().to_string(),
+        false,
+    )
+    .unwrap();
+    (mesa_core_api::router(state), store, mgr, staged)
+}
+
+/// 持久化面快照：connection_json / endpoint_secrets / desired_running /
+/// 更新时间 / 任务面 / 事件任务面。用 JSON 比对而不是逐个字段断言，避免
+/// 「看漏了某一列改了没改」。
+fn persisted_state(store: &ConfigStore, endpoint_id: &str) -> serde_json::Value {
+    let rec = store.get_endpoint(endpoint_id).unwrap().unwrap();
+    serde_json::json!({
+        "endpoint": rec,
+        "secret_fields": store.list_secret_fields(endpoint_id).unwrap(),
+        "password_secret": store.get_secret(endpoint_id, "password").unwrap(),
+        "tasks": store.list_tasks(endpoint_id).unwrap(),
+        "event_tasks": store.list_event_tasks(endpoint_id).unwrap(),
+    })
+}
+
+/// 一次性断言「响应体里没有出现任何明文凭据」。
+fn assert_no_plaintext(v: &serde_json::Value, plaintexts: &[&str]) {
+    let text = v.to_string();
+    for p in plaintexts {
+        assert!(
+            !text.contains(p),
+            "响应体不得出现明文 Secret（命中 {p}）: {text}"
+        );
+    }
+}
+
+/// C3-A 验收 1（+ C3-01 的「零 Probe」半条）：`mode=validate` 校验的是**当前
+/// 草稿**而不是已保存配置，且**完全不调用 Probe**。
+#[tokio::test]
+async fn connection_check_validate_uses_draft_and_never_probes() {
+    let (app, _store, mgr, _staged) = app_for_connection_check().await;
+    let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
+    assert_eq!(s, StatusCode::CREATED);
+    // 已保存配置：合法且带 60s Probe 延迟注入（真被 Probe 会阻塞十几秒）。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        r#"{"id":"e1","name":"E1","device_id":"d1","driver_id":"test-driver","connection":{"probe_delay_ms":60000}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "body: {v}");
+    let before = persisted_state(&_store, "e1");
+
+    // 预热 Descriptor（临时进程 + 缓存），把一次性 spawn 成本移出计时区。
+    let req = Request::builder()
+        .uri("/api/v1/drivers/test-driver/descriptor")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    // ① 草稿非法而**已保存配置合法** → 必须按草稿报 400：若读的是持久化配置
+    //    这里会返回 200，也证明不了「用草稿校验」。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/connection-check",
+        r#"{"mode":"validate","connection":{"probe_delay_ms":"not-an-int"}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+    assert_eq!(v["valid"], false);
+    assert!(
+        v["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["code"] == "INVALID_TYPE"),
+        "body: {v}"
+    );
+
+    // ② 草稿合法（且与已保存值不同）→ 200，且响应是**校验形状**，不是 Probe
+    //    结果形状；耗时必须远小于任何 Probe 路径。
+    //    对账：test-driver 的 probe() 会 sleep(probe_delay_ms)；未配置 timeout_ms
+    //    时 Query 预算 = min(4×5000+3000, PROBE_RPC_TIMEOUT=45s) = 23s，即一旦
+    //    真的走了 Probe，本请求至少 5s 起步（Open 5s + Query 命中同一延迟），
+    //    3s 阈值有足够判别力。
+    let started = std::time::Instant::now();
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/e1/connection-check",
+        r#"{"mode":"validate","connection":{"probe_delay_ms":1000}}"#,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(v["valid"], true, "body: {v}");
+    assert_eq!(v["issues"], serde_json::json!([]), "body: {v}");
+    assert!(
+        v.get("reachable").is_none(),
+        "validate 不得返回 Probe 结论: {v}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "validate 不得调用 Probe（耗时 {elapsed:?}；Probe 路径至少 5s，Query 预算 23s）"
+    );
+
+    // 零副作用：validate 前后持久化面逐字相同，且没有新的 Endpoint/运行态。
+    assert_eq!(
+        persisted_state(&_store, "e1"),
+        before,
+        "validate 不得改持久化面"
+    );
+    assert!(
+        mgr.snapshot()
+            .endpoint("e1")
+            .is_none_or(|s| s.state != "RUNNING"),
+        "连接检查不得启动 Endpoint"
+    );
+}
+
+/// C3-A 验收 2/3/4/5 + 红线 1/3（HTTP 层）：凭据归属、四语义、marker 位置与
+/// 形状、`driver_id` 不可覆盖、`probe` 未实现、响应脱敏。
+#[tokio::test]
+async fn connection_check_secret_semantics_are_endpoint_bound_and_side_effect_free() {
+    let (app, store, _mgr, _staged) = app_for_connection_check().await;
+    let uri_e1 = "/api/v1/endpoints/e1/connection-check";
+    let uri_e2 = "/api/v1/endpoints/e2/connection-check";
+    let uri_e3 = "/api/v1/endpoints/e3/connection-check";
+    let plaintexts = ["pw-of-e1", "pw-of-e2", "pw-fresh"];
+
+    let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
+    assert_eq!(s, StatusCode::CREATED);
+    // e1 有密码；e2/e3 同驱动、同字段但**没有** Secret。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        r#"{"id":"e1","name":"E1","device_id":"d1","driver_id":"opcua","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":"pw-of-e1"}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "body: {v}");
+    for id in ["e2", "e3"] {
+        let (s, v) = post_json(
+            app.clone(),
+            "/api/v1/endpoints",
+            &format!(
+                r#"{{"id":"{id}","name":"{id}","device_id":"d1","driver_id":"opcua","connection":{{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u"}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "body: {v}");
+    }
+
+    let before = persisted_state(&store, "e1");
+    let before_e2 = persisted_state(&store, "e2");
+
+    // ① 引用已存凭据（C3-03）：编辑态不回显密码也能检查。
+    let (s, v) = post_json(
+        app.clone(),
+        uri_e1,
+        r#"{"mode":"validate","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":{"secret_set":true}}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "marker 应解析为已存明文: {v}");
+    assert_no_plaintext(&v, &plaintexts);
+
+    // ② C3-07 跨 Endpoint 隔离：同一个 driver、同一个 field_path，但该 Endpoint
+    //    没有这条 Secret → 必须报引用无效，绝不「按 field_path 全局兜底」。
+    for uri in [uri_e2, uri_e3] {
+        let (s, v) = post_json(
+            app.clone(),
+            uri,
+            r#"{"mode":"validate","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":{"secret_set":true}}}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+        assert_eq!(v["error"]["code"], "SECRET_NOT_FOUND", "body: {v}");
+        assert_no_plaintext(&v, &plaintexts);
+    }
+
+    // ③ 新明文只用于本次检查（C3-05）：SecretStore 内容不变。
+    let (s, v) = post_json(
+        app.clone(),
+        uri_e1,
+        r#"{"mode":"validate","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":"pw-fresh"}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_no_plaintext(&v, &plaintexts);
+    assert_eq!(
+        store.get_secret("e1", "password").unwrap().as_deref(),
+        Some("pw-of-e1"),
+        "本次检查的明文不得写回 SecretStore"
+    );
+
+    // ④ 明确清除优先（红线 1）：清除后仍不继承旧值；SecretStore 同样不变。
+    let (s, v) = post_json(
+        app.clone(),
+        uri_e1,
+        r#"{"mode":"validate","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":{"clear_secret":true}}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "可选凭据被清除后应通过校验: {v}");
+    assert_eq!(v["valid"], true, "body: {v}");
+    // 空字符串同样视为明确清除（C2 归一化后的形态）。
+    let (s, v) = post_json(
+        app.clone(),
+        uri_e1,
+        r#"{"mode":"validate","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":""}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body: {v}");
+    assert_eq!(
+        store.get_secret("e1", "password").unwrap().as_deref(),
+        Some("pw-of-e1"),
+        "清除只作用于本次检查，不得删库"
+    );
+
+    // ⑤ 字段缺失 → 按 PUT 契约继承旧值（无旧值则保持缺失）。
+    let (s, v) = post_json(
+        app.clone(),
+        uri_e1,
+        r#"{"mode":"validate","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u"}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "缺失应继承已存凭据: {v}");
+
+    // ⑥ 红线 3：非 Secret 字段上的 marker、以及不合法的 marker 形状必须 400。
+    for bad in [
+        r#"{"mode":"validate","connection":{"endpoint_url":{"secret_set":true},"username":"u"}}"#,
+        r#"{"mode":"validate","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","password":{"secret_set":"yes"}}}"#,
+        r#"{"mode":"validate","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","password":{"secret_set":true,"x":1}}}"#,
+        r#"{"mode":"validate","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","password":{"clear_secret":true,"secret_set":true}}}"#,
+        r#"{"mode":"validate","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","password":{"credentials":{"user":"u"}}}}"#,
+    ] {
+        let (s, v) = post_json(app.clone(), uri_e1, bad).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "输入 {bad} → {v}");
+        assert_eq!(v["error"]["code"], "INVALID_SECRET_MARKER", "输入 {bad}");
+        assert_no_plaintext(&v, &plaintexts);
+    }
+
+    // ⑦ driver_id 只读已保存记录：请求体覆盖一律 400。
+    let (s, v) = post_json(
+        app.clone(),
+        uri_e1,
+        r#"{"mode":"validate","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840"},"driver_id":"s7"}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body: {v}");
+
+    // ⑧ Endpoint 不存在 → 404。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints/nope/connection-check",
+        r#"{"mode":"validate","connection":{}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "body: {v}");
+    assert_eq!(v["error"]["code"], "NOT_FOUND");
+
+    // ⑨ mode=probe 在 C3-B 之前必须明确「未实现」，绝不返回模拟成功。
+    let (s, v) = post_json(
+        app.clone(),
+        uri_e1,
+        r#"{"mode":"probe","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":{"secret_set":true}}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_IMPLEMENTED, "body: {v}");
+    assert_eq!(v["error"]["code"], "PROBE_NOT_IMPLEMENTED");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("C3-B"),
+        "必须写明待 C3-B 接入: {v}"
+    );
+    assert!(
+        v.get("reachable").is_none(),
+        "未实现的 probe 不得给出任何可达性结论: {v}"
+    );
+    assert_no_plaintext(&v, &plaintexts);
+
+    // ⑩ 无副作用：检查前后 connection_json / endpoint_secrets / desired_running /
+    //    任务 / 事件任务逐字一致。
+    assert_eq!(
+        persisted_state(&store, "e1"),
+        before,
+        "连接检查不得修改任何持久化状态"
+    );
+    assert_eq!(persisted_state(&store, "e2"), before_e2);
+}
+
+/// C3-A 验收 6（红线 2，HTTP 层）：密钥丢失/解密失败必须是 **503 SecretStore
+/// 基础设施故障**，不得是 400（参数错误）、不得降级为匿名连接。
+#[tokio::test]
+async fn connection_check_secret_store_failure_is_503() {
+    use mesa_config_store::{DeviceRecord, EndpointRecord};
+    let base = std::env::temp_dir().join(format!(
+        "mesa-c3-contract-store-{}-{}",
+        std::process::id(),
+        mesa_core_types::now_unix_ns()
+    ));
+    let db = base.join("mesa.db");
+    {
+        let s = ConfigStore::open(&db).unwrap();
+        s.create_device(&DeviceRecord {
+            id: "d1".into(),
+            name: "D".into(),
+        })
+        .unwrap();
+        s.create_endpoint(&EndpointRecord {
+            id: "e1".into(),
+            name: "E1".into(),
+            device_id: "d1".into(),
+            driver_id: "opcua".into(),
+            connection_json:
+                r#"{"endpoint_url":"opc.tcp://127.0.0.1:4840","password":{"secret_set":true}}"#
+                    .into(),
+            desired_running: false,
+            updated_at_ns: 0,
+        })
+        .unwrap();
+        s.put_secret("e1", "password", "top-secret-pw", "master")
+            .unwrap();
+    }
+    // 换成另一把合法密钥：AEAD 认证失败（密钥丢失/轮换的典型形态）。
+    std::fs::write(base.join("master.key"), [0x5Au8; 32]).unwrap();
+    let store = Arc::new(ConfigStore::open(&db).unwrap());
+
+    let staged = common::staged_drivers_with_test_driver();
+    let drivers_dir = staged.path().clone();
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
+    let state = mesa_core_api::AppState::try_new_with_control(
+        mgr,
+        store,
+        drivers_dir.to_string_lossy().to_string(),
+        false,
+    )
+    .unwrap();
+    let app = mesa_core_api::router(state);
+
+    let (s, v) = post_json(
+        app,
+        "/api/v1/endpoints/e1/connection-check",
+        r#"{"mode":"validate","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","password":{"secret_set":true}}}"#,
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "SecretStore 故障必须是 503（既不是 400 参数错误，也不是「设备不可达」）: {v}"
+    );
+    assert_eq!(v["error"]["code"], "SECRET_STORE_UNAVAILABLE", "body: {v}");
+    assert!(
+        !v.to_string().contains("top-secret-pw"),
+        "错误体不得回显明文: {v}"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// 捕获式 writer：把 tracing 输出收进共享缓冲，供「日志无明文」断言使用。
+#[derive(Clone)]
+struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// C3-A 验收 8（日志半条，红线「明文不得写入 tracing」）：连接检查路径即使按
+/// **trace 级**全量输出，也不得出现任何明文凭据——既包括用户本次输入的新明文，
+/// 也包括从 SecretStore 物化出来的旧明文。
+///
+/// 为什么值得单独装一个 subscriber 而不是「靠代码审查」：这条边界最容易在
+/// 后续排障时被顺手破坏（`tracing::debug!(?connection)` 一行就能泄漏），
+/// 只有把它钉在测试里才有回归保护。
+#[tokio::test]
+async fn connection_check_never_logs_secret_plaintext() {
+    const STORED: &str = "pw-stored-never-log";
+    const INLINE: &str = "pw-inline-never-log";
+    let (app, _store, _mgr, _staged) = app_for_connection_check().await;
+    let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        &format!(
+            r#"{{"id":"e1","name":"E1","device_id":"d1","driver_id":"opcua","connection":{{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":"{STORED}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "body: {v}");
+
+    let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("trace"))
+        .with_writer({
+            let b = Arc::clone(&buf);
+            move || CaptureWriter(Arc::clone(&b))
+        })
+        .finish();
+    // `set_default` 是线程级：`#[tokio::test]` 默认单线程运行时，请求处理与
+    // 断言在同一线程上，因此捕获范围正好覆盖被测路径。
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    for body in [
+        // 已存凭据物化（明文只在内存里出现）
+        r#"{"mode":"validate","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":{"secret_set":true}}}"#.to_string(),
+        // 本次新明文
+        format!(r#"{{"mode":"validate","connection":{{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":"{INLINE}"}}}}"#),
+        // 明确清除
+        r#"{"mode":"validate","connection":{"endpoint_url":"opc.tcp://127.0.0.1:4840","username":"u","password":{"clear_secret":true}}}"#.to_string(),
+    ] {
+        let (s, v) = post_json(app.clone(), "/api/v1/endpoints/e1/connection-check", &body).await;
+        assert_eq!(s, StatusCode::OK, "body: {v}");
+    }
+    drop(guard);
+
+    let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        !logged.is_empty(),
+        "预置：trace 级必须实际产出日志（否则本测试是空断言）"
+    );
+    assert!(
+        !logged.contains(STORED),
+        "日志不得出现 SecretStore 中的明文凭据: {logged}"
+    );
+    assert!(
+        !logged.contains(INLINE),
+        "日志不得出现本次输入的明文凭据: {logged}"
+    );
+}
