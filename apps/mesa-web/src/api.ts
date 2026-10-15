@@ -94,6 +94,24 @@ export const api = {
     postJson(`/api/v1/drivers/${id}/validate-connection`, { connection }, signal),
   probe: (id: string, connection: unknown, signal?: AbortSignal) =>
     postJson(`/api/v1/drivers/${id}/probe`, { connection }, signal),
+  /**
+   * C3-C：Endpoint-bound 连接检查（唯一**允许携带 Secret marker** 的检查入口）。
+   *
+   * 为什么单列一个接口而不是给 `probe` 加参数：`endpoint_id` 与 `driver_id` 的
+   * 归属规则完全不同——前者的 `driver_id` 由服务端按已保存记录取（请求体带
+   * `driver_id` 会被 400），因此只可能通过这条 URL 表达。`mode` 是服务端冻结的
+   * 二值：`validate` 只做 Schema 校验（不连设备），`probe` 才复用临时探测。
+   *
+   * `connection` 里的 `{secret_set:true}` 由服务端**在内存中**物化为该 Endpoint、
+   * 该字段的明文；前端的 marker 因此不再被当作密码发出。
+   */
+  connectionCheck: (
+    endpointId: string,
+    mode: "validate" | "probe",
+    connection: unknown,
+    signal?: AbortSignal,
+  ) =>
+    postJson(`/api/v1/endpoints/${endpointId}/connection-check`, { mode, connection }, signal),
   listEndpoints: () => getJson("/api/v1/endpoints"),
   listDevices: () => getJson("/api/v1/devices"),
   getDevice: (id: string) => getJson(`/api/v1/devices/${id}`),

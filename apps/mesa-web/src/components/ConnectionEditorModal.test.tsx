@@ -13,6 +13,7 @@ vi.mock("../api", () => ({
     getDescriptor: vi.fn(),
     probe: vi.fn(),
     validateConnection: vi.fn(),
+    connectionCheck: vi.fn(),
     stopEndpoint: vi.fn(),
     updateEndpoint: vi.fn(),
     startEndpoint: vi.fn(),
@@ -24,6 +25,7 @@ const mocked = api as unknown as {
   getDescriptor: Mock;
   probe: Mock;
   validateConnection: Mock;
+  connectionCheck: Mock;
   stopEndpoint: Mock;
   updateEndpoint: Mock;
   startEndpoint: Mock;
@@ -156,6 +158,10 @@ function mockEdit(opts: {
   mocked.startEndpoint.mockResolvedValue({ status: 200, body: {} });
   mocked.probe.mockResolvedValue({ status: 200, body: { reachable: true } });
   mocked.validateConnection.mockResolvedValue({ status: 200, body: {} });
+  mocked.connectionCheck.mockResolvedValue({
+    status: 200,
+    body: { reachable: true, device: { vendor: "Mesa" }, warnings: [] },
+  });
 }
 
 async function waitSaveEnabled() {
@@ -190,7 +196,7 @@ describe("C2 ConnectionEditorModal：Secret marker 语义", () => {
     expect(body.driver_id).toBeUndefined();
   });
 
-  it("Secret-safe：存在未重新输入的 marker 时禁止连接测试，且不发探测请求", async () => {
+  it("C3-C：编辑态接通 Endpoint-bound 检查 → marker 可测试，且绝不发 Driver-bound 探测", async () => {
     mockEdit({
       connection: { endpoint_url: "opc.tcp://10.0.0.2:4840", password: { secret_set: true } },
       descriptor: DESC_SECRET,
@@ -198,11 +204,34 @@ describe("C2 ConnectionEditorModal：Secret marker 语义", () => {
     renderModal("ep-a", "A");
     await waitSaveEnabled();
 
-    expect(await screen.findByText(/已保存的凭据不会回显/)).toBeTruthy();
+    // C2 的「含 marker 即禁测」在本入口被**解除**（C3-C 的前提正是 Endpoint-bound
+    // 检查已可用）：marker 由服务端在内存中物化为该 Endpoint 的明文。
+    expect(await screen.findByText(/使用已保存的凭据/)).toBeTruthy();
     const probeBtn = screen.getByRole("button", { name: /测试连接/ }) as HTMLButtonElement;
     const validateBtn = screen.getByRole("button", { name: /校验参数/ }) as HTMLButtonElement;
-    expect(probeBtn.disabled).toBe(true);
-    expect(validateBtn.disabled).toBe(true);
+    expect(probeBtn.disabled).toBe(false);
+    expect(validateBtn.disabled).toBe(false);
+
+    // 探测：URL 是 Endpoint-bound，且 marker **原样**交给服务端物化
+    fireEvent.click(probeBtn);
+    await waitFor(() => expect(mocked.connectionCheck).toHaveBeenCalledTimes(1));
+    const [probeEp, probeMode, probeConn] = mocked.connectionCheck.mock.calls[0] as [
+      string,
+      string,
+      Record<string, unknown>,
+    ];
+    expect(probeEp).toBe("ep-a");
+    expect(probeMode).toBe("probe");
+    expect(probeConn.password).toEqual({ secret_set: true });
+    expect(probeConn.endpoint_url).toBe("opc.tcp://10.0.0.2:4840");
+
+    // 校验：同一入口，mode=validate
+    fireEvent.click(validateBtn);
+    await waitFor(() => expect(mocked.connectionCheck).toHaveBeenCalledTimes(2));
+    expect((mocked.connectionCheck.mock.calls[1] as [string, string])[1]).toBe("validate");
+
+    // Driver-bound 通道一步都没走：marker 绝不能进 /probe 或 /validate-connection
+    // （新建/新增流程的「marker 即禁测」边界由 ConnectionSetupPanel.test 覆盖）。
     expect(mocked.probe).not.toHaveBeenCalled();
     expect(mocked.validateConnection).not.toHaveBeenCalled();
   });

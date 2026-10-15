@@ -6,8 +6,11 @@
 //    绝不能污染 B（否则 updateEndpoint(B, A-connection)）；
 // 2. Secret marker 语义：服务端不回显明文（`{secret_set:true}`），marker
 //    原样保留在草稿里并随 PUT 回传（后端据此保留历史凭据）；用户显式清除
-//    走 `{clear_secret:true}`。面板只把 marker 排除在 probe/validate 之外，
-//    **不**改变保存语义；
+//    走 `{clear_secret:true}`。C3-C 起，编辑态的「校验/测试」改走 Endpoint-bound
+//    `connection-check`：marker **可以**进入该检查（由服务端在内存中物化为该
+//    Endpoint 的明文），因此本入口不再因 marker 而禁测；Driver-bound 的
+//    probe/validate 与新建/新增流程的「marker 即禁测」边界**不变**。
+//    保存语义保持不变：marker 原样回传，明文的写入只发生在用户重新输入时。
 // 3. 生命周期顺序不变：STOPPED 直接 Apply；RUNNING 走 Stop → Apply →
 //    （可选）Restart，Stop 失败绝不 Apply，Apply 失败保持 STOPPED，
 //    Restart 失败明确提示。
@@ -211,6 +214,11 @@ export function ConnectionEditorModal(props: {
           sessionKey={`edit-connection:${endpointId}`}
           initialDriverId={driverId}
           initialValues={conn}
+          // C3-C：编辑态绑定本 Endpoint → 校验/测试改走 Endpoint-bound
+          // `POST /endpoints/{id}/connection-check`，可用**已保存凭据**（marker 由
+          // 服务端在内存中物化）。这也是解除「含 marker 即禁测」的唯一入口：新增
+          // 连接与新建设备不传该 prop，仍走 Driver-bound 路径（marker 依旧禁测）。
+          endpointId={endpointId}
           running={running}
           applying={saving}
           submitLabel="保存"

@@ -6,6 +6,11 @@
  * - `add`：给已有设备新增连接（主按钮「创建」）；
  * - `edit`：编辑既有连接（驱动不可改；保留既有 Stop→Apply→可选 Restart 流程）。
  *
+ * C3-C：只有 `edit` + 提供 `endpointId` 时，校验/测试才走 Endpoint-bound
+ * `connection-check`——那是唯一能用**已保存凭据**测试的通道（服务端在内存中物化
+ * marker，明文不进响应与日志）。`create-draft` / `add` 保持 Driver-bound 路径，
+ * marker 依旧禁测。
+ *
  * 纪律：
  * - 驱动清单失败 → 明确报错 + 重试，并且**禁止提交**（不回退到内置驱动常量）；
  * - 描述符失败 → 明确报错 + 重试，并且禁止提交；
@@ -34,6 +39,14 @@ export interface ConnectionSetupPanelProps {
   initialDriverId?: string | null;
   /** edit：服务端连接快照（引用必须稳定，通常放在父组件 state 里） */
   initialValues?: ConnectionValues | null;
+  /**
+   * C3-C：edit 模式绑定的**已存在 Endpoint** id。
+   *
+   * 传了它，编辑态的校验/测试才改走 Endpoint-bound `connection-check`（可用已保存
+   * 凭据），并据此解除「含 marker 即禁测」。非 edit 模式**一律忽略**该值：
+   * 新建流程与新增连接当时还没有 Endpoint，且 marker 绝不能进 Driver-bound Probe。
+   */
+  endpointId?: string | null;
   /** 会话标识：变化即整体复位（重新打开弹窗、切换 Endpoint） */
   sessionKey?: string;
   /** edit：Endpoint 是否运行中（决定是否走 Stop→Apply→Restart） */
@@ -66,6 +79,7 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
     driverSelectable = mode !== "edit",
     initialDriverId = null,
     initialValues = null,
+    endpointId = null,
     sessionKey,
     running = false,
     applying = false,
@@ -85,6 +99,10 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
     initialValues,
     // P1：编辑态必须保留 visible_if 隐藏字段的原值（后端整体替换 connection）
     preserveHiddenValues: mode === "edit",
+    // C3-C：只有 edit 模式才可能绑定已存在的 Endpoint。用 `mode === "edit"` 兜一道，
+    // 使「新增连接/新建设备仍走 Driver-bound」成为面板层的结构性事实，而不是调用方
+    // 的自觉——将来有人给 add 流程传了 endpointId 也不会把 marker 送进 Probe。
+    endpointId: mode === "edit" ? endpointId : null,
     onDescriptorChange,
   });
 
@@ -180,7 +198,13 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
   // 清单失败时既没有可选驱动，也没有可信的参数集合，任何请求都只会误导用户。
   // 注意：判定本身在模型层（submitBlockReason），这里只叠加入口侧条件。
   const driverBlocked = setup.blockReason !== null;
-  /** 校验/测试是否可用：驱动与描述符就绪、入口侧就绪，且没有未重新输入的 Secret marker */
+  /**
+   * 校验/测试是否可用：驱动与描述符就绪、入口侧就绪，且当前检查通道允许本次载荷。
+   *
+   * 通道差异（C3-C）封装在 `setup.canTestConnection` 里，面板不重复判定：
+   * - Driver-bound：任何未重新输入的 Secret marker 都禁测（marker 不是密码）；
+   * - Endpoint-bound：规范 marker 合法（服务端物化），只有位置/形状非法的 marker 才禁测。
+   */
   const canTest = !driverBlocked && !actionsDisabled && setup.canTestConnection;
   // 保存不受 Secret marker 限制：marker 必须原样回传，后端据此保留历史凭据
   //（若在此处禁用保存，就无法编辑含已存凭据连接的其它字段——属既有能力回归）。
@@ -276,12 +300,23 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
       ) : null}
 
       {setup.secretMarkers.length > 0 ? (
-        <Alert
-          type="info"
-          showIcon
-          message="已保存的凭据不会回显，本场景暂不支持校验/测试"
-          description={`连接中的凭据字段（${setup.secretMarkers.join("、")}）仍是「已保存」标记，不是明文。把它当密码发出去既连不上、也会把「凭据未回显」误报成设备不可达，因此这里不发请求。请重新输入凭据后再校验/测试；仅保存配置不受影响，凭据会原样保留。`}
-        />
+        setup.checkTarget === "endpoint" ? (
+          // C3-C：编辑态已接通 Endpoint-bound 检查。规范 marker 会被服务端在内存中
+          // 物化成该 Endpoint 的明文（不回显、不落库），因此这里只做说明，不再禁测。
+          <Alert
+            type="info"
+            showIcon
+            message="本次校验/测试将使用已保存的凭据（服务端在内存中解密，不回显、不写入配置）"
+            description={`连接中的凭据字段（${setup.secretMarkers.join("、")}）仍是「已保存」标记，不是明文。检查请求里保留标记，由服务端按该 Endpoint 的已存凭据物化后交给临时驱动进程；明文不会出现在响应或日志里。若要改用新凭据，直接在字段里输入即可（不会自动保存）。`}
+          />
+        ) : (
+          <Alert
+            type="info"
+            showIcon
+            message="已保存的凭据不会回显，本场景暂不支持校验/测试"
+            description={`连接中的凭据字段（${setup.secretMarkers.join("、")}）仍是「已保存」标记，不是明文。把它当密码发出去既连不上、也会把「凭据未回显」误报成设备不可达，因此这里不发请求。请重新输入凭据后再校验/测试；仅保存配置不受影响，凭据会原样保留。`}
+          />
+        )
       ) : null}
 
       <ConnectionTestResult

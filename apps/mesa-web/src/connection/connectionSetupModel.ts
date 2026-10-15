@@ -160,8 +160,9 @@ export function containsSecretMarker(value: unknown, depth = 0): boolean {
  *    保守阻断优于把未知结构当明文发出去）。
  *
  * 注意：这些字段**可以保存**——marker 原样回传是「不更新凭据」的正确语义，
- * 限制只针对需要真实凭据的 Probe/Validate（C3 的 Endpoint-bound
- * `connection-check` 才解决「用已存凭据测试」的场景）。
+ * 限制只针对 Driver-bound 的 Probe/Validate（只接受明文）。编辑态想「用已保存
+ * 凭据测试」必须走 Endpoint-bound 的 `connection-check`，那条路径用
+ * [`unsupportedCheckMarkerKeys`] 判定（规范 marker 合法）。
  */
 export function secretMarkerKeys(
   fields: FieldDescriptor[],
@@ -181,6 +182,107 @@ export function secretMarkerKeys(
     }
   }
   return keys;
+}
+
+// ---------------------------------------------------------------------------
+// C3-C：Endpoint-bound 检查的 Secret 语义（marker 白名单 + 明确清除）
+// ---------------------------------------------------------------------------
+
+/**
+ * Secret 的**规范 marker**：只允许 `{secret_set:true}` 与 `{clear_secret:true}`
+ * 这两种「单键、值为 true」的形状。
+ *
+ * 为什么必须严格（与 Core `classify_secret_value` 同口径）：端点检查会把 marker
+ * 交给服务端物化，任何「长得像 marker 但不是」的值（`{secret_set:"yes"}`、
+ * 多键对象、裸对象）都会被服务端 400 `INVALID_SECRET_MARKER`；前端先拦一次是为了
+ * 把「字段写错了」与「设备连不上」区分开——后者才是探测结论。
+ */
+export function isCanonicalSecretMarker(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const obj = value as Record<string, unknown>;
+  if (Object.keys(obj).length !== 1) return false;
+  return obj.secret_set === true || obj.clear_secret === true;
+}
+
+/**
+ * Endpoint-bound 检查**不能接受**的 marker 位置/形状（返回字段名，空数组即可发请求）。
+ *
+ * 与 [`secretMarkerKeys`] 的分工（这是 C3-C 的关键区别）：
+ * - `secretMarkerKeys`：Driver-bound 的 `validate-connection` / `probe` 只接受明文，
+ *   因此**任何** marker 都必须拦下（marker 当密码发出去既连不上、又把「凭据未回显」
+ *   误报成设备不可达）；
+ * - 本函数：Endpoint-bound 的 `connection-check` **正是**为「复用已保存凭据测试」
+ *   而存在，规范 marker 是**合法**输入，只拦两类必然 400 的形态：
+ *   ① 非 Secret 声明字段上的 marker 形状（位置红线）；
+ *   ② Secret 声明字段上的非规范取值（形状红线：多键对象、裸对象、数组/数字/布尔）。
+ *   空值（`null`/`undefined`/`""`）不算问题：清除意图由 `applySecretClears` 表达成
+ *   `{"clear_secret":true}`，而不是靠「字段缺席」（缺席会被服务端读成「继承旧值」）。
+ */
+export function unsupportedCheckMarkerKeys(
+  fields: FieldDescriptor[],
+  raw: ConnectionValues,
+): string[] {
+  const declared = new Set(
+    fields.filter((f) => isSecretField(f.field_type)).map((f) => f.key),
+  );
+  const keys: string[] = [];
+  for (const [key, value] of Object.entries(raw)) {
+    if (declared.has(key)) {
+      if (typeof value === "string") continue; // 用户输入的明文
+      if (isCanonicalSecretMarker(value)) continue; // 已保存凭据 / 明确清除
+      if (isEmptyConnectionValue(value)) continue; // 空值 → 交给 applySecretClears
+      keys.push(key);
+      continue;
+    }
+    // 非 Secret 字段：任何 marker 形状都是「放错位置」，服务端必定 400
+    if (containsSecretMarker(value)) keys.push(key);
+  }
+  return keys;
+}
+
+/**
+ * `touched + 空 Secret` → `{"clear_secret":true}`（C3 §10.2/§10.3）。
+ *
+ * 为什么必须显式表达：C2 的归一化会**丢弃空值**（`null`/`undefined`/`""` 不进入
+ * canonical），而服务端把「字段缺席」定义为「按 PUT 契约继承旧值」。于是「用户把
+ * 密码清空」会表现为 key 缺席 → 服务端拿**旧密码**去检查/保存，正好命中契约
+ * §2 明令禁止的「偷偷回退到旧密码」。
+ *
+ * 判定范围（严格限定，不得扩大）：
+ * - **只**处理 Descriptor 声明为 Secret（`FieldType::Secret`）的字段；
+ * - **只**在 `touched` 命中且当前值为空时转换；
+ * - **未触碰**的空值（程序初始化 / 快照装载物化出来的空）不转换——与 C2 的
+ *   `preserveHiddenFields` 同一口径；
+ * - 非 Secret 字段的空值规则完全不变（走「整体替换 + `required` 裁决」）。
+ *
+ * 与 `required` 的关系：必填 Secret 被清空时 `normalizeConnection` 仍会报
+ * `REQUIRED`（可见）或 `clearedHiddenRequiredIssues` 报 `REQUIRED_CLEARED`（隐藏），
+ * 本地即阻断提交——「必填凭据不能靠清空绕过」。清除标记只是把意图如实表达给服务端，
+ * 不会让必填缺失变成合法配置。
+ *
+ * 调用点：`useConnectionSetup.normalizeDraft()`，因此「测试/校验」与「正式保存」
+ * **两个出口共用同一份语义**（只修一个出口会让「测试说不需要密码」与「保存后旧密码
+ * 还在」自相矛盾）。
+ */
+export function applySecretClears(
+  connection: ConnectionValues,
+  fields: FieldDescriptor[],
+  raw: ConnectionValues,
+  touched: readonly string[],
+): { connection: ConnectionValues; clearedKeys: string[] } {
+  const touchedSet = new Set(touched);
+  const out: ConnectionValues = { ...connection };
+  const clearedKeys: string[] = [];
+  for (const field of fields) {
+    if (!isSecretField(field.field_type)) continue;
+    if (!touchedSet.has(field.key)) continue;
+    const hasRaw = Object.prototype.hasOwnProperty.call(raw, field.key);
+    const value = hasRaw ? raw[field.key] : undefined;
+    if (!isEmptyConnectionValue(value)) continue;
+    out[field.key] = { clear_secret: true };
+    clearedKeys.push(field.key);
+  }
+  return { connection: out, clearedKeys };
 }
 
 // ---------------------------------------------------------------------------
