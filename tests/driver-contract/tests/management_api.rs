@@ -2425,15 +2425,31 @@ async fn c3e_full_chain_offline_save_probe_start_data_stop() {
     );
 
     // 数据确实产出（证据形式：REST 最新值面出现该点，且数值持续推进）。
-    let (s, v) = get_json(app.clone(), "/api/v1/points/latest").await;
-    assert_eq!(s, StatusCode::OK, "段4 最新值: {v}");
-    let point = v["points"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["point_key"] == "c3e.counter")
-        .cloned()
-        .unwrap_or_else(|| panic!("段4 启动后必须产出采集数据: {v}"));
+    //
+    // NOTE（必须有界等待，不能单次读取即断言）：启动到**首个采样到达** REST 面之间
+    // 存在真实时间差，单次读取在慢机器上会偶发失败——实测 run 38750918018 在
+    // windows-arm64 上正是于此 panic（"段4 启动后必须产出采集数据"）。
+    // 这里改为有界轮询：断言内容与期望值完全不变，只是给它出现的窗口。
+    let mut point = serde_json::Value::Null;
+    let mut last_seen = serde_json::Value::Null;
+    for _ in 0..60 {
+        let (s, v) = get_json(app.clone(), "/api/v1/points/latest").await;
+        assert_eq!(s, StatusCode::OK, "段4 最新值: {v}");
+        last_seen = v.clone();
+        if let Some(found) = v["points"]
+            .as_array()
+            .and_then(|a| a.iter().find(|p| p["point_key"] == "c3e.counter"))
+            .cloned()
+        {
+            point = found;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(
+        !point.is_null(),
+        "段4 启动后必须产出采集数据（等待 30s 仍未出现）: {last_seen}"
+    );
     assert_eq!(point["endpoint_id"], EID, "段4: {point}");
     assert_eq!(point["type"], "f64", "段4: {point}");
     assert_eq!(point["quality"], "GOOD", "段4: {point}");
