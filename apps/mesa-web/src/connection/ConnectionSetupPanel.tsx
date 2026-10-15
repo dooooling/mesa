@@ -24,11 +24,47 @@ import { Alert, Button, Select, Space, Tag } from "antd";
 import type { DriverDescriptor } from "../types";
 import { ApplyWithRestart } from "../components/ApplyWithRestart";
 import { missingRequiredAdvanced, type ConnectionValues } from "./connectionSetupModel";
+import { selectablePresets, type ConnectionPreset } from "./connectionProfiles";
 import { CONNECTION_FIELD_ID_PREFIX, ConnectionFields } from "./ConnectionFields";
 import { ConnectionTestResult } from "./ConnectionTestResult";
 import { useConnectionSetup } from "./useConnectionSetup";
 
 export type ConnectionSetupMode = "create-draft" | "add" | "edit";
+
+/**
+ * 草稿里的 `family` 取值——预设适用范围的**唯一**依据。
+ *
+ * 只认非空字符串：`family` 是显式必填字段（NCK Descriptor 不提供静默默认），
+ * 未选择时必须视为「还不知道系列」，此时不得给出任何示例值。
+ */
+function draftFamily(raw: ConnectionValues): string | null {
+  const value = raw.family;
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
+
+/**
+ * 示例标题：由 `family` 派生（`828d` → 「828D 实测连接示例」）。
+ *
+ * 为什么派生而不是给 `ConnectionPreset` 加 `name` 字段：预设的作用范围本来就由
+ * `family` 定义，标题只是它的界面表达；另立一份名称表会多出一处可能与 `family`
+ * 漂移的事实来源。来源与限制说明一律用预设自带的 `provenance` / `caveat`。
+ */
+function presetTitle(preset: ConnectionPreset): string {
+  return `${preset.family.toUpperCase()} 实测连接示例`;
+}
+
+/** 单个预填值的展示文本：十六进制与十进制同时给出，免去用户自己换算 TSAP。 */
+function presetValueText(label: string, value: number): string {
+  const hex = `0x${value.toString(16).toUpperCase().padStart(4, "0")}`;
+  return `${label} ${hex} (${value})`;
+}
+
+/** 证据等级标记：`site_tested_example` 必须显式标注为单台实测，不得冒充通用值。 */
+function presetScopeTag(preset: ConnectionPreset): { color: string; text: string } {
+  return preset.scope === "site_tested_example"
+    ? { color: "orange", text: "单台设备验证" }
+    : { color: "green", text: "已验证范围" };
+}
 
 export interface ConnectionSetupPanelProps {
   mode: ConnectionSetupMode;
@@ -142,6 +178,37 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
     () => setup.drivers.filter((d) => !d.launchable),
     [setup.drivers],
   );
+
+  // -------------------------------------------------------------------------
+  // 实测示例预设（C2）：只列**可选**预设（含 `site_tested_example`）。
+  //
+  // 这里的计算是**纯渲染**：不存在任何 effect 把预设值写进草稿，因此驱动切换、
+  // 系列切换、描述符加载完成都不会自动套用示例值（单台实测值不得成为通用默认）。
+  // 写入草稿只有一条路径——用户点击「应用实测示例」（见 applyPreset）。
+  // -------------------------------------------------------------------------
+  const presets = useMemo(
+    () => selectablePresets(setup.driverId ?? "", draftFamily(setup.raw)),
+    [setup.driverId, setup.raw],
+  );
+
+  /**
+   * 应用实测示例：**唯一**把预设值写入草稿的入口，只由用户点击触发。
+   *
+   * 走既有草稿机制 `setup.setField`（而不是绕过它直接改内部状态）：revision 代际、
+   * `touched` 语义、上一次校验/探测结果的失效全部沿用，因此应用之后
+   * 「校验/测试/保存」拿到的就是这份新值，用户随后也能自由改回或改成别的值。
+   *
+   * NOTE: 切换 `family` 后已应用的值**不会**被自动清除（`connectionProfiles` 的
+   * `fieldsToClearOnSwitch` 尚未接入）。当前取舍是「不擅自删除用户可见的值」；
+   * 若后续要求「换系列即清空示例值」，应在此处补一次显式确认后再清理。
+   */
+  const applyPreset = (preset: ConnectionPreset) => {
+    for (const [key, value] of Object.entries(preset.values)) {
+      setup.setField(key, value);
+    }
+    // 预设填的都是高级参数：展开高级区，否则用户看不到刚刚写入了什么。
+    setAdvancedOpen(true);
+  };
 
   /** 高级必填缺失的兜底：自动展开 + 定位；返回是否可继续。 */
   const guardAdvanced = (): boolean => {
@@ -297,6 +364,58 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
           onAdvancedOpenChange={setAdvancedOpen}
           showMissingHint={showMissingHint}
         />
+      ) : null}
+
+      {setup.descriptorStatus === "ready" && presets.length > 0 ? (
+        // 紧贴高级参数区：预设填的正是 TSAP 这类高级参数。
+        <div style={{ display: "grid", gap: 6 }}>
+          {presets.map((preset) => {
+            const tag = presetScopeTag(preset);
+            return (
+              <div
+                key={preset.id}
+                data-preset-id={preset.id}
+                style={{
+                  border: "1px solid #d9d9d9",
+                  borderRadius: 4,
+                  padding: 12,
+                  display: "grid",
+                  gap: 6,
+                }}
+              >
+                <Space size={8} wrap>
+                  <span style={{ fontSize: 13, fontWeight: 600 }}>{presetTitle(preset)}</span>
+                  <Tag color={tag.color}>{tag.text}</Tag>
+                </Space>
+                <Space size={16} wrap>
+                  {Object.entries(preset.values).map(([key, value]) => (
+                    <span
+                      key={key}
+                      data-preset-value={key}
+                      style={{
+                        fontSize: 12,
+                        fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace",
+                      }}
+                    >
+                      {presetValueText(
+                        setup.fields.find((f) => f.key === key)?.label ?? key,
+                        value,
+                      )}
+                    </span>
+                  ))}
+                </Space>
+                {/* 来源与限制必须可见：单台实测值不是所有同系列设备的通用默认 */}
+                <div style={{ fontSize: 12, color: "#525252" }}>{preset.provenance}</div>
+                <div style={{ fontSize: 12, color: "#d46b08" }}>{preset.caveat}</div>
+                <div>
+                  <Button size="small" onClick={() => applyPreset(preset)}>
+                    应用实测示例
+                  </Button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
       ) : null}
 
       {setup.secretMarkers.length > 0 ? (

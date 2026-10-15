@@ -120,6 +120,13 @@ impl Driver for SinumerikNckDriver {
                         f.validation.min = Some(0.0);
                         f.validation.max = Some(65535.0);
                         f.ui.placeholder = Some("如 0x0100 或 256".into());
+                        // 归入「高级连接参数」：TSAP 是 S7 通信的 COTP 层参数，
+                        // 只有明确知道控制器侧配置的用户才改得动；放进高级区可避免
+                        // 常规配置被它干扰。**仅改分组，不提供默认值**——单台 828D
+                        // 的实测值（0x0400/0x0D04）只是可选示例，由前端在用户主动
+                        // 点击「应用实测示例」时写入，绝不静默预填（见
+                        // apps/mesa-web/src/connection/connectionProfiles.ts）。
+                        f.ui.advanced = Some(true);
                         f
                     },
                     {
@@ -129,6 +136,8 @@ impl Driver for SinumerikNckDriver {
                         f.validation.min = Some(0.0);
                         f.validation.max = Some(65535.0);
                         f.ui.placeholder = Some("如 0x0102 或 258".into());
+                        // 同 local_tsap：只归入高级区，不加默认值。
+                        f.ui.advanced = Some(true);
                         f
                     },
                     {
@@ -1195,6 +1204,8 @@ mod tests {
             assert_eq!(f.validation.min, Some(0.0));
             assert_eq!(f.validation.max, Some(65535.0));
             assert!(f.default.is_none(), "{key} 不得预填默认值");
+            // 归入高级连接参数（前端据此默认折叠），但不得因此弱化必填/校验。
+            assert_eq!(f.ui.advanced, Some(true), "{key} 应归入高级参数");
         }
         assert!(!d.capabilities.write, "NCK V1 只读");
         assert!(!d.capabilities.method, "NCK V1 无 command");
