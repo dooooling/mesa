@@ -367,20 +367,48 @@ describe("M4.2 AddDeviceFlow：P0 连接步提交出口", () => {
 // ---------------------------------------------------------------------------
 
 describe("M4.2 AddDeviceFlow：正向 bootstrap 请求体（C2）", () => {
+  /**
+   * 这两条用例要走完整个向导（① 设备 → ④ 确认页），是本文件里最重的交互测试：
+   * 本机实测约 4.2–4.5s，已接近 vitest 默认 5s 单测超时，Linux CI（更慢且并发）
+   * 会稳定超时。因此**只给这两条**指定独立超时，不改全局配置、不放宽任何断言。
+   */
+  const FULL_FLOW_TIMEOUT_MS = 15_000;
+
+  /**
+   * CI 阶段诊断标记：仅在 `CI` 环境下打印阶段与耗时。
+   *
+   * 为什么需要：这两条用例一旦超时，vitest 只报 "Test timed out in 5000ms"，
+   * 无法区分「流程卡在某一步没推进」与「流程正常但耗时超预算」。有了阶段标记，
+   * CI 日志会直接给出最后到达的阶段，避免靠猜。本地运行不打印，不制造噪音。
+   */
+  function makeStageMarker() {
+    const t0 = Date.now();
+    return (stage: string) => {
+      if (process.env.CI) {
+        // eslint-disable-next-line no-console
+        console.log(`[walk] ${stage} @${Date.now() - t0}ms`);
+      }
+    };
+  }
+
   /** 从设备步一路走到确认页（④），返回过程中截获的请求记录。 */
   async function walkToConfirmPage() {
     const calls = mockFlow({ descriptor: DESC_C2 });
     const user = userEvent.setup();
+    const mark = makeStageMarker();
     const { container } = renderFlow();
+    mark("rendered");
 
     // ① 设备：ID 与显示名都要落进 device.id / device.name（断言在下面的请求体里）
     await screen.findByText("① 设备");
+    mark("① 设备就绪");
     fireEvent.change(screen.getByPlaceholderText("CNC-01"), { target: { value: "CNC-01" } });
     fireEvent.change(screen.getByPlaceholderText("默认为 ID"), { target: { value: "一号机床" } });
     await user.click(screen.getByRole("button", { name: /下一步：连接/ }));
 
     // ② 连接：真实 Descriptor 的 required 字段必须填齐；TSAP 用文本输入
     await screen.findByText("② 连接");
+    mark("② 连接就绪");
     await waitFor(() =>
       expect(container.querySelector('[data-field-key="host"]')).not.toBeNull(),
     );
@@ -397,6 +425,7 @@ describe("M4.2 AddDeviceFlow：正向 bootstrap 请求体（C2）", () => {
 
     // ③ 数据：选资源参数 + 输出，加入采集项（required 的 offset 无默认值必须填）
     await screen.findByText("③ 数据");
+    mark("③ 数据就绪");
     fireEvent.change(container.querySelector('[data-field-key="offset"] input')!, {
       target: { value: "4" },
     });
@@ -415,6 +444,7 @@ describe("M4.2 AddDeviceFlow：正向 bootstrap 请求体（C2）", () => {
 
     // ④ 确认页（此前不可达）
     await screen.findByText("④ 确认 · 最终按钮才真正提交");
+    mark("④ 确认页就绪");
     expect(screen.getByText(/1 个数据点 · 2000ms/)).toBeTruthy();
     return { calls, user };
   }
@@ -490,7 +520,7 @@ describe("M4.2 AddDeviceFlow：正向 bootstrap 请求体（C2）", () => {
     // 成功后进入设备工作区的入口出现（证明成功路径而非仅"发出请求"）
     await screen.findByText(/已添加设备 CNC-01/);
     expect(screen.getByRole("button", { name: /进入设备/ })).toBeTruthy();
-  });
+  }, FULL_FLOW_TIMEOUT_MS);
 
   it("同一 Flow 内重复提交复用同一幂等键（重试不双建）", async () => {
     const { calls, user } = await walkToConfirmPage();
@@ -507,5 +537,5 @@ describe("M4.2 AddDeviceFlow：正向 bootstrap 请求体（C2）", () => {
     const key = (c: { body?: unknown }) => (c.body as { idempotency_key: string }).idempotency_key;
     // 重试必须复用同一 operation key（后端据此重放而不是再建一台设备）
     expect(key(bootstraps()[1])).toBe(key(bootstraps()[0]));
-  });
+  }, FULL_FLOW_TIMEOUT_MS);
 });
