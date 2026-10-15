@@ -20,6 +20,11 @@
  *   程序物化/快照装载得到的空值一律不算，隐藏字段补齐时会用服务端快照兜底旧值。
  *   另：用户清空**必填**字段后再让条件隐藏它 → 本地校验失败（不再静默删除，
  *   Core 的 `validate_instance` 不看 `visible_if`，缺必填必定 400）。
+ * - **两条检查通道，判据不同（C3-C）**：编辑态（`endpointId` 非 null）走 Endpoint-bound
+ *   `connection-check`，规范 Secret marker 合法（服务端在内存中物化，明文不进响应与
+ *   日志）；新建/新增走 Driver-bound `validate-connection` / `probe`，marker 一律拦下。
+ *   同时 `touched + 空 Secret` 一律显式转成 `{"clear_secret":true}`（§10.2），
+ *   因此「测试」与「保存」两个出口的清除语义同源、不会分叉。
  *
  * 本 Hook 只做状态与请求编排，不做任何协议语义判断（分类交给
  * `connectionSetupModel.classifyProbeOutcome`）。
@@ -28,6 +33,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import type { DriverDescriptor, FieldDescriptor } from "../types";
 import {
+  applySecretClears,
   classifyProbeOutcome,
   clearedHiddenRequiredIssues,
   initialSetupState,
@@ -40,6 +46,7 @@ import {
   secretUnavailableOutcome,
   submitBlockReason,
   touchedKeys,
+  unsupportedCheckMarkerKeys,
   withDriverChange,
   withFieldChange,
   type ConnectionValues,
@@ -108,6 +115,21 @@ export interface UseConnectionSetupOptions {
    * （用户看不到它，无法对它负责）。详见 `preserveHiddenFields` 的边界说明。
    */
   preserveHiddenValues?: boolean;
+  /**
+   * C3-C：本次会话绑定的**已存在 Endpoint**（编辑态由 `ConnectionEditorModal`
+   * 给出）。
+   *
+   * 非 null 时，`validate()` / `probeConnection()` 改走 Endpoint-bound 的
+   * `POST /api/v1/endpoints/{id}/connection-check`：
+   * - 起草载荷里的 `{secret_set:true}` / `{clear_secret:true}` 由服务端在内存中
+   *   物化/清除，因此**不再**拦截 marker（`secretMarkerKeys` 那道门只针对
+   *   Driver-bound 路径）；
+   * - `driver_id` 由服务端按已保存记录取，前端连传都不传（传了会被 400）。
+   *
+   * 为 null 时保持既有 Driver-bound 行为：新建流程与新增连接**必须**不传该值
+   * （那时 Endpoint 还不存在，且 marker 绝不能进 Driver-bound Probe）。
+   */
+  endpointId?: string | null;
   /** 描述符加载结果上报（新建流程的数据步需要 resources 目录） */
   onDescriptorChange?: (descriptor: DriverDescriptor | null) => void;
 }
@@ -147,11 +169,23 @@ export interface ConnectionSetupController {
 
   /**
    * 仍处于 marker 态、未重新输入明文的 Secret 字段。
-   * 非空时 `canTestConnection` 为 false：marker 不是密码，禁止发给
-   * probe / validate-connection（C3 的 Endpoint-bound connection-check 尚未实现）。
+   *
+   * 含义随检查通道而变（见 [`ConnectionSetupController.checkTarget`]）：
+   * - Driver-bound：非空即 `canTestConnection=false`——marker 不是密码，禁止发给
+   *   `probe` / `validate-connection`；
+   * - Endpoint-bound（`endpointId` 非 null）：规范 marker **可以**发（服务端物化），
+   *   因此它只用于界面提示「本次测试将使用已保存的凭据」。
    */
   secretMarkers: string[];
-  /** 是否允许发起 校验/探测（Secret marker 存在时禁止；保存不受影响） */
+  /** 本次会话的检查通道：Endpoint-bound 还是 Driver-bound（界面据此换文案） */
+  checkTarget: "endpoint" | "driver";
+  /**
+   * 是否允许发起 校验/探测。
+   *
+   * - Driver-bound：存在未重新输入的 Secret marker 时禁止（保存不受影响）；
+   * - Endpoint-bound：规范 marker 合法，只有「非 Secret 字段上的 marker」或
+   *   「Secret 字段上的非规范取值」才禁止（服务端必定 400，本地先拦）。
+   */
   canTestConnection: boolean;
 
   /** 现场归一化（不改状态）：提交前的 canonical 快照来源 */
@@ -163,9 +197,17 @@ export interface ConnectionSetupController {
   submitSnapshot: () => NormalizeResult | null;
   /** 只做本地归一化；有 issue 时写入结果区并返回 ok=false（不阻断式静默） */
   validateLocal: () => ValidateOutcome;
-  /** 本地归一化 + 服务端 validate-connection */
+  /**
+   * 本地归一化 + 服务端参数校验。
+   * 编辑态（`endpointId` 非 null）走 Endpoint-bound `connection-check(mode=validate)`，
+   * 其余入口走 Driver-bound `POST /drivers/{id}/validate-connection`。
+   */
   validate: () => Promise<ValidateOutcome>;
-  /** 本地归一化 + 服务端 probe，按 HTTP 状态与响应体分类 */
+  /**
+   * 本地归一化 + 服务端探测，按 HTTP 状态与响应体分类。
+   * 编辑态走 Endpoint-bound `connection-check(mode=probe)`（可携带已保存凭据 marker），
+   * 其余入口走 Driver-bound `POST /drivers/{id}/probe`（只接受明文）。
+   */
   probeConnection: () => Promise<ProbeOutcome | null>;
 }
 
@@ -197,6 +239,17 @@ export function secretMarkerReason(key: string): string {
   return `字段 ${key} 仍是「已保存的凭据」标记（不是明文）；重新输入凭据后才能校验/测试。`;
 }
 
+/**
+ * Endpoint-bound 检查下 marker **位置/形状**非法的统一说明（本地拦下，不发请求）。
+ *
+ * 与 [`secretMarkerReason`] 的区别：那条是「Driver-bound 不接受任何 marker」，
+ * 这条是「Endpoint-bound 只接受 Descriptor 声明为 Secret 的字段上的规范 marker」。
+ * 两者都是安全边界，不可合并成一句含糊的「参数非法」。
+ */
+export function invalidCheckMarkerReason(keys: readonly string[]): string {
+  return `字段 ${keys.join("、")} 的凭据标记位置或形状非法：只有 Descriptor 声明的 Secret 字段可以携带 {secret_set:true} / {clear_secret:true}。已阻止校验/测试，未发出任何请求。`;
+}
+
 export function useConnectionSetup(
   options: UseConnectionSetupOptions,
 ): ConnectionSetupController {
@@ -207,6 +260,7 @@ export function useConnectionSetup(
     initialDriverId,
     initialValues,
     preserveHiddenValues = false,
+    endpointId = null,
     onDescriptorChange,
   } = options;
 
@@ -230,6 +284,12 @@ export function useConnectionSetup(
   const stateRef = useRef<SetupState>(state);
   const fieldsRef = useRef<FieldDescriptor[]>(fields);
   fieldsRef.current = fields;
+
+  // C3-C：检查通道的归属 Endpoint 也必须走 ref（与 stateRef 同理）。迟到响应除了
+  // 要比对 (driverId, revision)，还要比对 **Endpoint 身份**：同一驱动、同一 revision
+  // 在不同 Endpoint 上完全可能出现（用户切 Endpoint 后草稿按新快照重新装载）。
+  const endpointIdRef = useRef<string | null>(endpointId);
+  endpointIdRef.current = endpointId;
 
   // 服务端快照（编辑态 initialValues）：隐藏字段提交补齐时的**旧值来源**。
   // 为什么要单独留一份引用：草稿 raw 可能被程序按新 Schema 重新物化（`withDriverChange`）
@@ -471,7 +531,22 @@ export function useConnectionSetup(
     () => secretMarkerKeys(fields, state.draft.raw),
     [fields, state.draft.raw],
   );
-  const canTestConnection = secretMarkers.length === 0;
+
+  // C3-C：检查通道。Endpoint 已存在（编辑态）→ 走 Endpoint-bound 检查，
+  // 规范 marker 合法（服务端在内存中物化）；否则维持 Driver-bound 的「marker 即禁测」。
+  const checkTarget: "endpoint" | "driver" = endpointId ? "endpoint" : "driver";
+
+  /**
+   * Endpoint-bound 路径下**真正**不能发的字段：非 Secret 字段上的 marker 形状，
+   * 或 Secret 字段上的非规范取值（服务端一律 400）。空数组 = 可以发。
+   */
+  const endpointMarkerIssues = useMemo(
+    () => (checkTarget === "endpoint" ? unsupportedCheckMarkerKeys(fields, state.draft.raw) : []),
+    [checkTarget, fields, state.draft.raw],
+  );
+
+  const canTestConnection =
+    checkTarget === "endpoint" ? endpointMarkerIssues.length === 0 : secretMarkers.length === 0;
 
   // -------------------------------------------------------------------------
   // 提交前置门（P0）：按钮 disabled 与提交函数守卫共用同一判定
@@ -508,14 +583,47 @@ export function useConnectionSetup(
     const currentFields = fieldsRef.current;
     const result = normalizeConnection(raw, currentFields);
     const cleared = clearedHiddenRequiredIssues(currentFields, raw, touched);
-    if (cleared.length === 0) return result;
+    // C3-C §10.2/§10.3：`touched + 空 Secret` 显式转成 `{"clear_secret":true}`。
+    //
+    // 放在这里（而不是各调用点）是刻意的：`snapshot()`（校验/测试载荷）与
+    // `submitSnapshot()`（正式保存载荷）**都**从这里出发，因此「测试」与「保存」
+    // 两个出口的清除语义不可能分叉——只修一个出口会让「测试说不需要密码」与
+    // 「保存后旧密码还在」自相矛盾。
+    const withClears = applySecretClears(result.connection, currentFields, raw, touched);
+    if (cleared.length === 0 && withClears.clearedKeys.length === 0) return result;
     return {
-      connection: result.connection,
+      connection: withClears.connection,
       issues: [...result.issues, ...cleared],
     };
   }, []);
 
   const snapshot = useCallback(() => normalizeDraft(), [normalizeDraft]);
+
+  /**
+   * **检查用**载荷（校验 / 测试）：Endpoint-bound 的编辑态与保存载荷同源。
+   *
+   * 为什么编辑态要额外补齐 `visible_if` 隐藏字段：检查与保存如果对同一份草稿
+   * 给出不同的连接内容，探测结论就不能代表「保存后能否连通」——隐藏字段（如
+   * `native_pdu`）在探测里回落到驱动默认值，用户会看到与真实配置不符的结论。
+   * 因此只在 Endpoint-bound（编辑既有连接）时套用与 `submitSnapshot` 相同的
+   * `preserveHiddenFields`；Driver-bound（新建 / 新增）**不**改变既有载荷语义。
+   *
+   * `preserveHiddenFields` 的边界不变：只补「当前 Descriptor 内、因 `visible_if`
+   * 不满足而未进入 canonical」的字段，可见却校验失败的字段仍由校验阻断，绝不用
+   * 旧值掩盖。
+   */
+  const checkPayload = useCallback((): NormalizeResult => {
+    const result = normalizeDraft();
+    if (!endpointIdRef.current || !preserveHiddenValues) return result;
+    const { raw, touched } = stateRef.current.draft;
+    return {
+      issues: result.issues,
+      connection: preserveHiddenFields(result.connection, raw, fieldsRef.current, {
+        touched,
+        fallback: snapshotRef.current,
+      }),
+    };
+  }, [normalizeDraft, preserveHiddenValues]);
 
   /**
    * 现场构造前置门输入。
@@ -576,8 +684,9 @@ export function useConnectionSetup(
   const validate = useCallback(async (): Promise<ValidateOutcome> => {
     const current = stateRef.current;
     const targetDriver = current.driverId;
+    const targetEndpoint = endpointIdRef.current;
     const revision = current.draft.revision;
-    const result = snapshot();
+    const result = checkPayload();
     // ---------------------------------------------------------------------
     // P0 守卫：驱动清单 / 可用驱动 / 描述符任一不可用即**不发请求**。
     // 与提交路径共用同一判定（submitBlockReason）：按钮的 disabled 只是 UI 表达，
@@ -603,29 +712,50 @@ export function useConnectionSetup(
       setValidation({ kind: "error", issues: [], detail: "尚未选择驱动" });
       return { normalize: result, ok: false };
     }
-    // Secret-safe：marker 不是密码。宁可明确拒绝，也不把 marker 发出去让后端
-    // 把「凭据未回显」误判成连接失败（C3 的 Endpoint-bound check 才解决该场景）。
-    const markers = secretMarkerKeys(fieldsRef.current, current.draft.raw);
-    if (markers.length > 0) {
-      setValidation({
-        kind: "error",
-        issues: markers.map((key) => ({
-          path: `connection.${key}`,
-          code: "SECRET_MARKER_NOT_TESTABLE",
-          message: secretMarkerReason(key),
-        })),
-        detail: "已保存的凭据不会回显，本场景暂不支持校验/测试；未发出任何请求。",
-      });
-      return { normalize: result, ok: false };
+    // Secret-safe 门（两条通道的判据不同，见各自函数的文档）：
+    // - Endpoint-bound：规范 marker 合法（服务端物化），只拦位置/形状非法的 marker；
+    // - Driver-bound：任何 marker 都不能当密码发出去，本地明确拒绝，绝不伪装成
+    //   「参数非法」或「设备不可达」。
+    if (targetEndpoint) {
+      const bad = unsupportedCheckMarkerKeys(fieldsRef.current, current.draft.raw);
+      if (bad.length > 0) {
+        setValidation({
+          kind: "error",
+          issues: bad.map((key) => ({
+            path: `connection.${key}`,
+            code: "INVALID_SECRET_MARKER",
+            message: `字段 ${key} 的凭据标记位置或形状非法`,
+          })),
+          detail: invalidCheckMarkerReason(bad),
+        });
+        return { normalize: result, ok: false };
+      }
+    } else {
+      const markers = secretMarkerKeys(fieldsRef.current, current.draft.raw);
+      if (markers.length > 0) {
+        setValidation({
+          kind: "error",
+          issues: markers.map((key) => ({
+            path: `connection.${key}`,
+            code: "SECRET_MARKER_NOT_TESTABLE",
+            message: secretMarkerReason(key),
+          })),
+          detail: "已保存的凭据不会回显，本场景暂不支持校验/测试；未发出任何请求。",
+        });
+        return { normalize: result, ok: false };
+      }
     }
     actionAbort.current?.abort();
     const ac = new AbortController();
     actionAbort.current = ac;
     setBusy("validate");
     try {
-      const r = await api.validateConnection(targetDriver, result.connection, ac.signal);
+      const r = targetEndpoint
+        ? await api.connectionCheck(targetEndpoint, "validate", result.connection, ac.signal)
+        : await api.validateConnection(targetDriver, result.connection, ac.signal);
       if (ac.signal.aborted) return { normalize: result, ok: false };
-      // 迟到响应：草稿已变（或驱动已换）则整份丢弃，不污染当前结果
+      // 迟到响应：草稿已变、驱动已换**或归属 Endpoint 已变**则整份丢弃。
+      if (endpointIdRef.current !== targetEndpoint) return { normalize: result, ok: false };
       if (!isResultCurrent(stateRef.current, { driverId: targetDriver, revision })) {
         return { normalize: result, ok: false };
       }
@@ -650,13 +780,14 @@ export function useConnectionSetup(
     } finally {
       if (!ac.signal.aborted) setBusy(null);
     }
-  }, [snapshot, gateInput]);
+  }, [checkPayload, gateInput]);
 
   const probeConnection = useCallback(async (): Promise<ProbeOutcome | null> => {
     const current = stateRef.current;
     const targetDriver = current.driverId;
+    const targetEndpoint = endpointIdRef.current;
     const revision = current.draft.revision;
-    const result = snapshot();
+    const result = checkPayload();
     // ---------------------------------------------------------------------
     // P0 守卫：与 validate / 提交同一判定。驱动清单或描述符不可用时**不发探测**：
     // 此时字段集合不可信，探出来的结论只会误导用户（按钮 disabled 之外的防线）。
@@ -682,23 +813,39 @@ export function useConnectionSetup(
       return outcome;
     }
     if (!targetDriver) return null;
-    // Secret-safe：与 validate 同一道门。这里刻意**不发请求**并返回专用 outcome，
-    // 既不伪装成「设备不可达」，也不伪装成「驱动不支持探测」。
-    const markers = secretMarkerKeys(fieldsRef.current, current.draft.raw);
-    if (markers.length > 0) {
-      const outcome = secretUnavailableOutcome(
-        `连接中的凭据仍是「已保存」标记（${markers.join("、")}）；已保存的凭据不会回显，无法作为密码发送。请重新输入凭据后再测试，或直接保存（凭据会原样保留）。`,
-      );
-      setProbe(outcome);
-      return outcome;
+    // Secret-safe 门：与 validate 同一判据（Endpoint-bound 允许规范 marker）。
+    // 这里刻意**不发请求**并返回专用 outcome：既不伪装成「设备不可达」，
+    // 也不伪装成「驱动不支持探测」。
+    if (targetEndpoint) {
+      const bad = unsupportedCheckMarkerKeys(fieldsRef.current, current.draft.raw);
+      if (bad.length > 0) {
+        // 复用统一分类（400 → invalid），不另造一套文案（A26：不把对象交给 React）
+        const outcome = classifyProbeOutcome(400, {
+          error: { code: "INVALID_SECRET_MARKER", message: invalidCheckMarkerReason(bad) },
+        });
+        setProbe(outcome);
+        return outcome;
+      }
+    } else {
+      const markers = secretMarkerKeys(fieldsRef.current, current.draft.raw);
+      if (markers.length > 0) {
+        const outcome = secretUnavailableOutcome(
+          `连接中的凭据仍是「已保存」标记（${markers.join("、")}）；已保存的凭据不会回显，无法作为密码发送。请重新输入凭据后再测试，或直接保存（凭据会原样保留）。`,
+        );
+        setProbe(outcome);
+        return outcome;
+      }
     }
     actionAbort.current?.abort();
     const ac = new AbortController();
     actionAbort.current = ac;
     setBusy("probe");
     try {
-      const r = await api.probe(targetDriver, result.connection, ac.signal);
+      const r = targetEndpoint
+        ? await api.connectionCheck(targetEndpoint, "probe", result.connection, ac.signal)
+        : await api.probe(targetDriver, result.connection, ac.signal);
       if (ac.signal.aborted) return null;
+      if (endpointIdRef.current !== targetEndpoint) return null;
       if (!isResultCurrent(stateRef.current, { driverId: targetDriver, revision })) return null;
       const outcome = classifyProbeOutcome(r.status, r.body);
       setProbe(outcome);
@@ -712,7 +859,7 @@ export function useConnectionSetup(
     } finally {
       if (!ac.signal.aborted) setBusy(null);
     }
-  }, [snapshot, gateInput]);
+  }, [checkPayload, gateInput]);
 
   return {
     drivers,
@@ -734,6 +881,7 @@ export function useConnectionSetup(
     busy,
     blockReason,
     secretMarkers,
+    checkTarget,
     canTestConnection,
     snapshot,
     submitSnapshot,

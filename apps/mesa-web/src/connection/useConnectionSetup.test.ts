@@ -51,6 +51,10 @@ interface ServerOpts {
   /** 每个驱动的描述符响应闸门：resolve 前该请求一直挂起（用于迟到响应） */
   gates?: Record<string, Promise<void>>;
   probe?: () => { status: number; body: unknown };
+  /** C3-C：Endpoint-bound `connection-check` 的响应（默认 200 校验通过） */
+  connectionCheck?: () => { status: number; body: unknown };
+  /** C3-C：`connection-check` 响应闸门（用于「切 Endpoint 后迟到响应」） */
+  checkGate?: Promise<void>;
 }
 
 function installFetch(opts: ServerOpts) {
@@ -81,6 +85,11 @@ function installFetch(opts: ServerOpts) {
     }
     if (/\/probe$/.test(url)) {
       const r = opts.probe?.() ?? { status: 200, body: { reachable: true, device: { vendor: "Siemens" }, warnings: [] } };
+      return { ok: r.status < 300, status: r.status, json: async () => r.body };
+    }
+    if (/\/connection-check$/.test(url)) {
+      if (opts.checkGate) await opts.checkGate;
+      const r = opts.connectionCheck?.() ?? { status: 200, body: { valid: true, issues: [] } };
       return { ok: r.status < 300, status: r.status, json: async () => r.body };
     }
     if (/\/validate-connection$/.test(url)) {
@@ -464,5 +473,260 @@ describe("C2 Hook：隐藏字段的清除判定（P1-2）", () => {
     const snap = result.current.submitSnapshot();
     // key 缺席 → 下游 cleanConnection 后即从服务端删除（不被快照旧值兜底）
     expect(snap && "note" in snap.connection).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C3-C：Endpoint-bound 检查通道
+//
+// 纪律（两条通道判据不同，不可互相污染）：
+// - `endpointId` 非空（编辑既有连接）→ `connection-check`，规范 marker 合法；
+// - `endpointId` 为空（新建 / 新增）→ Driver-bound，marker 一律禁测。
+// 另：`touched + 空 Secret` 必须在**两个出口**（校验/测试 与 保存）都表现为
+// `{"clear_secret":true}`，否则「测试说不需要密码」与「保存后旧密码还在」会矛盾。
+// ---------------------------------------------------------------------------
+
+describe("C3-C Hook：Endpoint-bound 检查通道", () => {
+  /** 编辑既有 Endpoint 的典型 options：驱动不可切、带服务端快照。 */
+  function editOptions(endpointId: string | null): UseConnectionSetupOptions {
+    return {
+      active: true,
+      driverSelectable: false,
+      sessionKey: `edit-connection:${endpointId ?? "none"}`,
+      initialDriverId: "opcua",
+      initialValues: OPCUA_INITIAL,
+      preserveHiddenValues: true,
+      endpointId,
+    };
+  }
+
+  it("endpointId 非空：probe/validate 走 connection-check，marker 原样发出，Driver-bound 零调用", async () => {
+    const srv = installFetch({ descriptors: { opcua: { fields: OPCUA_FIELDS } } });
+    const { result } = renderSetup(editOptions("e1"));
+
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("ready"));
+    await waitFor(() => expect(result.current.secretMarkers).toEqual(["api_token"]));
+    // marker 仍被识别为「已保存凭据」，但在本通道**不再**禁测
+    expect(result.current.checkTarget).toBe("endpoint");
+    expect(result.current.canTestConnection).toBe(true);
+
+    const outcomes: Array<ProbeOutcome | null> = [];
+    await act(async () => {
+      outcomes.push(await result.current.probeConnection());
+    });
+    const check = srv.calls.find((c) => c.url.endsWith("/connection-check"));
+    expect(check?.url).toBe("/api/v1/endpoints/e1/connection-check");
+    const body = check?.body as { mode: string; connection: ConnectionValues };
+    expect(body.mode).toBe("probe");
+    // marker 原样交给服务端物化（前端绝不自行把 marker 当密码，也不删掉它）
+    expect(body.connection.api_token).toEqual({ secret_set: true });
+    expect(body.connection.endpoint_url).toBe("opc.tcp://10.0.0.2:4840");
+
+    await act(async () => {
+      await result.current.validate();
+    });
+    const modes = srv.calls
+      .filter((c) => c.url.endsWith("/connection-check"))
+      .map((c) => (c.body as { mode: string }).mode);
+    expect(modes).toEqual(["probe", "validate"]);
+
+    // 用户重新输入明文 → 发出明文（marker 被替换），而不是 marker
+    act(() => result.current.setField("api_token", "new-token"));
+    await act(async () => {
+      await result.current.probeConnection();
+    });
+    const checks = srv.calls.filter((c) => c.url.endsWith("/connection-check"));
+    const plain = checks[checks.length - 1];
+    expect((plain?.body as { connection: ConnectionValues }).connection.api_token).toBe("new-token");
+    // Driver-bound 通道一步都没走
+    expect(srv.calls.some((c) => c.url.endsWith("/probe"))).toBe(false);
+    expect(srv.calls.some((c) => c.url.endsWith("/validate-connection"))).toBe(false);
+  });
+
+  it("无 endpointId（新建/新增）：marker 仍禁测，且零检查请求（既有边界不回归）", async () => {
+    const srv = installFetch({ descriptors: { opcua: { fields: OPCUA_FIELDS } } });
+    const { result } = renderSetup({ ...editOptions(null), endpointId: undefined });
+
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("ready"));
+    await waitFor(() => expect(result.current.secretMarkers).toEqual(["api_token"]));
+    expect(result.current.checkTarget).toBe("driver");
+    expect(result.current.canTestConnection).toBe(false);
+
+    const outcomes: Array<ProbeOutcome | null> = [];
+    await act(async () => {
+      outcomes.push(await result.current.probeConnection());
+    });
+    expect(outcomes[0]?.kind).toBe("secret_unavailable");
+    expect(srv.calls.filter((c) => c.method === "POST")).toEqual([]);
+  });
+
+  it("Endpoint-bound：非 Secret 字段上的 marker 仍被本地拦下（不发请求）", async () => {
+    const srv = installFetch({ descriptors: { opcua: { fields: OPCUA_FIELDS } } });
+    const { result } = renderSetup(editOptions("e1"));
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("ready"));
+
+    // 把 marker 放到非 Secret 字段上（前端产物污染/字段声明写错的典型形态）
+    act(() => result.current.setRaw({ endpoint_url: { secret_set: true } }));
+    await waitFor(() => expect(result.current.canTestConnection).toBe(false));
+
+    const outcomes: Array<ProbeOutcome | null> = [];
+    await act(async () => {
+      outcomes.push(await result.current.probeConnection());
+    });
+    expect(outcomes[0]?.kind).toBe("invalid");
+    expect(outcomes[0] && "detail" in outcomes[0] ? outcomes[0].detail : "").toContain(
+      "endpoint_url",
+    );
+    expect(srv.calls.some((c) => c.url.endsWith("/connection-check"))).toBe(false);
+  });
+
+  it("touched + 空 Secret：校验/测试载荷与保存载荷都带 {clear_secret:true}", async () => {
+    const srv = installFetch({ descriptors: { opcua: { fields: OPCUA_FIELDS } } });
+    const { result } = renderSetup(editOptions("e1"));
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("ready"));
+
+    // 用户在凭据输入框里把内容删空（touched + 空值）→ 明确清除意图
+    act(() => result.current.setRaw({ ...OPCUA_INITIAL, api_token: "" }));
+
+    // ① 检查出口
+    await act(async () => {
+      await result.current.validate();
+    });
+    const check = srv.calls.find((c) => c.url.endsWith("/connection-check"));
+    const checkBody = check?.body as { connection: ConnectionValues };
+    expect(checkBody.connection.api_token).toEqual({ clear_secret: true });
+
+    // ② 保存出口（同一份语义：不得一个清、一个继承）
+    const submit = result.current.submitSnapshot();
+    expect(submit?.connection.api_token).toEqual({ clear_secret: true });
+  });
+
+  it("未触碰的空 Secret 不是清除：保存载荷里不得凭空出现 clear 标记", async () => {
+    installFetch({ descriptors: { opcua: { fields: OPCUA_FIELDS } } });
+    const { result } = renderSetup({
+      ...editOptions("e1"),
+      // 程序装载出来的空值（用户从未触碰）
+      initialValues: { endpoint_url: "opc.tcp://10.0.0.2:4840", api_token: "" },
+    });
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("ready"));
+
+    const submit = result.current.submitSnapshot();
+    expect(submit && "api_token" in (submit.connection ?? {})).toBe(false);
+  });
+
+  it("检查载荷与保存载荷同源：visible_if 隐藏字段在探测里不回落成驱动默认值", async () => {
+    const VIS_FIELDS = [
+      { key: "host", label: "Host", field_type: "host", required: true, validation: {}, ui: { order: 1 } },
+      { key: "use_native", label: "Use native", field_type: "boolean", required: false, validation: {}, ui: { order: 2 } },
+      {
+        key: "native_pdu",
+        label: "PDU",
+        field_type: "integer",
+        required: false,
+        validation: { min: 1, max: 65535 },
+        ui: { order: 3, visible_if: { field: "use_native", op: "eq", value: true } },
+      },
+    ];
+    const srv = installFetch({ descriptors: { opcua: { fields: VIS_FIELDS } } });
+    const { result } = renderSetup({
+      active: true,
+      driverSelectable: false,
+      sessionKey: "edit-connection:e1",
+      initialDriverId: "opcua",
+      initialValues: { host: "10.0.0.2", use_native: false, native_pdu: 8192 },
+      preserveHiddenValues: true,
+      endpointId: "e1",
+    });
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("ready"));
+    expect(result.current.raw.native_pdu).toBe(8192);
+
+    await act(async () => {
+      await result.current.probeConnection();
+    });
+    const check = srv.calls.find((c) => c.url.endsWith("/connection-check"));
+    const conn = (check?.body as { connection: ConnectionValues }).connection;
+    // 隐藏字段带着快照原值进入检查载荷：探测用的连接与「保存后会写出的连接」一致
+    expect(conn.native_pdu).toBe(8192);
+    expect(conn.host).toBe("10.0.0.2");
+  });
+
+  it("必填 Secret 被清空：本地 REQUIRED 阻断，不发任何检查请求（清空不能绕过必填）", async () => {
+    const REQ_FIELDS = [
+      { key: "endpoint_url", label: "URL", field_type: "url", required: true, validation: {}, ui: { order: 1 } },
+      { key: "password", label: "Password", field_type: "secret", required: true, validation: {}, ui: { order: 2 } },
+    ];
+    const srv = installFetch({ descriptors: { opcua: { fields: REQ_FIELDS } } });
+    const { result } = renderSetup({
+      active: true,
+      driverSelectable: false,
+      sessionKey: "edit-connection:e1",
+      initialDriverId: "opcua",
+      initialValues: { endpoint_url: "opc.tcp://10.0.0.2:4840", password: { secret_set: true } },
+      preserveHiddenValues: true,
+      endpointId: "e1",
+    });
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("ready"));
+
+    // 用户把必填凭据清空（touched + 空）→ 归一化报 REQUIRED，请求不得发出
+    act(() => result.current.setRaw({ endpoint_url: "opc.tcp://10.0.0.2:4840", password: "" }));
+    const outcomes: ValidateOutcome[] = [];
+    await act(async () => {
+      outcomes.push(await result.current.validate());
+    });
+    expect(outcomes[0].ok).toBe(false);
+    expect(outcomes[0].normalize.issues.some((i) => i.code === "REQUIRED")).toBe(true);
+    expect(srv.calls.some((c) => c.url.endsWith("/connection-check"))).toBe(false);
+  });
+
+  it("面板不可见（弹窗已关闭）时端点通道同样零请求", async () => {
+    const srv = installFetch({ descriptors: { opcua: { fields: OPCUA_FIELDS } } });
+    const { result } = renderSetup({ ...editOptions("e1"), active: false });
+    // 不可见时连描述符都不拉（既有 fail-closed 语义），blockReason 直接是 inactive
+    await waitFor(() => expect(result.current.blockReason).toBe("inactive"));
+
+    const probes: Array<ProbeOutcome | null> = [];
+    const validations: ValidateOutcome[] = [];
+    await act(async () => {
+      probes.push(await result.current.probeConnection());
+      validations.push(await result.current.validate());
+    });
+    // 与提交同一道前置门：inactive 时既不发检查请求，也不伪装成设备不可达
+    expect(validations[0].ok).toBe(false);
+    expect(probes[0]?.kind).toBe("infrastructure");
+    expect(srv.calls.filter((c) => c.method === "POST")).toEqual([]);
+  });
+
+  it("归属 Endpoint 变化后，旧 Endpoint 的迟到响应不得覆盖新会话结果", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const srv = installFetch({
+      descriptors: { opcua: { fields: OPCUA_FIELDS } },
+      checkGate: gate,
+    });
+    // options 可变：模拟父组件切换 Endpoint（sessionKey 一并变化 → 会话复位）
+    let options: UseConnectionSetupOptions = editOptions("e1");
+    const { result, rerender } = renderHook(() => useConnectionSetup(options));
+    await waitFor(() => expect(result.current.descriptorStatus).toBe("ready"));
+
+    const pending: Array<ProbeOutcome | null> = [];
+    act(() => {
+      pending.push(result.current.probeConnection() as unknown as ProbeOutcome | null);
+    });
+    // 切到 e2：draft/结果复位、在途请求中止
+    await act(async () => {
+      options = { ...editOptions("e2"), sessionKey: "edit-connection:e2" };
+      rerender();
+    });
+    expect(srv.calls.some((c) => c.url === "/api/v1/endpoints/e1/connection-check")).toBe(true);
+
+    // 放行 e1 的迟到响应：它既不能写进结果区，也不能被当成 e2 的结论
+    await act(async () => {
+      release();
+      await Promise.resolve();
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(result.current.probe).toBeNull();
   });
 });

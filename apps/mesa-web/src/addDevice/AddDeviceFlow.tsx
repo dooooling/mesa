@@ -4,6 +4,8 @@
 //   参数只由当前 Descriptor 物化，校验/探测结果随参数变化立即失效；
 //   原先的 FALLBACK_DRIVERS 常量已删除（不得把内置列表当可用驱动）；
 // - 数据步用 ResourcePickerAntd（manual 选择；browse 需 endpoint 已存在，暂只 manual）；
+//   C3-D：**允许零采集点**（离线保存）——此时提交 `acquisition.tasks=[]`，且
+//   「创建后启动」默认 false 并禁用，界面明确提示「仅保存，不启动，不立即采集」；
 // - 提交走 bootstrapDevice（create→endpoint→tasks→start，失败反向补偿，
 //   补偿失败明示残留）；成功进 Device Workspace。
 import { useEffect, useMemo, useState } from "react";
@@ -38,7 +40,12 @@ export function AddDeviceFlow() {
   // 数据步状态
   const [sels, setSels] = useState<ResourceSelection[]>([]);
   const [intervalMs, setIntervalMs] = useState(1000);
-  const [startAfterCreate, setStartAfterCreate] = useState(true);
+  // C3-D：默认**不启动**。离线保存是常态（设备未开机 / 采集点稍后定），
+  // 只有用户明确勾选才发送 start: true。
+  const [startAfterCreate, setStartAfterCreate] = useState(false);
+  // 零采集点时「创建后启动」无意义（会得到一个空转的运行态），UI 上直接禁用并
+  // 保持 false；`bootstrapDevice` 里还有第二道兜底。
+  const zeroSelections = sels.length === 0;
 
   // 提交状态
   const [submitting, setSubmitting] = useState(false);
@@ -99,12 +106,23 @@ export function AddDeviceFlow() {
     setStep(2);
   };
 
+  /**
+   * 数据步「下一步」：允许**零采集点**（C3-D 离线保存）。
+   *
+   * 纪律：跳过采集点**不**绕过连接门禁——描述符仍未就绪（`!desc`）时一律不放行，
+   * 因为那意味着连接步的前置门被绕过，此时草稿里的连接不可信。
+   */
   const commitAcquisition = () => {
-    if (!sels.length) {
-      message.warning("请至少选择一个数据点");
+    if (!desc) {
+      message.error("驱动描述符未就绪，已阻止进入确认页（连接参数未通过描述符校验）。");
       return;
     }
-    setAcquisition({ intervalMs, selections: sels, startAfterCreate });
+    setAcquisition({
+      intervalMs,
+      selections: sels,
+      // 零采集点强制不启动（与 bootstrapDevice 的第二道兜底同口径）
+      startAfterCreate: zeroSelections ? false : startAfterCreate,
+    });
     setOperationKey(newOperationKey());
     setStep(3);
   };
@@ -155,6 +173,9 @@ export function AddDeviceFlow() {
     setConnection(null);
     setAcquisition(null);
     setSels([]);
+    // C3-D：再建一个设备必须回到默认「不启动」，不得继承上一次的勾选状态
+    //（否则第二次创建会在用户没有明确选择的情况下启动采集）。
+    setStartAfterCreate(false);
     setReport(null);
     setDesc(null);
     // 新操作：旧 operationKey 作废（删除后重建相同配置必须真正执行，
@@ -269,6 +290,15 @@ export function AddDeviceFlow() {
               <div style={{ marginTop: 8, fontSize: 12, color: "#525252" }}>
                 浏览设备（browse）需连接已存在，M4.2 暂只支持手动添加；已选 {sels.length} 项。
               </div>
+              {zeroSelections ? (
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginTop: 8 }}
+                  message="未选择数据点：将按「仅保存」创建"
+                  description="本次只保存设备与连接（后端收到 acquisition.tasks=[]），不启动、不立即采集。设备离线或采集点尚未确定时可以直接下一步，稍后再到设备详情里补采集点并手动启动。"
+                />
+              ) : null}
               {sels.length > 0 && (
                 <div style={{ marginTop: 8, display: "grid", gap: 4 }}>
                   {sels.map((s, i) => (
@@ -283,9 +313,20 @@ export function AddDeviceFlow() {
                 <span style={{ fontSize: 12 }}>采集周期</span>
                 <InputNumber min={100} value={intervalMs} onChange={(v) => setIntervalMs(typeof v === "number" ? v : 1000)} />
                 <span style={{ fontSize: 12 }}>ms</span>
-                <Checkbox checked={startAfterCreate} onChange={(e) => setStartAfterCreate(e.target.checked)}>
+                <Checkbox
+                  checked={!zeroSelections && startAfterCreate}
+                  disabled={zeroSelections}
+                  onChange={(e) => setStartAfterCreate(e.target.checked)}
+                >
                   创建后启动
                 </Checkbox>
+                <span style={{ fontSize: 12, color: "#525252" }}>
+                  {zeroSelections
+                    ? "零采集点：创建后为 STOPPED（仅保存配置）"
+                    : startAfterCreate
+                      ? "创建成功后立即开始采集"
+                      : "仅保存，不启动，不立即采集"}
+                </span>
               </div>
             </>
           )}
@@ -301,10 +342,10 @@ export function AddDeviceFlow() {
           <pre style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12, background: "#f4f4f4", padding: 12 }}>
 {`${device?.deviceId}（${device?.deviceName}）
 └─ ${connection?.endpointName} [${connection?.driverId}]
-   └─ ${acquisition?.selections.length} 个数据点 · ${acquisition?.intervalMs}ms${acquisition?.startAfterCreate ? " · 创建后启动" : ""}`}
+   └─ ${acquisition?.selections.length === 0 ? "零采集点（仅保存连接）" : `${acquisition?.selections.length} 个数据点 · ${acquisition?.intervalMs}ms`} · ${acquisition?.startAfterCreate ? "创建后启动" : "仅保存（不启动、不立即采集）"}`}
           </pre>
           {!draftComplete && (
-            <Alert type="warning" showIcon message="草稿不完整" description="请返回前面步骤补齐设备、连接与数据选择。" />
+            <Alert type="warning" showIcon message="草稿不完整" description="请返回前面步骤补齐设备与连接（采集点可以为空：零采集点将按「仅保存」创建）。" />
           )}
           {report && !report.ok && (
             <Alert

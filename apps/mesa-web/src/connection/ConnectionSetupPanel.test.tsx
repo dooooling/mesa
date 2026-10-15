@@ -50,6 +50,8 @@ interface ServerOpts {
   probe?: ProbeResponder;
   probeThrows?: boolean;
   validate?: ProbeResponder;
+  /** C3-C：Endpoint-bound `connection-check` 的响应 */
+  connectionCheck?: ProbeResponder;
 }
 
 function installFetch(opts: ServerOpts) {
@@ -88,6 +90,13 @@ function installFetch(opts: ServerOpts) {
         status: 200,
         body: { reachable: true, device: { vendor: "Siemens" }, warnings: [] },
       };
+      return { ok: r.status < 300, status: r.status, json: async () => r.body };
+    }
+    // C3-C：Endpoint-bound 检查（编辑态）。模式由请求体的 `mode` 区分，
+    // 默认回「校验通过」；探测用例传入自己的响应。
+    const check = /^\/api\/v1\/endpoints\/([^/]+)\/connection-check$/.exec(url);
+    if (check) {
+      const r = opts.connectionCheck?.() ?? { status: 200, body: { valid: true, issues: [] } };
       return { ok: r.status < 300, status: r.status, json: async () => r.body };
     }
     const validate = /^\/api\/v1\/drivers\/([^/]+)\/validate-connection$/.exec(url);
@@ -543,6 +552,132 @@ describe("C2 面板：Secret-safe 边界（编辑态）", () => {
     await waitFor(() => expect(probeCalls(srv.calls).length).toBe(1));
     const body = probeCalls(srv.calls)[0].body as { connection: ConnectionValues };
     expect(body.connection.api_token).toBe("new-token");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C3-C：编辑态接通 Endpoint-bound 检查
+//
+// 纪律：只有「编辑既有连接」（mode=edit + endpointId）才解除「含 marker 即禁测」；
+// 新建/新增必须保持 Driver-bound 边界（marker 绝不进 /probe）。
+// ---------------------------------------------------------------------------
+
+describe("C3-C 面板：编辑态 Endpoint-bound 检查（已保存凭据可用）", () => {
+  const SECRET_FIELDS = [
+    { key: "endpoint_url", label: "Endpoint URL", field_type: "url", required: true, validation: {}, ui: { order: 1 } },
+    { key: "api_token", label: "API Token", field_type: "secret", required: false, validation: {}, ui: { order: 2 } },
+  ];
+  const SAVED: ConnectionValues = {
+    endpoint_url: "opc.tcp://10.0.0.2:4840",
+    api_token: { secret_set: true },
+  };
+
+  function checkCalls(calls: Call[]): Call[] {
+    return calls.filter((c) => c.url.endsWith("/connection-check"));
+  }
+
+  function renderEditEndpoint(
+    opts: ServerOpts = {},
+    overrides: Partial<React.ComponentProps<typeof ConnectionSetupPanel>> = {},
+  ) {
+    const srv = installFetch({
+      drivers: [{ id: "opcua", name: "OPC UA", launchable: true }],
+      descriptors: { opcua: { fields: SECRET_FIELDS } },
+      ...opts,
+    });
+    const onSubmit = vi.fn();
+    const utils = render(
+      <ConnectionSetupPanel
+        mode="edit"
+        driverSelectable={false}
+        initialDriverId="opcua"
+        endpointId="ep-1"
+        initialValues={SAVED}
+        onSubmit={onSubmit}
+        {...overrides}
+      />,
+    );
+    return { ...utils, srv, onSubmit };
+  }
+
+  it("marker 解禁：校验/测试可用，请求发往 /endpoints/ep-1/connection-check 且 marker 原样", async () => {
+    const { srv } = renderEditEndpoint({
+      connectionCheck: () => ({
+        status: 200,
+        body: { reachable: true, device: { vendor: "Mesa" }, warnings: [] },
+      }),
+    });
+
+    // 文案从「暂不支持」换成「使用已保存凭据」，且不再禁用
+    await screen.findByText(/将使用已保存的凭据/);
+    expect(screen.queryByText(/本场景暂不支持校验\/测试/)).toBeNull();
+    const probeBtn = screen.getByRole("button", { name: /测试连接/ }) as HTMLButtonElement;
+    const validateBtn = screen.getByRole("button", { name: /校验参数/ }) as HTMLButtonElement;
+    expect(probeBtn.disabled).toBe(false);
+    expect(validateBtn.disabled).toBe(false);
+
+    fireEvent.click(probeBtn);
+    await waitFor(() => expect(checkCalls(srv.calls).length).toBe(1));
+    const body = checkCalls(srv.calls)[0].body as { mode: string; connection: ConnectionValues };
+    expect(body.mode).toBe("probe");
+    // marker 由服务端按该 Endpoint 物化：前端既不发送明文，也不把 marker 抹掉
+    expect(body.connection.api_token).toEqual({ secret_set: true });
+
+    fireEvent.click(validateBtn);
+    await waitFor(() => expect(checkCalls(srv.calls).length).toBe(2));
+    expect((checkCalls(srv.calls)[1].body as { mode: string }).mode).toBe("validate");
+
+    // Driver-bound 通道零调用（marker 绝不进 /probe、/validate-connection）
+    expect(probeCalls(srv.calls).length).toBe(0);
+    expect(srv.calls.some((c) => c.url.endsWith("/validate-connection"))).toBe(false);
+  });
+
+  it("两出口同口径：清空凭据 → 检查请求与保存负载都带 {clear_secret:true}", async () => {
+    const { srv, onSubmit } = renderEditEndpoint();
+    await screen.findByText(/将使用已保存的凭据/);
+
+    // 用户在凭据输入框里输入后又删空（touched + 空值）——若只丢 key，服务端会拿旧密码。
+    // 注意：marker 态输入框显示空值，直接 change 成 "" 会被 React 视为「值没变」而不触发
+    // onChange，因此按真实用户动作「先输入、再删空」构造。
+    const token = document.querySelector('input[type="password"]') as HTMLInputElement;
+    fireEvent.change(token, { target: { value: "temp" } });
+    fireEvent.change(token, { target: { value: "" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /测试连接/ }));
+    await waitFor(() => expect(checkCalls(srv.calls).length).toBe(1));
+    const checkBody = checkCalls(srv.calls)[0].body as { connection: ConnectionValues };
+    expect(checkBody.connection.api_token).toEqual({ clear_secret: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /保\s*存/ }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    const payload = onSubmit.mock.calls[0][0] as { connection: ConnectionValues };
+    expect(payload.connection.api_token).toEqual({ clear_secret: true });
+    // 其余字段不受影响（清除只针对被显式清空的 Secret）
+    expect(payload.connection.endpoint_url).toBe("opc.tcp://10.0.0.2:4840");
+  });
+
+  it("面板层守卫：非 edit 模式即使被传了 endpointId 也仍走 Driver-bound（marker 禁测）", async () => {
+    // 用 create-draft + 快照权威（driverSelectable=false）构造：草稿里保留 marker，
+    // 只有面板层「mode === \"edit\" 才认 endpointId」这一道守卫能决定走哪条通道。
+    const srv = installFetch({
+      descriptors: { opcua: { fields: SECRET_FIELDS } },
+    });
+    render(
+      <ConnectionSetupPanel
+        mode="create-draft"
+        driverSelectable={false}
+        initialDriverId="opcua"
+        endpointId="ep-1"
+        initialValues={SAVED}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    // 走回 Driver-bound 的阻断文案与禁用态（marker 不是密码）
+    await screen.findByText(/已保存的凭据不会回显/);
+    expect((screen.getByRole("button", { name: /测试连接/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(checkCalls(srv.calls).length).toBe(0);
+    expect(probeCalls(srv.calls).length).toBe(0);
   });
 });
 

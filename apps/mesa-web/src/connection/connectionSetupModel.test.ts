@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  applySecretClears,
   classifyProbeOutcome,
   clearedHiddenRequiredIssues,
   containsSecretMarker,
@@ -9,6 +10,7 @@ import {
   groupFields,
   initialSetupState,
   isBooleanField,
+  isCanonicalSecretMarker,
   isDurationField,
   isIntegerField,
   isFieldVisible,
@@ -26,6 +28,7 @@ import {
   secretUnavailableOutcome,
   submitBlockReason,
   touchedKeys,
+  unsupportedCheckMarkerKeys,
   withDriverChange,
   withFieldChange,
   type FieldDescriptor,
@@ -803,5 +806,151 @@ describe("safeText：issue path 前缀去重（P2）", () => {
     expect(describeIssue({ path: "connection.host", code: "", message: "缺少必填" })).toBe(
       "connection.host：缺少必填",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C3-C：Endpoint-bound 检查的 Secret 语义（marker 白名单 + 明确清除）
+// ---------------------------------------------------------------------------
+
+/** 编辑态典型字段集：一个 Secret（可空）与一个必填 Secret（用于 required 交互）。 */
+const C3_FIELDS: FieldDescriptor[] = [
+  { key: "endpoint_url", label: "Endpoint URL", field_type: "Url", required: true, ui: { order: 1 } },
+  { key: "username", label: "Username", field_type: "String", required: false, ui: { order: 2 } },
+  { key: "password", label: "Password", field_type: "Secret", required: false, ui: { order: 3 } },
+];
+
+describe("C3-C：规范 marker 判定", () => {
+  it("只认 {secret_set:true} / {clear_secret:true} 这两种单键形状", () => {
+    expect(isCanonicalSecretMarker({ secret_set: true })).toBe(true);
+    expect(isCanonicalSecretMarker({ clear_secret: true })).toBe(true);
+    // 与 Core classify_secret_value 同口径的严格性：多键 / false / 非法键名 / 非对象一律不认
+    expect(isCanonicalSecretMarker({ secret_set: true, x: 1 })).toBe(false);
+    expect(isCanonicalSecretMarker({ secret_set: true, clear_secret: true })).toBe(false);
+    expect(isCanonicalSecretMarker({ secret_set: false })).toBe(false);
+    expect(isCanonicalSecretMarker({ clear_secret: "yes" })).toBe(false);
+    expect(isCanonicalSecretMarker({})).toBe(false);
+    expect(isCanonicalSecretMarker([{ secret_set: true }])).toBe(false);
+    expect(isCanonicalSecretMarker("plain")).toBe(false);
+    expect(isCanonicalSecretMarker(null)).toBe(false);
+  });
+});
+
+describe("C3-C：Endpoint-bound 检查可接受的 marker（unsupportedCheckMarkerKeys）", () => {
+  it("Secret 字段上的规范 marker 与明文都合法（这正是该接口存在的意义）", () => {
+    expect(
+      unsupportedCheckMarkerKeys(C3_FIELDS, {
+        endpoint_url: "opc.tcp://a:4840",
+        password: { secret_set: true },
+      }),
+    ).toEqual([]);
+    expect(
+      unsupportedCheckMarkerKeys(C3_FIELDS, {
+        endpoint_url: "opc.tcp://a:4840",
+        password: { clear_secret: true },
+      }),
+    ).toEqual([]);
+    expect(
+      unsupportedCheckMarkerKeys(C3_FIELDS, {
+        endpoint_url: "opc.tcp://a:4840",
+        password: "new-pw",
+      }),
+    ).toEqual([]);
+    // 空值不算问题：清除意图由 applySecretClears 表达（缺席会被服务端读成「继承」）
+    expect(
+      unsupportedCheckMarkerKeys(C3_FIELDS, { endpoint_url: "opc.tcp://a:4840", password: "" }),
+    ).toEqual([]);
+  });
+
+  it("非 Secret 字段上的 marker 形状 / Secret 字段上的非规范取值必须拦下", () => {
+    expect(
+      unsupportedCheckMarkerKeys(C3_FIELDS, {
+        endpoint_url: { secret_set: true },
+        username: "u",
+      }),
+    ).toEqual(["endpoint_url"]);
+    // 嵌套形状同样拦（服务端 contains_marker_shape 的同一判据）
+    expect(
+      unsupportedCheckMarkerKeys(C3_FIELDS, { endpoint_url: "opc.tcp://a", username: { a: { b: { clear_secret: true } } } }),
+    ).toEqual(["username"]);
+    // Secret 字段上的多键对象 / 裸对象 / 数字都不可能是可用凭据
+    expect(unsupportedCheckMarkerKeys(C3_FIELDS, { password: { secret_set: true, x: 1 } })).toEqual([
+      "password",
+    ]);
+    expect(unsupportedCheckMarkerKeys(C3_FIELDS, { password: { user: "u" } })).toEqual(["password"]);
+    expect(unsupportedCheckMarkerKeys(C3_FIELDS, { password: 123 })).toEqual(["password"]);
+    expect(unsupportedCheckMarkerKeys(C3_FIELDS, { password: ["pw"] })).toEqual(["password"]);
+  });
+});
+
+describe("C3-C：touched + 空 Secret → {clear_secret:true}（两出口同口径）", () => {
+  const RAW_BASE = { endpoint_url: "opc.tcp://a:4840", username: "u" };
+
+  it("用户显式清空 Secret → 归一化结果里是 clear 标记，而不是缺席", () => {
+    const raw = { ...RAW_BASE, password: "" };
+    const normalized = normalizeConnection(raw, C3_FIELDS);
+    // 预置：不做转换时该字段会缺席（服务端会读成「继承旧值」——正是 §10.2 的缺口）
+    expect(normalized.connection.password).toBeUndefined();
+
+    const { connection, clearedKeys } = applySecretClears(
+      normalized.connection,
+      C3_FIELDS,
+      raw,
+      ["password"],
+    );
+    expect(connection.password).toEqual({ clear_secret: true });
+    expect(clearedKeys).toEqual(["password"]);
+  });
+
+  it("null / undefined 形态同样是「清除」（只要 touched 命中）", () => {
+    for (const value of [null, undefined]) {
+      const raw = { ...RAW_BASE, password: value };
+      const { connection } = applySecretClears({}, C3_FIELDS, raw, ["password"]);
+      expect(connection.password).toEqual({ clear_secret: true });
+    }
+  });
+
+  it("未触碰的空值不是清除（程序初始化 / 快照装载不得当作用户意图）", () => {
+    const raw = { ...RAW_BASE, password: "" };
+    const { connection, clearedKeys } = applySecretClears({}, C3_FIELDS, raw, []);
+    expect(connection.password).toBeUndefined();
+    expect(clearedKeys).toEqual([]);
+  });
+
+  it("非 Secret 字段的空值与明文 Secret 都不受影响（范围严格限定）", () => {
+    const raw = { endpoint_url: "", username: "", password: "plain-pw" };
+    const { connection, clearedKeys } = applySecretClears(
+      {},
+      C3_FIELDS,
+      raw,
+      ["endpoint_url", "username", "password"],
+    );
+    expect(clearedKeys).toEqual([]);
+    expect(connection.password).toBeUndefined(); // 明文由 normalizeConnection 负责写入
+    expect(connection.endpoint_url).toBeUndefined();
+    expect(connection.username).toBeUndefined();
+  });
+
+  it("用户点「清除凭据」（marker 形态）不被重复改写", () => {
+    const raw = { ...RAW_BASE, password: { clear_secret: true } };
+    const { connection, clearedKeys } = applySecretClears({}, C3_FIELDS, raw, ["password"]);
+    expect(clearedKeys).toEqual([]);
+    expect(connection.password).toBeUndefined();
+  });
+
+  it("必填 Secret 被清空：清除标记照常产出，但 REQUIRED 同时成立（本地仍阻断）", () => {
+    const fields: FieldDescriptor[] = [
+      { key: "endpoint_url", label: "URL", field_type: "Url", required: true, ui: { order: 1 } },
+      { key: "password", label: "Password", field_type: "Secret", required: true, ui: { order: 2 } },
+    ];
+    const raw = { endpoint_url: "opc.tcp://a:4840", password: "" };
+    const normalized = normalizeConnection(raw, fields);
+    // 归一化照旧报必填（不得因为「会被转成 clear 标记」就放过必填缺失）
+    expect(
+      normalized.issues.some((i) => i.code === "REQUIRED" && i.path === "connection.password"),
+    ).toBe(true);
+    // 清除意图仍然如实表达给服务端（服务端会以同一份 REQUIRED 拒绝：清空不能绕过必填）
+    const { connection } = applySecretClears(normalized.connection, fields, raw, ["password"]);
+    expect(connection.password).toEqual({ clear_secret: true });
   });
 });

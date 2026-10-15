@@ -22,6 +22,8 @@ use tokio_util::sync::CancellationToken;
 
 pub mod bootstrap;
 pub mod certificates;
+/// C3-A：Endpoint-bound 连接检查（尚未保存的连接草稿，只读、无副作用）。
+pub(crate) mod connection_check;
 pub mod runtime;
 use certificates::CertStore;
 
@@ -490,6 +492,76 @@ fn redact_connection_for_response(
     conn
 }
 
+/// Secret 引用失败的两种语义。**必须分开映射，不得合并**：
+///
+/// - [`SecretRefError::Missing`]：`{"secret_set": true}` 指向的 Secret 在**该
+///   Endpoint、该字段**上不存在。调用方按「引用无效」处理（REST 400）。用户在
+///   界面上看到「已保存凭据」而服务端却查无记录时必须明说，绝不能静默降级成
+///   不带凭据的连接（那会把「凭据丢了」伪装成「设备不需要认证」）。
+/// - [`SecretRefError::Store`]：SecretStore 基础设施故障（`master.key` 缺失或
+///   内容非法、AEAD 解密失败、SQLite 错误）。调用方**一律**映射 503，这是硬
+///   红线：密钥丢失/密文损坏既不是参数错误也不是设备不可达，把它显示成后者会
+///   引导用户去查网络，而真正要修的是密钥；更不允许降级为匿名连接。
+#[derive(Debug)]
+pub(crate) enum SecretRefError {
+    /// 引用无效：marker 存在但该 Endpoint 上没有这条 Secret（字段名不含明文）。
+    Missing(String),
+    /// SecretStore 不可用（原因保留在 StoreError 内，绝不篡改分类）。
+    Store(StoreError),
+}
+
+/// SecretStore 读取的**唯一**底层入口（C1 运行期构造、PUT 的 Secret 分支与 C3
+/// 草稿检查共用）。
+///
+/// 为什么值得单独抽一层：调用方需要区分的是「没有这条 Secret」（`Ok(None)`，
+/// 语义由调用方决定）与「读不出来」（`Err`，一律基础设施故障），而
+/// `StoreError` 自身无法表达这个区别（缺记录与解密失败在业务语义上完全不同）。
+///
+/// 为什么 PUT 也要走这里：`update_endpoint()` 的「marker 保留」与「缺失继承」
+/// 两个分支都直接查 SecretStore，而 C3 的 `connection-check` 必须与它逐字段
+/// 同源（否则会出现「PUT 会继承、检查却不继承」的偏差）。让两侧共用同一个函数
+/// 后，这种对齐是**代码级事实**而不是两段相似代码的巧合；函数体是直通的
+/// `get_secret`，行为与错误类型完全不变。
+pub(crate) fn read_stored_secret(
+    store: &ConfigStore,
+    endpoint_id: &str,
+    field: &str,
+) -> Result<Option<String>, StoreError> {
+    store.get_secret(endpoint_id, field)
+}
+
+/// C1 Secret 物化原语（仅内存）：把对象上 `{"secret_set": true}` marker 就地
+/// 还原为明文，返回被物化的字段名（**只有字段名，不含明文**，供诊断与测试）。
+///
+/// 为什么是共享函数而不是各自实现：运行期 Endpoint 构造
+/// （[`materialize_connection`]）与 C3 的**内存草稿**检查必须使用完全相同的
+/// marker 语义。两处各写一遍，迟早会在「什么算 marker」「marker 缺 Secret 时
+/// 算失败还是算空」上分叉，而这类分叉的后果就是把 marker 当密码发给 Driver，
+/// 或把丢凭证伪装成匿名连接。本函数只做物化、不做策略：缺记录与读失败一律
+/// 上抛，由调用方映射状态码。
+pub(crate) fn materialize_secret_markers_in_place(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    endpoint_id: &str,
+    store: &ConfigStore,
+    secret_keys: &[String],
+) -> Result<Vec<String>, SecretRefError> {
+    let mut materialized = Vec::new();
+    for key in secret_keys {
+        if let Some(cur) = obj.get(key).cloned() {
+            if is_secret_marker(&cur) {
+                match read_stored_secret(store, endpoint_id, key).map_err(SecretRefError::Store)? {
+                    Some(pt) => {
+                        obj.insert(key.clone(), serde_json::Value::String(pt));
+                        materialized.push(key.clone());
+                    }
+                    None => return Err(SecretRefError::Missing(key.clone())),
+                }
+            }
+        }
+    }
+    Ok(materialized)
+}
+
 /// 启动/探测时：将 marker 临时还原为明文（仅内存，不写盘）。
 ///
 /// fail-closed（C1 P0）：`connection_json` 必须是**合法 JSON 对象**。此前用
@@ -503,29 +575,20 @@ fn materialize_connection(
     secret_keys: &[String],
 ) -> Result<String, StoreError> {
     let mut v: serde_json::Value = serde_json::from_str(conn_str).map_err(StoreError::Json)?;
-    if !v.is_object() {
+    let Some(obj) = v.as_object_mut() else {
         return Err(StoreError::Validation(format!(
             "connection_json 必须是 JSON 对象（endpoint `{endpoint_id}`）"
         )));
-    }
-    if let Some(obj) = v.as_object_mut() {
-        for key in secret_keys {
-            if let Some(cur) = obj.get(key).cloned() {
-                if is_secret_marker(&cur) {
-                    match store.get_secret(endpoint_id, key) {
-                        Ok(Some(pt)) => {
-                            obj.insert(key.clone(), serde_json::Value::String(pt));
-                        }
-                        Ok(None) => {
-                            return Err(StoreError::Validation(format!(
-                                "secret `{key}` marker 存在但 SecretStore 无记录 (endpoint `{endpoint_id}`)"
-                            )));
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
+    };
+    match materialize_secret_markers_in_place(obj, endpoint_id, store, secret_keys) {
+        Ok(_) => {}
+        // 错误映射逐字保持 C1 既有行为（错误文本被既有测试与运维检索依赖）
+        Err(SecretRefError::Missing(key)) => {
+            return Err(StoreError::Validation(format!(
+                "secret `{key}` marker 存在但 SecretStore 无记录 (endpoint `{endpoint_id}`)"
+            )));
         }
+        Err(SecretRefError::Store(e)) => return Err(e),
     }
     serde_json::to_string(&v).map_err(StoreError::Json)
 }
@@ -646,31 +709,27 @@ async fn validate_connection(
     }
 }
 
-/// 动态探测（§8）：纯 HTTP 映射，编排（临时进程/Probe RPC/匹配/清理）
-/// 全部收敛在 `MesaManager::probe()`，本层只做形状转换与状态码映射。
-/// - 200：探测完成（含设备不可达 `reachable:false`，那是探测结果）；
-/// - 404/400：输入问题；501：Driver 不支持；503：基础设施失败；504：超时。
-async fn probe_driver(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<serde_json::Value>,
+/// 探测结果的**唯一** HTTP 映射点（既有 `/drivers/{id}/probe` 与 C3
+/// `POST /endpoints/{id}/connection-check` 的 `mode=probe` 共用）。
+///
+/// 为什么必须共用而不是各写一套：状态码分层是冻结契约（§5：200 可达/不可达、
+/// 400 输入、404 驱动不存在、501 不支持探测、503 基础设施、504 超时）。两份
+/// 相似代码迟早会在某个分支上分叉，而分叉的表现是「同一个探测在两个入口给出
+/// 不同诊断」，用户与运维都会据此得出错误结论。
+///
+/// 分层口径：
+/// - 200：探测**完成**（`reachable:false` 也是探测结果，不是错误）；
+/// - 404/400：Driver 不存在 / 输入问题（含 Driver 侧 ConfigurationError）；
+/// - 501：Driver 不支持探测；503：spawn/握手/RPC 等基础设施失败；504：超时。
+///
+/// NOTE（脱敏职责不在这里）：本函数只做形状与状态码映射，**不做**凭据擦除。
+/// 调用方（C3 路径）负责在下发前按 Descriptor 的 Secret 字段做值级擦除——
+/// 因为只有它同时掌握 Schema 与本次物化出来的明文；既有 `/drivers/{id}/probe`
+/// 的调用方自带明文（无 SecretStore 参与），返回值也只回到该调用方。
+pub(crate) fn probe_result_to_response(
+    result: Result<mesa_core_types::ProbeReport, mesa_driver_manager::probe::ProbeError>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let conn_val = if let Some(c) = body.get("connection") {
-        c.clone()
-    } else {
-        body.clone()
-    };
-    if !conn_val.is_object() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json_error(
-                "VALIDATION_ERROR",
-                "connection must be an object",
-            )),
-        );
-    }
-    let conn_str = serde_json::to_string(&conn_val).unwrap();
-    match state.manager.probe(&id, &conn_str).await {
+    match result {
         Ok(r) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -715,6 +774,33 @@ async fn probe_driver(
             }
         }
     }
+}
+
+/// 动态探测（§8）：纯 HTTP 映射，编排（临时进程/Probe RPC/匹配/清理）
+/// 全部收敛在 `MesaManager::probe()`，本层只做形状转换与状态码映射。
+/// - 200：探测完成（含设备不可达 `reachable:false`，那是探测结果）；
+/// - 404/400：输入问题；501：Driver 不支持；503：基础设施失败；504：超时。
+async fn probe_driver(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let conn_val = if let Some(c) = body.get("connection") {
+        c.clone()
+    } else {
+        body.clone()
+    };
+    if !conn_val.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "VALIDATION_ERROR",
+                "connection must be an object",
+            )),
+        );
+    }
+    let conn_str = serde_json::to_string(&conn_val).unwrap();
+    probe_result_to_response(state.manager.probe(&id, &conn_str).await)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1933,7 +2019,8 @@ async fn update_endpoint(
                         }
                         Some(v) if is_secret_marker(&v) => {
                             // marker：须存在旧值；logical 物化真实旧值参检
-                            match state.store.get_secret(&id, sk) {
+                            //（走唯一读入口 `read_stored_secret`，与 C3 检查同源）
+                            match read_stored_secret(&state.store, &id, sk) {
                                 Ok(Some(pt)) => {
                                     if let Some(lo) = logical_obj.as_mut() {
                                         lo.insert(sk.clone(), serde_json::Value::String(pt));
@@ -1969,8 +2056,11 @@ async fn update_endpoint(
                         None => {
                             // 缺失 → 保留旧值：旧值存在则 logical 继承真实值参检，
                             // persistence 保持 marker；无旧值则两侧都缺失
-                            //（required 与否由统一校验裁决）
-                            match state.store.get_secret(&id, sk) {
+                            //（required 与否由统一校验裁决）。
+                            // 这里是 C3 `connection-check` 的缺失继承**对齐基准**：
+                            // 直接查 SecretStore（唯一读入口）而不是解析
+                            // `connection_json`，因此连接检查必须同样先查 SecretStore。
+                            match read_stored_secret(&state.store, &id, sk) {
                                 Ok(Some(pt)) => {
                                     if let Some(lo) = logical_obj.as_mut() {
                                         lo.insert(sk.clone(), serde_json::Value::String(pt));
@@ -3169,6 +3259,12 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .delete(delete_endpoint),
         )
         .route("/api/v1/endpoints/{id}/state", get(endpoint_state))
+        // C3-A：Endpoint-bound 连接检查。endpoint_id 只来自 URL，driver_id 只读
+        // 已保存记录；请求体形状由 handler 内 deny_unknown_fields 拒绝覆盖。
+        .route(
+            "/api/v1/endpoints/{endpoint_id}/connection-check",
+            post(connection_check::connection_check),
+        )
         .route(
             "/api/v1/endpoints/{id}/diagnostics",
             get(endpoint_diagnostics),
