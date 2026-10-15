@@ -261,7 +261,13 @@ describe("C2 ConnectionEditorModal：生命周期顺序与失败语义", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /停止并应用/ }));
     await waitFor(() => expect(order).toEqual(["stop", "apply", "start"]));
-    expect(screen.getByText(/修改成功，已恢复运行/)).toBeTruthy();
+    // 必须**等待**提示渲染，不能同步断言：`order` 的最后一个元素是在
+    // `startEndpoint` 的 mock **内部**记录（push）的，所以上面的 waitFor 只保证
+    // 「调用已发生」，并不保证该 Promise 链已返回、React 已提交更新、
+    // `message.success`（ConnectionEditorModal.tsx 成功路径无条件渲染）已挂载。
+    // 本机快时同步 getByText 会侥幸命中，CI 负载下失败——实测 run 38749398014 报
+    // `Unable to find an element with the text: /修改成功，已恢复运行/`。
+    expect(await screen.findByText(/修改成功，已恢复运行/)).toBeTruthy();
   });
 
   it("Stop 失败：中止应用，绝不 Apply / Start", async () => {
