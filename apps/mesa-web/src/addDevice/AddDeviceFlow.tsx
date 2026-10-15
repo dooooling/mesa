@@ -1,31 +1,25 @@
 // M4.2 AddDeviceFlow：替换旧 Onboarding（路由 /devices/new，唯一入口“+ 添加设备”）。
 // - 设备 → 连接 → 数据 → 确认四步，前三步只攒 draft，最后一步才编排提交；
-// - 连接表单 Descriptor-driven（校验/探测复用 api）；数据步用 ResourcePickerAntd
-//  （manual 选择；browse 需 endpoint 已存在，M4.2 暂只 manual——备注说明）；
+// - 连接步（C2）改用共享面板 ConnectionSetupPanel：驱动清单/描述符失败即禁止前进，
+//   参数只由当前 Descriptor 物化，校验/探测结果随参数变化立即失效；
+//   原先的 FALLBACK_DRIVERS 常量已删除（不得把内置列表当可用驱动）；
+// - 数据步用 ResourcePickerAntd（manual 选择；browse 需 endpoint 已存在，暂只 manual）；
 // - 提交走 bootstrapDevice（create→endpoint→tasks→start，失败反向补偿，
 //   补偿失败明示残留）；成功进 Device Workspace。
 import { useEffect, useMemo, useState } from "react";
-import { Alert, Button, Card, Checkbox, Form, Input, InputNumber, Select, Space, Steps, Tag, message } from "antd";
+import { Alert, Button, Card, Checkbox, Form, Input, InputNumber, Space, Steps, Tag, message } from "antd";
 import { useNavigate } from "react-router-dom";
-import { api } from "../api";
 import type { DriverDescriptor } from "../types";
 import {
   buildEndpointCreatePayload,
-  cleanConnection,
   suggestEndpointId,
   type ResourceSelection,
 } from "../deviceModel";
-import { DescriptorFields, materializeSchemaDefaults } from "../components/DescriptorFields";
+import type { ConnectionValues } from "../connection/connectionSetupModel";
+import { ConnectionSetupPanel } from "../connection/ConnectionSetupPanel";
 import { ResourcePickerAntd } from "../components/ResourcePickerAntd";
 import { applySelectionAdd } from "../resourceSelectionModel";
 import { bootstrapDevice, isDraftComplete, newOperationKey, type AcquisitionDraft, type BootstrapReport, type ConnectionDraft, type DeviceDraft } from "./bootstrap";
-
-const FALLBACK_DRIVERS = [
-  { value: "s7", label: "Siemens S7" },
-  { value: "focas2", label: "FANUC FOCAS2" },
-  { value: "opcua", label: "OPC UA" },
-  { value: "sinumerik-nck", label: "SINUMERIK NCK" },
-];
 
 export function AddDeviceFlow() {
   const nav = useNavigate();
@@ -36,15 +30,10 @@ export function AddDeviceFlow() {
   const [connection, setConnection] = useState<ConnectionDraft | null>(null);
   const [acquisition, setAcquisition] = useState<AcquisitionDraft | null>(null);
 
-  // 连接步状态（Descriptor-driven，与 Onboarding/DeviceDetail 同源逻辑）
-  const [driverId, setDriverId] = useState("s7");
-  const [driverOptions, setDriverOptions] = useState(FALLBACK_DRIVERS);
+  // 连接步状态：描述符由面板上报（数据步需要 resources 目录），其余由面板自持
   const [desc, setDesc] = useState<DriverDescriptor | null>(null);
-  const [conn, setConn] = useState<Record<string, unknown>>({});
   const [connName, setConnName] = useState("");
   const [connId, setConnId] = useState("");
-  const [probe, setProbe] = useState<{ ok: boolean; msg: string } | null>(null);
-  const [issues, setIssues] = useState<Array<{ path: string; message: string }>>([]);
 
   // 数据步状态
   const [sels, setSels] = useState<ResourceSelection[]>([]);
@@ -57,27 +46,6 @@ export function AddDeviceFlow() {
   // RC2 修3：operation key（per-operation 幂等）。进入确认页生成一次，
   // 同一 Flow 内重复提交（重试/双击）复用；reset（再建一个）即新操作新 key。
   const [operationKey, setOperationKey] = useState("");
-
-  useEffect(() => {
-    api.listDrivers().then((j) => {
-      const ds = ((j as { drivers?: Array<{ id: string; name: string }> }).drivers ?? [])
-        .map((d) => ({ value: d.id, label: d.name }));
-      if (ds.length) {
-        setDriverOptions(ds);
-        setDriverId((cur) => (ds.some((x) => x.value === cur) ? cur : ds[0].value));
-      }
-    }).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    if (step !== 1) return;
-    fetch(`/api/v1/drivers/${driverId}/descriptor`).then((r) => r.json()).then((d) => {
-      setDesc(d);
-      setConn((prev) => ({ ...materializeSchemaDefaults(d.connection), ...prev }));
-      setProbe(null);
-      setIssues([]);
-    }).catch(() => setDesc(null));
-  }, [driverId, step]);
 
   const draftComplete = useMemo(
     () => isDraftComplete({ device, connection, acquisition }),
@@ -93,25 +61,42 @@ export function AddDeviceFlow() {
     } catch { /* 校验未通过 */ }
   };
 
-  const commitConnection = async () => {
+  /**
+   * 连接步「下一步」：面板已经完成本地归一化（canonical connection），
+   * 这里只补齐名称/ID 并组装 draft，不落库。
+   */
+  const commitConnection = async (args: {
+    driverId: string;
+    connection: ConnectionValues;
+  }) => {
+    // ---------------------------------------------------------------------
+    // P0 提交守卫：连接步的「下一步」只可能在面板前置门通过后被回调（面板
+    // handleSubmit 首行守卫 + hook 的 submitSnapshot 前置门）。这里再判一次入参，
+    // 保证**本函数自身**不会在驱动清单/描述符不可用时把连接写进草稿并推进流程
+    // ——草稿一旦被污染，第 ④ 步的 /api/v1/device-bootstrap 就会带着不可信连接落库。
+    // ---------------------------------------------------------------------
+    if (!args?.driverId) return;
+    let values: { name?: string; id?: string };
     try {
-      const v = (await connForm.validateFields()) as { name?: string; id?: string };
-      const payload = buildEndpointCreatePayload({
-        deviceId: device?.deviceId ?? "",
-        driverId,
-        name: (v.name ?? connName).trim() || "connection",
-        connection: cleanConnection(conn),
-        id: (v.id ?? connId).trim() || undefined,
-      });
-      setConnection({
-        driverId,
-        endpointId: payload.id,
-        endpointName: payload.name,
-        connection: payload.connection,
-      });
-      setConnId(payload.id);
-      setStep(2);
-    } catch { /* 校验未通过 */ }
+      values = (await connForm.validateFields()) as { name?: string; id?: string };
+    } catch {
+      return;
+    }
+    const payload = buildEndpointCreatePayload({
+      deviceId: device?.deviceId ?? "",
+      driverId: args.driverId,
+      name: (values.name ?? connName).trim() || "connection",
+      connection: args.connection,
+      id: (values.id ?? connId).trim() || undefined,
+    });
+    setConnection({
+      driverId: args.driverId,
+      endpointId: payload.id,
+      endpointName: payload.name,
+      connection: payload.connection,
+    });
+    setConnId(payload.id);
+    setStep(2);
   };
 
   const commitAcquisition = () => {
@@ -125,6 +110,11 @@ export function AddDeviceFlow() {
   };
 
   const submit = async () => {
+    // ---------------------------------------------------------------------
+    // P0 提交守卫：`connection` 只可能由上面已守卫的连接步产出，因此「清单失败 /
+    // 无可用驱动 / 描述符失败」时这里必然为 null。即便确认页按钮的 disabled 被
+    // 回归移除，也绝不发出 POST /api/v1/device-bootstrap。
+    // ---------------------------------------------------------------------
     if (!device || !connection || !acquisition) return;
     setSubmitting(true);
     setReport(null);
@@ -166,8 +156,7 @@ export function AddDeviceFlow() {
     setAcquisition(null);
     setSels([]);
     setReport(null);
-    setProbe(null);
-    setIssues([]);
+    setDesc(null);
     // 新操作：旧 operationKey 作废（删除后重建相同配置必须真正执行，
     // 不能命中旧 replay）。
     setOperationKey("");
@@ -206,44 +195,31 @@ export function AddDeviceFlow() {
 
       {step === 1 && (
         <Card size="small" title="② 连接" extra={<Tag>{device?.deviceId}</Tag>}>
-          <Form form={connForm} layout="vertical" initialValues={{ driver_id: driverId }}>
-            <Form.Item name="driver_id" label="驱动（创建后不可改）" rules={[{ required: true }]}>
-              <Select options={driverOptions} onChange={(v) => { setDriverId(v); setConn({}); }} />
-            </Form.Item>
-            <Form.Item name="name" label="连接名称">
-              <Input placeholder="如 FOCAS / OPC UA" value={connName} onChange={(e) => setConnName(e.target.value)} />
-            </Form.Item>
-            <Form.Item name="id" label="连接 ID（可空自动生成）">
-              <Input
-                placeholder={suggestEndpointId(driverId)}
-                value={connId}
-                onChange={(e) => setConnId(e.target.value)}
-                style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}
-              />
-            </Form.Item>
-            {!desc ? <div style={{ color: "#525252", fontSize: 12 }}>加载连接参数…</div> : (
-              <DescriptorFields schema={desc.connection} value={conn} onChange={setConn} />
-            )}
-            <Space style={{ marginTop: 8 }}>
-              <Button onClick={async () => {
-                const r = await api.validateConnection(driverId, cleanConnection(conn));
-                if (r.status === 200) { setIssues([]); message.success("校验通过"); }
-                else { setIssues(r.body.issues ?? []); message.error(r.body?.error?.message ?? "校验失败"); }
-              }}>校验</Button>
-              <Button onClick={async () => {
-                const r = await api.probe(driverId, cleanConnection(conn));
-                const ok = !!r.body.reachable;
-                setProbe(ok ? { ok: true, msg: "连接成功" } : { ok: false, msg: r.body.error ?? "不可达" });
-                if (ok) message.success("连接成功");
-                else message.error(r.body.error ?? "探测不可达");
-              }}>测试连接</Button>
-              {probe && <Tag color={probe.ok ? "green" : "red"}>{probe.msg}</Tag>}
-            </Space>
-            {!!issues.length && <Alert style={{ marginTop: 8 }} type="error" message={issues.map((i) => `${i.path}: ${i.message}`).join("； ")} />}
-          </Form>
+          <ConnectionSetupPanel
+            mode="create-draft"
+            active={step === 1}
+            sessionKey={`add-device-connection:${device?.deviceId ?? ""}`}
+            submitLabel="下一步：数据 →"
+            onSubmit={commitConnection}
+            onDescriptorChange={setDesc}
+            header={
+              <Form form={connForm} layout="vertical">
+                <Form.Item name="name" label="连接名称">
+                  <Input placeholder="如 FOCAS / OPC UA" value={connName} onChange={(e) => setConnName(e.target.value)} />
+                </Form.Item>
+                <Form.Item name="id" label="连接 ID（可空自动生成）">
+                  <Input
+                    placeholder={suggestEndpointId("connection")}
+                    value={connId}
+                    onChange={(e) => setConnId(e.target.value)}
+                    style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}
+                  />
+                </Form.Item>
+              </Form>
+            }
+          />
           <Space style={{ marginTop: 16 }}>
             <Button onClick={() => setStep(0)}>上一步</Button>
-            <Button type="primary" onClick={commitConnection}>下一步：数据 →</Button>
           </Space>
         </Card>
       )}

@@ -10,18 +10,25 @@ import { materializeSchemaDefaults } from "../resourceSelectionModel";
  * TSAP 文本编辑态：本地 draft（输入 0x010 不格式化打断），失焦/回车时
  * 合法值规范化为 number 提交；非法保留 draft 标红，由 required/Core 门裁决。
  * number 回显 0xXXXX。
+ *
+ * C2 增补：`onDraftText` 把「正在键入但尚未失焦」的原文逐字上报给外层。
+ * 原因：外层（连接面板）在用户未失焦就点校验/测试/保存时，必须拿到最新输入，
+ * 而不是上一次已提交的值。上报的是**原文**而非解析结果，归一化仍由外层在
+ * 提交前用 `normalizeConnection` 从 raw 现场完成（非法值不会被静默修复）。
  */
 function TsapField({
   field,
   value,
   disabled,
   onChange,
+  onDraftText,
   label,
 }: {
   field: FieldDescriptor;
   value: unknown;
   disabled?: boolean;
   onChange: (v: unknown) => void;
+  onDraftText?: (text: string) => void;
   label: React.ReactNode;
 }) {
   const toDisplay = (v: unknown): string => {
@@ -45,7 +52,10 @@ function TsapField({
       <Input
         disabled={disabled}
         value={shown}
-        onChange={(e) => setDraft(e.target.value)}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          onDraftText?.(e.target.value);
+        }}
         onBlur={(e) => commit(e.target.value)}
         onPressEnter={(e) => commit((e.target as HTMLInputElement).value)}
         placeholder={field.ui.placeholder ?? "如 0x0100 或 256"}
@@ -105,11 +115,14 @@ function FieldControl({
   value,
   disabled,
   onChange,
+  onDraftText,
 }: {
   field: FieldDescriptor;
   value: unknown;
   disabled?: boolean;
   onChange: (v: unknown) => void;
+  /** 仅 TSAP 字段使用：逐字上报未失焦的文本草稿 */
+  onDraftText?: (key: string, text: string) => void;
 }) {
   const label = (
     <span>
@@ -210,7 +223,16 @@ function FieldControl({
   // 如 0x010 的连续键入）；合法 hex/十进制→number，非法保留 draft 标红
   // 由 required/Core 门裁决；number 回显 0xXXXX。
   if (field.key === "local_tsap" || field.key === "remote_tsap") {
-    return <TsapField field={field} value={value} disabled={disabled} onChange={onChange} label={label} />;
+    return (
+      <TsapField
+        field={field}
+        value={value}
+        disabled={disabled}
+        onChange={onChange}
+        onDraftText={onDraftText ? (text) => onDraftText(field.key, text) : undefined}
+        label={label}
+      />
+    );
   }
   if (field.field_type === "integer" || field.field_type === "port") {
     const v = typeof value === "number" ? value : typeof field.default === "number" ? field.default : undefined;
@@ -229,7 +251,30 @@ function FieldControl({
       </div>
     );
   }
-  if (field.field_type === "number" || field.field_type === "duration") {
+  if (field.field_type === "duration") {
+    // duration 与 integer/port 同语义（见 connectionSetupModel.isDurationField 的
+    // 三方契约核查）：具体 Driver 的毫秒参数一律 as_u64() 读取，小数必被拒为
+    // BAD_CONFIG。这里用 precision=0 让界面只能产生整数，消除此前
+    // 「界面允许输入小数、模型/后端才拒绝」的自相矛盾。
+    const v = typeof value === "number" ? value : typeof field.default === "number" ? field.default : undefined;
+    return (
+      <div style={{ display: "grid", gap: 4 }}>
+        <span style={{ fontSize: 12 }}>{label}</span>
+        <InputNumber
+          disabled={disabled}
+          value={v}
+          min={field.validation.min}
+          max={field.validation.max}
+          precision={0}
+          step={1}
+          onChange={(n) => onChange(n)}
+          placeholder={field.ui.placeholder}
+          style={{ width: "100%" }}
+        />
+      </div>
+    );
+  }
+  if (field.field_type === "number") {
     const v = typeof value === "number" ? value : typeof field.default === "number" ? field.default : undefined;
     return (
       <div style={{ display: "grid", gap: 4 }}>
@@ -265,20 +310,44 @@ export function DescriptorFields({
   value,
   disabled,
   onChange,
+  advancedOpen,
+  onAdvancedOpenChange,
+  onDraftText,
+  idPrefix,
+  highlightKeys,
 }: {
   schema: SchemaDescriptor;
   value: Record<string, unknown>;
   disabled?: boolean;
   onChange: (next: Record<string, unknown>) => void;
+  /**
+   * 受控高级折叠（C2）：连接面板需要「高级必填缺失时自动展开」，因此折叠
+   * 状态可由外层控制。省略该 prop 时保持组件内部状态，既有调用方行为不变。
+   */
+  advancedOpen?: boolean;
+  onAdvancedOpenChange?: (open: boolean) => void;
+  /** TSAP 未失焦文本的逐字上报（C2：未失焦提交也必须是最新输入） */
+  onDraftText?: (key: string, text: string) => void;
+  /** 字段锚点 id 前缀；省略时不渲染 id，避免给既有调用方增加 DOM 变更 */
+  idPrefix?: string;
+  /** 需要高亮定位的字段 key（如缺失的高级必填项） */
+  highlightKeys?: string[];
 }) {
   // 高级字段折叠（ui.advanced）：通用行为，非 NCK-specific。默认只渲染
   // 基础字段；高级参数收进折叠区，点开才渲染（渲染前不参与 visible 计算之外的任何逻辑）。
-  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showAdvancedInternal, setShowAdvancedInternal] = useState(false);
+  const showAdvanced = advancedOpen ?? showAdvancedInternal;
+  const toggleAdvanced = () => {
+    const next = !showAdvanced;
+    if (advancedOpen === undefined) setShowAdvancedInternal(next);
+    onAdvancedOpenChange?.(next);
+  };
   const fields = (schema.fields ?? []).filter((f) => isVisible(f, value));
   const sorted = [...fields].sort((a, b) => (a.ui.order ?? 999) - (b.ui.order ?? 999));
   if (sorted.length === 0) return <div style={{ color: "#525252", fontSize: 12 }}>该流无参数</div>;
   const base = sorted.filter((f) => f.ui.advanced !== true);
   const advanced = sorted.filter((f) => f.ui.advanced === true);
+  const highlighted = new Set(highlightKeys ?? []);
   const renderGroups = (list: FieldDescriptor[]) => {
     const groups = new Map<string, FieldDescriptor[]>();
     for (const f of list) {
@@ -291,13 +360,26 @@ export function DescriptorFields({
         {g !== "default" ? <div style={{ fontSize: 12, color: "#525252", marginBottom: 6 }}>{g}</div> : null}
         <div style={{ display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))" }}>
           {fs.map((f) => (
-            <FieldControl
+            // 字段锚点：外层可据此 scrollIntoView 定位（C2 高级必填自动定位）。
+            // idPrefix 省略时不产生 id，保持既有调用方 DOM 不变。
+            <div
               key={f.key}
-              field={f}
-              value={value[f.key]}
-              disabled={disabled}
-              onChange={(v) => onChange({ ...value, [f.key]: v })}
-            />
+              id={idPrefix ? `${idPrefix}-${f.key}` : undefined}
+              data-field-key={f.key}
+              style={
+                highlighted.has(f.key)
+                  ? { outline: "2px solid #ff4d4f", outlineOffset: 2, borderRadius: 4 }
+                  : undefined
+              }
+            >
+              <FieldControl
+                field={f}
+                value={value[f.key]}
+                disabled={disabled}
+                onChange={(v) => onChange({ ...value, [f.key]: v })}
+                onDraftText={onDraftText}
+              />
+            </div>
           ))}
         </div>
       </div>
@@ -308,7 +390,7 @@ export function DescriptorFields({
       {renderGroups(base)}
       {advanced.length > 0 ? (
         <div>
-          <Button size="small" onClick={() => setShowAdvanced((v) => !v)}>
+          <Button size="small" onClick={toggleAdvanced}>
             {showAdvanced ? "▾ 收起高级" : `▸ 高级（${advanced.length}）`}
           </Button>
           {showAdvanced ? <div style={{ marginTop: 8 }}>{renderGroups(advanced)}</div> : null}

@@ -8,19 +8,25 @@ export interface ApiError extends Error {
   code?: string;
 }
 
-function toApiError(status: number, path: string, code?: string): ApiError {
-  const e = new Error(`${status} ${path}`) as ApiError;
+function toApiError(status: number, path: string, code?: string, detail?: string): ApiError {
+  // 保留 `status path` 前缀（既有调用方/日志依赖该形状），并在服务端给出
+  // error.message 时追加，避免界面只显示「500 /api/v1/drivers」而无原因。
+  const base = `${status} ${path}`;
+  const e = new Error(detail ? `${base}: ${detail}` : base) as ApiError;
   e.status = status;
   e.code = code;
   return e;
 }
 
-async function getJson(path: string) {
-  const r = await fetch(`${BASE}${path}`);
+// C2：连接配置交互需要「切换驱动/参数变化即作废在途请求」的能力，因此所有
+// 读接口都接受可选 AbortSignal。signal 只在调用方显式传入时才进入 RequestInit，
+// 既有调用方（不传）行为逐字不变。
+async function getJson(path: string, signal?: AbortSignal) {
+  const r = await fetch(`${BASE}${path}`, signal ? { signal } : undefined);
   if (!r.ok) {
     const j = await r.json().catch(() => ({}));
-    const code = (j as { error?: { code?: string } })?.error?.code;
-    throw toApiError(r.status, path, code);
+    const err = (j as { error?: { code?: string; message?: string } })?.error;
+    throw toApiError(r.status, path, err?.code, err?.message);
   }
   return r.json();
 }
@@ -49,11 +55,12 @@ function toQuery(filter: EventFilter): string {
   return s ? `?${s}` : "";
 }
 
-async function postJson(path: string, body: unknown) {
+async function postJson(path: string, body: unknown, signal?: AbortSignal) {
   const r = await fetch(`${BASE}${path}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
+    ...(signal ? { signal } : {}),
   });
   const j = await r.json().catch(() => ({}));
   return { status: r.status, body: j };
@@ -67,8 +74,8 @@ async function putJson(path: string, body: unknown) {
   });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) {
-    const code = (j as { error?: { code?: string } })?.error?.code;
-    throw toApiError(r.status, path, code);
+    const err = (j as { error?: { code?: string; message?: string } })?.error;
+    throw toApiError(r.status, path, err?.code, err?.message);
   }
   return j;
 }
@@ -79,13 +86,14 @@ export function isEventStoreUnavailable(e: unknown): boolean {
 }
 
 export const api = {
-  listDrivers: () => getJson("/api/v1/drivers"),
+  listDrivers: (signal?: AbortSignal) => getJson("/api/v1/drivers", signal),
   getDriver: (id: string) => getJson(`/api/v1/drivers/${id}`),
-  getDescriptor: (id: string) => getJson(`/api/v1/drivers/${id}/descriptor`),
-  validateConnection: (id: string, connection: unknown) =>
-    postJson(`/api/v1/drivers/${id}/validate-connection`, { connection }),
-  probe: (id: string, connection: unknown) =>
-    postJson(`/api/v1/drivers/${id}/probe`, { connection }),
+  getDescriptor: (id: string, signal?: AbortSignal) =>
+    getJson(`/api/v1/drivers/${id}/descriptor`, signal),
+  validateConnection: (id: string, connection: unknown, signal?: AbortSignal) =>
+    postJson(`/api/v1/drivers/${id}/validate-connection`, { connection }, signal),
+  probe: (id: string, connection: unknown, signal?: AbortSignal) =>
+    postJson(`/api/v1/drivers/${id}/probe`, { connection }, signal),
   listEndpoints: () => getJson("/api/v1/endpoints"),
   listDevices: () => getJson("/api/v1/devices"),
   getDevice: (id: string) => getJson(`/api/v1/devices/${id}`),

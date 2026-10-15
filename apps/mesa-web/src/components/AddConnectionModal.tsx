@@ -1,23 +1,18 @@
-// 新增连接 Modal（逻辑由 DeviceConfig 原样迁移）：
-// 选择 Driver → Descriptor → 名称/ID → 连接参数 → 校验/探测 → 创建。
-// 创建成功后 onCreated（父页刷新 inventory）。
-import { useEffect, useState } from "react";
-import { Alert, Button, Form, Input, Modal, Select, Space, Tag, message } from "antd";
+// 新增连接 Modal（C2）：驱动选择 / 连接参数 / 校验 / 探测 / 创建全部交给共享面板。
+//
+// 面板负责（三入口同源）：
+// - 驱动清单只认服务端 `launchable=true`，拉取失败即报错 + 重试并禁止提交
+//   （**已删除**原 `FALLBACK_DRIVERS` 常量：不再把内置列表当可用驱动展示）；
+// - 描述符失败即禁止提交；切换驱动按新 Schema 重建参数，不残留旧驱动参数；
+// - TSAP 未失焦提交最新输入；非法输入阻断且不自动修复；
+// - 参数一变旧的校验/探测结果立即失效。
+// 本文件只负责「名称/ID」这两个非连接字段与最终 POST /endpoints。
+import { useState } from "react";
+import { Button, Form, Input, Modal, message } from "antd";
 import { api } from "../api";
-import type { DriverDescriptor } from "../types";
-import {
-  buildEndpointCreatePayload,
-  cleanConnection,
-  suggestEndpointId,
-} from "../deviceModel";
-import { DescriptorFields, materializeSchemaDefaults } from "./DescriptorFields";
-
-const FALLBACK_DRIVERS = [
-  { value: "s7", label: "Siemens S7" },
-  { value: "focas2", label: "FANUC FOCAS2" },
-  { value: "opcua", label: "OPC UA" },
-  { value: "sinumerik-nck", label: "SINUMERIK NCK" },
-];
+import { buildEndpointCreatePayload, suggestEndpointId } from "../deviceModel";
+import { safeText, type ConnectionValues } from "../connection/connectionSetupModel";
+import { ConnectionSetupPanel } from "../connection/ConnectionSetupPanel";
 
 export function AddConnectionModal(props: {
   deviceId: string;
@@ -27,98 +22,89 @@ export function AddConnectionModal(props: {
 }) {
   const { deviceId, open, onClose, onCreated } = props;
   const [form] = Form.useForm();
-  const [driverId, setDriverId] = useState("s7");
-  const [driverOptions, setDriverOptions] = useState(FALLBACK_DRIVERS);
-  const [desc, setDesc] = useState<DriverDescriptor | null>(null);
-  const [conn, setConn] = useState<Record<string, unknown>>({});
-  const [issues, setIssues] = useState<Array<{ path: string; message: string }>>([]);
-  const [probe, setProbe] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [driverId, setDriverId] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
-  useEffect(() => {
-    api.listDrivers().then((j) => {
-      const ds = ((j as { drivers?: Array<{ id: string; name: string }> }).drivers ?? [])
-        .map((d) => ({ value: d.id, label: d.name }));
-      if (ds.length) {
-        setDriverOptions(ds);
-        setDriverId((cur) => (ds.some((x) => x.value === cur) ? cur : ds[0].value));
-      }
-    }).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    if (!open) return;
-    fetch(`/api/v1/drivers/${driverId}/descriptor`).then((r) => r.json()).then((d) => {
-      setDesc(d);
-      setConn((prev) => ({ ...materializeSchemaDefaults(d.connection), ...prev }));
-      setProbe(null);
-      setIssues([]);
-    }).catch(() => setDesc(null));
-  }, [driverId, open]);
-
-  const openFresh = () => {
-    setDriverId("s7");
-    setConn({});
-    form.resetFields();
-  };
-
-  // 父页打开时重置（Modal 复用实例，切设备不清旧草稿不可接受）。
-  useEffect(() => {
-    if (open) openFresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open ]);
-
-  const doAdd = async () => {
+  const handleSubmit = async (args: {
+    driverId: string;
+    connection: ConnectionValues;
+  }) => {
+    // ---------------------------------------------------------------------
+    // P0 提交守卫：面板在「驱动清单失败 / 无可用驱动 / 描述符失败」时不会回调
+    // 到这里（按钮 disabled + 面板 handleSubmit 首行守卫 + hook 的 submitSnapshot
+    // 前置门三重），这里再判一次入参，确保**本函数自身**也拒绝发出
+    // POST /api/v1/endpoints —— 防止将来新增程序化提交入口时绕过禁用状态。
+    // ---------------------------------------------------------------------
+    if (!args?.driverId) {
+      message.error("驱动未就绪，已阻止创建连接（不会回退到内置驱动列表）");
+      return;
+    }
+    let values: { name?: string; id?: string };
     try {
-      const v = (await form.validateFields()) as { name: string; id?: string; driver_id: string };
+      values = (await form.validateFields()) as { name?: string; id?: string };
+    } catch {
+      // antd 表单校验未通过（连接名称必填）：不落库、不提示成功
+      return;
+    }
+    setSubmitting(true);
+    try {
       const payload = buildEndpointCreatePayload({
         deviceId,
-        driverId: v.driver_id,
-        name: v.name,
-        connection: conn,
-        id: v.id,
+        driverId: args.driverId,
+        name: (values.name ?? "").trim() || "connection",
+        connection: args.connection,
+        id: (values.id ?? "").trim() || undefined,
       });
       const r = await api.createEndpoint(payload);
       if (r.status !== 201 && r.status !== 200) {
-        message.error(r.body?.error?.message ?? "创建连接失败");
+        message.error(safeText((r.body as { error?: unknown })?.error) || "创建连接失败");
         return;
       }
       message.success(`已添加连接 ${payload.id}（归属 ${deviceId}，未新增设备）`);
       onCreated();
-    } catch { /* antd 校验未通过 */ }
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
-    <Modal title={`新增连接 · 归属 ${deviceId}`} open={open} onOk={doAdd} onCancel={onClose} okText="创建" destroyOnHidden width={640}>
-      <Form form={form} layout="vertical" initialValues={{ driver_id: "s7" }}>
-        <Form.Item name="driver_id" label="驱动（创建后不可改）" rules={[{ required: true }]}>
-          <Select options={driverOptions} onChange={(v) => { setDriverId(v); setConn({}); }} />
-        </Form.Item>
-        <Form.Item name="name" label="连接名称" rules={[{ required: true, message: "连接名称必填" }]}>
-          <Input placeholder="如 PLC / NCK / OPC UA" />
-        </Form.Item>
-        <Form.Item name="id" label="连接 ID（可空自动生成，与设备 ID 独立）">
-          <Input placeholder={suggestEndpointId(driverId)} style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }} />
-        </Form.Item>
-        {!desc ? <div style={{ color: "#525252", fontSize: 12 }}>加载连接参数…</div> : (
-          <DescriptorFields schema={desc.connection} value={conn} onChange={setConn} />
-        )}
-        <Space style={{ marginTop: 8 }}>
-          <Button onClick={async () => {
-            const r = await api.validateConnection(driverId, cleanConnection(conn));
-            if (r.status === 200) { setIssues([]); message.success("校验通过"); }
-            else { setIssues(r.body.issues ?? []); message.error(r.body?.error?.message ?? "校验失败"); }
-          }}>校验</Button>
-          <Button onClick={async () => {
-            const r = await api.probe(driverId, cleanConnection(conn));
-            const ok = !!r.body.reachable;
-            setProbe(ok ? { ok: true, msg: "可达" } : { ok: false, msg: r.body.error ?? "不可达" });
-            if (ok) message.success("探测可达");
-            else message.error(r.body.error ?? "探测不可达");
-          }}>探测</Button>
-          {probe && <Tag color={probe.ok ? "green" : "red"}>{probe.msg}</Tag>}
-        </Space>
-        {!!issues.length && <Alert style={{ marginTop: 8 }} type="error" message={issues.map((i) => `${i.path}: ${i.message}`).join("； ")} />}
-      </Form>
+    <Modal
+      title={`新增连接 · 归属 ${deviceId}`}
+      open={open}
+      onCancel={onClose}
+      footer={null}
+      destroyOnHidden
+      width={720}
+    >
+      <ConnectionSetupPanel
+        mode="add"
+        active={open}
+        sessionKey={`add-connection:${deviceId}`}
+        submitLabel="创建"
+        actionsDisabled={submitting}
+        onSubmit={handleSubmit}
+        onDriverChange={setDriverId}
+        header={
+          <Form form={form} layout="vertical">
+            <Form.Item
+              name="name"
+              label="连接名称"
+              rules={[{ required: true, message: "连接名称必填" }]}
+            >
+              <Input placeholder="如 PLC / NCK / OPC UA" />
+            </Form.Item>
+            <Form.Item name="id" label="连接 ID（可空自动生成，与设备 ID 独立）">
+              <Input
+                placeholder={suggestEndpointId(driverId ?? "connection")}
+                style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}
+              />
+            </Form.Item>
+          </Form>
+        }
+      />
+      <div style={{ marginTop: 12 }}>
+        <Button onClick={onClose}>取消</Button>
+      </div>
     </Modal>
   );
 }
