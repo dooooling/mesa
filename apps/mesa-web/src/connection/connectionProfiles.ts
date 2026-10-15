@@ -84,6 +84,11 @@ export function selectablePresets(
  *
  * 返回需要从 raw 中**删除**的字段名：只清理由预设写入的键，不动用户手填的
  * 其它字段（避免误删）。
+ *
+ * 注意：本函数只回答「哪些 key 不再由当前预设控制」，**不回答**「这些 key 该不该
+ * 真的删掉」——是否删除还要看当前值是否仍等于预设写入的值（用户手工改过的值
+ * 属于用户输入，不得删除）。该判定需要调用方持有「预设来源状态」，见
+ * `ConnectionSetupPanel` 的 `AppliedPreset`。
  */
 export function fieldsToClearOnSwitch(
   previous: ConnectionPreset | null,
@@ -93,4 +98,36 @@ export function fieldsToClearOnSwitch(
   if (next && next.id === previous.id) return [];
   const nextKeys = new Set(Object.keys(next?.values ?? {}));
   return Object.keys(previous.values).filter((k) => !nextKeys.has(k));
+}
+
+/**
+ * 「该系列没有经过 Mesa 实机验证的 TSAP 预设」的界面说明。
+ *
+ * 为什么用「按 family 查表」而不是在面板里写 `if (family === "840d-sl")`：
+ * 「哪些系列有预设、哪些没有」本来就由本模块定义，说明文案必须与
+ * [`selectablePresets`] 同源，否则将来新增预设时会出现「预设卡片与
+ * 『暂无预设』说明同时出现」的自相矛盾。
+ *
+ * 纪律（评审明确）：没有实测依据的系列**只给说明**——不提供任何可点击的预设、
+ * 也不自动填充其 TSAP。即使按钮标注「未验证」，一个可点击的示例仍会被用户
+ * 读成推荐配置，因此这里连按钮都不给。
+ */
+const UNVERIFIED_FAMILY_NOTES: Record<string, string> = {
+  "840d-sl": "840D sl 暂无经过 Mesa 实机验证的 TSAP 预设，请依据实际控制器配置填写。",
+};
+
+/**
+ * 取某驱动/系列的「无实机验证预设」说明；`null` = 不需要展示。
+ *
+ * 返回非 null 的充要条件：驱动是 SINUMERIK NCK、系列已明确、该系列**没有**可选
+ * 预设（有预设时由预设卡片自己说明来源与限制），且本模块为该系列备有说明文案。
+ * 系列未选择时返回 `null`：还不知道是哪个系列，不该提前给结论。
+ */
+export function unverifiedFamilyNote(
+  driverId: string,
+  family: string | null,
+): string | null {
+  if (driverId !== "sinumerik-nck" || !family) return null;
+  if (selectablePresets(driverId, family).length > 0) return null;
+  return UNVERIFIED_FAMILY_NOTES[family] ?? null;
 }
