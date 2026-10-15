@@ -93,9 +93,15 @@ impl Driver for S7Driver {
             },
             connection: SchemaDescriptor {
                 fields: vec![
-                    FieldDescriptor::new("host", "Host", FieldType::Host)
-                        .required(true)
-                        .default_value(serde_json::json!("192.168.0.1")),
+                    // C1 §4：Host 无默认目标。Descriptor 不提供有效默认值，
+                    // 只给示例 placeholder；Driver Parser 对缺席/空/类型非法
+                    // 一律 BAD_CONFIG（不得落回 127.0.0.1 或 192.168.0.1）。
+                    {
+                        let mut f =
+                            FieldDescriptor::new("host", "Host", FieldType::Host).required(true);
+                        f.ui.placeholder = Some("如 192.0.2.10（示例，需按现场填写）".into());
+                        f
+                    },
                     FieldDescriptor::new("port", "Port", FieldType::Port)
                         .required(false)
                         .default_value(serde_json::json!(102)),
@@ -105,9 +111,17 @@ impl Driver for S7Driver {
                     FieldDescriptor::new("slot", "Slot", FieldType::Integer)
                         .required(false)
                         .default_value(serde_json::json!(1)),
-                    FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
-                        .required(false)
-                        .default_value(serde_json::json!(3000)),
+                    {
+                        // 下限与 `S7_MIN_TIMEOUT_MS` 同源：Descriptor 与
+                        // Driver Parser 必须给出同一套有效范围（C1 §6.2）。
+                        let mut f =
+                            FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
+                                .required(false)
+                                .default_value(serde_json::json!(3000));
+                        f.validation.min = Some(mesa_core_types::CONNECTION_TIMEOUT_MIN_MS as f64);
+                        f.validation.max = Some(mesa_core_types::CONNECTION_TIMEOUT_MAX_MS as f64);
+                        f
+                    },
                 ],
             },
             resources: vec![ResourceDescriptor {

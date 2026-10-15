@@ -45,6 +45,8 @@ EVENT = [
 LIFECYCLE = [
     "mesad_restart",
     "stop_lifecycle",
+    # C1 A21：含 Secret 的 OPC UA Endpoint 进程级重启恢复（真实认证 + 新采集数据）。
+    "opcua_auth_restart_e2e",
 ]
 
 SUITES = BASELINE + EVENT + LIFECYCLE

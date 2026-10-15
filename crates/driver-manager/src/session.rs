@@ -24,6 +24,23 @@ use tokio_util::sync::CancellationToken;
 /// 应拆分流程而非调大超时。
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Probe 路径单次 RPC 上限（C1 §6.3）。
+///
+/// 为什么单独开一个更大的值：探测路径上**协议握手发生在 `Probe` RPC 内**
+/// （四个驱动的 `open_connection` 都只做配置解析，见 `probe::ProbeBudgets`），
+/// 且握手是串行的多响应阶段，每段各受连接的 `timeout_ms` 约束。
+/// 用通用的 10s `REQUEST_TIMEOUT` 去卡它，等于「用户填了合法超时，却被管理面
+/// 提前掐断」。
+///
+/// 为什么不能直接全局拉长 `REQUEST_TIMEOUT`：它同时约束 Configure / Stop /
+/// Write 等所有管理 RPC，拉长会让故障检测普遍变慢。因此只有 Probe 的三个
+/// RPC（Open / Probe / Close）走本上限。
+///
+/// 取值依据：`ProbeBudgets` 按「4 个串行响应阶段 × timeout_ms + 3s 余量」推导，
+/// 而 `timeout_ms` 上限为 10s（`CONNECTION_TIMEOUT_MAX_MS`），
+/// 故 4×10s+3s = 43s；本常量取 45s 作为硬封顶。
+pub const PROBE_RPC_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// 心跳默认参数（§14.4）。
 const PING_PERIOD: Duration = Duration::from_secs(5);
 const PONG_DEADLINE: Duration = Duration::from_secs(3);
@@ -261,8 +278,6 @@ pub struct Session {
 
 /// 驱动启动窗口：从 spawn 到 listen 的容忍期（§14，Probe 外层需更大 budget）
 pub const DRIVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(6);
-/// Probe 整体超时需覆盖 startup + handshake + OpenConnection
-pub const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 
 impl Session {
     /// 带重试的连接：子进程从 bind 到 listen 存在窗口期，连接拒绝属预期时序，
@@ -678,10 +693,21 @@ impl Session {
         &self,
         connection_handle: u32,
     ) -> Result<mesa_core_types::ProbeReport, SessionError> {
+        self.probe_with_timeout(connection_handle, REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// [`Session::probe`] 的显式超时变体（C1 §6.3：Probe 路径专用）。
+    pub async fn probe_with_timeout(
+        &self,
+        connection_handle: u32,
+        timeout: Duration,
+    ) -> Result<mesa_core_types::ProbeReport, SessionError> {
         let reply = self
-            .call(pb::envelope::Body::ProbeRequest(pb::ProbeRequest {
-                connection_handle,
-            }))
+            .call_with_timeout(
+                pb::envelope::Body::ProbeRequest(pb::ProbeRequest { connection_handle }),
+                timeout,
+            )
             .await?;
         match reply.body {
             Some(pb::envelope::Body::ProbeResponse(r)) => {
@@ -863,7 +889,21 @@ impl Session {
     }
 
     /// 发送一帧并等待同 msg_id 的响应帧。超时即清理登记项，防止泄漏。
+    /// 使用通用 `REQUEST_TIMEOUT`；需要更长预算的路径（Probe）用
+    /// [`Session::call_with_timeout`]，不得为此调大全局值。
     pub async fn call(&self, body: pb::envelope::Body) -> Result<pb::Envelope, SessionError> {
+        self.call_with_timeout(body, REQUEST_TIMEOUT).await
+    }
+
+    /// [`Session::call`] 的显式超时变体（C1 §6.3：仅 Probe 路径使用）。
+    ///
+    /// 语义与 `call` 逐字一致（登记 / 清理 / Start 意图嗅探），唯一差别是
+    /// 等待响应的上限由调用方给出。超时同样 unregister，不泄漏 pending 项。
+    pub async fn call_with_timeout(
+        &self,
+        body: pb::envelope::Body,
+        timeout: Duration,
+    ) -> Result<pb::Envelope, SessionError> {
         let id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
         // 事件 barrier 自维护：Start 意图在此登记，reader 在 Ack 到达时更新
         // epoch 门。所有 Start/Stop/Close 都经本方法，调用方无需记得调 hook，
@@ -903,7 +943,7 @@ impl Session {
                 return Err(e.into());
             }
         }
-        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(reply)) => {
                 // 对端答非所问（非 StartConnectionAck）：永远等不到嗅探，在此清理
                 if start_intent
@@ -1280,6 +1320,42 @@ mod tests {
                 },
             }
         }
+    }
+
+    /// C1 §6.3：Probe 路径可用显式超时（长于通用 10s 的合法协议等待），
+    /// 且超时按给定上限生效、pending 登记项被清理（不泄漏）。
+    #[tokio::test]
+    async fn call_with_timeout_is_bounded_and_cleans_pending() {
+        let lb = Loopback::new(3).await;
+        // 对端只收不回：任何 RPC 都不会得到响应。
+        let started = std::time::Instant::now();
+        let err = lb
+            .session
+            .call_with_timeout(
+                pb::envelope::Body::ProbeRequest(pb::ProbeRequest {
+                    connection_handle: 1,
+                }),
+                Duration::from_millis(150),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::Timeout), "实际: {err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "必须按调用方给定上限返回，而不是等 REQUEST_TIMEOUT(10s)"
+        );
+        assert!(
+            lb.session.shared.pending.lock().unwrap().is_empty(),
+            "超时必须 unregister，否则 pending 表随每次探测泄漏"
+        );
+    }
+
+    /// 通用 `call()` 仍使用 REQUEST_TIMEOUT：本用例只锁定常量关系，
+    /// 避免未来把 Probe 的长超时误扩散到所有管理 RPC。
+    #[test]
+    fn generic_call_timeout_is_not_widened_for_probe() {
+        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(10));
+        assert!(PROBE_RPC_TIMEOUT > REQUEST_TIMEOUT);
     }
 
     /// 空任务不发 RPC：server 端无任何读取也不会超时，直接成功。

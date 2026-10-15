@@ -369,15 +369,26 @@ impl Driver for FocasDriver {
             },
             connection: SchemaDescriptor {
                 fields: vec![
-                    FieldDescriptor::new("host", "Host", FieldType::Host)
-                        .required(true)
-                        .default_value(serde_json::json!("192.168.0.1")),
+                    // C1 §4：Host 无默认目标（删除原 192.168.0.1 有效默认）。
+                    {
+                        let mut f =
+                            FieldDescriptor::new("host", "Host", FieldType::Host).required(true);
+                        f.ui.placeholder = Some("如 192.0.2.10（示例，需按现场填写）".into());
+                        f
+                    },
                     FieldDescriptor::new("port", "Port", FieldType::Port)
                         .required(false)
                         .default_value(serde_json::json!(8193)),
-                    FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
-                        .required(false)
-                        .default_value(serde_json::json!(3000)),
+                    {
+                        // C1 §6.2：Descriptor 与 Driver Parser 同一套范围。
+                        let mut f =
+                            FieldDescriptor::new("timeout_ms", "Timeout ms", FieldType::Duration)
+                                .required(false)
+                                .default_value(serde_json::json!(3000));
+                        f.validation.min = Some(mesa_core_types::CONNECTION_TIMEOUT_MIN_MS as f64);
+                        f.validation.max = Some(mesa_core_types::CONNECTION_TIMEOUT_MAX_MS as f64);
+                        f
+                    },
                     {
                         // Native 退役第一阶段：backend 默认 wire（生产主路径）。
                         // required(false) + default "wire"（缺省→Wire，UI 可见）；
@@ -952,26 +963,130 @@ impl Default for FocasConnConfig {
 }
 
 impl FocasConnConfig {
+    /// 从 JSON 解析连接参数（C1 §6.2「缺席 vs 存在但非法」契约）。
+    ///
+    /// 兼容别名（有明确定义的 legacy 形态）：`ip` = `host`、`timeout` = `timeout_ms`。
+    /// 规则：
+    /// - 主字段**缺席**时才允许读取别名；
+    /// - 主字段存在但类型非法 → 直接 `BAD_CONFIG`，**不得**退回别名；
+    /// - 主字段与别名同时存在且都是合法值但语义冲突 → 拒绝（不做无说明的任选）；
+    /// - 数值先判范围再窄化，禁止 `as u16` 截断（70000 不能变成 4464）。
     fn from_json(v: &serde_json::Value) -> Result<Self, SdkDriverError> {
-        // 兼容两种写法：{host,port,timeout_ms} 或 {ip,port}
-        let host = v
-            .get("host")
-            .or_else(|| v.get("ip"))
-            .and_then(|x| x.as_str())
-            .unwrap_or("127.0.0.1")
+        fn bad(message: impl Into<String>) -> SdkDriverError {
+            SdkDriverError::configuration("BAD_CONFIG", message)
+        }
+        let object = v.as_object().ok_or_else(|| bad("connection 需为对象"))?;
+
+        /// `timeout_ms` 范围校验（与 Descriptor 的 min/max 同源，C1 §6.2）。
+        fn check_timeout(t: u64) -> Result<(), SdkDriverError> {
+            if t < mesa_core_types::CONNECTION_TIMEOUT_MIN_MS {
+                return Err(SdkDriverError::configuration(
+                    "BAD_CONFIG",
+                    format!(
+                        "timeout_ms {t} 非法，最小值为 {}",
+                        mesa_core_types::CONNECTION_TIMEOUT_MIN_MS
+                    ),
+                ));
+            }
+            if t > mesa_core_types::CONNECTION_TIMEOUT_MAX_MS {
+                return Err(SdkDriverError::configuration(
+                    "BAD_CONFIG",
+                    format!(
+                        "timeout_ms {t} 超出支持上限 {}（Probe 分阶段预算按该值推导）",
+                        mesa_core_types::CONNECTION_TIMEOUT_MAX_MS
+                    ),
+                ));
+            }
+            Ok(())
+        }
+
+        /// 主字段 + 可选 legacy 别名的严格字符串解析。
+        fn field_str<'a>(
+            object: &'a serde_json::Map<String, serde_json::Value>,
+            key: &str,
+            alias: Option<&str>,
+        ) -> Result<Option<&'a str>, SdkDriverError> {
+            let main = object.get(key);
+            let alias_val = alias.and_then(|a| object.get(a));
+            match (main, alias_val) {
+                (None, None) => Ok(None),
+                (Some(_), None) => main
+                    .unwrap()
+                    .as_str()
+                    .map(Some)
+                    .ok_or_else(|| bad(format!("{key} 必须为字符串"))),
+                (None, Some(a)) => a
+                    .as_str()
+                    .map(Some)
+                    .ok_or_else(|| bad(format!("{} 必须为字符串", alias.unwrap_or_default()))),
+                (Some(m), Some(a)) => {
+                    let mv = m
+                        .as_str()
+                        .ok_or_else(|| bad(format!("{key} 必须为字符串")))?;
+                    let av = a.as_str().ok_or_else(|| {
+                        bad(format!("{} 必须为字符串", alias.unwrap_or_default()))
+                    })?;
+                    if mv != av {
+                        return Err(bad(format!(
+                            "{key} 与别名 {} 同时存在但取值冲突（`{mv}` vs `{av}`），拒绝隐式任选",
+                            alias.unwrap_or_default()
+                        )));
+                    }
+                    Ok(Some(mv))
+                }
+            }
+        }
+
+        let host = field_str(object, "host", Some("ip"))?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| bad("host 必填且必须为非空字符串（不从默认目标隐式连接）"))?
             .to_string();
-        let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(8193) as u16;
-        let timeout_ms = v
-            .get("timeout_ms")
-            .or_else(|| v.get("timeout"))
-            .and_then(|x| x.as_u64())
-            .unwrap_or(3000);
-        if host.trim().is_empty() {
-            return Err(SdkDriverError::configuration("BAD_CONFIG", "host 不能为空"));
-        }
-        if port == 0 {
-            return Err(SdkDriverError::configuration("BAD_CONFIG", "port 非法"));
-        }
+
+        // port：先取整数、再判范围，最后才窄化。
+        let port = match object.get("port") {
+            None => 8193u16,
+            Some(value) => {
+                let p = value
+                    .as_u64()
+                    .ok_or_else(|| bad("port 必须为 1..=65535 的整数"))?;
+                if !(1..=65535).contains(&p) {
+                    return Err(bad(format!("port {p} 非法，需 1..=65535")));
+                }
+                p as u16
+            }
+        };
+
+        // timeout_ms（别名 timeout）：数值先判范围。
+        let timeout_ms = match (object.get("timeout_ms"), object.get("timeout")) {
+            (None, None) => 3000u64,
+            (Some(value), None) => {
+                let t = value
+                    .as_u64()
+                    .ok_or_else(|| bad("timeout_ms 必须为非负整数"))?;
+                check_timeout(t)?;
+                t
+            }
+            (None, Some(value)) => {
+                let t = value
+                    .as_u64()
+                    .ok_or_else(|| bad("timeout 必须为非负整数"))?;
+                check_timeout(t)?;
+                t
+            }
+            (Some(m), Some(a)) => {
+                let mv = m.as_u64().ok_or_else(|| bad("timeout_ms 必须为非负整数"))?;
+                let av = a.as_u64().ok_or_else(|| bad("timeout 必须为非负整数"))?;
+                if mv != av {
+                    return Err(bad(format!(
+                        "timeout_ms 与别名 timeout 同时存在但取值冲突（{mv} vs {av}），拒绝隐式任选"
+                    )));
+                }
+                check_timeout(mv)?;
+                mv
+            }
+        };
+
         let backend = FocasBackend::parse(v)?;
         Ok(Self {
             host,
@@ -1577,6 +1692,177 @@ mod tests {
     use super::*;
     use mesa_core_types::{AcquisitionTask, DriverBinding};
 
+    // -----------------------------------------------------------------------
+    // C1 §6.2：连接字段「缺席 vs 存在但非法」+ legacy 别名契约
+    // -----------------------------------------------------------------------
+
+    /// Host 必填：缺席不得回落到内置默认连接目标（原实现回落 127.0.0.1）。
+    #[test]
+    fn host_is_required_and_never_falls_back_to_default_target() {
+        assert_eq!(
+            FocasConnConfig::from_json(&serde_json::json!({"port": 8193}))
+                .unwrap_err()
+                .code,
+            "BAD_CONFIG"
+        );
+        for bad in [
+            serde_json::json!(123),
+            serde_json::json!(true),
+            serde_json::json!(null),
+            serde_json::json!(""),
+            serde_json::json!("  "),
+        ] {
+            assert_eq!(
+                FocasConnConfig::from_json(&serde_json::json!({"host": bad}))
+                    .unwrap_err()
+                    .code,
+                "BAD_CONFIG",
+                "host={bad} 必须拒绝"
+            );
+        }
+    }
+
+    /// legacy 别名 `ip`/`timeout`：缺席时才允许；类型非法不得退回别名；
+    /// 同时存在且冲突必须拒绝（不隐式任选）。
+    #[test]
+    fn legacy_aliases_do_not_mask_ill_typed_primary_fields() {
+        // 仅别名 → 接受（有明确定义的 legacy 形态）。
+        let alias_only =
+            FocasConnConfig::from_json(&serde_json::json!({"ip": "10.0.0.9", "timeout": 4000}))
+                .unwrap();
+        assert_eq!(alias_only.host, "10.0.0.9");
+        assert_eq!(alias_only.timeout_ms, 4000);
+        // 主字段类型非法 → 拒绝，**不得**回退到别名。
+        assert_eq!(
+            FocasConnConfig::from_json(&serde_json::json!({"host": 123, "ip": "10.0.0.9"}))
+                .unwrap_err()
+                .code,
+            "BAD_CONFIG"
+        );
+        assert_eq!(
+            FocasConnConfig::from_json(
+                &serde_json::json!({"host": "10.0.0.9", "timeout_ms": "4000", "timeout": 4000})
+            )
+            .unwrap_err()
+            .code,
+            "BAD_CONFIG"
+        );
+        // 主字段与别名同时存在且取值冲突 → 拒绝。
+        assert_eq!(
+            FocasConnConfig::from_json(&serde_json::json!({"host": "10.0.0.9", "ip": "10.0.0.10"}))
+                .unwrap_err()
+                .code,
+            "BAD_CONFIG"
+        );
+        assert_eq!(
+            FocasConnConfig::from_json(
+                &serde_json::json!({"host": "10.0.0.9", "timeout_ms": 4000, "timeout": 5000})
+            )
+            .unwrap_err()
+            .code,
+            "BAD_CONFIG"
+        );
+        // 取值一致 → 接受（不因“重复书写”而拒绝）。
+        assert!(
+            FocasConnConfig::from_json(&serde_json::json!({"host": "10.0.0.9", "ip": "10.0.0.9"}))
+                .is_ok()
+        );
+    }
+
+    /// 端口必须先判范围再窄化：`70000 as u16` 会截断成 4464（连到别的目标）。
+    #[test]
+    fn port_range_is_checked_before_narrowing() {
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(65536),
+            serde_json::json!(70000),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("8193"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ] {
+            assert_eq!(
+                FocasConnConfig::from_json(&serde_json::json!({"host": "10.0.0.9", "port": bad}))
+                    .unwrap_err()
+                    .code,
+                "BAD_CONFIG",
+                "port={bad} 必须拒绝"
+            );
+        }
+        assert_eq!(
+            FocasConnConfig::from_json(&serde_json::json!({"host": "10.0.0.9", "port": 8193}))
+                .unwrap()
+                .port,
+            8193
+        );
+    }
+
+    /// timeout 上限/下限：超限在访问网络前拒绝，不静默 clamp。
+    #[test]
+    fn timeout_bounds_are_enforced_not_clamped() {
+        let with = |t: serde_json::Value| {
+            FocasConnConfig::from_json(&serde_json::json!({"host": "10.0.0.9", "timeout_ms": t}))
+        };
+        assert!(
+            with(serde_json::json!(
+                mesa_core_types::CONNECTION_TIMEOUT_MIN_MS - 1
+            ))
+            .is_err()
+        );
+        assert!(
+            with(serde_json::json!(
+                mesa_core_types::CONNECTION_TIMEOUT_MAX_MS + 1
+            ))
+            .is_err()
+        );
+        assert!(
+            with(serde_json::json!(
+                mesa_core_types::CONNECTION_TIMEOUT_MIN_MS
+            ))
+            .is_ok()
+        );
+        assert!(
+            with(serde_json::json!(
+                mesa_core_types::CONNECTION_TIMEOUT_MAX_MS
+            ))
+            .is_ok()
+        );
+        assert!(with(serde_json::json!(0)).is_err());
+    }
+
+    /// Descriptor 与 Driver 的有效范围必须同源（否则 UI 显示的合法值运行会失败）。
+    #[test]
+    fn descriptor_timeout_bounds_match_parser_contract() {
+        use mesa_driver_sdk::Driver;
+        let desc = FocasDriver.descriptor();
+        let f = desc
+            .connection
+            .fields
+            .iter()
+            .find(|f| f.key == "timeout_ms")
+            .expect("Descriptor 必须有 timeout_ms");
+        assert_eq!(
+            f.validation.min,
+            Some(mesa_core_types::CONNECTION_TIMEOUT_MIN_MS as f64)
+        );
+        assert_eq!(
+            f.validation.max,
+            Some(mesa_core_types::CONNECTION_TIMEOUT_MAX_MS as f64)
+        );
+        let host = desc
+            .connection
+            .fields
+            .iter()
+            .find(|f| f.key == "host")
+            .expect("Descriptor 必须有 host");
+        assert!(host.required, "host 必须 required");
+        assert_eq!(
+            host.default, None,
+            "host 不得有有效默认连接目标（C1 §4 硬要求）"
+        );
+    }
+
     fn generic_task(selections: serde_json::Value) -> AcquisitionTask {
         generic_task_with_id("t1", selections)
     }
@@ -1620,13 +1906,19 @@ mod tests {
     ///   Wire + HOLD（servo/spindle load、tool number）configure 即 UNSUPPORTED_POINT。
     #[tokio::test]
     async fn wire_backend_gate1_locked() {
-        // backend 解析。
-        let wire_cfg = FocasConnConfig::from_json(&serde_json::json!({})).unwrap();
+        // backend 解析（C1 后 host 必填，故显式提供连接目标）。
+        let base = || serde_json::json!({"host": "192.0.2.10"});
+        let wire_cfg = FocasConnConfig::from_json(&base()).unwrap();
         assert_eq!(wire_cfg.backend, FocasBackend::Wire);
-        let native_cfg =
-            FocasConnConfig::from_json(&serde_json::json!({"backend": "native"})).unwrap();
+        let mut native_json = base();
+        native_json["backend"] = serde_json::json!("native");
+        let native_cfg = FocasConnConfig::from_json(&native_json).unwrap();
         assert_eq!(native_cfg.backend, FocasBackend::Native);
-        assert!(FocasConnConfig::from_json(&serde_json::json!({"backend": "bogus"})).is_err());
+        let mut bogus = base();
+        bogus["backend"] = serde_json::json!("bogus");
+        assert!(FocasConnConfig::from_json(&bogus).is_err());
+        // C1：缺 host 不再隐式落到 127.0.0.1。
+        assert!(FocasConnConfig::from_json(&serde_json::json!({})).is_err());
         // 缺省 Wire 回归（Native 退役第一阶段：默认生产后端为 Wire）。
         let default_cfg = FocasConnConfig::default();
         assert_eq!(default_cfg.backend, FocasBackend::Wire);

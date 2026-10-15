@@ -12,6 +12,22 @@ use crate::schema::SchemaDescriptor;
 pub const DESCRIPTOR_CONTRACT_MAJOR: u32 = 2;
 pub const DESCRIPTOR_CONTRACT_MINOR: u32 = 0;
 
+/// 连接 `timeout_ms` 的支持上限（C1 §6.2 / §6.3）。
+///
+/// 为什么需要 Core 级常量：Probe 的外层总预算按「阶段数 × `timeout_ms`」推导，
+/// 没有统一上界时用户填一个极大值会让探测预算无界；同时 Descriptor
+/// （UI / Core Schema 校验）与各 Driver parser 必须给出**同一套**范围，
+/// 否则会出现「保存通过、运行才失败」或「UI 显示的值实际不生效」。
+///
+/// 语义：超过本值的配置在**访问网络之前**被拒绝（Core Schema 400 /
+/// Driver `BAD_CONFIG`），而不是被外层预算静默截断。
+///
+/// NOTE: 该值是「由阶段模型推出的工程上界」，不是真机实测结论；
+/// 真机分阶段量测（A22）后应复核并在此处更新。
+pub const CONNECTION_TIMEOUT_MAX_MS: u64 = 10_000;
+/// 连接 `timeout_ms` 的支持下限（低于此值的局域网抖动误超时概率显著上升）。
+pub const CONNECTION_TIMEOUT_MIN_MS: u64 = 500;
+
 /// Driver 身份（§13 identity）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DriverIdentity {

@@ -18,8 +18,8 @@ use crate::codec::S7Kind;
 use crate::s7any::{encode_bulk_item, encode_read_item, encode_write_spec};
 use mesa_core_types::ErrorKind;
 use mesa_s7_transport::{
-    S7_MAX_RACK, S7_MAX_SLOT, S7_MIN_TIMEOUT_MS, S7_PDU_DEFAULT, S7_PDU_MAX, S7_PDU_MIN,
-    S7ConnectOptions, S7Session, S7TransportError, S7TransportErrorKind,
+    S7_MAX_RACK, S7_MAX_SLOT, S7_PDU_DEFAULT, S7_PDU_MAX, S7_PDU_MIN, S7ConnectOptions, S7Session,
+    S7TransportError, S7TransportErrorKind,
 };
 
 /// 连接参数（来自 Endpoint.connection JSON，契约与抽取前一致）。
@@ -47,53 +47,92 @@ impl Default for S7ConnConfig {
 }
 
 impl S7ConnConfig {
-    /// 从 JSON 解析，缺省字段使用默认值。非法字段返回 ConfigurationError。
+    /// 从 JSON 解析。
+    ///
+    /// 契约（C1 §6.2「缺席 vs 存在但非法」）：
+    /// - **字段缺席**：`required` 字段（host）拒绝；真正 optional 的字段
+    ///   才使用 Descriptor 同义的默认值；
+    /// - **字段存在但类型/范围非法**（含 `null`、字符串数字、布尔、小数、
+    ///   负数、越界）：一律 `BAD_CONFIG`，绝不 `and_then(...).unwrap_or(...)`
+    ///   把非法类型当缺席后静默回落到默认连接目标。
+    ///
+    /// 数值一律先判范围再窄化（不允许先 `as u16` 再判 `== 0`，那会把
+    /// 65536 截断成 0、把 70000 截断成 4464 而连到另一台设备）。
     pub fn from_json(v: &serde_json::Value) -> Result<Self, SdkDriverError> {
-        let mut cfg = Self::default();
-        if let Some(h) = v.get("host").and_then(|x| x.as_str()) {
-            cfg.host = h.to_string();
+        fn bad(message: impl Into<String>) -> SdkDriverError {
+            SdkDriverError::configuration("BAD_CONFIG", message)
         }
-        if let Some(p) = v.get("port").and_then(|x| x.as_u64()) {
-            if p == 0 || p > 65535 {
-                return Err(SdkDriverError::configuration(
-                    "BAD_CONFIG",
-                    format!("port {p} 非法"),
-                ));
+        let object = v.as_object().ok_or_else(|| bad("connection 需为对象"))?;
+        // host：必填、非空字符串。缺席/类型非法都不得回落到内置默认目标。
+        let host = object
+            .get("host")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| bad("host 必填且必须为非空字符串（不从默认目标隐式连接）"))?
+            .to_string();
+        let mut cfg = Self {
+            host,
+            ..Self::default()
+        };
+        if let Some(value) = object.get("port") {
+            let p = value
+                .as_u64()
+                .ok_or_else(|| bad("port 必须为 1..=65535 的整数"))?;
+            if !(1..=65535).contains(&p) {
+                return Err(bad(format!("port {p} 非法，需 1..=65535")));
             }
             cfg.port = p as u16;
         }
-        if let Some(r) = v.get("rack").and_then(|x| x.as_u64()) {
+        if let Some(value) = object.get("rack") {
+            let r = value.as_u64().ok_or_else(|| bad("rack 必须为整数"))?;
             if r > S7_MAX_RACK as u64 {
-                return Err(SdkDriverError::configuration(
-                    "BAD_CONFIG",
-                    format!("rack {r} 非法，允许 0..{S7_MAX_RACK}"),
-                ));
+                return Err(bad(format!("rack {r} 非法，允许 0..{S7_MAX_RACK}")));
             }
             cfg.rack = r as u8;
         }
-        if let Some(s) = v.get("slot").and_then(|x| x.as_u64()) {
+        if let Some(value) = object.get("slot") {
+            let s = value.as_u64().ok_or_else(|| bad("slot 必须为整数"))?;
             if s > S7_MAX_SLOT as u64 {
-                return Err(SdkDriverError::configuration(
-                    "BAD_CONFIG",
-                    format!("slot {s} 非法，允许 0..{S7_MAX_SLOT}"),
-                ));
+                return Err(bad(format!("slot {s} 非法，允许 0..{S7_MAX_SLOT}")));
             }
             cfg.slot = s as u8;
         }
-        if let Some(t) = v.get("timeout_ms").and_then(|x| x.as_u64()) {
-            cfg.timeout_ms = t.max(S7_MIN_TIMEOUT_MS);
+        if let Some(value) = object.get("timeout_ms") {
+            let t = value
+                .as_u64()
+                .ok_or_else(|| bad("timeout_ms 必须为非负整数"))?;
+            // 下限/上限都是**显式契约**而不是静默抬升或截断：越界即拒绝，
+            // 避免“用户填 10、实际按 500 运行”或“填 60000、实际按 12s 被掐断”。
+            if t < mesa_core_types::CONNECTION_TIMEOUT_MIN_MS {
+                return Err(bad(format!(
+                    "timeout_ms {t} 非法，最小值为 {}",
+                    mesa_core_types::CONNECTION_TIMEOUT_MIN_MS
+                )));
+            }
+            if t > mesa_core_types::CONNECTION_TIMEOUT_MAX_MS {
+                return Err(bad(format!(
+                    "timeout_ms {t} 超出支持上限 {}（Probe 分阶段预算按该值推导，\
+                     超限配置无法被可靠验证）",
+                    mesa_core_types::CONNECTION_TIMEOUT_MAX_MS
+                )));
+            }
+            cfg.timeout_ms = t;
         }
-        if let Some(pdu) = v.get("pdu_length").and_then(|x| x.as_u64()) {
-            cfg.pdu_length = (pdu as u16).clamp(S7_PDU_MIN, S7_PDU_MAX);
+        if let Some(value) = object.get("pdu_length") {
+            let pdu = value.as_u64().ok_or_else(|| bad("pdu_length 必须为整数"))?;
+            if !(S7_PDU_MIN as u64..=S7_PDU_MAX as u64).contains(&pdu) {
+                return Err(bad(format!(
+                    "pdu_length {pdu} 非法，需 {S7_PDU_MIN}..={S7_PDU_MAX}（不截断、不 clamp）"
+                )));
+            }
+            cfg.pdu_length = pdu as u16;
         }
-        // 兼容 tsap 直接指定（可选）
-        if let Some(tsap) = v.get("remote_tsap").and_then(|x| x.as_u64()) {
-            // 覆盖 rack/slot 推导：高字节为 rack<<5|slot 的 TSAP 方案
-            // 这里仅存档，connect 时覆写计算
-            let _ = tsap;
-        }
-        if cfg.host.is_empty() {
-            return Err(SdkDriverError::configuration("BAD_CONFIG", "host 不能为空"));
+        // 兼容 tsap 直接指定（可选）：当前仅存档，connect 时仍按 rack/slot 推导。
+        // NOTE: 该字段不参与连接目标计算，保留读取以避免旧配置报未知字段。
+        if let Some(tsap) = object.get("remote_tsap") {
+            // 存在但类型非法同样拒绝，避免“看着生效、其实被忽略”。
+            tsap.as_u64().ok_or_else(|| bad("remote_tsap 必须为整数"))?;
         }
         Ok(cfg)
     }
@@ -424,5 +463,109 @@ mod tests {
         let phys_res = vec![Some(vec![0; 192]), None];
         let reass = reassemble_ranges(&map, &phys_res, ranges.len());
         assert!(reass[0].is_none(), "任一物理 BAD 则 logical BAD");
+    }
+
+    // -----------------------------------------------------------------------
+    // C1 §6.2：连接字段「缺席 vs 存在但非法」契约
+    // -----------------------------------------------------------------------
+
+    /// Host 必填：缺席或类型非法都不得回落到内置默认连接目标。
+    #[test]
+    fn host_is_required_and_never_falls_back_to_default_target() {
+        let base = || serde_json::json!({"port": 102});
+        assert_eq!(
+            S7ConnConfig::from_json(&base()).unwrap_err().code,
+            "BAD_CONFIG",
+            "缺 host 必须拒绝（不得落回 127.0.0.1/192.168.0.1）"
+        );
+        for bad in [
+            serde_json::json!(123),
+            serde_json::json!(true),
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!(""),
+            serde_json::json!("   "),
+        ] {
+            let mut v = base();
+            v["host"] = bad.clone();
+            assert_eq!(
+                S7ConnConfig::from_json(&v).unwrap_err().code,
+                "BAD_CONFIG",
+                "host={bad} 必须拒绝"
+            );
+        }
+        // 合法显式 host 通过，且不被改写。
+        let mut ok = base();
+        ok["host"] = serde_json::json!("10.0.0.7");
+        assert_eq!(S7ConnConfig::from_json(&ok).unwrap().host, "10.0.0.7");
+    }
+
+    /// 数值字段：类型非法 / 越界一律拒绝，且不得先窄化再判断。
+    #[test]
+    fn numeric_fields_reject_ill_typed_and_out_of_range() {
+        let with = |key: &str, value: serde_json::Value| {
+            let mut v = serde_json::json!({"host": "10.0.0.7"});
+            v[key] = value;
+            S7ConnConfig::from_json(&v)
+        };
+        // 类型非法（含字符串数字/小数/布尔/null）→ 拒绝，不回退默认值。
+        for key in ["port", "rack", "slot", "timeout_ms", "pdu_length"] {
+            for bad in [
+                serde_json::json!("102"),
+                serde_json::json!(1.5),
+                serde_json::json!(true),
+                serde_json::json!(null),
+            ] {
+                assert_eq!(
+                    with(key, bad.clone()).unwrap_err().code,
+                    "BAD_CONFIG",
+                    "{key}={bad} 必须拒绝"
+                );
+            }
+        }
+        // 越界：port 65536 若先 `as u16` 会截断成 0（连到另一语义目标）。
+        assert!(with("port", serde_json::json!(65536)).is_err());
+        assert!(with("port", serde_json::json!(0)).is_err());
+        assert!(with("port", serde_json::json!(-1)).is_err());
+        assert!(with("rack", serde_json::json!(8)).is_err());
+        assert!(with("slot", serde_json::json!(32)).is_err());
+        // timeout_ms：低于下限或高于支持上限都拒绝（不静默抬升/截断）。
+        assert!(with("timeout_ms", serde_json::json!(10)).is_err());
+        assert!(
+            with(
+                "timeout_ms",
+                serde_json::json!(mesa_core_types::CONNECTION_TIMEOUT_MAX_MS + 1)
+            )
+            .is_err()
+        );
+        assert!(
+            with(
+                "timeout_ms",
+                serde_json::json!(mesa_core_types::CONNECTION_TIMEOUT_MIN_MS)
+            )
+            .is_ok()
+        );
+        assert!(
+            with(
+                "timeout_ms",
+                serde_json::json!(mesa_core_types::CONNECTION_TIMEOUT_MAX_MS)
+            )
+            .is_ok()
+        );
+        // pdu_length：越界拒绝而不是 clamp 到边界值。
+        assert!(with("pdu_length", serde_json::json!(100)).is_err());
+        assert!(with("pdu_length", serde_json::json!(10_000)).is_err());
+        assert!(with("pdu_length", serde_json::json!(480)).is_ok());
+    }
+
+    /// 缺席的 optional 字段仍使用与 Descriptor 一致的默认值（不回归）。
+    #[test]
+    fn absent_optional_fields_keep_documented_defaults() {
+        let cfg = S7ConnConfig::from_json(&serde_json::json!({"host": "10.0.0.7"})).unwrap();
+        assert_eq!(cfg.port, 102);
+        assert_eq!(cfg.rack, 0);
+        assert_eq!(cfg.slot, 1);
+        assert_eq!(cfg.timeout_ms, 3000);
+        assert_eq!(cfg.pdu_length, S7_PDU_DEFAULT);
     }
 }

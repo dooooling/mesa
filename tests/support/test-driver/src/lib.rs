@@ -23,9 +23,13 @@
 //! - connection 顶层 `"fail_after_batches": N` 在第 N 批后连接报
 //!   SIMULATED_DISCONNECT（验证 Core 重连语义）；
 //! - `"crash_after_batches": N` 直接退出进程（仅子进程模式有意义，
-//!   进程内使用会终止测试进程），验证 Driver Crash Restore。
+//!   进程内使用会终止测试进程），验证 Driver Crash Restore；
+//! - connection 顶层 `"probe_delay_ms": N` 在 `probe()` 内注入延迟，
+//!   模拟「协议握手在 Probe RPC 内且较慢」的设备；用于验证 Probe 阶段预算
+//!   不会被外层/IPC 预算提前掐断（A22），以及取消时临时子进程与端口租约
+//!   被回收（A32）。
 //!
-//! TODO: 附录 A 其余能力（delay/jitter/burst/silent_interval）待性能预算阶段（§22）
+//! TODO: 附录 A 其余能力（jitter/burst/silent_interval）待性能预算阶段（§22）
 //! 按压测需要补齐。
 
 use std::sync::Arc;
@@ -99,6 +103,17 @@ impl Driver for TestDriver {
                         FieldType::Integer,
                     )
                     .required(false),
+                    {
+                        // C1 §6.3：Probe 延迟注入（慢设备模拟），供 A22/A32 使用。
+                        let mut f = FieldDescriptor::new(
+                            "probe_delay_ms",
+                            "Probe Delay (ms)",
+                            FieldType::Integer,
+                        )
+                        .required(false);
+                        f.validation.min = Some(0.0);
+                        f
+                    },
                 ],
             },
             resources: vec![
@@ -437,12 +452,10 @@ fn parse_batch_threshold(
 ) -> Result<Option<u64>, SdkDriverError> {
     match v.get(field) {
         None | Some(serde_json::Value::Null) => Ok(None),
-        Some(x) => x.as_u64().map(Some).ok_or_else(|| {
-            bad_point(
-                field,
-                &format!("`{field}` must be a positive integer batch count"),
-            )
-        }),
+        Some(x) => x
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| bad_point(field, &format!("`{field}` must be a non-negative integer"))),
     }
 }
 
@@ -595,6 +608,15 @@ struct ConnFaults {
     /// 第 N 批发布后进程直接退出（exit code 101）。仅子进程模式可观测，
     /// 用于端到端验证 Driver Crash Restore。
     crash_after_batches: Option<u64>,
+    /// `probe()` 内注入的延迟（毫秒）。
+    ///
+    /// 用途（C1 §6.3 / A22 / A32）：模拟「协议握手多阶段各耗时较久」的慢设备，
+    /// 用来证明 Probe 的外层预算与 IPC 预算不会把合法的慢路径提前掐断，
+    /// 以及请求被取消时临时子进程与端口租约确实被回收。
+    ///
+    /// NOTE: 该延迟发生在 `probe()` 内部，等价于真实驱动「握手在 Probe RPC 内」
+    /// 的形态，因此可以用于验证阶段预算模型本身。
+    probe_delay_ms: Option<u64>,
 }
 
 fn parse_conn_faults(cfg: &serde_json::Value) -> Result<ConnFaults, SdkDriverError> {
@@ -602,6 +624,8 @@ fn parse_conn_faults(cfg: &serde_json::Value) -> Result<ConnFaults, SdkDriverErr
         fail_after_batches: parse_batch_threshold(cfg, "fail_after_batches")
             .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?,
         crash_after_batches: parse_batch_threshold(cfg, "crash_after_batches")
+            .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?,
+        probe_delay_ms: parse_batch_threshold(cfg, "probe_delay_ms")
             .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?,
     })
 }
@@ -775,6 +799,12 @@ impl DriverConnection for SimConnection {
     /// 复用本连接（OpenConnection 已校验配置），不启动任何采集。
     async fn probe(&self) -> Result<mesa_core_types::ProbeReport, SdkDriverError> {
         use mesa_core_types::{CapabilityItem, CapabilityState};
+        // C1 §6.3：慢设备模拟。延迟发生在 probe() 内部，与真实驱动
+        // 「协议握手在 Probe RPC 内」的形态一致，因此可用于验证阶段预算
+        // 是否会被外层/IPC 预算提前掐断，以及取消时是否回收临时进程。
+        if let Some(ms) = self.faults.probe_delay_ms {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
         Ok(mesa_core_types::ProbeReport {
             reachable: true,
             vendor: Some("Mesa".into()),

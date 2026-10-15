@@ -7,9 +7,12 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use opcua_server::{ServerBuilder, ServerHandle};
+use opcua_server::{ServerBuilder, ServerEndpoint, ServerHandle, ServerUserToken};
 
 static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 凭据认证用的 user token key（`ServerEndpoint` 的策略表引用它）。
+const CREDENTIAL_TOKEN_ID: &str = "mesa_fixture_user";
 
 /// 运行中的 fixture 服务器：handle（trigger 事件）+ 端口（client 连接）。
 pub struct FixtureEventServer {
@@ -22,6 +25,20 @@ pub struct FixtureEventServer {
 impl FixtureEventServer {
     /// 启动服务器并等待 TCP 就绪（listener 由调用方预绑定，端口确定性已知）。
     pub async fn start() -> Self {
+        Self::start_inner(None).await
+    }
+
+    /// 启动**要求 UserNameIdentityToken** 的服务器（C1 / A21 用）。
+    ///
+    /// 做法：在匿名配置之上覆盖同名 `"none"` endpoint，使其 `user_token_ids`
+    /// 只含本凭据 key，从而**剔除匿名策略**；再注册该 key 的用户名/口令。
+    /// 口令不符时由默认认证器判 `BadIdentityTokenRejected`，因此该 fixture
+    /// 可以证明「驱动确实完成了认证」，而不是在匿名通道上"看起来连上了"。
+    pub async fn start_with_credentials(user: &str, pass: &str) -> Self {
+        Self::start_inner(Some((user.to_string(), pass.to_string()))).await
+    }
+
+    async fn start_inner(credentials: Option<(String, String)>) -> Self {
         let n = FIXTURE_SEQ.fetch_add(1, Ordering::SeqCst);
         let pki_dir = std::env::temp_dir().join(format!(
             "mesa-opcua-event-fixture-{}-{}",
@@ -38,6 +55,16 @@ impl FixtureEventServer {
             .port(port)
             .pki_dir(pki_dir.clone())
             .create_sample_keypair(true);
+        if let Some((user, pass)) = credentials {
+            // `add_endpoint` 是同 id 覆盖：用只含凭据策略的 "none" endpoint
+            // 替换 `new_anonymous` 注册的匿名 endpoint。
+            builder = builder
+                .add_user_token(CREDENTIAL_TOKEN_ID, ServerUserToken::user_pass(user, pass))
+                .add_endpoint(
+                    "none",
+                    ServerEndpoint::new_none("/", &[CREDENTIAL_TOKEN_ID.to_string()]),
+                );
+        }
         // fixture 队列上限：缺省值是测试型小数字（item 10 / subscription 20），
         // burst 会被服务端静默丢弃；提到与生产请求（1000）匹配的量级。
         // 注意：这是 fixture 侧的容量声明，不是被测行为。
