@@ -1,13 +1,18 @@
 //! 配置预填模板（Preset）：**可选**的配置素材，不参与采集准入。
 //!
-//! 设计边界（V2.0 §4）：
+//! 设计边界（V2.0 §4，PR-B 起叠加语义边界）：
 //! - Preset 只提供**结构固定字段**的预填（area/module/column/count/unit_mode/
 //!   decode/transport_size/unit）；`area_no` 与 `line` 一律留给使用者确认，
 //!   不猜轴/通道/行索引语义；
-//! - 模板是否可用**不影响**原生 `variable` 的 Configure/Poll：加载失败只让
-//!   模板浏览为空并给出诊断，数据面照常工作；
-//! - 模板数值来自已冻结的候选目录定义，保留 `validation_status=candidate`
-//!   与来源说明，绝不宣称硬件已验证；
+//! - **模板数据逐字不动**（C2=P1）：`PresetTemplate.parameters` 保持**原生**字段，
+//!   它同时是旧等价门 `tests/legacy_equivalence.rs` 的真值来源；语义索引走定义
+//!   目录的 `golden_ref`，**不由模板反向生成定义**（禁止自证循环）；
+//! - **浏览叶产出语义载荷**（M4）：叶的 `binding_json` 是
+//!   `{"kind":"nck_variable","parameters":{variable_id,definition_revision,target,arguments}}`
+//!   并旁挂 `identity` 块。语义载荷由「模板 id → `GoldenRef` → 定义目录」这条
+//!   **只读索引**链构造，原生字段不再出现在载荷里；
+//! - 模板是否可用**不影响**采集准入：加载失败只让模板浏览为空并给出诊断，
+//!   数据面照常工作；
 //! - 含 `drive_object_module` 的条目拆成两个独立模板（module 26 / module 130），
 //!   因为两条入口实例编号不同，不得互相换算。
 //!
@@ -17,7 +22,10 @@ use mesa_driver_protocol::pb::BrowseNode;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::compiler::POINT_KIND_VARIABLE;
+use crate::definition::{DefinitionCatalog, GoldenRef, NativeFieldSource, VariableDefinition};
 use crate::native::{NativeError, NativeNckAddress};
+use crate::targets::{DriveEntry, DriveObjectRef, TargetKind, TargetRef};
 
 /// 内嵌模板（随驱动发布；解析失败只影响浏览）。
 pub const EMBEDDED_828D: &str = include_str!("../presets/828d.json");
@@ -148,15 +156,26 @@ fn validate_template(t: &PresetTemplate) -> Result<(), String> {
         .map_err(|e: NativeError| e.to_string())
 }
 
-/// 模板 → 浏览叶（`binding_json` 只含固定字段；缺必填由通用校验阻止保存）。
+/// 模板 → 浏览叶。
+///
+/// **语义化（M4）**：叶的 `binding_json` 从原生信封
+/// `{"resource_id":"variable","parameters":{原生字段}}` 改为**语义信封**
+/// `{"kind":"nck_variable","parameters":{variable_id,definition_revision,target,arguments}}`，
+/// 并**旁挂** `identity` 块（`template`/`keys`/`preview_point_key`）。
+///
+/// 为什么可以这样改：模板本身承载的仍是**原生**字段（C2=P1：模板逐字不动），
+/// 但浏览叶是**载荷构造**层面——它把「已确认的原生实例」反推成用户要填的语义
+/// 坐标，从而让前端不必面对原生字段。`identity` **只出现在浏览/预填载荷**，
+/// **不得**进入持久化信封（信封是 `deny_unknown_fields` 的三字段结构）。
 pub fn leaf_node(t: &PresetTemplate) -> BrowseNode {
     leaf_node_with(t, &[])
 }
 
 /// 模板 → 浏览叶，并填入**已确认**的字段（例如身份核对出的实例编号）。
 ///
-/// 只允许填 `area_no`/`line` 这类使用者本来要填的实例字段；填入后该字段
-/// 从“待确认”列表移除，其余缺失项仍由通用必填校验阻止保存。
+/// 只允许填 `area_no`/`line` 这类使用者本来要填的实例字段；填入后会反映到语义
+/// `target`/`arguments`，其余缺失项保持缺失（**不猜测、不给默认值**），
+/// 由通用必填校验阻止保存。
 pub fn leaf_node_with(t: &PresetTemplate, filled: &[(&str, Value)]) -> BrowseNode {
     let mut parameters = t.parameters.clone();
     let mut pending: Vec<&str> = t.required_user_inputs.iter().map(|s| s.as_str()).collect();
@@ -164,25 +183,148 @@ pub fn leaf_node_with(t: &PresetTemplate, filled: &[(&str, Value)]) -> BrowseNod
         parameters.insert((*key).into(), value.clone());
         pending.retain(|k| k != key);
     }
-    let binding = serde_json::json!({
-        "resource_id": "variable",
-        "parameters": parameters,
-    })
-    .to_string();
     let suffix = if pending.is_empty() {
         "字段完整".to_string()
     } else {
         format!("待确认：{}", pending.join("/"))
     };
+    // 语义载荷优先；内嵌定义目录缺失该变量时退回原生信封并显式标注
+    // （绝不把「找不到定义」伪装成语义可用）。
+    let (kind, binding, note) = match semantic_binding(t, &parameters) {
+        Some(binding) => (POINT_KIND_VARIABLE.to_string(), binding, String::new()),
+        None => (
+            "variable".to_string(),
+            serde_json::json!({
+                "resource_id": "variable",
+                "parameters": parameters,
+            })
+            .to_string(),
+            " · 语义载荷不可用（内嵌定义目录缺少该变量；仅可作原生高级配置）".to_string(),
+        ),
+    };
     BrowseNode {
         id: format!("nck://presets/{}", t.id),
-        label: format!("{} · {} · {}", t.label, t.validation_status, suffix),
-        kind: "variable".into(),
+        label: format!("{} · {} · {}{}", t.label, t.validation_status, suffix, note),
+        kind,
         data_type: String::new(),
         access: "read".into(),
         has_children: false,
         binding_json: binding,
     }
+}
+
+/// 内嵌定义目录（进程内惰性装载；装载失败只让**语义叶**退化为原生信封）。
+fn embedded_catalog() -> Option<&'static DefinitionCatalog> {
+    static CATALOG: std::sync::OnceLock<Option<DefinitionCatalog>> = std::sync::OnceLock::new();
+    CATALOG
+        .get_or_init(|| DefinitionCatalog::embedded().ok())
+        .as_ref()
+}
+
+/// 模板 id 形态 `828d.<area>.<block>.<variable>.<entry>` → `GoldenRef` 四元组。
+///
+/// 这是「语义 `variable_id` ↔ 冻结 wire 向量 ↔ 模板 id」三者的**唯一**连接点：
+/// 只做**索引**映射，不复制任何 wire 真值，也不从模板生成定义。
+fn golden_ref_of_template(id: &str) -> Option<GoldenRef> {
+    let parts: Vec<&str> = id.split('.').collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    Some(GoldenRef {
+        area: parts[1].to_string(),
+        block: parts[2].to_string(),
+        variable: parts[3].to_string(),
+        entry: DriveEntry::parse(parts[4])?,
+    })
+}
+
+/// 语义信封 + `identity` 块（定义目录缺失时返回 `None`）。
+fn semantic_binding(t: &PresetTemplate, native: &Map<String, Value>) -> Option<String> {
+    let catalog = embedded_catalog()?;
+    let want = golden_ref_of_template(&t.id)?;
+    let def = catalog.find_by_golden_ref(&want).first().copied()?;
+    let (target, arguments) = prefill_from_native(def, native);
+    // 只有 target/arguments 完整时才能给出预览 Key；否则显式 `null`
+    // （**不猜测**缺失实例，也不物化可选默认值）。
+    let preview = def
+        .canonical_identity(&target, &arguments)
+        .ok()
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+    let mut params = Map::new();
+    params.insert("variable_id".into(), Value::from(def.variable_id.clone()));
+    params.insert("definition_revision".into(), Value::from(def.revision));
+    params.insert(
+        "target".into(),
+        serde_json::to_value(&target).unwrap_or(Value::Null),
+    );
+    params.insert("arguments".into(), Value::Object(arguments));
+    let identity = serde_json::json!({
+        "template": def.identity_template,
+        "keys": def.identity_keys,
+        "preview_point_key": preview,
+    });
+    Some(
+        serde_json::json!({
+            "kind": POINT_KIND_VARIABLE,
+            "parameters": Value::Object(params),
+            "identity": identity,
+        })
+        .to_string(),
+    )
+}
+
+/// 由「模板固定字段 + 已确认实例」反推语义 `target` / `arguments`。
+///
+/// **仅用于浏览/预填**：采集路径永远是「语义 → 原生」单向；
+/// 未确认的字段**不出现**（缺 `area_no` 就得不到 `channel`，绝不用 1 顶替）。
+fn prefill_from_native(
+    def: &VariableDefinition,
+    native: &Map<String, Value>,
+) -> (TargetRef, Map<String, Value>) {
+    let mut target = TargetRef::default();
+    let mut arguments = Map::new();
+    let module = native.get("module").and_then(Value::as_u64);
+    for (source, field_value) in [
+        (&def.addressing.area_no, native.get("area_no")),
+        (&def.addressing.line, native.get("line")),
+    ] {
+        let Some(value) = field_value.and_then(Value::as_u64) else {
+            continue;
+        };
+        match source {
+            NativeFieldSource::Target { kind } => match kind {
+                TargetKind::Channel => target.channel = u32::try_from(value).ok(),
+                TargetKind::ModeGroup => target.mode_group = u32::try_from(value).ok(),
+                TargetKind::Axis => target.axis = u32::try_from(value).ok(),
+                TargetKind::Spindle => target.spindle = u32::try_from(value).ok(),
+                TargetKind::DriveObject => {
+                    // `entry` 只能由模板的 module 唯一确定（26/130 不可换算）；
+                    // 拿不到就**不构造** drive_object，让使用者显式确认。
+                    let entry = match module {
+                        Some(26) => Some(DriveEntry::NcVariable),
+                        Some(130) => Some(DriveEntry::DriveObject),
+                        _ => None,
+                    };
+                    if let (Some(number), Some(entry)) = (u32::try_from(value).ok(), entry) {
+                        target.drive_object = Some(DriveObjectRef { number, entry });
+                    }
+                }
+            },
+            NativeFieldSource::Argument { key } => {
+                arguments.insert(key.clone(), Value::from(value));
+            }
+            NativeFieldSource::ArgumentOffset { key, offset } => {
+                let base = value as i64 - i64::from(*offset);
+                if base >= 0 {
+                    arguments.insert(key.clone(), Value::from(base));
+                }
+            }
+            // 固定字段与入口身份不来自用户输入，不进入 target/arguments。
+            NativeFieldSource::Fixed { .. } | NativeFieldSource::DriveEntryModule => {}
+        }
+    }
+    (target, arguments)
 }
 
 /// 目录节点（模板入口）。
@@ -310,16 +452,69 @@ mod tests {
     }
 
     #[test]
-    fn leaf_binding_carries_only_fixed_fields() {
+    fn leaf_binding_is_a_semantic_envelope_without_native_fields() {
         let reg = PresetRegistry::embedded();
         let t = reg.for_family("828d")[0];
         let node = leaf_node(t);
         assert!(node.id.starts_with("nck://presets/"));
         assert!(node.label.contains("candidate"));
         assert!(node.label.contains("待确认：area_no/line"));
+        assert_eq!(node.kind, "nck_variable", "叶必须是语义载荷");
         let binding: Value = serde_json::from_str(&node.binding_json).unwrap();
-        assert_eq!(binding["resource_id"], "variable");
-        assert!(binding["parameters"].get("area_no").is_none());
-        assert!(binding["parameters"].get("line").is_none());
+        assert_eq!(binding["kind"], "nck_variable");
+        let params = binding["parameters"].as_object().unwrap();
+        assert!(params.contains_key("variable_id"));
+        assert_eq!(params["definition_revision"], 1);
+        assert!(params.contains_key("target"));
+        assert!(params.contains_key("arguments"));
+        // 原生字段**不得**出现在语义信封里（语义模式下用户不面对协议字段）。
+        for key in params.keys() {
+            assert!(
+                ["variable_id", "definition_revision", "target", "arguments"]
+                    .contains(&key.as_str()),
+                "语义信封不得含原生字段 `{key}`：{}",
+                node.binding_json
+            );
+        }
+        for key in binding["parameters"]["target"].as_object().unwrap().keys() {
+            assert!(
+                ["channel", "mode_group", "axis", "spindle", "drive_object"]
+                    .contains(&key.as_str()),
+                "target 只允许语义变体，实际 `{key}`"
+            );
+        }
+        assert!(binding["resource_id"].is_null(), "不得再有旧资源信封");
+        // identity 块旁挂在**浏览载荷**里（模板/键集合/预览 Key）。
+        assert!(
+            binding["identity"]["template"]
+                .as_str()
+                .unwrap()
+                .starts_with("axis.")
+        );
+        assert!(!binding["identity"]["keys"].as_array().unwrap().is_empty());
+        // 未确认实例 ⇒ 预览 Key 为 null（不猜测）。
+        assert!(binding["identity"]["preview_point_key"].is_null());
+    }
+
+    #[test]
+    fn filled_leaf_prefill_produces_a_complete_preview_key() {
+        // 身份浏览会填入已核对的 area_no；驱动对象模板应能给出完整预览 Key。
+        let reg = PresetRegistry::embedded();
+        let t = reg
+            .for_family("828d")
+            .into_iter()
+            .find(|t| t.id == "828d.V.M.r0021.nc_variable")
+            .expect("驱动对象模板");
+        let node = leaf_node_with(t, &[("area_no", Value::from(3))]);
+        let binding: Value = serde_json::from_str(&node.binding_json).unwrap();
+        assert_eq!(binding["parameters"]["target"]["drive_object"]["number"], 3);
+        assert_eq!(
+            binding["parameters"]["target"]["drive_object"]["entry"],
+            "nc_variable"
+        );
+        assert_eq!(
+            binding["identity"]["preview_point_key"],
+            "drive.parameter.r0021@drive_object=o:{entry=s:nc_variable,number=i:3}"
+        );
     }
 }

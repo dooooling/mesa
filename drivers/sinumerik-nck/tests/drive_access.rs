@@ -8,8 +8,8 @@
 use mesa_core_types::{AcquisitionTask, DataType, Value};
 use mesa_driver_sdk::DriverConnection;
 use mesa_driver_sinumerik_nck::{
-    NativeNckAddress, NckConnConfig, NckConnection, NckDataKind, PresetRegistry, decode_value,
-    encode_var_spec, resolve_native,
+    AddressCompiler, DefinitionCatalog, NativeNckAddress, NckConnConfig, NckConnection,
+    NckDataKind, PresetRegistry, TargetRef, decode_value, encode_var_spec, resolve_native,
 };
 use serde_json::json;
 
@@ -136,43 +136,47 @@ fn object_name_status_and_axis_name_decode_recorded_values_strictly() {
     assert_eq!(NckDataKind::Utf16Be.core_array_type(), DataType::String);
 }
 
-/// 模板绑定（补 area_no/line 后）可直接 Configure，且 p0199 是 50 字节 String。
+/// 两条驱动入口（module 26 / 130）与 `p0199` 对象名的语义点位可直接 Configure，
+/// 且 `p0199` 是 50 字节 String（`count=25 × UTF16_BE`）。
+///
+/// PR-B 起走**语义信封**（`nck.points.v1`）：点位由定义目录的
+/// `drive.parameter.r0080` / `drive.object.name` + `target.drive_object{number,entry}`
+/// 描述；`entry` 显式决定 module 26/130，**不允许折叠**（旧 `mesa.resources.v1`
+/// 信封整体拒绝）。
 #[tokio::test]
-async fn preset_bindings_configure_with_declared_types() {
-    let reg = PresetRegistry::embedded();
-    let mut selections = Vec::new();
-    for (i, module) in [26u64, 130].into_iter().enumerate() {
-        let t = reg
-            .for_family("828d")
-            .into_iter()
-            .find(|t| {
-                t.id.starts_with("828d.V.M.r0080.") && t.parameters["module"] == json!(module)
-            })
-            .cloned()
-            .unwrap();
-        let mut binding = json!({"resource_id":"variable","parameters":t.parameters});
-        binding["parameters"]["area_no"] = json!(6);
-        binding["parameters"]["line"] = json!(1);
-        binding["outputs"] = json!([{"output":"value","point_key":format!("path{i}")}]);
-        selections.push(binding);
-    }
-    // p0199：25×U16BE = 50 字节 → 标量 String。
-    let name_t = reg
-        .for_family("828d")
-        .into_iter()
-        .find(|t| t.id.starts_with("828d.V.M.p0199.") && t.parameters["module"] == json!(130))
-        .cloned()
-        .unwrap();
-    let mut binding = json!({"resource_id":"variable","parameters":name_t.parameters});
-    assert_eq!(binding["parameters"]["count"], json!(25));
-    binding["parameters"]["area_no"] = json!(6);
-    binding["parameters"]["line"] = json!(1);
-    binding["outputs"] = json!([{"output":"value","point_key":"object_name"}]);
-    selections.push(binding);
-
+async fn drive_entry_points_configure_with_declared_types() {
+    let catalog = DefinitionCatalog::embedded().expect("内嵌定义目录");
+    let compiler = AddressCompiler::new(&catalog, "828d");
+    let point = |variable_id: &str, number: u32, entry: &str| {
+        let def = catalog.lookup(variable_id, 1).unwrap();
+        let target_json = json!({"drive_object": {"number": number, "entry": entry}});
+        let target = TargetRef::from_json(&target_json).unwrap();
+        let arguments = serde_json::Map::new();
+        let key = def.canonical_identity(&target, &arguments).unwrap();
+        let params = json!({
+            "variable_id": variable_id,
+            "definition_revision": 1,
+            "target": target_json,
+            "arguments": {},
+        });
+        // 顺带证明「Key 逐字相等 ⇒ 编译成功」在真实定义上成立。
+        compiler
+            .compile_point(
+                mesa_driver_sinumerik_nck::POINT_KIND_VARIABLE,
+                params.as_object().unwrap(),
+                &key,
+            )
+            .expect("语义点位必须可编译");
+        json!({"kind": "nck_variable", "point_key": key, "parameters": params})
+    };
+    let points_json = json!([
+        point("drive.parameter.r0080", 6, "nc_variable"),
+        point("drive.parameter.r0080", 6, "drive_object"),
+        point("drive.object.name", 6, "drive_object"),
+    ]);
     let task: AcquisitionTask = serde_json::from_value(
         json!({"id":"paths","schedule":{"mode":"poll","interval_ms":5000},
-        "binding":{"kind":"mesa.resources.v1","config":{"selections":selections}}}),
+        "binding":{"kind":"nck.points.v1","config":{"points":points_json}}}),
     )
     .unwrap();
     let cfg = NckConnConfig::from_json(
@@ -187,4 +191,8 @@ async fn preset_bindings_configure_with_declared_types() {
     // source_label 是原生地址标识，不含变量名，但能区分两条入口。
     assert!(points[0].source_label.as_deref().unwrap().contains("/26/"));
     assert!(points[1].source_label.as_deref().unwrap().contains("/130/"));
+    // 两条入口的身份不同（entry 进身份 ⇒ 不同 point_key）。
+    assert_ne!(points[0].point_key, points[1].point_key);
+    assert!(points[0].point_key.contains("entry=s:nc_variable"));
+    assert!(points[1].point_key.contains("entry=s:drive_object"));
 }

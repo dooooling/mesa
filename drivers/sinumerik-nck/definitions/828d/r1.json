@@ -1,0 +1,1331 @@
+{
+  "format_version": 1,
+  "family": "828d",
+  "revision": 1,
+  "definitions": [
+    {
+      "variable_id": "channel.program.status",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "通道程序状态", "en": "Channel program status" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/S/progStatus" }
+      ],
+      "targets": ["channel"],
+      "target_required": ["channel"],
+      "arguments": [],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 127 },
+        "column": 13,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "U16_LE",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "channel.program.status@channel={channel}",
+      "identity_keys": [{ "path": "channel", "required": true }],
+      "golden_ref": [{ "area": "C", "block": "S", "variable": "progStatus", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "mode_group.op_mode",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "方式组运行方式", "en": "Mode group operating mode" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "B/S/opMode" }
+      ],
+      "targets": ["mode_group"],
+      "target_required": ["mode_group"],
+      "arguments": [],
+      "addressing": {
+        "area": "B",
+        "area_no": { "source": "target", "kind": "mode_group" },
+        "module": { "source": "fixed", "value": 127 },
+        "column": 3,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "U16_LE",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "mode_group.op_mode@mode_group={mode_group}",
+      "identity_keys": [{ "path": "mode_group", "required": true }],
+      "golden_ref": [{ "area": "B", "block": "S", "variable": "opMode", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "channel.program.name.main",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "主程序名", "en": "Main program name" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/SPARPP/progName" }
+      ],
+      "targets": ["channel"],
+      "target_required": ["channel"],
+      "arguments": [],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 122 },
+        "column": 5,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "UTF8_NUL_LAST_32",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "channel.program.name.main@channel={channel}",
+      "identity_keys": [{ "path": "channel", "required": true }],
+      "golden_ref": [{ "area": "C", "block": "SPARPP", "variable": "progName", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "channel.program.name.active",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "当前活动程序名", "en": "Active program name" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/SPARP/progName" }
+      ],
+      "targets": ["channel"],
+      "target_required": ["channel"],
+      "arguments": [],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 125 },
+        "column": 3,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "UTF8_NUL_LAST_32",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "channel.program.name.active@channel={channel}",
+      "identity_keys": [{ "path": "channel", "required": true }],
+      "golden_ref": [{ "area": "C", "block": "SPARP", "variable": "progName", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "channel.program.line_number",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "当前程序行号", "en": "Active program line number" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/SPARP/actLineNumber" }
+      ],
+      "targets": ["channel"],
+      "target_required": ["channel"],
+      "arguments": [],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 125 },
+        "column": 9,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "I32_LE",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "channel.program.line_number@channel={channel}",
+      "identity_keys": [{ "path": "channel", "required": true }],
+      "golden_ref": [{ "area": "C", "block": "SPARP", "variable": "actLineNumber", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "channel.program.block",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "当前执行程序块", "en": "Active program block" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/SPARP/actBlock" }
+      ],
+      "targets": ["channel"],
+      "target_required": ["channel"],
+      "arguments": [],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 125 },
+        "column": 31,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "UTF8_NUL_FIRST_66",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "channel.program.block@channel={channel}",
+      "identity_keys": [{ "path": "channel", "required": true }],
+      "golden_ref": [{ "area": "C", "block": "SPARP", "variable": "actBlock", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "axis.position.commanded_mcs",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "轴指令位置（机床坐标系）", "en": "Axis commanded position (MCS)" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/SGA/actToolBasePos" }
+      ],
+      "targets": ["channel", "axis"],
+      "target_required": ["channel", "axis"],
+      "arguments": [],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 115 },
+        "column": 2,
+        "line": { "source": "target", "kind": "axis" }
+      },
+      "decode": "F64_LE",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "axis.position.commanded_mcs@axis={axis},channel={channel}",
+      "identity_keys": [
+        { "path": "axis", "required": true },
+        { "path": "channel", "required": true }
+      ],
+      "golden_ref": [{ "area": "C", "block": "SGA", "variable": "actToolBasePos", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "axis.position.actual_bcs",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "轴实际位置（基本坐标系）", "en": "Axis actual position (BCS)" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/SEGA/actProgPosBKS" }
+      ],
+      "targets": ["channel", "axis"],
+      "target_required": ["channel", "axis"],
+      "arguments": [],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 112 },
+        "column": 33,
+        "line": { "source": "target", "kind": "axis" }
+      },
+      "decode": "F64_LE",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "axis.position.actual_bcs@axis={axis},channel={channel}",
+      "identity_keys": [
+        { "path": "axis", "required": true },
+        { "path": "channel", "required": true }
+      ],
+      "golden_ref": [{ "area": "C", "block": "SEGA", "variable": "actProgPosBKS", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "channel.feed.actual",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "通道实际进给率（IPO）", "en": "Channel actual feedrate (IPO)" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/S/actFeedRateIpo" }
+      ],
+      "targets": ["channel"],
+      "target_required": ["channel"],
+      "arguments": [],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 127 },
+        "column": 1,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F64_LE",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "channel.feed.actual@channel={channel}",
+      "identity_keys": [{ "path": "channel", "required": true }],
+      "golden_ref": [{ "area": "C", "block": "S", "variable": "actFeedRateIpo", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "channel.feed.commanded",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "通道指令进给率（IPO）", "en": "Channel commanded feedrate (IPO)" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/S/cmdFeedRateIpo" }
+      ],
+      "targets": ["channel"],
+      "target_required": ["channel"],
+      "arguments": [],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 127 },
+        "column": 2,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F64_LE",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "channel.feed.commanded@channel={channel}",
+      "identity_keys": [{ "path": "channel", "required": true }],
+      "golden_ref": [{ "area": "C", "block": "S", "variable": "cmdFeedRateIpo", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "channel.feed.override",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "进给倍率（IPO）", "en": "Feedrate override (IPO)" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/S/feedRateIpoOvr" }
+      ],
+      "targets": ["channel"],
+      "target_required": ["channel"],
+      "arguments": [],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 127 },
+        "column": 3,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F64_LE",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "channel.feed.override@channel={channel}",
+      "identity_keys": [{ "path": "channel", "required": true }],
+      "golden_ref": [{ "area": "C", "block": "S", "variable": "feedRateIpoOvr", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "spindle.speed.actual",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "主轴实际转速", "en": "Spindle actual speed" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/SSP/actSpeed" }
+      ],
+      "targets": ["channel", "spindle"],
+      "target_required": ["channel", "spindle"],
+      "arguments": [],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 114 },
+        "column": 2,
+        "line": { "source": "target", "kind": "spindle" }
+      },
+      "decode": "F64_LE",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "spindle.speed.actual@channel={channel},spindle={spindle}",
+      "identity_keys": [
+        { "path": "channel", "required": true },
+        { "path": "spindle", "required": true }
+      ],
+      "golden_ref": [{ "area": "C", "block": "SSP", "variable": "actSpeed", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "spindle.speed.commanded",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "主轴指令转速", "en": "Spindle commanded speed" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/SSP/cmdSpeed" }
+      ],
+      "targets": ["channel", "spindle"],
+      "target_required": ["channel", "spindle"],
+      "arguments": [],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 114 },
+        "column": 3,
+        "line": { "source": "target", "kind": "spindle" }
+      },
+      "decode": "F64_LE",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "spindle.speed.commanded@channel={channel},spindle={spindle}",
+      "identity_keys": [
+        { "path": "channel", "required": true },
+        { "path": "spindle", "required": true }
+      ],
+      "golden_ref": [{ "area": "C", "block": "SSP", "variable": "cmdSpeed", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "spindle.speed.override",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "主轴倍率", "en": "Spindle speed override" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/SSP/speedOvr" }
+      ],
+      "targets": ["channel", "spindle"],
+      "target_required": ["channel", "spindle"],
+      "arguments": [],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 114 },
+        "column": 4,
+        "line": { "source": "target", "kind": "spindle" }
+      },
+      "decode": "F64_LE",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "spindle.speed.override@channel={channel},spindle={spindle}",
+      "identity_keys": [
+        { "path": "channel", "required": true },
+        { "path": "spindle", "required": true }
+      ],
+      "golden_ref": [{ "area": "C", "block": "SSP", "variable": "speedOvr", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "channel.tool.number_active",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "当前有效刀具号", "en": "Active tool number" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/S/actTNumber" }
+      ],
+      "targets": ["channel"],
+      "target_required": ["channel"],
+      "arguments": [],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 127 },
+        "column": 23,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "U16_LE",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "channel.tool.number_active@channel={channel}",
+      "identity_keys": [{ "path": "channel", "required": true }],
+      "golden_ref": [{ "area": "C", "block": "S", "variable": "actTNumber", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "channel.r_parameter",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "通道 R 参数", "en": "Channel R parameter" },
+      "source": [
+        { "kind": "manual", "reference": "Siemens 828D NC variables 03/2025 A5E53370586B AC" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/RP/rpa（index=0 → line=1）" }
+      ],
+      "targets": ["channel"],
+      "target_required": ["channel"],
+      "arguments": [
+        {
+          "key": "index",
+          "label": { "zh": "R 参数号", "en": "R parameter index" },
+          "value_type": "integer",
+          "required": true,
+          "min": 0,
+          "max": 65534
+        }
+      ],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 21 },
+        "column": 1,
+        "line": { "source": "argument_offset", "key": "index", "offset": 1 }
+      },
+      "decode": "F64_LE",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "channel.r_parameter#index={index}@channel={channel}",
+      "identity_keys": [
+        { "path": "index", "required": true },
+        { "path": "channel", "required": true }
+      ],
+      "golden_ref": [{ "area": "C", "block": "RP", "variable": "rpa", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "drive.parameter.r0021",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0021（仅参数身份，非工程语义）", "en": "Drive parameter r0021 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0021 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 21,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F32_BE",
+      "transport_size": 7,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0021@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0021", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0021", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0027",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0027（仅参数身份，非工程语义）", "en": "Drive parameter r0027 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0027 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 27,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F32_BE",
+      "transport_size": 7,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0027@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0027", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0027", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.motor.temperature",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "该驱动对象的电机温度（不表示某个机床轴）", "en": "Motor temperature of this drive object (not a machine axis)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023（p.71 无效值标记）" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0035 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 35,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F32_BE",
+      "transport_size": 7,
+      "count": 1,
+      "unit_mode": "current",
+      "invalid_rule": { "value": -200.0, "tolerance": 0.001 },
+      "identity_template": "drive.motor.temperature@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0035", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0035", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0033",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "candidate",
+      "label": { "zh": "驱动参数 r0033（候选语义：轴负载；未确认）", "en": "Drive parameter r0033 (candidate: axis load)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0033 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 33,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F32_BE",
+      "transport_size": 7,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0033@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0033", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0033", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0031",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "candidate",
+      "label": { "zh": "驱动参数 r0031（候选语义：滤波转矩实际值；访问能力 HOLD）", "en": "Drive parameter r0031 (candidate; access capability HOLD)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0031 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 31,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F32_BE",
+      "transport_size": 7,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0031@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0031", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0031", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0062",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0062（仅参数身份，非工程语义）", "en": "Drive parameter r0062 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0062 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 62,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F32_BE",
+      "transport_size": 7,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0062@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0062", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0062", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0063",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0063（仅参数身份，非工程语义）", "en": "Drive parameter r0063 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0063 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 63,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F32_BE",
+      "transport_size": 7,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0063@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0063", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0063", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0064",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0064（仅参数身份，非工程语义）", "en": "Drive parameter r0064 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0064 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 64,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F32_BE",
+      "transport_size": 7,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0064@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0064", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0064", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0077",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0077（仅参数身份，非工程语义）", "en": "Drive parameter r0077 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0077 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 77,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F32_BE",
+      "transport_size": 7,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0077@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0077", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0077", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0078",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0078（仅参数身份，非工程语义）", "en": "Drive parameter r0078 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0078 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 78,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F32_BE",
+      "transport_size": 7,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0078@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0078", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0078", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0079",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0079（仅参数身份，非工程语义）", "en": "Drive parameter r0079 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0079 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 79,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F32_BE",
+      "transport_size": 7,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0079@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0079", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0079", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0080",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0080（仅参数身份，非工程语义）", "en": "Drive parameter r0080 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0080 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 80,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F32_BE",
+      "transport_size": 7,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0080@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0080", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0080", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0081",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0081（仅参数身份，非工程语义）", "en": "Drive parameter r0081 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0081 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 81,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F32_BE",
+      "transport_size": 7,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0081@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0081", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0081", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0082",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0082（仅参数身份，非工程语义）", "en": "Drive parameter r0082 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0082 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 82,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "F32_BE",
+      "transport_size": 7,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0082@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0082", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0082", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0103",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0103（仅参数身份，非工程语义）", "en": "Drive parameter r0103 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0103 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 103,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "U16_BE",
+      "transport_size": 6,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0103@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0103", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0103", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.p0105",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 p0105（仅参数身份，非工程语义；只读）", "en": "Drive parameter p0105 (parameter identity only, read-only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/p0105 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 105,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "I16_BE",
+      "transport_size": 5,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.p0105@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "p0105", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "p0105", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0106",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0106（仅参数身份，非工程语义）", "en": "Drive parameter r0106 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0106 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 106,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "I16_BE",
+      "transport_size": 5,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0106@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0106", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0106", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0107",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0107（仅参数身份，非工程语义）", "en": "Drive parameter r0107 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0107 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 107,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "I16_BE",
+      "transport_size": 5,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0107@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0107", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0107", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.parameter.r0108",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label": { "zh": "驱动参数 r0108（仅参数身份，非工程语义）", "en": "Drive parameter r0108 (parameter identity only)" },
+      "source": [
+        { "kind": "manual", "reference": "SINAMICS S120/S150 参数手册 11/2023" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/r0108 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 108,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "U32_BE",
+      "transport_size": 6,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "drive.parameter.r0108@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "r0108", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "r0108", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "drive.object.name",
+      "revision": 1,
+      "family": "828d",
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label": { "zh": "该驱动对象名（25×U16BE）", "en": "Drive object name (25 x U16BE)" },
+      "source": [
+        { "kind": "measurement", "reference": "docs/evidence/nck-drive-object-readback.json", "note": "module26/module130 两条入口的 p0199 抓包" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "V/M/p0199 × 2（nc_variable / drive_object）" }
+      ],
+      "targets": ["drive_object"],
+      "target_required": ["drive_object"],
+      "arguments": [],
+      "addressing": {
+        "area": "V",
+        "area_no": { "source": "target", "kind": "drive_object" },
+        "module": { "source": "drive_entry_module" },
+        "column": 199,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "UTF16_BE",
+      "transport_size": 6,
+      "count": 25,
+      "unit_mode": "current",
+      "identity_template": "drive.object.name@drive_object={drive_object}",
+      "identity_keys": [{ "path": "drive_object", "required": true }],
+      "golden_ref": [
+        { "area": "V", "block": "M", "variable": "p0199", "entry": "nc_variable" },
+        { "area": "V", "block": "M", "variable": "p0199", "entry": "drive_object" }
+      ]
+    },
+    {
+      "variable_id": "axis.name",
+      "revision": 1,
+      "family": "828d",
+      "scope": "identity",
+      "semantics_status": "verified",
+      "label": { "zh": "机床轴名（身份探针）", "en": "Machine axis name (identity probe)" },
+      "source": [
+        { "kind": "identity_probe", "reference": "drivers/sinumerik-nck/src/identity_spec.rs", "note": "AXIS_NAME" },
+        { "kind": "measurement", "reference": "docs/evidence/nck-live-identity-probe.txt" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "N/M/MDSA_AXCONF_MACHAX_NAME_TAB" }
+      ],
+      "targets": ["axis"],
+      "target_required": ["axis"],
+      "arguments": [],
+      "addressing": {
+        "area": "N",
+        "area_no": { "source": "fixed", "value": 1 },
+        "module": { "source": "fixed", "value": 26 },
+        "column": 10000,
+        "line": { "source": "target", "kind": "axis" }
+      },
+      "decode": "UTF8_FIXED_16",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "axis.name@axis={axis}",
+      "identity_keys": [{ "path": "axis", "required": true }],
+      "golden_ref": [{ "area": "N", "block": "M", "variable": "MDSA_AXCONF_MACHAX_NAME_TAB", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "axis.ctrlout.module_number",
+      "revision": 1,
+      "family": "828d",
+      "scope": "identity",
+      "semantics_status": "verified",
+      "label": { "zh": "轴驱动模块号（身份探针）", "en": "Axis control output module number (identity probe)" },
+      "source": [
+        { "kind": "identity_probe", "reference": "drivers/sinumerik-nck/src/identity_spec.rs", "note": "AXIS_CTRLOUT_MODULE_NR" },
+        { "kind": "measurement", "reference": "docs/evidence/nck-live-identity-probe.txt" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "A/M/MDCA_CTRLOUT_MODULE_NR" }
+      ],
+      "targets": ["axis"],
+      "target_required": ["axis"],
+      "arguments": [],
+      "addressing": {
+        "area": "A",
+        "area_no": { "source": "target", "kind": "axis" },
+        "module": { "source": "fixed", "value": 26 },
+        "column": 30110,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "U8",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "axis.ctrlout.module_number@axis={axis}",
+      "identity_keys": [{ "path": "axis", "required": true }],
+      "golden_ref": [{ "area": "A", "block": "M", "variable": "MDCA_CTRLOUT_MODULE_NR", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "axis.encoder.module_number",
+      "revision": 1,
+      "family": "828d",
+      "scope": "identity",
+      "semantics_status": "verified",
+      "label": { "zh": "轴编码器模块号（身份探针）", "en": "Axis encoder module number (identity probe)" },
+      "source": [
+        { "kind": "identity_probe", "reference": "drivers/sinumerik-nck/src/identity_spec.rs", "note": "AXIS_ENC_MODULE_NR" },
+        { "kind": "measurement", "reference": "docs/evidence/nck-live-identity-probe.txt" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "A/M/MDCA_ENC_MODULE_NR" }
+      ],
+      "targets": ["axis"],
+      "target_required": ["axis"],
+      "arguments": [],
+      "addressing": {
+        "area": "A",
+        "area_no": { "source": "target", "kind": "axis" },
+        "module": { "source": "fixed", "value": 26 },
+        "column": 30220,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "U8",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "axis.encoder.module_number@axis={axis}",
+      "identity_keys": [{ "path": "axis", "required": true }],
+      "golden_ref": [{ "area": "A", "block": "M", "variable": "MDCA_ENC_MODULE_NR", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "axis.ctrlout.type",
+      "revision": 1,
+      "family": "828d",
+      "scope": "identity",
+      "semantics_status": "verified",
+      "label": { "zh": "轴驱动输出类型（身份探针；0 = 无驱动输出）", "en": "Axis control output type (identity probe)" },
+      "source": [
+        { "kind": "identity_probe", "reference": "drivers/sinumerik-nck/src/identity_spec.rs", "note": "AXIS_CTRLOUT_TYPE" },
+        { "kind": "measurement", "reference": "docs/evidence/nck-live-identity-probe.txt" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "A/M/MDCA_CTRLOUT_TYPE" }
+      ],
+      "targets": ["axis"],
+      "target_required": ["axis"],
+      "arguments": [],
+      "addressing": {
+        "area": "A",
+        "area_no": { "source": "target", "kind": "axis" },
+        "module": { "source": "fixed", "value": 26 },
+        "column": 30130,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "U8",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "axis.ctrlout.type@axis={axis}",
+      "identity_keys": [{ "path": "axis", "required": true }],
+      "golden_ref": [{ "area": "A", "block": "M", "variable": "MDCA_CTRLOUT_TYPE", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "channel.machine_axis_assignment",
+      "revision": 1,
+      "family": "828d",
+      "scope": "identity",
+      "semantics_status": "verified",
+      "label": { "zh": "通道位置→机床轴号（身份探针）", "en": "Channel position to machine axis number (identity probe)" },
+      "source": [
+        { "kind": "identity_probe", "reference": "drivers/sinumerik-nck/src/identity_spec.rs", "note": "CHANNEL_MACHAX_USED" },
+        { "kind": "measurement", "reference": "docs/evidence/nck-live-identity-probe.txt" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "C/M/AXCONF_MACHAX_USED" }
+      ],
+      "targets": ["channel"],
+      "target_required": ["channel"],
+      "arguments": [
+        {
+          "key": "position",
+          "label": { "zh": "通道位置（机床轴序号）", "en": "Channel position (machine axis index)" },
+          "value_type": "integer",
+          "required": true,
+          "min": 0,
+          "max": 65535
+        }
+      ],
+      "addressing": {
+        "area": "C",
+        "area_no": { "source": "target", "kind": "channel" },
+        "module": { "source": "fixed", "value": 26 },
+        "column": 20070,
+        "line": { "source": "argument", "key": "position" }
+      },
+      "decode": "U8",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "channel.machine_axis_assignment#position={position}@channel={channel}",
+      "identity_keys": [
+        { "path": "channel", "required": true },
+        { "path": "position", "required": true }
+      ],
+      "golden_ref": [{ "area": "C", "block": "M", "variable": "AXCONF_MACHAX_USED", "entry": "nc_variable" }]
+    },
+    {
+      "variable_id": "axis.spindle_assignment",
+      "revision": 1,
+      "family": "828d",
+      "scope": "identity",
+      "semantics_status": "verified",
+      "label": { "zh": "轴的主轴归属（身份探针；非 0 = 该轴为第 n 主轴）", "en": "Axis spindle assignment (identity probe)" },
+      "source": [
+        { "kind": "identity_probe", "reference": "drivers/sinumerik-nck/src/identity_spec.rs", "note": "AXIS_SPIND_ASSIGN" },
+        { "kind": "measurement", "reference": "docs/evidence/nck-live-identity-probe.txt" },
+        { "kind": "frozen_vector", "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json", "note": "A/M/SPIND_ASSIGN_TO_MACHAX" }
+      ],
+      "targets": ["axis"],
+      "target_required": ["axis"],
+      "arguments": [],
+      "addressing": {
+        "area": "A",
+        "area_no": { "source": "target", "kind": "axis" },
+        "module": { "source": "fixed", "value": 26 },
+        "column": 35000,
+        "line": { "source": "fixed", "value": 1 }
+      },
+      "decode": "U8",
+      "transport_size": 9,
+      "count": 1,
+      "unit_mode": "current",
+      "identity_template": "axis.spindle_assignment@axis={axis}",
+      "identity_keys": [{ "path": "axis", "required": true }],
+      "golden_ref": [{ "area": "A", "block": "M", "variable": "SPIND_ASSIGN_TO_MACHAX", "entry": "nc_variable" }]
+    }
+  ]
+}

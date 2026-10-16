@@ -271,4 +271,63 @@ async fn browse_sinumerik_nck_catalog_tree_e2e() {
         v["nodes"].as_array().expect("nodes 数组").is_empty(),
         "未知 parent 必须为空页，实际: {v}"
     );
+
+    // ---- 【PR-B 新增，不改写上面的既有断言】-------------------------------
+    // 828d 的预填模板叶必须产出**语义载荷**：`{"kind":"nck_variable",
+    // "parameters":{variable_id,definition_revision,target,arguments}}`，
+    // 且**不含**任何原生协议字段（语义模式下用户不面对 `module`/`column`/…）。
+    // 既有的 `840d-sl` 断言（根 2 节点、诊断节点、未知 parent 空页）保持不变：
+    // 该系列没有模板，正是上面那三条断言成立的原因。
+    let (app828, ep828) = app_with_endpoint(
+        "sinumerik-nck",
+        serde_json::json!({"host":"127.0.0.1","family":"828d","local_tsap":256,"remote_tsap":258}),
+    )
+    .await;
+    let req = Request::builder()
+        .uri(format!("/api/v1/endpoints/{ep828}/browse"))
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"parent":"nck://presets","limit":1}"#))
+        .unwrap();
+    let resp = app828.oneshot(req).await.unwrap();
+    let v = assert_browse_ok(resp, "sinumerik-nck 828d presets").await;
+    let leaf = &v["nodes"].as_array().expect("nodes 数组")[0];
+    assert_eq!(leaf["kind"], "nck_variable", "叶必须是语义载荷: {leaf}");
+    let binding: serde_json::Value =
+        serde_json::from_str(leaf["binding_json"].as_str().unwrap()).unwrap();
+    assert_eq!(binding["kind"], "nck_variable", "{binding}");
+    assert!(
+        binding.get("resource_id").is_none(),
+        "旧资源信封不得再出现: {binding}"
+    );
+    let params = binding["parameters"].as_object().expect("parameters 对象");
+    for key in params.keys() {
+        assert!(
+            ["variable_id", "definition_revision", "target", "arguments"].contains(&key.as_str()),
+            "语义载荷不得含 `{key}`: {binding}"
+        );
+    }
+    assert!(
+        params["variable_id"].as_str().unwrap().contains('.'),
+        "variable_id 必须是定义目录里的语义 ID: {binding}"
+    );
+    assert_eq!(params["definition_revision"], 1);
+    for key in params["target"].as_object().unwrap().keys() {
+        assert!(
+            ["channel", "mode_group", "axis", "spindle", "drive_object"].contains(&key.as_str()),
+            "target 只允许语义变体，实际 `{key}`: {binding}"
+        );
+    }
+    // 身份块旁挂在**浏览载荷**里（模板/键集合/预览 Key），供前端做通用替换。
+    assert!(
+        binding["identity"]["template"]
+            .as_str()
+            .unwrap()
+            .contains('{'),
+        "必须给出身份模板: {binding}"
+    );
+    assert!(
+        !binding["identity"]["keys"].as_array().unwrap().is_empty(),
+        "必须给出身份键集合: {binding}"
+    );
 }
