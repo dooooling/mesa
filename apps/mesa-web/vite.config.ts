@@ -10,6 +10,16 @@ export default defineConfig({
         changeOrigin: true,
       },
     },
+    // Windows 上「编辑工具 + 文件监听」会互相打架：部分工具写文件时先在源码目录
+    // 建 `.<文件名>.<pid>.<uuid>.tmpdir/<文件名>.tmp` 再改名，而 chokidar 会去
+    // 监听这个瞬时存在、且可能被锁定的临时文件，命中 EBUSY 后**整个 dev server
+    // 崩溃**（实测连续三次，分别撞 .tsx / .test.tsx / .ts 的临时文件）。
+    //
+    // 这里只忽略该类临时目录：不改变正常源码的监听（`.tsx` 改动仍触发 HMR），
+    // 也不切换到轮询模式（轮询会明显增加 CPU/延迟，属过度修复）。
+    watch: {
+      ignored: ["**/.*.tmpdir", "**/.*.tmpdir/**"],
+    },
   },
   build: {
     outDir: "dist",
