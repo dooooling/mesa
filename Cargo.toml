@@ -50,6 +50,21 @@ windows-sys = { version = "0.59", features = ["Win32_System_Performance", "Win32
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
+# Unicode 规范等价（NFC）：`point_key` 的字符串载荷必须先做 NFC，否则同一逻辑文本的
+# NFC/NFD 两种写法会得到两个 Key，点位身份不再稳定（反例 E3）。
+#
+# 版本与 feature 都是**契约的一部分**，不得随手放宽：
+# - `=0.1.25`：精确锁定。`point_key` 的身份编码依赖该 crate 内嵌的 Unicode 数据表
+#   （0.1.25 = Unicode 17.0.0）。次要版本升级即可能更换数据版本，从而改动边缘字符串的
+#   规范编码 ⇒ 同一逻辑点位的 Key 漂移。升级必须显式改本行 + 复核 golden 向量 + 更新
+#   `tests/fixtures/nck-point-key-golden.json` 的 `unicode_version` 字段。
+# - `default-features = false`：该 crate 唯一的 feature `std` 只切换 `no_std`/`std`
+#   （对 NFC 语义与结果无影响，见其 `#![cfg_attr(not(feature = "std"), no_std)]`），
+#   本仓库只使用 `nfc()` 迭代器，故不启用，保持最小依赖面。
+#
+# 归一形式**只允许 NFC**：绝不以 NFKC/NFKD 替代——兼容归一会把 `ﬁ`(U+FB01) → `fi`、
+# 全角 `Ａ`(U+FF21) → `A` 等语义不同的文本折叠成同一 Key，制造身份碰撞。
+unicode-normalization = { version = "=0.1.25", default-features = false }
 sha2 = "0.10"
 thiserror = "2"
 tracing = "0.1"

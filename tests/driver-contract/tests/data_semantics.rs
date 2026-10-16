@@ -1,12 +1,94 @@
 //! Data Plane 精确语义冻结契约（§3 / §4 P0.1 + P0.2）
 //! 覆盖 V2.1 §3.14 所列 14 断言。
+//!
+//! NCK 语义点位重构 PR-A 追加（设计文档 §4.3 / §6.6 T2、T3a）：
+//! `point_key`/`point_id` 的稳定性契约按语义模型显式重写。**全部使用字面量冻结 Key**
+//! ——Core 不生成也不推导身份（修订 4），因此本套件**不得**出现任何身份推导调用，
+//! 也不得依赖驱动子进程（保持「无驱动子进程」的轻量属性）。
 
-use mesa_config_store::ConfigStore;
+use mesa_config_store::{ConfigStore, DeviceRecord, EndpointRecord};
 use mesa_core_types::{
     AcquisitionTask, DataBatch, DataType, DriverBinding, PointDescriptor, PointValue, Quality,
-    TaskSchedule, Value, ValueOrigin, ensure_unique_point_keys, now_unix_ns,
+    TaskSchedule, Value, ValueOrigin, ensure_endpoint_point_keys_unique, ensure_unique_point_keys,
+    now_unix_ns, parse_point_binding,
 };
 use mesa_driver_manager::snapshot::Snapshot;
+
+/// 字面量冻结 Key（与 NCK Driver 的 golden 向量同源，§4.1.1 K）。
+/// **禁止**在 Core 侧用任何函数「推导」这些值——它们就是契约本身。
+const SEMANTIC_KEY: &str = "channel.r_parameter#index=i:100@channel=i:1";
+const SEMANTIC_KEY_OTHER_VARIABLE: &str = "channel.program.status@channel=i:1";
+const SEMANTIC_KEY_OTHER_INDEX: &str = "channel.r_parameter#index=i:101@channel=i:1";
+const NATIVE_KEY: &str = "native.C.1.21.1.396";
+const NATIVE_KEY_OTHER_ADDR: &str = "native.C.1.21.1.397";
+const NATIVE_USER_KEY: &str = "native.C.1.21.1.396~2";
+
+/// 最小夹具：一个 Device + 一个 Endpoint（各用例独立，避免并发互踩）。
+fn store_with_endpoint() -> ConfigStore {
+    let store = ConfigStore::open_in_memory().unwrap();
+    store
+        .create_device(&DeviceRecord {
+            id: "d1".into(),
+            name: "dev".into(),
+        })
+        .unwrap();
+    store
+        .create_endpoint(&EndpointRecord {
+            id: "ep1".into(),
+            name: "EP1".into(),
+            device_id: "d1".into(),
+            driver_id: "test-driver".into(),
+            connection_json: "{}".into(),
+            desired_running: false,
+            updated_at_ns: 0,
+        })
+        .unwrap();
+    store
+}
+
+fn descriptor(key: &str) -> PointDescriptor {
+    PointDescriptor {
+        point_key: key.into(),
+        data_type: DataType::F64,
+        unit: None,
+        source_label: None,
+    }
+}
+
+/// 分配一批字面量 Key，返回 `point_id`（与入参同序）。
+fn assign(store: &ConfigStore, keys: &[&str]) -> Vec<u32> {
+    let descs: Vec<PointDescriptor> = keys.iter().map(|k| descriptor(k)).collect();
+    store
+        .assign_point_ids("ep1", &descs)
+        .unwrap()
+        .into_iter()
+        .map(|d| d.point_id)
+        .collect()
+}
+
+/// 从 `point_registry`（含墓碑）读回 `(point_id, deleted)`。
+fn registry(store: &ConfigStore, key: &str) -> (u32, bool) {
+    store
+        .point_registry_all("ep1")
+        .unwrap()
+        .into_iter()
+        .find(|r| r.0 == key)
+        .map(|r| (r.1, r.3))
+        .unwrap_or_else(|| panic!("point_registry 中不存在 `{key}`"))
+}
+
+/// 以 `nck.points.v1` 信封（**字面量 point_key**）构造点位并取回其 `point_key`。
+/// 这同时证明「信封层通过」且「Core 不解释 parameters」。
+fn nck_point_key(parameters: serde_json::Value) -> String {
+    let binding = serde_json::json!({"points": [{
+        "kind": "nck_variable",
+        "point_key": SEMANTIC_KEY,
+        "parameters": parameters,
+    }]});
+    let (issues, parsed) = parse_point_binding(&binding, "tasks[0].binding.config");
+    assert!(issues.is_empty(), "信封层必须通过: {issues:?}");
+    parsed.unwrap().points[0].point_key.clone()
+}
 
 // --- §3.4 GOOD 必须类型匹配 ---
 #[test]
@@ -144,8 +226,13 @@ fn deleted_point_id_never_reused() {
     let defs2 = store.assign_point_ids("ep1", &descs2).unwrap();
     let k3_id = defs2.iter().find(|d| d.point_key == "k3").unwrap().point_id;
     assert_ne!(k3_id, k1_id, "deleted id must not be reused");
-    // 当前实现中 deleted 的 k1 仍保留，max+1 应大于 k1_id
-    assert!(k3_id > k1_id || k3_id != k1_id);
+    // 强断言（原实现为 `k3_id > k1_id || k3_id != k1_id`，因 `>` 蕴含 `!=`
+    // 该表达式等价于 `k3_id != k1_id`，`>` 分支是死代码，等于没验证单调递增）。
+    // 墓碑行保留在表中，故 max(point_id)+1 必须**严格大于**墓碑 id。
+    assert!(
+        k3_id > k1_id,
+        "新 id 必须严格大于墓碑 id（max+1 计入墓碑）: k1={k1_id} k3={k3_id}"
+    );
 }
 
 // --- re-add tombstone restores same ID (§3.10) ---
@@ -644,4 +731,202 @@ fn automatic_tombstone_gc_does_not_exist() {
     let store = ConfigStore::open_in_memory().unwrap();
     let _ = store;
     assert!(true, "no automatic GC contract holds");
+}
+
+// ===========================================================================
+// NCK 语义点位 PR-A：§4.3 语义 Key 断言 + §6.6 T2/T3a
+// ===========================================================================
+
+// --- §4.3(1b) 语义字面量 Key 同样恢复同一 point_id ---
+#[test]
+fn semantic_point_key_restores_same_point_id() {
+    let store = store_with_endpoint();
+    let ids1 = assign(&store, &[SEMANTIC_KEY]);
+    let ids2 = assign(&store, &[SEMANTIC_KEY]);
+    assert_eq!(ids2[0], ids1[0], "语义 Key 必须恢复同一 point_id");
+    // 同一批内多个语义 Key 各自独立分配。
+    let ids3 = assign(&store, &[SEMANTIC_KEY, SEMANTIC_KEY_OTHER_VARIABLE]);
+    assert_eq!(ids3[0], ids1[0]);
+    assert_ne!(ids3[1], ids1[0]);
+}
+
+// --- §6.6 T3a：Core 身份**只由 point_key 决定**，parameters 不参与 ---
+#[test]
+fn same_key_same_id_with_different_parameters() {
+    // 两份 parameters 仅 `definition_revision` 从 1 改为 2（R8：revision 不进身份）。
+    let key_rev1 = nck_point_key(serde_json::json!({
+        "variable_id": "channel.r_parameter",
+        "definition_revision": 1,
+        "target": {"channel": 1},
+        "arguments": {"index": 100}
+    }));
+    let key_rev2 = nck_point_key(serde_json::json!({
+        "variable_id": "channel.r_parameter",
+        "definition_revision": 2,
+        "target": {"channel": 1},
+        "arguments": {"index": 100}
+    }));
+    // Core 不解释 parameters，因此两份信封都必须通过，且取出的 Key 逐字相同。
+    assert_eq!(key_rev1, SEMANTIC_KEY);
+    assert_eq!(key_rev2, SEMANTIC_KEY);
+    assert_eq!(key_rev1, key_rev2);
+
+    let store = store_with_endpoint();
+    let ids1 = assign(&store, &[key_rev1.as_str()]);
+    let ids2 = assign(&store, &[key_rev2.as_str()]);
+    assert_eq!(
+        ids2[0], ids1[0],
+        "identity 只由 point_key 决定，parameters 变化不得改变 point_id（T3a）"
+    );
+    // 反向：point_key 变化 ⇒ 新 point_id，旧 id 走墓碑且不复用（R9/R3/R4）。
+    let ids3 = assign(&store, &[SEMANTIC_KEY_OTHER_INDEX]);
+    assert_ne!(ids3[0], ids1[0]);
+    assert!(ids3[0] > ids1[0], "新 id 必须严格大于墓碑 id");
+    assert_eq!(registry(&store, SEMANTIC_KEY), (ids1[0], true));
+    // 旧 id 绝不再出现在活跃映射中。
+    let active = store.point_map("ep1").unwrap();
+    assert!(!active.values().any(|v| *v == ids1[0]));
+}
+
+// --- §4.3(2b) 语义点删除后墓碑保留 id，新语义 Key 取严格更大的 id ---
+#[test]
+fn semantic_tombstone_retains_id_and_next_id_is_greater() {
+    let store = store_with_endpoint();
+    let first = assign(&store, &[SEMANTIC_KEY, SEMANTIC_KEY_OTHER_VARIABLE]);
+    // 第二轮只保留第二个 ⇒ 第一个转墓碑（保留行与 id）。
+    let second = assign(&store, &[SEMANTIC_KEY_OTHER_VARIABLE]);
+    assert_eq!(second[0], first[1]);
+    assert_eq!(registry(&store, SEMANTIC_KEY), (first[0], true));
+    assert_eq!(
+        registry(&store, SEMANTIC_KEY_OTHER_VARIABLE),
+        (first[1], false)
+    );
+    // 新增一个不同语义 Key ⇒ id 严格大于墓碑 id。
+    let third = assign(&store, &[SEMANTIC_KEY_OTHER_INDEX]);
+    assert!(
+        third[0] > first[0],
+        "max+1 必须计入墓碑: tombstone={} new={}",
+        first[0],
+        third[0]
+    );
+    // 墓碑恢复：重新加入原 Key ⇒ 恢复原 id 并清 deleted（R2）。
+    let restored = assign(&store, &[SEMANTIC_KEY]);
+    assert_eq!(restored[0], first[0]);
+    assert_eq!(registry(&store, SEMANTIC_KEY), (first[0], false));
+}
+
+// --- §4.3(2c) R9：改 variable_id ⇒ 新 Key、新 id，旧 id 永不出现 ---
+#[test]
+fn changed_variable_id_gets_new_id_and_old_id_stays_tombstoned() {
+    let store = store_with_endpoint();
+    let old = assign(&store, &[SEMANTIC_KEY]);
+    let new = assign(&store, &[SEMANTIC_KEY_OTHER_VARIABLE]);
+    assert_ne!(new[0], old[0]);
+    assert_eq!(registry(&store, SEMANTIC_KEY), (old[0], true));
+    assert_eq!(
+        registry(&store, SEMANTIC_KEY_OTHER_VARIABLE),
+        (new[0], false)
+    );
+    // 活跃映射只含新 Key；旧 id 不再出现。
+    let active = store.point_map("ep1").unwrap();
+    assert_eq!(active.get(SEMANTIC_KEY_OTHER_VARIABLE), Some(&new[0]));
+    assert!(!active.contains_key(SEMANTIC_KEY));
+}
+
+// --- §4.3(3b) R8：revision 变化不改变 Key ⇒ 不改变 point_id ---
+#[test]
+fn revision_change_keeps_same_key_and_id() {
+    let store = store_with_endpoint();
+    // 同一个持久化 Key（字面量），两轮「配置」只有 definition_revision 不同。
+    let ids1 = assign(&store, &[SEMANTIC_KEY]);
+    let ids2 = assign(&store, &[SEMANTIC_KEY]);
+    assert_eq!(ids1[0], ids2[0]);
+    assert_eq!(registry(&store, SEMANTIC_KEY), (ids1[0], false));
+    // 墓碑计数不得因「同一 Key 反复出现」增长。
+    let rows = store.point_registry_all("ep1").unwrap();
+    assert_eq!(rows.len(), 1, "同一 Key 不得产生第二行: {rows:?}");
+}
+
+// --- §4.3(3c) R10/R14：语义点与原生点是不同身份；derived 地址变化 ⇒ 新 id ---
+#[test]
+fn semantic_and_native_are_distinct_identities() {
+    let store = store_with_endpoint();
+    // `assign_point_ids` 是**全量替换**语义（不在本轮的活跃 Key 一律转墓碑），
+    // 因此每轮必须给出完整的活跃集合。
+    let first = assign(&store, &[SEMANTIC_KEY, NATIVE_KEY]);
+    assert_ne!(
+        first[0], first[1],
+        "nck_variable 与 nck_native 不得互相顶替（Key 前缀不同 ⇒ 身份不同）"
+    );
+    // R14：identity_mode="derived" 下改地址字段 ⇒ 新 Key ⇒ 新 id，旧 Key 走墓碑。
+    let moved = assign(&store, &[SEMANTIC_KEY, NATIVE_KEY_OTHER_ADDR]);
+    assert_eq!(moved[0], first[0], "语义点不受原生点地址变化影响");
+    assert!(moved[1] > first[1], "新地址 ⇒ 新 id（严格大于墓碑 id）");
+    assert_eq!(registry(&store, NATIVE_KEY), (first[1], true));
+    assert_eq!(registry(&store, NATIVE_KEY_OTHER_ADDR), (moved[1], false));
+    assert_eq!(registry(&store, SEMANTIC_KEY), (first[0], false));
+}
+
+// --- §4.3(3d) R13：identity_mode="user" 的逻辑身份不随地址变化 ---
+#[test]
+fn user_identity_mode_native_address_change_keeps_id() {
+    // 逻辑 Key 由用户显式选择（§4.1.2）：地址字段变化**不**改变 Key。
+    // Core 只看到同一个字面量 Key，因此必须复用同一 point_id。
+    let store = store_with_endpoint();
+    let ids1 = assign(&store, &[NATIVE_USER_KEY]);
+    let ids2 = assign(&store, &[NATIVE_USER_KEY]);
+    assert_eq!(ids1[0], ids2[0], "逻辑身份不随地址变化（R13）");
+    // 与 derived 默认 Key 是**不同**点位（~2 后缀区分「地址相同、用途不同」），
+    // 两者可同时活跃（`assign_point_ids` 是全量替换语义）。
+    let both = assign(&store, &[NATIVE_USER_KEY, NATIVE_KEY]);
+    assert_eq!(both[0], ids1[0], "同一逻辑 Key 必须复用原 id");
+    assert_ne!(both[1], ids1[0]);
+    let active = store.point_map("ep1").unwrap();
+    assert_eq!(active.get(NATIVE_USER_KEY), Some(&ids1[0]));
+    assert_eq!(active.get(NATIVE_KEY), Some(&both[1]));
+}
+
+// --- §6.6 T2：跨任务 / 跨 kind / 跨 Endpoint 的 point_key 唯一性 ---
+#[test]
+fn cross_task_duplicate_point_key() {
+    // ① 同一 Endpoint 的**两个不同任务**出现同一 Key ⇒ DUPLICATE_POINT_KEY。
+    let cross_task = ensure_endpoint_point_keys_unique(
+        &[(SEMANTIC_KEY, "tasks[1].binding.config.points[0]")],
+        &[(SEMANTIC_KEY, "tasks[0].binding.config.points[0]")],
+    );
+    assert_eq!(cross_task.len(), 1);
+    assert_eq!(cross_task[0].code, "DUPLICATE_POINT_KEY");
+
+    // ② 同一任务内重复（第二次出现才报）⇒ 同样拒绝。
+    let same_task = ensure_endpoint_point_keys_unique(
+        &[
+            (SEMANTIC_KEY, "tasks[0].binding.config.points[0]"),
+            (SEMANTIC_KEY, "tasks[0].binding.config.points[1]"),
+        ],
+        &[],
+    );
+    assert_eq!(same_task.len(), 1);
+    assert_eq!(same_task[0].code, "DUPLICATE_POINT_KEY");
+    assert_eq!(same_task[0].path, "tasks[0].binding.config.points[1]");
+
+    // ③ 跨 Task Binding Kind：`mesa.resources.v1` 已占用同一 Key ⇒ 拒绝。
+    let cross_kind = ensure_endpoint_point_keys_unique(
+        &[(SEMANTIC_KEY, "tasks[1].binding.config.points[0]")],
+        &[(SEMANTIC_KEY, "tasks[0].selections[0].outputs")],
+    );
+    assert_eq!(cross_kind.len(), 1);
+    assert_eq!(cross_kind[0].code, "DUPLICATE_POINT_KEY");
+
+    // ④ 不同 Endpoint 的同名 Key **不**冲突（本函数按 Endpoint 调用）。
+    assert!(ensure_endpoint_point_keys_unique(&[(SEMANTIC_KEY, "p")], &[]).is_empty());
+    assert!(ensure_endpoint_point_keys_unique(&[(SEMANTIC_KEY, "p")], &[]).is_empty());
+
+    // ⑤ 不同 Key 不冲突。
+    assert!(
+        ensure_endpoint_point_keys_unique(
+            &[(SEMANTIC_KEY, "p1"), (NATIVE_KEY, "p2")],
+            &[(SEMANTIC_KEY_OTHER_VARIABLE, "p0")],
+        )
+        .is_empty()
+    );
 }

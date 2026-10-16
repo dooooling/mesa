@@ -11,6 +11,8 @@ serde_json = { workspace = true }
 regex = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
+# `point_key` 字符串载荷的 NFC 归一（§4.1.1 F）；版本与 feature 在 workspace 层锁定。
+unicode-normalization = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
