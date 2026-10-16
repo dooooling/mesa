@@ -899,3 +899,279 @@ describe("C2 面板：用户清除 vs 自动隐藏（P1-2）", () => {
     expect(screen.getByText(/REQUIRED_CLEARED/)).toBeTruthy();
   });
 });
+
+// ---------------------------------------------------------------------------
+// 实测示例预设接入（本轮）：`connectionProfiles.selectablePresets` → 面板
+//
+// 产品约定（不得偏离）：
+// - 单台 828D 的实测 TSAP（0x0400/0x0D04）只是**可选示例**，不得自动预填；
+// - 只有用户主动点击「应用实测示例」才写入，且必须走既有草稿机制；
+// - 来源（provenance）与限制（caveat）必须对用户可见；
+// - TSAP 归入高级连接参数，但必填与校验规则不变。
+// ---------------------------------------------------------------------------
+
+/**
+ * 与真实 NCK Descriptor 对齐的字段集：TSAP **必填、无默认值、advanced=true**。
+ *
+ * 刻意不复用上面的 `NCK_FIELDS`——那份夹具带 `default: 1024/3332`，
+ * 而「没有静默默认」正是本组用例要证明的结论，夹具里出现默认值会让结论失去意义。
+ */
+const NCK_PRESET_FIELDS = [
+  { key: "host", label: "Host", field_type: "host", required: true, validation: {}, ui: { order: 1 } },
+  { key: "port", label: "Port", field_type: "port", required: false, default: 102, validation: { min: 1, max: 65535 }, ui: { order: 2 } },
+  { key: "family", label: "Family", field_type: "enum", required: true, validation: { enum_options: ["828d", "840d-sl"] }, ui: { order: 3 } },
+  { key: "local_tsap", label: "Local TSAP", field_type: "integer", required: true, validation: { min: 0, max: 65535 }, ui: { order: 10, advanced: true, placeholder: "如 0x0100 或 256" } },
+  { key: "remote_tsap", label: "Remote TSAP", field_type: "integer", required: true, validation: { min: 0, max: 65535 }, ui: { order: 11, advanced: true, placeholder: "如 0x0102 或 258" } },
+];
+
+/**
+ * 在 AntD Select 上真实选择一个选项（点开触发器 → 点选项）。
+ *
+ * AntD v6 的触发器类名是 `.ant-select-content`（v5 为 `.ant-select-selector`），
+ * 选项仍是 `.ant-select-item-option`（带 `title`）。
+ */
+async function selectEnumOption(container: HTMLElement, fieldKey: string, optionText: string) {
+  const trigger = container.querySelector(`[data-field-key="${fieldKey}"] .ant-select-content`);
+  if (!trigger) throw new Error(`字段 ${fieldKey} 的 Select 未渲染`);
+  const user = userEvent.setup();
+  await user.click(trigger as HTMLElement);
+  const option = await screen.findByTitle(optionText);
+  await user.click(option);
+}
+
+/** 预设用例前置：NCK 描述符就绪 → 填 host（不碰 TSAP / family）。 */
+async function readyPresetPanel(opts: ServerOpts = {}) {
+  const srv = installFetch({
+    drivers: NCK_DRIVER,
+    descriptors: { "sinumerik-nck": { fields: NCK_PRESET_FIELDS } },
+    ...opts,
+  });
+  const view = renderPanel();
+  await waitFor(() => expect(inputByLabel(view.container, "Host")).toBeTruthy());
+  fireEvent.change(inputByLabel(view.container, "Host"), { target: { value: "10.0.0.5" } });
+  return { ...view, ...srv };
+}
+
+const applyPresetButton = () => screen.getByRole("button", { name: /应用实测示例/ });
+
+describe("C2 面板：实测示例预设（不静默预填 / 显式应用 / 来源可见）", () => {
+  it("选择 NCK + 828d 后仍不预填：TSAP 输入框为空，草稿里没有 TSAP 值", async () => {
+    const srv = await readyPresetPanel();
+    await selectEnumOption(srv.container, "family", "828d");
+
+    // 预设被识别（卡片出现），但值只出现在卡片文案里，不进草稿
+    await screen.findByText("828D 实测连接示例");
+
+    fireEvent.click(screen.getByText(/高级（2）/));
+    expect(inputByLabel(srv.container, "Local TSAP").value).toBe("");
+    expect(inputByLabel(srv.container, "Remote TSAP").value).toBe("");
+
+    // 草稿里也没有 TSAP：必填缺失拦住提交（若有静默默认，这里就会提交成功）
+    fireEvent.click(screen.getByRole("button", { name: /下一步/ }));
+    await screen.findByText(/高级参数缺少必填项/);
+    expect(srv.onSubmit).not.toHaveBeenCalled();
+    expect(JSON.stringify(srv.calls)).not.toContain("1024");
+    expect(JSON.stringify(srv.calls)).not.toContain("3332");
+  });
+
+  it("显式点击「应用实测示例」后：草稿与提交载荷是 local_tsap=1024 / remote_tsap=3332", async () => {
+    const srv = await readyPresetPanel();
+    await selectEnumOption(srv.container, "family", "828d");
+    await screen.findByText("828D 实测连接示例");
+
+    fireEvent.click(applyPresetButton());
+
+    // 应用即展开高级区并按 number 回显为十六进制
+    await waitFor(() => expect(inputByLabel(srv.container, "Local TSAP").value).toBe("0x0400"));
+    expect(inputByLabel(srv.container, "Remote TSAP").value).toBe("0x0D04");
+
+    fireEvent.click(screen.getByRole("button", { name: /下一步/ }));
+    await waitFor(() => expect(srv.onSubmit).toHaveBeenCalledTimes(1));
+    const payload = srv.onSubmit.mock.calls[0][0] as { connection: ConnectionValues };
+    // 断言真实载荷值，而不是只看界面文案
+    expect(payload.connection.local_tsap).toBe(1024);
+    expect(payload.connection.remote_tsap).toBe(3332);
+  });
+
+  it("应用后仍可自由修改：以用户最终值为准，未改动的字段保持示例值", async () => {
+    const srv = await readyPresetPanel();
+    await selectEnumOption(srv.container, "family", "828d");
+    await screen.findByText("828D 实测连接示例");
+    fireEvent.click(applyPresetButton());
+    await waitFor(() => expect(inputByLabel(srv.container, "Local TSAP").value).toBe("0x0400"));
+
+    const tsap = inputByLabel(srv.container, "Local TSAP");
+    fireEvent.change(tsap, { target: { value: "0x0500" } });
+    fireEvent.blur(tsap);
+
+    fireEvent.click(screen.getByRole("button", { name: /下一步/ }));
+    await waitFor(() => expect(srv.onSubmit).toHaveBeenCalledTimes(1));
+    const payload = srv.onSubmit.mock.calls[0][0] as { connection: ConnectionValues };
+    expect(payload.connection.local_tsap).toBe(1280);
+    expect(payload.connection.remote_tsap).toBe(3332);
+  });
+
+  it("TSAP 归入高级参数：默认折叠不可见，展开后才渲染（必填与范围不变）", async () => {
+    const srv = await readyPresetPanel();
+    await selectEnumOption(srv.container, "family", "828d");
+
+    // 默认折叠：TSAP 不在 DOM 里
+    expect(srv.container.querySelector('[data-field-key="local_tsap"]')).toBeNull();
+    expect(srv.container.querySelector('[data-field-key="remote_tsap"]')).toBeNull();
+
+    fireEvent.click(screen.getByText(/高级（2）/));
+    expect(srv.container.querySelector('[data-field-key="local_tsap"]')).not.toBeNull();
+    expect(srv.container.querySelector('[data-field-key="remote_tsap"]')).not.toBeNull();
+    // 必填标记与格式提示仍在（归入高级区不等于放宽要求）
+    expect(inputByLabel(srv.container, "Local TSAP").placeholder).toBe("如 0x0100 或 256");
+  });
+
+  it("来源与限制可见：provenance / caveat 原文渲染 + 单台标记 + 十六进制与十进制并列", async () => {
+    const srv = await readyPresetPanel();
+    await selectEnumOption(srv.container, "family", "828d");
+    await screen.findByText("828D 实测连接示例");
+
+    // 证据等级标记
+    expect(screen.getByText("单台设备验证")).toBeTruthy();
+    // 来源：来自 connectionProfiles 的原文（不另写文案）
+    expect(screen.getByText(/nck-local-migration-2026-10-13\.md/)).toBeTruthy();
+    // 限制：单台设备的实测示例，不是所有 828D 的通用默认
+    expect(screen.getByText(/单台设备的实测示例/)).toBeTruthy();
+    expect(screen.getByText(/不是所有 828D 的通用默认/)).toBeTruthy();
+    // 十进制与十六进制同时给出
+    expect(srv.container.querySelector('[data-preset-value="local_tsap"]')?.textContent).toBe(
+      "Local TSAP 0x0400 (1024)",
+    );
+    expect(srv.container.querySelector('[data-preset-value="remote_tsap"]')?.textContent).toBe(
+      "Remote TSAP 0x0D04 (3332)",
+    );
+  });
+
+  it("换到无预设的系列（840d-sl）后不再展示示例，且不自动改动草稿", async () => {
+    const srv = await readyPresetPanel();
+    await selectEnumOption(srv.container, "family", "828d");
+    await screen.findByText("828D 实测连接示例");
+
+    await selectEnumOption(srv.container, "family", "840d-sl");
+    await waitFor(() => expect(screen.queryByText("828D 实测连接示例")).toBeNull());
+    expect(screen.queryByRole("button", { name: /应用实测示例/ })).toBeNull();
+    // 从未自动写入过任何 TSAP（应用按钮一次都没点过）
+    expect(JSON.stringify(srv.calls)).not.toContain("1024");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 跨系列预设遗留（评审要求）：切换系列只清理**仍由预设控制**的 TSAP 值
+//
+// 缺陷路径：选 828d → 应用实测示例（0x0400/0x0D04）→ 把系列改成 840d-sl；
+// 828D 卡片消失，但两个 TSAP 仍留在草稿里，用户可能把 828D 的实测值用在
+// 840D sl 上——与「单台实测值不得被当作其它设备的默认值」的约定冲突。
+//
+// 修复规则（不得偏离）：
+// - 当前值仍等于预设写入的值（用户没改过）→ 清除，必填校验重新接管；
+// - 当前值已被用户手工改过 → **不得删除**，改为要求用户确认适用性；
+// - 切回 828d **不**自动重新填充，写值只有「应用实测示例」一条用户路径。
+// ---------------------------------------------------------------------------
+
+/** 应用 828D 实测示例，并等到两个 TSAP 真实回填（应用后高级区自动展开）。 */
+async function apply828dExample(srv: { container: HTMLElement }) {
+  await selectEnumOption(srv.container, "family", "828d");
+  await screen.findByText("828D 实测连接示例");
+  fireEvent.click(applyPresetButton());
+  await waitFor(() => expect(inputByLabel(srv.container, "Local TSAP").value).toBe("0x0400"));
+  expect(inputByLabel(srv.container, "Remote TSAP").value).toBe("0x0D04");
+}
+
+describe("C2 面板：跨系列预设遗留（只清理未被用户改过的预设值）", () => {
+  it("① 828d 应用示例后切到 840d-sl：未改动的预设 TSAP 被自动清除，必填校验重新生效", async () => {
+    const srv = await readyPresetPanel();
+    await apply828dExample(srv);
+
+    await selectEnumOption(srv.container, "family", "840d-sl");
+
+    // 未改动的预设值回到未设置：输入框为空，示例卡片消失
+    await waitFor(() => expect(inputByLabel(srv.container, "Local TSAP").value).toBe(""));
+    expect(inputByLabel(srv.container, "Remote TSAP").value).toBe("");
+    expect(screen.queryByText("828D 实测连接示例")).toBeNull();
+
+    // 必填校验重新接管：提交被本地校验拦下，请求里没有 1024/3332
+    fireEvent.click(screen.getByRole("button", { name: /下一步/ }));
+    await screen.findByText(/高级参数缺少必填项/);
+    expect(srv.onSubmit).not.toHaveBeenCalled();
+    expect(JSON.stringify(srv.calls)).not.toContain("1024");
+    expect(JSON.stringify(srv.calls)).not.toContain("3332");
+  });
+
+  it("② 手工改过的 TSAP 不因切换系列被误删，且出现「请确认适用性」提示", async () => {
+    const srv = await readyPresetPanel();
+    await apply828dExample(srv);
+
+    // 用户手工把 Local TSAP 改成 0x0500（1280）——这是用户输入，不得删除
+    const tsap = inputByLabel(srv.container, "Local TSAP");
+    fireEvent.change(tsap, { target: { value: "0x0500" } });
+    fireEvent.blur(tsap);
+    await waitFor(() => expect(inputByLabel(srv.container, "Local TSAP").value).toBe("0x0500"));
+
+    await selectEnumOption(srv.container, "family", "840d-sl");
+
+    // 未被改动的 Remote TSAP 仍被清除；被改过的 Local TSAP 保留
+    await waitFor(() => expect(inputByLabel(srv.container, "Remote TSAP").value).toBe(""));
+    expect(inputByLabel(srv.container, "Local TSAP").value).toBe("0x0500");
+
+    // 要求确认适用性：提示可见、指名来源系列与字段
+    const notice = srv.container.querySelector("[data-stale-example]");
+    expect(notice).not.toBeNull();
+    expect(notice?.getAttribute("data-stale-example")).toBe("local_tsap");
+    expect(notice?.textContent).toContain("示例值可能不适用于当前系列");
+    expect(notice?.textContent).toContain("Local TSAP");
+    expect(notice?.textContent).toContain("来自 828D 的实测示例");
+    expect(notice?.textContent).toContain("请确认该值适用于当前控制器");
+  });
+
+  it("③ 切回 828d 不自动重新填充：草稿仍无 TSAP，必须用户再次主动应用", async () => {
+    const srv = await readyPresetPanel();
+    await apply828dExample(srv);
+    await selectEnumOption(srv.container, "family", "840d-sl");
+    await waitFor(() => expect(inputByLabel(srv.container, "Local TSAP").value).toBe(""));
+
+    // 切回有预设的系列：卡片回来了，但值不会自动写回草稿
+    await selectEnumOption(srv.container, "family", "828d");
+    await screen.findByText("828D 实测连接示例");
+    // 有预设的系列不再显示「暂无实机验证预设」说明（两者互斥）
+    expect(screen.queryByText(/暂无经过 Mesa 实机验证的 TSAP 预设/)).toBeNull();
+    expect(inputByLabel(srv.container, "Local TSAP").value).toBe("");
+    expect(inputByLabel(srv.container, "Remote TSAP").value).toBe("");
+
+    fireEvent.click(screen.getByRole("button", { name: /下一步/ }));
+    await screen.findByText(/高级参数缺少必填项/);
+    expect(srv.onSubmit).not.toHaveBeenCalled();
+    expect(JSON.stringify(srv.calls)).not.toContain("1024");
+
+    // 只有再次点击「应用实测示例」才写回
+    fireEvent.click(applyPresetButton());
+    await waitFor(() => expect(inputByLabel(srv.container, "Local TSAP").value).toBe("0x0400"));
+    expect(inputByLabel(srv.container, "Remote TSAP").value).toBe("0x0D04");
+  });
+
+  it("④ 840d-sl：显示「暂无实机验证预设」说明，且该系列没有任何可点击预设", async () => {
+    const srv = await readyPresetPanel();
+    // 还没选系列时不给结论：说明文案不出现
+    expect(srv.container.querySelector("[data-preset-note]")).toBeNull();
+
+    await selectEnumOption(srv.container, "family", "840d-sl");
+
+    // 说明文案（评审给定原文）必须可见
+    await screen.findByText(
+      /840D sl 暂无经过 Mesa 实机验证的 TSAP 预设，请依据实际控制器配置填写/,
+    );
+    expect(srv.container.querySelector('[data-preset-note="840d-sl"]')).not.toBeNull();
+    // 没有任何可点击预设：既没有「应用实测示例」按钮，也没有预设卡片
+    expect(screen.queryByRole("button", { name: /应用实测示例/ })).toBeNull();
+    expect(srv.container.querySelector("[data-preset-id]")).toBeNull();
+
+    // 也不自动填充：展开高级区后两个 TSAP 仍为空
+    fireEvent.click(screen.getByText(/高级（2）/));
+    expect(inputByLabel(srv.container, "Local TSAP").value).toBe("");
+    expect(inputByLabel(srv.container, "Remote TSAP").value).toBe("");
+  });
+});
