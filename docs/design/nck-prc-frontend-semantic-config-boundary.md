@@ -1,9 +1,14 @@
 # PR-C 实施边界与验收清单：828D 语义点位前端配置
 
 - 状态：**边界与验收设计稿（待评审批准后开工）**
-- 结论口径：本文件是**实施边界与验收清单**，不是实现。所有事实均以只读命令在
-  **`docs/nck-prc-boundary` / HEAD `152a3e2`**（已合并 PR-B 的 main，`feat/nck-prb-compiler` → PR #111）
+- 结论口径：本文件是**实施边界与验收清单**，不是实现。§1–§9 的事实均以只读命令在
+  **`docs/nck-prc-boundary`**（PR-B 合并基线 HEAD `152a3e2`，`feat/nck-prb-compiler` → PR #111）
   的工作树上核实，引用一律给 `文件:行号`；无法确证的一律标注**待确认**，**不编造**。
+- **本轮新增实测（评审要求，见 §9.1 / §9.3-1 / §2.5）**：在
+  **`docs/nck-prc-boundary` / HEAD `871fd11`**（PR #112 待修订分支）上执行了
+  `pnpm typecheck` 与 `pnpm test`（基线 **33 文件 / 383 用例**，两者均退出码 `0`，见 §9.1），
+  并在**独立临时副本**内完成「仓库级 golden fixture 可导入性」最小探针（§9.3-1 / §2.5）。
+  除该探针所在的临时副本外，**未修改任何生产代码 / 配置 / 其它文档**；临时副本已删除。
 - 上位文档（**本轮不得修改**，只引用）：
   `docs/design/nck-semantic-point-refactor.md`（1387 行，设计冻结稿）、
   `docs/design/nck-prb-driver-compiler-boundary.md`（1167 行，PR-B 已裁决）。
@@ -14,14 +19,17 @@
 
 | 项 | 内容 |
 |---|---|
-| 允许 | **只新建本文件** `docs/design/nck-prc-frontend-semantic-config-boundary.md` |
+| 允许（首轮） | **只新建本文件** `docs/design/nck-prc-frontend-semantic-config-boundary.md` |
+| 允许（**本轮定向修订**） | **只修改本文件**（修订而非重写）；除本文件外**不新增、不修改、不删除**任何代码 / 测试 / 配置 / 其它文档 |
+| 允许（**本轮实测**） | ① 在 `apps/mesa-web` 下执行 `pnpm typecheck` 与 `pnpm test`（**未改任何配置**）；② 在**系统临时目录的独立副本**内构造最小探针并运行（**副本已删除**、**未改动本分支工作树**） |
 | 禁止 | 修改任何代码 / 测试 / 配置 / 其它文档（含两份冻结设计文档） |
 | 禁止 | 修改前端代码、Core（`crates/**`）、NCK Compiler/Driver（`drivers/sinumerik-nck/**`）、原生协议、其它驱动、生产后端 |
 | 禁止 | 任何 git 写操作（commit/push/checkout/stash/reset/PR/tag）；只读 git 可用 |
-| 禁止 | 启动 `mesad`、启动 Vite、连接任何真实设备或机床 |
+| 禁止 | 启动 `mesad`、启动 Vite **dev server**、连接任何真实设备或机床 |
 
-**因此**：本文件中凡涉及后端改动的部分（§1.4 的 I-2），一律**只作为「接口需求」登记**，
-标明归属 PR，**不属于 PR-C 的施工范围**，也不在 PR-C 的验收门禁内。
+**因此**：本文件中凡涉及后端改动的部分（§1.4 的 I-2），一律**只作为「接口需求 / 依赖」登记**
+（**已正式登记于 §10.1 / §10.2**），标明归属 PR，**不属于 PR-C 的施工范围**；
+其中 I-2 **不进入** PR-C 的基础开发前置，但**进入** PR-C 的「完整语义配置闭环」验收依赖（§1.7、§10.1）。
 
 ## 0.1 七项交付物索引（评审给定）
 
@@ -173,6 +181,61 @@ Driver 侧的身份编译（`definition.rs:1091`）、浏览载荷的 `identity`
 | **是否需要后端补充** | **不需要**。这是本方案「最小」的核心理由：身份模板、身份键集合、预览 Key 三者**都已经在线上了**。 |
 | **覆盖缺口（必须写明）** | `identity` 块**只有** `template`/`keys`/`preview_point_key` 三项。§1 功能要求里的**「参数来源 / 支持状态 / 无法读取的原因」**（`semantics_status` + `source[]`，见 `definition.rs:59-69, 79-97`）、以及 `arguments` 的**类型/范围/必填**元数据（`r1.json` 的 `arguments[]`：`{key,label,value_type,required,min,max}`）**都不在** `identity` 块内，**Browse 拿不到**。 |
 
+#### 1.4.1 I-1 的能力边界（**评审第一条：必须明确写出，不得含糊**）
+
+**A. I-1 可独立交付的能力（PR-C 范围内，零后端改动，可单独验收）**：
+
+| # | 能力 | 边界说明 |
+|---|---|---|
+| 1 | **语义点位与原生点位的「数据模型」** | `PointSelection{kind, point_key, parameters}` 判别联合；`nck_variable` / `nck_native` 分流；`identity` **不得**折进 `parameters`（§2.2、§5.3-3） |
+| 2 | **C10 旧配置入口隔离** | 普通采集界面**不再**通向必败的旧 `variable` 手填流程；旧入口显式降级为「高级原生配置」（§5.4 六条措施） |
+| 3 | **已经由 Driver 返回的完整 `preview_point_key` 的展示与复用** | 在用户**未修改** `target`/`arguments` 时**逐字展示**并可直接复用；为 `null` 时禁止提交（§1.5） |
+| 4 | **前端 PointSelection / Task Binding 的正确构造** | 装配收敛为**唯一入口**，kind 按目标 Driver 判定（§3.2 ⑥、§5.3-2、§5.4 C10-4/C10-6） |
+| 5 | **高级原生模式与错误反馈** | `nck_native` 显式高级入口、`identity_mode=derived/user`、以及 Core/Driver 错误码**原样透传**（§6.2、§6.3） |
+
+**B. I-1 不能独立支撑的部分（必须显式声明，不得用 UI 兜底掩盖）**：
+
+现有 Browse 载荷**缺少「变量定义的完整元数据」**。除 `identity{template, keys, preview_point_key}` 与
+`parameters{variable_id, definition_revision, target, arguments}` 之外，以下**全部不在** Browse 载荷内：
+
+- **`scope`（适用范围）**——§4.1 登记的实测缺口，Browse **不做 `scope` 过滤**；
+- **Target 约束**——`targets`（可选集）、`target_required`（原始约束声明）；
+- **Arguments 约束**——`arguments[]` 的 `value_type` / `required` / `min` / `max`；
+- **支持状态**——`semantics_status`（`verified` / `candidate` / `parameter_identity`）；
+- **来源**——`source[]`（`manual` / `measurement` / `identity_probe` / `frozen_vector`）；
+- **展示名**——`label{zh,en}`；以及 `golden_ref[]`。
+
+> **⇒ 完整语义化配置体验依赖 I-2 或等价的服务端接口**（§1.4 I-2、§10.1）。
+> 在 I-2（或等价接口）落地前，PR-C 交付的是**以 Driver 预览为真值的最小闭环**，
+> **不得**声称已交付「完整的语义化配置体验」——两种完成度的口径见 §1.7。
+
+#### 1.4.2 实例身份规则（**评审第一条的最高优先级收紧项，原样生效**）
+
+> **Browse 返回的 `preview_point_key` 只是「特定实例」的身份预览，
+> 不等于任意 Target / Arguments 修改后的服务端实时编译结果。**
+>
+> **用户一旦修改 Target 或 Arguments，不得直接沿用旧 `preview_point_key`。**
+>
+> 仅靠**前端模板替换 + 共享 Golden** 虽可验证**编码规则**，
+> 但**不能证明身份语义与 Driver 当前定义完全一致**。
+>
+> **首选方案是服务端权威 Preview**；若采用前端通用模板渲染，
+> **必须有明确的适用范围与跨层契约验证**，
+> 且**不得视为「已由 Driver 验证的新实例身份」**。
+
+**这条规则对 §1.5 / §4.3 / §7 的强制后果（逐条落地，不得只在正文写口号）**：
+
+| 触发条件 | 必须的行为 | 禁止的行为 |
+|---|---|---|
+| 用户**未**修改 `target`/`arguments`（或修改后又**完整改回**同一实例） | 允许**逐字复用** `identity.preview_point_key` 提交 | — |
+| 用户**修改了** `target` 或 `arguments` | **(首选)** 请求**服务端权威 Preview** 取回新 Key；<br>**(降级且仅当有明确适用范围时)** 用 Driver 下发的 `template` + `keys` 做**通用替换**，并把该 Key 标注为**「前端渲染、未经 Driver 校验」** | 静默沿用旧 `preview_point_key`；把前端自算结果当作「已由 Driver 验证的新实例身份」持久化 |
+| 服务端 Preview **不可得**（无该接口 / Driver 不可达） | 该实例标记为**待确认**并**禁止提交**（§1.5） | 用前端自算值**冒充**已验证身份后提交 |
+
+> **可靠性边界（如实登记）**：前端通用替换只能证明「**编码规则**与共享 Golden 一致」
+> （§4.3、矩阵 A3/A4/A5），**不能**证明「该实例的身份语义与 Driver 当前定义完全一致」。
+> 因此矩阵新增 **A39**（改 Target/Arguments 后不得沿用旧 Key，**含反例**）与
+> **A41**（共享 Golden 可不复制地直读，仅证明编码规则层）两项可验收断言。
+
 ### I-2（**超出 PR-C 授权**，仅作接口需求登记）：新增只读「变量定义目录」端点
 
 | 项 | 内容 |
@@ -181,7 +244,8 @@ Driver 侧的身份编译（`definition.rs:1091`）、浏览载荷的 `identity`
 | **接口输出** | `{format_version, family, revision, definitions:[{variable_id, revision, scope, semantics_status, label{zh,en}, source[{kind,reference,note?}], targets[], target_required[], arguments[{key,label,value_type,required,min?,max?}], identity_template, identity_keys[], golden_ref[]}]}` —— 即 `definitions/828d/r1.json` 的内容**原样**（**不得**在 Core 侧裁剪、改名或重排） |
 | **责任归属** | **数据所有者**：NCK Driver（目录是 Driver 内嵌数据，`definition.rs` 的 `DefinitionCatalog`）<br>**传输/缓存**：Core 仅做**逐字透传**，**不得**解释 `variable_id`/`target`/`semantics_status`（否则违反「Core 不懂协议」）<br>**消费**：前端只读 |
 | **为什么是「最小」** | ① **只读**、无参数依赖、无写入路径；② **不改** `PointSelection`/`point_key`/Task Binding 任何语义；③ **不改** Descriptor 契约（`contract_major/minor` 保持 2/0，`crates/core-types/src/descriptor.rs:9-13` 冻结面不动）；④ **不改** 持久化面与 `mesa.resources.v1` 路径；⑤ 是唯一能满足「展示参数来源与支持状态」的形态。 |
-| **实现代价与归属（如实记录）** | 它需要 **Driver SDK 新增能力 + Core 透传 + 可能触及 `proto/**`** ⇒ 属**后端变更**，**不在 PR-C 授权内**。建议归属：**独立后端 PR（建议命名 `PR-B2-nck-definition-catalog-api`）**，作为 PR-C 的**硬前置或并行项**，由评审决定。 |
+| **实现代价与归属（如实记录）** | 它需要 **Driver SDK 新增能力 + Core 透传 + 可能触及 `proto/**`** ⇒ 属**后端变更**，**不在 PR-C 授权内**。建议归属：**独立后端 PR（建议命名 `PR-B2-nck-definition-catalog-api`）**。 |
+| **正式登记（评审第二条，见 §10.1）** | **I-2 登记为「独立后端接口工作」**：**不作为 PR-C 基础开发的前置**（PR-C 可先交付 §1.4.1 A 的五项能力），但 **PR-C 的「完整语义配置闭环」验收依赖它或等价接口**（§1.7）。 |
 | **PR-C 的应对** | 见 §1.5 降级路径：**I-2 未落地时，PR-C 必须把「支持状态不可得」如实显示为「未提供」，不得用 `verified` 兜底**。 |
 
 > **为什么不选「Core 侧兜底」**：`crates/core-types/src/point.rs:13-16` 明写 Core 无身份推导、
@@ -196,7 +260,7 @@ Driver 侧的身份编译（`definition.rs:1091`）、浏览载荷的 `identity`
 | 已浏览过并**已缓存**过 `identity.template`/`keys` | 允许离线编辑与预览（缓存的是**驱动产出的模板**，不是前端算法）；缓存必须显式标注来源与时间 |
 | 收到的叶**没有 `identity` 块**（旧驱动 / 未来降级） | 该叶**只能作为原生高级配置**入口，**不得**进入语义模式；UI 必须显示原因（对齐 `presets.rs:200-203` 的既有口径） |
 | `preview_point_key` 为 `null`（`target`/`arguments` 不完整） | 显示「身份未确定：待确认字段 …」（对齐 `presets.rs:186-190` 的 `pending` 文案），**禁止**提交 |
-| 用户改了 `target`/`arguments` 导致需要重算 | 仅有两种合法路径：**(a)** 用 Driver 下发的 `template` + `keys` 做**通用替换**（值编码遵守 `tests/fixtures/nck-point-key-golden.json`）；**(b)** 重新浏览取回新的 `preview_point_key`。**不得**有第三条（前端估算） |
+| 用户改了 `target`/`arguments` 导致需要重算 | **禁止沿用旧 `preview_point_key`**（§1.4.2）。合法路径按优先级：**(a) 首选**——请求**服务端权威 Preview** 取回该实例的新 Key；**(b) 降级**——仅在已声明适用范围时，用 Driver 下发的 `template` + `keys` 做**通用替换**（值编码遵守 `tests/fixtures/nck-point-key-golden.json`），并把结果标注为「前端渲染、未经 Driver 校验」；**(c)** 重新浏览取回新的 `preview_point_key`。**不得**有第四条（前端估算后冒充已验证身份）；`(b)` 的 Key **不得**标记为「已由 Driver 验证」 |
 | `identity_mode="user"`（高级原生模式改 Key） | Key 只作**建议值**，**必须用户显式确认**后才写入；**禁止**静默追加 `~<n>`（`resourceSelectionModel`/前端不得自动加后缀） |
 | 若 I-2 未落地 | 「参数来源 / 支持状态」显示为 **「未提供（需定义目录接口）」**，**绝不允许**把 `candidate` / 访问能力 HOLD 的条目显示为 `verified` |
 
@@ -219,6 +283,22 @@ Driver 侧的身份编译（`definition.rs:1091`）、浏览载荷的 `identity`
    且 Driver 会用同一规则重算并拒绝不一致（`compiler.rs:433`、`lib.rs:611-621`）⇒ **fail-closed**。
 3. **禁止**：由 `variable_id` 反推 `target`/`arguments`；自行决定哪些键进入身份；**自行排序身份键**；
    自行生成 `~<n>` 后缀；在无模板时猜测 Key。
+
+## 1.7 两级验收口径（**评审第一条：必须区分，不得混为一谈**）
+
+PR-C 存在**两种完成度**，验收时必须分别声明，**不得**用其中一级的完成去充当另一级：
+
+| 级别 | 名称 | 依赖 | 可验收内容 | 不得声称 |
+|---|---|---|---|---|
+| **L1** | **基础配置能力完成** | **仅依赖 I-1**（零后端改动） | §1.4.1 A 的五项能力：数据模型、C10 入口隔离、**Driver 已返回的完整 `preview_point_key` 的展示与复用**、PointSelection / Task Binding 正确构造、高级原生模式与错误反馈 | 不得声称「所有可见语义变量均可安全配置」（缺 `scope` 元数据，见 §10.2） |
+| **L2** | **完整语义配置闭环完成** | **依赖 I-2 或等价服务端接口** | L1 全部 ＋ 参数来源 / 支持状态 / 无法读取原因的真实展示；按 `scope` 正确过滤可采集变量；按 `targets`/`target_required`/`arguments[]` 约束渲染表单；**服务端权威 Preview**（改 Target/Arguments 后由服务端给出新实例身份） | — |
+
+**验收纪律**：
+
+1. PR-C 的**开发前置** = L1 的依赖项（I-1）；**PR-C 的「完整功能验收」** = L2 的依赖项（I-2 或等价接口）。
+2. L2 未达成时，PR-C 的验收结论**必须**写明「**L1 达成、L2 未达成**」，并列出未达成的具体条目
+   （至少：`scope` 过滤、`semantics_status`/`source[]` 展示、服务端权威 Preview）。
+3. **禁止**用 L1 的绿灯掩盖 L2 的缺口，也**禁止**用前端近似算法把 L2 的缺口「补绿」（§1.6 红线）。
 
 ---
 
@@ -255,12 +335,13 @@ Driver 侧的身份编译（`definition.rs:1091`）、浏览载荷的 `identity`
 | `apps/mesa-web/src/components/ResourceBrowseAntd.test.tsx` | 现有 2 用例 | 新增：浏览叶 → 语义 Selection | 上位设计 `:1210` |
 | `apps/mesa-web/src/components/EndpointAcquisitionPane.tsx` | 装配真值 1 的调用点（`:123`、`:146`） | `:123` 邻域：只调用共享装配入口，无独立语义；`:218-247` 传 `endpointId`（Browse 语义路径的**唯一**可用调用方） | 上位设计 `:221` |
 | `apps/mesa-web/src/components/EndpointAcquisitionPane.saveIssues.test.tsx` | 现有 2 用例 | 装配收敛后的绑定形态 | 上位设计 `:1211` |
-| `apps/mesa-web/tsconfig.json` | `include: ["src","vite.config.ts"]`（实测）；**未设** `resolveJsonModule` | **仅当**沿用仓库级 golden fixture 时：加 `resolveJsonModule: true` 且把 `../../tests/fixtures` 纳入编译范围 | **§9.3 待确认项 1**（上位设计未列此文件） |
-| `apps/mesa-web/vite.config.ts` | 无 `server.fs.allow`（实测）；`test.poolOptions` 等不动 | **仅当** dev server 拒绝 root 外文件时：加 `server.fs.allow`（**不得**改 `build`/`test` 段） | **§9.3 待确认项 1**（上位设计未列此文件） |
+| `apps/mesa-web/tsconfig.json` | `include: ["src","vite.config.ts"]`（实测）；**未显式设** `resolveJsonModule` —— 但 `tsc --showConfig` 实测其**生效值**为 `true`（§2.5） | **条件修改项，默认不改**：实测 `import ... from "../../../tests/fixtures/nck-point-key-golden.json"` 可解析、且 `pnpm typecheck`（`tsc --noEmit`）**零错误** ⇒ **本文件无需修改**（`include` 也**无需**扩展：被 import 的文件自动进入编译单元）。仅当未来 TS 版本 / `moduleResolution` 变更导致 `TS2732` 时，才按 §2.5 的最小改动处理 | **§2.5 本轮实测**（上位设计未列此文件） |
+| `apps/mesa-web/vite.config.ts` | 无 `server.fs.allow`（实测）；`test.poolOptions` 等不动 | **条件修改项，默认不改**：`pnpm test` **不启动 dev server**，实测 Vitest 导入该 fixture **直接通过**（1 文件 / 1 用例）⇒ **测试路径无需修改**。仅当**生产代码**（非测试文件）import 该 fixture 时，dev server 才会以 `403 outside of Vite serving allow list` 拒绝（§2.5 实测 `fs.allow` 不含仓库根）；此时**只改本文件这一处**，`build`/`test` 段一字不动 | **§2.5 本轮实测**（上位设计未列此文件） |
 
-> **明确不改**：`apps/mesa-web/src/addDevice/AddDeviceFlow.tsx` 与其测试。理由见 §8.1
-> （上位设计 `:1207` 曾要求 PR-C 改写它，与 `:1264` 的「`AddDeviceFlow.tsx` 属 PR-D 独占」冲突，
-> 本文件按**任务书给定的 PR-D 边界**处置并登记冲突）。
+> **明确不改（评审已裁决，见 §8.3）**：`apps/mesa-web/src/addDevice/AddDeviceFlow.tsx` 与
+> `apps/mesa-web/src/addDevice/AddDeviceFlow.test.tsx` **均由 PR-D 统一处理**，
+> **PR-C 不修改这两个文件**，本阶段也**不要求**完成新增设备向导的完整语义点位流程。
+> 上位设计 `:1207` / `:1223` / `:1264` 的**内部冲突标记为「已裁决」**，裁决结论见 §8.3。
 
 ## 2.3 冻结（**PR-C 不得改语义**；只允许「附加可选属性」式演进）
 
@@ -298,6 +379,102 @@ C2 为「未失焦就保存」问题**附加了可选属性 `onDraftText`**，�
 | `apps/mesad/**` | 生产后端入口；PR-C 不需要 |
 | `docs/design/nck-semantic-point-refactor.md`、`docs/design/nck-prb-driver-compiler-boundary.md`、`docs/adr/**` | 已冻结设计文档，逐字不动 |
 | `tests/driver-contract/**`、`scripts/**`、`.github/**` | 契约与 CI；PR-C 不改后端即无需触碰 |
+
+## 2.5 条件修改项：`tsconfig.json` / `vite.config.ts`（**实测结论：按 PR-C 计划形态，两个都无需修改**）
+
+评审给定的**正确顺序**（本文件严格按此顺序执行，未跳步）：
+
+1. 用**最小测试**尝试引用仓库级 fixture；
+2. 运行 `pnpm typecheck` 与 Vitest；
+3. **若能直接访问 ⇒ 两个配置文件都不修改**；
+4. 若存在**确定**的 TS 或 Vite 访问失败 ⇒ **仅修改导致失败的那一个**配置，保留**错误日志与修复前后对照**；
+5. **不复制第二份 Golden**；**不扩大 Vite 文件系统访问范围**到不必要目录。
+
+> **这两个文件是「条件修改项」，不是无条件修改授权**：默认处置是**不改**；
+> 只有在出现**确定的**、可复现的访问失败时才允许改，且**只改导致失败的那一个**。
+
+### 2.5.1 探针构造（系统临时目录内的**独立副本**，未触碰本分支工作树）
+
+| 项 | 内容 |
+|---|---|
+| 副本根 | `%TEMP%\mesa-prc-probe-871fd11`（**执行完毕后已删除**，删除结果见 §9.3-1） |
+| 副本内容 | `apps/mesa-web/**`（完整可运行，含 `node_modules`）＋ `tests/fixtures/nck-point-key-golden.json`，**相对层级与真实仓库一致**（副本内同样有 `tests/fixtures/`） |
+| 探针文件 | `apps/mesa-web/src/__fixture_probe__.test.ts` |
+| 导入语句 | `import golden from "../../../tests/fixtures/nck-point-key-golden.json";`（`src → mesa-web → apps → <root>` 共 **3 层**，按真实目录层级核准） |
+| 断言 | `value_cases.length === 55`、`value_reject_cases.length === 5`、`key_cases.length === 77`，并打印实际数量 |
+| **未做** | **未**修改 `tsconfig.json`、**未**修改 `vite.config.ts`、**未**复制第二份 Golden 进 `apps/mesa-web` |
+
+### 2.5.2 实测结果（**修复前**，即两个配置一个都没改）
+
+| 检查 | 命令 / 方法 | 退出码 | 结果 |
+|---|---|---|---|
+| **TS 侧** | `pnpm typecheck`（即 `tsc --noEmit`） | **0** | **零错误**。`--listFiles` 证据：编译单元**同时包含** `src/__fixture_probe__.test.ts` 与 `tests/fixtures/nck-point-key-golden.json` ⇒ JSON **被真正解析并纳入编译**，不是被当成 `any` 跳过 |
+| **TS 侧（对照实验）** | 在探针内植入 `const x: number = "str"` 后重跑 | 2 | 精确报出 `src/__fixture_probe__.test.ts(30,7): error TS2322` ⇒ 探针**确实在被类型检查**（排除「文件根本没进编译」导致的假通过） |
+| **Vitest 侧** | `vitest run src/__fixture_probe__.test.ts` | **0** | `Test Files 1 passed (1)` / `Tests 1 passed (1)`；`stdout` 打印 `[PROBE] value_cases=55 value_reject_cases=5 key_cases=77` |
+| **dev server 侧**（**与 test 不等价，必须分开结论**） | 用 Vite 自身的 `resolveConfig` + `searchForWorkspaceRoot` 求值（**不 listen、不启动任何 server**） | 0 | `server.fs.strict = true`；`server.fs.allow = [<副本>/apps/mesa-web, <vite>/dist/client]` ⇒ **不含仓库根**；`fixture 在 fs.allow 内？ = false` |
+
+### 2.5.3 结论（**TS 侧与 Vite 侧分别下结论，不含糊**）
+
+- **TS 侧：无需修改（确定）**。`tsc --showConfig` 显示**生效配置**里 `resolveJsonModule: true`
+  （尽管 `tsconfig.json` **未显式声明**它）—— 成因是 `moduleResolution: "bundler"`；
+  **反事实证据**：强制 `--moduleResolution node10` 后**立刻复现**
+  `TS2732: Cannot find module '...nck-point-key-golden.json'. Consider using '--resolveJsonModule' to import module with '.json' extension.`
+  ⇒ 现配置下 JSON import **可用**；`include` 也**无需**扩展（被 import 的文件自动进入编译单元）。
+- **Vitest 侧：无需修改（确定，实测通过）**。`pnpm test` **不启动 dev server**，
+  `server.fs.allow` **不参与**测试路径 ⇒ 「TS 通过、而 dev server 会拒绝」这一分叉**确实存在**，
+  但**不影响 `pnpm test`**，因此**不能**用「dev server 会拒绝」当作改 `vite.config.ts` 的理由。
+- **dev server 侧：确定会被拒绝**（但**不是** PR-C 计划形态的路径问题）。
+  `searchForWorkspaceRoot()` 因 `apps/mesa-web/pnpm-workspace.yaml` 存在而**停在 `apps/mesa-web`**，
+  导致 `fs.allow` 不含仓库根；Vite 的拒绝点是 `respondWithAccessDenied`
+  （`vite/dist/node/chunks/*.js`，文案 `The request url "..." is outside of Vite serving allow list.`，HTTP **403**）。
+
+**对 §2.2 两个条件文件的最终处置**：
+
+| 场景 | `tsconfig.json` | `vite.config.ts` |
+|---|---|---|
+| **fixture 仅被测试文件 import**（**PR-C 计划形态**：§2.1 的 `nckPointModel.test.ts` / 矩阵 A4 的向量一致性断言） | **不修改** | **不修改** |
+| fixture 被**生产代码**（例如 `nckPointModel.ts` 本体）import | **不修改** | **仅此一处需要修改**（最小改动见下） |
+
+**（仅第二种场景）`vite.config.ts` 的最小修改**——只追加**一个** `fs` 项，**只放行 fixture 所在目录**，
+不扩大到任何不必要目录，`build` / `test` 段一字不动：
+
+```ts
+// 顶部新增两个 import
+import path from "node:path";
+import { searchForWorkspaceRoot } from "vite";
+
+// server 段新增（其余配置保持不变）
+server: {
+  fs: {
+    allow: [
+      // 必须显式带回工作区根：一旦设置了 fs.allow，Vite 不再自动加入它
+      searchForWorkspaceRoot(process.cwd()),
+      // 只放行 fixture 目录，不放行整个仓库根
+      path.resolve(process.cwd(), "../../tests/fixtures"),
+    ],
+  },
+  // ...原有 proxy / watch 保持不变
+},
+```
+
+**修复前 / 修复后对照（均在副本内验证，真实仓库未改任何配置）**：
+
+```
+修复前：server.fs.allow = [ "<copy>/apps/mesa-web",
+                            "<vite>/dist/client" ]            fixture 在 fs.allow 内？= false
+修复后：server.fs.allow = [ "<copy>/apps/mesa-web",
+                            "<copy>/tests/fixtures",
+                            "<vite>/dist/client" ]            fixture 在 fs.allow 内？= true
+```
+
+**反事实证据（为什么不能只写 fixtures 目录）**：若 `allow` 只写
+`[path.resolve(process.cwd(), "../../tests/fixtures")]`，实测得到
+`server.fs.allow = ["<copy>/tests/fixtures", "<vite>/dist/client"]` —— **工作区根被丢弃**
+（Vite 只自动补回自己的 client 目录）⇒ dev server 将**无法服务 `src/**`**。
+故最小**且正确**的改动必须显式带回 `searchForWorkspaceRoot(process.cwd())`。
+
+> **未实测项（如实登记，不把推断写成实测）**：`vite build`（Rollup 生产构建）路径**本轮未实测**；
+> `server.fs.*` 按 Vite 设计是 dev server 专用配置、**不应**影响 build，但本文件不声称已实测。
 
 ---
 
@@ -382,7 +559,10 @@ PUT /api/v1/tasks/{endpoint_id}  →  Start  →  ⑧ Driver configure：重算 
 > （那属于「自行发明语义」）。因此：
 > - **若 I-2 落地**：按 `scope === "collect"` 过滤，`identity` 条目**不进入**可采集列表（并显示原因）。
 > - **若 I-2 未落地**：**必须**在 UI 上对所有变量统一显示「适用范围未提供（需定义目录接口）」，
->   **不得**默认它们都是可采集的；并把该缺口作为**后端缺陷**上报（建议归属 `PR-B2`）。
+>   **不得**默认它们都是可采集的；并把该缺口作为**独立 Driver 缺陷**上报（**已正式登记于 §10.2**，
+>   建议后续 **PR-B2** 处理）。
+> - **fail-closed 口径（§10.2）**：**PR-C 不得把缺失 `scope` 元数据的变量默认认定为可采集**；
+>   若无法可靠区分，**保持禁用或不可确认状态，不得静默放行**。
 > - 该缺口的**权威修复点**在 Driver（`presets.rs` 或目录查询层加 `scope` 过滤），**不属 PR-C**。
 
 ## 4.2 Target 约束
@@ -420,7 +600,8 @@ PUT /api/v1/tasks/{endpoint_id}  →  Start  →  ⑧ Driver configure：重算 
 | **身份模板 `identity_template`** | **Driver**（定义数据，`definition.rs`） | — | **只读消费**，**不得**自行拼装模板 |
 | **身份键集合 `identity_keys`** | **Driver** | — | **只读消费**，**不得**自行决定/排序 |
 | **预览 Key `preview_point_key`** | **Driver**（`presets.rs:249-253`） | — | **直接展示**；为 `null` 时禁止提交 |
-| **用户改 target/arguments 后的 Key** | 前端按**Driver 模板**做**通用替换** + 冻结的类型标签编码 | Driver 在 ⑧ 重算比对 | 通用替换 + 值编码（对齐 `tests/fixtures/nck-point-key-golden.json`）；**不得**反推/猜测 |
+| **用户改 target/arguments 后的 Key（§1.4.2 收紧）** | **首选：服务端权威 Preview**（该实例的新 Key 由 Driver/服务端编译给出）。降级路径才允许前端按 **Driver 模板**做通用替换 + 冻结的类型标签编码 | Driver 在 ⑧ 重算比对 | **不得沿用旧 `preview_point_key`**；降级路径产出的 Key **必须**标注「前端渲染、未经 Driver 校验」，**不得**视为「已由 Driver 验证的新实例身份」；**不得**反推/猜测；服务端 Preview 不可得时**标记待确认并禁止提交** |
+| **「前端通用替换」能证明什么 / 不能证明什么** | — | — | **能证明**：编码规则与共享 Golden 一致（矩阵 A3/A4/A5）。**不能证明**：身份语义与 Driver 当前定义完全一致 ⇒ 需**明确的适用范围 + 跨层契约验证**（矩阵 A39/A41） |
 | **`nck_native` + `identity_mode="derived"` 的 Key** | 前端按**固定规则** `native.<area>.<area_no>.<module>.<column>.<line>` | Driver 用同一规则重算（`compiler.rs:433`） | 实现已冻结规范；**不得**扩展该规则（不含 `count`/`decode`/`transport_size`/`invalid_*`/`identity_mode`，`definition.rs:1163-1165`） |
 | **`nck_native` + `identity_mode="user"` 的 Key** | **用户显式选择** | Driver **不重算**，但复核命名空间 `native.` 与语法 | 只给**建议值**；**必须用户显式确认**；**禁止静默追加 `~<n>`** |
 | **持久化 `point_key`** | 前端写入（来自 ④ 的产出） | **Core**：通用格式 + Endpoint-wide 唯一性（`point.rs:413/954`、`binding_gate.rs:112`） | 提交前用**实际载荷**校验（§7.3） |
@@ -585,7 +766,7 @@ grep 命中集合恰为 {Core, Driver, **前端(PR-C 时)**}，**不得**出现 
 | Target | 由 `target_required` 决定**哪些**控件必填，由 `targets` 决定**哪些**可选 | `targets.rs:46`（5 种 kind）；实测组合：`{drive_object}`×20、`{channel}`×11、`{axis}`×5、`{channel,spindle}`×3、`{channel,axis}`×2、`{mode_group}`×1 |
 | `drive_object.entry` | **必须显式选择** `nc_variable`(26) / `drive_object`(130)，**不得**折叠、**不得**由 `number` 反推 | `targets.rs:96-133`；PR-B「Module 26/130 **不允许折叠**」（`nck-semantic-point-refactor.md:1235`） |
 | Arguments | 按 `arguments[]` 生成：`value_type`（`integer`）、`required`、`min`/`max` | 实测仅 **2 条**定义有 arguments：`channel.r_parameter`（`index` 0..65534）、`channel.machine_axis_assignment`（`position` 0..65535）。**必填条件**：`required=true` 且缺失 ⇒ 阻止提交 |
-| **`point_key`** | **自动生成并校验**，语义模式下**只读展示**（可复制） | 来源：`identity.preview_point_key`（未改 target/arguments 时**逐字展示**）或按 `template`+`keys` 通用替换的结果。**不允许用户随意修改** |
+| **`point_key`** | **自动生成并校验**，语义模式下**只读展示**（可复制） | 来源：**未修改 `target`/`arguments` 时** = `identity.preview_point_key`（**逐字展示**）；**一旦用户修改 `target` 或 `arguments`，不得沿用旧 `preview_point_key`**（§1.4.2）——首选请求**服务端权威 Preview**，降级才按 `template`+`keys` 通用替换并**标注「前端渲染、未经 Driver 校验」**；服务端 Preview 不可得 ⇒ **待确认 + 禁止提交**。**不允许用户随意修改** |
 | 输出 | `value`（`DriverResolved`，`lib.rs:328-335`）—— 类型在 Configure 时才能确定，UI **不得**猜测 | `types.ts:60-63` |
 
 ## 6.2 高级原生模式（`nck_native`）
@@ -617,8 +798,9 @@ grep 命中集合恰为 {Core, Driver, **前端(PR-C 时)**}，**不得**出现 
 
 # 7. 交付物六：验收矩阵
 
-> **行数：38 行**（A1–A38）。分组：正常路径 A1–A7、边界条件 A8–A14、
-> 错误输入 A15–A20、身份 A21–A27、回归与装配 A28–A38。
+> **行数：41 行**（A1–A41；原 38 行 A1–A38，本轮按评审新增 **A39–A41** 三行，见 §7.7）。
+> 分组：正常路径 A1–A7、边界条件 A8–A14、错误输入 A15–A20、身份 A21–A27、
+> 回归与装配 A28–A38、**评审新增 A39–A41**。
 > 「对应规则」列引用：上位设计 `nck-semantic-point-refactor.md`、PR-B 文档 `nck-prb-driver-compiler-boundary.md`、
 > 本文件 §1–§6。
 
@@ -643,7 +825,7 @@ grep 命中集合恰为 {Core, Driver, **前端(PR-C 时)**}，**不得**出现 
 | A10 | `preview_null_blocks_submit_with_reason` | `preview_point_key === null` ⇒ 禁止提交并显示「待确认字段 …」 | `NckPointFields.test.tsx` | 不猜测缺失实例 | `presets.rs:247-253`、`:186-190` |
 | A11 | `zero_selections_still_bootstraps_without_tasks` | `selections=[]` ⇒ `tasks=[]` 且 `start=false` | `addDevice/bootstrap.test.ts` | C3-D 零采集点语义**不得**退化 | `bootstrap.ts:130-133, 153` |
 | A12 | `preserved_tasks_are_untouched_on_nck_endpoint` | 编辑 NCK Endpoint 时，非 canonical 任务逐字保留（含另一种 kind） | `deviceModel.test.ts` + `EndpointAcquisitionPane.saveIssues.test.tsx` | 数据安全：不得静默删任务 | 上位设计 `:213`；`deviceModel.ts:280-304` |
-| A13 | `scope_identity_variables_are_not_offered_as_collectable` | `scope=identity` 的 6 条**不**进入可采集列表；或（I-2 未落地时）显示「适用范围未提供」而**不**默认可采集 | `nckPointModel.test.ts` | 实测缺口（§4.1）不得被前端猜测掩盖 | 本文件 §4.1、§9.3-2 |
+| A13 | `scope_identity_variables_are_not_offered_as_collectable` | `scope=identity` 的 6 条**不**进入可采集列表；或（I-2 未落地时）显示「适用范围未提供」而**不**默认可采集 | `nckPointModel.test.ts` | 实测缺口（§4.1）不得被前端猜测掩盖 | 本文件 §4.1、§10.2（强化断言见 A40） |
 | A14 | `drive_object_entry_is_never_inferred_from_number` | `number=26` **不**自动推出 `entry=nc_variable`；必须显式给 `entry` | `nckPointModel.test.ts` | Module 26/130 不允许折叠 | PR-B `:568`、上位设计 `:1235` |
 
 ## 7.3 错误输入
@@ -695,6 +877,18 @@ grep 命中集合恰为 {Core, Driver, **前端(PR-C 时)**}，**不得**出现 
 | 多点位**不得**生成冲突身份 | A28、A36 + `resourceSelectionModel.ts:223-231` | 同一 Endpoint 两个点位得到同一 `point_key`（例如同一变量同一 Target 加两次）：前端必须拦（`point-key-conflict`），且 Core 侧 `ensure_endpoint_point_keys_unique`（`point.rs:954`）是**最终防御** |
 | **重新打开编辑器不得静默改变身份或修改既有采集目标** | A23、A25、A36 | 打开一个已保存的语义点位：`nckPointModel` **不得**因「模板重算」而改写 `point_key`；若 Driver 重算结果与已存 `point_key` 不同，**必须**显示差异并阻止提交，**不得**静默替换（否则会触发新 `point_id`、旧 key 走墓碑 —— 违反 R3/R4） |
 
+## 7.7 评审新增（**本轮三条，均含反例**）
+
+| # | 测试名（建议） | 断言要点 | 文件与套件 | 证明什么 | 对应规则 |
+|---|---|---|---|---|---|
+| A39 | `edited_instance_never_reuses_stale_preview_point_key` | **正例**：未修改 `target`/`arguments` 时，提交 `point_key` 逐字等于 `identity.preview_point_key`。<br>**反例（必须被拦）**：修改 `target` 或 `arguments` 后 —— ① **不得**继续沿用旧 `preview_point_key`；② **不得**把该 Key 标记为「已由 Driver 验证」；③ 首选走**服务端权威 Preview**；④ 服务端 Preview 不可得时该实例**必须**被标记为**待确认并禁止提交** | `nckPointModel.test.ts` + `NckPointFields.test.tsx` | §1.4.2 收紧：`preview_point_key` 只是**特定实例**的身份预览，不等于任意 Target/Arguments 修改后的服务端实时编译结果 | 本文件 §1.4.2、§1.5、§4.3、§6.1 |
+| A40 | `missing_scope_metadata_is_never_default_allowed` | **反例（必须被拦）**：变量**缺失 `scope` 元数据**（I-2 未落地 / 目录不可得）⇒ **不得**被默认为可采集、**不得**放行提交；UI 必须显示「适用范围未提供（需定义目录接口）」，`加入` 保持 **disabled 或不可确认**状态。<br>**正例**：`scope === "collect"` 才进入可采集列表；`scope === "identity"` 不进入并显示原因 | `nckPointModel.test.ts` + `NckPointFields.test.tsx` | §10.2 缺陷的 fail-closed 处置：**无法可靠区分时保持禁用，不得静默放行** | 本文件 §4.1、§10.2 |
+| A41 | `shared_golden_fixture_is_consumed_without_a_second_copy` | 前端直接从仓库级 `tests/fixtures/nck-point-key-golden.json` 读取向量（**不改** `tsconfig.json`、**不新增** `server.fs.allow`、**不复制**第二份）；断言 `value_cases=55` / `value_reject_cases=5` / `key_cases=77` | `nckPointModel.test.ts`（构建期零配置改动） | ① PR-B `:654`「同一份复用、**不得复制第二份**」在前端可达；② 本轮实测：TS 侧与 Vitest 侧**均无需修改配置**（§2.5） | 本文件 §2.5、§4.3；PR-B `:654` |
+
+> **A41 的能力边界（必须与 A39 一起读）**：A41 只能证明**编码规则层**的一致
+> （同一份 Golden、同一份向量），**不能**据此认为「新实例的身份语义已被 Driver 验证」——
+> 后者只能由**服务端权威 Preview** 或 Driver 的 ⑧ 重算比对（`compiler.rs:489-520`）证明。
+
 ---
 
 # 8. 交付物七：E2E 边界
@@ -719,13 +913,13 @@ grep 命中集合恰为 {Core, Driver, **前端(PR-C 时)**}，**不得**出现 
 | 3 | 前端 **E2E** 用例（「建设备 → 建 Endpoint → 选点位与 Target → 启动」全链、离线分支不得标记成功） | 上位设计 `:1221` |
 | 4 | 契约侧 **E2E**（REST 保存 → 启动 → `points/latest` 出现值；用 Simulator，**不得**连真机） | 上位设计 `:1222` |
 | 5 | **真机 / 真实机床**验证 | 本轮硬约束；且属 Driver Gate（`drivers/sinumerik-nck/GATE.md`） |
-| 6 | 性能验收（50K updates/s 等） | 归 CI `rust-perf`（§10） |
+| 6 | 性能验收（50K updates/s 等） | 归 CI `rust-perf`（§11） |
 
 ## 8.3 与上位设计的**已知冲突**（如实登记，不抹平）
 
 | 冲突 | 上位设计原话 | 本文件处置 | 理由 |
 |---|---|---|---|
-| `AddDeviceFlow.test.tsx` 的归属 | `:1207`（PR-C 节）把 `AddDeviceFlow.test.tsx` 列入「**必须改写**」；`:1223`（PR-D 节）又把它列入「**必须改写**（步骤语义最终形态）」 | **本文件采信 PR-D 归属**：PR-C **不改**该文件与其实现 | `:1264` 明确裁定「`AddDeviceFlow.tsx`（**PR-D 独占**）」；`:1223` 亦要求「与 PR-C 的差异必须显式说明，禁止同一文件在两阶段被不同语义改两次而无验收」。**任务书亦给定「PR-C 不做新增设备端到端向导整合」** ⇒ 三者中只有「全部归 PR-D」自洽。**请评审确认。** |
+| `AddDeviceFlow.tsx` / `AddDeviceFlow.test.tsx` 的归属 | `:1207`（PR-C 节）把 `AddDeviceFlow.test.tsx` 列入「**必须改写**」；`:1223`（PR-D 节）又把它列入「**必须改写**（步骤语义最终形态）」；`:1264` 裁定 `AddDeviceFlow.tsx` 属 **PR-D 独占** | **状态：已裁决（评审裁决，不再待确认）**。<br>**裁决结论：`AddDeviceFlow.tsx` 与 `AddDeviceFlow.test.tsx` 均由 PR-D 统一处理；PR-C 不修改这两个文件，也不要求本阶段完成新增设备向导的完整语义点位流程。** | ① `:1264` 明确裁定 `AddDeviceFlow.tsx` 属 **PR-D 独占**；② `:1223` 要求「与 PR-C 的差异必须显式说明，禁止同一文件在两阶段被不同语义改两次而无验收」；③ 任务书给定「PR-C 不做新增设备端到端向导整合」⇒ 三者中只有「两个文件全部归 PR-D」自洽。**⇒ 上位设计 `:1207`/`:1223`/`:1264` 的内部冲突标记为「已裁决」，PR-C 侧以本条为准。** |
 
 ---
 
@@ -739,7 +933,8 @@ grep 命中集合恰为 {Core, Driver, **前端(PR-C 时)**}，**不得**出现 
 | 用例数 | **383** | 行首 `it(`/`test(` = **380**；其中 **3** 个 `it(` 与 `describe(` **同行**（`connectionSetupModel.test.ts:251`、`:334`、`deviceModel.test.ts:155`）⇒ 380 + 3 = **383** |
 | `src/connection/**` | **9 文件 / 134 用例** | 行首计数 132 + `connectionSetupModel.test.ts` 的 2 个同行 `it(` = **134**（与上位设计 `:1212` 的 134 **一致**） |
 | 校验旁证 | 宽松匹配 `\b(it\|test)\s*\(` = **387**；减去 4 处正则方法调用（`ResourceBrowseAntd.test.tsx:81`、`useConnectionSetup.test.ts:86/90/95` 的 `/…/.test(`）= **383** | 两条独立路径同得 383 |
-| **未运行** | 本次**未执行**任何测试（未启动 pnpm/vitest，符合硬约束）；上表为**静态计数**，非测试运行结果 | — |
+| **实跑验证（本轮，替换此前的「未运行」）** | **`pnpm test` 退出码 `0`**：原始输出 `Test Files  33 passed (33)` / `Tests  383 passed (383)`（`vitest run`，`Duration 97.07s`）；**`pnpm typecheck` 退出码 `0`**：原始输出仅 `$ tsc --noEmit`，**零错误** | 本轮在 **HEAD `871fd11`**（PR #112 分支）上**实际执行**，前端运行时为 `C:\Users\34268\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe` + `...\pnpm\bin\pnpm.mjs`；命令、退出码与原始输出的采集方式见 §2.5 |
+| **基线结论** | **33 文件 / 383 用例 ⇒ 与既有基线一致**；静态计数与实跑结果**同值** | 上一行（实跑）＋ 上表三行（静态） |
 
 ## 9.2 其余已核实事实
 
@@ -762,15 +957,20 @@ grep 命中集合恰为 {Core, Driver, **前端(PR-C 时)**}，**不得**出现 
 | Browse 载荷 `binding_json` 逐字透传到前端 | `core-api/src/lib.rs:864` |
 | Core 无身份推导 API；`parameters` 不透明；信封层拒绝 `identity` 键 | `point.rs:13-16`、`:1613`、`:1730` |
 | `configure` 旧 `mesa.resources.v1` ⇒ `UNSUPPORTED_BINDING` | `drivers/sinumerik-nck/src/lib.rs:648-657` |
+| **前端可直读仓库级 golden fixture（TS 侧）**：`import "../../../tests/fixtures/nck-point-key-golden.json"` 在**不改 `tsconfig.json`** 的前提下 `tsc --noEmit` **零错误**；`--listFiles` 同时列出探针与 fixture；对照实验（植入 `TS2322`）证明探针确实被检查 | **本轮隔离副本实测**（§2.5） |
+| **`resolveJsonModule` 的生效值为 `true`**（`tsconfig.json` 未显式声明），成因 `moduleResolution: "bundler"`；强制 `--moduleResolution node10` 立刻复现 `TS2732` | **本轮隔离副本实测**（`tsc --showConfig` + 反事实，§2.5.3） |
+| **前端可直读仓库级 golden fixture（Vitest 侧）**：**不改 `vite.config.ts`** 的前提下 `Test Files 1 passed (1)` / `Tests 1 passed (1)`，读到 `value_cases=55 / value_reject_cases=5 / key_cases=77` | **本轮隔离副本实测**（§2.5.2） |
+| **Vite dev server 默认 `fs.allow` 不含仓库根**：`searchForWorkspaceRoot` 因 `apps/mesa-web/pnpm-workspace.yaml` 存在而**停在 `apps/mesa-web`** ⇒ 若**生产代码** import 该 fixture，dev server 会以 `403` 拒绝（`server.fs.strict = true`） | **本轮隔离副本实测**（`resolveConfig`，**未启动 server**，§2.5.2/§2.5.3） |
+| 前端测试基线 **33 文件 / 383 用例** 与既有基线一致（**实跑**，非仅静态计数） | 本轮 `pnpm test` 退出码 `0`；见 §9.1 |
 
 ## 9.3 无法确认 / 待确认（**如实列出，不抹平**）
 
 | # | 项 | 状态 | 影响 | 建议的确认动作（评审/后续 PR） |
 |---|---|---|---|---|
-| 1 | 前端能否**直接** `import` 仓库级 `tests/fixtures/nck-point-key-golden.json` | **待确认** | ① `apps/mesa-web/tsconfig.json` 的 `include` 仅 `["src","vite.config.ts"]`，且**未设** `resolveJsonModule` ⇒ `pnpm typecheck`（`tsc --noEmit`）可能失败；② `vite.config.ts` **未设** `server.fs.allow`，而仓库根**无** `pnpm-workspace.yaml`（`apps/mesa-web/pnpm-workspace.yaml` 仅含 `allowBuilds`）⇒ dev server 可能拒绝 root 外文件；③ PR-B 文档 `:654` **禁止**复制第二份 fixture ⇒ 只能改 `tsconfig`/`vite.config` | 需实跑一次 `pnpm typecheck` + `pnpm test` 与 dev server（**本轮未授权运行**） |
-| 2 | `scope=identity` 的 6 条定义经 Browse 暴露为可采集变量 | **已确证存在，归属待裁决** | 语义模式下 UI 会把「只服务身份探针」的变量当作可采集点位（§4.1） | 权威修复在 Driver（`presets.rs`/目录查询加 `scope` 过滤）⇒ 建议登记为 **PR-B2 的后端缺陷**；PR-C 只能如实显示「适用范围未提供」 |
-| 3 | I-2（定义目录端点）是否本 PR 前置 | **未裁决** | 决定 §1 功能要求「参数来源/支持状态/无法读取原因」能落到什么程度 | 评审裁决；建议作为独立后端 PR，不阻塞 PR-C 主体（PR-C 走 §1.5 降级） |
-| 4 | 上位设计内部冲突：`AddDeviceFlow.test.tsx` 归 PR-C 还是 PR-D | **已确证冲突，本文件已选边** | 见 §8.3 | 评审确认「全部归 PR-D」 |
+| 1 | 前端能否**直接** `import` 仓库级 `tests/fixtures/nck-point-key-golden.json`（**原「待确认」，本轮已实测结案**） | **已实测结案：按 PR-C 计划形态（fixture 仅被测试文件 import）⇒ `tsconfig.json` 与 `vite.config.ts` 两个都无需修改** | ① **TS 侧**：`tsc --showConfig` 生效值 `resolveJsonModule = true`（成因 `moduleResolution: "bundler"`；强制 `node10` 复现 `TS2732`）⇒ `tsc --noEmit` 零错误，`include` 无需扩展；② **Vitest 侧**：`pnpm test` 不启动 dev server，`server.fs.allow` 不参与，实测 1 文件 / 1 用例通过；③ **dev server 侧**：实测默认 `fs.allow` 不含仓库根 ⇒ 仅当**生产代码** import fixture 时才需要改 `vite.config.ts` **一处**（最小改动与前后对照见 §2.5.3） | 已执行（两配置未改）＝ §2.5；**本轮未启动任何 dev server**，dev server 结论由 `resolveConfig` + `searchForWorkspaceRoot` 求值 + Vite 自身 403 拒绝逻辑坐实 |
+| 2 | `scope=identity` 的 6 条定义经 Browse 暴露为可采集变量 | **已确证存在；评审已裁决 ⇒ 已正式登记为独立 Driver 缺陷（见 §10.2，建议 PR-B2）** | 语义模式下 UI 会把「只服务身份探针」的变量当作可采集点位（§4.1）；**PR-C 的 fail-closed 处置**：缺 `scope` 元数据 ⇒ **不得默认可采集**，保持禁用/不可确认（矩阵 A40） | 权威修复在 Driver（`presets.rs`/目录查询加 `scope` 过滤）⇒ 登记为 **PR-B2 后端缺陷**；PR-C 只如实显示「适用范围未提供」 |
+| 3 | I-2（定义目录端点）是否本 PR 前置 | **已裁决（见 §10.1）**：**不作为 PR-C 基础开发前置**，但**完整功能验收（L2）依赖它或等价接口** | 决定 §1 功能要求「参数来源/支持状态/无法读取原因」能落到什么程度；两级验收口径见 §1.7 | 独立后端 PR（建议 `PR-B2-nck-definition-catalog-api`）；PR-C 走 §1.5 降级路径 |
+| 4 | 上位设计内部冲突：`AddDeviceFlow.tsx` / `AddDeviceFlow.test.tsx` 归 PR-C 还是 PR-D | **已裁决（见 §8.3）**：**两个文件均由 PR-D 统一处理，PR-C 不修改** | — | 评审裁决已写入 §8.3，冲突标记为「已裁决」 |
 | 5 | `identity` 块进入 `BrowseSelection` 后是否会被**其他** Driver 的浏览叶误解 | **待确认** | OPC UA 叶是「裸参数」形态（`browseModel.ts:47-54`），新增可选字段不应影响；但需回归覆盖 | 矩阵 A17 已覆盖既有形态不退化 |
 | 6 | 高级原生模式是否需要在服务端限权 | **上位设计已明确排除** | `nck_native` 服务端限权**不在**本 PR（上位设计 `:941`：仅沿用只读基线 + 前端警告口径，**PR-C 落地**） | PR-C 只做前端警告，**不得**新增服务端权限逻辑 |
 | 7 | `~<n>` 建议值的具体生成规则（何时建议、如何避免与既有 key 冲突） | **待确认** | 影响矩阵 A25 的断言粒度 | 按 §4.1.2「Core 只负责唯一性」与 `allKnownPointKeys`（`resourceSelectionModel.ts:307-317`）实现，评审确认 UI 细节 |
@@ -778,18 +978,109 @@ grep 命中集合恰为 {Core, Driver, **前端(PR-C 时)**}，**不得**出现 
 
 ---
 
-# 10. 门禁清单（PR-C 完成时）
+## 9.4 本轮实测命令清单（供评审复核；**未执行任何 git 写操作**）
 
-| # | 门禁 | 命令（**PR-C 实施时执行**，本轮未执行） | 通过标准 |
+| # | 命令 / 方法 | 执行位置 | 结果 |
 |---|---|---|---|
-| G1 | 前端测试 | `pnpm --dir apps/mesa-web test`（即 `vitest run`） | **全绿**；用例数 **≥383**（现状 33 文件 / 383 用例）；`src/connection/**` 的 **134** 不得下降 |
-| G2 | 类型检查 | `pnpm --dir apps/mesa-web typecheck`（`tsc --noEmit`） | 零错误（含 §9.3-1 若涉及 `resolveJsonModule`） |
+| 1 | `pnpm typecheck`（即 `tsc --noEmit`） | 真实仓库 `apps/mesa-web`（HEAD `871fd11`） | 退出码 **0**，零错误 |
+| 2 | `pnpm test`（即 `vitest run`） | 真实仓库 `apps/mesa-web`（HEAD `871fd11`） | 退出码 **0**；`Test Files 33 passed (33)` / `Tests 383 passed (383)` |
+| 3 | `pnpm typecheck`（**含探针**，配置未改） | **隔离副本** `%TEMP%\mesa-prc-probe-871fd11\apps\mesa-web` | 退出码 **0**，零错误 |
+| 4 | `tsc --noEmit --listFiles`、`tsc --showConfig`、`tsc --noEmit --moduleResolution node10`（反事实） | 隔离副本 | 见 §2.5.2 / §2.5.3 |
+| 5 | `vitest run src/__fixture_probe__.test.ts` | 隔离副本 | 退出码 **0**；1 文件 / 1 用例通过 |
+| 6 | `node __probe_vite_allow__.mjs`（`vite.resolveConfig` + `searchForWorkspaceRoot`，**不 listen、不启动 server**） | 隔离副本 | 退出码 **0**；见 §2.5.2 |
+| 7 | `git status --porcelain`、`git rev-parse HEAD`、`git rev-parse --abbrev-ref HEAD`（**只读**） | 仓库根 | 执行前后均为**干净**（空输出） |
+
+**本轮明确未做**：未启动 Vite dev server、未启动 `mesad`、未连接任何真实设备或机床、
+未执行任何 git 写操作、未修改 `apps/mesa-web` 的任何生产源码或配置文件、未修改本文件以外的任何文档。
+隔离副本 `%TEMP%\mesa-prc-probe-871fd11` **已删除**（`Test-Path` 复核为 `False`）。
+
+> **方法学副作用（如实登记，含修复与复核结论；供后续探针避坑）**：
+> 该隔离副本的 `node_modules` 采用**链接到真实仓库 `.pnpm`** 的方式构造（避免复制 190MB / 2.6 万文件）。
+> 在副本内执行 `pnpm install`（pnpm 11 的 `verify-deps-before-run` 触发）时，pnpm 以**副本为项目根**
+> 重算了链接目标，**穿透写入真实仓库** `apps/mesa-web/node_modules/.pnpm`，
+> 把其中 **833 个 junction 的目标改成了副本路径**（1213 个中的 833 个）。
+> **处置**：已按前缀**逐一还原**（`Copy 前缀 → 真实仓库前缀`，先 `rmdir` 删链接再重建，不触碰目标内容），
+> 复核结果：指向临时副本的链接 **0** 个、junction 总数回到 **1213**、真实文件数 **26718**；
+> 随后在真实仓库**重新实跑** `pnpm typecheck`（退出码 `0`）与 `pnpm test`（**33 文件 / 383 用例全绿**，
+> 退出码 `0`），与基线**完全一致**；`git status --porcelain` **为空**。
+> **结论**：真实仓库工作树**未残留改动**（`node_modules` 属未跟踪目录，也未进入 git 状态）。
+> **避坑提示**：后续同类探针**不要**在「`node_modules` 链接进真实仓库」的副本内执行任何包管理器命令；
+> 若要复制 `node_modules`，应复制为**真实文件**（或用 `pnpm install --offline` 在副本内独立重建）。
+
+---
+
+# 10. 后端依赖与 Driver 缺陷登记（**正式登记**）
+
+> 本节是**登记**，不是 PR-C 的施工范围。两条登记项的共同要求是：
+> **前端不得用猜测填补后端缺口**（§1.6 红线），
+> 且在缺口存在时**保持 fail-closed（禁用 / 不可确认），不得静默放行**。
+
+## 10.1 I-2：新增只读「变量定义目录」端点 —— **独立后端接口工作**
+
+| 项 | 登记内容 |
+|---|---|
+| **性质** | **独立的后端接口工作**（Driver SDK 新增能力 + Core 逐字透传 + 可能触及 `proto/**`），**不属于 PR-C 授权范围** |
+| **是否 PR-C 基础开发前置** | **否**。PR-C 的 **L1（基础配置能力，§1.7）不依赖它**，可先行交付 |
+| **是否阻塞完整功能验收** | **是**。PR-C 的 **L2（完整语义配置闭环）验收依赖它或等价接口**：参数来源 / 支持状态 / 无法读取原因、`scope` 过滤、`targets`/`target_required`/`arguments[]` 约束渲染、**服务端权威 Preview** |
+| **归属建议** | 独立 PR（建议命名 `PR-B2-nck-definition-catalog-api`）；**不得**把后端改动混入 PR-C 的前端改动 |
+| **接口形态** | 见 §1.4 I-2（`GET /api/v1/drivers/{driver_id}/definitions?family=828d`；目录内容**原样透传**，Core **不得**解释，以守住「Core 不懂协议」） |
+| **I-2 未落地时 PR-C 的义务** | ① 「支持状态 / 参数来源」如实显示为 **「未提供（需定义目录接口）」**，**绝不**用 `verified` 兜底；② **不得**默认全部变量可采集（§10.2）；③ 验收结论**必须**写明 **L1 达成 / L2 未达成**（§1.7） |
+
+## 10.2 `scope=identity` 缺陷 —— **独立 Driver 缺陷（比普通 UI 缺陷更重要）**
+
+> **评审裁决**：本条**不是**普通 UI 缺陷，而是**独立的 Driver 缺陷**，建议由后续 **PR-B2** 处理。
+
+### 10.2.1 缺陷事实（§4.1 实测）
+
+- `PresetRegistry` / `semantic_binding` **不按 `scope` 过滤**（`drivers/sinumerik-nck/src/presets.rs`）；
+- `scope=identity` 的 **6 条定义**（`axis.name`、`axis.ctrlout.module_number`、`axis.encoder.module_number`、
+  `axis.ctrlout.type`、`channel.machine_axis_assignment`、`axis.spindle_assignment`）的 `golden_ref`
+  **全部出现在 preset 模板中**（实测 **6/6**），而 `definition.rs:51` 声明「`Identity` 只服务身份探针」；
+- `DefinitionScope` 在生产代码中**从未被校验**（仅出现在类型定义与测试中）
+  ⇒ **语义 Browse 今天会把「只服务身份探针」的变量当作可采集点位提供给用户**。
+
+### 10.2.2 必须写明的产品语义
+
+| `scope` | 产品语义（Driver 目录层必须表达清楚） |
+|---|---|
+| `collect` | **可采集**：该变量可被用户配置为采集点位 |
+| `identity` | **只服务身份探针**：用于身份判定 / 探测，**不是**面向用户的采集点位，**不得**作为可采集项出现在普通采集界面 |
+
+### 10.2.3 责任归属（**权威修复点不在前端**）
+
+- **由 Driver 的 Browse / 目录层负责提供正确的可采集能力**（在 `presets.rs` 或目录查询层按 `scope` 过滤，
+  或至少把 `scope` 元数据如实体现在可采集能力上）——**这是 Driver 侧的责任，不属 PR-C**。
+- 前端**必须**把缺失的 `scope` 当作**「不可确认」**处理，**不得**用变量名 / `variable_id` 前缀猜测。
+
+### 10.2.4 PR-C 的硬性约束（**fail-closed，可验收**）
+
+> **PR-C 不得把缺失 `scope` 元数据的变量默认认定为可采集。**
+>
+> **若无法可靠区分，则保持禁用或不可确认状态，不得静默放行。**
+
+对应可验收断言：矩阵 **A40**（含反例「**缺失 `scope` 的变量不得被默认放行**」）。
+
+### 10.2.5 阻塞关系（**必须分清，不得含糊**）
+
+| 问题 | 结论 |
+|---|---|
+| 是否阻塞 **PR-C 基础组件开发**（L1） | **不阻塞**。数据模型、C10 入口隔离、`preview_point_key` 的展示与复用、装配收敛、高级原生模式与错误反馈均可先行完成 |
+| 是否阻塞 **「所有可见语义变量均可安全配置」的功能验收声明** | **阻塞**。在该缺陷修复（或 I-2 提供 `scope` 元数据）之前，**不得**做出该声明；验收只能声明「缺失 `scope` 的变量处于**不可确认 / 禁用**状态」 |
+
+---
+
+# 11. 门禁清单（PR-C 完成时）
+
+| # | 门禁 | 命令（**PR-C 实施时逐轮执行**；**G1/G2 已在本轮作为基线实跑**，见 §9.1/§9.4） | 通过标准 |
+|---|---|---|---|
+| G1 | 前端测试 | `pnpm --dir apps/mesa-web test`（即 `vitest run`） | **全绿**；用例数 **≥383**（本轮实测基线 33 文件 / 383 用例，退出码 `0`）；`src/connection/**` 的 **134** 不得下降 |
+| G2 | 类型检查 | `pnpm --dir apps/mesa-web typecheck`（`tsc --noEmit`） | 零错误（本轮实测退出码 `0`）；**§9.3-1 已结案：`resolveJsonModule` 无需显式设置**（`moduleResolution: "bundler"` 下生效值为 `true`），`tsconfig.json` **不需要**修改 |
 | G3 | Lint | `pnpm --dir apps/mesa-web lint`（`eslint .`） | 零错误 |
 | G4 | 冻结面 | 见 §2.3 | `src/connection/**`（9 文件/134）、`DescriptorFields*`（3 文件）、`ApplyWithRestart` 相关用例**原样通过**；`resourceSelectionModel.ts:169-377` 算法语义不变 |
 | G5 | **红线门（grep）** | `grep -r "nck-point-key-golden" --include=*.rs --include=*.ts,*.tsx` | 命中集合恰为 {Core, Driver, 前端}；**不得**出现 `*copy*.json`（PR-B `:654`） |
 | G6 | **红线门（grep）** | 前端生产代码检索 NCK 原生协议常量 | 除 `nck_native` 表单的显式 12 字段声明外**零命中**（矩阵 A35/A38） |
 | G7 | **C10 门** | 矩阵 A19/A21/A22/A28/A29 | NCK **不**产出 `mesa.resources.v1`；旧路径显式标注为高级且会被拒 |
-| G8 | Rust 门禁 | `cargo build --workspace` + `cargo test --workspace` | **仅当触碰 Core/Driver 时必跑**。**PR-C 原则上不改后端**（§2.4）⇒ 默认**不需要**；若因 §9.3-3 引入后端改动，则由**该后端 PR** 承担此门禁，并需 `cargo build --locked --workspace` |
+| G8 | Rust 门禁 | `cargo build --workspace` + `cargo test --workspace` | **仅当触碰 Core/Driver 时必跑**。**PR-C 原则上不改后端**（§2.4）⇒ 默认**不需要**；若由 **§10.1 的 I-2 后端 PR** 引入后端改动，则由**该后端 PR** 承担此门禁，并需 `cargo build --locked --workspace` |
 | G9 | 契约测试 | `python scripts/write-contract-evidence.py`（29 套） | 同上：**仅后端 PR 承担**；PR-C 不改 `drivers/**`、`crates/**`、`tests/driver-contract/**` ⇒ 不在 PR-C 门禁内 |
 | G10 | 性能 | CI `rust-perf` | **不在 PR-C 范围**（性能预算 §22 归 CI） |
 
@@ -798,7 +1089,7 @@ grep 命中集合恰为 {Core, Driver, **前端(PR-C 时)**}，**不得**出现 
 
 ---
 
-# 11. 结论摘要（给评审）
+# 12. 结论摘要（给评审）
 
 1. **§0 结论 = (B)**：前端**不存在**可直接获取 Driver 身份计算结果的正式接口。
    但性质是「后端已实现、线级已承载、前端未消费」——
@@ -806,16 +1097,35 @@ grep 命中集合恰为 {Core, Driver, **前端(PR-C 时)**}，**不得**出现 
    （`presets.rs:242-275`，逐字透传于 `core-api/src/lib.rs:864`），
    它在 `browseModel.ts:20-23/41-54` 被**结构性丢弃**，且 `ResourcePickerAntd.tsx:93-97`
    连语义叶的 `resource_id="nck_variable"` 都无法映射。
-2. **最小接口方案**：**I-1**（零后端改动，PR-C 内完成）把既有 `identity` 块正式化为只读契约；
+2. **最小接口方案**：**I-1**（零后端改动，PR-C 内完成）把既有 `identity` 块正式化为只读契约，
+   其**可独立交付的能力清单与不可独立支撑的部分**已在 **§1.4.1** 明确写出
+   （完整语义化配置体验**依赖 I-2 或等价服务端接口**）；
    **I-2**（定义目录端点）是唯一能满足「参数来源/支持状态/无法读取原因」的形态，
-   **需后端改动，只作需求登记**，建议独立 PR，不阻塞 PR-C 主体。
+   **已正式登记为独立后端接口工作（§10.1）**：**不作为 PR-C 基础开发前置**，
+   但**完整功能验收（L2）依赖它或等价接口**（两级验收口径见 §1.7）。
+   **实例身份规则已按评审收紧（§1.4.2）**：Browse 的 `preview_point_key` 只是**特定实例**的身份预览，
+   **用户一旦修改 Target 或 Arguments，不得直接沿用旧 `preview_point_key`**；
+   **首选服务端权威 Preview**，前端通用模板替换只能证明**编码规则**一致，
+   **不得视为「已由 Driver 验证的新实例身份」**（矩阵 A39/A41）。
 3. **C10 的实际路径**已完整给出（§5.2 十步链），终局是
    `drivers/sinumerik-nck/src/lib.rs:648-657` 的 `UNSUPPORTED_BINDING`；
    处置为 **UI 侧收敛 + Descriptor 逐字不动**（六条措施 §5.4），
    并显式声明一个取舍：**PR-C 后向导页无法添加 NCK 语义点位**，归 PR-D。
 4. **红线与原样条款**见 §1.6；**唯一允许的例外**（`nck_native`+`derived` 的固定规则）已在
    §1.6 与 §4.3 明确边界，避免被误判违规。
-5. **8 项无法确认 / 冲突**如实列于 §9.3，其中 2 项（`scope` 未校验、`AddDeviceFlow.test.tsx` 归属）
-   已**确证**存在，1 项（前端能否直读仓库级 fixture）**待实跑确认**。
-6. 前端测试基线 **33 文件 / 383 用例**已通过两条独立计数路径核实与既有基线一致；
-   本次**未运行**它们。
+5. **无法确认 / 冲突项**如实列于 §9.3：其中 **`scope` 未校验**与 **`AddDeviceFlow.tsx` 归属**两项
+   已**确证并裁决**（前者登记为独立 Driver 缺陷 §10.2，后者写入 §8.3「已裁决」）；
+   **前端能否直读仓库级 fixture** 一项**已由本轮实测结案（§2.5/§9.3-1）**：
+   按 PR-C 计划形态（fixture 仅被测试文件 import）⇒ **`tsconfig.json` 与 `vite.config.ts` 两个都无需修改**；
+   仅当**生产代码** import 时才需要改 `vite.config.ts` **一处**（最小改动与修复前后对照已给出，
+   并附「只写 fixtures 会丢掉工作区根」的反事实证据）。剩余**真正待确认**项为 §9.3 的第 5、7 条。
+6. 前端测试基线 **33 文件 / 383 用例**：本轮**已实际运行**（`pnpm test` 退出码 `0`，
+   `Test Files 33 passed (33)` / `Tests 383 passed (383)`；`pnpm typecheck` 退出码 `0`），
+   实跑数字与原有两条独立静态计数路径**同值**（§9.1、§9.4）。
+7. **三级修订落点**：修订 1（I-1 能力边界 + 实例身份收紧 + 两级验收）＝ §1.4.1 / §1.4.2 / §1.7，
+   并落到 §1.5、§4.3、§6.1 与矩阵 **A39**；
+   修订 2（I-2 与 `scope=identity` 正式登记）＝ 新增 **§10.1 / §10.2**，并落到矩阵 **A40**；
+   修订 3（`tsconfig.json` / `vite.config.ts` 改为条件修改项 + 实测结论）＝ §2.2 两行、新增 **§2.5**、§9.3-1、门禁 G2。
+8. **矩阵最终行数：41 行（A1–A41）**——原 38 行 A1–A38 **全部保留**，本轮新增 **A39 / A40 / A41**（§7.7）。
+9. **`AddDeviceFlow.tsx` / `AddDeviceFlow.test.tsx` 的归属冲突已裁决**（§8.3）：
+   **两个文件均由 PR-D 统一处理，PR-C 不修改**；上位设计 `:1207`/`:1223`/`:1264` 的内部冲突标记为「**已裁决**」。
