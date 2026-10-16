@@ -769,15 +769,32 @@ fn collect_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<St
     }
 }
 
-/// 最长默认 Key 实测（Core 上限 256 字节**不放宽**，§2.5 待确认项 8）。
+/// 最长默认 Key 实测（Core 上限 256 字节**不放宽**，§2.5 待确认项 8）
+/// + **A：跨 Core/Driver 身份契约**（PR-B）。
 ///
-/// 这里用「最小合法实例 + 每个 argument 的下界」构造规范身份并实测字节数：
-/// 数字段的最长形态出现在多位实例号（如 255）与多位 argument 值，因此额外取
-/// `255` 作为实例号样本，确保测到的是**可能的最长形态**而非单一示例。
+/// **证明什么**：Driver 侧生成的身份不仅要「自己看着对」，还必须被 Core 侧的**通用语法校验器**
+/// 逐条接受。两侧各自通过各自的测试**并不**蕴含这件事：Driver 可能产出违反通用契约
+/// （NFC / 长度 / 字符集 / 段内键序 / 类型标签分隔符）的 Key，而故障只会在**生产保存点位时**
+/// 才暴露（Core 拒收），不会在任何一侧的 CI 里暴露。本用例把 **42 条定义 × 两组合法实例
+/// = 84 条真实 Driver 身份**全部送进 Core 校验器，把这处缺口关在 CI 里。
+///
+/// **为什么必须由生产代码提供两侧实现**（测试**不复制**任何身份拼装或 Key 校验算法——
+/// 复制一套就等于只测「我自己写的算法」，两侧真实漂移照样漏过）：
+/// - Driver 身份生成：`VariableDefinition::canonical_identity`（`src/definition.rs:1091`），
+///   与编译器 `src/compiler.rs:398`、预填 `src/presets.rs:250` 调用的是**同一函数**；
+/// - Driver 侧合法实例闸门：`TargetRef::validate`（`src/targets.rs:303`）与
+///   `VariableDefinition::validate_arguments`（`src/definition.rs:997`），
+///   即 `src/compiler.rs:383` / `src/compiler.rs:385` 使用的同两条校验
+///   （否则「合法实例」只是测试的自称）；
+/// - Core Key 校验：`mesa_core_types::validate_point_key`（`crates/core-types/src/point.rs:413`）。
+///
+/// 样本取「最小合法实例 + 每个 argument 的上界」：数字段的最长形态出现在多位实例号
+/// （如 255）与多位 argument 值，因此额外取 `255` 作为实例号样本，确保测到的是
+/// **可能的最长形态**而非单一示例。
 #[test]
 fn default_keys_stay_within_core_limit() {
     let cat = catalog();
-    let mut longest = (0usize, String::new());
+    let mut keys: Vec<(String, String)> = Vec::new();
     for d in cat.iter() {
         for value in [1u64, 255] {
             let mut target = serde_json::Map::new();
@@ -803,24 +820,181 @@ fn default_keys_stay_within_core_limit() {
                 );
             }
             let target = TargetRef::from_json(&Value::Object(target)).unwrap();
+            // 这两条闸门必须与 Compiler 的 D7/D8 同源：样本若本身不合法，
+            // 「84 条真实身份」就只是测试的自称（`src/compiler.rs:383/385`）。
+            target
+                .validate(d)
+                .unwrap_or_else(|e| panic!("{}：样本 target 不合法（D7）：{e}", d.variable_id));
+            d.validate_arguments(&arguments)
+                .unwrap_or_else(|e| panic!("{}：样本 arguments 不合法（D8）：{e}", d.variable_id));
             let key = d.canonical_identity(&target, &arguments).unwrap();
-            if key.len() > longest.0 {
-                longest = (key.len(), key);
-            }
+            keys.push((d.variable_id.clone(), key));
         }
     }
+    assert_eq!(keys.len(), 84, "42 条定义 × 两组合法实例 = 84 条真实身份");
+
+    let mut longest = (0usize, String::new());
+    for (variable_id, key) in &keys {
+        // ① Core 通用语法（非空 / NFC / 字节长 / 字符集 / 段内键名升序 / 规范类型标签编码）
+        //    必须逐条接受——这正是「Driver 生成 ⇒ Core 接受」的契约本身。
+        mesa_core_types::validate_point_key(key).unwrap_or_else(|e| {
+            panic!("{variable_id}：Driver 生成的身份被 Core 拒绝：{e}（key = {key}）")
+        });
+        // ② 编码后字节数必须 ≤ Core 上限（逐条，不只看最长的那条）。
+        assert!(
+            key.len() <= 256,
+            "{variable_id}：{key} 编码后 {} 字节超过 Core 上限 256",
+            key.len()
+        );
+        // ③ 类型标签分隔符**恒为** `:`；`=i=` / `=s=` 是错误形态，84 条里一条都不许出现。
+        assert!(
+            !key.contains("=i="),
+            "{variable_id}：{key} 出现错误分隔符 `=i=`（类型标签分隔符恒为 `:`）"
+        );
+        assert!(
+            !key.contains("=s="),
+            "{variable_id}：{key} 出现错误分隔符 `=s=`（类型标签分隔符恒为 `:`）"
+        );
+        if key.len() > longest.0 {
+            longest = (key.len(), key.clone());
+        }
+    }
+
     println!("最长默认 Key = {} 字节：{}", longest.0, longest.1);
-    assert!(
-        longest.0 <= 256,
-        "最长 Key {} 字节超过 Core 上限 256（不得放宽上限、不得截断）：{}",
-        longest.0,
-        longest.1
+    // ④ 最长 Key 的**规范字面量**冻结：定义数据或身份拼装一旦漂移，这里立刻失败。
+    const LONGEST_KEY: &str =
+        "drive.motor.temperature@drive_object=o:{entry=s:drive_object,number=i:255}";
+    assert_eq!(longest.1, LONGEST_KEY, "最长 Key 的规范字面量已冻结");
+    assert_eq!(
+        longest.0, 74,
+        "最长 Key 必须恰为 74 字节（与 Core 上限 256 相互独立的第二条判据）"
     );
+    assert_eq!(LONGEST_KEY.len(), 74, "冻结字面量自身必须为 74 字节");
     assert!(
         longest.0 >= 60,
         "若最长 Key 突然变短，说明样本或定义发生了非预期变化：{}",
         longest.1
     );
+
+    // ⑤「明确拒绝错误分隔符」：不能只断言「我们没写出来」——把最长 Key 的同形反例
+    //    （`number=i=255` / `entry=s=drive_object`）交给**同一个生产校验器**，必须报错。
+    assert!(mesa_core_types::validate_point_key(LONGEST_KEY).is_ok());
+    let wrong_separator = [
+        "drive.motor.temperature@drive_object=o:{entry=s:drive_object,number=i=255}",
+        "drive.motor.temperature@drive_object=o:{entry=s=drive_object,number=i:255}",
+    ];
+    for bad in wrong_separator {
+        let err = mesa_core_types::validate_point_key(bad).expect_err(&format!(
+            "含错误分隔符（`=i=` / `=s=`）的 Key 必须被 Core 拒绝：{bad}"
+        ));
+        println!("错误分隔符反例被拒：{bad} ⇒ {err}");
+    }
+}
+
+/// B：**Lock 摘要被篡改 ⇒ 装载失败，且失败被映射为 `DEFINITION_DIGEST_MISMATCH`**；
+/// 同时证明**仓库内正式 `DIGESTS.lock` 未被本次测试改动**。
+///
+/// **证明什么**：摘要校验必须 fail-closed，并且失败要落到**稳定的对外错误码**
+/// （不是「随便一个 JSON 错误」）。若装载路径吞掉 `DigestMismatch`、或把它错报成
+/// `Json` / `LockJson`，调用方（状态机 / CLI）就无法区分「定义被篡改」与「文件格式坏」，
+/// 而这正是 §3.5 A14 要求 21 个错误码逐条可映射的意义。
+///
+/// **为什么不触碰正式 Lock，以及为什么校验必须走生产路径**：
+/// - 篡改只发生在**内存副本**上：把 `include_str!` 读入的官方 Lock 文本解析为
+///   `serde_json::Value` → 翻转某一条 `digest` 的一位十六进制 → 重新序列化成字符串；
+///   仓库内的 `definitions/828d/DIGESTS.lock` **不写、不删、不改名**（测试用只读
+///   `std::fs::read` + SHA-256 读回比对证明，`git status` 亦为空）；
+/// - 校验走**唯一**的真实装载路径 `DefinitionCatalog::load`（`src/definition.rs:381`，
+///   `embedded()` 只是它的封装），内部由 `verify_digests`（`src/definition.rs:546`）
+///   产出 `CatalogError::DigestMismatch`，对外 code 由 `CatalogError::code`
+///   （`src/definition.rs:332`）映射。测试**不复制**摘要算法，也不另写一套装载校验。
+#[test]
+fn catalog_error_maps_to_definition_digest_mismatch() {
+    // 0) 正式 Lock 的基线指纹：磁盘读回 ≡ 编译期内嵌副本（两处互证）。
+    let lock_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("definitions/828d/DIGESTS.lock");
+    let baseline = sha256_hex(&std::fs::read(&lock_path).expect("正式 DIGESTS.lock 必须存在"));
+    assert_eq!(
+        baseline,
+        sha256_hex(DIGESTS_LOCK.as_bytes()),
+        "磁盘上的正式 DIGESTS.lock 必须与编译期内嵌副本逐字一致"
+    );
+    // 对照组：未篡改的官方 Lock 文本必须装载成功（失败只可能来自篡改本身）。
+    DefinitionCatalog::load(R1_JSON, DIGESTS_LOCK).expect("未篡改的官方 Lock 必须装载成功");
+
+    // 1) 只在**内存副本**上篡改一条摘要（翻转首个十六进制字符，长度与形状保持 64 位 hex）。
+    let official: Value = serde_json::from_str(DIGESTS_LOCK).unwrap();
+    let mut doc = official.clone();
+    let (victim_id, original) = {
+        let first = &doc["entries"].as_array().unwrap()[0];
+        (
+            first["variable_id"].as_str().unwrap().to_string(),
+            first["digest"].as_str().unwrap().to_string(),
+        )
+    };
+    let flipped = flip_first_hex(&original);
+    doc["entries"][0]["digest"] = Value::from(flipped.clone());
+    // 「篡改」必须可证明：除被翻转的那一条摘要外，副本与正式 Lock **逐字段相同**
+    // （条目数不变、其余摘要不变、`file` 指向不变）——否则失败可能来自别处的改动。
+    let mut expected_doc = official;
+    expected_doc["entries"][0]["digest"] = Value::from(flipped.clone());
+    assert_eq!(doc, expected_doc, "篡改必须只发生在被翻转的那一条摘要上");
+    assert_eq!(
+        doc["entries"].as_array().unwrap().len(),
+        42,
+        "副本条目数必须与正式 Lock 相同"
+    );
+    assert_ne!(flipped, original, "被篡改的摘要必须与原值不同");
+    assert_eq!(
+        flipped.len(),
+        64,
+        "篡改后的摘要仍须是 64 位 hex（只变值、不变形状）"
+    );
+    let tampered = serde_json::to_string_pretty(&doc).unwrap();
+
+    // 2) 真实装载路径：必须失败。
+    let err = DefinitionCatalog::load(R1_JSON, &tampered)
+        .expect_err("摘要被篡改后装载必须失败（fail-closed）");
+    // 3) 失败必须被映射为唯一的目标错误码，且诊断里带上两侧摘要。
+    assert_eq!(
+        err.code(),
+        "DEFINITION_DIGEST_MISMATCH",
+        "错误码映射漂移：{err}"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains(&victim_id), "必须点名被篡改的定义：{msg}");
+    assert!(
+        msg.contains(&flipped),
+        "必须报出 Lock 侧（expected）摘要：{msg}"
+    );
+    assert!(
+        msg.contains(&original),
+        "必须报出实算（actual）摘要以便比对：{msg}"
+    );
+
+    // 4) 正式 Lock 未被修改：磁盘读回指纹不变，且内嵌目录仍能装载 + 自洽。
+    assert_eq!(
+        sha256_hex(&std::fs::read(&lock_path).expect("正式 DIGESTS.lock 必须仍可读")),
+        baseline,
+        "正式 DIGESTS.lock 在测试过程中被改动"
+    );
+    let cat = DefinitionCatalog::embedded().expect("正式内嵌目录必须仍然可装载");
+    cat.verify_digests()
+        .expect("正式 DIGESTS.lock 与定义目录必须仍然自洽");
+}
+
+/// 内容 SHA-256（lowercase hex）——仅用于「读回比对」，不复制任何生产摘要逻辑。
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// 翻转首个十六进制字符（保证与原值不同；用于构造 Lock 篡改副本）。
+fn flip_first_hex(hex: &str) -> String {
+    let mut chars: Vec<char> = hex.chars().collect();
+    chars[0] = if chars[0] == 'f' { '0' } else { 'f' };
+    chars.into_iter().collect()
 }
 
 /// 所有定义都必须可被编译器消费：`targets` / `arguments` / `golden_ref` 自洽。
