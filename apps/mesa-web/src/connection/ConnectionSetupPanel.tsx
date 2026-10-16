@@ -23,12 +23,86 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Button, Select, Space, Tag } from "antd";
 import type { DriverDescriptor } from "../types";
 import { ApplyWithRestart } from "../components/ApplyWithRestart";
-import { missingRequiredAdvanced, type ConnectionValues } from "./connectionSetupModel";
+import {
+  isEmptyConnectionValue,
+  missingRequiredAdvanced,
+  type ConnectionValues,
+} from "./connectionSetupModel";
+import {
+  fieldsToClearOnSwitch,
+  selectablePresets,
+  unverifiedFamilyNote,
+  type ConnectionPreset,
+} from "./connectionProfiles";
 import { CONNECTION_FIELD_ID_PREFIX, ConnectionFields } from "./ConnectionFields";
 import { ConnectionTestResult } from "./ConnectionTestResult";
 import { useConnectionSetup } from "./useConnectionSetup";
 
 export type ConnectionSetupMode = "create-draft" | "add" | "edit";
+
+/**
+ * 草稿里的 `family` 取值——预设适用范围的**唯一**依据。
+ *
+ * 只认非空字符串：`family` 是显式必填字段（NCK Descriptor 不提供静默默认），
+ * 未选择时必须视为「还不知道系列」，此时不得给出任何示例值。
+ */
+function draftFamily(raw: ConnectionValues): string | null {
+  const value = raw.family;
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
+
+/**
+ * 示例标题：由 `family` 派生（`828d` → 「828D 实测连接示例」）。
+ *
+ * 为什么派生而不是给 `ConnectionPreset` 加 `name` 字段：预设的作用范围本来就由
+ * `family` 定义，标题只是它的界面表达；另立一份名称表会多出一处可能与 `family`
+ * 漂移的事实来源。来源与限制说明一律用预设自带的 `provenance` / `caveat`。
+ */
+function presetTitle(preset: ConnectionPreset): string {
+  return `${preset.family.toUpperCase()} 实测连接示例`;
+}
+
+/** 单个预填值的展示文本：十六进制与十进制同时给出，免去用户自己换算 TSAP。 */
+function presetValueText(label: string, value: number): string {
+  const hex = `0x${value.toString(16).toUpperCase().padStart(4, "0")}`;
+  return `${label} ${hex} (${value})`;
+}
+
+/** 证据等级标记：`site_tested_example` 必须显式标注为单台实测，不得冒充通用值。 */
+function presetScopeTag(preset: ConnectionPreset): { color: string; text: string } {
+  return preset.scope === "site_tested_example"
+    ? { color: "orange", text: "单台设备验证" }
+    : { color: "green", text: "已验证范围" };
+}
+
+/**
+ * 预设来源状态（最小集）：记录「哪条预设、在哪个驱动下、把哪些 key 写成了什么值」。
+ *
+ * 存在的唯一理由：切换系列时只允许清理**仍由预设控制**的值。`raw` 里的值本身
+ * 无法区分「预设写入后用户没动」与「用户后来手工改成别的值」——两者都是普通值，
+ * 因此必须显式留一份来源快照：把当前值与 `values` 比对即可判定是否被改过。
+ */
+interface AppliedPreset {
+  /** 写入草稿的那条预设（也是 `fieldsToClearOnSwitch` 的入参） */
+  preset: ConnectionPreset;
+  /** 应用该预设时的驱动 id：驱动切换会整体重建草稿，来源状态随之作废 */
+  driverId: string;
+  /** 预设实际写入的 key → 值（判定「用户是否改过」的唯一依据） */
+  values: Record<string, number>;
+}
+
+/**
+ * 「来自其它系列的示例值仍留在草稿里」的确认提示。
+ *
+ * 只登记**被用户手工改过**的 key：这类值不得擅自删除（那是用户的输入），但它
+ * 来源于其它系列的实测示例，必须由用户确认是否适用于当前控制器。
+ */
+interface StaleExampleNotice {
+  /** 示例来源系列（`828d` 这类原始 family 取值） */
+  fromFamily: string;
+  /** 被保留且需要确认适用性的字段 key */
+  keys: string[];
+}
 
 export interface ConnectionSetupPanelProps {
   mode: ConnectionSetupMode;
@@ -108,6 +182,10 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
 
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [showMissingHint, setShowMissingHint] = useState(false);
+  /** 预设来源状态：哪些 key 由哪条预设写入、写成了什么值（见 AppliedPreset） */
+  const [appliedPreset, setAppliedPreset] = useState<AppliedPreset | null>(null);
+  /** 切换系列后被保留、需要用户确认适用性的示例值（见 StaleExampleNotice） */
+  const [staleExample, setStaleExample] = useState<StaleExampleNotice | null>(null);
   // nonce 保证「连续两次同样的缺失」也能重新触发滚动定位
   const [focus, setFocus] = useState<{ key: string | null; nonce: number }>({
     key: null,
@@ -142,6 +220,118 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
     () => setup.drivers.filter((d) => !d.launchable),
     [setup.drivers],
   );
+
+  // -------------------------------------------------------------------------
+  // 实测示例预设（C2）：只列**可选**预设（含 `site_tested_example`）。
+  //
+  // 这里的计算是**纯渲染**：把预设值写进草稿只有一条路径——用户点击
+  // 「应用实测示例」（见 applyPreset）。驱动切换、系列切换、描述符加载完成都不会
+  // 自动套用示例值（单台实测值不得成为通用默认），切换系列只会**清理**已应用且
+  // 未被用户改过的值（见下方 effect）。
+  //
+  // `family` 提出来单独做依赖：它才是预设适用范围的唯一依据，用字符串依赖避免
+  // 每敲一个字符都重算预设列表。
+  // -------------------------------------------------------------------------
+  const family = draftFamily(setup.raw);
+  const presets = useMemo(
+    () => selectablePresets(setup.driverId ?? "", family),
+    [setup.driverId, family],
+  );
+  /**
+   * 「该系列没有实机验证预设」的说明（如 840d-sl）。
+   *
+   * 与 `presets` 同源（同一个 `family`）：有预设的系列由预设卡片说明来源与限制，
+   * 没有预设的系列只给一句说明——**不提供可点击预设、也不自动填充**。
+   */
+  const noPresetNote = useMemo(
+    () => unverifiedFamilyNote(setup.driverId ?? "", family),
+    [setup.driverId, family],
+  );
+
+  /**
+   * 应用实测示例：**唯一**把预设值写入草稿的入口，只由用户点击触发。
+   *
+   * 走既有草稿机制 `setup.setField`（而不是绕过它直接改内部状态）：revision 代际、
+   * `touched` 语义、上一次校验/探测结果的失效全部沿用，因此应用之后
+   * 「校验/测试/保存」拿到的就是这份新值，用户随后也能自由改回或改成别的值。
+   *
+   * 同时登记预设来源状态（`appliedPreset`）：切换系列时要靠它区分「仍是预设值」
+   * 与「用户后来手工改过」。来源状态与草稿值在这里同源写入，不存在第二条路径。
+   */
+  const applyPreset = (preset: ConnectionPreset) => {
+    for (const [key, value] of Object.entries(preset.values)) {
+      setup.setField(key, value);
+    }
+    setAppliedPreset({
+      preset,
+      driverId: setup.driverId ?? "",
+      values: { ...preset.values },
+    });
+    // 用户主动应用即代表「已知来源」：上一次切换系列留下的确认提示随之作废
+    setStaleExample(null);
+    // 预设填的都是高级参数：展开高级区，否则用户看不到刚刚写入了什么。
+    setAdvancedOpen(true);
+  };
+
+  /**
+   * 切换系列（或驱动）时处理「跨系列遗留」的预设值（评审要求）。
+   *
+   * 规则（严格遵守「只清理仍由预设控制的值」）：
+   * - 需要判定的 key 一律来自 [`fieldsToClearOnSwitch`]（不再属于当前系列预设的键）；
+   * - 当前值**仍等于预设写入的值** → 用户没改过 → 清除（回到未设置，必填校验接管）；
+   * - 当前值**已被用户手工改过** → 不得删除（那是用户的输入）→ 只要求用户确认适用性；
+   * - 已经是空值/缺失 → 无需处理，也**不**提示（没有遗留值可言）。
+   *
+   * 清除走 `setup.setField`（既有草稿入口）：revision 代际、`touched` 登记、
+   * 旧校验/探测结果失效全部沿用，不绕开任何既有机制。
+   *
+   * 切回原系列**不会**自动重新填充：清理后 `appliedPreset` 已置为当前（此处为
+   * `null`），写值永远只有「应用实测示例」这一条用户路径。
+   */
+  useEffect(() => {
+    if (!appliedPreset) return;
+    // 驱动切换：草稿已被 withDriverChange 按新 Schema 整体重建，来源状态随之作废
+    //（新驱动下残留的 key 已不存在，无需清理，也不该拿旧预设值去比对）
+    if (appliedPreset.driverId !== (setup.driverId ?? "")) {
+      setAppliedPreset(null);
+      setStaleExample(null);
+      return;
+    }
+    const next = selectablePresets(setup.driverId ?? "", family)[0] ?? null;
+    // 同一条预设仍然适用（系列没变）：这些值仍由它控制，不做任何处理
+    if (next && next.id === appliedPreset.preset.id) return;
+
+    const raw = setup.raw;
+    const kept: string[] = [];
+    for (const key of fieldsToClearOnSwitch(appliedPreset.preset, next)) {
+      if (!Object.prototype.hasOwnProperty.call(raw, key)) continue;
+      const current = raw[key];
+      // 已是空值（含 undefined）＝已回到未设置，不必再清一次
+      if (isEmptyConnectionValue(current)) continue;
+      if (current === appliedPreset.values[key]) {
+        setup.setField(key, undefined);
+        continue;
+      }
+      kept.push(key);
+    }
+    setStaleExample(
+      kept.length > 0 ? { fromFamily: appliedPreset.preset.family, keys: kept } : null,
+    );
+    // 来源状态随「当前生效的预设」走：`fieldsToClearOnSwitch` 保留下来的重叠 key
+    // 仍算该预设控制的值。
+    // NOTE: 目前只有一条系列预设，因此这个分支实际只会走到 `next === null`
+    // （切到无预设的系列）。将来新增第二条系列预设时，需要重新审视「两个预设
+    // 重叠的 key 保留了上一个系列的示例值」是否同样应当要求用户确认适用性。
+    setAppliedPreset(
+      next
+        ? { preset: next, driverId: appliedPreset.driverId, values: { ...next.values } }
+        : null,
+    );
+  }, [appliedPreset, family, setup.driverId, setup.raw, setup.setField]);
+
+  /** 字段展示名（确认提示里指代具体字段；找不到时退回 key，绝不显示空白）。 */
+  const fieldLabel = (key: string): string =>
+    setup.fields.find((f) => f.key === key)?.label ?? key;
 
   /** 高级必填缺失的兜底：自动展开 + 定位；返回是否可继续。 */
   const guardAdvanced = (): boolean => {
@@ -297,6 +487,75 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
           onAdvancedOpenChange={setAdvancedOpen}
           showMissingHint={showMissingHint}
         />
+      ) : null}
+
+      {setup.descriptorStatus === "ready" ? (
+        // 紧贴高级参数区：预设填的正是 TSAP 这类高级参数。
+        <div style={{ display: "grid", gap: 6 }}>
+          {noPresetNote ? (
+            // 没有实机验证预设的系列：只给说明，不给任何可点击预设、也不自动填充。
+            <div data-preset-note={family}>
+              <Alert type="info" showIcon message={noPresetNote} />
+            </div>
+          ) : null}
+          {staleExample ? (
+            // 用户手工改过的示例值被保留（不擅自删除用户输入），但必须确认适用性：
+            // 该值来自其它系列的实测示例，与本系列的控制器配置没有任何已验证关系。
+            <div data-stale-example={staleExample.keys.join(",")}>
+              <Alert
+                type="warning"
+                showIcon
+                message="示例值可能不适用于当前系列"
+                description={`字段 ${staleExample.keys
+                  .map(fieldLabel)
+                  .join("、")} 的值来自 ${staleExample.fromFamily.toUpperCase()} 的实测示例（单台设备实测，不是当前系列的预设），已保留未自动删除；请确认该值适用于当前控制器后再保存。`}
+              />
+            </div>
+          ) : null}
+          {presets.map((preset) => {
+            const tag = presetScopeTag(preset);
+            return (
+              <div
+                key={preset.id}
+                data-preset-id={preset.id}
+                style={{
+                  border: "1px solid #d9d9d9",
+                  borderRadius: 4,
+                  padding: 12,
+                  display: "grid",
+                  gap: 6,
+                }}
+              >
+                <Space size={8} wrap>
+                  <span style={{ fontSize: 13, fontWeight: 600 }}>{presetTitle(preset)}</span>
+                  <Tag color={tag.color}>{tag.text}</Tag>
+                </Space>
+                <Space size={16} wrap>
+                  {Object.entries(preset.values).map(([key, value]) => (
+                    <span
+                      key={key}
+                      data-preset-value={key}
+                      style={{
+                        fontSize: 12,
+                        fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace",
+                      }}
+                    >
+                      {presetValueText(fieldLabel(key), value)}
+                    </span>
+                  ))}
+                </Space>
+                {/* 来源与限制必须可见：单台实测值不是所有同系列设备的通用默认 */}
+                <div style={{ fontSize: 12, color: "#525252" }}>{preset.provenance}</div>
+                <div style={{ fontSize: 12, color: "#d46b08" }}>{preset.caveat}</div>
+                <div>
+                  <Button size="small" onClick={() => applyPreset(preset)}>
+                    应用实测示例
+                  </Button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
       ) : null}
 
       {setup.secretMarkers.length > 0 ? (

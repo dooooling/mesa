@@ -132,7 +132,13 @@ describe("C2 AddConnectionModal：P0 提交出口", () => {
     mocked.createEndpoint.mockResolvedValue({ status: 201, body: {} });
     renderModal();
 
-    await waitFor(() => expect(button(/创\s*建/).disabled).toBe(false));
+    // 显式给宽裕窗口：这里等的是「清单 + 描述符就绪 → 按钮启用」的异步链，
+    // 默认 1s 在负载高的 CI runner 上不够（实测 run 38768093113：
+    // waitFor 超时后抛出最后一次断言 `expected true to be false`）。
+    // 断言内容不变，只是把等待窗口放大——不是放宽判定。
+    await waitFor(() => expect(button(/创\s*建/).disabled).toBe(false), {
+      timeout: 10_000,
+    });
     // Modal 渲染在 portal 里，字段锚点要从 document 取
     const host = document.querySelector('[data-field-key="host"] input') as HTMLInputElement;
     fireEvent.change(host, { target: { value: "10.0.0.9" } });
