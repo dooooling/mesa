@@ -1,6 +1,6 @@
 # NCK 语义化 Point Definition 重构（Address Compiler 单一入口）
 
-- 状态：**设计冻结稿**（评审结论 = **有条件通过**；三项修订已落实，见「修订记录」）
+- 状态：**设计冻结稿**（第一轮评审 = 有条件通过，三项修订已落实；**第二轮复审 = 架构有条件通过**，两项 P0 已关闭，见「修订记录」的**修订 4/5**）
 - 基线：`main = 0d686b4`（工作树干净）；`sinumerik-nck 0.5.0` 保持 experimental
 - 上位依据：ADR 0001（协议划分）、ADR 0002（NCK 交叉验证）、ADR 0003（legacy binding 不作永久兼容承诺）、ADR 0004（原生寻址，Catalog 退出采集准入）
 - 目标模型：**语义化 Point Definition 为用户配置模型** → **NCK Driver 内 Address Compiler 为唯一协议地址转换入口** → 现有 NCK ReadVar/Codec 为稳定执行层
@@ -9,7 +9,7 @@
 
 ---
 
-## 修订记录（本次三项修订，对照评审结论）
+## 修订记录（第一轮三项修订 + 第二轮两项 P0）
 
 > **评审结论：有条件通过。** 评审已正式采用「**点位层 Point Kind + 单一 NCK 任务信封**」，允许同一任务混合 `nck_variable` 与 `nck_native`；**不采用**按点位类型拆分两个任务的方案。理由：两者只是**地址表达方式不同**，不是不同采集协议或调度模型——最终都进入**同一个 NCK ReadVar**。
 >
@@ -52,6 +52,26 @@
 ### 本次保留不变（评审已批准）
 
 总体分层（语义 Definition → Driver 内 Address Compiler → 既有 ReadVar/Codec 执行层）、Definition Revision 策略（§3）、62 条冻结 Wire Golden 的**完整覆盖**、Module 26/130 **不允许折叠**、不迁移历史 NCK 点位配置、非 NCK 功能与连接回归护栏不得退化、PR-A→PR-D 顺序（并强化：**PR-A 完成后必须独立验收才能进入 PR-B**）。
+
+### 修订 4 / 修订 5（第二轮复审：两项 P0，本次新增）
+
+> **第二轮复审结论：架构有条件通过。** 已批准并冻结的部分（Point Kind 位于点位层、`nck.points.v1` 任务信封、Core 参数层不透明、Driver Address Compiler、Definition Revision 策略、Core 只理解通用信封、NCK Target 归 Driver、同一任务可混合两种点位、62 条 Golden 完整保留）**一律不变**。关闭以下两项 P0 后方可启动 PR-A；此后评审**只看「Point Key 契约差异 + 对应测试样例」**。
+
+| # | 问题 | 矛盾 / 缺口 | 裁决（本次已落实） | 落实位置 |
+|---|---|---|---|---|
+| **修订 4 = P0-1** | **Point Key 职责边界** | 原 §4.1.1 第 10 条把「Key 编码 + 模板拼装 + 排序」放在 **Core 侧纯函数**，与 §2.4「Core 不解释 `parameters` 内任何键」**不可同时成立**（语义 Key 生成必须识别 `variable_id`/`target`/`arguments`/嵌套 `drive_object`） | **身份推导整体归 NCK Driver**：Driver 在**变量定义**中发布**规范身份模板**与**身份参数键集合**（Driver 数据），并在 Configure 时**重算 canonical identity 与持久化 `point_key` 逐字比对，不一致即拒绝**（唯一执行真值）；Frontend 只做**通用替换 / 消费驱动预览**；Core **只做通用格式校验 + 唯一性**，**不参与身份推导** | §2.1-3、§2.2、§2.3、§2.4、§2.4.2 D11、§2.6、§2.7、§2.8 #19–#21、§4.1.1 A–D、§4.2 R13/R14、§6.6 T3a/T3b/T4 |
+| **修订 5 = P0-2** | **Point Key 的规范输入类型编码** | 原 §4.1.1 只定义了**字符串**值的 NFC + 百分号编码；非字符串值（整数/浮点/布尔/null/对象/数组）**无确定性规则** ⇒ `1` 与 `"1"`、`1.0` 与 `1`、对象键序、嵌套 `drive_object` 等均可能碰撞或跨运行时漂移 | 引入**类型标签编码**（`s/i/d/b/z/o/a`）+ **数字规范化**（`1.0`→`i:1`、`1e2`→`i:100`、`-0`→`i:0`、越界即拒）+ **对象键序无关（字节序升序）+ 显式括号 + 递归 + 深度上限** + **三态可区分**；**禁止**用运行时的 `String(value)`/`JSON.stringify(value)` 作为通用编码 | §4.1.1 E–K、§2.2/§2.3 示例、§6.1/§6.2/§6.3 单测、§6.6 T5 |
+| 附加 1 | **Native 冲突后缀必须用户显式确认** | `~2` 需用户确认（方向已对），但需明确它**不是**身份生成器自动产生的标准后缀 | `~<n>` 是 UI 给出的**建议逻辑 Key**，**必须用户显式确认**；**Core 只负责唯一性，不得替用户静默改名** | §4.1.1 K、§4.1.2、§6.3 |
+| 附加 2 | **`DIGESTS.lock` 防「同时改定义与 Lock」** | 普通 CI 只比对「当前文件 vs 当前 Lock」，**挡不住**开发者同时修改两者 | 必须**对照基线分支**校验：已发布的 `(variable_id, revision)` **不可变化**，**只允许新增 revision** | §3.1、§6.2、§6.6 T6、§8.2（**阶段归属：PR-B，不阻塞 PR-A**） |
+
+**本次修订对上一版的具体推翻 / 修正**（逐条对应正文，详见 §4.1.1 A–D 与 §4.1.2）：
+
+1. **推翻**「`enc` + 模板拼装 + 排序是 **Core 侧纯函数**」（原 §4.1.1 第 10 条）⇒ 身份推导归 **Driver**；Core 只保留**通用键格式校验器**与**类型标签编码器**（后者只用于判定「规范形式」，**不用于身份推导**）。
+2. **推翻**「值中出现 `~` 原样输出」（原 §4.1.1 第 2 条的原始字符集取 RFC 3986 unreserved，含 `~`）⇒ `~` **必须**编码为 `%7E`，否则与用户确认的 `~<n>` 后缀碰撞（反例 R9/E10）。
+3. **修正**「`native` 是保留前缀（因 `variable_id` 必含 `.`，故不可能等于 `native`）」（原 §4.1.1 第 9 条）⇒ 该论证**不成立**（`native.foo` 合法）；改为**显式保留前缀规则**（§E）。
+4. **修正**「用户可修改 `point_key`」（原 §4.1.2 第 2 条，无条件）⇒ 仅 **`nck_native` 高级模式（`identity_mode="user"`）** 允许；`nck_variable` 的 `point_key` **必须**逐字等于 Driver 重算的 canonical identity。
+5. **修正**原 §4.1.1 的 `drive_object` 示例（`@drive_object=3,entry=nc_variable`）与 §2.4.1 的**实际结构**（`drive_object:{number,entry}`）**不一致** ⇒ 改为递归对象编码 `@drive_object=o:{entry=s:nc_variable,number=i:3}`（§K 给出完整推导）。
+6. **修正**原 §4.3 要求契约套件用 **Core 侧推导函数**构造语义 Key ⇒ 改为**字面量冻结 Key**；「revision 更新后身份稳定」的证据移到 **Driver 侧**（T3b），Core 侧只证明「身份**仅由** `point_key` 决定，`parameters` 不参与」（T3a）。
 
 ---
 
@@ -152,6 +172,7 @@
 | F13 | `src/connection/**` 共 9 个文件（3 个测试） | `apps/mesa-web/src/connection/*` |
 | F14 | 前端实测基线：**33 文件 / 383 用例全过**（本次实跑） | `pnpm test` @ `0d686b4` |
 | F15 | 受影响的 7 个文件合计 **119 用例**（本次实跑）；连接组 3 文件 **134 用例** | 见 §6.0 |
+| F16 | `point_key` 是**用户可编辑**输入框，冲突时**报错要求改名**（不静默改名）；但「加入」时 `suggestPointKey` 会**静默**追加 `.2/.3`（该静默路径即 §4.1.2 第 3 条要废弃的行为） | `apps/mesa-web/src/components/ResourcePickerAntd.tsx:227-230`、`:233-235`、`:278`（报错改名）；`:146` 调用 `:41-51`（静默递增） |
 
 ---
 
@@ -164,14 +185,14 @@
 | 路径 | 现状职责 | 判定 | 理由 | 影响面 |
 |---|---|---|---|---|
 | `crates/core-types/src/point.rs` | 不存在（`crates/core-types/src/` 现有 7 个模块，无 point） | 新增 | Core 需要显式**通用点位信封**承载「一个任务多点位」；`FieldType` 12 扁平标量（B4）与 `UNKNOWN_FIELD`（B5）表达不了嵌套对象 | 新增公开类型**仅** `PointSelection`/`PointBinding`（**信封层严格 + `parameters` 不透明**）；**不含任何 Siemens 类型**（修订 1）；不改 `SchemaDescriptor`（B6） |
-| `crates/core-types/src/point.rs` 内的 `NCK_POINTS_BINDING_KIND`（**Task Binding Kind**）与 `point_key` 规范编码纯函数 | 不存在 | 新增 | 与 `GENERIC_BINDING_KIND`（B8）同构的常量，禁止魔数；`point_key` 规范编码必须是 Core 侧可复用的纯函数（§4.1.1） | Core 门禁与前端常量同源；**Core 侧不建立 Point Kind 白名单** |
-| `drivers/sinumerik-nck/src/definition.rs` | 不存在 | 新增 | 变量定义目录（`VariableDefinition`、revision、digest、来源、验证状态）与解析 | 驱动新增模块；`native.rs` 不动 |
-| `drivers/sinumerik-nck/src/compiler.rs` | 不存在（今天转换逻辑内联在 configure :670-683） | 新增 | Address Compiler 唯一入口：`PointSelection + VariableDefinition → ResolvedPoint`；含**参数层严格校验**（§2.4.2 的 D1–D9） | configure 改为调用它；`resolve_native` 仍为下游 |
+| `crates/core-types/src/point.rs` 内的 `NCK_POINTS_BINDING_KIND`（**Task Binding Kind**）、`point_key` **通用键语法校验器**与**类型标签编码器** | 不存在 | 新增 | 与 `GENERIC_BINDING_KIND`（B8）同构的常量，禁止魔数；Core 只做**通用格式校验**（§4.1.1 E/F/G/H） | Core 门禁与前端常量同源；**Core 侧不建立 Point Kind 白名单**；**Core 不提供身份推导 API**（`canonical_identity` 归 Driver，修订 4） |
+| `drivers/sinumerik-nck/src/definition.rs` | 不存在 | 新增 | 变量定义目录（`VariableDefinition`、revision、digest、来源、验证状态）与解析；含 **`identity_template`/`identity_keys`**（Driver 数据的规范身份契约，§4.1.1 C） | 驱动新增模块；`native.rs` 不动 |
+| `drivers/sinumerik-nck/src/compiler.rs` | 不存在（今天转换逻辑内联在 configure :670-683） | 新增 | Address Compiler 唯一入口：`PointSelection + VariableDefinition → ResolvedPoint`；含**参数层严格校验**（§2.4.2 的 D1–D10）与**身份重算**（D11：与持久化 `point_key` 比对，不一致 → `POINT_KEY_MISMATCH`） | configure 改为调用它；`resolve_native` 仍为下游 |
 | `drivers/sinumerik-nck/src/targets.rs` | 不存在 | 新增 | **Siemens 专用**：`TargetRef`（Channel/ModeGroup/Axis/Spindle/DriveObject）、`DriveObjectRef`、`DriveEntry`（module **26**/**130** 入口身份）的**定义与语义校验**；Core **不得**知道这些类型（修订 1） | 与 `identity_spec.rs` 的入口常量对齐（N16）；PR-B 首次定义 |
 | `drivers/sinumerik-nck/src/definitions/828d.json` | 不存在（今天只有 `presets/828d.json`） | 新增 | 定义目录数据文件，随驱动版本发布（决策 3） | 编译期内嵌 `include_str!`，与 `presets.rs:23` 同模式 |
 | `drivers/sinumerik-nck/tests/definition_catalog.rs` | 不存在 | 新增 | 定义目录完整性/revision/digest 断言 | 新测试目标，需登记 `scripts/contract_suites.py` 之外（驱动自有目标，不进契约名单） |
 | `drivers/sinumerik-nck/tests/semantic_equivalence.rs` | 不存在（`legacy_equivalence.rs` 是模板路径版） | 新增 | 语义路径逐条复现 62 条冻结字节 | 62 条 golden 的**新**等价门；旧门保留（见 1.3） |
-| `apps/mesa-web/src/nckPointModel.ts` | 不存在 | 新增 | NCK 语义点位的纯函数层：payload 构造、`point_key` 推导、target/arguments 默认值、必填预检 | 纯函数，不 import React/AntD（与 `resourceSelectionModel.ts:18` 同纪律） |
+| `apps/mesa-web/src/nckPointModel.ts` | 不存在 | 新增 | NCK 语义点位的纯函数层：**消费 Driver 发布的 `identity_template`/`identity_keys` 做通用替换**、payload 构造、target/arguments 默认值、必填预检 | 纯函数，不 import React/AntD（与 `resourceSelectionModel.ts:18` 同纪律）；**不实现 Siemens 语义、不自行决定身份键集合、不自行排序**（修订 4） |
 | `apps/mesa-web/src/components/NckPointFields.tsx` | 不存在 | 新增 | NCK 专用语义表单（变量选择 + target + arguments），**不改** `DescriptorFields.tsx` | 新组件；`DescriptorFields` 语义冻结 |
 | `apps/mesa-web/src/nckPointModel.test.ts` | 不存在 | 新增 | 上述纯函数单测 | 新用例，计入新增 |
 | `apps/mesa-web/src/components/NckPointFields.test.tsx` | 不存在 | 新增 | 语义表单渲染/必填/target 校验 | 新用例，计入新增 |
@@ -187,7 +208,7 @@
 | `drivers/sinumerik-nck/src/lib.rs:596-739` | configure：读 `GenericBinding` → 逐 output → 原生解析 | 重构 | 改为按 **Point Kind** 路由到 Address Compiler（Point Kind 语义校验与参数层校验均在 Driver 侧，§2.4.2）；删掉 `resource_id`/`output` 硬校验（:644、:653） | 驱动 configure 契约；`resolve_native` 与 PDU 预检（:691-714）保留 |
 | `drivers/sinumerik-nck/src/lib.rs:170-330` | Descriptor 的 `variable` 资源 = 12 原生字段 | 重构 | 语义模式下用户不得面对原生字段；`nck_native` 走独立高级路径 | Descriptor 资源面变化（§5-4）；`descriptor_contract.rs:728-731` 需改 |
 | `drivers/sinumerik-nck/src/lib.rs:324-327` | `resource_selection_methods=[Manual,Browse]` | 重构 | 语义表单不走 Resource 参数渲染；browse 语义重做（§5-5） | `discovery_contract.rs:224-269` 需改 |
-| `drivers/sinumerik-nck/src/presets.rs:151-186` | 模板叶 `binding_json = {resource_id:"variable",parameters:{原生字段}}` | 重构 | 浏览叶必须产出**语义载荷**（`nck_variable` + target/arguments），否则前端仍被迫构造原生字段 | `browseModel.ts` 映射需扩展（F10） |
+| `drivers/sinumerik-nck/src/presets.rs:151-186` | 模板叶 `binding_json = {resource_id:"variable",parameters:{原生字段}}` | 重构 | 浏览叶必须产出**语义载荷**（`nck_variable` + target/arguments），**并附带 Driver 的 `identity` 块**（`template`/`keys`/`preview_point_key`，§4.1.1 C），否则前端仍被迫构造原生字段或自行推导身份 | `browseModel.ts` 映射需扩展（F10）；`identity` **不得**进入持久化信封 |
 | `apps/mesa-web/src/deviceModel.ts:203-210` | `ResourceSelection` 形状 + `CANONICAL_RESOURCES_KIND` | 重构 | 需新增 NCK canonical 形态与 kind 常量 | 影响 `deviceModel.test.ts`、`EndpointAcquisitionPane` |
 | `apps/mesa-web/src/deviceModel.ts:231-252` | `splitAcquisitionTasks`/`selectionsOf` 只认 `mesa.resources.v1` | 重构 | 必须同时识别 NCK kind，否则编辑 NCK Endpoint 时任务被当成 preserved 或被丢弃 | 数据安全关键路径（F5） |
 | `apps/mesa-web/src/deviceModel.ts:280-304`（:301） | Binding 装配**真值 1** | 重构 → **收敛** | 与 `bootstrap.ts:138` 合并为唯一装配入口（决策 7） | 双真值消除；两处调用方同步 |
@@ -284,7 +305,7 @@
 
 1. Core **只按 Task Binding Kind 路由**：`DriverBinding.kind ∈ {mesa.resources.v1, nck.points.v1}`，其余仍 `UNSUPPORTED_BINDING`（复用 `crates/core-api/src/lib.rs:244`）；**不做「未知 kind 静默放行」**。
 2. Core **不建立 NCK Point Kind 白名单**：不枚举 `nck_variable`/`nck_native`，只要求 `PointSelection.kind` 是**非空字符串**。
-3. Core **不解释** `parameters` 内任何键（不认识 `variable_id`/`definition_revision`/`target`/`arguments`/`module`/`entry`），只要求它是 **JSON 对象**。
+3. Core **不解释** `parameters` 内任何键（不认识 `variable_id`/`definition_revision`/`target`/`arguments`/`module`/`entry`/`identity_mode`），只要求它是 **JSON 对象**；**也不得**从 `parameters` 推导 `point_key`（身份推导归 NCK Driver，修订 4 → §4.1.1 A–D）。
 4. Point Kind 的语义校验、Target 合法性、地址合法性**全部归 NCK Driver**（§2.4.1、§2.4.2、§2.8）。
 
 **为什么需要任务层信封，而不是把 Point Kind 提到任务层**：
@@ -300,7 +321,7 @@
 ```jsonc
 {
   "kind": "nck_variable",                          // Point Kind
-  "point_key": "channel.r_parameter#index=100@channel=1",   // 点位身份，Endpoint 内唯一，见 §4
+  "point_key": "channel.r_parameter#index=i:100@channel=i:1",   // 点位身份（规范类型标签编码，§4.1.1），Endpoint 内唯一，见 §4
   "parameters": {                                  // 对 Core 不透明；Driver 严格校验
     "variable_id": "channel.r_parameter",          // 必填，string，必须命中驱动定义目录
     "definition_revision": 1,                      // 必填，integer >= 1，必须能被驱动解析（§3）
@@ -313,7 +334,7 @@
 | 字段 | 类型 | 必填 | 取值 | Core 校验（**仅信封层**） | Driver 校验（**参数层，唯一负责人**） |
 |---|---|---|---|---|---|
 | `kind` | string | 是 | 非空字符串；语义取值 `nck_variable` | **仅判非空**（`EMPTY_POINT_KIND`；**无白名单**） | 取值必须为 `nck_variable`，否则 `UNSUPPORTED_POINT_KIND` |
-| `point_key` | string | 是 | 规范编码（§4.1.1）、非空、Endpoint 内唯一 | 非空 + 规范编码/长度/NFC + 唯一（`DUPLICATE_POINT_KEY`，B9） | 不解释，仅回传 |
+| `point_key` | string | 是 | **规范类型标签编码**（§4.1.1）、非空、Endpoint 内唯一 | **只做通用格式校验**：非空 + 键语法 + 规范载荷 + NFC + 长度 + 唯一（`DUPLICATE_POINT_KEY`，B9）；**不推导身份** | **重算 canonical identity 并逐字比对**：不一致 → `POINT_KEY_MISMATCH`（§2.4.2 D11） |
 | `parameters` | object | 是 | 不透明 JSON 对象 | **只判是 object**（`INVALID_PARAMETERS`） | 反序列化到自己的强类型 |
 | `parameters.variable_id` | string | 是 | `^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$` | **不校验**（Core 不知道此键存在） | 形状 + 目录命中，否则 `UNKNOWN_VARIABLE` |
 | `parameters.definition_revision` | integer | 是 | `>= 1` | **不校验** | 解析不到 → `UNSUPPORTED_DEFINITION_REVISION`（**拒绝运行**，不退化） |
@@ -322,7 +343,7 @@
 | 信封层未知字段 | — | — | 不得出现 | `deny_unknown_fields` → `UNKNOWN_FIELD`（**不得静默丢弃**） | — |
 | `parameters` 层未知字段 | — | — | 不得出现 | **不校验**（参数层不透明） | 未知键即拒 → `INVALID_BINDING_CONFIG`（§2.4.2 D2） |
 
-**Core 禁止（修订 1，写进测试）**：不校验 `variable_id` 是否是已知变量、不校验 `definition_revision` 是否可解析、不校验 `target` 形态、不校验 `index` 范围、**不建立 `nck_variable`/`nck_native` 白名单**、不知道 `channel`/`module`/`entry` 之外任何 Siemens 语义（职责边界）。
+**Core 禁止（修订 1，写进测试）**：不校验 `variable_id` 是否是已知变量、不校验 `definition_revision` 是否可解析、不校验 `target` 形态、不校验 `index` 范围、**不建立 `nck_variable`/`nck_native` 白名单**、不知道 `channel`/`module`/`entry` 之外任何 Siemens 语义（职责边界）。**Core 也不生成、不重算 `point_key`**（修订 4）：Core 不知道「哪些键进入身份、以何顺序」，因此身份只能由 Driver 生成并在 Configure 时校验（§4.1.1 A–D）。
 
 ### 2.3 Point Kind `nck_native`（高级原生地址）
 
@@ -342,13 +363,16 @@
     "transport_size": "0x09",    // 必填 enum: 0x05|0x06|0x07|0x09
     "invalid_value": -200.0,     // 可选 number（须与 invalid_tolerance 成对）
     "invalid_tolerance": 0.001,  // 可选 number 0..=1（须与 invalid_value 成对）
-    "unit": "mm"                 // 可选 string，非空且 <= 32 字符
+    "unit": "mm",                // 可选 string，非空且 <= 32 字符
+    "identity_mode": "derived"   // 可选 enum: derived（默认）| user；user 仅本高级模式允许（§4.1.1 D / §4.1.2）
   }
 }
 ```
 
+**`identity_mode`（修订 4 / 附加 1）**：`derived`（默认）⇒ `point_key` **必须**等于 Driver 按地址重算的 `native.<area>.<area_no>.<module>.<column>.<line>`；`user` ⇒ `point_key` 是用户**显式选择**的逻辑身份（**不是**地址的函数），Driver **不重算**、**不静默改名**。该键位于 `parameters` 内，**Core 不解释**（修订 1 不变）。
+
 **Core 侧**：**不校验上表任何字段**——`parameters` 对 Core 是**不透明对象**，Core **不知道** `area`/`module`/`decode` 这些键存在（修订 1）。Core 只保证「`parameters` 是 JSON 对象」且「信封层没有多余字段」。
-**Driver 侧**：对 `parameters` 做**严格校验**（未知字段即拒、JSON 类型、整数范围、`area`/`unit_mode`/`decode`/`transport_size` 枚举、`invalid_value` 与 `invalid_tolerance` 成对且容差 `0..=1`、`unit` 非空且 ≤32 字符），然后**完全复用** `NativeNckAddress::from_parameters`（N7–N9、N13–N15）——这是**零新增**解析代码，也是「62 条 golden 物理含义不变」的技术保证。
+**Driver 侧**：对 `parameters` 做**严格校验**（未知字段即拒、JSON 类型、整数范围、`area`/`unit_mode`/`decode`/`transport_size` 枚举、`invalid_value` 与 `invalid_tolerance` 成对且容差 `0..=1`、`unit` 非空且 ≤32 字符、`identity_mode` ∈ `{derived, user}`），然后**完全复用** `NativeNckAddress::from_parameters`（N7–N9、N13–N15）——这是**零新增**解析代码，也是「62 条 golden 物理含义不变」的技术保证。此外 Driver 还需按 `identity_mode` 执行身份一致性校验（§2.4.2 D11）：`derived` 必须与重算身份逐字相等。
 
 **与「不允许前端构造原生协议字段」（决策 1）的关系**——精确定义：
 
@@ -374,7 +398,7 @@ pub const NCK_POINTS_BINDING_KIND: &str = "nck.points.v1";
 #[serde(deny_unknown_fields)]      // 关键：B7 的静默丢弃必须在此终止
 pub struct PointSelection {
     pub kind: String,              // Point Kind：**只要求非空字符串**；Core 不建白名单（§2.1）
-    pub point_key: String,         // 规范编码（§4.1.1）、非空、Endpoint 内唯一
+    pub point_key: String,         // **通用格式校验**（§4.1.1 E–H）、非空、Endpoint 内唯一；**Core 不推导身份**
     pub parameters: serde_json::Map<String, serde_json::Value>,  // 不透明 JSON 对象
 }
 
@@ -384,6 +408,8 @@ pub struct PointBinding {
     pub points: Vec<PointSelection>,
 }
 ```
+
+**`point_key` 在 Core 的位置（修订 4 / P0-1 的落点）**：Core **只**做**通用格式校验**（§4.1.1 E/F/G/H）——非空、NFC、长度上限 256 字节、**通用键语法**（`base_key` 与可选 `~<n>` 后缀）、每个值段必须是**规范类型标签编码**、段内键名按字节序升序且不重复、Endpoint 内唯一。Core **不生成** canonical identity、**不读** `identity_template`、**不知道**哪些键是 Siemens Target/arguments、**不因** `parameters` 或 `definition_revision` 变化而重算 Key。因此「Core 不解释 `parameters`」（§2.4 参数层不透明）与「Core 校验 `point_key`」**不再矛盾**：**前者是语义（Driver 的职责），后者是通用语法（Core 的职责）**；「格式合法但身份错误」的 Key 由 Driver 在 Configure 时以 `POINT_KEY_MISMATCH` 拒绝（§2.4.2 D11）。
 
 **Core 不定义的类型（修订 1 的硬边界）**：`TargetRef`、`DriveObjectRef`、`DriveEntry`、`NativeAddress` 等 **Siemens 专用**类型**不得**出现在 `crates/core-types/**`（也不得出现在 `crates/core-api/**` 的校验逻辑里）；它们定义在 NCK Driver 侧（§2.4.1）。Core **不需要**知道 `DriveEntry` 与 NCK 地址的对应关系，**不应知道** Module **26**/**130**。
 
@@ -397,10 +423,10 @@ pub struct PointBinding {
 | `INVALID_PARAMETERS` | `parameters` 不是 JSON 对象（数组 / `null` / 标量） | 参数层的**唯一**约束 |
 | `EMPTY_POINT_KIND` | `kind` 为空字符串 | 通用约束，**不是**白名单 |
 | `EMPTY_POINT_KEY` | `point_key` 为空 | 通用约束 |
-| `INVALID_POINT_KEY` | `point_key` 不符合规范编码 / 超过长度上限 / 未 NFC 归一 | §4.1.1（**PR-A 必须确定**） |
+| `INVALID_POINT_KEY` | `point_key` 不符合**通用键语法 / 规范类型标签编码**（§4.1.1 E/F/G/H）/ 超过 256 字节 / 未 NFC 归一 / `~<n>` 后缀非法（`n<2` 或有前导零） | **仅通用格式**，**不判定身份正确性**（修订 4） |
 | `DUPLICATE_POINT_KEY` | Endpoint-wide 重复（复用 B9） | **跨 Task** 也唯一 |
 
-**Core 明确不做（逐条写进测试）**：不校验 `variable_id` 是否存在、不校验 `definition_revision` 是否可解析、不校验 `target` 形态与实例范围、不校验任何整数范围、**不建立 `nck_variable`/`nck_native` 白名单**、不解释 `parameters` 内任何键。
+**Core 明确不做（逐条写进测试）**：不校验 `variable_id` 是否存在、不校验 `definition_revision` 是否可解析、不校验 `target` 形态与实例范围、不校验任何整数范围、**不建立 `nck_variable`/`nck_native` 白名单**、不解释 `parameters` 内任何键、**不从 `parameters` 推导或重算 `point_key`**（修订 4）。
 
 **不改 `SchemaDescriptor`**（B6）：上述类型是**独立**于 Descriptor 的 Core 契约，不进入 `FieldType`，因此 Descriptor Major 保持 2。
 
@@ -457,6 +483,9 @@ Driver 把 `parameters` 反序列化到**自己的**强类型（`#[serde(deny_un
 | D8 | **`arguments`** 键/类型/范围/`ArgumentOffset` 上溢 | `INVALID_ARGUMENTS` |
 | D9 | **原生地址有效性**（`area`/`unit_mode`/`decode`/`transport_size` 枚举、无效值成对、容差 `0..=1`、`unit` ≤32 字符） | `INVALID_VARIABLE` |
 | D10 | **Module 26/130 入口身份**（`entry` → module 映射，与 `identity_spec.rs` 常量一致，**不允许折叠**） | `INVALID_TARGET`（缺 `entry`）/ 构建期自检 |
+| D11 | **`point_key` 与重算身份的一致性**（`identity_mode="derived"`：必须逐字相等；`identity_mode="user"`：**仅** `nck_native` 允许，Driver 不重算，但 Key 仍需通过通用语法校验） | `POINT_KEY_MISMATCH` / `INVALID_BINDING_CONFIG`（`identity_mode` 取值错，或 `user` 用于 `nck_variable`） |
+
+**D11 是「唯一执行真值」的落点（修订 4 / P0-1）**：Driver 用**经过 D1–D10 验证的语义字段**重算 `canonical_identity`，与信封中持久化的 `point_key` **逐字比对**；不一致即 `configure` **整体失败**（`POINT_KEY_MISMATCH`），任务**不得启动**，错误消息必须含「持久化 Key / 重算 Key / `variable_id` + `revision`」三要素。**唯一例外**：`nck_native` 且 `identity_mode="user"` 时 `point_key` 是用户**显式选择**的逻辑身份（§4.1.2），Driver **不重算**、**不静默改名**，但仍要求它通过通用语法校验（Core 已校验，Driver 复核）。**Core 不参与 D11 的任何一步**（Core 不重算、也无法重算）。
 
 ### 2.5 Driver 侧 `VariableDefinition`（**全部为 NCK Driver 侧类型**，Core 不可见）
 
@@ -481,7 +510,9 @@ pub struct VariableDefinition {
     pub unit_mode: NckUnitMode,               // 固定（全部定义均为 Current，G3）
     pub unit: Option<String>,                 // 展示单位（仅注释）
     pub invalid_rule: Option<InvalidRuleSpec>,// 无效值哨兵（如 r0035: -200/0.001，G7）
-    pub digest: String,                       // 定义摘要，lowercase hex SHA-256（§3.2）
+    pub identity_template: String,            // 规范身份模板（Driver 数据；**身份推导归 Driver**，§4.1.1 C）
+    pub identity_keys: Vec<IdentityKeySpec>,  // 身份所需的参数键集合（缺失/为 null 即拒；§4.1.1 C）
+    pub digest: String,                       // 定义摘要，lowercase hex SHA-256（§3.2；含身份模板与键集合）
 }
 
 pub enum DefinitionScope { Collect, Identity }   // Identity 仅供身份探针，不出现在用户点位面
@@ -628,7 +659,8 @@ pub struct CompiledPoint {
     pub address: NativeNckAddress,        // 复用现有类型（N8）
     pub resolved: ResolvedPoint,          // 复用现有类型（N8）
     pub source_label: String,             // 复用 native.rs:347-361 的稳定格式（N10）
-    pub definition: Option<DefinitionRef> // Semantic 时给出 (variable_id, revision, digest)
+    pub definition: Option<DefinitionRef>,// Semantic 时给出 (variable_id, revision, digest)
+    pub canonical_identity: String,       // Driver 重算的规范身份（§4.1.1 A/C）；configure 与持久化 point_key 比对
 }
 ```
 
@@ -638,6 +670,7 @@ pub struct CompiledPoint {
 2. `Native` 分支直接走 `NativeNckAddress::from_parameters`，与今天**逐字相同**（N7–N9）。
 3. `CompileInput::Native` 不得被 `Semantic` 路径内部调用（禁止「语义失败就退化到原生」）。
 4. Compiler **不读连接配置**、**不发网络请求**、**不查目录文件**（决策 3：定义随驱动内嵌）。
+5. **身份是 Driver 的产出**（修订 4）：`canonical_identity` 由 Driver 从**已验证的语义字段**重算（`identity_template` 替换 + §4.1.1 E–H 的类型标签编码）；`configure` 用它与信封中的 `point_key` 比对，不一致即 `POINT_KEY_MISMATCH`（§2.4.2 D11）。**Core 不参与该计算**，前端只做同一规范的通用替换（§4.1.1 B）。
 
 **错误类型**（`CompileError`，映射到 `SdkDriverError`，N16 风格的 `ErrorKind` + 稳定 code）：
 
@@ -653,7 +686,8 @@ pub struct CompiledPoint {
 | `INVALID_ARGUMENTS` | `Configuration` | 未知/缺失/越界/类型错的 argument | 是 |
 | `DEFINITION_DIGEST_MISMATCH` | `Internal` | 内嵌定义自检摘要不符（构建期问题） | 是 |
 | `INVALID_VARIABLE` | `Address` | 复用：`NativeNckAddress::from_parameters` 失败（N7–N9） | 是 |
-| `INVALID_BINDING_CONFIG` | `Configuration` | 信封/点位结构错、`parameters` 层未知字段或类型错（§2.4.2 D2/D3） | 是 |
+| `INVALID_BINDING_CONFIG` | `Configuration` | 信封/点位结构错、`parameters` 层未知字段或类型错（§2.4.2 D2/D3）、`identity_mode` 取值错或 `user` 用于 `nck_variable` | 是 |
+| `POINT_KEY_MISMATCH` | `Configuration` | 持久化 `point_key` ≠ Driver 重算的 `canonical_identity`（`identity_mode="derived"`，§2.4.2 D11；**唯一执行真值**） | 是 |
 | `UNSUPPORTED_BINDING` | `Unsupported` | **Task Binding Kind** 非 `nck.points.v1` | 是 |
 
 `INVALID_VARIABLE` 与 `UNSUPPORTED_BINDING` 的 code 与今天**完全一致**（`drivers/sinumerik-nck/src/lib.rs:615`、`:673`、`:681`），保证既有错误面不漂移。
@@ -666,7 +700,8 @@ pub struct CompiledPoint {
 | Core | `INVALID_STRUCTURE` | `crates/core-types/src/resource.rs:265` | 复用（信封结构） |
 | Core | `UNKNOWN_FIELD` | `crates/core-types/src/schema.rs:410` | 复用（**信封层** `deny_unknown_fields` 命中） |
 | Core | `DUPLICATE_POINT_KEY` | `crates/core-types/src/resource.rs:352` | 复用（Endpoint-wide 唯一，**跨 Task**，B9） |
-| Core | `INVALID_PARAMETERS` / `EMPTY_POINT_KIND` / `EMPTY_POINT_KEY` / `INVALID_POINT_KEY` | 不存在 | **新增**（**信封层专属**；`INVALID_POINT_KEY` 见 §4.1.1） |
+| Core | `INVALID_PARAMETERS` / `EMPTY_POINT_KIND` / `EMPTY_POINT_KEY` / `INVALID_POINT_KEY` | 不存在 | **新增**（**信封层专属**）；`INVALID_POINT_KEY` = **通用键语法 + 规范类型标签编码**校验（§4.1.1 E/F/G/H），**不含**身份正确性判定（修订 4） |
+| Driver | `POINT_KEY_MISMATCH` | 不存在 | **新增**：重算 `canonical_identity` ≠ 持久化 `point_key`（**唯一执行真值**，§2.4.2 D11） |
 | Core | ~~`INVALID_TARGET`~~ | 不存在 | **不新增**：Core **不认识 Target**（修订 1 已把该校验移出 Core） |
 | Driver | `UNSUPPORTED_POINT_KIND` | 不存在 | **新增**（**Point Kind** 取值校验；替代初稿放在 Core 的白名单） |
 | Driver | `UNKNOWN_VARIABLE` / `UNSUPPORTED_DEFINITION_REVISION` / `UNSUPPORTED_TARGET` / `MISSING_TARGET` / `INVALID_TARGET` / `INVALID_ARGUMENTS` | 不存在 | **新增**（**参数层语义专属**，§2.4.2） |
@@ -686,8 +721,8 @@ pub struct CompiledPoint {
 | 5 | **Point Kind 语义** | ❌ **不建立白名单**（不枚举取值） | ✅ `UNSUPPORTED_POINT_KIND` |
 | 6 | **信封层未知字段拒绝** | ✅ `deny_unknown_fields` → `UNKNOWN_FIELD` | — |
 | 7 | **`parameters` 层未知字段拒绝** | ❌ 不解释（参数层不透明） | ✅ `INVALID_BINDING_CONFIG` |
-| 8 | **`point_key` 非空** | ✅ `EMPTY_POINT_KEY` | — |
-| 9 | **`point_key` 规范编码 / NFC / 长度上限 256 字节** | ✅ `INVALID_POINT_KEY`（§4.1.1，PR-A 必须确定） | — |
+| 8 | **`point_key` 非空** | ✅ `EMPTY_POINT_KEY` | ✅ 复核 |
+| 9 | **`point_key` 通用格式**（键语法 / 规范类型标签编码 / NFC / 长度上限 256 字节 / `~<n>` 后缀语法） | ✅ `INVALID_POINT_KEY`（§4.1.1 E–H） | ✅ 复核（**不裁决身份**） |
 | 10 | **`point_key` Endpoint 内唯一（跨 Task）** | ✅ `DUPLICATE_POINT_KEY`（B9/R5） | ❌ 不裁决身份 |
 | 11 | **`variable_id` 存在性**（目录命中） | ❌ 不知道变量名清单 | ✅ `UNKNOWN_VARIABLE` |
 | 12 | **`definition_revision` 可解析性** | ❌ 不解析 revision（§3.3） | ✅ `UNSUPPORTED_DEFINITION_REVISION`，**不得回落最新** |
@@ -697,8 +732,11 @@ pub struct CompiledPoint {
 | 16 | **原生地址有效性**（枚举、无效值成对、容差、`unit` 长度） | ❌ 不知道 `area`/`module` 等键存在 | ✅ `INVALID_VARIABLE`（复用 N7–N9） |
 | 17 | **Module 26/130 入口身份**（`entry` → module，**不允许折叠**） | ❌ **不应知道 Module 26/130** | ✅ `INVALID_TARGET`（缺 `entry`）+ `identity_spec.rs` 常量对齐（N16/G8） |
 | 18 | **`display_name` / `label` 等展示文案** | ❌ 不参与身份（R6/R11） | ❌ 不参与身份与寻址（§4.1.2） |
+| 19 | **canonical identity 生成**（`identity_template` 替换 + 类型标签编码 + 段序） | ❌ **不生成**（不读模板、不知道身份键集合、不排序） | ✅ **唯一实现**（`definition.rs` 的模板 + `compiler.rs` 的重算）；Frontend 仅按驱动模板做**通用替换** |
+| 20 | **`point_key` 与重算身份的一致性**（唯一执行真值） | ❌ 不做（Core 无法也不应重算） | ✅ `POINT_KEY_MISMATCH`（§2.4.2 D11），configure 整体失败 |
+| 21 | **用户显式逻辑 Key**（`nck_native` + `identity_mode="user"`） | ❌ 不解释（`parameters` 不透明） | ✅ 仅 `nck_native` 允许；**不得**静默改名（Core 只负责唯一性，附加 1） |
 
-**共 18 项**。其中 Core 独立负责 8 项（#1–#4、#6、#8–#10），Driver 独立负责 8 项（#5、#7、#11–#17 中除 #1–#4 复核外的语义项），展示文案 1 项（#18）双方均不参与。
+**共 21 项**。其中 Core 独立负责 8 项（#1–#4、#6、#8–#10），Driver 独立负责 12 项（#5、#7、#11–#17、#19–#21），展示文案 1 项（#18）双方均不参与。**#19–#21 是修订 4（P0-1）的直接落点：身份推导与一致性裁决都不在 Core**。
 
 ---
 
@@ -714,6 +752,11 @@ pub struct CompiledPoint {
 - **已发布的 (variable_id, revision) 定义不可原地修改**（评审硬约束）。任何字段变化（含 `semantics_status`、`label`、`source`、`unit`）都必须发布**新 revision**，旧 revision 原样保留在目录中。**原地修改**（含「只改一个 label」）一律视为违规，由 §3.2 的摘要清单在 CI 拦截。
 - 驱动**同时携带**同一 `variable_id` 的多个 revision（历史点位引用的 revision 必须仍可解析，否则老配置会在驱动升级后无法运行）。
 - 实施约束：定义目录数据文件按 `revision` 分文件存放（`definitions/828d/r1.json`、`r2.json`…），装载时合并；CI 断言「已存在的 (variable_id, revision) 文件内容不得被修改」——通过**摘要清单**（`definitions/828d/DIGESTS.lock`）冻结，改动即测试失败。
+- **`DIGESTS.lock` 必须对照基线分支校验（附加 2；阶段归属：PR-B，不阻塞 PR-A）**：普通 CI 只做「重算当前文件 vs 当前 Lock」，**挡不住**开发者**同时**修改定义文件与 Lock（两者一起改即自洽通过）。因此 PR-B 必须实现以 **PR base（基线分支，默认 `main`）** 的 `definitions/828d/DIGESTS.lock` 为基线的三条断言：
+  1. 基线中**已存在**的 `(variable_id, revision)`：其 digest 与文件内容**逐字不变**（变化即失败，**不得**靠同步更新 Lock 通过）；
+  2. 新分支中**新增**的 `(variable_id, revision)`：**允许**（**只允许新增 revision**），但仍必须通过 §3.2 的摘要自检与 §3.4 的 golden 义务；
+  3. 基线中存在、新分支中**缺失**的 `(variable_id, revision)`：**失败**（不得删除已发布 revision，见上条「驱动同时携带多个 revision」）。
+  该步骤**在 PR-B 完成**；PR-A 不引入定义目录与 Lock，因此**不阻塞 PR-A**。
 
 ### 3.2 摘要算法与稳定性要求
 
@@ -724,6 +767,10 @@ pub struct CompiledPoint {
   3. `digest` 字段本身**不参与**计算；
   4. 浮点用最短往返表示（`invalid_value=-200.0` 编码为 `-200.0`），非有限值直接报错（同 `event-store` 的 `finite_json` 纪律，`crates/event-store/src/lib.rs:149-152`）；
   5. 缺省可选字段**不出现**在 canonical 中（不得写成 `null`），否则「显式 null」与「缺省」会产生两个摘要。
+- **`identity_template` / `identity_keys` 属于定义语义**，因此**参与** digest（与 `label`/`unit`/`semantics_status` 同级）。由此推出两条硬性要求（修订 4）：
+  1. 对身份模板或身份键集合的任何改动 ⇒ **必须**发布新 revision；
+  2. 但**同一 `variable_id` 的所有 revision 必须给出逐字相同的 `identity_template`/`identity_keys`**——否则「仅 revision 变化 ⇒ `point_key` 不变」（R8）失效，旧点位会在驱动升级后被判为另一个点位。因此**修改身份模板不是新 revision，而是新 `variable_id`**（§3.5）。
+  该不变量由 `tests/definition_catalog.rs`（**PR-B**）断言；**Core 不读模板、不参与**（P0-1）。
 - 依赖：NCK 驱动需新增 `sha2 = { workspace = true }`（N19；workspace 已有 `sha2 = "0.10"`，`Cargo.toml:53`）。
 - **稳定性要求**：摘要必须只依赖**定义语义**，不得依赖编译时间、文件路径、驱动版本号。因此：
   - 驱动版本号**不进**定义摘要；
@@ -760,6 +807,7 @@ pub struct CompiledPoint {
 | `arguments` 语义变化（同一 `index` 指向不同物理量） | **新 Variable ID** | 等价于物理含义变化 |
 | `TargetRef` 结构变化导致同一 target 映射到不同 `area_no`/`line` | **新 Variable ID** | 旧点位的 target 会被重新解释 |
 | **重新命名**（`variable_id` 改名但字节不变） | **新 Variable ID + 显式别名记录**，且**必须**在 `DIGESTS.lock` 与映射表中逐一说明 | 「重新命名不代表重新解释已验证的请求字节」——62 条对应关系必须可追溯 |
+| **`identity_template` / `identity_keys` 变化**（同一 target/arguments 映射到**不同身份**） | **新 Variable ID** | revision 只能表达「定义修正」，**不能**改变点位身份（R8）；身份模板变化若走 revision 会让老点位在驱动升级后改身份 |
 
 ---
 
@@ -771,79 +819,233 @@ pub struct CompiledPoint {
 
 **评审批准的基本方向（保留不变）**：同一语义变量 + Target + Arguments → 同一默认身份；Revision 变化 → **不**自动产生新 Point ID；Target 或 Arguments 变化 → 产生新的默认身份；Native 与 Semantic **不能互相顶替**。
 
-在此基础上，本次补充两项（修订 3）：**4.1.1 Canonical Key 必须无歧义**、**4.1.2 Point Key 不是物理地址**。
+在此基础上，本次补充两项（修订 3）：**4.1.1 Canonical Key 必须无歧义**、**4.1.2 Point Key 不是物理地址**；第二轮复审再补两项：**4.1.1 A–D 身份生成权归 Driver（修订 4 / P0-1）**、**4.1.1 E–K 类型标签编码（修订 5 / P0-2）**。
 
-#### 4.1.1 Canonical Key 的语法与规范编码（修订 3-其一）
+#### 4.1.1 Point Key 的生成权与规范编码（修订 3-其一；**修订 4 = P0-1 / 修订 5 = P0-2**）
 
-**目标**：**禁止不同输入生成同一个 Key**。做法是把「结构分隔符」与「值」严格分离——分隔符只由模板产出，**值一律规范编码**。
+**目标**：**禁止不同输入生成同一个 Key**，并**禁止两处实现漂移**。为此必须把两件事严格分开：**「谁生成身份」**（修订 4）与**「值如何编码」**（修订 5）。做法仍是把「结构分隔符」与「值」严格分离——分隔符只由**驱动发布的身份模板**产出，**值一律按类型标签规范编码**。
 
 **三条不变量（保留）**：
 
 | 不变量 | 内容 | 理由 |
 |---|---|---|
-| **I1 含 target** | target 变体必须出现（如 `@channel=1`、`@axis=3`） | 同一变量的不同实例必须是不同点位 |
-| **I2 含 arguments** | 所有**显式提供**的 argument 按键名升序出现（如 `#index=100`） | 同一变量的不同索引必须是不同点位 |
+| **I1 含 target** | target 变体必须出现（如 `@channel=i:1`、`@axis=i:3`） | 同一变量的不同实例必须是不同点位 |
+| **I2 含 arguments** | 所有**显式提供**的 argument 按键名升序出现（如 `#index=i:100`） | 同一变量的不同索引必须是不同点位 |
 | **I3 不含 `definition_revision`** | revision **绝不**进入 `point_key` | revision 修正不得改变点位身份（§3.5「仅寻址定义修正 → 新 revision」必须保住 point_id） |
 
-**语法**：
+**A. 两个概念必须分开（修订 4）**
 
-```text
-point_key    := semantic_key | native_key
-semantic_key := variable_id [ "#" arglist ] [ "@" targetlist ]
-arglist      := arg ("," arg)*        arg := arg_key "=" enc(value)
-targetlist   := tgt ("," tgt)*        tgt := target_key "=" enc(value)
-native_key   := "native." area "." dec(area_no) "." dec(module) "." dec(column) "." dec(line)
+| 概念 | 定义 | 生成者 | 用途 |
+|---|---|---|---|
+| **canonical identity** | 由**经过验证的语义字段**（`variable_id` + target + arguments；或 native 地址）按 §C 的身份契约生成的规范身份串 | **NCK Driver**（唯一实现） | 身份等价判定 / 重复检测 / Configure 时与持久化 Key 比对 |
+| **point_key** | **Core 持久化**的稳定逻辑身份（`PointSelection.point_key`，Endpoint 内唯一，`point_id` 由它派生） | **默认 = Driver 的 canonical identity**；**高级 Native 模式**（`identity_mode="user"`）允许用户**显式选择**不同的逻辑身份（Native Key **不是**地址的函数） | 持久化身份、`point_id` 分配、墓碑复用（§4.2） |
+
+- **默认两者一致**，且该一致性由 **Driver 在 Configure 时强制**（§D），**不由 Core 推断**。
+- **语义点位（`nck_variable`）不允许用户改写 Key**：`point_key` **必须**逐字等于 canonical identity，否则 `POINT_KEY_MISMATCH`；用户可改的只有 `display_name`（§4.1.2）。
+- **原生高级点位（`nck_native` + `identity_mode="user"`）**：`point_key` 是用户**显式选择**的逻辑身份，Driver **不重算**、**不静默改名**。
+
+**B. 三方职责（修订 4 的裁决原文落实）**
+
+| 角色 | 必须做 | **不得做** |
+|---|---|---|
+| **NCK Driver** | ① 在**变量定义**中发布**规范身份模板** `identity_template` 与**身份所需的参数键集合** `identity_keys`（**Driver 数据**，不是 Core/Frontend 逻辑）；② 浏览/预填载荷给出 `identity_preview`；③ 严格校验 `parameters`（§2.4.2 D1–D10）后**重算 canonical identity** 并与持久化 `point_key` 比对，**不一致即拒绝**；④ 维护类型标签编码器的**参考实现与 golden 向量**（唯一权威） | 不把身份推导下沉给 Core/Frontend；不静默改写用户 Key；不用运行时的 `String()`/`JSON.stringify()` 作为编码 |
+| **Frontend** | ① **消费**驱动发布的身份模板做**通用替换**（共用 §F 的编码规范）得到「**建议逻辑 Key**」；② Native 高级模式下允许用户**显式**改名并确认；③ 驱动不可达且无缓存模板时**禁止提交语义点位** | **不实现 Siemens 语义**；不由 `variable_id` 反推 target/arguments；不自行决定哪些键进入身份；**不自行排序**；不静默追加 `~<n>` |
+| **Core** | ① `point_key` **通用格式校验**（非空、NFC、长度、键语法、规范类型标签编码、段内键名升序去重、`~<n>` 后缀语法）；② Endpoint 内唯一；③ 持久化 | **不生成** canonical identity；**不读** `identity_template`；**不认识** Target；**不因** `parameters`/`definition_revision` 变化重算 Key |
+
+**C. Driver 发布的身份契约（Driver 数据）**
+
+```rust
+pub struct VariableDefinition {
+    // ...既有字段（§2.5）
+    /// 规范身份模板：Driver 数据。占位符 {<path>} 引用 target/arguments 的点分叶路径；
+    /// 模板**已按 §H 的段序规则写成规范顺序**，消费方**不得重排**。
+    pub identity_template: String,
+    /// 身份所需的参数键集合（点分叶路径 + 是否必填）；**身份计算前**校验，缺失即拒。
+    pub identity_keys: Vec<IdentityKeySpec>,
+}
+
+pub struct IdentityKeySpec { pub path: String, pub required: bool }
 ```
 
-**编码函数 `enc`（逐步固定，不得依赖任何库的默认行为）**：
-
-1. **Unicode 规范化**：先对值做 **NFC**；规范化失败 → 拒绝该点位（`INVALID_POINT_KEY`），**不得**原样透传。
-2. **逐字节百分号编码**：对 NFC 后的 **UTF-8 字节**逐个处理——
-   - 字节 ∈ 未保留集 `A-Z a-z 0-9 - . _ ~`（RFC 3986 unreserved）→ **原样输出**；
-   - 否则输出 `%` + **两位大写十六进制**（`,` → `%2C`、`#` → `%23`、`=` → `%3D`、`@` → `%40`、`/` → `%2F`、`%` → `%25`、`轴` → `%E8%BD%B4`）。
-   - **`%` 本身必须被编码**（第 2 步对原始字节一次性完成，不允许「先转义非 ASCII、再补 `%`」的两遍做法，否则会与字面 `%XX` 文本碰撞，见 E2）。
-3. **键名（`arg_key`/`target_key`）不编码**：它们来自定义目录，必须匹配 `^[a-z][a-z0-9_]{0,63}$`；不匹配 → `INVALID_ARGUMENTS`/`INVALID_TARGET`（**绝不**静默编码）。
-4. **排序**：`arglist` 与 `targetlist` **各自**按**键名字节序升序**排列（同一语义载荷只有一种 Key）。
-5. **不物化缺省**：只有**显式提供**的 argument 进入 Key；缺省值**不得**物化（否则「前端是否填默认值」会改变身份）。
-6. **空字符串是显式值**：`{"index":""}` → `#index=`，与「不提供 `index`」（无 `#` 段）是**两个不同 Key**。
-7. **`native_key` 的数值段**用**十进制 ASCII**（无前导零）；`area` 用 `NckArea` 的规范字母（N11 的 7 个之一）。
-8. **长度上限**：`point_key` 的**规范编码后** UTF-8 字节数 **≤ 256**。依据：① 全部 42 条定义的默认 Key 实测最长 **≤ 64 字节**（如 `drive.motor.temperature@drive_object=130,entry=nc_variable` = 59 字节），256 字节留 ≥4 倍余量；② `point_key` 是 SQLite 索引列（`config-store` 的 Endpoint 内唯一约束），超长键恶化 B-tree 扇出与索引记录大小，而唯一性**只在 Endpoint 内**，不需要跨 Endpoint 前缀；③ 256 字节保证 Key 在日志、表格、UI 中单行可完整展示（可运维性）。超限 → `INVALID_POINT_KEY`，**不得截断**（截断会制造碰撞）。
-9. **可解析性前提**：`variable_id` 的字符集（`^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$`）不含 `#`/`@`/`,`/`=`；值经 `enc` 后也不含这些字符；因此**首个 `#`/`@` 的位置无歧义**，Key 可被唯一反解。`native` 是保留前缀（`variable_id` 必须含 `.`，故不可能等于 `native`）。
-10. **实现归属**：`enc` + 模板拼装 + 排序 + 长度/NFC 校验是 **Core 侧纯函数**（`crates/core-types/src/point.rs`），前端 `nckPointModel.ts` **复用同一规则**（PR-A 冻结，PR-C 消费）；**Driver 不重算 Key**（只回传）。
-
-**歧义示例（有风险的输入 → 规范编码后必得不同 Key）**：
-
-| # | 风险类别 | 输入 A | 输入 B | 不做规范编码（错误） | 规范编码后（正确） |
-|---|---|---|---|---|---|
-| **E1** | 值里含**分隔符** | `channel.r_parameter`，args `{index:"1,position=2"}`，target `{channel:1}` | 同变量，args `{index:"1",position:"2"}`，target `{channel:1}` | 两者都是 `… #index=1,position=2@channel=1` ⇒ **碰撞** | A：`channel.r_parameter#index=1%2Cposition%3D2@channel=1`；B：`channel.r_parameter#index=1,position=2@channel=1` |
-| **E2** | 值里含**字面 `%`**（与百分号编码互撞） | args `{name:"轴"}` | args `{name:"%E8%BD%B4"}` | 若只转义非 ASCII 而不转义 `%`：两者都是 `#name=%E8%BD%B4` ⇒ **碰撞** | A：`#name=%E8%BD%B4`；B：`#name=%25E8%25BD%25B4` |
-| **E3** | **非 ASCII / Unicode 规范化** | args `{name:"é"}`（U+00E9，NFC） | args `{name:"é"}`（`e`+U+0301，NFD） | 字节不同 ⇒ 同一**逻辑文本**得到**两个** Key（身份不稳定） | 两者 NFC 后同一码点 ⇒ 同一 Key `#name=%C3%A9`；而 `%C3%A9`（NFC 后）与 `e%CC%81`（若不做 NFC）**必不相同** |
-| **E4** | **空值 / 缺省参数** | args `{index:""}`（显式空串） | args `{}`（未提供，即使定义有 `default:0`） | 若把空串当「未提供」而省略整段（或物化缺省为 `#index=0`）⇒ **碰撞/身份漂移** | A：`channel.r_parameter#index=@channel=1`；B：`channel.r_parameter@channel=1` |
-| **E5** | 值里含 **`@`/`#`（可解析性歧义）** | args `{note:"x@channel=2"}`，target `{channel:1}` | args `{note:"x"}`，target `{channel:2}` | A 变成 `#note=x@channel=2@channel=1`：解析器**无法判断**第一个 `@` 属于值还是 target 段 | A：`#note=x%40channel%3D2@channel=1`（值内的 `@`/`=` 全部编码）；B：`#note=x@channel=2`。两者可唯一反解 |
-
-**默认 Key 示例**（**默认值**，用户可改名；Endpoint 内唯一）：
-
-| 载荷 | 默认 `point_key` |
+| 变量 | `identity_template` |
 |---|---|
-| `channel.r_parameter`, target `{channel:1}`, args `{index:100}` | `channel.r_parameter#index=100@channel=1` |
-| `channel.program.status`, target `{channel:1}`, args `{}` | `channel.program.status@channel=1` |
-| `axis.position.commanded_mcs`, target `{channel:1, axis:3}` | `axis.position.commanded_mcs@axis=3,channel=1` |
-| `spindle.speed.actual`, target `{channel:1, spindle:1}` | `spindle.speed.actual@channel=1,spindle=1` |
-| `drive.motor.temperature`, target `{drive_object:{number:3, entry:"nc_variable"}}` | `drive.motor.temperature@drive_object=3,entry=nc_variable` |
-| `nck_native`, params `area=C,area_no=1,module=21,column=1,line=396` | `native.C.1.21.1.396` |
-| `nck_native`, 同上地址但**逻辑用途不同**（§4.1.2） | `native.C.1.21.1.396~2`（默认建议值，用户可改） |
+| `channel.program.status` | `channel.program.status@channel={channel}` |
+| `channel.r_parameter` | `channel.r_parameter#index={index}@channel={channel}` |
+| `axis.position.commanded_mcs` | `axis.position.commanded_mcs@axis={axis},channel={channel}` |
+| `spindle.speed.actual` | `spindle.speed.actual@channel={channel},spindle={spindle}` |
+| `drive.motor.temperature` | `drive.motor.temperature@drive_object={drive_object}` |
+| `nck_native`（`identity_mode="derived"`） | **无定义**，Driver 固定规则：`native.<area>.<area_no>.<module>.<column>.<line>` |
 
-**排序规则**：target 与 arguments 的键**一律按键名字节序升序**，保证同一语义载荷只有一种 `point_key`（否则前端两次装配会产生两个身份 → 两个 point_id，直接触发 `DUPLICATE_POINT_KEY` 的漏判）。
+- `identity_keys` 中的键**必须存在且非 `null`**（缺失 → `MISSING_IDENTITY_KEY`；`null` → `INVALID_ARGUMENTS`），因此「缺省」与「显式 null」在**身份层**都不被接受（三态在**编码层**仍严格可区分，§H）。
+- 身份模板**参与** digest（§3.2），但**同一 `variable_id` 的所有 revision 必须给出逐字相同的模板与键集合**（否则 R8 失效；改模板 = 新 `variable_id`，§3.5）。
+- **发布位置**：`identity_template`/`identity_keys` 随定义目录内嵌（`definitions/828d/*.json`），并通过**浏览/预填载荷**（`presets.rs` 的叶载荷旁）暴露给前端：
+
+  ```jsonc
+  // 浏览叶（Driver 产出；前端消费）
+  { "kind": "nck_variable", "parameters": { /* ... */ },
+    "identity": { "template": "channel.r_parameter#index={index}@channel={channel}",
+                  "keys": [{"path":"channel","required":true},{"path":"index","required":true}],
+                  "preview_point_key": "channel.r_parameter#index=i:100@channel=i:1" } }
+  ```
+
+  **`identity` 只出现在浏览/预填载荷**，**不得**进入持久化的 `PointSelection`——信封是 `deny_unknown_fields` 的**三字段**结构（§2.4），多带 `identity` 会被 Core 以 `UNKNOWN_FIELD` 拒绝。
+
+**D. 唯一执行真值：Configure 时重算并拒绝不一致（修订 4 的核心）**
+
+```text
+定义目录(Driver) --identity_template/identity_keys--> 浏览/预填载荷 --identity_preview--> 前端预览/编辑
+        │                                                                       │
+        │  Configure: 严格校验语义字段(D1–D10)                                    │ 用户确认后的 point_key
+        ▼                                                                       ▼
+   canonical_identity  <──── 逐字比对 ────  持久化 point_key（Core 持久化，来自信封）
+        │
+        └─ 不一致 → POINT_KEY_MISMATCH（configure 整体失败，任务不得启动；消息含两个 Key + variable_id/revision）
+```
+
+1. Driver **先**完成 D1–D10（含未知键拒绝、类型校验、范围校验），**再**计算身份——因此**未知键与非法类型永远不会进入身份计算**（修订 5 的要求）。
+2. `identity_mode="derived"`（默认，含**全部** `nck_variable`）⇒ 必须**逐字相等**。
+3. `identity_mode="user"` ⇒ **仅** `nck_native` 允许；Driver 不重算，但要求 Key 已通过通用语法校验，且**不得**静默改名（Core 只负责唯一性，附加 1）。
+4. Core **不参与**上述任何一步；Core 侧的 `INVALID_POINT_KEY` 只是**通用语法**判定，「格式合法但身份错误」一律放行到 Driver 裁决。
+
+**E. 通用键语法（Core 校验的唯一一层）**
+
+```text
+point_key    := base_key [ "~" dec ]              // dec 无前导零且 >= 2（用户显式确认的逻辑 Key，§4.1.2）
+base_key     := semantic_key | native_key
+semantic_key := variable_id [ "#" arglist ] [ "@" targetlist ]
+arglist      := arg ("," arg)*        arg := arg_key "=" value
+targetlist   := tgt ("," tgt)*        tgt := target_key "=" value
+value        := type ":" payload                  // §F/G：类型标签 + 规范载荷
+native_key   := "native." area_letters "." dec "." dec "." dec "." dec
+```
+
+- **解析必须深度感知（括号配对）**：`o:{…}`/`a:[…]` 的载荷内部含**裸** `,`/`=`/`{`/`}`/`[`/`]`/`:`（结构字符），因此 `,`/`=` **只允许在括号深度 0 处**作为分隔符切分（反例 R6/R7/E9）。
+- **保留前缀（修正原第 9 条）**：`variable_id` **不得**等于 `native`、**也不得以 `native.` 开头**（目录构建期断言 + Core 语法层：`native.` 前缀 ⇒ 必须匹配 `native_key` 形态）。原论证「`variable_id` 必含 `.`，故不可能等于 `native`」**不成立**（`native.foo` 合法），故改为**显式保留前缀规则**。
+- **`native_key` 的段类型由语法固定**（`area` 是字母段、其余是十进制整数段，**无类型标签**）：`area_no: "1"`（字符串）在**身份计算前**即以 `INVALID_VARIABLE` 拒绝，**不会**与 `area_no: 1` 得到同一 Key（反例 R11）。Core 只校验「第 2 段是字母、其余是十进制」，**不判定**该字母是否属于 N11 的 7 个合法 area（那是 Driver 的职责）。
+- **`~` 是后缀标记**：值载荷中 `~` 一律编码为 `%7E`（§F），键名与 `variable_id` 字符集均不含 `~`，故「末尾 `~<n>`」可被**唯一识别与剥离**（反例 R9/E10）。
+
+**F. 类型标签编码（修订 5：每个值 = 类型标签 + 规范载荷）**
+
+| 标签 | 类型 | 规范载荷 | 示例 |
+|---|---|---|---|
+| `s` | string | NFC 后 UTF-8 **逐字节**百分号编码（见下） | `s:r0035`、`s:%E8%BD%B4`、`s:`（空串） |
+| `i` | integer | 十进制整数：无前导零、无 `+`、仅负数带 `-`；`-0` → `0`；范围 `-(2^53-1) ..= 2^53-1` | `i:100`、`i:-3`、`i:0` |
+| `d` | number（**非整数**） | **定点**十进制（**禁指数**），最短往返有效数字 ≤17 位，去尾零；要求 `|v| ≥ 1e-9` | `d:0.001`、`d:1.5` |
+| `b` | boolean | 小写 `true` / `false` | `b:true` |
+| `z` | null | 空载荷 | `z:` |
+| `o` | object | `{` k `=` value (`,` k `=` value)* `}`，键名**字节序升序**，**递归**，深度 ≤4 | `o:{entry=s:nc_variable,number=i:3}` |
+| `a` | array | `[` value (`,` value)* `]`，**保序** | `a:[i:1,i:2]` |
+
+**字符串载荷**（沿用原规则，仅**收窄**原始字符集）：先做 **NFC**（规范化失败 → 拒绝，**不得**原样透传）；再对 NFC 后的 **UTF-8 字节**逐个处理——
+
+- 字节 ∈ `A-Z a-z 0-9 - . _` → **原样输出**；
+- 否则输出 `%` + **两位大写十六进制**（`,`→`%2C`、`#`→`%23`、`=`→`%3D`、`@`→`%40`、`/`→`%2F`、`%`→`%25`、`~`→`%7E`、`轴`→`%E8%BD%B4`）；
+- **`%` 本身必须被编码**：必须对原始字节**一次性**完成，**不允许**「先转义非 ASCII、再补 `%`」的两遍做法（否则与字面 `%XX` 文本碰撞，见 E2）。
+
+> **相对上一版的收紧**：`~` **不再**原样输出（原规则取 RFC 3986 unreserved 全集，含 `~`）。理由见反例 **R9 / E10**：`~` 是用户确认后缀 `~<n>` 的标记字符，若值中可原样出现 `~`，「值以 `~2` 结尾」与「后缀 `~2`」将不可区分。
+
+**G. 数字规范化（逐条确定，禁止依赖运行时默认格式化）**
+
+1. **非有限**（NaN / ±Inf）→ 拒绝（Core 侧 `INVALID_POINT_KEY`；Driver 侧 `INVALID_ARGUMENTS`）。
+2. **`-0.0` → `i:0`**（与 `0` 同一身份）。
+3. **整数归一**：`v == trunc(v)` 且 `|v| ≤ 2^53-1 = 9007199254740991` ⇒ `i:` + 十进制数字。因此 **`1.0` → `i:1`（与 `1` 同一身份）**、**`1e2` → `i:100`（与 `100` 同一身份）**、`1E2`/`+1`/`01` 等等价写法归一后同值。
+4. **超范围整数 → 拒绝**：`|v| > 2^53-1`。理由：JSON 大整数在 JS 侧会丢精度，跨运行时**必然**漂移；**宁可拒绝也不静默改写**。
+5. **非整数** ⇒ `d:` + **定点最短往返**十进制：**禁止指数形式**、禁止前导零（`0.5` 保留整数部分的单个 `0`）、禁止尾随零、小数点必须存在、有效数字 ≤17 位；并要求 `|v| ≥ 1e-9`（更小的值一律拒绝）。f64 性质保证非整数必有 `|v| < 2^53`，故 `d` 域是完备的。
+6. **禁止**使用语言运行时的默认浮点格式化：JS `String(1e-8)` = `"1e-8"`、`String(1e21)` = `"1e+21"`，而 Rust `{}` 恒为定点 ⇒ 两者在指数阈值上**不一致**。实现必须**显式定点化**（等价于 ECMA-262 `Number::toString` 的「最短 + 最近」语义再做定点展开），并以 Driver 侧的 **golden 向量**为唯一判据。
+7. **禁止**直接使用 `String(value)` / `JSON.stringify(value)` 作为通用编码（反例 R12：`String(1)` 与 `String("1")` 同串；`JSON.stringify` 对键序敏感、对大数用指数、`String(undefined)` 与字符串 `"undefined"` 碰撞）。
+
+**H. 对象 / 数组 / 三态（修订 5）**
+
+1. **对象键序无关**：键名按**字节序升序**输出 ⇒ JSON 输入中的键顺序**不影响身份**（`drive_object` 即此例）。
+2. **显式括号 + 递归**：`o:{…}` 递归编码嵌套值；**深度上限 4**（根值深度 1），超限即拒。
+3. **未知键在身份计算前由 Driver 拒绝**：`deny_unknown_fields`（D2）**先于**身份计算，因此未知键**永远不会**进入编码，也**不会**产生 Key。
+4. **对象键名不编码**，但必须匹配 `^[a-z][a-z0-9_]{0,63}$` 且**由 Driver 声明**（不匹配 → `INVALID_ARGUMENTS`/`INVALID_TARGET`，**绝不**静默编码）。
+5. **数组保序**：顺序是语义的一部分（**不得**排序）。对象**必须**排序、数组**必须**保序——两者方向相反，必须分别固定。
+6. **三态必须可区分**（编码层）：
+
+   | 输入 | 编码 | 说明 |
+   |---|---|---|
+   | 键不存在（缺省） | **无该段** | 缺省**不得**物化（即使定义声明了 `default`） |
+   | 键存在且为 `null` | `z:` | 显式 null |
+   | 键存在且为空串 | `s:` | 显式空串 |
+
+   身份键集合（§C）中的键**必须存在且非 null**，否则 Driver 拒绝；非身份键的三态在编码层仍严格可区分。
+
+**I. 规则逐条 + 反例（不加该规则就会碰撞 / 漂移）**
+
+| # | 规则 | 反例 |
+|---|---|---|
+| R1 | **类型标签** | 不加标签：`{"index":1}` 与 `{"index":"1"}` 都得 `index=1` ⇒ 两个不同配置同一身份 |
+| R2 | **整数归一**（`1.0`→`1`） | 不归一：`{"tol":1.0}`→`d:1.0`、`{"tol":1}`→`i:1` ⇒ 同一逻辑值两个 `point_id`，历史数据被劈成两段 |
+| R3 | **指数归一**（`1e2`→`100`） | 不归一：`{"n":1e2}` 与 `{"n":100}` 形态不同；且 JS `String(1e21)`=`"1e+21"` 与 Rust 定点展开不同 ⇒ **跨运行时漂移** |
+| R4 | **布尔标签** | 不加标签：`{"flag":true}` 与 `{"flag":"true"}` 都得 `flag=true` ⇒ 碰撞 |
+| R5 | **三态** | 若 null 与缺省都「省略该段」⇒ 碰撞；若空串与缺省都省略 ⇒ 碰撞（原 E4） |
+| R6 | **对象键序** | 不排序：`{"a":1,"b":2}` 与 `{"b":2,"a":1}` 得到两个 Key ⇒ 同一逻辑对象两个身份（前端两次装配即产生两个 `point_id`） |
+| R7 | **递归 + 显式括号 + 模板声明叶路径** | 若把嵌套对象「拍平」而不在模板中声明：`{"drive_object":{"number":3,"entry":"nc_variable"}}` 与 `{"drive_object":3,"entry":"nc_variable"}` 碰撞 |
+| R8 | **深度上限** | 无上限：错误/恶意配置可构造超深递归（虽由 256 字节上限兜底，但必须在身份计算前**显式**拒绝） |
+| R9 | **`~` 一律编码为 `%7E`** | 不编码：值 `s:abc~2` 与「值 `s:abc` + 后缀 `~2`」不可区分（`~` 后缀可被值伪造） |
+| R10 | **数组保序 / 对象排序** | 若对数组排序：`[1,2]` 与 `[2,1]` 碰撞；若对对象保序：见 R6。两者方向相反 |
+| R11 | **原生段类型由语法固定** | 若 Driver 宽松 `String(v)`：`area_no: 1` 与 `area_no: "1"` 得到同一 native Key ⇒ 两个不同配置同一身份（正确行为：`"1"` 在身份计算前以 `INVALID_VARIABLE` 拒绝） |
+| R12 | **禁止运行时默认编码** | `JSON.stringify` 对 `{a:1,b:2}` 与 `{b:2,a:1}` 输出不同（R6）、对 `1e21` 输出 `1e+21`（R3）、`String(undefined)`=`"undefined"` 与字符串 `"undefined"` 碰撞 |
+
+**J. 歧义与碰撞示例（规范编码后必得不同 Key；E7/E8 是刻意的归一，其余为必须区分）**
+
+| # | 风险类别 | 输入 A | 输入 B | 不加规则（错误） | 规范编码后（正确） |
+|---|---|---|---|---|---|
+| **E1** | 值里含**分隔符** | args `{index:"1,position=2"}`，target `{channel:1}` | args `{index:"1",position:"2"}`，target `{channel:1}` | 两者都是 `#index=1,position=2@channel=1` ⇒ **碰撞** | A：`#index=s:1%2Cposition%3D2@channel=i:1`；B：`#index=s:1,position=s:2@channel=i:1` |
+| **E2** | 值里含**字面 `%`** | args `{name:"轴"}` | args `{name:"%E8%BD%B4"}` | 只转义非 ASCII 而不转义 `%`：两者都是 `#name=%E8%BD%B4` ⇒ **碰撞** | A：`#name=s:%E8%BD%B4`；B：`#name=s:%25E8%25BD%25B4` |
+| **E3** | **非 ASCII / NFC** | args `{name:"é"}`（U+00E9，NFC） | args `{name:"é"}`（`e`+U+0301，NFD） | 不做 NFC ⇒ 同一逻辑文本得到**两个** Key（身份不稳定） | 两者 NFC 后同一码点 ⇒ 同一 Key `#name=s:%C3%A9` |
+| **E4** | **空串 vs 缺省** | args `{index:""}`（显式空串） | args `{}`（未提供，即使定义有 `default:0`） | 若把空串当「未提供」而省略整段（或物化缺省为 `#index=i:0`）⇒ **碰撞 / 身份漂移** | A：`#index=s:@channel=i:1`；B：无 `#` 段 |
+| **E5** | 值里含 **`@`/`#`** | args `{note:"x@channel=2"}`，target `{channel:1}` | args `{note:"x"}`，target `{channel:2}` | A 变成 `#note=x@channel=2@channel=1`：解析器**无法判断**第一个 `@` 属于值还是 target 段 | A：`#note=s:x%40channel%3D2@channel=i:1`；B：`#note=s:x@channel=i:2` |
+| **E6** | **类型碰撞**（数字 / 字符串 / 布尔） | args `{index:1}`、`{flag:true}` | args `{index:"1"}`、`{flag:"true"}` | 无标签 ⇒ 两侧 `index=1`、`flag=true` **完全同串** ⇒ 碰撞 | A：`index=i:1`、`flag=b:true`；B：`index=s:1`、`flag=s:true` |
+| **E7** | **数字归一**（刻意同身份） | args `{index:1.0}`、`{index:1e2}`、`{index:-0.0}` | args `{index:1}`、`{index:100}`、`{index:0}` | 不归一 ⇒ `d:1.0`/`d:100`/`d:-0` 与 `i:1`/`i:100`/`i:0` 各自成两个身份 | 两列**同一 Key**：`index=i:1`、`index=i:100`、`index=i:0`；而 `{index:0.001}` ⇒ `index=d:0.001`（与 `i:0` **不同**）；`{index:9007199254740992}`（2^53）与 `{index:1e-12}` ⇒ **拒绝** |
+| **E8** | **对象键序无关**（刻意同身份） | target `{drive_object:{number:3,entry:"nc_variable"}}` | target `{drive_object:{entry:"nc_variable",number:3}}` | 用 `JSON.stringify` 直接拼 ⇒ 两个 Key ⇒ 同一逻辑对象两个 `point_id` | 两列**同一 Key**：`@drive_object=o:{entry=s:nc_variable,number=i:3}` |
+| **E9** | **嵌套 vs 扁平**（结构必须与 §2.4.1 一致） | target `{drive_object:{number:3,entry:"nc_variable"}}` | target `{drive_object:3,entry:"nc_variable"}` | 上一版示例把 A 拍平成 `@drive_object=3,entry=nc_variable` ⇒ 与 B 的「宽松解释」碰撞，且与 §2.4.1 结构不符 | A：`@drive_object=o:{entry=s:nc_variable,number=i:3}`；B：**不产生 Key**——`drive_object` 类型错 + 顶层未知键 `entry`，Driver 在身份计算前以 `INVALID_TARGET`/`INVALID_BINDING_CONFIG` 拒绝 |
+| **E10** | **`~` 后缀可被值伪造** | args `{name:"abc~2"}` | args `{name:"abc"}` + 用户确认后缀 `~2` | `~` 原样输出 ⇒ A 也是 `s:abc~2`，与 B 完全同串 ⇒ 后缀被伪造（同一 Endpoint 内被判重复，或冒充他人逻辑身份） | A：`#name=s:abc%7E2`；B：`…@channel=s:abc~2`（后缀） |
+| **E11** | **数组保序**（语法预留） | args `{path:[1,2]}` | args `{path:[2,1]}` | 若对数组排序 ⇒ 两者碰撞 | A：`a:[i:1,i:2]`；B：`a:[i:2,i:1]`（今天无定义声明数组型 argument，规则先行冻结，避免将来补规则时产生两个身份） |
+
+**长度上限（保留，依据按类型标签重算）**：`point_key` 的**规范编码后** UTF-8 字节数 **≤ 256**。依据：① 42 条定义的默认 Key 中**最长者为** `drive.motor.temperature@drive_object=o:{entry=s:nc_variable,number=i:3}` = **71 字节**（本次按 §2.5.1 的 target/arguments 逐条推得），256 字节留 ≥3 倍余量；② `point_key` 是 SQLite 索引列（Endpoint 内唯一约束），超长键恶化 B-tree 扇出与索引记录大小，而唯一性**只在 Endpoint 内**，不需要跨 Endpoint 前缀；③ 256 字节保证 Key 在日志/表格/UI 中单行可完整展示（可运维性）。超限 → `INVALID_POINT_KEY`，**不得截断**（截断会制造碰撞）。
+
+**键名规则（保留）**：`arg_key`/`target_key` **不编码**，必须匹配 `^[a-z][a-z0-9_]{0,63}$`（来自定义目录）；不匹配 → `INVALID_ARGUMENTS`/`INVALID_TARGET`（**绝不**静默编码）。
+
+**K. 默认 Key 示例（canonical identity = 建议逻辑 Key）**
+
+| 载荷 | 默认 `point_key`（= Driver 重算的 canonical identity） |
+|---|---|
+| `channel.r_parameter`, target `{channel:1}`, args `{index:100}` | `channel.r_parameter#index=i:100@channel=i:1` |
+| `channel.program.status`, target `{channel:1}`, args `{}` | `channel.program.status@channel=i:1` |
+| `axis.position.commanded_mcs`, target `{channel:1, axis:3}` | `axis.position.commanded_mcs@axis=i:3,channel=i:1` |
+| `spindle.speed.actual`, target `{channel:1, spindle:1}` | `spindle.speed.actual@channel=i:1,spindle=i:1` |
+| `drive.motor.temperature`, target `{drive_object:{number:3, entry:"nc_variable"}}` | `drive.motor.temperature@drive_object=o:{entry=s:nc_variable,number=i:3}` |
+| `nck_native`, params `area=C,area_no=1,module=21,column=1,line=396`（`identity_mode="derived"`） | `native.C.1.21.1.396` |
+| `nck_native`, 同上地址但**逻辑用途不同**（`identity_mode="user"`，§4.1.2） | `native.C.1.21.1.396~2`（UI **建议**值，**必须用户显式确认**） |
+
+**`drive_object` 完整编码示例（与 §2.4.1 的实际结构一致；修订 5 的修正点）**：§2.4.1 的结构是 `TargetRef{ drive_object: Option<DriveObjectRef> }`、`DriveObjectRef{ number: u32, entry: DriveEntry }`，其 JSON 形态为 `{"drive_object":{"number":3,"entry":"nc_variable"}}`。编码过程逐字如下：
+
+```text
+输入（JSON，键序任意）: { "drive_object": { "number": 3, "entry": "nc_variable" } }
+  └─ 对象键名字节序升序:  entry(0x65) < number(0x6E)
+  └─ entry  = "nc_variable" → 字符串 → NFC → 逐字节百分号编码 → s:nc_variable
+  └─ number = 3             → 整数   → 归一                → i:3
+  └─ 对象整体:            o:{entry=s:nc_variable,number=i:3}
+完整 Key: drive.motor.temperature@drive_object=o:{entry=s:nc_variable,number=i:3}
+（上一版的 drive.motor.temperature@drive_object=3,entry=nc_variable 是「拍平投影」，
+  与 §2.4.1 的实际结构不一致，已废弃：反例 E9 说明拍平写法会与顶层扁平键碰撞。）
+```
+
+**`~<n>` 后缀（附加 1）**：`~<n>`（`n≥2`，无前导零）是 **UI 给出的建议逻辑 Key**，**不是**身份生成器自动产生的标准后缀；**必须由用户显式确认**后才写入 `point_key`，且**仅** `nck_native` 高级模式（`identity_mode="user"`）允许。Core **只负责唯一性**（`DUPLICATE_POINT_KEY`），**不得**替用户静默改名、**不得**自动追加后缀（F16 的 `:146` 静默 `.2/.3` 路径必须废弃）。
+
+**排序规则（修订 4 后：归属 Driver 模板，Core 只校验）**：target 与 arguments 的键**一律按键名字节序升序**出现在 `identity_template` 中；前端**不得重排**（模板顺序即规范顺序），Core 只校验「段内键名按字节序升序且不重复」。若两处装配产生两个身份，会直接触发 `DUPLICATE_POINT_KEY` 的漏判。
 
 #### 4.1.2 Point Key **不是物理地址**（修订 3-其二）
 
 - **同一个原生地址可能被用户用于不同的逻辑采集用途**（例如同一 `V/M/r0035` 既用于「电机温度趋势」又用于「报警阈值监视」）。因此 **Native Point 不强制以地址本身作为唯一身份**。
 - 处置（四条，逐条写进测试）：
-  1. **Native 的默认 Key 只是建议值**（§4.1.1 的 `native.<area>.<area_no>.<module>.<column>.<line>`）。当默认值已被同一 Endpoint 的另一点位占用时，前端建议追加 `~<n>`（`n≥2`，如 `native.C.1.21.1.396~2`）。`~` 属未保留字符但**不出现**在原生字段的规范取值中（`area` 是字母、其余是十进制数字），故 `~<n>` 段可被唯一识别与剥离。
-  2. **用户可修改 `point_key`**（以及纯展示用的 `display_name`）；修改后的 `point_key` 即该点位的**稳定逻辑身份**。
-  3. **禁止自动递增后缀**：旧行为 `variable.value` → `variable.value.2`/`.3`（F6）**必须废弃**。语义点位的默认 Key 由规范算法**唯一确定**；若两个点位的语义身份完全相同，则它们是**同一个点位**，必须报 `DUPLICATE_POINT_KEY`，**不得**用后缀「造出」第二个身份（否则同一逻辑点产生两个 `point_id`，历史数据被劈成两段）。Native 的 `~<n>` 只用于「**地址相同但逻辑用途不同**」的显式区分，且**必须由用户可见地确认**，不得静默生成。
+  1. **Native 的默认 Key 只是建议值**（§4.1.1 的 `native.<area>.<area_no>.<module>.<column>.<line>`，即 `identity_mode="derived"`）。当默认值已被同一 Endpoint 的另一点位占用时，UI 建议追加 `~<n>`（`n≥2`，如 `native.C.1.21.1.396~2`）——它是**建议的逻辑 Key**，**必须由用户显式确认**后才写入 `point_key`（附加 1），**不是**身份生成器自动产生的标准后缀。`~` **一律**在值中编码为 `%7E`（§4.1.1 F），且不出现在 `area`/十进制段与键名中，故 `~<n>` 段可被**唯一识别与剥离**（反例 E10）。
+  2. **用户修改 `point_key` 仅限 `nck_native` 的高级模式**（`parameters.identity_mode="user"`，§2.3）：此时 `point_key` 是用户**显式选择**的逻辑身份，Driver **不重算**、**不静默改名**。**`nck_variable` 的 `point_key` 必须逐字等于 Driver 重算的 canonical identity**（§4.1.1 D），用户只能改 `display_name`——这是修订 4 对上一版「无条件可改名」的**收紧**。任何模式下 `display_name` 都可自由修改（纯展示）。
+  3. **禁止自动递增后缀**：旧行为 `variable.value` → `variable.value.2`/`.3`（F6）**必须废弃**；注意**现有实现的 `:146` 正是静默递增**（F16），必须改为「提示冲突 + 用户显式确认」。语义点位的默认 Key 由规范算法**唯一确定**；若两个点位的语义身份完全相同，则它们是**同一个点位**，必须报 `DUPLICATE_POINT_KEY`，**不得**用后缀「造出」第二个身份（否则同一逻辑点产生两个 `point_id`，历史数据被劈成两段）。Native 的 `~<n>` 只用于「**地址相同但逻辑用途不同**」的显式区分，且**必须由用户可见地确认**，不得静默生成。**Core 只负责唯一性，不得替用户静默改名**（附加 1）。
   4. **点位身份不得依赖前端展示文案**：身份 = 持久化的 `point_key`；`display_name` / 定义的 `label`（`LocalizedText`）是**纯展示元数据**，其变化**不得**影响 `point_key`/`point_id`（R6/R11）。
-- **`nck_native` 默认 Key 不含** `decode`/`transport_size`/`invalid_*`——因为那三项是**质量与解码**属性，不是身份。若同一地址需要不同 decode，按第 1 条由用户**显式区分命名**，UI 必须提示「这将是两个不同点位」（否则用户会以为改了 decode 还是同一个点）。
+- **`nck_native` 默认 Key 不含** `decode`/`transport_size`/`invalid_*`/`identity_mode`——因为前三项是**质量与解码**属性、`identity_mode` 是**模式声明**，都不是身份。若同一地址需要不同 decode，按第 1 条由用户**显式区分命名**（`identity_mode="user"`），UI 必须提示「这将是两个不同点位」（否则用户会以为改了 decode 还是同一个点）。
 
 **迁移**：不迁移历史 key（指令 9）。旧 key（`variable.value`、`variable.value.2`…）在新模型下不再产生；重建点位会得到新 key → 新 point_id。
 
@@ -861,7 +1063,7 @@ native_key   := "native." area "." dec(area_no) "." dec(module) "." dec(column) 
 | R6 | `display_name` 是用户元数据，configure **不得**覆盖或清空 | `config-store:1719-1727`、`:1743-1746` |
 | R7 | `source_label` 是 configure 真值快照：`Some` 覆盖、`None` 清空 | `config-store:1716-1718` |
 
-**新模型下的新增语义表述**（**五条**，必须写进测试）：
+**新模型下的新增语义表述**（**七条**，必须写进测试）：
 
 | 规则 | 表述 | 理由 |
 |---|---|---|
@@ -869,7 +1071,9 @@ native_key   := "native." area "." dec(area_no) "." dec(module) "." dec(column) 
 | **R9** | `variable_id` / 任一 target 实例 / 任一 argument 变化 ⇒ `point_key` 变化 ⇒ **新 `point_id`**；旧 key 走墓碑，其 `point_id` 永不复用 | §4.1 I1/I2 + R3/R4 |
 | **R10** | **Point Kind** 在 `nck_variable` ↔ `nck_native` 之间切换**必然**改变 `point_key`（前缀不同）⇒ 新 `point_id` | 语义点与原生点是不同身份，不得互相「顶替」 |
 | **R11** | `point_key` 一旦持久化即为身份；`display_name` / 定义 `label` 变化**不得**改变 `point_key` 或 `point_id` | 修订 3-其二：**身份不得依赖前端展示文案** |
-| **R12** | Native Point 的默认 Key 由地址派生，但**允许用户改名**；同一地址用于不同逻辑采集用途 ⇒ **不同点位、不同 `point_id`** | 修订 3-其二：**地址不是唯一身份**（§4.1.2） |
+| **R12** | Native Point 的默认 Key 由地址派生（`identity_mode="derived"`），但高级模式下**允许用户显式选择**不同的逻辑身份（`identity_mode="user"`）；同一地址用于不同逻辑采集用途 ⇒ **不同点位、不同 `point_id`** | 修订 3-其二 + 修订 4：**地址不是唯一身份**（§4.1.2） |
+| **R13** | `nck_native` 且 `identity_mode="user"`：`point_key` 是用户选择的**逻辑身份**，**不随地址变化**；改任一原生地址字段 ⇒ `point_key` **不变** ⇒ 复用**同一** `point_id`（UI 必须提示「这仍是同一个点位」） | 修订 4：Native Key **不是**地址的函数（§4.1.2 第 2 条） |
+| **R14** | `nck_native` 且 `identity_mode="derived"`（默认）：改任一地址字段（`area`/`area_no`/`module`/`column`/`line`）⇒ `point_key` 变化 ⇒ **新 `point_id`**，旧 key 走墓碑 | 修订 4：默认 Key 是地址的规范函数（§4.1.1 C/K） |
 
 **`source_label` 在新模型下的取值**：`Semantic` 编译成功时 = 现有 `NativeNckAddress::source_label()` 的稳定格式（N10），**不额外拼接** `variable_id`（`source_label` 是**原生地址标识**，语义名属于配置而非地址）。语义名通过 `display_name`（用户命名）与前端展示表达。这一点必须写死，否则 `source_label` 的稳定性会被破坏。
 
@@ -883,10 +1087,10 @@ native_key   := "native." area "." dec(area_no) "." dec(module) "." dec(column) 
 
 **改为**：
 1. 保留原字面量 key 用例（**不得删除**，它是 ConfigStore 层的冻结契约）；
-2. **新增**语义 key 用例：构造 §4.1 的默认 `point_key`（如 `channel.r_parameter#index=100@channel=1`），断言两次分配同 id；
-3. **新增 R8 断言**：同一 `variable_id`/`target`/`arguments`、仅 `definition_revision` 从 1 改为 2 时，**推导出的 `point_key` 逐字相等** ⇒ 第二次分配恢复同一 `point_id`。
+2. **新增**语义 key 用例：使用**字面量冻结 Key**（如 `channel.r_parameter#index=i:100@channel=i:1`，与 Driver 的 golden 向量同源），断言两次分配同 id；
+3. **新增 T3a 断言（修订 4）**：**同一 `point_key`** + **两份不同的 `parameters`**（其中一份仅 `definition_revision` 从 1 改为 2）⇒ Core 身份**只由 `point_key` 决定**，恢复**同一** `point_id`。
 
-> 该用例必须**只依赖 `point_key` 推导函数**（`crates/core-types/src/point.rs` 内的纯函数），不得依赖驱动，以便契约套件保持「无驱动子进程」的轻量属性。
+> 该用例必须**只使用字面量 `point_key`**，不得依赖驱动子进程（保持契约套件「无驱动子进程」的轻量属性），**更不得**在 Core 侧推导身份——Core 不生成 `point_key`（修订 4）。「`point_key` 与 `definition_revision` 无关」的**真正证据在 Driver 侧**（T3b，§6.6）：Driver 重算的身份必须与 revision 无关。
 
 #### （2）`tests/driver-contract/tests/data_semantics.rs:90-149`「删除 id 永不复用」
 
@@ -904,10 +1108,11 @@ native_key   := "native." area "." dec(area_no) "." dec(module) "." dec(column) 
 
 **改为**：
 1. 保留原用例（:182 的断言不变）；
-2. **新增 R8 用例**：以 `definition_revision` 不同的**同一语义点位**重新加入，断言 `point_key` 与 `point_id` **均**不变（这是「revision 修正不改变点位身份」的**唯一**契约证据）；
-3. **新增 R10 用例**：同一物理地址分别以 `nck_variable` 与 `nck_native` 表达，断言两者 `point_key` **不同**、`point_id` **不同**，且互不顶替。
+2. **新增 R8 用例**：以**相同 `point_key`**（字面量冻结值，来自 Driver 的 golden 向量）、`definition_revision` 不同的**同一语义点位**重新加入，断言 `point_key` 与 `point_id` **均**不变；**驱动侧重算身份与 revision 无关**的证据见 T3b（§6.6）——Core 侧不再声称自己能证明这一点；
+3. **新增 R10/R14 用例**：同一物理地址分别以 `nck_variable` 与 `nck_native` 表达，断言两者 `point_key` **不同**、`point_id` **不同**，且互不顶替；`identity_mode="derived"` 下改地址字段 ⇒ 新 Key、新 `point_id`；
+4. **新增 R13 用例（修订 4）**：`identity_mode="user"` 的 Native 点位改地址字段 ⇒ `point_key` **不变** ⇒ 复用**同一** `point_id`（逻辑身份不随地址变化）。
 
-**下界约束**：三条断言的**用例数不得减少**（原 3 个 → 改写后 ≥ 3，实际按上述展开为 9 个），且原字面量 key 的用例必须**原样通过**（它们是 ConfigStore 层契约，与语义模型正交）。
+**下界约束**：三条断言的**用例数不得减少**（原 3 个 → 改写后 ≥ 3，实际按上述展开为 **11** 个），且原字面量 key 的用例必须**原样通过**（它们是 ConfigStore 层契约，与语义模型正交）。
 
 ---
 
@@ -964,34 +1169,38 @@ native_key   := "native." area "." dec(area_no) "." dec(module) "." dec(column) 
 | 类型 | 项 | 内容 |
 |---|---|---|
 | **新增** | `crates/core-types` 单测 | `point.rs`：`PointSelection` 反序列化、**信封层** `deny_unknown_fields`（未知字段即拒）、`parameters` 必须为 JSON 对象、`kind` **非空**（`EMPTY_POINT_KIND`）、`EMPTY_POINT_KEY`、`INVALID_PARAMETERS`；**不含任何 Target/NCK 字段校验**（修订 1） |
-| **新增** | `point_key` 规范编码单测 | §4.1.1 的 `enc`：分隔符百分号编码、`%` 本身编码、NFC 归一、空串 vs 缺省、键名排序、缺省不物化、长度上限 **256 字节**；并逐条断言 **E1–E5 歧义示例「不同输入 ⇒ 不同 Key」**、同一逻辑文本 NFC 后 ⇒ 同一 Key |
+| **新增** | `point_key` **通用格式校验器 + 类型标签编码器**单测（修订 5） | §4.1.1 E/F/G/H：**标签表全覆盖**（`s/i/d/b/z/o/a`）、分隔符与 `%` 编码、**`~`→`%7E`**、NFC 归一、**数字规范化**（`1.0`≡`1`、`1e2`≡`100`、`-0`→`0`、2^53 与 `1e-9` 越界即拒）、三态（缺省 / `z:` / `s:`）、对象键序无关与递归、深度上限 4、数组保序、`~<n>` 后缀语法（`n<2`/前导零即拒）；**逐条断言 E1–E11** |
+| **新增** | **Core 边界单测（修订 4 / P0-1）** | ① Core **无**身份推导 API（不读 `identity_template`、不按 `variable_id` 拼装、不排序 Siemens 键）；② 对**任意** `kind` 与**任意不透明** `parameters`，Core 都能完成格式校验；③ **格式合法但身份错误**的 Key（如与 `parameters` 语义不符）**Core 放行**（由 Driver 以 `POINT_KEY_MISMATCH` 拒绝） |
 | **新增** | Core 门禁单测 | **Task Binding Kind** 白名单（`{mesa.resources.v1, nck.points.v1}`）；`mesa.resources.v1` 原路径逐字不变；未知 **Task Binding Kind** → `UNSUPPORTED_BINDING`；**未知 Point Kind（如 `"weird_kind"`）在信封层被放行**（P9，证明 Core 无 NCK 白名单） |
 | **新增** | 混合点位合同测试（§6.6 **T1**，Core 侧） | 一个 `nck.points.v1` 任务的 `points[]` **同时**含 `nck_variable` 与 `nck_native` → Core 门禁**放行**（不得因 Point Kind 拒绝、不得要求拆成两个任务） |
-| **必须改写** | `data_semantics` | §4.3 的三条断言（原 3 → ≥9 用例，原字面量 key 用例原样保留）；含 §6.6 的 **T2**（跨任务唯一）与 **T3**（Revision 稳定性） |
+| **必须改写** | `data_semantics` | §4.3 的三条断言（原 3 → **11** 用例，原字面量 key 用例原样保留）；含 §6.6 的 **T2**（跨任务唯一）与 **T3a**（Core 身份只由 `point_key` 决定，`parameters` 不参与） |
 | **必须原样通过** | `resource_contract`、`descriptor_contract`（PR-A 阶段不含 NCK 资源面改动）、`management_api`、`smoke`、`protocol_negotiation`、`session_lifecycle`、`data_plane`、`point_live`、`fault_tolerance`、`subprocess_recovery`、`discovery_contract`、`control_contract`、`subprocess_orphan_guard` + 事件 12 套 + `mesad_restart`/`stop_lifecycle`/`opcua_auth_restart_e2e` | 全部 |
 | **必须原样通过** | 前端全部 **383** | PR-A 不改前端 |
-| 验收 | `cargo test --workspace` 全绿；契约 29/29；前端 383/383；`point_key` 规范编码的 E1–E5 逐条通过；**Core 无 NCK 知识（P9）断言通过**；**PR-A 完成后必须独立验收，才能进入 PR-B**（§7.1） | — |
+| 验收 | `cargo test --workspace` 全绿；契约 29/29；前端 383/383；§4.1.1 的 **E1–E11** 逐条通过；**Core 无 NCK 知识（P9）断言通过**；**Core 侧无身份推导（修订 4 边界单测）通过**；**PR-A 完成后必须独立验收，才能进入 PR-B**（§7.1） | — |
 
 ### 6.2 PR-B（Driver Compiler）
 
 | 类型 | 项 | 内容 |
 |---|---|---|
-| **新增** | `drivers/sinumerik-nck/tests/definition_catalog.rs` | 42 条定义完整性；`(variable_id, revision)` 唯一；digest 与 `DIGESTS.lock` 一致；`semantics_status` 与 ID 形态规则（§2.5.2）；`scope=I` 的 6 条与 `identity_spec.rs` 同值 |
+| **新增** | `drivers/sinumerik-nck/tests/definition_catalog.rs` | 42 条定义完整性；`(variable_id, revision)` 唯一；digest 与 `DIGESTS.lock` 一致；`semantics_status` 与 ID 形态规则（§2.5.2）；`scope=I` 的 6 条与 `identity_spec.rs` 同值；`identity_template`/`identity_keys` 存在，且同一 `variable_id` 的**所有 revision 逐字相同**（§3.2 / §4.1.1 C） |
+| **新增** | **`DIGESTS.lock` 基线分支校验（附加 2 / T6）** | 以 **PR base（默认 `main`）** 的 `DIGESTS.lock` 为基线：① 已发布 `(variable_id, revision)` 的 digest/内容变化 ⇒ **失败**（即使同步更新了 Lock）；② 仅**新增** revision ⇒ 通过；③ 删除已发布 revision ⇒ **失败**（§3.1） |
+| **新增** | **身份契约与重算拒绝单测（修订 4 / T3b、T4）** | ① 对 42 条定义的**每一个 revision**，Driver 重算的 `canonical_identity` **逐字相等**（身份与 revision 无关）；② 持久化 `point_key` ≠ 重算身份 ⇒ `POINT_KEY_MISMATCH` 且 **configure 整体失败**、任务不得启动；③ 相等 ⇒ 成功；④ `identity_mode="user"` **仅** `nck_native` 允许，用于 `nck_variable` ⇒ `INVALID_BINDING_CONFIG`；⑤ `identity_mode="user"` 时不重算，但 Key 语法非法仍拒；⑥ `identity_keys` 缺失 / 为 `null` ⇒ `MISSING_IDENTITY_KEY` / `INVALID_ARGUMENTS` |
+| **新增** | **编码器一致性单测（修订 5 / T5）** | Driver 编码器对 §4.1.1 J 的 **E1–E11 golden 向量**逐条一致；向量集与 Core（PR-A）、前端（PR-C）**同源**（同一份 fixtures），三处实现任一漂移即失败 |
 | **新增** | `drivers/sinumerik-nck/tests/semantic_equivalence.rs` | §3.4：42 条定义逐条编译 → `encode_var_spec` == 冻结 `wire_hex`；`checked == 62`；20 条驱动对象入口 module/wire 必须不同（G4） |
 | **新增** | Compiler 单测 | `UNKNOWN_VARIABLE`、`UNSUPPORTED_DEFINITION_REVISION`（三种禁止退化逐条断言）、`MISSING_TARGET`、`INVALID_TARGET`（`entry` 缺失必拒）、`INVALID_ARGUMENTS`、`ArgumentOffset` 边界（R 参数 index=0 → line=1；上溢 → 拒） |
-| **新增** | 参数层严格校验单测（§2.4.2 **D1–D10**） | `UNSUPPORTED_POINT_KIND`（Point Kind 非两值）；`parameters` 层**未知字段即拒**；类型错；索引范围；原生地址枚举与无效值成对；`unit` ≤32 字符 |
+| **新增** | 参数层严格校验单测（§2.4.2 **D1–D11**） | `UNSUPPORTED_POINT_KIND`（Point Kind 非两值）；`parameters` 层**未知字段即拒**；类型错；索引范围；原生地址枚举与无效值成对；`unit` ≤32 字符；`identity_mode` 取值与适用范围（D11） |
 | **新增** | 混合点位合同测试（§6.6 **T1**，Driver 侧） | 同一任务内 `nck_variable` 与 `nck_native` 混排 → `configure` 成功，**逐点**路由到 Address Compiler 两条分支；**Module 26/130 不折叠**（`entry` 缺失 → `INVALID_TARGET`） |
 | **必须改写** | `descriptor_contract`（`:391-396`、`:593-603`、`:728-731`） | 资源面断言跟随新形态；**只读 / 无 subscribe / 无 events 三条不得放宽** |
 | **必须改写** | `discovery_contract`（`:224-269`） | 浏览叶形态；`nck://presets` 根与诊断节点语义不变 |
 | **必须原样通过** | `legacy_equivalence`（2 用例，`checked == 62`）、`native_address`（8）、`presets_828d`（6，若模板未在 PR-B 重构则原样）、`examples_828d`（3）、`drive_access`（6）、`identity_browse`（8）、`sharp7_vectors`（6） | 62 条 golden 字节**必须不变** |
 | **必须原样通过** | 契约 29/29；前端 **383**（PR-B 不改前端） | — |
-| 验收 | 62/62 字节等价；`sha2` 依赖加入后 `cargo build --locked --workspace` 通过；无 `UNSUPPORTED_DEFINITION_REVISION` 的静默退化路径 | — |
+| 验收 | 62/62 字节等价；`sha2` 依赖加入后 `cargo build --locked --workspace` 通过；无 `UNSUPPORTED_DEFINITION_REVISION` 的静默退化路径；**⑨ 身份契约 + Configure 重算拒绝（T3b/T4）通过**；**⑩ `DIGESTS.lock` 基线分支校验（T6）通过**；**⑪ 编码器 golden 向量（T5，Driver 侧）通过** | — |
 
 ### 6.3 PR-C（Frontend 编辑器）
 
 | 类型 | 项 | 内容 |
 |---|---|---|
-| **新增** | `nckPointModel.test.ts` | `point_key` 推导（I1/I2/I3）、**规范编码与 Core 纯函数逐字一致**（§4.1.1，含 E1–E5）、payload 构造、默认值、按 Point Kind 的必填预检、`nck_variable` ↔ `nck_native` 判别；**用户改名后身份稳定**、**禁止自动递增后缀**、`display_name` 变化不影响 `point_key`（§4.1.2） |
+| **新增** | `nckPointModel.test.ts` | **消费驱动身份模板**做通用替换（I1/I2/I3；**不实现 Siemens 语义、不自行决定身份键集合、不自行排序**）、**类型标签编码器与 §4.1.1 的 golden 向量逐字一致**（E1–E11）、payload 构造、默认值、按 Point Kind 的必填预检、`nck_variable` ↔ `nck_native` 判别；**驱动不可达且无缓存模板 ⇒ 禁止提交语义点位**（不得猜测 Key）；`point_key` 展示为「建议逻辑 Key」、Native 改名（`identity_mode="user"`）**必须显式确认**、**禁止静默后缀**、`display_name` 变化不影响 `point_key`（§4.1.2） |
 | **新增** | `NckPointFields.test.tsx` | 语义表单渲染；`nck_native` 高级警告；必填缺失提示；**不出现**原生字段（语义模式） |
 | **必须改写** | `deviceModel.test.ts` | 双真值收敛后的唯一装配入口；`splitAcquisitionTasks`/`selectionsOf` 识别 NCK kind；保留原有任务保全语义 |
 | **必须改写** | `addDevice/bootstrap.test.ts` | 装配入口收敛；`tasks=[]` 零采集点语义不变 |
@@ -1025,15 +1234,21 @@ native_key   := "native." area "." dec(area_no) "." dec(module) "." dec(column) 
 
 **评审重申**：62 条 Wire Golden 必须**完整覆盖**（不得抽样、不得跳过、不得减少）；**Module 26/130 不允许折叠**（`entry` 必填，双入口同 column 必须不同 module 且不同 wire）。
 
-### 6.6 评审要求的三条合同测试（必须有，**不得**以单测替代）
+### 6.6 评审要求的合同测试（必须有，**不得**以单测替代）
+
+> **修订 4 后 T3 必须拆开**：Core **不推导身份**，因此「revision 更新后身份稳定」**不能**由 Core 侧用推导函数证明；证据分两层——Core 侧证明「身份只由持久化 `point_key` 决定」（T3a），Driver 侧证明「重算身份与 revision 无关」（T3b）。
 
 | # | 合同测试 | 层次与位置 | 断言（失败即为架构错误） |
 |---|---|---|---|
 | **T1** | **同一任务混合点位** | Core 门禁（**PR-A**）+ Driver `configure`（**PR-B**） | 一个 `nck.points.v1` 任务的 `points[]` **同时**含 `nck_variable` 与 `nck_native`：Core 门禁**放行**（不因 Point Kind 拒绝）；Driver `configure` 成功且**逐点**路由到 Address Compiler 的两条分支；**不得**要求用户/前端拆成两个任务 |
 | **T2** | **跨任务 Point Key 唯一性** | Core 集合校验（**PR-A**） | 同一 Endpoint 的**两个不同任务**出现同一 `point_key` → `DUPLICATE_POINT_KEY`（B9/R5）；同一 `point_key` 在同一任务内重复同样拒绝；不同 Endpoint 的同名 key **不**冲突 |
-| **T3** | **Revision 更新后身份稳定性** | ConfigStore + Core（**PR-A**） | 仅 `definition_revision` 1→2（`variable_id`/`target`/`arguments` 均不变）：推导出的 `point_key` **逐字相等** ⇒ `assign_point_ids` 恢复**同一** `point_id`；反向：改 `target` / `arguments` / Point Kind ⇒ 新 Key、新 `point_id`，旧 id 走墓碑且**永不复用**（R8/R9/R10） |
+| **T3a** | **Core 身份 = `point_key`（`parameters` 不参与）** | ConfigStore + Core（**PR-A**） | **同一 `point_key`（字面量）+ 两份不同 `parameters`**（其中一份仅 `definition_revision` 1→2）⇒ `assign_point_ids` 恢复**同一** `point_id`；反向：改 `point_key` ⇒ 新 `point_id`，旧 id 走墓碑且**永不复用**（R3/R4/R8/R9/R10）。**该用例不得使用任何身份推导函数** |
+| **T3b** | **Driver 生成的身份与 Revision 无关** | NCK Driver（**PR-B**） | 对 42 条定义的**每一个已发布 revision**：用同一 target/arguments 重算 `canonical_identity` ⇒ **逐字相等**；且 `identity_template`/`identity_keys` 在所有 revision 间**逐字相同**。反向：改 `target`/`arguments` ⇒ 重算身份**不同**（R9/R14） |
+| **T4** | **唯一执行真值（重算并拒绝）** | NCK Driver `configure`（**PR-B**） | 持久化 `point_key` ≠ Driver 重算身份（`identity_mode="derived"`）⇒ `POINT_KEY_MISMATCH`，`configure` **整体失败**、任务**不得启动**、消息含两个 Key + `variable_id`/`revision`；相等 ⇒ 成功；`identity_mode="user"` **仅** `nck_native` 允许（用于 `nck_variable` ⇒ `INVALID_BINDING_CONFIG`），且不重算、不静默改名 |
+| **T5** | **类型标签编码无碰撞（三处一致）** | Core 校验器（**PR-A**）+ Driver 编码器（**PR-B**）+ 前端编码器（**PR-C**） | 三处实现共用**同一份 E1–E11 golden 向量**：`1`/`"1"`/`true`/`"true"` 互不相同；`1.0`≡`1`、`1e2`≡`100`、`-0`≡`0`；对象键序无关；null/缺省/空串三态可分；嵌套 `drive_object` 与 §2.4.1 结构一致；`~` 编码为 `%7E`；越界数字被拒。**任一处漂移即失败** |
+| **T6** | **`DIGESTS.lock` 已发布 revision 不可变** | CI + 定义目录（**PR-B**，不阻塞 PR-A） | 对照**基线分支**：已发布 `(variable_id, revision)` 内容/digest 变化 ⇒ 失败（同步改 Lock 也失败）；仅新增 revision ⇒ 通过；删除已发布 revision ⇒ 失败 |
 
-三条合同测试的**下界**：T1 ≥2 用例（Core + Driver 各 1），T2 ≥3 用例（跨任务/同任务/跨 Endpoint），T3 ≥3 用例（revision 不变、target 变、Point Kind 变）。
+合同测试的**下界**：T1 ≥2 用例（Core + Driver 各 1），T2 ≥3 用例（跨任务/同任务/跨 Endpoint），T3a ≥3 用例（同 Key 不同 `parameters`、Key 变、墓碑不复用），T3b ≥3 用例（多 revision 同身份、模板逐字相同、target/arguments 变则身份变），T4 ≥6 用例（见 §6.2），T5 ≥11 用例（E1–E11 三处各一遍），T6 ≥3 用例（不变/新增/删除）。
 
 ---
 
@@ -1041,32 +1256,32 @@ native_key   := "native." area "." dec(area_no) "." dec(module) "." dec(column) 
 
 ### 7.0 总原则：禁止多阶段交叉修改同一核心契约而缺少验收
 
-「核心契约」= **Core 侧**：`crates/core-types/src/point.rs` 的公开类型（**仅**通用信封 `PointSelection`/`PointBinding` 与 `NCK_POINTS_BINDING_KIND`）、`point_key` 规范编码规则（§4.1.1）、`nck.points.v1` 信封形状；**Driver 侧**：`drivers/sinumerik-nck/src/targets.rs` 的 `TargetRef`/`DriveEntry`、`VariableDefinition` 的**字段集合与 digest 算法**。约束：
+「核心契约」= **Core 侧**：`crates/core-types/src/point.rs` 的公开类型（**仅**通用信封 `PointSelection`/`PointBinding` 与 `NCK_POINTS_BINDING_KIND`）、`point_key` 的**通用键语法与类型标签编码规则**（§4.1.1 E–H，**不含**身份推导）、`nck.points.v1` 信封形状；**Driver 侧**：`drivers/sinumerik-nck/src/targets.rs` 的 `TargetRef`/`DriveEntry`、`VariableDefinition` 的**字段集合与 digest 算法**、**`identity_template`/`identity_keys` 身份契约**。约束：
 
 1. 每个 PR **只允许**在其归属阶段**首次定义**核心契约；后续 PR 只能**消费**，不得改形状。
 2. 若某 PR 确需改核心契约，**必须**：先单独提交一个「契约变更」PR（含验收），再继续；**禁止**在同一 PR 内既改契约又改消费方并只跑一半验收。
 3. 每个 PR 的验收必须包含「该阶段全部必须原样通过的测试」+「该阶段必须改写的测试已改写且用例数不减少」。
-4. 阶段间不得并行修改同一文件：`point.rs`（PR-A 独占）、`targets.rs`/`compiler.rs`/`definition.rs`（PR-B 独占）、`nckPointModel.ts`/`NckPointFields.tsx`（PR-C 独占）、`AddDeviceFlow.tsx`（PR-D 独占）。共享文件（`deviceModel.ts`、`resourceSelectionModel.ts`、`presets.rs`、`browseModel.ts`）**每个 PR 只允许改其归属部分**，且必须在 PR 描述中列出改动的函数名。
+4. 阶段间不得并行修改同一文件：`point.rs`（PR-A 独占）、`targets.rs`/`compiler.rs`/`definition.rs`/`definitions/828d/**`/`DIGESTS.lock`（PR-B 独占）、`nckPointModel.ts`/`NckPointFields.tsx`（PR-C 独占）、`AddDeviceFlow.tsx`（PR-D 独占）。共享文件（`deviceModel.ts`、`resourceSelectionModel.ts`、`presets.rs`、`browseModel.ts`）**每个 PR 只允许改其归属部分**，且必须在 PR 描述中列出改动的函数名。
 
 ### PR-A：Core 契约
 
 | 项 | 内容 |
 |---|---|
-| 范围 | `crates/core-types/src/point.rs`（新增，**仅通用信封**）；`crates/core-api/src/lib.rs:228-258` 与 `bootstrap.rs:218-251` 的**白名单收敛**（按 Task Binding Kind 路由）；`runtime.rs:178` 随动；`data_semantics.rs` 三条断言改写；`AGENTS.md` 的 29 套纠错 |
+| 范围 | `crates/core-types/src/point.rs`（新增，**仅通用信封** + **通用键语法校验器 / 类型标签编码器**，**无身份推导**）；`crates/core-api/src/lib.rs:228-258` 与 `bootstrap.rs:218-251` 的**白名单收敛**（按 Task Binding Kind 路由）；`runtime.rs:178` 随动；`data_semantics.rs` 三条断言改写；`AGENTS.md` 的 29 套纠错 |
 | 依赖 | 无（最先） |
 | 不改 | 前端全部；NCK 驱动；`resource.rs` 形状；`schema.rs`；`descriptor.rs` |
-| 验收 | ① `cargo test --workspace` 全绿；② 契约 29/29；③ 前端 383/383（零改动）；④ 新单测覆盖 §2.4 信封层全部错误码；⑤ `mesa.resources.v1` 路径**逐字不变**（有专门用例）；⑥ **P9 断言**：Core 零 Siemens 知识、**无 Point Kind 白名单**；⑦ **`point_key` 规范编码（§4.1.1）冻结并含 E1–E5 用例**；⑧ §6.6 的 T1（Core 侧）/T2/T3 通过 |
-| 交付物 | 冻结的 `point.rs` 公开类型（信封层严格 + 参数层不透明）+ `point_key` 规范编码纯函数 + 双份白名单收敛为一份 + **保存反馈机制形态明确**（§3.3 末段，评审裁决 10） |
+| 验收 | ① `cargo test --workspace` 全绿；② 契约 29/29；③ 前端 383/383（零改动）；④ 新单测覆盖 §2.4 信封层全部错误码；⑤ `mesa.resources.v1` 路径**逐字不变**（有专门用例）；⑥ **P9 断言**：Core 零 Siemens 知识、**无 Point Kind 白名单**；⑦ **`point_key` 通用格式校验（§4.1.1 E/F/G/H）冻结并含 E1–E11 用例**；⑧ §6.6 的 T1（Core 侧）/T2/T3a/T5（Core 侧）通过；⑨ **修订 4 边界断言**：Core 侧**无**身份推导 API，且「格式合法但身份错误」的 Key 在 Core 侧**放行** |
+| 交付物 | 冻结的 `point.rs` 公开类型（信封层严格 + 参数层不透明）+ **通用键语法校验器与类型标签编码器**（**不含**身份推导）+ 双份白名单收敛为一份 + **保存反馈机制形态明确**（§3.3 末段，评审裁决 10） |
 
 ### PR-B：Driver Compiler
 
 | 项 | 内容 |
 |---|---|
-| 范围 | `drivers/sinumerik-nck/src/{definition.rs, compiler.rs, targets.rs, definitions/828d/*.json}`（新增）；`lib.rs` 的 descriptor 与 configure 重构；`presets.rs` 叶形态；`presets/828d.json` 语义化；`Cargo.toml` 加 `sha2`；`descriptor_contract`/`discovery_contract` 改写；新增 `definition_catalog.rs`/`semantic_equivalence.rs` |
+| 范围 | `drivers/sinumerik-nck/src/{definition.rs, compiler.rs, targets.rs, definitions/828d/*.json}`（新增，含 **`identity_template`/`identity_keys`**）；`lib.rs` 的 descriptor 与 configure 重构（**含 Configure 身份重算与 `POINT_KEY_MISMATCH` 拒绝**）；`presets.rs` 叶形态（**含 `identity` 块**）；`presets/828d.json` 语义化；`Cargo.toml` 加 `sha2`；`descriptor_contract`/`discovery_contract` 改写；新增 `definition_catalog.rs`/`semantic_equivalence.rs`；**`DIGESTS.lock` 的基线分支 CI 校验** |
 | 依赖 | **PR-A 合并**（消费 `PointSelection` 的形状）；且 **PR-A 必须已独立验收**（§7.1） |
 | 不改 | `native.rs`/`codec.rs`/`value.rs`/`client.rs`/`address.rs`/`identity_spec.rs`/`identity.rs`（1.3 冻结）；`legacy-828d-wire.json`（**一个字节都不许改**）；前端 |
-| 验收 | ① 62/62 字节等价（`checked == 62`，G4 的双入口断言成立）；② `UNSUPPORTED_DEFINITION_REVISION` 的三种禁止退化逐条有用例；③ 42 条定义 digest 与 `DIGESTS.lock` 一致；④ `legacy_equivalence`/`native_address`/`presets_828d`/`examples_828d`/`drive_access`/`identity_browse`/`sharp7_vectors` 原样通过；⑤ 契约 29/29；⑥ 前端 383/383（零改动）；⑦ **参数层严格校验 D1–D10 逐条有用例**；⑧ **§6.6 T1（Driver 侧）通过，Module 26/130 不折叠** |
-| 交付物 | Address Compiler 唯一入口 + **Driver 侧 `targets.rs`（TargetRef/DriveEntry）** + 定义目录（42 条 × revision 1）+ 语义等价门 |
+| 验收 | ① 62/62 字节等价（`checked == 62`，G4 的双入口断言成立）；② `UNSUPPORTED_DEFINITION_REVISION` 的三种禁止退化逐条有用例；③ 42 条定义 digest 与 `DIGESTS.lock` 一致；④ `legacy_equivalence`/`native_address`/`presets_828d`/`examples_828d`/`drive_access`/`identity_browse`/`sharp7_vectors` 原样通过；⑤ 契约 29/29；⑥ 前端 383/383（零改动）；⑦ **参数层严格校验 D1–D11 逐条有用例**；⑧ **§6.6 T1（Driver 侧）通过，Module 26/130 不折叠**；⑨ **T3b/T4 通过（身份契约 + 重算拒绝，唯一执行真值）**；⑩ **T5（Driver 侧编码器 golden 向量）通过**；⑪ **T6（基线分支 `DIGESTS.lock` 不可变）通过** |
+| 交付物 | Address Compiler 唯一入口 + **Driver 侧 `targets.rs`（TargetRef/DriveEntry）** + 定义目录（42 条 × revision 1，**含身份模板与身份键集合**）+ **Configure 身份重算与拒绝** + 语义等价门 + 基线分支 Lock 校验 |
 
 ### PR-C：Frontend 编辑器
 
@@ -1075,7 +1290,7 @@ native_key   := "native." area "." dec(area_no) "." dec(module) "." dec(column) 
 | 范围 | 新增 `nckPointModel.ts`、`NckPointFields.tsx` 及其测试；重构 `deviceModel.ts`（装配收敛 + kind 识别）、`addDevice/bootstrap.ts`（装配收敛）、`resourceSelectionModel.ts`（identity 扩展）、`browseModel.ts`（信封扩展）、`ResourcePickerAntd.tsx`（按 Kind 必填）、`AddDeviceFlow.tsx`（渲染入口） |
 | 依赖 | **PR-B 合并**（需要 descriptor 的实际形态与浏览叶形态） |
 | 不改 | `src/connection/**`（P3）、`DescriptorFields.tsx`（P4）、`ApplyWithRestart.tsx`（P4）、`resourceSelectionModel.ts:169-377` 的裁决算法 |
-| 验收 | ① 前端 ≥383 全过；② `264` 与 `134` 下界不降；③ 7 个受影响文件的新用例覆盖 §4.1 三条不变量与 §2.4 的按 Kind 必填；④ `pnpm typecheck` + `pnpm lint` 通过；⑤ 生产代码仍**零**硬编码 NCK 原生协议字段（除 `nck_native` 表单的显式字段声明） |
+| 验收 | ① 前端 ≥383 全过；② `264` 与 `134` 下界不降；③ 7 个受影响文件的新用例覆盖 §4.1 三条不变量、**驱动身份模板消费**（不得自行实现 Siemens 语义/不得自行排序）与 §2.4 的按 Kind 必填；④ `pnpm typecheck` + `pnpm lint` 通过；⑤ 生产代码仍**零**硬编码 NCK 原生协议字段（除 `nck_native` 表单的显式字段声明）；⑥ **T5（前端侧编码器与 E1–E11 golden 向量逐字一致）通过**；⑦ **Native 改名必须用户显式确认、无静默后缀**（附加 1） |
 | 交付物 | NCK 专用语义表单 + 唯一 Binding 装配入口 + 按 Kind 的必填校验 |
 
 ### PR-D：AddDeviceFlow + E2E
@@ -1099,7 +1314,9 @@ PR-A (Core 契约冻结)
 
 严格串行。任何跨阶段并行都必须先拆分出独立的「契约变更」PR。
 
-**评审要求（门禁，不得绕过）**：**PR-A 完成后必须独立验收，才能进入 PR-B**。即：`cargo test --workspace` 全绿 + 契约 29/29 + 前端 383/383 + §7 PR-A 的 ⑥⑦⑧ 专项用例（P9、`point_key` 规范编码 E1–E5、T1 Core 侧 / T2 / T3）全部通过并留证，方可开启 PR-B。**不得**「PR-A 未验收即开工 PR-B」，**不得**用 PR-B 的验收结果回填 PR-A。
+**评审要求（门禁，不得绕过）**：**PR-A 完成后必须独立验收，才能进入 PR-B**。即：`cargo test --workspace` 全绿 + 契约 29/29 + 前端 383/383 + §7 PR-A 的 ⑥⑦⑧⑨ 专项用例（P9、`point_key` **通用格式校验** E1–E11、T1 Core 侧 / T2 / T3a / T5 Core 侧、**Core 无身份推导**）全部通过并留证，方可开启 PR-B。**不得**「PR-A 未验收即开工 PR-B」，**不得**用 PR-B 的验收结果回填 PR-A。
+
+**修订 4 的补充门禁**：**身份契约（`identity_template`/`identity_keys`）与 Configure 重算拒绝属于 PR-B**，因此 PR-A **不得**为「提前验证身份」而在 Core 侧引入任何 Siemens 知识或身份推导函数；反之 PR-B **不得**把身份一致性校验推给 Core。
 
 ---
 
@@ -1121,7 +1338,7 @@ PR-A (Core 契约冻结)
 | 8 | **840D sl** | **不纳入本次**；`DECLARED_FAMILIES` 仍含 `840d-sl`（N1）但**无任何定义**，必须明确「该系列无定义可引用」，**不得**套用 828D | §2.5 `family`、§8.2 | 真机/文档证据 |
 | 9 | **Native 限权** | 本期采用**只读约束**（沿用 V1 只读基线 + `nck_native` 仅前端警告、不得作为默认路径），**不额外引入复杂权限系统** | §2.3 | 产品裁决（若将来需要「仅管理员可用」） |
 | 10 | **Revision 保存校验** | **Driver 负责最终校验**；Core 保存门禁只做**信封层**校验；**保存反馈机制在 PR-A 明确** | §3.3 末段、§2.8 #12、§7 PR-A 交付物 | PR-A 实施设计（descriptor 可用时是否多一次只读校验调用） |
-| 11 | **Point Key 规范** | **PR-A 必须确定**（本次已给出规范：编码算法 + NFC + 256 字节上限 + E1–E5） | §4.1.1、§7 PR-A | 无 |
+| 11 | **Point Key 规范** | **PR-A 必须确定**（本次已给出规范：**通用键语法 + 类型标签编码 + 数字规范化 + 对象键序/递归/深度上限 + 三态 + 256 字节上限 + E1–E11**）；**修订 4 后：身份推导归 Driver，Core 只做通用格式校验** | §4.1.1（A–K）、§7 PR-A/PR-B | 无 |
 | 12 | **Golden 双轨** | 重构期间**保留双轨**（`legacy_equivalence` + `semantic_equivalence`），**完成独立验收后再评估精简** | §1.3、§3.4、§6.5 | 独立验收完成后评估 |
 
 > 计数说明：评审清单表述为「11 项处理决定」，本文档按原 §8 的**12 行**逐项裁决（其中「Point Key 规范」即原 §8-11「`point_key` 字符集与长度上限」，本次已由 §4.1.1 定稿）。
@@ -1134,10 +1351,21 @@ PR-A (Core 契约冻结)
 | `r0031` 的**访问能力** | 需真机复测（§8.1-7） | 定义保留 + `candidate` + 访问能力 HOLD |
 | `840d-sl` 的**定义目录** | 需真机/文档证据（§8.1-8） | 设备可选但**无可配点位**；拒绝时必须明确报「该系列无定义」 |
 | 19 条参数的**手册页码** | 可离线核实（§8.1-6） | 未提供前一律 `parameter_identity`，ID 不得升级为业务语义名 |
-| **`DIGESTS.lock` 的 CI 强制形式** | 实施设计（原 §8-8） | 锁文件格式、CI 步骤、与 `scripts/contract_suites.py` 的关系在 **PR-B** 明确 |
+| **`DIGESTS.lock` 的 CI 强制形式** | 实施设计（原 §8-8） | 锁文件格式、CI 步骤、与 `scripts/contract_suites.py` 的关系在 **PR-B** 明确；**必须对照基线分支**比对已发布 `(variable_id, revision)`（附加 2），**仅允许新增 revision** |
 | **`nck_native` 是否服务端限权** | 产品裁决（§8.1-9） | 本期只读约束 + 前端警告 |
 
 **范围外（明确不做）**：840D sl 定义、用户导入定义、Core 变量知识库、Core 编译快照（v1）、新增 proto/IPC 消息、新增 `FieldType`、新增 NCK area 字母、真机/网络访问（见附录 A）。
+
+### 8.3 第二轮复审已裁决（2 项 P0 + 2 项附加要求）
+
+第二轮复审结论 = **架构有条件通过**；以下两项 P0 关闭后方可启动 PR-A。此后评审**只看「Point Key 契约差异 + 对应测试样例」**，本表即该契约的索引。
+
+| # | 事项 | 裁决 | 落实位置 | 阶段归属 |
+|---|---|---|---|---|
+| **P0-1**（修订 4） | **Point Key 职责边界** | **NCK Driver** 负责语义身份解析与规范 Key 生成（发布身份模板与身份键集合）；**Frontend** 消费驱动预览/模板（不得自行实现 Siemens 语义）；**Core** 只校验非空 / 长度 / 合法编码 / Endpoint 内唯一；**Configure 重算并拒绝不一致**为**唯一执行真值**；「身份与 revision 无关」由 **Driver 侧独立测试**证明（**不得**让 Core 依赖 NCK 参数证明） | §2.1-3、§2.2、§2.3、§2.4、§2.4.2 **D11**、§2.6、§2.7、§2.8 **#19–#21**、§4.1.1 **A–D**、§4.2 **R13/R14**、§6.6 **T3a/T3b/T4** | **PR-A**（Core 通用校验 + 边界断言）+ **PR-B**（身份契约与重算拒绝） |
+| **P0-2**（修订 5） | **Point Key 规范输入类型编码** | 每个值 = **类型标签 + 规范载荷**（`s/i/d/b/z/o/a`）；**数字规范化**（`1.0`≡`1`、`1e2`≡`100`、`-0`→`0`、`2^53` 与 `1e-9` 越界即拒）；**对象键序无关**（字节序升序）+ **显式括号** + **递归** + **深度上限 4** + **未知键在身份计算前由 Driver 拒绝**；**null / 缺省 / 空串三态可区分**；数组保序；**禁止** `String(value)`/`JSON.stringify(value)` 作为通用编码 | §4.1.1 **E–K**、§2.2/§2.3 示例、§6.1/§6.2/§6.3 单测、§6.6 **T5** | **PR-A**（校验器与编码器冻结 + E1–E11）+ **PR-B/PR-C**（三处共享同一 golden 向量） |
+| 附加 1 | **Native 冲突后缀必须用户显式确认** | `~<n>` 是 UI 给出的**建议逻辑 Key**，**不是**身份生成器自动产生的标准后缀；**必须用户显式确认**；**Core 只负责唯一性，不得替用户静默改名** | §4.1.1 **K**、§4.1.2 第 1/3 条、§6.3 | **PR-A**（后缀语法）+ **PR-C**（UI 确认流程） |
+| 附加 2 | **`DIGESTS.lock` 防止修改既有 Revision** | 普通 CI（重算当前文件 vs 当前 Lock）**挡不住同时改两者**；必须**对照基线分支**校验：已发布 `(variable_id, revision)` **不可变化，只允许新增 Revision** | §3.1、§6.2、§6.6 **T6**、§8.2 | **PR-B**（**不阻塞 PR-A**） |
 
 ---
 
@@ -1147,6 +1375,10 @@ PR-A (Core 契约冻结)
 |---|---|
 | Core 变量知识库 / 变量名清单 | 决策 3：定义来源是 Driver 内置，Core 不硬编码 Siemens 知识 |
 | Core 侧的 Siemens Target 类型与 Point Kind 白名单 | 修订 1：`TargetRef`/`DriveEntry` 属 Driver（`targets.rs`）；Core 只要求 `kind` 非空字符串 |
+| **Core 侧的身份推导**（`canonical_identity` 生成、身份模板拼装、Siemens 键排序） | **修订 4（P0-1）**：身份推导归 Driver；Core 只做**通用格式校验**（§4.1.1 B/D） |
+| **前端自行实现 Siemens 身份语义**（自定身份键集合、自行排序、由 `variable_id` 反推 target/arguments） | **修订 4（P0-1）**：前端只**消费**驱动模板做通用替换（§4.1.1 B/C） |
+| **运行期自动递增 `~<n>` 后缀 / 静默改名** | **附加 1**：后缀必须用户显式确认；Core 只负责唯一性（§4.1.2） |
+| **用语言运行时的 `String(value)` / `JSON.stringify(value)` 作为 Key 编码** | **修订 5（P0-2）**：必须使用类型标签 + 规范载荷编码（§4.1.1 F/G/R12） |
 | 用户导入定义 | 决策 3 |
 | Core 编译快照 | 版本策略：第一版不引入；若将来驱动可能删除旧 revision 再评估，且必须明确唯一执行真值、不一致即拒绝运行 |
 | 新的 proto/IPC 消息或字段 | B3：kind/config 已透传 |
