@@ -19,6 +19,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # 定义目录的 DIGESTS.lock 必须**对照 PR base** 校验（附加 2 / T6）：
+          # 浅克隆拿不到基线提交，因此需要全量历史。
+          # 先例：ci.yml:53-60 的 plan job 已是 fetch-depth: 0 + BASE/HEAD。
+          fetch-depth: 0
 
       - name: Rust setup
         uses: ./.github/actions/rust-ci-setup
@@ -39,6 +44,16 @@ jobs:
 
       - name: FOCAS offline diff self-test
         run: python3 tools/ci/test_focas_diff.py
+
+      - name: NCK definition lock self-test
+        run: python3 tools/ci/test_nck_definition_lock.py
+
+      # 已发布 (variable_id, revision) 不可原地修改：普通 CI（重算当前文件 vs 当前
+      # Lock）挡不住「同时改定义与 Lock」，因此必须对照 PR base 的 Lock 比对。
+      - name: NCK definition lock vs PR base
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 tools/ci/nck_definition_lock.py --base "$BASE"
 
       - name: sccache stats
         if: always()

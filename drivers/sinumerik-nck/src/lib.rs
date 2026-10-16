@@ -15,19 +15,33 @@
 mod address;
 mod client;
 mod codec;
+mod compiler;
 mod config;
+mod definition;
 mod fixture;
 mod identity;
 mod identity_spec;
 mod native;
 mod presets;
 mod probe;
+mod targets;
 mod value;
 
 pub use address::{AddressError, NckArea, NckUnitMode};
 pub use client::{NckClient, NckReadItem, NckReadResult};
 pub use codec::{CodecError, NckWireAddress, encode_var_spec};
+pub use compiler::{
+    AddressCompiler, CompileError, CompileInput, CompiledPoint, DefinitionRef, IdentityMode,
+    NATIVE_IDENTITY_MODE_KEY, NATIVE_PARAMETER_KEYS, POINT_KIND_NATIVE, POINT_KIND_VARIABLE,
+    ensure_batch_identity_namespace_unique,
+};
 pub use config::{NCK_DEFAULT_PORT, NckConnConfig};
+pub use definition::{
+    AddressingRule, ArgType, ArgumentSpec, CatalogError, DEFINITION_FORMAT_VERSION,
+    DefinitionCatalog, DefinitionScope, DefinitionSource, DigestError, GoldenRef, IdentityKeySpec,
+    InvalidRuleSpec, LockEntry, MIN_DEFINITION_REVISION, NativeFieldSource, SemanticsStatus,
+    SourceKind, VariableDefinition,
+};
 pub use fixture::{NckFixture, NckFixtureState};
 pub use identity_spec::{
     AXIS_CTRLOUT_MODULE_NR, AXIS_CTRLOUT_TYPE, AXIS_ENC_MODULE_NR, AXIS_NAME, AXIS_SPIND_ASSIGN,
@@ -41,6 +55,7 @@ pub use native::{
 };
 pub use presets::{PresetRegistry, PresetTemplate};
 pub use probe::{NCK_ANCHOR_PENDING, probe_with_session};
+pub use targets::{DriveEntry, DriveObjectRef, MAX_TARGET_INSTANCE, TargetKind, TargetRef};
 pub use value::{NckDataKind, NckSample, ValueError, decode_value};
 
 use mesa_core_types::{AcquisitionTask, DriverMetadata, PointDescriptor, PointMap};
@@ -593,28 +608,49 @@ impl DriverConnection for NckConnection {
         Ok(probe_with_session(&self.cfg).await)
     }
 
-    /// 通用绑定 `mesa.resources.v1`（resource_id `variable`）→ 原生地址解析 →
-    /// PointDescriptor。未知变量/非法参数/单项超 PDU 即配置拒绝
-    /// （fail-closed，不进运行期；不查任何目录）。
+    /// 语义点位信封 `nck.points.v1`（**Task Binding Kind**）→ **逐点**按 Point Kind
+    /// 路由到 Address Compiler → `PointDescriptor`。
+    ///
+    /// 契约（边界文档 §2.2 M2、§3.3、§3.5 B 段）：
+    /// - 入口从「读 `GenericBinding` → 逐 output → `from_parameters`」改为
+    ///   「读 `PointBinding` → 逐 point 按 Point Kind 路由 → 逐点 `CompileError`」；
+    /// - **任一点失败即整体失败**（fail-closed），且**不写入计划**——任务不得启动；
+    /// - 旧 `mesa.resources.v1` 一律 `UNSUPPORTED_BINDING`（破坏性变更，不做迁移）；
+    /// - `identity_mode` 只由 Address Compiler 处理，**不传入**原生解析器；
+    /// - 批次内 `identity_mode="user"` 身份冲突提前反馈（B-2，**仅可见集合**）；
+    /// - `DUPLICATE_POINT_KEY` 仍是驱动侧「同任务/同批次重复」的权威码。
     async fn configure(
         &self,
         revision: u64,
         tasks: Vec<AcquisitionTask>,
     ) -> Result<Vec<PointDescriptor>, SdkDriverError> {
         use mesa_core_types::{
-            DuplicatePointKey, GENERIC_BINDING_KIND, GenericBinding, TaskSchedule,
-            ensure_unique_point_keys, validate_selections_structure,
+            DuplicatePointKey, NCK_POINTS_BINDING_KIND, PointBinding, TaskSchedule,
+            ensure_unique_point_keys,
         };
+        // 内嵌定义目录：装载即全量自检（ID 形状 / 身份覆盖 / 摘要一致）。
+        // 失败属**构建期**缺陷，映射为 Internal 的 DEFINITION_DIGEST_MISMATCH。
+        let catalog = DefinitionCatalog::embedded().map_err(|e| {
+            SdkDriverError::new(
+                mesa_core_types::ErrorKind::Internal,
+                e.code(),
+                e.to_string(),
+            )
+        })?;
+        let compiler = AddressCompiler::new(&catalog, &self.cfg.family);
         let mut new_points: Vec<PointSpec> = Vec::new();
         let mut new_tasks: Vec<TaskPlan> = Vec::new();
+        // B-2 的可见集合（最终 point_key + 身份模式）；仅用于批次内提前反馈。
+        let mut visible_keys: Vec<(String, IdentityMode)> = Vec::new();
         for task in &tasks {
             task.validate()
                 .map_err(|e| SdkDriverError::configuration("INVALID_TASK", e.to_string()))?;
-            if task.binding.kind != GENERIC_BINDING_KIND {
+            if task.binding.kind != NCK_POINTS_BINDING_KIND {
                 return Err(SdkDriverError::configuration(
                     "UNSUPPORTED_BINDING",
                     format!(
-                        "task `{}`: sinumerik-nck 只接受 {GENERIC_BINDING_KIND}",
+                        "task `{}`: sinumerik-nck 只接受 {NCK_POINTS_BINDING_KIND}\
+                         （旧 mesa.resources.v1 点位配置整体拒绝，不做隐式迁移）",
                         task.id
                     ),
                 ));
@@ -630,106 +666,72 @@ impl DriverConnection for NckConnection {
                     ),
                 ));
             };
-            let binding: GenericBinding = serde_json::from_value(task.binding.config.clone())
+            // 信封层严格：Core 已校验一层，Driver 复核（deny_unknown_fields）。
+            let binding = PointBinding::from_json(&task.binding.config).map_err(|e| {
+                SdkDriverError::configuration(
+                    "INVALID_BINDING_CONFIG",
+                    format!("task `{}`: invalid point binding: {e}", task.id),
+                )
+            })?;
+            let mut indices = Vec::new();
+            for point in &binding.points {
+                // 唯一转换入口：Point Kind 路由 + 参数层严格校验 + 身份重算/比对。
+                let compiled = compiler
+                    .compile_point(&point.kind, &point.parameters, &point.point_key)
+                    .map_err(|e| {
+                        SdkDriverError::new(e.kind(), e.code(), format!("task `{}`: {e}", task.id))
+                    })?;
+                let rp = &compiled.resolved;
+                // P2-1：Configure 期提前拦截「单项装不下」的配置，避免
+                // 「配置成功、启动后才在读取时报 READ_ITEM_TOO_LARGE」。
+                //
+                // 判定用**请求的** PDU：协商只向下取 min（见 s7-transport
+                // `parse_setup_ack`），所以这里判失败 ⇒ 协商后必然也失败，
+                // 是可靠的必要条件；判通过仍可能在协商到更小 PDU 后失败，
+                // 权威检查因此保留在读取时（fail-closed，不静默发超长请求）。
+                mesa_s7_transport::read_var::check_single_item_fits(
+                    &mesa_s7_transport::S7ReadVarItem {
+                        var_spec: encode_var_spec(&rp.wire),
+                        expected_data_len: rp.expected_data_len,
+                    },
+                    self.cfg.requested_pdu_length,
+                    false,
+                )
                 .map_err(|e| {
-                    SdkDriverError::configuration(
-                        "INVALID_BINDING_CONFIG",
-                        format!("task `{}`: invalid generic binding: {e}", task.id),
+                    SdkDriverError::new(
+                        mesa_core_types::ErrorKind::Configuration,
+                        e.code,
+                        format!(
+                            "point `{}`: count={} × {} 字节装不进请求 PDU {}（{}）；\
+                             请减小 count 或增大连接 `pdu_length`——协商 PDU 只会更小，\
+                             该配置在当前连接参数下无法读取",
+                            point.point_key,
+                            rp.wire.line_count,
+                            rp.kind.byte_len(),
+                            self.cfg.requested_pdu_length,
+                            e.message
+                        ),
                     )
                 })?;
-            validate_selections_structure(&binding.selections)
-                .map_err(|e| SdkDriverError::configuration("INVALID_BINDING_CONFIG", e))?;
-            let mut indices = Vec::new();
-            for sel in &binding.selections {
-                if sel.resource_id != GENERIC_RESOURCE_ID {
-                    return Err(SdkDriverError::configuration(
-                        "UNSUPPORTED_RESOURCE",
-                        format!("task `{}`: sinumerik-nck 只支持 variable", task.id),
-                    ));
-                }
-                for out in &sel.outputs {
-                    // 纵深校验：Driver 不依赖 UI 自动填充，也不依赖 Core
-                    // 前置 Schema 校验；输出必须正好是 value。
-                    if out.output != "value" {
-                        return Err(SdkDriverError::configuration(
-                            "UNSUPPORTED_OUTPUT",
-                            format!(
-                                "point `{}`: sinumerik-nck 只支持 output `value`",
-                                out.point_key
-                            ),
-                        ));
-                    }
-                    let params = sel.parameters.as_object().ok_or_else(|| {
-                        SdkDriverError::configuration(
-                            "INVALID_VARIABLE",
-                            format!("point `{}`: parameters 需为对象", out.point_key),
-                        )
-                    })?;
-                    // 唯一解析链：原生字段 → 校验 → wire/类型/规则。
-                    // 不查目录、不按名称推导、不做旧配置迁移。
-                    let addr = NativeNckAddress::from_parameters(params).map_err(|e| {
-                        SdkDriverError::new(
-                            mesa_core_types::ErrorKind::Address,
-                            "INVALID_VARIABLE",
-                            format!("point `{}`: {e}", out.point_key),
-                        )
-                    })?;
-                    let rp = resolve_native(addr).map_err(|e| {
-                        SdkDriverError::new(
-                            mesa_core_types::ErrorKind::Address,
-                            "INVALID_VARIABLE",
-                            format!("point `{}`: {e}", out.point_key),
-                        )
-                    })?;
-                    // P2-1：Configure 期提前拦截「单项装不下」的配置，避免
-                    // 「配置成功、启动后才在读取时报 READ_ITEM_TOO_LARGE」。
-                    //
-                    // 判定用**请求的** PDU：协商只向下取 min（见 s7-transport
-                    // `parse_setup_ack`），所以这里判失败 ⇒ 协商后必然也失败，
-                    // 是可靠的必要条件；判通过仍可能在协商到更小 PDU 后失败，
-                    // 权威检查因此保留在读取时（fail-closed，不静默发超长请求）。
-                    mesa_s7_transport::read_var::check_single_item_fits(
-                        &mesa_s7_transport::S7ReadVarItem {
-                            var_spec: encode_var_spec(&rp.wire),
-                            expected_data_len: rp.expected_data_len,
-                        },
-                        self.cfg.requested_pdu_length,
-                        false,
-                    )
-                    .map_err(|e| {
-                        SdkDriverError::new(
-                            mesa_core_types::ErrorKind::Configuration,
-                            e.code,
-                            format!(
-                                "point `{}`: count={} × {} 字节装不进请求 PDU {}（{}）；\
-                                 请减小 count 或增大连接 `pdu_length`——协商 PDU 只会更小，\
-                                 该配置在当前连接参数下无法读取",
-                                out.point_key,
-                                rp.wire.line_count,
-                                rp.kind.byte_len(),
-                                self.cfg.requested_pdu_length,
-                                e.message
-                            ),
-                        )
-                    })?;
-                    indices.push(new_points.len());
-                    tracing::debug!(
-                        key = %out.point_key,
-                        canonical = %rp.address.source_label(),
-                        "NCK 原生地址已解析",
-                    );
-                    new_points.push(PointSpec {
-                        key: out.point_key.clone(),
-                        source_label: rp.address.source_label(),
-                        wire: rp.wire,
-                        kind: rp.kind,
-                        expected_len: rp.expected_data_len,
-                        expected_transport_size: rp.expected_transport_size,
-                        data_type: rp.data_type,
-                        unit: rp.address.unit.clone(),
-                        invalid_rule: rp.invalid_rule,
-                    });
-                }
+                indices.push(new_points.len());
+                visible_keys.push((point.point_key.clone(), compiled.identity_mode));
+                tracing::debug!(
+                    key = %point.point_key,
+                    canonical = %compiled.source_label,
+                    mode = compiled.identity_mode.as_str(),
+                    "NCK 点位已编译",
+                );
+                new_points.push(PointSpec {
+                    key: point.point_key.clone(),
+                    source_label: compiled.source_label.clone(),
+                    wire: rp.wire,
+                    kind: rp.kind,
+                    expected_len: rp.expected_data_len,
+                    expected_transport_size: rp.expected_transport_size,
+                    data_type: rp.data_type,
+                    unit: compiled.address.unit.clone(),
+                    invalid_rule: rp.invalid_rule,
+                });
             }
             new_tasks.push(TaskPlan {
                 id: task.id.clone(),
@@ -737,6 +739,13 @@ impl DriverConnection for NckConnection {
                 point_indices: indices,
             });
         }
+        // B-2：**仅在该次 configure 可见的点位集合内**的 user 命名空间冲突。
+        // 它不是 Endpoint-wide 保证（Driver 看不到其它 Task），跨任务/跨 kind
+        // 的唯一性仍由 Core 的 `DUPLICATE_POINT_KEY` 唯一裁决。
+        ensure_batch_identity_namespace_unique(visible_keys.iter().map(|(k, m)| (k.as_str(), *m)))
+            .map_err(|e| {
+                SdkDriverError::new(e.kind(), e.code(), format!("revision {revision}: {e}"))
+            })?;
         let descriptors: Vec<PointDescriptor> = new_points
             .iter()
             .map(|p| PointDescriptor {
@@ -1376,30 +1385,62 @@ mod tests {
         conn_with_presets(PresetRegistry::embedded())
     }
 
-    fn poll_task(id: &str, selections: serde_json::Value) -> AcquisitionTask {
+    /// 828d 连接：语义点位只对 `definitions/828d/**` 有定义（`840d-sl` 无任何定义，
+    /// 被引用时必须明确报「该系列无定义」，不得套用 828D）。
+    fn conn_828d() -> NckConnection {
+        NckConnection::with_presets(
+            NckConnConfig::from_json(&serde_json::json!({
+                "host": "127.0.0.1", "family": "828d",
+                "local_tsap": 256, "remote_tsap": 258,
+            }))
+            .unwrap(),
+            PresetRegistry::embedded(),
+        )
+    }
+
+    /// `nck.points.v1`（Task Binding Kind）任务的点位载荷。
+    ///
+    /// PR-B 起 NCK **只接受**这个信封：旧 `mesa.resources.v1` + `variable` 资源
+    /// 的点位配置整体拒绝（`UNSUPPORTED_BINDING`），不做隐式迁移。
+    fn poll_task(id: &str, points: serde_json::Value) -> AcquisitionTask {
         AcquisitionTask {
             id: id.into(),
             schedule: mesa_core_types::TaskSchedule::Poll { interval_ms: 50 },
             binding: mesa_core_types::DriverBinding {
-                kind: mesa_core_types::GENERIC_BINDING_KIND.into(),
-                config: serde_json::json!({"selections": selections}),
+                kind: mesa_core_types::NCK_POINTS_BINDING_KIND.into(),
+                config: serde_json::json!({ "points": points }),
             },
         }
     }
 
-    /// 原生地址选择项（脚手架数值，非 Siemens 语义：C/1/module18/column42，
-    /// line=3，F64_BE/0x09，与 fixture 缺省响应自洽）。
-    fn speed_selection(point_key: &str) -> serde_json::Value {
-        serde_json::json!([{
-            "resource_id": "variable",
-            "parameters": {
-                "area": "C", "area_no": 1, "module": 18, "column": 42,
-                "line": 3, "count": 1, "unit_mode": "current",
-                "decode": "F64_BE", "transport_size": "0x09",
-                "unit": "mm/min",
-            },
-            "outputs": [{"output": "value", "point_key": point_key}],
-        }])
+    /// 脚手架原生地址：C/1/module18/column42、F64_BE/0x09，与 fixture 缺省响应自洽。
+    ///
+    /// `identity_mode="derived"`（默认）时 `point_key` **必须**逐字等于地址的规范
+    /// 函数 `native.<area>.<area_no>.<module>.<column>.<line>`，否则
+    /// `POINT_KEY_MISMATCH`（这就是 D11 唯一执行真值的日常体现）。
+    const SPEED_KEY_LINE3: &str = "native.C.1.18.42.3";
+    const SPEED_KEY_LINE4: &str = "native.C.1.18.42.4";
+
+    fn speed_parameters(line: u64) -> serde_json::Value {
+        serde_json::json!({
+            "area": "C", "area_no": 1, "module": 18, "column": 42,
+            "line": line, "count": 1, "unit_mode": "current",
+            "decode": "F64_BE", "transport_size": "0x09",
+            "unit": "mm/min",
+        })
+    }
+
+    /// 一个 `nck_native` 点位（`params_mut` 用于改 count / 加 identity_mode 等）。
+    fn native_point(point_key: &str, line: u64) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "nck_native",
+            "point_key": point_key,
+            "parameters": speed_parameters(line),
+        })
+    }
+
+    fn speed_points(point_key: &str, line: u64) -> serde_json::Value {
+        serde_json::Value::Array(vec![native_point(point_key, line)])
     }
 
     /// DriverResolved 闭环：原生 `decode + count` → configure →
@@ -1415,108 +1456,270 @@ mod tests {
         );
         // count=1 → F64（decode=F64_BE）
         let conn = conn_with_synthetic();
-        let params = serde_json::json!({
-            "area": "C", "area_no": 1, "module": 18, "column": 42,
-            "line": 3, "count": 1, "unit_mode": "current",
-            "decode": "F64_BE", "transport_size": "0x09",
-        });
+        let params = speed_parameters(3);
         let issues = var.parameters.validate_instance("parameters", &params);
         assert!(issues.is_empty(), "{issues:?}");
         let descs = conn
-            .configure(1, vec![poll_task("t1", speed_selection("k1"))])
+            .configure(1, vec![poll_task("t1", speed_points(SPEED_KEY_LINE3, 3))])
             .await
             .unwrap();
         assert_eq!(descs[0].data_type, mesa_core_types::DataType::F64);
         // count=3 → F64Array（与 pack_array 同口径）
-        let mut sel3 = speed_selection("k3");
-        sel3[0]["parameters"]["count"] = serde_json::json!(3);
-        let params3 = sel3[0]["parameters"].clone();
+        let mut p3 = native_point(SPEED_KEY_LINE3, 3);
+        p3["parameters"]["count"] = serde_json::json!(3);
+        let params3 = p3["parameters"].clone();
         let issues3 = var.parameters.validate_instance("parameters", &params3);
         assert!(issues3.is_empty(), "{issues3:?}");
         let descs3 = conn
-            .configure(2, vec![poll_task("t2", sel3)])
+            .configure(2, vec![poll_task("t2", serde_json::json!([p3]))])
             .await
             .unwrap();
         assert_eq!(descs3[0].data_type, mesa_core_types::DataType::F64Array);
     }
 
+    /// 矩阵 #42：`nck.points.v1` 信封 ⇒ configure 成功（新入口可用）。
+    #[tokio::test]
+    async fn configure_accepts_nck_points_envelope() {
+        let conn = conn_with_synthetic();
+        let descs = conn
+            .configure(1, vec![poll_task("t1", speed_points(SPEED_KEY_LINE3, 3))])
+            .await
+            .expect("语义信封必须被接受");
+        assert_eq!(descs.len(), 1);
+        assert_eq!(descs[0].point_key, SPEED_KEY_LINE3);
+        assert_eq!(descs[0].data_type, mesa_core_types::DataType::F64);
+        assert_eq!(descs[0].unit.as_deref(), Some("mm/min"));
+        assert_eq!(
+            descs[0].source_label.as_deref(),
+            Some("nck://read/C/1/18/42/3/1?mode=current&decode=F64_BE&transport=0x09"),
+            "source_label 是原生地址标识，不得拼接 variable_id"
+        );
+    }
+
+    /// 矩阵 #43：旧 `mesa.resources.v1` + `variable` 资源 ⇒ `UNSUPPORTED_BINDING`。
+    #[tokio::test]
+    async fn configure_rejects_legacy_resource_selection() {
+        let conn = conn_with_synthetic();
+        let mut task = poll_task("t1", speed_points(SPEED_KEY_LINE3, 3));
+        task.binding.kind = mesa_core_types::GENERIC_BINDING_KIND.into();
+        task.binding.config = serde_json::json!({
+            "selections": [{
+                "resource_id": "variable",
+                "parameters": speed_parameters(3),
+                "outputs": [{"output": "value", "point_key": SPEED_KEY_LINE3}],
+            }]
+        });
+        let err = conn.configure(1, vec![task]).await.unwrap_err();
+        assert_eq!(err.code, "UNSUPPORTED_BINDING");
+    }
+
+    /// **T4 / 矩阵 #15（lib.rs 侧 e2e）**：任一点身份不符 ⇒ configure **整体失败**、
+    /// **计划未被写入**（任务不得启动）。
+    #[tokio::test]
+    async fn t4_configure_fails_whole_batch_and_leaves_no_plan() {
+        let conn = conn_with_synthetic();
+        // 3 点任务：第 2 点 Key 与地址不符（差一个 line）。
+        let points = serde_json::json!([
+            native_point(SPEED_KEY_LINE3, 3),
+            native_point("native.C.1.18.42.99", 3),
+            native_point(SPEED_KEY_LINE4, 4),
+        ]);
+        let err = conn
+            .configure(1, vec![poll_task("t1", points)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "POINT_KEY_MISMATCH");
+        assert!(
+            conn.plan.read().unwrap().is_none(),
+            "失败路径不得留下任何计划"
+        );
+        // 修好后仍可提交（失败不污染后续 configure）。
+        conn.configure(2, vec![poll_task("t1", speed_points(SPEED_KEY_LINE3, 3))])
+            .await
+            .unwrap();
+        assert!(conn.plan.read().unwrap().is_some());
+    }
+
+    /// **T1（Driver 侧）**：同一任务混合 `nck_variable` 与 `nck_native` ⇒ 成功且
+    /// **逐点**路由到两条分支（用点位级断言证明路由，而不是只看总数）。
+    #[tokio::test]
+    async fn t1_mixed_point_kinds_route_per_point() {
+        let conn = conn_828d();
+        let semantic_key = "channel.program.status@channel=i:1";
+        let points = serde_json::json!([
+            native_point(SPEED_KEY_LINE3, 3),
+            {
+                "kind": "nck_variable",
+                "point_key": semantic_key,
+                "parameters": {
+                    "variable_id": "channel.program.status",
+                    "definition_revision": 1,
+                    "target": {"channel": 1},
+                    "arguments": {},
+                },
+            },
+        ]);
+        let descs = conn
+            .configure(1, vec![poll_task("t1", points)])
+            .await
+            .unwrap();
+        assert_eq!(descs.len(), 2);
+        assert_eq!(descs[0].point_key, SPEED_KEY_LINE3);
+        assert_eq!(descs[1].point_key, semantic_key);
+        // 语义点：U16_LE → U32（count=1），且地址来自定义目录的 addressing。
+        assert_eq!(descs[1].data_type, mesa_core_types::DataType::U32);
+        assert_eq!(
+            descs[1].source_label.as_deref(),
+            Some("nck://read/C/1/127/13/1/1?mode=current&decode=U16_LE&transport=0x09"),
+            "语义点的 source_label 仍是原生地址标识（不拼接 variable_id）"
+        );
+    }
+
+    /// 840d-sl 无任何定义：语义点位必须明确报「该系列无定义」（`UNSUPPORTED_FAMILY`），
+    /// **不得**套用 828D 的定义（§6 能力边界）。
+    #[tokio::test]
+    async fn semantic_point_on_840d_sl_reports_unsupported_family() {
+        let conn = conn_with_synthetic(); // family = 840d-sl
+        let points = serde_json::json!([{
+            "kind": "nck_variable",
+            "point_key": "channel.program.status@channel=i:1",
+            "parameters": {
+                "variable_id": "channel.program.status",
+                "definition_revision": 1,
+                "target": {"channel": 1},
+                "arguments": {},
+            },
+        }]);
+        let err = conn
+            .configure(1, vec![poll_task("t1", points)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "UNSUPPORTED_FAMILY");
+        assert!(err.message.contains("828d"), "{}", err.message);
+    }
+
+    /// 参数层与身份层的 fail-closed 面（PR-B 起：旧字段/旧资源/旧入口全部拒绝）。
     #[tokio::test]
     async fn configure_ok_and_rejects() {
         let conn = conn_with_synthetic();
         // 合法：descriptor 类型 F64 + unit 回填。
         let descs = conn
-            .configure(1, vec![poll_task("t1", speed_selection("axis3.speed"))])
+            .configure(1, vec![poll_task("t1", speed_points(SPEED_KEY_LINE3, 3))])
             .await
             .unwrap();
         assert_eq!(descs.len(), 1);
-        assert_eq!(descs[0].point_key, "axis3.speed");
+        assert_eq!(descs[0].point_key, SPEED_KEY_LINE3);
         assert_eq!(descs[0].data_type, mesa_core_types::DataType::F64);
         assert_eq!(descs[0].unit.as_deref(), Some("mm/min"));
 
-        // 旧模型字段 fail-closed（不迁移、不隐式推导）。
-        let mut bad_sel = speed_selection("k");
-        bad_sel[0]["parameters"]["variable"] = serde_json::json!("noSuchVar");
+        // 参数层未知字段 fail-closed（旧模型字段 `variable` 也不再被容忍）。
+        let mut bad = native_point(SPEED_KEY_LINE3, 3);
+        bad["parameters"]["variable"] = serde_json::json!("noSuchVar");
         let err = conn
-            .configure(2, vec![poll_task("t2", bad_sel)])
+            .configure(2, vec![poll_task("t2", serde_json::json!([bad]))])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "INVALID_BINDING_CONFIG");
+
+        // 非法原生字段（未知 transport）同样 fail-closed（复用原生解析链的码）。
+        let mut bad_ts = native_point(SPEED_KEY_LINE3, 3);
+        bad_ts["parameters"]["transport_size"] = serde_json::json!("0x04");
+        let err = conn
+            .configure(7, vec![poll_task("t7", serde_json::json!([bad_ts]))])
             .await
             .unwrap_err();
         assert_eq!(err.code, "INVALID_VARIABLE");
 
-        // 非法原生字段（未知 transport）同样 fail-closed。
-        let mut bad_ts = speed_selection("k");
-        bad_ts[0]["parameters"]["transport_size"] = serde_json::json!("0x04");
+        // identity_mode 取值非法 ⇒ INVALID_BINDING_CONFIG（Compiler 元数据严格校验）。
+        let mut bad_mode = native_point(SPEED_KEY_LINE3, 3);
+        bad_mode["parameters"]["identity_mode"] = serde_json::json!("Derived");
         let err = conn
-            .configure(7, vec![poll_task("t7", bad_ts)])
+            .configure(8, vec![poll_task("t8", serde_json::json!([bad_mode]))])
             .await
             .unwrap_err();
-        assert_eq!(err.code, "INVALID_VARIABLE");
+        assert_eq!(err.code, "INVALID_BINDING_CONFIG");
 
-        // output 不是 value：Driver 纵深拒绝。
-        let mut bad_out = speed_selection("k");
-        bad_out[0]["outputs"][0]["output"] = serde_json::json!("other");
+        // `identity_mode="user"` 的 Key 必须留在 native 命名空间（B-1）。
+        let mut bad_user = native_point(SPEED_KEY_LINE3, 3);
+        bad_user["parameters"]["identity_mode"] = serde_json::json!("user");
+        bad_user["point_key"] = serde_json::json!("axis3.speed");
         let err = conn
-            .configure(8, vec![poll_task("t8", bad_out)])
+            .configure(9, vec![poll_task("t9", serde_json::json!([bad_user]))])
             .await
             .unwrap_err();
-        assert_eq!(err.code, "UNSUPPORTED_OUTPUT");
+        assert_eq!(err.code, "INVALID_USER_IDENTITY");
 
         // 非 Poll 模式拒绝（不伪造 subscribe）。
-        let mut t = poll_task("t3", speed_selection("k"));
+        let mut t = poll_task("t3", speed_points(SPEED_KEY_LINE3, 3));
         t.schedule = mesa_core_types::TaskSchedule::default_subscribe();
         let err = conn.configure(3, vec![t]).await.unwrap_err();
         assert_eq!(err.code, "MODE_NOT_SUPPORTED");
 
-        // 非 variable 资源拒绝。
-        let mut sel = speed_selection("k");
-        sel[0]["resource_id"] = serde_json::json!("node");
-        let err = conn
-            .configure(4, vec![poll_task("t4", sel)])
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, "UNSUPPORTED_RESOURCE");
+        // 旧 Task Binding Kind 拒绝（含 resource_id `variable` 的旧信封）。
+        let mut legacy = poll_task("t4", speed_points(SPEED_KEY_LINE3, 3));
+        legacy.binding.kind = mesa_core_types::GENERIC_BINDING_KIND.into();
+        let err = conn.configure(4, vec![legacy]).await.unwrap_err();
+        assert_eq!(err.code, "UNSUPPORTED_BINDING");
 
-        // 重复 point_key：同任务内由结构校验先拦（INVALID_BINDING_CONFIG），
-        // 跨任务由快照唯一性拦（DUPLICATE_POINT_KEY）。
+        // 重复 point_key：同任务与跨任务都落到驱动侧权威码 DUPLICATE_POINT_KEY。
         let dup = serde_json::json!([
-            speed_selection("k")[0].clone(),
-            speed_selection("k")[0].clone(),
+            native_point(SPEED_KEY_LINE3, 3),
+            native_point(SPEED_KEY_LINE3, 3),
         ]);
         let err = conn
             .configure(5, vec![poll_task("t5", dup)])
             .await
             .unwrap_err();
-        assert_eq!(err.code, "INVALID_BINDING_CONFIG");
+        assert_eq!(err.code, "DUPLICATE_POINT_KEY");
         let err = conn
             .configure(
                 6,
                 vec![
-                    poll_task("t6a", speed_selection("k")),
-                    poll_task("t6b", speed_selection("k")),
+                    poll_task("t6a", speed_points(SPEED_KEY_LINE3, 3)),
+                    poll_task("t6b", speed_points(SPEED_KEY_LINE3, 3)),
                 ],
             )
             .await
             .unwrap_err();
         assert_eq!(err.code, "DUPLICATE_POINT_KEY");
+    }
+
+    /// **B-2 / 矩阵 #33（lib.rs 侧 e2e）**：批次内 `identity_mode="user"` 的
+    /// 命名空间冲突 ⇒ `IDENTITY_NAMESPACE_COLLISION`，configure 整体失败。
+    ///
+    /// **效力范围（必须原样保留）**：只覆盖**该次 configure 可见的点位集合**；
+    /// Driver 看不到其它 Task，因此这**不是** Endpoint-wide 唯一性保证——
+    /// 跨任务/跨 kind 的唯一性以 Core 的 `DUPLICATE_POINT_KEY` 为唯一权威。
+    #[tokio::test]
+    async fn b2_user_key_collision_is_rejected_within_visible_batch() {
+        let conn = conn_with_synthetic();
+        // A：derived，地址 C/1/21/1/396（规范身份 native.C.1.21.1.396）。
+        let a = serde_json::json!({
+            "kind": "nck_native",
+            "point_key": "native.C.1.21.1.396",
+            "parameters": {
+                "area": "C", "area_no": 1, "module": 21, "column": 1, "line": 396,
+                "count": 1, "unit_mode": "current", "decode": "F64_LE",
+                "transport_size": "0x09",
+            },
+        });
+        // B：user，**同一个最终 Key**，但地址不同（line=999）——正是「地址不是身份」
+        // 的合法用法，此时逻辑身份必须唯一。
+        let b = serde_json::json!({
+            "kind": "nck_native",
+            "point_key": "native.C.1.21.1.396",
+            "parameters": {
+                "area": "C", "area_no": 1, "module": 21, "column": 1, "line": 999,
+                "count": 1, "unit_mode": "current", "decode": "F64_LE",
+                "transport_size": "0x09", "identity_mode": "user",
+            },
+        });
+        let err = conn
+            .configure(1, vec![poll_task("t1", serde_json::json!([a, b]))])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "IDENTITY_NAMESPACE_COLLISION");
+        assert!(conn.plan.read().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1531,11 +1734,11 @@ mod tests {
         .await;
         let mut conn = conn_with_synthetic();
         conn.cfg.port = fx.addr.port();
-        conn.configure(1, vec![poll_task("t1", speed_selection("axis3.speed"))])
+        conn.configure(1, vec![poll_task("t1", speed_points(SPEED_KEY_LINE3, 3))])
             .await
             .unwrap();
         let mut map = std::collections::HashMap::new();
-        map.insert("axis3.speed".to_string(), 7u32);
+        map.insert(SPEED_KEY_LINE3.to_string(), 7u32);
         conn.apply_point_map(map).await.unwrap();
 
         // run → 收一批 → cancel → run 必须 Ok 退出（Stop 生命周期）。
@@ -1579,11 +1782,11 @@ mod tests {
         let mut conn2 = conn_with_synthetic();
         conn2.cfg.port = fx.addr.port();
         conn2
-            .configure(1, vec![poll_task("t1", speed_selection("axis3.speed"))])
+            .configure(1, vec![poll_task("t1", speed_points(SPEED_KEY_LINE3, 3))])
             .await
             .unwrap();
         let mut map2 = std::collections::HashMap::new();
-        map2.insert("axis3.speed".to_string(), 7u32);
+        map2.insert(SPEED_KEY_LINE3.to_string(), 7u32);
         conn2.apply_point_map(map2).await.unwrap();
         let sink2 = DataSink::for_test(ctrl_tx2, data_tx2, event_tx2);
         let sd2 = tokio_util::sync::CancellationToken::new();
@@ -1608,11 +1811,11 @@ mod tests {
         .await;
         let mut conn = conn_with_synthetic();
         conn.cfg.port = fx.addr.port();
-        conn.configure(1, vec![poll_task("t1", speed_selection("axis3.speed"))])
+        conn.configure(1, vec![poll_task("t1", speed_points(SPEED_KEY_LINE3, 3))])
             .await
             .unwrap();
         let mut map = std::collections::HashMap::new();
-        map.insert("axis3.speed".to_string(), 7u32);
+        map.insert(SPEED_KEY_LINE3.to_string(), 7u32);
         conn.apply_point_map(map).await.unwrap();
         let (data_tx, mut data_rx) = tokio::sync::mpsc::channel::<mesa_core_types::DataBatch>(16);
         let (ctrl_tx, _ctrl_rx) =
@@ -1668,11 +1871,11 @@ mod tests {
         .await;
         let mut conn = conn_with_synthetic();
         conn.cfg.port = fx.addr.port();
-        conn.configure(1, vec![poll_task("t1", speed_selection("axis3.speed"))])
+        conn.configure(1, vec![poll_task("t1", speed_points(SPEED_KEY_LINE3, 3))])
             .await
             .unwrap();
         let mut map = std::collections::HashMap::new();
-        map.insert("axis3.speed".to_string(), 7u32);
+        map.insert(SPEED_KEY_LINE3.to_string(), 7u32);
         conn.apply_point_map(map).await.unwrap();
         let (data_tx, _data_rx) = tokio::sync::mpsc::channel::<mesa_core_types::DataBatch>(16);
         let (ctrl_tx, _ctrl_rx) =
@@ -1700,11 +1903,11 @@ mod tests {
         .await;
         let mut conn = conn_with_synthetic();
         conn.cfg.port = fx.addr.port();
-        conn.configure(1, vec![poll_task("t1", speed_selection("axis3.speed"))])
+        conn.configure(1, vec![poll_task("t1", speed_points(SPEED_KEY_LINE3, 3))])
             .await
             .unwrap();
         let mut map = std::collections::HashMap::new();
-        map.insert("axis3.speed".to_string(), 7u32);
+        map.insert(SPEED_KEY_LINE3.to_string(), 7u32);
         conn.apply_point_map(map).await.unwrap();
         let (data_tx, mut data_rx) = tokio::sync::mpsc::channel::<mesa_core_types::DataBatch>(16);
         let (ctrl_tx, _ctrl_rx) =
@@ -1739,7 +1942,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_count_is_rejected_at_configure() {
         let conn = conn_with_synthetic();
-        let mut huge = speed_selection("big");
+        let mut huge = speed_points(SPEED_KEY_LINE3, 3);
         // F64 × 255 = 2040 字节，远超缺省请求 PDU 480。
         huge[0]["parameters"]["count"] = serde_json::json!(255);
         let err = conn
@@ -1759,7 +1962,7 @@ mod tests {
         );
         // 同一配置里合法点位不受影响：拒绝是整包 fail-closed，不留下半份计划。
         let ok = conn
-            .configure(1, vec![poll_task("tA", speed_selection("healthy"))])
+            .configure(1, vec![poll_task("tA", speed_points(SPEED_KEY_LINE3, 3))])
             .await;
         assert!(ok.is_ok(), "合法配置仍必须可提交");
     }
@@ -1783,21 +1986,22 @@ mod tests {
         let mut conn = conn_with_synthetic();
         conn.cfg.port = fx.addr.port();
         conn.cfg.requested_pdu_length = mesa_s7_transport::S7_PDU_MAX;
-        let mut huge_sel = speed_selection("big");
+        let mut huge_sel = speed_points(SPEED_KEY_LINE4, 4);
         // 12(var_spec) + 8×40 + 32(余量) = 364：装得进 960，装不进 240。
+        // 注意 key 用 line=4 的规范身份，避免与 task A 的点位重名。
         huge_sel[0]["parameters"]["count"] = serde_json::json!(40);
         conn.configure(
             1,
             vec![
-                poll_task("tA", speed_selection("healthy")),
+                poll_task("tA", speed_points(SPEED_KEY_LINE3, 3)),
                 poll_task("tB", huge_sel),
             ],
         )
         .await
         .unwrap();
         let mut map = std::collections::HashMap::new();
-        map.insert("healthy".to_string(), 7u32);
-        map.insert("big".to_string(), 8u32);
+        map.insert(SPEED_KEY_LINE3.to_string(), 7u32);
+        map.insert(SPEED_KEY_LINE4.to_string(), 8u32);
         conn.apply_point_map(map).await.unwrap();
         let (data_tx, _data_rx) = tokio::sync::mpsc::channel::<mesa_core_types::DataBatch>(16);
         let (ctrl_tx, _ctrl_rx) =

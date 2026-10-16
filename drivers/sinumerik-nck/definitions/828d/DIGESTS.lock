@@ -1,0 +1,258 @@
+{
+  "format_version": 1,
+  "family": "828d",
+  "entries": [
+    {
+      "variable_id": "channel.program.status",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "d27f6b5e83662fab859935e933ac548cc78596d534a453a7e8e57a85fcb20688"
+    },
+    {
+      "variable_id": "mode_group.op_mode",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "6238361d64d89a7d7639d2ebeb581b38ee7c25e8b24c9e0cd3ac7ef6f000ae69"
+    },
+    {
+      "variable_id": "channel.program.name.main",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "b3194b341c57c9393a146984267c31dc10d1c2b8d1fd63f36bb016e033fa5936"
+    },
+    {
+      "variable_id": "channel.program.name.active",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "2a5065d5c647865523c4533d2ce3b99c561d0d445e6e6d1bc46e60ccc865e034"
+    },
+    {
+      "variable_id": "channel.program.line_number",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "5e13723405b015247da990ee7f664d148198a744b46821553711dd83a78aa1d2"
+    },
+    {
+      "variable_id": "channel.program.block",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "0292e720861d124fbe5def913c9fcebe5bc0562e78c689e21a1829b4db4ea4c9"
+    },
+    {
+      "variable_id": "axis.position.commanded_mcs",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "64f1368787b394b477cbb8a734e2f91ea3c3820b729d66e14385f7eadaf84b4c"
+    },
+    {
+      "variable_id": "axis.position.actual_bcs",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "385440557786bf560548a36cafae53ac309775e5a67a203e6f84fce619c44dc0"
+    },
+    {
+      "variable_id": "channel.feed.actual",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "5b1c50c12c66412baa5d8dfb508abbd2b1a8b8695d730e1c3519035053a1ca9a"
+    },
+    {
+      "variable_id": "channel.feed.commanded",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "5261ac8ba74134bb11e982f4df70a0eed90d505e99d7fa697805b9815b5e1b2a"
+    },
+    {
+      "variable_id": "channel.feed.override",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "34075b07e3a1ac6d8c895445055a86f0edc70696620204ecf31f6b1533411579"
+    },
+    {
+      "variable_id": "spindle.speed.actual",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "f2a256d50f94a293e42d8603e919884866b53d35e9b35a0a339d825b9066eddc"
+    },
+    {
+      "variable_id": "spindle.speed.commanded",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "c98d28ecf79ed2ab8504c333154ce66b3ce00e05d9b7fd4ef9464f7321bd5dd6"
+    },
+    {
+      "variable_id": "spindle.speed.override",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "96e4462488b2ec0b5b39f51368db4df004e2b484b58b975062c68f509666aac6"
+    },
+    {
+      "variable_id": "channel.tool.number_active",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "4dd2675efac1f7718fdc508bab99bcf4e8b4379cc00302c92996a019af5b96fe"
+    },
+    {
+      "variable_id": "channel.r_parameter",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "eba34bc560283a2acc66fa7956c5add6a1289390c0ed489122f88e8032286a6d"
+    },
+    {
+      "variable_id": "drive.parameter.r0021",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "80eee8ba825cb44fe51828e22ca97ebba8016b2126530f47361abad26f686288"
+    },
+    {
+      "variable_id": "drive.parameter.r0027",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "d50e12185486bde630e3f68758bc330ccc333101e03969200840946bb589612e"
+    },
+    {
+      "variable_id": "drive.motor.temperature",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "9a6ed529a0c5ca30c0b1f4564fd30086d7c1e82f82b3dcfd569a2d9ee4f1d1e5"
+    },
+    {
+      "variable_id": "drive.parameter.r0033",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "ad76110f940dbf6e4908ec5b470c622a16db813e46cc01a1b70e0f3e1e20bc83"
+    },
+    {
+      "variable_id": "drive.parameter.r0031",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "04e6d433960d061127314f297bb1db34a864692c64a52c9d971ec7a1485136c5"
+    },
+    {
+      "variable_id": "drive.parameter.r0062",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "cde3632df4578877ffcb6849631cba5c2d6d853ad28f0bd57da31225a8614274"
+    },
+    {
+      "variable_id": "drive.parameter.r0063",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "785676cdf7b3e192454dc1675863cb3ce54127a2b81835c5f33ee238882a428f"
+    },
+    {
+      "variable_id": "drive.parameter.r0064",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "6727813cefc2ff2d71e9da645cba933f3a752ba7ba940173f3b1702c92afa949"
+    },
+    {
+      "variable_id": "drive.parameter.r0077",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "97e2088baa98ec6e2692480637638b2a8e260bbfd852dac68a26eb33f1f2d7b8"
+    },
+    {
+      "variable_id": "drive.parameter.r0078",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "816350df625a671af454fcc678cda8375c0ecea2b6071601f616596a0e437df4"
+    },
+    {
+      "variable_id": "drive.parameter.r0079",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "5c06fcca2a54c7012916feda5628e20c2c9efa9360e6b14eba04caf41eb7a1b5"
+    },
+    {
+      "variable_id": "drive.parameter.r0080",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "150fb6a92481bfff183433a10f45e9caebc4fd09a46546b7a00fea58d5f97319"
+    },
+    {
+      "variable_id": "drive.parameter.r0081",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "0e713fab3db4b21084c80c6f952a4f87feb064f63f0d09df76b68550f9332e82"
+    },
+    {
+      "variable_id": "drive.parameter.r0082",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "81241d2a92b48778a1783bf917ed1c979dec479533c4e4ae857bab25075da837"
+    },
+    {
+      "variable_id": "drive.parameter.r0103",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "0e9c52733dc1feccb3e81c65ce833c836c440edb9cd78816a7d729809062fa0c"
+    },
+    {
+      "variable_id": "drive.parameter.p0105",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "33eda3aa220cd11414e687aa456c9085d6de6265528595c13dee3415e5293c59"
+    },
+    {
+      "variable_id": "drive.parameter.r0106",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "e884df3a56be98debcfcd60b11b3dfd59fe1d40a17fd433cd68d9db48e014922"
+    },
+    {
+      "variable_id": "drive.parameter.r0107",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "afc9a8e38d4ae4a4a3245a93d885267efe925258a4952ad77024f31ce22523fa"
+    },
+    {
+      "variable_id": "drive.parameter.r0108",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "78d096624c7861c41499ad6d12c6e9ca486a2e52c25e3df1652de1a7684e7e3b"
+    },
+    {
+      "variable_id": "drive.object.name",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "9f20ccb7c53013ddbde578f66f43b304070c1a6cfbe883573805bf8d37b36a5c"
+    },
+    {
+      "variable_id": "axis.name",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "298b179307c2c60a848fb942043ee3437113f8480e2e7f35a06345c72ab66da6"
+    },
+    {
+      "variable_id": "axis.ctrlout.module_number",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "cd770ac53918716811dbbd5329f71460c2ef467fda224018468dc8f6afc09991"
+    },
+    {
+      "variable_id": "axis.encoder.module_number",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "7dce689ba9bf48156dfa6a7bfa1276733cf4a5a6ac1fc27c3f1cbf5b8325c6d2"
+    },
+    {
+      "variable_id": "axis.ctrlout.type",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "f68b5192846d547727c8a85b403ff64934fe147556a58e1c283f5f8da287e28c"
+    },
+    {
+      "variable_id": "channel.machine_axis_assignment",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "bcbfe145b413195de70e4dd7c1238fd8518af14e78979f1c9f38cd2ea6a1d5de"
+    },
+    {
+      "variable_id": "axis.spindle_assignment",
+      "revision": 1,
+      "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+      "digest": "ab8350b354693687c45650646879efdd584fb576eb2ffd30b68c3573290c7508"
+    }
+  ]
+}

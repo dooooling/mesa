@@ -51,6 +51,35 @@ module 130 两个独立模板）。
 > 上表是**人工确认时的参考**，不是自动填充规则；模板不会据此替你填
 > `area_no`/`line`。
 
+## 语义 `variable_id` ↔ 原生身份 ↔ 62 条冻结 wire 向量
+
+PR-B 起新增**定义目录** `definitions/828d/r1.json`（与 `src/` 平级，按 revision
+分文件），它把「业务语义」与「原生地址」分开表达：
+
+| 概念 | 位置 | 说明 |
+|---|---|---|
+| 语义索引 | `definitions/828d/r1.json` 的 `golden_ref{area,block,variable,entry}` | **只存索引**，不复制任何 wire 字节 |
+| 原生字段模板 | `presets/828d.json`（**逐字不动**，仍是原生字段） | 旧等价门 `tests/legacy_equivalence.rs` 的真值来源 |
+| 字节真值 | `tests/fixtures/legacy-828d-wire.json`（62 条） | 两条路径**各自独立构造地址**，只与它比较 |
+
+对应关系：42 条定义 → 62 条 golden（A 16×1 + B 20×2 + C 6×1），与 62 个模板 id
+（`828d.<area>.<block>.<variable>.<entry>`）**一对一**。
+**模板保持原生字段不变**（语义化模板会同时打破旧等价门与真值独立性）；
+语义化只发生在**浏览叶载荷**上：叶的 `binding_json` 现在是
+`{"kind":"nck_variable","parameters":{variable_id,definition_revision,target,arguments}}`
+并旁挂 `identity{template,keys,preview_point_key}`。
+两条路径的独立性由 4 条可执行检测固定（源码级零引用 / 来源级不得指向模板 /
+构建后定义目录零改动 / 删掉模板副本后新门仍 62/62）。
+
+## `semantics_status`：防语义虚构
+
+定义目录中每条定义的 `semantics_status` 是**定义的一部分**（进摘要），
+三档含义：`verified`（仓库内可追溯证据）、`candidate`（语义仅来自导入标签，
+必须显式标注候选）、`parameter_identity`（无任何语义证据，ID 必须是
+`drive.parameter.<参数名>`）。状态升级（如 `candidate → verified`）**必须**发布
+新 revision。本期 `r0031`/`r0033` 是 `candidate`（`r0031` 访问能力 HOLD），
+其余无语义证据的驱动参数一律 `parameter_identity`。
+
 ## 使用限制
 
 - 保留原导入点位名称不代表其物理含义已验证。尤其“机械坐标”对应
@@ -108,6 +137,27 @@ MD30110、经 module 26 的 `p0199` 核对）只列 module 26 模板；对象路
 边界。过滤在本页读取后执行，无匹配节点仍返回后续游标，**诊断节点不被过滤隐藏**。
 
 `SPIND_ASSIGN_TO_MACHAX` 读取轴的主轴编号，避免把机床轴号直接当成主轴索引。
+
+## 两条入口（26/130）与 `identity_template` 的递归编码
+
+- **入口身份**由 `target.drive_object.entry` 显式表达（必填、**无默认值**）：
+  `nc_variable` → module **26**，`drive_object` → module **130**。两条入口的实例
+  编号在实机上**并不相同**，禁止互相换算、也禁止把同一驱动参数折叠成一条定义。
+- **身份模板**里 `drive_object` 是**递归对象**编码（键名字节序升序），例如
+  `drive.motor.temperature@drive_object=o:{entry=s:nc_variable,number=i:3}`：
+  它同时区分了「哪个驱动访问编号」与「哪条入口」。因此同一 `number` 下
+  `entry=nc_variable` 与 `entry=drive_object` 得到**不同身份、不同 wire**。
+- `identity_template` / `identity_keys` 由**驱动**发布（随定义目录内嵌），
+  前端只做通用替换；同一 `variable_id` 的所有 revision 必须给出逐字相同的
+  身份契约（改身份契约 = 新 `variable_id`）。
+
+## 原生点位（`nck_native`）与 `identity_mode`
+
+高级原生点位的 `point_key` 默认（`identity_mode="derived"`）必须逐字等于
+`native.<area>.<area_no>.<module>.<column>.<line>`；只有 `identity_mode="user"`
+才允许用户显式选择逻辑身份（UI 建议 `~<n>` 后缀，**必须由用户确认**），
+驱动**不重算、不静默改名**。`identity_mode` 只由 Address Compiler 处理，
+**不传入**原生解析器的 12 字段白名单。
 
 未取得真实证据的系列（如 `840d-sl`）**不套用** 828D 探针，而是明确提示
 “身份浏览待验证”；使用者仍可手动填写原生地址进行结构化测试。

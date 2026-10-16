@@ -146,17 +146,50 @@ async fn fresh_requests_browse_root_pages_axis_object_and_leaf_pages_without_ful
         .unwrap();
     assert!(next.is_some());
     let binding: serde_json::Value = serde_json::from_str(&leaves[0].binding_json).unwrap();
-    assert_eq!(binding["parameters"]["area_no"], 4);
-    // 身份核对只填 area_no；line 仍需使用者确认（不按变量名猜行索引）。
-    assert!(binding["parameters"].get("line").is_none());
+    // PR-B：浏览叶是**语义载荷**，已核对的实例编号出现在 `target` 里（不再是原生
+    // `area_no`）；`line`/实例仍未确认的字段一律不出现（不按变量名猜行索引）。
+    assert_eq!(binding["kind"], "nck_variable");
+    // 身份核对出的实例编号出现在语义 `target` 里；入口身份由 `entry` 表达
+    // （轴路径经 module 26 的 p0199 核对 ⇒ `entry=nc_variable`）。
+    assert_eq!(binding["parameters"]["target"]["drive_object"]["number"], 4);
+    assert_eq!(
+        binding["parameters"]["target"]["drive_object"]["entry"], "nc_variable",
+        "轴路径只列 module 26 入口模板"
+    );
     assert!(
         binding["parameters"].get("access_path").is_none(),
         "新模型不再有访问路径字段，入口由 module 显式表达"
     );
-    // 轴路径的编号来自 MD30110 且由 module 26 入口核对，因此只能给出
-    // module 26 模板；给出 module 130 模板等于暗示两条入口编号可互换。
-    let module = binding["parameters"]["module"].as_u64().unwrap();
-    assert_eq!(module, 26, "轴路径只列 NC 变量入口（module 26）模板");
+    // 语义载荷不得含任何原生字段（用户不面对协议字段）。
+    for native in [
+        "area_no",
+        "line",
+        "module",
+        "column",
+        "decode",
+        "transport_size",
+    ] {
+        assert!(
+            binding["parameters"].get(native).is_none(),
+            "语义载荷不得含原生字段 `{native}`：{}",
+            leaves[0].binding_json
+        );
+    }
+    // 身份块给出模板/键集合/预览 Key（前端只做通用替换，不推导身份）。
+    let preview = binding["identity"]["preview_point_key"].as_str().unwrap();
+    assert!(preview.starts_with("drive.parameter."), "{preview}");
+    assert!(
+        preview.ends_with("@drive_object=o:{entry=s:nc_variable,number=i:4}"),
+        "{preview}"
+    );
+    assert_eq!(
+        binding["identity"]["template"],
+        format!(
+            "{}@drive_object={{drive_object}}",
+            binding["parameters"]["variable_id"].as_str().unwrap()
+        )
+    );
+    assert_eq!(binding["identity"]["keys"][0]["path"], "drive_object");
     assert!(
         leaves[0].label.contains("module26入口编号4"),
         "叶标签必须标出编号出处：{}",
@@ -180,12 +213,15 @@ async fn fresh_requests_browse_root_pages_axis_object_and_leaf_pages_without_ful
     // 不得用它生成 module 26 采集地址（两条入口编号在实机上并不相同）。
     assert_eq!(leaves.len(), 1, "对象路径只列 module 130 模板");
     let binding: serde_json::Value = serde_json::from_str(&leaves[0].binding_json).unwrap();
-    assert_eq!(binding["parameters"]["area_no"], 6);
+    assert_eq!(binding["parameters"]["target"]["drive_object"]["number"], 6);
+    assert_eq!(
+        binding["parameters"]["target"]["drive_object"]["entry"], "drive_object",
+        "入口身份由 `entry` 显式表达（module 130）"
+    );
     assert!(binding["parameters"].get("access_path").is_none());
     assert_eq!(
-        binding["parameters"]["module"].as_u64().unwrap(),
-        130,
-        "入口编号由 module 显式表达"
+        binding["identity"]["preview_point_key"],
+        "drive.parameter.r0080@drive_object=o:{entry=s:drive_object,number=i:6}"
     );
     assert!(
         leaves[0].label.contains("module130入口编号6"),
@@ -214,10 +250,9 @@ async fn identity_entries_never_cross_fill_instance_numbers() {
     assert!(!axis_leaves.is_empty(), "轴 4 应有模板叶");
     for node in &axis_leaves {
         let b: serde_json::Value = serde_json::from_str(&node.binding_json).unwrap();
-        assert_eq!(b["parameters"]["area_no"], 4);
+        assert_eq!(b["parameters"]["target"]["drive_object"]["number"], 4);
         assert_eq!(
-            b["parameters"]["module"].as_u64().unwrap(),
-            26,
+            b["parameters"]["target"]["drive_object"]["entry"], "nc_variable",
             "轴入口不得给出 module 130 模板：{}",
             node.id
         );
@@ -230,10 +265,9 @@ async fn identity_entries_never_cross_fill_instance_numbers() {
     assert!(!object_leaves.is_empty(), "对象 6 应有模板叶");
     for node in &object_leaves {
         let b: serde_json::Value = serde_json::from_str(&node.binding_json).unwrap();
-        assert_eq!(b["parameters"]["area_no"], 6);
+        assert_eq!(b["parameters"]["target"]["drive_object"]["number"], 6);
         assert_eq!(
-            b["parameters"]["module"].as_u64().unwrap(),
-            130,
+            b["parameters"]["target"]["drive_object"]["entry"], "drive_object",
             "对象入口不得给出 module 26 模板：{}",
             node.id
         );
