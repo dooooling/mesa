@@ -8,6 +8,7 @@
 pub mod capability;
 pub mod descriptor;
 pub mod event;
+pub mod point;
 pub mod probe;
 pub mod resource;
 pub mod schema;
@@ -26,6 +27,11 @@ pub use event::{
     EventFieldDescriptor, EventRecord, EventRecordError, EventSequenceTracker,
     EventStreamDescriptor, EventTask, EventTaskError, GENERIC_EVENT_BINDING_KIND,
     GenericEventBinding, SequenceVerdict, validate_event_binding_against,
+};
+pub use point::{
+    NCK_POINTS_BINDING_KIND, POINT_KEY_MAX_BYTES, POINT_KEY_MAX_DEPTH, PointBinding, PointKeyError,
+    PointSelection, encode_typed_value, ensure_endpoint_point_keys_unique, parse_point_binding,
+    validate_point_binding, validate_point_key,
 };
 pub use probe::{
     CapabilityItem, CapabilityState, PROBE_REPORT_MAX_BYTES, ProbeReport, ProbeWarning,

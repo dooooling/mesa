@@ -216,33 +216,25 @@ async fn device_bootstrap_inner(
                 }
             }
             // acquisition 集合校验（endpoint 尚未落库，直接用 descriptor 校验，
-            // 与 gate_data_tasks 同规则；Foundation-2 单路径：非 generic 即拒绝）
+            // 与 gate_data_tasks **同源**：Task Binding Kind 路由、绑定解析与
+            // Endpoint-wide point_key 唯一性全部走 `binding_gate` 的唯一实现，
+            // 不得在此再写第二份白名单——否则会出现「保存通过、bootstrap 拒绝」）。
             if let Some(acq) = &body.acquisition {
                 if !acq.tasks.is_empty() {
-                    let mut parsed = Vec::new();
-                    let mut issues = Vec::new();
-                    for (i, task) in acq.tasks.iter().enumerate() {
-                        if task.binding.kind != mesa_core_types::GENERIC_BINDING_KIND {
-                            issues.push(mesa_core_types::ValidationIssue {
-                                path: format!("acquisition.tasks[{i}].binding.kind"),
-                                code: "UNSUPPORTED_BINDING".into(),
-                                message: format!(
-                                    "binding kind `{}` 不再支持，仅允许 {}",
-                                    task.binding.kind,
-                                    mesa_core_types::GENERIC_BINDING_KIND,
-                                ),
-                            });
-                            continue;
-                        }
-                        match mesa_core_types::GenericBinding::from_json(&task.binding.config) {
-                            Ok(b) => parsed.push((i, b)),
-                            Err(e) => issues.push(mesa_core_types::ValidationIssue {
-                                path: format!("acquisition.tasks[{i}].binding"),
-                                code: "INVALID_BINDING_CONFIG".into(),
-                                message: e,
-                            }),
-                        }
+                    // ① Task Binding Kind 路由 + nck.points.v1 信封层校验。
+                    let (route_issues, nck_bindings) =
+                        super::binding_gate::route_data_task_kinds(&acq.tasks, "acquisition.tasks");
+                    if !route_issues.is_empty() {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "valid": false, "issues": route_issues })),
+                        );
                     }
+                    // ② 解析 mesa.resources.v1 绑定。
+                    let (mut issues, parsed) = super::binding_gate::parse_generic_bindings(
+                        &acq.tasks,
+                        "acquisition.tasks",
+                    );
                     if !issues.is_empty() {
                         return (
                             StatusCode::BAD_REQUEST,
@@ -265,7 +257,14 @@ async fn device_bootstrap_inner(
                         .zip(modes.iter())
                         .map(|(((_i, b), r), m)| (m, &b.selections[..], r.as_str()))
                         .collect();
+                    // ③ resources 集合级语义校验。
                     issues.extend(mesa_core_types::validate_task_set_against(&desc, &inputs));
+                    // ④ 跨 kind 的 Endpoint-wide point_key 唯一性。
+                    issues.extend(super::binding_gate::cross_kind_point_key_issues(
+                        &parsed,
+                        &nck_bindings,
+                        "acquisition.tasks",
+                    ));
                     if !issues.is_empty() {
                         return (
                             StatusCode::BAD_REQUEST,

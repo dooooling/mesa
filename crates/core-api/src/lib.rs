@@ -20,6 +20,8 @@ use mesa_event_store::{EventFilter, EventServices, StoredEvent};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+/// Data Task 绑定门禁的唯一实现（保存门禁与 bootstrap 共用，消除双份白名单）。
+pub(crate) mod binding_gate;
 pub mod bootstrap;
 pub mod certificates;
 /// C3-A：Endpoint-bound 连接检查（尚未保存的连接草稿，只读、无副作用）。
@@ -221,10 +223,20 @@ fn json_error(code: &str, message: &str) -> serde_json::Value {
 // Task 保存门禁：Core 统一 Descriptor 校验（PR4）
 // ---------------------------------------------------------------------------
 
-/// Data Task 保存门禁（Foundation-2 单路径）：所有任务必须走 Descriptor
-/// 集合级统一校验（`mesa.resources.v1` 唯一合法 kind；空数组 `tasks=[]` 清空
-/// 直接放行，不碰 Descriptor）。issues 为空即通过；endpoint 缺失/descriptor
-/// 不可用分别映射 404/503。
+/// Data Task 保存门禁（Foundation-2 单路径 + NCK 语义点位 PR-A 双 kind 路由）：
+/// 所有任务必须走 Descriptor 集合级统一校验（`mesa.resources.v1`）或点位信封层
+/// 校验（`nck.points.v1`；空数组 `tasks=[]` 清空直接放行，不碰 Descriptor）。
+/// issues 为空即通过；endpoint 缺失/descriptor 不可用分别映射 404/503。
+///
+/// **唯一实现**：Task Binding Kind 路由、绑定解析、跨 kind 的 Endpoint-wide
+/// `point_key` 唯一性全部来自 [`binding_gate`]；本函数只负责编排顺序与 HTTP 映射。
+/// bootstrap 创建门禁（`bootstrap.rs`）调用同一组函数，**不得**再写第二份判定。
+///
+/// 顺序契约（保持既有错误优先级，`mesa.resources.v1` 行为逐字不变）：
+/// ① kind 路由 + nck 信封层（Descriptor 无关）→ 400；
+/// ② Endpoint → 404 / Descriptor → 503；
+/// ③ resources 绑定解析 → 400；④ resources 集合级语义校验；
+/// ⑤ 跨 kind 的 Endpoint-wide point_key 唯一性。
 async fn gate_data_tasks(
     state: &AppState,
     endpoint_id: &str,
@@ -235,21 +247,11 @@ async fn gate_data_tasks(
     if tasks.is_empty() {
         return Ok(());
     }
-    // 非 generic kind 即拒绝（legacy 已删除，无 bypass）
+    // ① Task Binding Kind 路由 + nck.points.v1 信封层校验。
+    // 非白名单 kind 即拒绝（legacy 已删除，无 bypass）；Core 不建 Point Kind 白名单。
     let mut issues = Vec::new();
-    for (i, task) in tasks.iter().enumerate() {
-        if task.binding.kind != mesa_core_types::GENERIC_BINDING_KIND {
-            issues.push(mesa_core_types::ValidationIssue {
-                path: format!("tasks[{i}].binding.kind"),
-                code: "UNSUPPORTED_BINDING".into(),
-                message: format!(
-                    "binding kind `{}` 不再支持，仅允许 {}",
-                    task.binding.kind,
-                    mesa_core_types::GENERIC_BINDING_KIND,
-                ),
-            });
-        }
-    }
+    let (route_issues, nck_bindings) = binding_gate::route_data_task_kinds(tasks, "tasks");
+    issues.extend(route_issues);
     if !issues.is_empty() {
         return err(
             StatusCode::BAD_REQUEST,
@@ -275,19 +277,9 @@ async fn gate_data_tasks(
             );
         }
     };
-    // 解析全部 generic 绑定，集合级一次校验（Endpoint-wide point_key 唯一）
-    //（前置 kind 门已保证全为 generic，此处不再跳过任何任务）
-    let mut parsed: Vec<(usize, mesa_core_types::GenericBinding)> = Vec::new();
-    for (i, task) in tasks.iter().enumerate() {
-        match mesa_core_types::GenericBinding::from_json(&task.binding.config) {
-            Ok(binding) => parsed.push((i, binding)),
-            Err(e) => issues.push(mesa_core_types::ValidationIssue {
-                path: format!("tasks[{i}].binding"),
-                code: "INVALID_BINDING_CONFIG".into(),
-                message: e,
-            }),
-        }
-    }
+    // ③ 解析全部 generic 绑定（`mesa.resources.v1`）。
+    let (parse_issues, parsed) = binding_gate::parse_generic_bindings(tasks, "tasks");
+    issues.extend(parse_issues);
     // generic 解析失败即返（避免 roots 与 parsed 错位误报）
     if !issues.is_empty() {
         return err(
@@ -313,9 +305,16 @@ async fn gate_data_tasks(
         .zip(modes.iter())
         .map(|(((_i, b), r), m)| (m, &b.selections[..], r.as_str()))
         .collect();
+    // ④ resources 集合级语义校验（含 resources 内部的 Endpoint-wide 唯一性）。
     issues.extend(mesa_core_types::validate_task_set_against(
         &desc,
         &set_inputs,
+    ));
+    // ⑤ 跨 kind 的 Endpoint-wide point_key 唯一性（nck 内部 + nck×resources）。
+    issues.extend(binding_gate::cross_kind_point_key_issues(
+        &parsed,
+        &nck_bindings,
+        "tasks",
     ));
     if issues.is_empty() {
         Ok(())

@@ -363,3 +363,99 @@ fn generic_binding_structure_validation() {
     };
     assert!(mesa_core_types::validate_selections_structure(&dup.selections).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// PR-A P9 护栏：Core 零 Siemens 知识
+// ---------------------------------------------------------------------------
+
+/// 递归收集目录下的 `.rs` 文件。
+fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_rs(&p, out);
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            out.push(p);
+        }
+    }
+}
+
+/// P9 护栏（设计文档 §5.1）：`crates/core-types/**` 与 `crates/core-api/**`
+/// **不得出现** NCK Driver 侧的 Siemens 专有类型 / 身份契约标识。
+///
+/// 唯一允许出现的 NCK 标识是**任务层**常量 `nck.points.v1`
+/// （`NCK_POINTS_BINDING_KIND`）——它属于 §2.0 术语表的 **Task Binding Kind**，
+/// 与点位层 **Point Kind** 是两个层级，故不在此禁令内。
+///
+/// 扫描口径：只扫**生产代码**（第一个 `#[cfg(test)]` 之前）并剔除行注释。
+/// 之所以排除测试代码：`nck_variable`/`nck_native` 恰好是「Core **不**建立
+/// Point Kind 白名单」这一结论的**证据字面量**（未知 kind 被放行的用例必须提到它们）。
+#[test]
+fn core_has_zero_siemens_knowledge() {
+    const FORBIDDEN: &[&str] = &[
+        // NCK Driver 侧专有类型（§2.4.1 / §2.5）
+        "TargetRef",
+        "DriveObjectRef",
+        "DriveEntry",
+        "DriveEntryModule",
+        "NativeFieldSource",
+        "AddressingRule",
+        "VariableDefinition",
+        "DefinitionCatalog",
+        "AddressCompiler",
+        // 身份契约与身份推导（§4.1.1 C/D，归 Driver）
+        "identity_template",
+        "identity_keys",
+        "canonical_identity",
+        "identity_mode",
+        // 参数层 / Driver 专属错误码（Core 不得产生）
+        "POINT_KEY_MISMATCH",
+        "UNSUPPORTED_POINT_KIND",
+        "UNKNOWN_VARIABLE",
+        "UNSUPPORTED_DEFINITION_REVISION",
+        "MISSING_TARGET",
+        "INVALID_TARGET",
+        "INVALID_ARGUMENTS",
+        // Point Kind 取值（Core 不得枚举）
+        "nck_variable",
+        "nck_native",
+        // 驱动对象双入口（Core 不应知道 Module 26/130）
+        "identity_spec",
+        "drive_object",
+    ];
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = Vec::new();
+    for dir in ["crates/core-types/src", "crates/core-api/src"] {
+        collect_rs(&root.join(dir), &mut files);
+    }
+    assert!(
+        files.len() >= 5,
+        "必须扫到 Core 源码，实际 {} 个文件（路径基准 {})",
+        files.len(),
+        root.display()
+    );
+
+    let mut violations = Vec::new();
+    for f in &files {
+        let text = std::fs::read_to_string(f).unwrap();
+        // 生产代码 = 第一个 `#[cfg(test)]` 之前的部分。
+        let prod = text.split("#[cfg(test)]").next().unwrap_or("");
+        for (n, line) in prod.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            for token in FORBIDDEN {
+                if code.contains(token) {
+                    violations.push(format!("{}:{}: `{token}`", f.display(), n + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "Core 出现 Siemens 专有标识（P9 违规）：\n{}",
+        violations.join("\n")
+    );
+}

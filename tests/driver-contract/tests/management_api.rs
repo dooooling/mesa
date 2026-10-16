@@ -910,6 +910,344 @@ async fn task_save_gate_rejects_unknown_resource_and_connection_field() {
     assert_eq!(ep["driver_id"], "test-driver", "driver 未动: {ep}");
 }
 
+/// PR-A（NCK 语义点位）：Core 门禁对 `nck.points.v1` 的**信封层**判定。
+///
+/// 覆盖设计文档 §6.1 的 Core 门禁单测与 §6.6 的 T1（Core 侧）/T2，并同时证明
+/// `mesa.resources.v1` 路径**逐字不变**（P2 护栏）。
+/// 载荷统一用 `serde_json::json!` 构造，避免手写 JSON 的括号计数错误。
+#[tokio::test]
+async fn task_save_gate_nck_points_envelope() {
+    let (app, _, _staged) = app().await;
+    let (s, _) = post_json(app.clone(), "/api/v1/devices", r#"{"id":"d1","name":"D"}"#).await;
+    assert_eq!(s, StatusCode::CREATED, "create device");
+    let (s, _) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        r#"{"id":"e1","name":"E1","device_id":"d1","driver_id":"test-driver","connection":{}}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "create endpoint");
+
+    /// 以 e1 为 endpoint 保存任务集（`tasks` 为 JSON 数组）。
+    async fn save(app: axum::Router, tasks: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::json!({ "endpoint_id": "e1", "tasks": tasks }).to_string();
+        post_json(app, "/api/v1/tasks", &body).await
+    }
+    /// `nck.points.v1` 任务（`points` 为点位数组）。
+    fn nck_task(id: &str, points: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "schedule": { "mode": "poll", "interval_ms": 100 },
+            "binding": { "kind": "nck.points.v1", "config": { "points": points } }
+        })
+    }
+    /// `mesa.resources.v1` 任务（`selections` 为选择数组）。
+    fn generic_task(id: &str, selections: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "schedule": { "mode": "poll", "interval_ms": 100 },
+            "binding": { "kind": "mesa.resources.v1", "config": { "selections": selections } }
+        })
+    }
+    fn has_code(v: &serde_json::Value, code: &str) -> bool {
+        v["issues"]
+            .as_array()
+            .map(|a| a.iter().any(|i| i["code"] == code))
+            .unwrap_or(false)
+    }
+
+    // ① T1（Core 侧）：一个 nck.points.v1 任务**同时**含 nck_variable 与 nck_native
+    //    ⇒ 放行（不因 Point Kind 拒绝、不要求拆成两个任务）。
+    let mixed = nck_task(
+        "t1",
+        serde_json::json!([
+            {
+                "kind": "nck_variable",
+                "point_key": "channel.r_parameter#index=i:100@channel=i:1",
+                "parameters": {
+                    "variable_id": "channel.r_parameter",
+                    "definition_revision": 1,
+                    "target": { "channel": 1 },
+                    "arguments": { "index": 100 }
+                }
+            },
+            {
+                "kind": "nck_native",
+                "point_key": "native.C.1.21.1.396",
+                "parameters": {
+                    "area": "C", "area_no": 1, "module": 21, "column": 1, "line": 396,
+                    "count": 1, "unit_mode": "current", "decode": "F64_LE",
+                    "transport_size": "0x09"
+                }
+            }
+        ]),
+    );
+    let (s, v) = save(app.clone(), serde_json::json!([mixed])).await;
+    assert_eq!(s, StatusCode::OK, "混合 Point Kind 必须放行: {v}");
+
+    // ② 未知 **Point Kind** 一律放行（Core 不建立白名单，P9）。
+    let weird = nck_task(
+        "t1",
+        serde_json::json!([{
+            "kind": "weird_kind",
+            "point_key": "weird.thing@whatever=i:1",
+            "parameters": { "unknown": 1 }
+        }]),
+    );
+    let (s, v) = save(app.clone(), serde_json::json!([weird])).await;
+    assert_eq!(s, StatusCode::OK, "Core 不得枚举 Point Kind: {v}");
+
+    // ③ 信封层未知字段 ⇒ UNKNOWN_FIELD（不得静默丢弃）。
+    let unknown_field = nck_task(
+        "t1",
+        serde_json::json!([{
+            "kind": "nck_variable",
+            "point_key": "a.b",
+            "parameters": {},
+            "identity": { "template": "x" }
+        }]),
+    );
+    let (s, v) = save(app.clone(), serde_json::json!([unknown_field])).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(has_code(&v, "UNKNOWN_FIELD"), "{v}");
+
+    // ④ parameters 非对象 ⇒ INVALID_PARAMETERS。
+    let bad_params = nck_task(
+        "t1",
+        serde_json::json!([{
+            "kind": "nck_variable",
+            "point_key": "a.b",
+            "parameters": [1, 2]
+        }]),
+    );
+    let (s, v) = save(app.clone(), serde_json::json!([bad_params])).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(has_code(&v, "INVALID_PARAMETERS"), "{v}");
+
+    // ⑤ kind 为空 ⇒ EMPTY_POINT_KIND。
+    let empty_kind = nck_task(
+        "t1",
+        serde_json::json!([{ "kind": "", "point_key": "a.b", "parameters": {} }]),
+    );
+    let (s, v) = save(app.clone(), serde_json::json!([empty_kind])).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(has_code(&v, "EMPTY_POINT_KIND"), "{v}");
+
+    // ⑤b point_key 为空 ⇒ EMPTY_POINT_KEY。
+    let empty_key = nck_task(
+        "t1",
+        serde_json::json!([{ "kind": "nck_variable", "point_key": "", "parameters": {} }]),
+    );
+    let (s, v) = save(app.clone(), serde_json::json!([empty_key])).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(has_code(&v, "EMPTY_POINT_KEY"), "{v}");
+
+    // ⑥ point_key 通用格式非法 ⇒ INVALID_POINT_KEY（仅通用语法，不判身份）。
+    for bad_key in [
+        "channel.r_parameter#index=1@channel=i:1", // 值段缺类型标签
+        "channel.r_parameter#b=i:1,a=i:2@channel=i:1", // 键名未升序
+        "native.C.1.21.1.396~1",                   // 后缀 n < 2
+        "not a key",                               // 非键字符
+    ] {
+        let task = nck_task(
+            "t1",
+            serde_json::json!([{
+                "kind": "nck_variable",
+                "point_key": bad_key,
+                "parameters": {}
+            }]),
+        );
+        let (s, v) = save(app.clone(), serde_json::json!([task])).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "`{bad_key}` 应被拒: {v}");
+        assert!(has_code(&v, "INVALID_POINT_KEY"), "`{bad_key}`: {v}");
+    }
+
+    // ⑦ 格式合法但**身份错误**的 Key 必须放行（Core 不判定身份正确性，修订 4）。
+    let identity_wrong = nck_task(
+        "t1",
+        serde_json::json!([{
+            "kind": "nck_variable",
+            "point_key": "native.C.1.21.1.396",
+            "parameters": {
+                "variable_id": "channel.program.status",
+                "definition_revision": 99,
+                "target": { "channel": 1 },
+                "arguments": {}
+            }
+        }]),
+    );
+    let (s, v) = save(app.clone(), serde_json::json!([identity_wrong])).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "格式合法但身份错误必须放行（由 Driver 以 POINT_KEY_MISMATCH 拒绝）: {v}"
+    );
+
+    // ⑧ T2：**跨任务**重复 point_key ⇒ DUPLICATE_POINT_KEY（Endpoint-wide）。
+    let dup_cross_task = serde_json::json!([
+        nck_task(
+            "t1",
+            serde_json::json!([{ "kind": "nck_variable", "point_key": "dup.key@channel=i:1", "parameters": {} }])
+        ),
+        nck_task(
+            "t2",
+            serde_json::json!([{ "kind": "nck_native", "point_key": "dup.key@channel=i:1", "parameters": {} }])
+        )
+    ]);
+    let (s, v) = save(app.clone(), dup_cross_task).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(has_code(&v, "DUPLICATE_POINT_KEY"), "{v}");
+
+    // ⑨ 跨 Task Binding Kind 的重复 ⇒ 同样拒绝（两种 kind 共用一个命名空间）。
+    let dup_cross_kind = serde_json::json!([
+        generic_task(
+            "t1",
+            serde_json::json!([{
+                "resource_id": "counter",
+                "parameters": {},
+                "outputs": [{ "output": "value", "point_key": "cross.kind" }]
+            }])
+        ),
+        nck_task(
+            "t2",
+            serde_json::json!([{ "kind": "nck_variable", "point_key": "cross.kind", "parameters": {} }])
+        )
+    ]);
+    let (s, v) = save(app.clone(), dup_cross_kind).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(has_code(&v, "DUPLICATE_POINT_KEY"), "{v}");
+
+    // ⑩ 未知 **Task Binding Kind** ⇒ UNSUPPORTED_BINDING（路由仍严格，不静默放行）。
+    let bad_kind = serde_json::json!([{
+        "id": "t1",
+        "schedule": { "mode": "poll", "interval_ms": 100 },
+        "binding": { "kind": "mesa.points.v2", "config": { "points": [] } }
+    }]);
+    let (s, v) = save(app.clone(), bad_kind).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(has_code(&v, "UNSUPPORTED_BINDING"), "{v}");
+
+    // ⑪ `mesa.resources.v1` 行为**零变化**：合法 200、未知 resource 仍 400。
+    let generic_ok = serde_json::json!([generic_task(
+        "t1",
+        serde_json::json!([{
+            "resource_id": "counter",
+            "parameters": { "start": 1 },
+            "outputs": [{ "output": "value", "point_key": "generic.k" }]
+        }])
+    )]);
+    let (s, v) = save(app.clone(), generic_ok.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let generic_bad = serde_json::json!([generic_task(
+        "t1",
+        serde_json::json!([{
+            "resource_id": "nope",
+            "parameters": {},
+            "outputs": [{ "output": "value", "point_key": "generic.k" }]
+        }])
+    )]);
+    let (s, v) = save(app.clone(), generic_bad).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(has_code(&v, "UNKNOWN_RESOURCE"), "{v}");
+
+    // ⑫ 清空（tasks=[]）直接放行，不碰 Descriptor。
+    let (s, v) = save(app.clone(), serde_json::json!([])).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+/// PR-A P2 护栏：bootstrap 创建门禁与 REST 保存门禁**同源**（唯一实现）。
+///
+/// 设计文档 §1.2 / P2：两处此前各有一份 Task Binding Kind 白名单，必须收敛为
+/// 同一函数，否则会出现「保存通过、bootstrap 拒绝」的双真值分叉。本用例证明
+/// 同一载荷在两处得到**同一判定**（同状态码 + 同 issue code）。
+#[tokio::test]
+async fn bootstrap_gate_shares_nck_points_routing() {
+    fn bootstrap_body(id: &str, tasks: serde_json::Value) -> String {
+        serde_json::json!({
+            "device": { "id": format!("{id}-dev"), "name": "D" },
+            "endpoint": {
+                "id": id,
+                "name": "E1",
+                "driver_id": "test-driver",
+                "connection": {}
+            },
+            "acquisition": { "tasks": tasks },
+            "start": false
+        })
+        .to_string()
+    }
+    fn nck_task(id: &str, points: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "schedule": { "mode": "poll", "interval_ms": 100 },
+            "binding": { "kind": "nck.points.v1", "config": { "points": points } }
+        })
+    }
+
+    // ① 合法 nck.points.v1（含 Core 不认识的 Point Kind 与不透明 parameters）⇒ 创建成功。
+    let (app1, _, _staged1) = app().await;
+    let ok = bootstrap_body(
+        "e1",
+        serde_json::json!([nck_task(
+            "t1",
+            serde_json::json!([
+                {
+                    "kind": "weird_kind",
+                    "point_key": "channel.r_parameter#index=i:100@channel=i:1",
+                    "parameters": { "opaque": { "any": ["thing"] } }
+                },
+                {
+                    "kind": "nck_native",
+                    "point_key": "native.C.1.21.1.396",
+                    "parameters": {}
+                }
+            ])
+        )]),
+    );
+    let (s, v) = post_json(app1.clone(), "/api/v1/device-bootstrap", &ok).await;
+    assert_eq!(
+        s,
+        StatusCode::CREATED,
+        "bootstrap 必须与保存门禁同判定: {v}"
+    );
+
+    // ② 信封层非法（未知字段）⇒ 与 REST 路径同一 issue code。
+    let (app2, _, _staged2) = app().await;
+    let bad = bootstrap_body(
+        "e2",
+        serde_json::json!([nck_task(
+            "t1",
+            serde_json::json!([{
+                "kind": "nck_variable",
+                "point_key": "a.b",
+                "parameters": {},
+                "identity": {}
+            }])
+        )]),
+    );
+    let (s, v) = post_json(app2.clone(), "/api/v1/device-bootstrap", &bad).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["issues"][0]["code"], "UNKNOWN_FIELD", "{v}");
+    assert_eq!(
+        v["issues"][0]["path"], "acquisition.tasks[0].binding.config.points[0].identity",
+        "bootstrap 路径前缀必须与保存门禁同构: {v}"
+    );
+
+    // ③ 未知 Task Binding Kind ⇒ bootstrap 也拒绝（白名单唯一，无 bypass）。
+    let (app3, _, _staged3) = app().await;
+    let bad_kind = bootstrap_body(
+        "e3",
+        serde_json::json!([{
+            "id": "t1",
+            "schedule": { "mode": "poll", "interval_ms": 100 },
+            "binding": { "kind": "nck.points.v1.legacy", "config": { "points": [] } }
+        }]),
+    );
+    let (s, v) = post_json(app3.clone(), "/api/v1/device-bootstrap", &bad_kind).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["issues"][0]["code"], "UNSUPPORTED_BINDING", "{v}");
+}
+
 /// PR4 Secret 正式语义：缺失保留旧值、marker 保留、显式 clear 删除。
 ///（opcua password 为 optional Secret；marker 复用可观测保留/删除。）
 #[tokio::test]
