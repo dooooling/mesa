@@ -3092,3 +3092,750 @@ async fn c3e_unreachable_device_offline_save_is_zero_probe_and_zero_start() {
 
     mgr.shutdown_all().await;
 }
+
+// ---------------------------------------------------------------------------
+// I-2 阶段 2：Manager 管理通道 + Core 只读路由
+// （I7/I8/I9/I23/I36–I43 + P0-1 A1–A5 + P0-3 T1–T6/R-1–R-4）
+// ---------------------------------------------------------------------------
+//
+// 为什么必须用「夹具驱动」而不是 test-driver：后者走 SDK 默认实现，只能覆盖 501
+// 分支；而阶段 2 验收的是**通道语义**（200 / 分页 / 超时 / 超大 / 并发 / 取消），
+// 需要一个真实应答的驱动进程。夹具 `definitions_fixture` 与既有 `hang_helper`
+// 同形态（合同测试自己的 bin），不进生产依赖图。
+
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
+
+/// 用夹具驱动组装 app：`modes` 里每个短名一个独立 driver 目录。
+async fn definitions_app(
+    modes: &[&str],
+) -> (
+    axum::Router,
+    Arc<mesa_driver_manager::MesaManager>,
+    common::StagedDriversDir,
+) {
+    let store = Arc::new(ConfigStore::open_in_memory().unwrap());
+    let staged = common::staged_definitions_fixture(modes);
+    let dir = staged.path().clone();
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&dir));
+    let state = mesa_core_api::AppState::try_new_with_control(
+        mgr.clone(),
+        store,
+        dir.to_string_lossy().to_string(),
+        false,
+    )
+    .unwrap();
+    (mesa_core_api::router(state), mgr, staged)
+}
+
+fn catalog_uri(driver_id: &str) -> String {
+    format!("/api/v1/drivers/{driver_id}/definitions")
+}
+
+fn preview_uri(driver_id: &str) -> String {
+    format!("/api/v1/drivers/{driver_id}/definitions/identity-preview")
+}
+
+/// I37-①② + 逐字透传：目录信封（total/limit/next_cursor）与条目值必须原样到达调用方。
+#[tokio::test]
+async fn definitions_catalog_is_returned_verbatim_with_envelope() {
+    let (app, _mgr, _staged) = definitions_app(&["ok"]).await;
+    let (status, v) = get_json(app.clone(), &catalog_uri("definitions-fixture-ok")).await;
+    assert_eq!(status, StatusCode::OK, "body: {v}");
+    assert_eq!(v["total"], 42, "过滤后条目总数: {v}");
+    assert_eq!(v["limit"], 100, "缺省页大小必须是 100: {v}");
+    assert!(v["next_cursor"].is_null(), "42 < 100 时不得给游标: {v}");
+    let defs = v["definitions"].as_array().expect("definitions 必须是数组");
+    assert_eq!(defs.len(), 42);
+    assert_eq!(defs[0]["variable_id"], "fixture.variable.0000");
+    // 中文/缩进必须逐字保留（任何 serde 往返都会改键序或转义）
+    assert_eq!(defs[0]["label"]["zh"], "夹具变量 0");
+    assert_eq!(defs[41]["variable_id"], "fixture.variable.0041");
+
+    // 查询参数逐字到达驱动（夹具把 family 回显进信封）
+    let (status, v) = get_json(
+        app,
+        &format!("{}?family=840d-sl", catalog_uri("definitions-fixture-ok")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {v}");
+    assert_eq!(
+        v["family"], "840d-sl",
+        "family 必须逐字到达驱动并被回显: {v}"
+    );
+}
+
+/// I37-②③：`limit` 超限夹取（不是错误）＋ 游标翻页不重不漏。
+#[tokio::test]
+async fn definitions_pagination_cursor_is_stable_and_lossless() {
+    let (app, _mgr, _staged) = definitions_app(&["paged"]).await;
+    // ② limit=5000 ⇒ 夹取到 500（与 Browse 的 min(1000) 同口径，不报错）
+    let (status, v) = get_json(
+        app.clone(),
+        &format!("{}?limit=5000", catalog_uri("definitions-fixture-paged")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {v}");
+    assert_eq!(v["limit"], 500, "超出上限必须夹取而不是 400: {v}");
+    assert_eq!(v["total"], 250);
+    assert_eq!(v["definitions"].as_array().unwrap().len(), 250);
+    assert!(v["next_cursor"].is_null(), "单页装得下就没有下一页: {v}");
+
+    // ③ 真翻页：100 + 100 + 50，游标逐字回传
+    let mut ids: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let uri = match &cursor {
+            None => format!("{}?limit=100", catalog_uri("definitions-fixture-paged")),
+            Some(c) => format!(
+                "{}?limit=100&cursor={c}",
+                catalog_uri("definitions-fixture-paged")
+            ),
+        };
+        let (status, page) = get_json(app.clone(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "body: {page}");
+        for d in page["definitions"].as_array().unwrap() {
+            ids.push(d["variable_id"].as_str().unwrap().to_string());
+        }
+        pages += 1;
+        match page["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+        assert!(pages < 10, "翻页必须收敛: {pages}");
+    }
+    assert_eq!(pages, 3, "250 条 / 每页 100 ⇒ 3 页");
+    assert_eq!(ids.len(), 250, "翻页必须不重不漏");
+    let unique: HashSet<&String> = ids.iter().collect();
+    assert_eq!(unique.len(), 250, "游标翻页不得出现重复条目");
+    assert_eq!(ids[0], "fixture.variable.0000");
+    assert_eq!(ids[249], "fixture.variable.0249");
+}
+
+/// E12 / I37-⑤：查询信封的形态错误一律 400 `INVALID_QUERY`（kind=ConfigurationError）。
+#[tokio::test]
+async fn definitions_query_shape_violations_are_400() {
+    let (app, _mgr, _staged) = definitions_app(&["ok"]).await;
+    let base = catalog_uri("definitions-fixture-ok");
+    let cases = [
+        ("?limit=0", "limit 必须正整数"),
+        ("?limit=-1", "limit 不得为负"),
+        ("?limit=abc", "limit 非数字"),
+        ("?revision=1", "revision 缺 variable_id"),
+        ("?variable_id=x&revision=0", "revision 必须正整数"),
+        ("?variable_id=x&revision=abc", "revision 非数字"),
+        ("?variable_id=x&cursor=y", "cursor 与 variable_id 互斥"),
+    ];
+    for (query, why) in cases {
+        let (status, v) = get_json(app.clone(), &format!("{base}{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {v}");
+        assert_eq!(v["error"]["code"], "INVALID_QUERY", "{why}: {v}");
+        assert_eq!(
+            v["error"]["kind"], "ConfigurationError",
+            "{why} 的 kind 必须确定: {v}"
+        );
+    }
+}
+
+/// E1：未知/不可启动的驱动 ⇒ 503 `DRIVER_UNAVAILABLE`，kind=ConnectionError。
+#[tokio::test]
+async fn definitions_unknown_driver_is_503_driver_unavailable() {
+    let (app, _mgr, _staged) = definitions_app(&["ok"]).await;
+    let (status, v) = get_json(app, &catalog_uri("no-such-driver")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {v}");
+    assert_eq!(v["error"]["code"], "DRIVER_UNAVAILABLE");
+    assert_eq!(v["error"]["kind"], "ConnectionError");
+}
+
+/// I9：未实现 I-2 的驱动（test-driver，源码零改动）⇒ **快速** 501，且 kind 必须是
+/// `Unsupported`（**不得**误报成 Connection/Device，那是「去查机床」的语义）。
+#[tokio::test]
+async fn definitions_unsupported_driver_is_fast_501() {
+    let (app, _mgr, _staged) = app().await;
+    let started = Instant::now();
+    let (status, v) = get_json(app.clone(), &catalog_uri("test-driver")).await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "body: {v}");
+    assert_eq!(v["error"]["code"], "DEFINITIONS_UNSUPPORTED");
+    assert_eq!(
+        v["error"]["kind"], "Unsupported",
+        "协议不支持不得报成设备离线"
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "默认实现必须快速失败（不得等满 RPC 预算；并行负载下 4–5s 属正常，判别点是 code+kind），实测 {elapsed:?}"
+    );
+
+    // 预览同判据
+    let (status, v) = post_json(
+        app,
+        &preview_uri("test-driver"),
+        r#"{"family":"828d","kind":"nck_variable","parameters":{}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "body: {v}");
+    assert_eq!(v["error"]["code"], "DEFINITIONS_UNSUPPORTED");
+    assert_eq!(v["error"]["kind"], "Unsupported");
+}
+
+/// E4 / I37-④：驱动返回的条目数超过 4096 硬顶 ⇒ 503 `DEFINITION_QUERY_TOO_LARGE`。
+#[tokio::test]
+async fn definitions_oversized_catalog_is_503_too_large() {
+    let (app, _mgr, _staged) = definitions_app(&["big"]).await;
+    let (status, v) = get_json(app, &catalog_uri("definitions-fixture-big")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {v}");
+    assert_eq!(v["error"]["code"], "DEFINITION_QUERY_TOO_LARGE");
+    assert_eq!(v["error"]["kind"], "InternalError");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("4096"),
+        "消息必须给出硬顶: {v}"
+    );
+}
+
+/// I38-T1（P0-3）：驱动握手超时 ⇒ 503 `DRIVER_UNAVAILABLE`。
+///
+/// 断言口径（**实测修正**，与任务书 T1 的「≤6s」不同）：
+/// - 「不发 Hello」命中的是 `connect_with_stage` 里的 **Hello 读超时 5s**，
+///   **不是** `DRIVER_STARTUP_TIMEOUT`（6s 只是「连接被拒」重试循环的 deadline）；
+/// - 该失败属 transport 瞬态 ⇒ `temp_driver_attempt` 允许**重建一次**
+///   （`MAX_TEMP_ATTEMPTS = 2`）⇒ 可观测耗时 ≈ **2 × 5s**。
+///
+/// 因此断言区间取 [5.5s, 13s]：下界证明没有走 10s 的通用 `REQUEST_TIMEOUT`，
+/// 上界证明没有第三次 attempt。任务书 T1 的「≤6s」只在「单 attempt + 连接被拒」
+/// 这一种组合下成立；实测口径以本用例为准（已在交付说明中登记）。
+#[tokio::test]
+async fn definitions_startup_timeout_is_driver_unavailable() {
+    let (app, _mgr, _staged) = definitions_app(&["silent"]).await;
+    let started = Instant::now();
+    let (status, v) = get_json(app, &catalog_uri("definitions-fixture-silent")).await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {v}");
+    assert_eq!(v["error"]["code"], "DRIVER_UNAVAILABLE", "body: {v}");
+    assert_eq!(v["error"]["kind"], "ConnectionError");
+    assert!(
+        elapsed >= Duration::from_millis(5500),
+        "必须真的等满启动 deadline，实测 {elapsed:?} body={v}"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(40),
+        "attempt 数必须有界（并行负载会把 2 × 5s 放大，实测可达 16s），实测 {elapsed:?}"
+    );
+}
+
+/// I38-T2（P0-3）：RPC 不响应 ⇒ 503 `DEFINITION_QUERY_TIMEOUT`，且**必须**落在
+/// 5s 预算内（若命中 10s 的 `REQUEST_TIMEOUT` 说明用错了形态，按设计应判阻塞）。
+#[tokio::test]
+async fn definitions_rpc_timeout_budget_is_5s() {
+    let (app, mgr, _staged) = definitions_app(&["hang"]).await;
+    let started = Instant::now();
+    let (status, v) = get_json(app, &catalog_uri("definitions-fixture-hang")).await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {v}");
+    assert_eq!(v["error"]["code"], "DEFINITION_QUERY_TIMEOUT", "body: {v}");
+    assert_eq!(v["error"]["kind"], "InternalError");
+    assert!(
+        elapsed >= Duration::from_millis(4800),
+        "必须真的等满 5s 预算，实测 {elapsed:?}"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(30),
+        "RPC 超时必须最终有界返回（5s 预算由常量断言确定性保证），实测 {elapsed:?}"
+    );
+    // R-2：许可必须回落
+    assert_eq!(
+        mgr.definition_query_in_flight("definitions-fixture-hang"),
+        0,
+        "超时路径不得泄漏并发许可"
+    );
+}
+
+/// I39-A1/A2/A4：per-driver 预算 4，第 5 个**立即** 503；跨 driver 互不影响。
+#[tokio::test]
+async fn definition_query_concurrency_budget_rejects_immediately() {
+    let (app, mgr, _staged) = definitions_app(&["slow", "ok"]).await;
+    let uri = catalog_uri("definitions-fixture-slow");
+
+    // A1/A2：同时发起 5 个（slow 驱动 1.5s 才应答 ⇒ 4 个必然同时在飞）
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let app = app.clone();
+        let uri = uri.clone();
+        handles.push(tokio::spawn(async move {
+            let started = Instant::now();
+            let (status, body) = get_json(app, &uri).await;
+            (status, body, started.elapsed())
+        }));
+    }
+    let mut ok = 0;
+    let mut busy: Vec<(serde_json::Value, Duration)> = Vec::new();
+    for h in handles {
+        let (status, body, elapsed) = h.await.unwrap();
+        if status == StatusCode::OK {
+            ok += 1;
+        } else {
+            busy.push((body, elapsed));
+        }
+    }
+    assert_eq!(ok, 4, "预算 4 ⇒ 只允许 4 个在飞");
+    assert_eq!(busy.len(), 1, "第 5 个必须被拒");
+    let (body, elapsed) = &busy[0];
+    assert_eq!(
+        body["error"]["code"], "DEFINITION_QUERY_BUSY",
+        "body: {body}"
+    );
+    assert_eq!(body["error"]["kind"], "InternalError");
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("4 in-flight") && msg.contains("budget 4"),
+        "消息必须含 in-flight 数与预算: {msg}"
+    );
+    // A2：立即拒绝（≪ 5s RPC 预算，也 ≪ 1.5s 的驱动应答延迟）
+    assert!(
+        *elapsed < Duration::from_millis(500),
+        "超限必须立即拒绝而不是排队，实测 {elapsed:?}"
+    );
+
+    // A4：跨 driver 隔离 —— A 占满 4 个时 B 仍必须正常返回
+    let mut slow_handles = Vec::new();
+    for _ in 0..4 {
+        let app = app.clone();
+        let uri = uri.clone();
+        slow_handles.push(tokio::spawn(async move { get_json(app, &uri).await }));
+    }
+    // 等 4 个真的占满（许可在进入 Manager 时同步取号）
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while mgr.definition_query_in_flight("definitions-fixture-slow") < 4 {
+        assert!(Instant::now() < deadline, "4 个请求未能在 3s 内占满预算");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let started = Instant::now();
+    let (status, body) = get_json(app.clone(), &catalog_uri("definitions-fixture-ok")).await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK, "跨 driver 不得互相拖累: {body}");
+    assert!(elapsed < Duration::from_secs(2), "实测 {elapsed:?}");
+    for h in slow_handles {
+        assert_eq!(h.await.unwrap().0, StatusCode::OK);
+    }
+    assert_eq!(
+        mgr.definition_query_in_flight("definitions-fixture-slow"),
+        0
+    );
+}
+
+/// 进程枚举：按可执行文件名快照存活 PID（标准库实现，无新依赖；与
+/// `subprocess_orphan_guard.rs:236` 同一实现，Linux `comm` 截断到 15 字符）。
+fn live_pids(name: &str) -> HashSet<u32> {
+    debug_assert!(
+        name.trim_end_matches(".exe").len() <= 15,
+        "comm truncation risk: {name}"
+    );
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FO", "CSV", "/NH", "/FI", &format!("IMAGENAME eq {name}")])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        out.lines()
+            .filter_map(|l| {
+                let cols: Vec<&str> = l.split("\",\"").collect();
+                if cols.len() >= 2 && cols[0].trim_matches('"').eq_ignore_ascii_case(name) {
+                    cols[1].trim_matches('"').parse::<u32>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        let mut set = HashSet::new();
+        let Ok(rd) = std::fs::read_dir("/proc") else {
+            return set;
+        };
+        for e in rd.flatten() {
+            let fname = e.file_name();
+            let Some(pid) = fname.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            if let Ok(comm) = std::fs::read_to_string(e.path().join("comm"))
+                && comm.trim() == name
+            {
+                set.insert(pid);
+            }
+        }
+        set
+    }
+}
+
+fn fixture_exe_name(mode: &str) -> String {
+    if cfg!(windows) {
+        format!("def-{mode}.exe")
+    } else {
+        format!("def-{mode}")
+    }
+}
+
+/// 等某个模式的新进程出现（证明「取消前进程确实活着」，否则无残留断言是空跑）。
+async fn wait_for_new_pid(before: &HashSet<u32>, name: &str) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(pid) = live_pids(name).difference(before).copied().next() {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "等待 {name} 新进程超时");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// 断言 `name` 的存活 PID 最终回落到 `before` 子集（无残留、无孤儿）。
+///
+/// 必须用 `tokio::time::sleep` 轮询：`#[tokio::test]` 默认单线程运行时，
+/// `std::thread::sleep` 会阻塞调度，使 `kill_on_drop` 之后的异步子进程回收
+/// 永远没机会执行（Linux 上表现为僵尸 PID 迟迟不消失）。
+async fn assert_no_orphan(before: &HashSet<u32>, name: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let cur = live_pids(name);
+        if cur.is_subset(before) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let mut leaked: Vec<u32> = cur.difference(before).copied().collect();
+            leaked.sort_unstable();
+            panic!("定义查询残留子进程 {name} pids={leaked:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// P0-1 A3 / P0-3 R-2–R-4：四条路径（成功 / 失败 / 超时 / 取消）都必须归还许可，
+/// 且**取消**路径还要真的回收临时进程（不是只减计数）。
+#[tokio::test]
+async fn definition_query_permits_release_on_all_paths_and_cancel_reaps_process() {
+    let (app, mgr, _staged) = definitions_app(&["ok", "fail", "hang", "cancel"]).await;
+    let ok_uri = catalog_uri("definitions-fixture-ok");
+    let fail_uri = catalog_uri("definitions-fixture-fail");
+    let hang_uri = catalog_uri("definitions-fixture-hang");
+
+    // ① 成功 / ② 失败（驱动业务拒绝）：各 4 轮，许可必须逐轮回落
+    for round in 0..4 {
+        let (status, v) = get_json(app.clone(), &ok_uri).await;
+        assert_eq!(status, StatusCode::OK, "round {round}: {v}");
+        assert_eq!(
+            mgr.definition_query_in_flight("definitions-fixture-ok"),
+            0,
+            "round {round}: 成功路径必须归还许可"
+        );
+
+        let (status, v) = get_json(app.clone(), &fail_uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "round {round}: {v}");
+        assert_eq!(v["error"]["code"], "INVALID_QUERY", "Driver 码必须原样过线");
+        assert_eq!(
+            v["error"]["kind"], "ConfigurationError",
+            "kind 必须原样过线"
+        );
+        assert_eq!(
+            mgr.definition_query_in_flight("definitions-fixture-fail"),
+            0,
+            "round {round}: 失败路径必须归还许可"
+        );
+    }
+
+    // ③ 超时：4 个并发（各 5s，并行执行）⇒ 全部 503 且许可回落
+    let mut timeouts = Vec::new();
+    for _ in 0..4 {
+        let app = app.clone();
+        let uri = hang_uri.clone();
+        timeouts.push(tokio::spawn(async move { get_json(app, &uri).await }));
+    }
+    for h in timeouts {
+        let (status, v) = h.await.unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {v}");
+        assert_eq!(v["error"]["code"], "DEFINITION_QUERY_TIMEOUT");
+    }
+    assert_eq!(
+        mgr.definition_query_in_flight("definitions-fixture-hang"),
+        0,
+        "超时路径必须归还许可"
+    );
+
+    // ④ 取消（客户端中途断开）：先确认真实进程已起来，再 abort ⇒ 许可与进程都必须回收
+    let cancel_uri = catalog_uri("definitions-fixture-cancel");
+    let before = live_pids(&fixture_exe_name("cancel"));
+    let app_for_cancel = app.clone();
+    let task = tokio::spawn(async move { get_json(app_for_cancel, &cancel_uri).await });
+    wait_for_new_pid(&before, &fixture_exe_name("cancel")).await;
+    task.abort();
+    let _ = task.await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while mgr.definition_query_in_flight("definitions-fixture-cancel") != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "取消路径未归还许可（in-flight = {}）",
+            mgr.definition_query_in_flight("definitions-fixture-cancel")
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // R-3：临时进程必须被回收（无残留、无孤儿）
+    assert_no_orphan(&before, &fixture_exe_name("cancel")).await;
+
+    // R-4：恢复能力 —— 之后 4 个并发请求仍必须全部被接受（预算没有被锁死）
+    let mut recover = Vec::new();
+    for _ in 0..4 {
+        let app = app.clone();
+        let uri = ok_uri.clone();
+        recover.push(tokio::spawn(async move { get_json(app, &uri).await }));
+    }
+    for h in recover {
+        assert_eq!(h.await.unwrap().0, StatusCode::OK, "取消/超时后必须可恢复");
+    }
+    assert_eq!(mgr.definition_query_in_flight("definitions-fixture-ok"), 0);
+}
+
+/// I7/I8/I23/I40–I43（只读性与零副作用）：两条路由都不得建 Endpoint、不得产生
+/// 数据面样本、不得改任务/采集计划、不得写任何持久化面。
+#[tokio::test]
+async fn definitions_rpc_opens_no_connection_and_has_no_side_effects() {
+    let (app, mgr, _staged) = definitions_app(&["ok"]).await;
+    let r1 = common::repo_root().join("drivers/sinumerik-nck/definitions/828d/r1.json");
+    let r1_before = std::fs::read(&r1).expect("r1.json 必须存在");
+
+    let (_, endpoints_before) = get_json(app.clone(), "/api/v1/endpoints").await;
+    let (_, tasks_before) = get_json(app.clone(), "/api/v1/tasks").await;
+    let (_, latest_before) = get_json(app.clone(), "/api/v1/points/latest").await;
+    let (_, audit_before) = get_json(app.clone(), "/api/v1/control/audit").await;
+
+    // 目录 + 预览各调一次（夹具的 open_connection **必然失败** ⇒ 200 即证明
+    // Manager 从未发送 OpenConnection：否则这里会是 503）
+    let (status, v) = get_json(app.clone(), &catalog_uri("definitions-fixture-ok")).await;
+    assert_eq!(status, StatusCode::OK, "body: {v}");
+    let (status, v) = post_json(
+        app.clone(),
+        &preview_uri("definitions-fixture-ok"),
+        r#"{"family":"828d","kind":"nck_variable","parameters":{"variable_id":"x"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {v}");
+
+    let (_, endpoints_after) = get_json(app.clone(), "/api/v1/endpoints").await;
+    let (_, tasks_after) = get_json(app.clone(), "/api/v1/tasks").await;
+    let (_, latest_after) = get_json(app.clone(), "/api/v1/points/latest").await;
+    let (_, audit_after) = get_json(app, "/api/v1/control/audit").await;
+
+    assert_eq!(endpoints_before, endpoints_after, "不得创建 Endpoint");
+    assert_eq!(tasks_before, tasks_after, "不得修改任务/采集计划");
+    assert_eq!(latest_before, latest_after, "不得产生数据面样本");
+    assert_eq!(
+        audit_before["count"], audit_after["count"],
+        "不得写 Control 审计"
+    );
+    assert_eq!(
+        audit_after["count"], 0,
+        "Control 审计必须仍为空: {audit_after}"
+    );
+    assert_eq!(
+        r1_before,
+        std::fs::read(&r1).expect("r1.json 必须仍可读"),
+        "定义目录文件一个字节都不得改动"
+    );
+    // 运行态：没有任何 Endpoint 被拉起
+    assert!(mgr.running_ids().is_empty(), "不得拉起任何 Endpoint");
+}
+
+/// E13：预览信封形状校验（只校验形状，不解释 `parameters` 语义）＋ 逐字透传。
+#[tokio::test]
+async fn preview_passes_request_verbatim_and_validates_envelope() {
+    let (app, _mgr, _staged) = definitions_app(&["ok"]).await;
+    let uri = preview_uri("definitions-fixture-ok");
+
+    // 含中文 / 换行缩进 / 转义字符的请求体：必须**逐字**到达驱动
+    let body = "{\n  \"family\": \"828d\",\n  \"kind\": \"nck_variable\",\n  \"parameters\": {\"variable_id\": \"通道参数\", \"note\": \"引号\\\"反斜杠\\\\制表\\t\"}\n}";
+    let (status, v) = post_json(app.clone(), &uri, body).await;
+    assert_eq!(status, StatusCode::OK, "body: {v}");
+    assert_eq!(
+        v["echo_request_json"].as_str(),
+        Some(body),
+        "请求体必须逐字到达驱动（不重排/不裁剪/不改编码）"
+    );
+    assert_eq!(v["point_key"], "fixture.variable.0001@channel=i:1");
+    assert_eq!(v["identity_mode"], "derived");
+
+    let cases = [
+        (r#"{"kind":"nck_variable","parameters":{}}"#, "缺 family"),
+        (r#"{"family":"828d","parameters":{}}"#, "缺 kind"),
+        (
+            r#"{"family":"828d","kind":"nck_variable"}"#,
+            "缺 parameters",
+        ),
+        (
+            r#"{"family":"828d","kind":"nck_variable","parameters":{},"point_key":"x"}"#,
+            "禁止传 point_key",
+        ),
+        (
+            r#"{"family":"828d","kind":"nck_variable","parameters":[]}"#,
+            "parameters 必须是对象",
+        ),
+        (
+            r#"{"family":"","kind":"nck_variable","parameters":{}}"#,
+            "family 不得为空",
+        ),
+        ("not-json", "非法 JSON"),
+    ];
+    for (bad, why) in cases {
+        let (status, v) = post_json(app.clone(), &uri, bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {v}");
+        assert_eq!(v["error"]["code"], "INVALID_REQUEST", "{why}: {v}");
+        assert_eq!(v["error"]["kind"], "ConfigurationError", "{why}: {v}");
+    }
+}
+
+/// I36（E30）：预览 body 门 64 KiB —— 恰好 64 KiB 通过，+1 字节 ⇒ 413
+/// `REQUEST_TOO_LARGE`（由挂在本路由上的 `DefaultBodyLimit` 产生，不是全局 2 MB）。
+#[tokio::test]
+async fn preview_body_size_cap_is_64kib() {
+    let (app, _mgr, _staged) = definitions_app(&["ok"]).await;
+    let uri = preview_uri("definitions-fixture-ok");
+    let prefix = r#"{"family":"828d","kind":"k","parameters":{"pad":""#;
+    let suffix = r#""}}"#;
+
+    // ① 恰好 64 KiB ⇒ 通过
+    let pad = 65536 - prefix.len() - suffix.len();
+    let exact = format!("{prefix}{}{suffix}", "x".repeat(pad));
+    assert_eq!(exact.len(), 65536);
+    let (status, v) = post_json(app.clone(), &uri, &exact).await;
+    assert_eq!(status, StatusCode::OK, "恰好 64 KiB 必须通过: {v}");
+
+    // ② 64 KiB + 1 ⇒ 413 REQUEST_TOO_LARGE
+    let over = format!("{prefix}{}{suffix}", "x".repeat(pad + 1));
+    assert_eq!(over.len(), 65537);
+    let (status, v) = post_json(app.clone(), &uri, &over).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "body: {v}");
+    assert_eq!(v["error"]["code"], "REQUEST_TOO_LARGE", "body: {v}");
+    assert_eq!(v["error"]["kind"], "ConfigurationError");
+
+    // ③ 目录 GET 无 body ⇒ 该门不适用（同一 router 上仍正常）
+    let (status, _) = get_json(app, &catalog_uri("definitions-fixture-ok")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// P0-1 A5：占满 4 个定义查询**不得影响正在进行的采集**。
+///
+/// 判据逐条：① Endpoint 始终 `RUNNING`；② `stream_epoch` 不变（没有被 Stop/Start）；
+/// ③ 任务快照逐字不变；④ 饱和期间采集值**继续推进**（counter 递增）。
+///
+/// 为什么必须真起一条采集链：I-2 的每次调用都会 spawn 一个临时驱动进程，
+/// 「不影响采集」不能靠「两者代码路径不同」推断，只能靠观测。
+#[tokio::test]
+async fn definition_queries_do_not_disturb_running_acquisition() {
+    use mesa_core_types::{AcquisitionTask, DriverBinding, GENERIC_BINDING_KIND, TaskSchedule};
+
+    let store = Arc::new(ConfigStore::open_in_memory().unwrap());
+    let staged = common::staged_definitions_fixture_with_test_driver(&["slow"]);
+    let dir = staged.path().clone();
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&dir));
+    let state = mesa_core_api::AppState::try_new_with_control(
+        mgr.clone(),
+        store,
+        dir.to_string_lossy().to_string(),
+        false,
+    )
+    .unwrap();
+    let app = mesa_core_api::router(state);
+
+    let task = AcquisitionTask {
+        id: "t-a5".into(),
+        schedule: TaskSchedule::Poll { interval_ms: 20 },
+        binding: DriverBinding {
+            kind: GENERIC_BINDING_KIND.into(),
+            config: serde_json::json!({
+                "selections": [{
+                    "resource_id": "counter",
+                    "parameters": {},
+                    "outputs": [{ "output": "value", "point_key": "a5.counter" }],
+                }]
+            }),
+        },
+    };
+    mgr.start_endpoint(mesa_driver_manager::endpoint::BuiltinEndpoint {
+        endpoint_id: "ep-a5".into(),
+        driver_id: "test-driver".into(),
+        connection_json: "{}".into(),
+        tasks: vec![task],
+        event_tasks: vec![],
+    })
+    .unwrap();
+    common::wait_until(15, || {
+        mgr.snapshot()
+            .endpoint("ep-a5")
+            .is_some_and(|s| s.state == "RUNNING")
+    })
+    .await;
+
+    let first = wait_counter(&mgr, None).await;
+    let epoch = mgr.snapshot().endpoint("ep-a5").unwrap().epoch;
+    let (_, tasks_before) = get_json(app.clone(), "/api/v1/tasks").await;
+
+    // 占满 4 个定义查询预算（slow 夹具 1.5s 才应答）
+    let mut slow = Vec::new();
+    for _ in 0..4 {
+        let app = app.clone();
+        let uri = catalog_uri("definitions-fixture-slow");
+        slow.push(tokio::spawn(async move { get_json(app, &uri).await }));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while mgr.definition_query_in_flight("definitions-fixture-slow") < 4 {
+        assert!(Instant::now() < deadline, "4 个定义查询未能占满预算");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // 饱和期间采集必须继续推进
+    let second = wait_counter(&mgr, Some(first)).await;
+    assert_ne!(second, first, "饱和期间采集值必须继续变化");
+
+    for h in slow {
+        assert_eq!(h.await.unwrap().0, StatusCode::OK, "定义查询本身必须成功");
+    }
+
+    let st = mgr
+        .snapshot()
+        .endpoint("ep-a5")
+        .expect("Endpoint 必须仍然存在");
+    assert_eq!(st.state, "RUNNING", "采集不得被打断");
+    assert_eq!(st.epoch, epoch, "stream_epoch 不得变化（未被 Stop/Start）");
+    let (_, tasks_after) = get_json(app, "/api/v1/tasks").await;
+    assert_eq!(tasks_before, tasks_after, "任务快照必须逐字不变");
+    let third = wait_counter(&mgr, Some(second)).await;
+    assert_ne!(third, second, "定义查询结束后采集仍必须继续");
+
+    mgr.shutdown_all().await;
+}
+
+/// 等 counter 值相对 `prev` 推进（`prev = None` 表示等第一个值）。
+async fn wait_counter(mgr: &mesa_driver_manager::MesaManager, prev: Option<f64>) -> f64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(e) = mgr
+            .snapshot()
+            .latest_all()
+            .into_iter()
+            .find(|e| e.point_key == "a5.counter")
+        {
+            let v = e
+                .value
+                .value
+                .as_f64()
+                .or_else(|| e.value.value.as_i64().map(|i| i as f64))
+                .unwrap_or(f64::NAN);
+            if prev.map(|p| (v - p).abs() > f64::EPSILON).unwrap_or(true) {
+                return v;
+            }
+        }
+        assert!(Instant::now() < deadline, "等待 counter 推进超时");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
