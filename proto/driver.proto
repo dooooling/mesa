@@ -74,6 +74,23 @@ message Envelope {
     ConfigureEventTasks configure_event_tasks = 42;
     EventConfigApplied event_config_applied = 43;
     EventBatchMsg event_batch = 44;
+
+    // Management Plane: 定义目录 / 权威身份预览（I-2，IPC 1.7，纯 additive）。
+    //
+    // 为什么单独两条具名消息而不是复用 Browse/Probe：目录需要「零 Connection 条目」
+    // 即可应答（ProbeRequest 需要已打开的连接），预览需要「带用户参数」的只读计算
+    // （GetDescriptor 无任何字段）。两者都只走**临时进程**（temp_op）管理面，
+    // 不进入采集 / 事件 / 控制任一面，因此不参与 stream_epoch、事件 barrier
+    // 与 Control 可靠队列。
+    //
+    // 兼容性：negotiated_minor < 7 的对端不识别这两对消息（旧 SDK 的兜底分支会
+    // 静默忽略未知消息），所以**发送方必须先门控再发帧**
+    //（driver-protocol::DEFINITIONS_RPC_MIN_MINOR / definitions_query_supported），
+    // 不得发帧干等 timeout。
+    GetDefinitions get_definitions = 45;
+    DefinitionsReport definitions_report = 46;
+    PreviewPointKey preview_point_key = 47;
+    PreviewIdentityReport preview_identity_report = 48;
   }
 }
 
@@ -450,4 +467,43 @@ message EventBatchMsg {
   int64 timestamp_ns = 4;
   optional uint64 mono_ns = 5;
   repeated EventRecordMsg events = 6;
+}
+
+// ---------------------------------------------------------------------------
+// I-2 Management Plane：定义目录 + 权威身份预览（IPC 1.7）
+//
+// 设计取舍（与 ProbeResponse.report_json 同源）：**Proto 只传契约外框，具体
+// 目录/身份载荷以 JSON 承载**。这样 JSON 契约随 Minor 演进时不必再动 wire，
+// 也让 Core 完全不解释 NCK 语义（只做长度/形状校验 + 逐字透传）。
+//
+// 为什么没有 connection_handle：两条 RPC 都是「驱动能力查询」，不依赖任何
+// 已打开的 Connection 条目（与 GetDescriptor 同形态）⇒ 零连接即可应答。
+// ---------------------------------------------------------------------------
+
+// 定义目录查询（无参数）。
+//
+// NOTE: 按 I-2 设计 §8.2，本消息**刻意不带任何字段**（设计明确拒绝把它做成
+// 「DefinitionQuery{request_json} + op」的通用框架）。因此目录的查询参数
+//（family / variable_id / revision / limit / cursor）**不经 wire 传递**；
+// 过滤发生在哪一层属于阶段 2 的接口问题，此处不预判、不擅自加字段。
+message GetDefinitions {}
+
+message DefinitionsReport {
+  // ok / error_detail(kind, code, message)。失败时 kind 必须确定
+  //（不支持一律 Unsupported，严禁 Connection/Device —— 两者对运维含义相反）。
+  GenericResult result = 1;
+  // 目录 JSON（语义可见面白名单）；失败时为空串。
+  string definitions_json = 2;
+}
+
+// 权威身份预览请求。request_json 为纯查询 JSON，**无副作用**（POST-for-read）。
+message PreviewPointKey {
+  string request_json = 1;
+}
+
+message PreviewIdentityReport {
+  GenericResult result = 1;
+  // { point_key, identity_mode, scope, variable_id, definition_revision, definition_digest }
+  // 失败时为空串（绝不返回「看似有效」的残缺身份）。
+  string result_json = 2;
 }
