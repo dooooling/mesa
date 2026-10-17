@@ -480,13 +480,23 @@ message EventBatchMsg {
 // 已打开的 Connection 条目（与 GetDescriptor 同形态）⇒ 零连接即可应答。
 // ---------------------------------------------------------------------------
 
-// 定义目录查询（无参数）。
+// 定义目录查询。
 //
-// NOTE: 按 I-2 设计 §8.2，本消息**刻意不带任何字段**（设计明确拒绝把它做成
-// 「DefinitionQuery{request_json} + op」的通用框架）。因此目录的查询参数
-//（family / variable_id / revision / limit / cursor）**不经 wire 传递**；
-// 过滤发生在哪一层属于阶段 2 的接口问题，此处不预判、不擅自加字段。
-message GetDefinitions {}
+// `request_json` 承载**完整查询参数**（family / variable_id / revision / limit /
+// cursor 等；具体键的形状由 NCK Driver 的目录 JSON 契约定义），Core 只做长度/
+// 形状校验与**逐字透传**，不解释其中任何键的语义（与 `PreviewPointKey.request_json`
+// 同形态，也与 `ProbeResponse.report_json` 的「Proto 只传外框」取舍一致）。
+//
+// 为什么参数必须过 wire：Manager 侧的设计签名是 `definitions(driver_id, query_json)`，
+// 且 `UNSUPPORTED_FAMILY` / `UNKNOWN_VARIABLE` / `UNSUPPORTED_DEFINITION_REVISION` /
+// `INVALID_QUERY` 这些错误的**归属方是 Driver 层**——过滤与校验只能发生在驱动进程内。
+// 若 wire 上没有承载位置，Core 就被迫自己理解 NCK 目录语义，直接违反「Core 不懂协议」。
+//
+// 这与设计明确拒绝的「`{op, args}` 通用分发器」不是一回事：这里仍是**具名 RPC**
+//（`GetDefinitions` 有确定的请求/响应类型），只是携带自己的独立请求参数。
+message GetDefinitions {
+  string request_json = 1;
+}
 
 message DefinitionsReport {
   // ok / error_detail(kind, code, message)。失败时 kind 必须确定

@@ -130,7 +130,11 @@ pub trait Driver: Send + Sync + 'static {
         config_json: &str,
     ) -> Result<Box<dyn DriverConnection>, SdkDriverError>;
 
-    /// 定义目录（I-2）：返回目录 JSON 字符串，Core 只做长度/形状校验与逐字透传。
+    /// 定义目录（I-2）：`request_json` 是目录查询参数（family / variable_id /
+    /// revision / limit / cursor 等），返回目录 JSON 字符串。Core 只做长度/形状
+    /// 校验与逐字透传，**不解析** `request_json` 里任何键的语义——参数含义、
+    /// 缺省值、非法值判定（`UNSUPPORTED_FAMILY` / `UNKNOWN_VARIABLE` /
+    /// `UNSUPPORTED_DEFINITION_REVISION` / `INVALID_QUERY`）**全部归驱动**。
     ///
     /// 为什么放在 `Driver`（进程级）而不是 `DriverConnection`：目录是**驱动能力**，
     /// 与是否打开了 Connection 无关——与 [`Driver::descriptor`] 同形态，因此可以在
@@ -140,11 +144,9 @@ pub trait Driver: Send + Sync + 'static {
     /// 默认实现返回**快速、明确**的 `Unsupported`（code `DEFINITIONS_UNSUPPORTED`）：
     /// 不实现 I-2 的驱动（S7 / FOCAS2 / OPC UA / test-driver）因此**源码零改动**
     /// 即可编译并通过既有契约；被误调时立刻得到 501，而不是干等一个 RPC 超时。
-    ///
-    /// NOTE: 按 I-2 设计 §8.2，wire 的 `GetDefinitions` **不带任何字段**，
-    /// 因此本方法也没有查询参数——目录查询参数（family/variable_id/revision/
-    /// limit/cursor）如何过线属阶段 2 的接口问题，此处不预判。
-    async fn definitions(&self) -> Result<String, SdkDriverError> {
+    /// 注意默认实现**不读** `request_json`：它只是一条常量错误，零 await、零 IO，
+    /// 因此无论请求体多大都不可能因它而超时。
+    async fn definitions(&self, _request_json: &str) -> Result<String, SdkDriverError> {
         Err(SdkDriverError::new(
             mesa_core_types::ErrorKind::Unsupported,
             "DEFINITIONS_UNSUPPORTED",
@@ -1180,8 +1182,8 @@ async fn request_loop(
                     })
                     .await;
             }
-            Some(pb::envelope::Body::GetDefinitions(_)) => {
-                on_get_definitions(session, env.msg_id).await;
+            Some(pb::envelope::Body::GetDefinitions(req)) => {
+                on_get_definitions(session, req, env.msg_id).await;
             }
             Some(pb::envelope::Body::OpenConnection(req)) => {
                 on_open_connection(session, req, env.msg_id).await;
@@ -1643,11 +1645,14 @@ async fn on_close(session: &Session, req: pb::CloseConnection, msg_id: u64) {
 /// 定义目录（I-2）：与 `GetDescriptor` 同形态——**不查 `session.entries`**，
 /// 因此零 Connection 条目也能应答（Manager 的临时进程从不发 OpenConnection）。
 ///
+/// `req.request_json` **逐字**交给驱动（不解析、不重排、不裁剪）：查询参数的语义
+/// （含 `UNSUPPORTED_FAMILY` / `UNKNOWN_VARIABLE` 等错误归属）只属于驱动层。
+///
 /// 错误经 `DefinitionsReport.result` 回传（而不是 `DriverErrorReport`）：
 /// 让调用方只按 `ErrorKind` 映射 HTTP 状态，不需要解析 code 字符串；默认实现
 /// 的 `Unsupported` 因此必然是**快速的 501**，而不是超时。
-async fn on_get_definitions(session: &Session, msg_id: u64) {
-    let (result, definitions_json) = match session.driver.definitions().await {
+async fn on_get_definitions(session: &Session, req: pb::GetDefinitions, msg_id: u64) {
+    let (result, definitions_json) = match session.driver.definitions(&req.request_json).await {
         Ok(json) => (ok_result(), json),
         // 失败时绝不带半截载荷：空串让「有错误但看起来有数据」不可能发生
         Err(err) => (err_result(err.kind, &err.code, err.message), String::new()),
@@ -2484,7 +2489,10 @@ mod tests {
         let d = MinimalDriver;
         // 门槛：默认实现必须是纯同步路径（无 await 等待），故 100ms 绰绰有余
         let started = std::time::Instant::now();
-        let err = d.definitions().await.expect_err("默认实现必须拒绝");
+        let err = d
+            .definitions(r#"{"family":"828d"}"#)
+            .await
+            .expect_err("默认实现必须拒绝");
         let elapsed = started.elapsed();
         assert_eq!(err.kind, ErrorKind::Unsupported);
         assert_eq!(err.code, "DEFINITIONS_UNSUPPORTED");

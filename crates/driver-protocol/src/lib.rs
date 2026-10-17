@@ -764,21 +764,41 @@ mod tests {
         assert!(!definitions_query_supported(minor));
     }
 
-    /// 新增 4 个消息的编解码往返：`GetDefinitions` 无字段 ⇒ 编码体必须为 0 字节
-    /// （空 oneof 成员仍能正确区分 tag，这是 additive 增补的基本前提）。
+    /// 新增 4 个消息的编解码往返：`GetDefinitions.request_json` 必须原样往返
+    /// （含中文/缩进/特殊字符），空串时编码体仍为 0 字节——空 oneof 成员照样
+    /// 能凭 tag 区分，这是 additive 增补的基本前提。
     #[test]
     fn definitions_messages_roundtrip_on_wire() {
-        // 空消息：编码后 0 字节，但信封层仍能凭 tag 区分成员
+        // 空请求：编码后 0 字节，但信封层仍能凭 tag 区分成员
         let env = pb::Envelope {
             msg_id: 9,
-            body: Some(pb::envelope::Body::GetDefinitions(pb::GetDefinitions {})),
+            body: Some(pb::envelope::Body::GetDefinitions(pb::GetDefinitions {
+                request_json: String::new(),
+            })),
         };
         let bytes = env.encode_to_vec();
         let back = pb::Envelope::decode(bytes.as_slice()).unwrap();
-        assert!(matches!(
-            back.body,
-            Some(pb::envelope::Body::GetDefinitions(_))
-        ));
+        match back.body {
+            Some(pb::envelope::Body::GetDefinitions(r)) => assert!(r.request_json.is_empty()),
+            other => panic!("expected GetDefinitions, got {other:?}"),
+        }
+
+        // 带参数的请求：查询 JSON 必须**逐字**往返（驱动层才知道键的语义）
+        let query =
+            "{\n  \"family\": \"828d\",\n  \"variable_id\": \"通道参数\",\n  \"limit\": 50\n}";
+        let env = pb::Envelope {
+            msg_id: 13,
+            body: Some(pb::envelope::Body::GetDefinitions(pb::GetDefinitions {
+                request_json: query.into(),
+            })),
+        };
+        let back = pb::Envelope::decode(env.encode_to_vec().as_slice()).unwrap();
+        match back.body {
+            Some(pb::envelope::Body::GetDefinitions(r)) => {
+                assert_eq!(r.request_json, query, "查询 JSON 必须逐字往返");
+            }
+            other => panic!("expected GetDefinitions, got {other:?}"),
+        }
 
         let env = pb::Envelope {
             msg_id: 10,

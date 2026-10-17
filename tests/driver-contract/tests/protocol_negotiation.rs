@@ -353,7 +353,10 @@ const ADDITIVE_ONEOF_BODY: [(u32, &str, &str); 4] = [
 
 /// I-2 新增的 4 个 message 的字段形状（DC §8.2 逐字）。
 const ADDITIVE_MESSAGES: [(&str, &[&str]); 4] = [
-    ("GetDefinitions", &[]),
+    // 目录查询**必须**带请求参数：Manager 的签名是 definitions(driver_id, query_json)，
+    // 且 UNSUPPORTED_FAMILY / UNKNOWN_VARIABLE / UNSUPPORTED_DEFINITION_REVISION /
+    // INVALID_QUERY 的归属方是 Driver 层 ⇒ 参数在 wire 上必须有承载位置。
+    ("GetDefinitions", &["string request_json = 1"]),
     (
         "DefinitionsReport",
         &["GenericResult result = 1", "string definitions_json = 2"],
@@ -525,7 +528,8 @@ fn parse_driver_proto(src: &str) -> ProtoModel {
 ///
 /// ① §7.2.1 的 35 行逐字段核对表逐字不变；② 既有 tag 集合恰为 `{10..44}`
 /// （连续、无空洞、无重复）；③ 新增 tag 集合恰为 `{45,46,47,48}` 且新增 4 个
-/// message；④ 全部既有 message 的字段编号/类型逐字不变。
+/// message；④ 全部既有 message 的字段编号/类型逐字不变；⑤ `GetDefinitions`
+/// 恰 1 个字段 `request_json`（string = 1）——请求参数必须在 wire 上有承载位置。
 ///
 /// **不得**把断言写成「44 个」（第 1 轮的计数错误），也不断言「39 个」这类
 /// 派生数字以外的口径 —— 真值是逐字段表。
@@ -592,6 +596,44 @@ fn protocol_additive_fields_do_not_alter_existing_messages() {
         60,
         "顶层 message 数 = 56 + 4（含 Envelope）"
     );
+
+    // ⑤ `GetDefinitions` 的请求参数必须**在 wire 上有承载位置**：恰 1 个字段，
+    //    名为 `request_json`、类型 `string`、编号 `1`。
+    //
+    // 为什么单独断言、而不是只靠下面的 `ADDITIVE_MESSAGES` 字符串表：目录查询参数
+    //（family / variable_id / revision / limit / cursor）若在 wire 上无位置，驱动层
+    // 的 `UNSUPPORTED_FAMILY` / `UNKNOWN_VARIABLE` / `UNSUPPORTED_DEFINITION_REVISION`
+    // / `INVALID_QUERY` 就**永远无法触发**，Core 只能被迫自己解释 NCK 语义
+    //（违反「Core 不懂协议」）。这条断言把「请求参数必须过线」钉成契约。
+    let get_definitions = additive
+        .iter()
+        .find(|(n, _)| n == "GetDefinitions")
+        .expect("必须存在 GetDefinitions 消息");
+    assert_eq!(
+        get_definitions.1.len(),
+        1,
+        "GetDefinitions 必须恰有 1 个字段（request_json），实测 {:?}",
+        get_definitions.1
+    );
+    let (label, ty, name, tag, opts) = split_field(&get_definitions.1[0]);
+    assert!(
+        label.is_empty(),
+        "request_json 不得带 label，实测 {label:?}"
+    );
+    assert!(
+        opts.is_empty(),
+        "request_json 不得带额外选项，实测 {opts:?}"
+    );
+    assert_eq!(
+        name, "request_json",
+        "GetDefinitions 的唯一字段名必须是 request_json"
+    );
+    assert_eq!(
+        ty, "string",
+        "request_json 必须是 string（不透明 JSON 文本，Core 不解释语义）"
+    );
+    assert_eq!(tag, 1, "request_json 的字段编号必须是 1");
+
     assert_eq!(
         existing,
         FROZEN_MESSAGE_FIELDS
@@ -779,7 +821,7 @@ impl Driver for DefinitionsDriver {
         ))
     }
 
-    async fn definitions(&self) -> Result<String, SdkDriverError> {
+    async fn definitions(&self, _request_json: &str) -> Result<String, SdkDriverError> {
         Ok(self.catalog.to_string())
     }
 
@@ -817,12 +859,54 @@ impl Driver for RejectingDefinitionsDriver {
         ))
     }
 
-    async fn definitions(&self) -> Result<String, SdkDriverError> {
+    async fn definitions(&self, _request_json: &str) -> Result<String, SdkDriverError> {
         Err(SdkDriverError::new(
             ErrorKind::Configuration,
             "INVALID_QUERY",
             "fixture rejects every query",
         ))
+    }
+}
+
+/// 测试夹具：**记录**收到的 `request_json`（用于「逐字保留」用例）。
+///
+/// `log` 同时记录 `open_connection` 是否被调用：一条日志即可同时证明
+/// 「零 Connection 条目」与「请求 JSON 逐字到达」两件事，不需要额外状态。
+struct VerbatimDefinitionsDriver {
+    log: Arc<Mutex<Vec<String>>>,
+    catalog: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Driver for VerbatimDefinitionsDriver {
+    fn metadata(&self) -> mesa_core_types::DriverMetadata {
+        mesa_core_types::DriverMetadata {
+            driver_id: "definitions-verbatim".into(),
+            name: "Definitions Verbatim".into(),
+            version: "0.0.0".into(),
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+        }
+    }
+
+    async fn open_connection(
+        &self,
+        _endpoint_id: &str,
+        _config_json: &str,
+    ) -> Result<Box<dyn DriverConnection>, SdkDriverError> {
+        // 本用例要求**零 Connection 条目**：真被调用就记下来，让断言失败
+        self.log.lock().unwrap().push("OpenConnection".into());
+        Err(SdkDriverError::new(
+            ErrorKind::Unsupported,
+            "UNSUPPORTED",
+            "fixture has no connection",
+        ))
+    }
+
+    async fn definitions(&self, request_json: &str) -> Result<String, SdkDriverError> {
+        // 原样记录：断言「逐字相等」用的就是这份记录，SDK 任何重排/裁剪都会暴露
+        self.log.lock().unwrap().push(request_json.to_string());
+        Ok(self.catalog.to_string())
     }
 }
 
@@ -925,7 +1009,9 @@ async fn definitions_stale_binary_is_gated_before_send() {
     let started = std::time::Instant::now();
     let err = session
         .call_with_timeout(
-            pb::envelope::Body::GetDefinitions(pb::GetDefinitions {}),
+            pb::envelope::Body::GetDefinitions(pb::GetDefinitions {
+                request_json: r#"{"family":"828d"}"#.into(),
+            }),
             Duration::from_millis(300),
         )
         .await
@@ -969,7 +1055,9 @@ async fn definitions_default_impl_is_fast_unsupported_not_offline() {
     // 刻意不发 OpenConnection：两条 RPC 都必须在**零 Connection 条目**下应答
     let started = std::time::Instant::now();
     let reply = session
-        .call(pb::envelope::Body::GetDefinitions(pb::GetDefinitions {}))
+        .call(pb::envelope::Body::GetDefinitions(pb::GetDefinitions {
+            request_json: r#"{"family":"828d"}"#.into(),
+        }))
         .await
         .expect("GetDefinitions 必须有应答（不得超时）");
     let elapsed = started.elapsed();
@@ -1045,7 +1133,9 @@ async fn definitions_rpc_passes_json_verbatim_and_preserves_error_kind() {
     let (mut session, _events, _) = Session::connect(port, TOKEN).await.unwrap();
 
     let reply = session
-        .call(pb::envelope::Body::GetDefinitions(pb::GetDefinitions {}))
+        .call(pb::envelope::Body::GetDefinitions(pb::GetDefinitions {
+            request_json: r#"{"family":"828d"}"#.into(),
+        }))
         .await
         .expect("GetDefinitions 必须有应答");
     let report = match reply.body {
@@ -1083,7 +1173,9 @@ async fn definitions_rpc_passes_json_verbatim_and_preserves_error_kind() {
     let (port, cancel) = start_driver_server(RejectingDefinitionsDriver).await;
     let (mut session, _events, _) = Session::connect(port, TOKEN).await.unwrap();
     let reply = session
-        .call(pb::envelope::Body::GetDefinitions(pb::GetDefinitions {}))
+        .call(pb::envelope::Body::GetDefinitions(pb::GetDefinitions {
+            request_json: r#"{"family":"828d"}"#.into(),
+        }))
         .await
         .expect("GetDefinitions 必须有应答");
     let report = match reply.body {
@@ -1097,6 +1189,71 @@ async fn definitions_rpc_passes_json_verbatim_and_preserves_error_kind() {
         .expect("必须带 error");
     assert_eq!(err.kind, ErrorKind::Configuration.as_str());
     assert_eq!(err.code, "INVALID_QUERY");
+    teardown(&mut session, Some(cancel));
+}
+
+// ---------------------------------------------------------------------------
+// I27b（契约补丁）：请求参数经 SDK 分发**逐字保留**
+// ---------------------------------------------------------------------------
+
+/// I27b：`GetDefinitions.request_json` 必须**逐字**经 SDK 分发到达驱动，
+/// 驱动的 `definitions_json` 必须**逐字**回到调用方，且全程**零 Connection 条目**。
+///
+/// 为什么需要这条用例：目录的查询参数（family / variable_id / revision / limit /
+/// cursor）与 `UNSUPPORTED_FAMILY` / `UNKNOWN_VARIABLE` 等错误的归属都在 Driver
+/// 层，所以「参数原样过线」是本契约的唯一可行前提。请求/响应都故意带中文、缩进、
+/// 引号/反斜杠/制表符：任何「顺手 serde 一下再序列化」都会让逐字相等失败。
+///
+/// 零连接由夹具自行记录（`open_connection` 被调用会写日志），因此断言不是
+/// 「我们没发 OpenConnection」这种自述，而是**驱动侧从未收到过**连接请求。
+#[tokio::test]
+async fn definitions_request_json_survives_sdk_dispatch_verbatim() {
+    // 含中文 / 换行缩进 / 转义引号 / 反斜杠 / 制表符的查询 JSON
+    const QUERY: &str = "{\n  \"family\": \"828d\",\n  \"variable_id\": \"通道参数/R参数\",\n  \"note\": \"引号\\\"反斜杠\\\\制表\\t\",\n  \"limit\": 50,\n  \"cursor\": null\n}";
+    // 响应同样带中文 / 缩进 / 特殊字符，防止「重新序列化」蒙混过关
+    const CATALOG: &str = "{\n  \"definitions\": [{\"variable_id\":\"channel.r_parameter\",\"label\":\"通道 R 参数\",\"digest\":\"a\\\\b\"}],\n  \"next_cursor\": \"\"\n}";
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (port, cancel) = start_driver_server(VerbatimDefinitionsDriver {
+        log: log.clone(),
+        catalog: CATALOG,
+    })
+    .await;
+    let (mut session, _events, _) = Session::connect(port, TOKEN).await.unwrap();
+
+    // 刻意不发 OpenConnection：目录是驱动能力查询，零 Connection 条目也必须应答
+    let reply = session
+        .call(pb::envelope::Body::GetDefinitions(pb::GetDefinitions {
+            request_json: QUERY.into(),
+        }))
+        .await
+        .expect("GetDefinitions 必须有应答（不得超时）");
+    let report = match reply.body {
+        Some(pb::envelope::Body::DefinitionsReport(r)) => r,
+        other => panic!("期望 DefinitionsReport，实际 {other:?}"),
+    };
+    assert!(report.result.expect("result 必填").ok);
+    assert_eq!(
+        report.definitions_json, CATALOG,
+        "definitions_json 必须逐字回到调用方（不重排/不裁剪/不改编码）"
+    );
+
+    // 驱动侧只应看到一次 definitions 调用，且收到的字符串与发送的**逐字相等**
+    let seen = log.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "全程只应有 1 次驱动侧调用（零 Connection 条目），实测 {seen:?}"
+    );
+    assert_eq!(
+        seen[0], QUERY,
+        "request_json 必须逐字到达驱动（中文/缩进/特殊字符不得被改动）"
+    );
+    assert!(
+        !seen.iter().any(|n| n == "OpenConnection"),
+        "不得创建任何 Connection 条目，实测 {seen:?}"
+    );
+
     teardown(&mut session, Some(cancel));
 }
 
@@ -1293,7 +1450,7 @@ async fn non_nck_drivers_inherit_unsupported_default() {
         );
         // 两条 I-2 RPC 均走默认实现：快速 Unsupported
         let err = driver
-            .definitions()
+            .definitions(r#"{"family":"828d"}"#)
             .await
             .expect_err("{expected_id} 不应实现 I-2 目录");
         assert_eq!(err.kind, ErrorKind::Unsupported, "{expected_id}");
