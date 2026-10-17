@@ -126,6 +126,10 @@ where
 /// 失败再对有界重试的 copy 兜底，重试耗尽才 panic——并只在这里 panic 一次，
 /// 避免调用方用 `.ok()` 静默吞掉失败（那会让 manager 起来后报无关的
 /// “descriptor 不可用”，排查成本极高）。
+///
+/// 重试预算取 **30 次**（递增退避，总上限约 9.3s）：I-2 阶段 2 的合同测试会让
+/// 「同进程并行 + 多个 test-driver 子进程同时存活」成为常态，10 次（≈1.1s）在
+/// Windows 上被共享冲突打过（实测 `sim_stop_barrier_repeated` 偶发失败）。
 fn stage_binary(src: &std::path::Path, dst_dir: &std::path::Path) {
     let name = src
         .file_name()
@@ -134,9 +138,9 @@ fn stage_binary(src: &std::path::Path, dst_dir: &std::path::Path) {
     if std::fs::hard_link(src, &dst).is_ok() {
         return;
     }
-    match retry_io(10, |_| std::fs::copy(src, &dst).map(|_| ())) {
+    match retry_io(30, |_| std::fs::copy(src, &dst).map(|_| ())) {
         Ok(()) => {}
-        Err(e) => panic!("复制 {name:?} 到 staged 目录失败（10 次重试后）: {e:?}"),
+        Err(e) => panic!("复制 {name:?} 到 staged 目录失败（30 次重试后）: {e:?}"),
     }
 }
 
@@ -173,6 +177,70 @@ pub fn staged_drivers_with_test_driver() -> StagedDriversDir {
         .expect("canonical test-driver driver.toml must exist");
     std::fs::write(dir.join("driver.toml"), canonical).unwrap();
     StagedDriversDir(root)
+}
+
+/// I-2 夹具驱动的 staged 目录：`modes` 里每个短名（`ok`/`paged`/`big`/`slow`/
+/// `hang`/`silent`）对应一个独立驱动目录。
+///
+/// 为什么要多份同一二进制：`DriverProcess::spawn` 只传 `--port`，夹具靠 `argv[0]`
+/// 的 stem 判定行为；而环境变量是**进程级**共享状态，同进程并行跑多个用例会串味。
+///
+/// `driver_id` 固定为 `definitions-fixture-<mode>`，可执行文件名取短名
+/// `def-<mode>`（Linux `/proc/<pid>/comm` 截断到 15 字符，长名会让进程枚举断言失效）。
+pub fn staged_definitions_fixture(modes: &[&str]) -> StagedDriversDir {
+    let root = std::env::temp_dir().join(format!(
+        "mesa-def-fixture-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let src = find_built_binary("definitions_fixture");
+    for mode in modes {
+        let driver_id = format!("definitions-fixture-{mode}");
+        let dir = root.join(&driver_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe_name = format!("def-{mode}");
+        stage_binary_as(&src, &dir, &exe_name);
+        let manifest = format!(
+            "id = \"{driver_id}\"\nname = \"Definitions Fixture {mode}\"\nversion = \"0.0.0\"\nexecutable = \"{exe_name}\"\nprotocol_major = 1\nprotocol_minor = {}\n",
+            mesa_driver_protocol::PROTOCOL_MINOR
+        );
+        std::fs::write(dir.join("driver.toml"), manifest).unwrap();
+    }
+    StagedDriversDir(root)
+}
+
+/// 在夹具目录里**追加** test-driver（A5「采集不受影响」用例需要一条真实采集链）。
+///
+/// 为什么单独一个函数而不是默认塞进去：多数 I-2 用例刻意只要夹具驱动，
+/// 多一个可启动的 test-driver 会让「驱动清单」变大，徒增干扰。
+pub fn staged_definitions_fixture_with_test_driver(modes: &[&str]) -> StagedDriversDir {
+    let dir = staged_definitions_fixture(modes);
+    let td_dir = dir.path().join("test-driver");
+    std::fs::create_dir_all(&td_dir).unwrap();
+    stage_binary(&test_driver_exe(), &td_dir);
+    let canonical = std::fs::read(repo_root().join("tests/support/test-driver/driver.toml"))
+        .expect("canonical test-driver driver.toml must exist");
+    std::fs::write(td_dir.join("driver.toml"), canonical).unwrap();
+    dir
+}
+/// [`stage_binary`] 的「改名」变体：同一个源二进制可被 staged 成多个名字。
+fn stage_binary_as(src: &std::path::Path, dst_dir: &std::path::Path, name: &str) {
+    let file_name = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    let dst = dst_dir.join(file_name);
+    if std::fs::hard_link(src, &dst).is_ok() {
+        return;
+    }
+    match retry_io(30, |_| std::fs::copy(src, &dst).map(|_| ())) {
+        Ok(()) => {}
+        Err(e) => panic!("复制 {name:?} 到 staged 目录失败（30 次重试后）: {e:?}"),
+    }
 }
 
 /// 从 target/ 找已构建二进制，hardlink 到 staged 子目录（Windows 优先 .exe；

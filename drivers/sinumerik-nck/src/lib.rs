@@ -18,6 +18,7 @@ mod codec;
 mod compiler;
 mod config;
 mod definition;
+mod definition_api;
 mod fixture;
 mod identity;
 mod identity_spec;
@@ -375,6 +376,37 @@ impl Driver for SinumerikNckDriver {
         }
         Ok(Box::new(NckConnection::new(cfg)))
     }
+
+    /// 定义目录（I-2，DC §4）：**进程级、零 Connection**。
+    ///
+    /// 为什么实现放在 `Driver`（而不是 `DriverConnection`）：目录是**驱动能力**，
+    /// 与是否打开了连接无关——与 `descriptor()` 同形态。Manager 的定义查询走
+    /// 「临时进程 + 握手 + 单 RPC」，**从不发 OpenConnection**；因此本方法
+    /// 既不查 `session.entries`，也不持有任何 `NckConnection`。
+    ///
+    /// 全部语义（family / variable_id / revision / limit / cursor 的判定与
+    /// 错误归属）在 `definition_api` 内；本方法只做「同步计算 → SDK 错误」的
+    /// 一层转换，不解析请求、不解释参数。
+    async fn definitions(&self, request_json: &str) -> Result<String, SdkDriverError> {
+        definition_api::catalog_json(request_json).map_err(definition_api_error)
+    }
+
+    /// 权威身份预览（I-2，DC §5）：同样**进程级、零 Connection**、纯计算。
+    ///
+    /// 校验链与 Configure 共用（`compiler.rs` 的 D1–D10 + 身份重算），
+    /// **只跳过 D11**（持久化 Key 比对）；`nck_native` + `identity_mode="user"`
+    /// 与未知 Point Kind 明确拒绝（P0-2），绝不返回「看起来能用」的 Key。
+    async fn preview_point_key(&self, request_json: &str) -> Result<String, SdkDriverError> {
+        definition_api::preview_json(request_json).map_err(definition_api_error)
+    }
+}
+
+/// `DefinitionApiError` → SDK 错误：**码与 kind 逐字保留**。
+///
+/// 为什么不让 `definition_api` 直接依赖 SDK：该模块的边界只允许依赖
+/// definition/targets/compiler/native（N1），错误过线形态是进程集成的职责。
+fn definition_api_error(e: definition_api::DefinitionApiError) -> SdkDriverError {
+    SdkDriverError::new(e.kind(), e.code(), e.message().to_string())
 }
 
 #[derive(Debug, Clone)]

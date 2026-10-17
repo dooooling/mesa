@@ -21,12 +21,18 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// IPC 协议版本。Major 不兼容直接拒绝握手；Minor 取双方较小值。
 /// V1.2.1 新增 PointValue.value_origin（§5.5），Minor 1 保证新 Driver 的 typed BAD 语义可被新 Core 理解，旧端仍按 UNSPECIFIED 兼容解释
 pub const PROTOCOL_MAJOR: u32 = 1;
-/// Minor 6（Foundation-3）：WriteRequest structured target
-///（`resource_id + parameters_json + output` 三元组；旧 `target` 字符串
-/// 保留仅作 wire 兼容，新路径永不生成/消费）。
-/// 纯 additive，Core 不得因 minor 不同拒绝运行（structured write 遇旧端
-/// 走 CONTROL_MODEL 门控，见 driver-manager）。
-pub const PROTOCOL_MINOR: u32 = 6;
+/// Minor 7（I-2）：定义目录 + 权威身份预览两条只读管理 RPC
+///（tag 45–48：`GetDefinitions`/`DefinitionsReport`/`PreviewPointKey`/
+/// `PreviewIdentityReport`）。
+///
+/// 纯 additive：既有 35 个 `oneof body` 成员（tag 10–44）与全部既有 message
+/// 字段编号/类型逐字不动，`PROTOCOL_MAJOR` 仍为 1。旧端（Minor 6）不识别这
+/// 两对消息，因此**发送方必须先门控再发帧**（见
+/// [`DEFINITIONS_RPC_MIN_MINOR`]），不得发帧干等 timeout。
+///
+/// 历史（供协商排障）：Minor 6 = Foundation-3 structured WriteTarget 三元组；
+/// Minor 5 = TaskSchedule 四字段；Minor 3 = Event Plane；Minor 2 = Probe RPC。
+pub const PROTOCOL_MINOR: u32 = 7;
 
 /// Dynamic Probe RPC 可用的最低协商 Minor（§8）。协商 Minor < 2 的旧 Driver
 /// 不识别 ProbeRequest（会静默忽略），Core 必须直接返回 Unsupported，
@@ -47,6 +53,27 @@ pub const TASK_SCHEDULE_MIN_MINOR: u32 = 5;
 /// negotiated_minor < 6 的旧端不识别三元组字段：Core 侧直接
 /// `CONTROL_MODEL_UNSUPPORTED` fail-closed，不 fallback 旧 `target` 字符串。
 pub const CONTROL_MODEL_MIN_MINOR: u32 = 6;
+
+/// 定义目录 / 权威身份预览 RPC 可用的最低协商 Minor（I-2，IPC 1.7）。
+///
+/// negotiated_minor < 7 的旧端不识别 tag 45–48，其兜底分支会**静默忽略**
+/// 未知消息（`driver-sdk` 的 `unexpected envelope ignored`）⇒ 调用方会白等
+/// 一个完整 RPC 预算才失败。因此调用方（Manager）**必须先门控再发帧**：
+/// 门控不通过就直接返回 `DEFINITIONS_UNSUPPORTED`（`ErrorKind::Unsupported`，
+/// HTTP 501），既不排队也不超时。
+pub const DEFINITIONS_RPC_MIN_MINOR: u32 = 7;
+
+/// 定义目录 / 预览 RPC 的版本门控（**纯函数**，无任何运行期状态）。
+///
+/// 与 [`PROBE_RPC_MIN_MINOR`] 同族的 `>=` 语义：协商值来自 `negotiate()` 的
+/// 双方较小值，因此它同时代表「对端会不会识别这两对消息」。
+///
+/// 注意（设计口径）：本函数**只做版本判定**。并发预算（每 driver 4 个
+/// in-flight）与许可释放属 Manager 的运行期职责，**不得**放到本 crate
+/// （`driver-protocol` 不持有计数器 / in-flight 状态）。
+pub fn definitions_query_supported(negotiated_minor: u32) -> bool {
+    negotiated_minor >= DEFINITIONS_RPC_MIN_MINOR
+}
 
 /// 单帧上限。防止恶意/异常长度前缀导致无界分配（有界原则在 IPC 层的体现）。
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -675,6 +702,160 @@ impl ErrorDetailBox {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// 版本常量冻结（I-2 §7.2）：I-2 的 wire 增补是 **additive**，
+    /// 因此只允许 Minor +1，Major 必须仍为 1。
+    /// 这条断言的作用不是"复述常量"，而是把「有人顺手把 Major 也改了」这种
+    /// 破坏性变更挡在 CI：Major 变化会让所有旧驱动握手被拒。
+    #[test]
+    fn protocol_major_frozen_at_1_and_minor_is_7() {
+        assert_eq!(
+            PROTOCOL_MAJOR, 1,
+            "PROTOCOL_MAJOR 必须保持 1（additive 增补）"
+        );
+        assert_eq!(PROTOCOL_MINOR, 7, "I-2 的 wire 增补对应 Minor 7");
+        assert_eq!(
+            DEFINITIONS_RPC_MIN_MINOR, PROTOCOL_MINOR,
+            "I-2 RPC 的可用门槛必须等于引入它的 Minor，否则门控与常量会漂移"
+        );
+    }
+
+    /// V2 门控语义（纯函数）：协商 Minor < 7 的旧端不识别 tag 45–48，
+    /// 必须判为「不支持」；同时既有 4 个 Minor 门（2/3/5/6）语义不变。
+    #[test]
+    fn definitions_rpc_gate_requires_minor_7() {
+        for minor in 0..DEFINITIONS_RPC_MIN_MINOR {
+            assert!(
+                !definitions_query_supported(minor),
+                "negotiated_minor={minor} 必须被门控拦住（旧端会静默忽略未知消息）"
+            );
+        }
+        for minor in DEFINITIONS_RPC_MIN_MINOR..=DEFINITIONS_RPC_MIN_MINOR + 3 {
+            assert!(
+                definitions_query_supported(minor),
+                "negotiated_minor={minor} 必须放行"
+            );
+        }
+        // 既有门控常量未被本次增补改动（各自引入的 Minor 不变）
+        assert_eq!(PROBE_RPC_MIN_MINOR, 2);
+        assert_eq!(EVENT_PLANE_MIN_MINOR, 3);
+        assert_eq!(TASK_SCHEDULE_MIN_MINOR, 5);
+        assert_eq!(CONTROL_MODEL_MIN_MINOR, 6);
+    }
+
+    /// 协商取较小值（`negotiate` 逐字未变）：新 Core ↔ 旧驱动 / 旧 Core ↔
+    /// 新驱动两种组合都必须降到 6，且门控据此关闭 ⇒ 降级是静默且安全的。
+    #[test]
+    fn negotiate_min_keeps_definitions_gate_closed_across_versions() {
+        let core = (PROTOCOL_MAJOR, PROTOCOL_MINOR);
+        // 新 Core ↔ 新驱动：7，门控放行
+        let (maj, minor) = negotiate(core, (PROTOCOL_MAJOR, PROTOCOL_MINOR)).unwrap();
+        assert_eq!(maj, PROTOCOL_MAJOR);
+        assert_eq!(minor, 7);
+        assert!(definitions_query_supported(minor));
+        // 新 Core ↔ 旧驱动二进制（Minor 6）：协商 6，门控关闭
+        let (_, minor) = negotiate((PROTOCOL_MAJOR, 6), core).unwrap();
+        assert_eq!(minor, 6);
+        assert!(!definitions_query_supported(minor));
+        // 旧 Core（Minor 6）↔ 新驱动二进制：同样协商 6（旧 Core 根本不知道
+        // tag 45–48，因此永不发新帧；新驱动继续在旧消息集上工作）
+        let (_, minor) = negotiate(core, (PROTOCOL_MAJOR, 6)).unwrap();
+        assert_eq!(minor, 6);
+        assert!(!definitions_query_supported(minor));
+    }
+
+    /// 新增 4 个消息的编解码往返：`GetDefinitions.request_json` 必须原样往返
+    /// （含中文/缩进/特殊字符），空串时编码体仍为 0 字节——空 oneof 成员照样
+    /// 能凭 tag 区分，这是 additive 增补的基本前提。
+    #[test]
+    fn definitions_messages_roundtrip_on_wire() {
+        // 空请求：编码后 0 字节，但信封层仍能凭 tag 区分成员
+        let env = pb::Envelope {
+            msg_id: 9,
+            body: Some(pb::envelope::Body::GetDefinitions(pb::GetDefinitions {
+                request_json: String::new(),
+            })),
+        };
+        let bytes = env.encode_to_vec();
+        let back = pb::Envelope::decode(bytes.as_slice()).unwrap();
+        match back.body {
+            Some(pb::envelope::Body::GetDefinitions(r)) => assert!(r.request_json.is_empty()),
+            other => panic!("expected GetDefinitions, got {other:?}"),
+        }
+
+        // 带参数的请求：查询 JSON 必须**逐字**往返（驱动层才知道键的语义）
+        let query =
+            "{\n  \"family\": \"828d\",\n  \"variable_id\": \"通道参数\",\n  \"limit\": 50\n}";
+        let env = pb::Envelope {
+            msg_id: 13,
+            body: Some(pb::envelope::Body::GetDefinitions(pb::GetDefinitions {
+                request_json: query.into(),
+            })),
+        };
+        let back = pb::Envelope::decode(env.encode_to_vec().as_slice()).unwrap();
+        match back.body {
+            Some(pb::envelope::Body::GetDefinitions(r)) => {
+                assert_eq!(r.request_json, query, "查询 JSON 必须逐字往返");
+            }
+            other => panic!("expected GetDefinitions, got {other:?}"),
+        }
+
+        let env = pb::Envelope {
+            msg_id: 10,
+            body: Some(pb::envelope::Body::DefinitionsReport(
+                pb::DefinitionsReport {
+                    result: Some(ok_result()),
+                    definitions_json: r#"{"definitions":[]}"#.into(),
+                },
+            )),
+        };
+        let back = pb::Envelope::decode(env.encode_to_vec().as_slice()).unwrap();
+        match back.body {
+            Some(pb::envelope::Body::DefinitionsReport(r)) => {
+                assert!(r.result.unwrap().ok);
+                assert_eq!(r.definitions_json, r#"{"definitions":[]}"#);
+            }
+            other => panic!("expected DefinitionsReport, got {other:?}"),
+        }
+
+        let env = pb::Envelope {
+            msg_id: 11,
+            body: Some(pb::envelope::Body::PreviewPointKey(pb::PreviewPointKey {
+                request_json: r#"{"family":"828d"}"#.into(),
+            })),
+        };
+        let back = pb::Envelope::decode(env.encode_to_vec().as_slice()).unwrap();
+        match back.body {
+            Some(pb::envelope::Body::PreviewPointKey(r)) => {
+                assert_eq!(r.request_json, r#"{"family":"828d"}"#);
+            }
+            other => panic!("expected PreviewPointKey, got {other:?}"),
+        }
+
+        let env = pb::Envelope {
+            msg_id: 12,
+            body: Some(pb::envelope::Body::PreviewIdentityReport(
+                pb::PreviewIdentityReport {
+                    result: Some(err_result(
+                        ErrorKind::Unsupported,
+                        "DEFINITIONS_UNSUPPORTED",
+                        "not implemented",
+                    )),
+                    result_json: String::new(),
+                },
+            )),
+        };
+        let back = pb::Envelope::decode(env.encode_to_vec().as_slice()).unwrap();
+        match back.body {
+            Some(pb::envelope::Body::PreviewIdentityReport(r)) => {
+                let err = r.result.unwrap().error.unwrap();
+                assert_eq!(err.kind, ErrorKind::Unsupported.as_str());
+                assert_eq!(err.code, "DEFINITIONS_UNSUPPORTED");
+                assert!(r.result_json.is_empty());
+            }
+            other => panic!("expected PreviewIdentityReport, got {other:?}"),
+        }
+    }
 
     /// P1 invariant：in-tree driver.toml 的 protocol_minor 必须与
     /// PROTOCOL_MINOR 同步（管理面展示读 manifest，运行协商读常量；

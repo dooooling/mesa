@@ -36,6 +36,272 @@ impl DescriptorError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// I-2 管理面（定义目录 / 权威身份预览）：错误类型 + 每 driver 并发预算
+// ---------------------------------------------------------------------------
+
+/// 每 `driver_id` 在飞管理请求上限（P0-1 冻结口径：**4**）。
+///
+/// 为什么是 4：一次 I-2 调用 = 1 个临时驱动进程 + 1 个 TCP 监听端口，是**真实的
+/// 本机资源消耗**（与是否连机床无关）。4 与「管理面并发人手操作数」相当，乘上
+/// `MAX_TEMP_ATTEMPTS = 2` 后最坏瞬时进程数 8，远低于任何进程数风险阈值。
+/// 超限**立即拒绝、不排队**——排队会让「单次调用最坏上界」失效（DC §6.4-①-⑤）。
+pub const DEFINITION_QUERY_BUDGET: u32 = 4;
+
+/// 过滤后条目数硬顶（DC §6.4-①-②）：超过即视为驱动违约。
+pub const DEFINITION_QUERY_MAX_ENTRIES: usize = 4096;
+
+/// I-2 管理面错误：**携带结构化 `ErrorKind`**。
+///
+/// 为什么不用既有的 [`DescriptorError`]（只有 code+message）：DC §3.3 / §6.2 要求
+/// HTTP 状态由 Core **按 `ErrorKind`** 决定（不按码），P9 护栏禁止 Core 出现任何
+/// NCK 码字面量。因此 Manager 必须把 kind 结构化地交出去，Core 只做一次
+/// `ErrorKind → StatusCode` 的纯映射。
+#[derive(Debug, Clone)]
+pub struct DefinitionQueryError {
+    pub kind: mesa_core_types::ErrorKind,
+    pub code: String,
+    pub message: String,
+}
+
+impl DefinitionQueryError {
+    fn new(
+        kind: mesa_core_types::ErrorKind,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    /// E1/E2：驱动不在清单、不可启动、spawn/握手失败。
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(
+            mesa_core_types::ErrorKind::Connection,
+            "DRIVER_UNAVAILABLE",
+            message,
+        )
+    }
+
+    /// E31：并发预算耗尽（本机资源，与设备在线状态无关 ⇒ Internal/503）。
+    fn busy(driver_id: &str, in_flight: u32) -> Self {
+        Self::new(
+            mesa_core_types::ErrorKind::Internal,
+            "DEFINITION_QUERY_BUSY",
+            format!(
+                "driver `{driver_id}` has {in_flight} in-flight definition queries (budget {DEFINITION_QUERY_BUDGET})"
+            ),
+        )
+    }
+
+    /// E3：**Manager 管理 RPC 的内部执行预算耗尽**（不是机床通信超时）。
+    ///
+    /// kind 取 `Internal` 而不是 `Timeout`：设计 §6.2 的通用表把 `Timeout` 映射为
+    /// **504**，而 §6.2.1 与本阶段验收（I38 / T2）要求 **503**；Core 又只能按 kind
+    /// 映射（不得按码特判）。**已裁决**：保留 503/`Internal`，并把它明确定位为
+    /// 「Manager 自己的临时进程执行预算耗尽」（与 `DEFINITION_QUERY_BUSY` 同族），
+    /// 而不是「机床/设备通信超时」——后者会把运维引向查线查机床。
+    ///
+    /// 该三元组（`503` + `InternalError` + `DEFINITION_QUERY_TIMEOUT`）有回归断言
+    /// 固定：`manager.rs` 的单测钉 kind+code，`core-api` 的单测钉 kind→status，
+    /// 合同测试 `definitions_rpc_timeout_budget_is_5s` 钉端到端组合。
+    fn timeout(driver_id: &str) -> Self {
+        Self::new(
+            mesa_core_types::ErrorKind::Internal,
+            "DEFINITION_QUERY_TIMEOUT",
+            format!(
+                "management rpc budget exhausted: driver `{driver_id}` definition query exceeded {}ms \
+                 (temporary-process budget, not a device timeout)",
+                crate::session::DEFINITIONS_RPC_TIMEOUT.as_millis()
+            ),
+        )
+    }
+
+    /// E4：载荷超 256 KiB 或条目数超硬顶（驱动违约）。
+    fn too_large(message: impl Into<String>) -> Self {
+        Self::new(
+            mesa_core_types::ErrorKind::Internal,
+            "DEFINITION_QUERY_TOO_LARGE",
+            message,
+        )
+    }
+
+    /// E4-b（**契约勘误**）：驱动返回的响应**格式非法或结构不符合管理 RPC 契约**。
+    ///
+    /// 为什么不复用 `DEFINITION_QUERY_TOO_LARGE`：该码的设计条件是「体积或条目数
+    /// 超限」，把「JSON 语法错/缺 `definitions` 数组」永久伪装成体积超限，会让
+    /// 运维在驱动实现出错时去查目录规模——排障方向完全错误。
+    /// 本码只用于**格式/结构**违约；体积与条目门禁（E4）保持独立、互不替代。
+    fn response_invalid(message: impl Into<String>) -> Self {
+        Self::new(
+            mesa_core_types::ErrorKind::Internal,
+            "DEFINITION_RESPONSE_INVALID",
+            message,
+        )
+    }
+
+    /// E5：对端 Minor < 7（旧二进制会静默忽略未知消息）。
+    ///
+    /// **必须 `Unsupported`（501）**：把「协议不支持」报成 `Connection`/`Device`
+    /// 会被运维读成「去查机床/查线」，而实际要做的是「升级驱动或换 Core」。
+    fn unsupported(driver_id: &str, negotiated: u32) -> Self {
+        Self::new(
+            mesa_core_types::ErrorKind::Unsupported,
+            "DEFINITIONS_UNSUPPORTED",
+            format!(
+                "driver `{driver_id}` negotiated minor {negotiated} < {} (definition RPC unsupported)",
+                mesa_driver_protocol::DEFINITIONS_RPC_MIN_MINOR
+            ),
+        )
+    }
+
+    /// 会话层错误 → 结构化错误（**零字符串回猜**，按 `SessionError` 变体路由）。
+    fn from_session(driver_id: &str, e: crate::session::SessionError) -> Self {
+        use crate::session::SessionError as E;
+        match e {
+            E::Timeout => Self::timeout(driver_id),
+            E::ManagementJsonTooLarge { bytes, limit } => Self::too_large(format!(
+                "definition payload {bytes} bytes exceeds {limit} bytes"
+            )),
+            // Driver 语义错误：kind/code/message 原样过线（码表归属见 DC §6.2.1）
+            E::Driver {
+                kind,
+                code,
+                message,
+            } => Self::new(kind_from_wire(&kind), code, message),
+            other => Self::unavailable(format!("driver `{driver_id}`: {other}")),
+        }
+    }
+}
+
+/// wire 的 `kind` 字符串 → `ErrorKind`（Driver 经 `error_detail` 传的是字符串）。
+///
+/// 未知取值一律回落 `Internal`（fail-safe）：宁可报 503 也不把未知错误
+/// 说成「设备离线」或「参数错误」——那会把排障引向错误方向。
+fn kind_from_wire(kind: &str) -> mesa_core_types::ErrorKind {
+    use mesa_core_types::ErrorKind as K;
+    match kind {
+        "ConfigurationError" => K::Configuration,
+        "ConnectionError" => K::Connection,
+        "Timeout" => K::Timeout,
+        "AddressError" => K::Address,
+        "ProtocolError" => K::Protocol,
+        "DecodeError" => K::Decode,
+        "DeviceError" => K::Device,
+        "Unsupported" => K::Unsupported,
+        _ => K::Internal,
+    }
+}
+
+/// per-`driver_id` 在飞计数（P0-1 的唯一载体，冻结在 Manager）。
+#[derive(Default)]
+struct DefinitionQueryBudget {
+    in_flight: Mutex<HashMap<String, u32>>,
+}
+
+impl DefinitionQueryBudget {
+    /// 尝试取号：超预算**立即**失败（不排队、不等待）。
+    fn try_acquire(
+        self: &Arc<Self>,
+        driver_id: &str,
+    ) -> Result<DefinitionQueryPermit, DefinitionQueryError> {
+        let mut map = self.in_flight.lock().unwrap();
+        let n = map.entry(driver_id.to_string()).or_insert(0);
+        if *n >= DEFINITION_QUERY_BUDGET {
+            return Err(DefinitionQueryError::busy(driver_id, *n));
+        }
+        *n += 1;
+        Ok(DefinitionQueryPermit {
+            budget: Arc::clone(self),
+            driver_id: driver_id.to_string(),
+        })
+    }
+
+    fn count(&self, driver_id: &str) -> u32 {
+        self.in_flight
+            .lock()
+            .unwrap()
+            .get(driver_id)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// 并发许可（RAII）：**成功 / 失败 / 超时 / 取消**四条路径都由 `Drop` 归还。
+///
+/// 为什么必须是 RAII 而不是「函数末尾手动减一」：客户端中途断开时，handler 的
+/// future 会被**直接 drop**，任何写在 future 尾部的释放语句都不会执行 ——
+/// 那正是 P0-1 要求「不得只释放计数许可却留下仍在运行的临时驱动进程」的
+/// 反面场景。许可随 future 一起 drop，计数必然回落。
+struct DefinitionQueryPermit {
+    budget: Arc<DefinitionQueryBudget>,
+    driver_id: String,
+}
+
+impl Drop for DefinitionQueryPermit {
+    fn drop(&mut self) {
+        let mut map = self.budget.in_flight.lock().unwrap();
+        if let Some(n) = map.get_mut(&self.driver_id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                // 归零即删键：避免 driver_id 维度的无界增长
+                map.remove(&self.driver_id);
+            }
+        }
+    }
+}
+
+/// I-2 两个 RPC 的语义分类（同一套编排只差「调哪个方法」）。
+#[derive(Clone, Copy)]
+enum DefinitionQueryKind {
+    Catalog,
+    Preview,
+}
+
+/// 目录载荷的两道**独立**门（互不替代）：
+/// - **格式/结构**（E4-b）：必须是合法 JSON 对象且含 `definitions` 数组，
+///   否则 `DEFINITION_RESPONSE_INVALID`（Internal/503）；
+/// - **规模**（E4）：`definitions` 条目数 ≤ 4096，否则 `DEFINITION_QUERY_TOO_LARGE`。
+fn check_definition_payload(json: &str) -> Result<(), DefinitionQueryError> {
+    let v = parse_json_object(json, "definition catalog")?;
+    let Some(defs) = v.get("definitions").and_then(|d| d.as_array()) else {
+        return Err(DefinitionQueryError::response_invalid(
+            "definition catalog must be a json object containing a `definitions` array",
+        ));
+    };
+    if defs.len() > DEFINITION_QUERY_MAX_ENTRIES {
+        return Err(DefinitionQueryError::too_large(format!(
+            "definition catalog has {} entries, exceeding {DEFINITION_QUERY_MAX_ENTRIES}",
+            defs.len()
+        )));
+    }
+    Ok(())
+}
+
+/// 预览结果的**格式**门（E4-b）：只要求是合法 JSON 对象。
+///
+/// 刻意不校验任何键（`point_key` / `scope` 等属驱动语义，Core/Manager 不得解释），
+/// 只挡「驱动返回一坨非 JSON 却以 200 透出」这种契约违约。
+fn check_preview_payload(json: &str) -> Result<(), DefinitionQueryError> {
+    parse_json_object(json, "identity preview result").map(|_| ())
+}
+
+/// 解析为 JSON 对象；语法错或顶层不是对象都归 `DEFINITION_RESPONSE_INVALID`。
+fn parse_json_object(json: &str, what: &str) -> Result<serde_json::Value, DefinitionQueryError> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+        DefinitionQueryError::response_invalid(format!("{what} is not valid json: {e}"))
+    })?;
+    if !v.is_object() {
+        return Err(DefinitionQueryError::response_invalid(format!(
+            "{what} must be a json object"
+        )));
+    }
+    Ok(v)
+}
+
 /// §4.2 Descriptor version gate（纯函数，可单测）：
 /// 先检查 report.contract_major（旧 V1 直接 DESCRIPTOR_CONTRACT_UNSUPPORTED，
 /// 不 parse），再 parse descriptor_json，再校验 descriptor 内 major 与 report
@@ -101,6 +367,10 @@ pub struct MesaManager {
     /// 事件面服务（PR7 v1.1 §20）：`None` = 纯 Data-only 模式（EventStore
     /// 不可用时），endpoint 不起 ingress，数据面完全不受影响（§9 隔离）。
     event_services: RwLock<Option<Arc<mesa_event_store::EventServices>>>,
+    /// I-2 管理面并发预算（P0-1）：per-`driver_id` 在飞计数，唯一载体是 Manager。
+    /// 为什么放在这里而不是 `driver-protocol`：协议层只负责版本与消息契约，
+    /// 持有运行期计数会让「协议 crate」变成有状态组件（DC §8.1.2-M11 明令禁止）。
+    definition_query_budget: Arc<DefinitionQueryBudget>,
 }
 
 impl MesaManager {
@@ -123,6 +393,7 @@ impl MesaManager {
             descriptor_cache: RwLock::new(HashMap::new()),
             active_sessions: std::sync::Arc::new(RwLock::new(HashMap::new())),
             event_services: RwLock::new(None),
+            definition_query_budget: Arc::new(DefinitionQueryBudget::default()),
         }
     }
 
@@ -456,6 +727,98 @@ impl MesaManager {
         })
     }
 
+    /// 定义目录（I-2，DC §4）：临时进程 + 单 RPC，**不发 `OpenConnection`**。
+    ///
+    /// `query_json` 由 Core 按 §4.1 的查询参数组装后**逐字**透传；Manager 不解析
+    /// 其中任何键的语义（`family`/`variable_id`/`revision` 的判定全在 Driver）。
+    /// 并发预算：per-`driver_id` **4**，超限**立即** 503 `DEFINITION_QUERY_BUSY`。
+    pub async fn definitions(
+        &self,
+        driver_id: &str,
+        query_json: &str,
+    ) -> Result<String, DefinitionQueryError> {
+        self.definition_query(driver_id, DefinitionQueryKind::Catalog, query_json)
+            .await
+    }
+
+    /// 权威身份预览（I-2，DC §5）：与 [`MesaManager::definitions`] 同形态
+    /// （临时进程、零 Connection 条目、同一并发预算、同一超时/大小门）。
+    pub async fn preview_point_key(
+        &self,
+        driver_id: &str,
+        request_json: &str,
+    ) -> Result<String, DefinitionQueryError> {
+        self.definition_query(driver_id, DefinitionQueryKind::Preview, request_json)
+            .await
+    }
+
+    /// P0-1 的可观测点：当前 `driver_id` 的在飞管理请求数。
+    ///
+    /// 刻意**不新增对外 HTTP 接口**（DC §6.4 只允许测试内观测）：测试用它断言
+    /// 「许可已回落到 0」，这是 R-2「无许可泄漏」的直接证据。
+    pub fn definition_query_in_flight(&self, driver_id: &str) -> u32 {
+        self.definition_query_budget.count(driver_id)
+    }
+
+    /// 两个管理 RPC 共用的编排（差异只在「调哪个 Session 方法」）。
+    ///
+    /// NOTE（**对外超时口径**）：本函数**没有**最外层端到端 deadline，最坏耗时是
+    /// 「2 × (启动 6s + RPC 5s) = 22s」的**理论组合上界**，不是经实测证明的服务端
+    /// 硬上限。已裁决：**不得**把 22s / 25s 写成对外响应时间保证；若将来要承诺
+    /// 硬上限，必须在最外层实现并验证端到端 deadline（含取消传播与进程回收），
+    /// 而不是靠把某个内部预算调大。
+    async fn definition_query(
+        &self,
+        driver_id: &str,
+        kind: DefinitionQueryKind,
+        payload: &str,
+    ) -> Result<String, DefinitionQueryError> {
+        // E1：驱动不存在/不可启动 —— 在取号**之前**判定，避免不存在的驱动占用预算
+        let disc = self.find_driver(driver_id).ok_or_else(|| {
+            DefinitionQueryError::unavailable(format!(
+                "driver `{driver_id}` not found or not launchable"
+            ))
+        })?;
+        // P0-1：取号后立即持有 RAII 许可，直到本 future 结束——**取消**路径
+        // （handler future 被 drop）同样由 `Drop` 归还，不留计数泄漏。
+        let _permit = self.definition_query_budget.try_acquire(driver_id)?;
+
+        let out = crate::temp_op::temp_driver_attempt(&disc, |td| async {
+            // E5：**门控先于发帧**。Minor < 7 的旧二进制会静默忽略未知消息，
+            // 发帧只会干等一个 RPC 超时；且其能力面本来就该报 501。
+            let negotiated = td.session.negotiated_minor();
+            if !mesa_driver_protocol::definitions_query_supported(negotiated) {
+                return (
+                    td,
+                    Err(DefinitionQueryError::unsupported(driver_id, negotiated)),
+                );
+            }
+            let rpc = match kind {
+                DefinitionQueryKind::Catalog => td.session.definitions(payload).await,
+                DefinitionQueryKind::Preview => td.session.preview_point_key(payload).await,
+            };
+            (
+                td,
+                rpc.map_err(|e| DefinitionQueryError::from_session(driver_id, e)),
+            )
+        })
+        .await
+        .map_err(|e| match e {
+            crate::temp_op::TempOpError::Startup(s) => {
+                DefinitionQueryError::unavailable(s.to_string())
+            }
+            crate::temp_op::TempOpError::Rpc(e) => e,
+        })?;
+
+        // E4 的第二道门（Manager 侧）：格式/结构与条目数。字节门在 Session 侧
+        //（256 KiB），两处都按 DC §6.4-①-② 复用既有 descriptor 门的形态。
+        match kind {
+            DefinitionQueryKind::Catalog => check_definition_payload(&out)?,
+            DefinitionQueryKind::Preview => check_preview_payload(&out)?,
+        }
+        Ok(out)
+    }
+
     /// Control Write（§22；Foundation-3 单真值）：经由活跃会话的可靠
     /// Control 队列转发结构化 WriteTarget，永不 Latest-Wins。
     /// 协商 minor < 6 的旧端直接 CONTROL_MODEL_UNSUPPORTED（不 fallback
@@ -675,5 +1038,95 @@ mod tests {
             err.contains("not found or not launchable"),
             "应走到驱动查找，got {err}"
         );
+    }
+
+    /// **契约三元组冻结**（阶段 2 定向补丁）：Manager 侧错误的 kind 与 code 必须
+    /// 成对固定。只改 kind（例如把 E3 改回 `Timeout`）会让 Core 的通用映射把 503
+    /// 变成 504 —— 这条断言与 `core-api` 的 kind→status 单测、以及合同测试
+    /// `definitions_rpc_timeout_budget_is_5s` 的端到端组合共同锁死该三元组。
+    #[test]
+    fn definition_query_error_contracts_are_pinned() {
+        use mesa_core_types::ErrorKind;
+        let cases: [(DefinitionQueryError, ErrorKind, &str); 5] = [
+            (
+                DefinitionQueryError::timeout("d"),
+                ErrorKind::Internal,
+                "DEFINITION_QUERY_TIMEOUT",
+            ),
+            (
+                DefinitionQueryError::busy("d", 4),
+                ErrorKind::Internal,
+                "DEFINITION_QUERY_BUSY",
+            ),
+            (
+                DefinitionQueryError::too_large("x"),
+                ErrorKind::Internal,
+                "DEFINITION_QUERY_TOO_LARGE",
+            ),
+            (
+                DefinitionQueryError::response_invalid("x"),
+                ErrorKind::Internal,
+                "DEFINITION_RESPONSE_INVALID",
+            ),
+            (
+                DefinitionQueryError::unavailable("x"),
+                ErrorKind::Connection,
+                "DRIVER_UNAVAILABLE",
+            ),
+        ];
+        for (e, kind, code) in cases {
+            assert_eq!(
+                (e.kind, e.code.as_str()),
+                (kind, code),
+                "码与 kind 必须成对固定（改 kind 会让 Core 映射出另一个 HTTP 状态）"
+            );
+        }
+
+        // 驱动码透传：Revision 不支持必须保持 `Configuration`（⇒ HTTP 400），
+        // 不得被改写成 `Unsupported`（501）或按码特判成 404。
+        let e = DefinitionQueryError::from_session(
+            "d",
+            crate::session::SessionError::Driver {
+                kind: "ConfigurationError".into(),
+                code: "UNSUPPORTED_DEFINITION_REVISION".into(),
+                message: "revision 9 unavailable; available=[1]".into(),
+            },
+        );
+        assert_eq!(e.kind, ErrorKind::Configuration);
+        assert_eq!(e.code, "UNSUPPORTED_DEFINITION_REVISION");
+        assert!(e.message.contains("available"));
+    }
+
+    /// E4 与 E4-b **互不替代**：格式错报 `DEFINITION_RESPONSE_INVALID`，
+    /// 条目超硬顶才报 `DEFINITION_QUERY_TOO_LARGE`。
+    #[test]
+    fn definition_payload_gates_are_distinct() {
+        // 非法 JSON
+        let e = check_definition_payload("not-json").unwrap_err();
+        assert_eq!(e.code, "DEFINITION_RESPONSE_INVALID");
+        // 合法 JSON 但顶层不是对象
+        let e = check_definition_payload("[1,2,3]").unwrap_err();
+        assert_eq!(e.code, "DEFINITION_RESPONSE_INVALID");
+        // 缺 definitions 数组
+        let e = check_definition_payload(r#"{"format_version":1}"#).unwrap_err();
+        assert_eq!(e.code, "DEFINITION_RESPONSE_INVALID");
+        // 合法结构 + 未超硬顶 ⇒ 通过
+        check_definition_payload(r#"{"definitions":[]}"#).unwrap();
+        // 超硬顶 ⇒ 体积/数量门（不是格式门）
+        let big = format!(
+            r#"{{"definitions":{}}}"#,
+            serde_json::json!(vec![
+                serde_json::json!({});
+                DEFINITION_QUERY_MAX_ENTRIES + 1
+            ])
+        );
+        let e = check_definition_payload(&big).unwrap_err();
+        assert_eq!(e.code, "DEFINITION_QUERY_TOO_LARGE");
+        // 预览结果：非 JSON / 非对象 ⇒ 同一格式门
+        let e = check_preview_payload("<html>").unwrap_err();
+        assert_eq!(e.code, "DEFINITION_RESPONSE_INVALID");
+        let e = check_preview_payload("[]").unwrap_err();
+        assert_eq!(e.code, "DEFINITION_RESPONSE_INVALID");
+        check_preview_payload(r#"{"point_key":"k"}"#).unwrap();
     }
 }

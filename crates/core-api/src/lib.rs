@@ -26,6 +26,8 @@ pub mod bootstrap;
 pub mod certificates;
 /// C3-A：Endpoint-bound 连接检查（尚未保存的连接草稿，只读、无副作用）。
 pub(crate) mod connection_check;
+/// I-2 只读管理路由（定义目录 / 权威身份预览）：零厂商语义、只按 `ErrorKind` 映射。
+pub(crate) mod driver_query;
 pub mod runtime;
 use certificates::CertStore;
 
@@ -3241,6 +3243,26 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/drivers/{id}/descriptor",
             get(get_driver_descriptor),
+        )
+        // I-2 只读管理面（driver 作用域）：定义目录 + 权威身份预览。
+        // 两条都**不**打开 CNC 连接、不读机床实时值、不改采集计划、无持久化副作用
+        //（DC §6.3 的 R8–R11 逐条有测试断言）。POST 表示「带参数的只读计算」，
+        // 与既有 /probe、/validate-connection 的先例一致。
+        .route(
+            "/api/v1/drivers/{id}/definitions",
+            get(driver_query::definitions),
+        )
+        .route(
+            "/api/v1/drivers/{id}/definitions/identity-preview",
+            // 64 KiB body 门**只挂在本路由**（不是全局 2 MB 默认值）；外层
+            // map_response 把框架级 413 改写成统一错误信封（E30）。
+            post(driver_query::identity_preview)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    driver_query::MAX_REQUEST_BODY_BYTES,
+                ))
+                .layer(axum::middleware::map_response(
+                    driver_query::rewrite_payload_too_large,
+                )),
         )
         .route(
             "/api/v1/drivers/{id}/validate-connection",
