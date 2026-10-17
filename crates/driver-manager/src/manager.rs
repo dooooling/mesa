@@ -97,19 +97,24 @@ impl DefinitionQueryError {
         )
     }
 
-    /// E3：RPC 预算耗尽。
+    /// E3：**Manager 管理 RPC 的内部执行预算耗尽**（不是机床通信超时）。
     ///
-    /// NOTE: kind 取 `Internal` 而非 `Timeout` —— 设计 §6.2 的通用表把
-    /// `Timeout` 映射为 **504**，而 §6.2.1 与本阶段验收（I38 / T2）都要求
-    /// **503**；Core 又只能按 kind 映射（不得按码特判）。两者不可同时满足，
-    /// 此处取可验收的那一侧（503，与 `DEFINITION_QUERY_BUSY` 同族：Manager
-    /// 自身预算耗尽，不是设备超时）。该冲突已在交付说明中如实登记。
+    /// kind 取 `Internal` 而不是 `Timeout`：设计 §6.2 的通用表把 `Timeout` 映射为
+    /// **504**，而 §6.2.1 与本阶段验收（I38 / T2）要求 **503**；Core 又只能按 kind
+    /// 映射（不得按码特判）。**已裁决**：保留 503/`Internal`，并把它明确定位为
+    /// 「Manager 自己的临时进程执行预算耗尽」（与 `DEFINITION_QUERY_BUSY` 同族），
+    /// 而不是「机床/设备通信超时」——后者会把运维引向查线查机床。
+    ///
+    /// 该三元组（`503` + `InternalError` + `DEFINITION_QUERY_TIMEOUT`）有回归断言
+    /// 固定：`manager.rs` 的单测钉 kind+code，`core-api` 的单测钉 kind→status，
+    /// 合同测试 `definitions_rpc_timeout_budget_is_5s` 钉端到端组合。
     fn timeout(driver_id: &str) -> Self {
         Self::new(
             mesa_core_types::ErrorKind::Internal,
             "DEFINITION_QUERY_TIMEOUT",
             format!(
-                "driver `{driver_id}` definition query timed out after {}ms",
+                "management rpc budget exhausted: driver `{driver_id}` definition query exceeded {}ms \
+                 (temporary-process budget, not a device timeout)",
                 crate::session::DEFINITIONS_RPC_TIMEOUT.as_millis()
             ),
         )
@@ -120,6 +125,20 @@ impl DefinitionQueryError {
         Self::new(
             mesa_core_types::ErrorKind::Internal,
             "DEFINITION_QUERY_TOO_LARGE",
+            message,
+        )
+    }
+
+    /// E4-b（**契约勘误**）：驱动返回的响应**格式非法或结构不符合管理 RPC 契约**。
+    ///
+    /// 为什么不复用 `DEFINITION_QUERY_TOO_LARGE`：该码的设计条件是「体积或条目数
+    /// 超限」，把「JSON 语法错/缺 `definitions` 数组」永久伪装成体积超限，会让
+    /// 运维在驱动实现出错时去查目录规模——排障方向完全错误。
+    /// 本码只用于**格式/结构**违约；体积与条目门禁（E4）保持独立、互不替代。
+    fn response_invalid(message: impl Into<String>) -> Self {
+        Self::new(
+            mesa_core_types::ErrorKind::Internal,
+            "DEFINITION_RESPONSE_INVALID",
             message,
         )
     }
@@ -242,27 +261,45 @@ enum DefinitionQueryKind {
     Preview,
 }
 
-/// 目录载荷的第二道门（E4）：可解析性 + 过滤后条目数硬顶。
-///
-/// NOTE: 「驱动返回非法 JSON」在 DC §6.1.3 的 31 条码表里**没有专属码**，而码表
-/// 已冻结（不得新增码）。此处按 §6.2.1 对该码的描述「契约/规模违约」复用
-/// `DEFINITION_QUERY_TOO_LARGE`（Internal/503）；若后续裁决给出专属码，
-/// 只需替换本函数的一处构造。
+/// 目录载荷的两道**独立**门（互不替代）：
+/// - **格式/结构**（E4-b）：必须是合法 JSON 对象且含 `definitions` 数组，
+///   否则 `DEFINITION_RESPONSE_INVALID`（Internal/503）；
+/// - **规模**（E4）：`definitions` 条目数 ≤ 4096，否则 `DEFINITION_QUERY_TOO_LARGE`。
 fn check_definition_payload(json: &str) -> Result<(), DefinitionQueryError> {
-    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| {
-        DefinitionQueryError::too_large(format!("definition catalog is not valid json: {e}"))
-    })?;
-    let entries = v
-        .get("definitions")
-        .and_then(|d| d.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
-    if entries > DEFINITION_QUERY_MAX_ENTRIES {
+    let v = parse_json_object(json, "definition catalog")?;
+    let Some(defs) = v.get("definitions").and_then(|d| d.as_array()) else {
+        return Err(DefinitionQueryError::response_invalid(
+            "definition catalog must be a json object containing a `definitions` array",
+        ));
+    };
+    if defs.len() > DEFINITION_QUERY_MAX_ENTRIES {
         return Err(DefinitionQueryError::too_large(format!(
-            "definition catalog has {entries} entries, exceeding {DEFINITION_QUERY_MAX_ENTRIES}"
+            "definition catalog has {} entries, exceeding {DEFINITION_QUERY_MAX_ENTRIES}",
+            defs.len()
         )));
     }
     Ok(())
+}
+
+/// 预览结果的**格式**门（E4-b）：只要求是合法 JSON 对象。
+///
+/// 刻意不校验任何键（`point_key` / `scope` 等属驱动语义，Core/Manager 不得解释），
+/// 只挡「驱动返回一坨非 JSON 却以 200 透出」这种契约违约。
+fn check_preview_payload(json: &str) -> Result<(), DefinitionQueryError> {
+    parse_json_object(json, "identity preview result").map(|_| ())
+}
+
+/// 解析为 JSON 对象；语法错或顶层不是对象都归 `DEFINITION_RESPONSE_INVALID`。
+fn parse_json_object(json: &str, what: &str) -> Result<serde_json::Value, DefinitionQueryError> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+        DefinitionQueryError::response_invalid(format!("{what} is not valid json: {e}"))
+    })?;
+    if !v.is_object() {
+        return Err(DefinitionQueryError::response_invalid(format!(
+            "{what} must be a json object"
+        )));
+    }
+    Ok(v)
 }
 
 /// §4.2 Descriptor version gate（纯函数，可单测）：
@@ -724,6 +761,12 @@ impl MesaManager {
     }
 
     /// 两个管理 RPC 共用的编排（差异只在「调哪个 Session 方法」）。
+    ///
+    /// NOTE（**对外超时口径**）：本函数**没有**最外层端到端 deadline，最坏耗时是
+    /// 「2 × (启动 6s + RPC 5s) = 22s」的**理论组合上界**，不是经实测证明的服务端
+    /// 硬上限。已裁决：**不得**把 22s / 25s 写成对外响应时间保证；若将来要承诺
+    /// 硬上限，必须在最外层实现并验证端到端 deadline（含取消传播与进程回收），
+    /// 而不是靠把某个内部预算调大。
     async fn definition_query(
         &self,
         driver_id: &str,
@@ -767,10 +810,11 @@ impl MesaManager {
             crate::temp_op::TempOpError::Rpc(e) => e,
         })?;
 
-        // E4 的第二道门（Manager 侧）：条目数硬顶。字节门在 Session 侧（256 KiB），
-        // 两处都按 DC §6.4-①-② 复用既有 descriptor 门的形态。
-        if matches!(kind, DefinitionQueryKind::Catalog) {
-            check_definition_payload(&out)?;
+        // E4 的第二道门（Manager 侧）：格式/结构与条目数。字节门在 Session 侧
+        //（256 KiB），两处都按 DC §6.4-①-② 复用既有 descriptor 门的形态。
+        match kind {
+            DefinitionQueryKind::Catalog => check_definition_payload(&out)?,
+            DefinitionQueryKind::Preview => check_preview_payload(&out)?,
         }
         Ok(out)
     }
@@ -994,5 +1038,95 @@ mod tests {
             err.contains("not found or not launchable"),
             "应走到驱动查找，got {err}"
         );
+    }
+
+    /// **契约三元组冻结**（阶段 2 定向补丁）：Manager 侧错误的 kind 与 code 必须
+    /// 成对固定。只改 kind（例如把 E3 改回 `Timeout`）会让 Core 的通用映射把 503
+    /// 变成 504 —— 这条断言与 `core-api` 的 kind→status 单测、以及合同测试
+    /// `definitions_rpc_timeout_budget_is_5s` 的端到端组合共同锁死该三元组。
+    #[test]
+    fn definition_query_error_contracts_are_pinned() {
+        use mesa_core_types::ErrorKind;
+        let cases: [(DefinitionQueryError, ErrorKind, &str); 5] = [
+            (
+                DefinitionQueryError::timeout("d"),
+                ErrorKind::Internal,
+                "DEFINITION_QUERY_TIMEOUT",
+            ),
+            (
+                DefinitionQueryError::busy("d", 4),
+                ErrorKind::Internal,
+                "DEFINITION_QUERY_BUSY",
+            ),
+            (
+                DefinitionQueryError::too_large("x"),
+                ErrorKind::Internal,
+                "DEFINITION_QUERY_TOO_LARGE",
+            ),
+            (
+                DefinitionQueryError::response_invalid("x"),
+                ErrorKind::Internal,
+                "DEFINITION_RESPONSE_INVALID",
+            ),
+            (
+                DefinitionQueryError::unavailable("x"),
+                ErrorKind::Connection,
+                "DRIVER_UNAVAILABLE",
+            ),
+        ];
+        for (e, kind, code) in cases {
+            assert_eq!(
+                (e.kind, e.code.as_str()),
+                (kind, code),
+                "码与 kind 必须成对固定（改 kind 会让 Core 映射出另一个 HTTP 状态）"
+            );
+        }
+
+        // 驱动码透传：Revision 不支持必须保持 `Configuration`（⇒ HTTP 400），
+        // 不得被改写成 `Unsupported`（501）或按码特判成 404。
+        let e = DefinitionQueryError::from_session(
+            "d",
+            crate::session::SessionError::Driver {
+                kind: "ConfigurationError".into(),
+                code: "UNSUPPORTED_DEFINITION_REVISION".into(),
+                message: "revision 9 unavailable; available=[1]".into(),
+            },
+        );
+        assert_eq!(e.kind, ErrorKind::Configuration);
+        assert_eq!(e.code, "UNSUPPORTED_DEFINITION_REVISION");
+        assert!(e.message.contains("available"));
+    }
+
+    /// E4 与 E4-b **互不替代**：格式错报 `DEFINITION_RESPONSE_INVALID`，
+    /// 条目超硬顶才报 `DEFINITION_QUERY_TOO_LARGE`。
+    #[test]
+    fn definition_payload_gates_are_distinct() {
+        // 非法 JSON
+        let e = check_definition_payload("not-json").unwrap_err();
+        assert_eq!(e.code, "DEFINITION_RESPONSE_INVALID");
+        // 合法 JSON 但顶层不是对象
+        let e = check_definition_payload("[1,2,3]").unwrap_err();
+        assert_eq!(e.code, "DEFINITION_RESPONSE_INVALID");
+        // 缺 definitions 数组
+        let e = check_definition_payload(r#"{"format_version":1}"#).unwrap_err();
+        assert_eq!(e.code, "DEFINITION_RESPONSE_INVALID");
+        // 合法结构 + 未超硬顶 ⇒ 通过
+        check_definition_payload(r#"{"definitions":[]}"#).unwrap();
+        // 超硬顶 ⇒ 体积/数量门（不是格式门）
+        let big = format!(
+            r#"{{"definitions":{}}}"#,
+            serde_json::json!(vec![
+                serde_json::json!({});
+                DEFINITION_QUERY_MAX_ENTRIES + 1
+            ])
+        );
+        let e = check_definition_payload(&big).unwrap_err();
+        assert_eq!(e.code, "DEFINITION_QUERY_TOO_LARGE");
+        // 预览结果：非 JSON / 非对象 ⇒ 同一格式门
+        let e = check_preview_payload("<html>").unwrap_err();
+        assert_eq!(e.code, "DEFINITION_RESPONSE_INVALID");
+        let e = check_preview_payload("[]").unwrap_err();
+        assert_eq!(e.code, "DEFINITION_RESPONSE_INVALID");
+        check_preview_payload(r#"{"point_key":"k"}"#).unwrap();
     }
 }

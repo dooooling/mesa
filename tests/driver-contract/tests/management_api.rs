@@ -3334,9 +3334,23 @@ async fn definitions_rpc_timeout_budget_is_5s() {
     let started = Instant::now();
     let (status, v) = get_json(app, &catalog_uri("definitions-fixture-hang")).await;
     let elapsed = started.elapsed();
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {v}");
-    assert_eq!(v["error"]["code"], "DEFINITION_QUERY_TIMEOUT", "body: {v}");
-    assert_eq!(v["error"]["kind"], "InternalError");
+    // **三元组冻结**（阶段 2 定向补丁）：E3 必须固定为
+    // `503 + InternalError + DEFINITION_QUERY_TIMEOUT`。
+    // 只改 kind（例如改回 `Timeout`）会让通用映射把 503 变成 504 —— 这条端到端
+    // 断言与 `manager.rs` / `core-api` 的两条单测共同锁死该组合。
+    assert_eq!(
+        (
+            status,
+            v["error"]["kind"].as_str(),
+            v["error"]["code"].as_str()
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("InternalError"),
+            Some("DEFINITION_QUERY_TIMEOUT")
+        ),
+        "E3 必须是 503/Internal/DEFINITION_QUERY_TIMEOUT（Manager 预算耗尽，不是机床超时）: {v}"
+    );
     assert!(
         elapsed >= Duration::from_millis(4800),
         "必须真的等满 5s 预算，实测 {elapsed:?}"
@@ -3838,4 +3852,66 @@ async fn wait_counter(mgr: &mesa_driver_manager::MesaManager, prev: Option<f64>)
         assert!(Instant::now() < deadline, "等待 counter 推进超时");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+/// **Revision 不支持的映射冻结**（阶段 2 定向补丁）：`UNSUPPORTED_DEFINITION_REVISION`
+/// 的 kind 固定为 `Configuration` ⇒ HTTP **400**（不是 404、也不是 501）。
+///
+/// 为什么由夹具驱动来证：Core 只按 kind 映射，绝不按码特判；因此只要驱动把
+/// kind 报成 `ConfigurationError`，REST 就必须是 400。该用例把「不许为某个
+/// Siemens 错误码单独返回 404」这条边界钉在阶段 2，而不是等到阶段 3 才暴露。
+/// `available[]` 必须保留在 message 里，前端据此提示可选 Revision。
+#[tokio::test]
+async fn definition_query_revision_error_maps_to_400_configuration() {
+    let (app, _mgr, _staged) = definitions_app(&["revision"]).await;
+    let (status, v) = get_json(app, &catalog_uri("definitions-fixture-revision")).await;
+    assert_eq!(
+        (
+            status,
+            v["error"]["kind"].as_str(),
+            v["error"]["code"].as_str()
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            Some("ConfigurationError"),
+            Some("UNSUPPORTED_DEFINITION_REVISION")
+        ),
+        "Revision 不支持必须是 400/Configuration（不得按码特判成 404）: {v}"
+    );
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("available"),
+        "消息必须保留 available[] 供前端提示: {msg}"
+    );
+}
+
+/// E4-b（契约勘误）：驱动返回**格式非法或结构不符契约** ⇒ 503
+/// `DEFINITION_RESPONSE_INVALID`，**不得**伪装成体积门 `DEFINITION_QUERY_TOO_LARGE`。
+///
+/// 正例与反例同测：合法目录仍必须 200（证明新门没有误伤正常路径）。
+#[tokio::test]
+async fn definition_response_invalid_is_503_not_too_large() {
+    let (app, _mgr, _staged) = definitions_app(&["ok", "invalid", "shape"]).await;
+    for (driver_id, why) in [
+        ("definitions-fixture-invalid", "非法 JSON"),
+        ("definitions-fixture-shape", "缺 definitions 数组"),
+    ] {
+        let (status, v) = get_json(app.clone(), &catalog_uri(driver_id)).await;
+        assert_eq!(
+            (
+                status,
+                v["error"]["kind"].as_str(),
+                v["error"]["code"].as_str()
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("InternalError"),
+                Some("DEFINITION_RESPONSE_INVALID")
+            ),
+            "{why} 必须报 DEFINITION_RESPONSE_INVALID（不是 TOO_LARGE）: {v}"
+        );
+    }
+    // 正例：合法目录仍 200（新门不得误伤）
+    let (status, v) = get_json(app, &catalog_uri("definitions-fixture-ok")).await;
+    assert_eq!(status, StatusCode::OK, "合法目录必须仍 200: {v}");
+    assert_eq!(v["total"], 42);
 }

@@ -35,6 +35,12 @@ enum Mode {
     Hang,
     Silent,
     Fail,
+    /// 返回**非法 JSON**（验 E4-b 格式门）
+    Invalid,
+    /// 返回合法 JSON 但**缺 `definitions` 数组**（验 E4-b 结构门）
+    InvalidShape,
+    /// 业务拒绝：Revision 不支持（验「Configuration ⇒ 400」的映射）
+    Revision,
 }
 
 /// 按可执行文件名判定模式（staged 时的文件名即模式名）。
@@ -61,6 +67,9 @@ fn mode_from_argv0() -> Mode {
         "def-cancel" => Mode::Hang,
         "def-silent" => Mode::Silent,
         "def-fail" => Mode::Fail,
+        "def-invalid" => Mode::Invalid,
+        "def-shape" => Mode::InvalidShape,
+        "def-revision" => Mode::Revision,
         // 缺省按 ok 处理：手工调试时不至于直接 panic
         _ => Mode::Ok,
     }
@@ -199,6 +208,22 @@ impl Driver for FixtureDriver {
     }
 
     async fn definitions(&self, request_json: &str) -> Result<String, SdkDriverError> {
+        // E4-b：格式/结构违约必须由 Manager 判为 DEFINITION_RESPONSE_INVALID
+        //（而不是体积门 TOO_LARGE），因此这里直接返回坏载荷。
+        if self.mode == Mode::Invalid {
+            return Ok("<html>definition catalog unavailable</html>".to_string());
+        }
+        if self.mode == Mode::InvalidShape {
+            return Ok(r#"{"format_version":1,"total":0}"#.to_string());
+        }
+        // Revision 不支持的映射固定为 `Configuration → 400`（带 available[]）
+        if self.mode == Mode::Revision {
+            return Err(SdkDriverError::new(
+                ErrorKind::Configuration,
+                "UNSUPPORTED_DEFINITION_REVISION",
+                "revision 9 unavailable for `fixture.variable.0001`; available=[1]",
+            ));
+        }
         // 业务拒绝（E12 的 Driver 侧路径）：kind/code 必须原样过线到 REST
         if self.mode == Mode::Fail {
             return Err(SdkDriverError::new(

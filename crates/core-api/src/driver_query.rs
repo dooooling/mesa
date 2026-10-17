@@ -264,3 +264,48 @@ fn parse_positive_u32(raw: &str) -> Option<u32> {
     let v: u32 = raw.parse().ok()?;
     (v >= 1).then_some(v)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesa_core_types::ErrorKind as K;
+
+    /// **映射冻结**（阶段 2 定向补丁）：`ErrorKind → HTTP` 是 Core 唯一的状态码来源，
+    /// 只允许出现 kind 变体。这里把两个容易混淆的边界钉死：
+    /// `Internal → 503`（I-2 的 Manager 预算/契约类错误）与 `Timeout → 504`
+    ///（真正的 RPC 超时）。若有人把 `DEFINITION_QUERY_TIMEOUT` 的 kind 改成
+    /// `Timeout`，端到端状态会从 503 变成 504 —— 本断言 + `manager.rs` 的
+    /// `definition_query_error_contracts_are_pinned` 会同时报警。
+    #[test]
+    fn error_kind_to_status_is_pinned() {
+        assert_eq!(
+            error_kind_to_status(K::Internal),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            error_kind_to_status(K::Timeout),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        assert_eq!(
+            error_kind_to_status(K::Configuration),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(error_kind_to_status(K::Address), StatusCode::NOT_FOUND);
+        assert_eq!(
+            error_kind_to_status(K::Unsupported),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        for kind in [K::Connection, K::Device, K::Protocol, K::Decode] {
+            assert_eq!(error_kind_to_status(kind), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    /// 查询信封形态解析：正整数判定不接受 0 / 负数 / 非数字。
+    #[test]
+    fn positive_u32_parsing_is_strict() {
+        assert_eq!(parse_positive_u32("1"), Some(1));
+        assert_eq!(parse_positive_u32("500"), Some(500));
+        assert_eq!(parse_positive_u32("0"), None);
+        assert_eq!(parse_positive_u32("-1"), None);
+        assert_eq!(parse_positive_u32("abc"), None);
+    }
+}
