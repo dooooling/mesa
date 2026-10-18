@@ -84,6 +84,10 @@ interface MockState {
   /** 目录页：按 cursor 索引（"" = 首页）。为空表示不处理目录请求。 */
   catalogPages: Record<string, NckDefinitionsResponse>;
   catalogCalls: string[];
+  /** Browse 根节点（为空表示不处理 browse 请求）。 */
+  browseNodes: unknown[];
+  /** 覆盖 Descriptor 的 resources（native Schema 测试用）。 */
+  resources?: unknown[];
 }
 
 function mkState(overrides: Partial<MockState> = {}): MockState {
@@ -96,6 +100,7 @@ function mkState(overrides: Partial<MockState> = {}): MockState {
     previewCalls: [],
     catalogPages: {},
     catalogCalls: [],
+    browseNodes: [],
     ...overrides,
   };
 }
@@ -136,6 +141,9 @@ function installFetch(state: MockState) {
         ],
       });
     }
+    if (url === `/api/v1/endpoints/${EP}/browse` || url === "/api/v1/endpoints/ep-2/browse") {
+      return ok({ nodes: state.browseNodes, next_cursor: null });
+    }
     if (url.startsWith("/api/v1/drivers/") && url.endsWith("/definitions/identity-preview")) {
       const body = JSON.parse(String(init?.body)) as {
         parameters: Record<string, unknown>;
@@ -172,7 +180,9 @@ function installFetch(state: MockState) {
       if (!page) return { ok: false, status: 404, json: async () => ({}) };
       return ok(page);
     }
-    if (url.startsWith("/api/v1/drivers/")) return ok({ resources: RESOURCES });
+    if (url.startsWith("/api/v1/drivers/")) {
+      return ok({ resources: state.resources ?? RESOURCES });
+    }
     if (url.startsWith("/api/v1/tasks?endpoint=")) {
       return ok({ tasks: state.savedTasks ?? state.tasks });
     }
@@ -595,5 +605,179 @@ describe("收口回归：切换 Endpoint 不得残留上一台的表单/Preview"
     expect(screen.queryByTestId("nck-point-key")).toBeNull();
     // 未重新选择变量 ⇒ 不渲染任何 Target 输入（上一台的输入已随卸载丢弃）。
     expect(screen.queryByLabelText("target-channel")).toBeNull();
+  });
+});
+
+describe("PR-C 第三批：Endpoint 页 native 存量点位复核（A24–A27）", () => {
+  it("existing_derived_native_point_is_verified_and_noop_save_sends_no_put", async () => {
+    const user = userEvent.setup();
+    const nativeSchema = [
+      { key: "area", label: "Area", field_type: "enum", required: true, validation: { enum_options: ["C"] }, ui: {} },
+      { key: "area_no", label: "Area No.", field_type: "integer", required: true, validation: { min: 0, max: 31 }, ui: {} },
+      { key: "module", label: "Module", field_type: "integer", required: true, validation: { min: 0, max: 255 }, ui: {} },
+      { key: "column", label: "Column", field_type: "integer", required: true, validation: { min: 0, max: 65535 }, ui: {} },
+      { key: "line", label: "Line", field_type: "integer", required: true, validation: { min: 0, max: 65535 }, ui: {} },
+      { key: "count", label: "Count", field_type: "integer", required: true, default: 1, validation: { min: 1, max: 255 }, ui: {} },
+      { key: "unit_mode", label: "Unit mode", field_type: "enum", required: true, default: "current", validation: { enum_options: ["current"] }, ui: {} },
+      { key: "decode", label: "Decode", field_type: "enum", required: true, validation: { enum_options: ["U16_LE"] }, ui: {} },
+      { key: "transport_size", label: "Transport", field_type: "enum", required: true, validation: { enum_options: ["0x05"] }, ui: {} },
+    ];
+    const nativePoint: NckPointSelection = {
+      kind: "nck_native",
+      point_key: "native.C.1.21.1.396",
+      parameters: {
+        area: "C",
+        area_no: 1,
+        module: 21,
+        column: 1,
+        line: 396,
+        count: 1,
+        unit_mode: "current",
+        decode: "U16_LE",
+        transport_size: "0x05",
+      },
+    };
+    const state = mkState({
+      tasks: [nckTask("nck-native-task", [nativePoint])],
+      resources: [
+        {
+          id: "variable",
+          label: { default: "NC Variable" },
+          parameters: { fields: nativeSchema },
+          outputs: [],
+          modes: ["poll"],
+        },
+      ],
+    });
+    installFetch(state);
+    render(
+      <EndpointAcquisitionPane
+        endpointId={EP}
+        driverId={NCK_DRIVER}
+        onChanged={() => {}}
+        nckDefinitions={{
+          "syn.collect.a": {
+            variable_id: "syn.collect.a",
+            revision: 1,
+            family: "828d",
+            scope: "collect",
+            targets: ["channel"],
+            target_required: ["channel"],
+            arguments: [],
+          },
+        }}
+      />,
+    );
+    await screen.findByText(/高级原生（不适用目录 scope）/);
+    await waitFor(() => expect(saveButton().disabled).toBe(false));
+    await user.click(saveButton());
+    await screen.findByText(/未检测到实际修改/);
+    expect(state.putBodies).toHaveLength(0);
+
+    // native 点位也必须可进入编辑（高级原生页），而不是只能移除。
+    await user.click(
+      within(screen.getByTestId("nck-point-row")).getByRole("button", { name: /编\s*辑/ }),
+    );
+    expect(screen.getByTestId("nck-native-fields")).toBeTruthy();
+    expect(screen.getByTestId("nck-native-key").textContent).toBe("native.C.1.21.1.396");
+  });
+});
+
+describe("PR-C 第三批：Endpoint 页 Browse → 语义表单（A1/A13/A16）", () => {
+  it("semantic_browse_prefills_form_and_identity_leaf_is_blocked", async () => {
+    const user = userEvent.setup();
+    const collectNode = {
+      id: "browse.collect",
+      label: "Browse 程序状态",
+      kind: "nck_variable",
+      has_children: false,
+      binding_json: JSON.stringify({
+        kind: "nck_variable",
+        parameters: {
+          variable_id: "syn.collect.a",
+          definition_revision: 1,
+          target: { channel: 1 },
+          arguments: {},
+        },
+        identity: {
+          template: "syn.collect.a@channel={channel}",
+          keys: [{ path: "channel", required: true }],
+          preview_point_key: "syn.collect.a@channel=1",
+        },
+      }),
+    };
+    const identityNode = {
+      id: "browse.identity",
+      label: "Browse 身份探针",
+      kind: "nck_variable",
+      has_children: false,
+      binding_json: JSON.stringify({
+        kind: "nck_variable",
+        parameters: {
+          variable_id: "syn.identity.a",
+          definition_revision: 1,
+          target: { axis: 1 },
+          arguments: {},
+        },
+        identity: {
+          template: "syn.identity.a@axis={axis}",
+          keys: [{ path: "axis", required: true }],
+          preview_point_key: "syn.identity.a@axis=1",
+        },
+      }),
+    };
+    const state = mkState({ browseNodes: [collectNode, identityNode] });
+    installFetch(state);
+    render(
+      <EndpointAcquisitionPane
+        endpointId={EP}
+        driverId={NCK_DRIVER}
+        onChanged={() => {}}
+        nckDefinitions={{
+          "syn.collect.a": {
+            variable_id: "syn.collect.a",
+            revision: 1,
+            family: "828d",
+            scope: "collect",
+            targets: ["channel"],
+            target_required: ["channel"],
+            arguments: [],
+          },
+          "syn.identity.a": {
+            variable_id: "syn.identity.a",
+            revision: 1,
+            family: "828d",
+            scope: "identity",
+            targets: ["axis"],
+            target_required: ["axis"],
+            arguments: [],
+          },
+        }}
+      />,
+    );
+    await screen.findByTestId("nck-collectable-summary");
+    await user.click(screen.getByTestId("nck-browse-toggle"));
+    await screen.findByText("Browse 程序状态");
+
+    // A13：identity 叶必须有具体不可选原因，且没有“选用（语义）”。
+    const identityRow = screen.getByText("Browse 身份探针").closest("div") as HTMLElement;
+    expect(within(identityRow).getByTestId("browse-semantic-block").textContent).toContain(
+      "SCOPE_IDENTITY",
+    );
+    expect(within(identityRow).queryByRole("button", { name: /选用（语义）/ })).toBeNull();
+
+    // A1/A16：collect 叶可进入语义表单；Browse 预览只展示，提交前重新 Preview。
+    const collectRow = screen.getByText("Browse 程序状态").closest("div") as HTMLElement;
+    await user.click(within(collectRow).getByRole("button", { name: /选用（语义）/ }));
+    await waitFor(() =>
+      expect((screen.getByTestId("nck-variable-select") as HTMLSelectElement).value).toBe(
+        "syn.collect.a",
+      ),
+    );
+    expect((screen.getByLabelText("target-channel") as HTMLInputElement).value).toBe("1");
+    await screen.findByTestId("nck-point-key");
+    expect(screen.getByTestId("nck-point-key").textContent).toBe("syn.collect.a@channel=1");
+    await user.click(screen.getByTestId("nck-add-point"));
+    await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(1));
   });
 });

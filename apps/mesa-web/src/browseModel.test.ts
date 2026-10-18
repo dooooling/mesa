@@ -1,10 +1,107 @@
-// Browse → Selection 映射单测：只锁定两种信封形态，不解释协议语义。
+// Browse → Selection 映射单测：锁定信封形态，不解释协议语义。
 import { describe, expect, it } from "vitest";
 import { buildBrowseRequest, selectableFromNode } from "./browseModel";
 import { missingRequiredParams } from "./resourceSelectionModel";
 import type { FieldDescriptor } from "./types";
 
 describe("selectableFromNode", () => {
+  it("semantic_leaf_exposes_identity_without_entering_parameters (A1)", () => {
+    const sel = selectableFromNode({
+      id: "nck://presets/828d.C.S.progStatus.nck_variable",
+      kind: "nck_variable",
+      has_children: false,
+      binding_json: JSON.stringify({
+        kind: "nck_variable",
+        parameters: {
+          variable_id: "channel.program.status",
+          definition_revision: 1,
+          target: { channel: 1 },
+          arguments: {},
+        },
+        identity: {
+          template: "channel.program.status@channel={channel}",
+          keys: [{ path: "channel", required: true }],
+          preview_point_key: "channel.program.status@channel=i:1",
+        },
+      }),
+    });
+    expect(sel?.point_kind).toBe("nck_variable");
+    expect(sel?.resource_id).toBe("nck_variable");
+    expect(sel?.identity).toEqual({
+      template: "channel.program.status@channel={channel}",
+      keys: [{ path: "channel", required: true }],
+      preview_point_key: "channel.program.status@channel=i:1",
+    });
+    // identity 不得折进 parameters（否则会被持久化，Core 整体拒绝）。
+    expect(sel?.parameters).toEqual({
+      variable_id: "channel.program.status",
+      definition_revision: 1,
+      target: { channel: 1 },
+      arguments: {},
+    });
+  });
+
+  it("leaf_without_identity_not_selectable (A16)", () => {
+    for (const kind of ["nck_variable", "nck_native"]) {
+      expect(
+        selectableFromNode({
+          id: "x",
+          kind,
+          binding_json: JSON.stringify({
+            kind,
+            parameters: { variable_id: "channel.program.status" },
+          }),
+        }),
+      ).toBeNull();
+      // identity 形态非法同样不可选（不猜测/不补默认值）。
+      expect(
+        selectableFromNode({
+          id: "x",
+          kind,
+          binding_json: JSON.stringify({
+            kind,
+            parameters: {},
+            identity: "not-an-object",
+          }),
+        }),
+      ).toBeNull();
+    }
+  });
+
+  it("semantic_leaf_with_null_preview_is_still_parsed_for_reason_display", () => {
+    // A10 的“预览为空”不是“无 identity”：模型透出 null，由 UI 显示原因并禁用“选用”。
+    const sel = selectableFromNode({
+      id: "x",
+      kind: "nck_variable",
+      binding_json: JSON.stringify({
+        kind: "nck_variable",
+        parameters: { variable_id: "v" },
+        identity: { template: "v@channel={channel}", keys: [], preview_point_key: null },
+      }),
+    });
+    expect(sel?.point_kind).toBe("nck_variable");
+    expect(sel?.identity?.preview_point_key).toBeNull();
+  });
+
+  it("non-semantic leaves stay byte-for-byte shaped (A44 negative half)", () => {
+    const generic = selectableFromNode({
+      id: "g",
+      kind: "register",
+      binding_json: JSON.stringify({ resource_id: "register", parameters: { unit: 3 } }),
+    });
+    expect(generic).toEqual({ resource_id: "register", parameters: { unit: 3 } });
+    expect(generic).not.toHaveProperty("identity");
+    expect(generic).not.toHaveProperty("point_kind");
+
+    const bare = selectableFromNode({
+      id: "n",
+      kind: "node",
+      binding_json: JSON.stringify({ node_id: "x", data_type: "STRING" }),
+    });
+    expect(bare).toEqual({ resource_id: "node", parameters: { node_id: "x", data_type: "STRING" } });
+    expect(bare).not.toHaveProperty("identity");
+  });
+
   it("NCK 模板叶形态：显式 resource_id + 原生字段（不含实例/行）", () => {
     // 预填模板只带结构固定字段；area_no/line 必须由使用者确认。
     const sel = selectableFromNode({

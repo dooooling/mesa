@@ -48,9 +48,15 @@ import {
   evaluateNckPointIdentity,
   type NckDefinitionLike,
 } from "../nckPointModel";
+import {
+  nativeAddressParameters,
+  validateNativeFields,
+  validateNativePoint,
+} from "../nckNativeModel";
 import { applySelectionAdd } from "../resourceSelectionModel";
 import { ApplyWithRestart } from "./ApplyWithRestart";
 import { NckPointFields } from "./NckPointFields";
+import { ResourceBrowseAntd } from "./ResourceBrowseAntd";
 import { ResourcePickerAntd } from "./ResourcePickerAntd";
 
 /** 定义目录条目（I-2 `VariableDefinition` 的宽松形态，注入/测试可只给子集）。 */
@@ -152,6 +158,9 @@ export function EndpointAcquisitionPane({
   // 编辑态：null = 新增；否则为 nckPoints 下标。
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [formVersion, setFormVersion] = useState(0);
+  // Browse → 语义表单的预填（A1/A16 的入口）。preview_point_key 不参与提交。
+  const [browseOpen, setBrowseOpen] = useState(false);
+  const [browsePreset, setBrowsePreset] = useState<NckPointSelection | null>(null);
 
   const nck = isNckDriver(driverId);
   const catalogIndex = useMemo<NckDefinitionIndex | null>(
@@ -172,6 +181,11 @@ export function EndpointAcquisitionPane({
     () => collectableDefinitions(definitionList),
     [definitionList],
   );
+  // native 12 字段 Schema 的唯一来源：Descriptor 的 variable 资源（不硬编码）。
+  const nativeSchema = useMemo(() => {
+    if (!nck || !desc) return null;
+    return desc.resources.find((r) => r.id === "variable")?.parameters ?? null;
+  }, [nck, desc]);
 
   /** 按 `(variable_id, revision)` 精确查定义（多 revision 目录不得串用）。 */
   const lookupDefinition = useCallback(
@@ -200,9 +214,52 @@ export function EndpointAcquisitionPane({
   const verifyOne = useCallback(
     async (point: NckPointSelection): Promise<NckPointVerification> => {
       if (!nck) return { point, status: "verified" };
-      if (point.kind !== "nck_variable") {
-        // 高级原生：身份由用户显式指定/固定规则给出，不适用目录 scope 与语义预览。
+      if (point.kind === "nck_native") {
+        // 高级原生：不适用目录 scope，但身份规则仍必须复核：
+        // derived 用固定规则重算，user 只校验 native. 语法；字段再按 Descriptor
+        // Schema 校验。任一失败都不得作为有效点位继续提交。
+        if (!nativeSchema) {
+          return {
+            point,
+            status: "unverified",
+            code: "PARAMETERS_INVALID",
+            message: "Descriptor 的 variable 资源不可用：无法校验原生字段（fail-closed）",
+          };
+        }
+        const nativeCheck = validateNativePoint(point);
+        if (!nativeCheck.ok) {
+          return {
+            point,
+            status: "unverified",
+            code: nativeCheck.code,
+            message: `${nativeCheck.message}（原始配置可查看/移除）`,
+          };
+        }
+        if (nativeSchema) {
+          const issues = validateNativeFields(
+            nativeSchema,
+            nativeAddressParameters(point.parameters),
+          );
+          if (issues.length) {
+            return {
+              point,
+              status: "unverified",
+              code: "PARAMETERS_INVALID",
+              message: `原生字段不满足 Descriptor 约束：${issues
+                .map((i) => i.message)
+                .join("；")}`,
+            };
+          }
+        }
         return { point, status: "verified", native: true };
+      }
+      if (point.kind !== "nck_variable") {
+        return {
+          point,
+          status: "unverified",
+          code: "PARAMETERS_INVALID",
+          message: `未知 Point Kind "${point.kind}"：无法确认身份规则`,
+        };
       }
       const variableId =
         typeof point.parameters.variable_id === "string" ? point.parameters.variable_id : "";
@@ -272,7 +329,7 @@ export function EndpointAcquisitionPane({
         };
       }
     },
-    [nck, lookupDefinition, endpointFamily, catalogFamily, driverId],
+    [nck, lookupDefinition, endpointFamily, catalogFamily, driverId, nativeSchema],
   );
 
   const verifyPoints = useCallback(
@@ -347,6 +404,8 @@ export function EndpointAcquisitionPane({
     setRemovedPoints([]);
     setEditingIndex(null);
     setFormVersion(0);
+    setBrowseOpen(false);
+    setBrowsePreset(null);
     setEndpointFamily(null);
     setEndpointFamilyState("loading");
     let cancelled = false;
@@ -473,7 +532,8 @@ export function EndpointAcquisitionPane({
       return message.error("该 point_key 已被 Endpoint 内其它点位占用：请调整 Target/Arguments（不得自动改名/加后缀）");
     }
     setNckPoints((prev) => [...prev, point]);
-    // 表单重建一次：避免上一条目的输入残留到下一次新增。
+    // 表单重建一次：避免上一条目的输入（含 Browse 预填）残留到下一次新增。
+    setBrowsePreset(null);
     setFormVersion((v) => v + 1);
   };
 
@@ -811,6 +871,43 @@ export function EndpointAcquisitionPane({
         ) : null}
 
         {definitions && !editBlock ? (
+          <div style={{ display: "grid", gap: 8 }}>
+            <div>
+              <Button
+                size="small"
+                data-testid="nck-browse-toggle"
+                onClick={() => setBrowseOpen((v) => !v)}
+              >
+                {browseOpen ? "收起 Browse" : "从 Browse 选择语义变量"}
+              </Button>
+            </div>
+            {browseOpen ? (
+              <ResourceBrowseAntd
+                endpointId={endpointId}
+                onFill={() => message.warning("请选用语义点位（旧 variable 入口在 NCK 上已被禁用）")}
+                nckSemantic={{
+                  definitions: definitionList,
+                  endpointFamily,
+                  catalogFamily,
+                }}
+                onSemanticSelect={(sel) => {
+                  // Browse 的 preview_point_key 只作展示：预填参数后，NckPointFields
+                  // 会重新调用服务端 identity-preview 确认身份。
+                  setBrowsePreset({
+                    kind: "nck_variable",
+                    point_key: "",
+                    parameters: sel.parameters,
+                  });
+                  setEditingIndex(null);
+                  setFormVersion((v) => v + 1);
+                  message.info("已把 Browse 叶带入语义表单：请等待服务端 Preview 确认身份");
+                }}
+              />
+            ) : null}
+          </div>
+        ) : null}
+
+        {definitions && !editBlock ? (
           <div style={{ borderTop: "1px solid #e0e0e0", paddingTop: 8 }}>
             {editingIndex !== null && nckPoints[editingIndex] ? (
               <NckPointFields
@@ -821,6 +918,7 @@ export function EndpointAcquisitionPane({
                 definitions={collectableDefs}
                 takenPointKeys={takenPointKeys(editingIndex)}
                 initialPoint={nckPoints[editingIndex]}
+                nativeSchema={nativeSchema}
                 submitLabel="保存点位"
                 onCancel={() => setEditingIndex(null)}
                 onSubmit={(point) => replacePoint(editingIndex, point)}
@@ -833,6 +931,8 @@ export function EndpointAcquisitionPane({
                 catalogFamily={catalogFamily}
                 definitions={collectableDefs}
                 takenPointKeys={takenPointKeys(null)}
+                initialPoint={browsePreset}
+                nativeSchema={nativeSchema}
                 onSubmit={addPoint}
               />
             )}
@@ -931,9 +1031,14 @@ export function EndpointAcquisitionPane({
                 (!latestDefinition ||
                   typeof exactDefinition.revision !== "number" ||
                   latestDefinition.revision === exactDefinition.revision);
-              const editableGate = exactDefinition && revisionIsCurrent
-                ? evaluateNckSelectionAdd(exactDefinition).ok
-                : false;
+              // native 编辑只要求 Descriptor Schema 可用（不依赖语义目录）；
+              // 语义点位仍要求定义仍是最新 revision 且 scope=collect。
+              const editableGate =
+                point.kind === "nck_native"
+                  ? !!nativeSchema
+                  : exactDefinition && revisionIsCurrent
+                    ? evaluateNckSelectionAdd(exactDefinition).ok
+                    : false;
               return (
                 <div
                   key={`${point.point_key}-${idx}`}

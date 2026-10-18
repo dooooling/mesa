@@ -13,8 +13,12 @@
 //    不得在任何文案/状态里留下痕迹。
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Button, Input, Space, Tag } from "antd";
+import type { SchemaDescriptor } from "../types";
 import type { NckPointSelection } from "../deviceModel";
-import { evaluateNckSelectionAdd } from "../nckCollectability";
+import {
+  collectableDefinitions,
+  evaluateNckSelectionAdd,
+} from "../nckCollectability";
 import {
   isNckRequestError,
   previewNckPoint,
@@ -35,6 +39,7 @@ import {
   type NckFormDraft,
   type NckPreviewParameters,
 } from "../nckPointModel";
+import { NckNativeFields } from "./NckNativeFields";
 
 /** 预览函数签名（可注入：单测用 deferred promise 精确控制返回顺序）。 */
 export type NckPreviewFn = (
@@ -74,6 +79,11 @@ export interface NckPointFieldsProps {
   takenPointKeys: string[];
   /** 编辑已有语义点位时的初始值（仍必须重新走服务端预览）。 */
   initialPoint?: NckPointSelection | null;
+  /**
+   * NCK Descriptor 的 `variable` 资源 Schema（12 原生字段）。
+   * 提供时才显示「高级原生配置」页；缺失即不提供 native 入口（fail-closed）。
+   */
+  nativeSchema?: SchemaDescriptor | null;
   submitLabel?: string;
   onCancel?: () => void;
   onSubmit: (point: NckPointSelection) => void;
@@ -87,12 +97,17 @@ export function NckPointFields({
   definitions,
   takenPointKeys,
   initialPoint,
+  nativeSchema,
   submitLabel,
   onCancel,
   onSubmit,
   preview,
 }: NckPointFieldsProps) {
   const previewFn = preview ?? defaultPreview;
+  // native 编辑态：已有 native 点位必须直接在高级原生页打开（身份规则不同）。
+  const [editorMode, setEditorMode] = useState<"semantic" | "native">(
+    initialPoint?.kind === "nck_native" ? "native" : "semantic",
+  );
   const initialVariableId =
     initialPoint && typeof initialPoint.parameters?.variable_id === "string"
       ? initialPoint.parameters.variable_id
@@ -101,6 +116,12 @@ export function NckPointFields({
   const definition = useMemo(
     () => definitions.find((d) => d.variable_id === selectedId) ?? null,
     [definitions, selectedId],
+  );
+  // 即使父层传入全量目录，组件层也只**提供** collect 条目（A13 双执行）；
+  // definition 查找仍用全量，以便身份复核能显示具体 scope 原因。
+  const selectableDefinitions = useMemo(
+    () => collectableDefinitions(definitions),
+    [definitions],
   );
   const initialModel = useMemo(
     () =>
@@ -308,8 +329,54 @@ export function NckPointFields({
   };
 
   const issues = validation.issues;
+
+  const modeSwitch = nativeSchema ? (
+    <div style={{ display: "flex", gap: 8, alignItems: "center" }} data-testid="nck-editor-mode">
+      <Button
+        size="small"
+        type={editorMode === "semantic" ? "primary" : "default"}
+        onClick={() => setEditorMode("semantic")}
+      >
+        语义点位
+      </Button>
+      <Button
+        size="small"
+        type={editorMode === "native" ? "primary" : "default"}
+        onClick={() => setEditorMode("native")}
+      >
+        高级原生配置
+      </Button>
+    </div>
+  ) : null;
+
+  if (editorMode === "native") {
+    return (
+      <div style={{ display: "grid", gap: 8 }}>
+        {modeSwitch}
+        {nativeSchema ? (
+          <NckNativeFields
+            key={`native-${initialPoint?.point_key ?? "new"}`}
+            schema={nativeSchema}
+            takenPointKeys={takenPointKeys}
+            initialPoint={initialPoint?.kind === "nck_native" ? initialPoint : null}
+            submitLabel={submitLabel ?? "加入原生点位"}
+            onSubmit={onSubmit}
+          />
+        ) : (
+          <Alert
+            type="error"
+            data-testid="nck-native-schema-missing"
+            message="原生字段 Schema 不可用：高级原生配置已禁用"
+            description="Descriptor 的 variable 资源缺失时无法渲染 12 原生字段，保持不可提交（fail-closed）。"
+          />
+        )}
+      </div>
+    );
+  }
+
   return (
     <div style={{ display: "grid", gap: 8 }} data-testid="nck-point-fields">
+      {modeSwitch}
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <span style={{ fontSize: 12 }}>变量</span>
         <select
@@ -319,7 +386,7 @@ export function NckPointFields({
           style={{ minWidth: 320, padding: "4px 6px" }}
         >
           <option value="">请选择可采集变量</option>
-          {definitions.map((d) => (
+          {selectableDefinitions.map((d) => (
             <option key={String(d.variable_id)} value={String(d.variable_id)}>
               {nckDefinitionLabel(d) || String(d.variable_id)}（{String(d.variable_id)}）
             </option>

@@ -9,6 +9,7 @@ import { NckPointFields, type NckPreviewFn } from "./NckPointFields";
 import type { NckIdentityPreviewResponse } from "../nckCatalog";
 import type { NckDefinitionLike } from "../nckPointModel";
 import type { NckPointSelection } from "../deviceModel";
+import type { SchemaDescriptor } from "../types";
 
 function definition(overrides: Partial<NckDefinitionLike> = {}): NckDefinitionLike {
   return {
@@ -211,9 +212,23 @@ describe("门禁 3：identity 不可新增（Preview 成功也不放行）", () 
     renderFields({
       definitions: [definition({ scope: "identity" })],
       preview,
+      initialPoint: {
+        kind: "nck_variable",
+        point_key: "",
+        parameters: {
+          variable_id: "syn.channel.status",
+          definition_revision: 1,
+          target: { channel: 1 },
+          arguments: {},
+        },
+      },
     });
-    choose("syn.channel.status");
-    // 即使父层把 identity 定义塞进表单（绕过列表过滤），这里也必须拒绝。
+    // 即使父层把 identity 定义塞进表单（绕过列表过滤/直接用初始点位注入），
+    // 这里也必须拒绝；select 里不再提供 identity 选项，但 definition 仍能显示原因。
+    const optionValues = Array.from(
+      (screen.getByTestId("nck-variable-select") as HTMLSelectElement).querySelectorAll("option"),
+    ).map((o) => o.value);
+    expect(optionValues).not.toContain("syn.channel.status");
     expect(screen.getByTestId("nck-scope-reject").textContent).toContain("SCOPE_IDENTITY");
     expect(pending).toHaveLength(0);
     expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(true);
@@ -408,6 +423,60 @@ describe("门禁 6：Preview 失败不得回退旧 Key", () => {
     expect(screen.queryByTestId("nck-point-key")).toBeNull();
     expect(screen.getByTestId("nck-preview-error").textContent).toContain("driver unavailable");
     expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+describe("PR-C 第三批：高级原生模式入口", () => {
+  const nativeSchema: SchemaDescriptor = {
+    fields: [
+      { key: "area", label: "Area", field_type: "enum", required: true, validation: { enum_options: ["C"] }, ui: {} },
+      { key: "area_no", label: "Area No.", field_type: "integer", required: true, validation: { min: 0, max: 31 }, ui: {} },
+      { key: "module", label: "Module", field_type: "integer", required: true, validation: { min: 0, max: 255 }, ui: {} },
+      { key: "column", label: "Column", field_type: "integer", required: true, validation: { min: 0, max: 65535 }, ui: {} },
+      { key: "line", label: "Line", field_type: "integer", required: true, validation: { min: 0, max: 65535 }, ui: {} },
+    ],
+  };
+  const nativePoint: NckPointSelection = {
+    kind: "nck_native",
+    point_key: "native.C.1.21.1.396",
+    parameters: { area: "C", area_no: 1, module: 21, column: 1, line: 396 },
+  };
+
+  it("native_initial_point_opens_native_editor_and_submits_nck_native", () => {
+    const onSubmit = vi.fn();
+    render(
+      <NckPointFields
+        driverId="sinumerik-nck"
+        endpointFamily="828d"
+        definitions={[]}
+        takenPointKeys={[]}
+        initialPoint={nativePoint}
+        nativeSchema={nativeSchema}
+        onSubmit={onSubmit}
+      />,
+    );
+    expect(screen.getByTestId("nck-editor-mode")).toBeTruthy();
+    expect(screen.getByTestId("nck-native-fields")).toBeTruthy();
+    expect(screen.getByTestId("nck-native-key").textContent).toBe("native.C.1.21.1.396");
+    fireEvent.click(screen.getByTestId("nck-native-add-point"));
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect((onSubmit.mock.calls[0][0] as NckPointSelection).kind).toBe("nck_native");
+  });
+
+  it("native_without_schema_is_fail_closed", () => {
+    render(
+      <NckPointFields
+        driverId="sinumerik-nck"
+        endpointFamily="828d"
+        definitions={[]}
+        takenPointKeys={[]}
+        initialPoint={nativePoint}
+        nativeSchema={null}
+        onSubmit={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("nck-native-schema-missing")).toBeTruthy();
+    expect(screen.queryByTestId("nck-native-add-point")).toBeNull();
   });
 });
 
