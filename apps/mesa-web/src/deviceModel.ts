@@ -209,7 +209,102 @@ export interface ResourceSelection {
 
 export const CANONICAL_RESOURCES_KIND = "mesa.resources.v1";
 
-/** 服务端任务形状（Foundation-2 单真值：schedule；binding 仅 mesa.resources.v1）。 */
+/**
+ * NCK 语义点位的 **Task Binding Kind**（任务层，不是点位层 kind）。
+ *
+ * 与 `CANONICAL_RESOURCES_KIND` 并存：Core 的任务 kind 白名单同时接受两者，
+ * 但 NCK Driver 的 `configure` 只接受 `nck.points.v1`；在 NCK Endpoint 上写
+ * `mesa.resources.v1` 会被整体拒绝（连原有正确任务一起启动失败）。
+ * 因此 kind 必须由 Endpoint 的 Driver 决定，不得由调用方传字面量。
+ */
+export const NCK_POINTS_KIND = "nck.points.v1";
+
+/** 点位层信封（Core `PointSelection`：恰 3 字段，parameters 对 Core 不透明）。 */
+export interface NckPointSelection {
+  kind: string;
+  point_key: string;
+  parameters: Record<string, unknown>;
+}
+
+/** 装配输入：两种结构**不得**互相冒充（points ≠ selections）。 */
+export type AcquisitionBindingContent =
+  | { type: "resources"; selections: ResourceSelection[] }
+  | { type: "nck-points"; points: NckPointSelection[] };
+
+export type BindingAssemblyResult =
+  | { ok: true; binding: { kind: string; config: Record<string, unknown> } }
+  | { ok: false; code: "DRIVER_BINDING_KIND_MISMATCH"; message: string };
+
+/**
+ * Endpoint Driver 是否 NCK。只认唯一已发布的 driver id；空/未知 id 一律
+ * 视为非 NCK（调用方必须传真实 driver id，不得靠猜）。
+ */
+export function isNckDriver(driverId: string | null | undefined): boolean {
+  return (driverId ?? "").trim().toLowerCase() === "sinumerik-nck";
+}
+
+/** 按 Endpoint Driver 选择 Binding Kind（唯一决策点）。 */
+export function bindingKindForDriver(driverId: string | null | undefined): string {
+  return isNckDriver(driverId) ? NCK_POINTS_KIND : CANONICAL_RESOURCES_KIND;
+}
+
+/**
+ * **唯一** Binding 装配入口（P0-2 双真值收敛）。
+ *
+ * 为什么用 content 判别而不是让调用方传 kind：kind 是 Driver 的属性，
+ * 让调用方传字面量正是旧实现里 `bootstrap.ts` 与 `deviceModel.ts` 两处
+ * 装配分叉的成因。
+ * 这里同时拒绝「结构/驱动不匹配」的组合（NCK + selections、非 NCK + points），
+ * 避免把非法配置推迟到 Driver `configure` 才整体失败。
+ */
+export function assembleBinding(args: {
+  driverId?: string | null;
+  content: AcquisitionBindingContent;
+}): BindingAssemblyResult {
+  const nck = isNckDriver(args.driverId);
+  if (nck && args.content.type !== "nck-points") {
+    return {
+      ok: false,
+      code: "DRIVER_BINDING_KIND_MISMATCH",
+      message: "NCK Endpoint 不允许写入 mesa.resources.v1 任务（必须使用 nck.points.v1）",
+    };
+  }
+  if (!nck && args.content.type !== "resources") {
+    return {
+      ok: false,
+      code: "DRIVER_BINDING_KIND_MISMATCH",
+      message: `非 NCK Endpoint 不允许写入 ${NCK_POINTS_KIND} 任务（必须使用 mesa.resources.v1）`,
+    };
+  }
+  if (args.content.type === "nck-points") {
+    return {
+      ok: true,
+      binding: { kind: NCK_POINTS_KIND, config: { points: args.content.points } },
+    };
+  }
+  return {
+    ok: true,
+    binding: { kind: CANONICAL_RESOURCES_KIND, config: { selections: args.content.selections } },
+  };
+}
+
+/**
+ * 旧 canonical（非 NCK）Binding 装配：`mergeAcquisitionTasks` 与
+ * `bootstrap.ts` 共用，保证两处产出逐字相等（A28）。
+ *
+ * 调用方不传 driverId ⇒ 非 NCK；未知/空 driver 不得被猜成 NCK。
+ */
+export function assembleCanonicalBinding(
+  selections: ResourceSelection[],
+): { kind: string; config: Record<string, unknown> } {
+  const result = assembleBinding({ content: { type: "resources", selections } });
+  // 「非 NCK + resources」在 assembleBinding 中恒成功；分支只为类型收窄。
+  return result.ok
+    ? result.binding
+    : { kind: CANONICAL_RESOURCES_KIND, config: { selections } };
+}
+
+/** 服务端任务形状（Foundation-2 单真值：schedule；binding 为两种 kind 之一）。 */
 export interface TaskScheduleShape {
   mode: string;
   interval_ms?: number | null;
@@ -229,8 +324,15 @@ export interface AcquisitionTaskShape {
 }
 
 /**
- * 拆分任务集：第一个 canonical 任务归 Web 编辑，其余全部归保留。
- * 无 canonical 时 editable 为 null（保存即新增），preserved 为全集。
+ * 拆分任务集：第一个 canonical（`mesa.resources.v1`）任务归 Web 编辑，其余
+ * 全部归保留。无 canonical 时 editable 为 null（保存即新增），preserved 为全集。
+ *
+ * NOTE（P0-2）：这里**不**把 `nck.points.v1` 任务当成可编辑基底——本函数的
+ * 编辑产物是 `ResourceSelection[]`，与 NCK 的 `PointSelection[]` 结构不同，
+ * 混用会把两种配置当成同一种处理。NCK Endpoint 必须走
+ * `nckTaskBinding.selectEditableTask` / `mergeNckAcquisitionTasks`：
+ * 它们按 Driver 选 kind，并在「多个候选 / 结构非法 / 快照未就绪」时拒绝，
+ * 不会像本函数这样取第一个。
  */
 export function splitAcquisitionTasks(tasks: AcquisitionTaskShape[]): {
   editable: AcquisitionTaskShape | null;
@@ -244,7 +346,14 @@ export function splitAcquisitionTasks(tasks: AcquisitionTaskShape[]): {
   };
 }
 
-/** 从 canonical 任务的 config 里提取已选（非 canonical 形态返回空数组）。 */
+/**
+ * 从 canonical 任务的 config 里提取 `{selections:[...]}`（其他 kind /
+ * 其他结构返回空数组）。
+ *
+ * NOTE（P0-2）：`nck.points.v1` 的 `{points:[...]}` **不得**被这里读成
+ * `ResourceSelection[]`——两者字段语义不同（点位身份 vs 资源+输出）。
+ * NCK 点位请用 `nckTaskBinding.parseTaskBinding` / `nckPointsOf`。
+ */
 export function selectionsOf(task: AcquisitionTaskShape | null): ResourceSelection[] {
   if (!task || task.binding.kind !== CANONICAL_RESOURCES_KIND) return [];
   const config = task.binding.config as { selections?: ResourceSelection[] } | undefined;
@@ -281,6 +390,17 @@ export function mergeAcquisitionTasks(
   existing: AcquisitionTaskShape[],
   edited: { interval_ms: number; selections: ResourceSelection[] },
 ): AcquisitionTaskShape[] {
+  // P0-2 安全网：本函数只会装配 canonical（`{selections}`），无法表达 NCK 的
+  // `{points}`。任务集里一旦出现 `nck.points.v1`，继续走「找 canonical → 追加
+  // 一个 canonical」的老路，就会写出 Driver 必然整体拒绝的配置（连原有正确
+  // 任务一起挂）。在 UI 尚未接线到 `mergeNckAcquisitionTasks` 之前，这里选择
+  // 「原样不写」兜底：不覆盖、不追加、不丢任务。
+  //
+  // TODO(PR-C 后续批次)：EndpointAcquisitionPane 改走
+  // `mergeNckAcquisitionTasks` 并展示明确拒绝文案；届时删除本兜底。
+  // NOTE：本函数没有错误返回通道，因此兜底只能是 no-op——UI 会误报“已保存”，
+  // 这是已知且已登记的本批残余风险（见 PR 报告），不得据此认为编辑已生效。
+  if (existing.some((task) => task.binding?.kind === NCK_POINTS_KIND)) return existing;
   const { editable, preserved } = splitAcquisitionTasks(existing);
   const taken = new Set(existing.map((t) => t.id));
   let id = editable?.id ?? "t1";
@@ -298,7 +418,9 @@ export function mergeAcquisitionTasks(
       schedule.mode === "poll"
         ? { ...schedule, mode: "poll", interval_ms: edited.interval_ms }
         : schedule,
-    binding: { kind: CANONICAL_RESOURCES_KIND, config: { selections: edited.selections } },
+    // P0-2：装配走唯一入口（与 bootstrap.ts 逐字相等）；本函数只服务
+    // 非 NCK 的旧路径，NCK 编辑必须走 nckTaskBinding.mergeNckAcquisitionTasks。
+    binding: assembleCanonicalBinding(edited.selections),
   };
   return [...preserved, canonical];
 }
