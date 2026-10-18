@@ -10,13 +10,15 @@
 // 本模块只做纯判定，不 import React / AntD / 任何请求层，便于被 UI、提交模型
 // 和单测共同调用。两处执行点（缺一不可）：
 //   ① UI 层：collectableDefinitions（列表过滤）+ evaluateNckSelectionAdd
-//      （选择/加入时拒绝）；UI 接线在后续批次，本批只交付可单测的纯函数。
+//      （选择/加入时拒绝）。第二种已在 EndpointAcquisitionPane 接线（第二批 A）：
+//      可采集清单只渲染 collect 条目，且保存前对当前点位再做一次准入拦截。
 //   ② 提交模型层：validateNckPointSubmission（不信任 UI 传入的 collectable
-//      布尔标志，只重新读原始 definition.scope）。
+//      布尔标志，只重新读原始 definition.scope）。端点页保存计划
+//      （endpointSavePlan → validateNckTaskSubmission）已接线（第二批 A）。
 //
-// TODO(PR-C 后续批次)：把上面两个 UI 纯函数接到 NckPointFields /
-// ResourcePickerAntd 的“加入”出口。本批受“只做纯模型、不动 UI 组件”约束，
-// 因此这里只提供执行点，不接线；一旦接线，UI 与提交模型必须同时生效。
+// TODO(PR-C 第二批 B)：把两个 UI 纯函数接到 NckPointFields / ResourcePickerAntd
+// 的“加入”出口（语义表单与 Preview 状态机）。A 批只接线到端点保存页与
+// 可采集清单；一旦 B 接入选择表单，UI 与提交模型必须同时生效，不得只留一处。
 //
 // 判据唯一且严格：`scope === "collect"` 才为真。`identity`、缺失、null、
 // 大小写/拼写变体、未来新增值一律 false（fail-closed）。**禁止**写成

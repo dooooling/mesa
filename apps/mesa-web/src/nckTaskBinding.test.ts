@@ -141,17 +141,16 @@ describe("P0-2 绝不额外生成旧 kind 任务（A19/A29）", () => {
     expect(result.tasks).toHaveLength(1); // 没有「再追加一个旧 kind 任务」
   });
 
-  it("旧 merge 路径遇到 NCK 任务时原样返回，绝不追加 canonical（安全网）", () => {
+  it("旧 merge 路径遇到 NCK 任务时**显式抛错**（第二批 A 已移除 no-op 安全网）", () => {
     const existing = nckTask("nck-task", [point("var.collect.01", { channel: 1 })]);
-    const out = mergeAcquisitionTasks([existing], {
-      interval_ms: 1000,
-      selections: [{ resource_id: "variable", parameters: {}, outputs: [] }],
-    });
-    expect(out).toHaveLength(1);
-    expect(out[0].binding.kind).toBe(NCK_POINTS_KIND);
-    expect(JSON.stringify(out)).not.toContain(CANONICAL_RESOURCES_KIND);
-    // 原对象引用都不变（no-op 兜底，不改任何既有任务）
-    expect(out[0]).toBe(existing);
+    // 旧实现"原样返回 existing"——调用方随后 PUT 成功并提示"点位已保存"，
+    // 编辑其实没写进去（虚假保存成功）。现在改为抛错：用错入口必须立刻暴露。
+    expect(() =>
+      mergeAcquisitionTasks([existing], {
+        interval_ms: 1000,
+        selections: [{ resource_id: "variable", parameters: {}, outputs: [] }],
+      }),
+    ).toThrow(/nck\.points\.v1/);
   });
 
   it("kind 由 Endpoint Driver 决定；结构与 Driver 不匹配时装配直接拒绝", () => {

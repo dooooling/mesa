@@ -332,7 +332,7 @@ export interface AcquisitionTaskShape {
  * 混用会把两种配置当成同一种处理。NCK Endpoint 必须走
  * `nckTaskBinding.selectEditableTask` / `mergeNckAcquisitionTasks`：
  * 它们按 Driver 选 kind，并在「多个候选 / 结构非法 / 快照未就绪」时拒绝，
- * 不会像本函数这样取第一个。
+ * 不会像本函数这样取第一个。端点页已按此接线（`endpointSavePlan.planEndpointTaskSave`）。
  */
 export function splitAcquisitionTasks(tasks: AcquisitionTaskShape[]): {
   editable: AcquisitionTaskShape | null;
@@ -390,17 +390,21 @@ export function mergeAcquisitionTasks(
   existing: AcquisitionTaskShape[],
   edited: { interval_ms: number; selections: ResourceSelection[] },
 ): AcquisitionTaskShape[] {
-  // P0-2 安全网：本函数只会装配 canonical（`{selections}`），无法表达 NCK 的
-  // `{points}`。任务集里一旦出现 `nck.points.v1`，继续走「找 canonical → 追加
-  // 一个 canonical」的老路，就会写出 Driver 必然整体拒绝的配置（连原有正确
-  // 任务一起挂）。在 UI 尚未接线到 `mergeNckAcquisitionTasks` 之前，这里选择
-  // 「原样不写」兜底：不覆盖、不追加、不丢任务。
+  // 已消除旧「no-op 安全网」（第二批 A）：它在本函数无法表达 NCK `{points}` 时
+  // 原样返回 existing，调用方（UI）随后照常 PUT 成功并提示「点位已保存」——
+  // 编辑其实一个字都没写进去，是最典型的"虚假保存成功"。
   //
-  // TODO(PR-C 后续批次)：EndpointAcquisitionPane 改走
-  // `mergeNckAcquisitionTasks` 并展示明确拒绝文案；届时删除本兜底。
-  // NOTE：本函数没有错误返回通道，因此兜底只能是 no-op——UI 会误报“已保存”，
-  // 这是已知且已登记的本批残余风险（见 PR 报告），不得据此认为编辑已生效。
-  if (existing.some((task) => task.binding?.kind === NCK_POINTS_KIND)) return existing;
+  // 现在改为**显式抛错**：本函数没有错误返回通道，与其静默成功，不如让
+  // 「用错入口」立刻暴露。NCK Endpoint 的保存必须走
+  // `endpointSavePlan.planEndpointTaskSave` → `nckTaskBinding.mergeNckAcquisitionTasks`
+  // （按 Driver 选 kind、保留任务 ID/Schedule、冲突与歧义拒绝）。
+  if (existing.some((task) => task.binding?.kind === NCK_POINTS_KIND)) {
+    throw new Error(
+      "mergeAcquisitionTasks 不能处理 nck.points.v1 任务：本函数只能装配 canonical " +
+        "{selections}，无法表达 {points}。请改用 nckTaskBinding.mergeNckAcquisitionTasks " +
+        "（no-op 兜底会误报保存成功，已按第二批 A 移除）",
+    );
+  }
   const { editable, preserved } = splitAcquisitionTasks(existing);
   const taken = new Set(existing.map((t) => t.id));
   let id = editable?.id ?? "t1";
