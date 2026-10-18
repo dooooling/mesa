@@ -53,16 +53,25 @@ export interface NckTargetField {
   /** 驱动声明的 target 变体名（`channel` / `axis` / `drive_object` …）。 */
   kind: string;
   required: boolean;
+  /** 该 Target 变体是否需要额外的 `entry` 子字段（形状事实，不是地址规则）。 */
+  requiresEntry: boolean;
   /**
-   * `drive_object.entry` 的候选集：**只**来自定义数据 `golden_ref[].entry`。
+   * 目录是否**权威声明**了 `entry` 的完整合法候选集。
    *
-   * 为什么不在前端写死 `nc_variable` / `drive_object`：那等于把驱动入口表
-   * （module 26/130 的语义）搬进前端，违反「前端不得硬编码 NCK 原生地址规则」。
-   * 这里只消费驱动已投影出来的入口名；缺失即 fail-closed。
+   * 当前 I-2 目录的 `targets` / `target_required` 只给 Target 变体名，
+   * **没有** `entry` 合法域字段（已核对 `definition_api.rs` 的 14 字段投影与
+   * `r1.json` 的 `targets` 元数据）⇒ 恒为 `false`。前端据此拒绝把示例值
+   * 当成闭集（见 `entryExamples`）。
    */
-  entryOptions: string[];
-  /** `drive_object` 但定义没有给出任何 entry 时的拒绝原因。 */
-  entryError?: string;
+  entryDomainDeclared: boolean;
+  /**
+   * `drive_object.entry` 的**示例值**，只来自定义数据 `golden_ref[].entry`。
+   *
+   * Golden Reference 是验证样例，不是合法值全集；目录未声明候选集时，这些值
+   * 只能作为输入提示（datalist），**不得**用于「不在列表即拒绝」的闭集校验。
+   * 真正的合法性由服务端权威 Preview 裁决。
+   */
+  entryExamples: string[];
 }
 
 export interface NckArgumentField {
@@ -102,8 +111,9 @@ export type NckFormModel = NckFormModelOk | NckFormModelFail;
 /**
  * `drive_object` 的 envelope 形状（`{number, entry}`）由驱动的 Target 类型决定。
  *
- * 这里只识别「哪个 target 变体需要 entry 子字段」这一**形状**事实；候选值仍从
- * `golden_ref[].entry` 读取，二者都不是地址规则本身。
+ * 这里只识别「哪个 target 变体需要 entry 子字段」这一**形状**事实；
+ * entry 的**值**没有任何前端权威来源（目录未声明候选集），必须由用户输入并
+ * 最终交给服务端 Preview 校验。
  */
 function needsDriveEntry(kind: string): boolean {
   return kind === "drive_object";
@@ -174,11 +184,12 @@ export function buildNckFormModel(
   const targetFields: NckTargetField[] = targets.map((kind) => ({
     kind,
     required: required.includes(kind),
-    entryOptions: needsDriveEntry(kind) ? goldenEntries : [],
-    entryError:
-      needsDriveEntry(kind) && goldenEntries.length === 0
-        ? "定义未提供 golden_ref[].entry：无法确认驱动入口候选，保持不可提交"
-        : undefined,
+    requiresEntry: needsDriveEntry(kind),
+    // 目录（14 字段投影）没有 entry 合法域字段 ⇒ 只能诚实地标记为“未声明”。
+    // TODO(PR-C 后端补充授权)：等 Definition Catalog 增加权威 entry 候选集后，
+    // 这里改为读取该字段；在此之前不得把 golden_ref 示例当成完整可选域。
+    entryDomainDeclared: false,
+    entryExamples: needsDriveEntry(kind) ? goldenEntries : [],
   }));
 
   if (definition.arguments !== undefined && !Array.isArray(definition.arguments)) {
@@ -259,7 +270,7 @@ export function emptyNckDraft(model: NckFormModel): NckFormDraft {
   const target: Record<string, string> = {};
   for (const field of model.targetFields) {
     target[field.kind] = "";
-    if (needsDriveEntry(field.kind)) target[`${field.kind}.entry`] = "";
+    if (field.requiresEntry) target[`${field.kind}.entry`] = "";
   }
   const args: Record<string, string> = {};
   for (const field of model.argumentFields) args[field.key] = "";
@@ -272,7 +283,6 @@ export type NckFormIssueCode =
   | "UNSUPPORTED_TARGET"
   | "INVALID_TARGET"
   | "MISSING_TARGET_ENTRY"
-  | "INVALID_TARGET_ENTRY"
   | "MISSING_ARGUMENT"
   | "UNKNOWN_ARGUMENT"
   | "INVALID_ARGUMENT"
@@ -334,7 +344,7 @@ export function validateNckForm(
   const allowedTargetKeys = new Set<string>();
   for (const field of model.targetFields) {
     allowedTargetKeys.add(field.kind);
-    if (needsDriveEntry(field.kind)) allowedTargetKeys.add(`${field.kind}.entry`);
+    if (field.requiresEntry) allowedTargetKeys.add(`${field.kind}.entry`);
   }
   for (const key of Object.keys(draft.target)) {
     if (!allowedTargetKeys.has(key)) {
@@ -367,15 +377,7 @@ export function validateNckForm(
       });
       continue;
     }
-    if (needsDriveEntry(field.kind)) {
-      if (field.entryError) {
-        issues.push({
-          code: "INVALID_TARGET",
-          field: field.kind,
-          message: field.entryError,
-        });
-        continue;
-      }
+    if (field.requiresEntry) {
       const entry = (draft.target[`${field.kind}.entry`] ?? "").trim();
       if (entry === "") {
         issues.push({
@@ -385,16 +387,9 @@ export function validateNckForm(
         });
         continue;
       }
-      if (!field.entryOptions.includes(entry)) {
-        issues.push({
-          code: "INVALID_TARGET_ENTRY",
-          field: `${field.kind}.entry`,
-          message: `\`${field.kind}.entry\` 取值 "${entry}" 不在定义给出的候选 [${field.entryOptions.join(
-            ", ",
-          )}] 内`,
-        });
-        continue;
-      }
+      // 关键裁决：Golden 示例不是完整合法域。目录没有声明 entry 候选集时，
+      // 前端**不得**把「不在 golden_ref 中」当作非法（那会把示例当闭集）。
+      // 真正的合法性由服务端 Preview 裁决；预览失败即不可提交。
       target[field.kind] = { number, entry };
     } else {
       target[field.kind] = number;

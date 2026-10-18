@@ -377,6 +377,20 @@ export function NckPointFields({
 
       {definition && model.ok ? (
         <div style={{ display: "grid", gap: 6 }}>
+          {model.targetFields.some((field) => field.requiresEntry && !field.entryDomainDeclared) ? (
+            <Alert
+              type="warning"
+              data-testid="nck-entry-contract-gap"
+              message="drive_object.entry 候选集未由目录声明（契约缺口）"
+              description={
+                <span>
+                  目录的 targets / target_required 只声明 Target 变体，未提供 entry 的合法候选集；
+                  下面展示的 Golden 示例仅作输入提示，不代表完整可选域。合法性由服务端
+                  Preview 裁决（失败即不可提交）。已登记为待补充的最小契约缺口。
+                </span>
+              }
+            />
+          ) : null}
           <div style={{ fontSize: 12, color: "#525252" }}>Target（由定义 targets / target_required 动态生成）</div>
           {model.targetFields.map((field) => (
             <div key={field.kind} style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -397,10 +411,16 @@ export function NckPointFields({
                 style={{ width: 160 }}
                 placeholder="实例号"
               />
-              {field.entryOptions.length || field.entryError ? (
+              {field.requiresEntry ? (
                 <>
                   <span style={{ fontSize: 12 }}>entry</span>
-                  <select
+                  {/*
+                    这里刻意用自由输入 + datalist，而不是 select：
+                    目录没有声明 entry 合法域，把 Golden 示例渲染成闭集会让用户
+                    误以为「列表即全集」。输入值最终由服务端 Preview 校验。
+                  */}
+                  <Input
+                    list={`nck-entry-examples-${field.kind}`}
                     data-testid={`nck-target-${field.kind}-entry`}
                     aria-label={`target-${field.kind}-entry`}
                     value={draft.target[`${field.kind}.entry`] ?? ""}
@@ -410,18 +430,18 @@ export function NckPointFields({
                         target: { ...prev.target, [`${field.kind}.entry`]: e.target.value },
                       }))
                     }
-                    style={{ padding: "4px 6px" }}
-                  >
-                    <option value="">请选择入口</option>
-                    {field.entryOptions.map((entry) => (
-                      <option key={entry} value={entry}>
-                        {entry}
-                      </option>
+                    style={{ width: 220 }}
+                    placeholder={
+                      field.entryExamples.length
+                        ? `入口名（示例：${field.entryExamples.join(" / ")}）`
+                        : "入口名（目录未提供示例）"
+                    }
+                  />
+                  <datalist id={`nck-entry-examples-${field.kind}`}>
+                    {field.entryExamples.map((entry) => (
+                      <option key={entry} value={entry} />
                     ))}
-                  </select>
-                  {field.entryError ? (
-                    <span style={{ fontSize: 11, color: "#c62828" }}>{field.entryError}</span>
-                  ) : null}
+                  </datalist>
                 </>
               ) : null}
             </div>

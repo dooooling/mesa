@@ -122,6 +122,12 @@ function installFetch(state: MockState) {
             runtime: { state: "STOPPED" },
           },
           {
+            id: "ep-2",
+            driver_id: NCK_DRIVER,
+            connection: { family: "828d" },
+            runtime: { state: "STOPPED" },
+          },
+          {
             id: "ep-s7",
             driver_id: "s7",
             connection: { family: "" },
@@ -538,5 +544,56 @@ describe("门禁 6：已有点位预览失败 ⇒ 不得按旧 Key 继续提交"
     expect(alert.textContent).toContain("DRIVER_UNAVAILABLE");
     await waitFor(() => expect(saveButton().disabled).toBe(true));
     expect(state.putBodies).toHaveLength(0);
+  });
+});
+
+describe("收口回归：切换 Endpoint 不得残留上一台的表单/Preview", () => {
+  it("endpoint_switch_remounts_semantic_form_and_drops_previous_preview", async () => {
+    const user = userEvent.setup();
+    const state = mkState();
+    installFetch(state);
+    const definitions = {
+      "syn.collect.a": {
+        variable_id: "syn.collect.a",
+        revision: 1,
+        family: "828d",
+        scope: "collect",
+        targets: ["channel"],
+        target_required: ["channel"],
+        arguments: [],
+      },
+    };
+    const { rerender } = render(
+      <EndpointAcquisitionPane
+        endpointId={EP}
+        driverId={NCK_DRIVER}
+        onChanged={() => {}}
+        nckDefinitions={definitions}
+      />,
+    );
+    await screen.findByTestId("nck-collectable-summary");
+    await user.selectOptions(
+      screen.getByTestId("nck-variable-select") as HTMLSelectElement,
+      "syn.collect.a",
+    );
+    await user.type(screen.getByLabelText("target-channel"), "1");
+    await screen.findByTestId("nck-point-key");
+
+    rerender(
+      <EndpointAcquisitionPane
+        endpointId="ep-2"
+        driverId={NCK_DRIVER}
+        onChanged={() => {}}
+        nckDefinitions={definitions}
+      />,
+    );
+    // 表单以 endpointId 作为 key：切换 Endpoint 必须卸载重建，
+    // 上一台的目标输入与已确认 Key 不得跨设备残留。
+    await waitFor(() =>
+      expect((screen.getByTestId("nck-variable-select") as HTMLSelectElement).value).toBe(""),
+    );
+    expect(screen.queryByTestId("nck-point-key")).toBeNull();
+    // 未重新选择变量 ⇒ 不渲染任何 Target 输入（上一台的输入已随卸载丢弃）。
+    expect(screen.queryByLabelText("target-channel")).toBeNull();
   });
 });

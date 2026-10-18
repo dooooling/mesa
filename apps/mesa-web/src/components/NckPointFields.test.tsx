@@ -129,12 +129,55 @@ describe("门禁 4：Target/Arguments 动态生成，非法值拒绝", () => {
     choose("syn.drive.param");
     expect(screen.queryByLabelText("target-axis")).toBeNull();
     expect(screen.queryByLabelText("argument-index")).toBeNull();
-    const entry = screen.getByTestId("nck-target-drive_object-entry") as HTMLSelectElement;
-    expect(Array.from(entry.querySelectorAll("option")).map((o) => o.value)).toEqual([
-      "",
+    const entry = screen.getByTestId("nck-target-drive_object-entry") as HTMLInputElement;
+    // 目录未声明 entry 合法域 ⇒ 必须是自由输入 + datalist 示例，不能是闭集 select。
+    expect(entry.tagName).toBe("INPUT");
+    expect(screen.getByTestId("nck-entry-contract-gap")).toBeTruthy();
+    const datalist = document.getElementById("nck-entry-examples-drive_object") as HTMLDataListElement;
+    expect(Array.from(datalist.querySelectorAll("option")).map((o) => o.value)).toEqual([
       "nc_variable",
       "drive_object",
     ]);
+  });
+
+  it("golden_entries_are_examples_not_a_closed_domain", async () => {
+    const { preview, pending } = installPreview();
+    renderFields({
+      definitions: [
+        definition({
+          variable_id: "syn.drive.param",
+          targets: ["drive_object"],
+          target_required: ["drive_object"],
+          golden_ref: [{ entry: "nc_variable" }, { entry: "drive_object" }],
+        }),
+      ],
+      preview,
+    });
+    choose("syn.drive.param");
+    fireEvent.change(screen.getByLabelText("target-drive_object"), {
+      target: { value: "26" },
+    });
+    // 不在 Golden 示例里的值不得在前端被当成非法（示例 ≠ 完整合法域）；
+    // 它必须进入服务端 Preview，由服务端裁决。
+    fireEvent.change(screen.getByLabelText("target-drive_object-entry"), {
+      target: { value: "future_entry" },
+    });
+    expect(screen.queryByTestId("nck-form-issues")).toBeNull();
+    await waitFor(() => expect(pending).toHaveLength(1));
+    expect(pending[0].request.parameters).toEqual({
+      variable_id: "syn.drive.param",
+      definition_revision: 1,
+      target: { drive_object: { number: 26, entry: "future_entry" } },
+      arguments: {},
+    });
+    await act(async () => {
+      pending[0].deferred.reject(new Error("UNSUPPORTED_TARGET_ENTRY"));
+      await new Promise((r) => setTimeout(r, 10));
+    });
+    expect(screen.getByTestId("nck-preview-error").textContent).toContain(
+      "UNSUPPORTED_TARGET_ENTRY",
+    );
+    expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("invalid_values_are_rejected_before_preview_and_block_submit", () => {

@@ -145,20 +145,28 @@ describe("门禁 4：Target/Arguments 由定义动态生成，非法值拒绝", 
     expect(model.ok).toBe(true);
     const field = model.targetFields[0];
     expect(field.kind).toBe("drive_object");
-    // 候选集来自定义数据（golden_ref[].entry），不是前端写死的 26/130。
-    expect(field.entryOptions).toEqual(["nc_variable", "drive_object"]);
+    expect(field.requiresEntry).toBe(true);
+    // 目录只投影 golden_ref 示例；**没有**声明 entry 合法域（本轮裁决的契约缺口）。
+    expect(field.entryDomainDeclared).toBe(false);
+    expect(field.entryExamples).toEqual(["nc_variable", "drive_object"]);
 
-    const missingEntry = validateNckForm(def, model, draftOf({ drive_object: "26", "drive_object.entry": "" }));
+    const missingEntry = validateNckForm(
+      def,
+      model,
+      draftOf({ drive_object: "26", "drive_object.entry": "" }),
+    );
     expect(missingEntry.ok).toBe(false);
     expect(missingEntry.issues.some((i) => i.code === "MISSING_TARGET_ENTRY")).toBe(true);
 
-    const badEntry = validateNckForm(
+    // Golden 示例**不是**闭集：不在示例里的值不得在前端被拒绝（那会把样例
+    // 当成完整合法域）；它必须进入 Preview，由服务端裁决。
+    const futureEntry = validateNckForm(
       def,
       model,
-      draftOf({ drive_object: "26", "drive_object.entry": "guessed_from_number" }),
+      draftOf({ drive_object: "26", "drive_object.entry": "future_entry" }),
     );
-    expect(badEntry.ok).toBe(false);
-    expect(badEntry.issues.some((i) => i.code === "INVALID_TARGET_ENTRY")).toBe(true);
+    expect(futureEntry.ok).toBe(true);
+    expect(futureEntry.target.drive_object).toEqual({ number: 26, entry: "future_entry" });
 
     const ok = validateNckForm(
       def,
@@ -394,6 +402,36 @@ describe("已有点位重新核验：记录里的 point_key 不是当前可提�
       catalogFamily: null,
       preview: preview(),
     });
+    expect(check.ok).toBe(true);
+  });
+
+  it("drive_object_entry_outside_golden_examples_is_not_rejected_by_form (preview decides)", () => {
+    const driveDefinition = definition({
+      variable_id: "syn.drive.param",
+      targets: ["drive_object"],
+      target_required: ["drive_object"],
+      golden_ref: [{ entry: "nc_variable" }, { entry: "drive_object" }],
+    });
+    const drivePoint = {
+      kind: "nck_variable",
+      point_key: "syn.drive.param@drive_object=26,entry=future_entry",
+      parameters: {
+        variable_id: "syn.drive.param",
+        definition_revision: 1,
+        target: { drive_object: { number: 26, entry: "future_entry" } },
+        arguments: {},
+      },
+    };
+    const check = evaluateNckPointIdentity({
+      point: drivePoint,
+      definition: driveDefinition,
+      endpointFamily: "828d",
+      preview: preview({
+        point_key: drivePoint.point_key,
+        variable_id: "syn.drive.param",
+      }),
+    });
+    // Golden 示例不是合法域：不能因为 entry 不在示例里就把已有点位判成非法。
     expect(check.ok).toBe(true);
   });
 

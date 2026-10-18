@@ -814,7 +814,7 @@ export function EndpointAcquisitionPane({
           <div style={{ borderTop: "1px solid #e0e0e0", paddingTop: 8 }}>
             {editingIndex !== null && nckPoints[editingIndex] ? (
               <NckPointFields
-                key={`edit-${editingIndex}-${nckPoints[editingIndex].point_key}-${formVersion}`}
+                key={`edit-${endpointId}-${editingIndex}-${nckPoints[editingIndex].point_key}-${formVersion}`}
                 driverId={driverId}
                 endpointFamily={endpointFamily}
                 catalogFamily={catalogFamily}
@@ -827,7 +827,7 @@ export function EndpointAcquisitionPane({
               />
             ) : (
               <NckPointFields
-                key={`add-${formVersion}`}
+                key={`add-${endpointId}-${formVersion}`}
                 driverId={driverId}
                 endpointFamily={endpointFamily}
                 catalogFamily={catalogFamily}
