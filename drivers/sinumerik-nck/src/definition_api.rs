@@ -182,7 +182,11 @@ where
     let catalog = load().map_err(DefinitionApiError::from_catalog)?;
 
     // 系列过滤：先判「是否已声明」，再判「是否有定义」——两者的可区分性
-    // 正是 E8 与 E9 的分界（400/501 vs 200 + 空数组 + note）。
+    // 正是 E8 与 E9 的分界。
+    // 【契约勘误（PR #115）】E8 原文写 HTTP 400，但 §6.2.1 已把
+    // `UNSUPPORTED_FAMILY` 定为 `ErrorKind::Unsupported`，而 Core **只按 kind
+    // 映射**（不按码特判）⇒ 实际状态是 **501**。同一码不得有两种 kind，
+    // 故此处按 §6.2.1 实现；E9（已声明但无定义）仍是 200 + [] + note。
     if let Some(f) = &query.family
         && !DECLARED_FAMILIES.contains(&f.as_str())
     {
@@ -191,28 +195,38 @@ where
 
     let (matched, note) = select_definitions(&catalog, &query)?;
 
-    // 游标：语义 = 上一页最后一条 `variable_id`。它必须**存在于当前结果集**，
-    // 否则调用方拿到的是一个不存在的锚点，翻页语义不成立（E12）。
+    // 游标必须**逐字命中当前结果集里的某一条**，否则锚点不存在（E12）。
+    // 注意比较的是**完整排序键** `(variable_id, revision)`，不是 variable_id 单键。
     if let Some(cursor) = &query.cursor
-        && !matched.iter().any(|d| &d.variable_id == cursor)
+        && !matched
+            .iter()
+            .any(|d| d.variable_id == cursor.variable_id && d.revision == cursor.revision)
     {
         return Err(DefinitionApiError::invalid_query(format!(
-            "游标 `{cursor}` 不在当前结果集内（游标必须逐字回传上一页的 next_cursor）"
+            "游标 `{}` 不在当前结果集内（游标必须逐字回传上一页的 next_cursor）",
+            cursor.encode()
         )));
     }
-    // 下一页严格取 `variable_id` **大于**游标的条目：按 (variable_id, revision)
-    // 升序遍历时，即使同一 variable_id 将来有多个 revision，也会整组翻过，
-    // 不会在页边界重复或漏掉。
+    // 下一页严格取**完整排序键**大于游标的条目（见 [`PaginationCursor`]）。
+    //
+    // 为什么不能只比 `variable_id`：结果按 `(variable_id, revision)` 排序，同一
+    // variable_id 允许同时发布多个 revision。若游标只记 variable_id，当一页
+    // 恰好截在该组 revision 中间时，下一页会跳到下一个 variable_id，**静默漏掉
+    // 该组剩余 revision**（反例：A/r1、A/r2 在首页末，A/r3 被跳过）。复合游标
+    // 按完整排序键续取，从结构上消除这条路径。
     let start = match &query.cursor {
         None => 0,
-        Some(cursor) => matched.partition_point(|d| &d.variable_id <= cursor),
+        Some(cursor) => matched.partition_point(|d| {
+            (d.variable_id.as_str(), d.revision) <= (cursor.variable_id.as_str(), cursor.revision)
+        }),
     };
     let end = matched
         .len()
         .min(start.saturating_add(query.limit as usize));
     let page = &matched[start..end];
     let next_cursor = if end < matched.len() {
-        page.last().map(|d| d.variable_id.clone())
+        page.last()
+            .map(|d| PaginationCursor::new(d.variable_id.clone(), d.revision).encode())
     } else {
         None
     };
@@ -278,7 +292,95 @@ struct CatalogQuery {
     variable_id: Option<String>,
     revision: Option<u32>,
     limit: u32,
-    cursor: Option<String>,
+    cursor: Option<PaginationCursor>,
+}
+
+/// 分页游标：**完整排序键** `(variable_id, revision)`，对客户端不透明。
+///
+/// ## 为什么不是「上一页末条 `variable_id`」
+///
+/// 目录按 `(variable_id, revision)` 升序；同一 variable_id **可以**同时发布多条
+/// revision（跨 revision 的身份模板/身份键必须逐字相同，见
+/// `definition.rs:452-469`）。若游标只记录 variable_id，当一页恰好截在同一变量
+/// 的一组 revision 中间时，下一页按 `variable_id > cursor` 续取会**跳过该组
+/// 剩余 revision**：
+///
+/// ```text
+/// 排序： A/r1, A/r2, A/r3, B/r1      limit = 2
+/// 第 1 页：A/r1, A/r2  → 游标只记 A → 第 2 页从 B 开始，A/r3 被静默漏掉
+/// ```
+///
+/// 复合游标按完整排序键续取，从结构上消除这类漏项——不依赖「今天只有 r1」
+/// 这条会随数据演进而失效的假设。
+///
+/// ## 编码与稳定性
+///
+/// 形态 `v1-<variable_id>-<revision>`：
+/// - `variable_id` 的形状是 `^[a-z][a-z0-9_.]*$`（装载期自检，`definition.rs:633`），
+///   **不含 `-`**，因此最后一个 `-` 是无歧义的分隔符；
+/// - 前缀 `v1-` 为未来编码演进保留拒绝面（旧编码会被明确判成非法游标，而不是
+///   被误读为某个锚点）；
+/// - 只用 `[A-Za-z0-9_.-]`，可安全放进 query string（无需额外转义）。
+///
+/// 客户端**只允许逐字回传** `next_cursor`，不得解析或构造（DC §4.1/§4.3 的
+/// 「不透明游标」口径不因复合编码而改变）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaginationCursor {
+    variable_id: String,
+    revision: u32,
+}
+
+/// 游标版本前缀（见 [`PaginationCursor`] 的编码说明）。
+const CURSOR_PREFIX: &str = "v1-";
+
+impl PaginationCursor {
+    fn new(variable_id: String, revision: u32) -> Self {
+        Self {
+            variable_id,
+            revision,
+        }
+    }
+
+    /// 编码为对外游标（客户端逐字回传）。
+    fn encode(&self) -> String {
+        format!("{CURSOR_PREFIX}{}-{}", self.variable_id, self.revision)
+    }
+
+    /// 严格解码：前缀/分隔符/revision 任一不合法 ⇒ `INVALID_QUERY`。
+    ///
+    /// 这里**不**接受旧式「仅 variable_id」游标：旧编码无法表达「同一变量的
+    /// 第几个 revision」，在数据演进后正是会漏项的那一种；静默兼容会让
+    /// 「不重不漏」的保证重新变脆。客户端升级只需逐字改用新 `next_cursor`。
+    fn parse(raw: &str) -> Result<Self, DefinitionApiError> {
+        let rest = raw.strip_prefix(CURSOR_PREFIX).ok_or_else(|| {
+            DefinitionApiError::invalid_query(format!(
+                "游标 `{raw}` 形态非法：必须以 `{CURSOR_PREFIX}` 开头（请逐字回传上一页的 next_cursor）"
+            ))
+        })?;
+        let (variable_id, revision) = rest.rsplit_once('-').ok_or_else(|| {
+            DefinitionApiError::invalid_query(format!(
+                "游标 `{raw}` 形态非法：缺少 `-<revision>` 段（必须逐字回传 next_cursor）"
+            ))
+        })?;
+        if variable_id.is_empty() {
+            return Err(DefinitionApiError::invalid_query(format!(
+                "游标 `{raw}` 形态非法：variable_id 为空"
+            )));
+        }
+        let revision: u32 = revision
+            .parse()
+            .ok()
+            .filter(|r| *r >= MIN_DEFINITION_REVISION)
+            .ok_or_else(|| {
+                DefinitionApiError::invalid_query(format!(
+                    "游标 `{raw}` 形态非法：revision 必须是 >= {MIN_DEFINITION_REVISION} 的整数"
+                ))
+            })?;
+        Ok(Self {
+            variable_id: variable_id.to_string(),
+            revision,
+        })
+    }
 }
 
 /// 查询参数的**严格**解析（E12）。
@@ -309,7 +411,9 @@ fn parse_catalog_query(request_json: &str) -> Result<CatalogQuery, DefinitionApi
     let limit = optional_positive_u32(obj, "limit")?
         .map(|v| v.min(MAX_LIMIT))
         .unwrap_or(DEFAULT_LIMIT);
-    let cursor = optional_non_empty_string(obj, "cursor")?;
+    let cursor = optional_non_empty_string(obj, "cursor")?
+        .map(|raw| PaginationCursor::parse(&raw))
+        .transpose()?;
 
     // revision 与 variable_id 必须成对：只给 revision 等于「全目录过滤 revision」，
     // 语义不明确；只给 variable_id 则必须回落「最新 revision」，而冻结目录的
@@ -631,5 +735,128 @@ mod tests {
         let q = parse_catalog_query(r#"{"variable_id":"v","revision":3}"#).expect("合法");
         assert_eq!(q.revision, Some(3));
         assert_eq!(q.limit, DEFAULT_LIMIT);
+    }
+
+    /// 合成目录：同一 variable 三个 revision + 两个单 revision variable。
+    ///
+    /// 内嵌目录今天只有 revision 1，无法暴露「页边界切在多 revision 组中间」这类
+    /// 缺陷；`from_definitions` 是既有公开入口（装载期自检照跑），因此可以用
+    /// **真实定义**构造该场景，且不触碰任何冻结数据文件。
+    fn multi_revision_catalog() -> DefinitionCatalog {
+        let embedded = DefinitionCatalog::embedded().expect("内嵌目录必须可用");
+        let pick = |id: &str| {
+            embedded
+                .iter()
+                .find(|d| d.variable_id == id)
+                .unwrap_or_else(|| panic!("内嵌目录缺少 {id}"))
+                .clone()
+        };
+        let mut defs = Vec::new();
+        let base = pick("axis.position.commanded_mcs");
+        for revision in 1..=3u32 {
+            let mut def = base.clone();
+            def.revision = revision;
+            defs.push(def);
+        }
+        defs.push(pick("channel.program.status"));
+        defs.push(pick("spindle.speed.actual"));
+        DefinitionCatalog::from_definitions(defs).expect("合成目录必须通过装载期自检")
+    }
+
+    fn catalog_page(catalog: &DefinitionCatalog, query: &Value) -> Value {
+        let body = catalog_json_with_loader(&query.to_string(), || Ok(catalog.clone()))
+            .expect("目录查询应成功");
+        serde_json::from_str(&body).expect("目录响应必须是 JSON")
+    }
+
+    /// 分页游标必须是**完整排序键** `(variable_id, revision)`。
+    ///
+    /// 反例（评审给出的场景）：A/r1、A/r2、A/r3、B/r1，`limit=2`。
+    /// 若游标只记 variable_id，第一页末为 A/r2，第二页会直接从 B 开始，
+    /// **静默漏掉 A/r3**。本用例用合成目录（同一 variable 三个 revision，
+    /// 且页边界恰好切在组中间）证明实现按完整排序键续取、不漏不重。
+    #[test]
+    fn pagination_cursor_does_not_skip_multi_revision_groups() {
+        let catalog = multi_revision_catalog();
+        let mut seen: Vec<(String, u64)> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let query = match &cursor {
+                None => serde_json::json!({ "limit": 2 }),
+                Some(c) => serde_json::json!({ "limit": 2, "cursor": c }),
+            };
+            let v = catalog_page(&catalog, &query);
+            assert_eq!(v["total"], 5, "total 是过滤后、分页前的总数");
+            let rows = v["definitions"].as_array().expect("definitions");
+            assert!(!rows.is_empty(), "未到末页时不得返回空页");
+            for row in rows {
+                seen.push((
+                    row["variable_id"]
+                        .as_str()
+                        .expect("variable_id")
+                        .to_string(),
+                    row["revision"].as_u64().expect("revision"),
+                ));
+            }
+            pages += 1;
+            assert!(pages <= 5, "翻页不得死循环");
+            match v["next_cursor"].as_str() {
+                Some(c) => {
+                    let last = rows.last().expect("rows");
+                    assert_eq!(
+                        c,
+                        format!(
+                            "v1-{}-{}",
+                            last["variable_id"].as_str().expect("variable_id"),
+                            last["revision"].as_u64().expect("revision")
+                        ),
+                        "next_cursor 必须是复合排序键（variable_id + revision）"
+                    );
+                    cursor = Some(c.to_string());
+                }
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ("axis.position.commanded_mcs".to_string(), 1),
+                ("axis.position.commanded_mcs".to_string(), 2),
+                ("axis.position.commanded_mcs".to_string(), 3),
+                ("channel.program.status".to_string(), 1),
+                ("spindle.speed.actual".to_string(), 1),
+            ],
+            "页边界切在多 revision 组中间时也必须整组续取（不重不漏）"
+        );
+    }
+
+    /// 非法/旧式/越界游标一律 `INVALID_QUERY`（E12），不得被静默当成某个锚点。
+    #[test]
+    fn pagination_cursor_rejects_legacy_and_foreign_values() {
+        let catalog = multi_revision_catalog();
+        for bad in [
+            // 旧式「仅 variable_id」游标：无法表达组内第几个 revision，
+            // 正是数据演进后会漏项的那一种编码 ⇒ 明确拒绝而不是静默兼容。
+            "axis.position.commanded_mcs",
+            // 缺版本前缀 / 缺 revision 段 / revision 非整数 / 非正。
+            "axis.position.commanded_mcs-1",
+            "v1-axis.position.commanded_mcs",
+            "v1-axis.position.commanded_mcs-x",
+            "v1-axis.position.commanded_mcs-0",
+            // 结构对但锚点不存在（revision 越界 / 变量不存在）。
+            "v1-axis.position.commanded_mcs-9",
+            "v1-no.such.variable-1",
+            // 空 variable_id / 空串。
+            "v1--1",
+            "v1-",
+            "",
+        ] {
+            let query = serde_json::json!({ "cursor": bad }).to_string();
+            let err = catalog_json_with_loader(&query, || Ok(catalog.clone()))
+                .expect_err("非法游标必须被拒绝");
+            assert_eq!(err.code(), "INVALID_QUERY", "cursor={bad:?}");
+            assert_eq!(err.kind().as_str(), "ConfigurationError");
+        }
     }
 }

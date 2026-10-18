@@ -3915,3 +3915,99 @@ async fn definition_response_invalid_is_503_not_too_large() {
     assert_eq!(status, StatusCode::OK, "合法目录必须仍 200: {v}");
     assert_eq!(v["total"], 42);
 }
+
+// ---------------------------------------------------------------------------
+// I-2 阶段 3 收口：真实 sinumerik-nck 驱动的 HTTP 错误契约（UNSUPPORTED_FAMILY ⇒ 501）
+// ---------------------------------------------------------------------------
+//
+// 为什么必须用**真实** NCK 驱动而不是夹具：本组断言钉的是「同一码 → 同一 kind →
+// 同一 HTTP」这条跨层契约（DC §6.2.1），并且要为阶段 3 提供一条真实 API 链路证据
+// （目录 42 条、空系列 200、未声明系列 501）。夹具驱动无法证明真实驱动的 code/kind。
+
+/// `UNSUPPORTED_FAMILY` 三元组（**目录端点**，真实 NCK 驱动）：
+/// `UNSUPPORTED_FAMILY` + `ErrorKind::Unsupported` + **HTTP 501**。
+///
+/// 【契约勘误（PR #115）】E8 原文写 400，但 §6.2.1 把该码定为 `Unsupported`，
+/// 而 Core **只按 kind 映射**（不得按码特判）⇒ 统一为 501。本用例同时给出
+/// 真实链路证据：未声明 family 必须 501，而「已声明但无定义」的 840d-sl 仍是
+/// 200 + [] + note（E8 与 E9 必须可区分）。
+#[tokio::test]
+async fn nck_definitions_undeclared_family_is_501_unsupported() {
+    let (app, _mgr, _staged) = app().await;
+    let base = "/api/v1/drivers/sinumerik-nck/definitions";
+
+    // 成功基线：真实 NCK 目录 42 条（证明请求确实打到了真实驱动）。
+    let (status, v) = get_json(app.clone(), base).await;
+    assert_eq!(status, StatusCode::OK, "真实 NCK 目录必须 200: {v}");
+    assert_eq!(v["total"], 42, "真实目录必须 42 条: {v}");
+    assert_eq!(v["driver_id"], "sinumerik-nck");
+    assert!(v["next_cursor"].is_null(), "42 < 100 ⇒ 无下一页: {v}");
+
+    // 未声明 family ⇒ 501 / Unsupported / UNSUPPORTED_FAMILY（三元组）。
+    let (status, v) = get_json(app.clone(), &format!("{base}?family=foo")).await;
+    assert_eq!(
+        (
+            status,
+            v["error"]["kind"].as_str(),
+            v["error"]["code"].as_str()
+        ),
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Some("Unsupported"),
+            Some("UNSUPPORTED_FAMILY")
+        ),
+        "未声明 family 必须是 501/Unsupported/UNSUPPORTED_FAMILY（不得 400、不得 503）: {v}"
+    );
+
+    // 已声明但无定义 ⇒ **不是错误**：200 + [] + note（E9）。
+    let (status, v) = get_json(app, &format!("{base}?family=840d-sl")).await;
+    assert_eq!(status, StatusCode::OK, "空系列必须是 200: {v}");
+    assert_eq!(v["definitions"], serde_json::json!([]));
+    assert!(v["note"].is_string(), "空目录必须带 note: {v}");
+}
+
+/// `UNSUPPORTED_FAMILY` 三元组（**Preview 端点**，真实 NCK 驱动）：
+/// 与目录端点**同码、同 kind、同 HTTP 501**。
+///
+/// 预览的 family 不匹配由 `compiler.rs` 的 `def.family != family` 检查产生
+/// （E21），它必须是 `Unsupported`，绝不能退化成 400/404 或 503（那会把
+/// 「升级驱动 / 换 Core」误导成「查机床」）。
+#[tokio::test]
+async fn nck_preview_family_mismatch_is_501_unsupported() {
+    let (app, _mgr, _staged) = app().await;
+    let body = serde_json::json!({
+        "family": "840d-sl",
+        "kind": "nck_variable",
+        "parameters": {
+            "variable_id": "axis.name",
+            "definition_revision": 1,
+            "target": { "axis": 1 },
+            "arguments": {}
+        }
+    });
+    let (status, v) = post_json(
+        app,
+        "/api/v1/drivers/sinumerik-nck/definitions/identity-preview",
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(
+        (
+            status,
+            v["error"]["kind"].as_str(),
+            v["error"]["code"].as_str()
+        ),
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Some("Unsupported"),
+            Some("UNSUPPORTED_FAMILY")
+        ),
+        "Preview 的 family 不匹配必须是 501/Unsupported/UNSUPPORTED_FAMILY（与目录端点同一映射）: {v}"
+    );
+    // 消息必须含两侧 family，便于运维定位是「定义系列」还是「请求系列」。
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("828d") && msg.contains("840d-sl"),
+        "消息要素: {msg}"
+    );
+}

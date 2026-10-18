@@ -586,10 +586,17 @@ async fn definition_query_result_cap_and_pagination_enforced() {
         assert!(pages <= 10, "翻页不得死循环");
         match page["next_cursor"].as_str() {
             Some(c) => {
+                let last = rows.last().expect("rows");
+                // 游标是**复合**排序键（variable_id + revision），不是裸 variable_id：
+                // 只记 variable_id 会在「同一变量多 revision 且页边界切在组中间」时漏项。
                 assert_eq!(
                     c,
-                    rows.last().expect("rows")["variable_id"],
-                    "next_cursor = 本页末条"
+                    format!(
+                        "v1-{}-{}",
+                        last["variable_id"].as_str().expect("variable_id"),
+                        last["revision"].as_u64().expect("revision")
+                    ),
+                    "next_cursor 必须是复合排序键"
                 );
                 cursor = Some(c.to_string());
             }
@@ -605,9 +612,12 @@ async fn definition_query_result_cap_and_pagination_enforced() {
         .collect();
     assert_eq!(seen, expected, "翻页顺序 = variable_id 字典序的稳定遍历");
 
-    // ④ 游标不在结果集 ⇒ INVALID_QUERY（不存在的锚点无法定义「下一页」）。
-    let e = catalog_err(json!({ "cursor": "no.such.variable" })).await;
-    assert_eq!(e.code, "INVALID_QUERY");
+    // ④ 游标不在结果集 / 旧式「仅 variable_id」编码 ⇒ INVALID_QUERY
+    //    （不存在的锚点无法定义「下一页」；旧编码无法表达组内 revision，必须明确拒绝）。
+    for bad in ["no.such.variable", "channel.r_parameter"] {
+        let e = catalog_err(json!({ "cursor": bad })).await;
+        assert_eq!(e.code, "INVALID_QUERY", "cursor={bad}");
+    }
 }
 
 // ---------------------------------------------------------------------------
