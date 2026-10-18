@@ -1,6 +1,6 @@
 # PR-C 整体收口审查：只读核查与验收材料
 
-- 审查对象：`feat/nck-prc-impl` @ `600a492d6cdf86c4c151717524bfb3e72ab686bf`（PR #116，任务上下文给定 CI 绿）。
+- 审查对象：`feat/nck-prc-impl` @ `354bca96a814355f624117c58b18f7e44d08bd88`（初始审查基线 `600a492`；PR #116）。
 - 审查性质：**只读**。本轮不修改生产代码/测试/配置，不执行 git 写操作，不启动 mesad/Vite，不连接设备，不安装。
 - 判据来源：`docs/design/nck-prc-frontend-semantic-config-boundary.md`（下称“边界文档”，A1–A44）、
   `docs/design/nck-prc-implementation-checklist.md`（下称“实施清单”）、
@@ -15,25 +15,26 @@
    - **A24**：`NckNativeFields.tsx:55` 改为默认未确认；`:126-130` 任何 Key 编辑立即撤销确认；重开已有 user 点位默认未确认；新增两条组件级测试（`NckNativeFields.test.tsx:113,144`）。
 3. **一致性五项的结论**：语义 `point_key` 唯一来源仍是服务端 `identity-preview`，**未发现第二套语义 Key 真值**；**未发现可绕过 `scope` 的生产入口**；保存路径唯一；非 NCK 正常路径逐字不变（唯一有意差异见 §3.5）。
 4. **G5 已按裁决豁免**：D7 删除前端编码器后，G5 不再要求前端引用 Golden；新口径见 §6-1。前端生产代码不依赖 Golden、不复制身份编码算法。
-5. 真实 API 端到端验证**仍未执行**（§5），不能据此声称“已验收”；本轮只关闭 A15/A24 的前端缺口并跑完前端门禁。
+5. 真实 API V1–V7 已在隔离环境执行 **31/31 PASS**（§10）；但这仍是**软件 emulator** 集成，不等于真实 CNC 真机验收；PR #116 合并仍 HOLD。
 
 ## 1. 基线与门禁（本轮实测/静态）
 
 | 项 | 值 | 证据 |
 |---|---|---|
 | 分支 | `feat/nck-prc-impl` | `git rev-parse --abbrev-ref HEAD` |
-| 本地基线 HEAD | `600a492d6cdf86c4c151717524bfb3e72ab686bf` | 本轮修复基于该提交 |
-| 远程 PR #116 HEAD | `c4731c6b41e5ef987e07fb0c1934afbf4166a7a0`（相对 `600a492` 仅新增本文件） | 上级独立核查；本轮未访问远程 |
-| 工作树 | **有未提交收口修改**（授权范围内 4 文件，见 §9） | `git status --porcelain` |
+| 本地 HEAD | `354bca96a814355f624117c58b18f7e44d08bd88`（含 A15/A24 修复） | `git rev-parse HEAD` |
+| 远程 PR #116 HEAD | `354bca96a814355f624117c58b18f7e44d08bd88`；CI Run `39131116474` success | 上级独立核查 |
+| 工作树 | **仅本文件有未提交 V1–V7 更新**；生产代码/测试无未提交改动 | `git status --porcelain` |
 | 前端测试文件 | **43** | `Get-ChildItem apps/mesa-web/src -Recurse -Include *.test.ts,*.test.tsx` |
 | 前端用例（实跑） | **503**（43 文件全绿，退出码 0） | `pnpm --dir apps/mesa-web test`；静态计数同为 503（500 行首 + 3 同行） |
 | `src/connection/**` | **134** = 132 行首 + 2 同行 | 70（`connectionSetupModel`）+ 39（`ConnectionSetupPanel`）+ 23（`useConnectionSetup`）+ 2 |
 | 类型检查 | **`tsc --noEmit` 退出码 0** | 本轮实跑（§7） |
 | ESLint | **`eslint .` 退出码 0** | 本轮实跑（§7） |
 | 生产构建 | **`tsc -b && vite build` 退出码 0** | 本轮实跑；`dist/assets/index-Bn2eGD58.js` 1,304.30 kB |
-| 冻结面 | `connection/**`、`DescriptorFields*`、`ApplyWithRestart`、`resourceSelectionModel.ts`、`AddDeviceFlow*`、`tsconfig.json`、`vite.config.ts` **均不在本轮 diff** | `git diff --name-only 600a492` |
+| V1–V7 隔离集成 | **31/31 PASS**（2026-10-19，软件 NCK emulator，非真实 CNC） | 结果与证据见 §10；原始证据 `target/validation/pr-c-v1-v7-evidence.json` |
+| 冻结面 | `connection/**`、`DescriptorFields*`、`ApplyWithRestart`、`resourceSelectionModel.ts`、`AddDeviceFlow*`、`tsconfig.json`、`vite.config.ts` **均不在 `354bca9` 的 4 文件修复中** | `git show --stat 354bca9` |
 
-> 说明：远程 CI 由上级在提交/推送后取得；本轮只证明本地 vitest / tsc / lint / build 四项门禁全绿。A15/A24 的修复文件均在授权范围内，未触碰 Core/Driver/Proto/`AddDeviceFlow.tsx`/`resourceSelectionModel.ts` 算法。
+> 说明：A15/A24 的 4 文件修复已在 `354bca9` 提交/推送，远程 CI Run `39131116474` success；本轮仅在本文件追加 V1–V7 证据，未改生产代码/测试。本地 vitest / tsc / lint / build 与隔离集成 31/31 均通过。
 
 ## 2. A1–A44 逐条状态
 
@@ -75,7 +76,7 @@
 | A30 | 已落地 | `NckPointFields.tsx:280-286`（切换变量重建空草稿） | `NckPointFields.test.tsx:106`（切到 drive_object 后 axis/argument 控件消失） | — |
 | A31 | 已落地 | 同上；`validateNckForm` 拒绝未声明变体 `nckPointModel.ts:344-357` | `NckPointFields.test.tsx:106`；`nckPointModel.test.ts:119` | channel/axis 不残留 |
 | A32 | 已落地 | `NckPointFields.tsx:468-480`（受控 `onChange`，无 blur 依赖） | `nckB.test.tsx:298-321`（`user.type` 后直接点击，无 blur，载荷为当前值） | — |
-| A33 | 已落地 | `git diff --name-only 600a492` 无冻结文件；`connection/**` 134 用例 | 本轮实跑 vitest（43 文件 / 503 用例全绿） | “原样通过”由本轮全量 vitest 证明；冻结文件未改 |
+| A33 | 已落地 | `git show --stat 354bca9` 的 4 文件不含冻结面；`connection/**` 134 用例 | 本轮实跑 vitest（43 文件 / 503 用例全绿） | “原样通过”由本轮全量 vitest 证明；冻结文件未改 |
 | A34 | 已落地 | 43 文件 / 503 用例 | 本轮实跑 vitest 退出码 0 | ≥383 基线成立（较上轮 498 增 5，全部来自 A15/A24 回归） |
 | A35 | 已落地 | grep 生产代码：`area_no/transport_size/unit_mode/F32_BE` 仅 `nckNativeModel.ts`、`NckNativeFields.tsx` | 本轮 grep（§7） | 属 A27 明文允许的 native 例外；语义路径零命中 |
 | A36 | 已落地 | `resourceSelectionModel.ts` 未在 diff；算法 `:169-377` 未改 | `deviceModel.test.ts:236-373`（既有用例未改） | 冻结算法本体 |
@@ -119,8 +120,8 @@
 ### 3.1 结论
 
 **除“已被 D7 取代的编码器类”与“已转 PR-D 的向导接线类”外，PR-C 的强制 A 项已全部落地。**
-44 行现为 **37 已落地 / 5 被取代 / 2 转 PR-D / 0 部分**；G5 已按裁决豁免。剩余未完成项只有：
-**真实 API 集成验收**（§5）与 **PR-D 向导接线**（不在 PR-C 范围）。
+44 行现为 **37 已落地 / 5 被取代 / 2 转 PR-D / 0 部分**；G5 已按裁决豁免；V1–V7 隔离集成 31/31 PASS。剩余未完成项只有：
+**PR-D 向导接线**（不在 PR-C 范围）与**真实 CNC 真机验证**（GATE，另需授权）。
 
 ### 3.2 A15 关闭记录（测试缺口已补）
 
@@ -144,8 +145,8 @@
 
 ### 3.4 阻塞状态
 
-- A15/A24 的阻塞已解除；前端门禁（vitest/tsc/lint/build）本轮全绿。
-- 仍 HOLD：真实 API 集成验收（需单独授权）、PR-D 向导接线、PR #116 合并。
+- A15/A24 的阻塞已解除；前端门禁（vitest/tsc/lint/build）本轮全绿；V1–V7 隔离集成 31/31 PASS（§10）。
+- 仍 HOLD：PR-D 向导接线、真实 CNC 真机验证、PR #116 合并。
 - 本轮不执行提交/推送；最终合并审查由上级在取得远程 CI 后进行。
 
 ### 3.5 非 NCK 的“零行为变化”有一个有意例外
@@ -215,22 +216,23 @@
 - 唯一有意差异：§3.5 的 `DRIVER_KIND_MISMATCH`。
 - 结论：**正常非 NCK 路径零变化**。
 
-## 5. 待补做的真实 API 验证清单（本轮**全部未执行**）
+## 5. 真实 API 验证清单（原始定义；执行结果见 §10）
 
-> 前置共同项：`cargo build --workspace` + 显式授权启动 `mesad`；创建/复用 `sinumerik-nck` Endpoint（`connection.family=828d`）；前端 `pnpm dev`（需单独授权）。本轮**未启动 mesad/Vite、未连设备、未安装**。
+> 编号说明：本节是**原始定义**；裁决表的 V1–V7 与本节编号存在错位，映射见 §10.1。本轮按场景名执行，结果见 §10。
+> 前置共同项：`cargo build --workspace` + 显式授权启动 `mesad`；创建/复用 `sinumerik-nck` Endpoint（`connection.family=828d`）。本轮使用隔离 DB/端口/PKI + 软件 NCK emulator，**未连真实 CNC、未启动真实 CNC 采集任务、未安装**。
 
 | # | 场景 | 环境前置 | 验收要点 | 状态 |
 |---|---|---|---|---|
-| V1 | Browse 语义叶 | mesad + NCK Endpoint 可达；Browse 根/分支可下钻 | 叶 `kind=nck_variable` 带 `identity{template,keys,preview_point_key}`；`preview_point_key` 只展示；identity 叶显示 `SCOPE_IDENTITY` 且无“选用（语义）”；非 NCK 叶仍走旧回填 | **未执行** |
-| V2 | Native derived | 同上 + Descriptor `variable` 12 字段可用 | 选 derived → Key 恰为 `native.<area>.<area_no>.<module>.<column>.<line>`；保存后 Configure 不报 `POINT_KEY_MISMATCH`；重开编辑器复核通过 | **未执行** |
-| V3 | Native user | 同上 | 显式 Key 原值落库、无 `~<n>` 自动追加；冲突被拒；非法命名空间/语法被前端与 Driver 双重拒绝（`INVALID_USER_IDENTITY`） | **未执行** |
-| V4 | Picker 语义模式 | **当前无生产接线**（`AddDeviceFlow.tsx:254-257` 未传 semantic） | 只能在 PR-D 接线后验证；本轮组件测试不能替代真实 API | **未执行（且当前不可执行）** |
-| V5 | Endpoint 全链 | mesad + NCK Endpoint + 真实目录 | 目录 42 条分页取全（36 collect / 6 identity）；Preview 成功；新增/编辑/移除；`PUT /tasks` 后回读一致；启动后 `points/latest` 出现值 | **未执行** |
-| V6 | 非 NCK 回归 | S7/OPC UA/Simulator Endpoint | Browse 叶形状、保存 PUT body 与旧实现逐字一致；不因新增可选字段变成不可选 | **未执行** |
-| V7 | 错误路径 | 可制造 503/501/413/400 的桩或断连 | Preview/Browse 失败时 `加入`/保存 disabled；错误码按 `kind` 展示；不回退 Browse Key | **未执行** |
+| V1 | Browse 语义叶 | mesad + NCK Endpoint 可达；Browse 根/分支可下钻 | 叶 `kind=nck_variable` 带 `identity{template,keys,preview_point_key}`；`preview_point_key` 只展示；identity 叶显示 `SCOPE_IDENTITY` 且无“选用（语义）”；非 NCK 叶仍走旧回填 | **已执行（裁决表 V2）** |
+| V2 | Native derived | 同上 + Descriptor `variable` 12 字段可用 | 选 derived → Key 恰为 `native.<area>.<area_no>.<module>.<column>.<line>`；保存后 Configure 不报 `POINT_KEY_MISMATCH`；重开编辑器复核通过 | **已执行（裁决表 V3）** |
+| V3 | Native user | 同上 | 显式 Key 原值落库、无 `~<n>` 自动追加；冲突被拒；非法命名空间/语法被前端与 Driver 双重拒绝（`INVALID_USER_IDENTITY`） | **已执行（裁决表 V4）** |
+| V4 | Picker 语义模式 | **当前无生产接线**（`AddDeviceFlow.tsx:254-257` 未传 semantic） | 只能在 PR-D 接线后验证；组件测试不能替代真实 API | **未执行（PR-D）** |
+| V5 | Endpoint 全链 | mesad + NCK Endpoint + 真实目录 | 目录 42 条分页取全（36 collect / 6 identity）；Preview 成功；新增/编辑/移除；`PUT /tasks` 后回读一致；启动后 `points/latest` 出现值 | **已执行（裁决表 V5）** |
+| V6 | 非 NCK 回归 | S7/OPC UA/Simulator Endpoint | Browse 叶形状、保存 PUT body 与旧实现逐字一致；不因新增可选字段变成不可选 | **已执行（裁决表 V7）** |
+| V7 | 错误路径 | 可制造 503/501/413/400 的桩或断连 | Preview/Browse 失败时 `加入`/保存 disabled；错误码按 `kind` 展示；不回退 Browse Key | **已执行（裁决表 V6）** |
 
 > 说明：V2/V3 的最终裁决在 Driver Configure（D11），前端单测无法证明“真实 Key 与 Driver 重算一致”；V5 才能证明“保存 → 启动 → 出值”闭环。
-> A15/A24 的前端回归已在本轮关闭（§3.2/§3.3），但**不能替代** V1–V7 的真实 API 证据；尤其 V2（Native Derived 能否被真实 Configure 接受）与 V3（User Key 原值/冲突/命名空间）仍必须在隔离 mesad 环境执行。
+> A15/A24 的前端回归已在本轮关闭（§3.2/§3.3），但**不能替代** V1–V7 的真实 API 证据；本轮已在隔离环境执行，结果见 §10。
 
 ## 6. 无法确认 / 新发现的矛盾（如实登记）
 
@@ -260,7 +262,8 @@ git diff --stat 2261178 HEAD
 git diff --name-only 2261178 HEAD
 git diff 2261178 HEAD -- apps/mesa-web/src/components/EndpointAcquisitionPane.tsx
 git diff --stat                                # 本轮收口修改
-git diff --name-only 600a492                   # 本轮修改面
+git diff --name-only 600a492                   # 初始基线以来的修改面
+git diff --name-only 354bca9                   # 当前 HEAD 以来仅本文件
 git diff --check                               # 空白/冲突标记检查，退出码 0
 Get-ChildItem apps/mesa-web/src -Recurse -File -Include *.ts,*.tsx
 Get-ChildItem apps/mesa-web/src -Recurse -File -Include *.test.ts,*.test.tsx
@@ -271,23 +274,29 @@ node <pnpm.mjs> --dir apps/mesa-web test          # 43 文件 / 503 用例，退
 node <pnpm.mjs> --dir apps/mesa-web typecheck     # tsc --noEmit，退出码 0
 node <pnpm.mjs> --dir apps/mesa-web lint          # eslint .，退出码 0
 node <pnpm.mjs> --dir apps/mesa-web build         # tsc -b && vite build，退出码 0
+cargo build --workspace                            # 24.35s
+target/debug/mesa-nck-emulator.exe --port 0 --scenario happy --element-size 8
+target/debug/mesad.exe --db <tmp>/mesa.db --events-db <tmp>/events.db \
+  --http-port <free> --drivers-dir drivers          # MESA_OPCUA_PKI_DIR=<tmp>/pki
+python target/validation/pr-c-v1-v7-harness.py      # 31/31 PASS；结束后 terminate + 删临时目录
 ```
 
-- **未运行**：`cargo build/test`、`mesad`、Vite dev server、任何安装。
-- **未连接**任何设备/机床；**未执行**任何 git 写操作（commit/push/checkout/stash/reset/PR/tag）。
+- **本轮运行**：`cargo build --workspace`；隔离 `mesad` + `mesa-nck-emulator`（V1–V7）；vitest / typecheck / lint / build。
+- **未运行**：`cargo test --workspace`、Vite dev server、任何安装。
+- **未连接**真实 CNC/机床；**未执行**任何 git 写操作（commit/push/checkout/stash/reset/PR/tag）。
 
 ## 8. 声明
 
-- 本轮按裁决做**限定范围**修改：`apps/mesa-web/src/components/NckNativeFields.tsx`（A24）、
-  `apps/mesa-web/src/components/NckNativeFields.test.tsx`（A24 回归）、
-  `apps/mesa-web/src/components/ResourceBrowseAntd.test.tsx`（A15 回归），并更新本文件。
-- **未修改** Core / Driver / Proto / `apps/mesad` / `AddDeviceFlow.tsx` / `resourceSelectionModel.ts` 算法 /
-  其它冻结文件 / 配置。
+- A15/A24 的限定范围修改已在 `354bca9` 提交/推送（`NckNativeFields.tsx`、`NckNativeFields.test.tsx`、
+  `ResourceBrowseAntd.test.tsx` + 本文件）；本会话**未执行**该提交/推送。
+- 本轮 V1–V7 **只更新本文件**（追加 §10 证据），**未修改**生产代码/测试；未改 Core / Driver / Proto /
+  `apps/mesad` / `AddDeviceFlow.tsx` / `resourceSelectionModel.ts` 算法 / 其它冻结文件 / 配置。
 - **未执行** commit / push / checkout / stash / reset / PR / tag；只读 git。
-- **未启动** `mesad` / Vite dev server；**未连接**设备；**未安装**依赖。
+- V1–V7 期间**临时启动**隔离 `mesad` + 软件 NCK emulator（临时 DB / 独立端口 / 临时 PKI），已终止并清理；
+  **未启动** Vite dev server；**未连接**真实 CNC/机床；**未安装**依赖。
 - 本轮**实际运行** vitest（43 文件 / 503 用例）、`tsc --noEmit`、`eslint .`、`tsc -b && vite build`，均退出码 0；
-  远程 CI 由上级在提交/推送后取得。
-- 文中所有 `文件:行号` 按本轮工作树读取；A15/A24 的关闭证据见 §3.2/§3.3，门禁结果见 §9。
+  V1–V7 隔离集成 31/31 PASS（§10）；远程 CI 由上级在提交/推送后取得。
+- 文中所有 `文件:行号` 按本轮工作树读取；A15/A24 的关闭证据见 §3.2/§3.3，门禁结果见 §9，V1–V7 见 §10。
 
 ## 9. 最后一轮收口修复记录
 
@@ -301,5 +310,68 @@ node <pnpm.mjs> --dir apps/mesa-web build         # tsc -b && vite build，退�
 | TypeScript | `tsc --noEmit` 退出码 0 |
 | ESLint | `eslint .` 退出码 0 |
 | 生产构建 | `tsc -b && vite build` 退出码 0（dist 已重新生成） |
-| 未提交 | 工作树变更待上级审阅；提交/推送/远程 CI 需再次明确授权 |
-| 仍 HOLD | 真实 API 集成验收（§5）、PR-D 向导接线、PR #116 合并 |
+| V1–V7 隔离集成 | **31/31 PASS**（软件 NCK emulator，非真实 CNC；见 §10） |
+| 未提交 | A15/A24 修复已在 `354bca9` 提交/推送；本轮仅本文件（V1–V7 证据）未提交 |
+| 仍 HOLD | PR-D 向导接线、真实 CNC 真机验证、PR #116 合并 |
+
+## 10. V1–V7 隔离集成验收（2026-10-19）
+
+### 10.1 编号映射（裁决表 vs 文档 §5）
+
+> 裁决表的 V1–V7 与本文档 §5 的原始编号存在**错位**；本轮按场景名执行，两套编号映射如下，避免验收材料歧义。
+
+| 场景 | 裁决表编号 | 文档 §5 旧编号 | 结果 |
+|---|---|---|---|
+| Catalog / Preview | V1 | §5 V1 前置 + V5 目录 | PASS |
+| Browse 语义叶 | V2 | V1 | PASS |
+| Native Derived | V3 | V2 | PASS |
+| Native User | V4 | V3 | PASS |
+| Endpoint 保存 | V5 | V5 | PASS |
+| 错误 / 竞态 | V6 | V7 | PASS（API）+ UI 单测 |
+| 非 NCK 回归 | V7 | V6 | PASS |
+| Picker 语义模式 | — | V4 | 未执行（PR-D，无生产接线） |
+
+### 10.2 环境与边界
+
+- `cargo build --workspace` 成功（24.35s），使用 `target/debug/{mesad,mesa-driver-sinumerik-nck,mesa-nck-emulator}.exe`。
+- 软件 emulator：`--port 0 --scenario happy --element-size 8`，自报 `MESA_NCK_EMULATOR_READY=127.0.0.1:<port>`。
+- `mesad`：临时 `--db` / `--events-db` / `MESA_OPCUA_PKI_DIR` / 空闲 `--http-port` / `--drivers-dir drivers`。
+- **未使用**生产 DB、现场 Endpoint、真实 CNC；未启动 Vite；未安装依赖。
+
+### 10.3 PASS/FAIL（31/31 PASS）
+
+| 组 | 检查项（全部 PASS） |
+|---|---|
+| V1 | driver_discovered、catalog_pagination_total（5 页/42 条）、scope_split（36 collect/6 identity）、14_fields、preview_semantic、preview_identity_returns_key_but_scope_identity |
+| V2 | create_endpoint、browse_root（`nck://presets` + `nck://identity`）、browse_semantic_leaves（62 节点/62 语义）、identity_not_in_parameters、collect_and_identity_leaves_present（36/6） |
+| V3 | native_derived_save、readback_key、configure_and_poll（Key `native.C.1.18.42.1`，GOOD） |
+| V4 | native_user_save、key_preserved（`native.C.1.18.42.2~2`）、configure_and_poll（GOOD）、namespace_rejected（`INVALID_USER_IDENTITY`）、conflict_rejected（400 `DUPLICATE_POINT_KEY`） |
+| V5 | preview_semantic_f64、semantic_save、readback_task_id_and_payload、configure_and_poll（GOOD）、edit_save、edit_keeps_task_id、edit_both_points_good、remove_keeps_task_id |
+| V6 | browse_unreachable_returns_503（HTTP 503 `BROWSE_FAILED`）、endpoint_task_isolation；迟到 Preview / Endpoint 切换由 UI 单测 23/23 通过覆盖 |
+| V7 | non_nck_save（S7 `mesa.resources.v1` 200）、non_nck_readback_unchanged（逐字回读） |
+
+### 10.4 关键 API 证据（摘要）
+
+- Catalog：`GET .../definitions?family=828d&limit=10` 连续 5 页，`total=42`、`definitions=42`、`collect=36`、`identity=6`、14 字段投影。
+- Preview（collect）：`{"point_key":"channel.program.status@channel=i:1","identity_mode":"derived","scope":"collect","variable_id":"channel.program.status","definition_revision":1}`。
+- Preview（identity）：`{"point_key":"axis.name@axis=i:1","scope":"identity","variable_id":"axis.name"}` —— **Key 合法但 scope=identity**，前端必须拒绝。
+- Browse：根 `["nck://presets","nck://identity"]`；presets 62 节点全部 `kind=nck_variable`，`identity` 与 `parameters` 同级、不进入 `parameters`。
+- Native Derived：`PUT /tasks` 200；`points/latest` `point_key=native.C.1.18.42.1`、`quality=GOOD`、`type=f64`、`source_label=nck://read/C/1/18/42/1/1?...`。
+- Native User：`point_key=native.C.1.18.42.2~2` 原值保留、`quality=GOOD`；坏命名空间 `other.var@channel=i:1` 在启动 Configure 被 `ConfigurationError/INVALID_USER_IDENTITY` 拒绝；重复 Key 在保存时 400 `DUPLICATE_POINT_KEY`。
+- Endpoint：`axis.position.actual_bcs@axis=i:1,channel=i:1` 保存/回读/启动 GOOD；新增第二点后 task id 仍为 `nck-task`；移除后仍为 `nck-task`。
+- 错误：不可达 Endpoint 的 `nck://identity/axes` Browse 返回 **503** `BROWSE_FAILED`（`CONNECT_TIMEOUT`）；主 Endpoint 与不可达 Endpoint 的任务集相互隔离。
+- 非 NCK：S7 `mesa.resources.v1` 保存 200，回读与提交逐字一致。
+- 原始请求/响应：`target/validation/pr-c-v1-v7-evidence.json`（41 条请求/响应，151,693 字节）。
+
+### 10.5 资源清理
+
+- 所有测试 Endpoint 已 Stop；`mesad` 与 emulator 已 terminate；临时 DB / events DB / PKI / 日志目录已删除。
+- 未触碰仓库根既有 `mesa.db` / `events.db`（时间戳早于本轮，非本轮生成）；无残留监听端口/进程。
+- 证据文件在 `target/validation/`（gitignored），不属于生产代码。
+
+### 10.6 边界与待确认
+
+- 本轮是**软件 emulator** 集成，不等同于真实 CNC 真机验收；GATE 真机项仍 HOLD。
+- V6 的“迟到 Preview / Endpoint 切换不误提交”是 UI 状态机行为，由 `NckPointFields.test.tsx` / `EndpointAcquisitionPane.nckB.test.tsx` 23 用例覆盖；API 侧只验证了 503 与任务集隔离。
+- V5 使用 F64 语义变量 `axis.position.actual_bcs` 以匹配 emulator `element-size=8`；U16 语义变量在该 emulator 下返回 `BAD`，**推断**是 emulator 固定 8 字节 fixture 与 U16 期望长度不一致（未单独定位），属测试环境约束，不计为产品缺陷；真实设备应按请求长度返回。
+- Picker 语义模式仍未执行（PR-D，`AddDeviceFlow.tsx` 冻结）。
