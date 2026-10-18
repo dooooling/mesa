@@ -317,3 +317,51 @@ describe("PR-C 第三批：语义叶准入与路由（A1/A13/A16/A44）", () => 
   });
 });
 
+// A15：Browse 503 / 网络异常 / 响应不可解析时，不得出现可操作的非法语义叶。
+function installBrowseFailure(kind: "http503" | "network" | "unparseable") {
+  (globalThis as { fetch?: unknown }).fetch = vi.fn(async () => {
+    if (kind === "http503") {
+      return {
+        ok: false,
+        status: 503,
+        json: async () => ({ error: { code: "DRIVER_UNAVAILABLE", message: "驱动不可达" } }),
+      };
+    }
+    if (kind === "network") throw new Error("network down");
+    return {
+      ok: true,
+      json: async () => {
+        throw new Error("invalid json");
+      },
+    };
+  });
+}
+
+describe("PR-C A15：Browse 网络失败不得产生可选语义叶", () => {
+  for (const kind of ["http503", "network", "unparseable"] as const) {
+    it(`browse_${kind}_failure_never_offers_semantic_leaf`, async () => {
+      installBrowseFailure(kind);
+      const onFill = vi.fn();
+      const onSemanticSelect = vi.fn();
+      render(
+        <ResourceBrowseAntd
+          endpointId="ep1"
+          onFill={onFill}
+          nckSemantic={{ definitions: [collectDefinition()], endpointFamily: "828d" }}
+          onSemanticSelect={onSemanticSelect}
+        />,
+      );
+      if (kind === "unparseable") {
+        // 响应体不可解析 ⇒ 当作空页处理（不猜节点），仍不得出现任何“选用”。
+        await screen.findByText(/空（未知 parent 返回空页/);
+      } else {
+        await screen.findByText(/浏览不可用/);
+      }
+      expect(screen.queryByRole("button", { name: /选用（语义）/ })).toBeNull();
+      expect(screen.queryByRole("button", { name: /选\s*用/ })).toBeNull();
+      expect(onFill).not.toHaveBeenCalled();
+      expect(onSemanticSelect).not.toHaveBeenCalled();
+    });
+  }
+});
+

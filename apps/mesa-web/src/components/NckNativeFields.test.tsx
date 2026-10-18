@@ -109,4 +109,58 @@ describe("A24–A27：native 表单身份模式与提交", () => {
     expect(screen.getByTestId("nck-native-issues").textContent).toContain("area_no");
     expect((screen.getByTestId("nck-native-add-point") as HTMLButtonElement).disabled).toBe(true);
   });
+
+  it("existing_user_point_is_unconfirmed_and_requires_reconfirmation (A24)", () => {
+    const onSubmit = vi.fn();
+    const existing: NckPointSelection = {
+      kind: "nck_native",
+      point_key: "native.C.1.21.1.397",
+      parameters: { ...nativePoint().parameters, identity_mode: "user" },
+    };
+    render(
+      <NckNativeFields schema={schema} takenPointKeys={[]} initialPoint={existing} onSubmit={onSubmit} />,
+    );
+    const input = screen.getByTestId("nck-native-user-key") as HTMLInputElement;
+    const confirm = screen.getByTestId("nck-native-user-confirm") as HTMLInputElement;
+    const btn = screen.getByTestId("nck-native-add-point") as HTMLButtonElement;
+    // 重开已有 user 点位：展示原 Key，但默认未确认，保存被禁用。
+    expect(input.value).toBe("native.C.1.21.1.397");
+    expect(confirm.checked).toBe(false);
+    expect(btn.disabled).toBe(true);
+    fireEvent.click(confirm);
+    expect(btn.disabled).toBe(false);
+    // 确认后再次修改 Key：确认立即撤销，必须重新确认。
+    fireEvent.change(input, { target: { value: "native.C.1.21.1.398" } });
+    expect(confirm.checked).toBe(false);
+    expect(btn.disabled).toBe(true);
+    fireEvent.click(confirm);
+    expect(btn.disabled).toBe(false);
+    fireEvent.click(btn);
+    expect((onSubmit.mock.calls[0][0] as NckPointSelection).point_key).toBe(
+      "native.C.1.21.1.398",
+    );
+  });
+
+  it("switching_derived_and_back_to_user_requires_reconfirmation (A24)", () => {
+    render(
+      <NckNativeFields schema={schema} takenPointKeys={[]} initialPoint={nativePoint()} onSubmit={() => {}} />,
+    );
+    const radios = () => screen.getAllByRole("radio") as HTMLInputElement[];
+    const confirm = () => screen.getByTestId("nck-native-user-confirm") as HTMLInputElement;
+    const btn = () => screen.getByTestId("nck-native-add-point") as HTMLButtonElement;
+
+    fireEvent.click(radios()[1]); // user
+    const input = screen.getByTestId("nck-native-user-key") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "native.C.1.21.1.397" } });
+    fireEvent.click(confirm());
+    expect(btn().disabled).toBe(false);
+
+    fireEvent.click(radios()[0]); // 回到 derived
+    expect(screen.queryByTestId("nck-native-user-confirm")).toBeNull();
+    fireEvent.click(radios()[1]); // 再回 user
+    expect(confirm().checked).toBe(false);
+    expect(btn().disabled).toBe(true);
+    fireEvent.click(confirm());
+    expect(btn().disabled).toBe(false);
+  });
 });

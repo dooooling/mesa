@@ -5,39 +5,41 @@
 - 判据来源：`docs/design/nck-prc-frontend-semantic-config-boundary.md`（下称“边界文档”，A1–A44）、
   `docs/design/nck-prc-implementation-checklist.md`（下称“实施清单”）、
   `docs/design/nck-prc-start-review.md`（下称“启动审查”，D7/D11 裁决）。
-- 证据口径：实现给 `文件:行号`；测试给“文件:行号 + 用例名（静态读取，未运行）”；无法证实的一律标 **待确认**。
+- 证据口径：实现给 `文件:行号`；测试给“文件:行号 + 用例名（本轮实跑 + 静态定位）”；无法证实的一律标 **待确认**。
 
 ## 0. 结论速览（给评审）
 
-1. **没有“完全未落地”的强制验收项**。44 行中：**35 行已落地、5 行被 D7 取代、2 行转 PR-D、2 行部分**。
-2. **两项“部分”必须显式记录**：
-   - **A15**：提交侧 fail-closed 已实现，但缺“Browse 503 / 网络失败”的组件级用例（现有用例只覆盖 Preview 失败）。
-   - **A24**：`user` 模式“主动选择 + 二次确认”已实现，但 **确认态不随 Key 编辑复位**，且存量 `user` 点位重开即视为已确认（`NckNativeFields.tsx:53,124`）。
+1. **没有“完全未落地”的强制验收项**。44 行中：**37 行已落地、5 行被 D7 取代、2 行转 PR-D、0 行部分**。
+2. **上一轮两项“部分”已在最后一轮收口关闭**：
+   - **A15**：新增 Browse 503 / 网络异常 / 响应不可解析三组组件级回归（`ResourceBrowseAntd.test.tsx:340-366`），三种情况下均无可操作语义叶、`onSemanticSelect`/`onFill` 零调用。
+   - **A24**：`NckNativeFields.tsx:55` 改为默认未确认；`:126-130` 任何 Key 编辑立即撤销确认；重开已有 user 点位默认未确认；新增两条组件级测试（`NckNativeFields.test.tsx:113,144`）。
 3. **一致性五项的结论**：语义 `point_key` 唯一来源仍是服务端 `identity-preview`，**未发现第二套语义 Key 真值**；**未发现可绕过 `scope` 的生产入口**；保存路径唯一；非 NCK 正常路径逐字不变（唯一有意差异见 §3.5）。
-4. **但存在一个门禁字面冲突**：D7 删除前端编码器后，门禁 **G5** 要求 grep 命中集合含“前端”，实际只剩 Core/Driver（见 §6-1）。这是验收材料必须由上级裁决/改写的地方，不是代码缺陷。
-5. 真实 API 端到端验证**本轮一项都未执行**（§4），不能据此声称“已验收”。
+4. **G5 已按裁决豁免**：D7 删除前端编码器后，G5 不再要求前端引用 Golden；新口径见 §6-1。前端生产代码不依赖 Golden、不复制身份编码算法。
+5. 真实 API 端到端验证**仍未执行**（§5），不能据此声称“已验收”；本轮只关闭 A15/A24 的前端缺口并跑完前端门禁。
 
 ## 1. 基线与门禁（本轮实测/静态）
 
 | 项 | 值 | 证据 |
 |---|---|---|
 | 分支 | `feat/nck-prc-impl` | `git rev-parse --abbrev-ref HEAD` |
-| HEAD | `600a492d6cdf86c4c151717524bfb3e72ab686bf` | `git rev-parse HEAD` |
-| 工作树 | **clean**（`git status --porcelain` 空输出） | 本轮命令 |
+| 本地基线 HEAD | `600a492d6cdf86c4c151717524bfb3e72ab686bf` | 本轮修复基于该提交 |
+| 远程 PR #116 HEAD | `c4731c6b41e5ef987e07fb0c1934afbf4166a7a0`（相对 `600a492` 仅新增本文件） | 上级独立核查；本轮未访问远程 |
+| 工作树 | **有未提交收口修改**（授权范围内 4 文件，见 §9） | `git status --porcelain` |
 | 前端测试文件 | **43** | `Get-ChildItem apps/mesa-web/src -Recurse -Include *.test.ts,*.test.tsx` |
-| 前端用例（静态） | **498** = 495 行首 `it(`/`test(` + 3 处与 `describe` 同行 | 同行三处：`connectionSetupModel.test.ts:251`、`:334`、`deviceModel.test.ts:155`；无 `.skip/.only/.each` |
+| 前端用例（实跑） | **503**（43 文件全绿，退出码 0） | `pnpm --dir apps/mesa-web test`；静态计数同为 503（500 行首 + 3 同行） |
 | `src/connection/**` | **134** = 132 行首 + 2 同行 | 70（`connectionSetupModel`）+ 39（`ConnectionSetupPanel`）+ 23（`useConnectionSetup`）+ 2 |
 | 类型检查 | **`tsc --noEmit` 退出码 0** | 本轮实跑（§7） |
-| vitest / lint / build | **本轮未运行** | 提交说明（`600a492`）声称 498 全绿、lint 0、build 0；`apps/mesa-web/dist` 时间戳 2026-10-18 19:42:23 |
-| 冻结面 | `connection/**`、`DescriptorFields*`、`ApplyWithRestart`、`resourceSelectionModel.ts`、`AddDeviceFlow*`、`tsconfig.json`、`vite.config.ts` **均不在 diff** | `git diff --name-only 2261178 HEAD` |
+| ESLint | **`eslint .` 退出码 0** | 本轮实跑（§7） |
+| 生产构建 | **`tsc -b && vite build` 退出码 0** | 本轮实跑；`dist/assets/index-Bn2eGD58.js` 1,304.30 kB |
+| 冻结面 | `connection/**`、`DescriptorFields*`、`ApplyWithRestart`、`resourceSelectionModel.ts`、`AddDeviceFlow*`、`tsconfig.json`、`vite.config.ts` **均不在本轮 diff** | `git diff --name-only 600a492` |
 
-> 说明：任务给定 PR #116 CI 绿；本轮未访问 CI，也未重跑 vitest/lint/build，故“全绿”只作为**外部给定事实**引用，不作为本轮独立证据。
+> 说明：远程 CI 由上级在提交/推送后取得；本轮只证明本地 vitest / tsc / lint / build 四项门禁全绿。A15/A24 的修复文件均在授权范围内，未触碰 Core/Driver/Proto/`AddDeviceFlow.tsx`/`resourceSelectionModel.ts` 算法。
 
 ## 2. A1–A44 逐条状态
 
 > 状态只有四类：**已落地** / **转 PR-D** / **被新裁决取代** / **部分**。
 > “被新裁决取代”特指 D7“服务端 Preview 取代前端编码器”（`nck-prc-start-review.md:100`、`:104`、`:112-113`、`:117`）。
-> 测试名均为静态读取；**本轮未运行 vitest**。
+> 测试名与行号为本轮实跑/静态定位；全量结果见 §1 与 §9。
 
 | # | 状态 | 实现证据（文件:行号） | 测试证据（文件:行号 / 用例名） | 备注 |
 |---|---|---|---|---|
@@ -55,7 +57,7 @@
 | A12 | 已落地 | `nckTaskBinding.ts:478-488`（原位替换、其它任务逐字保留） | `nckTaskBinding.test.ts:266`（跨 kind 保留）；`nckB.test.tsx:328` | — |
 | A13 | 已落地 | `nckCollectability.ts:48-130`；`EndpointAcquisitionPane.tsx:180-183,580-597`；`NckPointFields.tsx:120-125` | `nckCollectability.test.ts:47,64,78`；`EndpointAcquisitionPane.nck.test.tsx:214,367`；`nckB.test.tsx:236`；`NckPointFields.test.tsx:210` | UI 双执行 + 提交模型第三道（§4.2） |
 | A14 | 已落地 | `nckPointModel.ts:380-393`（entry 必填、不因 number 反推） | `nckPointModel.test.ts:138 drive_object_entry_is_explicit_and_never_inferred_from_number` | Golden 示例只作 datalist，不作闭集 |
-| A15 | **部分** | `NckPointFields.tsx:182-263`（Preview 失败/丢弃保持 disabled）；`ResourceBrowseAntd.tsx:235-236`（Browse 失败无节点） | `NckPointFields.test.tsx:405 preview_failure_keeps_submit_disabled_and_never_reuses_previous_key` | **缺口**：无“Browse 503 / 网络失败”专门用例；实现层 fail-closed，但矩阵点名的 Browse 失败分支未被测试钉死 |
+| A15 | 已落地 | `NckPointFields.tsx:182-263`（Preview 失败/丢弃保持 disabled）；`ResourceBrowseAntd.tsx:235-236`（Browse 失败无节点） | `ResourceBrowseAntd.test.tsx:340-366`（503 / 网络异常 / 响应不可解析三组，均断言无可操作语义叶、回调零调用）；`NckPointFields.test.tsx:405` | 缺口已关闭（收口修复） |
 | A16 | 已落地 | `browseModel.ts:87-90`（无 identity ⇒ null） | `browseModel.test.ts:44 leaf_without_identity_not_selectable (A16)`；`ResourceBrowseAntd.test.tsx:239` | — |
 | A17 | 已落地 | `browseModel.ts:71-84`（空信封/非法 JSON/非对象 ⇒ null） | `browseModel.test.ts:144,167,173` | 既有断言未放宽 |
 | A18 | 已落地 | `NckPointFields.tsx:319-328`（仅 `variable_id/definition_revision/target/arguments`）；`nckTaskBinding.ts:130-151` | `nckB.test.tsx:312-321`（`parameters` 恰 4 键） | 无 area_no/line/module/decode/transport_size |
@@ -64,7 +66,7 @@
 | A21 | **转 PR-D** | 组件能力：`ResourcePickerAntd.tsx:141-150,354-470`；Endpoint 页：`EndpointAcquisitionPane.tsx:910-940` | `ResourcePickerAntd.test.tsx:427 semantic_config_is_default_and_legacy_variable_entry_is_not_rendered` | **Endpoint 页已满足**；向导 `AddDeviceFlow.tsx:254-257` 未传 `semantic`，向导侧默认页仍是旧 Picker ⇒ PR-D |
 | A22 | **转 PR-D** | `ResourcePickerAntd.tsx:453-458`（旧入口整体不渲染）；`ResourceBrowseAntd.tsx:282-290`（旧 variable 信封阻断） | `ResourcePickerAntd.test.tsx:427`；`ResourceBrowseAntd.test.tsx:289 legacy_variable_fallback_is_not_offered_in_semantic_context (A22)` | 同上；向导侧未接线 |
 | A23 | 已落地 | `NckPointFields.tsx:594-617`（`<code>` 展示，无输入框） | `NckPointFields.test.tsx:484 readonly_key_and_conflict_blocks_add` | 表单无 display_name 字段，故“改 display_name 不影响 Key”恒成立 |
-| A24 | **部分** | `NckNativeFields.tsx:47-65,107-113,133-141` | `NckNativeFields.test.tsx:58 user_mode_requires_explicit_confirmation_and_preserves_key (A24/A25)` | **缺口**：`confirmed` 不随 `userKey` 编辑复位（`:124`）；存量 user 点位初始即 `confirmed=true`（`:53`）。首次确认门有效，但“Key 改动需二次确认”未被严格实现 |
+| A24 | 已落地 | `NckNativeFields.tsx:47-67`（默认模式/提交门）、`:55`（默认未确认）、`:109-115`（切 user 复位）、`:126-130`（改 Key 复位）、`:139-147`（显式确认） | `NckNativeFields.test.tsx:58`（首次确认）、`:113`（重开存量 user 点位未确认 + 改 Key 撤销）、`:144`（derived→user 重新确认） | 缺口已关闭（收口修复）；Key 仍经命名空间/语法/冲突校验 |
 | A25 | 已落地 | `nckNativeModel.ts:62-123,145-175`（原值保留、无自动 `~<n>`、冲突拒绝） | `NckNativeFields.test.tsx:58,79`；`nckNativeModel.test.ts:64,88` | 允许用户显式写 `~2`，但不自动追加；冲突由表单+父层+提交模型三层拒绝 |
 | A26 | 已落地 | `nckNativeModel.ts:77-83`（`native.` 前缀 + 语法） | `NckNativeFields.test.tsx:79`；`nckNativeModel.test.ts:64` | Driver 侧同口径：`compiler.rs:572-585` |
 | A27 | 已落地 | `nckNativeModel.ts:29-52`（恰 5 个寻址字段） | `nckNativeModel.test.ts:43 native_derived_key_uses_area_area_no_module_column_line_only`；`NckNativeFields.test.tsx:42` | 与 Driver `drivers/sinumerik-nck/src/definition.rs:1163-1176` 逐字同规则；见 §4.3 |
@@ -73,8 +75,8 @@
 | A30 | 已落地 | `NckPointFields.tsx:280-286`（切换变量重建空草稿） | `NckPointFields.test.tsx:106`（切到 drive_object 后 axis/argument 控件消失） | — |
 | A31 | 已落地 | 同上；`validateNckForm` 拒绝未声明变体 `nckPointModel.ts:344-357` | `NckPointFields.test.tsx:106`；`nckPointModel.test.ts:119` | channel/axis 不残留 |
 | A32 | 已落地 | `NckPointFields.tsx:468-480`（受控 `onChange`，无 blur 依赖） | `nckB.test.tsx:298-321`（`user.type` 后直接点击，无 blur，载荷为当前值） | — |
-| A33 | 已落地（静态） | `git diff --name-only 2261178 HEAD` 无冻结文件；`connection/**` 134 用例 | 本轮静态计数；**未跑 vitest** | “原样通过”依赖 CI/提交说明；本轮只证明“文件未改、用例数未降” |
-| A34 | 已落地（静态） | 43 文件 / 498 用例 | 本轮静态计数；**未跑 vitest** | ≥383 基线成立 |
+| A33 | 已落地 | `git diff --name-only 600a492` 无冻结文件；`connection/**` 134 用例 | 本轮实跑 vitest（43 文件 / 503 用例全绿） | “原样通过”由本轮全量 vitest 证明；冻结文件未改 |
+| A34 | 已落地 | 43 文件 / 503 用例 | 本轮实跑 vitest 退出码 0 | ≥383 基线成立（较上轮 498 增 5，全部来自 A15/A24 回归） |
 | A35 | 已落地 | grep 生产代码：`area_no/transport_size/unit_mode/F32_BE` 仅 `nckNativeModel.ts`、`NckNativeFields.tsx` | 本轮 grep（§7） | 属 A27 明文允许的 native 例外；语义路径零命中 |
 | A36 | 已落地 | `resourceSelectionModel.ts` 未在 diff；算法 `:169-377` 未改 | `deviceModel.test.ts:236-373`（既有用例未改） | 冻结算法本体 |
 | A37 | 已落地 | `endpointSavePlan.ts:97-107`（快照门最前） | `endpointSavePlan.test.ts:147`；`deviceModel.test.ts:518-534`；`EndpointAcquisitionPane.nck.test.tsx:240` | 矩阵建议文件写 `saveIssues.test.tsx`，实际快照门用例在 `nck.test.tsx` |
@@ -88,10 +90,10 @@
 
 ### 2.1 计数
 
-- 已落地：**35**（A1、A6–A14、A16–A20、A23、A25–A40、A42–A44）
+- 已落地：**37**（A1、A6–A15、A16–A20、A23–A40、A42–A44）
 - 被新裁决取代：**5**（A2、A3、A4、A5、A41）
 - 转 PR-D：**2**（A21、A22）
-- 部分：**2**（A15、A24）
+- 部分：**0**
 
 ### 2.2 第三批（`600a492`）声称项的独立复核
 
@@ -104,39 +106,47 @@
 | A8 语义模式不用 12 原生 schema | **真落地** | `NckPointFields.tsx:445-574`（定义驱动）；`ResourcePickerAntd.tsx:141-150`（语义模式整体替换旧 manual 页） |
 | A21 语义默认入口 | **组件层落地；生产向导未接线** | `ResourcePickerAntd.test.tsx:427`（静态用例）；`AddDeviceFlow.tsx:254-257` 未传 `semantic` ⇒ PR-D |
 | A22 旧入口阻断 | **组件层落地；生产向导未接线** | `ResourceBrowseAntd.test.tsx:289`、`ResourcePickerAntd.tsx:453-458`；向导同上 |
-| A24 user 显式确认 | **部分** | 首次确认门有用例（`NckNativeFields.test.tsx:58`，静态）；但 `confirmed` 不随 Key 编辑复位（`:124`），存量 user 点位初始已确认（`:53`） |
+| A24 user 显式确认 | **真落地（收口修复）** | `NckNativeFields.tsx:55,109-115,126-130,139-147`；`NckNativeFields.test.tsx:58,113,144` |
 | A25 Key 原值保留、冲突拒绝 | **真落地** | `nckNativeModel.ts:62-123,164-174`；`NckNativeFields.test.tsx:58,79` |
 | A26 `native.` 命名空间 | **真落地** | `nckNativeModel.ts:77-83`；`NckNativeFields.test.tsx:79` |
 | A27 derived 固定规则 | **真落地** | `nckNativeModel.ts:29-52`；`nckNativeModel.test.ts:43`；与 `drivers/sinumerik-nck/src/definition.rs:1163-1176` 同规则 |
 
-**结论**：第三批声称的 11 项中，**8 项真落地、2 项仅组件层（向导转 PR-D）、1 项部分（A24）**。
+**结论**：第三批声称的 11 项中，**9 项真落地、2 项仅组件层（向导转 PR-D）、0 项部分**。A24 已在收口修复中关闭。
 
 
 ## 3. 遗漏项结论（本轮最重要）
 
 ### 3.1 结论
 
-**除“已被 D7 取代的编码器类”与“已转 PR-D 的向导接线类”外，PR-C 没有完全未落地的强制 A 项。**
-但**不能**声称“44/44 全绿”：有 **2 个部分项**（A15、A24）和 **1 个门禁字面冲突**（G5）。
+**除“已被 D7 取代的编码器类”与“已转 PR-D 的向导接线类”外，PR-C 的强制 A 项已全部落地。**
+44 行现为 **37 已落地 / 5 被取代 / 2 转 PR-D / 0 部分**；G5 已按裁决豁免。剩余未完成项只有：
+**真实 API 集成验收**（§5）与 **PR-D 向导接线**（不在 PR-C 范围）。
 
-### 3.2 A15 的缺口（测试，不是实现）
+### 3.2 A15 关闭记录（测试缺口已补）
 
-- 实现：Browse 失败时 `nodes=[]`（`ResourceBrowseAntd.tsx:235-236`），语义叶无“选用”入口；提交侧 Preview 失败保持 disabled（`NckPointFields.tsx:243-258`）。
-- 缺：没有“Browse 返回 503/网络异常 ⇒ 语义模式禁止提交且不生成猜测 Key”的组件级用例。矩阵点名的 `browseModel.test.ts` 是纯解析测试，不覆盖网络失败。
-- 影响：数据安全上仍是 fail-closed；**验收证据链**不完整。
+- 新增 `ResourceBrowseAntd.test.tsx:340-366`，三组用例：
+  `browse_http503_failure_never_offers_semantic_leaf`、
+  `browse_network_failure_never_offers_semantic_leaf`、
+  `browse_unparseable_failure_never_offers_semantic_leaf`。
+- 三种情况均断言：无“选用（语义）”、无“选用”、`onFill`/`onSemanticSelect` 零调用。
+- 503 / 网络异常显示“浏览不可用”；响应体不可解析按空页处理，不猜节点。
+- 未改 `ResourceBrowseAntd` 请求层：现有 fail-closed 实现已正确，测试未暴露旁路。
+- 本轮实跑：`ResourceBrowseAntd.test.tsx` 12 用例通过。
 
-### 3.3 A24 的缺口（语义，不只是测试）
+### 3.3 A24 关闭记录（确认状态已修）
 
-- `NckNativeFields.tsx:133-141` 的复选框只在“首次从 derived 切到 user”时复位（`:112`）。
-- `userKey` 的 `onChange`（`:124`）**不复位** `confirmed`：用户勾选确认后再改 Key，仍可直接提交。
-- 存量 `user` 点位重开时 `initialMode==="user"` ⇒ `confirmed` 初始为 `true`（`:53`），不要求再次确认。
-- 影响：Key 仍经过 `native.` 命名空间/语法/冲突校验，不是数据安全漏洞；但与 A24 字面“Key 改动需二次确认”不一致。建议由评审裁决：补“Key 变更即复位确认”，或改写 A24 文案。
+- `NckNativeFields.tsx:55`：`confirmed` 初始恒为 `false`；重开已有 user 点位也只展示原 Key。
+- `NckNativeFields.tsx:109-115`：每次选择 user 模式都复位确认。
+- `NckNativeFields.tsx:126-130`：任何 Key 编辑立即 `setConfirmed(false)`。
+- `NckNativeFields.tsx:139-147`：只有显式勾选才恢复确认。
+- 新增 `NckNativeFields.test.tsx:113`（存量 user 点位未确认、改 Key 撤销、重新确认后可提交）与 `:144`（derived→user 必须重新确认）。
+- 本轮实跑：`NckNativeFields.test.tsx` 6 用例通过。
 
-### 3.4 是否阻塞 PR-C
+### 3.4 阻塞状态
 
-- 若验收口径要求“A 项逐条可执行证据”：A15/A24 阻塞。
-- 若验收口径只要求“数据安全红线 + 主链可提交”：不阻塞，但必须在验收材料中登记为遗留。
-- 本轮不给合并结论；按授权只给核查事实。
+- A15/A24 的阻塞已解除；前端门禁（vitest/tsc/lint/build）本轮全绿。
+- 仍 HOLD：真实 API 集成验收（需单独授权）、PR-D 向导接线、PR #116 合并。
+- 本轮不执行提交/推送；最终合并审查由上级在取得远程 CI 后进行。
 
 ### 3.5 非 NCK 的“零行为变化”有一个有意例外
 
@@ -220,23 +230,24 @@
 | V7 | 错误路径 | 可制造 503/501/413/400 的桩或断连 | Preview/Browse 失败时 `加入`/保存 disabled；错误码按 `kind` 展示；不回退 Browse Key | **未执行** |
 
 > 说明：V2/V3 的最终裁决在 Driver Configure（D11），前端单测无法证明“真实 Key 与 Driver 重算一致”；V5 才能证明“保存 → 启动 → 出值”闭环。
+> A15/A24 的前端回归已在本轮关闭（§3.2/§3.3），但**不能替代** V1–V7 的真实 API 证据；尤其 V2（Native Derived 能否被真实 Configure 接受）与 V3（User Key 原值/冲突/命名空间）仍必须在隔离 mesad 环境执行。
 
 ## 6. 无法确认 / 新发现的矛盾（如实登记）
 
-1. **G5 门禁字面冲突（最重要）**：边界文档 G5 要求 `nck-point-key-golden` 命中集合“恰为 {Core, Driver, 前端}”（`nck-prc-frontend-semantic-config-boundary.md:1274`）。D7 删除前端编码器后，实际命中只有 `crates/core-types/src/point.rs:987`、`drivers/sinumerik-nck/tests/compiler_identity.rs:24,1029`，**前端 0 命中**。这不是代码缺陷，但**门禁文本必须改写或由评审豁免**，否则 PR-C 无法按原文宣称 G5 通过。
-2. **实施清单状态未回写**：`nck-prc-implementation-checklist.md:58` 写 P0-3“未开始（第二批 B）”、`:71` 写 P0-4“未开始（第二批 B）”，但 `nckCatalog.ts`/`NckPointFields.tsx` 已落地；该文件 `:7` 的基线“35 文件 / 405 用例”也已过期（现 43/498）。属文档滞后，不影响代码，但验收材料不能直接引用。
+1. **G5 门禁：已裁决豁免（不再是冲突）**。原 G5 要求 `nck-point-key-golden` 命中集合“恰为 {Core, Driver, 前端}”（`nck-prc-frontend-semantic-config-boundary.md:1274`）；D7 删除前端编码器后，实际命中只有 `crates/core-types/src/point.rs:987`、`drivers/sinumerik-nck/tests/compiler_identity.rs:24,1029`，前端 0 命中。**裁决**：G5 新口径为 ① Core/Driver 原有 Golden 测试继续通过；② 前端语义身份编码器必须不存在；③ 前端生产代码不得直接依赖 Golden；④ 不新增副本、不复制身份编码算法；⑤ 前端只验证权威 Preview 响应与当前输入的一致性。该勘误仅适用于 PR-C 的 G5。
+2. **实施清单状态未回写**：`nck-prc-implementation-checklist.md:58` 写 P0-3“未开始（第二批 B）”、`:71` 写 P0-4“未开始（第二批 B）”，但 `nckCatalog.ts`/`NckPointFields.tsx` 已落地；该文件 `:7` 的基线“35 文件 / 405 用例”也已过期（现 43/503）。属文档滞后，不影响代码，但验收材料不能直接引用。
 3. **A42 字面张力**：A42 写“不得由 `identity.keys` 推断 `arguments[]` 的类型/范围/必填”，但 `nckPointModel.ts:205-220` 会把 `identity_keys` 命中的 argument 标记为必填（仅收紧）。依据是 Driver 在身份层优先报 `MISSING_IDENTITY_KEY`（`drivers/sinumerik-nck/src/definition.rs:1060-1074`），行为正确；建议在验收材料中把“不得推断”限定为“不得用 keys 替代缺失的 `arguments[]` 元数据/不得据此放行”。
 4. **A6 字面张力**：A6 写 `{drive_object}` “只渲染一个”，实际渲染 number+entry 两个输入（`NckPointFields.tsx:462-515`），这是 TargetRef `{number,entry}` 的必需形状；应理解为“一个 Target 变体/一行”，不是“一个 input”。
-5. **A24 确认态不复位**（§3.3）：建议补“Key 编辑即复位 confirmed”或改写验收文字。
+5. **A24 确认态：已关闭**（§3.3）。`confirmed` 默认 false；选 user、改 Key、derived↔user 均复位；存量 user 点位重开需重新确认。新增两条组件级测试。
 6. **Native user 的 area 语法比 Core 更严**：前端 `[A-Z]+`（`nckNativeModel.ts:110`）vs Core `is_ascii_alphabetic`（`crates/core-types/src/point.rs:474`）。不会放行非法 Key，但会拒绝 Core/Driver 本可接受的 `native.c...`；是否放宽**待确认**。
 7. **Native derived 无服务端 Preview**：A27 允许前端按冻结规则生成，但一旦 TS 规则漂移，只有 Configure D11 能发现。建议把“native derived 保存成功”列入 V2，并考虑在 PR-D 增加 native derived 的 identity-preview 调用（**待确认**是否属于本阶段范围）。
 8. **Picker 语义模式的提交模型缺口**（§4.2）：当前无生产路径；PR-D 接线时若只把 `onAddPoint` 结果塞进 `selections` 而不走 `planEndpointTaskSave`，就会形成 scope 旁路。必须在 PR-D 设计里写死。
 9. **`validateNckTaskSubmission` 对 native 只校验信封**：`nckTaskBinding.ts:397-400` 直接放行 `nck_native`，原生字段 Schema 校验只在 Endpoint 页 `verifyOne`（`EndpointAcquisitionPane.tsx:217-254`）。若未来有别的调用方直接调保存计划，native 字段不会被模型层复核。
 10. **`buildNckFormModel` 把缺失 `arguments` 当空数组**：`nckPointModel.ts:195-203` 只在 `arguments !== undefined` 时校验类型，`:221` 用 `?? []`。I-2 目录契约要求 `arguments` 必填（`nckCatalog.ts:362-368`），故生产路径不会触发；测试注入的宽松定义可绕过“完整元数据”字面（A43）。
-11. **A15 的 Browse 503 用例缺失**（§3.2）；**A21/A22 向导接线**（§2）属 PR-D，不计入 PR-C 缺陷。
-12. **G11 生产构建未复跑**：`apps/mesa-web/dist` 存在（时间戳 2026-10-18 19:42:23），提交说明称 build 退出码 0；本轮未运行，不能独立证明。D7 后前端不再 import golden fixture，G11 的原始风险（Vite `fs.allow`）已基本消失。
+11. **A15 的 Browse 网络失败用例：已关闭**（§3.2，新增 3 条）；**A21/A22 向导接线**（§2）属 PR-D，不计入 PR-C 缺陷。
+12. **G11 生产构建：本轮已执行并通过**（`tsc -b && vite build` 退出码 0）。D7 后前端不再 import golden fixture，G11 的原始风险（Vite `fs.allow`）不再触发。
 
-## 7. 实际运行过的命令（全部只读）
+## 7. 实际运行过的命令（git 只读；本轮有授权内代码/测试修改与构建）
 
 ```text
 git rev-parse --abbrev-ref HEAD
@@ -248,20 +259,47 @@ git diff --stat HEAD~1 HEAD
 git diff --stat 2261178 HEAD
 git diff --name-only 2261178 HEAD
 git diff 2261178 HEAD -- apps/mesa-web/src/components/EndpointAcquisitionPane.tsx
+git diff --stat                                # 本轮收口修改
+git diff --name-only 600a492                   # 本轮修改面
+git diff --check                               # 空白/冲突标记检查，退出码 0
 Get-ChildItem apps/mesa-web/src -Recurse -File -Include *.ts,*.tsx
 Get-ChildItem apps/mesa-web/src -Recurse -File -Include *.test.ts,*.test.tsx
 Get-Content / Select-String（静态计数、用例名、行号定位、grep 红线）
-C:\Users\34268\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe \
-  D:\Mine\Project\mesa\apps\mesa-web\node_modules\typescript\bin\tsc \
-  --noEmit -p apps/mesa-web/tsconfig.json      # 退出码 0
+node <pnpm.mjs> --dir apps/mesa-web exec vitest run \
+  src/components/NckNativeFields.test.tsx src/components/ResourceBrowseAntd.test.tsx
+node <pnpm.mjs> --dir apps/mesa-web test          # 43 文件 / 503 用例，退出码 0
+node <pnpm.mjs> --dir apps/mesa-web typecheck     # tsc --noEmit，退出码 0
+node <pnpm.mjs> --dir apps/mesa-web lint          # eslint .，退出码 0
+node <pnpm.mjs> --dir apps/mesa-web build         # tsc -b && vite build，退出码 0
 ```
 
-- **未运行**：`pnpm test` / `vitest`、`pnpm lint`、`pnpm build`、`cargo build/test`、`mesad`、Vite、任何安装。
-- **未连接**任何设备/机床；**未执行**任何 git 写操作。
+- **未运行**：`cargo build/test`、`mesad`、Vite dev server、任何安装。
+- **未连接**任何设备/机床；**未执行**任何 git 写操作（commit/push/checkout/stash/reset/PR/tag）。
 
 ## 8. 声明
 
-- 本轮**只新建** `docs/design/nck-prc-acceptance-review.md` 一个文件；**未修改**任何生产代码、测试、配置或其它文档。
+- 本轮按裁决做**限定范围**修改：`apps/mesa-web/src/components/NckNativeFields.tsx`（A24）、
+  `apps/mesa-web/src/components/NckNativeFields.test.tsx`（A24 回归）、
+  `apps/mesa-web/src/components/ResourceBrowseAntd.test.tsx`（A15 回归），并更新本文件。
+- **未修改** Core / Driver / Proto / `apps/mesad` / `AddDeviceFlow.tsx` / `resourceSelectionModel.ts` 算法 /
+  其它冻结文件 / 配置。
 - **未执行** commit / push / checkout / stash / reset / PR / tag；只读 git。
-- **未启动** `mesad` / Vite；**未连接**设备；**未安装**依赖。
-- 文中所有 `文件:行号` 均按 `600a492` 读取；测试名与用例数为**静态读取**，未运行 vitest；推断性结论已标“待确认”或写入 §6。
+- **未启动** `mesad` / Vite dev server；**未连接**设备；**未安装**依赖。
+- 本轮**实际运行** vitest（43 文件 / 503 用例）、`tsc --noEmit`、`eslint .`、`tsc -b && vite build`，均退出码 0；
+  远程 CI 由上级在提交/推送后取得。
+- 文中所有 `文件:行号` 按本轮工作树读取；A15/A24 的关闭证据见 §3.2/§3.3，门禁结果见 §9。
+
+## 9. 最后一轮收口修复记录
+
+| 项 | 内容 |
+|---|---|
+| A24 代码 | `NckNativeFields.tsx:55` 默认未确认；`:109-115` 选 user 复位；`:126-130` 改 Key 复位；`:139-147` 显式确认 |
+| A24 测试 | `NckNativeFields.test.tsx:113 existing_user_point_is_unconfirmed_and_requires_reconfirmation (A24)`；`:144 switching_derived_and_back_to_user_requires_reconfirmation (A24)` |
+| A15 测试 | `ResourceBrowseAntd.test.tsx:340-366`：`browse_http503_failure_never_offers_semantic_leaf`、`browse_network_failure_never_offers_semantic_leaf`、`browse_unparseable_failure_never_offers_semantic_leaf` |
+| G5 | 按裁决豁免；复核结果：前端生产代码 **0 引用** `nck-point-key-golden`、**0 份** Golden 副本、**无**语义身份编码器；`suggestPointKey` 仅存在于非语义 Picker（`ResourcePickerAntd.tsx:73-83`，语义模式 `:141-150` 提前返回）。新口径见 §6-1 |
+| Vitest | **43 文件 / 503 用例全部通过**（较上轮 498 增 5：A15 三例 + A24 两例） |
+| TypeScript | `tsc --noEmit` 退出码 0 |
+| ESLint | `eslint .` 退出码 0 |
+| 生产构建 | `tsc -b && vite build` 退出码 0（dist 已重新生成） |
+| 未提交 | 工作树变更待上级审阅；提交/推送/远程 CI 需再次明确授权 |
+| 仍 HOLD | 真实 API 集成验收（§5）、PR-D 向导接线、PR #116 合并 |

@@ -50,7 +50,9 @@ export function NckNativeFields({
   const [userKey, setUserKey] = useState(
     initialMode === "user" ? initialPoint?.point_key ?? "" : "",
   );
-  const [confirmed, setConfirmed] = useState(initialMode === "user");
+  // A24：即使重开已有 user 点位，也只展示原 Key，默认**未确认**；本次保存前
+  // 必须由用户重新勾选。确认态只对「当前这一次 Key」有效：任何键入都会撤销。
+  const [confirmed, setConfirmed] = useState(false);
   const [submitError, setSubmitError] = useState("");
 
   const issues = validateNativeFields(schema, values);
@@ -121,7 +123,11 @@ export function NckNativeFields({
             data-testid="nck-native-user-key"
             aria-label="native-user-key"
             value={userKey}
-            onChange={(e) => setUserKey(e.target.value)}
+            onChange={(e) => {
+              setUserKey(e.target.value);
+              // A24：Key 一变，上一次确认立即失效（防止「确认后偷改」）。
+              setConfirmed(false);
+            }}
             placeholder="native.<area>.<area_no>.<module>.<column>.<line>"
             status={!userCheck.ok && userKey !== "" ? "error" : undefined}
           />
