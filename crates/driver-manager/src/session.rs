@@ -24,6 +24,21 @@ use tokio_util::sync::CancellationToken;
 /// 应拆分流程而非调大超时。
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// I-2 管理面单 RPC 预算（DC §6.4-①-④）。
+///
+/// 为什么**不是**通用 `REQUEST_TIMEOUT`（10s）：I-2 的目录/预览 RPC 与
+/// `GetDescriptor` 是**同一形态**（driver 作用域、无连接、单 RPC、JSON 透传），
+/// 复用它 5s 的取值才能让「一次调用最坏上界」可算（启动 6s + RPC 5s，attempt ≤ 2）。
+/// 反过来，若照抄通用 `call()` 的 10s，单次最坏会变成 2 × (6 + 10) = 32s，
+/// 且 10s 会先于 5s 命中，使 I38 的「RPC 超时必须 ≤5s」断言失效。
+///
+/// 为什么不能直接把 `REQUEST_TIMEOUT` 调小：它同时约束 Configure/Stop/Write
+/// 等所有管理 RPC，缩小会让正常路径误伤。故 I-2 用**专用**预算，全局值不动。
+pub const DEFINITIONS_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 管理面 JSON 载荷上限（DC §6.4-①-②）：与 descriptor 的 256 KiB 门同口径。
+pub const MANAGEMENT_JSON_MAX_BYTES: usize = 256 * 1024;
+
 /// Probe 路径单次 RPC 上限（C1 §6.3）。
 ///
 /// 为什么单独开一个更大的值：探测路径上**协议握手发生在 `Probe` RPC 内**
@@ -140,6 +155,13 @@ pub enum SessionError {
     /// 干等超时。调用方用 matches! 做精确路由。
     #[error("event plane unsupported (negotiated minor {negotiated} < {required})")]
     EventPlaneUnsupported { negotiated: u32, required: u32 },
+    /// I-2：管理面 JSON 超过 256 KiB 门（DC §6.4-①-② / E4）。
+    ///
+    /// 为什么用独立变体而不是 `Handshake("too large")` 字符串：调用方必须能
+    /// **精确**映射为 `DEFINITION_QUERY_TOO_LARGE`（503），而 `SessionError` 的
+    /// 约定是「结构化路由、禁止 contains() 回猜」（见 `Driver` 变体注释）。
+    #[error("management json too large: {bytes} bytes > {limit} bytes")]
+    ManagementJsonTooLarge { bytes: usize, limit: usize },
 }
 
 /// 临时操作启动阶段（Core 可观测粒度）：startup transport 失败时直接定位
@@ -680,6 +702,92 @@ impl Session {
                 // 校验 JSON 可解析性由调用方完成，此处仅透传
                 Ok((d.contract_major, d.contract_minor, d.descriptor_json))
             }
+            _ => Err(SessionError::Closed),
+        }
+    }
+
+    /// I-2 定义目录 RPC（DC §4.6）：与 [`Session::get_descriptor`] **逐字同形态**
+    /// ——5s 专用预算（[`DEFINITIONS_RPC_TIMEOUT`]）+ 256 KiB 门（[`MANAGEMENT_JSON_MAX_BYTES`]）。
+    ///
+    /// `request_json` 是**不透明查询 JSON**：本层不解析任何键
+    ///（`family`/`variable_id`/`revision`/`limit`/`cursor` 的语义只属于 Driver），
+    /// 只负责「发帧 + 等应答 + 大小门 + 错误分类」。**不查 `entries`**：目录是驱动
+    /// 能力查询，零 Connection 条目也必须能应答（对照 `on_browse` 需要已开连接）。
+    ///
+    /// 错误分类（供 Manager 精确映射，不做字符串回猜）：
+    /// - Driver 报 `ok=false` ⇒ [`SessionError::Driver`]（kind/code 原样保留）；
+    /// - 5s 内无应答 ⇒ [`SessionError::Timeout`]；
+    /// - 载荷超 256 KiB ⇒ [`SessionError::ManagementJsonTooLarge`]。
+    pub async fn definitions(&self, request_json: &str) -> Result<String, SessionError> {
+        let reply = self
+            .call_with_timeout(
+                pb::envelope::Body::GetDefinitions(pb::GetDefinitions {
+                    request_json: request_json.to_string(),
+                }),
+                DEFINITIONS_RPC_TIMEOUT,
+            )
+            .await?;
+        match reply.body {
+            Some(pb::envelope::Body::DefinitionsReport(r)) => match r.result {
+                Some(res) if res.ok => {
+                    if r.definitions_json.len() > MANAGEMENT_JSON_MAX_BYTES {
+                        return Err(SessionError::ManagementJsonTooLarge {
+                            bytes: r.definitions_json.len(),
+                            limit: MANAGEMENT_JSON_MAX_BYTES,
+                        });
+                    }
+                    // JSON 语义校验（可解析性/条目数）由 Manager 承担：本层只透传。
+                    Ok(r.definitions_json)
+                }
+                Some(res) => {
+                    let d = res.error.unwrap_or_default();
+                    Err(SessionError::Driver {
+                        kind: d.kind,
+                        code: d.code,
+                        message: d.message,
+                    })
+                }
+                None => Err(SessionError::Closed),
+            },
+            _ => Err(SessionError::Closed),
+        }
+    }
+
+    /// I-2 权威身份预览 RPC（DC §5）：与 [`Session::definitions`] 同形态
+    /// （5s 预算 + 256 KiB 门 + 零 Connection 条目）。
+    ///
+    /// 请求与结果都是**不透明 JSON**：预览的接受/拒绝面（D1–D10）与身份算法
+    /// 完全在 Driver 内，Core/Manager 不解释、不重排、不裁剪。
+    pub async fn preview_point_key(&self, request_json: &str) -> Result<String, SessionError> {
+        let reply = self
+            .call_with_timeout(
+                pb::envelope::Body::PreviewPointKey(pb::PreviewPointKey {
+                    request_json: request_json.to_string(),
+                }),
+                DEFINITIONS_RPC_TIMEOUT,
+            )
+            .await?;
+        match reply.body {
+            Some(pb::envelope::Body::PreviewIdentityReport(r)) => match r.result {
+                Some(res) if res.ok => {
+                    if r.result_json.len() > MANAGEMENT_JSON_MAX_BYTES {
+                        return Err(SessionError::ManagementJsonTooLarge {
+                            bytes: r.result_json.len(),
+                            limit: MANAGEMENT_JSON_MAX_BYTES,
+                        });
+                    }
+                    Ok(r.result_json)
+                }
+                Some(res) => {
+                    let d = res.error.unwrap_or_default();
+                    Err(SessionError::Driver {
+                        kind: d.kind,
+                        code: d.code,
+                        message: d.message,
+                    })
+                }
+                None => Err(SessionError::Closed),
+            },
             _ => Err(SessionError::Closed),
         }
     }
@@ -2040,5 +2148,36 @@ mod tests {
             rig.finish_ok().await;
             assert_eq!(rig.seqs_asc(), vec![1, 2, 3]);
         }
+    }
+    /// I38-T4 / DC §6.4-①-④：超时预算常量**冻结**。
+    ///
+    /// 为什么用常量断言而不是只靠集成用例的墙钟：并行跑整套合同测试时，
+    /// 单核争抢会把 5s 的预算放大到 10s+（实测），墙钟上界因此不再能区分
+    /// 「用了 5s 专用预算」还是「误用 10s 通用超时」。这条断言把区分点钉在
+    /// **常量本身**（确定性），集成用例只保留「真的等满预算」的下界与有界上界。
+    #[test]
+    fn definitions_rpc_budget_constants_are_frozen() {
+        assert_eq!(
+            DEFINITIONS_RPC_TIMEOUT,
+            Duration::from_secs(5),
+            "I-2 管理面 RPC 必须是 5s 专用预算（与 get_descriptor 同形态）"
+        );
+        assert_eq!(
+            REQUEST_TIMEOUT,
+            Duration::from_secs(10),
+            "I38-T4：通用 REQUEST_TIMEOUT 不得为 I-2 调大"
+        );
+        assert_eq!(
+            MANAGEMENT_JSON_MAX_BYTES,
+            256 * 1024,
+            "I-2 载荷门必须与 descriptor 的 256 KiB 门同口径"
+        );
+        // I38-T3：attempt 上限是「最坏 22s」这个上界的另一半（2 × (6s + 5s)）。
+        // 常量冻结 + T1 的实测耗时形态（≈2 × 5s）共同证明没有第三次重建。
+        assert_eq!(
+            crate::temp_op::MAX_TEMP_ATTEMPTS,
+            2,
+            "I38-T3：临时进程 attempt 上限必须保持 2"
+        );
     }
 }

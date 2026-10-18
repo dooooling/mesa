@@ -347,11 +347,65 @@ impl<'a> AddressCompiler<'a> {
         }
     }
 
-    /// 语义分支：定义目录 → `addressing` 组装 12 原生字段 → 复用原生解析链。
+    /// 权威身份预览（I-2 / DC §5.4.1）：与 Configure **共用** D1–D10 + 身份重算，
+    /// **只跳过 D11**（持久化 Key 比对）。
+    ///
+    /// 为什么必须这样拆：D11 的语义是「持久化 Key == 重算 Key」，而预览阶段
+    /// 持久化 Key 还不存在（先有鸡后有蛋）。**这不是**跳过 D1–D10 的理由，
+    /// 更**不是**「只调 `canonical_identity`」的捷径——反例：`channel=255` 能过
+    /// Target 校验却在原生解析失败，只调 `canonical_identity` 会给出一个
+    /// **在 Configure 必然失败**的「权威 Key」。
+    ///
+    /// `nck_native` + `identity_mode="user"`：Key 由用户显式指定，Driver 不重算、
+    /// 不静默改名，因此**没有**可重算的权威身份 ⇒ 明确拒绝（P0-2）。
+    /// 判定顺序刻意放在 D1–D10 **之后**：先与 Configure 走同一条校验链，
+    /// 再给出「此次请求能否生成身份」这一预览专属结论（避免两条路径的
+    /// 错误优先级不同）。
+    pub fn preview_point_key(
+        &self,
+        point_kind: &str,
+        parameters: &Map<String, Value>,
+    ) -> Result<CompiledPoint, CompileError> {
+        match point_kind {
+            POINT_KIND_VARIABLE => self.compile_semantic_checked(parameters),
+            POINT_KIND_NATIVE => {
+                let compiled = self.compile_native_checked(parameters)?;
+                if compiled.identity_mode == IdentityMode::User {
+                    return Err(CompileError::invalid_binding_config(
+                        "`identity_mode=\"user\"` 的身份由用户显式指定（Driver 不重算、不静默改名、\
+                         不自动追加 `~<n>` 后缀），没有可由 Driver 重算的权威身份 ⇒ 拒绝作为身份预览请求；\
+                         请改用 derived 模式，或直接提交你已确认的 user Key",
+                    ));
+                }
+                Ok(compiled)
+            }
+            other => Err(CompileError::UnsupportedPointKind {
+                kind: other.to_string(),
+            }),
+        }
+    }
+
+    /// 语义分支（Configure 全链）= **D1–D10 + 身份重算**（[`Self::compile_semantic_checked`]）
+    /// + **D11**（[`Self::check_identity`]，唯一执行真值）。
+    ///
+    /// 拆分的唯一目的：让预览复用同一段校验/算法而只跳过 D11（M10）。
+    /// **不得**在别处复制该前半段——那会变成第二套身份算法。
     fn compile_semantic(
         &self,
         parameters: &Map<String, Value>,
         persisted_point_key: &str,
+    ) -> Result<CompiledPoint, CompileError> {
+        let compiled = self.compile_semantic_checked(parameters)?;
+        self.check_identity(persisted_point_key, &compiled)?;
+        Ok(compiled)
+    }
+
+    /// **D1–D10 + 身份重算**（语义分支）——Configure 与 Preview 的**唯一**共用前半段。
+    ///
+    /// 语义分支：定义目录 → `addressing` 组装 12 原生字段 → 复用原生解析链。
+    fn compile_semantic_checked(
+        &self,
+        parameters: &Map<String, Value>,
     ) -> Result<CompiledPoint, CompileError> {
         // D2：参数层未知键即拒（`identity_mode` 亦不允许用于语义点位，B-3）。
         for key in parameters.keys() {
@@ -394,9 +448,9 @@ impl<'a> AddressCompiler<'a> {
             resolve_native(address.clone()).map_err(|e| CompileError::InvalidVariable {
                 reason: format!("`{variable_id}` resolve_native 失败：{e}"),
             })?;
-        // D11：先用**已验证的语义字段**重算身份，再与持久化 Key 比对。
+        // 身份重算：用**已验证的语义字段**算 canonical identity（D11 比对在调用方）。
         let canonical_identity = def.canonical_identity(&target, arguments)?;
-        let compiled = CompiledPoint {
+        Ok(CompiledPoint {
             source_label: address.source_label(),
             address,
             resolved,
@@ -407,16 +461,26 @@ impl<'a> AddressCompiler<'a> {
             }),
             canonical_identity,
             identity_mode: IdentityMode::Derived,
-        };
-        self.check_identity(persisted_point_key, &compiled)?;
-        Ok(compiled)
+        })
     }
 
-    /// 原生分支：按 C3 的 7 步流程处理 `identity_mode` 后**完全复用**既有解析。
+    /// 原生分支（Configure 全链）：`compile_native_checked` + D11。
     fn compile_native(
         &self,
         parameters: &Map<String, Value>,
         persisted_point_key: &str,
+    ) -> Result<CompiledPoint, CompileError> {
+        let compiled = self.compile_native_checked(parameters)?;
+        self.check_identity(persisted_point_key, &compiled)?;
+        Ok(compiled)
+    }
+
+    /// **D1–D10 + 身份重算**（原生分支）——Configure 与 Preview 的**唯一**共用前半段。
+    ///
+    /// 原生分支：按 C3 的 7 步流程处理 `identity_mode` 后**完全复用**既有解析。
+    fn compile_native_checked(
+        &self,
+        parameters: &Map<String, Value>,
     ) -> Result<CompiledPoint, CompileError> {
         // 第 2–4 步：全量严格校验（含 identity_mode）+ 构建**只含 12 原生字段**的独立 map。
         let (native, identity_mode) = Self::split_native_parameters(parameters)?;
@@ -431,16 +495,14 @@ impl<'a> AddressCompiler<'a> {
                 reason: e.to_string(),
             })?;
         let canonical_identity = native_identity_key(&address);
-        let compiled = CompiledPoint {
+        Ok(CompiledPoint {
             source_label: address.source_label(),
             address,
             resolved,
             definition: None,
             canonical_identity,
             identity_mode,
-        };
-        self.check_identity(persisted_point_key, &compiled)?;
-        Ok(compiled)
+        })
     }
 
     /// **C3 步骤 2–4**：严格校验完整参数集合（12 原生字段 + 可选 `identity_mode`），
