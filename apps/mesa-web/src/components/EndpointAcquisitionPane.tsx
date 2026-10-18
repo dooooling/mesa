@@ -1,12 +1,16 @@
-// Endpoint 采集配置窗格（Workspace「采集」tab；逻辑由 DeviceDetail 点位
-// Modal 原样迁移）。保存路径**按 Endpoint 的 Driver 分流**（第二批 A）：
-// - 非 NCK：编辑唯一 canonical（mesa.resources.v1）任务，其余任务原样保留；
-// - NCK：编辑唯一 `nck.points.v1` 任务（`{points:[…]}`），其余任务原样保留。
-// 两种 binding 的 `config` 结构不同，**不是**可互换的两种写法——混用会写出
-// 驱动程序整体拒绝的配置（连原有正确任务一起启动失败），因此这里不按"名字"
-// 判断，一律走 `endpointSavePlan` / `nckTaskBinding` 的 Driver 分流实现。
-import { useEffect, useMemo, useState } from "react";
-import { Alert, Button, InputNumber, Tag, message } from "antd";
+// Endpoint 采集配置窗格（Workspace「采集」tab）。
+//
+// 保存路径**按 Endpoint 的 Driver 分流**（第二批 A），第二批 B 在此之上接通：
+//   I-2 完整分页目录 → scope/ family 准入 → 动态表单 → 服务端权威 Preview
+//   → 新增/编辑 → planEndpointTaskSave（唯一保存入口）→ PUT → 回读确认。
+//
+// 两条数据安全红线：
+// - 非 NCK 路径逐字沿用旧行为（`mergeAcquisitionTasks` + 原生命周期）；
+// - NCK 路径不得因为「记录里已有 point_key」就认定身份可提交：加载后必须
+//   重新核验定义、参数与**服务端重算的 Key**，核验失败只能查看原始配置或
+//   显式移除，不能继续保存。
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Alert, Button, InputNumber, Space, Tag, message } from "antd";
 import { api } from "../api";
 import type { DriverDescriptor, ValidationIssue } from "../types";
 import {
@@ -26,32 +30,56 @@ import {
 import {
   collectableDefinitions,
   evaluateNckSelectionAdd,
-  type NckVariableDefinitionLike,
 } from "../nckCollectability";
 import { nckPointsOf, parseTaskBinding, selectEditableTask } from "../nckTaskBinding";
 import { planEndpointTaskSave, samePoints } from "../endpointSavePlan";
+import {
+  classifyNckError,
+  describeNckFailure,
+  fetchNckCatalog,
+  indexNckCatalogDefinitions,
+  isNckRequestError,
+  previewNckPoint,
+  type NckCatalog,
+  type NckDefinitionIndex,
+} from "../nckCatalog";
+import {
+  checkNckFamily,
+  evaluateNckPointIdentity,
+  type NckDefinitionLike,
+} from "../nckPointModel";
 import { applySelectionAdd } from "../resourceSelectionModel";
 import { ApplyWithRestart } from "./ApplyWithRestart";
+import { NckPointFields } from "./NckPointFields";
 import { ResourcePickerAntd } from "./ResourcePickerAntd";
 
-/** 定义目录条目的最小形态（I-2 `VariableDefinition` 的子集 + 展示用 label）。 */
-export interface NckDefinitionEntry extends NckVariableDefinitionLike {
-  label?: string;
-}
+/** 定义目录条目（I-2 `VariableDefinition` 的宽松形态，注入/测试可只给子集）。 */
+export type NckDefinitionEntry = NckDefinitionLike;
 
 /**
  * NCK 定义目录（按 `variable_id` 索引）。
  *
- * 本批（A）**只消费不获取**：目录运输、分页、错误映射与 Preview 接线属第二批 B。
- * 缺失时 NCK 保存保持禁用（fail-closed）——没有 `scope` 就无法执行 P0-1 准入，
- * 绝不能退化成"目录不可用也能存"。
- *
- * TODO(PR-C 第二批 B)：由目录客户端（nckCatalog）加载后从这里注入，并补
- * `family`（取自 Endpoint 有效连接配置 `connection.family`，与条目 `definition.family`
- * 交叉校验）。在 B 完成前，生产环境的 NCK Endpoint 保存保持禁用——这是刻意的
- * fail-closed 选择，不是遗漏。
+ * 生产路径由本组件调用 `nckCatalog.fetchNckCatalog` 获取完整分页目录；
+ * 该 prop 保留为**可注入测试缝**（第二批 A 的既有形态），注入时不再发目录请求。
+ * 缺失且目录加载失败 ⇒ NCK 保存保持禁用（fail-closed）。
  */
 export type NckDefinitionMap = Readonly<Record<string, NckDefinitionEntry>>;
+
+/** 单个点位的身份核验状态（"checking" 只在渲染层出现，不进入提交）。 */
+interface NckPointVerification {
+  point: NckPointSelection;
+  status: "verified" | "unverified";
+  code?: string;
+  message?: string;
+  /** 高级原生点位不适用语义 scope 准入（身份由用户/固定规则给出）。 */
+  native?: boolean;
+}
+
+/** 用户显式移除的点位：**保留原始配置**，便于确认具体改了什么。 */
+interface RemovedNckPoint {
+  point: NckPointSelection;
+  reason: string;
+}
 
 /** 取任务内已知 point_key：两种 kind 都读，未知 kind / 结构非法返回空。 */
 function pointKeysOfTask(task: AcquisitionTaskShape): string[] {
@@ -85,12 +113,12 @@ export function EndpointAcquisitionPane({
   endpointId: string;
   driverId: string;
   onChanged: () => void;
-  /** NCK 定义目录（第二批 B 注入；缺失即禁用 NCK 保存）。 */
+  /** NCK 定义目录注入（测试缝；缺省时由组件从 I-2 目录加载）。 */
   nckDefinitions?: NckDefinitionMap | null;
 }) {
   const [desc, setDesc] = useState<DriverDescriptor | null>(null);
   const [sels, setSels] = useState<ResourceSelection[]>([]);
-  // NCK 待提交点位（来自快照 + 本批编辑；本批不自行推导 point_key）。
+  // NCK 待提交点位（来自快照 + 本批新增/编辑；身份一律来自服务端预览）。
   const [nckPoints, setNckPoints] = useState<NckPointSelection[]>([]);
   const [existingTasks, setExistingTasks] = useState<AcquisitionTaskShape[]>([]);
   const [preservedTasks, setPreservedTasks] = useState<AcquisitionTaskShape[]>([]);
@@ -105,38 +133,202 @@ export function EndpointAcquisitionPane({
   const [tasksLoadState, setTasksLoadState] = useState<TaskSnapshotState>("idle");
   const [tasksLoadedEpId, setTasksLoadedEpId] = useState<string | null>(null);
   const [tasksLoadError, setTasksLoadError] = useState("");
-  // 保存失败的后端 issues 原样展示（`{valid:false, issues:[...]}`）：
-  // 不翻译、不重新判定；成功保存 / 重新发起保存时清掉旧值。
+  // 保存失败的后端 issues 原样展示（`{valid:false, issues:[...]}`）。
   const [saveIssues, setSaveIssues] = useState<ValidationIssue[]>([]);
 
+  // ---- 第二批 B 新增状态 -------------------------------------------------
+  // Endpoint 有效连接配置的 family（权威来源；目录顶层 family 只是回显）。
+  const [endpointFamily, setEndpointFamily] = useState<string | null>(null);
+  const [endpointFamilyState, setEndpointFamilyState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  // I-2 目录（组件自行加载；注入 `nckDefinitions` 时跳过）。
+  const [catalog, setCatalog] = useState<NckCatalog | null>(null);
+  const [catalogState, setCatalogState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [catalogError, setCatalogError] = useState("");
+  // 已有点位的重新核验结果（不是「有 point_key 就有效」）。
+  const [pointStatuses, setPointStatuses] = useState<NckPointVerification[]>([]);
+  const [verifying, setVerifying] = useState(false);
+  // 用户显式移除的点位及原因（原始配置保留展示）。
+  const [removedPoints, setRemovedPoints] = useState<RemovedNckPoint[]>([]);
+  // 编辑态：null = 新增；否则为 nckPoints 下标。
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  const [formVersion, setFormVersion] = useState(0);
+
   const nck = isNckDriver(driverId);
-  const definitions = nckDefinitions ?? null;
+  const catalogIndex = useMemo<NckDefinitionIndex | null>(
+    () => (catalog ? indexNckCatalogDefinitions(catalog.definitions) : null),
+    [catalog],
+  );
+  const definitions = useMemo<NckDefinitionMap | null>(() => {
+    if (nckDefinitions) return nckDefinitions;
+    return catalogIndex ? catalogIndex.byVariableId : null;
+  }, [nckDefinitions, catalogIndex]);
+  const catalogFamily = catalog?.family ?? null;
   const definitionList = useMemo<NckDefinitionEntry[]>(
     () => (definitions ? Object.values(definitions) : []),
     [definitions],
   );
   // UI 执行点①（P0-1）：只有 `scope === "collect"` 的定义才进入可采集集合。
-  // identity / 缺失 / 未知 scope 一律不出现（fail-closed，不做 `!== "identity"` 反写）。
   const collectableDefs = useMemo(
     () => collectableDefinitions(definitionList),
     [definitionList],
   );
-  // UI 执行点②（P0-1 双执行）：对**将要提交的点位**再查一次准入，不信任列表过滤
-  // 或选中态；提交模型（endpointSavePlan → validateNckTaskSubmission）还会再查一次。
-  const admissionIssues = useMemo(() => {
-    if (!nck) return [] as Array<{ pointKey: string; code: string; message: string }>;
-    return nckPoints.flatMap((point) => {
-      // 原生点位（高级模式）不适用目录 scope：身份由用户/固定规则给出。
-      if (point.kind !== "nck_variable") return [];
-      const variableId = point.parameters?.variable_id;
-      const definition =
-        typeof variableId === "string" && definitions ? definitions[variableId] : undefined;
-      const gate = evaluateNckSelectionAdd(definition);
-      return gate.ok
-        ? []
-        : [{ pointKey: point.point_key, code: gate.code, message: gate.message }];
-    });
-  }, [nck, nckPoints, definitions]);
+
+  /** 按 `(variable_id, revision)` 精确查定义（多 revision 目录不得串用）。 */
+  const lookupDefinition = useCallback(
+    (variableId: string, revision: number | null): NckDefinitionLike | null => {
+      if (!definitions) return null;
+      if (catalogIndex && revision !== null) {
+        const exact = catalogIndex.byRevision[`${variableId}@${revision}`];
+        if (exact) return exact;
+      }
+      const entry = definitions[variableId];
+      if (!entry) return null;
+      if (typeof entry.revision === "number" && revision !== null && entry.revision !== revision) {
+        return null;
+      }
+      return entry;
+    },
+    [definitions, catalogIndex],
+  );
+
+  /**
+   * 重新核验一个已有点位（语义点位）。
+   *
+   * 顺序刻意是「定义 → scope → family → 预览 → Key 逐字比对」：任何一步失败都
+   * 给出具体原因，但都**不**自动删除、不静默转换、也不放行其余点位。
+   */
+  const verifyOne = useCallback(
+    async (point: NckPointSelection): Promise<NckPointVerification> => {
+      if (!nck) return { point, status: "verified" };
+      if (point.kind !== "nck_variable") {
+        // 高级原生：身份由用户显式指定/固定规则给出，不适用目录 scope 与语义预览。
+        return { point, status: "verified", native: true };
+      }
+      const variableId =
+        typeof point.parameters.variable_id === "string" ? point.parameters.variable_id : "";
+      const revision =
+        typeof point.parameters.definition_revision === "number"
+          ? point.parameters.definition_revision
+          : null;
+      if (!variableId || revision === null) {
+        return {
+          point,
+          status: "unverified",
+          code: "PARAMETERS_INVALID",
+          message: "点位 parameters 缺少 variable_id / definition_revision，无法重新核验",
+        };
+      }
+      const definition = lookupDefinition(variableId, revision);
+      if (!definition) {
+        return {
+          point,
+          status: "unverified",
+          code: "DEFINITION_MISSING",
+          message: `定义目录中找不到 ${variableId}（rev ${revision}）：无法重新核验身份（原始配置可查看/移除）`,
+        };
+      }
+      const admission = evaluateNckSelectionAdd(definition);
+      if (!admission.ok) {
+        return {
+          point,
+          status: "unverified",
+          code: admission.code,
+          message: `${admission.message}（原始配置可查看/移除）`,
+        };
+      }
+      const familyCheck = checkNckFamily({
+        endpointFamily,
+        definitionFamily: definition.family,
+        catalogFamily,
+      });
+      if (!familyCheck.ok) {
+        return { point, status: "unverified", code: familyCheck.code, message: familyCheck.message };
+      }
+      try {
+        const preview = await previewNckPoint({
+          driverId,
+          family: familyCheck.family,
+          kind: "nck_variable",
+          parameters: point.parameters,
+        });
+        const check = evaluateNckPointIdentity({
+          point,
+          definition,
+          endpointFamily,
+          catalogFamily,
+          preview,
+        });
+        return check.ok
+          ? { point, status: "verified" }
+          : { point, status: "unverified", code: check.code, message: check.message };
+      } catch (e) {
+        const code = isNckRequestError(e) ? e.code : "PREVIEW_FAILED";
+        const detail = e instanceof Error ? e.message : String(e);
+        return {
+          point,
+          status: "unverified",
+          code,
+          message: `服务端身份预览失败（${code}）：${detail}`,
+        };
+      }
+    },
+    [nck, lookupDefinition, endpointFamily, catalogFamily, driverId],
+  );
+
+  const verifyPoints = useCallback(
+    async (points: NckPointSelection[]): Promise<NckPointVerification[]> => {
+      const out: NckPointVerification[] = [];
+      for (const point of points) out.push(await verifyOne(point));
+      return out;
+    },
+    [verifyOne],
+  );
+
+  /** 核验结果是否对应当前点位数组（对象引用 + 顺序同时匹配，避免错位复用）。 */
+  const statusesCurrent =
+    pointStatuses.length === nckPoints.length &&
+    pointStatuses.every((status, i) => status.point === nckPoints[i]);
+  const unverified = statusesCurrent
+    ? pointStatuses.filter((status) => status.status === "unverified")
+    : [];
+  const verificationReady = statusesCurrent && !verifying;
+
+  // ---- 目录加载（I-2 完整分页） -----------------------------------------
+  useEffect(() => {
+    if (!nck || nckDefinitions) {
+      setCatalog(null);
+      setCatalogState("idle");
+      setCatalogError("");
+      return;
+    }
+    let cancelled = false;
+    setCatalogState("loading");
+    setCatalogError("");
+    setCatalog(null);
+    fetchNckCatalog({ driverId })
+      .then((loaded) => {
+        if (cancelled) return;
+        setCatalog(loaded);
+        setCatalogState("ready");
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setCatalog(null);
+        setCatalogState("error");
+        setCatalogError(
+          isNckRequestError(e)
+            ? `${e.code}（HTTP ${e.status}，${describeNckFailure(
+                classifyNckError(e.status, e.kind),
+              )}）：${e.message}`
+            : e instanceof Error
+              ? e.message
+              : String(e),
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [nck, driverId, nckDefinitions]);
 
   useEffect(() => {
     // 切 Endpoint 时先复位：旧快照不得污染新窗格（fail-closed 默认禁用保存）。
@@ -151,6 +343,12 @@ export function EndpointAcquisitionPane({
     setTasksLoadedEpId(null);
     setTasksLoadError("");
     setSaveIssues([]);
+    setPointStatuses([]);
+    setRemovedPoints([]);
+    setEditingIndex(null);
+    setFormVersion(0);
+    setEndpointFamily(null);
+    setEndpointFamilyState("loading");
     let cancelled = false;
     // Descriptor + Task 快照并行加载；二者都成功才开放保存（NCK 只需要任务快照，
     // 因为它的点位来自定义目录/快照而不是 Descriptor 的 resources）。
@@ -218,14 +416,125 @@ export function EndpointAcquisitionPane({
     });
     api.listEndpoints()
       .then((j) => {
-        const live = ((j as { endpoints?: Array<{ id: string; runtime?: { state?: string }; state?: string }> }).endpoints ?? []).find(
-          (e) => e.id === endpointId,
-        );
-        if (!cancelled) setRunning(isRunningState(live?.state ?? live?.runtime?.state));
+        if (cancelled) return;
+        const list = ((j as { endpoints?: Array<{ id: string; runtime?: { state?: string }; state?: string; connection?: unknown }> }).endpoints ?? []);
+        const live = list.find((e) => e.id === endpointId);
+        setRunning(isRunningState(live?.state ?? live?.runtime?.state));
+        // family 的唯一权威来源 = Endpoint 有效连接配置（不是目录顶层回显）。
+        const connection = live?.connection;
+        const rawFamily =
+          connection && typeof connection === "object" && !Array.isArray(connection)
+            ? (connection as { family?: unknown }).family
+            : undefined;
+        setEndpointFamily(typeof rawFamily === "string" && rawFamily.trim() ? rawFamily.trim() : null);
+        setEndpointFamilyState("ready");
       })
-      .catch(() => {});
+      .catch(() => {
+        if (cancelled) return;
+        setEndpointFamily(null);
+        setEndpointFamilyState("error");
+      });
     return () => { cancelled = true; };
   }, [endpointId, driverId]);
+
+  // ---- 已有点位重新核验（加载后 & 点位变化后） ---------------------------
+  const verifyToken = useRef(0);
+  useEffect(() => {
+    if (!nck || !definitions) {
+      setVerifying(false);
+      return;
+    }
+    const token = ++verifyToken.current;
+    let cancelled = false;
+    const snapshot = nckPoints;
+    setVerifying(true);
+    void verifyPoints(snapshot).then((statuses) => {
+      if (cancelled || token !== verifyToken.current) return;
+      setPointStatuses(statuses);
+      setVerifying(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [nck, definitions, nckPoints, verifyPoints]);
+
+  /** 所有已占用 key：保留任务 + 当前点位（编辑时排除被编辑项自身）。 */
+  const takenPointKeys = (skipIndex: number | null): string[] => {
+    const keys = preservedTasks.flatMap(pointKeysOfTask);
+    nckPoints.forEach((point, i) => {
+      if (skipIndex !== null && i === skipIndex) return;
+      keys.push(point.point_key);
+    });
+    return keys;
+  };
+
+  const addPoint = (point: NckPointSelection) => {
+    if (takenPointKeys(null).includes(point.point_key)) {
+      return message.error("该 point_key 已被 Endpoint 内其它点位占用：请调整 Target/Arguments（不得自动改名/加后缀）");
+    }
+    setNckPoints((prev) => [...prev, point]);
+    // 表单重建一次：避免上一条目的输入残留到下一次新增。
+    setFormVersion((v) => v + 1);
+  };
+
+  const replacePoint = (index: number, point: NckPointSelection) => {
+    if (takenPointKeys(index).includes(point.point_key)) {
+      return message.error("该 point_key 已被 Endpoint 内其它点位占用：请调整 Target/Arguments（不得自动改名/加后缀）");
+    }
+    setNckPoints((prev) => prev.map((p, i) => (i === index ? point : p)));
+    setEditingIndex(null);
+    setFormVersion((v) => v + 1);
+  };
+
+  /**
+   * 显式移除点位（存量 identity / 核验失败点位的**唯一恢复路径**）。
+   *
+   * 关键：本函数**刻意不经过** scope 准入门、不查 family、不要求 Preview。
+   * 准入只约束「作为有效点位提交」，不约束「从既有载荷中移除」；若删除也要先
+   * 把非法点位「变成合法」，就会形成死锁——那正是本批要避免的缺陷。
+   *
+   * 移除前先把**原始配置**记下来，用户可确认自己到底改了什么。
+   */
+  const removePoint = (index: number) => {
+    const point = nckPoints[index];
+    if (!point) return;
+    const status = pointStatuses.find((s) => s.point === point);
+    const reason =
+      status?.status === "unverified"
+        ? `${status.code ?? "UNVERIFIED"}：${status.message ?? "身份核验未通过"}`
+        : "用户显式移除（原始配置已保留）";
+    setRemovedPoints((prev) => [{ point, reason }, ...prev]);
+    setNckPoints((prev) => prev.filter((_, i) => i !== index));
+    setEditingIndex((current) => {
+      if (current === null) return null;
+      if (current === index) return null;
+      return current > index ? current - 1 : current;
+    });
+  };
+
+  /**
+   * UI 执行点②（P0-1 双执行）：对**将要提交的点位**再查一次准入，不信任列表过滤
+   * 或选中态；提交模型（endpointSavePlan → validateNckTaskSubmission）还会再查一次。
+   * 注意：本判定只约束「作为有效点位提交」，**不**约束移除（见 removePoint）。
+   */
+  const admissionIssues = useMemo(() => {
+    if (!nck) return [] as Array<{ pointKey: string; code: string; message: string }>;
+    return nckPoints.flatMap((point) => {
+      // 原生点位（高级模式）不适用目录 scope：身份由用户/固定规则给出。
+      if (point.kind !== "nck_variable") return [];
+      const variableId = point.parameters?.variable_id;
+      const revision =
+        typeof point.parameters?.definition_revision === "number"
+          ? point.parameters.definition_revision
+          : null;
+      const definition =
+        typeof variableId === "string" ? lookupDefinition(variableId, revision) : null;
+      const gate = evaluateNckSelectionAdd(definition);
+      return gate.ok
+        ? []
+        : [{ pointKey: point.point_key, code: gate.code, message: gate.message }];
+    });
+  }, [nck, nckPoints, lookupDefinition]);
 
   const save = async (restart: boolean) => {
     // 快照门：pending / 失败 / 串 Endpoint 一律不可 PUT。
@@ -244,6 +553,33 @@ export function EndpointAcquisitionPane({
           .map((i) => `${i.pointKey}（${i.code}）`)
           .join("、")}`,
       );
+    }
+    if (nck) {
+      if (!definitions) {
+        return message.error("定义目录不可用：无法确认 scope/family，禁止提交（fail-closed）");
+      }
+      if (!endpointFamily) {
+        return message.error("Endpoint 连接配置缺少 family：无法确认系列，禁止提交（请先补齐连接配置）");
+      }
+      if (verifying || !verificationReady) {
+        return message.warning("正在重新核验已有点位身份，请稍候（核验完成前不会发送保存请求）");
+      }
+      if (unverified.length) {
+        return message.error(
+          `存在未通过身份核验的点位（${unverified.length} 项）：请先手动移除这些点位并重新验证剩余点位后再保存`,
+        );
+      }
+      // 提交前再核验一次：防止「加载时通过、提交时目录/定义已变」。
+      const fresh = await verifyPoints(nckPoints);
+      setPointStatuses(fresh);
+      const stillBad = fresh.filter((s) => s.status === "unverified");
+      if (stillBad.length) {
+        return message.error(
+          `保存前重新核验失败（${stillBad.length} 项）：${stillBad
+            .map((s) => `${s.point.point_key}（${s.code}）`)
+            .join("、")}；请先移除后再保存`,
+        );
+      }
     }
     // 唯一保存计划入口：按 Driver 分流 + 快照门 + 准入 + 冲突 + 变更判定。
     const plan = planEndpointTaskSave({
@@ -421,13 +757,24 @@ export function EndpointAcquisitionPane({
       />
       ) : (
       <div style={{ display: "grid", gap: 8 }}>
-        {/* TODO(PR-C 第二批 B)：目录注入（nckCatalog）+ 语义点位表单 + Preview 状态机。
-            本批只做"可采集范围 + 已有点位"两件事，避免在无法确认 scope 时放行。 */}
+        {catalogState === "loading" ? (
+          <div style={{ fontSize: 12, color: "#525252" }} data-testid="nck-catalog-loading">
+            正在读取定义目录（完整分页读取，不遗漏、不重复）…
+          </div>
+        ) : null}
+        {catalogState === "error" ? (
+          <Alert
+            type="error"
+            data-testid="nck-catalog-error"
+            message="定义目录加载失败：NCK 保存已禁用（fail-closed）"
+            description={`${catalogError}。没有权威目录就无法确认 scope/family，也不会退回「无 scope 也能存」。`}
+          />
+        ) : null}
         {!definitions ? (
           <Alert
             type="warning"
             message="定义目录不可用：NCK 保存已禁用（fail-closed）"
-            description="没有定义目录就无法确认哪些变量可采集（scope 准入），因此保存保持禁用。目录加载与语义点位表单在后续版本接入；在可用前不会出现“保存成功但编辑没生效”。"
+            description="没有定义目录就无法确认哪些变量可采集（scope 准入），因此保存保持禁用；在可用前不会出现“保存成功但编辑没生效”。"
           />
         ) : (
           <div style={{ fontSize: 12, color: "#525252" }} data-testid="nck-collectable-summary">
@@ -436,17 +783,114 @@ export function EndpointAcquisitionPane({
             <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 6 }}>
               {collectableDefs.map((definition) => (
                 <Tag key={String(definition.variable_id)} data-testid="nck-collectable-def">
-                  {definition.label ?? String(definition.variable_id)}
+                  {typeof definition.label === "string"
+                    ? definition.label
+                    : definition.label?.zh ?? String(definition.variable_id)}
                 </Tag>
               ))}
             </div>
-            <div style={{ marginTop: 6 }}>
-              当前版本不在此新增语义点位（选择变量 + Target/Arguments + 服务端预览的表单尚未
-              提供）；列表只说明可采集范围，保存使用已有点位。
+            <div style={{ marginTop: 6 }} data-testid="nck-catalog-meta">
+              目录：{catalog ? `${catalog.total} 条 / ${catalog.pages} 页 / rev ${catalog.revision}` : "注入目录"}
+              {" · "}Endpoint family：
+              {endpointFamilyState === "loading"
+                ? "读取中"
+                : endpointFamilyState === "error"
+                  ? "读取失败"
+                  : endpointFamily ?? "缺失（禁止提交）"}
             </div>
           </div>
         )}
-        {admissionIssues.length > 0 ? (
+
+        {definitions && endpointFamilyState === "ready" && !endpointFamily ? (
+          <Alert
+            type="error"
+            data-testid="nck-endpoint-family-missing"
+            message="Endpoint 连接配置缺少 family：禁止新增/保存语义点位"
+            description="family 必须以 Endpoint 有效连接配置为准（目录顶层 family 只是回显，不是提交依据）。请先补齐连接配置。"
+          />
+        ) : null}
+
+        {definitions && !editBlock ? (
+          <div style={{ borderTop: "1px solid #e0e0e0", paddingTop: 8 }}>
+            {editingIndex !== null && nckPoints[editingIndex] ? (
+              <NckPointFields
+                key={`edit-${editingIndex}-${nckPoints[editingIndex].point_key}-${formVersion}`}
+                driverId={driverId}
+                endpointFamily={endpointFamily}
+                catalogFamily={catalogFamily}
+                definitions={collectableDefs}
+                takenPointKeys={takenPointKeys(editingIndex)}
+                initialPoint={nckPoints[editingIndex]}
+                submitLabel="保存点位"
+                onCancel={() => setEditingIndex(null)}
+                onSubmit={(point) => replacePoint(editingIndex, point)}
+              />
+            ) : (
+              <NckPointFields
+                key={`add-${formVersion}`}
+                driverId={driverId}
+                endpointFamily={endpointFamily}
+                catalogFamily={catalogFamily}
+                definitions={collectableDefs}
+                takenPointKeys={takenPointKeys(null)}
+                onSubmit={addPoint}
+              />
+            )}
+          </div>
+        ) : null}
+
+        {removedPoints.length > 0 ? (
+          <Alert
+            type="info"
+            data-testid="nck-removed-points"
+            message={`已手动移除 ${removedPoints.length} 个点位（保存不会包含它们）`}
+            description={
+              <ul style={{ margin: 0, paddingLeft: 18 }}>
+                {removedPoints.map((removed, idx) => (
+                  <li
+                    key={`${removed.point.point_key}-${idx}`}
+                    style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 11 }}
+                  >
+                    {removed.point.kind} · {removed.point.point_key} · 原因：{removed.reason}
+                    <div style={{ color: "#525252" }}>
+                      原始配置：{JSON.stringify(removed.point.parameters)}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            }
+          />
+        ) : null}
+
+        {unverified.length > 0 ? (
+          <Alert
+            type="error"
+            data-testid="nck-legacy-identity-alert"
+            message="当前任务包含不可采集的身份探针点位"
+            description={
+              <div>
+                <div>
+                  当前任务包含不可采集的身份探针点位。请检查并手动移除这些点位，重新验证剩余点位后再保存。
+                </div>
+                <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+                  {unverified.map((status, idx) => (
+                    <li
+                      key={`${status.point.point_key}-${idx}`}
+                      style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 11 }}
+                    >
+                      {status.point.point_key} · {status.code} · {status.message}
+                    </li>
+                  ))}
+                </ul>
+                <div style={{ marginTop: 4 }}>
+                  这些点位不会被自动删除，也不会被自动转成 collect；只能由你显式移除。
+                </div>
+              </div>
+            }
+          />
+        ) : null}
+
+        {admissionIssues.length > 0 && unverified.length === 0 ? (
           <Alert
             type="error"
             message={`存在不可采集点位（${admissionIssues.length} 项，scope 准入拒绝）`}
@@ -461,23 +905,79 @@ export function EndpointAcquisitionPane({
             }
           />
         ) : null}
+
         {nckPoints.length > 0 ? (
-          <div style={{ display: "grid", gap: 6 }}>
-            {nckPoints.map((point, idx) => (
-              <div key={`${point.point_key}-${idx}`} style={{ display: "flex", gap: 8, alignItems: "center", padding: 6, border: "1px solid #e0e0e0", borderRadius: 0 }}>
-                <span style={{ flex: 1, fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}>
-                  {point.kind} · {point.point_key}{" "}
-                  <span style={{ color: "#525252" }}>{JSON.stringify(point.parameters)}</span>
-                </span>
-                <Button
-                  size="small"
-                  danger
-                  onClick={() => setNckPoints((prev) => prev.filter((_, i) => i !== idx))}
+          <div style={{ display: "grid", gap: 6 }} data-testid="nck-point-list">
+            {nckPoints.map((point, idx) => {
+              const status = statusesCurrent ? pointStatuses[idx] : undefined;
+              const variableId =
+                typeof point.parameters?.variable_id === "string"
+                  ? point.parameters.variable_id
+                  : "";
+              const revision =
+                typeof point.parameters?.definition_revision === "number"
+                  ? point.parameters.definition_revision
+                  : null;
+              const exactDefinition =
+                variableId && revision !== null
+                  ? lookupDefinition(variableId, revision)
+                  : null;
+              // 只允许编辑「目录里仍是最新 revision」的点位：若该变量已发布新
+              // revision，按旧 revision 打开编辑器会静默把身份迁到新 revision，
+              // 违反「重新打开编辑器不得静默改变身份」。此时只能移除后重配。
+              const latestDefinition = variableId ? definitions?.[variableId] : undefined;
+              const revisionIsCurrent =
+                !!exactDefinition &&
+                (!latestDefinition ||
+                  typeof exactDefinition.revision !== "number" ||
+                  latestDefinition.revision === exactDefinition.revision);
+              const editableGate = exactDefinition && revisionIsCurrent
+                ? evaluateNckSelectionAdd(exactDefinition).ok
+                : false;
+              return (
+                <div
+                  key={`${point.point_key}-${idx}`}
+                  data-testid="nck-point-row"
+                  style={{ display: "flex", gap: 8, alignItems: "center", padding: 6, border: "1px solid #e0e0e0", borderRadius: 0 }}
                 >
-                  移除
-                </Button>
-              </div>
-            ))}
+                  <span style={{ flex: 1, fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}>
+                    {point.kind} · {point.point_key}{" "}
+                    <span style={{ color: "#525252" }}>{JSON.stringify(point.parameters)}</span>
+                    <div style={{ marginTop: 2 }}>
+                      {!status ? <Tag>核验中…</Tag> : null}
+                      {status?.status === "verified" ? (
+                        <Tag color="green" data-testid="nck-point-status">
+                          {status.native ? "高级原生（不适用目录 scope）" : "身份已由服务端核验"}
+                        </Tag>
+                      ) : null}
+                      {status?.status === "unverified" ? (
+                        <Tag color="red" data-testid="nck-point-status">
+                          不可提交：{status.code} · {status.message}
+                        </Tag>
+                      ) : null}
+                    </div>
+                  </span>
+                  {editableGate ? (
+                    <Button
+                      size="small"
+                      onClick={() => {
+                        setEditingIndex(idx);
+                        setFormVersion((v) => v + 1);
+                      }}
+                    >
+                      编辑
+                    </Button>
+                  ) : null}
+                  {/*
+                    删除按钮**不经过** scope/family/预览准入门（见 removePoint 注释）。
+                    无论点位是否合法都必须可移除，否则存量 identity 点位会形成死锁。
+                  */}
+                  <Button size="small" danger onClick={() => removePoint(idx)}>
+                    移除
+                  </Button>
+                </div>
+              );
+            })}
           </div>
         ) : null}
       </div>
@@ -523,9 +1023,12 @@ export function EndpointAcquisitionPane({
             isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, endpointId) &&
             (nck
               ? !!definitions &&
+                !!endpointFamily &&
                 !editBlock &&
                 nckPoints.length > 0 &&
-                admissionIssues.length === 0
+                admissionIssues.length === 0 &&
+                verificationReady &&
+                unverified.length === 0
               : sels.length > 0 && !!desc)
           }
           applyLabel="保存并启动"

@@ -16,9 +16,9 @@
 //      布尔标志，只重新读原始 definition.scope）。端点页保存计划
 //      （endpointSavePlan → validateNckTaskSubmission）已接线（第二批 A）。
 //
-// TODO(PR-C 第二批 B)：把两个 UI 纯函数接到 NckPointFields / ResourcePickerAntd
-// 的“加入”出口（语义表单与 Preview 状态机）。A 批只接线到端点保存页与
-// 可采集清单；一旦 B 接入选择表单，UI 与提交模型必须同时生效，不得只留一处。
+// 第二批 B 已把两个 UI 执行点接到语义表单（NckPointFields）：
+// 可采集列表只提供 collect 条目，且“加入点位”出口在组件内再查一次；
+// 提交模型（endpointSavePlan → validateNckTaskSubmission → 本模块）仍是最后一道。
 //
 // 判据唯一且严格：`scope === "collect"` 才为真。`identity`、缺失、null、
 // 大小写/拼写变体、未来新增值一律 false（fail-closed）。**禁止**写成

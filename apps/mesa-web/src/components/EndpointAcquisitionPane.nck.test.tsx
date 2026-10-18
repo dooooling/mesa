@@ -52,14 +52,73 @@ interface MockState {
   /** 回读时返回的任务（null ⇒ 返回刚保存的任务，模拟正常持久化）。 */
   readBack: AcquisitionTaskShape[] | null;
   savedTasks: AcquisitionTaskShape[] | null;
+  /** 预览是否失败（用于证明「失败不回落旧 Key」）。 */
+  previewFails?: boolean;
+  /** 已发生的预览请求（variable_id 序列，便于断言重新核验确实发生）。 */
+  previewCalls?: string[];
 }
 
-/** 保存链路的 fetch 桩：区分初次快照 GET、PUT、以及保存后的回读 GET。 */
+/** 保存链路的 fetch 桩：区分初次快照 GET、PUT、目录预览与保存后的回读 GET。 */
 function installFetch(state: MockState) {
+  state.previewCalls ??= [];
   (globalThis as { fetch?: unknown }).fetch = vi.fn(
     async (url: string, init?: RequestInit) => {
       const method = init?.method ?? "GET";
-      if (url === "/api/v1/endpoints") return ok({ endpoints: [] });
+      if (url === "/api/v1/endpoints") {
+        return ok({
+          endpoints: [
+            {
+              id: EP,
+              driver_id: NCK_DRIVER,
+              connection: { family: "828d" },
+              runtime: { state: "STOPPED" },
+            },
+            {
+              id: "ep-s7",
+              driver_id: "s7",
+              connection: { family: "" },
+              runtime: { state: "STOPPED" },
+            },
+          ],
+        });
+      }
+      if (url.startsWith("/api/v1/drivers/") && url.endsWith("/definitions/identity-preview")) {
+        const body = JSON.parse(String(init?.body)) as {
+          kind: string;
+          parameters: Record<string, unknown>;
+        };
+        const variableId = String(body.parameters.variable_id ?? "");
+        state.previewCalls!.push(variableId);
+        if (state.previewFails) {
+          return {
+            ok: false,
+            status: 503,
+            json: async () => ({
+              error: {
+                code: "DRIVER_UNAVAILABLE",
+                kind: "ConnectionError",
+                message: "驱动不可达（测试桩）",
+              },
+            }),
+          };
+        }
+        // 与下方 point() 构造的 Key 逐字一致：channel / drive_object 两种形态。
+        const target = (body.parameters.target ?? {}) as Record<string, unknown>;
+        const key =
+          typeof target.number === "number" && typeof target.entry === "string"
+            ? `${variableId}@drive_object=${String(target.number)},entry=${target.entry}`
+            : `${variableId}@${Object.entries(target)
+                .map(([k, v]) => `${k}=${String(v)}`)
+                .join(",")}`;
+        return ok({
+          point_key: key,
+          identity_mode: "derived",
+          scope: "collect",
+          variable_id: variableId,
+          definition_revision: body.parameters.definition_revision,
+          definition_digest: "digest-test",
+        });
+      }
       if (url.startsWith("/api/v1/drivers/")) return ok({ resources: RESOURCES });
       if (url.startsWith("/api/v1/tasks?endpoint=")) {
         if (state.tasksGetFails) return { ok: false, status: 500, json: async () => ({}) };
@@ -96,13 +155,26 @@ function buildDefinitions(): NckDefinitionMap {
   for (let i = 1; i <= 36; i += 1) {
     out[`syn.collect.${i}`] = {
       variable_id: `syn.collect.${i}`,
+      revision: 1,
+      family: "828d",
       scope: "collect",
+      targets: ["channel"],
+      target_required: ["channel"],
+      arguments: [],
       label: `Collect ${i}`,
     };
   }
   for (let i = 1; i <= 6; i += 1) {
     // 刻意不给 label：若它出现在 DOM 里，只会以 id 形式出现，便于断言"未渲染"。
-    out[`syn.identity.${i}`] = { variable_id: `syn.identity.${i}`, scope: "identity" };
+    out[`syn.identity.${i}`] = {
+      variable_id: `syn.identity.${i}`,
+      revision: 1,
+      family: "828d",
+      scope: "identity",
+      targets: ["axis"],
+      target_required: ["axis"],
+      arguments: [],
+    };
   }
   return out;
 }
@@ -305,8 +377,9 @@ describe("UI 双执行：快照里的 identity 点位同样被拒绝", () => {
         nckDefinitions={buildDefinitions()}
       />,
     );
-    await screen.findByText(/存在不可采集点位/);
-    expect(screen.getByText(/SCOPE_IDENTITY/)).toBeTruthy();
+    await screen.findByTestId("nck-legacy-identity-alert");
+    expect(screen.getAllByText(/当前任务包含不可采集的身份探针点位/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/SCOPE_IDENTITY/).length).toBeGreaterThan(0);
     await waitFor(() => expect(saveButton().disabled).toBe(true));
     expect(state.putBodies).toHaveLength(0);
   });
