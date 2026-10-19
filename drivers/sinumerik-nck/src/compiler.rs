@@ -27,7 +27,7 @@ use thiserror::Error;
 use mesa_core_types::{ErrorKind, validate_point_key};
 
 use crate::definition::{
-    DefinitionCatalog, NativeFieldSource, VariableDefinition, native_identity_key,
+    DefinitionCatalog, DefinitionScope, NativeFieldSource, VariableDefinition, native_identity_key,
 };
 use crate::native::{NativeNckAddress, resolve_native, transport_size_name, unit_mode_name};
 use crate::targets::TargetRef;
@@ -144,6 +144,24 @@ pub enum CompileError {
     #[error("内嵌定义自检失败：{reason}")]
     DefinitionDigestMismatch { reason: String },
 
+    /// **Configure 层码（PR-B3）**：语义点位的定义 `scope` 不是 `collect`。
+    ///
+    /// 只由 [`AddressCompiler::ensure_collectable_scope`] 产生；`compile_point`
+    /// 与 `preview_point_key` **永不**返回它——否则会分别打断 62 条 wire golden
+    /// 与 6 条 identity 的权威预览（预览必须如实返回身份，采集准入是 Configure
+    /// 的职责）。
+    ///
+    /// 消息刻意包含 `variable_id` + `revision`：调用方（`configure`）再补上
+    /// `task id`，现场才能定位「是哪一条历史点位阻断了整个任务」。
+    #[error(
+        "定义 `{variable_id}` revision={revision} 的 scope=`{scope}` 不可采集（仅 scope=`collect` 允许进入采集计划）；请删除该点位，或改用 `nck_native` 显式声明原生地址"
+    )]
+    DefinitionScopeNotCollectable {
+        variable_id: String,
+        revision: u32,
+        scope: &'static str,
+    },
+
     /// **configure 层码（B5）**：只由 [`ensure_batch_identity_namespace_unique`] 产生，
     /// `compile_point` 永不返回它。
     ///
@@ -175,6 +193,9 @@ impl CompileError {
             CompileError::InvalidBindingConfig { .. } => "INVALID_BINDING_CONFIG",
             CompileError::InvalidVariable { .. } => "INVALID_VARIABLE",
             CompileError::DefinitionDigestMismatch { .. } => "DEFINITION_DIGEST_MISMATCH",
+            CompileError::DefinitionScopeNotCollectable { .. } => {
+                "DEFINITION_SCOPE_NOT_COLLECTABLE"
+            }
             CompileError::IdentityNamespaceCollision { .. } => "IDENTITY_NAMESPACE_COLLISION",
         }
     }
@@ -189,6 +210,9 @@ impl CompileError {
                 ErrorKind::Address
             }
             CompileError::DefinitionDigestMismatch { .. } => ErrorKind::Internal,
+            // PR-B3：采集准入是**配置**错误（⇒ Core ConfigurationFailed，不重试），
+            // 显式列出而不依赖 `_` 兜底，便于码表审计。
+            CompileError::DefinitionScopeNotCollectable { .. } => ErrorKind::Configuration,
             _ => ErrorKind::Configuration,
         }
     }
@@ -585,6 +609,36 @@ impl<'a> AddressCompiler<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// **PR-B3：Configure 专属采集准入**——语义点位的定义 `scope` 必须为 `collect`。
+    ///
+    /// 为什么只放在 Configure：`compile_semantic_checked` 与 `check_identity` 同时
+    /// 服务 `preview_point_key`（身份预览）和 62 条 wire golden；把采集策略塞进
+    /// 那两个入口，会让「身份能否被预览」与「点位能否被采集」混为一谈。预览必须
+    /// 对 6 条 identity 继续返回权威 Key，而 Configure 必须拒绝它们。
+    ///
+    /// 为什么判定 `!= Collect` 而不是 `== Identity`：对未来/未知 scope fail-closed。
+    /// 新增 scope 时若它可采集，必须显式改这里——默认拒绝，绝不静默放行。
+    ///
+    /// `compiled.definition == None`（`nck_native`）直接放行：原生地址没有定义
+    /// 目录坐标，也就没有 scope 可言；既有原生合法性规则（D1–D11）保持不变。
+    pub fn ensure_collectable_scope(&self, compiled: &CompiledPoint) -> Result<(), CompileError> {
+        let Some(d) = &compiled.definition else {
+            return Ok(());
+        };
+        // 编译刚刚命中过同一 `(variable_id, revision)`，理论不会 miss；若真 miss，
+        // 说明目录在编译与准入之间被替换——沿用既有 lookup 错误 fail-closed，
+        // 绝不返回「看起来可采集」的结论。
+        let def = self.catalog.lookup(&d.variable_id, d.revision)?;
+        if def.scope != DefinitionScope::Collect {
+            return Err(CompileError::DefinitionScopeNotCollectable {
+                variable_id: d.variable_id.clone(),
+                revision: d.revision,
+                scope: def.scope.as_str(),
+            });
+        }
+        Ok(())
     }
 }
 

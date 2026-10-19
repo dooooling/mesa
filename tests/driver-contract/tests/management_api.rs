@@ -1155,6 +1155,136 @@ async fn task_save_gate_nck_points_envelope() {
     assert_eq!(s, StatusCode::OK, "{v}");
 }
 
+/// PR-B3（P0）端到端：`scope=identity` 的语义点位在**真实驱动子进程**链路上
+/// 必须 Configure 失败 ⇒ 端点 `FAILED`、detail 含新码与三要素、不进入重连、
+/// 不分配任何 point_id（无部分计划）。
+///
+/// 不需要真机：`open_connection` 只解析配置（`lib.rs:355-378`），
+/// Configure 在建连之前就按 scope 拒绝。
+#[tokio::test]
+async fn nck_configure_rejects_identity_scope_at_start() {
+    const EID: &str = "nck-b3-identity";
+    let (app, mgr, _staged) = app().await;
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/devices",
+        r#"{"id":"nck-b3-dev","name":"NCK B3 Device"}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "create device: {v}");
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/endpoints",
+        &serde_json::json!({
+            "id": EID,
+            "name": "NCK B3 Identity",
+            "device_id": "nck-b3-dev",
+            "driver_id": "sinumerik-nck",
+            "connection": {
+                "host": "127.0.0.1",
+                "family": "828d",
+                "local_tsap": 256,
+                "remote_tsap": 258,
+            },
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "create endpoint: {v}");
+
+    // Core 保存门禁**不下沉** scope（本 PR 不扩大 Core 职责）：identity 任务保存成功。
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/tasks",
+        &serde_json::json!({
+            "endpoint_id": EID,
+            "tasks": [{
+                "id": "t-identity",
+                "schedule": { "mode": "poll", "interval_ms": 100 },
+                "binding": {
+                    "kind": "nck.points.v1",
+                    "config": { "points": [{
+                        "kind": "nck_variable",
+                        "point_key": "axis.name@axis=i:1",
+                        "parameters": {
+                            "variable_id": "axis.name",
+                            "definition_revision": 1,
+                            "target": { "axis": 1 },
+                            "arguments": {},
+                        },
+                    }]},
+                },
+            }],
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "Core 保存门禁只校验信封: {v}");
+
+    let (s, v) = post_json(app.clone(), &format!("/api/v1/endpoints/{EID}/start"), "{}").await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "start 先返回 200（拒绝经 /state 暴露）: {v}"
+    );
+
+    common::wait_until(20, || {
+        mgr.snapshot()
+            .endpoint(EID)
+            .is_some_and(|s| s.state == "FAILED")
+    })
+    .await;
+
+    let (s, v) = get_json(app.clone(), &format!("/api/v1/endpoints/{EID}/state")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "FAILED", "配置失败终态必须是 FAILED: {v}");
+    let detail = v["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("ConfigurationError/DEFINITION_SCOPE_NOT_COLLECTABLE"),
+        "detail 必须带新码: {detail}"
+    );
+    assert!(
+        detail.contains("t-identity"),
+        "detail 必须含 Task ID: {detail}"
+    );
+    assert!(
+        detail.contains("axis.name"),
+        "detail 必须含 Variable ID: {detail}"
+    );
+    assert!(
+        detail.contains("revision=1"),
+        "detail 必须含 Revision: {detail}"
+    );
+
+    // 不进入持续重连循环：配置失败是终态，等待后仍必须是 FAILED
+    //（若误走 Lost，run_endpoint 会置 RECONNECTING 并反复重试）。
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let (_, v) = get_json(app.clone(), &format!("/api/v1/endpoints/{EID}/state")).await;
+    assert_eq!(v["state"], "FAILED", "配置失败不得进入重连: {v}");
+    assert!(
+        !mgr.is_running(EID),
+        "配置失败后 run 任务必须结束（无重连、无旧计划可被 Start）"
+    );
+
+    // `desired_running` 保持 Start 时置的 true（本 PR 不改变生命周期语义）。
+    let (s, ep) = get_json(app.clone(), &format!("/api/v1/endpoints/{EID}")).await;
+    assert_eq!(s, StatusCode::OK, "{ep}");
+    assert_eq!(ep["desired_running"], true, "{ep}");
+    // 无部分计划：失败批次没有 descriptors ⇒ 运行态点数恒为 0（未分配 point_id）。
+    assert_eq!(ep["runtime"]["points"], 0, "失败批次不得注册任何点位: {ep}");
+    assert_eq!(ep["runtime"]["state"], "FAILED", "{ep}");
+    let (_, latest) = get_json(app.clone(), "/api/v1/points/latest").await;
+    assert!(
+        !latest["points"]
+            .as_array()
+            .map(|a| a.iter().any(|p| p["endpoint_id"] == EID))
+            .unwrap_or(false),
+        "失败端点不得产出数据: {latest}"
+    );
+}
+
 /// PR-A P2 护栏：bootstrap 创建门禁与 REST 保存门禁**同源**（唯一实现）。
 ///
 /// 设计文档 §1.2 / P2：两处此前各有一份 Task Binding Kind 白名单，必须收敛为

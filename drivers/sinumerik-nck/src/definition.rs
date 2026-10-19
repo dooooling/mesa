@@ -56,6 +56,20 @@ pub enum DefinitionScope {
     Identity,
 }
 
+impl DefinitionScope {
+    /// 投影字符串（与定义数据文件逐字一致）。
+    ///
+    /// PR-B3 起这是**唯一词表来源**：目录投影（`definition_api::scope_name`）
+    /// 与 Configure 拒绝消息都复用它，避免「前端看到的 scope」与「后端拒绝
+    /// 依据的 scope」各维护一份字符串而漂移。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DefinitionScope::Collect => "collect",
+            DefinitionScope::Identity => "identity",
+        }
+    }
+}
+
 /// 语义状态（§2.5.2，防语义虚构；状态升级必须发布新 revision）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

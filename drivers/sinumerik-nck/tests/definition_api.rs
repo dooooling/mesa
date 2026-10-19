@@ -199,14 +199,26 @@ async fn configure_one(
     parameters: Value,
     point_key: &str,
 ) -> Result<Vec<PointDescriptor>, SdkDriverError> {
+    configure_points(
+        conn,
+        "t-i32",
+        json!([{ "kind": kind, "point_key": point_key, "parameters": parameters }]),
+    )
+    .await
+}
+
+/// 以**任意点位集合**走真实 Configure（混合批次 / 原生回归用）。
+async fn configure_points(
+    conn: &NckConnection,
+    task_id: &str,
+    points: Value,
+) -> Result<Vec<PointDescriptor>, SdkDriverError> {
     let task = AcquisitionTask {
-        id: "t-i32".into(),
+        id: task_id.into(),
         schedule: TaskSchedule::Poll { interval_ms: 50 },
         binding: DriverBinding {
             kind: NCK_POINTS_BINDING_KIND.into(),
-            config: json!({
-                "points": [{ "kind": kind, "point_key": point_key, "parameters": parameters }]
-            }),
+            config: json!({ "points": points }),
         },
     };
     conn.configure(1, vec![task]).await
@@ -680,13 +692,20 @@ fn preview_equals_configure_recomputed_identity_for_all_42() {
 /// I32：**跨接口一致性** —— 42 条 × Preview → **真实 Configure**。
 ///
 /// 判据（DC §5.4.2）：① 预览 200 且非空；② Key 逐字写入 `PointSelection.point_key`
-/// 后 Configure 接受；③ 点位描述符数 == 点位数；④ 接受即意味着 D11 的
+/// 后 Configure 按 **scope** 分流——36 条 `collect` 接受、6 条 `identity` 拒绝
+/// （PR-B3 采集准入）；③ 接受的点位描述符数 == 点位数；④ 接受即意味着 D11 的
 /// 「持久化 Key == 重算 Key」成立（**无归一化**）。
+///
+/// 为什么这不是「放宽」：覆盖数仍为 42；旧断言「42/42 全接受」固化了
+/// 「identity 定义可被采集」这一缺陷，新断言额外要求 6 条必须被拒绝，且
+/// 码/kind/消息三要素精确——判定方向更多、更严。
 #[tokio::test]
 async fn preview_identity_equals_subsequently_configured_identity() {
     let conn = conn_828d();
     let catalog = catalog();
     let mut checked = 0;
+    let mut accepted = 0;
+    let mut rejected = 0;
     for def in all_definitions(&catalog) {
         let parameters = legal_parameters(def, DriveEntry::NcVariable);
         let previewed = preview(preview_request(POINT_KIND_VARIABLE, parameters.clone())).await;
@@ -696,23 +715,56 @@ async fn preview_identity_equals_subsequently_configured_identity() {
             .to_string();
         assert!(!previewed_key.is_empty());
 
-        let descriptors = configure_one(
-            &conn,
-            POINT_KIND_VARIABLE,
-            parameters.clone(),
-            &previewed_key,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{} 的预览 Key 未被 Configure 接受：{e}", def.variable_id));
-        assert_eq!(descriptors.len(), 1);
-        assert_eq!(
-            descriptors[0].point_key, previewed_key,
-            "{}：Configure 接受的身份必须与预览逐字一致",
-            def.variable_id
-        );
+        match def.scope {
+            DefinitionScope::Collect => {
+                let descriptors = configure_one(
+                    &conn,
+                    POINT_KIND_VARIABLE,
+                    parameters.clone(),
+                    &previewed_key,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{} 的预览 Key 未被 Configure 接受：{e}", def.variable_id)
+                });
+                assert_eq!(descriptors.len(), 1);
+                assert_eq!(
+                    descriptors[0].point_key, previewed_key,
+                    "{}：Configure 接受的身份必须与预览逐字一致",
+                    def.variable_id
+                );
+                accepted += 1;
+            }
+            DefinitionScope::Identity => {
+                let e = configure_one(
+                    &conn,
+                    POINT_KIND_VARIABLE,
+                    parameters.clone(),
+                    &previewed_key,
+                )
+                .await
+                .expect_err("identity 定义不得被 Configure 接受");
+                assert_eq!(
+                    e.code, "DEFINITION_SCOPE_NOT_COLLECTABLE",
+                    "{}",
+                    def.variable_id
+                );
+                assert_eq!(e.kind.as_str(), "ConfigurationError");
+                assert!(e.message.contains(&def.variable_id), "{}", e.message);
+                assert!(
+                    e.message.contains(&format!("revision={}", def.revision)),
+                    "{}",
+                    e.message
+                );
+                assert!(e.message.contains("t-i32"), "{}", e.message);
+                rejected += 1;
+            }
+        }
         checked += 1;
     }
     assert_eq!(checked, 42, "I32 必须逐条覆盖 42 条定义（42/42）");
+    assert_eq!(accepted, 36, "36 条 collect 必须全部 Configure 成功");
+    assert_eq!(rejected, 6, "6 条 identity 必须全部 Configure 拒绝");
 }
 
 /// I13：复合 Target `{channel,axis}` / `{channel,spindle}` 预览成功且两个键都进身份。
@@ -1189,7 +1241,12 @@ async fn preview_rejects_changed_definition_or_unsupported_revision() {
     assert!(e.message.contains("[1]"));
 }
 
-/// I45：6 条 `scope="identity"` 的 Preview **与 Configure 行为一致**（不是更严）。
+/// I45：6 条 `scope="identity"` 的 **Preview 仍如实返回身份**，而 Configure
+/// **必须拒绝**（PR-B3 采集准入）。
+///
+/// Preview 半边逐字保留（这是「未破坏权威预览」的回归）；Configure 半边反转旧
+/// 断言——旧断言写死「I-2 没有把 scope 校验下沉到 Configure：同一 Key 必须被
+/// 接受」，它固化的正是本缺陷，属需求变更而非放宽。
 #[tokio::test]
 async fn preview_scope_semantics_match_configure_for_identity_scope() {
     let conn = conn_828d();
@@ -1213,14 +1270,229 @@ async fn preview_scope_semantics_match_configure_for_identity_scope() {
             .expect("point_key")
             .to_string();
         assert!(!key.is_empty());
-        // ④ I-2 **没有**把 scope 校验下沉到 Configure：同一 Key 必须被接受。
+        // PR-B3：Preview 不负责采集准入（它必须给出权威身份），Configure 才拒绝。
+        let e = configure_one(&conn, POINT_KIND_VARIABLE, parameters, &key)
+            .await
+            .expect_err("identity 定义不得进入采集计划");
+        assert_eq!(e.code, "DEFINITION_SCOPE_NOT_COLLECTABLE");
+        assert_eq!(e.kind.as_str(), "ConfigurationError");
+        assert!(e.message.contains(&def.variable_id), "{}", e.message);
+        assert!(
+            e.message.contains(&format!("revision={}", def.revision)),
+            "{}",
+            e.message
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR-B3：Configure 采集准入（scope=identity 拒绝 / scope=collect 放行）
+// ---------------------------------------------------------------------------
+
+/// PR-B3 证据 1：6 条 `scope=identity` **逐条**被 Configure 拒绝，且
+/// 码 / kind / 消息三要素（task id + variable_id + revision）精确。
+#[tokio::test]
+async fn configure_rejects_all_six_identity_definitions() {
+    let conn = conn_828d();
+    let catalog = catalog();
+    let identity: Vec<&VariableDefinition> = all_definitions(&catalog)
+        .into_iter()
+        .filter(|d| d.scope == DefinitionScope::Identity)
+        .collect();
+    assert_eq!(identity.len(), 6, "identity scope 必须恰为 6 条");
+
+    let mut checked = 0;
+    for def in identity {
+        let parameters = legal_parameters(def, DriveEntry::NcVariable);
+        // 用**真实预览 Key** 走 Configure：拒绝必须发生在身份核对之后，
+        // 而不是「Key 算错」的副作用。
+        let previewed = preview(preview_request(POINT_KIND_VARIABLE, parameters.clone())).await;
+        let key = previewed["point_key"]
+            .as_str()
+            .expect("point_key")
+            .to_string();
+
+        let e = configure_one(&conn, POINT_KIND_VARIABLE, parameters, &key)
+            .await
+            .expect_err("identity 定义必须被 Configure 拒绝");
+        assert_eq!(
+            e.code, "DEFINITION_SCOPE_NOT_COLLECTABLE",
+            "{}",
+            def.variable_id
+        );
+        assert_eq!(e.kind.as_str(), "ConfigurationError");
+        assert!(
+            e.message.contains("t-i32"),
+            "消息必须含 Task ID：{}",
+            e.message
+        );
+        assert!(
+            e.message.contains(&def.variable_id),
+            "消息必须含 Variable ID：{}",
+            e.message
+        );
+        assert!(
+            e.message.contains(&format!("revision={}", def.revision)),
+            "消息必须含 Revision：{}",
+            e.message
+        );
+        assert!(
+            e.message.contains("scope=`identity`"),
+            "消息必须点明实际 scope：{}",
+            e.message
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 6, "必须逐条覆盖 6 条 identity 定义");
+}
+
+/// PR-B3 证据 2：36 条 `scope=collect` **逐条** Configure 成功，描述符不退化。
+#[tokio::test]
+async fn configure_accepts_all_thirty_six_collect_definitions() {
+    let conn = conn_828d();
+    let catalog = catalog();
+    let collect: Vec<&VariableDefinition> = all_definitions(&catalog)
+        .into_iter()
+        .filter(|d| d.scope == DefinitionScope::Collect)
+        .collect();
+    assert_eq!(collect.len(), 36, "collect scope 必须恰为 36 条");
+
+    let mut checked = 0;
+    for def in collect {
+        let parameters = legal_parameters(def, DriveEntry::NcVariable);
+        let previewed = preview(preview_request(POINT_KIND_VARIABLE, parameters.clone())).await;
+        let key = previewed["point_key"]
+            .as_str()
+            .expect("point_key")
+            .to_string();
         let descriptors = configure_one(&conn, POINT_KIND_VARIABLE, parameters, &key)
             .await
-            .unwrap_or_else(|e| {
-                panic!("{} 的 identity Key 被 Configure 拒绝：{e}", def.variable_id)
-            });
-        assert_eq!(descriptors[0].point_key, key);
+            .unwrap_or_else(|e| panic!("{} 的 collect 定义必须被接受：{e}", def.variable_id));
+        assert_eq!(descriptors.len(), 1, "{}", def.variable_id);
+        assert_eq!(descriptors[0].point_key, key, "{}", def.variable_id);
+        checked += 1;
     }
+    assert_eq!(checked, 36, "必须逐条覆盖 36 条 collect 定义");
+}
+
+/// PR-B3 证据 3：Native derived / user 与合法语义点位混合配置成功（不误伤）。
+#[tokio::test]
+async fn configure_accepts_native_derived_and_user_alongside_collect() {
+    let conn = conn_828d();
+    let mut user_parameters = native_derived_parameters();
+    user_parameters["identity_mode"] = json!("user");
+
+    let points = json!([
+        {
+            "kind": POINT_KIND_NATIVE,
+            "point_key": "native.C.1.21.1.396",
+            "parameters": native_derived_parameters(),
+        },
+        {
+            // user 模式：Key 由用户显式指定，Driver 不重算、不改名。
+            "kind": POINT_KIND_NATIVE,
+            "point_key": "native.C.1.21.1.396~2",
+            "parameters": user_parameters,
+        },
+        {
+            "kind": POINT_KIND_VARIABLE,
+            "point_key": "channel.program.status@channel=i:1",
+            "parameters": {
+                "variable_id": "channel.program.status",
+                "definition_revision": 1,
+                "target": { "channel": 1 },
+                "arguments": {},
+            },
+        },
+    ]);
+    let descriptors = configure_points(&conn, "t-native-mixed", points)
+        .await
+        .expect("Native derived/user 与合法语义点位混合必须成功");
+    assert_eq!(descriptors.len(), 3);
+    assert_eq!(descriptors[0].point_key, "native.C.1.21.1.396");
+    assert_eq!(descriptors[1].point_key, "native.C.1.21.1.396~2");
+    assert_eq!(
+        descriptors[2].point_key,
+        "channel.program.status@channel=i:1"
+    );
+}
+
+/// PR-B3 证据 4：合法与非法混合 ⇒ 整体拒绝；失败不污染后续合法 Configure。
+///
+/// 注：`PlanSnapshot` 是驱动私有状态，进程内 `plan.is_none()` 的权威断言在
+/// `lib.rs` 的同名单测（`configure_rejects_mixed_batch_and_leaves_no_partial_plan`）；
+/// 本用例从**外部可观察面**验证整包拒绝与后续可恢复。
+#[tokio::test]
+async fn configure_rejects_mixed_batch_without_partial_plan() {
+    let conn = conn_828d();
+    let identity_point = json!({
+        "kind": POINT_KIND_VARIABLE,
+        "point_key": "axis.name@axis=i:1",
+        "parameters": {
+            "variable_id": "axis.name",
+            "definition_revision": 1,
+            "target": { "axis": 1 },
+            "arguments": {},
+        },
+    });
+    let collect_point = json!({
+        "kind": POINT_KIND_VARIABLE,
+        "point_key": "channel.program.status@channel=i:1",
+        "parameters": {
+            "variable_id": "channel.program.status",
+            "definition_revision": 1,
+            "target": { "channel": 1 },
+            "arguments": {},
+        },
+    });
+    let points = json!([
+        {
+            "kind": POINT_KIND_NATIVE,
+            "point_key": "native.C.1.21.1.396",
+            "parameters": native_derived_parameters(),
+        },
+        collect_point.clone(),
+        // identity 放最后：若实现「边编译边提交」，前两点已进入局部计划。
+        identity_point,
+    ]);
+    let e = configure_points(&conn, "t-mixed-bad", points)
+        .await
+        .expect_err("批次含 identity 点位时必须整体拒绝");
+    assert_eq!(e.code, "DEFINITION_SCOPE_NOT_COLLECTABLE");
+    assert!(e.message.contains("t-mixed-bad"), "{}", e.message);
+    assert!(e.message.contains("axis.name"), "{}", e.message);
+    assert!(e.message.contains("revision=1"), "{}", e.message);
+
+    // 后续纯合法批次仍成功：失败没有污染驱动状态。
+    let descriptors = configure_points(&conn, "t-after-failure", json!([collect_point]))
+        .await
+        .expect("失败后合法批次必须可提交");
+    assert_eq!(descriptors.len(), 1);
+}
+
+/// PR-B3 证据 5：Preview 对 6 条 identity 仍返回合法身份（未破坏权威预览）。
+#[tokio::test]
+async fn identity_preview_still_succeeds_for_all_six() {
+    let catalog = catalog();
+    let identity: Vec<&VariableDefinition> = all_definitions(&catalog)
+        .into_iter()
+        .filter(|d| d.scope == DefinitionScope::Identity)
+        .collect();
+    assert_eq!(identity.len(), 6);
+
+    let mut checked = 0;
+    for def in identity {
+        let parameters = legal_parameters(def, DriveEntry::NcVariable);
+        let previewed = preview(preview_request(POINT_KIND_VARIABLE, parameters)).await;
+        assert_eq!(previewed["scope"], "identity", "{}", def.variable_id);
+        let key = previewed["point_key"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{} 的预览 Key 必须非空", def.variable_id));
+        assert!(!key.is_empty());
+        assert_eq!(previewed["identity_mode"], "derived", "{}", def.variable_id);
+        checked += 1;
+    }
+    assert_eq!(checked, 6);
 }
 
 // ---------------------------------------------------------------------------

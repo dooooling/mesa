@@ -18,8 +18,9 @@
 //! ## 目录真实性（I44：禁止静默删六条）
 //!
 //! `scope="identity"` 的 6 条定义**原样返回**：目录是「目录」，不是「可采集点位
-//! 清单」；准入判定归前端（PR-C 的 A40/A13）。少 6 条 + 浏览树仍 62 叶会形成
-//! 两份真值，是被明令禁止的组合（DC §9.3-C′）。
+//! 清单」；预览如实回显 scope，Configure 侧按 `scope=collect` 做采集准入
+//! （PR-B3：拒绝点在 `NckConnection::configure`，不在目录/预览）。少 6 条 +
+//! 浏览树仍 62 叶会形成两份真值，是被明令禁止的组合（DC §9.3-C′）。
 
 use std::collections::BTreeSet;
 
@@ -664,11 +665,11 @@ where
 }
 
 /// `DefinitionScope` → 投影字符串（与定义数据文件逐字一致）。
+///
+/// 词表唯一来源已下沉到 [`DefinitionScope::as_str`]；此处保留薄委托，
+/// 让「目录投影」与「Configure 拒绝消息」不可能各说各话。
 fn scope_name(scope: DefinitionScope) -> &'static str {
-    match scope {
-        DefinitionScope::Collect => "collect",
-        DefinitionScope::Identity => "identity",
-    }
+    scope.as_str()
 }
 
 #[cfg(test)]
