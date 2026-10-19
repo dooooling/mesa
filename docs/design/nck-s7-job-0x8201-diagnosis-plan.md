@@ -731,3 +731,40 @@ driver-sdk 的 Start             先 spawn(run)，随后即回 Ack
 
 - `rust-canonical` 在 CI 中**已执行并通过** `mesad_restart` 与 `opcua_auth_restart_e2e` 两套重启类测试，跨 Driver 生命周期无回归；
 - **本地 `target/validation/contract.json` 证据产物仍未产出**（生产实例占用调试二进制）。该缺失属**证据产物缺失**，**不是测试覆盖缺失**，不应在文档中混为一谈。
+
+### 17.5 合并后离线复验结果（T2a L1/L2）
+
+在合并后的 main（`38a2c53d55c3da9055c4d9600c552e04f75370f2`）上，于完全隔离环境完成复验。
+
+**构建基线**：工作树当时停在文档分支，故用 `git archive 38a2c53` 导出基线树构建；关键文件 blob 与基线逐一相等。构建使用独立 `CARGO_TARGET_DIR`，**未替换生产 `mesad.exe`**。`MESA_RECONNECT_FAST` 未设置。
+
+| 项 | 实测 | 判定 |
+|---|---|---|
+| **L1**（Ack 后立即失败） | `retry_in_secs` = **`[1, 2, 5, 10, 30, 30]`**；6/6 均 `had_running_session=true, saw_runtime_evidence=false`；采样 0 条 | **PASS** |
+| **L2**（保持 RUNNING 约 2s 后失败，poll 5s） | `retry_in_secs` = **`[1, 2, 5, 10, 30]`**；5/5 均 `saw_runtime_evidence=false`；采样 0 条 | **PASS** |
+| **Stop** | HTTP 200，3.5ms / 3.7ms；`STOPPED`；`desired_running=false`；**35s 内新 attempt = 0** | **PASS** |
+| **隔离** | 生产 PID 5652 存活且未变；`mesa.db`/`events.db` SHA-256 前后一致；真实端点仍 `STOPPED` | **PASS** |
+
+⇒ **§16.5 中"合并后离线回归"这一项已满足**。但 **T2a 真机执行仍需单独授权**，本次复验不构成真机放行。
+
+**保留的边界**（不得据此扩大结论）：
+- 不证明**所有故障场景**下 Stop 都能在数毫秒内完成；
+- 不保证 **Event-only 端点**或**"每批成功后故障"** 不会发生快速重连；
+- 不证明 `S7_JOB_0x8201` 根因。
+
+### 17.6 稳定性观察项：windows-x64 间歇失败
+
+main push CI（`38a2c53`）**首次运行**在 `rust-platform (windows-latest, windows-x64)` 失败：
+
+| 用例 | 失败位置 | 性质 |
+|---|---|---|
+| `event_runtime::exact_500_events_pipeline_exact_within_budget` | `tests/driver-contract/tests/common/mod.rs:614` | `wait_until` 条件等待超时（50ms 轮询） |
+| `event_persistence::stop_barrier_drains_inflight_epoch_events` | `tests/driver-contract/tests/event_persistence.rs:629` | `assertion left == right` |
+
+结果 `1091 passed / 2 failed / 18 skipped`（共 1093）。**同一 Git Tree（`566b7a31…`）重跑后全绿，两个用例均再次执行并通过**。
+
+**正式记录**：**Windows x64 首次失败、同一代码树重跑通过的间歇性测试失败，根因未确定。**
+
+**不得**据此宣称"已证明与 A1 无关" —— 两个失败用例都涉及事件处理，而 `event_ingress.rs` 在 A1 修改范围内，**该可能性未排除**。
+
+**升级条件**：若任一用例再次出现同类失败，**立即启动事件处理与排空时序专项调查**，不得继续归类为环境抖动。
