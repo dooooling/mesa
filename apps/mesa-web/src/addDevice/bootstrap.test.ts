@@ -1,8 +1,27 @@
 // M5.5 原子提交单测：一次 POST + 结果映射 + 幂等键稳定。
 // RC2 修3：幂等键语义改为 per-operation（调用方持有，重试复用；新 Flow 新 key）。
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { bootstrapDevice, isDraftComplete, newOperationKey, type BootstrapClient } from "./bootstrap";
 import { CANONICAL_RESOURCES_KIND, NCK_POINTS_KIND, mergeAcquisitionTasks } from "../deviceModel";
+import type { EndpointSavePlanInput } from "../endpointSavePlan";
+
+// PR-D：记录保存计划的入参，用来钉死「`tasks: [] + snapshotState: "ready"` 只允许
+// 出现在 Bootstrap 原子创建分支」这一 P0 约束（行为断言之外的结构证据）。
+const planCalls: EndpointSavePlanInput[] = [];
+vi.mock("../endpointSavePlan", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../endpointSavePlan")>();
+  return {
+    ...actual,
+    planEndpointTaskSave: (input: EndpointSavePlanInput) => {
+      planCalls.push(input);
+      return actual.planEndpointTaskSave(input);
+    },
+  };
+});
+
+beforeEach(() => {
+  planCalls.length = 0;
+});
 
 const DRAFT = {
   device: { deviceId: "cnc-01", deviceName: "CNC-01" },
@@ -190,5 +209,182 @@ describe("bootstrapDevice（原子接口）", () => {
     const b = c.calls[0] as { acquisition: { tasks: unknown[] }; start: unknown };
     expect(b.acquisition.tasks).toEqual([]);
     expect(b.start).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR-D：NCK 语义/原生点位 → planEndpointTaskSave → nck.points.v1
+//
+// 这些用例只走 mock client，不启动 mesad、不连接任何设备；请求体逐字断言，
+// 证明向导没有第二套任务装配/第二条 HTTP 保存路径。
+// ---------------------------------------------------------------------------
+
+const NCK_DEFINITIONS = {
+  "syn.collect.a": {
+    variable_id: "syn.collect.a",
+    revision: 1,
+    family: "828d",
+    scope: "collect",
+  },
+  "syn.identity.a": {
+    variable_id: "syn.identity.a",
+    revision: 1,
+    family: "828d",
+    scope: "identity",
+  },
+};
+
+const SEMANTIC_POINT = {
+  kind: "nck_variable",
+  point_key: "syn.collect.a@channel=1",
+  parameters: {
+    variable_id: "syn.collect.a",
+    definition_revision: 1,
+    target: { channel: 1 },
+    arguments: {},
+  },
+};
+
+function nckDraft(acquisition: Partial<{
+  nckPoints: Array<{ kind: string; point_key: string; parameters: Record<string, unknown> }>;
+  nckDefinitions: typeof NCK_DEFINITIONS | null;
+  selections: typeof DRAFT.acquisition.selections;
+  startAfterCreate: boolean;
+  intervalMs: number;
+}>) {
+  return {
+    device: DRAFT.device,
+    connection: {
+      driverId: "sinumerik-nck",
+      endpointId: "nck-ep",
+      endpointName: "NCK",
+      connection: { host: "10.0.0.5", family: "828d" },
+    },
+    acquisition: {
+      intervalMs: 2000,
+      selections: [],
+      nckPoints: [SEMANTIC_POINT],
+      nckDefinitions: NCK_DEFINITIONS,
+      startAfterCreate: true,
+      ...acquisition,
+    },
+  };
+}
+
+describe("PR-D：NCK 点位统一经 planEndpointTaskSave 装配", () => {
+  it("nck_points_use_save_plan：请求体恰为 nck.points.v1 {points}，point_key 逐字等于预览值", async () => {
+    const c = client({ device_id: "cnc-01", endpoint_id: "nck-ep", revision: 1, started: true });
+    const r = await bootstrapDevice(c, nckDraft({}));
+    expect(r.ok).toBe(true);
+
+    // 保存计划确实被调用，且入参是「Bootstrap 原子创建」专用的快照写法。
+    expect(planCalls).toHaveLength(1);
+    expect(planCalls[0]).toMatchObject({
+      driverId: "sinumerik-nck",
+      tasks: [],
+      snapshotState: "ready",
+      loadedEndpointId: "nck-ep",
+      currentEndpointId: "nck-ep",
+      intervalMs: 2000,
+    });
+    expect(planCalls[0].nckPoints).toEqual([SEMANTIC_POINT]);
+
+    // 只有一次写请求；任务只来自 plan.tasks。
+    expect(c.calls).toHaveLength(1);
+    const b = c.calls[0] as {
+      acquisition: { tasks: Array<Record<string, unknown>> };
+      start: unknown;
+    };
+    expect(b.acquisition.tasks).toEqual([
+      {
+        id: "t1",
+        schedule: { mode: "poll", interval_ms: 2000 },
+        binding: { kind: NCK_POINTS_KIND, config: { points: [SEMANTIC_POINT] } },
+      },
+    ]);
+    // 请求体**恰为** `{points}`，没有 selections 或其它字段混入。
+    const binding = (b.acquisition.tasks[0] as { binding: { config: Record<string, unknown> } })
+      .binding;
+    expect(Object.keys(binding.config)).toEqual(["points"]);
+    expect((binding.config.points as Array<{ point_key: string }>)[0].point_key).toBe(
+      "syn.collect.a@channel=1",
+    );
+    expect(b.start).toBe(true);
+  });
+
+  it("nck_snapshot_ready_empty_tasks_is_bootstrap_only：非 NCK 路径不调用保存计划", async () => {
+    const c = client({ device_id: "cnc-01", endpoint_id: "s7-ep", revision: 1, started: false });
+    await bootstrapDevice(c, DRAFT);
+    // 非 NCK 仍走原有 assembleBinding；保存计划（及其空快照写法）不得被复用。
+    expect(planCalls).toHaveLength(0);
+  });
+
+  it("identity_point_is_rejected_before_post：scope 无旁路，plan 拒绝且零 POST", async () => {
+    const identityPoint = {
+      kind: "nck_variable",
+      point_key: "syn.identity.a@channel=9",
+      parameters: {
+        variable_id: "syn.identity.a",
+        definition_revision: 1,
+        target: { channel: 9 },
+        arguments: {},
+      },
+    };
+    const c = client({ device_id: "cnc-01", endpoint_id: "nck-ep", revision: 1, started: true });
+    const r = await bootstrapDevice(c, nckDraft({ nckPoints: [identityPoint] }));
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("put-tasks");
+    expect(r.failedMessage).toContain("SCOPE_NOT_COLLECTABLE");
+    // 保存计划运行了（准入在模型层），但请求一个都不发。
+    expect(planCalls).toHaveLength(1);
+    expect(c.calls).toHaveLength(0);
+  });
+
+  it("nck_definitions_missing_fails_closed：目录不可用 ⇒ 拒绝提交且零 POST", async () => {
+    const c = client({ device_id: "cnc-01", endpoint_id: "nck-ep", revision: 1, started: true });
+    const r = await bootstrapDevice(c, nckDraft({ nckDefinitions: null }));
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("put-tasks");
+    expect(r.failedMessage).toContain("NCK_DEFINITIONS_MISSING");
+    expect(c.calls).toHaveLength(0);
+  });
+
+  it("nck_duplicate_native_keys_rejected：原生点位冲突在 plan 层拒绝且零 POST", async () => {
+    const nativePoint = {
+      kind: "nck_native",
+      point_key: "native.N.1.2.3.4",
+      parameters: { area: "N", area_no: 1, module: 2, column: 3, line: 4 },
+    };
+    const c = client({ device_id: "cnc-01", endpoint_id: "nck-ep", revision: 1, started: true });
+    const r = await bootstrapDevice(
+      c,
+      nckDraft({ nckPoints: [nativePoint, { ...nativePoint }] }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("put-tasks");
+    expect(r.failedMessage).toContain("POINT_KEY_CONFLICT");
+    expect(c.calls).toHaveLength(0);
+  });
+
+  it("nck_zero_points_skips_save_plan：零点位不发 plan、tasks=[]、start=false（D9）", async () => {
+    const c = client({ device_id: "cnc-01", endpoint_id: "nck-ep", revision: 1, started: false });
+    const r = await bootstrapDevice(c, nckDraft({ nckPoints: [], startAfterCreate: true }));
+    expect(r.ok).toBe(true);
+    expect(planCalls).toHaveLength(0);
+    const b = c.calls[0] as { acquisition: { tasks: unknown[] }; start: unknown };
+    expect(b.acquisition.tasks).toEqual([]);
+    expect(b.start).toBe(false);
+  });
+
+  it("nck_legacy_selections_still_rejected：NCK + selections 仍 fail-closed（A19 不回退）", async () => {
+    const c = client({ device_id: "cnc-01", endpoint_id: "nck-ep", revision: 1, started: true });
+    const r = await bootstrapDevice(
+      c,
+      nckDraft({ selections: DRAFT.acquisition.selections, nckPoints: [] }),
+    );
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("put-tasks");
+    expect(r.failedMessage).toContain(NCK_POINTS_KIND);
+    expect(c.calls).toHaveLength(0);
   });
 });

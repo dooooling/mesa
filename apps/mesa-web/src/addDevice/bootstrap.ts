@@ -4,8 +4,10 @@
 //   前端生成：同一 draft 重复提交视为重放，不建两台设备）；
 // - M4.2 的四步前端编排已退役（后端原子化后不再需要客户端补偿），
 //   draft 模型与报告语义保留，调用方（AddDeviceFlow）不动。
-import type { ResourceSelection } from "../deviceModel";
-import { assembleBinding } from "../deviceModel";
+import type { NckPointSelection, ResourceSelection } from "../deviceModel";
+import { assembleBinding, isNckDriver } from "../deviceModel";
+import type { NckVariableDefinitionLike } from "../nckCollectability";
+import { planEndpointTaskSave } from "../endpointSavePlan";
 
 export interface DeviceDraft {
   deviceId: string;
@@ -21,8 +23,26 @@ export interface ConnectionDraft {
 
 export interface AcquisitionDraft {
   intervalMs: number;
-  /** 采集点选择；**允许为空**（C3-D：零采集点 = 仅保存设备与连接）。 */
+  /**
+   * 非 NCK 的采集点选择；**允许为空**（C3-D：零采集点 = 仅保存设备与连接）。
+   *
+   * NCK 点位**不得**放进这里：`selections` 与 `nckPoints` 是两种不可互换的
+   * Binding 结构，混用会被 `assembleBinding`/Driver `configure` 整体拒绝。
+   */
   selections: ResourceSelection[];
+  /**
+   * NCK 语义/原生点位（PR-D）。**仅存在于向导本地草稿，不持久化**：
+   * 提交时统一交给 `planEndpointTaskSave` 做 scope 准入、唯一性与任务装配，
+   * 本字段不是第二条保存路径。
+   */
+  nckPoints?: NckPointSelection[];
+  /**
+   * NCK 定义目录（按 `variable_id` 索引），由数据步的完整目录索引得到。
+   *
+   * 必须传**全量**目录而不是只传 collect 条目：保存计划要能用 `identity`
+   * 条目给出 `SCOPE_NOT_COLLECTABLE` 的准确原因；缺失则 fail-closed。
+   */
+  nckDefinitions?: Readonly<Record<string, NckVariableDefinitionLike>> | null;
   /**
    * 创建后启动。
    *
@@ -128,15 +148,68 @@ export async function bootstrapDevice(
   opts?: { idempotencyKey?: string },
 ): Promise<BootstrapReport> {
   const { device, connection, acquisition } = draft;
-  // 零采集点：空数组，不是「一个空任务」。
-  //
-  // P0-2（A28/A29）：Binding 装配走 deviceModel 的**唯一入口**，不再在此处
-  // 硬编码旧 Binding Kind 字面量。kind 由 Endpoint 的 Driver 决定：
-  // NCK ⇒ `nck.points.v1`。向导页今天无法构造 NCK 语义点位（PR-D 边界），
-  // 因此若调用方硬塞 NCK + 旧 selections，装配会拒绝（fail-closed），
-  // 宁可保存失败也不写出一条必然被 NCK `configure` 整体拒绝的任务。
+  // 任务集只在这一处装配；`tasks=[]` 表示「本次不建任务」（零采集点）。
   let tasks: unknown[] = [];
-  if (acquisition.selections.length > 0) {
+  const nck = isNckDriver(connection.driverId);
+  if (nck) {
+    // NCK 的旧 `selections` 结构无法表达 `{points}`：保留原有 fail-closed
+    // （A19/A29），确保绝不在 NCK 上写出 `mesa.resources.v1`。
+    if (acquisition.selections.length > 0) {
+      const assembled = assembleBinding({
+        driverId: connection.driverId,
+        content: { type: "resources", selections: acquisition.selections },
+      });
+      return {
+        ok: false,
+        deviceId: device.deviceId,
+        endpointId: connection.endpointId,
+        failedStep: "put-tasks",
+        failedMessage: assembled.ok
+          ? "NCK Endpoint 不允许写入 mesa.resources.v1 任务（必须使用 nck.points.v1）"
+          : assembled.message,
+        compensated: false,
+        residual: false,
+        replayed: false,
+      };
+    }
+    const nckPoints = acquisition.nckPoints ?? [];
+    if (nckPoints.length > 0) {
+      // -------------------------------------------------------------------
+      // P0 快照限定：`tasks: [] + snapshotState: "ready"` **只**允许出现在
+      // Bootstrap 原子创建新 Endpoint 的分支——Endpoint 尚不存在，其服务端
+      // 任务集可证为空，因此不存在「用空快照覆盖已有任务」的风险。
+      // 已有 Endpoint 的编辑路径必须使用真实任务快照（见 EndpointAcquisitionPane
+      // 的 tasksLoadState / tasksLoadedEpId），**不得**复制本段写法。
+      // -------------------------------------------------------------------
+      const plan = planEndpointTaskSave({
+        driverId: connection.driverId,
+        tasks: [],
+        snapshotState: "ready",
+        loadedEndpointId: connection.endpointId,
+        currentEndpointId: connection.endpointId,
+        intervalMs: acquisition.intervalMs,
+        nckPoints,
+        nckDefinitions: acquisition.nckDefinitions ?? null,
+      });
+      if (!plan.ok) {
+        // 保存计划是唯一准入点（scope/结构/唯一性）；失败即零 POST。
+        return {
+          ok: false,
+          deviceId: device.deviceId,
+          endpointId: connection.endpointId,
+          failedStep: "put-tasks",
+          failedMessage: `${plan.code}：${plan.message}`,
+          compensated: false,
+          residual: false,
+          replayed: false,
+        };
+      }
+      // NCK 任务只来自保存计划：此处不重算身份、不改写任务、不出现 kind 字面量。
+      tasks = plan.tasks;
+    }
+    // 零点位：保持 `tasks=[]`（D9/A29）。**不**调用保存计划——空点位列会被
+    // 它以 EMPTY_POINTS 拒绝，而「零采集点」本身是合法的仅保存路径。
+  } else if (acquisition.selections.length > 0) {
     const assembled = assembleBinding({
       driverId: connection.driverId,
       content: { type: "resources", selections: acquisition.selections },
