@@ -118,6 +118,20 @@ impl Driver for TestDriver {
                     )
                     .required(false),
                     {
+                        // P1-A1：Start 被接受之后、首个数据/事件批次之前失败。
+                        // 为什么需要独立键：`fail_after_batches:1` 必先出 1 批，
+                        // 修复后该批会构成“运行证据”导致退避归零，无法复现
+                        // “假 RUNNING 后无证据地失败”这一缺陷形状。
+                        let mut f = FieldDescriptor::new(
+                            "fail_before_first_batch_ms",
+                            "Fail Before First Batch (ms)",
+                            FieldType::Integer,
+                        )
+                        .required(false);
+                        f.validation.min = Some(0.0);
+                        f
+                    },
+                    {
                         // C1 §6.3：Probe 延迟注入（慢设备模拟），供 A22/A32 使用。
                         let mut f = FieldDescriptor::new(
                             "probe_delay_ms",
@@ -689,6 +703,14 @@ struct ConnFaults {
     /// 第 N 批发布后进程直接退出（exit code 101）。仅子进程模式可观测，
     /// 用于端到端验证 Driver Crash Restore。
     crash_after_batches: Option<u64>,
+    /// P1-A1：`StartConnectionAck` 已成功返回（Core 已置 RUNNING）之后、
+    /// `run()` 尚未发布任何 Data/Event 批次之前，等待 N 毫秒再以
+    /// `SIMULATED_NO_FIRST_BATCH` 结束。
+    ///
+    /// 为什么放在 `run()` 内而不是 open/configure：只有 Ack 之后失败才复现
+    /// “短暂假 RUNNING”，在配置阶段失败会让 Core 根本看不到 RUNNING。
+    /// 事件任务在 `run()` 里晚于本检查 spawn，故该键天然是零数据批 + 零事件批。
+    fail_before_first_batch_ms: Option<u64>,
     /// `probe()` 内注入的延迟（毫秒）。
     ///
     /// 用途（C1 §6.3 / A22 / A32）：模拟「协议握手多阶段各耗时较久」的慢设备，
@@ -719,6 +741,10 @@ impl std::fmt::Debug for ConnFaults {
         f.debug_struct("ConnFaults")
             .field("fail_after_batches", &self.fail_after_batches)
             .field("crash_after_batches", &self.crash_after_batches)
+            .field(
+                "fail_before_first_batch_ms",
+                &self.fail_before_first_batch_ms,
+            )
             .field("probe_delay_ms", &self.probe_delay_ms)
             .field("password", &self.password.as_ref().map(|_| "[redacted]"))
             .field("capture_path", &self.capture_path)
@@ -766,6 +792,8 @@ fn parse_conn_faults(cfg: &serde_json::Value) -> Result<ConnFaults, SdkDriverErr
         fail_after_batches: parse_batch_threshold(cfg, "fail_after_batches")
             .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?,
         crash_after_batches: parse_batch_threshold(cfg, "crash_after_batches")
+            .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?,
+        fail_before_first_batch_ms: parse_batch_threshold(cfg, "fail_before_first_batch_ms")
             .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?,
         probe_delay_ms: parse_batch_threshold(cfg, "probe_delay_ms")
             .map_err(|e| SdkDriverError::configuration("BAD_CONFIG", e.message))?,
@@ -1350,6 +1378,21 @@ impl DriverConnection for SimConnection {
                 "run before apply_point_map",
             )
         })?;
+
+        // P1-A1 故障注入：`run()` 只在 StartConnectionAck 发出、release gate 放行
+        // 之后才被调用（driver-sdk `on_start`），因此此处失败必然对应
+        // “Core 已置 RUNNING → 零批次丢失”的假 RUNNING 形状。
+        // 事件任务在下方才 spawn（见本函数末尾的 event loop），故零事件批。
+        if let Some(ms) = self.faults.fail_before_first_batch_ms {
+            if ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+            return Err(SdkDriverError::new(
+                ErrorKind::Connection,
+                "SIMULATED_NO_FIRST_BATCH",
+                format!("fault injection: failed before first batch after {ms}ms"),
+            ));
+        }
 
         /// 组装某任务循环的 owned 运行单元（id + 规格 + 状态），不借用连接对象。
         /// Writable 点的 live 值不走快照（run 循环经 control_state 实时读，
@@ -2034,6 +2077,14 @@ mod tests {
         .unwrap();
         assert_eq!(f.fail_after_batches, Some(4));
         assert_eq!(f.crash_after_batches, Some(10));
+        // P1-A1 新键：缺失 = 不注入；显式 0 = 立即失败（与缺失可区分）。
+        assert_eq!(f.fail_before_first_batch_ms, None);
+        assert_eq!(
+            parse_conn_faults(&serde_json::json!({"fail_before_first_batch_ms": 0}))
+                .unwrap()
+                .fail_before_first_batch_ms,
+            Some(0)
+        );
 
         // 阈值非法 → 结构化配置错误
         // （Box<dyn DriverConnection> 非 Debug，不能用 unwrap_err，需手动匹配）
