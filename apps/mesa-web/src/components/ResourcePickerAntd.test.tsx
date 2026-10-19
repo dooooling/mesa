@@ -1,9 +1,11 @@
 // PR26 Gate：Mock Driver 只给 Descriptor，Web 无代码修改即可生成合法
 // ResourceSelection（typed 参数 + default 物化 + point_key 自动命名）。
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { ResourcePickerAntd, suggestPointKey } from "./ResourcePickerAntd";
 import type { ResourceDescriptor } from "../types";
+import type { NckPreviewFn } from "./NckPointFields";
+import type { NckDefinitionLike } from "../nckPointModel";
 
 // 虚构协议 "mockbus"：真实代码库从未见过这些 resource/参数。
 // encoding（选填 enum）与 scaled（选填 boolean）故意无 default：
@@ -400,5 +402,86 @@ describe("ResourcePickerAntd reconciliation 回归（终审 #4）", () => {
     // 表单 params 物化 defaulted=7 → 同实例 → value 显示已采集
     expect((outputBox("value") as HTMLInputElement).disabled).toBe(true);
     expect(screen.getByText("已采集")).toBeTruthy();
+  });
+});
+
+describe("PR-C 第三批：Picker 语义模式（A8/A21/A22）", () => {
+  const definition: NckDefinitionLike = {
+    variable_id: "syn.semantic",
+    revision: 1,
+    family: "828d",
+    scope: "collect",
+    targets: ["channel"],
+    target_required: ["channel"],
+    arguments: [],
+  };
+  const preview: NckPreviewFn = async (req) => ({
+    point_key: `${String(req.parameters.variable_id)}@channel=i:1`,
+    identity_mode: "derived",
+    scope: "collect",
+    variable_id: String(req.parameters.variable_id),
+    definition_revision: Number(req.parameters.definition_revision),
+    definition_digest: "d",
+  });
+
+  it("semantic_config_is_default_and_legacy_variable_entry_is_not_rendered", async () => {
+    const onAddPoint = vi.fn((_point: unknown) => true);
+    render(
+      <ResourcePickerAntd
+        resources={[]}
+        existingSelections={[]}
+        semantic={{
+          driverId: "sinumerik-nck",
+          definitions: [definition],
+          endpointFamily: "828d",
+          takenPointKeys: [],
+          onAddPoint,
+          preview,
+        }}
+      />,
+    );
+    // A21：语义页是默认页；A22：旧 variable 手动入口整体不存在。
+    expect(screen.getByTestId("nck-semantic-picker")).toBeTruthy();
+    expect(screen.getByText("语义点位")).toBeTruthy();
+    expect(screen.queryByText("手动")).toBeNull();
+    expect(screen.queryByText("无可用资源")).toBeNull();
+
+    fireEvent.change(screen.getByTestId("nck-variable-select"), {
+      target: { value: "syn.semantic" },
+    });
+    fireEvent.change(screen.getByLabelText("target-channel"), { target: { value: "1" } });
+    await waitFor(() => expect(screen.getByTestId("nck-point-key")).toBeTruthy());
+    fireEvent.click(screen.getByTestId("nck-add-point"));
+    expect(onAddPoint).toHaveBeenCalledTimes(1);
+    expect(onAddPoint.mock.calls[0][0]).toMatchObject({
+      kind: "nck_variable",
+      parameters: {
+        variable_id: "syn.semantic",
+        definition_revision: 1,
+        target: { channel: 1 },
+        arguments: {},
+      },
+    });
+  });
+
+  it("semantic_without_definitions_is_fail_closed_and_never_falls_back", () => {
+    render(
+      <ResourcePickerAntd
+        resources={MOCK_RESOURCES}
+        existingSelections={[]}
+        semantic={{
+          driverId: "sinumerik-nck",
+          definitions: null,
+          endpointFamily: "828d",
+          onAddPoint: () => true,
+          preview,
+        }}
+      />,
+    );
+    expect(screen.getByTestId("nck-semantic-picker-no-definitions")).toBeTruthy();
+    expect(screen.getByTestId("nck-semantic-picker-no-definitions-body")).toBeTruthy();
+    // 不回退旧 manual：没有 variable 资源选择、没有旧“加入”按钮。
+    expect(screen.queryByText("手动")).toBeNull();
+    expect(screen.queryByText("资源")).toBeNull();
   });
 });

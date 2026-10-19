@@ -5,6 +5,7 @@
 // - M4.2 的四步前端编排已退役（后端原子化后不再需要客户端补偿），
 //   draft 模型与报告语义保留，调用方（AddDeviceFlow）不动。
 import type { ResourceSelection } from "../deviceModel";
+import { assembleBinding } from "../deviceModel";
 
 export interface DeviceDraft {
   deviceId: string;
@@ -128,16 +129,38 @@ export async function bootstrapDevice(
 ): Promise<BootstrapReport> {
   const { device, connection, acquisition } = draft;
   // 零采集点：空数组，不是「一个空任务」。
-  const tasks =
-    acquisition.selections.length === 0
-      ? []
-      : [
-          {
-            id: "t1",
-            schedule: { mode: "poll", interval_ms: acquisition.intervalMs },
-            binding: { kind: "mesa.resources.v1", config: { selections: acquisition.selections } },
-          },
-        ];
+  //
+  // P0-2（A28/A29）：Binding 装配走 deviceModel 的**唯一入口**，不再在此处
+  // 硬编码旧 Binding Kind 字面量。kind 由 Endpoint 的 Driver 决定：
+  // NCK ⇒ `nck.points.v1`。向导页今天无法构造 NCK 语义点位（PR-D 边界），
+  // 因此若调用方硬塞 NCK + 旧 selections，装配会拒绝（fail-closed），
+  // 宁可保存失败也不写出一条必然被 NCK `configure` 整体拒绝的任务。
+  let tasks: unknown[] = [];
+  if (acquisition.selections.length > 0) {
+    const assembled = assembleBinding({
+      driverId: connection.driverId,
+      content: { type: "resources", selections: acquisition.selections },
+    });
+    if (!assembled.ok) {
+      return {
+        ok: false,
+        deviceId: device.deviceId,
+        endpointId: connection.endpointId,
+        failedStep: "put-tasks",
+        failedMessage: assembled.message,
+        compensated: false,
+        residual: false,
+        replayed: false,
+      };
+    }
+    tasks = [
+      {
+        id: "t1",
+        schedule: { mode: "poll", interval_ms: acquisition.intervalMs },
+        binding: assembled.binding,
+      },
+    ];
+  }
   const res = await client.deviceBootstrap({
     device: { id: device.deviceId, name: device.deviceName || device.deviceId },
     endpoint: {

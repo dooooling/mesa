@@ -2,6 +2,7 @@
 // RC2 修3：幂等键语义改为 per-operation（调用方持有，重试复用；新 Flow 新 key）。
 import { describe, expect, it, vi } from "vitest";
 import { bootstrapDevice, isDraftComplete, newOperationKey, type BootstrapClient } from "./bootstrap";
+import { CANONICAL_RESOURCES_KIND, NCK_POINTS_KIND, mergeAcquisitionTasks } from "../deviceModel";
 
 const DRAFT = {
   device: { deviceId: "cnc-01", deviceName: "CNC-01" },
@@ -140,6 +141,54 @@ describe("bootstrapDevice（原子接口）", () => {
     await bootstrapDevice(c, draft);
     const b = c.calls[0] as { acquisition: { tasks: unknown[] }; start: unknown };
     expect(b.acquisition.tasks).toHaveLength(1);
+    expect(b.start).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // P0-2：装配单真值（A28）+ NCK 绝不写旧 kind（A19/A29）
+  // -------------------------------------------------------------------------
+
+  it("A28：向导页与端点页的 binding 逐字相等（唯一装配入口）", async () => {
+    const selections = [
+      {
+        resource_id: "r1",
+        parameters: { address: 1 },
+        outputs: [{ output: "value", point_key: "r1.value" }],
+      },
+    ];
+    // 端点页路径（legacy canonical）：空任务集 + 编辑器周期/选择。
+    const merged = mergeAcquisitionTasks([], { interval_ms: 1000, selections });
+    const c = client({ device_id: "cnc-01", endpoint_id: "s7-ep", revision: 1, started: false });
+    await bootstrapDevice(c, { ...DRAFT, acquisition: { ...DRAFT.acquisition, selections } });
+    const b = c.calls[0] as { acquisition: { tasks: unknown[] } };
+    expect(b.acquisition.tasks).toEqual(merged);
+    expect((b.acquisition.tasks[0] as { binding: { kind: string } }).binding.kind).toBe(
+      CANONICAL_RESOURCES_KIND,
+    );
+  });
+
+  it("A19/A29：NCK 向导硬塞旧 selections ⇒ 装配拒绝、零请求、不写 mesa.resources.v1", async () => {
+    const c = client({ device_id: "cnc-01", endpoint_id: "nck-ep", revision: 1, started: true });
+    const r = await bootstrapDevice(c, {
+      ...DRAFT,
+      connection: { ...DRAFT.connection, driverId: "sinumerik-nck", endpointId: "nck-ep" },
+    });
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("put-tasks");
+    expect(r.failedMessage).toContain(NCK_POINTS_KIND);
+    expect(c.calls).toHaveLength(0); // 连 POST 都不发，绝不写无效任务
+  });
+
+  it("A29：NCK 零采集点仍发送 tasks=[]，不被误判成非法 binding", async () => {
+    const c = client({ device_id: "cnc-01", endpoint_id: "nck-ep", revision: 1, started: false });
+    const r = await bootstrapDevice(c, {
+      ...DRAFT,
+      connection: { ...DRAFT.connection, driverId: "sinumerik-nck", endpointId: "nck-ep" },
+      acquisition: { intervalMs: 1000, selections: [], startAfterCreate: true },
+    });
+    expect(r.ok).toBe(true);
+    const b = c.calls[0] as { acquisition: { tasks: unknown[] }; start: unknown };
+    expect(b.acquisition.tasks).toEqual([]);
     expect(b.start).toBe(false);
   });
 });
