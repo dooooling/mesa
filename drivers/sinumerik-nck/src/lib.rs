@@ -713,6 +713,15 @@ impl DriverConnection for NckConnection {
                     .map_err(|e| {
                         SdkDriverError::new(e.kind(), e.code(), format!("task `{}`: {e}", task.id))
                     })?;
+                // PR-B3：Configure 专属采集准入——只有 `scope=collect` 的语义定义
+                // 可进入采集计划。位置刻意在身份编译/核对之后、PDU 容量检查之前：
+                // ① 身份与参数错误保持既有优先级；
+                // ② 不可采集定义得到确定性业务错误，不被后续传输容量错误遮盖；
+                // ③ 仍在 `PlanSnapshot` 整体替换之前，失败绝不留下部分计划。
+                // 消息补 `task id`，与 Display 中的 variable_id/revision 合成三要素。
+                compiler.ensure_collectable_scope(&compiled).map_err(|e| {
+                    SdkDriverError::new(e.kind(), e.code(), format!("task `{}`: {e}", task.id))
+                })?;
                 let rp = &compiled.resolved;
                 // P2-1：Configure 期提前拦截「单项装不下」的配置，避免
                 // 「配置成功、启动后才在读取时报 READ_ITEM_TOO_LARGE」。
@@ -1752,6 +1761,102 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, "IDENTITY_NAMESPACE_COLLISION");
         assert!(conn.plan.read().unwrap().is_none());
+    }
+
+    /// PR-B3：混合批次含 identity 点位 ⇒ 整体拒绝，且 `PlanSnapshot` 仍为空
+    /// （不是「只提交前面合法的点位」）。
+    #[tokio::test]
+    async fn configure_rejects_mixed_batch_and_leaves_no_partial_plan() {
+        let conn = conn_828d();
+        let identity = serde_json::json!({
+            "kind": "nck_variable",
+            "point_key": "axis.name@axis=i:1",
+            "parameters": {
+                "variable_id": "axis.name",
+                "definition_revision": 1,
+                "target": { "axis": 1 },
+                "arguments": {},
+            },
+        });
+        let collect = serde_json::json!({
+            "kind": "nck_variable",
+            "point_key": "channel.program.status@channel=i:1",
+            "parameters": {
+                "variable_id": "channel.program.status",
+                "definition_revision": 1,
+                "target": { "channel": 1 },
+                "arguments": {},
+            },
+        });
+        let points =
+            serde_json::json!([native_point(SPEED_KEY_LINE3, 3), collect.clone(), identity,]);
+        let err = conn
+            .configure(1, vec![poll_task("t-mixed", points)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "DEFINITION_SCOPE_NOT_COLLECTABLE");
+        assert_eq!(err.kind.as_str(), "ConfigurationError");
+        assert!(err.message.contains("t-mixed"), "{}", err.message);
+        assert!(err.message.contains("axis.name"), "{}", err.message);
+        assert!(err.message.contains("revision=1"), "{}", err.message);
+        assert!(
+            conn.plan.read().unwrap().is_none(),
+            "混合批次失败不得留下部分计划"
+        );
+
+        // 失败不污染后续合法 Configure。
+        conn.configure(2, vec![poll_task("t-ok", serde_json::json!([collect]))])
+            .await
+            .unwrap();
+        assert!(conn.plan.read().unwrap().is_some());
+    }
+
+    /// PR-B3 旧计划隔离（Driver 侧事实）：失败的 reconfigure **不清空**上一次
+    /// 成功快照，也**不提交**本次任何点位。
+    ///
+    /// 这本身不是漏洞：Core 的 `run_config_flow` 在 Configure 失败后直接返回
+    /// `ConfigurationFailed`，**从不发 StartConnection**；随后 `teardown_attempt`
+    /// 终止驱动进程。旧快照随进程消失，无法被运行时误用。端到端证据见
+    /// `tests/driver-contract/tests/management_api.rs` 的
+    /// `nck_configure_rejects_identity_scope_at_start`。
+    #[tokio::test]
+    async fn reconfigure_failure_preserves_last_plan_snapshot_without_partial_commit() {
+        let conn = conn_828d();
+        conn.configure(
+            1,
+            vec![poll_task("t-old", speed_points(SPEED_KEY_LINE3, 3))],
+        )
+        .await
+        .unwrap();
+        {
+            let guard = conn.plan.read().unwrap();
+            let snap = guard.as_ref().expect("首次合法 Configure 必须写入计划");
+            assert_eq!(snap.revision, 1);
+            assert_eq!(snap.points.len(), 1);
+            assert_eq!(snap.points[0].key, SPEED_KEY_LINE3);
+        }
+
+        let identity = serde_json::json!([{
+            "kind": "nck_variable",
+            "point_key": "axis.name@axis=i:1",
+            "parameters": {
+                "variable_id": "axis.name",
+                "definition_revision": 1,
+                "target": { "axis": 1 },
+                "arguments": {},
+            },
+        }]);
+        let err = conn
+            .configure(2, vec![poll_task("t-new", identity)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "DEFINITION_SCOPE_NOT_COLLECTABLE");
+
+        let guard = conn.plan.read().unwrap();
+        let snap = guard.as_ref().expect("旧计划按既有语义保留（未清理）");
+        assert_eq!(snap.revision, 1, "失败不得把 revision 2 的部分结果写进计划");
+        assert_eq!(snap.points.len(), 1, "失败不得追加/替换任何点位");
+        assert_eq!(snap.points[0].key, SPEED_KEY_LINE3);
     }
 
     #[tokio::test]
