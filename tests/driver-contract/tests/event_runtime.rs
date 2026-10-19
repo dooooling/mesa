@@ -955,6 +955,7 @@ async fn exact_500_events_pipeline_exact_within_budget() {
         "exact-slo".into(),
         Arc::clone(&services),
         shutdown.clone(),
+        None,
     ));
 
     // 500 精确落盘（10s budget；条件必成立，超时只在真 bug 时触发）。

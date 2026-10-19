@@ -1849,6 +1849,7 @@ mod tests {
             "ep-drain".into(),
             services.clone(),
             shutdown.clone(),
+            None,
         ));
         let batch = |seq: u64| EventBatch {
             connection_handle: HANDLE,
@@ -1974,10 +1975,23 @@ mod tests {
             worker: Option<tokio::task::JoinHandle<Result<(), IngressFatal>>>,
             store: Arc<EventStore>,
             services: Arc<EventServices>,
+            /// P1-A1：本次 attempt 的运行证据（None = 无观测需求）。
+            evidence: Option<Arc<AtomicBool>>,
         }
 
         impl Rig {
             async fn start(epoch: u64) -> Self {
+                Self::start_inner(epoch, None).await
+            }
+
+            /// P1-A1：带证据句柄启动，返回 (Rig, 证据) 以便在 `h.await` 之后断言。
+            async fn start_with_evidence(epoch: u64) -> (Self, Arc<AtomicBool>) {
+                let ev = Arc::new(AtomicBool::new(false));
+                let rig = Self::start_inner(epoch, Some(Arc::clone(&ev))).await;
+                (rig, ev)
+            }
+
+            async fn start_inner(epoch: u64, evidence: Option<Arc<AtomicBool>>) -> Self {
                 // Shared 需要一个写半部占位（本测试不用请求路径，保持存活即可）。
                 let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
                     .await
@@ -2020,6 +2034,7 @@ mod tests {
                     "hd-ingress".into(),
                     services.clone(),
                     shutdown.clone(),
+                    evidence.clone(),
                 ));
                 Self {
                     tx,
@@ -2028,6 +2043,7 @@ mod tests {
                     worker: Some(worker),
                     store,
                     services,
+                    evidence,
                 }
             }
 
@@ -2147,6 +2163,30 @@ mod tests {
             rig.tx.send(batch(HANDLE, 8, 1, "t-1")).await.unwrap();
             rig.finish_ok().await;
             assert_eq!(rig.seqs_asc(), vec![1, 2, 3]);
+        }
+
+        /// P1-A1 S1：ingress 正常消费到批次 ⇒ 本次 attempt 的运行证据置真。
+        /// 断言点在 `finish_ok()`（内部 `h.await`）之后，与生产读取点同序。
+        #[tokio::test]
+        async fn evidence_marked_by_ingress_consumption() {
+            let (mut rig, ev) = Rig::start_with_evidence(0xE9).await;
+            assert!(!ev.load(Ordering::Relaxed), "未收到批次时不得置真");
+            rig.tx.send(batch(HANDLE, 0xE9, 1, "ev-1")).await.unwrap();
+            rig.wait_rows(1).await;
+            rig.finish_ok().await;
+            assert!(
+                ev.load(Ordering::Relaxed),
+                "正常消费的 EventBatch 必须构成本 attempt 的运行证据"
+            );
+        }
+
+        /// P1-A1 S3：整个 attempt 没有任何批次 ⇒ 证据必须保持 false。
+        /// 防止“从全局诊断计数推导”这类实现把无输入的 attempt 误判为有证据。
+        #[tokio::test]
+        async fn evidence_absent_when_no_batch_arrives() {
+            let (mut rig, ev) = Rig::start_with_evidence(0xEA).await;
+            rig.finish_ok().await;
+            assert!(!ev.load(Ordering::Relaxed), "空输入不得置真");
         }
     }
     /// I38-T4 / DC §6.4-①-④：超时预算常量**冻结**。

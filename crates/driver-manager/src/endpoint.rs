@@ -9,7 +9,7 @@
 //! 持久版 [`StorePointIdSource`] 委托 `ConfigStore`（带墓碑语义）。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,12 +29,62 @@ use crate::snapshot::{EndpointStatus, Snapshot};
 
 /// 连接级退避序列（§11.1 默认值）。当前不做上限熔断，成功后归零。
 /// 测试时 `MESA_RECONNECT_FAST=1` 缩短为 1s 固定，避免 30s/60s 阻塞。
+///
+/// 拆成两层是为了让表与边界可被纯函数单测覆盖：`reconnect_backoff_secs` 仍是
+/// 唯一读取进程 env 的入口（语义不变），`backoff_delay` 不含副作用。
 fn reconnect_backoff_secs(idx: usize) -> u64 {
-    if std::env::var("MESA_RECONNECT_FAST").ok().as_deref() == Some("1") {
+    backoff_delay(idx, reconnect_fast_from_env())
+}
+
+fn reconnect_fast_from_env() -> bool {
+    std::env::var("MESA_RECONNECT_FAST").ok().as_deref() == Some("1")
+}
+
+/// 退避表与 `idx.min(4)` 边界的纯函数（P1-A1 单测锚点，不得改变语义）。
+fn backoff_delay(idx: usize, fast: bool) -> u64 {
+    if fast {
         return 1;
     }
     const RECONNECT_BACKOFF_SECS: [u64; 5] = [1, 2, 5, 10, 30];
     RECONNECT_BACKOFF_SECS[idx.min(RECONNECT_BACKOFF_SECS.len() - 1)]
+}
+
+/// P1-A1 归零判据：只有“本次 attempt 走到了事件循环”**且**“本次 attempt 的
+/// 消费路径收到过至少一个批次”才把退避复位。
+///
+/// 为什么不是单个 `saw_runtime_evidence`：两者正交——`had_running_session`
+/// 表示进程起来且配置闭环走通（Start Ack 被接受），`saw_runtime_evidence`
+/// 表示数据面真的通过。缺前者说明没起来，缺后者说明起来了但一个批次都没有
+/// （假 RUNNING / 慢首采 / 空计划），两种情况都不该快速重连。
+fn should_reset_backoff(had_running_session: bool, saw_runtime_evidence: bool) -> bool {
+    had_running_session && saw_runtime_evidence
+}
+
+/// 单次连接尝试的“运行证据”观测器（attempt 局部，不跨 attempt / Endpoint）。
+///
+/// 语义：本次 attempt 的消费路径（数据面 `event_loop` / 事件面 ingress）至少从
+/// Driver 收到过 **一个** 批次；质量、有效性、重复、缺口一律无关。
+/// 生命周期：每次 `attempt_session` 新建、随 attempt 丢弃 —— “每次 attempt 开始时
+/// 重置”因此是结构性保证，而不是需要记得清零的字段。
+/// 读取时机：必须等 `teardown_attempt` 返回（`shutdown_ingress` 已 Join 或
+/// abort+await）之后。`Relaxed` 的安全性来自这次任务终止的 happens-before，
+/// 而不是原子序本身。
+struct AttemptEvidence(Arc<AtomicBool>);
+
+impl AttemptEvidence {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+    /// 交给本次 attempt 的 ingress 任务持有的句柄（跨任务，故用 Arc）。
+    fn handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
+    fn mark(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+    fn saw(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 /// 内置端点配置：空库演示时由 Mesad 硬编码注入，当前优先 ConfigStore 构造；硬编码仅用于空库演示
@@ -290,7 +340,7 @@ pub async fn run_endpoint_with_heartbeat(
             return None;
         }
 
-        let (outcome, drain_err) = attempt_session(
+        let (outcome, drain_err, saw_runtime_evidence) = attempt_session(
             &disc,
             &cfg,
             &snapshot,
@@ -343,7 +393,13 @@ pub async fn run_endpoint_with_heartbeat(
                 if let Some(e) = &drain_err {
                     tracing::error!(endpoint = %cfg.endpoint_id, %reason, %e, "teardown drain failed, reconnecting");
                 }
-                tracing::warn!(endpoint = %cfg.endpoint_id, %reason, had_running_session, "connection lost");
+                tracing::warn!(
+                    endpoint = %cfg.endpoint_id,
+                    %reason,
+                    had_running_session,
+                    saw_runtime_evidence,
+                    "connection lost"
+                );
                 snapshot.mark_communication_lost(&cfg.endpoint_id);
                 set_status(
                     &snapshot,
@@ -354,8 +410,10 @@ pub async fn run_endpoint_with_heartbeat(
                     last_epoch,
                     source.revision(&cfg.endpoint_id),
                 );
-                // 仅当本次 attempt 曾进入 Running（即 had_running_session）才归零，否则指数退避
-                if had_running_session {
+                // A1：Start Ack 只证明“驱动接受了 Start”，不证明数据面通过。
+                // 只有本次 attempt 真的收到过驱动上行批次（Data 或 Event），才归零
+                // 重新从 1s 起步；否则按 1/2/5/10/30 指数退避（抑制假 RUNNING 风暴）。
+                if should_reset_backoff(had_running_session, saw_runtime_evidence) {
                     backoff_idx = 0;
                 }
             }
@@ -407,9 +465,13 @@ fn set_status(
 }
 
 /// 一次完整连接尝试：成功则阻塞在事件循环直到断开/判死/停机。
-/// 返回 `(outcome, drain_err)`（P0-3）：teardown 的 drain 结论随 attempt
-/// 带出（`None` = 无 ingress 或干净），由 `run_endpoint` 路由到
-/// stop 显式错误或大声日志，禁止吞错。
+/// 返回 `(outcome, drain_err, saw_runtime_evidence)`：
+/// - `drain_err`（P0-3）：teardown 的 drain 结论随 attempt 带出（`None` = 无
+///   ingress 或干净），由 `run_endpoint` 路由到 stop 显式错误或大声日志；
+/// - `saw_runtime_evidence`（P1-A1）：本次 attempt 是否收到过驱动上行批次。
+///   **在 teardown 之后读取**——此时 `event_loop` 已返回、ingress 已被
+///   `shutdown_ingress` Join（或 abort 后 await），两个写者都已终止，读到的是
+///   终值；因此不需要更强的原子序，也不能提前到 `event_loop` 返回处读。
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 async fn attempt_session(
     disc: &DiscoveredDriver,
@@ -429,7 +491,10 @@ async fn attempt_session(
     >,
     services: Option<&Arc<EventServices>>,
     heartbeat: HeartbeatParams,
-) -> (AttemptOutcome, Option<EventDrainError>) {
+) -> (AttemptOutcome, Option<EventDrainError>, bool) {
+    // P1-A1：attempt 局部证据。先于任何 spawn 创建，只交给本 attempt 的 ingress；
+    // 不跨 attempt、不进 Snapshot/EventServices/registry。
+    let evidence = AttemptEvidence::new();
     let mut process = match DriverProcess::spawn(disc).await {
         Ok(p) => p,
         Err(e) => {
@@ -439,6 +504,7 @@ async fn attempt_session(
                     had_running_session: false,
                 },
                 None,
+                evidence.saw(),
             );
         }
     };
@@ -459,6 +525,7 @@ async fn attempt_session(
                     had_running_session: false,
                 },
                 None,
+                evidence.saw(),
             );
         }
     };
@@ -487,6 +554,8 @@ async fn attempt_session(
                 cfg.endpoint_id.clone(),
                 Arc::clone(svc),
                 ingress_shutdown.clone(),
+                // P1-A1：事件面证据句柄（本 attempt 私有）
+                Some(evidence.handle()),
             ))),
             _ => None,
         };
@@ -521,7 +590,7 @@ async fn attempt_session(
                 std::sync::Arc::clone(registry),
             )
             .await;
-            return (outcome, drain_err);
+            return (outcome, drain_err, evidence.saw());
         }
     }
 
@@ -546,6 +615,7 @@ async fn attempt_session(
         &mut events,
         &mut ingress,
         shutdown,
+        &evidence,
     )
     .await;
 
@@ -575,7 +645,9 @@ async fn attempt_session(
         std::sync::Arc::clone(registry),
     )
     .await;
-    (outcome, drain_err)
+    // 读点固定在 teardown 之后：event_loop 已返回、ingress 已 Join/abort+await，
+    // 两个写者都终止，读到的是终值（见函数文档）。
+    (outcome, drain_err, evidence.saw())
 }
 
 fn pb_shutdown_body() -> pb::envelope::Body {
@@ -855,6 +927,9 @@ async fn event_loop(
     events: &mut tokio::sync::mpsc::Receiver<SessionEvent>,
     ingress: &mut Option<tokio::task::JoinHandle<Result<(), IngressFatal>>>,
     shutdown: &CancellationToken,
+    // P1-A1：数据面运行证据（与事件面共用同一个 attempt 局部布尔）。
+    // 这里只写不读；读取发生在 `attempt_session` 的 teardown 之后。
+    evidence: &AttemptEvidence,
 ) -> AttemptOutcome {
     const WATCHDOG_TICK: Duration = Duration::from_secs(2);
     let mut watchdog = tokio::time::interval(WATCHDOG_TICK);
@@ -903,6 +978,8 @@ async fn event_loop(
             }
             ev = events.recv() => match ev {
                 Some(SessionEvent::Batch(batch)) => {
+                    // P1-A1：收到数据批次即“数据面通过”。质量无关（BAD 也算）。
+                    evidence.mark();
                     apply_batch_logged(snapshot, cfg, batch);
                 }
                 Some(SessionEvent::State { state, detail, .. }) => {
@@ -1049,6 +1126,49 @@ fn new_stream_epoch() -> u64 {
 mod tests {
     use super::*;
     use crate::event_ingress::IngressFatal;
+
+    /// P1-A1：归零判据必须是“走到事件循环”**且**“见到运行证据”。
+    /// 任一单独成立都不足以归零（假 RUNNING / 无证据都不得快速重连）。
+    #[test]
+    fn reset_requires_runtime_evidence() {
+        assert!(!should_reset_backoff(false, false), "没起来没数据");
+        assert!(
+            !should_reset_backoff(true, false),
+            "假 RUNNING：起来了但零批次"
+        );
+        assert!(
+            !should_reset_backoff(false, true),
+            "防御性：证据不应独立成立（不变式被破坏时不归零）"
+        );
+        assert!(should_reset_backoff(true, true), "真运行：有批次");
+    }
+
+    /// P1-A1：退避表与 `min(4)` 边界冻结；fast 分支固定 1s。
+    #[test]
+    fn backoff_sequence_is_frozen_table() {
+        let got: Vec<u64> = (0..13).map(|i| backoff_delay(i, false)).collect();
+        assert_eq!(got, vec![1, 2, 5, 10, 30, 30, 30, 30, 30, 30, 30, 30, 30]);
+        for i in 0..5 {
+            assert_eq!(backoff_delay(i, true), 1, "MESA_RECONNECT_FAST 语义不变");
+        }
+        assert_eq!(backoff_delay(usize::MAX, false), 30, "越界必须夹到 30s");
+    }
+
+    /// P1-A1：递增循环（`if backoff_idx < 10 { += 1 }`）与表一致、序列非递减。
+    #[test]
+    fn backoff_index_progression_matches_table() {
+        let mut idx = 0usize;
+        let mut planned = Vec::new();
+        for _ in 0..12 {
+            planned.push(backoff_delay(idx, false));
+            if idx < 10 {
+                idx += 1;
+            }
+        }
+        assert_eq!(idx, 10);
+        assert_eq!(planned, vec![1, 2, 5, 10, 30, 30, 30, 30, 30, 30, 30, 30]);
+        assert!(planned.windows(2).all(|w| w[0] <= w[1]));
+    }
 
     /// P0-3：drain 正常 → Ok（None ingress 同样 Ok，Data-only 零成本）。
     #[tokio::test]

@@ -15,7 +15,7 @@
 //! 不碰其他 endpoint，更不 shutdown 整个 Mesa。**
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use mesa_core_types::{EventSequenceTracker, SequenceVerdict, now_unix_ns};
 use mesa_event_store::{CommitRequest, EventDiagnostics, EventServices};
@@ -112,6 +112,12 @@ impl std::fmt::Display for EventDrainError {
 /// 运行 ingress 直到流关闭、fatal 或优雅取消。`endpoint_id` 即去重作用域
 /// 与存储分区。
 ///
+/// `evidence`（P1-A1）：**本次 attempt 的运行证据**句柄。收到任一事件批次
+/// （含 duplicate/gap 与最终 drain 的批次）即置真；`attempt_session` 在
+/// teardown（Join/abort 完成）之后读取它，决定重连退避是否归零。语义是
+/// “数据面通过”，与数据质量、是否入库成功无关。`None` = 无需观测
+/// （单元测试直连等无重连语义的场景）。
+///
 /// 优雅取消（Checkpoint B 方案 A + ⑨ final drain）：cancel 只在循环头检查——
 /// 当前 commit+publish 必完整执行；cancel 到达后**排空 channel 里已有批次**
 /// 再退出（⑨：Stop 时已进入 Core 的旧 epoch Event 不得因 ingress 先退而被
@@ -125,8 +131,9 @@ pub async fn run_event_ingress(
     endpoint_id: String,
     services: Arc<EventServices>,
     shutdown: CancellationToken,
+    evidence: Option<Arc<AtomicBool>>,
 ) -> Result<(), IngressFatal> {
-    let mut proc = BatchProcessor::new(endpoint_id, services);
+    let mut proc = BatchProcessor::new(endpoint_id, services, evidence);
     loop {
         let batch = tokio::select! {
             b = rx.recv() => b.ok_or(IngressFatal::StreamClosed)?,
@@ -150,15 +157,22 @@ struct BatchProcessor {
     // 已见最大序号（epoch, seq）：tracker 不暴露内部 max，本地维护，
     // 用于 Regression fatal 的精确上下文（之前最大是多少）。
     max_seen: Option<(u64, u64)>,
+    /// P1-A1：本次 attempt 的运行证据（收到即置真，先于 Sequence Gate）。
+    evidence: Option<Arc<AtomicBool>>,
 }
 
 impl BatchProcessor {
-    fn new(endpoint_id: String, services: Arc<EventServices>) -> Self {
+    fn new(
+        endpoint_id: String,
+        services: Arc<EventServices>,
+        evidence: Option<Arc<AtomicBool>>,
+    ) -> Self {
         Self {
             endpoint_id,
             services,
             tracker: EventSequenceTracker::new(),
             max_seen: None,
+            evidence,
         }
     }
 
@@ -169,6 +183,12 @@ impl BatchProcessor {
     }
 
     async fn process(&mut self, batch: mesa_core_types::EventBatch) -> Result<(), IngressFatal> {
+        // P1-A1：批次“到达 Core 并进入本 attempt 的消费路径”本身就是运行证据。
+        // 必须早于 Sequence Gate（Duplicate 会整批跳过并 return）与 commit
+        // （入库失败属于另一故障域，但驱动→Core 链路仍然通过）。
+        if let Some(e) = &self.evidence {
+            e.store(true, Ordering::Relaxed);
+        }
         self.diag(1, |d| &d.ingress_batches_total);
         let (handle, epoch, seq) = (batch.connection_handle, batch.stream_epoch, batch.sequence);
         // Sequence Gate（PR5 冻结语义，PR7 第一次执法）
@@ -288,5 +308,78 @@ impl BatchProcessor {
                 Err(IngressFatal::InvalidBatch(e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesa_core_types::{EventBatch, EventRecord};
+
+    fn batch(seq: u64, id: &str) -> EventBatch {
+        EventBatch {
+            connection_handle: 1,
+            stream_epoch: 7,
+            sequence: seq,
+            timestamp_ns: 1_700_000_000_000_000_000,
+            events: vec![EventRecord {
+                event_id: id.into(),
+                category: "message".into(),
+                kind: "counter.tick".into(),
+                source: "T".into(),
+                severity: 100,
+                code: None,
+                message: None,
+                message_locale: None,
+                occurred_at_ns: None,
+                condition: None,
+                correlation_id: None,
+                attributes: Default::default(),
+            }],
+            mono_ns: None,
+        }
+    }
+
+    fn processor(evidence: Option<Arc<AtomicBool>>) -> BatchProcessor {
+        let store = Arc::new(mesa_event_store::EventStore::open_in_memory().unwrap());
+        let services =
+            mesa_event_store::EventServices::new(store, mesa_event_store::EventHub::new(16));
+        BatchProcessor::new("hd-evidence".into(), services, evidence)
+    }
+
+    /// P1-A1 S1（处理层）：正常批次必须置真。
+    #[tokio::test]
+    async fn evidence_marked_on_batch_processing() {
+        let ev = Arc::new(AtomicBool::new(false));
+        let mut p = processor(Some(Arc::clone(&ev)));
+        assert!(!ev.load(Ordering::Relaxed));
+        p.process(batch(1, "e-1")).await.expect("commit ok");
+        assert!(ev.load(Ordering::Relaxed));
+    }
+
+    /// P1-A1 S2：置真必须早于 Sequence Gate —— Duplicate 会整批跳过并 return，
+    /// 但“本 attempt 收到过”仍成立。final drain 走的正是同一个 `process`。
+    #[tokio::test]
+    async fn evidence_marked_before_sequence_gate_on_duplicate() {
+        let ev = Arc::new(AtomicBool::new(false));
+        let mut p = processor(Some(Arc::clone(&ev)));
+        p.process(batch(1, "e-dup")).await.expect("first ok");
+        assert!(ev.load(Ordering::Relaxed));
+        // 仅测试用：清掉后观察“同一批再次到达”是否仍会置真。
+        ev.store(false, Ordering::Relaxed);
+        p.process(batch(1, "e-dup"))
+            .await
+            .expect("duplicate skipped");
+        assert!(
+            ev.load(Ordering::Relaxed),
+            "Duplicate 在 gate 之前也必须置真（否则 drain/重复批会被漏算）"
+        );
+    }
+
+    /// P1-A1：None 路径零成本且不得 panic（单元测试/无重连语义场景）。
+    #[tokio::test]
+    async fn evidence_none_path_is_safe() {
+        let mut p = processor(None);
+        p.process(batch(1, "e-none")).await.expect("commit ok");
     }
 }
