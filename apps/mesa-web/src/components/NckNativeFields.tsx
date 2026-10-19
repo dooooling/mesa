@@ -67,6 +67,12 @@ export function NckNativeFields({
     (identityMode === "derived" || (confirmed && userCheck.ok));
 
   const submit = () => {
+    // P1 加固：`confirmed` 必须在这里再复核一次。
+    // 按钮的 disabled 只是 UI 层约束（React/AntD 都会拦截禁用按钮的 click），
+    // 不能作为唯一防线：任何绕过 disabled 的程序化调用（直接触发内部 handler、
+    // fiber 探针等）若只靠 UI 拦截，就能把「未经用户本次确认的自定义 Native Key」
+    // 加入点位。derived 身份按固定规则生成、不需要确认，因此只拦 user 模式。
+    if (identityMode === "user" && confirmed !== true) return;
     setSubmitError("");
     const built = buildNativePointSelection({ values, identityMode, userKey });
     if (!built.ok) {
