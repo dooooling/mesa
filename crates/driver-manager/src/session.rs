@@ -1975,8 +1975,6 @@ mod tests {
             worker: Option<tokio::task::JoinHandle<Result<(), IngressFatal>>>,
             store: Arc<EventStore>,
             services: Arc<EventServices>,
-            /// P1-A1：本次 attempt 的运行证据（None = 无观测需求）。
-            evidence: Option<Arc<AtomicBool>>,
         }
 
         impl Rig {
@@ -2043,7 +2041,6 @@ mod tests {
                     worker: Some(worker),
                     store,
                     services,
-                    evidence,
                 }
             }
 
