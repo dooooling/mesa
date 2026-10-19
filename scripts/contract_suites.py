@@ -47,6 +47,8 @@ LIFECYCLE = [
     "stop_lifecycle",
     # C1 A21：含 Secret 的 OPC UA Endpoint 进程级重启恢复（真实认证 + 新采集数据）。
     "opcua_auth_restart_e2e",
+    # P1-A1：退避重置需“本次 attempt 的运行证据”（假 RUNNING 不得无限 1s 重连）。
+    "reconnect_backoff",
 ]
 
 SUITES = BASELINE + EVENT + LIFECYCLE
