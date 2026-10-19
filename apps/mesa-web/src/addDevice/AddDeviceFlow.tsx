@@ -3,7 +3,10 @@
 // - 连接步（C2）改用共享面板 ConnectionSetupPanel：驱动清单/描述符失败即禁止前进，
 //   参数只由当前 Descriptor 物化，校验/探测结果随参数变化立即失效；
 //   原先的 FALLBACK_DRIVERS 常量已删除（不得把内置列表当可用驱动）；
-// - 数据步用 ResourcePickerAntd（manual 选择；browse 需 endpoint 已存在，暂只 manual）；
+// - 数据步用 ResourcePickerAntd：非 NCK 保持 manual 选择；NCK（PR-D）走语义模式
+//   （NckPointFields / NckNativeFields），点位只暂存在本地草稿，提交时交给
+//   planEndpointTaskSave 统一准入与装配。向导**不传 endpointId**：Endpoint 尚未
+//   创建，Browse 必然 404，语义页本身也不需要它；
 //   C3-D：**允许零采集点**（离线保存）——此时提交 `acquisition.tasks=[]`，且
 //   「创建后启动」默认 false 并禁用，界面明确提示「仅保存，不启动，不立即采集」；
 // - 提交走 bootstrapDevice（create→endpoint→tasks→start，失败反向补偿，
@@ -14,13 +17,24 @@ import { useNavigate } from "react-router-dom";
 import type { DriverDescriptor } from "../types";
 import {
   buildEndpointCreatePayload,
+  isNckDriver,
   suggestEndpointId,
+  type NckPointSelection,
   type ResourceSelection,
 } from "../deviceModel";
 import type { ConnectionValues } from "../connection/connectionSetupModel";
 import { ConnectionSetupPanel } from "../connection/ConnectionSetupPanel";
 import { ResourcePickerAntd } from "../components/ResourcePickerAntd";
 import { applySelectionAdd } from "../resourceSelectionModel";
+import {
+  classifyNckError,
+  describeNckFailure,
+  fetchNckCatalog,
+  indexNckCatalogDefinitions,
+  isNckRequestError,
+  type NckCatalog,
+} from "../nckCatalog";
+import { checkNckFamily } from "../nckPointModel";
 import { bootstrapDevice, isDraftComplete, newOperationKey, type AcquisitionDraft, type BootstrapReport, type ConnectionDraft, type DeviceDraft } from "./bootstrap";
 
 export function AddDeviceFlow() {
@@ -39,13 +53,117 @@ export function AddDeviceFlow() {
 
   // 数据步状态
   const [sels, setSels] = useState<ResourceSelection[]>([]);
+  // PR-D：NCK 语义/原生点位草稿（**仅本地**，不持久化；提交时统一交给保存计划）。
+  // NCK 点位绝不进入 `sels`——两种 Binding 结构不可互换。
+  const [nckPoints, setNckPoints] = useState<NckPointSelection[]>([]);
+  // I-2 定义目录：driver 作用域接口，Endpoint 尚未创建也能读取。
+  const [catalog, setCatalog] = useState<NckCatalog | null>(null);
+  const [catalogState, setCatalogState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [catalogError, setCatalogError] = useState("");
   const [intervalMs, setIntervalMs] = useState(1000);
   // C3-D：默认**不启动**。离线保存是常态（设备未开机 / 采集点稍后定），
   // 只有用户明确勾选才发送 start: true。
   const [startAfterCreate, setStartAfterCreate] = useState(false);
   // 零采集点时「创建后启动」无意义（会得到一个空转的运行态），UI 上直接禁用并
   // 保持 false；`bootstrapDevice` 里还有第二道兜底。
-  const zeroSelections = sels.length === 0;
+  const zeroSelections = sels.length === 0 && nckPoints.length === 0;
+
+  const nck = isNckDriver(connection?.driverId);
+  const catalogIndex = useMemo(
+    () => (catalog ? indexNckCatalogDefinitions(catalog.definitions) : null),
+    [catalog],
+  );
+  // 全量目录（含 identity）：表单内部会再按 scope 过滤；保存计划需要全量才能
+  // 对 identity 点位给出 SCOPE_NOT_COLLECTABLE 而不是 DEFINITION_MISSING。
+  const definitions = useMemo(() => catalogIndex?.byVariableId ?? null, [catalogIndex]);
+  const definitionList = useMemo(
+    () => (definitions ? Object.values(definitions) : null),
+    [definitions],
+  );
+  const catalogFamily = catalog?.family ?? null;
+  // family 的权威来源 = 连接步 canonical 草稿（与随后落库的 connection 同源）；
+  // 目录顶层 family 只是回显，**不**作为提交依据。
+  const endpointFamily = useMemo(() => {
+    const raw = connection?.connection.family;
+    return typeof raw === "string" ? raw.trim() : "";
+  }, [connection]);
+  // 高级原生 Schema 的唯一来源：Descriptor 的 `variable` 资源（不硬编码字段）。
+  const nativeSchema = useMemo(() => {
+    if (!nck || !desc) return null;
+    return desc.resources?.find((r) => r.id === "variable")?.parameters ?? null;
+  }, [nck, desc]);
+  const takenNckPointKeys = useMemo(
+    () => nckPoints.map((point) => point.point_key),
+    [nckPoints],
+  );
+  const nckDriverId = connection?.driverId ?? "";
+
+  // -------------------------------------------------------------------------
+  // 目录加载（PR-D）：进入数据步且当前驱动是 NCK 时，按 **driver 作用域** 读取
+  // 完整目录。该接口不建 Endpoint、不开机床连接，因此可以在向导阶段调用。
+  // 刻意**不带 family 过滤**（与端点页一致）：family 交叉校验交给 checkNckFamily。
+  // 任何失败（含目录不完整）都置空并进入 error —— 绝不保留旧目录继续提交。
+  // -------------------------------------------------------------------------
+  useEffect(() => {
+    if (step !== 2 || !nck || !nckDriverId) return;
+    let cancelled = false;
+    setCatalogState("loading");
+    setCatalogError("");
+    setCatalog(null);
+    fetchNckCatalog({ driverId: nckDriverId })
+      .then((loaded) => {
+        if (cancelled) return;
+        setCatalog(loaded);
+        setCatalogState("ready");
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setCatalog(null);
+        setCatalogState("error");
+        setCatalogError(
+          isNckRequestError(error)
+            ? `${error.code}（HTTP ${error.status}，${describeNckFailure(
+                classifyNckError(error.status, error.kind),
+              )}）：${error.message}`
+            : error instanceof Error
+              ? error.message
+              : String(error),
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [step, nck, nckDriverId]);
+
+  /**
+   * 接收语义/原生点位。
+   *
+   * 这里只做「批内唯一性」这道父层职责（与端点页 addPoint 同口径），
+   * **不**重新实现身份/表单校验：Key 只能来自 NckPointFields 的服务端
+   * identity-preview 或 NckNativeFields 的已冻结规则；Native 的显式确认与
+   * 字段校验也由组件自身把关（按钮不可提交时本回调不会被调用）。
+   */
+  const addNckPoint = (point: NckPointSelection) => {
+    if (takenNckPointKeys.includes(point.point_key)) {
+      message.error(
+        "该 point_key 已被本批点位占用：请调整 Target/Arguments（不得自动改名/加后缀）",
+      );
+      return false;
+    }
+    setNckPoints((prev) => [...prev, point]);
+    return true;
+  };
+
+  /**
+   * 显式移除点位：**只影响当前向导草稿**，不发任何网络写请求。
+   *
+   * 不做直接编辑（不引入第二套编辑状态机）：删除后重新加入必须重新选择变量、
+   * 重新运行表单校验并由服务端 Preview 重新计算身份；加入成功时
+   * ResourcePickerAntd 会以 nonce 重挂载语义表单，因此不存在复用旧 Preview 的路径。
+   */
+  const removeNckPoint = (index: number) => {
+    setNckPoints((prev) => prev.filter((_, i) => i !== index));
+  };
 
   // 提交状态
   const [submitting, setSubmitting] = useState(false);
@@ -96,6 +214,28 @@ export function AddDeviceFlow() {
       connection: args.connection,
       id: (values.id ?? connId).trim() || undefined,
     });
+    // ---------------------------------------------------------------------
+    // P0：连接草稿变化（Driver 或 family）后，旧 NCK 点位可能属于另一系列。
+    // 必须整批清空并重载目录，**不做跨 Driver 自动迁移**；否则旧 family 的
+    // 语义 Key 会被当成新连接下的有效身份直接提交。
+    // ---------------------------------------------------------------------
+    const prevDriverId = connection?.driverId ?? "";
+    const prevFamily =
+      typeof connection?.connection.family === "string" ? connection.connection.family : "";
+    const nextFamily =
+      typeof payload.connection.family === "string" ? payload.connection.family : "";
+    const changed = !!connection && (prevDriverId !== args.driverId || prevFamily !== nextFamily);
+    if (changed && (isNckDriver(prevDriverId) || isNckDriver(args.driverId))) {
+      setNckPoints([]);
+      setCatalog(null);
+      setCatalogState("idle");
+      setCatalogError("");
+      // 旧 canonical 选择在切换后的驱动上同样不可信；NCK 与 selections 互斥。
+      setSels([]);
+      message.warning(
+        "连接草稿已变更（Driver/family）：已清空之前添加的 NCK 点位与目录缓存，请重新选择点位。",
+      );
+    }
     setConnection({
       driverId: args.driverId,
       endpointId: payload.id,
@@ -117,9 +257,41 @@ export function AddDeviceFlow() {
       message.error("驱动描述符未就绪，已阻止进入确认页（连接参数未通过描述符校验）。");
       return;
     }
+    if (nck) {
+      // 目录失败/不完整 ⇒ fail-closed：不进入确认页，也不拿旧目录凑合。
+      if (catalogState !== "ready" || !definitions) {
+        message.error("NCK 定义目录未就绪或不完整：已阻止进入确认页（不会使用旧目录缓存继续提交）。");
+        return;
+      }
+      // family 缺失 ⇒ 禁止提交（即使零点位也不放行：连接本身不可信）。
+      if (!endpointFamily) {
+        message.error("连接草稿缺少 family：无法确认系列，禁止提交 NCK 点位。");
+        return;
+      }
+      // 提交前逐点复核 family（复用 checkNckFamily，不新写规则）：
+      // 若连接草稿在加入点位后被改动而清空逻辑失效，这里仍会拒绝。
+      for (const point of nckPoints) {
+        if (point.kind !== "nck_variable") continue;
+        const variableId =
+          typeof point.parameters.variable_id === "string" ? point.parameters.variable_id : "";
+        const definition = definitions[variableId];
+        const family = checkNckFamily({
+          endpointFamily,
+          definitionFamily: definition?.family,
+          catalogFamily,
+        });
+        if (!family.ok) {
+          message.error(`点位 ${point.point_key} 的 family 校验失败：${family.code} ${family.message}`);
+          return;
+        }
+      }
+    }
     setAcquisition({
       intervalMs,
-      selections: sels,
+      // NCK 点位**绝不**进入 selections（两种结构不可互换）。
+      selections: nck ? [] : sels,
+      nckPoints: nck ? nckPoints : undefined,
+      nckDefinitions: nck ? definitions : undefined,
       // 零采集点强制不启动（与 bootstrapDevice 的第二道兜底同口径）
       startAfterCreate: zeroSelections ? false : startAfterCreate,
     });
@@ -173,6 +345,11 @@ export function AddDeviceFlow() {
     setConnection(null);
     setAcquisition(null);
     setSels([]);
+    // PR-D：再建一个必须回到干净的 NCK 草稿/目录状态（旧目录与旧点位不得复用）。
+    setNckPoints([]);
+    setCatalog(null);
+    setCatalogState("idle");
+    setCatalogError("");
     // C3-D：再建一个设备必须回到默认「不启动」，不得继承上一次的勾选状态
     //（否则第二次创建会在用户没有明确选择的情况下启动采集）。
     setStartAfterCreate(false);
@@ -249,6 +426,134 @@ export function AddDeviceFlow() {
         <Card size="small" title="③ 数据">
           {!desc ? (
             <div style={{ fontSize: 12, color: "#525252" }}>驱动描述缺失，无法选择数据点。请返回上一步确认驱动。</div>
+          ) : nck ? (
+            <>
+              {/* NCK：目录是 driver 作用域能力，Endpoint 尚未创建也能加载。
+                  失败/不完整即 fail-closed：不渲染可用语义表单，也不允许提交。 */}
+              {catalogState === "loading" ? (
+                <Alert
+                  type="info"
+                  showIcon
+                  data-testid="nck-catalog-loading"
+                  message="正在加载 NCK 定义目录…"
+                  description="目录来自 GET /api/v1/drivers/sinumerik-nck/definitions（driver 作用域，不创建 Endpoint、不连接机床）。"
+                />
+              ) : null}
+              {catalogState === "error" ? (
+                <Alert
+                  type="error"
+                  showIcon
+                  data-testid="nck-catalog-error"
+                  message="NCK 定义目录加载失败：语义点位与提交已禁用（fail-closed）"
+                  description={`${catalogError}（不会使用旧目录缓存继续提交）`}
+                />
+              ) : null}
+              {catalogState === "ready" && catalog ? (
+                <div
+                  data-testid="nck-catalog-meta"
+                  style={{ fontSize: 12, color: "#525252" }}
+                >
+                  定义目录：{catalog.total} 条 / {catalog.pages} 页 / rev {catalog.revision} ·
+                  family 取自连接草稿：{endpointFamily || "缺失（禁止提交）"}
+                </div>
+              ) : null}
+              {!endpointFamily ? (
+                <Alert
+                  type="error"
+                  showIcon
+                  data-testid="nck-family-missing"
+                  message="连接草稿缺少 family：禁止新增/提交 NCK 点位"
+                  description="family 必须以连接步的 canonical 草稿为准（目录顶层 family 只是回显，不是提交依据）。"
+                />
+              ) : null}
+              <ResourcePickerAntd
+                resources={(desc.resources ?? []) as never[]}
+                existingSelections={[] as never}
+                selectionMethods={(desc.resource_selection_methods ?? ["manual"]) as never}
+                // 刻意**不传 endpointId**：Endpoint 尚未创建，Browse 必然 404；
+                // 语义页自身不需要它。传了反而会让语义叶回填被静默吞掉。
+                semantic={{
+                  driverId: nckDriverId,
+                  // null ⇒ 组件 fail-closed，不退回旧 variable 原生字段路径。
+                  definitions: definitionList,
+                  endpointFamily,
+                  catalogFamily,
+                  nativeSchema,
+                  takenPointKeys: takenNckPointKeys,
+                  onAddPoint: addNckPoint,
+                }}
+              />
+              <div style={{ marginTop: 8, fontSize: 12, color: "#525252" }}>
+                浏览需保存后到设备详情页使用；向导内不伪造 Browse 入口。已加入 {nckPoints.length} 个 NCK 点位。
+              </div>
+              {nckPoints.length > 0 ? (
+                <div
+                  data-testid="nck-draft-points"
+                  style={{ marginTop: 8, display: "grid", gap: 6 }}
+                >
+                  {nckPoints.map((point, i) => (
+                    <div
+                      key={`${point.point_key}-${i}`}
+                      data-testid="nck-draft-point-row"
+                      style={{
+                        display: "flex",
+                        gap: 8,
+                        alignItems: "flex-start",
+                        flexWrap: "wrap",
+                        fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace",
+                        fontSize: 12,
+                      }}
+                    >
+                      <code data-testid="nck-draft-point-key">{point.point_key}</code>
+                      <Tag>{point.kind}</Tag>
+                      <code
+                        data-testid="nck-draft-point-parameters"
+                        style={{ fontSize: 11, color: "#525252", flex: 1 }}
+                      >
+                        {JSON.stringify(point.parameters)}
+                      </code>
+                      <Button
+                        size="small"
+                        type="link"
+                        danger
+                        data-testid="nck-remove-point"
+                        onClick={() => removeNckPoint(i)}
+                      >
+                        移除
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {zeroSelections ? (
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginTop: 8 }}
+                  message="未选择数据点：将按「仅保存」创建"
+                  description="本次只保存设备与连接（后端收到 acquisition.tasks=[]），不启动、不立即采集。设备离线或采集点尚未确定时可以直接下一步，稍后再到设备详情里补采集点并手动启动。"
+                />
+              ) : null}
+              <div style={{ marginTop: 12, display: "flex", gap: 12, alignItems: "center" }}>
+                <span style={{ fontSize: 12 }}>采集周期</span>
+                <InputNumber min={100} value={intervalMs} onChange={(v) => setIntervalMs(typeof v === "number" ? v : 1000)} />
+                <span style={{ fontSize: 12 }}>ms</span>
+                <Checkbox
+                  checked={!zeroSelections && startAfterCreate}
+                  disabled={zeroSelections}
+                  onChange={(e) => setStartAfterCreate(e.target.checked)}
+                >
+                  创建后启动
+                </Checkbox>
+                <span style={{ fontSize: 12, color: "#525252" }}>
+                  {zeroSelections
+                    ? "零采集点：创建后为 STOPPED（仅保存配置）"
+                    : startAfterCreate
+                      ? "创建成功后立即开始采集"
+                      : "仅保存，不启动，不立即采集"}
+                </span>
+              </div>
+            </>
           ) : (
             <>
               <ResourcePickerAntd
@@ -342,7 +647,13 @@ export function AddDeviceFlow() {
           <pre style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 12, background: "#f4f4f4", padding: 12 }}>
 {`${device?.deviceId}（${device?.deviceName}）
 └─ ${connection?.endpointName} [${connection?.driverId}]
-   └─ ${acquisition?.selections.length === 0 ? "零采集点（仅保存连接）" : `${acquisition?.selections.length} 个数据点 · ${acquisition?.intervalMs}ms`} · ${acquisition?.startAfterCreate ? "创建后启动" : "仅保存（不启动、不立即采集）"}`}
+   └─ ${
+     (acquisition?.nckPoints?.length ?? 0) > 0
+       ? `${acquisition?.nckPoints?.length} 个 NCK 点位 · ${acquisition?.intervalMs}ms`
+       : acquisition?.selections.length === 0
+         ? "零采集点（仅保存连接）"
+         : `${acquisition?.selections.length} 个数据点 · ${acquisition?.intervalMs}ms`
+   } · ${acquisition?.startAfterCreate ? "创建后启动" : "仅保存（不启动、不立即采集）"}`}
           </pre>
           {!draftComplete && (
             <Alert type="warning" showIcon message="草稿不完整" description="请返回前面步骤补齐设备与连接（采集点可以为空：零采集点将按「仅保存」创建）。" />
