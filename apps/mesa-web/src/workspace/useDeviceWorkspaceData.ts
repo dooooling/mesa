@@ -26,6 +26,19 @@ export interface WorkspacePoint {
   type: string;
   value: unknown;
   timestamp_ns: number;
+  /**
+   * PR-D1：质量码（十进制字符串或符号标记 `DEVICE_ERROR`/`COMMUNICATION_LOST`）。
+   * 运行期字段**早已存在**（`LatestEntry` 原样输出），这里只补类型；
+   * 缺失即 `undefined`（GOOD 行通常没有该键），不得用 `""` 兜底。
+   */
+  quality_code?: string;
+  /**
+   * PR-D1：值的来源 `CURRENT | LAST_KNOWN | PLACEHOLDER`（后端已 normalize）。
+   * 它只表达"这条值是谁的"，不表达"采集是否成功"——成功与否看 `quality`。
+   */
+  value_origin?: string;
+  /** 协议原始源时间；NCK 恒无、PLACEHOLDER 强制无。 */
+  source_timestamp_ns?: number;
   /** P1 来源标签（Driver 人类可读来源，如 S7 DB10.DBD20）；缺失即未支持。 */
   source_label?: string;
   /**
@@ -65,6 +78,11 @@ export interface DevicePointView extends WorkspacePoint {
   ageMs: number | null;
   /** 派生状态：quality BAD 即 BAD；否则 age 超阈即 STALE；非法时间戳为 UNKNOWN。 */
   derived: PointStale;
+  /**
+   * PR-D1：Driver 身份（由端点上下文注入，行内没有 `driver_id`）。
+   * `quality_code` 必须与它组成二元组才能分类；缺失为 `""`（分类降级 UNKNOWN）。
+   */
+  driverId: string;
   endpointName: string;
   deviceId: string;
   deviceName: string;
@@ -110,7 +128,7 @@ export const DEVICE_ENDPOINTS_POLL_MS = 10_000;
 function toView(
   p: WorkspacePoint,
   buildNow: number,
-  ctx: Map<string, { endpointName: string; deviceId: string; deviceName: string }>,
+  ctx: Map<string, { endpointName: string; deviceId: string; deviceName: string; driverId: string }>,
 ): DevicePointView {
   const c = ctx.get(p.endpoint_id);
   const ageMs = pointAgeMs(p.timestamp_ns, buildNow);
@@ -124,6 +142,8 @@ function toView(
     sourceText: p.source_label ?? null,
     ageMs,
     derived: derivePointStale(p.quality, ageMs),
+    // PR-D1：driver 只从端点上下文来；映射缺失即 ""（码分类降级，不猜）。
+    driverId: c?.driverId ?? "",
     endpointName: c?.endpointName ?? p.endpoint_id,
     deviceId: c?.deviceId ?? "",
     deviceName: c?.deviceName ?? "",
@@ -238,7 +258,13 @@ export function useDeviceWorkspaceData(deviceId: string): DeviceWorkspaceData {
   const ctx = useMemo(
     () =>
       resolveEndpointContexts(
-        endpoints.map((e) => ({ id: e.id, name: e.name, device_id: e.device_id })),
+        endpoints.map((e) => ({
+          id: e.id,
+          name: e.name,
+          device_id: e.device_id,
+          // PR-D1：driver_id 决定 quality_code 的语义空间（端点清单本就带该字段）。
+          driver_id: e.driver_id,
+        })),
         devices.length ? devices : device ? [device] : [],
       ),
     [endpoints, devices, device],

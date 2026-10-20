@@ -8,6 +8,7 @@ import { Alert, Button, Card, Input, Select, Space, Table, Tag } from "antd";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { formatAge, formatPointValue } from "../deviceModel";
 import { PointDetailDrawer } from "../components/PointDetailDrawer";
+import { QualityCodeBreakdown } from "../components/QualityCodeBreakdown";
 import type { DevicePointView } from "../workspace/useDeviceWorkspaceData";
 import { AgeCell, NameCell, SourceCell, StatusCell, ValueCell } from "../workspace/LiveCells";
 import { useLivePointsSource } from "../workspace/useLivePointsSource";
@@ -72,6 +73,16 @@ export function GlobalDataPage() {
     else next.set("connection", v);
     setParams(next);
   };
+
+  // PR-D1：按码分解/导出的作用域集合（连接筛选后）。memo 化以保住
+  // Popover 内 useMemo 的依赖引用（§7.3：只在点击展开时算一次）。
+  const breakdownPoints = useMemo(
+    () =>
+      connectionParam === "ALL"
+        ? src.allPoints
+        : src.allPoints.filter((p) => p.endpoint_id === connectionParam),
+    [src.allPoints, connectionParam],
+  );
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -212,7 +223,13 @@ export function GlobalDataPage() {
         {src.endpointsError ? <Alert type="warning" showIcon message="连接清单不可用" description={src.endpointsError} style={{ marginBottom: 8 }} /> : null}
         {src.pointsError ? <Alert type="warning" showIcon message="快照更新失败（显示上次已知值）" style={{ marginBottom: 8 }} /> : null}
         <div style={{ fontSize: 12, color: "#525252", marginBottom: 8 }}>
-          全部 {src.counts.total} · GOOD {src.counts.good} · BAD {src.counts.bad} · STALE {src.counts.stale}
+          {/* PR-D1 U8：计数行**仅点击**打开按码分解；导出作用域 = 当前连接筛选。 */}
+          <QualityCodeBreakdown
+            points={breakdownPoints}
+            scopeEndpointId={connectionParam === "ALL" ? null : connectionParam}
+          >
+            全部 {src.counts.total} · GOOD {src.counts.good} · BAD {src.counts.bad} · STALE {src.counts.stale}
+          </QualityCodeBreakdown>
         </div>
         <Table
           size="small"

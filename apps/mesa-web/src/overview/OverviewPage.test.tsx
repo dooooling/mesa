@@ -28,6 +28,8 @@ function pt(ep: string, key: string, quality: string, ageMs: number): DevicePoin
     sourceText: key,
     ageMs: age,
     derived: quality === "BAD" ? "BAD" : age > POINT_STALE_AFTER_MS ? "STALE" : "GOOD",
+    // PR-D1：DevicePointView 新增 driverId（码分类命名空间）；测试夹具同口径。
+    driverId: "focas2",
     endpointName: ep.toUpperCase(),
     deviceId: ep === "ep-a" || ep === "ep-b" ? "cnc-01" : "",
     deviceName: ep === "ep-a" || ep === "ep-b" ? "CNC-01" : "",

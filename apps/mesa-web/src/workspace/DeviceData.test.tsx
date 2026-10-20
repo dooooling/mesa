@@ -344,6 +344,8 @@ describe("M2 需要关注规则", () => {
         value: 1, timestamp_ns: (T0 - POINT_STALE_AFTER_MS - 5000) * 1e6,
         displayKey: "stale-k", sourceText: "stale-k",
         ageMs: POINT_STALE_AFTER_MS + 5000, derived: "STALE" as const,
+        // PR-D1：DevicePointView 新增 driverId（测试夹具补齐，不改断言）。
+        driverId: "s7",
         endpointName: "OK-EP", deviceId: "cnc-01", deviceName: "CNC-01",
       },
       {
@@ -351,6 +353,7 @@ describe("M2 需要关注规则", () => {
         value: 0, timestamp_ns: T0 * 1e6,
         displayKey: "bad-k", sourceText: "bad-k",
         ageMs: 0, derived: "BAD" as const,
+        driverId: "s7",
         endpointName: "OK-EP", deviceId: "cnc-01", deviceName: "CNC-01",
       },
     ];

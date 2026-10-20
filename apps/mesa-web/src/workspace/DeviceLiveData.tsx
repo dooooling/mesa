@@ -8,6 +8,7 @@ import { Button, Input, Select, Space, Table, Tag } from "antd";
 import type { DevicePointView, WorkspaceEndpoint } from "./useDeviceWorkspaceData";
 import { ConnectionSelect } from "./ConnectionSelect";
 import { AgeCell, NameCell, SourceCell, StatusCell, ValueCell } from "./LiveCells";
+import { QualityCodeBreakdown } from "../components/QualityCodeBreakdown";
 import { useConnectionQuery } from "./useConnectionQuery";
 
 type StatusFilter = "ALL" | "GOOD" | "BAD" | "STALE";
@@ -47,19 +48,27 @@ export function DeviceLiveData(props: {
     });
   }, [points, effectiveEndpointId, status, search]);
 
+  // 计数与按码分解共用同一作用域集合（连接筛选后）；不受状态/搜索过滤影响
+  //（与标题语义一致）。
+  const scopedPoints = useMemo(
+    () =>
+      effectiveEndpointId
+        ? points.filter((p) => p.endpoint_id === effectiveEndpointId)
+        : points,
+    [points, effectiveEndpointId],
+  );
+
   const counts = useMemo(() => {
-    // 计数不受状态/搜索过滤影响，只受连接上下文影响（与标题语义一致）。
-    const scoped = effectiveEndpointId ? points.filter((p) => p.endpoint_id === effectiveEndpointId) : points;
     let good = 0;
     let bad = 0;
     let stale = 0;
-    for (const p of scoped) {
+    for (const p of scopedPoints) {
       if (p.derived === "GOOD") good += 1;
       else if (p.derived === "BAD") bad += 1;
       else if (p.derived === "STALE") stale += 1;
     }
-    return { total: scoped.length, good, bad, stale };
-  }, [points, effectiveEndpointId]);
+    return { total: scopedPoints.length, good, bad, stale };
+  }, [scopedPoints]);
 
   // 列定义 memo 化：每 render 新建 columns 数组会迫使 Table 全量重算。
   // 固定布局 + 显式列宽：动态文本只在格内省略，不推动整表（Layout shift 根治）。
@@ -148,7 +157,13 @@ export function DeviceLiveData(props: {
       </div>
 
       <div style={{ fontSize: 12, color: "#525252" }}>
-        全部 {counts.total} · GOOD {counts.good} · BAD {counts.bad} · STALE {counts.stale}
+        {/* PR-D1 U8：计数行**仅点击**打开按码分解（悬停不展开）；文案不变。 */}
+        <QualityCodeBreakdown
+          points={scopedPoints}
+          scopeEndpointId={effectiveEndpointId ?? null}
+        >
+          全部 {counts.total} · GOOD {counts.good} · BAD {counts.bad} · STALE {counts.stale}
+        </QualityCodeBreakdown>
       </div>
 
       <Table

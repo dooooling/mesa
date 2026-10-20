@@ -5,8 +5,21 @@
 import { Button, Descriptions, Drawer, Space, Tag } from "antd";
 import { useNavigate } from "react-router-dom";
 import { formatAge, formatPointValue } from "../deviceModel";
+import {
+  CODE_FOOTNOTE,
+  COMMUNICATION_LOST_NOTE,
+  classifyCode,
+  codeGroupTitle,
+  codeHex,
+  codeText,
+  deriveFreshness,
+  namespaceLabel,
+  samplingBadge,
+} from "../qualityCode";
 import type { DevicePointView } from "../workspace/useDeviceWorkspaceData";
 import { DisplayNameEditor, type RenameTarget } from "./DisplayNameEditor";
+
+const MONO = "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace";
 
 function formatNsTime(ns: unknown): string {
   const n = typeof ns === "number" ? ns : Number(ns);
@@ -28,6 +41,15 @@ export function PointDetailDrawer(props: {
 }) {
   const { deviceId, deviceName, point, onClose, onRenamed } = props;
   const nav = useNavigate();
+
+  // PR-D1：采样状态与原因码全部**即时派生**（不写回任何 hook/store）。
+  const codeClass = point
+    ? classifyCode(point.driverId ?? "", point.quality_code, point.quality)
+    : "NONE";
+  const badge = point
+    ? samplingBadge(point.value_origin, point.quality, point.quality_code)
+    : null;
+  const codeExplanation = point ? codeText(point.driverId ?? "", point.quality_code) : null;
 
   const gotoAcquisition = () => {
     if (!point) return;
@@ -76,6 +98,73 @@ export function PointDetailDrawer(props: {
               <span style={{ fontSize: 12, color: "#525252" }}>{formatAge(point.ageMs)}未更新</span>
             </Space>
           </section>
+
+          {/*
+            PR-D1 U1：采样区按 (value_origin, quality) 二维取文案。
+            `CURRENT` 只说明"值由本次 attempt 产生"，不说明采集成功——
+            `CURRENT + BAD` 是本次尝试返回的失败结果，必须红色（P1-1）。
+          */}
+          {badge === null ? null : (
+            <section>
+              <h4>采样</h4>
+              <Space wrap>
+                <Tag color={badge.color}>{badge.text}</Tag>
+                {badge.abnormal ? <Tag color="orange">异常形态</Tag> : null}
+              </Space>
+              <div style={{ fontSize: 12, color: "#525252", marginTop: 8 }}>
+                最后采样时间：
+                {deriveFreshness(point.value_origin) === "NO_VALUE"
+                  ? "—（无有效采样）"
+                  : `${formatNsTime(point.timestamp_ns)}${
+                      badge.notCurrent ? "（非本次 attempt 产生）" : ""
+                    }`}
+              </div>
+              <div style={{ fontSize: 12, color: "#525252" }}>
+                源时间：
+                {point.source_timestamp_ns === undefined
+                  ? "—（协议未提供）"
+                  : formatNsTime(point.source_timestamp_ns)}
+              </div>
+            </section>
+          )}
+
+          {/*
+            PR-D1 U2–U6：原因码区。`quality_code` 缺失即整块不渲染（GOOD 行零额外 DOM）。
+            码与命名空间必须绑定显示；未知码只显示原值 + "不解释"；Mesa 标记
+            明确标注"不是设备返回码"，断线覆盖提示"不可恢复"。
+          */}
+          {point.quality_code === undefined ? null : (
+            <section>
+              <h4>原因码</h4>
+              <div style={{ fontSize: 12, color: "#525252" }}>{codeGroupTitle(codeClass)}</div>
+              <div
+                data-testid="quality-code-body"
+                style={{ marginTop: 6, display: "grid", gap: 4 }}
+              >
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <span style={{ fontFamily: MONO }}>
+                    {codeHex(point.quality_code) ?? point.quality_code}
+                  </span>
+                  {namespaceLabel(codeClass) === null ? null : (
+                    <Tag style={{ marginInlineEnd: 0 }}>{namespaceLabel(codeClass)}</Tag>
+                  )}
+                </div>
+                {codeExplanation === null ? null : (
+                  <div style={{ fontSize: 12 }}>{codeExplanation}</div>
+                )}
+                {codeClass === "DEVICE_S7_ITEM" && codeExplanation === null ? (
+                  <div style={{ fontSize: 12, color: "#525252" }}>仓库无该码定义（待确认）</div>
+                ) : null}
+                {codeClass === "UNKNOWN" ? (
+                  <div style={{ fontSize: 12, color: "#525252" }}>不解释</div>
+                ) : null}
+                {point.quality_code === "COMMUNICATION_LOST" ? (
+                  <div style={{ fontSize: 12 }}>{COMMUNICATION_LOST_NOTE}</div>
+                ) : null}
+              </div>
+              <div style={{ fontSize: 12, color: "#525252", marginTop: 6 }}>{CODE_FOOTNOTE}</div>
+            </section>
+          )}
 
           <section>
             <h4>数据类型</h4>

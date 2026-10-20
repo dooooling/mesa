@@ -42,6 +42,12 @@ export interface EndpointContext {
   endpointName: string;
   deviceId: string;
   deviceName: string;
+  /**
+   * PR-D1：Driver 身份（端点清单本就带 `driver_id`）。
+   * `quality_code` 的语义空间由它决定（`3` 在 nck 与 focas2 含义不同），
+   * 缺失时置 `""`，码分类降级为 `UNKNOWN`（不解释）——不猜命名空间。
+   */
+  driverId: string;
 }
 
 /**
@@ -49,7 +55,7 @@ export interface EndpointContext {
  * （如已被删）时回落显示 device_id，endpoint 名缺失回落 id——不编造归属。
  */
 export function resolveEndpointContexts(
-  endpoints: Array<{ id: string; name?: string; device_id?: string }>,
+  endpoints: Array<{ id: string; name?: string; device_id?: string; driver_id?: string }>,
   devices: Array<{ id: string; name: string }>,
 ): Map<string, EndpointContext> {
   const byId = new Map(devices.map((d) => [d.id, d.name] as const));
@@ -61,6 +67,7 @@ export function resolveEndpointContexts(
       endpointName: ep.name ?? ep.id,
       deviceId,
       deviceName: (deviceId && byId.get(deviceId)) || deviceId || "—",
+      driverId: ep.driver_id ?? "",
     });
   }
   return out;
@@ -565,6 +572,13 @@ export interface PointSnapshotLike {
   type?: string;
   source_label?: string;
   display_name?: string;
+  /**
+   * PR-D1：服务端**早已输出**这两个字段（`LatestEntry` 的 `quality_code` /
+   * `value_origin`），只是前端类型未声明、无人读。缺失即 `undefined`
+   * （后端 `skip_serializing_if = "Option::is_none"`，不是空串）。
+   */
+  quality_code?: string;
+  value_origin?: string;
 }
 
 /** 稳定行键（与后端 latest_all 的 endpoint_id+point_id 口径一致）。 */
@@ -587,6 +601,10 @@ function snapshotValueKey(v: unknown): string {
 /**
  * 行级字段指纹：metadata 全字段 + value/quality/timestamp（与 now 无关）。
  * 少任何一个都会吞更新（P1 source_label 可独立刷新，P2 display_name 可跨客户端改名）。
+ *
+ * PR-D1（P0-1）：`quality_code` / `value_origin` 必须计入。断线只把码覆盖成
+ * `COMMUNICATION_LOST`（`value`/`timestamp_ns`/`quality` 都可能不变），
+ * 指纹不含它们时 reconcile 会保留旧引用 → UI 永远看不到"码变了"。
  */
 export function pointFieldFingerprint(p: PointSnapshotLike): string {
   return [
@@ -599,6 +617,8 @@ export function pointFieldFingerprint(p: PointSnapshotLike): string {
     String(p.timestamp_ns ?? 0),
     p.source_label ?? "",
     p.display_name ?? "",
+    p.quality_code ?? "",
+    p.value_origin ?? "",
   ].join("|");
 }
 
