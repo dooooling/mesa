@@ -319,7 +319,7 @@
    - **原始证据** = `points_raw_text` + `evidence_integrity`（`raw_sha256` 字节级可校验、`raw_utf8_bytes` 可核大小、`raw_preserved` 说明存放位置）；
    - **结构化副本** = `points[]` + `summary`（供展示与统计，允许精度损失）。
 3. **`STATE_UNCHANGED` 不等于"有效新鲜样本"**：前后状态相同只说明两次读到的 `runtime` 相同；中间可能发生过一次短暂重连（退避窗口内的 `RECONNECTING` 未被两次采样覆盖），且部分行本就可能是上一轮的 `LAST_KNOWN`。因此：
-   - 有效性的唯一判据是 `sampling.freshness_summary`（`current` / `last_known` / `placeholder` 分布）；
+   - **数据来源分布**以 `sampling.freshness_summary`（`current` / `last_known` / `placeholder` 分布）判断；**质量**以逐点 `quality` 判断；**时间新鲜程度**还须结合采样时间与运行窗口。三者均不能仅由 `state_consistency` 或 `request_status` 推导；
    - `request_status=COMPLETE` 只说明"请求都成功"，与新鲜度、连接健康、设备正常**无关**；
    - `state_consistency` 只描述状态是否漂移，**不得**据此把整个导出标为"有效"；
    - `evidence_integrity` 只描述"原文是否完整保留且可校验"，同样不表达数据有效性；
@@ -536,7 +536,7 @@
 | 编号 | 改在哪一节 | 改成了什么 |
 |---|---|---|
 | **P0-1** 纳秒精度 | §6.2 步骤 1/3/7、§6.3、§6.4 注 2、§6.6-1、§10.2 T10/T15、§10.3-2/3 | `taken_at_ns`/`points_read_at_ns` 改**十进制字符串**（`BigInt`）；`points[]` 降级为"结构化副本"；`points_raw_text` + 校验和 为权威；明确**不得**声称两者纳秒一致 |
-| **P0-2** 状态≠有效 | §6.2 步骤 6、§6.3、§6.4 注 1、§6.6-3、§9 U10、§10.2 T12 | 拆成 `state_consistency` / `request_status` / `freshness_summary` 三个采样字段 + 顶层 `limitations`（第三轮再补 `sampling.evidence_integrity`，凑齐四个）；删除旧的单一"有效/无效"标志；有效性只看 `freshness_summary` |
+| **P0-2** 状态≠有效 | §6.2 步骤 6、§6.3、§6.4 注 1、§6.6-3、§9 U10、§10.2 T12 | 拆成 `state_consistency` / `request_status` / `freshness_summary` 三个采样字段 + 顶层 `limitations`（第三轮再补 `sampling.evidence_integrity`，凑齐四个）；删除旧的单一"有效/无效"标志；**不再有单一有效性判据** —— 来源分布看 `freshness_summary`、质量看逐点 `quality`、时间新鲜度需结合采样时间与运行窗口 |
 | **P1-1** CURRENT+BAD | §5.3（表头与 9 行）、§5.4-2、§9 U1/U12、§10.2 T6/T6b | `CURRENT+GOOD`→`当前有效值`（绿）；`CURRENT+BAD`→`本次返回失败`（红，禁绿）；`LAST_KNOWN`→`旧值，未更新`；`PLACEHOLDER`→`无有效值` |
 | **P1-2** 原始证据 vs 副本 | §6.3、§6.5、§6.6-2 | 原文 + 校验和 = 原始证据；`points[]` + `summary` = 结构化副本；5 MiB 阈值按 **UTF-8 字节**（`TextEncoder`）判定 |
 | **P1-3** 收窄 NCK 解释 | §4.2（3 行改写 + 收窄口径块）、§4.3、§4.4（新增禁用清单）、§9 U4、§10.2 T8 | 只给 `仓库现有 S7 参考码表：<类别>（可能关联，需结合协议层确认）`；逐字禁用 `CPU 保护等级`/`DB 不存在`/`PUT/GET` 等具体根因 |
