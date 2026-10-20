@@ -570,7 +570,8 @@ async fn attempt_session(
     };
     // G7：回填 pid（隔离态复核"残留进程是否已死"的唯一依据）。
     if let Some(c) = ctx {
-        c.pid.store(process.pid, std::sync::atomic::Ordering::Release);
+        c.pid
+            .store(process.pid, std::sync::atomic::Ordering::Release);
     }
 
     let (mut session, mut events, unresponsive_flag) = match Session::connect_retry_with_heartbeat(

@@ -2122,7 +2122,24 @@ async fn delete_endpoint(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if state.manager.is_running(&id) {
+    // G7：判据必须是 **attempt 真值**而不是 `is_running()`。拆解期 `is_running()`
+    // 已经是 false，但 attempt 条目仍在（正在等驱动进程退出）；此时删除配置会
+    // 留下"配置没了、驱动任务还在收尾/隔离"的孤儿，且迟到状态写入可能复活端点。
+    // 隔离态（FailedUnknown）同样命中——复核通过前不得删配置。
+    if state.manager.has_live_attempt(&id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json_error(
+                "CONFLICT",
+                "endpoint 正在运行，请先停止后再删除",
+            )),
+        );
+    }
+    // P0-7：作废在途 Start 票据（bump stop_gen），再复查一次 attempt 真值。
+    // 提交路径持有同一把门锁 ⇒ bump 返回后不可能再产生新 attempt；而 bump 之前
+    // 已提交的 attempt 在这里必然可见。两者合起来关掉"删除后又被启动"的窗口。
+    state.lifecycle.invalidate_starts_for_delete(&id);
+    if state.manager.has_live_attempt(&id) {
         return (
             StatusCode::CONFLICT,
             Json(json_error(
@@ -2139,6 +2156,9 @@ async fn delete_endpoint(
             state
                 .snapshot
                 .remove_endpoint(&id, state.manager.gen_floor(&id));
+            // 端点已彻底删除：停止意图围栏（若曾因落盘失败写入）已无保护对象，
+            // 不清会留下指向不存在端点的永久围栏项，干扰人工核验与诊断。
+            let _ = state.store.clear_stop_intent_unpersisted(&id);
             (StatusCode::OK, Json(serde_json::json!({ "deleted": id })))
         }
         Ok(false) => (
@@ -2198,12 +2218,21 @@ async fn stop_endpoint(
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let admission = state.lifecycle.admit_stop(&id);
+    let stop_gen = admission.stop_gen;
     let (stop_res, persist_res) = tokio::join!(admission.handle.await_result(), admission.persist);
     let persist_failed = match persist_res {
         Ok(Ok(())) => None,
         Ok(Err(e)) => Some(e),
         // blocking 任务本身 panic/取消：同样按"意图未持久化"处理（fail-closed）。
-        Err(join) => Some(format!("persist task failed: {join}")),
+        // 必须**归还门状态**：否则 `stop_persist_inflight` 永远非空，P0-1 的启动
+        // 闸门会把该端点永久锁在 409（一次任务异常 ≠ 永久不可用）。
+        Err(join) => {
+            let msg = format!("persist task failed: {join}");
+            let _ = state
+                .lifecycle
+                .finish_stop_persist(&id, stop_gen, Err(msg.clone()));
+            Some(msg)
+        }
     };
     if let Some(e) = persist_failed {
         tracing::error!(

@@ -58,19 +58,6 @@ pub fn mesad_exe() -> PathBuf {
 }
 
 fn find_built_binary(name: &str) -> PathBuf {
-    // 允许指向**另一个 target 目录**（`MESA_TEST_BINARY_DIR`）：当默认
-    // `target/debug/mesad.exe` 正被一个运行中的实例占用（Windows 无法覆盖
-    // 正在运行的 exe）时，用独立 target 目录构建同一份源码并让进程级测试
-    // 从那里取二进制。这只改变"从哪取二进制"，不改变任何断言。
-    if let Some(dir) = std::env::var_os("MESA_TEST_BINARY_DIR") {
-        let dir = PathBuf::from(dir);
-        for suffix in [".exe", ""] {
-            let p = dir.join(format!("{name}{suffix}"));
-            if p.is_file() {
-                return p;
-            }
-        }
-    }
     let target = repo_root().join("target");
     for profile in ["debug", "release"] {
         for suffix in [".exe", ""] {

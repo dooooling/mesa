@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -522,10 +522,9 @@ impl Drop for AttemptGuard {
     fn drop(&mut self) {
         let mut t = self.table.lock().unwrap();
         // 防御：条目已不属于本代次（例如被后续 Start 取代）则什么都不做。
-        if !t
-            .live
+        if t.live
             .get(&self.id)
-            .is_some_and(|e| e.ctx.generation == self.generation)
+            .is_none_or(|e| e.ctx.generation != self.generation)
         {
             drop(t);
             let _ = self.ctx.done_tx.send(self.ctx.outcome.get().cloned());
@@ -533,7 +532,8 @@ impl Drop for AttemptGuard {
         }
         if self.ctx.committed.load(Ordering::Acquire) {
             // 正常完成：写完成代次 + 移除条目，**同一临界区**（P0-3）。
-            t.last_completed_gen.insert(self.id.clone(), self.generation);
+            t.last_completed_gen
+                .insert(self.id.clone(), self.generation);
             t.live.remove(&self.id);
         } else {
             // 异常终止：**保留条目**、转隔离态、禁止新 Start（P0-1）。
@@ -693,10 +693,7 @@ impl MesaManager {
         if tokio::runtime::Handle::try_current().is_ok() {
             mgr.spawn_reaper(quarantine_rx);
         } else {
-            mgr.pending_reaper
-                .lock()
-                .unwrap()
-                .replace(quarantine_rx);
+            mgr.pending_reaper.lock().unwrap().replace(quarantine_rx);
         }
         mgr
     }
@@ -791,11 +788,7 @@ impl MesaManager {
     /// 这是"Stop 在途保护"的唯一判据：条目存在 ⇔ 该 attempt 尚未被证明完成
     /// teardown。它不依赖任何计数器副本，因此不会随请求取消而提前释放。
     pub fn has_live_attempt(&self, endpoint_id: &str) -> bool {
-        self.attempts
-            .lock()
-            .unwrap()
-            .live
-            .contains_key(endpoint_id)
+        self.attempts.lock().unwrap().live.contains_key(endpoint_id)
     }
 
     /// 当前 attempt 的阶段（诊断用；无条目返回 `None`）。
@@ -883,8 +876,7 @@ impl MesaManager {
     /// Stop 必须返回同一条 `ATTEMPT_FAILED_UNKNOWN`，直到 reaper 复核通过。
     #[cfg(feature = "test-hooks")]
     pub fn set_test_panic_before_teardown(&self, on: bool) {
-        self.test_panic_before_teardown
-            .store(on, Ordering::Relaxed);
+        self.test_panic_before_teardown.store(on, Ordering::Relaxed);
     }
 
     /// 测试专用：挂住 / 放行 reaper 的复核（`test-hooks`）。
@@ -977,9 +969,7 @@ impl MesaManager {
                     )
                     .await;
                     // 只有正常返回才走到这里；teardown 结论先写入，再 commit。
-                    let _ = task_ctx
-                        .outcome
-                        .set(outcome.map_or(Ok(true), |detail| Err(detail)));
+                    let _ = task_ctx.outcome.set(outcome.map_or(Ok(true), Err));
                     g.commit();
                 });
                 Ok(())
@@ -1446,6 +1436,14 @@ impl MesaManager {
     }
 }
 
+/// 隔离态复核的 pid 判据：**只有明确 `Dead` 才算收敛**。
+///
+/// `Alive`（还在跑）与 `Unknown`（查不清：权限不足/查询异常）都不构成"已死"
+/// 证据，必须继续隔离——fail-closed 不得被一次查询异常降级成 fail-open。
+fn pid_converged(status: crate::process::ProcessStatus) -> bool {
+    matches!(status, crate::process::ProcessStatus::Dead)
+}
+
 /// 隔离态监督清理（G7 §6.3.3）。
 ///
 /// **边界（必须守住，代码注释即 review 门）**：只清理"任务已死、条目处于
@@ -1501,24 +1499,36 @@ async fn attempt_reaper_loop(
                 cleared = true;
                 break;
             };
-            if pid != 0 && crate::process::process_alive(pid) {
+            // 三态复核（P0 回归）：只有**明确 Dead** 才算收敛。Unknown（权限不足/
+            // 查询异常）必须继续隔离并重试——旧实现把"打不开"当"已死"，会在
+            // Windows 上把仍在运行的残留驱动判成已收敛，放行新 Start 与之并存。
+            let pid_status = if pid == 0 {
+                crate::process::ProcessStatus::Dead
+            } else {
+                crate::process::process_status(pid)
+            };
+            if pid_status == crate::process::ProcessStatus::Alive {
                 tracing::warn!(
                     endpoint = %id, generation, pid,
                     "attempt_reaper: residual driver process alive, terminating"
                 );
                 let _ = crate::process::kill_pid(pid);
+            } else if pid_status == crate::process::ProcessStatus::Unknown {
+                tracing::warn!(
+                    endpoint = %id, generation, pid,
+                    "attempt_reaper: 无法证明残留进程已死（进程查询异常），保持隔离并重试"
+                );
             }
-            let pid_dead = pid == 0 || !crate::process::process_alive(pid);
+            let pid_dead = pid_converged(pid_status);
             // 摘除属于本 id 的残留会话键（隔离条目已无活 attempt 持有它）。
             let had_session = registry.write().unwrap().remove(&id).is_some();
             let session_released = !registry.read().unwrap().contains_key(&id);
             if pid_dead && session_released {
                 let mut t = table.lock().unwrap();
                 // 复核与清除必须在同一临界区重新确认代次与阶段（防止期间被改）。
-                let still = t
-                    .live
-                    .get(&id)
-                    .is_some_and(|e| e.ctx.generation == generation && e.ctx.phase() == AttemptPhase::FailedUnknown);
+                let still = t.live.get(&id).is_some_and(|e| {
+                    e.ctx.generation == generation && e.ctx.phase() == AttemptPhase::FailedUnknown
+                });
                 if still {
                     // 异常 attempt 同样需要"终结凭证"，但 outcome **保持 Err**
                     // （失败必须仍是失败，不得改写为成功）。
@@ -1839,7 +1849,11 @@ mod g7_tests {
             Some(5),
             "完成代次凭证必须保留（否则 await_settled 永远没有基准）"
         );
-        assert_eq!(mgr.gen_floor("ep"), 0, "手工登记不经过 next_gen，floor 仍为 0");
+        assert_eq!(
+            mgr.gen_floor("ep"),
+            0,
+            "手工登记不经过 next_gen，floor 仍为 0"
+        );
         // 完成后允许全新 Start（这里只验证门不再拦：驱动不存在 ⇒ 报 driver not found）。
         let err = mgr.start_endpoint(cfg("ep")).unwrap_err();
         assert!(!err.starts_with("ATTEMPT_FAILED_UNKNOWN"), "{err}");
@@ -1874,5 +1888,20 @@ mod g7_tests {
         assert_eq!(mgr.next_gen("other"), 1, "代次是 per-endpoint 的");
         assert_eq!(mgr.gen_floor("missing"), 0);
         let _ = AtomicBool::new(true);
+    }
+
+    /// 隔离态复核只接受"明确已死"：`Unknown`（进程查询异常）**不得**被当成收敛。
+    ///
+    /// 这是 Windows 上"查询异常 ⇒ 隔离态误判"的算法层回归点：旧实现把
+    /// `process_alive()==false` 直接当 `pid_dead`，而权限不足时它也是 false。
+    #[test]
+    fn pid_convergence_requires_proof_of_death() {
+        use crate::process::ProcessStatus;
+        assert!(pid_converged(ProcessStatus::Dead));
+        assert!(!pid_converged(ProcessStatus::Alive));
+        assert!(
+            !pid_converged(ProcessStatus::Unknown),
+            "无法证明已死时必须继续隔离（fail-closed），不得放行新 Start"
+        );
     }
 }

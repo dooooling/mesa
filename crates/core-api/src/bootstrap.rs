@@ -10,6 +10,7 @@
 //!   同 key 同指纹直接返回上次结果（`replayed: true`）；同 key 不同指纹 409。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
@@ -100,8 +101,39 @@ fn idempotency_key(headers: &HeaderMap, body: &BootstrapRequest) -> Option<Strin
         .filter(|s| !s.is_empty())
 }
 
+/// 启动 side effect 的失败分类（R-1：**必须**区分这两种）。
+///
+/// 二者在调用方看来都是"start 失败"，但副作用完全不同：
+/// - `NotStarted`：没有任何 attempt 被创建 ⇒ 直接补偿删除是安全的；
+/// - `StartedButIntentNotPersisted`：`commit_start` 已经 `start_endpoint` 成功，
+///   只是随后的 `desired_running=true` 落盘失败。此时**驱动任务正在执行**，
+///   若直接删配置就会留下"配置已删除、驱动仍在跑"的孤儿 ⇒ 必须先停止 attempt。
+enum StartFailure {
+    NotStarted(String),
+    StartedButIntentNotPersisted(String),
+}
+
+impl StartFailure {
+    fn message(&self) -> &str {
+        match self {
+            StartFailure::NotStarted(m) | StartFailure::StartedButIntentNotPersisted(m) => m,
+        }
+    }
+
+    fn started(&self) -> bool {
+        matches!(self, StartFailure::StartedButIntentNotPersisted(_))
+    }
+
+    fn code(&self) -> &'static str {
+        match self {
+            StartFailure::NotStarted(_) => "START_FAILED",
+            StartFailure::StartedButIntentNotPersisted(_) => "START_INTENT_NOT_PERSISTED",
+        }
+    }
+}
+
 /// 启动 side effect（`start_endpoint` 的核心逻辑抽出：DB 已落库后执行）。
-/// 失败返回 message（调用方补偿删除并报告）。
+/// 失败返回 [`StartFailure`]（调用方据此决定"直接补偿"还是"先停再补偿"）。
 ///
 /// C1 P0：连接构造（Descriptor / Secret 物化 / 任务门禁）**不得**在本文件里
 /// 再实现一遍——它与 REST Start、Mesad 开机恢复共用
@@ -115,15 +147,50 @@ fn idempotency_key(headers: &HeaderMap, body: &BootstrapRequest) -> Option<Strin
 /// - 旧 attempt 在拆解 ⇒ `STOP_IN_PROGRESS`（不排队）；
 /// - `desired_running=true` 只在 commit 成功后由门写入（§6.10.2 第 6 条），
 ///   建档事务里一律写 false（"刚建好 = 未运行"，第 5 条）。
-async fn start_created_endpoint(state: &AppState, endpoint_id: &str) -> Result<(), String> {
+async fn start_created_endpoint(state: &AppState, endpoint_id: &str) -> Result<(), StartFailure> {
     let ticket = state.lifecycle.admit_start(endpoint_id);
     let cfg = super::runtime::build_runtime_endpoint(state, endpoint_id)
         .await
-        .map_err(|e| e.to_string())?;
-    state
-        .lifecycle
-        .commit_start(&ticket, cfg)
-        .map_err(|e| format!("{}: {}", e.code, e.message))
+        .map_err(|e| StartFailure::NotStarted(e.to_string()))?;
+    match state.lifecycle.commit_start(&ticket, cfg) {
+        Ok(()) => Ok(()),
+        // R-1：这是唯一一种"启动已发生"的失败。attempt 已在跑，不能当普通失败补偿。
+        Err(e) if e.code == "START_INTENT_NOT_PERSISTED" => Err(
+            StartFailure::StartedButIntentNotPersisted(format!("{}: {}", e.code, e.message)),
+        ),
+        Err(e) => Err(StartFailure::NotStarted(format!(
+            "{}: {}",
+            e.code, e.message
+        ))),
+    }
+}
+
+/// R-1：停止"启动已发生"的 attempt，返回是否**确认**已无活 attempt。
+///
+/// 这里直接走 `manager.stop_endpoint` 而不是门：门在 `commit_start` 失败后已经
+/// 把该端点标成 `INTENT_UNPERSISTED`（503），再经门只会拿到 503 而不是停止。
+/// 停止动作本身不依赖 DB（安全方向），因此不受落盘失败影响。
+///
+/// 返回值语义：**只有确认条目已移除才算"停住了"**。超时/失败一律按"未确认"，
+/// 调用方据此保留配置（宁可留一个可见的端点，也不留一个无主的驱动进程）。
+async fn stop_started_attempt(state: &AppState, endpoint_id: &str) -> bool {
+    match tokio::time::timeout(
+        Duration::from_secs(30),
+        state.manager.stop_endpoint(endpoint_id),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::error!(
+            endpoint = %endpoint_id, error = %e,
+            "bootstrap 补偿前停止已启动 attempt 失败"
+        ),
+        Err(_) => tracing::error!(
+            endpoint = %endpoint_id,
+            "bootstrap 补偿前停止已启动 attempt 超时（30s）"
+        ),
+    }
+    !state.manager.has_live_attempt(endpoint_id)
 }
 
 pub async fn device_bootstrap(
@@ -321,39 +388,66 @@ async fn device_bootstrap_inner(
     // 3) start side effect（可选）
     let want_start = body.start.unwrap_or(true);
     let mut start_failed: Option<String> = None;
+    let mut start_failed_code = "START_FAILED";
     let mut compensated = false;
+    let mut attempt_stopped = false;
     if want_start {
-        if let Err(m) = start_created_endpoint(&state, &endpoint_rec.id).await {
-            // 补偿：删 endpoint → device（顺序不可反，device 有 RESTRICT）。
-            // R1.1：补偿结果必须检查——失败也写 compensated:true 是谎报；
-            // 如实报告，调用方凭 device_id/endpoint_id 定位残留。
-            match state
-                .store
-                .bootstrap_compensate(&device_rec.id, &endpoint_rec.id)
-            {
-                Ok(()) => {
-                    compensated = true;
-                    tracing::warn!(
-                        device_id = %device_rec.id,
-                        endpoint_id = %endpoint_rec.id,
-                        reason = %m,
-                        "device-bootstrap start 失败，已补偿删除"
-                    );
-                }
-                Err(e) => {
-                    compensated = false;
+        if let Err(failure) = start_created_endpoint(&state, &endpoint_rec.id).await {
+            let started = failure.started();
+            let m = failure.message().to_string();
+            start_failed_code = failure.code();
+            // R-1：**启动已发生**时不得直接删配置——驱动任务还在跑。
+            // 先停掉已启动的 attempt，并且只有"确认没有活 attempt"才允许补偿删除，
+            // 否则保留配置并如实报告（配置在、驱动在，至少不会变成无主进程）。
+            let mut may_delete = true;
+            if started {
+                attempt_stopped = stop_started_attempt(&state, &endpoint_rec.id).await;
+                if !attempt_stopped {
+                    may_delete = false;
                     tracing::error!(
                         device_id = %device_rec.id,
                         endpoint_id = %endpoint_rec.id,
                         reason = %m,
-                        compensate_error = %e,
-                        "device-bootstrap start 失败且补偿删除失败，存在残留，需人工处理"
+                        "device-bootstrap 启动意图未持久化且停止未确认；保留配置，禁止补偿删除"
                     );
                 }
             }
-            state
-                .snapshot
-                .remove_endpoint(&endpoint_rec.id, state.manager.gen_floor(&endpoint_rec.id));
+            if may_delete {
+                // 补偿：删 endpoint → device（顺序不可反，device 有 RESTRICT）。
+                // R1.1：补偿结果必须检查——失败也写 compensated:true 是谎报；
+                // 如实报告，调用方凭 device_id/endpoint_id 定位残留。
+                match state
+                    .store
+                    .bootstrap_compensate(&device_rec.id, &endpoint_rec.id)
+                {
+                    Ok(()) => {
+                        compensated = true;
+                        // 端点已不存在，围栏（若在启动意图落盘失败时写入）已无意义；
+                        // 不清除会在重启时留下指向不存在端点的永久围栏项。
+                        let _ = state.store.clear_stop_intent_unpersisted(&endpoint_rec.id);
+                        tracing::warn!(
+                            device_id = %device_rec.id,
+                            endpoint_id = %endpoint_rec.id,
+                            reason = %m,
+                            attempt_stopped,
+                            "device-bootstrap start 失败，已补偿删除"
+                        );
+                    }
+                    Err(e) => {
+                        compensated = false;
+                        tracing::error!(
+                            device_id = %device_rec.id,
+                            endpoint_id = %endpoint_rec.id,
+                            reason = %m,
+                            compensate_error = %e,
+                            "device-bootstrap start 失败且补偿删除失败，存在残留，需人工处理"
+                        );
+                    }
+                }
+                state
+                    .snapshot
+                    .remove_endpoint(&endpoint_rec.id, state.manager.gen_floor(&endpoint_rec.id));
+            }
             start_failed = Some(m);
         }
     }
@@ -364,10 +458,12 @@ async fn device_bootstrap_inner(
         return (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({
-                "error": { "code": "START_FAILED", "message": m },
+                "error": { "code": start_failed_code, "message": m },
                 "device_id": device_rec.id,
                 "endpoint_id": endpoint_rec.id,
                 "compensated": compensated,
+                // R-1：调用方可据此区分"启动已发生、但已先停掉"与"启动前就失败"。
+                "attempt_stopped": attempt_stopped,
             })),
         );
     }

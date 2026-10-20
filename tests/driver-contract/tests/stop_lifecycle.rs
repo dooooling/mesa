@@ -23,7 +23,7 @@
 //! - W1 `w1_stop_during_start_construction_leaves_nothing_running`（不变量门，
 //!   用冷 Descriptor 放大构造窗口，实测 8/8 命中）；
 //! - W2 `w2_start_during_stop_teardown_is_rejected_and_does_not_resurrect`
-//!  （栅栏挂住 teardown ⇒ 拆解期 Start 必须 409 `STOP_IN_PROGRESS`）；
+//!   （栅栏挂住 teardown ⇒ 拆解期 Start 必须 409 `STOP_IN_PROGRESS`）；
 //! - W3 `w3_double_start_only_one_attempt`（并发两 Start ⇒ 恰一个 200/一个 409，
 //!   Stop 后无孤儿继续采集）；
 //! - 异常 teardown（panic 注入）⇒ 隔离态 fail-closed；handler 取消 ⇒ 保护不释放；
@@ -350,9 +350,8 @@ impl Rig {
         let events_db = dir.join("events.db");
         let store = Arc::new(ConfigStore::open(&db).unwrap());
         let faults = Arc::new(StoreFaults::new(0, false));
-        let ev_store = Arc::new(
-            EventStore::open_with_faults(&events_db, Arc::clone(&faults)).unwrap(),
-        );
+        let ev_store =
+            Arc::new(EventStore::open_with_faults(&events_db, Arc::clone(&faults)).unwrap());
         let services = EventServices::new(ev_store, EventHub::new(EVENT_HUB_CAPACITY));
         let staged = common::staged_drivers_with_test_driver();
         let mgr = Arc::new(MesaManager::with_source(
@@ -429,7 +428,11 @@ impl Rig {
     }
 
     fn desired(&self, id: &str) -> bool {
-        self.store.get_endpoint(id).unwrap().unwrap().desired_running
+        self.store
+            .get_endpoint(id)
+            .unwrap()
+            .unwrap()
+            .desired_running
     }
 
     fn state_of(&self, id: &str) -> Option<String> {
@@ -527,7 +530,11 @@ async fn w1_stop_during_start_construction_leaves_nothing_running() {
             hit_window += 1;
         }
         let (stop_status, stop_body) = rig.stop(&id).await;
-        assert_eq!(stop_status, StatusCode::OK, "Stop 必须成功受理: {stop_body}");
+        assert_eq!(
+            stop_status,
+            StatusCode::OK,
+            "Stop 必须成功受理: {stop_body}"
+        );
 
         // Start 可能在 Stop 之前提交、也可能被作废；两种交错都不允许留下运行态。
         let (start_status, start_body) = tokio::time::timeout(Duration::from_secs(60), start_task)
@@ -541,7 +548,11 @@ async fn w1_stop_during_start_construction_leaves_nothing_running() {
                 "竞态分支的 409 必须是可机器识别的 Stop 优先码，实际: {start_body}"
             );
         } else {
-            assert_eq!(start_status, StatusCode::OK, "非冲突分支必须成功: {start_body}");
+            assert_eq!(
+                start_status,
+                StatusCode::OK,
+                "非冲突分支必须成功: {start_body}"
+            );
         }
 
         // 关键不变量：Stop 之后不得仍在运行，desired 不得为真。
@@ -666,7 +677,10 @@ async fn w2_start_during_stop_teardown_is_rejected_and_does_not_resurrect() {
         .find(|p| p.endpoint_id == id)
         .map(|p| p.timestamp_ns)
         .unwrap_or(0);
-    assert_eq!(before, after, "Stop 完成后不得仍有 attempt 在写采集值（孤儿）");
+    assert_eq!(
+        before, after,
+        "Stop 完成后不得仍有 attempt 在写采集值（孤儿）"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -824,7 +838,10 @@ async fn teardown_panic_quarantines_and_blocks_start() {
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    assert!(started, "reaper 复核通过后必须允许全新 Start（fail-closed 不得变成永久不可用）");
+    assert!(
+        started,
+        "reaper 复核通过后必须允许全新 Start（fail-closed 不得变成永久不可用）"
+    );
     let _ = rig.stop(id).await;
 }
 
@@ -879,10 +896,17 @@ async fn stop_protection_survives_handler_cancel() {
     // (c) 放行 → 后台 teardown 完成 → 条目移除、desired=false、Start 可成功。
     gate.release();
     common::wait_until(30, || !rig.mgr.is_running(id)).await;
-    assert!(!rig.desired(id), "后台 teardown 完成后 desired 必须为 false");
+    assert!(
+        !rig.desired(id),
+        "后台 teardown 完成后 desired 必须为 false"
+    );
     common::wait_until(15, || rig.state_of(id).as_deref() == Some("STOPPED")).await;
     let (s, v) = rig.start(id).await;
-    assert_eq!(s, StatusCode::OK, "旧 attempt 确认结束后允许全新 Start: {v}");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "旧 attempt 确认结束后允许全新 Start: {v}"
+    );
     let _ = rig.stop(id).await;
 }
 
@@ -917,15 +941,17 @@ async fn stop_intent_persist_failure_is_explicit_and_blocks_restart() {
     );
     assert_eq!(code_of(&v), "STOP_INTENT_NOT_PERSISTED", "{v}");
     assert_eq!(
-        v["error"]["message"],
-        "停止已执行，但停止意图未能持久化；禁止重新启动，需人工核验",
+        v["error"]["message"], "停止已执行，但停止意图未能持久化；禁止重新启动，需人工核验",
         "响应体冻结，逐字一致"
     );
     // teardown 照做（安全方向不受 DB 影响）。
     assert!(!rig.mgr.is_running(id), "落盘失败不得阻止实际停止");
     common::wait_until(15, || rig.state_of(id).as_deref() == Some("STOPPED")).await;
     // 持久化面仍是旧值 true（诚实声明），但围栏已写。
-    assert!(rig.desired(id), "DB 仍是旧值 true（这正是围栏要覆盖的残余风险）");
+    assert!(
+        rig.desired(id),
+        "DB 仍是旧值 true（这正是围栏要覆盖的残余风险）"
+    );
     assert!(
         rig.store
             .stop_intent_unpersisted()
@@ -1291,6 +1317,65 @@ impl SettleRig {
     async fn stop(&self, id: &str) -> (StatusCode, serde_json::Value) {
         self.post(&format!("/api/v1/endpoints/{id}/stop")).await
     }
+
+    /// 通用请求（DELETE / 带 body 的 POST 用）。
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(body.map_or_else(Body::empty, |v| Body::from(v.to_string())))
+            .unwrap();
+        let resp = self.app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn delete(&self, id: &str) -> (StatusCode, serde_json::Value) {
+        self.send("DELETE", &format!("/api/v1/endpoints/{id}"), None)
+            .await
+    }
+
+    async fn post_json(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        self.send("POST", path, Some(body)).await
+    }
+
+    fn desired(&self, id: &str) -> bool {
+        self.store
+            .get_endpoint(id)
+            .unwrap()
+            .unwrap()
+            .desired_running
+    }
+
+    fn state_of(&self, id: &str) -> Option<String> {
+        self.mgr.snapshot().endpoint(id).map(|s| s.state)
+    }
+
+    async fn wait_running(&self, id: &str, secs: u64) {
+        common::wait_until(secs, || {
+            self.mgr
+                .snapshot()
+                .endpoint(id)
+                .is_some_and(|s| s.state == "RUNNING")
+        })
+        .await;
+    }
 }
 
 /// P0-3 主门：**正常 Stop 完成后** `await_settled` 必须通过，且返回被移除条目的代次。
@@ -1305,7 +1390,10 @@ async fn settled_after_normal_stop_uses_last_completed_generation() {
     let (s, v) = rig.start(id).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     common::wait_until(30, || {
-        rig.mgr.snapshot().endpoint(id).is_some_and(|s| s.state == "RUNNING")
+        rig.mgr
+            .snapshot()
+            .endpoint(id)
+            .is_some_and(|s| s.state == "RUNNING")
     })
     .await;
     let generation_running = rig.mgr.current_gen(id).expect("运行中必须有代次");
@@ -1343,11 +1431,18 @@ async fn live_attempt_outlives_is_running_during_teardown() {
     let (s, v) = rig.start(id).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     common::wait_until(30, || {
-        rig.mgr.snapshot().endpoint(id).is_some_and(|s| s.state == "RUNNING")
+        rig.mgr
+            .snapshot()
+            .endpoint(id)
+            .is_some_and(|s| s.state == "RUNNING")
     })
     .await;
     common::wait_until(30, || {
-        rig.mgr.snapshot().latest_all().iter().any(|p| p.endpoint_id == id)
+        rig.mgr
+            .snapshot()
+            .latest_all()
+            .iter()
+            .any(|p| p.endpoint_id == id)
     })
     .await;
 
@@ -1438,7 +1533,10 @@ async fn deleted_endpoint_not_resurrected_by_late_status_write() {
     let (s, v) = rig.start(id).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     common::wait_until(30, || {
-        rig.mgr.snapshot().endpoint(id).is_some_and(|s| s.state == "RUNNING")
+        rig.mgr
+            .snapshot()
+            .endpoint(id)
+            .is_some_and(|s| s.state == "RUNNING")
     })
     .await;
     let (s, v) = rig.stop(id).await;
@@ -1495,3 +1593,389 @@ async fn deleted_endpoint_not_resurrected_by_late_status_write() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// P0-1：Stop 落盘在途期间禁止新 Start（防止 desired 反序）
+// ---------------------------------------------------------------------------
+
+/// P0-1 确定性 Gate：**慢 DB**（2.5s）下 Stop 的 teardown 已结束、但
+/// `desired_running=false` 仍在落盘途中，此时新 Start 必须被拒（409），
+/// 不得出现"实际 RUNNING、DB 却是 false"的反序。
+///
+/// 旧码：`commit_start` 只看 `stop_gen` 与 attempt 表，teardown 完成后即放行
+/// ⇒ Start 写 `true`，2.5s 后旧 Stop 的 `false` 落库覆盖它 ⇒ DB=false 而
+/// attempt 在跑。本用例最后一条断言（`desired` 必须为 false 且无 attempt）
+/// 在旧码上必红。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn start_rejected_while_stop_intent_persist_in_flight() {
+    let rig = SettleRig::new("p01").await;
+    let id = "p01-ep";
+    rig.create_endpoint(id, false);
+    let (s, v) = rig.start(id).await;
+    assert_eq!(s, StatusCode::OK, "预置启动: {v}");
+    rig.wait_running(id, 30).await;
+    assert!(rig.desired(id));
+
+    rig.store
+        .desired_write_faults()
+        .delay_ms
+        .store(4000, std::sync::atomic::Ordering::Relaxed);
+    let stop_task = {
+        let app = rig.app.clone();
+        let uri = format!("/api/v1/endpoints/{id}/stop");
+        tokio::spawn(async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap();
+            app.oneshot(req).await.unwrap().status()
+        })
+    };
+    // teardown 完成（条目已移除）但落盘仍在途。
+    common::wait_until(10, || !rig.mgr.has_live_attempt(id)).await;
+    common::wait_until(10, || rig.state_of(id).as_deref() == Some("STOPPED")).await;
+    assert!(
+        !stop_task.is_finished(),
+        "前置：落盘必须仍在途（否则测不到本窗口）"
+    );
+    assert!(rig.desired(id), "前置：DB 仍是旧值 true");
+
+    // 窗口内 Start：必须 409，且不得产生 attempt、不得写 desired=true。
+    let (s, v) = rig.start(id).await;
+    assert_eq!(
+        s,
+        StatusCode::CONFLICT,
+        "落盘未确认期间 Start 必须 409（否则反序）：{s} {v}"
+    );
+    assert_eq!(code_of(&v), "STOP_PERSIST_IN_PROGRESS", "{v}");
+    assert!(
+        !rig.mgr.has_live_attempt(id),
+        "被拒的 Start 不得留下 attempt"
+    );
+
+    let status = tokio::time::timeout(Duration::from_secs(40), stop_task)
+        .await
+        .expect("Stop 有界")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    // 反序断言：落盘完成后 DB 必须是 false，且没有 attempt 在跑。
+    assert!(!rig.desired(id), "落盘完成后 DB 必须为 false");
+    assert!(!rig.mgr.has_live_attempt(id), "不得有 attempt 残留");
+
+    rig.store
+        .desired_write_faults()
+        .delay_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    // 落盘确认后 Start 恢复可用。
+    let (s, v) = rig.start(id).await;
+    assert_eq!(s, StatusCode::OK, "落盘确认后 Start 必须可用: {v}");
+    let _ = rig.stop(id).await;
+}
+
+// ---------------------------------------------------------------------------
+// R-2：收敛判据必须包含"本次停止意图落盘已确认"
+// ---------------------------------------------------------------------------
+
+/// R-2 确定性 Gate：慢写（2.5s）下 teardown 已完成、状态 STOPPED、内存意图
+/// 已为 false，但 DB 仍是旧值 true ⇒ `await_settled` **必须** NotSettled。
+///
+/// 旧码用 `desired_seq >= last_stop_seq`，而 `last_stop_seq` 记录的是写入**前**
+/// 的旧序号，落盘一开始就满足 ⇒ 500ms 窗口后误判 Settled（DB 仍为 true，
+/// 重启会把这个用户明确要停的端点自动拉起）。落盘完成后才允许 Settled。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn await_settled_requires_confirmed_stop_intent_under_slow_db() {
+    use mesa_core_api::lifecycle::Settled;
+
+    let rig = SettleRig::new("r2").await;
+    let id = "r2-ep";
+    rig.create_endpoint(id, false);
+    let (s, v) = rig.start(id).await;
+    assert_eq!(s, StatusCode::OK, "预置启动: {v}");
+    rig.wait_running(id, 30).await;
+
+    rig.store
+        .desired_write_faults()
+        .delay_ms
+        .store(2500, std::sync::atomic::Ordering::Relaxed);
+    let stop_task = {
+        let app = rig.app.clone();
+        let uri = format!("/api/v1/endpoints/{id}/stop");
+        tokio::spawn(async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap();
+            app.oneshot(req).await.unwrap().status()
+        })
+    };
+    common::wait_until(10, || !rig.mgr.has_live_attempt(id)).await;
+    common::wait_until(10, || rig.state_of(id).as_deref() == Some("STOPPED")).await;
+    assert!(
+        !stop_task.is_finished(),
+        "前置：落盘必须仍在途（否则测不到本窗口）"
+    );
+    assert!(rig.desired(id), "前置：DB 仍是旧值 true");
+
+    // 500ms 收敛窗口 + 余量：落盘未确认 ⇒ 必须 NotSettled。
+    match rig
+        .state
+        .lifecycle
+        .await_settled(id, Duration::from_millis(700))
+        .await
+    {
+        Settled::NotSettled { reason, sample } => {
+            assert!(
+                sample.stop_persist_inflight.is_some(),
+                "未确认时必须报告落盘在途: {reason}"
+            );
+            assert_eq!(
+                sample.stop_persist_confirmed_gen, None,
+                "未确认时不得有确认凭证: {reason}"
+            );
+            assert_eq!(sample.desired, Some(false), "内存意图已是 false: {reason}");
+        }
+        other => panic!("落盘未确认时 await_settled 不得成功: {other:?}"),
+    }
+
+    let status = tokio::time::timeout(Duration::from_secs(40), stop_task)
+        .await
+        .expect("Stop 有界")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert!(!rig.desired(id), "落盘完成后 DB 必须为 false");
+    rig.store
+        .desired_write_faults()
+        .delay_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    match rig
+        .state
+        .lifecycle
+        .await_settled(id, Duration::from_secs(5))
+        .await
+    {
+        Settled::Settled { .. } => {}
+        other => panic!("落盘确认后必须 settled: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R-1：bootstrap "已启动却删配置"
+// ---------------------------------------------------------------------------
+
+/// R-1 确定性 Gate：`commit_start` 已启动 attempt、随后 `desired_running=true`
+/// 落盘失败 ⇒ bootstrap **必须先停止已启动的 attempt**，再补偿删除配置。
+///
+/// 旧码把它当普通 Start 失败，直接删 Endpoint/Device ⇒ 配置已删除、驱动任务
+/// 仍在执行（孤儿）。断言 `has_live_attempt == false` 在旧码上必红。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_intent_persist_failure_stops_attempt_before_compensating() {
+    let rig = SettleRig::new("r1").await;
+    let ep = "r1-ep";
+    let task = common::poll_task(
+        "d",
+        50,
+        serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
+    );
+    let body = serde_json::json!({
+        "device": {"id": "dev-r1", "name": "r1"},
+        "endpoint": {
+            "id": ep,
+            "name": ep,
+            "driver_id": "test-driver",
+            "connection": {},
+        },
+        "acquisition": {"tasks": [serde_json::to_value(&task).unwrap()]},
+        "start": true,
+    });
+
+    // 只让 `set_desired_running` 失败：启动本身成功，意图落盘失败。
+    rig.store
+        .desired_write_faults()
+        .fail
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (s, v) = rig.post_json("/api/v1/device-bootstrap", body).await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_GATEWAY,
+        "bootstrap 必须显式失败（不得谎报成功）: {v}"
+    );
+    assert_eq!(v["error"]["code"], "START_INTENT_NOT_PERSISTED", "{v}");
+    assert_eq!(v["attempt_stopped"], true, "必须报告已先停止 attempt: {v}");
+    assert_eq!(v["compensated"], true, "停止确认后才允许补偿删除: {v}");
+    assert!(
+        !rig.mgr.has_live_attempt(ep),
+        "R-1：配置已删但驱动任务仍在执行（孤儿）"
+    );
+    assert!(
+        rig.store.get_endpoint(ep).unwrap().is_none(),
+        "补偿删除后配置不得残留"
+    );
+    rig.store
+        .desired_write_faults()
+        .fail
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// 并发删除
+// ---------------------------------------------------------------------------
+
+/// 并发删除：两个 DELETE 竞争 ⇒ 恰好一个 200、一个 404；端点最终不存在。
+/// 拆解期 DELETE ⇒ 必须 409（`is_running()==false` 但 attempt 仍在）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_delete_and_delete_during_teardown_are_safe() {
+    let rig = SettleRig::new("delete2").await;
+
+    // (a) 并发两个 DELETE。
+    let id = "del-race";
+    rig.create_endpoint(id, false);
+    let (a, b) = tokio::join!(rig.delete(id), rig.delete(id));
+    let mut codes = [a.0, b.0];
+    codes.sort();
+    assert_eq!(
+        codes,
+        [StatusCode::OK, StatusCode::NOT_FOUND],
+        "并发删除必须恰好一个成功、一个 404"
+    );
+    assert!(
+        rig.store.get_endpoint(id).unwrap().is_none(),
+        "并发删除后不得残留配置"
+    );
+
+    // (b) 拆解期 DELETE：配置不得被删除（否则留下无主驱动任务）。
+    // 必须带 event 任务：commit 栅栏挂在事件提交路径上，没有事件就没有可挂住的
+    // in-flight commit，也就测不到"拆解中"这个窗口。
+    let id2 = "del-teardown";
+    rig.create_endpoint(id2, true);
+    let (s, v) = rig.start(id2).await;
+    assert_eq!(s, StatusCode::OK, "预置启动: {v}");
+    rig.wait_running(id2, 30).await;
+
+    let gate = rig.faults.arm_commit_gate();
+    common::wait_until(10, || gate.entered() >= 1).await;
+    let stop_task = {
+        let app = rig.app.clone();
+        let uri = format!("/api/v1/endpoints/{id2}/stop");
+        tokio::spawn(async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap();
+            app.oneshot(req).await.unwrap().status()
+        })
+    };
+    common::wait_until(10, || !rig.mgr.is_running(id2)).await;
+    assert!(
+        rig.mgr.has_live_attempt(id2),
+        "前置：拆解期 attempt 必须仍在"
+    );
+    let (s, v) = rig.delete(id2).await;
+    assert_eq!(
+        s,
+        StatusCode::CONFLICT,
+        "拆解期删除配置必须 409（否则驱动任务无主）: {s} {v}"
+    );
+    assert!(rig.store.get_endpoint(id2).unwrap().is_some());
+
+    gate.release();
+    let status = tokio::time::timeout(Duration::from_secs(40), stop_task)
+        .await
+        .expect("Stop 有界")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    common::wait_until(10, || !rig.mgr.has_live_attempt(id2)).await;
+    let (s, _) = rig.delete(id2).await;
+    assert_eq!(s, StatusCode::OK, "拆解完成后才允许删除");
+}
+
+// ---------------------------------------------------------------------------
+// P0-7：Start / DELETE 竞态 + `set_desired_running` 的 Ok(false)
+// ---------------------------------------------------------------------------
+
+/// P0-7 确定性 Gate：`set_desired_running` 返回 `Ok(false)`（UPDATE 命中 0 行，
+/// 即端点已被并发删除）时，`commit_start` **不得**当成功——attempt 已经启动，
+/// 必须立刻认领停止并返回 409。
+///
+/// 旧码把 `Ok(true) | Ok(false)` 都当成功 ⇒ 返回 200、`desired_running` 没写成、
+/// attempt 在跑、配置行却不存在（配置已删、驱动仍执行）。断言 `!has_live_attempt`
+/// 在旧码上必红。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn start_on_deleted_endpoint_is_aborted_not_orphaned() {
+    let rig = SettleRig::new("p07").await;
+    let id = "p07-ep";
+    rig.create_endpoint(id, false);
+    // 模拟并发 DELETE 已经删掉配置行（Start 已构造完成、正准备 commit）。
+    assert!(rig.store.delete_endpoint(id).unwrap());
+
+    let ticket = rig.state.lifecycle.admit_start(id);
+    let cfg = BuiltinEndpoint {
+        endpoint_id: id.into(),
+        driver_id: "test-driver".into(),
+        connection_json: "{}".into(),
+        tasks: vec![common::poll_task(
+            "d",
+            50,
+            serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
+        )],
+        event_tasks: vec![],
+    };
+    let err = rig
+        .state
+        .lifecycle
+        .commit_start(&ticket, cfg)
+        .expect_err("配置行已删除，Start 必须失败");
+    assert_eq!(err.code, "ENDPOINT_DELETED", "{}", err.message);
+    common::wait_until(10, || !rig.mgr.has_live_attempt(id)).await;
+    assert!(
+        !rig.mgr.has_live_attempt(id),
+        "P0-7：删除后不得留下运行中的 attempt（孤儿）"
+    );
+}
+
+/// P0-7 并发 Gate：Start 与 DELETE 竞争时，**删除成功就绝不允许留下活 attempt**。
+///
+/// 两种合法结局：DELETE 先赢（Start 409 / `SUPERSEDED_BY_STOP` 或
+/// `ENDPOINT_DELETED`），或 Start 先赢（DELETE 409，端点与 attempt 都还在）。
+/// 非法结局（旧码）：DELETE 返回 200，attempt 仍在跑。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_racing_start_never_leaves_orphan_attempt() {
+    let rig = SettleRig::new("delrace").await;
+    for round in 0..10 {
+        let id = format!("delrace-{round}");
+        rig.create_endpoint(&id, false);
+        let (start_res, del_res) = tokio::join!(rig.start(&id), rig.delete(&id));
+        match del_res.0 {
+            StatusCode::OK => {
+                // 删除成功 ⇒ 端点不存在，且不允许留下任何 attempt。
+                common::wait_until(10, || !rig.mgr.has_live_attempt(&id)).await;
+                assert!(
+                    !rig.mgr.has_live_attempt(&id),
+                    "第 {round} 轮：DELETE 成功后仍有 attempt 在跑（孤儿）；start={:?}",
+                    start_res.0
+                );
+                assert!(
+                    rig.store.get_endpoint(&id).unwrap().is_none(),
+                    "第 {round} 轮：DELETE 成功后配置必须不存在"
+                );
+            }
+            StatusCode::CONFLICT => {
+                // Start 先赢：端点与 attempt 都必须还在（不得半删）。
+                assert!(
+                    rig.store.get_endpoint(&id).unwrap().is_some(),
+                    "第 {round} 轮：DELETE 被拒后配置必须仍在"
+                );
+                assert!(
+                    rig.mgr.has_live_attempt(&id),
+                    "第 {round} 轮：DELETE 被拒说明有活 attempt，实际没有"
+                );
+                let _ = rig.stop(&id).await;
+            }
+            other => panic!("第 {round} 轮：DELETE 只允许 200/409，实际 {other}"),
+        }
+    }
+}

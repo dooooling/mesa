@@ -137,21 +137,29 @@ async fn main() {
     if stored_eps.is_empty() {
         tracing::warn!("no endpoints in store; create one via REST POST /api/v1/endpoints");
     }
-    // G7 S2（失败关闭）：上次进程有"停止意图未持久化"的围栏记录 ⇒ 这些端点
-    // **一律不自动恢复**。场景：Stop 已执行、但 `desired_running=false` 没写进
-    // DB（DB busy/失败），随后进程崩溃 ⇒ DB 仍是 true。若照常恢复，就会把用户
-    // 明确要停的机床端点重新拉起来（危险动作）。围栏是持久化事实，因此跨崩溃有效。
+    // G7 S2 / P0-4（**默认不恢复**，评审指定的默认值翻转）：
+    // 修复前是"命中围栏才不恢复"（默认恢复）。现在只有**能正向证明**运行意图
+    // 已持久化才恢复：DB 可写 + 围栏可读 + 意图确认凭证可读，且该端点在凭证里
+    // 被确认为 `true`。任一步做不到 ⇒ 不恢复（宁可少恢复，不可误拉起机床端点）。
     //
-    // 读失败同样 fail-closed：把"读不懂围栏"当成"可能有围栏"，宁可少恢复，
-    // 也不误拉起。人工确认方式：显式 POST /start（成功后门会清除围栏）。
-    let fenced: Vec<String> = match store.stop_intent_unpersisted() {
-        Ok(v) => v,
-        Err(e) => {
+    // 为什么围栏（负向证据）不够：Stop 的 `desired_running=false` 落盘失败时，
+    // 围栏本身也可能写不进去（同一个不可写的 DB）。正向凭证把"没写进去"与
+    // "写了但没证明"统一成同一种保守结果。
+    //
+    // 人工确认方式：显式 POST /start（成功后门会写凭证并清除围栏）。
+    let (fenced, confirmed): (Vec<String>, std::collections::BTreeSet<String>) = match store
+        .recovery_plan()
+    {
+        mesa_config_store::RecoveryPlan::Proceed { fenced, confirmed } => (fenced, confirmed),
+        mesa_config_store::RecoveryPlan::DenyAll { reason } => {
             tracing::error!(
-                error = %e,
-                "停止意图围栏读取失败：按 fail-closed 跳过本次全部自动恢复，需人工核验后显式启动"
+                reason = %reason,
+                "开机恢复被拒绝（fail-closed）：跳过本次全部自动恢复，需人工核验后显式 POST /start"
             );
-            stored_eps.iter().map(|r| r.id.clone()).collect()
+            (
+                stored_eps.iter().map(|r| r.id.clone()).collect(),
+                std::collections::BTreeSet::new(),
+            )
         }
     };
     for rec in &stored_eps {
@@ -171,6 +179,16 @@ async fn main() {
             continue;
         }
         if !rec.desired_running {
+            continue;
+        }
+        // P0-4：`desired_running=true` 但没有正向凭证 ⇒ 无法证明这是用户意图
+        // （可能是一次失败的 Stop 留下的旧值）⇒ 不恢复。
+        if !confirmed.contains(&rec.id) {
+            tracing::error!(
+                endpoint = %rec.id,
+                "SKIP auto-restore: 无法正向证明其运行意图已持久化（无确认凭证）；\
+                 禁止自动拉起，需人工核验后显式 POST /start 确认"
+            );
             continue;
         }
         // C1 P0：开机恢复必须与 REST Start / Bootstrap start 走**同一条**

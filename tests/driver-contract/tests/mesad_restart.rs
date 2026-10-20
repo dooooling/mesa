@@ -337,7 +337,13 @@ async fn stop_intent_fence_blocks_auto_restore_after_crash() {
         let tasks = r#"{"tasks":[{"id":"t1","schedule":{"mode":"poll","interval_ms":50},"binding":{"kind":"mesa.resources.v1","config":{"selections":[{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]}}}]}"#;
         let (st, v) = http(port1, "PUT", &format!("/api/v1/tasks/{ep}"), Some(tasks)).await;
         assert_eq!(st, 200, "put tasks {ep}: {v}");
-        let (st, v) = http(port1, "POST", &format!("/api/v1/endpoints/{ep}/start"), None).await;
+        let (st, v) = http(
+            port1,
+            "POST",
+            &format!("/api/v1/endpoints/{ep}/start"),
+            None,
+        )
+        .await;
         assert_eq!(st, 200, "start {ep}: {v}");
     }
     for ep in ["ep-fenced", "ep-control"] {
@@ -348,7 +354,10 @@ async fn stop_intent_fence_blocks_auto_restore_after_crash() {
             if v["state"] == "RUNNING" {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "{ep} not running: {v}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{ep} not running: {v}"
+            );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
@@ -419,7 +428,11 @@ async fn stop_intent_fence_blocks_auto_restore_after_crash() {
     {
         let store = mesa_config_store::ConfigStore::open(&db).unwrap();
         assert!(
-            store.get_endpoint("ep-fenced").unwrap().unwrap().desired_running,
+            store
+                .get_endpoint("ep-fenced")
+                .unwrap()
+                .unwrap()
+                .desired_running,
             "围栏不改变 DB 里的旧值（它只阻止自动恢复）"
         );
         assert_eq!(
@@ -450,6 +463,313 @@ async fn stop_intent_fence_blocks_auto_restore_after_crash() {
         assert!(
             store.stop_intent_unpersisted().unwrap().is_empty(),
             "显式启动成功（人工确认）后围栏必须清除"
+        );
+    }
+
+    mesad2.kill().await.unwrap();
+    let _ = mesad2.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P0-3（失败关闭）：**DB 通道写不进去**时，围栏仍必须跨崩溃有效。
+///
+/// 场景：Stop 已执行、`desired_running=false` 落盘失败，且此时**整个 DB 不可写**
+/// （`meta` 围栏也写不进去）。若围栏只依赖同一个 DB，重启就会读到旧的
+/// `desired_running=true` 并把用户明确要停的端点自动拉起。
+///
+/// 本用例用 sidecar 文件（DB 同目录 `<db>.stop-fence.json`）复现"DB 通道没写成、
+/// 文件通道写成了"的崩溃现场——这正是修复后生产路径在 DB 不可写时的落点：
+/// 命中 sidecar ⇒ 不自动恢复；对照组（未命中）必须正常恢复，证明恢复逻辑本身有效。
+#[tokio::test]
+async fn sidecar_fence_blocks_auto_restore_when_db_fence_missing() {
+    common::init_log();
+    let dir = std::env::temp_dir().join(format!(
+        "mesa-g7-sidecar-{}-{}",
+        std::process::id(),
+        mesa_core_types::now_unix_ns()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _staged = common::staged_drivers_with_test_driver();
+    let db = dir.join("mesa.db");
+    let sidecar = dir.join("mesa.db.stop-fence.json");
+
+    // ---- Phase 1：两个端点都启动（desired_running 落盘 true），然后崩溃 ----
+    let port1 = free_port().await;
+    let mut mesad1 = spawn_mesad(&dir, port1, _staged.path());
+    wait_ready(port1).await;
+    let (st, _) = http(
+        port1,
+        "POST",
+        "/api/v1/devices",
+        Some(r#"{"id":"dside","name":"Side"}"#),
+    )
+    .await;
+    assert_eq!(st, 201, "create device");
+    let tasks = r#"{"tasks":[{"id":"t1","schedule":{"mode":"poll","interval_ms":50},"binding":{"kind":"mesa.resources.v1","config":{"selections":[{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]}}}]}"#;
+    for ep in ["ep-side-fenced", "ep-side-control"] {
+        let body = format!(
+            r#"{{"id":"{ep}","name":"{ep}","device_id":"dside","driver_id":"test-driver","connection":{{}}}}"#
+        );
+        let (st, v) = http(port1, "POST", "/api/v1/endpoints", Some(&body)).await;
+        assert!(st == 200 || st == 201, "create endpoint {ep}: {v}");
+        let (st, v) = http(port1, "PUT", &format!("/api/v1/tasks/{ep}"), Some(tasks)).await;
+        assert_eq!(st, 200, "put tasks {ep}: {v}");
+        let (st, v) = http(
+            port1,
+            "POST",
+            &format!("/api/v1/endpoints/{ep}/start"),
+            None,
+        )
+        .await;
+        assert_eq!(st, 200, "start {ep}: {v}");
+    }
+    for ep in ["ep-side-fenced", "ep-side-control"] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let (st, v) = http(port1, "GET", &format!("/api/v1/endpoints/{ep}/state"), None).await;
+            assert_eq!(st, 200);
+            if v["state"] == "RUNNING" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{ep} not running: {v}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    mesad1.kill().await.unwrap();
+    let _ = mesad1.wait().await;
+
+    // ---- 崩溃现场：DB 仍是 true、DB 围栏为空，只有 sidecar 记下了围栏 ----
+    {
+        let store = mesa_config_store::ConfigStore::open(&db).unwrap();
+        assert!(
+            store
+                .get_endpoint("ep-side-fenced")
+                .unwrap()
+                .unwrap()
+                .desired_running,
+            "前置：DB 必须仍是旧值 true（否则本用例退化）"
+        );
+        // 裸 SQL 断言 DB 通道确实没有围栏（模拟 DB 不可写 ⇒ 只写成 sidecar）。
+        let raw = rusqlite::Connection::open(&db).unwrap();
+        let db_fence: Option<String> = raw
+            .query_row(
+                "SELECT value FROM meta WHERE key='stop_intent_unpersisted'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        assert!(db_fence.is_none(), "前置：DB 通道必须没有围栏");
+        std::fs::write(&sidecar, r#"{"version":1,"endpoints":["ep-side-fenced"]}"#).unwrap();
+        assert_eq!(
+            store.stop_intent_unpersisted().unwrap(),
+            vec!["ep-side-fenced".to_string()],
+            "读围栏必须是 DB 与 sidecar 的并集"
+        );
+    }
+
+    // ---- Phase 2：同目录重启 ----
+    let port2 = free_port().await;
+    let mut mesad2 = spawn_mesad(&dir, port2, _staged.path());
+    wait_ready(port2).await;
+
+    // 对照组：未命中围栏 ⇒ 必须被正常恢复。
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (st, v) = http(
+            port2,
+            "GET",
+            "/api/v1/endpoints/ep-side-control/state",
+            None,
+        )
+        .await;
+        assert_eq!(st, 200);
+        if v["state"] == "RUNNING" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "对照组 ep-side-control 必须被自动恢复: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // 命中 sidecar 围栏：5s 内任何时刻都不得 RUNNING。
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < until {
+        let (st, v) = http(port2, "GET", "/api/v1/endpoints/ep-side-fenced/state", None).await;
+        assert_eq!(st, 200, "{v}");
+        assert_ne!(
+            v["state"], "RUNNING",
+            "P0-3 失败：只有 sidecar 围栏时端点被自动拉起了（DB 不可写场景）：{v}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // ---- 人工确认：显式 POST /start 成功后 sidecar 围栏必须被清除 ----
+    let (st, v) = http(
+        port2,
+        "POST",
+        "/api/v1/endpoints/ep-side-fenced/start",
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "人工确认后必须允许显式启动: {v}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (st, v) = http(port2, "GET", "/api/v1/endpoints/ep-side-fenced/state", None).await;
+        assert_eq!(st, 200);
+        if v["state"] == "RUNNING" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "显式启动后必须进入 RUNNING: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    {
+        let store = mesa_config_store::ConfigStore::open(&db).unwrap();
+        assert!(
+            store.stop_intent_unpersisted().unwrap().is_empty(),
+            "显式启动成功（人工确认）后围栏（含 sidecar）必须清除"
+        );
+    }
+
+    mesad2.kill().await.unwrap();
+    let _ = mesad2.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P0-4（评审指定默认值翻转）：**默认不恢复**——只有被门正向确认过的
+/// `desired_running=true` 才自动恢复。
+///
+/// 判别力：`ep-unproven` 的 `desired_running=true` 是直接写进 DB 的（没有任何
+/// 意图确认凭证，等价于"一次失败的 Stop 留下的旧值"或"外部篡改"）。旧默认值
+/// （没围栏就恢复）会把它自动拉起；新默认值必须跳过，而对照组（正常 Start
+/// 过的 `ep-control`，凭证存在）必须照常恢复。
+#[tokio::test]
+async fn unconfirmed_desired_running_is_not_auto_restored() {
+    common::init_log();
+    let dir = std::env::temp_dir().join(format!(
+        "mesa-g7-proof-{}-{}",
+        std::process::id(),
+        mesa_core_types::now_unix_ns()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _staged = common::staged_drivers_with_test_driver();
+    let db = dir.join("mesa.db");
+
+    let port1 = free_port().await;
+    let mut mesad1 = spawn_mesad(&dir, port1, _staged.path());
+    wait_ready(port1).await;
+    let (st, _) = http(
+        port1,
+        "POST",
+        "/api/v1/devices",
+        Some(r#"{"id":"dproof","name":"Proof"}"#),
+    )
+    .await;
+    assert_eq!(st, 201, "create device");
+    let tasks = r#"{"tasks":[{"id":"t1","schedule":{"mode":"poll","interval_ms":50},"binding":{"kind":"mesa.resources.v1","config":{"selections":[{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]}}}]}"#;
+    let (st, v) = http(
+        port1,
+        "POST",
+        "/api/v1/endpoints",
+        Some(
+            r#"{"id":"ep-control","name":"ep-control","device_id":"dproof","driver_id":"test-driver","connection":{}}"#,
+        ),
+    )
+    .await;
+    assert!(st == 200 || st == 201, "create endpoint: {v}");
+    let (st, v) = http(port1, "PUT", "/api/v1/tasks/ep-control", Some(tasks)).await;
+    assert_eq!(st, 200, "put tasks: {v}");
+    let (st, v) = http(port1, "POST", "/api/v1/endpoints/ep-control/start", None).await;
+    assert_eq!(st, 200, "start control: {v}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (st, v) = http(port1, "GET", "/api/v1/endpoints/ep-control/state", None).await;
+        assert_eq!(st, 200);
+        if v["state"] == "RUNNING" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "control not running: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    mesad1.kill().await.unwrap();
+    let _ = mesad1.wait().await;
+
+    // 崩溃现场：直接写一个 desired_running=true、但**没有**意图确认凭证的端点。
+    {
+        let raw = rusqlite::Connection::open(&db).unwrap();
+        raw.execute(
+            "INSERT INTO endpoints(id,device_id,driver_id,name,connection_json,desired_running,updated_at_ns)
+             VALUES('ep-unproven','dproof','test-driver','ep-unproven','{}',1,0)",
+            [],
+        )
+        .unwrap();
+        let store = mesa_config_store::ConfigStore::open(&db).unwrap();
+        match store.recovery_plan() {
+            mesa_config_store::RecoveryPlan::Proceed { confirmed, .. } => {
+                assert!(
+                    confirmed.contains("ep-control"),
+                    "正常 Start 过的端点必须有确认凭证（对照组）"
+                );
+                assert!(
+                    !confirmed.contains("ep-unproven"),
+                    "直接写库的 desired_running=true 不得被正向确认"
+                );
+            }
+            mesa_config_store::RecoveryPlan::DenyAll { reason } => {
+                panic!("正常库不应 DenyAll: {reason}")
+            }
+        }
+    }
+
+    // Phase 2：重启。对照组恢复；未证明的端点不得被拉起。
+    let port2 = free_port().await;
+    let mut mesad2 = spawn_mesad(&dir, port2, _staged.path());
+    wait_ready(port2).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (st, v) = http(port2, "GET", "/api/v1/endpoints/ep-control/state", None).await;
+        assert_eq!(st, 200);
+        if v["state"] == "RUNNING" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "对照组 ep-control 必须被自动恢复: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < until {
+        let (st, v) = http(port2, "GET", "/api/v1/endpoints/ep-unproven/state", None).await;
+        assert_eq!(st, 200, "{v}");
+        assert_ne!(
+            v["state"], "RUNNING",
+            "P0-4 失败：无正向证明的 desired_running=true 被自动拉起了: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    {
+        // 诚实声明：围栏/凭证都不改变 DB 里的旧值，只是阻止自动恢复。
+        let store = mesa_config_store::ConfigStore::open(&db).unwrap();
+        assert!(
+            store
+                .get_endpoint("ep-unproven")
+                .unwrap()
+                .unwrap()
+                .desired_running,
+            "无凭证不改变 DB 旧值（它只阻止自动恢复）"
         );
     }
 

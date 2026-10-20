@@ -68,7 +68,13 @@ impl LifecycleError {
 
 impl std::fmt::Display for LifecycleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}: {}", self.status.as_u16(), self.code, self.message)
+        write!(
+            f,
+            "{}/{}: {}",
+            self.status.as_u16(),
+            self.code,
+            self.message
+        )
     }
 }
 
@@ -81,10 +87,20 @@ struct EpGate {
     inflight_starts: u32,
     /// `desired_running` 的内存权威（懒初始化自 DB；此后由门写入）。
     desired: Option<bool>,
-    /// 每次**成功**写入 +1（证明"读到的不是旧值"）。
+    /// 每次**成功**写入 +1（诊断用；证明"读到的不是旧值"）。
     desired_seq: u64,
-    /// 最近一次 `admit_stop` 时的 `desired_seq`（判据 2 的比对基准）。
-    last_stop_seq: Option<u64>,
+    /// 最近一次**已确认落盘**的 Stop 的 `stop_gen`（R-2 收敛判据）。
+    ///
+    /// 只有 `finish_stop_persist(Ok)` 且代次仍是最新时才推进。修复前用的是
+    /// "admit 时的 `desired_seq`"，那个值在落盘开始**之前**就已满足 ⇒ 慢写
+    /// 条件下 `await_settled` 会在 DB 仍为旧值时误判成功。
+    stop_persist_confirmed_gen: Option<u64>,
+    /// 正在落盘、尚未确认的 Stop 的 `stop_gen`（P0-1 启动闸门）。
+    ///
+    /// 非空 ⇒ `desired=false` 尚未确认写入 DB。此时若允许新 Start 提交
+    /// `desired=true`，旧 Stop 的 false 可能后到并覆盖它 ⇒ **实际 RUNNING、
+    /// DB 却是 false**（下次重启不会自动恢复，但运行态与持久化面矛盾）。
+    stop_persist_inflight: Option<u64>,
     /// Stop 意图落盘失败 ⇒ 禁止 Start，直到补写成功（§6.10.3）。
     intent_unpersisted: bool,
 }
@@ -125,6 +141,8 @@ pub struct StopAdmission {
     pub handle: StopHandle,
     /// 落盘尝试（`spawn_blocking`，不阻塞 teardown）。`Err` ⇒ 意图未持久化。
     pub persist: tokio::task::JoinHandle<Result<(), String>>,
+    /// 本次受理的 Stop 代次（落盘任务异常终止时用于归还门状态）。
+    pub stop_gen: u64,
 }
 
 /// 一次采样：6 条判据的**全部来源**（设计 §7.3）。
@@ -136,6 +154,12 @@ pub struct SettleSample {
     pub entry_absent: bool,
     pub desired: Option<bool>,
     pub desired_seq: u64,
+    /// 当前最新 Stop 代次（`admit_stop` 每受理一次 +1）。
+    pub stop_gen: u64,
+    /// 已确认落盘的 Stop 代次（R-2：收敛必须以此为准，不能只看内存意图）。
+    pub stop_persist_confirmed_gen: Option<u64>,
+    /// 仍在落盘中的 Stop 代次（P0-1：非空即禁止新 Start）。
+    pub stop_persist_inflight: Option<u64>,
     pub intent_unpersisted: bool,
     pub inflight_starts: u32,
 }
@@ -143,8 +167,13 @@ pub struct SettleSample {
 /// 收敛判定结果。
 #[derive(Debug, Clone)]
 pub enum Settled {
-    Settled { generation: u64 },
-    NotSettled { reason: String, sample: SettleSample },
+    Settled {
+        generation: u64,
+    },
+    NotSettled {
+        reason: String,
+        sample: SettleSample,
+    },
 }
 
 /// 生命周期门。
@@ -215,13 +244,30 @@ impl LifecycleGate {
                 ),
             ));
         }
+        // 步骤 1.5（P0-1）：Stop 的 `desired=false` 仍在落盘途中 ⇒ **禁止**新 Start。
+        //
+        // 为什么必须在启动**之前**拒绝：commit 的步骤 3 会写 `desired=true`。若旧
+        // Stop 的 `false` 因 DB 慢/忙在之后才落库，就会覆盖它 ⇒ 实际 RUNNING、
+        // DB 却是 false（与 §5.2 第三行"Stop 已受理、未完成 ⇒ Start 409"同向）。
+        // 只在拆解已经结束（无活 attempt）时才报本码；拆解仍在进行时让
+        // `start_endpoint` 给出既有的 `STOP_IN_PROGRESS`（契约行 2，码不变）。
+        if g.stop_persist_inflight.is_some() && !self.manager.has_live_attempt(&ticket.id) {
+            return Err(LifecycleError::new(
+                StatusCode::CONFLICT,
+                "STOP_PERSIST_IN_PROGRESS",
+                format!(
+                    "endpoint `{}`: 上一次 Stop 的停止意图仍在落盘，尚未确认；请稍后重试 Start",
+                    ticket.id
+                ),
+            ));
+        }
         // 步骤 2：同步启动（内部 insert-before-spawn；冲突由 attempt 表给出）。
         if let Err(msg) = self.manager.start_endpoint(cfg) {
             return Err(map_start_err(&ticket.id, msg));
         }
         // 步骤 3：落盘 true（attempt 已在跑，失败无法回滚 ⇒ 显式 500）。
         match self.store.set_desired_running(&ticket.id, true) {
-            Ok(true) | Ok(false) => {
+            Ok(true) => {
                 g.desired = Some(true);
                 g.desired_seq += 1;
                 g.intent_unpersisted = false;
@@ -234,6 +280,25 @@ impl LifecycleGate {
                     );
                 }
                 Ok(())
+            }
+            // P0-7：`Ok(false)` = UPDATE 命中 0 行 ⇒ 该端点已被并发删除，而 attempt
+            // 已经启动。若不处理就是"配置已删、驱动仍在跑"的孤儿。这里只做同步
+            // 认领（不能在同步临界区 await），等待放到独立任务。
+            Ok(false) => {
+                let handle = self.manager.begin_stop(&ticket.id);
+                if handle.was_running() {
+                    tokio::spawn(async move {
+                        let _ = handle.await_result().await;
+                    });
+                }
+                Err(LifecycleError::new(
+                    StatusCode::CONFLICT,
+                    "ENDPOINT_DELETED",
+                    format!(
+                        "endpoint `{}`: 该端点已被删除，启动已中止（已启动的 attempt 已认领停止）",
+                        ticket.id
+                    ),
+                ))
             }
             Err(e) => {
                 tracing::error!(
@@ -253,6 +318,29 @@ impl LifecycleGate {
     }
 
     // -----------------------------------------------------------------
+    // Delete：作废在途 Start（P0-7）
+    // -----------------------------------------------------------------
+
+    /// DELETE 前调用：`stop_gen + 1` 作废所有在途 Start 票据。
+    ///
+    /// 为什么必须在这里 bump：DELETE 的 `has_live_attempt` 检查与真正删除之间，
+    /// 一个已 admit 的 Start 仍可能提交并拉起驱动 ⇒ "删除的端点继续启动"。
+    /// 复用 Stop 的同一把锁 + 同一代次机制，提交侧无需新增分支。
+    ///
+    /// 不重置 `stop_gen`：端点若被同名重建，新票据拿到的是新代次，旧票据永远
+    /// 匹配不上（与墓碑语义一致）。
+    pub fn invalidate_starts_for_delete(&self, endpoint_id: &str) {
+        let mut m = self.inner.lock().unwrap();
+        let g = m.entry(endpoint_id.to_string()).or_default();
+        g.stop_gen += 1;
+        g.stop_persist_inflight = None;
+        g.stop_persist_confirmed_gen = None;
+        // 端点即将不存在：旧的"意图未持久化"阻塞不再适用于这个 id。
+        g.intent_unpersisted = false;
+        g.desired = None;
+    }
+
+    // -----------------------------------------------------------------
     // Stop：admit（同步：代次 +1 + 置假 + 认领 attempt）→ 落盘（并行）
     // -----------------------------------------------------------------
 
@@ -261,39 +349,49 @@ impl LifecycleGate {
     /// 顺序不可交换（S1）：若先落盘再拆解，DB busy 会把实际停止推迟数秒；
     /// 停止是安全方向，优先级高于持久化。
     pub fn admit_stop(self: &Arc<Self>, endpoint_id: &str) -> StopAdmission {
-        let (handle, seq_at_admit, stop_gen) = {
+        let (handle, stop_gen) = {
             let mut m = self.inner.lock().unwrap();
             let g = m.entry(endpoint_id.to_string()).or_default();
             // 1) 代次 +1：先作废所有在途 Start 票据（W1 的唯一判据）。
             g.stop_gen += 1;
+            let stop_generation = g.stop_gen;
             // 2) 内存意图立即置假（§5.3 前移）；desired=false + state!=STOPPED
             //    在拆解期是**合法组合**，判据侧不得当作矛盾。
             g.desired = Some(false);
-            g.last_stop_seq = Some(g.desired_seq);
-            // 3) 停止优先：同步认领并启动 teardown（无 await、无 DB）。
+            // 3) P0-1：落盘未确认期间禁止新 Start（本代次的确认尚未发生）。
+            g.stop_persist_inflight = Some(stop_generation);
+            // R-2：新 Stop 使上一次的"已确认"失效——本次停止的落盘还没确认，
+            // 收敛判据必须等这一次，而不是复用上一次的凭证。
+            g.stop_persist_confirmed_gen = None;
+            // 4) 停止优先：同步认领并启动 teardown（无 await、无 DB）。
             let h = self.manager.begin_stop(endpoint_id);
-            (h, g.desired_seq, g.stop_gen)
+            (h, stop_generation)
         };
         let store = Arc::clone(&self.store);
         let gate = Arc::clone(self);
         let id = endpoint_id.to_string();
-        // 4) 落盘尝试与 teardown **并行**：spawn_blocking 不占 tokio worker，
+        // 5) 落盘尝试与 teardown **并行**：spawn_blocking 不占 tokio worker，
         //    因此 DB busy 不会拖住拆解任务。
         let persist = tokio::task::spawn_blocking(move || {
-            let res = store.set_desired_running(&id, false).map_err(|e| e.to_string());
-            gate.finish_stop_persist(&id, seq_at_admit, stop_gen, res)
+            let res = store
+                .set_desired_running(&id, false)
+                .map_err(|e| e.to_string());
+            gate.finish_stop_persist(&id, stop_gen, res)
         });
-        StopAdmission { handle, persist }
+        StopAdmission {
+            handle,
+            persist,
+            stop_gen,
+        }
     }
 
     /// 落盘结果归并（在 blocking 线程内调用）。
     ///
     /// 失败语义（§6.10.3）：置 `intent_unpersisted`（禁止新 Start）+ 写持久化
     /// 围栏（S2：崩溃后重启也不得自动拉起该端点）+ 返回 Err 让响应变 500。
-    fn finish_stop_persist(
+    pub(crate) fn finish_stop_persist(
         &self,
         endpoint_id: &str,
-        seq_at_admit: u64,
         stop_gen: u64,
         res: Result<bool, String>,
     ) -> Result<(), String> {
@@ -305,7 +403,10 @@ impl LifecycleGate {
                 // 晚到成功，不得覆盖更新一次 Stop 已写入的事实。
                 if g.stop_gen == stop_gen {
                     g.desired = Some(false);
-                    g.desired_seq = g.desired_seq.max(seq_at_admit + 1);
+                    g.desired_seq += 1;
+                    g.stop_persist_inflight = None;
+                    // R-2：本次停止意图落盘已确认——这是收敛判据的唯一凭证。
+                    g.stop_persist_confirmed_gen = Some(stop_gen);
                     g.intent_unpersisted = false;
                     drop(m);
                     if let Err(e) = self.store.clear_stop_intent_unpersisted(endpoint_id) {
@@ -318,19 +419,51 @@ impl LifecycleGate {
                 Ok(())
             }
             Err(e) => {
-                {
+                let latest = {
                     let mut m = self.inner.lock().unwrap();
                     let g = m.entry(endpoint_id.to_string()).or_default();
-                    g.intent_unpersisted = true;
-                }
-                // S2：持久化"意图未持久化"围栏。即使 Core 随后崩溃，重启也不会
-                // 依据旧的 desired_running=true 自动拉起用户明确要停的端点。
-                if let Err(fence_err) = self.store.mark_stop_intent_unpersisted(endpoint_id) {
-                    // 围栏写失败是**最坏**情况：无法保证重启失败关闭。
-                    tracing::error!(
-                        endpoint = %endpoint_id, error = %fence_err,
-                        "CRITICAL: 停止意图围栏写入失败；重启后该端点可能被自动拉起，需人工核验"
+                    let latest = g.stop_gen == stop_gen;
+                    if latest {
+                        g.stop_persist_inflight = None;
+                        g.stop_persist_confirmed_gen = None;
+                        g.intent_unpersisted = true;
+                    }
+                    latest
+                };
+                if !latest {
+                    // 更晚的 Stop 已受理：它的落盘结果才是权威，旧代次的失败不得
+                    // 把门锁死在"意图未持久化"（否则一次陈旧失败会永久禁止 Start）。
+                    tracing::warn!(
+                        endpoint = %endpoint_id, stop_gen, error = %e,
+                        "stale STOP persist failed after a newer Stop was admitted; ignored"
                     );
+                    return Err(e);
+                }
+                // S2/P0-3：持久化"意图未持久化"围栏。即使 Core 随后崩溃，重启也不会
+                // 依据旧的 desired_running=true 自动拉起用户明确要停的端点。
+                // 围栏有 DB + sidecar 两条通道（DB 整体不可写时仍可跨崩溃）。
+                match self.store.mark_stop_intent_unpersisted(endpoint_id) {
+                    Ok(report) if report.durable() => {
+                        tracing::error!(
+                            endpoint = %endpoint_id,
+                            db_channel = report.db,
+                            file_channel = report.file,
+                            "STOP intent not persisted; 持久化围栏已写入（重启将拒绝自动恢复）"
+                        );
+                    }
+                    Ok(_) => {
+                        tracing::error!(
+                            endpoint = %endpoint_id,
+                            "CRITICAL: 停止意图围栏两条通道均未留下持久事实"
+                        );
+                    }
+                    Err(fence_err) => {
+                        // 围栏写失败是**最坏**情况：无法保证重启失败关闭。
+                        tracing::error!(
+                            endpoint = %endpoint_id, error = %fence_err,
+                            "CRITICAL: 停止意图围栏写入失败；重启后该端点可能被自动拉起，需人工核验"
+                        );
+                    }
                 }
                 tracing::error!(
                     endpoint = %endpoint_id, error = %e,
@@ -348,7 +481,15 @@ impl LifecycleGate {
     /// 一次跨来源采样。只读：不写 `desired_running`、不 cancel/restart attempt、
     /// 不改快照。一旦它开始"纠正"，就变成 §10-1 明确拒绝的对账器。
     pub fn sample(&self, endpoint_id: &str) -> SettleSample {
-        let (desired, desired_seq, intent_unpersisted, inflight_starts) = {
+        let (
+            desired,
+            desired_seq,
+            stop_gen,
+            confirmed,
+            inflight,
+            intent_unpersisted,
+            inflight_starts,
+        ) = {
             let mut m = self.inner.lock().unwrap();
             let g = m.entry(endpoint_id.to_string()).or_default();
             if g.desired.is_none() {
@@ -363,6 +504,9 @@ impl LifecycleGate {
             (
                 g.desired,
                 g.desired_seq,
+                g.stop_gen,
+                g.stop_persist_confirmed_gen,
+                g.stop_persist_inflight,
                 g.intent_unpersisted,
                 g.inflight_starts,
             )
@@ -379,6 +523,9 @@ impl LifecycleGate {
             entry_absent: !self.manager.has_live_attempt(endpoint_id),
             desired,
             desired_seq,
+            stop_gen,
+            stop_persist_confirmed_gen: confirmed,
+            stop_persist_inflight: inflight,
             intent_unpersisted,
             inflight_starts,
         }
@@ -387,10 +534,15 @@ impl LifecycleGate {
     /// 稳定窗口判定（设计 §7.4）。`timeout` 内连续 [`SETTLE_TICKS`] 个 tick 全过才算收敛。
     ///
     /// `current_gen == None` ⇒ `NotSettled{NoGenBaseline}`（**无证据 ≠ 证据成立**）。
+    ///
+    /// R-2：收敛**必须**以"本次 Stop 的 `desired=false` 落盘已确认"为前提。
+    /// 只看内存意图（`desired == Some(false)`）会在慢写条件下提前返回成功——
+    /// 此时 DB 仍是旧值 `true`，重启会把这个用户明确要停的端点自动拉起来。
     pub async fn await_settled(&self, endpoint_id: &str, timeout: Duration) -> Settled {
-        let seq_at_admit = {
+        // 以"进入判定时的最新 Stop 代次"为目标：只认这一次的落盘确认。
+        let target_gen = {
             let m = self.inner.lock().unwrap();
-            m.get(endpoint_id).and_then(|g| g.last_stop_seq)
+            m.get(endpoint_id).map_or(0, |g| g.stop_gen)
         };
         let deadline = Instant::now() + timeout;
         let mut ok_ticks = 0u32;
@@ -405,12 +557,17 @@ impl LifecycleGate {
                     sample: s,
                 };
             };
+            // R-2：本次停止意图落盘已确认，且没有更新的 Stop 在途。
+            let intent_confirmed = target_gen > 0
+                && s.stop_gen == target_gen
+                && s.stop_persist_confirmed_gen == Some(target_gen)
+                && s.stop_persist_inflight.is_none();
             let same_gen = last_gen.is_none_or(|g| g == cur);
             let pass = s.snapshot_gen == Some(cur)
                 && s.snapshot_state.as_deref() == Some("STOPPED")
                 && s.entry_absent
                 && s.desired == Some(false)
-                && s.desired_seq >= seq_at_admit.unwrap_or(0)
+                && intent_confirmed
                 && !s.intent_unpersisted
                 && s.inflight_starts == 0;
             ok_ticks = if pass && same_gen { ok_ticks + 1 } else { 0 };
@@ -422,14 +579,17 @@ impl LifecycleGate {
                 return Settled::NotSettled {
                     reason: format!(
                         "窗口内未连续 {} 个 tick 全过（snapshot_gen={:?} current_gen={:?} \
-                         state={:?} entry_absent={} desired={:?} seq={} intent_unpersisted={} inflight={}）",
+                         state={:?} entry_absent={} desired={:?} stop_gen={} \
+                         confirmed_gen={:?} persist_inflight={:?} intent_unpersisted={} inflight={}）",
                         SETTLE_TICKS,
                         last_sample.snapshot_gen,
                         last_sample.current_gen,
                         last_sample.snapshot_state,
                         last_sample.entry_absent,
                         last_sample.desired,
-                        last_sample.desired_seq,
+                        last_sample.stop_gen,
+                        last_sample.stop_persist_confirmed_gen,
+                        last_sample.stop_persist_inflight,
                         last_sample.intent_unpersisted,
                         last_sample.inflight_starts
                     ),
@@ -550,9 +710,7 @@ mod tests {
     #[tokio::test]
     async fn settled_without_generation_baseline_is_not_settled() {
         let g = gate("nobaseline");
-        let r = g
-            .await_settled("ep-1", Duration::from_millis(300))
-            .await;
+        let r = g.await_settled("ep-1", Duration::from_millis(300)).await;
         match r {
             Settled::NotSettled { reason, sample } => {
                 assert!(reason.contains("NoGenBaseline"), "{reason}");
@@ -569,7 +727,7 @@ mod tests {
         let g = gate("intent");
         // 直接驱动落盘归并（等价于 admit_stop 的 spawn_blocking 返回失败）。
         // `stop_gen` 必须与门当前值一致（生产里 admit_stop 先 +1 再落盘）。
-        let r = g.finish_stop_persist("ep-1", 0, 0, Err("disk full".into()));
+        let r = g.finish_stop_persist("ep-1", 0, Err("disk full".into()));
         assert!(r.is_err());
         assert!(g.intent_unpersisted("ep-1"));
         assert_eq!(
@@ -586,7 +744,7 @@ mod tests {
         assert_eq!(err.code, "INTENT_UNPERSISTED");
 
         // 补写成功 ⇒ 清标记 + 清围栏。
-        g.finish_stop_persist("ep-1", 0, 0, Ok(true)).unwrap();
+        g.finish_stop_persist("ep-1", 0, Ok(true)).unwrap();
         assert!(!g.intent_unpersisted("ep-1"));
         assert!(g.store.stop_intent_unpersisted().unwrap().is_empty());
     }
