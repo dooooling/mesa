@@ -1,9 +1,9 @@
 # 828D 一期首轮限定采样执行申请（真机验收标准模板 v1）
 
 - **文档性质：申请，尚未获批。** 本文档不构成执行授权；只有 §10 裁决为 **GO** 且四方签字齐全后，才可按 §5 执行。**未获批准不得 Start。**
-- **模板用法**：每轮复制本文件 → 改写 §1 空白、§3 点集、§5 时间窗 → **重跑 §4 五道门（用本轮新证据）** → §10 重新裁决。**上一轮的 GO 不延续到下一轮。**
-- 实施基线：`main = fda7633a6d675c43f5bab58f662667aac4a54daf`（编制前工作树干净；本文件为唯一新增）；本轮 **R1**；版本 v1.0；编制日期 2026-10-20。
-- 编制声明与口径：本次**只新增本文件**，未改代码/测试/配置/既有文档，未做 git 写操作，未连设备、未启服务、未跑测试或构建；事实给 `文件:行号`，无法由代码/产物确定的标 **待确认**；**不夸大**——30 秒 ≠ Stop 完成时间，读到值 ≠ 业务可用，rev15 可用是**已证明**的而非假定的。
+- **模板用法**：每轮复制本文件 → 改写 §1 空白、§3 点集、§5 时间窗 → **重跑 §4 五道现场门 + G6（用本轮新证据）** → §10 重新裁决。**上一轮的 GO 不延续到下一轮。**
+- 实施基线：`main = fda7633a6d675c43f5bab58f662667aac4a54daf`（编制前工作树干净；本文件为唯一新增）；本轮 **R1**；版本 **v1.1**（v1.0 → v1.1：按独立审查修订**执行安全与证据约束**，§1–§3 冻结范围不变）；编制日期 2026-10-20。
+- 编制声明与口径：本次**只新增本文件**，未改代码/测试/配置/既有文档，未做 git 写操作，未连设备、未启服务、未跑测试或构建；事实给 `文件:行号`，无法由代码/产物确定的标 **待确认**；**不夸大**——30 秒 ≠ Stop 完成时间，读到值 ≠ 业务可用，rev15 可用是**已证明**的而非假定的。**v1.1 只强化执行安全与证据约束（watchdog、日志口径、执行前重验、证据完整性），不新增点位、不扩大采集范围、不改任何代码。**
 - 简称：**诊断方案** = `docs/design/nck-s7-job-0x8201-diagnosis-plan.md`；**清单** = `docs/design/nck-828d-phase1-p0-points.md`；**质量调查** = `docs/design/quality-code-observability-investigation.md`；**D1** = `docs/design/pr-d1-quality-code-visibility-design.md`。
 
 ## 1. 申请信息
@@ -31,11 +31,12 @@
 
 | # | 风险 | 依据 | 本轮处置 |
 |---|---|---|---|
-| ① | **Stop 非即时**：最坏 ≈75–80 s，期间可能仍完成一次 Start | 诊断方案 `:395`、`:398` | 不假设"Stop 立即生效"；见 §5.3、§7 |
+| ① | **Stop 非即时**：**典型最坏 ≈75–80 s**，且该值**不是严格上界**（强杀后等待无超时，§5.3），期间可能仍完成一次 Start | 诊断方案 `:395`、`:398`；`crates/driver-manager/src/process.rs:127` | 不假设"Stop 立即生效"；Stop 由 watchdog 在截止时刻无条件发出（§4.6、§5.1、§5.3） |
 | ② | **机型身份无法由软件证明**：`family`/`model` 恒 `None`，`NCK_ANCHOR_PENDING` 恒在 | `drivers/sinumerik-nck/src/probe.rs:26`、`:49-64`；`GATE.md:91-92` | 只能靠铭牌 + HMI + X130 + 工位（§4-G1） |
-| ③ | **Core/驱动日志当前未落盘** | 诊断方案 `:171`、`:425` | 执行前须解决；未解决按 §6.3 记证据缺口 |
+| ③ | **Core/驱动日志不落盘——已知环境限制**（驱动进程无 tracing subscriber；mesad 由外层 `pwsh … 2>&1` 启动，`stdout/stderr` 未重定向） | 诊断方案 `:171`、`:425`；`process.rs:70-72` | **不以任何进程日志作为判据**，改用可独立获取的证据（watchdog 状态序列、`points/latest` 原始快照、Stop 请求/响应、epoch）；日志缺失本身**不**构成 INVALID，但**观测不到端点状态即 INVALID**（§6.3） |
 | ④ | **`runtime.revision=16` / `runtime.points=4` 是上次运行快照**，恢复 238 点后也不变 | `rev17-endpoint.raw.json`；`endpoint.rs:230-231`、`:431` | 恢复对账只认 `GET /tasks`（§8.3） |
 | ⑤ | **值语义未确认**（状态 `5`、参数 `1`、位置 `0.0`） | 清单 `:42`、`:73`、`:235` | 只判 GOOD/新鲜/窗口内推进，**不判语义**；与 ② 一样，软件侧无法自证 |
+| ⑥ | **Stop 生效前 Core 仍可能自行重连**（"不允许重试"只约束人工，不约束 Core） | `endpoint.rs:48`、`:59`、`:416-417`；诊断方案 `:610-614`、`:643` | 判据必须含"Stop 后无新 `epoch` / 无 `RECONNECTING`"（§3.5、§5.3-⑥） |
 
 ## 3. 精确配置
 
@@ -85,25 +86,56 @@
 | `max_read_items` | `1` |
 | 运行观察窗口 | **≤30 秒** |
 | 读取模式 | **只读**（不 Write、不 Command，Control 保持 `disabled`） |
-| 自动重试 | **不允许**（任何失败一律 Stop + 记录） |
+| 自动重试 | **人工不允许**（任何失败一律 Stop + 记录）；但 Stop 生效前 Core 仍可能自行重连，见下方定义 |
 | 扩点 / 自动进入第二轮 | **均不允许** |
 | 完成后状态 | **STOPPED**（`desired_running=false`） |
 
+**"不允许重试"的准确含义（三句，不得只引其中一句）**：
+
+1. **人工不主动重试**：不点第二次 Start、不"再试一次看看"、不自动进入下一轮（§7 统一流程、§10.4）。
+2. **异常时立即 Stop**（§7 任一触发即停）。
+3. **但"不允许重试"≠"不会重连"**：Stop 生效前 Core 仍可能发起重连——`RECONNECT_BACKOFF_SECS = [1, 2, 5, 10, 30]`（`crates/driver-manager/src/endpoint.rs:48`）**只对"连续失败且从未进入 `RUNNING`"的尝试递增**；一旦某次尝试短暂进入 `RUNNING`，退避下标归零（`endpoint.rs:59`、`:416-417`），实测节奏约 **3.58 s/次且可无限持续**（诊断方案 `:610-614`、`:643`）。因此"不允许重试"只约束**人**，**不构成"Stop 后不会再有连接"的保证**；判据必须包含 **Stop 后核验无新的 `epoch` 变化、无 `RECONNECTING`**（§5.3-⑥），否则判为**未停干净**。
+
 **变更控制**：冻结表内任一项变更（含"只多读 1 点""5000 改 4000""只延长 10 秒"）都使本申请**立即失效**，须重新编制、重过 §4、重新裁决；执行中发现配置与本文档不符 ⇒ 按 §7-S6 立即 Stop。
 
-## 4. 现场五道前置门（**必须使用本次执行窗口的新证据**）
+## 4. 现场前置门（G1–G5 五道现场门 + **G6 第六道执行前门**；**必须使用本次执行窗口的新证据**）
 
 > **授权不延续**：T2b 的通过结果、上一轮门禁记录、旧截图**一律不得复用**。每道门都须在**本次窗口内**重新取证、重新签字。任一门不通过 ⇒ **不 Start**（记 NO-GO，不得"先跑再说"）。
+>
+> **G6（watchdog 就绪）是原五道现场门之外的第六道执行前门**（§4.6）：它不替代 G1–G5，也不被 G1–G5 替代；**G6 未就绪 ⇒ 同样不得 Start**。
 
 | 门 | 要求（本次新证据） | 证据形式 | 为什么必须 | 不满足时 |
 |---|---|---|---|---|
 | **G1 机床身份** | ① 铭牌确认 **SINUMERIK 828D**（型号 + 序列号逐字抄录）② HMI 机床/系统信息页 ③ X130 网络口现场确认（指示灯、端口标签）④ 工位信息与申请一致 | 铭牌照片 + HMI 截图 + X130 照片 + 工位牌照片，**均带拍摄时间** | 软件侧 `family`/`model` **恒为 `None`**（`probe.rs:49-64`）、`NCK_ANCHOR_PENDING` 恒在（`probe.rs:26`、`GATE.md:91-92`）⇒ **无法由软件证明机型** | 停止，NO-GO |
-| **G2 网络参数** | ① HMI 实际 IP 仍为 `192.168.15.60`（网络设置页）② `remote_tsap=3332`、`pdu_length=480` 与目标机床一致（`connection-check` 的 `mode=probe` 协商 PDU，`core-api:3286`）③ **该地址无其他设备占用** | HMI 网络页截图 + `10-probe.json`（`reachable`、协商 PDU）+ 交换机/网口核对记录（`arp -a` 的 MAC 仅作辅助对照） | 历史上**同 IP 曾换过设备**（诊断方案 `:18`、`:541`）；probe 只证"连到 S7Comm 对端"，**不证身份**（`:185`） | 先做单次 probe 核对；仍不符 ⇒ 停止 |
+| **G2 网络参数** | ① HMI 实际 IP 仍为 `192.168.15.60`（网络设置页）② `remote_tsap=3332`、`pdu_length=480` 与目标机床一致（**仅在探测已获单独授权时**才可用 `connection-check` 的 `mode=probe` 核对协商 PDU，`core-api:3286`）③ **该地址无其他设备占用** | HMI 网络页截图 +（**已获授权时**）`10-probe.json`（`reachable`、协商 PDU）+ 交换机/网口核对记录（`arp -a` 的 MAC 仅作辅助对照） | 历史上**同 IP 曾换过设备**（诊断方案 `:18`、`:541`）；probe 只证"连到 S7Comm 对端"，**不证身份**（`:185`）；且 probe 是**真实机床 I/O**（见下方"探测授权"） | 未获探测授权 ⇒ 只用 HMI + ARP/MAC + 目视，**不得**由软件主动连机床；仍不符 ⇒ 停止 |
 | **G3 机床状态** | 无报警、无急停、安全静止；只读采集不影响当前加工安排（负责人确认） | 机床状态表（上电/急停/驱动使能/参考完成/程序运行/轴是否运动/报警号/操作员口述，诊断方案 `:159`）+ 签字 | 安全前提；状态变化会让"值是否合理"无法判读 | 记录状态后停止 |
-| **G4 现场监护** | 有权限监护人在场，具备 **人工 Stop** 与 **网络隔离**（拔**测试主机**网线）能力，并明确窗口时长 | 监护人姓名/电话 + 能力确认签字（§10.2） | **Stop 可能不及时**（最坏 ≈75–80 s，§5.3）；远程 Stop 不是安全保证 | 不开始 |
-| **G5 备份与并发** | ① `rev17` 备份已完成且 SHA 已核（**§8.1 已给出**）② **无其他控制端**同时操作该 Endpoint（另一 Mesa 控制台、HMI 侧采集工具、他人 REST 调用） | 备份三件套的 `Get-FileHash` 输出 + 并发确认（`GET /endpoints` 观察 + 现场唯一操作员） | 防止并发写入把"复现"变成"改配置"；恢复依赖备份 | 不开始 |
+| **G4 现场监护** | 有权限监护人在场，具备 **人工 Stop** 与 **网络隔离**（拔**测试主机**网线）能力，并明确窗口时长 | 监护人姓名/电话 + 能力确认签字（§10.2） | **Stop 可能不及时**（**典型**最坏 ≈75–80 s，**非严格上界**，§5.3）；远程 Stop 不是安全保证 | 不开始 |
+| **G5 备份与并发** | ① `rev17` 备份已在**本次窗口内重新获取并重算 SHA-256**，且与本文档基线逐字符一致（§8.1"执行窗口内的重新验证"；**不得**直接引用本文档旧哈希当作"已验证"）② **无其他控制端**同时操作该 Endpoint（另一 Mesa 控制台、HMI 侧采集工具、他人 REST 调用） | **本次窗口内**重新 `GET` 的端点/任务原始响应 + 其 `Get-FileHash` 输出 + 与 §6.4 基线的比对记录（两值并列）+ 并发确认（`GET /endpoints` 观察 + 现场唯一操作员） | 防止并发写入把"复现"变成"改配置"；恢复依赖**当时**的备份，不是"上次的备份" | 哈希不一致或无法重验 ⇒ **NO-GO**（重新评估回退目标）；并发不确认 ⇒ 不开始 |
 
-**关于 MAC `98-fa-9b-59-35-53`（仅辅助对照）**：该值目前**仅来自现场记录，仓库内无留存**（全仓检索无匹配，**待现场补充截图或书面记录**）。即便一致，**单靠 MAC 或 IP 不足以证明一定连接的是指定 828D**（MAC 可换网卡、IP 可复用；诊断方案 `:215-217` 明确"名称/ID 是人工标签，不是身份证据"）。MAC **只能**作为与 HMI + X130 + 工位信息相互印证的一环，**不得单独作为 G1 通过依据**。五门签字另附页，格式同 §10.2（确认人 / 确认时间 / 证据文件名；缺一即未通过）。
+**G2 的探测授权（单独授权，不得默认包含）**：`POST /api/v1/endpoints/{id}/connection-check` 的 `mode=probe` 会启动临时驱动进程并发起**真实机床 I/O**——TCP 连接 `192.168.15.60:102` → COTP → S7 Setup 握手（`drivers/sinumerik-nck/src/probe.rs:3`、`:38-48`；`core-api:3286-3287`），**不是**纯本地校验（`mode=validate` 才零 I/O，`connection_check.rs:75`、`:640`）。因此：
+
+- **该探测必须单独授权**，**不得**默认并入"尚未批准的前置检查"，也不得因"只是探一下"而免授权；一次探测 = 一次对机床的真实连接（诊断方案 `:185`、`:572`）。
+- **未获授权时，G2 只能依赖 HMI 侧信息 + `arp -a`/MAC 对照 + 现场目视**（X130 指示灯、端口标签），**不得**由软件主动连机床；此时 G2 的"协商 PDU"一项记为"未测（无授权）"，不得写成"已核对"。
+- 即便获授权，probe 结果也**只证"连到 S7Comm 对端"**，不证机型身份，不得替代 G1。
+
+**关于 MAC `98-fa-9b-59-35-53`（仅辅助对照）**：该值目前**仅来自现场记录，仓库内无留存**（全仓检索无匹配，**待现场补充截图或书面记录**）。即便一致，**单靠 MAC 或 IP 不足以证明一定连接的是指定 828D**（MAC 可换网卡、IP 可复用；诊断方案 `:215-217` 明确"名称/ID 是人工标签，不是身份证据"）。MAC **只能**作为与 HMI + X130 + 工位信息相互印证的一环，**不得单独作为 G1 通过依据**。五道现场门 + G6 的签字另附页，格式同 §10.2（确认人 / 确认时间 / 证据文件名；缺一即未通过）。
+
+### 4.6 第六道执行前门（G6）：watchdog 已就绪
+
+> **一句话**：**watchdog 未就绪，不得 Start。** 没有独立看门机制，30 秒截止就只是"希望主流程走到那一步"，不构成执行安全。
+
+| # | 就绪判据（全部满足） | 证据 |
+|---|---|---|
+| G6-1 | watchdog 已作为**独立进程**启动，PID 与启动时刻记入 `run-log.md` | 进程列表 + `run-log.md` |
+| G6-2 | 截止时刻 = `T0 + 30 s` 已由 watchdog **自行**计算并写入 `run-log.md`；不依赖主流程传入 | `run-log.md` + watchdog 首行记录（`watchdog-states.jsonl`） |
+| G6-3 | **通路自检**：对**当前已 STOPPED** 的端点调用一次 `POST .../stop`，返回 200 且 `was_running=false`（幂等，`core-api:2169-2175`），证明端口/凭据/网络可用 | `stop-selftest.json`（含时刻与响应体） |
+| G6-4 | 观测输出可写：`watchdog-states.jsonl` 已产生首行（含 `t_local`、`state`、`desired_running`、`epoch`、`http_status`） | 该文件前 3 行 |
+| G6-5 | 监护人已知晓"Stop 由 watchdog 发出，不由执行人手动决定"；执行人不得关停 watchdog | §10.2 签字备注 |
+
+- **自检纪律**：G6-3 **只能**在 Start 之前做（此时端点本已 `STOPPED`，Stop 幂等且不改配置）；**不得**在 Start 之后用自检代替真 Stop，也不得用自检制造"已验证"的错觉。
+- **不满足任一项 ⇒ NO-GO**，记入 §10.1；**不得**"先 Start 再说，watchdog 边跑边调"。
+- watchdog 的**实现要点**见 §5.1；**Start/Stop 竞态处理**见 §5.3。
+
 
 ## 5. 执行时间窗
 
@@ -113,31 +145,48 @@
 |---|---|
 | 计划开始 / 结束（本地时间） | **待填** / **待填**（结束须含 Stop 与恢复，留 ≥5 min 余量） |
 | `interval_ms` | `5000` |
-| 运行观察窗口 / 截止 | **≤30 秒**（硬上限）；截止 = `T0 + 30 s`，到点**立即**发 Stop（§5.3） |
-| 计时起点 `T0` | `POST /endpoints/{id}/start` **请求发出**的本地墙钟时刻（**含建连时间**，不因"还没 RUNNING"而延后截止） |
+| 运行观察窗口 / 截止 | **≤30 秒**（硬上限）；截止 = `T0 + 30 s`，到点由 **watchdog 无条件**发 Stop（**不等主流程、不等抓证完成**；§4.6、§5.3） |
+| 计时起点 `T0` | `POST /endpoints/{id}/start` **请求发出**的本地时刻（**含建连时间**，不因"还没 RUNNING"而延后截止）；由 **watchdog 以自身单调时钟**记录，**Start 是否返回、何时返回都不影响截止** |
+| Stop 发出者 | **watchdog（独立进程）**；执行人可另发人工 Stop（幂等，`core-api:2169-2175`），但**不得**替代或关停 watchdog |
 | 预期批次 | 5–6 轮（30 s ÷ 5 s；首轮相位取决于建连耗时，**不承诺**恰好 6 轮） |
+
+**watchdog 实现要点（独立进程，与主流程解耦）**——本文件**不创建**脚本，执行前须按下列要点落地并经监护人按 §4.6 逐项核对：
+
+1. **独立进程**：`pwsh -File stop-watchdog.ps1`，独立于抓证进程与执行人的操作节奏；**不 import 驱动/Core 代码、不读其内部循环、不以端点状态决定"何时该 Stop"**。
+2. **计时源**：自身 `[System.Diagnostics.Stopwatch]` 单调时钟；`T0` = 发出 Start 请求**前一刻**的 watchdog 本地时刻；**不采用**服务端时间，也**不采用**主流程回传的 `T0`。
+3. **职责**：watchdog **独占** Start 与截止 Stop。Start 用 `Invoke-WebRequest -TimeoutSec 10`，**只发一次、不重发**；超时/异常只记录，**不阻塞** 30 s 计时。
+4. **截止动作**：到达 `T0+30 s` **立即**发 `POST .../stop`（`-TimeoutSec 120`），**不等待** Start 响应、**不等待** `capture-points.ps1`（其本就不启停端点，`capture-points.ps1:1`）。
+5. **观测**：每 **200 ms** `GET /api/v1/endpoints/{id}`（`-TimeoutSec 5`），逐行追加 `watchdog-states.jsonl`（`t_local`、`t_unix_ns`、`state`、`desired_running`、`epoch`、`detail`、`http_status`），覆盖 `T0-2 s` 至最终 `STOPPED` 后 **10 s**；总上限 **120 s**。
+6. **不阻塞观测**：Stop 请求放独立 runspace/job 发出，主循环同时继续采样——**Stop 可能挂 75–80 s 以上**（§5.3），观测不能跟着卡住。
+7. **退出**：判据（§5.3-⑥）满足 ⇒ 退出码 0；120 s 仍未满足 ⇒ 退出码非 0 并打印隔离流程（§5.3 处置 ②–⑤），由监护人执行。
 
 ### 5.2 执行顺序（只读，逐步留证）
 
-1. §4 五门签字完成；抓**运行前**基线：`GET /endpoints/{id}`、`GET /tasks?endpoint=`、`GET /points/latest`（§6.3）。
+1. §4 **G1–G5 签字 + G6 watchdog 就绪**（§4.6）；抓**运行前**基线：`GET /endpoints/{id}`（完整保存）、`GET /tasks?endpoint=`、`GET /points/latest`（**完整原始响应**，§6.3）。
 2. `PUT /api/v1/tasks/lx-nck-tags-190-connection`，body = `{"tasks":[ …§3.1 四点… ]}`（结构与 `t2b-task.json` 同形，预期新 revision **18**）。保存会触发一次 Descriptor 校验（临时驱动进程，仅 handshake + GetDescriptor，`manager.rs:579-599`），**不建立到机床的 NCK 连接**；运行中保存被 `CONFLICT` 拒绝（`core-api:2297-2305`）。
-3. `POST /endpoints/{id}/start`，记录 `T0`。
-4. `T0+10 s±2 s` 抓 **`early`**；`T0+25~28 s` 抓 **`prestop`**（**必须在 Stop 之前**）。
-5. `T0+30 s` **立即** `POST /endpoints/{id}/stop`（客户端 `-TimeoutSec 120`，诊断方案 `:351`）。
-6. 按 §5.3 五项判据复核"停干净"；未干净 ⇒ 现场处置（§5.3）。
+3. **由 watchdog** 发 `POST /endpoints/{id}/start` 并记录 `T0`（watchdog **不等响应**；执行人不另发 Start）。
+4. `T0+10 s±2 s` 抓 **`early`**；`T0+25~28 s` 抓 **`prestop`**（**必须在 Stop 之前**）。抓证进程从 watchdog 输出的 `t0.stamp` **只读**取 `T0` 以对齐时刻（**不参与** Stop 决策）。**抓不完也不得推迟 Stop**——抓证失败只影响证据，不影响截止。
+5. `T0+30 s` **watchdog 无条件** `POST /endpoints/{id}/stop`（客户端 `-TimeoutSec 120`，诊断方案 `:351`）；执行人**不得**以"prestop 还没抓完"为由推迟或取消。
+6. 按 §5.3 **六项**判据复核"停干净"；若观测到 Start 迟到生效的竞态（`RUNNING`/`epoch` 变化）⇒ **再 Stop** 并记 `RACE_START_AFTER_STOP`；未干净 ⇒ 现场处置（§5.3）。
 7. 恢复 `rev17`（§8.2）→ 对账（§8.3）→ 保持 STOPPED。
 
 ### 5.3 Stop 时间约束（**本轮最关键的一条，不得改写**）
 
-> **30 秒是"运行观察窗口"，不是"Stop 完成时间"。**
+> **30 秒是"运行观察窗口"，不是"Stop 完成时间"；Stop 由 watchdog 在截止时刻无条件发出，不依赖主流程是否走到那一步。**
 
-- **Stop 完成时间最坏可能达约 75–80 秒**（诊断方案 `:357`、`:386`）：teardown 小计 ≈35 s（post 5 s + terminate 5+5 s + reader 5 s + drain 15 s，`:375-383`）+ **取消覆盖不到的**建连/配置闭环 ≈46 s（`DRIVER_STARTUP_TIMEOUT` 6 s + 4 个 RPC × 10 s，`:384`）。故 Stop 请求的**客户端超时必须 ≥120 s**（`:351`）；HTTP 层无全局超时，服务端会挂到 teardown 结束（`:386`）。
-- **三条硬性纪律（逐字保留）**：
-  1. **到达运行截止时间必须立即发出 Stop，不得为了等 `prestop` 快照而延长采集。**
+- **Stop 完成时间：典型最坏 ≈75–80 秒，但这不是严格上界**（诊断方案 `:357`、`:386`）：teardown 小计 ≈35 s（post 5 s + terminate 5+5 s + reader 5 s + drain 15 s，`:375-383`）+ **取消覆盖不到的**建连/配置闭环 ≈46 s（`DRIVER_STARTUP_TIMEOUT` 6 s + 4 个 RPC × 10 s，`:384`）。**该估算不含"强杀后等待子进程回收"的无界时间**：`DriverProcess::terminate` 的宽限只包住第一次 `child.wait()`（`crates/driver-manager/src/process.rs:122`），**强杀后的第二次 `child.wait()` 没有 timeout**（`process.rs:127`）；`terminate_after_shutdown` 同样（`:144`、`:153`）。因此 **75–80 s 只能写作"典型最坏估计"，不得作为超时判据、不得当作安全承诺**。
+- **客户端超时 ≥120 s 只是"客户端愿意等"**（诊断方案 `:351`），**不等于服务端保证 120 s 内停住**；HTTP 层无全局超时，Stop 会挂到 teardown 结束（`:386`）。**"≥120 s" 是等待上限，不是完成保证。**
+- **超过 120 s 仍未 `STOPPED` ⇒ 按隔离流程处理，不再等**：① 阻断出站（防火墙 Block `192.168.15.60:102`，对机床零风险，诊断方案 `:405`）→ ② 杀驱动进程（`:404`，会触发重连，故**必须先阻断**）→ ③ 杀 mesad（`:406`，须先确认 `desired_running=false`）→ ④ **物理隔离只拔测试主机网线**，不得擅自断产线交换机口（`:407` 的 E4 会影响整线）；**每一步后复核状态**（`state`/`desired_running`/驱动进程/到 `:102` 的连接），全过程记入 §10.3。
+- **三条硬性纪律（逐字保留，第 1 条已指向 watchdog）**：
+  1. **到达运行截止时间必须立即发出 Stop（由 watchdog 无条件发出），不得为了等 `prestop` 快照而延长采集。**
   2. **提前触发停止条件时，立即执行停止流程**（§7），不等到截止时间。
   3. **Stop 未能及时完成时，由现场人员按批准的安全处置流程处理，不得假定远程 Stop 必然即时生效。**
-- **现场安全处置（批准后按序）**：① 继续等 Stop（≤120 s，期间只读状态，不重复点 Stop）；② REST 不可用或超时 ⇒ **先阻断出站**（防火墙 Block `192.168.15.60:102`，对机床零风险，诊断方案 `:405`）；③ 仍不收敛 ⇒ 杀驱动进程（`:404`，会触发重连）；④ 最后才杀 mesad（`:406`，须先确认 `desired_running=false`）；⑤ **物理隔离只拔测试主机网线**，不得擅自断产线交换机口（`:407` 的 E4 会影响整线）。
-- **"停干净"五项判据**（缺一不算）：HTTP 200/500 + `state=STOPPED` + `desired_running=false` + 驱动进程空 + 到 `192.168.15.60:102` 无 Established（`:398`）。**看到 500 不等于没停住**（drain 失败也 500，但 `desired_running` 仍落 false，`:396`）。
+- **Start/Stop 并发竞态（必须按此处理，不得假设"先 Start 后 Stop"的顺序成立）**：
+  - **机制**：Stop 在 `manager.is_running()` 为假时**直接置 `desired_running=false` 并返回 200**（`core-api:2169-2175`）；若 Start 随后才走成功路径，它会把 `desired_running` **重新置 true**（`core-api:2153-2156`）⇒ 端点可能在 **Stop 之后**才进入 `RUNNING`。这不是 Stop 失败，是**竞态**。
+  - **Start 超时/未返回时，watchdog 仍必须按截止时间发 Stop**——截止与 Start 的返回值无关（§5.1-3/4）。
+  - Stop 发出后**继续观测**：若看到 `RUNNING` 或 `epoch` 变化 ⇒ **再次 Stop**（最多 3 次），并在 `run-log.md` 记 `RACE_START_AFTER_STOP`（含两次 Stop 的时刻与完整状态序列）。
+  - **判据以"最终观测到 `STOPPED` + `desired_running=false`"为准**，**不是**"Stop 请求已发出"。
+- **"停干净"六项判据（缺一不算）**：① HTTP 200/500（`core-api:2181-2190`）② `state=STOPPED` ③ `desired_running=false` ④ 驱动进程空 ⑤ 到 `192.168.15.60:102` 无 Established（`:398`）⑥ **自首次观测到 `STOPPED` 起连续 10 s（≥10 次、1 s/次）内 `epoch` 不再变化且未出现 `RECONNECTING`**（§3.5）。**看到 500 不等于没停住**（drain 失败也 500，但 `desired_running` 仍落 false，`:396`）；**看到 200 也不等于停干净**（竞态可让 Start 迟到生效）。
 
 ### 5.4 冷却与总量
 
@@ -147,31 +196,48 @@
 
 ### 6.1 目录与命名
 
-`target/validation/828d-r1/round1-<UTC 时间戳>/`（`/target/validation/` 已被 `.gitignore:55` 忽略，不进仓）。文件名前缀 `<UTC>-<label>-<endpoint>`，`label ∈ {early, prestop, pre, post, probe, log}`；目录内必须有 `run-log.md`（字段沿用诊断方案 `:478`）。
+`target/validation/828d-r1/round1-<UTC 时间戳>/`（`/target/validation/` 已被 `.gitignore:55` 忽略，不进仓）。文件名前缀 `<UTC>-<label>-<endpoint>`，`label ∈ {early, prestop, pre, post, probe, log(可选)}`；目录内必须有 `run-log.md`（**人工执行记录**，字段沿用诊断方案 `:478`；它不是进程日志，见 §6.3）。`log` 标签仅在已把 mesad 控制台重定向到文件时使用，**可选、非判据**。
 
 ### 6.2 运行中原始快照（两次，缺一即 INVALID）
 
 | 标签 | 时机 | 内容 | 工具 |
 |---|---|---|---|
-| `early` | `T0+10 s±2 s`（**尽早**，不要等最后） | `when.json`（本地墙钟 + Unix ns）、`state.json`、`points-latest.raw.json`（**逐字节完整响应，不裁剪不摘要**）、`state-after.json` | `target/validation/capture-points.ps1 -Label early`（`:15-31`） |
+| `early` | `T0+10 s±2 s`（**尽早**，不要等最后） | `when.json`（本地墙钟 + Unix ns）、`state.json`、`points-latest.raw.json`（**逐字节完整响应，不裁剪不摘要**，含**全部端点**）、`state-after.json` | `target/validation/capture-points.ps1 -Label early`（`:15-31`） |
 | `prestop` | `T0+25~28 s`，**Stop 之前** | 同上四件套 | 同上 `-Label prestop` |
 
+- **保存顺序（强制）**：先**原样落盘完整响应**（`/points/latest` 是全端点响应，`core-api:1571-1576`），**再**在分析阶段按 `endpoint_id` 筛出目标端点 4 条（§6.3）；**不得**只保存筛选后的 4 条——原始全量是"没读错端点、没悄悄扩点"的唯一凭证。
+- **目录参数必须显式给**：脚本默认输出到 `target\validation\qc-capture`（`capture-points.ps1:8`），与 §6.1 的 `828d-r1/round1-<ts>/` 不同；执行时必须显式 `-OutDir target\validation\828d-r1\round1-<UTC 时间戳>`，否则证据不落在本轮目录。
 - 两次抓取之间**必须**看到批次推进（T2b 实测 25.001 s = 5×5000 ms）；两次 `timestamp_ns` 相同 ⇒ 采集停滞，按 §7-S6 停。抓取期间状态变化（`state.json` 与 `state-after.json` 不一致）⇒ 该样本**作废**（`capture-points.ps1:36-38`）。
+- **抓证失败不推迟 Stop**：`early`/`prestop` 任一次失败只记证据缺口（该样本缺失 ⇒ 按 §9 判 INVALID），**截止时刻仍由 watchdog 无条件 Stop**（§5.1-4）。
 
-### 6.3 前后端点状态与日志
+### 6.3 端点状态、快照与日志口径
 
-`GET /endpoints/{id}`（运行前/后）记录 `state`、`desired_running`、`runtime.epoch`、`runtime.revision`、`runtime.points`、`connection` 全字段；`GET /tasks?endpoint=`（运行前/恢复后）记录 `{endpoint_id, revision, tasks}`（`core-api:2223`）；`GET /points/latest` 只取该端点 4 条，记 `quality`/`quality_code`/`value_origin`/`timestamp_ns`/`value`。
+**端点状态（独立证据，判据的唯一来源）**：
 
-**日志当前状态**：Core 日志**未落盘**（mesad 由外层 `pwsh … 2>&1` 启动，`stdout/stderr` 未重定向，诊断方案 `:171`、`:425`）；驱动 `stdout/stderr` 被 `inherit`（`process.rs:70-72`）。**执行前必须解决**（重定向到 §6.1 的 `mesad-console.log`）。未解决时本轮**仍可执行**，但须在 §10 记**证据缺口**——失败时可能缺时序证据，判定只能落 INVALID，不得凭"没看到错误"判 PASS。
+- `GET /endpoints/{id}`：运行前/后各一次，**完整保存**（含 `state`、`desired_running`、`runtime.epoch`、`runtime.revision`、`runtime.points`、`connection` 全字段）。
+- **watchdog 状态时间序列**：`T0-2 s` 至最终 `STOPPED` 后 10 s，每 200 ms 一次 `GET /endpoints/{id}`，逐行写 `watchdog-states.jsonl`（`t_local`、`t_unix_ns`、`state`、`desired_running`、`epoch`、`detail`、`http_status`）。**这是"Stop 是否生效""是否又重连"的唯一判据来源**（§5.1-5）。
+- `GET /tasks?endpoint=`：运行前/恢复后各一次，记录 `{endpoint_id, revision, tasks}`（`core-api:2223`）。
+- `GET /points/latest`：**先完整保存原始响应（全端点、不裁剪、不摘要）**，**再**在分析阶段按 `endpoint_id` 筛出目标端点 4 条（每条 latest 点自带 `endpoint_id`，`snapshot.rs:99`），记 `quality`/`quality_code`/`value_origin`/`timestamp_ns`/`value`。响应顶层 `count` 是**全端点**总数（`core-api:1571-1576`），须原样记录、**不得**当作目标端点条数；目标端点条数由筛选结果单独统计。
+- **Stop 请求/响应**：发出时刻、HTTP 状态、响应体、返回耗时——watchdog 与人工各记一份；竞态重发时逐次记录（§5.3）。
+
+**日志口径（唯一口径，全文一致）**：
+
+- **事实**：驱动进程无 tracing subscriber、Core 日志不落盘，是**已知环境限制**（诊断方案 `:171`、`:425`；驱动 `stdout/stderr` 被 `inherit`，`process.rs:70-72`）。
+- **结论**：本轮**不以任何进程日志作为判据**，也**不要求**执行前解决日志落盘（不把它列为执行前门禁）；日志即使存在也只作旁证。
+- **不得**用"没看到错误"推断 PASS；**不得**因日志缺失把 PASS 降为 NOTES，也**不得**因日志缺失直接判 INVALID——日志缺失对判定**中性**。
+- **红线**：**若无法持续观测端点状态（watchdog 未就绪、观测中断、`GET /endpoints/{id}` 持续失败），判 INVALID**——**不得启动**；已启动则**立即 Stop** 并按 §5.3 处置。
+- `mesad-console.log` 若已重定向则一并保存（§6.1 的 `log` 标签），**可选**；`run-log.md` 是**人工执行记录**（谁在何时做了什么、发了什么 Stop），**仍是必需证据**，与进程日志不是一回事。
 
 ### 6.4 SHA-256 清单（执行时逐文件填写；基线值本次编制时已实测）
+
+> **时效声明**：下表哈希是**编制时（2026-10-20）的基线参照，不是执行时的验证结果**。执行前必须在本次窗口内重新 `GET` 并重算（§8.1），**不得**引用本表充当"已验证"。
 
 | 文件 | 字节 | SHA-256 |
 |---|---|---|
 | `828d-r1/rev17-endpoint.raw.json` | 658 | `B3D2D3F0AC0D438E0B1DB66FCDA6D0564DDB620EDE7E3F359309E561B83BB659` |
 | `828d-r1/rev17-tasks.raw.json` | 111,992 | `CE1EEEB28C1BC2A54B3A0A0781E2F966C495516749B74782A444D06AEE5E96F1` |
 | `828d-r1/rev17-rollback-put.json` / `t2b-rollback-rev15.json` | 111,925 / 111,925 | `10515C712FC9AF27D8B6FDF229764A88FE3E4E7DAC3B7FAC7F01637F21DFDF42`（两文件同值） |
-| 本轮文件（`early`/`prestop` 四件套、`pre`/`post` 快照、`mesad-console.log`） | 待填 | 待填（每个文件一行） |
+| 本轮文件（`early`/`prestop` 四件套、`pre`/`post` 快照、`watchdog-states.jsonl`、`stop-*.json`；`mesad-console.log` 若存在） | 待填 | 待填（每个文件一行） |
 
 **纪律**：只保存"原始响应文本 + SHA-256"，**不得只存统计摘要**（质量调查 `:151`；D1 `:18`：`timestamp_ns` ≈1.8e18 超出 JS 安全整数，二次解析会丢精度）。
 
@@ -195,15 +261,24 @@
 | **S3** | 异常重连：除 Start 那一次外 `runtime.epoch` 再变 ≥1 次；或 `RECONNECTING` ≥10 s | 诊断方案 `:343`（其 30 s 阈值对本轮 30 s 窗口无效，收紧到 10 s） | 立即 Stop |
 | **S4** | 机床异常：报警、急停、伺服掉使能、异响；或操作员要求停 | 诊断方案 `:340` | 立即 Stop（**人工优先于脚本**） |
 | **S5** | 监护人要求停止（任何理由，无需解释） | 人工 | 立即 Stop |
-| **S6** | 状态/数据不自洽：非预期 `STOPPED`/`FAILED`；`count≠4`；任一点 `timestamp_ns` 停滞 ≥3×interval；`quality≠GOOD` | 诊断方案 `:341`；清单 `:153`、`:178` | 立即 Stop |
+| **S6** | 状态/数据不自洽：非预期 `STOPPED`/`FAILED`；**筛选后目标端点条数 ≠ 4**（顶层 `count` 是全端点总数，**不作此判据**）；任一点 `timestamp_ns` 停滞 ≥3×interval；`quality≠GOOD` | 诊断方案 `:341`；清单 `:153`、`:178` | 立即 Stop |
 
-**统一流程**：Stop（`-TimeoutSec 120`）→ 五项复核（§5.3）→ 落盘（时刻/触发条款/`detail`/证据文件）→ 判 **NO-GO 或 INVALID** → **不自动重试**、**不自动进入下一轮**。"再试一次看看"属新的启停，计入 §5.4 的 5 次上限，且须人工批准。
+**统一流程**：Stop（watchdog 或人工，幂等，`-TimeoutSec 120`）→ **六项**复核（§5.3）→ 落盘（时刻/触发条款/`detail`/证据文件）→ 判 **NO-GO 或 INVALID** → **不自动重试**、**不自动进入下一轮**。"再试一次看看"属新的启停，计入 §5.4 的 5 次上限，且须人工批准。**注意**：§3.5 已明确"不自动重试"只约束人工，**Stop 生效前 Core 仍可能重连**，故复核必须含 §5.3-⑥。
 
 ## 8. 恢复与回退
 
 ### 8.1 回退基线 `rev17` 及其**证明过程**（不是"假定一致"）
 
-**已捕获的三件套**（`target/validation/828d-r1/`）：`rev17-endpoint.raw.json`（658 B，端点快照：`connection` 8 字段、`desired_running=false`、`state=STOPPED`、`runtime.revision=16`、`runtime.points=4`）、`rev17-tasks.raw.json`（111,992 B，`GET /tasks` 原始响应 `{endpoint_id, revision:17, tasks:[…]}`，238 点）、`rev17-rollback-put.json`（111,925 B，**可直接作为 `PUT /tasks/{ep}` 请求体** `{"tasks":[…238 点…]}`）。
+> **执行窗口内的重新验证（强制；不得以本节旧哈希代替）**：本节与 §6.4 记录的 SHA-256 全部是**编制时（2026-10-20）的本地结果，只是基准参照，不是执行时的验证结果**。执行前**必须**在**本次窗口内**：
+>
+> 1. 重新 `GET /api/v1/endpoints/lx-nck-tags-190-connection` 与 `GET /api/v1/tasks?endpoint=lx-nck-tags-190-connection`，**原样保存**响应文本（不重排 JSON）；
+> 2. 对本次重新获取的文件与 §6.4 基线同法计算 SHA-256（`Get-FileHash -Algorithm SHA256`）；
+> 3. 与本文档记录的基线值**逐字符比对**，把"命令、时刻、本次值、基线值、结论"**五列**写入 `run-log.md`；
+> 4. 同步核对 `connection` 8 字段与 §3.2、任务 `revision` 与 §1 表一致。
+>
+> **不一致 ⇒ NO-GO**：须重新评估回退目标（本文档的 `rev17` 备份可能已不是当前配置，恢复路径失效），**不得**"按文档哈希认定一致"后继续；**也不得**把本文档旧哈希写成"执行时已验证"。
+
+**已捕获的三件套**（`target/validation/828d-r1/`，**编制时**本地结果）：`rev17-endpoint.raw.json`（658 B，端点快照：`connection` 8 字段、`desired_running=false`、`state=STOPPED`、`runtime.revision=16`、`runtime.points=4`）、`rev17-tasks.raw.json`（111,992 B，`GET /tasks` 原始响应 `{endpoint_id, revision:17, tasks:[…]}`，238 点）、`rev17-rollback-put.json`（111,925 B，**可直接作为 `PUT /tasks/{ep}` 请求体** `{"tasks":[…238 点…]}`）。
 
 **证明步骤（本次编制时逐条实测，可复核）**：
 
@@ -211,14 +286,15 @@
 2. **字节级一致**：哈希相同 ⇒ 两文件**内容逐字节一致**（SHA-256 抗碰撞性是该结论的唯一依据；本次另以原始文本逐字节比较复核，结果相同）。
 3. **逐点核对**：解析两份 PUT 体比较 `point_key` 序列 —— **238 / 238 完全一致**（含顺序）；`interval_ms` 均为 `1000`，`kind` 均为 `nck.points.v1`，任务 `id` 均为 `t1`，`mode` 均为 `poll`。据此**结论**：`t2b-rollback-rev15.json` **可以**作为 `rev17` 的回退目标。
 4. **依据边界**：依据是**哈希相等 + 238 点逐点比对**，**不是**"rev15 与 rev17 应该一样"的假定；也**不覆盖**端点 `connection`（以 `rev17-endpoint.raw.json` 为准，本轮不改动）。若未来某轮的 `rev17` 备份与 rev15 哈希不同，则 rev15 **不能**再用，必须按当时的 `rev17` 备份恢复。
+5. **时效边界（v1.1 新增）**：以上 1–4 只证明"**编制时刻**这两份本地文件一致"，**不证明执行时刻的 `rev17` 仍是同一内容**（配置可能已被他人修改）。执行时的有效性**只能**由 §8.1 顶部的"执行窗口内的重新验证"给出；**未重验即视为未验证**。
 
 ### 8.2 恢复操作步骤
 
 1. 确认已停：`state=STOPPED`、`desired_running=false`（未停不许改任务，`core-api:2297-2305` 返回 `CONFLICT`）。
-2. `PUT /api/v1/tasks/lx-nck-tags-190-connection`，body = **`rev17-rollback-put.json` 原文**（不手工重排 JSON、不 `ConvertTo-Json` 二次序列化）。
+2. `PUT /api/v1/tasks/lx-nck-tags-190-connection`，body = **`rev17-rollback-put.json` 原文**（不手工重排 JSON、不 `ConvertTo-Json` 二次序列化）。**前提**：该文件已按 §8.1 在本次窗口内重验通过；**未重验不得 PUT**。
 3. 读回 `GET /api/v1/tasks?endpoint=`，记录新 `revision`（预期 **19**：17 → 四点配置 18 → 恢复 19）。
 4. 按 §8.3 对账（**内容**必须与 `rev17` 一致；**revision 号会递增，不可能回退**，`config-store:1432-1452`）。保持 **STOPPED**，**不自动 Start**；不删除、不改名任何备份文件。
-5. PUT 失败：只允许**重试 1 次**（同 body、同端点），再失败即升级上报，**不得**循环重试或"手工重建 238 点"。
+5. PUT 失败：只允许**重试 1 次**（同 body、同端点），再失败即升级上报，**不得**循环重试或"手工重建 238 点"。**注**：此处的"重试 1 次"是**恢复操作**的重试，与 §3.5 的"采集不得重试"不是一回事；它同样须人工决定，且**不得**借此再 Start（§3.5、§10.4）。
 
 ### 8.3 配置对账（恢复后逐项核对；含恢复后纪律）
 
@@ -234,7 +310,7 @@
 | `state` / `desired_running` | RUNNING→STOPPED | **STOPPED / false** | 必须 |
 | `runtime.revision` / `runtime.points` | 16 / 4 | **仍是 16 / 4** | **不作为判据**（上次运行视图，§2.1-④） |
 
-**恢复后纪律**：端点保持 **STOPPED**，**不自动 Start**；下一轮必须重新申请、重过五门（§4）。备份三件套与本轮证据**全部保留**，不覆盖、不"整理"。恢复失败 ⇒ 判 **INVALID**（本轮数据不得用于任何结论），按 §10 上报。
+**恢复后纪律**：端点保持 **STOPPED**，**不自动 Start**；下一轮必须重新申请、**重过 §4 五道现场门 + G6**。备份三件套与本轮证据**全部保留**，不覆盖、不"整理"；恢复所用的 `rev17-rollback-put.json` **必须**是执行前按 §8.1 重验通过的那一份。恢复失败 ⇒ 判 **INVALID**（本轮数据不得用于任何结论），按 §10 上报。
 
 ## 9. 验收判据
 
@@ -242,14 +318,15 @@
 
 | # | 判据 | 证据 | 备注 |
 |---|---|---|---|
-| 1 | 四点 **4/4 `quality=GOOD`** 且 `value_origin=CURRENT`（不是 `LAST_KNOWN`/`PLACEHOLDER`），`early` 与 `prestop` **两次**都成立 | 两次 `points-latest.raw.json` | 只 1 次成立 ⇒ 不足以判 PASS；清单 `:153` |
-| 2 | `timestamp_ns` 落在 `[T0, Stop 发出时刻]` 内，且相邻批次推进 ≈ `n × 5000 ms` | 两次快照的 `timestamp_ns` | T2b 实测 25.001 s = 5×5000 ms；按"轮"判，不按点判 |
+| 1 | 四点 **4/4 `quality=GOOD`** 且 `value_origin=CURRENT`（不是 `LAST_KNOWN`/`PLACEHOLDER`），`early` 与 `prestop` **两次**都成立 | 两次 `points-latest.raw.json`（**原始全量**）+ 筛选结果 | 只 1 次成立 ⇒ 不足以判 PASS；清单 `:153` |
+| 2 | `timestamp_ns` 落在 `[T0, Stop 发出时刻]` 内，且相邻批次推进 ≈ `n × 5000 ms` | 两次快照的 `timestamp_ns` + watchdog 的 Stop 时刻 | T2b 实测 25.001 s = 5×5000 ms；按"轮"判，不按点判 |
 | 3 | 抓取时刻与 `timestamp_ns` 差 ≤ 1×interval（T2b `early` 4.80 s、`prestop` 0.50 s） | `when.json` + 快照 | 超过即数据不新鲜 |
-| 4 | `count=4`，无第 5 点、无多余条目 | 快照 | 防"悄悄扩点" |
-| 5 | 全程未触发 §7 任一条；`state` 除首末外为 `RUNNING`，`epoch` 只在 Start 变化 1 次 | `state*.json`、`run-log.md` | — |
-| 6 | Stop "停干净"五项齐（§5.3） | `state`、进程表、`Get-NetTCPConnection` | 缺一 ⇒ INVALID |
-| 7 | 证据齐全（§6 全部条目）+ SHA 清单填全 + HMI 对照在案 | §6.1 目录 | 缺一 ⇒ INVALID |
+| 4 | **按 `endpoint_id` 筛选后恰 4 条**，无第 5 点、无其它端点混入 | 快照（原始全量 + 筛选） | 防"悄悄扩点"；顶层 `count` 是全端点总数（`core-api:1571-1576`），**不作 4 的判据** |
+| 5 | 全程未触发 §7 任一条；`state` 除首末外为 `RUNNING`，`epoch` 只在 Start 变化 1 次 | `watchdog-states.jsonl`、`run-log.md` | 无状态序列即无法判此条 |
+| 6 | Stop "停干净"**六项**齐（§5.3，含"Stop 后无新 epoch / 无 `RECONNECTING`"） | `watchdog-states.jsonl`、进程表、`Get-NetTCPConnection` | 缺一 ⇒ INVALID |
+| 7 | 证据齐全（§6 全部条目）+ SHA 清单填全 + HMI 对照在案；**watchdog 时间序列完整覆盖 `T0` 至 `STOPPED` 后 10 s** | §6.1 目录 | 缺一 ⇒ INVALID |
 | 8 | 恢复完成且 §8.3 对账一致，端点保持 STOPPED | 读回快照 | 未恢复不得裁决 |
+| 9 | **全部结论只来自独立证据**（状态序列、`points/latest` 原始快照、Stop 请求/响应、`epoch`），未用进程日志推断，也未以"没看到错误"代替观测 | §6.3 | 无独立证据 ⇒ 无结论（§6.3 红线） |
 
 **判据不是"等于历史值"**：T2b 的 `_N_MPF0`、`5`、`1`、`0.00` 只说明"量级/形态合理"。程序名、状态、参数、位置都会随机床状态变化，**禁止**把"必须等于 `_N_MPF0`/`5`/`1`/`0.0`"写成判据（清单 `:155`）。本轮判的是 **GOOD + 新鲜 + 窗口内推进**，不是数值相等。
 
@@ -261,10 +338,16 @@
 
 | 判定 | 条件 |
 |---|---|
-| **PASS** | §9.1 八条全满足 |
-| **PASS-WITH-NOTES** | §9.1 全满足，但有**不影响结论**的偏差（如 HMI 无对应显示、日志缺口已登记） |
+| **PASS** | §9.1 **九条**全满足 |
+| **PASS-WITH-NOTES** | §9.1 **九条全满足**，且只存在**不影响结论的说明项**（如 HMI 无对应显示、值语义待确认、`mesad-console.log` 未保存）。**"说明项"仅限"证据已完整、结论不受影响"**；**不得**用它放行任何证据缺失、观测中断或判据不明的情形 |
 | **FAIL** | 出现 §7 触发，或 §9.1 第 1–6 条任一不满足 |
-| **INVALID** | 证据缺失（§6 不全）、Stop 未确认停干净、恢复未完成/对账不一致、或执行偏离冻结项 |
+| **INVALID** | 证据缺失（§6 不全）、**watchdog 未就绪或观测中断（无法持续观测端点状态）**、Stop 未确认停干净（六项缺一）、恢复未完成/对账不一致、或执行偏离冻结项 |
+
+**判定口径（与 §6.3 一致，不得两说）**：
+
+- **日志缺失不是 NOTES，也不是 INVALID**：进程日志本就不是判据（§6.3）；它缺失只说明"少一份旁证"，不影响 §9.1 的任一条。
+- **"没看到错误"不是证据**：没有状态序列就没有"停干净"的结论；没有原始快照就没有"4/4 GOOD"的结论。
+- **观测能力红线**：watchdog 不能持续观测端点状态 ⇒ **INVALID**，且**不得启动**（§4.6）；已启动则立即 Stop。
 
 **INVALID ≠ FAIL**：INVALID 说明"这轮什么也没证明"，**不得**用于任何结论，也不得"挑好的数据留下"。
 
@@ -272,7 +355,7 @@
 
 ### 10.1 裁决
 
-- [ ] **GO** —— 批准按 §5 执行（仅限 §3.5 冻结范围，单次）
+- [ ] **GO** —— 批准按 §5 执行（仅限 §3.5 冻结范围，单次；**前提：G1–G5 五道现场门 + G6 watchdog 就绪全部通过**，且 §8.1 执行前重验已完成）
 - [ ] **NO-GO** —— 不执行（原因：______________________）
 - [ ] **HOLD** —— 暂缓（待补：______________________；补齐后重新提交 §10）
 
@@ -287,14 +370,17 @@
 | 现场监护人 | 待填 | 待填 | 待填 | |
 | 审批人 | 待填 | 待填 | 待填 | |
 
+**G6 watchdog 就绪确认（§4.6；执行人与监护人双签）**：watchdog PID ______；`T0` 记录方式 ______；截止 `T0+30 s` 已写入 `run-log.md`（是/否）；通路自检 `stop-selftest.json`（是/否）；`watchdog-states.jsonl` 首行（是/否）。
+
 ### 10.3 异常记录（无异常也要写"无"）
 
 | 序号 | 时刻（本地） | 现象 | 证据文件 | 处置 | 触发条款 |
 |---|---|---|---|---|---|
 | 1 | 待填 | 待填 | 待填 | 待填 | S?/无 |
+| 2 | 待填 | **Start/Stop 竞态**（Stop 后观测到 `RUNNING`/`epoch` 变化）须单独记一行 | `watchdog-states.jsonl` | 再次 Stop | `RACE_START_AFTER_STOP` |
 
 ### 10.4 后续纪律
 
-1. **禁止自动进入下一轮**：本轮结束即停止；下一轮重新编制申请（复制本模板）、重跑 §4 五门、重新裁决。
+1. **禁止自动进入下一轮**：本轮结束即停止；下一轮重新编制申请（复制本模板）、重跑 §4 **五道现场门 + G6**、重新裁决。
 2. 本轮 **GO 不覆盖**：238 点、`1000 ms`、扩点、其它轴、性能评估、语义确认、生产接入；**PASS 也不外推**——不构成"828D 已验收"、不构成"NCK 驱动可生产"、不翻转 `GATE.md:91-92` 的任何 Gate。
 3. 归档：本文件 + §6.1 证据目录 + SHA 清单；结案后 90 天（诊断方案 `:477`），必要时转 `docs/evidence/`。
