@@ -80,6 +80,8 @@ export function DeviceWorkspacePage() {
     if (activeTab === "data") {
       return (
         <DeviceLiveData
+          deviceId={deviceId}
+          deviceName={device?.name ?? deviceId}
           endpoints={deviceEndpoints}
           endpointsReady={epReady}
           points={data.devicePoints}

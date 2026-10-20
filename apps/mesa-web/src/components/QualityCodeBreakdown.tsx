@@ -18,6 +18,11 @@ import {
   type CodeClass,
 } from "../qualityCode";
 import { ExportHttpError, buildPointsExport, downloadExportFiles } from "../qualityExport";
+import {
+  makeQualityScope,
+  qualityScopeText,
+  type QualityScope,
+} from "../qualityScope";
 
 /** 分解只需要这几列：不依赖 DevicePointView 的全部派生字段。 */
 export interface BreakdownPoint {
@@ -77,14 +82,24 @@ export function breakdownByCode(points: BreakdownPoint[]): BreakdownRow[] {
 
 export function QualityCodeBreakdownContent(props: {
   points: BreakdownPoint[];
-  /** 当前 UI 连接作用域；`null`/缺省 = 全部端点（导出文件名用 `all`）。 */
-  scopeEndpointId?: string | null;
+  /**
+   * 统计/导出分析作用域（设备 + 连接）；`null`/缺省 = 全部设备与全部连接。
+   * 与页面计数行/表格共用 qualityScope 的同一真值。
+   */
+  scope?: QualityScope | null;
+  /** 作用域的可读文案（如 `CNC-01 · 全部连接`）；缺省由 scope 推导。 */
+  scopeText?: string;
   onExported?: (fileNames: string[]) => void;
 }) {
-  const { points, scopeEndpointId, onExported } = props;
+  const { points, scope, scopeText, onExported } = props;
   // 只在内容真正挂载（Popover 打开）时计算一次；关闭后结果随 memo 保留。
   const rows = useMemo(() => breakdownByCode(points), [points]);
   const [exporting, setExporting] = useState(false);
+  const effectiveScope = useMemo(
+    () => scope ?? makeQualityScope(),
+    [scope],
+  );
+  const currentScopeText = scopeText ?? qualityScopeText(effectiveScope);
 
   const partitions = useMemo(() => {
     const byTitle = new Map<string, BreakdownRow[]>();
@@ -102,7 +117,7 @@ export function QualityCodeBreakdownContent(props: {
   const runExport = async () => {
     setExporting(true);
     try {
-      const result = await buildPointsExport({ endpointId: scopeEndpointId ?? null });
+      const result = await buildPointsExport({ scope: effectiveScope });
       downloadExportFiles(result.files);
       onExported?.(result.files.map((f) => f.name));
       message.success(
@@ -121,6 +136,9 @@ export function QualityCodeBreakdownContent(props: {
 
   return (
     <div style={{ width: 380 }}>
+      <div data-testid="breakdown-scope" style={{ fontSize: 12, color: "#525252", marginBottom: 8 }}>
+        统计范围：{currentScopeText}（不受质量状态/搜索筛选影响）
+      </div>
       {rows.length === 0 ? (
         <div style={{ fontSize: 12, color: "#525252" }}>当前快照中没有质量码</div>
       ) : (
@@ -150,6 +168,18 @@ export function QualityCodeBreakdownContent(props: {
         <Button size="small" disabled={exporting} onClick={() => void runExport()}>
           {exporting ? "采集中…" : "导出原始快照"}
         </Button>
+        {/*
+          复审修订 2：raw_scope / analysis_scope 不能只存在于导出文件里。
+          用户点击导出前必须在**同一视觉区域**看到范围差异，避免误分享：
+          原始证据是全量端点（可能含其他设备），只有结构化分析按所选范围过滤。
+        */}
+        <div
+          data-testid="export-scope-hint"
+          style={{ fontSize: 12, color: "#525252", marginTop: 6, lineHeight: 1.6 }}
+        >
+          <div>原始响应包含全部端点，可能包括其他设备。</div>
+          <div>结构化分析仅按所选设备与连接过滤（当前：{currentScopeText}）。</div>
+        </div>
       </div>
     </div>
   );
@@ -161,7 +191,8 @@ export function QualityCodeBreakdownContent(props: {
  */
 export function QualityCodeBreakdown(props: {
   points: BreakdownPoint[];
-  scopeEndpointId?: string | null;
+  scope?: QualityScope | null;
+  scopeText?: string;
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
@@ -171,13 +202,20 @@ export function QualityCodeBreakdown(props: {
       open={open}
       onOpenChange={setOpen}
       placement="bottomLeft"
+      /*
+       * 注意：content **不能**写成 `open ? <Content/> : null`。
+       * antd v6 的 Popover 在 content 不可渲染时把 overlay 置空，Tooltip 侧
+       * `noTitle` 会强制 setOpen(false) 且不再回调 onOpenChange —— 结果是
+       * 点击触发器永远打不开（浏览器里同样如此）。这里始终传元素：
+       * rc-trigger 只在首次打开后才挂载 popup，内容组件仍只在展开时 mount，
+       * "只在点击时计算一次"的意图不受影响。
+       */
       content={
-        open ? (
-          <QualityCodeBreakdownContent
-            points={props.points}
-            scopeEndpointId={props.scopeEndpointId}
-          />
-        ) : null
+        <QualityCodeBreakdownContent
+          points={props.points}
+          scope={props.scope}
+          scopeText={props.scopeText}
+        />
       }
     >
       <span style={{ cursor: "pointer" }}>{props.children}</span>

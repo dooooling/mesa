@@ -13,15 +13,33 @@
 //   舍入（1.8e18 量级间隔 256 ns），因此**导出元数据时间戳一律十进制字符串**
 //   （BigInt 计算），绝不使用 `Date.now() * 1e6` 的浮点结果。
 //
-// 范围（缺陷 3）：原始证据始终是 `/points/latest` 的**全部端点**（可能含其他
-// 连接/设备），而 `points[]` / `summary` 只覆盖当前 UI 连接范围。两者必须在
+// 范围（缺陷 3 / 复审修订 1）：原始证据始终是 `/points/latest` 的**全部端点**
+// （可能含其他连接/设备），而 `points[]` / `summary` 只覆盖当前 UI 的**设备 +
+// 连接**作用域（与计数行/Popover 共用 qualityScope 的同一真值）。两者必须在
 // 导出对象里分别标注为 `raw_scope` / `analysis_scope`，防止用户误以为导出
 // 只含自己选的连接。
+//
+// 格式兼容（`mesa.points.export.v1` 的**增量**字段，评审要求明确记录）：
+// 本版本新增 `raw_scope`、`analysis_scope`（含 `device_id` / `device_ids`）、
+// `freshness_summary.unknown`、`scope.device_id`，均为 **additive**：
+// 不重命名、不改变既有字段语义、不删除既有字段。因此消费方必须：
+//   1. **保留未知字段**——解析后重建文档时不得丢弃不认识的字段；
+//   2. 做**显式兼容性检查**（探测 `schema`/字段是否存在），不满足时给出可诊断
+//      错误，而不是静默按旧结构解释；
+//   3. **不得假定所有外部解析器都兼容**——严格 Schema 校验程序（`additional
+//      Properties: false` 之类）是否接受这些新增字段**仍属未知**，本仓库不做
+//      该保证，也不宣称"所有外部解析器都兼容"。
 //
 // 请求上界：一次点击 **4 个 GET**（2 波），不轮询、不重试；任一失败即中止且
 // **不产出任何文件**（禁止半份证据）。`request_status` 只有 `COMPLETE` 一个值，
 // 失败时根本不存在文件，故没有 `FAILED` / `INCOMPLETE`。
 import { classifyCode, type CodeClass } from "./qualityCode";
+import {
+  filterPointsInQualityScope,
+  makeQualityScope,
+  qualityScopeDescription,
+  type QualityScope,
+} from "./qualityScope";
 
 export const EXPORT_SCHEMA = "mesa.points.export.v1";
 
@@ -82,10 +100,20 @@ export interface RawScope {
 }
 
 /**
- * 分析范围（缺陷 3）：`points[]` / `summary` 实际覆盖的连接范围。
- * 与 {@link RawScope} 必须分别标注，防止用户以为导出只含所选连接。
+ * 分析范围（缺陷 3 / 复审修订 1）：`points[]` / `summary` 实际覆盖的
+ * **设备 + 连接**作用域。与 {@link RawScope} 必须分别标注，防止用户以为
+ * 导出只含所选连接。
+ *
+ * `device_ids` 是**实际覆盖**的设备集合（由筛选结果反推，去重排序）；它可能
+ * 比 `device_id` 更窄（例如所选设备下没有任何点）。归属不可证明的点不会出现
+ * 在结果里（fail-closed）。
  */
 export interface AnalysisScope {
+  /** 所选设备；`null` = 全部设备。 */
+  device_id: string | null;
+  /** 实际覆盖的设备 id 集合（排序；不含归属不可证明的端点）。 */
+  device_ids: string[];
+  /** 所选连接；`null` = 全部连接。 */
   endpoint_id: string | null;
   row_count: number;
   description: string;
@@ -103,10 +131,15 @@ export interface PointsExportDocument {
   schema: string;
   taken_at_ns: string;
   mesa_version: string;
-  scope: { endpoint_id: string | null; row_count: number };
-  /** 缺陷 3：原始证据范围（全部端点）与当前 UI 连接范围无关。 */
+  /**
+   * 兼容字段（扁平视图）：与 `analysis_scope` 同源，但只保留
+   * `device_id` / `endpoint_id` / `row_count` 三个标量。
+   * **权威范围以 `analysis_scope` 为准**（含 `device_ids` 与文案）。
+   */
+  scope: { device_id: string | null; endpoint_id: string | null; row_count: number };
+  /** 缺陷 3：原始证据范围（全部端点）与当前 UI 作用域无关。 */
   raw_scope: RawScope;
-  /** 缺陷 3：分析范围（按连接筛选后的结构化副本与统计）。 */
+  /** 缺陷 3 / 复审修订 1：分析范围（设备 + 连接筛选后的结构化副本与统计）。 */
   analysis_scope: AnalysisScope;
   history: { available: false; reason: string };
   sampling: {
@@ -203,6 +236,22 @@ function projectEndpointState(json: unknown): EndpointSamplingState[] {
   });
 }
 
+/**
+ * 端点 → 设备归属（`/endpoints` 响应已含 `device_id`，零后端改动）。
+ * 缺失/非字符串一律记空串，交给作用域函数 fail-closed（不猜归属）。
+ */
+function projectEndpointDevices(json: unknown): Map<string, string> {
+  const list = (json as { endpoints?: unknown } | null)?.endpoints;
+  const out = new Map<string, string>();
+  if (!Array.isArray(list)) return out;
+  for (const raw of list) {
+    const ep = raw as { id?: unknown; device_id?: unknown };
+    if (typeof ep.id !== "string") continue;
+    out.set(ep.id, typeof ep.device_id === "string" ? ep.device_id : "");
+  }
+  return out;
+}
+
 function readVersion(json: unknown): string {
   const version = (json as { version?: unknown } | null)?.version;
   // diagnostics 是必需请求；缺失 version 即结构不符 → 中止，不产出文件。
@@ -282,8 +331,13 @@ function utcStamp(ns: string): string {
 }
 
 export interface BuildPointsExportOptions {
-  /** 当前 UI 连接作用域；`null`/缺省 = 全部端点（文件名用 `all`）。 */
-  endpointId?: string | null;
+  /**
+   * 统计/分析作用域（**设备 + 连接**）；缺省 = 全部设备与全部连接。
+   *
+   * 与页面计数行/Popover 共用 {@link filterPointsInQualityScope} 同一真值：
+   * 设备选中 + 连接 ALL 时只导出该设备的全部连接，**不是**跨设备。
+   */
+  scope?: Partial<QualityScope> | null;
   /** 注入时钟（测试用；生产走 `Date.now()`）。 */
   now?: () => number;
   /** 注入 fetch（测试用；生产走全局 fetch）。 */
@@ -300,7 +354,7 @@ export async function buildPointsExport(
   options: BuildPointsExportOptions = {},
 ): Promise<PointsExportResult> {
   const fetchImpl = options.fetchImpl ?? fetch;
-  const endpointId = options.endpointId ?? null;
+  const scope = makeQualityScope(options.scope?.deviceId, options.scope?.endpointId);
 
   // 步骤 1：点击时刻（十进制字符串，BigInt 计算）。
   const takenAtNs = utcNsString(nowMs(options));
@@ -311,6 +365,8 @@ export async function buildPointsExport(
     getText(fetchImpl, "/api/v1/diagnostics"),
   ]);
   const stateBefore = projectEndpointState(beforeRes.json);
+  // 设备归属映射：作用域过滤只用**读点前**的清单（与状态前快照同一时刻）。
+  const deviceByEndpoint = projectEndpointDevices(beforeRes.json);
   const mesaVersion = readVersion(diagRes.json);
 
   // 步骤 3：读点前时刻 + 原始响应（先原文，再结构化副本）。
@@ -322,10 +378,26 @@ export async function buildPointsExport(
   }
   const allPoints = parsedLatest.points as Array<Record<string, unknown>>;
   // 作用域过滤只影响"结构化副本"；原始响应文本始终完整保留为权威证据。
-  const points =
-    endpointId === null
-      ? allPoints
-      : allPoints.filter((p) => p.endpoint_id === endpointId);
+  // 设备 + 连接双重作用域：与计数行/Popover 调用**同一个**过滤函数。
+  // 断言只为让 `Record<string, unknown>` 行满足 ScopedPoint 的静态形状；
+  // 运行期仍按 fail-closed 处理（非字符串 endpoint_id 不会被误判为匹配）。
+  const scopedAllPoints = allPoints as Array<Record<string, unknown> & { endpoint_id: string }>;
+  const points = filterPointsInQualityScope(
+    scopedAllPoints,
+    scope,
+    (endpointId) => deviceByEndpoint.get(endpointId) ?? "",
+  );
+  // 实际覆盖的设备（由筛选结果反推；归属不可证明的点已被排除）。
+  const deviceIds = [
+    ...new Set(
+      points.map((p) => {
+        const endpointId = typeof p.endpoint_id === "string" ? p.endpoint_id : "";
+        return deviceByEndpoint.get(endpointId) ?? "";
+      }),
+    ),
+  ]
+    .filter((id) => id.length > 0)
+    .sort();
 
   // 缺陷 3：证据范围与分析范围必须分开标注（两者可能不同）。
   const rawScope: RawScope = {
@@ -333,15 +405,14 @@ export async function buildPointsExport(
     includes: "ALL_ENDPOINTS",
     row_count: allPoints.length,
     description:
-      "原始响应包含全部端点（可能含其他连接/设备），未按连接筛选；纳秒级对账以 points_raw_text 为权威",
+      "原始响应包含全部端点（可能含其他连接/设备），未按设备或连接筛选；纳秒级对账以 points_raw_text 为权威",
   };
   const analysisScope: AnalysisScope = {
-    endpoint_id: endpointId,
+    device_id: scope.deviceId,
+    device_ids: deviceIds,
+    endpoint_id: scope.endpointId,
     row_count: points.length,
-    description:
-      endpointId === null
-        ? "分析覆盖全部连接（未按连接筛选）"
-        : `分析仅覆盖所选连接 ${endpointId}（按连接筛选后的结构化副本与统计）`,
+    description: qualityScopeDescription(scope),
   };
 
   // 步骤 4：状态后。
@@ -369,7 +440,11 @@ export async function buildPointsExport(
     schema: EXPORT_SCHEMA,
     taken_at_ns: takenAtNs,
     mesa_version: mesaVersion,
-    scope: { endpoint_id: endpointId, row_count: points.length },
+    scope: {
+      device_id: scope.deviceId,
+      endpoint_id: scope.endpointId,
+      row_count: points.length,
+    },
     raw_scope: rawScope,
     analysis_scope: analysisScope,
     history: {
@@ -395,7 +470,10 @@ export async function buildPointsExport(
   };
 
   const stamp = utcStamp(takenAtNs);
-  const scopeName = endpointId ?? "all";
+  // 文件名是分享时最先看到的东西：设备筛选必须体现在名字里，
+  // 否则"只含所选设备"的分析文件会被误当成整库快照。
+  const scopeName =
+    [scope.deviceId, scope.endpointId].filter((v): v is string => v !== null).join("__") || "all";
   const stateSuffix = stateConsistency === "STATE_CHANGED_DURING_READ" ? "-statechanged" : "";
   const base = `mesa-points-export-${stamp}-${scopeName}${stateSuffix}`;
 

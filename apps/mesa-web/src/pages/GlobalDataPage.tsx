@@ -9,6 +9,12 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { formatAge, formatPointValue } from "../deviceModel";
 import { PointDetailDrawer, pointIdentityOf, type PointIdentity } from "../components/PointDetailDrawer";
 import { QualityCodeBreakdown } from "../components/QualityCodeBreakdown";
+import {
+  filterPointsInQualityScope,
+  makeQualityScope,
+  qualityScopeLabel,
+  qualityScopeText,
+} from "../qualityScope";
 import type { DevicePointView } from "../workspace/useDeviceWorkspaceData";
 import { AgeCell, NameCell, SourceCell, StatusCell, ValueCell } from "../workspace/LiveCells";
 import { useLivePointsSource } from "../workspace/useLivePointsSource";
@@ -80,37 +86,54 @@ export function GlobalDataPage() {
     setParams(next);
   };
 
-  // PR-D1：按码分解/导出的作用域集合（连接筛选后）。memo 化以保住
-  // Popover 内 useMemo 的依赖引用（§7.3：只在点击展开时算一次）。
-  const breakdownPoints = useMemo(
-    () =>
-      connectionParam === "ALL"
-        ? src.allPoints
-        : src.allPoints.filter((p) => p.endpoint_id === connectionParam),
-    [src.allPoints, connectionParam],
+  // 复审修订 1：统计 / 按码分解 / 导出分析使用**同一个设备 + 连接作用域**
+  // （qualityScope 单一真值）。旧实现"统计只跟连接、不跟设备"：表格只显示
+  // 这台机床，旁边统计却含其他设备，不符合现场监控预期。
+  // 边界：质量状态筛选与搜索关键字**不进入**该作用域（只影响表格行），
+  // 避免用户搜一个点后误以为整台设备只有一个点。
+  const scope = useMemo(
+    () => makeQualityScope(deviceParam, connectionParam),
+    [deviceParam, connectionParam],
+  );
+  // 端点 → 设备归属（/endpoints 已含 device_id；零后端改动）。
+  const endpointDevice = useMemo(
+    () => new Map(src.endpoints.map((e) => [e.id, e.device_id ?? ""] as const)),
+    [src.endpoints],
+  );
+  const deviceOfEndpoint = useCallback(
+    (endpointId: string) => endpointDevice.get(endpointId) ?? "",
+    [endpointDevice],
+  );
+  // 作用域内点集：计数行、Popover、导出分析同源（memo 保住 Popover 依赖引用）。
+  const scopedPoints = useMemo(
+    () => filterPointsInQualityScope(src.allPoints, scope, deviceOfEndpoint),
+    [src.allPoints, scope, deviceOfEndpoint],
   );
 
-  // 裁决 2：计数行与 Popover / 导出分析**共用同一个连接范围**（connectionParam）。
-  // 旧实现计数行用 src.counts（全局、无视连接筛选），与 Popover/导出不一致：
-  // 选单连接后计数仍显示全部连接的点，用户会以为筛选没生效。
-  // 注意：设备筛选只作用于表格，不参与统计范围——当 connection=ALL 时统计
-  // 会跨设备，必须由 scopeLabel 明示（见渲染处），不能让人误以为已按单连接过滤。
   const scopedCounts = useMemo(() => {
     let good = 0;
     let bad = 0;
     let stale = 0;
     let unknown = 0;
-    for (const p of breakdownPoints) {
+    for (const p of scopedPoints) {
       if (p.derived === "GOOD") good += 1;
       else if (p.derived === "BAD") bad += 1;
       else if (p.derived === "STALE") stale += 1;
       else unknown += 1;
     }
-    return { total: breakdownPoints.length, good, bad, stale, unknown };
-  }, [breakdownPoints]);
+    return { total: scopedPoints.length, good, bad, stale, unknown };
+  }, [scopedPoints]);
 
-  // 连接=ALL ⇒ 统计范围是全部连接（可能跨设备）；必须显式标注。
-  const scopeLabel = connectionParam === "ALL" ? "全部连接（跨设备）" : null;
+  // 范围标注写实（设备选中 + 连接 ALL ⇒ "CNC-01 · 全部连接"，不再出现
+  // "跨设备"——范围已收敛到该设备）。
+  const deviceLabel = scope.deviceId
+    ? (src.devices.find((d) => d.id === scope.deviceId)?.name ?? scope.deviceId)
+    : undefined;
+  const endpointLabel = scope.endpointId
+    ? (src.endpoints.find((e) => e.id === scope.endpointId)?.name ?? scope.endpointId)
+    : undefined;
+  const scopeText = qualityScopeText(scope, { device: deviceLabel, endpoint: endpointLabel });
+  const scopeLabel = qualityScopeLabel(scope, { device: deviceLabel, endpoint: endpointLabel });
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -262,20 +285,19 @@ export function GlobalDataPage() {
         {src.endpointsError ? <Alert type="warning" showIcon message="连接清单不可用" description={src.endpointsError} style={{ marginBottom: 8 }} /> : null}
         {src.pointsError ? <Alert type="warning" showIcon message="快照更新失败（显示上次已知值）" style={{ marginBottom: 8 }} /> : null}
         <div style={{ fontSize: 12, color: "#525252", marginBottom: 8 }}>
-          {/* PR-D1 U8：计数行**仅点击**打开按码分解；导出作用域 = 当前连接筛选。 */}
+          {/* PR-D1 U8：计数行**仅点击**打开按码分解；作用域 = 设备 + 连接。 */}
           <QualityCodeBreakdown
-            points={breakdownPoints}
-            scopeEndpointId={connectionParam === "ALL" ? null : connectionParam}
+            points={scopedPoints}
+            scope={scope}
+            scopeText={scopeText}
           >
             全部 {scopedCounts.total} · GOOD {scopedCounts.good} · BAD {scopedCounts.bad} · STALE{" "}
             {scopedCounts.stale}
           </QualityCodeBreakdown>
-          {/* 裁决 2 特殊情况：连接=ALL 时统计跨设备，必须显式标注。 */}
-          {scopeLabel === null ? null : (
-            <span data-testid="data-scope-label" style={{ marginLeft: 8 }}>
-              {scopeLabel}
-            </span>
-          )}
+          {/* 范围标注始终写实：统计/分析只覆盖该设备与该连接。 */}
+          <span data-testid="data-scope-label" style={{ marginLeft: 8 }}>
+            {scopeLabel}
+          </span>
         </div>
         <Table
           size="small"

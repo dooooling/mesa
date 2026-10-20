@@ -173,7 +173,7 @@ describe("qualityExport · 原始快照导出（PR-D1）", () => {
         count: 1,
       },
     ]);
-    expect(doc.scope).toEqual({ endpoint_id: null, row_count: 2 });
+    expect(doc.scope).toEqual({ device_id: null, endpoint_id: null, row_count: 2 });
     // 原文作为内联证据保留，且文件是单文件。
     expect(doc.points_raw_text).toBe(LATEST_TEXT);
     expect(result.files[0].name).toMatch(/^mesa-points-export-\d{8}-\d{6}-all\.json$/);
@@ -207,16 +207,19 @@ describe("qualityExport · 原始快照导出（PR-D1）", () => {
     ];
     const { fetchImpl } = makeFetch({ before: endpoints, latestText });
     const { document: doc } = await buildPointsExport({
-      endpointId: "lx-nck",
+      scope: { endpointId: "lx-nck" },
       now: () => 1_792_460_055_541,
       fetchImpl,
     });
 
     // 分析范围 = 所选连接。
-    expect(doc.scope).toEqual({ endpoint_id: "lx-nck", row_count: 1 });
+    expect(doc.scope).toEqual({ device_id: null, endpoint_id: "lx-nck", row_count: 1 });
     expect(doc.points).toHaveLength(1);
     expect(doc.summary.by_code.map((e) => e.endpoint_id)).toEqual(["lx-nck"]);
     expect(doc.analysis_scope).toEqual({
+      device_id: null,
+      // 设备维度：即使没按设备筛选，也必须如实记录"实际覆盖了哪些设备"。
+      device_ids: ["cnc-01"],
       endpoint_id: "lx-nck",
       row_count: 1,
       description: expect.stringContaining("所选连接"),
@@ -232,18 +235,128 @@ describe("qualityExport · 原始快照导出（PR-D1）", () => {
     expect(doc.points_raw_text).toBe(latestText);
     expect(doc.points_raw_text).toContain("lx-other");
 
-    // 未选连接时两者一致（分析也覆盖全部连接）。
+    // 未选连接/设备时两者一致（分析也覆盖全部设备与全部连接）。
     const { fetchImpl: fetchAll } = makeFetch({ before: endpoints, latestText });
     const { document: all } = await buildPointsExport({
       now: () => 1_792_460_055_541,
       fetchImpl: fetchAll,
     });
     expect(all.analysis_scope).toEqual({
+      device_id: null,
+      device_ids: ["cnc-01", "plc-01"],
       endpoint_id: null,
       row_count: 2,
       description: expect.stringContaining("全部连接"),
     });
     expect(all.raw_scope.row_count).toBe(2);
+  });
+
+  it("export_scope_device_and_connection_matrix", async () => {
+    // 复审修订 1：统计/导出分析 = 设备 + 连接双重作用域。
+    // 两台设备各两个连接 ⇒ 四种组合的 analysis_scope 与行集都必须正确。
+    const eps = [
+      { id: "ep-a1", driver_id: "s7", device_id: "dev-a", runtime: { state: "RUNNING" } },
+      { id: "ep-a2", driver_id: "s7", device_id: "dev-a", runtime: { state: "RUNNING" } },
+      { id: "ep-b1", driver_id: "s7", device_id: "dev-b", runtime: { state: "RUNNING" } },
+      { id: "ep-b2", driver_id: "s7", device_id: "dev-b", runtime: { state: "RUNNING" } },
+    ];
+    const rows = ["ep-a1", "ep-a2", "ep-b1", "ep-b2"].map((ep, i) => ({
+      ...ROW_CURRENT,
+      endpoint_id: ep,
+      point_id: 100 + i,
+      point_key: `${ep}.k`,
+      key: `${ep}.k`,
+    }));
+    const latestText = JSON.stringify({ points: rows, count: rows.length });
+
+    const cases: Array<{
+      scope: { deviceId?: string | null; endpointId?: string | null };
+      rowCount: number;
+      endpointIds: string[];
+      deviceId: string | null;
+      deviceIds: string[];
+    }> = [
+      // 全部设备 + 全部连接：所有设备、所有连接。
+      { scope: {}, rowCount: 4, endpointIds: ["ep-a1", "ep-a2", "ep-b1", "ep-b2"], deviceId: null, deviceIds: ["dev-a", "dev-b"] },
+      // 设备选中 + 全部连接：仅该设备的全部连接（不是跨设备）。
+      { scope: { deviceId: "dev-a" }, rowCount: 2, endpointIds: ["ep-a1", "ep-a2"], deviceId: "dev-a", deviceIds: ["dev-a"] },
+      // 设备 + 单连接：仅该连接。
+      { scope: { deviceId: "dev-a", endpointId: "ep-a1" }, rowCount: 1, endpointIds: ["ep-a1"], deviceId: "dev-a", deviceIds: ["dev-a"] },
+      // 全部设备 + 单连接：仅该连接。
+      { scope: { endpointId: "ep-b1" }, rowCount: 1, endpointIds: ["ep-b1"], deviceId: null, deviceIds: ["dev-b"] },
+    ];
+
+    for (const c of cases) {
+      const { fetchImpl } = makeFetch({ before: eps, latestText });
+      const { document: doc } = await buildPointsExport({
+        scope: c.scope,
+        now: () => 1_792_460_055_541,
+        fetchImpl,
+      });
+      expect(doc.analysis_scope.device_id).toBe(c.deviceId);
+      expect(doc.analysis_scope.endpoint_id).toBe(c.scope.endpointId ?? null);
+      expect(doc.analysis_scope.device_ids).toEqual(c.deviceIds);
+      expect(doc.analysis_scope.row_count).toBe(c.rowCount);
+      expect(doc.scope).toEqual({
+        device_id: c.deviceId,
+        endpoint_id: c.scope.endpointId ?? null,
+        row_count: c.rowCount,
+      });
+      // 结构化副本/汇总只覆盖作用域内的行。
+      expect(doc.points.map((p) => p.endpoint_id).sort()).toEqual([...c.endpointIds].sort());
+      expect(doc.sampling.freshness_summary.current).toBe(c.rowCount);
+      expect(doc.summary.by_quality.GOOD).toBe(c.rowCount);
+      // 原始证据始终是全部端点，绝不被作用域裁剪。
+      expect(doc.raw_scope.row_count).toBe(4);
+      expect(doc.raw_scope.includes).toBe("ALL_ENDPOINTS");
+      expect(doc.points_raw_text).toBe(latestText);
+    }
+  });
+
+  it("export_device_scope_fail_closed_for_unattributed_points", async () => {
+    // 端点不在 /endpoints 清单里 ⇒ 归属不可证明 ⇒ 设备筛选下必须排除
+    //（与表格 fail-closed 同口径），不得猜成"可能属于所选设备"。
+    const rows = [
+      { ...ROW_CURRENT, endpoint_id: "ep-a1", point_id: 1 },
+      { ...ROW_CURRENT, endpoint_id: "ghost", point_id: 2 },
+    ];
+    const latestText = JSON.stringify({ points: rows, count: 2 });
+    const { fetchImpl } = makeFetch({
+      before: [
+        { id: "ep-a1", driver_id: "s7", device_id: "dev-a", runtime: { state: "RUNNING" } },
+      ],
+      latestText,
+    });
+    const { document: doc } = await buildPointsExport({
+      scope: { deviceId: "dev-a" },
+      now: () => 1_792_460_055_541,
+      fetchImpl,
+    });
+    expect(doc.points.map((p) => p.endpoint_id)).toEqual(["ep-a1"]);
+    expect(doc.analysis_scope.row_count).toBe(1);
+    expect(doc.analysis_scope.device_ids).toEqual(["dev-a"]);
+    // 原始证据仍然包含 ghost 行（证据完整，不被分析范围裁剪）。
+    expect(doc.raw_scope.row_count).toBe(2);
+  });
+
+  it("export_filename_reflects_device_scope", async () => {
+    // 文件名是分享时最先看到的东西：设备筛选必须体现在名字里，
+    // 否则"只含所选设备"的分析文件会被误当成整库快照。
+    const { fetchImpl } = makeFetch({});
+    const { files } = await buildPointsExport({
+      scope: { deviceId: "cnc-01" },
+      now: () => 1_792_460_055_541,
+      fetchImpl,
+    });
+    expect(files[0].name).toMatch(/^mesa-points-export-\d{8}-\d{6}-cnc-01\.json$/);
+
+    const { fetchImpl: f2 } = makeFetch({});
+    const { files: both } = await buildPointsExport({
+      scope: { deviceId: "cnc-01", endpointId: "lx-nck" },
+      now: () => 1_792_460_055_541,
+      fetchImpl: f2,
+    });
+    expect(both[0].name).toMatch(/^mesa-points-export-\d{8}-\d{6}-cnc-01__lx-nck\.json$/);
   });
 
   it("export_counts_unknown_value_origin_separately", async () => {
