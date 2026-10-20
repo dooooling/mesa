@@ -134,10 +134,26 @@
 
 顺序即优先级；**P0 不改代码，且能直接回答本次 80 点的定性问题**。
 
-**P0（测量，零代码）**：在端点 RUNNING 时抓一次 `GET /api/v1/points/latest`，只看这 80 行的 `quality_code`：
-- 数字（如 `"5"`/`"3"`/`"10"`）⇒ **设备项级拒绝**，问题在地址/状态/权限，按 `crates/s7-transport/src/error.rs:14-21` 的 0x03/0x04/0x05 语义解读；
-- `"DEVICE_ERROR"` ⇒ **本地校验失败**（transport/length/decode），优先怀疑 `native.rs:126-127` 里声明的 `transport_size` 与设备实际不符，或 `decode` 与宽/字节序不符；
-- `"COMMUNICATION_LOST"` ⇒ 不是项级问题，样本无效，须重测。
+**P0（测量，零代码）**：在端点 RUNNING 时抓一次 `GET /api/v1/points/latest`，只看这 80 行的 `quality_code`。**该观测只能用于分档，不能单凭一个码指认根因**：
+
+| 观测值 | **能确认的** | **不能直接断定的** |
+|---|---|---|
+| 数字字符串（如 `"5"`/`"3"`/`"10"`） | **存在驱动上报的数字错误码**，按当前 NCK 路径可对应 S7 Item 返回码 | 具体是**地址不存在、权限不足还是索引问题** —— 须结合 `crates/s7-transport/src/error.rs:14-21` 的码语义再解读 |
+| `"DEVICE_ERROR"` | **该 BAD 点没有驱动上报的数字码**，由 Core 兜底写入 | **不能证明是本地校验失败** —— 无码 BAD 可能来自本地校验或解码失败，也可能来自驱动尚未覆盖的上行路径 |
+| `"COMMUNICATION_LOST"` | 当前快照已被**连接丢失**状态覆盖 | **无法反推原始项级原因**；样本无效，须在连接正常时重测 |
+
+> **口径纠正（评审）**：本节早期版本把 `DEVICE_ERROR` 直接判为"本地校验失败，并优先怀疑 `transport_size` 声明不符"，这是**过度推断**。
+> `DEVICE_ERROR` 仅是"无数字码"的兜底标记，**不能据此单独指认本地校验**。`transport_size` 与 `decode` 的一致性检查应作为**独立的离线静态核查**来做，而不是从该码反推。
+
+**P0 采样纪律（评审要求，必须遵守）**：
+
+1. **在任务仍正常工作、尚未 `Stop` 之前**保存**完整 `points/latest` 原始响应**，同时保存**采样时刻**与 **Endpoint 状态**（`state` / `epoch` / `detail`）。
+2. **不得只保存"158 GOOD / 80 BAD"这类统计摘要** —— 摘要无法事后归因。
+3. **不得仅凭 `state=RUNNING` 认定这 238 行是本轮新鲜采样**。必须逐行核对：
+   - `timestamp_ns` 是否落在本次运行窗口内；
+   - `value_origin` 是否为本次 attempt 产生（而非 `LAST_KNOWN` / `PLACEHOLDER`）；
+   - `quality_code` 是否被连接级原因覆盖。
+4. 断线不改时间戳（见 `snapshot.rs:396-423`），因此**旧快照可能带着看似合理的旧时间戳** —— 这是最容易踩的坑。
 
 这条分工在**当前 HEAD 上已经成立**，无需改任何代码。仓库里 `target/validation/t2a-exec-watch.log`（2026-10-19 23:36:58–23:38:26，416 次采样全部 `RUNNING`、`detail` 全空、`epoch` 不变）说明曾存在约 90 s 的 **RUNNING 观测窗口**，但当时没有落 `points/latest`。注意按 `docs/design/nck-s7-job-0x8201-diagnosis-plan.md:173` 的既有口径，`RUNNING`/`epoch` 只能证明 Core 收到了 `StartConnectionAck`，**不等于**驱动真的连到机床、更不等于数据面已通过；但它仍是唯一能抓到项级码的机会窗 —— 这正是本次证据缺口，**待确认 → 需补一次抓取**。
 
