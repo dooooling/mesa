@@ -3,23 +3,33 @@
 // - 连接筛选本页局部管理（useConnectionQuery allowAll + ConnectionSelect），
 //   不再由父 Workspace 注入 Connection Context；
 // - 行点击打开 PointDetailDrawer，不跳页面。
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Button, Input, Select, Space, Table, Tag } from "antd";
 import type { DevicePointView, WorkspaceEndpoint } from "./useDeviceWorkspaceData";
 import { ConnectionSelect } from "./ConnectionSelect";
 import { AgeCell, NameCell, SourceCell, StatusCell, ValueCell } from "./LiveCells";
+import { QualityCodeBreakdown } from "../components/QualityCodeBreakdown";
+import {
+  filterPointsInQualityScope,
+  makeQualityScope,
+  qualityScopeLabel,
+  qualityScopeText,
+} from "../qualityScope";
 import { useConnectionQuery } from "./useConnectionQuery";
 
 type StatusFilter = "ALL" | "GOOD" | "BAD" | "STALE";
 
 export function DeviceLiveData(props: {
+  /** 当前设备 id：统计/导出分析的作用域必须与设备页表格一致（不跨设备）。 */
+  deviceId: string;
+  deviceName?: string;
   endpoints: WorkspaceEndpoint[];
   endpointsReady: boolean;
   points: DevicePointView[];
   pointsError: boolean;
   onOpenPoint: (p: DevicePointView) => void;
 }) {
-  const { endpoints, endpointsReady, points, pointsError, onOpenPoint } = props;
+  const { deviceId, deviceName, endpoints, endpointsReady, points, pointsError, onOpenPoint } = props;
   const [status, setStatus] = useState<StatusFilter>("ALL");
   const [search, setSearch] = useState("");
   // 本页连接筛选（全部/单连接），URL 局部 ?connection=，不跨 Tab 同步。
@@ -47,19 +57,45 @@ export function DeviceLiveData(props: {
     });
   }, [points, effectiveEndpointId, status, search]);
 
+  // 计数与按码分解共用同一作用域集合（设备 + 连接）；不受状态/搜索过滤影响
+  //（与标题语义一致）。设备维度显式参与：即使 points 已按设备过滤，
+  // 导出分析也必须带上设备 id，否则会退化成跨设备。
+  const scope = useMemo(
+    () => makeQualityScope(deviceId, effectiveEndpointId),
+    [deviceId, effectiveEndpointId],
+  );
+  const endpointDevice = useMemo(
+    () => new Map(endpoints.map((e) => [e.id, e.device_id ?? ""] as const)),
+    [endpoints],
+  );
+  const deviceOfEndpoint = useCallback(
+    (endpointId: string) => endpointDevice.get(endpointId) ?? "",
+    [endpointDevice],
+  );
+  const scopedPoints = useMemo(
+    () => filterPointsInQualityScope(points, scope, deviceOfEndpoint),
+    [points, scope, deviceOfEndpoint],
+  );
+  const scopeLabels = {
+    device: deviceName || deviceId,
+    endpoint: scope.endpointId
+      ? (endpoints.find((e) => e.id === scope.endpointId)?.name ?? scope.endpointId)
+      : undefined,
+  };
+  const scopeText = qualityScopeText(scope, scopeLabels);
+  const scopeLabel = qualityScopeLabel(scope, scopeLabels);
+
   const counts = useMemo(() => {
-    // 计数不受状态/搜索过滤影响，只受连接上下文影响（与标题语义一致）。
-    const scoped = effectiveEndpointId ? points.filter((p) => p.endpoint_id === effectiveEndpointId) : points;
     let good = 0;
     let bad = 0;
     let stale = 0;
-    for (const p of scoped) {
+    for (const p of scopedPoints) {
       if (p.derived === "GOOD") good += 1;
       else if (p.derived === "BAD") bad += 1;
       else if (p.derived === "STALE") stale += 1;
     }
-    return { total: scoped.length, good, bad, stale };
-  }, [points, effectiveEndpointId]);
+    return { total: scopedPoints.length, good, bad, stale };
+  }, [scopedPoints]);
 
   // 列定义 memo 化：每 render 新建 columns 数组会迫使 Table 全量重算。
   // 固定布局 + 显式列宽：动态文本只在格内省略，不推动整表（Layout shift 根治）。
@@ -148,7 +184,14 @@ export function DeviceLiveData(props: {
       </div>
 
       <div style={{ fontSize: 12, color: "#525252" }}>
-        全部 {counts.total} · GOOD {counts.good} · BAD {counts.bad} · STALE {counts.stale}
+        {/* PR-D1 U8：计数行**仅点击**打开按码分解（悬停不展开）；文案不变。 */}
+        <QualityCodeBreakdown points={scopedPoints} scope={scope} scopeText={scopeText}>
+          全部 {counts.total} · GOOD {counts.good} · BAD {counts.bad} · STALE {counts.stale}
+        </QualityCodeBreakdown>
+        {/* 复审修订 1：统计/导出范围写实（设备 + 连接），不再有跨设备歧义。 */}
+        <span data-testid="data-scope-label" style={{ marginLeft: 8 }}>
+          {scopeLabel}
+        </span>
       </div>
 
       <Table

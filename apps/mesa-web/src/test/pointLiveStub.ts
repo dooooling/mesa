@@ -13,6 +13,12 @@ export interface PointLiveStubRow {
   timestamp_ns?: number;
   source_label?: string;
   display_name?: string;
+  /**
+   * PR-D1：`quality_code` / `value_origin` 等最新行字段由调用方按需透传。
+   * SSE 帧是**整行**（不是 patch），测试必须能原样发出这些字段，
+   * 否则"码变化"类回归根本到不了前端。
+   */
+  [k: string]: unknown;
 }
 
 const T0 = 1_700_000_000_000;
@@ -66,40 +72,12 @@ export class MockPointLiveSource {
   }
 
   emitSnapshot(rows: PointLiveStubRow[]) {
-    const data = JSON.stringify({
-      points: rows.map((r, i) => ({
-        endpoint_id: r.endpoint_id,
-        point_id: r.key.length + i * 1000,
-        point_key: r.key,
-        key: r.key,
-        quality: r.quality ?? "GOOD",
-        type: r.type ?? "f64",
-        value: r.value ?? 1,
-        timestamp_ns: r.timestamp_ns ?? (T0 - 500) * 1e6,
-        value_origin: "CURRENT",
-        ...(r.source_label ? { source_label: r.source_label } : {}),
-        ...(r.display_name ? { display_name: r.display_name } : {}),
-      })),
-    });
+    const data = JSON.stringify({ points: encodeRows(rows) });
     for (const fn of this.listeners.get("mesa-points-snapshot") ?? []) fn({ data });
   }
 
   emitDelta(rows: PointLiveStubRow[]) {
-    const data = JSON.stringify({
-      points: rows.map((r, i) => ({
-        endpoint_id: r.endpoint_id,
-        point_id: r.key.length + i * 1000,
-        point_key: r.key,
-        key: r.key,
-        quality: r.quality ?? "GOOD",
-        type: r.type ?? "f64",
-        value: r.value ?? 1,
-        timestamp_ns: r.timestamp_ns ?? (T0 - 500) * 1e6,
-        value_origin: "CURRENT",
-        ...(r.source_label ? { source_label: r.source_label } : {}),
-        ...(r.display_name ? { display_name: r.display_name } : {}),
-      })),
-    });
+    const data = JSON.stringify({ points: encodeRows(rows) });
     for (const fn of this.listeners.get("mesa-points-delta") ?? []) fn({ data });
   }
 
@@ -120,19 +98,35 @@ type LiveStubInstance = {
 };
 
 function encodeRows(rows: PointLiveStubRow[]) {
-  return rows.map((r, i) => ({
-    endpoint_id: r.endpoint_id,
-    point_id: r.key.length + i * 1000,
-    point_key: r.key,
-    key: r.key,
-    quality: r.quality ?? "GOOD",
-    type: r.type ?? "f64",
-    value: r.value ?? 1,
-    timestamp_ns: r.timestamp_ns ?? (T0 - 500) * 1e6,
-    value_origin: "CURRENT",
-    ...(r.source_label ? { source_label: r.source_label } : {}),
-    ...(r.display_name ? { display_name: r.display_name } : {}),
-  }));
+  return rows.map((r, i) => {
+    // 已知字段单独取值，其余（quality_code / value_origin 等）原样透传；
+    // 放在最后以便调用方覆盖默认值（如把 value_origin 设为 LAST_KNOWN）。
+    const {
+      endpoint_id,
+      key,
+      quality,
+      type,
+      value,
+      timestamp_ns,
+      source_label,
+      display_name,
+      ...extra
+    } = r;
+    return {
+      endpoint_id,
+      point_id: key.length + i * 1000,
+      point_key: key,
+      key,
+      quality: quality ?? "GOOD",
+      type: type ?? "f64",
+      value: value ?? 1,
+      timestamp_ns: timestamp_ns ?? (T0 - 500) * 1e6,
+      value_origin: "CURRENT",
+      ...(source_label ? { source_label } : {}),
+      ...(display_name ? { display_name } : {}),
+      ...extra,
+    };
+  });
 }
 
 function liveInstances(): LiveStubInstance[] {
@@ -218,6 +212,17 @@ export function installPointLiveStub(opts: {
         generic.call(inst, "mesa-points-snapshot", JSON.stringify({ points: rows }));
       } else {
         (inst as LiveStubInstance).emitSnapshot(opts.points);
+      }
+    },
+    /** 发任意全量 snapshot（删除收敛只能由 snapshot 表达，delta 不处理删除）。 */
+    emitSnapshot: (rows: PointLiveStubRow[]) => {
+      const inst = liveInstances()[0];
+      const encoded = encodeRows(rows);
+      const generic = (inst as unknown as { emit?: (n: string, d: string) => void })?.emit;
+      if (typeof generic === "function") {
+        generic.call(inst, "mesa-points-snapshot", JSON.stringify({ points: encoded }));
+      } else {
+        (inst as LiveStubInstance).emitSnapshot(rows);
       }
     },
     emitDelta: (rows: PointLiveStubRow[]) => {

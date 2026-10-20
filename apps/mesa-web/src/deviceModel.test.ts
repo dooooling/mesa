@@ -177,8 +177,9 @@ describe("resolveEndpointContexts", () => {
   it("endpoint 经 device_id 反查设备名（Device → Endpoint → Point）", () => {
     const ctx = resolveEndpointContexts(
       [
-        { id: "a-nck", name: "NCK", device_id: "device-a" },
-        { id: "b-s7", device_id: "device-b" },
+        // PR-D1：driver_id 进上下文（码分类的命名空间来源）。
+        { id: "a-nck", name: "NCK", device_id: "device-a", driver_id: "sinumerik-nck" },
+        { id: "b-s7", device_id: "device-b", driver_id: "s7" },
       ],
       devices,
     );
@@ -187,6 +188,7 @@ describe("resolveEndpointContexts", () => {
       endpointName: "NCK",
       deviceId: "device-a",
       deviceName: "CNC-01",
+      driverId: "sinumerik-nck",
     });
     // endpoint 名缺失回落 id
     expect(ctx.get("b-s7")?.endpointName).toBe("b-s7");
@@ -762,6 +764,9 @@ describe("reconcilePointSnapshots", () => {
       { timestamp_ns: T0 * 1e6 },
       { source_label: "X" },
       { display_name: "N" },
+      // PR-D1：质量码与值的来源同样是 UI 可观察字段（断线覆盖只改这两者）。
+      { quality_code: "COMMUNICATION_LOST" },
+      { value_origin: "LAST_KNOWN" },
     ]) {
       expect(pointRowFingerprint(base, T0)).not.toBe(
         pointRowFingerprint({ ...base, ...over }, T0),
@@ -836,5 +841,68 @@ describe("nextStaleDeadlineMs（Point Live STALE 翻转调度）", () => {
 
   it("已越界不等待（调用方立即重算收敛）", () => {
     expect(nextStaleDeadlineMs([row(31_000)], T)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR-D1 质量码可见性（T4a / T4b / T5）
+//
+// 为什么单列一组：`pointFieldFingerprint` 此前只覆盖 value/quality/timestamp
+// 与 metadata，**不含** `quality_code` / `value_origin`。断线覆盖只改码
+// （DEVICE_ERROR → COMMUNICATION_LOST）时指纹不变，reconcile 会保留旧对象
+// 引用，UI 永远看不到变化——这恰好掩盖 D1 要暴露的事实（P0-1）。
+// 三条用例必须能独立失败：只改一个字段也必须换引用。
+// ---------------------------------------------------------------------------
+describe("reconcilePointSnapshots · PR-D1 指纹覆盖 quality_code / value_origin", () => {
+  const T0 = 1_700_000_000_000;
+  const mk = (over: Record<string, unknown> = {}) => ({
+    endpoint_id: "ep",
+    key: "k1",
+    point_id: 1,
+    quality: "BAD",
+    type: "u32",
+    value: 0,
+    timestamp_ns: (T0 - 500) * 1e6,
+    value_origin: "PLACEHOLDER",
+    quality_code: "DEVICE_ERROR",
+    ...over,
+  });
+
+  it("fingerprint_covers_quality_code_alone", () => {
+    // 仅 quality_code 变化（其余字段逐字相同）⇒ 必须 changed 且返回新引用。
+    const prev = [mk({ quality_code: "DEVICE_ERROR" })];
+    const next = [mk({ quality_code: "COMMUNICATION_LOST" })];
+    const { points, changed } = reconcilePointSnapshots(prev, next, T0);
+    expect(changed).toBe(true);
+    expect(points[0]).toBe(next[0]);
+    expect((points[0] as { quality_code?: string }).quality_code).toBe("COMMUNICATION_LOST");
+  });
+
+  it("fingerprint_covers_value_origin_alone", () => {
+    // 仅 value_origin 变化（CURRENT → LAST_KNOWN）⇒ 必须 changed 且返回新引用。
+    const prev = [mk({ value_origin: "CURRENT" })];
+    const next = [mk({ value_origin: "LAST_KNOWN" })];
+    const { points, changed } = reconcilePointSnapshots(prev, next, T0);
+    expect(changed).toBe(true);
+    expect(points[0]).toBe(next[0]);
+    expect((points[0] as { value_origin?: string }).value_origin).toBe("LAST_KNOWN");
+  });
+
+  it("reconcile_updates_on_communication_lost_overwrite", () => {
+    // 当前缺陷复现：断线把码覆盖成 COMMUNICATION_LOST，值/时间戳/来源全不变。
+    const before = mk({
+      quality: "BAD",
+      quality_code: "DEVICE_ERROR",
+      value_origin: "PLACEHOLDER",
+    });
+    const after = mk({
+      quality: "BAD",
+      quality_code: "COMMUNICATION_LOST",
+      value_origin: "PLACEHOLDER",
+    });
+    const { points, changed } = reconcilePointSnapshots([before], [after], T0);
+    expect(changed).toBe(true);
+    expect(points[0]).toBe(after);
+    expect((points[0] as { quality_code?: string }).quality_code).toBe("COMMUNICATION_LOST");
   });
 });

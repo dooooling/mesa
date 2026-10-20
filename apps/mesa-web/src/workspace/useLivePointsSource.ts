@@ -98,7 +98,13 @@ export function useLivePointsSource(): LivePointsSource {
   const ctx = useMemo(
     () =>
       resolveEndpointContexts(
-        endpoints.map((e) => ({ id: e.id, name: e.name, device_id: e.device_id })),
+        endpoints.map((e) => ({
+          id: e.id,
+          name: e.name,
+          device_id: e.device_id,
+          // PR-D1：与设备页同口径，driver_id 进上下文（码分类的命名空间）。
+          driver_id: e.driver_id,
+        })),
         devices,
       ),
     [endpoints, devices],
@@ -120,6 +126,8 @@ export function useLivePointsSource(): LivePointsSource {
           sourceText: p.source_label ?? null,
           ageMs,
           derived: derivePointStale(p.quality, ageMs),
+          // PR-D1：driver 身份只从端点上下文来（缺失即 ""，不猜命名空间）。
+          driverId: c?.driverId ?? "",
           endpointName: c?.endpointName ?? p.endpoint_id,
           deviceId: c?.deviceId ?? "",
           deviceName: c?.deviceName ?? "",

@@ -3,11 +3,18 @@
 // - 共用 PointDetailDrawer（只多展示来源 Device，不复制 Drawer）；
 // - device/connection 进 URL（?device=&connection=），状态/搜索为页面内状态；
 // - 行内“打开设备”闭环回 /devices/:id/data?connection=。
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Alert, Button, Card, Input, Select, Space, Table, Tag } from "antd";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { formatAge, formatPointValue } from "../deviceModel";
-import { PointDetailDrawer } from "../components/PointDetailDrawer";
+import { PointDetailDrawer, pointIdentityOf, type PointIdentity } from "../components/PointDetailDrawer";
+import { QualityCodeBreakdown } from "../components/QualityCodeBreakdown";
+import {
+  filterPointsInQualityScope,
+  makeQualityScope,
+  qualityScopeLabel,
+  qualityScopeText,
+} from "../qualityScope";
 import type { DevicePointView } from "../workspace/useDeviceWorkspaceData";
 import { AgeCell, NameCell, SourceCell, StatusCell, ValueCell } from "../workspace/LiveCells";
 import { useLivePointsSource } from "../workspace/useLivePointsSource";
@@ -20,7 +27,13 @@ export function GlobalDataPage() {
   const src = useLivePointsSource();
   const [status, setStatus] = useState<StatusFilter>("ALL");
   const [search, setSearch] = useState("");
-  const [openPoint, setOpenPoint] = useState<DevicePointView | null>(null);
+  // PR-D1 缺陷 1：只记定位标识；Drawer 渲染时从 src.allPoints（SSE 合并结果）
+  // 查找，SSE 改码/删点即时反映，不持有点击时的行快照。
+  const [openPoint, setOpenPoint] = useState<PointIdentity | null>(null);
+  const openPointRow = useCallback(
+    (p: DevicePointView) => setOpenPoint(pointIdentityOf(p)),
+    [],
+  );
 
   const deviceParam = params.get("device") ?? "ALL";
   const connectionParam = params.get("connection") ?? "ALL";
@@ -73,6 +86,55 @@ export function GlobalDataPage() {
     setParams(next);
   };
 
+  // 复审修订 1：统计 / 按码分解 / 导出分析使用**同一个设备 + 连接作用域**
+  // （qualityScope 单一真值）。旧实现"统计只跟连接、不跟设备"：表格只显示
+  // 这台机床，旁边统计却含其他设备，不符合现场监控预期。
+  // 边界：质量状态筛选与搜索关键字**不进入**该作用域（只影响表格行），
+  // 避免用户搜一个点后误以为整台设备只有一个点。
+  const scope = useMemo(
+    () => makeQualityScope(deviceParam, connectionParam),
+    [deviceParam, connectionParam],
+  );
+  // 端点 → 设备归属（/endpoints 已含 device_id；零后端改动）。
+  const endpointDevice = useMemo(
+    () => new Map(src.endpoints.map((e) => [e.id, e.device_id ?? ""] as const)),
+    [src.endpoints],
+  );
+  const deviceOfEndpoint = useCallback(
+    (endpointId: string) => endpointDevice.get(endpointId) ?? "",
+    [endpointDevice],
+  );
+  // 作用域内点集：计数行、Popover、导出分析同源（memo 保住 Popover 依赖引用）。
+  const scopedPoints = useMemo(
+    () => filterPointsInQualityScope(src.allPoints, scope, deviceOfEndpoint),
+    [src.allPoints, scope, deviceOfEndpoint],
+  );
+
+  const scopedCounts = useMemo(() => {
+    let good = 0;
+    let bad = 0;
+    let stale = 0;
+    let unknown = 0;
+    for (const p of scopedPoints) {
+      if (p.derived === "GOOD") good += 1;
+      else if (p.derived === "BAD") bad += 1;
+      else if (p.derived === "STALE") stale += 1;
+      else unknown += 1;
+    }
+    return { total: scopedPoints.length, good, bad, stale, unknown };
+  }, [scopedPoints]);
+
+  // 范围标注写实（设备选中 + 连接 ALL ⇒ "CNC-01 · 全部连接"，不再出现
+  // "跨设备"——范围已收敛到该设备）。
+  const deviceLabel = scope.deviceId
+    ? (src.devices.find((d) => d.id === scope.deviceId)?.name ?? scope.deviceId)
+    : undefined;
+  const endpointLabel = scope.endpointId
+    ? (src.endpoints.find((e) => e.id === scope.endpointId)?.name ?? scope.endpointId)
+    : undefined;
+  const scopeText = qualityScopeText(scope, { device: deviceLabel, endpoint: endpointLabel });
+  const scopeLabel = qualityScopeLabel(scope, { device: deviceLabel, endpoint: endpointLabel });
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return src.allPoints.filter((p) => {
@@ -96,10 +158,21 @@ export function GlobalDataPage() {
     });
   }, [src.allPoints, deviceParam, connectionParam, status, search]);
 
+  // Drawer 的设备名从**连接映射**反查（不依赖已消失的行）；行还在时再回退
+  // 到行上的 deviceName，保证点被删除后 Drawer 仍有可读来源。
+  const openEndpoint =
+    openPoint === null ? null : (src.endpoints.find((e) => e.id === openPoint.endpoint_id) ?? null);
+  const drawerDeviceId = openEndpoint?.device_id ?? "";
+  const drawerPoint =
+    openPoint === null
+      ? null
+      : (src.allPoints.find(
+          (p) => p.endpoint_id === openPoint.endpoint_id && p.point_id === openPoint.point_id,
+        ) ?? null);
   const drawerDeviceName =
-    openPoint == null
-      ? ""
-      : (src.devices.find((d) => d.id === openPoint.deviceId)?.name ?? openPoint.deviceName ?? openPoint.deviceId);
+    (drawerDeviceId
+      ? (src.devices.find((d) => d.id === drawerDeviceId)?.name ?? drawerDeviceId)
+      : "") || drawerPoint?.deviceName || "";
 
   // 列定义 memo 化 + 固定布局（与设备页同口径，Layout shift 根治）。
   const columns = useMemo(
@@ -160,7 +233,7 @@ export function GlobalDataPage() {
         render: (_: unknown, r: DevicePointView) => (
           <Space onClick={(e) => e.stopPropagation()}>
             {/* M7 可访问性：详情是 Drawer 的键盘路径（行 onClick 仅鼠标可达）。 */}
-            <Button size="small" type="link" onClick={() => setOpenPoint(r)}>
+            <Button size="small" type="link" onClick={() => openPointRow(r)}>
               详情
             </Button>
             <Button
@@ -177,7 +250,7 @@ export function GlobalDataPage() {
         ),
       },
     ],
-    [setOpenPoint, nav],
+    [openPointRow, nav],
   );
 
   return (
@@ -212,7 +285,19 @@ export function GlobalDataPage() {
         {src.endpointsError ? <Alert type="warning" showIcon message="连接清单不可用" description={src.endpointsError} style={{ marginBottom: 8 }} /> : null}
         {src.pointsError ? <Alert type="warning" showIcon message="快照更新失败（显示上次已知值）" style={{ marginBottom: 8 }} /> : null}
         <div style={{ fontSize: 12, color: "#525252", marginBottom: 8 }}>
-          全部 {src.counts.total} · GOOD {src.counts.good} · BAD {src.counts.bad} · STALE {src.counts.stale}
+          {/* PR-D1 U8：计数行**仅点击**打开按码分解；作用域 = 设备 + 连接。 */}
+          <QualityCodeBreakdown
+            points={scopedPoints}
+            scope={scope}
+            scopeText={scopeText}
+          >
+            全部 {scopedCounts.total} · GOOD {scopedCounts.good} · BAD {scopedCounts.bad} · STALE{" "}
+            {scopedCounts.stale}
+          </QualityCodeBreakdown>
+          {/* 范围标注始终写实：统计/分析只覆盖该设备与该连接。 */}
+          <span data-testid="data-scope-label" style={{ marginLeft: 8 }}>
+            {scopeLabel}
+          </span>
         </div>
         <Table
           size="small"
@@ -220,26 +305,20 @@ export function GlobalDataPage() {
           tableLayout="fixed"
           dataSource={filtered}
           pagination={{ pageSize: 20 }}
-          onRow={(r) => ({ onClick: () => setOpenPoint(r as DevicePointView), style: { cursor: "pointer" } })}
+          onRow={(r) => ({ onClick: () => openPointRow(r as DevicePointView), style: { cursor: "pointer" } })}
           columns={columns}
           locale={{ emptyText: "暂无数据" }}
         />
       </Card>
 
       <PointDetailDrawer
-        deviceId={openPoint?.deviceId ?? ""}
+        deviceId={drawerDeviceId}
         deviceName={drawerDeviceName}
-        point={openPoint}
+        points={src.allPoints}
+        selected={openPoint}
         onClose={() => setOpenPoint(null)}
         onRenamed={(target, display_name) => {
           src.patchDisplayName(target.endpoint_id, target.point_key, display_name);
-          setOpenPoint((prev) =>
-            prev !== null &&
-            prev.endpoint_id === target.endpoint_id &&
-            (prev.key ?? prev.point_key) === target.point_key
-              ? { ...prev, display_name: display_name ?? undefined }
-              : prev,
-          );
         }}
       />
     </div>
