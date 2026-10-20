@@ -15,6 +15,9 @@
 5. **S7 驱动不上报设备码**（`drivers/s7/src/client.rs:213-221` 丢弃 `return_code`，`drivers/s7/` 无任何 `quality_code` 赋值）；能带设备码的只有 NCK。"S7 端点上设备说 X"的文案**恒为假**。
 6. **必须先修的展示层缺陷**：`pointFieldFingerprint` 不含 `quality_code`/`value_origin`（`apps/mesa-web/src/deviceModel.ts:591-603`），导致 `BAD(DEVICE_ERROR,PLACEHOLDER)` → `BAD(COMMUNICATION_LOST,PLACEHOLDER)` 这种"只改码"的覆盖在 UI 上**不刷新**（`:640-648` 保旧引用）——恰好掩盖 D1 要暴露的事实。
 7. D1 只让**今后**的码可见，**不能**回溯解释那 80 个已被覆盖的点；统计只有当前快照、没有历史（§7.1、§11）。
+8. **时间戳精度**：Unix ns ≈ `1.8e18` 超出 `Number.MAX_SAFE_INTEGER`，`Date.now()*1e6` 与 `JSON.parse` 都会丢精度 ⇒ 导出元数据时间戳一律**十进制字符串**（`BigInt` 计算），**原始响应文本 + SHA-256 才是权威证据**，`points[]` 只是结构化副本（§6.6-1）。
+9. **`STATE_UNCHANGED` 不等于有效样本**：前后端点状态相同只说明状态没漂移；是否新鲜只能看 `freshness_summary`（`current`/`last_known`/`placeholder`）。导出用四个字段分离"状态一致性 / 抓取完整性 / 新鲜度分布 / 限制"（§6.3、§6.6-3）。
+10. `CURRENT` 只表达**值的来源**，不表达**采集成功**：`CURRENT + BAD` 必须显示"本次返回失败"，**不得**用成功绿色（§5.3、P1-1）。
 
 ## 1. 现状核实：现有 API 实际输出什么
 
@@ -154,9 +157,9 @@
 | `quality_code` 缺失 且 `quality="BAD"` | `UNKNOWN` | "未提供（异常形态，请报告）" | 否 | 兜底逻辑应恒写 `DEVICE_ERROR`（`snapshot.rs:318-324`），缺失即异常 |
 | `= "DEVICE_ERROR"` | `MESA_MARKER` | 分组"Mesa 标记（不是设备返回码）"：`DEVICE_ERROR` — "驱动未提供数字码" | **否**（Core 本地标记） | `snapshot.rs:318-324` |
 | `= "COMMUNICATION_LOST"` | `MESA_MARKER` | 同上分组：`COMMUNICATION_LOST` — "连接丢失，已覆盖该点此前的码"+ "此前的项级码已被覆盖，不可恢复" | **否**（Core 本地标记） | `snapshot.rs:399-424`（`:404-405`） |
-| `driver=sinumerik-nck` 且 `code=3` | `DEVICE_S7_ITEM` | `0x03 (3)` — "仓库 S7 码表：访问拒绝（CPU 保护等级/安全策略）" | 是（附边界） | `crates/s7-transport/src/error.rs:18-19`、`:88-91` |
-| `driver=sinumerik-nck` 且 `code=4` | `DEVICE_S7_ITEM` | `0x04 (4)` — "上下文不支持（S7-1200/1500 未放行 PUT/GET）" | 是（附边界） | `error.rs:16-17`、`:80-83` |
-| `driver=sinumerik-nck` 且 `code=5` | `DEVICE_S7_ITEM` | `0x05 (5)` — "地址错误（DB 不存在/非标准访问/越界）" | 是（附边界） | `error.rs:14-15`、`:84-87` |
+| `driver=sinumerik-nck` 且 `code=3` | `DEVICE_S7_ITEM` | `0x03 (3)` — `仓库现有 S7 参考码表：访问拒绝类（可能关联，需结合协议层确认）` | **不直接解释根因**（仅参考类别） | `crates/s7-transport/src/error.rs:18-19`、`:88-91` |
+| `driver=sinumerik-nck` 且 `code=4` | `DEVICE_S7_ITEM` | `0x04 (4)` — `仓库现有 S7 参考码表：上下文不支持类（可能关联，需结合协议层确认）` | **不直接解释根因** | `error.rs:16-17`、`:80-83` |
+| `driver=sinumerik-nck` 且 `code=5` | `DEVICE_S7_ITEM` | `0x05 (5)` — `仓库现有 S7 参考码表：地址错误类（可能关联，需结合协议层确认）` | **不直接解释根因** | `error.rs:14-15`、`:84-87` |
 | `driver=sinumerik-nck` 且 `code=10`（0x0A） | `DEVICE_S7_ITEM` | `0x0A (10)` — **无解释** | **否**（仓库无码表） | 仅 `tests/identity_browse.rs:378-385` 出现该值 |
 | `driver=sinumerik-nck` 且其他 `0..255` | `DEVICE_S7_ITEM` | `0xNN (N)` — 无解释 | **否** | 仓库无定义 |
 | `driver=opcua` 且任意数字 | `PROTOCOL_STATUS` | `0x80340000 (-2143289344)` — "OPC UA 状态码（位模式），无仓库码表" | **否** | `drivers/opcua/src/lib.rs:789` 等 |
@@ -169,14 +172,20 @@
 
 **唯一可称为"设备返回的码"的只有 `sinumerik-nck` 的 `0..254` 与 `opcua` 的 StatusCode 位模式**；其余全是 Mesa 标记或分类。
 
+> **首版收窄口径（P1-3）**：`0x03`/`0x04`/`0x05` 的说明**只给类别名**，因为仓库码表声明的是 **CPU 侧**语义（`error.rs:14-19`），而 `quality_code` 走的是 **item 级**字节（`read_var.rs:190-231`），二者是否同义**尚未确认**（§12-2）。因此首版：
+> - **保留原始码**（`0x03 (3)` 等）；
+> - 标注 `仓库现有 S7 参考码表`；
+> - **禁止**显示具体根因（见 §4.4 禁用清单）；
+> - 未核实部分统一写 `可能关联，需结合协议层确认`。
+
 ### 4.3 数值空间冲突（必须用二元组）
 
-`3` 在 `sinumerik-nck` 是 S7 访问拒绝，在 `focas2` 是"参数类错误"（`focas2/src/lib.rs:1668-1673`）。故：展示与统计的最小键是 `(driverId, code)`；UI 必须把码与其命名空间绑定显示；跨驱动聚合**不得**相加同名数字。
+`3` 在 `sinumerik-nck` 是 S7 参考码表的访问拒绝类，在 `focas2` 是"参数类错误"（`focas2/src/lib.rs:1668-1673`）。故：展示与统计的最小键是 `(driverId, code)`；UI 必须把码与其命名空间绑定显示；跨驱动聚合**不得**相加同名数字。
 
 ### 4.4 文案红线（禁止暗示因果）
 
-允许：`原始码 0x05`、`来源：S7 item 返回码（设备返回）`、`仓库码表：地址错误（DB 不存在/非标准访问/越界）`。
-禁止：`因地址不存在而读取失败`、`设备说该点无效`、`权限不足导致 BAD`、`该点配置错误`。
+允许：`原始码 0x05`、`来源：S7 item 返回码（设备返回）`、`仓库现有 S7 参考码表：地址错误类（可能关联，需结合协议层确认）`。
+**禁用清单（逐字禁止出现在任何码区/导出文案）**：`CPU 保护等级`、`安全策略禁止`、`DB 不存在`、`非标准访问`、`优化块`、`越界`、`S7-1200/1500 未放行 PUT/GET`、`权限不足`、`因…而读取失败`、`设备说…`、`导致 BAD`。理由：这些是**具体根因**，仓库码表并未在 item 级确认（§12-1/§12-2），写出来会误导现场人员。
 固定脚注（每块码区底部，逐字）：**"展示一个码 ≠ 确定根因；码表仅覆盖仓库内已定义的部分。"**（对齐 `quality-code-observability-investigation.md:137-146`）
 
 ## 5. 断线显示规则（逐条件）
@@ -191,20 +200,26 @@
 
 ### 5.3 逐条件展示表
 
-| `value_origin` | `quality_code` | 采样徽标（文案/色） | 码区 | 时间列 | "不可恢复"提示 |
-|---|---|---|---|---|---|
-| `CURRENT` | 缺失（GOOD） | `本次采样`（绿） | 不渲染 | `最后采样时间：…` | 无 |
-| `CURRENT` | 数字码 | `本次采样`（绿） | 设备/协议分组 + 命名空间 + 码表（若有） | 同上 | 无 |
-| `LAST_KNOWN` | `COMMUNICATION_LOST` | **`旧值（断线前，未更新）`**（灰） | "Mesa 标记"分组 | `最后采样时间：…（非本次 attempt 产生）` | **显示** |
-| `LAST_KNOWN` | 数字码 | `旧值（本次 attempt 未更新该点）`（灰） | 设备/协议分组 | 同上 | 无 |
-| `PLACEHOLDER` | `DEVICE_ERROR` | **`无有效值`**（灰） | "Mesa 标记"分组 | `最后采样时间：—`（无有效采样） | 无 |
-| `PLACEHOLDER` | `COMMUNICATION_LOST` | `无有效值（且已断线）`（灰） | "Mesa 标记"分组 | 同上 | 显示 |
+**`value_origin` 表达"值的来源"，`quality` 表达"质量"——两者不可相互替代。`CURRENT` 只说明值由本次 attempt 产生，不说明采集成功**：`CURRENT + BAD` 是"本次尝试得到的最新一次失败结果"。
+
+| `value_origin` | `quality` | `quality_code` | 采样徽标（文案/色） | 码区 | 时间列 | "不可恢复"提示 |
+|---|---|---|---|---|---|---|
+| `CURRENT` | `GOOD` | 缺失 | **`当前有效值`**（绿） | 不渲染 | `最后采样时间：…` | 无 |
+| `CURRENT` | `BAD` | 数字码 | **`本次返回失败`**（红，**禁用绿色**） | 设备/协议分组 + 命名空间 + 参考类别（若有） | 同上 | 无 |
+| `CURRENT` | `BAD` | `DEVICE_ERROR` | **`本次返回失败（未提供数字码）`**（红） | "Mesa 标记"分组 | 同上 | 无 |
+| `CURRENT` | `UNCERTAIN` | 数字码 | **`本次返回不确定`**（橙） | 设备/协议分组 | 同上 | 无 |
+| `CURRENT` | `BAD` | `COMMUNICATION_LOST` | 理论不可达（`mark_communication_lost` 会把 `CURRENT`→`LAST_KNOWN`，`snapshot.rs:406-408`）；若出现按 `本次返回失败` 渲染并标 `异常形态` | "Mesa 标记"分组 | 同上 | 无 |
+| `LAST_KNOWN` | `BAD` | `COMMUNICATION_LOST` | **`旧值，未更新（断线前）`**（灰） | "Mesa 标记"分组 | `最后采样时间：…（非本次 attempt 产生）` | **显示** |
+| `LAST_KNOWN` | `BAD` | 数字码 | `旧值，未更新（本次 attempt 未更新该点）`（灰） | 设备/协议分组 | 同上 | 无 |
+| `PLACEHOLDER` | `BAD` | `DEVICE_ERROR` | **`无有效值`**（灰） | "Mesa 标记"分组 | `最后采样时间：—`（无有效采样） | 无 |
+| `PLACEHOLDER` | `BAD` | `COMMUNICATION_LOST` | `无有效值（且已断线）`（灰） | "Mesa 标记"分组 | 同上 | 显示 |
 
 ### 5.4 红线
 
 1. **不得**把 `LAST_KNOWN` 渲染成"当前值"；`CURRENT` 以外一律带"未更新/无有效值"字样。
-2. **不得**在 `COMMUNICATION_LOST` 行展示任何设备码解释（原码已被覆盖，展示即编造）。
-3. **不得**用 `STALE`（`deviceModel.ts:496`、`:543-547`，30s 阈值）替代新鲜度：`STALE` 答"多久没更新"，`value_origin` 答"这条值是谁的"，两者并列显示、互不替代。
+2. **不得**把 `CURRENT + BAD` 渲染成绿色/"本次采样成功"——它只表示"本次 attempt 返回了这个失败结果"（P1-1）。
+3. **不得**在 `COMMUNICATION_LOST` 行展示任何设备码解释（原码已被覆盖，展示即编造）。
+4. **不得**用 `STALE`（`deviceModel.ts:496`、`:543-547`，30s 阈值）替代新鲜度：`STALE` 答"多久没更新"，`value_origin` 答"这条值是谁的"，`quality` 答"值是否可信"，三者并列显示、互不替代。
 
 ## 6. 原始快照导出（前端拼装，零后端）
 
@@ -214,67 +229,97 @@
 
 ### 6.2 生成流程（4 个 GET、2 波、失败即中止）
 
-1. `taken_at_ns = Date.now()*1e6`（点击时刻）。
-2. 并行：`GET /api/v1/endpoints` → `state_before`；`GET /api/v1/diagnostics` → `mesa_version`。
-3. `points_read_at_ns = Date.now()*1e6`，然后 `GET /api/v1/points/latest`，**保存 `await r.text()` 原文**再 `JSON.parse`。
+1. `taken_at_ns = (BigInt(Date.now()) * 1_000_000n).toString()`（**十进制字符串**；`Date.now()` 只有毫秒分辨率，故末 6 位恒为 0，这是**已知且必须标注**的精度上限）。
+2. 并行：`GET /api/v1/endpoints` → `state_before`；`GET /api/v1/diagnostics` → `mesa_version`（**可选**，失败不中止，见 `capture_status`）。
+3. `points_read_at_ns = (BigInt(Date.now()) * 1_000_000n).toString()`，然后 `GET /api/v1/points/latest`：先 `await r.text()` 保存**原文**，再 `JSON.parse` 得结构化副本。
 4. `GET /api/v1/endpoints` → `state_after`。
-5. 任一请求非 2xx 或 `points.points` 非数组 → **中止，不产出文件**，弹出错误（禁止半份证据）。
-6. `consistency = (state_before == state_after) ? "STATE_UNCHANGED" : "STATE_CHANGED_DURING_READ"`；后者 `sample_status="SUSPECT"`（对应 `capture-points.ps1:36-38`）。
-7. `points_sha256` = `crypto.subtle.digest("SHA-256", rawText)`（Node 22/浏览器均可用；测试环境同一 API）。
+5. 必需请求（步骤 2 的 `endpoints`、步骤 3、步骤 4）任一非 2xx，或 `points.points` 非数组 → **中止，不产出任何文件**（禁止半份证据）；仅 `diagnostics` 失败不中止（`mesa_version=null` + `capture_status=COMPLETE_WITHOUT_VERSION`）。
+6. `state_consistency` / `capture_status` / `freshness_summary` 按 §6.3 计算；**不得**由"前后状态相同"推导出"样本有效"（§6.6-2）。
+7. `points_sha256` = `crypto.subtle.digest("SHA-256", new TextEncoder().encode(rawText))`（对**原文 UTF-8 字节**计算；Node 22/浏览器均可用）。
 
 ### 6.3 逐字段 schema（`mesa.points.export.v1`）
+
+> 时间字段一律 **十进制字符串**（`string`），不用 JSON number：Unix ns 约 `1.8e18` 远超 `Number.MAX_SAFE_INTEGER`（`9_007_199_254_740_991` ≈ `9.0e15`），number 会静默舍入（§6.6-1）。
 
 | 字段 | 类型 | 必填 | 来源 / 规则 |
 |---|---|---|---|
 | `schema` | string | 是 | 常量 `"mesa.points.export.v1"` |
-| `taken_at_ns` | number(int64) | 是 | 点击时刻（UTC ns） |
-| `mesa_version` | string | 是 | `GET /api/v1/diagnostics` 的 `version`（`core-api:1594`） |
+| `taken_at_ns` | **string** | 是 | 点击时刻 UTC ns 十进制字符串；毫秒分辨率（末 6 位为 `0`） |
+| `mesa_version` | string \| null | 是 | `GET /api/v1/diagnostics` 的 `version`（`core-api:1594`）；该请求失败则 `null` |
 | `scope` | object | 是 | `{ "endpoint_id": string \| null, "row_count": number }`；`null` = 全部端点 |
 | `history` | object | 是 | `{ "available": false, "reason": "Snapshot 仅驻留当前最新值，不含时间序列" }` |
+| `evidence_completeness` | string | 是 | `FULL`（原文与分析同文件）/ `SPLIT`（原文单独文件，§6.5） |
 | `sampling.endpoint_state_before` | array | 是 | `GET /endpoints` 原始项的 `{id, driver_id, runtime{state,detail,revision,points,epoch}}`，**逐字保留** |
-| `sampling.points_read_at_ns` | number(int64) | 是 | 第 3 步时刻 |
+| `sampling.points_read_at_ns` | **string** | 是 | 第 3 步时刻（同上精度） |
 | `sampling.endpoint_state_after` | array | 是 | 第 4 步，同结构 |
-| `sampling.consistency` | string | 是 | `STATE_UNCHANGED` / `STATE_CHANGED_DURING_READ` |
-| `sampling.sample_status` | string | 是 | `VALID` / `SUSPECT` |
-| `points` | array | 是 | `GET /points/latest` 的 `points[]`，**逐字**（不重排/不改格式/不补默认值） |
-| `points_raw_text` | string | 条件必填 | `/points/latest` 的**原始响应文本**（证据级）；>5 MB 时省略并置 `points_raw_omitted` |
-| `points_raw_omitted` | string? | 否 | 仅省略时出现，值固定 `"TOO_LARGE"` |
-| `points_sha256` | string | 是 | 上述原文的 SHA-256（hex 小写） |
+| `sampling.state_consistency` | string | 是 | `STATE_UNCHANGED` / `STATE_CHANGED_DURING_READ`（**仅描述前后状态**，不代表样本有效） |
+| `sampling.capture_status` | string | 是 | `COMPLETE`（4 请求全成功）/ `COMPLETE_WITHOUT_VERSION`（仅 diagnostics 失败） |
+| `sampling.freshness_summary` | object | 是 | `{ "current": n, "last_known": n, "placeholder": n }`（按 `value_origin` 统计，单位=点数） |
+| `points` | array | 是 | `GET /points/latest` 的 `points[]` 经 `JSON.parse` 后的**结构化副本**（不重排/不改格式/不补默认值）；**纳秒数值可能已被舍入，不作为对账依据** |
+| `points_raw_text` | string | 条件必填 | `/points/latest` 的**原始响应文本**（原始证据）。`evidence_completeness=FULL` 时必填；`SPLIT` 时在 `<base>-raw.json` 中 |
+| `points_sha256` | string | 是 | **原文 UTF-8 字节**的 SHA-256（hex 小写）；两文件模式下两边都写，用于配对校验 |
 | `summary.by_quality` | object | 是 | `{GOOD, UNCERTAIN, BAD, UNKNOWN}` 计数 |
 | `summary.by_code` | array | 是 | `[{endpoint_id, driver_id, code, origin, count}]`，键 = `(endpoint_id, driver_id, code)` |
-| `limitations` | array[string] | 是 | 3 条固定文案（§6.4） |
+| `limitations` | array[string] | 是 | 固定 4 条（§6.4），**含"单次导出不是原子一致性快照"** |
 
 ### 6.4 示例（节选）
 
 ```json
-{ "schema": "mesa.points.export.v1", "taken_at_ns": 1792460055540482200,
+{ "schema": "mesa.points.export.v1",
+  "taken_at_ns": "1792460055540000000",
   "mesa_version": "0.0.0",
   "scope": { "endpoint_id": "lx-nck-tags-190-connection", "row_count": 238 },
   "history": { "available": false, "reason": "Snapshot 仅驻留当前最新值，不含时间序列" },
+  "evidence_completeness": "FULL",
   "sampling": {
     "endpoint_state_before": [{ "id": "lx-nck-tags-190-connection", "driver_id": "sinumerik-nck",
       "runtime": { "state": "RUNNING", "detail": "", "revision": 16, "points": 238, "epoch": 123 } }],
-    "points_read_at_ns": 1792460055540482200,
+    "points_read_at_ns": "1792460055540000000",
     "endpoint_state_after": [{ "…": "同结构" }],
-    "consistency": "STATE_UNCHANGED", "sample_status": "VALID" },
+    "state_consistency": "STATE_UNCHANGED",
+    "capture_status": "COMPLETE",
+    "freshness_summary": { "current": 0, "last_known": 158, "placeholder": 80 } },
   "points": [{ "endpoint_id": "…", "point_id": 261, "point_key": "…", "key": "…",
-    "type": "u32", "value": 5, "quality": "GOOD",
-    "timestamp_ns": 1792460055540482200, "value_origin": "CURRENT" }],
+    "type": "u32", "value": 5, "quality": "BAD", "quality_code": "COMMUNICATION_LOST",
+    "timestamp_ns": 1792460055540482200, "value_origin": "LAST_KNOWN" }],
   "points_raw_text": "{\"count\":238,\"points\":[…] }",
   "points_sha256": "…",
-  "summary": { "by_quality": { "GOOD": 158, "UNCERTAIN": 0, "BAD": 80, "UNKNOWN": 0 },
+  "summary": { "by_quality": { "GOOD": 0, "UNCERTAIN": 0, "BAD": 238, "UNKNOWN": 0 },
     "by_code": [{ "endpoint_id": "…", "driver_id": "sinumerik-nck",
-      "code": "COMMUNICATION_LOST", "origin": "MESA_MARKER", "count": 80 }] },
+      "code": "COMMUNICATION_LOST", "origin": "MESA_MARKER", "count": 238 }] },
   "limitations": ["仅当前快照，不含历史序列",
     "quality_code 语义依赖 driver_id，未知码不解释",
-    "断线后的码为 COMMUNICATION_LOST 覆盖值，不可反推原始项级码"] }
+    "断线后的码为 COMMUNICATION_LOST 覆盖值，不可反推原始项级码",
+    "单次导出不是原子一致性快照：行与端点状态来自独立读取，且 points 的纳秒数值可能被 JSON 舍入"] }
 ```
 
-### 6.5 上界与守卫
+> 注 1：示例即本机 `t0` 断线场景（238/238 `COMMUNICATION_LOST`）。它同时演示 P0-2：`state_consistency="STATE_UNCHANGED"` 但 `freshness_summary.current = 0` —— **前后状态相同绝不等于"本次新鲜采样"**。
+> 注 2：示例中 `points[].timestamp_ns` 仍是 **number**——它来自服务端原始 JSON，前端只能原样保留；再次 `JSON.stringify` 落盘时会写成**舍入后的值**，与 `points_raw_text` 内的原文可能相差 ≤128 ns。**权威值请读 `points_raw_text`**（§6.6-1）。
 
-- **请求次数**：每次点击 **4 个 GET**（2 波）；不轮询、不重试（失败即中止）。
-- **文件大小**：238 点约 <1 MB；`points_raw_text` 与 `points` 各存一份约 2×。若 `points_raw_text.length > 5_000_000`（≈5 MB），**省略 `points_raw_text`** 并置 `points_raw_omitted: "TOO_LARGE"`，`points_sha256` 仍必填。
-- **文件名**：`mesa-points-export-<UTC yyyyMMdd-HHmmss>-<endpoint_id|all>.json`。
+### 6.5 上界与证据完整性（不静默降级）
+
+- **请求次数**：每次点击 **4 个 GET**（2 波）；不轮询、不重试。
+- **大小阈值按 UTF-8 字节数**：`new TextEncoder().encode(rawText).length`（**不是** `String.length`——后者是 UTF-16 码元数，非 ASCII 内容会低估）。
+- **两种完整性状态**（无第三种，**永不丢弃原文**）：
+  - `FULL`（默认，原文 ≤ 5 MiB）：单文件，`points_raw_text` 内嵌。
+  - `SPLIT`（原文 > 5 MiB）：**下载两个文件** —— `<base>-raw.json`（原文 + `points_sha256` + `taken_at_ns`）与 `<base>-analysis.json`（结构化副本 + `evidence_completeness:"SPLIT"` + 同一 `points_sha256`）。UI 必须提示"已拆分为 2 个文件"。
+- **禁止**：省略原文后仍宣称"完整原始证据"；`ANALYSIS_ONLY` 状态不存在。
+- **文件名**：`mesa-points-export-<UTC yyyyMMdd-HHmmss>-<endpoint_id|all>.json`（`SPLIT` 追加 `-raw` / `-analysis`）。
+
+### 6.6 精度与证据分级（P0-1 / P1-2）
+
+1. **纳秒精度**：Unix ns ≈ `1.8e18`，`Number.MAX_SAFE_INTEGER = 9_007_199_254_740_991`（`9.0e15`）。在该量级 IEEE-754 double 的间隔为 **256 ns**，`JSON.parse` 后的 `timestamp_ns` 可能偏差 ≤128 ns；**`Date.now()*1e6` 还会额外引入整毫秒截断**。故：
+   - 导出元数据时间戳用**十进制字符串**（`BigInt` 计算，无精度损失）；
+   - `points[].timestamp_ns` 是 number，**只用于展示/排序**；
+   - **纳秒级对账一律以 `points_raw_text`（+ `points_sha256`）为权威**；
+   - **不得**声称 `points[]` 与原文在纳秒数值上完全一致。
+2. **证据分级**：
+   - **原始证据** = `points_raw_text` + `points_sha256`（字节级可校验）；
+   - **结构化副本** = `points[]` + `summary`（供展示与统计，允许精度损失）。
+3. **`STATE_UNCHANGED` 不等于"有效新鲜样本"**：前后状态相同只说明两次读到的 `runtime` 相同；中间可能发生过一次短暂重连（退避窗口内的 `RECONNECTING` 未被两次采样覆盖），且部分行本就可能是上一轮的 `LAST_KNOWN`。因此：
+   - 有效性的唯一判据是 `sampling.freshness_summary`（`current` / `last_known` / `placeholder` 分布）；
+   - `state_consistency` 只描述状态是否漂移，**不得**据此把整个导出标为"有效"；
+   - `limitations` 必含"单次导出不是原子一致性快照"。
 
 ## 7. 统计口径
 
@@ -300,7 +345,7 @@
 | 触发 | 行为 |
 |---|---|
 | 计数行渲染 | 只算 `counts`（现状已有，`useLivePointsSource.ts:133-145`），**不**算按码分解 |
-| 用户点击/悬停计数行 | 打开 Popover 时才 `useMemo` 计算分解；`useMemo` 依赖 `points` 数组引用（SSE 每帧最多换引用一次） |
+| **点击**计数行（**仅点击，不用悬停**） | 打开 Popover 时才 `useMemo` 计算分解；`useMemo` 依赖 `points` 数组引用（SSE 每帧最多换引用一次）。悬停不展开——避免无意间触发大规模统计 |
 | Popover 关闭 | 结果随 memo 保留，不重算；不写任何 store |
 
 ### 7.4 限制语（Popover 底部固定文案）
@@ -352,17 +397,18 @@
 
 | # | 组件/位置 | 触发/条件 | 展示内容与文案 |
 |---|---|---|---|
-| U1 | `PointDetailDrawer` 状态区之后（`:70-78` 后） | 抽屉打开 | 新增"采样"区：徽标（§5.3 文案）+ `最后采样时间：<本地时间>`；`CURRENT` 以外追加 `（非本次 attempt 产生）`；`源时间：<本地时间>` 或 `—（协议未提供）` |
+| U1 | `PointDetailDrawer` 状态区之后（`:70-78` 后） | 抽屉打开 | 新增"采样"区：徽标按 **`(value_origin, quality)` 二维**取 §5.3 文案（`CURRENT+GOOD`→`当前有效值`绿；`CURRENT+BAD`→`本次返回失败`红；`LAST_KNOWN`→`旧值，未更新`灰；`PLACEHOLDER`→`无有效值`灰）+ `最后采样时间：<本地时间>`；非 `CURRENT` 追加 `（非本次 attempt 产生）`；`源时间：<本地时间>` 或 `—（协议未提供）` |
 | U2 | 同上 | `quality_code !== undefined` | 新增"原因码"区；否则整块不渲染 |
 | U3 | 原因码区 | `codeClass = MESA_MARKER` | 小标题 `Mesa 标记（不是设备返回码）`；正文 `<code>` + 说明；`COMMUNICATION_LOST` 追加 `此前的项级码已被覆盖，不可恢复` |
-| U4 | 原因码区 | `codeClass ∈ {DEVICE_S7_ITEM, PROTOCOL_STATUS, MESA_CLASS}` | 小标题 `设备/协议返回码`；正文 `0xNN (N)`（十进制码时）+ 命名空间标签（`S7 item` / `OPC UA StatusCode` / `Mesa 分类`）；可解释时加 `仓库码表：…`，否则加 `仓库无该码定义（待确认）` |
+| U4 | 原因码区 | `codeClass ∈ {DEVICE_S7_ITEM, PROTOCOL_STATUS, MESA_CLASS}` | 小标题 `设备/协议返回码`；正文 `0xNN (N)`（十进制码时）+ 命名空间标签（`S7 item` / `OPC UA StatusCode` / `Mesa 分类`）；nck 的 3/4/5 只给 `仓库现有 S7 参考码表：<类别>（可能关联，需结合协议层确认）`；无类别时加 `仓库无该码定义（待确认）`。**不得**出现 §4.4 禁用清单中的任何具体根因 |
 | U5 | 原因码区 | `codeClass = UNKNOWN` | 小标题 `未知命名空间`；只显示原值 + `不解释` |
 | U6 | 原因码区底部 | 恒显示（U2 成立时） | 脚注 `展示一个码 ≠ 确定根因；码表仅覆盖仓库内已定义的部分。` |
 | U7 | 行内状态列（`LiveCells.tsx:86-93` 后，可选） | `quality_code !== undefined` | Tag 后追加徽标：`nck`/`opcua`/`focas2`/`Mesa`；`title` = 原值；无码则不渲染 |
-| U8 | 计数行（`DeviceLiveData.tsx:151`、`GlobalDataPage.tsx:214-216`） | 点击计数行 | 打开 Popover：按 `MESA_MARKER` / `设备/协议返回码` 分区，按端点分组的码计数；底部 §7.4 限制语 |
-| U9 | 同一 Popover 内 | 恒显示 | 导出按钮 `导出原始快照`；点击后禁用并显示 `采集中…`，完成触发下载；失败弹 `导出失败：<HTTP 状态>（未生成文件）` |
-| U10 | 导出文件名 | 完成时 | `mesa-points-export-<UTC>-<endpoint|all>.json`；`sample_status=SUSPECT` 时文件名追加 `-suspect` |
+| U8 | 计数行（`DeviceLiveData.tsx:151`、`GlobalDataPage.tsx:214-216`） | **仅点击**（悬停不展开） | 打开 Popover：按 `MESA_MARKER` / `设备/协议返回码` 分区，按端点分组的码计数；底部 §7.4 限制语 |
+| U9 | 同一 Popover 内 | 恒显示 | 导出按钮 `导出原始快照`；点击后禁用并显示 `采集中…`；完成触发下载（`FULL` 单文件；`SPLIT` 两个文件 + 提示 `已拆分为 2 个文件`）；失败弹 `导出失败：<HTTP 状态>（未生成文件）` |
+| U10 | 导出文件名 | 完成时 | `mesa-points-export-<UTC>-<endpoint_id\|all>.json`；`state_consistency=STATE_CHANGED_DURING_READ` 时追加 `-statechanged`；`SPLIT` 追加 `-raw`/`-analysis` |
 | U11 | 任意码区 | 恒 | **不出现**任何因果措辞（§4.4 禁用词表）；不出现"设备说" |
+| U12 | 采样区 | `value_origin=CURRENT` 且 `quality=BAD` | 徽标必须为红色 `本次返回失败`，**不得**使用绿色/成功语义（P1-1） |
 
 ## 10. 回归测试清单（用例名 + 断言点）
 
@@ -386,23 +432,28 @@
 | T1 | `classifyCode_device_codes_only_for_known_drivers` | `qualityCode.test.ts` | `("sinumerik-nck","5")→DEVICE_S7_ITEM`；`("opcua","-2143289344")→PROTOCOL_STATUS`；`("focas2","2")→MESA_CLASS`；`("","5")→UNKNOWN` |
 | T2 | `classifyCode_never_explains_unknown_numbers` | 同上 | `("sinumerik-nck","10")` 与 `("sinumerik-nck","7")` 的 `codeText === null` |
 | T3 | `mesa_markers_are_never_device_codes` | 同上 | `DEVICE_ERROR`/`COMMUNICATION_LOST` → `MESA_MARKER` 且 `codeText` 不含"设备" |
-| T4 | `fingerprint_covers_quality_code_and_origin` | `deviceModel.test.ts`（扩展 `:754-769` 循环） | 仅改 `quality_code` 或仅改 `value_origin` ⇒ `changed === true` |
+| T4a | `fingerprint_covers_quality_code_alone` | `deviceModel.test.ts`（扩展 `:754-769` 循环） | **仅**改 `quality_code`（其余字段全同）⇒ `changed === true` 且返回新引用。**D1 必要功能，非可选优化** |
+| T4b | `fingerprint_covers_value_origin_alone` | 同上 | **仅**改 `value_origin`（其余字段全同）⇒ `changed === true` 且返回新引用 |
 | T5 | `reconcile_updates_on_communication_lost_overwrite` | `deviceModel.test.ts` | `BAD/DEVICE_ERROR/PLACEHOLDER/T` → `BAD/COMMUNICATION_LOST/PLACEHOLDER/T` 必须换引用 |
-| T6 | `drawer_marks_last_known_as_not_current` | `PointDetailDrawer.test.tsx`（新建） | 文本含 `旧值（断线前，未更新）`、`此前的项级码已被覆盖，不可恢复`；不含 `设备返回` |
+| T6 | `drawer_marks_last_known_as_not_current` | `PointDetailDrawer.test.tsx`（新建） | 文本含 `旧值，未更新（断线前）`、`此前的项级码已被覆盖，不可恢复`；不含 `设备返回` |
+| T6b | `drawer_current_bad_is_not_success` | 同上 | `CURRENT+BAD+code="5"` ⇒ 含 `本次返回失败`，**不含** `当前有效值`/`本次采样`；徽标色非绿 |
 | T7 | `drawer_hides_code_section_for_good_rows` | 同上 | GOOD 且无码 ⇒ 无"原因码"标题 |
-| T8 | `drawer_shows_hex_and_decimal_for_device_code` | 同上 | `0x05 (5)` 与 `仓库码表：地址错误` 同时出现；`0x0A` 出现时无解释文案 |
+| T8 | `drawer_shows_reference_class_not_root_cause` | 同上 | `0x05 (5)` 与 `仓库现有 S7 参考码表：地址错误类（可能关联，需结合协议层确认）` 同时出现；**断言不含** `DB 不存在`/`CPU 保护等级`/`PUT/GET`；`0x0A` 出现时无任何类别文案 |
 | T9 | `breakdown_groups_by_origin_and_endpoint` | `QualityCodeBreakdown.test.tsx`（新建） | 分区标题存在；同一数字在不同 driver 下**分开计数** |
-| T10 | `export_builds_schema_with_sampling_context` | `qualityExport.test.ts`（新建） | 4 次 GET（顺序断言）；`schema/history/consistency/sample_status` 存在；`points` 深度等于 latest 响应 |
-| T11 | `export_aborts_on_http_error` | 同上 | 任一请求 500 ⇒ 抛错且**不产生** Blob/下载 |
-| T12 | `export_marks_suspect_when_state_changes` | 同上 | before≠after ⇒ `sample_status==="SUSPECT"` |
+| T10 | `export_builds_schema_with_sampling_context` | `qualityExport.test.ts`（新建） | 4 次 GET（顺序断言）；`schema/history/state_consistency/capture_status/freshness_summary/evidence_completeness` 存在；`taken_at_ns` 与 `points_read_at_ns` 为**十进制字符串**且 `/^\d+$/`；`points` 与 latest 响应的**解析结果**深度相等（**不**与原文比数值） |
+| T11 | `export_aborts_on_http_error` | 同上 | 必需请求 500 ⇒ 抛错且**不产生**任何文件（含 SPLIT 两文件都不产出） |
+| T12 | `export_separates_state_consistency_from_freshness` | 同上 | before≠after ⇒ `state_consistency==="STATE_CHANGED_DURING_READ"`，但**断言不存在** `sample_status`/`VALID` 字段；`freshness_summary` 三项之和 == `scope.row_count` |
+| T13 | `export_split_when_raw_exceeds_threshold` | 同上 | 构造 >5 MiB 原文 ⇒ `evidence_completeness==="SPLIT"` 且产出 2 个文件；`points_sha256` 两文件相同；**断言原文未被丢弃** |
+| T14 | `export_threshold_uses_utf8_bytes` | 同上 | 含多字节字符（如中文）的原文按 `TextEncoder` 字节数判定，而非 `String.length` |
+| T15 | `export_timestamp_is_bigint_string` | 同上 | `taken_at_ns` 与 `points_read_at_ns` 用 `BigInt` 生成（末 6 位为 `0` 的毫秒对齐值），**不得**出现 `Date.now()*1e6` 的浮点结果 |
 
 ### 10.3 "没有改变采集正确性"的证明
 
 1. `git diff --stat` 中 `crates/**`、`drivers/**`、`proto/**`、`tests/driver-contract/**` 为空。
-2. 同端点同状态下 D1 前后各抓一次 `points/latest`：`points[]` 字段集合与取值形态（含 `quality_code` 十进制字符串）完全一致（除 `timestamp_ns`/`value` 自然变化）。
-3. 导出的 `points` 与同刻 `points/latest` 深度相等（T10）——若有人改了码格式立刻红。
+2. 同端点同状态下 D1 前后各抓一次 `points/latest`：`points[]` 的**字段集合**（键名）与 `quality_code` 字符串形态完全一致（`timestamp_ns`/`value` 自然变化；**比较在"解析后的键集合"层面进行，不主张纳秒数值相等**，§6.6-1）。
+3. 导出的 `points` 与同刻 `points/latest` 的**解析结果**深度相等（T10）——若有人改了码格式立刻红；**原文一致性**由 `points_sha256` 单独证明。
 4. 断线契约断言原样通过（§10.1 第 1 行）。
-5. 唯一可信证据：`python scripts/write-contract-evidence.py` 产出的 `target/validation/contract.json`（27 suites，`scripts/contract_suites.py:14-51`）。
+5. 唯一可信证据：`python scripts/write-contract-evidence.py` 产出的 `target/validation/contract.json`。**suite 数必须以注册表为准**：`scripts/contract_suites.py:13-52` 当前为 **30**（BASELINE 14 + EVENT 12 + LIFECYCLE 4），`AGENTS.md` 中的"27"已过时（建议随 D1 一并更正）。
 
 ## 11. D1 明确不能解决什么（诚实边界）
 
@@ -450,8 +501,22 @@
 | 审查重点 | 本文件章节 | 一句话结论 |
 |---|---|---|
 | 数据契约 | §1、§3 | 复用 11 个现有字段，零新增；派生字段只在视图层，不复制状态 |
-| 质量码解释 | §4 | 按 `(driver_id, code)` 完整映射 16 种情形；设备码仅 nck/opcua |
-| 断线显示 | §5 | 6 种 `(origin, code)` 组合逐条定义；旧值必带"未更新/无有效值" |
-| 原始数据导出 | §6 | 逐字段 schema + 4 个既有 GET + 原文与 sha256，不丢码/时间戳/来源/端点状态 |
-| 统计分析 | §7 | 仅当前快照（每点 1 样本）；无历史，限制语固定 |
-| 回归测试 | §10 | 8 条既有契约不变 + 12 条新增用例（用例名+断言点） |
+| 质量码解释 | §4 | 按 `(driver_id, code)` 完整映射 16 种情形；设备码仅 nck/opcua；首版只给"参考类别"，禁写具体根因 |
+| 断线显示 | §5 | 9 种 `(origin, quality, code)` 组合逐条定义；`CURRENT+BAD` 不得用绿色；旧值必带"未更新/无有效值" |
+| 原始数据导出 | §6 | 逐字段 schema + 4 个既有 GET；时间戳为十进制字符串；原文+sha256 为权威，`points[]` 为结构化副本 |
+| 统计分析 | §7 | 仅当前快照（每点 1 样本）；无历史，限制语固定；Popover 仅点击触发 |
+| 回归测试 | §10 | 8 条既有契约不变 + 17 条新增用例（用例名+断言点）；suite 数以注册表 30 为准 |
+
+## 附录 B：本次修订对照（相对 `80c180e`）
+
+| 编号 | 改在哪一节 | 改成了什么 |
+|---|---|---|
+| **P0-1** 纳秒精度 | §6.2 步骤 1/3/7、§6.3、§6.4 注 2、§6.6-1、§10.2 T10/T15、§10.3-2/3 | `taken_at_ns`/`points_read_at_ns` 改**十进制字符串**（`BigInt`）；`points[]` 降级为"结构化副本"；`points_raw_text`+`points_sha256` 为权威；明确**不得**声称两者纳秒一致 |
+| **P0-2** 状态≠有效 | §6.2 步骤 6、§6.3、§6.4 注 1、§6.6-3、§9 U10、§10.2 T12 | 拆成 `state_consistency` / `capture_status` / `freshness_summary` / `limitations`；删除 `sample_status`；有效性只看 `freshness_summary` |
+| **P1-1** CURRENT+BAD | §5.3（表头与 9 行）、§5.4-2、§9 U1/U12、§10.2 T6/T6b | `CURRENT+GOOD`→`当前有效值`（绿）；`CURRENT+BAD`→`本次返回失败`（红，禁绿）；`LAST_KNOWN`→`旧值，未更新`；`PLACEHOLDER`→`无有效值` |
+| **P1-2** 原始证据 vs 副本 | §6.3、§6.5、§6.6-2 | 原文+sha256=原始证据；`points[]`+`summary`=结构化副本；5 MiB 阈值按 **UTF-8 字节**（`TextEncoder`）判定 |
+| **P1-3** 收窄 NCK 解释 | §4.2（3 行改写 + 收窄口径块）、§4.3、§4.4（新增禁用清单）、§9 U4、§10.2 T8 | 只给 `仓库现有 S7 参考码表：<类别>（可能关联，需结合协议层确认）`；逐字禁用 `CPU 保护等级`/`DB 不存在`/`PUT/GET` 等具体根因 |
+| **建议 1** suite 数 | §10.3-5、附录 A | 27 → **30**（`scripts/contract_suites.py:13-52`：BASELINE 14 + EVENT 12 + LIFECYCLE 4）；注明 `AGENTS.md` 的 27 已过时 |
+| **建议 2** Popover | §7.3、§9 U8 | 统一**仅点击**触发；悬停不展开 |
+| **建议 3** 指纹用例 | §10.2 T4a/T4b | 拆成"仅改 `quality_code`"与"仅改 `value_origin`"两条独立用例，并标注为 **D1 必要功能** |
+| **细节** >5 MB | §6.3、§6.5、§9 U9、§10.2 T13/T14 | 新增 `evidence_completeness`（`FULL`/`SPLIT`）；超限时**下载两个文件**而非丢弃原文；禁止 `ANALYSIS_ONLY` |
