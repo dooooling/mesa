@@ -125,7 +125,7 @@ export function QualityCodeBreakdownContent(props: {
         <div style={{ fontSize: 12, color: "#525252" }}>当前快照中没有质量码</div>
       ) : (
         partitions.map(([title, list]) => (
-          <div key={title} style={{ marginBottom: 8 }}>
+          <div key={title} data-testid="code-partition" style={{ marginBottom: 8 }}>
             <div style={{ fontWeight: 600, fontSize: 12 }}>{title}</div>
             {list.map((r) => (
               <div

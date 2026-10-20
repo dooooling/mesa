@@ -137,7 +137,12 @@ describe("qualityExport · 原始快照导出（PR-D1）", () => {
     });
     expect(doc.sampling.state_consistency).toBe("STATE_UNCHANGED");
     expect(doc.sampling.request_status).toBe("COMPLETE");
-    expect(doc.sampling.freshness_summary).toEqual({ current: 1, last_known: 1, placeholder: 0 });
+    expect(doc.sampling.freshness_summary).toEqual({
+      current: 1,
+      last_known: 1,
+      placeholder: 0,
+      unknown: 0,
+    });
     expect(doc.sampling.evidence_integrity.raw_preserved).toBe("INLINE");
     expect(doc.sampling.evidence_integrity.raw_sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(doc.sampling.evidence_integrity.raw_utf8_bytes).toBe(
@@ -172,6 +177,96 @@ describe("qualityExport · 原始快照导出（PR-D1）", () => {
     // 原文作为内联证据保留，且文件是单文件。
     expect(doc.points_raw_text).toBe(LATEST_TEXT);
     expect(result.files[0].name).toMatch(/^mesa-points-export-\d{8}-\d{6}-all\.json$/);
+  });
+
+  it("export_marks_raw_scope_vs_analysis_scope", async () => {
+    // 缺陷 3：原始响应始终是全部端点（证据完整），分析只覆盖所选连接。
+    // 两者必须在导出对象里显式区分，防止用户以为导出只含自己选的连接。
+    const rowOther = {
+      endpoint_id: "lx-other",
+      point_id: 9,
+      point_key: "DB1.temp",
+      key: "DB1.temp",
+      type: "f64",
+      value: 36.5,
+      quality: "BAD",
+      quality_code: "DEVICE_ERROR",
+      timestamp_ns: 1792460055540482200,
+      value_origin: "CURRENT",
+    };
+    const latestText = JSON.stringify({ points: [ROW_LAST_KNOWN, rowOther], count: 2 });
+    const endpoints = [
+      ...EP_BEFORE,
+      {
+        id: "lx-other",
+        name: "S7",
+        driver_id: "s7",
+        device_id: "plc-01",
+        runtime: { state: "RUNNING", detail: "", revision: 1, points: 1, epoch: 1 },
+      },
+    ];
+    const { fetchImpl } = makeFetch({ before: endpoints, latestText });
+    const { document: doc } = await buildPointsExport({
+      endpointId: "lx-nck",
+      now: () => 1_792_460_055_541,
+      fetchImpl,
+    });
+
+    // 分析范围 = 所选连接。
+    expect(doc.scope).toEqual({ endpoint_id: "lx-nck", row_count: 1 });
+    expect(doc.points).toHaveLength(1);
+    expect(doc.summary.by_code.map((e) => e.endpoint_id)).toEqual(["lx-nck"]);
+    expect(doc.analysis_scope).toEqual({
+      endpoint_id: "lx-nck",
+      row_count: 1,
+      description: expect.stringContaining("所选连接"),
+    });
+
+    // 原始证据范围 = 全部端点（含其他连接/设备），原文未丢弃。
+    expect(doc.raw_scope).toEqual({
+      source: "GET /api/v1/points/latest",
+      includes: "ALL_ENDPOINTS",
+      row_count: 2,
+      description: expect.stringContaining("全部端点"),
+    });
+    expect(doc.points_raw_text).toBe(latestText);
+    expect(doc.points_raw_text).toContain("lx-other");
+
+    // 未选连接时两者一致（分析也覆盖全部连接）。
+    const { fetchImpl: fetchAll } = makeFetch({ before: endpoints, latestText });
+    const { document: all } = await buildPointsExport({
+      now: () => 1_792_460_055_541,
+      fetchImpl: fetchAll,
+    });
+    expect(all.analysis_scope).toEqual({
+      endpoint_id: null,
+      row_count: 2,
+      description: expect.stringContaining("全部连接"),
+    });
+    expect(all.raw_scope.row_count).toBe(2);
+  });
+
+  it("export_counts_unknown_value_origin_separately", async () => {
+    // 缺陷 4：未知/缺失 value_origin 不得并入 PLACEHOLDER（会静默抬高"无有效值"）。
+    const base = { ...ROW_CURRENT, quality: "BAD" };
+    const rows = [
+      { ...base, point_id: 1, value_origin: "CURRENT" },
+      { ...base, point_id: 2, value_origin: "LAST_KNOWN" },
+      { ...base, point_id: 3, value_origin: "PLACEHOLDER" },
+      { ...base, point_id: 4, value_origin: "FUTURE_ORIGIN" },
+      { ...base, point_id: 5, value_origin: undefined },
+    ];
+    const latestText = JSON.stringify({ points: rows, count: rows.length });
+    const { fetchImpl } = makeFetch({ latestText });
+    const { document: doc } = await buildPointsExport({
+      now: () => 1_792_460_055_541,
+      fetchImpl,
+    });
+    const f = doc.sampling.freshness_summary;
+    expect(f).toEqual({ current: 1, last_known: 1, placeholder: 1, unknown: 2 });
+    // 未识别来源单独计数，不得静默合并。
+    expect(f.placeholder).toBe(1);
+    expect(f.current + f.last_known + f.placeholder + f.unknown).toBe(doc.scope.row_count);
   });
 
   it("export_aborts_on_http_error", async () => {

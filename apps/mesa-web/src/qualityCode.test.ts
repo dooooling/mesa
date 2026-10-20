@@ -8,7 +8,13 @@
 // - `DEVICE_ERROR` / `COMMUNICATION_LOST` 是 Core 写的**符号标记**，不是设备
 //   返回码，任何情况下都不得解释成设备语义。
 import { describe, expect, it } from "vitest";
-import { classifyCode, codeText } from "./qualityCode";
+import {
+  MISSING_CODE_TEXT,
+  classifyCode,
+  codeGroupTitle,
+  codeText,
+  shouldShowCodeSection,
+} from "./qualityCode";
 
 describe("qualityCode · 质量码分类（PR-D1）", () => {
   it("classifyCode_device_codes_only_for_known_drivers", () => {
@@ -37,5 +43,26 @@ describe("qualityCode · 质量码分类（PR-D1）", () => {
       expect(text.length).toBeGreaterThan(0);
       expect(text).not.toContain("设备");
     }
+  });
+
+  it("focas_mesa_class_is_not_device_return_group", () => {
+    // 缺陷 2：focas2 的 1..5 是 Mesa 自己的单点错误分类码（§4.2），
+    // 不是厂家/设备返回码，不得与 S7/NCK 的设备返回码同组。
+    expect(codeGroupTitle("MESA_CLASS")).toBe("Mesa 分类（非厂家码）");
+    expect(codeGroupTitle("MESA_CLASS")).not.toBe(codeGroupTitle("DEVICE_S7_ITEM"));
+    expect(codeGroupTitle("MESA_CLASS")).not.toBe(codeGroupTitle("PROTOCOL_STATUS"));
+    expect(codeGroupTitle("DEVICE_S7_ITEM")).toBe("设备/协议返回码");
+    expect(codeGroupTitle("PROTOCOL_STATUS")).toBe("设备/协议返回码");
+  });
+
+  it("missing_code_is_visible_for_non_good_rows_only", () => {
+    // 裁决 1（U2 vs §4.2）：GOOD 无码隐藏（T7 依赖）；BAD 无码必须显示异常形态。
+    expect(shouldShowCodeSection("GOOD", undefined)).toBe(false);
+    expect(shouldShowCodeSection("good", undefined)).toBe(false);
+    expect(shouldShowCodeSection("BAD", undefined)).toBe(true);
+    expect(shouldShowCodeSection("UNCERTAIN", undefined)).toBe(true);
+    // 有码的行任何质量都显示（含 GOOD，例如断线残留/异常数据）。
+    expect(shouldShowCodeSection("GOOD", "5")).toBe(true);
+    expect(MISSING_CODE_TEXT).toBe("未提供（异常形态，请报告）");
   });
 });

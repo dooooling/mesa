@@ -75,4 +75,30 @@ describe("QualityCodeBreakdown · 质量码分解（PR-D1）", () => {
     expect(screen.getByText(BREAKDOWN_LIMITATION)).toBeTruthy();
     expect(screen.getByText("导出原始快照")).toBeTruthy();
   });
+
+  it("focas_mesa_class_has_its_own_partition", () => {
+    // 缺陷 2：focas2 的 1..5 是 Mesa 自己的分类码（非厂家码），
+    // 必须单独分组，不得与 S7/NCK 的设备返回码同组展示。
+    const points: BreakdownPoint[] = [
+      p({ endpoint_id: "ep-nck", driverId: "sinumerik-nck", quality_code: "5" }),
+      p({ endpoint_id: "ep-focas", driverId: "focas2", quality_code: "5" }),
+    ];
+    render(<QualityCodeBreakdownContent points={points} />);
+
+    const partitions = screen.getAllByTestId("code-partition");
+    const devicePartition = partitions.find((el) =>
+      el.textContent?.includes("设备/协议返回码"),
+    );
+    const mesaPartition = partitions.find((el) =>
+      el.textContent?.includes("Mesa 分类（非厂家码）"),
+    );
+    expect(devicePartition).toBeTruthy();
+    expect(mesaPartition).toBeTruthy();
+    // focas2 的码只出现在 Mesa 分类分区，绝不混进设备/协议返回码分区。
+    expect(within(devicePartition!).queryByText("focas2")).toBeNull();
+    expect(within(mesaPartition!).getByText("focas2")).toBeTruthy();
+    expect(within(mesaPartition!).getByText("0x05 (5)")).toBeTruthy();
+    // nck 的 5 仍在设备/协议分区。
+    expect(within(devicePartition!).getByText("sinumerik-nck")).toBeTruthy();
+  });
 });

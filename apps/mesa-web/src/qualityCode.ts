@@ -30,6 +30,15 @@ export const MESA_MARKER_COMMUNICATION_LOST = "COMMUNICATION_LOST";
 /** 断线覆盖提示（U3）：此前的项级码已被 `COMMUNICATION_LOST` 覆盖，不可恢复。 */
 export const COMMUNICATION_LOST_NOTE = "此前的项级码已被覆盖，不可恢复";
 
+/**
+ * 非 GOOD 行缺码的固定文案（§4.2 逐字）。
+ *
+ * 为什么必须显示：兜底逻辑本应恒写 `DEVICE_ERROR`（`snapshot.rs:318-324`），
+ * 缺失本身就是异常形态；若像 GOOD 行一样隐藏，操作员会把"没有原因码"
+ * 误读成"没有异常"，直接违背 D1 让故障原因可见的目的。
+ */
+export const MISSING_CODE_TEXT = "未提供（异常形态，请报告）";
+
 /** 码区固定脚注（§4.4，逐字）。 */
 export const CODE_FOOTNOTE = "展示一个码 ≠ 确定根因；码表仅覆盖仓库内已定义的部分。";
 
@@ -102,6 +111,21 @@ export function classifyCode(
 }
 
 /**
+ * 码区是否渲染（U2 与 §4.2 的裁决）：
+ * - 有码 ⇒ 恒渲染；
+ * - 无码 + `GOOD` ⇒ 隐藏（GOOD 行零额外 DOM，T7 依赖）；
+ * - 无码 + 非 `GOOD` ⇒ **必须渲染**并显示 {@link MISSING_CODE_TEXT}
+ *   （缺失即异常形态，不得静默隐藏）。
+ */
+export function shouldShowCodeSection(
+  quality: string | undefined,
+  code: string | undefined,
+): boolean {
+  if (code !== undefined) return true;
+  return (quality ?? "").toUpperCase() !== "GOOD";
+}
+
+/**
  * 一句话解释；无可解释定义时返回 `null`（UI 只显示原值）。
  * 符号标记的解释**不得**含"设备"字样——它们是 Core 本地标记。
  */
@@ -152,12 +176,20 @@ export function namespaceLabel(cls: CodeClass): string | null {
   return null;
 }
 
-/** 分区标题（U3/U4/U5、统计 Popover 同口径）。 */
+/**
+ * 分区标题（U3/U4/U5、统计 Popover 同口径）。
+ *
+ * 缺陷 2（语义错误）：FOCAS2 的 `1..5` 是 **Mesa 自己的单点错误分类码**，
+ * 不是厂家/设备返回码（§4.1、§4.2 明确写着"非厂家码"）。因此 `MESA_CLASS`
+ * 必须单独成组，**不得**与 S7/NCK 的 `DEVICE_S7_ITEM`、OPC UA 的
+ * `PROTOCOL_STATUS` 同组展示——同组会让读者把它当成设备给出的码。
+ */
 export function codeGroupTitle(cls: CodeClass): string {
   if (cls === "MESA_MARKER") return "Mesa 标记（不是设备返回码）";
-  if (cls === "DEVICE_S7_ITEM" || cls === "PROTOCOL_STATUS" || cls === "MESA_CLASS") {
+  if (cls === "DEVICE_S7_ITEM" || cls === "PROTOCOL_STATUS") {
     return "设备/协议返回码";
   }
+  if (cls === "MESA_CLASS") return "Mesa 分类（非厂家码）";
   if (cls === "UNKNOWN") return "未知命名空间（不解释）";
   return "";
 }

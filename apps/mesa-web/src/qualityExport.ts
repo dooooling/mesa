@@ -13,6 +13,11 @@
 //   舍入（1.8e18 量级间隔 256 ns），因此**导出元数据时间戳一律十进制字符串**
 //   （BigInt 计算），绝不使用 `Date.now() * 1e6` 的浮点结果。
 //
+// 范围（缺陷 3）：原始证据始终是 `/points/latest` 的**全部端点**（可能含其他
+// 连接/设备），而 `points[]` / `summary` 只覆盖当前 UI 连接范围。两者必须在
+// 导出对象里分别标注为 `raw_scope` / `analysis_scope`，防止用户误以为导出
+// 只含自己选的连接。
+//
 // 请求上界：一次点击 **4 个 GET**（2 波），不轮询、不重试；任一失败即中止且
 // **不产出任何文件**（禁止半份证据）。`request_status` 只有 `COMPLETE` 一个值，
 // 失败时根本不存在文件，故没有 `FAILED` / `INCOMPLETE`。
@@ -54,6 +59,36 @@ export interface FreshnessSummary {
   current: number;
   last_known: number;
   placeholder: number;
+  /**
+   * 缺陷 4：未知/缺失 `value_origin` 单独计数。
+   *
+   * 旧实现把它并入 `placeholder`（"无有效值"），等于静默把"来源不明"
+   * 断言成"确认无值"——统计失真。未知来源既不能证明来自本次采集，
+   * 也不能证明是占位值，只能诚实标为未分类。
+   */
+  unknown: number;
+}
+
+/**
+ * 原始证据范围（缺陷 3）：`GET /points/latest` 的**完整**响应，
+ * 不按连接筛选，因此可能包含其他连接/设备的点。纳秒级对账只认
+ * `points_raw_text` + `evidence_integrity`。
+ */
+export interface RawScope {
+  source: "GET /api/v1/points/latest";
+  includes: "ALL_ENDPOINTS";
+  row_count: number;
+  description: string;
+}
+
+/**
+ * 分析范围（缺陷 3）：`points[]` / `summary` 实际覆盖的连接范围。
+ * 与 {@link RawScope} 必须分别标注，防止用户以为导出只含所选连接。
+ */
+export interface AnalysisScope {
+  endpoint_id: string | null;
+  row_count: number;
+  description: string;
 }
 
 export interface CodeSummaryEntry {
@@ -69,6 +104,10 @@ export interface PointsExportDocument {
   taken_at_ns: string;
   mesa_version: string;
   scope: { endpoint_id: string | null; row_count: number };
+  /** 缺陷 3：原始证据范围（全部端点）与当前 UI 连接范围无关。 */
+  raw_scope: RawScope;
+  /** 缺陷 3：分析范围（按连接筛选后的结构化副本与统计）。 */
+  analysis_scope: AnalysisScope;
   history: { available: false; reason: string };
   sampling: {
     evidence_integrity: EvidenceIntegrity;
@@ -174,13 +213,15 @@ function readVersion(json: unknown): string {
 }
 
 function countFreshness(points: Array<Record<string, unknown>>): FreshnessSummary {
-  const out: FreshnessSummary = { current: 0, last_known: 0, placeholder: 0 };
+  const out: FreshnessSummary = { current: 0, last_known: 0, placeholder: 0, unknown: 0 };
   for (const p of points) {
     const origin = p.value_origin;
     if (origin === "CURRENT") out.current += 1;
     else if (origin === "LAST_KNOWN") out.last_known += 1;
-    // 未知/缺失来源按"无有效值"保守计入：无法证明它来自本次采集。
-    else out.placeholder += 1;
+    else if (origin === "PLACEHOLDER") out.placeholder += 1;
+    // 缺陷 4：未知/缺失来源**不得**并入 placeholder（那会把"来源不明"
+    // 静默断言成"确认无值"）。单独计为 unknown，保持可解释。
+    else out.unknown += 1;
   }
   return out;
 }
@@ -286,6 +327,23 @@ export async function buildPointsExport(
       ? allPoints
       : allPoints.filter((p) => p.endpoint_id === endpointId);
 
+  // 缺陷 3：证据范围与分析范围必须分开标注（两者可能不同）。
+  const rawScope: RawScope = {
+    source: "GET /api/v1/points/latest",
+    includes: "ALL_ENDPOINTS",
+    row_count: allPoints.length,
+    description:
+      "原始响应包含全部端点（可能含其他连接/设备），未按连接筛选；纳秒级对账以 points_raw_text 为权威",
+  };
+  const analysisScope: AnalysisScope = {
+    endpoint_id: endpointId,
+    row_count: points.length,
+    description:
+      endpointId === null
+        ? "分析覆盖全部连接（未按连接筛选）"
+        : `分析仅覆盖所选连接 ${endpointId}（按连接筛选后的结构化副本与统计）`,
+  };
+
   // 步骤 4：状态后。
   const afterRes = await getText(fetchImpl, "/api/v1/endpoints");
   const stateAfter = projectEndpointState(afterRes.json);
@@ -312,6 +370,8 @@ export async function buildPointsExport(
     taken_at_ns: takenAtNs,
     mesa_version: mesaVersion,
     scope: { endpoint_id: endpointId, row_count: points.length },
+    raw_scope: rawScope,
+    analysis_scope: analysisScope,
     history: {
       available: false,
       reason: "Snapshot 仅驻留当前最新值，不含时间序列",
@@ -354,6 +414,8 @@ export async function buildPointsExport(
   const rawFile = {
     schema: EXPORT_SCHEMA,
     taken_at_ns: takenAtNs,
+    // 原始证据文件也标注范围：单独打开它时同样不应误以为只含所选连接。
+    raw_scope: rawScope,
     evidence_integrity: evidence,
     points_raw_text: latestRes.text,
   };

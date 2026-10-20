@@ -3,11 +3,11 @@
 // - 共用 PointDetailDrawer（只多展示来源 Device，不复制 Drawer）；
 // - device/connection 进 URL（?device=&connection=），状态/搜索为页面内状态；
 // - 行内“打开设备”闭环回 /devices/:id/data?connection=。
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Alert, Button, Card, Input, Select, Space, Table, Tag } from "antd";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { formatAge, formatPointValue } from "../deviceModel";
-import { PointDetailDrawer } from "../components/PointDetailDrawer";
+import { PointDetailDrawer, pointIdentityOf, type PointIdentity } from "../components/PointDetailDrawer";
 import { QualityCodeBreakdown } from "../components/QualityCodeBreakdown";
 import type { DevicePointView } from "../workspace/useDeviceWorkspaceData";
 import { AgeCell, NameCell, SourceCell, StatusCell, ValueCell } from "../workspace/LiveCells";
@@ -21,7 +21,13 @@ export function GlobalDataPage() {
   const src = useLivePointsSource();
   const [status, setStatus] = useState<StatusFilter>("ALL");
   const [search, setSearch] = useState("");
-  const [openPoint, setOpenPoint] = useState<DevicePointView | null>(null);
+  // PR-D1 缺陷 1：只记定位标识；Drawer 渲染时从 src.allPoints（SSE 合并结果）
+  // 查找，SSE 改码/删点即时反映，不持有点击时的行快照。
+  const [openPoint, setOpenPoint] = useState<PointIdentity | null>(null);
+  const openPointRow = useCallback(
+    (p: DevicePointView) => setOpenPoint(pointIdentityOf(p)),
+    [],
+  );
 
   const deviceParam = params.get("device") ?? "ALL";
   const connectionParam = params.get("connection") ?? "ALL";
@@ -84,6 +90,28 @@ export function GlobalDataPage() {
     [src.allPoints, connectionParam],
   );
 
+  // 裁决 2：计数行与 Popover / 导出分析**共用同一个连接范围**（connectionParam）。
+  // 旧实现计数行用 src.counts（全局、无视连接筛选），与 Popover/导出不一致：
+  // 选单连接后计数仍显示全部连接的点，用户会以为筛选没生效。
+  // 注意：设备筛选只作用于表格，不参与统计范围——当 connection=ALL 时统计
+  // 会跨设备，必须由 scopeLabel 明示（见渲染处），不能让人误以为已按单连接过滤。
+  const scopedCounts = useMemo(() => {
+    let good = 0;
+    let bad = 0;
+    let stale = 0;
+    let unknown = 0;
+    for (const p of breakdownPoints) {
+      if (p.derived === "GOOD") good += 1;
+      else if (p.derived === "BAD") bad += 1;
+      else if (p.derived === "STALE") stale += 1;
+      else unknown += 1;
+    }
+    return { total: breakdownPoints.length, good, bad, stale, unknown };
+  }, [breakdownPoints]);
+
+  // 连接=ALL ⇒ 统计范围是全部连接（可能跨设备）；必须显式标注。
+  const scopeLabel = connectionParam === "ALL" ? "全部连接（跨设备）" : null;
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return src.allPoints.filter((p) => {
@@ -107,10 +135,21 @@ export function GlobalDataPage() {
     });
   }, [src.allPoints, deviceParam, connectionParam, status, search]);
 
+  // Drawer 的设备名从**连接映射**反查（不依赖已消失的行）；行还在时再回退
+  // 到行上的 deviceName，保证点被删除后 Drawer 仍有可读来源。
+  const openEndpoint =
+    openPoint === null ? null : (src.endpoints.find((e) => e.id === openPoint.endpoint_id) ?? null);
+  const drawerDeviceId = openEndpoint?.device_id ?? "";
+  const drawerPoint =
+    openPoint === null
+      ? null
+      : (src.allPoints.find(
+          (p) => p.endpoint_id === openPoint.endpoint_id && p.point_id === openPoint.point_id,
+        ) ?? null);
   const drawerDeviceName =
-    openPoint == null
-      ? ""
-      : (src.devices.find((d) => d.id === openPoint.deviceId)?.name ?? openPoint.deviceName ?? openPoint.deviceId);
+    (drawerDeviceId
+      ? (src.devices.find((d) => d.id === drawerDeviceId)?.name ?? drawerDeviceId)
+      : "") || drawerPoint?.deviceName || "";
 
   // 列定义 memo 化 + 固定布局（与设备页同口径，Layout shift 根治）。
   const columns = useMemo(
@@ -171,7 +210,7 @@ export function GlobalDataPage() {
         render: (_: unknown, r: DevicePointView) => (
           <Space onClick={(e) => e.stopPropagation()}>
             {/* M7 可访问性：详情是 Drawer 的键盘路径（行 onClick 仅鼠标可达）。 */}
-            <Button size="small" type="link" onClick={() => setOpenPoint(r)}>
+            <Button size="small" type="link" onClick={() => openPointRow(r)}>
               详情
             </Button>
             <Button
@@ -188,7 +227,7 @@ export function GlobalDataPage() {
         ),
       },
     ],
-    [setOpenPoint, nav],
+    [openPointRow, nav],
   );
 
   return (
@@ -228,8 +267,15 @@ export function GlobalDataPage() {
             points={breakdownPoints}
             scopeEndpointId={connectionParam === "ALL" ? null : connectionParam}
           >
-            全部 {src.counts.total} · GOOD {src.counts.good} · BAD {src.counts.bad} · STALE {src.counts.stale}
+            全部 {scopedCounts.total} · GOOD {scopedCounts.good} · BAD {scopedCounts.bad} · STALE{" "}
+            {scopedCounts.stale}
           </QualityCodeBreakdown>
+          {/* 裁决 2 特殊情况：连接=ALL 时统计跨设备，必须显式标注。 */}
+          {scopeLabel === null ? null : (
+            <span data-testid="data-scope-label" style={{ marginLeft: 8 }}>
+              {scopeLabel}
+            </span>
+          )}
         </div>
         <Table
           size="small"
@@ -237,26 +283,20 @@ export function GlobalDataPage() {
           tableLayout="fixed"
           dataSource={filtered}
           pagination={{ pageSize: 20 }}
-          onRow={(r) => ({ onClick: () => setOpenPoint(r as DevicePointView), style: { cursor: "pointer" } })}
+          onRow={(r) => ({ onClick: () => openPointRow(r as DevicePointView), style: { cursor: "pointer" } })}
           columns={columns}
           locale={{ emptyText: "暂无数据" }}
         />
       </Card>
 
       <PointDetailDrawer
-        deviceId={openPoint?.deviceId ?? ""}
+        deviceId={drawerDeviceId}
         deviceName={drawerDeviceName}
-        point={openPoint}
+        points={src.allPoints}
+        selected={openPoint}
         onClose={() => setOpenPoint(null)}
         onRenamed={(target, display_name) => {
           src.patchDisplayName(target.endpoint_id, target.point_key, display_name);
-          setOpenPoint((prev) =>
-            prev !== null &&
-            prev.endpoint_id === target.endpoint_id &&
-            (prev.key ?? prev.point_key) === target.point_key
-              ? { ...prev, display_name: display_name ?? undefined }
-              : prev,
-          );
         }}
       />
     </div>
