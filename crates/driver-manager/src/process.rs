@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -19,6 +20,95 @@ use crate::manifest::DiscoveredDriver;
 
 /// Shutdown 后等待进程退出的宽限；超时强制终止（§14.4）。
 pub const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+
+/// Core 进程内"当前认为存活的 Driver 子进程"计数（G7 §6.6 进程不变量）。
+///
+/// 口径：`DriverProcess::spawn` 成功后 +1；该进程被 `wait()` 回收（正常
+/// `terminate*` 路径）或 `DriverProcess` 被 drop（异常路径，`kill_on_drop`
+/// 已发出强杀）时 −1。它**不是**生命周期真值（真值在 attempt 表），只用于
+/// 测试与诊断断言"Stop 完成后没有残留子进程"。
+pub static LIVE_CHILDREN: AtomicUsize = AtomicUsize::new(0);
+
+/// 当前计数（诊断/测试用）。
+pub fn live_children() -> usize {
+    LIVE_CHILDREN.load(Ordering::Relaxed)
+}
+
+/// 该 pid 是否仍存活（G7 `attempt_reaper` 复核用；**不是**生命周期判据）。
+///
+/// Windows：`OpenProcess` 成功且退出码仍为 `STILL_ACTIVE`(259) 才算存活；
+/// 打不开（权限/已退出）一律按"不存活"处理——隔离态复核要求的是"能证明
+/// 已死"，而打不开的进程无法证明其活着，但同样无法证明其已死。因此这里
+/// 只在**能明确判定**时返回 true；调用方（reaper）另有有界重试。
+#[cfg(windows)]
+pub fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let h: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(h, &mut code);
+        CloseHandle(h);
+        // STILL_ACTIVE = 259（winnt.h）；成功查询且仍是该值即"仍在跑"
+        ok != 0 && code == 259
+    }
+}
+
+#[cfg(unix)]
+pub fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // 已退出但尚未被回收的僵尸进程也会让 kill(pid,0) 成功；reaper 侧用
+    // 有界重试覆盖"tokio 孤儿队列异步回收"的时间差。
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn process_alive(_pid: u32) -> bool {
+    false
+}
+
+/// 强杀指定 pid（G7 reaper 只对"任务已死、条目已隔离"的残留 pid 调用）。
+/// 返回是否成功发出终止请求。
+#[cfg(windows)]
+pub fn kill_pid(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let h: HANDLE = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let ok = TerminateProcess(h, 1);
+        CloseHandle(h);
+        ok != 0
+    }
+}
+
+#[cfg(unix)]
+pub fn kill_pid(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) == 0 }
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn kill_pid(_pid: u32) -> bool {
+    false
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpawnError {
@@ -47,6 +137,8 @@ pub struct DriverProcess {
     /// 端口租约：与子进程生命周期绑定，drop 时释放。
     /// 禁止移除——移除即重开 Core 内并发 spawn 抢同一端口的 TOCTOU（P1-A）。
     _port_lease: PortLease,
+    /// 是否仍计入 [`LIVE_CHILDREN`]（保证 +1/−1 恰好配对）。
+    counted: bool,
 }
 
 impl DriverProcess {
@@ -95,6 +187,7 @@ impl DriverProcess {
 
         // NOTE: 不做 TCP 探活——SDK 只 accept 一条管理连接，任何探测性连接
         // 都会抢占该名额导致握手永远失败。端口未就绪由 Session::connect_retry 处理。
+        LIVE_CHILDREN.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             port,
             pid,
@@ -103,7 +196,16 @@ impl DriverProcess {
             stdin: Some(stdin),
             _job: job,
             _port_lease: port_lease,
+            counted: true,
         })
+    }
+
+    /// 进程已被 `wait()` 回收：退出 [`LIVE_CHILDREN`] 计数（幂等）。
+    fn note_reaped(&mut self) {
+        if self.counted {
+            self.counted = false;
+            LIVE_CHILDREN.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// 兜底强杀（正常路径应先经 Session 发送 Shutdown 消息）。
@@ -127,6 +229,7 @@ impl DriverProcess {
                 let _ = self.child.wait().await;
             }
         }
+        self.note_reaped();
     }
 
     /// 正常 Shutdown 收尾（P0-2 Final）：已 post Shutdown RPC 后调用。
@@ -142,7 +245,10 @@ impl DriverProcess {
     /// RPC 与 stdin pipe 之间无 happens-before，正常路径绝不能先关 stdin。
     pub async fn terminate_after_shutdown(&mut self) {
         match tokio::time::timeout(TERMINATE_GRACE, self.child.wait()).await {
-            Ok(_) => return,
+            Ok(_) => {
+                self.note_reaped();
+                return;
+            }
             Err(_) => {
                 tracing::warn!(
                     pid = self.pid,
@@ -151,6 +257,14 @@ impl DriverProcess {
             }
         }
         self.terminate().await;
+    }
+}
+
+/// 异常路径兜底：`DriverProcess` 在展开（panic）中被 drop 时，`kill_on_drop`
+/// 已发出强杀，这里同步退出计数，保证 [`LIVE_CHILDREN`] 不会因为 panic 泄漏。
+impl Drop for DriverProcess {
+    fn drop(&mut self) {
+        self.note_reaped();
     }
 }
 

@@ -28,6 +28,8 @@ pub mod certificates;
 pub(crate) mod connection_check;
 /// I-2 只读管理路由（定义目录 / 权威身份预览）：零厂商语义、只按 `ErrorKind` 映射。
 pub(crate) mod driver_query;
+/// G7：生命周期门（Start 两阶段提交 / Stop 合流 / 停止判据观察器）。
+pub mod lifecycle;
 pub mod runtime;
 use certificates::CertStore;
 
@@ -39,6 +41,8 @@ pub struct AppState {
     pub snapshot: Arc<Snapshot>,
     pub manager: Arc<MesaManager>,
     pub store: Arc<ConfigStore>,
+    /// G7：生命周期门（唯一排序器；不持有生命周期真值）。
+    pub lifecycle: Arc<lifecycle::LifecycleGate>,
     /// 驱动目录（供 rescan 使用）。
     pub drivers_dir: String,
     pub start_time: Instant,
@@ -139,6 +143,10 @@ impl AppState {
             .map_err(|e| format!("own 证书初始化失败: {e}"))?;
         Ok(Arc::new(Self {
             snapshot,
+            lifecycle: Arc::new(lifecycle::LifecycleGate::new(
+                Arc::clone(&store),
+                Arc::clone(&manager),
+            )),
             manager,
             store,
             drivers_dir,
@@ -178,6 +186,10 @@ impl AppState {
             let cert_store = Arc::new(CertStore::new(cert_dir_c));
             Arc::new(Self {
                 snapshot,
+                lifecycle: Arc::new(lifecycle::LifecycleGate::new(
+                    Arc::clone(&store_c),
+                    Arc::clone(&manager_c),
+                )),
                 manager: manager_c,
                 store: store_c,
                 drivers_dir: drivers_dir_c,
@@ -2121,8 +2133,12 @@ async fn delete_endpoint(
     }
     match state.store.delete_endpoint(&id) {
         Ok(true) => {
-            // 清理 Snapshot 中的残留状态（latest/status）
-            state.snapshot.remove_endpoint(&id);
+            // 清理 Snapshot 中的残留状态（latest/status）。
+            // G7：必须传 `gen_floor`（该 id 已发放的最大代次）立墓碑，否则旧
+            // attempt 的迟到状态写入会让已删除端点"复活"（§6.5）。
+            state
+                .snapshot
+                .remove_endpoint(&id, state.manager.gen_floor(&id));
             (StatusCode::OK, Json(serde_json::json!({ "deleted": id })))
         }
         Ok(false) => (
@@ -2133,16 +2149,24 @@ async fn delete_endpoint(
     }
 }
 
+/// 启动 Endpoint（G7 两阶段提交）。
+///
+/// 阶段划分（设计 §1.3 修订后）：`admit`（同步，票据）→ 构造（长 await）→
+/// `commit`（同步单临界区：代次比对 + start + 置真）→ 应答。
+///
+/// 为什么不再先查 `is_running`：它既不能表达"Stop 已受理"，也不能表达"有 Start
+/// 在途"，是 W1/W2/W3 的共同根因（§1.2）。冲突判定改由门 + attempt 表给出：
+/// - Stop 在构造期被受理 ⇒ 409 `SUPERSEDED_BY_STOP`（契约行 1）；
+/// - 旧 attempt 仍在拆解 ⇒ 409 `STOP_IN_PROGRESS`（契约行 2，不排队）；
+/// - 异常终止待复核 ⇒ 409 `ATTEMPT_FAILED_UNKNOWN`；
+/// - 真的已在运行 ⇒ 409 `CONFLICT`（文案不变）。
 async fn start_endpoint(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if state.manager.is_running(&id) {
-        return (
-            StatusCode::CONFLICT,
-            Json(json_error("CONFLICT", "endpoint 已在运行")),
-        );
-    }
+    // 准入：同步登记票据（不查运行态、不碰 DB、不起进程）。票据 RAII 释放，
+    // 因此构造期被取消（客户端断开）不会留下任何副作用。
+    let ticket = state.lifecycle.admit_start(&id);
     // C1 P0：运行期 Endpoint 只能经共享构造路径生成（REST Start、
     // Bootstrap start、Mesad 开机恢复三者同源），否则重启恢复会把
     // Secret marker 当密码交给 Driver。
@@ -2150,35 +2174,51 @@ async fn start_endpoint(
         Ok(cfg) => cfg,
         Err(e) => return (e.status, e.to_json()),
     };
-    match state.manager.start_endpoint(cfg) {
-        Ok(()) => {
-            let _ = state.store.set_desired_running(&id, true);
-            (StatusCode::OK, Json(serde_json::json!({ "started": id })))
-        }
-        Err(msg) => (
-            StatusCode::BAD_REQUEST,
-            Json(json_error("START_FAILED", &msg)),
-        ),
+    match state.lifecycle.commit_start(&ticket, cfg) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "started": id }))),
+        Err(e) => e.to_response(),
     }
 }
 
+/// 停止 Endpoint（G7 合流 + 意图前移）。
+///
+/// 语义（§5.2 六行）：
+/// - 第一次 Stop：受理即触发**一次** teardown；
+/// - teardown 中再次 Stop：**合流**等待同一次结论，不重复 teardown；
+/// - 成功 ⇒ 两个请求都 200 `was_running=true`；失败 ⇒ 两个都拿到同一次明确失败；
+/// - 完成后再 Stop ⇒ 200 `was_running=false`（幂等语义冻结）；
+/// - 客户端断开/超时 ⇒ 只丢应答，不取消后台停止。
+///
+/// `desired_running=false` 在受理时（同步临界区）就落到内存意图，并在
+/// `spawn_blocking` 中**与 teardown 并行**落盘（S1：DB busy 不阻止停止）。
+/// 落盘失败 ⇒ 即使 teardown 成功也返回 500 `STOP_INTENT_NOT_PERSISTED`
+///（§6.10.3：停止意图没落盘就返回成功，重启后会意外自动拉起）。
 async fn stop_endpoint(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !state.manager.is_running(&id) {
-        // 即使未运行也更新期望态，保持幂等
-        let _ = state.store.set_desired_running(&id, false);
+    let admission = state.lifecycle.admit_stop(&id);
+    let (stop_res, persist_res) = tokio::join!(admission.handle.await_result(), admission.persist);
+    let persist_failed = match persist_res {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e),
+        // blocking 任务本身 panic/取消：同样按"意图未持久化"处理（fail-closed）。
+        Err(join) => Some(format!("persist task failed: {join}")),
+    };
+    if let Some(e) = persist_failed {
+        tracing::error!(
+            endpoint = %id, error = %e,
+            "STOP intent not persisted; response is explicit failure (500)"
+        );
         return (
-            StatusCode::OK,
-            Json(serde_json::json!({ "stopped": id, "was_running": false })),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(
+                "STOP_INTENT_NOT_PERSISTED",
+                lifecycle::STOP_INTENT_NOT_PERSISTED_MESSAGE,
+            )),
         );
     }
-    // P0-3：teardown 异常（drain fatal/timeout）是 500 显式错误，
-    // 不再"Detach 了也返回成功"。任务已结束（await 过），期望态照常落 false。
-    let res = state.manager.stop_endpoint(&id).await;
-    let _ = state.store.set_desired_running(&id, false);
-    match res {
+    match stop_res {
         Ok(was) => (
             StatusCode::OK,
             Json(serde_json::json!({ "stopped": id, "was_running": was })),

@@ -137,7 +137,39 @@ async fn main() {
     if stored_eps.is_empty() {
         tracing::warn!("no endpoints in store; create one via REST POST /api/v1/endpoints");
     }
+    // G7 S2（失败关闭）：上次进程有"停止意图未持久化"的围栏记录 ⇒ 这些端点
+    // **一律不自动恢复**。场景：Stop 已执行、但 `desired_running=false` 没写进
+    // DB（DB busy/失败），随后进程崩溃 ⇒ DB 仍是 true。若照常恢复，就会把用户
+    // 明确要停的机床端点重新拉起来（危险动作）。围栏是持久化事实，因此跨崩溃有效。
+    //
+    // 读失败同样 fail-closed：把"读不懂围栏"当成"可能有围栏"，宁可少恢复，
+    // 也不误拉起。人工确认方式：显式 POST /start（成功后门会清除围栏）。
+    let fenced: Vec<String> = match store.stop_intent_unpersisted() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "停止意图围栏读取失败：按 fail-closed 跳过本次全部自动恢复，需人工核验后显式启动"
+            );
+            stored_eps.iter().map(|r| r.id.clone()).collect()
+        }
+    };
     for rec in &stored_eps {
+        if fenced.iter().any(|f| f == &rec.id) {
+            if rec.desired_running {
+                tracing::error!(
+                    endpoint = %rec.id,
+                    "SKIP auto-restore: 该端点上次停止意图未能持久化（围栏命中）；\
+                     禁止自动拉起，需人工核验后显式 POST /start 确认"
+                );
+            } else {
+                // 意图已经是 false：风险消失，围栏可以安全清除（否则会永久累积）。
+                if let Err(e) = store.clear_stop_intent_unpersisted(&rec.id) {
+                    tracing::warn!(endpoint = %rec.id, error = %e, "清除停止意图围栏失败");
+                }
+            }
+            continue;
+        }
         if !rec.desired_running {
             continue;
         }

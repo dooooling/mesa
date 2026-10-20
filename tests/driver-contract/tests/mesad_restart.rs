@@ -286,3 +286,174 @@ async fn mesad_process_restart_recovers_events_and_history() {
     assert!(!repo_root().join("master.key").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// G7 S2（失败关闭）：**停止意图未持久化 + 崩溃 ⇒ 重启不得自动拉起该端点**。
+///
+/// 场景复现（与生产事故链逐环对应）：
+/// 1. 端点正常运行，DB 里 `desired_running=true`；
+/// 2. Stop 已受理并**真正停掉**，但 `desired_running=false` 落盘失败
+///    （DB busy/磁盘错误）⇒ DB 仍是 true；
+/// 3. 进程在此刻崩溃（`kill`，非优雅退出）。
+///
+/// 若无围栏：重启时开机恢复读到 `desired_running=true` ⇒ 把用户**明确要停**的
+/// 机床端点重新拉起来（危险动作）。围栏（`meta.stop_intent_unpersisted`）是
+/// 持久化事实，因此跨崩溃有效：命中即跳过自动恢复，并要求人工确认
+/// （显式 `POST /start` 成功后才清除围栏）。
+///
+/// 判别力：同一库里另有一个**未命中围栏**的 `desired_running=true` 端点作为
+/// 对照组——它必须被正常恢复。否则"没被拉起"可能只是恢复逻辑整体失效。
+#[tokio::test]
+async fn stop_intent_fence_blocks_auto_restore_after_crash() {
+    common::init_log();
+    let dir = std::env::temp_dir().join(format!(
+        "mesa-g7-fence-{}-{}",
+        std::process::id(),
+        mesa_core_types::now_unix_ns()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _staged = common::staged_drivers_with_test_driver();
+    let db = dir.join("mesa.db");
+
+    // ---- Phase 1：两个端点都启动（desired_running 落盘 true）----
+    let port1 = free_port().await;
+    let mut mesad1 = spawn_mesad(&dir, port1, _staged.path());
+    wait_ready(port1).await;
+    let (st, _) = http(
+        port1,
+        "POST",
+        "/api/v1/devices",
+        Some(r#"{"id":"dfence","name":"Fence"}"#),
+    )
+    .await;
+    assert_eq!(st, 201, "create device");
+    for ep in ["ep-fenced", "ep-control"] {
+        let body = format!(
+            r#"{{"id":"{ep}","name":"{ep}","device_id":"dfence","driver_id":"test-driver","connection":{{}}}}"#
+        );
+        let (st, v) = http(port1, "POST", "/api/v1/endpoints", Some(&body)).await;
+        assert!(st == 200 || st == 201, "create endpoint {ep}: {v}");
+        // 必须有采集任务：无任务的 test-driver 会立即报 Stopped（端点进 RECONNECTING）。
+        let tasks = r#"{"tasks":[{"id":"t1","schedule":{"mode":"poll","interval_ms":50},"binding":{"kind":"mesa.resources.v1","config":{"selections":[{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]}}}]}"#;
+        let (st, v) = http(port1, "PUT", &format!("/api/v1/tasks/{ep}"), Some(tasks)).await;
+        assert_eq!(st, 200, "put tasks {ep}: {v}");
+        let (st, v) = http(port1, "POST", &format!("/api/v1/endpoints/{ep}/start"), None).await;
+        assert_eq!(st, 200, "start {ep}: {v}");
+    }
+    for ep in ["ep-fenced", "ep-control"] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let (st, v) = http(port1, "GET", &format!("/api/v1/endpoints/{ep}/state"), None).await;
+            assert_eq!(st, 200);
+            if v["state"] == "RUNNING" {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{ep} not running: {v}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    // 崩溃（非优雅）：落盘即事实。
+    mesad1.kill().await.unwrap();
+    let _ = mesad1.wait().await;
+
+    // ---- 模拟"停止意图未持久化"的崩溃现场 ----
+    // 1) 断言前置：DB 里两个端点都还是 desired_running=true（若这里是 false，
+    //    本用例就退化成空断言）。
+    {
+        let store = mesa_config_store::ConfigStore::open(&db).unwrap();
+        for ep in ["ep-fenced", "ep-control"] {
+            assert!(
+                store.get_endpoint(ep).unwrap().unwrap().desired_running,
+                "前置：{ep} 的 desired_running 必须仍为 true"
+            );
+        }
+        assert!(
+            store.stop_intent_unpersisted().unwrap().is_empty(),
+            "前置：围栏必须为空"
+        );
+    }
+    // 2) 直接写入围栏（等价于 Stop 落盘失败时门写入的那条持久化事实）。
+    //    用裸 SQL 而不是 store API：本用例要能在**修复前**的代码上编译并失败。
+    {
+        let raw = rusqlite::Connection::open(&db).unwrap();
+        raw.execute(
+            "INSERT INTO meta(key,value) VALUES('stop_intent_unpersisted',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [r#"["ep-fenced"]"#],
+        )
+        .unwrap();
+    }
+
+    // ---- Phase 2：同目录重启 ----
+    let port2 = free_port().await;
+    let mut mesad2 = spawn_mesad(&dir, port2, _staged.path());
+    wait_ready(port2).await;
+
+    // 对照组：未命中围栏的端点必须被正常恢复（证明恢复逻辑本身有效）。
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (st, v) = http(port2, "GET", "/api/v1/endpoints/ep-control/state", None).await;
+        assert_eq!(st, 200);
+        if v["state"] == "RUNNING" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "对照组 ep-control 必须被自动恢复: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // 命中围栏：5s 内**任何时刻**都不得出现 RUNNING（不得被自动拉起）。
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < until {
+        let (st, v) = http(port2, "GET", "/api/v1/endpoints/ep-fenced/state", None).await;
+        assert_eq!(st, 200, "{v}");
+        assert_ne!(
+            v["state"], "RUNNING",
+            "S2 失败：命中围栏的端点被自动拉起了（用户明确要停的端点）: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // 持久化意图仍是 true（残余风险本身没变），只是被围栏挡住了。
+    {
+        let store = mesa_config_store::ConfigStore::open(&db).unwrap();
+        assert!(
+            store.get_endpoint("ep-fenced").unwrap().unwrap().desired_running,
+            "围栏不改变 DB 里的旧值（它只阻止自动恢复）"
+        );
+        assert_eq!(
+            store.stop_intent_unpersisted().unwrap(),
+            vec!["ep-fenced".to_string()],
+            "围栏必须仍在（等待人工确认）"
+        );
+    }
+
+    // ---- 人工确认：显式 POST /start 成功，并清除围栏 ----
+    let (st, v) = http(port2, "POST", "/api/v1/endpoints/ep-fenced/start", None).await;
+    assert_eq!(st, 200, "人工确认后必须允许显式启动: {v}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (st, v) = http(port2, "GET", "/api/v1/endpoints/ep-fenced/state", None).await;
+        assert_eq!(st, 200);
+        if v["state"] == "RUNNING" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "显式启动后必须进入 RUNNING: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    {
+        let store = mesa_config_store::ConfigStore::open(&db).unwrap();
+        assert!(
+            store.stop_intent_unpersisted().unwrap().is_empty(),
+            "显式启动成功（人工确认）后围栏必须清除"
+        );
+    }
+
+    mesad2.kill().await.unwrap();
+    let _ = mesad2.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

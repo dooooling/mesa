@@ -8,6 +8,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "test-hooks")]
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 #[allow(unused_imports)]
@@ -293,6 +295,32 @@ fn aead_decrypt(ciphertext: &[u8], nonce: &[u8], key: &[u8; 32]) -> Result<Vec<u
 /// point_registry 行（诊断用）：key/id/类型/墓碑/来源标签/展示名。
 pub type RegistryRow = (String, u32, String, bool, Option<String>, Option<String>);
 
+/// 运行意图（`desired_running`）落盘故障注入（`test-hooks` feature 门控）。
+///
+/// 为什么需要它：G7 生命周期修复里有两条**必须可判定**的语义，都依赖"落盘失败
+/// / 落盘很慢"这一外部条件：
+/// 1. 落盘失败 ⇒ Stop 返回 500 `STOP_INTENT_NOT_PERSISTED`（禁止静默成功）；
+/// 2. 落盘慢（DB busy）⇒ **不得**阻塞实际 teardown（停止优先级高于持久化）。
+/// 真实磁盘故障/长事务无法在 CI 上确定性构造，故与 `mesa-event-store` 的
+/// `StoreFaults` 同口径提供注入点：默认构建（无 feature）零检查、零字段。
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Default)]
+pub struct DesiredWriteFaults {
+    /// true ⇒ `set_desired_running` 立即返回 SQLITE_FULL 风格错误（整条 UPDATE 不执行）。
+    pub fail: std::sync::atomic::AtomicBool,
+    /// >0 ⇒ `set_desired_running` 在真正写库前先阻塞该毫秒数（模拟 DB busy）。
+    pub delay_ms: std::sync::atomic::AtomicU64,
+}
+
+/// 同一 DB 中 `meta` 表里保存"停止意图未持久化"围栏的键。
+///
+/// 语义（S2 失败关闭）：该键存在某个 endpoint_id ⇒ 上次进程**未能**把
+/// `desired_running=false` 落盘，而内存里已经按"已停止"处理过。此时若进程崩溃，
+/// 旧的 `desired_running=true` 仍会让开机恢复把用户明确要停的端点拉起来。
+/// 因此开机恢复必须跳过这些端点，并要求人工确认（显式 POST /start）。
+/// 放在既有 `meta` 表（键值对）里，**不新增表、不新增列、不改 schema 版本**。
+const STOP_INTENT_FENCE_KEY: &str = "stop_intent_unpersisted";
+
 pub struct ConfigStore {
     conn: Mutex<Connection>,
     /// master.key 目录：文件库 = DB 父目录（P0-1），内存库 = None（固定测试 key）。
@@ -300,6 +328,9 @@ pub struct ConfigStore {
     /// master key 实例级缓存（P0-1 Final）：`get_or_try_init` 串行化并发首次
     /// 访问；各实例独立，in-memory/多目录文件库同进程共存不串 key。
     master_key: OnceLock<[u8; 32]>,
+    /// 运行意图落盘故障注入（仅 `test-hooks` 构建存在）。
+    #[cfg(feature = "test-hooks")]
+    desired_faults: Arc<DesiredWriteFaults>,
 }
 
 impl ConfigStore {
@@ -324,6 +355,8 @@ impl ConfigStore {
             conn: Mutex::new(conn),
             key_dir,
             master_key: OnceLock::new(),
+            #[cfg(feature = "test-hooks")]
+            desired_faults: Arc::new(DesiredWriteFaults::default()),
         };
         s.migrate()?;
         Ok(s)
@@ -336,9 +369,17 @@ impl ConfigStore {
             conn: Mutex::new(conn),
             key_dir: None,
             master_key: OnceLock::new(),
+            #[cfg(feature = "test-hooks")]
+            desired_faults: Arc::new(DesiredWriteFaults::default()),
         };
         s.migrate()?;
         Ok(s)
+    }
+
+    /// 运行意图落盘故障注入句柄（仅 `test-hooks` 构建可见）。
+    #[cfg(feature = "test-hooks")]
+    pub fn desired_write_faults(&self) -> Arc<DesiredWriteFaults> {
+        Arc::clone(&self.desired_faults)
     }
 
     /// 本实例的 master key（P0-1 Final：实例级缓存 + 目录锚定 DB，跨实例
@@ -1088,9 +1129,15 @@ impl ConfigStore {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         // driver_id 创建后不可变：UPDATE 永不触碰 driver_id（API 层已拒绝变更）
+        //
+        // G7 P0-2：**本函数永不写运行意图**（`desired_running` 不在列清单里）。
+        // 理由：core-api 的 PUT 是"读 Endpoint → 可能很长的 Descriptor 异步校验
+        // → 把读到的旧对象整体写回"；若本 UPDATE 带该列，一次普通改名/改连接
+        // 就能把 Stop 刚写入的 `false` 覆盖回**读时的旧值 true**，且完全绕过
+        // 生命周期门。意图只能由 `set_desired_running`（唯一写点）写入。
         let n = tx.execute(
-            "UPDATE endpoints SET device_id=?1, name=?2, connection_json=?3, desired_running=?4, updated_at_ns=?5 WHERE id=?6",
-            params![rec.device_id, rec.name, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns, rec.id],
+            "UPDATE endpoints SET device_id=?1, name=?2, connection_json=?3, updated_at_ns=?4 WHERE id=?5",
+            params![rec.device_id, rec.name, rec.connection_json, rec.updated_at_ns, rec.id],
         )?;
         if n == 0 {
             return Ok(false);
@@ -1162,9 +1209,12 @@ impl ConfigStore {
         }
         let conn = self.conn.lock().unwrap();
         // driver_id 创建后不可变：UPDATE 永不触碰 driver_id
+        //
+        // G7 P0-2：与 `update_endpoint_with_secrets` 同语义——**永不写运行意图**。
+        // 本函数当前无生产调用方，但保留公开 API 时必须同语义，否则将来复用即复发。
         let n = conn.execute(
-            "UPDATE endpoints SET device_id=?1, name=?2, connection_json=?3, desired_running=?4, updated_at_ns=?5 WHERE id=?6",
-            params![rec.device_id, rec.name, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns, rec.id],
+            "UPDATE endpoints SET device_id=?1, name=?2, connection_json=?3, updated_at_ns=?4 WHERE id=?5",
+            params![rec.device_id, rec.name, rec.connection_json, rec.updated_at_ns, rec.id],
         )?;
         Ok(n > 0)
     }
@@ -1175,17 +1225,115 @@ impl ConfigStore {
         Ok(n > 0)
     }
 
+    /// **运行意图（`desired_running`）的唯一写点**（G7 §6.10）。
+    ///
+    /// 只有生命周期门（core-api `LifecycleGate`）允许调用它：Start 提交成功后写
+    /// true、Stop 受理时写 false、Bootstrap 启动成功后写 true。任何"整体回写
+    /// EndpointRecord"的路径都不得触碰该列（见上面两条 UPDATE 的注释）。
     pub fn set_desired_running(
         &self,
         endpoint_id: &str,
         running: bool,
     ) -> Result<bool, StoreError> {
+        #[cfg(feature = "test-hooks")]
+        {
+            // DB busy 模拟：先阻塞（模拟等锁），再决定是否注入失败。
+            let delay = self
+                .desired_faults
+                .delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            if self
+                .desired_faults
+                .fail
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(13),
+                    Some("disk full (injected desired_running fault)".into()),
+                )));
+            }
+        }
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "UPDATE endpoints SET desired_running=?1, updated_at_ns=?2 WHERE id=?3",
             params![running as i32, Self::now_ns(), endpoint_id],
         )?;
         Ok(n > 0)
+    }
+
+    // ---- 停止意图围栏（G7 S2：异常重启的失败关闭）----
+    //
+    // 场景：Stop 已受理（内存里按"已停止"处理、teardown 照做），但
+    // `desired_running=false` 落盘失败 ⇒ DB 仍是 true。此时若进程崩溃，开机恢复
+    // 会把这个**用户明确要停**的端点重新拉起来（对机床是危险动作）。
+    //
+    // 对策：落盘失败时在 `meta` 里记一条围栏（endpoint_id 列表）；开机恢复前
+    // 读取它，命中的端点**一律不自动恢复**，只记 error 并要求人工确认
+    // （显式 POST /start，成功后清除围栏）。围栏是持久化事实，因此"崩溃 + 重启
+    // 不会自动拉起"可被测试证明。
+
+    /// 记录"该 endpoint 的停止意图未持久化"。幂等。
+    pub fn mark_stop_intent_unpersisted(&self, endpoint_id: &str) -> Result<(), StoreError> {
+        let mut ids = self.stop_intent_unpersisted()?;
+        if ids.iter().any(|i| i == endpoint_id) {
+            return Ok(());
+        }
+        ids.push(endpoint_id.to_string());
+        ids.sort();
+        let json = serde_json::to_string(&ids).map_err(StoreError::Json)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![STOP_INTENT_FENCE_KEY, json],
+        )?;
+        Ok(())
+    }
+
+    /// 清除围栏（意图已成功落盘 / 人工确认后的显式启动）。返回是否确有该条。
+    pub fn clear_stop_intent_unpersisted(&self, endpoint_id: &str) -> Result<bool, StoreError> {
+        let mut ids = self.stop_intent_unpersisted()?;
+        let before = ids.len();
+        ids.retain(|i| i != endpoint_id);
+        if ids.len() == before {
+            return Ok(false);
+        }
+        let json = serde_json::to_string(&ids).map_err(StoreError::Json)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![STOP_INTENT_FENCE_KEY, json],
+        )?;
+        Ok(true)
+    }
+
+    /// 读出全部"停止意图未持久化"的 endpoint_id（已排序）。
+    ///
+    /// 解析失败返回错误而不是当作空集合：调用方（开机恢复）必须 fail-closed，
+    /// 把"读不懂围栏"当成"可能有围栏"处理，否则一个损坏的 meta 值就能绕过保护。
+    pub fn stop_intent_unpersisted(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key=?1",
+                params![STOP_INTENT_FENCE_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        drop(conn);
+        match raw {
+            None => Ok(Vec::new()),
+            Some(s) => {
+                let mut v: Vec<String> = serde_json::from_str(&s).map_err(StoreError::Json)?;
+                v.sort();
+                v.dedup();
+                Ok(v)
+            }
+        }
     }
 
     // ---- Bootstrap（M5 device-bootstrap 原子事务）----
@@ -3725,5 +3873,92 @@ mod tests {
             s.bootstrap_idempotency_delete_by_device("ghost").unwrap(),
             0
         );
+    }
+
+    // ---- G7 §6.10：`desired_running` 写路径拆分 ----
+
+    /// P0-2 主门：**用旧对象回写不得覆盖运行意图**。
+    ///
+    /// 场景（现场可达）：读出 `rec`（desired=true）→ Stop 写入 false →
+    /// 用旧 `rec` 调 `update_endpoint_with_secrets`（改名/改连接）。
+    /// 修复前该 UPDATE 带 `desired_running=?4` ⇒ DB 被写回 true（红）；
+    /// 修复后 SQL 层物理忽略该列 ⇒ 仍为 false（绿）。
+    #[test]
+    fn stale_endpoint_record_writeback_keeps_desired_running() {
+        let s = mem();
+        s.create_device(&dev("d1")).unwrap();
+        let mut rec = ep("e1", "d1");
+        rec.desired_running = true;
+        s.create_endpoint(&rec).unwrap();
+        assert!(s.get_endpoint("e1").unwrap().unwrap().desired_running);
+
+        // Stop 意图（唯一写点）。
+        assert!(s.set_desired_running("e1", false).unwrap());
+        assert!(!s.get_endpoint("e1").unwrap().unwrap().desired_running);
+
+        // 旧对象回写（读时的 desired=true）。
+        rec.name = "改名后".into();
+        assert!(s.update_endpoint_with_secrets(&rec, &[], &[]).unwrap());
+        let after = s.get_endpoint("e1").unwrap().unwrap();
+        assert_eq!(after.name, "改名后", "普通字段必须照常更新");
+        assert!(
+            !after.desired_running,
+            "用旧对象回写不得把 Stop 写入的 false 覆盖回 true（P0-2）"
+        );
+
+        // `update_endpoint` 同语义（公开 API，防止将来复用即复发）。
+        rec.desired_running = true;
+        assert!(s.update_endpoint(&rec).unwrap());
+        assert!(
+            !s.get_endpoint("e1").unwrap().unwrap().desired_running,
+            "update_endpoint 同样永不写运行意图"
+        );
+    }
+
+    /// S2 围栏：写入/读取/清除 + 幂等 + 排序。
+    #[test]
+    fn stop_intent_fence_roundtrip() {
+        let s = mem();
+        assert!(s.stop_intent_unpersisted().unwrap().is_empty());
+        s.mark_stop_intent_unpersisted("ep-b").unwrap();
+        s.mark_stop_intent_unpersisted("ep-a").unwrap();
+        s.mark_stop_intent_unpersisted("ep-b").unwrap(); // 幂等
+        assert_eq!(
+            s.stop_intent_unpersisted().unwrap(),
+            vec!["ep-a".to_string(), "ep-b".to_string()]
+        );
+        assert!(s.clear_stop_intent_unpersisted("ep-a").unwrap());
+        assert!(!s.clear_stop_intent_unpersisted("ep-a").unwrap());
+        assert_eq!(
+            s.stop_intent_unpersisted().unwrap(),
+            vec!["ep-b".to_string()]
+        );
+        s.clear_stop_intent_unpersisted("ep-b").unwrap();
+        assert!(s.stop_intent_unpersisted().unwrap().is_empty());
+    }
+
+    /// 围栏是**持久化**事实：新实例（等价进程重启）仍能读到。
+    #[test]
+    fn stop_intent_fence_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "mesa-fence-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mesa.db");
+        {
+            let s = ConfigStore::open(&db).unwrap();
+            s.mark_stop_intent_unpersisted("ep-x").unwrap();
+        }
+        {
+            let s = ConfigStore::open(&db).unwrap();
+            assert_eq!(
+                s.stop_intent_unpersisted().unwrap(),
+                vec!["ep-x".to_string()],
+                "围栏必须跨进程（重开库）仍然有效"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

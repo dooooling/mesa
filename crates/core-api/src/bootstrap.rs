@@ -107,21 +107,23 @@ fn idempotency_key(headers: &HeaderMap, body: &BootstrapRequest) -> Option<Strin
 /// 再实现一遍——它与 REST Start、Mesad 开机恢复共用
 /// [`super::runtime::build_runtime_endpoint`]，否则三条入口的 Secret 语义会
 /// 再次分叉。
+///
+/// G7 §4-③：bootstrap 的"建档即启动"与 REST Start 同构，**必须一并接入门**，
+/// 否则它同样能覆盖并发的 Stop（W1）。因此这里走 `admit_start` →
+/// `build_runtime_endpoint` → `commit_start` 同一条两阶段路径：
+/// - 构造期间 Stop 被受理 ⇒ `SUPERSEDED_BY_STOP`（启动失败，走补偿删除）；
+/// - 旧 attempt 在拆解 ⇒ `STOP_IN_PROGRESS`（不排队）；
+/// - `desired_running=true` 只在 commit 成功后由门写入（§6.10.2 第 6 条），
+///   建档事务里一律写 false（"刚建好 = 未运行"，第 5 条）。
 async fn start_created_endpoint(state: &AppState, endpoint_id: &str) -> Result<(), String> {
+    let ticket = state.lifecycle.admit_start(endpoint_id);
     let cfg = super::runtime::build_runtime_endpoint(state, endpoint_id)
         .await
         .map_err(|e| e.to_string())?;
-    state.manager.start_endpoint(cfg)?;
-    // 期望态落盘失败不翻转 start 成功（驱动已在运行，DB 期望态下次对账可纠）；
-    // 但必须记日志，否则重启恢复时该 endpoint 不会被自动拉起，静默丢运行态。
-    if let Err(e) = state.store.set_desired_running(endpoint_id, true) {
-        tracing::error!(
-            endpoint_id = %endpoint_id,
-            error = %e,
-            "device-bootstrap start 成功但期望态落盘失败，重启后可能不自动恢复"
-        );
-    }
-    Ok(())
+    state
+        .lifecycle
+        .commit_start(&ticket, cfg)
+        .map_err(|e| format!("{}: {}", e.code, e.message))
 }
 
 pub async fn device_bootstrap(
@@ -294,7 +296,11 @@ async fn device_bootstrap_inner(
         device_id: body.device.id.clone(),
         driver_id: body.endpoint.driver_id.clone(),
         connection_json: serde_json::to_string(&conn_val).unwrap(),
-        desired_running: body.start.unwrap_or(true),
+        // G7 §6.10.2 第 5 条：建档一律写 `false`（刚建好 = 未运行）。
+        // `start=true` 的启动意图由 `commit_start` 在**启动成功后**写入，
+        // 收益：DB 里不再可能出现"从未经过门却为 true"的行（否则一次并发 Stop
+        // 会被建档时的 true 覆盖回运行意图）。
+        desired_running: false,
         updated_at_ns: mesa_core_types::now_unix_ns(),
     };
     let tasks: &[mesa_core_types::AcquisitionTask] = body
@@ -345,11 +351,14 @@ async fn device_bootstrap_inner(
                     );
                 }
             }
-            state.snapshot.remove_endpoint(&endpoint_rec.id);
+            state
+                .snapshot
+                .remove_endpoint(&endpoint_rec.id, state.manager.gen_floor(&endpoint_rec.id));
             start_failed = Some(m);
         }
     }
-    // 注：start=false 时 desired_running 已在事务内写 false，无需再写一次。
+    // 注：start=false 时 desired_running 已在事务内写 false，无需再写一次；
+    // start=true 的 true 由 commit_start 写入（见 start_created_endpoint）。
 
     if let Some(m) = start_failed {
         return (

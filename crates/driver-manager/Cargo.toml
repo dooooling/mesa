@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 rust-version.workspace = true
+
+[features]
+# 测试故障注入（teardown panic）。生产图不启用；仅合同测试经 dev-dependencies
+# 打开，与 mesa-event-store / mesa-config-store 的 test-hooks 同口径。
+test-hooks = []
+
 [dependencies]
 mesa-core-types = { workspace = true }
 mesa-driver-protocol = { workspace = true }
@@ -18,6 +24,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 getrandom = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
