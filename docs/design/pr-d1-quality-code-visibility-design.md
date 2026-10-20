@@ -1,6 +1,6 @@
 # PR-D1 质量码可见性设计（复用 `quality_code`：零新增路由、零后端改动）
 
-- 基线：`main = f956f38450e535f7c75c24ab038dd2f5f6f1d9d8`（工作树干净）。
+- 基线：`main = 760942e8532f9990b7dd33dcc10acb40d3d201ac`（PR #127 合并后的实现基线；本文档已对齐该实现）。
 - 性质：**只写设计文档**。未改任何生产代码/测试/配置；未启动 mesad/Vite/emulator；未连接设备；未运行测试或构建；未做 git 写操作。
 - 上游输入（均已合并，直接引用）：`docs/design/quality-code-observability-investigation.md`（PR #123）、`docs/design/endpoint-running-backoff-p1-review.md`、`docs/design/nck-s7-job-0x8201-diagnosis-plan.md` §16/§17。
 - 命名消歧：本文件是 **PR-D1 = 质量码可见性**，与 `docs/design/pr-d-startup-review.md`（PR-D = 新建设备向导接线）无关。
@@ -52,7 +52,7 @@
 | REST 与 SSE 都整行序列化 `LatestEntry`，无裁剪 | `core-api/src/lib.rs:1571-1576`、`:2823-2835`、`:2843-2902` |
 | 路由表无任何统计/导出/过滤端点（`/points/latest` 为全局全量） | `:3240-3360`（`:3302-3303` 仅 latest/live） |
 | 行内**没有 `driver_id`**（在 endpoint 级） | `:1557-1566`；`snapshot.rs:83-95` |
-| 前端不消费该字段；抽屉无"原因码"区；状态列只有 GOOD/BAD/STALE | `useDeviceWorkspaceData.ts:20-36`；`PointDetailDrawer.tsx:70-78`、`:108-122`；`LiveCells.tsx:86-93` |
+| **D1 实施前**：前端不消费该字段；抽屉无"原因码"区；状态列只有 GOOD/BAD/STALE。**（D1 已实施后现状：前端已消费，抽屉有采样与原因码区，见 §5.3 / §8.3）** | `useDeviceWorkspaceData.ts:20-36`；`PointDetailDrawer.tsx:70-78`、`:108-122`；`LiveCells.tsx:86-93` |
 
 ## 2. 最小侵入：复用清单与"为什么零新增路由"
 
@@ -75,7 +75,7 @@
 
 ### 2.2 D1 唯一新增面（全部在 `apps/mesa-web`）
 
-| # | 文件 | 改动 | 量级 |
+| # | 文件 | 改动 | 量级（**最初设计估算**） |
 |---|---|---|---|
 | 1 | `workspace/useDeviceWorkspaceData.ts:20-36`、`deviceModel.ts:557-568` | 类型补 `quality_code?: string`、`value_origin?: string`（**仅类型，运行期字段已存在**） | ~4 行 |
 | 2 | `deviceModel.ts:40-45`、`:51-67`；两处 `toView` | `EndpointContext`/`DevicePointView` 补 `driverId`（endpoint 清单本就带 `driver_id`，`useLivePointsSource.ts:71`） | ~8 行 |
@@ -85,6 +85,10 @@
 | 6 | 新增 `src/qualityExport.ts` | 纯函数拼装 + 4 次既有 GET（§6.2） | ~90 行 |
 | 7 | 新增 `src/components/QualityCodeBreakdown.tsx` | 计数行上的 Popover（按码分解），挂到 2 处既有计数行 | ~50 行 |
 | 8 | `LiveCells.tsx:86-93` 旁（可选） | 状态 Tag 后加"有码才显示"的命名空间徽标（不新增列） | ~15 行 |
+
+> **量级说明**：上表"量级"为**最初设计估算**，只表示相对规模，**不是最终行数**。实际实现因增加弹层可达性约束、导出范围对象、未知来源计数与作用域模块等，`qualityCode.ts` / `qualityExport.ts` / `QualityCodeBreakdown.tsx` 等均**显著大于**估算值。**不要用本表核对实现体量**，以代码为准。
+>
+> 另：第 8 项（行内命名空间徽标）标注为**可选**，本轮**未实施** —— 抽屉与 Popover 已覆盖展示需求（见 §9 U7）。
 
 ### 2.3 被否决的"更大方案"（每条给否决理由）
 
@@ -553,7 +557,16 @@
 
 > 说明：`GlobalDataPage.test.tsx` 的「计数行跟随设备 + 连接双重筛选」与「设备选中但连接 ALL：统计只含该设备的全部连接（不是跨设备）」是**既有用例的改写**（原名分别为「计数行跟随连接筛选（不跟随设备筛选）」「设备选中但连接 ALL 时明确标注全部连接（跨设备）」），不计入上表 18 条；改写本身即"旧口径 → 新口径"的回归守门。
 >
-> 另：上一实现轮（`a1090bb`）新增的 `export_marks_raw_scope_vs_analysis_scope`、`export_counts_unknown_value_origin_separately` 等用例尚未登记进 §10.2，**待评审决定是否本轮补录**。
+> **上一实现轮（`a1090bb`）的用例已补录**（此前遗漏，本轮补齐）。它们与 §10.2 的 18 条同属 D1 验收范围：
+
+| # | 用例 | 断言要点 |
+|---|---|---|
+| R1 | `export_marks_raw_scope_vs_analysis_scope` | `raw_scope` 覆盖全部端点、`analysis_scope` 仅所选设备与连接；两者同时写入导出文档 |
+| R2 | `export_counts_unknown_value_origin_separately` | 未知/缺失 `value_origin` 单独计入 `unknown`，**不并入 `placeholder`**；四项之和 == `row_count` |
+| R3 | `drawer_shows_missing_code_for_bad_rows` | **BAD 且无码**时码区可见并显示"未提供（异常形态，请报告）"（§9 U2） |
+| R4 | `drawer_follows_live_updates_while_open` | **抽屉打开期间**收到实时更新：码变化随之更新；点消失显示"已从实时快照中消失"，**不再显示旧值** |
+| R5 | `focas_mesa_class_is_not_device_return_group` | FOCAS2 分类码归入"Mesa 分类（非厂家码）"，**不与设备返回码同组** |
+| R6 | `missing_code_is_visible_for_non_good_rows_only` | 码区可见性判据：有码恒显示、GOOD 无码隐藏、**非 GOOD 无码必须显示** |
 
 ### 10.3 "没有改变采集正确性"的证明
 
