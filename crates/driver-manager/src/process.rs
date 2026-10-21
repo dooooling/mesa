@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -19,6 +20,150 @@ use crate::manifest::DiscoveredDriver;
 
 /// Shutdown 后等待进程退出的宽限；超时强制终止（§14.4）。
 pub const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+
+/// Core 进程内"当前认为存活的 Driver 子进程"计数（G7 §6.6 进程不变量）。
+///
+/// 口径：`DriverProcess::spawn` 成功后 +1；该进程被 `wait()` 回收（正常
+/// `terminate*` 路径）或 `DriverProcess` 被 drop（异常路径，`kill_on_drop`
+/// 已发出强杀）时 −1。它**不是**生命周期真值（真值在 attempt 表），只用于
+/// 测试与诊断断言"Stop 完成后没有残留子进程"。
+pub static LIVE_CHILDREN: AtomicUsize = AtomicUsize::new(0);
+
+/// 当前计数（诊断/测试用）。
+pub fn live_children() -> usize {
+    LIVE_CHILDREN.load(Ordering::Relaxed)
+}
+
+/// 进程存活查询的**三态**结果（G7 隔离态复核用）。
+///
+/// 为什么不能是 `bool`：查询失败既可能是"进程确实已退出"（可证明已死），也可能是
+/// "权限不足/查询异常"（**无法**证明已死）。旧实现把打不开一律当"不存活"，于是
+/// reaper 会在隔离态下误判收敛、清掉条目并放行新 Start，而旧驱动进程可能仍在
+/// 执行（对机床是危险动作）。因此复核只接受 [`ProcessStatus::Dead`] 作为证据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessStatus {
+    /// 能明确判定仍在运行。
+    Alive,
+    /// 能明确判定已退出（ESRCH / ERROR_INVALID_PARAMETER / 非 STILL_ACTIVE）。
+    Dead,
+    /// 无法判定（权限不足、查询失败、未知平台）——**不得**当作已死。
+    Unknown,
+}
+
+/// 该 pid 是否仍存活（G7 `attempt_reaper` 复核用；**不是**生命周期判据）。
+///
+/// Windows：`OpenProcess` 成功且退出码仍为 `STILL_ACTIVE`(259) 才算存活；
+/// 打不开（权限/已退出）一律按"不存活"处理——隔离态复核要求的是"能证明
+/// 已死"，而打不开的进程无法证明其活着，但同样无法证明其已死。因此这里
+/// 只在**能明确判定**时返回 true；调用方（reaper）另有有界重试。
+#[cfg(windows)]
+pub fn process_status(pid: u32) -> ProcessStatus {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return ProcessStatus::Dead;
+    }
+    unsafe {
+        let h: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            // ERROR_INVALID_PARAMETER = 该 pid 不存在（可证明已死）；
+            // ERROR_ACCESS_DENIED 等 = 查询异常（无法证明）⇒ Unknown。
+            return match GetLastError() {
+                ERROR_INVALID_PARAMETER => ProcessStatus::Dead,
+                _ => ProcessStatus::Unknown,
+            };
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(h, &mut code);
+        CloseHandle(h);
+        if ok == 0 {
+            return ProcessStatus::Unknown;
+        }
+        // STILL_ACTIVE = 259（winnt.h）；成功查询且仍是该值即"仍在跑"。
+        if code == 259 {
+            ProcessStatus::Alive
+        } else {
+            ProcessStatus::Dead
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn process_alive(pid: u32) -> bool {
+    process_status(pid) == ProcessStatus::Alive
+}
+
+#[cfg(unix)]
+pub fn process_status(pid: u32) -> ProcessStatus {
+    if pid == 0 {
+        return ProcessStatus::Dead;
+    }
+    // 已退出但尚未被回收的僵尸进程也会让 kill(pid,0) 成功；reaper 侧用
+    // 有界重试覆盖"tokio 孤儿队列异步回收"的时间差。
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if r == 0 {
+        return ProcessStatus::Alive;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => ProcessStatus::Dead,
+        // EPERM：进程存在但不属于本用户 ⇒ 活着，绝不能当死。
+        Some(libc::EPERM) => ProcessStatus::Alive,
+        _ => ProcessStatus::Unknown,
+    }
+}
+
+#[cfg(unix)]
+pub fn process_alive(pid: u32) -> bool {
+    process_status(pid) == ProcessStatus::Alive
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn process_status(_pid: u32) -> ProcessStatus {
+    // 未知平台：宁可"无法证明"，也不能谎报已死（fail-closed）。
+    ProcessStatus::Unknown
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn process_alive(_pid: u32) -> bool {
+    false
+}
+
+/// 强杀指定 pid（G7 reaper 只对"任务已死、条目已隔离"的残留 pid 调用）。
+/// 返回是否成功发出终止请求。
+#[cfg(windows)]
+pub fn kill_pid(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let h: HANDLE = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let ok = TerminateProcess(h, 1);
+        CloseHandle(h);
+        ok != 0
+    }
+}
+
+#[cfg(unix)]
+pub fn kill_pid(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) == 0 }
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn kill_pid(_pid: u32) -> bool {
+    false
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpawnError {
@@ -47,6 +192,8 @@ pub struct DriverProcess {
     /// 端口租约：与子进程生命周期绑定，drop 时释放。
     /// 禁止移除——移除即重开 Core 内并发 spawn 抢同一端口的 TOCTOU（P1-A）。
     _port_lease: PortLease,
+    /// 是否仍计入 [`LIVE_CHILDREN`]（保证 +1/−1 恰好配对）。
+    counted: bool,
 }
 
 impl DriverProcess {
@@ -95,6 +242,7 @@ impl DriverProcess {
 
         // NOTE: 不做 TCP 探活——SDK 只 accept 一条管理连接，任何探测性连接
         // 都会抢占该名额导致握手永远失败。端口未就绪由 Session::connect_retry 处理。
+        LIVE_CHILDREN.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             port,
             pid,
@@ -103,7 +251,16 @@ impl DriverProcess {
             stdin: Some(stdin),
             _job: job,
             _port_lease: port_lease,
+            counted: true,
         })
+    }
+
+    /// 进程已被 `wait()` 回收：退出 [`LIVE_CHILDREN`] 计数（幂等）。
+    fn note_reaped(&mut self) {
+        if self.counted {
+            self.counted = false;
+            LIVE_CHILDREN.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// 兜底强杀（正常路径应先经 Session 发送 Shutdown 消息）。
@@ -127,6 +284,7 @@ impl DriverProcess {
                 let _ = self.child.wait().await;
             }
         }
+        self.note_reaped();
     }
 
     /// 正常 Shutdown 收尾（P0-2 Final）：已 post Shutdown RPC 后调用。
@@ -142,7 +300,10 @@ impl DriverProcess {
     /// RPC 与 stdin pipe 之间无 happens-before，正常路径绝不能先关 stdin。
     pub async fn terminate_after_shutdown(&mut self) {
         match tokio::time::timeout(TERMINATE_GRACE, self.child.wait()).await {
-            Ok(_) => return,
+            Ok(_) => {
+                self.note_reaped();
+                return;
+            }
             Err(_) => {
                 tracing::warn!(
                     pid = self.pid,
@@ -151,6 +312,14 @@ impl DriverProcess {
             }
         }
         self.terminate().await;
+    }
+}
+
+/// 异常路径兜底：`DriverProcess` 在展开（panic）中被 drop 时，`kill_on_drop`
+/// 已发出强杀，这里同步退出计数，保证 [`LIVE_CHILDREN`] 不会因为 panic 泄漏。
+impl Drop for DriverProcess {
+    fn drop(&mut self) {
+        self.note_reaped();
     }
 }
 
@@ -386,5 +555,59 @@ mod job {
             }
             Ok(JobHandle(handle))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 已退出的子进程必须能被**明确**判定为 Dead（这是隔离态复核放行的唯一证据）。
+    #[test]
+    fn exited_child_is_dead() {
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit", "0"])
+                .spawn()
+                .unwrap()
+        } else {
+            std::process::Command::new("sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap()
+        };
+        let pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(
+            process_status(pid),
+            ProcessStatus::Dead,
+            "已 wait 的子进程必须判为 Dead"
+        );
+        assert!(!process_alive(pid), "Dead 不得被当成存活");
+    }
+
+    /// 系统进程（Windows PID 4 / Unix PID 1）**不得**被判为 Dead。
+    ///
+    /// 这正是"Windows 进程查询异常 ⇒ 隔离态误判"的回归点：非管理员打开 PID 4
+    /// 会拿到 ERROR_ACCESS_DENIED，旧实现把它当"不存活"，reaper 就会在隔离态下
+    /// 误判收敛并放行新 Start。新实现必须返回 Unknown 或 Alive，绝不能是 Dead。
+    #[test]
+    fn foreign_system_pid_is_never_reported_dead() {
+        let pid = if cfg!(windows) { 4 } else { 1 };
+        let st = process_status(pid);
+        assert_ne!(
+            st,
+            ProcessStatus::Dead,
+            "系统进程 pid={pid} 被判为 Dead：查询异常被当成了'已死'证据"
+        );
+        // 三态自洽：process_alive 只对 Alive 为真。
+        assert_eq!(process_alive(pid), st == ProcessStatus::Alive);
+    }
+
+    /// pid 0 是"无残留进程"的哨兵值，必须直接 Dead（不能走平台查询）。
+    #[test]
+    fn zero_pid_is_dead() {
+        assert_eq!(process_status(0), ProcessStatus::Dead);
+        assert!(!process_alive(0));
     }
 }

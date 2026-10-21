@@ -150,11 +150,36 @@ pub enum LatestChange {
 /// 不是一个 point。慢消费者 Lagged 即转 Resync（重发全量），不补 backlog。
 pub const POINT_LIVE_NOTICE_CAPACITY: usize = 1024;
 
+/// 单个 endpoint 的运行态记录：`(generation, status)` **原子对**（G7 §6.5）。
+///
+/// 为什么把 generation 放进 map 的值而不是 `EndpointStatus` 里：`EndpointStatus` 是
+/// `/api/v1/endpoints` 的响应元素（Serialize），给它加字段等于改 wire；代次只
+/// 需要存在于内部结构。读侧在同一次加锁内取 `(generation, status)`，因此不可能拼出
+/// "新 generation + 旧 state"。
+#[derive(Debug, Clone)]
+struct EndpointRecord {
+    generation: u64,
+    status: EndpointStatus,
+}
+
+/// `endpoints` 表的唯一线性化点（G7 §6.5 / P0-4）。
+///
+/// 墓碑（`retired`）与状态写入**必须同一把锁**：分成两把锁时，"读墓碑 → 尚未
+/// 写状态"之间存在窗口，DELETE 落在窗口内即可让已删除端点复活。单锁使
+/// "upsert 的检查+写入"与"remove 的算 floor+写墓碑+删除"按锁获取顺序构成全序。
+#[derive(Debug, Default)]
+struct EndpointTable {
+    live: HashMap<String, EndpointRecord>,
+    /// 墓碑：DELETE 时记录"该 id 已退休的最大代次"；只增不减。
+    retired: HashMap<String, u64>,
+}
+
 /// 进程级共享快照。锁粒度按用途拆分，REST 读路径互不阻塞；latest/meta 采用 RwLock
 /// 以支持高频 DataBatch 写入与 REST 并发读取（§22 50K/s 下 apply_batch 与 latest_all 争用显著）。
 pub struct Snapshot {
     drivers: RwLock<Vec<DriverInfo>>,
-    endpoints: RwLock<HashMap<String, EndpointStatus>>,
+    /// G7：`(generation, EndpointStatus)` 表 + 墓碑，**单锁**（见 [`EndpointTable`]）。
+    endpoints: RwLock<EndpointTable>,
     latest: RwLock<HashMap<(String, u32), LatestEntry>>,
     /// (endpoint_id, point_id) -> (point_key, source_label)，register 时 replace。
     point_meta: RwLock<HashMap<(String, u32), PointMeta>>,
@@ -179,7 +204,7 @@ impl Default for Snapshot {
     fn default() -> Self {
         Self {
             drivers: RwLock::new(Vec::new()),
-            endpoints: RwLock::new(HashMap::new()),
+            endpoints: RwLock::new(EndpointTable::default()),
             latest: RwLock::new(HashMap::new()),
             point_meta: RwLock::new(HashMap::new()),
             name_overrides: RwLock::new(HashMap::new()),
@@ -205,21 +230,65 @@ impl Snapshot {
         self.drivers.read().unwrap().clone()
     }
 
-    pub fn upsert_endpoint(&self, status: EndpointStatus) {
-        self.endpoints
-            .write()
-            .unwrap()
-            .insert(status.endpoint_id.clone(), status);
+    /// 写入运行态（带代次门，G7 §6.5）。
+    ///
+    /// 返回值：`true` = 已写入；`false` = 被丢弃（旧代次写入，或端点已删除且
+    /// 代次不高于墓碑）。丢弃不是错误——它是"旧 attempt 的迟到状态不得覆盖
+    /// 新 attempt / 不得复活已删除端点"的**唯一**保证。
+    pub fn upsert_endpoint(&self, generation: u64, status: EndpointStatus) -> bool {
+        let mut t = self.endpoints.write().unwrap();
+        if t.retired
+            .get(&status.endpoint_id)
+            .is_some_and(|&r| generation <= r)
+        {
+            // 墓碑门：DELETE 之后，任何 generation <= retired 的写入一律丢弃。
+            // gen_floor 必须是"已发放的最大代次"，否则重建端点的首个写入会被
+            // 永久拒绝（off-by-one，见 `delete_then_recreate_status_write_is_accepted`）。
+            return false;
+        }
+        if t.live
+            .get(&status.endpoint_id)
+            .is_some_and(|rec| generation < rec.generation)
+        {
+            return false;
+        }
+        t.live.insert(
+            status.endpoint_id.clone(),
+            EndpointRecord { generation, status },
+        );
+        true
     }
 
     pub fn endpoints(&self) -> Vec<EndpointStatus> {
-        let mut v: Vec<_> = self.endpoints.read().unwrap().values().cloned().collect();
+        let mut v: Vec<_> = self
+            .endpoints
+            .read()
+            .unwrap()
+            .live
+            .values()
+            .map(|r| r.status.clone())
+            .collect();
         v.sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
         v
     }
 
     pub fn endpoint(&self, id: &str) -> Option<EndpointStatus> {
-        self.endpoints.read().unwrap().get(id).cloned()
+        self.endpoints
+            .read()
+            .unwrap()
+            .live
+            .get(id)
+            .map(|r| r.status.clone())
+    }
+
+    /// `(generation, status)` 原子对（G7 §7.3 判据 1/6 的唯一读取口）。
+    pub fn endpoint_with_gen(&self, id: &str) -> Option<(u64, EndpointStatus)> {
+        self.endpoints
+            .read()
+            .unwrap()
+            .live
+            .get(id)
+            .map(|r| (r.generation, r.status.clone()))
     }
 
     /// 记录点元数据（ApplyPointMap 时）：point_id -> (point_key, source_label, display_name)，
@@ -423,7 +492,12 @@ impl Snapshot {
         }
     }
 
-    pub fn remove_endpoint(&self, endpoint_id: &str) {
+    /// 删除 Endpoint 的**全部**快照痕迹，并立墓碑（G7 §6.5）。
+    ///
+    /// `gen_floor` 必须是该 id **已发放的最大代次**（`MesaManager::gen_floor`），
+    /// 不是"下一个将要发放的值"：墓碑比较是 `generation <= retired`，若传下一个值，
+    /// 重建端点的第一个 attempt（generation = floor+1）恰好等于墓碑而被永久丢弃。
+    pub fn remove_endpoint(&self, endpoint_id: &str, gen_floor: u64) {
         self.point_meta
             .write()
             .unwrap()
@@ -437,7 +511,15 @@ impl Snapshot {
             .write()
             .unwrap()
             .retain(|(ep, _), _| ep != endpoint_id);
-        self.endpoints.write().unwrap().remove(endpoint_id);
+        {
+            // 墓碑与删除在**同一临界区**：检查墓碑的 upsert 与这里的写入
+            // 按锁获取顺序构成全序，不存在"检查完墓碑、尚未落盘时 DELETE 插进来"。
+            let mut t = self.endpoints.write().unwrap();
+            let floor = gen_floor.max(t.live.get(endpoint_id).map_or(0, |e| e.generation));
+            let r = t.retired.entry(endpoint_id.to_string()).or_insert(0);
+            *r = (*r).max(floor);
+            t.live.remove(endpoint_id);
+        }
         // 结构删除走 Resync（消费方重拉全量，幽灵行自然消失）。
         self.emit_change(LatestChange::Resync);
     }
@@ -896,5 +978,110 @@ mod tests {
         // 订阅释放后门关闭（Receiver drop → receiver_count 回落）。
         drop(rx);
         assert!(!snap.has_live_subscribers());
+    }
+
+    // ---- G7 代次门 / 墓碑（§6.5）----
+
+    fn status(id: &str, state: &str) -> EndpointStatus {
+        EndpointStatus {
+            endpoint_id: id.into(),
+            driver_id: "test-driver".into(),
+            state: state.into(),
+            detail: String::new(),
+            revision: 0,
+            points: 0,
+            epoch: 0,
+        }
+    }
+
+    /// 旧代次写入必须被丢弃：老 attempt 拆解时写的 STOPPED 不得覆盖新 attempt
+    /// 的 RUNNING（旧实现是"最后写入者胜"，本用例在旧码上无 gen 参数 ⇒ 必红）。
+    #[test]
+    fn stale_generation_write_is_dropped() {
+        let snap = Snapshot::new();
+        assert!(snap.upsert_endpoint(2, status("ep1", "RUNNING")));
+        assert!(
+            !snap.upsert_endpoint(1, status("ep1", "STOPPED")),
+            "旧代次写入必须被丢弃"
+        );
+        let (generation, st) = snap.endpoint_with_gen("ep1").unwrap();
+        assert_eq!(generation, 2);
+        assert_eq!(st.state, "RUNNING", "快照不得被旧 attempt 的 STOPPED 覆盖");
+        // 同代次允许覆盖（同一 attempt 的状态推进）。
+        assert!(snap.upsert_endpoint(2, status("ep1", "STOPPED")));
+        assert_eq!(snap.endpoint("ep1").unwrap().state, "STOPPED");
+    }
+
+    /// 墓碑门：DELETE 之后，任何 `generation <= retired` 的写入都被丢弃，
+    /// 已删除端点不得因迟到状态写入而复活（P0-4）。
+    #[test]
+    fn deleted_endpoint_write_is_dropped_by_tombstone() {
+        let snap = Snapshot::new();
+        assert!(snap.upsert_endpoint(3, status("ep1", "RUNNING")));
+        snap.remove_endpoint("ep1", 3);
+        assert!(snap.endpoint("ep1").is_none());
+        for g in 0..=3 {
+            assert!(
+                !snap.upsert_endpoint(g, status("ep1", "RUNNING")),
+                "generation {g} <= 墓碑 3，必须被丢弃"
+            );
+            assert!(snap.endpoint("ep1").is_none(), "不得复活");
+        }
+        // 下一代（= 墓碑 + 1）必须被接受（否则端点重建后永远不显示状态）。
+        assert!(snap.upsert_endpoint(4, status("ep1", "RUNNING")));
+        assert_eq!(snap.endpoint_with_gen("ep1").unwrap().0, 4);
+    }
+
+    /// 钉住 `gen_floor` 的 off-by-one：DELETE 传"已发放的最大代次"后重建，
+    /// 新 attempt 的 `generation = floor + 1` **必须**被接受。
+    #[test]
+    fn delete_then_recreate_status_write_is_accepted() {
+        let snap = Snapshot::new();
+        snap.upsert_endpoint(1, status("ep1", "RUNNING"));
+        snap.upsert_endpoint(2, status("ep1", "STOPPED"));
+        // 已发放的最大代次 = 2（不是"下一个"3）。
+        snap.remove_endpoint("ep1", 2);
+        assert!(snap.endpoint("ep1").is_none());
+        assert!(
+            snap.upsert_endpoint(3, status("ep1", "CONNECTING")),
+            "重建后的首个写入（generation = floor + 1）不得被墓碑永久拒绝"
+        );
+    }
+
+    /// 并发 DELETE + 迟到写入：`remove_endpoint` 返回之后，任何 `generation <= floor`
+    /// 的 upsert 都必须返回 false，且 `endpoint()` 恒为 None（不是"跑很多次没出事"，
+    /// 而是每次读都必须成立的不变量）。
+    #[test]
+    fn concurrent_delete_and_late_status_write_never_resurrects() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let snap = Arc::new(Snapshot::new());
+        snap.upsert_endpoint(1, status("ep1", "RUNNING"));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writer = {
+            let snap = Arc::clone(&snap);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut g = 1u64;
+                while !stop.load(Ordering::Relaxed) {
+                    // 迟到写入：一律用 <= 墓碑的代次（模拟旧 attempt 的残留写）。
+                    snap.upsert_endpoint(g, status("ep1", "STOPPED"));
+                    g = 1;
+                }
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        snap.remove_endpoint("ep1", 1);
+        // remove 返回之后：任何读都不得看到该端点。
+        for _ in 0..2000 {
+            assert!(
+                snap.endpoint("ep1").is_none(),
+                "remove_endpoint 返回后端点不得复活"
+            );
+            assert!(!snap.upsert_endpoint(1, status("ep1", "RUNNING")));
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(snap.endpoint("ep1").is_none());
     }
 }
