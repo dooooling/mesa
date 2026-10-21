@@ -2136,35 +2136,50 @@ async fn delete_endpoint(
             )),
         );
     }
-    // P0-D：打开删除屏障——此后新的 Start 提交（门内 409 `ENDPOINT_DELETED`）
-    // 与新的 Stop 落盘都不再进入本端点，避免"等待收敛 → 删行"之间又冒出写入。
-    state.lifecycle.begin_delete(&id);
+    // P0-D/P0-E-2：打开删除屏障。返回值是 **RAII guard**：handler 无论从哪条
+    // 路径离开（等待超时、409、404、存储错误、客户端断开的取消、panic），只要
+    // 没有 `commit()`，Drop 就会撤销屏障——修复前这些显式 `abort_delete` 在
+    // 取消/panic 路径上根本执行不到，`deleting` 永久为 true，该端点此后所有
+    // Start 都被 409 拒绝。
+    //
+    // 屏障只挡 Start 提交（门内 409 `ENDPOINT_DELETED`）；**Stop 的意图持久化
+    // 照常进入**（P0-E-1），因此下面的等待必须配合删行前的串行器复查。
+    let barrier = state.lifecycle.begin_delete(&id);
     // P0-D：**等已有的在途意图写入真正收敛**（不是清空标记）。teardown 已完成、
     // `desired=false` 仍在写库的 Stop，必须在删行之前落完：否则删行 + 同 ID 重建
     // + Start 之后，那条迟到的 `false` 会写到新实例上（评审给的五步交错）。
     // 超时 ⇒ 409 `DELETE_PERSIST_IN_PROGRESS`，撤销屏障且不删除（宁可让客户端
     // 重试，也不在没把握时做不可逆的删除）。
-    if let Err(e) = state
-        .lifecycle
-        .await_intent_quiescent(&id, lifecycle::DELETE_PERSIST_WAIT)
-        .await
-    {
-        state.lifecycle.abort_delete(&id);
-        return e.to_response();
-    }
-    // 屏障期间仍可能受理过 Stop（`admit_stop` 与门锁同临界区，会同步 begin_stop）。
-    // 一旦有活 attempt 出现，同样不得删配置（P0-7 的原判据必须在新窗口里复查）。
-    if state.manager.has_live_attempt(&id) {
-        state.lifecycle.abort_delete(&id);
-        return (
-            StatusCode::CONFLICT,
-            Json(json_error(
-                "CONFLICT",
-                "endpoint 正在运行，请先停止后再删除",
-            )),
-        );
-    }
-    match state.store.delete_endpoint(&id) {
+    //
+    // P0-E-1：屏障期 Stop 会真实落盘，于是"观测为空"与"删行"之间仍可能插入一次
+    // 登记 ⇒ 每轮在拿到意图串行器后**再复查一次**；复查不干净就重试（总预算仍是
+    // `DELETE_PERSIST_WAIT`，不延长）。串行器一直持有到删行 + 立墓碑完成。
+    let intent_lock = {
+        let deadline = std::time::Instant::now() + lifecycle::DELETE_PERSIST_WAIT;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if let Err(e) = state.lifecycle.await_intent_quiescent(&id, remaining).await {
+                return e.to_response();
+            }
+            // 屏障期间仍可能受理过 Stop（`admit_stop` 与门锁同临界区，会同步
+            // begin_stop）。一旦有活 attempt 出现，同样不得删配置（P0-7 的原判据
+            // 必须在新窗口里复查）。
+            if state.manager.has_live_attempt(&id) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json_error(
+                        "CONFLICT",
+                        "endpoint 正在运行，请先停止后再删除",
+                    )),
+                );
+            }
+            if let Some(lock) = state.lifecycle.lock_intent_persist_if_quiescent(&id).await {
+                break lock;
+            }
+            // 观测之后又有屏障期 Stop 登记了在途写入 ⇒ 重试（预算用尽则上面 409）。
+        }
+    };
+    let resp = match state.store.delete_endpoint(&id) {
         Ok(true) => {
             // 清理 Snapshot 中的残留状态（latest/status）。
             // G7：必须传 `gen_floor`（该 id 已发放的最大代次）立墓碑，否则旧
@@ -2177,21 +2192,20 @@ async fn delete_endpoint(
             let _ = state.store.clear_stop_intent_unpersisted(&id);
             // P0-D：立墓碑代次（`stop_gen + 1`）并复位缓冲意图；此时已证明没有
             // 任何在途意图写入，因此不会再有旧写入落到重建后的同 ID 记录上。
-            state.lifecycle.finish_delete(&id);
+            // guard 的 `commit()` 同时把"未提交即撤销"的语义置为已完成。
+            barrier.commit();
             (StatusCode::OK, Json(serde_json::json!({ "deleted": id })))
         }
-        Ok(false) => {
-            state.lifecycle.abort_delete(&id);
-            (
-                StatusCode::NOT_FOUND,
-                Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
-            )
-        }
-        Err(e) => {
-            state.lifecycle.abort_delete(&id);
-            store_err_to_response(e)
-        }
-    }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
+        ),
+        Err(e) => store_err_to_response(e),
+    };
+    // 串行器在删行与立墓碑之后才释放：屏障期 Stop 的落盘要么已经排在它前面完成，
+    // 要么在它之后执行——那时行已删除（0 行命中）或已立墓碑代次。
+    drop(intent_lock);
+    resp
 }
 
 /// 启动 Endpoint（G7 两阶段提交）。

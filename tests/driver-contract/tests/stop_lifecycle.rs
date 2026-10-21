@@ -482,6 +482,30 @@ fn code_of(v: &serde_json::Value) -> &str {
     v["error"]["code"].as_str().unwrap_or("")
 }
 
+/// 在独立 task 里发一次请求（需要与其它请求并发时用；`rig.post/delete` 会阻塞当前
+/// future）。返回 `(status, body)`。
+async fn send_http(
+    app: axum::Router,
+    method: &str,
+    uri: String,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // W1：Stop 落进 Start 的配置构造窗口
 // ---------------------------------------------------------------------------
@@ -2542,4 +2566,244 @@ async fn delete_waits_for_inflight_stop_persist_and_rebuild_is_not_polluted() {
     let _ = rig.stop(id).await;
     assert!(!rig.desired(id), "收尾 Stop 后 DB 必须为 false");
     assert!(!rig.mgr.has_live_attempt(id));
+}
+
+// ---------------------------------------------------------------------------
+// P0-E-1：屏障期 Stop 的 200 必须等价于"停止意图已确认落盘"
+// ---------------------------------------------------------------------------
+
+/// **P0-E-1 确定性 Gate（端到端）**：屏障期 Stop + **DELETE 失败** ⇒
+/// `desired_running` 不得为 true。
+///
+/// 交错（全部落在可机器判定的状态上）：
+/// 1. 端点运行中（DB `desired_running=true`）；Stop-A 的 `desired=false` 写库被注入
+///    12s 延迟（> DELETE 的 10s 等待预算）⇒ DELETE 必然停在屏障里等待；
+/// 2. DELETE 在屏障里等待的同时，屏障期 Stop-B 到达（旧码：直接跳过落盘、
+///    立即返回 200 ⇒ 下面 `!stop_b.is_finished()` 断言必红）；
+/// 3. DELETE 预算用尽 ⇒ 409 `DELETE_PERSIST_IN_PROGRESS`（**删除失败**、行仍在、
+///    屏障随 guard 丢弃而撤销）；
+/// 4. Stop-B 只有在它自己的 `desired=false` 落盘完成后才返回 200 ⇒ 此时 DB 必为
+///    false。旧码停在步骤 2 的"假成功"，DB 仍是 true（这正是 P0-E-1 的缺陷）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn barrier_stop_confirms_intent_before_returning_success_even_if_delete_fails() {
+    use std::sync::atomic::Ordering;
+
+    let rig = SettleRig::new("p0e1").await;
+    let id = "p0e1-ep";
+    rig.create_endpoint(id, false);
+    let (s, v) = rig.start(id).await;
+    assert_eq!(s, StatusCode::OK, "预置启动: {v}");
+    rig.wait_running(id, 30).await;
+    assert!(rig.desired(id), "预置：DB 必须为 true");
+
+    // Stop-A 的 false 写库阻塞 12s；队列只放一个元素，屏障期 Stop-B 的写不延迟
+    // （但它排在 Stop-A 之后，因此同样落在 12s 之后）。
+    {
+        let faults = rig.store.desired_write_faults();
+        let mut q = faults.delay_seq.lock().unwrap();
+        q.clear();
+        q.push_back(12_000);
+    }
+    let base_started = rig
+        .store
+        .desired_write_faults()
+        .calls_started
+        .load(Ordering::Relaxed);
+
+    let app = rig.app.clone();
+    let stop_uri = format!("/api/v1/endpoints/{id}/stop");
+    let stop_a = tokio::spawn(send_http(app.clone(), "POST", stop_uri.clone()));
+    common::wait_until(10, || {
+        rig.store
+            .desired_write_faults()
+            .calls_started
+            .load(Ordering::Relaxed)
+            > base_started
+    })
+    .await;
+    common::wait_until(10, || !rig.mgr.has_live_attempt(id)).await;
+    common::wait_until(10, || rig.state_of(id).as_deref() == Some("STOPPED")).await;
+    assert!(rig.desired(id), "前置：Stop-A 的写入在途，DB 仍是旧值 true");
+
+    // DELETE：因有在途写入而停在屏障里等待（预算 10s）。
+    let delete_uri = format!("/api/v1/endpoints/{id}");
+    let delete_task = tokio::spawn(send_http(app.clone(), "DELETE", delete_uri));
+    common::wait_until(5, || rig.state.lifecycle.sample(id).deleting).await;
+    assert!(
+        rig.store.get_endpoint(id).unwrap().is_some(),
+        "前置：DELETE 仍在等待，行必须在"
+    );
+
+    // 屏障期 Stop-B。
+    let stop_b = tokio::spawn(send_http(app.clone(), "POST", stop_uri));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // 判别：旧码在屏障期跳过落盘、立即 200 ⇒ 这里必然已结束（必红）。
+    assert!(
+        !stop_b.is_finished(),
+        "P0-E-1：屏障期 Stop 不得在停止意图落盘之前返回成功"
+    );
+    assert!(
+        rig.desired(id),
+        "P0-E-1：Stop 尚未返回成功时不得声称 DB 已反映停止"
+    );
+
+    // DELETE 预算用尽 ⇒ 显式失败（409），且不删行、屏障必须撤销。
+    let (del_status, del_body) = tokio::time::timeout(Duration::from_secs(40), delete_task)
+        .await
+        .expect("DELETE 有界")
+        .unwrap();
+    assert_eq!(
+        del_status,
+        StatusCode::CONFLICT,
+        "在途写入未收敛时 DELETE 必须显式失败: {del_body}"
+    );
+    assert_eq!(
+        code_of(&del_body),
+        "DELETE_PERSIST_IN_PROGRESS",
+        "{del_body}"
+    );
+    assert!(
+        rig.store.get_endpoint(id).unwrap().is_some(),
+        "DELETE 失败后端点必须仍然存在"
+    );
+    common::wait_until(2, || !rig.state.lifecycle.sample(id).deleting).await;
+
+    // Stop-B 落地：200 只在它自己的 `desired=false` 落盘确认之后才返回。
+    let (stop_b_status, stop_b_body) = tokio::time::timeout(Duration::from_secs(40), stop_b)
+        .await
+        .expect("屏障期 Stop 有界")
+        .unwrap();
+    assert_eq!(
+        stop_b_status,
+        StatusCode::OK,
+        "屏障期 Stop 必须成功: {stop_b_body}"
+    );
+    assert!(
+        !rig.desired(id),
+        "P0-E-1：Stop 返回 200 + DELETE 失败 ⇒ desired_running 不得为 true"
+    );
+
+    // Stop-A 也已完成（同一次 12s 写），收尾并证明端点仍可正常启停。
+    let (stop_a_status, stop_a_body) = tokio::time::timeout(Duration::from_secs(40), stop_a)
+        .await
+        .expect("Stop-A 有界")
+        .unwrap();
+    assert_eq!(
+        stop_a_status,
+        StatusCode::OK,
+        "Stop-A 必须成功: {stop_a_body}"
+    );
+    let (s, v) = rig.start(id).await;
+    assert_eq!(s, StatusCode::OK, "DELETE 失败后 Start 必须仍可用: {v}");
+    rig.wait_running(id, 30).await;
+    assert!(rig.desired(id), "Start 成功后 DB 必须为 true");
+    let _ = rig.stop(id).await;
+    assert!(!rig.desired(id), "收尾 Stop 后 DB 必须为 false");
+}
+
+// ---------------------------------------------------------------------------
+// P0-E-2：DELETE 请求被取消不得留下永久删除屏障
+// ---------------------------------------------------------------------------
+
+/// **P0-E-2 确定性 Gate（端到端）**：DELETE 停在屏障里等待时被取消（客户端断开 /
+/// 网关超时 ⇒ handler future 被丢弃）⇒ 屏障必须自动撤销，随后 **Start 必须能成功**。
+///
+/// 旧码：`begin_delete()` 之后的显式 `abort_delete()` 只存在于正常返回分支，
+/// future 被丢弃时根本执行不到 ⇒ `deleting` 永久为 true ⇒ 该端点此后所有 Start
+/// 都是 409 `ENDPOINT_DELETED`（只能重启 Core 才能恢复）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_delete_request_does_not_leave_a_permanent_barrier() {
+    use std::sync::atomic::Ordering;
+
+    let rig = SettleRig::new("p0e2").await;
+    let id = "p0e2-ep";
+    rig.create_endpoint(id, false);
+    let (s, v) = rig.start(id).await;
+    assert_eq!(s, StatusCode::OK, "预置启动: {v}");
+    rig.wait_running(id, 30).await;
+    assert!(rig.desired(id), "预置：DB 必须为 true");
+
+    // 让 Stop-A 的 false 写库阻塞 3s：DELETE 一定停得进屏障里等待。
+    {
+        let faults = rig.store.desired_write_faults();
+        let mut q = faults.delay_seq.lock().unwrap();
+        q.clear();
+        q.push_back(3_000);
+    }
+    let base_started = rig
+        .store
+        .desired_write_faults()
+        .calls_started
+        .load(Ordering::Relaxed);
+
+    let app = rig.app.clone();
+    let stop_uri = format!("/api/v1/endpoints/{id}/stop");
+    let stop_a = tokio::spawn(send_http(app.clone(), "POST", stop_uri));
+    common::wait_until(10, || {
+        rig.store
+            .desired_write_faults()
+            .calls_started
+            .load(Ordering::Relaxed)
+            > base_started
+    })
+    .await;
+    common::wait_until(10, || !rig.mgr.has_live_attempt(id)).await;
+    common::wait_until(10, || rig.state_of(id).as_deref() == Some("STOPPED")).await;
+
+    // 把 DELETE 的 future 钉住并驱动到"屏障已立、正在等待"。
+    let delete_uri = format!("/api/v1/endpoints/{id}");
+    let mut delete_fut = Box::pin(send_http(app.clone(), "DELETE", delete_uri));
+    {
+        let barrier_up = async {
+            loop {
+                if rig.state.lifecycle.sample(id).deleting {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            _ = &mut delete_fut => panic!("在途写入未收敛时 DELETE 不得返回"),
+            _ = barrier_up => {}
+        }
+    }
+    assert!(
+        rig.state.lifecycle.sample(id).deleting,
+        "前置：屏障已立且 DELETE 正在等待"
+    );
+
+    // 取消（等价客户端断开 / 网关超时）：必须真正 drop 掉 future 本体。
+    drop(delete_fut);
+    common::wait_until(2, || !rig.state.lifecycle.sample(id).deleting).await;
+    assert!(
+        !rig.state.lifecycle.sample(id).deleting,
+        "P0-E-2：取消 DELETE 后不得留下永久删除屏障"
+    );
+    assert!(
+        rig.store.get_endpoint(id).unwrap().is_some(),
+        "取消 DELETE 不得删除端点"
+    );
+
+    // Stop-A 落盘完成 → desired=false；此后 Start 必须能正常成功。
+    let (stop_a_status, stop_a_body) = tokio::time::timeout(Duration::from_secs(40), stop_a)
+        .await
+        .expect("Stop-A 有界")
+        .unwrap();
+    assert_eq!(
+        stop_a_status,
+        StatusCode::OK,
+        "Stop-A 必须成功: {stop_a_body}"
+    );
+    assert!(!rig.desired(id), "Stop-A 完成后 DB 必须为 false");
+
+    let (s, v) = rig.start(id).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "P0-E-2：取消 DELETE 之后 Start 必须能正常成功（旧码永久 409 ENDPOINT_DELETED）: {v}"
+    );
+    rig.wait_running(id, 30).await;
+    assert!(rig.desired(id), "Start 成功后 DB 必须为 true");
+    let _ = rig.stop(id).await;
+    assert!(!rig.desired(id), "收尾 Stop 后 DB 必须为 false");
 }
