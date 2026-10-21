@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 rust-version.workspace = true
+
+[features]
+# 测试故障注入（运行意图落盘失败/变慢）。生产图不启用；仅合同测试经
+# dev-dependencies 打开，与 mesa-event-store 的 test-hooks 同口径。
+test-hooks = []
+
 [dependencies]
 mesa-core-types = { workspace = true }
 rusqlite = { workspace = true }

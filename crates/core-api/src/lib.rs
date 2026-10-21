@@ -28,6 +28,9 @@ pub mod certificates;
 pub(crate) mod connection_check;
 /// I-2 只读管理路由（定义目录 / 权威身份预览）：零厂商语义、只按 `ErrorKind` 映射。
 pub(crate) mod driver_query;
+/// G7：生命周期门（Start 两阶段提交 / Stop 合流 / 停止判据观察器）。
+pub mod lifecycle;
+pub mod recovery;
 pub mod runtime;
 use certificates::CertStore;
 
@@ -39,6 +42,8 @@ pub struct AppState {
     pub snapshot: Arc<Snapshot>,
     pub manager: Arc<MesaManager>,
     pub store: Arc<ConfigStore>,
+    /// G7：生命周期门（唯一排序器；不持有生命周期真值）。
+    pub lifecycle: Arc<lifecycle::LifecycleGate>,
     /// 驱动目录（供 rescan 使用）。
     pub drivers_dir: String,
     pub start_time: Instant,
@@ -139,6 +144,10 @@ impl AppState {
             .map_err(|e| format!("own 证书初始化失败: {e}"))?;
         Ok(Arc::new(Self {
             snapshot,
+            lifecycle: Arc::new(lifecycle::LifecycleGate::new(
+                Arc::clone(&store),
+                Arc::clone(&manager),
+            )),
             manager,
             store,
             drivers_dir,
@@ -178,6 +187,10 @@ impl AppState {
             let cert_store = Arc::new(CertStore::new(cert_dir_c));
             Arc::new(Self {
                 snapshot,
+                lifecycle: Arc::new(lifecycle::LifecycleGate::new(
+                    Arc::clone(&store_c),
+                    Arc::clone(&manager_c),
+                )),
                 manager: manager_c,
                 store: store_c,
                 drivers_dir: drivers_dir_c,
@@ -2110,7 +2123,11 @@ async fn delete_endpoint(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if state.manager.is_running(&id) {
+    // G7：判据必须是 **attempt 真值**而不是 `is_running()`。拆解期 `is_running()`
+    // 已经是 false，但 attempt 条目仍在（正在等驱动进程退出）；此时删除配置会
+    // 留下"配置没了、驱动任务还在收尾/隔离"的孤儿，且迟到状态写入可能复活端点。
+    // 隔离态（FailedUnknown）同样命中——复核通过前不得删配置。
+    if state.manager.has_live_attempt(&id) {
         return (
             StatusCode::CONFLICT,
             Json(json_error(
@@ -2119,10 +2136,64 @@ async fn delete_endpoint(
             )),
         );
     }
-    match state.store.delete_endpoint(&id) {
+    // P0-D/P0-E-2：打开删除屏障。返回值是 **RAII guard**：handler 无论从哪条
+    // 路径离开（等待超时、409、404、存储错误、客户端断开的取消、panic），只要
+    // 没有 `commit()`，Drop 就会撤销屏障——修复前这些显式 `abort_delete` 在
+    // 取消/panic 路径上根本执行不到，`deleting` 永久为 true，该端点此后所有
+    // Start 都被 409 拒绝。
+    //
+    // 屏障只挡 Start 提交（门内 409 `ENDPOINT_DELETED`）；**Stop 的意图持久化
+    // 照常进入**（P0-E-1），因此下面的等待必须配合删行前的串行器复查。
+    let barrier = state.lifecycle.begin_delete(&id);
+    // P0-D：**等已有的在途意图写入真正收敛**（不是清空标记）。teardown 已完成、
+    // `desired=false` 仍在写库的 Stop，必须在删行之前落完：否则删行 + 同 ID 重建
+    // + Start 之后，那条迟到的 `false` 会写到新实例上（评审给的五步交错）。
+    // 超时 ⇒ 409 `DELETE_PERSIST_IN_PROGRESS`，撤销屏障且不删除（宁可让客户端
+    // 重试，也不在没把握时做不可逆的删除）。
+    //
+    // P0-E-1：屏障期 Stop 会真实落盘，于是"观测为空"与"删行"之间仍可能插入一次
+    // 登记 ⇒ 每轮在拿到意图串行器后**再复查一次**；复查不干净就重试（总预算仍是
+    // `DELETE_PERSIST_WAIT`，不延长）。串行器一直持有到删行 + 立墓碑完成。
+    let intent_lock = {
+        let deadline = std::time::Instant::now() + lifecycle::DELETE_PERSIST_WAIT;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if let Err(e) = state.lifecycle.await_intent_quiescent(&id, remaining).await {
+                return e.to_response();
+            }
+            // 屏障期间仍可能受理过 Stop（`admit_stop` 与门锁同临界区，会同步
+            // begin_stop）。一旦有活 attempt 出现，同样不得删配置（P0-7 的原判据
+            // 必须在新窗口里复查）。
+            if state.manager.has_live_attempt(&id) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json_error(
+                        "CONFLICT",
+                        "endpoint 正在运行，请先停止后再删除",
+                    )),
+                );
+            }
+            if let Some(lock) = state.lifecycle.lock_intent_persist_if_quiescent(&id).await {
+                break lock;
+            }
+            // 观测之后又有屏障期 Stop 登记了在途写入 ⇒ 重试（预算用尽则上面 409）。
+        }
+    };
+    let resp = match state.store.delete_endpoint(&id) {
         Ok(true) => {
-            // 清理 Snapshot 中的残留状态（latest/status）
-            state.snapshot.remove_endpoint(&id);
+            // 清理 Snapshot 中的残留状态（latest/status）。
+            // G7：必须传 `gen_floor`（该 id 已发放的最大代次）立墓碑，否则旧
+            // attempt 的迟到状态写入会让已删除端点"复活"（§6.5）。
+            state
+                .snapshot
+                .remove_endpoint(&id, state.manager.gen_floor(&id));
+            // 端点已彻底删除：停止意图围栏（若曾因落盘失败写入）已无保护对象，
+            // 不清会留下指向不存在端点的永久围栏项，干扰人工核验与诊断。
+            let _ = state.store.clear_stop_intent_unpersisted(&id);
+            // P0-D：立墓碑代次（`stop_gen + 1`）并复位缓冲意图；此时已证明没有
+            // 任何在途意图写入，因此不会再有旧写入落到重建后的同 ID 记录上。
+            // guard 的 `commit()` 同时把"未提交即撤销"的语义置为已完成。
+            barrier.commit();
             (StatusCode::OK, Json(serde_json::json!({ "deleted": id })))
         }
         Ok(false) => (
@@ -2130,19 +2201,32 @@ async fn delete_endpoint(
             Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
         ),
         Err(e) => store_err_to_response(e),
-    }
+    };
+    // 串行器在删行与立墓碑之后才释放：屏障期 Stop 的落盘要么已经排在它前面完成，
+    // 要么在它之后执行——那时行已删除（0 行命中）或已立墓碑代次。
+    drop(intent_lock);
+    resp
 }
 
+/// 启动 Endpoint（G7 两阶段提交）。
+///
+/// 阶段划分（设计 §1.3 修订后 + P0-B）：`admit`（同步，票据）→ 构造（长
+/// await）→ `commit`（门外取得落盘串行器 → 同步临界区：代次比对 + start →
+/// 临界区外落盘 true 并 await 结果）→ 应答。
+///
+/// 为什么不再先查 `is_running`：它既不能表达"Stop 已受理"，也不能表达"有 Start
+/// 在途"，是 W1/W2/W3 的共同根因（§1.2）。冲突判定改由门 + attempt 表给出：
+/// - Stop 在构造期被受理 ⇒ 409 `SUPERSEDED_BY_STOP`（契约行 1）；
+/// - 旧 attempt 仍在拆解 ⇒ 409 `STOP_IN_PROGRESS`（契约行 2，不排队）；
+/// - 异常终止待复核 ⇒ 409 `ATTEMPT_FAILED_UNKNOWN`；
+/// - 真的已在运行 ⇒ 409 `CONFLICT`（文案不变）。
 async fn start_endpoint(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if state.manager.is_running(&id) {
-        return (
-            StatusCode::CONFLICT,
-            Json(json_error("CONFLICT", "endpoint 已在运行")),
-        );
-    }
+    // 准入：同步登记票据（不查运行态、不碰 DB、不起进程）。票据 RAII 释放，
+    // 因此构造期被取消（客户端断开）不会留下任何副作用。
+    let ticket = state.lifecycle.admit_start(&id);
     // C1 P0：运行期 Endpoint 只能经共享构造路径生成（REST Start、
     // Bootstrap start、Mesad 开机恢复三者同源），否则重启恢复会把
     // Secret marker 当密码交给 Driver。
@@ -2150,35 +2234,60 @@ async fn start_endpoint(
         Ok(cfg) => cfg,
         Err(e) => return (e.status, e.to_json()),
     };
-    match state.manager.start_endpoint(cfg) {
-        Ok(()) => {
-            let _ = state.store.set_desired_running(&id, true);
-            (StatusCode::OK, Json(serde_json::json!({ "started": id })))
-        }
-        Err(msg) => (
-            StatusCode::BAD_REQUEST,
-            Json(json_error("START_FAILED", &msg)),
-        ),
+    match state.lifecycle.commit_start(&ticket, cfg).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "started": id }))),
+        Err(e) => e.to_response(),
     }
 }
 
+/// 停止 Endpoint（G7 合流 + 意图前移）。
+///
+/// 语义（§5.2 六行）：
+/// - 第一次 Stop：受理即触发**一次** teardown；
+/// - teardown 中再次 Stop：**合流**等待同一次结论，不重复 teardown；
+/// - 成功 ⇒ 两个请求都 200 `was_running=true`；失败 ⇒ 两个都拿到同一次明确失败；
+/// - 完成后再 Stop ⇒ 200 `was_running=false`（幂等语义冻结）；
+/// - 客户端断开/超时 ⇒ 只丢应答，不取消后台停止。
+///
+/// `desired_running=false` 在受理时（同步临界区）就落到内存意图，并在
+/// `spawn_blocking` 中**与 teardown 并行**落盘（S1：DB busy 不阻止停止）。
+/// 落盘失败 ⇒ 即使 teardown 成功也返回 500 `STOP_INTENT_NOT_PERSISTED`
+///（§6.10.3：停止意图没落盘就返回成功，重启后会意外自动拉起）。
 async fn stop_endpoint(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !state.manager.is_running(&id) {
-        // 即使未运行也更新期望态，保持幂等
-        let _ = state.store.set_desired_running(&id, false);
+    let admission = state.lifecycle.admit_stop(&id);
+    let stop_gen = admission.stop_gen;
+    let (stop_res, persist_res) = tokio::join!(admission.handle.await_result(), admission.persist);
+    let persist_failed = match persist_res {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e),
+        // blocking 任务本身 panic/取消：同样按"意图未持久化"处理（fail-closed）。
+        // 必须**归还门状态**：否则 `stop_persist_inflight` 永远非空，P0-1 的启动
+        // 闸门会把该端点永久锁在 409（一次任务异常 ≠ 永久不可用）。
+        Err(join) => {
+            let msg = format!("persist task failed: {join}");
+            let _ = state
+                .lifecycle
+                .finish_stop_persist(&id, stop_gen, Err(msg.clone()));
+            Some(msg)
+        }
+    };
+    if let Some(e) = persist_failed {
+        tracing::error!(
+            endpoint = %id, error = %e,
+            "STOP intent not persisted; response is explicit failure (500)"
+        );
         return (
-            StatusCode::OK,
-            Json(serde_json::json!({ "stopped": id, "was_running": false })),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(
+                "STOP_INTENT_NOT_PERSISTED",
+                lifecycle::STOP_INTENT_NOT_PERSISTED_MESSAGE,
+            )),
         );
     }
-    // P0-3：teardown 异常（drain fatal/timeout）是 500 显式错误，
-    // 不再"Detach 了也返回成功"。任务已结束（await 过），期望态照常落 false。
-    let res = state.manager.stop_endpoint(&id).await;
-    let _ = state.store.set_desired_running(&id, false);
-    match res {
+    match stop_res {
         Ok(was) => (
             StatusCode::OK,
             Json(serde_json::json!({ "stopped": id, "was_running": was })),

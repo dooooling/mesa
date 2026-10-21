@@ -46,3 +46,7 @@ async-opcua-types = "0.19"
 [dev-dependencies]
 rusqlite = { workspace = true }
 mesa-event-store = { workspace = true, features = ["test-hooks"] }
+# G7 生命周期竞态 Gate：teardown panic 注入 + 运行意图落盘失败/变慢注入。
+# 与上面 event-store 同口径：只经 dev-dependencies 打开，生产图永不启用。
+mesa-driver-manager = { workspace = true, features = ["test-hooks"] }
+mesa-config-store = { workspace = true, features = ["test-hooks"] }
