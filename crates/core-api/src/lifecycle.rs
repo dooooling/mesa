@@ -4,6 +4,7 @@
 //! - `driver-manager` 的 attempt 表 = "有没有 attempt、到哪一步"的唯一真值；
 //! - 本模块的 [`LifecycleGate`] = **排序器与票据池**，持有 `stop_gen`、
 //!   在途 Start 票据数、**全部在途 Stop 落盘代次集合**（P0-A）、
+//!   **在途 Start 落盘计数与 DELETE 屏障**（P0-D）、
 //!   `desired_running` 缓存与写入序号；"有没有 attempt、到哪一步"仍只由
 //!   `driver-manager` 回答。
 //!
@@ -44,6 +45,17 @@ pub const SETTLE_TICK: Duration = Duration::from_millis(250);
 /// Stop 意图落盘失败的**冻结响应体**（评审给定，逐字采用）。
 pub const STOP_INTENT_NOT_PERSISTED_MESSAGE: &str =
     "停止已执行，但停止意图未能持久化；禁止重新启动，需人工核验";
+
+/// DELETE 等待在途意图写入收敛的预算（P0-D）。
+///
+/// 取值依据：Stop 的 `desired=false` 落盘在 DB busy 场景下是毫秒到秒级（验收用的
+/// 慢写注入是 2.5–9s），10s 覆盖最坏预算且不会让正常删除变慢——**正常路径下
+/// 两个计数器都是 0，`await_intent_quiescent` 第一次观测就返回，无任何 sleep**。
+/// 超时不是"硬删"，而是 409 拒绝，让客户端重试（删除不可逆，等不到就别做）。
+pub const DELETE_PERSIST_WAIT: Duration = Duration::from_secs(10);
+
+/// 上述等待的采样间隔（只在确实有在途写入时才 sleep，故不影响正常路径）。
+const DELETE_PERSIST_POLL: Duration = Duration::from_millis(5);
 
 /// 生命周期错误（结构化：状态码 + 可机器识别 code + 文案）。
 #[derive(Debug, Clone)]
@@ -89,6 +101,23 @@ struct EpGate {
     stop_gen: u64,
     /// 已 admit、未 commit/未放弃的 Start 票据数（判据 3 / 6）。
     inflight_starts: u32,
+    /// **已提交**、`desired=true` 仍在落盘的 Start 数（P0-D）。
+    ///
+    /// 与 `inflight_starts` 的区别是"有没有外部副作用"：票据只代表"有人想启动"，
+    /// 尚未拉起任何东西，DELETE 的代次 bump 足以作废它；本计数代表"驱动已经起来、
+    /// 运行意图正在写库"，删除前必须等它真正收敛，否则迟到的 `true` 会落到删除后
+    /// 重建的同 ID 记录上（与 P0-A 同类的持久化反序）。
+    ///
+    /// 登记点在 `commit_start`（与 `start_endpoint` 同一临界区），归还点由
+    /// [`StartPersistGuard`] 的 Drop 负责——含 blocking 任务 panic/取消路径。
+    start_persist_inflight: u32,
+    /// DELETE 屏障（P0-D）：置位期间**不接受新的写入**。
+    ///
+    /// 为什么必须有它：只"等待在途写入收敛"是不够的——"观察到集合为空"与
+    /// "真正删掉记录行"之间仍会受理新的 Stop 并派生出新的落盘任务，那个任务
+    /// 完全可能在本端点被删除、又被同 ID 重建**之后**才执行。屏障把这段窗口
+    /// 里的新写入直接掐掉，于是"一次观测为空"等价于"删行时一定为空"。
+    deleting: bool,
     /// `desired_running` 的内存权威（懒初始化自 DB；此后由门写入）。
     desired: Option<bool>,
     /// 每次**成功**写入 +1（诊断用；证明"读到的不是旧值"）。
@@ -153,6 +182,42 @@ impl Drop for StartTicket {
     }
 }
 
+/// Start 运行意图落盘的 RAII 计数（P0-D）。
+///
+/// 为什么用 RAII 而不是"每个返回分支各减一次"：落盘发生在 `spawn_blocking`
+/// 里，写入成功、写入失败、blocking 任务 panic 三条路径都要归还；只要漏掉
+/// 一条，DELETE 的等待就会永久超时（比漏减更糟的是"错误地减掉"——那会让
+/// 删除在写入未完成时放行）。Drop 在**展开路径**上同样执行，因此无需重复
+/// 记账。注意计数归还发生在本任务结束时，比 DB 写入本身略晚——这只会让
+/// DELETE 多等一拍，方向是安全的。
+struct StartPersistGuard {
+    gate: Arc<LifecycleGate>,
+    id: String,
+}
+
+impl StartPersistGuard {
+    /// 只在 `commit_start` 的同步临界区内构造。
+    ///
+    /// 注意签名接收 `&mut EpGate` 而不是自己再加锁：调用方此时**已经持有**门锁，
+    /// `std::sync::Mutex` 不可重入，二次加锁会死锁。
+    fn register(g: &mut EpGate, gate: &Arc<LifecycleGate>, id: &str) -> Self {
+        g.start_persist_inflight = g.start_persist_inflight.saturating_add(1);
+        Self {
+            gate: Arc::clone(gate),
+            id: id.to_string(),
+        }
+    }
+}
+
+impl Drop for StartPersistGuard {
+    fn drop(&mut self) {
+        let mut m = self.gate.inner.lock().unwrap();
+        if let Some(g) = m.get_mut(&self.id) {
+            g.start_persist_inflight = g.start_persist_inflight.saturating_sub(1);
+        }
+    }
+}
+
 /// Stop 受理结果：拆解**已经开始**，`persist` 是并行的落盘尝试。
 pub struct StopAdmission {
     /// 合流句柄（多个 Stop 等同一个结论）。
@@ -186,6 +251,12 @@ pub struct SettleSample {
     pub stop_persist_inflight_count: usize,
     pub intent_unpersisted: bool,
     pub inflight_starts: u32,
+    /// DELETE 屏障是否已打开（P0-D，诊断面）。
+    ///
+    /// 只读观测点：DELETE 受理后、等到在途意图写入收敛之前本值为 true，删除撤销
+    /// 或完成即复位。单测据此断言"屏障可立可撤"；端到端用例不依赖它判时序
+    /// （DELETE 的等待时长取决于注入的 DB 延迟，观察窗口不保证可采样）。
+    pub deleting: bool,
 }
 
 /// 收敛判定结果。
@@ -276,7 +347,7 @@ impl LifecycleGate {
         // 若等锁期间有新 Stop 受理，下面的二次判定会拒绝或交给 start_endpoint。
         let guard = persist_lock.lock_owned().await;
 
-        {
+        let start_persist = {
             let mut m = self.inner.lock().unwrap();
             let g = m.entry(ticket.id.clone()).or_default();
             Self::check_start_preconditions(g, &ticket.id, ticket.stop_gen)?;
@@ -295,7 +366,11 @@ impl LifecycleGate {
             if let Err(msg) = self.manager.start_endpoint(cfg) {
                 return Err(map_start_err(&ticket.id, msg));
             }
-        }
+            // P0-D：**在同一临界区**登记"运行意图正在落盘"。DELETE 的屏障与等待
+            // 读的是同一把门锁，因此不可能出现"attempt 已起、写入已派发，但删除
+            // 看不到它"的交错。
+            StartPersistGuard::register(g, self, &ticket.id)
+        };
 
         // 临界区外落盘 true（P0-B）。串行器 guard 被 move 进 blocking 任务：
         // 即使 handler 被取消，落盘与门状态归并仍会完成（只丢应答，不丢状态）。
@@ -306,6 +381,8 @@ impl LifecycleGate {
         let rt = tokio::runtime::Handle::current();
         match tokio::task::spawn_blocking(move || {
             let _guard = guard;
+            // 落盘在途计数随本任务结束归还（含 panic 展开路径）。
+            let _start_persist = start_persist;
             let write = store
                 .set_desired_running(&id, true)
                 .map_err(|e| e.to_string());
@@ -356,6 +433,16 @@ impl LifecycleGate {
                     "endpoint `{endpoint_id}`: Stop 已受理，本次启动被取消（stop_gen {ticket_gen} -> {}）",
                     g.stop_gen
                 ),
+            ));
+        }
+        // 步骤 2（P0-D）：DELETE 屏障期间一律不得提交。
+        // 复用既有 `ENDPOINT_DELETED`（与 P0-7 的"配置行已删"同一语义、同一响应码），
+        // 不新增码：调用方已按"该端点正在消失"处理。
+        if g.deleting {
+            return Err(LifecycleError::new(
+                StatusCode::CONFLICT,
+                "ENDPOINT_DELETED",
+                format!("endpoint `{endpoint_id}`: 该端点正在被删除，启动已中止"),
             ));
         }
         Ok(())
@@ -442,26 +529,110 @@ impl LifecycleGate {
     }
 
     // -----------------------------------------------------------------
-    // Delete：作废在途 Start（P0-7）
+    // Delete：删除屏障 + 在途写入收敛 + 墓碑代次（P0-7 / P0-D）
     // -----------------------------------------------------------------
 
-    /// DELETE 前调用：`stop_gen + 1` 作废所有在途 Start 票据。
+    /// DELETE 第一步（同步）：打开删除屏障，**拒绝新的写入**进入本端点。
     ///
-    /// 为什么必须在这里 bump：DELETE 的 `has_live_attempt` 检查与真正删除之间，
-    /// 一个已 admit 的 Start 仍可能提交并拉起驱动 ⇒ "删除的端点继续启动"。
-    /// 复用 Stop 的同一把锁 + 同一代次机制，提交侧无需新增分支。
+    /// 修复的竞态（P0-D，评审给的五步交错）：Stop-A 的 teardown 已完成、
+    /// `desired=false` 仍在写库，此时 DELETE 只看 attempt 表 ⇒ 认为"没有活跃
+    /// attempt" ⇒ 删行 + 清空在途标记；随后的 CREATE 以**同一 ID** 重建并 Start
+    /// 写入 `desired=true`；最后 Stop-A 的迟到 SQL 落到新记录上，把新实例污染成
+    /// `desired=false` 而实际在跑。
     ///
-    /// 不重置 `stop_gen`：端点若被同名重建，新票据拿到的是新代次，旧票据永远
-    /// 匹配不上（与墓碑语义一致）。
-    pub fn invalidate_starts_for_delete(&self, endpoint_id: &str) {
+    /// 根因与 P0-A 同类：**清空集合 ≠ 后台持久化已完成**。
+    ///
+    /// 因此 DELETE 拆成三步，必须按序调用：
+    /// 1. [`Self::begin_delete`]：屏障 —— 新 Start 提交、新 Stop 落盘一律不再进入；
+    /// 2. [`Self::await_intent_quiescent`]：等**已在途**的写入真正收敛（有界）；
+    /// 3. 删行后 [`Self::finish_delete`]（成功，立墓碑代次）/ [`Self::abort_delete`]
+    ///    （未删成，只撤屏障）。
+    ///
+    /// 为什么先开屏障再等待（而不是先等再开屏障）：否则"观测到集合为空"与
+    /// "真正删行"之间还会受理新 Stop 并派生出新落盘任务，那个任务可能在本端点
+    /// 被删除、又被同 ID 重建**之后**才执行——窗口只是变窄，并没有消失。
+    pub fn begin_delete(&self, endpoint_id: &str) {
         let mut m = self.inner.lock().unwrap();
         let g = m.entry(endpoint_id.to_string()).or_default();
+        g.deleting = true;
+    }
+
+    /// DELETE 撤销（等待超时 / 404 / 存储错误）：只撤屏障。
+    ///
+    /// 刻意**不动**在途计数、`intent_unpersisted` 与 `stop_persist_confirmed_gen`：
+    /// 删除没有发生，端点仍然存在，这些状态对"是否允许启动 / 是否停干净"仍然
+    /// 有效，清掉它们等于放宽保护。
+    pub fn abort_delete(&self, endpoint_id: &str) {
+        let mut m = self.inner.lock().unwrap();
+        if let Some(g) = m.get_mut(endpoint_id) {
+            g.deleting = false;
+        }
+    }
+
+    /// 等待该端点的全部运行意图落盘收敛（P0-D，DELETE 专用，有界）。
+    ///
+    /// 判据是**两个真实计数器**，而不是"集合已被清空"这个动作：
+    /// - `stop_persist_inflight`：已受理 Stop 的 `desired=false` 尚未确认；
+    /// - `start_persist_inflight`：已提交 Start 的 `desired=true` 尚未确认。
+    ///
+    /// 必须在 [`Self::begin_delete`] 之后调用：屏障保证等待期间不再产生新写入，
+    /// 因此"一次观测为空"就等价于"删行时一定为空"，观察点与删行之间没有窗口。
+    /// 超时 ⇒ 返回 409 `DELETE_PERSIST_IN_PROGRESS`（拒绝删除，而不是在没把握时
+    /// 删掉配置：删除是不可逆的破坏性动作，等不到就应当让客户端重试）。
+    pub async fn await_intent_quiescent(
+        &self,
+        endpoint_id: &str,
+        timeout: Duration,
+    ) -> Result<(), LifecycleError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = {
+                let m = self.inner.lock().unwrap();
+                m.get(endpoint_id).map_or((0usize, 0u32), |g| {
+                    (g.stop_persist_inflight.len(), g.start_persist_inflight)
+                })
+            };
+
+            if now == (0, 0) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(delete_persist_in_progress(endpoint_id, now, timeout));
+            }
+            tokio::time::sleep(DELETE_PERSIST_POLL).await;
+        }
+    }
+
+    /// DELETE 第三步（记录行已删除）：立墓碑代次并复位门状态。
+    ///
+    /// 两件事：
+    /// 1. `stop_gen + 1` —— **墓碑代次**，复用既有代次机制，不新造一套：删除前
+    ///    admit 的 Start 票据、以及删除前受理的 Stop 代次，永远匹配不上重建后的
+    ///    实例（`finish_stop_persist` 的 `latest` 判定同样不再成立，因此旧代次
+    ///    即使归并也不会改写新实例的内存意图）。
+    /// 2. 复位缓存的 `desired`（重建后的端点懒加载自 DB），清掉围栏标记（记录行
+    ///    已不存在，围栏没有保护对象；`store` 侧的围栏由 handler 一并清除）。
+    ///
+    /// **不再 `stop_persist_inflight.clear()`**：清空集合不等于任务已完成。能走到
+    /// 这里的前提是 [`Self::await_intent_quiescent`] 已证明计数为 0；万一该前提
+    /// 被破坏（不应发生），保留计数是 fail-closed 方向——重建后的同名端点会被
+    /// 409 `STOP_PERSIST_IN_PROGRESS` 拦住，而不是让旧写入落到新记录上。
+    pub fn finish_delete(&self, endpoint_id: &str) {
+        let mut m = self.inner.lock().unwrap();
+        let g = m.entry(endpoint_id.to_string()).or_default();
+        if !g.stop_persist_inflight.is_empty() || g.start_persist_inflight != 0 {
+            tracing::error!(
+                endpoint = %endpoint_id,
+                stop_inflight = g.stop_persist_inflight.len(),
+                start_inflight = g.start_persist_inflight,
+                "删除完成时仍有在途运行意图写入（不应发生）；保留计数以禁止该 id 被重新启动"
+            );
+        }
         g.stop_gen += 1;
-        g.stop_persist_inflight.clear();
         g.stop_persist_confirmed_gen = None;
-        // 端点即将不存在：旧的"意图未持久化"阻塞不再适用于这个 id。
         g.intent_unpersisted = false;
         g.desired = None;
+        g.deleting = false;
     }
 
     // -----------------------------------------------------------------
@@ -476,6 +647,23 @@ impl LifecycleGate {
         let (handle, stop_gen, persist_lock) = {
             let mut m = self.inner.lock().unwrap();
             let g = m.entry(endpoint_id.to_string()).or_default();
+            // P0-D 删除屏障：端点正在被删除（DELETE 已核对过无活 attempt），行即将
+            // 消失。这次 `desired=false` **没有持久对象**，因此：
+            // - 不登记在途代次（否则把删除的等待绑在一次本就无意义的写入上）；
+            // - 不起落盘任务（否则它可能在删除完成、同 ID 重建之后才执行，落到新
+            //   记录上）。
+            // 丢意图的风险为零：端点未在运行还是未在运行——若删除失败，DB 里的
+            // `desired` 要么本就是 false，要么已被更早的失败围栏（intent_unpersisted
+            // + 持久化围栏）挡住自动恢复；内存意图这里仍置假。
+            if g.deleting {
+                g.desired = Some(false);
+                let h = self.manager.begin_stop(endpoint_id);
+                return StopAdmission {
+                    handle: h,
+                    persist: tokio::spawn(async { Ok::<(), String>(()) }),
+                    stop_gen: g.stop_gen,
+                };
+            }
             // 1) 代次 +1：先作废所有在途 Start 票据（W1 的唯一判据）。
             g.stop_gen += 1;
             let stop_generation = g.stop_gen;
@@ -639,6 +827,7 @@ impl LifecycleGate {
             inflight_count,
             intent_unpersisted,
             inflight_starts,
+            deleting,
         ) = {
             let mut m = self.inner.lock().unwrap();
             let g = m.entry(endpoint_id.to_string()).or_default();
@@ -660,6 +849,7 @@ impl LifecycleGate {
                 g.stop_persist_inflight.len(),
                 g.intent_unpersisted,
                 g.inflight_starts,
+                g.deleting,
             )
         };
         let (snapshot_gen, snapshot_state) = self
@@ -680,6 +870,7 @@ impl LifecycleGate {
             stop_persist_inflight_count: inflight_count,
             intent_unpersisted,
             inflight_starts,
+            deleting,
         }
     }
 
@@ -774,6 +965,30 @@ fn stop_persist_in_progress(endpoint_id: &str) -> LifecycleError {
         "STOP_PERSIST_IN_PROGRESS",
         format!(
             "endpoint `{endpoint_id}`: 上一次 Stop 的停止意图仍在落盘，尚未确认；请稍后重试 Start"
+        ),
+    )
+}
+
+/// P0-D 的拒绝码：DELETE 等不到在途意图写入收敛。
+///
+/// **增量新增**（不动 wire/proto，也不动冻结的 8 个 Stop 码）：它属于删除面，
+/// 与 Start 面的 `STOP_PERSIST_IN_PROGRESS` 语义不同，客户端需要区分"再试一次
+/// Start"与"再试一次 DELETE"。
+fn delete_persist_in_progress(
+    endpoint_id: &str,
+    pending: (usize, u32),
+    waited: Duration,
+) -> LifecycleError {
+    LifecycleError::new(
+        StatusCode::CONFLICT,
+        "DELETE_PERSIST_IN_PROGRESS",
+        format!(
+            "endpoint `{endpoint_id}`: 仍有运行意图正在落盘（Stop 在途 {} 个 / Start 在途 {} 个），\
+             已等待 {}ms 仍未收敛；为避免删除后被同 ID 重建的实例被旧写入污染，本次删除被拒绝，\
+             请稍后重试",
+            pending.0,
+            pending.1,
+            waited.as_millis()
         ),
     )
 }
@@ -953,7 +1168,7 @@ mod tests {
     }
 
     /// 合流语义的纯逻辑面：第二次 Stop 不重复 cancel/teardown，只等同一个结论。
-    /// （真正的并发 Stop 端到端在 `lifecycle_race.rs`。）
+    /// （真正的并发 Stop 端到端在 `tests/driver-contract/tests/stop_lifecycle.rs`。）
     #[tokio::test]
     async fn second_stop_joins_instead_of_failing() {
         let g = gate("join");
@@ -965,5 +1180,149 @@ mod tests {
         assert_eq!(b.handle.await_result().await, Ok(false));
         assert_eq!(a.persist.await.unwrap(), Ok(()));
         assert_eq!(b.persist.await.unwrap(), Ok(()));
+    }
+
+    // -----------------------------------------------------------------
+    // P0-D：删除与未完成 Stop 落盘的竞态
+    // -----------------------------------------------------------------
+
+    /// P0-D（门状态面）：在途落盘未收敛时 DELETE 的等待必须**失败**（409 拒绝），
+    /// 收敛后才放行；`abort_delete` 不得顺手清掉任何保护状态。
+    #[tokio::test]
+    async fn delete_wait_rejects_unconverged_intent_persist_and_passes_after_convergence() {
+        let g = gate("p0d-wait");
+        // 构造"Stop-A 已受理、其 desired=false 仍在途"的门状态。
+        {
+            let mut m = g.inner.lock().unwrap();
+            let ep = m.entry("ep-1".to_string()).or_default();
+            ep.stop_gen = 1;
+            ep.desired = Some(true);
+            ep.stop_persist_inflight.insert(1);
+        }
+        g.begin_delete("ep-1");
+        let err = g
+            .await_intent_quiescent("ep-1", Duration::from_millis(50))
+            .await
+            .expect_err("落盘未收敛时 DELETE 必须被拒绝");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, "DELETE_PERSIST_IN_PROGRESS");
+
+        // 撤销屏障：端点仍在，Stop 的落盘归并照常推进（保护状态不得被清掉）。
+        g.abort_delete("ep-1");
+        assert_eq!(g.sample("ep-1").stop_persist_inflight_count, 1);
+        g.finish_stop_persist("ep-1", 1, Ok(true)).unwrap();
+        assert_eq!(g.sample("ep-1").desired, Some(false));
+        assert_eq!(g.sample("ep-1").stop_persist_confirmed_gen, Some(1));
+
+        // 收敛后：等待立即通过（正常路径无 sleep，一次观测即返回）。
+        g.begin_delete("ep-1");
+        let t = Instant::now();
+        g.await_intent_quiescent("ep-1", DELETE_PERSIST_WAIT)
+            .await
+            .expect("已收敛，等待必须通过");
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "正常路径不得引入等待时延，实际 {:?}",
+            t.elapsed()
+        );
+
+        // 立墓碑：代次 +1（旧票据/旧 Stop 代次永不匹配重建后的实例）。
+        let gen_before = g.sample("ep-1").stop_gen;
+        g.finish_delete("ep-1");
+        let s = g.sample("ep-1");
+        assert_eq!(s.stop_gen, gen_before + 1, "删除成功必须推进墓碑代次");
+        // `desired` 复位为"无缓存"⇒ sample 懒加载自 DB（本用例的库行仍在，
+        // 值为 false；真实删除后为 None）。两条都表示"不再沿用旧实例的缓存"。
+        assert_eq!(s.desired, Some(false), "重建后的端点应懒加载自 DB");
+        assert_eq!(s.stop_persist_confirmed_gen, None);
+        assert!(!s.intent_unpersisted);
+    }
+
+    /// P0-D（屏障面）：屏障期间**不得**产生新写入——新 Start 409
+    /// `ENDPOINT_DELETED`（且不留 attempt），新 Stop 照常拆解但不派发落盘任务、
+    /// 不登记在途代次（否则删除的等待会被一次无意义的写入拖住）。
+    #[tokio::test]
+    async fn delete_barrier_blocks_new_start_and_new_stop_persist() {
+        let g = gate("p0d-barrier");
+        g.begin_delete("ep-1");
+        assert!(g.sample("ep-1").deleting, "屏障必须可观测（诊断面）");
+        g.abort_delete("ep-1");
+        assert!(!g.sample("ep-1").deleting, "撤销后屏障必须复位");
+        g.begin_delete("ep-1");
+
+        // 新 Stop：受理、拆解照做、落盘任务立即返回 Ok，且不登记在途代次。
+        let adm = g.admit_stop("ep-1");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), adm.persist)
+                .await
+                .expect("屏障期 Stop 的落盘占位必须有界")
+                .expect("占位任务不得 panic"),
+            Ok(())
+        );
+        assert_eq!(
+            g.sample("ep-1").stop_persist_inflight_count,
+            0,
+            "屏障期不得登记在途代次"
+        );
+        assert_eq!(g.sample("ep-1").desired, Some(false), "内存意图仍须置假");
+
+        // 新 Start：必须 409，且不得产生 attempt。
+        let ticket = g.admit_start("ep-1");
+        let err = g
+            .commit_start(&ticket, dummy_cfg("ep-1"))
+            .await
+            .expect_err("删除屏障期间 Start 必须被拒");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, "ENDPOINT_DELETED");
+        assert!(!g.manager.has_live_attempt("ep-1"), "不得产生 attempt");
+
+        // 撤销屏障后，请求重新抵达 manager（本例驱动目录为空，因此必然失败，
+        // 但失败原因**不得**再是删除相关的码 ⇒ 屏障确已撤销）。
+        g.abort_delete("ep-1");
+        let ticket = g.admit_start("ep-1");
+        let err = g
+            .commit_start(&ticket, dummy_cfg("ep-1"))
+            .await
+            .expect_err("本例驱动目录为空，Start 必然失败");
+        assert_ne!(
+            err.code, "ENDPOINT_DELETED",
+            "撤销屏障后不得继续以删除为由拒绝: {err}"
+        );
+    }
+
+    /// P0-D（不变量）：`finish_delete` **不得**靠 `clear()` 掩盖在途写入。
+    ///
+    /// 修复前的 `invalidate_starts_for_delete` 无条件 `stop_persist_inflight.clear()`；
+    /// 本用例把计数摆成"仍有在途"后调 `finish_delete`，集合必须原样保留 ⇒ 重建后
+    /// 的同 ID 端点会被 409 `STOP_PERSIST_IN_PROGRESS` 拦住（fail-closed），
+    /// 而不是让旧写入落到新记录上。
+    #[tokio::test]
+    async fn finish_delete_never_hides_inflight_intent_writes() {
+        let g = gate("p0d-tomb");
+        {
+            let mut m = g.inner.lock().unwrap();
+            let ep = m.entry("ep-1".to_string()).or_default();
+            ep.stop_gen = 4;
+            ep.stop_persist_inflight.insert(4);
+            ep.start_persist_inflight = 1;
+        }
+        g.begin_delete("ep-1");
+        g.finish_delete("ep-1");
+
+        let s = g.sample("ep-1");
+        assert_eq!(
+            s.stop_persist_inflight_count, 1,
+            "finish_delete 不得清空在途 Stop 集合: {s:?}"
+        );
+        assert_eq!(s.stop_gen, 5, "墓碑代次必须推进");
+
+        // 重建同 ID 后的 Start 必须被拒（fail-closed），绝不写 desired=true。
+        let ticket = g.admit_start("ep-1");
+        let err = g
+            .commit_start(&ticket, dummy_cfg("ep-1"))
+            .await
+            .expect_err("仍有在途写入时不得放行 Start");
+        assert_eq!(err.code, "STOP_PERSIST_IN_PROGRESS");
+        assert!(!g.manager.has_live_attempt("ep-1"));
     }
 }

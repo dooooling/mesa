@@ -1253,23 +1253,7 @@ impl SettleRig {
                 name: "dev".into(),
             })
             .unwrap();
-        self.store
-            .create_endpoint(&EndpointRecord {
-                id: id.into(),
-                name: id.into(),
-                device_id: format!("dev-{id}"),
-                driver_id: "test-driver".into(),
-                connection_json: "{}".into(),
-                desired_running: false,
-                updated_at_ns: mesa_core_types::now_unix_ns(),
-            })
-            .unwrap();
-        let tasks = vec![common::poll_task(
-            "d",
-            50,
-            serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
-        )];
-        self.store.replace_tasks(id, &tasks).unwrap();
+        self.create_endpoint_row(id);
         if with_event {
             let binding = mesa_core_types::GenericEventBinding {
                 stream_id: mesa_test_driver::SIM_EVENT_STREAM_COUNTER.into(),
@@ -1290,6 +1274,28 @@ impl SettleRig {
                 )
                 .unwrap();
         }
+    }
+
+    /// 只写 endpoint 行 + data 任务（device 复用）。P0-D 的"同 ID 重建"用它：
+    /// device 删不掉也无需重建，重建的正是 endpoint 行本身。
+    fn create_endpoint_row(&self, id: &str) {
+        self.store
+            .create_endpoint(&EndpointRecord {
+                id: id.into(),
+                name: id.into(),
+                device_id: format!("dev-{id}"),
+                driver_id: "test-driver".into(),
+                connection_json: "{}".into(),
+                desired_running: false,
+                updated_at_ns: mesa_core_types::now_unix_ns(),
+            })
+            .unwrap();
+        let tasks = vec![common::poll_task(
+            "d",
+            50,
+            serde_json::json!([{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]),
+        )];
+        self.store.replace_tasks(id, &tasks).unwrap();
     }
 
     async fn post(&self, path: &str) -> (StatusCode, serde_json::Value) {
@@ -2275,4 +2281,265 @@ async fn delete_racing_start_never_leaves_orphan_attempt() {
             other => panic!("第 {round} 轮：DELETE 只允许 200/409，实际 {other}"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// P0-D：删除与"未完成的 Stop 落盘"的竞态（DELETE + 同 ID 重建）
+// ---------------------------------------------------------------------------
+
+/// P0-D 确定性 Gate：评审给定的五步交错，全部经由 HTTP + 持久化面复现。
+///
+/// ```text
+/// 1. Stop-A 已完成驱动 teardown（attempt 条目已移除），
+///    但 desired=false 仍在写库（注入 9s 延迟；DELETE 的等待预算 10s）；
+/// 2. DELETE 到达：旧码"看不到活跃 attempt"⇒ 立即删行 + 清空在途标记；
+/// 3. CREATE 以**同一 Endpoint ID** 重建，Start 写入 desired=true；
+/// 4. 旧 Stop-A 的迟到 SQL 仍会执行 —— 它命中的已经是**另一条记录**；
+/// 5. 结果：新实例的运行意图可能被旧实例的异步任务改写（DB 与运行态不一致）。
+/// ```
+///
+/// 修复后：DELETE 必须**等待**那次写入真正收敛（有界 10s）后才删行；等待期间
+/// 屏障拒绝新 Start（409 `ENDPOINT_DELETED`）；删除成功才立墓碑代次（`stop_gen`
+/// +1），使旧实例的票据/代次永远匹配不上重建后的记录。
+///
+/// 旧码上**确定性必红**的断言（在"前置：写入仍在途"成立时）：
+/// - 删除窗口内的 Start 不是 409（旧码已删行、且清空了在途标记）；
+/// - 旧 Stop 的 `desired=false` 未确认之前配置行已被删掉；
+/// - DELETE 返回时旧 Stop 的 `desired=false` 尚未确认落库。
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_waits_for_inflight_stop_persist_and_rebuild_is_not_polluted() {
+    use std::sync::atomic::Ordering;
+
+    let rig = SettleRig::new("p0d").await;
+
+    let id = "p0d-ep";
+    rig.create_endpoint(id, false);
+    let (s, v) = rig.start(id).await;
+    assert_eq!(s, StatusCode::OK, "预置启动: {v}");
+    rig.wait_running(id, 30).await;
+    assert!(rig.desired(id), "预置：DB 必须为 true");
+
+    // 只让本次 Stop 的 false 写延迟 9s；队列消费完即回落到 0ms，因此重建实例的
+    // true 写不受影响。9s 是刻意留的余量：DELETE 的等待预算是 10s（`DELETE_PERSIST_WAIT`），
+    // 而 teardown 本身耗时不定（实测几十毫秒，重载时可到秒级）——"Stop 的写入仍在途"
+    // 这个窗口必须比 teardown 明显宽，否则本用例会退化成时序采样而不是确定性 Gate。
+    {
+        let faults = rig.store.desired_write_faults();
+        let mut q = faults.delay_seq.lock().unwrap();
+        q.clear();
+        q.push_back(9000);
+    }
+    let base = rig
+        .store
+        .desired_write_faults()
+        .calls_started
+        .load(Ordering::Relaxed);
+    // 旧实例那次 `desired=false` 写库**已执行完毕**的判据（calls_completed 在
+    // UPDATE 之后 +1）：用它替代固定 sleep，才能确定性覆盖"迟到写入落地"的时刻。
+    let base_completed = rig
+        .store
+        .desired_write_faults()
+        .calls_completed
+        .load(Ordering::Relaxed);
+
+    // ── 步骤 1：Stop 受理 → teardown 完成 → desired=false 仍在途 ──
+    let stop_task = {
+        let app = rig.app.clone();
+        let uri = format!("/api/v1/endpoints/{id}/stop");
+        tokio::spawn(async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+            )
+        })
+    };
+    common::wait_until(10, || {
+        rig.store
+            .desired_write_faults()
+            .calls_started
+            .load(Ordering::Relaxed)
+            > base
+    })
+    .await;
+    common::wait_until(10, || !rig.mgr.has_live_attempt(id)).await;
+    common::wait_until(10, || rig.state_of(id).as_deref() == Some("STOPPED")).await;
+    assert!(
+        !stop_task.is_finished(),
+        "前置：Stop 的落盘必须仍在途（否则测不到本窗口）"
+    );
+    assert!(rig.desired(id), "前置：DB 仍是旧值 true");
+    // 前置的量化判据：旧 Stop 的那次写库调用**尚未完成**（`calls_completed` 在
+    // UPDATE 之后才 +1）。步骤 3 会用同一个计数器证明 DELETE 返回时它已完成。
+    assert_eq!(
+        rig.store
+            .desired_write_faults()
+            .calls_completed
+            .load(Ordering::Relaxed),
+        base_completed,
+        "前置：旧 Stop 的 desired=false 必须仍在途（已进入写库但未完成）"
+    );
+    assert_eq!(
+        rig.state.lifecycle.sample(id).stop_persist_inflight_count,
+        1,
+        "前置：在途 Stop 代次必须被门跟踪"
+    );
+
+    // ── 步骤 2：DELETE 到达 —— 必须等待，不得"看到没 attempt 就删" ──
+    //
+    // 判据全部落在可机器判定的状态上（不靠固定 sleep 猜时序）：
+    // - 删除窗口内的 Start 一律不得成功（409，且不得留下 attempt / 写入）；
+    // - 旧 Stop 的 `desired=false` 未确认之前，配置行不得被删掉；
+    // - DELETE 返回时，那次写入必须**已确认落库**（见步骤 3）。
+    let delete_task = {
+        let app = rig.app.clone();
+        let uri = format!("/api/v1/endpoints/{id}");
+        tokio::spawn(async move {
+            let req = Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+            )
+        })
+    };
+
+    // 窗口内的 Start：必须被拒。两种合法拒绝码取决于 DELETE 是否已立屏障：
+    // 屏障已立 ⇒ `ENDPOINT_DELETED`；尚未轮到 handler ⇒ 仍由 P0-A 的在途 Stop
+    // 闸门给出 `STOP_PERSIST_IN_PROGRESS`。两者都要求"不得产生 attempt / 写入"。
+    // 旧码：DELETE 已删行且清空了在途标记 ⇒ Start 会成功或被 404 挡住，本条即红。
+    let (s, v) = rig.start(id).await;
+    assert_eq!(
+        s,
+        StatusCode::CONFLICT,
+        "删除窗口内的 Start 必须 409: {s} {v}"
+    );
+    assert!(
+        matches!(code_of(&v), "ENDPOINT_DELETED" | "STOP_PERSIST_IN_PROGRESS"),
+        "删除窗口内的 Start 必须是可机器识别的拒绝码，实际: {v}"
+    );
+    assert!(
+        !rig.mgr.has_live_attempt(id),
+        "被拒的 Start 不得留下 attempt"
+    );
+    assert!(
+        rig.store.get_endpoint(id).unwrap().is_some(),
+        "P0-D：旧 Stop 的 desired=false 未确认前，DELETE 不得删行"
+    );
+    assert!(
+        !delete_task.is_finished(),
+        "P0-D：旧 Stop 的 desired=false 未确认前，DELETE 不得返回"
+    );
+
+    // ── 步骤 3：DELETE 收敛并删行（不在这里等 Stop 应答——否则旧码会因为
+    //    等 Stop 而错过"重建发生在迟到写入之前"的污染窗口）──
+    let (del_status, del_body) = tokio::time::timeout(Duration::from_secs(40), delete_task)
+        .await
+        .expect("DELETE 有界")
+        .unwrap();
+    assert_eq!(
+        del_status,
+        StatusCode::OK,
+        "落盘收敛后 DELETE 必须成功: {del_body}"
+    );
+    assert!(
+        rig.store.get_endpoint(id).unwrap().is_none(),
+        "DELETE 后配置行必须不存在"
+    );
+    // 修复的**核心**：DELETE 返回时，旧 Stop 的 `desired=false` 必须已经
+    // **确认落库**（`calls_completed` 在 UPDATE 之后才 +1），而不是"门把在途标记
+    // 清掉就算完成"。修复前这里恒为 false（DELETE 在被注入的 6s 窗口内就返回了）。
+    assert!(
+        rig.store
+            .desired_write_faults()
+            .calls_completed
+            .load(Ordering::Relaxed)
+            > base_completed,
+        "P0-D：DELETE 返回时旧 Stop 的 desired=false 必须已确认落库"
+    );
+
+    // ── 步骤 4：同一 ID 重建 + Start（写 desired=true）──
+    let calls_before_rebuild = rig
+        .store
+        .desired_write_faults()
+        .calls_started
+        .load(Ordering::Relaxed);
+    rig.create_endpoint_row(id);
+    let (s, v) = rig.start(id).await;
+    assert_eq!(s, StatusCode::OK, "同 ID 重建后 Start 必须成功: {v}");
+    rig.wait_running(id, 30).await;
+    assert!(rig.desired(id), "新实例：DB 必须为 true");
+
+    // ── 步骤 5：旧实例的迟到写入不得落到新记录上 ──
+    // 等**两次**写入都执行完毕再看（`calls_completed` 在 UPDATE 之后才 +1）：
+    // 旧 Stop 的 `desired=false` 与新实例的 `desired=true`。只等一次不够——新实例
+    // 自己的 true 会先完成，那正是"迟到写入尚未落地"的假绿窗口。
+    //
+    // 判别力（诚实说明，见 `persist_lock`）：同一 endpoint 的 `desired` 写库由
+    // `EpGate::persist_lock` 串行化，且该串行器在 DELETE 后仍被重建实例复用，
+    // 因此**仅仅"DB 慢"不会把两次写入的顺序颠倒**——旧写入排在前面时，它的
+    // `false` 会被新实例的 `true` 覆盖。真正的污染窗口是：
+    //   a) 旧写入还没排上串行器（调度饥饿）⇒ 它可以排在新的 `true` 之后；
+    //   b) 新实例的 `true` 写入失败/未发生 ⇒ 旧的 `false` 留在新记录上。
+    // 两者都不是靠"注入 DB 延迟"能确定性构造的，所以本用例把可判定性放在前面
+    // 三条断言（DELETE 必须等旧写入确认后才删行、删行时行还在、屏障期 Start 409）
+    // ——它们在修复前**确定性必红**；这里保留的是"最终 DB 与运行态一致"的收尾断言，
+    // 连同"重建后只允许新实例自己的一次写入"一起证明旧实例没有再发出写库调用。
+    common::wait_until(20, || {
+        rig.store
+            .desired_write_faults()
+            .calls_completed
+            .load(Ordering::Relaxed)
+            > base_completed + 1
+    })
+    .await;
+    assert!(
+        rig.desired(id),
+        "P0-D：旧 Stop 的迟到写入污染了重建后的记录（实际 RUNNING、DB=false）"
+    );
+    assert!(rig.mgr.has_live_attempt(id), "P0-D：新实例必须在运行");
+    assert_eq!(rig.state_of(id).as_deref(), Some("RUNNING"));
+    assert_eq!(
+        rig.store
+            .desired_write_faults()
+            .calls_started
+            .load(Ordering::Relaxed),
+        calls_before_rebuild + 1,
+        "P0-D：重建后只允许新实例自己的 true 写入，旧实例不得再发出任何写库调用"
+    );
+
+    // Stop 的应答也必须成功（它的 false 已确认落库，不会在之后覆盖新实例）。
+    let (stop_status, stop_body) = tokio::time::timeout(Duration::from_secs(40), stop_task)
+        .await
+        .expect("Stop 有界")
+        .unwrap();
+    assert_eq!(stop_status, StatusCode::OK, "Stop 必须成功: {stop_body}");
+    assert!(
+        rig.desired(id),
+        "P0-D：Stop 应答返回后新实例的 desired 仍必须为 true"
+    );
+
+    // 一致性收尾：DB 与运行态必须同向（RUNNING ⇒ desired=true）。
+    let _ = rig.stop(id).await;
+    assert!(!rig.desired(id), "收尾 Stop 后 DB 必须为 false");
+    assert!(!rig.mgr.has_live_attempt(id));
 }

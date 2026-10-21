@@ -2136,11 +2136,26 @@ async fn delete_endpoint(
             )),
         );
     }
-    // P0-7：作废在途 Start 票据（bump stop_gen），再复查一次 attempt 真值。
-    // 提交路径持有同一把门锁 ⇒ bump 返回后不可能再产生新 attempt；而 bump 之前
-    // 已提交的 attempt 在这里必然可见。两者合起来关掉"删除后又被启动"的窗口。
-    state.lifecycle.invalidate_starts_for_delete(&id);
+    // P0-D：打开删除屏障——此后新的 Start 提交（门内 409 `ENDPOINT_DELETED`）
+    // 与新的 Stop 落盘都不再进入本端点，避免"等待收敛 → 删行"之间又冒出写入。
+    state.lifecycle.begin_delete(&id);
+    // P0-D：**等已有的在途意图写入真正收敛**（不是清空标记）。teardown 已完成、
+    // `desired=false` 仍在写库的 Stop，必须在删行之前落完：否则删行 + 同 ID 重建
+    // + Start 之后，那条迟到的 `false` 会写到新实例上（评审给的五步交错）。
+    // 超时 ⇒ 409 `DELETE_PERSIST_IN_PROGRESS`，撤销屏障且不删除（宁可让客户端
+    // 重试，也不在没把握时做不可逆的删除）。
+    if let Err(e) = state
+        .lifecycle
+        .await_intent_quiescent(&id, lifecycle::DELETE_PERSIST_WAIT)
+        .await
+    {
+        state.lifecycle.abort_delete(&id);
+        return e.to_response();
+    }
+    // 屏障期间仍可能受理过 Stop（`admit_stop` 与门锁同临界区，会同步 begin_stop）。
+    // 一旦有活 attempt 出现，同样不得删配置（P0-7 的原判据必须在新窗口里复查）。
     if state.manager.has_live_attempt(&id) {
+        state.lifecycle.abort_delete(&id);
         return (
             StatusCode::CONFLICT,
             Json(json_error(
@@ -2160,13 +2175,22 @@ async fn delete_endpoint(
             // 端点已彻底删除：停止意图围栏（若曾因落盘失败写入）已无保护对象，
             // 不清会留下指向不存在端点的永久围栏项，干扰人工核验与诊断。
             let _ = state.store.clear_stop_intent_unpersisted(&id);
+            // P0-D：立墓碑代次（`stop_gen + 1`）并复位缓冲意图；此时已证明没有
+            // 任何在途意图写入，因此不会再有旧写入落到重建后的同 ID 记录上。
+            state.lifecycle.finish_delete(&id);
             (StatusCode::OK, Json(serde_json::json!({ "deleted": id })))
         }
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
-        ),
-        Err(e) => store_err_to_response(e),
+        Ok(false) => {
+            state.lifecycle.abort_delete(&id);
+            (
+                StatusCode::NOT_FOUND,
+                Json(json_error("NOT_FOUND", &format!("endpoint `{id}`"))),
+            )
+        }
+        Err(e) => {
+            state.lifecycle.abort_delete(&id);
+            store_err_to_response(e)
+        }
     }
 }
 
