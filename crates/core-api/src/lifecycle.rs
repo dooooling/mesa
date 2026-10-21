@@ -869,6 +869,44 @@ mod tests {
         assert_eq!(g.desired("ep-1"), Some(false), "desired 必须仍为假");
     }
 
+    /// P0-A 的集合语义（**不依赖**串行器）：Stop-B 是最新代次且先完成，
+    /// 不得把仍在途的 Stop-A 代次从集合里清掉；否则新 Start 会被放行，
+    /// 随后 A 的迟到 false 覆盖 Start 的 true。
+    #[tokio::test]
+    async fn newer_stop_completion_does_not_clear_older_inflight_stop() {
+        let g = gate("p0a-set");
+        // 直接构造"两次 Stop 已受理、A 尚未确认、B 已确认"的门状态。
+        {
+            let mut m = g.inner.lock().unwrap();
+            let ep = m.entry("ep-1".to_string()).or_default();
+            ep.stop_gen = 2;
+            ep.stop_persist_inflight.insert(1);
+            ep.stop_persist_inflight.insert(2);
+        }
+        // Stop-B（最新代次）先完成。
+        g.finish_stop_persist("ep-1", 2, Ok(true)).unwrap();
+        let s = g.sample("ep-1");
+        assert_eq!(
+            s.stop_persist_inflight_count, 1,
+            "B 完成后 A 必须仍在集合中: {s:?}"
+        );
+        assert_eq!(s.stop_persist_inflight, Some(1));
+
+        // 无活 attempt ⇒ 新 Start 必须被拒，且不得写 desired=true。
+        let ticket = g.admit_start("ep-1");
+        let err = g
+            .commit_start(&ticket, dummy_cfg("ep-1"))
+            .await
+            .expect_err("A 仍在途，Start 必须被拒");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, "STOP_PERSIST_IN_PROGRESS");
+        assert!(!g.manager.has_live_attempt("ep-1"), "不得产生 attempt");
+
+        // A 完成后集合清空，Start 才允许提交。
+        g.finish_stop_persist("ep-1", 1, Ok(true)).unwrap();
+        assert_eq!(g.sample("ep-1").stop_persist_inflight_count, 0);
+    }
+
     /// P0-3 的 fail-closed 面：没有代次基准（从未有 attempt / 刚重启）时，
     /// `await_settled` **不得**判为 settled（无证据 ≠ 证据成立）。
     #[tokio::test]
