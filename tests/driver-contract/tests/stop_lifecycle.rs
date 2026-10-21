@@ -1674,6 +1674,302 @@ async fn start_rejected_while_stop_intent_persist_in_flight() {
 }
 
 // ---------------------------------------------------------------------------
+// P0-A：Stop-A 的迟到落盘不得覆盖后续 Start（跟踪全部在途 Stop）
+// ---------------------------------------------------------------------------
+
+/// P0-A 确定性 Gate：精确构造评审给出的四步交错。
+///
+/// 1. Stop-A 受理，但它的 `desired=false` 写库被阻塞（6s）；
+/// 2. Stop-B 受理并完成 teardown（**不得**因为 B 完成就清空 A 的在途标记）；
+/// 3. 此时新 Start 必须被拒（409 `STOP_PERSIST_IN_PROGRESS`）——若放行，
+///    Stop-A 的迟到 SQL 会在之后把 `desired` 写回 false（实际 RUNNING、DB false）；
+/// 4. A/B 全部落盘完成后，Start 才允许提交，最终 DB 与运行态一致。
+///
+/// 旧实现只存**最新**代次：B 完成即清空标记 ⇒ 第 3 步放行 ⇒ 第 4 步 A 的迟到
+/// 写入覆盖 true ⇒ 最终 DB=false 而 attempt 在跑。本用例的 409 与最终一致性
+/// 断言在旧码上必红。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_stop_a_write_cannot_override_new_start() {
+    use std::sync::atomic::Ordering;
+
+    let rig = SettleRig::new("p0a").await;
+    let id = "p0a-ep";
+    rig.create_endpoint(id, false);
+    let (s, v) = rig.start(id).await;
+    assert_eq!(s, StatusCode::OK, "预置启动: {v}");
+    rig.wait_running(id, 30).await;
+    assert!(rig.desired(id), "预置：DB 必须为 true");
+
+    // 逐调用延迟：Stop-A 的 false 写 6s，Stop-B 的 false 写 0ms。
+    // 初始 Start 的 true 已经完成，不会消费本队列。
+    {
+        let faults = rig.store.desired_write_faults();
+        let mut q = faults.delay_seq.lock().unwrap();
+        q.clear();
+        q.push_back(6000);
+        q.push_back(0);
+    }
+    let base = rig
+        .store
+        .desired_write_faults()
+        .calls_started
+        .load(Ordering::Relaxed);
+
+    // 步骤 1：Stop-A 受理并进入 DB 写（被 6s 延迟阻塞）。
+    let stop_a = {
+        let app = rig.app.clone();
+        let uri = format!("/api/v1/endpoints/{id}/stop");
+        tokio::spawn(async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+            )
+        })
+    };
+    common::wait_until(10, || {
+        rig.store
+            .desired_write_faults()
+            .calls_started
+            .load(Ordering::Relaxed)
+            > base
+    })
+    .await;
+    assert!(
+        !stop_a.is_finished(),
+        "前置：Stop-A 的落盘必须仍在途（否则测不到本窗口）"
+    );
+
+    // 步骤 2：Stop-B 受理；teardown 很快完成，但 B 的落盘排在 A 之后。
+    let stop_b = {
+        let app = rig.app.clone();
+        let uri = format!("/api/v1/endpoints/{id}/stop");
+        tokio::spawn(async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+            )
+        })
+    };
+    common::wait_until(10, || !rig.mgr.has_live_attempt(id)).await;
+    common::wait_until(10, || rig.state_of(id).as_deref() == Some("STOPPED")).await;
+
+    // B 完成后，A 仍在途：集合必须同时包含两代次（不是"只存最新"）。
+    common::wait_until(5, || {
+        rig.state.lifecycle.sample(id).stop_persist_inflight_count == 2
+    })
+    .await;
+    let sample = rig.state.lifecycle.sample(id);
+    assert_eq!(
+        sample.stop_persist_inflight_count, 2,
+        "P0-A：必须跟踪全部在途 Stop（A 与 B），实际: {sample:?}"
+    );
+    assert_eq!(
+        sample.stop_persist_inflight,
+        Some(2),
+        "最新在途代次应为 Stop-B 的 2"
+    );
+    assert!(
+        !stop_a.is_finished() && !stop_b.is_finished(),
+        "前置：两个 Stop 的落盘都未确认"
+    );
+
+    // 步骤 3：新 Start 必须被拒（B 完成不得清空 A 的在途标记）。
+    let (s, v) = rig.start(id).await;
+    assert_eq!(
+        s,
+        StatusCode::CONFLICT,
+        "P0-A：Stop-A 落盘未确认期间 Start 必须 409: {s} {v}"
+    );
+    assert_eq!(code_of(&v), "STOP_PERSIST_IN_PROGRESS", "{v}");
+    assert!(
+        !rig.mgr.has_live_attempt(id),
+        "被拒的 Start 不得留下 attempt"
+    );
+    assert!(
+        rig.desired(id),
+        "A 尚未落盘：DB 仍是旧值 true（这正是必须拦住 Start 的原因）"
+    );
+
+    // 步骤 4：等 A/B 全部落盘完成，再允许 Start；最终 DB 与运行态一致。
+    let (sa, va) = tokio::time::timeout(Duration::from_secs(40), stop_a)
+        .await
+        .expect("Stop-A 有界")
+        .unwrap();
+    assert_eq!(sa, StatusCode::OK, "{va}");
+    let (sb, vb) = tokio::time::timeout(Duration::from_secs(40), stop_b)
+        .await
+        .expect("Stop-B 有界")
+        .unwrap();
+    assert_eq!(sb, StatusCode::OK, "{vb}");
+    assert!(!rig.desired(id), "两次 Stop 落盘完成后 DB 必须为 false");
+    assert!(!rig.mgr.has_live_attempt(id), "不得有 attempt 残留");
+
+    let (s, v) = rig.start(id).await;
+    assert_eq!(s, StatusCode::OK, "全部落盘完成后 Start 必须可用: {v}");
+    rig.wait_running(id, 30).await;
+    assert!(
+        rig.desired(id),
+        "P0-A 最终一致性：实际 RUNNING 时 DB 必须为 true"
+    );
+    assert!(
+        rig.mgr.has_live_attempt(id),
+        "P0-A 最终一致性：DB=true 时必须有活 attempt"
+    );
+    let _ = rig.stop(id).await;
+}
+
+// ---------------------------------------------------------------------------
+// P0-B：慢 Start 落盘不得阻塞 Stop 的 begin_stop
+// ---------------------------------------------------------------------------
+
+/// P0-B 确定性 Gate：Start 的 `desired=true` 写库慢 3s，Stop 并发受理。
+///
+/// 旧实现 `commit_start` 在生命周期门锁内同步写库；Stop 的 `begin_stop` 要取
+/// 同一把锁 ⇒ 必须等 Start 的 3s 写完才能 cancel。拆锁后：
+/// - `begin_stop`（`admit_stop` 的同步部分）必须 **<200ms** 返回，且立即进入
+///   拆解——此时 Start 的 3s 落盘仍未完成；
+/// - Start 的响应不得早于 3s（意图落盘先于"认可完成"）；
+/// - 最终 DB=false 且无 attempt（Stop 的 false 排在 Start 的 true 之后）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_start_persist_does_not_delay_stop_begin() {
+    use std::sync::atomic::Ordering;
+
+    let rig = SettleRig::new("p0b").await;
+    let id = "p0b-ep";
+    rig.create_endpoint(id, false);
+    // Start 的 true 写 3s；Stop 的 false 写 0ms（逐调用队列）。
+    {
+        let faults = rig.store.desired_write_faults();
+        let mut q = faults.delay_seq.lock().unwrap();
+        q.clear();
+        q.push_back(3000);
+        q.push_back(0);
+    }
+    let base = rig
+        .store
+        .desired_write_faults()
+        .calls_started
+        .load(Ordering::Relaxed);
+
+    let t_start = std::time::Instant::now();
+    let start_task = {
+        let app = rig.app.clone();
+        let uri = format!("/api/v1/endpoints/{id}/start");
+        tokio::spawn(async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+            )
+        })
+    };
+    // 等 Start 已产生 attempt 且进入 DB 写（此时它持有落盘串行器，不持有门锁）。
+    common::wait_until(10, || {
+        rig.store
+            .desired_write_faults()
+            .calls_started
+            .load(Ordering::Relaxed)
+            > base
+    })
+    .await;
+    assert!(
+        rig.mgr.has_live_attempt(id),
+        "前置：Start 必须先启动 attempt 再落盘"
+    );
+    assert!(!start_task.is_finished(), "前置：Start 仍在等 3s 落盘");
+
+    // 直接调用门的 Stop 受理（REST 的 Stop handler 就是先调它）：测的是
+    // `begin_stop` 本身是否被 Start 的慢落盘拖住，不受 HTTP 调度与拆解耗时干扰。
+    let t_admit = std::time::Instant::now();
+    let admission = rig.state.lifecycle.admit_stop(id);
+    let admit_elapsed = t_admit.elapsed();
+    assert!(
+        admission.handle.was_running(),
+        "P0-B：Stop 必须认领 Start 刚创建的 attempt"
+    );
+    assert!(
+        admit_elapsed < Duration::from_millis(200),
+        "P0-B 时间上界：begin_stop 必须 <200ms 返回（Start 落盘需 3s），实际 {admit_elapsed:?}"
+    );
+    assert!(
+        !start_task.is_finished(),
+        "前置：begin_stop 返回时 Start 的落盘必须仍未完成（否则测不到本窗口）"
+    );
+
+    // teardown 结论；Stop 的 false 落盘排在 Start 的 true 之后。
+    let was_running =
+        tokio::time::timeout(Duration::from_secs(30), admission.handle.await_result())
+            .await
+            .expect("teardown 有界")
+            .expect("teardown 必须成功");
+    assert!(was_running, "Stop 必须报告 was_running=true");
+    let persist = tokio::time::timeout(Duration::from_secs(30), admission.persist)
+        .await
+        .expect("Stop 落盘有界")
+        .expect("Stop 落盘任务不得 panic");
+    assert!(persist.is_ok(), "Stop 落盘必须成功: {persist:?}");
+
+    // Start 的意图落盘必须先于响应返回（拆锁后的硬约束）。
+    let (ss, sv) = tokio::time::timeout(Duration::from_secs(20), start_task)
+        .await
+        .expect("Start 有界")
+        .unwrap();
+    let start_elapsed = t_start.elapsed();
+    assert_eq!(ss, StatusCode::OK, "慢 Start 最终成功: {sv}");
+    assert!(
+        start_elapsed >= Duration::from_millis(3000),
+        "P0-B：Start 必须等自己的意图落盘完成才返回，实际 {start_elapsed:?}"
+    );
+    assert!(
+        rig.store
+            .desired_write_faults()
+            .calls_completed
+            .load(Ordering::Relaxed)
+            > base,
+        "P0-B：Start 响应返回时，意图写必须已完成"
+    );
+
+    assert!(
+        !rig.desired(id),
+        "P0-B 最终一致性：Stop 的 false 必须排在 Start 的 true 之后（DB=false）"
+    );
+    assert!(!rig.mgr.has_live_attempt(id), "不得有 attempt 残留");
+    common::wait_until(10, || rig.state_of(id).as_deref() == Some("STOPPED")).await;
+}
+
+// ---------------------------------------------------------------------------
 // R-2：收敛判据必须包含"本次停止意图落盘已确认"
 // ---------------------------------------------------------------------------
 
@@ -1928,6 +2224,7 @@ async fn start_on_deleted_endpoint_is_aborted_not_orphaned() {
         .state
         .lifecycle
         .commit_start(&ticket, cfg)
+        .await
         .expect_err("配置行已删除，Start 必须失败");
     assert_eq!(err.code, "ENDPOINT_DELETED", "{}", err.message);
     common::wait_until(10, || !rig.mgr.has_live_attempt(id)).await;

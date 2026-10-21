@@ -181,6 +181,21 @@ async fn main() {
         if !rec.desired_running {
             continue;
         }
+        // 828D 一期产品约束（**不是**通用生命周期语义）：`sinumerik-nck` 端点
+        // 开机一律不自动恢复——无论凭证、围栏、`desired_running` 为何，必须由
+        // 现场显式 `POST /start` 才启动。其他驱动行为不变。
+        //
+        // 为什么放在凭证判定之前：这是产品策略，不依赖"能否证明用户意图"；
+        // 即使正向凭证完整（升级后正常 Start 过），NCK 也不得被自动拉起。
+        if !mesa_core_api::recovery::boot_auto_restore_allowed(&rec.driver_id) {
+            tracing::warn!(
+                endpoint = %rec.id,
+                driver = %rec.driver_id,
+                "SKIP auto-restore: 828D 一期产品约束——sinumerik-nck 开机一律不自动恢复；\
+                 需现场显式 POST /start"
+            );
+            continue;
+        }
         // P0-4：`desired_running=true` 但没有正向凭证 ⇒ 无法证明这是用户意图
         // （可能是一次失败的 Stop 留下的旧值）⇒ 不恢复。
         if !confirmed.contains(&rec.id) {

@@ -30,6 +30,7 @@ pub(crate) mod connection_check;
 pub(crate) mod driver_query;
 /// G7：生命周期门（Start 两阶段提交 / Stop 合流 / 停止判据观察器）。
 pub mod lifecycle;
+pub mod recovery;
 pub mod runtime;
 use certificates::CertStore;
 
@@ -2171,8 +2172,9 @@ async fn delete_endpoint(
 
 /// 启动 Endpoint（G7 两阶段提交）。
 ///
-/// 阶段划分（设计 §1.3 修订后）：`admit`（同步，票据）→ 构造（长 await）→
-/// `commit`（同步单临界区：代次比对 + start + 置真）→ 应答。
+/// 阶段划分（设计 §1.3 修订后 + P0-B）：`admit`（同步，票据）→ 构造（长
+/// await）→ `commit`（门外取得落盘串行器 → 同步临界区：代次比对 + start →
+/// 临界区外落盘 true 并 await 结果）→ 应答。
 ///
 /// 为什么不再先查 `is_running`：它既不能表达"Stop 已受理"，也不能表达"有 Start
 /// 在途"，是 W1/W2/W3 的共同根因（§1.2）。冲突判定改由门 + attempt 表给出：
@@ -2194,7 +2196,7 @@ async fn start_endpoint(
         Ok(cfg) => cfg,
         Err(e) => return (e.status, e.to_json()),
     };
-    match state.lifecycle.commit_start(&ticket, cfg) {
+    match state.lifecycle.commit_start(&ticket, cfg).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "started": id }))),
         Err(e) => e.to_response(),
     }

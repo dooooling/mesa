@@ -777,3 +777,154 @@ async fn unconfirmed_desired_running_is_not_auto_restored() {
     let _ = mesad2.wait().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// P0-C（828D 一期产品约束）：`sinumerik-nck` 端点**开机一律不自动恢复**。
+///
+/// 构造对自动恢复最有利的现场：`desired_running=true`、无围栏、正向凭证已确认。
+/// 对照组是同库的 test-driver 端点（条件相同）——它必须被正常恢复，证明恢复
+/// 逻辑本身没有被整体关掉；NCK 端点则必须**没有运行态条目**（未被拉起），
+/// 只有显式 `POST /start` 才允许启动。
+///
+/// 这不是通用生命周期语义：仅 `sinumerik-nck` 受此产品策略约束。
+#[tokio::test]
+async fn nck_endpoint_is_never_auto_restored_at_boot() {
+    common::init_log();
+    let dir = std::env::temp_dir().join(format!(
+        "mesa-g7-nck-policy-{}-{}",
+        std::process::id(),
+        mesa_core_types::now_unix_ns()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _staged = common::staged_drivers_with_test_driver();
+    let db = dir.join("mesa.db");
+
+    // ---- Phase 1：两个端点都置为 desired_running=true ----
+    let port1 = free_port().await;
+    let mut mesad1 = spawn_mesad(&dir, port1, _staged.path());
+    wait_ready(port1).await;
+    let (st, _) = http(
+        port1,
+        "POST",
+        "/api/v1/devices",
+        Some(r#"{"id":"dnck","name":"NckPolicy"}"#),
+    )
+    .await;
+    assert_eq!(st, 201, "create device");
+
+    // NCK 端点：连接指向 127.0.0.1:1（不连真机；即使被拉起也只会快速失败）。
+    let nck_body = r#"{"id":"ep-nck","name":"ep-nck","device_id":"dnck","driver_id":"sinumerik-nck","connection":{"host":"127.0.0.1","port":1,"family":"828d","local_tsap":1024,"remote_tsap":3332,"timeout_ms":500}}"#;
+    let (st, v) = http(port1, "POST", "/api/v1/endpoints", Some(nck_body)).await;
+    assert!(st == 200 || st == 201, "create NCK endpoint: {st} {v}");
+
+    // 对照组：test-driver + 采集任务（能真正进入 RUNNING）。
+    let ctl_body = r#"{"id":"ep-control","name":"ep-control","device_id":"dnck","driver_id":"test-driver","connection":{}}"#;
+    let (st, v) = http(port1, "POST", "/api/v1/endpoints", Some(ctl_body)).await;
+    assert!(st == 200 || st == 201, "create control endpoint: {st} {v}");
+    let tasks = r#"{"tasks":[{"id":"t1","schedule":{"mode":"poll","interval_ms":50},"binding":{"kind":"mesa.resources.v1","config":{"selections":[{"resource_id":"counter","parameters":{},"outputs":[{"output":"value","point_key":"k.counter"}]}]}}}]}"#;
+    let (st, v) = http(port1, "PUT", "/api/v1/tasks/ep-control", Some(tasks)).await;
+    assert_eq!(st, 200, "put control tasks: {v}");
+
+    // 显式启动两个端点：两者都应写入 desired_running=true + 正向凭证。
+    for ep in ["ep-nck", "ep-control"] {
+        let (st, v) = http(
+            port1,
+            "POST",
+            &format!("/api/v1/endpoints/{ep}/start"),
+            None,
+        )
+        .await;
+        assert_eq!(st, 200, "start {ep}: {v}");
+    }
+    // 对照组必须真的 RUNNING；NCK 不要求连上（它连的是 127.0.0.1:1）。
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (st, v) = http(port1, "GET", "/api/v1/endpoints/ep-control/state", None).await;
+        assert_eq!(st, 200);
+        if v["state"] == "RUNNING" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "对照组启动失败: {v}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    mesad1.kill().await.unwrap();
+    let _ = mesad1.wait().await;
+
+    // 前置：两者 desired_running=true、无围栏、正向凭证均确认。
+    {
+        let store = mesa_config_store::ConfigStore::open(&db).unwrap();
+        for ep in ["ep-nck", "ep-control"] {
+            assert!(
+                store.get_endpoint(ep).unwrap().unwrap().desired_running,
+                "前置：{ep} 的 desired_running 必须为 true"
+            );
+        }
+        match store.recovery_plan() {
+            mesa_config_store::RecoveryPlan::Proceed { fenced, confirmed } => {
+                assert!(fenced.is_empty(), "前置：围栏必须为空: {fenced:?}");
+                assert!(
+                    confirmed.contains("ep-nck") && confirmed.contains("ep-control"),
+                    "前置：两个端点都必须有正向确认凭证: {confirmed:?}"
+                );
+            }
+            mesa_config_store::RecoveryPlan::DenyAll { reason } => {
+                panic!("前置：恢复计划不应 DenyAll: {reason}")
+            }
+        }
+    }
+
+    // ---- Phase 2：同目录重启 ----
+    let port2 = free_port().await;
+    let mut mesad2 = spawn_mesad(&dir, port2, _staged.path());
+    wait_ready(port2).await;
+
+    // 对照组被正常恢复（证明恢复循环本身有效）。
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (st, v) = http(port2, "GET", "/api/v1/endpoints/ep-control/state", None).await;
+        assert_eq!(st, 200);
+        if v["state"] == "RUNNING" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "对照组 ep-control 必须被自动恢复: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // NCK：5s 内任何时刻都不得出现运行态条目（即从未被拉起）。
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < until {
+        let (st, v) = http(port2, "GET", "/api/v1/endpoints/ep-nck/state", None).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(
+            v["error"]["code"], "NOT_FOUND",
+            "P0-C 失败：sinumerik-nck 端点被开机自动恢复了: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // DB 里的旧值不变（产品策略只阻止自动恢复，不改写用户意图）。
+    {
+        let store = mesa_config_store::ConfigStore::open(&db).unwrap();
+        assert!(
+            store
+                .get_endpoint("ep-nck")
+                .unwrap()
+                .unwrap()
+                .desired_running,
+            "产品策略不改变 DB 旧值（它只阻止自动恢复）"
+        );
+    }
+
+    // 显式 POST /start 才允许启动。
+    let (st, v) = http(port2, "POST", "/api/v1/endpoints/ep-nck/start", None).await;
+    assert_eq!(
+        st, 200,
+        "P0-C：显式 POST /start 必须允许启动 NCK 端点: {st} {v}"
+    );
+
+    mesad2.kill().await.unwrap();
+    let _ = mesad2.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

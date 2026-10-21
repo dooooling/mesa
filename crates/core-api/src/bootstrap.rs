@@ -152,7 +152,7 @@ async fn start_created_endpoint(state: &AppState, endpoint_id: &str) -> Result<(
     let cfg = super::runtime::build_runtime_endpoint(state, endpoint_id)
         .await
         .map_err(|e| StartFailure::NotStarted(e.to_string()))?;
-    match state.lifecycle.commit_start(&ticket, cfg) {
+    match state.lifecycle.commit_start(&ticket, cfg).await {
         Ok(()) => Ok(()),
         // R-1：这是唯一一种"启动已发生"的失败。attempt 已在跑，不能当普通失败补偿。
         Err(e) if e.code == "START_INTENT_NOT_PERSISTED" => Err(

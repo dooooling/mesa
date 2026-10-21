@@ -318,6 +318,18 @@ pub struct DesiredWriteFaults {
     pub fence_db_fail: std::sync::atomic::AtomicBool,
     /// true ⇒ **围栏的 sidecar 文件通道**写入失败（模拟"文件系统也不可写"）。
     pub fence_file_fail: std::sync::atomic::AtomicBool,
+    /// 按调用顺序消费的延迟序列（仅测试用；G7 P0-A 的交错构造需要）。
+    ///
+    /// 为什么需要它：P0-A 的原始交错是"Stop-A 的写很慢、Stop-B 的写很快"，
+    /// 而 [`Self::delay_ms`] 是全局的，无法让两次调用产生不同延迟。队列按
+    /// `set_desired_running` 的调用顺序取队首；队列空时回落到 `delay_ms`。
+    pub delay_seq: Mutex<std::collections::VecDeque<u64>>,
+    /// 已**进入** `set_desired_running` 的调用数（在取延迟/睡眠之前 +1）。
+    /// 测试据此确定性等待"某次写入已经开始"，而不是靠 sleep 猜。
+    pub calls_started: std::sync::atomic::AtomicU64,
+    /// 已**完成**（成功或注入失败返回）的调用数。用于证明 Start 的意图落盘
+    /// 先于其响应返回（P0-B 拆锁后仍必须成立）。
+    pub calls_completed: std::sync::atomic::AtomicU64,
 }
 
 /// 同一 DB 中 `meta` 表里保存"停止意图未持久化"围栏的键。
@@ -1609,11 +1621,20 @@ impl ConfigStore {
     ) -> Result<bool, StoreError> {
         #[cfg(feature = "test-hooks")]
         {
+            use std::sync::atomic::Ordering;
+            self.desired_faults
+                .calls_started
+                .fetch_add(1, Ordering::Relaxed);
             // DB busy 模拟：先阻塞（模拟等锁），再决定是否注入失败。
-            let delay = self
-                .desired_faults
-                .delay_ms
-                .load(std::sync::atomic::Ordering::Relaxed);
+            // 优先消费逐调用延迟队列（P0-A 的"慢 Stop-A / 快 Stop-B"交错）。
+            let delay = {
+                let mut q = self.desired_faults.delay_seq.lock().unwrap();
+                q.pop_front().unwrap_or_else(|| {
+                    self.desired_faults
+                        .delay_ms
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                })
+            };
             if delay > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(delay));
             }
@@ -1622,6 +1643,9 @@ impl ConfigStore {
                 .fail
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
+                self.desired_faults
+                    .calls_completed
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(13),
                     Some("disk full (injected desired_running fault)".into()),
@@ -1633,6 +1657,10 @@ impl ConfigStore {
             "UPDATE endpoints SET desired_running=?1, updated_at_ns=?2 WHERE id=?3",
             params![running as i32, Self::now_ns(), endpoint_id],
         )?;
+        #[cfg(feature = "test-hooks")]
+        self.desired_faults
+            .calls_completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // P0-4：DB 写入成功后才记正向凭证（持同一把锁，避免并发端点互相覆盖）。
         // 行不存在（n == 0）不写凭证——"没写进 DB 的意图"不能被证明。
         if n > 0 {
