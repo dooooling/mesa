@@ -1,11 +1,11 @@
 # Core Start/Stop 生命周期竞态修复设计（G7）
 
-- **版本**：**v3**（v1 = `c3d8918` 初稿；v2 = `eb0a0c8` + `f65a71c` 冻结契约稿/PR #132 Draft；**v3 = 已对齐 main `9611255de75962fcf61874a84befcd59651cb608`（G7 实现已合并，PR #133）的实际代码**）
+- **版本**：**v3.1**（v1 = `c3d8918` 初稿；v2 = `eb0a0c8` + `f65a71c` 冻结契约稿/PR #132 Draft；v3 = 已对齐 main `9611255de75962fcf61874a84befcd59651cb608`（G7 实现已合并，PR #133）的实际代码；**v3.1 = 勘误：收紧风险适用范围、对齐持久化与 API 契约**——只做三组纯文字事实修正，见 §6.10.2 末（`attempt_stopped` 增量字段）、§6.10.3（`intent_unpersisted` 置位时机、不存在"finalize 自动补写"、误拉起风险按驱动区分）；v3.1 同样**不改任何代码/测试/配置**）
 - **状态**：设计**已与实现一致**，不再含"未实施"的表述。G7 实现过程中新增/纠正了五块内容，v3 已全部补齐：
   1. **P0-D：删除与在途运行意图写入的竞态**（初稿完全没有）→ §6.12；
   2. **P0-E-1：删除屏障期 Stop 必须照常落盘**（初稿/早期实现写错）→ §6.13；
   3. **P0-E-2：`DeleteGuard` RAII（未提交即撤销屏障）**（初稿没有）→ §6.14；
-  4. **828D 一期开机不自动恢复**（初稿把"重启误拉起"列为**不消除**的残余风险，现由持久化围栏 + 正向凭证 + 一期产品约束消除，P0-C）→ §6.10.3、§6.15；
+  4. **828D 一期开机不自动恢复**（初稿把"重启误拉起"列为**不消除**的残余风险；**v3.1 收紧适用范围**：只有 `sinumerik-nck` 由一期产品约束**无条件消除**该风险，其他驱动仅被"持久化围栏 + 正向凭证"**收窄**、**未消除**，P0-C）→ §6.10.3、§6.15；
   5. **编号口径重排**（实现侧 `P0-A/B/C/D/E` 与原稿的编号**不是同一组含义**）→ §0.2 对照表。
 - **基线**：`main = 9611255de75962fcf61874a84befcd59651cb608`。**本文所有 `文件:行号` 均按该提交逐一核对**；`crates/`、`apps/`、`tests/` 与本文同源，无待合并差异。
 - **上游依据**：`docs/validation/828d-phase1-first-limited-sampling-application.md` 的 文档 §4.7（G7-1/2/3）、文档 §5.3（竞态机制、Stop 时间约束、六项判据）；828D 一期产品约束见 `docs/design/nck-828d-phase1-boot-recovery-policy.md`（独立文档，本文只引用、不复述）。
@@ -22,7 +22,7 @@
 3. 修复方向不变：**Stop 生成号 + Stop 在途保护 + Start 两阶段提交（admit/commit）**。但本轮修订纠正了两个根本性错误：
    - **Stop 在途保护必须归属于"实际生命周期操作"（attempt 任务本身），不能归属于 HTTP 请求**。原稿 §5 让 handler 用 RAII guard 减计数，一旦客户端断开/超时导致 handler 被取消、而 teardown 仍在后台跑，guard 会提前释放保护、**重新开放 W2**（§6.3）。
    - **`is_running()` 不能作为"停干净"的完成判据**：它在拆解开始前就变假（`manager.rs:535`），且 W3 孤儿根本不在运行表里（`manager.rs:513-516`）。判据必须换成"代次化的 attempt 表 + 代次化快照"（§1.2、§6.5、§7）。
-4. 变化仅限 Core 内部：`driver-manager` 新增代次化 attempt 表与快照代次门（`snapshot.rs`/`endpoint.rs`/`manager.rs`/`process.rs`），`core-api` 新增薄门 `LifecycleGate`，`config-store` 收缩 `desired_running` 的写路径（§6.10，**不改表结构、不加列**）；**不碰 wire/IPC、不改 REST 字段**。对外的行为变化共**六处**：竞态分支下 Start 的状态码 200 → 409（带可机器识别的 code）；并发 Stop 由"立即 200 `was_running=false`"改为**合流并返回同一次结果**（§5.2）；`desired_running=false` 由"teardown 之后"**前移到 Stop 受理时**（§5.3）；**Stop 意图落盘失败由静默 200 改为显式 500**（§6.10.3）；**Stop 意图落盘未确认期间新 Start 一律 409 `STOP_PERSIST_IN_PROGRESS`**（P0-A，§6.12.1）；**DELETE 在"仍有运行意图在落盘"时返回 409 `DELETE_PERSIST_IN_PROGRESS` 而不是立即删行**（P0-D，§6.12）。
+4. 变化仅限 Core 内部：`driver-manager` 新增代次化 attempt 表与快照代次门（`snapshot.rs`/`endpoint.rs`/`manager.rs`/`process.rs`），`core-api` 新增薄门 `LifecycleGate`，`config-store` 收缩 `desired_running` 的写路径（§6.10，**不改表结构、不加列**）；**不碰 wire/IPC、不改既有 REST 路由与字段**（**唯一的响应字段增量**：Bootstrap 失败响应新增 `attempt_stopped`，R-1，`bootstrap.rs:466`，见 §6.10.2 末——v3.1 勘误，原文笼统的"不改 REST 字段"不成立）。对外的行为变化共**六处**：竞态分支下 Start 的状态码 200 → 409（带可机器识别的 code）；并发 Stop 由"立即 200 `was_running=false`"改为**合流并返回同一次结果**（§5.2）；`desired_running=false` 由"teardown 之后"**前移到 Stop 受理时**（§5.3）；**Stop 意图落盘失败由静默 200 改为显式 500**（§6.10.3）；**Stop 意图落盘未确认期间新 Start 一律 409 `STOP_PERSIST_IN_PROGRESS`**（P0-A，§6.12.1）；**DELETE 在"仍有运行意图在落盘"时返回 409 `DELETE_PERSIST_IN_PROGRESS` 而不是立即删行**（P0-D，§6.12）。
 5. 第二轮复审补齐的四项**不是可选优化，而是前述方案的成立条件**（详见对应小节；下述"现状"均指**修复前** `fda7633`，现在的代码见 §1.1.1）：
    - **P0-1**：`AttemptGuard::Drop` 在 panic 展开时同样执行 ⇒ 若照原稿无条件删条目，新 Start 会在 teardown 未证明完成时被放行，**与 fail-closed 直接矛盾**。必须区分"正常完成"与"异常终止"，后者进入 `FAILED_UNKNOWN` 隔离态并禁止新 Start（§6.3.2、§6.3.3）。
    - **P0-2**：`desired_running` 还有两条**不经过生命周期门**的写路径（`update_endpoint()` / `update_endpoint_with_secrets()` 的 UPDATE 都带该列，`config-store/src/lib.rs:1091-1094`、`:1165-1168`），且 `core-api` 的 PUT 是"先读 → 长 await 校验 → 把旧对象写回"（`lib.rs:1979`、`:1998`、`:2096-2099`）⇒ **"门是唯一写者"在现有代码中不成立**。必须做写路径拆分（§6.10）。
@@ -41,7 +41,7 @@
 | 1 | P0-D 删除与在途意图写入竞态 | **没有** | 屏障 + 有限等待 + 条件复位 + 串行器复查（§6.12） |
 | 2 | P0-E-1 屏障期 Stop 的落盘 | **写错**（屏障期跳过落盘仍 200） | 与正常路径同源、照常落盘（§6.13） |
 | 3 | P0-E-2 `DeleteGuard` RAII | **没有**（靠调用方显式 `abort_delete`） | guard 未提交即撤销，覆盖取消/panic（§6.14） |
-| 4 | 828D 重启恢复残余风险 | 列为**不消除** | **已消除**（S2 围栏 + 正向凭证 + P0-C 产品约束，§6.10.3、§6.15） |
+| 4 | 重启误拉起风险（v3.1：按驱动区分） | 列为**不消除** | **仅 `sinumerik-nck` 无条件消除**（S2 围栏 + 正向凭证 + P0-C 产品约束，§6.15）；**其他驱动仍未消除**，只是被围栏 + 正向凭证收窄（§6.10.3 末） |
 | 5 | 编号口径 | 原稿 `P0-A~E` / `P0-1~4` 混用 | 实现侧重排，见 §0.2 |
 
 ### 0.2 编号口径对照（**实现侧为准**）
@@ -64,7 +64,7 @@
 | `R-1` | Bootstrap"已启动却删配置"：启动失败分类，先停再补偿 | `bootstrap.rs:104-133`、`:168-194`；测试 `stop_lifecycle.rs:2100` | §6.10.2 |
 | `R-2` | 收敛判据必须包含"**本次** Stop 落盘已确认"（慢写下不得提前判成功） | `lifecycle.rs:125-130`、`:983-1046`；测试 `stop_lifecycle.rs:2013` | §7.3、§7.4 |
 | `S1` | **停止优先**：`admit_stop` 先 `begin_stop` 再落盘，DB busy 不得推迟停止 | `lifecycle.rs:737-743`、`:781-783`；`lib.rs:2252-2262` | §5.5 |
-| `S2` | 落盘失败写**持久化围栏**（DB meta + sidecar 双通道），崩溃重启也不得自动拉起 | `lifecycle.rs:881-906`；`config-store/src/lib.rs:1694-1795` | §5.5、§6.10.3 |
+| `S2` | 落盘失败写**持久化围栏**（DB meta + sidecar 双通道）；围栏至少一条通道落盘成功时，崩溃重启也不得自动拉起（两通道都失败的情形见 §6.10.3 末） | `lifecycle.rs:881-906`；`config-store/src/lib.rs:1694-1795` | §5.5、§6.10.3 |
 
 ---
 
@@ -401,7 +401,7 @@ struct EpGate {
     desired_seq: u64,                          // 每次成功写入 +1（诊断：证明"读到的不是旧值"）
     stop_persist_confirmed_gen: Option<u64>,   // 最近一次**已确认落盘**的 Stop 代次（R-2，收敛判据凭证）
     stop_persist_inflight: BTreeSet<u64>,      // **全部**在途 Stop 落盘代次（P0-A：集合，不是"最新一个"）
-    intent_unpersisted: bool,                  // 落盘失败 ⇒ 禁止 Start，直到补写成功（§6.10.3）
+    intent_unpersisted: bool,                  // Stop 意图**落盘失败时**才置位（不是受理时，见 §6.10.3）⇒ 禁止 Start，直到下一次成功的意图落盘
     persist_lock: Arc<tokio::sync::Mutex<()>>, // per-endpoint 意图写库串行器（P0-A / P0-B）
 }
 
@@ -770,17 +770,17 @@ pub fn start_endpoint(&self, cfg: BuiltinEndpoint) -> Result<(), String> {   // 
 | **DELETE handler 被取消**（客户端断开/超时/**panic 展开**） | 显式 `abort_delete()` 在提前返回与展开路径上执行不到 ⇒ `deleting` 永久为 `true` ⇒ 该端点此后所有 Start 都 409 `ENDPOINT_DELETED`，只能重启 Core（P0-E-2） | 屏障由 `DeleteGuard` 持有：未 `commit()` 即撤销（Drop 覆盖三条非正常退出路径），且 Drop 内**不 panic**（`let Ok(..) else return`）。删除本身**没有发生**，端点仍可用（§6.14、`lifecycle.rs:221-263`） |
 | 客户端拿不到 Stop 结果 | 无补偿 | 结果留在 `AttemptCtx.outcome` 与 `done_tx`：再次 `POST /stop` 会**合流**到同一次 teardown 并返回同一结果（幂等 join），或读到 `was_running=false`（已完成）。同时落 `tracing` 结构化日志 |
 
-**"返回给客户端的结果可以是未知，但服务端状态必须可查"**：可查渠道全部是既有能力——`GET /api/v1/endpoints`（`state`，已代次化）、`GET /api/v1/endpoints/{id}`（`desired_running`，`lib.rs:1508`/`:1576`）、结构化日志。**不新增 REST 路由或字段**（§10）。
+**"返回给客户端的结果可以是未知，但服务端状态必须可查"**：可查渠道全部是既有能力——`GET /api/v1/endpoints`（`state`，已代次化）、`GET /api/v1/endpoints/{id}`（`desired_running`，`lib.rs:1508`/`:1576`）、结构化日志。**不新增 REST 路由或字段**（§10；start/stop 两个 handler 的应答形状确未变，**但整体上 REST 字段并非"完全不变"**——Bootstrap 失败响应新增 `attempt_stopped`，见 §6.10.2 末）。
 
 ### 6.8 错误码（**逐个按 `9611255` 的实际代码核对**）
 
-body 形状不变（`json_error(code, message)`），只增加新的 `code` 字符串；不新增路由、不新增响应字段。下表每一行都给出**判定位置**，可直接对照源码。
+body 形状不变（`json_error(code, message)`），只增加新的 `code` 字符串；不新增路由、不新增响应字段（本节新增的码**不涉及**响应字段；Bootstrap 失败响应的 `attempt_stopped` 增量不属本节，见 §6.10.2 末）。下表每一行都给出**判定位置**，可直接对照源码。
 
 **Start（`POST /api/v1/endpoints/{id}/start`）**
 
 | code | HTTP | 触发条件 | 判定位置 | 相对 `fda7633` |
 |---|---|---|---|---|
-| `INTENT_UNPERSISTED` | 503 | 该端点上一次 Stop 的意图落盘失败（`intent_unpersisted==true`），补写成功前拒绝启动 | `lifecycle.rs:461-470`（`check_start_preconditions` 步骤 0） | **新增** |
+| `INTENT_UNPERSISTED` | 503 | 该端点上一次 Stop 的意图落盘失败（`intent_unpersisted==true`，由 `finish_stop_persist` 在**落盘失败**分支置位，`lifecycle.rs:868`）；在**下一次成功的意图落盘**之前拒绝启动（不存在"自动补写"步骤，见 §6.10.3） | `lifecycle.rs:461-470`（`check_start_preconditions` 步骤 0） | **新增** |
 | `SUPERSEDED_BY_STOP` | 409 | 票据 `stop_gen` 与当前不等（Stop 在 admit 之后、commit 之前受理） | `lifecycle.rs:471-481`（步骤 1） | **新增** |
 | `ENDPOINT_DELETED` | 409 | (a) DELETE 屏障期间提交（`deleting==true`）；(b) `desired=true` 落盘时 UPDATE 命中 0 行（行已被并发删除，attempt 已认领停止） | `lifecycle.rs:482-491`；`:541-557` | **新增**（P0-D / P0-7） |
 | `STOP_PERSIST_IN_PROGRESS` | 409 | **任一**在途 Stop 的 `desired=false` 尚未确认（P0-A），且当前无活 attempt | `lifecycle.rs:378-380`、`:398-408`；构造函数 `:1064-1072` | **新增** |
@@ -828,7 +828,7 @@ ATTEMPT_FAILED_UNKNOWN            ← 唯一的增量（G7 §6.8，隔离态让 
 | 回归风险 | 中：行为变化**六处**——竞态分支下 Start 200→409（含新 code）；并发 Stop 由"立即 200 false"改为"合流后返回同一结果"（§5.2）；`desired_running` 写入时机由"teardown 之后"前移到"受理时"（§5.3）；**Stop 意图落盘失败由静默成功改为 500**（§6.10.3）；**在途 Stop 落盘未确认期间 Start 返回 409 `STOP_PERSIST_IN_PROGRESS`**（P0-A）；**DELETE 在意图写入未收敛时返回 409 `DELETE_PERSIST_IN_PROGRESS` 而不是立即删行**（P0-D）。`mesa-web` 对 start/stop 只读 `status` 与 `error.message`，不匹配 code（`apps/mesa-web/src/api.ts:146-147`、`deviceModel.ts:446-450`），其"stop→apply→start"是**顺序 await**（`deviceModel.ts:474-494`），不会自撞；但 500 会让其提示"停止失败"，这是**期望行为** |
 | 删除语义 | 删除从"看到没有活跃 attempt 就删"改为**屏障 → 等意图写入收敛（≤10s）→ 串行器复查 → 删行 → 立墓碑**；等不到就 409 让客户端重试（删除不可逆，宁可不删）。正常路径**零额外延迟**：两个计数器都是 0 时第一次观测即返回（`lifecycle.rs:49-54`） |
 | A1 退避 | 不受影响：门在 attempt 之上，`backoff_idx` 的生成/归零语义（`endpoint.rs:315`、`:416-418`）一字未改；反而**减少**了一次"新 attempt 从 0 档重来"的伪重连。新增的观察器与 `attempt_reaper` 只读/只清理残留，**绝不** cancel 活着的 attempt、绝不重启（否则等于引入 §10-1 拒绝的对账器） |
-| wire/IPC | 不改（`EndpointStatus` 字段不变，代次只在 map 键结构里） |
+| wire/IPC | 不改（`EndpointStatus` 字段不变，代次只在 map 键结构里）；**HTTP 侧的例外只有一处**：Bootstrap 失败响应新增 `attempt_stopped`（§6.10.2 末） |
 | 持久化 | 不加列：`generation`/`last_completed_gen` 只在内存；`desired_running` 仍是既有单列 UPDATE（`config-store/src/lib.rs:1655-1659`），但**只允许由 `set_desired_running` 写入**（§6.10）；S2 围栏复用既有 `meta` 键值表 + sidecar 文件、P0-4 凭证用 sidecar 文件，均**无 schema 变更** |
 | 新增常驻资源 | 一个 `attempt_reaper` 任务 + 一条 `quarantine_tx` 通道（§6.3.3）；无定时轮询（只由 panic 路径触发），空载零开销 |
 
@@ -885,19 +885,39 @@ ATTEMPT_FAILED_UNKNOWN            ← 唯一的增量（G7 §6.8，隔离态让 
 
 **验收判据（可执行）**：`stale_endpoint_record_writeback_keeps_desired_running`（config-store 单测，§9）—— 读出 `rec`（`desired=true`）→ `set_desired_running(id,false)` → 用旧 `rec` 调 `update_endpoint_with_secrets` → 断言 DB 仍为 `false`。该用例在旧代码上**必红**（W-a），是本条的主门。
 
+**REST 响应契约的唯一增量（v3.1 勘误）**：G7 没有改 `EndpointStatus`，也没有改 start / stop / delete 的应答形状，但 **Bootstrap（`POST /api/v1/bootstrap/device`）的失败响应新增了 `attempt_stopped` 字段**（`crates/core-api/src/bootstrap.rs:393` 声明、`:404-414` 置值、`:466` 输出）。`fda7633` 的同处失败响应只有 `error{code,message}` + `device_id` + `endpoint_id` + `compensated`（该提交 `bootstrap.rs:361` 附近），**没有**该字段。因此本文任何"REST 字段不变 / 不新增响应字段"的表述都必须读作"**既有字段不变 + 这一处增量**"，不能笼统当作"所有 REST 响应字段完全不变"。语义（R-1）：启动**已发生**但随后已被先停掉 ⇒ `attempt_stopped=true`；启动已发生而停止**未能确认** ⇒ `false` 且 `may_delete=false`、配置被保留并如实报告（`bootstrap.rs:399-414`），调用方据此区分"启动前就失败 / 已停干净 / 停止未确认"三种现场。
+
 #### 6.10.3 Stop 意图落盘失败时的行为（显式失败 + 安全方向 + 禁止不受控重启）
 
 **已消灭的旧语义（修复前 `fda7633`）**：`let _ = set_desired_running(false)`（`lib.rs:2171`、`:2180`）⇒ 落盘失败仍返回 200 ⇒ 重启后 `desired_running` 仍为 `true` ⇒ **自动拉起一个用户明确要求停止的端点**。现在落盘失败一律 500 `STOP_INTENT_NOT_PERSISTED` + 持久化围栏（S2），见上表。
 
 | 要求 | 落地 |
 |---|---|
-| **显式失败** | `admit_stop` 记录 `gate.intent_unpersisted=true`；Stop 最终响应为 **500** + `code=STOP_INTENT_NOT_PERSISTED`（**即使 teardown 成功也不得返回 200**，见 §6.4 末条），并 `tracing::error!` 带 `endpoint_id` 与 DB 错误 |
+| **显式失败** | **置位时机（v3.1 勘误）**：`intent_unpersisted=true` **不是**在 Stop 受理时置位——`admit_stop` 只做"代次 +1 / 内存意图置假 / 登记在途代次 / 同步启动 teardown"（`lifecycle.rs:770-782`），**不碰**该标记；它由 `finish_stop_persist` 在**停止意图真正落盘失败**的分支置位，且只在该代次仍是最新时（`lifecycle.rs:859-869`，置位语句在 `:868`；陈旧代次的失败只 `warn!`，不锁门）。Stop 最终响应为 **500** + `code=STOP_INTENT_NOT_PERSISTED`（**即使 teardown 成功也不得返回 200**，见 §6.4 末条），并 `tracing::error!` 带 `endpoint_id` 与 DB 错误 |
 | **继续执行安全方向的停止处理** | 落盘失败**不阻止** `begin_stop` 与 teardown：停下来的安全收益与 DB 无关。**禁止**因为"意图没写进去"就跳过停止 |
-| **禁止不受控重新启动** | `intent_unpersisted=true` 期间 `commit_start` 一律返回 **503 `INTENT_UNPERSISTED`**（§6.4 步骤 0）——不接受新的 Start，直到意图补写成功。补写时机：teardown 结束后的 finalize（同步重试一次）与下一次 Stop（再写一次）；补写成功后清标记并 `desired_seq += 1` |
+| **禁止不受控重新启动** | `intent_unpersisted=true` 期间 `commit_start` 一律返回 **503 `INTENT_UNPERSISTED`**（§6.4 步骤 0）——不接受新的 Start，直到**下一次成功的意图落盘**。**不存在"teardown 结束后由 finalize 自动同步补写一次"的步骤（v3.1 勘误：代码中并无该机制，落盘只发生一次）**：Stop 的 `desired=false` 落盘只有 `admit_stop` 派发的那一个任务（`lifecycle.rs:793-810`）。标记只能被后续**新的**成功写入清除——下一次 Stop 落盘成功（`lifecycle.rs:840-846`，并顺带清围栏 `:849-856`）、下一次 Start 落盘成功（`:512-539`，并顺带清围栏 `:531`）、或端点删除收尾（`:728`）。 |
 
-**重启恢复的残余风险：已从"不消除"改为"已消除"（v3 更正）**
+**重启误拉起风险：按驱动分别表述（v3.1 勘误——v3 的"已消除"是过度承诺）**
 
-初稿（v2）在此写的是"本设计不能消除它，因为 DB 是唯一持久真值"。**这个结论已被实现推翻**，现在的机制是三层叠加，且都不新增表列（§10-4 仍然成立）：
+初稿（v2）在此写"本设计不能消除它，因为 DB 是唯一持久真值"；v3 又把整段改成"**已消除**"。**"已消除"只对 `sinumerik-nck` 成立，不得扩大成所有驱动的绝对保证**——v3 实际是把 828D 一期的产品约束（P0-C）当成了通用保证：
+
+| 驱动 | 结论 | 依据 |
+|---|---|---|
+| `driver_id="sinumerik-nck"` | **无条件禁止开机自动恢复**（一期产品约束，与围栏 / 正向凭证 / `desired_running` 无关）⇒ **"重启误拉起"这一风险确实消除** | `crates/core-api/src/recovery.rs:35-37`；判定在**正向凭证之前**直接 `continue`：`apps/mesad/src/main.rs:190-198`（§6.15） |
+| **其他驱动** | **仍存在误自动恢复风险，未消除**（路径见下） | 判定函数对其他 `driver_id` 恒为 `true`（`recovery.rs:35-37`、单测 `:53-63`），只交给"围栏 + 正向凭证"判据（`main.rs:165-208`） |
+
+**其他驱动仍可能被误拉起的完整路径**（每一环都按代码核对，缺一不发生）：
+
+1. DB 里旧值 `desired_running=true`（端点此前在跑），且正向凭证 `<db>.intent-proof.json` 中该 id 仍为 `true`——该端点曾成功 Start 过（`config-store/src/lib.rs:712-724` 记录凭证、`set_desired_running` 成功后写入 `:1664-1669`）；
+2. 用户 Stop，`set_desired_running(false)` 落盘**失败**（此时 `intent_unpersisted=true`，但 DB 里的旧值仍是 `true`）；
+3. S2 围栏**两条通道都写失败**（`config-store/src/lib.rs:1734-1741` 返回 `Err`）⇒ `lifecycle.rs:884-906` 只留下 `CRITICAL` 日志，**没有留下任何持久痕迹**；
+4. 重启前存储**恢复可写** ⇒ `recovery_plan()` 返回 `Proceed`（`config-store/src/lib.rs:739-767`：DB 可写 + 围栏可读且为空 + 凭证可读）、无围栏命中、凭证为 `true`、且非 NCK 驱动 ⇒ **该端点被自动拉起**（`apps/mesad/src/main.rs:181-208`）。
+
+也就是说，"围栏 + 正向凭证"把风险**收窄**成"两条围栏通道同时写不进去、且重启时存储已恢复可写"这一窄窗口，**但并未消除**它。
+
+**要彻底消除"所有驱动"的这类风险，需要另行产品决策**——例如把 §6.15 的"一律不自动恢复"从 NCK 推广为**全局策略**（任何端点开机都必须显式 `POST /start`）。**当前未做**：`boot_auto_restore_allowed()` 对其他驱动恒为 `true`（`recovery.rs:35-37`），本设计不改变这一点，本轮也不改任何代码（§11-17）。
+
+**现有机制确实成立的部分**（不是"已消除"，而是"已按 fail-closed 处理"）：
 
 | 层 | 机制 | 代码 |
 |---|---|---|
@@ -905,12 +925,10 @@ ATTEMPT_FAILED_UNKNOWN            ← 唯一的增量（G7 §6.8，隔离态让 
 | 2. 默认值翻转 + 正向凭证 | 开机恢复从"没围栏就恢复"改为"**能证明才恢复**"：需 DB 可写 + 围栏可读 + `<db>.intent-proof.json` 里该 id 被确认为 `true`；`set_desired_running` 成功且 `n>0` 才写凭证 | `config-store/src/lib.rs:359-374`、`:708`、`:739-767`；`apps/mesad/src/main.rs:140-208` |
 | 3. 一期产品约束（P0-C） | `sinumerik-nck` 端点**任何情况都不自动恢复**，与凭证/围栏/`desired_running` 无关；必须显式 `POST /start` | `core-api/src/recovery.rs:29-37`；`apps/mesad/src/main.rs:184-198`（§6.15） |
 
-**仍然诚实的边界（不是"已知无法消除"，而是"已按 fail-closed 处理"）**：
-
-- 围栏**两条通道都写不进去**、或 sidecar 读不懂、或 DB 只读 ⇒ `recovery_plan()` 返回 `DenyAll` ⇒ **本次进程一个端点都不自动恢复**（宁可少恢复，不可误拉起机床端点）：`config-store/src/lib.rs:739-767`、`:1694-1742`（两通道都失败才 `Err`）、`:4584` 附近单测 `corrupt_sidecar_is_an_error_not_empty_fence`。
-- `set_desired_running` 写成功但**凭证写失败**（文件不可写）⇒ 下次开机该端点不恢复（安全方向），需人工 `POST /start` 一次。
+- 围栏**两条通道都写不进去**、或 sidecar 读不懂、或 DB 只读 ⇒ `recovery_plan()` 返回 `DenyAll` ⇒ **本次进程一个端点都不自动恢复**（宁可少恢复，不可误拉起机床端点）：`config-store/src/lib.rs:739-767`、`:1694-1742`（两通道都失败才 `Err`）、单测 `corrupt_sidecar_is_an_error_not_empty_fence`（`:4587`）。
+- `set_desired_running` 写成功但**凭证写失败**（`config-store/src/lib.rs:712-727`；失败只体现为"凭证里没有该条"）⇒ 下次开机该端点不恢复（安全方向），需人工 `POST /start` 一次。
 - 升级迁移：升级前已在运行的端点没有凭证 ⇒ 升级后**首次重启不会自动恢复**，需现场逐台显式 `POST /start`（`recovery.rs:18-26` 的迁移语义注释）。
-- 真正无法在本设计内消除的只剩"两通道同时不可写 + 进程崩溃"这一种，且它导致的是**不恢复**（安全方向）而不是误拉起。
+- 上面这些"不恢复"都是安全方向；**唯一可能变成"误拉起"的，只有本小节开头那张表里"其他驱动"的第 1~4 步路径**，而它只能靠产品决策消除。
 
 ### 6.11 完成代次凭证 `last_completed_gen`（P0-3）
 
@@ -1295,7 +1313,7 @@ async fn await_settled(&self, id: &str, timeout: Duration) -> Settled {
 | 1169 | `in_flight_start_superseded_by_stop_admission` | admit_start → admit_stop → commit_start ⇒ 409 `SUPERSEDED_BY_STOP`；无 attempt、`desired` 仍假 |
 | 1193 | `newer_stop_completion_does_not_clear_older_inflight_stop` | **P0-A 主门**：Stop-B（最新）先完成不得清掉 Stop-A 的代次；Start 得 409 `STOP_PERSIST_IN_PROGRESS` |
 | 1230 | `settled_without_generation_baseline_is_not_settled` | `current_gen==None` ⇒ `NotSettled{NoGenBaseline}`（无证据 ≠ 成立） |
-| 1245 | `stop_intent_persist_failure_blocks_start_until_rewritten` | 落盘失败 ⇒ `intent_unpersisted` + 持久化围栏 + Start 503 `INTENT_UNPERSISTED`；补写成功后恢复并清围栏 |
+| 1245 | `stop_intent_persist_failure_blocks_start_until_rewritten` | 落盘失败 ⇒ `intent_unpersisted` + 持久化围栏 + Start 503 `INTENT_UNPERSISTED`；再次落盘成功（重写）后恢复并清围栏 |
 | 1275 | `second_stop_joins_instead_of_failing` | 两次 `admit_stop` 都等同一个结论（合流，不重复拆解） |
 | 1294 | `delete_wait_rejects_unconverged_intent_persist_and_passes_after_convergence` | **P0-D**：在途写入未收敛 ⇒ 409 `DELETE_PERSIST_IN_PROGRESS`；收敛后等待立即通过且不引入延迟；`commit()` 推进墓碑代次 |
 | 1351 | `delete_barrier_blocks_new_start_but_still_persists_new_stop` | **P0-D + P0-E-1**（改名后的新语义，更严）：屏障期 Start 409 `ENDPOINT_DELETED` 且不留 attempt；**屏障期 Stop 照常把 DB 写成 `false`**；丢弃 guard 即撤屏障 |
@@ -1401,7 +1419,7 @@ async fn await_settled(&self, id: &str, timeout: Duration) -> Settled {
 ## 10. 明确不做
 
 1. **不重构生命周期**：不引入"期望态 vs 运行态"对账器/看门狗（它本身会启停端点，对现场更危险）；不改 attempt 状态机、不改 teardown 预算。§7.3 的观察器**只读**，不写 `desired_running`、不 cancel attempt。§6.3.3 的 `attempt_reaper` **只清理已死 attempt 的残留**（kill 残留 pid、摘除属于该 gen 的 registry 键），**不启停端点、不写期望态、不改快照** ⇒ 它不是对账器，不属本项排除对象；但它的实现必须守住这条边界（代码注释 + review 门）。
-2. **不改 wire/IPC**：`driver-protocol`、protobuf、驱动进程协议、REST 路由与字段一律不动；`EndpointStatus`（`snapshot.rs:83-95`）**不加字段**，代次只存在于 `Snapshot` 的内部 map 键结构（`EndpointRecord{generation,status}`）里。对外行为变化仅限 §6.9 "回归风险"列出的**六处**（状态码/code、Stop 的失败可见性、`STOP_PERSIST_IN_PROGRESS`、`DELETE_PERSIST_IN_PROGRESS`），**不新增路由、不新增响应字段**。
+2. **不改 wire/IPC**：`driver-protocol`、protobuf、驱动进程协议、REST 路由一律不动；`EndpointStatus`（`snapshot.rs:83-95`）**不加字段**，代次只存在于 `Snapshot` 的内部 map 键结构（`EndpointRecord{generation,status}`）里。对外行为变化仅限 §6.9 "回归风险"列出的**六处**（状态码/code、Stop 的失败可见性、`STOP_PERSIST_IN_PROGRESS`、`DELETE_PERSIST_IN_PROGRESS`），**不新增路由**；**REST 字段的唯一增量**是 Bootstrap 失败响应的 `attempt_stopped`（R-1，`bootstrap.rs:466`，见 §6.10.2 末——v3.1 勘误：不能笼统说"字段完全不变"）。
 3. **不改 A1**：`endpoint.rs:44-50`、`:315`、`:416-418`、`:59-61` 一字不改；不调退避档位、不改归零判据。
 4. **不新增持久化列**：`generation`/`last_completed_gen` 只存内存，避免 `endpoints` 表迁移与 `assert_changed_within` 类红线冲突。**注意两点**：(a) §6.10 修改了 `UPDATE` 语句的列清单（去掉 `desired_running`），但**不改表结构、不加列、不迁移**；(b) S2 的停止意图围栏与 P0-4 的正向凭证**也不加列**——围栏复用既有 `meta` 键值表（`STOP_INTENT_FENCE_KEY`，`config-store/src/lib.rs:342`）+ DB 同目录 sidecar 文件（`.stop-fence.json`，`:349`），凭证用 `<db>.intent-proof.json`（`:357`）。
 5. **不修** `run_config_flow` 无取消点（Stop 后仍可能 `StartConnection`）——文档 §5.3-⑥ 已作为**观测判据**登记，属独立缺陷，另立设计；本设计不宣称消除它。
@@ -1409,7 +1427,7 @@ async fn await_settled(&self, id: &str, timeout: Duration) -> Settled {
 7. **不删除** 828D 的 G7-3（无在途 Start）与文档 §5.3 的竞态观测：修复只是让竞态**显式失败**（409），现场仍按 `RACE_START_AFTER_STOP` 记录。
 8. **不加自动强杀/自动恢复**：`child.wait()` 无界时保持 fail-closed（Start 一直 409）并大声告警，不引入"超时就当停了"的判定（§6.3.1）。**唯一例外**是 §6.3.3 的 `attempt_reaper`：它只对"任务已死、条目处于隔离态"的残留 pid 做强杀与回收，不改变任何活着的 attempt 的 teardown 预算。
 9. **不做现场 10 s 判据的自动化**：Core 不实现"连续 10 s 观察"、不新增配置项、不写 `desired_running`（§7.5）。现场判据由证据脚本/监护流程执行，Core 只提供可观测面。
-10. **不做额外的"上次干净退出"持久标记**：重启误拉起的风险已由 **S2 围栏（双通道）+ 正向凭证 + 默认不恢复 + P0-C（NCK 永不自动恢复）** 消除（§6.10.3 已改写），不需要再加"上次是否干净退出"这类新的持久状态（它与 §10-4 冲突）。剩余的唯一情形是"两通道同时不可写"，其后果是**不恢复**（安全方向），不是误拉起。
+10. **不做额外的"上次干净退出"持久标记**：S2 围栏（双通道）+ 正向凭证 + 默认不恢复已把"重启误拉起"从"随时可能"收窄到极窄窗口，P0-C 又让 **NCK 无条件不自动恢复**（§6.10.3 已改写），因此不值得再加"上次是否干净退出"这类新的持久状态（它与 §10-4 冲突）。**边界必须说清（v3.1 勘误）**：这条"不做"成立的前提是**接受**"其他驱动仍有一类误拉起路径"——即"DB 旧值 `desired_running=true` + 正向凭证为真 + Stop 落盘失败 + 围栏两通道都写不进去 + 重启前恢复可写"（§6.10.3 末）。该路径的**唯一**彻底解法是产品决策层面的"所有驱动开机一律不自动恢复"（§11-17），本设计**没有做**，也**不声称已消除**。
 
 ---
 
@@ -1435,3 +1453,4 @@ async fn await_settled(&self, id: &str, timeout: Duration) -> Settled {
 15. **`DELETE_PERSIST_WAIT = 10s` 的取值**（P0-D）：依据是"验收用慢写注入 2.5–9 s + 正常路径零等待"（`lifecycle.rs:49-54`）。现场若出现更长的事务阻塞，DELETE 会稳定返回 409 让客户端重试；是否需要一个可配置项——**待确认**（本文倾向不引入配置，避免"配置得越小越危险"）。
 
 16. **P0-C 在产品层的可见性**：NCK 端点被开机跳过时目前只写 `warn!` 日志（`main.rs:191-197`），REST 面上没有"因产品策略跳过恢复"的状态位。是否需要可观测字段——**待确认**（`nck-828d-phase1-boot-recovery-policy.md` 属独立文档，本文不改它）。
+17. **是否把"开机一律不自动恢复"从 NCK 推广到所有驱动**（v3.1 登记）：这是彻底消除 §6.10.3 末"**其他驱动**仍存在误自动恢复风险"的**唯一**手段，属产品决策，不是本设计能自行补上的实现项。**当前未做**——`boot_auto_restore_allowed()` 对其他 `driver_id` 恒为 `true`（`recovery.rs:35-37`）。若采纳，改动点是该函数恒返回 `false` 并把现场流程改为"每次开机逐端点显式 `POST /start`"，代价是自动化程度与现场工作量——**待确认**。
