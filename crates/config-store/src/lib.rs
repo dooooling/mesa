@@ -295,6 +295,69 @@ fn aead_decrypt(ciphertext: &[u8], nonce: &[u8], key: &[u8; 32]) -> Result<Vec<u
 /// point_registry 行（诊断用）：key/id/类型/墓碑/来源标签/展示名。
 pub type RegistryRow = (String, u32, String, bool, Option<String>, Option<String>);
 
+/// 显式"挂起 → 由测试放行"屏障（`test-hooks` 门控的自测基础设施）。
+///
+/// 为什么需要它（G7 P0-D 用例的确定性要求）：此前的做法是"给这次写库注入 9s
+/// 延迟，DELETE 的等待预算是 10s"——正确性依赖"机器一定比注入延迟更快"。
+/// CI 负载高时 9s 写入 + teardown + 调度开销会超过 10s，DELETE 于是按预算用尽
+/// 返回 409 `DELETE_PERSIST_IN_PROGRESS`，用例间歇性变红（同一份代码在其他 CI
+/// 上却是绿的）。
+///
+/// 改用本屏障后，"写入在途"成为一个**时长由测试决定**的窗口：写入在
+/// "已进入 `set_desired_running`（`calls_started` 已 +1）、尚未写库"处挂起，
+/// 直到测试显式 [`Self::release`]。这样 DELETE 的开始时刻与写入完成时刻的先后
+/// 关系由测试的显式握手决定，不再依赖机器速度；而生产常量
+/// `DELETE_PERSIST_WAIT`（10s）保持不变。
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Default)]
+pub struct WriteHold {
+    /// 是否已放行（`release` 置真，幂等）。
+    released: std::sync::Mutex<bool>,
+    /// 放行通知：避免测试放行后写入端还要再轮询一段时间。
+    cv: std::sync::Condvar,
+}
+
+#[cfg(feature = "test-hooks")]
+impl WriteHold {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 放行被挂起的写入。幂等：重复调用、或在写入端尚未挂起时调用都安全。
+    pub fn release(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *released = true;
+        self.cv.notify_all();
+    }
+
+    /// 挂起当前（blocking）线程，直到 [`Self::release`] 被调用。
+    ///
+    /// `max_wait` 只是**安全阀**（防止测试漏掉 release 时永久占住一个 blocking
+    /// 线程把测试进程拖死），不参与语义：正常路径上 release 在毫秒级完成，
+    /// 因此它不会把"确定性握手"退化成"靠超时猜"。
+    fn wait(&self, max_wait: std::time::Duration) {
+        let deadline = std::time::Instant::now() + max_wait;
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*released {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return;
+            }
+            let (guard, _) = self
+                .cv
+                .wait_timeout(released, deadline - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            released = guard;
+        }
+    }
+}
+
 /// 运行意图（`desired_running`）落盘故障注入（`test-hooks` feature 门控）。
 ///
 /// 为什么需要它：G7 生命周期修复里有两条**必须可判定**的语义，都依赖"落盘失败
@@ -330,6 +393,13 @@ pub struct DesiredWriteFaults {
     /// 已**完成**（成功或注入失败返回）的调用数。用于证明 Start 的意图落盘
     /// 先于其响应返回（P0-B 拆锁后仍必须成立）。
     pub calls_completed: std::sync::atomic::AtomicU64,
+    /// 显式挂起队列（见 [`WriteHold`]）：按 `set_desired_running` 的调用顺序取
+    /// 队首；取到的那次调用会在 `calls_started` +1 之后、真正写库之前挂起，
+    /// 直到测试 `release()`。队列空 ⇒ 不挂起（与 [`Self::delay_seq`] 同口径）。
+    ///
+    /// 与"注入固定延迟"的区别：延迟只是"大概是够用的窗口"，屏障是"窗口由测试
+    /// 开关决定"，因此并发顺序可被证明，而不是被采样。
+    pub hold_seq: Mutex<std::collections::VecDeque<std::sync::Arc<WriteHold>>>,
 }
 
 /// 同一 DB 中 `meta` 表里保存"停止意图未持久化"围栏的键。
@@ -1637,6 +1707,16 @@ impl ConfigStore {
             };
             if delay > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            // 显式挂起（G7 P0-D 用例）：由测试决定"写入在途"窗口有多长，
+            // 而不是靠"注入的延迟比调用方预算短"这种与机器速度相关的假设。
+            // 仍在取 `self.conn` 之前 ⇒ 挂起期间不持有 DB 锁，其他读取不被连带阻塞。
+            let hold = {
+                let mut q = self.desired_faults.hold_seq.lock().unwrap();
+                q.pop_front()
+            };
+            if let Some(hold) = hold {
+                hold.wait(std::time::Duration::from_secs(120));
             }
             if self
                 .desired_faults
