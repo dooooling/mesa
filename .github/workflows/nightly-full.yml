@@ -6,7 +6,7 @@
 # - stress（Windows x64 重复采样）
 # - perf（7 项秒级门）
 # - web
-# - watchdog（Windows + Linux 离线场景 M0–M16；nightly 不看 planner，全量安全网里必须有它）
+# - watchdog（Windows + Linux 离线场景 M0–M18；nightly 不看 planner，全量安全网里必须有它）
 # 日常 PR 只跑 selective；FULL 只放这里 + 手动触发。
 name: nightly-full
 on:

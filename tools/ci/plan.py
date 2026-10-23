@@ -14,7 +14,7 @@
   "stress": false,            # rust-stress
   "perf": false,              # rust-perf
   "web": true,                # web build/test
-  "watchdog": false,          # stop-watchdog 离线场景（Windows + Linux，M0–M16）
+  "watchdog": false,          # stop-watchdog 离线场景（Windows + Linux，M0–M18）
   "reason": "...",            # 人类可读路由原因
 }
 

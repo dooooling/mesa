@@ -12,7 +12,7 @@
 #   ├─ rust-platform ×3（全 workspace 编译 + smoke；main 上 full）
 #   ├─ rust-stress（风险触发；main Rust change 必跑）
 #   ├─ rust-perf（风险触发；与 canonical 并行）
-#   └─ watchdog（Windows + Linux 并行跑 stop-watchdog 离线场景 M0–M16；**仅** watchdog 相关
+#   └─ watchdog（Windows + Linux 并行跑 stop-watchdog 离线场景 M0–M18；**仅** watchdog 相关
 #                路径变更或 fail-closed FULL 时运行，绝不无条件跑——单 job 25 分钟预算）
 # PR 快速反馈 + main 全集成安全网（不再机械完全重复）。
 name: CI
