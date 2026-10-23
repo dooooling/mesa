@@ -9,7 +9,7 @@
 > - **填写者不得为了让测试通过而调整任何预期值**（§5.6-N9）。任何"先跑再说、边跑边改"的做法一律作废。
 > - 本文件**不含**任何已批准的具体值：所有 `______` / **待填** 都是待签署内容，不是默认值。
 
-**编制信息**：实施基线 `main = 125d00bc840470858f9ced9cf81e313d452a1dae`；模板版本 **t1**；编制日期 2026-10-23；编制范围**仅新建本文件**（未改代码/测试/配置/其它文档，未做 git 写操作，未启服务、未连设备、未跑测试或构建）。
+**编制信息**：实施基线 `main = 125d00bc840470858f9ced9cf81e313d452a1dae`；**t1.1 同步基线（#136/#137 合入后）：`main = 7ca0edc5de5fd26daf4c7090e9f640470f9e0058`**；模板版本 **t1**；编制日期 2026-10-23；编制范围**仅新建本文件**（未改代码/测试/配置/其它文档，未做 git 写操作，未启服务、未连设备、未跑测试或构建）。
 
 **本模板引用的已合并契约（不得重新设计，只能引用）**：
 
@@ -23,7 +23,7 @@
 
 **术语**：**watchdog** = `scripts/stop-watchdog.ps1`；**#130** = 上表第 1 项；**G7 设计** = 上表第 3 项；**生命周期门** = 上表第 4 项；**ARMED / FIRED** = watchdog 的两个阶段（`watchdog:13-32`）；**三轴** = `summary.json` 的 `axes.schedule` / `axes.sampling` / `axes.convergence`（`watchdog:2966-2990`）。
 
-**本模板不承诺的事（写在这里，避免签署时误解）**：30 秒是**调度目标**而非物理停止保证；读到的值 ≠ 业务可用；点位数量门禁（`-ExpectedPointCount`）**已由 B-1 代码修复关闭**（PR #136，**待合入 main**）：配置门核验的是**当前任务点数**（取自实时任务快照 `tasks[].binding.config.points[]`），`diagnostics.point_count` 降级为运行状态观测值 `diagnostics_point_count_observed`、**不参与判定**（§2.5）；G6 的 ARMED **不能**对生产 `127.0.0.1:8132` 执行（`watchdog:611-628`）。
+**本模板不承诺的事（写在这里，避免签署时误解）**：30 秒是**调度目标**而非物理停止保证；读到的值 ≠ 业务可用；点位数量门禁（`-ExpectedPointCount`）**已由 B-1 代码修复关闭**（PR #136，**已合入 main**）：配置门核验的是**当前任务点数**（取自实时任务快照 `tasks[].binding.config.points[]`），`diagnostics.point_count` 降级为运行状态观测值 `diagnostics_point_count_observed`、**不参与判定**（§2.5）；G6 的 ARMED **不能**对生产 `127.0.0.1:8132` 执行（`watchdog:611-628`）。
 
 ---
 
@@ -103,7 +103,7 @@
 
 > **指纹 ≠ 文件摘要**：指纹只覆盖规范化 `tasks` 数组，**不覆盖 `connection`**（`watchdog:170-171`、`:1123-1125`）。只签指纹不签文件摘要 ⇒ `connection` 被改而指纹不变，必然被 `watchdog:1326-1330` 拒绝。
 >
-> **行号口径**：2.3-2 的 `watchdog:1536-1538` / `:1515-1518` 属 **PR #136 版本**（3241 行，尚未合入 main）；本表其余行号对应**已合入基线**（PR #131 的 3096 行版本）。两者不可混用；本次仅重排"点数门"相关行号，`#136` 合入后需对全表整体重排。
+> **行号口径**：2.3-2 的 `watchdog:1536-1538` / `:1515-1518` 属 **PR #136 版本**（3241 行，**已合入 main，merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`**）；本表其余行号对应**已合入基线**（PR #131 的 3096 行版本）。两者不可混用；本次仅重排"点数门"相关行号，`#136` 合入后需对全表整体重排。
 
 ### 2.4 「批准值来源」栏（硬约束 1 的可检查项）
 
@@ -126,9 +126,9 @@
 
 ### 2.5 `-ExpectedPointCount` 时序核实（硬约束 4，**本模板的技术核心**）
 
-**结论：原为 B（无法确认）；已由 B-1 代码修复关闭（PR #136，HEAD `dfc81e04a9d3683dd06d6e19426012d9dcdab5a2`，CI 4 PASS / 0 FAIL，**尚未合入 main**）。** 修复前该门禁**不能**用"由获批配置推导的值"可靠判定；修复后 `-ExpectedPointCount` 比对的是**当前任务点数**（实时任务快照 `tasks[].binding.config.points[]` 总数），`diagnostics.point_count` 降级为运行状态观测、**不参与配置门判定**。签署前仍须**确认 #136 已合入 main**（本模板不得先于 #136 合并）。
+**结论：原为 B（无法确认）；已由 B-1 代码修复关闭（PR #136，HEAD `dfc81e04a9d3683dd06d6e19426012d9dcdab5a2`，CI 4 PASS / 0 FAIL，**已合入 main**）。** 修复前该门禁**不能**用"由获批配置推导的值"可靠判定；修复后 `-ExpectedPointCount` 比对的是**当前任务点数**（实时任务快照 `tasks[].binding.config.points[]` 总数），`diagnostics.point_count` 降级为运行状态观测、**不参与配置门判定**。签署前仍须**确认 #136 已合入 main**（本模板不得先于 #136 合并）。
 
-> **行号口径**：本节引用的 `watchdog:<行号>` 以 **PR #136 的 `scripts/stop-watchdog.ps1`（3241 行，HEAD `dfc81e0`）** 为准。该版本尚未合入 `main`，故本模板中"已合并契约"表（§开头第 2 项，PR #131 的 3096 行版本）仍是**已合入基线**，两者行号不可混用。
+> **行号口径**：本节引用的 `watchdog:<行号>` 以 **PR #136 的 `scripts/stop-watchdog.ps1`（3241 行，HEAD `dfc81e0`）** 为准。该版本**已合入 `main`**（merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`），故本模板的"已合并契约"表应更新为 **PR #136 的脚本版本**；§开头第 2 项记录的 PR #131（3096 行）版本已作废，两者行号不可混用。
 
 **修复后的实际语义（#136 已实现，本节即最终口径）**：
 
@@ -168,11 +168,11 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 
 **补充事实（影响"首轮 = 0"的假设）**：`point_registry` 表**没有外键**（`crates/config-store/src/lib.rs:919-929`），`delete_endpoint` 只执行 `DELETE FROM endpoints`（`:1676-1680`），handler 也只清 Snapshot 与停止意图围栏（`crates/core-api/src/lib.rs:2182-2196`），**都不清理 `point_registry`**。因此"从未 Start 过 ⇒ `point_count = 0`"只对**从未使用过该 `id`** 的端点成立；同一 `id` 删除后重建会继承旧行。
 
-**`BLOCKED-01` 的关闭方式：已选定 B-1（代码修复）并已实现（PR #136，待合入 main）**。B-2 / B-3 保留为**历史备选，本轮均未采用**：
+**`BLOCKED-01` 的关闭方式：已选定 B-1（代码修复）并已实现（PR #136，**已合入 main，merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`**）**。B-2 / B-3 保留为**历史备选，本轮均未采用**：
 
 | 选项 | 做法 | 状态 |
 |---|---|---|
-| **B-1 代码修复（已选定、已实现）** | 让配置门比对"当前任务点数"（实时任务快照 `tasks[].binding.config.points[]` 总数，`watchdog:1293`），并把 `diagnostics.point_count` 降级为 `diagnostics_point_count_observed`（observed-only、不参与判定） | **已实现于 PR #136**（`dfc81e0`，CI 4 PASS / 0 FAIL）；**尚未合入 main**，本模板不得先于 #136 合并 |
+| **B-1 代码修复（已选定、已实现）** | 让配置门比对"当前任务点数"（实时任务快照 `tasks[].binding.config.points[]` 总数，`watchdog:1293`），并把 `diagnostics.point_count` 降级为 `diagnostics_point_count_observed`（observed-only、不参与判定） | **已实现于 PR #136**（`dfc81e0`，CI 4 PASS / 0 FAIL）；**已合入 main**，本模板不得先于 #136 合并 |
 | **B-2 语义改写并显式签署** | 由审批人签署"`-ExpectedPointCount` 是**状态断言**（残留 registry 行数）"并承担风险 | **未采用**（与硬约束 1 精神冲突；#136 已从根上消除该需要） |
 | **B-3 本轮不执行** | 以 `BLOCKED-01` 未关闭为由判 NO-GO，等待 B-1 | **未采用**（B-1 已落地） |
 
@@ -209,7 +209,7 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 | 3.2-1 | CI run / 流水线标识 | ______ | 可公开检索的 run 链接或编号 |
 | 3.2-2 | 构建产物名（artifact） | ______ | 与 3.1-2 的路径对应 |
 | 3.2-3 | 产出人 / 产出时间 | ______ / ______ | 构建方签署 |
-| 3.2-4 | 该产物是否来自 `main = 125d00b` 之后的含 G7 版本 | ☐ 是 ☐ 否（否 ⇒ NO-GO） | 仅作**辅助记录**，不作为通过依据（见 §3.4） |
+| 3.2-4 | 该产物是否来自含 G7 与 BLOCKED-01 修复的版本（`main >= f5f9f56a35a8d3c457a139f8904fcbaf4372e119`） | ☐ 是 ☐ 否（否 ⇒ NO-GO） | 仅作**辅助记录**，不作为通过依据（见 §3.4） |
 
 ### 3.3 构建清单文件与其自身 SHA-256
 
@@ -351,7 +351,7 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 | N5 | 现场门禁任一门（G1–G6）不通过 | §5.1 逐门核对 | ☐ 是 ☐ 否 |
 | N6 | 人工核验三字段任一缺失/不一致/无法取证 | §5.5 | ☐ 是 ☐ 否 |
 | N7 | 签署栏（§5.7）四方任缺签名、日期或角色重复 | 逐栏核对 | ☐ 是 ☐ 否 |
-| N8 | **`BLOCKED-01` 的依赖未满足**：PR #136（B-1 修复）**未合入 `main`** ⇒ 修复不在基线中，仍判 NO-GO（`BLOCKED-01` 本身已由 B-1 关闭） | 核对 PR #136 是否已合入 `main`（`git log main` / PR 状态），并确认部署的 watchdog 为含 `Get-WdTaskPointCount`（`watchdog:1293`）的版本 | ☐ 是 ☐ 否 |
+| N8 | **`BLOCKED-01` 依赖已满足**：PR #136（B-1 修复）**已合入 `main`**（merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`）⇒ 修复在基线中，本项**通过**；若部署的 watchdog 早于该合并则仍判 NO-GO（`BLOCKED-01` 本身已由 B-1 关闭） | 核对 PR #136 是否已合入 `main`（`git log main` / PR 状态），并确认部署的 watchdog 为含 `Get-WdTaskPointCount`（`watchdog:1293`）的版本 | ☐ 是 ☐ 否 |
 | N9 | 有人修改过任何预期值以"让门禁通过" | 对照 §2.4 批准记录与最终命令行参数 | ☐ 是 ☐ 否 |
 | N10 | 使用了 `-SkipHostChecks` 或携带测试注入参数 | `watchdog:1731-1733`、`:654-702` | ☐ 是 ☐ 否 |
 | N11 | 存在**遗留的在途 Start**（已发出、未收到明确结果） | #130 §4.7-c；`watchdog:2784`、`:2859` | ☐ 是 ☐ 否 |
@@ -374,7 +374,7 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 - ☐ 三个摘要（§4-①②③）已填入且来源符合 §4 的批准来源要求。
 - ☐ §5.5 人工核验三字段已逐字段比对并由复核人独立签名。
 - ☐ `-Mode arm` 退出码 ______（须 0）、`arm-report.json` ______、凭证汇总 ______（须 `verified`）。
-- ☐ `BLOCKED-01` **已选 B-1 并实现（PR #136，待合入 main）**；已确认 **#136 已合入 main** ☐；审批人签字 ______。
+- ☐ `BLOCKED-01` **已选 B-1 并实现（PR #136，**已合入 main，merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`**）**；已确认 **#136 已合入 main** ☑；审批人签字 ______。
 - ☐ 本人已知晓：**30 秒是调度目标，不是物理停止保证**；`T0` 由 watchdog 在 FIRED 时刻自生成，**签字时不得填写任何具体 `T0` 或截止时刻**（`watchdog:2248-2293`）。
 
 ### 5.8 执行顺序（本模板固定顺序；**含门禁前置诊断步骤**）
@@ -517,7 +517,7 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 
 | # | 项 | 状态 | 为什么不能在本模板里写死 | 谁来解决 |
 |---|---|---|---|---|
-| **BLOCKED-01** | **`-ExpectedPointCount` 的时序语义**（§2.5） | **已关闭（B-1，PR #136）**；**依赖 #136 合入 main**（未合入 ⇒ 仍判 NO-GO，§5.6-N8） | 关闭前的问题：`point_count` 来自持久化 `point_registry`（`crates/core-api/src/lib.rs:1499` → `crates/config-store/src/lib.rs:2459-2473`），只由 Start 时的 `assign` 写入（`crates/driver-manager/src/endpoint.rs:206-224`，调用点 `:213` ← `run_config_flow:943-945`），PUT 不写它（`crates/core-api/src/lib.rs:2415-2419`），因此不存在"由获批配置推导、又必然等于现场残留"的值。#136 改为核验**当前任务点数**（实时快照 `tasks[].binding.config.points[]`，`watchdog:1293`/`:1515-1518`），`diagnostics.point_count` 降级为 `diagnostics_point_count_observed`（observed-only） | 已由代码修复解决；**待 #136 合入 main**（合入前本模板不得先行合并） |
+| **BLOCKED-01** | **`-ExpectedPointCount` 的时序语义**（§2.5） | **已关闭（B-1，PR #136）**；**依赖已满足：#136 已合入 main（merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`）**（**若现场部署的 watchdog 早于该合并 ⇒ 仍判 NO-GO**，§5.6-N8） | 关闭前的问题：`point_count` 来自持久化 `point_registry`（`crates/core-api/src/lib.rs:1499` → `crates/config-store/src/lib.rs:2459-2473`），只由 Start 时的 `assign` 写入（`crates/driver-manager/src/endpoint.rs:206-224`，调用点 `:213` ← `run_config_flow:943-945`），PUT 不写它（`crates/core-api/src/lib.rs:2415-2419`），因此不存在"由获批配置推导、又必然等于现场残留"的值。#136 改为核验**当前任务点数**（实时快照 `tasks[].binding.config.points[]`，`watchdog:1293`/`:1515-1518`），`diagnostics.point_count` 降级为 `diagnostics_point_count_observed`（observed-only） | 已由代码修复解决；**待 #136 合入 main**（合入前本模板不得先行合并） |
 | 2 | `-ExpectedTaskRevision` 的时序 | **待确认** | 签署包在窗口之前准备，无法预知窗口内是否发生其它写入；一旦偏移 ⇒ `REFUSED_TASKCONFIG_MISMATCH`（`watchdog:285`） | 审批时一并签署；窗口内禁止任何其它写入（G5-②） |
 | 3 | G2 的"协商 PDU 核对" | **待确认** | `mode=probe` 会发起真实机床 I/O，需**单独授权**（#130 §4-G2） | 审批人单独授权或明确"不做" |
 | 4 | MAC `98-fa-9b-59-35-53` | **待确认** | 仓库内无留存（全仓检索无匹配） | 现场补充截图/书面记录 |
@@ -576,14 +576,14 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire `
   -ExpectedApprovedTaskConfigSha256 sha256:<签署值>
 ```
 
-> 骨架**不是**可直接执行的命令：所有 `<...>` 必须由 §2–§4 的签署值填入，且须先**确认 PR #136 已合入 main**（`BLOCKED-01` 已由 B-1 关闭）。**不得**携带 `-TestHostProbeError` / `-TestAbortFlow` / `-SkipHostChecks`（`watchdog:654-702`、`:1731-1733`）。
+> 骨架**不是**可直接执行的命令：所有 `<...>` 必须由 §2–§4 的签署值填入，且**已确认 PR #136 已合入 main（merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`）**（`BLOCKED-01` 已由 B-1 关闭）。**不得**携带 `-TestHostProbeError` / `-TestAbortFlow` / `-SkipHostChecks`（`watchdog:654-702`、`:1731-1733`）。
 
 ## 附录 C：填写完整性自检（提交签署前逐项打勾）
 
 - ☐ §1.1 九项身份栏位全部填写，机型四证（§1.2）齐备
 - ☐ §2.1 四点逐字段与 `approved-task-config.json` 逐字一致；§2.2 八字段齐备且标注 5 自动 / 3 人工
 - ☐ §2.3 四项（revision / 点位数 / 指纹 / 文件摘要）同源；§2.4 每行都有"由谁 / 依据什么 / 何时批准"
-- ☐ §2.5 已**确认 PR #136 已合入 main**（`BLOCKED-01` 已由 B-1 关闭）；§3 部署身份三件套齐备且未用 git 标识充当通过依据
+- ☑ §2.5 已**确认 PR #136 已合入 main**（`BLOCKED-01` 已由 B-1 关闭）；§3 部署身份三件套齐备且未用 git 标识充当通过依据
 - ☐ §4 三个摘要各自写明批准来源，且无现场现算；§5.1 六道门均为**本次窗口**新证据
 - ☐ §5.2 自动 / 人工两列未混写；§5.5 人工三字段有独立签名；§5.6 N1–N12 全为"否"
 - ☐ §5.7 四方签名齐全；§5.8 九步顺序已交底；§6 的核验项与证据清单全部填写
