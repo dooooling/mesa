@@ -39,7 +39,7 @@
   - GC4 升级路径写实：`CONTRACT.md` §升级与迁移 记录备份→停止→重建→核对
     四步与“无自动迁移”的明确承诺。✅
   - GC5 集成回归（REST/Core 全链）：`scripts/nck-native-rest-e2e.py` +
-    `docs/evidence/nck-rest-e2e.txt`（12 项断言）—— 模拟器真实 TCP +
+    `docs/evidence/nck-rest-e2e.txt`（13 项断言）—— 模拟器真实 TCP +
     mesad（临时 DB/独立端口），不触碰本机配置。覆盖：
     - 手写原生字段：保存→启动→采到 **GOOD**（`type=f64`、
       `source_label=nck://read/C/1/18/42/1/1?mode=current&decode=F64_BE&transport=0x09`）；
