@@ -1298,7 +1298,7 @@ function Get-WdTaskPointCount {
     #   （crates/core-api/src/lib.rs:1499 → crates/config-store/src/lib.rs:2459-2473，
     #    `SELECT … FROM point_registry WHERE endpoint_id=?1 AND deleted=0`）；
     #   唯一写点是 assign_point_ids（config-store:2344-2456），由
-    #   StorePointIdSource::assign（drivers/sinumerik-nck/src/endpoint.rs:206-224，调用点 :213）
+    #   StorePointIdSource::assign（crates/driver-manager/src/endpoint.rs:206-224，调用点 :213）
     #   在 run_config_flow 的 :943-945（ConfigureTasks :914 之后、ApplyPointMap :968-985 之前）写入。
     #   也就是说：读到的行数只反映"**上次走完 ConfigureTasks 的那次 Start**"留下的残留状态，
     #   与本次要核对的任务配置无关 —— 拿它当"配置正确性"判据，等于用历史残留冒充当前配置。
