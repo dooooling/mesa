@@ -241,6 +241,11 @@ C3-D 采用 **(A)**；如需 (B) 请明确指示。（本文档按 (A) 冻结。
    且 `MesaManager.source` 构造后不可替换 ⇒ 「进程内 `AppState` + `discover()`」的用例
    **看不到** `point_id` 落库（表现为运行态 `points=1` 而 `/diagnostics.point_count=0`）。
    C3-E 链路用例因此复刻 mesad 装配。
+   **（v1.4 勘误）** `point_count` 是 `point_registry` 的**活跃残留行数**，在 Start 配置闭环的
+   **`assign_point_ids`（assign）阶段**写入——`run_config_flow` 在 `ConfigureTasks` 之后、
+   `ApplyPointMap` 之前调用 `assign_point_ids`（`crates/driver-manager/src/endpoint.rs:943-945`
+   → `:206-224` → `crates/config-store/src/lib.rs:2344-2456`）；**不是** `ApplyPointMap` 写入
+   （它只把映射下发给 Driver，`endpoint.rs:968-985`）。
 2. **非 Secret 字段不做缺省继承**（`resolve_connection_draft` 的 NOTE）：草稿省略可见必填
    字段按 `required` 报 400，而不是回填已保存值；`connection-check` 的缺省继承**只**适用于
    §4 规定的 Secret 字段。这与 PUT「非 Secret 整体替换」同源，不是缺陷。
@@ -251,12 +256,24 @@ C3-D 采用 **(A)**；如需 (B) 请明确指示。（本文档按 (A) 冻结。
 > mesad 一致的 `MesaManager::with_source(StorePointIdSource)` 装配；`discover()` 仅提供
 > **内存型** ID 源，**不得**用它验证持久化点位。测试应**同时**断言实际出数与 ConfigStore
 > 中的 Point ID 映射，防止假绿。
+>
+> **（v1.4 勘误）** 该字段是**运行状态观测**（`point_registry` 的残留行数），**不应**作为
+> "当前任务点数"的判据——当前任务点数只能从实时任务快照
+> `GET /api/v1/tasks?endpoint=` 的 `tasks[].binding.config.points[]` 计算
+> （PR #136 的 `Get-WdTaskPointCount`，**已合入 main，merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`**）。用例若需断言"配置里有几个点"，
+> 断言任务快照或获批配置，不要断言 `point_count`。
 
 理由与处置（评审裁决：本轮**不改生产代码**）：
 
 - `MesaManager::discover()` 默认内存 `PointIdAllocator`；`with_source()` 才接持久化
   `PointIdSource`；`apps/mesad/src/main.rs` 用的是后者；`/endpoints/{id}/diagnostics` 的
-  `point_count` 来自 ConfigStore 的 `point_map`。
+  `point_count` 来自 ConfigStore 的 `point_registry` 行数（`point_map` 视图，
+  `config-store/src/lib.rs:2459-2473` 取 `deleted=0` 的活跃行），其**唯一写点是
+  `assign_point_ids`**（`config-store/src/lib.rs:2344-2456`），由 `StorePointIdSource::assign`
+  （`crates/driver-manager/src/endpoint.rs:206-224`，调用点 `:213`）在 `run_config_flow`
+  （`endpoint.rs:943-945`）中调用，写入时机在 `ConfigureTasks`（`:914`）之后、
+  `ApplyPointMap`（`:968-985`）之前；`ApplyPointMap` 只负责把映射下发给 Driver
+  （**v1.4 勘误**：原文写作"来自 `point_map`"，易被误读为 `ApplyPointMap` 落库）。
 - 因此该问题是**集成测试装配容易失真**，**不是生产装配缺陷**——生产路径正确。
 - 不做 (a)「让 `/diagnostics` 暴露 ID 源类型」：需扩展运行期状态/类型信息并改动公共 API，
   为提醒测试编写者而引入公共 API 变更，收益不足。
