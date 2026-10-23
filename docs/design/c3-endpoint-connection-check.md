@@ -260,7 +260,7 @@ C3-D 采用 **(A)**；如需 (B) 请明确指示。（本文档按 (A) 冻结。
 > **（v1.4 勘误）** 该字段是**运行状态观测**（`point_registry` 的残留行数），**不应**作为
 > "当前任务点数"的判据——当前任务点数只能从实时任务快照
 > `GET /api/v1/tasks?endpoint=` 的 `tasks[].binding.config.points[]` 计算
-> （PR #136 的 `Get-WdTaskPointCount`，**待合入 main**）。用例若需断言"配置里有几个点"，
+> （PR #136 的 `Get-WdTaskPointCount`，**已合入 main，merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`**）。用例若需断言"配置里有几个点"，
 > 断言任务快照或获批配置，不要断言 `point_count`。
 
 理由与处置（评审裁决：本轮**不改生产代码**）：
