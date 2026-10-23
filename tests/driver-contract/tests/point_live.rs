@@ -277,3 +277,59 @@ async fn point_live_remove_endpoint_resyncs_and_reconnect_fresh() {
     assert_eq!(g0.event.as_deref(), Some("mesa-points-snapshot"));
     assert_eq!(points_of(&g0).len(), 0);
 }
+
+/// 一期必需：`quality_code` 在 Point Live（SSE）上同样原样可见。
+///
+/// REST `/points/latest` 的同一字段由 data_plane 套件端到端断言；本用例锁住
+/// 第二条出口：SSE delta 行是**完整** `LatestEntry`，设备原生码不得在
+/// `latest_for_keys` 重组时丢失，GOOD 行也不得凭空多出该键。
+#[tokio::test]
+async fn point_live_quality_code_visible_and_absent_for_good() {
+    let srv = serve_points().await;
+    srv.snapshot.register_points("ep1", &defs());
+    let (_, mut cli) = PointSseClient::connect(srv.port, "/api/v1/points/live").await;
+    let _ = cli.next_frame_timeout(5).await;
+
+    let b = DataBatch {
+        connection_handle: 1,
+        stream_epoch: 1,
+        sequence: 1,
+        timestamp_ns: 100,
+        values: vec![
+            // 设备原生码（NCK 的 S7 item 返回码形态）
+            PointValue {
+                point_id: 1,
+                value: Value::F64(0.0),
+                quality: Quality::Bad,
+                quality_code: Some(5),
+                source_timestamp_ns: None,
+                value_origin: ValueOrigin::Current,
+            },
+            // GOOD：无码
+            PointValue::good(2, Value::F64(1.0)),
+        ],
+        mono_ns: None,
+    };
+    apply(&srv.snapshot, "ep1", &b);
+
+    let f = cli.next_frame_timeout(5).await;
+    assert_eq!(f.event.as_deref(), Some("mesa-points-delta"));
+    let pts = points_of(&f);
+    let bad = pts
+        .iter()
+        .find(|p| p["point_id"] == 1)
+        .expect("bad row 必须在 delta 帧里");
+    assert_eq!(bad["quality"], "BAD");
+    assert_eq!(
+        bad["quality_code"], "5",
+        "SSE 必须输出同一个设备原生码: {bad}"
+    );
+    let good = pts
+        .iter()
+        .find(|p| p["point_id"] == 2)
+        .expect("good row 必须在 delta 帧里");
+    assert!(
+        good.get("quality_code").is_none(),
+        "GOOD 行不得出现 quality_code 键: {good}"
+    );
+}

@@ -494,6 +494,12 @@ struct QualitySpec {
     bad_after_batches: Option<u64>,
     /// 第 M 批起恢复 GOOD（须大于 bad_after_batches 才有转换窗口）。
     good_again_after: Option<u64>,
+    /// 设备原生质量码（`quality_code` 全链路穿透测试的注入点）。
+    ///
+    /// 只在非 GOOD 批次上行：GOOD 行不带码是线上契约（Core 只对 BAD 兜底
+    /// `DEVICE_ERROR`，前端 GOOD 行也不渲染码区），夹具若产出 GOOD+码 会
+    /// 造出现场不存在的形态，反而掩盖真实语义。
+    code: Option<i32>,
 }
 
 impl Default for QualitySpec {
@@ -502,6 +508,7 @@ impl Default for QualitySpec {
             base: Quality::Good,
             bad_after_batches: None,
             good_again_after: None,
+            code: None,
         }
     }
 }
@@ -524,6 +531,7 @@ impl QualitySpec {
         }
         spec.bad_after_batches = parse_batch_threshold(v, "bad_after_batches")?;
         spec.good_again_after = parse_batch_threshold(v, "good_again_after")?;
+        spec.code = parse_quality_code(v)?;
         Ok(spec)
     }
 
@@ -551,6 +559,29 @@ fn parse_batch_threshold(
             .as_u64()
             .map(Some)
             .ok_or_else(|| bad_point(field, &format!("`{field}` must be a non-negative integer"))),
+    }
+}
+
+/// 解析设备原生质量码（`quality_code`）。
+///
+/// 线上类型是 `optional sint32`（`proto/driver.proto:271`），因此：
+/// - 只接受 JSON 整数，且在 i32 范围内（字符串 `"5"`、浮点 `5.5` 一律拒绝）；
+/// - **允许负数**——OPC UA 驱动上行的是 `StatusCode::bits() as i32` 位模式，
+///   夹具不得把负数当非法值，否则无法复现真实驱动的码形态。
+fn parse_quality_code(v: &serde_json::Value) -> Result<Option<i32>, SdkDriverError> {
+    match v.get("quality_code") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(x) => {
+            let n = x.as_i64().ok_or_else(|| {
+                bad_point("quality_code", "`quality_code` must be an integer (sint32)")
+            })?;
+            i32::try_from(n).map(Some).map_err(|_| {
+                bad_point(
+                    "quality_code",
+                    &format!("`quality_code` {n} 超出 sint32 范围"),
+                )
+            })
+        }
     }
 }
 
@@ -1473,6 +1504,10 @@ impl DriverConnection for SimConnection {
                                     };
                                     let mut pv = PointValue::good(rp.point_id, v);
                                     pv.quality = rp.spec.quality.at(batch_no);
+                                    // 设备原生码只在非 GOOD 批次随批上行（见 QualitySpec::code）。
+                                    if pv.quality != Quality::Good {
+                                        pv.quality_code = rp.spec.quality.code;
+                                    }
                                     pv
                                 })
                                 .collect();
@@ -2063,6 +2098,41 @@ mod tests {
         // 非法质量名与非法阈值必须被拒绝
         assert!(QualitySpec::from_json(&serde_json::json!({"quality": "PERFECT"})).is_err());
         assert!(QualitySpec::from_json(&serde_json::json!({"bad_after_batches": -1})).is_err());
+    }
+
+    /// `quality_code` 注入：线上是 `optional sint32`，因此只接受 i32 整数；
+    /// 负数必须放行（OPC UA 的 `StatusCode::bits() as i32` 就是负值），
+    /// 字符串/浮点/越界必须拒绝（夹具不得造出 wire 表达不了的码）。
+    #[test]
+    fn quality_spec_quality_code_is_sint32_only() {
+        let q =
+            QualitySpec::from_json(&serde_json::json!({"quality":"BAD","quality_code":5})).unwrap();
+        assert_eq!(q.code, Some(5));
+        // 负数（位模式）合法
+        let q = QualitySpec::from_json(
+            &serde_json::json!({"quality":"BAD","quality_code":-2143289344i64}),
+        )
+        .unwrap();
+        assert_eq!(q.code, Some(-2143289344));
+        // 缺省/显式 null 均为无码
+        assert_eq!(
+            QualitySpec::from_json(&serde_json::json!({"quality":"BAD"}))
+                .unwrap()
+                .code,
+            None
+        );
+        assert_eq!(
+            QualitySpec::from_json(&serde_json::json!({"quality":"BAD","quality_code":null}))
+                .unwrap()
+                .code,
+            None
+        );
+        // 非整数与越界拒绝
+        assert!(QualitySpec::from_json(&serde_json::json!({"quality_code":"5"})).is_err());
+        assert!(QualitySpec::from_json(&serde_json::json!({"quality_code":5.5})).is_err());
+        assert!(
+            QualitySpec::from_json(&serde_json::json!({"quality_code":2147483648i64})).is_err()
+        );
     }
 
     #[tokio::test]
