@@ -31,8 +31,8 @@ def pkgs():
 
 
 def main():
-    # plan_version 冻结（CI v3 → 3）。
-    check("plan_version==3", plan.PLAN_VERSION == 3)
+    # plan_version 冻结（CI v4 → 4；v4 新增 watchdog 标志）。
+    check("plan_version==4", plan.PLAN_VERSION == 4)
 
     # docs-only → all skip。
     p = plan_for_files(["docs/a.md", "drivers/focas2/docs/x.md"], pkgs())
@@ -209,6 +209,68 @@ def main():
         if not (isinstance(rv, dict) and rv.get("workspace") is True):
             missing.append(m)
     check("members rust-version.workspace", not missing, str(missing))
+
+    # ── CI v4：watchdog 标志（只按 watchdog 相关路径触发，绝不无条件运行）─────────────
+    # schema：每个计划都必须带 bool 类型的 watchdog（gate 会 fail-closed 校验）。
+    probe_cases = [
+        [],
+        ["docs/a.md"],
+        ["apps/mesa-web/src/App.tsx"],
+        ["drivers/focas2/src/wire/codec.rs"],
+        ["scripts/stop-watchdog.ps1"],
+        ["tests/watchdog/stub_endpoint.py"],
+        [".github/workflows/_watchdog.yml"],
+        ["Cargo.lock"],
+        ["mystery/new.bin"],
+    ]
+    shape_bad = [f for f in probe_cases
+                 if not isinstance(plan_for_files(f, pkgs()).get("watchdog"), bool)]
+    check("watchdog 标志恒为 bool（gate fail-closed 前提）", not shape_bad, str(shape_bad))
+
+    # 被测脚本本体变更 → 只跑 watchdog（不牵连 Rust/web）。
+    p = plan_for_files(["scripts/stop-watchdog.ps1"], pkgs())
+    check("watchdog: ps1 → true", p["watchdog"] is True, p)
+    check("watchdog: ps1 → 不触发 Rust",
+          p["quality"] is False and p["canonical"] is False
+          and p["platform_mode"] == "skip" and p["stress"] is False and p["perf"] is False,
+          p)
+    check("watchdog: ps1 → 不触发 web 且不构建", p["web"] is False
+          and p["build_targets"] == {"kind": "none"}, p)
+
+    # 测试资产（桩 / 场景驱动）变更 → true。
+    for f in ("tests/watchdog/stub_endpoint.py",
+              "tests/watchdog/run-watchdog-scenarios.ps1"):
+        p = plan_for_files([f], pkgs())
+        check(f"watchdog: {f} → true", p["watchdog"] is True and p["canonical"] is False, p)
+
+    # 刻意保留 docs-only 语义：tests/watchdog/README.md 属文档 → 全部 skip（不为改文档烧 runner）。
+    # 但"文档 + 代码"混合改动仍然要跑。
+    p = plan_for_files(["tests/watchdog/README.md"], pkgs())
+    check("watchdog: tests/watchdog/README.md → docs-only skip", p["watchdog"] is False
+          and p["canonical"] is False and p["platform_mode"] == "skip", p)
+    p = plan_for_files(["tests/watchdog/README.md", "tests/watchdog/stub_endpoint.py"], pkgs())
+    check("watchdog: README+stub → true", p["watchdog"] is True, p)
+
+    # watchdog workflow 自身变更 → true（同时命中 .github/ 的 FULL，fail-closed）。
+    p = plan_for_files([".github/workflows/_watchdog.yml"], pkgs())
+    check("watchdog: _watchdog.yml → true + FULL", p["watchdog"] is True
+          and p["platform_mode"] == "full", p)
+
+    # 无关改动 → false（"不要对每个无关 PR 无条件消耗 runner"）。
+    for f in ("drivers/focas2/src/wire/codec.rs", "crates/driver-manager/src/x.rs",
+              "apps/mesa-web/src/App.tsx", "docs/a.md"):
+        p = plan_for_files([f], pkgs())
+        check(f"watchdog: {f} → false", p["watchdog"] is False, p)
+
+    # 混合改动（Rust + watchdog）→ 两者都跑。
+    p = plan_for_files(["drivers/s7/src/y.rs", "tests/watchdog/stub_endpoint.py"], pkgs())
+    check("watchdog: rust+watchdog → 两者都 true", p["watchdog"] is True
+          and p["canonical"] is True, p)
+
+    # fail-closed：未知路径 / 空 diff / Cargo.lock → watchdog 也置真。
+    for f in ([], ["mystery/new.bin"], ["Cargo.lock"], ["tools/ci/plan.py"]):
+        p = plan_for_files(f, pkgs())
+        check(f"watchdog: fail-closed {f or '[]'} → true", p["watchdog"] is True, p)
 
     print(f"\n{ PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

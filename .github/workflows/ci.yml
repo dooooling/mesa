@@ -1,9 +1,9 @@
 # CI 统一入口/调度（CI v2）：本文件是唯一监听 PR/push 的 workflow，
 # 实际工作下沉到 _rust-quality/_rust-canonical/_rust-platform/_rust-stress/
-# _rust-perf/_web（均为 workflow_call，不各自监听 pull_request）。
+# _rust-perf/_web/_watchdog（均为 workflow_call，不各自监听 pull_request）。
 # Branch Protection 只绑定最后的 `ci-gate`，内部增删 job 不需要再改保护规则。
 #
-# 模型（CI v2）：
+# 模型（CI v2 / v4）：
 #   planner（tools/ci/plan.py，唯一调度真值）
 #   ├─ docs-only → gate
 #   ├─ web
@@ -11,7 +11,9 @@
 #   ├─ rust-canonical（Linux x64 语义正确性主平台，nextest + doctest）
 #   ├─ rust-platform ×3（全 workspace 编译 + smoke；main 上 full）
 #   ├─ rust-stress（风险触发；main Rust change 必跑）
-#   └─ rust-perf（风险触发；与 canonical 并行）
+#   ├─ rust-perf（风险触发；与 canonical 并行）
+#   └─ watchdog（Windows + Linux 并行跑 stop-watchdog 离线场景 M0–M18；**仅** watchdog 相关
+#                路径变更或 fail-closed FULL 时运行，绝不无条件跑——单 job 25 分钟预算）
 # PR 快速反馈 + main 全集成安全网（不再机械完全重复）。
 name: CI
 on:
@@ -49,6 +51,7 @@ jobs:
       stress: ${{ steps.route.outputs.stress }}
       perf: ${{ steps.route.outputs.perf }}
       web: ${{ steps.route.outputs.web }}
+      watchdog: ${{ steps.route.outputs.watchdog }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -75,6 +78,7 @@ jobs:
             echo "stress=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["stress"]).lower())')"
             echo "perf=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["perf"]).lower())')"
             echo "web=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["web"]).lower())')"
+            echo "watchdog=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["watchdog"]).lower())')"
           } >> "$GITHUB_OUTPUT"
 
   rust-quality:
@@ -119,6 +123,14 @@ jobs:
     if: needs.plan.outputs.web == 'true'
     uses: ./.github/workflows/_web.yml
 
+  # Watchdog 离线场景（Windows + Linux 并行；单 job 25 分钟预算）：
+  # **只**在 watchdog 相关路径变更（scripts/stop-watchdog.ps1、tests/watchdog/**、
+  # .github/workflows/_watchdog.yml）或 fail-closed FULL 时运行，绝不无条件跑。
+  watchdog:
+    needs: [plan]
+    if: needs.plan.outputs.watchdog == 'true'
+    uses: ./.github/workflows/_watchdog.yml
+
   # Stress：PR 按 planner 风险触发；main Rust change 必跑（plan 已升级）。
   rust-stress:
     needs: [plan]
@@ -135,7 +147,7 @@ jobs:
 
   # 唯一 Merge Gate：plan 驱动 fail-closed（plan_version/bool/mode 全校验）。
   ci-gate:
-    needs: [plan, rust-quality, rust-canonical, rust-platform, web, rust-stress, rust-perf]
+    needs: [plan, rust-quality, rust-canonical, rust-platform, web, rust-stress, rust-perf, watchdog]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -161,8 +173,8 @@ jobs:
               fail.append(f'plan 输出不可解析（{e}）→ FAIL CLOSED')
               print('GATE FAILED: %s' % fail)
               sys.exit(1)
-          if plan.get('plan_version') != 3:
-              fail.append(f"plan_version 必须 3（实际 {plan.get('plan_version')}）")
+          if plan.get('plan_version') != 4:
+              fail.append(f"plan_version 必须 4（实际 {plan.get('plan_version')}）")
           def need(job, want_run, want_skip=False):
               r = n.get(job, {}).get('result')
               if want_run and r != 'success':
@@ -173,9 +185,12 @@ jobs:
               if isinstance(v, bool):
                   return v
               return str(v).lower() == 'true'
-          # quality / canonical / web / stress / perf：bool 驱动。
+          # quality / canonical / web / stress / perf / watchdog：bool 驱动。
+          # watchdog 的语义与其它一致：planner 说该跑 ⇒ 必须 success；说不用跑 ⇒ 必须 skipped
+          # （"跳过了但没跑"不算失败，"该跑却跳过"一定失败）。
           for key, job in [('quality', 'rust-quality'), ('canonical', 'rust-canonical'),
-                           ('web', 'web'), ('stress', 'rust-stress'), ('perf', 'rust-perf')]:
+                           ('web', 'web'), ('stress', 'rust-stress'), ('perf', 'rust-perf'),
+                           ('watchdog', 'watchdog')]:
               v = plan.get(key)
               if not isinstance(v, bool):
                   fail.append(f'{key} 必须 bool（实际 {v!r}）→ FAIL CLOSED')
