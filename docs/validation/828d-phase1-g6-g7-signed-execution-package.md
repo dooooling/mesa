@@ -23,7 +23,7 @@
 
 **术语**：**watchdog** = `scripts/stop-watchdog.ps1`；**#130** = 上表第 1 项；**G7 设计** = 上表第 3 项；**生命周期门** = 上表第 4 项；**ARMED / FIRED** = watchdog 的两个阶段（`watchdog:13-32`）；**三轴** = `summary.json` 的 `axes.schedule` / `axes.sampling` / `axes.convergence`（`watchdog:2966-2990`）。
 
-**本模板不承诺的事（写在这里，避免签署时误解）**：30 秒是**调度目标**而非物理停止保证；读到的值 ≠ 业务可用；`point_count` 门禁在当前实现下**无法可靠判定**（§2.5，阻塞项 **BLOCKED-01**）；G6 的 ARMED **不能**对生产 `127.0.0.1:8132` 执行（`watchdog:611-628`）。
+**本模板不承诺的事（写在这里，避免签署时误解）**：30 秒是**调度目标**而非物理停止保证；读到的值 ≠ 业务可用；点位数量门禁（`-ExpectedPointCount`）**已由 B-1 代码修复关闭**（PR #136，**待合入 main**）：配置门核验的是**当前任务点数**（取自实时任务快照 `tasks[].binding.config.points[]`），`diagnostics.point_count` 降级为运行状态观测值 `diagnostics_point_count_observed`、**不参与判定**（§2.5）；G6 的 ARMED **不能**对生产 `127.0.0.1:8132` 执行（`watchdog:611-628`）。
 
 ---
 
@@ -97,11 +97,13 @@
 | # | 项 | 填写栏位 | 来源要求 | 校验方式 |
 |---|---|---|---|---|
 | 2.3-1 | **预期 task revision** | ______（PUT 四点后预期 `18`；#130 §3.3） | 审批时一并签署；窗口内禁止任何其它写入（G5-②） | `watchdog:1405-1406` 与 `GET /api/v1/tasks?endpoint=` 的 `revision` 严格比对；不一致 ⇒ exit 40 |
-| 2.3-2 | **点位数量** | ______（获批配置点位总数；**不是** `diagnostics.point_count` 的来源，见 §2.5） | 由 `approved-task-config.json` 的 `tasks[].binding.config.points[]` 计数 | `watchdog:1426-1428`：获批配置点位总数必须等于 `-ExpectedPointCount` |
+| 2.3-2 | **点位数量** | ______（获批配置点位总数；**= 当前任务点数**：实时任务快照 `tasks[].binding.config.points[]` 总数）；`diagnostics.point_count` 是持久化残留值，**不参与判定**（§2.5） | 由 `approved-task-config.json` 的 `tasks[].binding.config.points[]` 计数 | `watchdog:1536-1538`：获批配置点位总数必须等于 `-ExpectedPointCount`；现场实时值由 `watchdog:1515-1518` 比对 |
 | 2.3-3 | **规范化 tasks 指纹** | `sha256:______` | 对 `approved-task-config.json` 的 `tasks` 数组按"键递归排序 + 按 `task.id` 排序 + 紧凑 JSON"计算（`watchdog:1056-1075`） | `watchdog:1339-1342`（获批文件自证）+ `:1440-1443`（实际 GET 一致）；两处都必须相等 |
 | 2.3-4 | `-ExpectedApprovedTaskConfigSha256` | `sha256:______` | **只能来自本签署包**（§4-①） | `watchdog:1120-1174`：**解析前**对原始字节比对；不一致 ⇒ `REFUSED_TASKCONFIG_INTEGRITY` |
 
 > **指纹 ≠ 文件摘要**：指纹只覆盖规范化 `tasks` 数组，**不覆盖 `connection`**（`watchdog:170-171`、`:1123-1125`）。只签指纹不签文件摘要 ⇒ `connection` 被改而指纹不变，必然被 `watchdog:1326-1330` 拒绝。
+>
+> **行号口径**：2.3-2 的 `watchdog:1536-1538` / `:1515-1518` 属 **PR #136 版本**（3241 行，尚未合入 main）；本表其余行号对应**已合入基线**（PR #131 的 3096 行版本）。两者不可混用；本次仅重排"点数门"相关行号，`#136` 合入后需对全表整体重排。
 
 ### 2.4 「批准值来源」栏（硬约束 1 的可检查项）
 
@@ -124,9 +126,31 @@
 
 ### 2.5 `-ExpectedPointCount` 时序核实（硬约束 4，**本模板的技术核心**）
 
-**结论：B —— 无法确认；列为阻塞项 `BLOCKED-01`。** 该门禁在当前实现下**不能**用"由获批配置推导的值"可靠判定，签署前必须解决（代码修复或经审批人显式改写该参数的语义），**不得假装门禁已满足**。
+**结论：原为 B（无法确认）；已由 B-1 代码修复关闭（PR #136，HEAD `dfc81e04a9d3683dd06d6e19426012d9dcdab5a2`，CI 4 PASS / 0 FAIL，**尚未合入 main**）。** 修复前该门禁**不能**用"由获批配置推导的值"可靠判定；修复后 `-ExpectedPointCount` 比对的是**当前任务点数**（实时任务快照 `tasks[].binding.config.points[]` 总数），`diagnostics.point_count` 降级为运行状态观测、**不参与配置门判定**。签署前仍须**确认 #136 已合入 main**（本模板不得先于 #136 合并）。
 
-**调查证据（逐条给位置）**：
+> **行号口径**：本节引用的 `watchdog:<行号>` 以 **PR #136 的 `scripts/stop-watchdog.ps1`（3241 行，HEAD `dfc81e0`）** 为准。该版本尚未合入 `main`，故本模板中"已合并契约"表（§开头第 2 项，PR #131 的 3096 行版本）仍是**已合入基线**，两者行号不可混用。
+
+**修复后的实际语义（#136 已实现，本节即最终口径）**：
+
+| 项 | 修复前（**已废弃**） | 修复后（#136 已实现） |
+|---|---|---|
+| 配置门判据 | `-ExpectedPointCount` 比对 `diagnostics.point_count` | **比对"当前任务点数"**，由新增 `Get-WdTaskPointCount`（`watchdog:1293`）从**实时任务快照** `tasks[].binding.config.points[]` 总数计算 |
+| 判据位置 | `watchdog:1407-1408`（旧点数门）、`:1426-1428`（获批点数自洽） | **`watchdog:1509-1518`**（新判据块；点数判据本体 `:1515-1518`），失败原因明写"取自实时任务快照 `tasks[].binding.config.points[]`，**非** `diagnostics.point_count`" |
+| `diagnostics.point_count` | 被当作"当前任务点数" | 降级为 **`diagnostics_point_count_observed`**（角色串见 `watchdog:1395`），**observed-only**，**不参与配置门判定** |
+| 证据字段（三处独立块 `task_config_observation`） | — | 拒绝记录 `watchdog:614`、arm-report `:1756`、fire summary `:3045`；每块含 `expected_task_point_count` / `task_point_count_live` / `task_count_live` / `diagnostics_point_count_observed` / `diagnostics_point_count_role='observed-only…'` / `task_config_state` |
+| 缺失 / 不可核实 | fail-closed | **仍然 fail-closed**：`task_point_count` 读不到（快照无 `tasks[]`）⇒ `unverified`，拒绝进入 FIRED（`watchdog:1515`、`:1554-1558`） |
+| Core / DB | — | **零改动、无新增 API**（只改 watchdog 与离线场景） |
+
+**写入时序（更正任何"`ApplyPointMap` 写 `point_registry`"的说法）**：
+
+```
+ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
+→ ApplyPointMap（只把 point_id 映射下发给 Driver，本身不写 registry） → StartConnection
+```
+
+`point_registry` 的唯一写点是 `assign_point_ids`（`crates/config-store/src/lib.rs:2344-2456`）← `crates/driver-manager/src/endpoint.rs:206-224`（调用点 `:213`）← `run_config_flow:943-945`。
+
+**调查证据（逐条给位置；这些事实在修复后依然成立，正是 #136 的修法依据）**：
 
 | # | 问题 | 核实结果 | 代码位置 |
 |---|---|---|---|
@@ -136,28 +160,35 @@
 | 4 | 四点配置 PUT 之后、Start 之前 `point_registry` 的内容 | **完全不变**。`PUT /tasks/{id}` 只做 `gate_data_tasks`（descriptor 集合级/信封层校验，`crates/core-api/src/lib.rs:2415-2418`）→ `store.replace_tasks`（`:2419`），**不触碰 `point_registry`**；descriptor 校验走 `manager.get_descriptor`（临时进程 handshake + GetDescriptor，`crates/driver-manager/src/manager.rs:1076-1115`），也不写 registry | `crates/core-api/src/lib.rs:255-342`、`:2371-2425`；`manager.rs:1077-1115` |
 | 5 | 首轮与后续轮的预期值是否不同 | **不同，且差异来自运行历史而非配置**：①首轮（该端点上次配置闭环的点集 ≠ 本次获批点集）⇒ 残留值 = 上次点集大小（本机编制时快照为 `runtime.points=4`，见下）；②本轮跑过一次 4 点配置之后 ⇒ 残留值 = 4，与获批配置点数相同。因此**同一份获批配置在不同轮次的期望值可能不同** | 残留值来源 `endpoint.rs:351`（`id_map` 初值 = `known_map()` = 持久化 `point_map`）→ `:354-363`（首个 `set_status` 用 `id_map.len()`）→ `crates/driver-manager/src/endpoint.rs:497`/`:509`（`EndpointStatus.points`） |
 
-**为什么是 B 而不是 A**：门禁要求 `-ExpectedPointCount` **同时**等于 ①获批配置的点位总数（`watchdog:1426-1428`）与 ②现场实时 `diagnostics.point_count`（`watchdog:1407-1408`）。①可由签署包给出；②是**运行残留**，只能由"上一次 Start 的点集"决定，而"上一次 Start 用过哪些点"在签署时**无法从仓库证明**（DB 在 `target/` 下、不进仓，且任何人都可能在审批与执行之间 Start 过该端点）。因此不存在一个"既由获批配置推导、又必然等于现场残留"的值。
+**为什么最初判为 B，以及修复如何解决它**：旧门禁要求 `-ExpectedPointCount` **同时**等于 ①获批配置的点位总数（旧 `watchdog:1426-1428`）与 ②现场实时 `diagnostics.point_count`（旧 `watchdog:1407-1408`）。①可由签署包给出；②是**运行残留**，只能由"上一次 Start 的点集"决定，而"上一次 Start 用过哪些点"在签署时**无法从仓库证明**（DB 在 `target/` 下、不进仓，且任何人都可能在审批与执行之间 Start 过该端点）。因此不存在一个"既由获批配置推导、又必然等于现场残留"的值——**旧实现里两个被要求相等的量中，有一个（`diagnostics.point_count`）与本次任务配置无关**。#136 的修法是：**删掉这个无关量作为判据**，改为只比对"当前任务点数"（`watchdog:1293` 计算、`:1515-1518` 判定），并把 `diagnostics.point_count` 改名为 `diagnostics_point_count_observed`、只作观测输出。于是判据重新变成"可由获批配置推导"，`BLOCKED-01` 关闭。
 
-**唯一可见的旁证（只能当假设，不得写死）**：编制机本地快照 `target/validation/828d-r1/rev17-endpoint.raw.json`（658 B）中 `runtime.points = 4`、`runtime.revision = 16`。由于 `runtime.points` 在 Start 起点取自持久化 `point_map`（`endpoint.rs:351` → `:497`/`:509`），它**与 `diagnostics.point_count` 是同一残留量的两个视图**，故"编制时残留 = 4"有证据支持。但它**不能**证明执行窗口内的值仍为 4（期间任何一次 Start 都会改变它），所以**不得**把"4"写成批准值并声称门禁已满足。
+**唯一可见的旁证（只能当假设，不得写死）**：编制机本地快照 `target/validation/828d-r1/rev17-endpoint.raw.json`（658 B）中 `runtime.points = 4`、`runtime.revision = 16`。由于 `runtime.points` 在 Start 起点取自持久化 `point_map`（`endpoint.rs:351` → `:497`/`:509`），它**与 `diagnostics.point_count` 是同一残留量的两个视图**，故"编制时残留 = 4"有证据支持。但它**不能**证明执行窗口内的值仍为 4（期间任何一次 Start 都会改变它）。**修复后该残留量只影响观测值 `diagnostics_point_count_observed`，不再是任何判据**，因此也不必（且不得）把它写成批准值。
 
-**为什么不能只写"任务有 4 个点，所以 `point_count` 必然为 4"**：这是评审明确要求排查的错误假设——`point_count` 来自 `point_registry`，**不是**任务配置里的点数（`crates/core-api/src/lib.rs:1499`）；四点 PUT 后 `point_registry` 一字未变（见 #4）。若上次跑的是 238 点配置，此时 `point_count` 仍是 238，即使任务配置里只有 4 点。
+**为什么不能只写"任务有 4 个点，所以 `point_count` 必然为 4"**：这是评审明确要求排查的错误假设——`point_count` 来自 `point_registry`，**不是**任务配置里的点数（`crates/core-api/src/lib.rs:1499`）；四点 PUT 后 `point_registry` 一字未变（见 #4）。若上次跑的是 238 点配置，此时 `point_count` 仍是 238，即使任务配置里只有 4 点——这正是 #136 不再用它作判据、改为从实时任务快照计算的原因（`watchdog:1293`）。
 
 **补充事实（影响"首轮 = 0"的假设）**：`point_registry` 表**没有外键**（`crates/config-store/src/lib.rs:919-929`），`delete_endpoint` 只执行 `DELETE FROM endpoints`（`:1676-1680`），handler 也只清 Snapshot 与停止意图围栏（`crates/core-api/src/lib.rs:2182-2196`），**都不清理 `point_registry`**。因此"从未 Start 过 ⇒ `point_count = 0`"只对**从未使用过该 `id`** 的端点成立；同一 `id` 删除后重建会继承旧行。
 
-**`BLOCKED-01` 的关闭方式（三选一，由审批人决定并书面记录）**：
+**`BLOCKED-01` 的关闭方式：已选定 B-1（代码修复）并已实现（PR #136，待合入 main）**。B-2 / B-3 保留为**历史备选，本轮均未采用**：
 
-| 选项 | 做法 | 代价 |
+| 选项 | 做法 | 状态 |
 |---|---|---|
-| **B-1（推荐）代码修复** | 让门禁比对"获批配置的点位总数"或让 `diagnostics` 暴露独立的 `task_point_count`（由 `GET /tasks` 派生），把 `point_count` 降级为"残留一致性"检查并另立参数 | 需改 `scripts/stop-watchdog.ps1` + 可能改 `crates/core-api`，属新 PR；本轮不实施 |
-| **B-2 语义改写并显式签署** | 由审批人在 §2.4 明确签署"`-ExpectedPointCount` 是**状态断言**（残留 registry 行数），不是配置断言"，并承担"窗口内任何人 Start 过该端点即失效"的风险 | 不需改代码；但门禁不再证明"配置正确"，只证明"残留未变"，且与硬约束 1 的精神冲突，须审批人书面接受 |
-| **B-3 本轮不执行** | 以 `BLOCKED-01` 未关闭为由判 NO-GO，等待 B-1 | 零风险，但本轮无数据 |
+| **B-1 代码修复（已选定、已实现）** | 让配置门比对"当前任务点数"（实时任务快照 `tasks[].binding.config.points[]` 总数，`watchdog:1293`），并把 `diagnostics.point_count` 降级为 `diagnostics_point_count_observed`（observed-only、不参与判定） | **已实现于 PR #136**（`dfc81e0`，CI 4 PASS / 0 FAIL）；**尚未合入 main**，本模板不得先于 #136 合并 |
+| **B-2 语义改写并显式签署** | 由审批人签署"`-ExpectedPointCount` 是**状态断言**（残留 registry 行数）"并承担风险 | **未采用**（与硬约束 1 精神冲突；#136 已从根上消除该需要） |
+| **B-3 本轮不执行** | 以 `BLOCKED-01` 未关闭为由判 NO-GO，等待 B-1 | **未采用**（B-1 已落地） |
 
-**无论选哪个，以下现场步骤必须执行并留证（C 的实测要求，写进执行顺序）**：
+**已验证的判别性场景（M19（单场景 54 项断言；全量 M0–M19 共 20 场景 / 282 项断言）；`tests/watchdog/run-watchdog-scenarios.ps1`）**：
 
-1. 在 #130 §5.2-3 的 `PUT /api/v1/tasks/{endpoint}` **之后**、`-Mode fire` **之前**（本模板 §5.8 第 4 步），做一次**只读** `GET /api/v1/endpoints/lx-nck-tags-190-connection/diagnostics`，原样保存响应；
-2. 在 `site-log.md` 记录五列：**命令 / 时刻 / 实测 `point_count` / 签署值 / 结论**；
-3. 实测值 ≠ 签署值 ⇒ **立即 NO-GO，不得进入 FIRED**（否则 fire 必然 `exit 40`，`watchdog:1407-1408`）；
-4. 该实测值**只能**用于"确认门禁是否会被拒绝"，**不得**反过来填入 §2.3 的批准栏位（硬约束 1）。
+- **① 残留 238 / 0，当前任务 12 点 ⇒ 放行**（`exit=0`、`task_config_state=verified`、`START_begin=1`），证据为 `diagnostics_point_count_observed=238` 而 `task_point_count_live=12`（旧判据在此必然误拒）；
+- **② 实时 3 / 5 点（`diagnostics` 仍报 12，旧判据看着"一致"）⇒ 拒绝** `REFUSED_TASKCONFIG_MISMATCH`（旧判据在此必然漏放）；
+- **③ 点数相同但某点位参数被改 ⇒ 拒绝，且点数门不触发**（点数门与逐点参数门是两条独立判据）；
+- **④ 快照不可读 / 无 `tasks` 数组 ⇒ fail-closed**（`unverified`，拒绝进入 FIRED）。
+
+**已选定 B-1 后，以下现场步骤仍然必须执行并留证（门禁前置诊断，写进执行顺序）**：
+
+1. 在 #130 §5.2-3 的 `PUT /api/v1/tasks/{endpoint}` **之后**、`-Mode fire` **之前**（本模板 §5.8 第 4 步），做一次**只读** `GET /api/v1/tasks?endpoint=…` 与 `GET /api/v1/endpoints/lx-nck-tags-190-connection/diagnostics`，原样保存两份响应；
+2. 在 `site-log.md` 记录**六列**：**命令 / 时刻 / 当前任务点数（实时快照 `tasks[].binding.config.points[]` 计数）/ `diagnostics_point_count_observed`（观测值）/ 签署值 / 结论**；其中**只有"当前任务点数"参与判定**，观测值**不得**当作判据；
+3. 当前任务点数 ≠ 签署值 ⇒ **立即 NO-GO，不得进入 FIRED**（否则 fire 必然 `exit 40`，`watchdog:1515-1518`）；`diagnostics_point_count_observed` 与签署值不等**不构成**拒绝理由（正常现象）；
+4. 上述任何实测值**只能**用于"确认门禁是否会被拒绝"，**不得**反过来填入 §2.3 的批准栏位（硬约束 1）。
 
 ---
 
@@ -242,7 +273,7 @@
 | **G3 机床状态** | 上电 ______ / 急停 ______ / 驱动使能 ______ / 参考完成 ______ / 程序运行 ______ / 轴运动 ______ / 报警号 ______ / 操作员口述 ______ | 机床状态表 + 签字 | 记录状态后停止 |
 | **G4 现场监护** | 监护人 ______ / 电话 ______ / 人工 Stop 能力 ☐ / 拔测试主机网线能力 ☐ / 窗口时长 ______ | 监护人签字（§5.7） | 不开始 |
 | **G5 备份与并发** | 窗口内重新 GET 的端点/任务原始响应 ______ / 其 SHA-256 ______ / 与 #130 §6.4 基线比对结论 ______ / 并发确认 ______ | 本次窗口内的原始响应 + `Get-FileHash` 输出 + 两值并列比对记录 + 并发确认 | 哈希不一致或无法重验 ⇒ **NO-GO**；并发不确认 ⇒ 不开始 |
-| **G6 就绪与凭证** | `-Mode arm` 退出码 ______（须 0）/ `arm-report.json` ______ / 凭证汇总 `overall` ______（须 `verified`） | `arm-report.json` + `run-log.md` + 离线套件 M0–M18 汇总 + **本签署包**（两个文件摘要的来源） | 任一项不满足 ⇒ **NO-GO**，不得 Start |
+| **G6 就绪与凭证** | `-Mode arm` 退出码 ______（须 0）/ `arm-report.json` ______ / 凭证汇总 `overall` ______（须 `verified`） | `arm-report.json` + `run-log.md` + 离线套件 M0–M19 汇总 + **本签署包**（两个文件摘要的来源） | 任一项不满足 ⇒ **NO-GO**，不得 Start |
 
 > **G2 的探测需单独授权**：`mode=probe` 会发起真实机床 I/O（`drivers/sinumerik-nck/src/probe.rs:3`、`:38-48`；路由 `crates/core-api/src/lib.rs:3396`），**不得**默认并入前置检查；未授权时 G2 的"协商 PDU"只能记"未测"。
 
@@ -270,7 +301,7 @@
 | 5.3-4 | 退出码 1/2/3 任一 ⇒ 不通过（`ARMED_INPUTS_MISSING` / `ARMED_SELFTEST_FAIL` / `ARMED_ENDPOINT_UNREACHABLE`） | ______ | `watchdog:268-272`、`:1625-1627` |
 | 5.3-5 | 离线硬门未触发（arm 只允许回环且端口 ≠ 8132） | 实际 `-BaseUrl` ______ | `watchdog:611-628`（**注意**：`-BaseUrl` 缺省值是 `http://127.0.0.1:8132`，`watchdog:326`，因此 arm **必须显式**给离线桩地址） |
 | 5.3-6 | 测试注入参数未携带（`-TestHostProbeError` / `-TestAbortFlow`） | ☐ 未携带（必须） | `watchdog:654-702`（B1：任何网络动作之前 exit 40，`network_actions = 0`） |
-| 5.3-7 | 离线套件 M0–M18 全部通过（**证明工具行为，不构成现场授权**） | 汇总文件 ______ | `tests/watchdog/run-watchdog-scenarios.ps1:14-36` |
+| 5.3-7 | 离线套件 M0–M19 全部通过（**证明工具行为，不构成现场授权**） | 汇总文件 ______ | `tests/watchdog/run-watchdog-scenarios.ps1:14-36` |
 
 > **能力边界（不得夸大）**：ARMED **不能**对生产实例 `127.0.0.1:8132` 执行（`watchdog:611-628` 直接 exit 40）。生产侧的可达性与配置一致性由 **fire 阶段的只读 GET** 证明（`watchdog:1344-1399`），任何不一致在**发出 Start 之前**以 exit 40 拒绝（`watchdog:1721-1726`）。**不得**把"离线桩自检通过"写成"生产通路已验证"。
 
@@ -283,7 +314,7 @@
 | 5.4-3 | `-AuthzTicket`（授权凭证编号） | ______ | `watchdog:1478-1483` |
 | 5.4-4 | `-G6Signoff` + `-G6SignedAt`（G6 现场签署） | ______ / ______ | `watchdog:725-739`：非空、时间可解析、不在未来 |
 | 5.4-5 | `-G7DeployVersion`（+`-G7BinaryPath` / `-ExpectedManifestSha256`） | 见 §3.1 | `watchdog:882-1029` |
-| 5.4-6 | `-ExpectedTaskRevision` / `-ExpectedPointCount` / `-ApprovedTaskConfig` / `-ExpectedTaskFingerprint` / `-ExpectedApprovedTaskConfigSha256` | 见 §2.3、§4 | `watchdog:1288-1455` |
+| 5.4-6 | `-ExpectedTaskRevision` / `-ExpectedPointCount` / `-ApprovedTaskConfig` / `-ExpectedTaskFingerprint` / `-ExpectedApprovedTaskConfigSha256` | 见 §2.3、§4 | `watchdog:1368-1565`（`Test-WdCredTaskConfig`，**#136 版本**；#131 基线对应 `:1288-1455`） |
 | 5.4-7 | 全部凭证 `overall = verified`（fire 下四项**全部** `verified`，含 `task_config`） | ______ | `watchdog:1692-1726`；`task_config` 非 `verified` ⇒ exit 40 |
 | 5.4-8 | `-SkipHostChecks` **未使用**（否则 ④⑤ 记 `not_verified`，`exit 7`） | ☐ 未使用（必须） | `watchdog:1731-1733`、`:217-219` |
 
@@ -316,11 +347,11 @@
 | N1 | §2.4「批准值来源」任一行缺少"由谁/依据什么/何时批准" | 逐行核对 §2.4 | ☐ 是 ☐ 否 |
 | N2 | 三个摘要中任一缺失，或与现场实算不一致 | `watchdog:1120-1174`、`:935-962`、`:1025-1028` | ☐ 是 ☐ 否 |
 | N3 | 部署身份不明（`-G7DeployVersion` 非 `sha256:`/`manifest:`；二进制定位不到；清单读不到） | `watchdog:992-1009`、`:828-844` | ☐ 是 ☐ 否 |
-| N4 | 任务配置不一致（revision / 连接 5 字段 / 逐点 Key 与参数 / 指纹 / `point_count`） | `watchdog:1401-1448` | ☐ 是 ☐ 否 |
+| N4 | 任务配置不一致（revision / 连接 5 字段 / 逐点 Key 与参数 / 指纹 / **当前任务点数（实时快照）**） | `watchdog:1368-1565`（`Test-WdCredTaskConfig`，**#136 版本**行号；点数判据 `:1515-1518`；#131 基线对应 `:1288-1456`） | ☐ 是 ☐ 否 |
 | N5 | 现场门禁任一门（G1–G6）不通过 | §5.1 逐门核对 | ☐ 是 ☐ 否 |
 | N6 | 人工核验三字段任一缺失/不一致/无法取证 | §5.5 | ☐ 是 ☐ 否 |
 | N7 | 签署栏（§5.7）四方任缺签名、日期或角色重复 | 逐栏核对 | ☐ 是 ☐ 否 |
-| N8 | **`BLOCKED-01` 未关闭**（§2.5：`point_count` 时序） | §2.5 选项 B-1/B-2/B-3 是否已书面选定并落实 | ☐ 是 ☐ 否 |
+| N8 | **`BLOCKED-01` 的依赖未满足**：PR #136（B-1 修复）**未合入 `main`** ⇒ 修复不在基线中，仍判 NO-GO（`BLOCKED-01` 本身已由 B-1 关闭） | 核对 PR #136 是否已合入 `main`（`git log main` / PR 状态），并确认部署的 watchdog 为含 `Get-WdTaskPointCount`（`watchdog:1293`）的版本 | ☐ 是 ☐ 否 |
 | N9 | 有人修改过任何预期值以"让门禁通过" | 对照 §2.4 批准记录与最终命令行参数 | ☐ 是 ☐ 否 |
 | N10 | 使用了 `-SkipHostChecks` 或携带测试注入参数 | `watchdog:1731-1733`、`:654-702` | ☐ 是 ☐ 否 |
 | N11 | 存在**遗留的在途 Start**（已发出、未收到明确结果） | #130 §4.7-c；`watchdog:2784`、`:2859` | ☐ 是 ☐ 否 |
@@ -343,24 +374,24 @@
 - ☐ 三个摘要（§4-①②③）已填入且来源符合 §4 的批准来源要求。
 - ☐ §5.5 人工核验三字段已逐字段比对并由复核人独立签名。
 - ☐ `-Mode arm` 退出码 ______（须 0）、`arm-report.json` ______、凭证汇总 ______（须 `verified`）。
-- ☐ `BLOCKED-01` 处置选项：☐ B-1 ☐ B-2（审批人书面接受状态断言） ☐ B-3；审批人签字 ______。
+- ☐ `BLOCKED-01` **已选 B-1 并实现（PR #136，待合入 main）**；已确认 **#136 已合入 main** ☐；审批人签字 ______。
 - ☐ 本人已知晓：**30 秒是调度目标，不是物理停止保证**；`T0` 由 watchdog 在 FIRED 时刻自生成，**签字时不得填写任何具体 `T0` 或截止时刻**（`watchdog:2248-2293`）。
 
-### 5.8 执行顺序（本模板固定顺序；**含 `BLOCKED-01` 的实测步骤**）
+### 5.8 执行顺序（本模板固定顺序；**含门禁前置诊断步骤**）
 
 | 步 | 动作 | 前置条件 | 留证 |
 |---|---|---|---|
 | 1 | `-Mode arm` 对**离线回环桩**执行（不得指向 8132） | §2–§4 已填；§5.7 已签（`-G6Signoff`/`-G6SignedAt` 本身是 arm 的凭证项，`watchdog:1484`） | `arm-report.json`、`run-log.md` |
 | 2 | 抓运行前基线：`GET /endpoints/{id}`、`GET /tasks?endpoint=`、`GET /points/latest`（完整原始响应） | G1–G5 已签字 | 原始响应文件 + SHA-256 |
 | 3 | `PUT /api/v1/tasks/{endpoint}`（body = 获批 4 点，预期 revision 18） | 端点已 STOPPED（运行中保存被 `CONFLICT` 拒绝，`core-api:2406-2414`） | PUT 响应 + 读回 `GET /tasks` |
-| 4 | **`BLOCKED-01` 实测（只读）**：`GET …/diagnostics` 取 `point_count`，与签署值比对 | 第 3 步完成 | `site-log.md` 五列（§2.5） |
+| 4 | **门禁前置诊断（只读）**：记录 `task_point_count_live`（当前任务点数，实时快照，**判据**）与 `diagnostics_point_count_observed`（**观测值**），**两者都记录但只有前者参与判定**；不再要求 `point_count` 与签署值相等 | 第 3 步完成 | `site-log.md` 六列（§2.5） |
 | 5 | §5.5 人工核验三字段（`family` / `max_read_items` / `timeout_ms`）+ 复核签名 | 第 2 步的原始响应在案 | 原始响应 + 规范化 diff + 签名 |
 | 6 | `-Mode fire -Authorized …`（携带 §4 三个摘要与全部凭证） | 第 1、4、5 步全部通过 | `t0.stamp`、`summary.json` |
 | 7 | `T0+10 s±2 s` 抓 `early`；`T0+25~28 s` 抓 `prestop`（**必须在 Stop 之前**） | 第 6 步已进入 FIRED | 两次四件套 |
 | 8 | `T0+30 s` watchdog **无条件**发 Stop（执行人不得推迟） | — | `watchdog-stops.jsonl` |
 | 9 | 按 §6.6 复核"停干净" → 恢复 `rev17`（§6.4）→ 对账 → 保持 STOPPED | 第 8 步完成 | `summary.json`、恢复读回 |
 
-- 第 4 步是**门禁前置诊断**：`point_count` 与签署值不符 ⇒ **不得进入第 6 步**（否则 fire 必然 `exit 40`）。该值**不是**批准值（§2.5 末尾第 4 条）。
+- 第 4 步是**门禁前置诊断**：`task_point_count_live`（当前任务点数）≠ 签署值 ⇒ **不得进入第 6 步**（否则 fire 必然 `exit 40`，`watchdog:1515-1518`）。`diagnostics_point_count_observed` 只作观测，与签署值不等**不构成**拒绝理由，**也不是**批准值（§2.5 末尾第 4 条）。
 - 抓证失败（第 7 步）**不推迟** Stop（#130 §6.2）；抓证进程从 `t0.stamp` **只读**取 `T0`，**不参与** Stop 决策。
 
 ---
@@ -478,7 +509,7 @@
 
 - **保存顺序（强制）**：`points/latest` 先**原样落盘完整响应**（全端点），再在分析阶段按 `endpoint_id` 筛出目标 4 条；顶层 `count` 是**全端点**总数，不得当作目标端点条数（#130 §6.2、§6.3）。
 - **日志口径**：进程日志不落盘是既定环境事实，**不以任何进程日志作为判据**；日志缺失对判定中性（#130 §6.3）。**若无法持续观测端点状态 ⇒ INVALID**。
-- **`point_count` 不得用于恢复对账**：恢复 `rev17`（238 点）只写 `tasks` 表，**不写** `point_registry`（§2.5-证据 #4），因此恢复后 `diagnostics.point_count` 仍是上次运行的点数（本轮为 4），与 `GET /tasks` 的 238 点不一致**是预期现象**。恢复对账只认 `GET /tasks` 的内容与点数（#130 §8.3）。
+- **`diagnostics_point_count_observed` 不得用于恢复对账**：该观测值是持久化残留量（`point_registry` 中 `deleted=0` 的行数，`core-api:1499` ← `config-store:2459-2473`），恢复 `rev17`（238 点）只写 `tasks` 表，**不写** `point_registry`（§2.5-证据 #4、写入时序块），因此恢复后该观测值仍是上次运行的点数（本轮为 4），与 `GET /tasks` 的 238 点不一致**是预期现象**。恢复对账只认 `GET /tasks` 的内容与点数（#130 §8.3）。
 
 ---
 
@@ -486,7 +517,7 @@
 
 | # | 项 | 状态 | 为什么不能在本模板里写死 | 谁来解决 |
 |---|---|---|---|---|
-| **BLOCKED-01** | **`-ExpectedPointCount` 的时序语义**（§2.5） | **阻塞（结论 B）** | `point_count` 来自持久化 `point_registry`（`crates/core-api/src/lib.rs:1499` → `crates/config-store/src/lib.rs:2459-2473`），只由 Start 时的 `assign` 写入（`crates/driver-manager/src/endpoint.rs:943-945`）；PUT 不写它（`crates/core-api/src/lib.rs:2415-2419`）。因此不存在"由获批配置推导、又必然等于现场残留"的值 | 审批人选择 §2.5 的 B-1/B-2/B-3；B-1 需代码修复 PR |
+| **BLOCKED-01** | **`-ExpectedPointCount` 的时序语义**（§2.5） | **已关闭（B-1，PR #136）**；**依赖 #136 合入 main**（未合入 ⇒ 仍判 NO-GO，§5.6-N8） | 关闭前的问题：`point_count` 来自持久化 `point_registry`（`crates/core-api/src/lib.rs:1499` → `crates/config-store/src/lib.rs:2459-2473`），只由 Start 时的 `assign` 写入（`crates/driver-manager/src/endpoint.rs:206-224`，调用点 `:213` ← `run_config_flow:943-945`），PUT 不写它（`crates/core-api/src/lib.rs:2415-2419`），因此不存在"由获批配置推导、又必然等于现场残留"的值。#136 改为核验**当前任务点数**（实时快照 `tasks[].binding.config.points[]`，`watchdog:1293`/`:1515-1518`），`diagnostics.point_count` 降级为 `diagnostics_point_count_observed`（observed-only） | 已由代码修复解决；**待 #136 合入 main**（合入前本模板不得先行合并） |
 | 2 | `-ExpectedTaskRevision` 的时序 | **待确认** | 签署包在窗口之前准备，无法预知窗口内是否发生其它写入；一旦偏移 ⇒ `REFUSED_TASKCONFIG_MISMATCH`（`watchdog:285`） | 审批时一并签署；窗口内禁止任何其它写入（G5-②） |
 | 3 | G2 的"协商 PDU 核对" | **待确认** | `mode=probe` 会发起真实机床 I/O，需**单独授权**（#130 §4-G2） | 审批人单独授权或明确"不做" |
 | 4 | MAC `98-fa-9b-59-35-53` | **待确认** | 仓库内无留存（全仓检索无匹配） | 现场补充截图/书面记录 |
@@ -509,7 +540,7 @@
 | G7 部署身份 | `-G7DeployVersion`、`-G7BinaryPath`、`-ExpectedManifestSha256` | `watchdog:882-1029` | `REFUSED_MANIFEST_INTEGRITY` / `REFUSED_CREDENTIAL_INVALID` / `REFUSED_CREDENTIAL_UNVERIFIABLE` / 40 |
 | 获批配置自身完整性（G2） | `-ExpectedApprovedTaskConfigSha256` | `watchdog:1120-1174`、`:1326-1330` | `REFUSED_TASKCONFIG_INTEGRITY` / 40 |
 | 任务 revision | `-ExpectedTaskRevision` | `watchdog:1405-1406` | `REFUSED_TASKCONFIG_MISMATCH` / 40 |
-| 点位数量 | `-ExpectedPointCount` | `watchdog:1407-1408`、`:1426-1428` | 同上（**语义见 §2.5 BLOCKED-01**） |
+| **当前任务点数**（配置门判据） | `-ExpectedPointCount` | `watchdog:1509-1518`（判据块，点数判据本体 `:1515-1518`）、`watchdog:1293`（`Get-WdTaskPointCount` 计算） | 同上（**语义见 §2.5**；`diagnostics_point_count_observed` 为观测值，不参与判定） |
 | 连接配置 5 字段（自动） | `-ApprovedTaskConfig` 的 `connection` | `watchdog:1176-1216`、`:1420-1421` | 同上 |
 | 逐点 Key 与参数 | 同上（`tasks[].binding.config.points[]`） | `watchdog:1218-1250`、`:1429-1438` | 同上 |
 | 规范化 tasks 指纹 | `-ExpectedTaskFingerprint` | `watchdog:1056-1075`、`:1339-1342`、`:1440-1443` | 同上 |
@@ -545,14 +576,14 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire `
   -ExpectedApprovedTaskConfigSha256 sha256:<签署值>
 ```
 
-> 骨架**不是**可直接执行的命令：所有 `<...>` 必须由 §2–§4 的签署值填入，且 `BLOCKED-01` 必须先关闭。**不得**携带 `-TestHostProbeError` / `-TestAbortFlow` / `-SkipHostChecks`（`watchdog:654-702`、`:1731-1733`）。
+> 骨架**不是**可直接执行的命令：所有 `<...>` 必须由 §2–§4 的签署值填入，且须先**确认 PR #136 已合入 main**（`BLOCKED-01` 已由 B-1 关闭）。**不得**携带 `-TestHostProbeError` / `-TestAbortFlow` / `-SkipHostChecks`（`watchdog:654-702`、`:1731-1733`）。
 
 ## 附录 C：填写完整性自检（提交签署前逐项打勾）
 
 - ☐ §1.1 九项身份栏位全部填写，机型四证（§1.2）齐备
 - ☐ §2.1 四点逐字段与 `approved-task-config.json` 逐字一致；§2.2 八字段齐备且标注 5 自动 / 3 人工
 - ☐ §2.3 四项（revision / 点位数 / 指纹 / 文件摘要）同源；§2.4 每行都有"由谁 / 依据什么 / 何时批准"
-- ☐ §2.5 `BLOCKED-01` 已由审批人书面处置；§3 部署身份三件套齐备且未用 git 标识充当通过依据
+- ☐ §2.5 已**确认 PR #136 已合入 main**（`BLOCKED-01` 已由 B-1 关闭）；§3 部署身份三件套齐备且未用 git 标识充当通过依据
 - ☐ §4 三个摘要各自写明批准来源，且无现场现算；§5.1 六道门均为**本次窗口**新证据
 - ☐ §5.2 自动 / 人工两列未混写；§5.5 人工三字段有独立签名；§5.6 N1–N12 全为"否"
 - ☐ §5.7 四方签名齐全；§5.8 九步顺序已交底；§6 的核验项与证据清单全部填写
