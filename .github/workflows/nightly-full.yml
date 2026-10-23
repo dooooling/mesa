@@ -7,6 +7,7 @@
 # - perf（7 项秒级门）
 # - web
 # - watchdog（Windows + Linux 离线场景 M0–M18；nightly 不看 planner，全量安全网里必须有它）
+# - e2e（Windows + Linux NCK REST 端到端；nightly 不看 planner，全量安全网里必须有它）
 # 日常 PR 只跑 selective；FULL 只放这里 + 手动触发。
 name: nightly-full
 on:
@@ -27,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      plan: '{"plan_version":4,"full":true,"watchdog":true}'
+      plan: '{"plan_version":5,"full":true,"watchdog":true,"e2e":true}'
     steps:
       - run: echo "nightly FULL plan"
 
@@ -80,8 +81,12 @@ jobs:
     needs: [plan]
     uses: ./.github/workflows/_watchdog.yml
 
+  e2e:
+    needs: [plan]
+    uses: ./.github/workflows/_e2e.yml
+
   nightly-gate:
-    needs: [plan, rust-quality, rust-canonical, rust-platform, web, rust-stress, rust-perf, watchdog]
+    needs: [plan, rust-quality, rust-canonical, rust-platform, web, rust-stress, rust-perf, watchdog, e2e]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10

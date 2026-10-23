@@ -1,0 +1,140 @@
+# NCK REST 端到端（配置 → 采集 → 数据处理 → REST 展示）：Windows + Linux 并行，单 job 20 分钟预算。
+#
+# 被测对象：`scripts/nck-native-rest-e2e.py`
+#   * 真实 TCP 模拟器 `tools/nck-emulator`（`--port 0` 由 OS 原子分配端口）；
+#   * 真实 `mesad` 进程（临时 DB + **动态** HTTP 端口，不占用生产 8132）；
+#   * REST 全链：devices → endpoints → tasks(PUT) → start → points/latest →
+#     browse 模板 → identity-preview → 重启后 point_id 稳定性 → 旧字段负例。
+#
+# 边界（重要）：
+#   * **不连真机、不起生产 mesad**：全部跑在 127.0.0.1 的回环上，8132 保持空闲；
+#   * 只依赖 **pwsh 7+** 与 **python3**（两个平台都必须有；缺失即**明确失败**，
+#     绝不静默跳过）；构建依赖 cargo（由 rust-ci-setup 提供，缺失同样明确失败）；
+#   * 失败也上传证据（run.log / summary.json / mesad 与模拟器日志），
+#     便于直接判断是"起不来"、"端口冲突"还是"断言不过"。
+#
+# 调度：**不是**无条件运行——由 ci.yml 的 planner（tools/ci/plan.py）输出 e2e 标志，
+# 只有 E2E 相关路径变更（或 fail-closed FULL）才跑。
+name: e2e
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # 断言名是中文：显式 UTF-8，避免 runner 代码页（Windows runner 可能是 cp1252）
+  # 让 `print` 抛 UnicodeEncodeError 而把环境问题伪装成测试失败。
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
+
+jobs:
+  nck-rest-e2e:
+    strategy:
+      # 两个平台都跑完再判（不要一个挂了就取消另一个：平台差异本身就是要看的信息）。
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: windows-latest
+            platform: windows
+            cache-domain: windows-x64
+          - runs-on: ubuntu-latest
+            platform: linux
+            cache-domain: linux-x64
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: 环境自检（pwsh 7+ / python3）——缺失即失败
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ps = $PSVersionTable.PSVersion
+          Write-Host "PowerShell = $ps"
+          if ($ps.Major -lt 7) {
+            throw "需要 pwsh 7+，实际 $ps（不得因环境缺失而跳过测试）"
+          }
+          $py = $null
+          foreach ($cand in @('python3', 'python')) {
+            $cmd = Get-Command $cand -ErrorAction SilentlyContinue
+            if (-not $cmd) { continue }
+            try { $v = (& $cand --version 2>&1) } catch { continue }
+            if ($LASTEXITCODE -eq 0 -and "$v" -match 'Python (\d+)\.(\d+)') {
+              if ([int]$Matches[1] -lt 3) { throw "需要 python3，实际 $v（$cand）" }
+              $py = $cand
+              Write-Host "python = $cand ($v)"
+              break
+            }
+          }
+          if (-not $py) {
+            throw '需要 python3（E2E 脚本本体就是 python）；runner 上找不到 python3/python —— 明确失败，不静默跳过'
+          }
+          # 后续步骤统一用探测到的解释器名（Windows 上常只有 python，Linux 上常只有 python3）。
+          "PYTHON_CMD=$py" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "平台 = ${{ matrix.platform }}；pwsh/python 就绪"
+
+      - name: Rust setup
+        uses: ./.github/actions/rust-ci-setup
+        with:
+          cache-domain: ${{ matrix.cache-domain }}
+          # 只读兼容域：save 归 main 的 canonical/platform（避免多 job 抢写同一 archive）。
+          cache-writer: "false"
+          install-nextest: "false"
+
+      # 构建被测进程：mesad + NCK 驱动 + 模拟器（其余驱动不参与本链路，不必构建）。
+      # 脚本启动前会硬检查"二进制不比源码旧"（AGENTS.md：旧二进制会让结论静默失效）。
+      - name: 构建 mesad + NCK 驱动 + 模拟器
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargo = Get-Command cargo -ErrorAction SilentlyContinue
+          if (-not $cargo) {
+            throw '需要 cargo（E2E 要构建 mesad/驱动/模拟器）—— 明确失败，不静默跳过'
+          }
+          cargo build --locked --bins -p mesad -p mesa-nck-emulator -p mesa-driver-sinumerik-nck
+          if ($LASTEXITCODE -ne 0) { throw "构建失败（exit=$LASTEXITCODE）；E2E 不得跳过" }
+          $suffix = if ($IsWindows) { '.exe' } else { '' }
+          $need = @('mesad', 'mesa-nck-emulator', 'mesa-driver-sinumerik-nck')
+          $missing = @($need | Where-Object { -not (Test-Path (Join-Path 'target/debug' ($_ + $suffix))) })
+          Write-Host "binaries: $(($need | ForEach-Object { $_ + $suffix }) -join ', ')"
+          if ($missing.Count -gt 0) {
+            throw "缺少二进制：$($missing -join ', ')（构建未产出；不得跳过 E2E）"
+          }
+
+      - name: 跑 NCK REST 端到端（13 项断言）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 控制台解码按 UTF-8（脚本输出含中文断言名），否则落盘日志会乱码。
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          $evidence = 'target/validation/nck-rest-e2e'
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $log = Join-Path $evidence 'run.log'
+          & $env:PYTHON_CMD scripts/nck-native-rest-e2e.py --evidence-dir $evidence 2>&1 |
+            Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            throw "NCK REST E2E 失败（exit=$code）；证据见上传的 artifact nck-rest-e2e-${{ matrix.platform }}"
+          }
+
+      - name: 上传证据（summary.json / run.log / 子进程日志）
+        if: always()
+        # 按仓库约定钉扎到提交 SHA（v4.6.2）；浮动 tag 可能被上游改写，导致 CI 静默失效
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nck-rest-e2e-${{ matrix.platform }}
+          path: target/validation/nck-rest-e2e
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: sccache stats
+        if: always()
+        shell: pwsh
+        run: |
+          # 只作诊断：stats 不可用不得影响 job 结论（否则会掩盖真实测试结果）。
+          sccache --show-stats
+          exit 0

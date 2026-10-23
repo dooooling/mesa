@@ -31,8 +31,8 @@ def pkgs():
 
 
 def main():
-    # plan_version 冻结（CI v4 → 4；v4 新增 watchdog 标志）。
-    check("plan_version==4", plan.PLAN_VERSION == 4)
+    # plan_version 冻结（CI v5 → 5；v4 新增 watchdog 标志，v5 新增 e2e 标志）。
+    check("plan_version==5", plan.PLAN_VERSION == 5)
 
     # docs-only → all skip。
     p = plan_for_files(["docs/a.md", "drivers/focas2/docs/x.md"], pkgs())
@@ -271,6 +271,83 @@ def main():
     for f in ([], ["mystery/new.bin"], ["Cargo.lock"], ["tools/ci/plan.py"]):
         p = plan_for_files(f, pkgs())
         check(f"watchdog: fail-closed {f or '[]'} → true", p["watchdog"] is True, p)
+
+    # ── CI v5：e2e 标志（NCK REST 端到端；只按相关路径触发，绝不无条件运行）───────────
+    # schema：每个计划都必须带 bool 类型的 e2e（gate 会 fail-closed 校验）。
+    e2e_probe_cases = [
+        [],
+        ["docs/a.md"],
+        ["apps/mesa-web/src/App.tsx"],
+        ["drivers/focas2/src/wire/codec.rs"],
+        ["scripts/nck-native-rest-e2e.py"],
+        ["tools/nck-emulator/src/main.rs"],
+        ["drivers/sinumerik-nck/src/lib.rs"],
+        ["crates/core-api/src/lib.rs"],
+        ["crates/config-store/src/lib.rs"],
+        ["apps/mesad/src/main.rs"],
+        ["tests/driver-contract/tests/smoke.rs"],
+        ["tests/watchdog/stub_endpoint.py"],
+        ["scripts/stop-watchdog.ps1"],
+        [".github/workflows/_e2e.yml"],
+        ["Cargo.lock"],
+        ["mystery/new.bin"],
+    ]
+    shape_bad = [f for f in e2e_probe_cases
+                 if not isinstance(plan_for_files(f, pkgs()).get("e2e"), bool)]
+    check("e2e 标志恒为 bool（gate fail-closed 前提）", not shape_bad, str(shape_bad))
+
+    # 被测脚本本体变更 → 只跑 e2e（不牵连 Rust/web），且**不**落到 unknown→FULL。
+    p = plan_for_files(["scripts/nck-native-rest-e2e.py"], pkgs())
+    check("e2e: 脚本 → true", p["e2e"] is True, p)
+    check("e2e: 脚本 → 不触发 Rust/web 且不构建",
+          p["quality"] is False and p["canonical"] is False
+          and p["platform_mode"] == "skip" and p["stress"] is False and p["perf"] is False
+          and p["web"] is False and p["build_targets"] == {"kind": "none"}, p)
+
+    # 链路真正依赖的每一处都必须触发（Rust 侧同时照常跑，两者不是二选一）。
+    for f in ("tools/nck-emulator/src/main.rs",
+              "drivers/sinumerik-nck/src/lib.rs",
+              "crates/core-api/src/lib.rs",
+              "crates/driver-manager/src/endpoint.rs",
+              "crates/config-store/src/lib.rs",
+              "apps/mesad/src/main.rs",
+              "tests/driver-contract/tests/smoke.rs"):
+        p = plan_for_files([f], pkgs())
+        check(f"e2e: {f} → true", p["e2e"] is True and p["canonical"] is True, p)
+
+    # e2e workflow 自身变更 → true（同时命中 .github/ 的 FULL，fail-closed）。
+    p = plan_for_files([".github/workflows/_e2e.yml"], pkgs())
+    check("e2e: _e2e.yml → true + FULL", p["e2e"] is True
+          and p["platform_mode"] == "full", p)
+
+    # 无关改动 → false（"不要对每个无关 PR 无条件消耗两个 runner"）。
+    for f in ("drivers/focas2/src/wire/codec.rs", "drivers/s7/src/y.rs",
+              "crates/event-store/src/x.rs", "apps/mesa-web/src/App.tsx",
+              "docs/a.md", "scripts/stop-watchdog.ps1", "tests/watchdog/stub_endpoint.py"):
+        p = plan_for_files([f], pkgs())
+        check(f"e2e: {f} → false", p["e2e"] is False, p)
+
+    # 混合改动（E2E 资产 + 无关 Rust）→ 两者都跑。
+    p = plan_for_files(["scripts/nck-native-rest-e2e.py", "drivers/s7/src/y.rs"], pkgs())
+    check("e2e: 脚本+s7 → e2e 与 canonical 都 true",
+          p["e2e"] is True and p["canonical"] is True, p)
+
+    # fail-closed：未知路径 / 空 diff / Cargo.lock / tools-ci → e2e 也置真。
+    for f in ([], ["mystery/new.bin"], ["Cargo.lock"], ["tools/ci/plan.py"]):
+        p = plan_for_files(f, pkgs())
+        check(f"e2e: fail-closed {f or '[]'} → true", p["e2e"] is True, p)
+
+    # watchdog 与 e2e 互不牵连（各自只按自己的路径触发）。
+    p = plan_for_files(["scripts/stop-watchdog.ps1"], pkgs())
+    check("e2e: watchdog-only → e2e false", p["e2e"] is False and p["watchdog"] is True, p)
+    p = plan_for_files(["scripts/nck-native-rest-e2e.py"], pkgs())
+    check("watchdog: e2e-only → watchdog false",
+          p["watchdog"] is False and p["e2e"] is True, p)
+
+    # e2e 相关路径里的文档变更仍按 docs-only 处理（不为改 README 烧 runner）。
+    p = plan_for_files(["tests/driver-contract/README.md"], pkgs())
+    check("e2e: 文档 → docs-only skip", p["e2e"] is False
+          and p["platform_mode"] == "skip", p)
 
     print(f"\n{ PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

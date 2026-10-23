@@ -3,7 +3,7 @@
 
 输入：变更文件列表（git diff --name-only），输出 JSON 计划：
 {
-  "plan_version": 4,
+  "plan_version": 5,
   "quality": true,            # rust-quality（fmt/clippy）
   "canonical": true,          # rust-canonical（Linux x64 完整语义）
   "canonical_filter": ...,    # nextest filterset：all() 或 rdeps(=pkg) 联合
@@ -15,6 +15,7 @@
   "perf": false,              # rust-perf
   "web": true,                # web build/test
   "watchdog": false,          # stop-watchdog 离线场景（Windows + Linux，M0–M18）
+  "e2e": false,               # NCK REST 端到端（Windows + Linux，真实 mesad + 模拟器）
   "reason": "...",            # 人类可读路由原因
 }
 
@@ -24,6 +25,16 @@ watchdog（CI v4）：
   跑完整离线套件（单 job 25 分钟预算），与本仓库绝大多数改动无关。
 - FULL（未知路径/空 diff/diff 失败/`.github/**`、`tools/ci/**` 等 fail-closed 路径）时为真：
   "无法判断影响面"时宁可多跑一次，也不要漏跑。
+
+e2e（CI v5）：
+- 只有 **E2E 相关路径**变更才置真（scripts/nck-native-rest-e2e.py、tools/nck-emulator/**、
+  drivers/sinumerik-nck/**、crates/{core-api,driver-manager,config-store}/**、apps/mesad/**、
+  tests/driver-contract/**、.github/workflows/_e2e.yml）；同样**绝不**无条件运行——
+  它是"重"测试：真实 mesad 进程 + 真实 TCP 模拟器 + 临时 DB，双平台各 20 分钟预算。
+- 触发面按"这条链路真正依赖的东西"选：NCK 驱动的地址编译/身份、Core 的任务门禁与
+  REST、DriverManager 的启停/配置重放、ConfigStore 的持久化、mesad 的装配，
+  以及承载同一批断言的 contract suites。改这些而不跑 E2E 等于让回归静默溜过去。
+- FULL 时同样为真（fail-closed）。
 
 build_targets（selective compile，CI v3）：
 - {"kind": "bins"}：cargo build --workspace --bins（FULL/未知影响用）
@@ -39,7 +50,7 @@ import os
 import sys
 import tomllib
 
-PLAN_VERSION = 4
+PLAN_VERSION = 5
 
 # --- watchdog 相关路径（CI v4：只有这些路径变更才跑 watchdog 套件） ---
 # 说明：
@@ -63,6 +74,57 @@ def needs_watchdog(files: list[str]) -> bool:
         if p in WATCHDOG_CI_FILES:
             return True
         for prefix in WATCHDOG_PATHS:
+            if p == prefix.rstrip("/") or p.startswith(prefix):
+                return True
+    return False
+
+
+# --- E2E（NCK REST 端到端）相关路径（CI v5） ---
+# 说明（为什么是这些）：
+#   * scripts/nck-native-rest-e2e.py —— 被测脚本本体（**非** workspace member，
+#     因此还要进 E2E_ONLY_PATHS，否则会落到 unknown path → FULL）；
+#   * tools/nck-emulator/            —— 真实 TCP 模拟器（对端行为）；
+#   * drivers/sinumerik-nck/         —— 地址编译 / 身份 / 定义目录 / presets；
+#   * crates/core-api/               —— REST 路由、任务门禁、point_key 唯一性；
+#   * crates/driver-manager/         —— 端点启停、配置重放、PointMap 应用；
+#   * crates/config-store/           —— 任务/端点持久化（重启后 point_id 稳定性）；
+#   * apps/mesad/                    —— 进程装配（DB / 端口 / drivers-dir）；
+#   * tests/driver-contract/         —— 同一批 REST/端点/数据面断言的 contract suites。
+# 刻意**不**包含 .github/workflows/ci.yml：它属 FULL_PATHS，接线是否正确由 ci-gate
+# 在每个 PR 上校验（e2e=false 时必须 skipped）。
+E2E_PATHS = (
+    "scripts/nck-native-rest-e2e.py",
+    "tools/nck-emulator/",
+    "drivers/sinumerik-nck/",
+    "crates/core-api/",
+    "crates/driver-manager/",
+    "crates/config-store/",
+    "apps/mesad/",
+    "tests/driver-contract/",
+)
+E2E_CI_FILES = (".github/workflows/_e2e.yml",)
+
+# E2E 相关、但**不是** workspace member、也没有 SPECIAL_PACKAGES 映射的路径。
+# 它们必须被显式认作"已知的非 Rust 路径"，否则会 fall through 到 unknown → FULL，
+# 让改一行 E2E 脚本也触发全量 Rust 集成（与"不要无条件消耗 runner"相反）。
+E2E_ONLY_PATHS = ("scripts/nck-native-rest-e2e.py",)
+
+
+def needs_e2e(files: list[str]) -> bool:
+    """NCK REST 端到端是否必须运行（只看与它真正相关的路径）。"""
+    for p in files:
+        if p in E2E_CI_FILES:
+            return True
+        for prefix in E2E_PATHS:
+            if p == prefix.rstrip("/") or p.startswith(prefix):
+                return True
+    return False
+
+
+def needs_e2e_only(files: list[str]) -> bool:
+    """该路径是否属于"已知的 E2E-only 非 Rust 路径"（用于避免 unknown→FULL）。"""
+    for p in files:
+        for prefix in E2E_ONLY_PATHS:
             if p == prefix.rstrip("/") or p.startswith(prefix):
                 return True
     return False
@@ -255,6 +317,8 @@ def full_plan(reason: str) -> dict:
         "web": True,
         # fail-closed：影响面无法判断时宁可多跑一次 watchdog 离线套件。
         "watchdog": True,
+        # 同理：E2E 也是 fail-closed 置真（未知路径/空 diff 都可能悄悄改坏这条链路）。
+        "e2e": True,
         "reason": reason,
     }
 
@@ -275,6 +339,7 @@ def empty_plan(reason: str) -> dict:
         "perf": False,
         "web": False,
         "watchdog": False,
+        "e2e": False,
         "reason": reason,
     }
 
@@ -302,6 +367,7 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
             "perf": False,
             "web": True,
             "watchdog": False,
+            "e2e": False,
             "reason": "web-only → web only",
         }
 
@@ -313,13 +379,14 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
 
     # 路径 → packages。
     watchdog_changed = needs_watchdog(files)
+    e2e_changed = needs_e2e(files)
     pkgs: set[str] = set()
     for p in files:
         matched = False
-        # watchdog 相关路径是**已知的非 Rust 路径**：只置 watchdog 标志，不牵连任何 Rust job。
-        # （不加这一条的话它们会落到下面的 unknown path → FULL，等于让每个 watchdog 小改动
+        # watchdog / E2E 相关路径里的**已知非 Rust 路径**：只置对应标志，不牵连 Rust job。
+        # （不加这一条的话它们会落到下面的 unknown path → FULL，等于让每个测试资产小改动
         #  都跑一遍全量 Rust 集成，与"不要无条件消耗 runner"的要求相反。）
-        if needs_watchdog([p]):
+        if needs_watchdog([p]) or needs_e2e_only([p]):
             matched = True
         for prefix, extra in SPECIAL_PACKAGES.items():
             if p == prefix or p.startswith(prefix + "/"):
@@ -336,8 +403,13 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
             return full_plan(f"unknown path: {p} (fail-closed)")
 
     if not pkgs:
-        if watchdog_changed:
-            # watchdog-only：只跑 watchdog 离线套件，Rust/web 全部 skip。
+        if watchdog_changed or e2e_changed:
+            # 只有测试资产变更：只跑对应的重套件，Rust/web 全部 skip。
+            parts = []
+            if watchdog_changed:
+                parts.append("watchdog")
+            if e2e_changed:
+                parts.append("e2e")
             return {
                 "plan_version": PLAN_VERSION,
                 "quality": False,
@@ -351,8 +423,10 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
                 "stress": False,
                 "perf": False,
                 "web": False,
-                "watchdog": True,
-                "reason": "watchdog-only → watchdog suite only",
+                "watchdog": watchdog_changed,
+                "e2e": e2e_changed,
+                "reason": "%s-only → %s suite only"
+                % ("+".join(parts), "+".join(parts)),
             }
         # 全是 member 内 .md。
         return empty_plan("member docs-only → all skip")
@@ -406,6 +480,7 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
         "perf": perf,
         "web": web,
         "watchdog": watchdog_changed,
+        "e2e": e2e_changed,
         "reason": "; ".join(reasons),
     }
     if is_main and any(
