@@ -14,6 +14,8 @@
 #   ├─ rust-perf（风险触发；与 canonical 并行）
 #   └─ watchdog（Windows + Linux 并行跑 stop-watchdog 离线场景 M0–M18；**仅** watchdog 相关
 #                路径变更或 fail-closed FULL 时运行，绝不无条件跑——单 job 25 分钟预算）
+#   └─ e2e（Windows + Linux 并行跑 NCK REST 端到端：真实 mesad + 真实 TCP 模拟器；
+#            **仅** E2E 相关路径变更或 fail-closed FULL 时运行——单 job 20 分钟预算）
 # PR 快速反馈 + main 全集成安全网（不再机械完全重复）。
 name: CI
 on:
@@ -52,6 +54,7 @@ jobs:
       perf: ${{ steps.route.outputs.perf }}
       web: ${{ steps.route.outputs.web }}
       watchdog: ${{ steps.route.outputs.watchdog }}
+      e2e: ${{ steps.route.outputs.e2e }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -79,6 +82,7 @@ jobs:
             echo "perf=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["perf"]).lower())')"
             echo "web=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["web"]).lower())')"
             echo "watchdog=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["watchdog"]).lower())')"
+            echo "e2e=$(python3 -c 'import json; print(str(json.load(open("plan.json"))["e2e"]).lower())')"
           } >> "$GITHUB_OUTPUT"
 
   rust-quality:
@@ -131,6 +135,17 @@ jobs:
     if: needs.plan.outputs.watchdog == 'true'
     uses: ./.github/workflows/_watchdog.yml
 
+  # NCK REST 端到端（Windows + Linux 并行；单 job 20 分钟预算）：
+  # 真实 mesad + 真实 TCP 模拟器 + 临时 DB + 动态端口（不占用生产 8132）。
+  # **只**在 E2E 相关路径变更（scripts/nck-native-rest-e2e.py、tools/nck-emulator/**、
+  # drivers/sinumerik-nck/**、crates/{core-api,driver-manager,config-store}/**、
+  # apps/mesad/**、tests/driver-contract/**、.github/workflows/_e2e.yml）
+  # 或 fail-closed FULL 时运行，绝不无条件跑。
+  e2e:
+    needs: [plan]
+    if: needs.plan.outputs.e2e == 'true'
+    uses: ./.github/workflows/_e2e.yml
+
   # Stress：PR 按 planner 风险触发；main Rust change 必跑（plan 已升级）。
   rust-stress:
     needs: [plan]
@@ -147,7 +162,7 @@ jobs:
 
   # 唯一 Merge Gate：plan 驱动 fail-closed（plan_version/bool/mode 全校验）。
   ci-gate:
-    needs: [plan, rust-quality, rust-canonical, rust-platform, web, rust-stress, rust-perf, watchdog]
+    needs: [plan, rust-quality, rust-canonical, rust-platform, web, rust-stress, rust-perf, watchdog, e2e]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -173,8 +188,8 @@ jobs:
               fail.append(f'plan 输出不可解析（{e}）→ FAIL CLOSED')
               print('GATE FAILED: %s' % fail)
               sys.exit(1)
-          if plan.get('plan_version') != 4:
-              fail.append(f"plan_version 必须 4（实际 {plan.get('plan_version')}）")
+          if plan.get('plan_version') != 5:
+              fail.append(f"plan_version 必须 5（实际 {plan.get('plan_version')}）")
           def need(job, want_run, want_skip=False):
               r = n.get(job, {}).get('result')
               if want_run and r != 'success':
@@ -185,12 +200,12 @@ jobs:
               if isinstance(v, bool):
                   return v
               return str(v).lower() == 'true'
-          # quality / canonical / web / stress / perf / watchdog：bool 驱动。
-          # watchdog 的语义与其它一致：planner 说该跑 ⇒ 必须 success；说不用跑 ⇒ 必须 skipped
+          # quality / canonical / web / stress / perf / watchdog / e2e：bool 驱动。
+          # watchdog / e2e 的语义与其它一致：planner 说该跑 ⇒ 必须 success；说不用跑 ⇒ 必须 skipped
           # （"跳过了但没跑"不算失败，"该跑却跳过"一定失败）。
           for key, job in [('quality', 'rust-quality'), ('canonical', 'rust-canonical'),
                            ('web', 'web'), ('stress', 'rust-stress'), ('perf', 'rust-perf'),
-                           ('watchdog', 'watchdog')]:
+                           ('watchdog', 'watchdog'), ('e2e', 'e2e')]:
               v = plan.get(key)
               if not isinstance(v, bool):
                   fail.append(f'{key} 必须 bool（实际 {v!r}）→ FAIL CLOSED')

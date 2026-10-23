@@ -1,0 +1,72 @@
+NCK 原生寻址 REST 端到端（脚本：scripts/nck-native-rest-e2e.py）
+================================================================
+
+执行基线
+--------
+  * 仓库 commit：b41ce6e33a6427ada0ac06ee89958f74b16cdad5（main）
+  * 平台：Windows（本机），Python 3.13.11
+  * 构建：cargo build --locked --bins -p mesad -p mesa-nck-emulator -p mesa-driver-sinumerik-nck
+  * 命令：python scripts/nck-native-rest-e2e.py --evidence-dir target/validation/nck-rest-e2e
+  * 结果：13/13 PASS（exit 0，耗时 12.2s）
+
+与历史证据 docs/evidence/nck-rest-e2e.txt 的关系
+------------------------------------------------
+旧证据是 12 项断言、且任务信封为 mesa.resources.v1 时代的产物；现行契约（ADR 0005 /
+PR-B）要求 NCK 任务只接受 nck.points.v1 信封、point_key 由驱动身份算法推导。本文件
+是脚本跨平台化 + 接入 CI 时按现行契约重跑的结果，断言数 12 → 13（新增
+identity-preview 权威 Key 一项）。旧文件保留作历史记录，不再代表当前行为。
+
+CI 中的运行方式（本文件不是 CI 证据，CI 证据看 artifact）
+----------------------------------------------------------
+  * workflow：.github/workflows/_e2e.yml（Windows + Linux 并行，单 job 20 分钟预算）
+  * 触发：ci.yml 的 planner（tools/ci/plan.py）输出 e2e=true 才跑（E2E 相关路径变更
+    或 fail-closed FULL）
+  * 门禁：ci-gate 严格判定 —— e2e=true ⇒ 该 job 必须 success；e2e=false ⇒ 必须 skipped；
+    e2e 非 bool ⇒ FAIL CLOSED
+  * artifact：nck-rest-e2e-{windows,linux}（summary.json / run.log / mesad 与模拟器日志，
+    失败也上传）
+
+原始输出
+--------
+emulator ready: 127.0.0.1:52665
+mesad ready on http://127.0.0.1:52666
+POST /devices -> 201
+POST /endpoints -> 201
+PUT /tasks (原生字段) -> 200
+读回点位是否一致: True
+POST /start -> 200
+latest point: {"endpoint_id": "e2e-nck", "key": "native.C.1.18.42.1", "point_id": 1, "point_key": "native.C.1.18.42.1", "quality": "GOOD", "source_label": "nck://read/C/1/18/42/1/1?mode=current&decode=F64_BE&transport=0x09", "timestamp_ns": 1792775532108056600, "type": "f64", "value": 3.7209743448696e-294, "value_origin": "CURRENT"}
+data_type: None value: 3.7209743448696e-294
+browse 根 -> 200 ['nck://presets', 'nck://identity']
+browse 模板(filter=rpa) -> 200 命中 1
+leaf label: RP/rpa F64_LE · candidate · 待确认：area_no/line
+identity-preview -> 200 {"definition_digest": "eba34bc560283a2acc66fa7956c5add6a1289390c0ed489122f88e8032286a6d", "definition_revision": 1, "identity_mode": "derived", "point_key": "channel.r_parameter#index=i:0@channel=i:1", "scope": "collect", "variable_id": "channel.r_parameter"}
+PUT /tasks (模板+确认) -> 200
+preset point: {"endpoint_id": "e2e-nck", "key": "channel.r_parameter#index=i:0@channel=i:1", "point_id": 2, "point_key": "channel.r_parameter#index=i:0@channel=i:1", "quality": "GOOD", "source_label": "nck://read/C/1/21/1/1/1?mode=current&decode=F64_LE&transport=0x09", "timestamp_ns": 1792775534831565300, "type": "f64", "value": 3.7209743448696e-294, "value_origin": "CURRENT"}
+PUT /tasks (两条任务) -> 200
+重启前: {'native.C.1.18.42.1': 1, 'channel.r_parameter#index=i:0@channel=i:1': 2}
+重启后: {'native.C.1.18.42.1': 1, 'channel.r_parameter#index=i:0@channel=i:1': 2}
+PUT /tasks (旧字段) -> 200 {"endpoint_id": "e2e-nck", "revision": 4}
+start -> 200 | runtime detail: ConfigurationError/INVALID_BINDING_CONFIG: task `t-legacy`: 绑定配置非法：`nck_native` 参数层未知字段 `block`（剥离仅针对已明确验证的 Compiler 元数据 `identity_mode`）
+
+=== 结果 ===
+PASS  保存原生字段任务
+PASS  任务往返参数逐字节一致（无静默重解释）
+PASS  启动端点
+PASS  原生任务采到 GOOD
+PASS  Browse 根为模板+身份两类入口
+PASS  模板只预填固定字段（实例字段未预填）
+PASS  模板标注 candidate 且列出待确认项
+PASS  身份预览返回权威 Key（derived / collect）
+PASS  模板补必填后可保存
+PASS  模板任务采到 GOOD
+PASS  两条任务可同时保存
+PASS  端点重启后两个点都在且 point_id 不变（PointMap 稳定）
+PASS  旧字段在 Configure 被明确拒绝（不得静默跑起来）
+
+13/13 PASS
+
+本机验证到的失败路径（前置自检不得静默跳过）
+--------------------------------------------
+  * 缺少 target/debug/mesad.exe ⇒ exit 2，输出「FAIL(前置): 缺少 ... 先 cargo build ...」
+  * 二进制比源码旧 ⇒ exit 2，输出「... 比 tools/nck-emulator/src/main.rs 旧 ...」

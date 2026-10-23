@@ -25,7 +25,7 @@ from contextlib import redirect_stdout
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CI_YML = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
-EXPECTED_PLAN_VERSION = 4
+EXPECTED_PLAN_VERSION = 5
 
 PASS = 0
 FAIL = 0
@@ -55,7 +55,7 @@ def load_gate_code():
 GATE = load_gate_code()
 
 
-def base_plan(watchdog):
+def base_plan(watchdog, e2e=False):
     plan = {
         "plan_version": EXPECTED_PLAN_VERSION,
         "quality": True,
@@ -72,10 +72,12 @@ def base_plan(watchdog):
     }
     if watchdog != "absent":
         plan["watchdog"] = watchdog
+    if e2e != "absent":
+        plan["e2e"] = e2e
     return plan
 
 
-def needs_json(plan, watchdog_result):
+def needs_json(plan, watchdog_result, e2e_result="skipped"):
     return {
         "plan": {"result": "success", "outputs": {"plan": json.dumps(plan)}},
         "rust-quality": {"result": "success"},
@@ -85,11 +87,12 @@ def needs_json(plan, watchdog_result):
         "rust-stress": {"result": "skipped"},
         "rust-perf": {"result": "skipped"},
         "watchdog": {"result": watchdog_result},
+        "e2e": {"result": e2e_result},
     }
 
 
-def run_gate(plan, watchdog_result):
-    os.environ["NEEDS_JSON"] = json.dumps(needs_json(plan, watchdog_result))
+def run_gate(plan, watchdog_result, e2e_result="skipped"):
+    os.environ["NEEDS_JSON"] = json.dumps(needs_json(plan, watchdog_result, e2e_result))
     buf = io.StringIO()
     with redirect_stdout(buf):
         try:
@@ -112,9 +115,28 @@ def main():
         got, out = run_gate(base_plan(wd), result)
         check(tag, got == want, f"exit={got} want={want}\n{out}")
 
+    # e2e：与 watchdog 同一套严格语义（该跑必须 success；不该跑必须 skipped；
+    # flag 缺失/非 bool 必须 FAIL CLOSED）。
+    for tag, e2e, result, want in [
+        ("e2e=true + success → OK", True, "success", 0),
+        ("e2e=true + skipped → FAIL", True, "skipped", 1),
+        ("e2e=true + failure → FAIL", True, "failure", 1),
+        ("e2e=false + skipped → OK", False, "skipped", 0),
+        ("e2e=false + success → FAIL（接线错误）", False, "success", 1),
+        ("plan 缺 e2e → FAIL CLOSED", "absent", "skipped", 1),
+    ]:
+        got, out = run_gate(base_plan(False, e2e), "skipped", result)
+        check(tag, got == want, f"exit={got} want={want}\n{out}")
+
+    # e2e 非 bool（字符串 "true"）同样 FAIL CLOSED：不能靠真值性蒙混过关。
+    plan = base_plan(False, "true")
+    got, out = run_gate(plan, "skipped", "success")
+    check("e2e 非 bool（\"true\"）→ FAIL CLOSED", got == 1, out)
+
     # 既有 flag 同样严格（防止改 gate 时顺手放宽别的 job）。
     for key, job in [("quality", "rust-quality"), ("canonical", "rust-canonical"),
-                     ("web", "web"), ("stress", "rust-stress"), ("perf", "rust-perf")]:
+                     ("web", "web"), ("stress", "rust-stress"), ("perf", "rust-perf"),
+                     ("e2e", "e2e")]:
         plan = base_plan(False)
         plan[key] = True
         needs = needs_json(plan, "skipped")
@@ -135,14 +157,23 @@ def main():
     got, out = run_gate(plan, "skipped")
     check("plan_version 旧版本 → FAIL", got == 1, out)
 
-    # ci.yml 的 job 列表确实包含 watchdog（防止 gate 校验了、job 却没定义）。
+    # ci.yml 的 job 列表确实包含 watchdog / e2e（防止 gate 校验了、job 却没定义）。
     src = open(CI_YML, encoding="utf-8").read()
     check("ci.yml 定义了 watchdog job", re.search(r"^  watchdog:\n", src, re.M) is not None)
     check("ci-gate needs 里包含 watchdog",
           re.search(r"needs: \[plan, rust-quality, rust-canonical, rust-platform, web, "
-                    r"rust-stress, rust-perf, watchdog\]", src) is not None)
+                    r"rust-stress, rust-perf, watchdog, e2e\]", src) is not None)
     check("watchdog job 不是无条件运行",
           re.search(r"if: needs\.plan\.outputs\.watchdog == 'true'", src) is not None)
+
+    # e2e 接线（同样的三道结构性断言；漏一处 gate 就会"校验了不存在的 job"）。
+    check("ci.yml 定义了 e2e job", re.search(r"^  e2e:\n", src, re.M) is not None)
+    check("e2e job 引用 _e2e.yml",
+          re.search(r"uses: \./\.github/workflows/_e2e\.yml", src) is not None)
+    check("e2e job 不是无条件运行",
+          re.search(r"if: needs\.plan\.outputs\.e2e == 'true'", src) is not None)
+    check("ci-gate needs 里包含 e2e",
+          re.search(r"needs: \[plan, [^\]]*\be2e\]", src) is not None)
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
