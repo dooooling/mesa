@@ -21,15 +21,23 @@
           ① -Authorized 开关 + -AuthorizedBy 授权人标识（显式授权、可追溯）；
           ② -AuthzTicket 授权凭证编号；
           ③ G6 现场签署：-G6Signoff + -G6SignedAt（时间必须可解析且不在未来）；
-          ④ G7 部署版本：-G7DeployVersion **与仓库 HEAD / git describe / 部署二进制 sha256 实际比对**；
-          ⑤ 任务配置：-ExpectedTaskRevision + -ExpectedPointCount，脚本**先做只读 GET**
-             （端点快照 / diagnostics / tasks）与**实际值比对**，不一致或读不到即拒绝。
+          ④ G7 部署身份：-G7DeployVersion 必须是 `sha256:<hex>` 或 `manifest:<path>`，
+             **与部署二进制实算摘要比对**（git HEAD/describe 只作辅助信息，不再作为通过依据）；
+          ⑤ 任务配置：-ExpectedTaskRevision + -ExpectedPointCount + -ApprovedTaskConfig
+             + -ExpectedTaskFingerprint，脚本**先做只读 GET**（diagnostics / tasks / 端点快照）
+             与**实际完整配置比对**（连接 host/port/TSAP/PDU、逐点 Key 与参数、配置指纹），
+             不一致或读不到即拒绝。
 
   ── 授权边界（本轮冻结）───────────────────────────────────────────────────────────
     arm  只允许**回环地址且端口≠8132**（8132 是生产 mesad）：非回环或指向 8132 ⇒ 40，
          **无任何参数可绕过**。ARMED 永远不碰生产实例，自检只针对明确指定的离线模拟端点。
     fire 静态凭证通过后才放行任意 host（含 127.0.0.1:8132 生产 mesad、192.168.15.60 等
          现场地址）；任务配置核验的只读 GET 通过后，才允许进入 FIRED 并发 Start。
+    **测试注入参数（B1）**：-TestHostProbeError / -TestAbortFlow 是离线测试专用，只允许配合
+         明确的离线回环端点（loopback 且端口≠8132）；**非回环地址或生产端口 8132** 携带它们
+         ⇒ 在**任何网络动作之前** exit 40（REFUSED_TEST_INJECTION_ONLINE，网络动作数 = 0）。
+         原因：这两个参数会在 Start 之后**故意**中止工作流或伪造本机核对失败——把它们带进
+         真实执行命令，等于我们自己制造异常，不能冒充"设备故障"或"无法确定"。
     40 = **授权边界拒绝，非设备故障**：它不是 Stop 失败，也不是采集异常，现场不要按设备
     故障处置（脚本会把理由与缺失/不匹配的凭证逐项打印并落盘）。
 
@@ -102,21 +110,44 @@
   脚本校验**可解析且不在未来**。
 
 .PARAMETER G7DeployVersion
-  G7 部署版本确认（commit SHA / git describe / `sha256:<hex>`），fire 必填；
-  脚本**实际比对**仓库 HEAD（或 describe）、或目标部署二进制的 SHA256：
-  读不到就记"无法校验"并**按未通过处理**（不放行、不进入 FIRED）。
+  G7 部署身份确认（fire 必填），**只接受**两种可独立证明"实际部署二进制身份"的形式：
+    · `sha256:<64 hex>`  —— 与 -G7BinaryPath（缺省探测 target/{release,debug}/mesad[.exe]）**实算**摘要比对；
+    · `manifest:<path>`  —— 从受信构建清单读期望摘要，再与部署二进制实算摘要比对。
+  **git commit SHA / git describe 不再作为通过依据**（只能证明"输入值与仓库版本匹配"，不能证明
+  部署物就是该版本构建的）；它们只作为辅助信息记录在 summary/t0.stamp 里。
+  两种形式都不可用（未给摘要/清单、清单不可读、定位不到二进制）⇒ `unverified` ⇒ 拒绝进入 FIRED
+  （fail-closed，**不得**降级为"用 git HEAD 代替"）。
+
+.PARAMETER G7BinaryPath
+  部署二进制路径（可选）。给出时**只**比对这个文件；给了却不存在 ⇒ 直接 unverified
+  （不回退到 target/ 下的其它二进制，避免"凑出通过"）。缺省时按
+  `target/release/mesad.exe` → `target/release/mesad` → `target/debug/mesad.exe` → `target/debug/mesad`
+  顺序探测，并如实记录最终比对的是哪一个文件。
 
 .PARAMETER ExpectedTaskRevision
-  期望的任务配置 revision（fire 必填）。脚本先做只读 `GET /api/v1/tasks/{EndpointId}`，
+  期望的任务配置 revision（fire 必填）。脚本先做只读任务快照
+  （`GET /api/v1/tasks?endpoint={EndpointId}`，404/405 回退 `GET /api/v1/tasks/{EndpointId}`），
   与返回的 `revision` 比对，不一致即拒绝。
 
 .PARAMETER ExpectedPointCount
   期望的点位数量（fire 必填，0 表示"应为 0 个点"）。脚本先做只读
   `GET /api/v1/endpoints/{id}/diagnostics`，与返回的 `point_count` 比对，不一致即拒绝。
 
+.PARAMETER ApprovedTaskConfig
+  获批任务配置 JSON 路径（fire 必填）。文件里给出连接配置（host / port / local_tsap / remote_tsap /
+  pdu_length）与**完整点位清单**（tasks[].binding.config.points[]：Key 与全部参数）。
+  脚本把实际只读 GET 到的值与之**逐项、逐点**比对（B3：只比 revision/point_count 不足以证明与获批配置一致）。
+
+.PARAMETER ExpectedTaskFingerprint
+  批准版本的任务配置指纹（fire 必填，`sha256:<64 hex>`）。指纹 = SHA-256(规范化 tasks 数组)，
+  规范化 = 键递归排序 + 按 task.id 排序 + 紧凑 JSON。脚本会用同一算法核对：
+  ① 获批配置文件本身的指纹必须等于该值（防止"拿错/被改过的批准文件"）；
+  ② 实际只读 GET 到的 tasks 指纹必须等于该值。
+
 .PARAMETER TaskConfigRef
   可选自由文本备注（任务配置核验依据的说明/工单链接），只记录不校验；
-  真正的核验由 -ExpectedTaskRevision + -ExpectedPointCount 完成。
+  真正的核验由 -ExpectedTaskRevision + -ExpectedPointCount + -ApprovedTaskConfig
+  + -ExpectedTaskFingerprint 共同完成。
 
 .PARAMETER BaseUrl
   Core 的 REST 根地址。arm：**只允许回环且端口≠8132**；fire：凭证校验通过后允许任意 host。
@@ -159,27 +190,37 @@
   pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode arm `
        -BaseUrl http://127.0.0.1:18080 -OutDir target\validation\stop-watchdog\M7 `
        -G6Signoff "张工/QC-828D-01" -G6SignedAt "2026-10-24T09:00:00+08:00" `
-       -G7DeployVersion "<git rev-parse HEAD>" -ExpectedTaskRevision rev13 -ExpectedPointCount 12
+       -G7DeployVersion "sha256:<部署 mesad 的 sha256>" -G7BinaryPath "C:\mesa\bin\mesad.exe" `
+       -ExpectedTaskRevision rev13 -ExpectedPointCount 12 `
+       -ApprovedTaskConfig "target\validation\approved-task-config.json" `
+       -ExpectedTaskFingerprint "sha256:<规范化 tasks 数组的 sha256>"
 
 .EXAMPLE
   # ② 正式执行（fire）：显式授权 + 授权人 + 四项凭证（全部**校验**通过才放行）
   pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire -Authorized -AuthorizedBy "李工" `
        -AuthzTicket G6-828D-R1 -G6Signoff "张工/QC-828D-01" -G6SignedAt "2026-10-24T09:00:00+08:00" `
-       -G7DeployVersion "<git rev-parse HEAD>" -ExpectedTaskRevision rev13 -ExpectedPointCount 12 `
+       -G7DeployVersion "manifest:target\validation\mesad-build-manifest.json" `
+       -G7BinaryPath "C:\mesa\bin\mesad.exe" `
+       -ExpectedTaskRevision rev13 -ExpectedPointCount 12 `
+       -ApprovedTaskConfig "target\validation\approved-task-config.json" `
+       -ExpectedTaskFingerprint "sha256:<规范化 tasks 数组的 sha256>" `
        -BaseUrl http://127.0.0.1:8132 -OutDir target\validation\828d-r1\round1-20261024T010203Z
 
 .EXAMPLE
   # ③ 离线 M1：假端点 GET 挂起 36 s，观测超时放宽到 45 s（心跳关闭，只测调度解耦）
   pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire -Authorized -AuthorizedBy SIM `
        -AuthzTicket SIM-M1 -G6Signoff SIM-G6 -G6SignedAt "2026-10-24T09:00:00+08:00" `
-       -G7DeployVersion "<git rev-parse HEAD>" -ExpectedTaskRevision rev13 -ExpectedPointCount 12 `
+       -G7DeployVersion "sha256:<离线测试二进制摘要>" -G7BinaryPath "target\validation\fixtures\mesad-fixture.bin" `
+       -ExpectedTaskRevision rev13 -ExpectedPointCount 12 `
+       -ApprovedTaskConfig "target\validation\approved-task-config.json" `
+       -ExpectedTaskFingerprint "sha256:<规范化 tasks 数组的 sha256>" `
        -BaseUrl http://127.0.0.1:18081 -ObserveTimeoutSec 45 -ObserveStallSec 0 `
        -OutDir target\validation\stop-watchdog\M1
 
 .NOTES
   严禁指向真实机床：离线模拟只用 127.0.0.1 的假端点或不可达地址（脚本本身也会拒绝非回环地址）。
   本脚本**不 import** 任何驱动/Core 代码，只经 REST 交互（§5.1-1）。
-  可重复的离线测试框架在 tests/watchdog/（一条命令跑完 M0–M12）。
+  可重复的离线测试框架在 tests/watchdog/（一条命令跑完 M0–M16）。
 
   ── 退出码（进程怎么处置）与试验结论（summary.json 的 verdict / axes）分开 ──────────
   arm 模式：
@@ -189,10 +230,13 @@
     3  ARMED_ENDPOINT_UNREACHABLE  端点不可达（离线桩未起 / 地址错）
   拒绝执行（授权边界，**先于一切写动作**，也先于 FIRED）：
     40 REFUSED_NON_OFFLINE         arm 指向非回环地址或生产 mesad 端口 8132
+    40 REFUSED_TEST_INJECTION_ONLINE 携带 -TestHostProbeError/-TestAbortFlow 却指向非回环地址或端口 8132
+                                    （B1：在任何网络动作之前拒绝，网络动作数 = 0）
     40 REFUSED_NOT_AUTHORIZED      fire 缺 -Authorized / -AuthorizedBy / -AuthzTicket
-    40 REFUSED_CREDENTIAL_INVALID  G6 签署时间不可解析、G7 与仓库 HEAD/二进制指纹不一致
-    40 REFUSED_TASKCONFIG_MISMATCH 任务配置与实际只读 GET 不一致（revision / point_count）
-    40 REFUSED_CREDENTIAL_UNVERIFIABLE 凭证读不到（无 git、端点读不到）→ 按未通过处理
+    40 REFUSED_CREDENTIAL_INVALID  G6 签署时间不可解析；G7 部署二进制摘要与期望不一致
+    40 REFUSED_TASKCONFIG_MISMATCH 完整任务配置与获批配置不一致（连接配置 / 点位 Key 与参数 / 指纹 / revision / point_count）
+    40 REFUSED_CREDENTIAL_UNVERIFIABLE 凭证读不到或无法独立验证（G7 无摘要/清单、部署二进制定位不到、
+                                    端点读不到、获批配置不可用）→ 按未通过处理（fail-closed）
   **40 一律表示"授权边界拒绝，非设备故障"**：未发出 Start、未进入 FIRED。
   fire 模式：
     0  STOPPED_CLEAN               收敛 CONVERGED + 采集 VALID + Start 确认 + 无竞态 + 无提前触发
@@ -221,8 +265,11 @@ param(
     [string]$G6Signoff = '',
     [string]$G6SignedAt = '',
     [string]$G7DeployVersion = '',
+    [string]$G7BinaryPath = '',
     [string]$ExpectedTaskRevision = '',
     [ValidateRange(-1, 10000000)][int]$ExpectedPointCount = -1,
+    [string]$ApprovedTaskConfig = '',
+    [string]$ExpectedTaskFingerprint = '',
     [string]$TaskConfigRef = '',
     [string]$BaseUrl = 'http://127.0.0.1:8132',
     [string]$EndpointId = 'lx-nck-tags-190-connection',
@@ -237,8 +284,11 @@ param(
     [switch]$HostChecks,
     [switch]$SkipHostChecks,
     [string]$Tag = 'run',
-    # ── 以下是**离线测试专用**注入开关（tests/watchdog/ 使用；非离线地址下不可能走到）──
+    # ── 以下是**离线测试专用**注入开关（tests/watchdog/ 使用）──────────────────────────
     # 只用于复现"查询失败 / 工作流异常退出"两类故障；正常执行时全部为缺省值。
+    # B1 冻结：这两个参数**只允许**配合明确的离线回环端点（loopback 且端口≠8132）；
+    # 非回环地址或生产端口 8132 携带它们 ⇒ 在**任何网络动作之前** exit 40
+    # （REFUSED_TEST_INJECTION_ONLINE，见下面的 Test-WdInjectionGuard）。
     [ValidateSet('', 'process', 'tcp', 'both')][string]$TestHostProbeError = '',
     [ValidateSet('', 'obs', 'timer', 'stop', 'start')][string]$TestAbortFlow = '',
     [ValidateRange(1, 120)][int]$TestAbortAfterSec = 3
@@ -467,8 +517,11 @@ function Write-WdRefusal {
             g6_signoff        = $G6Signoff
             g6_signed_at      = $G6SignedAt
             g7_deploy_version = $G7DeployVersion
+            g7_binary_path    = $G7BinaryPath
             expected_revision = $ExpectedTaskRevision
             expected_points   = $ExpectedPointCount
+            approved_task_config = $ApprovedTaskConfig
+            expected_tasks_fingerprint = $ExpectedTaskFingerprint
         }
         network_actions = $NetworkActions
         extra           = $Extra
@@ -483,6 +536,9 @@ function Write-WdRefusal {
     Write-Host ("ExitCode        : {0}（40 = 授权边界拒绝，不是 Stop 失败/设备故障）" -f $Code)
     Write-Host ("已发出 Start    : 否（拒绝发生在 FIRED 之前）")
     Write-Host ("网络动作        : {0} 次{1}" -f $NetworkActions, $(if ($NetworkActions -gt 0) { '（仅任务配置核验的只读 GET）' } else { '（未建立任何连接）' }))
+    if ($script:TestInjectionActive -and $script:TestInjectionActive.Count -gt 0) {
+        Write-Host ("测试注入参数    : {0}（离线测试专用；被本守卫拒绝时不允许用于真实执行）" -f ($script:TestInjectionActive -join ' '))
+    }
     Write-Host ("证据目录        : {0}" -f $OutDir)
     Write-Host '==========================================================================='
     exit $Code
@@ -524,6 +580,74 @@ else {
 Add-WdLog $ctx 'INFO' ("授权边界：mode={0} host={1}:{2} loopback={3} allowed={4}；{5}" -f $Mode, $urlInfo.host, $urlInfo.port, $urlInfo.loopback, $boundary.allowed, $boundary.reason)
 #endregion
 
+#region ── B1：测试注入参数的离线边界（统一守卫；先于任何网络动作）────────────────────
+# 复审阻塞 B1：-TestHostProbeError / -TestAbortFlow 是**离线测试专用**注入开关，旧版只在
+# 各自使用点（HostChecks 的 ④⑤、协调者主循环的注入中止）读取，**没有统一保护**；而 fire 模式
+# 放行任意 host。于是"把测试参数带进真实执行命令"会在 Start 之后**故意**中止工作流（WORKER_ABORT）
+# 或把本机核对伪造成"无法确定"——那不是设备故障，是我们自己制造的异常，在生产 mesad（8132）
+# 或现场机床上不可接受。
+#
+# 冻结规则：注入参数只允许用于**明确的离线回环端点**（loopback 且端口≠8132）。
+# 违反 ⇒ 在任何网络动作之前 exit 40（REFUSED_TEST_INJECTION_ONLINE），network_actions = 0。
+# 实现位置刻意放在"参数解析之后、任何 HTTP 之前"：本 region 位于 arm 探活（GET 快照）与
+# fire 凭证核验（只读 GET）之前，因此拒绝时**连一条 TCP 连接都不会建立**（M13 断言网络动作数=0）。
+$script:TestInjectionActive = @()
+if (-not [string]::IsNullOrWhiteSpace($TestHostProbeError)) { $script:TestInjectionActive += "-TestHostProbeError=$TestHostProbeError" }
+if (-not [string]::IsNullOrWhiteSpace($TestAbortFlow)) { $script:TestInjectionActive += "-TestAbortFlow=$TestAbortFlow" }
+# 说明：-TestAbortAfterSec 单独出现**不构成**注入（它只在 -TestAbortFlow 生效时才被读取），
+# 故不计入；这与"注入必须显式命名被注入的对象"的语义一致。
+
+function Test-WdInjectionGuard {
+    # 统一的注入边界判定（唯一判定点，不在各使用点零散判断）。
+    # 返回 [ordered]@{ active; allowed; reason; decided_by; ... }；allowed=false 时调用方必须 exit 40。
+    param($UrlInfo, [string[]]$InjectionParams)
+    $active = (@($InjectionParams).Count -gt 0)
+    $g = [ordered]@{
+        active          = $active
+        params          = @($InjectionParams)
+        allowed         = $true
+        host            = $UrlInfo.host
+        port            = $UrlInfo.port
+        loopback        = [bool]$UrlInfo.loopback
+        production_port = $script:PRODUCTION_CORE_PORT
+        network_actions = 0
+        reason          = '未携带测试注入参数（正常执行路径，不受本守卫约束）'
+        decided_by      = 'injection-guard：不适用'
+    }
+    if (-not $active) { return $g }
+    if (-not $UrlInfo.ok) {
+        $g.allowed = $false
+        $g.decided_by = 'injection-guard：注入参数要求合法 http/https 回环 BaseUrl'
+        $g.reason = "携带测试注入参数（$($InjectionParams -join ', ')），但 BaseUrl 不合法：$($UrlInfo.reason)"
+        return $g
+    }
+    if (-not $UrlInfo.loopback) {
+        $g.allowed = $false
+        $g.decided_by = 'injection-guard：OFFLINE_ONLY(loopback)'
+        $g.reason = "携带测试注入参数（$($InjectionParams -join ', ')）却指向非回环地址 $($UrlInfo.host)：测试注入只允许用于明确的离线回环端点"
+        return $g
+    }
+    if ($UrlInfo.port -eq $script:PRODUCTION_CORE_PORT) {
+        $g.allowed = $false
+        $g.decided_by = 'injection-guard：拒绝生产端口'
+        $g.reason = "携带测试注入参数（$($InjectionParams -join ', ')）却指向生产端口 $($script:PRODUCTION_CORE_PORT)（生产 mesad）：测试注入只允许用于离线桩端口"
+        return $g
+    }
+    $g.decided_by = 'injection-guard：OFFLINE_ONLY(loopback && 端口≠8132) 通过'
+    $g.reason = "携带测试注入参数（$($InjectionParams -join ', ')）指向回环离线端点 $($UrlInfo.host):$($UrlInfo.port) ⇒ 允许（仅离线测试）"
+    return $g
+}
+
+$injectionGuard = Test-WdInjectionGuard -UrlInfo $urlInfo -InjectionParams $script:TestInjectionActive
+Add-WdLog $ctx $(if ($injectionGuard.allowed) { 'INFO' } else { 'ERROR' }) ("测试注入边界：{0}（{1}）" -f $injectionGuard.reason, $injectionGuard.decided_by)
+if (-not $injectionGuard.allowed) {
+    Write-WdRefusal -Code 40 -Label 'REFUSED_TEST_INJECTION_ONLINE' -Reason $injectionGuard.reason -Extra @{
+        injection_guard = $injectionGuard
+        hint            = '测试注入参数（-TestHostProbeError / -TestAbortFlow）只能配合 127.0.0.1 的非 8132 端口（tests/watchdog/ 的假端点桩）；真实执行必须去掉这些参数'
+    } -NetworkActions 0
+}
+#endregion
+
 #region ── 四项凭证：**校验**而不是"接收"（G6 签署 / G7 部署版本 / 任务配置 / 显式授权）──
 # 约定：每项 state ∈ verified / invalid / missing / unverified / not_checked
 #   verified   = 校验通过（G7 与仓库 HEAD 或部署二进制指纹一致；任务配置与实际只读 GET 一致）
@@ -557,106 +681,515 @@ function Test-WdCredG6 {
     return (New-WdCredItem 'g6_signoff' 'verified' "签署=$Signoff；签署时间=$($dt.ToString('o'))" $provided ([ordered]@{ parsed = $dt.ToString('o') }))
 }
 
-function Test-WdCredG7 {
-    # G7 部署版本确认：与实际部署物比对——优先仓库 HEAD/describe，其次 sha256:<hash> 形式的二进制指纹。
-    # 两者都读不到 ⇒ unverified（按未通过处理），不做"看起来像 SHA 就算过"的宽松判定。
-    param([string]$Provided)
-    if ([string]::IsNullOrWhiteSpace($Provided)) { return (New-WdCredItem 'g7_deploy_version' 'missing' '未提供 -G7DeployVersion（部署 commit / describe）' $null $null) }
-    $p = $Provided.Trim()
+function Get-WdFileSha256 {
+    # 文件 SHA-256（小写十六进制）。部署二进制身份的唯一可计算依据（B2）。
+    param([string]$Path)
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
+function Get-WdGitAux {
+    # git HEAD / describe 在 B2 之后**只是辅助信息**：它们只能证明"输入值与仓库版本匹配"，
+    # **不能**独立证明"实际运行的 mesad 二进制就是这个版本构建的"（复审阻塞 B2）。
+    # 因此这里只采集、只记录（写进 summary/t0.stamp 供追溯），**绝不参与 G7 通过判定**。
+    param([string]$Root)
+    $aux = [ordered]@{
+        role          = 'auxiliary-only（B2：仅记录，不作为 G7 通过依据）'
+        repo_root     = $Root
+        git_available = $false
+        git_head      = $null
+        git_describe  = $null
+    }
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return $aux }
+    try {
+        $h = (& git -C $Root rev-parse HEAD 2>$null | Select-Object -First 1)
+        if (-not [string]::IsNullOrWhiteSpace($h)) {
+            $aux.git_available = $true
+            $aux.git_head = ([string]$h).Trim()
+            $d = (& git -C $Root describe --tags --always --dirty 2>$null | Select-Object -First 1)
+            if (-not [string]::IsNullOrWhiteSpace($d)) { $aux.git_describe = ([string]$d).Trim() }
+        }
+    }
+    catch { }
+    return $aux
+}
+
+function Resolve-WdDeployBinary {
+    # 定位"实际部署的二进制"。显式 -G7BinaryPath 优先且**不回退**：显式给了却不存在 ⇒ $null
+    # （fail-closed —— 绝不悄悄换成 target/ 下的另一个二进制来凑出"通过"）。
+    # 未显式指定时才按固定顺序探测默认产物路径（并如实记录最终比对的是哪一个文件）。
+    param([string]$Explicit)
+    if (-not [string]::IsNullOrWhiteSpace($Explicit)) {
+        $p = $Explicit.Trim()
+        if (Test-Path -LiteralPath $p -PathType Leaf) { return (Resolve-Path -LiteralPath $p).Path }
+        return $null
+    }
     $root = Get-WdRepoRoot
-    $gitCmd = Get-Command git -ErrorAction SilentlyContinue
-    if ($gitCmd) {
-        $head = $null
-        $desc = $null
-        try { $head = (& git -C $root rev-parse HEAD 2>$null | Select-Object -First 1) } catch { }
-        if (-not [string]::IsNullOrWhiteSpace($head)) {
-            $head = ([string]$head).Trim()
-            try { $desc = (& git -C $root describe --tags --always --dirty 2>$null | Select-Object -First 1) } catch { }
-            $descText = if ($desc) { ([string]$desc).Trim() } else { '' }
-            $actual = [ordered]@{ source = 'git'; head = $head; describe = $descText; repo_root = $root }
-            if ($head -ieq $p) {
-                return (New-WdCredItem 'g7_deploy_version' 'verified' "与仓库 HEAD 一致（$head）" $p $actual)
-            }
-            if ($p.Length -ge 7 -and $head.StartsWith($p, [System.StringComparison]::OrdinalIgnoreCase)) {
-                return (New-WdCredItem 'g7_deploy_version' 'verified' "与仓库 HEAD 前缀一致（$p → $head）" $p $actual)
-            }
-            if ($descText -and $descText -ieq $p) {
-                return (New-WdCredItem 'g7_deploy_version' 'verified' "与 git describe 一致（$descText）" $p $actual)
-            }
-            return (New-WdCredItem 'g7_deploy_version' 'invalid' "提供的版本 $p 与仓库 HEAD($head)/describe($descText) 不一致" $p $actual)
+    foreach ($rel in @('target/release/mesad.exe', 'target/release/mesad', 'target/debug/mesad.exe', 'target/debug/mesad')) {
+        $bin = Join-Path $root $rel
+        if (Test-Path -LiteralPath $bin -PathType Leaf) { return (Resolve-Path -LiteralPath $bin).Path }
+    }
+    return $null
+}
+
+function Read-WdManifestDigest {
+    # 受信构建清单（manifest）：只认**显式摘要字段**，缺字段/格式错一律 ok=false（fail-closed）。
+    # 支持两种形态：
+    #   {"binary": "<相对/绝对路径>", "sha256": "<64 hex>"}                  —— 单产物
+    #   {"artifacts": {"mesad.exe": "<64 hex>", "mesad": "<64 hex>"}}         —— 多产物（按文件名取）
+    param([string]$Path, [string]$BinaryName)
+    $digest = $null
+    $binRel = $null
+    $note = ''
+    try { $doc = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json }
+    catch {
+        return [ordered]@{ ok = $false; sha256 = $null; binary = $null; note = "受信清单不是合法 JSON：$($_.Exception.Message)" }
+    }
+    if ($doc.PSObject.Properties['binary'] -and -not [string]::IsNullOrWhiteSpace([string]$doc.binary)) { $binRel = [string]$doc.binary }
+    if ($doc.PSObject.Properties['sha256'] -and -not [string]::IsNullOrWhiteSpace([string]$doc.sha256)) {
+        $digest = ([string]$doc.sha256).Trim().ToLowerInvariant()
+    }
+    elseif ($doc.PSObject.Properties['artifacts'] -and $doc.artifacts) {
+        $props = @($doc.artifacts.PSObject.Properties)
+        foreach ($pr in $props) {
+            if ($BinaryName -and $pr.Name -eq $BinaryName) { $digest = ([string]$pr.Value).Trim().ToLowerInvariant(); break }
+        }
+        if (-not $digest) {
+            # 未按名命中：清单只有一个产物时允许取它（摘要格式仍需合法）；多产物则必须按名命中。
+            if ($props.Count -eq 1) { $digest = ([string]$props[0].Value).Trim().ToLowerInvariant() }
+            else { $note = "受信清单 artifacts 未包含 $BinaryName（共 $($props.Count) 项）" }
         }
     }
-    if ($p -like 'sha256:*') {
-        $want = ($p -replace '^sha256:', '').ToLowerInvariant()
-        foreach ($rel in @('target/release/mesad', 'target/release/mesad.exe', 'target/debug/mesad', 'target/debug/mesad.exe')) {
-            $bin = Join-Path $root $rel
-            if (-not (Test-Path $bin)) { continue }
-            try {
-                $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $bin).Hash.ToLowerInvariant()
-                $actual = [ordered]@{ source = 'binary-sha256'; binary = $bin; sha256 = $h }
-                if ($h -eq $want) { return (New-WdCredItem 'g7_deploy_version' 'verified' "与部署二进制指纹一致（$rel）" $p $actual) }
-                return (New-WdCredItem 'g7_deploy_version' 'invalid' "提供的 sha256 与 $rel 实际指纹不一致" $p $actual)
-            }
-            catch { }
+    if (-not $digest) {
+        if (-not $note) { $note = '受信清单缺少 sha256 / artifacts 摘要字段' }
+        return [ordered]@{ ok = $false; sha256 = $null; binary = $binRel; note = $note }
+    }
+    if ($digest -notmatch '^[0-9a-f]{64}$') {
+        return [ordered]@{ ok = $false; sha256 = $null; binary = $binRel; note = "受信清单摘要不是 64 位十六进制：$digest" }
+    }
+    return [ordered]@{ ok = $true; sha256 = $digest; binary = $binRel; note = '' }
+}
+
+function Test-WdCredG7 {
+    # G7 部署版本确认（B2 之后）：**只**接受能独立证明"实际部署二进制身份"的两种形式
+    #   ① sha256:<64 hex>   —— 与指定部署二进制（-G7BinaryPath；缺省探测 target/{release,debug}/mesad[.exe]）
+    #                          的**实算**摘要比对；
+    #   ② manifest:<path>   —— 从受信构建清单读取期望摘要，再与部署二进制实算摘要比对。
+    # git HEAD / describe **只作辅助信息**记录，绝不作为通过依据（旧实现拿它当通过依据 = 阻塞 B2）。
+    # 两者都不可用（未给摘要/清单、清单不可读或格式错、定位不到二进制、摘要算不出）
+    #   ⇒ unverified ⇒ 拒绝进入 FIRED（fail-closed），**不得**降级为"用 git HEAD 代替"。
+    param([string]$Provided, [string]$BinaryPath = '')
+    $aux = Get-WdGitAux -Root (Get-WdRepoRoot)
+    if ([string]::IsNullOrWhiteSpace($Provided)) {
+        return (New-WdCredItem 'g7_deploy_version' 'missing' '未提供 -G7DeployVersion（必须 sha256:<64 hex> 或 manifest:<path>；git HEAD/describe 只能作辅助信息，不作为通过依据）' $null $aux)
+    }
+    $p = $Provided.Trim()
+    $want = $null
+    $source = ''
+    $manifestInfo = $null
+    if ($p -match '^(?i)sha256:([0-9a-f]{64})$') {
+        $want = $Matches[1].ToLowerInvariant()
+        $source = 'sha256'
+    }
+    elseif ($p -match '^(?i)manifest:(.+)$') {
+        $source = 'manifest'
+        $mPath = $Matches[1].Trim()
+        if (-not (Test-Path -LiteralPath $mPath -PathType Leaf)) {
+            $actual = [ordered]@{ source = 'manifest'; manifest = [ordered]@{ path = $mPath; ok = $false; note = '读不到' }; git = $aux }
+            return (New-WdCredItem 'g7_deploy_version' 'unverified' "受信清单读不到：$mPath → 无法获得期望摘要（按未通过处理；不用 git HEAD 替代）" $p $actual)
+        }
+        $mPath = (Resolve-Path -LiteralPath $mPath).Path
+        $binName = if (-not [string]::IsNullOrWhiteSpace($BinaryPath)) { Split-Path -Leaf $BinaryPath } else { '' }
+        $manifestInfo = Read-WdManifestDigest -Path $mPath -BinaryName $binName
+        $manifestInfo['path'] = $mPath
+        try { $manifestInfo['sha256_self'] = Get-WdFileSha256 -Path $mPath } catch { $manifestInfo['sha256_self'] = $null }
+        if (-not $manifestInfo.ok) {
+            $actual = [ordered]@{ source = 'manifest'; manifest = $manifestInfo; git = $aux }
+            return (New-WdCredItem 'g7_deploy_version' 'unverified' ("受信清单不可用（{0}）→ 无法获得期望摘要（按未通过处理）" -f $manifestInfo.note) $p $actual)
+        }
+        $want = [string]$manifestInfo.sha256
+        # 清单内声明的 binary（相对清单目录解析）作为部署二进制，除非显式给了 -G7BinaryPath。
+        if ([string]::IsNullOrWhiteSpace($BinaryPath) -and -not [string]::IsNullOrWhiteSpace([string]$manifestInfo.binary)) {
+            $cand = [string]$manifestInfo.binary
+            if (-not [System.IO.Path]::IsPathRooted($cand)) { $cand = Join-Path (Split-Path -Parent $mPath) $cand }
+            $BinaryPath = $cand
         }
     }
-    return (New-WdCredItem 'g7_deploy_version' 'unverified' '无法读取仓库 HEAD（无 git / 非 git 工作树）且未提供 sha256:<hash> 形式可核对的部署二进制指纹 → 无法校验（按未通过处理）' $p $null)
+    else {
+        # 形如 commit SHA / git describe：只能证明"与仓库版本匹配"，不能证明部署物身份 → fail-closed。
+        $actual = [ordered]@{ source = 'rejected-form'; provided = $p; git = $aux }
+        return (New-WdCredItem 'g7_deploy_version' 'unverified' "提供的值 `"$p`" 不是 sha256:<64 hex> / manifest:<path>：git 版本标识不能独立证明部署二进制身份（B2）→ 按未通过处理，不做降级放行" $p $actual)
+    }
+    $binary = Resolve-WdDeployBinary -Explicit $BinaryPath
+    if (-not $binary) {
+        $where = if ([string]::IsNullOrWhiteSpace($BinaryPath)) {
+            '未给 -G7BinaryPath，且 target/{release,debug}/mesad[.exe] 均不存在'
+        }
+        else { "指定的 -G7BinaryPath 不存在：$BinaryPath（显式指定不回退到其它路径）" }
+        $actual = [ordered]@{ source = $source; binary = $null; binary_path_param = $BinaryPath; manifest = $manifestInfo; git = $aux }
+        return (New-WdCredItem 'g7_deploy_version' 'unverified' "无法定位部署二进制（$where）→ 无法实算比对（按未通过处理）" $p $actual)
+    }
+    try { $h = Get-WdFileSha256 -Path $binary }
+    catch {
+        $actual = [ordered]@{ source = $source; binary = $binary; err = $_.Exception.Message; git = $aux }
+        return (New-WdCredItem 'g7_deploy_version' 'unverified' "部署二进制无法计算摘要（$binary）：$($_.Exception.Message)（按未通过处理）" $p $actual)
+    }
+    $actual = [ordered]@{
+        source      = $source
+        binary      = $binary
+        sha256      = $h
+        expected    = $want
+        manifest    = $manifestInfo
+        git         = $aux
+        compared_at = (Get-Date).ToString('o')
+    }
+    if ($h -eq $want) {
+        return (New-WdCredItem 'g7_deploy_version' 'verified' "部署二进制实算摘要与期望一致（source=$source；binary=$binary；sha256=$h）" $p $actual)
+    }
+    return (New-WdCredItem 'g7_deploy_version' 'invalid' "部署二进制实算摘要与期望不一致（source=$source；binary=$binary；实际 $h，期望 $want）" $p $actual)
+}
+
+# ── B3：任务配置的规范化 / 指纹 / 完整点位比对 ────────────────────────────────────
+function ConvertTo-WdCanonicalNode {
+    # 规范化节点（供指纹计算）：对象键**递归排序**，数组保持原序，标量原样。
+    # 目的：同一份配置的不同书写顺序（键顺序）得到同一指纹，同时**不抹平任何值差异**
+    # （值差异必须体现为指纹差异，否则指纹就失去"证明配置未变"的作用）。
+    # 输出与 python `json.dumps(sort_keys=True, separators=(',',':'))` 逐字节一致
+    # （tests/watchdog 用 python 独立实现交叉核对，见 run-watchdog-scenarios.ps1 的指纹用例）。
+    param($Node)
+    if ($null -eq $Node) { return $null }
+    if ($Node -is [string] -or $Node -is [bool] -or $Node -is [int] -or $Node -is [long] -or $Node -is [double] -or $Node -is [decimal]) { return $Node }
+    if ($Node -is [System.Collections.IDictionary]) {
+        $o = [ordered]@{}
+        foreach ($k in (@($Node.Keys) | Sort-Object -Property { [string]$_ })) { $o[[string]$k] = ConvertTo-WdCanonicalNode -Node $Node[$k] }
+        return $o
+    }
+    if ($Node -is [System.Collections.IEnumerable]) {
+        $arr = [System.Collections.Generic.List[object]]::new()
+        foreach ($it in $Node) { $arr.Add((ConvertTo-WdCanonicalNode -Node $it)) }
+        return , ($arr.ToArray())
+    }
+    $o = [ordered]@{}
+    foreach ($p in (@($Node.PSObject.Properties) | Sort-Object -Property Name)) { $o[$p.Name] = ConvertTo-WdCanonicalNode -Node $p.Value }
+    return $o
+}
+
+function Get-WdTasksFingerprint {
+    # 任务配置指纹 = SHA-256(规范化 tasks 数组)，输出 "sha256:<64 hex>"。
+    # 规范化 = 每个 task 键递归排序 + **按 task.id 排序**（任务集合无序、id 唯一；同 id 用规范 JSON
+    # 兜底以保证确定性）+ 紧凑 JSON（UTF-8、无空白）。
+    # 这是 B3 的"批准版本一致性"依据：revision 与 point_count 相同**不足以**证明配置一致。
+    param($Tasks)
+    $items = @()
+    foreach ($t in @($Tasks)) {
+        if ($null -eq $t) { continue }
+        $id = ''
+        if ($t.PSObject.Properties['id']) { $id = [string]$t.id }
+        $canon = ConvertTo-WdCanonicalNode -Node $t
+        $items += [pscustomobject]@{ id = $id; canon = $canon; json = (ConvertTo-Json -InputObject $canon -Compress -Depth 100) }
+    }
+    $sorted = @($items | Sort-Object -Property id, json)
+    $payload = ConvertTo-Json -InputObject @($sorted | ForEach-Object { $_.canon }) -Compress -Depth 100
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+    $hex = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    return [ordered]@{ fingerprint = "sha256:$hex"; payload = $payload; count = $sorted.Count }
+}
+
+function Read-WdApprovedTaskConfig {
+    # 读"获批任务配置"（**本地文件，不涉及网络**）。缺字段/格式错 ⇒ ok=false（fail-closed）。
+    # 文件形态（tests/watchdog 的桩与场景驱动共用同一份，字段名与真实 schema 对齐）：
+    #   {
+    #     "schema": "mesa.stop-watchdog.approved-task-config.v1",
+    #     "endpoint_id": "...", "revision": "rev13",
+    #     "connection": {"host","port","local_tsap","remote_tsap","pdu_length"},
+    #     "tasks": [ {"id","schedule","binding":{"kind","config":{"points":[...]}}} ]
+    #   }
+    param([string]$Path)
+    $r = [ordered]@{ ok = $false; note = ''; path = $Path; schema = $null; endpoint_id = $null; revision = $null; connection = $null; tasks = $null; tasks_fingerprint = $null; tasks_payload = $null }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { $r.note = "获批任务配置读不到：$Path"; return $r }
+    $r.path = (Resolve-Path -LiteralPath $Path).Path
+    try { $doc = Get-Content -LiteralPath $r.path -Raw | ConvertFrom-Json }
+    catch { $r.note = "获批任务配置不是合法 JSON：$($_.Exception.Message)"; return $r }
+    if ($doc.PSObject.Properties['schema']) { $r.schema = [string]$doc.schema }
+    if ($doc.PSObject.Properties['endpoint_id']) { $r.endpoint_id = [string]$doc.endpoint_id }
+    if ($doc.PSObject.Properties['revision']) { $r.revision = [string]$doc.revision }
+    if ($doc.PSObject.Properties['connection']) { $r.connection = $doc.connection }
+    if ($doc.PSObject.Properties['tasks']) { $r.tasks = @($doc.tasks) }
+    if ($null -eq $r.connection) { $r.note = '获批任务配置缺少 connection（host / port / local_tsap / remote_tsap / pdu_length）'; return $r }
+    if ($null -eq $r.tasks) { $r.note = '获批任务配置缺少 tasks 数组（完整点位 Key 与参数）'; return $r }
+    $fp = Get-WdTasksFingerprint -Tasks $r.tasks
+    $r.tasks_fingerprint = $fp.fingerprint
+    $r.tasks_payload = $fp.payload
+    $r.ok = $true
+    return $r
+}
+
+function Compare-WdConnectionConfig {
+    # 比对连接配置（B3）：host / port / TSAP（local_tsap + remote_tsap）/ PDU（pdu_length）。
+    # 字段名与 sinumerik-nck 的 connection schema 一致（drivers/sinumerik-nck/src/config.rs:26-41）。
+    param($Expected, $Actual)
+    $fields = @(
+        @{ name = 'host'; kind = 'string' },
+        @{ name = 'port'; kind = 'int' },
+        @{ name = 'local_tsap'; kind = 'int' },
+        @{ name = 'remote_tsap'; kind = 'int' },
+        @{ name = 'pdu_length'; kind = 'int' }
+    )
+    $problems = @()
+    $exp = [ordered]@{}
+    $act = [ordered]@{}
+    foreach ($f in $fields) {
+        $n = $f.name
+        $ev = $null
+        $av = $null
+        if ($Expected -and $Expected.PSObject.Properties[$n]) { $ev = $Expected.$n }
+        if ($Actual -and $Actual.PSObject.Properties[$n]) { $av = $Actual.$n }
+        if ($f.kind -eq 'int') {
+            $ei = if ($null -ne $ev -and "$ev" -match '^-?\d+$') { [long]$ev } else { $null }
+            $ai = if ($null -ne $av -and "$av" -match '^-?\d+$') { [long]$av } else { $null }
+            $exp[$n] = $ei
+            $act[$n] = $ai
+            if ($null -eq $ai) { $problems += "连接配置 $n 读不到（端点未返回该字段）" }
+            elseif ($null -eq $ei) { $problems += "连接配置 $n 在获批配置里缺失或非整数（$ev）" }
+            elseif ($ei -ne $ai) { $problems += "连接配置 $n 不一致（期望 $ei，实际 $ai）" }
+        }
+        else {
+            $es = if ($null -ne $ev) { ([string]$ev).Trim() } else { $null }
+            $as = if ($null -ne $av) { ([string]$av).Trim() } else { $null }
+            $exp[$n] = $es
+            $act[$n] = $as
+            if ([string]::IsNullOrEmpty($as)) { $problems += "连接配置 $n 读不到（端点未返回该字段）" }
+            elseif ([string]::IsNullOrEmpty($es)) { $problems += "连接配置 $n 在获批配置里缺失" }
+            elseif ($es -ine $as) { $problems += "连接配置 $n 不一致（期望 $es，实际 $as）" }
+        }
+    }
+    return [ordered]@{ problems = @($problems); expected = $exp; actual = $act }
+}
+
+function Get-WdPointKeyMap {
+    # 从 tasks 提取"点位 Key → 该点位的规范化完整参数（紧凑 JSON）"映射
+    # （B3：核**完整 Key 与参数**，不只数量）。
+    # 规则：tasks[].binding.config.points[] 的每个元素是一个点位
+    # （mesa_core_types::PointSelection：point_key / kind / parameters，见 crates/core-types/src/point.rs:100-120）；
+    # Key 取 point_key，兼容 key / name / id。参数取该元素**整体**（比"只比 parameters"更严格）。
+    # 映射键写成 "<task id>/<point key>"：跨任务同名 Key 本身就是配置错误，按任务分组更易定位。
+    param($Tasks)
+    $map = [ordered]@{}
+    foreach ($t in @($Tasks)) {
+        if ($null -eq $t) { continue }
+        $tid = ''
+        if ($t.PSObject.Properties['id']) { $tid = [string]$t.id }
+        $points = $null
+        if ($t.PSObject.Properties['binding'] -and $null -ne $t.binding -and
+            $t.binding.PSObject.Properties['config'] -and $null -ne $t.binding.config -and
+            $t.binding.config.PSObject.Properties['points']) {
+            $points = @($t.binding.config.points)
+        }
+        if ($null -eq $points) { continue }
+        foreach ($p in $points) {
+            if ($null -eq $p) { continue }
+            $k = $null
+            foreach ($cand in @('point_key', 'key', 'name', 'id')) {
+                if ($p.PSObject.Properties[$cand] -and -not [string]::IsNullOrWhiteSpace([string]$p.$cand)) { $k = [string]$p.$cand; break }
+            }
+            if (-not $k) { continue }
+            $canon = ConvertTo-WdCanonicalNode -Node $p
+            $map["$tid/$k"] = (ConvertTo-Json -InputObject $canon -Compress -Depth 100)
+        }
+    }
+    return $map
+}
+
+function Get-WdTaskSnapshot {
+    # 只读任务快照：优先 Core 的真实形态 `GET /api/v1/tasks?endpoint=<id>`
+    # （crates/core-api/src/lib.rs:2317-2337 → {endpoint_id, revision, tasks}）；
+    # 404/405 时回退到 `GET /api/v1/tasks/<id>`（旧桩形态，保持兼容）。
+    # 返回 @{ status; revision; tasks; source; uri; http }；调用方据 status 判 unverified。
+    param($Ctx, [string]$Endpoint)
+    $base = $Ctx.baseUrl
+    $out = [ordered]@{ status = 0; revision = $null; tasks = $null; source = ''; uri = ''; http = [ordered]@{} }
+    $queryUri = "$base/api/v1/tasks?endpoint=$Endpoint"
+    $pathUri = "$base/api/v1/tasks/$Endpoint"
+    $script:credNetworkActions++
+    $r = Invoke-WebRequest -Uri $queryUri -Method Get -TimeoutSec ([int]$Ctx.observeTimeoutSec) -SkipHttpErrorCheck -ErrorAction Stop
+    $out.http['query'] = [int]$r.StatusCode
+    if ([int]$r.StatusCode -eq 200) {
+        $out.uri = $queryUri; $out.source = 'query'; $out.status = 200
+        $o = [string]$r.Content | ConvertFrom-Json
+        if ($null -ne $o.revision) { $out.revision = [string]$o.revision }
+        if ($null -ne $o.tasks) { $out.tasks = @($o.tasks) }
+        return $out
+    }
+    if ([int]$r.StatusCode -in @(404, 405)) {
+        $script:credNetworkActions++
+        $r2 = Invoke-WebRequest -Uri $pathUri -Method Get -TimeoutSec ([int]$Ctx.observeTimeoutSec) -SkipHttpErrorCheck -ErrorAction Stop
+        $out.http['path'] = [int]$r2.StatusCode
+        $out.uri = $pathUri; $out.source = 'path'; $out.status = [int]$r2.StatusCode
+        if ([int]$r2.StatusCode -eq 200) {
+            $o2 = [string]$r2.Content | ConvertFrom-Json
+            if ($null -ne $o2.revision) { $out.revision = [string]$o2.revision }
+            if ($null -ne $o2.tasks) { $out.tasks = @($o2.tasks) }
+        }
+        return $out
+    }
+    $out.uri = $queryUri; $out.source = 'query'; $out.status = [int]$r.StatusCode
+    return $out
 }
 
 function Test-WdCredTaskConfig {
-    # 任务配置核验：**先做只读 GET**，把 endpoint 存在性 / 任务 revision / 点位数与实际值比对。
-    # 任一项读不到 ⇒ unverified；读到但不一致 ⇒ invalid。两者都不得进入 FIRED。
-    param($Ctx, [string]$ExpectedEndpoint, [string]$ExpectedRevision, [int]$ExpectedPoints)
-    $expected = [ordered]@{ endpoint_id = $ExpectedEndpoint; revision = $ExpectedRevision; point_count = $ExpectedPoints }
+    # 任务配置核验（B3 之后：核对**完整配置**，不再只比 revision / point_count）：
+    #   ① revision 与 point_count（原有）
+    #   ② 连接配置 host / port / TSAP(local_tsap + remote_tsap) / PDU(pdu_length)
+    #   ③ 获批点位的**完整 Key 与参数**（tasks[].binding.config.points[]，逐点比对，不只数量）
+    #   ④ 任务配置**指纹**（规范化 tasks 数组的 SHA-256）与批准版本一致
+    # 任一项读不到 ⇒ unverified；读到但不一致 ⇒ invalid。两者都不得进入 FIRED（不发 Start）。
+    param($Ctx, [string]$ExpectedEndpoint, [string]$ExpectedRevision, [int]$ExpectedPoints,
+        [string]$ApprovedPath, [string]$ExpectedFingerprint)
+    $expected = [ordered]@{
+        endpoint_id          = $ExpectedEndpoint
+        revision             = $ExpectedRevision
+        point_count          = $ExpectedPoints
+        approved_task_config = $ApprovedPath
+        tasks_fingerprint    = $ExpectedFingerprint
+    }
+    # ── 输入完整性：缺任一项都不得放行（B3 的期望值不是"可选项"）──────────────────
     if ([string]::IsNullOrWhiteSpace($ExpectedRevision)) {
         return (New-WdCredItem 'task_config' 'missing' '未提供 -ExpectedTaskRevision（期望的任务 revision）' $expected $null)
     }
     if ($ExpectedPoints -lt 0) {
         return (New-WdCredItem 'task_config' 'missing' '未提供 -ExpectedPointCount（期望的点位数量）' $expected $null)
     }
+    if ([string]::IsNullOrWhiteSpace($ApprovedPath)) {
+        return (New-WdCredItem 'task_config' 'missing' '未提供 -ApprovedTaskConfig（获批任务配置：连接配置 + 完整点位 Key/参数）——只比 revision/点数不足以证明与获批配置一致' $expected $null)
+    }
+    if ([string]::IsNullOrWhiteSpace($ExpectedFingerprint)) {
+        return (New-WdCredItem 'task_config' 'missing' '未提供 -ExpectedTaskFingerprint（批准版本的任务配置指纹 sha256:<64 hex>）' $expected $null)
+    }
+    if ($ExpectedFingerprint -notmatch '^(?i)sha256:[0-9a-f]{64}$') {
+        return (New-WdCredItem 'task_config' 'invalid' "ExpectedTaskFingerprint 格式非法：$ExpectedFingerprint（应形如 sha256:<64 hex>）" $expected $null)
+    }
+    $wantFp = ($ExpectedFingerprint -replace '^(?i)sha256:', '').ToLowerInvariant()
+
+    # ── ① 本地：获批配置必须自证是"批准版本"（不涉及网络）──────────────────────
+    $approved = Read-WdApprovedTaskConfig -Path $ApprovedPath
+    if (-not $approved.ok) {
+        return (New-WdCredItem 'task_config' 'unverified' ("获批任务配置不可用（{0}）→ 无法核验任务配置（按未通过处理）" -f $approved.note) $expected ([ordered]@{ approved = $approved }))
+    }
+    $approvedFp = [string]$approved.tasks_fingerprint
+    if ($approvedFp -ne "sha256:$wantFp") {
+        $actual0 = [ordered]@{ approved = $approved; approved_fingerprint = $approvedFp; expected_fingerprint = "sha256:$wantFp"; http = [ordered]@{} }
+        return (New-WdCredItem 'task_config' 'invalid' ("获批任务配置文件的指纹（{0}）与 -ExpectedTaskFingerprint（sha256:{1}）不一致：该文件不是获批版本（或已被改动）→ 拒绝" -f $approvedFp, $wantFp) $expected $actual0)
+    }
+
+    # ── ② 网络：三条**配置面**只读 GET ───────────────────────────────────────────
+    # diagnostics（endpoint_id + point_count）、tasks（revision + 完整点位/参数）、
+    # endpoints/{id}（connection：host/port/TSAP/PDU —— B3 必需；Core 只在这条路径暴露连接配置）。
     $base = $Ctx.baseUrl
     $diagUri = "$base/api/v1/endpoints/$ExpectedEndpoint/diagnostics"
-    $tasksUri = "$base/api/v1/tasks/$ExpectedEndpoint"
-    $actual = [ordered]@{ endpoint_id = $null; revision = $null; point_count = $null; http = [ordered]@{} }
+    $epUri = "$base/api/v1/endpoints/$ExpectedEndpoint"
+    $actual = [ordered]@{
+        endpoint_id          = $null
+        revision             = $null
+        point_count          = $null
+        connection           = $null
+        tasks_fingerprint    = $null
+        approved_fingerprint = $approvedFp
+        point_keys           = [ordered]@{}
+        tasks_source         = ''
+        tasks_payload        = $null
+        http                 = [ordered]@{}
+    }
     $script:credNetworkActions = 0
-    # 只用两条**配置面**的只读 GET：diagnostics（含 endpoint_id + point_count）与 tasks（含 revision）。
-    # 刻意**不读**端点运行快照 `/api/v1/endpoints/{id}`：那条路径正是 OBS 观测通道，
-    # 万一 Core 在这条路径上卡住（M8 的故障形态），不该让"凭证核验"跟着一起卡死。
     try {
         $script:credNetworkActions++
-        $r2 = Invoke-WebRequest -Uri $diagUri -Method Get -TimeoutSec ([int]$Ctx.observeTimeoutSec) -SkipHttpErrorCheck -ErrorAction Stop
-        $actual.http['diagnostics'] = [int]$r2.StatusCode
-        if ([int]$r2.StatusCode -ne 200) {
-            return (New-WdCredItem 'task_config' 'unverified' "diagnostics 读不到（GET $diagUri → HTTP $($r2.StatusCode)），无法核验任务配置（按未通过处理）" $expected $actual)
+        $r1 = Invoke-WebRequest -Uri $diagUri -Method Get -TimeoutSec ([int]$Ctx.observeTimeoutSec) -SkipHttpErrorCheck -ErrorAction Stop
+        $actual.http['diagnostics'] = [int]$r1.StatusCode
+        if ([int]$r1.StatusCode -ne 200) {
+            return (New-WdCredItem 'task_config' 'unverified' "diagnostics 读不到（GET $diagUri → HTTP $($r1.StatusCode)），无法核验任务配置（按未通过处理）" $expected $actual)
         }
-        $o2 = [string]$r2.Content | ConvertFrom-Json
-        if ($o2.PSObject.Properties['endpoint_id']) { $actual.endpoint_id = [string]$o2.endpoint_id }
-        if ($null -ne $o2.point_count) { $actual.point_count = [int]$o2.point_count }
+        $o1 = [string]$r1.Content | ConvertFrom-Json
+        if ($o1.PSObject.Properties['endpoint_id']) { $actual.endpoint_id = [string]$o1.endpoint_id }
+        if ($null -ne $o1.point_count) { $actual.point_count = [int]$o1.point_count }
+
+        $snap = Get-WdTaskSnapshot -Ctx $Ctx -Endpoint $ExpectedEndpoint
+        $actual.http['tasks'] = [int]$snap.status
+        $actual.tasks_source = [string]$snap.source
+        if ([int]$snap.status -ne 200) {
+            return (New-WdCredItem 'task_config' 'unverified' ("任务快照读不到（GET {0} → HTTP {1}），无法核验 revision / 点位 / 指纹（按未通过处理）" -f $snap.uri, $snap.status) $expected $actual)
+        }
+        if ($null -ne $snap.revision) { $actual.revision = [string]$snap.revision }
+        if ($null -ne $snap.tasks) {
+            $fp = Get-WdTasksFingerprint -Tasks $snap.tasks
+            $actual.tasks_fingerprint = $fp.fingerprint
+            $actual.tasks_payload = $fp.payload
+            $actual.point_keys = Get-WdPointKeyMap -Tasks $snap.tasks
+        }
+
         $script:credNetworkActions++
-        $r3 = Invoke-WebRequest -Uri $tasksUri -Method Get -TimeoutSec ([int]$Ctx.observeTimeoutSec) -SkipHttpErrorCheck -ErrorAction Stop
-        $actual.http['tasks'] = [int]$r3.StatusCode
+        $r3 = Invoke-WebRequest -Uri $epUri -Method Get -TimeoutSec ([int]$Ctx.observeTimeoutSec) -SkipHttpErrorCheck -ErrorAction Stop
+        $actual.http['endpoint'] = [int]$r3.StatusCode
         if ([int]$r3.StatusCode -eq 200) {
             $o3 = [string]$r3.Content | ConvertFrom-Json
-            if ($null -ne $o3.revision) { $actual.revision = [string]$o3.revision }
+            if ($o3.PSObject.Properties['connection'] -and $null -ne $o3.connection) { $actual.connection = $o3.connection }
         }
     }
     catch {
         return (New-WdCredItem 'task_config' 'unverified' "任务配置核验的只读 GET 失败：$($_.Exception.Message)（按未通过处理）" $expected $actual)
     }
+
     $problems = @()
+    # ② 基础项（原有）
     if (-not $actual.endpoint_id) { $problems += 'diagnostics 未返回 endpoint id' }
     elseif ($actual.endpoint_id -ne $ExpectedEndpoint) { $problems += "endpoint id 不一致（期望 $ExpectedEndpoint，实际 $($actual.endpoint_id)）" }
-    if ($null -eq $actual.revision) { $problems += "任务 revision 读不到（GET $tasksUri → HTTP $($actual.http['tasks'])）" }
+    if ($null -eq $actual.revision) { $problems += '任务 revision 读不到' }
     elseif ($actual.revision -ne [string]$ExpectedRevision) { $problems += "任务 revision 不一致（期望 $ExpectedRevision，实际 $($actual.revision)）" }
-    if ($null -eq $actual.point_count) { $problems += "point_count 读不到（GET $diagUri → HTTP $($actual.http['diagnostics'])）" }
+    if ($null -eq $actual.point_count) { $problems += 'point_count 读不到' }
     elseif ($actual.point_count -ne $ExpectedPoints) { $problems += "point_count 不一致（期望 $ExpectedPoints，实际 $($actual.point_count)）" }
+    # 获批文件自身也必须自洽（防止拿错端点/版本的批准文件）
+    if ($approved.endpoint_id -and $approved.endpoint_id -ne $ExpectedEndpoint) {
+        $problems += "获批配置的 endpoint_id 不一致（期望 $ExpectedEndpoint，获批文件 $($approved.endpoint_id)）"
+    }
+    if ($approved.revision -and $approved.revision -ne [string]$ExpectedRevision) {
+        $problems += "获批配置的 revision 不一致（期望 $ExpectedRevision，获批文件 $($approved.revision)）"
+    }
+    # ③ 连接配置（host / port / TSAP / PDU）
+    if ($null -eq $actual.connection) {
+        $problems += "端点未返回 connection（GET $epUri → HTTP $($actual.http['endpoint'])）：无法核对 host/port/TSAP/PDU"
+    }
+    $connCmp = Compare-WdConnectionConfig -Expected $approved.connection -Actual $actual.connection
+    foreach ($p in $connCmp.problems) { $problems += $p }
+    # ④ 点位完整 Key 与参数（逐点比对，不只数量）
+    $expPoints = Get-WdPointKeyMap -Tasks $approved.tasks
+    $actPoints = $actual.point_keys
+    # 获批配置里的**点位总数**必须等于 -ExpectedPointCount（tasks 条数 ≠ 点位数：一个 task 可含多点）。
+    if ($expPoints.Count -ne $ExpectedPoints) {
+        $problems += "获批配置的点位总数与 -ExpectedPointCount 不一致（获批 $($expPoints.Count) 个 / 期望 $ExpectedPoints 个）"
+    }
+    foreach ($k in $expPoints.Keys) {
+        if (-not $actPoints.Contains($k)) { $problems += "获批点位缺失：$k（实际配置里没有这个 Key）" }
+        elseif ($expPoints[$k] -ne $actPoints[$k]) { $problems += "点位参数不一致：$k（获批 $($expPoints[$k])；实际 $($actPoints[$k])）" }
+    }
+    foreach ($k in $actPoints.Keys) {
+        if (-not $expPoints.Contains($k)) { $problems += "实际配置多出点位：$k（获批配置里没有）" }
+    }
+    if ($expPoints.Count -eq 0 -and $approved.tasks.Count -gt 0) {
+        $problems += '获批配置的 tasks 里没有可识别的点位（binding.config.points[]）→ 无法证明点位 Key/参数一致'
+    }
+    # ⑤ 任务配置指纹
+    if ($null -eq $actual.tasks_fingerprint) { $problems += '任务配置指纹算不出来（任务快照无 tasks 数组）' }
+    elseif ($actual.tasks_fingerprint -ne "sha256:$wantFp") {
+        $problems += "任务配置指纹不一致（期望 sha256:$wantFp，实际 $($actual.tasks_fingerprint)）"
+    }
     if ($problems.Count -gt 0) {
         # 读不到（缺值）算 unverified；读到但不一致算 invalid —— 两者都不放行。
-        $unreadable = @($problems | Where-Object { $_ -match '读不到|未返回' })
+        $unreadable = @($problems | Where-Object { $_ -match '读不到|未返回|算不出' })
         $state = if ($unreadable.Count -gt 0) { 'unverified' } else { 'invalid' }
-        return (New-WdCredItem 'task_config' $state ("任务配置核验不通过：" + ($problems -join '；')) $expected $actual)
+        return (New-WdCredItem 'task_config' $state ("任务配置核验不通过（完整配置核对）：" + ($problems -join '；')) $expected $actual)
     }
-    return (New-WdCredItem 'task_config' 'verified' "endpoint=$ExpectedEndpoint；revision=$($actual.revision)；point_count=$($actual.point_count)（与期望一致）" $expected $actual)
+    $okDetail = ("完整任务配置一致：endpoint={0}；revision={1}；point_count={2}；点位 {3} 个（Key 与参数逐点一致）；连接 {4}:{5} TSAP={6}/{7} PDU={8}；指纹 {9}" -f `
+            $ExpectedEndpoint, $actual.revision, $actual.point_count, $expPoints.Count,
+        $connCmp.actual.host, $connCmp.actual.port, $connCmp.actual.local_tsap, $connCmp.actual.remote_tsap,
+        $connCmp.actual.pdu_length, $actual.tasks_fingerprint)
+    return (New-WdCredItem 'task_config' 'verified' $okDetail $expected $actual)
 }
 
 function Test-WdCredentials {
@@ -687,12 +1220,12 @@ function Test-WdCredentials {
         $items['authz_ticket'] = New-WdCredItem 'authz_ticket' 'verified' "授权凭证编号=$AuthzTicket" $AuthzTicket $null
     }
     $items['g6_signoff'] = Test-WdCredG6 -Signoff $G6Signoff -SignedAt $G6SignedAt
-    $items['g7_deploy_version'] = Test-WdCredG7 -Provided $G7DeployVersion
+    $items['g7_deploy_version'] = Test-WdCredG7 -Provided $G7DeployVersion -BinaryPath $G7BinaryPath
     if ($CheckNetwork) {
-        $items['task_config'] = Test-WdCredTaskConfig -Ctx $ctx -ExpectedEndpoint $EndpointId -ExpectedRevision $ExpectedTaskRevision -ExpectedPoints $ExpectedPointCount
+        $items['task_config'] = Test-WdCredTaskConfig -Ctx $ctx -ExpectedEndpoint $EndpointId -ExpectedRevision $ExpectedTaskRevision -ExpectedPoints $ExpectedPointCount -ApprovedPath $ApprovedTaskConfig -ExpectedFingerprint $ExpectedTaskFingerprint
     }
     else {
-        $items['task_config'] = New-WdCredItem 'task_config' 'not_checked' '静态校验阶段未做任务配置核验（需先通过授权边界后才发起只读 GET）' ([ordered]@{ endpoint_id = $EndpointId; revision = $ExpectedTaskRevision; point_count = $ExpectedPointCount }) $null
+        $items['task_config'] = New-WdCredItem 'task_config' 'not_checked' '静态校验阶段未做任务配置核验（需先通过授权边界后才发起只读 GET）' ([ordered]@{ endpoint_id = $EndpointId; revision = $ExpectedTaskRevision; point_count = $ExpectedPointCount; approved_task_config = $ApprovedTaskConfig; tasks_fingerprint = $ExpectedTaskFingerprint }) $null
     }
     # not_checked 是"静态阶段还没做"的占位（任务配置核验需要只读 GET），不算失败项。
     $failing = @($items.Keys | Where-Object { $items[$_].state -notin @('verified', 'not_checked') })
@@ -899,7 +1432,7 @@ $boundary.decided_by = 'fire：静态凭证校验通过'
 $boundary.reason = "fire 凭证已校验通过 → 放行 $($urlInfo.host):$($urlInfo.port)"
 Add-WdLog $ctx 'INFO' "授权边界放行：$($boundary.reason)"
 
-$taskCred = Test-WdCredTaskConfig -Ctx $ctx -ExpectedEndpoint $EndpointId -ExpectedRevision $ExpectedTaskRevision -ExpectedPoints $ExpectedPointCount
+$taskCred = Test-WdCredTaskConfig -Ctx $ctx -ExpectedEndpoint $EndpointId -ExpectedRevision $ExpectedTaskRevision -ExpectedPoints $ExpectedPointCount -ApprovedPath $ApprovedTaskConfig -ExpectedFingerprint $ExpectedTaskFingerprint
 $creds.items['task_config'] = $taskCred
 $creds.failing = @($creds.items.Keys | Where-Object { $creds.items[$_].state -ne 'verified' })
 $creds.overall = if ($creds.failing.Count -eq 0) { 'verified' } else { 'rejected' }
@@ -1463,8 +1996,12 @@ $stamp = [ordered]@{
         g6_signoff   = $G6Signoff
         g6_signed_at = $G6SignedAt
         g7_deploy_version = $G7DeployVersion
+        g7_binary_path    = $G7BinaryPath
         expected_revision = $ExpectedTaskRevision
         expected_points   = $ExpectedPointCount
+        approved_task_config = $ApprovedTaskConfig
+        expected_tasks_fingerprint = $ExpectedTaskFingerprint
+        injection_guard   = $injectionGuard
         items        = $creds.items
     }
 }
@@ -2071,8 +2608,11 @@ $summary = [ordered]@{
         g6_signoff        = $G6Signoff
         g6_signed_at      = $G6SignedAt
         g7_deploy_version = $G7DeployVersion
+        g7_binary_path    = $G7BinaryPath
         expected_revision = $ExpectedTaskRevision
         expected_points   = $ExpectedPointCount
+        approved_task_config = $ApprovedTaskConfig
+        expected_tasks_fingerprint = $ExpectedTaskFingerprint
         task_config_ref   = $TaskConfigRef
         failing           = @($creds.failing)
         items             = $creds.items
@@ -2165,6 +2705,8 @@ $summary = [ordered]@{
         host_probe_error = $TestHostProbeError
         abort_flow       = $TestAbortFlow
         abort_after_sec  = $(if ($TestAbortFlow) { $TestAbortAfterSec } else { $null })
+        # B1：注入参数是否被离线边界守卫放行（正常执行时 active=false）
+        injection_guard  = $injectionGuard
     }
     trial                = $trial
     verdict              = $verdict

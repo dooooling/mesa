@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  stop-watchdog 离线场景驱动（M0–M12）—— 一条命令跑完全部离线故障模拟并给出断言汇总。
+  stop-watchdog 离线场景驱动（M0–M16）—— 一条命令跑完全部离线故障模拟并给出断言汇总。
 
 .DESCRIPTION
   每个场景：起本地假端点桩（stub_endpoint.py）→ 以独立 pwsh 进程跑 scripts/stop-watchdog.ps1
@@ -24,9 +24,23 @@
     M10 watchdog 工作线程异常退出（不静默继续，MON 接管截止调度）
     M11 授权门正向：四项凭证齐全且校验通过 ⇒ 放行并正常执行
     M12 授权门负向：缺一项凭证 / 任务配置与只读 GET 不一致 ⇒ exit 40 且不发 Start
+    M13 测试注入参数的离线边界（B1 负向）：非回环地址 / 生产端口 8132 + 注入参数
+        ⇒ exit 40、网络动作数 = 0、假端点未收到任何请求（更不会有 Start/Stop）
+    M14 G7 部署身份不可验证（B2 fail-closed）：只给 git 版本标识 / 二进制缺失 / 清单缺失或
+        摘要不符 ⇒ 一律 exit 40 且不进入 FIRED（**不得**用 git HEAD 降级通过）
+    M15 完整任务配置不匹配（B3 负向）：连接配置（PDU）/ 点位参数 / 配置指纹任一不一致
+        ⇒ exit 40 且不发 Start
+    M16 完整任务配置匹配（B3 正向）：连接配置 + 全部点位 Key/参数 + 指纹全部一致 ⇒ 放行并正常执行
+
+  关于 G7：本驱动**不再**用 git HEAD 充当 G7 凭证（那只能证明"与仓库版本匹配"，不能证明部署物
+  身份）。它离线构造两份 fixture 并交给被测脚本实算比对：
+    · `_fixtures/mesad-fixture.bin`：固定内容的"部署二进制"（不启动 mesad）；
+    · `_fixtures/mesad-build-manifest.json`：受信构建清单（含该文件的 sha256）。
+  获批任务配置（`_fixtures/approved-task-config.json`）与桩共用同一份 tasks 定义
+  （`_fixtures/tasks.json`），指纹由 python 侧**独立实现**算出，与 PowerShell 侧互为交叉核对。
 
 .PARAMETER Scenario
-  只跑指定场景，例如 -Scenario M7,M12。缺省 = M0–M12 全部。
+  只跑指定场景，例如 -Scenario M7,M13。缺省 = M0–M16 全部。
 
 .PARAMETER EvidenceRoot
   证据根目录，缺省 target/validation/stop-watchdog（已被 .gitignore 忽略）。
@@ -37,6 +51,10 @@
 .PARAMETER PythonExe
   指定 python 解释器（缺省自动探测 python3 / python / $env:PYTHON）。
 
+.PARAMETER DeployBinaryPath
+  指定"部署二进制"（G7 实算比对目标）。缺省用本轮生成的 `_fixtures/mesad-fixture.bin`。
+  指向真实 `target/release/mesad` 时同样可用（仍不会启动它）。
+
 .PARAMETER List
   只列出场景，不执行。
 
@@ -44,12 +62,10 @@
   pwsh -NoProfile -File tests/watchdog/run-watchdog-scenarios.ps1
 
 .EXAMPLE
-  pwsh -NoProfile -File tests/watchdog/run-watchdog-scenarios.ps1 -Scenario M7,M11,M12
+  pwsh -NoProfile -File tests/watchdog/run-watchdog-scenarios.ps1 -Scenario M7,M11,M13,M14,M15,M16
 
 .NOTES
   Windows / Linux 均可运行（pwsh 7+ 与 python3）。CI 用法见 README.md。
-  G7 部署版本凭证由驱动**现场计算**（git rev-parse HEAD；无 git 时退回目标二进制 sha256），
-  所以脚本里的 G7 校验是真比对，而不是"随便填个值就过"。
 #>
 [CmdletBinding()]
 param(
@@ -57,6 +73,7 @@ param(
     [string]$EvidenceRoot,
     [switch]$KeepEvidence,
     [string]$PythonExe,
+    [string]$DeployBinaryPath,
     [switch]$List,
     [int]$StubReadyTimeoutSec = 20
 )
@@ -73,28 +90,16 @@ $endpoint = 'lx-nck-tags-190-connection'
 # 任务配置核验的期望值（与桩的默认 --task-revision / --point-count 对齐）
 $expectedRevision = 'rev13'
 $expectedPoints = 12
+$expectedTaskCount = 3
+$pointsPerTask = 4
 
-# ── 凭证取值：G7 必须与**真实**仓库 HEAD（或部署二进制指纹）一致，否则脚本会正确拒绝 ──
-$g7Value = $null
-try {
-    # 注意：&(...) 是子作用域，$LASTEXITCODE 不会回传，这里直接校验取值形态（7–40 位十六进制）。
-    $h = (& git -C $repo rev-parse HEAD 2>$null | Select-Object -First 1)
-    if (-not [string]::IsNullOrWhiteSpace($h) -and (([string]$h).Trim() -match '^[0-9a-fA-F]{7,40}$')) { $g7Value = ([string]$h).Trim() }
-}
-catch { }
-if (-not $g7Value) {
-    foreach ($rel in @('target/release/mesad', 'target/release/mesad.exe', 'target/debug/mesad', 'target/debug/mesad.exe')) {
-        $bin = Join-Path $repo $rel
-        if (Test-Path $bin) {
-            $g7Value = 'sha256:' + (Get-FileHash -Algorithm SHA256 -LiteralPath $bin).Hash.ToLowerInvariant()
-            break
-        }
-    }
-}
-if (-not $g7Value) {
-    Write-Host '[warn] 既读不到 git HEAD 也找不到部署二进制：G7 校验将无法通过，fire 场景会被脚本以 40 拒绝' -ForegroundColor Yellow
-    $g7Value = 'UNVERIFIED'
-}
+# 连接配置期望值（B3：host / port / TSAP / PDU）。桩按同一组参数暴露，获批配置按同一组参数声明。
+$conn = [ordered]@{ host = '127.0.0.1'; port = 18099; local_tsap = 256; remote_tsap = 256; pdu_length = 240 }
+$connStubCfg = @('--device-host', $conn.host, '--device-port', [string]$conn.port,
+    '--local-tsap', [string]$conn.local_tsap, '--remote-tsap', [string]$conn.remote_tsap,
+    '--pdu-length', [string]$conn.pdu_length)
+
+# G6 签署时间（可解析且不在未来）
 $g6SignedAt = (Get-Date).AddMinutes(-15).ToString('o')
 
 # 用"当前正在运行的 pwsh"跑被测脚本，保证子进程与本驱动同一版本、同一平台。
@@ -109,7 +114,8 @@ if (-not $pwshExe) {
 }
 
 # ── 场景定义：stub = 假端点桩参数；wd = watchdog 额外参数；mode = arm/fire ────────
-$commonStubCfg = @('--task-revision', $expectedRevision, '--point-count', [string]$expectedPoints)
+$commonStubCfg = @('--task-revision', $expectedRevision, '--point-count', [string]$expectedPoints,
+    '--task-count', [string]$expectedTaskCount, '--points-per-task', [string]$pointsPerTask) + $connStubCfg
 $SCEN = [ordered]@{
     M0  = @{ title = '正常路径'; stub = @('--port', '18080') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18080 }
     M1  = @{ title = '观测阻塞 36s'; stub = @('--port', '18081', '--get-delay-running', '36') + $commonStubCfg; wd = @('-ObserveTimeoutSec', '45', '-ObserveStallSec', '0'); mode = 'fire'; port = 18081 }
@@ -119,11 +125,26 @@ $SCEN = [ordered]@{
     M5  = @{ title = '迟到 Start 竞态'; stub = @('--port', '18085', '--race-after-stop', '5') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18085 }
     M6  = @{ title = '首次通信失败即停'; stub = @('--port', '18086', '--fail-after', '6') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18086 }
     M7  = @{ title = 'ARMED 误启动防护'; stub = @('--port', '18087') + $commonStubCfg; wd = @(); mode = 'arm'; armHold = 3; port = 18087 }
-    M8  = @{ title = 'OBS 心跳失效'; stub = @('--port', '18088', '--get-delay', '60') + $commonStubCfg; wd = @('-ObserveTimeoutSec', '5', '-ObserveMaxSec', '40'); mode = 'fire'; port = 18088 }
+    # M8 用 --get-delay-running：Start 之后（desired_running=true）的 GET 全部挂 60 s —— 观测窗口
+    # 完全无响应，心跳必然失效。改用该旋钮是为了让**凭证核验阶段**（FIRED 之前的只读 GET，此时
+    # desired=false）仍能完成：B3 之后凭证核验必须读端点 connection，若全量 GET 都挂住，
+    # 那轮会在授权门就被正确拒绝（40），M8 想验证的"FIRED 之后心跳失效"就永远走不到。
+    # -ObserveMaxSec 从 40 放宽到 45 的**原因**（不是放宽断言，是补足稳定窗口所需时长）：
+    # 观测流比 T0 早 1.5 s 启动，截止 Stop 在 T0+30 s，而"停干净"⑥要求 Stop 之后连续 10 s 无新
+    # epoch/无 RECONNECTING —— 需要观测到 T0+40 s，即观测流需存活 ≥41.5 s；40 s 会差 1.5 s
+    # 判成 not_converged（那是窗口被截断，不是没停稳）。断言本身（exit 2 / INVALID_OBSERVATION_GAP /
+    # stall_fired / OBS_STALL ≤ T0+8 s / 截止 Stop 准时）一条都没改。
+    M8  = @{ title = 'OBS 心跳失效'; stub = @('--port', '18088', '--get-delay-running', '60') + $commonStubCfg; wd = @('-ObserveTimeoutSec', '5', '-ObserveMaxSec', '45'); mode = 'fire'; port = 18088 }
     M9  = @{ title = 'HostChecks 查询失败'; stub = @('--port', '18089') + $commonStubCfg; wd = @('-TestHostProbeError', 'both'); mode = 'fire'; port = 18089 }
     M10 = @{ title = '工作线程异常退出'; stub = @('--port', '18090') + $commonStubCfg; wd = @('-TestAbortFlow', 'timer', '-TestAbortAfterSec', '3'); mode = 'fire'; port = 18090 }
     M11 = @{ title = '授权门正向（四项凭证校验通过）'; stub = @('--port', '18091') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18091 }
     M12 = @{ title = '授权门负向（缺凭证/任务配置不匹配）'; stub = @('--port', '18092') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18092; phases = $true }
+    # M13：桩绑 0.0.0.0，好让"非回环字面量但确实是本机"的子用例**在守卫失效时真能收到请求**
+    # （否则"桩没收到"就成了空断言）。8132 子用例不启桩——生产端口必须保持空闲。
+    M13 = @{ title = '测试注入参数离线边界（B1 负向）'; stub = @('--port', '18093', '--bind', '0.0.0.0') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18093; phases = 'm13' }
+    M14 = @{ title = 'G7 部署身份不可验证（B2 fail-closed）'; stub = @('--port', '18094') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18094; phases = 'm14' }
+    M15 = @{ title = '完整任务配置不匹配（B3 负向）'; stub = @('--port', '18095') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18095; phases = 'm15' }
+    M16 = @{ title = '完整任务配置匹配（B3 正向）'; stub = @('--port', '18096') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18096; g7 = 'manifest' }
 }
 
 # -File 传参时 "M0,M1" 会作为单个字符串进来，这里统一按逗号拆分（Windows/Linux 行为一致）。
@@ -174,6 +195,83 @@ if (-not $python -and ($targets | Where-Object { $SCEN[$_].stub.Count -gt 0 })) 
 
 New-Item -ItemType Directory -Force -Path $EvidenceRoot | Out-Null
 $EvidenceRoot = (Resolve-Path -LiteralPath $EvidenceRoot).Path
+
+# ── 凭证 fixture（B2 / B3）：部署二进制 + 受信清单 + 获批任务配置 + 指纹 ──────────────
+# 设计：G7 不再接受 git HEAD（只能证明"与仓库版本匹配"）。这里离线构造一份"部署二进制"
+# （固定内容，**不启动 mesad**）与一份受信构建清单，交给被测脚本实算 sha256 比对；
+# 获批任务配置与桩共用同一份 tasks 定义（python 侧导出），指纹由 python 侧**独立实现**算出，
+# 与 PowerShell 侧实现互为交叉核对。
+$fixtureRoot = Join-Path $EvidenceRoot '_fixtures'
+New-Item -ItemType Directory -Force -Path $fixtureRoot | Out-Null
+
+$deployBin = if ($DeployBinaryPath) { (Resolve-Path -LiteralPath $DeployBinaryPath).Path } else { Join-Path $fixtureRoot 'mesad-fixture.bin' }
+if (-not $DeployBinaryPath) {
+    # 固定内容（含说明文本）——"离线测试用的假部署二进制"，不是可执行程序，也不会被启动。
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes("mesa offline watchdog fixture: fake mesad binary`nrevision=$expectedRevision`n")
+    [System.IO.File]::WriteAllBytes($deployBin, $bytes)
+}
+$deploySha = (Get-FileHash -Algorithm SHA256 -LiteralPath $deployBin).Hash.ToLowerInvariant()
+
+$manifestPath = Join-Path $fixtureRoot 'mesad-build-manifest.json'
+$manifestDoc = [ordered]@{
+    schema   = 'mesa.stop-watchdog.build-manifest.v1'
+    note     = '离线测试用的受信构建清单（fixture）：只含摘要，不含真实构建信息'
+    binary   = (Split-Path -Leaf $deployBin)
+    sha256   = $deploySha
+}
+[System.IO.File]::WriteAllText($manifestPath, ($manifestDoc | ConvertTo-Json -Depth 6), [System.Text.UTF8Encoding]::new($false))
+
+$tasksFile = Join-Path $fixtureRoot 'tasks.json'
+if ($python) {
+    $null = & $python $stubPy --emit-tasks $tasksFile --task-count $expectedTaskCount --points-per-task $pointsPerTask 2>&1
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tasksFile)) {
+        throw "导出 tasks fixture 失败（python=$python）：$tasksFile"
+    }
+}
+else {
+    throw '未找到 python3/python：无法导出 tasks fixture（B3 需要完整点位清单）'
+}
+$tasksFixture = Get-Content -LiteralPath $tasksFile -Raw | ConvertFrom-Json
+
+# 获批任务配置：连接配置 + 完整点位清单（与桩完全一致）
+$approvedPath = Join-Path $fixtureRoot 'approved-task-config.json'
+$approvedDoc = [ordered]@{
+    schema      = 'mesa.stop-watchdog.approved-task-config.v1'
+    endpoint_id = $endpoint
+    revision    = $expectedRevision
+    connection  = [ordered]@{
+        host        = $conn.host
+        port        = $conn.port
+        local_tsap  = $conn.local_tsap
+        remote_tsap = $conn.remote_tsap
+        pdu_length  = $conn.pdu_length
+    }
+    tasks       = $tasksFixture
+}
+[System.IO.File]::WriteAllText($approvedPath, ($approvedDoc | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+
+# 指纹：python 侧独立实现（sort_keys + 紧凑分隔符）
+$fingerprint = (& $python $stubPy --fingerprint-file $tasksFile 2>$null | Select-Object -First 1)
+$fingerprint = ([string]$fingerprint).Trim()
+if ($fingerprint -notmatch '^sha256:[0-9a-f]{64}$') {
+    throw "计算获批任务配置指纹失败（python 输出：$fingerprint）"
+}
+Write-Host ("[fixture] 部署二进制 = {0}（sha256={1}）" -f $deployBin, $deploySha) -ForegroundColor DarkGray
+Write-Host ("[fixture] 受信清单   = {0}" -f $manifestPath) -ForegroundColor DarkGray
+Write-Host ("[fixture] 获批配置   = {0}（指纹 {1}）" -f $approvedPath, $fingerprint) -ForegroundColor DarkGray
+
+# 计算"期望的任务配置指纹"（用于 M15c：故意给一个与获批文件不一致的指纹）
+$wrongFingerprint = 'sha256:' + ('0' * 64)
+
+# 受信清单的负向 fixture（M14d：摘要与二进制不符 ⇒ 必须判 invalid，不得放行）
+$manifestWrongPath = Join-Path $fixtureRoot 'mesad-build-manifest-wrong-digest.json'
+$manifestWrongDoc = [ordered]@{
+    schema = 'mesa.stop-watchdog.build-manifest.v1'
+    note   = '负向 fixture：摘要被故意写错，用来证明 G7 不会"有清单就放行"'
+    binary = (Split-Path -Leaf $deployBin)
+    sha256 = ('b' * 64)
+}
+[System.IO.File]::WriteAllText($manifestWrongPath, ($manifestWrongDoc | ConvertTo-Json -Depth 6), [System.Text.UTF8Encoding]::new($false))
 
 # ── 通用小工具 ────────────────────────────────────────────────────────────────────
 $script:asserts = @()
@@ -261,24 +359,61 @@ function Start-Stub {
 }
 
 # ── 组装 watchdog 参数 / 执行一次 / 收证据 ─────────────────────────────────────────
+# G7 的两种合法形式（B2）：sha256:<hex> 或 manifest:<path>。默认用 sha256 形式，
+# M16 用 manifest 形式，保证两种形式都被真实跑到。
+function Get-G7Arg {
+    param([string]$Form)
+    if ($Form -eq 'manifest') { return "manifest:$manifestPath" }
+    return "sha256:$deploySha"
+}
+
+# 统一用"参数表 → argv"的方式组装：便于负向用例按名字覆盖/去掉某一项，
+# 不依赖"同名参数重复出现时谁生效"这种隐式规则。
+function New-WdArgsFromSpec {
+    param([string]$Name, [string]$OutDir, [string]$BaseUrl, [hashtable]$Set = @{})
+    $spec = [ordered]@{
+        '-Mode'                    = 'fire'
+        '-Authorized'              = $true
+        '-AuthorizedBy'            = 'SIM-AUTHZ'
+        '-AuthzTicket'             = "SIM-$Name"
+        '-G6Signoff'               = 'SIM-G6'
+        '-G6SignedAt'              = $g6SignedAt
+        '-G7DeployVersion'         = (Get-G7Arg 'sha256')
+        '-G7BinaryPath'            = $deployBin
+        '-ExpectedTaskRevision'    = $expectedRevision
+        '-ExpectedPointCount'      = [string]$expectedPoints
+        '-ApprovedTaskConfig'      = $approvedPath
+        '-ExpectedTaskFingerprint' = $fingerprint
+        '-BaseUrl'                 = $BaseUrl
+        '-EndpointId'              = $endpoint
+        '-OutDir'                  = $OutDir
+        '-Tag'                     = $Name
+    }
+    foreach ($k in $Set.Keys) { $spec[$k] = $Set[$k] }
+    $a = @()
+    foreach ($k in $spec.Keys) {
+        $v = $spec[$k]
+        if ($null -eq $v) { continue }
+        if ($v -is [bool]) { if ($v) { $a += $k }; continue }
+        if ($v -is [string] -and $v -eq '') { continue }
+        $a += @($k, [string]$v)
+    }
+    return $a
+}
+
 function New-WdArgs {
     param([string]$Name, [string]$OutDir, [string]$BaseUrl, $Cfg)
-    $a = @()
+    $set = @{}
+    $g7Form = if ($Cfg.ContainsKey('g7')) { [string]$Cfg.g7 } else { 'sha256' }
+    $set['-G7DeployVersion'] = Get-G7Arg $g7Form
     if ($Cfg.mode -eq 'arm') {
         # ARMED：只自检。凭证都给（用于演示"凭证齐备也不等于可以启动端点"），但**不给** -Authorized。
-        $a += @('-Mode', 'arm', '-ArmHoldSec', [string]$Cfg.armHold,
-            '-G6Signoff', 'SIM-G6', '-G6SignedAt', $g6SignedAt,
-            '-G7DeployVersion', $g7Value,
-            '-ExpectedTaskRevision', $expectedRevision, '-ExpectedPointCount', [string]$expectedPoints)
+        $set['-Mode'] = 'arm'
+        $set['-Authorized'] = $false
+        $set['-ArmHoldSec'] = [string]$Cfg.armHold
     }
-    else {
-        $a += @('-Mode', 'fire', '-Authorized', '-AuthorizedBy', 'SIM-AUTHZ',
-            '-AuthzTicket', "SIM-$Name",
-            '-G6Signoff', 'SIM-G6', '-G6SignedAt', $g6SignedAt,
-            '-G7DeployVersion', $g7Value,
-            '-ExpectedTaskRevision', $expectedRevision, '-ExpectedPointCount', [string]$expectedPoints)
-    }
-    $a += @('-BaseUrl', $BaseUrl, '-EndpointId', $endpoint, '-OutDir', $OutDir, '-Tag', $Name)
+    $a = New-WdArgsFromSpec -Name $Name -OutDir $OutDir -BaseUrl $BaseUrl -Set $set
+    if ($Cfg.ContainsKey('wd') -and $Cfg.wd) { $a += $Cfg.wd }
     return $a
 }
 
@@ -291,6 +426,23 @@ function Invoke-WdRun {
     & $pwshExe -NoProfile -File $watchdog @WdArgs 2>&1 | Tee-Object -FilePath $consoleLog | Out-Null
     $code = $LASTEXITCODE
     return [pscustomobject]@{ out = $OutDir; exit = $code; elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 1) }
+}
+
+function Invoke-WdCase {
+    # 跑一次子用例，并把桩日志按行号切成"本次子用例"的切片（同场景内多个子用例共用一只桩）。
+    param([string]$OutDir, [string[]]$WdArgs, [string]$StubLog)
+    $before = Get-StubLogLineCount -Path $StubLog
+    $run = Invoke-WdRun -OutDir $OutDir -WdArgs $WdArgs
+    $ev = Read-WdEvidence $run
+    $all = @(Read-Jsonl $StubLog)
+    $ev.events = @($all | Select-Object -Skip $before)
+    $ev.ev = @{}
+    foreach ($e in $ev.events) {
+        $k = [string]$e.event
+        if (-not $ev.ev.ContainsKey($k)) { $ev.ev[$k] = 0 }
+        $ev.ev[$k]++
+    }
+    return $ev
 }
 
 function Read-WdEvidence {
@@ -373,22 +525,18 @@ foreach ($name in $targets) {
 
     $script:asserts = @()
 
-    if ($cfg.ContainsKey('phases') -and $cfg.phases) {
+    if ($cfg.ContainsKey('phases') -and $cfg.phases -eq $true) {
         # ── M12：授权门负向，两段子用例（都必须 exit 40 且不发 Start）───────────────
         $outA = Join-Path $out 'a-missing-authorization'
         $outB = Join-Path $out 'b-taskconfig-mismatch'
-        $argsA = @('-Mode', 'fire',
-            '-AuthzTicket', 'SIM-M12a',
-            '-G6Signoff', 'SIM-G6', '-G6SignedAt', $g6SignedAt,
-            '-G7DeployVersion', $g7Value,
-            '-ExpectedTaskRevision', $expectedRevision, '-ExpectedPointCount', [string]$expectedPoints,
-            '-BaseUrl', $baseUrl, '-EndpointId', $endpoint, '-OutDir', $outA, '-Tag', 'M12a')
-        $argsB = @('-Mode', 'fire', '-Authorized', '-AuthorizedBy', 'SIM-AUTHZ',
-            '-AuthzTicket', 'SIM-M12b',
-            '-G6Signoff', 'SIM-G6', '-G6SignedAt', $g6SignedAt,
-            '-G7DeployVersion', $g7Value,
-            '-ExpectedTaskRevision', 'rev99-DOES-NOT-MATCH', '-ExpectedPointCount', [string]$expectedPoints,
-            '-BaseUrl', $baseUrl, '-EndpointId', $endpoint, '-OutDir', $outB, '-Tag', 'M12b')
+        $argsA = New-WdArgsFromSpec -Name 'M12a' -OutDir $outA -BaseUrl $baseUrl -Set @{
+            '-Authorized' = $false
+            '-AuthzTicket' = 'SIM-M12a'
+        }
+        $argsB = New-WdArgsFromSpec -Name 'M12b' -OutDir $outB -BaseUrl $baseUrl -Set @{
+            '-AuthzTicket' = 'SIM-M12b'
+            '-ExpectedTaskRevision' = 'rev99-DOES-NOT-MATCH'
+        }
         $runA = Invoke-WdRun -OutDir $outA -WdArgs $argsA
         $nA = Get-StubLogLineCount -Path (Join-Path $out 'stub-requests.jsonl')
         $runB = Invoke-WdRun -OutDir $outB -WdArgs $argsB
@@ -432,9 +580,166 @@ foreach ($name in $targets) {
         $rowMaxDev = $null
         $rowElapsed = [math]::Round($evA.elapsed + $evB.elapsed, 1)
     }
+    elseif ($cfg.phases -eq 'm13') {
+        # ── M13：测试注入参数的离线边界（B1 负向）────────────────────────────────────
+        # 三个子用例**都带完整有效凭证**：这样 40 只可能来自注入守卫（若守卫失效，脚本会真的去
+        # 连接目标地址 → 子用例会以别的标签/非 40 结束，测试立刻失败）。这比"故意缺凭证"强得多。
+        # 桩绑在 0.0.0.0：子用例 c 用"本机主机名"这种**非回环字面量**，若守卫没拦住，请求会真的
+        # 落到桩上（因此"桩收到 0 条请求"不是空断言）。
+        $stubLog = Join-Path $out 'stub-requests.jsonl'
+        $hostLabel = [System.Net.Dns]::GetHostName()
+        $cases = @(
+            @{ tag = 'a-non-loopback-ip'; base = 'http://192.0.2.10:18093'; wd = @('-TestAbortFlow', 'timer'); why = '非回环地址 192.0.2.10 + -TestAbortFlow' }
+            @{ tag = 'b-production-port-8132'; base = 'http://127.0.0.1:8132'; wd = @('-TestHostProbeError', 'both'); why = '生产端口 8132 + -TestHostProbeError' }
+            @{ tag = 'c-non-loopback-hostname'; base = "http://${hostLabel}:18093"; wd = @('-TestAbortFlow', 'stop'); why = "非回环字面量（本机主机名 $hostLabel）+ -TestAbortFlow" }
+        )
+        $elapsed = 0.0
+        foreach ($c in $cases) {
+            $co = Join-Path $out $c.tag
+            $a = New-WdArgsFromSpec -Name "M13$($c.tag)" -OutDir $co -BaseUrl $c.base -Set @{ '-AuthzTicket' = "SIM-M13-$($c.tag)" }
+            $a += $c.wd
+            $ev = Invoke-WdCase -OutDir $co -WdArgs $a -StubLog $stubLog
+            $elapsed += $ev.elapsed
+            $guard = Get-Nested $ev.summary 'extra.injection_guard'
+            Assert-Wd ("[{0}] {1} ⇒ exit 40" -f $c.tag, $c.why) ($ev.exit -eq 40) "exit=$($ev.exit)"
+            Assert-Wd ("[{0}] 拒绝标签 = REFUSED_TEST_INJECTION_ONLINE" -f $c.tag) ((Get-Nested $ev.summary 'refused') -eq 'REFUSED_TEST_INJECTION_ONLINE') "refused=$(Get-Nested $ev.summary 'refused')"
+            Assert-Wd ("[{0}] 网络动作数 = 0（拒绝发生在任何连接之前）" -f $c.tag) ([int](Get-Nested $ev.summary 'network_actions') -eq 0) "network_actions=$(Get-Nested $ev.summary 'network_actions')"
+            Assert-Wd ("[{0}] 未写 t0.stamp（未进入 FIRED）" -f $c.tag) (-not $ev.t0Exists) "t0=$($ev.t0Exists)"
+            Assert-Wd ("[{0}] 假端点未收到任何请求（含 Start/Stop）" -f $c.tag) (@($ev.events).Count -eq 0) "events=$(@($ev.events).Count)"
+            Assert-Wd ("[{0}] 守卫如实记录了注入参数" -f $c.tag) (@(Get-Nested $guard 'params').Count -ge 1) "params=$((@(Get-Nested $guard 'params')) -join ' ')"
+            Assert-Wd ("[{0}] 守卫判定的 host 就是 BaseUrl 的字面 host" -f $c.tag) ([string](Get-Nested $guard 'host') -eq ([System.Uri]::new($c.base)).Host) "guard_host=$(Get-Nested $guard 'host')"
+        }
+        $ev = $null
+        $rowExit = 40
+        $rowVerdict = 'REFUSED_TEST_INJECTION_ONLINE ×3'
+        $rowTrial = ''
+        $rowSched = ''
+        $rowSampling = ''
+        $rowConv = ''
+        $rowT0 = ''
+        $rowStops = @()
+        $rowMaxDev = $null
+        $rowElapsed = [math]::Round($elapsed, 1)
+    }
+    elseif ($cfg.phases -eq 'm14') {
+        # ── M14：G7 部署身份不可验证（B2 fail-closed）────────────────────────────────
+        # 关键：**只给 git 版本标识**也必须被拒（旧实现会把它当通过依据）。同时覆盖
+        # 二进制缺失 / 清单缺失 / 清单摘要不符 / 完全未提供 四种不可验证形态。
+        $stubLog = Join-Path $out 'stub-requests.jsonl'
+        $gitHead = ''
+        try { $gitHead = ([string](& git -C $repo rev-parse HEAD 2>$null | Select-Object -First 1)).Trim() } catch { }
+        if (-not $gitHead) { $gitHead = 'f803de55d319cdc24e28d069a3a40ab92d7024c7' }  # 无 git 时的固定回退（仅用于构造"像版本号"的输入）
+        $cases = @(
+            @{ tag = 'a-git-head-only'; set = @{ '-G7DeployVersion' = $gitHead }; expectState = 'unverified'; why = '只给 git HEAD（无摘要/无清单）' }
+            @{ tag = 'b-sha256-binary-missing'; set = @{ '-G7DeployVersion' = ('sha256:' + ('a' * 64)); '-G7BinaryPath' = (Join-Path $out 'no-such-binary.bin') }; expectState = 'unverified'; why = 'sha256 + 指定的部署二进制不存在' }
+            @{ tag = 'c-manifest-missing'; set = @{ '-G7DeployVersion' = ('manifest:' + (Join-Path $out 'no-such-manifest.json')) }; expectState = 'unverified'; why = '受信清单读不到' }
+            @{ tag = 'd-manifest-wrong-digest'; set = @{ '-G7DeployVersion' = "manifest:$manifestWrongPath"; '-G7BinaryPath' = $deployBin }; expectState = 'invalid'; why = '受信清单摘要与部署二进制不符' }
+            @{ tag = 'e-no-g7'; set = @{ '-G7DeployVersion' = '' }; expectState = 'missing'; why = '完全未提供 -G7DeployVersion' }
+        )
+        $elapsed = 0.0
+        foreach ($c in $cases) {
+            $co = Join-Path $out $c.tag
+            $set = @{ '-AuthzTicket' = "SIM-M14-$($c.tag)" }
+            foreach ($k in $c.set.Keys) { $set[$k] = $c.set[$k] }
+            $a = New-WdArgsFromSpec -Name "M14$($c.tag)" -OutDir $co -BaseUrl $baseUrl -Set $set
+            $ev = Invoke-WdCase -OutDir $co -WdArgs $a -StubLog $stubLog
+            $elapsed += $ev.elapsed
+            # 拒绝记录的形状：Write-WdRefusal 把凭证明细放在 extra.credentials（与 fire 的 summary 不同）
+            $g7State = [string](Get-Nested $ev.summary 'extra.credentials.items.g7_deploy_version.state')
+            $refused = [string](Get-Nested $ev.summary 'refused')
+            Assert-Wd ("[{0}] {1} ⇒ exit 40" -f $c.tag, $c.why) ($ev.exit -eq 40) "exit=$($ev.exit)"
+            Assert-Wd ("[{0}] G7 不得判 verified" -f $c.tag) ($g7State -ne 'verified') "g7_state=$g7State"
+            Assert-Wd ("[{0}] G7 state = {1}" -f $c.tag, $c.expectState) ($g7State -eq $c.expectState) "g7_state=$g7State"
+            Assert-Wd ("[{0}] 拒绝标签属于凭证不可验证/不一致/缺失" -f $c.tag) (@('REFUSED_CREDENTIAL_UNVERIFIABLE', 'REFUSED_CREDENTIAL_INVALID', 'REFUSED_NOT_AUTHORIZED') -contains $refused) "refused=$refused"
+            Assert-Wd ("[{0}] 未写 t0.stamp（未进入 FIRED）" -f $c.tag) (-not $ev.t0Exists) "t0=$($ev.t0Exists)"
+            Assert-Wd ("[{0}] 桩未收到任何 START" -f $c.tag) ((Count-Ev $ev 'START_begin') -eq 0) "START_begin=$(Count-Ev $ev 'START_begin')"
+            if ($c.tag -eq 'a-git-head-only') {
+                # 反证：git 信息被**记录**了（辅助信息），但**没有**被当作通过依据。
+                Assert-Wd '[a] 辅助信息里如实记录了 git HEAD（仅记录）' ([string](Get-Nested $ev.summary 'extra.credentials.items.g7_deploy_version.actual.git.git_head') -eq $gitHead) "git_head=$(Get-Nested $ev.summary 'extra.credentials.items.g7_deploy_version.actual.git.git_head')"
+                Assert-Wd '[a] 拒绝说明指明"不能独立证明部署二进制身份"' ([string](Get-Nested $ev.summary 'reason') -match '不能独立证明|不是 sha256|部署二进制') "reason=$(Get-Nested $ev.summary 'reason')"
+            }
+        }
+        $ev = $null
+        $rowExit = 40
+        $rowVerdict = 'G7 unverified/invalid ×5（fail-closed）'
+        $rowTrial = ''
+        $rowSched = ''
+        $rowSampling = ''
+        $rowConv = ''
+        $rowT0 = ''
+        $rowStops = @()
+        $rowMaxDev = $null
+        $rowElapsed = [math]::Round($elapsed, 1)
+    }
+    elseif ($cfg.phases -eq 'm15') {
+        # ── M15：完整任务配置不匹配（B3 负向）────────────────────────────────────────
+        # 三个子用例各只改一处：连接配置 PDU / 某点位的参数 / 期望指纹。都必须 exit 40 且不发 Start。
+        $stubLog = Join-Path $out 'stub-requests.jsonl'
+        # a：获批配置把 PDU 写成 480（桩是 240）——tasks 未变，所以指纹仍用同一份。
+        $approvedA = [ordered]@{
+            schema      = 'mesa.stop-watchdog.approved-task-config.v1'
+            endpoint_id = $endpoint
+            revision    = $expectedRevision
+            connection  = [ordered]@{
+                host        = $conn.host
+                port        = $conn.port
+                local_tsap  = $conn.local_tsap
+                remote_tsap = $conn.remote_tsap
+                pdu_length  = 480
+            }
+            tasks       = $tasksFixture
+        }
+        $approvedAPath = Join-Path $out 'a-approved-pdu-mismatch.json'
+        [System.IO.File]::WriteAllText($approvedAPath, ($approvedA | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+        # b：改一个点位的参数（offset 0 → 99），并对**改后**的 tasks 重新算指纹，
+        #    这样触发点只可能是"点位参数不一致"（而不是顺带触发指纹不一致）。
+        $tasksB = Get-Content -LiteralPath $tasksFile -Raw | ConvertFrom-Json
+        $tasksB[0].binding.config.points[0].parameters.offset = 99
+        $tasksBPath = Join-Path $out 'b-tasks-point-param-changed.json'
+        [System.IO.File]::WriteAllText($tasksBPath, ($tasksB | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+        $fpB = ([string](& $python $stubPy --fingerprint-file $tasksBPath 2>$null | Select-Object -First 1)).Trim()
+        $approvedB = [ordered]@{
+            schema      = 'mesa.stop-watchdog.approved-task-config.v1'
+            endpoint_id = $endpoint
+            revision    = $expectedRevision
+            connection  = $approvedDoc.connection
+            tasks       = $tasksB
+        }
+        $approvedBPath = Join-Path $out 'b-approved-point-param-changed.json'
+        [System.IO.File]::WriteAllText($approvedBPath, ($approvedB | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+        $cases = @(
+            @{ tag = 'a-connection-pdu-mismatch'; set = @{ '-ApprovedTaskConfig' = $approvedAPath; '-ExpectedTaskFingerprint' = $fingerprint }; why = '连接配置 PDU 不一致（获批 480 / 实际 240）'; expect = 'pdu_length' }
+            @{ tag = 'b-point-param-mismatch'; set = @{ '-ApprovedTaskConfig' = $approvedBPath; '-ExpectedTaskFingerprint' = $fpB }; why = '点位参数不一致（point 0 offset 0→99）'; expect = '点位参数不一致' }
+            @{ tag = 'c-fingerprint-mismatch'; set = @{ '-ApprovedTaskConfig' = $approvedPath; '-ExpectedTaskFingerprint' = $wrongFingerprint }; why = '配置指纹与获批版本不一致'; expect = '指纹' }
+        )
+        $elapsed = 0.0
+        foreach ($c in $cases) {
+            $co = Join-Path $out $c.tag
+            $set = @{ '-AuthzTicket' = "SIM-M15-$($c.tag)" }
+            foreach ($k in $c.set.Keys) { $set[$k] = $c.set[$k] }
+            $a = New-WdArgsFromSpec -Name "M15$($c.tag)" -OutDir $co -BaseUrl $baseUrl -Set $set
+            $ev = Invoke-WdCase -OutDir $co -WdArgs $a -StubLog $stubLog
+            $elapsed += $ev.elapsed
+            Assert-Wd ("[{0}] {1} ⇒ exit 40" -f $c.tag, $c.why) ($ev.exit -eq 40) "exit=$($ev.exit)"
+            Assert-Wd ("[{0}] 拒绝标签 = REFUSED_TASKCONFIG_MISMATCH" -f $c.tag) ((Get-Nested $ev.summary 'refused') -eq 'REFUSED_TASKCONFIG_MISMATCH') "refused=$(Get-Nested $ev.summary 'refused')"
+            Assert-Wd ("[{0}] 未写 t0.stamp（未进入 FIRED）" -f $c.tag) (-not $ev.t0Exists) "t0=$($ev.t0Exists)"
+            Assert-Wd ("[{0}] 桩未收到任何 START" -f $c.tag) ((Count-Ev $ev 'START_begin') -eq 0) "START_begin=$(Count-Ev $ev 'START_begin')"
+            Assert-Wd ("[{0}] 拒绝原因点明具体差异（{1}）" -f $c.tag, $c.expect) ([string](Get-Nested $ev.summary 'reason') -match [regex]::Escape($c.expect)) "reason=$(Get-Nested $ev.summary 'reason')"
+        }
+        $ev = $null
+        $rowExit = 40
+        $rowVerdict = 'REFUSED_TASKCONFIG_MISMATCH ×3'
+        $rowTrial = ''
+        $rowSched = ''
+        $rowSampling = ''
+        $rowConv = ''
+        $rowT0 = ''
+        $rowStops = @()
+        $rowMaxDev = $null
+        $rowElapsed = [math]::Round($elapsed, 1)
+    }
     else {
         $wdArgs = New-WdArgs -Name $name -OutDir $out -BaseUrl $baseUrl -Cfg $cfg
-        $wdArgs += $cfg.wd
         $run = Invoke-WdRun -OutDir $out -WdArgs $wdArgs
         $ev = Read-WdEvidence $run
         $sum = $ev.summary
@@ -554,13 +859,28 @@ foreach ($name in $targets) {
             'M11' {
                 Assert-Wd 'exit=0（四项凭证校验通过 → 放行并正常执行）' ($code -eq 0) "exit=$code"
                 Assert-Wd 'authorization.overall = verified' ((Get-Nested $sum 'authorization.overall') -eq 'verified') "overall=$(Get-Nested $sum 'authorization.overall')"
-                Assert-Wd 'G7 与仓库 HEAD/二进制指纹**实际比对**通过' ((Get-Nested $sum 'authorization.items.g7_deploy_version.state') -eq 'verified') "g7=$(Get-Nested $sum 'authorization.items.g7_deploy_version.detail')"
-                Assert-Wd '任务配置核验通过（revision + point_count 实读比对）' ((Get-Nested $sum 'authorization.items.task_config.state') -eq 'verified') "task_config=$(Get-Nested $sum 'authorization.items.task_config.detail')"
+                Assert-Wd 'G7 与部署二进制**实算摘要**比对通过（sha256 形式）' (((Get-Nested $sum 'authorization.items.g7_deploy_version.state') -eq 'verified') -and ((Get-Nested $sum 'authorization.items.g7_deploy_version.actual.source') -eq 'sha256')) "g7=$(Get-Nested $sum 'authorization.items.g7_deploy_version.detail')"
+                Assert-Wd 'G7 比对的正是指定的部署二进制（路径与实算摘要一致）' (((Get-Nested $sum 'authorization.items.g7_deploy_version.actual.binary') -eq $deployBin) -and ((Get-Nested $sum 'authorization.items.g7_deploy_version.actual.sha256') -eq $deploySha)) "binary=$(Get-Nested $sum 'authorization.items.g7_deploy_version.actual.binary')"
+                Assert-Wd '任务配置核验通过（revision + point_count + 连接 + 点位 + 指纹）' ((Get-Nested $sum 'authorization.items.task_config.state') -eq 'verified') "task_config=$(Get-Nested $sum 'authorization.items.task_config.detail')"
                 Assert-Wd 'G6 签署时间可解析' ((Get-Nested $sum 'authorization.items.g6_signoff.state') -eq 'verified') "g6=$(Get-Nested $sum 'authorization.items.g6_signoff.state')"
                 Assert-Wd '授权边界放行' ((Get-Nested $sum 'boundary.allowed') -eq $true) "boundary=$(Get-Nested $sum 'boundary.reason')"
                 Assert-Wd 'Start 已发出并确认' ((Get-Nested $sum 'start.outcome') -eq 'returned') "start=$(Get-Nested $sum 'start.outcome')"
                 Assert-Wd '完整生命周期正常（STOPPED_CLEAN）' ((Get-Nested $sum 'verdict') -eq 'STOPPED_CLEAN') "verdict=$(Get-Nested $sum 'verdict')"
                 Assert-Wd '截止 Stop 准时' (($deadlineStops.Count -gt 0) -and ($maxAbsDev -le 1000)) "maxAbsDev=$maxAbsDev"
+            }
+            'M16' {
+                # ── B3 正向：连接配置 + 全部点位 Key/参数 + 指纹全部一致 ⇒ 放行并正常执行 ──
+                Assert-Wd 'exit=0（完整配置一致 → 放行并正常执行）' ($code -eq 0) "exit=$code"
+                Assert-Wd 'verdict=STOPPED_CLEAN（真的跑完了整个生命周期）' ((Get-Nested $sum 'verdict') -eq 'STOPPED_CLEAN') "verdict=$(Get-Nested $sum 'verdict')"
+                Assert-Wd 'authorization.overall = verified' ((Get-Nested $sum 'authorization.overall') -eq 'verified') "overall=$(Get-Nested $sum 'authorization.overall')"
+                Assert-Wd 'G7 用 manifest:<path> 形式也通过（受信清单 + 实算摘要）' (((Get-Nested $sum 'authorization.items.g7_deploy_version.state') -eq 'verified') -and ((Get-Nested $sum 'authorization.items.g7_deploy_version.actual.source') -eq 'manifest')) "g7=$(Get-Nested $sum 'authorization.items.g7_deploy_version.detail')"
+                Assert-Wd '受信清单记录的自身摘要可审计' ([string](Get-Nested $sum 'authorization.items.g7_deploy_version.actual.manifest.sha256_self') -match '^[0-9a-f]{64}$') "manifest_sha=$(Get-Nested $sum 'authorization.items.g7_deploy_version.actual.manifest.sha256_self')"
+                Assert-Wd 'task_config = verified' ((Get-Nested $sum 'authorization.items.task_config.state') -eq 'verified') "task_config=$(Get-Nested $sum 'authorization.items.task_config.detail')"
+                Assert-Wd '实际任务配置指纹 = 获批指纹（独立实现交叉核对）' ((Get-Nested $sum 'authorization.items.task_config.actual.tasks_fingerprint') -eq $fingerprint) "actual=$(Get-Nested $sum 'authorization.items.task_config.actual.tasks_fingerprint') expect=$fingerprint"
+                Assert-Wd '逐点核对了全部 12 个点位（不只数量）' (@((Get-Nested $sum 'authorization.items.task_config.actual.point_keys').PSObject.Properties).Count -eq $expectedPoints) "point_keys=$(@((Get-Nested $sum 'authorization.items.task_config.actual.point_keys').PSObject.Properties).Count)"
+                Assert-Wd '连接配置 host/port/TSAP/PDU 均与获批一致' (((Get-Nested $sum 'authorization.items.task_config.actual.connection.pdu_length') -eq $conn.pdu_length) -and ((Get-Nested $sum 'authorization.items.task_config.actual.connection.local_tsap') -eq $conn.local_tsap) -and ((Get-Nested $sum 'authorization.items.task_config.actual.connection.remote_tsap') -eq $conn.remote_tsap) -and ((Get-Nested $sum 'authorization.items.task_config.actual.connection.host') -eq $conn.host)) "conn=$(Get-Nested $sum 'authorization.items.task_config.actual.connection')"
+                Assert-Wd 'Start 已确认 + 截止 Stop 准时' (((Get-Nested $sum 'start.outcome') -eq 'returned') -and ($deadlineStops.Count -gt 0) -and ($maxAbsDev -le 1000)) "start=$(Get-Nested $sum 'start.outcome') maxAbsDev=$maxAbsDev"
+                Assert-Wd '工作流全部正常' ((Get-Nested $sum 'workers.abort_count') -eq 0) "aborts=$(Get-Nested $sum 'workers.abort_count')"
             }
         }
 
@@ -650,7 +970,23 @@ $suiteSummary = [ordered]@{
     ps_version      = [string]$PSVersionTable.PSVersion
     python          = $python
     evidence_root   = $EvidenceRoot
-    g7_credential   = $g7Value
+    # G7（B2）：不再记录"git HEAD 充当的凭证"，而是记录本轮实算比对的部署二进制与受信清单
+    g7 = [ordered]@{
+        deploy_binary      = $deployBin
+        deploy_sha256      = $deploySha
+        manifest           = $manifestPath
+        manifest_wrong     = $manifestWrongPath
+        note               = 'git HEAD/describe 只作辅助信息，不作为 G7 通过依据'
+    }
+    # B3：获批任务配置与指纹（指纹由 python 侧独立实现算出，与 PowerShell 侧交叉核对）
+    task_config = [ordered]@{
+        approved           = $approvedPath
+        tasks_fixture      = $tasksFile
+        expected_fingerprint = $fingerprint
+        expected_revision  = $expectedRevision
+        expected_points    = $expectedPoints
+        connection         = $conn
+    }
     rows            = @($rows)
     passed          = @($rows | Where-Object { $_.result -eq 'PASS' }).Count
     failed          = @($rows | Where-Object { $_.result -ne 'PASS' }).Count

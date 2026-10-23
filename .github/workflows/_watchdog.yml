@@ -1,0 +1,74 @@
+# Watchdog 离线场景（Windows + Linux 并行，单 job 25 分钟预算）。
+#
+# 被测对象：scripts/stop-watchdog.ps1（G6-ARMED / FIRED 执行体）。
+# 测试资产：tests/watchdog/{stub_endpoint.py, run-watchdog-scenarios.ps1, README.md}。
+#
+# 边界（重要）：
+#   * **不启动 mesad、不连真机、不占用 8132**：全部场景跑在 127.0.0.1 的假端点桩上；
+#   * 只依赖 **pwsh 7+** 与 **python3**（两个平台都必须有；缺失即**明确失败**，绝不静默跳过）；
+#   * 失败时上传证据目录（console.log / run-log.md / summary.json / stub-requests.jsonl 等），
+#     便于直接定位是调度轴、采集轴、收敛轴还是授权门的问题。
+#
+# 调度：**不是**无条件运行——由 ci.yml 的 planner（tools/ci/plan.py）输出 watchdog 标志，
+# 只有 scripts/stop-watchdog.ps1、tests/watchdog/**、本文件变更（或 fail-closed FULL）才跑。
+name: watchdog
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-scenarios:
+    strategy:
+      # 两个平台都跑完再判（不要一个挂了就取消另一个：平台差异本身就是要看的信息）。
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: windows-latest
+            platform: windows
+          - runs-on: ubuntu-latest
+            platform: linux
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: 环境自检（pwsh 7+ / python3）——缺失即失败
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ps = $PSVersionTable.PSVersion
+          Write-Host "PowerShell = $ps"
+          if ($ps.Major -lt 7) {
+            throw "需要 pwsh 7+，实际 $ps（不得因环境缺失而跳过测试）"
+          }
+          $py = $null
+          foreach ($cand in @('python3', 'python')) {
+            $cmd = Get-Command $cand -ErrorAction SilentlyContinue
+            if (-not $cmd) { continue }
+            try { $v = (& $cand --version 2>&1) } catch { continue }
+            if ($LASTEXITCODE -eq 0 -and "$v" -match 'Python (\d+)\.(\d+)') {
+              if ([int]$Matches[1] -lt 3) { throw "需要 python3，实际 $v（$cand）" }
+              $py = $cand
+              Write-Host "python = $cand ($v)"
+              break
+            }
+          }
+          if (-not $py) { throw '需要 python3（假端点桩依赖它）；runner 上找不到 python3/python —— 明确失败，不静默跳过' }
+          Write-Host "平台 = ${{ matrix.platform }}；pwsh/python 就绪"
+
+      - name: 跑 stop-watchdog 离线场景（M0–M16）
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/watchdog/run-watchdog-scenarios.ps1 -EvidenceRoot target/validation/stop-watchdog
+          if ($LASTEXITCODE -ne 0) { throw "watchdog 离线场景失败（exit=$LASTEXITCODE），证据见上传的 artifact" }
+
+      - name: 上传证据（测试结果与失败日志）
+        if: always()
+        uses: actions/upload-artifact@v4 # TODO: 待确认 SHA 钉扎（v4 具体提交号需联网核对，避免写错导致 CI 静默失效）
+        with:
+          name: watchdog-${{ matrix.platform }}
+          path: target/validation/stop-watchdog
+          if-no-files-found: warn
+          retention-days: 14

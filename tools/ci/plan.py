@@ -3,7 +3,7 @@
 
 输入：变更文件列表（git diff --name-only），输出 JSON 计划：
 {
-  "plan_version": 3,
+  "plan_version": 4,
   "quality": true,            # rust-quality（fmt/clippy）
   "canonical": true,          # rust-canonical（Linux x64 完整语义）
   "canonical_filter": ...,    # nextest filterset：all() 或 rdeps(=pkg) 联合
@@ -14,8 +14,16 @@
   "stress": false,            # rust-stress
   "perf": false,              # rust-perf
   "web": true,                # web build/test
+  "watchdog": false,          # stop-watchdog 离线场景（Windows + Linux，M0–M16）
   "reason": "...",            # 人类可读路由原因
 }
+
+watchdog（CI v4）：
+- 只有 **watchdog 相关路径**变更才置真（scripts/stop-watchdog.ps1、tests/watchdog/**、
+  .github/workflows/_watchdog.yml）；**绝不**无条件运行——它要起 Windows + Linux 两个 runner
+  跑完整离线套件（单 job 25 分钟预算），与本仓库绝大多数改动无关。
+- FULL（未知路径/空 diff/diff 失败/`.github/**`、`tools/ci/**` 等 fail-closed 路径）时为真：
+  "无法判断影响面"时宁可多跑一次，也不要漏跑。
 
 build_targets（selective compile，CI v3）：
 - {"kind": "bins"}：cargo build --workspace --bins（FULL/未知影响用）
@@ -31,7 +39,33 @@ import os
 import sys
 import tomllib
 
-PLAN_VERSION = 3
+PLAN_VERSION = 4
+
+# --- watchdog 相关路径（CI v4：只有这些路径变更才跑 watchdog 套件） ---
+# 说明：
+#   * scripts/stop-watchdog.ps1 —— 被测脚本本体；
+#   * tests/watchdog/           —— 假端点桩 + 场景驱动 + 断言（含 fixtures）；
+#   * .github/workflows/_watchdog.yml —— 该 job 自身（改了它必须验证它能跑）。
+# 刻意**不**包含 .github/workflows/ci.yml：它属于 FULL_PATHS（任何改动都会触发全量 rust job），
+# 而 watchdog 的接线是否正确由 ci-gate 在每个 PR 上校验（watchdog=false 时必须 skipped）。
+WATCHDOG_PATHS = (
+    "scripts/stop-watchdog.ps1",
+    "tests/watchdog/",
+)
+WATCHDOG_CI_FILES = (
+    ".github/workflows/_watchdog.yml",
+)
+
+
+def needs_watchdog(files: list[str]) -> bool:
+    """watchdog 离线套件是否必须运行（只看与它真正相关的路径）。"""
+    for p in files:
+        if p in WATCHDOG_CI_FILES:
+            return True
+        for prefix in WATCHDOG_PATHS:
+            if p == prefix.rstrip("/") or p.startswith(prefix):
+                return True
+    return False
 
 # --- workspace members（从 Cargo.toml 自动发现，不手写） ---
 
@@ -219,6 +253,8 @@ def full_plan(reason: str) -> dict:
         "stress": True,
         "perf": True,
         "web": True,
+        # fail-closed：影响面无法判断时宁可多跑一次 watchdog 离线套件。
+        "watchdog": True,
         "reason": reason,
     }
 
@@ -238,6 +274,7 @@ def empty_plan(reason: str) -> dict:
         "stress": False,
         "perf": False,
         "web": False,
+        "watchdog": False,
         "reason": reason,
     }
 
@@ -264,6 +301,7 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
             "stress": False,
             "perf": False,
             "web": True,
+            "watchdog": False,
             "reason": "web-only → web only",
         }
 
@@ -274,9 +312,15 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
                 return full_plan(f"full-ci path: {p}")
 
     # 路径 → packages。
+    watchdog_changed = needs_watchdog(files)
     pkgs: set[str] = set()
     for p in files:
         matched = False
+        # watchdog 相关路径是**已知的非 Rust 路径**：只置 watchdog 标志，不牵连任何 Rust job。
+        # （不加这一条的话它们会落到下面的 unknown path → FULL，等于让每个 watchdog 小改动
+        #  都跑一遍全量 Rust 集成，与"不要无条件消耗 runner"的要求相反。）
+        if needs_watchdog([p]):
+            matched = True
         for prefix, extra in SPECIAL_PACKAGES.items():
             if p == prefix or p.startswith(prefix + "/"):
                 pkgs.update(extra)
@@ -292,6 +336,24 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
             return full_plan(f"unknown path: {p} (fail-closed)")
 
     if not pkgs:
+        if watchdog_changed:
+            # watchdog-only：只跑 watchdog 离线套件，Rust/web 全部 skip。
+            return {
+                "plan_version": PLAN_VERSION,
+                "quality": False,
+                "canonical": False,
+                "canonical_filter": "none()",
+                "canonical_soak": "skip",
+                "canonical_contract_bins": False,
+                "platform_mode": "skip",
+                "platform_soak": "skip",
+                "build_targets": {"kind": "none"},
+                "stress": False,
+                "perf": False,
+                "web": False,
+                "watchdog": True,
+                "reason": "watchdog-only → watchdog suite only",
+            }
         # 全是 member 内 .md。
         return empty_plan("member docs-only → all skip")
 
@@ -343,6 +405,7 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
         "stress": stress,
         "perf": perf,
         "web": web,
+        "watchdog": watchdog_changed,
         "reason": "; ".join(reasons),
     }
     if is_main and any(

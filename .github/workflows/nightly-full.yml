@@ -6,6 +6,7 @@
 # - stress（Windows x64 重复采样）
 # - perf（7 项秒级门）
 # - web
+# - watchdog（Windows + Linux 离线场景 M0–M16；nightly 不看 planner，全量安全网里必须有它）
 # 日常 PR 只跑 selective；FULL 只放这里 + 手动触发。
 name: nightly-full
 on:
@@ -26,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      plan: '{"plan_version":3,"full":true}'
+      plan: '{"plan_version":4,"full":true,"watchdog":true}'
     steps:
       - run: echo "nightly FULL plan"
 
@@ -75,8 +76,12 @@ jobs:
     needs: [plan]
     uses: ./.github/workflows/_rust-perf.yml
 
+  watchdog:
+    needs: [plan]
+    uses: ./.github/workflows/_watchdog.yml
+
   nightly-gate:
-    needs: [plan, rust-quality, rust-canonical, rust-platform, web, rust-stress, rust-perf]
+    needs: [plan, rust-quality, rust-canonical, rust-platform, web, rust-stress, rust-perf, watchdog]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
