@@ -1,18 +1,20 @@
-# stop-watchdog 离线可重复测试框架（M0–M16）
+# stop-watchdog 离线可重复测试框架（M0–M18）
 
 本目录是 `scripts/stop-watchdog.ps1` 的**可复现离线测试**：假端点桩 + 场景驱动 + 断言。
 它把原先只存在于 `target/validation/`（gitignored，别人和 CI 都拿不到）的验证手段固化进仓库，
 使 **Windows / Linux 都能独立复现**全部离线场景。
 
-**当前规模（2026-10-23 修订）**：脚本 **2809 行**、本目录 **4 个文件**、**17 个场景（M0–M16）**、
-**174 项断言**（旧版本曾记录为 1054 行 / 7 场景 / 2267 行 / 13 场景 / 94 断言，均已过期）。
+**当前规模（2026-10-23 第二次修订）**：**19 个场景（M0–M18）**、**228 项断言**
+（旧版本曾记录为 1054 行 / 7 场景 / 2267 行 / 13 场景 / 94 断言 / 17 场景 / 174 断言，均已过期）。
 
 * 不连真实设备，不启动 `mesad`，不依赖 8132 生产实例，不依赖 Rust 代码；
 * 需要：**pwsh 7+** 与 **python3**（Windows 上 `python` 亦可）；
 * **G7 不再用 git HEAD 充当凭证**（那只能证明"与仓库版本匹配"，不能证明部署物身份）：
   驱动离线构造"部署二进制 fixture + 受信构建清单"，由被测脚本**实算 sha256** 比对；
 * **任务配置核验核对完整配置**（连接 host/port/TSAP/PDU + 逐点 Key 与参数 + 规范化指纹），
-  不再只比 revision / point_count。
+  不再只比 revision / point_count；
+* **被批准对象自身也要与签署值比对**（G1/G2）：清单**自身**摘要（`-ExpectedManifestSha256`）与
+  获批配置文件**自身**摘要（`-ExpectedApprovedTaskConfigSha256`）都必须来自签署包，缺失或不一致一律拒绝。
 
 ## 一条命令跑完全部场景
 
@@ -103,19 +105,51 @@ PowerShell 侧（`ConvertTo-WdCanonicalNode` / `Get-WdTasksFingerprint`）与 py
 > （`--get-delay-running`）——凭证核验发生在 Start 之前（desired=false），必须能完成；
 > M8 要验证的"FIRED 之后观测通道无响应 ⇒ 心跳失效"语义不变，断言未放宽。
 
+### G1/G2 被批准对象自身必须与签署值比对（本轮新增，两条均为**必填**）
+
+B2/B3 修好的是"输入值 ↔ 实际对象"的一致性，但**被批准的那个对象本身**没有被独立验证：
+
+| 缺口 | 为什么 B2/B3 挡不住 |
+|---|---|
+| **G1** 构建清单自身未被验证 | `manifest:<path>` 只把清单**里写的**二进制摘要与实算摘要比对。**清单与二进制一起被替换**时二者仍然互相匹配 ⇒ 校验通过，但两份都不是签署时批准的东西 |
+| **G2** 获批任务配置文件自身未被验证 | `-ExpectedTaskFingerprint` 只覆盖**规范化 tasks 数组**，**connection（host/port/TSAP/PDU）不在其中** ⇒ 改动连接配置时指纹一字不变，"指纹相同"不能证明文件未被动过 |
+
+修法（两处都**在解析内容之前**对**原始文件字节**算 SHA-256）：
+
+| 新增参数 | 必填条件 | 校验对象 | 缺失/不匹配 |
+|---|---|---|---|
+| `-ExpectedManifestSha256` | `-G7DeployVersion` 为 `manifest:<path>` 时**必填** | 受信构建清单**原始文件字节**的 SHA-256（与签署包批准值比对） | **exit 40** `REFUSED_MANIFEST_INTEGRITY` |
+| `-ExpectedApprovedTaskConfigSha256` | **fire 必填**（arm 也校验） | 获批任务配置**原始文件字节**的 SHA-256（与签署包批准值比对） | **exit 40** `REFUSED_TASKCONFIG_INTEGRITY` |
+
+实现要点（`scripts/stop-watchdog.ps1`）：
+
+* **先摘要、后解析**：`Read-WdRawFileBytes` 一次 `ReadAllBytes`，**同一份字节**既用于算摘要也交给
+  `ConvertFrom-WdJsonBytes` 解析 ⇒ 不存在"先解析再比对"或"比对与解析读到不同内容"（TOCTOU）的绕过空间；
+* 两个参数都接受 `sha256:<64 hex>` 或裸 `<64 hex>`，但格式仍严格 64 位十六进制；
+* 取值**只能来自已签署的 G6/G7 执行包**：现场用 `Get-FileHash` 现算等于自己给自己授权；
+* G2 的检查发生在**任何网络动作之前**（`network_actions = 0`），不是"先连上端点再发现文件是假的"；
+* 反向约束：给了 `-ExpectedManifestSha256` 却不用 `manifest:` 形式 ⇒ **拒绝**（不静默忽略一个已批准的摘要）。
+
+对应场景：**M17**（G1 负向 3 子用例：缺参数 / 清单+二进制一起被换且自洽 / 清单字节被改）、
+**M18**（G2 负向 3 子用例：缺参数 / 只改 connection 而**指纹不变** / 改文件后用改后文件自身摘要）。
+
 ### 获批凭证的权威来源（一期冻结）
 
 **离线套件通过只证明校验逻辑有效，不代表现场凭证已获得授权。**
 
-未来 FIRED 执行必须使用**经独立审批的记录**，至少绑定下列五项：
+未来 FIRED 执行必须使用**经独立审批的记录**，至少绑定下列六项：
 
 | 项 | 要求 |
 |---|---|
 | Endpoint ID 与任务 revision | 与获批执行包一致 |
 | 完整连接配置 | `host` / `port` / `local_tsap` / `remote_tsap` / `pdu_length` |
-| 规范化 tasks 数组的 SHA-256 | 即 `-ExpectedTaskFingerprint` |
-| `approved-task-config.json` 文件自身的 SHA-256 | 防止"拿错或被改过的批准文件" |
+| 规范化 tasks 数组的 SHA-256 | 即 `-ExpectedTaskFingerprint`（**不覆盖 connection**，见 G2） |
+| `approved-task-config.json` 文件自身的 SHA-256 | 即 `-ExpectedApprovedTaskConfigSha256`（G2） |
+| 受信构建清单自身的 SHA-256 | 即 `-ExpectedManifestSha256`（G1；仅 `manifest:` 形式） |
 | 实际部署 `mesad` 二进制的 SHA-256 | 即 `-G7DeployVersion sha256:<hex>` |
+
+**原则（一句话）**：**被批准的对象本身必须与签署值比对** —— 只比"被批准对象内部的一致性"，
+等于允许"把被批准对象连同它引用的东西一起换掉"。
 
 **凭证来源**：经签署的 **G6/G7 执行包**与**现场工单**。
 
@@ -141,7 +175,9 @@ PowerShell 侧（`ConvertTo-WdCanonicalNode` / `Get-WdTasksFingerprint`）与 py
 | **M13** 测试注入参数离线边界（B1 负向） | 三个子用例**都带完整有效凭证**：① `http://192.0.2.10:18093` + `-TestAbortFlow`；② `http://127.0.0.1:8132`（生产端口）+ `-TestHostProbeError`；③ `http://<本机主机名>:18093`（非回环字面量）+ `-TestAbortFlow`（桩绑 `0.0.0.0`，守卫失效时请求会真的到达） | 三者都 **exit 40**、标签 `REFUSED_TEST_INJECTION_ONLINE`、**`network_actions = 0`**、无 `t0.stamp`、**桩收到 0 条请求**（更不会有 Start/Stop）；守卫如实记录参数与字面 host |
 | **M14** G7 部署身份不可验证（B2 fail-closed） | 5 子用例：只给 git HEAD / `sha256:` 但二进制不存在 / `manifest:` 清单不存在 / 清单摘要不符 / 完全未提供 | 全部 **exit 40**；G7 `state` 分别为 `unverified`/`unverified`/`unverified`/`invalid`/`missing`（**绝不为 verified**）；无 `t0.stamp`；桩未收到 START；子用例 ① 额外证明 git HEAD 被**记录为辅助信息**但**未用于放行** |
 | **M15** 完整任务配置不匹配（B3 负向） | 3 子用例：① 获批 PDU=480（桩 240）；② 获批某点位参数 offset 0→99；③ `-ExpectedTaskFingerprint` 与获批文件不符 | 全部 **exit 40**、标签 `REFUSED_TASKCONFIG_MISMATCH`、无 `t0.stamp`、桩未收到 START；拒绝原因**点名具体差异**（`pdu_length` / `点位参数不一致：<key>` / 指纹） |
-| **M16** 完整任务配置匹配（B3 正向） | 无（连接 + 全部 12 个点位 + 指纹全一致；G7 = `manifest:` 形式） | exit 0 / STOPPED_CLEAN；G7 `source=manifest` 且清单自身摘要可审计；`task_config=verified`；实际指纹 = 获批指纹（两套独立实现一致）；**逐点核对 12 个点位**；连接 host/port/TSAP/PDU 全一致；Start 确认 + 截止 Stop 准时 |
+| **M16** 完整任务配置匹配（B3 正向） | 无（连接 + 全部 12 个点位 + 指纹全一致；G7 = `manifest:` 形式） | exit 0 / STOPPED_CLEAN；G7 `source=manifest` 且清单自身摘要 = 签署值（`verified_before_parse=true`）；`task_config=verified`；实际指纹 = 获批指纹（两套独立实现一致）；**逐点核对 12 个点位**；连接 host/port/TSAP/PDU 全一致；Start 确认 + 截止 Stop 准时 |
+| **M17** G1 负向（清单自身未被独立验证） | 3 子用例（其余凭证齐全，40 只可能来自 G1）：① 走 `manifest:` 但缺 `-ExpectedManifestSha256`；② **清单+二进制一起被换**（攻击者清单内部摘要 = 攻击者二进制实算摘要，二者自洽）；③ 清单字节被改（内部摘要仍指向真二进制） | 三者都 **exit 40**、标签 `REFUSED_MANIFEST_INTEGRITY`、**网络动作数 = 0**、无 `t0.stamp`、桩收到 **0 条请求**；② 额外断言"前提成立：清单内部摘要 = 攻击者二进制摘要"（**若只看清单与二进制是否互相匹配，本子用例会通过**），并断言清单自身摘要 ≠ 签署值、证据里 expected/actual 都留痕 |
+| **M18** G2 负向（获批配置文件自身未被独立验证） | 3 子用例：① 缺 `-ExpectedApprovedTaskConfigSha256`；② 批准文件字节被改（**只改 connection，tasks 一字未动 ⇒ 指纹不变**）；③ 改文件 + 用改后文件自身摘要 | ①② **exit 40**、标签 `REFUSED_TASKCONFIG_INTEGRITY`、**网络动作数 = 0**、无 `t0.stamp`、桩 0 条请求；③ **exit 40**、标签 `REFUSED_TASKCONFIG_MISMATCH`（文件完整性通过后仍被连接配置字段比对挡住，`network_actions ≥ 1`）。② 额外断言"改后文件的 tasks 指纹 = 获批指纹"（**指纹不变也挡不住 connection 篡改**，只能靠文件摘要） |
 
 > M9 / M10 用到的 `-TestHostProbeError` / `-TestAbortFlow` 是**离线测试专用注入开关**；
 > 正常执行时保持缺省值，注入值会写进 `summary.json` 的 `test_hooks`（含 `injection_guard` 判定），
@@ -156,15 +192,23 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode arm `
      -G6Signoff "<签署人/编号>" -G6SignedAt "2026-10-24T09:00:00+08:00" `
      -G7DeployVersion "sha256:<部署 mesad 的 sha256>" -G7BinaryPath "<部署 mesad 路径>" `
      -ExpectedTaskRevision rev13 -ExpectedPointCount 12 `
-     -ApprovedTaskConfig "<获批任务配置.json>" -ExpectedTaskFingerprint "sha256:<指纹>"
+     -ApprovedTaskConfig "<获批任务配置.json>" `
+     -ExpectedApprovedTaskConfigSha256 "sha256:<获批配置文件的 sha256（签署包）>" `
+     -ExpectedTaskFingerprint "sha256:<指纹>"
 
 # FIRED（正式执行）：必须 -Mode fire + 显式授权 + 授权人 + 凭证 + 完整任务配置期望值
+# 两个"被批准对象自身"的摘要都取自**签署包**（现场不得现算）：
+#   -ExpectedManifestSha256（受信清单自身，G1；manifest 形式必填）
+#   -ExpectedApprovedTaskConfigSha256（获批配置自身，G2；fire 必填）
 pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire `
      -Authorized -AuthorizedBy "李工" -AuthzTicket "<工单号>" `
      -G6Signoff "<签署人/编号>" -G6SignedAt "2026-10-24T09:00:00+08:00" `
      -G7DeployVersion "manifest:<受信构建清单.json>" -G7BinaryPath "<部署 mesad 路径>" `
+     -ExpectedManifestSha256 "sha256:<受信构建清单自身的 sha256（签署包）>" `
      -ExpectedTaskRevision rev13 -ExpectedPointCount 12 `
-     -ApprovedTaskConfig "<获批任务配置.json>" -ExpectedTaskFingerprint "sha256:<指纹>" `
+     -ApprovedTaskConfig "<获批任务配置.json>" `
+     -ExpectedApprovedTaskConfigSha256 "sha256:<获批配置文件的 sha256（签署包）>" `
+     -ExpectedTaskFingerprint "sha256:<指纹>" `
      -BaseUrl http://127.0.0.1:8132 -OutDir <dir>
 ```
 
@@ -203,7 +247,9 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire `
 | 授权凭证号 | `-AuthzTicket` | 非空（arm 记 `not_checked`） |
 | G6 现场签署 | `-G6Signoff` + `-G6SignedAt` | 签署标识非空；签署时间必须可解析（ISO 8601）且不在未来 |
 | G7 部署身份 | `-G7DeployVersion`（+ `-G7BinaryPath`） | `sha256:<hex>` 或 `manifest:<path>`，与部署二进制**实算摘要**比对；git HEAD/describe 仅作辅助记录；不可验证 ⇒ `unverified` ⇒ 拒绝 |
+| **G7 清单自身（G1）** | **`-ExpectedManifestSha256`** | `manifest:` 形式**必填**；在**解析清单之前**对清单**原始字节**算摘要，与签署包批准值比对；缺失/不一致/格式非法 ⇒ `REFUSED_MANIFEST_INTEGRITY`（exit 40，网络动作数 = 0） |
 | 任务配置 | `-ExpectedTaskRevision` + `-ExpectedPointCount` + `-ApprovedTaskConfig` + `-ExpectedTaskFingerprint` | **先做只读 GET**（diagnostics / tasks / 端点快照）与获批配置**逐项、逐点、指纹**比对；不一致 ⇒ `REFUSED_TASKCONFIG_MISMATCH`，读不到 ⇒ `REFUSED_CREDENTIAL_UNVERIFIABLE` |
+| **获批配置自身（G2）** | **`-ExpectedApprovedTaskConfigSha256`** | fire **必填**；在**解析文件之前**对文件**原始字节**算摘要，与签署包批准值比对；缺失/不一致/格式非法 ⇒ `REFUSED_TASKCONFIG_INTEGRITY`（exit 40，网络动作数 = 0）。**指纹不覆盖 connection，只有它挡得住 connection 篡改** |
 
 ## 退出码与试验结论（分开表达）
 
@@ -217,6 +263,8 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire `
 | **40** | `REFUSED_TEST_INJECTION_ONLINE` | 携带测试注入参数却指向非回环地址或 8132（B1；网络动作数 = 0） |
 | **40** | `REFUSED_NOT_AUTHORIZED` | fire 缺 `-Authorized` / `-AuthorizedBy` / `-AuthzTicket` |
 | **40** | `REFUSED_CREDENTIAL_INVALID` | G6 时间不可解析、G7 部署二进制摘要与期望不一致、任务配置指纹/字段不一致 |
+| **40** | `REFUSED_MANIFEST_INTEGRITY` | **G1**：受信清单自身未被独立验证（缺 `-ExpectedManifestSha256` / 清单原始字节摘要与签署值不一致 / 格式非法 / 给了该参数却不走 `manifest:` 形式）。纯本地检查，`network_actions = 0` |
+| **40** | `REFUSED_TASKCONFIG_INTEGRITY` | **G2**：获批任务配置**文件自身**未被独立验证（缺 `-ExpectedApprovedTaskConfigSha256` / 文件原始字节摘要与签署值不一致 / 格式非法）。纯本地检查，`network_actions = 0`；**tasks 指纹相同也不放行** |
 | **40** | `REFUSED_TASKCONFIG_MISMATCH` | 完整任务配置与获批配置不一致（连接配置 / 点位 Key 与参数 / 指纹 / revision / point_count） |
 | **40** | `REFUSED_CREDENTIAL_UNVERIFIABLE` | 凭证读不到或无法独立验证（G7 无摘要/清单、部署二进制定位不到、端点读不到、获批配置不可用）→ fail-closed |
 | 0 | `STOPPED_CLEAN` | fire：收敛 CONVERGED + 采集 VALID + Start 确认 + 无竞态 |
@@ -252,7 +300,7 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire `
 
 ## 证据目录内容
 
-每个场景目录（`<EvidenceRoot>/<场景>/`；M12/M13/M14/M15 下再分子用例目录）：
+每个场景目录（`<EvidenceRoot>/<场景>/`；M12/M13/M14/M15/M17/M18 下再分子用例目录）：
 
 | 文件 | 内容 |
 |---|---|
@@ -266,8 +314,10 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire `
 | `stub-requests.jsonl` | 假端点桩收到的每个请求（用于**独立**交叉核对 Stop/Start 时刻、以及"拒绝时到底有没有连接"） |
 | `stub-stdout.log` / `stub-stderr.log` | 桩的原始输出 |
 
-`<EvidenceRoot>/_fixtures/` 下是本轮凭证 fixture（部署二进制、受信清单、tasks、获批配置），
-`<EvidenceRoot>/suite-summary.json` 汇总全部场景并记录本轮 G7 fixture 与获批指纹。
+`<EvidenceRoot>/_fixtures/` 下是本轮凭证 fixture（部署二进制、受信清单、tasks、获批配置，
+以及 M17/M18 的负向 fixture：攻击者二进制+自洽清单、被改清单、被改获批配置），
+`<EvidenceRoot>/suite-summary.json` 汇总全部场景并记录本轮 G7 fixture、清单自身摘要、
+获批配置自身摘要与获批指纹。
 
 ## CI 接入（Windows + Linux 双平台，并行）
 
@@ -285,7 +335,7 @@ workflow：`.github/workflows/_watchdog.yml`（`workflow_call`），由 `ci.yml`
 
 `ci-gate` 自身的严格性有离线自测：`python3 tools/ci/test_ci_gate.py`（CI quality job 内执行）。
 
-单场景耗时 5 s（M7/M12/M13/M14/M15）到 ~60 s（M3/M4/M8），全量约 **10–13 分钟**。
+单场景耗时 2 s（M12/M13/M15/M17/M18）到 ~60 s（M3/M4/M8），全量约 **12–15 分钟**。
 若 CI 机器上有其它 mesa 驱动进程或到目标端口的 Established 连接，M0/M11/M16 的 HostChecks 会正确地
 判为未收敛——那是**预期行为**（说明该机器不适合做"停干净"验收），不是测试缺陷。
 
@@ -294,4 +344,5 @@ workflow：`.github/workflows/_watchdog.yml`（`workflow_call`），由 `ci.yml`
 1. 先看该场景的 `console.log` 末尾（判定 + 处置提示）与 `summary.json` 的 `axes`；
 2. 断言失败会打印 `[FAIL] 断言名 — 实际值`，对照上表定位是哪一层（调度/采集/收敛/授权/注入边界/工作流）；
 3. 不得为了让断言通过而放宽脚本阈值（尤其 `ObserveStallSec`、`SAMPLING_MAX_GAP_MS`、`MAX_STOPS`）——
-   这些阈值本身就是被验收对象；同理不得把注入守卫、G7 摘要比对、任务配置完整核对"简化"掉。
+   这些阈值本身就是被验收对象；同理不得把注入守卫、G7 摘要比对、G1/G2 的"被批准对象自身"摘要比对、
+   任务配置完整核对"简化"掉。

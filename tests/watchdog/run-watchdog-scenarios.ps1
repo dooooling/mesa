@@ -31,6 +31,10 @@
     M15 完整任务配置不匹配（B3 负向）：连接配置（PDU）/ 点位参数 / 配置指纹任一不一致
         ⇒ exit 40 且不发 Start
     M16 完整任务配置匹配（B3 正向）：连接配置 + 全部点位 Key/参数 + 指纹全部一致 ⇒ 放行并正常执行
+    M17 G1 负向：构建清单**自身**未被独立验证（缺 -ExpectedManifestSha256 / 清单字节被改 /
+        清单+二进制一起被换且互相自洽）⇒ exit 40、网络动作数 0、不发 Start
+    M18 G2 负向：获批任务配置**文件自身**未被独立验证（缺 -ExpectedApprovedTaskConfigSha256 /
+        文件字节被改而 tasks 指纹不变 / 改文件后用改后文件自身摘要）⇒ exit 40、不发 Start
 
   关于 G7：本驱动**不再**用 git HEAD 充当 G7 凭证（那只能证明"与仓库版本匹配"，不能证明部署物
   身份）。它离线构造两份 fixture 并交给被测脚本实算比对：
@@ -38,6 +42,11 @@
     · `_fixtures/mesad-build-manifest.json`：受信构建清单（含该文件的 sha256）。
   获批任务配置（`_fixtures/approved-task-config.json`）与桩共用同一份 tasks 定义
   （`_fixtures/tasks.json`），指纹由 python 侧**独立实现**算出，与 PowerShell 侧互为交叉核对。
+
+  关于 G1/G2（"被批准对象自身必须与签署值比对"）：正向用例把本轮 fixture 的**真实摘要**当作
+  "签署包里批准的值"传入（清单自身 ⇒ -ExpectedManifestSha256；获批配置文件自身 ⇒
+  -ExpectedApprovedTaskConfigSha256）；M17/M18 则构造"缺失 / 字节被改 / 清单与二进制一起被换"
+  三类形态，证明这两层校验确实拦得住 —— 尤其证明"tasks 指纹不变也挡不住 connection 篡改"。
 
 .PARAMETER Scenario
   只跑指定场景，例如 -Scenario M7,M13。缺省 = M0–M16 全部。
@@ -145,6 +154,10 @@ $SCEN = [ordered]@{
     M14 = @{ title = 'G7 部署身份不可验证（B2 fail-closed）'; stub = @('--port', '18094') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18094; phases = 'm14' }
     M15 = @{ title = '完整任务配置不匹配（B3 负向）'; stub = @('--port', '18095') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18095; phases = 'm15' }
     M16 = @{ title = '完整任务配置匹配（B3 正向）'; stub = @('--port', '18096') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18096; g7 = 'manifest' }
+    # M17/M18：G1/G2 —— "被批准对象自身必须与签署值比对"。
+    # 桩仍然起在回环端口上：这样"桩收到 0 条请求"才是有效断言（守卫/校验失效时请求会真的到达）。
+    M17 = @{ title = 'G1 负向：构建清单自身未被独立验证'; stub = @('--port', '18097') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18097; phases = 'm17' }
+    M18 = @{ title = 'G2 负向：获批配置文件自身未被独立验证'; stub = @('--port', '18098') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18098; phases = 'm18' }
 }
 
 # -File 传参时 "M0,M1" 会作为单个字符串进来，这里统一按逗号拆分（Windows/Linux 行为一致）。
@@ -249,6 +262,9 @@ $approvedDoc = [ordered]@{
     tasks       = $tasksFixture
 }
 [System.IO.File]::WriteAllText($approvedPath, ($approvedDoc | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+# G2：获批配置**文件自身**的摘要。正向用例把它当作"签署包里批准的值"传给被测脚本；
+# 负向用例（M18）故意传"缺失"或"改动前的旧值"，以证明文件字节被改时即使指纹不变也必须拒绝。
+$approvedSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $approvedPath).Hash.ToLowerInvariant()
 
 # 指纹：python 侧独立实现（sort_keys + 紧凑分隔符）
 $fingerprint = (& $python $stubPy --fingerprint-file $tasksFile 2>$null | Select-Object -First 1)
@@ -272,6 +288,60 @@ $manifestWrongDoc = [ordered]@{
     sha256 = ('b' * 64)
 }
 [System.IO.File]::WriteAllText($manifestWrongPath, ($manifestWrongDoc | ConvertTo-Json -Depth 6), [System.Text.UTF8Encoding]::new($false))
+
+# ── G1 负向 fixture（M17）：清单自身未被独立验证 ───────────────────────────────────
+# 受信清单自身的摘要 = "签署包里批准的那个值"（正向用例与 M17 的对照基准）。
+$manifestSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $manifestPath).Hash.ToLowerInvariant()
+
+# (b) 攻击者把"清单 + 二进制"一起换掉，且换得**自洽**：清单内部摘要 = 攻击者二进制的真实摘要。
+#     于是"清单里的摘要 ↔ 二进制实算摘要"必然匹配 —— 这正是旧实现的缺口：
+#     只有"清单自身与签署包批准值比对"（-ExpectedManifestSha256）才能识破。
+$attackerBinPath = Join-Path $fixtureRoot 'm17-attacker-mesad.bin'
+[System.IO.File]::WriteAllBytes($attackerBinPath, [System.Text.Encoding]::UTF8.GetBytes("ATTACKER mesad build: NOT the approved artifact`nrevision=attacker`n"))
+$attackerSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $attackerBinPath).Hash.ToLowerInvariant()
+$attackerManifestPath = Join-Path $fixtureRoot 'm17-attacker-manifest.json'
+$attackerManifestDoc = [ordered]@{
+    schema = 'mesa.stop-watchdog.build-manifest.v1'
+    note   = '负向 fixture（M17b）：攻击者自洽清单 —— 内部摘要 = 攻击者二进制的真实摘要'
+    binary = (Split-Path -Leaf $attackerBinPath)
+    sha256 = $attackerSha
+}
+[System.IO.File]::WriteAllText($attackerManifestPath, ($attackerManifestDoc | ConvertTo-Json -Depth 6), [System.Text.UTF8Encoding]::new($false))
+
+# (c) 只改清单**字节**、内部摘要仍指向真二进制（"清单文件字节被改动"的最小形态）。
+$tamperedManifestPath = Join-Path $fixtureRoot 'm17-manifest-bytes-tampered.json'
+$tamperedManifestDoc = [ordered]@{
+    schema      = 'mesa.stop-watchdog.build-manifest.v1'
+    note        = '负向 fixture（M17c）：清单字节被改动（多了一个字段），内部摘要仍指向真二进制'
+    binary      = (Split-Path -Leaf $deployBin)
+    sha256      = $deploySha
+    injected_by = 'someone-who-is-not-the-signer'
+}
+[System.IO.File]::WriteAllText($tamperedManifestPath, ($tamperedManifestDoc | ConvertTo-Json -Depth 6), [System.Text.UTF8Encoding]::new($false))
+
+# ── G2 负向 fixture（M18）：只改 connection，tasks 一字未动 ⇒ 指纹不变 ──────────────
+# 这是 G2 存在的理由：-ExpectedTaskFingerprint 只覆盖规范化 tasks 数组，
+# connection（host/port/TSAP/PDU）不在其中，所以"指纹相同"完全挡不住 connection 被改。
+$approvedTamperedDoc = [ordered]@{
+    schema      = 'mesa.stop-watchdog.approved-task-config.v1'
+    endpoint_id = $endpoint
+    revision    = $expectedRevision
+    connection  = [ordered]@{
+        host        = $conn.host
+        port        = 18100                       # ← 被改（真实桩声明的设备端口是 18099）
+        local_tsap  = $conn.local_tsap
+        remote_tsap = $conn.remote_tsap
+        pdu_length  = $conn.pdu_length
+    }
+    tasks       = $tasksFixture                   # ← 与获批配置完全一致 ⇒ 指纹不变
+}
+$approvedTamperedPath = Join-Path $fixtureRoot 'm18-approved-connection-tampered.json'
+[System.IO.File]::WriteAllText($approvedTamperedPath, ($approvedTamperedDoc | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+$approvedTamperedSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $approvedTamperedPath).Hash.ToLowerInvariant()
+# 独立（python 侧）复算"改后文件里 tasks 的指纹"，用于在 M18b 断言"指纹确实没变"。
+$tamperedTasksFile = Join-Path $fixtureRoot 'm18-tampered-tasks-only.json'
+[System.IO.File]::WriteAllText($tamperedTasksFile, ($tasksFixture | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+$tamperedFingerprint = ([string](& $python $stubPy --fingerprint-file $tamperedTasksFile 2>$null | Select-Object -First 1)).Trim()
 
 # ── 通用小工具 ────────────────────────────────────────────────────────────────────
 $script:asserts = @()
@@ -383,6 +453,9 @@ function New-WdArgsFromSpec {
         '-ExpectedTaskRevision'    = $expectedRevision
         '-ExpectedPointCount'      = [string]$expectedPoints
         '-ApprovedTaskConfig'      = $approvedPath
+        # G2：获批任务配置**文件自身**的摘要（正向用例一律给"本轮 fixture 的真实摘要"，
+        # 等价于签署包里批准的那个值；负向用例在 -Set 里显式覆盖成缺失/过期值）。
+        '-ExpectedApprovedTaskConfigSha256' = "sha256:$approvedSha"
         '-ExpectedTaskFingerprint' = $fingerprint
         '-BaseUrl'                 = $BaseUrl
         '-EndpointId'              = $endpoint
@@ -390,6 +463,18 @@ function New-WdArgsFromSpec {
         '-Tag'                     = $Name
     }
     foreach ($k in $Set.Keys) { $spec[$k] = $Set[$k] }
+    # G1：走 manifest:<path> 形式时，脚本要求同时给"清单自身"的批准摘要。
+    # 这里按**清单文件当前的真实摘要**自动填入（等价于"签署包里批准的就是这份清单"）；
+    # 需要验证"缺失/被换掉"的负向用例，在 -Set 里把该键显式置为 '' 或换成旧值即可（见下方 Contains 判断）。
+    $g7Value = [string]$spec['-G7DeployVersion']
+    if ($g7Value -match '^(?i)manifest:(.+)$') {
+        if (-not $spec.Contains('-ExpectedManifestSha256')) {
+            $mPath = $Matches[1].Trim()
+            if (Test-Path -LiteralPath $mPath -PathType Leaf) {
+                $spec['-ExpectedManifestSha256'] = 'sha256:' + (Get-FileHash -Algorithm SHA256 -LiteralPath $mPath).Hash.ToLowerInvariant()
+            }
+        }
+    }
     $a = @()
     foreach ($k in $spec.Keys) {
         $v = $spec[$k]
@@ -708,8 +793,8 @@ foreach ($name in $targets) {
         $approvedBPath = Join-Path $out 'b-approved-point-param-changed.json'
         [System.IO.File]::WriteAllText($approvedBPath, ($approvedB | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
         $cases = @(
-            @{ tag = 'a-connection-pdu-mismatch'; set = @{ '-ApprovedTaskConfig' = $approvedAPath; '-ExpectedTaskFingerprint' = $fingerprint }; why = '连接配置 PDU 不一致（获批 480 / 实际 240）'; expect = 'pdu_length' }
-            @{ tag = 'b-point-param-mismatch'; set = @{ '-ApprovedTaskConfig' = $approvedBPath; '-ExpectedTaskFingerprint' = $fpB }; why = '点位参数不一致（point 0 offset 0→99）'; expect = '点位参数不一致' }
+            @{ tag = 'a-connection-pdu-mismatch'; set = @{ '-ApprovedTaskConfig' = $approvedAPath; '-ExpectedApprovedTaskConfigSha256' = ('sha256:' + (Get-FileHash -Algorithm SHA256 -LiteralPath $approvedAPath).Hash.ToLowerInvariant()); '-ExpectedTaskFingerprint' = $fingerprint }; why = '连接配置 PDU 不一致（获批 480 / 实际 240）'; expect = 'pdu_length' }
+            @{ tag = 'b-point-param-mismatch'; set = @{ '-ApprovedTaskConfig' = $approvedBPath; '-ExpectedApprovedTaskConfigSha256' = ('sha256:' + (Get-FileHash -Algorithm SHA256 -LiteralPath $approvedBPath).Hash.ToLowerInvariant()); '-ExpectedTaskFingerprint' = $fpB }; why = '点位参数不一致（point 0 offset 0→99）'; expect = '点位参数不一致' }
             @{ tag = 'c-fingerprint-mismatch'; set = @{ '-ApprovedTaskConfig' = $approvedPath; '-ExpectedTaskFingerprint' = $wrongFingerprint }; why = '配置指纹与获批版本不一致'; expect = '指纹' }
         )
         $elapsed = 0.0
@@ -729,6 +814,124 @@ foreach ($name in $targets) {
         $ev = $null
         $rowExit = 40
         $rowVerdict = 'REFUSED_TASKCONFIG_MISMATCH ×3'
+        $rowTrial = ''
+        $rowSched = ''
+        $rowSampling = ''
+        $rowConv = ''
+        $rowT0 = ''
+        $rowStops = @()
+        $rowMaxDev = $null
+        $rowElapsed = [math]::Round($elapsed, 1)
+    }
+    elseif ($cfg.phases -eq 'm17') {
+        # ── M17（G1 负向）：构建清单**本身**未被独立验证 ⇒ 一律拒绝 ────────────────────
+        # 三个子用例都只有"清单自身"这一层不成立（其余凭证齐全），因此 40 只可能来自 G1。
+        # (b) 是最关键的一条：**清单 + 二进制一起被换掉**且两者互相匹配 —— 旧实现会放行。
+        $stubLog = Join-Path $out 'stub-requests.jsonl'
+        $cases = @(
+            @{ tag = 'a-missing-expected-manifest-sha'; g7 = "manifest:$manifestPath"; bin = $deployBin; msha = ''; expectLabel = 'REFUSED_MANIFEST_INTEGRITY'; why = '走 manifest: 形式但缺 -ExpectedManifestSha256' }
+            @{ tag = 'b-manifest-and-binary-swapped'; g7 = "manifest:$attackerManifestPath"; bin = $attackerBinPath; msha = "sha256:$manifestSha"; expectLabel = 'REFUSED_MANIFEST_INTEGRITY'; why = '清单+二进制一起被换（清单内部摘要与攻击者二进制匹配，二者互相自洽）' }
+            @{ tag = 'c-manifest-bytes-tampered'; g7 = "manifest:$tamperedManifestPath"; bin = $deployBin; msha = "sha256:$manifestSha"; expectLabel = 'REFUSED_MANIFEST_INTEGRITY'; why = '清单文件字节被改动（内部摘要仍指向真二进制）' }
+        )
+        $elapsed = 0.0
+        foreach ($c in $cases) {
+            $co = Join-Path $out $c.tag
+            $set = @{
+                '-AuthzTicket'             = "SIM-M17-$($c.tag)"
+                '-G7DeployVersion'         = $c.g7
+                '-G7BinaryPath'            = $c.bin
+                '-ExpectedManifestSha256'  = $c.msha
+            }
+            $a = New-WdArgsFromSpec -Name "M17$($c.tag)" -OutDir $co -BaseUrl $baseUrl -Set $set
+            $ev = Invoke-WdCase -OutDir $co -WdArgs $a -StubLog $stubLog
+            $elapsed += $ev.elapsed
+            $g7State = [string](Get-Nested $ev.summary 'extra.credentials.items.g7_deploy_version.state')
+            $refused = [string](Get-Nested $ev.summary 'refused')
+            Assert-Wd ("[{0}] {1} ⇒ exit 40" -f $c.tag, $c.why) ($ev.exit -eq 40) "exit=$($ev.exit)"
+            Assert-Wd ("[{0}] 拒绝标签 = {1}" -f $c.tag, $c.expectLabel) ($refused -eq $c.expectLabel) "refused=$refused"
+            Assert-Wd ("[{0}] G7 不得判 verified" -f $c.tag) ($g7State -ne 'verified') "g7_state=$g7State"
+            Assert-Wd ("[{0}] 未写 t0.stamp（未进入 FIRED）" -f $c.tag) (-not $ev.t0Exists) "t0=$($ev.t0Exists)"
+            Assert-Wd ("[{0}] 桩未收到任何 START" -f $c.tag) ((Count-Ev $ev 'START_begin') -eq 0) "START_begin=$(Count-Ev $ev 'START_begin')"
+            Assert-Wd ("[{0}] 桩未收到任何请求（清单校验是纯本地检查）" -f $c.tag) (@($ev.events).Count -eq 0) "events=$(@($ev.events).Count)"
+            Assert-Wd ("[{0}] 网络动作数 = 0（拒绝发生在任何连接之前）" -f $c.tag) ([int](Get-Nested $ev.summary 'network_actions') -eq 0) "network_actions=$(Get-Nested $ev.summary 'network_actions')"
+            Assert-Wd ("[{0}] 拒绝原因点明清单自身未获独立批准" -f $c.tag) ([string](Get-Nested $ev.summary 'reason') -match '清单') "reason=$(Get-Nested $ev.summary 'reason')"
+            if ($c.tag -eq 'b-manifest-and-binary-swapped') {
+                # 反证"这是一次自洽的替换"：清单内部摘要 == 攻击者二进制的实算摘要。
+                # 也就是说，**若只看清单与二进制是否互相匹配，本子用例会通过** —— 必须靠清单自身摘要识破。
+                $attManifestDoc = Get-Content -LiteralPath $attackerManifestPath -Raw | ConvertFrom-Json
+                Assert-Wd '[b] 前提成立：攻击者清单内部摘要 = 攻击者二进制实算摘要（二者互相匹配）' `
+                    ([string]$attManifestDoc.sha256 -eq $attackerSha) "manifest_sha=$($attManifestDoc.sha256) bin_sha=$attackerSha"
+                Assert-Wd '[b] 但清单自身摘要 ≠ 签署包批准值 ⇒ 仍然拒绝' `
+                    ($manifestSha -ne (Get-FileHash -Algorithm SHA256 -LiteralPath $attackerManifestPath).Hash.ToLowerInvariant()) "signed=$manifestSha attacker_manifest=$((Get-FileHash -Algorithm SHA256 -LiteralPath $attackerManifestPath).Hash.ToLowerInvariant())"
+                Assert-Wd '[b] 拒绝记录里保留了清单自身摘要比对（expected/actual 都在证据里）' `
+                    (([string](Get-Nested $ev.summary 'extra.credentials.items.g7_deploy_version.actual.manifest.sha256_self') -match '^[0-9a-f]{64}$') -and ([string](Get-Nested $ev.summary 'extra.credentials.items.g7_deploy_version.actual.manifest.integrity.expected') -eq $manifestSha)) `
+                    "self=$(Get-Nested $ev.summary 'extra.credentials.items.g7_deploy_version.actual.manifest.sha256_self') expected=$(Get-Nested $ev.summary 'extra.credentials.items.g7_deploy_version.actual.manifest.integrity.expected')"
+            }
+        }
+        $ev = $null
+        $rowExit = 40
+        $rowVerdict = 'REFUSED_MANIFEST_INTEGRITY ×3'
+        $rowTrial = ''
+        $rowSched = ''
+        $rowSampling = ''
+        $rowConv = ''
+        $rowT0 = ''
+        $rowStops = @()
+        $rowMaxDev = $null
+        $rowElapsed = [math]::Round($elapsed, 1)
+    }
+    elseif ($cfg.phases -eq 'm18') {
+        # ── M18（G2 负向）：获批任务配置文件**自身**未被独立验证 ⇒ 一律拒绝 ─────────────
+        # (b) 是最关键的一条：**tasks 指纹保持不变、只改 connection** —— 指纹校验完全挡不住，
+        #     必须靠"文件原始字节摘要"识破。
+        # (c) 是"改文件 + 用改后文件自身摘要"：文件完整性因此通过，但连接配置与实时不一致 ⇒ 仍然拒绝
+        #     （证明字段比对这一层没有被 G2 取代）。
+        $stubLog = Join-Path $out 'stub-requests.jsonl'
+        $cases = @(
+            @{ tag = 'a-missing-expected-config-sha'; file = $approvedPath; sha = ''; expectLabel = 'REFUSED_TASKCONFIG_INTEGRITY'; why = '缺 -ExpectedApprovedTaskConfigSha256'; expectNet = 0 }
+            @{ tag = 'b-config-bytes-tampered-fingerprint-unchanged'; file = $approvedTamperedPath; sha = "sha256:$approvedSha"; expectLabel = 'REFUSED_TASKCONFIG_INTEGRITY'; why = '批准文件字节被改（只改 connection，tasks 未动 ⇒ 指纹不变）'; expectNet = 0 }
+            @{ tag = 'c-tampered-with-its-own-sha'; file = $approvedTamperedPath; sha = "sha256:$approvedTamperedSha"; expectLabel = 'REFUSED_TASKCONFIG_MISMATCH'; why = '文件被改且用改后文件自身摘要 ⇒ 文件完整性通过，但连接配置与实时不一致'; expectNet = -1 }
+        )
+        $elapsed = 0.0
+        foreach ($c in $cases) {
+            $co = Join-Path $out $c.tag
+            $set = @{
+                '-AuthzTicket'                        = "SIM-M18-$($c.tag)"
+                '-ApprovedTaskConfig'                 = $c.file
+                '-ExpectedApprovedTaskConfigSha256'   = $c.sha
+            }
+            $a = New-WdArgsFromSpec -Name "M18$($c.tag)" -OutDir $co -BaseUrl $baseUrl -Set $set
+            $ev = Invoke-WdCase -OutDir $co -WdArgs $a -StubLog $stubLog
+            $elapsed += $ev.elapsed
+            $refused = [string](Get-Nested $ev.summary 'refused')
+            $net = [int](Get-Nested $ev.summary 'network_actions')
+            Assert-Wd ("[{0}] {1} ⇒ exit 40" -f $c.tag, $c.why) ($ev.exit -eq 40) "exit=$($ev.exit)"
+            Assert-Wd ("[{0}] 拒绝标签 = {1}" -f $c.tag, $c.expectLabel) ($refused -eq $c.expectLabel) "refused=$refused"
+            Assert-Wd ("[{0}] 未写 t0.stamp（未进入 FIRED）" -f $c.tag) (-not $ev.t0Exists) "t0=$($ev.t0Exists)"
+            Assert-Wd ("[{0}] 桩未收到任何 START" -f $c.tag) ((Count-Ev $ev 'START_begin') -eq 0) "START_begin=$(Count-Ev $ev 'START_begin')"
+            Assert-Wd ("[{0}] 没有发出 Start（t0.stamp 与 START 双证）" -f $c.tag) ((-not $ev.t0Exists) -and ((Count-Ev $ev 'START_begin') -eq 0)) "t0=$($ev.t0Exists) START_begin=$(Count-Ev $ev 'START_begin')"
+            if ($c.expectNet -ge 0) {
+                Assert-Wd ("[{0}] 网络动作数 = {1}（G2 是纯本地检查，先于任何连接）" -f $c.tag, $c.expectNet) ($net -eq $c.expectNet) "network_actions=$net"
+                Assert-Wd ("[{0}] 桩未收到任何请求" -f $c.tag) (@($ev.events).Count -eq 0) "events=$(@($ev.events).Count)"
+            }
+            else {
+                Assert-Wd ("[{0}] 文件完整性通过后才做只读核验（网络动作数 ≥ 1）" -f $c.tag) ($net -ge 1) "network_actions=$net"
+                Assert-Wd ("[{0}] 拒绝原因点明连接配置不一致" -f $c.tag) ([string](Get-Nested $ev.summary 'reason') -match 'port') "reason=$(Get-Nested $ev.summary 'reason')"
+            }
+            if ($c.tag -eq 'b-config-bytes-tampered-fingerprint-unchanged') {
+                # 反证：改后文件里的 tasks 指纹**与获批指纹完全相同**（python 侧独立复算）。
+                # 因此"指纹校验"这一层对该文件是失效的，挡住它的只能是文件原始字节摘要。
+                Assert-Wd '[b] 前提成立：改后文件的 tasks 指纹与获批指纹相同（指纹不变）' ($tamperedFingerprint -eq $fingerprint) "tampered=$tamperedFingerprint approved=$fingerprint"
+                Assert-Wd '[b] 前提成立：改后文件字节确实与获批文件不同' ($approvedTamperedSha -ne $approvedSha) "tampered_sha=$approvedTamperedSha approved_sha=$approvedSha"
+                Assert-Wd '[b] 但仍然拒绝（只能靠文件摘要，不能靠指纹）' ($ev.exit -eq 40) "exit=$($ev.exit)"
+                Assert-Wd '[b] 拒绝记录里同时给出 expected/actual 文件摘要' `
+                    ((([string](Get-Nested $ev.summary 'extra.credentials.items.approved_task_config_integrity.actual.file.actual') -eq $approvedTamperedSha) -and ([string](Get-Nested $ev.summary 'extra.credentials.items.approved_task_config_integrity.actual.file.expected') -eq $approvedSha))) `
+                    "actual=$(Get-Nested $ev.summary 'extra.credentials.items.approved_task_config_integrity.actual.file.actual') expected=$(Get-Nested $ev.summary 'extra.credentials.items.approved_task_config_integrity.actual.file.expected')"
+            }
+        }
+        $ev = $null
+        $rowExit = 40
+        $rowVerdict = 'REFUSED_TASKCONFIG_INTEGRITY ×2 + REFUSED_TASKCONFIG_MISMATCH ×1'
         $rowTrial = ''
         $rowSched = ''
         $rowSampling = ''
@@ -863,6 +1066,9 @@ foreach ($name in $targets) {
                 Assert-Wd 'G7 比对的正是指定的部署二进制（路径与实算摘要一致）' (((Get-Nested $sum 'authorization.items.g7_deploy_version.actual.binary') -eq $deployBin) -and ((Get-Nested $sum 'authorization.items.g7_deploy_version.actual.sha256') -eq $deploySha)) "binary=$(Get-Nested $sum 'authorization.items.g7_deploy_version.actual.binary')"
                 Assert-Wd '任务配置核验通过（revision + point_count + 连接 + 点位 + 指纹）' ((Get-Nested $sum 'authorization.items.task_config.state') -eq 'verified') "task_config=$(Get-Nested $sum 'authorization.items.task_config.detail')"
                 Assert-Wd 'G6 签署时间可解析' ((Get-Nested $sum 'authorization.items.g6_signoff.state') -eq 'verified') "g6=$(Get-Nested $sum 'authorization.items.g6_signoff.state')"
+                Assert-Wd 'G2：获批配置文件自身摘要 = 签署值（解析前比对）' `
+                    (((Get-Nested $sum 'authorization.items.approved_task_config_integrity.state') -eq 'verified') -and ((Get-Nested $sum 'authorization.items.approved_task_config_integrity.actual.file.actual') -eq $approvedSha) -and ((Get-Nested $sum 'authorization.items.approved_task_config_integrity.actual.file.verified_before_parse') -eq $true)) `
+                    "file_sha=$(Get-Nested $sum 'authorization.items.approved_task_config_integrity.actual.file.actual') expected=$approvedSha"
                 Assert-Wd '授权边界放行' ((Get-Nested $sum 'boundary.allowed') -eq $true) "boundary=$(Get-Nested $sum 'boundary.reason')"
                 Assert-Wd 'Start 已发出并确认' ((Get-Nested $sum 'start.outcome') -eq 'returned') "start=$(Get-Nested $sum 'start.outcome')"
                 Assert-Wd '完整生命周期正常（STOPPED_CLEAN）' ((Get-Nested $sum 'verdict') -eq 'STOPPED_CLEAN') "verdict=$(Get-Nested $sum 'verdict')"
@@ -875,6 +1081,9 @@ foreach ($name in $targets) {
                 Assert-Wd 'authorization.overall = verified' ((Get-Nested $sum 'authorization.overall') -eq 'verified') "overall=$(Get-Nested $sum 'authorization.overall')"
                 Assert-Wd 'G7 用 manifest:<path> 形式也通过（受信清单 + 实算摘要）' (((Get-Nested $sum 'authorization.items.g7_deploy_version.state') -eq 'verified') -and ((Get-Nested $sum 'authorization.items.g7_deploy_version.actual.source') -eq 'manifest')) "g7=$(Get-Nested $sum 'authorization.items.g7_deploy_version.detail')"
                 Assert-Wd '受信清单记录的自身摘要可审计' ([string](Get-Nested $sum 'authorization.items.g7_deploy_version.actual.manifest.sha256_self') -match '^[0-9a-f]{64}$') "manifest_sha=$(Get-Nested $sum 'authorization.items.g7_deploy_version.actual.manifest.sha256_self')"
+                Assert-Wd 'G1：清单自身摘要 = 签署值（解析前比对，verified_before_parse=true）' `
+                    (((Get-Nested $sum 'authorization.items.g7_deploy_version.actual.manifest.integrity.ok') -eq $true) -and ((Get-Nested $sum 'authorization.items.g7_deploy_version.actual.manifest.integrity.expected') -eq $manifestSha) -and ((Get-Nested $sum 'authorization.items.g7_deploy_version.actual.manifest.integrity.verified_before_parse') -eq $true)) `
+                    "expected=$(Get-Nested $sum 'authorization.items.g7_deploy_version.actual.manifest.integrity.expected') signed=$manifestSha"
                 Assert-Wd 'task_config = verified' ((Get-Nested $sum 'authorization.items.task_config.state') -eq 'verified') "task_config=$(Get-Nested $sum 'authorization.items.task_config.detail')"
                 Assert-Wd '实际任务配置指纹 = 获批指纹（独立实现交叉核对）' ((Get-Nested $sum 'authorization.items.task_config.actual.tasks_fingerprint') -eq $fingerprint) "actual=$(Get-Nested $sum 'authorization.items.task_config.actual.tasks_fingerprint') expect=$fingerprint"
                 Assert-Wd '逐点核对了全部 12 个点位（不只数量）' (@((Get-Nested $sum 'authorization.items.task_config.actual.point_keys').PSObject.Properties).Count -eq $expectedPoints) "point_keys=$(@((Get-Nested $sum 'authorization.items.task_config.actual.point_keys').PSObject.Properties).Count)"
@@ -970,22 +1179,31 @@ $suiteSummary = [ordered]@{
     ps_version      = [string]$PSVersionTable.PSVersion
     python          = $python
     evidence_root   = $EvidenceRoot
-    # G7（B2）：不再记录"git HEAD 充当的凭证"，而是记录本轮实算比对的部署二进制与受信清单
+    # G7（B2）+ G1：记录本轮实算比对的部署二进制、受信清单**及其自身摘要**
     g7 = [ordered]@{
         deploy_binary      = $deployBin
         deploy_sha256      = $deploySha
         manifest           = $manifestPath
+        manifest_sha256    = $manifestSha
         manifest_wrong     = $manifestWrongPath
-        note               = 'git HEAD/describe 只作辅助信息，不作为 G7 通过依据'
+        m17_attacker_binary   = $attackerBinPath
+        m17_attacker_sha256   = $attackerSha
+        m17_attacker_manifest = $attackerManifestPath
+        m17_tampered_manifest = $tamperedManifestPath
+        note               = 'git HEAD/describe 只作辅助信息，不作为 G7 通过依据；manifest 形式另需清单自身摘要（G1）'
     }
-    # B3：获批任务配置与指纹（指纹由 python 侧独立实现算出，与 PowerShell 侧交叉核对）
+    # B3 + G2：获批任务配置、指纹、以及**文件自身摘要**
     task_config = [ordered]@{
         approved           = $approvedPath
+        approved_sha256    = $approvedSha
         tasks_fixture      = $tasksFile
         expected_fingerprint = $fingerprint
         expected_revision  = $expectedRevision
         expected_points    = $expectedPoints
         connection         = $conn
+        m18_tampered_file  = $approvedTamperedPath
+        m18_tampered_sha256 = $approvedTamperedSha
+        m18_tampered_tasks_fingerprint = $tamperedFingerprint
     }
     rows            = @($rows)
     passed          = @($rows | Where-Object { $_.result -eq 'PASS' }).Count

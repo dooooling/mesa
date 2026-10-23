@@ -6,7 +6,7 @@
   设计契约（先读，再改本文件）：
     docs/validation/828d-phase1-first-limited-sampling-application.md
       §4.6     G6-ARMED 七条判据（本脚本必须能逐条自证）
-      §4.6.1   M0–M12 离线故障模拟（可重复实现见 tests/watchdog/）
+      §4.6.1   M0–M18 离线故障模拟（可重复实现见 tests/watchdog/）
       §5.1     实现要点 1–7（独立进程 / T0 自生成 / 独占 Start / 截止 Stop / 观测 / 双向解耦 / 退出码）
       §5.3     Stop 时间约束与"停干净"六项判据、Start/Stop 竞态处置
 
@@ -23,10 +23,23 @@
           ③ G6 现场签署：-G6Signoff + -G6SignedAt（时间必须可解析且不在未来）；
           ④ G7 部署身份：-G7DeployVersion 必须是 `sha256:<hex>` 或 `manifest:<path>`，
              **与部署二进制实算摘要比对**（git HEAD/describe 只作辅助信息，不再作为通过依据）；
+             走 `manifest:` 形式时**还必须**给 -ExpectedManifestSha256（清单**自身**的 SHA-256，
+             取自签署的 G6/G7 执行包），脚本在**解析清单内容之前**对清单**原始字节**算摘要比对（G1）；
           ⑤ 任务配置：-ExpectedTaskRevision + -ExpectedPointCount + -ApprovedTaskConfig
-             + -ExpectedTaskFingerprint，脚本**先做只读 GET**（diagnostics / tasks / 端点快照）
-             与**实际完整配置比对**（连接 host/port/TSAP/PDU、逐点 Key 与参数、配置指纹），
-             不一致或读不到即拒绝。
+             + -ExpectedTaskFingerprint + **-ExpectedApprovedTaskConfigSha256**，
+             脚本先在**解析获批配置文件之前**对文件**原始字节**算摘要、与签署值比对（G2），
+             再**先做只读 GET**（diagnostics / tasks / 端点快照）与**实际完整配置比对**
+             （连接 host/port/TSAP/PDU、逐点 Key 与参数、配置指纹），不一致或读不到即拒绝。
+
+  ── 凭证完整性原则（G1/G2，本文件不可放宽）────────────────────────────────────────
+    "被批准的对象本身必须与签署值比对"，否则校验可以被"把被批准对象一起换掉"绕过：
+    · G1：只比"清单里的二进制摘要 ↔ 实际二进制"时，**清单与二进制一起被替换**仍然互相匹配；
+      因此清单**自身**必须有一个来自**签署包**的独立摘要（-ExpectedManifestSha256）。
+    · G2：任务配置指纹只覆盖**规范化 tasks 数组**，**不覆盖连接配置**；因此获批配置文件**自身**
+      必须有一个来自签署包（-ExpectedApprovedTaskConfigSha256）。
+    · 两者都在**解析内容之前**对**原始文件字节**算 SHA-256：一次 ReadAllBytes 的**同一份字节**
+      既用于算摘要也用于后续解析，不存在"先解析再比对"或"比对与解析读到不同内容"（TOCTOU）的空间。
+    · 缺失或不匹配 ⇒ 拒绝执行（exit 40，fail-closed），**不发 Start、不写 t0.stamp**。
 
   ── 授权边界（本轮冻结）───────────────────────────────────────────────────────────
     arm  只允许**回环地址且端口≠8132**（8132 是生产 mesad）：非回环或指向 8132 ⇒ 40，
@@ -124,6 +137,17 @@
   `target/release/mesad.exe` → `target/release/mesad` → `target/debug/mesad.exe` → `target/debug/mesad`
   顺序探测，并如实记录最终比对的是哪一个文件。
 
+.PARAMETER ExpectedManifestSha256
+  受信构建清单**自身**的 SHA-256（`sha256:<64 hex>`，也接受裸 64 hex）。**走 `manifest:` 形式时必填**
+  （G1：清单完整性）。取值**只能来自已签署的 G6/G7 执行包**，禁止在现场用 `Get-FileHash` 现算——
+  自己现算等于自己给自己授权，与本参数的目的（防"清单+二进制一起被替换"）正好相反。
+  校验时机与方式：
+    · 在**解析清单内容之前**对清单**原始文件字节**算 SHA-256（一次 ReadAllBytes，摘要与解析共用
+      同一份字节，避免"解析后再比对"或 TOCTOU 绕过）；
+    · 缺失 ⇒ `REFUSED_MANIFEST_INTEGRITY`（exit 40）；不匹配 ⇒ 同上（exit 40）；格式非法 ⇒ 同上；
+    · 清单读不到 / 不是合法 JSON ⇒ `unverified` ⇒ 同样拒绝（fail-closed）。
+  给了本参数但 `-G7DeployVersion` 不是 `manifest:<path>` ⇒ **拒绝**（不静默忽略一个已批准的摘要）。
+
 .PARAMETER ExpectedTaskRevision
   期望的任务配置 revision（fire 必填）。脚本先做只读任务快照
   （`GET /api/v1/tasks?endpoint={EndpointId}`，404/405 回退 `GET /api/v1/tasks/{EndpointId}`），
@@ -143,6 +167,18 @@
   规范化 = 键递归排序 + 按 task.id 排序 + 紧凑 JSON。脚本会用同一算法核对：
   ① 获批配置文件本身的指纹必须等于该值（防止"拿错/被改过的批准文件"）；
   ② 实际只读 GET 到的 tasks 指纹必须等于该值。
+  **注意指纹不覆盖连接配置**：connection（host/port/TSAP/PDU）不在规范化 tasks 数组内，
+  所以"指纹不变"**不能**证明文件未被改动 —— 那必须靠 -ExpectedApprovedTaskConfigSha256（G2）。
+
+.PARAMETER ExpectedApprovedTaskConfigSha256
+  获批任务配置**文件自身**的 SHA-256（`sha256:<64 hex>`，也接受裸 64 hex）。fire 必填
+  （G2：被批准对象自身完整性）。取值**只能来自已签署的 G6/G7 执行包**，禁止在现场现算。
+  校验时机与方式：
+    · 在**解析文件之前**对文件**原始字节**算 SHA-256（一次 ReadAllBytes，摘要与解析共用同一份字节）；
+    · 该检查发生在**任何网络动作之前**（静态凭证阶段），因此拒绝时 network_actions = 0；
+    · 缺失 / 不匹配 / 格式非法 ⇒ `REFUSED_TASKCONFIG_INTEGRITY`（exit 40）；文件读不到 ⇒ `unverified` ⇒ 拒绝。
+  为什么必须独立于 -ExpectedTaskFingerprint：指纹只覆盖规范化 tasks 数组，**connection 被改动时指纹不变**，
+  只有文件摘要能挡住这种篡改。
 
 .PARAMETER TaskConfigRef
   可选自由文本备注（任务配置核验依据的说明/工单链接），只记录不校验；
@@ -193,16 +229,21 @@
        -G7DeployVersion "sha256:<部署 mesad 的 sha256>" -G7BinaryPath "C:\mesa\bin\mesad.exe" `
        -ExpectedTaskRevision rev13 -ExpectedPointCount 12 `
        -ApprovedTaskConfig "target\validation\approved-task-config.json" `
+       -ExpectedApprovedTaskConfigSha256 "sha256:<获批配置文件的 sha256>" `
        -ExpectedTaskFingerprint "sha256:<规范化 tasks 数组的 sha256>"
 
 .EXAMPLE
   # ② 正式执行（fire）：显式授权 + 授权人 + 四项凭证（全部**校验**通过才放行）
+  #    注意两个"被批准对象自身"的摘要都**取自签署包**，不得在现场现算：
+  #      -ExpectedManifestSha256（清单自身，G1）与 -ExpectedApprovedTaskConfigSha256（获批配置自身，G2）
   pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire -Authorized -AuthorizedBy "李工" `
        -AuthzTicket G6-828D-R1 -G6Signoff "张工/QC-828D-01" -G6SignedAt "2026-10-24T09:00:00+08:00" `
        -G7DeployVersion "manifest:target\validation\mesad-build-manifest.json" `
        -G7BinaryPath "C:\mesa\bin\mesad.exe" `
+       -ExpectedManifestSha256 "sha256:<受信构建清单自身的 sha256（来自签署包）>" `
        -ExpectedTaskRevision rev13 -ExpectedPointCount 12 `
        -ApprovedTaskConfig "target\validation\approved-task-config.json" `
+       -ExpectedApprovedTaskConfigSha256 "sha256:<获批配置文件的 sha256（来自签署包）>" `
        -ExpectedTaskFingerprint "sha256:<规范化 tasks 数组的 sha256>" `
        -BaseUrl http://127.0.0.1:8132 -OutDir target\validation\828d-r1\round1-20261024T010203Z
 
@@ -213,6 +254,7 @@
        -G7DeployVersion "sha256:<离线测试二进制摘要>" -G7BinaryPath "target\validation\fixtures\mesad-fixture.bin" `
        -ExpectedTaskRevision rev13 -ExpectedPointCount 12 `
        -ApprovedTaskConfig "target\validation\approved-task-config.json" `
+       -ExpectedApprovedTaskConfigSha256 "sha256:<获批配置文件的 sha256>" `
        -ExpectedTaskFingerprint "sha256:<规范化 tasks 数组的 sha256>" `
        -BaseUrl http://127.0.0.1:18081 -ObserveTimeoutSec 45 -ObserveStallSec 0 `
        -OutDir target\validation\stop-watchdog\M1
@@ -220,7 +262,7 @@
 .NOTES
   严禁指向真实机床：离线模拟只用 127.0.0.1 的假端点或不可达地址（脚本本身也会拒绝非回环地址）。
   本脚本**不 import** 任何驱动/Core 代码，只经 REST 交互（§5.1-1）。
-  可重复的离线测试框架在 tests/watchdog/（一条命令跑完 M0–M16）。
+  可重复的离线测试框架在 tests/watchdog/（一条命令跑完 M0–M18）。
 
   ── 退出码（进程怎么处置）与试验结论（summary.json 的 verdict / axes）分开 ──────────
   arm 模式：
@@ -234,6 +276,12 @@
                                     （B1：在任何网络动作之前拒绝，网络动作数 = 0）
     40 REFUSED_NOT_AUTHORIZED      fire 缺 -Authorized / -AuthorizedBy / -AuthzTicket
     40 REFUSED_CREDENTIAL_INVALID  G6 签署时间不可解析；G7 部署二进制摘要与期望不一致
+    40 REFUSED_MANIFEST_INTEGRITY  受信清单**自身**未被独立验证（G1）：缺 -ExpectedManifestSha256、
+                                    清单原始字节摘要与签署值不一致、格式非法、或给了该参数却不走 manifest 形式
+                                    （本地检查，**网络动作数 = 0**）
+    40 REFUSED_TASKCONFIG_INTEGRITY 获批任务配置**文件自身**未被独立验证（G2）：缺
+                                    -ExpectedApprovedTaskConfigSha256、文件原始字节摘要与签署值不一致、格式非法
+                                    （本地检查，**网络动作数 = 0**；指纹相同也不放行）
     40 REFUSED_TASKCONFIG_MISMATCH 完整任务配置与获批配置不一致（连接配置 / 点位 Key 与参数 / 指纹 / revision / point_count）
     40 REFUSED_CREDENTIAL_UNVERIFIABLE 凭证读不到或无法独立验证（G7 无摘要/清单、部署二进制定位不到、
                                     端点读不到、获批配置不可用）→ 按未通过处理（fail-closed）
@@ -266,10 +314,14 @@ param(
     [string]$G6SignedAt = '',
     [string]$G7DeployVersion = '',
     [string]$G7BinaryPath = '',
+    # G1：受信构建清单**自身**的 SHA-256（必须来自签署的 G6/G7 执行包；manifest 形式时必填）
+    [string]$ExpectedManifestSha256 = '',
     [string]$ExpectedTaskRevision = '',
     [ValidateRange(-1, 10000000)][int]$ExpectedPointCount = -1,
     [string]$ApprovedTaskConfig = '',
     [string]$ExpectedTaskFingerprint = '',
+    # G2：获批任务配置**文件自身**的 SHA-256（必须来自签署的 G6/G7 执行包；fire 必填）
+    [string]$ExpectedApprovedTaskConfigSha256 = '',
     [string]$TaskConfigRef = '',
     [string]$BaseUrl = 'http://127.0.0.1:8132',
     [string]$EndpointId = 'lx-nck-tags-190-connection',
@@ -385,7 +437,7 @@ $header = @(
     "- 模式：Mode=$Mode（arm = 只自检、零副作用；fire = 显式授权后的正式执行）"
     "- 参数：BaseUrl=$BaseUrl EndpointId=$EndpointId ObserveTimeoutSec=$ObserveTimeoutSec ObserveMaxSec=$ObserveMaxSec StopTimeoutSec=$StopTimeoutSec StartTimeoutSec=$StartTimeoutSec ObserveStallSec=$ObserveStallSec ArmHoldSec=$ArmHoldSec SelfTest=$SelfTest HostChecks=$HostChecks SkipHostChecks=$SkipHostChecks Tag=$Tag"
     "- 授权：Authorized=$Authorized AuthorizedBy=$(if ($AuthorizedBy) { $AuthorizedBy } else { '（未提供）' }) AuthzTicket=$(if ($AuthzTicket) { $AuthzTicket } else { '（未提供）' })"
-    "- 现场输入：G6Signoff=$(if ($G6Signoff) { $G6Signoff } else { '（未提供）' })；G6SignedAt=$(if ($G6SignedAt) { $G6SignedAt } else { '（未提供）' })；G7DeployVersion=$(if ($G7DeployVersion) { $G7DeployVersion } else { '（未提供）' })；ExpectedTaskRevision=$(if ($ExpectedTaskRevision) { $ExpectedTaskRevision } else { '（未提供）' })；ExpectedPointCount=$ExpectedPointCount；TaskConfigRef=$(if ($TaskConfigRef) { $TaskConfigRef } else { '（未提供）' })"
+    "- 现场输入：G6Signoff=$(if ($G6Signoff) { $G6Signoff } else { '（未提供）' })；G6SignedAt=$(if ($G6SignedAt) { $G6SignedAt } else { '（未提供）' })；G7DeployVersion=$(if ($G7DeployVersion) { $G7DeployVersion } else { '（未提供）' })；ExpectedManifestSha256=$(if ($ExpectedManifestSha256) { $ExpectedManifestSha256 } else { '（未提供）' })；ExpectedTaskRevision=$(if ($ExpectedTaskRevision) { $ExpectedTaskRevision } else { '（未提供）' })；ExpectedPointCount=$ExpectedPointCount；ExpectedApprovedTaskConfigSha256=$(if ($ExpectedApprovedTaskConfigSha256) { $ExpectedApprovedTaskConfigSha256 } else { '（未提供）' })；TaskConfigRef=$(if ($TaskConfigRef) { $TaskConfigRef } else { '（未提供）' })"
     "- 截止偏移：$($script:DEADLINE_OFFSET_MS) ms（脚本内常量，不接受外部指定）"
     '- 说明：T0 与截止时刻**只**由本进程在 FIRED 时刻生成；人工/主流程/抓证脚本不得预先填写或修正。'
     '- 说明：T0+30 s 是 **Stop 请求的截止调度目标**，不代表驱动进程/设备通信已在第 30 s 物理终止。'
@@ -518,10 +570,12 @@ function Write-WdRefusal {
             g6_signed_at      = $G6SignedAt
             g7_deploy_version = $G7DeployVersion
             g7_binary_path    = $G7BinaryPath
+            expected_manifest_sha256 = $ExpectedManifestSha256
             expected_revision = $ExpectedTaskRevision
             expected_points   = $ExpectedPointCount
             approved_task_config = $ApprovedTaskConfig
             expected_tasks_fingerprint = $ExpectedTaskFingerprint
+            expected_approved_task_config_sha256 = $ExpectedApprovedTaskConfigSha256
         }
         network_actions = $NetworkActions
         extra           = $Extra
@@ -661,8 +715,11 @@ function Get-WdRepoRoot {
 }
 
 function New-WdCredItem {
-    param([string]$Id, [string]$State, [string]$Detail, $Provided, $Actual)
-    return [ordered]@{ id = $Id; state = $State; detail = $Detail; provided = $Provided; actual = $Actual }
+    # 凭证项统一形状。label 是可选的**拒绝标签**：凭证校验给出"更精确"的拒绝理由时使用
+    # （G1 ⇒ REFUSED_MANIFEST_INTEGRITY / G2 ⇒ REFUSED_TASKCONFIG_INTEGRITY），
+    # 让现场与测试能从 summary.refused 直接看出是哪一类完整性问题，而不是笼统的 CREDENTIAL_INVALID。
+    param([string]$Id, [string]$State, [string]$Detail, $Provided, $Actual, [string]$Label = '')
+    return [ordered]@{ id = $Id; state = $State; detail = $Detail; provided = $Provided; actual = $Actual; label = $Label }
 }
 
 function Test-WdCredG6 {
@@ -685,6 +742,61 @@ function Get-WdFileSha256 {
     # 文件 SHA-256（小写十六进制）。部署二进制身份的唯一可计算依据（B2）。
     param([string]$Path)
     return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
+function ConvertTo-WdDigestHex {
+    # 把 "sha256:<64 hex>" 或裸 "<64 hex>" 规范化为小写 64 位十六进制；格式非法返回 $null。
+    # 之所以两种都接受：签署包里常写成 sha256:<hex>（与 -G7DeployVersion 的形式一致），
+    # 但人工转录时偶尔只抄 hex；两种写法代表同一个摘要，不构成放宽（格式仍然严格 64 位十六进制）。
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $v = $Value.Trim()
+    if ($v -notmatch '^(?i)(?:sha256:)?([0-9a-f]{64})$') { return $null }
+    return $Matches[1].ToLowerInvariant()
+}
+
+function Read-WdRawFileBytes {
+    # 读取文件**原始字节**并计算 SHA-256（G1/G2 的唯一实现）。
+    #
+    # 为什么必须是"原始字节"而不是"解析后的对象"：
+    #   1) 若先解析再比对，比对的对象可能已经不是"被签署的那个文件内容"（解析器会规范化/丢字段），
+    #      而且"先解析"本身就给了"解析结果与摘要不同源"的绕过空间；
+    #   2) 一次 ReadAllBytes 之后，**同一份字节**既用于算摘要也交给后续解析（$r.bytes），
+    #      因此比对与解析读到的必然是同一份内容，不存在 TOCTOU（比对后文件被换掉再解析）。
+    # 调用方必须先调用本函数、比对成功之后才允许解析 $r.bytes。
+    param([string]$Path)
+    $r = [ordered]@{ ok = $false; path = $Path; bytes = $null; size = 0; sha256 = $null; note = '' }
+    if ([string]::IsNullOrWhiteSpace($Path)) { $r.note = '路径为空'; return $r }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { $r.note = "文件不存在：$Path"; return $r }
+    try {
+        $r.path = (Resolve-Path -LiteralPath $Path).Path
+        $bytes = [System.IO.File]::ReadAllBytes($r.path)
+    }
+    catch {
+        $r.note = "读取原始字节失败：$($_.Exception.Message)"
+        return $r
+    }
+    $r.bytes = $bytes
+    $r.size = $bytes.Length
+    $r.sha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    $r.ok = $true
+    return $r
+}
+
+function ConvertFrom-WdJsonBytes {
+    # 把**已校验过摘要的**原始字节解析成 JSON 对象（与 Read-WdRawFileBytes 配对使用）。
+    # 单独成函数是为了让"摘要 → 解析"的先后顺序在代码里一眼可见：解析只接受字节，不接受路径。
+    param([byte[]]$Bytes)
+    $out = [ordered]@{ ok = $false; doc = $null; note = '' }
+    try {
+        $text = [System.Text.Encoding]::UTF8.GetString($Bytes)
+        $out.doc = $text | ConvertFrom-Json
+        $out.ok = $true
+    }
+    catch {
+        $out.note = $_.Exception.Message
+    }
+    return $out
 }
 
 function Get-WdGitAux {
@@ -731,25 +843,23 @@ function Resolve-WdDeployBinary {
     return $null
 }
 
-function Read-WdManifestDigest {
-    # 受信构建清单（manifest）：只认**显式摘要字段**，缺字段/格式错一律 ok=false（fail-closed）。
+function Get-WdManifestDigestFromDoc {
+    # 从**已解析**的受信构建清单对象里取期望二进制摘要；缺字段/格式错一律 ok=false（fail-closed）。
+    # 注意：本函数只接受**已解析对象**，调用方必须先用 Read-WdRawFileBytes 校验清单**自身**的摘要
+    # （G1），再用 ConvertFrom-WdJsonBytes 解析同一份字节 —— 顺序不可颠倒。
     # 支持两种形态：
     #   {"binary": "<相对/绝对路径>", "sha256": "<64 hex>"}                  —— 单产物
     #   {"artifacts": {"mesad.exe": "<64 hex>", "mesad": "<64 hex>"}}         —— 多产物（按文件名取）
-    param([string]$Path, [string]$BinaryName)
+    param($Doc, [string]$BinaryName)
     $digest = $null
     $binRel = $null
     $note = ''
-    try { $doc = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json }
-    catch {
-        return [ordered]@{ ok = $false; sha256 = $null; binary = $null; note = "受信清单不是合法 JSON：$($_.Exception.Message)" }
+    if ($Doc.PSObject.Properties['binary'] -and -not [string]::IsNullOrWhiteSpace([string]$Doc.binary)) { $binRel = [string]$Doc.binary }
+    if ($Doc.PSObject.Properties['sha256'] -and -not [string]::IsNullOrWhiteSpace([string]$Doc.sha256)) {
+        $digest = ([string]$Doc.sha256).Trim().ToLowerInvariant()
     }
-    if ($doc.PSObject.Properties['binary'] -and -not [string]::IsNullOrWhiteSpace([string]$doc.binary)) { $binRel = [string]$doc.binary }
-    if ($doc.PSObject.Properties['sha256'] -and -not [string]::IsNullOrWhiteSpace([string]$doc.sha256)) {
-        $digest = ([string]$doc.sha256).Trim().ToLowerInvariant()
-    }
-    elseif ($doc.PSObject.Properties['artifacts'] -and $doc.artifacts) {
-        $props = @($doc.artifacts.PSObject.Properties)
+    elseif ($Doc.PSObject.Properties['artifacts'] -and $Doc.artifacts) {
+        $props = @($Doc.artifacts.PSObject.Properties)
         foreach ($pr in $props) {
             if ($BinaryName -and $pr.Name -eq $BinaryName) { $digest = ([string]$pr.Value).Trim().ToLowerInvariant(); break }
         }
@@ -770,14 +880,16 @@ function Read-WdManifestDigest {
 }
 
 function Test-WdCredG7 {
-    # G7 部署版本确认（B2 之后）：**只**接受能独立证明"实际部署二进制身份"的两种形式
+    # G7 部署版本确认：**只**接受能独立证明"实际部署二进制身份"的两种形式
     #   ① sha256:<64 hex>   —— 与指定部署二进制（-G7BinaryPath；缺省探测 target/{release,debug}/mesad[.exe]）
     #                          的**实算**摘要比对；
     #   ② manifest:<path>   —— 从受信构建清单读取期望摘要，再与部署二进制实算摘要比对。
+    #                          **G1 之后**：清单**自身**还必须与 -ExpectedManifestSha256（来自签署包）比对，
+    #                          且该比对发生在**解析清单内容之前**、对**原始文件字节**进行。
     # git HEAD / describe **只作辅助信息**记录，绝不作为通过依据（旧实现拿它当通过依据 = 阻塞 B2）。
     # 两者都不可用（未给摘要/清单、清单不可读或格式错、定位不到二进制、摘要算不出）
     #   ⇒ unverified ⇒ 拒绝进入 FIRED（fail-closed），**不得**降级为"用 git HEAD 代替"。
-    param([string]$Provided, [string]$BinaryPath = '')
+    param([string]$Provided, [string]$BinaryPath = '', [string]$ExpectedManifestSha256 = '')
     $aux = Get-WdGitAux -Root (Get-WdRepoRoot)
     if ([string]::IsNullOrWhiteSpace($Provided)) {
         return (New-WdCredItem 'g7_deploy_version' 'missing' '未提供 -G7DeployVersion（必须 sha256:<64 hex> 或 manifest:<path>；git HEAD/describe 只能作辅助信息，不作为通过依据）' $null $aux)
@@ -797,11 +909,74 @@ function Test-WdCredG7 {
             $actual = [ordered]@{ source = 'manifest'; manifest = [ordered]@{ path = $mPath; ok = $false; note = '读不到' }; git = $aux }
             return (New-WdCredItem 'g7_deploy_version' 'unverified' "受信清单读不到：$mPath → 无法获得期望摘要（按未通过处理；不用 git HEAD 替代）" $p $actual)
         }
-        $mPath = (Resolve-Path -LiteralPath $mPath).Path
+
+        # ── G1：清单**自身**的完整性（必须先于解析，且针对原始文件字节）────────────────
+        # 复审阻塞：只比"清单里的二进制摘要 ↔ 实际二进制"时，**清单与二进制一起被替换**仍然互相匹配；
+        # 清单自身必须有一个来自**签署包**的独立摘要，否则"校验通过"只证明了"两份被换过的东西彼此一致"。
+        $wantManifest = ConvertTo-WdDigestHex -Value $ExpectedManifestSha256
+        if ([string]::IsNullOrWhiteSpace($ExpectedManifestSha256)) {
+            $actual = [ordered]@{
+                source   = 'manifest'
+                manifest = [ordered]@{ path = $mPath; ok = $false; note = '未提供 -ExpectedManifestSha256' }
+                integrity = [ordered]@{ expected = $null; actual = $null; ok = $false; verified_before_parse = $false }
+                git      = $aux
+            }
+            return (New-WdCredItem 'g7_deploy_version' 'missing' '未提供 -ExpectedManifestSha256（受信构建清单自身的 SHA-256，必须取自签署的 G6/G7 执行包）：缺它时"清单+二进制一起被替换"仍会互相匹配 → 拒绝' $p $actual -Label 'REFUSED_MANIFEST_INTEGRITY')
+        }
+        if (-not $wantManifest) {
+            $actual = [ordered]@{
+                source    = 'manifest'
+                manifest  = [ordered]@{ path = $mPath; ok = $false; note = 'ExpectedManifestSha256 格式非法' }
+                integrity = [ordered]@{ expected = $ExpectedManifestSha256; actual = $null; ok = $false; verified_before_parse = $false }
+                git       = $aux
+            }
+            return (New-WdCredItem 'g7_deploy_version' 'invalid' "ExpectedManifestSha256 格式非法：$ExpectedManifestSha256（应形如 sha256:<64 hex>）" $p $actual -Label 'REFUSED_MANIFEST_INTEGRITY')
+        }
+        $rawManifest = Read-WdRawFileBytes -Path $mPath
+        if (-not $rawManifest.ok) {
+            $actual = [ordered]@{
+                source    = 'manifest'
+                manifest  = [ordered]@{ path = $mPath; ok = $false; note = $rawManifest.note }
+                integrity = [ordered]@{ expected = $wantManifest; actual = $null; ok = $false; verified_before_parse = $false }
+                git       = $aux
+            }
+            return (New-WdCredItem 'g7_deploy_version' 'unverified' ("受信清单原始字节读不到（{0}）→ 无法核对清单自身摘要（按未通过处理）" -f $rawManifest.note) $p $actual)
+        }
+        $mIntegrity = [ordered]@{
+            role                 = 'manifest-integrity（G1：清单自身与签署包批准值比对）'
+            path                 = $rawManifest.path
+            size                 = $rawManifest.size
+            expected             = $wantManifest
+            actual               = $rawManifest.sha256
+            ok                   = ($rawManifest.sha256 -eq $wantManifest)
+            verified_before_parse = $true
+            compared_at          = (Get-Date).ToString('o')
+        }
+        if (-not $mIntegrity.ok) {
+            $actual = [ordered]@{
+                source    = 'manifest'
+                manifest  = [ordered]@{ path = $rawManifest.path; ok = $false; sha256_self = $rawManifest.sha256; integrity = $mIntegrity }
+                git       = $aux
+            }
+            return (New-WdCredItem 'g7_deploy_version' 'invalid' ("受信清单原始文件的 SHA-256（{0}）与签署包批准值（{1}）不一致：清单内容未获独立批准（清单与二进制一起被替换时二者仍互相匹配）→ 拒绝" -f $rawManifest.sha256, $wantManifest) $p $actual -Label 'REFUSED_MANIFEST_INTEGRITY')
+        }
+
+        # 完整性通过后才解析：解析的正是**校验过的那份字节**（ConvertFrom-WdJsonBytes 只接受字节）。
+        $parsed = ConvertFrom-WdJsonBytes -Bytes $rawManifest.bytes
+        if (-not $parsed.ok) {
+            $actual = [ordered]@{
+                source    = 'manifest'
+                manifest  = [ordered]@{ path = $rawManifest.path; ok = $false; sha256_self = $rawManifest.sha256; integrity = $mIntegrity; note = '不是合法 JSON' }
+                git       = $aux
+            }
+            return (New-WdCredItem 'g7_deploy_version' 'unverified' "受信清单不是合法 JSON：$($parsed.note)（按未通过处理）" $p $actual)
+        }
+        $mPath = $rawManifest.path
         $binName = if (-not [string]::IsNullOrWhiteSpace($BinaryPath)) { Split-Path -Leaf $BinaryPath } else { '' }
-        $manifestInfo = Read-WdManifestDigest -Path $mPath -BinaryName $binName
+        $manifestInfo = Get-WdManifestDigestFromDoc -Doc $parsed.doc -BinaryName $binName
         $manifestInfo['path'] = $mPath
-        try { $manifestInfo['sha256_self'] = Get-WdFileSha256 -Path $mPath } catch { $manifestInfo['sha256_self'] = $null }
+        $manifestInfo['sha256_self'] = $rawManifest.sha256
+        $manifestInfo['integrity'] = $mIntegrity
         if (-not $manifestInfo.ok) {
             $actual = [ordered]@{ source = 'manifest'; manifest = $manifestInfo; git = $aux }
             return (New-WdCredItem 'g7_deploy_version' 'unverified' ("受信清单不可用（{0}）→ 无法获得期望摘要（按未通过处理）" -f $manifestInfo.note) $p $actual)
@@ -818,6 +993,11 @@ function Test-WdCredG7 {
         # 形如 commit SHA / git describe：只能证明"与仓库版本匹配"，不能证明部署物身份 → fail-closed。
         $actual = [ordered]@{ source = 'rejected-form'; provided = $p; git = $aux }
         return (New-WdCredItem 'g7_deploy_version' 'unverified' "提供的值 `"$p`" 不是 sha256:<64 hex> / manifest:<path>：git 版本标识不能独立证明部署二进制身份（B2）→ 按未通过处理，不做降级放行" $p $actual)
+    }
+    # G1 的反向约束：给了"清单自身摘要"却不走清单形式 ⇒ 拒绝（不静默忽略一个已批准的摘要）。
+    if ($source -ne 'manifest' -and -not [string]::IsNullOrWhiteSpace($ExpectedManifestSha256)) {
+        $actual = [ordered]@{ source = $source; provided = $p; expected_manifest_sha256 = $ExpectedManifestSha256; git = $aux }
+        return (New-WdCredItem 'g7_deploy_version' 'invalid' "已提供 -ExpectedManifestSha256，但 -G7DeployVersion 不是 manifest:<path>（该批准值无处可用）：不允许静默忽略签署包里的清单摘要 → 拒绝" $p $actual -Label 'REFUSED_MANIFEST_INTEGRITY')
     }
     $binary = Resolve-WdDeployBinary -Explicit $BinaryPath
     if (-not $binary) {
@@ -903,12 +1083,26 @@ function Read-WdApprovedTaskConfig {
     #     "connection": {"host","port","local_tsap","remote_tsap","pdu_length"},
     #     "tasks": [ {"id","schedule","binding":{"kind","config":{"points":[...]}}} ]
     #   }
-    param([string]$Path)
-    $r = [ordered]@{ ok = $false; note = ''; path = $Path; schema = $null; endpoint_id = $null; revision = $null; connection = $null; tasks = $null; tasks_fingerprint = $null; tasks_payload = $null }
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { $r.note = "获批任务配置读不到：$Path"; return $r }
-    $r.path = (Resolve-Path -LiteralPath $Path).Path
-    try { $doc = Get-Content -LiteralPath $r.path -Raw | ConvertFrom-Json }
-    catch { $r.note = "获批任务配置不是合法 JSON：$($_.Exception.Message)"; return $r }
+    # G2 之后本函数**优先接受字节**（-Bytes）：调用方必须先用 Read-WdRawFileBytes 校验文件自身摘要，
+    # 再把**同一份字节**交进来解析。只有 -Bytes 为空时才回退到按路径读（仅供不需要 G2 的旧调用点，
+    # 当前脚本内已无此类调用点）。
+    param([string]$Path, [byte[]]$Bytes = $null, [string]$FileSha256 = '')
+    $r = [ordered]@{ ok = $false; note = ''; path = $Path; schema = $null; endpoint_id = $null; revision = $null; connection = $null; tasks = $null; tasks_fingerprint = $null; tasks_payload = $null; file_sha256 = $FileSha256; parsed_from = '' }
+    if ($null -ne $Bytes -and $Bytes.Length -gt 0) {
+        $r.parsed_from = 'verified-bytes'
+        $parsed = ConvertFrom-WdJsonBytes -Bytes $Bytes
+        if (-not $parsed.ok) { $r.note = "获批任务配置不是合法 JSON：$($parsed.note)"; return $r }
+        $doc = $parsed.doc
+    }
+    else {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { $r.note = "获批任务配置读不到：$Path"; return $r }
+        $r.parsed_from = 'path（未做文件自身摘要校验的旧路径）'
+        try { $doc = Get-Content -LiteralPath $r.path -Raw | ConvertFrom-Json }
+        catch { $r.note = "获批任务配置不是合法 JSON：$($_.Exception.Message)"; return $r }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Path) -and (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $r.path = (Resolve-Path -LiteralPath $Path).Path
+    }
     if ($doc.PSObject.Properties['schema']) { $r.schema = [string]$doc.schema }
     if ($doc.PSObject.Properties['endpoint_id']) { $r.endpoint_id = [string]$doc.endpoint_id }
     if ($doc.PSObject.Properties['revision']) { $r.revision = [string]$doc.revision }
@@ -920,6 +1114,62 @@ function Read-WdApprovedTaskConfig {
     $r.tasks_fingerprint = $fp.fingerprint
     $r.tasks_payload = $fp.payload
     $r.ok = $true
+    return $r
+}
+
+function Test-WdApprovedFileIntegrity {
+    # G2：获批任务配置**文件自身**的完整性 —— 必须与签署包里的独立批准值比对。
+    #
+    # 为什么不能只靠 -ExpectedTaskFingerprint：指纹 = SHA-256(规范化 **tasks 数组**)，
+    # **connection（host/port/TSAP/PDU）不在其中**；改动 connection 时指纹一字不变，
+    # 于是"指纹相同"并不能证明"这份文件就是签署时批准的那份"。只有文件原始字节的摘要能证明。
+    #
+    # 顺序要求：**先对原始字节算摘要并比对，比对通过后才允许解析**（本函数只返回字节，不解析）。
+    # 返回 state ∈ verified / missing / invalid / unverified，与凭证项的状态语义一致。
+    param([string]$Path, [string]$ExpectedSha256)
+    $r = [ordered]@{
+        state                  = 'unverified'
+        detail                 = ''
+        path                   = $Path
+        size                   = 0
+        expected               = $null
+        actual                 = $null
+        ok                     = $false
+        verified_before_parse  = $false
+        compared_at            = (Get-Date).ToString('o')
+        raw                    = $null
+    }
+    if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+        $r.state = 'missing'
+        $r.detail = '未提供 -ExpectedApprovedTaskConfigSha256（获批任务配置文件自身的 SHA-256，必须取自签署的 G6/G7 执行包）：tasks 指纹不覆盖 connection，文件可被改动而指纹不变 → 拒绝'
+        return $r
+    }
+    $want = ConvertTo-WdDigestHex -Value $ExpectedSha256
+    if (-not $want) {
+        $r.state = 'invalid'
+        $r.expected = $ExpectedSha256
+        $r.detail = "ExpectedApprovedTaskConfigSha256 格式非法：$ExpectedSha256（应形如 sha256:<64 hex>）"
+        return $r
+    }
+    $r.expected = $want
+    $raw = Read-WdRawFileBytes -Path $Path
+    if (-not $raw.ok) {
+        $r.detail = "获批任务配置读不到（$($raw.note)）→ 无法核对文件自身摘要（按未通过处理）"
+        return $r
+    }
+    $r.raw = $raw
+    $r.path = $raw.path
+    $r.size = $raw.size
+    $r.actual = $raw.sha256
+    $r.verified_before_parse = $true
+    if ($raw.sha256 -ne $want) {
+        $r.state = 'invalid'
+        $r.detail = "获批任务配置文件的 SHA-256（$($raw.sha256)）与签署包批准值（$want）不一致：该文件不是签署时批准的版本 → 拒绝（tasks 指纹相同也不放行：指纹不覆盖 connection）"
+        return $r
+    }
+    $r.state = 'verified'
+    $r.ok = $true
+    $r.detail = "获批任务配置文件的原始字节 SHA-256 与签署包批准值一致（$want；$($raw.size) 字节；在解析文件之前比对）"
     return $r
 }
 
@@ -1041,15 +1291,19 @@ function Test-WdCredTaskConfig {
     #   ② 连接配置 host / port / TSAP(local_tsap + remote_tsap) / PDU(pdu_length)
     #   ③ 获批点位的**完整 Key 与参数**（tasks[].binding.config.points[]，逐点比对，不只数量）
     #   ④ 任务配置**指纹**（规范化 tasks 数组的 SHA-256）与批准版本一致
+    #   ⓪（G2，**最先做**）获批配置文件**自身**的 SHA-256 必须等于签署包批准值，
+    #      且在**解析文件之前**对**原始字节**计算 —— 指纹不覆盖 connection，只有文件摘要能挡住
+    #      "connection 被改而指纹不变"的篡改。
     # 任一项读不到 ⇒ unverified；读到但不一致 ⇒ invalid。两者都不得进入 FIRED（不发 Start）。
     param($Ctx, [string]$ExpectedEndpoint, [string]$ExpectedRevision, [int]$ExpectedPoints,
-        [string]$ApprovedPath, [string]$ExpectedFingerprint)
+        [string]$ApprovedPath, [string]$ExpectedFingerprint, [string]$ExpectedApprovedSha256 = '')
     $expected = [ordered]@{
-        endpoint_id          = $ExpectedEndpoint
-        revision             = $ExpectedRevision
-        point_count          = $ExpectedPoints
-        approved_task_config = $ApprovedPath
-        tasks_fingerprint    = $ExpectedFingerprint
+        endpoint_id                = $ExpectedEndpoint
+        revision                   = $ExpectedRevision
+        point_count                = $ExpectedPoints
+        approved_task_config       = $ApprovedPath
+        tasks_fingerprint          = $ExpectedFingerprint
+        approved_config_sha256     = $ExpectedApprovedSha256
     }
     # ── 输入完整性：缺任一项都不得放行（B3 的期望值不是"可选项"）──────────────────
     if ([string]::IsNullOrWhiteSpace($ExpectedRevision)) {
@@ -1069,14 +1323,21 @@ function Test-WdCredTaskConfig {
     }
     $wantFp = ($ExpectedFingerprint -replace '^(?i)sha256:', '').ToLowerInvariant()
 
+    # ── ⓪ G2：获批配置文件**自身**必须先与签署包批准值比对（先算摘要、后解析）──────
+    $approvedIntegrity = Test-WdApprovedFileIntegrity -Path $ApprovedPath -ExpectedSha256 $ExpectedApprovedSha256
+    if ($approvedIntegrity.state -ne 'verified') {
+        return (New-WdCredItem 'task_config' $approvedIntegrity.state $approvedIntegrity.detail $expected ([ordered]@{ approved_file = $approvedIntegrity }) -Label 'REFUSED_TASKCONFIG_INTEGRITY')
+    }
+
     # ── ① 本地：获批配置必须自证是"批准版本"（不涉及网络）──────────────────────
-    $approved = Read-WdApprovedTaskConfig -Path $ApprovedPath
+    # 解析的是**刚校验过摘要的那份字节**（不是重新按路径读一遍），排除"比对与解析不同源"。
+    $approved = Read-WdApprovedTaskConfig -Path $ApprovedPath -Bytes $approvedIntegrity.raw.bytes -FileSha256 $approvedIntegrity.actual
     if (-not $approved.ok) {
-        return (New-WdCredItem 'task_config' 'unverified' ("获批任务配置不可用（{0}）→ 无法核验任务配置（按未通过处理）" -f $approved.note) $expected ([ordered]@{ approved = $approved }))
+        return (New-WdCredItem 'task_config' 'unverified' ("获批任务配置不可用（{0}）→ 无法核验任务配置（按未通过处理）" -f $approved.note) $expected ([ordered]@{ approved = $approved; approved_file = $approvedIntegrity }))
     }
     $approvedFp = [string]$approved.tasks_fingerprint
     if ($approvedFp -ne "sha256:$wantFp") {
-        $actual0 = [ordered]@{ approved = $approved; approved_fingerprint = $approvedFp; expected_fingerprint = "sha256:$wantFp"; http = [ordered]@{} }
+        $actual0 = [ordered]@{ approved = $approved; approved_file = $approvedIntegrity; approved_fingerprint = $approvedFp; expected_fingerprint = "sha256:$wantFp"; http = [ordered]@{} }
         return (New-WdCredItem 'task_config' 'invalid' ("获批任务配置文件的指纹（{0}）与 -ExpectedTaskFingerprint（sha256:{1}）不一致：该文件不是获批版本（或已被改动）→ 拒绝" -f $approvedFp, $wantFp) $expected $actual0)
     }
 
@@ -1093,6 +1354,7 @@ function Test-WdCredTaskConfig {
         connection           = $null
         tasks_fingerprint    = $null
         approved_fingerprint = $approvedFp
+        approved_file        = $approvedIntegrity
         point_keys           = [ordered]@{}
         tasks_source         = ''
         tasks_payload        = $null
@@ -1220,12 +1482,19 @@ function Test-WdCredentials {
         $items['authz_ticket'] = New-WdCredItem 'authz_ticket' 'verified' "授权凭证编号=$AuthzTicket" $AuthzTicket $null
     }
     $items['g6_signoff'] = Test-WdCredG6 -Signoff $G6Signoff -SignedAt $G6SignedAt
-    $items['g7_deploy_version'] = Test-WdCredG7 -Provided $G7DeployVersion -BinaryPath $G7BinaryPath
+    $items['g7_deploy_version'] = Test-WdCredG7 -Provided $G7DeployVersion -BinaryPath $G7BinaryPath -ExpectedManifestSha256 $ExpectedManifestSha256
     if ($CheckNetwork) {
-        $items['task_config'] = Test-WdCredTaskConfig -Ctx $ctx -ExpectedEndpoint $EndpointId -ExpectedRevision $ExpectedTaskRevision -ExpectedPoints $ExpectedPointCount -ApprovedPath $ApprovedTaskConfig -ExpectedFingerprint $ExpectedTaskFingerprint
+        $items['task_config'] = Test-WdCredTaskConfig -Ctx $ctx -ExpectedEndpoint $EndpointId -ExpectedRevision $ExpectedTaskRevision -ExpectedPoints $ExpectedPointCount -ApprovedPath $ApprovedTaskConfig -ExpectedFingerprint $ExpectedTaskFingerprint -ExpectedApprovedSha256 $ExpectedApprovedTaskConfigSha256
     }
     else {
-        $items['task_config'] = New-WdCredItem 'task_config' 'not_checked' '静态校验阶段未做任务配置核验（需先通过授权边界后才发起只读 GET）' ([ordered]@{ endpoint_id = $EndpointId; revision = $ExpectedTaskRevision; point_count = $ExpectedPointCount; approved_task_config = $ApprovedTaskConfig; tasks_fingerprint = $ExpectedTaskFingerprint }) $null
+        # 静态阶段也核对"获批配置文件自身"的摘要（G2）：这是**纯本地文件检查、不需要网络**，
+        # 因此必须在这一阶段就成立 —— 好处是 G2 的拒绝发生在任何连接建立之前（network_actions = 0），
+        # 而不是"先连上端点再去发现批准文件是假的"。
+        $fileIntegrity = Test-WdApprovedFileIntegrity -Path $ApprovedTaskConfig -ExpectedSha256 $ExpectedApprovedTaskConfigSha256
+        $items['approved_task_config_integrity'] = New-WdCredItem 'approved_task_config_integrity' $fileIntegrity.state $fileIntegrity.detail `
+        ([ordered]@{ path = $ApprovedTaskConfig; expected = $ExpectedApprovedTaskConfigSha256 }) ([ordered]@{ file = $fileIntegrity }) `
+        $(if ($fileIntegrity.state -eq 'verified') { '' } else { 'REFUSED_TASKCONFIG_INTEGRITY' })
+        $items['task_config'] = New-WdCredItem 'task_config' 'not_checked' '静态校验阶段未做任务配置核验（需先通过授权边界后才发起只读 GET；获批配置**文件自身**的摘要已在 approved_task_config_integrity 里核对）' ([ordered]@{ endpoint_id = $EndpointId; revision = $ExpectedTaskRevision; point_count = $ExpectedPointCount; approved_task_config = $ApprovedTaskConfig; tasks_fingerprint = $ExpectedTaskFingerprint; approved_config_sha256 = $ExpectedApprovedTaskConfigSha256 }) $null
     }
     # not_checked 是"静态阶段还没做"的占位（任务配置核验需要只读 GET），不算失败项。
     $failing = @($items.Keys | Where-Object { $items[$_].state -notin @('verified', 'not_checked') })
@@ -1380,7 +1649,7 @@ if ($Mode -eq 'arm') {
             side_effects       = @($networkActions | Where-Object { $_ -like 'POST*' })
         }
         ready_for_fire       = ($armExit -eq 0)
-        next_step            = '若 ready_for_fire=true，运行 fire 需另行显式：-Mode fire -Authorized -AuthorizedBy … -AuthzTicket … -G6Signoff … -G6SignedAt … -G7DeployVersion … -ExpectedTaskRevision … -ExpectedPointCount …'
+        next_step            = '若 ready_for_fire=true，运行 fire 需另行显式：-Mode fire -Authorized -AuthorizedBy … -AuthzTicket … -G6Signoff … -G6SignedAt … -G7DeployVersion … -ExpectedManifestSha256 …（manifest 形式时）-ExpectedTaskRevision … -ExpectedPointCount … -ApprovedTaskConfig … -ExpectedApprovedTaskConfigSha256 … -ExpectedTaskFingerprint …'
         verdict              = $armLabel
         exit_code            = $armExit
         out_dir              = $OutDir
@@ -1416,14 +1685,26 @@ if ($Mode -eq 'arm') {
 
 #region ── FIRED 前置条件：显式授权 + 四项凭证**校验通过**（F2）───────────────────
 # 到这里说明 Mode=fire。分三步，**任一步不通过都不进入 FIRED（不发 Start）**：
-#   ① 静态凭证（不建连接）：授权开关/授权人/凭证号/G6 格式/G7 与仓库 HEAD 或二进制指纹比对；
+#   ① 静态凭证（不建连接）：授权开关/授权人/凭证号/G6 格式/G7 与二进制或受信清单指纹比对
+#      （G1：清单**自身**也要与签署包批准值比对）/获批配置文件**自身**摘要（G2）；
 #   ② 授权边界：静态凭证通过 ⇒ 放行任意 host（含生产 mesad 8132 与现场地址）；
-#   ③ 任务配置核验（只读 GET）：endpoint 存在性 / 任务 revision / point_count 与实际比对。
+#   ③ 任务配置核验（只读 GET）：endpoint 存在性 / 任务 revision / point_count / 连接 / 点位 / 指纹。
 $creds = Test-WdCredentials -CheckNetwork:$false
 Add-WdLog $ctx 'INFO' ("fire 静态凭证校验：overall={0}；未通过={1}" -f $creds.overall, $(if ($creds.failing.Count -gt 0) { $creds.failing -join ',' } else { '（无）' }))
 if ($creds.overall -ne 'verified') {
     $missing = @($creds.failing | Where-Object { $creds.items[$_].state -eq 'missing' })
-    $label = if ($missing.Count -gt 0) { 'REFUSED_NOT_AUTHORIZED' } else { 'REFUSED_CREDENTIAL_INVALID' }
+    # 拒绝标签优先级：
+    #   ① 显式授权缺失（-Authorized / -AuthzTicket）⇒ REFUSED_NOT_AUTHORIZED（这是最外层的门，先报它）；
+    #   ② 凭证项自己给出的**精确标签**（G1 ⇒ REFUSED_MANIFEST_INTEGRITY / G2 ⇒ REFUSED_TASKCONFIG_INTEGRITY）；
+    #   ③ 其余缺失 ⇒ REFUSED_NOT_AUTHORIZED；④ 其余 ⇒ REFUSED_CREDENTIAL_INVALID。
+    # 这样"清单/批准文件自身未被独立验证"不会被笼统归成"缺授权"，而"根本就没授权"也不会被
+    # 后面的完整性标签掩盖。
+    $authMissing = @($creds.failing | Where-Object { $_ -in @('authorized', 'authz_ticket') -and $creds.items[$_].state -eq 'missing' })
+    $labelled = @($creds.failing | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$creds.items[$_].label) })
+    $label = if ($authMissing.Count -gt 0) { 'REFUSED_NOT_AUTHORIZED' }
+    elseif ($labelled.Count -gt 0) { [string]$creds.items[$labelled[0]].label }
+    elseif ($missing.Count -gt 0) { 'REFUSED_NOT_AUTHORIZED' }
+    else { 'REFUSED_CREDENTIAL_INVALID' }
     $detailLines = @($creds.failing | ForEach-Object { "$_=$($creds.items[$_].state)：$($creds.items[$_].detail)" })
     Write-WdRefusal -Code 40 -Label $label -Reason ("四项凭证未全部通过校验 → 不进入 FIRED：" + ($detailLines -join '；')) -Extra @{ credentials = $creds }
 }
@@ -1432,13 +1713,15 @@ $boundary.decided_by = 'fire：静态凭证校验通过'
 $boundary.reason = "fire 凭证已校验通过 → 放行 $($urlInfo.host):$($urlInfo.port)"
 Add-WdLog $ctx 'INFO' "授权边界放行：$($boundary.reason)"
 
-$taskCred = Test-WdCredTaskConfig -Ctx $ctx -ExpectedEndpoint $EndpointId -ExpectedRevision $ExpectedTaskRevision -ExpectedPoints $ExpectedPointCount -ApprovedPath $ApprovedTaskConfig -ExpectedFingerprint $ExpectedTaskFingerprint
+$taskCred = Test-WdCredTaskConfig -Ctx $ctx -ExpectedEndpoint $EndpointId -ExpectedRevision $ExpectedTaskRevision -ExpectedPoints $ExpectedPointCount -ApprovedPath $ApprovedTaskConfig -ExpectedFingerprint $ExpectedTaskFingerprint -ExpectedApprovedSha256 $ExpectedApprovedTaskConfigSha256
 $creds.items['task_config'] = $taskCred
 $creds.failing = @($creds.items.Keys | Where-Object { $creds.items[$_].state -ne 'verified' })
 $creds.overall = if ($creds.failing.Count -eq 0) { 'verified' } else { 'rejected' }
 Add-WdLog $ctx $(if ($taskCred.state -eq 'verified') { 'INFO' } else { 'ERROR' }) ("fire 任务配置核验：{0}；{1}" -f $taskCred.state, $taskCred.detail)
 if ($taskCred.state -ne 'verified') {
-    $label = if ($taskCred.state -eq 'invalid') { 'REFUSED_TASKCONFIG_MISMATCH' } else { 'REFUSED_CREDENTIAL_UNVERIFIABLE' }
+    $label = if (-not [string]::IsNullOrWhiteSpace([string]$taskCred.label)) { [string]$taskCred.label }
+    elseif ($taskCred.state -eq 'invalid') { 'REFUSED_TASKCONFIG_MISMATCH' }
+    else { 'REFUSED_CREDENTIAL_UNVERIFIABLE' }
     Write-WdRefusal -Code 40 -Label $label -Reason ("任务配置核验未通过 → 不进入 FIRED：" + $taskCred.detail) -Extra @{ credentials = $creds } -NetworkActions ([int]$(if ($null -ne $script:credNetworkActions) { $script:credNetworkActions } else { 0 }))
 }
 if ($HostChecks) {
@@ -1448,7 +1731,7 @@ if ($HostChecks) {
 if ($SkipHostChecks) {
     Add-WdLog $ctx 'WARN' '显式 -SkipHostChecks：④驱动进程 / ⑤到设备 TCP 记为 not_verified，本轮不得判"停净"（退出码 7）'
 }
-Add-WdLog $ctx 'WARN' ("FIRED 前置条件全部满足：AuthorizedBy={0}；ticket={1}；G6={2}@{3}；G7={4}；rev={5}；points={6}" -f $AuthorizedBy, $AuthzTicket, $G6Signoff, $G6SignedAt, $G7DeployVersion, $ExpectedTaskRevision, $ExpectedPointCount)
+Add-WdLog $ctx 'WARN' ("FIRED 前置条件全部满足：AuthorizedBy={0}；ticket={1}；G6={2}@{3}；G7={4}；清单自身={5}；rev={6}；points={7}；获批配置自身={8}" -f $AuthorizedBy, $AuthzTicket, $G6Signoff, $G6SignedAt, $G7DeployVersion, $(if ($ExpectedManifestSha256) { $ExpectedManifestSha256 } else { '（不适用：非 manifest 形式）' }), $ExpectedTaskRevision, $ExpectedPointCount, $ExpectedApprovedTaskConfigSha256)
 Write-Host ("[fire] 授权就绪：by={0} ticket={1} g6={2}@{3} g7={4} rev={5} points={6}" -f $AuthorizedBy, $AuthzTicket, $G6Signoff, $G6SignedAt, $G7DeployVersion, $ExpectedTaskRevision, $ExpectedPointCount)
 #endregion
 
@@ -1997,10 +2280,12 @@ $stamp = [ordered]@{
         g6_signed_at = $G6SignedAt
         g7_deploy_version = $G7DeployVersion
         g7_binary_path    = $G7BinaryPath
+        expected_manifest_sha256 = $ExpectedManifestSha256
         expected_revision = $ExpectedTaskRevision
         expected_points   = $ExpectedPointCount
         approved_task_config = $ApprovedTaskConfig
         expected_tasks_fingerprint = $ExpectedTaskFingerprint
+        expected_approved_task_config_sha256 = $ExpectedApprovedTaskConfigSha256
         injection_guard   = $injectionGuard
         items        = $creds.items
     }
@@ -2609,10 +2894,12 @@ $summary = [ordered]@{
         g6_signed_at      = $G6SignedAt
         g7_deploy_version = $G7DeployVersion
         g7_binary_path    = $G7BinaryPath
+        expected_manifest_sha256 = $ExpectedManifestSha256
         expected_revision = $ExpectedTaskRevision
         expected_points   = $ExpectedPointCount
         approved_task_config = $ApprovedTaskConfig
         expected_tasks_fingerprint = $ExpectedTaskFingerprint
+        expected_approved_task_config_sha256 = $ExpectedApprovedTaskConfigSha256
         task_config_ref   = $TaskConfigRef
         failing           = @($creds.failing)
         items             = $creds.items

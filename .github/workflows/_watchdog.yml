@@ -58,7 +58,7 @@ jobs:
           if (-not $py) { throw '需要 python3（假端点桩依赖它）；runner 上找不到 python3/python —— 明确失败，不静默跳过' }
           Write-Host "平台 = ${{ matrix.platform }}；pwsh/python 就绪"
 
-      - name: 跑 stop-watchdog 离线场景（M0–M16）
+      - name: 跑 stop-watchdog 离线场景（M0–M18）
         shell: pwsh
         run: |
           pwsh -NoProfile -File tests/watchdog/run-watchdog-scenarios.ps1 -EvidenceRoot target/validation/stop-watchdog
