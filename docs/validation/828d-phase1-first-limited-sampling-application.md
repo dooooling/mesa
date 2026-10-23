@@ -2,12 +2,15 @@
 
 - **文档性质：申请，尚未获批。** 本文档不构成执行授权；只有 §10 裁决为 **GO** 且四方签字齐全后，才可按 §5 执行。**未获批准不得 Start。**
 - **模板用法**：每轮复制本文件 → 改写 §1 空白、§3 点集、§5 时间窗 → **重跑 §4 六道现场门（用本轮新证据）** → §10 重新裁决。**上一轮的 GO 不延续到下一轮。**
-- 实施基线：**`main = 1a382ee58428c472cc936d2340b21deee7a2f070`**（G7 代码、G7 设计、watchdog 全部已合并；编制时工作树干净，本文件为唯一新增）；本轮 **R1**；版本 **v1.3**；编制日期 2026-10-20（v1.3 对齐修订 2026-10-23）。
+- 实施基线：**`main = 1a382ee58428c472cc936d2340b21deee7a2f070`**（G7 代码、G7 设计、watchdog 全部已合并；编制时工作树干净，本文件为唯一新增）；本轮 **R1**；版本 **v1.4**；编制日期 2026-10-20（v1.3 对齐修订 2026-10-23；**v1.4 勘误 2026-10-23**）。
+- **v1.4 勘误声明（必须先读；只追加标注，不改写 v1.3 原文）**：v1.3 有两处技术口径与实现不符，本版据代码与 PR 更正。原文**保留**并就地加注（`~~删除线~~` 表示被更正的原句），因为 v1.3 是已签署的申请记录，**不得静默改写历史**：
+  1. **事实 A：`ApplyPointMap` 不写 `point_registry`**。`point_registry` 的**唯一写点**是 `assign_point_ids`（`crates/config-store/src/lib.rs:2344-2456`），经 `StorePointIdSource::assign`（`crates/driver-manager/src/endpoint.rs:206-224`，调用点 `:213`）在 `run_config_flow`（`endpoint.rs:943-945`）中调用，**位于 `ConfigureTasks`（`endpoint.rs:914`）之后、`ApplyPointMap`（`endpoint.rs:968-985`）之前**；`ApplyPointMap` 只把 `point_key → point_id` 映射下发给 Driver，**本身不落库**。凡 v1.3 中"`point_map` 由 Start 时的 `ApplyPointMap` 写入"一类表述，一律按此更正（见 §4.6 末条、§11-2）。
+  2. **事实 B：`-ExpectedPointCount` 的语义已由 PR #136 变更**（BLOCKED-01；`dfc81e0`，**Draft，尚未合入 main**）。旧语义：比对 `diagnostics.point_count`（持久化 `point_registry` 的残留行数）；新语义：比对**当前任务点数**——由 `Get-WdTaskPointCount`（**PR #136 后** `scripts/stop-watchdog.ps1:1293`）从**实时任务快照** `tasks[].binding.config.points[]` 总数计算，判据在 **PR #136 后** `watchdog:1509-1518`。`diagnostics.point_count` 降级为 `diagnostics_point_count_observed`（**observed-only，不参与配置门判定**；证据块 `task_config_observation`：拒绝记录 `:614` / arm-report `:1756` / fire summary `:3045`）。**#136 未合入前，main 上的 `watchdog:156-158` 仍是旧语义**，故本文凡引用 #136 行号处均标"PR #136 后"。详见 §3.3、§11-2。
 - **v1.3 对齐声明（必须先读）**：本文档**已对齐 `main = 1a382ee` 上 G6/G7 的实际已实现能力**，不再按"设计意图"承诺。三处实质性修订：
   1. **G6 由"设计要点"改为"已实现脚本的实测门"**：`scripts/stop-watchdog.ps1`（3096 行）已实现 `-Mode arm|fire`（**缺省 arm**）、ARMED **零副作用**、FIRED **必须显式授权**、**四项凭证全部为校验**（含两个"被批准对象自身"的文件摘要）、**完整配置比对**、**离线硬门**、**`exit 40 = 授权边界拒绝`**。
   2. **G7 由"待修复前置"改为"已合入 main 的生命周期门"**：`crates/core-api/src/lifecycle.rs` 已落地 attempt 表唯一真值、**六条完整停止判据**（`lifecycle.rs:986-1046`）、并发 Stop 合流（`lib.rs:2262`）、删除屏障与有界等待 `DELETE_PERSIST_WAIT = 10s`（`lifecycle.rs:55`）、**NCK 开机一律不自动恢复**（`recovery.rs:29-37`、`apps/mesad/src/main.rs:184-198`）。因此现场不再"核验修复 PR"，改为**核验部署二进制身份**（`-G7DeployVersion`）+ **外部复核六条判据**。
   3. **证据与判据改为按实现口径**：`watchdog-states.jsonl` / `watchdog-stops.jsonl` / `run-log.md` / `t0.stamp` / `summary.json` / `arm-report.json` **由 watchdog 自动产出**；`summary.json` 把 **调度（schedule）/ 采集（sampling）/ 收敛（convergence）拆成三条独立轴**，并把 **`verdict`（进程处置）与 `trial`（试验结论）分开**。
-- 编制声明与口径：本次**只新增/改写本文件**，未改代码/测试/配置/既有文档，未做 git 写操作，未连设备、未启服务、未跑测试或构建；事实给 `文件:行号` 或场景号（`tests/watchdog/run-watchdog-scenarios.ps1` 的 M0–M18），无法由代码/产物确定的标 **待确认**（汇总见 §11）；**不夸大**——30 秒 ≠ Stop 完成时间，读到值 ≠ 业务可用，rev15/rev17 可用是**已证明**的而非假定的。**v1.0 → v1.1 强化执行安全与证据约束；v1.1 → v1.2 拆 G6 两阶段、调度解耦与竞态前置；v1.3 按 main 实际实现逐条对齐——三版均不新增点位、不扩大采集范围、不改任何代码。**
+- 编制声明与口径：本次**只新增/改写本文件**，未改代码/测试/配置/既有文档，未做 git 写操作，未连设备、未启服务、未跑测试或构建；事实给 `文件:行号` 或场景号（`tests/watchdog/run-watchdog-scenarios.ps1` 的 M0–M18），无法由代码/产物确定的标 **待确认**（汇总见 §11）；**不夸大**——30 秒 ≠ Stop 完成时间，读到值 ≠ 业务可用，rev15/rev17 可用是**已证明**的而非假定的。**v1.0 → v1.1 强化执行安全与证据约束；v1.1 → v1.2 拆 G6 两阶段、调度解耦与竞态前置；v1.3 按 main 实际实现逐条对齐；v1.4 仅勘误两处口径（`ApplyPointMap` 不写 registry、`-ExpectedPointCount` 语义）——四版均不新增点位、不扩大采集范围、不改任何代码。**
 - 简称：**诊断方案** = `docs/design/nck-s7-job-0x8201-diagnosis-plan.md`；**清单** = `docs/design/nck-828d-phase1-p0-points.md`；**质量调查** = `docs/design/quality-code-observability-investigation.md`；**D1** = `docs/design/pr-d1-quality-code-visibility-design.md`；**watchdog** = `scripts/stop-watchdog.ps1`；**G7 设计** = `docs/design/core-start-stop-race-fix-design.md`；**离线套件** = `tests/watchdog/`（`run-watchdog-scenarios.ps1` + `stub_endpoint.py` + `README.md`）；**生命周期门** = `crates/core-api/src/lifecycle.rs`。
 
 ## 1. 申请信息
@@ -72,7 +75,7 @@
 
 `endpoint_id=lx-nck-tags-190-connection`；单任务 `id=t1`；`schedule={interval_ms:5000, mode:"poll"}`；`binding.kind=nck.points.v1`；`binding.config.points` = §3.1 的 4 点，**顺序不变**。
 
-- **v1.3 补充（与 watchdog 凭证的对应关系）**：本轮四点配置的 PUT 发生在 **Start 之前**（§5.2-3），预期 `revision=18`。watchdog 的 `-ExpectedTaskRevision` 与 `GET /api/v1/tasks?endpoint=` 的 `revision` 严格比对（`watchdog:1252-1286`、`:151-154`），`-ExpectedPointCount` 与 `GET /api/v1/endpoints/{id}/diagnostics` 的 `point_count` 比对（`watchdog:156-158`；来源 `crates/core-api/src/lib.rs:1499`）。**这两个值必须取自签署的 G6/G7 执行包，不得在现场按当前状态现填**（§4.6-④、§11-2）。
+- **v1.3 补充（与 watchdog 凭证的对应关系）**：本轮四点配置的 PUT 发生在 **Start 之前**（§5.2-3），预期 `revision=18`。watchdog 的 `-ExpectedTaskRevision` 与 `GET /api/v1/tasks?endpoint=` 的 `revision` 严格比对（`watchdog:1252-1286`、`:151-154`），`-ExpectedPointCount` 与 `GET /api/v1/endpoints/{id}/diagnostics` 的 `point_count` 比对（`watchdog:156-158`；来源 `crates/core-api/src/lib.rs:1499`）。**这两个值必须取自签署的 G6/G7 执行包，不得在现场按当前状态现填**（§4.6-④、§11-2）。**v1.4 勘误**：`-ExpectedPointCount` 的语义见 §3.3 与 §11-2——**当前任务点数取自实时任务快照**（`GET /api/v1/tasks?endpoint=` 的 `tasks[].binding.config.points[]` 总数），**不是 `diagnostics.point_count`**（后者是 `point_registry` 的残留行数，已由 PR #136 降级为 observed-only，**待合入 main**）。上句 `watchdog:156-158` 描述的是 **main 现状（旧语义）**；合入 #136 后，该判据改由 `Get-WdTaskPointCount`（PR #136 后 `:1293`）给出、判据在 `:1509-1518`。
 
 ### 3.4 与 T2b 逐字段对照（同一配置，不是"相似"）
 
@@ -180,7 +183,7 @@ watchdog 的连接配置**自动**比对**只覆盖五个字段**（`host` / `po
 | ① | 显式授权 | `-Authorized`、`-AuthorizedBy`、`-AuthzTicket` | fire 必填；arm 记 `not_checked`（`:1463-1483`） |
 | ② | G6 现场签署 | `-G6Signoff`、`-G6SignedAt` | 非空 **且时间可解析、不在未来**（`:725-740`） |
 | ③ | G7 部署身份 | `-G7DeployVersion`、`-G7BinaryPath`、`-ExpectedManifestSha256` | **只接受** `sha256:<64hex>` 或 `manifest:<path>`；与部署二进制**实算摘要**比对；`manifest:` 形式**必填**清单**自身**摘要，且在**解析清单之前**对**原始字节**计算；**git HEAD/describe 仅辅助记录、不参与放行**（`:125-149`、`:882`、`:1120`） |
-| ④ | 任务配置 | `-ExpectedTaskRevision`、`-ExpectedPointCount`、`-ApprovedTaskConfig`、`-ExpectedTaskFingerprint`、`-ExpectedApprovedTaskConfigSha256` | 获批配置**文件自身**原始字节摘要（**先摘要、后解析，同一份字节**）→ 只读 `GET` 快照 → **完整配置比对**（`:34-42`、`:1120`、`:1288-1456`） |
+| ④ | 任务配置 | `-ExpectedTaskRevision`、`-ExpectedPointCount`、`-ApprovedTaskConfig`、`-ExpectedTaskFingerprint`、`-ExpectedApprovedTaskConfigSha256` | 获批配置**文件自身**原始字节摘要（**先摘要、后解析，同一份字节**）→ 只读 `GET` 快照 → **完整配置比对**（`:34-42`、`:1120`、`:1288-1456`）。**`-ExpectedPointCount` 的语义 = 当前任务点数（取自实时任务快照 `tasks[].binding.config.points[]`，见 §11-2）**；main 现状仍比对 `diagnostics.point_count`（`:156-158`），语义变更见 PR #136（**待合入 main**） |
 
 **"完整配置比对"到底比什么（`watchdog:1176-1216`、`:1218-1250`、`:1056-1075`）**：
 
@@ -190,10 +193,12 @@ watchdog 的连接配置**自动**比对**只覆盖五个字段**（`host` / `po
 
 **为什么必须有两个"被批准对象自身"的摘要（`watchdog:34-42`，G1/G2）**：只比"清单里的摘要 ↔ 实际二进制"时，**清单与二进制一起被替换**仍互相匹配；而任务配置指纹**只覆盖规范化 tasks 数组、不覆盖连接配置**。因此：清单自身摘要（`-ExpectedManifestSha256`）与获批配置文件自身摘要（`-ExpectedApprovedTaskConfigSha256`）**都必须来自签署的 G6/G7 执行包**，**禁止在现场用 `Get-FileHash` 现算**（现算等于自己给自己授权）。负向场景见 **M17**（G1）/ **M18**（G2）。
 
-**两条必须写明的能力边界（v1.3 新增，避免承诺代码做不到的事）**：
+**两条必须写明的能力边界（v1.3 新增；**第二条已于 v1.4 勘误**，避免承诺代码做不到的事）**：
 
 - **ARMED 不能对生产实例（`127.0.0.1:8132`）执行**：`arm` 冻结为"回环且端口 ≠ 8132"（`:611-628`），指向 8132 直接 `exit 40`。因此 **v1.2 的 `G6-ARMED-4"对当前已 STOPPED 的端点做一次幂等 stop 自检"只能对离线桩做**（`-SelfTest`，`:209-212`、`:1566-1576`，产出 `stop-selftest.json`）。**生产侧的可达性与配置一致性由 fire 阶段的只读 `GET` 证明**（`:1252-1286`），任何不一致在**发出 Start 之前**以 `exit 40` 拒绝（`:285`）。**不得**把"离线桩自检通过"写成"生产通路已验证"。
-- **`-ExpectedPointCount` 比对的是 `point_count`，其来源是持久化 `point_map`**（`crates/core-api/src/lib.rs:1499` → `config-store/src/lib.rs:2459`），**不是**任务配置里的点数；`point_map` 由 Start 时的 `ApplyPointMap` 写入。因此该值必须由签署包给定并在 fire 的只读阶段实测确认，**本轮标 待确认**（§11-2）。
+- **`-ExpectedPointCount` 的语义（v1.4 勘误）**：**现行判据 = 当前任务点数**，取自**实时任务快照** `GET /api/v1/tasks?endpoint=` 的 `tasks[].binding.config.points[]` 总数（`Get-WdTaskPointCount`，**PR #136 后** `watchdog:1293`；判据 **PR #136 后** `watchdog:1509-1518`），**不是** `diagnostics.point_count`。
+  - `diagnostics.point_count` 的真实来源是**持久化 `point_registry` 的活跃行数（`deleted=0`）**（`crates/core-api/src/lib.rs:1499` → `config-store/src/lib.rs:2459-2473`），其**唯一写点**是 `assign_point_ids`（`config-store:2344-2456`），由 `StorePointIdSource::assign`（`crates/driver-manager/src/endpoint.rs:206-224`，调用点 `:213`）在 `run_config_flow`（`endpoint.rs:943-945`）中调用——**写入时机在 `ConfigureTasks`（`:914`）之后、`ApplyPointMap`（`:968-985`）之前**；`ApplyPointMap` 只下发映射，**不写 registry**。故该计数只反映"上次走完 ConfigureTasks 的那次 Start"的残留。
+  - **v1.3 原文（勘误前，保留以备追溯）**：~~`-ExpectedPointCount` 比对的是 `point_count`，其来源是持久化 `point_map`（`crates/core-api/src/lib.rs:1499` → `config-store/src/lib.rs:2459`），不是任务配置里的点数；`point_map` 由 Start 时的 `ApplyPointMap` 写入。~~ **该理解已被 PR #136 修正**（`dfc81e0`，Draft，**尚未合入 main**）：现行判据取自实时任务快照，`point_map` / `point_registry` 的残留值**降级为观测**（`diagnostics_point_count_observed`，observed-only，不参与配置门判定）。该值仍必须由签署包给定，并在 fire 的只读阶段实测确认（§11-2）。
 
 **离线套件 M0–M18（`tests/watchdog/run-watchdog-scenarios.ps1:14-36`）—— 证明工具行为，不构成现场授权**：
 
@@ -606,10 +611,12 @@ watchdog 的连接配置**自动**比对**只覆盖五个字段**（`host` / `po
 
 ## 11. 待确认清单（**本申请明确不承诺的能力**；执行前必须逐条落实或改为"不做"）
 
+> **v1.4 勘误**：第 **2** 项（`-ExpectedPointCount` 的语义）**已关闭**——已修复于 **PR #136（`dfc81e0`，Draft，待合入 main）**，本表保留原条目并改为"**依赖检查项：确认 #136 已合入 main**"。其余条目不变。事实基础见 **§11.1（事实 A：`ApplyPointMap` 不写 `point_registry`）**。
+
 | # | 待确认项 | 为什么不能承诺 | 谁来解决 |
 |---|---|---|---|
 | 1 | **签署的 G6/G7 执行包本身尚不存在**：本轮需要的 `approved-task-config.json`、受信构建清单、以及三个摘要（获批配置自身 / 清单自身 / 部署 `mesad` 二进制）都还没有经签署的版本 | `watchdog` 明确要求这两个摘要**只能来自签署包**，禁止现场现算（`:140-149`、`:173-181`）。**在签署包到位之前，fire 阶段必然 `exit 40`** | 审批人 + 构建方 |
-| 2 | **`-ExpectedPointCount` 的语义**：它比对的是 `diagnostics.point_count`，来源是持久化 `point_map`（`core-api/src/lib.rs:1499` → `config-store/src/lib.rs:2459`），由 Start 时的 `ApplyPointMap` 写入，**不是**任务配置里的点数 | 在"四点配置已 PUT、但尚未 Start 过"的时刻，`point_map` 里是**上一次运行**的结果（本申请 §1 记录上次为 4 点，但这是历史观测、非本轮实测） | 执行前实测 `GET /endpoints/{id}/diagnostics`，把实测值与签署值对齐 |
+| 2 | **【已关闭（v1.4）】`-ExpectedPointCount` 的语义**：~~比对 `diagnostics.point_count`（持久化 `point_map` 残留，由 Start 时的 `ApplyPointMap` 写入），不是任务配置里的点数~~ → **现行判据：比对当前任务点数**（实时任务快照 `tasks[].binding.config.points[]` 总数；`Get-WdTaskPointCount`，**PR #136 后** `watchdog:1293`，判据 `:1509-1518`）。**已修复于 PR #136（`dfc81e0`，Draft，待合入 main）**；`diagnostics.point_count` 降级为 `diagnostics_point_count_observed`（**observed-only，不参与配置门判定**） | **改为依赖检查项**：执行前确认 **PR #136 已合入 main**（`git log --oneline -1 dfc81e0` + `git merge-base --is-ancestor dfc81e0 main`）。**未合入时** main 上仍是旧语义（`watchdog:156-158` 比对 `diagnostics.point_count`，读到的只是 `point_registry` 残留），此时须在 `site-log.md` 写明本轮所用语义版本，并按该语义取签署值——**不得**把"残留 4 行"当成"当前任务 4 点"的证据 | 审批人（确认 #136 合入状态）+ 执行人（签署值口径） |
 | 3 | **`-ExpectedTaskRevision` 的时序**：PUT 四点后 revision 变为 18（预期），而 `-ExpectedTaskRevision` 必须与签署值一致 | 签署包在窗口之前准备，无法预知窗口内是否发生其它写入；一旦偏移 ⇒ `REFUSED_TASKCONFIG_MISMATCH`（`exit 40`） | 审批时把 revision 一并签署；窗口内禁止任何其它写入（G5-②） |
 | 4 | **G2 的"协商 PDU 核对"**：`mode=probe` 会发起真实机床 I/O，需**单独授权** | 本申请未包含该授权；未授权时该项只能记"未测" | 审批人单独授权或明确不做 |
 | 5 | **MAC `98-fa-9b-59-35-53`** 无仓库内留存 | 仅来自现场记录，全仓检索无匹配 | 现场补充截图/书面记录 |
@@ -619,3 +626,26 @@ watchdog 的连接配置**自动**比对**只覆盖五个字段**（`host` / `po
 | 9 | **`ARMED` 无法对生产 8132 执行**，生产侧"通路可用"只能由 fire 的只读 GET 证明 | `arm` 冻结为回环且端口 ≠ 8132（`watchdog:611-628`） | 流程层面接受（现场交底时写清）；如需"对生产端点的独立通路自检"，属**新功能**，本申请不承诺 |
 | 10 | **真机停止时刻**无法由任何离线手段证明 | 30 s 是调度目标；实际停止由 §5.3.1 第二层六项另行观测，且尾部可能无界（`process.rs:284`） | 现场监护人按 §5.3 处置 |
 | 11 | **`max_read_items` / `timeout_ms` / `family` 三字段不由 watchdog 自动验证** | watchdog 的连接配置自动比对只覆盖 5 个字段（`host`/`port`/`local_tsap`/`remote_tsap`/`pdu_length`，`watchdog:1176-1216`）；这三字段**不在集合内** | **现场人工核验**（§4.2）：对本次窗口的 Endpoint 原始 GET 响应与签署的 `approved-task-config.json` 逐字段比较，保存原始响应 + 规范化 diff + 复核签名；任一缺失/不一致/无法取证 ⇒ **NO-GO，不得进入 FIRED**。**这是人工项，不是自动门禁** |
+
+### 11.1 §11-2 的事实基础（事实 A，v1.4 新增）：`ApplyPointMap` **不写** `point_registry`
+
+> 这一条是 §11-2 与 §4.6 末条的共同前提；v1.3 把它写反了（"`point_map` 由 Start 时的 `ApplyPointMap` 写入"），故单列在此，便于后续轮次直接引用。
+
+**正确时序**（`crates/driver-manager/src/endpoint.rs:868-999`，函数 `run_config_flow`）：
+
+```
+OpenConnection（:882）→ ConfigureTasks（:914）→ 驱动回 PointDescriptors（:925-932）
+→ assign_point_ids 写 point_registry（:943-945 → StorePointIdSource::assign :206-224 → crates/config-store/src/lib.rs:2344-2456）
+→ ApplyPointMap（:968-985，只把 point_key → point_id 映射下发给 Driver，本身不写 registry）
+→ ConfigureEventTasks（:990-995）→ StartConnection（:997 起，新 stream_epoch）
+```
+
+| 结论 | 依据 |
+|---|---|
+| `point_registry` 的**唯一写点**是 `assign_point_ids`（INSERT/UPSERT + 墓碑 UPDATE，`config-store:2408-2447`） | `crates/config-store/src/lib.rs:2344-2456` |
+| 调用链：`run_config_flow` → `StorePointIdSource::assign` → `assign_point_ids` | `crates/driver-manager/src/endpoint.rs:943-945` → `:206-224`（调用点 `:213`） |
+| 写入时机在 **`ConfigureTasks` 之后、`ApplyPointMap` 之前** | 同上（`:914` / `:943-945` / `:968-985`） |
+| `ApplyPointMap` 只下发映射（`Body::ApplyPointMap{ connection_handle, revision, key_to_point_id }`），**无任何持久化副作用** | `endpoint.rs:968-985` |
+| `diagnostics.point_count` = `point_map(endpoint_id).len()` = `point_registry` 中 `deleted=0` 的活跃行数 | `crates/core-api/src/lib.rs:1499` → `crates/config-store/src/lib.rs:2459-2473` |
+
+**推论（现场口径）**：在"四点配置已 PUT、但本轮尚未 Start 过"的时刻，`diagnostics.point_count` 读到的是**上一次 Start 走完 ConfigureTasks 留下的残留行数**（本申请 §1 记录上次为 4 点，属**历史观测**，不能当作本轮四点配置已生效的证据）。这正是 BLOCKED-01 的成因，也是 PR #136 把配置门判据改为"实时任务快照点数"的原因。**在 #136 合入 main 之前**，本申请对 `-ExpectedPointCount` 一律按 §11-2 的"依赖检查项"处理：先确认合入状态，再按所用语义取签署值并记录于 `site-log.md`。
