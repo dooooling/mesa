@@ -66,7 +66,8 @@ jobs:
 
       - name: 上传证据（测试结果与失败日志）
         if: always()
-        uses: actions/upload-artifact@v4 # TODO: 待确认 SHA 钉扎（v4 具体提交号需联网核对，避免写错导致 CI 静默失效）
+        # 按仓库约定钉扎到提交 SHA（v4.6.2）；浮动 tag 可能被上游改写，导致 CI 静默失效
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: watchdog-${{ matrix.platform }}
           path: target/validation/stop-watchdog

@@ -103,6 +103,24 @@ PowerShell 侧（`ConvertTo-WdCanonicalNode` / `Get-WdTasksFingerprint`）与 py
 > （`--get-delay-running`）——凭证核验发生在 Start 之前（desired=false），必须能完成；
 > M8 要验证的"FIRED 之后观测通道无响应 ⇒ 心跳失效"语义不变，断言未放宽。
 
+### 获批凭证的权威来源（一期冻结）
+
+**离线套件通过只证明校验逻辑有效，不代表现场凭证已获得授权。**
+
+未来 FIRED 执行必须使用**经独立审批的记录**，至少绑定下列五项：
+
+| 项 | 要求 |
+|---|---|
+| Endpoint ID 与任务 revision | 与获批执行包一致 |
+| 完整连接配置 | `host` / `port` / `local_tsap` / `remote_tsap` / `pdu_length` |
+| 规范化 tasks 数组的 SHA-256 | 即 `-ExpectedTaskFingerprint` |
+| `approved-task-config.json` 文件自身的 SHA-256 | 防止"拿错或被改过的批准文件" |
+| 实际部署 `mesad` 二进制的 SHA-256 | 即 `-G7DeployVersion sha256:<hex>` |
+
+**凭证来源**：经签署的 **G6/G7 执行包**与**现场工单**。
+
+**明确禁止**：在现场执行时，从**当前端点状态**或**未经审核的本地文件**临时生成批准值 —— 那样等于自己给自己授权，凭证校验形同虚设。
+
 ## 场景与断言
 
 | 场景 | 桩的故障旋钮 | 关键断言 |
