@@ -19,5 +19,5 @@ pub mod snapshot;
 pub(crate) mod temp_op;
 
 pub use endpoint::{BuiltinEndpoint, PointIdAllocator, PointIdSource, StorePointIdSource};
-pub use manager::MesaManager;
+pub use manager::{AttemptPhase, MesaManager, StopHandle};
 pub use snapshot::{DriverInfo, EndpointStatus, LatestEntry, Snapshot};

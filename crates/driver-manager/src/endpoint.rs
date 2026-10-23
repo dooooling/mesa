@@ -294,6 +294,10 @@ pub async fn run_endpoint(
 /// （drain fatal/timeout 等精确描述），`stop_endpoint` 转为显式错误。
 /// `heartbeat` 为本次运行的会话心跳参数（调用方显式给出；测试按需传 fast，
 /// 不再经进程 env 隐式决定）。
+///
+/// G7 NOTE：本函数**绕过** Manager 的 attempt 表（测试夹具直调路径），因此
+/// 不走代次化快照门（generation=0）、也不参与"停干净"判据。生产唯一入口是
+/// [`crate::MesaManager::start_endpoint`]（走 [`run_endpoint_with_attempt`]）。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_endpoint_with_heartbeat(
     disc: DiscoveredDriver,
@@ -312,6 +316,37 @@ pub async fn run_endpoint_with_heartbeat(
     events: Option<Arc<EventServices>>,
     heartbeat: HeartbeatParams,
 ) -> Option<String> {
+    run_endpoint_with_attempt(
+        disc, cfg, snapshot, source, shutdown, registry, events, heartbeat, None,
+    )
+    .await
+}
+
+/// 带 attempt 上下文的运行任务（G7 生产路径）。
+///
+/// `ctx` 是本次 attempt 的**唯一可判定证据载体**：代次（快照写入过滤）、
+/// pid（残留进程复核）、session_released / remote_eof（收敛证据）、
+/// outcome（单次结论）。`None` 仅供旧直调路径使用（generation=0，永不覆盖正式 attempt）。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_endpoint_with_attempt(
+    disc: DiscoveredDriver,
+    cfg: BuiltinEndpoint,
+    snapshot: Arc<Snapshot>,
+    source: Arc<dyn PointIdSource>,
+    shutdown: CancellationToken,
+    registry: std::sync::Arc<
+        std::sync::RwLock<
+            std::collections::HashMap<
+                String,
+                std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>,
+            >,
+        >,
+    >,
+    events: Option<Arc<EventServices>>,
+    heartbeat: HeartbeatParams,
+    ctx: Option<Arc<crate::manager::AttemptCtx>>,
+) -> Option<String> {
+    let generation = ctx.as_ref().map_or(0, |c| c.generation);
     let mut backoff_idx = 0usize;
     let mut id_map: HashMap<String, u32> = source.known_map(&cfg.endpoint_id);
     let mut last_epoch: u64 = 0;
@@ -319,6 +354,7 @@ pub async fn run_endpoint_with_heartbeat(
     set_status(
         &snapshot,
         &cfg,
+        generation,
         ConnectionState::Connecting,
         "",
         id_map.len(),
@@ -331,6 +367,7 @@ pub async fn run_endpoint_with_heartbeat(
             set_status(
                 &snapshot,
                 &cfg,
+                generation,
                 ConnectionState::Stopped,
                 "stopped",
                 id_map.len(),
@@ -351,6 +388,7 @@ pub async fn run_endpoint_with_heartbeat(
             &registry,
             events.as_ref(),
             heartbeat,
+            ctx.as_ref(),
         )
         .await;
         match outcome {
@@ -358,6 +396,7 @@ pub async fn run_endpoint_with_heartbeat(
                 set_status(
                     &snapshot,
                     &cfg,
+                    generation,
                     ConnectionState::Stopped,
                     "stopped",
                     id_map.len(),
@@ -375,6 +414,7 @@ pub async fn run_endpoint_with_heartbeat(
                 set_status(
                     &snapshot,
                     &cfg,
+                    generation,
                     ConnectionState::Failed,
                     &detail,
                     id_map.len(),
@@ -404,6 +444,7 @@ pub async fn run_endpoint_with_heartbeat(
                 set_status(
                     &snapshot,
                     &cfg,
+                    generation,
                     ConnectionState::Reconnecting,
                     &reason,
                     id_map.len(),
@@ -428,7 +469,7 @@ pub async fn run_endpoint_with_heartbeat(
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = shutdown.cancelled() => {
-                set_status(&snapshot, &cfg, ConnectionState::Stopped, "core shutdown", id_map.len(), last_epoch, source.revision(&cfg.endpoint_id));
+                set_status(&snapshot, &cfg, generation, ConnectionState::Stopped, "core shutdown", id_map.len(), last_epoch, source.revision(&cfg.endpoint_id));
                 return None;
             }
         }
@@ -444,24 +485,41 @@ enum AttemptOutcome {
     },
 }
 
+/// 写入运行态快照（带代次门，G7 §6.5）：`generation` 由 attempt 上下文给出，
+/// 直调路径为 0（永不覆盖正式 attempt，也永不复活已删端点）。
+#[allow(clippy::too_many_arguments)]
 fn set_status(
     snapshot: &Snapshot,
     cfg: &BuiltinEndpoint,
+    generation: u64,
     state: ConnectionState,
     detail: &str,
     points: usize,
     epoch: u64,
     revision: u64,
 ) {
-    snapshot.upsert_endpoint(EndpointStatus {
-        endpoint_id: cfg.endpoint_id.clone(),
-        driver_id: cfg.driver_id.clone(),
-        state: state.as_str().to_string(),
-        detail: detail.to_string(),
-        revision,
-        points,
-        epoch,
-    });
+    let written = snapshot.upsert_endpoint(
+        generation,
+        EndpointStatus {
+            endpoint_id: cfg.endpoint_id.clone(),
+            driver_id: cfg.driver_id.clone(),
+            state: state.as_str().to_string(),
+            detail: detail.to_string(),
+            revision,
+            points,
+            epoch,
+        },
+    );
+    if !written {
+        // 丢弃是设计行为（旧代次/已删除端点），但静默丢弃会掩盖真实缺陷，
+        // 因此留一条诊断；不得在此重试或改写。
+        tracing::debug!(
+            endpoint = %cfg.endpoint_id,
+            generation,
+            state = state.as_str(),
+            "stale status write dropped by generation/tombstone gate"
+        );
+    }
 }
 
 /// 一次完整连接尝试：成功则阻塞在事件循环直到断开/判死/停机。
@@ -491,7 +549,9 @@ async fn attempt_session(
     >,
     services: Option<&Arc<EventServices>>,
     heartbeat: HeartbeatParams,
+    ctx: Option<&Arc<crate::manager::AttemptCtx>>,
 ) -> (AttemptOutcome, Option<EventDrainError>, bool) {
+    let generation = ctx.map_or(0, |c| c.generation);
     // P1-A1：attempt 局部证据。先于任何 spawn 创建，只交给本 attempt 的 ingress；
     // 不跨 attempt、不进 Snapshot/EventServices/registry。
     let evidence = AttemptEvidence::new();
@@ -508,6 +568,11 @@ async fn attempt_session(
             );
         }
     };
+    // G7：回填 pid（隔离态复核"残留进程是否已死"的唯一依据）。
+    if let Some(c) = ctx {
+        c.pid
+            .store(process.pid, std::sync::atomic::Ordering::Release);
+    }
 
     let (mut session, mut events, unresponsive_flag) = match Session::connect_retry_with_heartbeat(
         process.port,
@@ -588,21 +653,28 @@ async fn attempt_session(
                 ingress,
                 events,
                 std::sync::Arc::clone(registry),
+                ctx,
             )
-            .await;
+            .await
+            .0;
             return (outcome, drain_err, evidence.saw());
         }
     }
 
+    // G7：进入 RUNNING（快照写入 + phase 迁移在同一处，避免两处真值分叉）。
     set_status(
         snapshot,
         cfg,
+        generation,
         ConnectionState::Running,
         "",
         id_map.len(),
         *last_epoch,
         source.revision(&cfg.endpoint_id),
     );
+    if let Some(c) = ctx {
+        c.set_phase(crate::manager::AttemptPhase::Running);
+    }
 
     // 事件循环期间保持会话注册。Control 与 event_loop 并发执行：
     // control_write/command 经 session 内 writer 锁 + pending 表串行，
@@ -643,8 +715,10 @@ async fn attempt_session(
         ingress,
         events,
         std::sync::Arc::clone(registry),
+        ctx,
     )
-    .await;
+    .await
+    .0;
     // 读点固定在 teardown 之后：event_loop 已返回、ingress 已 Join/abort+await，
     // 两个写者都终止，读到的是终值（见函数文档）。
     (outcome, drain_err, evidence.saw())
@@ -701,7 +775,18 @@ async fn teardown_attempt(
     ingress: Option<tokio::task::JoinHandle<Result<(), IngressFatal>>>,
     events: tokio::sync::mpsc::Receiver<SessionEvent>,
     registry: Arc<std::sync::RwLock<HashMap<String, Arc<tokio::sync::Mutex<Session>>>>>,
-) -> Option<EventDrainError> {
+    ctx: Option<&Arc<crate::manager::AttemptCtx>>,
+) -> (Option<EventDrainError>, bool) {
+    // 测试专用 panic 注入点（`test-hooks`）：位置在"第 2 步 terminate"之前，
+    // 即子进程尚未回收、会话尚未摘除、ingress 尚未排空的时刻——这正是
+    // "Drop 时未证明收敛"的真实形态，用来验证隔离态 fail-closed（G7 §9-5）。
+    #[cfg(feature = "test-hooks")]
+    if ctx.is_some_and(|c| {
+        c.test_panic_before_teardown
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }) {
+        panic!("injected teardown panic before process termination (test-hooks)");
+    }
     {
         let sess = session_arc.lock().await;
         if !sess.is_unresponsive() {
@@ -711,6 +796,7 @@ async fn teardown_attempt(
         }
     }
     process.terminate_after_shutdown().await;
+    let mut remote_eof = false;
     {
         let sess = session_arc.lock().await;
         if !sess.wait_reader_done(Duration::from_secs(5)).await {
@@ -718,6 +804,8 @@ async fn teardown_attempt(
                 endpoint = %endpoint_id,
                 "reader did not finish after terminate, draining what arrived"
             );
+        } else {
+            remote_eof = true;
         }
     }
     let drain_err = shutdown_ingress(ingress_shutdown, ingress).await.err();
@@ -726,8 +814,14 @@ async fn teardown_attempt(
         sess.invalidate();
     }
     registry.write().unwrap().remove(endpoint_id);
+    if let Some(c) = ctx {
+        c.remote_eof
+            .store(remote_eof, std::sync::atomic::Ordering::Release);
+        c.session_released
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
     drop(events);
-    drain_err
+    (drain_err, remote_eof)
 }
 
 /// ingress 优雅停机（Checkpoint B 方案 A + ⑨ final drain + P0-3）：

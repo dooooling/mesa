@@ -2,11 +2,15 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::endpoint::{BuiltinEndpoint, PointIdAllocator, PointIdSource, run_endpoint};
+use crate::endpoint::{
+    BuiltinEndpoint, PointIdAllocator, PointIdSource, run_endpoint_with_attempt,
+};
 use crate::manifest::{DiscoveredDriver, scan_drivers};
 use crate::snapshot::{DriverInfo, Snapshot};
 
@@ -346,18 +350,290 @@ pub(crate) fn gate_descriptor_report(
     Ok(desc)
 }
 
-struct RunningEntry {
+// ---------------------------------------------------------------------------
+// G7：代次化 attempt 表（生命周期的唯一真值来源）
+// ---------------------------------------------------------------------------
+
+/// attempt 阶段（G7 §6.2）。
+///
+/// **只有 [`AttemptGuard::commit`] 能写终态 `TeardownDone`**；`FailedUnknown`
+/// 只能由 `AttemptGuard::drop` 在"未 commit"时写。任何在别处写终态的改动
+/// 都是缺陷（等于让别的路径拥有"释放保护"的权力，P0-A 的同型错误）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AttemptPhase {
+    /// 已登记、任务尚未进入 RUNNING（spawn 前就存在，insert-before-spawn）。
+    Starting = 0,
+    /// 已进入 RUNNING（会话建立、配置完成）。
+    Running = 1,
+    /// Stop 已受理，teardown 进行中（条目仍在 ⇒ 保护仍在）。
+    Stopping = 2,
+    /// teardown 已被证明完成（只能由 commit 写入，且与条目移除同一临界区）。
+    TeardownDone = 3,
+    /// 异常终止（panic / abort / 未 commit 的提前返回）：teardown 未证明，
+    /// 条目**保留**，新 Start 一律拒绝（fail-closed）。
+    FailedUnknown = 4,
+}
+
+impl AttemptPhase {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Running,
+            2 => Self::Stopping,
+            3 => Self::TeardownDone,
+            4 => Self::FailedUnknown,
+            _ => Self::Starting,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "STARTING",
+            Self::Running => "RUNNING",
+            Self::Stopping => "STOPPING",
+            Self::TeardownDone => "TEARDOWN_DONE",
+            Self::FailedUnknown => "FAILED_UNKNOWN",
+        }
+    }
+
+    /// 是否算"有活着的生命周期操作"（用于 `is_running` 兼容投影）。
+    fn is_live(self) -> bool {
+        matches!(self, Self::Starting | Self::Running)
+    }
+}
+
+/// 一次 attempt 的全部可判定证据（G7 §6.2）。
+///
+/// 单次 attempt 只有一个结论：`outcome` 是 `OnceLock`，两个并发 Stop 不可能
+/// 看到两次不同的失败描述（§5.2 第四行）。
+pub struct AttemptCtx {
+    /// 单调代次（per endpoint，永不回收；墓碑以它为下界）。
+    pub generation: u64,
+    phase: AtomicU8,
+    /// 驱动子进程 pid（spawn 后回填；0 = 尚未 spawn）。
+    pub pid: AtomicU32,
+    /// teardown 末尾：registry 已摘除本 attempt 的 session（E4）。
+    pub session_released: AtomicBool,
+    /// teardown 末尾：reader 观测到对端 EOF。
+    pub remote_eof: AtomicBool,
+    /// teardown 结论（`Ok(was_running)` / `Err(精确码前缀 + detail)`）。
+    pub outcome: OnceLock<Result<bool, String>>,
+    /// **唯一正常完成标记**，只能由 [`AttemptGuard::commit`] 置 true。
+    committed: AtomicBool,
+    /// 完成通知（合流点：所有 Stop 等待同一个结论）。
+    done_tx: tokio::sync::watch::Sender<Option<Result<bool, String>>>,
+    /// 测试专用 panic 注入开关（`test-hooks`）。
+    #[cfg(feature = "test-hooks")]
+    pub test_panic_before_teardown: AtomicBool,
+}
+
+impl AttemptCtx {
+    fn new(generation: u64) -> Self {
+        let (done_tx, _) = tokio::sync::watch::channel(None);
+        Self {
+            generation,
+            phase: AtomicU8::new(AttemptPhase::Starting as u8),
+            pid: AtomicU32::new(0),
+            session_released: AtomicBool::new(false),
+            remote_eof: AtomicBool::new(false),
+            outcome: OnceLock::new(),
+            committed: AtomicBool::new(false),
+            done_tx,
+            #[cfg(feature = "test-hooks")]
+            test_panic_before_teardown: AtomicBool::new(false),
+        }
+    }
+
+    pub fn phase(&self) -> AttemptPhase {
+        AttemptPhase::from_u8(self.phase.load(Ordering::Acquire))
+    }
+
+    pub fn set_phase(&self, p: AttemptPhase) {
+        self.phase.store(p as u8, Ordering::Release);
+    }
+
+    pub fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<Result<bool, String>>> {
+        self.done_tx.subscribe()
+    }
+
+    /// 读取已发布的结论（未发布则 `None`）。
+    ///
+    /// 以 `outcome`（OnceLock）为唯一真值：`watch` 只是**通知**通道，
+    /// 当发送时恰好没有接收者，`send` 会失败且不更新值——但结论仍然成立。
+    pub fn settled(&self) -> Option<Result<bool, String>> {
+        self.outcome
+            .get()
+            .cloned()
+            .or_else(|| self.done_tx.borrow().clone())
+    }
+}
+
+struct AttemptEntry {
+    ctx: Arc<AttemptCtx>,
     cancel: CancellationToken,
-    /// P0-3：任务返回 teardown 结论（`None` = 干净，`Some` = drain 异常描述），
-    /// `stop_endpoint` 转为显式错误，禁止 detach-success。
-    handle: tokio::task::JoinHandle<Option<String>>,
+    // 注意：这里**没有** JoinHandle（G7 §6.6）：条目存在 ⇔ 生命周期操作未证明
+    // 结束。任务 handle 被丢弃不会产生孤儿，因为"活着"与"有条目"是同一件事。
+}
+
+/// attempt 表：`live` + `last_completed_gen` **同锁**（P0-3 的原子性来源）。
+///
+/// 隔离态不另设 map：它就是 `live` 里 `phase == FailedUnknown` 的条目
+///（避免两处真值再次分叉）。
+#[derive(Default)]
+struct AttemptTable {
+    live: HashMap<String, AttemptEntry>,
+    /// 只由 commit 路径（与移除条目同一临界区）与 reaper 复核通过后写入；
+    /// 永不回退、永不清理（§6.11）。
+    last_completed_gen: HashMap<String, u64>,
+}
+
+/// attempt 任务自持的守卫（G7 §6.3.2）。
+///
+/// 放在**任务内部**才正确：随任务结束而 drop，drop 里只做同步簿记。
+/// `Drop` 在 panic 展开时同样执行，因此必须区分"正常完成"（`committed`）
+/// 与"异常终止"——判据**不是** `std::thread::panicking()`，而是显式提交标记。
+struct AttemptGuard {
+    table: Arc<Mutex<AttemptTable>>,
+    id: String,
+    generation: u64,
+    ctx: Arc<AttemptCtx>,
+    quarantine_tx: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+impl AttemptGuard {
+    /// 唯一正常退出路径：必须在 `run_endpoint_with_attempt` 正常返回、
+    /// 且 `ctx.outcome` 已写入之后调用。
+    fn commit(&self) {
+        debug_assert!(
+            self.ctx.outcome.get().is_some(),
+            "commit 前必须已有 teardown 结论"
+        );
+        // 先置终态再置标记：观察者看到 committed=true 时 phase 必然已是终态。
+        self.ctx.set_phase(AttemptPhase::TeardownDone);
+        self.ctx.committed.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for AttemptGuard {
+    fn drop(&mut self) {
+        let mut t = self.table.lock().unwrap();
+        // 防御：条目已不属于本代次（例如被后续 Start 取代）则什么都不做。
+        if t.live
+            .get(&self.id)
+            .is_none_or(|e| e.ctx.generation != self.generation)
+        {
+            drop(t);
+            let _ = self.ctx.done_tx.send(self.ctx.outcome.get().cloned());
+            return;
+        }
+        if self.ctx.committed.load(Ordering::Acquire) {
+            // 正常完成：写完成代次 + 移除条目，**同一临界区**（P0-3）。
+            t.last_completed_gen
+                .insert(self.id.clone(), self.generation);
+            t.live.remove(&self.id);
+        } else {
+            // 异常终止：**保留条目**、转隔离态、禁止新 Start（P0-1）。
+            // Drop 里不能 await，也不能做任何"证明收敛"的工作（kill/wait 全是
+            // async）——这正是只能"保留 + 交给 reaper"的原因。
+            self.ctx.set_phase(AttemptPhase::FailedUnknown);
+            let _ = self.ctx.outcome.set(Err(format!(
+                "ATTEMPT_FAILED_UNKNOWN: attempt generation {} terminated abnormally (panic/abort); \
+                 teardown completion NOT proven",
+                self.generation
+            )));
+            if std::thread::panicking() {
+                // 只用于留证据，**不参与判定**。
+                tracing::error!(
+                    endpoint = %self.id,
+                    generation = self.generation,
+                    "attempt task panicked; entry quarantined as FAILED_UNKNOWN"
+                );
+            }
+        }
+        let _ = self.ctx.done_tx.send(self.ctx.outcome.get().cloned());
+        drop(t);
+        if !self.ctx.committed.load(Ordering::Acquire) {
+            // 异常路径把 id 交给监督清理：try_send 非阻塞，Drop 里绝不 await。
+            let _ = self.quarantine_tx.send(self.id.clone());
+        }
+    }
+}
+
+/// Stop 受理结果（G7 §6.4 `begin_stop`）：**同步**返回，拆解已经开始。
+///
+/// `ctx == None` ⇒ 无 attempt（幂等成功 `was_running=false`）；
+/// `Some` ⇒ 合流等待同一次 teardown 结论（Claimed / Join / Quarantined 三者
+/// 都映射到同一个 `outcome`，因此两个并发 Stop 必然拿到同一结论）。
+pub struct StopHandle {
+    ctx: Option<Arc<AttemptCtx>>,
+}
+
+impl StopHandle {
+    fn not_running() -> Self {
+        Self { ctx: None }
+    }
+
+    fn join(ctx: Arc<AttemptCtx>) -> Self {
+        Self { ctx: Some(ctx) }
+    }
+
+    /// 是否真的认领了一次 teardown（false = 当时无 attempt）。
+    pub fn was_running(&self) -> bool {
+        self.ctx.is_some()
+    }
+
+    /// 等待**同一次** teardown 的结论。丢弃本 future（客户端断开）不会取消
+    /// 任何后台操作——它只持有一个 `watch::Receiver`（§6.3 第 3 条）。
+    ///
+    /// 结论真值是 `ctx.outcome`（OnceLock，只可写一次）；`watch` 只用于唤醒，
+    /// 因此"发送时没有接收者导致 send 失败"也不会让本函数永久挂住。
+    pub async fn await_result(self) -> Result<bool, String> {
+        let Some(ctx) = self.ctx else {
+            return Ok(false);
+        };
+        let mut rx = ctx.subscribe();
+        loop {
+            if let Some(v) = ctx.outcome.get() {
+                return v.clone();
+            }
+            tokio::select! {
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        // 发送端已销毁：再读一次结论，读不到就明确报"不可证明"。
+                        return match ctx.outcome.get() {
+                            Some(v) => v.clone(),
+                            None => Err(
+                                "ATTEMPT_FAILED_UNKNOWN: attempt context dropped before publishing outcome"
+                                    .to_string(),
+                            ),
+                        };
+                    }
+                }
+                // 兜底轮询：覆盖"send 失败（无接收者）但结论已写入"的路径。
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
 }
 
 pub struct MesaManager {
     drivers: RwLock<Vec<DiscoveredDriver>>,
     snapshot: Arc<Snapshot>,
     source: Arc<dyn PointIdSource>,
-    running: Mutex<HashMap<String, RunningEntry>>,
+    /// G7：代次化 attempt 表（生命周期唯一真值；替换旧的 `running` 表）。
+    attempts: Arc<Mutex<AttemptTable>>,
+    /// 每 endpoint 已发放的最大代次（单调、永不回收；墓碑以下界用它）。
+    gens: Mutex<HashMap<String, u64>>,
+    /// 异常终止的 attempt 交给监督清理（Drop 里 try_send，绝不 await）。
+    quarantine_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// reaper 启动一次性（首次 `start_endpoint` 时在运行期内 spawn）。
+    reaper_started: OnceLock<()>,
+    /// 构造时无 runtime 的接收端暂存（首次在 runtime 内使用时启动）。
+    pending_reaper: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
     shutdown: CancellationToken,
     descriptor_cache: RwLock<HashMap<DescriptorCacheKey, CachedDescriptor>>,
     /// 活跃会话注册表：endpoint_id -> Session（用于 Control 面可靠转发，§22）
@@ -371,6 +647,12 @@ pub struct MesaManager {
     /// 为什么放在这里而不是 `driver-protocol`：协议层只负责版本与消息契约，
     /// 持有运行期计数会让「协议 crate」变成有状态组件（DC §8.1.2-M11 明令禁止）。
     definition_query_budget: Arc<DefinitionQueryBudget>,
+    /// 测试专用：新 attempt 是否在 teardown 第 2 步之前 panic（`test-hooks`）。
+    #[cfg(feature = "test-hooks")]
+    test_panic_before_teardown: AtomicBool,
+    /// 测试专用：挂住 reaper 的复核（`test-hooks`），用于**确定性**观察隔离态。
+    #[cfg(feature = "test-hooks")]
+    reaper_hold: Arc<AtomicBool>,
 }
 
 impl MesaManager {
@@ -384,17 +666,36 @@ impl MesaManager {
         let drivers = scan_drivers(drivers_dir);
         let snapshot = Arc::new(Snapshot::new());
         snapshot.set_drivers(Self::driver_infos(&drivers));
-        Self {
+        let (quarantine_tx, quarantine_rx) = tokio::sync::mpsc::unbounded_channel();
+        let attempts = Arc::new(Mutex::new(AttemptTable::default()));
+        let mgr = Self {
             drivers: RwLock::new(drivers),
             snapshot,
             source,
-            running: Mutex::new(HashMap::new()),
+            attempts: Arc::clone(&attempts),
+            gens: Mutex::new(HashMap::new()),
+            quarantine_tx,
+            reaper_started: OnceLock::new(),
+            pending_reaper: Mutex::new(None),
             shutdown: CancellationToken::new(),
             descriptor_cache: RwLock::new(HashMap::new()),
             active_sessions: std::sync::Arc::new(RwLock::new(HashMap::new())),
             event_services: RwLock::new(None),
             definition_query_budget: Arc::new(DefinitionQueryBudget::default()),
+            #[cfg(feature = "test-hooks")]
+            test_panic_before_teardown: AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            reaper_hold: Arc::new(AtomicBool::new(false)),
+        };
+        // 监督任务：**只**清理"任务已死、条目处于隔离态"的残留（不启停端点、
+        // 不写期望态、不改快照）⇒ 不是对账器/看门狗（G7 §10-1 边界）。
+        // 仅在运行期内启动；纯同步构造（无 runtime）时延后到首次 start。
+        if tokio::runtime::Handle::try_current().is_ok() {
+            mgr.spawn_reaper(quarantine_rx);
+        } else {
+            mgr.pending_reaper.lock().unwrap().replace(quarantine_rx);
         }
+        mgr
     }
 
     /// 注入事件面服务（Mesad 在 EventStore 打开后调用一次）。构造器签名不变，
@@ -456,65 +757,224 @@ impl MesaManager {
             .cloned()
     }
 
+    /// 兼容投影：是否有**活的**生命周期操作（Starting/Running）。
+    ///
+    /// G7 §1.2 / §10-6：`is_running()==false` 是"停干净"的**必要不充分**条件
+    ///（拆解开始即假），只作为 UI/兼容投影保留，对外语义与修复前一致；
+    /// **禁止**把它用于完成判据、门控判定或回归断言的核心断言。可信判据是
+    /// [`Self::has_live_attempt`] / [`Self::current_gen`] / 代次化快照。
     pub fn is_running(&self, endpoint_id: &str) -> bool {
-        let map = self.running.lock().unwrap();
-        if let Some(entry) = map.get(endpoint_id) {
-            !entry.handle.is_finished()
-        } else {
-            false
-        }
+        self.attempts
+            .lock()
+            .unwrap()
+            .live
+            .get(endpoint_id)
+            .is_some_and(|e| e.ctx.phase().is_live())
     }
 
     pub fn running_ids(&self) -> Vec<String> {
-        self.running
+        self.attempts
             .lock()
             .unwrap()
+            .live
             .iter()
-            .filter(|(_, entry)| !entry.handle.is_finished())
+            .filter(|(_, e)| e.ctx.phase().is_live())
             .map(|(k, _)| k.clone())
             .collect()
     }
 
-    /// 启动一个 Endpoint。已在运行则返回错误。
+    /// 是否存在**未完成**的 attempt（含 Stopping 与隔离态 FailedUnknown）。
+    ///
+    /// 这是"Stop 在途保护"的唯一判据：条目存在 ⇔ 该 attempt 尚未被证明完成
+    /// teardown。它不依赖任何计数器副本，因此不会随请求取消而提前释放。
+    pub fn has_live_attempt(&self, endpoint_id: &str) -> bool {
+        self.attempts.lock().unwrap().live.contains_key(endpoint_id)
+    }
+
+    /// 当前 attempt 的阶段（诊断用；无条目返回 `None`）。
+    pub fn attempt_phase(&self, endpoint_id: &str) -> Option<AttemptPhase> {
+        self.attempts
+            .lock()
+            .unwrap()
+            .live
+            .get(endpoint_id)
+            .map(|e| e.ctx.phase())
+    }
+
+    /// 当前代次：有条目取条目代次，无条目取"最后一次已证明完成的代次"。
+    ///
+    /// 两者取自**同一把表锁** ⇒ 不可能读到"既无条目又无凭证"的组合（P0-3）。
+    /// 无凭证（从未有 attempt / 进程刚重启）返回 `None`——判据侧必须把它当作
+    /// "无基准 ≠ 已停干净"（fail-closed）。
+    pub fn current_gen(&self, endpoint_id: &str) -> Option<u64> {
+        let t = self.attempts.lock().unwrap();
+        t.live
+            .get(endpoint_id)
+            .map(|e| e.ctx.generation)
+            .or_else(|| t.last_completed_gen.get(endpoint_id).copied())
+    }
+
+    /// 该 id **已发放的最大代次**（墓碑下界）。
+    ///
+    /// 注意是"已发放的最大值"，不是"下一个将要发放的值"：墓碑比较是
+    /// `generation <= retired`，差一会让端点重建后的首个状态写入被永久丢弃。
+    pub fn gen_floor(&self, endpoint_id: &str) -> u64 {
+        self.gens
+            .lock()
+            .unwrap()
+            .get(endpoint_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 分配下一个代次（per endpoint，单调、永不回收）。
+    fn next_gen(&self, endpoint_id: &str) -> u64 {
+        let mut g = self.gens.lock().unwrap();
+        let e = g.entry(endpoint_id.to_string()).or_insert(0);
+        *e += 1;
+        *e
+    }
+
+    /// 首次在运行期内使用时启动监督清理任务（构造期无 runtime 的兼容路径）。
+    fn ensure_reaper(&self) {
+        if self.reaper_started.get().is_some() {
+            return;
+        }
+        // 同步上下文（无 reactor）里 `tokio::spawn` 会 panic；此时保持惰性，
+        // 等第一次真正在运行期内 start 时再启动（生产入口都在运行期内）。
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let rx = self.pending_reaper.lock().unwrap().take();
+        if let Some(rx) = rx {
+            self.spawn_reaper(rx);
+        }
+    }
+
+    fn spawn_reaper(&self, rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
+        if self.reaper_started.set(()).is_err() {
+            return;
+        }
+        let attempts = Arc::clone(&self.attempts);
+        let registry = Arc::clone(&self.active_sessions);
+        let shutdown = self.shutdown.clone();
+        #[cfg(feature = "test-hooks")]
+        let hold = Arc::clone(&self.reaper_hold);
+        tokio::spawn(attempt_reaper_loop(
+            rx,
+            attempts,
+            registry,
+            shutdown,
+            #[cfg(feature = "test-hooks")]
+            hold,
+        ));
+    }
+
+    /// 测试专用：注入"teardown 第 2 步之前 panic"（`test-hooks`）。
+    ///
+    /// 用于验证隔离态 fail-closed：panic 后条目必须保留、新 Start 必须 409、
+    /// Stop 必须返回同一条 `ATTEMPT_FAILED_UNKNOWN`，直到 reaper 复核通过。
+    #[cfg(feature = "test-hooks")]
+    pub fn set_test_panic_before_teardown(&self, on: bool) {
+        self.test_panic_before_teardown.store(on, Ordering::Relaxed);
+    }
+
+    /// 测试专用：挂住 / 放行 reaper 的复核（`test-hooks`）。
+    ///
+    /// 为什么需要：真实收敛证明可能在微秒级完成（子进程已被 `kill_on_drop`
+    /// 终止、会话键可摘除），隔离态窗口短到无法确定性观察。挂住它只是把
+    /// **已有的状态**保持住，不改变任何生产语义（生产构建里该字段不存在）。
+    #[cfg(feature = "test-hooks")]
+    pub fn set_test_hold_reaper(&self, hold: bool) {
+        self.reaper_hold.store(hold, Ordering::Relaxed);
+    }
+
+    /// 启动一个 Endpoint。已在运行 / 正在停止 / 隔离中一律拒绝。
     ///
     /// P0-2 fail-closed：事件使能（`event_tasks` 非空）但 EventStore 不可用
     /// （`event_services == None`）时直接拒绝，连 Driver 进程都不启动——
     /// 否则事件会发出却无人持久化，形成"RUNNING 但丢历史"的静默缺口。
+    ///
+    /// G7 §6.6：**insert-before-spawn + Entry::Vacant**。检查存在与插入占位条目
+    /// 在同一次加锁内完成，覆盖写在类型层面不可表达；第二个 Start 在检查处即被
+    /// 拒绝，**根本没有 spawn 发生**（因此不存在需要终止旧条目的危险动作）。
     pub fn start_endpoint(&self, cfg: BuiltinEndpoint) -> Result<(), String> {
-        if self.is_running(&cfg.endpoint_id) {
-            return Err(format!("endpoint `{}` already running", cfg.endpoint_id));
-        }
-        if !cfg.event_tasks.is_empty() && self.event_services.read().unwrap().is_none() {
-            return Err(format!(
-                "EVENT_STORE_UNAVAILABLE: endpoint `{}` has event tasks but EventStore is unavailable",
-                cfg.endpoint_id
-            ));
-        }
-        let disc = self
-            .find_driver(&cfg.driver_id)
-            .ok_or_else(|| format!("driver `{}` not found or not launchable", cfg.driver_id))?;
+        self.ensure_reaper();
+        let mut t = self.attempts.lock().unwrap();
+        match t.live.entry(cfg.endpoint_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(e) => Err(match e.get().ctx.phase() {
+                AttemptPhase::FailedUnknown => format!(
+                    "ATTEMPT_FAILED_UNKNOWN: endpoint `{}` generation {} awaiting supervisor \
+                     verification; teardown completion NOT proven",
+                    cfg.endpoint_id,
+                    e.get().ctx.generation
+                ),
+                AttemptPhase::Stopping => format!(
+                    "STOP_IN_PROGRESS: endpoint `{}` is stopping (teardown not completed)",
+                    cfg.endpoint_id
+                ),
+                _ => format!("endpoint `{}` already running", cfg.endpoint_id),
+            }),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                if !cfg.event_tasks.is_empty() && self.event_services.read().unwrap().is_none() {
+                    return Err(format!(
+                        "EVENT_STORE_UNAVAILABLE: endpoint `{}` has event tasks but EventStore is unavailable",
+                        cfg.endpoint_id
+                    ));
+                }
+                let disc = self.find_driver(&cfg.driver_id).ok_or_else(|| {
+                    format!("driver `{}` not found or not launchable", cfg.driver_id)
+                })?;
 
-        let shutdown = self.shutdown.child_token();
-        let cancel = shutdown.clone();
-        let snapshot = Arc::clone(&self.snapshot);
-        let source = Arc::clone(&self.source);
-        let registry = std::sync::Arc::clone(&self.active_sessions);
-        let events = self.event_services.read().unwrap().clone();
-        let handle = tokio::spawn(run_endpoint(
-            disc,
-            cfg.clone(),
-            snapshot,
-            source,
-            shutdown,
-            registry,
-            events,
-        ));
+                let generation = self.next_gen(&cfg.endpoint_id);
+                let shutdown = self.shutdown.child_token();
+                let cancel = shutdown.clone();
+                let snapshot = Arc::clone(&self.snapshot);
+                let source = Arc::clone(&self.source);
+                let registry = std::sync::Arc::clone(&self.active_sessions);
+                let events = self.event_services.read().unwrap().clone();
+                let ctx = Arc::new(AttemptCtx::new(generation));
+                #[cfg(feature = "test-hooks")]
+                ctx.test_panic_before_teardown.store(
+                    self.test_panic_before_teardown.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                let guard = AttemptGuard {
+                    table: Arc::clone(&self.attempts),
+                    id: cfg.endpoint_id.clone(),
+                    generation,
+                    ctx: Arc::clone(&ctx),
+                    quarantine_tx: self.quarantine_tx.clone(),
+                };
+                v.insert(AttemptEntry {
+                    ctx: Arc::clone(&ctx),
+                    cancel,
+                });
+                // 锁必须在 spawn 之前释放：任务内部的 commit/Drop 需要同一把锁。
+                drop(t);
 
-        self.running
-            .lock()
-            .unwrap()
-            .insert(cfg.endpoint_id, RunningEntry { cancel, handle });
-        Ok(())
+                let task_ctx = Arc::clone(&ctx);
+                tokio::spawn(async move {
+                    let g = guard; // 任务自持：panic 时同样 drop
+                    let outcome = run_endpoint_with_attempt(
+                        disc,
+                        cfg,
+                        snapshot,
+                        source,
+                        shutdown,
+                        registry,
+                        events,
+                        crate::session::HeartbeatParams::default(),
+                        Some(Arc::clone(&task_ctx)),
+                    )
+                    .await;
+                    // 只有正常返回才走到这里；teardown 结论先写入，再 commit。
+                    let _ = task_ctx.outcome.set(outcome.map_or(Ok(true), Err));
+                    g.commit();
+                });
+                Ok(())
+            }
+        }
     }
 
     /// 兼容旧名称。
@@ -522,55 +982,92 @@ impl MesaManager {
         self.start_endpoint(cfg)
     }
 
+    /// Stop 的**受理**（同步，G7 §6.4 `begin_stop`）。
+    ///
+    /// 语义（逐条对应 §5.2 六行）：
+    /// - 无条目 ⇒ `NotRunning`（幂等成功 `was_running=false`）；
+    /// - `Stopping` ⇒ **合流**：不重复 cancel/teardown，等待同一次结论；
+    /// - `FailedUnknown`（隔离态）⇒ 不重复 teardown、不清除隔离，直接返回该条目
+    ///   已发布的同一次明确失败；
+    /// - 其余 ⇒ 置 `Stopping` + cancel（拆解**立即**开始），返回同一个结论通道。
+    ///
+    /// 全同步 ⇒ "受理"与"启动拆解"不可分割：不存在"代次已 +1、desired 已写假、
+    /// 但 teardown 没启动"的中间态。
+    pub fn begin_stop(&self, endpoint_id: &str) -> StopHandle {
+        let t = self.attempts.lock().unwrap();
+        let Some(e) = t.live.get(endpoint_id) else {
+            return StopHandle::not_running();
+        };
+        match e.ctx.phase() {
+            // 已证明完成、只差 Drop 移除条目：不 cancel、不改 phase，只等结论。
+            _ if e.ctx.is_committed() => StopHandle::join(Arc::clone(&e.ctx)),
+            AttemptPhase::FailedUnknown => StopHandle::join(Arc::clone(&e.ctx)),
+            AttemptPhase::Stopping => StopHandle::join(Arc::clone(&e.ctx)),
+            _ => {
+                e.ctx.set_phase(AttemptPhase::Stopping);
+                e.cancel.cancel();
+                StopHandle::join(Arc::clone(&e.ctx))
+            }
+        }
+    }
+
     /// 停止指定 Endpoint。
     ///
     /// P0-3：`Ok(was_running)`——`false` = 当时未运行（幂等成功）；
     /// `Err(detail)` = teardown 异常（drain fatal/timeout 精确码在前，
-    /// 或任务 panic）。Stop 等待 teardown 真正完成才返回：
-    /// 内部各步骤自带 bounded timeout（post 5s + terminate 10s + barrier 5s +
-    /// drain 可组合预算 15s，见 `INGRESS_DRAIN_TIMEOUT`，总 ≈ 35s 最坏），
-    /// Manager 直接 await，不再用"比总预算还短的外层 timeout 静默 detach"。
-    /// 返回后新旧 attempt 不重叠（同一 endpoint 立即 Start 安全）。
+    /// 或任务异常终止的 `ATTEMPT_FAILED_UNKNOWN`）。Stop 等待 teardown 真正
+    /// 完成才返回：内部各步骤自带 bounded timeout（post 5s + terminate 10s +
+    /// barrier 5s + drain 可组合预算 15s，见 `INGRESS_DRAIN_TIMEOUT`，
+    /// 总 ≈ 35s 最坏）。
+    ///
+    /// G7：签名不变（既有 30+ 调用点零改动）；实现改为 `begin_stop` +
+    /// 等待同一个结论，因此并发 Stop 会**合流**到同一次 teardown。
     pub async fn stop_endpoint(&self, endpoint_id: &str) -> Result<bool, String> {
-        let entry = self.running.lock().unwrap().remove(endpoint_id);
-        let Some(entry) = entry else {
-            return Ok(false);
-        };
-        entry.cancel.cancel();
-        match entry.handle.await {
-            Ok(None) => Ok(true),
-            Ok(Some(drain_err)) => Err(drain_err),
-            Err(join) => Err(format!("EVENT_DRAIN_FAILED: endpoint task failed: {join}")),
+        let t0 = Instant::now();
+        let handle = self.begin_stop(endpoint_id);
+        let res = handle.await_result().await;
+        let elapsed = t0.elapsed();
+        // 尾部无界时的诊断（§6.3.1）：超过 teardown 预算大声告警，不加自动强杀。
+        if elapsed > Duration::from_secs(35) * 3 {
+            tracing::error!(
+                endpoint = %endpoint_id,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "teardown exceeded 3x budget; attempt entry stays (fail-closed, Start will 409)"
+            );
+        } else if elapsed > Duration::from_secs(35) {
+            tracing::warn!(
+                endpoint = %endpoint_id,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "teardown exceeded budget"
+            );
         }
+        res
     }
-
     /// 统一停机（消费 self，兼容旧调用）。
     pub async fn shutdown(self) {
         self.shutdown_all().await;
     }
 
     /// 统一停机（&self 版，供 Arc 持有者调用）。
-    /// P0-3：直接 await 全部任务（teardown 全步骤有界，必结束），
+    /// P0-3：直接 await 全部结论（teardown 全步骤有界，必结束），
     /// 异常大声记录；进程退出路径无调用方可接收错误，但绝不静默 detach。
     pub async fn shutdown_all(&self) {
         self.shutdown.cancel();
-        let handles: Vec<(String, tokio::task::JoinHandle<Option<String>>)> = {
-            let mut m = self.running.lock().unwrap();
-            m.drain()
+        let handles: Vec<(String, StopHandle)> = {
+            let t = self.attempts.lock().unwrap();
+            t.live
+                .iter()
                 .map(|(id, e)| {
                     e.cancel.cancel();
-                    (id, e.handle)
+                    (id.clone(), StopHandle::join(Arc::clone(&e.ctx)))
                 })
                 .collect()
         };
         for (id, h) in handles {
-            match h.await {
-                Ok(None) => {}
-                Ok(Some(e)) => {
+            match h.await_result().await {
+                Ok(_) => {}
+                Err(e) => {
                     tracing::error!(endpoint = %id, "shutdown teardown failed: {e}");
-                }
-                Err(join) => {
-                    tracing::error!(endpoint = %id, "shutdown task failed: {join}");
                 }
             }
         }
@@ -939,6 +1436,132 @@ impl MesaManager {
     }
 }
 
+/// 隔离态复核的 pid 判据：**只有明确 `Dead` 才算收敛**。
+///
+/// `Alive`（还在跑）与 `Unknown`（查不清：权限不足/查询异常）都不构成"已死"
+/// 证据，必须继续隔离——fail-closed 不得被一次查询异常降级成 fail-open。
+fn pid_converged(status: crate::process::ProcessStatus) -> bool {
+    matches!(status, crate::process::ProcessStatus::Dead)
+}
+
+/// 隔离态监督清理（G7 §6.3.3）。
+///
+/// **边界（必须守住，代码注释即 review 门）**：只清理"任务已死、条目处于
+/// `FailedUnknown`"的残留——kill 残留 pid、摘除属于该 id 的 registry 键、
+/// 复核通过后移除条目并写完成代次。**不启动、不重启、不写 `desired_running`、
+/// 不改快照、不 cancel 任何活着的 attempt** ⇒ 它不是对账器/看门狗（§10-1）。
+///
+/// 复核条件（有界重试）：① pid 不再存活（必要时先强杀）；② registry 中该
+/// `endpoint_id` 的键已不存在（隔离条目不可能是活 attempt，故该键必为残留）。
+/// 二者都成立才允许清除；否则保留条目、大声告警并继续重试——永远无法证明
+/// 收敛时只能重启 Core（与 §6.3.1 "尾部无界 ⇒ Start 永远 409" 同一 fail-closed 选择）。
+async fn attempt_reaper_loop(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    table: Arc<Mutex<AttemptTable>>,
+    registry: Arc<
+        RwLock<HashMap<String, std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>>>,
+    >,
+    shutdown: CancellationToken,
+    #[cfg(feature = "test-hooks")] hold: Arc<AtomicBool>,
+) {
+    // 复核重试参数：总窗口 ≈ 30s（60 × 500ms），覆盖 tokio 孤儿队列异步回收僵尸。
+    const RETRIES: u32 = 60;
+    const RETRY_DELAY: Duration = Duration::from_millis(500);
+    loop {
+        let id = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            id = rx.recv() => match id {
+                Some(id) => id,
+                None => return,
+            },
+        };
+        // 测试闸门：仅在 `test-hooks` 构建里存在；生产路径整段被编译掉。
+        // 用轮询而不是 channel：语义就是"保持隔离态直到测试放行"，轮询没有
+        // 额外的唤醒时序问题（50ms 粒度对测试无影响）。
+        #[cfg(feature = "test-hooks")]
+        while hold.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut cleared = false;
+        for attempt in 0..RETRIES {
+            // 取快照（不持锁做 IO）
+            let target = {
+                let t = table.lock().unwrap();
+                match t.live.get(&id) {
+                    Some(e) if e.ctx.phase() == AttemptPhase::FailedUnknown => {
+                        Some((e.ctx.generation, e.ctx.pid.load(Ordering::Acquire)))
+                    }
+                    // 已被其它路径清理 / 不是隔离态：无需动作
+                    _ => None,
+                }
+            };
+            let Some((generation, pid)) = target else {
+                cleared = true;
+                break;
+            };
+            // 三态复核（P0 回归）：只有**明确 Dead** 才算收敛。Unknown（权限不足/
+            // 查询异常）必须继续隔离并重试——旧实现把"打不开"当"已死"，会在
+            // Windows 上把仍在运行的残留驱动判成已收敛，放行新 Start 与之并存。
+            let pid_status = if pid == 0 {
+                crate::process::ProcessStatus::Dead
+            } else {
+                crate::process::process_status(pid)
+            };
+            if pid_status == crate::process::ProcessStatus::Alive {
+                tracing::warn!(
+                    endpoint = %id, generation, pid,
+                    "attempt_reaper: residual driver process alive, terminating"
+                );
+                let _ = crate::process::kill_pid(pid);
+            } else if pid_status == crate::process::ProcessStatus::Unknown {
+                tracing::warn!(
+                    endpoint = %id, generation, pid,
+                    "attempt_reaper: 无法证明残留进程已死（进程查询异常），保持隔离并重试"
+                );
+            }
+            let pid_dead = pid_converged(pid_status);
+            // 摘除属于本 id 的残留会话键（隔离条目已无活 attempt 持有它）。
+            let had_session = registry.write().unwrap().remove(&id).is_some();
+            let session_released = !registry.read().unwrap().contains_key(&id);
+            if pid_dead && session_released {
+                let mut t = table.lock().unwrap();
+                // 复核与清除必须在同一临界区重新确认代次与阶段（防止期间被改）。
+                let still = t.live.get(&id).is_some_and(|e| {
+                    e.ctx.generation == generation && e.ctx.phase() == AttemptPhase::FailedUnknown
+                });
+                if still {
+                    // 异常 attempt 同样需要"终结凭证"，但 outcome **保持 Err**
+                    // （失败必须仍是失败，不得改写为成功）。
+                    t.last_completed_gen.insert(id.clone(), generation);
+                    t.live.remove(&id);
+                    cleared = true;
+                }
+                tracing::error!(
+                    endpoint = %id, generation,
+                    had_session,
+                    "attempt_reaper: quarantined attempt cleared after convergence proof; \
+                     original outcome remains FAILED (ATTEMPT_FAILED_UNKNOWN)"
+                );
+                break;
+            }
+            if attempt + 1 == RETRIES {
+                tracing::error!(
+                    endpoint = %id, generation, pid,
+                    "attempt_reaper: convergence NOT proven within budget; entry stays \
+                     quarantined (Start keeps returning ATTEMPT_FAILED_UNKNOWN until restart)"
+                );
+            }
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
+        if !cleared {
+            tracing::error!(
+                endpoint = %id,
+                "attempt_reaper: gave up this round; entry remains quarantined (fail-closed)"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1128,5 +1751,157 @@ mod tests {
         let e = check_preview_payload("[]").unwrap_err();
         assert_eq!(e.code, "DEFINITION_RESPONSE_INVALID");
         check_preview_payload(r#"{"point_key":"k"}"#).unwrap();
+    }
+}
+
+/// G7 attempt 表 / 隔离态 / 完成代次凭证的**算法层**确定性单测
+///（无 HTTP、无时序；`test-hooks` 门控，因为需要挂住 reaper 才能观察隔离态）。
+#[cfg(all(test, feature = "test-hooks"))]
+mod g7_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn empty_manager(tag: &str) -> MesaManager {
+        let dir = std::env::temp_dir().join(format!(
+            "mesa-g7-unit-{tag}-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        MesaManager::discover(&dir)
+    }
+
+    fn cfg(id: &str) -> BuiltinEndpoint {
+        BuiltinEndpoint {
+            endpoint_id: id.into(),
+            driver_id: "test-driver".into(),
+            connection_json: "{}".into(),
+            tasks: vec![],
+            event_tasks: vec![],
+        }
+    }
+
+    /// 手工登记一个 attempt（等价于 `start_endpoint` 的 insert-before-spawn），
+    /// 返回它的守卫。
+    fn register(mgr: &MesaManager, id: &str, generation: u64) -> AttemptGuard {
+        let ctx = Arc::new(AttemptCtx::new(generation));
+        mgr.attempts.lock().unwrap().live.insert(
+            id.to_string(),
+            AttemptEntry {
+                ctx: Arc::clone(&ctx),
+                cancel: CancellationToken::new(),
+            },
+        );
+        AttemptGuard {
+            table: Arc::clone(&mgr.attempts),
+            id: id.to_string(),
+            generation,
+            ctx,
+            quarantine_tx: mgr.quarantine_tx.clone(),
+        }
+    }
+
+    /// P0-1 主门：未 commit 就 drop（panic 展开同路径）⇒ 条目**保留**、
+    /// phase=FailedUnknown、结论是**同一次**明确失败。
+    #[tokio::test]
+    async fn guard_without_commit_quarantines_entry() {
+        let mgr = empty_manager("quarantine");
+        mgr.set_test_hold_reaper(true);
+        let guard = register(&mgr, "ep", 3);
+        let ctx = Arc::clone(&guard.ctx);
+        drop(guard); // 模拟 teardown 中途 panic：Drop 执行但从未 commit
+        assert_eq!(ctx.phase(), AttemptPhase::FailedUnknown);
+        assert!(mgr.has_live_attempt("ep"), "异常终止不得移除条目");
+        assert_eq!(mgr.current_gen("ep"), Some(3), "隔离态代次仍可取");
+        assert!(!ctx.is_committed());
+        match ctx.settled() {
+            Some(Err(e)) => assert!(e.starts_with("ATTEMPT_FAILED_UNKNOWN"), "{e}"),
+            other => panic!("必须发布明确失败: {other:?}"),
+        }
+        let err = mgr.start_endpoint(cfg("ep")).unwrap_err();
+        assert!(
+            err.starts_with("ATTEMPT_FAILED_UNKNOWN"),
+            "隔离态必须拒绝新 Start: {err}"
+        );
+        // Stop 命中隔离态：不重复 teardown、不清除隔离，返回同一次失败。
+        let h = mgr.begin_stop("ep");
+        assert!(h.was_running(), "隔离条目仍算'有 attempt'");
+        let e = h.await_result().await.unwrap_err();
+        assert!(e.starts_with("ATTEMPT_FAILED_UNKNOWN"), "{e}");
+        assert!(mgr.has_live_attempt("ep"), "Stop 不得清除隔离");
+        mgr.set_test_hold_reaper(false);
+    }
+
+    /// 正常完成：`commit()` 之后的 Drop 在**同一临界区**写完成代次并移除条目
+    ///（P0-3：`current_gen` 仍可回退到该凭证，正常停止的判据才有基准）。
+    #[tokio::test]
+    async fn committed_guard_records_completed_generation() {
+        let mgr = empty_manager("commit");
+        let guard = register(&mgr, "ep", 5);
+        let ctx = Arc::clone(&guard.ctx);
+        let _ = ctx.outcome.set(Ok(true));
+        guard.commit();
+        drop(guard);
+        assert_eq!(ctx.phase(), AttemptPhase::TeardownDone);
+        assert!(!mgr.has_live_attempt("ep"), "正常完成必须移除条目");
+        assert_eq!(
+            mgr.current_gen("ep"),
+            Some(5),
+            "完成代次凭证必须保留（否则 await_settled 永远没有基准）"
+        );
+        assert_eq!(
+            mgr.gen_floor("ep"),
+            0,
+            "手工登记不经过 next_gen，floor 仍为 0"
+        );
+        // 完成后允许全新 Start（这里只验证门不再拦：驱动不存在 ⇒ 报 driver not found）。
+        let err = mgr.start_endpoint(cfg("ep")).unwrap_err();
+        assert!(!err.starts_with("ATTEMPT_FAILED_UNKNOWN"), "{err}");
+        assert!(!err.starts_with("STOP_IN_PROGRESS"), "{err}");
+    }
+
+    /// 契约行 2：Stopping 期间 Start 必须同步拒绝，且**未**产生第二个 attempt。
+    #[tokio::test]
+    async fn start_rejected_while_stopping() {
+        let mgr = empty_manager("stopping");
+        let guard = register(&mgr, "ep", 1);
+        mgr.begin_stop("ep");
+        let err = mgr.start_endpoint(cfg("ep")).unwrap_err();
+        assert!(err.starts_with("STOP_IN_PROGRESS"), "{err}");
+        assert_eq!(
+            mgr.attempts.lock().unwrap().live.len(),
+            1,
+            "不得产生第二个 attempt（无孤儿）"
+        );
+        let _ = guard.ctx.outcome.set(Ok(true));
+        guard.commit();
+        drop(guard);
+    }
+
+    /// 代次单调且永不回收；`gen_floor` 是"已发放的最大值"（墓碑下界）。
+    #[tokio::test]
+    async fn generation_is_monotonic_and_floor_is_last_issued() {
+        let mgr = empty_manager("generation");
+        assert_eq!(mgr.next_gen("ep"), 1);
+        assert_eq!(mgr.next_gen("ep"), 2);
+        assert_eq!(mgr.gen_floor("ep"), 2);
+        assert_eq!(mgr.next_gen("other"), 1, "代次是 per-endpoint 的");
+        assert_eq!(mgr.gen_floor("missing"), 0);
+        let _ = AtomicBool::new(true);
+    }
+
+    /// 隔离态复核只接受"明确已死"：`Unknown`（进程查询异常）**不得**被当成收敛。
+    ///
+    /// 这是 Windows 上"查询异常 ⇒ 隔离态误判"的算法层回归点：旧实现把
+    /// `process_alive()==false` 直接当 `pid_dead`，而权限不足时它也是 false。
+    #[test]
+    fn pid_convergence_requires_proof_of_death() {
+        use crate::process::ProcessStatus;
+        assert!(pid_converged(ProcessStatus::Dead));
+        assert!(!pid_converged(ProcessStatus::Alive));
+        assert!(
+            !pid_converged(ProcessStatus::Unknown),
+            "无法证明已死时必须继续隔离（fail-closed），不得放行新 Start"
+        );
     }
 }

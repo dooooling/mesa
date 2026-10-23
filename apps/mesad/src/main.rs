@@ -137,8 +137,73 @@ async fn main() {
     if stored_eps.is_empty() {
         tracing::warn!("no endpoints in store; create one via REST POST /api/v1/endpoints");
     }
+    // G7 S2 / P0-4（**默认不恢复**，评审指定的默认值翻转）：
+    // 修复前是"命中围栏才不恢复"（默认恢复）。现在只有**能正向证明**运行意图
+    // 已持久化才恢复：DB 可写 + 围栏可读 + 意图确认凭证可读，且该端点在凭证里
+    // 被确认为 `true`。任一步做不到 ⇒ 不恢复（宁可少恢复，不可误拉起机床端点）。
+    //
+    // 为什么围栏（负向证据）不够：Stop 的 `desired_running=false` 落盘失败时，
+    // 围栏本身也可能写不进去（同一个不可写的 DB）。正向凭证把"没写进去"与
+    // "写了但没证明"统一成同一种保守结果。
+    //
+    // 人工确认方式：显式 POST /start（成功后门会写凭证并清除围栏）。
+    let (fenced, confirmed): (Vec<String>, std::collections::BTreeSet<String>) = match store
+        .recovery_plan()
+    {
+        mesa_config_store::RecoveryPlan::Proceed { fenced, confirmed } => (fenced, confirmed),
+        mesa_config_store::RecoveryPlan::DenyAll { reason } => {
+            tracing::error!(
+                reason = %reason,
+                "开机恢复被拒绝（fail-closed）：跳过本次全部自动恢复，需人工核验后显式 POST /start"
+            );
+            (
+                stored_eps.iter().map(|r| r.id.clone()).collect(),
+                std::collections::BTreeSet::new(),
+            )
+        }
+    };
     for rec in &stored_eps {
+        if fenced.iter().any(|f| f == &rec.id) {
+            if rec.desired_running {
+                tracing::error!(
+                    endpoint = %rec.id,
+                    "SKIP auto-restore: 该端点上次停止意图未能持久化（围栏命中）；\
+                     禁止自动拉起，需人工核验后显式 POST /start 确认"
+                );
+            } else {
+                // 意图已经是 false：风险消失，围栏可以安全清除（否则会永久累积）。
+                if let Err(e) = store.clear_stop_intent_unpersisted(&rec.id) {
+                    tracing::warn!(endpoint = %rec.id, error = %e, "清除停止意图围栏失败");
+                }
+            }
+            continue;
+        }
         if !rec.desired_running {
+            continue;
+        }
+        // 828D 一期产品约束（**不是**通用生命周期语义）：`sinumerik-nck` 端点
+        // 开机一律不自动恢复——无论凭证、围栏、`desired_running` 为何，必须由
+        // 现场显式 `POST /start` 才启动。其他驱动行为不变。
+        //
+        // 为什么放在凭证判定之前：这是产品策略，不依赖"能否证明用户意图"；
+        // 即使正向凭证完整（升级后正常 Start 过），NCK 也不得被自动拉起。
+        if !mesa_core_api::recovery::boot_auto_restore_allowed(&rec.driver_id) {
+            tracing::warn!(
+                endpoint = %rec.id,
+                driver = %rec.driver_id,
+                "SKIP auto-restore: 828D 一期产品约束——sinumerik-nck 开机一律不自动恢复；\
+                 需现场显式 POST /start"
+            );
+            continue;
+        }
+        // P0-4：`desired_running=true` 但没有正向凭证 ⇒ 无法证明这是用户意图
+        // （可能是一次失败的 Stop 留下的旧值）⇒ 不恢复。
+        if !confirmed.contains(&rec.id) {
+            tracing::error!(
+                endpoint = %rec.id,
+                "SKIP auto-restore: 无法正向证明其运行意图已持久化（无确认凭证）；\
+                 禁止自动拉起，需人工核验后显式 POST /start 确认"
+            );
             continue;
         }
         // C1 P0：开机恢复必须与 REST Start / Bootstrap start 走**同一条**

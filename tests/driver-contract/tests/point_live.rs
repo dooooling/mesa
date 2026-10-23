@@ -265,7 +265,9 @@ async fn point_live_remove_endpoint_resyncs_and_reconnect_fresh() {
     let f0 = cli.next_frame_timeout(5).await;
     assert_eq!(points_of(&f0).len(), 1);
     // 删除 endpoint → Resync 全量（旧行消失）。
-    srv.snapshot.remove_endpoint("ep1");
+    // G7：DELETE 必须带 `gen_floor`（墓碑下界）；本夹具的状态写入 gen=0，
+    // 因此 floor=0 即"已发放的最大代次"。
+    srv.snapshot.remove_endpoint("ep1", 0);
     let f1 = cli.next_frame_timeout(5).await;
     assert_eq!(f1.event.as_deref(), Some("mesa-points-snapshot"));
     assert_eq!(points_of(&f1).len(), 0);
