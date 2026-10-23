@@ -12,7 +12,7 @@
 #   ├─ rust-platform ×3（全 workspace 编译 + smoke；main 上 full）
 #   ├─ rust-stress（风险触发；main Rust change 必跑）
 #   ├─ rust-perf（风险触发；与 canonical 并行）
-#   └─ watchdog（Windows + Linux 并行跑 stop-watchdog 离线场景 M0–M18；**仅** watchdog 相关
+#   └─ watchdog（Windows + Linux 并行跑 stop-watchdog 离线场景 M0–M19；**仅** watchdog 相关
 #                路径变更或 fail-closed FULL 时运行，绝不无条件跑——单 job 25 分钟预算）
 #   └─ e2e（Windows + Linux 并行跑 NCK REST 端到端：真实 mesad + 真实 TCP 模拟器；
 #            **仅** E2E 相关路径变更或 fail-closed FULL 时运行——单 job 20 分钟预算）

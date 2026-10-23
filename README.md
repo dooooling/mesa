@@ -7,9 +7,10 @@
 ## 快速开始
 
 ```bash
-cargo build --workspace          # 含全部驱动 bin，edition 2024 rust 1.95.0
+cargo build --workspace          # 含全部驱动 bin，edition 2024 rust 1.95.0；产物在 target/debug/
 cargo test --workspace -- --test-threads=1
-./target/release/mesad --http-port 8132 --drivers-dir drivers  # 默认 8132 loopback
+./target/debug/mesad --http-port 8132 --drivers-dir drivers  # 默认 8132 loopback
+# 若要 release：先 cargo build --release --workspace，再跑 ./target/release/mesad（不加 --release 只会产出 debug）
 ```
 
 验收入口 `http://127.0.0.1:8132/api/v1/drivers` `.../endpoints` `.../points/latest` `.../diagnostics` `.../certificates/opcua/diagnostics`
