@@ -65,7 +65,8 @@
 | `local_tsap` | `1024` | `max_read_items` | **`1`** |
 | `timeout_ms` | `1000` | `family` | `828d` |
 
-- **v1.3 补充**：`host` / `port` / `local_tsap` / `remote_tsap` / `pdu_length` **五字段**是 watchdog 的连接配置比对项（`watchdog:1176-1216`，逐字段、任一不一致即拒绝）。`max_read_items`/`timeout_ms`/`family` 不在该比对集合内，只能靠 §3.4 的机械 diff 与 §3.1 的点位参数比对间接保证。
+- **v1.3 补充（口径修正）**：`host` / `port` / `local_tsap` / `remote_tsap` / `pdu_length` **五字段**是 watchdog 的**自动**连接配置比对项（`watchdog:1176-1216`，逐字段、任一不一致即拒绝）。
+- **`max_read_items` / `timeout_ms` / `family` 三字段不在 watchdog 自动比对集合内 —— 不得声称它们已被自动验证。** 三者必须按 **§4.2 的人工逐字段核验**处理（对本次窗口的 Endpoint 原始 GET 响应与签署的 `approved-task-config.json` 逐字段比较），**且 §3.4 的历史配置对照不能替代现场实时校验**（历史对照只说明"编制时一致"，不证明"本次窗口一致"）。
 
 ### 3.3 Task 参数
 
@@ -129,6 +130,17 @@
 - **该探测必须单独授权**，**不得**默认并入"尚未批准的前置检查"，也不得因"只是探一下"而免授权；一次探测 = 一次对机床的真实连接（诊断方案 `:185`、`:572`）。
 - **未获授权时，G2 只能依赖 HMI 侧信息 + `arp -a`/MAC 对照 + 现场目视**（X130 指示灯、端口标签），**不得**由软件主动连机床；此时 G2 的"协商 PDU"一项记为"未测（无授权）"，不得写成"已核对"。
 - 即便获授权，probe 结果也**只证"连到 S7Comm 对端"**，不证机型身份，不得替代 G1。
+
+### 4.2 人工逐字段核验（`max_read_items` / `timeout_ms` / `family`）—— **不是 watchdog 自动门禁**
+
+watchdog 的连接配置**自动**比对**只覆盖五个字段**（`host` / `port` / `local_tsap` / `remote_tsap` / `pdu_length`，`watchdog:1176-1216`）。**`max_read_items` / `timeout_ms` / `family` 三个字段不在该集合内**，因此**不得声称它们已被自动验证**，必须由现场**人工**核验：
+
+1. 在**本次窗口内**取 **Endpoint 原始 GET 响应**（不裁剪、不摘要化），与签署的 `approved-task-config.json` **逐字段**比较这三个字段；
+2. 保存 **原始响应**、**规范化差异**（JSON 规范化后 diff）与**复核签名**（§10.2）；
+3. **任一字段缺失、不一致或无法取证 ⇒ NO-GO，不得进入 FIRED**；
+4. **§3.4 的历史配置对照不能替代本项** —— 历史对照只证明"编制时一致"，**不证明"本次窗口一致"**。
+
+> ⚠️ **这是人工核验项，不是 watchdog 自动门禁。** 证据清单（§6.4）与待确认清单（§11）均已登记该项；判 NO-GO 时须在 §10.3 记录具体缺失字段。
 
 **关于 MAC `98-fa-9b-59-35-53`（仅辅助对照）**：该值目前**仅来自现场记录，仓库内无留存**（全仓检索无匹配，**待现场补充截图或书面记录**）。即便一致，**单靠 MAC 或 IP 不足以证明一定连接的是指定 828D**（MAC 可换网卡、IP 可复用；诊断方案 `:215-217` 明确"名称/ID 是人工标签，不是身份证据"）。MAC **只能**作为与 HMI + X130 + 工位信息相互印证的一环，**不得单独作为 G1 通过依据**。六道门的签字另附页，格式同 §10.2（确认人 / 确认时间 / 证据文件名；缺一即未通过）。
 
@@ -446,7 +458,7 @@
 > 1. 重新 `GET /api/v1/endpoints/lx-nck-tags-190-connection` 与 `GET /api/v1/tasks?endpoint=lx-nck-tags-190-connection`，**原样保存**响应文本（不重排 JSON）；
 > 2. 对本次重新获取的文件与 §6.4 基线同法计算 SHA-256（`Get-FileHash -Algorithm SHA256`）；
 > 3. 与本文档记录的基线值**逐字符比对**，把"命令、时刻、本次值、基线值、结论"**五列**写入 `site-log.md`；
-> 4. 同步核对 `connection` 8 字段与 §3.2、任务 `revision` 与 §1 表一致。
+> 4. 同步核对 `connection` **全部 8 字段**与 §3.2：其中 **5 个**（`host`/`port`/`local_tsap`/`remote_tsap`/`pdu_length`）由 watchdog **自动**比对，另 **3 个**（`max_read_items`/`timeout_ms`/`family`）按 **§4.2 人工核验**；并核对任务 `revision` 与 §1 表一致。
 >
 > **不一致 ⇒ NO-GO**：须重新评估回退目标（本文档的 `rev17` 备份可能已不是当前配置，恢复路径失效），**不得**"按文档哈希认定一致"后继续；**也不得**把本文档旧哈希写成"执行时已验证"。
 
@@ -483,7 +495,8 @@
 | `interval_ms` / `mode` / `binding.kind` | 5000 / poll / `nck.points.v1` | **1000** / poll / `nck.points.v1` | 相等 |
 | `point_key` 序列 | 4 条 | **238 条，与 rev17 逐点一致** | 逐点比对（顺序敏感） |
 | 任务内容哈希 | 待填 | `tasks` 数组规范化后须与 rev17 的 `tasks` 数组同法哈希一致（**不得**直接比 `rev17-tasks.raw.json` 整文件哈希：其中 `revision=17`，恢复后为 19） | 相等；不等即恢复失败 |
-| `connection` 8 字段 | 见 §3.2 | 同 §3.2（本轮从未修改） | 逐字段相等 |
+| `connection` 5 字段（**watchdog 自动**） | 见 §3.2 | 同 §3.2（本轮从未修改） | 逐字段相等（自动门禁） |
+| `connection` 另 3 字段（**人工核验**） | `max_read_items`/`timeout_ms`/`family` | 原始 GET 响应 + 规范化 diff + 复核签名（§4.2） | 逐字段相等，缺失即 NO-GO |
 | `state` / `desired_running` | RUNNING→STOPPED | **STOPPED / false** | 必须 |
 | `runtime.revision` / `runtime.points` | 16 / 4 | **仍是 16 / 4** | **不作为判据**（上次运行视图，§2.1-④） |
 | **重启后是否自动恢复** | — | **否**（`driver_id="sinumerik-nck"`） | 记录实测（重启一次观察）；**"未自动拉起"是期望结果** |
@@ -605,3 +618,4 @@
 | 8 | **`sinumerik-nck` 之外的驱动仍有"重启误拉起"路径** | G7 设计 §6.10.3 末明确**未消除**；本轮不涉及其它驱动，也不得外推 | 产品决策（是否推广"所有驱动开机一律不自动恢复"） |
 | 9 | **`ARMED` 无法对生产 8132 执行**，生产侧"通路可用"只能由 fire 的只读 GET 证明 | `arm` 冻结为回环且端口 ≠ 8132（`watchdog:611-628`） | 流程层面接受（现场交底时写清）；如需"对生产端点的独立通路自检"，属**新功能**，本申请不承诺 |
 | 10 | **真机停止时刻**无法由任何离线手段证明 | 30 s 是调度目标；实际停止由 §5.3.1 第二层六项另行观测，且尾部可能无界（`process.rs:284`） | 现场监护人按 §5.3 处置 |
+| 11 | **`max_read_items` / `timeout_ms` / `family` 三字段不由 watchdog 自动验证** | watchdog 的连接配置自动比对只覆盖 5 个字段（`host`/`port`/`local_tsap`/`remote_tsap`/`pdu_length`，`watchdog:1176-1216`）；这三字段**不在集合内** | **现场人工核验**（§4.2）：对本次窗口的 Endpoint 原始 GET 响应与签署的 `approved-task-config.json` 逐字段比较，保存原始响应 + 规范化 diff + 复核签名；任一缺失/不一致/无法取证 ⇒ **NO-GO，不得进入 FIRED**。**这是人工项，不是自动门禁** |
