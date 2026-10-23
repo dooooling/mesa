@@ -2315,7 +2315,7 @@ async fn delete_racing_start_never_leaves_orphan_attempt() {
 ///
 /// ```text
 /// 1. Stop-A 已完成驱动 teardown（attempt 条目已移除），
-///    但 desired=false 仍在写库（注入 9s 延迟；DELETE 的等待预算 10s）；
+///    但 desired=false 仍在写库（被 `WriteHold` 挂住，由本用例显式放行）；
 /// 2. DELETE 到达：旧码"看不到活跃 attempt"⇒ 立即删行 + 清空在途标记；
 /// 3. CREATE 以**同一 Endpoint ID** 重建，Start 写入 desired=true；
 /// 4. 旧 Stop-A 的迟到 SQL 仍会执行 —— 它命中的已经是**另一条记录**；
@@ -2326,6 +2326,16 @@ async fn delete_racing_start_never_leaves_orphan_attempt() {
 /// 屏障拒绝新 Start（409 `ENDPOINT_DELETED`）；删除成功才立墓碑代次（`stop_gen`
 /// +1），使旧实例的票据/代次永远匹配不上重建后的记录。
 ///
+/// 时序确定性（为什么不再用"注入 9s 延迟"）：`DELETE_PERSIST_WAIT` 是 10s，
+/// 9s 注入只留 1s 余量——CI 负载高时"9s 写入 + teardown + 调度开销"会超过预算，
+/// DELETE 按预算用尽返回 409 `DELETE_PERSIST_IN_PROGRESS`，于是本用例间歇性变红
+/// （同一份代码在其他 CI 上是绿的，属机器速度决定的假红）。现在改为**显式握手**：
+/// 那次 `desired=false` 写库在"已进入 `set_desired_running`、尚未写库"处被
+/// `WriteHold` 挂起 ⇒ 本用例观测到 `stop_persist_inflight_count == 1` 与
+/// `deleting == true`（DELETE 已进入屏障并在等它）之后才 `release()` 放行，
+/// 写入随即完成、DELETE 立即可收敛。**顺序由测试决定，与机器快慢无关**，
+/// 而且投影到生产路径的仍只有"DELETE 必须在在途写入收敛后才成功"这一条语义。
+///
 /// 旧码上**确定性必红**的断言（在"前置：写入仍在途"成立时）：
 /// - 删除窗口内的 Start 不是 409（旧码已删行、且清空了在途标记）；
 /// - 旧 Stop 的 `desired=false` 未确认之前配置行已被删掉；
@@ -2334,6 +2344,22 @@ async fn delete_racing_start_never_leaves_orphan_attempt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delete_waits_for_inflight_stop_persist_and_rebuild_is_not_polluted() {
     use std::sync::atomic::Ordering;
+
+    // 放行守卫：断言 panic 展开时也把写入放行，避免把 blocking 线程挂到安全阀
+    // 超时（那会让"用例失败"变成"测试进程空转两分钟"）。
+    struct ReleaseOnDrop(Option<Arc<mesa_config_store::WriteHold>>);
+    impl ReleaseOnDrop {
+        fn release(&mut self) {
+            if let Some(h) = self.0.take() {
+                h.release();
+            }
+        }
+    }
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
 
     let rig = SettleRig::new("p0d").await;
 
@@ -2344,15 +2370,25 @@ async fn delete_waits_for_inflight_stop_persist_and_rebuild_is_not_polluted() {
     rig.wait_running(id, 30).await;
     assert!(rig.desired(id), "预置：DB 必须为 true");
 
-    // 只让本次 Stop 的 false 写延迟 9s；队列消费完即回落到 0ms，因此重建实例的
-    // true 写不受影响。9s 是刻意留的余量：DELETE 的等待预算是 10s（`DELETE_PERSIST_WAIT`），
-    // 而 teardown 本身耗时不定（实测几十毫秒，重载时可到秒级）——"Stop 的写入仍在途"
-    // 这个窗口必须比 teardown 明显宽，否则本用例会退化成时序采样而不是确定性 Gate。
+    // 只挂住本次 Stop 的 false 写（队列只放一个元素，消费完即不再挂起，因此重建
+    // 实例的 true 写不受影响）。`delay_seq` 清空 ⇒ 不注入固定延迟：本用例的
+    // "写入在途"窗口完全由下面的屏障开关决定，不依赖"9s < 10s"这种机器速度假设。
+    let hold = Arc::new(mesa_config_store::WriteHold::new());
+    let mut hold_guard = ReleaseOnDrop(Some(Arc::clone(&hold)));
     {
-        let faults = rig.store.desired_write_faults();
-        let mut q = faults.delay_seq.lock().unwrap();
-        q.clear();
-        q.push_back(9000);
+        // 清空延迟队列 ⇒ 不注入固定延迟（`delay_ms` 默认为 0），窗口只由屏障决定。
+        rig.store
+            .desired_write_faults()
+            .delay_seq
+            .lock()
+            .unwrap()
+            .clear();
+        rig.store
+            .desired_write_faults()
+            .hold_seq
+            .lock()
+            .unwrap()
+            .push_back(Arc::clone(&hold));
     }
     let base = rig
         .store
@@ -2447,9 +2483,30 @@ async fn delete_waits_for_inflight_stop_persist_and_rebuild_is_not_polluted() {
         })
     };
 
-    // 窗口内的 Start：必须被拒。两种合法拒绝码取决于 DELETE 是否已立屏障：
-    // 屏障已立 ⇒ `ENDPOINT_DELETED`；尚未轮到 handler ⇒ 仍由 P0-A 的在途 Stop
-    // 闸门给出 `STOP_PERSIST_IN_PROGRESS`。两者都要求"不得产生 attempt / 写入"。
+    // 确定性握手第一步：`deleting` 由 `begin_delete()` 在 DELETE handler 最开头
+    // 置真，此后 handler 只可能在 `await_intent_quiescent` 上等这次在途写入
+    //（在途计数非 0 ⇒ 只能按 `DELETE_PERSIST_POLL` 轮询）。因此"在途计数仍为 1
+    // 时观测到 `deleting`"就证明 **DELETE 已经进入屏障并在等我们这次写入**，
+    // 而不是"DELETE 请求还没被调度"。
+    common::wait_until(10, || rig.state.lifecycle.sample(id).deleting).await;
+    assert_eq!(
+        rig.state.lifecycle.sample(id).stop_persist_inflight_count,
+        1,
+        "DELETE 进入屏障时，旧 Stop 的落盘必须仍在途（写入被屏障挂住）"
+    );
+    assert_eq!(
+        rig.store
+            .desired_write_faults()
+            .calls_completed
+            .load(Ordering::Relaxed),
+        base_completed,
+        "DELETE 已进入屏障时，旧 Stop 的 desired=false 仍不得完成（否则测不到本窗口）"
+    );
+
+    // 窗口内的 Start：必须被拒。此时 `deleting` 已被上面确定性观测到为真，
+    // 因此正常应得 `ENDPOINT_DELETED`；这里仍接受 P0-A 的 `STOP_PERSIST_IN_PROGRESS`
+    // 作为等价合法拒绝（两者都表示"这次 Start 没有发生"），关键判据是
+    // **不得成功、不得留下 attempt / 写入**。
     // 旧码：DELETE 已删行且清空了在途标记 ⇒ Start 会成功或被 404 挡住，本条即红。
     let (s, v) = rig.start(id).await;
     assert_eq!(
@@ -2474,6 +2531,22 @@ async fn delete_waits_for_inflight_stop_persist_and_rebuild_is_not_polluted() {
         "P0-D：旧 Stop 的 desired=false 未确认前，DELETE 不得返回"
     );
 
+    // ── 步骤 2.5：放行屏障 —— 写入真正完成之前，DELETE 不得收敛 ──
+    //
+    // 到这里为止已由可机器判定的状态证明：写入在途（`calls_completed` 未变）、
+    // DELETE 已进入屏障（`deleting` 为真且在等）、配置行仍在、窗口内 Start 被拒。
+    // 现在显式放行那次写库（此后不再注入任何延迟），并等它真正完成：
+    // 只有这样 DELETE 才会在它自己的 10s 预算内返回 200 —— 与机器快慢无关。
+    hold_guard.release();
+    common::wait_until(10, || {
+        rig.store
+            .desired_write_faults()
+            .calls_completed
+            .load(Ordering::Relaxed)
+            > base_completed
+    })
+    .await;
+
     // ── 步骤 3：DELETE 收敛并删行（不在这里等 Stop 应答——否则旧码会因为
     //    等 Stop 而错过"重建发生在迟到写入之前"的污染窗口）──
     let (del_status, del_body) = tokio::time::timeout(Duration::from_secs(40), delete_task)
@@ -2491,7 +2564,7 @@ async fn delete_waits_for_inflight_stop_persist_and_rebuild_is_not_polluted() {
     );
     // 修复的**核心**：DELETE 返回时，旧 Stop 的 `desired=false` 必须已经
     // **确认落库**（`calls_completed` 在 UPDATE 之后才 +1），而不是"门把在途标记
-    // 清掉就算完成"。修复前这里恒为 false（DELETE 在被注入的 6s 窗口内就返回了）。
+    // 清掉就算完成"。修复前这里恒为 false（DELETE 在写入仍被挂住时就删行返回了）。
     assert!(
         rig.store
             .desired_write_faults()
