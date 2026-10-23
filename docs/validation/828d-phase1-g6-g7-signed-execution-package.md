@@ -5,7 +5,7 @@
 > **本文件是模板；未填写、未签署、未复核的模板不构成任何执行授权。**
 >
 > - 本文件**不是**已获批的签署包，**不是**放行单，**不是**执行授权，**不构成**任何 `-Mode fire` 的依据。
-> - 只有同时满足 ①本文件全部必填栏位已填写 ②§5.7 签署栏四方齐全 ③§4 三个摘要均来自受信产物 ④§5 六道现场门全部通过 ⑤§7 全部阻塞项已关闭（或经审批人书面降级），才**可能**被视为一份可用的签署包；缺任一条即为 **NO-GO**（§5.6）。
+> - 只有同时满足 ①本文件全部必填栏位已填写 ②§5.7 签署栏四方齐全 ③§4 四个摘要均来自受信产物 ④§5 六道现场门全部通过 ⑤§7 全部阻塞项已关闭（或经审批人书面降级），才**可能**被视为一份可用的签署包；缺任一条即为 **NO-GO**（§5.6）。
 > - **填写者不得为了让测试通过而调整任何预期值**（§5.6-N9）。任何"先跑再说、边跑边改"的做法一律作废。
 > - 本文件**不含**任何已批准的具体值：所有 `______` / **待填** 都是待签署内容，不是默认值。
 
@@ -236,27 +236,31 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 
 ---
 
-## 4. 文件完整性：三个摘要 + 各自的独立批准来源
+## 4. 文件完整性：四个摘要 + 各自的独立批准来源
 
 | # | 摘要 | 对应参数 | 批准来源要求 | 填写栏位 |
 |---|---|---|---|---|
 | ① | `approved-task-config.json` **原始字节** SHA-256 | `-ExpectedApprovedTaskConfigSha256` | **本文件 §5.7 签署栏**（签署包） | `sha256:______` |
 | ② | 构建清单**原始字节** SHA-256 | `-ExpectedManifestSha256` | **本文件 §5.7 签署栏**（签署包） | `sha256:______` |
 | ③ | 部署二进制 SHA-256 | `-G7DeployVersion` | **受信构建产物**（§3.2 的 CI run / 产物） | `sha256:______` |
+| ④ | **部署的 `scripts/stop-watchdog.ps1` 原始字节 SHA-256** | **无 CLI 参数**（脚本不能自校验）；由 §5.6-**N8** 现场核对 | **本文件 §5.7 签署栏**（签署包），取自**受信构建产物**中与 ③ 同源的版本 | `sha256:______` |
+
+> **④ 为什么需要**：N8 要求核对**部署的** watchdog 是否包含 `BLOCKED-01` 修复（`Get-WdTaskPointCount`）。仅凭"`#136` 已合入 `main`"**不能证明现场实际部署的那份脚本就是含修复的版本** —— 现场可能部署了旧脚本。④ 把"部署脚本身份"也纳入签署范围，与 ①–③ 同等对待。
 
 **必须写明（硬约束 1 的直接落地）**：
 
-1. 三者**不得**在现场从"当前端点状态"或"未经审核的本地文件"临时生成。现场 `Get-FileHash` 现算 = 自己给自己授权（`watchdog:140-149`、`:173-181`、`:1120-1174`）。
+1. **四者**均**不得**在现场从"当前端点状态"或"未经审核的本地文件"临时生成。现场 `Get-FileHash` 现算 = 自己给自己授权（`watchdog:140-149`、`:173-181`、`:1120-1174`）。
 2. ①与②的比对都发生在**解析内容之前**，对**同一份原始字节**进行（一次 `ReadAllBytes`，摘要与解析共用同一份字节，排除 TOCTOU；`watchdog:758-784`、`:786-800`、`:1120-1174`、`:935-965`）。
-3. ①的作用不可由指纹替代：指纹不覆盖 `connection`（`watchdog:1123-1125`）；②的作用不可由清单内摘要替代：清单可被整体替换（`watchdog:913-915`）。
-4. 三者中任一缺失/不匹配 ⇒ `exit 40`，**不发 Start、不写 `t0.stamp`**（`watchdog:42`、`:273-288`）。
+3. ①的作用不可由指纹替代：指纹不覆盖 `connection`（`watchdog:1123-1125`）；②的作用不可由清单内摘要替代：清单可被整体替换（`watchdog:913-915`）；④的作用不可由 git 提交号替代：**git 标识只证明仓库版本，不证明部署文件**。
+4. **四者**中任一缺失/不匹配 ⇒ `exit 40`（①–③）或 **NO-GO**（④，由 N8 判定），**不发 Start、不写 `t0.stamp`**（`watchdog:42`、`:273-288`）。
 
 | 归档项 | 内容 | 填写栏位 |
 |---|---|---|
 | `approved-task-config.json` 文件路径 | ______ | 与 ① 摘要对应的**那一份**文件（路径 + 摘要必须配对记录） |
 | 构建清单文件路径 | ______ | 与 ② 摘要对应的那一份 |
 | 部署二进制路径 | ______ | 与 ③ 摘要对应的那一份 |
-| 三者的字节数 | ______ / ______ / ______ | 便于事后核对是否被替换 |
+| 部署的 `scripts/stop-watchdog.ps1` 路径 | ______ | 与 ④ 摘要对应的那一份（须与 ③ 同源构建） |
+| 四者的字节数 | ______ / ______ / ______ / ______ | 便于事后核对是否被替换 |
 
 ---
 
@@ -345,7 +349,7 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 | # | 触发条件（可判定） | 检查方式 | 本次是否触发 |
 |---|---|---|---|
 | N1 | §2.4「批准值来源」任一行缺少"由谁/依据什么/何时批准" | 逐行核对 §2.4 | ☐ 是 ☐ 否 |
-| N2 | 三个摘要中任一缺失，或与现场实算不一致 | `watchdog:1120-1174`、`:935-962`、`:1025-1028` | ☐ 是 ☐ 否 |
+| N2 | 四个摘要中任一缺失，或与现场实算不一致 | `watchdog:1120-1174`、`:935-962`、`:1025-1028` | ☐ 是 ☐ 否 |
 | N3 | 部署身份不明（`-G7DeployVersion` 非 `sha256:`/`manifest:`；二进制定位不到；清单读不到） | `watchdog:992-1009`、`:828-844` | ☐ 是 ☐ 否 |
 | N4 | 任务配置不一致（revision / 连接 5 字段 / 逐点 Key 与参数 / 指纹 / **当前任务点数（实时快照）**） | `watchdog:1368-1565`（`Test-WdCredTaskConfig`，**#136 版本**行号；点数判据 `:1515-1518`；#131 基线对应 `:1288-1456`） | ☐ 是 ☐ 否 |
 | N5 | 现场门禁任一门（G1–G6）不通过 | §5.1 逐门核对 | ☐ 是 ☐ 否 |
@@ -373,14 +377,18 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 | 阶段 | 时点 | 允许的动作 | 必须具备 |
 |---|---|---|---|
 | **A. 预授权签署** | **ARMED 之前** | **仅**允许执行 `-Mode arm` 对**离线回环桩**（零副作用：不发 Start、不写 `t0.stamp`、不起执行流） | §2–§4 已填；G1–G5 现场门已签字；四方人员已确定（可先不签最终栏） |
-| **B. 最终 FIRED 签署** | **ARMED 之后、FIRED 之前** | 允许进入 `-Mode fire` | **A 已完成** 且 **ARMED 结果已纳入本阶段证据**（`exit 0`/`ARMED_READY`、`arm-report.json`、凭证汇总 `verified`）；N1–N12 全为"否" |
+| **B. 配置写入授权** | **ARMED 之后、真实 PUT 之前** | **仅**允许对**真实 Endpoint** 执行一次 `PUT /api/v1/tasks/{endpoint}`（§5.8 第 3 步） | **A 已完成且 ARMED = `ARMED_READY`**；本阶段须**单独记录**并绑定：① Endpoint ID ② 目标 `revision` ③ 获批配置摘要（§4-①） ④ **rev17 回退摘要**（§8.1） ⑤ 执行窗口起止 ⑥ 授权人与编号 |
+| **C. 最终 FIRED 签署** | **PUT 读回核对之后、FIRED 之前** | 允许进入 `-Mode fire` | **A、B 已完成**；**PUT 后读回的实时配置与获批配置完全一致**（§5.8 第 4 步）；ARMED 结果已纳入证据；N1–N12 全为"否" |
+
+> **为什么需要阶段 B**：阶段 A 只授权**离线** ARMED，**不覆盖对真实机床端点的一次配置写入**。真实 PUT 会改变持久化任务配置，必须有**独立、可追溯、绑定回退依据**的授权记录，否则"谁批准了这次写入"无法回答。
+
 
 > **不得为消除循环而取消 ARMED 证据要求** —— ARMED 结果仍是进入 FIRED 的**必要输入**，只是它属于阶段 B 的输入，而不是阶段 A 的前提。
 
-**B. 最终 FIRED 签署时必须同时勾选/填写**：
+**C. 最终 FIRED 签署时必须同时勾选/填写**：
 
 - ☐ §5.6 的 N1–N12 全部为"否"；NO-GO 结论栏已填 **GO**。
-- ☐ 三个摘要（§4-①②③）已填入且来源符合 §4 的批准来源要求。
+- ☐ 四个摘要（§4-①②③）已填入且来源符合 §4 的批准来源要求。
 - ☐ §5.5 人工核验三字段已逐字段比对并由复核人独立签名。
 - ☐ `-Mode arm` 退出码 ______（须 0）、`arm-report.json` ______、凭证汇总 ______（须 `verified`）。
 - ☐ `BLOCKED-01` **已选 B-1 并实现（PR #136，**已合入 main，merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`**）**；已确认 **#136 已合入 main** ☑；审批人签字 ______。
@@ -392,10 +400,10 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 |---|---|---|---|
 | 1 | `-Mode arm` 对**离线回环桩**执行（不得指向 8132） | §2–§4 已填；**§5.7 阶段 A（预授权）已签**（`-G6Signoff`/`-G6SignedAt` 本身是 arm 的凭证项，`watchdog:1484`） | `arm-report.json`、`run-log.md` |
 | 2 | 抓运行前基线：`GET /endpoints/{id}`、`GET /tasks?endpoint=`、`GET /points/latest`（完整原始响应） | G1–G5 已签字 | 原始响应文件 + SHA-256 |
-| 3 | `PUT /api/v1/tasks/{endpoint}`（body = 获批 4 点，预期 revision 18） | 端点已 STOPPED（运行中保存被 `CONFLICT` 拒绝，`core-api:2406-2414`） | PUT 响应 + 读回 `GET /tasks` |
+| 3 | `PUT /api/v1/tasks/{endpoint}`（body = 获批 4 点，预期 revision 18） | **§5.7 阶段 B（配置写入授权）已签**（绑定 Endpoint / 目标 revision / 获批配置摘要 / rev17 回退摘要 / 执行窗口 / 授权人与编号）；**且**端点已 STOPPED（运行中保存被 `CONFLICT` 拒绝，`core-api:2406-2414`） | PUT 响应 + 读回 `GET /tasks` |
 | 4 | **门禁前置诊断（只读）**：记录 `task_point_count_live`（当前任务点数，实时快照，**判据**）与 `diagnostics_point_count_observed`（**观测值**），**两者都记录但只有前者参与判定**；不再要求 `point_count` 与签署值相等 | 第 3 步完成 | `site-log.md` 六列（§2.5） |
 | 5 | §5.5 人工核验三字段（`family` / `max_read_items` / `timeout_ms`）+ 复核签名 | 第 2 步的原始响应在案 | 原始响应 + 规范化 diff + 签名 |
-| 6 | `-Mode fire -Authorized …`（携带 §4 三个摘要与全部凭证） | 第 1、4、5 步全部通过 | `t0.stamp`、`summary.json` |
+| 6 | `-Mode fire -Authorized …`（携带 §4 **四个摘要**与全部凭证） | **①第 1–5 步全部按顺序完成**；**②第 4 步读回的实时配置与获批配置完全一致**（revision / 连接 5 字段 / 逐点 Key 与参数 / 指纹 / 当前任务点数）；**③§5.7 阶段 C（最终签署）已签**；**④N1–N12 全部为"否"** | `t0.stamp`、`summary.json` |
 | 7 | `T0+10 s±2 s` 抓 `early`；`T0+25~28 s` 抓 `prestop`（**必须在 Stop 之前**） | 第 6 步已进入 FIRED | 两次四件套 |
 | 8 | `T0+30 s` watchdog **无条件**发 Stop（执行人不得推迟） | — | `watchdog-stops.jsonl` |
 | 9 | 按 §6.6 复核"停干净" → 恢复 `rev17`（§6.4）→ 对账 → 保持 STOPPED | 第 8 步完成 | `summary.json`、恢复读回 |
@@ -513,7 +521,7 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 | 8 | `early` 四件套（`when.json`/`state.json`/`points-latest.raw.json`/`state-after.json`） | 抓证脚本（#130 §6.2） | ______ | ______ |
 | 9 | `prestop` 四件套 | 同上 | ______ | ______ |
 | 10 | `site-log.md`（人工记录：谁/何时/做了什么/异常处置） | 执行人 | ______ | ______ |
-| 11 | 本签署包（含 §4 三个摘要） | 审批人 | ______ | ______ |
+| 11 | 本签署包（含 §4 四个摘要） | 审批人 | ______ | ______ |
 | 12 | §5.5 人工核验的原始响应 + 规范化 diff | 执行人/复核人 | ______ | ______ |
 
 - **保存顺序（强制）**：`points/latest` 先**原样落盘完整响应**（全端点），再在分析阶段按 `endpoint_id` 筛出目标 4 条；顶层 `count` 是**全端点**总数，不得当作目标端点条数（#130 §6.2、§6.3）。
@@ -567,8 +575,10 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 
 ```powershell
 # 阶段 A：ARMED（必须显式给离线回环桩地址；缺省 -BaseUrl 是 8132，会被 exit 40 拒绝）
+# 注意：ARMED 阶段同样校验 G6 凭证（watchdog:725-739），缺 -G6Signoff/-G6SignedAt 会得到 ARMED_INPUTS_MISSING
 pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode arm `
   -BaseUrl http://127.0.0.1:<离线桩端口> -EndpointId <endpoint-id> -OutDir <本轮证据目录> `
+  -G6Signoff <预授权签署编号> -G6SignedAt <ISO8601> `
   -ExpectedTaskRevision <签署值> -ExpectedPointCount <签署值> -ApprovedTaskConfig <签署包路径> `
   -ExpectedTaskFingerprint sha256:<签署值> -ExpectedApprovedTaskConfigSha256 sha256:<签署值> `
   -G7DeployVersion <sha256:... | manifest:<path>> -ExpectedManifestSha256 sha256:<签署值>
@@ -593,7 +603,7 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire `
 - ☐ §2.1 四点逐字段与 `approved-task-config.json` 逐字一致；§2.2 八字段齐备且标注 5 自动 / 3 人工
 - ☐ §2.3 四项（revision / 点位数 / 指纹 / 文件摘要）同源；§2.4 每行都有"由谁 / 依据什么 / 何时批准"
 - ☑ §2.5 已**确认 PR #136 已合入 main**（`BLOCKED-01` 已由 B-1 关闭）；§3 部署身份三件套齐备且未用 git 标识充当通过依据
-- ☐ §4 三个摘要各自写明批准来源，且无现场现算；§5.1 六道门均为**本次窗口**新证据
+- ☐ §4 四个摘要各自写明批准来源，且无现场现算；§5.1 六道门均为**本次窗口**新证据
 - ☐ §5.2 自动 / 人工两列未混写；§5.5 人工三字段有独立签名；§5.6 N1–N12 全为"否"
 - ☐ §5.7 四方签名齐全；§5.8 九步顺序已交底；§6 的核验项与证据清单全部填写
 
