@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  stop-watchdog 离线场景驱动（M0–M16）—— 一条命令跑完全部离线故障模拟并给出断言汇总。
+  stop-watchdog 离线场景驱动（M0–M19）—— 一条命令跑完全部离线故障模拟并给出断言汇总。
 
 .DESCRIPTION
   每个场景：起本地假端点桩（stub_endpoint.py）→ 以独立 pwsh 进程跑 scripts/stop-watchdog.ps1
@@ -35,6 +35,10 @@
         清单+二进制一起被换且互相自洽）⇒ exit 40、网络动作数 0、不发 Start
     M18 G2 负向：获批任务配置**文件自身**未被独立验证（缺 -ExpectedApprovedTaskConfigSha256 /
         文件字节被改而 tasks 指纹不变 / 改文件后用改后文件自身摘要）⇒ exit 40、不发 Start
+    M19 配置门验证的是**当前获批任务**，不是历史残留状态（BLOCKED-01）：a/b 历史残留值
+        （diagnostics.point_count=0 / 238）与当前任务无关 ⇒ **必须放行**并记录观测值；
+        c/d 实时任务只有 3 / 5 点（diagnostics 仍报 12）⇒ **必须拒绝**；e 点数相同但一个点位
+        参数被改 ⇒ **必须拒绝**；f/g 任务快照读不到 / 指纹算不出 ⇒ **必须 fail-closed**
 
   关于 G7：本驱动**不再**用 git HEAD 充当 G7 凭证（那只能证明"与仓库版本匹配"，不能证明部署物
   身份）。它离线构造两份 fixture 并交给被测脚本实算比对：
@@ -49,7 +53,7 @@
   三类形态，证明这两层校验确实拦得住 —— 尤其证明"tasks 指纹不变也挡不住 connection 篡改"。
 
 .PARAMETER Scenario
-  只跑指定场景，例如 -Scenario M7,M13。缺省 = M0–M16 全部。
+  只跑指定场景，例如 -Scenario M7,M13。缺省 = 全部场景（M0–M19）。
 
 .PARAMETER EvidenceRoot
   证据根目录，缺省 target/validation/stop-watchdog（已被 .gitignore 忽略）。
@@ -158,6 +162,10 @@ $SCEN = [ordered]@{
     # 桩仍然起在回环端口上：这样"桩收到 0 条请求"才是有效断言（守卫/校验失效时请求会真的到达）。
     M17 = @{ title = 'G1 负向：构建清单自身未被独立验证'; stub = @('--port', '18097') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18097; phases = 'm17' }
     M18 = @{ title = 'G2 负向：获批配置文件自身未被独立验证'; stub = @('--port', '18098') + $commonStubCfg; wd = @(); mode = 'fire'; port = 18098; phases = 'm18' }
+    # M19（BLOCKED-01）：配置门必须验证**当前获批任务**（实时任务快照），而不是 diagnostics.point_count
+    # 这个"持久化 point_registry 行数残留"。每个子用例的故障旋钮不同（残留值 / 实时点数 / 快照不可读），
+    # 因此**不在主循环预起桩**，由场景内为每个子用例各起一只（见 phases='m19' 分支）。
+    M19 = @{ title = '配置门验证当前任务而非历史残留（BLOCKED-01）'; stub = @(); wd = @(); mode = 'fire'; port = 18111; phases = 'm19' }
 }
 
 # -File 传参时 "M0,M1" 会作为单个字符串进来，这里统一按逗号拆分（Windows/Linux 行为一致）。
@@ -605,7 +613,12 @@ foreach ($name in $targets) {
         Write-Host ("[stub] 就绪 {0}（pid={1}）" -f $baseUrl, $stubProc.Id)
     }
     else {
-        Write-Host ("[stub] 无桩：使用不可达地址 {0}" -f $baseUrl)
+        if ($cfg.phases -eq 'm19') {
+            Write-Host '[stub] M19 每个子用例各自起一只桩（端口与故障旋钮不同）'
+        }
+        else {
+            Write-Host ("[stub] 无桩：使用不可达地址 {0}" -f $baseUrl)
+        }
     }
 
     $script:asserts = @()
@@ -941,6 +954,124 @@ foreach ($name in $targets) {
         $rowMaxDev = $null
         $rowElapsed = [math]::Round($elapsed, 1)
     }
+    elseif ($cfg.phases -eq 'm19') {
+        # ── M19（BLOCKED-01）：配置门必须验证**当前获批任务**，而不是历史残留状态 ─────────
+        # 旧判据 diagnostics.point_count 的来源是持久化 point_registry 行数（core-api:1499 →
+        # config-store:2459-2473；唯一写点 assign_point_ids config-store:2344-2456，由
+        # run_config_flow:943-945 在 ConfigureTasks 之后写），只反映"上次走完 ConfigureTasks 的
+        # 那次 Start"的残留状态。后果是两个方向都会错：
+        #   · 残留值不同（0 / 238）⇒ 把**正确的当前配置**误判为不一致（假阳性，a/b）；
+        #   · 残留值恰好相同（都 12）⇒ 把**错误的当前配置**放行（假阴性，c/d/e）。
+        # 本场景把两向都钉住：a/b 必须放行并记录观测值；c/d/e 必须拒绝；f/g 读不到必须 fail-closed。
+        $m19Live3 = Join-Path $out 'live-3-points.json'
+        $m19Live5 = Join-Path $out 'live-5-points.json'
+        $null = & $python $stubPy --emit-tasks $m19Live3 --task-count 1 --points-per-task 3 2>&1
+        $null = & $python $stubPy --emit-tasks $m19Live5 --task-count 1 --points-per-task 5 2>&1
+        if (-not (Test-Path $m19Live3) -or -not (Test-Path $m19Live5)) {
+            throw 'M19：导出 live tasks fixture 失败（需要 python + stub_endpoint.py --emit-tasks）'
+        }
+        # e：点数仍是 12（3×4），只把**实时配置**里一个点位的参数改掉（offset 0→99）。
+        #    获批配置与期望指纹都保持原样 ⇒ 数量门必然通过，拒绝只能来自逐点参数/指纹比对。
+        $m19TasksE = Get-Content -LiteralPath $tasksFile -Raw | ConvertFrom-Json
+        $m19TasksE[0].binding.config.points[0].parameters.offset = 99
+        $m19LiveE = Join-Path $out 'live-point-param-changed.json'
+        [System.IO.File]::WriteAllText($m19LiveE, ($m19TasksE | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+
+        $cases = @(
+            # ① 历史残留值与当前任务无关 ⇒ 必须放行（并如实记录观测值）
+            @{ tag = 'a-diagnostics-point-count-zero'; port = 18111; stub = @('--tasks-file', $tasksFile, '--point-count', '0'); kind = 'allow'; obs = 0 }
+            @{ tag = 'b-diagnostics-point-count-residual-238'; port = 18112; stub = @('--tasks-file', $tasksFile, '--point-count', '238'); kind = 'allow'; obs = 238 }
+            # ② diagnostics 报 12（与获批一致），但实时任务只有 3 / 5 点 ⇒ 必须拒绝
+            @{ tag = 'c-live-points-3'; port = 18113; stub = @('--tasks-file', $m19Live3, '--point-count', [string]$expectedPoints); kind = 'reject-count'; live = 3 }
+            @{ tag = 'd-live-points-5'; port = 18114; stub = @('--tasks-file', $m19Live5, '--point-count', [string]$expectedPoints); kind = 'reject-count'; live = 5 }
+            # ③ 点数相同（12），但一个点位参数被改 ⇒ 必须拒绝
+            @{ tag = 'e-live-point-param-changed'; port = 18115; stub = @('--tasks-file', $m19LiveE, '--point-count', [string]$expectedPoints); kind = 'reject-points' }
+            # ④ 任务快照不可读 / 指纹算不出 ⇒ fail-closed（diagnostics 仍可读，证明观测值替代不了核实）
+            @{ tag = 'f-tasks-snapshot-http-500'; port = 18116; stub = @('--tasks-file', $tasksFile, '--point-count', [string]$expectedPoints, '--tasks-error', '500'); kind = 'reject-unverified' }
+            @{ tag = 'g-tasks-snapshot-no-array'; port = 18117; stub = @('--tasks-file', $tasksFile, '--point-count', [string]$expectedPoints, '--tasks-omit-array'); kind = 'reject-unverified' }
+        )
+        $elapsed = 0.0
+        foreach ($c in $cases) {
+            $co = Join-Path $out $c.tag
+            New-Item -ItemType Directory -Force -Path $co | Out-Null
+            $caseBase = "http://127.0.0.1:$($c.port)"
+            $stubArgs = @('--port', [string]$c.port) + $c.stub + $connStubCfg
+            $sp = Start-Stub -Port $c.port -StubArgs $stubArgs -OutDir $co -Python $python
+            $ev = $null
+            try {
+                $a = New-WdArgsFromSpec -Name "M19$($c.tag)" -OutDir $co -BaseUrl $caseBase -Set @{ '-AuthzTicket' = "SIM-M19-$($c.tag)" }
+                $ev = Invoke-WdCase -OutDir $co -WdArgs $a -StubLog (Join-Path $co 'stub-requests.jsonl')
+            }
+            finally {
+                try { Stop-Process -Id $sp.Id -Force -ErrorAction SilentlyContinue } catch { }
+                Start-Sleep -Milliseconds 150
+            }
+            $elapsed += $ev.elapsed
+            $refused = [string](Get-Nested $ev.summary 'refused')
+            $reason = [string](Get-Nested $ev.summary 'reason')
+            # 拒绝记录把凭证明细放在 extra.credentials（与 fire 的 summary 形状不同）
+            $actLivePts = Get-Nested $ev.summary 'extra.credentials.items.task_config.actual.task_point_count'
+            $actDiagPts = Get-Nested $ev.summary 'extra.credentials.items.task_config.actual.diagnostics_point_count'
+            $sumLivePts = Get-Nested $ev.summary 'task_config_observation.task_point_count_live'
+            $sumDiagPts = Get-Nested $ev.summary 'task_config_observation.diagnostics_point_count_observed'
+
+            switch ($c.kind) {
+                'allow' {
+                    # 核心反证：历史残留值（0 / 238）与获批 12 点完全不同，但当前任务确实是 12 点 ⇒ 放行。
+                    Assert-Wd ("[{0}] 残留 point_count={1} 但当前任务=12 点 ⇒ 放行（exit 0）" -f $c.tag, $c.obs) ($ev.exit -eq 0) "exit=$($ev.exit)"
+                    Assert-Wd ("[{0}] 完整生命周期正常（STOPPED_CLEAN，确实进入了 FIRED）" -f $c.tag) ((Get-Nested $ev.summary 'verdict') -eq 'STOPPED_CLEAN') "verdict=$(Get-Nested $ev.summary 'verdict')"
+                    Assert-Wd ("[{0}] 配置门 verified（当前任务点数取自实时快照）" -f $c.tag) ((Get-Nested $ev.summary 'authorization.items.task_config.state') -eq 'verified') "state=$(Get-Nested $ev.summary 'authorization.items.task_config.state') detail=$(Get-Nested $ev.summary 'authorization.items.task_config.detail')"
+                    Assert-Wd ("[{0}] 判据值 = 实时快照 12 点" -f $c.tag) ([int]$sumLivePts -eq $expectedPoints) "task_point_count_live=$sumLivePts"
+                    Assert-Wd ("[{0}] 观测值如实记录 diagnostics.point_count={1}（不参与判定）" -f $c.tag, $c.obs) ([int]$sumDiagPts -eq [int]$c.obs) "diagnostics_point_count_observed=$sumDiagPts"
+                    Assert-Wd ("[{0}] 观测值在 task_config.actual 里也独立可见" -f $c.tag) ([int](Get-Nested $ev.summary 'authorization.items.task_config.actual.diagnostics_point_count') -eq [int]$c.obs) "actual.diagnostics_point_count=$(Get-Nested $ev.summary 'authorization.items.task_config.actual.diagnostics_point_count')"
+                    Assert-Wd ("[{0}] 观测值标注为 observed-only（运行状态残留，非当前任务点数）" -f $c.tag) ([string](Get-Nested $ev.summary 'task_config_observation.diagnostics_point_count_role') -match 'observed-only') "role=$(Get-Nested $ev.summary 'task_config_observation.diagnostics_point_count_role')"
+                    Assert-Wd ("[{0}] 真的发出了 Start" -f $c.tag) ((Count-Ev $ev 'START_begin') -ge 1) "START_begin=$(Count-Ev $ev 'START_begin')"
+                }
+                'reject-count' {
+                    # 核心反证：diagnostics 报 12（旧判据看着"一致"），实时只有 3 / 5 点 ⇒ 仍必须拒绝。
+                    Assert-Wd ("[{0}] 实时任务只有 {1} 点（diagnostics 仍报 12）⇒ exit 40" -f $c.tag, $c.live) ($ev.exit -eq 40) "exit=$($ev.exit)"
+                    Assert-Wd ("[{0}] 拒绝标签 = REFUSED_TASKCONFIG_MISMATCH" -f $c.tag) ($refused -eq 'REFUSED_TASKCONFIG_MISMATCH') "refused=$refused"
+                    Assert-Wd ("[{0}] 拒绝原因点名当前任务点数不一致（期望 12，实际 {1}）" -f $c.tag, $c.live) ($reason -match [regex]::Escape("当前任务点数不一致（期望 $expectedPoints，实际 $($c.live)")) "reason=$reason"
+                    Assert-Wd ("[{0}] 证据里判据值 = 实时 {1} 点" -f $c.tag, $c.live) ([int]$actLivePts -eq [int]$c.live) "task_point_count=$actLivePts"
+                    Assert-Wd ("[{0}] 证据里观测值 = 12（旧判据看着一致，正说明它不足以判配置）" -f $c.tag) ([int]$actDiagPts -eq [int]$expectedPoints) "diagnostics_point_count=$actDiagPts"
+                    Assert-Wd ("[{0}] 拒绝记录里也有独立观测块（判据 {1} 点 / 观测 12）" -f $c.tag, $c.live) (([int](Get-Nested $ev.summary 'task_config_observation.task_point_count_live') -eq [int]$c.live) -and ([int](Get-Nested $ev.summary 'task_config_observation.diagnostics_point_count_observed') -eq [int]$expectedPoints)) "live=$(Get-Nested $ev.summary 'task_config_observation.task_point_count_live') observed=$(Get-Nested $ev.summary 'task_config_observation.diagnostics_point_count_observed')"
+                    Assert-Wd ("[{0}] 未写 t0.stamp（未进入 FIRED）" -f $c.tag) (-not $ev.t0Exists) "t0=$($ev.t0Exists)"
+                    Assert-Wd ("[{0}] 桩未收到任何 START" -f $c.tag) ((Count-Ev $ev 'START_begin') -eq 0) "START_begin=$(Count-Ev $ev 'START_begin')"
+                }
+                'reject-points' {
+                    # 核心反证：点数完全一致（12 = 12）⇒ 数量门通过，但配置仍不一致 ⇒ 必须拒绝。
+                    Assert-Wd ("[{0}] 点数相同（12）但点位参数被改 ⇒ exit 40" -f $c.tag) ($ev.exit -eq 40) "exit=$($ev.exit)"
+                    Assert-Wd ("[{0}] 拒绝标签 = REFUSED_TASKCONFIG_MISMATCH" -f $c.tag) ($refused -eq 'REFUSED_TASKCONFIG_MISMATCH') "refused=$refused"
+                    Assert-Wd ("[{0}] 拒绝原因点名点位参数不一致" -f $c.tag) ($reason -match '点位参数不一致') "reason=$reason"
+                    Assert-Wd ("[{0}] 点数门**没有**触发（12 = 12，数量相同不等于配置一致）" -f $c.tag) ($reason -notmatch '当前任务点数不一致') "reason=$reason"
+                    Assert-Wd ("[{0}] 证据里判据值 = 12（点数确实一致）" -f $c.tag) ([int]$actLivePts -eq [int]$expectedPoints) "task_point_count=$actLivePts"
+                    Assert-Wd ("[{0}] 拒绝记录里判据值 = 12、观测值 = 12（点数一致但仍被拒绝）" -f $c.tag) (([int](Get-Nested $ev.summary 'task_config_observation.task_point_count_live') -eq [int]$expectedPoints) -and ([int](Get-Nested $ev.summary 'task_config_observation.diagnostics_point_count_observed') -eq [int]$expectedPoints)) "live=$(Get-Nested $ev.summary 'task_config_observation.task_point_count_live') observed=$(Get-Nested $ev.summary 'task_config_observation.diagnostics_point_count_observed')"
+                    Assert-Wd ("[{0}] 未写 t0.stamp（未进入 FIRED）" -f $c.tag) (-not $ev.t0Exists) "t0=$($ev.t0Exists)"
+                    Assert-Wd ("[{0}] 桩未收到任何 START" -f $c.tag) ((Count-Ev $ev 'START_begin') -eq 0) "START_begin=$(Count-Ev $ev 'START_begin')"
+                }
+                'reject-unverified' {
+                    Assert-Wd ("[{0}] 任务快照不可核实 ⇒ exit 40（fail-closed）" -f $c.tag) ($ev.exit -eq 40) "exit=$($ev.exit)"
+                    Assert-Wd ("[{0}] 拒绝标签 = REFUSED_CREDENTIAL_UNVERIFIABLE" -f $c.tag) ($refused -eq 'REFUSED_CREDENTIAL_UNVERIFIABLE') "refused=$refused"
+                    Assert-Wd ("[{0}] 拒绝原因点明读不到 / 算不出" -f $c.tag) ($reason -match '读不到|算不出') "reason=$reason"
+                    Assert-Wd ("[{0}] 拒绝记录里观测值仍如实记录 12，而判据值读不到（null）" -f $c.tag) (([int](Get-Nested $ev.summary 'task_config_observation.diagnostics_point_count_observed') -eq [int]$expectedPoints) -and ($null -eq (Get-Nested $ev.summary 'task_config_observation.task_point_count_live'))) "live=$(Get-Nested $ev.summary 'task_config_observation.task_point_count_live') observed=$(Get-Nested $ev.summary 'task_config_observation.diagnostics_point_count_observed')"
+                    Assert-Wd ("[{0}] 未写 t0.stamp（未进入 FIRED）" -f $c.tag) (-not $ev.t0Exists) "t0=$($ev.t0Exists)"
+                    Assert-Wd ("[{0}] 桩未收到任何 START" -f $c.tag) ((Count-Ev $ev 'START_begin') -eq 0) "START_begin=$(Count-Ev $ev 'START_begin')"
+                    Assert-Wd ("[{0}] 确实做过只读核验 GET（不是空谈）" -f $c.tag) (((Count-Ev $ev 'DIAG') + (Count-Ev $ev 'TASKS') + (Count-Ev $ev 'TASKS_ERROR')) -ge 1) "DIAG=$(Count-Ev $ev 'DIAG') TASKS=$(Count-Ev $ev 'TASKS') TASKS_ERROR=$(Count-Ev $ev 'TASKS_ERROR')"
+                }
+            }
+        }
+        $ev = $null
+        $rowExit = -1
+        $rowVerdict = 'allow×2 / REFUSED_TASKCONFIG_MISMATCH×3 / REFUSED_CREDENTIAL_UNVERIFIABLE×2'
+        $rowTrial = ''
+        $rowSched = ''
+        $rowSampling = ''
+        $rowConv = ''
+        $rowT0 = ''
+        $rowStops = @()
+        $rowMaxDev = $null
+        $rowElapsed = [math]::Round($elapsed, 1)
+    }
     else {
         $wdArgs = New-WdArgs -Name $name -OutDir $out -BaseUrl $baseUrl -Cfg $cfg
         $run = Invoke-WdRun -OutDir $out -WdArgs $wdArgs
@@ -1200,6 +1331,9 @@ $suiteSummary = [ordered]@{
         expected_fingerprint = $fingerprint
         expected_revision  = $expectedRevision
         expected_points    = $expectedPoints
+        # BLOCKED-01：expected_points 的语义是**获批任务配置的点数**（与实时任务快照比对），
+        # 不是 diagnostics.point_count（后者只是持久化 point_registry 行数的运行状态残留值）。
+        expected_points_semantics = 'approved-task-config point count（与 GET /api/v1/tasks 的 tasks[].binding.config.points[] 总数比对）'
         connection         = $conn
         m18_tampered_file  = $approvedTamperedPath
         m18_tampered_sha256 = $approvedTamperedSha
