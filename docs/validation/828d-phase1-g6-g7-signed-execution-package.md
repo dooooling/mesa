@@ -381,6 +381,24 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 | **C. 最终 FIRED 签署** | **PUT 读回核对之后、FIRED 之前** | 允许进入 `-Mode fire` | **A、B 已完成**；**PUT 后读回的实时配置与获批配置完全一致**（§5.8 第 4 步）；ARMED 结果已纳入证据；N1–N12 全为"否" |
 
 > **为什么需要阶段 B**：阶段 A 只授权**离线** ARMED，**不覆盖对真实机床端点的一次配置写入**。真实 PUT 会改变持久化任务配置，必须有**独立、可追溯、绑定回退依据**的授权记录，否则"谁批准了这次写入"无法回答。
+**阶段 B 授权记录（可填写、可归档；原件须纳入本次证据归档）**：
+
+| # | 项目 | 填写栏位 |
+|---|---|---|
+| B-1 | 授权记录编号 | ______（唯一，不可复用） |
+| B-2 | 签署者（审批人） | ______ |
+| B-3 | 签署时间 | ______（ISO 8601，须早于 PUT 时刻） |
+| B-4 | Endpoint ID | ______ |
+| B-5 | 目标 `revision` | ______（PUT 后预期值） |
+| B-6 | 获批配置 SHA-256（§4-①） | `sha256:______` |
+| B-7 | **rev17 回退 SHA-256**（§8.1） | `sha256:______` |
+| B-8 | 执行窗口（起 / 止） | ______ / ______ |
+| B-9 | 现场工单编号 | ______ |
+| B-10 | 授权原件归档路径 | ______ |
+| B-11 | 授权原件**自身** SHA-256 | `sha256:______`（归档后计算并回填，防止原件被替换） |
+
+> **B-11 的作用**：与 §4 的四个摘要同理 —— 只有记录了**授权原件自身的摘要**，事后才能证明归档的那份就是当时批准的那份。
+> **若已有正式工单模板**，可引用该模板，但**必须**满足：唯一编号、不可变摘要、签署记录、原件纳入本次证据归档。
 
 
 > **不得为消除循环而取消 ARMED 证据要求** —— ARMED 结果仍是进入 FIRED 的**必要输入**，只是它属于阶段 B 的输入，而不是阶段 A 的前提。
@@ -388,7 +406,7 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 **C. 最终 FIRED 签署时必须同时勾选/填写**：
 
 - ☐ §5.6 的 N1–N12 全部为"否"；NO-GO 结论栏已填 **GO**。
-- ☐ 四个摘要（§4-①②③）已填入且来源符合 §4 的批准来源要求。
+- ☐ 四个摘要（**§4-①②③④**）已填入且来源符合 §4 的批准来源要求；其中 **④ 为部署的 `scripts/stop-watchdog.ps1` 的 SHA-256**，须已获独立批准且与实际部署文件一致（N8 据此核对）。
 - ☐ §5.5 人工核验三字段已逐字段比对并由复核人独立签名。
 - ☐ `-Mode arm` 退出码 ______（须 0）、`arm-report.json` ______、凭证汇总 ______（须 `verified`）。
 - ☐ `BLOCKED-01` **已选 B-1 并实现（PR #136，**已合入 main，merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`**）**；已确认 **#136 已合入 main** ☑；审批人签字 ______。
@@ -581,7 +599,10 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode arm `
   -G6Signoff <预授权签署编号> -G6SignedAt <ISO8601> `
   -ExpectedTaskRevision <签署值> -ExpectedPointCount <签署值> -ApprovedTaskConfig <签署包路径> `
   -ExpectedTaskFingerprint sha256:<签署值> -ExpectedApprovedTaskConfigSha256 sha256:<签署值> `
-  -G7DeployVersion <sha256:... | manifest:<path>> -ExpectedManifestSha256 sha256:<签署值>
+  -G7DeployVersion <sha256:... | manifest:<path>> -G7BinaryPath <部署二进制路径> `
+  -ExpectedManifestSha256 sha256:<签署值>
+# ↑ 阶段 A 必须显式给 -G7BinaryPath：不给时脚本按默认顺序查找 target/release|debug 下的 mesad，
+#   可能核验本地构建产物而非签署包批准的部署二进制。阶段 A 与阶段 B 必须用**同一路径 + 同一摘要**。
 
 # 阶段 B：FIRED（必须显式授权；四项凭证全部 verified 才会放行 Start）
 pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire `
