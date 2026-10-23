@@ -1,11 +1,20 @@
 //! §21 数据面语义：质量注入（DataBatch Semantics 扩展）与背压（Backpressure）。
+//!
+//! 一期必需补充：`quality_code` 全链路穿透（驱动 → IPC → Core → REST）。
+//! 此前项级码断言止于驱动层（`drivers/sinumerik-nck/src/lib.rs:1985`），
+//! 没有任何用例证明同一个码经 IPC/Core 后仍是原值——本套件补上这条链。
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use mesa_core_types::Quality;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use mesa_core_types::{DataBatch, PointDefinition, PointValue, Quality, Value};
 use mesa_driver_manager::session::Session;
+use mesa_driver_manager::snapshot::Snapshot;
+use tower::ServiceExt;
 
 use common::*;
 
@@ -137,4 +146,185 @@ async fn backpressure_coalesces_and_keeps_control_responsive() {
     );
 
     teardown(&mut session, Some(cancel));
+}
+
+// ---------------------------------------------------------------------------
+// quality_code 全链路（一期必需）
+//
+// 判据：设备原生码必须原样穿过 IPC → Core → REST，不得被 Core 的 BAD 兜底
+// （`DEVICE_ERROR`）或断线覆盖（`COMMUNICATION_LOST`）替换；GOOD 行必须**没有**
+// 该键（`skip_serializing_if`）。
+// ---------------------------------------------------------------------------
+
+/// 最小 REST 装配：真实 `AppState` + `router`（`Snapshot` 是唯一真值源）。
+///
+/// 不起驱动子进程：批次由用例经真实 IPC 收到后显式交给 `Snapshot::apply_batch`
+/// ——这正是生产侧的唯一写入入口（`endpoint::apply_batch_logged` 内部同一句，
+/// `crates/driver-manager/src/endpoint.rs:1136`），因此本用例覆盖的链路是
+/// 驱动（SDK 服务端）→ TCP IPC → Core 解码 → Snapshot → REST 序列化。
+async fn rest_app() -> (axum::Router, Arc<Snapshot>) {
+    let drivers_dir = repo_root().join("drivers");
+    let cfg = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
+    let state = mesa_core_api::AppState::try_new_with_control(
+        mgr,
+        cfg,
+        drivers_dir.to_string_lossy().to_string(),
+        false,
+    )
+    .unwrap();
+    let snapshot = state.snapshot.clone();
+    (mesa_core_api::router(state), snapshot)
+}
+
+async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+fn point_def(point_id: u32, key: &str) -> PointDefinition {
+    PointDefinition {
+        point_id,
+        point_key: key.into(),
+        data_type: mesa_core_types::DataType::F64,
+        unit: None,
+        source_label: None,
+        display_name: None,
+    }
+}
+
+/// T1 + T2（一期必需）：设备原生码穿透 IPC/Core/REST；GOOD 行无该键。
+#[tokio::test]
+async fn quality_code_native_survives_ipc_and_rest_and_good_row_has_no_key() {
+    let (port, cancel) = start_sim_server().await;
+    let (mut session, mut events, _) = Session::connect(port, TOKEN).await.unwrap();
+
+    open_connection(&session, H, "{}").await;
+    let descriptors = configure_tasks(
+        &session,
+        H,
+        1,
+        &[poll_task(
+            "t",
+            30,
+            serde_json::json!([
+                // 设备原生码：NCK 的 S7 item 返回码形态（0x05）。故意不用 0/1，
+                // 以免与 Core 兜底值巧合相等而让断言失去分辨力。
+                {"resource_id":"constant","parameters":{"value":0,"quality":"BAD","quality_code":5},"outputs":[{"output":"value","point_key":"qc.native"}]},
+                // 同任务的 GOOD 点（无码）
+                {"resource_id":"constant","parameters":{"value":1},"outputs":[{"output":"value","point_key":"qc.good"}]}
+            ]),
+        )],
+    )
+    .await;
+    let ids = sequential_ids(&descriptors, 10);
+    apply_point_map(&session, H, 1, ids.clone()).await;
+    start_connection(&session, H, 1).await;
+
+    // ① 驱动 → IPC：批次里必须是驱动填的那个码本身（不是 0、不是 1、不是符号标记）。
+    let batch = recv_batch(&mut events, 5).await;
+    let bad = batch
+        .values
+        .iter()
+        .find(|pv| pv.point_id == 10)
+        .expect("native code point 必须在本批");
+    assert_eq!(bad.quality, Quality::Bad);
+    assert_eq!(bad.quality_code, Some(5), "IPC 解码后必须仍是设备原生码 5");
+    let good = batch
+        .values
+        .iter()
+        .find(|pv| pv.point_id == 11)
+        .expect("good point 必须在本批");
+    assert_eq!(good.quality, Quality::Good);
+    assert_eq!(good.quality_code, None);
+
+    // ② IPC → Core：走 Core 真实写入入口（生产为 endpoint::apply_batch_logged）。
+    let (app, snapshot) = rest_app().await;
+    snapshot.register_points(
+        "ep1",
+        &[point_def(10, "qc.native"), point_def(11, "qc.good")],
+    );
+    snapshot.apply_batch(&batch, "ep1");
+
+    // ③ Core → REST：十进制字符串，逐字同一个码。
+    let (status, latest) = get_json(app, "/api/v1/points/latest").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = latest["points"].as_array().expect("points 必须是数组");
+    let bad_row = rows
+        .iter()
+        .find(|r| r["point_id"] == 10)
+        .expect("native code row 必须在 REST 响应里");
+    assert_eq!(bad_row["quality"], "BAD");
+    assert_eq!(
+        bad_row["quality_code"].as_str(),
+        Some("5"),
+        "REST 必须输出同一个设备原生码（十进制字符串）: {bad_row}"
+    );
+    assert_eq!(bad_row["value_origin"], "CURRENT");
+
+    // T2：GOOD 行必须"键不存在"，不是 null、不是空串。
+    let good_row = rows
+        .iter()
+        .find(|r| r["point_id"] == 11)
+        .expect("good row 必须在 REST 响应里");
+    assert_eq!(good_row["quality"], "GOOD");
+    assert!(
+        good_row.get("quality_code").is_none(),
+        "GOOD 行不得出现 quality_code 键（skip_serializing_if）: {good_row}"
+    );
+
+    teardown(&mut session, Some(cancel));
+}
+
+/// T3（一期必需）：会话丢失时 Core 写入合成码 `COMMUNICATION_LOST` ⇒ REST 可见。
+///
+/// Core 侧写入点是 `Snapshot::mark_communication_lost`（生产调用点
+/// `crates/driver-manager/src/endpoint.rs:443`，Lost 分支）；本用例验证该合成码
+/// 写入后经 `/points/latest` 一定可观测，且不伪造新采样（值/时间戳保持旧值）。
+#[tokio::test]
+async fn communication_lost_code_is_visible_in_rest() {
+    let (app, snapshot) = rest_app().await;
+    snapshot.register_points("ep1", &[point_def(1, "k1")]);
+    snapshot.apply_batch(
+        &DataBatch {
+            connection_handle: 1,
+            stream_epoch: 1,
+            sequence: 1,
+            timestamp_ns: mesa_core_types::now_unix_ns(),
+            values: vec![PointValue::good(1, Value::F64(1.5))],
+            mono_ns: None,
+        },
+        "ep1",
+    );
+
+    // 断线前：GOOD 行无码（同一响应形态）。
+    let (_, before) = get_json(app.clone(), "/api/v1/points/latest").await;
+    assert!(
+        before["points"][0].get("quality_code").is_none(),
+        "GOOD 行不得有码: {before}"
+    );
+    let ts_before = before["points"][0]["timestamp_ns"].clone();
+
+    snapshot.mark_communication_lost("ep1");
+
+    let (status, after) = get_json(app, "/api/v1/points/latest").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(after["points"][0]["quality"], "BAD");
+    assert_eq!(
+        after["points"][0]["quality_code"], "COMMUNICATION_LOST",
+        "断线合成码必须出现在 REST 响应里: {after}"
+    );
+    // 断线不生成虚假采样：值与时间戳保持断线前的旧值。
+    assert_eq!(after["points"][0]["value"], 1.5);
+    assert_eq!(after["points"][0]["timestamp_ns"], ts_before);
 }
