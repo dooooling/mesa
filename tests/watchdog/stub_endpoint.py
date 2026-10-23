@@ -14,7 +14,9 @@
   GET  /health                      -> {"ok": true}
   GET  /api/v1/endpoints/{id}       -> 端点快照（runtime / desired_running / runtime.epoch /
                                        connection：host / port / local_tsap / remote_tsap / pdu_length）
-  GET  /api/v1/endpoints/{id}/diagnostics -> {"point_count": N, ...}（任务配置核验用，只读）
+  GET  /api/v1/endpoints/{id}/diagnostics -> {"point_count": N, ...}（point_count 等价于真实 Core 的
+                                       持久化 point_registry 行数残留 ⇒ **只作运行状态观测**，
+                                       不参与配置门判定；见 --point-count 说明）
   GET  /api/v1/tasks?endpoint={id}  -> {"endpoint_id", "revision", "tasks": [...]}（**Core 真实形态**）
   GET  /api/v1/tasks/{id}           -> 同上（旧桩形态；watchdog 在 404/405 时回退到它）
   POST /api/v1/endpoints/{id}/start -> {"started": id}
@@ -35,8 +37,14 @@
   --local-tsap/--remote-tsap/--pdu-length
                         connection 里的 TSAP / PDU（B3：连接配置完整核对的比对目标）
   --point-count / --task-revision / --task-count   任务配置核验（diagnostics / tasks）的返回值
-                                                  —— M11/M12/M15/M16 用它构造"匹配/不匹配"两种情形
+                                                  —— M11/M12/M15/M16 用它构造"匹配/不匹配"两种情形。
+                                                  **注意（BLOCKED-01）**：--point-count 只改 diagnostics
+                                                  里的值（= 真实 Core 的持久化 point_registry 行数残留），
+                                                  它**不是**当前任务点数；M19 用它在"任务快照正确"
+                                                  的前提下伪造历史残留值。
   --tasks-file PATH     用文件里的 tasks 数组（完整点位 Key 与参数）；缺省按 --task-count 生成
+  --tasks-error STATUS  任务快照读不到：两个 tasks 端点都返回该 HTTP 状态（M19f：fail-closed）
+  --tasks-omit-array    任务快照返回 200 但**不含 tasks 数组**（M19g：指纹算不出 ⇒ fail-closed）
   --bind ADDR           监听地址（缺省 127.0.0.1；M13 用 0.0.0.0 + 主机名做"非回环"负向用例）
 
 独立工具（不算 HTTP 服务）
@@ -88,7 +96,15 @@ def tasks_fingerprint(tasks):
 
 
 def point_count():
-    """diagnostics 里的 point_count：缺省取 tasks 里的点位总数（真实 Core 用 point_map 长度）。"""
+    """diagnostics 里的 point_count。
+
+    真实 Core 的取值来自**持久化 point_registry 行数**（core-api:1499 → config-store:2459-2473，
+    唯一写点 assign_point_ids config-store:2344-2456，由 run_config_flow:943-945 在 ConfigureTasks
+    之后写入），因此它是"上次走完 ConfigureTasks 的那次 Start"的残留值，与当前任务配置无关。
+    这里缺省按 tasks 里的点位总数返回（便于 M11/M16 的"看起来一致"场景），并可用 --point-count
+    显式伪造历史残留值（M19a/b：残留 0 / 238，而当前任务确实是 12 点）。
+    **watchdog 不得用它判定配置正确性**（BLOCKED-01）。
+    """
     if ARGS.point_count is not None:
         return ARGS.point_count
     total = 0
@@ -193,13 +209,20 @@ class Handler(BaseHTTPRequestHandler):
                 }
             log('DIAG', point_count=point_count())
             return self._send(200, snap)
-        if self.path == f'/api/v1/tasks/{EPID}':
-            log('TASKS', revision=ARGS.task_revision, count=len(TASKS), source='path')
-            return self._send(200, {'endpoint_id': EPID, 'revision': ARGS.task_revision, 'tasks': TASKS})
-        if self.path == f'/api/v1/tasks?endpoint={EPID}':
-            # Core 的真实形态（crates/core-api/src/lib.rs:2317-2337：list_tasks 用 ?endpoint=）。
-            log('TASKS', revision=ARGS.task_revision, count=len(TASKS), source='query')
-            return self._send(200, {'endpoint_id': EPID, 'revision': ARGS.task_revision, 'tasks': TASKS})
+        if self.path == f'/api/v1/tasks/{EPID}' or self.path == f'/api/v1/tasks?endpoint={EPID}':
+            source = 'query' if '?' in self.path else 'path'
+            if ARGS.tasks_error:
+                # M19f：任务快照读不到（fail-closed 用例）。诊断端点仍正常，用来证明
+                # "diagnostics 可读"不能替代"任务快照可核实"。
+                log('TASKS_ERROR', status=ARGS.tasks_error, source=source)
+                return self._send(ARGS.tasks_error, {'code': 'INJECTED_TASKS_ERROR',
+                                                     'message': 'M19：故意让任务快照读不到'})
+            body = {'endpoint_id': EPID, 'revision': ARGS.task_revision}
+            if not ARGS.tasks_omit_array:
+                body['tasks'] = TASKS
+            log('TASKS', revision=ARGS.task_revision, count=len(TASKS), source=source,
+                omit_array=ARGS.tasks_omit_array)
+            return self._send(200, body)
         if self.path.startswith('/api/v1/tasks'):
             return self._send(400, {'code': 'VALIDATION_ERROR', 'message': '缺少查询参数 endpoint'})
         if not self.path.startswith('/api/v1/endpoints/'):
@@ -332,7 +355,12 @@ def main():
                    help='Start 成功后 N 秒注入通信失败 detail（M6）')
     p.add_argument('--fail-detail', default='driver reported Failed ConnectionError/COTP_RECV_FAIL: early eof')
     p.add_argument('--point-count', type=int, default=None,
-                   help='diagnostics 里的 point_count；缺省 = tasks 里点位总数（与真实 Core 的 point_map 长度一致）')
+                   help='diagnostics 里的 point_count（**不是**当前任务点数：真实 Core 这里是持久化 '
+                        'point_registry 行数残留）；缺省 = tasks 里点位总数')
+    p.add_argument('--tasks-error', type=int, default=0,
+                   help='任务快照读不到：两个 tasks 端点都返回该 HTTP 状态（M19f）')
+    p.add_argument('--tasks-omit-array', action='store_true',
+                   help='任务快照返回 200 但不含 tasks 数组（M19g：指纹算不出）')
     p.add_argument('--task-revision', default='rev13',
                    help='任务快照返回的 revision（任务配置核验的比对目标之一）')
     p.add_argument('--task-count', type=int, default=3,
