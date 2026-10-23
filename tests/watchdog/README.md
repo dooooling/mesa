@@ -1,18 +1,19 @@
-# stop-watchdog 离线可重复测试框架（M0–M18）
+# stop-watchdog 离线可重复测试框架（M0–M19）
 
 本目录是 `scripts/stop-watchdog.ps1` 的**可复现离线测试**：假端点桩 + 场景驱动 + 断言。
 它把原先只存在于 `target/validation/`（gitignored，别人和 CI 都拿不到）的验证手段固化进仓库，
 使 **Windows / Linux 都能独立复现**全部离线场景。
 
-**当前规模（2026-10-23 第二次修订）**：**19 个场景（M0–M18）**、**228 项断言**
-（旧版本曾记录为 1054 行 / 7 场景 / 2267 行 / 13 场景 / 94 断言 / 17 场景 / 174 断言，均已过期）。
+**当前规模（2026-10-23 第三次修订，BLOCKED-01）**：**20 个场景（M0–M19）**、**282 项断言**
+（旧版本曾记录为 1054 行 / 7 场景 / 2267 行 / 13 场景 / 94 断言 / 17 场景 / 174 断言 / 19 场景 228 断言，均已过期）。
 
 * 不连真实设备，不启动 `mesad`，不依赖 8132 生产实例，不依赖 Rust 代码；
 * 需要：**pwsh 7+** 与 **python3**（Windows 上 `python` 亦可）；
 * **G7 不再用 git HEAD 充当凭证**（那只能证明"与仓库版本匹配"，不能证明部署物身份）：
   驱动离线构造"部署二进制 fixture + 受信构建清单"，由被测脚本**实算 sha256** 比对；
 * **任务配置核验核对完整配置**（连接 host/port/TSAP/PDU + 逐点 Key 与参数 + 规范化指纹），
-  不再只比 revision / point_count；
+  不再只比 revision / 点数；**当前任务点数取自实时任务快照**（`tasks[].binding.config.points[]`），
+  `diagnostics.point_count` 已降级为**运行状态观测值**（见下文 BLOCKED-01）；
 * **被批准对象自身也要与签署值比对**（G1/G2）：清单**自身**摘要（`-ExpectedManifestSha256`）与
   获批配置文件**自身**摘要（`-ExpectedApprovedTaskConfigSha256`）都必须来自签署包，缺失或不一致一律拒绝。
 
@@ -133,6 +134,39 @@ B2/B3 修好的是"输入值 ↔ 实际对象"的一致性，但**被批准的�
 对应场景：**M17**（G1 负向 3 子用例：缺参数 / 清单+二进制一起被换且自洽 / 清单字节被改）、
 **M18**（G2 负向 3 子用例：缺参数 / 只改 connection 而**指纹不变** / 改文件后用改后文件自身摘要）。
 
+### BLOCKED-01 配置门必须验证**当前任务**，而不是历史残留状态
+
+**问题（已核实）**：旧实现的点数门比对的是 `diagnostics.point_count`，而它的来源是**持久化
+`point_registry` 的行数**：
+
+* `crates/core-api/src/lib.rs:1499` → `crates/config-store/src/lib.rs:2459-2473`
+  （`SELECT … FROM point_registry WHERE endpoint_id=?1 AND deleted=0`）；
+* **唯一写点**：`assign_point_ids`（`config-store:2344-2456`）← `StorePointIdSource::assign`
+  （`drivers/sinumerik-nck/src/endpoint.rs:206-224`，调用点 `:213`）← `run_config_flow`（`:943-945`）；
+* 写入时机：OpenConnection(`:882`) → ConfigureTasks(`:914`) → GetDescriptors(`:925-938`) →
+  **写 registry(`:943-945`)** → ApplyPointMap(`:968-985`) → StartConnection(`:997-1009`)。
+
+⇒ FIRED 前读到的是"**上次走完 ConfigureTasks 的那次 Start**"的残留行数，与当前任务配置无关。
+⇒ 该门禁只能校验"残留一致性"，**不能校验"配置正确性"**：残留值不同会把正确的当前配置**误拒**，
+残留值碰巧相同又会把错误的当前配置**误放行**。
+
+**修法（只改 watchdog 的配置门语义，不动 Core / DB / wire）**：
+
+| 项 | 修订后 |
+|---|---|
+| 当前任务点数（**判据**） | 从实时任务快照计算：`GET /api/v1/tasks?endpoint=…` 的 `tasks[].binding.config.points[]` **总数**（`Get-WdTaskPointCount`） |
+| 获批点数 | `-ExpectedPointCount` 的语义 = **获批任务配置的点数**（取自签署包），与任务快照比对 |
+| `diagnostics.point_count` | **降级为独立运行状态观测值**：写进 `summary.json` / `arm-report.json` 的 `task_config_observation.diagnostics_point_count_observed`（以及 `task_config.actual.diagnostics_point_count`），并标注 `observed-only`；**不参与配置门判定** |
+| 缺失 / 不一致 | 任务快照读不到、指纹算不出、点位参数对不上 ⇒ **仍然 fail-closed**（`unverified` ⇒ 拒绝进入 FIRED） |
+| Core / DB | **不修改、不新增 API、不改持久化语义** |
+
+对应场景 **M19**（7 子用例，两向都钉住）：a/b 残留值 0 / 238 但当前任务确实 12 点 ⇒ **必须放行**并
+记录观测值；c/d 实时只有 3 / 5 点（`diagnostics` 仍报 12）⇒ **必须拒绝**；e 点数相同（12）但一个点位
+参数被改 ⇒ **必须拒绝**且点数门**不**触发；f/g 任务快照 HTTP 500 / 无 `tasks` 数组 ⇒ **必须 fail-closed**。
+
+> 桩的 `--point-count` 只改 `diagnostics` 里的值（等价于真实 Core 的 `point_registry` 残留），
+> **不是**当前任务点数；`--tasks-error` / `--tasks-omit-array` 用来构造"任务快照不可核实"。
+
 ### 获批凭证的权威来源（一期冻结）
 
 **离线套件通过只证明校验逻辑有效，不代表现场凭证已获得授权。**
@@ -170,7 +204,7 @@ B2/B3 修好的是"输入值 ↔ 实际对象"的一致性，但**被批准的�
 | **M8** OBS 心跳失效 | `--get-delay-running 60`（运行中 GET 全无响应）；`-ObserveMaxSec 45` | exit 2；`OBS_STALL` 提前 Stop（≤ T0+8 s）；采集 INVALID_OBSERVATION_GAP；**截止 Stop 仍在 T0+30 s 准时发出** |
 | **M9** HostChecks 查询失败 | `-TestHostProbeError both`（注入权限/查询错误） | exit 9；④⑤ 判 `indeterminate`；收敛 INDETERMINATE；**不得 exit 0、不得判停净**；采集仍 VALID |
 | **M10** 工作线程异常退出 | `-TestAbortFlow timer` | exit 8；`WORKER_ABORTED`；立即 Stop（reason=WORKER_ABORT）+ **MON 接管截止调度**（DEADLINE_FAILSAFE）；控制台给出处置提示 |
-| **M11** 授权门正向 | 无（凭证齐全且校验通过；G7 = `sha256:` 形式） | exit 0；`authorization.overall=verified`；G7 与**指定的部署二进制实算摘要**一致；任务配置（revision + point_count + 连接 + 点位 + 指纹）verified；边界放行；正常 Start 与截止 Stop |
+| **M11** 授权门正向 | 无（凭证齐全且校验通过；G7 = `sha256:` 形式） | exit 0；`authorization.overall=verified`；G7 与**指定的部署二进制实算摘要**一致；任务配置（revision + **当前任务点数** + 连接 + 点位 + 指纹）verified；边界放行；正常 Start 与截止 Stop |
 | **M12** 授权门负向 | 两段：(a) 缺 `-Authorized/-AuthorizedBy`；(b) `-ExpectedTaskRevision rev99` 与桩的 `rev13` 不一致 | 两段都 **exit 40**、**未写 t0.stamp**、**桩未收到任何 START**；拒绝标签分别为 `REFUSED_NOT_AUTHORIZED` / `REFUSED_TASKCONFIG_MISMATCH`；(b) 确实做过只读核验 GET |
 | **M13** 测试注入参数离线边界（B1 负向） | 三个子用例**都带完整有效凭证**：① `http://192.0.2.10:18093` + `-TestAbortFlow`；② `http://127.0.0.1:8132`（生产端口）+ `-TestHostProbeError`；③ `http://<本机主机名>:18093`（非回环字面量）+ `-TestAbortFlow`（桩绑 `0.0.0.0`，守卫失效时请求会真的到达） | 三者都 **exit 40**、标签 `REFUSED_TEST_INJECTION_ONLINE`、**`network_actions = 0`**、无 `t0.stamp`、**桩收到 0 条请求**（更不会有 Start/Stop）；守卫如实记录参数与字面 host |
 | **M14** G7 部署身份不可验证（B2 fail-closed） | 5 子用例：只给 git HEAD / `sha256:` 但二进制不存在 / `manifest:` 清单不存在 / 清单摘要不符 / 完全未提供 | 全部 **exit 40**；G7 `state` 分别为 `unverified`/`unverified`/`unverified`/`invalid`/`missing`（**绝不为 verified**）；无 `t0.stamp`；桩未收到 START；子用例 ① 额外证明 git HEAD 被**记录为辅助信息**但**未用于放行** |
@@ -178,6 +212,7 @@ B2/B3 修好的是"输入值 ↔ 实际对象"的一致性，但**被批准的�
 | **M16** 完整任务配置匹配（B3 正向） | 无（连接 + 全部 12 个点位 + 指纹全一致；G7 = `manifest:` 形式） | exit 0 / STOPPED_CLEAN；G7 `source=manifest` 且清单自身摘要 = 签署值（`verified_before_parse=true`）；`task_config=verified`；实际指纹 = 获批指纹（两套独立实现一致）；**逐点核对 12 个点位**；连接 host/port/TSAP/PDU 全一致；Start 确认 + 截止 Stop 准时 |
 | **M17** G1 负向（清单自身未被独立验证） | 3 子用例（其余凭证齐全，40 只可能来自 G1）：① 走 `manifest:` 但缺 `-ExpectedManifestSha256`；② **清单+二进制一起被换**（攻击者清单内部摘要 = 攻击者二进制实算摘要，二者自洽）；③ 清单字节被改（内部摘要仍指向真二进制） | 三者都 **exit 40**、标签 `REFUSED_MANIFEST_INTEGRITY`、**网络动作数 = 0**、无 `t0.stamp`、桩收到 **0 条请求**；② 额外断言"前提成立：清单内部摘要 = 攻击者二进制摘要"（**若只看清单与二进制是否互相匹配，本子用例会通过**），并断言清单自身摘要 ≠ 签署值、证据里 expected/actual 都留痕 |
 | **M18** G2 负向（获批配置文件自身未被独立验证） | 3 子用例：① 缺 `-ExpectedApprovedTaskConfigSha256`；② 批准文件字节被改（**只改 connection，tasks 一字未动 ⇒ 指纹不变**）；③ 改文件 + 用改后文件自身摘要 | ①② **exit 40**、标签 `REFUSED_TASKCONFIG_INTEGRITY`、**网络动作数 = 0**、无 `t0.stamp`、桩 0 条请求；③ **exit 40**、标签 `REFUSED_TASKCONFIG_MISMATCH`（文件完整性通过后仍被连接配置字段比对挡住，`network_actions ≥ 1`）。② 额外断言"改后文件的 tasks 指纹 = 获批指纹"（**指纹不变也挡不住 connection 篡改**，只能靠文件摘要） |
+| **M19** 配置门验证当前任务而非历史残留（BLOCKED-01） | 7 子用例，每个子用例各起一只桩：a `--point-count 0`；b `--point-count 238`；c 实时 1×3 点（`--point-count 12`）；d 实时 1×5 点（`--point-count 12`）；e 实时 12 点但一个点位 `offset 0→99`；f `--tasks-error 500`；g `--tasks-omit-array` | **a/b 必须放行**（exit 0 / `STOPPED_CLEAN` / 真的发出 Start），且 `task_point_count_live=12`、`diagnostics_point_count_observed` 如实记录 0 / 238 并标注 `observed-only`；**c/d 必须 exit 40** `REFUSED_TASKCONFIG_MISMATCH`，原因点名"当前任务点数不一致（期望 12，实际 3/5）"，而证据里 `diagnostics_point_count=12`（旧判据看着一致）；**e 必须 exit 40**，原因点名"点位参数不一致"且**不含**点数不一致（数量相同不等于配置一致）；**f/g 必须 exit 40** `REFUSED_CREDENTIAL_UNVERIFIABLE`（读不到 / 算不出 ⇒ fail-closed）；c–g 均无 `t0.stamp`、桩未收到 START |
 
 > M9 / M10 用到的 `-TestHostProbeError` / `-TestAbortFlow` 是**离线测试专用注入开关**；
 > 正常执行时保持缺省值，注入值会写进 `summary.json` 的 `test_hooks`（含 `injection_guard` 判定），
@@ -248,7 +283,7 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire `
 | G6 现场签署 | `-G6Signoff` + `-G6SignedAt` | 签署标识非空；签署时间必须可解析（ISO 8601）且不在未来 |
 | G7 部署身份 | `-G7DeployVersion`（+ `-G7BinaryPath`） | `sha256:<hex>` 或 `manifest:<path>`，与部署二进制**实算摘要**比对；git HEAD/describe 仅作辅助记录；不可验证 ⇒ `unverified` ⇒ 拒绝 |
 | **G7 清单自身（G1）** | **`-ExpectedManifestSha256`** | `manifest:` 形式**必填**；在**解析清单之前**对清单**原始字节**算摘要，与签署包批准值比对；缺失/不一致/格式非法 ⇒ `REFUSED_MANIFEST_INTEGRITY`（exit 40，网络动作数 = 0） |
-| 任务配置 | `-ExpectedTaskRevision` + `-ExpectedPointCount` + `-ApprovedTaskConfig` + `-ExpectedTaskFingerprint` | **先做只读 GET**（diagnostics / tasks / 端点快照）与获批配置**逐项、逐点、指纹**比对；不一致 ⇒ `REFUSED_TASKCONFIG_MISMATCH`，读不到 ⇒ `REFUSED_CREDENTIAL_UNVERIFIABLE` |
+| 任务配置 | `-ExpectedTaskRevision` + `-ExpectedPointCount` + `-ApprovedTaskConfig` + `-ExpectedTaskFingerprint` | **先做只读 GET**（任务快照 / 端点快照 / diagnostics）与获批配置**逐项、逐点、指纹**比对；**当前任务点数取自任务快照** `tasks[].binding.config.points[]`（`diagnostics.point_count` 只作观测）；不一致 ⇒ `REFUSED_TASKCONFIG_MISMATCH`，读不到 ⇒ `REFUSED_CREDENTIAL_UNVERIFIABLE` |
 | **获批配置自身（G2）** | **`-ExpectedApprovedTaskConfigSha256`** | fire **必填**；在**解析文件之前**对文件**原始字节**算摘要，与签署包批准值比对；缺失/不一致/格式非法 ⇒ `REFUSED_TASKCONFIG_INTEGRITY`（exit 40，网络动作数 = 0）。**指纹不覆盖 connection，只有它挡得住 connection 篡改** |
 
 ## 退出码与试验结论（分开表达）
@@ -265,7 +300,7 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire `
 | **40** | `REFUSED_CREDENTIAL_INVALID` | G6 时间不可解析、G7 部署二进制摘要与期望不一致、任务配置指纹/字段不一致 |
 | **40** | `REFUSED_MANIFEST_INTEGRITY` | **G1**：受信清单自身未被独立验证（缺 `-ExpectedManifestSha256` / 清单原始字节摘要与签署值不一致 / 格式非法 / 给了该参数却不走 `manifest:` 形式）。纯本地检查，`network_actions = 0` |
 | **40** | `REFUSED_TASKCONFIG_INTEGRITY` | **G2**：获批任务配置**文件自身**未被独立验证（缺 `-ExpectedApprovedTaskConfigSha256` / 文件原始字节摘要与签署值不一致 / 格式非法）。纯本地检查，`network_actions = 0`；**tasks 指纹相同也不放行** |
-| **40** | `REFUSED_TASKCONFIG_MISMATCH` | 完整任务配置与获批配置不一致（连接配置 / 点位 Key 与参数 / 指纹 / revision / point_count） |
+| **40** | `REFUSED_TASKCONFIG_MISMATCH` | 完整任务配置与获批配置不一致（连接配置 / 点位 Key 与参数 / 指纹 / revision / **当前任务点数**）。当前任务点数取自实时任务快照，**不是** `diagnostics.point_count` |
 | **40** | `REFUSED_CREDENTIAL_UNVERIFIABLE` | 凭证读不到或无法独立验证（G7 无摘要/清单、部署二进制定位不到、端点读不到、获批配置不可用）→ fail-closed |
 | 0 | `STOPPED_CLEAN` | fire：收敛 CONVERGED + 采集 VALID + Start 确认 + 无竞态 |
 | 1 | `NOT_STOPPED` | 已观测到仍未收敛（最高严重级） |
@@ -300,7 +335,7 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire `
 
 ## 证据目录内容
 
-每个场景目录（`<EvidenceRoot>/<场景>/`；M12/M13/M14/M15/M17/M18 下再分子用例目录）：
+每个场景目录（`<EvidenceRoot>/<场景>/`；M12/M13/M14/M15/M17/M18/M19 下再分子用例目录）：
 
 | 文件 | 内容 |
 |---|---|
@@ -309,8 +344,8 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire `
 | `t0.stamp` | T0 与截止时刻（仅 fire 且进入 FIRED 才有；被拒绝时**不存在**——这本身是断言） |
 | `watchdog-states.jsonl` | 每次观测一行（相对 T0 的时刻、state、epoch、req_ms、err） |
 | `watchdog-stops.jsonl` | 每次 Stop 一行（原因、发出时刻、相对截止偏差、http、耗时） |
-| `summary.json` | 判定汇总（6 项三态、三条轴、workers、credentials、test_hooks、verdict、exit_code）；被拒绝时是拒绝记录（`refused` / `note` / `network_actions` / `extra`） |
-| `arm-report.json` | 仅 arm 模式：探活/凭证校验/保持时间/副作用清单 |
+| `summary.json` | 判定汇总（6 项三态、三条轴、workers、credentials、test_hooks、verdict、exit_code）；被拒绝时是拒绝记录（`refused` / `note` / `network_actions` / `extra`）。**两种形态**都含独立的 `task_config_observation` 块：`task_point_count_live`（**判据**，实时任务快照）+ `diagnostics_point_count_observed`（**只作观测**，持久化 `point_registry` 残留行数）+ `diagnostics_point_count_role`（标注 `observed-only`） |
+| `arm-report.json` | 仅 arm 模式：探活/凭证校验/保持时间/副作用清单；同样含独立的 `task_config_observation` 块 |
 | `stub-requests.jsonl` | 假端点桩收到的每个请求（用于**独立**交叉核对 Stop/Start 时刻、以及"拒绝时到底有没有连接"） |
 | `stub-stdout.log` / `stub-stderr.log` | 桩的原始输出 |
 
@@ -335,7 +370,8 @@ workflow：`.github/workflows/_watchdog.yml`（`workflow_call`），由 `ci.yml`
 
 `ci-gate` 自身的严格性有离线自测：`python3 tools/ci/test_ci_gate.py`（CI quality job 内执行）。
 
-单场景耗时 2 s（M12/M13/M15/M17/M18）到 ~60 s（M3/M4/M8），全量约 **12–15 分钟**。
+单场景耗时 2 s（M12/M13/M15/M17/M18）到 ~60 s（M3/M4/M8）；M19 含 2 次完整生命周期 + 5 次快速拒绝，
+约 **2 分钟**；全量约 **14–16 分钟**。
 若 CI 机器上有其它 mesa 驱动进程或到目标端口的 Established 连接，M0/M11/M16 的 HostChecks 会正确地
 判为未收敛——那是**预期行为**（说明该机器不适合做"停干净"验收），不是测试缺陷。
 
@@ -345,4 +381,5 @@ workflow：`.github/workflows/_watchdog.yml`（`workflow_call`），由 `ci.yml`
 2. 断言失败会打印 `[FAIL] 断言名 — 实际值`，对照上表定位是哪一层（调度/采集/收敛/授权/注入边界/工作流）；
 3. 不得为了让断言通过而放宽脚本阈值（尤其 `ObserveStallSec`、`SAMPLING_MAX_GAP_MS`、`MAX_STOPS`）——
    这些阈值本身就是被验收对象；同理不得把注入守卫、G7 摘要比对、G1/G2 的"被批准对象自身"摘要比对、
-   任务配置完整核对"简化"掉。
+   任务配置完整核对"简化"掉，也不得把"当前任务点数"改回读 `diagnostics.point_count`
+   （那是持久化 `point_registry` 的残留值，见 BLOCKED-01）。
