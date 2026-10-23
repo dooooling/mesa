@@ -1400,6 +1400,7 @@ name = "mesa-driver-manager"
 version = "0.3.0"
 dependencies = [
  "getrandom 0.2.17",
+ "libc",
  "mesa-config-store",
  "mesa-core-types",
  "mesa-driver-protocol",

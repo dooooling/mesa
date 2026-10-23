@@ -8,6 +8,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "test-hooks")]
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 #[allow(unused_imports)]
@@ -293,13 +295,192 @@ fn aead_decrypt(ciphertext: &[u8], nonce: &[u8], key: &[u8; 32]) -> Result<Vec<u
 /// point_registry 行（诊断用）：key/id/类型/墓碑/来源标签/展示名。
 pub type RegistryRow = (String, u32, String, bool, Option<String>, Option<String>);
 
+/// 显式"挂起 → 由测试放行"屏障（`test-hooks` 门控的自测基础设施）。
+///
+/// 为什么需要它（G7 P0-D 用例的确定性要求）：此前的做法是"给这次写库注入 9s
+/// 延迟，DELETE 的等待预算是 10s"——正确性依赖"机器一定比注入延迟更快"。
+/// CI 负载高时 9s 写入 + teardown + 调度开销会超过 10s，DELETE 于是按预算用尽
+/// 返回 409 `DELETE_PERSIST_IN_PROGRESS`，用例间歇性变红（同一份代码在其他 CI
+/// 上却是绿的）。
+///
+/// 改用本屏障后，"写入在途"成为一个**时长由测试决定**的窗口：写入在
+/// "已进入 `set_desired_running`（`calls_started` 已 +1）、尚未写库"处挂起，
+/// 直到测试显式 [`Self::release`]。这样 DELETE 的开始时刻与写入完成时刻的先后
+/// 关系由测试的显式握手决定，不再依赖机器速度；而生产常量
+/// `DELETE_PERSIST_WAIT`（10s）保持不变。
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Default)]
+pub struct WriteHold {
+    /// 是否已放行（`release` 置真，幂等）。
+    released: std::sync::Mutex<bool>,
+    /// 放行通知：避免测试放行后写入端还要再轮询一段时间。
+    cv: std::sync::Condvar,
+}
+
+#[cfg(feature = "test-hooks")]
+impl WriteHold {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 放行被挂起的写入。幂等：重复调用、或在写入端尚未挂起时调用都安全。
+    pub fn release(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *released = true;
+        self.cv.notify_all();
+    }
+
+    /// 挂起当前（blocking）线程，直到 [`Self::release`] 被调用。
+    ///
+    /// `max_wait` 只是**安全阀**（防止测试漏掉 release 时永久占住一个 blocking
+    /// 线程把测试进程拖死），不参与语义：正常路径上 release 在毫秒级完成，
+    /// 因此它不会把"确定性握手"退化成"靠超时猜"。
+    fn wait(&self, max_wait: std::time::Duration) {
+        let deadline = std::time::Instant::now() + max_wait;
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*released {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return;
+            }
+            let (guard, _) = self
+                .cv
+                .wait_timeout(released, deadline - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            released = guard;
+        }
+    }
+}
+
+/// 运行意图（`desired_running`）落盘故障注入（`test-hooks` feature 门控）。
+///
+/// 为什么需要它：G7 生命周期修复里有两条**必须可判定**的语义，都依赖"落盘失败
+/// / 落盘很慢"这一外部条件：
+/// 1. 落盘失败 ⇒ Stop 返回 500 `STOP_INTENT_NOT_PERSISTED`（禁止静默成功）；
+/// 2. 落盘慢（DB busy）⇒ **不得**阻塞实际 teardown（停止优先级高于持久化）。
+///
+/// 真实磁盘故障/长事务无法在 CI 上确定性构造，故与 `mesa-event-store` 的
+/// `StoreFaults` 同口径提供注入点：默认构建（无 feature）零检查、零字段。
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Default)]
+pub struct DesiredWriteFaults {
+    /// true ⇒ `set_desired_running` 立即返回 SQLITE_FULL 风格错误（整条 UPDATE 不执行）。
+    pub fail: std::sync::atomic::AtomicBool,
+    /// >0 ⇒ `set_desired_running` 在真正写库前先阻塞该毫秒数（模拟 DB busy）。
+    pub delay_ms: std::sync::atomic::AtomicU64,
+    /// true ⇒ **围栏的 DB 通道**写入失败（模拟"整个 DB 不可写"）。
+    ///
+    /// 与 `fail` 分开是刻意的：P0-3 要证明的是"停止意图落盘失败 + 围栏的 DB
+    /// 通道也写不进去"时，sidecar 文件通道仍能留下持久事实（失败关闭）。
+    pub fence_db_fail: std::sync::atomic::AtomicBool,
+    /// true ⇒ **围栏的 sidecar 文件通道**写入失败（模拟"文件系统也不可写"）。
+    pub fence_file_fail: std::sync::atomic::AtomicBool,
+    /// 按调用顺序消费的延迟序列（仅测试用；G7 P0-A 的交错构造需要）。
+    ///
+    /// 为什么需要它：P0-A 的原始交错是"Stop-A 的写很慢、Stop-B 的写很快"，
+    /// 而 [`Self::delay_ms`] 是全局的，无法让两次调用产生不同延迟。队列按
+    /// `set_desired_running` 的调用顺序取队首；队列空时回落到 `delay_ms`。
+    pub delay_seq: Mutex<std::collections::VecDeque<u64>>,
+    /// 已**进入** `set_desired_running` 的调用数（在取延迟/睡眠之前 +1）。
+    /// 测试据此确定性等待"某次写入已经开始"，而不是靠 sleep 猜。
+    pub calls_started: std::sync::atomic::AtomicU64,
+    /// 已**完成**（成功或注入失败返回）的调用数。用于证明 Start 的意图落盘
+    /// 先于其响应返回（P0-B 拆锁后仍必须成立）。
+    pub calls_completed: std::sync::atomic::AtomicU64,
+    /// 显式挂起队列（见 [`WriteHold`]）：按 `set_desired_running` 的调用顺序取
+    /// 队首；取到的那次调用会在 `calls_started` +1 之后、真正写库之前挂起，
+    /// 直到测试 `release()`。队列空 ⇒ 不挂起（与 [`Self::delay_seq`] 同口径）。
+    ///
+    /// 与"注入固定延迟"的区别：延迟只是"大概是够用的窗口"，屏障是"窗口由测试
+    /// 开关决定"，因此并发顺序可被证明，而不是被采样。
+    pub hold_seq: Mutex<std::collections::VecDeque<std::sync::Arc<WriteHold>>>,
+}
+
+/// 同一 DB 中 `meta` 表里保存"停止意图未持久化"围栏的键。
+///
+/// 语义（S2 失败关闭）：该键存在某个 endpoint_id ⇒ 上次进程**未能**把
+/// `desired_running=false` 落盘，而内存里已经按"已停止"处理过。此时若进程崩溃，
+/// 旧的 `desired_running=true` 仍会让开机恢复把用户明确要停的端点拉起来。
+/// 因此开机恢复必须跳过这些端点，并要求人工确认（显式 POST /start）。
+/// 放在既有 `meta` 表（键值对）里，**不新增表、不新增列、不改 schema 版本**。
+const STOP_INTENT_FENCE_KEY: &str = "stop_intent_unpersisted";
+
+/// sidecar 围栏文件名后缀（P0-3）：`<db 路径>.stop-fence.json`。
+///
+/// 为什么不放 `target/` 或进程 CWD：围栏必须与它所保护的 DB 同生命周期、
+/// 同备份/搬迁语义；放 CWD 会在 `cd` 后丢，放 `target/` 会被 `cargo clean`
+/// 删掉。同目录是唯一能保证"库在围栏就在"的位置。
+const STOP_INTENT_FENCE_SUFFIX: &str = ".stop-fence.json";
+
+/// **意图确认凭证**文件名后缀（P0-4 正向证明）：`<db 路径>.intent-proof.json`。
+///
+/// 与围栏相反：围栏是"负向证据"（出现过未持久化的停止），本文件是"正向证据"
+/// （某个端点的 `desired_running` 确实由门成功写入过）。开机恢复**只**恢复
+/// 能在这里被正向确认的端点——"没写进去"和"写了但没证明"必须得到同一种
+/// 保守结果（不恢复）。
+const INTENT_PROOF_SUFFIX: &str = ".intent-proof.json";
+
+/// 开机恢复计划（P0-4：**默认不恢复**，只有正向证明才恢复）。
+///
+/// 评审指定的默认值翻转：修复前是"命中围栏才不恢复"（默认恢复），现在是
+/// "能证明才恢复"（默认不恢复）。这样即使围栏本身写失败，未被证明的
+/// `desired_running=true` 也不会被当成用户意图。
+#[derive(Debug, Clone)]
+pub enum RecoveryPlan {
+    /// 可以继续逐端点判定：`fenced` 命中一律不恢复；`desired_running=true`
+    /// 但不在 `confirmed` 中的端点同样不恢复（无法正向证明）。
+    Proceed {
+        fenced: Vec<String>,
+        confirmed: std::collections::BTreeSet<String>,
+    },
+    /// 连"做判定"的前提都不成立 ⇒ 一个都不恢复。
+    DenyAll { reason: String },
+}
+
+/// 停止意图围栏的写入结果（P0-3：两条**独立**的持久化通道）。
+///
+/// `db` = `meta` 表通道；`file` = DB 同目录 sidecar 通道。任一通道成功即
+/// "围栏已持久化"；两条都失败才允许调用方按"无法证明安全"处理。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FenceWriteReport {
+    pub db: bool,
+    pub file: bool,
+}
+
+impl FenceWriteReport {
+    /// 是否至少有一条通道留下了持久事实。
+    pub fn durable(&self) -> bool {
+        self.db || self.file
+    }
+}
+
 pub struct ConfigStore {
     conn: Mutex<Connection>,
     /// master.key 目录：文件库 = DB 父目录（P0-1），内存库 = None（固定测试 key）。
     key_dir: Option<PathBuf>,
+    /// 停止意图围栏 sidecar 文件（P0-3）：文件库 = `<db>.stop-fence.json`；
+    /// 内存库 = None（没有可持久的文件系统位置，只用 DB 通道）。
+    fence_path: Option<PathBuf>,
+    /// 意图确认凭证文件（P0-4）：文件库 = `<db>.intent-proof.json`；内存库 = None。
+    intent_proof_path: Option<PathBuf>,
+    /// 本次进程是否**禁止一切自动恢复**（P0-3 fail-closed）。
+    ///
+    /// 置位条件：打开时 DB 连"写回自身 header"都做不到（只读/不可写），或
+    /// 围栏 sidecar 存在但读不懂。此时无法证明任何 `desired_running=true` 是
+    /// 用户意图 ⇒ 开机恢复必须全部跳过（宁可少恢复，不可误拉起机床端点）。
+    recovery_denied: bool,
     /// master key 实例级缓存（P0-1 Final）：`get_or_try_init` 串行化并发首次
     /// 访问；各实例独立，in-memory/多目录文件库同进程共存不串 key。
     master_key: OnceLock<[u8; 32]>,
+    /// 运行意图落盘故障注入（仅 `test-hooks` 构建存在）。
+    #[cfg(feature = "test-hooks")]
+    desired_faults: Arc<DesiredWriteFaults>,
 }
 
 impl ConfigStore {
@@ -320,12 +501,22 @@ impl ConfigStore {
             Some(p) if !p.as_os_str().is_empty() => Some(p.to_path_buf()),
             _ => Some(PathBuf::from(".")),
         };
-        let s = Self {
+        let fence_path = Some(Self::sidecar_path(path, STOP_INTENT_FENCE_SUFFIX));
+        let intent_proof_path = Some(Self::sidecar_path(path, INTENT_PROOF_SUFFIX));
+        let mut s = Self {
             conn: Mutex::new(conn),
             key_dir,
+            fence_path,
+            intent_proof_path,
+            recovery_denied: false,
             master_key: OnceLock::new(),
+            #[cfg(feature = "test-hooks")]
+            desired_faults: Arc::new(DesiredWriteFaults::default()),
         };
         s.migrate()?;
+        // P0-3：打开即探测"这个库还能不能写"。只读库上的 `desired_running=true`
+        // 既无法被 Stop 改写、也无法被围栏标记 ⇒ 本次进程一律不自动恢复。
+        s.recovery_denied = !Self::probe_writable(&s.conn.lock().unwrap());
         Ok(s)
     }
 
@@ -335,10 +526,314 @@ impl ConfigStore {
         let s = Self {
             conn: Mutex::new(conn),
             key_dir: None,
+            // 内存库没有文件系统位置：P0-3 的 sidecar 通道不存在（仅测试/临时用）。
+            fence_path: None,
+            intent_proof_path: None,
+            recovery_denied: false,
             master_key: OnceLock::new(),
+            #[cfg(feature = "test-hooks")]
+            desired_faults: Arc::new(DesiredWriteFaults::default()),
         };
         s.migrate()?;
         Ok(s)
+    }
+
+    /// 运行意图落盘故障注入句柄（仅 `test-hooks` 构建可见）。
+    #[cfg(feature = "test-hooks")]
+    pub fn desired_write_faults(&self) -> Arc<DesiredWriteFaults> {
+        Arc::clone(&self.desired_faults)
+    }
+
+    /// 本次进程是否禁止一切自动恢复（P0-3 fail-closed 总闸）。
+    ///
+    /// 为 true 时调用方（mesad 开机恢复）必须跳过**全部** `desired_running=true`
+    /// 端点：DB 只读意味着连"把停止意图写回去"都做不到，任何"用户想让它运行"
+    /// 的持久化声明都无法被证明/撤销。
+    pub fn recovery_denied(&self) -> bool {
+        self.recovery_denied
+    }
+
+    /// sidecar 路径（与 DB 同目录、同前缀）。
+    fn sidecar_path(db: &Path, suffix: &str) -> PathBuf {
+        let mut s = db.as_os_str().to_os_string();
+        s.push(suffix);
+        PathBuf::from(s)
+    }
+
+    /// 探测主库是否可写：把 `user_version` 的原值写回。
+    ///
+    /// 内容不变，但 SQLite 仍要真的落一页（只读库/只读目录会在这里失败），
+    /// 因此比"能打开"更强：能打开 ≠ 能写。
+    fn probe_writable(conn: &Connection) -> bool {
+        let Ok(v) = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)) else {
+            return false;
+        };
+        conn.execute_batch(&format!("PRAGMA user_version = {v};"))
+            .is_ok()
+    }
+
+    /// DB 通道是否被注入为不可写（仅 test-hooks 构建可能为真）。
+    fn fence_db_injected_failure(&self) -> bool {
+        #[cfg(feature = "test-hooks")]
+        {
+            self.desired_faults
+                .fence_db_fail
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        {
+            false
+        }
+    }
+
+    /// sidecar 通道是否被注入为不可写（仅 test-hooks 构建可能为真）。
+    fn fence_file_injected_failure(&self) -> bool {
+        #[cfg(feature = "test-hooks")]
+        {
+            self.desired_faults
+                .fence_file_fail
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        {
+            false
+        }
+    }
+
+    /// 从 DB 的 `meta` 表读围栏列表。解析失败**返回错误**（调用方 fail-closed）。
+    fn read_db_fence(conn: &Connection) -> Result<Vec<String>, StoreError> {
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key=?1",
+                params![STOP_INTENT_FENCE_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(s) = raw else {
+            return Ok(Vec::new());
+        };
+        let mut v: Vec<String> = serde_json::from_str(&s).map_err(StoreError::Json)?;
+        v.sort();
+        v.dedup();
+        Ok(v)
+    }
+
+    /// **单事务**内完成 DB 通道的"读列表 → 改列表 → 写列表"（P0-2）。
+    ///
+    /// 修复前是两个独立的锁获取（先 `stop_intent_unpersisted()` 再写回）：
+    /// 两个端点并发 mark/clear 时，后写者会用自己读到的旧快照覆盖先写者，
+    /// 丢掉另一端点的围栏（进而让该端点在重启后被自动拉起）。这里用
+    /// `BEGIN IMMEDIATE` + 同一临界区，读改写不可分割。
+    ///
+    /// `f` 返回是否需要写回（false ⇒ 内容未变，省一次写）。
+    fn mutate_db_fence<F>(conn: &mut Connection, f: F) -> Result<(), StoreError>
+    where
+        F: FnOnce(&mut Vec<String>) -> bool,
+    {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut ids = Self::read_db_fence(&tx)?;
+        if f(&mut ids) {
+            ids.sort();
+            ids.dedup();
+            let json = serde_json::to_string(&ids).map_err(StoreError::Json)?;
+            tx.execute(
+                "INSERT INTO meta(key,value) VALUES(?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![STOP_INTENT_FENCE_KEY, json],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 读 sidecar 通道。文件不存在 = 空集合；**存在但读不懂 = 错误**
+    /// （调用方必须把"读不懂"当成"可能有围栏"，否则一个损坏文件就能绕过保护）。
+    fn read_file_fence(&self) -> Result<Vec<String>, StoreError> {
+        let Some(path) = &self.fence_path else {
+            return Ok(Vec::new());
+        };
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(StoreError::Validation(format!(
+                    "围栏 sidecar 读取失败 {}: {e}",
+                    path.display()
+                )));
+            }
+        };
+        #[derive(serde::Deserialize)]
+        struct Sidecar {
+            endpoints: Vec<String>,
+        }
+        // 同时接受对象形式（本实现写的）与裸数组（便于人工/早期版本写入）。
+        let mut v = match serde_json::from_str::<Sidecar>(&raw) {
+            Ok(s) => s.endpoints,
+            Err(_) => serde_json::from_str::<Vec<String>>(&raw).map_err(|e| {
+                StoreError::Validation(format!("围栏 sidecar 解析失败 {}: {e}", path.display()))
+            })?,
+        };
+        v.sort();
+        v.dedup();
+        Ok(v)
+    }
+
+    /// 原子写 sidecar 通道：临时文件 + `sync_all` + rename。
+    ///
+    /// 必须原子：崩溃在"写了一半"的时刻不能留下一个半截 JSON（那会让下次
+    /// 启动把围栏读成损坏 ⇒ 全量不恢复，虽安全但不可用）。rename 在同一目录
+    /// 内是原子的（Windows 用 `MoveFileEx(REPLACE_EXISTING)`）。
+    fn write_file_fence(&self, ids: &[String]) -> Result<(), StoreError> {
+        let Some(path) = &self.fence_path else {
+            return Ok(());
+        };
+        if self.fence_file_injected_failure() {
+            return Err(StoreError::Validation(
+                "围栏 sidecar 写入失败（注入）".into(),
+            ));
+        }
+        let body = serde_json::json!({"version": 1, "endpoints": ids}).to_string();
+        let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(body.as_bytes())?;
+            f.sync_all()?;
+            Ok(())
+        };
+        if let Err(e) = write() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(StoreError::Validation(format!(
+                "围栏 sidecar 写入失败 {}: {e}",
+                tmp.display()
+            )));
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(StoreError::Validation(format!(
+                "围栏 sidecar 落位失败 {}: {e}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// 原子写任意 sidecar JSON：临时文件 + `sync_all` + rename（同目录原子替换）。
+    fn write_json_sidecar(path: &Path, body: &str) -> Result<(), StoreError> {
+        let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(body.as_bytes())?;
+            f.sync_all()?;
+            Ok(())
+        };
+        if let Err(e) = write() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(StoreError::Validation(format!(
+                "sidecar 写入失败 {}: {e}",
+                tmp.display()
+            )));
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(StoreError::Validation(format!(
+                "sidecar 落位失败 {}: {e}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// 读"意图确认凭证"：`endpoint_id -> 最近一次成功写入的 desired 值`。
+    ///
+    /// 文件不存在 = 空（没有任何端点被正向证明）；**存在但读不懂 = 错误**
+    /// （调用方 `recovery_plan()` 会据此 DenyAll）。
+    fn read_intent_proof(&self) -> Result<std::collections::BTreeMap<String, bool>, StoreError> {
+        let Some(path) = &self.intent_proof_path else {
+            return Ok(std::collections::BTreeMap::new());
+        };
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(std::collections::BTreeMap::new());
+            }
+            Err(e) => {
+                return Err(StoreError::Validation(format!(
+                    "意图确认凭证读取失败 {}: {e}",
+                    path.display()
+                )));
+            }
+        };
+        #[derive(serde::Deserialize)]
+        struct Proof {
+            confirmed: std::collections::BTreeMap<String, bool>,
+        }
+        let p: Proof = serde_json::from_str(&raw).map_err(|e| {
+            StoreError::Validation(format!("意图确认凭证解析失败 {}: {e}", path.display()))
+        })?;
+        Ok(p.confirmed)
+    }
+
+    /// 记录"该端点的 `desired_running` 已被门成功写入"（P0-4 正向证明）。
+    ///
+    /// 只在 DB 写入**成功之后**调用；写失败只影响下次开机恢复（该端点少恢复
+    /// 一次），属安全方向，因此不升级为错误、也不影响本次操作的成功语义。
+    fn record_intent_proof(&self, endpoint_id: &str, running: bool) {
+        let Some(path) = &self.intent_proof_path else {
+            return;
+        };
+        // 读不懂就**不覆盖**：保持"无法证明"的保守状态，让恢复侧 DenyAll。
+        let Ok(mut confirmed) = self.read_intent_proof() else {
+            return;
+        };
+        if running {
+            confirmed.insert(endpoint_id.to_string(), true);
+        } else {
+            confirmed.remove(endpoint_id);
+        }
+        let body = serde_json::json!({"version": 1, "confirmed": confirmed}).to_string();
+        let _ = Self::write_json_sidecar(path, &body);
+    }
+
+    /// 开机恢复计划（P0-4：**默认不恢复**，只有正向证明才恢复）。
+    ///
+    /// 判定顺序（任一步失败 ⇒ DenyAll）：
+    /// 1. DB 可写（写探测通过）；
+    /// 2. 围栏（DB + sidecar 并集）可读；
+    /// 3. 意图确认凭证可读。
+    ///
+    /// 通过后仍需逐端点：命中围栏 ⇒ 不恢复；`desired_running=true` 但不在
+    /// `confirmed` 中 ⇒ 不恢复（无法正向证明它是用户意图，而不是一次失败的
+    /// Stop 留下的旧值）。
+    pub fn recovery_plan(&self) -> RecoveryPlan {
+        if self.recovery_denied {
+            return RecoveryPlan::DenyAll {
+                reason: "DB 不可写（写探测失败），无法证明任何运行意图".into(),
+            };
+        }
+        if self.intent_proof_path.is_none() {
+            return RecoveryPlan::DenyAll {
+                reason: "内存库没有持久化确认凭证位置".into(),
+            };
+        }
+        let fenced = match self.stop_intent_unpersisted() {
+            Ok(v) => v,
+            Err(e) => {
+                return RecoveryPlan::DenyAll {
+                    reason: format!("停止意图围栏读取失败: {e}"),
+                };
+            }
+        };
+        let confirmed = match self.read_intent_proof() {
+            Ok(m) => m.into_iter().filter(|(_, v)| *v).map(|(k, _)| k).collect(),
+            Err(e) => {
+                return RecoveryPlan::DenyAll {
+                    reason: format!("意图确认凭证读取失败: {e}"),
+                };
+            }
+        };
+        RecoveryPlan::Proceed { fenced, confirmed }
     }
 
     /// 本实例的 master key（P0-1 Final：实例级缓存 + 目录锚定 DB，跨实例
@@ -1088,9 +1583,15 @@ impl ConfigStore {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         // driver_id 创建后不可变：UPDATE 永不触碰 driver_id（API 层已拒绝变更）
+        //
+        // G7 P0-2：**本函数永不写运行意图**（`desired_running` 不在列清单里）。
+        // 理由：core-api 的 PUT 是"读 Endpoint → 可能很长的 Descriptor 异步校验
+        // → 把读到的旧对象整体写回"；若本 UPDATE 带该列，一次普通改名/改连接
+        // 就能把 Stop 刚写入的 `false` 覆盖回**读时的旧值 true**，且完全绕过
+        // 生命周期门。意图只能由 `set_desired_running`（唯一写点）写入。
         let n = tx.execute(
-            "UPDATE endpoints SET device_id=?1, name=?2, connection_json=?3, desired_running=?4, updated_at_ns=?5 WHERE id=?6",
-            params![rec.device_id, rec.name, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns, rec.id],
+            "UPDATE endpoints SET device_id=?1, name=?2, connection_json=?3, updated_at_ns=?4 WHERE id=?5",
+            params![rec.device_id, rec.name, rec.connection_json, rec.updated_at_ns, rec.id],
         )?;
         if n == 0 {
             return Ok(false);
@@ -1162,9 +1663,12 @@ impl ConfigStore {
         }
         let conn = self.conn.lock().unwrap();
         // driver_id 创建后不可变：UPDATE 永不触碰 driver_id
+        //
+        // G7 P0-2：与 `update_endpoint_with_secrets` 同语义——**永不写运行意图**。
+        // 本函数当前无生产调用方，但保留公开 API 时必须同语义，否则将来复用即复发。
         let n = conn.execute(
-            "UPDATE endpoints SET device_id=?1, name=?2, connection_json=?3, desired_running=?4, updated_at_ns=?5 WHERE id=?6",
-            params![rec.device_id, rec.name, rec.connection_json, rec.desired_running as i32, rec.updated_at_ns, rec.id],
+            "UPDATE endpoints SET device_id=?1, name=?2, connection_json=?3, updated_at_ns=?4 WHERE id=?5",
+            params![rec.device_id, rec.name, rec.connection_json, rec.updated_at_ns, rec.id],
         )?;
         Ok(n > 0)
     }
@@ -1175,17 +1679,199 @@ impl ConfigStore {
         Ok(n > 0)
     }
 
+    /// **运行意图（`desired_running`）的唯一写点**（G7 §6.10）。
+    ///
+    /// 只有生命周期门（core-api `LifecycleGate`）允许调用它：Start 提交成功后写
+    /// true、Stop 受理时写 false、Bootstrap 启动成功后写 true。任何"整体回写
+    /// EndpointRecord"的路径都不得触碰该列（见上面两条 UPDATE 的注释）。
     pub fn set_desired_running(
         &self,
         endpoint_id: &str,
         running: bool,
     ) -> Result<bool, StoreError> {
+        #[cfg(feature = "test-hooks")]
+        {
+            use std::sync::atomic::Ordering;
+            self.desired_faults
+                .calls_started
+                .fetch_add(1, Ordering::Relaxed);
+            // DB busy 模拟：先阻塞（模拟等锁），再决定是否注入失败。
+            // 优先消费逐调用延迟队列（P0-A 的"慢 Stop-A / 快 Stop-B"交错）。
+            let delay = {
+                let mut q = self.desired_faults.delay_seq.lock().unwrap();
+                q.pop_front().unwrap_or_else(|| {
+                    self.desired_faults
+                        .delay_ms
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                })
+            };
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            // 显式挂起（G7 P0-D 用例）：由测试决定"写入在途"窗口有多长，
+            // 而不是靠"注入的延迟比调用方预算短"这种与机器速度相关的假设。
+            // 仍在取 `self.conn` 之前 ⇒ 挂起期间不持有 DB 锁，其他读取不被连带阻塞。
+            let hold = {
+                let mut q = self.desired_faults.hold_seq.lock().unwrap();
+                q.pop_front()
+            };
+            if let Some(hold) = hold {
+                hold.wait(std::time::Duration::from_secs(120));
+            }
+            if self
+                .desired_faults
+                .fail
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.desired_faults
+                    .calls_completed
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(13),
+                    Some("disk full (injected desired_running fault)".into()),
+                )));
+            }
+        }
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "UPDATE endpoints SET desired_running=?1, updated_at_ns=?2 WHERE id=?3",
             params![running as i32, Self::now_ns(), endpoint_id],
         )?;
+        #[cfg(feature = "test-hooks")]
+        self.desired_faults
+            .calls_completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // P0-4：DB 写入成功后才记正向凭证（持同一把锁，避免并发端点互相覆盖）。
+        // 行不存在（n == 0）不写凭证——"没写进 DB 的意图"不能被证明。
+        if n > 0 {
+            self.record_intent_proof(endpoint_id, running);
+        }
         Ok(n > 0)
+    }
+
+    // ---- 停止意图围栏（G7 S2 / P0-3：异常重启的失败关闭）----
+    //
+    // 场景：Stop 已受理（内存里按"已停止"处理、teardown 照做），但
+    // `desired_running=false` 落盘失败 ⇒ DB 仍是 true。此时若进程崩溃，开机恢复
+    // 会把这个**用户明确要停**的端点重新拉起来（对机床是危险动作）。
+    //
+    // 对策：落盘失败时写一条**独立于业务表**的围栏记录；开机恢复前读取它，
+    // 命中的端点**一律不自动恢复**，只记 error 并要求人工确认（显式 POST /start，
+    // 成功后清除围栏）。围栏是持久化事实，因此"崩溃 + 重启不会自动拉起"可被测试证明。
+    //
+    // P0-3 的核心约束是"**告警不能充当持久保护**"：如果围栏只写在同一个可能
+    // 不可写的 DB 里，那么"DB 整体不可写"时围栏也写不进去，日志喊得再大声也不
+    // 能阻止下次启动自动拉起。因此围栏有两条**互相独立**的持久化通道：
+    //   A) DB `meta` 表 —— 单事务读改写（P0-2 的原子性修复）；
+    //   B) DB 同目录 sidecar 文件 —— 原子 rename + fsync。
+    // 任一通道成功即可跨崩溃；两条都失败才返回 Err（调用方按"无法证明安全"
+    // 处理：禁止 Start + 大声告警）。打开库时若 sidecar 读不懂或库只读，也一律
+    // 走 `recovery_denied()`（全量不恢复）。
+
+    /// 记录"该 endpoint 的停止意图未持久化"。幂等。
+    ///
+    /// 返回两条通道各自是否成功；**只有两条都失败**才返回 `Err`。
+    pub fn mark_stop_intent_unpersisted(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<FenceWriteReport, StoreError> {
+        let mut report = FenceWriteReport::default();
+        let mut errors: Vec<String> = Vec::new();
+        // 全程持同一把 store 锁：DB 事务与 sidecar 读改写互斥，两个端点并发
+        // mark/clear 不会互相丢更新（P0-2 的另一半——文件通道的原子性）。
+        let mut conn = self.conn.lock().unwrap();
+        if self.fence_db_injected_failure() {
+            errors.push("db: 围栏通道不可写（注入）".to_string());
+        } else {
+            match Self::mutate_db_fence(&mut conn, |ids| {
+                if ids.iter().any(|i| i == endpoint_id) {
+                    false
+                } else {
+                    ids.push(endpoint_id.to_string());
+                    true
+                }
+            }) {
+                Ok(()) => report.db = true,
+                Err(e) => errors.push(format!("db: {e}")),
+            }
+        }
+        match self.read_file_fence() {
+            Ok(mut ids) => {
+                if !ids.iter().any(|i| i == endpoint_id) {
+                    ids.push(endpoint_id.to_string());
+                    ids.sort();
+                    match self.write_file_fence(&ids) {
+                        Ok(()) => report.file = self.fence_path.is_some(),
+                        Err(e) => errors.push(format!("file: {e}")),
+                    }
+                } else {
+                    report.file = self.fence_path.is_some();
+                }
+            }
+            Err(e) => errors.push(format!("file: {e}")),
+        }
+        drop(conn);
+        if report.durable() {
+            Ok(report)
+        } else {
+            Err(StoreError::Validation(format!(
+                "停止意图围栏两条通道均不可写（无法保证重启失败关闭）: {}",
+                errors.join("; ")
+            )))
+        }
+    }
+
+    /// 清除围栏（意图已成功落盘 / 人工确认后的显式启动）。返回是否确有该条。
+    ///
+    /// 清除是**安全方向**：任一通道失败只意味着围栏多留一会儿（下次启动少恢复
+    /// 一个端点），因此不返回 Err，只报告"是否确实存在过"。
+    pub fn clear_stop_intent_unpersisted(&self, endpoint_id: &str) -> Result<bool, StoreError> {
+        let mut found = false;
+        let mut conn = self.conn.lock().unwrap();
+        if !self.fence_db_injected_failure() {
+            match Self::mutate_db_fence(&mut conn, |ids| {
+                let before = ids.len();
+                ids.retain(|i| i != endpoint_id);
+                found |= ids.len() != before;
+                ids.len() != before
+            }) {
+                Ok(()) => {}
+                Err(_) => {
+                    // 保留围栏 = 下次启动继续拒绝自动恢复（安全方向），不升级为错误。
+                }
+            }
+        }
+        match self.read_file_fence() {
+            Ok(ids) => {
+                if ids.iter().any(|i| i == endpoint_id) {
+                    found = true;
+                    let rest: Vec<String> = ids.into_iter().filter(|i| i != endpoint_id).collect();
+                    // 失败同样只保留围栏（安全方向）。
+                    let _ = self.write_file_fence(&rest);
+                }
+            }
+            Err(_) => {
+                // 读不懂 ⇒ 保持原样（fail-closed）。
+            }
+        }
+        drop(conn);
+        Ok(found)
+    }
+
+    /// 读出全部"停止意图未持久化"的 endpoint_id（两条通道的**并集**，已排序）。
+    ///
+    /// 任一通道读失败都返回错误而不是当作空集合：调用方（开机恢复）必须
+    /// fail-closed，把"读不懂围栏"当成"可能有围栏"处理，否则一个损坏的
+    /// meta 值/半截 sidecar 就能绕过保护。
+    pub fn stop_intent_unpersisted(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut ids = Self::read_db_fence(&conn)?;
+        let file = self.read_file_fence()?;
+        drop(conn);
+        ids.extend(file);
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
     }
 
     // ---- Bootstrap（M5 device-bootstrap 原子事务）----
@@ -3725,5 +4411,351 @@ mod tests {
             s.bootstrap_idempotency_delete_by_device("ghost").unwrap(),
             0
         );
+    }
+
+    // ---- G7 §6.10：`desired_running` 写路径拆分 ----
+
+    /// P0-2 主门：**用旧对象回写不得覆盖运行意图**。
+    ///
+    /// 场景（现场可达）：读出 `rec`（desired=true）→ Stop 写入 false →
+    /// 用旧 `rec` 调 `update_endpoint_with_secrets`（改名/改连接）。
+    /// 修复前该 UPDATE 带 `desired_running=?4` ⇒ DB 被写回 true（红）；
+    /// 修复后 SQL 层物理忽略该列 ⇒ 仍为 false（绿）。
+    #[test]
+    fn stale_endpoint_record_writeback_keeps_desired_running() {
+        let s = mem();
+        s.create_device(&dev("d1")).unwrap();
+        let mut rec = ep("e1", "d1");
+        rec.desired_running = true;
+        s.create_endpoint(&rec).unwrap();
+        assert!(s.get_endpoint("e1").unwrap().unwrap().desired_running);
+
+        // Stop 意图（唯一写点）。
+        assert!(s.set_desired_running("e1", false).unwrap());
+        assert!(!s.get_endpoint("e1").unwrap().unwrap().desired_running);
+
+        // 旧对象回写（读时的 desired=true）。
+        rec.name = "改名后".into();
+        assert!(s.update_endpoint_with_secrets(&rec, &[], &[]).unwrap());
+        let after = s.get_endpoint("e1").unwrap().unwrap();
+        assert_eq!(after.name, "改名后", "普通字段必须照常更新");
+        assert!(
+            !after.desired_running,
+            "用旧对象回写不得把 Stop 写入的 false 覆盖回 true（P0-2）"
+        );
+
+        // `update_endpoint` 同语义（公开 API，防止将来复用即复发）。
+        rec.desired_running = true;
+        assert!(s.update_endpoint(&rec).unwrap());
+        assert!(
+            !s.get_endpoint("e1").unwrap().unwrap().desired_running,
+            "update_endpoint 同样永不写运行意图"
+        );
+    }
+
+    /// S2 围栏：写入/读取/清除 + 幂等 + 排序。
+    #[test]
+    fn stop_intent_fence_roundtrip() {
+        let s = mem();
+        assert!(s.stop_intent_unpersisted().unwrap().is_empty());
+        s.mark_stop_intent_unpersisted("ep-b").unwrap();
+        s.mark_stop_intent_unpersisted("ep-a").unwrap();
+        s.mark_stop_intent_unpersisted("ep-b").unwrap(); // 幂等
+        assert_eq!(
+            s.stop_intent_unpersisted().unwrap(),
+            vec!["ep-a".to_string(), "ep-b".to_string()]
+        );
+        assert!(s.clear_stop_intent_unpersisted("ep-a").unwrap());
+        assert!(!s.clear_stop_intent_unpersisted("ep-a").unwrap());
+        assert_eq!(
+            s.stop_intent_unpersisted().unwrap(),
+            vec!["ep-b".to_string()]
+        );
+        s.clear_stop_intent_unpersisted("ep-b").unwrap();
+        assert!(s.stop_intent_unpersisted().unwrap().is_empty());
+    }
+
+    /// 围栏是**持久化**事实：新实例（等价进程重启）仍能读到。
+    #[test]
+    fn stop_intent_fence_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "mesa-fence-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mesa.db");
+        {
+            let s = ConfigStore::open(&db).unwrap();
+            s.mark_stop_intent_unpersisted("ep-x").unwrap();
+        }
+        {
+            let s = ConfigStore::open(&db).unwrap();
+            assert_eq!(
+                s.stop_intent_unpersisted().unwrap(),
+                vec!["ep-x".to_string()],
+                "围栏必须跨进程（重开库）仍然有效"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0-2：**并发** mark/clear 不得丢掉其它端点的围栏。
+    ///
+    /// 修复前是两次独立加锁（读列表 → 释放 → 改 → 再写回）：两个端点并发 mark
+    /// 时，后写者用自己的旧快照覆盖先写者 ⇒ 前一个端点的围栏消失，该端点在
+    /// 下次启动会被自动拉起（正是围栏要防的危险动作）。
+    ///
+    /// 判别力：8 线程 × 20 轮交错；旧实现几乎必然丢更新（断言最终集合 == 全集）。
+    #[test]
+    fn stop_intent_fence_concurrent_mark_clear_does_not_lose_updates() {
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!(
+            "mesa-fence-conc-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mesa.db");
+        let s = Arc::new(ConfigStore::open(&db).unwrap());
+        const N: usize = 8;
+        let ids = |i: usize| format!("ep-{i}");
+
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let s = Arc::clone(&s);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..20 {
+                    s.mark_stop_intent_unpersisted(&ids(i)).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let want: Vec<String> = (0..N).map(ids).collect();
+        assert_eq!(
+            s.stop_intent_unpersisted().unwrap(),
+            want,
+            "并发 mark 必须留下全部端点的围栏（不得互相覆盖）"
+        );
+
+        // 并发：偶数端点 clear、奇数端点重复 mark —— 两者必须互不影响。
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let s = Arc::clone(&s);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..20 {
+                    if i % 2 == 0 {
+                        s.clear_stop_intent_unpersisted(&ids(i)).unwrap();
+                    } else {
+                        s.mark_stop_intent_unpersisted(&ids(i)).unwrap();
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let want_odd: Vec<String> = (0..N).filter(|i| i % 2 == 1).map(ids).collect();
+        assert_eq!(
+            s.stop_intent_unpersisted().unwrap(),
+            want_odd,
+            "并发 clear/mark 不得让被清除的端点复活，也不得丢掉未清除的端点"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0-3：**DB 通道不可写**时 sidecar 通道必须独立留下持久事实。
+    ///
+    /// 这是"告警不能充当持久保护"的直接反例：如果围栏只写同一个 DB，那么
+    /// "整个 DB 不可写"时它同样写不进去，崩溃重启后仍会把用户明确要停的
+    /// 端点自动拉起来。断言：DB 通道失败、文件通道成功；**重开库**（等价重启）
+    /// 仍能读到该围栏。
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn fence_sidecar_survives_db_unwritable() {
+        let dir = std::env::temp_dir().join(format!(
+            "mesa-fence-sidecar-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mesa.db");
+        let sidecar = dir.join("mesa.db.stop-fence.json");
+        {
+            let s = ConfigStore::open(&db).unwrap();
+            assert!(!s.recovery_denied(), "正常库不得禁止恢复");
+            // 构造"崩溃现场"：端点 desired=true，Stop 想把 false 写进去。
+            s.create_device(&DeviceRecord {
+                id: "d-x".into(),
+                name: "d-x".into(),
+            })
+            .unwrap();
+            s.create_endpoint(&EndpointRecord {
+                id: "ep-x".into(),
+                name: "ep-x".into(),
+                device_id: "d-x".into(),
+                driver_id: "test-driver".into(),
+                connection_json: "{}".into(),
+                desired_running: true,
+                updated_at_ns: 0,
+            })
+            .unwrap();
+            let f = s.desired_write_faults();
+            // "整个 DB 不可写"：运行意图写入失败 + 围栏的 DB 通道也失败。
+            f.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+            f.fence_db_fail
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                s.set_desired_running("ep-x", false).is_err(),
+                "前置：运行意图必须写不进去"
+            );
+            let report = s.mark_stop_intent_unpersisted("ep-x").unwrap();
+            assert!(!report.db, "注入后 DB 通道必须失败");
+            assert!(report.file, "DB 不可写时 sidecar 通道必须成功");
+            assert!(report.durable());
+            assert!(sidecar.exists(), "sidecar 文件必须落盘");
+        }
+        {
+            // 等价于进程崩溃后重启：DB 仍是旧值 true，但围栏（sidecar）必须命中。
+            let s = ConfigStore::open(&db).unwrap();
+            assert!(
+                s.get_endpoint("ep-x").unwrap().unwrap().desired_running,
+                "DB 仍是旧值 true（这正是围栏要覆盖的残余风险）"
+            );
+            assert_eq!(
+                s.stop_intent_unpersisted().unwrap(),
+                vec!["ep-x".to_string()],
+                "DB 不可写时写入的围栏必须跨重启有效（sidecar 通道）"
+            );
+            // 清除同样要覆盖两条通道。
+            assert!(s.clear_stop_intent_unpersisted("ep-x").unwrap());
+            assert!(s.stop_intent_unpersisted().unwrap().is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0-3：两条通道都写不进去 ⇒ 必须返回 Err（调用方据此按"无法证明安全"
+    /// 处理，而不是把日志当保护）。
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn fence_reports_error_when_both_channels_fail() {
+        let dir = std::env::temp_dir().join(format!(
+            "mesa-fence-bothfail-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mesa.db");
+        let s = ConfigStore::open(&db).unwrap();
+        let f = s.desired_write_faults();
+        f.fence_db_fail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        f.fence_file_fail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            s.mark_stop_intent_unpersisted("ep-x").is_err(),
+            "两条通道都失败必须显式报错"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0-3：sidecar 存在但**读不懂** ⇒ 读围栏必须报错（调用方 fail-closed），
+    /// 不能当空集合绕过保护。
+    #[test]
+    fn corrupt_sidecar_is_an_error_not_empty_fence() {
+        let dir = std::env::temp_dir().join(format!(
+            "mesa-fence-corrupt-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mesa.db");
+        {
+            let s = ConfigStore::open(&db).unwrap();
+            std::fs::write(dir.join("mesa.db.stop-fence.json"), b"{ not json").unwrap();
+            assert!(
+                s.stop_intent_unpersisted().is_err(),
+                "损坏的 sidecar 必须报错（fail-closed），不得当成空围栏"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0-4：恢复必须**正向证明**（默认不恢复），而不是"没围栏就恢复"。
+    ///
+    /// 判别力：旧默认值下，一个 `desired_running=true` 但从未被门确认过的行
+    /// （例如一次失败 Stop 留下的旧值）会被自动拉起；新默认值下它必须不在
+    /// `confirmed` 里 ⇒ 调用方跳过恢复。
+    #[test]
+    fn recovery_plan_requires_positive_intent_proof() {
+        let dir = std::env::temp_dir().join(format!(
+            "mesa-proof-{}-{}",
+            std::process::id(),
+            mesa_core_types::now_unix_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mesa.db");
+        let proof = dir.join("mesa.db.intent-proof.json");
+        let s = ConfigStore::open(&db).unwrap();
+        s.create_device(&DeviceRecord {
+            id: "d-p".into(),
+            name: "d-p".into(),
+        })
+        .unwrap();
+        s.create_endpoint(&EndpointRecord {
+            id: "ep-p".into(),
+            name: "ep-p".into(),
+            device_id: "d-p".into(),
+            driver_id: "test-driver".into(),
+            connection_json: "{}".into(),
+            desired_running: true,
+            updated_at_ns: 0,
+        })
+        .unwrap();
+
+        // ① 只有 DB 的 true、没有凭证 ⇒ 不得被确认。
+        match s.recovery_plan() {
+            RecoveryPlan::Proceed { confirmed, .. } => assert!(
+                !confirmed.contains("ep-p"),
+                "未经门写入的 desired_running=true 不得被正向确认"
+            ),
+            RecoveryPlan::DenyAll { reason } => panic!("正常库不应 DenyAll: {reason}"),
+        }
+
+        // ② 门成功写入 true ⇒ 凭证出现。
+        assert!(s.set_desired_running("ep-p", true).unwrap());
+        match s.recovery_plan() {
+            RecoveryPlan::Proceed { confirmed, .. } => assert!(
+                confirmed.contains("ep-p"),
+                "门确认过的运行意图必须被正向证明"
+            ),
+            RecoveryPlan::DenyAll { reason } => panic!("正常库不应 DenyAll: {reason}"),
+        }
+
+        // ③ 成功写入 false ⇒ 凭证撤销（不再恢复）。
+        assert!(s.set_desired_running("ep-p", false).unwrap());
+        match s.recovery_plan() {
+            RecoveryPlan::Proceed { confirmed, .. } => {
+                assert!(!confirmed.contains("ep-p"), "已停止的端点不得保留运行凭证")
+            }
+            RecoveryPlan::DenyAll { reason } => panic!("正常库不应 DenyAll: {reason}"),
+        }
+
+        // ④ 凭证文件损坏 ⇒ DenyAll（读不懂 ≠ 没有证据）。
+        std::fs::write(&proof, b"{ broken").unwrap();
+        assert!(
+            matches!(s.recovery_plan(), RecoveryPlan::DenyAll { .. }),
+            "凭证损坏必须整体拒绝恢复"
+        );
+
+        // ⑤ 凭证被删（无法证明任何意图）⇒ Proceed 但 confirmed 为空。
+        std::fs::remove_file(&proof).unwrap();
+        match s.recovery_plan() {
+            RecoveryPlan::Proceed { confirmed, .. } => assert!(confirmed.is_empty()),
+            RecoveryPlan::DenyAll { reason } => panic!("缺凭证不应 DenyAll: {reason}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
