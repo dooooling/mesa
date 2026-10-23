@@ -16,7 +16,7 @@
 | # | 契约 | 合并来源 | 实测规模 | 本模板引用的部分 |
 |---|---|---|---|---|
 | 1 | `docs/validation/828d-phase1-first-limited-sampling-application.md` | PR #130 | 621 行，v1.3 | §3 精确配置、§4 G1–G6 六道门与 §4.2 人工核验、§5 时间窗、§7 立即停止、§8 回退、§9 验收、§11 待确认 |
-| 2 | `scripts/stop-watchdog.ps1` | PR #131 | **3096 行**（任务书写"2809+"，合并后经后续提交增长） | `-Mode arm\|fire`、四项凭证校验、退出码语义、三轴与 `verdict`/`trial` |
+| 2 | `scripts/stop-watchdog.ps1` | **原始基线 PR #131**；**现行版本 PR #136（已合入 main）** | **原始基线 3096 行**（任务书写"2809+"，合并后经后续提交增长）；**现行版本 3241 行**（#136 修复后，merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`）——**本模板的行号口径以现行版本为准**（见 §2.3、§2.5 的行号口径注） | `-Mode arm\|fire`、四项凭证校验、退出码语义、三轴与 `verdict`/`trial` |
 | 3 | `docs/design/core-start-stop-race-fix-design.md` | PR #132 | 1456 行 | §5.3.1 第一层六条判据的设计依据、§6.3.1 尾部无界、§6.15 恢复策略边界 |
 | 4 | `crates/core-api/src/lifecycle.rs` | PR #133 | 1649 行 | `await_settled` 六条判据（`:986-1046`）、`SETTLE_TICKS`（`:42-43`）、`DELETE_PERSIST_WAIT`（`:55`） |
 | 5 | `tests/driver-contract/tests/stop_lifecycle.rs` | PR #134 | 2882 行 | 同步屏障/栅栏用例（`:181`、`:2661`、`:2788`）、冻结 Stop 错误码（`:68-83`） |
@@ -351,7 +351,7 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 | N5 | 现场门禁任一门（G1–G6）不通过 | §5.1 逐门核对 | ☐ 是 ☐ 否 |
 | N6 | 人工核验三字段任一缺失/不一致/无法取证 | §5.5 | ☐ 是 ☐ 否 |
 | N7 | 签署栏（§5.7）四方任缺签名、日期或角色重复 | 逐栏核对 | ☐ 是 ☐ 否 |
-| N8 | **`BLOCKED-01` 依赖已满足**：PR #136（B-1 修复）**已合入 `main`**（merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`）⇒ 修复在基线中，本项**通过**；若部署的 watchdog 早于该合并则仍判 NO-GO（`BLOCKED-01` 本身已由 B-1 关闭） | 核对 PR #136 是否已合入 `main`（`git log main` / PR 状态），并确认部署的 watchdog 为含 `Get-WdTaskPointCount`（`watchdog:1293`）的版本 | ☐ 是 ☐ 否 |
+| N8 | **部署的 watchdog 不包含 `BLOCKED-01` 修复**（缺 `Get-WdTaskPointCount`），或无法证明部署文件与获批摘要一致 ⇒ 配置门仍是旧语义（比对 `diagnostics.point_count` 残留值），本轮不可执行 | 确认**部署**的 `scripts/stop-watchdog.ps1` 含 `Get-WdTaskPointCount`（`watchdog:1293`）且其 SHA-256 与获批摘要一致。**注：`#136` 已合入 `main`（merge `f5f9f56…`）是通过依据，不是失败条件** | ☐ 是 ☐ 否 |
 | N9 | 有人修改过任何预期值以"让门禁通过" | 对照 §2.4 批准记录与最终命令行参数 | ☐ 是 ☐ 否 |
 | N10 | 使用了 `-SkipHostChecks` 或携带测试注入参数 | `watchdog:1731-1733`、`:654-702` | ☐ 是 ☐ 否 |
 | N11 | 存在**遗留的在途 Start**（已发出、未收到明确结果） | #130 §4.7-c；`watchdog:2784`、`:2859` | ☐ 是 ☐ 否 |
@@ -368,7 +368,16 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 | 现场监护人 | ______ | ______ | ______ | |
 | 审批人 | ______ | ______ | ______ | |
 
-**签署时必须同时勾选/填写**：
+**签署分两阶段（消除 ARMED 与签署的循环依赖）**：
+
+| 阶段 | 时点 | 允许的动作 | 必须具备 |
+|---|---|---|---|
+| **A. 预授权签署** | **ARMED 之前** | **仅**允许执行 `-Mode arm` 对**离线回环桩**（零副作用：不发 Start、不写 `t0.stamp`、不起执行流） | §2–§4 已填；G1–G5 现场门已签字；四方人员已确定（可先不签最终栏） |
+| **B. 最终 FIRED 签署** | **ARMED 之后、FIRED 之前** | 允许进入 `-Mode fire` | **A 已完成** 且 **ARMED 结果已纳入本阶段证据**（`exit 0`/`ARMED_READY`、`arm-report.json`、凭证汇总 `verified`）；N1–N12 全为"否" |
+
+> **不得为消除循环而取消 ARMED 证据要求** —— ARMED 结果仍是进入 FIRED 的**必要输入**，只是它属于阶段 B 的输入，而不是阶段 A 的前提。
+
+**B. 最终 FIRED 签署时必须同时勾选/填写**：
 
 - ☐ §5.6 的 N1–N12 全部为"否"；NO-GO 结论栏已填 **GO**。
 - ☐ 三个摘要（§4-①②③）已填入且来源符合 §4 的批准来源要求。
@@ -381,7 +390,7 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 
 | 步 | 动作 | 前置条件 | 留证 |
 |---|---|---|---|
-| 1 | `-Mode arm` 对**离线回环桩**执行（不得指向 8132） | §2–§4 已填；§5.7 已签（`-G6Signoff`/`-G6SignedAt` 本身是 arm 的凭证项，`watchdog:1484`） | `arm-report.json`、`run-log.md` |
+| 1 | `-Mode arm` 对**离线回环桩**执行（不得指向 8132） | §2–§4 已填；**§5.7 阶段 A（预授权）已签**（`-G6Signoff`/`-G6SignedAt` 本身是 arm 的凭证项，`watchdog:1484`） | `arm-report.json`、`run-log.md` |
 | 2 | 抓运行前基线：`GET /endpoints/{id}`、`GET /tasks?endpoint=`、`GET /points/latest`（完整原始响应） | G1–G5 已签字 | 原始响应文件 + SHA-256 |
 | 3 | `PUT /api/v1/tasks/{endpoint}`（body = 获批 4 点，预期 revision 18） | 端点已 STOPPED（运行中保存被 `CONFLICT` 拒绝，`core-api:2406-2414`） | PUT 响应 + 读回 `GET /tasks` |
 | 4 | **门禁前置诊断（只读）**：记录 `task_point_count_live`（当前任务点数，实时快照，**判据**）与 `diagnostics_point_count_observed`（**观测值**），**两者都记录但只有前者参与判定**；不再要求 `point_count` 与签署值相等 | 第 3 步完成 | `site-log.md` 六列（§2.5） |
@@ -517,7 +526,7 @@ ConfigureTasks → GetDescriptors → assign_point_ids 写 point_registry
 
 | # | 项 | 状态 | 为什么不能在本模板里写死 | 谁来解决 |
 |---|---|---|---|---|
-| **BLOCKED-01** | **`-ExpectedPointCount` 的时序语义**（§2.5） | **已关闭（B-1，PR #136）**；**依赖已满足：#136 已合入 main（merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`）**（**若现场部署的 watchdog 早于该合并 ⇒ 仍判 NO-GO**，§5.6-N8） | 关闭前的问题：`point_count` 来自持久化 `point_registry`（`crates/core-api/src/lib.rs:1499` → `crates/config-store/src/lib.rs:2459-2473`），只由 Start 时的 `assign` 写入（`crates/driver-manager/src/endpoint.rs:206-224`，调用点 `:213` ← `run_config_flow:943-945`），PUT 不写它（`crates/core-api/src/lib.rs:2415-2419`），因此不存在"由获批配置推导、又必然等于现场残留"的值。#136 改为核验**当前任务点数**（实时快照 `tasks[].binding.config.points[]`，`watchdog:1293`/`:1515-1518`），`diagnostics.point_count` 降级为 `diagnostics_point_count_observed`（observed-only） | 已由代码修复解决；**待 #136 合入 main**（合入前本模板不得先行合并） |
+| **BLOCKED-01** | **`-ExpectedPointCount` 的时序语义**（§2.5） | **已关闭（B-1，PR #136）**；**依赖已满足：#136 已合入 main（merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`）**（**若现场部署的 watchdog 早于该合并 ⇒ 仍判 NO-GO**，§5.6-N8） | 关闭前的问题：`point_count` 来自持久化 `point_registry`（`crates/core-api/src/lib.rs:1499` → `crates/config-store/src/lib.rs:2459-2473`），只由 Start 时的 `assign` 写入（`crates/driver-manager/src/endpoint.rs:206-224`，调用点 `:213` ← `run_config_flow:943-945`），PUT 不写它（`crates/core-api/src/lib.rs:2415-2419`），因此不存在"由获批配置推导、又必然等于现场残留"的值。#136 改为核验**当前任务点数**（实时快照 `tasks[].binding.config.points[]`，`watchdog:1293`/`:1515-1518`），`diagnostics.point_count` 降级为 `diagnostics_point_count_observed`（observed-only） | 已由代码修复解决（**#136 已合入 main**，merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`）；**执行前仍须核对实际部署的 watchdog 是否包含该修复**（见 §5.6-N8） |
 | 2 | `-ExpectedTaskRevision` 的时序 | **待确认** | 签署包在窗口之前准备，无法预知窗口内是否发生其它写入；一旦偏移 ⇒ `REFUSED_TASKCONFIG_MISMATCH`（`watchdog:285`） | 审批时一并签署；窗口内禁止任何其它写入（G5-②） |
 | 3 | G2 的"协商 PDU 核对" | **待确认** | `mode=probe` 会发起真实机床 I/O，需**单独授权**（#130 §4-G2） | 审批人单独授权或明确"不做" |
 | 4 | MAC `98-fa-9b-59-35-53` | **待确认** | 仓库内无留存（全仓检索无匹配） | 现场补充截图/书面记录 |
