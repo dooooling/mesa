@@ -154,13 +154,22 @@
   与返回的 `revision` 比对，不一致即拒绝。
 
 .PARAMETER ExpectedPointCount
-  期望的点位数量（fire 必填，0 表示"应为 0 个点"）。脚本先做只读
-  `GET /api/v1/endpoints/{id}/diagnostics`，与返回的 `point_count` 比对，不一致即拒绝。
+  **获批任务配置的点数**（fire 必填，0 表示"获批配置应为 0 个点"）。取值来自签署包，不是现场现算。
+  核验方式（BLOCKED-01 修订）：脚本只读 `GET /api/v1/tasks?endpoint={id}`（404/405 回退
+  `GET /api/v1/tasks/{id}`）取**实时任务快照**，按 `tasks[].binding.config.points[]` 求和得到
+  **当前任务点数**，与本参数比对；不一致 ⇒ `REFUSED_TASKCONFIG_MISMATCH`（exit 40）。
+  **不再**用 `diagnostics.point_count` 作判据：该值来自持久化 `point_registry` 行数
+  （`core-api:1499` → `config-store:2459-2473`），唯一写点是 `assign_point_ids`
+  （`config-store:2344-2456`，由 `run_config_flow:943-945` 在 ConfigureTasks 之后写入），
+  因此它反映的是"**上次走完 ConfigureTasks 的那次 Start**"的残留行数，与当前任务配置无关，
+  用它判"配置正确性"等于拿历史残留冒充当前配置。
+  该值仍会被读取并写进证据（`task_config.actual.diagnostics_point_count` 与
+  `task_config_observation.diagnostics_point_count_observed`），**只作运行状态观测**。
 
 .PARAMETER ApprovedTaskConfig
   获批任务配置 JSON 路径（fire 必填）。文件里给出连接配置（host / port / local_tsap / remote_tsap /
   pdu_length）与**完整点位清单**（tasks[].binding.config.points[]：Key 与全部参数）。
-  脚本把实际只读 GET 到的值与之**逐项、逐点**比对（B3：只比 revision/point_count 不足以证明与获批配置一致）。
+  脚本把实际只读 GET 到的值与之**逐项、逐点**比对（B3：只比 revision/点数不足以证明与获批配置一致）。
 
 .PARAMETER ExpectedTaskFingerprint
   批准版本的任务配置指纹（fire 必填，`sha256:<64 hex>`）。指纹 = SHA-256(规范化 tasks 数组)，
@@ -282,7 +291,7 @@
     40 REFUSED_TASKCONFIG_INTEGRITY 获批任务配置**文件自身**未被独立验证（G2）：缺
                                     -ExpectedApprovedTaskConfigSha256、文件原始字节摘要与签署值不一致、格式非法
                                     （本地检查，**网络动作数 = 0**；指纹相同也不放行）
-    40 REFUSED_TASKCONFIG_MISMATCH 完整任务配置与获批配置不一致（连接配置 / 点位 Key 与参数 / 指纹 / revision / point_count）
+    40 REFUSED_TASKCONFIG_MISMATCH 完整任务配置与获批配置不一致（连接配置 / 点位 Key 与参数 / 指纹 / revision / 当前任务点数）
     40 REFUSED_CREDENTIAL_UNVERIFIABLE 凭证读不到或无法独立验证（G7 无摘要/清单、部署二进制定位不到、
                                     端点读不到、获批配置不可用）→ 按未通过处理（fail-closed）
   **40 一律表示"授权边界拒绝，非设备故障"**：未发出 Start、未进入 FIRED。
@@ -518,7 +527,7 @@ Write-Host ("[start] PID={0}  Mode={1}  BaseUrl={2}  Endpoint={3}  OutDir={4}" -
 #               ARMED 永远不碰生产实例，只针对明确指定的离线模拟端点。
 #   fire        静态凭证（-Authorized/-AuthorizedBy/-AuthzTicket + G6 + G7）校验通过后，
 #               才允许任意 host（含生产 mesad 8132 与 192.168.15.60 等现场地址）；
-#               任务配置还要**先做一次只读 GET** 与实际 revision/point_count 比对，
+#               任务配置还要**先做只读 GET**（任务快照 + 端点连接配置）与获批配置比对，
 #               不一致或读不到 ⇒ 40，且**绝不进入 FIRED**（不发 Start）。
 # 40 = "授权边界拒绝，**非设备故障**"：它不是 Stop 失败、也不是采集异常，现场不要按设备故障处置。
 $script:PRODUCTION_CORE_PORT = 8132
@@ -549,9 +558,31 @@ function Get-WdUrlInfo {
     }
 }
 
+function Get-WdProp {
+    # 空安全取属性：$null 对象 / 缺失键一律返回 $null（不抛错）。
+    # 为什么需要：证据里 `items.task_config.actual` 在"静态阶段未做网络核验"时就是 $null，
+    # 而拒绝记录与汇总代码要无条件读取其中的观测字段 —— 用本函数避免"某个阶段少一个字段就整轮崩"。
+    # 位置说明：必须定义在**第一次调用点之前**（Write-WdRefusal 在授权边界拒绝时就会被调用）。
+    param($Obj, [string]$Name)
+    if ($null -eq $Obj) { return $null }
+    if ($Obj -is [System.Collections.IDictionary]) {
+        if ($Obj.Contains($Name)) { return $Obj[$Name] }
+        return $null
+    }
+    $p = $Obj.PSObject.Properties[$Name]
+    if ($p) { return $p.Value }
+    return $null
+}
+
 function Write-WdRefusal {
     # 拒绝记录：写证据目录后直接退出。除任务配置核验外**不发起任何网络动作**（Flag: NetworkActions）。
     param([int]$Code, [string]$Label, [string]$Reason, [hashtable]$Extra, [int]$NetworkActions = 0)
+    # BLOCKED-01：拒绝记录**也是 summary.json**，因此同样要给出**独立的**运行状态观测字段，
+    # 与配置门判据分开呈现 —— 现场不得把 diagnostics.point_count 当成"当前任务点数"。
+    # 任务配置核验之前的拒绝（G1/G2/注入守卫/缺授权）没有 actual，相关字段一律 $null。
+    $refCreds = if ($Extra -and $Extra.ContainsKey('credentials')) { $Extra['credentials'] } else { $null }
+    $refTaskItem = Get-WdProp (Get-WdProp $refCreds 'items') 'task_config'
+    $refTaskActual = Get-WdProp $refTaskItem 'actual'
     $rec = [ordered]@{
         mode            = $Mode
         pid             = $PID
@@ -572,12 +603,22 @@ function Write-WdRefusal {
             g7_binary_path    = $G7BinaryPath
             expected_manifest_sha256 = $ExpectedManifestSha256
             expected_revision = $ExpectedTaskRevision
-            expected_points   = $ExpectedPointCount
+            # 语义：获批任务配置的点数（BLOCKED-01 起；不是 diagnostics.point_count）。
+            expected_task_point_count = $ExpectedPointCount
             approved_task_config = $ApprovedTaskConfig
             expected_tasks_fingerprint = $ExpectedTaskFingerprint
             expected_approved_task_config_sha256 = $ExpectedApprovedTaskConfigSha256
         }
         network_actions = $NetworkActions
+        # BLOCKED-01：判据 vs 观测值（两者语义不同，不得互相顶替）
+        task_config_observation = [ordered]@{
+            expected_task_point_count        = $ExpectedPointCount
+            task_point_count_live            = (Get-WdProp $refTaskActual 'task_point_count')
+            task_count_live                  = (Get-WdProp $refTaskActual 'task_count')
+            diagnostics_point_count_observed = (Get-WdProp $refTaskActual 'diagnostics_point_count')
+            diagnostics_point_count_role     = 'observed-only：运行状态残留值（持久化 point_registry 行数，core-api:1499 ← config-store:2459-2473），非当前任务点数，不参与配置门判定'
+            task_config_state                = (Get-WdProp $refTaskItem 'state')
+        }
         extra           = $Extra
     }
     [System.IO.File]::WriteAllText($summaryPath, ($rec | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
@@ -1057,7 +1098,7 @@ function Get-WdTasksFingerprint {
     # 任务配置指纹 = SHA-256(规范化 tasks 数组)，输出 "sha256:<64 hex>"。
     # 规范化 = 每个 task 键递归排序 + **按 task.id 排序**（任务集合无序、id 唯一；同 id 用规范 JSON
     # 兜底以保证确定性）+ 紧凑 JSON（UTF-8、无空白）。
-    # 这是 B3 的"批准版本一致性"依据：revision 与 point_count 相同**不足以**证明配置一致。
+    # 这是 B3 的"批准版本一致性"依据：revision 与点数相同**不足以**证明配置一致。
     param($Tasks)
     $items = @()
     foreach ($t in @($Tasks)) {
@@ -1249,6 +1290,45 @@ function Get-WdPointKeyMap {
     return $map
 }
 
+function Get-WdTaskPointCount {
+    # **当前任务点数** = 实时任务快照里 tasks[].binding.config.points[] 的总数。
+    #
+    # 为什么不能用 diagnostics.point_count（BLOCKED-01）：
+    #   diagnostics.point_count 的来源是**持久化 point_registry 的行数**
+    #   （crates/core-api/src/lib.rs:1499 → crates/config-store/src/lib.rs:2459-2473，
+    #    `SELECT … FROM point_registry WHERE endpoint_id=?1 AND deleted=0`）；
+    #   唯一写点是 assign_point_ids（config-store:2344-2456），由
+    #   StorePointIdSource::assign（crates/driver-manager/src/endpoint.rs:206-224，调用点 :213）
+    #   在 run_config_flow 的 :943-945（ConfigureTasks :914 之后、ApplyPointMap :968-985 之前）写入。
+    #   也就是说：读到的行数只反映"**上次走完 ConfigureTasks 的那次 Start**"留下的残留状态，
+    #   与本次要核对的任务配置无关 —— 拿它当"配置正确性"判据，等于用历史残留冒充当前配置。
+    #   真正的当前配置只能从 `GET /api/v1/tasks?endpoint=…` 的实时快照里算。
+    #
+    # 返回 @{ ok; count; tasks; points_arrays; note }：
+    #   ok=false 仅当**任务快照根本没有 tasks 数组**（无法核实 ⇒ 调用方按 unverified 处理）；
+    #   tasks 存在但没有 binding.config.points[]（含空数组）⇒ ok=true、count=0，
+    #   这是"配置确实为 0 个点"，属于**读到但不一致**（invalid），不是读不到。
+    param($Tasks)
+    $r = [ordered]@{ ok = $false; count = 0; tasks = 0; points_arrays = 0; note = '' }
+    if ($null -eq $Tasks) {
+        $r.note = '任务快照没有 tasks 数组'
+        return $r
+    }
+    $arr = @($Tasks)
+    $r.tasks = $arr.Count
+    $r.ok = $true
+    foreach ($t in $arr) {
+        if ($null -eq $t) { continue }
+        if (-not ($t.PSObject.Properties['binding'] -and $null -ne $t.binding -and
+                $t.binding.PSObject.Properties['config'] -and $null -ne $t.binding.config -and
+                $t.binding.config.PSObject.Properties['points'])) { continue }
+        $r.points_arrays++
+        $r.count += @($t.binding.config.points | Where-Object { $null -ne $_ }).Count
+    }
+    if ($r.points_arrays -eq 0) { $r.note = '任务快照里没有任何 tasks[].binding.config.points[]（点数按 0 计）' }
+    return $r
+}
+
 function Get-WdTaskSnapshot {
     # 只读任务快照：优先 Core 的真实形态 `GET /api/v1/tasks?endpoint=<id>`
     # （crates/core-api/src/lib.rs:2317-2337 → {endpoint_id, revision, tasks}）；
@@ -1286,8 +1366,8 @@ function Get-WdTaskSnapshot {
 }
 
 function Test-WdCredTaskConfig {
-    # 任务配置核验（B3 之后：核对**完整配置**，不再只比 revision / point_count）：
-    #   ① revision 与 point_count（原有）
+    # 任务配置核验（B3 之后：核对**完整配置**；BLOCKED-01 之后：点数取自**实时任务快照**）：
+    #   ① revision 与**当前任务点数**（点数 = 实时快照 tasks[].binding.config.points[] 总数）
     #   ② 连接配置 host / port / TSAP(local_tsap + remote_tsap) / PDU(pdu_length)
     #   ③ 获批点位的**完整 Key 与参数**（tasks[].binding.config.points[]，逐点比对，不只数量）
     #   ④ 任务配置**指纹**（规范化 tasks 数组的 SHA-256）与批准版本一致
@@ -1295,22 +1375,31 @@ function Test-WdCredTaskConfig {
     #      且在**解析文件之前**对**原始字节**计算 —— 指纹不覆盖 connection，只有文件摘要能挡住
     #      "connection 被改而指纹不变"的篡改。
     # 任一项读不到 ⇒ unverified；读到但不一致 ⇒ invalid。两者都不得进入 FIRED（不发 Start）。
+    #
+    # BLOCKED-01（最小修复，只改配置门语义）：`diagnostics.point_count` **不再**参与判定。
+    #   它的来源是持久化 point_registry 行数（core-api:1499 → config-store:2459-2473；唯一写点
+    #   assign_point_ids config-store:2344-2456，由 run_config_flow:943-945 在 ConfigureTasks
+    #   之后写入），因此 FIRED 前读到的是"上次走完 ConfigureTasks 的那次 Start"的**残留行数**，
+    #   与当前任务配置无关。它现在只作为**独立的运行状态观测值**记入证据
+    #   （actual.diagnostics_point_count / summary.task_config_observation），不参与配置门判定。
     param($Ctx, [string]$ExpectedEndpoint, [string]$ExpectedRevision, [int]$ExpectedPoints,
         [string]$ApprovedPath, [string]$ExpectedFingerprint, [string]$ExpectedApprovedSha256 = '')
     $expected = [ordered]@{
         endpoint_id                = $ExpectedEndpoint
         revision                   = $ExpectedRevision
-        point_count                = $ExpectedPoints
+        # 语义：**获批任务配置的点数**（与实时任务快照比对），不是 diagnostics.point_count。
+        task_point_count           = $ExpectedPoints
         approved_task_config       = $ApprovedPath
         tasks_fingerprint          = $ExpectedFingerprint
         approved_config_sha256     = $ExpectedApprovedSha256
+        diagnostics_point_count_role = 'observed-only：运行状态残留值（持久化 point_registry 行数），非当前任务点数，不参与配置门判定'
     }
     # ── 输入完整性：缺任一项都不得放行（B3 的期望值不是"可选项"）──────────────────
     if ([string]::IsNullOrWhiteSpace($ExpectedRevision)) {
         return (New-WdCredItem 'task_config' 'missing' '未提供 -ExpectedTaskRevision（期望的任务 revision）' $expected $null)
     }
     if ($ExpectedPoints -lt 0) {
-        return (New-WdCredItem 'task_config' 'missing' '未提供 -ExpectedPointCount（期望的点位数量）' $expected $null)
+        return (New-WdCredItem 'task_config' 'missing' '未提供 -ExpectedPointCount（获批任务配置的点数，与实时任务快照比对）' $expected $null)
     }
     if ([string]::IsNullOrWhiteSpace($ApprovedPath)) {
         return (New-WdCredItem 'task_config' 'missing' '未提供 -ApprovedTaskConfig（获批任务配置：连接配置 + 完整点位 Key/参数）——只比 revision/点数不足以证明与获批配置一致' $expected $null)
@@ -1342,23 +1431,30 @@ function Test-WdCredTaskConfig {
     }
 
     # ── ② 网络：三条**配置面**只读 GET ───────────────────────────────────────────
-    # diagnostics（endpoint_id + point_count）、tasks（revision + 完整点位/参数）、
-    # endpoints/{id}（connection：host/port/TSAP/PDU —— B3 必需；Core 只在这条路径暴露连接配置）。
+    # tasks（revision + 完整点位/参数 + **当前任务点数**）、endpoints/{id}（connection：host/port/
+    # TSAP/PDU —— B3 必需；Core 只在这条路径暴露连接配置）、diagnostics（endpoint_id 观测；
+    # 其 point_count 仅作运行状态观测记录，不参与判定）。
     $base = $Ctx.baseUrl
     $diagUri = "$base/api/v1/endpoints/$ExpectedEndpoint/diagnostics"
     $epUri = "$base/api/v1/endpoints/$ExpectedEndpoint"
     $actual = [ordered]@{
-        endpoint_id          = $null
-        revision             = $null
-        point_count          = $null
-        connection           = $null
-        tasks_fingerprint    = $null
-        approved_fingerprint = $approvedFp
-        approved_file        = $approvedIntegrity
-        point_keys           = [ordered]@{}
-        tasks_source         = ''
-        tasks_payload        = $null
-        http                 = [ordered]@{}
+        endpoint_id             = $null
+        revision                = $null
+        # 当前任务点数：**配置门判据**，来自实时任务快照 tasks[].binding.config.points[]。
+        task_point_count        = $null
+        task_count              = $null
+        task_points_arrays      = $null
+        # diagnostics.point_count：**只作运行状态观测**（持久化 point_registry 残留行数），
+        # 不参与配置门判定 —— 见函数头 BLOCKED-01 说明。
+        diagnostics_point_count = $null
+        connection              = $null
+        tasks_fingerprint       = $null
+        approved_fingerprint    = $approvedFp
+        approved_file           = $approvedIntegrity
+        point_keys              = [ordered]@{}
+        tasks_source            = ''
+        tasks_payload           = $null
+        http                    = [ordered]@{}
     }
     $script:credNetworkActions = 0
     try {
@@ -1366,17 +1462,18 @@ function Test-WdCredTaskConfig {
         $r1 = Invoke-WebRequest -Uri $diagUri -Method Get -TimeoutSec ([int]$Ctx.observeTimeoutSec) -SkipHttpErrorCheck -ErrorAction Stop
         $actual.http['diagnostics'] = [int]$r1.StatusCode
         if ([int]$r1.StatusCode -ne 200) {
-            return (New-WdCredItem 'task_config' 'unverified' "diagnostics 读不到（GET $diagUri → HTTP $($r1.StatusCode)），无法核验任务配置（按未通过处理）" $expected $actual)
+            return (New-WdCredItem 'task_config' 'unverified' "diagnostics 读不到（GET $diagUri → HTTP $($r1.StatusCode)），无法核对端点身份（按未通过处理）" $expected $actual)
         }
         $o1 = [string]$r1.Content | ConvertFrom-Json
         if ($o1.PSObject.Properties['endpoint_id']) { $actual.endpoint_id = [string]$o1.endpoint_id }
-        if ($null -ne $o1.point_count) { $actual.point_count = [int]$o1.point_count }
+        # 只记录，不判定（BLOCKED-01）：这是"上次走完 ConfigureTasks 的那次 Start"的残留行数。
+        if ($null -ne $o1.point_count) { $actual.diagnostics_point_count = [int]$o1.point_count }
 
         $snap = Get-WdTaskSnapshot -Ctx $Ctx -Endpoint $ExpectedEndpoint
         $actual.http['tasks'] = [int]$snap.status
         $actual.tasks_source = [string]$snap.source
         if ([int]$snap.status -ne 200) {
-            return (New-WdCredItem 'task_config' 'unverified' ("任务快照读不到（GET {0} → HTTP {1}），无法核验 revision / 点位 / 指纹（按未通过处理）" -f $snap.uri, $snap.status) $expected $actual)
+            return (New-WdCredItem 'task_config' 'unverified' ("任务快照读不到（GET {0} → HTTP {1}），无法核验 revision / 当前任务点数 / 点位 / 指纹（按未通过处理）" -f $snap.uri, $snap.status) $expected $actual)
         }
         if ($null -ne $snap.revision) { $actual.revision = [string]$snap.revision }
         if ($null -ne $snap.tasks) {
@@ -1384,6 +1481,13 @@ function Test-WdCredTaskConfig {
             $actual.tasks_fingerprint = $fp.fingerprint
             $actual.tasks_payload = $fp.payload
             $actual.point_keys = Get-WdPointKeyMap -Tasks $snap.tasks
+        }
+        # 当前任务点数（判据）：必须来自**实时快照**，读不到就保持 $null ⇒ 后面判 unverified。
+        $livePoints = Get-WdTaskPointCount -Tasks $snap.tasks
+        if ($livePoints.ok) {
+            $actual.task_point_count = [int]$livePoints.count
+            $actual.task_count = [int]$livePoints.tasks
+            $actual.task_points_arrays = [int]$livePoints.points_arrays
         }
 
         $script:credNetworkActions++
@@ -1404,8 +1508,14 @@ function Test-WdCredTaskConfig {
     elseif ($actual.endpoint_id -ne $ExpectedEndpoint) { $problems += "endpoint id 不一致（期望 $ExpectedEndpoint，实际 $($actual.endpoint_id)）" }
     if ($null -eq $actual.revision) { $problems += '任务 revision 读不到' }
     elseif ($actual.revision -ne [string]$ExpectedRevision) { $problems += "任务 revision 不一致（期望 $ExpectedRevision，实际 $($actual.revision)）" }
-    if ($null -eq $actual.point_count) { $problems += 'point_count 读不到' }
-    elseif ($actual.point_count -ne $ExpectedPoints) { $problems += "point_count 不一致（期望 $ExpectedPoints，实际 $($actual.point_count)）" }
+    # ② 当前任务点数（**配置门判据**）：实时任务快照 tasks[].binding.config.points[] 的总数。
+    #    与 -ExpectedPointCount（获批任务配置的点数）比对。
+    #    为什么不是 diagnostics.point_count：见函数头 BLOCKED-01 —— 那是 point_registry 的残留行数，
+    #    与当前任务配置无关；拿它判定会把"历史残留"误判成"当前配置"。
+    if ($null -eq $actual.task_point_count) { $problems += '当前任务点数读不到（任务快照里没有 tasks[].binding.config.points[]）' }
+    elseif ([int]$actual.task_point_count -ne $ExpectedPoints) {
+        $problems += "当前任务点数不一致（期望 $ExpectedPoints，实际 $($actual.task_point_count)；取自实时任务快照 tasks[].binding.config.points[]，非 diagnostics.point_count）"
+    }
     # 获批文件自身也必须自洽（防止拿错端点/版本的批准文件）
     if ($approved.endpoint_id -and $approved.endpoint_id -ne $ExpectedEndpoint) {
         $problems += "获批配置的 endpoint_id 不一致（期望 $ExpectedEndpoint，获批文件 $($approved.endpoint_id)）"
@@ -1447,10 +1557,10 @@ function Test-WdCredTaskConfig {
         $state = if ($unreadable.Count -gt 0) { 'unverified' } else { 'invalid' }
         return (New-WdCredItem 'task_config' $state ("任务配置核验不通过（完整配置核对）：" + ($problems -join '；')) $expected $actual)
     }
-    $okDetail = ("完整任务配置一致：endpoint={0}；revision={1}；point_count={2}；点位 {3} 个（Key 与参数逐点一致）；连接 {4}:{5} TSAP={6}/{7} PDU={8}；指纹 {9}" -f `
-            $ExpectedEndpoint, $actual.revision, $actual.point_count, $expPoints.Count,
+    $okDetail = ("完整任务配置一致：endpoint={0}；revision={1}；当前任务点数={2}（取自实时任务快照 tasks[].binding.config.points[]，共 {3} 个 task）；点位 {4} 个（Key 与参数逐点一致）；连接 {5}:{6} TSAP={7}/{8} PDU={9}；指纹 {10}；diagnostics_point_count={11}（**运行状态观测值**：持久化 point_registry 残留行数，非当前任务点数，不参与本判定）" -f `
+            $ExpectedEndpoint, $actual.revision, $actual.task_point_count, $actual.task_count, $expPoints.Count,
         $connCmp.actual.host, $connCmp.actual.port, $connCmp.actual.local_tsap, $connCmp.actual.remote_tsap,
-        $connCmp.actual.pdu_length, $actual.tasks_fingerprint)
+        $connCmp.actual.pdu_length, $actual.tasks_fingerprint, $(if ($null -eq $actual.diagnostics_point_count) { '（读不到）' } else { [string]$actual.diagnostics_point_count }))
     return (New-WdCredItem 'task_config' 'verified' $okDetail $expected $actual)
 }
 
@@ -1494,7 +1604,7 @@ function Test-WdCredentials {
         $items['approved_task_config_integrity'] = New-WdCredItem 'approved_task_config_integrity' $fileIntegrity.state $fileIntegrity.detail `
         ([ordered]@{ path = $ApprovedTaskConfig; expected = $ExpectedApprovedTaskConfigSha256 }) ([ordered]@{ file = $fileIntegrity }) `
         $(if ($fileIntegrity.state -eq 'verified') { '' } else { 'REFUSED_TASKCONFIG_INTEGRITY' })
-        $items['task_config'] = New-WdCredItem 'task_config' 'not_checked' '静态校验阶段未做任务配置核验（需先通过授权边界后才发起只读 GET；获批配置**文件自身**的摘要已在 approved_task_config_integrity 里核对）' ([ordered]@{ endpoint_id = $EndpointId; revision = $ExpectedTaskRevision; point_count = $ExpectedPointCount; approved_task_config = $ApprovedTaskConfig; tasks_fingerprint = $ExpectedTaskFingerprint; approved_config_sha256 = $ExpectedApprovedTaskConfigSha256 }) $null
+        $items['task_config'] = New-WdCredItem 'task_config' 'not_checked' '静态校验阶段未做任务配置核验（需先通过授权边界后才发起只读 GET；获批配置**文件自身**的摘要已在 approved_task_config_integrity 里核对）' ([ordered]@{ endpoint_id = $EndpointId; revision = $ExpectedTaskRevision; task_point_count = $ExpectedPointCount; approved_task_config = $ApprovedTaskConfig; tasks_fingerprint = $ExpectedTaskFingerprint; approved_config_sha256 = $ExpectedApprovedTaskConfigSha256 }) $null
     }
     # not_checked 是"静态阶段还没做"的占位（任务配置核验需要只读 GET），不算失败项。
     $failing = @($items.Keys | Where-Object { $items[$_].state -notin @('verified', 'not_checked') })
@@ -1627,6 +1737,11 @@ if ($Mode -eq 'arm') {
     elseif ($creds.overall -ne 'verified') { $armExit = 1; $armLabel = 'ARMED_INPUTS_MISSING' }
     else { $armExit = 0; $armLabel = 'ARMED_READY' }
 
+    # BLOCKED-01：配置门的**判据**（实时任务快照算出的当前任务点数）与**运行状态观测值**
+    # （diagnostics.point_count）必须在证据里分开呈现，避免把残留观测值当成配置结论。
+    $armTaskItem = $creds.items['task_config']
+    $armTaskActual = Get-WdProp $armTaskItem 'actual'
+
     $armReport = [ordered]@{
         mode                 = 'arm'
         pid                  = $PID
@@ -1637,6 +1752,15 @@ if ($Mode -eq 'arm') {
         endpoint_id          = $EndpointId
         offline_boundary     = $boundary
         credentials          = $creds
+        # BLOCKED-01：配置门判据 = 实时任务快照点数；diagnostics.point_count 仅为运行状态观测。
+        task_config_observation = [ordered]@{
+            expected_task_point_count        = $ExpectedPointCount
+            task_point_count_live            = (Get-WdProp $armTaskActual 'task_point_count')
+            task_count_live                  = (Get-WdProp $armTaskActual 'task_count')
+            diagnostics_point_count_observed = (Get-WdProp $armTaskActual 'diagnostics_point_count')
+            diagnostics_point_count_role     = 'observed-only：运行状态残留值（持久化 point_registry 行数，core-api:1499 ← config-store:2459-2473），非当前任务点数，不参与配置门判定'
+            task_config_state                = (Get-WdProp $armTaskItem 'state')
+        }
         endpoint_probe       = $probe
         selftest             = $selfTestRec
         arm                  = [ordered]@{
@@ -1688,7 +1812,7 @@ if ($Mode -eq 'arm') {
 #   ① 静态凭证（不建连接）：授权开关/授权人/凭证号/G6 格式/G7 与二进制或受信清单指纹比对
 #      （G1：清单**自身**也要与签署包批准值比对）/获批配置文件**自身**摘要（G2）；
 #   ② 授权边界：静态凭证通过 ⇒ 放行任意 host（含生产 mesad 8132 与现场地址）；
-#   ③ 任务配置核验（只读 GET）：endpoint 存在性 / 任务 revision / point_count / 连接 / 点位 / 指纹。
+#   ③ 任务配置核验（只读 GET）：endpoint 存在性 / 任务 revision / 当前任务点数（实时任务快照） / 连接 / 点位 / 指纹。
 $creds = Test-WdCredentials -CheckNetwork:$false
 Add-WdLog $ctx 'INFO' ("fire 静态凭证校验：overall={0}；未通过={1}" -f $creds.overall, $(if ($creds.failing.Count -gt 0) { $creds.failing -join ',' } else { '（无）' }))
 if ($creds.overall -ne 'verified') {
@@ -2282,7 +2406,8 @@ $stamp = [ordered]@{
         g7_binary_path    = $G7BinaryPath
         expected_manifest_sha256 = $ExpectedManifestSha256
         expected_revision = $ExpectedTaskRevision
-        expected_points   = $ExpectedPointCount
+        # 语义：获批任务配置的点数（BLOCKED-01 起；不是 diagnostics.point_count）。
+        expected_task_point_count = $ExpectedPointCount
         approved_task_config = $ApprovedTaskConfig
         expected_tasks_fingerprint = $ExpectedTaskFingerprint
         expected_approved_task_config_sha256 = $ExpectedApprovedTaskConfigSha256
@@ -2872,6 +2997,11 @@ else { 'NO_GO_ANOMALY' }
 #endregion
 
 #region ── 汇总输出与落盘 ─────────────────────────────────────────────────────────
+# BLOCKED-01：配置门判据（实时任务快照点数）与运行状态观测值（diagnostics.point_count）分开记录。
+# 这里取值只读不写，缺失一律 $null（静态阶段未做网络核验时 actual 为空）。
+$taskCredItem = $creds.items['task_config']
+$taskConfigActual = Get-WdProp $taskCredItem 'actual'
+
 $summary = [ordered]@{
     tag                  = $Tag
     mode                 = $Mode
@@ -2896,7 +3026,8 @@ $summary = [ordered]@{
         g7_binary_path    = $G7BinaryPath
         expected_manifest_sha256 = $ExpectedManifestSha256
         expected_revision = $ExpectedTaskRevision
-        expected_points   = $ExpectedPointCount
+        # 语义：获批任务配置的点数（BLOCKED-01 起；不是 diagnostics.point_count）。
+        expected_task_point_count = $ExpectedPointCount
         approved_task_config = $ApprovedTaskConfig
         expected_tasks_fingerprint = $ExpectedTaskFingerprint
         expected_approved_task_config_sha256 = $ExpectedApprovedTaskConfigSha256
@@ -2905,6 +3036,20 @@ $summary = [ordered]@{
         items             = $creds.items
     }
     boundary             = $boundary
+    # ── BLOCKED-01：配置门判据 vs 运行状态观测值（两者语义不同，不得互相顶替）──────────
+    #   task_point_count_live            = 实时任务快照 tasks[].binding.config.points[] 总数（**判据**）
+    #   diagnostics_point_count_observed = diagnostics.point_count（**只作观测**）：来自持久化
+    #     point_registry 行数（core-api:1499 → config-store:2459-2473），唯一写点 assign_point_ids
+    #     （config-store:2344-2456，由 run_config_flow:943-945 在 ConfigureTasks 之后写），
+    #     因此是"上次走完 ConfigureTasks 的那次 Start"的残留值，与当前任务配置无关。
+    task_config_observation = [ordered]@{
+        expected_task_point_count        = $ExpectedPointCount
+        task_point_count_live            = (Get-WdProp $taskConfigActual 'task_point_count')
+        task_count_live                  = (Get-WdProp $taskConfigActual 'task_count')
+        diagnostics_point_count_observed = (Get-WdProp $taskConfigActual 'diagnostics_point_count')
+        diagnostics_point_count_role     = 'observed-only：运行状态残留值（持久化 point_registry 行数，core-api:1499 ← config-store:2459-2473），非当前任务点数，不参与配置门判定'
+        task_config_state                = (Get-WdProp $taskCredItem 'state')
+    }
     t0                   = [ordered]@{
         local            = $t0Dto.ToString('o')
         unix_ns          = $t0UnixNs
