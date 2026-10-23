@@ -599,7 +599,7 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode arm `
   -G6Signoff <预授权签署编号> -G6SignedAt <ISO8601> `
   -ExpectedTaskRevision <签署值> -ExpectedPointCount <签署值> -ApprovedTaskConfig <签署包路径> `
   -ExpectedTaskFingerprint sha256:<签署值> -ExpectedApprovedTaskConfigSha256 sha256:<签署值> `
-  -G7DeployVersion <sha256:... | manifest:<path>> -G7BinaryPath <部署二进制路径> `
+  -G7DeployVersion manifest:<获批清单路径> -G7BinaryPath <部署二进制路径> `
   -ExpectedManifestSha256 sha256:<签署值>
 # ↑ 阶段 A 必须显式给 -G7BinaryPath：不给时脚本按默认顺序查找 target/release|debug 下的 mesad，
 #   可能核验本地构建产物而非签署包批准的部署二进制。阶段 A 与阶段 B 必须用**同一路径 + 同一摘要**。
@@ -609,13 +609,23 @@ pwsh -NoProfile -File scripts/stop-watchdog.ps1 -Mode fire `
   -BaseUrl http://127.0.0.1:8132 -EndpointId <endpoint-id> -OutDir <本轮证据目录> `
   -Authorized -AuthorizedBy <姓名> -AuthzTicket <编号> `
   -G6Signoff <签署编号> -G6SignedAt <ISO8601> `
-  -G7DeployVersion <sha256:... | manifest:<path>> -G7BinaryPath <部署二进制路径> `
+  -G7DeployVersion manifest:<获批清单路径> -G7BinaryPath <部署二进制路径> `
   -ExpectedManifestSha256 sha256:<签署值> `
   -ExpectedTaskRevision <签署值> -ExpectedPointCount <签署值> `
   -ApprovedTaskConfig <签署包路径> -ExpectedTaskFingerprint sha256:<签署值> `
   -ExpectedApprovedTaskConfigSha256 sha256:<签署值>
 ```
 
+> **现场统一使用 `manifest:` 凭证形式（互斥说明）**：脚本的两种形式是**互斥**的 —— `-G7DeployVersion sha256:<hex>` 与 `-ExpectedManifestSha256` **同时给出会被拒绝**（§3.3-4 契约）。因此本骨架**只保留 `manifest:` 形式**。现场签署执行时，阶段 A 与阶段 B 必须保持以下**四项完全一致**：
+>
+> | 项 | 值来源 |
+> |---|---|
+> | `-G7BinaryPath` | 部署二进制实际路径（§3.1-2） |
+> | 二进制 SHA-256 | §4-③（清单内该文件的摘要须与之相等） |
+> | 获批清单路径 | §4-② 对应的那一份文件 |
+> | 清单 SHA-256 | §4-②（`-ExpectedManifestSha256`） |
+>
+> 这样"四个摘要"才与实际门禁核验一一对应，而不是仅在文档里列出。
 > 骨架**不是**可直接执行的命令：所有 `<...>` 必须由 §2–§4 的签署值填入，且**已确认 PR #136 已合入 main（merge `f5f9f56a35a8d3c457a139f8904fcbaf4372e119`）**（`BLOCKED-01` 已由 B-1 关闭）。**不得**携带 `-TestHostProbeError` / `-TestAbortFlow` / `-SkipHostChecks`（`watchdog:654-702`、`:1731-1733`）。
 
 ## 附录 C：填写完整性自检（提交签署前逐项打勾）
