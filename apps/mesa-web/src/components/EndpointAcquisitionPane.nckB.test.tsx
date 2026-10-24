@@ -213,7 +213,8 @@ function nckTask(id: string, points: NckPointSelection[]): AcquisitionTaskShape 
 }
 
 function saveButton(): HTMLButtonElement {
-  return screen.getByRole("button", { name: /保存并启动/ }) as HTMLButtonElement;
+  // P0-2：已停止时按钮文案是「保存配置」（不会再承诺启动采集）。
+  return screen.getByRole("button", { name: /保存配置/ }) as HTMLButtonElement;
 }
 
 function rowOf(pointKey: string): HTMLElement {
@@ -254,7 +255,7 @@ describe("门禁 1/3：目录分页完整读取，仅 collect 进入采集界面
     render(<EndpointAcquisitionPane endpointId={EP} driverId={NCK_DRIVER} onChanged={() => {}} />);
 
     const summary = await screen.findByTestId("nck-collectable-summary");
-    expect(summary.textContent).toContain("2 / 3");
+    expect(summary.textContent).toContain("2 个可配置变量");
     expect(screen.getByTestId("nck-catalog-meta").textContent).toContain("3 条 / 2 页");
     // 两页都读了：cursor 逐字回传。
     expect(state.catalogCalls).toHaveLength(2);
@@ -668,7 +669,8 @@ describe("PR-C 第三批：Endpoint 页 native 存量点位复核（A24–A27）
         }}
       />,
     );
-    await screen.findByText(/高级原生（不适用目录 scope）/);
+    // P1-2：状态标签只声明“配置格式校验通过”，不得暗示真实机床已读取成功。
+    await screen.findByText("配置格式校验通过（原生）");
     await waitFor(() => expect(saveButton().disabled).toBe(false));
     await user.click(saveButton());
     await screen.findByText(/未检测到实际修改/);

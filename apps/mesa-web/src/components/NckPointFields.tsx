@@ -113,6 +113,8 @@ export function NckPointFields({
       ? initialPoint.parameters.variable_id
       : "";
   const [selectedId, setSelectedId] = useState(initialVariableId);
+  // P1-1：36 个变量只用一个搜索框过滤（不新建分类体系）。支持中文名称与 ID。
+  const [query, setQuery] = useState("");
   const definition = useMemo(
     () => definitions.find((d) => d.variable_id === selectedId) ?? null,
     [definitions, selectedId],
@@ -123,6 +125,31 @@ export function NckPointFields({
     () => collectableDefinitions(definitions),
     [definitions],
   );
+  const filteredDefinitions = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return selectableDefinitions;
+    return selectableDefinitions.filter((item) => {
+      const variableId = String(item.variable_id ?? "").toLowerCase();
+      const label = nckDefinitionLabel(item).toLowerCase();
+      const en =
+        item.label && typeof item.label === "object"
+          ? String(item.label.en ?? "").toLowerCase()
+          : "";
+      return variableId.includes(needle) || label.includes(needle) || en.includes(needle);
+    });
+  }, [selectableDefinitions, query]);
+  // 已选变量必须始终留在下拉里：搜索词把它过滤掉时补回首项，避免
+  // `<select value>` 找不到匹配项而视觉上变成“未选择”（状态其实还在）。
+  const visibleDefinitions = useMemo(() => {
+    if (!selectedId) return filteredDefinitions;
+    if (filteredDefinitions.some((item) => String(item.variable_id) === selectedId)) {
+      return filteredDefinitions;
+    }
+    const selected = selectableDefinitions.find(
+      (item) => String(item.variable_id) === selectedId,
+    );
+    return selected ? [selected, ...filteredDefinitions] : filteredDefinitions;
+  }, [filteredDefinitions, selectedId, selectableDefinitions]);
   const initialModel = useMemo(
     () =>
       buildNckFormModel(
@@ -276,6 +303,10 @@ export function NckPointFields({
     validation.ok &&
     !!currentKey &&
     !keyTaken;
+  const hasSelection = selectedId.trim() !== "";
+  // P0-1：未选择变量 ≠ 定义异常。前者只提示「请选择可采集变量」，后者（已选
+  // 但目录里找不到定义）仍必须报错并保持不可提交——真正的异常不得被吞掉。
+  const definitionMissing = hasSelection && !definition;
 
   const handleSelect = (value: string) => {
     setSelectedId(value);
@@ -328,7 +359,9 @@ export function NckPointFields({
     });
   };
 
-  const issues = validation.issues;
+  // P0-1：未选择变量时 `validateNckForm(null, …)` 会产出 FORM_MODEL_INVALID，
+  // 但那是“还没选”而不是“定义坏了”。只有真正选中定义后才展示输入校验问题。
+  const issues = definition ? validation.issues : [];
 
   const modeSwitch = nativeSchema ? (
     <div style={{ display: "flex", gap: 8, alignItems: "center" }} data-testid="nck-editor-mode">
@@ -339,6 +372,7 @@ export function NckPointFields({
       >
         语义点位
       </Button>
+      <span style={{ fontSize: 11, color: "#8c8c8c" }}>推荐日常使用</span>
       <Button
         size="small"
         type={editorMode === "native" ? "primary" : "default"}
@@ -379,6 +413,15 @@ export function NckPointFields({
       {modeSwitch}
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <span style={{ fontSize: 12 }}>变量</span>
+        <Input
+          data-testid="nck-variable-search"
+          aria-label="搜索变量"
+          placeholder="搜索变量名称或 ID"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          allowClear
+          style={{ width: 260 }}
+        />
         <select
           data-testid="nck-variable-select"
           value={selectedId}
@@ -386,12 +429,19 @@ export function NckPointFields({
           style={{ minWidth: 320, padding: "4px 6px" }}
         >
           <option value="">请选择可采集变量</option>
-          {selectableDefinitions.map((d) => (
+          {visibleDefinitions.map((d) => (
             <option key={String(d.variable_id)} value={String(d.variable_id)}>
               {nckDefinitionLabel(d) || String(d.variable_id)}（{String(d.variable_id)}）
             </option>
           ))}
         </select>
+        {query.trim() ? (
+          <span data-testid="nck-variable-search-count" style={{ fontSize: 12, color: "#525252" }}>
+            {filteredDefinitions.length
+              ? `匹配 ${filteredDefinitions.length} 个变量`
+              : "没有匹配的变量（可改用变量 ID 搜索）"}
+          </span>
+        ) : null}
         {definition ? (
           <Space size={4}>
             <Tag>{String(definition.scope ?? "scope 缺失")}</Tag>
@@ -400,6 +450,25 @@ export function NckPointFields({
           </Space>
         ) : null}
       </div>
+
+      <div data-testid="nck-form-steps" style={{ fontSize: 11, color: "#8c8c8c" }}>
+        选择变量 → 填写必要参数 → 自动校验 → 加入点位
+      </div>
+
+      {!hasSelection ? (
+        <div data-testid="nck-select-hint" style={{ fontSize: 12, color: "#525252" }}>
+          请选择可采集变量后填写 Target / Arguments。
+        </div>
+      ) : null}
+
+      {definitionMissing ? (
+        <Alert
+          type="error"
+          data-testid="nck-definition-missing"
+          message="定义缺失：无法生成 Target/Arguments 表单"
+          description={`已选择变量 "${selectedId}"，但当前目录中找不到它的定义（可能已被移除，或不在可采集范围内）。真正的定义异常仍会拦截保存；请重新选择变量，若整个目录加载失败请先恢复目录。`}
+        />
+      ) : null}
 
       {definition ? (
         <div style={{ fontSize: 11, color: "#525252" }} data-testid="nck-definition-meta">
@@ -591,6 +660,8 @@ export function NckPointFields({
         />
       ) : null}
 
+      {/* 未选择变量时：提交按钮保持禁用、身份区只显示占位，但**不展示任何
+          校验错误**（P0-1）；真正的定义异常仍由上方 definition-missing 拦截。 */}
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <span style={{ fontSize: 12 }}>point_key</span>
         {currentKey ? (

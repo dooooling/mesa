@@ -10,7 +10,8 @@
 //   重新核验定义、参数与**服务端重算的 Key**，核验失败只能查看原始配置或
 //   显式移除，不能继续保存。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Button, InputNumber, Space, Tag, message } from "antd";
+import { Alert, Button, InputNumber, Tag, Tooltip, message } from "antd";
+import { QuestionCircleOutlined } from "@ant-design/icons";
 import { api } from "../api";
 import type { DriverDescriptor, ValidationIssue } from "../types";
 import {
@@ -54,7 +55,8 @@ import {
   validateNativePoint,
 } from "../nckNativeModel";
 import { applySelectionAdd } from "../resourceSelectionModel";
-import { ApplyWithRestart } from "./ApplyWithRestart";
+import { nckPointDisplay } from "../nckPointDisplay";
+import { ApplyWithRestart, type ApplyResult } from "./ApplyWithRestart";
 import { NckPointFields } from "./NckPointFields";
 import { ResourceBrowseAntd } from "./ResourceBrowseAntd";
 import { ResourcePickerAntd } from "./ResourcePickerAntd";
@@ -133,6 +135,11 @@ export function EndpointAcquisitionPane({
   const [running, setRunning] = useState(false);
   const [intervalMs, setIntervalMs] = useState(1000);
   const [saving, setSaving] = useState(false);
+  // P0-2：运行中是否在应用后恢复运行。提升到父层是为了让底部执行说明与
+  // 状态区能显示**真实**路径（勾选状态不再只活在 ApplyWithRestart 内部）。
+  const [restart, setRestart] = useState(true);
+  // 上一次保存的真实落点（由 LifecycleOutcome 映射；不猜、不提前宣告成功）。
+  const [lastApply, setLastApply] = useState<ApplyResult | null>(null);
   // 任务快照门（P0 fail-closed，与 DeviceDetail 点位 Modal 同门）：
   // 只有 ready + 归属当前 Endpoint 才允许 PUT；loading/error 一律禁用保存，
   // 绝不能把 [] 当作“服务端没有任务”去覆盖 task-a/b/c。
@@ -395,6 +402,8 @@ export function EndpointAcquisitionPane({
     setExistingTasks([]);
     setPreservedTasks([]);
     setIntervalMs(1000);
+    setRestart(true);
+    setLastApply(null);
     setDesc(null);
     setTasksLoadState("loading");
     setTasksLoadedEpId(null);
@@ -516,6 +525,15 @@ export function EndpointAcquisitionPane({
       cancelled = true;
     };
   }, [nck, definitions, nckPoints, verifyPoints]);
+
+  // 编辑一变，上一次的「已保存」结论立即失效：否则用户改完参数仍看到
+  // “配置已保存，当前停止”，会把旧结论误当成新配置的结论。
+  const editSignature = `${intervalMs}|${nckPoints.map((p) => p.point_key).join(",")}|${sels
+    .map((s) => s.resource_id)
+    .join(",")}`;
+  useEffect(() => {
+    setLastApply(null);
+  }, [editSignature]);
 
   /** 所有已占用 key：保留任务 + 当前点位（编辑时排除被编辑项自身）。 */
   const takenPointKeys = (skipIndex: number | null): string[] => {
@@ -741,24 +759,57 @@ export function EndpointAcquisitionPane({
         },
       });
       if (outcome.kind === "applied-restarted") {
-        message.success(kept("，正在启动…"));
+        // P0-2：完成态必须明确写出实际落点，而不是让用户从「正在启动…」猜。
+        setLastApply("restarted");
+        setRunning(true);
+        message.success("配置已保存，采集已启动");
         onChanged();
       } else if (outcome.kind === "applied-stopped") {
-        message.success(running && !restart ? kept("，Endpoint 保持停止") : kept(""));
+        setLastApply("stopped");
+        // 状态区/下一次按钮必须反映“保存后确实停止了”，不能沿用保存前的运行态。
+        setRunning(false);
+        message.success(
+          running && !restart ? kept("，Endpoint 保持停止") : kept("，当前停止"),
+        );
         onChanged();
       } else if (outcome.kind === "stop-failed") {
+        setLastApply(null);
         message.error(`停止失败，已中止应用，未修改点位：${outcome.message}`);
       } else if (outcome.kind === "apply-failed-stopped") {
+        setLastApply(null);
+        setRunning(false);
         message.error(`应用失败，Endpoint 当前已停止：${outcome.message}`);
         onChanged();
       } else {
-        message.warning(`配置已保存，但恢复运行失败：${outcome.message}`);
+        setLastApply("restart-failed");
+        setRunning(false);
+        message.warning(`配置已保存，但采集启动失败：${outcome.message}`);
         onChanged();
       }
     } finally {
       setSaving(false);
     }
   };
+
+  // P0-2：完成态文案只描述**已经发生**的事；未保存时只描述“保存后会怎样”，
+  // 且与按钮/复选框的实际分支一一对应（不写死 Stop → PUT → Start）。
+  const afterSaveText =
+    lastApply === "restarted"
+      ? "配置已保存，采集已启动"
+      : lastApply === "stopped"
+        ? "配置已保存，当前停止"
+        : lastApply === "restart-failed"
+          ? "配置已保存，但采集启动失败"
+          : !running
+            ? "保存后保持停止"
+            : restart
+              ? "停止 → 写入配置 → 启动"
+              : "停止 → 写入配置，保存后保持停止";
+  const executionNote = !running
+    ? `保存将直接写入配置（PUT /tasks/${endpointId}），不会启动采集；Endpoint 保持停止。`
+    : restart
+      ? `保存将执行：停止 → 写入配置（PUT /tasks/${endpointId}）→ 启动。`
+      : `保存将执行：停止 → 写入配置（PUT /tasks/${endpointId}），保存后保持停止。`;
 
   const descOk = nck || !!desc;
   if (!descOk && tasksLoadState === "loading") return <div style={{ color: "#525252" }}>加载资源…</div>;
@@ -779,10 +830,62 @@ export function EndpointAcquisitionPane({
         <Alert type="error" message="资源描述加载失败" description="描述缺失时选型无合法依据，已禁用保存（不会覆盖已有任务）。请切换后重试。" />
       ) : (
       <>
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <span style={{ fontSize: 12 }}>采集周期</span>
         <InputNumber min={10} max={60000} step={10} value={intervalMs} onChange={(v) => setIntervalMs(v ?? 1000)} addonAfter="ms" style={{ width: 180 }} />
-        <span style={{ fontSize: 12, color: "#525252" }}>10ms–60s，20ms已通过50K/s压测</span>
+        <span style={{ fontSize: 12, color: "#525252" }}>10ms–60s（配置值）</span>
+        {/*
+          P2-1：压测数字只能出现在帮助提示里，且必须同时声明“软件压测 ≠ 机床能力”。
+          把 20ms / 50K/s 直接摆在输入框旁，用户会把它读成“这台机床能 20ms 采”。
+        */}
+        <Tooltip
+          title={
+            <span>
+              20ms 是软件压力测试中达到 50K/s 的条件；软件压力测试结果不代表真实机床的可用采集周期。
+              实际采集表现以运行结果为准。
+            </span>
+          }
+        >
+          <QuestionCircleOutlined
+            aria-label="采集周期说明"
+            data-testid="interval-help"
+            style={{ color: "#8c8c8c", cursor: "help" }}
+          />
+        </Tooltip>
+      </div>
+      <div style={{ fontSize: 11, color: "#8c8c8c" }} data-testid="interval-note">
+        周期为配置值，实际采集表现以运行结果为准。
+      </div>
+
+      {/* P2-2：复用现有 Endpoint 状态与点位数据，不新增后端接口。 */}
+      <div
+        data-testid="acquisition-status"
+        style={{
+          display: "flex",
+          gap: 16,
+          flexWrap: "wrap",
+          fontSize: 12,
+          color: "#525252",
+          border: "1px solid #e0e0e0",
+          padding: "6px 8px",
+        }}
+      >
+        <span>
+          采集状态：
+          <b data-testid="acquisition-status-state">{running ? "运行中" : "已停止"}</b>
+        </span>
+        <span>
+          当前采集周期：
+          <b data-testid="acquisition-status-interval">{intervalMs} ms</b>
+        </span>
+        <span>
+          当前已配置点位：
+          <b data-testid="acquisition-status-points">{nck ? nckPoints.length : sels.length} 个</b>
+        </span>
+        <span>
+          保存后状态：
+          <b data-testid="acquisition-status-after">{afterSaveText}</b>
+        </span>
       </div>
       {!nck ? (
       <ResourcePickerAntd
@@ -838,26 +941,24 @@ export function EndpointAcquisitionPane({
           />
         ) : (
           <div style={{ fontSize: 12, color: "#525252" }} data-testid="nck-collectable-summary">
-            可采集变量 {collectableDefs.length} / {definitionList.length}（其余为身份探针或缺少
-            scope，不可采集）
-            <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 6 }}>
-              {collectableDefs.map((definition) => (
-                <Tag key={String(definition.variable_id)} data-testid="nck-collectable-def">
-                  {typeof definition.label === "string"
-                    ? definition.label
-                    : definition.label?.zh ?? String(definition.variable_id)}
-                </Tag>
-              ))}
+            {/* P1-1：默认只显示数量；36 个标签墙已移除（标签不可点击，纯占位）。 */}
+            <div style={{ fontSize: 13, color: "#262626" }} data-testid="nck-collectable-count">
+              {collectableDefs.length} 个可配置变量
             </div>
-            <div style={{ marginTop: 6 }} data-testid="nck-catalog-meta">
-              目录：{catalog ? `${catalog.total} 条 / ${catalog.pages} 页 / rev ${catalog.revision}` : "注入目录"}
-              {" · "}Endpoint family：
-              {endpointFamilyState === "loading"
-                ? "读取中"
-                : endpointFamilyState === "error"
-                  ? "读取失败"
-                  : endpointFamily ?? "缺失（禁止提交）"}
-            </div>
+            <details data-testid="nck-catalog-details" style={{ marginTop: 4 }}>
+              <summary style={{ cursor: "pointer", fontSize: 11 }}>目录详情</summary>
+              <div style={{ marginTop: 4, fontSize: 11 }} data-testid="nck-catalog-meta">
+                共 {definitionList.length} 条定义（其余为身份探针或缺少 scope，不可采集）
+                {" · "}目录：
+                {catalog ? `${catalog.total} 条 / ${catalog.pages} 页 / rev ${catalog.revision}` : "注入目录"}
+                {" · "}Endpoint family：
+                {endpointFamilyState === "loading"
+                  ? "读取中"
+                  : endpointFamilyState === "error"
+                    ? "读取失败"
+                    : endpointFamily ?? "缺失（禁止提交）"}
+              </div>
+            </details>
           </div>
         )}
 
@@ -873,8 +974,10 @@ export function EndpointAcquisitionPane({
         {definitions && !editBlock ? (
           <div style={{ display: "grid", gap: 8 }}>
             <div>
+              {/* Browse 是辅助入口：用 link 样式避免与主选择框争抢注意力。 */}
               <Button
                 size="small"
+                type="link"
                 data-testid="nck-browse-toggle"
                 onClick={() => setBrowseOpen((v) => !v)}
               >
@@ -1008,6 +1111,11 @@ export function EndpointAcquisitionPane({
 
         {nckPoints.length > 0 ? (
           <div style={{ display: "grid", gap: 6 }} data-testid="nck-point-list">
+            {/* P1-2 硬约束：绿色标签只代表**配置格式**校验，不能让用户误以为
+                真实机床已经读取成功。 */}
+            <div style={{ fontSize: 11, color: "#8c8c8c" }} data-testid="nck-point-list-hint">
+              以下为配置格式校验结果，不代表机床已成功读取数据；真实采集情况请到「数据」页查看。
+            </div>
             {nckPoints.map((point, idx) => {
               const status = statusesCurrent ? pointStatuses[idx] : undefined;
               const variableId =
@@ -1039,47 +1147,91 @@ export function EndpointAcquisitionPane({
                   : exactDefinition && revisionIsCurrent
                     ? evaluateNckSelectionAdd(exactDefinition).ok
                     : false;
+              // P1-2：两层信息。名称只取定义 label（原生点位固定「原生点位」），
+              // 地址由参数结构化拼出；point_key / 完整 JSON / 版本收进折叠区。
+              const display = nckPointDisplay(point, exactDefinition);
               return (
                 <div
                   key={`${point.point_key}-${idx}`}
                   data-testid="nck-point-row"
-                  style={{ display: "flex", gap: 8, alignItems: "center", padding: 6, border: "1px solid #e0e0e0", borderRadius: 0 }}
+                  style={{ display: "grid", gap: 6, padding: 8, border: "1px solid #e0e0e0", borderRadius: 0 }}
                 >
-                  <span style={{ flex: 1, fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}>
-                    {point.kind} · {point.point_key}{" "}
-                    <span style={{ color: "#525252" }}>{JSON.stringify(point.parameters)}</span>
-                    <div style={{ marginTop: 2 }}>
-                      {!status ? <Tag>核验中…</Tag> : null}
-                      {status?.status === "verified" ? (
-                        <Tag color="green" data-testid="nck-point-status">
-                          {status.native ? "高级原生（不适用目录 scope）" : "身份已由服务端核验"}
-                        </Tag>
-                      ) : null}
-                      {status?.status === "unverified" ? (
-                        <Tag color="red" data-testid="nck-point-status">
-                          不可提交：{status.code} · {status.message}
-                        </Tag>
-                      ) : null}
+                  <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                    <div style={{ flex: 1, display: "grid", gap: 2 }}>
+                      <div data-testid="nck-point-name" style={{ fontSize: 13, fontWeight: 600 }}>
+                        {display.title}
+                      </div>
+                      <div data-testid="nck-point-address" style={{ fontSize: 12, color: "#525252" }}>
+                        {display.address}
+                      </div>
+                      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                        {!status ? <Tag>正在校验配置格式…</Tag> : null}
+                        {status?.status === "verified" ? (
+                          <Tag color="green" data-testid="nck-point-status">
+                            {status.native ? "配置格式校验通过（原生）" : "配置格式校验通过"}
+                          </Tag>
+                        ) : null}
+                        {status?.status === "unverified" ? (
+                          <>
+                            <Tag color="red" data-testid="nck-point-status">
+                              配置格式校验未通过：{status.code}
+                            </Tag>
+                            <span
+                              data-testid="nck-point-status-detail"
+                              style={{ fontSize: 11, color: "#c62828" }}
+                            >
+                              {status.message}
+                            </span>
+                          </>
+                        ) : null}
+                      </div>
                     </div>
-                  </span>
-                  {editableGate ? (
-                    <Button
-                      size="small"
-                      onClick={() => {
-                        setEditingIndex(idx);
-                        setFormVersion((v) => v + 1);
+                    <div style={{ display: "flex", gap: 6 }}>
+                      {editableGate ? (
+                        <Button
+                          size="small"
+                          onClick={() => {
+                            setEditingIndex(idx);
+                            setFormVersion((v) => v + 1);
+                          }}
+                        >
+                          编辑
+                        </Button>
+                      ) : null}
+                      {/*
+                        删除按钮**不经过** scope/family/预览准入门（见 removePoint 注释）。
+                        无论点位是否合法都必须可移除，否则存量 identity 点位会形成死锁。
+                      */}
+                      <Button size="small" danger onClick={() => removePoint(idx)}>
+                        移除
+                      </Button>
+                    </div>
+                  </div>
+                  <details data-testid="nck-point-technical">
+                    <summary style={{ cursor: "pointer", fontSize: 11, color: "#525252" }}>
+                      技术详情
+                    </summary>
+                    <div
+                      style={{
+                        marginTop: 4,
+                        display: "grid",
+                        gap: 2,
+                        fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace",
+                        fontSize: 11,
+                        color: "#525252",
                       }}
                     >
-                      编辑
-                    </Button>
-                  ) : null}
-                  {/*
-                    删除按钮**不经过** scope/family/预览准入门（见 removePoint 注释）。
-                    无论点位是否合法都必须可移除，否则存量 identity 点位会形成死锁。
-                  */}
-                  <Button size="small" danger onClick={() => removePoint(idx)}>
-                    移除
-                  </Button>
+                      <div>point_key：{point.point_key}</div>
+                      <div>kind：{point.kind}</div>
+                      <div>{display.revision}</div>
+                      <div>参数：{JSON.stringify(point.parameters)}</div>
+                      {point.kind === "nck_native" ? (
+                        <div>校验方式：原生字段（不适用目录 scope）</div>
+                      ) : (
+                        <div>身份来源：服务端 identity-preview 重算</div>
+                      )}
+                    </div>
+                  </details>
                 </div>
               );
             })}
@@ -1088,8 +1240,8 @@ export function EndpointAcquisitionPane({
       </div>
       )}
       </>)}
-      <div style={{ fontSize: 12, color: "#525252" }}>
-        已选 {nck ? nckPoints.length : sels.length} 项 · {intervalMs}ms 轮询 · 保存将执行 Stop → PUT /tasks/{endpointId} → Start
+      <div style={{ fontSize: 12, color: "#525252" }} data-testid="acquisition-execution-note">
+        已选 {nck ? nckPoints.length : sels.length} 项 · {intervalMs}ms 轮询 · {executionNote}
         {!nck ? (
           <Button size="small" onClick={() => setSels([])} style={{ marginLeft: 8 }}>清空</Button>
         ) : null}
@@ -1121,6 +1273,8 @@ export function EndpointAcquisitionPane({
         </div>
       )}
       <div>
+        {/* P0-2：已停止时保存只写配置（onApply(false)），按钮不得写「保存并启动」；
+            运行中的恢复运行由 restart 勾选决定，结果由 lastApply 明确回显。 */}
         <ApplyWithRestart
           running={running}
           applying={saving}
@@ -1136,7 +1290,11 @@ export function EndpointAcquisitionPane({
                 unverified.length === 0
               : sels.length > 0 && !!desc)
           }
-          applyLabel="保存并启动"
+          applyLabel="保存配置"
+          stoppedLabel="保存配置"
+          restart={restart}
+          onRestartChange={setRestart}
+          result={lastApply}
           onApply={save}
         />
       </div>
