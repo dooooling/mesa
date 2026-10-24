@@ -102,6 +102,101 @@ function choose(variableId: string) {
   });
 }
 
+describe("P0-1：未选择变量不显示虚假错误", () => {
+  it("no_selection_shows_only_prompt_and_no_form_model_invalid", () => {
+    const { preview } = installPreview();
+    renderFields({ definitions: [definition()], preview });
+    // 只提示「请选择可采集变量」，不出现校验错误 / FORM_MODEL_INVALID。
+    expect(screen.getByTestId("nck-select-hint").textContent).toContain("请选择可采集变量");
+    expect(screen.queryByTestId("nck-form-issues")).toBeNull();
+    expect(screen.queryByTestId("nck-model-reject")).toBeNull();
+    expect(screen.queryByText(/FORM_MODEL_INVALID/)).toBeNull();
+    // 提交按钮保持禁用（不是报错，也不产生可提交路径）。
+    expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("selected_variable_without_definition_still_reports_real_error", () => {
+    renderFields({
+      definitions: [],
+      preview: installPreview().preview,
+      initialPoint: {
+        kind: "nck_variable",
+        point_key: "",
+        parameters: {
+          variable_id: "syn.missing",
+          definition_revision: 1,
+          target: { channel: 1 },
+          arguments: {},
+        },
+      },
+    });
+    // 真正的定义异常不得被“未选择”的宽松分支吞掉。
+    expect(screen.getByTestId("nck-definition-missing").textContent).toContain("定义缺失");
+    expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("selected_definition_shows_input_requirements_and_validation_issues", () => {
+    const { preview } = installPreview();
+    renderFields({ definitions: [definition()], preview });
+    choose("syn.channel.status");
+    // 已选择：显示输入要求（Target 表单）与必填校验问题。
+    expect(screen.getByText(/Target（由定义/)).toBeTruthy();
+    expect(screen.getByTestId("nck-form-issues").textContent).toContain("MISSING_TARGET");
+  });
+});
+
+describe("P1-1：变量选择可搜索（中文名称 / 变量 ID）", () => {
+  function optionValues(): string[] {
+    return Array.from(
+      (screen.getByTestId("nck-variable-select") as HTMLSelectElement).querySelectorAll("option"),
+    )
+      .map((o) => o.value)
+      .filter(Boolean);
+  }
+
+  const spindle = definition({
+    variable_id: "syn.spindle.speed",
+    label: { zh: "主轴转速", en: "Spindle speed" },
+  });
+  const channel = definition({
+    variable_id: "syn.channel.status",
+    label: { zh: "通道状态", en: "Channel status" },
+  });
+
+  it("filters_by_chinese_label_and_variable_id", () => {
+    const { preview } = installPreview();
+    renderFields({ definitions: [spindle, channel], preview });
+    expect(optionValues()).toEqual(["syn.spindle.speed", "syn.channel.status"]);
+
+    const search = screen.getByTestId("nck-variable-search");
+    fireEvent.change(search, { target: { value: "主轴" } });
+    expect(optionValues()).toEqual(["syn.spindle.speed"]);
+
+    fireEvent.change(search, { target: { value: "channel.status" } });
+    expect(optionValues()).toEqual(["syn.channel.status"]);
+
+    fireEvent.change(search, { target: { value: "不存在的变量" } });
+    expect(optionValues()).toEqual([]);
+    expect(screen.getByTestId("nck-variable-search-count").textContent).toContain(
+      "没有匹配的变量",
+    );
+  });
+
+  it("keeps_selected_variable_visible_when_search_excludes_it", () => {
+    const { preview } = installPreview();
+    renderFields({ definitions: [spindle, channel], preview });
+    choose("syn.spindle.speed");
+    fireEvent.change(screen.getByTestId("nck-variable-search"), {
+      target: { value: "通道" },
+    });
+    // 已选变量必须仍在下拉中：否则 select 会显示为空，用户会以为选择被清掉。
+    expect(optionValues()).toEqual(["syn.spindle.speed", "syn.channel.status"]);
+    expect((screen.getByTestId("nck-variable-select") as HTMLSelectElement).value).toBe(
+      "syn.spindle.speed",
+    );
+  });
+});
+
 describe("门禁 4：Target/Arguments 动态生成，非法值拒绝", () => {
   it("dynamic_targets_and_arguments_follow_definition_without_hardcoding", () => {
     const compound = definition({

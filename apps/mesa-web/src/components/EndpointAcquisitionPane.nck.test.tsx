@@ -225,8 +225,13 @@ describe("关键回归 6：UI 只提供 36 条 collect（scope 准入接线）",
       />,
     );
     const summary = await screen.findByTestId("nck-collectable-summary");
-    expect(summary.textContent).toContain("36 / 42");
-    expect(screen.getAllByTestId("nck-collectable-def")).toHaveLength(36);
+    // P1-1：默认只显示数量文字，不再铺 36 个不可点击的 Tag。
+    expect(summary.textContent).toContain("36 个可配置变量");
+    expect(screen.queryAllByTestId("nck-collectable-def")).toHaveLength(0);
+    const options = Array.from(
+      (screen.getByTestId("nck-variable-select") as HTMLSelectElement).querySelectorAll("option"),
+    ).map((o) => o.value);
+    expect(options.filter(Boolean)).toHaveLength(36);
     // 6 条 identity 定义不得出现在可采集集合里（不是"显示为禁用"，而是根本不渲染）。
     for (let i = 1; i <= 6; i += 1) {
       expect(screen.queryByText(`syn.identity.${i}`)).toBeNull();
