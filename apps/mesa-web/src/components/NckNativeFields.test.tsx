@@ -314,3 +314,39 @@ describe("P1：Native user 确认门（绕过 disabled 也无法提交未确认�
     expect(onSubmit).not.toHaveBeenCalled();
   });
 });
+
+// A3：原生字段 Schema 里出现界面不认识的类型 ⇒ 不允许加入点位。
+// 与通用 DescriptorFields 的拒绝逻辑同源，这里锁住表单层的提交门。
+describe("A3：未知字段类型禁止加入原生点位", () => {
+  const badSchema: SchemaDescriptor = {
+    fields: [
+      ...schema.fields,
+      {
+        key: "shape",
+        label: "Shape",
+        field_type: "geometry" as SchemaDescriptor["fields"][number]["field_type"],
+        required: false,
+        validation: {},
+        ui: {},
+      },
+    ],
+  };
+
+  it("提示出现且「加入原生点位」禁用；绕过 disabled 也不 onSubmit", () => {
+    const onSubmit = vi.fn();
+    render(
+      <NckNativeFields schema={badSchema} takenPointKeys={[]} initialPoint={nativePoint()} onSubmit={onSubmit} />,
+    );
+    expect(screen.getByTestId("descriptor-unsupported-notice")).toBeTruthy();
+    const add = screen.getByTestId("nck-native-add-point") as HTMLButtonElement;
+    expect(add.disabled).toBe(true);
+
+    let invoked = false;
+    act(() => {
+      invoked = invokeSubmitIgnoringDisabled(add);
+    });
+    expect(invoked).toBe(true);
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(screen.getByTestId("nck-native-submit-error").textContent).toContain("当前界面不支持");
+  });
+});

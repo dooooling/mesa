@@ -7,6 +7,8 @@ import { DeleteOutlined, PlusOutlined } from "@ant-design/icons";
 import { api } from "../api";
 import type { DriverDescriptor, EventStreamDescriptor, EventTask, LocalizedText, TaskMode } from "../types";
 import { DescriptorFields, materializeSchemaDefaults } from "./DescriptorFields";
+import { UNSUPPORTED_CONFIG_NOTICE, unsupportedFields } from "../descriptorCompatibility";
+import { localizedText } from "../localizedText";
 import { ApplyWithRestart } from "./ApplyWithRestart";
 import { applyEndpointChange, type LifecycleStepResult } from "../deviceModel";
 import {
@@ -39,7 +41,8 @@ let draftSeq = 0;
 const nextKey = () => `draft-${Date.now()}-${(draftSeq += 1)}`;
 
 export function streamLabel(label: LocalizedText): string {
-  return label?.["zh-CN"] ?? label?.default ?? "";
+  // A1：与资源选择器共用同一条取值规则（优先 zh-CN，回落 default）。
+  return localizedText(label);
 }
 
 function streamById(streams: EventStreamDescriptor[], id: string): EventStreamDescriptor | undefined {
@@ -192,7 +195,29 @@ export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string 
 
   const hasProblem = problems.some((p) => p !== null);
 
+  /**
+   * A3：任一草稿引用的事件流参数含「界面不认识的字段类型」⇒ 整次保存禁用。
+   *
+   * 为什么按流而不是按草稿：保存是**全量快照替换**，只要有一份草稿无法被
+   * 界面正确表达，就不能把整份快照写回去（会把看不明白的值原样带回去或改坏）。
+   * 影响范围仅限本次订阅配置：不停采集、不影响其它 Endpoint。
+   */
+  const hasUnsupportedFields = useMemo(
+    () =>
+      drafts.some((d) => {
+        if (d.kind !== "generic") return false;
+        const st = streamById(streams, d.streamId);
+        return !!st && unsupportedFields(st.parameters).length > 0;
+      }),
+    [drafts, streams],
+  );
+
   const save = async (restart: boolean) => {
+    // A3 提交门：界面没看懂的字段类型不允许写入（与按钮 disabled 同源）。
+    if (hasUnsupportedFields) {
+      setError(UNSUPPORTED_CONFIG_NOTICE);
+      return;
+    }
     // 归属门：只有当前选中 Endpoint 成功加载出的配置才允许保存。
     // 统一生命周期：运行中先停止再应用（停止是本次应用的一部分），
     // 是否恢复运行由复选框决定；已停止则直接应用。
@@ -423,7 +448,7 @@ export function EventTaskEditor({ fixedEndpointId }: { fixedEndpointId?: string 
             <ApplyWithRestart
               running={running}
               applying={saving}
-              canApply={loadedEndpointId === selected?.id && !hasProblem && !!selected}
+              canApply={loadedEndpointId === selected?.id && !hasProblem && !hasUnsupportedFields && !!selected}
               applyLabel="保存订阅"
               onApply={save}
             />

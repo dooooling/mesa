@@ -37,6 +37,7 @@ import {
 import { CONNECTION_FIELD_ID_PREFIX, ConnectionFields } from "./ConnectionFields";
 import { ConnectionTestResult } from "./ConnectionTestResult";
 import { useConnectionSetup } from "./useConnectionSetup";
+import { unsupportedFields } from "../descriptorCompatibility";
 
 export type ConnectionSetupMode = "create-draft" | "add" | "edit";
 
@@ -182,6 +183,16 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
 
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [showMissingHint, setShowMissingHint] = useState(false);
+  /**
+   * A3：连接参数里出现「界面不认识的字段类型」⇒ 校验/测试/保存全部禁用。
+   *
+   * 为什么必须在面板层再判一次：`DescriptorFields` 只负责拒绝渲染可编辑控件，
+   * 而「测试连接」「保存」是面板的动作按钮。若只靠控件禁用，用户仍可能拿着
+   * 一份界面没看懂（且含未知字段）的配置去探测/落库。影响范围仅这一条连接，
+   * 不阻断其它连接，也不触碰运行中的采集。
+   */
+  const unsupported = useMemo(() => unsupportedFields({ fields: setup.fields }), [setup.fields]);
+  const unsupportedBlocked = unsupported.length > 0;
   /** 预设来源状态：哪些 key 由哪条预设写入、写成了什么值（见 AppliedPreset） */
   const [appliedPreset, setAppliedPreset] = useState<AppliedPreset | null>(null);
   /** 切换系列后被保留、需要用户确认适用性的示例值（见 StaleExampleNotice） */
@@ -347,11 +358,13 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
   };
 
   const handleValidate = async () => {
+    if (unsupportedBlocked) return;
     guardAdvanced();
     await setup.validate();
   };
 
   const handleProbe = async () => {
+    if (unsupportedBlocked) return;
     guardAdvanced();
     await setup.probeConnection();
   };
@@ -367,7 +380,7 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
     // 判定与按钮读的是**同一个** `setup.blockReason`（纯函数 submitBlockReason），
     // 因此两侧不可能漂移。
     // ---------------------------------------------------------------------
-    if (setup.blockReason !== null || actionsDisabled) return;
+    if (setup.blockReason !== null || actionsDisabled || unsupportedBlocked) return;
     const advancedOk = guardAdvanced();
     // 上一次服务端校验已判非法且参数未改动：不允许绕过校验直接提交
     const priorInvalid = setup.validation?.kind === "invalid";
@@ -395,10 +408,10 @@ export function ConnectionSetupPanel(props: ConnectionSetupPanelProps) {
    * - Driver-bound：任何未重新输入的 Secret marker 都禁测（marker 不是密码）；
    * - Endpoint-bound：规范 marker 合法（服务端物化），只有位置/形状非法的 marker 才禁测。
    */
-  const canTest = !driverBlocked && !actionsDisabled && setup.canTestConnection;
+  const canTest = !driverBlocked && !actionsDisabled && setup.canTestConnection && !unsupportedBlocked;
   // 保存不受 Secret marker 限制：marker 必须原样回传，后端据此保留历史凭据
   //（若在此处禁用保存，就无法编辑含已存凭据连接的其它字段——属既有能力回归）。
-  const canSubmit = !driverBlocked && !actionsDisabled;
+  const canSubmit = !driverBlocked && !actionsDisabled && !unsupportedBlocked;
 
   const primaryLabel = submitLabel ?? (mode === "add" ? "创建" : "下一步");
 

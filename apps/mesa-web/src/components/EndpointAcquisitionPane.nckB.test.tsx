@@ -4,10 +4,12 @@
 // 已有点位编辑不增殖旧 Binding；存量 identity 点位的**显式移除恢复路径**
 // （删除不经准入门）；预览失败/身份不一致时禁用保存。
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { message } from "antd";
 import { EndpointAcquisitionPane } from "./EndpointAcquisitionPane";
+import { invokeDisabledButton } from "../test/bypassDisabled";
+import { UNSUPPORTED_CONFIG_NOTICE } from "../descriptorCompatibility";
 import {
   CANONICAL_RESOURCES_KIND,
   NCK_POINTS_KIND,
@@ -213,7 +215,8 @@ function nckTask(id: string, points: NckPointSelection[]): AcquisitionTaskShape 
 }
 
 function saveButton(): HTMLButtonElement {
-  return screen.getByRole("button", { name: /保存并启动/ }) as HTMLButtonElement;
+  // P0-2：已停止时按钮文案是「保存配置」（不会再承诺启动采集）。
+  return screen.getByRole("button", { name: /保存配置/ }) as HTMLButtonElement;
 }
 
 function rowOf(pointKey: string): HTMLElement {
@@ -254,7 +257,7 @@ describe("门禁 1/3：目录分页完整读取，仅 collect 进入采集界面
     render(<EndpointAcquisitionPane endpointId={EP} driverId={NCK_DRIVER} onChanged={() => {}} />);
 
     const summary = await screen.findByTestId("nck-collectable-summary");
-    expect(summary.textContent).toContain("2 / 3");
+    expect(summary.textContent).toContain("2 个可配置变量");
     expect(screen.getByTestId("nck-catalog-meta").textContent).toContain("3 条 / 2 页");
     // 两页都读了：cursor 逐字回传。
     expect(state.catalogCalls).toHaveLength(2);
@@ -668,7 +671,8 @@ describe("PR-C 第三批：Endpoint 页 native 存量点位复核（A24–A27）
         }}
       />,
     );
-    await screen.findByText(/高级原生（不适用目录 scope）/);
+    // P1-2：状态标签只声明“配置格式校验通过”，不得暗示真实机床已读取成功。
+    await screen.findByText("配置格式校验通过（原生）");
     await waitFor(() => expect(saveButton().disabled).toBe(false));
     await user.click(saveButton());
     await screen.findByText(/未检测到实际修改/);
@@ -680,6 +684,92 @@ describe("PR-C 第三批：Endpoint 页 native 存量点位复核（A24–A27）
     );
     expect(screen.getByTestId("nck-native-fields")).toBeTruthy();
     expect(screen.getByTestId("nck-native-key").textContent).toBe("native.C.1.21.1.396");
+  });
+});
+
+// P1：Endpoint 层最终保存守卫（复用本文件的目录/预览夹具，不连真机、不新增 mock 套件）。
+//
+// 场景：驱动升级后 `variable` 资源新增一个界面不认识的**必填**字段，存量原生点位
+// 尚未携带该键。旧守卫只查「值里有没有这个 key」⇒ 返回空 ⇒ 放行保存；新守卫必须
+// 按**完整 Schema** 拒绝，并且拒绝要发生在任何 stop / PUT / start 之前。
+describe("P1：Endpoint 层最终保存守卫（完整 Schema）", () => {
+  it("unknown_required_native_field_blocks_save_before_any_request", async () => {
+    const nativeSchema = [
+      { key: "area", label: "Area", field_type: "enum", required: true, validation: { enum_options: ["C"] }, ui: {} },
+      { key: "area_no", label: "Area No.", field_type: "integer", required: true, validation: { min: 0, max: 31 }, ui: {} },
+      { key: "module", label: "Module", field_type: "integer", required: true, validation: { min: 0, max: 255 }, ui: {} },
+      { key: "column", label: "Column", field_type: "integer", required: true, validation: { min: 0, max: 65535 }, ui: {} },
+      { key: "line", label: "Line", field_type: "integer", required: true, validation: { min: 0, max: 65535 }, ui: {} },
+      // 驱动新增：界面不认识的类型 + required，旧配置里没有这个键。
+      { key: "axis_ref", label: "Axis ref", field_type: "axis_ref", required: true, validation: {}, ui: {} },
+    ];
+    const nativePoint: NckPointSelection = {
+      kind: "nck_native",
+      point_key: "native.C.1.21.1.396",
+      parameters: { area: "C", area_no: 1, module: 21, column: 1, line: 396 },
+    };
+    const state = mkState({
+      tasks: [nckTask("nck-native-task", [nativePoint])],
+      resources: [
+        {
+          id: "variable",
+          label: { default: "NC Variable" },
+          parameters: { fields: nativeSchema },
+          outputs: [],
+          modes: ["poll"],
+        },
+      ],
+    });
+    installFetch(state);
+    render(
+      <EndpointAcquisitionPane
+        endpointId={EP}
+        driverId={NCK_DRIVER}
+        onChanged={() => {}}
+        nckDefinitions={{
+          "syn.collect.a": {
+            variable_id: "syn.collect.a",
+            revision: 1,
+            family: "828d",
+            scope: "collect",
+            targets: ["channel"],
+            target_required: ["channel"],
+            arguments: [],
+          },
+        }}
+      />,
+    );
+
+    // 完整 Schema 守卫在界面上可见：未携带的未知必填字段也被点名。
+    expect(await screen.findByTestId("acquisition-unsupported-fields")).toBeTruthy();
+    expect(
+      screen.getByText("variable · axis_ref · axis_ref · 配置未携带（驱动新增字段）"),
+    ).toBeTruthy();
+    const save = saveButton();
+    expect(save.disabled).toBe(true);
+
+    // 制造一次真实变更（周期 1000 → 2000）：若守卫缺失，保存会真的发请求。
+    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
+
+    const fetchMock = globalThis.fetch as unknown as {
+      mock: { calls: Array<[string, RequestInit | undefined]> };
+    };
+    const before = fetchMock.mock.calls.length;
+    // 绕过 disabled 直接触发组件级 onClick（disabled 不是唯一防线）。
+    expect(invokeDisabledButton(save)).toBe(true);
+    await act(async () => {});
+
+    // 拒绝发生在任何 stop / PUT / start 之前：连一个请求都没有发出。
+    expect(fetchMock.mock.calls.length).toBe(before);
+    expect(state.putBodies).toHaveLength(0);
+    const urls = fetchMock.mock.calls.map(([url]) => String(url));
+    expect(urls.some((url) => /\/stop$|\/start$/.test(url))).toBe(false);
+    // 拒绝原因来自 Schema 守卫（不是「身份核验未通过」那条分支）。
+    await waitFor(() =>
+      expect(document.querySelector(".ant-message")?.textContent ?? "").toContain(
+        UNSUPPORTED_CONFIG_NOTICE,
+      ),
+    );
   });
 });
 

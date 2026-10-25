@@ -3,6 +3,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { ResourcePickerAntd, suggestPointKey } from "./ResourcePickerAntd";
+import { invokeDisabledButton } from "../test/bypassDisabled";
 import type { ResourceDescriptor } from "../types";
 import type { NckPreviewFn } from "./NckPointFields";
 import type { NckDefinitionLike } from "../nckPointModel";
@@ -483,5 +484,56 @@ describe("PR-C 第三批：Picker 语义模式（A8/A21/A22）", () => {
     // 不回退旧 manual：没有 variable 资源选择、没有旧“加入”按钮。
     expect(screen.queryByText("手动")).toBeNull();
     expect(screen.queryByText("资源")).toBeNull();
+  });
+});
+
+// A3：未知 field_type 的资源既不能编辑也不能「加入」。
+// 这里用一个虚构类型 "geometry"：真实驱动从未声明过，模拟驱动升级/降级后的
+// 界面不兼容场景。
+const UNKNOWN_RESOURCE: ResourceDescriptor[] = [
+  {
+    id: "probe",
+    // A1：资源标签同时给 zh-CN 与 default，界面必须优先中文。
+    label: { default: "Probe", "zh-CN": "探针" },
+    parameters: {
+      fields: [
+        { key: "unit", label: "Unit", field_type: "integer", required: false, default: 3, validation: {}, ui: {} },
+        {
+          key: "shape",
+          label: "Shape",
+          field_type: "geometry" as ResourceDescriptor["parameters"]["fields"][number]["field_type"],
+          required: false,
+          validation: {},
+          ui: { advanced: true },
+        },
+      ],
+    },
+    outputs: [
+      { id: "value", label: { default: "Value" }, type_spec: { kind: "fixed", data_type: "F64" }, access: "read" },
+    ],
+    modes: ["poll"],
+  },
+];
+
+describe("未知字段类型（A3）", () => {
+  it("打开即提示不支持，且「加入」禁用；绕过 disabled 也不发 onAdd", () => {
+    const onAdd = vi.fn((_sel: unknown): boolean => true);
+    const { container } = render(
+      <ResourcePickerAntd resources={UNKNOWN_RESOURCE} existingSelections={[]} onAdd={onAdd} />,
+    );
+    expect(screen.getByTestId("descriptor-unsupported-notice")).toBeTruthy();
+    // 选一个输出让「加入」只差字段类型这一道门
+    const outputBox = screen.getByRole("checkbox", { name: "output-value" });
+    fireEvent.click(outputBox.querySelector("input") ?? outputBox);
+    const add = container.querySelector("button.ant-btn-primary") as HTMLButtonElement;
+    expect(add.disabled).toBe(true);
+    // 探针：即使 disabled 被绕过，提交函数也必须自己拒绝
+    expect(invokeDisabledButton(add)).toBe(true);
+    expect(onAdd).not.toHaveBeenCalled();
+  });
+
+  it("资源标签优先 zh-CN（A1 统一取值）", () => {
+    render(<ResourcePickerAntd resources={UNKNOWN_RESOURCE} existingSelections={[]} onAdd={() => true} />);
+    expect(screen.getByText(/探针/)).toBeTruthy();
   });
 });

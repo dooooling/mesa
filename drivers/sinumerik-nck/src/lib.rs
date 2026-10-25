@@ -185,7 +185,10 @@ impl Driver for SinumerikNckDriver {
             },
             resources: vec![ResourceDescriptor {
                 id: GENERIC_RESOURCE_ID.into(),
-                label: LocalizedText::new("NC Variable"),
+                // A2：资源名补 zh-CN。Descriptor 契约（LocalizedText）本就允许
+                // 可选译文，Web 端已统一「优先 zh-CN、回落 default」，因此这里
+                // 只需补数据，不改契约版本。
+                label: LocalizedText::new("NC Variable").with_zh("NC 变量"),
                 parameters: SchemaDescriptor {
                     // 原生只读地址（V2.0 §2.2）：字段即协议字段，不存在
                     // 变量名目录、不存在 access_path 入口切换、不存在
@@ -328,7 +331,8 @@ impl Driver for SinumerikNckDriver {
                 },
                 outputs: vec![OutputDescriptor {
                     id: "value".into(),
-                    label: LocalizedText::new("Value"),
+                    // A2：输出名补 zh-CN（同上：只补数据，不动契约）。
+                    label: LocalizedText::new("Value").with_zh("值"),
                     // 类型来自地址上的 `decode`，只能 Configure 时确定。
                     type_spec: OutputTypeSpec::DriverResolved,
                     unit: None,
@@ -1295,6 +1299,15 @@ mod tests {
                 "旧字段 {legacy} 不得出现在新 Schema"
             );
         }
+        // A2：资源名与输出名必须同时带 zh-CN。Web 已统一为「优先 zh-CN、
+        // 回落 default」，缺译文时界面会退回英文——这类“只有 default”的
+        // 数据缺口必须由 Descriptor 测试拦住，而不是等界面显示英文才发现。
+        assert_eq!(res.label.default, "NC Variable");
+        assert_eq!(res.label.zh_cn.as_deref(), Some("NC 变量"));
+        let out = res.outputs.first().expect("variable 资源必须有 value 输出");
+        assert_eq!(out.id, "value");
+        assert_eq!(out.label.default, "Value");
+        assert_eq!(out.label.zh_cn.as_deref(), Some("值"));
     }
 
     #[tokio::test]
