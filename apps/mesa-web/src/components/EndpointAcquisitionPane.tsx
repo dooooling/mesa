@@ -59,9 +59,11 @@ import { nckPointDisplay } from "../nckPointDisplay";
 import { pointSummary } from "../pointSummary";
 import {
   UNSUPPORTED_CONFIG_NOTICE,
-  unsupportedFieldsInValue,
-  type UnsupportedField,
+  unsupportedFieldsInResources,
+  type SubmittedResourceSchema,
+  type UnsupportedFieldInResource,
 } from "../descriptorCompatibility";
+import { draftSignature, savedVsDraftText } from "../acquisitionDraft";
 import { ApplyWithRestart, type ApplyResult } from "./ApplyWithRestart";
 import { NckPointFields } from "./NckPointFields";
 import { ResourceBrowseAntd } from "./ResourceBrowseAntd";
@@ -102,6 +104,31 @@ function pointKeysOfTask(task: AcquisitionTaskShape): string[] {
     return parsed.points.map((point) => point.point_key);
   }
   return selectionsOf(task).flatMap((s) => s.outputs.map((o) => o.point_key));
+}
+
+/**
+ * 服务端快照里的采集周期（仅 poll 任务有意义）。
+ *
+ * 缺失/非 poll ⇒ `null`：状态区必须显示「没有已保存的周期」，不得用前端默认值
+ * 冒充服务端已生效值。
+ */
+function snapshotIntervalMs(task: AcquisitionTaskShape | null | undefined): number | null {
+  if (!task || task.schedule?.mode !== "poll") return null;
+  return typeof task.schedule.interval_ms === "number" ? task.schedule.interval_ms : null;
+}
+
+/**
+ * 服务端已生效配置的展示快照（P2-2）。
+ *
+ * 存在意义：状态区必须同时说清「当前生效」与「尚未保存」。只读编辑状态会把
+ * 草稿显示成当前配置，用户会以为改动已经生效。
+ */
+interface SavedBaseline {
+  /** 服务端当前是否存在可编辑的采集任务；false 时没有「已保存」值可对照。 */
+  hasTask: boolean;
+  intervalMs: number | null;
+  /** 已生效点位数（口径与状态区一致：NCK = 点位，非 NCK = 资源选择条数）。 */
+  pointCount: number;
 }
 
 /**
@@ -154,6 +181,9 @@ export function EndpointAcquisitionPane({
   const [tasksLoadError, setTasksLoadError] = useState("");
   // 保存失败的后端 issues 原样展示（`{valid:false, issues:[...]}`）。
   const [saveIssues, setSaveIssues] = useState<ValidationIssue[]>([]);
+  // P2-2：服务端已生效配置的展示快照（null = 快照未就绪/不可用）。
+  // 状态区据此区分「已保存」与「待保存」，不再让草稿冒充当前配置。
+  const [savedBaseline, setSavedBaseline] = useState<SavedBaseline | null>(null);
 
   // ---- 第二批 B 新增状态 -------------------------------------------------
   // Endpoint 有效连接配置的 family（权威来源；目录顶层 family 只是回显）。
@@ -415,6 +445,7 @@ export function EndpointAcquisitionPane({
     setTasksLoadedEpId(null);
     setTasksLoadError("");
     setSaveIssues([]);
+    setSavedBaseline(null);
     setPointStatuses([]);
     setRemovedPoints([]);
     setEditingIndex(null);
@@ -452,6 +483,8 @@ export function EndpointAcquisitionPane({
             setEditBlock({ code: selected.code, message: selected.message });
             setPreservedTasks([]);
             setNckPoints([]);
+            // 现有任务无法安全编辑 ⇒ 没有可信的「已生效」值可对照。
+            setSavedBaseline({ hasTask: false, intervalMs: null, pointCount: 0 });
           } else {
             setPreservedTasks(selected.preserved);
             preservedIds = selected.preserved.map((t) => t.id);
@@ -459,17 +492,30 @@ export function EndpointAcquisitionPane({
               setIntervalMs(selected.editable.schedule.interval_ms ?? 1000);
             }
             // 只读 `{points:[…]}`：绝不把 NCK 点位当成 ResourceSelection[]。
-            setNckPoints(nckPointsOf(selected.editable));
+            const loadedPoints = nckPointsOf(selected.editable);
+            setNckPoints(loadedPoints);
+            // P2-2 基线：快照里已生效的周期/点位（保存成功后由 PUT 成功分支刷新）。
+            setSavedBaseline({
+              hasTask: !!selected.editable,
+              intervalMs: snapshotIntervalMs(selected.editable),
+              pointCount: loadedPoints.length,
+            });
           }
         } else {
           const { editable, preserved } = splitAcquisitionTasks(tasks);
           setPreservedTasks(preserved);
           preservedIds = preserved.map((t) => t.id);
-          if (editable) {
-            if (editable.schedule?.mode === "poll") setIntervalMs(editable.schedule.interval_ms ?? 1000);
-            const s = selectionsOf(editable);
-            if (s.length) setSels(s);
+          const loadedSelections = editable ? selectionsOf(editable) : [];
+          if (editable?.schedule?.mode === "poll") {
+            setIntervalMs(editable.schedule.interval_ms ?? 1000);
           }
+          if (loadedSelections.length) setSels(loadedSelections);
+          // P2-2 基线：快照里已生效的周期/选择条数（保存成功后由 PUT 成功分支刷新）。
+          setSavedBaseline({
+            hasTask: !!editable,
+            intervalMs: snapshotIntervalMs(editable),
+            pointCount: loadedSelections.length,
+          });
         }
         // 快照就绪：只有此时保存才允许 PUT（空数组即服务端真的无任务）。
         setTasksLoadedEpId(endpointId);
@@ -534,9 +580,19 @@ export function EndpointAcquisitionPane({
 
   // 编辑一变，上一次的「已保存」结论立即失效：否则用户改完参数仍看到
   // “配置已保存，当前停止”，会把旧结论误当成新配置的结论。
-  const editSignature = `${intervalMs}|${nckPoints.map((p) => p.point_key).join(",")}|${sels
-    .map((s) => s.resource_id)
-    .join(",")}`;
+  //
+  // P2-1：指纹必须是**完整有效配置**（周期 + 每个点位的完整参数 + 顺序），
+  // 不能只比 point_key / resource_id——同一原生点位只改 decode/count 时键不变，
+  // 旧的「已保存」会残留。
+  const editSignature = useMemo(
+    () =>
+      draftSignature({
+        intervalMs,
+        selections: nck ? undefined : sels,
+        nckPoints: nck ? nckPoints : undefined,
+      }),
+    [intervalMs, nck, sels, nckPoints],
+  );
   useEffect(() => {
     setLastApply(null);
   }, [editSignature]);
@@ -621,39 +677,53 @@ export function EndpointAcquisitionPane({
   }, [nck, nckPoints, lookupDefinition]);
 
   /**
-   * A3：已选配置中**确实带着**界面不认识的字段类型的项。
+   * P1（最终保存守卫的唯一依据）：**本次提交涉及资源**的完整 Schema。
    *
-   * 两个刻意的收窄：
-   * - 只检查「配置里存在该 key」的项（`unsupportedFieldsInValue`），而不是
-   *   「Descriptor 声明了就封保存」——否则驱动多声明一个当前未使用的类型就会
-   *   波及与问题无关的配置；
-   * - NCK 语义点位的参数来自定义目录（target/arguments），不经过 Descriptor
-   *   参数 Schema，因此只检查原生点位。
+   * 为什么不能只查「值里已有的键」（旧实现）：驱动升级后新增一个界面不认识的
+   * **必填**字段时，旧配置尚未携带该键——编辑表单因为扫完整 Schema 已被禁用，
+   * 只查 key 存在性的守卫却会放行，形成「表单说不行、保存却通过」的缺口。
+   *
+   * 影响范围仍然受限（不检查未使用的其它资源）：
+   * - 非 NCK：只取 `sels` 里真实出现的 `resource_id` 对应的 Schema；
+   * - NCK：语义点位参数来自定义目录，不经过 Descriptor Schema；只有本次提交里
+   *   含原生点位时才涉及 `variable` 资源。
+   */
+  const submittedResources = useMemo<SubmittedResourceSchema[]>(() => {
+    if (!desc) return [];
+    if (nck) {
+      if (!nativeSchema) return [];
+      const nativeValues = nckPoints
+        .filter((point) => point.kind === "nck_native")
+        .map((point) => point.parameters);
+      return nativeValues.length
+        ? [{ resourceId: "variable", schema: nativeSchema, values: nativeValues }]
+        : [];
+    }
+    const byResource = new Map<string, Array<Record<string, unknown>>>();
+    for (const sel of sels) {
+      const values = byResource.get(sel.resource_id) ?? [];
+      values.push(sel.parameters ?? {});
+      byResource.set(sel.resource_id, values);
+    }
+    return Array.from(byResource.entries()).flatMap(([resourceId, values]) => {
+      const schema = (desc.resources ?? []).find((r) => r.id === resourceId)?.parameters;
+      return schema ? [{ resourceId, schema, values }] : [];
+    });
+  }, [desc, nck, nativeSchema, nckPoints, sels]);
+
+  /**
+   * A3/P1：本次提交涉及资源里**界面不认识**的字段类型（按完整 Schema 判定）。
+   *
+   * 同时用 `unsupportedFieldsInValue` 标注该字段是否已被存量配置携带：
+   * - 已携带 ⇒ 这条配置原本就带着未知字段（老问题）；
+   * - 未携带 ⇒ 驱动新增/升级引入，旧配置根本没机会填（本次修复的缺口）。
    *
    * 影响范围：仅当前 Endpoint 的保存按钮；不停已运行的采集，也不阻断其它连接。
    */
-  const incompatible = useMemo(() => {
-    const out: Array<UnsupportedField & { pointKey: string }> = [];
-    if (!desc) return out;
-    if (nck) {
-      if (!nativeSchema) return out;
-      for (const point of nckPoints) {
-        if (point.kind !== "nck_native") continue;
-        for (const field of unsupportedFieldsInValue(nativeSchema, point.parameters)) {
-          out.push({ ...field, pointKey: point.point_key });
-        }
-      }
-      return out;
-    }
-    for (const sel of sels) {
-      const schema = (desc.resources ?? []).find((r) => r.id === sel.resource_id)?.parameters;
-      const pointKey = sel.outputs.map((o) => o.point_key).join(", ") || sel.resource_id;
-      for (const field of unsupportedFieldsInValue(schema, sel.parameters)) {
-        out.push({ ...field, pointKey });
-      }
-    }
-    return out;
-  }, [desc, nck, nativeSchema, nckPoints, sels]);
+  const incompatible = useMemo<UnsupportedFieldInResource[]>(
+    () => unsupportedFieldsInResources(submittedResources),
+    [submittedResources],
+  );
   const hasIncompatible = incompatible.length > 0;
 
   const save = async (restart: boolean) => {
@@ -662,7 +732,9 @@ export function EndpointAcquisitionPane({
       if (tasksLoadState === "error") return message.error("任务快照加载失败，禁止保存以防覆盖已有任务。请切换后重试。");
       return message.warning("任务快照加载中，禁止保存以防覆盖已有任务。请稍候。");
     }
-    // A3 提交门：配置里确实带着界面不认识的字段类型时，拒绝整份保存。
+    // A3/P1 提交门：本次提交涉及资源的**完整 Schema** 里存在界面不认识的字段
+    // 类型时，拒绝整份保存。必须放在任何 stop / PUT / start（以及提交前的
+    // identity-preview）之前——拒绝时不得发出任何请求。
     // 只影响当前 Endpoint 的配置；不停采集、不阻断其它连接。
     if (hasIncompatible) {
       return message.error(UNSUPPORTED_CONFIG_NOTICE);
@@ -777,6 +849,13 @@ export function EndpointAcquisitionPane({
                 };
               }
             }
+            // P2-2：配置确实写进服务端后，才把「已保存」基线刷新为本次提交值
+            // （失败/回读不一致的路径不得刷新，否则状态区会虚报已生效）。
+            setSavedBaseline({
+              hasTask: true,
+              intervalMs,
+              pointCount: nck ? nckPoints.length : sels.length,
+            });
             return { ok: true };
           }
           // 后端 issues 原样保存并展示（`{valid:false, issues}`）；
@@ -922,12 +1001,25 @@ export function EndpointAcquisitionPane({
           <b data-testid="acquisition-status-state">{running ? "运行中" : "已停止"}</b>
         </span>
         <span>
-          当前采集周期：
-          <b data-testid="acquisition-status-interval">{intervalMs} ms</b>
+          采集周期：
+          {/* P2-2 方案 B：同时给出「已保存」与「待保存」，草稿不再冒充当前配置。 */}
+          <b data-testid="acquisition-status-interval">
+            {savedVsDraftText(
+              savedBaseline?.hasTask ? savedBaseline.intervalMs : null,
+              intervalMs,
+              "ms",
+            )}
+          </b>
         </span>
         <span>
-          当前已配置点位：
-          <b data-testid="acquisition-status-points">{nck ? nckPoints.length : sels.length} 个</b>
+          已配置点位：
+          <b data-testid="acquisition-status-points">
+            {savedVsDraftText(
+              savedBaseline?.hasTask ? savedBaseline.pointCount : null,
+              nck ? nckPoints.length : sels.length,
+              "个",
+            )}
+          </b>
         </span>
         <span>
           保存后状态：
@@ -1332,7 +1424,9 @@ export function EndpointAcquisitionPane({
         </div>
       )}
       {hasIncompatible ? (
-        // A3：提示只出现一次（不逐行红框），字段名/类型收在「技术详情」。
+        // A3/P1：提示只出现一次（不逐行红框），字段名/类型收在「技术详情」。
+        // 明确区分「存量配置已携带」与「驱动新增、配置未携带」——后者正是
+        // 「表单已禁用但旧守卫会放行」的缺口来源。
         // 只禁用本 Endpoint 的保存；不停已运行的采集，也不影响其它连接。
         <Alert
           type="warning"
@@ -1345,10 +1439,11 @@ export function EndpointAcquisitionPane({
               <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
                 {incompatible.map((item, idx) => (
                   <li
-                    key={`${item.pointKey}-${item.key}-${idx}`}
+                    key={`${item.resourceId}-${item.key}-${idx}`}
                     style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}
                   >
-                    {item.pointKey} · {item.key} · {item.fieldType}
+                    {item.resourceId} · {item.key} · {item.fieldType} ·{" "}
+                    {item.carried ? "存量配置已携带" : "配置未携带（驱动新增字段）"}
                   </li>
                 ))}
               </ul>

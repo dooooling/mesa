@@ -87,10 +87,10 @@ export function unsupportedFields(
 /**
  * 只报告**该配置里真的带着**的不支持字段（按 key 存在性判定）。
  *
- * 为什么需要这个更窄的判定：对「已经保存过的配置」做提交前检查时，若因为
- * Descriptor 里声明了一个当前未使用的未知字段就封掉整个保存，会波及与问题
- * 无关的配置（违反「只阻止相关配置」）。这里要求 key 在 `value` 里真实存在，
- * 把影响范围限制在「确实携带未知字段」的那一条配置上。
+ * 用途（**不是**最终保存守卫）：给「存量配置已携带未知字段」的场景做影响范围
+ * 标注——同一个 Schema 里可能声明了多个未知字段，只有真的写进配置的那几个才
+ * 与这条配置相关。最终保存守卫必须用 {@link unsupportedFieldsInResources}
+ * （扫完整 Schema），否则「驱动新增未知必填字段、旧配置未携带」会漏放行。
  *
  * 注意：只判 key 是否存在（含 null），**不判断值是否合法**——类型合法性是
  * 后端 `validate_instance` 的职责。
@@ -103,6 +103,55 @@ export function unsupportedFieldsInValue(
   return unsupportedFields(schema).filter((field) =>
     Object.prototype.hasOwnProperty.call(value, field.key),
   );
+}
+
+/**
+ * 本次提交涉及的一个资源：完整 Schema + 该资源将要提交的值（同一资源可多条）。
+ *
+ * 由调用方按「本次提交实际涉及」构造——**不要**把 Descriptor 里的所有资源都
+ * 塞进来：未使用资源的未知类型不得阻断与它无关的保存。
+ */
+export interface SubmittedResourceSchema {
+  resourceId: string;
+  schema: SchemaDescriptor;
+  /** 该资源本次提交的参数值（只用于标注「存量配置是否已携带」）。 */
+  values: Array<Record<string, unknown>>;
+}
+
+/** 一条「本次提交涉及的资源不支持该字段」记录。 */
+export interface UnsupportedFieldInResource extends UnsupportedField {
+  resourceId: string;
+  /** 提交值里是否真的带着该 key：区分「存量已携带」与「驱动新增、配置未携带」。 */
+  carried: boolean;
+}
+
+/**
+ * **最终保存守卫**：扫本次提交涉及资源的**完整 Schema**。
+ *
+ * 为什么不能拿 `unsupportedFieldsInValue` 当守卫：它只判「值里有没有这个 key」。
+ * 驱动升级后新增一个界面不认识的**必填**字段时，旧配置尚未携带该键——编辑表单
+ * 因为扫完整 Schema 已被禁用，保存守卫却会放行，形成「表单说不行、保存却通过」
+ * 的缺口。守卫因此必须按 Schema 声明判定，与表单同源。
+ *
+ * 影响范围仍受控：只扫调用方给出的「本次提交涉及」资源；未使用的其它资源即使
+ * 声明了未知类型也不阻断（见 {@link SubmittedResourceSchema} 注释）。
+ */
+export function unsupportedFieldsInResources(
+  resources: readonly SubmittedResourceSchema[],
+): UnsupportedFieldInResource[] {
+  const out: UnsupportedFieldInResource[] = [];
+  for (const { resourceId, schema, values } of resources) {
+    // 逐值复用窄判定，只用于「是否已携带」标注，不参与是否阻断。
+    const carriedKeys = new Set(
+      values.flatMap((value) =>
+        unsupportedFieldsInValue(schema, value).map((field) => field.key),
+      ),
+    );
+    for (const field of unsupportedFields(schema)) {
+      out.push({ ...field, resourceId, carried: carriedKeys.has(field.key) });
+    }
+  }
+  return out;
 }
 
 /**

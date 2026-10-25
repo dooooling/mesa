@@ -71,6 +71,8 @@ interface MockState {
   putBodies: AcquisitionTaskShape[][];
   stopCalls: number;
   startCalls: number;
+  /** 覆盖 Descriptor 的 resources（原生字段 Schema 测试用）。 */
+  resources?: unknown[];
 }
 
 function mkState(overrides: Partial<MockState> = {}): MockState {
@@ -117,7 +119,7 @@ function installFetch(state: MockState) {
         definition_digest: "digest-test",
       });
     }
-    if (url.startsWith("/api/v1/drivers/")) return ok({ resources: RESOURCES });
+    if (url.startsWith("/api/v1/drivers/")) return ok({ resources: state.resources ?? RESOURCES });
     if (url.startsWith("/api/v1/tasks?endpoint=")) {
       return ok({ tasks: state.savedTasks ?? state.tasks });
     }
@@ -176,9 +178,14 @@ describe("P0-2 / P2-2：已停止时的按钮、说明与状态区", () => {
 
     const status = await screen.findByTestId("acquisition-status");
     expect(within(status).getByTestId("acquisition-status-state").textContent).toBe("已停止");
-    expect(within(status).getByTestId("acquisition-status-interval").textContent).toBe("1000 ms");
+    // P2-2 方案 B：未修改时单值标注「已保存」，草稿不会被误读成当前配置。
+    expect(within(status).getByTestId("acquisition-status-interval").textContent).toBe(
+      "1000 ms（已保存）",
+    );
     await waitFor(() =>
-      expect(within(status).getByTestId("acquisition-status-points").textContent).toBe("1 个"),
+      expect(within(status).getByTestId("acquisition-status-points").textContent).toBe(
+        "1 个（已保存）",
+      ),
     );
     expect(within(status).getByTestId("acquisition-status-after").textContent).toBe(
       "保存后保持停止",
@@ -204,7 +211,9 @@ describe("P0-2 / P2-2：已停止时的按钮、说明与状态区", () => {
     // 制造一次真实变更（周期 1000 → 2000），否则保存计划会按 NO_CHANGES 拒绝发 PUT。
     fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
     await waitFor(() =>
-      expect(screen.getByTestId("acquisition-status-interval").textContent).toBe("2000 ms"),
+      expect(screen.getByTestId("acquisition-status-interval").textContent).toBe(
+        "1000 ms（已保存） → 2000 ms（待保存）",
+      ),
     );
     await user.click(screen.getByTestId("apply-button"));
 
@@ -264,7 +273,9 @@ describe("P0-2：运行中的按钮/勾选/底部说明随动作变化", () => {
     // 同样制造一次真实变更，确保保存计划不会因 NO_CHANGES 提前返回。
     fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
     await waitFor(() =>
-      expect(screen.getByTestId("acquisition-status-interval").textContent).toBe("2000 ms"),
+      expect(screen.getByTestId("acquisition-status-interval").textContent).toBe(
+        "1000 ms（已保存） → 2000 ms（待保存）",
+      ),
     );
     await user.click(screen.getByTestId("apply-button"));
 
@@ -341,5 +352,104 @@ describe("P1-2：点位行两层信息 + 技术详情折叠 + 状态文案", () 
     expect(within(row).getByTestId("nck-point-name").textContent).toBe("原生点位");
     expect(within(row).getByTestId("nck-point-address").textContent).toBe("A / 1 / 26 / 30110 / 1");
     expect(row.textContent).not.toMatch(/进给|倍率|主轴转速/);
+  });
+});
+
+// P2-1/P2-2 用：在共享 NATIVE_SCHEMA 上追加一个可选 decode（枚举），
+// 用于验证「同一点位只改 decode」也必须清除已保存结论。
+const DECODE_SCHEMA = [
+  ...NATIVE_SCHEMA,
+  {
+    key: "decode",
+    label: "Decode",
+    field_type: "enum",
+    required: false,
+    default: "U16_LE",
+    validation: { enum_options: ["U16_LE", "U16_BE"] },
+    ui: {},
+  },
+];
+
+function nativePointWithDecode(decode: string): NckPointSelection {
+  return {
+    kind: "nck_native",
+    point_key: "native.A.1.26.30110.1",
+    parameters: { area: "A", area_no: 1, module: 26, column: 30110, line: 1, decode },
+  };
+}
+
+function nativeResources() {
+  return [
+    {
+      id: "variable",
+      label: { default: "Variable" },
+      parameters: { fields: DECODE_SCHEMA },
+      outputs: [],
+      modes: ["poll"],
+    },
+  ];
+}
+
+describe("P2-2（状态区）：区分「已保存」与「待保存」", () => {
+  it("未保存的周期改动只出现在「待保存」一侧，已保存值保持不变", async () => {
+    const state = mkState({ tasks: [nckTask([point("syn.collect.a", { channel: 1 })])] });
+    installFetch(state);
+    renderPane();
+    await waitFor(() =>
+      expect(screen.getByTestId("acquisition-status-interval").textContent).toBe(
+        "1000 ms（已保存）",
+      ),
+    );
+
+    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
+    await waitFor(() =>
+      expect(screen.getByTestId("acquisition-status-interval").textContent).toBe(
+        "1000 ms（已保存） → 2000 ms（待保存）",
+      ),
+    );
+    // 尚未保存：不得出现「已保存」结论，服务端也没收到 PUT。
+    expect(screen.queryByTestId("apply-result")).toBeNull();
+    expect(state.putBodies).toHaveLength(0);
+    // 点位没改 ⇒ 仍是已保存值（草稿不会冒充当前配置）。
+    expect(screen.getByTestId("acquisition-status-points").textContent).toBe("1 个（已保存）");
+  });
+});
+
+describe("P2-1（已保存状态）：改同一点位参数后「已保存」必须清除", () => {
+  it("保存成功 → 编辑同一点位的 decode → 旧「已保存」提示消失", async () => {
+    const user = userEvent.setup();
+    const state = mkState({
+      tasks: [nckTask([nativePointWithDecode("U16_LE")])],
+      resources: nativeResources(),
+    });
+    installFetch(state);
+    renderPane();
+
+    // 先制造一次可保存的变更（周期 1000 → 2000）并保存成功。
+    await waitFor(() =>
+      expect(screen.getByTestId("apply-button").hasAttribute("disabled")).toBe(false),
+    );
+    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
+    await user.click(screen.getByTestId("apply-button"));
+    expect(await screen.findByTestId("apply-result")).toBeTruthy();
+
+    // 编辑同一原生点位，只改 decode：point_key 与所有「键」都不变。
+    await user.click(
+      within(screen.getByTestId("nck-point-row")).getByRole("button", { name: /编\s*辑/ }),
+    );
+    const nativeForm = await screen.findByTestId("nck-native-fields");
+    // 原生表单里的下拉只有两个枚举字段：area、decode（decode 是第 2 个）；
+    // rc-select 在 mousedown 时展开候选。
+    const decodeCombo = within(nativeForm).getAllByRole("combobox")[1]!;
+    fireEvent.mouseDown(decodeCombo);
+    const candidates = await screen.findAllByText("U16_BE");
+    const option =
+      candidates.find((el) => el.classList.contains("ant-select-item-option-content")) ??
+      candidates[candidates.length - 1]!;
+    await user.click(option);
+    await user.click(within(nativeForm).getByTestId("nck-native-add-point"));
+
+    // 参数已变 ⇒ 旧的「已保存」结论必须立即失效（重新出现未保存状态）。
+    await waitFor(() => expect(screen.queryByTestId("apply-result")).toBeNull());
   });
 });

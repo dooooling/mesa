@@ -13,6 +13,7 @@ import {
   unsupportedFieldDetails,
   unsupportedFieldKeys,
   unsupportedFields,
+  unsupportedFieldsInResources,
   unsupportedFieldsInValue,
 } from "./descriptorCompatibility";
 
@@ -105,5 +106,50 @@ describe("unsupportedFieldsInValue（限制影响范围）", () => {
   it("没有配置值时不做判断", () => {
     expect(unsupportedFieldsInValue(s, undefined)).toEqual([]);
     expect(unsupportedFieldsInValue(s, null)).toEqual([]);
+  });
+});
+
+describe("unsupportedFieldsInResources（最终保存守卫：扫完整 Schema）", () => {
+  const s = schema([field("host", "host"), field("shape", "geometry", { advanced: true })]);
+
+  it("配置未携带未知必填字段也必须检出（驱动新增字段的唯一缺口）", () => {
+    const out = unsupportedFieldsInResources([
+      { resourceId: "probe", schema: s, values: [{ host: "1.2.3.4" }] },
+    ]);
+    expect(out.map((f) => f.key)).toEqual(["shape"]);
+    // 未携带：存量配置根本没有这个键，旧守卫（unsupportedFieldsInValue）会返回空。
+    expect(out[0]!.carried).toBe(false);
+    expect(out[0]!.resourceId).toBe("probe");
+    expect(out[0]!.advanced).toBe(true);
+  });
+
+  it("存量配置已携带时同样检出，并标注 carried", () => {
+    const out = unsupportedFieldsInResources([
+      { resourceId: "probe", schema: s, values: [{ host: "h", shape: { x: 1 } }] },
+    ]);
+    expect(out.map((f) => f.key)).toEqual(["shape"]);
+    expect(out[0]!.carried).toBe(true);
+  });
+
+  it("同一资源多条提交值：任一条携带即算携带", () => {
+    const out = unsupportedFieldsInResources([
+      { resourceId: "probe", schema: s, values: [{ host: "a" }, { shape: null }] },
+    ]);
+    expect(out[0]!.carried).toBe(true);
+  });
+
+  it("只扫传入的提交资源（未使用资源不在入参里 ⇒ 不会误报）", () => {
+    expect(unsupportedFieldsInResources([])).toEqual([]);
+  });
+
+  it("多个提交资源各自独立标注", () => {
+    const clean = schema([field("host", "host")]);
+    const out = unsupportedFieldsInResources([
+      { resourceId: "a", schema: clean, values: [{}] },
+      { resourceId: "b", schema: s, values: [{}] },
+    ]);
+    expect(out.map((f) => `${f.resourceId}:${f.key}:${f.carried}`)).toEqual([
+      "b:shape:false",
+    ]);
   });
 });

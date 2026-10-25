@@ -1,10 +1,12 @@
-// A3/A4 采集窗格回归（非 NCK 通用资源路径）：
+// A3/A4/P1 采集窗格回归（非 NCK 通用资源路径）：
 // - A3：已保存配置里带着「界面不认识的字段类型」⇒ 保存禁用且不发 PUT；
+// - P1：驱动新增未知必填字段、旧配置未携带 ⇒ 完整 Schema 守卫仍拒绝（且在任何请求前）；
 // - A4：点位行用「字段标签 + 值」摘要，替代原来的 JSON.stringify(parameters)。
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { EndpointAcquisitionPane } from "./EndpointAcquisitionPane";
 import { invokeDisabledButton } from "../test/bypassDisabled";
+import { UNSUPPORTED_CONFIG_NOTICE } from "../descriptorCompatibility";
 import type { ResourceDescriptor } from "../types";
 
 const EP = "ep-generic";
@@ -50,10 +52,17 @@ function taskWith(parameters: Record<string, unknown>) {
   };
 }
 
-function installFetch(resources: ResourceDescriptor[], tasks: unknown) {
+function installFetch(
+  resources: ResourceDescriptor[],
+  tasks: unknown,
+  options: { state?: "STOPPED" | "RUNNING" } = {},
+) {
   const puts: Array<{ url: string; body: unknown }> = [];
+  // P1 证据：记录**所有**请求，用于断言拒绝发生在 stop / PUT / start 之前。
+  const calls: Array<{ url: string; method: string }> = [];
   (globalThis as { fetch?: unknown }).fetch = vi.fn(async (url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
+    calls.push({ url, method });
     if (url.startsWith("/api/v1/drivers/") && url.endsWith("/descriptor")) {
       return { ok: true, status: 200, json: async () => ({ resources }) };
     }
@@ -68,12 +77,23 @@ function installFetch(resources: ResourceDescriptor[], tasks: unknown) {
       return {
         ok: true,
         status: 200,
-        json: async () => ({ endpoints: [{ id: EP, driver_id: "drv", runtime: { state: "STOPPED" } }] }),
+        json: async () => ({
+          endpoints: [
+            {
+              id: EP,
+              driver_id: "drv",
+              runtime: { state: options.state ?? "STOPPED" },
+            },
+          ],
+        }),
       };
+    }
+    if (url === `/api/v1/endpoints/${EP}/stop` || url === `/api/v1/endpoints/${EP}/start`) {
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
     }
     return { ok: false, status: 404, json: async () => ({}) };
   });
-  return { puts };
+  return { puts, calls };
 }
 
 beforeEach(() => {
@@ -104,8 +124,8 @@ describe("A3：未知字段类型阻止保存（只影响该配置）", () => {
     render(<EndpointAcquisitionPane endpointId={EP} driverId="drv" onChanged={() => {}} />);
 
     expect(await screen.findByTestId("acquisition-unsupported-fields")).toBeTruthy();
-    // 字段名与类型只在「技术详情」里出现一次
-    expect(screen.getByText("probe.value · shape · geometry")).toBeTruthy();
+    // 字段名与类型只在「技术详情」里出现一次；并标注是存量配置已携带。
+    expect(screen.getByText("probe · shape · geometry · 存量配置已携带")).toBeTruthy();
 
     const save = screen.getByTestId("apply-button") as HTMLButtonElement;
     expect(save.disabled).toBe(true);
@@ -113,7 +133,9 @@ describe("A3：未知字段类型阻止保存（只影响该配置）", () => {
     await waitFor(() => expect(srv.puts).toHaveLength(0));
   });
 
-  it("未知类型只在 Descriptor 里声明、配置未携带 → 不阻断保存（限制影响范围）", async () => {
+  it("P1：驱动新增未知必填字段、旧配置未携带 → 完整 Schema 守卫拒绝，且不发任何请求", async () => {
+    // 驱动升级后新增 required 字段 "shape"（未知类型），存量配置里没有这个键。
+    // 旧守卫（unsupportedFieldsInValue）返回空 ⇒ 会放行；新守卫必须按完整 Schema 拒绝。
     const resources = [
       resource({
         parameters: {
@@ -123,7 +145,7 @@ describe("A3：未知字段类型阻止保存（只影响该配置）", () => {
               key: "shape",
               label: "Shape",
               field_type: "geometry" as ResourceDescriptor["parameters"]["fields"][number]["field_type"],
-              required: false,
+              required: true,
               validation: {},
               ui: {},
             },
@@ -131,7 +153,52 @@ describe("A3：未知字段类型阻止保存（只影响该配置）", () => {
         },
       }),
     ];
-    const srv = installFetch(resources, taskWith({ unit: 3 }));
+    // RUNNING：若守卫失效，保存会真的发出 stop → PUT → start（便于证明"拒绝在任何请求之前"）。
+    const srv = installFetch(resources, taskWith({ unit: 3 }), { state: "RUNNING" });
+    render(<EndpointAcquisitionPane endpointId={EP} driverId="drv" onChanged={() => {}} />);
+
+    expect(await screen.findByTestId("acquisition-unsupported-fields")).toBeTruthy();
+    expect(
+      screen.getByText("probe · shape · geometry · 配置未携带（驱动新增字段）"),
+    ).toBeTruthy();
+
+    const save = screen.getByTestId("apply-button") as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    // 记录点击前的请求数：加载阶段的 GET 不计入。
+    const before = srv.calls.length;
+    // 绕过 disabled，直接触发组件级 onClick：守卫若缺失，这里会真的发 stop/PUT/start。
+    expect(invokeDisabledButton(save)).toBe(true);
+    await act(async () => {});
+    // 拒绝必须发生在任何 stop / PUT / start 之前（也不应有提交前的 preview）。
+    expect(srv.calls.length).toBe(before);
+    expect(srv.puts).toHaveLength(0);
+    expect(srv.calls.some((c) => /\/stop$|\/start$/.test(c.url))).toBe(false);
+    expect(srv.calls.some((c) => c.method === "PUT")).toBe(false);
+    // 用户可见的拒绝原因来自 Schema 守卫本身（toast，不是"未通过身份核验"那类分支）。
+    await waitFor(() => {
+      const toast = document.querySelector(".ant-message");
+      expect(toast?.textContent ?? "").toContain(UNSUPPORTED_CONFIG_NOTICE);
+    });
+  });
+
+  it("未知类型只在**未使用**的其它资源里声明 → 不阻断本次保存（限制影响范围）", async () => {
+    // 提交只涉及 probe（Schema 干净）；unused 资源声明了未知类型但没被提交。
+    const unused = resource({
+      id: "unused",
+      parameters: {
+        fields: [
+          {
+            key: "shape",
+            label: "Shape",
+            field_type: "geometry" as ResourceDescriptor["parameters"]["fields"][number]["field_type"],
+            required: true,
+            validation: {},
+            ui: {},
+          },
+        ],
+      },
+    });
+    const srv = installFetch([resource(), unused], taskWith({ unit: 3 }));
     render(<EndpointAcquisitionPane endpointId={EP} driverId="drv" onChanged={() => {}} />);
 
     await waitFor(() => expect(screen.getByTestId("apply-button")).toBeTruthy());
