@@ -39,8 +39,12 @@
   - `apps/mesa-web/src/nckPointModel.ts:696-717`：把服务端 preview 返回的 `scope`
     与目录条目的 `scope` 逐字比对，不一致即拒绝。
 - **为什么是耦合**：`scope` 是 **Driver 定义目录**里的字段，但「什么值可采集」
-  由 Web 用字符串白名单二次解释。Core/Driver 并不校验 `scope`，所以 Web 的
-  白名单实际上成了唯一执行点。
+  由 Web 用字符串白名单二次解释。**Driver 在 `configure` 阶段确实校验** ——
+  `crates/sinumerik-nck/src/compiler.rs:626-640` 的 `ensure_collectable_scope`
+  （`!= Collect` 即拒），由 `lib.rs:716-724` 在 configure 调用。**但预览（preview）
+  只回 `scope` 原值、不返回权威准入结论**（`definition_api.rs:658`）。前端要在
+  「列表过滤 / 加入 / 保存前」三个时刻给结论，只能自己解释规则。
+  **⇒ 缺口是「预览无权威准入结论」，不是「Web 是唯一执行点」。**
 - **风险**：驱动新增 `scope` 取值（例如 `"probe"`）时，Web 的未知值处理是
   fail-closed（正确），但**语义完全由 Web 猜测**；反过来若某驱动把可采集标成
   `"Collect"`（大小写），Web 会静默拒绝，而驱动认为合法。
@@ -49,7 +53,7 @@
 
 - **位置**
   - `apps/mesa-web/src/deviceModel.ts:249-255`：`isNckDriver()` 用 `driver_id`
-    字符串包含 `"nck"` 判定，`bindingKindForDriver()` 据此在
+    **规范化后精确等于** `sinumerik-nck` 判定（不是子串包含），`bindingKindForDriver()` 据此在
     `mesa.resources.v1` / `nck.points.v1` 之间二选一。
   - `apps/mesa-web/src/endpointSavePlan.ts:97-109`：`planEndpointTaskSave` 以
     `isNckDriver(input.driverId)` 决定走哪条保存计划。
@@ -72,8 +76,9 @@
     `quality` 字符串（`"BAD"` / `"UNCERTAIN"`）分支决定文案与颜色。
   - `apps/mesa-web/src/qualityCode.ts:120-126`：`shouldShowCodeSection()` 用
     `"GOOD"` 字面量决定是否渲染码区。
-- **为什么是耦合**：码表与码空间是**协议知识**（Core 不懂协议），却存在 Web；
-  `GOOD/BAD/UNCERTAIN` 是 Core 质量枚举的 wire 字符串，Web 用裸字符串比较。
+- **为什么是耦合**：**需要区分两层** ——
+  - **通用质量枚举**（`GOOD` / `BAD` / `UNCERTAIN`）**不属于驱动耦合**：它是 Core 的质量枚举，Web 使用它是**合理**的，不需要迁移。
+  - **真正的耦合**是：① **协议码表**（S7 item 字节、OPC UA StatusCode、FOCAS2 分类码）硬编码在 Web；② **按 `driver_id` 解释质量码**的分支逻辑（`classifyCode`）。这两者才是协议知识泄漏，应迁至 Driver 声明或返回。
 - **风险**：驱动改码表/新增码空间，Web 不更新就只能显示 `UNKNOWN`；更严重的是
   同一数字在不同驱动语义不同，前端按 `driver_id` 猜错会把「参数错」解释成
   「地址不存在」。
@@ -132,8 +137,13 @@
 ## 三、拟改契约：具体加/改什么，版本影响
 
 > 统一原则：**只加字段、不改旧字段语义**；Web 对缺失新字段的旧驱动保留现有
-> fallback（并标注 `TODO` 移除版本）。因此除特别说明外，均为 **contract_minor**
-> 变更（向后兼容）；删除 fallback 才需要 **contract_major**。
+> fallback（并标注 `TODO` 移除版本）。
+>
+> **⚠️ 版本影响一律标为「待评审」** —— 下表"版本影响"列只是**初判**，不是结论：
+> - **C4 涉及 snapshot 结构**（`code_namespace`），其版本归属需单独评审，**不能**笼统按 Descriptor minor 处理；
+> - 其余项也需在动契约前逐项确认：新增字段默认值、老驱动行为、能力协商方式、不支持时的降级路径。
+>
+> 一般规律（仅供初判参考）：JSON 字段**加法 + 缺失可回退**通常为 minor；**形态变更**（如 string → 联合类型）或**删除 fallback** 才升 major。
 
 | 编号 | 变更 | 类型/默认 | 兼容策略 | 版本影响 |
 |---|---|---|---|---|
@@ -141,7 +151,7 @@
 | C2 | 定义目录条目增 `collectable: bool` + `admission: {code, message}`；或 Core 通用 `admission` 结构 | `collectable` 可选；缺失 ⇒ Web 保持现有 `scope` 白名单 | 目录 `format_version` 1 → 2，旧字段保留 | minor（format_version +1） |
 | C3 | `DriverDescriptor.task_bindings: [{ kind, schema, modes }]` | 可选；缺失 ⇒ Web 按 `driver_id` fallback | Web 优先声明，fallback 标注废弃 | minor |
 | C4 | `DriverDescriptor.quality_codes: [{ namespace, code, class, text }]`；snapshot 增 `code_namespace` | 可选；缺失 ⇒ 现有 `driver_id` 分支 | Core 透传 namespace，Web 不再按 id 猜 | minor（snapshot 加字段） |
-| C5 | 原生点位身份改由**服务端 preview** 返回权威 `point_key`；Descriptor 侧只保留 `identity` 声明用于展示 | 新端点/新字段可选 | Web 删除 `nativeDerivedPointKey` 需与 preview 接线同批；旧驱动缺 preview ⇒ 保持只读、禁止保存 | minor（加 preview 能力）；删除副本本身是 Web 内部变更 |
+| C5 | **原生 derived 点位已有服务端 preview 支持**，缺的是**前端接通**（当前 Web 仍用 `nativeDerivedPointKey` 本地复刻）；Descriptor 侧只保留 `identity` 声明用于展示 | 端点已存在；Web 改为调用即可 | Web 删除本地复刻需与 preview 接线同批；旧驱动缺 preview ⇒ 保持只读、禁止保存 | **待评审**（端点已存在，可能不涉版本）；删除副本本身是 Web 内部变更 |
 | C6 | `ResourceDescriptor.role: "native_address" \| "point_address" \| ...`（或 Descriptor 顶层 `native_parameters_resource`） | 可选；缺失 ⇒ 现有 `id === "variable"` fallback | Web 优先 role，fallback 标注废弃 | minor |
 
 **不做的事（本批明确排除）**：
@@ -156,8 +166,7 @@
   确认（`ui` 目前是纯展示提示，放输入格式是否越界 —— 待确认）。
 - C4 的 `code_namespace` 由 Core 在 snapshot 上补，还是由 Driver 在 point 更新里
   自带，需要看 IPC 消息是否允许扩展（待确认）。
-- C5 的 preview 端点目前只有 NCK 语义点位使用；原生点位复用同一端点还是新增
-  `native-preview`，需要驱动侧确认（待确认）。
+- C5：**原生 derived 点位已有服务端预览支持**，需确认的是前端接线方式（复用同一端点）。**另需区分**：`identity_mode = user` 表示**身份由用户指定**，现有 preview 对该模式**明确拒绝** —— 这两者不能混为一谈，用户指定身份的点位不在本项范围内（待确认）。
 
 ---
 
