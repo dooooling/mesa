@@ -19,6 +19,7 @@
 import { useEffect, useState } from "react";
 import { Alert, Button, Card, Checkbox, Input, Select, Tabs, Tag, message } from "antd";
 import type { ResourceDescriptor, SchemaDescriptor } from "../types";
+import { localizedText } from "../localizedText";
 import { materializeSchemaDefaults, missingRequiredParams } from "../resourceSelectionModel";
 import {
   allKnownPointKeys,
@@ -27,6 +28,7 @@ import {
   type ResourceSelectionLike,
 } from "../resourceSelectionModel";
 import { DescriptorFields } from "./DescriptorFields";
+import { UNSUPPORTED_CONFIG_NOTICE, unsupportedFields } from "../descriptorCompatibility";
 import {
   ResourceBrowseAntd,
   type NckSemanticBrowseConfig,
@@ -151,6 +153,11 @@ export function ResourcePickerAntd({
 
   const res = resources.find((r) => r.id === rid);
   if (!res) return <div style={{ color: "#525252" }}>无可用资源</div>;
+
+  // A3：未知字段类型 ⇒ 该资源参数**不可编辑、不可加入**。
+  // 判定基于完整 Schema（含高级/隐藏字段），打开界面即生效；只影响当前资源，
+  // 不阻止切换资源或使用其它连接。
+  const unsupported = unsupportedFields(res.parameters);
 
   // required 前置（表单完整性预检，唯一允许的前端 required 判断）：
   // 缺席的必填字段 key 列表（`0`/`false` 视为在场，不得 truthy 判）；
@@ -293,8 +300,14 @@ export function ResourcePickerAntd({
 
         <Button
           type="primary"
-          disabled={!outputs.length || missingRequired.length > 0}
+          disabled={!outputs.length || missingRequired.length > 0 || unsupported.length > 0}
           onClick={() => {
+            // A3 提交门（与 disabled 同源，防程序化绕过）：未知字段类型的配置
+            // 既不能编辑也不能提交，绝不发出一个界面没看懂的选择。
+            if (unsupported.length > 0) {
+              message.error(UNSUPPORTED_CONFIG_NOTICE);
+              return;
+            }
             // required 前置防御（即使绕过 disabled，onClick 再判一次）：
             // 缺席即拒绝，不发 onAdd；类型/enum/range/pattern 不判，交 Core。
             const missing = missingRequiredParams(
@@ -469,11 +482,9 @@ function SemanticResourcePicker({
   );
 }
 
-function labelOf(label: unknown): string | undefined {
-  if (typeof label === "string") return label;
-  if (label && typeof label === "object") {
-    const d = (label as { default?: unknown }).default;
-    return typeof d === "string" ? d : undefined;
-  }
-  return undefined;
+// 资源 / 输出标签的唯一取值入口（A1）：统一走 localizedText（优先 zh-CN，
+// 回落 default）。返回空串即视为「没有标签」，由调用方退回 id。
+function labelOf(label: ResourceDescriptor["label"] | null | undefined): string | undefined {
+  const text = localizedText(label);
+  return text === "" ? undefined : text;
 }

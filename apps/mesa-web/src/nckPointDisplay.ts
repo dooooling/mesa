@@ -11,6 +11,7 @@
 // 本模块不 import React/AntD，也不做任何身份/准入判定：它只负责把已经通过
 // 校验的点位渲染成人能读的两行信息，判定仍在 nckPointModel / nckCollectability。
 import { buildNckFormModel, nckDefinitionLabel, type NckDefinitionLike } from "./nckPointModel";
+import { summarizeParameters } from "./pointSummary";
 
 /** 展示所需的最小点位形态（与 `NckPointSelection` 结构兼容）。 */
 export interface NckDisplayPoint {
@@ -82,23 +83,30 @@ function semanticAddress(
     for (const field of model.argumentFields) argLabels.set(field.key, field.label || field.key);
   }
 
-  const parts: string[] = [];
-  for (const [key, value] of Object.entries(target)) {
-    const label = TARGET_LABELS[key] ?? key;
-    if (isPlainObject(value)) {
+  // A4：地址行改为复用**通用**「字段标签 + 值」摘要（不再为 NCK 单独维护一套
+  // 拼接逻辑）。target/arguments 摊平成同一层键值，标签仍只来自既有事实：
+  // TARGET_LABELS（字段名翻译）与定义目录的 argument label。
+  const labels = new Map<string, string>();
+  for (const key of Object.keys(target)) {
+    const label = TARGET_LABELS[key];
+    if (label) labels.set(key, label);
+  }
+  for (const [key, label] of argLabels) labels.set(key, label);
+
+  const body = summarizeParameters(
+    { ...target, ...args },
+    {
+      separator: " / ",
+      labelOf: (key) => labels.get(key),
       // drive_object 的 envelope：{number, entry}；entry 是入口身份，不是业务名。
-      const number = value.number;
-      const entry = typeof value.entry === "string" ? value.entry : "";
-      parts.push(`${label} ${formatScalar(number)}${entry ? `（入口 ${entry}）` : ""}`);
-    } else {
-      parts.push(`${label} ${formatScalar(value)}`);
-    }
-  }
-  for (const [key, value] of Object.entries(args)) {
-    const label = argLabels.get(key) ?? key;
-    parts.push(`${label} ${formatScalar(value)}`);
-  }
-  return parts.length ? `语义点位 · ${parts.join(" / ")}` : "语义点位";
+      formatEntry: (key, value) => {
+        if (key !== "drive_object" || !isPlainObject(value)) return undefined;
+        const entry = typeof value.entry === "string" ? value.entry : "";
+        return `${TARGET_LABELS.drive_object} ${formatScalar(value.number)}${entry ? `（入口 ${entry}）` : ""}`;
+      },
+    },
+  );
+  return body ? `语义点位 · ${body}` : "语义点位";
 }
 
 /**

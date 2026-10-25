@@ -56,6 +56,12 @@ import {
 } from "../nckNativeModel";
 import { applySelectionAdd } from "../resourceSelectionModel";
 import { nckPointDisplay } from "../nckPointDisplay";
+import { pointSummary } from "../pointSummary";
+import {
+  UNSUPPORTED_CONFIG_NOTICE,
+  unsupportedFieldsInValue,
+  type UnsupportedField,
+} from "../descriptorCompatibility";
 import { ApplyWithRestart, type ApplyResult } from "./ApplyWithRestart";
 import { NckPointFields } from "./NckPointFields";
 import { ResourceBrowseAntd } from "./ResourceBrowseAntd";
@@ -614,11 +620,52 @@ export function EndpointAcquisitionPane({
     });
   }, [nck, nckPoints, lookupDefinition]);
 
+  /**
+   * A3：已选配置中**确实带着**界面不认识的字段类型的项。
+   *
+   * 两个刻意的收窄：
+   * - 只检查「配置里存在该 key」的项（`unsupportedFieldsInValue`），而不是
+   *   「Descriptor 声明了就封保存」——否则驱动多声明一个当前未使用的类型就会
+   *   波及与问题无关的配置；
+   * - NCK 语义点位的参数来自定义目录（target/arguments），不经过 Descriptor
+   *   参数 Schema，因此只检查原生点位。
+   *
+   * 影响范围：仅当前 Endpoint 的保存按钮；不停已运行的采集，也不阻断其它连接。
+   */
+  const incompatible = useMemo(() => {
+    const out: Array<UnsupportedField & { pointKey: string }> = [];
+    if (!desc) return out;
+    if (nck) {
+      if (!nativeSchema) return out;
+      for (const point of nckPoints) {
+        if (point.kind !== "nck_native") continue;
+        for (const field of unsupportedFieldsInValue(nativeSchema, point.parameters)) {
+          out.push({ ...field, pointKey: point.point_key });
+        }
+      }
+      return out;
+    }
+    for (const sel of sels) {
+      const schema = (desc.resources ?? []).find((r) => r.id === sel.resource_id)?.parameters;
+      const pointKey = sel.outputs.map((o) => o.point_key).join(", ") || sel.resource_id;
+      for (const field of unsupportedFieldsInValue(schema, sel.parameters)) {
+        out.push({ ...field, pointKey });
+      }
+    }
+    return out;
+  }, [desc, nck, nativeSchema, nckPoints, sels]);
+  const hasIncompatible = incompatible.length > 0;
+
   const save = async (restart: boolean) => {
     // 快照门：pending / 失败 / 串 Endpoint 一律不可 PUT。
     if (!isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, endpointId)) {
       if (tasksLoadState === "error") return message.error("任务快照加载失败，禁止保存以防覆盖已有任务。请切换后重试。");
       return message.warning("任务快照加载中，禁止保存以防覆盖已有任务。请稍候。");
+    }
+    // A3 提交门：配置里确实带着界面不认识的字段类型时，拒绝整份保存。
+    // 只影响当前 Endpoint 的配置；不停采集、不阻断其它连接。
+    if (hasIncompatible) {
+      return message.error(UNSUPPORTED_CONFIG_NOTICE);
     }
     // 描述门（仅非 NCK）：旧路径的选型来自 Descriptor，缺失时不得凭空回写。
     if (!nck && !desc) return message.error("资源描述加载失败，禁止保存。请切换后重试。");
@@ -1264,14 +1311,51 @@ export function EndpointAcquisitionPane({
       )}
       {!nck && !!sels.length && (
         <div style={{ display: "grid", gap: 6 }}>
-          {sels.map((s, idx) => (
-            <div key={idx} style={{ display: "flex", gap: 8, alignItems: "center", padding: 6, border: "1px solid #e0e0e0", borderRadius: 0 }}>
-              <span style={{ flex: 1, fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}>{s.resource_id} → {s.outputs.map((o) => o.point_key).join(", ")} <span style={{ color: "#525252" }}>{JSON.stringify(s.parameters)}</span></span>
-              <Button size="small" danger onClick={() => setSels((p) => p.filter((_, i) => i !== idx))}>移除</Button>
-            </div>
-          ))}
+          {sels.map((s, idx) => {
+            // A4：通用「字段标签 + 值」摘要（标签来自 Descriptor 字段 label）；
+            // 无可读参数时 pointSummary 回落 point_key——此处不再重复渲染
+            // 一遍与左侧相同的 key，避免 `register.value register.value`。
+            const schema = (desc?.resources ?? []).find((r) => r.id === s.resource_id)?.parameters;
+            const pointKeys = s.outputs.map((o) => o.point_key).join(", ");
+            const summary = pointSummary({
+              point_key: pointKeys,
+              parameters: s.parameters,
+              schema,
+            });
+            return (
+              <div key={idx} style={{ display: "flex", gap: 8, alignItems: "center", padding: 6, border: "1px solid #e0e0e0", borderRadius: 0 }}>
+                <span style={{ flex: 1, fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}>{s.resource_id} → {pointKeys} {summary && summary !== pointKeys ? <span style={{ color: "#525252" }}>{summary}</span> : null}</span>
+                <Button size="small" danger onClick={() => setSels((p) => p.filter((_, i) => i !== idx))}>移除</Button>
+              </div>
+            );
+          })}
         </div>
       )}
+      {hasIncompatible ? (
+        // A3：提示只出现一次（不逐行红框），字段名/类型收在「技术详情」。
+        // 只禁用本 Endpoint 的保存；不停已运行的采集，也不影响其它连接。
+        <Alert
+          type="warning"
+          showIcon
+          data-testid="acquisition-unsupported-fields"
+          message={UNSUPPORTED_CONFIG_NOTICE}
+          description={
+            <details data-testid="acquisition-unsupported-details">
+              <summary style={{ cursor: "pointer", fontSize: 12 }}>技术详情</summary>
+              <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+                {incompatible.map((item, idx) => (
+                  <li
+                    key={`${item.pointKey}-${item.key}-${idx}`}
+                    style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}
+                  >
+                    {item.pointKey} · {item.key} · {item.fieldType}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          }
+        />
+      ) : null}
       <div>
         {/* P0-2：已停止时保存只写配置（onApply(false)），按钮不得写「保存并启动」；
             运行中的恢复运行由 restart 勾选决定，结果由 lastApply 明确回显。 */}
@@ -1280,6 +1364,7 @@ export function EndpointAcquisitionPane({
           applying={saving}
           canApply={
             isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, endpointId) &&
+            !hasIncompatible &&
             (nck
               ? !!definitions &&
                 !!endpointFamily &&

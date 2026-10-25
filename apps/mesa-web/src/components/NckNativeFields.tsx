@@ -12,6 +12,7 @@ import type { SchemaDescriptor } from "../types";
 import type { NckPointSelection } from "../deviceModel";
 import { DescriptorFields } from "./DescriptorFields";
 import { materializeSchemaDefaults } from "../resourceSelectionModel";
+import { UNSUPPORTED_CONFIG_NOTICE, unsupportedFields } from "../descriptorCompatibility";
 import {
   buildNativePointSelection,
   nativeAddressParameters,
@@ -60,13 +61,21 @@ export function NckNativeFields({
   const userCheck = validateNativeUserPointKey(userKey);
   const key = identityMode === "derived" ? derivedKey : userCheck.ok ? userCheck.key : null;
   const conflict = !!key && takenPointKeys.includes(key);
+  // A3：原生字段 Schema 含界面不认识的类型 ⇒ 不允许加入点位（只影响本表单）。
+  const unsupported = unsupportedFields(schema);
   const canSubmit =
     issues.length === 0 &&
     !!key &&
     !conflict &&
+    unsupported.length === 0 &&
     (identityMode === "derived" || (confirmed && userCheck.ok));
 
   const submit = () => {
+    // A3 提交门（与按钮 disabled 同源）：未知字段类型不得进入点位参数。
+    if (unsupported.length > 0) {
+      setSubmitError(UNSUPPORTED_CONFIG_NOTICE);
+      return;
+    }
     // P1 加固：`confirmed` 必须在这里再复核一次。
     // 按钮的 disabled 只是 UI 层约束（React/AntD 都会拦截禁用按钮的 click），
     // 不能作为唯一防线：任何绕过 disabled 的程序化调用（直接触发内部 handler、

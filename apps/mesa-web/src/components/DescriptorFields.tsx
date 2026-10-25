@@ -1,10 +1,23 @@
 // PR8 受控描述字段：值纯 controlled（无内部值状态），只理解 FieldDescriptor，
 // 不理解 Driver / Protocol / EventStream ID。PR9 OPC UA 事件过滤参数直接复用。
 // 唯一内部状态是高级折叠显隐（纯展示，不触碰值）。
+//
+// 未知 `field_type` 的处理（A3）：不再「兜底成可编辑文本框」。已知文本类类型
+// 共用一个文本框；未知类型整体拒绝编辑——顶部一条兼容性提示 + 只读原值，
+// 并把字段名/类型收进「技术详情」。判定扫完整 Schema（含高级区/隐藏字段），
+// 避免用户展开折叠后才发现不支持。
 import { useState } from "react";
-import { Button, Checkbox, Input, InputNumber, Select } from "antd";
+import { Alert, Button, Checkbox, Input, InputNumber, Select } from "antd";
 import type { FieldDescriptor, SchemaDescriptor } from "../types";
 import { materializeSchemaDefaults } from "../resourceSelectionModel";
+import {
+  UNSUPPORTED_CONFIG_NOTICE,
+  isTextLikeFieldType,
+  unsupportedFieldDetails,
+  unsupportedFieldKeys,
+  unsupportedFields,
+  type UnsupportedField,
+} from "../descriptorCompatibility";
 
 /**
  * TSAP 文本编辑态：本地 draft（输入 0x010 不格式化打断），失焦/回车时
@@ -291,17 +304,102 @@ function FieldControl({
       </div>
     );
   }
+  // 显式白名单：只有已知文本类类型才共用文本框。未知类型**不得**落到这里
+  // （上层已用只读视图替换），此处的防御分支也不渲染可编辑控件——宁可少一个
+  // 输入框，也不能让界面假装认识一个它不认识的类型。
+  if (isTextLikeFieldType(field.field_type)) {
+    return (
+      <div style={{ display: "grid", gap: 4 }}>
+        <span style={{ fontSize: 12 }}>{label}</span>
+        <Input
+          disabled={disabled}
+          value={String(value ?? field.default ?? "")}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={field.ui.placeholder}
+          style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}
+        />
+      </div>
+    );
+  }
+  return <UnsupportedFieldView field={field} value={value} />;
+}
+
+/**
+ * 未知类型的**只读**视图。
+ *
+ * 三条硬约束：
+ * 1. 允许查看已有配置：原值原样展示（对象走 JSON，不做 `String(...)` 强转，
+ *    避免把结构化值变成 `[object Object]` 后被用户当成“已损坏”）；
+ * 2. 不产生任何 `onChange`：值不被改写，保存其它字段时该键原样保留；
+ * 3. 不在字段旁重复提示：兼容性说明只在顶部出现一次，字段名/类型进「技术详情」。
+ */
+function UnsupportedFieldView({ field, value }: { field: FieldDescriptor; value: unknown }) {
   return (
-    <div style={{ display: "grid", gap: 4 }}>
-      <span style={{ fontSize: 12 }}>{label}</span>
-      <Input
-        disabled={disabled}
-        value={String(value ?? field.default ?? "")}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={field.ui.placeholder}
-        style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace" }}
-      />
+    <div
+      data-testid={`descriptor-unsupported-field-${field.key}`}
+      style={{ display: "grid", gap: 4 }}
+    >
+      <span style={{ fontSize: 12 }}>
+        {field.label} <span style={{ color: "#8c8c8c" }}>（当前界面不支持该类型，只读）</span>
+      </span>
+      <pre
+        style={{
+          margin: 0,
+          padding: 6,
+          background: "#f4f4f4",
+          border: "1px solid #e0e0e0",
+          fontSize: 11,
+          maxHeight: 120,
+          overflow: "auto",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-all",
+          fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace",
+        }}
+      >
+        {rawValueText(value)}
+      </pre>
     </div>
+  );
+}
+
+/** 原值展示文本：字符串原样，标量转字面量，其余 JSON（不做语义解释）。 */
+function rawValueText(value: unknown): string {
+  if (value === undefined) return "（未设置）";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/** 兼容性提示：整块只出现一次；字段名与类型收在「技术详情」里。 */
+function UnsupportedNotice({ fields }: { fields: UnsupportedField[] }) {
+  return (
+    <Alert
+      type="warning"
+      showIcon
+      data-testid="descriptor-unsupported-notice"
+      message={UNSUPPORTED_CONFIG_NOTICE}
+      description={
+        <details data-testid="descriptor-unsupported-details">
+          <summary style={{ cursor: "pointer", fontSize: 12 }}>技术详情</summary>
+          <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+            {unsupportedFieldDetails(fields).map((line) => (
+              <li
+                key={line}
+                style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}
+              >
+                {line}
+              </li>
+            ))}
+          </ul>
+        </details>
+      }
+    />
   );
 }
 
@@ -344,7 +442,11 @@ export function DescriptorFields({
   };
   const fields = (schema.fields ?? []).filter((f) => isVisible(f, value));
   const sorted = [...fields].sort((a, b) => (a.ui.order ?? 999) - (b.ui.order ?? 999));
-  if (sorted.length === 0) return <div style={{ color: "#525252", fontSize: 12 }}>该流无参数</div>;
+  // 兼容性判定扫**完整 Schema**（不受折叠/visible_if 影响）：打开界面即知道
+  // 有没有不支持的类型，绝不等用户展开高级区才发现。
+  const unsupported = unsupportedFields(schema);
+  const unsupportedKeys = unsupportedFieldKeys(unsupported);
+  const blocked = unsupported.length > 0;
   const base = sorted.filter((f) => f.ui.advanced !== true);
   const advanced = sorted.filter((f) => f.ui.advanced === true);
   const highlighted = new Set(highlightKeys ?? []);
@@ -372,13 +474,20 @@ export function DescriptorFields({
                   : undefined
               }
             >
-              <FieldControl
-                field={f}
-                value={value[f.key]}
-                disabled={disabled}
-                onChange={(v) => onChange({ ...value, [f.key]: v })}
-                onDraftText={onDraftText}
-              />
+              {unsupportedKeys.has(f.key) ? (
+                // 未知类型：只读原值，绝不渲染可编辑控件（也不强转字符串）。
+                <UnsupportedFieldView field={f} value={value[f.key]} />
+              ) : (
+                <FieldControl
+                  field={f}
+                  value={value[f.key]}
+                  // 存在不支持字段时整份配置只读：界面不能一边说“不支持”一边
+                  // 让用户继续改其它字段再提交（那会掩盖问题）。
+                  disabled={disabled || blocked}
+                  onChange={(v) => onChange({ ...value, [f.key]: v })}
+                  onDraftText={onDraftText}
+                />
+              )}
             </div>
           ))}
         </div>
@@ -387,15 +496,22 @@ export function DescriptorFields({
   };
   return (
     <div style={{ display: "grid", gap: 12 }}>
-      {renderGroups(base)}
-      {advanced.length > 0 ? (
-        <div>
-          <Button size="small" onClick={toggleAdvanced}>
-            {showAdvanced ? "▾ 收起高级" : `▸ 高级（${advanced.length}）`}
-          </Button>
-          {showAdvanced ? <div style={{ marginTop: 8 }}>{renderGroups(advanced)}</div> : null}
-        </div>
-      ) : null}
+      {blocked ? <UnsupportedNotice fields={unsupported} /> : null}
+      {sorted.length === 0 && !blocked ? (
+        <div style={{ color: "#525252", fontSize: 12 }}>该流无参数</div>
+      ) : (
+        <>
+          {renderGroups(base)}
+          {advanced.length > 0 ? (
+            <div>
+              <Button size="small" onClick={toggleAdvanced}>
+                {showAdvanced ? "▾ 收起高级" : `▸ 高级（${advanced.length}）`}
+              </Button>
+              {showAdvanced ? <div style={{ marginTop: 8 }}>{renderGroups(advanced)}</div> : null}
+            </div>
+          ) : null}
+        </>
+      )}
     </div>
   );
 }

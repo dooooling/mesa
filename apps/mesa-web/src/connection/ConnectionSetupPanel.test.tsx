@@ -1175,3 +1175,43 @@ describe("C2 面板：跨系列预设遗留（只清理未被用户改过的预�
     expect(inputByLabel(srv.container, "Remote TSAP").value).toBe("");
   });
 });
+
+// A3：连接参数里出现界面不认识的字段类型时，校验/测试/保存全部禁用。
+// 只影响这一条连接，不阻断其它连接，也不触碰运行中的采集。
+describe("A3 未知字段类型：连接动作全部禁用", () => {
+  const BAD_FIELDS = [
+    ...NCK_FIELDS,
+    {
+      key: "shape",
+      label: "Shape",
+      field_type: "geometry",
+      required: false,
+      validation: {},
+      ui: { advanced: true },
+    },
+  ];
+
+  it("打开即提示；测试连接/下一步禁用，绕过 disabled 也不发探测、不提交", async () => {
+    const srv = installFetch({
+      drivers: NCK_DRIVER,
+      descriptors: { "sinumerik-nck": { fields: BAD_FIELDS } },
+    });
+    const view = renderPanel();
+    await waitFor(() => expect(inputByLabel(view.container, "Host")).toBeTruthy());
+
+    expect(screen.getByTestId("descriptor-unsupported-notice")).toBeTruthy();
+    expect(screen.getByText("shape · geometry（高级）")).toBeTruthy();
+
+    const testBtn = screen.getByRole("button", { name: /测试连接/ }) as HTMLButtonElement;
+    const submitBtn = screen.getByRole("button", { name: /下一步/ }) as HTMLButtonElement;
+    expect(testBtn.disabled).toBe(true);
+    expect(submitBtn.disabled).toBe(true);
+
+    // 绕过 disabled 的探针：提交函数自己的守卫必须拦住
+    expect(invokeDisabledButton(testBtn)).toBe(true);
+    expect(invokeDisabledButton(submitBtn)).toBe(true);
+    await act(async () => {});
+    expect(probeCalls(srv.calls)).toHaveLength(0);
+    expect(view.onSubmit).not.toHaveBeenCalled();
+  });
+});

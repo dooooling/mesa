@@ -352,3 +352,30 @@ describe("EventTaskEditor", () => {
     await waitFor(() => expect(screen.getByText(/配置已保存，但恢复运行失败/)).toBeTruthy());
   });
 });
+
+// A3：事件流参数出现界面不认识的字段类型时，整次订阅保存禁用。
+// 保存是全量快照替换，界面没看懂的值不允许被写回。
+describe("EventTaskEditor 未知字段类型（A3）", () => {
+  it("流参数含未知类型 → 打开即提示且「保存订阅」禁用", async () => {
+    mockStopped([GENERIC_TASK]);
+    const incompatible = JSON.parse(JSON.stringify(DESCRIPTOR)) as typeof DESCRIPTOR;
+    incompatible.events.streams[0].parameters = {
+      fields: [
+        {
+          key: "shape",
+          label: "Shape",
+          field_type: "geometry" as unknown as "string",
+          required: false,
+          validation: {},
+          ui: {},
+        },
+      ],
+    } as unknown as (typeof DESCRIPTOR)["events"]["streams"][number]["parameters"];
+    mocked.getDescriptor.mockResolvedValue(incompatible);
+    render(<EventTaskEditor />);
+    await screen.findByText("Counter (stream.counter)");
+    expect(await screen.findByTestId("descriptor-unsupported-notice")).toBeTruthy();
+    const save = screen.getByRole("button", { name: "保存订阅" }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+  });
+});
