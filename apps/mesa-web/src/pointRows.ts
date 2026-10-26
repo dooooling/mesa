@@ -29,15 +29,37 @@ export interface RowIdAllocator {
  * 创建分配器。`prefix` 只用于调试可读性（如 `nck` / `sel`），不参与判定。
  *
  * 刻意不做「按内容哈希」：内容变化（编辑）不得改变 rowId。
+ *
+ * `startAt`：从既有 rowId 续号。用于「草稿副本在路由之外保存、重挂载后恢复」的
+ * 场景（`draftStash.tsx`）：恢复出来的行沿用**原来的** rowId，新分配器必须
+ * 从最大序号之后继续，否则新增行会撞上已恢复的 id（React key 冲突 / 编辑态串行）。
  */
-export function createRowIdAllocator(prefix = "row"): RowIdAllocator {
-  let seq = 0;
+export function createRowIdAllocator(prefix = "row", startAt = 0): RowIdAllocator {
+  let seq = Number.isFinite(startAt) ? Math.max(0, Math.floor(startAt)) : 0;
   return {
     next: () => {
       seq += 1;
       return `${prefix}-${seq}`;
     },
   };
+}
+
+/**
+ * 既有 rowId 集合里的最大序号（`<prefix>-<n>` 形态；其它形态忽略）。
+ *
+ * 与 `createRowIdAllocator(prefix, maxRowIdSeq(ids, prefix))` 配对使用，
+ * 只服务「恢复草稿副本后继续发号」，不参与任何配置判定。
+ */
+export function maxRowIdSeq(ids: readonly string[], prefix = "row"): number {
+  let max = 0;
+  for (const id of ids) {
+    if (typeof id !== "string" || !id.startsWith(`${prefix}-`)) continue;
+    const tail = id.slice(prefix.length + 1);
+    if (!/^[0-9]+$/.test(tail)) continue;
+    const n = Number(tail);
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  return max;
 }
 
 /** 首次加载：按顺序为新行分配 rowId（顺序即服务端/草稿顺序）。 */

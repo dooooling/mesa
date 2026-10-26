@@ -11,6 +11,7 @@ import { Alert, Button, Input } from "antd";
 import type { SchemaDescriptor } from "../types";
 import type { NckPointSelection } from "../deviceModel";
 import { DescriptorFields } from "./DescriptorFields";
+import { locateFieldAnchor } from "./fieldFocus";
 import { materializeSchemaDefaults } from "../resourceSelectionModel";
 import { UNSUPPORTED_CONFIG_NOTICE, unsupportedFields } from "../descriptorCompatibility";
 import {
@@ -95,26 +96,8 @@ export function NckNativeFields({
       setAdvancedOpen(true);
       return;
     }
-    // 抽屉里的内容可能比本 effect 晚一次提交（antd Drawer 在 open 后才挂载子树）：
-    // 有限次重试，拿不到锚点就放弃——**不猜元素**、也不抛错。
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let attempts = 0;
-    const locate = () => {
-      if (cancelled) return;
-      const anchor = document.getElementById(`native-field-${focusFieldKey}`);
-      if (anchor) {
-        anchor.scrollIntoView?.({ block: "center" });
-        return;
-      }
-      attempts += 1;
-      if (attempts <= 20) timer = setTimeout(locate, 16);
-    };
-    locate();
-    return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-    };
+    // 滚动到字段锚点：与通用资源表单共用同一套"有限次重试定位"（`fieldFocus.ts`）。
+    return locateFieldAnchor(`native-field-${focusFieldKey}`);
   }, [focusFieldKey, focusField, advancedOpen]);
 
   const issues = validateNativeFields(schema, values);

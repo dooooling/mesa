@@ -3,6 +3,7 @@
 > 分支 `feat/acquisition-page-refactor`，第 3 步验收起点 `HEAD = f995a90`，本轮起点 `HEAD = cfaa38d`（PR #146）。
 > 本文件是**第 3 步（统一验收）+ 第 4 轮（验收遗漏修复）唯一新增/更新的文档**；代码改动仅限 `apps/mesa-web/`（见 §7、附录 A）。
 > 实施依据：`docs/design/acquisition-page-refactor-review.md`（§2.5 第 8 条、§4.7 保存区状态机、§5.2 238 点验收 11 项、§7-7/§7-8 定案、§7.2 实施期待定）。
+> **第 5 轮（最新，P1 连续后退丢草稿 / P2 通用资源字段定位）见 §10-§13**；下文 §0-§9 与附录 A 为第 3/4 轮记录，其中「浏览器后退用哨兵 + popstate」一段（§0.1 第 4 行、§8.2-D8、§7-11）的实现已按 §10 重写，测试也从「合成 popstate」升级为「真实 history.back()」。
 > 结论（本轮更新）：**11 项验收 11 项通过**——原未通过的 §5.2-5「操作失败后能直接找到处理位置」已实现（可定位/不可定位两类都有测试与界面分层），并修复用户实测发现的 2 个回归（侧栏离开静默丢草稿、不支持事件的卡片常驻）；请求顺序 8 条全部符合预期；布局覆盖按「jsdom 可机械判定 / 必须真实浏览器」分开记录（§4）。
 
 ---
@@ -372,3 +373,123 @@ pnpm --dir apps/mesa-web build       # tsc -b && vite build 通过（chunk 体�
 | `pnpm --dir apps/mesa-web lint` | `eslint .` 通过（无输出） |
 | `pnpm --dir apps/mesa-web build` | `tsc -b && vite build` 通过（仅既有 chunk >500kB 告警） |
 | git 写操作 | **无**（提交由父代理执行） |
+
+---
+
+# 第 5 轮（P1 连续后退丢草稿 / P2 通用资源字段定位）
+
+> 本轮起点 `HEAD = 7c860c5`（PR #146，分支 `feat/acquisition-page-refactor`）。改动仅限 `apps/mesa-web/**` 与本文件；**未**改 `proto/`、`crates/**`、`drivers/**`、契约、版本，未连真机、未读写生产库，未做任何 git 写操作。
+
+## 10. P1：连续后退仍丢草稿，且地址与页面内容不一致
+
+### 10.1 先核实的根因（实际行为，不是推断）
+
+| # | 事实（代码位置） | 后果 |
+|---|---|---|
+| 1 | 本项目是 `<BrowserRouter>` + `<Routes>` 声明式路由（`main.tsx:66`、`App.tsx:74-92`）。`popstate` 时 `BrowserRouter` 在 `useLayoutEffect` 订阅的 `history.listen` 里**先**更新 `location`（`react-router-dom@6.30.6 dist/index.js:634`；`@remix-run/router@1.23.4 dist/router.js:350-362` 的 `handlePop`） | 只要 URL 真的变了，采集页**已经**被卸载 |
+| 2 | 草稿本来是采集页组件的 `useState`（`EndpointAcquisitionPane.tsx:325` `intervalMs` 等） | 卸载即丢，事后没有任何"取消"能把草稿变回来 |
+| 3 | 旧实现 `draftNavGuard.tsx:169`（本轮起点版本）：`if (window.location.href !== href) return;` —— **URL 一变就直接放行** | 第二次后退（穿透哨兵、真正离开采集页 URL）完全不拦；同一次交互里第一次弹的确认框还开着 |
+| 4 | 旧实现取消分支只有 `history.pushState(..., href)` | 只改地址栏，**不通知路由** ⇒ 地址栏是采集页、路由内容停在概览页（用户实测到的"地址与内容不一致"） |
+| 5 | 旧实现的监听挂在 `[dirty]` 上，且"待确认"没有任何状态 | 待确认期间再后退不会被中和（只防第一次） |
+
+复现链（与用户实测逐字对应）：改周期 2000 → 后退（落在哨兵/锚点，弹确认）→ 不选 → 再后退（旧实现走到第 3 条：放行 ⇒ 路由切概览、采集页卸载、草稿丢）→ 点「继续编辑」（旧实现走到第 4 条：只推 URL ⇒ 地址采集页/内容概览页）。
+
+### 10.2 采用的方案：锚点条目 + 同 URL 哨兵（每次 popstate 逐个中和）+ 路由级 repair + 草稿副本
+
+`apps/mesa-web/src/workspace/draftNavGuard.tsx`（`useBrowserBackGuard`，`:225-381`）现在的语义：
+
+1. **武装**：草稿出现时记下「锚点」（采集页条目 URL + 路由落点），并在其后压一条**同 URL 哨兵**；
+2. **每一次** `popstate`（不论第几次）：
+   - 落点 URL == 锚点 URL ⇒ 说明只落在锚点/哨兵上（路由没变、组件没卸载）：**先补回哨兵**再询问 ⇒ 连续后退每一次都只落到同一 URL，逐个被中和，不会穿透；
+   - 落点 URL != 锚点 URL（浏览器把连点合并成一次跨步遍历）⇒ 记下用户原本想去的位置，**当场 repair**：用路由自己的 `navigate(anchorRoute, { replace: true })` 把**地址与内容一起**拉回采集页（不用裸 `pushState`——那正是"地址是采集页、内容是概览页"的成因），再补哨兵；
+   - 待确认期间（`asking`）不弹第二个框；
+3. **取消**：常路径下什么都没被动过（URL/内容/草稿都在原位），只需幂等复核；跨步遍历时已在第 2 步当场中和；
+4. **确认**：当前条目 = 哨兵、锚点在它前一条 ⇒ `history.go(-2)` **一次**落到用户原本想去的位置（只走一步，不多跳不漏跳）；跨步遍历过则改用记下的 `targetPath` 导航一次。哨兵没压上（环境禁 `pushState`）时退化为 `go(-1)`；若那次后退根本不可能发生（采集页就是历史第一条），400ms 兜底把守卫恢复成"仍武装"，**不会**把之后的后退永久放行；
+5. **纵深防御**：草稿内容另有副本（`apps/mesa-web/src/draftStash.tsx`，`DraftStashProvider` 挂在 `DraftGuardProvider` 内、包住整个路由内容）——卸载前写入、重新挂载并加载完服务端快照后取回，恢复成**未保存草稿**（基线仍是服务端真值，差异判定照常把它算成"有修改"）。因此即使某次中间态真的把采集页卸载了，草稿也不会消失。
+
+**为什么这套能防住连续后退**：`popstate` 的落点被"哨兵"约束在同一 URL 上，而每一个 `popstate` 都会**同步**补回哨兵，所以第 N 次后退与第 1 次等价（都落在锚点 URL，都被询问）；跨步遍历（一次后退多格）由"落点 URL != 锚点 URL"识别并当场中和，因此"漏掉的第二次"在两种情形下都被覆盖。**没有**改成 data router（`useBlocker`）：那会牵动 6 个以 `MemoryRouter` 渲染 `<App/>` 的既有测试文件，收益不抵代价。
+
+### 10.3 P1 测试：从"合成事件"变成"真实历史跳转"
+
+新增 `apps/mesa-web/src/workspace/DraftNavGuard.history.test.tsx`（6 例，`BrowserRouter` + 真实 `window.history.back()`；jsdom 会真移动条目并异步派发 `popstate`）：
+
+| 用例 | 断言（地址 / 内容 / 草稿 三者） |
+|---|---|
+| `real_back_asks_and_keeps_draft_when_cancelled` | 后退 ⇒ 弹确认（`pops == [采集页]`）；点「继续编辑」⇒ `location.pathname` 仍是采集页、**页面内容是采集页**、周期仍是 2000；**取消后再后退一次仍会弹框**（哨兵已补回） |
+| `every_back_during_pending_confirmation_is_neutralised` | 待确认期间**连续后退三次**：`pops == [采集页, 采集页, 采集页]`（三次真实跳转全被逐次中和）、页面仍是采集页、只有 1 个确认框、周期仍未 2000 |
+| `user_reported_sequence_back_twice_then_continue_editing_keeps_draft` | 用户实测顺序：后退 → 不选 → 再后退 → 点「继续编辑」⇒ 地址、内容都是采集页，周期 2000，且保存区仍在（不是靠"重新加载"骗过断言） |
+| `confirmed_leave_navigates_exactly_once_to_the_previous_page` | 后退 → 确认 ⇒ `pops == [采集页, 概览页]`（**只跳一次**，不多跳不漏跳），`location.pathname` 是概览页且页面内容是概览页 |
+| `cross_step_traversal_is_neutralised_immediately_and_keeps_draft` | 用 `history.go(-2)` 驱动"连点被合并成跨步遍历"的真实跳转（jsdom 会把同 tick 的多次 `back()` 折叠，无法用连点复现）：落点先到概览页 ⇒ **立即**被中和回采集页、内容也是采集页、周期 2000；取消后仍一致 |
+| `confirmed_leave_after_cross_step_traversal_goes_to_the_recorded_target` | 跨步遍历后确认 ⇒ 一次导航落到记下的目标（概览页），内容一致 |
+
+另有 `apps/mesa-web/src/components/EndpointAcquisitionPane.draftStash.test.tsx`（2 例）用**真实卸载再挂载**（换 key 强制重建，等价于路由把采集页卸载掉）证明纵深防御：有未保存修改 ⇒ 重挂载后周期仍是 2000、保存区仍在、`onDraftStateChange` 重新上报 `dirty: true`；无修改 ⇒ 不留残留（回到服务端值 1000、无保存区）。
+
+保留 `DraftNavGuard.test.tsx`（5 例，`MemoryRouter` + 侧栏/面包屑/Tab/合成 `popstate`）不动：它证明四条**应用内**路径的确认文案与"取消后草稿仍在"，与真实历史跳转用例互补（断言只增不减）。
+
+### 10.4 只能人工验证的部分（如实说明）
+
+- **真实浏览器的历史栈语义**：jsdom 的 `history` 是内存实现，`back()` 为异步任务、同 tick 多次 `back()` 会被折叠，因此"连点两次后退"在真实浏览器里是否会被合并成一次多步遍历、合并后落点如何，**只能在真实浏览器确认**（本轮的代码路径已用 `go(-2)` 等价驱动并自动化）。
+- **地址栏瞬时可见性**：跨步遍历时地址栏会极短暂地显示目标地址（React 18 批处理下通常不会完成一次提交，但这是渲染时序，jsdom 无法观测）。
+- **iOS 上 `pushState` 的次数限制**（history API 的已知平台限制）与"确认后 `go(-2)` 是否一定产生 `popstate`"的实际时序。
+- 上述之外的部分（URL 与路由内容一致性、草稿保留、只跳一次、跨步中和）**全部已自动化**。
+
+## 11. P2：通用资源的字段错误不能定位到可编辑字段
+
+### 11.1 改在哪
+
+| 文件 | 改动 |
+|---|---|
+| `components/EndpointAcquisitionPane.tsx` | `locateIssueRow`（`:1783-1831`）不再写死「只有 NCK + fieldKey 才开编辑抽屉」：改为 `canLocateFieldInPlace(rowId, fieldKey)` —— NCK 保持既有行为，通用资源按**该行资源 Schema** 判定；可编辑 ⇒ 打开**编辑表单**并把字段交给表单高亮，不可编辑 ⇒ 打开**只读技术详情**并写明原因（`data-in-place-editable="false"`）；新增 `editingSelIndex` 状态、`openEditSelectionDrawer`、`replaceSelection`（编辑不改 rowId）；通用行也有「编辑」入口（`editableRowIds` 按 Schema 判定，不看驱动/资源名）；正文文案区分「高亮字段 / 打开技术详情（该字段无法就地编辑）」 |
+| `components/ResourcePickerAntd.tsx` | 新增可选 `initialSelection`（就地编辑：按该行预填资源+参数+输出，主按钮「确认修改」）与 `focusFieldKey`（高级区先展开 → 高亮 → 有限次重试滚动）；`DescriptorFields` 加 `idPrefix="selection-field"`、`highlightKeys`、受控 `advancedOpen`；编辑态的 `dirty` 改为「与预填值比对」，打开表单本身不算修改（否则关抽屉会无端弹「放弃未确认的修改？」） |
+| `components/fieldFocus.ts`（新增） | 共用定位动作 `locateFieldAnchor` / `useFieldAnchorFocus`：折叠区/抽屉里的字段晚一次渲染才存在 ⇒ 有限次（20×16ms）重试，拿不到就放弃（不猜元素、不抛错） |
+| `components/NckNativeFields.tsx` | 原 `:91-118` 的重试定位逻辑改为调用 `fieldFocus.locateFieldAnchor` —— **同一套机制**，NCK 与通用表单不再各写一遍 |
+| `pointRows.ts` | `createRowIdAllocator(prefix, startAt)`（`:37`）+ `maxRowIdSeq(ids, prefix)`（`:53`）：恢复草稿副本后分配器续号，新增行不会撞上已恢复的 rowId |
+
+### 11.2 字段 key 怎么对上
+
+1. `issueLocation.fieldKeyOf` 只认 `...parameters.<field>`（`issueLocation.ts:173-178`），`<field>` 就是 Core `validate_instance` 拼路径时用的 `field.key`（`crates/core-types/src/schema.rs:293-301`，只引用不改）；
+2. 页面层拿 `<field>` 去**该行资源**的 `parameters.fields` 里查：存在 ⇒ 该字段有对应控件；`DescriptorFields` 的字段锚点 id 就是 `selection-field-<field.key>`（`DescriptorFields.tsx:469-475`，`highlightKeys` 见 `:452`），高亮集合也是同一 key ⇒ **同一个 key 贯穿 path → 判定 → 锚点 → 高亮**；
+3. NCK 侧沿用既有 `native-field-<key>` 锚点与「展开高级区再定位」的顺序。
+
+### 11.3 不可就地编辑时（如实说明，不假装高亮）
+
+判据只有两条，全部来自 Descriptor，**没有** `driver_id` / 协议字段名 / 资源 ID 特判：① 该行资源在 `desc.resources` 里存在；② 该资源参数 Schema **没有界面不认识的字段类型**（`unsupportedFields` 为空，A3 口径）。任一不满足，或 `<field>` 不在 Schema 里：
+
+- 打开**只读技术详情**，顶部写「该行存在服务端校验问题（字段：X）· 该字段无法就地编辑（资源参数 Schema 里没有这个字段，或含界面不支持的类型），请按下面的原始配置排查」；
+- 属性 `data-in-place-editable="false"` 可供机械断言；
+- 正文（`save-issues-lead`）同步改口为「打开技术详情（该字段无法就地编辑）」，**不说**"高亮字段"；
+- 断言里显式检查：编辑表单没打开、没有任何 `selection-field-*` 锚点被滚动。
+
+### 11.4 P2 测试
+
+新增 `apps/mesa-web/src/components/EndpointAcquisitionPane.issueLocateGeneral.test.tsx`（6 例，通用资源 `mesa.resources.v1` 主路径）：
+
+| 用例 | 断言 |
+|---|---|
+| `generic_field_level_issue_opens_the_edit_form_and_highlights_the_field` | `tasks[1].selections[27].parameters.count` ⇒ 跳页（1→2）+ 抽屉标题「编辑点位」+ `resource-select` 在（**不是**只读详情）+ 表单按该行预填（`#selection-field-count input` 值 = 27）+ `selection-field-count` 外框 + `scrollIntoView` 命中该锚点 + 行锚点唯一 + 正文不含原始 path |
+| `generic_advanced_field_is_expanded_before_highlighting` | `parameters.decode`（`ui.advanced`）⇒ **先展开高级区**，锚点随后存在且高亮（与 NCK 同一顺序） |
+| `generic_field_missing_from_schema_opens_read_only_detail_and_says_so` | `parameters.not_in_schema` ⇒ 只读技术详情 + `data-in-place-editable="false"` + 「无法就地编辑」文案 + 编辑表单未打开 + 无字段锚点被滚动 + 正文改口 |
+| `task_level_path_is_still_unlocatable` | 任务级 ⇒ 「无法自动定位」，页码不动、无定位按钮、不开抽屉、无行标记 |
+| `row_level_path_opens_read_only_detail_not_the_edit_form` | 行级（`selections[0].resource_id`）⇒ 技术详情、不摊开编辑表单（保持既有行为） |
+| `preserved_task_path_is_still_unlocatable` | 保留任务 ⇒ 不跳转、不开抽屉 |
+
+既有 NCK 字段路径用例（`EndpointAcquisitionPane.issueLocate.test.tsx` 4 例）**未改一行**并保持全绿。
+
+## 12. 本轮命令结果（实跑）
+
+| 命令 | 结果 |
+|---|---|
+| `pnpm --dir apps/mesa-web test` | **78 文件 / 841 用例全部通过**（起点 75 / 825；+3 文件 / +16 用例，无删除、无跳过、无放宽） |
+| `pnpm --dir apps/mesa-web typecheck` | `tsc --noEmit` 通过（无输出） |
+| `pnpm --dir apps/mesa-web lint` | `eslint .` 通过（无输出） |
+| `pnpm --dir apps/mesa-web build` | `tsc -b && vite build` 通过（仅既有 chunk >500kB 告警） |
+
+新增用例清单：`DraftNavGuard.history.test.tsx`（6）、`EndpointAcquisitionPane.draftStash.test.tsx`（2）、`EndpointAcquisitionPane.issueLocateGeneral.test.tsx`（6）、`pointRows.test.ts` 的新增 2 例（`maxRowIdSeq` 只认 `<prefix>-<n>`；`createRowIdAllocator` 带 `startAt` 续号）。
+
+## 13. 本轮已知限制 / 待确认
+
+1. **真实浏览器历史栈**、**地址栏瞬时可见性**、**iOS `pushState` 次数限制**：只能在真实浏览器确认（见 §10.4）。
+2. **采集页是历史第一条**（深链接/新标签页直达）时，确认后无处可退：守卫会恢复成"仍武装"（不会把后续后退永久放行），但**不会**替用户离开站点——浏览器也没有可去之处。
+3. **哨兵条目的历史栈副作用**（既有）：有草稿期间会多一条同 URL 记录；用户放弃/保存后该条目仍在，后退会先经过它（视觉无变化）。要彻底消除需要 data router + `useBlocker`（代价见 §10.2）。
+4. **行级问题**仍打开只读技术详情（保持既有行为）；若产品希望行级也直接进编辑态，只需改 `locateIssueRow` 一处分支。
+5. **通用资源的就地编辑**是本轮新增能力（此前通用行只有「添加/移除」）：`replaceSelection` 只改草稿，不发写请求；保存仍走同一 `planEndpointTaskSave` 全量替换路径，`rowId` 不变。

@@ -9,6 +9,7 @@ import {
   assignRowIds,
   createRowIdAllocator,
   filterRows,
+  maxRowIdSeq,
   paginateRows,
   stableIdentityKey,
   toRows,
@@ -41,6 +42,24 @@ describe("rowId 分配：只发号、不回收、不复用", () => {
     const a = alloc.next();
     const b = alloc.next();
     expect(a).not.toBe(b);
+  });
+});
+
+describe("恢复草稿副本后继续发号（draftStash 用）", () => {
+  it("maxRowIdSeq 只认 <prefix>-<n> 形态，取最大序号", () => {
+    expect(maxRowIdSeq(["row-1", "row-9", "row-3"], "row")).toBe(9);
+    // 其它前缀 / 非数字后缀一律忽略（不猜、不把奇怪 id 当序号）。
+    expect(maxRowIdSeq(["nck-7", "row-x", "row-", "", "row-2"] as string[], "row")).toBe(2);
+    expect(maxRowIdSeq([], "row")).toBe(0);
+  });
+
+  it("createRowIdAllocator 带 startAt 时从旧序号之后继续，新号不会撞上已恢复的行", () => {
+    // 场景：草稿副本里有 row-1..row-5，重新挂载后分配器必须从 6 开始。
+    const restored = ["row-1", "row-2", "row-3", "row-4", "row-5"];
+    const alloc = createRowIdAllocator("row", maxRowIdSeq(restored, "row"));
+    const next = alloc.next();
+    expect(next).toBe("row-6");
+    expect(restored).not.toContain(next);
   });
 });
 

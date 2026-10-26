@@ -28,6 +28,8 @@ import {
   type ResourceSelectionLike,
 } from "../resourceSelectionModel";
 import { DescriptorFields } from "./DescriptorFields";
+import { locateFieldAnchor } from "./fieldFocus";
+import { draftContentKey } from "../acquisitionDraftDiff";
 import { UNSUPPORTED_CONFIG_NOTICE, unsupportedFields } from "../descriptorCompatibility";
 import {
   ResourceBrowseAntd,
@@ -95,6 +97,8 @@ export function ResourcePickerAntd({
   requireExplicitSelection,
   submitLabel,
   onDirtyChange,
+  initialSelection,
+  focusFieldKey,
 }: {
   resources: ResourceDescriptor[];
   /**
@@ -125,17 +129,45 @@ export function ResourcePickerAntd({
   submitLabel?: string;
   /** 抽屉内「有未确认修改」的上报（关闭前提醒一次）。 */
   onDirtyChange?: (dirty: boolean) => void;
+  /**
+   * **就地编辑**已有点位（通用资源）：给定时表单按这份选择预填（资源 + 参数 + 输出），
+   * 主按钮执行「替换这一行」而不是「加入」。
+   *
+   * 为什么要有：服务端字段级校验（`issues[].path = ...parameters.<field>`）按
+   * `issueLocation.ts` 的核实主要出现在**通用资源**路径上；只有能就地编辑，用户才能
+   * 在那条字段上直接改完再保存。
+   */
+  initialSelection?: ResourceSelectionInput | null;
+  /**
+   * 外部要求定位的字段 key（字段级 issues）：与 NCK 原生表单同一套动作
+   * （`fieldFocus.ts`：展开高级区 → 高亮 → 有限次重试定位）。
+   */
+  focusFieldKey?: string | null;
 }) {
   const methods: Array<"manual" | "browse" | "import"> =
     selectionMethods && selectionMethods.length ? selectionMethods : ["manual"];
   const [mode, setMode] = useState<"manual" | "browse">(methods.includes("manual") ? "manual" : "browse");
-  const firstResource = requireExplicitSelection ? undefined : resources[0];
-  const [rid, setRid] = useState(firstResource?.id ?? "");
+  // 就地编辑：预填「资源 + 参数 + 输出」，且不再要求用户先选资源。
+  const editing = initialSelection ?? null;
+  const initialResource = editing
+    ? resources.find((r) => r.id === editing.resource_id)
+    : requireExplicitSelection
+      ? undefined
+      : resources[0];
+  const [rid, setRid] = useState(initialResource?.id ?? "");
   const [params, setParams] = useState<Record<string, unknown>>(() =>
-    firstResource ? materializeSchemaDefaults(firstResource.parameters) : {},
+    editing
+      ? { ...materializeSchemaDefaults(initialResource?.parameters ?? { fields: [] }), ...editing.parameters }
+      : initialResource
+        ? materializeSchemaDefaults(initialResource.parameters)
+        : {},
   );
-  const [outputs, setOutputs] = useState<Array<{ output: string; point_key: string }>>([]);
+  const [outputs, setOutputs] = useState<Array<{ output: string; point_key: string }>>(() =>
+    editing ? editing.outputs.map((o) => ({ ...o })) : [],
+  );
   const [fill, setFill] = useState<PickerExternalFill | null>(null);
+  // 高级折叠：受控（字段级定位可能需要**先展开**再滚动，见下方 focus effect）。
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   // Browse 选用回填：resource 必须存在于 Descriptor（Core 门禁同样要求），
   // 参数以节点 binding 为准、缺失项用 schema 默认补齐显示（显示即保存）。
@@ -155,10 +187,37 @@ export function ResourcePickerAntd({
   }, [fill, resources]);
 
   // 抽屉「有未确认修改」的判定：选了资源、勾了输出即算（不引入新业务判据）。
-  const dirty = !!rid || outputs.length > 0;
+  // 就地编辑时改为「与预填值比是否真的改过」：打开表单本身不算修改，否则关抽屉
+  // 会无端弹「放弃未确认的修改？」。
+  const dirty = editing
+    ? draftContentKey({ resource_id: rid, parameters: params, outputs }) !==
+      draftContentKey({
+        resource_id: editing.resource_id,
+        parameters: editing.parameters,
+        outputs: editing.outputs,
+      })
+    : !!rid || outputs.length > 0;
   useEffect(() => {
     onDirtyChange?.(dirty);
   }, [dirty, onDirtyChange]);
+
+  // 字段级定位（服务端 `issues[].path` 指到 `...parameters.<field>`）：
+  // 与 NCK 原生表单同一套动作——高级字段在折叠态**不渲染**，必须先展开，
+  // 再在下一轮渲染滚动到锚点并高亮（`DescriptorFields` 的 highlightKeys）。
+  // 只认当前资源 Schema 里真实存在的字段；不存在就什么都不做（不猜、不硬塞高亮）。
+  const focusField = focusFieldKey
+    ? (resources.find((r) => r.id === rid)?.parameters.fields ?? []).find((f) => f.key === focusFieldKey)
+    : undefined;
+  const focusFieldName = focusField?.key ?? null;
+  const focusFieldIsAdvanced = focusField?.ui?.advanced === true;
+  useEffect(() => {
+    if (!focusFieldName) return;
+    if (focusFieldIsAdvanced && !advancedOpen) {
+      setAdvancedOpen(true);
+      return;
+    }
+    return locateFieldAnchor(`selection-field-${focusFieldName}`);
+  }, [focusFieldName, focusFieldIsAdvanced, advancedOpen]);
 
   // 语义模式：不进入通用 resource/manual 分支，旧 `variable` 入口整体不渲染（A22）。
   if (semantic) {
@@ -290,7 +349,16 @@ export function ResourcePickerAntd({
 
         {!!res.parameters.fields.length && (
           <Card size="small" title="参数">
-            <DescriptorFields schema={res.parameters} value={params} onChange={setParams} />
+            <DescriptorFields
+              schema={res.parameters}
+              value={params}
+              onChange={setParams}
+              // 字段锚点前缀 + 高亮集合：字段级问题定位要能滚动到这里（`fieldFocus.ts`）。
+              idPrefix="selection-field"
+              advancedOpen={advancedOpen}
+              onAdvancedOpenChange={setAdvancedOpen}
+              highlightKeys={focusFieldName ? [focusFieldName] : []}
+            />
           </Card>
         )}
 

@@ -43,9 +43,11 @@ import {
   alignRowIds,
   assignRowIds,
   createRowIdAllocator,
+  maxRowIdSeq,
   paginateItems,
   stableIdentityKey,
 } from "../pointRows";
+import { draftStashKey, useDraftStashOrDefault } from "../draftStash";
 import {
   buildFilterOptions,
   countRowStates,
@@ -97,6 +99,7 @@ import { ResourceBrowseAntd } from "./ResourceBrowseAntd";
 import { ResourcePickerAntd } from "./ResourcePickerAntd";
 import {
   UNSUPPORTED_CONFIG_NOTICE,
+  unsupportedFields,
   unsupportedFieldsInResources,
   type SubmittedResourceSchema,
   type UnsupportedFieldInResource,
@@ -140,6 +143,29 @@ interface RemovedDraftEntry {
   reason: string;
   point?: NckPointSelection;
   selection?: ResourceSelection;
+}
+
+/**
+ * 草稿副本（`draftStash`，挂在**路由之外**）。
+ *
+ * 为什么要存这一份（§7-7 第 5 步）：声明式路由（`BrowserRouter` + `Routes`）下，
+ * 浏览器后退触发 `popstate` 时路由已经变了，采集页会短暂卸载——组件内 `useState`
+ * 的草稿会跟着消失。副本让「短暂的路由变化不可能销毁草稿」：卸载前写入，
+ * 重新挂载并加载完服务端快照后取回，恢复成**未保存草稿**（基线仍是服务端快照，
+ * 因此差异判定会照常把它算成"有未保存修改"）。
+ *
+ * 只放**用户可编辑的草稿内容**：服务端快照（任务/描述/运行态/基线）一律重新加载，
+ * 不复制、不伪造。
+ */
+interface StashedDraft {
+  intervalMs: number;
+  sels: ResourceSelection[];
+  selRowIds: string[];
+  nckPoints: NckPointSelection[];
+  nckRowIds: string[];
+  removedEntries: RemovedDraftEntry[];
+  /** 「保存后是否恢复采集」的选择同属草稿（用户改过就不该被清掉）。 */
+  restart: boolean;
 }
 
 /** 取任务内已知 point_key：两种 kind 都读，未知 kind / 结构非法返回空。 */
@@ -315,9 +341,11 @@ export function EndpointAcquisitionPane({
   // rowId（§5.2-5）。只用于界面定位，不参与任何配置差异判定（§4.8）。
   const [submittedRowSnapshot, setSubmittedRowSnapshot] = useState<SubmittedRowSnapshot | null>(null);
   // 当前被定位的问题行（行高亮 + 抽屉内字段定位）；null = 没有生效的定位。
-  const [locatedIssue, setLocatedIssue] = useState<{ rowId: string; fieldKey: string | null } | null>(
-    null,
-  );
+  // `inPlaceEditable`：该字段能否在**编辑表单里**就地改（决定"打开编辑表单并高亮"
+  // 还是"打开只读技术详情并说明不可就地编辑"——不假装高亮）。
+  const [locatedIssue, setLocatedIssue] = useState<
+    { rowId: string; fieldKey: string | null; inPlaceEditable: boolean } | null
+  >(null);
   // P2-2：服务端已生效配置的展示快照（null = 快照未就绪/不可用）。
   // 状态区据此区分「已保存」与「待保存」，不再让草稿冒充当前配置。
   const [savedBaseline, setSavedBaseline] = useState<SavedBaseline | null>(null);
@@ -347,6 +375,10 @@ export function EndpointAcquisitionPane({
   const [removedEntries, setRemovedEntries] = useState<RemovedDraftEntry[]>([]);
   // 编辑态：null = 新增；否则为 nckPoints 下标。
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  // 通用资源的编辑态：null = 新增；否则为 sels 下标（就地编辑同一条选择）。
+  // 与 `editingIndex` 分开：两种载荷结构不同（`{kind,point_key,parameters}` vs
+  // `{resource_id,parameters,outputs}`），混用下标会让表单读错数据。
+  const [editingSelIndex, setEditingSelIndex] = useState<number | null>(null);
   const [formVersion, setFormVersion] = useState(0);
   // Browse → 语义表单的预填（A1/A16 的入口）。preview_point_key 不参与提交。
   const [browseOpen, setBrowseOpen] = useState(false);
@@ -372,6 +404,10 @@ export function EndpointAcquisitionPane({
   const restoreScrollTop = useRef<number | null>(null);
 
   const nck = isNckDriver(driverId);
+  // 草稿副本（路由之外的暂存，§7-7 第 5 步）：无 Provider 时退化为空实现，
+  // 直接渲染本组件的既有测试行为零变化。
+  const draftStash = useDraftStashOrDefault();
+  const stashKey = draftStashKey(endpointId);
   const catalogIndex = useMemo<NckDefinitionIndex | null>(
     () => (catalog ? indexNckCatalogDefinitions(catalog.definitions) : null),
     [catalog],
@@ -690,6 +726,7 @@ export function EndpointAcquisitionPane({
     setPointStatuses([]);
     setRemovedEntries([]);
     setEditingIndex(null);
+    setEditingSelIndex(null);
     setFormVersion(0);
     setBrowseOpen(false);
     setBrowsePreset(null);
@@ -800,6 +837,28 @@ export function EndpointAcquisitionPane({
             tasks,
           });
         }
+        // 草稿副本恢复（§7-7 第 5 步）：离开守卫下浏览器后退可能让本组件短暂卸载，
+        // 草稿内容在 `draftStash`（路由之外）里。这里在**服务端快照与基线就绪之后**
+        // 才套用副本，因此：基线仍是服务端真值，草稿仍是"未保存"（差异判定照常把它
+        // 算成有修改），保存路径与平时完全一致。
+        // 键里含 (driverId, endpointId)：换连接不会串用别人的草稿。
+        const stashed = draftStash.take(stashKey) as StashedDraft | null;
+        if (stashed) {
+          setIntervalMs(stashed.intervalMs);
+          setRestart(stashed.restart);
+          setRemovedEntries(stashed.removedEntries);
+          if (isNckDriver(driverId)) {
+            setNckPoints(stashed.nckPoints);
+            setNckRowIds(stashed.nckRowIds);
+            // 恢复出来的行沿用**原来的** rowId；分配器续号到最大序号之后，
+            // 避免之后新增的行撞上已恢复的 id。
+            rowIdAllocator.current = createRowIdAllocator("row", maxRowIdSeq(stashed.nckRowIds));
+          } else {
+            setSels(stashed.sels);
+            setSelRowIds(stashed.selRowIds);
+            rowIdAllocator.current = createRowIdAllocator("row", maxRowIdSeq(stashed.selRowIds));
+          }
+        }
         // 快照就绪：只有此时保存才允许 PUT（空数组即服务端真的无任务）。
         setTasksLoadedEpId(endpointId);
         setTasksLoadState("ready");
@@ -820,7 +879,7 @@ export function EndpointAcquisitionPane({
       // 让在途的运行态读取作废：切换连接后它的结果不得回写到新窗格。
       runStateToken.current += 1;
     };
-  }, [endpointId, driverId, loadRunState, reloadNonce]);
+  }, [endpointId, driverId, loadRunState, reloadNonce, draftStash, stashKey]);
 
   // ---- 已有点位重新核验（加载后 & 点位变化后） ---------------------------
   const verifyToken = useRef(0);
@@ -987,6 +1046,7 @@ export function EndpointAcquisitionPane({
     // 用户主动开抽屉 ⇒ 上一次「问题定位」的高亮不再适用（不把旧定位带进新编辑）。
     setLocatedIssue(null);
     setEditingIndex(null);
+    setEditingSelIndex(null);
     setBrowsePreset(null);
     setFormVersion((v) => v + 1);
     setDrawerDirty(false);
@@ -999,15 +1059,50 @@ export function EndpointAcquisitionPane({
     restoreScrollTop.current = listScrollRef.current?.scrollTop ?? 0;
     setLocatedIssue(null);
     setEditingIndex(index);
+    setEditingSelIndex(null);
     setBrowsePreset(null);
     setFormVersion((v) => v + 1);
     setDrawerDirty(false);
     setDrawerOpen(true);
   };
 
+  /**
+   * 通用资源：就地编辑某一行（用户主动点「编辑」，或字段级问题定位时由
+   * `locateIssueRow` 打开，见那里的 `setEditingSelIndex`）。
+   *
+   * 服务端字段级校验（`issues[].path = ...parameters.<field>`）按 `issueLocation.ts`
+   * 的核实主要出现在这条路径上，因此必须有可编辑入口——否则字段名只能看不能改。
+   */
+  const openEditSelectionDrawer = (rowId: string) => {
+    const index = selRowIds.indexOf(rowId);
+    if (index < 0) return;
+    restoreScrollTop.current = listScrollRef.current?.scrollTop ?? 0;
+    setLocatedIssue(null);
+    setEditingIndex(null);
+    setEditingSelIndex(index);
+    setBrowsePreset(null);
+    setFormVersion((v) => v + 1);
+    setDrawerDirty(false);
+    setDrawerOpen(true);
+  };
+
+  /**
+   * 替换一条资源选择（就地编辑的提交动作）。
+   *
+   * 与 `replacePoint` 同一条规则：**编辑不改 rowId**——同一行换了参数仍是同一行
+   * （§4.8），否则行标记、行内编辑态会在保存前乱跳。
+   */
+  const replaceSelection = (index: number, selection: ResourceSelection): void => {
+    setSels((prev) => prev.map((sel, i) => (i === index ? selection : sel)));
+    setEditingSelIndex(null);
+    setFormVersion((v) => v + 1);
+    closeDrawer();
+  };
+
   const closeDrawer = () => {
     setDrawerOpen(false);
     setEditingIndex(null);
+    setEditingSelIndex(null);
     setDrawerDirty(false);
   };
 
@@ -1583,10 +1678,66 @@ export function EndpointAcquisitionPane({
     });
   }, [nck, nckPoints, nckRowIds, statusesCurrent, pointStatuses, definitionOf, sels, selRowIds, desc]);
 
+  /**
+   * 通用资源某一行能否**就地编辑**（不看 `driver_id`、不看资源 id 特判）：
+   *
+   * 判据只有两条，完全来自 Descriptor：
+   * 1. 该选择指向的资源在 `desc.resources` 里存在（不存在就没有表单可渲染）；
+   * 2. 该资源参数 Schema 里没有界面不认识的字段类型（A3：整份只读，不假装能编辑）。
+   */
+  const selectionRowEditable = useCallback(
+    (selection: ResourceSelection | undefined): boolean => {
+      if (!selection) return false;
+      const resource = (desc?.resources ?? []).find((r) => r.id === selection.resource_id);
+      if (!resource) return false;
+      return unsupportedFields(resource.parameters).length === 0;
+    },
+    [desc],
+  );
+
+  /**
+   * 字段级问题能否落在**可编辑控件**上：只按通用 Schema 的字段 key 判定。
+   *
+   * 字段 key 必须真的存在于该行资源的参数 Schema 里——不存在就说明界面没有对应控件
+   * （或后端报的是前端不认识的字段），此时**不假装高亮**，退回只读技术详情并说明。
+   */
+  const selectionFieldEditable = useCallback(
+    (rowId: string, fieldKey: string | null): boolean => {
+      if (!fieldKey) return false;
+      const index = selRowIds.indexOf(rowId);
+      const selection = index >= 0 ? sels[index] : undefined;
+      if (!selection || !selectionRowEditable(selection)) return false;
+      const resource = (desc?.resources ?? []).find((r) => r.id === selection.resource_id);
+      return (resource?.parameters.fields ?? []).some((field) => field.key === fieldKey);
+    },
+    [selRowIds, sels, desc, selectionRowEditable],
+  );
+
+  /**
+   * 定位落点判定（**只判定、不执行**）：字段级问题能不能在编辑表单里就地改？
+   *
+   * NCK 保持既有行为（字段级 ⇒ 打开语义/原生表单）；通用资源按上面的 Schema 判定。
+   */
+  const canLocateFieldInPlace = useCallback(
+    (rowId: string, fieldKey: string | null): boolean => {
+      if (!fieldKey) return false;
+      if (nck) return true;
+      return selectionFieldEditable(rowId, fieldKey);
+    },
+    [nck, selectionFieldEditable],
+  );
+
   /** 每行的「可编辑性」判定（原样保留既有准入口径，不下沉到通用组件）。 */
   const editableRowIds = useMemo(() => {
     const ids = new Set<string>();
-    if (!nck) return ids;
+    if (!nck) {
+      // 通用资源：资源 Schema 全部字段类型都认识 ⇒ 可以就地编辑这一行。
+      sels.forEach((selection, index) => {
+        const rowId = selRowIds[index];
+        if (rowId && selectionRowEditable(selection)) ids.add(rowId);
+      });
+      return ids;
+    }
     nckPoints.forEach((point, index) => {
       const rowId = nckRowIds[index];
       if (!rowId) return;
@@ -1613,7 +1764,7 @@ export function EndpointAcquisitionPane({
       if (gate) ids.add(rowId);
     });
     return ids;
-  }, [nck, nckPoints, nckRowIds, lookupDefinition, definitions, nativeSchema]);
+  }, [nck, nckPoints, nckRowIds, lookupDefinition, definitions, nativeSchema, sels, selRowIds, selectionRowEditable]);
 
   /**
    * 把一条保存失败的问题定位到「行（+字段）」并执行三个动作：跳页、打开抽屉、高亮。
@@ -1621,8 +1772,13 @@ export function EndpointAcquisitionPane({
    * 三条硬约束（§5.2-5）：
    * 1. **只按提交快照换算**（`issueLocation.ts`），不拿实时列表下标去猜；
    * 2. 换算不出行就**什么都不做**（不挑一行跳过去），由界面明确说「无法自动定位」；
-   * 3. 字段级才打开编辑抽屉（那里能就地改并高亮字段）；行级问题打开该行的
+   * 3. 字段级问题打开**编辑表单**（那里能就地改并高亮字段），行级问题打开该行的
    *    「技术详情」，避免在用户没准备编辑时把可编辑表单摊开。
+   *
+   * 第 3 条的补充（本轮修复）：字段级问题**不区分驱动**——通用资源路径才是真实后端
+   * 字段级校验的主路径（见 `issueLocation.ts:18-22`）。能否就地编辑只由该行资源
+   * Schema 决定（字段 key 是否存在、字段类型是否都认识），不看 `driver_id`/资源 id。
+   * 不可就地编辑时**不假装高亮**：打开只读技术详情，并明确写出原因。
    */
   function locateIssueRow(
     issue: ValidationIssue,
@@ -1641,10 +1797,16 @@ export function EndpointAcquisitionPane({
     setQuery("");
     setFilter("all");
     setPage(Math.floor(index / Math.max(1, pageSize)) + 1);
-    setLocatedIssue({ rowId: location.rowId, fieldKey: location.fieldKey });
-    if (nck && location.fieldKey) {
+    const editableInPlace = canLocateFieldInPlace(location.rowId, location.fieldKey);
+    setLocatedIssue({
+      rowId: location.rowId,
+      fieldKey: location.fieldKey,
+      inPlaceEditable: editableInPlace,
+    });
+    if (editableInPlace && location.fieldKey) {
       restoreScrollTop.current = listScrollRef.current?.scrollTop ?? 0;
-      setEditingIndex(index);
+      if (nck) setEditingIndex(index);
+      else setEditingSelIndex(index);
       setBrowsePreset(null);
       setFormVersion((v) => v + 1);
       setDrawerDirty(false);
@@ -1679,6 +1841,44 @@ export function EndpointAcquisitionPane({
   useEffect(() => {
     if (paged.page !== page) setPage(paged.page);
   }, [paged.page, page]);
+
+  /**
+   * 把当前草稿写进**路由之外**的副本（§7-7 第 5 步）。
+   *
+   * 时机很关键：只在服务端快照就绪后写。加载前的空态（`sels=[]` / `intervalMs=1000`）
+   * 绝不允许覆盖上一份副本，否则「后退时短暂卸载」期间写一次空态就把草稿抹掉了。
+   * 没有未保存修改时删掉副本：不留无意义的残留，也避免下次进页面"复活"旧内容。
+   */
+  useEffect(() => {
+    if (!isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, endpointId)) return;
+    if (!diff.hasChanges) {
+      draftStash.drop(stashKey);
+      return;
+    }
+    draftStash.put(stashKey, {
+      intervalMs,
+      sels,
+      selRowIds,
+      nckPoints,
+      nckRowIds,
+      removedEntries,
+      restart,
+    } satisfies StashedDraft);
+  }, [
+    draftStash,
+    stashKey,
+    tasksLoadState,
+    tasksLoadedEpId,
+    endpointId,
+    diff.hasChanges,
+    intervalMs,
+    sels,
+    selRowIds,
+    nckPoints,
+    nckRowIds,
+    removedEntries,
+    restart,
+  ]);
 
   // 抽屉关闭后回到原列表位置（§2.7「位置保持」，不把用户顶回顶部）。
   useEffect(() => {
@@ -1734,6 +1934,18 @@ export function EndpointAcquisitionPane({
       (loc): loc is Extract<IssueLocation, { kind: "unlocatable" }> =>
         loc.kind === "unlocatable",
     );
+  // 正文只承诺**做得到**的事：字段级且能就地编辑才说"高亮字段"；
+  // 字段级但不可就地编辑时说"打开技术详情"，不假装高亮了某个控件。
+  const locatableFieldInPlace = locatableIssue
+    ? canLocateFieldInPlace(locatableIssue.location.rowId, locatableIssue.location.fieldKey)
+    : false;
+  const locateLeadAction = !locatableIssue
+    ? null
+    : locatableIssue.location.fieldKey
+      ? locatableFieldInPlace
+        ? "并高亮字段"
+        : "并打开技术详情（该字段无法就地编辑）"
+      : "并高亮该行";
 
   /** 放弃修改：整份回到服务端已保存值（不写服务端，只重读）。 */
   const discardDraft = () => {
@@ -2025,7 +2237,12 @@ export function EndpointAcquisitionPane({
               }}
               isEditable={(row) => editableRowIds.has(row.rowId)}
               actions={{
-                onEdit: (row) => openEditDrawer(row.rowId),
+                // 编辑入口按载荷类型分流（不按驱动名判断）：
+                // NCK 点位 → `nckRowIds`；通用资源选择 → `selRowIds`。
+                onEdit: (row) => {
+                  if (nck) openEditDrawer(row.rowId);
+                  else openEditSelectionDrawer(row.rowId);
+                },
                 onRemove: (row) => {
                   if (nck) {
                     const index = nckRowIds.indexOf(row.rowId);
@@ -2217,7 +2434,7 @@ export function EndpointAcquisitionPane({
               {/* 正文：只说「能不能处理、点哪里」，**不含**原始 path / code（§3.3 分层）。 */}
               <div data-testid="save-issues-lead">
                 {locatableIssue
-                  ? `${saveIssues.length} 个问题需要处理，点此查看第一个（跳到该行所在页并高亮字段）。`
+                  ? `${saveIssues.length} 个问题需要处理，点此查看第一个（跳到该行所在页${locateLeadAction ?? ""}）。`
                   : `${saveIssues.length} 个问题需要处理；该问题无法自动定位（${describeUnlocatable(
                       firstUnlocatable?.reason ?? "unrecognized",
                     )}），请按技术详情里的原始路径排查。`}
@@ -2269,7 +2486,7 @@ export function EndpointAcquisitionPane({
       {/* 添加/编辑抽屉（§4.1/§4.2）：默认页面不常驻表单。 */}
       <PointDrawer
         open={drawerOpen}
-        title={editingIndex !== null ? "编辑点位" : "添加点位"}
+        title={editingIndex !== null || editingSelIndex !== null ? "编辑点位" : "添加点位"}
         busy={saving}
         onClose={requestCloseDrawer}
         footer={
@@ -2410,15 +2627,46 @@ export function EndpointAcquisitionPane({
           </div>
         ) : (
           <ResourcePickerAntd
+            key={`sel-${endpointId}-${editingSelIndex ?? "add"}-${formVersion}`}
             resources={desc?.resources ?? []}
-            existingSelections={sels}
+            // 就地编辑：把**被编辑的这一行**从 reconciliation 的 editable 集合里排除，
+            // 否则提交自己会被判成「与已有项重复」；protected 永远不动。
+            existingSelections={
+              editingSelIndex !== null ? sels.filter((_, i) => i !== editingSelIndex) : sels
+            }
             protectedSelections={preservedTasks.flatMap((t) => selectionsOf(t))}
             selectionMethods={desc?.resource_selection_methods ?? []}
             endpointId={endpointId}
             requireExplicitSelection
-            submitLabel="加入待保存列表"
+            initialSelection={
+              editingSelIndex !== null && sels[editingSelIndex]
+                ? {
+                    resource_id: sels[editingSelIndex]!.resource_id,
+                    parameters: sels[editingSelIndex]!.parameters,
+                    outputs: sels[editingSelIndex]!.outputs,
+                  }
+                : null
+            }
+            // 字段级定位：只有「被定位的就是正在编辑的这一行」才把字段交给表单高亮。
+            focusFieldKey={
+              editingSelIndex !== null &&
+              locatedIssue &&
+              selRowIds[editingSelIndex] === locatedIssue.rowId
+                ? locatedIssue.fieldKey
+                : null
+            }
+            submitLabel={editingSelIndex !== null ? "确认修改" : "加入待保存列表"}
             onDirtyChange={setDrawerDirty}
             onAdd={(selection) => {
+              // 就地编辑：替换这一行（rowId 不变，§4.8），不做 merge/append。
+              if (editingSelIndex !== null) {
+                replaceSelection(editingSelIndex, {
+                  resource_id: selection.resource_id,
+                  parameters: selection.parameters,
+                  outputs: selection.outputs,
+                });
+                return true;
+              }
               // 唯一防御门：与 AddDeviceFlow 同一共享实现（protected 永不动）。
               const schemaOf = (resourceId: string) => {
                 const found = (desc?.resources ?? []).find((r) => r.id === resourceId);
@@ -2482,10 +2730,15 @@ export function EndpointAcquisitionPane({
             <div
               data-testid="point-detail-issue"
               data-located-field={locatedIssue.fieldKey ?? ""}
+              data-in-place-editable={locatedIssue.inPlaceEditable ? "true" : "false"}
               style={{ color: "#c62828" }}
             >
               该行存在服务端校验问题
               {locatedIssue.fieldKey ? `（字段：${locatedIssue.fieldKey}）` : ""}
+              {/* 字段级但**不能**就地编辑：如实说明，不假装高亮了某个控件。 */}
+              {locatedIssue.fieldKey && !locatedIssue.inPlaceEditable
+                ? " · 该字段无法就地编辑（资源参数 Schema 里没有这个字段，或含界面不支持的类型），请按下面的原始配置排查"
+                : ""}
             </div>
           ) : null}
           {detailRow
