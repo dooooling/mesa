@@ -41,6 +41,14 @@ interface DraftGuardValue {
   confirmLeave: (action: string) => Promise<boolean>;
   /** 采集页上报草稿状态（唯一来源，避免两个真值）。 */
   reportDirty: (dirty: boolean) => void;
+  /**
+   * 清掉草稿副本。
+   *
+   * 用户**明确放弃**草稿后必须调用：副本存在路由之外，专为「路由变化不销毁草稿」
+   * 而设；若放弃时不清，下次进采集页会把已放弃的草稿复活（真实缺陷）。
+   * 浏览器后退与站内导航两条路径都要清，不能只有一条。
+   */
+  clearStash: () => void;
 }
 
 const DraftGuardContext = createContext<DraftGuardValue | null>(null);
@@ -72,8 +80,8 @@ function DraftGuardState({ children }: { children: ReactNode }) {
   const clearStash = useCallback(() => stash?.clear(), [stash]);
   useBrowserBackGuard(dirty, confirmLeave, clearStash);
   const value = useMemo<DraftGuardValue>(
-    () => ({ dirty, confirmLeave, reportDirty }),
-    [dirty, confirmLeave, reportDirty],
+    () => ({ dirty, confirmLeave, reportDirty, clearStash }),
+    [dirty, confirmLeave, reportDirty, clearStash],
   );
   return <DraftGuardContext.Provider value={value}>{children}</DraftGuardContext.Provider>;
 }
@@ -120,7 +128,12 @@ export function useGuardedNavigate(): (to: string, action?: string) => void {
         return;
       }
       void (async () => {
-        if (await ctx.confirmLeave(action)) nav(to);
+        if (await ctx.confirmLeave(action)) {
+          // 确认放弃 ⇒ 同时清掉草稿副本，否则再进采集页会复活已放弃的草稿。
+          // 页签、侧栏、面包屑都走 useGuardedNavigate，故这里一处即可统一覆盖。
+          ctx.clearStash();
+          nav(to);
+        }
       })();
     },
     [ctx, nav],

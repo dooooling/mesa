@@ -187,4 +187,32 @@ describe("应用内离开路径统一守卫（侧栏 / 面包屑 / Tab / 前进�
     await waitFor(() => expect(screen.queryByTestId("acquisition-interval-input")).toBeNull());
     expect(leaveDialog()).toBeNull();
   }, 60_000);
+
+  // 回归（真实浏览器复现）：明确「放弃修改并继续」后再进采集页，必须回到**已保存**的
+  // 1000，而不是把已放弃的 2000 草稿复活。
+  //
+  // 根因：草稿副本（draftStash）原先只在**浏览器后退**路径清理，站内导航（页签/侧栏
+  // /面包屑）确认放弃后没有清，副本还在，下次进页就被当成"待保存草稿"恢复出来。
+  it("abandoning_the_draft_then_reentering_shows_the_saved_interval", async () => {
+    const user = userEvent.setup();
+    mount();
+    await dirtyInterval(user);
+    expect(intervalValue()).toBe("2000");
+
+    // 站内导航（设备页签）并**确认放弃**。
+    await user.click(tabLink("概览"));
+    const modal = await waitFor(() => {
+      const el = leaveDialog();
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    await user.click(within(modal).getByRole("button", { name: "放弃修改并继续" }));
+    await waitFor(() => expect(leaveDialog()).toBeNull());
+
+    // 再进采集页：必须是已保存的 1000，且不再有未保存草稿（保存区不出现）。
+    await user.click(tabLink("采集"));
+    const interval = (await screen.findByTestId("acquisition-interval-input")) as HTMLInputElement;
+    await waitFor(() => expect(interval.value).toBe("1000"));
+    expect(screen.queryByTestId("draft-save-bar")).toBeNull();
+  }, 60_000);
 });

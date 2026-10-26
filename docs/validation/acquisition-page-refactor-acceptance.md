@@ -493,3 +493,17 @@ pnpm --dir apps/mesa-web build       # tsc -b && vite build 通过（chunk 体�
 3. **哨兵条目的历史栈副作用**（既有）：有草稿期间会多一条同 URL 记录；用户放弃/保存后该条目仍在，后退会先经过它（视觉无变化）。要彻底消除需要 data router + `useBlocker`（代价见 §10.2）。
 4. **行级问题**仍打开只读技术详情（保持既有行为）；若产品希望行级也直接进编辑态，只需改 `locateIssueRow` 一处分支。
 5. **通用资源的就地编辑**是本轮新增能力（此前通用行只有「添加/移除」）：`replaceSelection` 只改草稿，不发写请求；保存仍走同一 `planEndpointTaskSave` 全量替换路径，`rowId` 不变。
+
+---
+
+## 附录 D.10（回归）：明确放弃的草稿会重新出现
+
+**真实浏览器复现**：周期 1000 → 改 2000 → 点设备「概览」→「放弃修改并继续」→ 再进「采集」⇒ **仍是 2000 待保存**（预期应为已保存的 1000）。
+
+**根因**：草稿副本（`draftStash`）是「路由变化不销毁草稿」的纵深防御，但**只有浏览器后退路径**在确认放弃后清空；**站内导航**（页签 / 侧栏 / 面包屑）确认放弃后没清 ⇒ 副本残留，下次进页被当作待保存草稿恢复。
+
+**修复**：把 `clearStash` 暴露到守卫上下文（`draftNavGuard.tsx` 的 `DraftGuardValue`），并在 `useGuardedNavigate` 确认放弃后调用。页签、侧栏、面包屑**都走同一函数**，故一处即可统一覆盖，与浏览器后退路径口径一致。
+
+**回归测试**：`DraftNavGuard.test.tsx` 的 `abandoning_the_draft_then_reentering_shows_the_saved_interval` —— 断言再进采集页时周期为 **1000**、且 `draft-save-bar` **不出现**。
+
+**已验证该测试确实能抓到缺陷**：临时注释掉 `ctx.clearStash()` 后该用例失败，报 `expected '2000' to be '1000'`（与用户现象一致），恢复后通过。
