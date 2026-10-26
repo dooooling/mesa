@@ -68,7 +68,7 @@ import {
 import { NoticeSlot } from "./acquisition/NoticeSlot";
 import { PointDrawer } from "./acquisition/PointDrawer";
 import { PointSearch } from "./acquisition/PointSearch";
-import { PointTable } from "./acquisition/PointTable";
+import { PointTable, PointPagination } from "./acquisition/PointTable";
 import { DraftSaveBar } from "./acquisition/DraftSaveBar";
 import {
   classifyNckError,
@@ -1673,8 +1673,11 @@ export function EndpointAcquisitionPane({
     runState === "running" ? "运行中" : runState === "stopped" ? "已停止" : "状态未知";
   const draftPointCount = nck ? nckPoints.length : sels.length;
 
+  // 不再限制面板最大宽度。原先写死 maxWidth 980 是按「表单可读宽度」设的，
+  // 但采集页的主体是点位表格 —— 宽屏下整块被压在 980px 内、右侧留大片空白，
+  // 表格三列也挤在一起。改为占满可用宽度，由表格自身的三列 grid 分配空间。
   return (
-    <div style={{ display: "grid", gap: 12, maxWidth: 980 }}>
+    <div style={{ display: "grid", gap: 12, minWidth: 0 }}>
       {/* 真实问题照常出现（§3.3）：加载失败/配置损坏/未知状态都不得被「首屏安静」掩盖。 */}
       {tasksLoadState === "error" ? (
         <Alert
@@ -1888,7 +1891,22 @@ export function EndpointAcquisitionPane({
             }}
           />
 
-          <div ref={listScrollRef} data-testid="point-list-scroll" style={{ overflowY: "auto", maxHeight: 520 }}>
+          {/*
+          列表滚动区按视口高度自适应，不再写死固定高度。
+          写死 520px 时在 1080p 屏幕上列表只占约一半，下方留大片空白；而固定过高
+          又会在小屏把分页挤到视口外。用 calc(100vh - 占位) 让列表吃掉剩余高度，
+          并保留 minHeight 以免极窄视口下列表被压成一条缝。
+          占位约为：页头 + 连接行 + 周期行 + 列表标题 + 搜索行 + 分页行 + 保存区。
+        */}
+        <div
+          ref={listScrollRef}
+          data-testid="point-list-scroll"
+          style={{
+            overflowY: "auto",
+            maxHeight: "calc(100vh - 360px)",
+            minHeight: 240,
+          }}
+        >
             <PointTable
               rows={paged.rows}
               total={paged.total}
@@ -1944,8 +1962,22 @@ export function EndpointAcquisitionPane({
                   </div>
                 )
               }
+              showPagination={false}
             />
           </div>
+          {/* 分页固定在滚动区之外：列表滚动时分页常驻可见，不会跟着行一起滚走。 */}
+          <PointPagination
+            total={paged.total}
+            page={paged.page}
+            pageSize={pageSize}
+            pageCount={paged.pageCount}
+            pageSizeOptions={[25, 50, 100]}
+            onPageChange={setPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setPage(1);
+            }}
+          />
 
           {/* 移除先改草稿，可撤销（§7-9）：只有确实移除过才出现，且带处理动作。 */}
           {removedEntries.length > 0 ? (

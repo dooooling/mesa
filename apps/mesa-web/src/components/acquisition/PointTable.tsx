@@ -40,6 +40,7 @@ export function PointTable({
   pageSizeOptions,
   onPageChange,
   onPageSizeChange,
+  showPagination = true,
   actions,
   isEditable,
   rowTestId = "point-row",
@@ -54,6 +55,8 @@ export function PointTable({
   pageSizeOptions: number[];
   onPageChange: (page: number) => void;
   onPageSizeChange: (size: number) => void;
+  /** 是否在表格内渲染分页；页面层要把分页固定在滚动区外时传 false（默认 true）。 */
+  showPagination?: boolean;
   actions: PointTableActions;
   /** 行是否可编辑（可编辑性判定不属于本组件，由页面层给出）。 */
   isEditable?: (row: PointRowView) => boolean;
@@ -246,11 +249,61 @@ export function PointTable({
           </div>
         );
       })}
-      <div
-        data-testid="point-table-pagination"
-        style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 0", flexWrap: "wrap" }}
+      {/* 分页可外置：默认渲染在表格内；页面层若要把分页固定在滚动区之外
+          （避免分页跟着列表一起滚走），传 showPagination={false} 自行渲染。 */}
+      {showPagination ? (
+        <PointPagination
+          total={total}
+          page={page}
+          pageSize={pageSize}
+          pageCount={pageCount}
+          pageSizeOptions={pageSizeOptions}
+          onPageChange={onPageChange}
+          onPageSizeChange={onPageSizeChange}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * 点位列表分页条（独立导出）。
+ *
+ * 从 PointTable 拆出来是为了让页面层能把分页放在**滚动区之外**：分页若跟着
+ * 列表一起滚，用户翻到第 N 页再滚动时页码和每页条数会被滚出视口，等于在长
+ * 列表里丢失导航。拆出后「表格滚动、分页常驻」。
+ */
+export function PointPagination({
+  total,
+  page,
+  pageSize,
+  pageCount,
+  pageSizeOptions,
+  onPageChange,
+  onPageSizeChange,
+}: {
+  total: number;
+  page: number;
+  pageSize: number;
+  pageCount: number;
+  pageSizeOptions: number[];
+  onPageChange: (page: number) => void;
+  onPageSizeChange: (size: number) => void;
+}) {
+  return (
+    <div
+      data-testid="point-table-pagination"
+      style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 0", flexWrap: "wrap" }}
+    >
+      <span style={{ fontSize: 12, color: "#525252" }}>共 {total} 项</span>
+      {/*
+        分页控件整体右对齐：总数留左端做概览，页码与每页条数贴右端。
+        用 marginLeft:auto 而不是 justifyContent:space-between —— 窄屏 flexWrap
+        换行时右组能整体换到下一行，不会只把其中一项甩到右侧。
+      */}
+      <span
+        style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}
       >
-        <span style={{ fontSize: 12, color: "#525252" }}>共 {total} 项</span>
         {/* 每页条数用显式按钮而不是 locale 依赖的下拉：文案固定中文、可机械点击。 */}
         <span style={{ fontSize: 12, color: "#525252" }}>每页</span>
         <span style={{ display: "inline-flex", gap: 4 }}>
@@ -281,7 +334,7 @@ export function PointTable({
         <span style={{ fontSize: 11, color: "#8c8c8c" }}>
           第 {page} / {pageCount} 页
         </span>
-      </div>
+      </span>
     </div>
   );
 }
