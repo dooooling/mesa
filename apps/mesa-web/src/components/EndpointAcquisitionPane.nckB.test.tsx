@@ -1,8 +1,14 @@
-// PR-C 第二批 B：Endpoint 采集窗格的端到端（组件级）门禁。
+// 第二批 B + 第 2 步（页面交互）：Endpoint 采集窗格的端到端（组件级）门禁。
 //
-// 覆盖：目录分页 → scope 过滤 → 新增点位 → 保存计划 → PUT → 回读；
+// 覆盖：目录分页 → scope 过滤 → 抽屉内新增点位 → 保存计划 → PUT → 回读；
 // 已有点位编辑不增殖旧 Binding；存量 identity 点位的**显式移除恢复路径**
 // （删除不经准入门）；预览失败/身份不一致时禁用保存。
+//
+// 第 2 步只改「入口位置与查询方式」，断言强度不放宽：
+// - 变量选择/目录统计在**抽屉**里（默认页面不常驻表单）；
+// - 保存区在无修改时**不渲染**（`apply-button` 取不到是预期）；
+// - 逐行绿色「校验通过」标签删除，改用 `data-verify-status` 锚点；
+// - 移除走行内「⋯ → 移除」。
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -31,6 +37,9 @@ const RESOURCES = [
     modes: ["poll"],
   },
 ];
+
+/** 驱动声明的选型入口（NCK 真实声明 manual + browse；import 后端 501，不得开放）。 */
+const SELECTION_METHODS = ["manual", "browse"];
 
 function ok(body: unknown) {
   return { ok: true, status: 200, json: async () => body };
@@ -183,7 +192,10 @@ function installFetch(state: MockState) {
       return ok(page);
     }
     if (url.startsWith("/api/v1/drivers/")) {
-      return ok({ resources: state.resources ?? RESOURCES });
+      return ok({
+        resources: state.resources ?? RESOURCES,
+        resource_selection_methods: SELECTION_METHODS,
+      });
     }
     if (url.startsWith("/api/v1/tasks?endpoint=")) {
       return ok({ tasks: state.savedTasks ?? state.tasks });
@@ -214,15 +226,43 @@ function nckTask(id: string, points: NckPointSelection[]): AcquisitionTaskShape 
   };
 }
 
+/** 保存区主按钮（无修改时保存区不渲染，取不到是**预期**）。 */
 function saveButton(): HTMLButtonElement {
-  // P0-2：已停止时按钮文案是「保存配置」（不会再承诺启动采集）。
-  return screen.getByRole("button", { name: /保存配置/ }) as HTMLButtonElement;
+  return screen.getByTestId("apply-button") as HTMLButtonElement;
 }
 
+/** 等身份核验落定（绿色标签已删除，改看行上的 data-verify-status）。 */
+async function waitVerified(count = 1) {
+  await waitFor(() =>
+    expect(document.querySelectorAll('[data-verify-status="verified"]').length).toBe(count),
+  );
+}
+
+/** 打开添加抽屉并等待里面的选择入口就绪。 */
+async function openAddDrawer(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByTestId("add-point-entry"));
+  await screen.findByTestId("nck-variable-select");
+}
+
+/** 制造一次真实变更，让固定保存区出现。 */
+async function changeInterval(value: number) {
+  await waitFor(() =>
+    expect(screen.getByTestId("acquisition-status-interval").textContent).toContain("（已保存）"),
+  );
+  fireEvent.change(screen.getByTestId("acquisition-interval-input"), {
+    target: { value: String(value) },
+  });
+}
+
+/**
+ * 按点位键找到对应行：界面默认只展示「名称 + 摘要」，完整键在技术详情里，
+ * 因此这里用 variable_id 段定位（同一 Endpoint 内唯一）。
+ */
 function rowOf(pointKey: string): HTMLElement {
+  const needle = pointKey.split("@")[0]!;
   const row = screen
     .getAllByTestId("nck-point-row")
-    .find((el) => (el.textContent ?? "").includes(pointKey));
+    .find((el) => (el.textContent ?? "").includes(needle));
   if (!row) throw new Error(`找不到点位行：${pointKey}`);
   return row;
 }
@@ -237,6 +277,7 @@ afterEach(() => {
 
 describe("门禁 1/3：目录分页完整读取，仅 collect 进入采集界面", () => {
   it("catalog_pages_are_all_loaded_and_identity_never_offered", async () => {
+    const user = userEvent.setup();
     const state = mkState({
       catalogPages: {
         "": catEnvelope({
@@ -256,6 +297,9 @@ describe("门禁 1/3：目录分页完整读取，仅 collect 进入采集界面
     installFetch(state);
     render(<EndpointAcquisitionPane endpointId={EP} driverId={NCK_DRIVER} onChanged={() => {}} />);
 
+    // 目录统计不在默认页面上（§2.5），打开抽屉后才是选择器的信息区。
+    await waitFor(() => expect(screen.queryByTestId("nck-collectable-summary")).toBeNull());
+    await openAddDrawer(user);
     const summary = await screen.findByTestId("nck-collectable-summary");
     expect(summary.textContent).toContain("2 个可配置变量");
     expect(screen.getByTestId("nck-catalog-meta").textContent).toContain("3 条 / 2 页");
@@ -272,7 +316,7 @@ describe("门禁 1/3：目录分页完整读取，仅 collect 进入采集界面
   });
 });
 
-describe("门禁 7：新增点位 → nck.points.v1 → PUT 后回读一致", () => {
+describe("门禁 7：抽屉内新增点位 → nck.points.v1 → PUT 后回读一致", () => {
   it("new_point_is_saved_and_read_back", async () => {
     const user = userEvent.setup();
     const state = mkState();
@@ -295,13 +339,29 @@ describe("门禁 7：新增点位 → nck.points.v1 → PUT 后回读一致", ()
         }}
       />,
     );
-    await waitFor(() => expect(saveButton().disabled).toBe(true));
+    // 默认页面不常驻添加表单（§2.1）。
+    await waitFor(() => expect(screen.queryByTestId("add-point-entry")).toBeTruthy());
+    expect(screen.queryByTestId("nck-variable-select")).toBeNull();
+    // 无修改时保存区不渲染。
+    expect(screen.queryByTestId("apply-button")).toBeNull();
+
+    await openAddDrawer(user);
+    // 抽屉里只有一句说明（§4.3）。
+    expect(screen.getByTestId("drawer-draft-notice").textContent).toBe(
+      "确认后加入页面草稿，保存配置后生效。",
+    );
+    // 未选资源时只显示一个选择入口：没有空身份、禁用按钮与错误框的组合。
+    expect(screen.queryByTestId("nck-add-point")).toBeNull();
     const select = screen.getByTestId("nck-variable-select") as HTMLSelectElement;
     await user.selectOptions(select, "syn.collect.a");
     await user.type(screen.getByLabelText("target-channel"), "1");
     await screen.findByTestId("nck-point-key");
+    // 按钮文案是「加入待保存列表」，不是「保存点位」（§4.1-7）。
+    expect(screen.getByTestId("nck-add-point").textContent).toBe("加入待保存列表");
     await user.click(screen.getByTestId("nck-add-point"));
     await screen.findByTestId("nck-point-row");
+    // 抽屉关闭（只更新草稿，不发任何写请求）。
+    await waitFor(() => expect(screen.queryByTestId("nck-variable-select")).toBeNull());
     await waitFor(() => expect(saveButton().disabled).toBe(false));
     await user.click(saveButton());
 
@@ -374,12 +434,13 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
         }}
       />,
     );
-    // 快照就绪（点位行已渲染）；无实际修改时按钮禁用（§4.4.2）。
-    await screen.findByTestId("nck-point-row");
-    await waitFor(() => expect(saveButton().disabled).toBe(true));
+    // 快照就绪（点位行已渲染）；无实际修改时保存区不渲染（§4.7）。
+    await waitVerified(1);
+    expect(screen.queryByTestId("draft-save-bar")).toBeNull();
     expect(rowOf(p1.point_key)).toBeTruthy();
 
-    // 在同一个 NCK 任务里新增第二个点位。
+    // 在同一个 NCK 任务里新增第二个点位（抽屉入口）。
+    await openAddDrawer(user);
     await user.selectOptions(
       screen.getByTestId("nck-variable-select") as HTMLSelectElement,
       "syn.collect.b",
@@ -429,11 +490,13 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
         }}
       />,
     );
-    // 快照就绪（点位行已渲染）；无实际修改时按钮禁用（§4.4.2）。
-    await screen.findByTestId("nck-point-row");
-    await waitFor(() => expect(saveButton().disabled).toBe(true));
+    await waitVerified(1);
+    expect(screen.queryByTestId("draft-save-bar")).toBeNull();
 
-    await user.click(within(rowOf(original.point_key)).getByRole("button", { name: /编\s*辑/ }));
+    // 点行「编辑」→ 抽屉立即打开并带入配置；确认按钮是「确认修改」。
+    await user.click(within(rowOf(original.point_key)).getByTestId("point-row-edit"));
+    await screen.findByTestId("nck-variable-select");
+    expect(screen.getByTestId("nck-add-point").textContent).toBe("确认修改");
     const input = screen.getByLabelText("target-channel") as HTMLInputElement;
     await user.clear(input);
     await user.type(input, "3");
@@ -443,6 +506,13 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
     await user.click(screen.getByTestId("nck-add-point"));
     await waitFor(() =>
       expect(screen.getAllByTestId("nck-point-row")).toHaveLength(1),
+    );
+    // 「确认修改」只更新草稿：没有任何写请求，行标记「已修改」。
+    expect(state.putBodies).toHaveLength(0);
+    await waitFor(() =>
+      expect(within(rowOf(original.point_key)).getByTestId("point-row-status").textContent).toContain(
+        "已修改",
+      ),
     );
     await waitFor(() => expect(saveButton().disabled).toBe(false));
     await user.click(saveButton());
@@ -495,30 +565,32 @@ describe("门禁 9：存量 identity 点位 → 显式移除 → 重验剩余 �
       />,
     );
 
-    // 1) 必须展示「不能保存的具体原因」，且不可保存。
+    // 1) 必须展示「不能保存的具体原因」（真实问题照常出现，§3.3），且不可保存。
     const alert = await screen.findByTestId("nck-legacy-identity-alert");
     expect(alert.textContent).toContain("身份探针点位");
     expect(alert.textContent).toContain("请检查并手动移除这些点位");
     expect(alert.textContent).toContain("SCOPE_IDENTITY");
-    await waitFor(() => expect(saveButton().disabled).toBe(true));
+    expect(screen.queryByTestId("draft-save-bar")).toBeNull();
     expect(state.putBodies).toHaveLength(0);
 
     // 2) 不得自动删除：两个点位都还在。
     expect(screen.getAllByTestId("nck-point-row")).toHaveLength(2);
     expect(rowOf(identityPoint.point_key)).toBeTruthy();
 
-    // 3) 显式移除：按钮必须可用（删除本身不经过 scope 准入门）。
+    // 3) 显式移除：入口必须可用（删除本身不经过 scope 准入门）。
     const identityRow = rowOf(identityPoint.point_key);
-    const removeButton = within(identityRow).getByRole("button", { name: /移\s*除/ }) as HTMLButtonElement;
-    expect(removeButton.disabled).toBe(false);
     const previewsBeforeRemoval = state.previewCalls.length;
-    await user.click(removeButton);
+    await user.click(within(identityRow).getByTestId("point-row-more"));
+    const removeItem = await screen.findByTestId("point-row-remove");
+    expect((removeItem as HTMLButtonElement).disabled).toBe(false);
+    await user.click(removeItem);
 
-    // 4) 原始点位信息保留，便于确认改了什么。
+    // 4) 原始点位信息保留（技术详情里），便于确认改了什么；并可撤销。
     const removed = await screen.findByTestId("nck-removed-points");
     expect(removed.textContent).toContain(identityPoint.point_key);
     expect(removed.textContent).toContain('"channel":9');
     expect(removed.textContent).toContain("SCOPE_IDENTITY");
+    expect(screen.getByTestId("undo-remove")).toBeTruthy();
 
     // 5) 移除后重新验证剩余点位（至少再次调用预览），然后才允许保存。
     expect(screen.getAllByTestId("nck-point-row")).toHaveLength(1);
@@ -564,7 +636,7 @@ describe("门禁 6：已有点位预览失败 ⇒ 不得按旧 Key 继续提交"
     );
     const alert = await screen.findByTestId("nck-legacy-identity-alert");
     expect(alert.textContent).toContain("DRIVER_UNAVAILABLE");
-    await waitFor(() => expect(saveButton().disabled).toBe(true));
+    expect(screen.queryByTestId("draft-save-bar")).toBeNull();
     expect(state.putBodies).toHaveLength(0);
   });
 });
@@ -593,7 +665,7 @@ describe("收口回归：切换 Endpoint 不得残留上一台的表单/Preview"
         nckDefinitions={definitions}
       />,
     );
-    await screen.findByTestId("nck-collectable-summary");
+    await openAddDrawer(user);
     await user.selectOptions(
       screen.getByTestId("nck-variable-select") as HTMLSelectElement,
       "syn.collect.a",
@@ -609,11 +681,10 @@ describe("收口回归：切换 Endpoint 不得残留上一台的表单/Preview"
         nckDefinitions={definitions}
       />,
     );
-    // 表单以 endpointId 作为 key：切换 Endpoint 必须卸载重建，
-    // 上一台的目标输入与已确认 Key 不得跨设备残留。
-    await waitFor(() =>
-      expect((screen.getByTestId("nck-variable-select") as HTMLSelectElement).value).toBe(""),
-    );
+    // 切换 Endpoint 必须关闭抽屉并重建表单：上一台的目标输入与已确认 Key 不得残留。
+    await waitFor(() => expect(screen.queryByTestId("nck-variable-select")).toBeNull());
+    await openAddDrawer(user);
+    expect((screen.getByTestId("nck-variable-select") as HTMLSelectElement).value).toBe("");
     expect(screen.queryByTestId("nck-point-key")).toBeNull();
     // 未重新选择变量 ⇒ 不渲染任何 Target 输入（上一台的输入已随卸载丢弃）。
     expect(screen.queryByLabelText("target-channel")).toBeNull();
@@ -680,24 +751,19 @@ describe("PR-C 第三批：Endpoint 页 native 存量点位复核（A24–A27）
         }}
       />,
     );
-    // P1-2：状态标签只声明“配置格式校验通过”，不得暗示真实机床已读取成功。
-    await screen.findByText("配置格式校验通过（原生）");
-    // 无实际修改 ⇒ 按钮禁用（§4.4.2）。
-    await waitFor(() => expect(saveButton().disabled).toBe(true));
-    // 按钮禁用只是体验：绕过 disabled 直接触发提交函数，仍不得发任何写请求。
-    const fetchMock = globalThis.fetch as unknown as {
-      mock: { calls: Array<[string, RequestInit | undefined]> };
-    };
-    const before = fetchMock.mock.calls.length;
-    expect(invokeDisabledButton(saveButton())).toBe(true);
-    await screen.findByText(/未检测到实际修改/);
+    // 原生点位同样只靠行级锚点声明「配置格式校验通过」，界面上不再有绿色标签。
+    await waitVerified(1);
+    expect(document.body.textContent).not.toContain("校验通过");
+    // 无实际修改 ⇒ 保存区不渲染；改一次周期后按钮仍可用（证明准入没问题）。
+    expect(screen.queryByTestId("draft-save-bar")).toBeNull();
+    await changeInterval(2000);
+    await waitFor(() => expect(saveButton().disabled).toBe(false));
+    fireEvent.change(screen.getByTestId("acquisition-interval-input"), { target: { value: "1000" } });
+    await waitFor(() => expect(screen.queryByTestId("draft-save-bar")).toBeNull());
     expect(state.putBodies).toHaveLength(0);
-    expect(fetchMock.mock.calls.length).toBe(before);
 
     // native 点位也必须可进入编辑（高级原生页），而不是只能移除。
-    await user.click(
-      within(screen.getByTestId("nck-point-row")).getByRole("button", { name: /编\s*辑/ }),
-    );
+    await user.click(screen.getByTestId("point-row-edit"));
     expect(screen.getByTestId("nck-native-fields")).toBeTruthy();
     expect(screen.getByTestId("nck-native-key").textContent).toBe("native.C.1.21.1.396");
   });
@@ -761,18 +827,18 @@ describe("P1：Endpoint 层最终保存守卫（完整 Schema）", () => {
     expect(
       screen.getByText("variable · axis_ref · axis_ref · 配置未携带（驱动新增字段）"),
     ).toBeTruthy();
-    const save = saveButton();
-    expect(save.disabled).toBe(true);
 
     // 制造一次真实变更（周期 1000 → 2000）：若守卫缺失，保存会真的发请求。
-    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
+    fireEvent.change(screen.getByTestId("acquisition-interval-input"), { target: { value: "2000" } });
+    const save = await screen.findByTestId("apply-button");
+    expect((save as HTMLButtonElement).disabled).toBe(true);
 
     const fetchMock = globalThis.fetch as unknown as {
       mock: { calls: Array<[string, RequestInit | undefined]> };
     };
     const before = fetchMock.mock.calls.length;
     // 绕过 disabled 直接触发组件级 onClick（disabled 不是唯一防线）。
-    expect(invokeDisabledButton(save)).toBe(true);
+    expect(invokeDisabledButton(save as HTMLButtonElement)).toBe(true);
     await act(async () => {});
 
     // 拒绝发生在任何 stop / PUT / start 之前：连一个请求都没有发出。
@@ -861,7 +927,8 @@ describe("PR-C 第三批：Endpoint 页 Browse → 语义表单（A1/A13/A16）"
         }}
       />,
     );
-    await screen.findByTestId("nck-collectable-summary");
+    // 浏览入口在抽屉里，且必须由驱动声明（resource_selection_methods 含 browse）。
+    await openAddDrawer(user);
     await user.click(screen.getByTestId("nck-browse-toggle"));
     await screen.findByText("Browse 程序状态");
 

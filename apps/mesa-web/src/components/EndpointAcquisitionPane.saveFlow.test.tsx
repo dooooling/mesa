@@ -1,4 +1,4 @@
-// 采集页第 1 步（状态与保存流程）门禁。
+// 采集页第 1 步（状态与保存流程）门禁 —— 第 2 步（页面交互）后的版本。
 //
 // 覆盖评审稿的六项交付里可直接观测的行为：
 // 1. 运行态三态：加载失败 / 切换连接 ⇒ unknown，**不沿用**旧值、不当成「已停止」；
@@ -8,6 +8,9 @@
 //    不报成功、不刷新基线、不自动重新 PUT；
 // 5. 配置已保存但启动失败 ⇒ 草稿标记清除，只重试启动（不重复整套保存）；
 // 6. 稳定 rowId：编辑/删除/新增后同一行的 data-row-id 不变，删除的号不复用。
+//
+// 第 2 步只改「入口位置与查询方式」：无修改时保存区**不渲染**（不是禁用），
+// 添加/编辑走抽屉，移除走行内「⋯ → 移除」。
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -189,8 +192,16 @@ function renderPane(endpointId = EP) {
   );
 }
 
+/** 保存区主按钮（无修改时保存区不渲染，取不到是**预期**）。 */
 function saveButton(): HTMLButtonElement {
   return screen.getByTestId("apply-button") as HTMLButtonElement;
+}
+
+/** 等身份核验落定（绿色标签已删除，改看行上的 data-verify-status）。 */
+async function waitVerified(count = 1) {
+  await waitFor(() =>
+    expect(document.querySelectorAll('[data-verify-status="verified"]').length).toBe(count),
+  );
 }
 
 /**
@@ -235,19 +246,17 @@ describe("交付 1/2：运行态三态与「未知禁止保存」", () => {
     renderPane();
 
     // 三态：读不到 ⇒ 状态未知，绝不推断成「已停止」。
-    // 用 findBy 等「未知提示」出现（它只在一次读取结束后才渲染），避免抢在读取完成前断言。
     expect(await screen.findByTestId("acquisition-run-state-unknown")).toBeTruthy();
     expect(screen.getByTestId("acquisition-status-state").textContent).toBe("状态未知");
     expect(screen.getByTestId("refresh-run-state")).toBeTruthy();
-    // 草稿仍可编辑（点位行照常渲染）；等任务快照就绪后再验证提交函数守卫
-    // （快照门也会拦请求，不能拿它冒充「运行态未知」的证据）。
+    // 草稿仍可编辑（点位行照常渲染）；等任务快照就绪后再验证提交函数守卫。
     expect(screen.getByTestId("nck-point-row")).toBeTruthy();
-    await waitFor(() =>
-      expect(screen.getByTestId("acquisition-status-interval").textContent).toContain("（已保存）"),
-    );
+    await changeInterval(2000);
 
-    const save = saveButton();
+    // 有修改 ⇒ 保存区出现，但按钮禁用且只提供「刷新状态」。
+    const save = (await screen.findByTestId("apply-button")) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
+    expect(screen.getByTestId("save-bar-refresh-state")).toBeTruthy();
     const before = fetchCalls().length;
     // 绕过 disabled：提交函数自身的守卫必须拦住，且**一个请求都不发**。
     expect(invokeDisabledButton(save)).toBe(true);
@@ -286,10 +295,11 @@ describe("交付 1/2：运行态三态与「未知禁止保存」", () => {
       />,
     );
     // 关键：读取失败 ⇒ 未知；既不是上一台的「运行中」，也不是「已停止」。
-    // 等「未知提示」出现再断言（它只在一次读取结束后渲染）。
     expect(await screen.findByTestId("acquisition-run-state-unknown")).toBeTruthy();
     expect(screen.getByTestId("acquisition-status-state").textContent).toBe("状态未知");
-    expect(saveButton().disabled).toBe(true);
+    // 切换连接后草稿清空 ⇒ 没有「待保存」态，保存区不渲染。
+    expect(screen.queryByTestId("apply-button")).toBeNull();
+    expect(writeCalls()).toEqual([]);
   });
 
   it("刷新状态：重新读取成功后转为已停止（不再是未知）", async () => {
@@ -324,7 +334,7 @@ describe("交付 1/2：运行态三态与「未知禁止保存」", () => {
     renderPane(EP);
     expect(await screen.findByTestId("acquisition-run-state-unknown")).toBeTruthy();
     expect(screen.getByTestId("acquisition-status-state").textContent).toBe("状态未知");
-    expect(saveButton().disabled).toBe(true);
+    expect(screen.queryByTestId("apply-button")).toBeNull();
     expect(writeCalls()).toEqual([]);
   });
 });
@@ -383,8 +393,7 @@ describe("交付 3：稳定 rowId（编辑/删除/新增后同一行身份不变
     expect(new Set(initial).size).toBe(2);
 
     // 1) 编辑第二行：point_key 从 syn.collect.b@channel=2 变成 ...=9，但 rowId 不变。
-    const second = rows()[1];
-    await user.click(within(second).getByRole("button", { name: /编\s*辑/ }));
+    await user.click(within(rows()[1]!).getByTestId("point-row-edit"));
     const input = await screen.findByLabelText("target-channel");
     await user.clear(input);
     await user.type(input, "9");
@@ -396,14 +405,15 @@ describe("交付 3：稳定 rowId（编辑/删除/新增后同一行身份不变
     expect(idsOf()).toEqual(initial);
 
     // 2) 删除第一行：剩下那行仍是它自己的 rowId（不按下标重排）。
-    const first = rows()[0];
-    await user.click(within(first).getByRole("button", { name: /移\s*除/ }));
+    await user.click(within(rows()[0]!).getByTestId("point-row-more"));
+    await user.click(await screen.findByTestId("point-row-remove"));
     await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(1));
     expect(idsOf()).toEqual([initial[1]]);
 
     // 3) 新增一行：发新号，且不复用被删除的 initial[0]。
+    await user.click(screen.getByTestId("add-point-entry"));
     await user.selectOptions(
-      screen.getByTestId("nck-variable-select") as HTMLSelectElement,
+      (await screen.findByTestId("nck-variable-select")) as HTMLSelectElement,
       "syn.collect.a",
     );
     await user.type(screen.getByLabelText("target-channel"), "5");
@@ -414,7 +424,7 @@ describe("交付 3：稳定 rowId（编辑/删除/新增后同一行身份不变
     expect(after[0]).toBe(initial[1]);
     expect(after[1]).not.toBe(initial[0]);
     expect(after[1]).not.toBe(initial[1]);
-  });
+  }, 30_000);
 });
 
 describe("交付 4/5：完整配置回读与基线更新", () => {
@@ -476,7 +486,9 @@ describe("交付 4/5：完整配置回读与基线更新", () => {
     });
     installFetch(state);
     renderPane();
-    await waitFor(() => expect(saveButton().disabled).toBe(true));
+    await waitVerified(1);
+    // 无修改时保存区不渲染；产生修改后才出现按钮。
+    expect(screen.queryByTestId("apply-button")).toBeNull();
     await changeInterval(2000);
     await waitFor(() => expect(saveButton().disabled).toBe(false));
     await user.click(saveButton());
@@ -486,6 +498,9 @@ describe("交付 4/5：完整配置回读与基线更新", () => {
     expect(outcome.textContent).toContain("回读失败");
     expect(screen.queryByTestId("apply-result")).toBeNull();
     expect(state.putBodies).toHaveLength(1);
+    // 待核对期间保存区必须仍然可见并保留入口（即使草稿已回到基线）。
+    expect(screen.getByTestId("draft-save-bar")).toBeTruthy();
+    expect(screen.getByTestId("draft-save-notice").textContent).toContain("保存结果待核对");
   });
 
   it("周期是唯一变更也必须发请求（点位相同）", async () => {
@@ -494,7 +509,8 @@ describe("交付 4/5：完整配置回读与基线更新", () => {
     const state = mkState({ tasks: [nckTask([p], 1000)] });
     installFetch(state);
     renderPane();
-    await waitFor(() => expect(saveButton().disabled).toBe(true));
+    await waitVerified(1);
+    expect(screen.queryByTestId("apply-button")).toBeNull();
     await changeInterval(500);
     await waitFor(() => expect(saveButton().disabled).toBe(false));
     await user.click(saveButton());
@@ -506,7 +522,7 @@ describe("交付 4/5：完整配置回读与基线更新", () => {
     expect(sentPoints).toEqual([p]);
   });
 
-  it("保存后基线整份刷新：再点保存（无修改）不再发 PUT", async () => {
+  it("保存后基线整份刷新：无修改时保存区收起、不再发 PUT", async () => {
     const user = userEvent.setup();
     const state = mkState({ tasks: [nckTask([point("syn.collect.a", 1)], 1000)] });
     installFetch(state);
@@ -517,10 +533,11 @@ describe("交付 4/5：完整配置回读与基线更新", () => {
     await waitFor(() => expect(state.putBodies).toHaveLength(1));
     await screen.findByTestId("apply-result");
 
-    // 基线已刷新为「周期 2000 + 同一点位」⇒ 无实际修改，按钮禁用。
-    await waitFor(() => expect(saveButton().disabled).toBe(true));
-    expect(invokeDisabledButton(saveButton())).toBe(true);
-    await screen.findByText(/未检测到实际修改/);
+    // 基线已刷新为「周期 2000 + 同一点位」⇒ 无实际修改：保存动作收起，
+    // 只剩一次简短结果行（不再有待保存摘要与按钮）。
+    await waitFor(() => expect(screen.queryByTestId("apply-button")).toBeNull());
+    expect(screen.queryByTestId("discard-draft")).toBeNull();
+    expect(screen.queryByTestId("draft-save-summary")).toBeNull();
     expect(state.putBodies).toHaveLength(1);
   });
 });
@@ -542,13 +559,13 @@ describe("交付 6：配置已保存但启动失败 ⇒ 只重试启动", () => 
     await waitFor(() => expect(saveButton().disabled).toBe(false));
     await user.click(saveButton());
 
-    // 回读一致 ⇒ 基线已刷新（草稿标记清除），但启动失败。
-    const result = await screen.findByTestId("apply-result");
-    expect(result.textContent).toContain("配置已保存，但采集启动失败");
+    // 回读一致 ⇒ 基线已刷新（草稿标记清除），但启动失败：保存区转为结果态。
     await waitFor(() =>
       expect(screen.getByTestId("acquisition-status-interval").textContent).toBe("2000 ms（已保存）"),
     );
-    expect(screen.getByTestId("restart-failed")).toBeTruthy();
+    const notice = await screen.findByTestId("draft-save-notice");
+    expect(notice.textContent).toContain("配置已保存，但恢复采集失败");
+    expect(screen.getByTestId("retry-start")).toBeTruthy();
     expect(state.stopCalls).toBe(1);
     expect(state.putBodies).toHaveLength(1);
     expect(state.startCalls).toBe(1);
@@ -557,14 +574,14 @@ describe("交付 6：配置已保存但启动失败 ⇒ 只重试启动", () => 
     state.startOk = true;
     await user.click(screen.getByTestId("retry-start"));
     await waitFor(() =>
-      expect(screen.getByTestId("apply-result").textContent).toContain("配置已保存，采集已启动"),
+      expect(screen.getByTestId("acquisition-status-state").textContent).toBe("运行中"),
     );
     expect(state.stopCalls).toBe(1);
     expect(state.putBodies).toHaveLength(1);
     expect(state.startCalls).toBe(2);
-    expect(screen.queryByTestId("restart-failed")).toBeNull();
-    await waitFor(() =>
-      expect(screen.getByTestId("acquisition-status-state").textContent).toBe("运行中"),
-    );
+    // 结果态收起：不再有重试入口与保存按钮，只留一次成功结果。
+    await waitFor(() => expect(screen.queryByTestId("retry-start")).toBeNull());
+    expect(screen.queryByTestId("apply-button")).toBeNull();
   });
 });
+

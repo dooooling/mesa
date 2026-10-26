@@ -46,7 +46,7 @@ describe("原生点位：没有可靠业务名称就不编造", () => {
     const display = nckPointDisplay(nativePoint, null);
     expect(display.title).toBe("原生点位");
     // 五段地址按 area / area_no / module / column / line 原样拼接。
-    expect(display.address).toBe("A / 1 / 26 / 30110 / 1");
+    expect(display.address).toBe("区域 A · 区域号 1 · 模块 26 · 列 30110 · 行 1");
     expect(display.revision).toBe("定义版本：不适用（高级原生点位）");
   });
 
@@ -63,7 +63,26 @@ describe("原生点位：没有可靠业务名称就不编造", () => {
       null,
     );
     expect(display.title).toBe("原生点位");
-    expect(display.address).toBe("A / 1");
+    expect(display.address).toBe("区域 A · 区域号 1");
+  });
+
+  it("native_address_is_labeled_not_bare_numbers(self)", () => {
+    // §2.6-4：原生地址必须是「字段标签 + 值」，不能是无说明的五段数字。
+    const display = nckPointDisplay(nativePoint, null);
+    expect(display.address).toBe("区域 A · 区域号 1 · 模块 26 · 列 30110 · 行 1");
+  });
+
+  it("native_translation_table_then_schema_label_then_key", () => {
+    // 翻译表命中的字段用中文标签；未收录的字段不影响地址摘要，也不编造业务名。
+    const display = nckPointDisplay(nativePoint, null, {
+      nativeSchema: {
+        fields: [
+          { key: "module", label: "Module (EN)", field_type: "integer", required: false, validation: {}, ui: {} },
+        ],
+      },
+    });
+    expect(display.address).toBe("区域 A · 区域号 1 · 模块 26 · 列 30110 · 行 1");
+    expect(display.address).not.toMatch(/进给|倍率|转速/);
   });
 });
 
@@ -71,7 +90,7 @@ describe("语义点位：名称只取定义 label，地址由 Target/Arguments �
   it("shows_definition_label_and_readable_address", () => {
     const display = nckPointDisplay(semanticPoint(), semanticDefinition());
     expect(display.title).toBe("轴位置");
-    expect(display.address).toBe("语义点位 · 通道 1 / 轴 2 / R 参数号 5");
+    expect(display.address).toBe("通道 1 · 轴 2 · R 参数号 5");
     expect(display.revision).toBe("定义版本：rev 1");
   });
 
@@ -104,7 +123,7 @@ describe("语义点位：名称只取定义 label，地址由 Target/Arguments �
         arguments: [],
       },
     );
-    expect(display.address).toBe("语义点位 · 驱动对象 26（入口 nc_variable）");
+    expect(display.address).toBe("驱动对象 26（入口 nc_variable）");
     expect(display.revision).toBe("定义版本：rev 3");
   });
 
@@ -123,7 +142,8 @@ describe("语义点位：名称只取定义 label，地址由 Target/Arguments �
       null,
     );
     expect(display.title).toBe("legacy.variable");
-    expect(display.address).toBe("语义点位 · 通道 9");
+    expect(display.address).toBe("通道 9");
     expect(display.revision).toBe("定义版本：rev 1");
   });
 });
+

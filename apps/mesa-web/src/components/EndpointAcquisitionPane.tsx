@@ -10,7 +10,7 @@
 //   重新核验定义、参数与**服务端重算的 Key**，核验失败只能查看原始配置或
 //   显式移除，不能继续保存。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Button, InputNumber, Tag, Tooltip, message } from "antd";
+import { Alert, Button, InputNumber, Modal, Tooltip, message } from "antd";
 import { QuestionCircleOutlined } from "@ant-design/icons";
 import { api } from "../api";
 import type { DriverDescriptor, ValidationIssue } from "../types";
@@ -43,8 +43,33 @@ import {
   alignRowIds,
   assignRowIds,
   createRowIdAllocator,
+  paginateItems,
   stableIdentityKey,
 } from "../pointRows";
+import {
+  buildFilterOptions,
+  countRowStates,
+  applyRowQuery,
+  type PointFilter,
+  type PointRowView,
+} from "../acquisitionRowView";
+import {
+  buildNckPointRows,
+  buildSelectionRows,
+  type RowVerification,
+} from "../acquisitionRowModel";
+import {
+  diffDraft,
+  draftContentKey,
+  saveBarView,
+  type DraftBaseline,
+  type DraftRowRef,
+} from "../acquisitionDraftDiff";
+import { NoticeSlot } from "./acquisition/NoticeSlot";
+import { PointDrawer } from "./acquisition/PointDrawer";
+import { PointSearch } from "./acquisition/PointSearch";
+import { PointTable } from "./acquisition/PointTable";
+import { DraftSaveBar } from "./acquisition/DraftSaveBar";
 import {
   classifyNckError,
   describeNckFailure,
@@ -66,8 +91,10 @@ import {
   validateNativePoint,
 } from "../nckNativeModel";
 import { applySelectionAdd } from "../resourceSelectionModel";
-import { nckPointDisplay } from "../nckPointDisplay";
-import { pointSummary } from "../pointSummary";
+import type { ApplyResult } from "./ApplyWithRestart";
+import { NckPointFields } from "./NckPointFields";
+import { ResourceBrowseAntd } from "./ResourceBrowseAntd";
+import { ResourcePickerAntd } from "./ResourcePickerAntd";
 import {
   UNSUPPORTED_CONFIG_NOTICE,
   unsupportedFieldsInResources,
@@ -75,10 +102,6 @@ import {
   type UnsupportedFieldInResource,
 } from "../descriptorCompatibility";
 import { draftSignature, savedVsDraftText } from "../acquisitionDraft";
-import { ApplyWithRestart, type ApplyResult } from "./ApplyWithRestart";
-import { NckPointFields } from "./NckPointFields";
-import { ResourceBrowseAntd } from "./ResourceBrowseAntd";
-import { ResourcePickerAntd } from "./ResourcePickerAntd";
 
 /** 定义目录条目（I-2 `VariableDefinition` 的宽松形态，注入/测试可只给子集）。 */
 export type NckDefinitionEntry = NckDefinitionLike;
@@ -102,10 +125,14 @@ interface NckPointVerification {
   native?: boolean;
 }
 
-/** 用户显式移除的点位：**保留原始配置**，便于确认具体改了什么。 */
-interface RemovedNckPoint {
-  point: NckPointSelection;
+/** 用户从草稿里移除的一行：**原始配置保留**，便于确认改了什么，且可撤销。 */
+interface RemovedDraftEntry {
+  rowId: string;
+  /** 原下标：撤销时放回原位（顺序也是配置的一部分）。 */
+  index: number;
   reason: string;
+  point?: NckPointSelection;
+  selection?: ResourceSelection;
 }
 
 /** 取任务内已知 point_key：两种 kind 都读，未知 kind / 结构非法返回空。 */
@@ -126,6 +153,24 @@ function pointKeysOfTask(task: AcquisitionTaskShape): string[] {
 function snapshotIntervalMs(task: AcquisitionTaskShape | null | undefined): number | null {
   if (!task || task.schedule?.mode !== "poll") return null;
   return typeof task.schedule.interval_ms === "number" ? task.schedule.interval_ms : null;
+}
+
+/**
+ * 草稿行内容键（只用于**差异展示**：行标记与变更摘要）。
+ *
+ * NCK 点位用 `kind + 完整参数`：`point_key` 由参数派生，进不进键都不改变判定。
+ * 通用资源选择用 `resource_id + 完整参数 + 输出`（顺序保序：顺序也是配置）。
+ */
+function pointContentKey(point: NckPointSelection): string {
+  return draftContentKey({ kind: point.kind, parameters: point.parameters });
+}
+
+function selectionContentKey(selection: ResourceSelection): string {
+  return draftContentKey({
+    resource_id: selection.resource_id,
+    parameters: selection.parameters,
+    outputs: selection.outputs,
+  });
 }
 
 /**
@@ -212,12 +257,18 @@ export function EndpointAcquisitionPane({
   driverId,
   onChanged,
   nckDefinitions,
+  onDraftStateChange,
 }: {
   endpointId: string;
   driverId: string;
   onChanged: () => void;
   /** NCK 定义目录注入（测试缝；缺省时由组件从 I-2 目录加载）。 */
   nckDefinitions?: NckDefinitionMap | null;
+  /**
+   * 草稿状态上报（外壳层用）：`dirty` = 有未保存修改，`saving` = 正在保存。
+   * 外壳层据此禁用连接切换 / 提示离开页面（§4.7 / §7-7）；本组件不自己拦路由。
+   */
+  onDraftStateChange?: (state: { dirty: boolean; saving: boolean }) => void;
 }) {
   const [desc, setDesc] = useState<DriverDescriptor | null>(null);
   const [sels, setSels] = useState<ResourceSelection[]>([]);
@@ -278,14 +329,33 @@ export function EndpointAcquisitionPane({
   // 已有点位的重新核验结果（不是「有 point_key 就有效」）。
   const [pointStatuses, setPointStatuses] = useState<NckPointVerification[]>([]);
   const [verifying, setVerifying] = useState(false);
-  // 用户显式移除的点位及原因（原始配置保留展示）。
-  const [removedPoints, setRemovedPoints] = useState<RemovedNckPoint[]>([]);
+  // 用户显式移除的草稿行（原始配置保留 + 可撤销，§7-9）。
+  const [removedEntries, setRemovedEntries] = useState<RemovedDraftEntry[]>([]);
   // 编辑态：null = 新增；否则为 nckPoints 下标。
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [formVersion, setFormVersion] = useState(0);
   // Browse → 语义表单的预填（A1/A16 的入口）。preview_point_key 不参与提交。
   const [browseOpen, setBrowseOpen] = useState(false);
   const [browsePreset, setBrowsePreset] = useState<NckPointSelection | null>(null);
+
+  // ---- 紧凑列表：搜索 / 筛选 / 分页（§2.7） ------------------------------
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<PointFilter>("all");
+  // ---- 抽屉式添加/编辑（§4.1/§4.2） --------------------------------------
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  // 抽屉内是否有「尚未确认」的修改：关闭时提醒一次（不静默丢弃）。
+  const [drawerDirty, setDrawerDirty] = useState(false);
+  // 技术详情抽屉（完整点键 / 原始 JSON / 版本 / 身份来源，主动展开才看得到）。
+  const [detailRow, setDetailRow] = useState<PointRowView | null>(null);
+  // 草稿基线：差异**展示**的对照物（行标记 / 变更摘要）。保存判据不依赖它。
+  const [draftBaseline, setDraftBaseline] = useState<DraftBaseline | null>(null);
+  // 「放弃修改」= 整份回到服务端已保存值：递增该计数触发一次重新加载。
+  const [reloadNonce, setReloadNonce] = useState(0);
+  // 列表滚动位置（抽屉打开期间保持，关闭后恢复，§2.7「位置保持」）。
+  const listScrollRef = useRef<HTMLDivElement | null>(null);
+  const restoreScrollTop = useRef<number | null>(null);
 
   const nck = isNckDriver(driverId);
   const catalogIndex = useMemo<NckDefinitionIndex | null>(
@@ -475,6 +545,26 @@ export function EndpointAcquisitionPane({
     : [];
   const verificationReady = statusesCurrent && !verifying;
 
+  /**
+   * 当前草稿的「行标识 + 内容键」序列（差异展示的唯一输入）。
+   *
+   * 用 useCallback 而不是在 render 里就地算：保存/核对成功要把同一份序列写成
+   * 新基线，两处必须用**同一个**口径，否则刚保存完的行会残留「已修改」标记。
+   */
+  const draftRowRefs = useCallback(
+    (): DraftRowRef[] =>
+      nck
+        ? nckPoints.map((point, index) => ({
+            rowId: nckRowIds[index] ?? "",
+            contentKey: pointContentKey(point),
+          }))
+        : sels.map((selection, index) => ({
+            rowId: selRowIds[index] ?? "",
+            contentKey: selectionContentKey(selection),
+          })),
+    [nck, nckPoints, nckRowIds, sels, selRowIds],
+  );
+
   // ---- 目录加载（I-2 完整分页） -----------------------------------------
   useEffect(() => {
     if (!nck || nckDefinitions) {
@@ -584,11 +674,20 @@ export function EndpointAcquisitionPane({
     setSaveIssues([]);
     setSavedBaseline(null);
     setPointStatuses([]);
-    setRemovedPoints([]);
+    setRemovedEntries([]);
     setEditingIndex(null);
     setFormVersion(0);
     setBrowseOpen(false);
     setBrowsePreset(null);
+    // 列表/搜索/分页与抽屉：切换连接后回到第 1 页、清空搜索与筛选。
+    setPage(1);
+    setPageSize(25);
+    setQuery("");
+    setFilter("all");
+    setDrawerOpen(false);
+    setDrawerDirty(false);
+    setDetailRow(null);
+    setDraftBaseline(null);
     setEndpointFamily(null);
     setEndpointFamilyState("loading");
     // 运行态必须立即复位为未知：切换连接后不得沿用上一台的值（§4.4.1）。
@@ -640,7 +739,16 @@ export function EndpointAcquisitionPane({
             const loadedPoints = nckPointsOf(selected.editable);
             setNckPoints(loadedPoints);
             // 行身份在**加载快照**时分配一次，之后编辑/搜索/分页都不再重发（§4.8）。
-            setNckRowIds(assignRowIds(loadedPoints.length, rowIdAllocator.current));
+            const nextRowIds = assignRowIds(loadedPoints.length, rowIdAllocator.current);
+            setNckRowIds(nextRowIds);
+            // 草稿基线（差异展示用）：行标识 + 内容快照 + 已保存周期。
+            setDraftBaseline({
+              rows: loadedPoints.map((point, index) => ({
+                rowId: nextRowIds[index]!,
+                contentKey: pointContentKey(point),
+              })),
+              intervalMs: snapshotIntervalMs(selected.editable),
+            });
             // P2-2 基线：快照里已生效的完整任务集（保存回读一致后才整份替换）。
             setSavedBaseline({
               hasTask: !!selected.editable,
@@ -657,10 +765,19 @@ export function EndpointAcquisitionPane({
           if (editable?.schedule?.mode === "poll") {
             setIntervalMs(editable.schedule.interval_ms ?? 1000);
           }
+          let nextRowIds: string[] = [];
           if (loadedSelections.length) {
             setSels(loadedSelections);
-            setSelRowIds(assignRowIds(loadedSelections.length, rowIdAllocator.current));
+            nextRowIds = assignRowIds(loadedSelections.length, rowIdAllocator.current);
+            setSelRowIds(nextRowIds);
           }
+          setDraftBaseline({
+            rows: loadedSelections.map((sel, index) => ({
+              rowId: nextRowIds[index] ?? "",
+              contentKey: selectionContentKey(sel),
+            })),
+            intervalMs: snapshotIntervalMs(editable),
+          });
           // P2-2 基线：快照里已生效的完整任务集（保存回读一致后才整份替换）。
           setSavedBaseline({
             hasTask: !!editable,
@@ -672,14 +789,9 @@ export function EndpointAcquisitionPane({
         // 快照就绪：只有此时保存才允许 PUT（空数组即服务端真的无任务）。
         setTasksLoadedEpId(endpointId);
         setTasksLoadState("ready");
-        if (tasks.length) {
-          const editableLabel = isNckDriver(driverId) ? "NCK 任务" : "canonical 任务";
-          message.info(
-            preservedIds.length
-              ? `已回显 ${editableLabel}，另有 ${preservedIds.length} 个任务将被保留（${preservedIds.join("、")}）`
-              : `已回显 ${tasks.length} 任务`,
-          );
-        }
+        // §2.5：删除「加载即弹的提示」；有保留任务时改由列表下方一行静态说明承担
+        // （`preserved-tasks-note`），不再打断用户。
+        void preservedIds;
       } else {
         // Task 快照失败：fail-closed——显示错误并禁用保存，不拿 [] 去覆盖服务端。
         setTasksLoadState("error");
@@ -694,7 +806,7 @@ export function EndpointAcquisitionPane({
       // 让在途的运行态读取作废：切换连接后它的结果不得回写到新窗格。
       runStateToken.current += 1;
     };
-  }, [endpointId, driverId, loadRunState]);
+  }, [endpointId, driverId, loadRunState, reloadNonce]);
 
   // ---- 已有点位重新核验（加载后 & 点位变化后） ---------------------------
   const verifyToken = useRef(0);
@@ -756,6 +868,8 @@ export function EndpointAcquisitionPane({
     // 表单重建一次：避免上一条目的输入（含 Browse 预填）残留到下一次新增。
     setBrowsePreset(null);
     setFormVersion((v) => v + 1);
+    // 只更新页面草稿：不发任何写请求；抽屉关闭后回到原列表位置（§4.1-8）。
+    closeDrawer();
   };
 
   const replacePoint = (index: number, point: NckPointSelection) => {
@@ -766,16 +880,18 @@ export function EndpointAcquisitionPane({
     // 编辑**不**改 rowId：同一行换了 point_key/参数，仍然是同一行（§4.8）。
     setEditingIndex(null);
     setFormVersion((v) => v + 1);
+    closeDrawer();
   };
 
   /**
-   * 显式移除点位（存量 identity / 核验失败点位的**唯一恢复路径**）。
+   * 从草稿移除一行（**先改草稿、支持撤销**，§7-9）。
    *
    * 关键：本函数**刻意不经过** scope 准入门、不查 family、不要求 Preview。
    * 准入只约束「作为有效点位提交」，不约束「从既有载荷中移除」；若删除也要先
    * 把非法点位「变成合法」，就会形成死锁——那正是本批要避免的缺陷。
    *
-   * 移除前先把**原始配置**记下来，用户可确认自己到底改了什么。
+   * 移除前把**原始配置**与原因记下来：一是让用户确认到底改了什么，二是支持撤销
+   * （撤销把同一行放回**原下标**，顺序也是配置的一部分）。
    */
   const removePoint = (index: number) => {
     const point = nckPoints[index];
@@ -785,7 +901,10 @@ export function EndpointAcquisitionPane({
       status?.status === "unverified"
         ? `${status.code ?? "UNVERIFIED"}：${status.message ?? "身份核验未通过"}`
         : "用户显式移除（原始配置已保留）";
-    setRemovedPoints((prev) => [{ point, reason }, ...prev]);
+    setRemovedEntries((prev) => [
+      { rowId: nckRowIds[index] ?? "", index, reason, point },
+      ...prev,
+    ]);
     setNckPoints((prev) => prev.filter((_, i) => i !== index));
     // 移除只删掉**这一行**的 rowId：其余行的身份与顺序不变（不重新发号）。
     setNckRowIds((prev) => prev.filter((_, i) => i !== index));
@@ -793,6 +912,104 @@ export function EndpointAcquisitionPane({
       if (current === null) return null;
       if (current === index) return null;
       return current > index ? current - 1 : current;
+    });
+  };
+
+  /** 从草稿移除一条资源选择（同样先改草稿、可撤销）。 */
+  const removeSelection = (index: number) => {
+    const selection = sels[index];
+    if (!selection) return;
+    setRemovedEntries((prev) => [
+      { rowId: selRowIds[index] ?? "", index, reason: "用户显式移除（原始配置已保留）", selection },
+      ...prev,
+    ]);
+    setSels((prev) => prev.filter((_, i) => i !== index));
+    setSelRowIds((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  /**
+   * 撤销一次移除：把行放回**原下标**并复用**它自己的** rowId。
+   *
+   * 复用旧 id 是安全的：该 id 属于这一行本身（不是「回收给新行」），因此
+   * 「删除后重新添加要发新号」的规则不受影响（新行永远拿新号）。
+   */
+  const undoRemove = (rowId: string) => {
+    const entry = removedEntries.find((item) => item.rowId === rowId);
+    if (!entry) return;
+    setRemovedEntries((prev) => prev.filter((item) => item.rowId !== rowId));
+    if (nck && entry.point) {
+      const insertAt = Math.min(Math.max(0, entry.index), nckPoints.length);
+      setNckPoints((prev) => {
+        const next = [...prev];
+        next.splice(insertAt, 0, entry.point!);
+        return next;
+      });
+      setNckRowIds((prev) => {
+        const next = [...prev];
+        next.splice(insertAt, 0, entry.rowId);
+        return next;
+      });
+      return;
+    }
+    if (!nck && entry.selection) {
+      const insertAt = Math.min(Math.max(0, entry.index), sels.length);
+      setSels((prev) => {
+        const next = [...prev];
+        next.splice(insertAt, 0, entry.selection!);
+        return next;
+      });
+      setSelRowIds((prev) => {
+        const next = [...prev];
+        next.splice(insertAt, 0, entry.rowId);
+        return next;
+      });
+    }
+  };
+
+  // ---- 抽屉开合（§4.1 / §4.2） -------------------------------------------
+  const openAddDrawer = () => {
+    // 记录列表滚动位置：关闭后回到同一位置（不把用户顶回顶部）。
+    restoreScrollTop.current = listScrollRef.current?.scrollTop ?? 0;
+    setEditingIndex(null);
+    setBrowsePreset(null);
+    setFormVersion((v) => v + 1);
+    setDrawerDirty(false);
+    setDrawerOpen(true);
+  };
+
+  const openEditDrawer = (rowId: string) => {
+    const index = nckRowIds.indexOf(rowId);
+    if (index < 0) return;
+    restoreScrollTop.current = listScrollRef.current?.scrollTop ?? 0;
+    setEditingIndex(index);
+    setBrowsePreset(null);
+    setFormVersion((v) => v + 1);
+    setDrawerDirty(false);
+    setDrawerOpen(true);
+  };
+
+  const closeDrawer = () => {
+    setDrawerOpen(false);
+    setEditingIndex(null);
+    setDrawerDirty(false);
+  };
+
+  /**
+   * 请求关闭抽屉：抽屉内**未确认的修改**必须先提醒一次（§4.1 补充）。
+   * 保存中禁止关闭（§4.7）——按钮已被 `busy` 禁用挡住，这里再兜一层。
+   */
+  const requestCloseDrawer = () => {
+    if (saving) return;
+    if (!drawerDirty) {
+      closeDrawer();
+      return;
+    }
+    Modal.confirm({
+      title: "放弃未确认的修改？",
+      content: "抽屉里的修改还没有加入页面草稿，关闭后不会保留。",
+      okText: "放弃修改",
+      cancelText: "继续编辑",
+      onOk: () => closeDrawer(),
     });
   };
 
@@ -887,6 +1104,16 @@ export function EndpointAcquisitionPane({
     });
   }, []);
 
+  /**
+   * 回读一致后把**草稿基线**整份替换（= 刚刚确认已生效的值）。
+   *
+   * 只在回读一致后调用：行标记「已修改/新增」、变更摘要与保存区都随之清零收起。
+   * PUT 2xx 时就重置会让界面虚报「已保存」（§4.4.3）。
+   */
+  const rebaseDraftBaseline = useCallback((rows: DraftRowRef[], savedIntervalMs: number) => {
+    setDraftBaseline({ rows, intervalMs: savedIntervalMs });
+  }, []);
+
   /** 只执行「启动」步骤（待核对核对一致后的恢复采集、启动失败后的重试共用）。 */
   const startOnly = async (): Promise<void> => {
     const r = await api.startEndpoint(endpointId).catch((e) => ({
@@ -951,6 +1178,7 @@ export function EndpointAcquisitionPane({
         return;
       }
       applyVerifiedBaseline(pending.baseline);
+      rebaseDraftBaseline(draftRowRefs(), pending.baseline.intervalMs);
       setPendingVerify(null);
       setSaveOutcome(null);
       setSaveIssues([]);
@@ -1136,6 +1364,8 @@ export function EndpointAcquisitionPane({
             }
             // 一致后才刷新**完整基线**；PUT 2xx 时绝不刷新（否则状态区会虚报已生效）。
             applyVerifiedBaseline(baseline);
+            // 草稿基线同步替换：行标记清除、摘要与保存区收起（成功只报一次）。
+            rebaseDraftBaseline(draftRowRefs(), intervalMs);
             return { ok: true };
           }
           // 后端 issues 原样保存并展示（`{valid:false, issues}`）；
@@ -1278,33 +1508,330 @@ export function EndpointAcquisitionPane({
     ],
   );
 
+  // ---- 点位行视图（页面层：唯一允许按驱动分流的地方，§2.8） --------------
+  const definitionOf = useCallback(
+    (point: NckPointSelection): NckDefinitionLike | null => {
+      const variableId =
+        typeof point.parameters?.variable_id === "string" ? point.parameters.variable_id : "";
+      const revision =
+        typeof point.parameters?.definition_revision === "number"
+          ? point.parameters.definition_revision
+          : null;
+      return variableId ? lookupDefinition(variableId, revision) : null;
+    },
+    [lookupDefinition],
+  );
+
+  const rowViews = useMemo<PointRowView[]>(() => {
+    if (nck) {
+      return buildNckPointRows({
+        points: nckPoints,
+        rowIds: nckRowIds,
+        verificationOf: (index): RowVerification | undefined => {
+          if (!statusesCurrent) return { status: "pending" };
+          const status = pointStatuses[index];
+          return status
+            ? { status: status.status, code: status.code, message: status.message }
+            : undefined;
+        },
+        definitionOf,
+      });
+    }
+    return buildSelectionRows({
+      selections: sels,
+      rowIds: selRowIds,
+      resources: desc?.resources ?? [],
+    });
+  }, [nck, nckPoints, nckRowIds, statusesCurrent, pointStatuses, definitionOf, sels, selRowIds, desc]);
+
+  /** 每行的「可编辑性」判定（原样保留既有准入口径，不下沉到通用组件）。 */
+  const editableRowIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (!nck) return ids;
+    nckPoints.forEach((point, index) => {
+      const rowId = nckRowIds[index];
+      if (!rowId) return;
+      const variableId =
+        typeof point.parameters?.variable_id === "string" ? point.parameters.variable_id : "";
+      const revision =
+        typeof point.parameters?.definition_revision === "number"
+          ? point.parameters.definition_revision
+          : null;
+      const exactDefinition =
+        variableId && revision !== null ? lookupDefinition(variableId, revision) : null;
+      const latestDefinition = variableId ? definitions?.[variableId] : undefined;
+      const revisionIsCurrent =
+        !!exactDefinition &&
+        (!latestDefinition ||
+          typeof exactDefinition.revision !== "number" ||
+          latestDefinition.revision === exactDefinition.revision);
+      const gate =
+        point.kind === "nck_native"
+          ? !!nativeSchema
+          : exactDefinition && revisionIsCurrent
+            ? evaluateNckSelectionAdd(exactDefinition).ok
+            : false;
+      if (gate) ids.add(rowId);
+    });
+    return ids;
+  }, [nck, nckPoints, nckRowIds, lookupDefinition, definitions, nativeSchema]);
+
+  // ---- 草稿差异与保存区（§4.7 / §4.8） -----------------------------------
+  const draftRows = useMemo(() => draftRowRefs(), [draftRowRefs]);
+  const diff = useMemo(
+    () => diffDraft({ baseline: draftBaseline, draft: draftRows, intervalMs }),
+    [draftBaseline, draftRows, intervalMs],
+  );
+  const markedRows = useMemo(
+    () =>
+      rowViews.map((row) => {
+        const marker = diff.rowMarkers[row.rowId];
+        return marker ? { ...row, marker } : row;
+      }),
+    [rowViews, diff],
+  );
+  const rowCounts = countRowStates(markedRows);
+  const filterOptions = buildFilterOptions(rowCounts);
+  const visibleRows = applyRowQuery(markedRows, { query, filter });
+  const paged = paginateItems(visibleRows, page, pageSize);
+
+  // 页码越界（筛选/每页条数变化、行被移除）时收敛到有效页；不改 rowId。
+  useEffect(() => {
+    if (paged.page !== page) setPage(paged.page);
+  }, [paged.page, page]);
+
+  // 抽屉关闭后回到原列表位置（§2.7「位置保持」，不把用户顶回顶部）。
+  useEffect(() => {
+    if (drawerOpen) return;
+    const el = listScrollRef.current;
+    if (el && restoreScrollTop.current !== null) el.scrollTop = restoreScrollTop.current;
+  }, [drawerOpen]);
+
+  // 保存结果只出现一次，随后自动收起（§4.7「已保存」→ 自动退出）。
+  useEffect(() => {
+    if (!lastApply || lastApply === "restart-failed" || diff.hasChanges) return;
+    const timer = setTimeout(() => setLastApply(null), 5000);
+    return () => clearTimeout(timer);
+  }, [lastApply, diff.hasChanges]);
+
+  const saveBar = saveBarView({
+    hasChanges: diff.hasChanges,
+    saving,
+    pendingVerify: !!pendingVerify,
+    restartFailed: !!restartFailed,
+    savedResult:
+      lastApply === "restarted" ? "restarted" : lastApply === "stopped" ? "stopped" : null,
+    runState,
+    restart,
+    // 与提交函数**共用同一判定**（§4.4.2）：按钮可用性只是体验，真正的防线在 save()。
+    canSave:
+      isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, endpointId) &&
+      !hasIncompatible &&
+      !editBlock &&
+      (nck
+        ? !!definitions &&
+          !!endpointFamily &&
+          nckPoints.length > 0 &&
+          admissionIssues.length === 0 &&
+          verificationReady &&
+          unverified.length === 0
+        : sels.length > 0 && !!desc) &&
+      saveChangeState === "changed" &&
+      !pendingVerify,
+  });
+
+  /** 放弃修改：整份回到服务端已保存值（不写服务端，只重读）。 */
+  const discardDraft = () => {
+    if (saving || rechecking) return;
+    setReloadNonce((v) => v + 1);
+  };
+
+  // 把「有未保存修改 / 正在保存」上报给外壳层：切换连接与离开页面的提示由外壳做
+  // （路由与连接选择不在本组件的职责内，见 §4.7 / §7-7）。
+  useEffect(() => {
+    onDraftStateChange?.({ dirty: diff.hasChanges, saving });
+  }, [onDraftStateChange, diff.hasChanges, saving]);
+
+  const copyPointKey = (row: PointRowView) => {
+    const key = row.detail.find((entry) => entry.label === "point_key")?.value ?? "";
+    const clipboard = (globalThis as { navigator?: Navigator }).navigator?.clipboard;
+    if (clipboard?.writeText) {
+      void clipboard.writeText(key).then(
+        () => message.success("已复制标识"),
+        () => message.warning("复制失败：请从技术详情手动复制"),
+      );
+      return;
+    }
+    message.warning("当前环境不支持剪贴板：请从技术详情手动复制");
+  };
+
+  const canAdd = !editBlock && (nck ? !!definitions : !!desc && (desc.resources ?? []).length > 0);
   const descOk = nck || !!desc;
   if (!descOk && tasksLoadState === "loading") return <div style={{ color: "#525252" }}>加载资源…</div>;
+
+  const stateText =
+    runState === "running" ? "运行中" : runState === "stopped" ? "已停止" : "状态未知";
+  const draftPointCount = nck ? nckPoints.length : sels.length;
+
   return (
-    <div style={{ display: "grid", gap: 12, maxWidth: 860 }}>
+    <div style={{ display: "grid", gap: 12, maxWidth: 980 }}>
+      {/* 真实问题照常出现（§3.3）：加载失败/配置损坏/未知状态都不得被「首屏安静」掩盖。 */}
       {tasksLoadState === "error" ? (
-        <Alert type="error" message={tasksLoadError || "任务快照加载失败"} description="服务端已有任务未知，为防止覆盖已禁用保存。请切换后重试。" />
+        <Alert
+          type="error"
+          showIcon
+          data-testid="tasks-load-error"
+          message="配置加载失败，暂时无法编辑"
+          description={
+            <div style={{ display: "grid", gap: 6 }}>
+              <span>{tasksLoadError || "任务快照加载失败"}</span>
+              <span>
+                <Button size="small" data-testid="retry-load" onClick={() => setReloadNonce((v) => v + 1)}>
+                  重试
+                </Button>
+              </span>
+            </div>
+          }
+        />
       ) : null}
-      {tasksLoadState === "loading" ? <div style={{ fontSize: 12, color: "#525252" }}>正在加载任务快照…（快照就绪前保存保持禁用，防止覆盖已有任务）</div> : null}
+      {tasksLoadState === "loading" ? (
+        <div style={{ fontSize: 12, color: "#525252" }}>正在加载任务快照…（快照就绪前不会保存）</div>
+      ) : null}
       {editBlock ? (
         <Alert
           type="error"
+          showIcon
           message="现有任务无法安全编辑，已禁用保存"
           description={`${editBlock.code}：${editBlock.message}`}
         />
       ) : null}
       {!descOk ? (
-        <Alert type="error" message="资源描述加载失败" description="描述缺失时选型无合法依据，已禁用保存（不会覆盖已有任务）。请切换后重试。" />
-      ) : (
-      <>
+        <Alert
+          type="error"
+          showIcon
+          message="资源描述加载失败"
+          description="描述缺失时选型无合法依据，已禁用保存（不会覆盖已有任务）。请切换后重试。"
+        />
+      ) : null}
+
+      {/* 一行运行摘要（§2.2：四段状态条收敛为一行）。 */}
+      <div
+        data-testid="acquisition-status"
+        style={{
+          display: "flex",
+          gap: 12,
+          flexWrap: "wrap",
+          fontSize: 12,
+          color: "#525252",
+          alignItems: "baseline",
+        }}
+      >
+        <span>
+          采集状态：<b data-testid="acquisition-status-state">{stateText}</b>
+        </span>
+        <span>·</span>
+        <span>
+          点位：
+          <b data-testid="acquisition-status-points">
+            {savedVsDraftText(
+              savedBaseline?.hasTask ? savedBaseline.pointCount : null,
+              draftPointCount,
+              "个",
+            )}
+          </b>
+        </span>
+        <span>·</span>
+        <span>
+          周期：
+          <b data-testid="acquisition-status-interval">
+            {savedVsDraftText(
+              savedBaseline?.hasTask ? savedBaseline.intervalMs : null,
+              intervalMs,
+              "ms",
+            )}
+          </b>
+        </span>
+      </div>
+
+      {/* 运行状态未知：禁止一切保存（含只写配置），只给刷新入口；草稿仍可编辑。 */}
+      {runStateSettled && runState === "unknown" ? (
+        <Alert
+          type="warning"
+          showIcon
+          data-testid="acquisition-run-state-unknown"
+          message="运行状态未知，已禁用保存"
+          description="读取 Endpoint 运行状态失败，或该 Endpoint 不在清单中。为避免在未知状态下停止/写入/启动采集，保存已禁用（含只写配置）；草稿仍可编辑。"
+          action={
+            <Button size="small" data-testid="refresh-run-state" loading={saving} onClick={() => void loadRunState()}>
+              刷新状态
+            </Button>
+          }
+        />
+      ) : null}
+
+      {/* 已有配置存在真实问题：一条摘要 + 可处理原因；原始错误码收进技术详情。 */}
+      {unverified.length > 0 ? (
+        <Alert
+          type="error"
+          showIcon
+          data-testid="nck-legacy-identity-alert"
+          message={`${unverified.length} 个点位需要处理：当前任务包含不可采集的身份探针点位`}
+          description={
+            <div>
+              <div>
+                请检查并手动移除这些点位，重新验证剩余点位后再保存。这些点位不会被自动删除，也不会被自动转成 collect；只能由你显式移除。
+              </div>
+              <details style={{ marginTop: 4 }}>
+                <summary style={{ cursor: "pointer", fontSize: 11 }}>技术详情</summary>
+                <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+                  {unverified.map((status, idx) => (
+                    <li
+                      key={`${status.point.point_key}-${idx}`}
+                      style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 11 }}
+                    >
+                      {status.point.point_key} · {status.code} · {status.message}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            </div>
+          }
+        />
+      ) : null}
+      {admissionIssues.length > 0 && unverified.length === 0 ? (
+        <Alert
+          type="error"
+          showIcon
+          data-testid="nck-admission-blocked"
+          message={`存在不可采集点位（${admissionIssues.length} 项，scope 准入拒绝）`}
+          description={
+            <details>
+              <summary style={{ cursor: "pointer", fontSize: 11 }}>技术详情</summary>
+              <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+                {admissionIssues.map((issue, idx) => (
+                  <li key={idx} style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 11 }}>
+                    {issue.pointKey} · {issue.code} · {issue.message}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          }
+        />
+      ) : null}
+
+      {/* 采集周期：一个输入框 + 单位（§2.2）。压测数字只在帮助提示里出现。 */}
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <span style={{ fontSize: 12 }}>采集周期</span>
-        <InputNumber min={10} max={60000} step={10} value={intervalMs} onChange={(v) => setIntervalMs(v ?? 1000)} addonAfter="ms" data-testid="acquisition-interval-input" style={{ width: 180 }} />
-        <span style={{ fontSize: 12, color: "#525252" }}>10ms–60s（配置值）</span>
-        {/*
-          P2-1：压测数字只能出现在帮助提示里，且必须同时声明“软件压测 ≠ 机床能力”。
-          把 20ms / 50K/s 直接摆在输入框旁，用户会把它读成“这台机床能 20ms 采”。
-        */}
+        <InputNumber
+          min={10}
+          max={60000}
+          step={10}
+          value={intervalMs}
+          onChange={(v) => setIntervalMs(v ?? 1000)}
+          addonAfter="ms"
+          data-testid="acquisition-interval-input"
+          style={{ width: 180 }}
+        />
         <Tooltip
           title={
             <span>
@@ -1319,522 +1846,157 @@ export function EndpointAcquisitionPane({
             style={{ color: "#8c8c8c", cursor: "help" }}
           />
         </Tooltip>
-      </div>
-      <div style={{ fontSize: 11, color: "#8c8c8c" }} data-testid="interval-note">
-        周期为配置值，实际采集表现以运行结果为准。
-      </div>
-
-      {/* P2-2：复用现有 Endpoint 状态与点位数据，不新增后端接口。 */}
-      <div
-        data-testid="acquisition-status"
-        style={{
-          display: "flex",
-          gap: 16,
-          flexWrap: "wrap",
-          fontSize: 12,
-          color: "#525252",
-          border: "1px solid #e0e0e0",
-          padding: "6px 8px",
-        }}
-      >
-        <span>
-          采集状态：
-          <b data-testid="acquisition-status-state">
-            {runState === "running" ? "运行中" : runState === "stopped" ? "已停止" : "状态未知"}
-          </b>
-        </span>
-        <span>
-          采集周期：
-          {/* P2-2 方案 B：同时给出「已保存」与「待保存」，草稿不再冒充当前配置。 */}
-          <b data-testid="acquisition-status-interval">
-            {savedVsDraftText(
-              savedBaseline?.hasTask ? savedBaseline.intervalMs : null,
-              intervalMs,
-              "ms",
-            )}
-          </b>
-        </span>
-        <span>
-          已配置点位：
-          <b data-testid="acquisition-status-points">
-            {savedVsDraftText(
-              savedBaseline?.hasTask ? savedBaseline.pointCount : null,
-              nck ? nckPoints.length : sels.length,
-              "个",
-            )}
-          </b>
-        </span>
-        <span>
-          保存后状态：
-          <b data-testid="acquisition-status-after">{afterSaveText}</b>
+        <span style={{ fontSize: 11, color: "#8c8c8c" }} data-testid="interval-note">
+          周期为配置值，实际采集表现以运行结果为准。
         </span>
       </div>
-      {/*
-        运行态未知（加载失败 / 切换连接 / 刷新失败 / Endpoint 不在清单）：
-        禁止一切保存（含「只写配置」），只提供刷新入口；草稿仍可编辑（§4.4.1）。
-      */}
-      {runStateSettled && runState === "unknown" ? (
-        <Alert
-          type="warning"
-          showIcon
-          data-testid="acquisition-run-state-unknown"
-          message="运行状态未知，已禁用保存"
-          description="读取 Endpoint 运行状态失败，或该 Endpoint 不在清单中。为避免在未知状态下停止/写入/启动采集，保存已禁用（含只写配置）；草稿仍可编辑。"
-          action={
-            <Button
-              size="small"
-              data-testid="refresh-run-state"
-              loading={saving}
-              onClick={() => void loadRunState()}
-            >
-              刷新状态
-            </Button>
-          }
-        />
-      ) : null}
-      {!nck ? (
-      <ResourcePickerAntd
-        resources={desc?.resources ?? []}
-        existingSelections={sels}
-        protectedSelections={preservedTasks.flatMap((t) => selectionsOf(t))}
-        selectionMethods={desc?.resource_selection_methods ?? []}
-        endpointId={endpointId}
-        onAdd={(s) => {
-          // 唯一防御门：与 AddDeviceFlow 同一共享实现（终审：两调用方行为一致，
-          // protected 永不动；point_key 检查由 reconcile 统一执行）。
-          const schemaOf = (resourceId: string) => {
-            const found = (desc?.resources ?? []).find((r) => r.id === resourceId);
-            return {
-              fields: (found?.parameters.fields ?? []).map((f) => ({ key: f.key, default: f.default })),
-            };
-          };
-          const { next, message: msg } = applySelectionAdd({
-            candidate: s,
-            editable: sels,
-            protectedSelections: preservedTasks.flatMap((t) => selectionsOf(t)),
-            schemaOf,
-          });
-          if (msg) {
-            if (msg.startsWith("point_key")) message.error(msg);
-            else message.warning(msg);
-            return false;
-          }
-          setSels(next);
-          // 已有的选择项按对象引用/身份键沿用 rowId；新增项发新号（不重排既有行）。
-          // 身份键 = resource_id + 参数（同一资源同参数视为同一行；合并 outputs
-          // 会产出新对象，靠身份键把 rowId 接续过去）。仅用于界面定位。
-          setSelRowIds((prev) =>
-            alignRowIds(
-              sels,
-              prev,
-              next,
-              rowIdAllocator.current,
-              (sel) => `${sel.resource_id}\u0000${stableIdentityKey(sel.parameters)}`,
-            ),
-          );
-          return true;
-        }}
-      />
-      ) : (
-      <div style={{ display: "grid", gap: 8 }}>
-        {catalogState === "loading" ? (
-          <div style={{ fontSize: 12, color: "#525252" }} data-testid="nck-catalog-loading">
-            正在读取定义目录（完整分页读取，不遗漏、不重复）…
+
+      {descOk ? (
+        <>
+          {/* 列表标题 + 唯一添加入口（默认页面不常驻表单，§2.2）。 */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 13, fontWeight: 600 }}>已配置点位（{draftPointCount}）</span>
+            <span style={{ marginLeft: "auto" }}>
+              {canAdd ? (
+                <Button
+                  size="small"
+                  type="primary"
+                  ghost
+                  data-testid="add-point-entry"
+                  // 保存中不再开放新的编辑动作（避免「请求还在飞、草稿又变」）。
+                  disabled={saving}
+                  onClick={openAddDrawer}
+                >
+                  + 添加点位
+                </Button>
+              ) : null}
+            </span>
           </div>
-        ) : null}
-        {catalogState === "error" ? (
-          <Alert
-            type="error"
-            data-testid="nck-catalog-error"
-            message="定义目录加载失败：NCK 保存已禁用（fail-closed）"
-            description={`${catalogError}。没有权威目录就无法确认 scope/family，也不会退回「无 scope 也能存」。`}
+
+          <PointSearch
+            query={query}
+            placeholder="搜索名称、标识或配置内容……"
+            onChange={(next) => {
+              setQuery(next);
+              setPage(1);
+            }}
+            filters={filterOptions}
+            filter={filter}
+            onFilterChange={(next) => {
+              setFilter(next);
+              setPage(1);
+            }}
           />
-        ) : null}
-        {!definitions ? (
-          <Alert
-            type="warning"
-            message="定义目录不可用：NCK 保存已禁用（fail-closed）"
-            description="没有定义目录就无法确认哪些变量可采集（scope 准入），因此保存保持禁用；在可用前不会出现“保存成功但编辑没生效”。"
-          />
-        ) : (
-          <div style={{ fontSize: 12, color: "#525252" }} data-testid="nck-collectable-summary">
-            {/* P1-1：默认只显示数量；36 个标签墙已移除（标签不可点击，纯占位）。 */}
-            <div style={{ fontSize: 13, color: "#262626" }} data-testid="nck-collectable-count">
-              {collectableDefs.length} 个可配置变量
-            </div>
-            <details data-testid="nck-catalog-details" style={{ marginTop: 4 }}>
-              <summary style={{ cursor: "pointer", fontSize: 11 }}>目录详情</summary>
-              <div style={{ marginTop: 4, fontSize: 11 }} data-testid="nck-catalog-meta">
-                共 {definitionList.length} 条定义（其余为身份探针或缺少 scope，不可采集）
-                {" · "}目录：
-                {catalog ? `${catalog.total} 条 / ${catalog.pages} 页 / rev ${catalog.revision}` : "注入目录"}
-                {" · "}Endpoint family：
-                {endpointFamilyState === "loading"
-                  ? "读取中"
-                  : endpointFamilyState === "error"
-                    ? "读取失败"
-                    : endpointFamily ?? "缺失（禁止提交）"}
-              </div>
-            </details>
-          </div>
-        )}
 
-        {definitions && endpointFamilyState === "ready" && !endpointFamily ? (
-          <Alert
-            type="error"
-            data-testid="nck-endpoint-family-missing"
-            message="Endpoint 连接配置缺少 family：禁止新增/保存语义点位"
-            description="family 必须以 Endpoint 有效连接配置为准（目录顶层 family 只是回显，不是提交依据）。请先补齐连接配置。"
-          />
-        ) : null}
-
-        {definitions && !editBlock ? (
-          <div style={{ display: "grid", gap: 8 }}>
-            <div>
-              {/* Browse 是辅助入口：用 link 样式避免与主选择框争抢注意力。 */}
-              <Button
-                size="small"
-                type="link"
-                data-testid="nck-browse-toggle"
-                onClick={() => setBrowseOpen((v) => !v)}
-              >
-                {browseOpen ? "收起 Browse" : "从 Browse 选择语义变量"}
-              </Button>
-            </div>
-            {browseOpen ? (
-              <ResourceBrowseAntd
-                endpointId={endpointId}
-                onFill={() => message.warning("请选用语义点位（旧 variable 入口在 NCK 上已被禁用）")}
-                nckSemantic={{
-                  definitions: definitionList,
-                  endpointFamily,
-                  catalogFamily,
-                }}
-                onSemanticSelect={(sel) => {
-                  // Browse 的 preview_point_key 只作展示：预填参数后，NckPointFields
-                  // 会重新调用服务端 identity-preview 确认身份。
-                  setBrowsePreset({
-                    kind: "nck_variable",
-                    point_key: "",
-                    parameters: sel.parameters,
-                  });
-                  setEditingIndex(null);
-                  setFormVersion((v) => v + 1);
-                  message.info("已把 Browse 叶带入语义表单：请等待服务端 Preview 确认身份");
-                }}
-              />
-            ) : null}
-          </div>
-        ) : null}
-
-        {definitions && !editBlock ? (
-          <div style={{ borderTop: "1px solid #e0e0e0", paddingTop: 8 }}>
-            {editingIndex !== null && nckPoints[editingIndex] ? (
-              <NckPointFields
-                key={`edit-${endpointId}-${editingIndex}-${nckPoints[editingIndex].point_key}-${formVersion}`}
-                driverId={driverId}
-                endpointFamily={endpointFamily}
-                catalogFamily={catalogFamily}
-                definitions={collectableDefs}
-                takenPointKeys={takenPointKeys(editingIndex)}
-                initialPoint={nckPoints[editingIndex]}
-                nativeSchema={nativeSchema}
-                submitLabel="保存点位"
-                onCancel={() => setEditingIndex(null)}
-                onSubmit={(point) => replacePoint(editingIndex, point)}
-              />
-            ) : (
-              <NckPointFields
-                key={`add-${endpointId}-${formVersion}`}
-                driverId={driverId}
-                endpointFamily={endpointFamily}
-                catalogFamily={catalogFamily}
-                definitions={collectableDefs}
-                takenPointKeys={takenPointKeys(null)}
-                initialPoint={browsePreset}
-                nativeSchema={nativeSchema}
-                onSubmit={addPoint}
-              />
-            )}
-          </div>
-        ) : null}
-
-        {removedPoints.length > 0 ? (
-          <Alert
-            type="info"
-            data-testid="nck-removed-points"
-            message={`已手动移除 ${removedPoints.length} 个点位（保存不会包含它们）`}
-            description={
-              <ul style={{ margin: 0, paddingLeft: 18 }}>
-                {removedPoints.map((removed, idx) => (
-                  <li
-                    key={`${removed.point.point_key}-${idx}`}
-                    style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 11 }}
-                  >
-                    {removed.point.kind} · {removed.point.point_key} · 原因：{removed.reason}
-                    <div style={{ color: "#525252" }}>
-                      原始配置：{JSON.stringify(removed.point.parameters)}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            }
-          />
-        ) : null}
-
-        {unverified.length > 0 ? (
-          <Alert
-            type="error"
-            data-testid="nck-legacy-identity-alert"
-            message="当前任务包含不可采集的身份探针点位"
-            description={
-              <div>
-                <div>
-                  当前任务包含不可采集的身份探针点位。请检查并手动移除这些点位，重新验证剩余点位后再保存。
-                </div>
-                <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
-                  {unverified.map((status, idx) => (
-                    <li
-                      key={`${status.point.point_key}-${idx}`}
-                      style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 11 }}
+          <div ref={listScrollRef} data-testid="point-list-scroll" style={{ overflowY: "auto", maxHeight: 520 }}>
+            <PointTable
+              rows={paged.rows}
+              total={paged.total}
+              page={paged.page}
+              pageSize={pageSize}
+              pageCount={paged.pageCount}
+              pageSizeOptions={[25, 50, 100]}
+              onPageChange={setPage}
+              onPageSizeChange={(size) => {
+                setPageSize(size);
+                setPage(1);
+              }}
+              rowTestId={nck ? "nck-point-row" : "sel-point-row"}
+              rowData={(row) => {
+                const status = nck ? pointStatuses[nckPoints.findIndex((_, i) => nckRowIds[i] === row.rowId)] : undefined;
+                return { "data-verify-status": status ? status.status : "none" };
+              }}
+              isEditable={(row) => editableRowIds.has(row.rowId)}
+              actions={{
+                onEdit: (row) => openEditDrawer(row.rowId),
+                onRemove: (row) => {
+                  if (nck) {
+                    const index = nckRowIds.indexOf(row.rowId);
+                    if (index >= 0) removePoint(index);
+                  } else {
+                    const index = selRowIds.indexOf(row.rowId);
+                    if (index >= 0) removeSelection(index);
+                  }
+                },
+                onDetail: (row) => setDetailRow(row),
+                onCopyKey: copyPointKey,
+              }}
+              emptyState={
+                query || filter !== "all" ? (
+                  <div style={{ padding: 16, fontSize: 12, color: "#525252" }}>
+                    没有匹配的点位，可改用标识搜索。
+                    <Button
+                      size="small"
+                      type="link"
+                      data-testid="clear-point-search"
+                      onClick={() => {
+                        setQuery("");
+                        setFilter("all");
+                        setPage(1);
+                      }}
                     >
-                      {status.point.point_key} · {status.code} · {status.message}
+                      清除搜索
+                    </Button>
+                  </div>
+                ) : (
+                  <div style={{ padding: 16, fontSize: 12, color: "#525252" }}>
+                    还没有配置点位{canAdd ? "：点「+ 添加点位」开始配置。" : "。"}
+                  </div>
+                )
+              }
+            />
+          </div>
+
+          {/* 移除先改草稿，可撤销（§7-9）：只有确实移除过才出现，且带处理动作。 */}
+          {removedEntries.length > 0 ? (
+            <NoticeSlot
+              level="info"
+              testId="nck-removed-points"
+              text={`已从草稿移除 ${removedEntries.length} 项（保存不会包含它们）`}
+              action={
+                <Button
+                  size="small"
+                  type="link"
+                  data-testid="undo-remove"
+                  onClick={() => undoRemove(removedEntries[0]!.rowId)}
+                >
+                  撤销
+                </Button>
+              }
+              detail={
+                <ul style={{ margin: 0, paddingLeft: 18 }}>
+                  {removedEntries.map((entry) => (
+                    <li
+                      key={entry.rowId}
+                      style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 11, color: "#525252" }}
+                    >
+                      {entry.point?.point_key ??
+                        entry.selection?.outputs.map((output) => output.point_key).join(", ") ??
+                        entry.rowId}
+                      {" · "}
+                      {entry.reason}
+                      <div>
+                        原始配置：
+                        {JSON.stringify(entry.point?.parameters ?? entry.selection?.parameters ?? {})}
+                      </div>
                     </li>
                   ))}
                 </ul>
-                <div style={{ marginTop: 4 }}>
-                  这些点位不会被自动删除，也不会被自动转成 collect；只能由你显式移除。
-                </div>
-              </div>
-            }
-          />
-        ) : null}
+              }
+            />
+          ) : null}
 
-        {admissionIssues.length > 0 && unverified.length === 0 ? (
-          <Alert
-            type="error"
-            message={`存在不可采集点位（${admissionIssues.length} 项，scope 准入拒绝）`}
-            description={
-              <ul style={{ margin: 0, paddingLeft: 18 }}>
-                {admissionIssues.map((issue, idx) => (
-                  <li key={idx} style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 11 }}>
-                    {issue.pointKey} · {issue.code} · {issue.message}
-                  </li>
-                ))}
-              </ul>
-            }
-          />
-        ) : null}
-
-        {nckPoints.length > 0 ? (
-          <div style={{ display: "grid", gap: 6 }} data-testid="nck-point-list">
-            {/* P1-2 硬约束：绿色标签只代表**配置格式**校验，不能让用户误以为
-                真实机床已经读取成功。 */}
-            <div style={{ fontSize: 11, color: "#8c8c8c" }} data-testid="nck-point-list-hint">
-              以下为配置格式校验结果，不代表机床已成功读取数据；真实采集情况请到「数据」页查看。
+          {/* 保留任务：一行静态说明（替代旧的「已回显 N 任务」加载即弹提示，§2.5）。 */}
+          {preservedTasks.length > 0 ? (
+            <div data-testid="preserved-tasks-note" style={{ fontSize: 12, color: "#525252" }}>
+              另有 {preservedTasks.length} 个任务不在此编辑，保存时原样保留：
+              {preservedTasks.map((task) => task.id).join("、")}
             </div>
-            {nckPoints.map((point, idx) => {
-              const status = statusesCurrent ? pointStatuses[idx] : undefined;
-              const variableId =
-                typeof point.parameters?.variable_id === "string"
-                  ? point.parameters.variable_id
-                  : "";
-              const revision =
-                typeof point.parameters?.definition_revision === "number"
-                  ? point.parameters.definition_revision
-                  : null;
-              const exactDefinition =
-                variableId && revision !== null
-                  ? lookupDefinition(variableId, revision)
-                  : null;
-              // 只允许编辑「目录里仍是最新 revision」的点位：若该变量已发布新
-              // revision，按旧 revision 打开编辑器会静默把身份迁到新 revision，
-              // 违反「重新打开编辑器不得静默改变身份」。此时只能移除后重配。
-              const latestDefinition = variableId ? definitions?.[variableId] : undefined;
-              const revisionIsCurrent =
-                !!exactDefinition &&
-                (!latestDefinition ||
-                  typeof exactDefinition.revision !== "number" ||
-                  latestDefinition.revision === exactDefinition.revision);
-              // native 编辑只要求 Descriptor Schema 可用（不依赖语义目录）；
-              // 语义点位仍要求定义仍是最新 revision 且 scope=collect。
-              const editableGate =
-                point.kind === "nck_native"
-                  ? !!nativeSchema
-                  : exactDefinition && revisionIsCurrent
-                    ? evaluateNckSelectionAdd(exactDefinition).ok
-                    : false;
-              // P1-2：两层信息。名称只取定义 label（原生点位固定「原生点位」），
-              // 地址由参数结构化拼出；point_key / 完整 JSON / 版本收进折叠区。
-              const display = nckPointDisplay(point, exactDefinition);
-              // 行 key 用稳定 rowId：编辑改 point_key 时行不重建、位置不被顶走（§4.8）。
-              const rowId = nckRowIds[idx] ?? `nck-row-missing-${idx}`;
-              return (
-                <div
-                  key={rowId}
-                  data-row-id={rowId}
-                  data-testid="nck-point-row"
-                  style={{ display: "grid", gap: 6, padding: 8, border: "1px solid #e0e0e0", borderRadius: 0 }}
-                >
-                  <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-                    <div style={{ flex: 1, display: "grid", gap: 2 }}>
-                      <div data-testid="nck-point-name" style={{ fontSize: 13, fontWeight: 600 }}>
-                        {display.title}
-                      </div>
-                      <div data-testid="nck-point-address" style={{ fontSize: 12, color: "#525252" }}>
-                        {display.address}
-                      </div>
-                      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-                        {!status ? <Tag>正在校验配置格式…</Tag> : null}
-                        {status?.status === "verified" ? (
-                          <Tag color="green" data-testid="nck-point-status">
-                            {status.native ? "配置格式校验通过（原生）" : "配置格式校验通过"}
-                          </Tag>
-                        ) : null}
-                        {status?.status === "unverified" ? (
-                          <>
-                            <Tag color="red" data-testid="nck-point-status">
-                              配置格式校验未通过：{status.code}
-                            </Tag>
-                            <span
-                              data-testid="nck-point-status-detail"
-                              style={{ fontSize: 11, color: "#c62828" }}
-                            >
-                              {status.message}
-                            </span>
-                          </>
-                        ) : null}
-                      </div>
-                    </div>
-                    <div style={{ display: "flex", gap: 6 }}>
-                      {editableGate ? (
-                        <Button
-                          size="small"
-                          onClick={() => {
-                            setEditingIndex(idx);
-                            setFormVersion((v) => v + 1);
-                          }}
-                        >
-                          编辑
-                        </Button>
-                      ) : null}
-                      {/*
-                        删除按钮**不经过** scope/family/预览准入门（见 removePoint 注释）。
-                        无论点位是否合法都必须可移除，否则存量 identity 点位会形成死锁。
-                      */}
-                      <Button size="small" danger onClick={() => removePoint(idx)}>
-                        移除
-                      </Button>
-                    </div>
-                  </div>
-                  <details data-testid="nck-point-technical">
-                    <summary style={{ cursor: "pointer", fontSize: 11, color: "#525252" }}>
-                      技术详情
-                    </summary>
-                    <div
-                      style={{
-                        marginTop: 4,
-                        display: "grid",
-                        gap: 2,
-                        fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace",
-                        fontSize: 11,
-                        color: "#525252",
-                      }}
-                    >
-                      <div>point_key：{point.point_key}</div>
-                      <div>kind：{point.kind}</div>
-                      <div>{display.revision}</div>
-                      <div>参数：{JSON.stringify(point.parameters)}</div>
-                      {point.kind === "nck_native" ? (
-                        <div>校验方式：原生字段（不适用目录 scope）</div>
-                      ) : (
-                        <div>身份来源：服务端 identity-preview 重算</div>
-                      )}
-                    </div>
-                  </details>
-                </div>
-              );
-            })}
-          </div>
-        ) : null}
-      </div>
-      )}
-      </>)}
-      <div style={{ fontSize: 12, color: "#525252" }} data-testid="acquisition-execution-note">
-        已选 {nck ? nckPoints.length : sels.length} 项 · {intervalMs}ms 轮询 · {executionNote}
-        {!nck ? (
-          <Button
-            size="small"
-            onClick={() => {
-              setSels([]);
-              setSelRowIds([]);
-            }}
-            style={{ marginLeft: 8 }}
-          >
-            清空
-          </Button>
-        ) : null}
-      </div>
-      {preservedTasks.length > 0 && (
-        <div style={{ fontSize: 12, color: "#525252" }}>
-          以下任务不在此编辑、保存时原样保留（只读，reconciliation 仅检测不修改）：
-          {preservedTasks.map((t) => {
-            const keys = pointKeysOfTask(t);
-            return (
-              <div key={t.id} style={{ marginTop: 4 }}>
-                <Tag>{t.id} · {t.binding.kind} · {t.schedule?.mode}</Tag>
-                <span style={{ marginLeft: 6, fontFamily: "'IBM Plex Mono',monospace", fontSize: 11 }}>
-                  {keys.length ? keys.join(", ") : "（空任务）"}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-      )}
-      {!nck && !!sels.length && (
-        <div style={{ display: "grid", gap: 6 }}>
-          {sels.map((s, idx) => {
-            // A4：通用「字段标签 + 值」摘要（标签来自 Descriptor 字段 label）；
-            // 无可读参数时 pointSummary 回落 point_key——此处不再重复渲染
-            // 一遍与左侧相同的 key，避免 `register.value register.value`。
-            const schema = (desc?.resources ?? []).find((r) => r.id === s.resource_id)?.parameters;
-            const pointKeys = s.outputs.map((o) => o.point_key).join(", ");
-            const summary = pointSummary({
-              point_key: pointKeys,
-              parameters: s.parameters,
-              schema,
-            });
-            // 行 key 用稳定 rowId（不能用下标：移除一行后同一 key 会指向别的行）。
-            const rowId = selRowIds[idx] ?? `sel-row-missing-${idx}`;
-            return (
-              <div
-                key={rowId}
-                data-row-id={rowId}
-                data-testid="sel-point-row"
-                style={{ display: "flex", gap: 8, alignItems: "center", padding: 6, border: "1px solid #e0e0e0", borderRadius: 0 }}
-              >
-                <span style={{ flex: 1, fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}>{s.resource_id} → {pointKeys} {summary && summary !== pointKeys ? <span style={{ color: "#525252" }}>{summary}</span> : null}</span>
-                <Button
-                  size="small"
-                  danger
-                  onClick={() => {
-                    // 移除只删掉这一行的 rowId，其余行身份不变（§4.8）。
-                    setSels((p) => p.filter((_, i) => i !== idx));
-                    setSelRowIds((p) => p.filter((_, i) => i !== idx));
-                  }}
-                >
-                  移除
-                </Button>
-              </div>
-            );
-          })}
-        </div>
-      )}
+          ) : null}
+        </>
+      ) : null}
+
       {hasIncompatible ? (
-        // A3/P1：提示只出现一次（不逐行红框），字段名/类型收在「技术详情」。
-        // 明确区分「存量配置已携带」与「驱动新增、配置未携带」——后者正是
-        // 「表单已禁用但旧守卫会放行」的缺口来源。
-        // 只禁用本 Endpoint 的保存；不停已运行的采集，也不影响其它连接。
         <Alert
           type="warning"
           showIcon
@@ -1847,7 +2009,7 @@ export function EndpointAcquisitionPane({
                 {incompatible.map((item, idx) => (
                   <li
                     key={`${item.resourceId}-${item.key}-${idx}`}
-                    style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}
+                    style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 11 }}
                   >
                     {item.resourceId} · {item.key} · {item.fieldType} ·{" "}
                     {item.carried ? "存量配置已携带" : "配置未携带（驱动新增字段）"}
@@ -1858,63 +2020,8 @@ export function EndpointAcquisitionPane({
           }
         />
       ) : null}
-      <div>
-        {/*
-          运行态未知：保存区不提供任何保存动作，只给「刷新状态」。
-          仍渲染一个 disabled 的保存按钮（文案与已知状态一致），因为**按钮禁用
-          只是体验**：真正的防线在 save() 里的 unknown 守卫（§4.4.1）。
-        */}
-        {runState === "unknown" ? (
-          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-            <Button
-              type="primary"
-              data-testid="apply-button"
-              disabled
-              onClick={() => void save(restart)}
-            >
-              保存配置
-            </Button>
-            <span data-testid="apply-stopped-note" style={{ fontSize: 12, color: "#525252" }}>
-              {runStateSettled ? "运行状态未知，无法保存" : "正在读取运行状态…"}
-            </span>
-          </div>
-        ) : (
-          /* P0-2：已停止时保存只写配置（onApply(false)），按钮不得写「保存并启动」；
-             运行中的恢复运行由 restart 勾选决定，结果由 lastApply 明确回显。 */
-          <ApplyWithRestart
-            running={running}
-            applying={saving}
-            canApply={
-              isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, endpointId) &&
-              !hasIncompatible &&
-              (nck
-                ? !!definitions &&
-                  !!endpointFamily &&
-                  !editBlock &&
-                  nckPoints.length > 0 &&
-                  admissionIssues.length === 0 &&
-                  verificationReady &&
-                  unverified.length === 0
-                : sels.length > 0 && !!desc) &&
-              // 无实际修改 ⇒ 按钮不可用（所有驱动同一判定，§4.4.2）。
-              saveChangeState === "changed" &&
-              // 待核对期间不允许再走主保存动作（只能「重新核对」）。
-              !pendingVerify
-            }
-            applyLabel="保存配置"
-            stoppedLabel="保存配置"
-            restart={restart}
-            onRestartChange={setRestart}
-            result={lastApply}
-            onApply={save}
-          />
-        )}
-      </div>
-      {/*
-        「保存结果待核对」（§4.4.3）：回读失败或回读不一致。
-        持久展示，不报成功、不刷新基线；主操作只能是「重新核对」，
-        不允许直接重新 PUT。核对确认不一致后才出现「重新保存」。
-      */}
+
+      {/* 保存失败 / 状态变化 / 待核对：持久展示 + 可点击的下一步（§4.6-4）。 */}
       {saveOutcome ? (
         <Alert
           type={saveOutcome.kind === "failed" ? "error" : "warning"}
@@ -1946,9 +2053,7 @@ export function EndpointAcquisitionPane({
                       size="small"
                       data-testid="resave-after-pending"
                       disabled={saving || runState === "unknown"}
-                      onClick={() =>
-                        void save(pendingVerify.restart, { fromPendingResave: true })
-                      }
+                      onClick={() => void save(pendingVerify.restart, { fromPendingResave: true })}
                     >
                       重新保存
                     </Button>
@@ -1970,45 +2075,254 @@ export function EndpointAcquisitionPane({
           }
         />
       ) : null}
-      {/*
-        「配置已保存但启动失败」（§4.5）：草稿标记已清除（基线已刷新），
-        但处理入口必须保留；重试**只调用启动步骤**，不 stop、不 PUT。
-        该入口不随新修改消失（§4.7：产生新修改时仍保留「上次保存后采集未恢复」）。
-      */}
-      {restartFailed ? (
-        <div
-          data-testid="restart-failed"
-          style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}
-        >
-          <span style={{ fontSize: 12, color: "#8a6d3b" }}>
-            配置已保存，但恢复采集失败：{restartFailed}
-          </span>
-          <Button
-            size="small"
-            data-testid="retry-start"
-            loading={saving}
-            disabled={saving || rechecking || runState === "unknown"}
-            onClick={() => void retryStart()}
-          >
-            重试启动
-          </Button>
-        </div>
-      ) : null}
+
       {saveIssues.length > 0 ? (
         <Alert
           type="error"
           message={`保存被后端拒绝（${saveIssues.length} 项，原样展示）`}
           description={
             <ul style={{ margin: 0, paddingLeft: 18 }}>
-              {saveIssues.map((i, idx) => (
-                <li key={idx} style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}>
-                  {i.path} · {i.code} · {i.message}
+              {saveIssues.map((issue, idx) => (
+                <li
+                  key={idx}
+                  style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 11 }}
+                >
+                  {issue.path} · {issue.code} · {issue.message}
                 </li>
               ))}
             </ul>
           }
         />
       ) : null}
+
+      {/* 固定保存区（§2.3/§4.7）：没有修改且无待处理结果时**整个不渲染**。 */}
+      <DraftSaveBar
+        view={saveBar}
+        summary={diff.summary}
+        noticeDetail={restartFailed ?? null}
+        onSave={() => void save(running ? restart : false)}
+        onDiscard={discardDraft}
+        onRetryStart={() => void retryStart()}
+        onRefreshState={() => void loadRunState()}
+        onToggleRestart={() => setRestart((value) => !value)}
+        retryBusy={saving}
+      />
+
+      {/* 添加/编辑抽屉（§4.1/§4.2）：默认页面不常驻表单。 */}
+      <PointDrawer
+        open={drawerOpen}
+        title={editingIndex !== null ? "编辑点位" : "添加点位"}
+        busy={saving}
+        onClose={requestCloseDrawer}
+        footer={
+          <Button data-testid="drawer-cancel" disabled={saving} onClick={requestCloseDrawer}>
+            取消
+          </Button>
+        }
+      >
+        {nck ? (
+          <div style={{ display: "grid", gap: 12 }}>
+            {catalogState === "loading" ? (
+              <div style={{ fontSize: 12, color: "#525252" }} data-testid="nck-catalog-loading">
+                正在读取定义目录（完整分页读取，不遗漏、不重复）…
+              </div>
+            ) : null}
+            {catalogState === "error" ? (
+              <Alert
+                type="error"
+                data-testid="nck-catalog-error"
+                message="定义目录加载失败：NCK 保存已禁用（fail-closed）"
+                description={`${catalogError}。没有权威目录就无法确认 scope/family，也不会退回「无 scope 也能存」。`}
+              />
+            ) : null}
+            {!definitions ? (
+              <Alert
+                type="warning"
+                data-testid="nck-definitions-missing"
+                message="定义目录不可用：NCK 保存已禁用（fail-closed）"
+                description="没有定义目录就无法确认哪些变量可采集（scope 准入），因此保存保持禁用；在可用前不会出现“保存成功但编辑没生效”。"
+              />
+            ) : (
+              <div style={{ fontSize: 12, color: "#525252" }} data-testid="nck-collectable-summary">
+                {/* 目录统计不在默认页面上：收进抽屉（搜索即列表，选中才展示定义信息）。 */}
+                <div style={{ fontSize: 13, color: "#262626" }} data-testid="nck-collectable-count">
+                  {collectableDefs.length} 个可配置变量
+                </div>
+                <details data-testid="nck-catalog-details" style={{ marginTop: 4 }}>
+                  <summary style={{ cursor: "pointer", fontSize: 11 }}>目录详情</summary>
+                  <div style={{ marginTop: 4, fontSize: 11 }} data-testid="nck-catalog-meta">
+                    共 {definitionList.length} 条定义（其余为身份探针或缺少 scope，不可采集）
+                    {" · "}目录：
+                    {catalog ? `${catalog.total} 条 / ${catalog.pages} 页 / rev ${catalog.revision}` : "注入目录"}
+                    {" · "}Endpoint family：
+                    {endpointFamilyState === "loading"
+                      ? "读取中"
+                      : endpointFamilyState === "error"
+                        ? "读取失败"
+                        : endpointFamily ?? "缺失（禁止提交）"}
+                  </div>
+                </details>
+              </div>
+            )}
+
+            {definitions && endpointFamilyState === "ready" && !endpointFamily ? (
+              <Alert
+                type="error"
+                data-testid="nck-endpoint-family-missing"
+                message="Endpoint 连接配置缺少 family：禁止新增/保存语义点位"
+                description="family 必须以 Endpoint 有效连接配置为准（目录顶层 family 只是回显，不是提交依据）。请先补齐连接配置。"
+              />
+            ) : null}
+
+            {/* Browse 入口：只在驱动声明了 browse 时出现（不新增特判，§4.1-2）。 */}
+            {definitions && (desc?.resource_selection_methods ?? []).includes("browse") ? (
+              <div style={{ display: "grid", gap: 8 }}>
+                <div>
+                  <Button
+                    size="small"
+                    type="link"
+                    data-testid="nck-browse-toggle"
+                    onClick={() => setBrowseOpen((v) => !v)}
+                  >
+                    {browseOpen ? "收起浏览" : "从浏览树选择语义变量"}
+                  </Button>
+                </div>
+                {browseOpen ? (
+                  <ResourceBrowseAntd
+                    endpointId={endpointId}
+                    onFill={() => message.warning("请选用语义点位（旧资源入口在 NCK 上已被禁用）")}
+                    nckSemantic={{
+                      definitions: definitionList,
+                      endpointFamily,
+                      catalogFamily,
+                    }}
+                    onSemanticSelect={(sel) => {
+                      setBrowsePreset({
+                        kind: "nck_variable",
+                        point_key: "",
+                        parameters: sel.parameters,
+                      });
+                      setEditingIndex(null);
+                      setFormVersion((v) => v + 1);
+                      message.info("已把浏览叶带入语义表单：请等待服务端预览确认身份");
+                    }}
+                  />
+                ) : null}
+              </div>
+            ) : null}
+
+            {definitions ? (
+              editingIndex !== null && nckPoints[editingIndex] ? (
+                <NckPointFields
+                  key={`edit-${endpointId}-${editingIndex}-${nckPoints[editingIndex].point_key}-${formVersion}`}
+                  driverId={driverId}
+                  endpointFamily={endpointFamily}
+                  catalogFamily={catalogFamily}
+                  definitions={collectableDefs}
+                  takenPointKeys={takenPointKeys(editingIndex)}
+                  initialPoint={nckPoints[editingIndex]}
+                  nativeSchema={nativeSchema}
+                  submitLabel="确认修改"
+                  onDirtyChange={setDrawerDirty}
+                  onCancel={requestCloseDrawer}
+                  onSubmit={(point) => replacePoint(editingIndex, point)}
+                />
+              ) : (
+                <NckPointFields
+                  key={`add-${endpointId}-${formVersion}`}
+                  driverId={driverId}
+                  endpointFamily={endpointFamily}
+                  catalogFamily={catalogFamily}
+                  definitions={collectableDefs}
+                  takenPointKeys={takenPointKeys(null)}
+                  initialPoint={browsePreset}
+                  nativeSchema={nativeSchema}
+                  submitLabel="加入待保存列表"
+                  onDirtyChange={setDrawerDirty}
+                  onSubmit={addPoint}
+                />
+              )
+            ) : null}
+          </div>
+        ) : (
+          <ResourcePickerAntd
+            resources={desc?.resources ?? []}
+            existingSelections={sels}
+            protectedSelections={preservedTasks.flatMap((t) => selectionsOf(t))}
+            selectionMethods={desc?.resource_selection_methods ?? []}
+            endpointId={endpointId}
+            requireExplicitSelection
+            submitLabel="加入待保存列表"
+            onDirtyChange={setDrawerDirty}
+            onAdd={(selection) => {
+              // 唯一防御门：与 AddDeviceFlow 同一共享实现（protected 永不动）。
+              const schemaOf = (resourceId: string) => {
+                const found = (desc?.resources ?? []).find((r) => r.id === resourceId);
+                return {
+                  fields: (found?.parameters.fields ?? []).map((f) => ({ key: f.key, default: f.default })),
+                };
+              };
+              const { next, message: msg } = applySelectionAdd({
+                candidate: selection,
+                editable: sels,
+                protectedSelections: preservedTasks.flatMap((t) => selectionsOf(t)),
+                schemaOf,
+              });
+              if (msg) {
+                if (msg.startsWith("point_key")) message.error(msg);
+                else message.warning(msg);
+                return false;
+              }
+              setSels(next);
+              // 既有行按对象引用/身份键沿用 rowId；新增项发新号（不重排既有行）。
+              setSelRowIds((prev) =>
+                alignRowIds(
+                  sels,
+                  prev,
+                  next,
+                  rowIdAllocator.current,
+                  (sel) => `${sel.resource_id}\u0000${stableIdentityKey(sel.parameters)}`,
+                ),
+              );
+              closeDrawer();
+              return true;
+            }}
+          />
+        )}
+      </PointDrawer>
+
+      {/* 技术详情抽屉：完整点键 / 原始参数 / 定义版本 / 身份来源（主动展开才看）。 */}
+      <PointDrawer
+        open={!!detailRow}
+        title="技术详情"
+        notice={null}
+        testId="point-detail-drawer"
+        onClose={() => setDetailRow(null)}
+        footer={
+          <Button data-testid="detail-close" onClick={() => setDetailRow(null)}>
+            关闭
+          </Button>
+        }
+      >
+        <div
+          data-testid="point-detail"
+          style={{
+            display: "grid",
+            gap: 6,
+            fontSize: 12,
+            fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace",
+          }}
+        >
+          {detailRow
+            ? detailRow.detail.map((entry) => (
+                <div key={entry.label} style={{ overflowWrap: "anywhere" }}>
+                  <span style={{ color: "#525252" }}>{entry.label}：</span>
+                  {entry.value}
+                </div>
+              ))
+            : null}
+        </div>
+      </PointDrawer>
     </div>
   );
 }

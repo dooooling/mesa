@@ -228,9 +228,11 @@ function planNckSave(input: EndpointSavePlanInput): EndpointSavePlan {
  * 1. **任务数组顺序**：`GET /api/v1/tasks` 按 task id 升序返回
  *    （`crates/config-store/src/lib.rs:2172` 的 `ORDER BY id`），提交顺序不被保留。
  *    因此任务**按 id 对齐**比较，任务数组顺序不算配置差异（任务内点位顺序仍严格比较）。
- * 2. **Subscribe schedule 缺省字段**：服务端反序列化时补默认值
- *    （`crates/core-types/src/lib.rs:442-450`）。基线本身来自 GET（已归一），
- *    所以提交值不会被服务端改写；这里不额外放宽。
+ * 2. **Subscribe schedule 的四个缺省字段**：`crates/core-types/src/lib.rs:444-467`
+ *    对 `publishing_interval_ms`(500) / `sampling_interval_ms`(250) /
+ *    `queue_size`(10) / `discard_oldest`(true) 提供 serde default。**这不是放宽**：
+ *    基线来自 GET（服务端已归一），保留任务逐字复制，提交值与回读值本就带同样的
+ *    缺省字段；若提交值真的省掉它们，比对按不一致处理（fail-closed）。
  */
 export function sameTaskSet(
   a: AcquisitionTaskShape[],

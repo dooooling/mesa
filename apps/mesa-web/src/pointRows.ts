@@ -130,16 +130,27 @@ export function filterRows<T>(
 
 /**
  * 分页：只切片，不重新分配 rowId。页码越界时收敛到有效范围（不返回负页码）。
+ *
+ * 与 `paginateItems` 同一实现：行身份与分页无关，分页只需要「按顺序切片」。
  */
 export function paginateRows<T>(
   rows: readonly PointRow<T>[],
   page: number,
   pageSize: number,
 ): { rows: PointRow<T>[]; page: number; pageCount: number; total: number } {
-  const total = rows.length;
+  return paginateItems(rows, page, pageSize);
+}
+
+/** 通用分页（任意元素数组；顺序即顺序，不做排序、不重排）。 */
+export function paginateItems<T>(
+  items: readonly T[],
+  page: number,
+  pageSize: number,
+): { rows: T[]; page: number; pageCount: number; total: number } {
+  const total = items.length;
   const size = Math.max(1, Math.floor(pageSize) || 1);
   const pageCount = Math.max(1, Math.ceil(total / size));
   const safePage = Math.min(Math.max(1, Math.floor(page) || 1), pageCount);
   const start = (safePage - 1) * size;
-  return { rows: rows.slice(start, start + size), page: safePage, pageCount, total };
+  return { rows: items.slice(start, start + size), page: safePage, pageCount, total };
 }

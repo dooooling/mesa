@@ -74,14 +74,13 @@ describe("EndpointAcquisitionPane saveIssues（后端 issues 原样展示）", (
     ];
     mockFetch(() => ({ ok: false, status: 400, json: async () => ({ valid: false, issues }) }));
     render(<EndpointAcquisitionPane endpointId="ep1" driverId="drv" onChanged={() => {}} />);
-    // 等待快照就绪；制造一次真实变更（周期 1000 → 2000）才允许保存——
-    // 无实际修改时按钮禁用且提交函数也会拦截（§4.4.2，所有驱动统一）。
-    await waitFor(() => expect(screen.getByRole("button", { name: /保存/ })).toBeTruthy());
-    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
-    await waitFor(() =>
-      expect((screen.getByRole("button", { name: /保存/ }) as HTMLButtonElement).disabled).toBe(false),
-    );
-    await user.click(screen.getByRole("button", { name: /保存/ }));
+    // 等待快照就绪；无修改时保存区不渲染（§4.7），制造一次真实变更（周期 1000 → 2000）
+    // 后按钮才出现——无实际修改时提交函数也会拦截（§4.4.2，所有驱动统一）。
+    await waitFor(() => expect(screen.getByTestId("sel-point-row")).toBeTruthy());
+    fireEvent.change(screen.getByTestId("acquisition-interval-input"), { target: { value: "2000" } });
+    const save = (await screen.findByTestId("apply-button")) as HTMLButtonElement;
+    await waitFor(() => expect(save.disabled).toBe(false));
+    await user.click(save);
     // 两条 issues 原样展示（path/code/message 全在，不翻译不重判）：
     // toast 摘要与列表块都会出现 path 文案，故用 getAllBy 锁"同时显示两条"。
     await waitFor(() => expect(screen.getByText(/保存被后端拒绝/)).toBeTruthy());
@@ -96,13 +95,12 @@ describe("EndpointAcquisitionPane saveIssues（后端 issues 原样展示）", (
     const user = userEvent.setup();
     mockFetch(() => ({ ok: false, status: 500, json: async () => ({ error: { message: "boom" } }) }));
     render(<EndpointAcquisitionPane endpointId="ep2" driverId="drv" onChanged={() => {}} />);
-    await waitFor(() => expect(screen.getByRole("button", { name: /保存/ })).toBeTruthy());
-    // 同样需要一次真实变更，否则会被「无实际修改」拦截（不发请求）。
-    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
-    await waitFor(() =>
-      expect((screen.getByRole("button", { name: /保存/ }) as HTMLButtonElement).disabled).toBe(false),
-    );
-    await user.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(screen.getByTestId("sel-point-row")).toBeTruthy());
+    // 同样需要一次真实变更，否则保存区不渲染、也无从提交。
+    fireEvent.change(screen.getByTestId("acquisition-interval-input"), { target: { value: "2000" } });
+    const save = (await screen.findByTestId("apply-button")) as HTMLButtonElement;
+    await waitFor(() => expect(save.disabled).toBe(false));
+    await user.click(save);
     // issues 列表不出现（无 issues 可展），toast 走原 message（assert 不抛即不断言 antd portal 文案）
     await act(async () => {});
     expect(screen.queryByText(/保存被后端拒绝/)).toBeNull();

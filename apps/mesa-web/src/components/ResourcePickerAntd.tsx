@@ -92,6 +92,9 @@ export function ResourcePickerAntd({
   selectionMethods,
   endpointId,
   semantic,
+  requireExplicitSelection,
+  submitLabel,
+  onDirtyChange,
 }: {
   resources: ResourceDescriptor[];
   /**
@@ -112,13 +115,24 @@ export function ResourcePickerAntd({
   endpointId?: string;
   /** NCK 语义模式（可选；未提供时行为逐字保持旧 Picker）。 */
   semantic?: PickerSemanticConfig | null;
+  /**
+   * 「先选资源、再填参数」形态（抽屉添加流程，§4.1-4）：
+   * 未选择资源时只渲染**一个**搜索/选择入口，不展示空表单、禁用按钮与错误框的组合。
+   * 缺省 false ⇒ 行为逐字保持旧 Picker（既有调用方零变化）。
+   */
+  requireExplicitSelection?: boolean;
+  /** 主按钮文案（抽屉里是「加入待保存列表」，不是「保存点位」）。 */
+  submitLabel?: string;
+  /** 抽屉内「有未确认修改」的上报（关闭前提醒一次）。 */
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const methods: Array<"manual" | "browse" | "import"> =
     selectionMethods && selectionMethods.length ? selectionMethods : ["manual"];
   const [mode, setMode] = useState<"manual" | "browse">(methods.includes("manual") ? "manual" : "browse");
-  const [rid, setRid] = useState(resources[0]?.id ?? "");
+  const firstResource = requireExplicitSelection ? undefined : resources[0];
+  const [rid, setRid] = useState(firstResource?.id ?? "");
   const [params, setParams] = useState<Record<string, unknown>>(() =>
-    materializeSchemaDefaults(resources[0]?.parameters ?? { fields: [] }),
+    firstResource ? materializeSchemaDefaults(firstResource.parameters) : {},
   );
   const [outputs, setOutputs] = useState<Array<{ output: string; point_key: string }>>([]);
   const [fill, setFill] = useState<PickerExternalFill | null>(null);
@@ -140,6 +154,12 @@ export function ResourcePickerAntd({
     setMode("manual");
   }, [fill, resources]);
 
+  // 抽屉「有未确认修改」的判定：选了资源、勾了输出即算（不引入新业务判据）。
+  const dirty = !!rid || outputs.length > 0;
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
+
   // 语义模式：不进入通用 resource/manual 分支，旧 `variable` 入口整体不渲染（A22）。
   if (semantic) {
     return (
@@ -151,8 +171,36 @@ export function ResourcePickerAntd({
     );
   }
 
+  /** 切换资源：参数按新 Schema 物化默认值，输出选择清空（显示即保存值）。 */
+  const switchResource = (v: string) => {
+    setRid(v);
+    const next = resources.find((r) => r.id === v);
+    setParams(materializeSchemaDefaults(next?.parameters ?? { fields: [] }));
+    setOutputs([]);
+  };
+
   const res = resources.find((r) => r.id === rid);
-  if (!res) return <div style={{ color: "#525252" }}>无可用资源</div>;
+  if (!resources.length) return <div style={{ color: "#525252" }}>无可用资源</div>;
+  if (!res) {
+    // 还没选资源：只给**一个**搜索/选择入口（§4.1-4）。参数表、输出表与主按钮
+    // 都要等选中之后才出现，避免「空表单 + 禁用按钮 + 错误框」的组合。
+    return (
+      <div style={{ display: "grid", gap: 8 }} data-testid="resource-picker-idle">
+        <div style={{ fontSize: 12, fontWeight: 600 }}>资源</div>
+        <Select
+          data-testid="resource-select"
+          aria-label="搜索并选择资源"
+          showSearch
+          optionFilterProp="label"
+          placeholder="搜索并选择资源"
+          style={{ width: "100%" }}
+          value={undefined}
+          onChange={switchResource}
+          options={resources.map((r) => ({ value: r.id, label: `${labelOf(r.label) ?? r.id} — ${r.id}` }))}
+        />
+      </div>
+    );
+  }
 
   // A3：未知字段类型 ⇒ 该资源参数**不可编辑、不可加入**。
   // 判定基于完整 Schema（含高级/隐藏字段），打开界面即生效；只影响当前资源，
@@ -187,13 +235,6 @@ export function ResourcePickerAntd({
     schemaOf,
   );
 
-  const switchResource = (v: string) => {
-    setRid(v);
-    const next = resources.find((r) => r.id === v);
-    setParams(materializeSchemaDefaults(next?.parameters ?? { fields: [] }));
-    setOutputs([]);
-  };
-
   const toggleOutput = (outputId: string, checked: boolean) => {
     if (checked) {
       const taken = new Set([...knownKeys, ...outputs.map((o) => o.point_key)]);
@@ -223,9 +264,8 @@ export function ResourcePickerAntd({
         ),
       }]
       : []),
-    ...(methods.includes("import")
-      ? [{ key: "import", label: "导入", disabled: true, children: <div style={{ fontSize: 12, color: "#525252" }}>Import 尚未实现（后端 501）。声明保留，待实现后开放。</div> }]
-      : []),
+    // §4.1.1：导入必须**同时**满足「驱动声明」与「产品实现可用」；后端导入接口当前
+    // 恒返回 501，因此这里**不渲染**该入口（不是置灰占位，也不因声明而放开）。
   ];
 
   function manualPane() {
@@ -236,6 +276,11 @@ export function ResourcePickerAntd({
         <div>
           <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>资源</div>
           <Select
+            data-testid="resource-select"
+            aria-label="搜索并选择资源"
+            showSearch
+            optionFilterProp="label"
+            placeholder="搜索并选择资源"
             style={{ width: "100%" }}
             value={rid}
             onChange={switchResource}
@@ -342,15 +387,16 @@ export function ResourcePickerAntd({
             if (onAdd?.({ resource_id: res.id, parameters: params, outputs })) setOutputs([]);
           }}
         >
-          加入
+          {submitLabel ?? "加入"}
         </Button>
       </div>
     );
   }
 
-  // 纯手动声明时保持老布局零变化；一旦声明 browse/import 即进入 tab 形态
+  // 纯手动声明时保持老布局零变化；一旦声明 browse 即进入 tab 形态
   //（单 browse 声明也走 Tabs，避免回落到不存在的手动页）。
-  if (!methods.includes("browse") && !methods.includes("import")) return manualPane();
+  // 未实现的 import 不进入 tabs（见上方注释），因此不再作为分支条件。
+  if (!methods.includes("browse")) return manualPane();
   return <Tabs activeKey={mode} onChange={(k) => setMode(k as "manual" | "browse")} items={tabs} />;
 }
 
@@ -445,20 +491,7 @@ function SemanticResourcePicker({
     ...(methods.includes("browse")
       ? [{ key: "browse", label: "浏览（语义）", children: browsePane }]
       : []),
-    ...(methods.includes("import")
-      ? [
-          {
-            key: "import",
-            label: "导入",
-            disabled: true,
-            children: (
-              <div style={{ fontSize: 12, color: "#525252" }}>
-                Import 尚未实现（后端 501）。声明保留，待实现后开放。
-              </div>
-            ),
-          },
-        ]
-      : []),
+    // 导入入口在语义模式下同样不渲染（产品未实现，§4.1.1）。
   ];
 
   return (

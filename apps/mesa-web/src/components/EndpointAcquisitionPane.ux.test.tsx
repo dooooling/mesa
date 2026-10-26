@@ -1,8 +1,10 @@
-// 采集页 UX 回归（P0-2 / P1-1 / P1-2 / P2-1 / P2-2）。
+// 采集页 UX 回归（第 2 步：紧凑列表 / 抽屉 / 固定保存区）。
 //
-// 这些断言刻意都落在**用户能看到的文案与按钮**上：按钮说“保存配置”就必须
-// 不启动采集；底部说明必须随 Endpoint 状态/勾选变化；绿色标签必须只声明
-// “配置格式校验通过”，不得暗示真实机床读取成功。
+// 这些断言刻意都落在**用户能看到的文案与按钮**上：
+// - 顶部只有一行运行摘要（不再是四段状态条）；
+// - 正常行不再重复绿色「校验通过」标签，技术细节收进「⋯ → 技术详情」；
+// - 保存区只在需要时出现，按钮文案描述真实动作（不再出现「停止并应用」）；
+// - 添加/编辑走抽屉，关闭后回到原列表位置。
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -162,6 +164,16 @@ function renderPane() {
   );
 }
 
+/** 制造一次真实变更（周期 1000 → value），使固定保存区出现。 */
+async function changeInterval(value: number) {
+  await waitFor(() =>
+    expect(screen.getByTestId("acquisition-status-interval").textContent).toContain("（已保存）"),
+  );
+  fireEvent.change(screen.getByTestId("acquisition-interval-input"), {
+    target: { value: String(value) },
+  });
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
 });
@@ -187,19 +199,19 @@ describe("P0-2 / P2-2：已停止时的按钮、说明与状态区", () => {
         "1 个（已保存）",
       ),
     );
-    expect(within(status).getByTestId("acquisition-status-after").textContent).toBe(
-      "保存后保持停止",
-    );
+    // 第 2 步：四段状态条收敛为一行，「保存后状态」不再常驻。
+    expect(within(status).queryByTestId("acquisition-status-after")).toBeNull();
+    // 没有修改 ⇒ 固定保存区完全不渲染（不是禁用）。
+    expect(screen.queryByTestId("draft-save-bar")).toBeNull();
+    expect(screen.queryByTestId("apply-button")).toBeNull();
 
-    const button = screen.getByTestId("apply-button");
+    // 产生真实变更后：按钮文案只承诺「保存配置」，并说明不会启动采集。
+    await changeInterval(2000);
+    const button = await screen.findByTestId("apply-button");
     expect(button.textContent).toBe("保存配置");
-    expect(screen.getByTestId("apply-stopped-note").textContent).toContain("保存后保持停止");
-    const note = screen.getByTestId("acquisition-execution-note").textContent ?? "";
-    expect(note).toContain("不会启动采集");
-    expect(note).toContain("保持停止");
-    // 不得再写死旧路径。
-    expect(note).not.toContain("Stop → PUT");
-    expect(note).not.toContain("→ Start");
+    expect(screen.getByTestId("draft-save-note").textContent).toContain("不会启动采集");
+    // 不得再写死旧路径文案。
+    expect(document.body.textContent).not.toContain("Stop → PUT");
   });
 
   it("saving_while_stopped_writes_config_and_reports_currently_stopped", async () => {
@@ -207,25 +219,19 @@ describe("P0-2 / P2-2：已停止时的按钮、说明与状态区", () => {
     const state = mkState({ tasks: [nckTask([point("syn.collect.a", { channel: 1 })])] });
     installFetch(state);
     renderPane();
-    // 无实际修改 ⇒ 保存按钮禁用（§4.4.2）；改周期后才可用。
-    // 先等快照就绪（状态区出现「已保存」），避免改动被加载结果覆盖。
+    // 无实际修改 ⇒ 保存区不出现（§4.7 隐藏态）。
     await waitFor(() =>
       expect(screen.getByTestId("acquisition-status-interval").textContent).toBe("1000 ms（已保存）"),
     );
-    await waitFor(() =>
-      expect(screen.getByTestId("apply-button").hasAttribute("disabled")).toBe(true),
-    );
+    expect(screen.queryByTestId("apply-button")).toBeNull();
     // 制造一次真实变更（周期 1000 → 2000），否则保存计划会按 NO_CHANGES 拒绝发 PUT。
-    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
-    await waitFor(() =>
-      expect(screen.getByTestId("apply-button").hasAttribute("disabled")).toBe(false),
-    );
+    fireEvent.change(screen.getByTestId("acquisition-interval-input"), { target: { value: "2000" } });
     await waitFor(() =>
       expect(screen.getByTestId("acquisition-status-interval").textContent).toBe(
         "1000 ms（已保存） → 2000 ms（待保存）",
       ),
     );
-    await user.click(screen.getByTestId("apply-button"));
+    await user.click(await screen.findByTestId("apply-button"));
 
     const result = await screen.findByTestId("apply-result");
     expect(result.textContent).toContain("配置已保存，当前停止");
@@ -236,8 +242,8 @@ describe("P0-2 / P2-2：已停止时的按钮、说明与状态区", () => {
   });
 });
 
-describe("P0-2：运行中的按钮/勾选/底部说明随动作变化", () => {
-  it("running_endpoint_shows_stop_and_apply_with_real_path", async () => {
+describe("P0-2：运行中的按钮/次级选项/中断说明随动作变化", () => {
+  it("running_endpoint_offers_restart_by_default_and_secondary_keep_stopped", async () => {
     const user = userEvent.setup();
     const state = mkState({
       endpointState: "RUNNING",
@@ -249,24 +255,25 @@ describe("P0-2：运行中的按钮/勾选/底部说明随动作变化", () => {
     await waitFor(() =>
       expect(screen.getByTestId("acquisition-status-state").textContent).toBe("运行中"),
     );
-    const button = screen.getByTestId("apply-button");
-    expect(button.textContent).toBe("停止并应用");
-    const checkbox = screen.getByRole("checkbox") as HTMLInputElement;
-    expect(checkbox.checked).toBe(true);
-    expect(screen.getByTestId("acquisition-execution-note").textContent).toContain(
-      `停止 → 写入配置（PUT /tasks/${EP}）→ 启动`,
-    );
-    expect(screen.getByTestId("acquisition-status-after").textContent).toBe(
-      "停止 → 写入配置 → 启动",
-    );
+    // 无修改 ⇒ 保存区不渲染（中断说明也不出现）。
+    expect(screen.queryByTestId("draft-save-note")).toBeNull();
 
-    await user.click(checkbox);
-    expect(screen.getByTestId("acquisition-execution-note").textContent).toContain(
-      "保存后保持停止",
+    await changeInterval(2000);
+    const button = await screen.findByTestId("apply-button");
+    // 默认动作是「保存并恢复采集」（不是旧文案「停止并应用」）。
+    expect(button.textContent).toBe("保存并恢复采集");
+    // 中断说明只在「有修改 + 运行中」时出现，且不承诺时长。
+    const note = screen.getByTestId("draft-save-note").textContent ?? "";
+    expect(note).toBe("保存会暂时中断当前连接的采集");
+    expect(note).not.toMatch(/1[–-]2 ?秒/);
+
+    // 次级选项：切到「保存后保持停止」后主按钮文案随之改变。
+    expect(screen.getByTestId("toggle-restart").textContent).toBe("保存后保持停止");
+    await user.click(screen.getByTestId("toggle-restart"));
+    await waitFor(() =>
+      expect(screen.getByTestId("apply-button").textContent).toBe("保存并停止采集"),
     );
-    expect(screen.getByTestId("acquisition-status-after").textContent).toBe(
-      "停止 → 写入配置，保存后保持停止",
-    );
+    expect(screen.getByTestId("toggle-restart").textContent).toBe("保存后恢复采集");
   });
 
   it("running_save_with_restart_reports_acquisition_started", async () => {
@@ -280,14 +287,13 @@ describe("P0-2：运行中的按钮/勾选/底部说明随动作变化", () => {
     await waitFor(() =>
       expect(screen.getByTestId("acquisition-status-state").textContent).toBe("运行中"),
     );
-    // 同样制造一次真实变更，确保保存计划不会因 NO_CHANGES 提前返回。
-    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
+    await changeInterval(2000);
     await waitFor(() =>
       expect(screen.getByTestId("acquisition-status-interval").textContent).toBe(
         "1000 ms（已保存） → 2000 ms（待保存）",
       ),
     );
-    await user.click(screen.getByTestId("apply-button"));
+    await user.click(await screen.findByTestId("apply-button"));
 
     const result = await screen.findByTestId("apply-result");
     expect(result.textContent).toContain("配置已保存，采集已启动");
@@ -316,8 +322,8 @@ describe("P2-1：压测信息只出现在帮助提示里", () => {
   });
 });
 
-describe("P1-2：点位行两层信息 + 技术详情折叠 + 状态文案", () => {
-  it("semantic_point_shows_name_address_and_config_only_status", async () => {
+describe("P1-2 / 第 2 步：点位行三层信息 + 技术详情抽屉，不再有逐行绿标", () => {
+  it("semantic_point_shows_name_and_labeled_summary_without_green_tag", async () => {
     const state = mkState({
       tasks: [nckTask([point("syn.collect.a", { channel: 1 })])],
     });
@@ -325,42 +331,38 @@ describe("P1-2：点位行两层信息 + 技术详情折叠 + 状态文案", () 
     renderPane();
 
     const row = await screen.findByTestId("nck-point-row");
-    await waitFor(() =>
-      expect(within(row).getByTestId("nck-point-status").textContent).toContain(
-        "配置格式校验通过",
-      ),
-    );
-    expect(within(row).getByTestId("nck-point-name").textContent).toBe("主轴转速");
-    expect(within(row).getByTestId("nck-point-address").textContent).toBe("语义点位 · 通道 1");
-    // 绿色标签只声明配置格式，不得让用户以为真实机床读取成功。
-    const status = within(row).getByTestId("nck-point-status").textContent ?? "";
-    expect(status).not.toContain("采集正常");
-    expect(status).not.toContain("已读取");
-    expect(screen.getByTestId("nck-point-list-hint").textContent).toContain(
-      "不代表机床已成功读取数据",
-    );
-    // 技术细节默认折叠，但 point_key / 完整 JSON / 定义版本都在。
-    const tech = within(row).getByTestId("nck-point-technical") as HTMLDetailsElement;
-    expect(tech.open).toBe(false);
-    expect(tech.textContent).toContain("point_key：syn.collect.a@channel=1");
-    expect(tech.textContent).toContain('"channel":1');
-    expect(tech.textContent).toContain("定义版本：rev 1");
+    await waitFor(() => expect(row.getAttribute("data-verify-status")).toBe("verified"));
+    expect(within(row).getByTestId("point-row-title").textContent).toBe("主轴转速");
+    // 摘要 = 字段标签 + 值（不再带「语义点位 · 」前缀）。
+    expect(within(row).getByTestId("point-row-summary").textContent).toBe("通道 1");
+    // §6-7：正常行不出现绿色/成功类标签，也不出现任何「校验通过」文案。
+    expect(within(row).queryByTestId("point-row-status")).toBeNull();
+    expect(document.body.textContent).not.toContain("校验通过");
+
+    // 技术细节收进「⋯ → 技术详情」抽屉（主动展开才看得到）。
+    const user = userEvent.setup();
+    await user.click(within(row).getByTestId("point-row-more"));
+    await user.click(await screen.findByTestId("point-row-detail"));
+    const detail = await screen.findByTestId("point-detail");
+    expect(detail.textContent).toContain("point_key：syn.collect.a@channel=1");
+    expect(detail.textContent).toContain('"channel":1');
+    expect(detail.textContent).toContain("定义版本：rev 1");
+    expect(detail.textContent).toContain("服务端 identity-preview 重算");
   });
 
-  it("native_point_is_named_generically_and_shows_structured_address", async () => {
+  it("native_point_is_named_generically_and_shows_labeled_address", async () => {
     const state = mkState({ tasks: [nckTask([NATIVE_POINT])] });
     installFetch(state);
     renderPane();
 
     const row = await screen.findByTestId("nck-point-row");
-    await waitFor(() =>
-      expect(within(row).getByTestId("nck-point-status").textContent).toContain(
-        "配置格式校验通过（原生）",
-      ),
+    await waitFor(() => expect(row.getAttribute("data-verify-status")).toBe("verified"));
+    // 硬约束：没有可靠业务名称 ⇒ 只能叫「原生点位」，不得按地址编造业务名。
+    expect(within(row).getByTestId("point-row-title").textContent).toBe("原生点位");
+    // §2.6-4：地址必须是「字段标签 + 值」，不能是无说明的五段数字。
+    expect(within(row).getByTestId("point-row-summary").textContent).toBe(
+      "区域 A · 区域号 1 · 模块 26 · 列 30110 · 行 1",
     );
-    // 硬约束：没有可靠业务名称 ⇒ 只能叫「原生点位」。
-    expect(within(row).getByTestId("nck-point-name").textContent).toBe("原生点位");
-    expect(within(row).getByTestId("nck-point-address").textContent).toBe("A / 1 / 26 / 30110 / 1");
     expect(row.textContent).not.toMatch(/进给|倍率|主轴转速/);
   });
 });
@@ -411,7 +413,7 @@ describe("P2-2（状态区）：区分「已保存」与「待保存」", () => 
       ),
     );
 
-    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
+    fireEvent.change(screen.getByTestId("acquisition-interval-input"), { target: { value: "2000" } });
     await waitFor(() =>
       expect(screen.getByTestId("acquisition-status-interval").textContent).toBe(
         "1000 ms（已保存） → 2000 ms（待保存）",
@@ -436,24 +438,16 @@ describe("P2-1（已保存状态）：改同一点位参数后「已保存」必
     renderPane();
 
     // 先制造一次可保存的变更（周期 1000 → 2000）并保存成功。
-    // 无实际修改时按钮禁用（§4.4.2），因此这里先等「无修改」态再改周期。
     await waitFor(() =>
       expect(screen.getByTestId("acquisition-status-interval").textContent).toBe("1000 ms（已保存）"),
     );
-    await waitFor(() =>
-      expect(screen.getByTestId("apply-button").hasAttribute("disabled")).toBe(true),
-    );
-    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
-    await waitFor(() =>
-      expect(screen.getByTestId("apply-button").hasAttribute("disabled")).toBe(false),
-    );
-    await user.click(screen.getByTestId("apply-button"));
+    fireEvent.change(screen.getByTestId("acquisition-interval-input"), { target: { value: "2000" } });
+    await user.click(await screen.findByTestId("apply-button"));
     expect(await screen.findByTestId("apply-result")).toBeTruthy();
 
     // 编辑同一原生点位，只改 decode：point_key 与所有「键」都不变。
-    await user.click(
-      within(screen.getByTestId("nck-point-row")).getByRole("button", { name: /编\s*辑/ }),
-    );
+    // 编辑走抽屉（点行「编辑」→ 抽屉立即打开并带入配置）。
+    await user.click(within(screen.getByTestId("nck-point-row")).getByTestId("point-row-edit"));
     const nativeForm = await screen.findByTestId("nck-native-fields");
     // 原生表单里的下拉只有两个枚举字段：area、decode（decode 是第 2 个）；
     // rc-select 在 mousedown 时展开候选。
@@ -468,5 +462,12 @@ describe("P2-1（已保存状态）：改同一点位参数后「已保存」必
 
     // 参数已变 ⇒ 旧的「已保存」结论必须立即失效（重新出现未保存状态）。
     await waitFor(() => expect(screen.queryByTestId("apply-result")).toBeNull());
+    // 该行标记「已修改」（唯一逐行标记），保存区重新出现。
+    await waitFor(() =>
+      expect(within(screen.getByTestId("nck-point-row")).getByTestId("point-row-status").textContent).toContain(
+        "已修改",
+      ),
+    );
+    expect(screen.getByTestId("draft-save-bar")).toBeTruthy();
   });
 });

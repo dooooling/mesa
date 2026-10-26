@@ -11,12 +11,16 @@ export function ConnectionSelect(props: {
   allowAll?: boolean;
   onChange: (id: string | null) => void;
   width?: number;
+  /** 保存中禁止切换连接（§4.7）。 */
+  disabled?: boolean;
 }) {
-  const { endpoints, value, allowAll = true, onChange, width = 180 } = props;
+  const { endpoints, value, allowAll = true, onChange, width = 180, disabled = false } = props;
   return (
     <span style={{ fontSize: 12 }}>
       连接{" "}
       <Select
+        data-testid="connection-select"
+        disabled={disabled}
         value={allowAll ? (value ?? "ALL") : (value ?? endpoints[0]?.id ?? null)}
         onChange={(v) => onChange(v === "ALL" ? null : (v as string))}
         style={{ width }}

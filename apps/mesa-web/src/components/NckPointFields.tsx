@@ -88,6 +88,11 @@ export interface NckPointFieldsProps {
   onCancel?: () => void;
   onSubmit: (point: NckPointSelection) => void;
   preview?: NckPreviewFn;
+  /**
+   * 抽屉内「有未确认修改」的上报（关闭抽屉前提醒一次，§4.1）。
+   * 只在表单自身知道的信息（选了变量、改了参数、切了模式）上派生，不引入新判据。
+   */
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 export function NckPointFields({
@@ -102,6 +107,7 @@ export function NckPointFields({
   onCancel,
   onSubmit,
   preview,
+  onDirtyChange,
 }: NckPointFieldsProps) {
   const previewFn = preview ?? defaultPreview;
   // native 编辑态：已有 native 点位必须直接在高级原生页打开（身份规则不同）。
@@ -383,6 +389,60 @@ export function NckPointFields({
     </div>
   ) : null;
 
+  // 抽屉「有未确认修改」的判定：只取表单自己知道的事实（选了变量 / 填了参数 /
+  // 切到原生页），不引入新的业务判据。关闭抽屉前据此提醒一次。
+  const hasDraftInput =
+    hasSelection ||
+    Object.keys(draft.target).length > 0 ||
+    Object.keys(draft.arguments).length > 0 ||
+    editorMode === "native";
+  useEffect(() => {
+    onDirtyChange?.(hasDraftInput);
+  }, [hasDraftInput, onDirtyChange]);
+
+  /** 变量选择入口（搜索即列表；选中才展示定义信息）。 */
+  const picker = (
+    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+      <span style={{ fontSize: 12 }}>变量</span>
+      <Input
+        data-testid="nck-variable-search"
+        aria-label="搜索变量"
+        placeholder="搜索变量名称或 ID"
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        allowClear
+        style={{ width: 260 }}
+      />
+      <select
+        data-testid="nck-variable-select"
+        value={selectedId}
+        onChange={(e) => handleSelect(e.target.value)}
+        style={{ minWidth: 320, padding: "4px 6px" }}
+      >
+        <option value="">请选择可采集变量</option>
+        {visibleDefinitions.map((d) => (
+          <option key={String(d.variable_id)} value={String(d.variable_id)}>
+            {nckDefinitionLabel(d) || String(d.variable_id)}（{String(d.variable_id)}）
+          </option>
+        ))}
+      </select>
+      {query.trim() ? (
+        <span data-testid="nck-variable-search-count" style={{ fontSize: 12, color: "#525252" }}>
+          {filteredDefinitions.length
+            ? `匹配 ${filteredDefinitions.length} 个变量`
+            : "没有匹配的变量（可改用变量 ID 搜索）"}
+        </span>
+      ) : null}
+      {definition ? (
+        <Space size={4}>
+          <Tag>{String(definition.scope ?? "scope 缺失")}</Tag>
+          <Tag>{String(definition.semantics_status ?? "状态未提供")}</Tag>
+          {typeof definition.revision === "number" ? <Tag>rev {definition.revision}</Tag> : null}
+        </Space>
+      ) : null}
+    </div>
+  );
+
   if (editorMode === "native") {
     return (
       <div style={{ display: "grid", gap: 8 }}>
@@ -408,58 +468,23 @@ export function NckPointFields({
     );
   }
 
+  // 还没选变量：只给**一个选择入口**——不出现空身份、禁用按钮与错误框的组合（§4.1-4）。
+  if (!hasSelection) {
+    return (
+      <div style={{ display: "grid", gap: 8 }} data-testid="nck-point-fields-idle">
+        {modeSwitch}
+        {picker}
+        <div data-testid="nck-select-hint" style={{ fontSize: 12, color: "#525252" }}>
+          请选择可采集变量后填写参数。
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={{ display: "grid", gap: 8 }} data-testid="nck-point-fields">
       {modeSwitch}
-      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-        <span style={{ fontSize: 12 }}>变量</span>
-        <Input
-          data-testid="nck-variable-search"
-          aria-label="搜索变量"
-          placeholder="搜索变量名称或 ID"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          allowClear
-          style={{ width: 260 }}
-        />
-        <select
-          data-testid="nck-variable-select"
-          value={selectedId}
-          onChange={(e) => handleSelect(e.target.value)}
-          style={{ minWidth: 320, padding: "4px 6px" }}
-        >
-          <option value="">请选择可采集变量</option>
-          {visibleDefinitions.map((d) => (
-            <option key={String(d.variable_id)} value={String(d.variable_id)}>
-              {nckDefinitionLabel(d) || String(d.variable_id)}（{String(d.variable_id)}）
-            </option>
-          ))}
-        </select>
-        {query.trim() ? (
-          <span data-testid="nck-variable-search-count" style={{ fontSize: 12, color: "#525252" }}>
-            {filteredDefinitions.length
-              ? `匹配 ${filteredDefinitions.length} 个变量`
-              : "没有匹配的变量（可改用变量 ID 搜索）"}
-          </span>
-        ) : null}
-        {definition ? (
-          <Space size={4}>
-            <Tag>{String(definition.scope ?? "scope 缺失")}</Tag>
-            <Tag>{String(definition.semantics_status ?? "状态未提供")}</Tag>
-            {typeof definition.revision === "number" ? <Tag>rev {definition.revision}</Tag> : null}
-          </Space>
-        ) : null}
-      </div>
-
-      <div data-testid="nck-form-steps" style={{ fontSize: 11, color: "#8c8c8c" }}>
-        选择变量 → 填写必要参数 → 自动校验 → 加入点位
-      </div>
-
-      {!hasSelection ? (
-        <div data-testid="nck-select-hint" style={{ fontSize: 12, color: "#525252" }}>
-          请选择可采集变量后填写 Target / Arguments。
-        </div>
-      ) : null}
+      {picker}
 
       {definitionMissing ? (
         <Alert
@@ -470,21 +495,10 @@ export function NckPointFields({
         />
       ) : null}
 
-      {definition ? (
-        <div style={{ fontSize: 11, color: "#525252" }} data-testid="nck-definition-meta">
-          来源：
-          {Array.isArray(definition.source) && definition.source.length
-            ? definition.source
-                .map((s) =>
-                  typeof s === "object" && s
-                    ? String((s as { kind?: unknown }).kind ?? "unknown")
-                    : "unknown",
-                )
-                .join(" / ")
-            : "未提供"}
-          {definition.identity_template ? ` · 身份模板：${definition.identity_template}` : ""}
-        </div>
-      ) : null}
+      {/*
+        定义的「来源 / 身份模板 / 接口地址」不再常驻表单：按 §2.5 收进技术详情
+        （点位行「⋯ → 技术详情」），表单里只保留与填写直接相关的信息（scope/rev 标签）。
+      */}
 
       {definition && !admission.ok ? (
         <Alert

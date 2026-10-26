@@ -462,3 +462,44 @@ describe("决定 3：回读比对覆盖完整提交配置（周期 + 点位参�
     ).toBe(false);
   });
 });
+
+// 服务端归一化**豁免清单**的显式证据（§4.4.3 / §7.2-2）。
+//
+// 现状只有一条真正需要豁免的服务端行为，另一条经核实**不构成差异**：
+// ① 任务数组顺序：`GET /api/v1/tasks` 按 task id 升序返回
+//    （`crates/config-store/src/lib.rs:2172` 的 `ORDER BY id`），因此按 id 对齐比较，
+//    数组顺序不算配置差异（上面的 `task_array_order_is_not_a_change` 与
+//    「完全一致（任务数组顺序不同也算一致）」已锁住）。
+// ② Subscribe schedule 的四个缺省字段：`crates/core-types/src/lib.rs:444-467`
+//    对 `publishing_interval_ms`(500) / `sampling_interval_ms`(250) /
+//    `queue_size`(10) / `discard_oldest`(true) 给了 serde default。**但这不是豁免**：
+//    前端基线来自 GET（服务端已归一），保留任务逐字复制，因此提交值与回读值本来就
+//    带同样的缺省字段；若有人真的省掉它们，比对按不一致处理（fail-closed）。
+describe("服务端归一化：只豁免「任务数组按 id 升序」，subscribe 缺省字段不放宽", () => {
+  const withDefaults = {
+    id: "task-sub",
+    schedule: {
+      mode: "subscribe",
+      publishing_interval_ms: 500,
+      sampling_interval_ms: 250,
+      queue_size: 10,
+      discard_oldest: true,
+    },
+    binding: { kind: "custom.v0", config: {} },
+  } as AcquisitionTaskShape;
+
+  it("subscribe_defaults_present_on_both_sides_compare_equal", () => {
+    // 基线来自 GET（已归一）⇒ 逐字保留 ⇒ 回读一致。
+    expect(sameSubmittedConfig([withDefaults], [{ ...withDefaults }])).toBe(true);
+  });
+
+  it("dropping_a_defaulted_field_is_a_mismatch_not_an_exemption", () => {
+    // 提交值省略缺省字段 ⇒ 与回读值不同 ⇒ 判为不一致（不设「服务端会补默认」的豁免）。
+    const withoutDefaults = {
+      id: "task-sub",
+      schedule: { mode: "subscribe" },
+      binding: { kind: "custom.v0", config: {} },
+    } as AcquisitionTaskShape;
+    expect(sameSubmittedConfig([withDefaults], [withoutDefaults])).toBe(false);
+  });
+});

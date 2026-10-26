@@ -127,8 +127,11 @@ describe("A3：未知字段类型阻止保存（只影响该配置）", () => {
     // 字段名与类型只在「技术详情」里出现一次；并标注是存量配置已携带。
     expect(screen.getByText("probe · shape · geometry · 存量配置已携带")).toBeTruthy();
 
-    const save = screen.getByTestId("apply-button") as HTMLButtonElement;
+    // 无修改时保存区不渲染（§4.7）；制造一次真实变更让按钮出现，它必须仍然是禁用的。
+    fireEvent.change(screen.getByTestId("acquisition-interval-input"), { target: { value: "2000" } });
+    const save = (await screen.findByTestId("apply-button")) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
+    // 按钮禁用只是体验：绕过 disabled 直接触发提交函数，仍不得发写请求。
     expect(invokeDisabledButton(save)).toBe(true);
     await waitFor(() => expect(srv.puts).toHaveLength(0));
   });
@@ -162,7 +165,9 @@ describe("A3：未知字段类型阻止保存（只影响该配置）", () => {
       screen.getByText("probe · shape · geometry · 配置未携带（驱动新增字段）"),
     ).toBeTruthy();
 
-    const save = screen.getByTestId("apply-button") as HTMLButtonElement;
+    // 制造一次真实变更，让固定保存区出现（否则保存区不渲染、无从点击）。
+    fireEvent.change(screen.getByTestId("acquisition-interval-input"), { target: { value: "2000" } });
+    const save = (await screen.findByTestId("apply-button")) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
     // 记录点击前的请求数：加载阶段的 GET 不计入。
     const before = srv.calls.length;
@@ -201,13 +206,13 @@ describe("A3：未知字段类型阻止保存（只影响该配置）", () => {
     const srv = installFetch([resource(), unused], taskWith({ unit: 3 }));
     render(<EndpointAcquisitionPane endpointId={EP} driverId="drv" onChanged={() => {}} />);
 
-    await waitFor(() => expect(screen.getByTestId("apply-button")).toBeTruthy());
+    // 等点位行就绪（无修改时保存区不渲染，§4.7）。
+    await waitFor(() => expect(screen.getByTestId("sel-point-row")).toBeTruthy());
     expect(screen.queryByTestId("acquisition-unsupported-fields")).toBeNull();
-    const save = screen.getByTestId("apply-button") as HTMLButtonElement;
-    // 无实际修改时按钮禁用（§4.4.2）；制造一次周期变更后应可用，
-    // 证明「未使用资源里的未知类型」没有阻断本次保存。
-    expect(save.disabled).toBe(true);
+    expect(screen.queryByTestId("apply-button")).toBeNull();
+    // 制造一次周期变更后按钮出现且可用，证明「未使用资源里的未知类型」没有阻断本次保存。
     fireEvent.change(screen.getByTestId("acquisition-interval-input"), { target: { value: "2000" } });
+    const save = (await screen.findByTestId("apply-button")) as HTMLButtonElement;
     await waitFor(() => expect(save.disabled).toBe(false));
     expect(srv.puts).toHaveLength(0);
   });
