@@ -97,7 +97,9 @@ jobs:
                   return base
               return base + ' & (' + ' | '.join(f'test(={t})' for t in tests) + ')'
           filt = selected('stop_lifecycle', stop) + ' | ' + selected('management_api', management)
+          # -E 只筛运行集合；显式限制 Cargo 构建目标，避免链接其它未运行套件。
           subprocess.run(['cargo', 'nextest', 'run', '--locked', '-p', 'mesa-contract-tests',
+                          '--test', 'stop_lifecycle', '--test', 'management_api',
                           '--all-features', '--profile', 'ci-stress', '-E', filt], check=True)
           EOF
 
