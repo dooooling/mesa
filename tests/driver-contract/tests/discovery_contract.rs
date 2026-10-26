@@ -73,8 +73,10 @@ async fn app_with_endpoint_in_dir(
         .unwrap();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(drivers_dir));
     #[allow(deprecated)]
-    let state = mesa_core_api::AppState::new(mgr, store, drivers_dir.to_string_lossy().to_string());
-    let router = mesa_core_api::router(state);
+    let state =
+        common::isolated_app_state(mgr, store, drivers_dir.to_string_lossy().to_string(), false)
+            .expect("isolated AppState");
+    let router = state.router();
     (router, ep_id)
 }
 

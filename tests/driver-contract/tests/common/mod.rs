@@ -41,6 +41,66 @@ pub fn repo_root() -> PathBuf {
         .join("..")
 }
 
+/// REST 夹具的证书目录必须独立于工作目录与其它测试进程。
+/// Router 持有目录守卫，直到最后一个 Router 副本释放后才清理，避免后台请求读到已删除文件。
+struct TestCertDir(PathBuf);
+
+impl Drop for TestCertDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub struct TestAppState {
+    state: std::sync::Arc<mesa_core_api::AppState>,
+    cert_dir: std::sync::Arc<TestCertDir>,
+}
+
+impl std::ops::Deref for TestAppState {
+    type Target = std::sync::Arc<mesa_core_api::AppState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl TestAppState {
+    pub fn router(&self) -> axum::Router {
+        mesa_core_api::router(std::sync::Arc::clone(&self.state))
+            .layer(axum::Extension(std::sync::Arc::clone(&self.cert_dir)))
+    }
+
+    pub fn cert_dir(&self) -> &std::path::Path {
+        &self.cert_dir.0
+    }
+}
+
+/// 构造与生产相同的 fail-closed AppState，仅注入独立证书目录；不改环境变量或当前目录。
+pub fn isolated_app_state(
+    manager: std::sync::Arc<mesa_driver_manager::MesaManager>,
+    store: std::sync::Arc<mesa_config_store::ConfigStore>,
+    drivers_dir: String,
+    enable_control: bool,
+) -> Result<TestAppState, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "mesa-test-certs-{}-{}-{}",
+        std::process::id(),
+        mesa_core_types::now_unix_ns(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ));
+    std::fs::create_dir(&dir).map_err(|e| format!("创建隔离证书目录失败: {e}"))?;
+    let cert_dir = std::sync::Arc::new(TestCertDir(dir));
+    let state = mesa_core_api::AppState::try_new_with_cert_dir_and_control(
+        manager,
+        store,
+        drivers_dir,
+        cert_dir.0.clone(),
+        enable_control,
+    )?;
+    Ok(TestAppState { state, cert_dir })
+}
+
 /// 已构建的 test-driver 可执行文件路径。
 ///
 /// NOTE(cargo 行为): `cargo test -p mesa-contract-tests` 只构建依赖包的 lib，
@@ -58,7 +118,7 @@ pub fn mesad_exe() -> PathBuf {
 }
 
 fn find_built_binary(name: &str) -> PathBuf {
-    let target = repo_root().join("target");
+    let target = mesa_contract_tests::target_dir();
     for profile in ["debug", "release"] {
         for suffix in [".exe", ""] {
             let p = target.join(profile).join(format!("{name}{suffix}"));
@@ -256,7 +316,7 @@ fn link_built_exe(src_manifest_dir: &std::path::Path, staged_dir: &std::path::Pa
     if exe_base.is_empty() {
         return;
     }
-    let target = repo_root().join("target");
+    let target = mesa_contract_tests::target_dir();
     for profile in ["debug", "release"] {
         // Windows 必须优先 .exe（无扩展名 Unix 产物在 Windows 下不可执行）；
         // cfg! 运行时分支保证两平台都不产生 unused_mut。

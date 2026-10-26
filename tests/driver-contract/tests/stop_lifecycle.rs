@@ -361,7 +361,7 @@ impl Rig {
             ))),
         ));
         mgr.set_event_services(Arc::clone(&services));
-        let state = mesa_core_api::AppState::try_new_with_control(
+        let state = common::isolated_app_state(
             Arc::clone(&mgr),
             Arc::clone(&store),
             staged.path().to_string_lossy().to_string(),
@@ -369,7 +369,7 @@ impl Rig {
         )
         .unwrap();
         state.set_event_services(services);
-        let app = mesa_core_api::router(state);
+        let app = state.router();
         Self {
             dir,
             store,
@@ -1250,7 +1250,7 @@ impl SettleRig {
             ))),
         ));
         mgr.set_event_services(Arc::clone(&services));
-        let state = mesa_core_api::AppState::try_new_with_control(
+        let state = common::isolated_app_state(
             Arc::clone(&mgr),
             Arc::clone(&store),
             staged.path().to_string_lossy().to_string(),
@@ -1258,14 +1258,14 @@ impl SettleRig {
         )
         .unwrap();
         state.set_event_services(services);
-        let app = mesa_core_api::router(Arc::clone(&state));
+        let app = state.router();
         Self {
             dir,
             store,
             mgr,
             app,
             faults,
-            state,
+            state: Arc::clone(&state),
             _staged: staged,
         }
     }

@@ -3956,17 +3956,79 @@ mod tests {
         assert!(!e.is_session_fatal(), "Remote 不杀 session");
     }
 
-    /// feed `0x24` 请求：count=1（`0x24-only` Gate 冻结形态）。
-    #[test]
-    fn feed_request_single_locked() {
-        use super::super::frame::encode_generic_request as enc;
-        let payload = enc(&[request_subpacket(DEV_CNC, FUNC_FEED, [0, 0, 0, 0, 0])]);
-        // count=1 + 28B = 30 = 0x1e（与 sysinfo 同长，function 换 0x24）。
-        assert_eq!(payload.len(), 0x1e);
-        assert_eq!(&payload[0..2], &[0x00, 0x01]);
-        let back = super::super::frame::decode_generic_payload(&payload).unwrap();
-        assert_eq!(back.len(), 1);
-        assert_eq!(back[0].function, FUNC_FEED);
+    /// 回环直接调用生产 API，实际发出的全部字节必须等于真机捕获。
+    /// 不能在测试里重新拼一份请求再自解码，否则生产参数写错也不会失败。
+    #[tokio::test]
+    async fn production_read_requests_match_captured_frames() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = super::super::fixture_dir();
+        for (operation, group, request, response) in [
+            (
+                "feed",
+                "feed",
+                "feed_request.bin",
+                "feed_response_single.bin",
+            ),
+            (
+                "spindle",
+                "spindle1",
+                "spindle_request_frame.bin",
+                "spindle_response_frame.bin",
+            ),
+            (
+                "macro",
+                "macro1",
+                "macro_request_frame.bin",
+                "macro_response_frame.bin",
+            ),
+            (
+                "param",
+                "param_3411",
+                "param_request_frame.bin",
+                "param_response_frame.bin",
+            ),
+        ] {
+            let read = |group: &str, name: &str| {
+                super::super::read_fixture_bytes(&root.join(group).join(name))
+            };
+            let open_request = read("sysinfo", "open_request.bin");
+            let open_response = read("sysinfo", "open_response.bin");
+            let expected = read(group, request);
+            let reply = read(group, response);
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut open = vec![0; open_request.len()];
+                stream.read_exact(&mut open).await.unwrap();
+                assert_eq!(open, open_request, "{operation}: OPEN 必须同源");
+                stream.write_all(&open_response).await.unwrap();
+                let mut actual = vec![0; expected.len()];
+                stream.read_exact(&mut actual).await.unwrap();
+                assert_eq!(actual, expected, "{operation}: 生产请求必须匹配捕获");
+                stream.write_all(&reply).await.unwrap();
+            });
+            let client = FocasClient::new(Duration::from_secs(5));
+            client.ensure_connected("127.0.0.1", port).await.unwrap();
+            match operation {
+                "feed" => {
+                    client.feed_rate().await.unwrap();
+                }
+                "spindle" => {
+                    client.spindle_speed().await.unwrap();
+                }
+                "macro" => {
+                    client.macro_value(501).await.unwrap();
+                }
+                "param" => {
+                    client.param_value(3411).await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            server.await.unwrap();
+        }
     }
 
     /// feed 响应解码：`00 00 00 64 00 0a 00 00` → mantissa=100/base=10/exp=0。
@@ -4129,24 +4191,6 @@ mod tests {
             exponent: 3,
         };
         assert_eq!(axis_to_value(&pos).unwrap(), Value::I32(-10));
-    }
-
-    /// spindle `0x25` 请求：count=1（Evidence S0~S4 冻结形态：
-    /// `device=1/path=1/args=[0,0,0,0]/aux=0`，逐字节恒定，无 selector）。
-    #[test]
-    fn spindle_request_single_locked() {
-        use super::super::frame::encode_generic_request as enc;
-        let payload = enc(&[request_subpacket(
-            DEV_CNC,
-            FUNC_SPINDLE_SPEED,
-            [0, 0, 0, 0, 0],
-        )]);
-        // count=1 + 28B = 30 = 0x1e（与 sysinfo/feed/axis 同长，function 换 0x25）。
-        assert_eq!(payload.len(), 0x1e);
-        assert_eq!(&payload[0..2], &[0x00, 0x01]);
-        let back = decode_generic_payload(&payload).unwrap();
-        assert_eq!(back.len(), 1);
-        assert_eq!(back[0].function, FUNC_SPINDLE_SPEED);
     }
 
     /// spindle S1 响应解码：`00 00 01 f4 00 0a 00 00` → mantissa=500。
@@ -4377,20 +4421,6 @@ mod tests {
                 "axis={axis} 必须 Unsupported（不发包）"
             );
         }
-    }
-
-    /// macro `0x15` 请求：count=1（Evidence M0~M3 冻结形态：
-    /// `args=[number,number,0,0]/aux=0`，单点语义，不做范围读）。
-    #[test]
-    fn macro_request_single_locked() {
-        use super::super::frame::encode_generic_request as enc;
-        let payload = enc(&[request_subpacket(DEV_CNC, FUNC_MACRO, [501, 501, 0, 0, 0])]);
-        // count=1 + 28B = 30 = 0x1e（与 sysinfo/feed/axis/spindle 同长）。
-        assert_eq!(payload.len(), 0x1e);
-        assert_eq!(&payload[0..2], &[0x00, 0x01]);
-        let back = decode_generic_payload(&payload).unwrap();
-        assert_eq!(back.len(), 1);
-        assert_eq!(back[0].function, FUNC_MACRO);
     }
 
     /// macro M1 响应解码：`0e e6 b2 80 00 0a 00 07` → mantissa=250000000。
@@ -5698,24 +5728,6 @@ mod tests {
         );
     }
 
-    /// param `0x8D` 请求：count=1（Evidence Q0/Q3/6711 冻结形态：
-    /// `args=[number,number,0,0]/aux=0`，单点语义，不做范围/axis）。
-    #[test]
-    fn param_request_single_locked() {
-        use super::super::frame::encode_generic_request as enc;
-        let payload = enc(&[request_subpacket(
-            DEV_CNC,
-            FUNC_PARAM,
-            [3410, 3410, 0, 0, 0],
-        )]);
-        // count=1 + 28B = 30 = 0x1e（与 CNC 系同长，function 换 0x8D）。
-        assert_eq!(payload.len(), 0x1e);
-        assert_eq!(&payload[0..2], &[0x00, 0x01]);
-        let back = decode_generic_payload(&payload).unwrap();
-        assert_eq!(back.len(), 1);
-        assert_eq!(back[0].function, FUNC_PARAM);
-    }
-
     /// param Q3 响应解码：datano=3411 + value=0 + identity tail → `I32(0)`。
     /// Q0（`00 0a 00 03`）不在此列——它走负 evidence（见下），不 admit。
     #[test]
@@ -6236,47 +6248,38 @@ mod tests {
         assert_eq!(r.records[1].numeric.raw, 560);
     }
 
-    /// B1 数量合同：`N=min(num_in, before, after)`。
-    /// num_in=2, before=1, after=1 → 只返回 1 条（不伪造第二条）。
+    /// 返回数量取请求上限与前后计数的最小值，不能伪造剩余记录。
     #[test]
     fn servo_load_count_min_locked() {
-        let names = b"X\0\0\0Y\0\0\0";
-        let mut vals = load_elem_bytes(-270, [0x00, 0x00], 1);
-        vals.extend_from_slice(&load_elem_bytes(560, [0x00, 0x00], 1));
-        let frame = FocasFrame {
-            origin: 0x0003,
-            packet_type: PacketType::GENERIC_RESPONSE,
-            payload: encode_generic_request(&[
-                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
-                load_slot(super::CMD_SERVO_LOAD_NAMES, 0, names),
-                load_slot(super::CMD_SERVO_LOAD, 0, &vals),
-                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x01]),
-            ]),
-        };
-        let r = super::decode_servo_load_new(&frame, 2).unwrap();
-        assert_eq!(r.records.len(), 1);
-        assert_eq!(r.records[0].axis_raw, [b'X', 0, 0]);
-    }
-
-    /// B1 数量合同：`num_in=4, before=3, after=2` → 返回 2 条。
-    #[test]
-    fn servo_load_count_min_4_3_2_locked() {
-        let names = b"X\0\0\0Y\0\0\0Z\0\0\0";
-        let mut vals = load_elem_bytes(100, [0x00, 0x00], 1);
-        vals.extend_from_slice(&load_elem_bytes(200, [0x00, 0x00], 1));
-        vals.extend_from_slice(&load_elem_bytes(300, [0x00, 0x00], 1));
-        let frame = FocasFrame {
-            origin: 0x0003,
-            packet_type: PacketType::GENERIC_RESPONSE,
-            payload: encode_generic_request(&[
-                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x03]),
-                load_slot(super::CMD_SERVO_LOAD_NAMES, 0, names),
-                load_slot(super::CMD_SERVO_LOAD, 0, &vals),
-                load_slot(super::CMD_LOAD_HEAD, 0, &[0x00, 0x02]),
-            ]),
-        };
-        let r = super::decode_servo_load_new(&frame, 4).unwrap();
-        assert_eq!(r.records.len(), 2);
+        for (num_in, before, after, values, expected, first_raw) in [
+            (2, 1u16, 1u16, vec![-270, 560], 1, 270),
+            (4, 3, 2, vec![100, 200, 300], 2, 100),
+        ] {
+            let names = b"X\0\0\0Y\0\0\0Z\0\0\0";
+            let vals: Vec<u8> = values
+                .iter()
+                .flat_map(|raw| load_elem_bytes(*raw, [0x00, 0x00], 1))
+                .collect();
+            let frame = FocasFrame {
+                origin: 0x0003,
+                packet_type: PacketType::GENERIC_RESPONSE,
+                payload: encode_generic_request(&[
+                    load_slot(super::CMD_LOAD_HEAD, 0, &before.to_be_bytes()),
+                    load_slot(super::CMD_SERVO_LOAD_NAMES, 0, &names[..values.len() * 4]),
+                    load_slot(super::CMD_SERVO_LOAD, 0, &vals),
+                    load_slot(super::CMD_LOAD_HEAD, 0, &after.to_be_bytes()),
+                ]),
+            };
+            let r = super::decode_servo_load_new(&frame, num_in).unwrap();
+            assert_eq!(
+                r.records.len(),
+                expected,
+                "counts=({num_in}, {before}, {after})"
+            );
+            assert_eq!(r.records[0].axis_raw, [b'X', 0, 0]);
+            // 伺服负载沿用 Native ABI 的绝对值语义，不能套用主轴负载的符号规则。
+            assert_eq!(r.records[0].numeric.raw, first_raw);
+        }
     }
 
     /// B1 数量合同：`before=0` → 空记录（不伪造有效负载）。

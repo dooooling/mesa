@@ -1,14 +1,8 @@
 //! 辅助进程：模拟 Core，拉起 Driver 并持有 Job/Session，待外层测试杀死本进程以验证孤儿防护。
 use std::path::PathBuf;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-}
-
 fn test_driver_exe() -> PathBuf {
-    let target = repo_root().join("target");
+    let target = mesa_contract_tests::target_dir();
     for profile in ["debug", "release"] {
         for name in ["mesa-test-driver.exe", "mesa-test-driver"] {
             let p = target.join(profile).join(name);

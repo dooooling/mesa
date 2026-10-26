@@ -72,6 +72,7 @@ jobs:
     uses: ./.github/workflows/_rust-stress.yml
     with:
       runs-on: windows-latest
+      repeat-all: true
 
   rust-perf:
     needs: [plan]

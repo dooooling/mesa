@@ -166,15 +166,11 @@ async fn rest_app() -> (axum::Router, Arc<Snapshot>) {
     let drivers_dir = repo_root().join("drivers");
     let cfg = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
-    let state = mesa_core_api::AppState::try_new_with_control(
-        mgr,
-        cfg,
-        drivers_dir.to_string_lossy().to_string(),
-        false,
-    )
-    .unwrap();
+    let state =
+        common::isolated_app_state(mgr, cfg, drivers_dir.to_string_lossy().to_string(), false)
+            .unwrap();
     let snapshot = state.snapshot.clone();
-    (mesa_core_api::router(state), snapshot)
+    (state.router(), snapshot)
 }
 
 async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {

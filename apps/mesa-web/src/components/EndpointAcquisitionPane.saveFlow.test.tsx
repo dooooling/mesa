@@ -1,22 +1,13 @@
-// 采集页第 1 步（状态与保存流程）门禁 —— 第 2 步（页面交互）后的版本。
-//
-// 覆盖评审稿的六项交付里可直接观测的行为：
-// 1. 运行态三态：加载失败 / 切换连接 ⇒ unknown，**不沿用**旧值、不当成「已停止」；
-// 2. unknown ⇒ 禁止任何保存（含只写配置），绕过 disabled 也不发任何请求；
-// 3. 保存前重新确认运行状态：不一致 ⇒ 中止、不发 stop/PUT/start，由用户再次点击；
-// 4. 成功 = 回读与**完整提交配置**一致；回读不一致 ⇒「保存结果待核对」，
-//    不报成功、不刷新基线、不自动重新 PUT；
-// 5. 配置已保存但启动失败 ⇒ 草稿标记清除，只重试启动（不重复整套保存）；
-// 6. 稳定 rowId：编辑/删除/新增后同一行的 data-row-id 不变，删除的号不复用。
-//
-// 第 2 步只改「入口位置与查询方式」：无修改时保存区**不渲染**（不是禁用），
-// 添加/编辑走抽屉，移除走行内「⋯ → 移除」。
+// 采集状态、行身份与回读恢复：
+// - 切换或刷新连接时不沿用旧运行状态；
+// - 编辑/删除/新增不重排或复用 rowId；
+// - 回读失败或完整配置不一致时，保留草稿与基线，重新核对成功后才结束待核对。
+// 保存守卫、状态复核和启动重试的请求与界面断言统一由 requestOrder 覆盖。
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { message } from "antd";
 import { EndpointAcquisitionPane, type NckDefinitionMap } from "./EndpointAcquisitionPane";
-import { invokeDisabledButton } from "../test/bypassDisabled";
 import { NCK_POINTS_KIND, type AcquisitionTaskShape, type NckPointSelection } from "../deviceModel";
 
 const NCK_DRIVER = "sinumerik-nck";
@@ -237,42 +228,6 @@ afterEach(() => {
 });
 
 describe("交付 1/2：运行态三态与「未知禁止保存」", () => {
-  it("运行态读取失败 ⇒ unknown（不是已停止），绕过 disabled 也不发任何请求", async () => {
-    const state = mkState({
-      endpointStates: ["fail"],
-      tasks: [nckTask([point("syn.collect.a", 1)])],
-    });
-    installFetch(state);
-    renderPane();
-
-    // 三态：读不到 ⇒ 状态未知，绝不推断成「已停止」。
-    expect(await screen.findByTestId("acquisition-run-state-unknown")).toBeTruthy();
-    expect(screen.getByTestId("acquisition-status-state").textContent).toBe("状态未知");
-    expect(screen.getByTestId("refresh-run-state")).toBeTruthy();
-    // 草稿仍可编辑（点位行照常渲染）；等任务快照就绪后再验证提交函数守卫。
-    expect(screen.getByTestId("nck-point-row")).toBeTruthy();
-    await changeInterval(2000);
-
-    // 有修改 ⇒ 保存区出现，但按钮禁用且只提供「刷新状态」。
-    const save = (await screen.findByTestId("apply-button")) as HTMLButtonElement;
-    expect(save.disabled).toBe(true);
-    expect(screen.getByTestId("save-bar-refresh-state")).toBeTruthy();
-    const before = fetchCalls().length;
-    // 绕过 disabled：提交函数自身的守卫必须拦住，且**一个请求都不发**。
-    expect(invokeDisabledButton(save)).toBe(true);
-    await act(async () => {});
-    expect(fetchCalls().length).toBe(before);
-    expect(writeCalls()).toEqual([]);
-    expect(state.putBodies).toHaveLength(0);
-    expect(state.stopCalls).toBe(0);
-    expect(state.startCalls).toBe(0);
-    // 提示必须说明「已禁用保存」，并保留刷新入口。
-    await waitFor(() =>
-      expect(document.querySelector(".ant-message")?.textContent ?? "").toContain(
-        "运行状态未知",
-      ),
-    );
-  });
 
   it("加载失败后不沿用旧状态：切到新连接时旧 RUNNING 不得变成「已停止」", async () => {
     const state = mkState({
@@ -339,43 +294,6 @@ describe("交付 1/2：运行态三态与「未知禁止保存」", () => {
   });
 });
 
-describe("交付 2（追加）：保存前重新确认运行状态", () => {
-  it("复核发现状态变化 ⇒ 中止本次保存（不发 stop/PUT/start），再次点击才执行", async () => {
-    const user = userEvent.setup();
-    const state = mkState({
-      // 加载时 RUNNING；保存复核时已变成 STOPPED（第三方操作）。
-      endpointStates: ["RUNNING", "STOPPED"],
-      tasks: [nckTask([point("syn.collect.a", 1)])],
-    });
-    installFetch(state);
-    renderPane();
-    await waitFor(() =>
-      expect(screen.getByTestId("acquisition-status-state").textContent).toBe("运行中"),
-    );
-    await changeInterval(2000);
-    await waitFor(() => expect(saveButton().disabled).toBe(false));
-    await user.click(saveButton());
-
-    // 中止：没有任何写请求；界面以新状态为准。
-    const outcome = await screen.findByTestId("save-outcome");
-    expect(outcome.getAttribute("data-kind")).toBe("state-changed");
-    expect(outcome.textContent).toContain("本次保存未执行");
-    expect(writeCalls()).toEqual([]);
-    expect(state.putBodies).toHaveLength(0);
-    await waitFor(() =>
-      expect(screen.getByTestId("acquisition-status-state").textContent).toBe("已停止"),
-    );
-
-    // 用户再次点击：这次状态一致（STOPPED），按已停止路径只写配置。
-    await waitFor(() => expect(saveButton().disabled).toBe(false));
-    await user.click(saveButton());
-    await waitFor(() => expect(state.putBodies).toHaveLength(1));
-    expect(state.stopCalls).toBe(0);
-    expect(state.startCalls).toBe(0);
-    const result = await screen.findByTestId("apply-result");
-    expect(result.textContent).toContain("配置已保存");
-  });
-});
 
 describe("交付 3：稳定 rowId（编辑/删除/新增后同一行身份不变）", () => {
   it("编辑不改 rowId；删除不重排；新增不复用旧号", async () => {
@@ -503,85 +421,5 @@ describe("交付 4/5：完整配置回读与基线更新", () => {
     expect(screen.getByTestId("draft-save-notice").textContent).toContain("保存结果待核对");
   });
 
-  it("周期是唯一变更也必须发请求（点位相同）", async () => {
-    const user = userEvent.setup();
-    const p = point("syn.collect.a", 1);
-    const state = mkState({ tasks: [nckTask([p], 1000)] });
-    installFetch(state);
-    renderPane();
-    await waitVerified(1);
-    expect(screen.queryByTestId("apply-button")).toBeNull();
-    await changeInterval(500);
-    await waitFor(() => expect(saveButton().disabled).toBe(false));
-    await user.click(saveButton());
-    await waitFor(() => expect(state.putBodies).toHaveLength(1));
-    const sent = state.putBodies[0][0];
-    expect(sent.schedule).toEqual({ mode: "poll", interval_ms: 500 });
-    // 点位逐字不变：证明差异判定包含周期，而不是只比点位。
-    const sentPoints = (sent.binding.config as { points: NckPointSelection[] }).points;
-    expect(sentPoints).toEqual([p]);
-  });
 
-  it("保存后基线整份刷新：无修改时保存区收起、不再发 PUT", async () => {
-    const user = userEvent.setup();
-    const state = mkState({ tasks: [nckTask([point("syn.collect.a", 1)], 1000)] });
-    installFetch(state);
-    renderPane();
-    await changeInterval(2000);
-    await waitFor(() => expect(saveButton().disabled).toBe(false));
-    await user.click(saveButton());
-    await waitFor(() => expect(state.putBodies).toHaveLength(1));
-    await screen.findByTestId("apply-result");
-
-    // 基线已刷新为「周期 2000 + 同一点位」⇒ 无实际修改：保存动作收起，
-    // 只剩一次简短结果行（不再有待保存摘要与按钮）。
-    await waitFor(() => expect(screen.queryByTestId("apply-button")).toBeNull());
-    expect(screen.queryByTestId("discard-draft")).toBeNull();
-    expect(screen.queryByTestId("draft-save-summary")).toBeNull();
-    expect(state.putBodies).toHaveLength(1);
-  });
 });
-
-describe("交付 6：配置已保存但启动失败 ⇒ 只重试启动", () => {
-  it("启动失败后重试只调用 start（不 stop、不重复 PUT）", async () => {
-    const user = userEvent.setup();
-    const state = mkState({
-      endpointStates: ["RUNNING"],
-      tasks: [nckTask([point("syn.collect.a", 1)])],
-      startOk: false,
-    });
-    installFetch(state);
-    renderPane();
-    await waitFor(() =>
-      expect(screen.getByTestId("acquisition-status-state").textContent).toBe("运行中"),
-    );
-    await changeInterval(2000);
-    await waitFor(() => expect(saveButton().disabled).toBe(false));
-    await user.click(saveButton());
-
-    // 回读一致 ⇒ 基线已刷新（草稿标记清除），但启动失败：保存区转为结果态。
-    await waitFor(() =>
-      expect(screen.getByTestId("acquisition-status-interval").textContent).toBe("2000 ms（已保存）"),
-    );
-    const notice = await screen.findByTestId("draft-save-notice");
-    expect(notice.textContent).toContain("配置已保存，但恢复采集失败");
-    expect(screen.getByTestId("retry-start")).toBeTruthy();
-    expect(state.stopCalls).toBe(1);
-    expect(state.putBodies).toHaveLength(1);
-    expect(state.startCalls).toBe(1);
-
-    // 重试启动：只调用 start。
-    state.startOk = true;
-    await user.click(screen.getByTestId("retry-start"));
-    await waitFor(() =>
-      expect(screen.getByTestId("acquisition-status-state").textContent).toBe("运行中"),
-    );
-    expect(state.stopCalls).toBe(1);
-    expect(state.putBodies).toHaveLength(1);
-    expect(state.startCalls).toBe(2);
-    // 结果态收起：不再有重试入口与保存按钮，只留一次成功结果。
-    await waitFor(() => expect(screen.queryByTestId("retry-start")).toBeNull());
-    expect(screen.queryByTestId("apply-button")).toBeNull();
-  });
-});
-

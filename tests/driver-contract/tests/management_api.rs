@@ -8,6 +8,35 @@ use mesa_config_store::ConfigStore;
 use std::sync::Arc;
 use tower::ServiceExt;
 
+/// 同进程的两个装配也不能共享证书；Router 的存活期必须覆盖证书目录的存活期。
+#[tokio::test]
+async fn isolated_rest_fixtures_keep_certificates_until_router_drop() {
+    let staged = common::staged_drivers_with_test_driver();
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(staged.path()));
+    let make_state = || {
+        common::isolated_app_state(
+            Arc::clone(&mgr),
+            Arc::new(ConfigStore::open_in_memory().unwrap()),
+            staged.path().to_string_lossy().to_string(),
+            false,
+        )
+        .unwrap()
+    };
+    let first = make_state();
+    let second = make_state();
+    let first_dir = first.cert_dir().to_path_buf();
+    assert_ne!(first_dir, second.cert_dir());
+    for state in [&first, &second] {
+        assert!(state.cert_dir().join("own/own.der").is_file());
+        assert!(state.cert_dir().join("own/own.key").is_file());
+    }
+    let router = first.router();
+    drop(first);
+    assert!(first_dir.exists(), "Router 仍在使用证书目录");
+    drop(router);
+    assert!(!first_dir.exists(), "最后一个 Router 释放后必须清理目录");
+}
+
 async fn app() -> (
     axum::Router,
     Arc<mesa_driver_manager::MesaManager>,
@@ -31,14 +60,14 @@ async fn app_with_control(
     let staged = common::staged_drivers_with_test_driver();
     let drivers_dir = staged.path().clone();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
-    let state = mesa_core_api::AppState::try_new_with_control(
+    let state = common::isolated_app_state(
         mgr.clone(),
         store,
         drivers_dir.to_string_lossy().to_string(),
         enable_control,
     )
     .unwrap();
-    let router = mesa_core_api::router(state);
+    let router = state.router();
     (router, mgr, staged)
 }
 
@@ -291,7 +320,7 @@ async fn control_command_business_failure_is_not_violation() {
     let _staged = common::staged_drivers_with_test_driver();
     let drivers_dir = _staged.path().clone();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
-    let state = mesa_core_api::AppState::try_new_with_control(
+    let state = common::isolated_app_state(
         mgr.clone(),
         store.clone(),
         drivers_dir.to_string_lossy().to_string(),
@@ -329,7 +358,7 @@ async fn control_command_business_failure_is_not_violation() {
             }],
         )
         .unwrap();
-    let app = mesa_core_api::router(state);
+    let app = state.router();
     mgr.start_endpoint(mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: "e1".into(),
         driver_id: "test-driver".into(),
@@ -401,7 +430,7 @@ async fn control_running_e2e_write_command_visible_in_samples() {
     let _staged = common::staged_drivers_with_test_driver();
     let drivers_dir = _staged.path().clone();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
-    let state = mesa_core_api::AppState::try_new_with_control(
+    let state = common::isolated_app_state(
         mgr.clone(),
         store.clone(),
         drivers_dir.to_string_lossy().to_string(),
@@ -435,7 +464,7 @@ async fn control_running_e2e_write_command_visible_in_samples() {
         },
     };
     store.replace_tasks("e1", &[task]).unwrap();
-    let app = mesa_core_api::router(state);
+    let app = state.router();
     // STOPPED 写即 409（ENDPOINT_NOT_RUNNING）
     let (s, _) = post_json(
         app.clone(),
@@ -533,7 +562,7 @@ async fn control_running_e2e_broadcast_isolation_and_write_without_acquire() {
     let _staged = common::staged_drivers_with_test_driver();
     let drivers_dir = _staged.path().clone();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
-    let state = mesa_core_api::AppState::try_new_with_control(
+    let state = common::isolated_app_state(
         mgr.clone(),
         store.clone(),
         drivers_dir.to_string_lossy().to_string(),
@@ -573,7 +602,7 @@ async fn control_running_e2e_broadcast_isolation_and_write_without_acquire() {
             &[mk_task("t1", "a", "w.a"), mk_task("t2", "b", "w.b")],
         )
         .unwrap();
-    let app = mesa_core_api::router(state);
+    let app = state.router();
     mgr.start_endpoint(mesa_driver_manager::endpoint::BuiltinEndpoint {
         endpoint_id: "e1".into(),
         driver_id: "test-driver".into(),
@@ -1465,14 +1494,14 @@ async fn app_for_connection_check() -> (
     let staged = common::staged_drivers_with_test_driver();
     let drivers_dir = staged.path().clone();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
-    let state = mesa_core_api::AppState::try_new_with_control(
+    let state = common::isolated_app_state(
         mgr.clone(),
         Arc::clone(&store),
         drivers_dir.to_string_lossy().to_string(),
         false,
     )
     .unwrap();
-    (mesa_core_api::router(state), store, mgr, staged)
+    (state.router(), store, mgr, staged)
 }
 
 /// 持久化面快照：connection_json / endpoint_secrets / desired_running /
@@ -1803,14 +1832,10 @@ async fn connection_check_secret_store_failure_is_503() {
     let staged = common::staged_drivers_with_test_driver();
     let drivers_dir = staged.path().clone();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
-    let state = mesa_core_api::AppState::try_new_with_control(
-        mgr,
-        store,
-        drivers_dir.to_string_lossy().to_string(),
-        false,
-    )
-    .unwrap();
-    let app = mesa_core_api::router(state);
+    let state =
+        common::isolated_app_state(mgr, store, drivers_dir.to_string_lossy().to_string(), false)
+            .unwrap();
+    let app = state.router();
 
     let (s, v) = post_json(
         app,
@@ -2423,14 +2448,10 @@ async fn connection_check_probe_persisted_connection_invalid_is_503() {
     let staged = common::staged_drivers_with_test_driver();
     let drivers_dir = staged.path().clone();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
-    let state = mesa_core_api::AppState::try_new_with_control(
-        mgr,
-        store,
-        drivers_dir.to_string_lossy().to_string(),
-        false,
-    )
-    .unwrap();
-    let app = mesa_core_api::router(state);
+    let state =
+        common::isolated_app_state(mgr, store, drivers_dir.to_string_lossy().to_string(), false)
+            .unwrap();
+    let app = state.router();
 
     // ① 草稿省略 password ⇒ 需要继承 ⇒ 已保存记录损坏必须 fail-closed（503）。
     let cap = tmp.file("must-not-exist.json");
@@ -2643,14 +2664,14 @@ async fn c3e_full_chain_offline_save_probe_start_data_stop() {
             &store,
         ))),
     ));
-    let state = mesa_core_api::AppState::try_new_with_control(
+    let state = common::isolated_app_state(
         Arc::clone(&mgr),
         Arc::clone(&store),
         drivers_dir.to_string_lossy().to_string(),
         false,
     )
     .unwrap();
-    let app = mesa_core_api::router(state);
+    let app = state.router();
     warm_descriptor(&app, "test-driver").await;
 
     // === 段 1：零采集点离线保存（C3-02 创建半条 + C3-01 的零 Probe/零 Start） ===
@@ -3091,14 +3112,14 @@ async fn c3e_unreachable_device_offline_save_is_zero_probe_and_zero_start() {
             &store,
         ))),
     ));
-    let state = mesa_core_api::AppState::try_new_with_control(
+    let state = common::isolated_app_state(
         Arc::clone(&mgr),
         Arc::clone(&store),
         drivers_dir.to_string_lossy().to_string(),
         false,
     )
     .unwrap();
-    let app = mesa_core_api::router(state);
+    let app = state.router();
     warm_descriptor(&app, "test-driver").await;
 
     // ① 夹具注入的不可达设备：离线保存必须成功，且全程不接触设备。
@@ -3248,14 +3269,10 @@ async fn definitions_app(
     let staged = common::staged_definitions_fixture(modes);
     let dir = staged.path().clone();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&dir));
-    let state = mesa_core_api::AppState::try_new_with_control(
-        mgr.clone(),
-        store,
-        dir.to_string_lossy().to_string(),
-        false,
-    )
-    .unwrap();
-    (mesa_core_api::router(state), mgr, staged)
+    let state =
+        common::isolated_app_state(mgr.clone(), store, dir.to_string_lossy().to_string(), false)
+            .unwrap();
+    (state.router(), mgr, staged)
 }
 
 fn catalog_uri(driver_id: &str) -> String {
@@ -3883,14 +3900,10 @@ async fn definition_queries_do_not_disturb_running_acquisition() {
     let staged = common::staged_definitions_fixture_with_test_driver(&["slow"]);
     let dir = staged.path().clone();
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&dir));
-    let state = mesa_core_api::AppState::try_new_with_control(
-        mgr.clone(),
-        store,
-        dir.to_string_lossy().to_string(),
-        false,
-    )
-    .unwrap();
-    let app = mesa_core_api::router(state);
+    let state =
+        common::isolated_app_state(mgr.clone(), store, dir.to_string_lossy().to_string(), false)
+            .unwrap();
+    let app = state.router();
 
     let task = AcquisitionTask {
         id: "t-a5".into(),

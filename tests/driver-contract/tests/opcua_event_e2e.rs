@@ -341,16 +341,18 @@ async fn opcua_native_rows_visible_via_rest() {
     let cfg_store = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
     let mgr = Arc::new(mgr);
     #[allow(deprecated)]
-    let state = mesa_core_api::AppState::new(
+    let state = common::isolated_app_state(
         mgr.clone(),
         cfg_store,
         drivers_dir.to_string_lossy().to_string(),
-    );
+        false,
+    )
+    .expect("isolated AppState");
     state.set_event_services(EventServices::new(
         store.clone(),
         EventHub::new(EVENT_HUB_CAPACITY),
     ));
-    let app = mesa_core_api::router(state);
+    let app = state.router();
     let req = Request::builder()
         .uri("/api/v1/events?endpoint_id=ct-opcua-evt")
         .body(Body::empty())

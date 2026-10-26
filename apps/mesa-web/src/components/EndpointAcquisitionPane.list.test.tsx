@@ -1,4 +1,5 @@
-// 238 点离线夹具的页面验收（§5.2 的 1–5、7、8、11 项）。
+// 列表草稿与错误处理：规模相关行为由 acceptance 中的 238 点链路覆盖，
+// 此处用两个原生点位与三个语义点位验证交互，避免每个独立行为都核验完整目录。
 //
 // 全部为**离线/前端**验收：不启动服务、不连真机、不改配置；判定全部可机械核实
 // （计数、页码、滚动位置、请求次数、文案）。
@@ -9,6 +10,7 @@ import { message } from "antd";
 import { EndpointAcquisitionPane } from "./EndpointAcquisitionPane";
 import {
   buildAcquisition238,
+  SEMANTIC_DEFINITIONS,
   semanticPointKey,
   type AcquisitionFixture238,
 } from "../test/acquisitionFixture238";
@@ -32,8 +34,14 @@ interface MockState {
 }
 
 function mkState(overrides: Partial<MockState> = {}): MockState {
+  const fixture = buildAcquisition238();
+  const points = fixture.points.filter((point, index) => index < 2 || point.kind === "nck_variable");
   return {
-    fixture: buildAcquisition238(),
+    fixture: {
+      ...fixture,
+      points,
+      task: { ...fixture.task, binding: { ...fixture.task.binding, config: { points } } },
+    },
     selectionMethods: ["manual", "browse"],
     putBodies: [],
     ...overrides,
@@ -95,13 +103,13 @@ function renderPane() {
       endpointId={EP}
       driverId={NCK_DRIVER}
       onChanged={() => {}}
-      nckDefinitions={buildAcquisition238().definitions}
+      nckDefinitions={SEMANTIC_DEFINITIONS}
     />,
   );
 }
 
-/** 等 238 点全部核验落定（行锚点，不靠绿色标签）。 */
-async function waitAllVerified(total = 238) {
+/** 等小夹具的全部点位核验落定（行锚点，不靠绿色标签）。 */
+async function waitAllVerified(total: number) {
   // 只有当前页渲染在 DOM 里；用「总数」锚点在分页信息上，核验结果看行属性。
   await waitFor(() =>
     expect(screen.getByTestId("point-table-pagination").textContent).toContain(String(total)),
@@ -121,164 +129,13 @@ afterEach(() => {
   message.destroy();
 });
 
-describe("验收 1：正常首屏安静（无标签墙 / 无教程 / 无逐行绿标 / 无无关警告）", () => {
-  it("first_screen_is_quiet_and_only_renders_one_page", async () => {
-    const state = mkState();
-    installFetch(state);
-    renderPane();
-    await waitAllVerified(238);
-
-    // Alert 数 = 0（正常夹具：加载成功、配置完整、身份核验通过）。
-    expect(document.querySelectorAll(".ant-alert").length).toBe(0);
-    // 无逐行绿色「校验通过」标签、无标签墙、无教程/流程说明。
-    expect(document.body.textContent).not.toContain("校验通过");
-    expect(screen.queryByTestId("nck-collectable-summary")).toBeNull();
-    expect(screen.queryByTestId("nck-catalog-meta")).toBeNull();
-    expect(document.body.textContent).not.toContain("选择变量 → 填写必要参数");
-    // 238 行不同时渲染：只渲染 25 行（分页 10 页）。
-    expect(screen.getAllByTestId("nck-point-row")).toHaveLength(25);
-    const pagination = screen.getByTestId("point-table-pagination").textContent ?? "";
-    expect(pagination).toContain("共 238 项");
-    expect(pagination).toContain("第 1 / 10 页");
-    // 无修改时保存区完全不渲染。
-    expect(screen.queryByTestId("draft-save-bar")).toBeNull();
-    // 三列表头（名称或标识 / 配置摘要 / 操作）。
-    const headers = screen.getAllByRole("columnheader").map((el) => el.textContent);
-    expect(headers).toEqual(["名称或标识", "配置摘要", "操作"]);
-  });
-
-  it("page_size_can_switch_to_50_and_100", async () => {
-    const user = userEvent.setup();
-    const state = mkState();
-    installFetch(state);
-    renderPane();
-    await waitAllVerified(238);
-
-    await user.click(screen.getByTestId("page-size-50"));
-    await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(50));
-    expect(screen.getByTestId("point-table-pagination").textContent).toContain("第 1 / 5 页");
-
-    await user.click(screen.getByTestId("page-size-100"));
-    await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(100));
-    expect(screen.getByTestId("point-table-pagination").textContent).toContain("第 1 / 3 页");
-
-    // 切回默认 25 项/页。
-    await user.click(screen.getByTestId("page-size-25"));
-    await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(25));
-    expect(screen.getByTestId("point-table-pagination").textContent).toContain("第 1 / 10 页");
-  });
-});
-
-describe("验收 2：238 点搜索直达（名称 / 地址片段 / 标识片段）", () => {
-  it("search_by_name_address_and_identifier_lands_on_page_one", async () => {
-    const user = userEvent.setup();
-    const state = mkState();
-    installFetch(state);
-    renderPane();
-    await waitAllVerified(238);
-
-    // 先翻到第 2 页，证明搜索会把结果带回第 1 页。
-    await user.click(within(screen.getByTestId("point-table-pagination")).getByTitle("2"));
-    await waitFor(() =>
-      expect(screen.getByTestId("point-table-pagination").textContent).toContain("第 2 / 10 页"),
-    );
-
-    // 名称：轴实际位置
-    fireEvent.change(screen.getByTestId("point-search"), { target: { value: "轴实际位置" } });
-    await waitFor(() => expect(screen.getByTestId("point-table-pagination").textContent).toContain("第 1 / 1 页"));
-    let rows = screen.getAllByTestId("nck-point-row");
-    expect(rows).toHaveLength(1);
-    expect(within(rows[0]!).getByTestId("point-row-title").textContent).toBe("轴实际位置");
-
-    // 地址片段：区域 C · 区域号 1 · 模块 122（原生点位的带标签地址）
-    fireEvent.change(screen.getByTestId("point-search"), {
-      target: { value: "区域 C · 区域号 1 · 模块 122" },
-    });
-    await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(1));
-    rows = screen.getAllByTestId("nck-point-row");
-    expect(within(rows[0]!).getByTestId("point-row-summary").textContent).toContain(
-      "区域 C · 区域号 1 · 模块 122 · 列 1 · 行 1",
-    );
-
-    // 标识片段：native.C.1.122（完整点键只在技术详情，但必须可搜）
-    fireEvent.change(screen.getByTestId("point-search"), { target: { value: "native.C.1.122" } });
-    await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(1));
-
-    // 不存在串 ⇒ 空态提示（不是一张空表）。
-    fireEvent.change(screen.getByTestId("point-search"), { target: { value: "不存在的点位" } });
-    const empty = await screen.findByTestId("point-table-empty");
-    expect(empty.textContent).toContain("没有匹配的点位，可改用标识搜索");
-    expect(screen.queryAllByTestId("nck-point-row")).toHaveLength(0);
-    // 清除搜索回到完整列表。
-    await user.click(screen.getByTestId("clear-point-search"));
-    await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(25));
-  });
-});
-
-describe("验收 3：第 10 页编辑后位置不变", () => {
-  it("editing_on_last_page_keeps_page_and_scroll", async () => {
-    const user = userEvent.setup();
-    const state = mkState();
-    installFetch(state);
-    renderPane();
-    await waitAllVerified(238);
-
-    const pagination = screen.getByTestId("point-table-pagination");
-    await user.click(within(pagination).getByTitle("10"));
-    await waitFor(() => expect(pagination.textContent).toContain("第 10 / 10 页"));
-
-    // 记录滚动位置（列表区自带滚动容器，位置必须保持）。
-    const scroller = screen.getByTestId("point-list-scroll");
-    scroller.scrollTop = 240;
-
-    const targetRow = screen
-      .getAllByTestId("nck-point-row")
-      .find((row) => (row.textContent ?? "").includes("轴实际位置"))!;
-    await user.click(within(targetRow).getByTestId("point-row-edit"));
-    const input = await screen.findByLabelText("target-channel");
-    await user.clear(input);
-    await user.type(input, "3");
-    await waitFor(() =>
-      expect(screen.getByTestId("nck-point-key").textContent).toBe(
-        semanticPointKey("axis.position.actual_bcs", { axis: 1, channel: 3 }),
-      ),
-    );
-    await user.click(screen.getByTestId("nck-add-point"));
-
-    // 仍停在第 10 页，滚动位置一致（不需要回到顶部）。
-    await waitFor(() => expect(pagination.textContent).toContain("第 10 / 10 页"));
-    expect(screen.getByTestId("point-list-scroll").scrollTop).toBe(240);
-    // 该行标记「已修改」，保存区出现。
-    const marked = screen
-      .getAllByTestId("nck-point-row")
-      .find((row) => (row.textContent ?? "").includes("轴实际位置"))!;
-    expect(within(marked).getByTestId("point-row-status").textContent).toContain("已修改");
-    expect(screen.getByTestId("draft-save-bar")).toBeTruthy();
-  });
-});
-
-describe("验收 4：未操作时不报字段级错误", () => {
-  it("no_field_errors_when_nothing_is_touched", async () => {
-    const state = mkState();
-    installFetch(state);
-    renderPane();
-    await waitAllVerified(238);
-    // 抽屉未打开时页面没有任何字段级错误。
-    expect(document.querySelectorAll(".ant-form-item-explain-error").length).toBe(0);
-    expect(document.querySelectorAll('[data-testid="nck-form-issues"]').length).toBe(0);
-    expect(document.body.textContent).not.toContain("FORM_MODEL_INVALID");
-    // 也未打开添加/编辑抽屉。
-    expect(screen.queryByTestId("nck-variable-select")).toBeNull();
-  });
-});
-
 describe("验收 6/8：变更摘要措辞与「抵消 / 恢复原值」", () => {
   it("summary_separates_point_changes_from_interval_change", async () => {
     const user = userEvent.setup();
     const state = mkState();
     installFetch(state);
     renderPane();
-    await waitAllVerified(238);
+    await waitAllVerified(state.fixture.points.length);
 
     // 改周期 + 移除一个点位 ⇒ 「1 项点位变更（移除 1）；周期另有修改：1000 → 500 ms」。
     fireEvent.change(screen.getByTestId("acquisition-interval-input"), { target: { value: "500" } });
@@ -307,7 +164,7 @@ describe("验收 6/8：变更摘要措辞与「抵消 / 恢复原值」", () => 
     const state = mkState();
     installFetch(state);
     renderPane();
-    await waitAllVerified(238);
+    await waitAllVerified(state.fixture.points.length);
 
     // 新增一个语义点位 → 计数「新增 1」，新行标记「新增」。
     await user.click(screen.getByTestId("add-point-entry"));
@@ -341,7 +198,7 @@ describe("验收 10：未实现入口不出现（声明了 import 也不渲染�
     const state = mkState({ selectionMethods: ["manual", "browse", "import"] });
     installFetch(state);
     renderPane();
-    await waitAllVerified(238);
+    await waitAllVerified(state.fixture.points.length);
     await user.click(screen.getByTestId("add-point-entry"));
     // 变量选择入口（语义点位）在抽屉里；导入不出现（不是置灰占位）。
     await screen.findByTestId("nck-variable-select");
@@ -373,7 +230,7 @@ describe("抽屉：未确认修改关闭时提醒一次（草稿生命周期）"
     const state = mkState();
     installFetch(state);
     renderPane();
-    await waitAllVerified(238);
+    await waitAllVerified(state.fixture.points.length);
 
     await user.click(screen.getByTestId("add-point-entry"));
     await user.selectOptions(
@@ -411,11 +268,11 @@ describe("草稿状态上报（外壳层切换连接/离开页面的依据）", 
         endpointId={EP}
         driverId={NCK_DRIVER}
         onChanged={() => {}}
-        nckDefinitions={buildAcquisition238().definitions}
+        nckDefinitions={SEMANTIC_DEFINITIONS}
         onDraftStateChange={onDraftStateChange}
       />,
     );
-    await waitAllVerified(238);
+    await waitAllVerified(state.fixture.points.length);
     // 初始：没有未保存修改、没有保存中。
     expect(onDraftStateChange).toHaveBeenLastCalledWith({ dirty: false, saving: false });
 
@@ -432,5 +289,3 @@ describe("草稿状态上报（外壳层切换连接/离开页面的依据）", 
     );
   });
 });
-
-

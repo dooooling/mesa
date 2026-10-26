@@ -21,9 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master@2026-09-05
+      - name: Rust setup
+        uses: ./.github/actions/rust-ci-setup
         with:
-          toolchain: '1.95.0'
+          cache-domain: linux-x64
+          cache-writer: "false"
+          install-nextest: "true"
 
       - name: contract evidence (all suites from contract_suites.py, exact SHA)
         run: python scripts/write-contract-evidence.py

@@ -2,11 +2,12 @@
 // NOTE: 本工程未开 vitest globals，testing-library 的自动 cleanup 不会注册，
 // 这里显式注册，保证每个测试后卸载组件，避免跨测试 DOM 残留造成多匹配。
 import { afterEach } from "vitest";
-import { cleanup } from "@testing-library/react";
 
-afterEach(() => {
-  cleanup();
-});
+// Node 模型测试不加载 ReactDOM/浏览器桩；组件测试仍逐例卸载。
+if (typeof document !== "undefined") {
+  const { cleanup } = await import("@testing-library/react");
+  afterEach(cleanup);
+}
 
 if (typeof window !== "undefined" && !window.matchMedia) {
   window.matchMedia = ((query: string) => ({

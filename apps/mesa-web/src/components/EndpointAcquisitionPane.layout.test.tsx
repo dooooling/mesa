@@ -6,10 +6,9 @@
 //    - 列表滚动容器声明的最大高度按视口换算后是否够高（`calc(100vh - 360px)` 逐项算）；
 //    - 分页、保存区是否在**滚动容器之外**（DOM 层级，与滚动位置无关）；
 //    - 滚动容器是唯一的 `overflow-y: auto` 区域，表格在其内部。
-// 2. **必须真实浏览器**（本文件用一条显式断言记录该限制，不假装覆盖）：
+// 2. **必须真实浏览器**：
 //    jsdom 没有布局引擎，`getBoundingClientRect()` 恒为 0——真实溢出、遮挡、层叠、
-//    字体度量一律测不到。若将来引入 Playwright/真实浏览器，第一条断言会失败，
-//    提醒维护者把这里升级成真实布局断言（而不是继续默默"以为覆盖了"）。
+//    字体度量一律测不到。此处仅验证 DOM 结构与样式声明，不将环境限制写成测试。
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import { EndpointAcquisitionPane } from "./EndpointAcquisitionPane";
@@ -122,21 +121,5 @@ describe("列表高度与分页位置（声明层面，可机械判定）", () =
     const rows = screen.getAllByTestId("nck-point-row");
     expect(rows).toHaveLength(25);
     for (const row of rows) expect(list.contains(row)).toBe(true);
-  });
-});
-
-describe("必须真实浏览器才能判定的部分（此处显式记录限制，不假装覆盖）", () => {
-  it("jsdom_has_no_layout_engine_so_real_overflow_cannot_be_asserted", async () => {
-    const list = await renderReady();
-    // jsdom 不做布局：高度恒为 0。下面这些「真实溢出/遮挡/层叠」问题**无法**在此判定，
-    // 验收报告里按「需真实浏览器」单列：
-    // - 480px 视口下抽屉内字段是否横向溢出；
-    // - 滚动中间态保存区与分页的视觉重叠；
-    // - 行内「⋯」菜单是否被容器裁切；
-    // - 真实字号/触摸目标大小。
-    expect(list.getBoundingClientRect().height).toBe(0);
-    const row = screen.getAllByTestId("nck-point-row")[0]!;
-    expect(row.getBoundingClientRect().height).toBe(0);
-    expect(list.clientHeight).toBe(0);
   });
 });
