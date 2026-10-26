@@ -31,7 +31,8 @@ export function PointSearch({
         placeholder={placeholder}
         value={query}
         onChange={(e) => onChange(e.target.value)}
-        style={{ width: 360 }}
+        // 窄屏：360px 是桌面舒适宽度，但不能把窄视口撑出横向滚动条。
+        style={{ width: 360, maxWidth: "100%", minWidth: 0 }}
       />
       {/* 只有「全部」时不渲染下拉：没有可筛的维度就不占位置。 */}
       {filters.length > 1 ? (

@@ -68,11 +68,16 @@ export function NckNativeFields({
   const firstMissingAdvancedKey = missingRequiredAdvanced[0]?.key;
   useEffect(() => {
     if (!firstMissingAdvancedKey) return;
-    setAdvancedOpen(true);
-    // 定位到第一个缺失字段（jsdom 无 scrollIntoView 时安全跳过）。
+    // 先展开，再定位：高级区默认**不渲染**，折叠时 `getElementById` 必然是 null，
+    // 直接在这里 scrollIntoView 会静默失败（字段虽然高亮了，用户却还停在表单顶部）。
+    // 展开后本 effect 会因 `advancedOpen` 变化再跑一次，那时锚点已经存在。
+    if (!advancedOpen) {
+      setAdvancedOpen(true);
+      return;
+    }
     const anchor = document.getElementById(`native-field-${firstMissingAdvancedKey}`);
     anchor?.scrollIntoView?.({ block: "center" });
-  }, [firstMissingAdvancedKey]);
+  }, [firstMissingAdvancedKey, advancedOpen]);
 
   const issues = validateNativeFields(schema, values);
   const derivedKey = nativeDerivedPointKey(values);

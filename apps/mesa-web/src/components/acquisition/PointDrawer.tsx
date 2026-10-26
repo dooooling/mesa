@@ -8,6 +8,7 @@
 // 只读抽屉（技术详情）传 `notice={null}` 即可不显示这句。
 import type { ReactNode } from "react";
 import { Drawer } from "antd";
+import { fitDrawerWidth, useViewportWidth } from "../../useViewportWidth";
 
 /** 抽屉里的唯一说明（§4.3，全文不得再加第二句流程说明）。 */
 export const DRAFT_NOTICE = "确认后加入页面草稿，保存配置后生效。";
@@ -30,17 +31,24 @@ export function PointDrawer({
   onClose: () => void;
   /** 保存中：禁止关闭抽屉（避免「请求还在飞、抽屉已关」的错位，§4.7）。 */
   busy?: boolean;
+  /** 桌面默认宽度（§7-5 定案 640px）；窄屏由视口收敛，不接受拖拽。 */
   width?: number;
   /** 说明行；`null` 表示不显示（只读抽屉）。 */
   notice?: string | null;
   testId?: string;
 }) {
   const noticeText = notice === undefined ? DRAFT_NOTICE : notice;
+  // 窄屏自适应（只收敛、不拖拽）：视口比桌面宽度更窄时取视口宽度，否则保持 640px。
+  // 放在抽屉内部而不是页面层：这是容器自身的布局职责，页面层不该为它传视口数值。
+  const viewportWidth = useViewportWidth();
+  const resolvedWidth = fitDrawerWidth(width, viewportWidth);
   return (
     <Drawer
       open={open}
       title={title}
-      width={width}
+      // antd v6：`width` 已弃用，`size` 接受数字（与 px 等值），语义相同。
+      size={resolvedWidth}
+      data-narrow={viewportWidth > 0 && resolvedWidth < width ? "true" : "false"}
       onClose={onClose}
       closable={!busy}
       maskClosable={!busy}
