@@ -3,8 +3,8 @@
 // 本页只负责：Device 加载 + Header + Tab 导航 + 当前页 + Point Drawer。
 // Connection 选择各页局部管理（useConnectionQuery），无全局 Context。
 import { useCallback, useEffect, useState } from "react";
-import { Alert, Button, Card } from "antd";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { Alert, Button, Card } from "antd";
 import { PointDetailDrawer, pointIdentityOf, type PointIdentity } from "../components/PointDetailDrawer";
 import { DeviceAcquisition } from "./DeviceAcquisition";
 import { DeviceConnections } from "./DeviceConnections";
@@ -14,7 +14,6 @@ import { DeviceHeader } from "./DeviceHeader";
 import { DeviceLiveData } from "./DeviceLiveData";
 import { DeviceOverview } from "./DeviceOverview";
 import { DeviceTabNav } from "./DeviceTabNav";
-import { confirmDiscardDraft } from "../acquisitionDraftGuard";
 import {
   useDeviceWorkspaceData,
   type DevicePointView,
@@ -41,8 +40,6 @@ export function DeviceWorkspacePage() {
   // PR-D1 缺陷 1：只记定位标识（endpoint_id + point_id），不记整行快照。
   // Drawer 渲染时从 devicePoints（SSE 合并结果）查找，SSE 更新/删除即时可见。
   const [openPoint, setOpenPoint] = useState<PointIdentity | null>(null);
-  // 采集页是否有未保存修改（Tab 切换前提示一次，避免切走就丢掉草稿）。
-  const [acqDraftDirty, setAcqDraftDirty] = useState(false);
   // 稳定引用：DeviceLiveData/Overview 的列/行渲染依赖它，避免每次渲染重建。
   const openPointRow = useCallback(
     (p: DevicePointView) => setOpenPoint(pointIdentityOf(p)),
@@ -108,7 +105,6 @@ export function DeviceWorkspacePage() {
           endpoints={deviceEndpoints}
           endpointsReady={epReady}
           onReload={data.reloadInventory}
-          onDraftDirtyChange={setAcqDraftDirty}
         />
       );
     }
@@ -147,14 +143,9 @@ export function DeviceWorkspacePage() {
 
       {epError ? <Alert type="warning" showIcon message="连接清单不可用" description={epError} /> : null}
 
-      <DeviceTabNav
-        deviceId={deviceId}
-        active={activeTab}
-        // 只在「离开采集页」时确认：其它 Tab 没有草稿语义，不必打扰。
-        beforeNavigate={() =>
-          confirmDiscardDraft(activeTab === "acquisition" && acqDraftDirty, "离开采集页")
-        }
-      />
+      {/* Tab 切换的离开确认由 DeviceTabNav 内部走统一守卫（`draftNavGuard`），
+          与侧栏、面包屑、浏览器前进后退共用同一份判定。 */}
+      <DeviceTabNav deviceId={deviceId} active={activeTab} />
 
       {renderTab()}
 

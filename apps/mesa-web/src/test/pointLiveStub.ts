@@ -148,6 +148,13 @@ export function installPointLiveStub(opts: {
   devices?: Array<{ id: string; name: string }>;
   device?: { id: string; name: string };
   endpoints?: Array<{ id: string; name?: string; driver_id: string; device_id: string; state?: string }>;
+  /**
+   * 驱动描述（`GET /api/v1/drivers/{id}/descriptor`）。给定时所有驱动共用一个描述；
+   * 省略时该接口保持 404（与既有行为一致：页面按「描述不可用」处理）。
+   */
+  descriptor?: Record<string, unknown>;
+  /** 采集任务快照（`GET /api/v1/tasks?endpoint=`）；省略时按空任务集返回。 */
+  tasks?: Array<Record<string, unknown>>;
 }) {
   const registry = (
     globalThis as unknown as { __PointLiveStubSource?: { instances?: LiveStubInstance[] } }
@@ -197,6 +204,20 @@ export function installPointLiveStub(opts: {
         ok: true,
         status: 200,
         json: async () => ({ endpoints: list }),
+      };
+    }
+    if (url.startsWith("/api/v1/drivers/") && opts.descriptor) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => opts.descriptor,
+      };
+    }
+    if (url.startsWith("/api/v1/tasks?endpoint=")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ tasks: opts.tasks ?? [] }),
       };
     }
     return { ok: false, status: 404, json: async () => ({}) };

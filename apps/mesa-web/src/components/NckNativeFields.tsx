@@ -28,12 +28,18 @@ export function NckNativeFields({
   initialPoint,
   submitLabel,
   onSubmit,
+  focusFieldKey,
 }: {
   schema: SchemaDescriptor;
   takenPointKeys: string[];
   initialPoint?: NckPointSelection | null;
   submitLabel?: string;
   onSubmit: (point: NckPointSelection) => void;
+  /**
+   * 外部要求定位的字段 key（如服务端 `issues[].path` 指到 `...parameters.<field>`）。
+   * 与「必填缺失自动定位」共用同一条机制：**先展开高级区，再在下一轮渲染定位**。
+   */
+  focusFieldKey?: string | null;
 }) {
   const initialValues = useMemo(() => {
     const base = materializeSchemaDefaults(schema);
@@ -78,6 +84,38 @@ export function NckNativeFields({
     const anchor = document.getElementById(`native-field-${firstMissingAdvancedKey}`);
     anchor?.scrollIntoView?.({ block: "center" });
   }, [firstMissingAdvancedKey, advancedOpen]);
+
+  // 外部定位（服务端 issues 的字段级 path）：与上面的必填缺失定位同一套动作——
+  // 高级字段在折叠态**不渲染**，必须先展开，再在下一轮渲染定位并高亮。
+  // 只认 Schema 里真实存在的字段；不存在就什么都不做（不猜、不硬塞高亮）。
+  const focusField = (schema.fields ?? []).find((field) => field.key === focusFieldKey);
+  useEffect(() => {
+    if (!focusFieldKey || !focusField) return;
+    if (focusField.ui?.advanced === true && !advancedOpen) {
+      setAdvancedOpen(true);
+      return;
+    }
+    // 抽屉里的内容可能比本 effect 晚一次提交（antd Drawer 在 open 后才挂载子树）：
+    // 有限次重试，拿不到锚点就放弃——**不猜元素**、也不抛错。
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let attempts = 0;
+    const locate = () => {
+      if (cancelled) return;
+      const anchor = document.getElementById(`native-field-${focusFieldKey}`);
+      if (anchor) {
+        anchor.scrollIntoView?.({ block: "center" });
+        return;
+      }
+      attempts += 1;
+      if (attempts <= 20) timer = setTimeout(locate, 16);
+    };
+    locate();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [focusFieldKey, focusField, advancedOpen]);
 
   const issues = validateNativeFields(schema, values);
   const derivedKey = nativeDerivedPointKey(values);
@@ -194,7 +232,13 @@ export function NckNativeFields({
         idPrefix="native-field"
         advancedOpen={advancedOpen}
         onAdvancedOpenChange={setAdvancedOpen}
-        highlightKeys={firstMissingAdvancedKey ? [firstMissingAdvancedKey] : []}
+        highlightKeys={
+          // 高亮集合：必填缺失（原有）+ 外部定位字段（issues 的字段级 path）。
+          [
+            ...(firstMissingAdvancedKey ? [firstMissingAdvancedKey] : []),
+            ...(focusField ? [focusField.key] : []),
+          ]
+        }
       />
 
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
@@ -256,3 +300,5 @@ export function NckNativeFields({
     </div>
   );
 }
+
+

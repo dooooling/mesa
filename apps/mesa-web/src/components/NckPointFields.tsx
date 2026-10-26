@@ -93,6 +93,12 @@ export interface NckPointFieldsProps {
    * 只在表单自身知道的信息（选了变量、改了参数、切了模式）上派生，不引入新判据。
    */
   onDirtyChange?: (dirty: boolean) => void;
+  /**
+   * 外部要求定位的字段 key（服务端 `issues[].path` 的字段级定位，§5.2-5）。
+   * 原生页交给 `NckNativeFields` 的展开+定位机制；语义页目前没有可锚定的同源字段，
+   * 因此不假装高亮（宁可只定位到行，也不指错字段）。
+   */
+  focusField?: string | null;
 }
 
 export function NckPointFields({
@@ -108,6 +114,7 @@ export function NckPointFields({
   onSubmit,
   preview,
   onDirtyChange,
+  focusField,
 }: NckPointFieldsProps) {
   const previewFn = preview ?? defaultPreview;
   // native 编辑态：已有 native 点位必须直接在高级原生页打开（身份规则不同）。
@@ -455,6 +462,7 @@ export function NckPointFields({
             initialPoint={initialPoint?.kind === "nck_native" ? initialPoint : null}
             submitLabel={submitLabel ?? "加入原生点位"}
             onSubmit={onSubmit}
+            focusFieldKey={focusField ?? null}
           />
         ) : (
           <Alert

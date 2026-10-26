@@ -1,10 +1,12 @@
 // 设备一级 Tab 导航：概览 | 实时数据 | 连接 | 采集 | 事件 | 诊断。
 // 无 config，无嵌套。Tab 切换不保留 ?connection=（各页连接筛选局部化）。
 //
-// `beforeNavigate`：离开当前 Tab 前的一次确认（采集页用它提示未保存修改，
-// 避免切走就静默丢掉草稿，§7-7）。返回 false 则阻止本次跳转。
-import { Link, useNavigate } from "react-router-dom";
+// 离开确认不再由本组件自己实现：Tab 与侧栏、面包屑、浏览器前进后退共用
+// `draftNavGuard` 的**同一个守卫**（有未保存草稿时先确认，取消则本次跳转不发生，
+// §7-7）。本组件只负责「把点击交给守卫」，不再持有第二套判定。
+import { Link } from "react-router-dom";
 import { Tabs } from "antd";
+import { DRAFT_LEAVE_ACTION, useGuardedNavigate } from "./draftNavGuard";
 
 export const DEVICE_TABS = [
   { key: "overview", label: "概览" },
@@ -21,14 +23,9 @@ export function isDeviceTab(v: string): v is DeviceTabKey {
   return (DEVICE_TABS as readonly { key: string }[]).some((t) => t.key === v);
 }
 
-export function DeviceTabNav(props: {
-  deviceId: string;
-  active: string;
-  /** 返回 false 阻止跳转（异步确认：有未保存修改时先问一次）。 */
-  beforeNavigate?: (nextKey: string) => boolean | Promise<boolean>;
-}) {
-  const { deviceId, active, beforeNavigate } = props;
-  const nav = useNavigate();
+export function DeviceTabNav(props: { deviceId: string; active: string }) {
+  const { deviceId, active } = props;
+  const guardedNavigate = useGuardedNavigate();
   return (
     <Tabs
       data-testid="device-tab-nav"
@@ -39,11 +36,9 @@ export function DeviceTabNav(props: {
           <Link
             to={`/devices/${deviceId}/${t.key}`}
             onClick={(event) => {
-              if (!beforeNavigate) return;
+              // 统一守卫：不直接导航，先问「要不要放弃草稿」，取消则停在原页。
               event.preventDefault();
-              void (async () => {
-                if (await beforeNavigate(t.key)) nav(`/devices/${deviceId}/${t.key}`);
-              })();
+              guardedNavigate(`/devices/${deviceId}/${t.key}`, DRAFT_LEAVE_ACTION);
             }}
           >
             {t.label}

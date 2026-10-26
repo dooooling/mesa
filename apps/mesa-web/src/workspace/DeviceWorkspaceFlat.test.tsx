@@ -32,6 +32,47 @@ function mockAll(endpoints: typeof EPS = EPS) {
   });
 }
 
+/** 采集页专用桩：驱动**声明了**事件流（`descriptor.events.streams` 非空）。 */
+function mockAllWithEventStreams(endpoints: typeof EPS = EPS) {
+  return installPointLiveStub({
+    points: [pt("plc", "a"), pt("focas", "b")],
+    endpoints,
+    descriptor: {
+      contract_major: 2,
+      contract_minor: 1,
+      identity: { driver_id: "s7", name: "S7", version: "0.0.1" },
+      connection: { fields: [] },
+      resources: [],
+      controls: { commands: [] },
+      resource_selection_methods: ["manual"],
+      capabilities: { poll: true, subscribe: true, write: false, method: false, events: true },
+      events: {
+        streams: [
+          { id: "alarms", label: { default: "Alarms" }, modes: ["subscribe"], parameters: { fields: [] }, fields: [] },
+        ],
+      },
+    },
+  });
+}
+
+/** 采集页专用桩：驱动**没有**声明事件流（`events` 缺省 = 空目录）。 */
+function mockAllWithoutEventStreams() {
+  return installPointLiveStub({
+    points: [pt("plc", "a"), pt("focas", "b")],
+    endpoints: EPS,
+    descriptor: {
+      contract_major: 2,
+      contract_minor: 1,
+      identity: { driver_id: "s7", name: "S7", version: "0.0.1" },
+      connection: { fields: [] },
+      resources: [],
+      controls: { commands: [] },
+      resource_selection_methods: ["manual"],
+      capabilities: { poll: true, subscribe: false, write: false, method: false },
+    },
+  });
+}
+
 function renderApp(path: string) {
   return render(
     <MemoryRouter initialEntries={[path]}>
@@ -128,15 +169,25 @@ describe("扁平设备详情", () => {
     expect(screen.queryByText("高级诊断")).toBeNull();
   });
 
-  it("采集页含数据采集 + 事件订阅两 Section", async () => {
-    mockAll();
+  it("采集页含数据采集 + 事件订阅两 Section（事件能力由 Descriptor 声明）", async () => {
+    mockAllWithEventStreams();
     renderApp("/devices/cnc-01/acquisition");
     // Card title 文本可能拆元素，分开断言
     await screen.findByText(/数据采集/, undefined, { timeout: 30000 });
     expect(screen.getByText(/数据采集/)).toBeTruthy();
     expect(screen.getByText("PLC-01")).toBeTruthy();
+    expect(await screen.findByTestId("event-subscription-region", undefined, { timeout: 10000 })).toBeTruthy();
     expect(screen.getByText("事件订阅")).toBeTruthy();
   });
+
+  it("驱动未声明事件流 ⇒ 采集页不渲染事件区域（回归：曾无条件常驻）", async () => {
+    mockAllWithoutEventStreams();
+    renderApp("/devices/cnc-01/acquisition");
+    await screen.findByTestId("acquisition-interval-input", undefined, { timeout: 30000 });
+    // 不支持 ⇒ 整块不渲染：既没有区域，也没有「未声明事件流」的常驻说明。
+    expect(screen.queryByTestId("event-subscription-region")).toBeNull();
+    expect(screen.queryByText(/未声明事件流/)).toBeNull();
+  }, 30000);
 
   it("跨设备隔离：B 的连接不进 A 的 Header/连接页/筛选器", async () => {
     mockAll(EPS_CROSS);

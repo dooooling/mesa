@@ -102,6 +102,13 @@ import {
   type UnsupportedFieldInResource,
 } from "../descriptorCompatibility";
 import { draftSignature, savedVsDraftText } from "../acquisitionDraft";
+import {
+  describeUnlocatable,
+  firstLocatableIssue,
+  locateIssuePath,
+  type IssueLocation,
+  type SubmittedRowSnapshot,
+} from "../issueLocation";
 
 /** 定义目录条目（I-2 `VariableDefinition` 的宽松形态，注入/测试可只给子集）。 */
 export type NckDefinitionEntry = NckDefinitionLike;
@@ -304,6 +311,13 @@ export function EndpointAcquisitionPane({
   const [tasksLoadError, setTasksLoadError] = useState("");
   // 保存失败的后端 issues 原样展示（`{valid:false, issues:[...]}`）。
   const [saveIssues, setSaveIssues] = useState<ValidationIssue[]>([]);
+  // 本次提交的行快照：`issue.path` 的下标只能按**提交那一刻**的数组换算成稳定
+  // rowId（§5.2-5）。只用于界面定位，不参与任何配置差异判定（§4.8）。
+  const [submittedRowSnapshot, setSubmittedRowSnapshot] = useState<SubmittedRowSnapshot | null>(null);
+  // 当前被定位的问题行（行高亮 + 抽屉内字段定位）；null = 没有生效的定位。
+  const [locatedIssue, setLocatedIssue] = useState<{ rowId: string; fieldKey: string | null } | null>(
+    null,
+  );
   // P2-2：服务端已生效配置的展示快照（null = 快照未就绪/不可用）。
   // 状态区据此区分「已保存」与「待保存」，不再让草稿冒充当前配置。
   const [savedBaseline, setSavedBaseline] = useState<SavedBaseline | null>(null);
@@ -970,6 +984,8 @@ export function EndpointAcquisitionPane({
   const openAddDrawer = () => {
     // 记录列表滚动位置：关闭后回到同一位置（不把用户顶回顶部）。
     restoreScrollTop.current = listScrollRef.current?.scrollTop ?? 0;
+    // 用户主动开抽屉 ⇒ 上一次「问题定位」的高亮不再适用（不把旧定位带进新编辑）。
+    setLocatedIssue(null);
     setEditingIndex(null);
     setBrowsePreset(null);
     setFormVersion((v) => v + 1);
@@ -981,6 +997,7 @@ export function EndpointAcquisitionPane({
     const index = nckRowIds.indexOf(rowId);
     if (index < 0) return;
     restoreScrollTop.current = listScrollRef.current?.scrollTop ?? 0;
+    setLocatedIssue(null);
     setEditingIndex(index);
     setBrowsePreset(null);
     setFormVersion((v) => v + 1);
@@ -1275,6 +1292,21 @@ export function EndpointAcquisitionPane({
       return message.error(plan.message);
     }
     const submittedTasks = plan.tasks;
+    // 提交快照：把「任务下标 + 任务内下标」与稳定 rowId 对齐，供保存失败后按
+    // `issue.path` 定位（§5.2-5）。两次 merge 都是「保留任务 + 被编辑任务」的追加
+    // 顺序（`deviceModel.ts:460`、`nckTaskBinding.ts:487`），NCK 直接用计划给出的
+    // taskId 回查下标；下标对不齐时宁可不给快照（不猜行）。
+    const editedTaskIndex =
+      plan.driverKind === "nck"
+        ? submittedTasks.findIndex((task) => task.id === plan.taskId)
+        : submittedTasks.length - 1;
+    const submittedRowIds = nck ? [...nckRowIds] : [...selRowIds];
+    const rowIdsAligned =
+      plan.driverKind !== "nck" || plan.points.length === submittedRowIds.length;
+    const rowSnapshot: SubmittedRowSnapshot | null =
+      editedTaskIndex >= 0 && rowIdsAligned
+        ? { taskIndex: editedTaskIndex, taskCount: submittedTasks.length, rowIds: submittedRowIds }
+        : null;
     // ---- 保存前重新确认运行状态（§4.4.1）--------------------------------
     // 打开页面时读到的状态只用于渲染；用户可能已经编辑很久。这里在**任何**
     // stop / PUT / start 之前重新读一次：不一致即中止，由用户再次点击保存
@@ -1320,6 +1352,8 @@ export function EndpointAcquisitionPane({
     setSaving(true);
     // 重新发起保存：清掉上一次的 issues（成功后同样清掉）。
     setSaveIssues([]);
+    setSubmittedRowSnapshot(rowSnapshot);
+    setLocatedIssue(null);
     setSaveOutcome(null);
     setPendingVerify(null);
     // apply 步骤里的「待核对」判定必须传出来：applyEndpointChange 只表达 ok/failed，
@@ -1374,11 +1408,16 @@ export function EndpointAcquisitionPane({
           if (Array.isArray(issues.issues)) {
             const list = issues.issues as ValidationIssue[];
             setSaveIssues(list);
+            // 定位：只对**能按提交快照换算成行**的问题跳转（§5.2-5）；
+            // 任务级/保留任务/无法识别的 path 一律不跳，留给「技术详情」。
+            const hit = firstLocatableIssue(list, rowSnapshot);
+            if (hit) locateIssueRow(hit.issue, rowSnapshot);
+            // 面向用户的一句话（**不含原始 path/code**）：原始值只在技术详情里。
             const summary =
               list.length > 0
-                ? `点位保存失败（${list.length} 项）：${list
-                    .map((i) => `${i.path} · ${i.code}`)
-                    .join("；")}`
+                ? hit
+                  ? `点位保存失败（${list.length} 项）：已跳到第一个可定位的问题，其余见「技术详情」`
+                  : `点位保存失败（${list.length} 项）：该问题无法自动定位，详见「技术详情」的原始路径`
                 : "点位保存失败";
             return { ok: false, message: summary };
           }
@@ -1576,6 +1615,47 @@ export function EndpointAcquisitionPane({
     return ids;
   }, [nck, nckPoints, nckRowIds, lookupDefinition, definitions, nativeSchema]);
 
+  /**
+   * 把一条保存失败的问题定位到「行（+字段）」并执行三个动作：跳页、打开抽屉、高亮。
+   *
+   * 三条硬约束（§5.2-5）：
+   * 1. **只按提交快照换算**（`issueLocation.ts`），不拿实时列表下标去猜；
+   * 2. 换算不出行就**什么都不做**（不挑一行跳过去），由界面明确说「无法自动定位」；
+   * 3. 字段级才打开编辑抽屉（那里能就地改并高亮字段）；行级问题打开该行的
+   *    「技术详情」，避免在用户没准备编辑时把可编辑表单摊开。
+   */
+  function locateIssueRow(
+    issue: ValidationIssue,
+    snapshot: SubmittedRowSnapshot | null,
+  ): IssueLocation {
+    const location = locateIssuePath(issue.path, snapshot);
+    if (location.kind !== "row") return location;
+    const ids = nck ? nckRowIds : selRowIds;
+    const index = ids.indexOf(location.rowId);
+    if (index < 0) {
+      // 行身份还在快照里、但已不在当前草稿（用户又改过草稿）：同样不猜。
+      return { kind: "unlocatable", reason: "unrecognized", detail: "目标行已不在当前草稿中" };
+    }
+    // 目标行必须可见：先清掉搜索与筛选（否则跳到那一页也可能被过滤掉），
+    // 再按「行在全部行里的下标」算页码——rowId 与页码都只由下标推导，不改行身份。
+    setQuery("");
+    setFilter("all");
+    setPage(Math.floor(index / Math.max(1, pageSize)) + 1);
+    setLocatedIssue({ rowId: location.rowId, fieldKey: location.fieldKey });
+    if (nck && location.fieldKey) {
+      restoreScrollTop.current = listScrollRef.current?.scrollTop ?? 0;
+      setEditingIndex(index);
+      setBrowsePreset(null);
+      setFormVersion((v) => v + 1);
+      setDrawerDirty(false);
+      setDrawerOpen(true);
+    } else {
+      const row = rowViews.find((item) => item.rowId === location.rowId);
+      if (row) setDetailRow(row);
+    }
+    return location;
+  }
+
   // ---- 草稿差异与保存区（§4.7 / §4.8） -----------------------------------
   const draftRows = useMemo(() => draftRowRefs(), [draftRowRefs]);
   const diff = useMemo(
@@ -1639,6 +1719,21 @@ export function EndpointAcquisitionPane({
       saveChangeState === "changed" &&
       !pendingVerify,
   });
+
+  /**
+   * 保存失败问题的**分层展示**（需求 3）：
+   * - 正文只回答「有几个、能不能点过去」；
+   * - 原始 `path` / `code` 只在技术详情里。
+   *
+   * 可定位 = 能按提交快照换算成行；换算不出来就明确说「无法自动定位」，不猜目标。
+   */
+  const locatableIssue = firstLocatableIssue(saveIssues, submittedRowSnapshot);
+  const firstUnlocatable = saveIssues
+    .map((issue) => locateIssuePath(issue.path, submittedRowSnapshot))
+    .find(
+      (loc): loc is Extract<IssueLocation, { kind: "unlocatable" }> =>
+        loc.kind === "unlocatable",
+    );
 
   /** 放弃修改：整份回到服务端已保存值（不写服务端，只重读）。 */
   const discardDraft = () => {
@@ -1922,7 +2017,11 @@ export function EndpointAcquisitionPane({
               rowTestId={nck ? "nck-point-row" : "sel-point-row"}
               rowData={(row) => {
                 const status = nck ? pointStatuses[nckPoints.findIndex((_, i) => nckRowIds[i] === row.rowId)] : undefined;
-                return { "data-verify-status": status ? status.status : "none" };
+                return {
+                  "data-verify-status": status ? status.status : "none",
+                  // 被保存失败的问题定位到的行：只做锚点标记，不加视觉标签（§2.9 元素预算）。
+                  "data-issue-located": locatedIssue?.rowId === row.rowId ? "true" : "false",
+                };
               }}
               isEditable={(row) => editableRowIds.has(row.rowId)}
               actions={{
@@ -2111,18 +2210,45 @@ export function EndpointAcquisitionPane({
       {saveIssues.length > 0 ? (
         <Alert
           type="error"
-          message={`保存被后端拒绝（${saveIssues.length} 项，原样展示）`}
+          message={`保存被后端拒绝：${saveIssues.length} 个问题需要处理`}
+          data-testid="save-issues"
           description={
-            <ul style={{ margin: 0, paddingLeft: 18 }}>
-              {saveIssues.map((issue, idx) => (
-                <li
-                  key={idx}
-                  style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 11 }}
-                >
-                  {issue.path} · {issue.code} · {issue.message}
-                </li>
-              ))}
-            </ul>
+            <div style={{ display: "grid", gap: 8 }}>
+              {/* 正文：只说「能不能处理、点哪里」，**不含**原始 path / code（§3.3 分层）。 */}
+              <div data-testid="save-issues-lead">
+                {locatableIssue
+                  ? `${saveIssues.length} 个问题需要处理，点此查看第一个（跳到该行所在页并高亮字段）。`
+                  : `${saveIssues.length} 个问题需要处理；该问题无法自动定位（${describeUnlocatable(
+                      firstUnlocatable?.reason ?? "unrecognized",
+                    )}），请按技术详情里的原始路径排查。`}
+              </div>
+              {locatableIssue ? (
+                <div>
+                  <Button
+                    size="small"
+                    data-testid="locate-first-issue"
+                    onClick={() => locateIssueRow(locatableIssue.issue, submittedRowSnapshot)}
+                  >
+                    点此查看第一个
+                  </Button>
+                </div>
+              ) : null}
+              {/* 技术详情：原始 path / code / message 原样保留（可排查、可断言）。 */}
+              <details data-testid="save-issues-details">
+                <summary style={{ cursor: "pointer", fontSize: 12 }}>技术详情（原始 path / code）</summary>
+                <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+                  {saveIssues.map((issue, idx) => (
+                    <li
+                      key={idx}
+                      data-testid="issue-raw"
+                      style={{ fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}
+                    >
+                      {issue.path} · {issue.code} · {issue.message}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            </div>
           }
         />
       ) : null}
@@ -2258,6 +2384,12 @@ export function EndpointAcquisitionPane({
                   onDirtyChange={setDrawerDirty}
                   onCancel={requestCloseDrawer}
                   onSubmit={(point) => replacePoint(editingIndex, point)}
+                  // 字段级定位：只有「被定位的就是正在编辑的这一行」才把字段交给表单高亮。
+                  focusField={
+                    locatedIssue && nckRowIds[editingIndex] === locatedIssue.rowId
+                      ? locatedIssue.fieldKey
+                      : null
+                  }
                 />
               ) : (
                 <NckPointFields
@@ -2345,6 +2477,17 @@ export function EndpointAcquisitionPane({
             fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace",
           }}
         >
+          {/* 由保存失败的问题定位打开时：把「这一行为什么被定位」写在抽屉顶部。 */}
+          {locatedIssue && detailRow?.rowId === locatedIssue.rowId ? (
+            <div
+              data-testid="point-detail-issue"
+              data-located-field={locatedIssue.fieldKey ?? ""}
+              style={{ color: "#c62828" }}
+            >
+              该行存在服务端校验问题
+              {locatedIssue.fieldKey ? `（字段：${locatedIssue.fieldKey}）` : ""}
+            </div>
+          ) : null}
           {detailRow
             ? detailRow.detail.map((entry) => (
                 <div key={entry.label} style={{ overflowWrap: "anywhere" }}>

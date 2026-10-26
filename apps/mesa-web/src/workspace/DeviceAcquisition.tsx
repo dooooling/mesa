@@ -5,13 +5,21 @@
 // 1. **切换连接前**提示未保存修改；保存中禁止切换；
 // 2. 把「有未保存修改」注册为浏览器原生离开提醒，并上报给设备页做 Tab 切换守卫。
 // 采集窗格本身只报告状态（`onDraftStateChange`），不自己拦路由。
-import { Alert, Card } from "antd";
+//
+// 第 4 步修复（§2.5 第 8 条 + §7-8 定案）：事件订阅区域**按驱动声明的事件能力**出现——
+// 之前无条件渲染，不支持事件流的驱动也会常驻一块「该驱动未声明事件流」的卡片。
+// 判据是 `descriptor.events.streams` 是否为空（与 `EventTaskEditor.tsx:129`、`:330-331`
+// 同源），**不看 `driver_id`**；不支持 ⇒ 整块不渲染；支持 ⇒ 独立折叠区域（默认收起），
+// 保存范围仍是这一块自己的（`EventTaskEditor` 内部的生命周期）。
+import { Alert, Card, Collapse } from "antd";
 import { useCallback, useMemo, useState } from "react";
 import { EndpointAcquisitionPane } from "../components/EndpointAcquisitionPane";
 import { EventTaskEditor } from "../components/EventTaskEditor";
 import { confirmDiscardDraft, useBeforeUnloadGuard } from "../acquisitionDraftGuard";
 import { ConnectionSelect } from "./ConnectionSelect";
 import { useConnectionQuery } from "./useConnectionQuery";
+import { useDriverEventCatalog } from "./useDriverEventCatalog";
+import { useDraftGuardReporter } from "./draftNavGuard";
 import type { WorkspaceEndpoint } from "./useDeviceWorkspaceData";
 
 export function DeviceAcquisition(props: {
@@ -31,6 +39,10 @@ export function DeviceAcquisition(props: {
     dirty: false,
     saving: false,
   });
+  // 事件能力目录（判据只有 Descriptor：`events.streams` 为空 = 不支持）。
+  const eventCatalog = useDriverEventCatalog(active?.driver_id ?? null);
+  // 统一的「应用内离开」守卫：侧栏 / 面包屑 / 设备 Tab / 浏览器前进后退共用一个来源。
+  useDraftGuardReporter(draft.dirty);
   const handleDraftState = useCallback(
     (state: { dirty: boolean; saving: boolean }) => {
       setDraft(state);
@@ -76,9 +88,43 @@ export function DeviceAcquisition(props: {
               onDraftStateChange={handleDraftState}
             />
           </Card>
-          <Card size="small" title="事件订阅">
-            <EventTaskEditor fixedEndpointId={active.id} />
-          </Card>
+          {/* 事件订阅：只有驱动真的声明了事件流才给这块区域（§2.5-8）。
+              不支持 ⇒ 整块不渲染（不再显示「该驱动未声明事件流」这种常驻说明）。 */}
+          {eventCatalog.state === "ready" && eventCatalog.streams.length > 0 ? (
+            <div data-testid="event-subscription-region">
+              <Collapse
+                // 默认收起（§7-8）：事件订阅不是默认页面的一屏四块之一，展开才占空间。
+                defaultActiveKey={[]}
+                items={[
+                  {
+                    key: "event-subscription",
+                    label: "事件订阅",
+                    children: <EventTaskEditor fixedEndpointId={active.id} />,
+                  },
+                ]}
+              />
+            </div>
+          ) : null}
+          {/* 描述读取失败是**真实问题**（§3.3），不静默隐藏：给一句影响说明 + 重试入口。 */}
+          {eventCatalog.state === "error" ? (
+            <Alert
+              type="warning"
+              showIcon
+              data-testid="event-catalog-error"
+              message="事件订阅能力读取失败（不影响上面的数据采集配置）"
+              description={eventCatalog.error}
+              action={
+                <button
+                  type="button"
+                  data-testid="retry-event-catalog"
+                  onClick={eventCatalog.reload}
+                  style={{ cursor: "pointer" }}
+                >
+                  重试
+                </button>
+              }
+            />
+          ) : null}
         </div>
       ) : null}
     </div>

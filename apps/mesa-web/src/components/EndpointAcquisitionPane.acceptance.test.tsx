@@ -526,17 +526,43 @@ describe("验收 8：保存失败保留修改（草稿计数、保存区、行�
     const outcome = await screen.findByTestId("save-outcome");
     expect(outcome.getAttribute("data-kind")).toBe("failed");
     expect(outcome.textContent).toContain("写入失败");
-    // 后端 issues 原样展示（含 path / code）。
-    expect(document.body.textContent).toContain("tasks[0].binding.config.points[3].parameters.module");
-    expect(document.body.textContent).toContain("OUT_OF_RANGE");
+    // 后端 issues 原样保留（path / code），但原始值只在**技术详情**里（正文只写可处理说明）。
+    const details = await screen.findByTestId("save-issues-details");
+    expect(details.textContent).toContain("tasks[0].binding.config.points[3].parameters.module");
+    expect(details.textContent).toContain("OUT_OF_RANGE");
+    expect(screen.getByTestId("save-issues-lead").textContent ?? "").not.toContain("tasks[0]");
 
-    // 草稿不丢：保存区仍在、计数不变、行标记仍在。
+    // §5.2-5：字段级 path ⇒ 自动跳到该行所在页 + 打开抽屉 + 高亮该字段。
+    await waitFor(() => expect(pagination().textContent).toContain("第 1 / 10 页"));
+    const locatedField = await waitFor(() => {
+      const el = document.getElementById("native-field-module");
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    expect(locatedField.getAttribute("style") ?? "").toContain("outline");
+    expect(
+      screen.getAllByTestId("nck-point-row").find((el) => el.getAttribute("data-issue-located") === "true"),
+    ).toBeTruthy();
+
+    // 草稿不丢：保存区仍在、计数不变。
     expect(screen.getByTestId("draft-save-bar")).toBeTruthy();
     expect(screen.getByTestId("draft-save-summary").textContent).toBe("1 项点位变更（修改 1）");
-    expect(within(rowWith("轴实际位置")).getByTestId("point-row-status").textContent).toContain("已修改");
     // 未成功 ⇒ 不出现成功结果条。
     expect(screen.queryByTestId("apply-result")).toBeNull();
     expect(probe.writeSequence()).toEqual(["PUT:tasks"]);
+
+    // 定位打开的抽屉里未确认的修改需要一次确认才能关；关掉后回到第 10 页，
+    // 行标记必须还在（草稿没有因为保存失败被清掉）。
+    await user.click(await screen.findByTestId("drawer-cancel"));
+    // 确认框里的「放弃修改」（保存区也有同名按钮，必须限定在 modal 内）。
+    const confirm = await waitFor(() => {
+      const el = document.querySelector(".ant-modal-confirm");
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    await user.click(within(confirm).getByRole("button", { name: "放弃修改" }));
+    await gotoPage(10);
+    expect(within(rowWith("轴实际位置")).getByTestId("point-row-status").textContent).toContain("已修改");
   }, 60_000);
 });
 

@@ -5,7 +5,7 @@
 // “不知道”不显示成精确总数。设备改名/删除走 DeviceEditorModal。
 import { Button, Space } from "antd";
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { GuardedLink } from "./draftNavGuard";
 import type { WorkspaceEndpoint } from "./useDeviceWorkspaceData";
 import { DeviceEditorModal } from "../components/DeviceEditorModal";
 
@@ -32,7 +32,8 @@ export function DeviceHeader(props: {
   return (
     <div>
       <div style={{ fontSize: 12, color: "#525252" }}>
-        <Link to="/devices">设备</Link> {" > "} {deviceName}
+        {/* 面包屑同样是「应用内离开路径」：有未保存草稿时必须先确认（§7-7）。 */}
+        <GuardedLink to="/devices">设备</GuardedLink> {" > "} {deviceName}
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 4 }}>
         <span style={{ fontSize: 20, fontWeight: 600 }}>{deviceName}</span>
