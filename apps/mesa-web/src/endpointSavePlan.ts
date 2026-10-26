@@ -14,10 +14,16 @@
 //
 // 数据安全口径（本批的核心）：
 // - 快照未就绪 ⇒ 直接拒绝（不产出任何可 PUT 的任务集）；
-// - NCK 目标集与当前快照**逐字相等** ⇒ 拒绝并给 `NO_CHANGES`：UI 必须**不报告成功**，
-//   也不应发 PUT（"保存接口 2xx"不等于"编辑已持久化"，这是旧 no-op 安全网误报的根因）；
+// - **所有驱动路径**：目标配置与当前快照一致 ⇒ 拒绝并给 `NO_CHANGES`。UI 必须
+//   **不发 PUT / stop / start**，也不报告成功（"保存接口 2xx"不等于"编辑已持久化"，
+//   这是旧 no-op 安全网误报的根因）。非 NCK 原先只有信息性的 `changed`，本批改为
+//   与 NCK 同口径的强制拦截（§4.4.2）；
 // - 非 NCK 路径逐字沿用 `mergeAcquisitionTasks`（唯一差异见 `DRIVER_KIND_MISMATCH`：
 //   旧实现在"非 NCK Endpoint 上存在 NCK 任务"时会 no-op 然后误报成功，本层改为显式拒绝）。
+//
+// 「无实际修改」的判据是**完整有效配置**，不是只比 `point_key`：周期 + 每个点位的
+// 完整参数 + 顺序 + 保留任务（§4.4.2 / §4.8）。因此判据直接用任务集比较，
+// 不用前端草稿指纹（指纹只服务展示与行标记，避免两套口径）。
 
 import {
   NCK_POINTS_KIND,
@@ -72,7 +78,7 @@ export type EndpointSavePlan =
       driverKind: "canonical";
       tasks: AcquisitionTaskShape[];
       preservedCount: number;
-      /** 仅信息性：非 NCK 路径不做回读校验（行为与旧实现一致）。 */
+      /** 恒为 true（`ok:true` 已蕴含「确有变更」；保留字段兼容既有调用方）。 */
       changed: boolean;
     }
   | {
@@ -87,6 +93,13 @@ export type EndpointSavePlan =
       points: NckPointSelection[];
     }
   | { ok: false; code: EndpointSaveCode; message: string };
+
+/**
+ * 「无实际修改」的统一提示文案（所有驱动同一句，info 层级，不是成功）。
+ * 文案刻意写明「未发送保存请求」，避免用户把它读成「已经保存过了」。
+ */
+export const NO_CHANGES_MESSAGE =
+  "未检测到实际修改（目标配置与当前快照一致）：未发送保存请求";
 
 /**
  * 生成保存计划。**不**发请求、**不**改入参；调用方拿到 `ok:true` 才可 PUT。
@@ -134,12 +147,17 @@ function planCanonicalSave(input: EndpointSavePlanInput): EndpointSavePlan {
     interval_ms: input.intervalMs,
     selections,
   });
+  // 所有驱动统一拦截：无实际修改不发 PUT/stop/start（旧实现只把 changed 当信息，
+  // 于是「什么都没改」也会整份重写一次服务端配置）。
+  if (sameTaskSet(input.tasks, tasks)) {
+    return { ok: false, code: "NO_CHANGES", message: NO_CHANGES_MESSAGE };
+  }
   return {
     ok: true,
     driverKind: "canonical",
     tasks,
     preservedCount: tasks.length - 1,
-    changed: !sameTaskSet(input.tasks, tasks),
+    changed: true,
   };
 }
 
@@ -181,7 +199,7 @@ function planNckSave(input: EndpointSavePlanInput): EndpointSavePlan {
     return {
       ok: false,
       code: "NO_CHANGES",
-      message: "未检测到实际修改（目标任务集与当前快照逐字相等）：未发送保存请求",
+      message: NO_CHANGES_MESSAGE,
     };
   }
   return {
@@ -196,21 +214,84 @@ function planNckSave(input: EndpointSavePlanInput): EndpointSavePlan {
 }
 
 /**
- * 任务集逐字相等判定（顺序敏感：任务顺序也是配置的一部分）。
- * 用稳定 JSON（对象 key 排序）比较，避免"同内容不同 key 顺序"被误判成变更。
+ * 任务集相等判定（**完整配置**口径，§4.4.2 / §4.4.3）。
+ *
+ * 比的是「提交后的有效配置」而不是 `point_key` 摘要：
+ * - 任务 id 集合（多一个/少一个都算变更）；
+ * - 每个任务的 schedule 全字段（poll 的 `interval_ms` 就是采集周期——只比点位
+ *   会漏掉「点位相同、周期未保存」的情形）；
+ * - `binding.kind`；
+ * - `binding.config` 全量逐字（NCK = 每个点位的完整 `parameters`；canonical =
+ *   `resource_id` + `parameters` + `outputs`，**数组顺序保序**：顺序也是配置）。
+ *
+ * 已知且已确认的服务端归一化（唯一允许的差异，其余一律按不一致处理）：
+ * 1. **任务数组顺序**：`GET /api/v1/tasks` 按 task id 升序返回
+ *    （`crates/config-store/src/lib.rs:2172` 的 `ORDER BY id`），提交顺序不被保留。
+ *    因此任务**按 id 对齐**比较，任务数组顺序不算配置差异（任务内点位顺序仍严格比较）。
+ * 2. **Subscribe schedule 的四个缺省字段**：`crates/core-types/src/lib.rs:444-467`
+ *    对 `publishing_interval_ms`(500) / `sampling_interval_ms`(250) /
+ *    `queue_size`(10) / `discard_oldest`(true) 提供 serde default。**这不是放宽**：
+ *    基线来自 GET（服务端已归一），保留任务逐字复制，提交值与回读值本就带同样的
+ *    缺省字段；若提交值真的省掉它们，比对按不一致处理（fail-closed）。
  */
 export function sameTaskSet(
   a: AcquisitionTaskShape[],
   b: AcquisitionTaskShape[],
 ): boolean {
   if (a.length !== b.length) return false;
-  return a.every((task, i) => stableJson(task) === stableJson(b[i]));
+  const byId = new Map<string, AcquisitionTaskShape>();
+  for (const task of b) {
+    if (byId.has(task.id)) return false; // 重复 id 不是合法任务集
+    byId.set(task.id, task);
+  }
+  const seen = new Set<string>();
+  for (const task of a) {
+    if (seen.has(task.id)) return false;
+    seen.add(task.id);
+    const other = byId.get(task.id);
+    if (!other || stableJson(task) !== stableJson(other)) return false;
+  }
+  return true;
 }
 
 /**
- * 点位数组逐字相等判定（保存后回读核对用）。
- * 只比较**点位**而不是整任务：服务端可能对 schedule 做归一化，但点位是
- * 本次编辑的实体，"编辑是否持久化"只应由点位是否原样回来决定。
+ * 保存后回读比对（**所有驱动统一**的成功判据，§4.4.3）。
+ *
+ * 成功 = 回读值与本次**完整提交配置**逐字一致，不是「PUT 返回 2xx」。
+ * 比对范围与 `sameTaskSet` 完全相同（周期 + 每个点位完整参数 + 保留任务），
+ * 因此「点位相同、周期没保存」这类情形会被判为不一致，进入「保存结果待核对」。
+ *
+ * 不设归一化豁免；上面 `sameTaskSet` 注释里列出的两条服务端行为是唯一例外。
+ */
+export function sameSubmittedConfig(
+  readBack: AcquisitionTaskShape[],
+  submitted: AcquisitionTaskShape[],
+): boolean {
+  return sameTaskSet(readBack, submitted);
+}
+
+/** 「本次草稿是否有实际修改」的三态结论（按钮与提交函数共用同一判定）。 */
+export type EndpointChangeState = "changed" | "unchanged" | "unknown";
+
+/**
+ * 供按钮 `canApply` 复用的判定：直接调用**唯一决策点**，不另写一套比较逻辑。
+ * - `changed`：计划通过，确有变更；
+ * - `unchanged`：计划以 `NO_CHANGES` 拒绝（无实际修改）；
+ * - `unknown`：计划因其它原因拒绝（快照/准入/冲突等），按钮同样不可用。
+ */
+export function endpointSaveChangeState(
+  input: EndpointSavePlanInput,
+): EndpointChangeState {
+  const plan = planEndpointTaskSave(input);
+  if (plan.ok) return "changed";
+  return plan.code === "NO_CHANGES" ? "unchanged" : "unknown";
+}
+
+/**
+ * 点位数组逐字相等判定（**点位级**辅助函数）。
+ *
+ * NOTE：它**不是**保存成功判据——成功判据是 `sameSubmittedConfig`（完整配置）。
+ * 只比点位会漏掉「点位相同、周期未保存」，所以调用方不得只拿本函数判成功。
  */
 export function samePoints(a: NckPointSelection[], b: NckPointSelection[]): boolean {
   if (a.length !== b.length) return false;

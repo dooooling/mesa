@@ -111,8 +111,11 @@ describe("P0-1：未选择变量不显示虚假错误", () => {
     expect(screen.queryByTestId("nck-form-issues")).toBeNull();
     expect(screen.queryByTestId("nck-model-reject")).toBeNull();
     expect(screen.queryByText(/FORM_MODEL_INVALID/)).toBeNull();
-    // 提交按钮保持禁用（不是报错，也不产生可提交路径）。
-    expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(true);
+    // §4.1-4：未选变量时只保留**一个选择入口**——不渲染空身份、禁用按钮与错误框
+    // 的组合，因此不存在可提交按钮（也就没有可提交路径）。
+    expect(screen.queryByTestId("nck-add-point")).toBeNull();
+    expect(screen.queryByTestId("nck-point-key-empty")).toBeNull();
+    expect(screen.getByTestId("nck-variable-select")).toBeTruthy();
   });
 
   it("selected_variable_without_definition_still_reports_real_error", () => {

@@ -24,6 +24,30 @@ export function isRunningState(state?: string): boolean {
 }
 
 /**
+ * Endpoint 运行态**三态**（采集页保存流程的唯一依据，§4.4.1 / §6-2）。
+ *
+ * 为什么不能继续用布尔 `running`：`isRunningState(undefined) === false` 会把
+ * 「Endpoint 不在清单里」当成「已停止」，而「已停止」在保存流程里的含义是
+ * **可以直接 PUT、不需要 stop**——这正是最危险的一种推断。三态把「读不到」
+ * 显式表达成 `unknown`，保存侧据此禁止一切写请求（含「只写配置」）。
+ *
+ * 过渡态归属：`CONNECTING` / `RECONNECTING` 归入 `running`（后端在运行中会 409，
+ * 保存必须先 stop），**不得**归入 `stopped`（否则会跳过 stop 直接 PUT 被拒）。
+ */
+export type RunState = "running" | "stopped" | "unknown";
+
+/**
+ * 由服务端状态字符串推导三态。缺失/空/未知取值一律 `unknown`——**不猜**。
+ * 只有明确的 `STOPPED` 才算「已停止」。
+ */
+export function deriveRunState(state?: string | null): RunState {
+  const s = (state ?? "").trim().toUpperCase();
+  if (s === "STOPPED") return "stopped";
+  if (isRunningState(s)) return "running";
+  return "unknown";
+}
+
+/**
  * 严格运行中（仅 RUNNING）。Dashboard“运行中”计数用此口径：
  * CONNECTING / RECONNECTING 是过渡态，不得计入在线；过渡态在启停按钮
  * 侧仍视为忙（isRunningState），避免重复启动。

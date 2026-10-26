@@ -6,11 +6,12 @@
 //
 // 本组件只读 Descriptor 的 `variable` 资源 Schema（12 原生字段），不硬编码
 // 地址规则；唯一的前端规则是已冻结的 derived Key 与 user Key 语法（A27/A26）。
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Alert, Button, Input } from "antd";
 import type { SchemaDescriptor } from "../types";
 import type { NckPointSelection } from "../deviceModel";
 import { DescriptorFields } from "./DescriptorFields";
+import { locateFieldAnchor } from "./fieldFocus";
 import { materializeSchemaDefaults } from "../resourceSelectionModel";
 import { UNSUPPORTED_CONFIG_NOTICE, unsupportedFields } from "../descriptorCompatibility";
 import {
@@ -28,12 +29,18 @@ export function NckNativeFields({
   initialPoint,
   submitLabel,
   onSubmit,
+  focusFieldKey,
 }: {
   schema: SchemaDescriptor;
   takenPointKeys: string[];
   initialPoint?: NckPointSelection | null;
   submitLabel?: string;
   onSubmit: (point: NckPointSelection) => void;
+  /**
+   * 外部要求定位的字段 key（如服务端 `issues[].path` 指到 `...parameters.<field>`）。
+   * 与「必填缺失自动定位」共用同一条机制：**先展开高级区，再在下一轮渲染定位**。
+   */
+  focusFieldKey?: string | null;
 }) {
   const initialValues = useMemo(() => {
     const base = materializeSchemaDefaults(schema);
@@ -55,6 +62,43 @@ export function NckNativeFields({
   // 必须由用户重新勾选。确认态只对「当前这一次 Key」有效：任何键入都会撤销。
   const [confirmed, setConfirmed] = useState(false);
   const [submitError, setSubmitError] = useState("");
+  // 高级字段折叠只由 **Schema 的 `ui.advanced` 标记**决定（§4.1-5）：
+  // 这里不按「原生 12 字段」之类的协议知识分类，只认 Descriptor 的声明。
+  // 校验触发时自动展开并定位到第一个缺失的必填高级字段（§4.1-6）。
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const missingRequiredAdvanced = (schema.fields ?? []).filter(
+    (field) =>
+      field.ui?.advanced === true &&
+      field.required &&
+      (values[field.key] === undefined || values[field.key] === null || values[field.key] === ""),
+  );
+  const firstMissingAdvancedKey = missingRequiredAdvanced[0]?.key;
+  useEffect(() => {
+    if (!firstMissingAdvancedKey) return;
+    // 先展开，再定位：高级区默认**不渲染**，折叠时 `getElementById` 必然是 null，
+    // 直接在这里 scrollIntoView 会静默失败（字段虽然高亮了，用户却还停在表单顶部）。
+    // 展开后本 effect 会因 `advancedOpen` 变化再跑一次，那时锚点已经存在。
+    if (!advancedOpen) {
+      setAdvancedOpen(true);
+      return;
+    }
+    const anchor = document.getElementById(`native-field-${firstMissingAdvancedKey}`);
+    anchor?.scrollIntoView?.({ block: "center" });
+  }, [firstMissingAdvancedKey, advancedOpen]);
+
+  // 外部定位（服务端 issues 的字段级 path）：与上面的必填缺失定位同一套动作——
+  // 高级字段在折叠态**不渲染**，必须先展开，再在下一轮渲染定位并高亮。
+  // 只认 Schema 里真实存在的字段；不存在就什么都不做（不猜、不硬塞高亮）。
+  const focusField = (schema.fields ?? []).find((field) => field.key === focusFieldKey);
+  useEffect(() => {
+    if (!focusFieldKey || !focusField) return;
+    if (focusField.ui?.advanced === true && !advancedOpen) {
+      setAdvancedOpen(true);
+      return;
+    }
+    // 滚动到字段锚点：与通用资源表单共用同一套"有限次重试定位"（`fieldFocus.ts`）。
+    return locateFieldAnchor(`native-field-${focusFieldKey}`);
+  }, [focusFieldKey, focusField, advancedOpen]);
 
   const issues = validateNativeFields(schema, values);
   const derivedKey = nativeDerivedPointKey(values);
@@ -164,7 +208,21 @@ export function NckNativeFields({
       ) : null}
 
       <div style={{ fontSize: 12, color: "#525252" }}>原生字段（来自 Descriptor variable 资源）</div>
-      <DescriptorFields schema={schema} value={values} onChange={setValues} />
+      <DescriptorFields
+        schema={schema}
+        value={values}
+        onChange={setValues}
+        idPrefix="native-field"
+        advancedOpen={advancedOpen}
+        onAdvancedOpenChange={setAdvancedOpen}
+        highlightKeys={
+          // 高亮集合：必填缺失（原有）+ 外部定位字段（issues 的字段级 path）。
+          [
+            ...(firstMissingAdvancedKey ? [firstMissingAdvancedKey] : []),
+            ...(focusField ? [focusField.key] : []),
+          ]
+        }
+      />
 
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <span style={{ fontSize: 12 }}>point_key</span>
@@ -225,3 +283,5 @@ export function NckNativeFields({
     </div>
   );
 }
+
+

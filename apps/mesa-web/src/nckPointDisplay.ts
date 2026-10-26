@@ -12,6 +12,7 @@
 // 校验的点位渲染成人能读的两行信息，判定仍在 nckPointModel / nckCollectability。
 import { buildNckFormModel, nckDefinitionLabel, type NckDefinitionLike } from "./nckPointModel";
 import { summarizeParameters } from "./pointSummary";
+import type { SchemaDescriptor } from "./types";
 
 /** 展示所需的最小点位形态（与 `NckPointSelection` 结构兼容）。 */
 export interface NckDisplayPoint {
@@ -23,7 +24,10 @@ export interface NckDisplayPoint {
 export interface NckPointDisplay {
   /** 易读名称；原生点位恒为「原生点位」（没有可靠业务名称就不编造）。 */
   title: string;
-  /** 地址行：语义点位 `语义点位 · 通道 1 / 轴 2`；原生 `A / 1 / 26 / 30110 / 1`。 */
+  /**
+   * 地址/配置摘要行，一律「字段标签 + 值」：
+   * 语义点位 `通道 1 · 轴 2`；原生 `区域 C · 区域号 1 · 模块 122 · 列 5 · 行 1`。
+   */
   address: string;
   /** 定义版本行（技术详情用）。 */
   revision: string;
@@ -61,11 +65,51 @@ function formatScalar(value: unknown): string {
 /** 原生地址五段（与 derived Key 的寻址字段同序，不重实现 Key 规则）。 */
 const NATIVE_ADDRESS_KEYS = ["area", "area_no", "module", "column", "line"] as const;
 
-function nativeAddress(parameters: Record<string, unknown>): string {
-  const parts = NATIVE_ADDRESS_KEYS.map((key) => parameters[key])
-    .filter((value) => value !== undefined && value !== null && value !== "")
-    .map((value) => formatScalar(value));
-  return parts.length ? parts.join(" / ") : "原生地址字段不完整";
+/**
+ * 原生地址字段的**字段名翻译**（同 §2.6-4 / TARGET_LABELS 机制）。
+ *
+ * 为什么必须有：Descriptor 里这些字段的 label 目前是英文（Area / Area No. …），
+ * 直接展示会得到 `C / 1 / 122 / 5 / 1` 这种**无说明的五段数字**，两个原生点位在
+ * 列表里无法区分也不可读。这里只翻译**字段名**，不猜测任何业务含义。
+ * 未收录的字段退回 Schema label、再退回字段 key。
+ */
+const NATIVE_FIELD_LABELS: Record<string, string> = {
+  area: "区域",
+  area_no: "区域号",
+  module: "模块",
+  column: "列",
+  line: "行",
+};
+
+/** 原生字段的可读标签：翻译表 → Schema label → 字段 key（绝不猜业务名）。 */
+export function nativeFieldLabel(
+  key: string,
+  schemaLabels?: Map<string, string> | null,
+): string {
+  return NATIVE_FIELD_LABELS[key] ?? schemaLabels?.get(key) ?? key;
+}
+
+function nativeAddress(
+  parameters: Record<string, unknown>,
+  schemaLabels?: Map<string, string> | null,
+): string {
+  const parts = NATIVE_ADDRESS_KEYS.filter((key) => {
+    const value = parameters[key];
+    return value !== undefined && value !== null && value !== "";
+  }).map((key) => `${nativeFieldLabel(key, schemaLabels)} ${formatScalar(parameters[key])}`);
+  return parts.length ? parts.join(" · ") : "原生地址字段不完整";
+}
+
+/** Schema 字段 label 索引（保留翻译表优先级，只作兜底）。 */
+function nativeSchemaLabels(
+  schema?: SchemaDescriptor | null,
+): Map<string, string> | null {
+  if (!schema) return null;
+  const labels = new Map<string, string>();
+  for (const field of schema.fields ?? []) {
+    if (typeof field.label === "string" && field.label !== "") labels.set(field.key, field.label);
+  }
+  return labels;
 }
 
 /** 语义点位的地址：Target + Arguments，用定义里的 label 解释字段（不猜业务名）。 */
@@ -96,7 +140,8 @@ function semanticAddress(
   const body = summarizeParameters(
     { ...target, ...args },
     {
-      separator: " / ",
+      // §2.2 摘要形态：`通道 1 · 轴 1`（与通用「字段标签 + 值」摘要同一分隔符）。
+      separator: " · ",
       labelOf: (key) => labels.get(key),
       // drive_object 的 envelope：{number, entry}；entry 是入口身份，不是业务名。
       formatEntry: (key, value) => {
@@ -106,7 +151,7 @@ function semanticAddress(
       },
     },
   );
-  return body ? `语义点位 · ${body}` : "语义点位";
+  return body || "语义点位";
 }
 
 /**
@@ -121,12 +166,16 @@ function semanticAddress(
 export function nckPointDisplay(
   point: NckDisplayPoint,
   definition: NckDefinitionLike | null | undefined,
+  options: {
+    /** Descriptor 原生字段 Schema（提供时用它的 label 兜底翻译表）。 */
+    nativeSchema?: SchemaDescriptor | null;
+  } = {},
 ): NckPointDisplay {
   const parameters = point.parameters ?? {};
   if (point.kind === "nck_native") {
     return {
       title: "原生点位",
-      address: nativeAddress(parameters),
+      address: nativeAddress(parameters, nativeSchemaLabels(options.nativeSchema)),
       revision: "定义版本：不适用（高级原生点位）",
     };
   }

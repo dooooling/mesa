@@ -3,8 +3,8 @@
 // 本页只负责：Device 加载 + Header + Tab 导航 + 当前页 + Point Drawer。
 // Connection 选择各页局部管理（useConnectionQuery），无全局 Context。
 import { useCallback, useEffect, useState } from "react";
-import { Alert, Button, Card } from "antd";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { Alert, Button, Card } from "antd";
 import { PointDetailDrawer, pointIdentityOf, type PointIdentity } from "../components/PointDetailDrawer";
 import { DeviceAcquisition } from "./DeviceAcquisition";
 import { DeviceConnections } from "./DeviceConnections";
@@ -143,6 +143,8 @@ export function DeviceWorkspacePage() {
 
       {epError ? <Alert type="warning" showIcon message="连接清单不可用" description={epError} /> : null}
 
+      {/* Tab 切换的离开确认由 DeviceTabNav 内部走统一守卫（`draftNavGuard`），
+          与侧栏、面包屑、浏览器前进后退共用同一份判定。 */}
       <DeviceTabNav deviceId={deviceId} active={activeTab} />
 
       {renderTab()}

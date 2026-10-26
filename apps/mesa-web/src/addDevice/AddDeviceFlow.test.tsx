@@ -899,7 +899,8 @@ describe("PR-D D1–D3：NCK 数据步只提供语义入口", () => {
     // 只填 Target 即可加入：不得出现「缺少必填参数：area/area_no/...」。
     expect(screen.queryByText(/缺少必填参数/)).toBeNull();
     expect(screen.queryByTestId("missing-required")).toBeNull();
-    expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(true);
+    // §4.1-4：未选择变量时只保留一个选择入口（没有提交按钮，也就没有可提交路径）。
+    expect(screen.queryByTestId("nck-add-point")).toBeNull();
 
     await addSemanticPoint(userEvent.setup(), "1");
     expect(screen.getByTestId("nck-draft-point-row").textContent).toContain(
@@ -1267,8 +1268,9 @@ describe("PR-D：删除后重加与连接草稿变更", () => {
     await user.click(screen.getByTestId("nck-remove-point"));
     expect(screen.queryByTestId("nck-draft-point-row")).toBeNull();
     expect(calls.filter((c) => c.method !== "GET").length).toBe(writesBefore);
-    // 删除后表单里没有旧 Preview 留下的 Key。
-    expect(screen.getByTestId("nck-point-key-empty")).toBeTruthy();
+    // 删除后表单里没有旧 Preview 留下的 Key（未选变量时连身份行都不渲染）。
+    expect(screen.queryByTestId("nck-point-key-empty")).toBeNull();
+    expect(screen.queryByTestId("nck-point-key")).toBeNull();
 
     // 重新加入必须重新选择并重新请求服务端 Preview（不复用旧状态）。
     await addSemanticPoint(user, "1");

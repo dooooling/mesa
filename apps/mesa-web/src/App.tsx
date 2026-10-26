@@ -1,6 +1,6 @@
 import { Layout, Menu, theme } from "antd";
 import { DashboardOutlined, ApiOutlined, EyeOutlined, BellOutlined, SettingOutlined } from "@ant-design/icons";
-import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { DevicesPage } from "./pages/DevicesPage";
 import { DeviceWorkspacePage } from "./workspace/DeviceWorkspacePage";
 import { AddDeviceFlow } from "./addDevice/AddDeviceFlow";
@@ -10,6 +10,7 @@ import { NotFoundPage } from "./pages/NotFoundPage";
 import { OverviewPage } from "./overview/OverviewPage";
 import { StaleClockProvider } from "./workspace/StaleClock";
 import { SystemPage } from "./system/SystemPage";
+import { DraftGuardProvider, useGuardedNavigate } from "./workspace/draftNavGuard";
 
 const { Header, Sider, Content } = Layout;
 
@@ -25,9 +26,21 @@ const items = [
 ];
 
 export default function App() {
+  // 守卫状态必须在外壳层（侧栏与面包屑都不在设备页里）：Provider 包住整个应用壳，
+  // 由 AppShell 消费（`useGuardedNavigate` 必须在 Provider 内部调用）。
+  return (
+    <DraftGuardProvider>
+      <AppShell />
+    </DraftGuardProvider>
+  );
+}
+
+function AppShell() {
   const loc = useLocation();
-  const nav = useNavigate();
   const { token } = theme.useToken();
+  // 应用内离开守卫：侧栏点击必须与设备 Tab/面包屑/浏览器前进后退共用同一判定
+  //（有未保存草稿时先确认，取消则该次导航不发生，§7-7）。
+  const guardedNavigate = useGuardedNavigate();
   // 高亮归属：Workspace 严格嵌套在 Device 下（无顶层入口），高亮仍归属 /devices；
   // 根路径与未知路径回总览。
   const selected = loc.pathname === "/"
@@ -49,7 +62,7 @@ export default function App() {
           <span style={{ width: 28, height: 28, background: token.colorPrimary, color: "#ffffff", display: "grid", placeItems: "center", fontSize: 14, fontWeight: 600 }}>M</span>
           <span>Mesa</span>
         </div>
-        <Menu theme="light" mode="inline" selectedKeys={[selected]} items={items} onClick={({ key }) => nav(key)} style={{ borderRight: "none" }} />
+        <Menu theme="light" mode="inline" selectedKeys={[selected]} items={items} onClick={({ key }) => guardedNavigate(key)} style={{ borderRight: "none" }} />
       </Sider>
       <Layout style={{ background: token.colorBgLayout }}>
         <Header style={{ padding: "0 16px", background: "#ffffff", borderBottom: "1px solid #e0e0e0", display: "flex", alignItems: "center" }}>

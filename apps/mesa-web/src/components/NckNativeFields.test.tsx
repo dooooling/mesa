@@ -350,3 +350,53 @@ describe("A3：未知字段类型禁止加入原生点位", () => {
     expect(screen.getByTestId("nck-native-submit-error").textContent).toContain("当前界面不支持");
   });
 });
+
+// 第 2 步 §4.1-5/6：高级字段折叠只由 **Schema 的 ui.advanced** 决定；缺失必填时
+// 自动展开并高亮定位（不静默落到后端 400）。
+describe("高级字段：按 ui.advanced 折叠 + 必填缺失自动展开定位", () => {
+  const advancedSchema: SchemaDescriptor = {
+    fields: [
+      ...schema.fields,
+      {
+        key: "advanced_note",
+        label: "Advanced note",
+        field_type: "string",
+        required: false,
+        validation: {},
+        ui: { advanced: true },
+      },
+      {
+        key: "advanced_required",
+        label: "Advanced required",
+        field_type: "string",
+        required: true,
+        validation: {},
+        ui: { advanced: true },
+      },
+    ],
+  };
+
+  it("collapses_advanced_by_default_but_expands_when_required_is_missing", () => {
+    render(<NckNativeFields schema={advancedSchema} takenPointKeys={[]} onSubmit={vi.fn()} />);
+    // 未携带必填高级字段 ⇒ 自动展开（并高亮第一个缺失项），而不是静默不可提交。
+    const advancedField = document.querySelector('[data-field-key="advanced_required"]');
+    expect(advancedField).not.toBeNull();
+    expect(advancedField!.getAttribute("id")).toBe("native-field-advanced_required");
+    // 「高级（N）」折叠标题仍在（可手动收起），但默认是展开的。
+    expect(screen.getByRole("button", { name: /收起高级/ })).toBeTruthy();
+  });
+
+  it("keeps_advanced_collapsed_when_nothing_required_is_missing", () => {
+    const complete = nativePoint();
+    const withAdvanced = {
+      ...complete,
+      parameters: { ...complete.parameters, advanced_required: "ok" },
+    };
+    render(
+      <NckNativeFields schema={advancedSchema} takenPointKeys={[]} initialPoint={withAdvanced} onSubmit={vi.fn()} />,
+    );
+    // 高级字段齐全 ⇒ 默认收起（不占默认视觉）。
+    expect(screen.queryByRole("button", { name: /收起高级/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /高级（2）/ })).toBeTruthy();
+  });
+});

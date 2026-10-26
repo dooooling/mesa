@@ -217,7 +217,10 @@ describe("M3.1 全局实时数据", () => {
     });
     expect(counts()).toBe("全部 2 · GOOD 0 · BAD 1 · STALE 1");
     expect(screen.getAllByText("spindle.speed").length).toBeGreaterThanOrEqual(1);
-  });
+    // 显式超时：本用例内部已有多个 10s/30s 的等待，默认 5s 会在整文件并行
+    // 执行时偶发超时（第 3 步验收报已记录的既有 flake，§7-10）。只加时限，
+    // 不改任何断言。
+  }, 60_000);
 
   it("导出前可见范围提示：原始响应含全部端点，分析按所选设备与连接过滤", async () => {
     // 复审修订 2：raw_scope / analysis_scope 不能只存在于文件里，
