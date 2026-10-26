@@ -305,7 +305,9 @@ describe("门禁 7：新增点位 → nck.points.v1 → PUT 后回读一致", ()
     await waitFor(() => expect(saveButton().disabled).toBe(false));
     await user.click(saveButton());
 
-    await screen.findByText(/点位已保存/);
+    // 回读一致后才报成功；成功提示只由保存区结果条展示一次（§4.6-4）。
+    const result = await screen.findByTestId("apply-result");
+    expect(result.textContent).toContain("配置已保存");
     expect(state.putBodies).toHaveLength(1);
     const sent = state.putBodies[0];
     expect(sent).toHaveLength(1);
@@ -372,7 +374,9 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
         }}
       />,
     );
-    await waitFor(() => expect(saveButton().disabled).toBe(false));
+    // 快照就绪（点位行已渲染）；无实际修改时按钮禁用（§4.4.2）。
+    await screen.findByTestId("nck-point-row");
+    await waitFor(() => expect(saveButton().disabled).toBe(true));
     expect(rowOf(p1.point_key)).toBeTruthy();
 
     // 在同一个 NCK 任务里新增第二个点位。
@@ -386,7 +390,8 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
     await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(2));
     await waitFor(() => expect(saveButton().disabled).toBe(false));
     await user.click(saveButton());
-    await screen.findByText(/点位已保存/);
+    const result = await screen.findByTestId("apply-result");
+    expect(result.textContent).toContain("配置已保存");
 
     expect(state.putBodies).toHaveLength(1);
     const sent = state.putBodies[0];
@@ -424,7 +429,9 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
         }}
       />,
     );
-    await waitFor(() => expect(saveButton().disabled).toBe(false));
+    // 快照就绪（点位行已渲染）；无实际修改时按钮禁用（§4.4.2）。
+    await screen.findByTestId("nck-point-row");
+    await waitFor(() => expect(saveButton().disabled).toBe(true));
 
     await user.click(within(rowOf(original.point_key)).getByRole("button", { name: /编\s*辑/ }));
     const input = screen.getByLabelText("target-channel") as HTMLInputElement;
@@ -439,7 +446,8 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
     );
     await waitFor(() => expect(saveButton().disabled).toBe(false));
     await user.click(saveButton());
-    await screen.findByText(/点位已保存/);
+    const result = await screen.findByTestId("apply-result");
+    expect(result.textContent).toContain("配置已保存");
 
     const sent = state.putBodies[0];
     expect(sent).toHaveLength(1);
@@ -519,7 +527,8 @@ describe("门禁 9：存量 identity 点位 → 显式移除 → 重验剩余 �
 
     // 6) 保存只包含剩余合法点位；identity 没有被静默改成 collect。
     await user.click(saveButton());
-    await screen.findByText(/点位已保存/);
+    const result = await screen.findByTestId("apply-result");
+    expect(result.textContent).toContain("配置已保存");
     expect(state.putBodies).toHaveLength(1);
     const sentPoints = (state.putBodies[0][0].binding.config as { points: NckPointSelection[] })
       .points;
@@ -673,10 +682,17 @@ describe("PR-C 第三批：Endpoint 页 native 存量点位复核（A24–A27）
     );
     // P1-2：状态标签只声明“配置格式校验通过”，不得暗示真实机床已读取成功。
     await screen.findByText("配置格式校验通过（原生）");
-    await waitFor(() => expect(saveButton().disabled).toBe(false));
-    await user.click(saveButton());
+    // 无实际修改 ⇒ 按钮禁用（§4.4.2）。
+    await waitFor(() => expect(saveButton().disabled).toBe(true));
+    // 按钮禁用只是体验：绕过 disabled 直接触发提交函数，仍不得发任何写请求。
+    const fetchMock = globalThis.fetch as unknown as {
+      mock: { calls: Array<[string, RequestInit | undefined]> };
+    };
+    const before = fetchMock.mock.calls.length;
+    expect(invokeDisabledButton(saveButton())).toBe(true);
     await screen.findByText(/未检测到实际修改/);
     expect(state.putBodies).toHaveLength(0);
+    expect(fetchMock.mock.calls.length).toBe(before);
 
     // native 点位也必须可进入编辑（高级原生页），而不是只能移除。
     await user.click(

@@ -17,8 +17,8 @@ import type { DriverDescriptor, ValidationIssue } from "../types";
 import {
   NCK_POINTS_KIND,
   applyEndpointChange,
+  deriveRunState,
   isNckDriver,
-  isRunningState,
   isTaskSnapshotReady,
   selectionsOf,
   splitAcquisitionTasks,
@@ -26,6 +26,7 @@ import {
   type LifecycleStepResult,
   type NckPointSelection,
   type ResourceSelection,
+  type RunState,
   type TaskSnapshotState,
 } from "../deviceModel";
 import {
@@ -33,7 +34,17 @@ import {
   evaluateNckSelectionAdd,
 } from "../nckCollectability";
 import { nckPointsOf, parseTaskBinding, selectEditableTask } from "../nckTaskBinding";
-import { planEndpointTaskSave, samePoints } from "../endpointSavePlan";
+import {
+  endpointSaveChangeState,
+  planEndpointTaskSave,
+  sameSubmittedConfig,
+} from "../endpointSavePlan";
+import {
+  alignRowIds,
+  assignRowIds,
+  createRowIdAllocator,
+  stableIdentityKey,
+} from "../pointRows";
 import {
   classifyNckError,
   describeNckFailure,
@@ -122,6 +133,9 @@ function snapshotIntervalMs(task: AcquisitionTaskShape | null | undefined): numb
  *
  * 存在意义：状态区必须同时说清「当前生效」与「尚未保存」。只读编辑状态会把
  * 草稿显示成当前配置，用户会以为改动已经生效。
+ *
+ * `tasks` 是**完整任务基线**（周期 + 每个点位的完整参数 + 保留任务），
+ * 保存后回读一致时整份替换；展示用的 `intervalMs` / `pointCount` 只是它的投影。
  */
 interface SavedBaseline {
   /** 服务端当前是否存在可编辑的采集任务；false 时没有「已保存」值可对照。 */
@@ -129,14 +143,62 @@ interface SavedBaseline {
   intervalMs: number | null;
   /** 已生效点位数（口径与状态区一致：NCK = 点位，非 NCK = 资源选择条数）。 */
   pointCount: number;
+  /** 完整任务基线（回读一致后的真值；无任务时为空数组）。 */
+  tasks: AcquisitionTaskShape[];
+}
+
+/** 保存后回读一致时写入的完整基线（周期 + 点位完整参数 + 保留任务）。 */
+interface SaveBaseline {
+  tasks: AcquisitionTaskShape[];
+  intervalMs: number;
+  pointCount: number;
 }
 
 /**
- * 保存后回读任务快照（仅 NCK 使用）。
+ * 「保存结果待核对」的待确认提交（§4.4.3）。
+ *
+ * 为什么必须记住这些值：PUT 已返回 2xx 但回读失败/不一致时，页面既不能说成功、
+ * 也不能刷新基线，更不能直接重新 PUT。用户点「重新核对」时只能拿**同一份提交值**
+ * 再比一次；核对一致后还要接着执行用户原本选择的恢复采集（原保存可能停在写入后、
+ * 启动前），因此 `restart` / `wasRunning` 必须一起留存。
+ */
+interface PendingVerification {
+  baseline: SaveBaseline;
+  /** 用户当时选择的「保存后是否恢复采集」。 */
+  restart: boolean;
+  /** 本次保存前 Endpoint 是否在运行（决定核对一致后是否需要 start）。 */
+  wasRunning: boolean;
+  /** 回读失败（请求本身失败）还是回读与提交值不一致。 */
+  reason: "read-failed" | "mismatch";
+}
+
+/** 保存结果（持久展示，不用一次性 toast；§4.6-4）。 */
+type SaveOutcome =
+  | { kind: "failed"; message: string }
+  | { kind: "state-changed"; message: string }
+  | { kind: "pending-verify"; message: string; canResave?: boolean };
+
+/** Endpoint 清单条目（只取本窗格需要的字段，避免把清单形状硬编码进业务判断）。 */
+interface EndpointListEntry {
+  id: string;
+  state?: string;
+  runtime?: { state?: string };
+  connection?: unknown;
+}
+
+/** 运行态未知时禁止保存的统一文案（含「只写配置」，§4.4.1）。 */
+const RUN_STATE_UNKNOWN_NOTICE =
+  "运行状态未知，已禁用保存（含只写配置）：请先刷新状态，草稿仍可编辑";
+
+/** 回读无法确认时的持久提示（§4.4.3）。 */
+const PENDING_VERIFY_NOTICE = "保存结果待核对";
+
+/**
+ * 保存后回读任务快照（**所有驱动**的成功判据，§4.4.3）。
  *
  * 为什么需要：`PUT /tasks` 返回 2xx 只证明"服务端接受了请求"，不证明"编辑已
- * 持久化"。旧实现正是在这里把 no-op 当成功汇报。NCK 路径因此额外回读一次，
- * 以点位是否原样回来作为成功判据。
+ * 持久化"。旧实现只对 NCK 回读，非 NCK 把 2xx 直接当成功——本步统一为：
+ * 回读值与**本次完整提交配置**一致才算成功，否则进入「保存结果待核对」。
  */
 async function readBackTasks(endpointId: string): Promise<AcquisitionTaskShape[] | null> {
   const r = await fetch(`/api/v1/tasks?endpoint=${endpointId}`);
@@ -161,11 +223,21 @@ export function EndpointAcquisitionPane({
   const [sels, setSels] = useState<ResourceSelection[]>([]);
   // NCK 待提交点位（来自快照 + 本批新增/编辑；身份一律来自服务端预览）。
   const [nckPoints, setNckPoints] = useState<NckPointSelection[]>([]);
+  // 行身份（§4.8）：与 sels / nckPoints **按下标对齐**的稳定 rowId。
+  // 只用于界面定位（React key / data-row-id），不参与配置差异判定。
+  const [selRowIds, setSelRowIds] = useState<string[]>([]);
+  const [nckRowIds, setNckRowIds] = useState<string[]>([]);
+  // 分配器只发号不回收：删除后的 id 不复用，避免「删掉的行」与「新行」撞 key。
+  const rowIdAllocator = useRef(createRowIdAllocator("row"));
   const [existingTasks, setExistingTasks] = useState<AcquisitionTaskShape[]>([]);
   const [preservedTasks, setPreservedTasks] = useState<AcquisitionTaskShape[]>([]);
   // 现有任务无法安全编辑（多候选 / 结构非法）：保存必须禁用，绝不猜第一个。
   const [editBlock, setEditBlock] = useState<{ code: string; message: string } | null>(null);
-  const [running, setRunning] = useState(false);
+  // 运行态**三态**（§4.4.1）：unknown 一律禁止保存（含只写配置）。
+  const [runState, setRunState] = useState<RunState>("unknown");
+  // 是否已完成一次运行态读取：只用于「未知」提示的展示时机——首次加载期间
+  // 不应把「还不知道」渲染成一条警告（§3.3 首屏安静），但保存侧仍按 unknown 禁用。
+  const [runStateSettled, setRunStateSettled] = useState(false);
   const [intervalMs, setIntervalMs] = useState(1000);
   const [saving, setSaving] = useState(false);
   // P0-2：运行中是否在应用后恢复运行。提升到父层是为了让底部执行说明与
@@ -184,6 +256,16 @@ export function EndpointAcquisitionPane({
   // P2-2：服务端已生效配置的展示快照（null = 快照未就绪/不可用）。
   // 状态区据此区分「已保存」与「待保存」，不再让草稿冒充当前配置。
   const [savedBaseline, setSavedBaseline] = useState<SavedBaseline | null>(null);
+  // 回读无法确认（PUT 已发出但结果未知）：不报成功、不刷新基线、不自动重发 PUT。
+  const [pendingVerify, setPendingVerify] = useState<PendingVerification | null>(null);
+  const [rechecking, setRechecking] = useState(false);
+  // 持久保存结果（失败/状态变化/待核对）；成功由 ApplyWithRestart 的结果条展示一次。
+  const [saveOutcome, setSaveOutcome] = useState<SaveOutcome | null>(null);
+  // 「配置已保存但启动失败」：草稿标记已清除，但处理入口必须保留（可跨新修改存活）。
+  const [restartFailed, setRestartFailed] = useState<string | null>(null);
+
+  // 过渡态（CONNECTING / RECONNECTING）按「运行中」路径处理（先 stop 再写入）。
+  const running = runState === "running";
 
   // ---- 第二批 B 新增状态 -------------------------------------------------
   // Endpoint 有效连接配置的 family（权威来源；目录顶层 family 只是回显）。
@@ -430,10 +512,65 @@ export function EndpointAcquisitionPane({
     };
   }, [nck, driverId, nckDefinitions]);
 
+  // ---- 运行态三态（§4.4.1 / §6-2） ---------------------------------------
+  //
+  // 与 family 共用同一次 `GET /api/v1/endpoints`（family 的唯一权威来源也是它）。
+  // 关键点：**每次读取前先把状态复位为 unknown**——读取失败、Endpoint 不在清单、
+  // 未知取值都不得沿用上一次的值（旧实现 catch 里不复位，于是切换连接后仍显示
+  // 上一台的运行态，保存路径也跟着错）。
+  const runStateToken = useRef(0);
+
+  /**
+   * 重新读取运行态 + Endpoint family。
+   *
+   * 返回本次读到的三态（`null` = 已被更新的读取取代，调用方应放弃后续动作）。
+   * `unknown` 是**正常返回值**，不是异常：它表示「无法确认」，调用方必须禁止保存。
+   *
+   * `resetFirst`：读取前是否先把状态复位为 unknown。
+   * - 刷新/加载路径必须复位（fail-closed：读不到就不得沿用旧值）；
+   * - **保存前复核**不复位：复核期间界面不应闪成「状态未知」，且此时尚未发出任何
+   *   写请求；读取失败仍会在 catch 里落成 unknown。
+   */
+  const loadRunState = useCallback(
+    async (opts: { resetFirst?: boolean } = {}): Promise<RunState | null> => {
+      const token = ++runStateToken.current;
+      if (opts.resetFirst !== false) setRunState("unknown");
+      try {
+        const j = (await api.listEndpoints()) as { endpoints?: EndpointListEntry[] };
+        if (token !== runStateToken.current) return null;
+        const list = j?.endpoints ?? [];
+        const live = list.find((e) => e.id === endpointId);
+        const next = deriveRunState(live?.state ?? live?.runtime?.state);
+        setRunState(next);
+        setRunStateSettled(true);
+        // family 的唯一权威来源 = Endpoint 有效连接配置（不是目录顶层回显）。
+      const connection = live?.connection;
+      const rawFamily =
+        connection && typeof connection === "object" && !Array.isArray(connection)
+          ? (connection as { family?: unknown }).family
+          : undefined;
+      setEndpointFamily(
+        typeof rawFamily === "string" && rawFamily.trim() ? rawFamily.trim() : null,
+      );
+      setEndpointFamilyState("ready");
+      return next;
+    } catch {
+      if (token !== runStateToken.current) return null;
+      // 读取失败 ⇒ 运行态未知（不是「已停止」）；family 同样不可信。
+      setRunState("unknown");
+      setRunStateSettled(true);
+      setEndpointFamily(null);
+      setEndpointFamilyState("error");
+      return "unknown";
+    }
+  }, [endpointId]);
+
   useEffect(() => {
     // 切 Endpoint 时先复位：旧快照不得污染新窗格（fail-closed 默认禁用保存）。
     setSels([]);
+    setSelRowIds([]);
     setNckPoints([]);
+    setNckRowIds([]);
     setEditBlock(null);
     setExistingTasks([]);
     setPreservedTasks([]);
@@ -454,6 +591,13 @@ export function EndpointAcquisitionPane({
     setBrowsePreset(null);
     setEndpointFamily(null);
     setEndpointFamilyState("loading");
+    // 运行态必须立即复位为未知：切换连接后不得沿用上一台的值（§4.4.1）。
+    setRunState("unknown");
+    setRunStateSettled(false);
+    // 上一台的待核对/失败/启动失败结论同样不得带过来。
+    setPendingVerify(null);
+    setSaveOutcome(null);
+    setRestartFailed(null);
     let cancelled = false;
     // Descriptor + Task 快照并行加载；二者都成功才开放保存（NCK 只需要任务快照，
     // 因为它的点位来自定义目录/快照而不是 Descriptor 的 resources）。
@@ -483,8 +627,9 @@ export function EndpointAcquisitionPane({
             setEditBlock({ code: selected.code, message: selected.message });
             setPreservedTasks([]);
             setNckPoints([]);
+            setNckRowIds([]);
             // 现有任务无法安全编辑 ⇒ 没有可信的「已生效」值可对照。
-            setSavedBaseline({ hasTask: false, intervalMs: null, pointCount: 0 });
+            setSavedBaseline({ hasTask: false, intervalMs: null, pointCount: 0, tasks: [] });
           } else {
             setPreservedTasks(selected.preserved);
             preservedIds = selected.preserved.map((t) => t.id);
@@ -494,11 +639,14 @@ export function EndpointAcquisitionPane({
             // 只读 `{points:[…]}`：绝不把 NCK 点位当成 ResourceSelection[]。
             const loadedPoints = nckPointsOf(selected.editable);
             setNckPoints(loadedPoints);
-            // P2-2 基线：快照里已生效的周期/点位（保存成功后由 PUT 成功分支刷新）。
+            // 行身份在**加载快照**时分配一次，之后编辑/搜索/分页都不再重发（§4.8）。
+            setNckRowIds(assignRowIds(loadedPoints.length, rowIdAllocator.current));
+            // P2-2 基线：快照里已生效的完整任务集（保存回读一致后才整份替换）。
             setSavedBaseline({
               hasTask: !!selected.editable,
               intervalMs: snapshotIntervalMs(selected.editable),
               pointCount: loadedPoints.length,
+              tasks,
             });
           }
         } else {
@@ -509,12 +657,16 @@ export function EndpointAcquisitionPane({
           if (editable?.schedule?.mode === "poll") {
             setIntervalMs(editable.schedule.interval_ms ?? 1000);
           }
-          if (loadedSelections.length) setSels(loadedSelections);
-          // P2-2 基线：快照里已生效的周期/选择条数（保存成功后由 PUT 成功分支刷新）。
+          if (loadedSelections.length) {
+            setSels(loadedSelections);
+            setSelRowIds(assignRowIds(loadedSelections.length, rowIdAllocator.current));
+          }
+          // P2-2 基线：快照里已生效的完整任务集（保存回读一致后才整份替换）。
           setSavedBaseline({
             hasTask: !!editable,
             intervalMs: snapshotIntervalMs(editable),
             pointCount: loadedSelections.length,
+            tasks,
           });
         }
         // 快照就绪：只有此时保存才允许 PUT（空数组即服务端真的无任务）。
@@ -534,28 +686,15 @@ export function EndpointAcquisitionPane({
         setTasksLoadError("任务快照加载失败：服务端任务集未知，已禁用保存（请切换后重试，不会覆盖已有任务）。");
       }
     });
-    api.listEndpoints()
-      .then((j) => {
-        if (cancelled) return;
-        const list = ((j as { endpoints?: Array<{ id: string; runtime?: { state?: string }; state?: string; connection?: unknown }> }).endpoints ?? []);
-        const live = list.find((e) => e.id === endpointId);
-        setRunning(isRunningState(live?.state ?? live?.runtime?.state));
-        // family 的唯一权威来源 = Endpoint 有效连接配置（不是目录顶层回显）。
-        const connection = live?.connection;
-        const rawFamily =
-          connection && typeof connection === "object" && !Array.isArray(connection)
-            ? (connection as { family?: unknown }).family
-            : undefined;
-        setEndpointFamily(typeof rawFamily === "string" && rawFamily.trim() ? rawFamily.trim() : null);
-        setEndpointFamilyState("ready");
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setEndpointFamily(null);
-        setEndpointFamilyState("error");
-      });
-    return () => { cancelled = true; };
-  }, [endpointId, driverId]);
+    // 运行态与 family 走同一次 GET（loadRunState 内部复位为 unknown，
+    // 读取失败/清单缺失都不会沿用上一台的值）。
+    void loadRunState();
+    return () => {
+      cancelled = true;
+      // 让在途的运行态读取作废：切换连接后它的结果不得回写到新窗格。
+      runStateToken.current += 1;
+    };
+  }, [endpointId, driverId, loadRunState]);
 
   // ---- 已有点位重新核验（加载后 & 点位变化后） ---------------------------
   const verifyToken = useRef(0);
@@ -612,6 +751,8 @@ export function EndpointAcquisitionPane({
       return message.error("该 point_key 已被 Endpoint 内其它点位占用：请调整 Target/Arguments（不得自动改名/加后缀）");
     }
     setNckPoints((prev) => [...prev, point]);
+    // 新行分配**新** rowId（删除过的 id 不复用）；既有行身份不变（§4.8）。
+    setNckRowIds((prev) => [...prev, rowIdAllocator.current.next()]);
     // 表单重建一次：避免上一条目的输入（含 Browse 预填）残留到下一次新增。
     setBrowsePreset(null);
     setFormVersion((v) => v + 1);
@@ -622,6 +763,7 @@ export function EndpointAcquisitionPane({
       return message.error("该 point_key 已被 Endpoint 内其它点位占用：请调整 Target/Arguments（不得自动改名/加后缀）");
     }
     setNckPoints((prev) => prev.map((p, i) => (i === index ? point : p)));
+    // 编辑**不**改 rowId：同一行换了 point_key/参数，仍然是同一行（§4.8）。
     setEditingIndex(null);
     setFormVersion((v) => v + 1);
   };
@@ -645,6 +787,8 @@ export function EndpointAcquisitionPane({
         : "用户显式移除（原始配置已保留）";
     setRemovedPoints((prev) => [{ point, reason }, ...prev]);
     setNckPoints((prev) => prev.filter((_, i) => i !== index));
+    // 移除只删掉**这一行**的 rowId：其余行的身份与顺序不变（不重新发号）。
+    setNckRowIds((prev) => prev.filter((_, i) => i !== index));
     setEditingIndex((current) => {
       if (current === null) return null;
       if (current === index) return null;
@@ -726,7 +870,119 @@ export function EndpointAcquisitionPane({
   );
   const hasIncompatible = incompatible.length > 0;
 
-  const save = async (restart: boolean) => {
+  /**
+   * 回读一致后写入**完整任务基线**（§4.4.3 步骤 2）。
+   *
+   * 为什么连 `existingTasks` 一起换：它才是下一次「无实际修改判定」的对照物。
+   * 只更新展示计数/点位列表，会让刚保存完的页面再点一次保存又发一遍 PUT
+   * （判据仍拿旧快照比较）。基线必须同时覆盖周期、每个点位完整参数、保留任务。
+   */
+  const applyVerifiedBaseline = useCallback((baseline: SaveBaseline) => {
+    setExistingTasks(baseline.tasks);
+    setSavedBaseline({
+      hasTask: true,
+      intervalMs: baseline.intervalMs,
+      pointCount: baseline.pointCount,
+      tasks: baseline.tasks,
+    });
+  }, []);
+
+  /** 只执行「启动」步骤（待核对核对一致后的恢复采集、启动失败后的重试共用）。 */
+  const startOnly = async (): Promise<void> => {
+    const r = await api.startEndpoint(endpointId).catch((e) => ({
+      status: -1,
+      body: { error: { message: e instanceof Error ? e.message : String(e) } },
+    }));
+    if (r.status === 200) {
+      setRunState("running");
+      setLastApply("restarted");
+      setRestartFailed(null);
+      setSaveOutcome(null);
+    } else {
+      const msg =
+        (r.body as { error?: { message?: string } })?.error?.message ?? `恢复采集失败（${r.status}）`;
+      setRunState("stopped");
+      setLastApply("restart-failed");
+      setRestartFailed(msg);
+    }
+    onChanged();
+  };
+
+  /**
+   * 启动失败后的**重试启动**：只调用启动步骤，不 stop、不 PUT（§4.5）。
+   *
+   * 配置在回读一致时已经确认保存（基线已刷新），重复整套保存只会把已生效的
+   * 配置再覆盖一次，并多出一次不必要的采集中断。
+   */
+  const retryStart = async () => {
+    if (saving || rechecking) return;
+    setSaving(true);
+    try {
+      await startOnly();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /**
+   * 「保存结果待核对」→ 重新核对（§4.4.3）：只再次 GET 比对，**绝不**重新 PUT。
+   * - 一致 ⇒ 刷新完整基线，并继续执行用户原本选择的恢复采集；
+   * - 不一致 ⇒ 仍为待核对，此时才允许用户主动「重新保存」（重新走完整保存前检查）。
+   */
+  const recheckPending = async () => {
+    const pending = pendingVerify;
+    if (!pending || saving || rechecking) return;
+    setRechecking(true);
+    try {
+      const back = await readBackTasks(endpointId).catch(() => null);
+      if (back === null) {
+        setSaveOutcome({
+          kind: "pending-verify",
+          message: `${PENDING_VERIFY_NOTICE}：回读失败，仍无法确认配置是否已持久化（未刷新基线，未重复写入）`,
+        });
+        return;
+      }
+      if (!sameSubmittedConfig(back, pending.baseline.tasks)) {
+        setSaveOutcome({
+          kind: "pending-verify",
+          message: `${PENDING_VERIFY_NOTICE}：回读不一致（服务端当前配置与本次提交不同；未刷新基线，未重复写入）。可重新核对，或主动重新保存`,
+          canResave: true,
+        });
+        return;
+      }
+      applyVerifiedBaseline(pending.baseline);
+      setPendingVerify(null);
+      setSaveOutcome(null);
+      setSaveIssues([]);
+      // 原保存可能停在「写入后、启动前」：核对一致后继续用户选择的恢复采集。
+      if (pending.wasRunning && pending.restart) {
+        await startOnly();
+      } else {
+        setRunState("stopped");
+        setLastApply("stopped");
+        onChanged();
+      }
+    } finally {
+      setRechecking(false);
+    }
+  };
+
+  const save = async (restart: boolean, opts: { fromPendingResave?: boolean } = {}) => {
+    // 保存中不允许并发发起第二次（复核步骤本身也要时间）。
+    if (saving) return;
+    // 「保存结果待核对」期间**不得直接重新 PUT**：主操作只能是「重新核对」。
+    // 唯一例外是用户在核对确认「未写入」后主动点「重新保存」（显式重走完整保存前检查）。
+    if (pendingVerify && !opts.fromPendingResave) {
+      return message.warning(
+        "保存结果待核对：请先「重新核对」确认服务端当前配置，再决定是否重新保存（不会自动重复写入）",
+      );
+    }
+    // 运行态未知 ⇒ 禁止**任何形式**的保存，包括「只写配置」（§4.4.1 决定 1）。
+    // 这是最外层的门：位置刻意放在快照门与 NCK 提交前复核之前——未知状态下
+    // 连身份预览都不发，更不会有 stop / PUT / start。草稿仍可编辑。
+    if (runState === "unknown") {
+      return message.error(RUN_STATE_UNKNOWN_NOTICE);
+    }
     // 快照门：pending / 失败 / 串 Endpoint 一律不可 PUT。
     if (!isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, endpointId)) {
       if (tasksLoadState === "error") return message.error("任务快照加载失败，禁止保存以防覆盖已有任务。请切换后重试。");
@@ -766,19 +1022,10 @@ export function EndpointAcquisitionPane({
           `存在未通过身份核验的点位（${unverified.length} 项）：请先手动移除这些点位并重新验证剩余点位后再保存`,
         );
       }
-      // 提交前再核验一次：防止「加载时通过、提交时目录/定义已变」。
-      const fresh = await verifyPoints(nckPoints);
-      setPointStatuses(fresh);
-      const stillBad = fresh.filter((s) => s.status === "unverified");
-      if (stillBad.length) {
-        return message.error(
-          `保存前重新核验失败（${stillBad.length} 项）：${stillBad
-            .map((s) => `${s.point.point_key}（${s.code}）`)
-            .join("、")}；请先移除后再保存`,
-        );
-      }
     }
     // 唯一保存计划入口：按 Driver 分流 + 快照门 + 准入 + 冲突 + 变更判定。
+    // 刻意排在「提交前重新核验」（会发 identity-preview 请求）之前：
+    // 无实际修改时连预览请求都不该发（§4.4.2）。
     const plan = planEndpointTaskSave({
       driverId,
       tasks: existingTasks,
@@ -793,26 +1040,69 @@ export function EndpointAcquisitionPane({
     if (!plan.ok) {
       // 非 NCK 空选择：保持旧提示层级（warning）与文案。
       if (plan.code === "EMPTY_SELECTION") return message.warning(plan.message);
-      // 无实际变更：**不发 PUT、不报成功**——"保存接口 2xx"不等于"编辑已持久化"。
+      // 无实际修改（**所有驱动**统一拦截）：不发 PUT、不发 stop、不发 start，
+      // 提示为 info 而不是成功——"保存接口 2xx"不等于"编辑已持久化"（§4.4.2）。
       if (plan.code === "NO_CHANGES") return message.info(plan.message);
       // 其余（歧义 / 结构非法 / 准入 / 冲突 / 快照 / 目录缺失）一律明确失败。
       return message.error(plan.message);
     }
-    const tasks = plan.tasks;
-    const preservedCount = plan.preservedCount;
-    // 回读核对参数先固定下来：闭包内不能再依赖联合类型收窄。
-    const nckWrite =
-      plan.driverKind === "nck" ? { taskId: plan.taskId, points: plan.points } : null;
-    const kept = (extra: string) =>
-      preservedCount > 0 ? `点位已保存（另保留 ${preservedCount} 个任务）${extra}` : `点位已保存${extra}`;
+    const submittedTasks = plan.tasks;
+    // ---- 保存前重新确认运行状态（§4.4.1）--------------------------------
+    // 打开页面时读到的状态只用于渲染；用户可能已经编辑很久。这里在**任何**
+    // stop / PUT / start 之前重新读一次：不一致即中止，由用户再次点击保存
+    // （不额外弹确认框）。注意：这只降低「用过期状态决策」的概率，
+    // **不提供并发原子保证**（§4.4.4，后端没有条件写/版本号）。
+    // 复核期间保持界面现有状态（不闪成「状态未知」）；读取失败仍会落成 unknown。
+    const confirmed = await loadRunState({ resetFirst: false });
+    if (confirmed === null) return; // 页面已切换，放弃本次保存
+    if (confirmed === "unknown" || confirmed !== runState) {
+      setLastApply(null);
+      setSaveOutcome({
+        kind: "state-changed",
+        message:
+          confirmed === "unknown"
+            ? "运行状态已变化或无法确认，本次保存未执行（未发出任何停止/写入/启动请求）。请刷新状态后再次点击保存"
+            : "运行状态已变化，本次保存未执行（未发出任何停止/写入/启动请求）。请确认状态后再次点击保存",
+      });
+      return;
+    }
+    const wasRunning = confirmed === "running";
+    // 提交前再核验一次（NCK）：防止「加载时通过、提交时目录/定义已变」。
+    // 放在保存计划与状态复核之后：无实际修改、状态已变化时都不会因为一次
+    // 无意义的保存触发 identity-preview 请求。这一步仍早于任何 stop / PUT / start。
+    if (nck) {
+      const fresh = await verifyPoints(nckPoints);
+      setPointStatuses(fresh);
+      const stillBad = fresh.filter((s) => s.status === "unverified");
+      if (stillBad.length) {
+        return message.error(
+          `保存前重新核验失败（${stillBad.length} 项）：${stillBad
+            .map((s) => `${s.point.point_key}（${s.code}）`)
+            .join("、")}；请先移除后再保存`,
+        );
+      }
+    }
+    // 本次提交的**完整基线**：周期 + 每个点位的完整参数 + 保留任务（= 整份任务集）。
+    // 回读一致后整份写入，作为下一次「无实际修改判定」的对照物。
+    const baseline: SaveBaseline = {
+      tasks: submittedTasks,
+      intervalMs,
+      pointCount: nck ? nckPoints.length : sels.length,
+    };
     setSaving(true);
     // 重新发起保存：清掉上一次的 issues（成功后同样清掉）。
     setSaveIssues([]);
+    setSaveOutcome(null);
+    setPendingVerify(null);
+    // apply 步骤里的「待核对」判定必须传出来：applyEndpointChange 只表达 ok/failed，
+    // 用局部槽位 + 读取函数，避免 TS 把闭包内赋值当成不可达。
+    let pendingOutcome: PendingVerification | null = null;
+    const takePending = () => pendingOutcome;
     try {
       // 统一生命周期：STOPPED 直接 apply（绝不自动 start）；RUNNING 经
       // executor 走 stop → apply →（可选）start，各步失败都有明确 outcome。
       const outcome = await applyEndpointChange({
-        wasRunning: running,
+        wasRunning,
         restart,
         stop: async (): Promise<LifecycleStepResult> => {
           const r = await api.stopEndpoint(endpointId).catch((e) => ({
@@ -827,35 +1117,25 @@ export function EndpointAcquisitionPane({
           const r = await fetch(`/api/v1/tasks/${endpointId}`, {
             method: "PUT",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ tasks }),
+            body: JSON.stringify({ tasks: submittedTasks }),
           });
           const j = await r.json().catch(() => ({}));
           if (r.ok) {
             setSaveIssues([]);
-            // NCK：2xx 之后必须回读核对，否则"保存成功"只是接口语义。
-            if (nckWrite) {
-              const back = await readBackTasks(endpointId).catch(() => null);
-              if (!back) {
-                return {
-                  ok: false,
-                  message: "保存响应成功，但回读任务失败：无法确认编辑已持久化（按失败处理，不报告成功）",
-                };
-              }
-              const savedTask = back.find((t) => t.id === nckWrite.taskId);
-              if (!savedTask || !samePoints(nckPointsOf(savedTask), nckWrite.points)) {
-                return {
-                  ok: false,
-                  message: "保存响应成功，但回读不一致：编辑未持久化（不报告成功，请重试或检查服务端）",
-                };
-              }
+            // **所有驱动**统一回读：成功判据是「回读值与本次完整提交配置一致」，
+            // 不是 PUT 2xx（§4.4.3）。回读失败或不一致一律进入「保存结果待核对」，
+            // 此时不报成功、不刷新基线、不启动、也不自动重发 PUT。
+            const back = await readBackTasks(endpointId).catch(() => null);
+            if (back === null) {
+              pendingOutcome = { baseline, restart, wasRunning, reason: "read-failed" };
+              return { ok: false, message: `${PENDING_VERIFY_NOTICE}：回读失败` };
             }
-            // P2-2：配置确实写进服务端后，才把「已保存」基线刷新为本次提交值
-            // （失败/回读不一致的路径不得刷新，否则状态区会虚报已生效）。
-            setSavedBaseline({
-              hasTask: true,
-              intervalMs,
-              pointCount: nck ? nckPoints.length : sels.length,
-            });
+            if (!sameSubmittedConfig(back, submittedTasks)) {
+              pendingOutcome = { baseline, restart, wasRunning, reason: "mismatch" };
+              return { ok: false, message: `${PENDING_VERIFY_NOTICE}：回读不一致` };
+            }
+            // 一致后才刷新**完整基线**；PUT 2xx 时绝不刷新（否则状态区会虚报已生效）。
+            applyVerifiedBaseline(baseline);
             return { ok: true };
           }
           // 后端 issues 原样保存并展示（`{valid:false, issues}`）；
@@ -884,32 +1164,54 @@ export function EndpointAcquisitionPane({
             : { ok: false, message: (r.body as { error?: { message?: string } })?.error?.message ?? `恢复运行失败（${r.status}）` };
         },
       });
+      const pending = takePending();
+      if (pending) {
+        setPendingVerify(pending);
+        setLastApply(null);
+        setSaveOutcome({
+          kind: "pending-verify",
+          message:
+            pending.reason === "read-failed"
+              ? `${PENDING_VERIFY_NOTICE}：回读失败，无法确认配置是否已持久化（未刷新基线，未重复写入）`
+              : `${PENDING_VERIFY_NOTICE}：回读不一致（回读值与本次提交配置不同；未刷新基线，未重复写入）`,
+        });
+        // stop 已成功 ⇒ 连接确实已停；写入结果未知只影响「待核对」，不影响运行态。
+        if (wasRunning) setRunState("stopped");
+        return;
+      }
       if (outcome.kind === "applied-restarted") {
         // P0-2：完成态必须明确写出实际落点，而不是让用户从「正在启动…」猜。
+        // 成功提示只由保存区结果条展示一次（不再叠加 toast，§4.6-4）。
         setLastApply("restarted");
-        setRunning(true);
-        message.success("配置已保存，采集已启动");
+        setRunState("running");
+        setRestartFailed(null);
         onChanged();
       } else if (outcome.kind === "applied-stopped") {
         setLastApply("stopped");
         // 状态区/下一次按钮必须反映“保存后确实停止了”，不能沿用保存前的运行态。
-        setRunning(false);
-        message.success(
-          running && !restart ? kept("，Endpoint 保持停止") : kept("，当前停止"),
-        );
+        setRunState("stopped");
+        setRestartFailed(null);
         onChanged();
       } else if (outcome.kind === "stop-failed") {
         setLastApply(null);
-        message.error(`停止失败，已中止应用，未修改点位：${outcome.message}`);
+        setSaveOutcome({
+          kind: "failed",
+          message: `未能停止采集，已取消本次保存，未修改配置：${outcome.message}`,
+        });
       } else if (outcome.kind === "apply-failed-stopped") {
         setLastApply(null);
-        setRunning(false);
-        message.error(`应用失败，Endpoint 当前已停止：${outcome.message}`);
+        setRunState("stopped");
+        setSaveOutcome({
+          kind: "failed",
+          message: `写入失败，Endpoint 当前已停止：${outcome.message}`,
+        });
         onChanged();
       } else {
+        // 回读已一致（基线已刷新、草稿标记已清除）但启动失败：
+        // 只保留「重试启动」入口，重试只调用启动步骤，不重复整套保存（§4.5）。
         setLastApply("restart-failed");
-        setRunning(false);
-        message.warning(`配置已保存，但采集启动失败：${outcome.message}`);
+        setRunState("stopped");
+        setRestartFailed(outcome.message);
         onChanged();
       }
     } finally {
@@ -919,23 +1221,62 @@ export function EndpointAcquisitionPane({
 
   // P0-2：完成态文案只描述**已经发生**的事；未保存时只描述“保存后会怎样”，
   // 且与按钮/复选框的实际分支一一对应（不写死 Stop → PUT → Start）。
+  // 运行态未知时不得描述任何保存路径（不知道会不会先 stop）。
   const afterSaveText =
-    lastApply === "restarted"
-      ? "配置已保存，采集已启动"
-      : lastApply === "stopped"
-        ? "配置已保存，当前停止"
-        : lastApply === "restart-failed"
-          ? "配置已保存，但采集启动失败"
-          : !running
-            ? "保存后保持停止"
-            : restart
-              ? "停止 → 写入配置 → 启动"
-              : "停止 → 写入配置，保存后保持停止";
-  const executionNote = !running
-    ? `保存将直接写入配置（PUT /tasks/${endpointId}），不会启动采集；Endpoint 保持停止。`
-    : restart
-      ? `保存将执行：停止 → 写入配置（PUT /tasks/${endpointId}）→ 启动。`
-      : `保存将执行：停止 → 写入配置（PUT /tasks/${endpointId}），保存后保持停止。`;
+    runState === "unknown"
+      ? "状态未知（无法判断保存路径）"
+      : lastApply === "restarted"
+        ? "配置已保存，采集已启动"
+        : lastApply === "stopped"
+          ? "配置已保存，当前停止"
+          : lastApply === "restart-failed"
+            ? "配置已保存，但采集启动失败"
+            : !running
+              ? "保存后保持停止"
+              : restart
+                ? "停止 → 写入配置 → 启动"
+                : "停止 → 写入配置，保存后保持停止";
+  const executionNote =
+    runState === "unknown"
+      ? "运行状态未知：保存已禁用（不会发出停止/写入/启动请求）。请先刷新状态。"
+      : !running
+        ? `保存将直接写入配置（PUT /tasks/${endpointId}），不会启动采集；Endpoint 保持停止。`
+        : restart
+          ? `保存将执行：停止 → 写入配置（PUT /tasks/${endpointId}）→ 启动。`
+          : `保存将执行：停止 → 写入配置（PUT /tasks/${endpointId}），保存后保持停止。`;
+
+  /**
+   * 按钮可用性与提交函数**共用同一判定**（§4.4.2）：直接调用唯一决策点
+   * `planEndpointTaskSave`，不另写一套比较逻辑。
+   * - `changed`：可保存；
+   * - `unchanged`：无实际修改（按钮禁用；提交函数仍会再拦一次并给 info 提示）；
+   * - `unknown`：被其它门拒绝（快照/准入/冲突等）。
+   */
+  const saveChangeState = useMemo(
+    () =>
+      endpointSaveChangeState({
+        driverId,
+        tasks: existingTasks,
+        snapshotState: tasksLoadState,
+        loadedEndpointId: tasksLoadedEpId,
+        currentEndpointId: endpointId,
+        intervalMs,
+        selections: sels,
+        nckPoints,
+        nckDefinitions: definitions,
+      }),
+    [
+      driverId,
+      existingTasks,
+      tasksLoadState,
+      tasksLoadedEpId,
+      endpointId,
+      intervalMs,
+      sels,
+      nckPoints,
+      definitions,
+    ],
+  );
 
   const descOk = nck || !!desc;
   if (!descOk && tasksLoadState === "loading") return <div style={{ color: "#525252" }}>加载资源…</div>;
@@ -958,7 +1299,7 @@ export function EndpointAcquisitionPane({
       <>
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <span style={{ fontSize: 12 }}>采集周期</span>
-        <InputNumber min={10} max={60000} step={10} value={intervalMs} onChange={(v) => setIntervalMs(v ?? 1000)} addonAfter="ms" style={{ width: 180 }} />
+        <InputNumber min={10} max={60000} step={10} value={intervalMs} onChange={(v) => setIntervalMs(v ?? 1000)} addonAfter="ms" data-testid="acquisition-interval-input" style={{ width: 180 }} />
         <span style={{ fontSize: 12, color: "#525252" }}>10ms–60s（配置值）</span>
         {/*
           P2-1：压测数字只能出现在帮助提示里，且必须同时声明“软件压测 ≠ 机床能力”。
@@ -998,7 +1339,9 @@ export function EndpointAcquisitionPane({
       >
         <span>
           采集状态：
-          <b data-testid="acquisition-status-state">{running ? "运行中" : "已停止"}</b>
+          <b data-testid="acquisition-status-state">
+            {runState === "running" ? "运行中" : runState === "stopped" ? "已停止" : "状态未知"}
+          </b>
         </span>
         <span>
           采集周期：
@@ -1026,6 +1369,29 @@ export function EndpointAcquisitionPane({
           <b data-testid="acquisition-status-after">{afterSaveText}</b>
         </span>
       </div>
+      {/*
+        运行态未知（加载失败 / 切换连接 / 刷新失败 / Endpoint 不在清单）：
+        禁止一切保存（含「只写配置」），只提供刷新入口；草稿仍可编辑（§4.4.1）。
+      */}
+      {runStateSettled && runState === "unknown" ? (
+        <Alert
+          type="warning"
+          showIcon
+          data-testid="acquisition-run-state-unknown"
+          message="运行状态未知，已禁用保存"
+          description="读取 Endpoint 运行状态失败，或该 Endpoint 不在清单中。为避免在未知状态下停止/写入/启动采集，保存已禁用（含只写配置）；草稿仍可编辑。"
+          action={
+            <Button
+              size="small"
+              data-testid="refresh-run-state"
+              loading={saving}
+              onClick={() => void loadRunState()}
+            >
+              刷新状态
+            </Button>
+          }
+        />
+      ) : null}
       {!nck ? (
       <ResourcePickerAntd
         resources={desc?.resources ?? []}
@@ -1054,6 +1420,18 @@ export function EndpointAcquisitionPane({
             return false;
           }
           setSels(next);
+          // 已有的选择项按对象引用/身份键沿用 rowId；新增项发新号（不重排既有行）。
+          // 身份键 = resource_id + 参数（同一资源同参数视为同一行；合并 outputs
+          // 会产出新对象，靠身份键把 rowId 接续过去）。仅用于界面定位。
+          setSelRowIds((prev) =>
+            alignRowIds(
+              sels,
+              prev,
+              next,
+              rowIdAllocator.current,
+              (sel) => `${sel.resource_id}\u0000${stableIdentityKey(sel.parameters)}`,
+            ),
+          );
           return true;
         }}
       />
@@ -1289,9 +1667,12 @@ export function EndpointAcquisitionPane({
               // P1-2：两层信息。名称只取定义 label（原生点位固定「原生点位」），
               // 地址由参数结构化拼出；point_key / 完整 JSON / 版本收进折叠区。
               const display = nckPointDisplay(point, exactDefinition);
+              // 行 key 用稳定 rowId：编辑改 point_key 时行不重建、位置不被顶走（§4.8）。
+              const rowId = nckRowIds[idx] ?? `nck-row-missing-${idx}`;
               return (
                 <div
-                  key={`${point.point_key}-${idx}`}
+                  key={rowId}
+                  data-row-id={rowId}
                   data-testid="nck-point-row"
                   style={{ display: "grid", gap: 6, padding: 8, border: "1px solid #e0e0e0", borderRadius: 0 }}
                 >
@@ -1382,7 +1763,16 @@ export function EndpointAcquisitionPane({
       <div style={{ fontSize: 12, color: "#525252" }} data-testid="acquisition-execution-note">
         已选 {nck ? nckPoints.length : sels.length} 项 · {intervalMs}ms 轮询 · {executionNote}
         {!nck ? (
-          <Button size="small" onClick={() => setSels([])} style={{ marginLeft: 8 }}>清空</Button>
+          <Button
+            size="small"
+            onClick={() => {
+              setSels([]);
+              setSelRowIds([]);
+            }}
+            style={{ marginLeft: 8 }}
+          >
+            清空
+          </Button>
         ) : null}
       </div>
       {preservedTasks.length > 0 && (
@@ -1414,10 +1804,27 @@ export function EndpointAcquisitionPane({
               parameters: s.parameters,
               schema,
             });
+            // 行 key 用稳定 rowId（不能用下标：移除一行后同一 key 会指向别的行）。
+            const rowId = selRowIds[idx] ?? `sel-row-missing-${idx}`;
             return (
-              <div key={idx} style={{ display: "flex", gap: 8, alignItems: "center", padding: 6, border: "1px solid #e0e0e0", borderRadius: 0 }}>
+              <div
+                key={rowId}
+                data-row-id={rowId}
+                data-testid="sel-point-row"
+                style={{ display: "flex", gap: 8, alignItems: "center", padding: 6, border: "1px solid #e0e0e0", borderRadius: 0 }}
+              >
                 <span style={{ flex: 1, fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11 }}>{s.resource_id} → {pointKeys} {summary && summary !== pointKeys ? <span style={{ color: "#525252" }}>{summary}</span> : null}</span>
-                <Button size="small" danger onClick={() => setSels((p) => p.filter((_, i) => i !== idx))}>移除</Button>
+                <Button
+                  size="small"
+                  danger
+                  onClick={() => {
+                    // 移除只删掉这一行的 rowId，其余行身份不变（§4.8）。
+                    setSels((p) => p.filter((_, i) => i !== idx));
+                    setSelRowIds((p) => p.filter((_, i) => i !== idx));
+                  }}
+                >
+                  移除
+                </Button>
               </div>
             );
           })}
@@ -1452,32 +1859,141 @@ export function EndpointAcquisitionPane({
         />
       ) : null}
       <div>
-        {/* P0-2：已停止时保存只写配置（onApply(false)），按钮不得写「保存并启动」；
-            运行中的恢复运行由 restart 勾选决定，结果由 lastApply 明确回显。 */}
-        <ApplyWithRestart
-          running={running}
-          applying={saving}
-          canApply={
-            isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, endpointId) &&
-            !hasIncompatible &&
-            (nck
-              ? !!definitions &&
-                !!endpointFamily &&
-                !editBlock &&
-                nckPoints.length > 0 &&
-                admissionIssues.length === 0 &&
-                verificationReady &&
-                unverified.length === 0
-              : sels.length > 0 && !!desc)
-          }
-          applyLabel="保存配置"
-          stoppedLabel="保存配置"
-          restart={restart}
-          onRestartChange={setRestart}
-          result={lastApply}
-          onApply={save}
-        />
+        {/*
+          运行态未知：保存区不提供任何保存动作，只给「刷新状态」。
+          仍渲染一个 disabled 的保存按钮（文案与已知状态一致），因为**按钮禁用
+          只是体验**：真正的防线在 save() 里的 unknown 守卫（§4.4.1）。
+        */}
+        {runState === "unknown" ? (
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <Button
+              type="primary"
+              data-testid="apply-button"
+              disabled
+              onClick={() => void save(restart)}
+            >
+              保存配置
+            </Button>
+            <span data-testid="apply-stopped-note" style={{ fontSize: 12, color: "#525252" }}>
+              {runStateSettled ? "运行状态未知，无法保存" : "正在读取运行状态…"}
+            </span>
+          </div>
+        ) : (
+          /* P0-2：已停止时保存只写配置（onApply(false)），按钮不得写「保存并启动」；
+             运行中的恢复运行由 restart 勾选决定，结果由 lastApply 明确回显。 */
+          <ApplyWithRestart
+            running={running}
+            applying={saving}
+            canApply={
+              isTaskSnapshotReady(tasksLoadState, tasksLoadedEpId, endpointId) &&
+              !hasIncompatible &&
+              (nck
+                ? !!definitions &&
+                  !!endpointFamily &&
+                  !editBlock &&
+                  nckPoints.length > 0 &&
+                  admissionIssues.length === 0 &&
+                  verificationReady &&
+                  unverified.length === 0
+                : sels.length > 0 && !!desc) &&
+              // 无实际修改 ⇒ 按钮不可用（所有驱动同一判定，§4.4.2）。
+              saveChangeState === "changed" &&
+              // 待核对期间不允许再走主保存动作（只能「重新核对」）。
+              !pendingVerify
+            }
+            applyLabel="保存配置"
+            stoppedLabel="保存配置"
+            restart={restart}
+            onRestartChange={setRestart}
+            result={lastApply}
+            onApply={save}
+          />
+        )}
       </div>
+      {/*
+        「保存结果待核对」（§4.4.3）：回读失败或回读不一致。
+        持久展示，不报成功、不刷新基线；主操作只能是「重新核对」，
+        不允许直接重新 PUT。核对确认不一致后才出现「重新保存」。
+      */}
+      {saveOutcome ? (
+        <Alert
+          type={saveOutcome.kind === "failed" ? "error" : "warning"}
+          showIcon
+          data-testid="save-outcome"
+          data-kind={saveOutcome.kind}
+          message={
+            saveOutcome.kind === "pending-verify"
+              ? PENDING_VERIFY_NOTICE
+              : saveOutcome.kind === "state-changed"
+                ? "运行状态已变化或无法确认"
+                : "保存未完成"
+          }
+          description={
+            <div style={{ display: "grid", gap: 8 }}>
+              <div>{saveOutcome.message}</div>
+              {saveOutcome.kind === "pending-verify" ? (
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <Button
+                    size="small"
+                    data-testid="recheck-save"
+                    loading={rechecking}
+                    onClick={() => void recheckPending()}
+                  >
+                    重新核对
+                  </Button>
+                  {saveOutcome.canResave && pendingVerify ? (
+                    <Button
+                      size="small"
+                      data-testid="resave-after-pending"
+                      disabled={saving || runState === "unknown"}
+                      onClick={() =>
+                        void save(pendingVerify.restart, { fromPendingResave: true })
+                      }
+                    >
+                      重新保存
+                    </Button>
+                  ) : null}
+                </div>
+              ) : null}
+              {saveOutcome.kind === "state-changed" ? (
+                <div>
+                  <Button
+                    size="small"
+                    data-testid="refresh-run-state-after-abort"
+                    onClick={() => void loadRunState()}
+                  >
+                    刷新状态
+                  </Button>
+                </div>
+              ) : null}
+            </div>
+          }
+        />
+      ) : null}
+      {/*
+        「配置已保存但启动失败」（§4.5）：草稿标记已清除（基线已刷新），
+        但处理入口必须保留；重试**只调用启动步骤**，不 stop、不 PUT。
+        该入口不随新修改消失（§4.7：产生新修改时仍保留「上次保存后采集未恢复」）。
+      */}
+      {restartFailed ? (
+        <div
+          data-testid="restart-failed"
+          style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}
+        >
+          <span style={{ fontSize: 12, color: "#8a6d3b" }}>
+            配置已保存，但恢复采集失败：{restartFailed}
+          </span>
+          <Button
+            size="small"
+            data-testid="retry-start"
+            loading={saving}
+            disabled={saving || rechecking || runState === "unknown"}
+            onClick={() => void retryStart()}
+          >
+            重试启动
+          </Button>
+        </div>
+      ) : null}
       {saveIssues.length > 0 ? (
         <Alert
           type="error"

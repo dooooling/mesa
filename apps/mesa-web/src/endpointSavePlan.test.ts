@@ -21,8 +21,10 @@ import {
 } from "./deviceModel";
 import { nckPointsOf } from "./nckTaskBinding";
 import {
+  NO_CHANGES_MESSAGE,
   planEndpointTaskSave,
   samePoints,
+  sameSubmittedConfig,
   type EndpointSavePlanInput,
 } from "./endpointSavePlan";
 
@@ -335,5 +337,128 @@ describe("点位身份冲突：与其它任务（含跨 kind）逐层拒绝", ()
       expect(plan.code).toBe("POINT_KEY_CONFLICT");
       expect(plan.message).toContain("var.collect.01@channel=1");
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 第 1 步（状态与保存流程）：无实际修改统一拦截 + 完整配置回读比对
+// ---------------------------------------------------------------------------
+
+describe("决定 2：无实际修改 —— 非 NCK 也必须强制拦截（不再只是信息）", () => {
+  it("non_nck_no_change_is_rejected_with_NO_CHANGES", () => {
+    const existing = canonicalTask("task-a", ["legacy.k1"]);
+    const selections: ResourceSelection[] = [
+      { resource_id: "variable", parameters: {}, outputs: [{ output: "out-0", point_key: "legacy.k1" }] },
+    ];
+    const plan = planEndpointTaskSave(
+      base({ driverId: "s7", tasks: [existing], selections, nckPoints: undefined }),
+    );
+    // 旧实现：ok + changed:false（仅信息）⇒ save() 照发 PUT，把同一份配置整份重写。
+    expect(plan.ok).toBe(false);
+    if (plan.ok) return;
+    expect(plan.code).toBe("NO_CHANGES");
+    expect(plan.message).toBe(NO_CHANGES_MESSAGE);
+    expect(plan.message).toContain("未发送保存请求");
+    // 拒绝时不产出任何可 PUT 的载荷。
+    expect(Object.prototype.hasOwnProperty.call(plan, "tasks")).toBe(false);
+  });
+
+  it("non_nck_interval_only_change_is_a_real_edit", () => {
+    // 点位完全相同、只有采集周期变了：必须被视为真实修改（否则会漏保存周期）。
+    const existing = canonicalTask("task-a", ["legacy.k1"]);
+    const selections: ResourceSelection[] = [
+      { resource_id: "variable", parameters: {}, outputs: [{ output: "out-0", point_key: "legacy.k1" }] },
+    ];
+    const plan = planEndpointTaskSave(
+      base({
+        driverId: "s7",
+        tasks: [existing],
+        selections,
+        nckPoints: undefined,
+        intervalMs: 500,
+      }),
+    );
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.changed).toBe(true);
+    const editable = plan.tasks.find((t) => t.id === "task-a");
+    expect(editable?.schedule).toEqual({ mode: "poll", interval_ms: 500 });
+  });
+
+  it("task_array_order_is_not_a_change（服务端按 id 排序返回）", () => {
+    // GET /tasks 按 task id 升序（config-store `ORDER BY id`）：加载顺序与
+    // merge 产出的顺序不同，不得被判成「有修改」而多发一次 PUT。
+    const a = canonicalTask("task-a", ["k1"]);
+    const z = { id: "task-z", schedule: { mode: "subscribe" }, binding: { kind: "custom.v0", config: {} } } as AcquisitionTaskShape;
+    const selections: ResourceSelection[] = [
+      { resource_id: "variable", parameters: {}, outputs: [{ output: "out-0", point_key: "k1" }] },
+    ];
+    const plan = planEndpointTaskSave(
+      base({ driverId: "s7", tasks: [a, z], selections, nckPoints: undefined }),
+    );
+    // 无修改：即便 merge 会把 canonical 放到末尾，也必须是 NO_CHANGES。
+    expect(plan.ok).toBe(false);
+    if (!plan.ok) expect(plan.code).toBe("NO_CHANGES");
+  });
+});
+
+describe("决定 3：回读比对覆盖完整提交配置（周期 + 点位参数 + 保留任务）", () => {
+  const submitted = [
+    nckTask("nck-task", [point("var.collect.01", { channel: 1 }), point("var.collect.02", { axis: 2 })], {
+      mode: "poll",
+      interval_ms: 500,
+    }),
+    { id: "task-b", schedule: { mode: "subscribe" }, binding: { kind: "custom.v0", config: { x: 1 } } } as AcquisitionTaskShape,
+  ];
+
+  it("完全一致（任务数组顺序不同也算一致）", () => {
+    // 服务端按 id 升序返回：task-b 在 nck-task 之前。
+    expect(sameSubmittedConfig([submitted[1], submitted[0]], submitted)).toBe(true);
+  });
+
+  it("只比点位会漏掉的情形：点位相同、周期不同 ⇒ 不一致", () => {
+    const readBack = [
+      nckTask("nck-task", [point("var.collect.01", { channel: 1 }), point("var.collect.02", { axis: 2 })], {
+        mode: "poll",
+        interval_ms: 1000, // 周期没写进去
+      }),
+      submitted[1],
+    ];
+    // 点位本身完全一样（旧实现只比点位 ⇒ 会误报成功）。
+    expect(samePoints(nckPointsOf(readBack[0]), nckPointsOf(submitted[0]))).toBe(true);
+    expect(sameSubmittedConfig(readBack, submitted)).toBe(false);
+  });
+
+  it("点位参数变化 / 顺序变化 / 保留任务被改 ⇒ 不一致", () => {
+    const changedParam = [
+      nckTask("nck-task", [point("var.collect.01", { channel: 2 }), point("var.collect.02", { axis: 2 })], {
+        mode: "poll",
+        interval_ms: 500,
+      }),
+      submitted[1],
+    ];
+    expect(sameSubmittedConfig(changedParam, submitted)).toBe(false);
+
+    const reordered = [
+      nckTask("nck-task", [point("var.collect.02", { axis: 2 }), point("var.collect.01", { channel: 1 })], {
+        mode: "poll",
+        interval_ms: 500,
+      }),
+      submitted[1],
+    ];
+    expect(sameSubmittedConfig(reordered, submitted)).toBe(false);
+
+    const preservedChanged = [
+      submitted[0],
+      { id: "task-b", schedule: { mode: "subscribe" }, binding: { kind: "custom.v0", config: { x: 2 } } } as AcquisitionTaskShape,
+    ];
+    expect(sameSubmittedConfig(preservedChanged, submitted)).toBe(false);
+  });
+
+  it("多一个 / 少一个任务 ⇒ 不一致", () => {
+    expect(sameSubmittedConfig([submitted[0]], submitted)).toBe(false);
+    expect(
+      sameSubmittedConfig([...submitted, { id: "task-c", schedule: { mode: "poll", interval_ms: 1 }, binding: { kind: "custom.v0", config: {} } } as AcquisitionTaskShape], submitted),
+    ).toBe(false);
   });
 });

@@ -7,6 +7,7 @@ import {
   buildEndpointUpdatePayload,
   canDeleteDevice,
   cleanConnection,
+  deriveRunState,
   deviceCounts,
   groupEndpointsByDevice,
   isDriverChangeAttempt,
@@ -166,6 +167,28 @@ describe("isRunningState", () => {  it("RUNNING/CONNECTING/RECONNECTING 视为�
     expect(isStrictlyRunning("RECONNECTING")).toBe(false);
     expect(isStrictlyRunning("STOPPED")).toBe(false);
     expect(isStrictlyRunning(undefined)).toBe(false);
+  });
+
+  // 采集页保存流程用的是三态（§4.4.1）：布尔口径会把「读不到」当成「已停止」。
+  it("deriveRunState：只有明确的 STOPPED 才是 stopped", () => {
+    expect(deriveRunState("STOPPED")).toBe("stopped");
+    expect(deriveRunState("stopped")).toBe("stopped");
+  });
+
+  it("deriveRunState：RUNNING 与过渡态都算 running（不得当成已停止）", () => {
+    expect(deriveRunState("RUNNING")).toBe("running");
+    expect(deriveRunState("CONNECTING")).toBe("running");
+    expect(deriveRunState("RECONNECTING")).toBe("running");
+    expect(deriveRunState("reconnecting")).toBe("running");
+  });
+
+  it("deriveRunState：缺失/空/未知取值一律 unknown（Endpoint 不在清单即此情形）", () => {
+    expect(deriveRunState(undefined)).toBe("unknown");
+    expect(deriveRunState(null)).toBe("unknown");
+    expect(deriveRunState("")).toBe("unknown");
+    expect(deriveRunState("   ")).toBe("unknown");
+    expect(deriveRunState("FAILED")).toBe("unknown");
+    expect(deriveRunState("SOMETHING_NEW")).toBe("unknown");
   });
 });
 

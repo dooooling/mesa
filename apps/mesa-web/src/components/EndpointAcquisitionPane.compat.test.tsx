@@ -3,7 +3,7 @@
 // - P1：驱动新增未知必填字段、旧配置未携带 ⇒ 完整 Schema 守卫仍拒绝（且在任何请求前）；
 // - A4：点位行用「字段标签 + 值」摘要，替代原来的 JSON.stringify(parameters)。
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { EndpointAcquisitionPane } from "./EndpointAcquisitionPane";
 import { invokeDisabledButton } from "../test/bypassDisabled";
 import { UNSUPPORTED_CONFIG_NOTICE } from "../descriptorCompatibility";
@@ -204,7 +204,11 @@ describe("A3：未知字段类型阻止保存（只影响该配置）", () => {
     await waitFor(() => expect(screen.getByTestId("apply-button")).toBeTruthy());
     expect(screen.queryByTestId("acquisition-unsupported-fields")).toBeNull();
     const save = screen.getByTestId("apply-button") as HTMLButtonElement;
-    expect(save.disabled).toBe(false);
+    // 无实际修改时按钮禁用（§4.4.2）；制造一次周期变更后应可用，
+    // 证明「未使用资源里的未知类型」没有阻断本次保存。
+    expect(save.disabled).toBe(true);
+    fireEvent.change(screen.getByTestId("acquisition-interval-input"), { target: { value: "2000" } });
+    await waitFor(() => expect(save.disabled).toBe(false));
     expect(srv.puts).toHaveLength(0);
   });
 });

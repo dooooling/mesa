@@ -207,9 +207,19 @@ describe("P0-2 / P2-2：已停止时的按钮、说明与状态区", () => {
     const state = mkState({ tasks: [nckTask([point("syn.collect.a", { channel: 1 })])] });
     installFetch(state);
     renderPane();
-    await waitFor(() => expect(screen.getByTestId("apply-button").hasAttribute("disabled")).toBe(false));
+    // 无实际修改 ⇒ 保存按钮禁用（§4.4.2）；改周期后才可用。
+    // 先等快照就绪（状态区出现「已保存」），避免改动被加载结果覆盖。
+    await waitFor(() =>
+      expect(screen.getByTestId("acquisition-status-interval").textContent).toBe("1000 ms（已保存）"),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("apply-button").hasAttribute("disabled")).toBe(true),
+    );
     // 制造一次真实变更（周期 1000 → 2000），否则保存计划会按 NO_CHANGES 拒绝发 PUT。
     fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
+    await waitFor(() =>
+      expect(screen.getByTestId("apply-button").hasAttribute("disabled")).toBe(false),
+    );
     await waitFor(() =>
       expect(screen.getByTestId("acquisition-status-interval").textContent).toBe(
         "1000 ms（已保存） → 2000 ms（待保存）",
@@ -426,10 +436,17 @@ describe("P2-1（已保存状态）：改同一点位参数后「已保存」必
     renderPane();
 
     // 先制造一次可保存的变更（周期 1000 → 2000）并保存成功。
+    // 无实际修改时按钮禁用（§4.4.2），因此这里先等「无修改」态再改周期。
+    await waitFor(() =>
+      expect(screen.getByTestId("acquisition-status-interval").textContent).toBe("1000 ms（已保存）"),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("apply-button").hasAttribute("disabled")).toBe(true),
+    );
+    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
     await waitFor(() =>
       expect(screen.getByTestId("apply-button").hasAttribute("disabled")).toBe(false),
     );
-    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "2000" } });
     await user.click(screen.getByTestId("apply-button"));
     expect(await screen.findByTestId("apply-result")).toBeTruthy();
 
