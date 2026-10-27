@@ -409,6 +409,17 @@ impl AttemptPhase {
 pub struct AttemptCtx {
     /// 单调代次（per endpoint，永不回收；墓碑以它为下界）。
     pub generation: u64,
+    /// Issue #102：本 attempt 的审计上下文（父请求 + 来源 + 可选 sink）。
+    /// attempt 级而非 endpoint 级：开机恢复、REST Start、Bootstrap 的父请求各不相同，
+    /// 而重连必须沿用同一个父请求 ID 才能把多个 epoch 归到同一次启动。
+    audit: crate::attempt_audit::AttemptContext,
+    /// Issue #102：attempt 内 StartConnection 序号（1 = 首连；重连自增）。
+    connection_seq: crate::attempt_audit::ConnectionSequence,
+    /// Issue #102：本 attempt 是否**曾经成功建立过连接**（StartConnection ACK 成功）。
+    ///
+    /// 用来区分 "首次连接的重试" 与 "连上之后的断线重连"：只有真的连上过，
+    /// `internal_reconnect` 这个来源才成立（评审指出的语义边界）。
+    connection_established: std::sync::atomic::AtomicBool,
     phase: AtomicU8,
     /// 驱动子进程 pid（spawn 后回填；0 = 尚未 spawn）。
     pub pid: AtomicU32,
@@ -430,10 +441,13 @@ pub struct AttemptCtx {
 }
 
 impl AttemptCtx {
-    fn new(generation: u64) -> Self {
+    fn new(generation: u64, audit: crate::attempt_audit::AttemptContext) -> Self {
         let (done_tx, _) = tokio::sync::watch::channel(None);
         Self {
             generation,
+            audit,
+            connection_seq: crate::attempt_audit::ConnectionSequence::default(),
+            connection_established: std::sync::atomic::AtomicBool::new(false),
             phase: AtomicU8::new(AttemptPhase::Starting as u8),
             pid: AtomicU32::new(0),
             session_released: AtomicBool::new(false),
@@ -446,6 +460,88 @@ impl AttemptCtx {
             #[cfg(feature = "test-hooks")]
             test_reconnect_clock: OnceLock::new(),
         }
+    }
+
+    /// 本 attempt 的审计上下文（Issue #102）。未注入 sink 时 `is_audited()==false`，
+    /// 运行期审计全部退化为 no-op。
+    pub fn audit(&self) -> &crate::attempt_audit::AttemptContext {
+        &self.audit
+    }
+
+    /// 分配 attempt 内的下一个连接序号（1 起，重连自增）。
+    pub fn next_connection_sequence(&self) -> u64 {
+        self.connection_seq.next()
+    }
+
+    /// 候选连接序号（不推进；Issue #102 两段式序号）。
+    pub fn peek_connection_sequence(&self) -> u64 {
+        self.connection_seq.peek()
+    }
+
+    /// Issue #102：为本次连接登记 epoch 意图（**两段式序号**）。
+    ///
+    /// - `Ok(Some(request_id))`：意图已持久化，序号已提交；
+    /// - `Ok(None)`：本 attempt 未启用审计（sink/父请求缺失），全部 no-op；
+    /// - `Err(e)`：意图写不进去 ⇒ 调用方必须**放弃本次连接**（不发 StartConnection），
+    ///   并且序号**没有被消耗**——下一次成功连接仍然拿到 `:epoch:1` /
+    ///   `initial_connection`，不会把"审计抖动"伪装成"内部重连"。
+    pub fn try_audit_epoch_intent(
+        &self,
+        endpoint_id: &str,
+        stream_epoch: u64,
+    ) -> Result<Option<String>, String> {
+        let Some(sink) = self.audit.active_sink() else {
+            return Ok(None);
+        };
+        let candidate = self.connection_seq.peek();
+        let Some(request_id) = self.audit.epoch_request_id(candidate) else {
+            return Ok(None);
+        };
+        let intent = crate::attempt_audit::EpochIntent {
+            request_id: request_id.clone(),
+            parent_request_id: self
+                .audit
+                .parent_request_id()
+                .unwrap_or_default()
+                .to_string(),
+            endpoint_id: endpoint_id.to_string(),
+            // 来源按「序号 + 是否曾经连上过」判定（评审修正）：
+            // - 候选 1：本 attempt 首连；
+            // - 候选 >1 且从未成功建连：首次连接的重试（没有"断线"可言）；
+            // - 候选 >1 且曾成功建连：真正的断线重连。
+            source: if candidate == 1 {
+                crate::attempt_audit::EpochSource::InitialConnection
+            } else if self.has_established_connection() {
+                crate::attempt_audit::EpochSource::InternalReconnect
+            } else {
+                crate::attempt_audit::EpochSource::InitialConnectionRetry
+            },
+            connection_sequence: candidate,
+            stream_epoch,
+            actor: self.audit.actor().to_string(),
+            generation: self.generation,
+        };
+        // 先落盘，后提交序号：顺序不可交换，否则失败会白吃一个序号。
+        sink.record_epoch_intent(&intent)?;
+        let committed = self.connection_seq.commit(candidate);
+        debug_assert_eq!(
+            committed, candidate,
+            "attempt 内的连接序号只能由该 attempt 的任务推进"
+        );
+        Ok(Some(request_id))
+    }
+
+    /// 本 attempt 是否曾经成功建立过连接（StartConnection ACK 成功）。
+    pub fn has_established_connection(&self) -> bool {
+        self.connection_established.load(Ordering::Acquire)
+    }
+
+    /// 标记本 attempt 已成功建立过一次连接。
+    ///
+    /// 只在 StartConnection 真正 ACK 之后调用：它决定后续重试的来源是
+    /// `initial_connection_retry`（还没连上过）还是 `internal_reconnect`（真断线）。
+    pub fn mark_connection_established(&self) {
+        self.connection_established.store(true, Ordering::Release);
     }
 
     pub fn phase(&self) -> AttemptPhase {
@@ -922,6 +1018,20 @@ impl MesaManager {
     /// 在同一次加锁内完成，覆盖写在类型层面不可表达；第二个 Start 在检查处即被
     /// 拒绝，**根本没有 spawn 发生**（因此不存在需要终止旧条目的危险动作）。
     pub fn start_endpoint(&self, cfg: BuiltinEndpoint) -> Result<(), String> {
+        // 既有调用方（合同测试、内置演示端点）不关心审计：等价于"无父请求、不记录"。
+        self.start_endpoint_with_context(cfg, crate::attempt_audit::AttemptContext::default())
+    }
+
+    /// 带审计上下文的启动（Issue #102）：REST Start / Bootstrap / 开机恢复都走这条，
+    /// 由 Core 传入父请求 ID、来源与 sink，运行期 epoch 子记录才能挂回正确的那次请求。
+    ///
+    /// 与 [`Self::start_endpoint`] 的唯一差别就是 `AttemptCtx` 里多带一个审计上下文；
+    /// 门/attempt 表/insert-before-spawn 的语义完全不变。
+    pub fn start_endpoint_with_context(
+        &self,
+        cfg: BuiltinEndpoint,
+        audit: crate::attempt_audit::AttemptContext,
+    ) -> Result<(), String> {
         self.ensure_reaper();
         let mut t = self.attempts.lock().unwrap();
         match t.live.entry(cfg.endpoint_id.clone()) {
@@ -956,7 +1066,7 @@ impl MesaManager {
                 let source = Arc::clone(&self.source);
                 let registry = std::sync::Arc::clone(&self.active_sessions);
                 let events = self.event_services.read().unwrap().clone();
-                let ctx = Arc::new(AttemptCtx::new(generation));
+                let ctx = Arc::new(AttemptCtx::new(generation, audit));
                 #[cfg(feature = "test-hooks")]
                 if let Some(clock) = self
                     .test_reconnect_clocks
@@ -1817,7 +1927,10 @@ mod g7_tests {
     /// 手工登记一个 attempt（等价于 `start_endpoint` 的 insert-before-spawn），
     /// 返回它的守卫。
     fn register(mgr: &MesaManager, id: &str, generation: u64) -> AttemptGuard {
-        let ctx = Arc::new(AttemptCtx::new(generation));
+        let ctx = Arc::new(AttemptCtx::new(
+            generation,
+            crate::attempt_audit::AttemptContext::default(),
+        ));
         mgr.attempts.lock().unwrap().live.insert(
             id.to_string(),
             AttemptEntry {
@@ -1936,5 +2049,113 @@ mod g7_tests {
             !pid_converged(ProcessStatus::Unknown),
             "无法证明已死时必须继续隔离（fail-closed），不得放行新 Start"
         );
+    }
+
+    // ---- Issue #102：epoch 来源分类（评审边界） ----
+
+    /// 记录每次 epoch 意图的 (序号, 来源)。
+    struct EpochRecorder(std::sync::Mutex<Vec<(u64, &'static str)>>);
+
+    impl crate::attempt_audit::AttemptAuditSink for EpochRecorder {
+        fn record_epoch_intent(
+            &self,
+            intent: &crate::attempt_audit::EpochIntent,
+        ) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((intent.connection_sequence, intent.source.as_str()));
+            Ok(())
+        }
+        fn record_epoch_outcome(
+            &self,
+            _request_id: &str,
+            _outcome: &crate::attempt_audit::EpochOutcome,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// 第一次意图写入失败（审计故障）不得吃掉连接序号。
+    struct FailFirstEpochIntent(AtomicBool);
+
+    impl crate::attempt_audit::AttemptAuditSink for FailFirstEpochIntent {
+        fn record_epoch_intent(
+            &self,
+            _intent: &crate::attempt_audit::EpochIntent,
+        ) -> Result<(), String> {
+            if !self.0.swap(true, Ordering::SeqCst) {
+                return Err("store busy".into());
+            }
+            Ok(())
+        }
+        fn record_epoch_outcome(
+            &self,
+            _request_id: &str,
+            _outcome: &crate::attempt_audit::EpochOutcome,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn attempt_with_sink(
+        sink: std::sync::Arc<dyn crate::attempt_audit::AttemptAuditSink>,
+    ) -> AttemptCtx {
+        AttemptCtx::new(
+            7,
+            crate::attempt_audit::AttemptContext::audited(
+                "lc-endpoint.start-ep1-1",
+                "local-api",
+                sink,
+            ),
+        )
+    }
+
+    /// 评审边界回归：首连意图已落盘但 `StartConnection` 失败时，后续重试**不得**被标成
+    /// `internal_reconnect`（那会暗示"曾经连上过"）。
+    ///
+    /// 复现的是完整状态机：意图落盘（序号提交）→ 连接失败（不 mark established）→
+    /// 下一次意图落盘 ⇒ 来源必须是 `initial_connection_retry`；只有真的连上过之后的重试
+    /// 才是 `internal_reconnect`。
+    #[test]
+    fn retry_after_failed_first_connection_is_not_internal_reconnect() {
+        let rec = Arc::new(EpochRecorder(std::sync::Mutex::new(Vec::new())));
+        let ctx = attempt_with_sink(rec.clone());
+
+        // 第 1 次：意图落盘成功（序号 1），随后 StartConnection 失败 ⇒ 不 mark established
+        let rid1 = ctx.try_audit_epoch_intent("ep1", 100).unwrap().unwrap();
+        assert!(rid1.ends_with(":epoch:1"), "{rid1}");
+        // 第 2 次（内部重试）：仍未连上过
+        let rid2 = ctx.try_audit_epoch_intent("ep1", 200).unwrap().unwrap();
+        assert!(rid2.ends_with(":epoch:2"), "{rid2}");
+        // 模拟某次连接真的成功：之后的重连才是 internal_reconnect
+        ctx.mark_connection_established();
+        let rid3 = ctx.try_audit_epoch_intent("ep1", 300).unwrap().unwrap();
+        assert!(rid3.ends_with(":epoch:3"), "{rid3}");
+
+        assert_eq!(
+            rec.0.lock().unwrap().clone(),
+            vec![
+                (1, "initial_connection"),
+                (2, "initial_connection_retry"),
+                (3, "internal_reconnect"),
+            ],
+            "来源分类必须区分「首连重试」与「已连上后的断线重连」"
+        );
+    }
+
+    /// 评审边界回归（配套）：意图写入失败时序号不被消耗，下一次成功仍是 `:epoch:1` /
+    /// `initial_connection`（不会被伪装成重试或重连）。
+    #[test]
+    fn failed_epoch_intent_does_not_consume_sequence() {
+        let ctx = attempt_with_sink(Arc::new(FailFirstEpochIntent(AtomicBool::new(false))));
+
+        let err = ctx.try_audit_epoch_intent("ep1", 100).unwrap_err();
+        assert!(err.contains("store busy"), "{err}");
+        assert_eq!(ctx.peek_connection_sequence(), 1, "失败不得推进序号");
+
+        let rid = ctx.try_audit_epoch_intent("ep1", 200).unwrap().unwrap();
+        assert!(rid.ends_with(":epoch:1"), "重试仍应拿到首连序号: {rid}");
+        assert!(!ctx.has_established_connection());
     }
 }

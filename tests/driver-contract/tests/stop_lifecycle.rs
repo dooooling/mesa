@@ -2254,7 +2254,12 @@ async fn start_on_deleted_endpoint_is_aborted_not_orphaned() {
     let err = rig
         .state
         .lifecycle
-        .commit_start(&ticket, cfg)
+        .commit_start(
+            &ticket,
+            cfg,
+            // Issue #102：合同测试不关心生命周期审计，使用"无父请求、无 sink"的上下文
+            mesa_driver_manager::attempt_audit::AttemptContext::default(),
+        )
         .await
         .expect_err("配置行已删除，Start 必须失败");
     assert_eq!(err.code, "ENDPOINT_DELETED", "{}", err.message);

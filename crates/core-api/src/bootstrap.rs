@@ -18,7 +18,7 @@ use axum::http::{HeaderMap, StatusCode};
 use mesa_config_store::{DeviceRecord, EndpointRecord};
 use serde::{Deserialize, Serialize};
 
-use super::{AppState, json_error, secret_field_keys, store_err_to_response};
+use super::{AppState, json_error, lifecycle_audit, secret_field_keys, store_err_to_response};
 
 /// Bootstrap 请求体。`acquisition.tasks` 为空表示不配置任务（纯连接设备）；
 /// `start` 为 false 时建完保持 STOPPED（不执行 start side effect）。
@@ -147,12 +147,19 @@ impl StartFailure {
 /// - 旧 attempt 在拆解 ⇒ `STOP_IN_PROGRESS`（不排队）；
 /// - `desired_running=true` 只在 commit 成功后由门写入（§6.10.2 第 6 条），
 ///   建档事务里一律写 false（"刚建好 = 未运行"，第 5 条）。
-async fn start_created_endpoint(state: &AppState, endpoint_id: &str) -> Result<(), StartFailure> {
-    let ticket = state.lifecycle.admit_start(endpoint_id);
+async fn start_created_endpoint(
+    state: &AppState,
+    endpoint_id: &str,
+    // Issue #102：Bootstrap 的启动也要带上父请求上下文，epoch 子记录才能挂到
+    // 这次 bootstrap 请求下（而不是变成无主 epoch）。
+    audit_ctx: mesa_driver_manager::attempt_audit::AttemptContext,
+    // Issue #102：入口处已取得的启动票据（事务提交前就已登记，关闭 Stop 竞态窗口）。
+    ticket: &super::lifecycle::StartTicket,
+) -> Result<(), StartFailure> {
     let cfg = super::runtime::build_runtime_endpoint(state, endpoint_id)
         .await
         .map_err(|e| StartFailure::NotStarted(e.to_string()))?;
-    match state.lifecycle.commit_start(&ticket, cfg).await {
+    match state.lifecycle.commit_start(ticket, cfg, audit_ctx).await {
         Ok(()) => Ok(()),
         // R-1：这是唯一一种"启动已发生"的失败。attempt 已在跑，不能当普通失败补偿。
         Err(e) if e.code == "START_INTENT_NOT_PERSISTED" => Err(
@@ -198,13 +205,121 @@ pub async fn device_bootstrap(
     headers: HeaderMap,
     Json(body): Json<BootstrapRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    device_bootstrap_inner(State(state), headers, body).await
+    let audit = state.audit();
+    let endpoint_id = body.endpoint.id.clone();
+    let request_id = lifecycle_audit::new_request_id(lifecycle_audit::OP_BOOTSTRAP, &endpoint_id);
+    let want_start = body.start.unwrap_or(true);
+    // Issue #102 修复（评审 P1，Bootstrap/Stop 竞态）：`start=true` 时**在入口就取票据**。
+    //
+    // 原来的顺序是「事务提交（端点行立刻对其它请求可见）→ … → start_created_endpoint 里才
+    // admit_start」，这中间是一段 Stop 看不见"有 Start 在途"的窗口：Stop 会以
+    // `200 was_running=false` 返回，随后 bootstrap 照样把端点拉起来 —— 与 W1 同类。
+    //
+    // 票据是**纯内存准入**（不查运行态、不碰 DB、不起进程），不是启动副作用，因此可以
+    // 也应当先于审计插入拿到。`start=false` 不取票：没有启动意图就不该让 Stop 看到它。
+    let start_ticket = if want_start {
+        Some(state.lifecycle.admit_start(&endpoint_id))
+    } else {
+        None
+    };
+    // Issue #102 §8：审计包住**整个**入口（含幂等重放与所有早退分支），
+    // 因为 bootstrap 是"建档 + 启动"的原子动作，任何一条返回路径都可能创建了
+    // 运行态副作用；只记录成功路径等于留下黑洞。
+    //
+    // 意图先落盘（fail-closed）：写不进审计就不建 Device/Endpoint/Tasks、不起驱动。
+    //
+    // 注意：审计**不记录**连接 JSON、密码明文与原始幂等键，只记计数与布尔事实。
+    // NOTE（后续项，非本 PR 阻塞）：尚未记录"是否包含 Secret"布尔值——该信息要等
+    // descriptor 门禁拆分 secret 后才可知，而意图必须早于任何副作用写入；已作为
+    // Issue #102 的后续跟进项登记，不在本次实现。
+    let idem_key_present = idempotency_key(&headers, &body).is_some();
+    if let Err(e) = audit.started(
+        &request_id,
+        &endpoint_id,
+        lifecycle_audit::OP_BOOTSTRAP,
+        lifecycle_audit::ACTOR_LOCAL_API,
+        serde_json::json!({
+            "action": "bootstrap",
+            "device_id": &body.device.id,
+            "endpoint_id": &endpoint_id,
+            "driver_id": &body.endpoint.driver_id,
+            "start": want_start,
+            "task_count": body.acquisition.as_ref().map(|a| a.tasks.len()).unwrap_or(0),
+            "idempotency_key_present": idem_key_present,
+            "source": lifecycle_audit::SRC_HTTP_BOOTSTRAP,
+            "client": lifecycle_audit::client_meta(&headers),
+        }),
+    ) {
+        tracing::error!(
+            request_id = %request_id, endpoint = %endpoint_id, error = %e,
+            "生命周期审计意图写入失败，拒绝 device-bootstrap（fail-closed）"
+        );
+        // 票据随作用域释放：审计没落地就绝不能留下"已登记但不会提交"的 Start。
+        drop(start_ticket);
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error(
+                "AUDIT_UNAVAILABLE",
+                "lifecycle audit store unavailable, bootstrap refused",
+            )),
+        );
+    }
+
+    let (status, Json(mut value)) = device_bootstrap_inner(
+        State(state),
+        headers,
+        body,
+        request_id.clone(),
+        start_ticket,
+    )
+    .await;
+
+    // 结论分类：成功 = COMPLETED（含幂等重放）；4xx = 校验/幂等冲突拒绝；
+    // 5xx（含 502 start_failed）= FAILED。重放必须可区分，否则"同 key 又跑了一次"
+    // 与"新请求"在审计里长得一样。
+    let replayed = value
+        .get("replayed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let error_code = value
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string());
+    let audit_status = if status.is_success() {
+        lifecycle_audit::ST_COMPLETED
+    } else if status.is_client_error() {
+        lifecycle_audit::ST_REJECTED
+    } else {
+        lifecycle_audit::ST_FAILED
+    };
+    audit.finish_or_warn(
+        &request_id,
+        audit_status,
+        serde_json::json!({
+            "http_status": status.as_u16(),
+            "replayed": replayed,
+            "error_code": error_code,
+            "endpoint_id": &endpoint_id,
+        }),
+    );
+    if let Some(o) = value.as_object_mut() {
+        o.insert(
+            "request_id".to_string(),
+            serde_json::Value::String(request_id),
+        );
+    }
+    (status, Json(value))
 }
 
 async fn device_bootstrap_inner(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: BootstrapRequest,
+    request_id: String,
+    // Issue #102 修复：`start=true` 时由外层入口取好的 StartTicket（纯内存准入）。
+    // 在事务之前就登记，是为了让并发 Stop 能看见这次启动请求并使其失效。
+    start_ticket: Option<super::lifecycle::StartTicket>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // 幂等键 + 指纹（body 指纹排除 idempotency_key 自身，避免“同请求换 key”
     // 视为不同指纹；secret 明文参与指纹——同一 key 换密码必须 409）。
@@ -385,6 +500,14 @@ async fn device_bootstrap_inner(
         Err(e) => return store_err_to_response(e),
     };
 
+    // 测试钩子（Issue #102 并发回归）：在「事务已提交、Start 尚未提交」处等待放行。
+    // 这正是评审指出的窗口位置；生产构建里该字段不存在，等待路径不编译。
+    #[cfg(feature = "test-hooks")]
+    if let Some(gate) = state.test_bootstrap_start_gate() {
+        // 0 许可 = 一直阻塞，直到测试 `add_permits(1)`；许可不归还（闸门一次性使用）。
+        let _permit = gate.acquire().await;
+    }
+
     // 3) start side effect（可选）
     let want_start = body.start.unwrap_or(true);
     let mut start_failed: Option<String> = None;
@@ -392,7 +515,31 @@ async fn device_bootstrap_inner(
     let mut compensated = false;
     let mut attempt_stopped = false;
     if want_start {
-        if let Err(failure) = start_created_endpoint(&state, &endpoint_rec.id).await {
+        // Issue #102：启动 side effect 带上父请求上下文（bootstrap 的 request_id），
+        // 并使用**入口处取好的票据**——这里不再重新 admit，否则"事务提交 → admit"
+        // 之间又会重新长出一条 Stop 看不见 Start 的窗口。
+        let audit_ctx = mesa_driver_manager::attempt_audit::AttemptContext::audited(
+            request_id.clone(),
+            lifecycle_audit::ACTOR_LOCAL_API,
+            state.audit_sink(),
+        );
+        let start_result = match start_ticket {
+            Some(ticket) => {
+                start_created_endpoint(&state, &endpoint_rec.id, audit_ctx, &ticket).await
+            }
+            None => {
+                // 不变量破坏（want_start=true 时入口必取票）：按普通启动失败处理，
+                // 走既有补偿路径，绝不"没票也启动"。
+                tracing::error!(
+                    endpoint = %endpoint_rec.id,
+                    "device-bootstrap 缺少生命周期票据（装配不变量被破坏），拒绝启动"
+                );
+                Err(StartFailure::NotStarted(
+                    "START_TICKET_MISSING: bootstrap 未在入口取得启动票据".into(),
+                ))
+            }
+        };
+        if let Err(failure) = start_result {
             let started = failure.started();
             let m = failure.message().to_string();
             start_failed_code = failure.code();
