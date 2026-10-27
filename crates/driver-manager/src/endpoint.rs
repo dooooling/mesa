@@ -466,8 +466,17 @@ pub async fn run_endpoint_with_attempt(
             backoff_idx += 1;
         }
         tracing::info!(endpoint = %cfg.endpoint_id, retry_in_secs = delay.as_secs(), "reconnecting");
+        let wait = async {
+            // 仅测试可以显式推进本 Endpoint 的等待；计划值、递增与重置仍走生产逻辑。
+            #[cfg(feature = "test-hooks")]
+            if let Some(clock) = ctx.as_ref().and_then(|c| c.test_reconnect_clock.get()) {
+                clock.wait(delay).await;
+                return;
+            }
+            tokio::time::sleep(delay).await;
+        };
         tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
+            _ = wait => {}
             _ = shutdown.cancelled() => {
                 set_status(&snapshot, &cfg, generation, ConnectionState::Stopped, "core shutdown", id_map.len(), last_epoch, source.revision(&cfg.endpoint_id));
                 return None;

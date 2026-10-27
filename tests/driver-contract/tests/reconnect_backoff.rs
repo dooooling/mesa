@@ -5,7 +5,7 @@
 //! 因此本套件：
 //! - 不读、也不设置 `MESA_RECONNECT_FAST`（避免进程级 env 串扰）；
 //! - 用测试侧 `PointIdSource` 装饰器记录每个 attempt 的起始（`assign()` 时间戳），
-//!   无需轮询、无需新增生产 API；
+//!   真实子进程仍按原路径启动/退出；test-hooks 时钟只推进本 Endpoint 的退避等待；
 //! - 用本进程 tracing subscriber 捕获日志并解析 `retry_in_secs`（字符串精确）。
 //!
 //! 触发器 `fail_before_first_batch_ms` 的语义由 test-driver 保证：
@@ -191,6 +191,7 @@ impl Rig {
         tasks: Vec<mesa_core_types::AcquisitionTask>,
         event_tasks: Vec<EventTask>,
     ) {
+        self.mgr.test_reconnect_clock(endpoint_id);
         self.mgr
             .start_endpoint(BuiltinEndpoint {
                 endpoint_id: endpoint_id.into(),
@@ -206,7 +207,7 @@ impl Rig {
         self.hits.lock().unwrap().len()
     }
 
-    async fn wait_attempts(&self, n: usize, secs: u64) {
+    async fn wait_attempts(&self, endpoint: &str, n: usize, secs: u64) {
         let deadline = Instant::now() + Duration::from_secs(secs);
         while self.attempts() < n {
             assert!(
@@ -214,6 +215,7 @@ impl Rig {
                 "attempt 数不足：want>={n}, got={}",
                 self.attempts()
             );
+            self.mgr.test_reconnect_clock(endpoint).advance();
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
@@ -230,6 +232,7 @@ impl Rig {
                 Instant::now() < deadline,
                 "计划退避值不足：want>={n}, got={v:?}"
             );
+            self.mgr.test_reconnect_clock(endpoint_id).advance();
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
@@ -457,8 +460,9 @@ async fn stop_cancels_escalated_backoff_and_stops_retrying() {
     rig.start(EP, r#"{"fail_before_first_batch_ms":100}"#);
 
     // 第 4 次 attempt 起点之后，下一次退避为 10s（1,2,5 已消耗）。
-    rig.wait_attempts(4, 40).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    rig.wait_attempts(EP, 4, 40).await;
+    let clock = rig.mgr.test_reconnect_clock(EP);
+    common::wait_until(20, || clock.pending() == Some(Duration::from_secs(10))).await;
     let before = rig.attempts();
 
     let t0 = Instant::now();
@@ -473,6 +477,12 @@ async fn stop_cancels_escalated_backoff_and_stops_retrying() {
     );
     assert_eq!(rig.state(EP), "STOPPED", "Stop 后终态必须是 STOPPED");
 
-    tokio::time::sleep(Duration::from_secs(12)).await;
+    assert!(
+        clock.pending().is_none(),
+        "Stop 必须销毁等待，而不是留下一次可唤醒的重连"
+    );
+    assert!(!clock.advance(), "Stop 后不能再推进已取消的退避");
+    tokio::task::yield_now().await;
+    assert!(!rig.mgr.has_live_attempt(EP));
     assert_eq!(rig.attempts(), before, "Stop 之后不得再产生任何 attempt");
 }

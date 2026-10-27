@@ -5,8 +5,8 @@
 #   必要 binary link（contract smoke 真正需要的 bins）+
 #   platform-sensitive suites（nextest ci-platform，soak 除外）。
 #   不再全 workspace bins + 全 targets --no-run。
-# - full（main）：check 全 workspace + bins 全 link + ci-platform 全量
-#   （soak 除外；soak 归 stress）。
+# - full（main）：一次 all-targets 构建覆盖全 workspace 检查、bins 与测试程序，
+#   ci-platform 复用产物执行全量（soak 除外；soak 归 stress）。
 # 平台无关逻辑不重复全量——由 Linux canonical 覆盖。
 name: rust-platform
 on:
@@ -56,9 +56,9 @@ jobs:
           cache-writer: "true"
           install-nextest: "true"
 
-      # 全 workspace 类型/条件编译正确（check，不 link 全量；
-      # performance-tests 与旧行为一致，继续 exclude）。
+      # smoke 不构建全部测试，仍单独做全目标检查；FULL 由下面的 all-targets 构建覆盖。
       - name: check workspace
+        if: inputs.mode == 'smoke'
         run: >
           cargo check
           --locked
@@ -114,10 +114,11 @@ jobs:
           --profile ci-platform
           -E 'package(=mesa-contract-tests) and (binary(=smoke) or binary(=protocol_negotiation) or binary(=fault_tolerance) or binary(=discovery_contract) or binary(=session_lifecycle) or binary(=stop_lifecycle) or binary(=subprocess_orphan_guard) or binary(=subprocess_recovery) or binary(=mesad_restart)) and (not (binary(=event_soak) or binary(=event_pressure)))'
 
-      # full 一次构建覆盖全部 runtime bins，不再先构建 smoke 子集；feature 与 nextest 对齐。
-      - name: build all bins (full only)
+      # FULL 一次编译所有旧 check 目标及 runtime bins，nextest 复用测试程序。
+      # examples/benches 也实际构建，不能通过删 check 遗漏原有检查范围。
+      - name: build all targets (full only)
         if: inputs.mode != 'smoke'
-        run: cargo build --locked --workspace --bins --all-features
+        run: cargo build --locked --workspace --all-targets --all-features --exclude mesa-performance-tests --timings
 
       - name: nextest platform full (soak excluded)
         if: inputs.mode != 'smoke'
@@ -140,6 +141,16 @@ jobs:
           --all-features
           --profile ci-platform
           -E 'package(=mesa-contract-tests) and (binary(=event_soak) or binary(=event_pressure))'
+
+      # 诊断附件放在测试之后；上传故障不能阻止测试或改变测试准入结果。
+      - name: upload build timings
+        if: always() && inputs.mode != 'smoke'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-timings-${{ inputs.cache-domain }}
+          path: target/cargo-timings/
+          if-no-files-found: warn
 
       - name: sccache stats
         if: always()

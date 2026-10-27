@@ -322,6 +322,7 @@ struct Rig {
     mgr: Arc<MesaManager>,
     app: axum::Router,
     faults: Arc<StoreFaults>,
+    lifecycle: Arc<mesa_core_api::lifecycle::LifecycleGate>,
     _staged: common::StagedDriversDir,
 }
 
@@ -369,6 +370,7 @@ impl Rig {
         )
         .unwrap();
         state.set_event_services(services);
+        let lifecycle = Arc::clone(&state.lifecycle);
         let app = state.router();
         Self {
             dir,
@@ -376,6 +378,7 @@ impl Rig {
             mgr,
             app,
             faults,
+            lifecycle,
             _staged: staged,
         }
     }
@@ -716,81 +719,71 @@ async fn w2_start_during_stop_teardown_is_rejected_and_does_not_resurrect() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w3_double_start_only_one_attempt() {
     let rig = Rig::new("w3", false).await;
-    // 预热 Descriptor：让两个 handler 尽量同时抵达提交点（放大竞态窗口）。
-    let warm = "w3-warm";
-    rig.create_endpoint(warm, false);
-    let _ = rig.start(warm).await;
-    let _ = rig.stop(warm).await;
-    let _ = rig.store.delete_endpoint(warm);
-
-    for i in 0..12 {
-        let id = format!("w3-{i}");
-        rig.create_endpoint(&id, false);
-        let mut tasks = Vec::new();
-        for _ in 0..2 {
-            let app = rig.app.clone();
-            let uri = format!("/api/v1/endpoints/{id}/start");
-            tasks.push(tokio::spawn(async move {
-                let req = Request::builder()
-                    .method("POST")
-                    .uri(uri)
-                    .header("content-type", "application/json")
-                    .body(Body::empty())
-                    .unwrap();
-                let resp = app.oneshot(req).await.unwrap();
-                let status = resp.status();
-                let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-                    .await
-                    .unwrap();
-                (
-                    status,
-                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
-                )
-            }));
-        }
-        let mut oks = 0;
-        let mut conflicts = 0;
-        for t in tasks {
-            let (s, v) = t.await.unwrap();
-            match s {
-                StatusCode::OK => oks += 1,
-                StatusCode::CONFLICT => {
-                    conflicts += 1;
-                    assert_eq!(
-                        code_of(&v),
-                        "CONFLICT",
-                        "重复 Start 的冲突码必须是 CONFLICT，实际: {v}"
-                    );
-                }
-                other => panic!("重复 Start 只允许 200/409，实际 {other}: {v}"),
-            }
-        }
-        assert_eq!(oks, 1, "第 {i} 轮：并发两 Start 必须恰好一个成功");
-        assert_eq!(conflicts, 1, "第 {i} 轮：另一个必须是 409 冲突");
-
-        // Stop 之后不得有孤儿仍在采集。
-        let (s, v) = rig.stop(&id).await;
-        assert_eq!(s, StatusCode::OK, "Stop: {v}");
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        let t1 = rig
-            .mgr
-            .snapshot()
-            .latest_all()
-            .into_iter()
-            .find(|p| p.endpoint_id == id)
-            .map(|p| p.timestamp_ns);
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let t2 = rig
-            .mgr
-            .snapshot()
-            .latest_all()
-            .into_iter()
-            .find(|p| p.endpoint_id == id)
-            .map(|p| p.timestamp_ns);
-        assert_eq!(t1, t2, "第 {i} 轮：Stop 后仍有孤儿在采集");
-        assert!(!rig.mgr.is_running(&id));
-        let _ = rig.store.delete_endpoint(&id);
+    let id = "w3-race";
+    rig.create_endpoint(id, false);
+    // 两个真实 HTTP handler 构造完成后都停在提交前；第三方参与者由本测试放行。
+    // 相比反复启停碰竞态，这保证两个票据同时在途，且不会提前产生运行副作用。
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    rig.lifecycle
+        .set_test_start_commit_barrier(Some(Arc::clone(&barrier)));
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        tasks.push(tokio::spawn(send_http(
+            rig.app.clone(),
+            "POST",
+            format!("/api/v1/endpoints/{id}/start"),
+        )));
     }
+    common::wait_until(20, || rig.lifecycle.sample(id).inflight_starts == 2).await;
+    assert!(!rig.mgr.has_live_attempt(id), "放行前不得提交 attempt");
+    assert!(!rig.desired(id), "放行前不得写运行意图");
+    tokio::time::timeout(Duration::from_secs(20), barrier.wait())
+        .await
+        .expect("两个 handler 都必须完成构造并抵达提交屏障");
+    rig.lifecycle.set_test_start_commit_barrier(None);
+
+    let mut oks = 0;
+    let mut conflicts = 0;
+    for task in tasks {
+        let (status, body) = tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .unwrap()
+            .unwrap();
+        match status {
+            StatusCode::OK => oks += 1,
+            StatusCode::CONFLICT => {
+                conflicts += 1;
+                assert_eq!(code_of(&body), "CONFLICT", "{body}");
+            }
+            other => panic!("并发 Start 只允许 200/409，实际 {other}: {body}"),
+        }
+    }
+    assert_eq!(
+        (oks, conflicts),
+        (1, 1),
+        "并发 Start 必须恰好一个成功、一个冲突"
+    );
+    assert_eq!(rig.mgr.gen_floor(id), 1, "不得产生被覆盖的第二个 attempt");
+    rig.wait_running(id, 20).await;
+    assert!(rig.desired(id));
+    let (status, body) = rig.stop(id).await;
+    assert_eq!(status, StatusCode::OK, "Stop: {body}");
+    assert!(!rig.mgr.has_live_attempt(id));
+    assert!(!rig.desired(id));
+    // 保留原来的停止后观察窗口，仍核验没有孤儿继续发布，而不是仅检查响应码。
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let latest = || {
+        rig.mgr
+            .snapshot()
+            .latest_all()
+            .into_iter()
+            .find(|p| p.endpoint_id == id)
+            .map(|p| p.timestamp_ns)
+    };
+    let before = latest();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(before, latest(), "Stop 后不得仍有孤儿采集");
+    assert!(!rig.mgr.is_running(id));
 }
 
 // ---------------------------------------------------------------------------

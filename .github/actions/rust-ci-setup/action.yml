@@ -1,4 +1,4 @@
-# 共享 Rust CI 环境（CI v2 cache topology v2）：所有 Rust job 唯一 setup 入口。
+# 共享 Rust CI 环境（按平台与调试信息隔离缓存）：所有 Rust job 唯一 setup 入口。
 #
 # 拓扑（local sccache + archive save；GHA remote backend 已废弃）：
 # - sccache 只写本地盘（SCCACHE_DIR=$RUNNER_TEMP/mesa-sccache，512M）；
@@ -14,6 +14,7 @@
 #                 同时决定 sccache archive 与 registry key）
 #   cache-writer: 是否为该域 writer（main 成功时 save；reader 永不 save）
 #   install-nextest: 是否安装 nextest（test job true；quality false）
+#   debug-info: CI 调试信息级别；dev/test 共用，避免重复编译
 name: rust-ci-setup
 description: "Mesa CI v2 共享 Rust 环境：toolchain + registry cache + local sccache archive + nextest（可选）"
 inputs:
@@ -32,9 +33,27 @@ inputs:
     description: "是否安装 cargo-nextest 0.9.146"
     required: false
     default: "false"
+  debug-info:
+    description: "CI 调试信息：保留文件/行号的 line-tables-only；full 用于对照验证"
+    required: false
+    default: "line-tables-only"
 runs:
   using: composite
   steps:
+    # 两个 profile 必须一致，避免 build 与 nextest 因调试配置不同重新编译。
+    # 仅影响 CI 环境；保留断言、溢出检查与 opt-level，发布配置和本地默认不变。
+    - name: CI debug information
+      shell: bash
+      env:
+        DEBUG_INFO: ${{ inputs.debug-info }}
+      run: |
+        case "$DEBUG_INFO" in
+          line-tables-only|full) ;;
+          *) echo "debug-info 非法：$DEBUG_INFO" >&2; exit 1 ;;
+        esac
+        echo "CARGO_PROFILE_DEV_DEBUG=$DEBUG_INFO" >> "$GITHUB_ENV"
+        echo "CARGO_PROFILE_TEST_DEBUG=$DEBUG_INFO" >> "$GITHUB_ENV"
+
     # toolchain 唯一真值：解析 rust-toolchain.toml channel（升级只改一处）。
     - name: Resolve toolchain channel
       id: toolchain
@@ -98,9 +117,10 @@ runs:
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ runner.temp }}/mesa-sccache
-        key: mesa-sccache-v2-${{ inputs.cache-domain }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}-${{ github.sha }}
+        key: mesa-sccache-v3-${{ inputs.cache-domain }}-${{ inputs.debug-info }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}-${{ github.sha }}
         restore-keys: |
-          mesa-sccache-v2-${{ inputs.cache-domain }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}-
+          mesa-sccache-v3-${{ inputs.cache-domain }}-${{ inputs.debug-info }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}-
+          mesa-sccache-v3-${{ inputs.cache-domain }}-${{ inputs.debug-info }}-
           mesa-sccache-v2-${{ inputs.cache-domain }}-
 
     # sccache archive restore+save（仅 main + writer；完整 actions/cache
@@ -110,7 +130,8 @@ runs:
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ runner.temp }}/mesa-sccache
-        key: mesa-sccache-v2-${{ inputs.cache-domain }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}-${{ github.sha }}
+        key: mesa-sccache-v3-${{ inputs.cache-domain }}-${{ inputs.debug-info }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}-${{ github.sha }}
         restore-keys: |
-          mesa-sccache-v2-${{ inputs.cache-domain }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}-
+          mesa-sccache-v3-${{ inputs.cache-domain }}-${{ inputs.debug-info }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}-
+          mesa-sccache-v3-${{ inputs.cache-domain }}-${{ inputs.debug-info }}-
           mesa-sccache-v2-${{ inputs.cache-domain }}-

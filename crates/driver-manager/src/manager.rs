@@ -425,6 +425,8 @@ pub struct AttemptCtx {
     /// 测试专用 panic 注入开关（`test-hooks`）。
     #[cfg(feature = "test-hooks")]
     pub test_panic_before_teardown: AtomicBool,
+    #[cfg(feature = "test-hooks")]
+    pub test_reconnect_clock: OnceLock<Arc<crate::test_clock::ReconnectClock>>,
 }
 
 impl AttemptCtx {
@@ -441,6 +443,8 @@ impl AttemptCtx {
             done_tx,
             #[cfg(feature = "test-hooks")]
             test_panic_before_teardown: AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            test_reconnect_clock: OnceLock::new(),
         }
     }
 
@@ -653,6 +657,8 @@ pub struct MesaManager {
     /// 测试专用：挂住 reaper 的复核（`test-hooks`），用于**确定性**观察隔离态。
     #[cfg(feature = "test-hooks")]
     reaper_hold: Arc<AtomicBool>,
+    #[cfg(feature = "test-hooks")]
+    test_reconnect_clocks: Mutex<HashMap<String, Arc<crate::test_clock::ReconnectClock>>>,
 }
 
 impl MesaManager {
@@ -686,6 +692,8 @@ impl MesaManager {
             test_panic_before_teardown: AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
             reaper_hold: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "test-hooks")]
+            test_reconnect_clocks: Mutex::new(HashMap::new()),
         };
         // 监督任务：**只**清理"任务已死、条目处于隔离态"的残留（不启停端点、
         // 不写期望态、不改快照）⇒ 不是对账器/看门狗（G7 §10-1 边界）。
@@ -879,6 +887,21 @@ impl MesaManager {
         self.test_panic_before_teardown.store(on, Ordering::Relaxed);
     }
 
+    /// 测试专用：必须在 Start 前安装；每个 Endpoint 独立，不读取或改写全局 env。
+    #[cfg(feature = "test-hooks")]
+    pub fn test_reconnect_clock(
+        &self,
+        endpoint_id: &str,
+    ) -> Arc<crate::test_clock::ReconnectClock> {
+        Arc::clone(
+            self.test_reconnect_clocks
+                .lock()
+                .unwrap()
+                .entry(endpoint_id.to_string())
+                .or_default(),
+        )
+    }
+
     /// 测试专用：挂住 / 放行 reaper 的复核（`test-hooks`）。
     ///
     /// 为什么需要：真实收敛证明可能在微秒级完成（子进程已被 `kill_on_drop`
@@ -934,6 +957,16 @@ impl MesaManager {
                 let registry = std::sync::Arc::clone(&self.active_sessions);
                 let events = self.event_services.read().unwrap().clone();
                 let ctx = Arc::new(AttemptCtx::new(generation));
+                #[cfg(feature = "test-hooks")]
+                if let Some(clock) = self
+                    .test_reconnect_clocks
+                    .lock()
+                    .unwrap()
+                    .get(&cfg.endpoint_id)
+                    .cloned()
+                {
+                    let _ = ctx.test_reconnect_clock.set(clock);
+                }
                 #[cfg(feature = "test-hooks")]
                 ctx.test_panic_before_teardown.store(
                     self.test_panic_before_teardown.load(Ordering::Relaxed),

@@ -320,6 +320,8 @@ pub struct LifecycleGate {
     store: Arc<ConfigStore>,
     manager: Arc<MesaManager>,
     inner: Mutex<HashMap<String, EpGate>>,
+    #[cfg(feature = "test-hooks")]
+    start_commit_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 impl LifecycleGate {
@@ -328,7 +330,16 @@ impl LifecycleGate {
             store,
             manager,
             inner: Mutex::new(HashMap::new()),
+            #[cfg(feature = "test-hooks")]
+            start_commit_barrier: Mutex::new(None),
         }
+    }
+
+    /// 测试专用：在构造完成、提交开始之前会合，使并发 Start 的交错可确定复现。
+    /// 不持有门锁跨 await；默认构建没有本字段或等待路径。
+    #[cfg(feature = "test-hooks")]
+    pub fn set_test_start_commit_barrier(&self, barrier: Option<Arc<tokio::sync::Barrier>>) {
+        *self.start_commit_barrier.lock().unwrap() = barrier;
     }
 
     // -----------------------------------------------------------------
@@ -366,6 +377,13 @@ impl LifecycleGate {
         ticket: &StartTicket,
         cfg: mesa_driver_manager::endpoint::BuiltinEndpoint,
     ) -> Result<(), LifecycleError> {
+        #[cfg(feature = "test-hooks")]
+        {
+            let barrier = self.start_commit_barrier.lock().unwrap().clone();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+            }
+        }
         // 快路径：已有活 attempt 时不需要等落盘串行器——`start_endpoint` 会给出
         // 既有的 STOP_IN_PROGRESS / already running / ATTEMPT_FAILED_UNKNOWN。
         let persist_lock = {
