@@ -441,6 +441,28 @@ pub async fn run_endpoint_with_attempt(
                     "connection lost"
                 );
                 snapshot.mark_communication_lost(&cfg.endpoint_id);
+                // Issue #102：记录旧 epoch 的结束（辅助证据，失败只告警）。
+                // 不阻断 teardown/重连：连接已经断了，任何"为了写审计而延迟退出"都是错的。
+                if let Some((c, sink)) = ctx
+                    .as_ref()
+                    .and_then(|c| Some((c, c.audit().active_sink()?)))
+                {
+                    let ev = crate::attempt_audit::RuntimeLostEvent {
+                        parent_request_id: c.audit().parent_request_id().map(|s| s.to_string()),
+                        endpoint_id: cfg.endpoint_id.clone(),
+                        generation,
+                        last_epoch,
+                        // 只写白名单稳定码：原始 reason 已在上面的 "connection lost" 日志里
+                        reason_code: lost_reason_code(&reason),
+                        had_running_session,
+                    };
+                    if let Err(e) = sink.record_runtime_lost(&ev) {
+                        tracing::warn!(
+                            endpoint = %cfg.endpoint_id, error = %e,
+                            "runtime_lost 审计写入失败（不阻止 teardown 与重连）"
+                        );
+                    }
+                }
                 set_status(
                     &snapshot,
                     &cfg,
@@ -645,7 +667,7 @@ async fn attempt_session(
         let sess = session_arc.lock().await;
         #[allow(clippy::explicit_auto_deref)]
         {
-            run_config_flow(&sess, cfg, source, id_map, snapshot, last_epoch).await
+            run_config_flow(&sess, cfg, source, id_map, snapshot, last_epoch, ctx).await
         }
     };
     match config_res {
@@ -875,6 +897,9 @@ async fn shutdown_ingress(
 }
 
 /// 配置闭环（§6.2）：Open -> Configure -> PointDescriptors -> ApplyPointMap -> Start。
+///
+/// `ctx`（Issue #102）：提供 epoch 审计上下文。为 `None` 或不带 sink 时，
+/// 审计退化为 no-op，行为与改动前完全一致。
 async fn run_config_flow(
     session: &Session,
     cfg: &BuiltinEndpoint,
@@ -882,6 +907,7 @@ async fn run_config_flow(
     id_map: &mut HashMap<String, u32>,
     snapshot: &Arc<Snapshot>,
     last_epoch: &mut u64,
+    ctx: Option<&Arc<crate::manager::AttemptCtx>>,
 ) -> Result<(), AttemptOutcome> {
     use pb::envelope::Body;
 
@@ -1005,22 +1031,141 @@ async fn run_config_flow(
 
     // StartConnection(new stream_epoch)
     let epoch = new_stream_epoch();
-    let reply = session
-        .call(Body::StartConnection(pb::StartConnection {
-            connection_handle: HANDLE,
-            stream_epoch: epoch,
-        }))
-        .await
-        .map_err(|e| AttemptOutcome::Lost {
-            reason: format!("start rpc: {e}"),
-            had_running_session: false,
-        })?;
-    let result = expect_ack(reply.body).ok_or_else(|| lost("StartConnection"))?;
-    config_gate(result, "StartConnection")?;
+    // Issue #102：epoch 意图必须**先落盘、再发 StartConnection**。
+    //
+    // 这条顺序是可追溯性的地基：只要驱动开始按某个 epoch 发数据，审计面就必然存在一条
+    // 能对上它的记录。写不进去就不启动——否则时间线上会出现"有 epoch 无来源"的黑洞，
+    // 正是 #102 现场（10:24:30 冒出陌生 epoch）无法归因的直接原因。
+    //
+    // 失败归类为 `Lost`（可重连）而不是 `ConfigurationFailed`（终态）：审计失败通常是
+    // DB 短暂不可用，重连退避会重试；而配置类失败是终态，一次 DB 抖动就会让端点
+    // 永久 FAILED，代价与"审计缺失"完全不对等。
+    //
+    // 序号两段式（评审修正）：`try_audit_epoch_intent` 只在意图**持久化成功**后提交序号，
+    // 因此"第一次写失败、第二次成功"时，第一次真正成功的连接仍是 `:epoch:1` /
+    // `initial_connection`，不会被伪装成内部重连。
+    let epoch_request_id = match ctx {
+        Some(c) => match c.try_audit_epoch_intent(&cfg.endpoint_id, epoch) {
+            Ok(rid) => rid,
+            Err(e) => {
+                tracing::error!(
+                    endpoint = %cfg.endpoint_id, epoch, error = %e,
+                    "epoch 审计意图写入失败：拒绝发送 StartConnection"
+                );
+                return Err(AttemptOutcome::Lost {
+                    reason: format!("AUDIT_UNAVAILABLE: epoch intent not persisted: {e}"),
+                    had_running_session: false,
+                });
+            }
+        },
+        None => None,
+    };
+    // RPC + ACK 收在一个块里，成败都以同一条记录收尾（成功 COMPLETED / 失败 FAILED）。
+    let start_res: Result<(), AttemptOutcome> = async {
+        let reply = session
+            .call(Body::StartConnection(pb::StartConnection {
+                connection_handle: HANDLE,
+                stream_epoch: epoch,
+            }))
+            .await
+            .map_err(|e| AttemptOutcome::Lost {
+                reason: format!("start rpc: {e}"),
+                had_running_session: false,
+            })?;
+        let result = expect_ack(reply.body).ok_or_else(|| lost("StartConnection"))?;
+        config_gate(result, "StartConnection")?;
+        Ok(())
+    }
+    .await;
+    // Issue #102：只有 StartConnection 真的 ACK 才算"建立过连接"。
+    // 它决定后续重试的来源分类：没连上过 ⇒ `initial_connection_retry`（不是断线重连）。
+    if let (true, Some(c)) = (start_res.is_ok(), ctx) {
+        c.mark_connection_established();
+    }
+    if let (Some(rid), Some(sink)) = (
+        epoch_request_id.as_deref(),
+        ctx.and_then(|c| c.audit().active_sink()),
+    ) {
+        let outcome = match &start_res {
+            Ok(()) => crate::attempt_audit::EpochOutcome::Completed {
+                point_count: defs.len(),
+            },
+            Err(o) => {
+                let (category, code) = start_failure_category(o);
+                crate::attempt_audit::EpochOutcome::Failed { category, code }
+            }
+        };
+        // 结果更新失败只告警：采集已经在跑（或已经失败），不能为了补记录打断连接。
+        if let Err(e) = sink.record_epoch_outcome(rid, &outcome) {
+            tracing::warn!(request_id = %rid, error = %e, "epoch 审计结果更新失败（连接不受影响）");
+        }
+    }
+    start_res?;
     *last_epoch = epoch;
-    tracing::info!(endpoint = %cfg.endpoint_id, epoch, points = defs.len(), "connection started");
+    tracing::info!(
+        endpoint = %cfg.endpoint_id,
+        epoch,
+        points = defs.len(),
+        request_id = epoch_request_id.as_deref().unwrap_or("-"),
+        "connection started"
+    );
 
     Ok(())
+}
+
+/// 把 StartConnection 阶段的失败归类成**稳定**审计字段 `(category, code)`。
+///
+/// 持久审计只保留分类与稳定错误码：原始 detail 可能含地址、路径或对端错误文本，
+/// 属于"只进日志"的内容（评审要求）。日志侧的错误仍在调用方 `tracing::error!` 里完整保留。
+fn start_failure_category(outcome: &AttemptOutcome) -> (String, Option<String>) {
+    match outcome {
+        AttemptOutcome::Shutdown => ("shutdown".to_string(), None),
+        AttemptOutcome::ConfigurationFailed(detail) => {
+            ("configuration_failed".to_string(), stable_code(detail))
+        }
+        // Lost 的原因串同样只在日志里；审计只留分类（具体原因由 runtime_lost 的
+        // reason_code 白名单映射承担）。
+        AttemptOutcome::Lost { .. } => ("lost".to_string(), None),
+    }
+}
+
+/// 从错误描述里取出**稳定错误码**（形如 `ConfigurationError/DEFINITION_SCOPE_NOT_COLLECTABLE`）。
+///
+/// 只取首个分隔符前的 token，且只接受"看起来像码"的形状（ASCII 字母数字与 `_/.-`），
+/// 其余一律丢弃——宁可少存，也不把可能含路径/地址的自由文本写进审计。
+fn stable_code(detail: &str) -> Option<String> {
+    let head = detail.split([':', ' ']).next().unwrap_or_default().trim();
+    let shaped = !head.is_empty()
+        && head.len() <= 96
+        && head
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '.' | '-'));
+    // 纯数字/纯小写单词不算码（避免把人类句子当成 code 存下来）
+    if shaped && head.chars().any(|c| c.is_ascii_uppercase()) {
+        Some(head.to_string())
+    } else {
+        None
+    }
+}
+
+/// 连接丢失原因的**白名单**稳定码。
+///
+/// 为什么不用原始串：`reason` 里会拼接底层错误（可能含地址/端点细节），
+/// 审计表需要的是可聚合、可告警的分类；原始串已经在 `connection lost` 日志里。
+fn lost_reason_code(reason: &str) -> &'static str {
+    let head = reason.split(':').next().unwrap_or_default().trim();
+    match head {
+        "spawn failed" => "spawn_failed",
+        "connect failed" => "connect_failed",
+        "open rpc" => "open_rpc_failed",
+        "configure rpc" => "configure_rpc_failed",
+        "apply rpc" => "apply_rpc_failed",
+        "start rpc" => "start_rpc_failed",
+        "event ingress exited" => "event_ingress_exited",
+        "heartbeat" | "watchdog" => "heartbeat_lost",
+        "reader eof" | "reader closed" | "peer closed" => "reader_eof",
+        _ => "other",
+    }
 }
 
 async fn event_loop(

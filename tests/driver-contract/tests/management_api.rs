@@ -4154,3 +4154,272 @@ async fn nck_preview_family_mismatch_is_501_unsupported() {
         "消息要素: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #102：端点生命周期可追溯性（意图先行 / 结果如实 / epoch 可归因）
+//
+// 现场问题不是"端点自己跑起来"这个现象本身，而是**没人能说清是谁让它跑起来的**。
+// 本组用例把"能回答"变成可执行断言：
+// ① bootstrap 与 REST start 都必须在运行副作用之前留下 `STARTED`→`ACCEPTED/COMPLETED`；
+// ② 每个真实 `stream_epoch` 都必须有一条挂在**触发它的那次请求**下的子记录；
+// ③ `Manager 接受` 不得被记成 `RUNNING`（真实 RUNNING 只由 epoch 记录证明）；
+// ④ Stop 的响应必须如实报告审计是否写入（`audit_recorded`），审计失败不改变停止结果。
+// ---------------------------------------------------------------------------
+
+/// 可正常启动的 test-driver 端点：空任务（无采集点），但 Start/epoch 链路完整。
+/// 空任务的收益是 epoch 断言不受点位扫描影响，仍然是**真实子进程 + 真实 IPC**。
+fn audit_bootstrap_body(device_id: &str, endpoint_id: &str) -> String {
+    serde_json::json!({
+        "device": { "id": device_id, "name": "审计设备" },
+        "endpoint": {
+            "id": endpoint_id,
+            "name": "审计端点",
+            "driver_id": "test-driver",
+            "connection": {},
+        },
+        "acquisition": { "tasks": [] },
+        "start": true,
+    })
+    .to_string()
+}
+
+/// 取某端点全部 lifecycle 审计（降序，最新在前）。
+async fn lifecycle_audits(app: &axum::Router, endpoint_id: &str) -> Vec<serde_json::Value> {
+    let (s, v) = get_json(
+        app.clone(),
+        &format!(
+            "/api/v1/control/audit?endpoint_id={endpoint_id}&operation_type=lifecycle&limit=50"
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "审计查询必须可用: {v}");
+    v["audits"].as_array().cloned().unwrap_or_default()
+}
+
+fn find_op<'a>(audits: &'a [serde_json::Value], op: &str) -> Option<&'a serde_json::Value> {
+    audits.iter().find(|a| a["operation_id"] == op)
+}
+
+/// 轮询等待审计面出现满足条件的记录：审计写入与驱动启动都是异步的，
+/// 断言必须等"事实落地"，不能靠固定 sleep 猜时间。
+async fn wait_for_audit<F>(app: &axum::Router, endpoint_id: &str, mut pred: F)
+where
+    F: FnMut(&[serde_json::Value]) -> bool,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let audits = lifecycle_audits(app, endpoint_id).await;
+        if pred(&audits) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "20s 内未等到期望的审计记录（endpoint={endpoint_id}）"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_audit_traces_bootstrap_epoch_stop_and_start() {
+    let (app, mgr, _staged) = app().await;
+    let eid = "audit-ep1";
+
+    // === 段 1：bootstrap（建档即启动）===
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/device-bootstrap",
+        &audit_bootstrap_body("audit-dev1", eid),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "bootstrap 必须成功: {v}");
+    let bootstrap_rid = v["request_id"]
+        .as_str()
+        .expect("bootstrap 响应必须带 request_id（审计主键）")
+        .to_string();
+
+    // 真实 RUNNING 由 epoch 子记录证明，而不是靠 bootstrap 的响应码。
+    wait_for_audit(&app, eid, |audits| {
+        audits
+            .iter()
+            .any(|a| a["operation_id"] == "endpoint.runtime_epoch" && a["status"] == "COMPLETED")
+    })
+    .await;
+
+    let audits = lifecycle_audits(&app, eid).await;
+    // ① bootstrap 主记录：COMPLETED + actor/source 如实
+    let boot = find_op(&audits, "device.bootstrap").expect("bootstrap 审计必须存在");
+    assert_eq!(boot["status"], "COMPLETED", "bootstrap 审计: {boot}");
+    assert_eq!(boot["request_id"].as_str(), Some(bootstrap_rid.as_str()));
+    assert_eq!(boot["actor"], "local-api");
+    let boot_req: serde_json::Value =
+        serde_json::from_str(boot["request_json"].as_str().unwrap()).unwrap();
+    assert_eq!(boot_req["source"], "http_bootstrap");
+    assert!(
+        boot_req.get("connection").is_none(),
+        "审计不得保存连接内容（含潜在 Secret）: {boot_req}"
+    );
+
+    // ② epoch 子记录：挂在 bootstrap 的父请求下，source=initial_connection
+    let epoch = find_op(&audits, "endpoint.runtime_epoch").expect("epoch 审计必须存在");
+    assert_eq!(epoch["status"], "COMPLETED", "epoch 审计: {epoch}");
+    assert_eq!(
+        epoch["request_id"].as_str(),
+        Some(format!("{bootstrap_rid}:epoch:1").as_str()),
+        "epoch 子记录 ID 必须是 <父请求>:epoch:<序号>"
+    );
+    let epoch_req: serde_json::Value =
+        serde_json::from_str(epoch["request_json"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        epoch_req["parent_request_id"].as_str(),
+        Some(bootstrap_rid.as_str())
+    );
+    assert_eq!(epoch_req["source"], "initial_connection");
+    assert_eq!(epoch_req["connection_sequence"], 1);
+    let epoch_res: serde_json::Value =
+        serde_json::from_str(epoch["result_json"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        epoch_res["state"], "RUNNING",
+        "只有 epoch 能证明 RUNNING: {epoch_res}"
+    );
+    // epoch 必须是十进制字符串且与快照里的真实 epoch 一致
+    let snapshot_epoch = mgr
+        .snapshot()
+        .endpoint(eid)
+        .expect("端点必须处于运行态")
+        .epoch;
+    assert_eq!(
+        epoch_req["stream_epoch"].as_str(),
+        Some(snapshot_epoch.to_string().as_str()),
+        "审计里的 epoch 必须等于真实 stream_epoch"
+    );
+
+    // === 段 2：Stop 必须如实报告审计结果 ===
+    let (s, v) = post_json(app.clone(), &format!("/api/v1/endpoints/{eid}/stop"), "{}").await;
+    assert_eq!(s, StatusCode::OK, "stop: {v}");
+    assert_eq!(v["was_running"], true, "stop: {v}");
+    assert_eq!(
+        v["audit_recorded"], true,
+        "Stop 审计必须写入成功并如实上报: {v}"
+    );
+    let stop_rid = v["request_id"].as_str().expect("stop 必须返回 request_id");
+    let (s, v) = get_json(app.clone(), &format!("/api/v1/control/audit/{stop_rid}")).await;
+    assert_eq!(s, StatusCode::OK, "按 request_id 查询: {v}");
+    assert_eq!(v["operation_id"], "endpoint.stop");
+    assert_eq!(v["status"], "COMPLETED");
+    let stop_res: serde_json::Value =
+        serde_json::from_str(v["result_json"].as_str().unwrap()).unwrap();
+    assert_eq!(stop_res["was_running"], true);
+    assert_eq!(
+        stop_res["desired_running_persisted"], true,
+        "停止意图持久化结果必须留痕: {stop_res}"
+    );
+
+    // === 段 3：REST Start 只能记 ACCEPTED（不得谎报已 RUNNING）===
+    let (s, v) = post_json(app.clone(), &format!("/api/v1/endpoints/{eid}/start"), "{}").await;
+    assert_eq!(s, StatusCode::OK, "start: {v}");
+    let start_rid = v["request_id"]
+        .as_str()
+        .expect("start 必须返回 request_id")
+        .to_string();
+    assert_eq!(v["started"], eid);
+    let (s, start_rec) = get_json(app.clone(), &format!("/api/v1/control/audit/{start_rid}")).await;
+    assert_eq!(s, StatusCode::OK, "{start_rec}");
+    assert_eq!(start_rec["operation_id"], "endpoint.start");
+    assert_eq!(
+        start_rec["status"], "ACCEPTED",
+        "Manager 接受 ≠ RUNNING，必须是 ACCEPTED: {start_rec}"
+    );
+    let start_res: serde_json::Value =
+        serde_json::from_str(start_rec["result_json"].as_str().unwrap()).unwrap();
+    assert_eq!(start_res["manager_accepted"], true);
+    assert_eq!(start_res["state"], "accepted_not_running");
+
+    // 这次 Start 也必须产生自己的 epoch 子记录（父请求 = 本次 start 的 request_id）
+    let expect_rid = format!("{start_rid}:epoch:1");
+    wait_for_audit(&app, eid, |audits| {
+        audits.iter().any(|a| {
+            a["operation_id"] == "endpoint.runtime_epoch"
+                && a["status"] == "COMPLETED"
+                && a["request_id"].as_str() == Some(expect_rid.as_str())
+        })
+    })
+    .await;
+
+    // === 段 4：拒绝路径也必须留痕（无副作用 ⇒ REJECTED）===
+    let (s, v) = post_json(app.clone(), "/api/v1/endpoints/nope-ep/start", "{}").await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "不存在的端点: {v}");
+    let rejected = lifecycle_audits(&app, "nope-ep").await;
+    let rec = find_op(&rejected, "endpoint.start").expect("拒绝也必须留痕（否则又是一处黑洞）");
+    assert_eq!(rec["status"], "REJECTED", "拒绝记录: {rec}");
+    assert!(
+        mgr.snapshot().endpoint("nope-ep").is_none(),
+        "拒绝路径不得产生任何运行态"
+    );
+}
+
+/// Issue #102 评审 P1 回归：Bootstrap 的 Start 票据必须在**建端点事务之前**登记。
+///
+/// 确定性构造（`test-hooks` 闸门）：bootstrap 停在「事务已提交、Start 尚未提交」处，
+/// 此刻发 Stop。若票据登记晚于事务，Stop 会以 `200 was_running=false` 返回却什么也
+/// 没作废，随后 bootstrap 照样把端点拉起来 —— 正是被指出的窗口。修复后 Stop 作废
+/// 在途 Start，bootstrap 走补偿删除，端点最终不运行。
+#[tokio::test]
+async fn bootstrap_start_superseded_by_concurrent_stop_leaves_nothing_running() {
+    let store = Arc::new(ConfigStore::open_in_memory().unwrap());
+    let staged = common::staged_drivers_with_test_driver();
+    let drivers_dir = staged.path().clone();
+    let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
+    let state = common::isolated_app_state(
+        Arc::clone(&mgr),
+        Arc::clone(&store),
+        drivers_dir.to_string_lossy().to_string(),
+        false,
+    )
+    .unwrap();
+    let app = state.router();
+
+    // 0 许可 = bootstrap 到达「事务后、Start 前」就阻塞，直到测试放行。
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    state.set_test_bootstrap_start_gate(Some(Arc::clone(&gate)));
+
+    let eid = "bs-race-ep1";
+    let body = audit_bootstrap_body("bs-race-dev1", eid);
+    let boot_app = app.clone();
+    let boot =
+        tokio::spawn(async move { post_json(boot_app, "/api/v1/device-bootstrap", &body).await });
+
+    // 端点行可见 ⇒ 事务已提交；而 bootstrap 仍卡在闸门上，Start 尚未提交。
+    common::wait_until(10, || store.get_endpoint(eid).ok().flatten().is_some()).await;
+    assert!(!mgr.is_running(eid), "预置：此刻不允许已有运行中的 attempt");
+
+    // 并发 Stop：必须受理，并且（修复后）必须让在途 Start 失效。
+    let (s, v) = post_json(app.clone(), &format!("/api/v1/endpoints/{eid}/stop"), "{}").await;
+    assert_eq!(s, StatusCode::OK, "Stop 必须受理: {v}");
+    assert_eq!(v["was_running"], false, "Stop 时端点尚未运行: {v}");
+
+    // 放行 bootstrap：它的 Start 必须被上一步的 Stop 作废，而不是照样拉起端点。
+    gate.add_permits(1);
+    let (status, value) = tokio::time::timeout(std::time::Duration::from_secs(60), boot)
+        .await
+        .expect("bootstrap 必须有界返回")
+        .expect("bootstrap 任务不得 panic");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !mgr.is_running(eid),
+        "Stop 之后 bootstrap 不得把端点拉起来（W1 类竞态）: {status} {value}"
+    );
+    assert_ne!(
+        mgr.snapshot().endpoint(eid).map(|s| s.state),
+        Some("RUNNING".to_string()),
+        "快照不得显示 RUNNING: {value}"
+    );
+    // 审计面：被作废的 bootstrap 结论不能是 COMPLETED
+    let audits = lifecycle_audits(&app, eid).await;
+    let boot_rec = find_op(&audits, "device.bootstrap").expect("bootstrap 审计必须存在");
+    assert_ne!(
+        boot_rec["status"], "COMPLETED",
+        "被 Stop 作废的 bootstrap 不得记成功: {boot_rec}"
+    );
+}

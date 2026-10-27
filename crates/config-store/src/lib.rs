@@ -22,7 +22,11 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 /// 当前 schema 版本。增量迁移时递增并在 `meta` 中持久化（§6.1）。
 /// v9（Foundation-2）：tasks / event_tasks 表 mode + interval_ms 两列由
 /// schedule_json 单列替代（调度单真值，ADR 0003 §37.3）。
-const SCHEMA_VERSION: i64 = 9;
+/// v10（Issue #102）：`control_audit.operation_type` 的 CHECK 追加 `lifecycle`，
+/// 使端点生命周期（Start/Stop/Bootstrap/System Restore/Runtime Epoch）与控制面
+/// 共用同一张审计表——审计的意义在于"一个地方能看到全部运行态变更来源"，
+/// 分成两张表会让追溯需要跨表拼时间线。
+const SCHEMA_VERSION: i64 = 10;
 
 // ---------------------------------------------------------------------------
 // 记录类型
@@ -1336,6 +1340,75 @@ impl ConfigStore {
                 cur_ver = 9;
             }
         }
+        // 010 迁移（Issue #102）：control_audit 允许 operation_type='lifecycle'。
+        //
+        // 为什么不新增第二张审计表：端点生命周期的可追溯性要求"一条时间线"能同时
+        // 看到控制写/命令与 Start/Stop/恢复/Epoch，分表会让现场追溯退化成跨表拼接，
+        // 而且两套编码（状态词、来源词）迟早漂移。
+        //
+        // 安全边界：只放宽 CHECK，不动任何列、不改任何历史行语义；迁移在单事务内完成，
+        // 任一步失败都整体回滚（旧表名会一并还原，不会留下半迁移状态）。
+        if cur_ver < 10 {
+            let has_10: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=10)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !has_10 {
+                Self::backup_file_db(&conn);
+                let tx = conn.transaction()?;
+                // 防御性检查：v1/v2 之前的极老库可能没有 control_audit（002 会建，
+                // 但若 schema_migrations 被外部修补过则可能缺）。缺表时先按新约束建表，
+                // 后续复制为空操作——迁移必须幂等于"目标 schema 成立"，而不是依赖历史顺序。
+                let has_table: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='control_audit')",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(false);
+                if !has_table {
+                    tx.execute_batch(
+                        "CREATE TABLE control_audit(
+                            request_id TEXT PRIMARY KEY,
+                            endpoint_id TEXT NOT NULL,
+                            actor TEXT NOT NULL,
+                            operation_type TEXT NOT NULL CHECK(operation_type IN ('write','command','lifecycle')),
+                            operation_id TEXT NOT NULL,
+                            request_json TEXT NOT NULL,
+                            result_json TEXT,
+                            status TEXT NOT NULL,
+                            started_at_ns INTEGER NOT NULL,
+                            finished_at_ns INTEGER
+                        );
+                        CREATE INDEX idx_control_audit_endpoint_time
+                            ON control_audit(endpoint_id, started_at_ns DESC);
+                        CREATE INDEX idx_control_audit_status_time
+                            ON control_audit(status, started_at_ns DESC);",
+                    )?;
+                } else {
+                    let sql10 = include_str!("../migrations/010_control_audit_lifecycle.sql");
+                    tx.execute_batch(sql10)?;
+                }
+                let checksum10 = format!(
+                    "{:x}",
+                    include_str!("../migrations/010_control_audit_lifecycle.sql").len()
+                );
+                tx.execute(
+                    "INSERT INTO schema_migrations(version,name,checksum,applied_at_ns) VALUES(10,'010_control_audit_lifecycle',?1,?2)",
+                    params![checksum10, Self::now_ns()],
+                )?;
+                tx.execute("UPDATE meta SET value='10' WHERE key='schema_version'", [])?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','10')",
+                    [],
+                )?;
+                tx.commit()?;
+                cur_ver = 10;
+            }
+        }
         // 最终确保 meta 为最新
         if cur_ver < SCHEMA_VERSION {
             conn.execute(
@@ -2623,6 +2696,12 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// 更新审计记录的最终状态。
+    ///
+    /// Issue #102：**UPDATE 命中 0 行必须报错**。旧实现丢弃了 `execute` 的返回行数，
+    /// 于是"request_id 不存在/拼错"与"更新成功"对调用方完全不可区分——审计面会静默
+    /// 留下一批永远停在 STARTED 的记录，而调用方以为自己写成功了。审计的价值在于
+    /// 可判定，所以这里把"没更新到任何行"变成明确错误，由调用方决定告警还是失败。
     pub fn update_control_audit(
         &self,
         request_id: &str,
@@ -2631,18 +2710,32 @@ impl ConfigStore {
         finished_at_ns: i64,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let n = conn.execute(
             "UPDATE control_audit SET status=?1, result_json=?2, finished_at_ns=?3 WHERE request_id=?4",
             params![status, result_json, finished_at_ns, request_id],
         )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!(
+                "control_audit request_id `{request_id}` 不存在，状态未能更新"
+            )));
+        }
         Ok(())
     }
 
-    /// 列表查询：按 endpoint/status/时间范围过滤，支持 limit/cursor（cursor 为 started_at_ns 的分页锚点）
+    /// 列表查询：按 endpoint/status/operation_type/时间范围过滤，支持 limit/cursor
+    /// （cursor 为 started_at_ns 的分页锚点）。
+    ///
+    /// `operation_type` 过滤是 Issue #102 加的：control_audit 现在同时承载控制面
+    /// （write/command）与生命周期（lifecycle）记录，管理面必须能只要其中一类，
+    /// 否则端点详情页的时间线会被历史控制写记录淹没。
+    // 七个可选过滤条件都是"原样透传给 SQL"的独立维度，包成结构体只会把
+    // 构造负担转嫁给调用方（Core API 与测试共两处），此处保留扁平签名。
+    #[allow(clippy::too_many_arguments)]
     pub fn list_control_audit(
         &self,
         endpoint_id: Option<&str>,
         status: Option<&str>,
+        operation_type: Option<&str>,
         from_ns: Option<i64>,
         to_ns: Option<i64>,
         limit: u32,
@@ -2661,6 +2754,10 @@ impl ConfigStore {
         if let Some(st) = status {
             sql.push_str(" AND status=?");
             args.push(Box::new(st.to_string()));
+        }
+        if let Some(ot) = operation_type {
+            sql.push_str(" AND operation_type=?");
+            args.push(Box::new(ot.to_string()));
         }
         if let Some(f) = from_ns {
             sql.push_str(" AND started_at_ns>=?");
@@ -2960,7 +3057,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ver, "9");
+        assert_eq!(ver, "10");
         let has: bool = s
             .conn
             .lock()
@@ -3108,7 +3205,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "9");
+            assert_eq!(ver, "10");
             // 004：profile 列已删除，但设备行本身保留（仅去列，不丢行）
             let cols: Vec<String> = conn
                 .prepare("PRAGMA table_info(devices)")
@@ -3206,7 +3303,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "9");
+            assert_eq!(ver, "10");
             // 旧行以 id 回填 name，业务行保留
             let old_name: String = conn
                 .query_row("SELECT name FROM endpoints WHERE id='e1'", [], |r| r.get(0))
@@ -3309,7 +3406,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "9");
+            assert_eq!(ver, "10");
             // 006 幂等表已建
             let tbl: String = conn
                 .query_row(
@@ -3429,7 +3526,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "9");
+            assert_eq!(ver, "10");
             let has7: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7)",
@@ -3668,7 +3765,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(ver, "9");
+            assert_eq!(ver, "10");
             let has8: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=8)",
@@ -4234,6 +4331,170 @@ mod tests {
         assert_eq!(got.status, "Succeeded");
     }
 
+    fn audit_rec(request_id: &str, operation_type: &str, started_at_ns: i64) -> ControlAuditRecord {
+        ControlAuditRecord {
+            request_id: request_id.into(),
+            endpoint_id: "ep1".into(),
+            actor: "local-api".into(),
+            operation_type: operation_type.into(),
+            operation_id: "endpoint.start".into(),
+            request_json: r#"{"source":"http_start"}"#.into(),
+            result_json: None,
+            status: "STARTED".into(),
+            started_at_ns,
+            finished_at_ns: None,
+        }
+    }
+
+    /// Issue #102：v10 之后同一张表既能写 lifecycle，也能继续写历史 write/command，
+    /// 且 `operation_type` 过滤能把两类分开；非法类型仍被 CHECK 拒绝。
+    #[test]
+    fn control_audit_accepts_lifecycle_and_filters_by_type() {
+        let s = mem();
+        s.insert_control_audit(&audit_rec("req-w", "write", 1000))
+            .unwrap();
+        s.insert_control_audit(&audit_rec("req-l", "lifecycle", 2000))
+            .unwrap();
+        // 历史类型未被 v10 迁移破坏
+        assert!(s.get_control_audit("req-w").unwrap().is_some());
+        // 过滤：只要 lifecycle
+        let only_lifecycle = s
+            .list_control_audit(None, None, Some("lifecycle"), None, None, 50, None)
+            .unwrap();
+        assert_eq!(only_lifecycle.len(), 1);
+        assert_eq!(only_lifecycle[0].request_id, "req-l");
+        // 不过滤：两类都在
+        let all = s
+            .list_control_audit(None, None, None, None, None, 50, None)
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        // CHECK 仍然生效：拼错的类型名必须被拒绝，而不是静默写入
+        let bad = audit_rec("req-bad", "lifecyle", 3000);
+        assert!(
+            s.insert_control_audit(&bad).is_err(),
+            "非法 operation_type 必须被 CHECK 拒绝"
+        );
+    }
+
+    /// Issue #102：更新不存在的 request_id 必须报错。旧实现丢弃行数，
+    /// 会让"拼错 ID"与"更新成功"不可区分，审计面静默堆积停在 STARTED 的记录。
+    #[test]
+    fn control_audit_update_missing_row_is_error() {
+        let s = mem();
+        s.insert_control_audit(&audit_rec("req-1", "lifecycle", 1000))
+            .unwrap();
+        s.update_control_audit("req-1", "COMPLETED", Some(r#"{"ok":true}"#), 2000)
+            .unwrap();
+        let got = s.get_control_audit("req-1").unwrap().unwrap();
+        assert_eq!(got.status, "COMPLETED");
+        assert_eq!(got.finished_at_ns, Some(2000));
+
+        match s.update_control_audit("req-typo", "COMPLETED", None, 3000) {
+            Err(StoreError::NotFound(_)) => {}
+            other => panic!("缺失行必须返回 NotFound，got {other:?}"),
+        }
+    }
+
+    /// Issue #102 migration 010：把文件库还原成 v9 形态（旧 CHECK + 两条历史行），
+    /// 重新打开后必须完成重建：历史 write/command 行逐列保留、lifecycle 可写、
+    /// schema_version 升到 10。
+    #[test]
+    fn migration_010_rebuilds_control_audit_and_preserves_rows() {
+        let dir = std::env::temp_dir().join(format!("mesa-cfgstore-v10-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("cfg.db");
+        let _ = std::fs::remove_file(&db);
+
+        // 1) 先建到 v10，再**降级**成 v9 形态，模拟"旧库升级"的真实迁移路径
+        {
+            let s = ConfigStore::open(&db).unwrap();
+            {
+                let conn = s.conn.lock().unwrap();
+                conn.execute_batch(
+                    "DROP INDEX IF EXISTS idx_control_audit_endpoint_time;
+                     DROP INDEX IF EXISTS idx_control_audit_status_time;
+                     DROP TABLE control_audit;
+                     CREATE TABLE control_audit(
+                        request_id TEXT PRIMARY KEY,
+                        endpoint_id TEXT NOT NULL,
+                        actor TEXT NOT NULL,
+                        operation_type TEXT NOT NULL CHECK(operation_type IN ('write','command')),
+                        operation_id TEXT NOT NULL,
+                        request_json TEXT NOT NULL,
+                        result_json TEXT,
+                        status TEXT NOT NULL,
+                        started_at_ns INTEGER NOT NULL,
+                        finished_at_ns INTEGER
+                     );
+                     CREATE INDEX idx_control_audit_endpoint_time
+                        ON control_audit(endpoint_id, started_at_ns DESC);
+                     CREATE INDEX idx_control_audit_status_time
+                        ON control_audit(status, started_at_ns DESC);
+                     DELETE FROM schema_migrations WHERE version=10;
+                     UPDATE meta SET value='9' WHERE key='schema_version';",
+                )
+                .unwrap();
+            }
+            s.insert_control_audit(&audit_rec("legacy-w", "write", 1000))
+                .unwrap();
+            s.insert_control_audit(&audit_rec("legacy-c", "command", 2000))
+                .unwrap();
+            // 降级态下 lifecycle 必须写不进去（否则本测试证明不了迁移必要）
+            assert!(
+                s.insert_control_audit(&audit_rec("pre", "lifecycle", 1500))
+                    .is_err()
+            );
+        }
+
+        // 2) 重新打开 ⇒ 触发 010 迁移
+        let s = ConfigStore::open(&db).unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            let ver: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ver, "10");
+            let has10: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=10)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(has10, "010 迁移记录必须写入 schema_migrations");
+            // 旧表名不得残留（迁移必须走完，而不是留半成品）
+            let leftover: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='control_audit_legacy_v9')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!leftover, "临时表必须被删除");
+        }
+        // 历史行逐列保留
+        let w = s.get_control_audit("legacy-w").unwrap().unwrap();
+        assert_eq!(w.operation_type, "write");
+        assert_eq!(w.started_at_ns, 1000);
+        assert_eq!(w.status, "STARTED");
+        assert!(s.get_control_audit("legacy-c").unwrap().is_some());
+        // 迁移后 lifecycle 可写
+        s.insert_control_audit(&audit_rec("post", "lifecycle", 3000))
+            .unwrap();
+        let lifecycles = s
+            .list_control_audit(None, None, Some("lifecycle"), None, None, 50, None)
+            .unwrap();
+        assert_eq!(lifecycles.len(), 1);
+        assert_eq!(lifecycles[0].request_id, "post");
+
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn migration_chain_intact_through_003() {
         let s = mem();
@@ -4246,8 +4507,9 @@ mod tests {
             )
             .unwrap();
         // PR7 起 SCHEMA_VERSION=3，DeviceProfile 删除后升至 4，Endpoint.name 后升至 5；
-        // 002/003 本身仍必须存在且已应用（增量链不断）；Foundation-2 后升至 9。
-        assert!(ver == "9", "新库应为 v9，got {ver}");
+        // 002/003 本身仍必须存在且已应用（增量链不断）；Foundation-2 后升至 9；
+        // Issue #102 的 lifecycle 审计后升至 10。
+        assert!(ver == "10", "新库应为 v10，got {ver}");
         let has2: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=2)",

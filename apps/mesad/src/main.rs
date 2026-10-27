@@ -147,6 +147,7 @@ async fn main() {
     // "写了但没证明"统一成同一种保守结果。
     //
     // 人工确认方式：显式 POST /start（成功后门会写凭证并清除围栏）。
+    let mut deny_all_reason: Option<String> = None;
     let (fenced, confirmed): (Vec<String>, std::collections::BTreeSet<String>) = match store
         .recovery_plan()
     {
@@ -156,6 +157,7 @@ async fn main() {
                 reason = %reason,
                 "开机恢复被拒绝（fail-closed）：跳过本次全部自动恢复，需人工核验后显式 POST /start"
             );
+            deny_all_reason = Some(reason);
             (
                 stored_eps.iter().map(|r| r.id.clone()).collect(),
                 std::collections::BTreeSet::new(),
@@ -169,6 +171,19 @@ async fn main() {
                     endpoint = %rec.id,
                     "SKIP auto-restore: 该端点上次停止意图未能持久化（围栏命中）；\
                      禁止自动拉起，需人工核验后显式 POST /start 确认"
+                );
+                // Issue #102：跳过也是决策，必须留痕（否则"为什么没恢复"同样不可查）。
+                mesa_core_api::restore::record_skipped(
+                    &app_state,
+                    &rec.id,
+                    if deny_all_reason.is_some() {
+                        "RECOVERY_DENIED_ALL"
+                    } else {
+                        "STOP_INTENT_FENCED"
+                    },
+                    deny_all_reason
+                        .as_deref()
+                        .unwrap_or("上次停止意图未持久化（围栏命中）"),
                 );
             } else {
                 // 意图已经是 false：风险消失，围栏可以安全清除（否则会永久累积）。
@@ -194,6 +209,12 @@ async fn main() {
                 "SKIP auto-restore: 828D 一期产品约束——sinumerik-nck 开机一律不自动恢复；\
                  需现场显式 POST /start"
             );
+            mesa_core_api::restore::record_skipped(
+                &app_state,
+                &rec.id,
+                "DRIVER_POLICY_NO_AUTO_RESTORE",
+                "sinumerik-nck 开机一律不自动恢复（产品策略）",
+            );
             continue;
         }
         // P0-4：`desired_running=true` 但没有正向凭证 ⇒ 无法证明这是用户意图
@@ -204,6 +225,12 @@ async fn main() {
                 "SKIP auto-restore: 无法正向证明其运行意图已持久化（无确认凭证）；\
                  禁止自动拉起，需人工核验后显式 POST /start 确认"
             );
+            mesa_core_api::restore::record_skipped(
+                &app_state,
+                &rec.id,
+                "INTENT_PROOF_MISSING",
+                "无法正向证明运行意图已持久化（无确认凭证）",
+            );
             continue;
         }
         // C1 P0：开机恢复必须与 REST Start / Bootstrap start 走**同一条**
@@ -211,17 +238,18 @@ async fn main() {
         // 此前这里直接传持久化的 `connection_json`，其中的 Secret 字段是
         // `{"secret_set": true}` marker，会被当作密码交给 Driver：带认证的
         // 连接重启后必然 BAD_CONFIG，而配置类失败是终态，端点永久 FAILED。
-        let cfg = match mesa_core_api::runtime::build_runtime_endpoint(&app_state, &rec.id).await {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                // fail-closed：单个端点构造失败只跳过该端点，不影响其它端点。
-                tracing::error!(endpoint = %rec.id, "skip restore: {e}");
-                continue;
+        //
+        // Issue #102：恢复也并入 `LifecycleGate`（此前直接调 Manager，绕过门，
+        // 与并发 REST Start 构成竞态），并由 core-api 统一写审计：
+        // 意图 STARTED → ACCEPTED/FAILED，真实 RUNNING 由 epoch 子记录证明。
+        match mesa_core_api::restore::restore_endpoint(&app_state, &rec.id).await {
+            mesa_core_api::restore::RestoreOutcome::Starting => {
+                tracing::info!(endpoint = %rec.id, "restored endpoint (desired=running)")
             }
-        };
-        match manager.start_endpoint(cfg) {
-            Ok(()) => tracing::info!(endpoint = %rec.id, "restored endpoint (desired=running)"),
-            Err(e) => tracing::error!(endpoint = %rec.id, "{e}"),
+            mesa_core_api::restore::RestoreOutcome::Failed(e) => {
+                // fail-closed：单个端点失败只跳过该端点，不影响其它端点。
+                tracing::error!(endpoint = %rec.id, "skip restore: {e}")
+            }
         }
     }
 

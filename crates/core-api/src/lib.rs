@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use mesa_config_store::{ConfigStore, DeviceRecord, EndpointRecord, StoreError};
@@ -30,7 +30,11 @@ pub(crate) mod connection_check;
 pub(crate) mod driver_query;
 /// G7：生命周期门（Start 两阶段提交 / Stop 合流 / 停止判据观察器）。
 pub mod lifecycle;
+/// Issue #102：端点生命周期审计（意图先行、结果如实、epoch 可归因）。
+pub mod lifecycle_audit;
 pub mod recovery;
+/// Issue #102：开机恢复的统一入口（审计 + 生命周期门 + 产品策略跳过记录）。
+pub mod restore;
 pub mod runtime;
 use certificates::CertStore;
 
@@ -54,6 +58,11 @@ pub struct AppState {
     /// `/events*` 系接口 503，Data 面不受影响。
     /// `OnceLock` 保证只注入一次；构造器签名零 churn，老调用方默认无事件。
     pub events: std::sync::OnceLock<Option<Arc<EventServices>>>,
+    /// 测试专用（Issue #102 并发回归）：Bootstrap 在「事务已提交、Start 尚未提交」
+    /// 处等待放行，用于**确定性**复现"Stop 先于 bootstrap Start 提交"的交错。
+    /// 生产构建里该字段不存在，也不存在任何等待路径。
+    #[cfg(feature = "test-hooks")]
+    pub test_bootstrap_start_gate: std::sync::OnceLock<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl AppState {
@@ -65,6 +74,29 @@ impl AppState {
     /// 取事件面服务（`None` 即不可用，调用方转 503）。
     pub fn event_services(&self) -> Option<Arc<EventServices>> {
         self.events.get().cloned().flatten()
+    }
+
+    /// 生命周期审计写入器（Issue #102）。按需构造，只克隆一个 `Arc`，不新增状态。
+    pub fn audit(&self) -> lifecycle_audit::LifecycleAudit {
+        lifecycle_audit::LifecycleAudit::new(Arc::clone(&self.store))
+    }
+
+    /// 运行期审计 sink（交给 `MesaManager` 写 epoch / runtime_lost 记录）。
+    pub fn audit_sink(&self) -> Arc<dyn mesa_driver_manager::attempt_audit::AttemptAuditSink> {
+        Arc::new(self.audit())
+    }
+
+    /// 测试专用（`test-hooks`）：安装/清除 Bootstrap 的"事务后、Start 提交前"放行闸门。
+    /// 0 许可 = 一律阻塞；测试用 `add_permits(1)` 放行一个。
+    #[cfg(feature = "test-hooks")]
+    pub fn set_test_bootstrap_start_gate(&self, gate: Option<Arc<tokio::sync::Semaphore>>) {
+        let _ = self.test_bootstrap_start_gate.set(gate);
+    }
+
+    /// 测试专用（`test-hooks`）：读取放行闸门（生产构建不存在该字段）。
+    #[cfg(feature = "test-hooks")]
+    pub fn test_bootstrap_start_gate(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.test_bootstrap_start_gate.get().cloned().flatten()
     }
 }
 
@@ -155,6 +187,8 @@ impl AppState {
             cert_store,
             enable_control,
             events: std::sync::OnceLock::new(),
+            #[cfg(feature = "test-hooks")]
+            test_bootstrap_start_gate: std::sync::OnceLock::new(),
         }))
     }
 
@@ -198,6 +232,8 @@ impl AppState {
                 cert_store,
                 enable_control,
                 events: std::sync::OnceLock::new(),
+                #[cfg(feature = "test-hooks")]
+                test_bootstrap_start_gate: std::sync::OnceLock::new(),
             })
         })
     }
@@ -1429,6 +1465,8 @@ mod command_status_tests {
 struct AuditQuery {
     endpoint_id: Option<String>,
     status: Option<String>,
+    /// `write` / `command` / `lifecycle`（Issue #102）：只取某一类审计。
+    operation_type: Option<String>,
     from_ns: Option<i64>,
     to_ns: Option<i64>,
     limit: Option<u32>,
@@ -1443,6 +1481,7 @@ async fn list_control_audit(
     match state.store.list_control_audit(
         q.endpoint_id.as_deref(),
         q.status.as_deref(),
+        q.operation_type.as_deref(),
         q.from_ns,
         q.to_ns,
         limit,
@@ -2222,21 +2261,103 @@ async fn delete_endpoint(
 /// - 真的已在运行 ⇒ 409 `CONFLICT`（文案不变）。
 async fn start_endpoint(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // 准入：同步登记票据（不查运行态、不碰 DB、不起进程）。票据 RAII 释放，
-    // 因此构造期被取消（客户端断开）不会留下任何副作用。
+    let audit = state.audit();
+    let request_id = lifecycle_audit::new_request_id(lifecycle_audit::OP_START, &id);
+    // 准入必须在审计之前：`admit_start` 是**内存票据**（不查运行态、不碰 DB、不起进程），
+    // 它让并发的 Stop 能看见"有 Start 在途"，从而给出 `SUPERSEDED_BY_STOP`。
+    //
+    // 为什么顺序不能反（CI 实测教训）：先写审计等于在"Start 已进入处理"与"Start 已登记"
+    // 之间插进一次 DB 写；这段窗口里到达的 Stop 看不到票据，会以 `200 was_running=false`
+    // 返回，而随后的 Start 照样把端点拉起来 —— 正好复活 W1 竞态
+    //（`w1_stop_during_start_construction_leaves_nothing_running` 在 windows-arm64 上暴露）。
+    // 票据 RAII 释放：后续任一步失败（含审计写失败）都会作废本次尝试，不留运行副作用。
     let ticket = state.lifecycle.admit_start(&id);
+    // Issue #102：**意图先落盘**（在任何运行副作用之前）。审计写不进去就不构造、不起进程
+    // ——与 Control 面同一取舍：记不下来就不执行，绝不出现"驱动跑起来了但查不出谁起的"。
+    if let Err(e) = audit.started(
+        &request_id,
+        &id,
+        lifecycle_audit::OP_START,
+        lifecycle_audit::ACTOR_LOCAL_API,
+        serde_json::json!({
+            "action": "start",
+            "endpoint_id": &id,
+            "source": lifecycle_audit::SRC_HTTP_START,
+            "client": lifecycle_audit::client_meta(&headers),
+        }),
+    ) {
+        tracing::error!(
+            request_id = %request_id, endpoint = %id, error = %e,
+            "生命周期审计意图写入失败，拒绝 Start（fail-closed）"
+        );
+        // 票据在此释放：不能留下"已登记但不会提交"的 Start 让后续 Stop 误判。
+        drop(ticket);
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error(
+                "AUDIT_UNAVAILABLE",
+                "lifecycle audit store unavailable, start refused",
+            )),
+        );
+    }
     // C1 P0：运行期 Endpoint 只能经共享构造路径生成（REST Start、
     // Bootstrap start、Mesad 开机恢复三者同源），否则重启恢复会把
     // Secret marker 当密码交给 Driver。
     let cfg = match runtime::build_runtime_endpoint(&state, &id).await {
         Ok(cfg) => cfg,
-        Err(e) => return (e.status, e.to_json()),
+        Err(e) => {
+            // 构造失败没有任何运行副作用 ⇒ REJECTED（不是 FAILED）。
+            audit.finish_or_warn(
+                &request_id,
+                lifecycle_audit::ST_REJECTED,
+                serde_json::json!({
+                    "error_code": e.code,
+                    "phase": "build_runtime_endpoint",
+                }),
+            );
+            return (e.status, e.to_json());
+        }
     };
-    match state.lifecycle.commit_start(&ticket, cfg).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "started": id }))),
-        Err(e) => e.to_response(),
+    // 审计上下文只携带父请求与 sink：门的判定逻辑完全不受它影响。
+    let ctx = mesa_driver_manager::attempt_audit::AttemptContext::audited(
+        request_id.clone(),
+        lifecycle_audit::ACTOR_LOCAL_API,
+        state.audit_sink(),
+    );
+    match state.lifecycle.commit_start(&ticket, cfg, ctx).await {
+        Ok(()) => {
+            // ACCEPTED 而不是 COMPLETED：Manager 接受只代表 attempt 已登记，
+            // 设备是否真的连上由 `endpoint.runtime_epoch` 子记录证明。
+            audit.finish_or_warn(
+                &request_id,
+                lifecycle_audit::ST_ACCEPTED,
+                serde_json::json!({
+                    "manager_accepted": true,
+                    "state": "accepted_not_running",
+                }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "started": id, "request_id": request_id })),
+            )
+        }
+        Err(e) => {
+            // 4xx = 门在校验阶段拒绝（无副作用）；5xx = 执行阶段失败。
+            let status = if e.status.is_client_error() {
+                lifecycle_audit::ST_REJECTED
+            } else {
+                lifecycle_audit::ST_FAILED
+            };
+            audit.finish_or_warn(
+                &request_id,
+                status,
+                serde_json::json!({"error_code": e.code, "message": &e.message}),
+            );
+            e.to_response()
+        }
     }
 }
 
@@ -2255,11 +2376,51 @@ async fn start_endpoint(
 ///（§6.10.3：停止意图没落盘就返回成功，重启后会意外自动拉起）。
 async fn stop_endpoint(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let audit = state.audit();
+    let request_id = lifecycle_audit::new_request_id(lifecycle_audit::OP_STOP, &id);
+    // Issue #102 §7：**安全优先**。先受理 Stop（teardown 立即开始），审计绝不挡在
+    // 停止前面——DB 慢/坏时"停不下来"比"记不下来"严重得多。
     let admission = state.lifecycle.admit_stop(&id);
     let stop_gen = admission.stop_gen;
-    let (stop_res, persist_res) = tokio::join!(admission.handle.await_result(), admission.persist);
+    // 审计意图与 teardown/落盘并行。审计是同步 rusqlite 单行 INSERT，必须
+    // spawn_blocking：否则它会占住 tokio worker，反过来拖慢 Stop（自相矛盾）。
+    let audit_task = {
+        let audit = audit.clone();
+        let request_id = request_id.clone();
+        let id_for_task = id.clone();
+        let client = lifecycle_audit::client_meta(&headers);
+        tokio::task::spawn_blocking(move || {
+            audit.started(
+                &request_id,
+                &id_for_task,
+                lifecycle_audit::OP_STOP,
+                lifecycle_audit::ACTOR_LOCAL_API,
+                serde_json::json!({
+                    "action": "stop",
+                    "endpoint_id": id_for_task,
+                    "source": lifecycle_audit::SRC_HTTP_STOP,
+                    "client": client,
+                }),
+            )
+        })
+    };
+    let (stop_res, persist_res, audit_res) = tokio::join!(
+        admission.handle.await_result(),
+        admission.persist,
+        audit_task
+    );
+    let audit_recorded = matches!(audit_res, Ok(Ok(())));
+    if !audit_recorded {
+        // 明确的、被接受的例外：停止已执行但审计缺失。必须由日志与响应同时暴露，
+        // 绝不能让调用方以为审计完整。
+        tracing::error!(
+            request_id = %request_id, endpoint = %id,
+            "Stop 审计写入失败：停止已执行但审计缺失（audit_recorded=false）"
+        );
+    }
     let persist_failed = match persist_res {
         Ok(Ok(())) => None,
         Ok(Err(e)) => Some(e),
@@ -2279,6 +2440,17 @@ async fn stop_endpoint(
             endpoint = %id, error = %e,
             "STOP intent not persisted; response is explicit failure (500)"
         );
+        if audit_recorded {
+            audit.finish_or_warn(
+                &request_id,
+                lifecycle_audit::ST_FAILED,
+                serde_json::json!({
+                    "error_code": "STOP_INTENT_NOT_PERSISTED",
+                    "message": &e,
+                    "audit_recorded": true,
+                }),
+            );
+        }
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json_error(
@@ -2288,14 +2460,46 @@ async fn stop_endpoint(
         );
     }
     match stop_res {
-        Ok(was) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "stopped": id, "was_running": was })),
-        ),
-        Err(detail) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json_error("STOP_FAILED", &detail)),
-        ),
+        Ok(was) => {
+            if audit_recorded {
+                audit.finish_or_warn(
+                    &request_id,
+                    lifecycle_audit::ST_COMPLETED,
+                    serde_json::json!({
+                        "was_running": was,
+                        // 停止意图已确认落盘（否则上面就 500 返回了）
+                        "desired_running_persisted": true,
+                        "audit_recorded": true,
+                    }),
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "stopped": id,
+                    "was_running": was,
+                    "request_id": request_id,
+                    "audit_recorded": audit_recorded,
+                })),
+            )
+        }
+        Err(detail) => {
+            if audit_recorded {
+                audit.finish_or_warn(
+                    &request_id,
+                    lifecycle_audit::ST_FAILED,
+                    serde_json::json!({
+                        "error_code": "STOP_FAILED",
+                        "message": &detail,
+                        "audit_recorded": true,
+                    }),
+                );
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error("STOP_FAILED", &detail)),
+            )
+        }
     }
 }
 

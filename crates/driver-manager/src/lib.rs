@@ -7,7 +7,9 @@
 //! - [`endpoint`]：Endpoint 配置闭环运行时（§6.2/§11.1）
 //! - [`snapshot`]：REST 可见的进程内共享状态
 //! - [`manager`]：编排入口
+//! - [`attempt_audit`]：运行期审计接口（Issue #102）：epoch 意图/结果由 Core 注入实现
 
+pub mod attempt_audit;
 pub mod endpoint;
 pub mod event_ingress;
 pub mod manager;
@@ -20,6 +22,10 @@ pub(crate) mod temp_op;
 #[cfg(feature = "test-hooks")]
 pub mod test_clock;
 
+pub use attempt_audit::{
+    AttemptAuditSink, AttemptContext, ConnectionSequence, EpochIntent, EpochOutcome, EpochSource,
+    RuntimeLostEvent,
+};
 pub use endpoint::{BuiltinEndpoint, PointIdAllocator, PointIdSource, StorePointIdSource};
 pub use manager::{AttemptPhase, MesaManager, StopHandle};
 pub use snapshot::{DriverInfo, EndpointStatus, LatestEntry, Snapshot};

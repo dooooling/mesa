@@ -376,6 +376,9 @@ impl LifecycleGate {
         self: &Arc<Self>,
         ticket: &StartTicket,
         cfg: mesa_driver_manager::endpoint::BuiltinEndpoint,
+        // Issue #102：本次启动的审计上下文（父请求 + sink）。由触发方构造，
+        // 只透传给 `MesaManager`，**不参与**门的任何判定——门仍然只管顺序与代次。
+        audit: mesa_driver_manager::attempt_audit::AttemptContext,
     ) -> Result<(), LifecycleError> {
         #[cfg(feature = "test-hooks")]
         {
@@ -399,7 +402,7 @@ impl LifecycleGate {
             if self.manager.has_live_attempt(&ticket.id) {
                 return self
                     .manager
-                    .start_endpoint(cfg)
+                    .start_endpoint_with_context(cfg, audit)
                     .map_err(|msg| map_start_err(&ticket.id, msg));
             }
             Arc::clone(&g.persist_lock)
@@ -419,13 +422,13 @@ impl LifecycleGate {
                 if self.manager.has_live_attempt(&ticket.id) {
                     return self
                         .manager
-                        .start_endpoint(cfg)
+                        .start_endpoint_with_context(cfg, audit)
                         .map_err(|msg| map_start_err(&ticket.id, msg));
                 }
                 return Err(stop_persist_in_progress(&ticket.id));
             }
             // 同步启动（内部 insert-before-spawn；冲突由 attempt 表给出）。
-            if let Err(msg) = self.manager.start_endpoint(cfg) {
+            if let Err(msg) = self.manager.start_endpoint_with_context(cfg, audit) {
                 return Err(map_start_err(&ticket.id, msg));
             }
             // P0-D：**在同一临界区**登记"运行意图正在落盘"。DELETE 的屏障与等待
@@ -1181,6 +1184,12 @@ mod tests {
         }
     }
 
+    /// 门单测不关心审计（Issue #102 的审计语义由 `lifecycle_audit` 单测覆盖）：
+    /// 统一用"无父请求、无 sink"的上下文，等价于改动前的行为。
+    fn no_audit() -> mesa_driver_manager::attempt_audit::AttemptContext {
+        mesa_driver_manager::attempt_audit::AttemptContext::default()
+    }
+
     /// 契约行 1 / W1：在 Stop 受理前 admit、之后 commit 的 Start 必须失败，
     /// 且**不得产生任何 attempt**、不得把 desired 写回 true。
     #[tokio::test]
@@ -1195,7 +1204,7 @@ mod tests {
         assert!(persisted.is_ok(), "落盘应成功: {persisted:?}");
 
         let err = g
-            .commit_start(&ticket, dummy_cfg("ep-1"))
+            .commit_start(&ticket, dummy_cfg("ep-1"), no_audit())
             .await
             .expect_err("Stop 已受理，在途 Start 必须失败");
         assert_eq!(err.status, StatusCode::CONFLICT);
@@ -1230,7 +1239,7 @@ mod tests {
         // 无活 attempt ⇒ 新 Start 必须被拒，且不得写 desired=true。
         let ticket = g.admit_start("ep-1");
         let err = g
-            .commit_start(&ticket, dummy_cfg("ep-1"))
+            .commit_start(&ticket, dummy_cfg("ep-1"), no_audit())
             .await
             .expect_err("A 仍在途，Start 必须被拒");
         assert_eq!(err.status, StatusCode::CONFLICT);
@@ -1275,7 +1284,7 @@ mod tests {
 
         let ticket = g.admit_start("ep-1");
         let err = g
-            .commit_start(&ticket, dummy_cfg("ep-1"))
+            .commit_start(&ticket, dummy_cfg("ep-1"), no_audit())
             .await
             .expect_err("意图未持久化期间必须拒绝 Start");
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1416,7 +1425,7 @@ mod tests {
         // 新 Start：必须 409，且不得产生 attempt。
         let ticket = g.admit_start("ep-1");
         let err = g
-            .commit_start(&ticket, dummy_cfg("ep-1"))
+            .commit_start(&ticket, dummy_cfg("ep-1"), no_audit())
             .await
             .expect_err("删除屏障期间 Start 必须被拒");
         assert_eq!(err.status, StatusCode::CONFLICT);
@@ -1429,7 +1438,7 @@ mod tests {
         assert!(!g.sample("ep-1").deleting, "撤销后屏障必须复位");
         let ticket = g.admit_start("ep-1");
         let err = g
-            .commit_start(&ticket, dummy_cfg("ep-1"))
+            .commit_start(&ticket, dummy_cfg("ep-1"), no_audit())
             .await
             .expect_err("本例驱动目录为空，Start 必然失败");
         assert_ne!(
@@ -1465,7 +1474,7 @@ mod tests {
         // 重建同 ID 后的 Start 必须被拒（fail-closed），绝不写 desired=true。
         let ticket = g.admit_start("ep-1");
         let err = g
-            .commit_start(&ticket, dummy_cfg("ep-1"))
+            .commit_start(&ticket, dummy_cfg("ep-1"), no_audit())
             .await
             .expect_err("仍有在途写入时不得放行 Start");
         assert_eq!(err.code, "STOP_PERSIST_IN_PROGRESS");
@@ -1598,7 +1607,7 @@ mod tests {
         );
         let ticket = g.admit_start("ep-1");
         let err = g
-            .commit_start(&ticket, dummy_cfg("ep-1"))
+            .commit_start(&ticket, dummy_cfg("ep-1"), no_audit())
             .await
             .expect_err("本例驱动目录为空，Start 必然失败");
         assert_ne!(
@@ -1659,7 +1668,7 @@ mod tests {
         // 后续 Start 必须能正常抵达 manager（本例无驱动 ⇒ 失败原因与删除无关）。
         let ticket = g.admit_start("ep-1");
         let err = g
-            .commit_start(&ticket, dummy_cfg("ep-1"))
+            .commit_start(&ticket, dummy_cfg("ep-1"), no_audit())
             .await
             .expect_err("本例驱动目录为空，Start 必然失败");
         assert_ne!(err.code, "ENDPOINT_DELETED", "后续 Start 不得再被删除挡住");
