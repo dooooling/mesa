@@ -103,6 +103,15 @@ jobs:
                           '--all-features', '--profile', 'ci-stress', '-E', filt], check=True)
           EOF
 
+      - name: upload event soak diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: event-soak-stress-${{ github.run_attempt }}
+          path: target/validation/event-soak/
+          if-no-files-found: warn
+
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true

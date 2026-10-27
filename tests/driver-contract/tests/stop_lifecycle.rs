@@ -229,6 +229,11 @@ async fn stop_waits_for_inflight_commit_then_drains_exact() {
     let gate = faults.arm_commit_gate();
     common::wait_until(10, || gate.entered() >= 1).await;
 
+    // 诊断必须能在 writer 被阻塞时读取，不依赖同一个 SQLite 连接。
+    let writer = store.test_writer_snapshot();
+    assert!(writer.started > writer.finished);
+    assert!(writer.in_flight_ms.is_some());
+
     // 并发 Stop：栅栏关闭期间必须等待，不得提前返回（成功或超时都是 bug）。
     let stop_fut = mgr.stop_endpoint(ep);
     tokio::pin!(stop_fut);
@@ -250,6 +255,9 @@ async fn stop_waits_for_inflight_commit_then_drains_exact() {
         .await
         .expect("放行后 Stop 必须有界返回");
     assert_eq!(res, Ok(true), "放行后 Stop 必须干净成功，实际: {res:?}");
+    let writer = store.test_writer_snapshot();
+    assert_eq!(writer.started, writer.finished);
+    assert!(writer.in_flight_ms.is_none());
 
     // 精确：DB 行连续 + persisted 计数 == 行数。
     let rows = rows_of(&store, ep);

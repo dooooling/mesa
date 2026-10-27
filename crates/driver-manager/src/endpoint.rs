@@ -748,7 +748,7 @@ const INGRESS_DRAIN_TIMEOUT: Duration = Duration::from_millis(
     mesa_event_store::EVENT_STORE_BUSY_TIMEOUT_MS as u64 + INGRESS_DRAIN_MARGIN_MS,
 );
 /// 余量：reader barrier 达成后 backlog 有限（生产者已停），覆盖其排空 +
-/// Tokio/Windows 调度抖动。病态 backlog（通道上限 128 批全慢）超出本预算时
+/// Tokio/Windows 调度抖动。病态 backlog（通道上限 512 批全慢）超出本预算时
 /// 走大声 `EVENT_DRAIN_TIMEOUT`，不静默——预算覆盖现实最坏，不覆盖病态。
 const INGRESS_DRAIN_MARGIN_MS: u64 = 10_000;
 
@@ -1314,11 +1314,21 @@ mod tests {
     }
 
     /// P0-3：drain 超时（[`INGRESS_DRAIN_TIMEOUT`]）→ EVENT_DRAIN_TIMEOUT
-    ///（abort 已执行，不 detach）。固定开销一次慢断言（suite 内已有 30s 级用例）。
+    ///（abort 已执行，不 detach）。此用例无 IPC/DB，只推进 Tokio 虚拟时钟。
     /// 超时码本身是冻结契约，时长是可组合预算——改预算不改码。
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn shutdown_ingress_timeout_is_explicit_error() {
-        let h = tokio::spawn(async {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let witness = Dropped(Arc::clone(&dropped));
+        let start = tokio::time::Instant::now();
+        let h = tokio::spawn(async move {
+            let _witness = witness;
             // 无视 cancel 的顽固任务（模拟磁盘 hang）：pending 永不就绪
             std::future::pending::<Result<(), IngressFatal>>().await
         });
@@ -1326,5 +1336,7 @@ mod tests {
             .await
             .expect_err("timeout must be explicit error, not success");
         assert_eq!(err.code(), "EVENT_DRAIN_TIMEOUT");
+        assert!(tokio::time::Instant::now() - start >= INGRESS_DRAIN_TIMEOUT);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

@@ -185,16 +185,19 @@ impl StoreFaults {
 /// 默认构建：Commit 直落 `commit_batch`，无故障检查。
 /// `commit_latency_max_ns`：每次 commit 执行耗时（不含队列等待）最大值，
 /// stall 位置判定用（ingress 测到的大延迟若此处很小，说明堵在队列/调度）。
-pub fn writer_loop(
+pub(crate) fn writer_loop(
     mut conn: Connection,
     mut rx: mpsc::Receiver<WriteCommand>,
     commit_latency_max_ns: Arc<AtomicU64>,
+    #[cfg(feature = "test-hooks")] probe: Arc<crate::test_probe::WriterProbe>,
 ) {
     #[cfg(feature = "test-hooks")]
     let mut faults: Option<Arc<StoreFaults>> = None;
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             WriteCommand::Commit(req, reply) => {
+                #[cfg(feature = "test-hooks")]
+                probe.start();
                 let exec_start = std::time::Instant::now();
                 #[cfg(feature = "test-hooks")]
                 let res = match faults.as_ref().map(|f| f.check()).unwrap_or(Ok(())) {
@@ -212,6 +215,8 @@ pub fn writer_loop(
                 #[cfg(not(feature = "test-hooks"))]
                 let res = commit_batch(&mut conn, &req);
                 record_max_ns(&commit_latency_max_ns, exec_start.elapsed().as_nanos());
+                #[cfg(feature = "test-hooks")]
+                probe.finish();
                 let _ = reply.send(res);
             }
             WriteCommand::Purge {

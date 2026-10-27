@@ -19,6 +19,11 @@
 
 ## 一条命令跑完全部场景
 
+CI 在 Windows/Linux 各运行两片，分片名单为 `ci-shards.json`。`ci_shards.py`
+对照 PowerShell 的真实场景表检查恰好覆盖一次，并在执行后验证结果没有缺项或失败。
+每片使用独立 runner、证据目录和 artifact；场景内的时间预算与断言保持不变。
+可在本地使用 `python tests/watchdog/ci_shards.py --shard 1` 获取第一片的 `-Scenario` 参数。
+
 ```powershell
 # Windows
 pwsh -NoProfile -File tests/watchdog/run-watchdog-scenarios.ps1

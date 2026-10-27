@@ -142,6 +142,15 @@ jobs:
           --profile ci-platform
           -E 'package(=mesa-contract-tests) and (binary(=event_soak) or binary(=event_pressure))'
 
+      - name: upload event soak diagnostics
+        if: always() && inputs.soak == 'run'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: event-soak-platform-${{ inputs.cache-domain }}-${{ github.run_attempt }}
+          path: target/validation/event-soak/
+          if-no-files-found: warn
+
       # 诊断附件放在测试之后；上传故障不能阻止测试或改变测试准入结果。
       - name: upload build timings
         if: always() && inputs.mode != 'smoke'

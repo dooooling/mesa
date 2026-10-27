@@ -7,6 +7,8 @@
 
 mod common;
 mod event_common;
+#[path = "event_common/soak_trace.rs"]
+mod soak_trace;
 
 use std::time::Duration;
 
@@ -35,6 +37,13 @@ async fn steady_state_soak(tag: &str, secs: u64, min_rows: usize) {
     let mgr = std::sync::Arc::new(MesaManager::discover(_staged.path()));
     mgr.set_event_services(std::sync::Arc::clone(&services));
     let ep = format!("hd-soak-{tag}");
+    let trace = soak_trace::SoakTrace::start(
+        std::sync::Arc::clone(&mgr),
+        std::sync::Arc::clone(&services),
+        ep.clone(),
+    )
+    .await;
+    let trace_path = trace.path.clone();
     let binding = mesa_core_types::GenericEventBinding {
         stream_id: mesa_test_driver::SIM_EVENT_STREAM_COUNTER.into(),
         parameters: serde_json::json!({}),
@@ -61,13 +70,20 @@ async fn steady_state_soak(tag: &str, secs: u64, min_rows: usize) {
     .unwrap();
 
     tokio::time::sleep(Duration::from_secs(secs)).await;
-    assert!(mgr.is_running(&ep), "soak 全程 endpoint 必须存活");
+    let running = mgr.is_running(&ep);
 
     // 先 Stop 再做 final snapshot：stop barrier 排空后状态冻结，
     // rows 与 diagnostics 处于同一静止时刻，exact 对账才有意义
     //（运行中先读 rows 再读 diagnostics，中间 commit 一条就会 ±1）。
     // 这比旧顺序更强：barrier 尾部接收的 events 同样进入最终 invariant。
-    assert_eq!(mgr.stop_endpoint(&ep).await, Ok(true));
+    trace.stop_started();
+    let stop_result = mgr.stop_endpoint(&ep).await;
+    trace.finish().await;
+    assert!(
+        running,
+        "soak 结束时 endpoint 必须存活，诊断见 {trace_path:?}"
+    );
+    assert_eq!(stop_result, Ok(true), "诊断见 {trace_path:?}");
 
     // 长期无损：n 连续
     let rows = rows_of(&store, &ep);

@@ -175,6 +175,34 @@ def main():
     check("ci-gate needs 里包含 e2e",
           re.search(r"needs: \[plan, [^\]]*\be2e\]", src) is not None)
 
+    # 读取实际 cache 步骤的条件，防止开放 PR 写入时误让 reader/fork/普通分支写入。
+    setup_path = os.path.join(REPO_ROOT, ".github", "actions", "rust-ci-setup", "action.yml")
+    setup = open(setup_path, encoding="utf-8").read()
+    def cache_if(name, values):
+        match = re.search(r"- name: " + re.escape(name) + r"\n\s+if: (.+)", setup)
+        if not match:
+            raise AssertionError(f"找不到 cache 条件：{name}")
+        expr = match[1].strip().removeprefix("${{").removesuffix("}}").strip()
+        for key in sorted(values, key=len, reverse=True):
+            expr = expr.replace(key, repr(values[key]))
+        expr = expr.replace("&&", " and ").replace("||", " or ").replace("!", " not ")
+        return eval(expr, {"__builtins__": {}}, {})
+
+    for tag, candidate, ref, event, head, expected in [
+        ("main writer", "true", "refs/heads/main", "push", "", True),
+        ("main reader", "false", "refs/heads/main", "push", "", False),
+        ("same-repo PR writer", "true", "refs/pull/147/merge", "pull_request", "dooooling/mesa", True),
+        ("same-repo PR reader", "false", "refs/pull/147/merge", "pull_request", "dooooling/mesa", False),
+        ("fork PR", "true", "refs/pull/999/merge", "pull_request", "outside/mesa", False),
+        ("branch push", "true", "refs/heads/work", "push", "dooooling/mesa", False),
+    ]:
+        values = {"inputs.cache-writer": candidate, "github.ref": ref,
+                  "github.event_name": event, "github.repository": "dooooling/mesa",
+                  "github.event.pull_request.head.repo.full_name": head}
+        writer = cache_if("Restore and save sccache archive", values)
+        reader = cache_if("Restore sccache archive", values)
+        check(f"cache policy: {tag}", writer == expected and reader == (not expected))
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

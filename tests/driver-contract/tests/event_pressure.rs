@@ -5,6 +5,8 @@
 
 mod common;
 mod event_common;
+#[path = "event_common/soak_trace.rs"]
+mod soak_trace;
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -270,6 +272,13 @@ async fn event_stall_6s_recovers_exact() {
     let faults = std::sync::Arc::new(StoreFaults::new(0, false));
     let rig = StallRig::start("hd-stall-recover", faults.clone());
     let hub = HubWitness::subscribe(&rig.services);
+    let trace = soak_trace::SoakTrace::start(
+        std::sync::Arc::clone(&rig.mgr),
+        std::sync::Arc::clone(&rig.services),
+        rig.endpoint_id.clone(),
+    )
+    .await;
+    let trace_path = trace.path.clone();
     rig.start_counter(50);
     common::wait_until(30, || rig.counter_ns().len() >= 2).await;
 
@@ -303,7 +312,10 @@ async fn event_stall_6s_recovers_exact() {
     const CATCH_UP_MARGIN: u64 = 20;
     let drained_target = frozen as u64 + max_hold_emissions as u64 + CATCH_UP_MARGIN;
     common::wait_until(60, || rig.counter_ns().len() as u64 >= drained_target).await;
-    rig.mgr.stop_endpoint(&rig.endpoint_id).await.unwrap();
+    trace.stop_started();
+    let stop_result = rig.mgr.stop_endpoint(&rig.endpoint_id).await;
+    trace.finish().await;
+    stop_result.unwrap_or_else(|error| panic!("Stop 失败：{error}，诊断见 {trace_path:?}"));
     let ns = rig.counter_ns();
     let max = *ns.last().unwrap();
     assert_eq!(ns.len() as u64, max, "恢复后无丢失无重复");

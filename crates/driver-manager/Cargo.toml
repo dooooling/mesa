@@ -28,6 +28,10 @@ getrandom = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[dev-dependencies]
+# 仅进程内计时单测暂停 Tokio 时钟；真实子进程与生产计时不受影响。
+tokio = { workspace = true, features = ["test-util"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",

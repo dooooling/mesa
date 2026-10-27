@@ -6,13 +6,14 @@
 # - Cargo registry cache：shared-key 按兼容域（add-job-id-key=false），
 #   只缓存 registry/git（cache-targets/bin=false）。
 # - 兼容域（4 个）：linux-x64 / windows-x64 / windows-arm64 / linux-arm64；
-#   同域 job 共用 archive。每域仅 1 writer（main 才 save），其余 restore-only。
+#   同域 job 共用 archive。每域仅 1 writer；main 与同仓库 PR 可保存，其余只恢复。
+#   PR 缓存由 GitHub 限定在 merge ref 内，供同 PR 后续提交复用，不能覆盖 main。
 #
 # 输入：
 #   components: 额外 toolchain 组件（默认空；quality 传 rustfmt,clippy）
 #   cache-domain: 兼容域（linux-x64/windows-x64/windows-arm64/linux-arm64；
 #                 同时决定 sccache archive 与 registry key）
-#   cache-writer: 是否为该域 writer（main 成功时 save；reader 永不 save）
+#   cache-writer: 是否为该域 writer（main/同仓库 PR 成功时 save；reader 永不 save）
 #   install-nextest: 是否安装 nextest（test job true；quality false）
 #   debug-info: CI 调试信息级别；dev/test 共用，避免重复编译
 name: rust-ci-setup
@@ -26,7 +27,7 @@ inputs:
     description: "兼容域（linux-x64/windows-x64/windows-arm64/linux-arm64）"
     required: true
   cache-writer:
-    description: "是否为该域 writer（main save；reader 永不 save）"
+    description: "是否为该域 writer（main/同仓库 PR save；reader 永不 save）"
     required: false
     default: "false"
   install-nextest:
@@ -70,7 +71,7 @@ runs:
         components: ${{ inputs.components }}
 
     # Cargo registry cache（shared-key 按兼容域；不缓存 target/bin；
-    # save 仅 main + writer——与 sccache archive 同策略）。
+    # registry 仍仅 main + writer 保存，不为 PR 重复归档依赖源码）。
     - name: Rust cache
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
@@ -110,10 +111,10 @@ runs:
         echo "sccache remote backend: disabled (local archive topology v2)"
         sccache --version
 
-    # sccache archive restore（reader/PR 全 job；main writer 走下步完整
+    # sccache archive restore（reader/外部 PR；可写 ref 的 writer 走下步完整
     # actions/cache——互斥，避免同 archive restore 两次）。
     - name: Restore sccache archive
-      if: ${{ !(github.ref == 'refs/heads/main' && inputs.cache-writer == 'true') }}
+      if: ${{ !(inputs.cache-writer == 'true' && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))) }}
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ runner.temp }}/mesa-sccache
@@ -123,10 +124,10 @@ runs:
           mesa-sccache-v3-${{ inputs.cache-domain }}-${{ inputs.debug-info }}-
           mesa-sccache-v2-${{ inputs.cache-domain }}-
 
-    # sccache archive restore+save（仅 main + writer；完整 actions/cache
+    # sccache archive restore+save（main/同仓库 PR + writer；完整 actions/cache
     # 先 restore（含 restore-keys warm-start）再 post save；reader 永不进此步）。
     - name: Restore and save sccache archive
-      if: github.ref == 'refs/heads/main' && inputs.cache-writer == 'true'
+      if: inputs.cache-writer == 'true' && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ runner.temp }}/mesa-sccache

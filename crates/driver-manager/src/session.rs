@@ -246,6 +246,9 @@ struct Shared {
     event_stream_dead: AtomicBool,
     /// 因溢出被拒绝的 EventBatch 数（流已死后不再计数， incidental）。
     event_overflow_drops: AtomicU64,
+    /// 测试诊断：包括流关闭后拒绝的批次，用于区分突发发送与消费停滞。
+    #[cfg(feature = "test-hooks")]
+    test_event_batches_received: AtomicU64,
     /// 事件队列深度（发送侧采样快照，非实时值：只在成功 `try_send` 后更新，
     /// 消费端 dequeue 不回写；发送间隙只减不增，故为保守上界估计。
     /// 精确批量测试用它做"全部到达"见证；`high_water` 做单调最大值）。
@@ -491,6 +494,8 @@ impl Session {
             dropped_events: AtomicU64::new(0),
             event_stream_dead: AtomicBool::new(false),
             event_overflow_drops: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            test_event_batches_received: AtomicU64::new(0),
             event_queue_depth_last_sample: AtomicU64::new(0),
             event_queue_high_water: AtomicU64::new(0),
             event_decode_errors: AtomicU64::new(0),
@@ -589,6 +594,14 @@ impl Session {
     /// 因溢出被拒绝的 EventBatch 数（诊断用）。
     pub fn event_overflow_drops(&self) -> u64 {
         self.shared.event_overflow_drops.load(Ordering::Relaxed)
+    }
+
+    /// 测试诊断：reader 实际见到的事件帧数，不代表接受或已落盘。
+    #[cfg(feature = "test-hooks")]
+    pub fn test_event_batches_received(&self) -> u64 {
+        self.shared
+            .test_event_batches_received
+            .load(Ordering::Relaxed)
     }
 
     /// 事件队列深度快照（发送侧采样，非实时值；精确批量测试的到达见证）。
@@ -1149,6 +1162,10 @@ async fn reader_loop(mut rd: OwnedReadHalf, shared: Arc<Shared>, cancel: Cancell
         // 1.5) 事件批次走独立可靠流（Event Plane V1 §12）：绝不进入 SessionEvent
         // 队列——该队列满时 try_send 丢弃的语义对事件不可接受。
         if let Some(Body::EventBatch(b)) = env.body {
+            #[cfg(feature = "test-hooks")]
+            shared
+                .test_event_batches_received
+                .fetch_add(1, Ordering::Relaxed);
             // 流已死后拒绝一切后续批次（channel 已关闭，try_send 必败；此处
             // 短路避免无意义的解码开销）
             if shared.event_stream_dead.load(Ordering::Relaxed) {
@@ -1389,6 +1406,8 @@ mod tests {
                 dropped_events: AtomicU64::new(0),
                 event_stream_dead: AtomicBool::new(false),
                 event_overflow_drops: AtomicU64::new(0),
+                #[cfg(feature = "test-hooks")]
+                test_event_batches_received: AtomicU64::new(0),
                 event_queue_depth_last_sample: AtomicU64::new(0),
                 event_queue_high_water: AtomicU64::new(0),
                 event_decode_errors: AtomicU64::new(0),
@@ -1712,6 +1731,8 @@ mod tests {
             dropped_events: AtomicU64::new(0),
             event_stream_dead: AtomicBool::new(false),
             event_overflow_drops: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            test_event_batches_received: AtomicU64::new(0),
             event_queue_depth_last_sample: AtomicU64::new(0),
             event_queue_high_water: AtomicU64::new(0),
             event_decode_errors: AtomicU64::new(0),
@@ -1829,6 +1850,8 @@ mod tests {
             dropped_events: AtomicU64::new(0),
             event_stream_dead: AtomicBool::new(false),
             event_overflow_drops: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            test_event_batches_received: AtomicU64::new(0),
             event_queue_depth_last_sample: AtomicU64::new(0),
             event_queue_high_water: AtomicU64::new(0),
             event_decode_errors: AtomicU64::new(0),
@@ -2011,6 +2034,8 @@ mod tests {
                     dropped_events: AtomicU64::new(0),
                     event_stream_dead: AtomicBool::new(false),
                     event_overflow_drops: AtomicU64::new(0),
+                    #[cfg(feature = "test-hooks")]
+                    test_event_batches_received: AtomicU64::new(0),
                     event_queue_depth_last_sample: AtomicU64::new(0),
                     event_queue_high_water: AtomicU64::new(0),
                     event_decode_errors: AtomicU64::new(0),
