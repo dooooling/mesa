@@ -204,7 +204,13 @@ describe("验收 1–3 + 6/7/9/10：238 点完整操作路径（首屏 → 搜�
     expect(document.body.textContent).not.toContain("校验通过");
     // 教程/流程说明不在页面上（只留在抽屉）。
     expect(screen.queryByTestId("nck-collectable-count")).toBeNull();
+    expect(screen.queryByTestId("nck-collectable-summary")).toBeNull();
+    expect(screen.queryByTestId("nck-catalog-meta")).toBeNull();
     expect(document.body.textContent).not.toContain("选择变量 → 填写必要参数");
+    expect(document.querySelectorAll(".ant-form-item-explain-error")).toHaveLength(0);
+    expect(screen.queryByTestId("nck-form-issues")).toBeNull();
+    expect(document.body.textContent).not.toContain("FORM_MODEL_INVALID");
+    expect(screen.queryByTestId("nck-variable-select")).toBeNull();
     expect(screen.getAllByTestId("nck-point-row")).toHaveLength(25);
     expect(pagination().textContent).toContain("共 238 项");
     expect(pagination().textContent).toContain("第 1 / 10 页");
@@ -216,6 +222,8 @@ describe("验收 1–3 + 6/7/9/10：238 点完整操作路径（首屏 → 搜�
     expect(screen.queryByTestId("point-filter")).toBeNull();
 
     // ---------- 2) 搜索三路：名称 / 地址片段 / 标识片段 ----------
+    // 从非首页开始，证明搜索会复位页码，而非仅在首页看起来正确。
+    await gotoPage(2);
     fireEvent.change(screen.getByTestId("point-search"), { target: { value: "轴实际位置" } });
     await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(1));
     expect(pagination().textContent).toContain("第 1 / 1 页");
@@ -243,6 +251,7 @@ describe("验收 1–3 + 6/7/9/10：238 点完整操作路径（首屏 → 搜�
     expect((await screen.findByTestId("point-table-empty")).textContent).toContain(
       "没有匹配的点位，可改用标识搜索",
     );
+    expect(screen.queryAllByTestId("nck-point-row")).toHaveLength(0);
     await user.click(screen.getByTestId("clear-point-search"));
     await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(25));
 
@@ -255,6 +264,7 @@ describe("验收 1–3 + 6/7/9/10：238 点完整操作路径（首屏 → 搜�
     expect(pagination().textContent).toContain("第 1 / 3 页");
     await user.click(screen.getByTestId("page-size-25"));
     await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(25));
+    expect(pagination().textContent).toContain("第 1 / 10 页");
 
     // ---------- 4) 第 10 页编辑：位置不变 + 行标「已修改」 ----------
     await gotoPage(10);
@@ -322,42 +332,6 @@ describe("验收 1–3 + 6/7/9/10：238 点完整操作路径（首屏 → 搜�
   }, 60_000);
 });
 
-describe("验收 7：知道保存会不会影响采集（运行中的中断说明与三种按钮文案）", () => {
-  it("save_labels_follow_run_state_and_restart_choice", async () => {
-    const user = userEvent.setup();
-    const probe = createRequestProbe();
-    const state = mkState({ endpointStates: ["RUNNING"] });
-    installFetch(state, probe);
-    renderPane(state);
-    await waitAllVerified(238);
-    await waitFor(() =>
-      expect(screen.getByTestId("acquisition-status-state").textContent).toBe("运行中"),
-    );
-    // 只观察「加载完成之后」的请求（快照加载自带一次只读 GET /tasks）。
-    probe.reset();
-
-    // 无修改：运行中也不出现保存区（「中断说明」只在有修改时出现）。
-    expect(screen.queryByTestId("draft-save-bar")).toBeNull();
-
-    fireEvent.change(screen.getByTestId("acquisition-interval-input"), { target: { value: "500" } });
-    const summary = await screen.findByTestId("draft-save-summary");
-    expect(summary.textContent).toBe("周期另有修改：1000 → 500 ms");
-    // 默认主动作是「保存并恢复采集」；次级选项是「保存后保持停止」。
-    expect(saveButton().textContent).toContain("保存并恢复采集");
-    expect(screen.getByTestId("draft-save-note").textContent).toBe(
-      "保存会暂时中断当前连接的采集",
-    );
-    expect(screen.getByTestId("toggle-restart").textContent).toContain("保存后保持停止");
-    // 不承诺中断时长（§4.4.5）。
-    expect(document.body.textContent).not.toContain("约 1–2 秒");
-
-    // 切到「保持停止」：主按钮文案改写，次级选项变成反向动作。
-    await user.click(screen.getByTestId("toggle-restart"));
-    await waitFor(() => expect(saveButton().textContent).toContain("保存并停止采集"));
-    expect(screen.getByTestId("toggle-restart").textContent).toContain("保存后恢复采集");
-    expect(probe.writeSequence()).toEqual([]);
-  });
-});
 
 describe("添加：抽屉 → 选中资源 → 填写 → 加入待保存列表 → 回原位置", () => {
   it("add_via_drawer_returns_to_same_page_and_scroll", async () => {

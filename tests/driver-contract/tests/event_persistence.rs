@@ -293,13 +293,18 @@ async fn event_history_rest_pagination_filters_and_detail() {
     let cfg_store = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
     let mgr = Arc::new(MesaManager::discover(&drivers_dir));
     #[allow(deprecated)]
-    let state =
-        mesa_core_api::AppState::new(mgr, cfg_store, drivers_dir.to_string_lossy().to_string());
+    let state = common::isolated_app_state(
+        mgr,
+        cfg_store,
+        drivers_dir.to_string_lossy().to_string(),
+        false,
+    )
+    .expect("isolated AppState");
     state.set_event_services(EventServices::new(
         store.clone(),
         EventHub::new(EVENT_HUB_CAPACITY),
     ));
-    let app = mesa_core_api::router(state);
+    let app = state.router();
 
     async fn get(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
         let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
@@ -382,9 +387,14 @@ async fn event_history_rest_pagination_filters_and_detail() {
     let mgr2 = Arc::new(MesaManager::discover(_staged2.path()));
     let cfg2 = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
     #[allow(deprecated)]
-    let state2 =
-        mesa_core_api::AppState::new(mgr2, cfg2, _staged2.path().to_string_lossy().to_string());
-    let app2 = mesa_core_api::router(state2);
+    let state2 = common::isolated_app_state(
+        mgr2,
+        cfg2,
+        _staged2.path().to_string_lossy().to_string(),
+        false,
+    )
+    .expect("isolated AppState");
+    let app2 = state2.router();
     let (st, v) = get(app2, "/api/v1/events").await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(v["error"]["code"], "EVENT_STORE_UNAVAILABLE");
@@ -422,13 +432,15 @@ async fn event_task_rest_crud_and_running_conflict() {
         .unwrap();
     let mgr = Arc::new(MesaManager::discover(&drivers_dir));
     #[allow(deprecated)]
-    let state = mesa_core_api::AppState::new(
+    let state = common::isolated_app_state(
         mgr.clone(),
         cfg_store,
         drivers_dir.to_string_lossy().to_string(),
-    );
+        false,
+    )
+    .expect("isolated AppState");
     state.set_event_services(EventServices::new(store, EventHub::new(EVENT_HUB_CAPACITY)));
-    let app = mesa_core_api::router(state);
+    let app = state.router();
 
     async fn put(
         app: axum::Router,

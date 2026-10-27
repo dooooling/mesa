@@ -124,20 +124,17 @@ async fn orphan_guard_stdin_eof_exits_quickly() {
 #[tokio::test]
 async fn orphan_guard_helper_death_cleans_driver() {
     // cargo build 需先产出 orphan_helper 二进制
-    let helper_exe = repo_root()
-        .join("target")
+    let helper_exe = mesa_contract_tests::target_dir()
         .join("debug")
         .join(if cfg!(windows) {
             "orphan_helper.exe"
         } else {
             "orphan_helper"
         });
-    if !helper_exe.is_file() {
-        eprintln!(
-            "orphan_helper not built, skipping helper death test (run cargo build -p mesa-contract-tests)"
-        );
-        return;
-    }
+    assert!(
+        helper_exe.is_file(),
+        "orphan_helper 未构建；先 cargo build -p mesa-contract-tests --bins，不得跳过孤儿防护验证"
+    );
 
     let mut cmd = tokio::process::Command::new(&helper_exe);
     cmd.stdout(std::process::Stdio::piped())
@@ -382,7 +379,7 @@ fn stage_drivers_dir(tag: &str, src_exe: &Path, unique_base: &str) -> (PathBuf, 
 }
 
 fn hang_exe() -> PathBuf {
-    let target = repo_root().join("target");
+    let target = mesa_contract_tests::target_dir();
     for profile in ["debug", "release"] {
         let p = target.join(profile).join(exe_name("hang_helper"));
         if p.is_file() {
@@ -470,10 +467,14 @@ fn claim_dir() -> PathBuf {
     std::env::temp_dir().join("mesa-driver-ports")
 }
 
-/// 当前被认领的端口集合。
+/// 当前测试进程认领的端口集合；全局目录中的其它 Core 不属于本次探测。
 fn claimed_ports() -> HashSet<u16> {
+    claimed_ports_in(&claim_dir(), std::process::id())
+}
+
+fn claimed_ports_in(dir: &Path, owner: u32) -> HashSet<u16> {
     let mut set = HashSet::new();
-    let Ok(rd) = std::fs::read_dir(claim_dir()) else {
+    let Ok(rd) = std::fs::read_dir(dir) else {
         return set;
     };
     for e in rd.flatten() {
@@ -481,11 +482,33 @@ fn claimed_ports() -> HashSet<u16> {
         if let Some(rest) = name.strip_prefix("port-")
             && let Some(num) = rest.strip_suffix(".lock")
             && let Ok(p) = num.parse::<u16>()
+            && std::fs::read_to_string(e.path())
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                == Some(owner)
         {
             set.insert(p);
         }
     }
     set
+}
+
+/// 外部 Core 的新租约和旧版空文件都不能被认作本次探测的端口。
+#[test]
+fn lease_claim_observation_excludes_foreign_and_incomplete_owners() {
+    let dir = std::env::temp_dir().join(format!(
+        "mesa-claim-observation-{}-{}",
+        std::process::id(),
+        now_ns()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("port-30001.lock"), "101\n").unwrap();
+    std::fs::write(dir.join("port-30002.lock"), "202\n").unwrap();
+    std::fs::write(dir.join("port-30003.lock"), "").unwrap();
+    std::fs::write(dir.join("port-30004.lock"), "invalid").unwrap();
+    assert_eq!(claimed_ports_in(&dir, 101), HashSet::from([30001]));
+    assert_eq!(claimed_ports_in(&dir, 202), HashSet::from([30002]));
+    cleanup_dir(&dir);
 }
 
 /// 轮询等待「出现一个不在 `before` 中的存活 PID」。
@@ -785,14 +808,14 @@ async fn c3_connection_check_probe_cleans_up_and_spares_running_endpoint() {
     let value_before = latest_value(&mgr, "c3.counter").expect("预置：已开始出数");
     let persisted_before = c3_persisted_snapshot(&store);
 
-    let state = mesa_core_api::AppState::try_new_with_control(
+    let state = common::isolated_app_state(
         Arc::clone(&mgr),
         Arc::clone(&store),
         root.to_string_lossy().to_string(),
         false,
     )
     .unwrap();
-    let app = mesa_core_api::router(state);
+    let app = state.router();
     let uri = "/api/v1/endpoints/e-probe/connection-check";
     let tmp = std::env::temp_dir().join(format!("mesa-c3-orphan-{}", now_ns()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -824,10 +847,8 @@ async fn c3_connection_check_probe_cleans_up_and_spares_running_endpoint() {
     };
     // ② 它同时认领了一个新的端口租约。
     //
-    // NOTE（诚实说明）：`mesa-driver-ports` 是**全局**目录，cargo 并行跑
-    // 同一套件的其它用例时也会短暂认领端口，因此"新出现的租约"严格来说不保证
-    // 就是本次探测的（A32 用例沿用同一手法，这里保持一致）。为降低误判，先等
-    // 唯一命名的临时子进程彻底消失，再对这一租约做有界等待。
+    // 只观察本测试 Core 的租约；运行实例已在基线中，新增项属于本次临时探测。
+    // 其它 nextest 测试即使同时启动 Driver，也不能成为这里的清理判据。
     let temp_port = wait_for_new_claim(&claims_before).await;
     let new_claims: Vec<u16> = {
         let mut v: Vec<u16> = claimed_ports()

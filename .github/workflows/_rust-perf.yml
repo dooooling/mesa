@@ -41,6 +41,7 @@ jobs:
           --test data_plane_soak
           --test e2e_50k_real
           --test ipc_latency
+          -- --test-threads=1
 
       - name: sccache stats
         if: always()

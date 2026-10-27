@@ -1,6 +1,6 @@
 // 第 3 步验收：**请求顺序**证据（§4.4 / §4.7 / §5.4「典型失败信号」）。
 //
-// 本文件只回答一个问题：在每种状态下点保存，服务端**按什么顺序**收到哪些请求。
+// 在每种状态下点保存，验证请求顺序及最终界面结果，避免为同一请求链另挂一次页面。
 // 计数式断言（putCount === 1）证明不了顺序，因此这里逐条比对序列，并且专门验证
 // 「守卫都在 stop/PUT/start 之前」——即被拒绝的保存连一个写请求都不该发出。
 //
@@ -253,12 +253,29 @@ describe("请求顺序 2：已停止保存 ⇒ 仅 PUT + 回读 GET", () => {
     installFetch(state, probe);
     renderPane();
     await waitVerified(1);
+    const originalPoints = (state.tasks[0].binding.config as { points: NckPointSelection[] }).points;
     await changeInterval(2000);
     await waitFor(() => expect(saveButton().disabled).toBe(false));
+    expect(saveButton().textContent).toBe("保存配置");
+    expect(screen.getByTestId("draft-save-note").textContent).toContain("不会启动采集");
+    expect(screen.getByTestId("acquisition-status-interval").textContent).toBe(
+      "1000 ms（已保存） → 2000 ms（待保存）",
+    );
 
     probe.reset();
     await user.click(saveButton());
-    await waitFor(() => expect(state.putBodies).toHaveLength(1));
+    const result = await screen.findByTestId("apply-result");
+    expect(result.textContent).toContain("配置已保存，当前停止");
+    expect(state.putBodies).toHaveLength(1);
+    // 只改周期也必须提交，点位参数保持原样；成功后完整基线更新，动作区收起。
+    expect(state.putBodies[0][0].schedule).toEqual({ mode: "poll", interval_ms: 2000 });
+    expect((state.putBodies[0][0].binding.config as { points: NckPointSelection[] }).points).toEqual(
+      originalPoints,
+    );
+    expect(screen.getByTestId("acquisition-status-interval").textContent).toBe("2000 ms（已保存）");
+    expect(screen.queryByTestId("apply-button")).toBeNull();
+    expect(screen.queryByTestId("discard-draft")).toBeNull();
+    expect(screen.queryByTestId("draft-save-summary")).toBeNull();
 
     // 已停止路径：不 stop、不 start，只有「PUT → 回读 GET」。
     expect(probe.writeSequence()).toEqual(["PUT:tasks", "GET:tasks"]);
@@ -284,7 +301,12 @@ describe("请求顺序 3：运行中保存并恢复 ⇒ stop → PUT → 回读 
 
     probe.reset();
     await user.click(saveButton());
-    await waitFor(() => expect(state.startCalls).toBe(1));
+    const result = await screen.findByTestId("apply-result");
+    expect(result.textContent).toContain("配置已保存，采集已启动");
+    expect(state.stopCalls).toBe(1);
+    expect(state.startCalls).toBe(1);
+    expect(state.putBodies).toHaveLength(1);
+    expect(screen.getByTestId("acquisition-status-interval").textContent).toBe("2000 ms（已保存）");
 
     expect(probe.writeSequence()).toEqual(["STOP", "PUT:tasks", "GET:tasks", "START"]);
     // 守卫顺序：状态复核（GET /endpoints）与提交前身份核验（PREVIEW）都早于 stop。
@@ -305,11 +327,22 @@ describe("请求顺序 4：运行中保存并停止 ⇒ stop → PUT → 回读 
     await waitFor(() =>
       expect(screen.getByTestId("acquisition-status-state").textContent).toBe("运行中"),
     );
+    expect(screen.queryByTestId("draft-save-bar")).toBeNull();
+    expect(screen.queryByTestId("draft-save-note")).toBeNull();
     await changeInterval(2000);
     await waitFor(() => expect(saveButton().disabled).toBe(false));
+    expect(saveButton().textContent).toBe("保存并恢复采集");
+    expect(screen.getByTestId("draft-save-note").textContent).toBe(
+      "保存会暂时中断当前连接的采集",
+    );
+    expect(screen.getByTestId("draft-save-note").textContent).not.toMatch(/1[–-]2 ?秒/);
+    expect(screen.getByTestId("toggle-restart").textContent).toBe("保存后保持停止");
     // 次级选项：切到「保存后保持停止」，主按钮文案随动作改写。
+    probe.reset();
     await user.click(screen.getByTestId("toggle-restart"));
-    expect(saveButton().textContent).toContain("保存并停止采集");
+    expect(saveButton().textContent).toBe("保存并停止采集");
+    expect(screen.getByTestId("toggle-restart").textContent).toBe("保存后恢复采集");
+    expect(probe.writeSequence()).toEqual([]);
 
     probe.reset();
     await user.click(saveButton());
@@ -373,6 +406,11 @@ describe("请求顺序 6：启动失败后重试 ⇒ 仅 start（无 stop、无 
     await user.click(saveButton());
     await waitFor(() => expect(screen.getByTestId("retry-start")).toBeTruthy());
     expect(probe.writeSequence()).toEqual(["STOP", "PUT:tasks", "GET:tasks", "START"]);
+    expect(screen.getByTestId("acquisition-status-interval").textContent).toBe("2000 ms（已保存）");
+    expect(screen.getByTestId("draft-save-notice").textContent).toContain(
+      "配置已保存，但恢复采集失败",
+    );
+    expect(state.startCalls).toBe(1);
 
     // 重试启动：增量序列里只有 START。
     state.startOk = true;
@@ -384,6 +422,10 @@ describe("请求顺序 6：启动失败后重试 ⇒ 仅 start（无 stop、无 
     expect(probe.calls.filter((call) => call !== "GET:endpoints")).toEqual(["START"]);
     expect(state.stopCalls).toBe(1);
     expect(state.putBodies).toHaveLength(1);
+    expect(state.startCalls).toBe(2);
+    await waitFor(() => expect(screen.queryByTestId("retry-start")).toBeNull());
+    expect(screen.queryByTestId("apply-button")).toBeNull();
+    expect(screen.getByTestId("apply-result").textContent).toContain("配置已保存，采集已启动");
   });
 });
 
@@ -394,9 +436,13 @@ describe("请求顺序 7：运行状态未知 ⇒ 零请求（含只读复核）
     installFetch(state, probe);
     renderPane();
     expect(await screen.findByTestId("acquisition-run-state-unknown")).toBeTruthy();
+    expect(screen.getByTestId("acquisition-status-state").textContent).toBe("状态未知");
+    expect(screen.getByTestId("refresh-run-state")).toBeTruthy();
+    expect(screen.getByTestId("nck-point-row")).toBeTruthy();
     await changeInterval(2000);
     const save = (await screen.findByTestId("apply-button")) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
+    expect(screen.getByTestId("save-bar-refresh-state")).toBeTruthy();
 
     probe.reset();
     expect(invokeDisabledButton(save)).toBe(true);
@@ -406,6 +452,9 @@ describe("请求顺序 7：运行状态未知 ⇒ 零请求（含只读复核）
     expect(state.putBodies).toHaveLength(0);
     expect(state.stopCalls).toBe(0);
     expect(state.startCalls).toBe(0);
+    await waitFor(() =>
+      expect(document.querySelector(".ant-message")?.textContent ?? "").toContain("运行状态未知"),
+    );
   });
 });
 
@@ -431,6 +480,18 @@ describe("请求顺序 8：保存前复核发现状态变化 ⇒ 零 stop/PUT/st
     // 复核失败后连身份预览都不发：复核在提交前核验之前。
     expect(probe.calls.filter((call) => call === "PREVIEW")).toHaveLength(0);
     expect(state.putBodies).toHaveLength(0);
+    expect(outcome.textContent).toContain("本次保存未执行");
+    await waitFor(() => expect(screen.getByTestId("acquisition-status-state").textContent).toBe("已停止"));
+
+    // 状态变化后不自动重试；用户再次保存才按新的已停止路径提交。
+    await waitFor(() => expect(saveButton().disabled).toBe(false));
+    probe.reset();
+    await user.click(saveButton());
+    expect((await screen.findByTestId("apply-result")).textContent).toContain("配置已保存");
+    expect(probe.writeSequence()).toEqual(["PUT:tasks", "GET:tasks"]);
+    expect(state.putBodies).toHaveLength(1);
+    expect(state.stopCalls).toBe(0);
+    expect(state.startCalls).toBe(0);
   });
 });
 

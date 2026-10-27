@@ -71,7 +71,7 @@ jobs:
                   print('build:', ' '.join(cmd))
                   subprocess.run(cmd, check=True)
           else:
-              cmd = ['cargo', 'build', '--locked', '--workspace', '--bins']
+              cmd = ['cargo', 'build', '--locked', '--workspace', '--bins', '--all-features']
               print('build:', ' '.join(cmd))
               subprocess.run(cmd, check=True)
           EOF
@@ -80,8 +80,8 @@ jobs:
       # 输出 canonical_contract_bins，不解析 filter 字符串——filter 写法变了
       # 也不漏；false 时不补 bins（防退化成全补）。
       - name: build contract runtime bins
-        if: inputs.contract-bins == 'true'
-        run: cargo build --locked -p mesad -p mesa-test-driver -p mesa-contract-tests --bins
+        if: inputs.contract-bins == 'true' && fromJSON(inputs.build-targets).kind == 'packages'
+        run: cargo build --locked -p mesad -p mesa-test-driver -p mesa-contract-tests --bins --all-features
 
       - name: nextest (profile ci, soak excluded)
         run: >
@@ -114,6 +114,15 @@ jobs:
           --workspace
           --all-features
           --exclude mesa-performance-tests
+
+      - name: upload event soak diagnostics
+        if: always() && inputs.soak == 'run'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: event-soak-canonical-${{ github.run_attempt }}
+          path: target/validation/event-soak/
+          if-no-files-found: warn
 
       - name: sccache stats
         if: always()

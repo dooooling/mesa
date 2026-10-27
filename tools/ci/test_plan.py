@@ -51,6 +51,63 @@ def main():
     check("web-only", p["web"] is True and p["canonical"] is False
           and p["platform_mode"] == "skip" and p["stress"] is False, p)
 
+    # 混合改动应合并各自检查，文档不能让已知前端路径退化成 unknown → FULL。
+    # 比较完整执行计划（只忽略说明文字），防止修好误跑却漏掉另一侧检查。
+    web_file = "apps/mesa-web/src/App.tsx"
+    mixed_cases = [
+        ("web+docs", ["docs/design/review.md"], []),
+        ("web+gitignore", [".gitignore"], []),
+        ("web+rust+docs", ["drivers/focas2/src/wire/codec.rs", "docs/design/review.md"],
+         ["drivers/focas2/src/wire/codec.rs"]),
+        ("web+core-api", ["crates/core-api/src/lib.rs"], ["crates/core-api/src/lib.rs"]),
+        ("web+watchdog", ["scripts/stop-watchdog.ps1"], ["scripts/stop-watchdog.ps1"]),
+        ("web+e2e", ["scripts/nck-native-rest-e2e.py"], ["scripts/nck-native-rest-e2e.py"]),
+        ("web+watchdog+e2e", ["scripts/stop-watchdog.ps1", "scripts/nck-native-rest-e2e.py"],
+         ["scripts/stop-watchdog.ps1", "scripts/nck-native-rest-e2e.py"]),
+    ]
+    for is_main in (False, True):
+        for label, companions, baseline_files in mixed_cases:
+            expected = plan_for_files(baseline_files or [web_file], pkgs(), is_main=is_main)
+            expected = {k: v for k, v in expected.items() if k != "reason"}
+            expected["web"] = True
+            # 路径顺序不能改变检查集合：git diff 的排序不是路由语义的一部分。
+            for files in ([web_file, *companions], [*companions, web_file]):
+                actual = plan_for_files(files, pkgs(), is_main=is_main)
+                check(f"mixed {label} main={is_main} files={files}",
+                      {k: v for k, v in actual.items() if k != "reason"} == expected, actual)
+
+    # 已知前端路径不能掩盖真正未知路径或强制 FULL 路径，也不能误认相邻目录。
+    for other in ("mystery/new.bin", "apps/mesa-web-extra/src/App.tsx", "Cargo.lock",
+                  ".github/workflows/ci.yml", "tools/ci/plan.py"):
+        actual = plan_for_files([web_file, other], pkgs())
+        expected = plan.full_plan("")
+        check(f"mixed web+{other} remains FULL",
+              {k: v for k, v in actual.items() if k != "reason"}
+              == {k: v for k, v in expected.items() if k != "reason"}, actual)
+
+    # 独立工作流与普通代码混合时取检查并集；公共 CI 文件与未知文件仍然 FULL。
+    scoped = [(".github/workflows/_web.yml", "web"),
+              (".github/workflows/_watchdog.yml", "watchdog"),
+              (".github/workflows/_e2e.yml", "e2e")]
+    for workflow, flag in scoped:
+        for companions in (["docs/review.md"], [web_file],
+                           ["drivers/focas2/src/wire/wire.rs"]):
+            expected = plan_for_files(companions, pkgs())
+            expected[flag] = True
+            actual = plan_for_files([workflow, *companions], pkgs())
+            check(f"scoped union {workflow} {companions}",
+                  {k: v for k, v in actual.items() if k != "reason"}
+                  == {k: v for k, v in expected.items() if k != "reason"}, actual)
+        for shared in (".github/workflows/ci.yml", ".github/actions/rust-ci-setup/action.yml",
+                       ".github/workflows/new-unknown.yml", "tools/ci/plan.py"):
+            actual = plan_for_files([workflow, shared], pkgs())
+            check(f"scoped cannot mask FULL {workflow} {shared}",
+                  actual["platform_mode"] == "full" and actual["canonical_filter"] == "all()"
+                  and all(actual[k] for k in ["quality", "canonical", "web", "stress", "perf", "e2e", "watchdog"]), actual)
+    actual = plan_for_files([f for f, _ in scoped], pkgs())
+    check("all independent workflows union", actual["web"] and actual["e2e"] and actual["watchdog"]
+          and not actual["canonical"] and actual["platform_mode"] == "skip", actual)
+
     # focas2 source → rdeps(focas2), smoke, no stress/perf, no web（CI v3）。
     p = plan_for_files(["drivers/focas2/src/wire/codec.rs"], pkgs())
     check("focas2 filter", p["canonical_filter"] == "rdeps(=mesa-driver-focas2)", p)
@@ -251,10 +308,10 @@ def main():
     p = plan_for_files(["tests/watchdog/README.md", "tests/watchdog/stub_endpoint.py"], pkgs())
     check("watchdog: README+stub → true", p["watchdog"] is True, p)
 
-    # watchdog workflow 自身变更 → true（同时命中 .github/ 的 FULL，fail-closed）。
+    # 独立 watchdog 工作流只执行自己的验证链。
     p = plan_for_files([".github/workflows/_watchdog.yml"], pkgs())
-    check("watchdog: _watchdog.yml → true + FULL", p["watchdog"] is True
-          and p["platform_mode"] == "full", p)
+    check("watchdog: _watchdog.yml → watchdog only", p["watchdog"] is True
+          and p["platform_mode"] == "skip" and not p["canonical"] and not p["web"], p)
 
     # 无关改动 → false（"不要对每个无关 PR 无条件消耗 runner"）。
     for f in ("drivers/focas2/src/wire/codec.rs", "crates/driver-manager/src/x.rs",
@@ -315,10 +372,10 @@ def main():
         p = plan_for_files([f], pkgs())
         check(f"e2e: {f} → true", p["e2e"] is True and p["canonical"] is True, p)
 
-    # e2e workflow 自身变更 → true（同时命中 .github/ 的 FULL，fail-closed）。
+    # 独立 E2E 工作流只执行自己的验证链。
     p = plan_for_files([".github/workflows/_e2e.yml"], pkgs())
-    check("e2e: _e2e.yml → true + FULL", p["e2e"] is True
-          and p["platform_mode"] == "full", p)
+    check("e2e: _e2e.yml → e2e only", p["e2e"] is True
+          and p["platform_mode"] == "skip" and not p["canonical"] and not p["web"], p)
 
     # 无关改动 → false（"不要对每个无关 PR 无条件消耗两个 runner"）。
     for f in ("drivers/focas2/src/wire/codec.rs", "drivers/s7/src/y.rs",

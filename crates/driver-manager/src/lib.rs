@@ -17,6 +17,8 @@ pub mod process;
 pub mod session;
 pub mod snapshot;
 pub(crate) mod temp_op;
+#[cfg(feature = "test-hooks")]
+pub mod test_clock;
 
 pub use endpoint::{BuiltinEndpoint, PointIdAllocator, PointIdSource, StorePointIdSource};
 pub use manager::{AttemptPhase, MesaManager, StopHandle};

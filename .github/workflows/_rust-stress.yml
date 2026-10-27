@@ -1,7 +1,6 @@
 # Rust Stress（Windows x64）：event 60s soak / stop / pressure / management
-# 关键场景重复采样。PR 按 planner 触发（runtime-sensitive 才跑），main
-# Rust change 必跑。内容不削减（与旧 _runtime-stress.yml 同集合），执行器
-# 切 nextest ci-stress（分类见 .config/nextest.toml）。
+# 关键场景重复采样，按 planner 的 runtime-sensitive 路由触发。
+# 完整集合先执行一次；PR 只对并发门追加采样，Nightly/主分支保留完整二次采样。
 name: rust-stress
 on:
   workflow_call:
@@ -9,6 +8,10 @@ on:
       runs-on:
         required: true
         type: string
+      repeat-all:
+        description: "是否重复完整套件；false 时仅重复已列出的并发门"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -33,8 +36,11 @@ jobs:
 
       # test-driver 等子进程类测试需要真实 executable（cargo build 默认
       # 只构建 lib，不产出 [[bin]]；--bins 保证 mesa-test-driver 可 launch）。
-      - name: build workspace
-        run: cargo build --locked --workspace --bins
+      - name: build runtime binaries
+        run: >
+          cargo build --locked --all-features --bins
+          -p mesad -p mesa-contract-tests -p mesa-test-driver
+          -p mesa-driver-s7 -p mesa-driver-focas2 -p mesa-driver-opcua -p mesa-driver-sinumerik-nck
 
       # 最易抖场景 ×2：60s 稳态 soak（Stop/drain 全链路 + 溢出边界）。
       - name: stress event_soak 60s x2
@@ -44,12 +50,10 @@ jobs:
           && cargo nextest run --locked -p mesa-contract-tests --all-features
           --profile ci-stress --test event_soak sim_steady_state_soak_60s_no_loss_no_drift
 
-      # Stop/drain 确定性 Gates ×2（含 in-flight 判别 hold）。
-      - name: stress stop_lifecycle x2
+      # 完整集合必须执行；含 in-flight 判别 hold，不缩短时间预算。
+      - name: stress stop_lifecycle
         run: >
           cargo nextest run --locked -p mesa-contract-tests --all-features
-          --profile ci-stress --test stop_lifecycle
-          && cargo nextest run --locked -p mesa-contract-tests --all-features
           --profile ci-stress --test stop_lifecycle
 
       # 容量公式 Gates ×1（速率 SLO + stall 恢复 + 溢出边界，内含长 hold）。
@@ -58,13 +62,55 @@ jobs:
           cargo nextest run --locked -p mesa-contract-tests --all-features
           --profile ci-stress --test event_pressure
 
-      # 并发 Probe ×2（startup spawn/租约/建连并发正确性）。
-      - name: stress management_api x2
+      - name: stress management_api
         run: >
           cargo nextest run --locked -p mesa-contract-tests --all-features
           --profile ci-stress --test management_api
-          && cargo nextest run --locked -p mesa-contract-tests --all-features
-          --profile ci-stress --test management_api
+
+      # 重复采样不是失败重试：前面任一失败会直接使 job 失败，不会由此变绿。
+      - name: repeat concurrency gates (full on nightly)
+        shell: bash
+        env:
+          REPEAT_ALL: ${{ inputs.repeat-all }}
+        run: |
+          python3 - <<'EOF'
+          import os, subprocess
+          stop = [
+              'double_start_only_one_attempt_at_table_level',
+              'start_rejected_while_stop_intent_persist_in_flight',
+              'late_stop_a_write_cannot_override_new_start',
+              'slow_start_persist_does_not_delay_stop_begin',
+              'await_settled_requires_confirmed_stop_intent_under_slow_db',
+              'concurrent_delete_and_delete_during_teardown_are_safe',
+              'delete_racing_start_never_leaves_orphan_attempt',
+              'delete_waits_for_inflight_stop_persist_and_rebuild_is_not_polluted',
+              'cancelled_delete_request_does_not_leave_a_permanent_barrier',
+          ]
+          management = [
+              'probe_concurrent_same_driver_all_succeed',
+              'definition_query_concurrency_budget_rejects_immediately',
+              'definition_query_permits_release_on_all_paths_and_cancel_reaps_process',
+          ]
+          def selected(binary, tests):
+              base = f'binary(={binary})'
+              if os.environ['REPEAT_ALL'] == 'true':
+                  return base
+              return base + ' & (' + ' | '.join(f'test(={t})' for t in tests) + ')'
+          filt = selected('stop_lifecycle', stop) + ' | ' + selected('management_api', management)
+          # -E 只筛运行集合；显式限制 Cargo 构建目标，避免链接其它未运行套件。
+          subprocess.run(['cargo', 'nextest', 'run', '--locked', '-p', 'mesa-contract-tests',
+                          '--test', 'stop_lifecycle', '--test', 'management_api',
+                          '--all-features', '--profile', 'ci-stress', '-E', filt], check=True)
+          EOF
+
+      - name: upload event soak diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: event-soak-stress-${{ github.run_attempt }}
+          path: target/validation/event-soak/
+          if-no-files-found: warn
 
       - name: sccache stats
         if: always()

@@ -1,6 +1,36 @@
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
+// 纯模型显式使用 Node；Hook 与组件继续使用 jsdom，避免按后缀误分环境。
+const nodeTests = [
+  "src/acquisitionDraft.test.ts",
+  "src/acquisitionDraftDiff.test.ts",
+  "src/acquisitionRowView.test.ts",
+  "src/addDevice/bootstrap.test.ts",
+  "src/browseModel.test.ts",
+  "src/connection/connectionSetupModel.test.ts",
+  "src/descriptorCompatibility.test.ts",
+  "src/deviceModel.test.ts",
+  "src/endpointSavePlan.test.ts",
+  "src/events/filters.test.ts",
+  "src/events/format.test.ts",
+  "src/events/model.test.ts",
+  "src/events/taskBinding.test.ts",
+  "src/issueLocation.test.ts",
+  "src/localizedText.test.ts",
+  "src/nckCatalog.test.ts",
+  "src/nckCollectability.test.ts",
+  "src/nckNativeModel.test.ts",
+  "src/nckPointDisplay.test.ts",
+  "src/nckPointModel.test.ts",
+  "src/nckTaskBinding.test.ts",
+  "src/pointRows.test.ts",
+  "src/pointSummary.test.ts",
+  "src/qualityCode.test.ts",
+  "src/qualityExport.test.ts",
+  "src/qualityScope.test.ts",
+];
+
 export default defineConfig({
   plugins: [react()],
   server: {
@@ -27,9 +57,10 @@ export default defineConfig({
   },
   test: {
     environment: "jsdom",
+    environmentMatchGlobs: nodeTests.map((path) => [path, "node"]),
     setupFiles: ["./src/test/setup.ts"],
     // M7：重交互测试（user.click + 轮询 + SSE mock）在高并发 worker 下时序
-    // flaky；threads 池 2 并发是稳定与速度的折中（全量约 1 分钟）。
+    // flaky；本地最多两个 worker，CI 分片会进一步限制为每 runner 一个。
     poolOptions: {
       threads: { minThreads: 1, maxThreads: 2 },
     },

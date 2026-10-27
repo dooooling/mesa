@@ -11,7 +11,11 @@ mod hub;
 mod query;
 pub mod retention;
 mod schema;
+#[cfg(feature = "test-hooks")]
+mod test_probe;
 mod writer;
+#[cfg(feature = "test-hooks")]
+pub use test_probe::TestWriterSnapshot;
 
 pub use hub::{EVENT_HUB_CAPACITY, EventHub};
 pub use query::{EventFilter, max_seq, query_by_seq, query_history, query_range_asc};
@@ -299,6 +303,8 @@ pub struct EventStore {
     writer_join: Option<std::thread::JoinHandle<()>>,
     /// writer 线程 commit 执行耗时最大值 ns（不含队列等待；stall 位置判定）。
     writer_commit_latency_max_ns: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(feature = "test-hooks")]
+    writer_probe: Arc<test_probe::WriterProbe>,
 }
 
 impl EventStore {
@@ -359,15 +365,29 @@ impl EventStore {
         let (tx, rx) = tokio::sync::mpsc::channel(writer::WRITER_QUEUE);
         let writer_commit_latency_max_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let latency_probe = Arc::clone(&writer_commit_latency_max_ns);
+        #[cfg(feature = "test-hooks")]
+        let writer_probe = Arc::new(test_probe::WriterProbe::default());
+        #[cfg(feature = "test-hooks")]
+        let thread_probe = Arc::clone(&writer_probe);
         let join = std::thread::Builder::new()
             .name("event-store-writer".into())
-            .spawn(move || writer::writer_loop(write_conn, rx, latency_probe))
+            .spawn(move || {
+                writer::writer_loop(
+                    write_conn,
+                    rx,
+                    latency_probe,
+                    #[cfg(feature = "test-hooks")]
+                    thread_probe,
+                )
+            })
             .map_err(|e| EventStoreError::Unavailable(format!("spawn writer: {e}")))?;
         Ok(Self {
             writer_tx: tx,
             reader: Arc::new(Mutex::new(read_conn)),
             writer_join: Some(join),
             writer_commit_latency_max_ns,
+            #[cfg(feature = "test-hooks")]
+            writer_probe,
         })
     }
 
@@ -376,6 +396,13 @@ impl EventStore {
     pub fn writer_commit_latency_max_ns(&self) -> u64 {
         self.writer_commit_latency_max_ns
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 测试诊断快照：不查询 SQLite，writer 卡在磁盘/栅栏时仍能采样。
+    #[cfg(feature = "test-hooks")]
+    pub fn test_writer_snapshot(&self) -> TestWriterSnapshot {
+        self.writer_probe
+            .snapshot(writer::WRITER_QUEUE.saturating_sub(self.writer_tx.capacity()))
     }
 
     /// 打开（不存在则创建）文件库。

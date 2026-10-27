@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 rust-version.workspace = true
+[features]
+# 合同测试控制 Start 提交交错；默认生产依赖图不包含屏障。
+test-hooks = []
+
 [dependencies]
 mesa-core-types = { workspace = true }
 mesa-driver-protocol = { workspace = true }

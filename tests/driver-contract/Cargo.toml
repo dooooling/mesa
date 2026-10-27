@@ -44,6 +44,7 @@ async-opcua-types = "0.19"
 # 放 dev-dependencies 使 `cargo build`（生产图）永不启用，
 # 仅 `cargo test` 激活。
 [dev-dependencies]
+mesa-core-api = { workspace = true, features = ["test-hooks"] }
 rusqlite = { workspace = true }
 mesa-event-store = { workspace = true, features = ["test-hooks"] }
 # G7 生命周期竞态 Gate：teardown panic 注入 + 运行意图落盘失败/变慢注入。

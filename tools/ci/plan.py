@@ -200,7 +200,7 @@ SPECIAL_PACKAGES: dict[str, list[str]] = {
     "tests/fixtures": ["mesa-contract-tests"],
 }
 
-# 强制 FULL 的路径前缀/精确名（fail-closed，不做 dependency-filter）。
+# 强制 FULL 的路径前缀/精确名；仅下方精确列出的独立工作流例外。
 FULL_PATHS = (
     ".github/",
     "tools/ci/",
@@ -210,6 +210,14 @@ FULL_PATHS = (
     "Cargo.lock",
     "rust-toolchain.toml",
 )
+
+# 独立工作流只验证自己的执行链；公共 action、总调度及未知 CI 文件仍走 FULL。
+# 名单精确到文件，不能按 .github/workflows/ 前缀整体放行。
+SCOPED_CI_FILES = {
+    ".github/workflows/_web.yml",
+    ".github/workflows/_watchdog.yml",
+    ".github/workflows/_e2e.yml",
+}
 
 
 # --- workspace rdeps（Cargo metadata 反向依赖闭包；不解析 filter 字符串） ---
@@ -345,34 +353,25 @@ def empty_plan(reason: str) -> dict:
 
 
 def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = False) -> dict:
-    """核心路由（纯函数，可单测；is_main=true 时 Rust/code change 升级全集成）。"""
+    """核心路由；PR/main 共用选择性计划，公共 CI 或未知影响面使用 FULL。"""
     if not files:
         return full_plan("empty diff → FULL (fail-closed)")
     if all(is_docs_only(p) for p in files):
         return empty_plan("docs-only → all skip")
 
-    # web-only：只有 apps/mesa-web 下文件。
-    if all(p == "apps/mesa-web/" or p.startswith("apps/mesa-web/") for p in files):
-        return {
-            "plan_version": PLAN_VERSION,
-            "quality": False,
-            "canonical": False,
-            "canonical_filter": "none()",
-            "canonical_soak": "skip",
-            "canonical_contract_bins": False,
-            "platform_mode": "skip",
-            "platform_soak": "skip",
-            "build_targets": {"kind": "none"},
-            "stress": False,
-            "perf": False,
-            "web": True,
-            "watchdog": False,
-            "e2e": False,
-            "reason": "web-only → web only",
-        }
+    # Web 不属于 Cargo workspace，但仍是已知路径；混合改动必须合并检查，
+    # 不能只在「全部文件都是前端」时识别，否则附带文档就会误触发 FULL。
+    web_files = {
+        p for p in files
+        if p == "apps/mesa-web/" or p.startswith("apps/mesa-web/")
+        or p == ".github/workflows/_web.yml"
+    }
+    web = bool(web_files)
 
     # 强制 FULL 路径。
     for p in files:
+        if p in SCOPED_CI_FILES:
+            continue
         for fp in FULL_PATHS:
             if p == fp.rstrip("/") or p.startswith(fp):
                 return full_plan(f"full-ci path: {p}")
@@ -382,7 +381,7 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
     e2e_changed = needs_e2e(files)
     pkgs: set[str] = set()
     for p in files:
-        matched = False
+        matched = p in web_files or p in SCOPED_CI_FILES
         # watchdog / E2E 相关路径里的**已知非 Rust 路径**：只置对应标志，不牵连 Rust job。
         # （不加这一条的话它们会落到下面的 unknown path → FULL，等于让每个测试资产小改动
         #  都跑一遍全量 Rust 集成，与"不要无条件消耗 runner"的要求相反。）
@@ -403,9 +402,11 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
             return full_plan(f"unknown path: {p} (fail-closed)")
 
     if not pkgs:
-        if watchdog_changed or e2e_changed:
-            # 只有测试资产变更：只跑对应的重套件，Rust/web 全部 skip。
+        if web or watchdog_changed or e2e_changed:
+            # 没有 Rust 改动：合并前端与测试资产各自需要的检查。
             parts = []
+            if web:
+                parts.append("web")
             if watchdog_changed:
                 parts.append("watchdog")
             if e2e_changed:
@@ -422,7 +423,7 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
                 "build_targets": {"kind": "none"},
                 "stress": False,
                 "perf": False,
-                "web": False,
+                "web": web,
                 "watchdog": watchdog_changed,
                 "e2e": e2e_changed,
                 "reason": "%s-only → %s suite only"
@@ -434,6 +435,8 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
     # canonical filter：deterministic 联合 rdeps。
     filt = " | ".join(f"rdeps(={p})" for p in sorted(pkgs))
     reasons = [f"rust package change: {p}" for p in sorted(pkgs)]
+    if web:
+        reasons.append("web change → web suite")
 
     # contract suite 自身修改 → stress。
     stress = bool(pkgs & STRESS_PACKAGES)
@@ -460,11 +463,6 @@ def plan_for_files(files: list[str], packages: dict[str, str], is_main: bool = F
     # 则 canonical 必须先补 mesad + test-driver + contract --bins。
     # 不解析 filter 字符串：直接用 workspace dependency graph 求 rdeps 闭包。
     contract_bins = needs_contract_bins(pkgs, packages)
-
-    # web：只有 apps/mesa-web 受影响才跑（Rust-only 不带 web）。
-    web = any(
-        p == "apps/mesa-web/" or p.startswith("apps/mesa-web/") for p in files
-    )
 
     plan = {
         "plan_version": PLAN_VERSION,

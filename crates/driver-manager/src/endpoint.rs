@@ -466,8 +466,17 @@ pub async fn run_endpoint_with_attempt(
             backoff_idx += 1;
         }
         tracing::info!(endpoint = %cfg.endpoint_id, retry_in_secs = delay.as_secs(), "reconnecting");
+        let wait = async {
+            // 仅测试可以显式推进本 Endpoint 的等待；计划值、递增与重置仍走生产逻辑。
+            #[cfg(feature = "test-hooks")]
+            if let Some(clock) = ctx.as_ref().and_then(|c| c.test_reconnect_clock.get()) {
+                clock.wait(delay).await;
+                return;
+            }
+            tokio::time::sleep(delay).await;
+        };
         tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
+            _ = wait => {}
             _ = shutdown.cancelled() => {
                 set_status(&snapshot, &cfg, generation, ConnectionState::Stopped, "core shutdown", id_map.len(), last_epoch, source.revision(&cfg.endpoint_id));
                 return None;
@@ -739,7 +748,7 @@ const INGRESS_DRAIN_TIMEOUT: Duration = Duration::from_millis(
     mesa_event_store::EVENT_STORE_BUSY_TIMEOUT_MS as u64 + INGRESS_DRAIN_MARGIN_MS,
 );
 /// 余量：reader barrier 达成后 backlog 有限（生产者已停），覆盖其排空 +
-/// Tokio/Windows 调度抖动。病态 backlog（通道上限 128 批全慢）超出本预算时
+/// Tokio/Windows 调度抖动。病态 backlog（通道上限 512 批全慢）超出本预算时
 /// 走大声 `EVENT_DRAIN_TIMEOUT`，不静默——预算覆盖现实最坏，不覆盖病态。
 const INGRESS_DRAIN_MARGIN_MS: u64 = 10_000;
 
@@ -1305,11 +1314,22 @@ mod tests {
     }
 
     /// P0-3：drain 超时（[`INGRESS_DRAIN_TIMEOUT`]）→ EVENT_DRAIN_TIMEOUT
-    ///（abort 已执行，不 detach）。固定开销一次慢断言（suite 内已有 30s 级用例）。
+    ///（abort 已执行，不 detach）。保留真实计时，避免 test-util 改变工作区
+    /// 的依赖特征集合，使 bins 与单独运行的合同测试重复构建依赖。
     /// 超时码本身是冻结契约，时长是可组合预算——改预算不改码。
     #[tokio::test]
     async fn shutdown_ingress_timeout_is_explicit_error() {
-        let h = tokio::spawn(async {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let witness = Dropped(Arc::clone(&dropped));
+        let start = tokio::time::Instant::now();
+        let h = tokio::spawn(async move {
+            let _witness = witness;
             // 无视 cancel 的顽固任务（模拟磁盘 hang）：pending 永不就绪
             std::future::pending::<Result<(), IngressFatal>>().await
         });
@@ -1317,5 +1337,7 @@ mod tests {
             .await
             .expect_err("timeout must be explicit error, not success");
         assert_eq!(err.code(), "EVENT_DRAIN_TIMEOUT");
+        assert!(tokio::time::Instant::now() - start >= INGRESS_DRAIN_TIMEOUT);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

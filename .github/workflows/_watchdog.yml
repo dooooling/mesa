@@ -1,4 +1,4 @@
-# Watchdog 离线场景（Windows + Linux 并行，单 job 25 分钟预算）。
+# Watchdog 离线场景（Windows/Linux 各两片，单 job 25 分钟预算）。
 #
 # 被测对象：scripts/stop-watchdog.ps1（G6-ARMED / FIRED 执行体）。
 # 测试资产：tests/watchdog/{stub_endpoint.py, run-watchdog-scenarios.ps1, README.md}。
@@ -20,16 +20,18 @@ permissions:
 
 jobs:
   offline-scenarios:
+    name: offline-scenarios (${{ matrix.target.platform }}, shard ${{ matrix.shard }})
     strategy:
       # 两个平台都跑完再判（不要一个挂了就取消另一个：平台差异本身就是要看的信息）。
       fail-fast: false
       matrix:
-        include:
-          - runs-on: windows-latest
+        target:
+          - runner: windows-latest
             platform: windows
-          - runs-on: ubuntu-latest
+          - runner: ubuntu-latest
             platform: linux
-    runs-on: ${{ matrix.runs-on }}
+        shard: ["1", "2"]
+    runs-on: ${{ matrix.target.runner }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -56,20 +58,29 @@ jobs:
             }
           }
           if (-not $py) { throw '需要 python3（假端点桩依赖它）；runner 上找不到 python3/python —— 明确失败，不静默跳过' }
-          Write-Host "平台 = ${{ matrix.platform }}；pwsh/python 就绪"
+          "WATCHDOG_PYTHON=$py" >> $env:GITHUB_ENV
+          Write-Host "平台 = ${{ matrix.target.platform }}；pwsh/python 就绪"
 
-      - name: 跑 stop-watchdog 离线场景（M0–M19）
+      - name: 验证分片准入
+        shell: pwsh
+        run: '& $env:WATCHDOG_PYTHON tests/watchdog/test_ci_shards.py'
+
+      - name: 跑 stop-watchdog 离线场景分片
         shell: pwsh
         run: |
-          pwsh -NoProfile -File tests/watchdog/run-watchdog-scenarios.ps1 -EvidenceRoot target/validation/stop-watchdog
+          $cases = & $env:WATCHDOG_PYTHON tests/watchdog/ci_shards.py --shard '${{ matrix.shard }}'
+          if ($LASTEXITCODE -ne 0) { throw '分片定义无效，不执行部分场景' }
+          pwsh -NoProfile -File tests/watchdog/run-watchdog-scenarios.ps1 -Scenario "$cases" -PythonExe "$env:WATCHDOG_PYTHON" -EvidenceRoot target/validation/stop-watchdog-${{ matrix.shard }}
           if ($LASTEXITCODE -ne 0) { throw "watchdog 离线场景失败（exit=$LASTEXITCODE），证据见上传的 artifact" }
+          & $env:WATCHDOG_PYTHON tests/watchdog/ci_shards.py --shard '${{ matrix.shard }}' --summary target/validation/stop-watchdog-${{ matrix.shard }}/suite-summary.json
+          if ($LASTEXITCODE -ne 0) { throw '分片结果缺失或未全部通过' }
 
       - name: 上传证据（测试结果与失败日志）
         if: always()
         # 按仓库约定钉扎到提交 SHA（v4.6.2）；浮动 tag 可能被上游改写，导致 CI 静默失效
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: watchdog-${{ matrix.platform }}
-          path: target/validation/stop-watchdog
+          name: watchdog-${{ matrix.target.platform }}-${{ matrix.shard }}
+          path: target/validation/stop-watchdog-${{ matrix.shard }}
           if-no-files-found: warn
           retention-days: 14

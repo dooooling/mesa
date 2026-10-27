@@ -90,9 +90,11 @@ async fn serve_with_services(services: Arc<EventServices>) -> TestServer {
     let cfg = Arc::new(mesa_config_store::ConfigStore::open_in_memory().unwrap());
     let mgr = Arc::new(mesa_driver_manager::MesaManager::discover(&drivers_dir));
     #[allow(deprecated)]
-    let state = mesa_core_api::AppState::new(mgr, cfg, drivers_dir.to_string_lossy().to_string());
+    let state =
+        common::isolated_app_state(mgr, cfg, drivers_dir.to_string_lossy().to_string(), false)
+            .expect("isolated AppState");
     state.set_event_services(services);
-    let app = mesa_core_api::router(state);
+    let app = state.router();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();

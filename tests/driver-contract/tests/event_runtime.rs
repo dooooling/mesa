@@ -885,12 +885,7 @@ async fn start_exact_fake(
                             .unwrap();
                         }
                     }
-                    // 发射后读到 EOF 退出。
-                    loop {
-                        if read_envelope(&mut rd).await.is_err() {
-                            return;
-                        }
-                    }
+                    // 继续由外层循环处理 Ping，直到 EOF；不能只读掉请求而不回复心跳。
                 }
                 Some(pb::envelope::Body::Ping(_)) => {
                     write_envelope(
@@ -921,6 +916,31 @@ fn exact_task() -> EventTask {
             config: serde_json::json!({}),
         },
     }
+}
+
+/// 发射完成不是连接关闭：夹具仍须回复心跳，否则慢机器上会把有效会话误判为失联。
+#[tokio::test]
+async fn exact_fake_answers_ping_after_emission() {
+    let port = start_exact_fake(vec![exact_batch(7, 1, 1)], vec![], None).await;
+    let (mut session, _events, _) = Session::connect(port, TOKEN).await.unwrap();
+    session
+        .configure_events(7, 1, &[exact_task()])
+        .await
+        .unwrap();
+    start_connection(&session, 7, 1).await;
+    let mut batches = session.take_event_batches().unwrap();
+    recv_event_batch(&mut batches, 5).await;
+    for _ in 0..2 {
+        let reply = session
+            .call_with_timeout(
+                pb::envelope::Body::Ping(pb::Ping {}),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("发射完成后必须继续回复 Ping");
+        assert!(matches!(reply.body, Some(pb::envelope::Body::Pong(_))));
+    }
+    teardown(&mut session, None);
 }
 
 /// SLO 精确证明：500 个 occurrence（公式 RATE×STALL×SAFETY 的 RATE×10s）在
@@ -958,15 +978,31 @@ async fn exact_500_events_pipeline_exact_within_budget() {
         None,
     ));
 
-    // 500 精确落盘（10s budget；条件必成立，超时只在真 bug 时触发）。
-    common::wait_until(10, || {
-        services
+    // 保留 10 秒预算；失败时输出实际进度与会话/队列状态，区分吞吐不足与链路中断。
+    let started = std::time::Instant::now();
+    let completed = tokio::time::timeout(Duration::from_secs(10), async {
+        while services
             .diagnostics
             .ingress_persisted_events_total
             .load(std::sync::atomic::Ordering::Relaxed)
-            >= N
+            < N
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     })
     .await;
+    assert!(
+        completed.is_ok(),
+        "500 事件落盘超时: elapsed={:?}, db={:?}, diagnostics={:?}, queue_depth={}, queue_high_water={}, stream_failed={}, unresponsive={}, ingress_finished={}",
+        started.elapsed(),
+        db,
+        services.diagnostics,
+        session.event_queue_depth_last_sample(),
+        session.event_queue_high_water(),
+        session.event_stream_failed(),
+        session.is_unresponsive(),
+        ingress_h.is_finished()
+    );
 
     // DB 精确：500 行、event_id exact:1..=500 连续、单 epoch。
     let rows = rows_of(&store, "exact-slo");

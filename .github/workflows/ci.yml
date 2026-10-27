@@ -60,6 +60,11 @@ jobs:
         with:
           # PR 取 base..head 全量变更；main push 取前后 commit。
           fetch-depth: 0
+      # 轻量调度自测先于 Rust job；Web-only 也不能绕过总门禁的自测。
+      - name: planner and gate self-tests
+        run: |
+          python3 tools/ci/test_plan.py
+          python3 tools/ci/test_ci_gate.py
       - id: route
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -153,6 +158,7 @@ jobs:
     uses: ./.github/workflows/_rust-stress.yml
     with:
       runs-on: windows-latest
+      repeat-all: ${{ github.event_name != 'pull_request' }}
 
   # Perf：PR 按 planner 风险触发；与 canonical 并行。
   rust-perf:

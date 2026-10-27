@@ -1,4 +1,4 @@
-# Web（Ubuntu x64，一次）：mesa-web 与 Rust Native 并行跑，
+# Web（Ubuntu x64）：构建与两片测试并行，并与 Rust Native 并行跑，
 # Windows/ARM runner 不再为 Rust 装 Node/pnpm。
 name: web
 on:
@@ -27,8 +27,42 @@ jobs:
       - name: pnpm install
         run: pnpm --dir apps/mesa-web install --frozen-lockfile
 
-      - name: web test
-        run: pnpm --filter mesa-web test
-
       - name: web build
         run: pnpm --filter mesa-web build
+
+  # 文件级分片使用独立 runner，每片只开一个 worker；总体仍是两个 worker，
+  # 将重交互用例分散到两台机器，避免在单台 runner 上争抢 CPU 导致短超时误伤。
+  # build 与两片测试均为此 reusable workflow 的必需 job，任一失败都会使上层 web 失败。
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 10.28.0
+          run_install: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22.18.0'
+          cache: 'pnpm'
+          cache-dependency-path: 'apps/mesa-web/pnpm-lock.yaml'
+      - name: pnpm install
+        run: pnpm --dir apps/mesa-web install --frozen-lockfile
+      - name: web test shard
+        run: >
+          pnpm --filter mesa-web test --shard=${{ matrix.shard }}/2
+          --poolOptions.threads.maxThreads=1
+          --reporter=default --reporter=json
+          --outputFile=../../target/validation/web-shard-${{ matrix.shard }}.json
+      - name: 上传测试明细与耗时
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: web-shard-${{ matrix.shard }}
+          path: target/validation/web-shard-${{ matrix.shard }}.json
+          if-no-files-found: error

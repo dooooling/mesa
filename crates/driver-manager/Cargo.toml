@@ -7,8 +7,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-# 测试故障注入（teardown panic）。生产图不启用；仅合同测试经 dev-dependencies
-# 打开，与 mesa-event-store / mesa-config-store 的 test-hooks 同口径。
+# 测试故障注入与调度控制（teardown panic、reaper 挂起、Endpoint 退避时钟）。
+# 生产图不启用；仅合同测试经 dev-dependencies 打开，与其他存储包的 test-hooks 同口径。
 test-hooks = []
 
 [dependencies]

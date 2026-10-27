@@ -424,17 +424,25 @@ fn lease_port() -> Option<PortLease> {
 /// 跨进程认领端口：`create_new` 原子，文件已存在即认领失败。
 /// 目录创建失败视为认领失败（换号重试，不 fail 整个 spawn）。
 fn claim_port_cross_process(port: u16) -> Option<(std::fs::File, std::path::PathBuf)> {
+    use std::io::Write;
     let dir = port_claim_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return None;
     }
     let path = dir.join(format!("port-{port}.lock"));
-    std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
-        .ok()
-        .map(|f| (f, path))
+        .ok()?;
+    // 所有者用于诊断与测试归因，不用于判断存活或清理旧租约（PID 可被复用）。
+    // 必须在返回租约、启动子进程之前写完；失败则撤销本次认领。
+    if writeln!(file, "{}", std::process::id()).is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    Some((file, path))
 }
 
 /// 256-bit 随机 session token 的十六进制形式（§14.2）。
