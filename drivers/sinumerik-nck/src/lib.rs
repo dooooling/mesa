@@ -14,6 +14,7 @@
 
 mod address;
 mod browse_selection;
+mod catalog_category;
 mod client;
 mod codec;
 mod compiler;
@@ -30,6 +31,10 @@ mod targets;
 mod value;
 
 pub use address::{AddressError, NckArea, NckUnitMode};
+pub use catalog_category::{
+    CATEGORY_BASIS_NAVIGATION_RULE, CATEGORY_RULES, CatalogCategory, CategoryAssignment,
+    CategoryRule, EvidenceAnchor, classify_category,
+};
 pub use client::{NckClient, NckReadItem, NckReadResult};
 pub use codec::{CodecError, NckWireAddress, encode_var_spec};
 pub use compiler::{
