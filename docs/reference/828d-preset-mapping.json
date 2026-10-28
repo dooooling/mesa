@@ -1,0 +1,4417 @@
+{
+  "$comment": "828D 62 个预设模板 → r1.json 定义映射原始数据（Phase 0 只读盘点）。由 map_presets.py 生成，勿手工编辑。匹配依据 = golden_ref 四元组。",
+  "baseline": {
+    "repo_head": "047e2064bd233eafc508ca9fe5329e93a96ee6e2",
+    "r1_path": "drivers/sinumerik-nck/definitions/828d/r1.json",
+    "r1_blob_sha1": "3c0abe67cbcb64b525cddec1584e6e1747e0f062",
+    "presets_path": "drivers/sinumerik-nck/presets/828d.json",
+    "match_basis": "M1: golden_ref (area, block, variable, entry)",
+    "generator_script": "docs/reference/828d-preset-mapping.md 附录 A"
+  },
+  "summary": {
+    "preset_count": 62,
+    "definition_count": 42,
+    "golden_ref_total": 62,
+    "preset_minus_golden_ref": [],
+    "golden_ref_minus_preset": [],
+    "bijection": true,
+    "verdict_counts": {
+      "mapped": 62
+    },
+    "match_basis_counts": {
+      "M1": 62
+    },
+    "mapped_count": 62,
+    "unmapped_count": 0,
+    "distinct_variable_ids_hit": 42,
+    "definitions_hit_by_presets": 42,
+    "definitions_not_hit_by_any_preset": 0,
+    "definitions_not_hit_by_any_preset_ids": [],
+    "presets_per_definition": {
+      "axis.ctrlout.module_number": 1,
+      "axis.ctrlout.type": 1,
+      "axis.encoder.module_number": 1,
+      "axis.name": 1,
+      "axis.position.actual_bcs": 1,
+      "axis.position.commanded_mcs": 1,
+      "axis.spindle_assignment": 1,
+      "channel.feed.actual": 1,
+      "channel.feed.commanded": 1,
+      "channel.feed.override": 1,
+      "channel.machine_axis_assignment": 1,
+      "channel.program.block": 1,
+      "channel.program.line_number": 1,
+      "channel.program.name.active": 1,
+      "channel.program.name.main": 1,
+      "channel.program.status": 1,
+      "channel.r_parameter": 1,
+      "channel.tool.number_active": 1,
+      "drive.motor.temperature": 2,
+      "drive.object.name": 2,
+      "drive.parameter.p0105": 2,
+      "drive.parameter.r0021": 2,
+      "drive.parameter.r0027": 2,
+      "drive.parameter.r0031": 2,
+      "drive.parameter.r0033": 2,
+      "drive.parameter.r0062": 2,
+      "drive.parameter.r0063": 2,
+      "drive.parameter.r0064": 2,
+      "drive.parameter.r0077": 2,
+      "drive.parameter.r0078": 2,
+      "drive.parameter.r0079": 2,
+      "drive.parameter.r0080": 2,
+      "drive.parameter.r0081": 2,
+      "drive.parameter.r0082": 2,
+      "drive.parameter.r0103": 2,
+      "drive.parameter.r0106": 2,
+      "drive.parameter.r0107": 2,
+      "drive.parameter.r0108": 2,
+      "mode_group.op_mode": 1,
+      "spindle.speed.actual": 1,
+      "spindle.speed.commanded": 1,
+      "spindle.speed.override": 1
+    },
+    "preset_validation_status_counts": {
+      "candidate": 62
+    },
+    "field_consistency_failures": {
+      "module_ok": 0,
+      "column_ok": 0,
+      "decode_ok": 0,
+      "transport_ok": 0,
+      "count_ok": 0,
+      "unit_mode_ok": 0
+    },
+    "field_consistency_checked_pairs": 62
+  },
+  "presets": [
+    {
+      "preset_id": "828d.C.S.progStatus.nc_variable",
+      "label": "S/progStatus U16_LE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 127,
+        "column": 13,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U16_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "S",
+        "variable": "progStatus",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "channel.program.status"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "channel.program.status",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "channel.program.status",
+          "module_kind": "fixed",
+          "module_expected": 127,
+          "module_preset": 127,
+          "module_ok": true,
+          "column_def": 13,
+          "column_preset": 13,
+          "column_ok": true,
+          "decode_def": "U16_LE",
+          "decode_preset": "U16_LE",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "channel.program.status"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.B.S.opMode.nc_variable",
+      "label": "S/opMode U16_LE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "B",
+        "module": 127,
+        "column": 3,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U16_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "B",
+        "block": "S",
+        "variable": "opMode",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "mode_group.op_mode"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "mode_group.op_mode",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "mode_group.op_mode",
+          "module_kind": "fixed",
+          "module_expected": 127,
+          "module_preset": 127,
+          "module_ok": true,
+          "column_def": 3,
+          "column_preset": 3,
+          "column_ok": true,
+          "decode_def": "U16_LE",
+          "decode_preset": "U16_LE",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "mode_group.op_mode"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.SPARPP.progName.nc_variable",
+      "label": "SPARPP/progName UTF8_NUL_LAST_32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 122,
+        "column": 5,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "UTF8_NUL_LAST_32",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "SPARPP",
+        "variable": "progName",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "channel.program.name.main"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "channel.program.name.main",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "channel.program.name.main",
+          "module_kind": "fixed",
+          "module_expected": 122,
+          "module_preset": 122,
+          "module_ok": true,
+          "column_def": 5,
+          "column_preset": 5,
+          "column_ok": true,
+          "decode_def": "UTF8_NUL_LAST_32",
+          "decode_preset": "UTF8_NUL_LAST_32",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "channel.program.name.main"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.SPARP.progName.nc_variable",
+      "label": "SPARP/progName UTF8_NUL_LAST_32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 125,
+        "column": 3,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "UTF8_NUL_LAST_32",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "SPARP",
+        "variable": "progName",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "channel.program.name.active"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "channel.program.name.active",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "channel.program.name.active",
+          "module_kind": "fixed",
+          "module_expected": 125,
+          "module_preset": 125,
+          "module_ok": true,
+          "column_def": 3,
+          "column_preset": 3,
+          "column_ok": true,
+          "decode_def": "UTF8_NUL_LAST_32",
+          "decode_preset": "UTF8_NUL_LAST_32",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "channel.program.name.active"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.SPARP.actLineNumber.nc_variable",
+      "label": "SPARP/actLineNumber I32_LE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 125,
+        "column": 9,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "I32_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "SPARP",
+        "variable": "actLineNumber",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "channel.program.line_number"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "channel.program.line_number",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "channel.program.line_number",
+          "module_kind": "fixed",
+          "module_expected": 125,
+          "module_preset": 125,
+          "module_ok": true,
+          "column_def": 9,
+          "column_preset": 9,
+          "column_ok": true,
+          "decode_def": "I32_LE",
+          "decode_preset": "I32_LE",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "channel.program.line_number"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.SPARP.actBlock.nc_variable",
+      "label": "SPARP/actBlock UTF8_NUL_FIRST_66",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 125,
+        "column": 31,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "UTF8_NUL_FIRST_66",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "SPARP",
+        "variable": "actBlock",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "channel.program.block"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "channel.program.block",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "channel.program.block",
+          "module_kind": "fixed",
+          "module_expected": 125,
+          "module_preset": 125,
+          "module_ok": true,
+          "column_def": 31,
+          "column_preset": 31,
+          "column_ok": true,
+          "decode_def": "UTF8_NUL_FIRST_66",
+          "decode_preset": "UTF8_NUL_FIRST_66",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "channel.program.block"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.SGA.actToolBasePos.nc_variable",
+      "label": "SGA/actToolBasePos F64_LE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 115,
+        "column": 2,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "SGA",
+        "variable": "actToolBasePos",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "axis.position.commanded_mcs"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "axis.position.commanded_mcs",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "axis.position.commanded_mcs",
+          "module_kind": "fixed",
+          "module_expected": 115,
+          "module_preset": 115,
+          "module_ok": true,
+          "column_def": 2,
+          "column_preset": 2,
+          "column_ok": true,
+          "decode_def": "F64_LE",
+          "decode_preset": "F64_LE",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "axis.position.commanded_mcs"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.SEGA.actProgPosBKS.nc_variable",
+      "label": "SEGA/actProgPosBKS F64_LE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 112,
+        "column": 33,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "SEGA",
+        "variable": "actProgPosBKS",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "axis.position.actual_bcs"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "axis.position.actual_bcs",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "axis.position.actual_bcs",
+          "module_kind": "fixed",
+          "module_expected": 112,
+          "module_preset": 112,
+          "module_ok": true,
+          "column_def": 33,
+          "column_preset": 33,
+          "column_ok": true,
+          "decode_def": "F64_LE",
+          "decode_preset": "F64_LE",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "axis.position.actual_bcs"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.S.actFeedRateIpo.nc_variable",
+      "label": "S/actFeedRateIpo F64_LE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 127,
+        "column": 1,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "S",
+        "variable": "actFeedRateIpo",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "channel.feed.actual"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "channel.feed.actual",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "channel.feed.actual",
+          "module_kind": "fixed",
+          "module_expected": 127,
+          "module_preset": 127,
+          "module_ok": true,
+          "column_def": 1,
+          "column_preset": 1,
+          "column_ok": true,
+          "decode_def": "F64_LE",
+          "decode_preset": "F64_LE",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "channel.feed.actual"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.S.cmdFeedRateIpo.nc_variable",
+      "label": "S/cmdFeedRateIpo F64_LE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 127,
+        "column": 2,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "S",
+        "variable": "cmdFeedRateIpo",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "channel.feed.commanded"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "channel.feed.commanded",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "channel.feed.commanded",
+          "module_kind": "fixed",
+          "module_expected": 127,
+          "module_preset": 127,
+          "module_ok": true,
+          "column_def": 2,
+          "column_preset": 2,
+          "column_ok": true,
+          "decode_def": "F64_LE",
+          "decode_preset": "F64_LE",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "channel.feed.commanded"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.S.feedRateIpoOvr.nc_variable",
+      "label": "S/feedRateIpoOvr F64_LE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 127,
+        "column": 3,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09",
+        "unit": "%"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "S",
+        "variable": "feedRateIpoOvr",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "channel.feed.override"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "channel.feed.override",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "channel.feed.override",
+          "module_kind": "fixed",
+          "module_expected": 127,
+          "module_preset": 127,
+          "module_ok": true,
+          "column_def": 3,
+          "column_preset": 3,
+          "column_ok": true,
+          "decode_def": "F64_LE",
+          "decode_preset": "F64_LE",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "channel.feed.override"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.SSP.actSpeed.nc_variable",
+      "label": "SSP/actSpeed F64_LE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 114,
+        "column": 2,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "SSP",
+        "variable": "actSpeed",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "spindle.speed.actual"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "spindle.speed.actual",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "spindle.speed.actual",
+          "module_kind": "fixed",
+          "module_expected": 114,
+          "module_preset": 114,
+          "module_ok": true,
+          "column_def": 2,
+          "column_preset": 2,
+          "column_ok": true,
+          "decode_def": "F64_LE",
+          "decode_preset": "F64_LE",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "spindle.speed.actual"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.SSP.cmdSpeed.nc_variable",
+      "label": "SSP/cmdSpeed F64_LE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 114,
+        "column": 3,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "SSP",
+        "variable": "cmdSpeed",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "spindle.speed.commanded"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "spindle.speed.commanded",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "spindle.speed.commanded",
+          "module_kind": "fixed",
+          "module_expected": 114,
+          "module_preset": 114,
+          "module_ok": true,
+          "column_def": 3,
+          "column_preset": 3,
+          "column_ok": true,
+          "decode_def": "F64_LE",
+          "decode_preset": "F64_LE",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "spindle.speed.commanded"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.SSP.speedOvr.nc_variable",
+      "label": "SSP/speedOvr F64_LE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 114,
+        "column": 4,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09",
+        "unit": "%"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "SSP",
+        "variable": "speedOvr",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "spindle.speed.override"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "spindle.speed.override",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "spindle.speed.override",
+          "module_kind": "fixed",
+          "module_expected": 114,
+          "module_preset": 114,
+          "module_ok": true,
+          "column_def": 4,
+          "column_preset": 4,
+          "column_ok": true,
+          "decode_def": "F64_LE",
+          "decode_preset": "F64_LE",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "spindle.speed.override"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.S.actTNumber.nc_variable",
+      "label": "S/actTNumber U16_LE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 127,
+        "column": 23,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U16_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "S",
+        "variable": "actTNumber",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "channel.tool.number_active"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "channel.tool.number_active",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "channel.tool.number_active",
+          "module_kind": "fixed",
+          "module_expected": 127,
+          "module_preset": 127,
+          "module_ok": true,
+          "column_def": 23,
+          "column_preset": 23,
+          "column_ok": true,
+          "decode_def": "U16_LE",
+          "decode_preset": "U16_LE",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "channel.tool.number_active"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.RP.rpa.nc_variable",
+      "label": "RP/rpa F64_LE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 21,
+        "column": 1,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F64_LE",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "RP",
+        "variable": "rpa",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "channel.r_parameter"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "channel.r_parameter",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "channel.r_parameter",
+          "module_kind": "fixed",
+          "module_expected": 21,
+          "module_preset": 21,
+          "module_ok": true,
+          "column_def": 1,
+          "column_preset": 1,
+          "column_ok": true,
+          "decode_def": "F64_LE",
+          "decode_preset": "F64_LE",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "channel.r_parameter"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.V.M.r0021.nc_variable",
+      "label": "M/r0021 F32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 21,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0021",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0021"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0021",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0021",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 21,
+          "column_preset": 21,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0021"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0021.drive_object",
+      "label": "M/r0021 F32（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 21,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0021",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0021"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0021",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0021",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 21,
+          "column_preset": 21,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0021"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0027.nc_variable",
+      "label": "M/r0027 F32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 27,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0027",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0027"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0027",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0027",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 27,
+          "column_preset": 27,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0027"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0027.drive_object",
+      "label": "M/r0027 F32（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 27,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0027",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0027"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0027",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0027",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 27,
+          "column_preset": 27,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0027"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0035.nc_variable",
+      "label": "M/r0035 F32（含 -200 无效温度规则）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 35,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07",
+        "invalid_value": -200.0,
+        "invalid_tolerance": 0.001
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0035",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.motor.temperature"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.motor.temperature",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.motor.temperature",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 35,
+          "column_preset": 35,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.motor.temperature"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0035.drive_object",
+      "label": "M/r0035 F32（驱动对象入口 module130，含 -200 无效温度规则）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 35,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07",
+        "invalid_value": -200.0,
+        "invalid_tolerance": 0.001
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0035",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.motor.temperature"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.motor.temperature",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.motor.temperature",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 35,
+          "column_preset": 35,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.motor.temperature"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0033.nc_variable",
+      "label": "M/r0033 F32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 33,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07",
+        "unit": "%"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0033",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0033"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0033",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "candidate",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0033",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 33,
+          "column_preset": 33,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0033"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0033.drive_object",
+      "label": "M/r0033 F32（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 33,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07",
+        "unit": "%"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0033",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0033"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0033",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "candidate",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0033",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 33,
+          "column_preset": 33,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0033"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0031.nc_variable",
+      "label": "M/r0031 F32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 31,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07",
+        "unit": "Nm"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0031",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0031"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0031",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "candidate",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0031",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 31,
+          "column_preset": 31,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0031"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0031.drive_object",
+      "label": "M/r0031 F32（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 31,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07",
+        "unit": "Nm"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0031",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0031"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0031",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "candidate",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0031",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 31,
+          "column_preset": 31,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0031"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0062.nc_variable",
+      "label": "M/r0062 F32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 62,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0062",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0062"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0062",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0062",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 62,
+          "column_preset": 62,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0062"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0062.drive_object",
+      "label": "M/r0062 F32（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 62,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0062",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0062"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0062",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0062",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 62,
+          "column_preset": 62,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0062"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0063.nc_variable",
+      "label": "M/r0063 F32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 63,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0063",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0063"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0063",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0063",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 63,
+          "column_preset": 63,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0063"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0063.drive_object",
+      "label": "M/r0063 F32（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 63,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0063",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0063"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0063",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0063",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 63,
+          "column_preset": 63,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0063"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0064.nc_variable",
+      "label": "M/r0064 F32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 64,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0064",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0064"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0064",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0064",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 64,
+          "column_preset": 64,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0064"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0064.drive_object",
+      "label": "M/r0064 F32（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 64,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0064",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0064"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0064",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0064",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 64,
+          "column_preset": 64,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0064"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0077.nc_variable",
+      "label": "M/r0077 F32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 77,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0077",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0077"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0077",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0077",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 77,
+          "column_preset": 77,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0077"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0077.drive_object",
+      "label": "M/r0077 F32（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 77,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0077",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0077"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0077",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0077",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 77,
+          "column_preset": 77,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0077"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0078.nc_variable",
+      "label": "M/r0078 F32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 78,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0078",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0078"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0078",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0078",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 78,
+          "column_preset": 78,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0078"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0078.drive_object",
+      "label": "M/r0078 F32（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 78,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0078",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0078"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0078",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0078",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 78,
+          "column_preset": 78,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0078"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0079.nc_variable",
+      "label": "M/r0079 F32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 79,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0079",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0079"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0079",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0079",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 79,
+          "column_preset": 79,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0079"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0079.drive_object",
+      "label": "M/r0079 F32（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 79,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0079",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0079"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0079",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0079",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 79,
+          "column_preset": 79,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0079"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0080.nc_variable",
+      "label": "M/r0080 F32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 80,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0080",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0080"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0080",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0080",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 80,
+          "column_preset": 80,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0080"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0080.drive_object",
+      "label": "M/r0080 F32（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 80,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0080",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0080"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0080",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0080",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 80,
+          "column_preset": 80,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0080"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0081.nc_variable",
+      "label": "M/r0081 F32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 81,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0081",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0081"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0081",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0081",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 81,
+          "column_preset": 81,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0081"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0081.drive_object",
+      "label": "M/r0081 F32（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 81,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0081",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0081"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0081",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0081",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 81,
+          "column_preset": 81,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0081"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0082.nc_variable",
+      "label": "M/r0082 F32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 82,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0082",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0082"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0082",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0082",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 82,
+          "column_preset": 82,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0082"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0082.drive_object",
+      "label": "M/r0082 F32（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 82,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "F32_BE",
+        "transport_size": "0x07"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0082",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0082"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0082",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0082",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 82,
+          "column_preset": 82,
+          "column_ok": true,
+          "decode_def": "F32_BE",
+          "decode_preset": "F32_BE",
+          "decode_ok": true,
+          "transport_def": 7,
+          "transport_preset": "0x07",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0082"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0103.nc_variable",
+      "label": "M/r0103 U16_BE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 103,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U16_BE",
+        "transport_size": "0x06"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0103",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0103"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0103",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0103",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 103,
+          "column_preset": 103,
+          "column_ok": true,
+          "decode_def": "U16_BE",
+          "decode_preset": "U16_BE",
+          "decode_ok": true,
+          "transport_def": 6,
+          "transport_preset": "0x06",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0103"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0103.drive_object",
+      "label": "M/r0103 U16_BE（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 103,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U16_BE",
+        "transport_size": "0x06"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0103",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0103"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0103",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0103",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 103,
+          "column_preset": 103,
+          "column_ok": true,
+          "decode_def": "U16_BE",
+          "decode_preset": "U16_BE",
+          "decode_ok": true,
+          "transport_def": 6,
+          "transport_preset": "0x06",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0103"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.p0105.nc_variable",
+      "label": "M/p0105 I16_BE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 105,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "I16_BE",
+        "transport_size": "0x05"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "p0105",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.p0105"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.p0105",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.p0105",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 105,
+          "column_preset": 105,
+          "column_ok": true,
+          "decode_def": "I16_BE",
+          "decode_preset": "I16_BE",
+          "decode_ok": true,
+          "transport_def": 5,
+          "transport_preset": "0x05",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.p0105"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.p0105.drive_object",
+      "label": "M/p0105 I16_BE（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 105,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "I16_BE",
+        "transport_size": "0x05"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "p0105",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.p0105"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.p0105",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.p0105",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 105,
+          "column_preset": 105,
+          "column_ok": true,
+          "decode_def": "I16_BE",
+          "decode_preset": "I16_BE",
+          "decode_ok": true,
+          "transport_def": 5,
+          "transport_preset": "0x05",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.p0105"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0106.nc_variable",
+      "label": "M/r0106 I16_BE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 106,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "I16_BE",
+        "transport_size": "0x05"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0106",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0106"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0106",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0106",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 106,
+          "column_preset": 106,
+          "column_ok": true,
+          "decode_def": "I16_BE",
+          "decode_preset": "I16_BE",
+          "decode_ok": true,
+          "transport_def": 5,
+          "transport_preset": "0x05",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0106"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0106.drive_object",
+      "label": "M/r0106 I16_BE（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 106,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "I16_BE",
+        "transport_size": "0x05"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0106",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0106"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0106",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0106",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 106,
+          "column_preset": 106,
+          "column_ok": true,
+          "decode_def": "I16_BE",
+          "decode_preset": "I16_BE",
+          "decode_ok": true,
+          "transport_def": 5,
+          "transport_preset": "0x05",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0106"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0107.nc_variable",
+      "label": "M/r0107 I16_BE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 107,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "I16_BE",
+        "transport_size": "0x05"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0107",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0107"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0107",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0107",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 107,
+          "column_preset": 107,
+          "column_ok": true,
+          "decode_def": "I16_BE",
+          "decode_preset": "I16_BE",
+          "decode_ok": true,
+          "transport_def": 5,
+          "transport_preset": "0x05",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0107"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0107.drive_object",
+      "label": "M/r0107 I16_BE（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 107,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "I16_BE",
+        "transport_size": "0x05"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0107",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0107"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0107",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0107",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 107,
+          "column_preset": 107,
+          "column_ok": true,
+          "decode_def": "I16_BE",
+          "decode_preset": "I16_BE",
+          "decode_ok": true,
+          "transport_def": 5,
+          "transport_preset": "0x05",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0107"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0108.nc_variable",
+      "label": "M/r0108 U32",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 108,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U32_BE",
+        "transport_size": "0x06"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0108",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0108"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0108",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0108",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 108,
+          "column_preset": 108,
+          "column_ok": true,
+          "decode_def": "U32_BE",
+          "decode_preset": "U32_BE",
+          "decode_ok": true,
+          "transport_def": 6,
+          "transport_preset": "0x06",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0108"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.r0108.drive_object",
+      "label": "M/r0108 U32（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 108,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U32_BE",
+        "transport_size": "0x06"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "r0108",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.parameter.r0108"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.parameter.r0108",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "parameter_identity",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.parameter.r0108",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 108,
+          "column_preset": 108,
+          "column_ok": true,
+          "decode_def": "U32_BE",
+          "decode_preset": "U32_BE",
+          "decode_ok": true,
+          "transport_def": 6,
+          "transport_preset": "0x06",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.parameter.r0108"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.p0199.nc_variable",
+      "label": "M/p0199 UTF16_BE",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 26,
+        "column": 199,
+        "count": 25,
+        "unit_mode": "current",
+        "decode": "UTF16_BE",
+        "transport_size": "0x06"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "p0199",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.object.name"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.object.name",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.object.name",
+          "module_kind": "drive_entry_module",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 199,
+          "column_preset": 199,
+          "column_ok": true,
+          "decode_def": "UTF16_BE",
+          "decode_preset": "UTF16_BE",
+          "decode_ok": true,
+          "transport_def": 6,
+          "transport_preset": "0x06",
+          "transport_ok": true,
+          "count_def": 25,
+          "count_preset": 25,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.object.name"
+      ]
+    },
+    {
+      "preset_id": "828d.V.M.p0199.drive_object",
+      "label": "M/p0199 UTF16_BE（驱动对象入口 module130）",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "V",
+        "module": 130,
+        "column": 199,
+        "count": 25,
+        "unit_mode": "current",
+        "decode": "UTF16_BE",
+        "transport_size": "0x06"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "V",
+        "block": "M",
+        "variable": "p0199",
+        "entry": "drive_object"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "drive.object.name"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "drive.object.name",
+          "revision": 1,
+          "scope": "collect",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable",
+            "drive_object"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "drive.object.name",
+          "module_kind": "drive_entry_module",
+          "module_expected": 130,
+          "module_preset": 130,
+          "module_ok": true,
+          "column_def": 199,
+          "column_preset": 199,
+          "column_ok": true,
+          "decode_def": "UTF16_BE",
+          "decode_preset": "UTF16_BE",
+          "decode_ok": true,
+          "transport_def": 6,
+          "transport_preset": "0x06",
+          "transport_ok": true,
+          "count_def": 25,
+          "count_preset": 25,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [],
+      "addr_weak_candidates": [
+        "drive.object.name"
+      ]
+    },
+    {
+      "preset_id": "828d.N.M.MDSA_AXCONF_MACHAX_NAME_TAB.nc_variable",
+      "label": "M/MDSA_AXCONF_MACHAX_NAME_TAB UTF8_FIXED_16",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "N",
+        "module": 26,
+        "column": 10000,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "UTF8_FIXED_16",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "N",
+        "block": "M",
+        "variable": "MDSA_AXCONF_MACHAX_NAME_TAB",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "axis.name"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "axis.name",
+          "revision": 1,
+          "scope": "identity",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "axis.name",
+          "module_kind": "fixed",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 10000,
+          "column_preset": 10000,
+          "column_ok": true,
+          "decode_def": "UTF8_FIXED_16",
+          "decode_preset": "UTF8_FIXED_16",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "axis.name"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.A.M.MDCA_CTRLOUT_MODULE_NR.nc_variable",
+      "label": "M/MDCA_CTRLOUT_MODULE_NR U8",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "A",
+        "module": 26,
+        "column": 30110,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U8",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "A",
+        "block": "M",
+        "variable": "MDCA_CTRLOUT_MODULE_NR",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "axis.ctrlout.module_number"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "axis.ctrlout.module_number",
+          "revision": 1,
+          "scope": "identity",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "axis.ctrlout.module_number",
+          "module_kind": "fixed",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 30110,
+          "column_preset": 30110,
+          "column_ok": true,
+          "decode_def": "U8",
+          "decode_preset": "U8",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "axis.ctrlout.module_number"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.A.M.MDCA_ENC_MODULE_NR.nc_variable",
+      "label": "M/MDCA_ENC_MODULE_NR U8",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "A",
+        "module": 26,
+        "column": 30220,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U8",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "A",
+        "block": "M",
+        "variable": "MDCA_ENC_MODULE_NR",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "axis.encoder.module_number"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "axis.encoder.module_number",
+          "revision": 1,
+          "scope": "identity",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "axis.encoder.module_number",
+          "module_kind": "fixed",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 30220,
+          "column_preset": 30220,
+          "column_ok": true,
+          "decode_def": "U8",
+          "decode_preset": "U8",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "axis.encoder.module_number"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.A.M.MDCA_CTRLOUT_TYPE.nc_variable",
+      "label": "M/MDCA_CTRLOUT_TYPE U8",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "A",
+        "module": 26,
+        "column": 30130,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U8",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "A",
+        "block": "M",
+        "variable": "MDCA_CTRLOUT_TYPE",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "axis.ctrlout.type"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "axis.ctrlout.type",
+          "revision": 1,
+          "scope": "identity",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "axis.ctrlout.type",
+          "module_kind": "fixed",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 30130,
+          "column_preset": 30130,
+          "column_ok": true,
+          "decode_def": "U8",
+          "decode_preset": "U8",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "axis.ctrlout.type"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.C.M.AXCONF_MACHAX_USED.nc_variable",
+      "label": "M/AXCONF_MACHAX_USED U8",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "C",
+        "module": 26,
+        "column": 20070,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U8",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "C",
+        "block": "M",
+        "variable": "AXCONF_MACHAX_USED",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "channel.machine_axis_assignment"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "channel.machine_axis_assignment",
+          "revision": 1,
+          "scope": "identity",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "channel.machine_axis_assignment",
+          "module_kind": "fixed",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 20070,
+          "column_preset": 20070,
+          "column_ok": true,
+          "decode_def": "U8",
+          "decode_preset": "U8",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "channel.machine_axis_assignment"
+      ],
+      "addr_weak_candidates": []
+    },
+    {
+      "preset_id": "828d.A.M.SPIND_ASSIGN_TO_MACHAX.nc_variable",
+      "label": "M/SPIND_ASSIGN_TO_MACHAX U8",
+      "family": "828d",
+      "validation_status": "candidate",
+      "parameters": {
+        "area": "A",
+        "module": 26,
+        "column": 35000,
+        "count": 1,
+        "unit_mode": "current",
+        "decode": "U8",
+        "transport_size": "0x09"
+      },
+      "required_user_inputs": [
+        "area_no",
+        "line"
+      ],
+      "parsed_from_id": {
+        "area": "A",
+        "block": "M",
+        "variable": "SPIND_ASSIGN_TO_MACHAX",
+        "entry": "nc_variable"
+      },
+      "match_basis": "M1:golden_ref(area/block/variable/entry)",
+      "verdict": "mapped",
+      "matched_variable_ids": [
+        "axis.spindle_assignment"
+      ],
+      "matched_definition_meta": [
+        {
+          "variable_id": "axis.spindle_assignment",
+          "revision": 1,
+          "scope": "identity",
+          "semantics_status": "verified",
+          "golden_ref_entries": [
+            "nc_variable"
+          ]
+        }
+      ],
+      "field_consistency": [
+        {
+          "variable_id": "axis.spindle_assignment",
+          "module_kind": "fixed",
+          "module_expected": 26,
+          "module_preset": 26,
+          "module_ok": true,
+          "column_def": 35000,
+          "column_preset": 35000,
+          "column_ok": true,
+          "decode_def": "U8",
+          "decode_preset": "U8",
+          "decode_ok": true,
+          "transport_def": 9,
+          "transport_preset": "0x09",
+          "transport_ok": true,
+          "count_def": 1,
+          "count_preset": 1,
+          "count_ok": true,
+          "unit_mode_def": "current",
+          "unit_mode_preset": "current",
+          "unit_mode_ok": true
+        }
+      ],
+      "addr_only_candidates": [
+        "axis.spindle_assignment"
+      ],
+      "addr_weak_candidates": []
+    }
+  ]
+}
