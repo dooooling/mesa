@@ -15,7 +15,6 @@
     "conclusion": "仓库内（含 git 跟踪与工作区）未找到任何 PDF 文件；本清单三条记录一律 file_present=false",
     "expected_path_policy": "PDF 存放路径尚未确定（仓库内无既有 PDF 目录约定），故 expected_path 一律为 null，不擅自指定目录"
   },
-
   "documents": [
     {
       "id": "828d-sysvar-lists-0723",
@@ -26,7 +25,7 @@
       "language": "zh-CHS",
       "file_present": false,
       "sha256": null,
-      "expected_path": null,
+      "expected_path": "docs/reference/manuals/828D_sysvar_lists_man_0723_zh-CHS.pdf",
       "status": "pending_file",
       "scope": {
         "summary": "828D 系统变量清单（NC 系统变量/变量列表类手册）",
@@ -47,8 +46,10 @@
       "planned_use": "PDF 到位后：为 r1.json 中 kind=manual 且 reference 指向 828D NC 变量的 16 条定义补 document_id/section/page（当前 42/42 条均无结构化章节页码）",
       "notes": [
         "文档号沿用用户提供值，未与任何在线目录核对（离线环境，不联网）",
-        "文件名带 _man_ 与 _0723_，仅表文件名自述版本，未验证"
-      ]
+        "文件名带 _man_ 与 _0723_，仅表文件名自述版本，未验证",
+        "PDF 保留在本地工作区，不提交 Git（避免未经许可重新分发西门子文档）；仅提交清单、SHA-256 与来源审计结果。"
+      ],
+      "committed_to_git": false
     },
     {
       "id": "828d-md-lists-0723",
@@ -59,7 +60,7 @@
       "language": "zh-CHS",
       "file_present": false,
       "sha256": null,
-      "expected_path": null,
+      "expected_path": "docs/reference/manuals/828D_md_lists_man_0723_zh-CHS.pdf",
       "status": "pending_file",
       "scope": {
         "summary": "828D 机床数据（MD）清单（机床数据列表类手册）",
@@ -80,8 +81,10 @@
       "planned_use": "PDF 到位后：为身份探针里引用的机床数据编号（MD10000/MD30110/MD30130/MD30220/MD35000/MD20070 语义）补章节页码证据；当前这些编号的文档出处一律未找到",
       "notes": [
         "文档号沿用用户提供值，未与任何在线目录核对（离线环境，不联网）",
-        "该文档可能不覆盖 SINAMICS 驱动参数（r*/p*），覆盖范围待核实"
-      ]
+        "该文档可能不覆盖 SINAMICS 驱动参数（r*/p*），覆盖范围待核实",
+        "PDF 保留在本地工作区，不提交 Git（避免未经许可重新分发西门子文档）；仅提交清单、SHA-256 与来源审计结果。"
+      ],
+      "committed_to_git": false
     },
     {
       "id": "sinamics-s120-para-lists-0723",
@@ -92,7 +95,7 @@
       "language": "zh-CHS",
       "file_present": false,
       "sha256": null,
-      "expected_path": null,
+      "expected_path": "docs/reference/manuals/828D_S120_para_lists_man_0723_zh-CHS.pdf",
       "status": "pending_file",
       "scope": {
         "summary": "SINAMICS S120 参数列表（驱动参数号 r*/p* 清单类手册，文件名前缀为 828D 随附资料）",
@@ -115,11 +118,12 @@
       "planned_use": "PDF 到位后：为 drive.* 的 20 条参数定义补章节页码，并核实 r0035 的无效值标记页与 invalid_rule(-200.0 ± 0.001) 的工程含义",
       "notes": [
         "文档号沿用用户提供值，未与任何在线目录核对（离线环境，不联网）",
-        "文档号前缀 A5E5 与 828D 的 6FC5 前缀不同，系列判定按任务提供值记为 SINAMICS S120"
-      ]
+        "文档号前缀 A5E5 与 828D 的 6FC5 前缀不同，系列判定按任务提供值记为 SINAMICS S120",
+        "PDF 保留在本地工作区，不提交 Git（避免未经许可重新分发西门子文档）；仅提交清单、SHA-256 与来源审计结果。"
+      ],
+      "committed_to_git": false
     }
   ],
-
   "known_version_divergence": {
     "severity": "high",
     "statement": "r1.json 的 manual 来源版本与用户提供的三份 PDF 版本**不等同**；不得把 07/2023 追认成现有定义的来源。",
@@ -169,7 +173,6 @@
       "禁止仅凭文件名断言 PDF 内容（例如断言 sysvar_lists 一定包含 C/S/progStatus）"
     ]
   },
-
   "coverage_status": {
     "definitions_with_structured_document_ref": 0,
     "definitions_total": 42,
@@ -177,7 +180,6 @@
     "definitions_without_manual_source": 7,
     "note": "42/42 条定义的 source 条目只有 kind/reference/note 三个键，无 document_id/section/page；详见 docs/reference/828d-definition-source-audit.md §2.7"
   },
-
   "completion_gate": {
     "status": "pending_file",
     "unblocked_when": [
