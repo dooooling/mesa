@@ -87,7 +87,7 @@ import {
   evaluateNckPointIdentity,
   type NckDefinitionLike,
 } from "../nckPointModel";
-import { createNckBrowseLeafPolicy } from "../nckBrowsePolicy";
+import { createNckSemanticHandler } from "../nckBrowseSemantic";
 import {
   nativeAddressParameters,
   validateNativeFields,
@@ -2567,13 +2567,9 @@ export function EndpointAcquisitionPane({
                   <ResourceBrowseAntd
                     endpointId={endpointId}
                     onFill={() => message.warning("请选用语义点位（旧资源入口在 NCK 上已被禁用）")}
-                    // 语义判定由 NCK 策略注入：通用 Browse 组件不认识 scope/family/kind。
-                    leafPolicy={createNckBrowseLeafPolicy({
-                      definitions: definitionList,
-                      endpointFamily,
-                      catalogFamily,
-                    })}
-                    onLeafSelect={(sel) => {
+                    // 语义载荷解析由 NCK 处理器注入；可选性/阻断原因由驱动给出（IPC 1.8）。
+                    semanticHandler={createNckSemanticHandler()}
+                    onSemanticSelect={(sel) => {
                       setBrowsePreset({
                         kind: sel.pointKind,
                         point_key: "",

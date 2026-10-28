@@ -861,6 +861,52 @@ struct BrowseReq {
     limit: Option<u32>,
 }
 
+/// Browse 节点 → REST JSON（**语义中立**的纯透传层）。
+///
+/// 语义中立是硬约束（AGENTS.md「Core 不懂协议」）：本函数只做字段搬运，不解释、
+/// 不补齐、不过滤。IPC 1.8 的选择契约三字段同样如此：
+///
+/// - `selection_mode` 原样给**数值**（`0` = 旧驱动未声明）：Core 不把它映射成
+///   字符串、不判断「可不可选」，也不因为它是 0 就补默认值——那是驱动与消费端
+///   的事；
+/// - `selection_payload_json` 是驱动私有 JSON：Core 不解析、不校验、不裁剪
+///   （载荷畸形必须由消费端 fail-closed）；
+/// - `diagnostics[].code` 是驱动自定义稳定码：Core 不维护码表、不改写文案。
+///
+/// 旧驱动（IPC < 1.8）不填这三项 ⇒ JSON 里就是 `0` / `""` / `[]`，与 1.7 的
+/// 语义完全等价（消费端据此走既有通用规则），因此**普通资源浏览不受影响**。
+///
+/// 这里出现任何品牌/协议字面量都属架构错误——这是契约测试要拦的事。
+fn browse_nodes_json(nodes: Vec<mesa_driver_protocol::pb::BrowseNode>) -> Vec<serde_json::Value> {
+    nodes
+        .into_iter()
+        .map(|n| {
+            serde_json::json!({
+                "id": n.id,
+                "label": n.label,
+                "kind": n.kind,
+                "data_type": n.data_type,
+                "access": n.access,
+                "has_children": n.has_children,
+                "binding_json": n.binding_json,
+                "selection_mode": n.selection_mode,
+                "selection_payload_json": n.selection_payload_json,
+                "diagnostics": n
+                    .diagnostics
+                    .into_iter()
+                    .map(|d| {
+                        serde_json::json!({
+                            "code": d.code,
+                            "message": d.message,
+                            "severity": d.severity,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
 async fn browse_endpoint(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -902,20 +948,7 @@ async fn browse_endpoint(
         .await
     {
         Ok((nodes, next)) => {
-            let nodes_json: Vec<serde_json::Value> = nodes
-                .into_iter()
-                .map(|n| {
-                    serde_json::json!({
-                        "id": n.id,
-                        "label": n.label,
-                        "kind": n.kind,
-                        "data_type": n.data_type,
-                        "access": n.access,
-                        "has_children": n.has_children,
-                        "binding_json": n.binding_json,
-                    })
-                })
-                .collect();
+            let nodes_json = browse_nodes_json(nodes);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "nodes": nodes_json, "next_cursor": next })),
@@ -3729,4 +3762,87 @@ pub async fn serve_snapshot(
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
+}
+
+#[cfg(test)]
+mod browse_json_tests {
+    use super::*;
+    use mesa_driver_protocol::pb::{
+        BrowseDiagnosticSeverity, BrowseNode, BrowseSelectionDiagnostic,
+    };
+
+    /// 旧驱动（IPC < 1.8）不填选择契约 ⇒ JSON 三字段必须是 `0`/`""`/`[]`，
+    /// 其余 7 字段逐字不变。这是「新 Core + 旧驱动行为不变」的机械判据：
+    /// 消费端拿到 `selection_mode = 0` 只会走既有通用规则，不会误判成"不可选"。
+    #[test]
+    fn legacy_node_passes_through_with_unspecified_selection_mode() {
+        let json = browse_nodes_json(vec![BrowseNode {
+            id: "nsu=urn:mesa:fake:1;i=1".into(),
+            label: "Counter".into(),
+            kind: "node".into(),
+            data_type: "STRING".into(),
+            access: "read".into(),
+            has_children: true,
+            binding_json: r#"{"node_id":"nsu=urn:mesa:fake:1;i=1"}"#.into(),
+            ..Default::default()
+        }]);
+        assert_eq!(json.len(), 1);
+        let n = &json[0];
+        assert_eq!(n["selection_mode"], 0);
+        assert_eq!(n["selection_payload_json"], "");
+        assert_eq!(n["diagnostics"], serde_json::json!([]));
+        // 既有 7 字段逐字透传
+        assert_eq!(n["id"], "nsu=urn:mesa:fake:1;i=1");
+        assert_eq!(n["kind"], "node");
+        assert_eq!(n["has_children"], true);
+        assert_eq!(
+            n["binding_json"],
+            r#"{"node_id":"nsu=urn:mesa:fake:1;i=1"}"#
+        );
+    }
+
+    /// 新驱动填了选择契约 ⇒ 原样透传，**Core 不改写任何内容**：
+    /// 未知模式值（未来驱动）也必须原值到达消费端，由消费端 fail-closed。
+    #[test]
+    fn selection_contract_passes_through_verbatim() {
+        let payload = r#"{"kind":"vendor_payload","parameters":{"x":1}}"#;
+        let json = browse_nodes_json(vec![BrowseNode {
+            id: "v://leaf".into(),
+            selection_mode: 99, // 未来驱动的未知模式
+            selection_payload_json: payload.into(),
+            diagnostics: vec![BrowseSelectionDiagnostic {
+                code: "VENDOR_CODE".into(),
+                message: "为什么不可选（驱动文案）".into(),
+                severity: BrowseDiagnosticSeverity::Error as i32,
+            }],
+            ..Default::default()
+        }]);
+        let n = &json[0];
+        assert_eq!(
+            n["selection_mode"], 99,
+            "未知模式必须原值透传，不得被 Core 归一化"
+        );
+        assert_eq!(n["selection_payload_json"], payload);
+        assert_eq!(n["diagnostics"][0]["code"], "VENDOR_CODE");
+        assert_eq!(n["diagnostics"][0]["message"], "为什么不可选（驱动文案）");
+        assert_eq!(n["diagnostics"][0]["severity"], 3);
+    }
+
+    /// 三字段之外的既有字段语义不得被顺手"增强"（例如把空 payload 换成
+    /// binding_json）——那会让 Core 变成第二真值来源。
+    ///
+    /// 说明：**品牌字面量扫描**放在合同测试里（`discovery_contract.rs`）对本文件
+    /// 做源码级断言；此处不做，因为断言文本自身含被扫的词，会自证失败。
+    #[test]
+    fn empty_payload_is_not_backfilled_from_binding_json() {
+        let json = browse_nodes_json(vec![BrowseNode {
+            id: "x".into(),
+            kind: "folder".into(),
+            has_children: true,
+            binding_json: r#"{"resource_id":"variable"}"#.into(),
+            ..Default::default()
+        }]);
+        assert_eq!(json[0]["selection_payload_json"], "");
+        assert_eq!(json[0]["selection_mode"], 0);
+    }
 }

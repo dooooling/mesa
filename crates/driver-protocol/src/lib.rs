@@ -21,18 +21,20 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// IPC 协议版本。Major 不兼容直接拒绝握手；Minor 取双方较小值。
 /// V1.2.1 新增 PointValue.value_origin（§5.5），Minor 1 保证新 Driver 的 typed BAD 语义可被新 Core 理解，旧端仍按 UNSPECIFIED 兼容解释
 pub const PROTOCOL_MAJOR: u32 = 1;
-/// Minor 7（I-2）：定义目录 + 权威身份预览两条只读管理 RPC
-///（tag 45–48：`GetDefinitions`/`DefinitionsReport`/`PreviewPointKey`/
-/// `PreviewIdentityReport`）。
+/// Minor 8（Browse 选择契约）：`BrowseNode` 增加 `selection_mode`(8) /
+/// `selection_payload_json`(9) / `diagnostics`(10)，并新增
+/// `BrowseSelectionMode` / `BrowseDiagnosticSeverity` / `BrowseSelectionDiagnostic`。
 ///
-/// 纯 additive：既有 35 个 `oneof body` 成员（tag 10–44）与全部既有 message
-/// 字段编号/类型逐字不动，`PROTOCOL_MAJOR` 仍为 1。旧端（Minor 6）不识别这
-/// 两对消息，因此**发送方必须先门控再发帧**（见
-/// [`DEFINITIONS_RPC_MIN_MINOR`]），不得发帧干等 timeout。
+/// 纯 additive：既有 39 个 `oneof body` 成员（tag 10–48）与全部既有 message
+/// 字段编号/类型逐字不动，`PROTOCOL_MAJOR` 仍为 1。旧端（Minor 7）读到新增
+/// 字段会**忽略**（protobuf 前向兼容），因此无需发送前门控：新增字段只在
+/// 响应方向出现，没有新增请求消息。旧驱动不填新字段 ⇒ `selection_mode = 0`
+///（UNSPECIFIED），消费方按 1.7 的既有行为处理。
 ///
-/// 历史（供协商排障）：Minor 6 = Foundation-3 structured WriteTarget 三元组；
+/// 历史（供协商排障）：Minor 7 = I-2 定义目录 / 权威身份预览；
+/// Minor 6 = Foundation-3 structured WriteTarget 三元组；
 /// Minor 5 = TaskSchedule 四字段；Minor 3 = Event Plane；Minor 2 = Probe RPC。
-pub const PROTOCOL_MINOR: u32 = 7;
+pub const PROTOCOL_MINOR: u32 = 8;
 
 /// Dynamic Probe RPC 可用的最低协商 Minor（§8）。协商 Minor < 2 的旧 Driver
 /// 不识别 ProbeRequest（会静默忽略），Core 必须直接返回 Unsupported，
@@ -75,8 +77,115 @@ pub fn definitions_query_supported(negotiated_minor: u32) -> bool {
     negotiated_minor >= DEFINITIONS_RPC_MIN_MINOR
 }
 
+/// Browse 选择契约（`BrowseNode.selection_mode` / `selection_payload_json` /
+/// `diagnostics`）引入的最小协商 Minor（IPC 1.8）。
+///
+/// 与 [`DEFINITIONS_RPC_MIN_MINOR`] 的**关键差别**：I-2 那两对是**请求**消息，
+/// 旧端不识别就静默忽略 ⇒ 发送方必须先门控再发帧；本契约只出现在**响应**
+/// 字段里，protobuf 前向兼容保证旧端会忽略未知字段，因此**没有**「必须先
+/// 门控」的调用点。
+///
+/// 保留常量与纯函数的原因：给「谁需要判断对端会不会填这些字段」的地方一个
+/// 唯一真值锚点（当前是契约测试与排障；Core 的 REST 透传不依赖它——它对
+/// `selection_mode = 0` 与旧驱动一视同仁）。
+pub const BROWSE_SELECTION_MIN_MINOR: u32 = 8;
+
+/// 选择契约是否可用（**纯函数**，与 [`definitions_query_supported`] 同族语义）。
+pub fn browse_selection_supported(negotiated_minor: u32) -> bool {
+    negotiated_minor >= BROWSE_SELECTION_MIN_MINOR
+}
+
 /// 单帧上限。防止恶意/异常长度前缀导致无界分配（有界原则在 IPC 层的体现）。
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
+
+/// Browse 选择契约（IPC 1.8）的**构造器**。
+///
+/// 为什么放在 `driver-protocol`：这三个字段是 Mesa 的 wire 契约，与任何厂商都
+/// 无关。构造器集中在这里，驱动只需回答「这个节点是哪一种」以及「理由是什么」，
+/// 不必各自手写 `i32` 枚举值与诊断元组——那正是字段语义漂移的入口。
+///
+/// 纪律：
+/// - **模式与诊断必须同源产生**（见 [`Selection`]）：不允许出现「声明可选但
+///   没有载荷」或「声明不可选却没给理由」的组合；
+/// - 提示级诊断（INFO/WARNING）**永不**改变可选性——可选性只有 `mode` 说了算；
+/// - 本轮只提供 4 种真实形态的构造器（未声明 / 不可选 / 语义 / 资源），
+///   没有 `unspecified()`：旧驱动不填就是「不填」，不需要构造器帮忙。
+pub mod browse_selection {
+    use crate::pb::{BrowseDiagnosticSeverity, BrowseSelectionDiagnostic, BrowseSelectionMode};
+
+    /// 选择契约三字段的构造结果（与 `BrowseNode` 的 8/9/10 号字段一一对应）。
+    ///
+    /// 驱动侧**逐字段显式赋值**而不是 `..Default::default()`：协议新增字段时，
+    /// 编译错误会逼着调用点重新表态，而不是悄悄沿用零值。
+    pub struct Selection {
+        pub mode: BrowseSelectionMode,
+        pub payload_json: String,
+        pub diagnostics: Vec<BrowseSelectionDiagnostic>,
+    }
+
+    /// 构造一条诊断（`severity` 用 proto 枚举，避免各处手写数字）。
+    pub fn diagnostic(
+        code: &str,
+        message: impl Into<String>,
+        severity: BrowseDiagnosticSeverity,
+    ) -> BrowseSelectionDiagnostic {
+        BrowseSelectionDiagnostic {
+            code: code.to_string(),
+            message: message.into(),
+            severity: severity as i32,
+        }
+    }
+
+    /// 分支 / 诊断节点：**明确不可选**，且不需要额外理由。
+    ///
+    /// 为什么不用 `UNSPECIFIED`：这两类节点永远不该被选用。由驱动把这件事说
+    /// 清楚，消费端就不必靠 `has_children` / 空 `binding_json` 之类的形态去猜。
+    /// 空诊断 = 「无理由的不可选」，用户面不应出现红色阻断块。
+    pub fn not_selectable() -> Selection {
+        Selection {
+            mode: BrowseSelectionMode::NotSelectable,
+            payload_json: String::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// 被准入规则拒绝的叶：不可选，且必须给出**稳定码 + 可读文案**。
+    ///
+    /// `payload_json` 保留（通常与 `binding_json` 同内容）：旧客户端仍按旧形态
+    /// 消费；新客户端只认 `NOT_SELECTABLE` + 诊断，载荷不构成可选许可。
+    pub fn rejected(
+        payload_json: impl Into<String>,
+        code: &str,
+        message: impl Into<String>,
+    ) -> Selection {
+        Selection {
+            mode: BrowseSelectionMode::NotSelectable,
+            payload_json: payload_json.into(),
+            diagnostics: vec![diagnostic(code, message, BrowseDiagnosticSeverity::Error)],
+        }
+    }
+
+    /// 可选用的语义叶：载荷只对该驱动自己的语义层有意义，Core 与通用 UI 不解释。
+    pub fn semantic(
+        payload_json: impl Into<String>,
+        diagnostics: Vec<BrowseSelectionDiagnostic>,
+    ) -> Selection {
+        Selection {
+            mode: BrowseSelectionMode::Semantic,
+            payload_json: payload_json.into(),
+            diagnostics,
+        }
+    }
+
+    /// 可选用的通用资源叶：载荷是 Mesa 通用资源选择（`resource_id` + `parameters`）。
+    pub fn resource(payload_json: impl Into<String>) -> Selection {
+        Selection {
+            mode: BrowseSelectionMode::Resource,
+            payload_json: payload_json.into(),
+            diagnostics: Vec::new(),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -703,21 +812,49 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    /// 版本常量冻结（I-2 §7.2）：I-2 的 wire 增补是 **additive**，
-    /// 因此只允许 Minor +1，Major 必须仍为 1。
+    /// 版本常量冻结：wire 增补必须是 **additive**，因此只允许 Minor +1，
+    /// Major 必须仍为 1。
     /// 这条断言的作用不是"复述常量"，而是把「有人顺手把 Major 也改了」这种
     /// 破坏性变更挡在 CI：Major 变化会让所有旧驱动握手被拒。
     #[test]
-    fn protocol_major_frozen_at_1_and_minor_is_7() {
+    fn protocol_major_frozen_at_1_and_minor_is_8() {
         assert_eq!(
             PROTOCOL_MAJOR, 1,
             "PROTOCOL_MAJOR 必须保持 1（additive 增补）"
         );
-        assert_eq!(PROTOCOL_MINOR, 7, "I-2 的 wire 增补对应 Minor 7");
+        assert_eq!(PROTOCOL_MINOR, 8, "Browse 选择契约的 wire 增补对应 Minor 8");
         assert_eq!(
-            DEFINITIONS_RPC_MIN_MINOR, PROTOCOL_MINOR,
-            "I-2 RPC 的可用门槛必须等于引入它的 Minor，否则门控与常量会漂移"
+            DEFINITIONS_RPC_MIN_MINOR, 7,
+            "I-2 RPC 的可用门槛必须停在引入它的 Minor（不得随本次 bump 漂移）"
         );
+        assert_eq!(
+            BROWSE_SELECTION_MIN_MINOR, PROTOCOL_MINOR,
+            "选择契约的引入 Minor 必须等于当前 Minor，否则门控与常量会漂移"
+        );
+    }
+
+    /// V2 门控语义（纯函数）：协商 Minor < 8 的旧端不会填选择契约字段，
+    /// 必须判为「不支持」；既有 5 个 Minor 门（2/3/5/6/7）语义不变。
+    #[test]
+    fn browse_selection_gate_requires_minor_8() {
+        for minor in 0..BROWSE_SELECTION_MIN_MINOR {
+            assert!(
+                !browse_selection_supported(minor),
+                "negotiated_minor={minor} 必须被门控判为不支持选择契约"
+            );
+        }
+        for minor in BROWSE_SELECTION_MIN_MINOR..=BROWSE_SELECTION_MIN_MINOR + 3 {
+            assert!(
+                browse_selection_supported(minor),
+                "negotiated_minor={minor} 必须放行"
+            );
+        }
+        // 既有门控常量未被本次增补改动（各自引入的 Minor 不变）
+        assert_eq!(PROBE_RPC_MIN_MINOR, 2);
+        assert_eq!(EVENT_PLANE_MIN_MINOR, 3);
+        assert_eq!(TASK_SCHEDULE_MIN_MINOR, 5);
+        assert_eq!(CONTROL_MODEL_MIN_MINOR, 6);
+        assert_eq!(DEFINITIONS_RPC_MIN_MINOR, 7);
     }
 
     /// V2 门控语义（纯函数）：协商 Minor < 7 的旧端不识别 tag 45–48，
@@ -744,24 +881,34 @@ mod tests {
     }
 
     /// 协商取较小值（`negotiate` 逐字未变）：新 Core ↔ 旧驱动 / 旧 Core ↔
-    /// 新驱动两种组合都必须降到 6，且门控据此关闭 ⇒ 降级是静默且安全的。
+    /// 新驱动两种组合都必须降到 7，且 I-2 门控据此关闭 ⇒ 降级是静默且安全的。
+    ///
+    /// 同时覆盖 Browse 选择契约：协商降到 7 时 `browse_selection_supported`
+    /// 必须为 false（旧驱动不会填 tag 8/9/10），而响应字段本身是 additive，
+    /// 因此**不需要**像 I-2 那样在发送前门控。
     #[test]
     fn negotiate_min_keeps_definitions_gate_closed_across_versions() {
         let core = (PROTOCOL_MAJOR, PROTOCOL_MINOR);
-        // 新 Core ↔ 新驱动：7，门控放行
+        // 新 Core ↔ 新驱动：8，两道门控都放行
         let (maj, minor) = negotiate(core, (PROTOCOL_MAJOR, PROTOCOL_MINOR)).unwrap();
         assert_eq!(maj, PROTOCOL_MAJOR);
-        assert_eq!(minor, 7);
+        assert_eq!(minor, 8);
         assert!(definitions_query_supported(minor));
-        // 新 Core ↔ 旧驱动二进制（Minor 6）：协商 6，门控关闭
+        assert!(browse_selection_supported(minor));
+        // 新 Core ↔ 旧驱动二进制（Minor 6）：协商 6，两道门控都关闭
         let (_, minor) = negotiate((PROTOCOL_MAJOR, 6), core).unwrap();
         assert_eq!(minor, 6);
         assert!(!definitions_query_supported(minor));
-        // 旧 Core（Minor 6）↔ 新驱动二进制：同样协商 6（旧 Core 根本不知道
-        // tag 45–48，因此永不发新帧；新驱动继续在旧消息集上工作）
-        let (_, minor) = negotiate(core, (PROTOCOL_MAJOR, 6)).unwrap();
-        assert_eq!(minor, 6);
-        assert!(!definitions_query_supported(minor));
+        assert!(!browse_selection_supported(minor));
+        // 旧 Core（Minor 7）↔ 新驱动二进制：协商 7（旧 Core 不认识 tag 45–48
+        // 之外的任何新东西；选择契约是响应字段，旧 Core 直接忽略）
+        let (_, minor) = negotiate(core, (PROTOCOL_MAJOR, 7)).unwrap();
+        assert_eq!(minor, 7);
+        assert!(definitions_query_supported(minor));
+        assert!(
+            !browse_selection_supported(minor),
+            "旧 Core 协商到 7 时不具备选择契约（字段会被忽略）"
+        );
     }
 
     /// 新增 4 个消息的编解码往返：`GetDefinitions.request_json` 必须原样往返
@@ -855,6 +1002,127 @@ mod tests {
             }
             other => panic!("expected PreviewIdentityReport, got {other:?}"),
         }
+    }
+
+    /// 选择契约构造器：模式与诊断必须同源自洽。
+    ///
+    /// 断言口径是「不允许出现自相矛盾的组合」：分支节点没有理由、被拒绝必有
+    /// ERROR 级理由、可选叶的诊断不会把可选性拉成 false。
+    #[test]
+    fn browse_selection_builders_stay_consistent() {
+        use crate::browse_selection as sel;
+
+        let f = sel::not_selectable();
+        assert_eq!(f.mode, pb::BrowseSelectionMode::NotSelectable);
+        assert!(f.payload_json.is_empty());
+        assert!(
+            f.diagnostics.is_empty(),
+            "分支/诊断节点不应产生红色阻断理由"
+        );
+
+        let r = sel::rejected(r#"{"kind":"x"}"#, "SOME_CODE", "为什么不可选");
+        assert_eq!(r.mode, pb::BrowseSelectionMode::NotSelectable);
+        assert_eq!(r.payload_json, r#"{"kind":"x"}"#);
+        assert_eq!(r.diagnostics.len(), 1);
+        assert_eq!(r.diagnostics[0].code, "SOME_CODE");
+        assert_eq!(r.diagnostics[0].message, "为什么不可选");
+        assert_eq!(
+            r.diagnostics[0].severity,
+            pb::BrowseDiagnosticSeverity::Error as i32,
+            "拒绝理由必须是 ERROR 级，否则前端不会渲染成阻断"
+        );
+
+        let s = sel::semantic(
+            "{}",
+            vec![sel::diagnostic(
+                "IDENTITY_UNRESOLVED",
+                "身份未确定",
+                pb::BrowseDiagnosticSeverity::Warning,
+            )],
+        );
+        assert_eq!(s.mode, pb::BrowseSelectionMode::Semantic);
+        assert_eq!(
+            s.diagnostics[0].severity,
+            pb::BrowseDiagnosticSeverity::Warning as i32
+        );
+
+        let g = sel::resource(r#"{"resource_id":"node","parameters":{}}"#);
+        assert_eq!(g.mode, pb::BrowseSelectionMode::Resource);
+        assert!(g.diagnostics.is_empty());
+        // 这条断言防「诊断悄悄改写可选性」：模式仍是调用方选择的那一个。
+        assert_ne!(g.mode, pb::BrowseSelectionMode::NotSelectable);
+    }
+
+    /// Browse 选择契约的 **wire 兼容**（IPC 1.8 additive 的核心保证）。
+    ///
+    /// ① 旧驱动（Minor 7）不填 tag 8/9/10 ⇒ 解码后 `selection_mode = 0`、
+    ///    载荷为空串、诊断为空：普通资源浏览必须继续按 1.7 的行为工作，
+    ///    因此消费方**不得**把 0 当成「不可选」。
+    /// ② 新驱动填了字段 ⇒ 逐字往返（含中文文案与多条诊断）。
+    /// ③ 未来驱动给出未知枚举值（如 99）⇒ 解码**不得报错**，原值保留；
+    ///    消费方据此 fail-closed（`try_from` 失败即阻断），而不是 panic。
+    #[test]
+    fn browse_selection_fields_are_additive_and_forward_compatible() {
+        // ① 旧驱动的字节形态：只有 tag 1–7（默认值不编码，与 1.7 完全一致）
+        let legacy = pb::BrowseNode {
+            id: "nsu=urn:mesa:fake:1;i=1".into(),
+            label: "Counter".into(),
+            kind: "node".into(),
+            data_type: "STRING".into(),
+            access: "read".into(),
+            has_children: true,
+            binding_json: r#"{"node_id":"nsu=urn:mesa:fake:1;i=1"}"#.into(),
+            ..Default::default()
+        };
+        let bytes = legacy.encode_to_vec();
+        let back = pb::BrowseNode::decode(bytes.as_slice()).unwrap();
+        assert_eq!(back.selection_mode, 0, "旧驱动不填 ⇒ UNSPECIFIED(0)");
+        assert_eq!(back.selection_payload_json, "", "旧驱动不填 ⇒ 空载荷");
+        assert!(back.diagnostics.is_empty(), "旧驱动不填 ⇒ 无诊断");
+        assert_eq!(
+            back.binding_json, legacy.binding_json,
+            "既有 7 字段语义逐字不变"
+        );
+
+        // ② 新驱动的字节形态：三条新字段逐字往返
+        let modern = pb::BrowseNode {
+            id: "nck://presets/x".into(),
+            kind: "nck_variable".into(),
+            selection_mode: pb::BrowseSelectionMode::Semantic as i32,
+            selection_payload_json: r#"{"kind":"nck_variable","parameters":{"variable_id":"a.b"}}"#
+                .into(),
+            diagnostics: vec![pb::BrowseSelectionDiagnostic {
+                code: "NCK_PREVIEW_POINT_KEY".into(),
+                message: "Browse 预览：a.b@channel=i:1（仅展示）".into(),
+                severity: pb::BrowseDiagnosticSeverity::Info as i32,
+            }],
+            ..Default::default()
+        };
+        let back = pb::BrowseNode::decode(modern.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(back.selection_mode, 2);
+        assert_eq!(back.selection_payload_json, modern.selection_payload_json);
+        assert_eq!(back.diagnostics.len(), 1);
+        assert_eq!(back.diagnostics[0].code, "NCK_PREVIEW_POINT_KEY");
+        assert_eq!(
+            back.diagnostics[0].message,
+            "Browse 预览：a.b@channel=i:1（仅展示）"
+        );
+
+        // ③ 未知枚举值：解码保留原值，`try_from` 失败 ⇒ 消费侧 fail-closed
+        let unknown = pb::BrowseNode {
+            id: "future://x".into(),
+            selection_mode: 99,
+            ..Default::default()
+        };
+        let back = pb::BrowseNode::decode(unknown.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(
+            back.selection_mode, 99,
+            "未知模式必须原值保留，不得被吞成 0"
+        );
+        assert!(
+            pb::BrowseSelectionMode::try_from(back.selection_mode).is_err(),
+            "未知模式必须让 try_from 失败，消费方据此明确阻断"
+        );
     }
 
     /// P1 invariant：in-tree driver.toml 的 protocol_minor 必须与

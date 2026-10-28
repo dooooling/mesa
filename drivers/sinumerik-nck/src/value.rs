@@ -341,6 +341,108 @@ mod tests {
         assert!(decode_value(&[0; 31], NckDataKind::Utf8NulLast32).is_err());
     }
 
+    /// 32 / 66 字节文本投影的**边界与异常值**（actBlock = `UTF8_NUL_FIRST_66`，
+    /// progName = `UTF8_NUL_LAST_32`；长度依据见
+    /// `docs/reference/nck-source-evidence-stage4.md` §2，**手册未写长度**）。
+    ///
+    /// 三条语义差异（本测试同时把它们钉住，避免以后被“统一”掉）：
+    /// 1. `UTF8_NUL_FIRST_66` 取**第一个非空段**（跳过前置 NUL/空格填充）；
+    /// 2. `UTF8_NUL_LAST_32` 取**最后一个非空段**（跳过后置 NUL/空格填充）；
+    /// 3. `UTF8_FIXED_16` / `UTF16_BE` 取**字面第一段**（不跳填充、不 trim 空格）。
+    ///
+    /// 长度口径：`decode_value` 只拒绝 `len < 32/66`（`ShortData`），
+    /// **不截断超长输入**——超长的实际拦截点在 `lib.rs::decode_point`
+    /// （`bytes.len() != spec.expected_len` ⇒ 该点 BAD）。两处行为本测试都断言，
+    /// 以免有人误以为解码层会“自动截断到 66”。
+    #[test]
+    fn nul_text_projection_boundaries_at_32_and_66() {
+        // --- 正好 32 字节：无 NUL ⇒ 整块就是唯一段 ---
+        let exact32 = vec![b'A'; 32];
+        assert_eq!(
+            decode_value(&exact32, NckDataKind::Utf8NulLast32).unwrap(),
+            Value::String("A".repeat(32))
+        );
+        // --- 正好 66 字节：同理 ---
+        let exact66 = vec![b'B'; 66];
+        assert_eq!(
+            decode_value(&exact66, NckDataKind::Utf8NulFirst66).unwrap(),
+            Value::String("B".repeat(66))
+        );
+
+        // --- 短一字节即 fail-closed（不补齐、不按 0 填充） ---
+        assert!(decode_value(&[b'A'; 31], NckDataKind::Utf8NulLast32).is_err());
+        assert!(decode_value(&[b'A'; 65], NckDataKind::Utf8NulFirst66).is_err());
+
+        // --- 超长：解码层不截断（33 / 67 字节），由 decode_point 的 exact 校验拦截 ---
+        let mut over32 = vec![b'A'; 31];
+        over32.push(0);
+        over32.push(b'Z'); // 33 字节，末段 "Z"
+        assert_eq!(
+            decode_value(&over32, NckDataKind::Utf8NulLast32).unwrap(),
+            Value::String("Z".into()),
+            "NUL_LAST 取最后一个非空段，33 字节输入整体参与"
+        );
+        let mut over66 = vec![b'C'; 66];
+        over66.push(b'X');
+        assert_eq!(
+            decode_value(&over66, NckDataKind::Utf8NulFirst66).unwrap(),
+            Value::String(format!("{}X", "C".repeat(66))),
+            "解码层不按 66 截断；超长必须由调用方（decode_point）拒绝"
+        );
+
+        // --- 含 NUL：FIXST 取第一个非空段，LAST 取最后一个非空段 ---
+        let mut block = Vec::new();
+        block.extend_from_slice(b"N10 G0 X0\0");
+        block.resize(66, 0);
+        assert_eq!(
+            decode_value(&block, NckDataKind::Utf8NulFirst66).unwrap(),
+            Value::String("N10 G0 X0".into())
+        );
+        let mut path = Vec::new();
+        path.extend_from_slice(b"_N_MPF_DIR\0  WORK.MPF  \0");
+        path.resize(32, 0);
+        assert_eq!(
+            decode_value(&path, NckDataKind::Utf8NulLast32).unwrap(),
+            Value::String("WORK.MPF".into()),
+            "末段两侧空格被 trim；后置 NUL 填充被跳过"
+        );
+        // 前置 NUL 填充（FIRST 的典型形态）跳过空段，不是“返回空串”。
+        let mut leading_nul = vec![0u8; 10];
+        leading_nul.extend_from_slice(b"ACT.BLK");
+        leading_nul.resize(66, 0);
+        assert_eq!(
+            decode_value(&leading_nul, NckDataKind::Utf8NulFirst66).unwrap(),
+            Value::String("ACT.BLK".into())
+        );
+
+        // --- 空串：全 NUL（32 与 66） ⇒ ""，不报错 ---
+        assert_eq!(
+            decode_value(&[0u8; 32], NckDataKind::Utf8NulLast32).unwrap(),
+            Value::String(String::new())
+        );
+        assert_eq!(
+            decode_value(&[0u8; 66], NckDataKind::Utf8NulFirst66).unwrap(),
+            Value::String(String::new())
+        );
+
+        // --- 多字节 UTF-8：恰好压到边界 → 正常；被边界切断 → 无效 UTF-8（fail-closed） ---
+        let mut exact_multibyte = vec![b'D'; 63];
+        exact_multibyte.extend_from_slice("中".as_bytes()); // 3 字节 ⇒ 合计 66
+        assert_eq!(
+            decode_value(&exact_multibyte, NckDataKind::Utf8NulFirst66).unwrap(),
+            Value::String(format!("{}中", "D".repeat(63)))
+        );
+        let mut truncated = vec![b'D'; 65];
+        truncated.push(0xE4); // "中" 的首字节，被 66 字节边界截断
+        assert!(
+            decode_value(&truncated, NckDataKind::Utf8NulFirst66).is_err(),
+            "跨边界被截断的多字节字符必须报错，不得替换成 U+FFFD"
+        );
+        let mut truncated32 = vec![b'E'; 31];
+        truncated32.push(0xE4);
+        assert!(decode_value(&truncated32, NckDataKind::Utf8NulLast32).is_err());
+    }
+
     #[test]
     fn decode_golden_values() {
         assert_eq!(

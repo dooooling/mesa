@@ -18,12 +18,16 @@
 //!
 //! 本模块不做：地址准入、设备探测、自动填充缺失必填项。
 
-use mesa_driver_protocol::pb::BrowseNode;
+use mesa_driver_protocol::browse_selection as wire_selection;
+use mesa_driver_protocol::pb::{BrowseDiagnosticSeverity, BrowseNode, BrowseSelectionDiagnostic};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::compiler::POINT_KIND_VARIABLE;
-use crate::definition::{DefinitionCatalog, GoldenRef, NativeFieldSource, VariableDefinition};
+use crate::browse_selection as admission;
+use crate::compiler::{CompileError, POINT_KIND_VARIABLE};
+use crate::definition::{
+    DefinitionCatalog, DefinitionScope, GoldenRef, NativeFieldSource, VariableDefinition,
+};
 use crate::native::{NativeError, NativeNckAddress};
 use crate::targets::{DriveEntry, DriveObjectRef, TargetKind, TargetRef};
 
@@ -156,6 +160,13 @@ fn validate_template(t: &PresetTemplate) -> Result<(), String> {
         .map_err(|e: NativeError| e.to_string())
 }
 
+/// 语义载荷不可用时的标签注记（**文案逐字沿用** IPC 1.7 的既有口径）。
+const UNAVAILABLE_LABEL_NOTE: &str =
+    " · 语义载荷不可用（内嵌定义目录缺少该变量；仅可作原生高级配置）";
+
+/// 语义载荷不可用时的诊断文案（与前端历史展示文案保持一致）。
+const UNAVAILABLE_DIAGNOSTIC: &str = "语义载荷不可用（内嵌定义目录缺少该变量）：只能使用「高级原生配置」，不得走旧 variable 采集入口";
+
 /// 模板 → 浏览叶。
 ///
 /// **语义化（M4）**：叶的 `binding_json` 从原生信封
@@ -167,6 +178,11 @@ fn validate_template(t: &PresetTemplate) -> Result<(), String> {
 /// 但浏览叶是**载荷构造**层面——它把「已确认的原生实例」反推成用户要填的语义
 /// 坐标，从而让前端不必面对原生字段。`identity` **只出现在浏览/预填载荷**，
 /// **不得**进入持久化信封（信封是 `deny_unknown_fields` 的三字段结构）。
+///
+/// **IPC 1.8 选择契约**：`kind` / `label` / `binding_json` 与 1.7 逐字一致
+/// （旧客户端零影响）；可选性、载荷与诊断改由 additive 字段
+/// `selection_mode` / `selection_payload_json` / `diagnostics` 表达，
+/// 判定全部来自内嵌定义目录（见 [`crate::browse_selection`]）。
 pub fn leaf_node(t: &PresetTemplate) -> BrowseNode {
     leaf_node_with(t, &[])
 }
@@ -177,6 +193,15 @@ pub fn leaf_node(t: &PresetTemplate) -> BrowseNode {
 /// `target`/`arguments`，其余缺失项保持缺失（**不猜测、不给默认值**），
 /// 由通用必填校验阻止保存。
 pub fn leaf_node_with(t: &PresetTemplate, filled: &[(&str, Value)]) -> BrowseNode {
+    leaf_node_in(embedded_catalog(), t, filled)
+}
+
+/// 浏览叶装配（目录可注入：生产走内嵌目录，测试用内存目录验证准入分支）。
+fn leaf_node_in(
+    catalog: Option<&DefinitionCatalog>,
+    t: &PresetTemplate,
+    filled: &[(&str, Value)],
+) -> BrowseNode {
     let mut parameters = t.parameters.clone();
     let mut pending: Vec<&str> = t.required_user_inputs.iter().map(|s| s.as_str()).collect();
     for (key, value) in filled {
@@ -190,16 +215,33 @@ pub fn leaf_node_with(t: &PresetTemplate, filled: &[(&str, Value)]) -> BrowseNod
     };
     // 语义载荷优先；内嵌定义目录缺失该变量时退回原生信封并显式标注
     // （绝不把「找不到定义」伪装成语义可用）。
-    let (kind, binding, note) = match semantic_binding(t, &parameters) {
-        Some(binding) => (POINT_KIND_VARIABLE.to_string(), binding, String::new()),
-        None => (
+    let (kind, binding, note, selection) = match semantic_leaf(catalog, t, &parameters) {
+        SemanticLeaf::Selectable {
+            binding,
+            diagnostics,
+        } => (
+            POINT_KIND_VARIABLE.to_string(),
+            binding.clone(),
+            String::new(),
+            wire_selection::semantic(binding, diagnostics),
+        ),
+        // 目录命中但准入拒绝：载荷照旧给出（旧客户端按 1.7 形态消费），
+        // 可选性由 `NOT_SELECTABLE` + ERROR 诊断明确否认。
+        SemanticLeaf::Rejected { binding, err } => (
+            POINT_KIND_VARIABLE.to_string(),
+            binding.clone(),
+            String::new(),
+            admission::rejected(binding, &err),
+        ),
+        SemanticLeaf::Unavailable { binding, note } => (
             "variable".to_string(),
-            serde_json::json!({
-                "resource_id": "variable",
-                "parameters": parameters,
-            })
-            .to_string(),
-            " · 语义载荷不可用（内嵌定义目录缺少该变量；仅可作原生高级配置）".to_string(),
+            binding.clone(),
+            note,
+            wire_selection::rejected(
+                binding,
+                admission::CODE_SEMANTIC_PAYLOAD_UNAVAILABLE,
+                UNAVAILABLE_DIAGNOSTIC,
+            ),
         ),
     };
     BrowseNode {
@@ -210,6 +252,97 @@ pub fn leaf_node_with(t: &PresetTemplate, filled: &[(&str, Value)]) -> BrowseNod
         access: "read".into(),
         has_children: false,
         binding_json: binding,
+        selection_mode: selection.mode as i32,
+        selection_payload_json: selection.payload_json,
+        diagnostics: selection.diagnostics,
+    }
+}
+
+/// 单个浏览叶的语义构造结果。
+///
+/// 三种状态的差别就是「用户能不能选用」的全部真相，因此**不允许**出现
+/// 第四种（例如「有载荷但没说能不能选」）——那会把猜测重新推回前端。
+enum SemanticLeaf {
+    /// 定义命中且准入通过：可选用的语义叶（提示级诊断不改变可选性）。
+    Selectable {
+        binding: String,
+        diagnostics: Vec<BrowseSelectionDiagnostic>,
+    },
+    /// 定义命中但准入拒绝（family 不一致 / scope 不可采集）：不可选，理由在诊断里。
+    Rejected { binding: String, err: CompileError },
+    /// 连语义载荷都构造不出来（目录缺失 / 模板无对应定义）：不可选，退回原生信封。
+    Unavailable { binding: String, note: String },
+}
+
+/// 语义载荷的构造结果（含仅供展示的预览 Key）。
+struct SemanticBinding {
+    /// 语义信封 JSON（`kind` + `parameters` + `identity`）。
+    json: String,
+    /// 预览身份 Key；target/arguments 不完整时为 `None`（**不猜测**）。
+    preview_point_key: Option<String>,
+}
+
+/// 模板 → 语义叶（**含准入判定**）。
+///
+/// 判定顺序刻意固定：先问「载荷能不能构造」，再问「能不能采集」。
+/// 载荷构造失败时必须退回旧原生信封并显式标注（不能伪装成语义可用）；
+/// 准入失败时载荷照旧给出，只把可选性置否——两者对用户的意义完全不同。
+fn semantic_leaf(
+    catalog: Option<&DefinitionCatalog>,
+    t: &PresetTemplate,
+    native: &Map<String, Value>,
+) -> SemanticLeaf {
+    // ① 目录缺失 / 模板 id 无法映射 / 定义查不到 ⇒ 语义载荷不可用。
+    let Some((def, binding)) = semantic_payload(catalog, t, native) else {
+        return SemanticLeaf::Unavailable {
+            binding: legacy_variable_envelope(native),
+            note: UNAVAILABLE_LABEL_NOTE.to_string(),
+        };
+    };
+
+    // ② 准入判定（a）：定义 family 必须与本模板系列一致。
+    //    不跨系列套用定义——那会把别的机床系列的点位当成本系列可用。
+    if def.family != t.family {
+        return SemanticLeaf::Rejected {
+            binding: binding.json,
+            err: CompileError::UnsupportedFamily {
+                definition_family: def.family.clone(),
+                device_family: t.family.clone(),
+            },
+        };
+    }
+
+    // ③ 准入判定（b）：只有 `scope=collect` 才允许作为采集点位。
+    //    这里的判据与 Configure（`ensure_collectable_scope`）**同一份**定义数据，
+    //    理由是「能不能采集」是驱动事实，不该由每个前端各写一份白名单。
+    if def.scope != DefinitionScope::Collect {
+        return SemanticLeaf::Rejected {
+            binding: binding.json,
+            err: CompileError::DefinitionScopeNotCollectable {
+                variable_id: def.variable_id.clone(),
+                revision: def.revision,
+                scope: def.scope.as_str(),
+            },
+        };
+    }
+
+    // ④ 可选用：诊断只承载展示性提示（预览 Key / 身份未确定）。
+    //    提示级诊断**永不**改变可选性——可选性只由 `selection_mode` 说了算。
+    let diagnostics = vec![match &binding.preview_point_key {
+        Some(key) => wire_selection::diagnostic(
+            admission::CODE_IDENTITY_PREVIEW,
+            format!("Browse 预览：{key}（仅展示；提交前仍需服务端确认）"),
+            BrowseDiagnosticSeverity::Info,
+        ),
+        None => wire_selection::diagnostic(
+            admission::CODE_IDENTITY_UNRESOLVED,
+            "Browse 预览：身份未确定（target/arguments 不完整）——可选用后到语义表单补全，提交前必须由服务端 Preview 确认",
+            BrowseDiagnosticSeverity::Warning,
+        ),
+    }];
+    SemanticLeaf::Selectable {
+        binding: binding.json,
+        diagnostics,
     }
 }
 
@@ -219,6 +352,15 @@ fn embedded_catalog() -> Option<&'static DefinitionCatalog> {
     CATALOG
         .get_or_init(|| DefinitionCatalog::embedded().ok())
         .as_ref()
+}
+
+/// 旧 `variable` 原生信封（语义载荷不可用时的降级形态，A22 只允许提示，不得回填）。
+fn legacy_variable_envelope(native: &Map<String, Value>) -> String {
+    serde_json::json!({
+        "resource_id": "variable",
+        "parameters": native,
+    })
+    .to_string()
 }
 
 /// 模板 id 形态 `828d.<area>.<block>.<variable>.<entry>` → `GoldenRef` 四元组。
@@ -238,19 +380,22 @@ fn golden_ref_of_template(id: &str) -> Option<GoldenRef> {
     })
 }
 
-/// 语义信封 + `identity` 块（定义目录缺失时返回 `None`）。
-fn semantic_binding(t: &PresetTemplate, native: &Map<String, Value>) -> Option<String> {
-    let catalog = embedded_catalog()?;
+/// 语义信封 + `identity` 块（定义目录缺失 / 无对应定义时返回 `None`）。
+///
+/// 同时把命中的**定义**一并返回：准入判定（family / scope）必须基于同一份
+/// 定义，绝不允许「载荷按 A 定义构造、准入按 B 定义判断」。
+fn semantic_payload<'a>(
+    catalog: Option<&'a DefinitionCatalog>,
+    t: &PresetTemplate,
+    native: &Map<String, Value>,
+) -> Option<(&'a VariableDefinition, SemanticBinding)> {
+    let catalog = catalog?;
     let want = golden_ref_of_template(&t.id)?;
     let def = catalog.find_by_golden_ref(&want).first().copied()?;
     let (target, arguments) = prefill_from_native(def, native);
     // 只有 target/arguments 完整时才能给出预览 Key；否则显式 `null`
     // （**不猜测**缺失实例，也不物化可选默认值）。
-    let preview = def
-        .canonical_identity(&target, &arguments)
-        .ok()
-        .map(Value::from)
-        .unwrap_or(Value::Null);
+    let preview = def.canonical_identity(&target, &arguments).ok();
     let mut params = Map::new();
     params.insert("variable_id".into(), Value::from(def.variable_id.clone()));
     params.insert("definition_revision".into(), Value::from(def.revision));
@@ -264,14 +409,19 @@ fn semantic_binding(t: &PresetTemplate, native: &Map<String, Value>) -> Option<S
         "keys": def.identity_keys,
         "preview_point_key": preview,
     });
-    Some(
-        serde_json::json!({
-            "kind": POINT_KIND_VARIABLE,
-            "parameters": Value::Object(params),
-            "identity": identity,
-        })
-        .to_string(),
-    )
+    let json = serde_json::json!({
+        "kind": POINT_KIND_VARIABLE,
+        "parameters": Value::Object(params),
+        "identity": identity,
+    })
+    .to_string();
+    Some((
+        def,
+        SemanticBinding {
+            json,
+            preview_point_key: preview,
+        },
+    ))
 }
 
 /// 由「模板固定字段 + 已确认实例」反推语义 `target` / `arguments`。
@@ -328,7 +478,11 @@ fn prefill_from_native(
 }
 
 /// 目录节点（模板入口）。
+///
+/// IPC 1.8 起显式声明 `NOT_SELECTABLE`：分支节点永远不该被选用，由驱动把这件事
+/// 说清楚，前端不必再靠 `has_children` / 空信封之类的形态去猜。
 pub fn folder_node(id: &str, label: &str) -> BrowseNode {
+    let selection = wire_selection::not_selectable();
     BrowseNode {
         id: id.into(),
         label: label.into(),
@@ -337,11 +491,15 @@ pub fn folder_node(id: &str, label: &str) -> BrowseNode {
         access: "read".into(),
         has_children: true,
         binding_json: "{}".into(),
+        selection_mode: selection.mode as i32,
+        selection_payload_json: selection.payload_json,
+        diagnostics: selection.diagnostics,
     }
 }
 
 /// 模板目录诊断节点（模板不可用时明确提示，而不是伪装成空目录）。
 pub fn diagnostic(message: String) -> BrowseNode {
+    let selection = wire_selection::not_selectable();
     BrowseNode {
         id: "nck://presets/note".into(),
         label: message,
@@ -350,6 +508,9 @@ pub fn diagnostic(message: String) -> BrowseNode {
         access: "read".into(),
         has_children: false,
         binding_json: "{}".into(),
+        selection_mode: selection.mode as i32,
+        selection_payload_json: selection.payload_json,
+        diagnostics: selection.diagnostics,
     }
 }
 
@@ -516,5 +677,180 @@ mod tests {
             binding["identity"]["preview_point_key"],
             "drive.parameter.r0021@drive_object=o:{entry=s:nc_variable,number=i:3}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // IPC 1.8 Browse 选择契约（准入判定在驱动侧）
+    // ---------------------------------------------------------------------
+
+    use crate::definition::DefinitionScope;
+    use mesa_driver_protocol::pb::BrowseSelectionMode;
+
+    /// 用内嵌目录里的**真实定义**克隆一份并改字段，构造内存目录。
+    ///
+    /// 为什么克隆真定义而不是手写 JSON：手写会引入第二份"定义长什么样"的真值，
+    /// 一旦 schema 演进就会变成假绿。克隆后仅改被测字段，其余（身份模板、
+    /// golden_ref、addressing）都与生产数据逐字一致。
+    fn catalog_with(
+        mutate: impl FnOnce(&mut VariableDefinition),
+    ) -> (DefinitionCatalog, PresetTemplate) {
+        let embedded = DefinitionCatalog::embedded().expect("内嵌目录必须可装载");
+        let reg = PresetRegistry::embedded();
+        // 基线必须选一条**可采集**（scope=collect）的模板：模板顺序首项对应的是
+        // 身份探针用的 identity 定义，拿它当"可选叶"基线会掩盖准入判定。
+        let t = reg
+            .for_family("828d")
+            .into_iter()
+            .find(|t| {
+                golden_ref_of_template(&t.id)
+                    .and_then(|w| embedded.find_by_golden_ref(&w).first().copied())
+                    .is_some_and(|d| d.scope == DefinitionScope::Collect)
+            })
+            .expect("828D 应至少有一条可采集模板")
+            .clone();
+        let want = golden_ref_of_template(&t.id).expect("模板 id 必须可映射");
+        let mut def = embedded
+            .find_by_golden_ref(&want)
+            .first()
+            .copied()
+            .expect("模板必须能命中定义")
+            .clone();
+        mutate(&mut def);
+        let catalog = DefinitionCatalog::from_definitions(vec![def]).expect("内存目录必须合法");
+        (catalog, t)
+    }
+
+    /// `scope=collect` 且 family 一致的叶：驱动声明 **SEMANTIC**，载荷与
+    /// `binding_json` 逐字一致，诊断只放 INFO 级预览提示。
+    #[test]
+    fn selectable_leaf_declares_semantic_mode_with_preview_diagnostic() {
+        let (catalog, t) = catalog_with(|_| {});
+        // 填齐使用者本来就要确认的实例字段 ⇒ target/arguments 完整 ⇒ 有预览 Key。
+        let node = leaf_node_in(
+            Some(&catalog),
+            &t,
+            &[("area_no", Value::from(1)), ("line", Value::from(1))],
+        );
+        assert_eq!(
+            node.selection_mode,
+            BrowseSelectionMode::Semantic as i32,
+            "可采集的语义叶必须声明 SEMANTIC（不是靠前端推断）"
+        );
+        assert_eq!(
+            node.selection_payload_json, node.binding_json,
+            "选择载荷与 binding_json 同内容（旧客户端继续读 binding_json）"
+        );
+        assert_eq!(node.diagnostics.len(), 1);
+        assert_eq!(node.diagnostics[0].code, admission::CODE_IDENTITY_PREVIEW);
+        assert_eq!(
+            node.diagnostics[0].severity,
+            mesa_driver_protocol::pb::BrowseDiagnosticSeverity::Info as i32,
+            "预览 Key 只是展示性提示，不得升级成阻断"
+        );
+        assert!(node.diagnostics[0].message.contains("Browse 预览："));
+    }
+
+    /// 身份未确定（target/arguments 不完整）⇒ 仍可选，但诊断必须是 WARNING。
+    #[test]
+    fn unresolved_identity_keeps_leaf_selectable_with_warning() {
+        let (catalog, t) = catalog_with(|_| {});
+        // 不填 area_no/line ⇒ 无法构造 target ⇒ 预览 Key 为 None。
+        let node = leaf_node_in(Some(&catalog), &t, &[]);
+        assert_eq!(node.selection_mode, BrowseSelectionMode::Semantic as i32);
+        assert_eq!(
+            node.diagnostics[0].code,
+            admission::CODE_IDENTITY_UNRESOLVED
+        );
+        assert_eq!(
+            node.diagnostics[0].severity,
+            mesa_driver_protocol::pb::BrowseDiagnosticSeverity::Warning as i32
+        );
+        assert!(node.diagnostics[0].message.contains("身份未确定"));
+    }
+
+    /// `scope=identity` ⇒ 驱动直接声明不可选 + `DEFINITION_SCOPE_NOT_COLLECTABLE`，
+    /// 与 Configure 拒绝码**同源**（前端不再需要自己解释 scope 白名单）。
+    #[test]
+    fn identity_scope_leaf_is_declared_not_selectable_by_driver() {
+        let (catalog, t) = catalog_with(|def| def.scope = DefinitionScope::Identity);
+        let node = leaf_node_in(Some(&catalog), &t, &[]);
+        assert_eq!(
+            node.selection_mode,
+            BrowseSelectionMode::NotSelectable as i32
+        );
+        assert_eq!(node.diagnostics.len(), 1);
+        assert_eq!(node.diagnostics[0].code, "DEFINITION_SCOPE_NOT_COLLECTABLE");
+        assert_eq!(
+            node.diagnostics[0].severity,
+            mesa_driver_protocol::pb::BrowseDiagnosticSeverity::Error as i32
+        );
+        assert!(node.diagnostics[0].message.contains("scope=`identity`"));
+        // 载荷仍按 1.7 形态给出（旧客户端不受影响），但它不构成可选许可。
+        assert_eq!(node.kind, POINT_KIND_VARIABLE);
+        assert!(!node.selection_payload_json.is_empty());
+    }
+
+    /// 定义 family 与本模板系列不一致 ⇒ 不可选 + `UNSUPPORTED_FAMILY`
+    /// （禁止跨系列套用定义）。
+    #[test]
+    fn family_mismatch_is_declared_not_selectable_by_driver() {
+        let (catalog, t) = catalog_with(|def| def.family = "840d-sl".into());
+        let node = leaf_node_in(Some(&catalog), &t, &[]);
+        assert_eq!(
+            node.selection_mode,
+            BrowseSelectionMode::NotSelectable as i32
+        );
+        assert_eq!(node.diagnostics[0].code, "UNSUPPORTED_FAMILY");
+    }
+
+    /// 目录不可用（`None`）⇒ 退回旧 `variable` 原生信封，但仍声明**不可选**
+    /// 且给出 `SEMANTIC_PAYLOAD_UNAVAILABLE`：绝不把"找不到定义"伪装成可选。
+    #[test]
+    fn missing_catalog_is_declared_not_selectable_with_code() {
+        let reg = PresetRegistry::embedded();
+        let t = reg.for_family("828d")[0].clone();
+        let node = leaf_node_in(None, &t, &[]);
+        assert_eq!(
+            node.selection_mode,
+            BrowseSelectionMode::NotSelectable as i32
+        );
+        assert_eq!(
+            node.diagnostics[0].code,
+            admission::CODE_SEMANTIC_PAYLOAD_UNAVAILABLE
+        );
+        assert_eq!(node.kind, "variable", "降级形态必须显式标注（A22）");
+        let binding: Value = serde_json::from_str(&node.binding_json).unwrap();
+        assert_eq!(binding["resource_id"], "variable");
+        assert!(
+            node.label.contains("语义载荷不可用"),
+            "标签也要保留降级说明，实际：{}",
+            node.label
+        );
+        assert!(
+            !node.selection_payload_json.is_empty(),
+            "降级叶的载荷必须与 binding_json 同内容（旧客户端继续读 binding_json）"
+        );
+    }
+
+    /// 分支 / 诊断节点：驱动声明 **NOT_SELECTABLE** 且**不给理由**
+    /// （它们本来就不该被选用，红色阻断会误导用户）。
+    #[test]
+    fn folder_and_diagnostic_nodes_are_not_selectable_without_reason() {
+        for node in [
+            folder_node("nck://presets", "常用预设"),
+            diagnostic("模板不可用".into()),
+        ] {
+            assert_eq!(
+                node.selection_mode,
+                BrowseSelectionMode::NotSelectable as i32,
+                "{} 必须显式声明不可选",
+                node.id
+            );
+            assert!(
+                node.diagnostics.is_empty(),
+                "分支/诊断节点不应产生红色阻断理由"
+            );
+            assert!(node.selection_payload_json.is_empty());
+        }
     }
 }

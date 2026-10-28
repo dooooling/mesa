@@ -43,7 +43,9 @@ pub fn supported(family: &str) -> bool {
     probes_for_family(family).is_some()
 }
 
+/// 分支节点：**明确不可选**（IPC 1.8 选择契约），前端无需靠空信封形态猜测。
 fn folder(id: &str, label: &str) -> BrowseNode {
+    let selection = mesa_driver_protocol::browse_selection::not_selectable();
     BrowseNode {
         id: id.into(),
         label: label.into(),
@@ -52,6 +54,9 @@ fn folder(id: &str, label: &str) -> BrowseNode {
         access: "read".into(),
         has_children: true,
         binding_json: "{}".into(),
+        selection_mode: selection.mode as i32,
+        selection_payload_json: selection.payload_json,
+        diagnostics: selection.diagnostics,
     }
 }
 
@@ -59,7 +64,10 @@ pub fn root_node() -> BrowseNode {
     folder(ROOT, "轴与驱动对象（实时只读核对）")
 }
 
+/// 诊断节点：不可选，但**不给理由**——它本身就是「为什么看不到内容」的说明，
+/// 再叠一条红色阻断只会误导（用户本来也不该在这里选用任何东西）。
 fn diagnostic(id: &str, message: String) -> BrowseNode {
+    let selection = mesa_driver_protocol::browse_selection::not_selectable();
     BrowseNode {
         id: id.into(),
         label: message,
@@ -68,6 +76,9 @@ fn diagnostic(id: &str, message: String) -> BrowseNode {
         access: "read".into(),
         has_children: false,
         binding_json: "{}".into(),
+        selection_mode: selection.mode as i32,
+        selection_payload_json: selection.payload_json,
+        diagnostics: selection.diagnostics,
     }
 }
 

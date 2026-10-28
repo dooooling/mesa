@@ -258,3 +258,51 @@ python -c "import json;d=json.load(open('docs/evidence/nck-drive-object-readback
 
 （上述命令只读本地文件，不建立网络连接、不运行探针测试。
 `tests/live_identity_probe.rs` 是 `#[ignore]` 的真机探针，本次**未运行**。）
+
+## 9. 第 4 步裁决：`AXIS_ENC_MODULE_NR` 走「撤销测量声明」路线（§7 第 2、10 行的待办在此关闭）
+
+本节的裁决以 `docs/reference/nck-source-evidence-stage4.md` §4 为准（含四份手册的检索证据与逐条依据），
+这里只记录与本文前文直接相关的**状态变化**，不重复论证。
+
+### 9.1 裁决结果
+
+| 项 | 结果 |
+|---|---|
+| 选定路线 | **路线 2：撤销无依据的测量声明**（不是"接线"路线） |
+| `r1.json:1207` 的 `measurement`（`docs/evidence/nck-live-identity-probe.txt`） | 标记 **`retraction_pending_definition_rev`**（详见 `828d-definition-source-audit.md` §7.3） |
+
+> **生效定义仍携带该声明**：`r1.json` 中 `axis.encoder.module_number` 仍为 `revision=1`、`semantics_status=verified`，且 `source[]` 仍含指向 `docs/evidence/nck-live-identity-probe.txt` 的 `measurement` 条目。本 PR **未移除**它——定义目录的 `(variable_id, revision)` 不可原地修改，且当前不存在撤回机制，移除须发布新 revision 或经评审的定义修订。**审计判定不等于定义已撤回。**
+
+| `r1.json` 是否改动 | **没有**（blob 仍 `3c0abe67cbcb64b525cddec1584e6e1747e0f062`）；实际移除留给后续经评审的定义修订 |
+| `PROBES_828D` 是否删掉该常量 | **没有**。删掉会让 `tests/definition_catalog.rs:404` 的"目录 ↔ 探针逐字段"契约失去可比对象，等于用一个静默缺口换另一个 |
+
+### 9.2 为什么不是"接线"路线（要点）
+
+1. **适用条件未证明**：07/2023 机床数据手册 p366 写明 MD30220 是 `$MA_ENC_MODULE_NR[下标+1]`，下标按
+   **编码器编号 0 或 1**；而本探针把 `line` 固定为 1，`line → 下标` 的对应关系**无任何证据**（待核实）。
+2. **module 字节无依据**：`module=26` 对该机床数据的适用性属全局 `unresolved: module-value-authority`，
+   手册不提供（`manual_mapping.result.native_module_values_provided = 0`）。
+3. **执行路径无处"启用"**：`identity.rs` 里不存在任何包含它的分支（`identity.rs:6-9` 未导入、
+   `identity.rs:152-193` 的读取序列没有第 6 次读），只能新写；新写就等于把语义未确认的读塞进用户可见的身份浏览。
+4. **无法取证**：真实 828D 未连接，接线后也只能证明"被调用"，无法证明"读数正确"；
+   而 `live_identity_probe.rs` 的真机探针本轮**未运行**（`#[ignore]`，需显式授权）。
+
+### 9.3 本轮实际改动（仅注释与测试，无行为变化）
+
+| 改动 | 位置 |
+|---|---|
+| 常量注释补 `FIXME`（证据链缺陷）/ `TODO`（待硬件证据后才能接线）/ `NOTE`（07/2023 只是较早版本依据） | `drivers/sinumerik-nck/src/identity_spec.rs:134-154` |
+| `PROBES_828D` 补 `NOTE`：集合成员 ≠ 被执行，当前实际执行集合是 7 个 | `drivers/sinumerik-nck/src/identity_spec.rs:229-233` |
+| 新增契约层测试（地址自洽 + 明示未被执行） | `drivers/sinumerik-nck/src/identity_spec.rs:344-362` |
+
+> 行号说明：因上述注释插入，`AXIS_ENC_MODULE_NR` 常量体由原先的 135 行位置移到 **155 行**；
+> 本文 §1 表格与 §4/§5 里出现的 `identity_spec.rs:135` 属插入前的历史行号，内容不变。
+
+### 9.4 线路图：什么条件下才允许改成"接线"
+
+1. 取得真实 828D 上 `A/<axis>/M/30220` 的**接受请求字节与读数**（虚拟控制器读数不算），并留存原始转录；
+2. 明确 `line` 取值与编码器下标（0/1）的对应关系，或改用能显式表达下标的地址形态；
+3. module 字节 26 获得规格/设备证据（或至少与同组机床数据的 module 观测一致）；
+4. 再决定挂在轴路径做第 6 次读，还是单开一页，并为"设备拒绝"设计诊断（不得把拒绝误报成表尾）。
+
+在这四步完成前，`axis.encoder.module_number` 只能标：**尚未验证 / 暂不可用（measurement 已撤）**。

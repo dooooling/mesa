@@ -1239,16 +1239,36 @@ impl DriverConnection for OpcUaConnection {
         };
         let nodes = slice
             .iter()
-            .map(|(name, node_id)| mesa_driver_protocol::pb::BrowseNode {
-                id: node_id.clone(),
-                label: name.clone(),
-                kind: "node".into(),
-                // browse 发出的类型必须是 canonical（回填 selection 可直接过门禁）
-                data_type: "STRING".into(),
-                access: "read".into(),
-                has_children: true,
-                binding_json: serde_json::json!({"node_id": node_id, "data_type": "STRING"})
+            .map(|(name, node_id)| {
+                // IPC 1.8 选择契约：OPC UA 的 Browse 叶一律是**通用资源叶**——
+                // 载荷就是 Descriptor `node` 资源的 canonical selection
+                //（`resource_id` + `parameters`），通用前端无需任何语义层即可回填。
+                // 因此显式声明 `RESOURCE`，不再依赖前端从 `binding_json` 形态猜测。
+                let parameters = serde_json::json!({
+                    "node_id": node_id,
+                    "data_type": "STRING",
+                });
+                mesa_driver_protocol::pb::BrowseNode {
+                    id: node_id.clone(),
+                    label: name.clone(),
+                    kind: "node".into(),
+                    // browse 发出的类型必须是 canonical（回填 selection 可直接过门禁）
+                    data_type: "STRING".into(),
+                    access: "read".into(),
+                    has_children: true,
+                    binding_json: serde_json::json!({
+                        "node_id": node_id,
+                        "data_type": "STRING",
+                    })
                     .to_string(),
+                    selection_mode: mesa_driver_protocol::pb::BrowseSelectionMode::Resource as i32,
+                    selection_payload_json: serde_json::json!({
+                        "resource_id": "node",
+                        "parameters": parameters,
+                    })
+                    .to_string(),
+                    diagnostics: Vec::new(),
+                }
             })
             .collect();
         Ok((nodes, next_cursor))

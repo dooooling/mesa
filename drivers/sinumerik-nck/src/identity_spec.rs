@@ -131,7 +131,27 @@ pub const AXIS_CTRLOUT_TYPE: IdentityProbeSpec = IdentityProbeSpec {
     transport_size: 0x09,
 };
 
-/// 轴编码器驱动号（`A/<axis>/MDCA_ENC_MODULE_NR`）。
+/// 轴编码器驱动号（`A/<axis>/MDCA_ENC_MODULE_NR`，机床数据 30220）。
+///
+/// FIXME(证据链缺陷，未修): 该常量**不在任何执行路径上**——`identity.rs:6-9` 的
+/// 导入清单与 `tests/live_identity_probe.rs:16-20` 的 use 清单都**没有**它，
+/// 它只被下面的 `PROBES_828D` 列出、被 `tests/definition_catalog.rs:404` 逐字段
+/// 比对，**从不实际发出读取**。同时 `r1.json` 的
+/// `axis.encoder.module_number.source[]` 挂了一条
+/// `kind=measurement, reference=docs/evidence/nck-live-identity-probe.txt`，
+/// 而该证据文件（128 行 / 13 小节）**没有编码器驱动号一节** ⇒ 这条测量声明无对应记录。
+/// 该项目前按“撤销声明”处理：`docs/reference/nck-source-evidence-stage4.md` §4 把该
+/// measurement 记为 `retraction_pending_definition_rev`；`r1.json` 本轮不得改动，实际移除
+/// 留给后续经评审的定义修订。
+///
+/// TODO(待硬件证据后才能接线): 若要把本探针纳入真实执行路径，前提是先在真实 828D 上
+/// 取得 `A/<axis>/M/30220` 的**接受字节与读数**（现有虚拟控制器读数不算），再决定
+/// 挂在轴上做第 6 次读还是独立页；在那之前**不得**把本常量出现在 `PROBES_828D` 里
+/// 当作“已核对/已实测”。
+///
+/// NOTE(文档依据只到较早版本): 本地 07/2023 机床数据手册 p365 有 30220
+/// `ENC_MODULE_NR` 条目（说明延续至 p366），但那是比 r1.json 所引 11/2023 更早的
+/// 版本，只补“手册里有这个机床数据”，**不补**native module 字节、也不补真机可读性。
 pub const AXIS_ENC_MODULE_NR: IdentityProbeSpec = IdentityProbeSpec {
     name: "axis_enc_module_nr",
     area: NckArea::Axis,
@@ -205,6 +225,11 @@ pub const DRIVE_OBJECT_NAME_M130: IdentityProbeSpec = IdentityProbeSpec {
 };
 
 /// 828D 已核对的全部身份探针。
+///
+/// NOTE(集合 ≠ 执行): 这里只登记“本系列有哪些内建探针定义”，**不代表每一个都被
+/// 执行**。当前 `identity.rs` 的实际执行集合是 7 个（`AXIS_ENC_MODULE_NR` 未被导入、
+/// 从不读取，原因见该常量上的 FIXME）；`tests/live_identity_probe.rs` 的真机探针
+/// 同样不含它。读代码时不要由本数组的成员关系推断“已核对/已实测”。
 pub const PROBES_828D: [IdentityProbeSpec; 8] = [
     AXIS_NAME,
     AXIS_CTRLOUT_MODULE_NR,
@@ -314,6 +339,26 @@ mod tests {
         // 驱动对象：target 进 area_no。
         let (w, _) = DRIVE_OBJECT_NAME.resolve(6).unwrap();
         assert_eq!(w.area_unit, (5 << 5) | 6);
+    }
+
+    /// 编码器驱动号探针的**契约层**性质：地址可构造、长度/transport 与 catalog 一致。
+    ///
+    /// 这一条只证明「常量本身自洽」，**不证明**它被执行过：
+    /// 期望字节按 `codec::encode_var_spec` 的 10 字节布局推导（同
+    /// `axis_and_channel_probe_layout_derived`，属“布局推导”而非抓包证据），
+    /// 且当前没有任何生产/探针路径会走到它（见常量上的 FIXME）。
+    #[test]
+    fn enc_module_nr_probe_contract_is_well_formed_but_unexercised() {
+        // A/1，module 26，col 30220(0x760C)，line 1，count 1；area A(3)<<5 | 1 = 0x61。
+        assert_eq!(
+            bytes(&AXIS_ENC_MODULE_NR, 1),
+            vec![0x12, 0x08, 0x82, 0x61, 0x76, 0x0c, 0x00, 0x01, 0x1a, 0x01]
+        );
+        let (w, item) = AXIS_ENC_MODULE_NR.resolve(4).unwrap();
+        assert_eq!(w.area_unit, (3 << 5) | 4, "inst 进 area_no");
+        assert_eq!(w.line, 1, "line 固定 1");
+        assert_eq!(item.expected_data_len, 1, "U8");
+        assert_eq!(item.expected_transport_size, 0x09);
     }
 
     /// 实例槽位越界 fail-closed（unit 5 位上限 31）。
