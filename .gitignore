@@ -71,3 +71,7 @@ __pycache__/
 # 只精确忽略这一个路径：不要写成 *.json，避免误伤仓库内其它证据文件。
 # mesad 生成的运行时意图凭证（G7 停止意图围栏）。文件本身保留在工作区，不删除。
 /mesa.db.intent-proof.json
+
+# 本地西门子参考手册；默认不重新分发，PDF 不入库（只提交清单与 SHA-256）
+docs/reference/manuals/*.pdf
+docs/reference/manuals/*.PDF
