@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "purpose": "Separate NCK wire-format evidence, manual semantic evidence, and live-device observations. This matrix does not certify address mappings beyond the evidence stated per row.",
+  "baseline": {
+    "main_commit": "dae035ea7b7f683d7b51fffc5f1637aeac8e7bec",
+    "r1_blob_sha1": "3c0abe67cbcb64b525cddec1584e6e1747e0f062",
+    "real_828d_test_in_this_change": false
+  },
+  "wire_layout": {
+    "source_symbol": "Wireshark epan/dissectors/packet-s7comm.c: s7comm_decode_param_item / s7comm_syntaxid_nck",
+    "repo_source": "drivers/sinumerik-nck/src/codec.rs",
+    "format": {
+      "bytes": 10,
+      "fields": [
+        {
+          "name": "spec_type",
+          "offset": 0,
+          "width": 1,
+          "observed_value": "0x12",
+          "evidence_class": "protocol_layout"
+        },
+        {
+          "name": "spec_length",
+          "offset": 1,
+          "width": 1,
+          "observed_value": "0x08",
+          "evidence_class": "protocol_layout"
+        },
+        {
+          "name": "syntax_id",
+          "offset": 2,
+          "width": 1,
+          "observed_values": [
+            "0x82",
+            "0x83",
+            "0x84"
+          ],
+          "evidence_class": "protocol_layout"
+        },
+        {
+          "name": "area_unit",
+          "offset": 3,
+          "width": 1,
+          "expression": "(area << 5) | unit",
+          "evidence_class": "protocol_layout"
+        },
+        {
+          "name": "column",
+          "offset": 4,
+          "width": 2,
+          "endian": "big",
+          "evidence_class": "protocol_layout"
+        },
+        {
+          "name": "line",
+          "offset": 6,
+          "width": 2,
+          "endian": "big",
+          "evidence_class": "protocol_layout"
+        },
+        {
+          "name": "module",
+          "offset": 8,
+          "width": 1,
+          "evidence_class": "protocol_layout",
+          "caveat": "Field position/width is known; its block-specific value source is not established by the 03/2025 NC Variables manual."
+        },
+        {
+          "name": "line_count",
+          "offset": 9,
+          "width": 1,
+          "evidence_class": "protocol_layout"
+        }
+      ]
+    }
+  },
+  "block_observations": [
+    {
+      "block": "S",
+      "module_decimal": 127,
+      "module_hex": "0x7f",
+      "raw_request_example": "12 08 82 41 00 0d 00 01 7f 01",
+      "sample_ref": "docs/evidence/nck-live-samples-probe.txt",
+      "sample_lines": [
+        5
+      ],
+      "status": "observed",
+      "claim_scope": "Observed accepted request for channel.program.status in one real-device sample; not a universal mapping proof."
+    },
+    {
+      "block": "RP",
+      "module_decimal": 21,
+      "module_hex": "0x15",
+      "raw_request_example": "12 08 82 41 00 01 00 01 15 01",
+      "sample_ref": "docs/evidence/nck-live-samples-probe.txt",
+      "sample_lines": [
+        7
+      ],
+      "status": "observed",
+      "claim_scope": "Observed accepted request for R parameter in one real-device sample; not a universal mapping proof."
+    },
+    {
+      "block": "SSP",
+      "module_decimal": 114,
+      "module_hex": "0x72",
+      "raw_request_example": "12 08 82 41 00 03 00 01 72 01",
+      "sample_ref": "docs/evidence/nck-live-samples-probe.txt",
+      "sample_lines": [
+        36
+      ],
+      "status": "observed",
+      "claim_scope": "Observed accepted request for cmdSpeed in one real-device sample; not a universal mapping proof."
+    },
+    {
+      "block": "SGA",
+      "module_decimal": 115,
+      "module_hex": "0x73",
+      "raw_request_example": "12 08 82 41 00 02 00 01 73 01",
+      "sample_ref": "docs/evidence/nck-live-samples-probe.txt",
+      "sample_lines": [
+        21
+      ],
+      "status": "observed",
+      "claim_scope": "Observed accepted request for actToolBasePos in one real-device sample; not a universal mapping proof."
+    },
+    {
+      "block": "SEGA",
+      "module_decimal": 112,
+      "module_hex": "0x70",
+      "raw_request_example": "12 08 82 41 00 21 00 01 70 01",
+      "sample_ref": "docs/evidence/nck-live-samples-probe.txt",
+      "sample_lines": [
+        29
+      ],
+      "status": "observed",
+      "claim_scope": "Observed accepted request for actProgPosBKS in one real-device sample; not a universal mapping proof."
+    }
+  ],
+  "manual_mapping": {
+    "source_document": {
+      "title": "SINUMERIK 828D NC variables List Manual",
+      "document_number": "A5E53370586B AC",
+      "version": "03/2025",
+      "sha256": "1274440ed70ef00e82d5f3560e38558740139fa6337405c75df4f0bea1eb5ed1"
+    },
+    "result": {
+      "required_entries": 15,
+      "exact_semantic_matches": 14,
+      "pending_review": [
+        "channel.program.name.main"
+      ],
+      "native_module_values_provided": 0,
+      "complete_five_field_native_addresses_provided": 0,
+      "conclusion": "manual_semantic_only",
+      "caveats": [
+        "The manual does not provide the Mesa native NCK module byte.",
+        "The manual does not directly provide area_no as a native NCK address field.",
+        "Manual column indices must not be assumed to be native wire columns without an independently demonstrated mapping."
+      ]
+    }
+  },
+  "unresolved": [
+    {
+      "id": "module-value-authority",
+      "question": "What authoritative specification maps NCK block identifiers to the module byte for the supported control/software generation?",
+      "status": "open",
+      "do_not_infer": true
+    },
+    {
+      "id": "area-no-mapping",
+      "question": "What authoritative rule maps the logical target/area number to the encoded unit/area_no for each supported access path?",
+      "status": "open",
+      "do_not_infer": true
+    },
+    {
+      "id": "channel.program.name.main",
+      "question": "Which official manual/version documents the expected (C, SPARPP) entry and column?",
+      "status": "open",
+      "do_not_infer": true
+    },
+    {
+      "id": "string-lengths",
+      "question": "What source confirms the configured 66-byte actBlock and 32-byte progName decoding lengths?",
+      "status": "open",
+      "do_not_infer": true
+    },
+    {
+      "id": "drive-parameter-manual-112023",
+      "question": "Obtain and verify the exact 11/2023 SINAMICS S120/S150 source rather than substituting 07/2023.",
+      "status": "open",
+      "do_not_infer": true
+    },
+    {
+      "id": "axis.encoder.module_number",
+      "question": "The cited measurement evidence does not contain this probe result; exercise the real probe path or withdraw the unsupported measurement claim.",
+      "status": "open",
+      "do_not_infer": true
+    },
+    {
+      "id": "hardware-validation",
+      "question": "Validate the remaining 10 definitions with live device reads only after explicit authorization.",
+      "status": "requires_explicit_authorization",
+      "do_not_infer": true
+    }
+  ],
+  "invariants": [
+    "No r1.json address/decode/status change without row-level evidence and review.",
+    "Protocol field layout, manual semantic meaning, and real-device observations are distinct evidence classes.",
+    "Observed accepted values on one device are not universal mapping rules.",
+    "No live hardware probe is run by CI or without explicit authorization."
+  ]
+}
