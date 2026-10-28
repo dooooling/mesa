@@ -231,8 +231,8 @@
         "version": "03/2025",
         "entry_count": 16,
         "covers_family": "828D NC 变量",
-        "matching_pdf_in_this_manifest": null,
-        "relation": "版本不同（03/2025 vs 07/2023）且文档号不同（A5E53370586B AC vs 6FC5397-5FP40-0RA6）；**未找到**同一文档的证据"
+        "matching_pdf_in_this_manifest": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "relation": "同文档：本清单 documents[] 已登记该文件（id=nc-variables-032025，文档号 A5E53370586B AC、版本 03/2025、1262 页、SHA-256 已实测），并已完成 16 条逐条核验（见 828d-manual-cross-reference.md §12）。注意：它与三份 07/2023 PDF 仍是不同文档/不同版本，07/2023 的页码不得当作 03/2025 的页码。"
       },
       {
         "reference_string": "SINAMICS S120/S150 参数手册 11/2023",

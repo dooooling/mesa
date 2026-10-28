@@ -9,6 +9,10 @@
 | `828D_sysvar_lists_man_0723_zh-CHS.pdf` | `6FC5397-5FP40-0RA6` | 07/2023 |
 | `828D_md_lists_man_0723_zh-CHS.pdf` | `6FC5397-4DP40-6RA6` | 07/2023 |
 | `828D_S120_para_lists_man_0723_zh-CHS.pdf` | `A5E53014702F AA` | 07/2023 |
+| `828D_ncvar_lists_man_0325_en-US.pdf` | `A5E53370586B AC` | 03/2025 |
+
+第四份（03/2025 NC variables）**正是** 16 条定义 `source[].reference` 所写的文档，与前三份 07/2023 属不同
+文档/不同版本，两者页码不可互换。
 
 ## 放置步骤
 
@@ -23,6 +27,12 @@ Get-FileHash docs/reference/manuals/*.pdf -Algorithm SHA256
 > **状态（Phase 0 阶段 A，commit `c394584`）**：上述步骤已完成——三份 PDF 均在位，`file_present` 全为 `true`，
 > SHA-256 / size_bytes / 页数 / 首页文档号版本均已实测填入；逐条交叉引用见 `../828d-manual-cross-reference.md`。
 > 清单是否过期可用 `python ../check-manual-metadata.py` 机械检查（OK / WARN / FAIL 三档）。
+>
+> **状态（阶段 B）**：第四份 03/2025 `828D_ncvar_lists_man_0325_en-US.pdf` 已在位（1262 页，
+> SHA-256 `1274440ed70ef00e82d5f3560e38558740139fa6337405c75df4f0bea1eb5ed1`），并已在其上完成
+> 13 条 `not_found` + 2 条 `pending_review` 的逐条核验（`../828d-manual-cross-reference.md` §12、
+> `../828d-definition-source-audit.md` §8）。该手册给出区域/块助记名/`Column index`/`Line index`，
+> **不给出** Mesa 原生地址里的 `module` 字节取值。
 
 ## 硬性要求
 
