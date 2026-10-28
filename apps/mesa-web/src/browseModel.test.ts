@@ -1,12 +1,21 @@
 // Browse → Selection 映射单测：锁定信封形态，不解释协议语义。
+//
+// PR #150 解耦后：通用层不认识任何 point kind。带 `kind` 的信封（语义载荷）
+// 通用层一律不猜（返回 null），identity 之类的语义块由 `parseBrowseEnvelope`
+// 原样透出给策略层（见 nckBrowsePolicy.test.ts）。
 import { describe, expect, it } from "vitest";
-import { buildBrowseRequest, selectableFromNode } from "./browseModel";
+import {
+  buildBrowseRequest,
+  declaresOpaquePointKind,
+  parseBrowseEnvelope,
+  selectableFromNode,
+} from "./browseModel";
 import { missingRequiredParams } from "./resourceSelectionModel";
 import type { FieldDescriptor } from "./types";
 
 describe("selectableFromNode", () => {
-  it("semantic_leaf_exposes_identity_without_entering_parameters (A1)", () => {
-    const sel = selectableFromNode({
+  it("semantic_payload_is_not_generically_selectable_and_envelope_is_opaque (A1)", () => {
+    const node = {
       id: "nck://presets/828d.C.S.progStatus.nck_variable",
       kind: "nck_variable",
       has_children: false,
@@ -24,16 +33,18 @@ describe("selectableFromNode", () => {
           preview_point_key: "channel.program.status@channel=i:1",
         },
       }),
-    });
-    expect(sel?.point_kind).toBe("nck_variable");
-    expect(sel?.resource_id).toBe("nck_variable");
-    expect(sel?.identity).toEqual({
+    };
+    // 通用层不解释 point kind：不产出 selection（也就不会给出「选用」）。
+    expect(selectableFromNode(node)).toBeNull();
+    const envelope = parseBrowseEnvelope(node)!;
+    expect(declaresOpaquePointKind(envelope)).toBe(true);
+    // 信封原样透出（策略层据此判定），parameters 仍是 Core 契约的 4 键。
+    expect(envelope.identity).toEqual({
       template: "channel.program.status@channel={channel}",
       keys: [{ path: "channel", required: true }],
       preview_point_key: "channel.program.status@channel=i:1",
     });
-    // identity 不得折进 parameters（否则会被持久化，Core 整体拒绝）。
-    expect(sel?.parameters).toEqual({
+    expect(envelope.parameters).toEqual({
       variable_id: "channel.program.status",
       definition_revision: 1,
       target: { channel: 1 },
@@ -41,36 +52,26 @@ describe("selectableFromNode", () => {
     });
   });
 
-  it("leaf_without_identity_not_selectable (A16)", () => {
+  it("leaf_without_identity_is_not_generically_selectable (A16)", () => {
     for (const kind of ["nck_variable", "nck_native"]) {
-      expect(
-        selectableFromNode({
+      for (const envelope of [
+        { parameters: { variable_id: "channel.program.status" } },
+        { parameters: {}, identity: "not-an-object" },
+      ]) {
+        const node = {
           id: "x",
           kind,
-          binding_json: JSON.stringify({
-            kind,
-            parameters: { variable_id: "channel.program.status" },
-          }),
-        }),
-      ).toBeNull();
-      // identity 形态非法同样不可选（不猜测/不补默认值）。
-      expect(
-        selectableFromNode({
-          id: "x",
-          kind,
-          binding_json: JSON.stringify({
-            kind,
-            parameters: {},
-            identity: "not-an-object",
-          }),
-        }),
-      ).toBeNull();
+          binding_json: JSON.stringify({ kind, ...envelope }),
+        };
+        // 无论 identity 是否合法，通用层都不得把它当资源叶（交给策略层判定）。
+        expect(selectableFromNode(node)).toBeNull();
+      }
     }
   });
 
-  it("semantic_leaf_with_null_preview_is_still_parsed_for_reason_display", () => {
-    // A10 的“预览为空”不是“无 identity”：模型透出 null，由 UI 显示原因并禁用“选用”。
-    const sel = selectableFromNode({
+  it("semantic_leaf_with_null_preview_keeps_null_in_envelope (A10)", () => {
+    // A10 的“预览为空”不是“无 identity”：信封如实透出 null，由策略层显示原因。
+    const envelope = parseBrowseEnvelope({
       id: "x",
       kind: "nck_variable",
       binding_json: JSON.stringify({
@@ -78,20 +79,17 @@ describe("selectableFromNode", () => {
         parameters: { variable_id: "v" },
         identity: { template: "v@channel={channel}", keys: [], preview_point_key: null },
       }),
-    });
-    expect(sel?.point_kind).toBe("nck_variable");
-    expect(sel?.identity?.preview_point_key).toBeNull();
+    })!;
+    expect((envelope.identity as { preview_point_key?: unknown }).preview_point_key).toBeNull();
   });
 
-  it("non-semantic leaves stay byte-for-byte shaped (A44 negative half)", () => {
+  it("generic leaves keep the exact two-field shape (A44)", () => {
     const generic = selectableFromNode({
       id: "g",
       kind: "register",
       binding_json: JSON.stringify({ resource_id: "register", parameters: { unit: 3 } }),
     });
     expect(generic).toEqual({ resource_id: "register", parameters: { unit: 3 } });
-    expect(generic).not.toHaveProperty("identity");
-    expect(generic).not.toHaveProperty("point_kind");
 
     const bare = selectableFromNode({
       id: "n",
@@ -99,7 +97,6 @@ describe("selectableFromNode", () => {
       binding_json: JSON.stringify({ node_id: "x", data_type: "STRING" }),
     });
     expect(bare).toEqual({ resource_id: "node", parameters: { node_id: "x", data_type: "STRING" } });
-    expect(bare).not.toHaveProperty("identity");
   });
 
   it("NCK 模板叶形态：显式 resource_id + 原生字段（不含实例/行）", () => {
