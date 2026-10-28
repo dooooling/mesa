@@ -110,11 +110,19 @@ describe("vendor-neutral catalog pagination contract", () => {
   });
 
   it("rejects page-limit exhaustion and malformed entry identities", async () => {
+    // 本用例只验证「页数上限」，因此夹具必须每页给**不同的**游标与条目键：
+    // 若两页都回同一个 next_cursor，实现会先命中「游标重复」检测（CATALOG_CURSOR_CYCLE），
+    // 根本走不到页数判断，用例就测错了对象（曾因此失败）。
+    // total 必须全程不变，否则会先命中 CATALOG_TOTAL_CHANGED。
+    let pageNo = 0;
     const tooMany = await readCompleteCatalog({
-      loadPage: async (cursor) =>
-        cursor
-          ? makePage([{ id: "b", value: 2 }], { total: 3, next_cursor: "next" })
-          : makePage([{ id: "a", value: 1 }], { total: 3, next_cursor: "next" }),
+      loadPage: async () => {
+        pageNo += 1;
+        return makePage([{ id: `e${pageNo}`, value: pageNo }], {
+          total: 99,
+          next_cursor: `c${pageNo}`,
+        });
+      },
       getPage: pageShape,
       getEntryKey: (entry) => entry.id,
       maxPages: 2,
