@@ -9,7 +9,7 @@
     "reconciliation": "git ls-tree HEAD = git hash-object = 远端 origin HEAD 同一 commit，三处一致"
   },
   "file_presence_audit": {
-    "checked_at_commit": "c3945847dcc196e8cb969f08fe71b7b397edfd8d",
+    "checked_at_commit": "88a9170e5ede3e4aa45e27d88d1598d78d16b53f",
     "manuals_dir": "docs/reference/manuals",
     "expected_file_count": 4,
     "present_file_count": 4,
@@ -323,6 +323,6 @@
     ],
     "source_of_truth_forbidden_until_then": "任何手册条目匹配都不得单独作为原生 NCK module / area_no 地址映射或真机可读性的证明。未完成独立映射证据前，不得仅据手册匹配修改 r1.json 的地址、decode 或验证状态。07/2023 页码只能留在旧版交叉引用记录中。"
   },
-  "checked_at_commit": "c3945847dcc196e8cb969f08fe71b7b397edfd8d",
-  "checked_at_note": "checked_at_commit 记录本次文件在位审计与 PDF 首页实测所基于的 commit；PDF 本身不入库（.gitignore:76-77 精确忽略 docs/reference/manuals/*.pdf），故 PDF 的 SHA-256 与页数只在本地可复核。"
+  "checked_at_commit": "88a9170e5ede3e4aa45e27d88d1598d78d16b53f",
+  "checked_at_note": "阶段 B 实测四份 PDF 的文件身份与页数时的提交；PDF 文件本身按政策不入 Git，清单记录的是当时本地实际核验结果。"
 }
