@@ -1296,13 +1296,16 @@ python audit_sources.py drivers/sinumerik-nck/definitions/828d/r1.json audit.jso
 `docs/evidence/nck-native-address-evidence.json` 的 `unresolved: string-lengths` 保持 open，
 本轮只补边界测试（`drivers/sinumerik-nck/src/value.rs:358`、`lib.rs:1223`），不补"权威依据"。
 
-### 7.3 `axis.encoder.module_number`：measurement 声明标记为 `retracted_pending_evidence`
+### 7.3 `axis.encoder.module_number`：measurement 声明标记为 `retraction_pending_definition_rev`
+
+> **生效定义仍携带该声明**：`r1.json` 中 `axis.encoder.module_number` 仍为 `revision=1`、`semantics_status=verified`，且 `source[]` 仍含指向 `docs/evidence/nck-live-identity-probe.txt` 的 `measurement` 条目。本 PR **未移除**它——定义目录的 `(variable_id, revision)` 不可原地修改，且当前不存在撤回机制，移除须发布新 revision 或经评审的定义修订。**审计判定不等于定义已撤回。**
+
 
 | 项 | 内容 |
 |---|---|
 | 定义 | `r1.json:1199`（`scope=identity`、`semantics_status=verified`、`column=30220`、`module=26`、`decode=U8`、`transport_size=9`） |
 | 被撤的 source 条目 | `r1.json:1207` — `{ "kind": "measurement", "reference": "docs/evidence/nck-live-identity-probe.txt" }` |
-| **标记** | **`retracted_pending_evidence`** |
+| **标记** | **`retraction_pending_definition_rev`** |
 | 撤的依据 ① | 所引证据文件共 128 行 / 13 个小节（小节头在第 7、16、25、34、43、52、61、70、79、88、97、106、115 行），**没有「编码器驱动号」一节** |
 | 撤的依据 ② | 产生该文件的探针 `drivers/sinumerik-nck/tests/live_identity_probe.rs:16-20` 的 use 清单**不含** `AXIS_ENC_MODULE_NR`，探针体也不调用它 ⇒ 该文件不可能含此读数 |
 | 撤的依据 ③ | 常量 `AXIS_ENC_MODULE_NR`（`identity_spec.rs:155`）**不在任何执行路径上**：`drivers/sinumerik-nck/src/identity.rs:6-9` 的导入清单不含它，`identity.rs:152-193` 的轴身份读取序列没有它。它只被 `PROBES_828D`（`identity_spec.rs:233`）列出、被 `tests/definition_catalog.rs:404` 逐字段比对 |

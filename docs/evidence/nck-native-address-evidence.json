@@ -834,7 +834,18 @@
       "question": "The cited measurement evidence does not contain this probe result; exercise the real probe path or withdraw the unsupported measurement claim.",
       "status": "open",
       "do_not_infer": true,
-      "note": "第 4 步裁决：选“撤销声明”路线。r1.json:1207 的 measurement 已在 docs/reference/828d-definition-source-audit.md 第 7.3 节标记为 retracted_pending_evidence（r1.json 本轮不改，实际移除留给评审后的定义修订）；代码侧以 FIXME/TODO 标注（drivers/sinumerik-nck/src/identity_spec.rs:136、:147）。未接线的原因：MD30220 按编码器编号 0/1 索引（07/2023 机床数据手册 p366），而探针把 line 固定为 1，该对应关系无证据；module 字节 26 仍属 module-value-authority。本文件因此不收任何 probe_outputs。"
+      "note": "Audit verdict: the cited measurement evidence does not contain this probe result, and the probe constant is never exercised. Retraction is DECIDED but NOT APPLIED to the effective definition, which still carries the claim. Do not treat the audit record as proof that the production definition is clean.",
+      "retraction_state": "retraction_pending_definition_rev",
+      "effective_definition_still_carries_claim": true,
+      "effective_definition": {
+        "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
+        "variable_id": "axis.encoder.module_number",
+        "revision": 1,
+        "semantics_status": "verified",
+        "offending_source_kind": "measurement",
+        "offending_source_reference": "docs/evidence/nck-live-identity-probe.txt"
+      },
+      "why_not_retracted_in_place": "The definition catalogue forbids in-place modification of a published (variable_id, revision) and provides no retraction/supersede mechanism: DIGESTS.lock must match definitions 1:1 (MissingLockEntry / UnexpectedLockEntry). Removing the claim therefore requires publishing a new revision or a reviewed definition revision, neither of which this change performs."
     },
     {
       "id": "manual-entry-page-traceability",

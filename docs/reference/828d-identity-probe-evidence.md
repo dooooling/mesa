@@ -269,7 +269,10 @@ python -c "import json;d=json.load(open('docs/evidence/nck-drive-object-readback
 | 项 | 结果 |
 |---|---|
 | 选定路线 | **路线 2：撤销无依据的测量声明**（不是"接线"路线） |
-| `r1.json:1207` 的 `measurement`（`docs/evidence/nck-live-identity-probe.txt`） | 标记 **`retracted_pending_evidence`**（详见 `828d-definition-source-audit.md` §7.3） |
+| `r1.json:1207` 的 `measurement`（`docs/evidence/nck-live-identity-probe.txt`） | 标记 **`retraction_pending_definition_rev`**（详见 `828d-definition-source-audit.md` §7.3） |
+
+> **生效定义仍携带该声明**：`r1.json` 中 `axis.encoder.module_number` 仍为 `revision=1`、`semantics_status=verified`，且 `source[]` 仍含指向 `docs/evidence/nck-live-identity-probe.txt` 的 `measurement` 条目。本 PR **未移除**它——定义目录的 `(variable_id, revision)` 不可原地修改，且当前不存在撤回机制，移除须发布新 revision 或经评审的定义修订。**审计判定不等于定义已撤回。**
+
 | `r1.json` 是否改动 | **没有**（blob 仍 `3c0abe67cbcb64b525cddec1584e6e1747e0f062`）；实际移除留给后续经评审的定义修订 |
 | `PROBES_828D` 是否删掉该常量 | **没有**。删掉会让 `tests/definition_catalog.rs:404` 的"目录 ↔ 探针逐字段"契约失去可比对象，等于用一个静默缺口换另一个 |
 

@@ -397,20 +397,23 @@ python -c "import json;d=json.load(open('drivers/sinumerik-nck/definitions/828d/
 | 1 | 在常量上加 `FIXME`（证据链缺陷：不在执行路径 + measurement 无对应记录）、`TODO`（待硬件证据后才能接线）、`NOTE`（07/2023 只是较早版本的文档依据） | `drivers/sinumerik-nck/src/identity_spec.rs:134-154`（FIXME `:136`、TODO `:147`） |
 | 2 | 在 `PROBES_828D` 上加 `NOTE`：**集合成员 ≠ 被执行**，当前实际执行集合是 7 个 | `drivers/sinumerik-nck/src/identity_spec.rs:228-242` |
 | 3 | 新增契约层测试：证明该常量**地址自洽**（A/1、col 30220=0x760C、module 26、len 1、transport 0x09）且**明示未被执行** | `drivers/sinumerik-nck/src/identity_spec.rs:344-362`（`enc_module_nr_probe_contract_is_well_formed_but_unexercised`） |
-| 4 | 在审计记录里把该 `measurement` 标记为 `retracted_pending_evidence` | `docs/reference/828d-definition-source-audit.md` §7.3；`docs/reference/828d-identity-probe-evidence.md` §9；本文 §4.4 |
+| 4 | 在审计记录里把该 `measurement` 标记为 `retraction_pending_definition_rev` | `docs/reference/828d-definition-source-audit.md` §7.3；`docs/reference/828d-identity-probe-evidence.md` §9；本文 §4.4 |
+
+> **生效定义仍携带该声明**：`r1.json` 中 `axis.encoder.module_number` 仍为 `revision=1`、`semantics_status=verified`，且 `source[]` 仍含指向 `docs/evidence/nck-live-identity-probe.txt` 的 `measurement` 条目。本 PR **未移除**它——定义目录的 `(variable_id, revision)` 不可原地修改，且当前不存在撤回机制，移除须发布新 revision 或经评审的定义修订。**审计判定不等于定义已撤回。**
+
 | 5 | `r1.json` **未改动**（blob 复核见 §6）；实际移除留给后续经评审的定义修订 | — |
 
 关于"是否要从 `r1.json` 的 `source` 里移除该 measurement"：
 **本轮不移除，也不允许移除**（硬约束：`r1.json` 一字节不许动）。移除动作挂在 §4.4 的待办里。
 
-### 4.4 `retracted_pending_evidence` 记录（本轮的正式标记）
+### 4.4 `retraction_pending_definition_rev` 记录（本轮的正式标记）
 
 ```yaml
 variable_id: axis.encoder.module_number        # r1.json:1199
 source_entry:
   kind: measurement                            # r1.json:1207
   reference: docs/evidence/nck-live-identity-probe.txt
-status: retracted_pending_evidence
+status: retraction_pending_definition_rev
 reason:
   - 所引证据文件（128 行 / 13 小节）没有「编码器驱动号」一节
   - 产生该证据的探针（tests/live_identity_probe.rs）不含 AXIS_ENC_MODULE_NR，故该文件不可能含此读数
@@ -465,7 +468,7 @@ cannot_claim:
 | CI 脚本 | `tools/ci/test_nck_address_evidence.py` | 仅 stdout 编码修复（见 §5.1） |
 | 证据矩阵 | `docs/evidence/nck-native-address-evidence.json` | 新增 `string_lengths` 块（刻意不含 `authority`）；3 条 `unresolved` 的 `note` |
 | 审计记录 | `docs/reference/nck-source-evidence-stage4.md`（新） | 本文 |
-| 审计记录 | `docs/reference/828d-definition-source-audit.md` §7 | 四项登记（含 `retracted_pending_evidence`、`pending_document`） |
+| 审计记录 | `docs/reference/828d-definition-source-audit.md` §7 | 四项登记（含 `retraction_pending_definition_rev`、`pending_document`） |
 | 审计记录 | `docs/reference/828d-manual-cross-reference.md` §13 | progName/SPARPP/SPARPI/SPARPF 逐页检索结果 |
 | 审计记录 | `docs/reference/828d-identity-probe-evidence.md` §9 | encoder 探针裁决与接线前置条件 |
 | 清单 | `docs/reference/sinumerik-828d-manuals.json` | 新增 `pending_documents[]`（11/2023） |
@@ -489,7 +492,7 @@ git ls-files -s drivers/sinumerik-nck/definitions/828d/r1.json
 | 1 | `channel.program.name.main` 的 `column 5` 依据 | `pending_review`（四份手册 0 命中） | 需其他版本/官方证据 |
 | 2 | 66 / 32 字节长度的权威依据 | 66 有"相邻不同变量"表述（p509/p516，且单位是 characters）；32 无；`unresolved: string-lengths` 保持 open | 需官方证据或独立设备证据 |
 | 3 | 11/2023 SINAMICS S120/S150 参数手册 | `pending_document`（19 条定义受影响） | 需取得同版本文件 |
-| 4 | `axis.encoder.module_number` 的 `measurement` | `retracted_pending_evidence`；`r1.json` 待评审后移除 | 定义修订评审 |
+| 4 | `axis.encoder.module_number` 的 `measurement` | `retraction_pending_definition_rev`；`r1.json` 待评审后移除 | 定义修订评审 |
 | 5 | `line=1` → MD30220 编码器下标（0 或 1）的对应关系 | 待核实 | 需真机/官方说明 |
 | 6 | module 字节 26 的权威来源 | `unresolved: module-value-authority`（未变） | 需规格来源 |
 | 7 | 真机验证（含本项及其余点位） | 未做（`real_828d_test_in_this_change = false`） | 需显式授权 + 真机 |

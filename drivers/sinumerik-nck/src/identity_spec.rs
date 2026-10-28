@@ -141,7 +141,7 @@ pub const AXIS_CTRLOUT_TYPE: IdentityProbeSpec = IdentityProbeSpec {
 /// `kind=measurement, reference=docs/evidence/nck-live-identity-probe.txt`，
 /// 而该证据文件（128 行 / 13 小节）**没有编码器驱动号一节** ⇒ 这条测量声明无对应记录。
 /// 该项目前按“撤销声明”处理：`docs/reference/nck-source-evidence-stage4.md` §4 把该
-/// measurement 记为 `retracted_pending_evidence`；`r1.json` 本轮不得改动，实际移除
+/// measurement 记为 `retraction_pending_definition_rev`；`r1.json` 本轮不得改动，实际移除
 /// 留给后续经评审的定义修订。
 ///
 /// TODO(待硬件证据后才能接线): 若要把本探针纳入真实执行路径，前提是先在真实 828D 上
