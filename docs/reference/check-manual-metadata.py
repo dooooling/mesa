@@ -181,15 +181,23 @@ def check_audit_consistency(manuals, verbose):
         ok('B3', 'file_presence_audit.conclusion 无与 documents[] 相反的过期表述')
     if not absent and present:
         ok('B4', '三份文档 file_present=true 且 audit 声明 present_file_count=%d' % len(present))
-    # checked_at_commit
+    # checked_at_commit 只是「检查发生时的 HEAD」这一历史记录值，用于追溯。
+    #
+    # 不能拿它与当前 HEAD 比对来判「清单过期」：本清单本身就在这次提交里，每提交一次
+    # HEAD 必变，那样每次都会 WARN，WARN 会退化成噪音，真正的过期反而被淹没。
+    #
+    # 真正会过期的风险在于「被审计的输入变了」，由两处机械比对覆盖：
+    #   - r1.json 内容是否仍是审计时的版本 —— C3 用 git hash-object 对比 EXPECTED_R1_BLOB_SHA1
+    #   - PDF 是否仍是审计时的那份     —— A 组用 sha256/size 与 documents[] 记录值比对
     cac = audit.get('checked_at_commit') or manuals.get('checked_at_commit')
     if not cac or not re.match(r'^[0-9a-f]{40}$', str(cac)):
         fail('B5', 'file_presence_audit.checked_at_commit 缺失或不是 40 位 commit SHA')
     else:
         head = git('rev-parse', 'HEAD')
         if head and head != cac:
-            warn('B5', 'checked_at_commit=%s 与当前 HEAD=%s 不同（清单可能已过期，请重跑本脚本并更新）'
-                 % (cac[:12], head[:12]))
+            ok('B5', 'checked_at_commit=%s 与当前 HEAD=%s 不同属正常（本次提交即含本清单）；'
+                     '过期以 C3 的 r1.json 摘要与 A 组 PDF 摘要为准'
+                     % (cac[:12], head[:12]))
         else:
             ok('B5', 'checked_at_commit=%s 与当前 HEAD 一致' % cac[:12])
     # 文档正文层面：不允许在任何 .md 里留下“PDF 不在位 / 文件缺失”的过期结论
