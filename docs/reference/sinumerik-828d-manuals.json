@@ -23,10 +23,10 @@
       "series": "828D",
       "expected_version": "07/2023",
       "language": "zh-CHS",
-      "file_present": false,
-      "sha256": null,
+      "file_present": true,
+      "sha256": "4c3346b010509f6df9c49a7b179781ebff0f0a45f27e98235a3cba3f90002620",
       "expected_path": "docs/reference/manuals/828D_sysvar_lists_man_0723_zh-CHS.pdf",
-      "status": "pending_file",
+      "status": "file_present_sha_recorded",
       "scope": {
         "summary": "828D 系统变量清单（NC 系统变量/变量列表类手册）",
         "scope_basis": "仅由文件名 sysvar_lists 可读部分推断；PDF 未到位，实际覆盖面与章节结构**未核实**",
@@ -49,7 +49,21 @@
         "文件名带 _man_ 与 _0723_，仅表文件名自述版本，未验证",
         "PDF 保留在本地工作区，不提交 Git（避免未经许可重新分发西门子文档）；仅提交清单、SHA-256 与来源审计结果。"
       ],
-      "committed_to_git": false
+      "committed_to_git": false,
+      "size_bytes": 9631331,
+      "verified": {
+        "extracted_at_phase": "phase0-subset",
+        "pages": 1236,
+        "pdf_title": "系统变量",
+        "pdf_author": "Siemens AG",
+        "pdf_subject": "SINUMERIK 828D",
+        "pdf_creation_date": "D:20230720135031+01'00'",
+        "pdf_mod_date": "D:20230724072558+02'00'",
+        "page1_text_head": "SINUMERIK SINUMERIK 828D 系统变量 参数手册 适用于： 控制系统 SINUMERIK 828D 软件 CNC 软件版本 5.22 07/2023 6FC5397-5FP40-0RA6 前言 1 基本安全说明 2 一览 3 系统变量列表 4 附录 A",
+        "document_number_seen_in_pdf": true,
+        "version_seen_in_pdf": true,
+        "self_described_as": "参数手册"
+      }
     },
     {
       "id": "828d-md-lists-0723",
@@ -58,10 +72,10 @@
       "series": "828D",
       "expected_version": "07/2023",
       "language": "zh-CHS",
-      "file_present": false,
-      "sha256": null,
+      "file_present": true,
+      "sha256": "344c9e9401f95668373d56f36ec04a8828545823e32ef46f3f9c7497b242027a",
       "expected_path": "docs/reference/manuals/828D_md_lists_man_0723_zh-CHS.pdf",
-      "status": "pending_file",
+      "status": "file_present_sha_recorded",
       "scope": {
         "summary": "828D 机床数据（MD）清单（机床数据列表类手册）",
         "scope_basis": "仅由文件名 md_lists 可读部分推断；PDF 未到位，实际覆盖面与章节结构**未核实**",
@@ -84,7 +98,21 @@
         "该文档可能不覆盖 SINAMICS 驱动参数（r*/p*），覆盖范围待核实",
         "PDF 保留在本地工作区，不提交 Git（避免未经许可重新分发西门子文档）；仅提交清单、SHA-256 与来源审计结果。"
       ],
-      "committed_to_git": false
+      "committed_to_git": false,
+      "size_bytes": 8402056,
+      "verified": {
+        "extracted_at_phase": "phase0-subset",
+        "pages": 690,
+        "pdf_title": "机床数据",
+        "pdf_author": "Siemens AG",
+        "pdf_subject": "SINUMERIK 828D, SINAMICS S120",
+        "pdf_creation_date": "D:20230719150137+01'00'",
+        "pdf_mod_date": "D:20230720104847+02'00'",
+        "page1_text_head": "SINUMERIK SINUMERIK 828D, SINAMICS S120 机床数据 参数手册 适用于： 控制系统 SINUMERIK 828D 软件 CNC 软件，版本 5.22 07/2023 6FC5397-4DP40-6RA6 前言 1 基本安全说明 2 机床/设定数据说明 3 显示机床数据 4 NC 机床数据 5 NC 设定数据 6 循环机床数据和设定数据 7 SINAMICS 参数 8 附录 A",
+        "document_number_seen_in_pdf": true,
+        "version_seen_in_pdf": true,
+        "self_described_as": "参数手册"
+      }
     },
     {
       "id": "sinamics-s120-para-lists-0723",
@@ -93,10 +121,10 @@
       "series": "SINAMICS S120",
       "expected_version": "07/2023",
       "language": "zh-CHS",
-      "file_present": false,
-      "sha256": null,
+      "file_present": true,
+      "sha256": "f9fedd1f953df4d25dedd1721e195380df7f8397773d5603a9f1ec42a6b7c244",
       "expected_path": "docs/reference/manuals/828D_S120_para_lists_man_0723_zh-CHS.pdf",
-      "status": "pending_file",
+      "status": "file_present_sha_recorded",
       "scope": {
         "summary": "SINAMICS S120 参数列表（驱动参数号 r*/p* 清单类手册，文件名前缀为 828D 随附资料）",
         "scope_basis": "仅由文件名 S120_para_lists 与文档号前缀 A5E5 可读部分推断；PDF 未到位，实际覆盖面与章节结构**未核实**",
@@ -121,7 +149,21 @@
         "文档号前缀 A5E5 与 828D 的 6FC5 前缀不同，系列判定按任务提供值记为 SINAMICS S120",
         "PDF 保留在本地工作区，不提交 Git（避免未经许可重新分发西门子文档）；仅提交清单、SHA-256 与来源审计结果。"
       ],
-      "committed_to_git": false
+      "committed_to_git": false,
+      "size_bytes": 8039176,
+      "verified": {
+        "extracted_at_phase": "phase0-subset",
+        "pages": 1414,
+        "pdf_title": "参数描述",
+        "pdf_author": "Siemens AG",
+        "pdf_subject": "SINUMERIK 828D,          SINAMICS S120",
+        "pdf_creation_date": "D:20230731101405+01'00'",
+        "pdf_mod_date": "D:20230831140052+02'00'",
+        "page1_text_head": "SINUMERIK SINUMERIK 828D, SINAMICS S120 参数描述 参数手册 适用于： 控制系统 SINUMERIK 828D 软件 CNC 软件，版本 5.22 SINAMICS S120 书本型和 Combi，版本 5.2 SP3 HF9 07/2023 A5E53014702F AA 引言 1 基本安全说明 2 参数列表说明 3 SINAMICS 参数 4 附录 A",
+        "document_number_seen_in_pdf": true,
+        "version_seen_in_pdf": true,
+        "self_described_as": "参数手册"
+      }
     }
   ],
   "known_version_divergence": {
