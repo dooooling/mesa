@@ -1215,6 +1215,77 @@ mod tests {
         );
     }
 
+    /// 文本点（actBlock 66B / progName 32B）在**执行面**的长度口径：
+    /// 必须与 `expected_len` 逐字节相等，短/长都判 BAD（有缓存则 LastKnown），
+    /// 绝不截断、绝不补齐。`decode_value` 自身只拒绝过短（见 `value.rs` 的边界测试），
+    /// 所以这条 exact 校验是运行时的真实闸门。
+    #[test]
+    fn text_point_requires_exact_wire_length() {
+        fn spec(column: u16, decode: &str) -> PointSpec {
+            let params = serde_json::json!({
+                "area": "C", "area_no": 1, "module": 125, "column": column, "line": 1,
+                "count": 1, "unit_mode": "current", "decode": decode,
+                "transport_size": "0x09",
+            });
+            let addr = NativeNckAddress::from_parameters(params.as_object().unwrap()).unwrap();
+            let rp = resolve_native(addr).unwrap();
+            PointSpec {
+                key: format!("{decode}@{column}"),
+                source_label: rp.address.source_label(),
+                wire: rp.wire,
+                kind: rp.kind,
+                expected_len: rp.expected_data_len,
+                expected_transport_size: rp.expected_transport_size,
+                data_type: rp.data_type,
+                unit: rp.address.unit.clone(),
+                invalid_rule: rp.invalid_rule,
+            }
+        }
+
+        // actBlock：66 字节，正好等于期望长度 ⇒ GOOD，取第一个非空段。
+        let block = spec(31, "UTF8_NUL_FIRST_66");
+        assert_eq!(block.expected_len, 66);
+        let mut cache = std::collections::HashMap::new();
+        let mut good66 = Vec::new();
+        good66.extend_from_slice(b"N10 G0 X0\0");
+        good66.resize(66, 0);
+        let v = decode_point(&block, 1, Some(&good66), Some(0xff), &mut cache);
+        assert_eq!(v.quality, mesa_core_types::Quality::Good);
+        assert_eq!(v.value, mesa_core_types::Value::String("N10 G0 X0".into()));
+
+        // 67 字节（超长一字节）⇒ BAD + LastKnown，**不截断到 66**。
+        let mut long67 = good66.clone();
+        long67.push(b'Z');
+        let v = decode_point(&block, 1, Some(&long67), Some(0xff), &mut cache);
+        assert_eq!(v.quality, mesa_core_types::Quality::Bad);
+        assert_eq!(v.value, mesa_core_types::Value::String("N10 G0 X0".into()));
+        assert_eq!(
+            v.value_origin,
+            mesa_core_types::ValueOrigin::LastKnown,
+            "超长不得杜撰新值"
+        );
+
+        // 65 字节（短一字节）⇒ BAD。
+        let v = decode_point(&block, 1, Some(&good66[..65]), Some(0xff), &mut cache);
+        assert_eq!(v.quality, mesa_core_types::Quality::Bad);
+
+        // progName：32 字节，同一个 exact 口径。
+        let name = spec(3, "UTF8_NUL_LAST_32");
+        assert_eq!(name.expected_len, 32);
+        let mut path = Vec::new();
+        path.extend_from_slice(b"_N_MPF_DIR\0PART.MPF\0");
+        path.resize(32, 0);
+        let v = decode_point(&name, 2, Some(&path), Some(0xff), &mut cache);
+        assert_eq!(v.quality, mesa_core_types::Quality::Good);
+        assert_eq!(v.value, mesa_core_types::Value::String("PART.MPF".into()));
+        let v = decode_point(&name, 2, Some(&path[..31]), Some(0xff), &mut cache);
+        assert_eq!(v.quality, mesa_core_types::Quality::Bad);
+        let mut long33 = path.clone();
+        long33.push(b'Y');
+        let v = decode_point(&name, 2, Some(&long33), Some(0xff), &mut cache);
+        assert_eq!(v.quality, mesa_core_types::Quality::Bad);
+    }
+
     #[test]
     fn descriptor_is_valid_and_read_only() {
         let d = SinumerikNckDriver.descriptor();

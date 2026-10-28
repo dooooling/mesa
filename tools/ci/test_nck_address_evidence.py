@@ -28,6 +28,14 @@ import json
 import os
 import sys
 
+# Windows 控制台默认 GBK 编码：本脚本的断言标签含 `⇒` 与中文，直接 print 会抛
+# UnicodeEncodeError（不是测试失败，却会让 CI 以退出码 1 结束）。这里把 stdout
+# 显式切到 UTF-8，保留逐行 PASS/FAIL 报告可读性；断言逻辑不受影响。
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except (AttributeError, OSError):  # 极老 Python 或已重定向到不可重配置的流
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, '..', '..'))
 sys.path.insert(0, HERE)
