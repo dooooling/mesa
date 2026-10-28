@@ -3,10 +3,11 @@
 // - 连接步（C2）改用共享面板 ConnectionSetupPanel：驱动清单/描述符失败即禁止前进，
 //   参数只由当前 Descriptor 物化，校验/探测结果随参数变化立即失效；
 //   原先的 FALLBACK_DRIVERS 常量已删除（不得把内置列表当可用驱动）；
-// - 数据步用 ResourcePickerAntd：非 NCK 保持 manual 选择；NCK（PR-D）走语义模式
-//   （NckPointFields / NckNativeFields），点位只暂存在本地草稿，提交时交给
-//   planEndpointTaskSave 统一准入与装配。向导**不传 endpointId**：Endpoint 尚未
-//   创建，Browse 必然 404，语义页本身也不需要它；
+// - 数据步：非 NCK 用通用的 `ResourcePickerAntd`；NCK（PR-D）显式渲染
+//   `NckSemanticPicker`（语义选型器，内含 NckPointFields / NckNativeFields），
+//   点位只暂存在本地草稿，提交时交给 planEndpointTaskSave 统一准入与装配。
+//   向导**不传 endpointId**：Endpoint 尚未创建，Browse 必然 404，语义页本身
+//   也不需要它；
 //   C3-D：**允许零采集点**（离线保存）——此时提交 `acquisition.tasks=[]`，且
 //   「创建后启动」默认 false 并禁用，界面明确提示「仅保存，不启动，不立即采集」；
 // - 提交走 bootstrapDevice（create→endpoint→tasks→start，失败反向补偿，
@@ -25,6 +26,7 @@ import {
 import type { ConnectionValues } from "../connection/connectionSetupModel";
 import { ConnectionSetupPanel } from "../connection/ConnectionSetupPanel";
 import { ResourcePickerAntd } from "../components/ResourcePickerAntd";
+import { NckSemanticPicker } from "../components/NckSemanticPicker";
 import { applySelectionAdd } from "../resourceSelectionModel";
 import {
   classifyNckError,
@@ -159,7 +161,7 @@ export function AddDeviceFlow() {
    *
    * 不做直接编辑（不引入第二套编辑状态机）：删除后重新加入必须重新选择变量、
    * 重新运行表单校验并由服务端 Preview 重新计算身份；加入成功时
-   * ResourcePickerAntd 会以 nonce 重挂载语义表单，因此不存在复用旧 Preview 的路径。
+   * ResourcePickerAntd/NckSemanticPicker 会以 nonce 重挂载表单，因此不存在复用旧 Preview 的路径。
    */
   const removeNckPoint = (index: number) => {
     setNckPoints((prev) => prev.filter((_, i) => i !== index));
@@ -466,22 +468,19 @@ export function AddDeviceFlow() {
                   description="family 必须以连接步的 canonical 草稿为准（目录顶层 family 只是回显，不是提交依据）。"
                 />
               ) : null}
-              <ResourcePickerAntd
-                resources={(desc.resources ?? []) as never[]}
-                existingSelections={[] as never}
+              <NckSemanticPicker
+                // 语义选型是驱动专属形态，由本向导显式选择；通用 Picker 不认识它。
                 selectionMethods={(desc.resource_selection_methods ?? ["manual"]) as never}
                 // 刻意**不传 endpointId**：Endpoint 尚未创建，Browse 必然 404；
                 // 语义页自身不需要它。传了反而会让语义叶回填被静默吞掉。
-                semantic={{
-                  driverId: nckDriverId,
-                  // null ⇒ 组件 fail-closed，不退回旧 variable 原生字段路径。
-                  definitions: definitionList,
-                  endpointFamily,
-                  catalogFamily,
-                  nativeSchema,
-                  takenPointKeys: takenNckPointKeys,
-                  onAddPoint: addNckPoint,
-                }}
+                driverId={nckDriverId}
+                // null ⇒ 组件 fail-closed，不退回旧 variable 原生字段路径。
+                definitions={definitionList}
+                endpointFamily={endpointFamily}
+                catalogFamily={catalogFamily}
+                nativeSchema={nativeSchema}
+                takenPointKeys={takenNckPointKeys}
+                onAddPoint={addNckPoint}
               />
               <div style={{ marginTop: 8, fontSize: 12, color: "#525252" }}>
                 浏览需保存后到设备详情页使用；向导内不伪造 Browse 入口。已加入 {nckPoints.length} 个 NCK 点位。

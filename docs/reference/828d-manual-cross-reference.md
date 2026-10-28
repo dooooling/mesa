@@ -1,5 +1,14 @@
 # 828D 定义 ↔ 07/2023 手册逐条交叉引用（Phase 0 阶段 A）
 
+> **阶段 B 增补（03/2025 NC 变量手册）** —— 见 **§12**。
+> 阶段 B 单独核验了 13 条 `not_found` + 2 条 `pending_review`（共 15 条），使用的是**所引版本的原始文档**
+> `SINUMERIK 828D NC variables`，文档号 `A5E53370586B AC`、版本 `03/2025`、1262 页
+> （SHA-256 `1274440e…b5ed1`）。
+> 结果：**14 条 `exact_match`、1 条仍 `pending_review`（`channel.program.name.main`）**；
+> 但**地址映射**上 `manual_gives_native_address` 为 **0 条**——手册给出区域/块助记名/`Column index`/`Line index`，
+> **从不给出 Mesa 原生地址里的 `module` 字节取值**（详见 §12.5）。
+> 本节（§0–§11）的 07/2023 结论**一个字都没有改**，两轮分布分开统计（§12.8 与 §2.4）。
+
 本文件逐条回答一个问题：**r1.json 的 42 条定义，能否在三份 07/2023 手册 PDF 中找到对应条目，找到在第几页、结论是什么。**
 
 一句话结论：**35 条有 manual 来源的定义中，19 条在 07/2023 手册中找到同名条目且语义/类型不冲突（属较早版本），1 条存在实质差异，13 条在三份 PDF 中完全没有该标识符，2 条只在正文被提及而无条目定义；`exact_match` 为 0，因为三份 PDF 都是 07/2023，早于所引的 03/2025 与 11/2023。**
@@ -19,6 +28,16 @@
 | scope | collect 36 / identity 6 |
 | 手册 PDF | 三份 07/2023，共 1236 + 690 + 1414 = 3340 页，本地 `docs/reference/manuals/`（gitignore:76-77，不入库） |
 | 抽取工具 | pypdf（本机 6.6.0）逐页 `extract_text()` |
+
+阶段 B 增补的第四份文档（与上表并列，**不替代**任何 07/2023 结论）：
+
+| 项 | 值 |
+|---|---|
+| 文件 | `docs/reference/manuals/828D_ncvar_lists_man_0325_en-US.pdf` |
+| 文档号 / 版本 / 语言 | `A5E53370586B AC` / `03/2025` / `en-US`（首页与 PDF `/DocumentId` 一致） |
+| 页数 | 1262（实测）；PDF 页 = 印刷页，偏移 0（§12.6） |
+| SHA-256 | `1274440ed70ef00e82d5f3560e38558740139fa6337405c75df4f0bea1eb5ed1` |
+| 与定义的关系 | **正是 16 条定义 `source[].reference` 所写的文档，文档号/版本逐字相同** ⇒ 阶段 B 的核验对象是“所引来源版本”，故可判 `exact_match` |
 
 ## 1. 本轮纪律（评审可直接用于否决）
 
@@ -448,3 +467,229 @@ PY
 - **实体 828D 的硬件验收状态**
 - 生产库配置
 - `docs/reference/sinumerik-828d-manuals.json` 中第 4 份文档已登记为 `pending_file`，PDF 同样不入库
+
+<!-- BEGIN SECTION-0325 -->
+
+## 12. 03/2025 交叉引用（`A5E53370586B AC`，实测 1262 页）
+
+> 本节是**并列新增**的核验：§3–§6 的 07/2023 结论**一个字都没有改**。07/2023 与 03/2025 的分布分开统计（见 §12.8）。
+> 本节只写 `docs/reference/` 下的文档；`r1.json`、代码、测试、契约一律未改（见 §12.10）。
+
+### 12.0 这节要回答的问题
+
+1. 13 条 `not_found` 与 2 条 `pending_review`，在**所引版本的原始文档**（03/2025 NC 变量手册）里到底有没有独立条目？在**第几页**？
+2. 手册条目**是否直接给出** Mesa 原生线缆地址（area / area_no / module / column / line）？还是**只能证明语义存在**、地址映射仍需另行证明？
+
+第 2 个问题是本节的核心产出（§12.5），比页码更重要。
+
+### 12.1 手册身份（本机实测，不采信文件名自述）
+
+| 项 | 实测值 | 实测方式 |
+|---|---|---|
+| 文件 | `docs/reference/manuals/828D_ncvar_lists_man_0325_en-US.pdf` | 文件在位 |
+| 文档号（印刷 + PDF 元数据） | `A5E53370586B AC` | 首页文字与 PDF `/DocumentId` 两处一致 |
+| 版本 | `03/2025` | 首页 `03/2025`；PDF 创建日期 `D:20250120…` |
+| 适用软件 | CNC software, version **5.25** | 首页 `Valid for: … CNC software, version 5.25` |
+| 语言 | `en-US` | 元数据 `/Language=en`，正文英文 |
+| 页数 | **1262** | `PdfReader.pages` |
+| SHA-256 | `1274440ed70ef00e82d5f3560e38558740139fa6337405c75df4f0bea1eb5ed1` | `hashlib.sha256` 全文 |
+| 首页自述 | `SINUMERIK 828D NC variables List Manual` | 逐字 |
+
+**关键**：该文档号与 16 条定义 `source[].reference` 里写的 `Siemens 828D NC variables 03/2025 A5E53370586B AC` **逐字相同**，因此本轮是**所引来源版本**的核验，不是“较早版本比对”——这就是本次允许判 `exact_match` 的依据（判据见 §2.3 的 `exact_match` 定义）。
+
+### 12.2 定位方法（可复核）
+
+- **检索串**：仍用 `r1.json` 的 `golden_ref.variable`（OPI 变量名）——`opMode`、`progName`、`actLineNumber`、`actBlock`、`actToolBasePos`、`actProgPosBKS`、`actFeedRateIpo`、`cmdFeedRateIpo`、`feedRateIpoOvr`、`actSpeed`、`cmdSpeed`、`speedOvr`、`actTNumber`、`progStatus`、`rpa`。
+- **第二重校验**：手册条目标签形如 `(区域, 块)`（如 `(C, S)`），块助记名可与 `golden_ref.block` 直接比对；并对手册全文的 4015 处 `(区域, 块)` 标签做机械统计，用于判断某块在手册中是否存在条目。
+- **不用的检索串**：`variable_id`（本仓库命名，手册里不出现）与中文 label（手册是 en-US）。
+- **抽取**：pypdf 6.6.0 逐页 `extract_text()`，1262 页全部成功（见 §12.7）；区分大小写与不区分大小写两轮检索。
+- **章节号**取自 PDF 目录页 p3–p6 与页眉；页码为 PDF 页码（= 印刷页，§12.6）。
+
+### 12.3 16 条逐条结果（必核 15 条 + 顺带 1 条）
+
+`channel.r_parameter` 不属本次必核清单（它原本是 `matching_older_version`），顺带核对是为了把「03/2025 组 16 条」补全到 16/16，并给出 `line` 索引规则的直接证据。
+
+| # | `variable_id` | 手册中的标识（条目头逐字） | 页 | 章节 | 手册给出的地址要素 | 本仓 r1 原生地址 | `match_conclusion` | `address_mapping_conclusion` |
+|---|---|---|---|---|---|---|---|---|
+| 1 | `mode_group.op_mode` | `opMode opMode (B, S) DB11, DBXn6.0-n6.2 (n=0,2,4,6, ...)` | p89, p90 | 5.2.1 S: Status data（章 5.2 "Area mode group data mode group (B)" 自 p88 起；本条条目跨 p89–p90） | (B, S) / col 3 / line 空 / TYPE_UWORD / 参考机床数据 `DB11, DBXn6.0-n6.2 (n=0,2,4,6, ...)` | `B / 127 / col 3 / line 1` | `exact_match` | `manual_semantic_only` |
+| 2 | `channel.program.name.main` | `progName`（无 `(C, SPARPP)` 条目；命中 `(C, SPARP)`/`(C, SPARPF)`/`(C, SPARPI)`） | p530, p531, p515, p522, p526 | 5.3.27 SPARPP: Program pointers in the automatic mode（p530；本章条目实际全部标为 (C, SPARPI)） | 无 `(C, SPARPP)` 条目 / col 无 / line 空 / TYPE_STRING | `C / 122 / col 5 / line 1` | `pending_review` | `pending_review` |
+| 3 | `channel.program.name.active` | `progName progName (C, SPARP)` | p515 | 5.3.24 SPARP: Part program information（p506 起） | (C, SPARP) / col 3 / line 空 / TYPE_STRING | `C / 125 / col 3 / line 1` | `exact_match` | `manual_semantic_only` |
+| 4 | `channel.program.line_number` | `actLineNumber actLineNumber (C, SPARP)` | p508 | 5.3.24 SPARP: Part program information（p506 起） | (C, SPARP) / col 9 / line=1 / TYPE_DWORD | `C / 125 / col 9 / line 1` | `exact_match` | `manual_semantic_only` |
+| 5 | `channel.program.block` | `actBlock actBlock (C, SPARP)` | p507 | 5.3.24 SPARP: Part program information（p506 起） | (C, SPARP) / col 31 / line=1 / TYPE_STRING | `C / 125 / col 31 / line 1` | `exact_match` | `manual_semantic_only` |
+| 6 | `axis.position.commanded_mcs` | `actToolBasePos actToolBasePos (C, SGA)` | p488 | 5.3.20 SGA: Status data in the WCS（p487 起） | (C, SGA) / col 2 / line=Axis index / TYPE_DOUBLE | `C / 115 / col 2 / line=轴号` | `exact_match` | `manual_semantic_only` |
+| 7 | `axis.position.actual_bcs` | `actProgPosBKS actProgPosBKS (C, SEGA)` | p387 | 5.3.18 SEGA: Extended status data in the WCS（p380 起） | (C, SEGA) / col 33 / line=Axis index / TYPE_DOUBLE | `C / 112 / col 33 / line=轴号` | `exact_match` | `manual_semantic_only` |
+| 8 | `channel.feed.actual` | `actFeedRateIpo actFeedRateIpo (C, S)` | p272 | 5.3.16 S: Status data（p219 起） | (C, S) / col 1 / line 空 / TYPE_DOUBLE | `C / 127 / col 1 / line 1` | `exact_match` | `manual_semantic_only` |
+| 9 | `channel.feed.commanded` | `cmdFeedRateIpo cmdFeedRateIpo (C, S) $AC_F` | p288 | 5.3.16 S: Status data（p219 起） | (C, S) / col 2 / line 空 / TYPE_DOUBLE / 参考机床数据 `$AC_F` | `C / 127 / col 2 / line 1` | `exact_match` | `manual_semantic_only` |
+| 10 | `channel.feed.override` | `feedRateIpoOvr feedRateIpoOvr (C, S)` | p292 | 5.3.16 S: Status data（p219 起） | (C, S) / col 3 / line 空 / TYPE_DOUBLE | `C / 127 / col 3 / line 1` | `exact_match` | `manual_semantic_only` |
+| 11 | `spindle.speed.actual` | `actSpeed actSpeed (C, SSP)` | p536 | 5.3.28 SSP: Spindle status data（p535 起） | (C, SSP) / col 2 / line=Spindle index / TYPE_DOUBLE | `C / 114 / col 2 / line=主轴号` | `exact_match` | `manual_semantic_only` |
+| 12 | `spindle.speed.commanded` | `cmdSpeed cmdSpeed (C, SSP)` | p537 | 5.3.28 SSP: Spindle status data（p535 起） | (C, SSP) / col 3 / line=Spindle index / TYPE_DOUBLE | `C / 114 / col 3 / line=主轴号` | `exact_match` | `manual_semantic_only` |
+| 13 | `spindle.speed.override` | `speedOvr speedOvr (C, SSP)` | p541 | 5.3.28 SSP: Spindle status data（p535 起） | (C, SSP) / col 4 / line=Spindle index / TYPE_DOUBLE | `C / 114 / col 4 / line=主轴号` | `exact_match` | `manual_semantic_only` |
+| 14 | `channel.tool.number_active` | `actTNumber actTNumber (C, S) $P_TOOLNO` | p277 | 5.3.16 S: Status data（p219 起） | (C, S) / col 23 / line 空 / TYPE_UWORD / 参考机床数据 `$P_TOOLNO` | `C / 127 / col 23 / line 1` | `exact_match` | `manual_semantic_only` |
+| 15 | `channel.program.status` | `progStatus progStatus (C, S) DB21-30, DBX35.0 - DBX35.4` | p306 | 5.3.16 S: Status data（p219 起） | (C, S) / col 13 / line 空 / TYPE_UWORD / 参考机床数据 `DB21-30, DBX35.0 - DBX35.4` | `C / 127 / col 13 / line 1` | `exact_match` | `manual_semantic_only` |
+| 16 | `channel.r_parameter` | `rpa rpa (C, RP) $R[x] x = ParameterNo`（顺带核对） | p219 | 5.3.15 RP: Arithmetic parameters（p219） | (C, RP) / col 1 / line=R parameter + 1 / TYPE_DOUBLE / 参考机床数据 `$R[x] x = ParameterNo` | `C / 21 / col 1 / line=R号+1` | `exact_match` | `manual_semantic_only` |
+
+### 12.4 抽取原文片段（英文原文逐字，不翻译）
+
+下列片段为 pypdf 抽取文本**原样**：换行以 ` / ` 表示，跨页以 `<pNN>` 标记。写入前由脚本断言每段确实存在于该页抽取结果中（不是手打）。
+
+| # | 变量 | 页 | 抽取原文片段 |
+|---|---|---|---|
+| 1 | `mode_group.op_mode` | p89,p90 | <p89> opMode opMode (B, S) DB11, DBXn6.0-n6.2 (n=0,2,4,6, ...) / Active mode / Return value / 0 = JOG / 1 = MDI / 2 = AUTO / Units and value ranges / Physical unit: / - / Data type: / TYPE_UWORD <p90> opMode opMode (B, S) DB11, DBXn6.0-n6.2 (n=0,2,4,6, ...) / Column index: / 3 / Line index: Max. line index: /   Read access |
+| 2 | `channel.program.name.main` | p530,p531,p515,p522,p526 | <p530> 5.3.27 SPARPP: Program pointers in the automatic mode <p531> progName progName (C, SPARPI)   / Program name / Progam name of the currently active program (or subroutine) / Units and value ranges / Physical unit: / - / Data type: / TYPE_STRING / Default value: Minimum value: Maximum value: / Area / Column index: / 7 / Line index: / Index of program level / Max. line index: / 18 |
+| 3 | `channel.program.name.active` | p515 | <p515> progName progName (C, SPARP)   / Program name / Progam name of the currently active program (or subroutine) / Units and value ranges / Physical unit: / - / Data type: / TYPE_STRING / Default value: Minimum value: Maximum value: / Area / Column index: / 3 / Line index: Max. line index: /   Read access |
+| 4 | `channel.program.line_number` | p508 | <p508> actLineNumber actLineNumber (C, SPARP)   / Line number of current NC instruction (start:1) / Line number of the current NC instruction (starting at 1) / 0: before program start / -1: not available due to an error / -2: not available because of DISPLOF / Units and value ranges / Physical unit: / - / Data type: / TYPE_DWORD / Default value: Minimum value: Maximum value: / Area / Column index: / 9 / Line index: / 1 / Max. line index: / 1 |
+| 5 | `channel.program.block` | p507 | <p507> actBlock actBlock (C, SPARP)   / Current block (DISPLOF active) / Current part program block. / With DISPLOF the subroutine call is displayed. / Units and value ranges / Physical unit: / - / Data type: / TYPE_STRING / Default value: Minimum value: Maximum value: / Area / Column index: / 31 / Line index: / 1 / Max. line index: / 1 |
+| 6 | `axis.position.commanded_mcs` | p488 | <p488> actToolBasePos actToolBasePos (C, SGA)   / Axis setpoint in the machine coordinate system / Determines the current setpoint of the axis in the machine coordinate system (MCS) for the corresponding axis.  / This value contains all axis-specific override components (e.g. Differential Resolver Function, $AA_OFF, external work offset) / Units and value ranges / Physical unit: / mm, inch, degree, user  / defined / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 2 / Line index: / Axis index / Max. line index: / numMachAxes |
+| 7 | `axis.position.actual_bcs` | p387 | <p387> actProgPosBKS actProgPosBKS (C, SEGA)   / Actual value in basic coordinate system / Actual value of geometry and orientation axes in basic coordinate system / Units and value ranges / Physical unit: / mm, inch, degree, user  / defined / Data type: / TYPE_DOUBLE / Default value: / 0.0 / Minimum value: Maximum value: / Area / Column index: / 33 / Line index: / Axis index / Max. line index: / numMachAxes |
+| 8 | `channel.feed.actual` | p272 | <p272> actFeedRateIpo actFeedRateIpo (C, S)   / Actual value of the interpolation feedrate / Actual value of the interpolation feedrate. The actual value is the feed actually moved with. (depends on the acceleration profiles, LookAhead,  / velocity limits etc. ) The variable 'feedRateIpoUnit' defines the physical unit. / Units and value ranges / Physical unit: / mm/min, inch/min, user  / defined / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 1 / Line index: Max. line index: |
+| 9 | `channel.feed.commanded` | p288 | <p288> cmdFeedRateIpo cmdFeedRateIpo (C, S) $AC_F / Desired value of the interpolation feedrate / Desired feedrate of the interpolation feedrate. The physical unit is defined in the variable 'feedRateIpoUnit' / Units and value ranges / Physical unit: / mm/min, inch/min, user  / defined / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 2 / Line index: Max. line index: |
+| 10 | `channel.feed.override` | p292 | <p292> feedRateIpoOvr feedRateIpoOvr (C, S)   / Interpolation feedrate, override / Units and value ranges / Physical unit: / % / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 3 / Line index: Max. line index: |
+| 11 | `spindle.speed.actual` | p536 | <p536> actSpeed actSpeed (C, SSP)   / Actual value of the spindle speed / Current speed of the spindle [n]. / The sign indicates the direction of rotation. The direction of rotation can vary from machine to machine, and is specified by the machine  / manufacturer. / Units and value ranges / Physical unit: / rev/min, user defined / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 2 / Line index: / Spindle index / Max. line index: / numSpindles |
+| 12 | `spindle.speed.commanded` | p537 | <p537> cmdSpeed cmdSpeed (C, SSP)   / Spindle speed, desired value / Spindle speed desired value / Units and value ranges / Physical unit: / rev/min , m/min / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 3 / Line index: / Spindle index / Max. line index: / numSpindles |
+| 13 | `spindle.speed.override` | p541 | <p541> speedOvr speedOvr (C, SSP)   / Spindle override / Units and value ranges / Physical unit: / % / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 4 / Line index: / Spindle index / Max. line index: / numSpindles |
+| 14 | `channel.tool.number_active` | p277 | <p277> actTNumber actTNumber (C, S) $P_TOOLNO / Active tool number / The command should not be used if magazine management (TMMG=1) is active. / If magazine management is active, GETTEXET should be used instead. / For $MC_CUTTING_EDGE_DEFAULT=0 or -2, an incorrect T number may be determined. / If the programming is made after programming D > 0, it is also safe. /   / Units and value ranges / Physical unit: / - / Data type: / TYPE_UWORD / Default value: Minimum value: / 0 / Maximum value: / 32000 / Area / Column index: / 23 / Line index: Max. line index: |
+| 15 | `channel.program.status` | p306 | <p306> progStatus progStatus (C, S) DB21-30, DBX35.0 - DBX35.4 / Program status / Return value / 1 = interrupted / 2 = stopped / 3 = in progress / 4 = waiting / 5 = aborted / Units and value ranges / Physical unit: / - / Data type: / TYPE_UWORD / Default value: Minimum value: Maximum value: / Area / Column index: / 13 |
+| 16 | `channel.r_parameter` | p219 | <p219> rpa rpa (C, RP) $R[x] x = ParameterNo / R variables / Units and value ranges / Physical unit: / - / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 1 / Line index: / R parameter + 1 / Max. line index: / $MC_MM_NUM_R_PARA / M + 1 /   Read access and write access |
+
+人工可判读抽查（对应上表 #1、#6、#7、#13、#14、#16）：
+
+1. `opMode` 条目头 `opMode opMode (B, S) DB11, DBXn6.0-n6.2 (n=0,2,4,6, ...)` 与返回值 `0 = JOG / 1 = MDI / 2 = AUTO` 可读 → 与 label「方式组运行方式」对得上（p89–p90）。
+2. `actToolBasePos` 描述 `Axis setpoint in the machine coordinate system` 可读 → 与 label「轴指令位置（机床坐标系）」对得上（p488）。
+3. `actProgPosBKS` 描述 `Actual value in basic coordinate system` 可读 → 与 label「轴实际位置（基本坐标系）」对得上（p387）。
+4. `actTNumber` 的 `Column index: 23` 与 `TYPE_UWORD` 可读 → 与 `column=23` / `U16_LE` 对得上（p277）。
+5. `progStatus` 的 `Return value 1 = interrupted … 5 = aborted` 与 `Column index: 13` 可读 → 与 `column=13` 对得上（p306）。
+6. `rpa` 的 `Line index: R parameter + 1` 可读 → 与 r1 的 `argument_offset(index)+1` **逐字相符**（p219）。
+
+### 12.5 地址映射结论（本次核心产出）
+
+**先分清两种地址**：
+
+- **手册给的是 NC 变量条目的“寻址描述”**：区域 + 块助记名 + `Column index` + `Line index` + 数据类型；个别条目另给一行绝对的 **DB 号 + DBX 字节.位**（该行的列名是 `Reference to assigned machine data`）。
+- **Mesa 用的是原生 NCK 线缆地址**：`area` / `area_no` / `module` / `column` / `line` 五段，其中 `module` 在 S7 变量规范里承载一个 **u8 数值**（线缆布局见 `drivers/sinumerik-nck/src/codec.rs:6-9`、字段定义 `drivers/sinumerik-nck/src/codec.rs:55`，地址模型见 `drivers/sinumerik-nck/src/native.rs:120`）。
+
+| Mesa 原生字段 | 03/2025 手册是否给出 | 手册中的形态 | 逐条比对结果 |
+|---|---|---|---|
+| `area` | **给出** | 条目标签 `(C, S)` 的第一段 + 章标题 `5.3 Area channel (C)` | 16/16 与 `golden_ref.area` 一致 |
+| `area_no` | **不给** | 手册 4.3（p20）只把 “Area number” 列为访问要素，条目里不给编号 | 无法比对（r1 由 `target` 决定，如 `channel=1`） |
+| `module` | **不给** | 手册的 Addressing 表**没有**该字段；条目标签只给块助记名；全文无任何数值块号 | **0/16 可比对** |
+| `column` | **给出** | `Column index: <n>` | **15/16 完全相等**（唯一例外 `channel.program.name.main`：手册无 `(C, SPARPP)` 条目） |
+| `line` | **给出** | `Line index`、`Max. line index`、以及 “Axis index / Spindle index / R parameter + 1” 语义 | **15/15 相容**（单行 ↔ `line=1`；轴/主轴索引 ↔ `target`；`R parameter + 1` ↔ `argument_offset(index)+1` 逐字相符） |
+
+**结论（一句话）**：`address_mapping_conclusion = manual_gives_native_address` 的条数是 **0**；16 条里 **15 条为 `manual_semantic_only`**、1 条为 `pending_review`。手册能证明「语义 + 区域 + 块 + 列号 + 行号」，**不能证明 `module` 字节的取值**，`area_no` 也不由条目给出。
+
+#### 12.5.1 为什么 DB11 / DB21-30 不能当作 `module`
+
+15 条里只有 2 条在条目第二行给出绝对 DB 号：`opMode` = `DB11, DBXn6.0-n6.2 (n=0,2,4,6, ...)`（p89），`progStatus` = `DB21-30, DBX35.0 - DBX35.4`（p306）。三条事实说明它**不是** Mesa 的 `module`：
+
+1. **列名不允许**：Table 4-6（p24）把条目第二行定义为 `Reference to assigned machine data`，真正的寻址字段在下一张表（p25 的 `Addressing`：Area / Column index / Line index / Max. line index / 访问权限）。同一位置在 `actTNumber`（p277）写的是 `$P_TOOLNO`、在 `rpa`（p219）写的是 `$R[x] x = ParameterNo`——这些显然不是“模块号”，而是“参考的机床数据/系统变量”。
+2. **编号体系不同**：§4.6（p25–26）明确这类 `DB…, DBX…` 写法是 **SINUMERIK ONE** 的绝对地址，并给出 828D 换算表：`DB11.DBX6.7` → `DB3300.DBX3.7`、`DB31, … .DBX12.2` → `DB380x.DBX1000.2`、`DB10.DBX108.3` → `DB2700.DBX2.3`。也就是说手册自己声明“这批 DB 号不是本机型（828D）的绝对地址”。
+   更直接的对照：同页 p90 的 `resetActive resetActive (B, S) DB11, DBX6.3, DBX26.3, DBX46.3, ...` 与 §4.6 表里的 `DB11.DBX6.7` → `DB3300.DBX3.7` 是同一个 DB11 的同一个字节 6，而 `opMode` 的 `DBXn6.0-n6.2` 正是该字节的第 0..2 位。
+3. **真机事实与之不符**（属另一证据类别，仅作对照）：同一台 828D 上实际被接受的 `module` 字节按块而不同，并非 `DB11`/`DB21`：S=0x7f(127)、RP=0x15(21)、SSP=0x72(114)、SGA=0x73(115)、SEGA=0x70(112)（`docs/evidence/nck-live-samples-probe.txt:8,11,16,25,34`）。其中 RP=21 与 `r1.json:457` 的 `channel.r_parameter` `module=21` 相符，而 S 块是 127 —— **恰好说明 `module` 是“按块取值”的线缆字段，其取值不由本手册提供**。
+
+> 由此产生的独立缺口登记在 JSON 的 `open_gaps[].module_byte_value_not_covered_by_manual_0325`：`module` 取值的来源必须另行证明（协议规范或真机逐块留证），**不得**用「手册里有同名变量」推定 `module` 已对上，也**不得**用 `DB11`/`DB21-30` 反推 `module`。
+
+#### 12.5.2 手册的 `Area` 单元格是空的（排版事实）
+
+条目 Addressing 表里的 `Area` 行在 PDF 中是**空值单元格**（`extract_text(extraction_mode="layout")` 在 p306 实测：`Area` 独占一行、其下无值）。区域信息来自条目标签 `(C, S)` 与章标题，而不是该单元格。这一条只影响“怎么读手册”，不改变结论。
+
+### 12.6 PDF 页码 vs 印刷页码（03/2025 单独实测）
+
+做法：逐页取页脚，用页脚里的文档号 `A5E53370586B AC` 定位印刷页码，再与 PDF 页号相减。
+
+| 文件 | 总页数 | 成功取到印刷页码 | 偏移 `PDF页 − 印刷页` 分布 | 取不到的页 |
+|---|---|---|---|---|
+| `828D_ncvar_lists_man_0325_en-US.pdf` | 1262 | 1260 | `{0: 1260}` | p1 封面、p2 法律资讯（无页脚） |
+
+**结论：偏移 0（1260 页验证，0 例外）**。页脚两种版式：偶数页 `46 NC variables / List Manual, 03/2025, A5E53370586B AC` 式，奇数页 `List Manual, 03/2025, A5E53370586B AC 89` 式（文档号在页码前）。
+
+独立旁证：手册自带索引（p1231 起）给出的页码与实测页码一致，例如 `opMode, 89, 90`（p1251）、`progStatus, 306`（p1253）、`actTNumber, 277`（p1235）、`actFeedRateIpo, 272, 386`（p1234）、`cmdSpeed, 537, 553, 1035, 1051`（p1239）、`rpa, 219`（p1255）。
+
+### 12.7 抽取质量与覆盖率
+
+| 项 | 值 |
+|---|---|
+| 抽取工具 | pypdf 6.6.0（`extract_text()`，非 layout 模式；layout 模式只在 §12.5.2 用于确认空单元格） |
+| 总页数 | 1262 |
+| 抽取成功（有文本） | **1262 / 1262** |
+| 抽取失败（抛异常） | **0** |
+| 抽取成功但空文本 | **0** |
+| 乱码 / CID 未映射 | 未发现：16 条条目的名称、描述、`Column index`、`Data type` 均逐字可读（见 §12.4） |
+| 失败页说明 | 无失败页，故无需说明 |
+
+抽取缓存不随文档入库：PDF 规则见 `.gitignore:76-77`（`docs/reference/manuals/*.pdf`），临时缓存见 `.gitignore:80`（`docs/reference/.cache_*`）；复核命令见 §12.10。
+
+### 12.8 分布（03/2025 单独统计，与 07/2023 并列）
+
+必核 15 条（13 条原 `not_found` + 2 条原 `pending_review`）：
+
+| `match_conclusion`（03/2025） | 条数 | 条目 |
+|---|---|---|
+| `exact_match` | 14 | `mode_group.op_mode`, `channel.program.name.active`, `channel.program.line_number`, `channel.program.block`, `axis.position.commanded_mcs`, `axis.position.actual_bcs`, `channel.feed.actual`, `channel.feed.commanded`, `channel.feed.override`, `spindle.speed.actual`, `spindle.speed.commanded`, `spindle.speed.override`, `channel.tool.number_active`, `channel.program.status` |
+| `pending_review` | 1 | `channel.program.name.main` |
+| `matching_older_version`、`version_difference`、`not_found` | 0 | — |
+| **合计** | **15** | |
+
+含顺带核对的 `channel.r_parameter` 共 16 条：`exact_match` 15、`pending_review` 1。
+
+`address_mapping_conclusion`（16 条）：
+
+| 取值 | 条数 |
+|---|---|
+| `manual_gives_native_address` | 0 |
+| `manual_semantic_only` | 15 |
+| `pending_review` | 1 |
+| `not_found` | 0 |
+
+对照 07/2023 分布（**未改动**，见 §2.4）：`exact_match` 0、`matching_older_version` 19、`version_difference` 1、`not_found` 13、`pending_review` 2（合计 35）。
+
+### 12.9 与 07/2023 结论的关系（升级清单，07/2023 原文保留）
+
+| 变化 | 条数 | 条目 |
+|---|---|---|
+| `not_found` → `exact_match` | 12 | `mode_group.op_mode`、`channel.program.name.active`、`channel.program.line_number`、`channel.program.block`、`axis.position.commanded_mcs`、`axis.position.actual_bcs`、`channel.feed.actual`、`channel.feed.commanded`、`channel.feed.override`、`spindle.speed.actual`、`spindle.speed.override`、`channel.tool.number_active` |
+| `pending_review` → `exact_match` | 2 | `channel.program.status`、`spindle.speed.commanded` |
+| `not_found` → `pending_review`（仍未解决） | 1 | `channel.program.name.main` |
+| 07/2023 结论不变（`matching_older_version` → `exact_match`，因找到所引版本） | 1 | `channel.r_parameter` |
+
+两条 `pending_review` 的原文疑虑，在 03/2025 中都已解开：
+
+- `channel.program.status`：07/2023 只在 md p222–223 正文提到 `progStatus`；03/2025 有独立条目（p306，`Column index: 13`、`TYPE_UWORD`、返回值 1..5），与 `r1.json:7` 的 `column=13` / `U16_LE` 一致。
+- `spindle.speed.commanded`：07/2023 的 md p39 把 `cmdSpeed` 归到功能块 SPARPP，与定义 `block=SSP` 冲突；03/2025 明确该变量属 `(C, SSP)` 块（p537，`Column index: 3`），冲突消除。
+
+`channel.program.name.main` **为什么没有升级**：03/2025 手册里 `progName` 只出现在 `(C, SPARP)`（p515，col 3）、`(C, SPARPF)`（p522，col 7）、`(C, SPARPI)`（p526、p531，col 7）；全文 4015 处 `(区域, 块)` 标签中 **`(C, SPARPP)` 计数为 0**，仅有章标题「5.3.27 SPARPP: Program pointers in the automatic mode」（p530），且该章内条目全部标 `(C, SPARPI)`。r1 该条 `block=SPARPP` / `module=122` / `column=5` 三项都无手册依据，按纪律**不因名称相似升级**，保持 `pending_review`（`r1.json:65`）。
+
+### 12.10 本轮纪律（可复核的“没做什么”）
+
+1. **`r1.json` 一字未改**：`git hash-object` 仍为 `3c0abe67cbcb64b525cddec1584e6e1747e0f062`（由 `check-manual-metadata.py` 的 C3 项机械复核）。
+2. **07/2023 结论未改**：`entries[].match_conclusion` 与 `entries[].cross_reference_202307` 保持原值；03/2025 的结论写在新增的 `entries[].cross_reference_202503` 里。
+3. **不把 03/2025 页码回填进 `r1.json`**：`backfill_to_r1_allowed=false`（逐条）。
+4. **不用 DB 号顶替 `module`**，不因同名把候选升级为已验证（见 §12.5）。
+5. **不把手册证据当成设备可读证据**：16 条里仅 5 条另有真机读数（`progStatus`、`actFeedRateIpo`、`actToolBasePos`、`actProgPosBKS`、`cmdSpeed`）与 `rpa`，它们同属 `measurement` 类别，与手册证据分开记。
+
+复核命令（只读；需要本地有该 PDF，PDF 不入库）：
+
+```bash
+# 1) 机械校验（文件身份/清单矛盾/统计口径/覆盖率/缺口说明/03-2025 新增字段不影响旧结论）
+python docs/reference/check-manual-metadata.py
+
+# 2) 逐页抽取并检索某一条（示例：progStatus）
+python - <<'PY'
+from pypdf import PdfReader
+r = PdfReader("docs/reference/manuals/828D_ncvar_lists_man_0325_en-US.pdf")
+for i, p in enumerate(r.pages, 1):
+    t = p.extract_text() or ""
+    if "progStatus" in t:
+        print(i, [l for l in t.splitlines() if "progStatus" in l])
+PY
+
+# 3) 复算本节的分布（03/2025 单独统计）
+python - <<'PY'
+import json, collections
+d = json.load(open("docs/reference/828d-manual-cross-reference.json", encoding="utf-8"))
+cr = [e["cross_reference_202503"] for e in d["entries"] if "cross_reference_202503" in e]
+print(len(cr), collections.Counter(c["match_conclusion"] for c in cr),
+      collections.Counter(c["address_mapping_conclusion"] for c in cr))
+PY
+```
+
+<!-- END SECTION-0325 -->

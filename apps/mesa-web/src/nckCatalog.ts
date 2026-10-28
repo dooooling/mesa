@@ -17,6 +17,8 @@
 //
 // 本文件为纯客户端逻辑：不 import React/AntD，可被 vitest 直接驱动。
 
+import { CatalogContractError, readCompleteCatalog, type CompleteCatalogResult } from "./catalogContract";
+
 /** 目录条目里的一条来源声明（I-2 `source[]`）。 */
 export interface NckCatalogSourceRef {
   kind?: string;
@@ -459,85 +461,45 @@ export interface NckCatalogLoadOptions {
 }
 
 /**
- * 读取**完整分页目录**（不遗漏、不重复）。
- *
- * 三条硬性判定：
- * - `next_cursor` 逐字回传，直到为 null；
- * - `total` 是「过滤后、分页前」的总数，必须跨页恒定；结束时条目数必须等于它；
- * - `(variable_id, revision)` 重复出现 ⇒ 契约损坏，报错而不是静默去重（静默去重
- *   会掩盖「分页游标错误」这类真实缺陷，且让 total 校验失去意义）。
+ * 读取完整分页目录。通用分页不变量统一委托给 catalogContract；
+ * NCK 适配器只负责路径、响应字段与 (variable_id, revision) 身份键。
  */
 export async function fetchNckCatalog(options: NckCatalogLoadOptions): Promise<NckCatalog> {
   const fetchImpl = options.fetchImpl ?? fetch;
-  const maxPages = options.maxPages ?? 100;
-  const definitions: NckCatalogDefinition[] = [];
-  const seen = new Set<string>();
-  const seenCursors = new Set<string>();
-  let cursor: string | undefined;
-  let first: NckDefinitionsResponse | null = null;
-  let pages = 0;
-  for (;;) {
-    if (pages >= maxPages) {
-      throw new NckRequestError({
-        status: 200,
-        code: "CATALOG_TOO_MANY_PAGES",
-        kind: "",
-        message: `目录翻页超过 ${maxPages} 页仍未结束：拒绝继续（防止游标死循环）`,
-      });
-    }
-    const page = await fetchNckCatalogPage(
-      {
-        driverId: options.driverId,
-        family: options.family,
-        limit: options.limit,
-        cursor,
-      },
-      fetchImpl,
-    );
-    pages += 1;
-    if (!first) first = page;
-    else if (page.total !== first.total) {
-      throw new NckRequestError({
-        status: 200,
-        code: "CATALOG_TOTAL_CHANGED",
-        kind: "",
-        message: `翻页期间 total 从 ${first.total} 变为 ${page.total}：目录不稳定，拒绝拼接`,
-      });
-    }
-    for (const definition of page.definitions) {
-      const key = `${definition.variable_id}@${definition.revision}`;
-      if (seen.has(key)) {
-        throw new NckRequestError({
-          status: 200,
-          code: "CATALOG_DUPLICATE_ENTRY",
-          kind: "",
-          message: `目录条目重复出现：${key}（分页游标可能回退，拒绝静默去重）`,
-        });
-      }
-      seen.add(key);
-      definitions.push(definition);
-    }
-    if (page.next_cursor === null) break;
-    if (seenCursors.has(page.next_cursor)) {
-      throw new NckRequestError({
-        status: 200,
-        code: "CATALOG_CURSOR_CYCLE",
-        kind: "",
-        message: `next_cursor 重复出现（${page.next_cursor}）：拒绝无限翻页`,
-      });
-    }
-    seenCursors.add(page.next_cursor);
-    cursor = page.next_cursor;
-  }
-  const head = first as NckDefinitionsResponse;
-  if (definitions.length !== head.total) {
-    throw new NckRequestError({
-      status: 200,
-      code: "CATALOG_INCOMPLETE",
-      kind: "",
-      message: `目录读取不完整：total=${head.total}，实际取到 ${definitions.length} 条（拒绝以残缺目录继续）`,
+  let result: CompleteCatalogResult<NckDefinitionsResponse, NckCatalogDefinition>;
+  try {
+    result = await readCompleteCatalog({
+      loadPage: (cursor) =>
+        fetchNckCatalogPage(
+          {
+            driverId: options.driverId,
+            family: options.family,
+            limit: options.limit,
+            cursor,
+          },
+          fetchImpl,
+        ),
+      getPage: (page) => ({
+        total: page.total,
+        nextCursor: page.next_cursor,
+        entries: page.definitions,
+      }),
+      getEntryKey: (definition) => `${definition.variable_id}@${definition.revision}`,
+      maxPages: options.maxPages,
     });
+  } catch (error) {
+    if (error instanceof CatalogContractError) {
+      throw new NckRequestError({
+        status: 200,
+        code: error.code,
+        kind: "",
+        message: error.message,
+      });
+    }
+    throw error;
   }
+
+  const head = result.firstPage;
   return {
     driverId: head.driver_id,
     family: head.family,
@@ -545,8 +507,8 @@ export async function fetchNckCatalog(options: NckCatalogLoadOptions): Promise<N
     driverVersion: head.driver_version,
     note: head.note,
     total: head.total,
-    definitions,
-    pages,
+    definitions: result.entries,
+    pages: result.pages,
   };
 }
 

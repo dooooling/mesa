@@ -75,3 +75,6 @@ __pycache__/
 # 本地西门子参考手册；默认不重新分发，PDF 不入库（只提交清单与 SHA-256）
 docs/reference/manuals/*.pdf
 docs/reference/manuals/*.PDF
+
+# 手册抽取的临时缓存（由分析脚本生成，不入库）
+docs/reference/.cache_*

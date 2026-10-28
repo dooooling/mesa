@@ -10,15 +10,12 @@
 //   parameters 来自节点 binding，输出仍由用户勾选；映射规则见 browseModel）
 // - import：仅当声明时展示禁用占位（后端 501，未实现不伪装入口）
 //
-// PR-C 第三批：当上层提供 `semantic` 配置（仅 NCK Endpoint 页/未来 PR-D 向导）
-// 时，组件进入**语义模式**：
-// - 不再渲染旧 `variable` 手动/原生字段入口（A22：该路径在 NCK 上必被驱动拒绝）；
-// - 默认页是 NckPointFields（服务端 Preview 唯一权威，A21）；
-// - Browse 语义叶经 nckSemantic 准入（scope/family/identity）后才可选用（A13/A16）。
-// 未提供 `semantic` 时，行为逐字保持旧通用 Picker（非 NCK 零变化）。
+// 本文件不再包含任何 NCK/语义分支（PR #150 解耦项）：语义选型是驱动专属
+// 形态，由调用方显式渲染 `components/NckSemanticPicker.tsx`，而不是在这里
+// 通过 `semantic` 开关切走整棵子树。
 import { useEffect, useState } from "react";
-import { Alert, Button, Card, Checkbox, Input, Select, Tabs, Tag, message } from "antd";
-import type { ResourceDescriptor, SchemaDescriptor } from "../types";
+import { Button, Card, Checkbox, Input, Select, Tabs, Tag, message } from "antd";
+import type { ResourceDescriptor } from "../types";
 import { localizedText } from "../localizedText";
 import { materializeSchemaDefaults, missingRequiredParams } from "../resourceSelectionModel";
 import {
@@ -31,32 +28,8 @@ import { DescriptorFields } from "./DescriptorFields";
 import { locateFieldAnchor } from "./fieldFocus";
 import { draftContentKey } from "../acquisitionDraftDiff";
 import { UNSUPPORTED_CONFIG_NOTICE, unsupportedFields } from "../descriptorCompatibility";
-import {
-  ResourceBrowseAntd,
-  type NckSemanticBrowseConfig,
-} from "./ResourceBrowseAntd";
-import { NckPointFields, type NckPreviewFn } from "./NckPointFields";
+import { ResourceBrowseAntd } from "./ResourceBrowseAntd";
 import type { BrowseSelection } from "../browseModel";
-import type { NckPointSelection } from "../deviceModel";
-import type { NckDefinitionLike } from "../nckPointModel";
-
-/**
- * 语义模式配置（仅 NCK 调用方注入）。
- *
- * `definitions` 是语义表单的唯一元数据来源；缺失即 fail-closed，不退回旧
- * `variable` 原生字段路径。
- */
-export interface PickerSemanticConfig extends NckSemanticBrowseConfig {
-  driverId: string;
-  definitions?: readonly NckDefinitionLike[] | null;
-  /** Descriptor variable 资源 Schema；提供时才开放高级原生页。 */
-  nativeSchema?: SchemaDescriptor | null;
-  takenPointKeys?: string[];
-  /** 语义点位加入回调；未提供时语义表单只读提示，不产生可提交点位。 */
-  onAddPoint?: (point: NckPointSelection) => boolean;
-  /** 测试注入 Preview；生产不传，走服务端 identity-preview。 */
-  preview?: NckPreviewFn;
-}
 
 
 export interface ResourceSelectionInput {
@@ -93,7 +66,6 @@ export function ResourcePickerAntd({
   onAdd,
   selectionMethods,
   endpointId,
-  semantic,
   requireExplicitSelection,
   submitLabel,
   onDirtyChange,
@@ -117,8 +89,6 @@ export function ResourcePickerAntd({
   selectionMethods?: Array<"manual" | "browse" | "import">;
   /** Browse 模式必需：浏览作用的 endpoint */
   endpointId?: string;
-  /** NCK 语义模式（可选；未提供时行为逐字保持旧 Picker）。 */
-  semantic?: PickerSemanticConfig | null;
   /**
    * 「先选资源、再填参数」形态（抽屉添加流程，§4.1-4）：
    * 未选择资源时只渲染**一个**搜索/选择入口，不展示空表单、禁用按钮与错误框的组合。
@@ -218,17 +188,6 @@ export function ResourcePickerAntd({
     }
     return locateFieldAnchor(`selection-field-${focusFieldName}`);
   }, [focusFieldName, focusFieldIsAdvanced, advancedOpen]);
-
-  // 语义模式：不进入通用 resource/manual 分支，旧 `variable` 入口整体不渲染（A22）。
-  if (semantic) {
-    return (
-      <SemanticResourcePicker
-        methods={methods}
-        endpointId={endpointId}
-        semantic={semantic}
-      />
-    );
-  }
 
   /** 切换资源：参数按新 Schema 物化默认值，输出选择清空（显示即保存值）。 */
   const switchResource = (v: string) => {
@@ -466,121 +425,6 @@ export function ResourcePickerAntd({
   // 未实现的 import 不进入 tabs（见上方注释），因此不再作为分支条件。
   if (!methods.includes("browse")) return manualPane();
   return <Tabs activeKey={mode} onChange={(k) => setMode(k as "manual" | "browse")} items={tabs} />;
-}
-
-/**
- * NCK 语义 Picker（PR-C 第三批）。
- *
- * 为什么单独一个组件而不是在旧 manualPane 里加 if：
- * 旧 pane 的身份真值来自 `suggestPointKey(resource.output)` 与自由文本，
- * 与 NCK 的 `{kind,point_key,parameters}` 完全不是同一模型；把两者揉进一个
- * 表单会让“语义点位”再次出现第二套 Key 生成逻辑。这里直接复用
- * `NckPointFields`（服务端 Preview 唯一权威），旧 manual 入口在语义模式
- * 下**整体不渲染**（A22：不提供明知会失败的保存操作）。
- */
-function SemanticResourcePicker({
-  methods,
-  endpointId,
-  semantic,
-}: {
-  methods: Array<"manual" | "browse" | "import">;
-  endpointId?: string;
-  semantic: PickerSemanticConfig;
-}) {
-  const [mode, setMode] = useState<"semantic" | "browse">("semantic");
-  const [preset, setPreset] = useState<NckPointSelection | null>(null);
-  const [nonce, setNonce] = useState(0);
-  const definitions = semantic.definitions ? [...semantic.definitions] : null;
-
-  const semanticPane = !definitions ? (
-    <div data-testid="nck-semantic-picker-no-definitions-body" style={{ fontSize: 12, color: "#525252" }}>
-      定义目录不可用：不会渲染语义表单，也不会退回旧 variable 原生字段流程。
-    </div>
-  ) : semantic.onAddPoint ? (
-    <NckPointFields
-      key={`picker-semantic-${nonce}-${String(preset?.parameters.variable_id ?? "")}`}
-      driverId={semantic.driverId}
-      endpointFamily={semantic.endpointFamily}
-      catalogFamily={semantic.catalogFamily}
-      definitions={definitions ?? []}
-      takenPointKeys={semantic.takenPointKeys ?? []}
-      initialPoint={preset}
-      nativeSchema={semantic.nativeSchema ?? null}
-      preview={semantic.preview}
-      onSubmit={(point) => {
-        const accepted = semantic.onAddPoint?.(point) ?? false;
-        if (accepted) {
-          setPreset(null);
-          setNonce((n) => n + 1);
-        }
-      }}
-    />
-  ) : (
-    <div style={{ fontSize: 12, color: "#c62828" }}>
-      上层未提供语义点位接收入口：禁止产生可提交点位。
-    </div>
-  );
-
-  const browsePane = !endpointId ? (
-    <div style={{ fontSize: 12, color: "#525252" }}>浏览需要已创建的 Endpoint。</div>
-  ) : (
-    <ResourceBrowseAntd
-      endpointId={endpointId}
-      onFill={() => {
-        // 语义模式下不允许回填旧 resource 表单：非语义叶不应被当成 NCK 点位。
-        message.warning("请选用语义点位（旧 variable 入口在 NCK 上已被禁用）");
-      }}
-      nckSemantic={{
-        definitions: semantic.definitions,
-        endpointFamily: semantic.endpointFamily,
-        catalogFamily: semantic.catalogFamily,
-      }}
-      onSemanticSelect={
-        semantic.onAddPoint
-          ? (sel) => {
-              setPreset({
-                kind: "nck_variable",
-                // Browse 的 preview 只是展示；这里置空，由 NckPointFields 的
-                // 服务端 Preview 重新确认。
-                point_key: "",
-                parameters: sel.parameters,
-              });
-              setNonce((n) => n + 1);
-              setMode("semantic");
-              message.info("已把 Browse 叶带入语义表单：请等待服务端 Preview 确认身份");
-            }
-          : undefined
-      }
-    />
-  );
-
-  const tabs = [
-    { key: "semantic", label: "语义点位", children: semanticPane },
-    ...(methods.includes("browse")
-      ? [{ key: "browse", label: "浏览（语义）", children: browsePane }]
-      : []),
-    // 导入入口在语义模式下同样不渲染（产品未实现，§4.1.1）。
-  ];
-
-  return (
-    <div style={{ display: "grid", gap: 8 }}>
-      <Alert
-        type="info"
-        data-testid="nck-semantic-picker"
-        message="NCK 语义点位"
-        description="旧 variable 原生字段入口在 NCK 上必然被驱动拒绝，已不再提供；请在此配置语义点位，身份以服务端 Preview 为准。"
-      />
-      {!definitions ? (
-        <Alert
-          type="warning"
-          data-testid="nck-semantic-picker-no-definitions"
-          message="定义目录不可用：语义点位保持禁用（fail-closed）"
-          description="没有目录就无法确认 scope/Target/Arguments；不会退回旧原生字段流程。"
-        />
-      ) : null}
-      <Tabs activeKey={mode} onChange={(k) => setMode(k as "semantic" | "browse")} items={tabs} />
-    </div>
-  );
 }
 
 // 资源 / 输出标签的唯一取值入口（A1）：统一走 localizedText（优先 zh-CN，

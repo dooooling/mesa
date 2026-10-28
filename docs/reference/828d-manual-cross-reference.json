@@ -25,6 +25,18 @@
       "file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
       "document_number": "A5E53014702F AA",
       "id": "sinamics-s120-para-lists-0723"
+    },
+    "ncvar_0325": {
+      "file": "828D_ncvar_lists_man_0325_en-US.pdf",
+      "document_number": "A5E53370586B AC",
+      "id": "nc-variables-032025",
+      "version": "03/2025",
+      "language": "en-US",
+      "pages": 1262,
+      "sha256": "1274440ed70ef00e82d5f3560e38558740139fa6337405c75df4f0bea1eb5ed1",
+      "self_description": "SINUMERIK 828D NC variables List Manual，Valid for CNC software version 5.25（首页逐字）",
+      "note": "本文件只在本地保留（gitignore:76-77），不入库；页数/SHA-256 由本机实测。",
+      "registry": "docs/reference/sinumerik-828d-manuals.json → documents[].id=nc-variables-032025（同一份清单，文档号/版本/页数/SHA-256 一致）"
     }
   },
   "method": {
@@ -43,7 +55,21 @@
       "not_found": "该标识符在三份 PDF 中未出现，且无名称可机械对应的条目；语义近邻只写在 notes，不计入结论",
       "pending_review": "标识符确实出现在 PDF 正文中但不构成条目定义（或语义需人工核对），不能据此确认身份"
     },
-    "page_kind": "全部为 PDF 页码；本套三份 PDF 实测 PDF 页 = 印刷页（偏移 0），见 .md §4"
+    "page_kind": "全部为 PDF 页码；本套三份 PDF 实测 PDF 页 = 印刷页（偏移 0），见 .md §4",
+    "extraction_202503": "pypdf 6.6.0 逐页 extract_text()，1262 页全部抽取成功（0 页失败、0 页空文本）；抽取文本缓存在本地临时目录，不随文档入库。",
+    "identifier_selection_202503": [
+      "全部 16 条仍以 r1.json 的 golden_ref.variable（OPI 变量名）为检索串：opMode / progName / actLineNumber / actBlock / actToolBasePos / actProgPosBKS / actFeedRateIpo / cmdFeedRateIpo / feedRateIpoOvr / actSpeed / cmdSpeed / speedOvr / actTNumber / progStatus / rpa",
+      "block 名（S/SPARP/SPARPP/SGA/SEGA/SSP/RP）作为第二重校验：手册条目标签形如 \"(区域, 块)\"，块名可与 golden_ref.block 直接比对",
+      "variable_id（如 channel.feed.actual）与 label 中文名不作为检索串：手册是 en-US 版，且 variable_id 是本仓库命名，手册里不出现"
+    ],
+    "search_202503": "对 1262 页缓存做区分大小写与不区分大小写两轮子串检索，记录命中页与命中行；另外对全文的 \"(区域, 块)\" 条目标签做机械统计（共 4015 处），用于核对块归属是否存在；章节号取自 PDF 目录页 p3–p6 与页眉。",
+    "page_kind_202503": "全部为 PDF 页码；实测 PDF 页 = 印刷页，偏移 0（1260/1262 页取到页脚印刷页码且全部相等，p1 封面与 p2 法律资讯无页脚），与手册索引页（p1231 起）给出的页码一致。",
+    "address_mapping_conclusion_rule": {
+      "manual_gives_native_address": "手册条目直接给出 Mesa 原生地址的全部五段（area / area_no / module / column / line）中的 module 值，或其数值地址形式与 828D 线缆字段一一对应",
+      "manual_semantic_only": "手册能证明该变量的语义/类型/列号/行号，但没有给出 Mesa 的 module（Baustein）数值，或所给地址形式属另一套编号体系（如 SINUMERIK ONE 绝对 DB 地址）",
+      "not_found": "手册中不存在该条目",
+      "pending_review": "条目存在但块归属或列号与定义不一致，需人工确认"
+    }
   },
   "summary": {
     "definitions_total": 42,
@@ -89,7 +115,67 @@
     ],
     "version_difference_ids": [
       "drive.parameter.r0033"
-    ]
+    ],
+    "cross_reference_202503": {
+      "$comment": "03/2025 核验单独统计，与 07/2023 的 match_conclusion_distribution 并列且互不影响；entries[].match_conclusion 仍是 07/2023 结论（未改动）。",
+      "document": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "pages": 1262,
+        "sha256": "1274440ed70ef00e82d5f3560e38558740139fa6337405c75df4f0bea1eb5ed1"
+      },
+      "required_ids": 15,
+      "verified_ids_total": 16,
+      "match_conclusion_distribution_required_15": {
+        "exact_match": 14,
+        "matching_older_version": 0,
+        "version_difference": 0,
+        "not_found": 0,
+        "pending_review": 1
+      },
+      "match_conclusion_distribution_all_16": {
+        "exact_match": 15,
+        "matching_older_version": 0,
+        "version_difference": 0,
+        "not_found": 0,
+        "pending_review": 1
+      },
+      "address_mapping_conclusion_distribution": {
+        "manual_semantic_only": 15,
+        "pending_review": 1
+      },
+      "address_mapping_headline": "manual_gives_native_address = 0 条：手册对 16 条中的任何一条都没有给出 Mesa 的 module（Baustein）数值；能对上的是 area、block 助记名、column index、line index（列号 14/15 完全相等）。",
+      "upgraded_from_202307": {
+        "not_found_to_exact_match": [
+          "mode_group.op_mode",
+          "channel.program.name.active",
+          "channel.program.line_number",
+          "channel.program.block",
+          "axis.position.commanded_mcs",
+          "axis.position.actual_bcs",
+          "channel.feed.actual",
+          "channel.feed.commanded",
+          "channel.feed.override",
+          "spindle.speed.actual",
+          "spindle.speed.override",
+          "channel.tool.number_active"
+        ],
+        "pending_review_to_exact_match": [
+          "channel.program.status",
+          "spindle.speed.commanded"
+        ],
+        "still_not_resolved": [
+          "channel.program.name.main"
+        ],
+        "note": "07/2023 的 13 条 not_found 中 12 条在 03/2025 找到独立条目并升级；channel.program.name.main 因手册没有 (C, SPARPP) 条目标签、且 progName 的列号只有 3/7/7，仍保持 pending_review。"
+      },
+      "not_proven_by_this_document": [
+        "module（Baustein）字节取值：手册的 Addressing 表没有该字段，条目标签只给 (区域, 块助记名)",
+        "协议可访问性与真机可读性：本轮只证明手册中的条目定义",
+        "字符串类变量的字节长度（TYPE_STRING 未给长度）：actBlock 的 66 字节、progName 的 32 字节未获手册证实"
+      ]
+    },
+    "match_conclusion_distribution_note_202503": "07/2023 与 03/2025 分开统计：summary.match_conclusion_distribution 是 07/2023 的（35 条），summary.cross_reference_202503.match_conclusion_distribution_* 是 03/2025 的（15 条必核 / 16 条含顺带核对）。"
   },
   "evidence_classes_stay_independent": {
     "manual": {
@@ -108,7 +194,12 @@
       "can_prove": "探针返回过什么",
       "cannot_prove": "实际调用路径与采样范围（本轮：AXIS_ENC_MODULE_NR 未进入真实探测执行路径）"
     },
-    "rule": "四类证据互不替代；新增 07/2023 文档依据不等于任何一类运行时证据升级"
+    "rule": "四类证据互不替代；新增 07/2023 文档依据不等于任何一类运行时证据升级",
+    "manual_202503": {
+      "can_prove": "03/2025 手册如何定义该条目：区域、块助记名、Column index、Line index、数据类型、单位、返回值含义",
+      "cannot_prove": "Mesa 的 module 字节取值、S7 NCK 线缆可访问性、真机可读性；也不能把手册的 SINUMERIK ONE 绝对 DB 地址（DB11 / DB21-30）当作 828D 线缆 module",
+      "rule": "手册语义对上 ≠ 原生线缆地址对上；module 字段必须另有证据（真机读数或协议规范）"
+    }
   },
   "open_gaps": [
     {
@@ -136,6 +227,18 @@
         "每个映射必须绑定实际入口、对象类型、索引与验证证据"
       ],
       "required_action": "任何依赖驱动对象编号的映射（含 MD30110/MD30220 的“驱动器编号/测量回路编号”语义）必须写明入口 module 26 或 module 130。"
+    },
+    {
+      "id": "module_byte_value_not_covered_by_manual_0325",
+      "title": "Mesa 原生地址的 module（Baustein）字节取值不被 03/2025 手册覆盖（新发现的独立缺口）",
+      "facts": [
+        "手册 4.3（p20、p22）把 NC 变量访问所需的地址要素写为：Area 与 area number、Block、NC variable name（或 column number）、Line number —— 没有 module/Baustein 数值字段",
+        "手册全文 4015 处条目标签只有 (区域, 块助记名) 形状（如 \"(C, S)\"），无任何数值块号",
+        "手册 Addressing 表的 Area 单元格在 PDF 中为空值（pypdf layout 模式确认该单元格无文本），区域由条目标签与章标题给出",
+        "15 条中只有 2 条在条目第二行（\"Reference to assigned machine data\" 列）给出绝对 DB 号：opMode = DB11、progStatus = DB21-30；p25–26 §4.6 明确这些是 SINUMERIK ONE 编号并给出 828D 换算（DB11.DBX6.7 → DB3300.DBX3.7），不是 OPI 选择器字段",
+        "真机证据（另一证据类别）显示 module 字节按块不同：S=0x7f(127)、RP=0x15(21)、SSP=0x72(114)、SGA=0x73(115)、SEGA=0x70(112)，见 docs/evidence/nck-live-samples-probe.txt:8,11,16,25,34"
+      ],
+      "required_action": "module 取值的来源必须另行证明（协议规范或真机读数逐块留证）；不得用「手册里有同名变量」推定 module 已对上，也不得用 DB11/DB21-30 反推 module。"
     }
   ],
   "entries": [
@@ -215,7 +318,59 @@
       "match_conclusion": "pending_review",
       "notes": "三份 PDF 中唯一出现该标识符的位置是 md p222–223 的正文（异步子程序执行时不通过 OPI 变量“progStatus”和“chanStatus”显示）。该处只以字符串提及 OPI 变量名，未给出该变量的数据类型/单位/下标/读取方式，不构成条目定义，故不能作为 42 条定义的来源页码；需人工核对是否存在独立的 NC 变量（OPI 变量）清单文档。抽取文本可读，无 CID 乱码。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          306
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.16 S: Status data（p219 起）",
+        "matched_identifier": "progStatus",
+        "matched_entry_header": "progStatus progStatus (C, S) DB21-30, DBX35.0 - DBX35.4",
+        "manual_stated_address": {
+          "area": "C",
+          "block": "S",
+          "column_index": 13,
+          "line_index": null,
+          "line_index_kind": "Line index 与 Max. line index 均空 → 单行变量",
+          "data_type": "TYPE_UWORD",
+          "return_value": "1 = interrupted / 2 = stopped / 3 = in progress / 4 = waiting / 5 = aborted",
+          "reference_to_assigned_machine_data": "DB21-30, DBX35.0 - DBX35.4",
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 127,
+          "column": 13,
+          "line": "fixed 1",
+          "decode": "U16_LE"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（S）",
+          "column": "一致（手册 13 = r1 13）",
+          "line": "相容（单行 vs fixed 1）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p306> progStatus progStatus (C, S) DB21-30, DBX35.0 - DBX35.4 / Program status / Return value / 1 = interrupted / 2 = stopped / 3 = in progress / 4 = waiting / 5 = aborted / Units and value ranges / Physical unit: / - / Data type: / TYPE_UWORD / Default value: Minimum value: Maximum value: / Area / Column index: / 13",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 306,
+            "text": "progStatus progStatus (C, S) DB21-30, DBX35.0 - DBX35.4\nProgram status\nReturn value\n1 = interrupted\n2 = stopped\n3 = in progress\n4 = waiting\n5 = aborted\nUnits and value ranges\nPhysical unit:\n-\nData type:\nTYPE_UWORD\nDefault value: Minimum value: Maximum value:\nArea\nColumn index:\n13"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "07/2023 三份手册只在 md p222–223 正文提到该名（无条目定义）→ 当时判 pending_review；本轮在 03/2025 找到独立条目（p306，Column index=13、TYPE_UWORD、Return value 1..5），语义与 label「通道程序状态」一致，故升级为 exact_match（所引来源版本与手册版本一致）。但 \"DB21-30, DBX35.0 - DBX35.4\" 是「Reference to assigned machine data」列（Table 4-6，p24），且 §4.6 说明其属 SINUMERIK ONE 绝对地址体系（同一张表里 DB11.DBX6.7 → DB3300.DBX3.7 的 828D 换算），因此不能把 DB21 当成 r1 的 module=127；真机侧 module 字节为 0x7f（127）且返回 GOOD（docs/evidence/nck-live-samples-probe.txt:8，measurement 类别），该数值与手册的 DB 号不同，说明 module 的取值不由本手册给出。更直接的对照：同页 p90 的 `resetActive resetActive (B, S) DB11, DBX6.3, DBX26.3, DBX46.3, ...` 与 §4.6 换算表里的 `DB11.DBX6.7` → `DB3300.DBX3.7`（All channels within the mode group are in the reset state）指同一 DB11 的同一字节 6 —— 手册自己把这种 DB/DBX 写法标为 SINUMERIK ONE 绝对地址并给出 828D 的 DB3300 对应，而 opMode 的 DBXn6.0-n6.2 正是同一个 DB11 字节 6 的第 0..2 位。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "mode_group.op_mode",
@@ -290,7 +445,63 @@
       "match_conclusion": "not_found",
       "notes": "标识符 opMode 在三份 PDF 中均未出现（区分大小写检索为 0 命中）。语义近邻：sysvar p265–266 的 $P_OPMODE「选择的运行方式」（$P_ 前缀编程系统变量，且说明为“通过 PLC 选择的运行方式”），但其名称、访问入口与地址形态（B/S/col 3）均与本定义不同，按纪律不得顶替为匹配。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          89,
+          90
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.2.1 S: Status data（章 5.2 \"Area mode group data mode group (B)\" 自 p88 起；本条条目跨 p89–p90）",
+        "matched_identifier": "opMode",
+        "matched_entry_header": "opMode opMode (B, S) DB11, DBXn6.0-n6.2 (n=0,2,4,6, ...)",
+        "manual_stated_address": {
+          "area": "B",
+          "block": "S",
+          "column_index": 3,
+          "line_index": null,
+          "line_index_kind": "Line index 与 Max. line index 均空 → 单行变量",
+          "data_type": "TYPE_UWORD",
+          "reference_to_assigned_machine_data": "DB11, DBXn6.0-n6.2 (n=0,2,4,6, ...)",
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "B",
+          "area_no": "target(mode_group)",
+          "module": 127,
+          "column": 3,
+          "line": "fixed 1",
+          "decode": "U16_LE"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（B/S 与 golden_ref.block=S 相同）",
+          "column": "一致（手册 3 = r1 3）",
+          "line": "相容（手册单行，r1 line=fixed 1）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p89> opMode opMode (B, S) DB11, DBXn6.0-n6.2 (n=0,2,4,6, ...) / Active mode / Return value / 0 = JOG / 1 = MDI / 2 = AUTO / Units and value ranges / Physical unit: / - / Data type: / TYPE_UWORD <p90> opMode opMode (B, S) DB11, DBXn6.0-n6.2 (n=0,2,4,6, ...) / Column index: / 3 / Line index: Max. line index: /   Read access",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 89,
+            "text": "opMode opMode (B, S) DB11, DBXn6.0-n6.2 (n=0,2,4,6, ...)\nActive mode\nReturn value\n0 = JOG\n1 = MDI\n2 = AUTO\nUnits and value ranges\nPhysical unit:\n-\nData type:\nTYPE_UWORD"
+          },
+          {
+            "page": 90,
+            "text": "opMode opMode (B, S) DB11, DBXn6.0-n6.2 (n=0,2,4,6, ...)\nColumn index:\n3\nLine index: Max. line index:\n  Read access"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "条目在 03/2025 手册中存在且语义一致：Return value \"0 = JOG / 1 = MDI / 2 = AUTO\" 与 label「方式组运行方式」相符，TYPE_UWORD 与 decode=U16_LE 相符。Addressing 表（p90）给出 Column index=3，与 r1 column=3 一致；Area/Block 由条目标签 (B, S) 与章标题给出。第二行的 \"DB11, DBXn6.0-n6.2\" 位于 Table 4-6（p24）定义的「Reference to assigned machine data」列，不是 OPI 选择器字段；p25–26 §4.6 又明确该类绝对 DB 地址是 SINUMERIK ONE 编号并给出 828D 换算（DB11.DBX6.7 → DB3300.DBX3.7），故 DB11 不能当作 r1 的 module=127，也不能据此把 module 判为已验证。本条无真机读数证据（docs/evidence 内无 opMode 记录）。更直接的对照：同页 p90 的 `resetActive resetActive (B, S) DB11, DBX6.3, DBX26.3, DBX46.3, ...` 与 §4.6 换算表里的 `DB11.DBX6.7` → `DB3300.DBX3.7`（All channels within the mode group are in the reset state）指同一 DB11 的同一字节 6 —— 手册自己把这种 DB/DBX 写法标为 SINUMERIK ONE 绝对地址并给出 828D 的 DB3300 对应，而 opMode 的 DBXn6.0-n6.2 正是同一个 DB11 字节 6 的第 0..2 位。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "channel.program.name.main",
@@ -365,7 +576,67 @@
       "match_conclusion": "not_found",
       "notes": "progName 未出现。同页语境：md p39 出现另一个 OPI 变量名 lastBlockNoStr（功能块 SPARP/SPARPP），与本定义 golden_ref 的 progName 不是同一标识符，不顶替。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          530,
+          531,
+          515,
+          522,
+          526
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.27 SPARPP: Program pointers in the automatic mode（p530；本章条目实际全部标为 (C, SPARPI)）",
+        "matched_identifier": "progName",
+        "matched_entry_header": "progName progName (C, SPARP) / progName progName (C, SPARPF) / progName progName (C, SPARPI)",
+        "manual_stated_address": {
+          "area": "C",
+          "block": null,
+          "block_note": "本轮机械统计全文 4015 处 (Area, Block) 条目标签：SPARP=51、SPARPF=16、SPARPI=30、(C, SPARPP)=0",
+          "column_index": null,
+          "column_index_note": "SPARP 的 progName 在 p515 col 3；SPARPF 在 p522 col 7；SPARPI 在 p526/p531 col 7；无 col 5",
+          "line_index": null,
+          "data_type": "TYPE_STRING",
+          "reference_to_assigned_machine_data": null,
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 122,
+          "column": 5,
+          "line": "fixed 1",
+          "decode": "UTF8_NUL_LAST_32"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "不一致（r1 为 SPARPP，手册无 (C, SPARPP) 条目）",
+          "column": "不一致（r1 col 5；手册 progName 只有 col 3/7/7）",
+          "line": "无法比对（无对应条目的 line 语义）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p530> 5.3.27 SPARPP: Program pointers in the automatic mode <p531> progName progName (C, SPARPI)   / Program name / Progam name of the currently active program (or subroutine) / Units and value ranges / Physical unit: / - / Data type: / TYPE_STRING / Default value: Minimum value: Maximum value: / Area / Column index: / 7 / Line index: / Index of program level / Max. line index: / 18",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 530,
+            "text": "5.3.27 SPARPP: Program pointers in the automatic mode"
+          },
+          {
+            "page": 531,
+            "text": "progName progName (C, SPARPI)  \nProgram name\nProgam name of the currently active program (or subroutine)\nUnits and value ranges\nPhysical unit:\n-\nData type:\nTYPE_STRING\nDefault value: Minimum value: Maximum value:\nArea\nColumn index:\n7\nLine index:\nIndex of program level\nMax. line index:\n18"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "pending_review",
+        "address_mapping_conclusion": "pending_review",
+        "notes": "标识符 progName 确实出现在 03/2025 手册（p515/p522/p526/p531），但**没有任何 (C, SPARPP) 条目**：p530 只有章标题「5.3.27 SPARPP: Program pointers in the automatic mode」，该章内条目却全部标 (C, SPARPI)（p531 L32）。r1 该条 block=SPARPP、module=122、column=5，三项都无手册依据（SPARP col 3、SPARPF col 7、SPARPI col 7）。语义（程序名）成立，但「SPARPP 下的第 5 列」这一具体位置未被证实，按纪律不得因名称相似升级 → pending_review。旁证：手册 5.3.27 章正文描述的仍是 SPARPI（中断指针）内容，怀疑是该版手册的章节归属问题，需人工或在另一版 NC 变量手册中复核。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "channel.program.name.active",
@@ -440,7 +711,58 @@
       "match_conclusion": "not_found",
       "notes": "progName（block=SPARP）未出现；与上一条同因，md p39 的 lastBlockNoStr 不足以定位“当前活动程序名”。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          515
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.24 SPARP: Part program information（p506 起）",
+        "matched_identifier": "progName",
+        "matched_entry_header": "progName progName (C, SPARP)",
+        "manual_stated_address": {
+          "area": "C",
+          "block": "SPARP",
+          "column_index": 3,
+          "line_index": null,
+          "line_index_kind": "Line index 与 Max. line index 均空 → 单行变量",
+          "data_type": "TYPE_STRING",
+          "reference_to_assigned_machine_data": null,
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 125,
+          "column": 3,
+          "line": "fixed 1",
+          "decode": "UTF8_NUL_LAST_32"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（SPARP = golden_ref.block）",
+          "column": "一致（手册 3 = r1 3）",
+          "line": "相容（手册单行，r1 line=fixed 1）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p515> progName progName (C, SPARP)   / Program name / Progam name of the currently active program (or subroutine) / Units and value ranges / Physical unit: / - / Data type: / TYPE_STRING / Default value: Minimum value: Maximum value: / Area / Column index: / 3 / Line index: Max. line index: /   Read access",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 515,
+            "text": "progName progName (C, SPARP)  \nProgram name\nProgam name of the currently active program (or subroutine)\nUnits and value ranges\nPhysical unit:\n-\nData type:\nTYPE_STRING\nDefault value: Minimum value: Maximum value:\nArea\nColumn index:\n3\nLine index: Max. line index:\n  Read access"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "描述「Progam name of the currently active program (or subroutine)」（原文拼写照抄）与 label「当前活动程序名」一致；Column index=3 与 r1 column=3 一致。TYPE_STRING 与 decode=UTF8_NUL_LAST_32 类别相容，但手册未给字符串字节长度，32 字节这一点未获手册证实（不构成冲突）。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "channel.program.line_number",
@@ -515,7 +837,58 @@
       "match_conclusion": "not_found",
       "notes": "actLineNumber 未出现。手册内“程序段号”语义由 lastBlockNoStr（md p39）等其它 OPI 名承载，名称不匹配，不顶替。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          508
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.24 SPARP: Part program information（p506 起）",
+        "matched_identifier": "actLineNumber",
+        "matched_entry_header": "actLineNumber actLineNumber (C, SPARP)",
+        "manual_stated_address": {
+          "area": "C",
+          "block": "SPARP",
+          "column_index": 9,
+          "line_index": 1,
+          "line_index_kind": "Line index=1，Max. line index=1 → 单行变量",
+          "data_type": "TYPE_DWORD",
+          "reference_to_assigned_machine_data": null,
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 125,
+          "column": 9,
+          "line": "fixed 1",
+          "decode": "I32_LE"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（SPARP）",
+          "column": "一致（手册 9 = r1 9）",
+          "line": "一致（手册 1 = r1 fixed 1）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p508> actLineNumber actLineNumber (C, SPARP)   / Line number of current NC instruction (start:1) / Line number of the current NC instruction (starting at 1) / 0: before program start / -1: not available due to an error / -2: not available because of DISPLOF / Units and value ranges / Physical unit: / - / Data type: / TYPE_DWORD / Default value: Minimum value: Maximum value: / Area / Column index: / 9 / Line index: / 1 / Max. line index: / 1",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 508,
+            "text": "actLineNumber actLineNumber (C, SPARP)  \nLine number of current NC instruction (start:1)\nLine number of the current NC instruction (starting at 1)\n0: before program start\n-1: not available due to an error\n-2: not available because of DISPLOF\nUnits and value ranges\nPhysical unit:\n-\nData type:\nTYPE_DWORD\nDefault value: Minimum value: Maximum value:\nArea\nColumn index:\n9\nLine index:\n1\nMax. line index:\n1"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "描述「Line number of current NC instruction (start:1)」并列出 -1（错误）/-2（DISPLOF）负值特殊值；TYPE_DWORD 与 decode=I32_LE（有符号 32 位）一致——负特殊值要求有符号解码，这一点手册与定义相符。Column index=9 与 r1 column=9 一致。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "channel.program.block",
@@ -590,7 +963,58 @@
       "match_conclusion": "not_found",
       "notes": "actBlock 未出现。md p39 的 lastBlockNoStr 为不同标识符，按纪律不顶替。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          507
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.24 SPARP: Part program information（p506 起）",
+        "matched_identifier": "actBlock",
+        "matched_entry_header": "actBlock actBlock (C, SPARP)",
+        "manual_stated_address": {
+          "area": "C",
+          "block": "SPARP",
+          "column_index": 31,
+          "line_index": 1,
+          "line_index_kind": "Line index=1，Max. line index=1 → 单行变量",
+          "data_type": "TYPE_STRING",
+          "reference_to_assigned_machine_data": null,
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 125,
+          "column": 31,
+          "line": "fixed 1",
+          "decode": "UTF8_NUL_FIRST_66"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（SPARP）",
+          "column": "一致（手册 31 = r1 31）",
+          "line": "一致（手册 1 = r1 fixed 1）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p507> actBlock actBlock (C, SPARP)   / Current block (DISPLOF active) / Current part program block. / With DISPLOF the subroutine call is displayed. / Units and value ranges / Physical unit: / - / Data type: / TYPE_STRING / Default value: Minimum value: Maximum value: / Area / Column index: / 31 / Line index: / 1 / Max. line index: / 1",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 507,
+            "text": "actBlock actBlock (C, SPARP)  \nCurrent block (DISPLOF active)\nCurrent part program block.\nWith DISPLOF the subroutine call is displayed.\nUnits and value ranges\nPhysical unit:\n-\nData type:\nTYPE_STRING\nDefault value: Minimum value: Maximum value:\nArea\nColumn index:\n31\nLine index:\n1\nMax. line index:\n1"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "描述「Current part program block. With DISPLOF the subroutine call is displayed.」与 label「当前执行程序块」一致。Column index=31 与 r1 column=31 一致。TYPE_STRING（手册只写 null-terminated，未给长度），decode=UTF8_NUL_FIRST_66 的 66 字节长度未获手册证实。注意同页另有 actBlockA（col 30，DISPLOF inactive）与 p508 的 actBlockI（col 32），三者为不同条目，不互相顶替。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "axis.position.commanded_mcs",
@@ -665,7 +1089,58 @@
       "match_conclusion": "not_found",
       "notes": "actToolBasePos 未出现；手册的轴位置类条目均为 $AA_/$VA_ 前缀编程系统变量，无 C/SGA 访问入口的 NC 变量名。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          488
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.20 SGA: Status data in the WCS（p487 起）",
+        "matched_identifier": "actToolBasePos",
+        "matched_entry_header": "actToolBasePos actToolBasePos (C, SGA)",
+        "manual_stated_address": {
+          "area": "C",
+          "block": "SGA",
+          "column_index": 2,
+          "line_index": "Axis index",
+          "line_index_kind": "Line index=Axis index，Max. line index=numMachAxes（按轴索引）",
+          "data_type": "TYPE_DOUBLE",
+          "reference_to_assigned_machine_data": null,
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 115,
+          "column": 2,
+          "line": "target(axis)",
+          "decode": "F64_LE"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（SGA）",
+          "column": "一致（手册 2 = r1 2）",
+          "line": "一致（手册按 Axis index，r1 line=target(axis)）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p488> actToolBasePos actToolBasePos (C, SGA)   / Axis setpoint in the machine coordinate system / Determines the current setpoint of the axis in the machine coordinate system (MCS) for the corresponding axis.  / This value contains all axis-specific override components (e.g. Differential Resolver Function, $AA_OFF, external work offset) / Units and value ranges / Physical unit: / mm, inch, degree, user  / defined / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 2 / Line index: / Axis index / Max. line index: / numMachAxes",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 488,
+            "text": "actToolBasePos actToolBasePos (C, SGA)  \nAxis setpoint in the machine coordinate system\nDetermines the current setpoint of the axis in the machine coordinate system (MCS) for the corresponding axis. \nThis value contains all axis-specific override components (e.g. Differential Resolver Function, $AA_OFF, external work offset)\nUnits and value ranges\nPhysical unit:\nmm, inch, degree, user \ndefined\nData type:\nTYPE_DOUBLE\nDefault value: Minimum value: Maximum value:\nArea\nColumn index:\n2\nLine index:\nAxis index\nMax. line index:\nnumMachAxes"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "描述「Axis setpoint in the machine coordinate system … contains all axis-specific override components」与 label「轴指令位置（机床坐标系）」一致；TYPE_DOUBLE 与 F64_LE 一致。同名条目另有 (C, SMA) p501 与 (N, SMA) p1030，r1 的 golden_ref.block=SGA 对应本页 p488。另有一份不属本手册的证据类别：docs/evidence/nck-live-samples-probe.txt:16-23 记录该地址（module 0x73=115、col 2、line=轴号）在真机返回 GOOD（8 轴）；那是 measurement，不与手册证据混算。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "axis.position.actual_bcs",
@@ -740,7 +1215,58 @@
       "match_conclusion": "not_found",
       "notes": "actProgPosBKS 未出现（含不区分大小写检索）。不顶替。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          387
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.18 SEGA: Extended status data in the WCS（p380 起）",
+        "matched_identifier": "actProgPosBKS",
+        "matched_entry_header": "actProgPosBKS actProgPosBKS (C, SEGA)",
+        "manual_stated_address": {
+          "area": "C",
+          "block": "SEGA",
+          "column_index": 33,
+          "line_index": "Axis index",
+          "line_index_kind": "Line index=Axis index，Max. line index=numMachAxes",
+          "data_type": "TYPE_DOUBLE",
+          "reference_to_assigned_machine_data": null,
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 112,
+          "column": 33,
+          "line": "target(axis)",
+          "decode": "F64_LE"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（SEGA）",
+          "column": "一致（手册 33 = r1 33）",
+          "line": "一致（Axis index）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p387> actProgPosBKS actProgPosBKS (C, SEGA)   / Actual value in basic coordinate system / Actual value of geometry and orientation axes in basic coordinate system / Units and value ranges / Physical unit: / mm, inch, degree, user  / defined / Data type: / TYPE_DOUBLE / Default value: / 0.0 / Minimum value: Maximum value: / Area / Column index: / 33 / Line index: / Axis index / Max. line index: / numMachAxes",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 387,
+            "text": "actProgPosBKS actProgPosBKS (C, SEGA)  \nActual value in basic coordinate system\nActual value of geometry and orientation axes in basic coordinate system\nUnits and value ranges\nPhysical unit:\nmm, inch, degree, user \ndefined\nData type:\nTYPE_DOUBLE\nDefault value:\n0.0\nMinimum value: Maximum value:\nArea\nColumn index:\n33\nLine index:\nAxis index\nMax. line index:\nnumMachAxes"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "描述「Actual value in basic coordinate system / Actual value of geometry and orientation axes in basic coordinate system」与 label「轴实际位置（基本坐标系）」一致；TYPE_DOUBLE/F64_LE 一致；Column index=33 与 r1 column=33 一致。手册内多处交叉引用 /C/SEGA/actProgPosBKS（p392、p540、p556、p1037、p1053），可作同名一致性的旁证。真机读数另存 docs/evidence/nck-live-samples-probe.txt:25-32（measurement 类别）。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "channel.feed.actual",
@@ -815,7 +1341,58 @@
       "match_conclusion": "not_found",
       "notes": "actFeedRateIpo 未出现。语义近邻 $AC_FEED 类编程变量未与本定义地址对应，不顶替。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          272
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.16 S: Status data（p219 起）",
+        "matched_identifier": "actFeedRateIpo",
+        "matched_entry_header": "actFeedRateIpo actFeedRateIpo (C, S)",
+        "manual_stated_address": {
+          "area": "C",
+          "block": "S",
+          "column_index": 1,
+          "line_index": null,
+          "line_index_kind": "Line index 与 Max. line index 均空 → 单行变量",
+          "data_type": "TYPE_DOUBLE",
+          "reference_to_assigned_machine_data": null,
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 127,
+          "column": 1,
+          "line": "fixed 1",
+          "decode": "F64_LE"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（S）",
+          "column": "一致（手册 1 = r1 1）",
+          "line": "相容（单行 vs fixed 1）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p272> actFeedRateIpo actFeedRateIpo (C, S)   / Actual value of the interpolation feedrate / Actual value of the interpolation feedrate. The actual value is the feed actually moved with. (depends on the acceleration profiles, LookAhead,  / velocity limits etc. ) The variable 'feedRateIpoUnit' defines the physical unit. / Units and value ranges / Physical unit: / mm/min, inch/min, user  / defined / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 1 / Line index: Max. line index:",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 272,
+            "text": "actFeedRateIpo actFeedRateIpo (C, S)  \nActual value of the interpolation feedrate\nActual value of the interpolation feedrate. The actual value is the feed actually moved with. (depends on the acceleration profiles, LookAhead, \nvelocity limits etc. ) The variable 'feedRateIpoUnit' defines the physical unit.\nUnits and value ranges\nPhysical unit:\nmm/min, inch/min, user \ndefined\nData type:\nTYPE_DOUBLE\nDefault value: Minimum value: Maximum value:\nArea\nColumn index:\n1\nLine index: Max. line index:"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "描述「Actual value of the interpolation feedrate … The variable feedRateIpoUnit defines the physical unit」与 label「通道实际进给率（IPO）」一致；TYPE_DOUBLE/F64_LE 一致；Column index=1 与 r1 column=1 一致。另有同名 (C, SEGA) p386，r1 的 block=S 对应 p272。真机读数另存 docs/evidence/nck-live-samples-probe.txt:9（measurement 类别）。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "channel.feed.commanded",
@@ -890,7 +1467,58 @@
       "match_conclusion": "not_found",
       "notes": "cmdFeedRateIpo 未出现。手册未提供 NC 变量接口名与 C/S 地址的映射表。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          288
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.16 S: Status data（p219 起）",
+        "matched_identifier": "cmdFeedRateIpo",
+        "matched_entry_header": "cmdFeedRateIpo cmdFeedRateIpo (C, S) $AC_F",
+        "manual_stated_address": {
+          "area": "C",
+          "block": "S",
+          "column_index": 2,
+          "line_index": null,
+          "line_index_kind": "Line index 与 Max. line index 均空 → 单行变量",
+          "data_type": "TYPE_DOUBLE",
+          "reference_to_assigned_machine_data": "$AC_F",
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 127,
+          "column": 2,
+          "line": "fixed 1",
+          "decode": "F64_LE"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（S）",
+          "column": "一致（手册 2 = r1 2）",
+          "line": "相容（单行 vs fixed 1）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p288> cmdFeedRateIpo cmdFeedRateIpo (C, S) $AC_F / Desired value of the interpolation feedrate / Desired feedrate of the interpolation feedrate. The physical unit is defined in the variable 'feedRateIpoUnit' / Units and value ranges / Physical unit: / mm/min, inch/min, user  / defined / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 2 / Line index: Max. line index:",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 288,
+            "text": "cmdFeedRateIpo cmdFeedRateIpo (C, S) $AC_F\nDesired value of the interpolation feedrate\nDesired feedrate of the interpolation feedrate. The physical unit is defined in the variable 'feedRateIpoUnit'\nUnits and value ranges\nPhysical unit:\nmm/min, inch/min, user \ndefined\nData type:\nTYPE_DOUBLE\nDefault value: Minimum value: Maximum value:\nArea\nColumn index:\n2\nLine index: Max. line index:"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "描述「Desired value of the interpolation feedrate. The physical unit is defined in the variable feedRateIpoUnit」与 label「通道指令进给率（IPO）」一致；TYPE_DOUBLE/F64_LE 一致。该条第二列写的是参考机床数据 $AC_F（同页另有 cmdFeedRateIpoS），不提供 module 数值。另有同名 (C, SEGA) p391。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "channel.feed.override",
@@ -965,7 +1593,59 @@
       "match_conclusion": "not_found",
       "notes": "feedRateIpoOvr 未出现。语义近邻：sysvar p143 $AC_OVR「轨迹倍率」、p144 $AC_TOTAL_OVR「总轨迹倍率」；二者是该手册记录的编程系统变量，不是本定义所指 C/S/col 3 的 NC 变量接口项，按纪律不顶替。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          292
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.16 S: Status data（p219 起）",
+        "matched_identifier": "feedRateIpoOvr",
+        "matched_entry_header": "feedRateIpoOvr feedRateIpoOvr (C, S)",
+        "manual_stated_address": {
+          "area": "C",
+          "block": "S",
+          "column_index": 3,
+          "line_index": null,
+          "line_index_kind": "Line index 与 Max. line index 均空 → 单行变量",
+          "data_type": "TYPE_DOUBLE",
+          "physical_unit": "%",
+          "reference_to_assigned_machine_data": null,
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 127,
+          "column": 3,
+          "line": "fixed 1",
+          "decode": "F64_LE"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（S）",
+          "column": "一致（手册 3 = r1 3）",
+          "line": "相容（单行 vs fixed 1）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p292> feedRateIpoOvr feedRateIpoOvr (C, S)   / Interpolation feedrate, override / Units and value ranges / Physical unit: / % / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 3 / Line index: Max. line index:",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 292,
+            "text": "feedRateIpoOvr feedRateIpoOvr (C, S)  \nInterpolation feedrate, override\nUnits and value ranges\nPhysical unit:\n%\nData type:\nTYPE_DOUBLE\nDefault value: Minimum value: Maximum value:\nArea\nColumn index:\n3\nLine index: Max. line index:"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "描述「Interpolation feedrate, override」，物理单位 %，与 label「进给倍率（IPO）」一致；TYPE_DOUBLE/F64_LE 一致；Column index=3 与 r1 column=3 一致。手册未写值域（如 0..200%），定义亦未断言值域，故不冲突；但因手册未给值域，不能据此确认倍率的量纲是「百分比数值」还是「系数」（decode=F64_LE 只保证字节解码）。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "spindle.speed.actual",
@@ -1040,7 +1720,59 @@
       "match_conclusion": "not_found",
       "notes": "actSpeed 未出现。手册的主轴转速条目为 $AA_/  $AC_ 类编程变量，非 SSP 块 NC 变量名。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          536
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.28 SSP: Spindle status data（p535 起）",
+        "matched_identifier": "actSpeed",
+        "matched_entry_header": "actSpeed actSpeed (C, SSP)",
+        "manual_stated_address": {
+          "area": "C",
+          "block": "SSP",
+          "column_index": 2,
+          "line_index": "Spindle index",
+          "line_index_kind": "Line index=Spindle index，Max. line index=numSpindles",
+          "data_type": "TYPE_DOUBLE",
+          "physical_unit": "rev/min, user defined",
+          "reference_to_assigned_machine_data": null,
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 114,
+          "column": 2,
+          "line": "target(spindle)",
+          "decode": "F64_LE"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（SSP）",
+          "column": "一致（手册 2 = r1 2）",
+          "line": "一致（Spindle index）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p536> actSpeed actSpeed (C, SSP)   / Actual value of the spindle speed / Current speed of the spindle [n]. / The sign indicates the direction of rotation. The direction of rotation can vary from machine to machine, and is specified by the machine  / manufacturer. / Units and value ranges / Physical unit: / rev/min, user defined / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 2 / Line index: / Spindle index / Max. line index: / numSpindles",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 536,
+            "text": "actSpeed actSpeed (C, SSP)  \nActual value of the spindle speed\nCurrent speed of the spindle [n].\nThe sign indicates the direction of rotation. The direction of rotation can vary from machine to machine, and is specified by the machine \nmanufacturer.\nUnits and value ranges\nPhysical unit:\nrev/min, user defined\nData type:\nTYPE_DOUBLE\nDefault value: Minimum value: Maximum value:\nArea\nColumn index:\n2\nLine index:\nSpindle index\nMax. line index:\nnumSpindles"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "描述「Actual value of the spindle speed / Current speed of the spindle [n] … The sign indicates the direction of rotation」与 label「主轴实际转速」一致；TYPE_DOUBLE/F64_LE 一致；Column index=2 与 r1 column=2 一致。同名条目另有 (C, SSP2) p551、(N, SSP) p1034、(N, SSP2) p1049，r1 的 golden_ref.block=SSP 且目标为通道主轴 → 对应 p536。手册注明转速符号表示转向，定义未断言语义以外内容，不冲突。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "spindle.speed.commanded",
@@ -1117,7 +1849,59 @@
       "match_conclusion": "pending_review",
       "notes": "md p39 出现「该位涉及功能块 SPARPP 中的 OPI 变量 cmdSpeed」，说明该标识符确属本手册体系的 OPI 变量名，但（a）无独立条目给出类型/单位/下标，（b）手册把它归到功能块 SPARPP，而 r1 定义把 cmdSpeed 落在 block=SSP，二者归属不一致，需人工核对后方可采用。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          537
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.28 SSP: Spindle status data（p535 起）",
+        "matched_identifier": "cmdSpeed",
+        "matched_entry_header": "cmdSpeed cmdSpeed (C, SSP)",
+        "manual_stated_address": {
+          "area": "C",
+          "block": "SSP",
+          "column_index": 3,
+          "line_index": "Spindle index",
+          "line_index_kind": "Line index=Spindle index，Max. line index=numSpindles",
+          "data_type": "TYPE_DOUBLE",
+          "physical_unit": "rev/min , m/min",
+          "reference_to_assigned_machine_data": null,
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 114,
+          "column": 3,
+          "line": "target(spindle)",
+          "decode": "F64_LE"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（SPP=SSP，手册写 SSP；r1 golden_ref.block=SSP）",
+          "column": "一致（手册 3 = r1 3）",
+          "line": "一致（Spindle index）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p537> cmdSpeed cmdSpeed (C, SSP)   / Spindle speed, desired value / Spindle speed desired value / Units and value ranges / Physical unit: / rev/min , m/min / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 3 / Line index: / Spindle index / Max. line index: / numSpindles",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 537,
+            "text": "cmdSpeed cmdSpeed (C, SSP)  \nSpindle speed, desired value\nSpindle speed desired value\nUnits and value ranges\nPhysical unit:\nrev/min , m/min\nData type:\nTYPE_DOUBLE\nDefault value: Minimum value: Maximum value:\nArea\nColumn index:\n3\nLine index:\nSpindle index\nMax. line index:\nnumSpindles"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "07/2023 的 md p39 把 cmdSpeed 归到功能块 SPARPP，与本定义 block=SSP 冲突，当时判 pending_review；03/2025 手册给出独立条目 (C, SSP)（p537，Column index=3、TYPE_DOUBLE、单位 rev/min 与 m/min），与 r1 的 block=SSP / column=3 一致 → 该冲突由新版文档解开，升级为 exact_match。同名条目另有 (C, SSP2) p553、(N, SSP) p1035、(N, SSP2) p1051。真机读数另存 docs/evidence/nck-live-samples-probe.txt:34-35（主轴1 GOOD 10000.0，module 0x72=114，measurement 类别）。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "spindle.speed.override",
@@ -1192,7 +1976,59 @@
       "match_conclusion": "not_found",
       "notes": "speedOvr 未出现。语义近邻：sysvar p1143 $AA_SPEED_OVR「主轴倍率」、p989 $AA_OVR「轴的倍率」；不同访问入口，不顶替。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          541
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.28 SSP: Spindle status data（p535 起）",
+        "matched_identifier": "speedOvr",
+        "matched_entry_header": "speedOvr speedOvr (C, SSP)",
+        "manual_stated_address": {
+          "area": "C",
+          "block": "SSP",
+          "column_index": 4,
+          "line_index": "Spindle index",
+          "line_index_kind": "Line index=Spindle index，Max. line index=numSpindles",
+          "data_type": "TYPE_DOUBLE",
+          "physical_unit": "%",
+          "reference_to_assigned_machine_data": null,
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 114,
+          "column": 4,
+          "line": "target(spindle)",
+          "decode": "F64_LE"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（SSP）",
+          "column": "一致（手册 4 = r1 4）",
+          "line": "一致（Spindle index）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p541> speedOvr speedOvr (C, SSP)   / Spindle override / Units and value ranges / Physical unit: / % / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 4 / Line index: / Spindle index / Max. line index: / numSpindles",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 541,
+            "text": "speedOvr speedOvr (C, SSP)  \nSpindle override\nUnits and value ranges\nPhysical unit:\n%\nData type:\nTYPE_DOUBLE\nDefault value: Minimum value: Maximum value:\nArea\nColumn index:\n4\nLine index:\nSpindle index\nMax. line index:\nnumSpindles"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "描述「Spindle override」，单位 %，与 label「主轴倍率」一致；TYPE_DOUBLE/F64_LE 一致；Column index=4 与 r1 column=4 一致。同名条目另有 (C, SSP2) p557、(N, SSP) p1038、(N, SSP2) p1054。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "channel.tool.number_active",
@@ -1267,7 +2103,59 @@
       "match_conclusion": "not_found",
       "notes": "actTNumber 未出现；中文关键词“刀具号”在三份 PDF 的条目头中亦无命中（命中项均为刀具数据表，不含该 NC 变量名）。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          277
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.16 S: Status data（p219 起）",
+        "matched_identifier": "actTNumber",
+        "matched_entry_header": "actTNumber actTNumber (C, S) $P_TOOLNO",
+        "manual_stated_address": {
+          "area": "C",
+          "block": "S",
+          "column_index": 23,
+          "line_index": null,
+          "line_index_kind": "Line index 与 Max. line index 均空 → 单行变量",
+          "data_type": "TYPE_UWORD",
+          "value_range_note": "Maximum value 32000",
+          "reference_to_assigned_machine_data": "$P_TOOLNO",
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 127,
+          "column": 23,
+          "line": "fixed 1",
+          "decode": "U16_LE"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（S）",
+          "column": "一致（手册 23 = r1 23）",
+          "line": "相容（单行 vs fixed 1）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p277> actTNumber actTNumber (C, S) $P_TOOLNO / Active tool number / The command should not be used if magazine management (TMMG=1) is active. / If magazine management is active, GETTEXET should be used instead. / For $MC_CUTTING_EDGE_DEFAULT=0 or -2, an incorrect T number may be determined. / If the programming is made after programming D > 0, it is also safe. /   / Units and value ranges / Physical unit: / - / Data type: / TYPE_UWORD / Default value: Minimum value: / 0 / Maximum value: / 32000 / Area / Column index: / 23 / Line index: Max. line index:",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 277,
+            "text": "actTNumber actTNumber (C, S) $P_TOOLNO\nActive tool number\nThe command should not be used if magazine management (TMMG=1) is active.\nIf magazine management is active, GETTEXET should be used instead.\nFor $MC_CUTTING_EDGE_DEFAULT=0 or -2, an incorrect T number may be determined.\nIf the programming is made after programming D > 0, it is also safe.\n \nUnits and value ranges\nPhysical unit:\n-\nData type:\nTYPE_UWORD\nDefault value: Minimum value:\n0\nMaximum value:\n32000\nArea\nColumn index:\n23\nLine index: Max. line index:"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "描述「Active tool number」与 label「当前有效刀具号」一致；TYPE_UWORD（最大 32000）与 decode=U16_LE 相容；Column index=23 与 r1 column=23 一致。手册另有使用限制（TMMG=1 时不应使用、$MC_CUTTING_EDGE_DEFAULT=0 或 -2 时 T 号可能不准），属适用范围说明，定义未断言该场景，不构成冲突但采集侧需注意。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false
+      }
     },
     {
       "variable_id": "channel.r_parameter",
@@ -1345,7 +2233,59 @@
       "match_conclusion": "matching_older_version",
       "notes": "按中文标签“通道 R 参数”＋ golden_ref.variable=rpa（R-Parameter）定位到 sysvar §3.3（p15）：手册明确 R[n] 为通道专用、Real/DOUBLE、可掉电保持、数量由 MD28050 $MC_MM_NUM_R_PARAM 定义，且“NC 变量”读取属性为 X（可通过 NC 变量/OPI 读取），与定义 decode=F64_LE（8 字节 DOUBLE）一致。但手册未给出 C/RP/col 1 的地址形态与 line=index+1 的映射，该部分仍只能由 03/2025 版 NC 变量文档支撑。本节为 07/2023 较早版本，故记为 matching_older_version。",
       "is_original_source": false,
-      "must_not_backfill_to_r1": true
+      "must_not_backfill_to_r1": true,
+      "cross_reference_202503": {
+        "pdf_file": "828D_ncvar_lists_man_0325_en-US.pdf",
+        "pdf_document_number": "A5E53370586B AC",
+        "pdf_version": "03/2025",
+        "pdf_total_pages": 1262,
+        "page": [
+          219
+        ],
+        "page_kind": "PDF 页码（实测：PDF 页 = 印刷页，偏移 0；见 .md §12.6）",
+        "section": "5.3.15 RP: Arithmetic parameters（p219）",
+        "matched_identifier": "rpa",
+        "matched_entry_header": "rpa rpa (C, RP) $R[x] x = ParameterNo",
+        "manual_stated_address": {
+          "area": "C",
+          "block": "RP",
+          "column_index": 1,
+          "line_index": "R parameter + 1",
+          "line_index_kind": "Line index=\"R parameter + 1\"，Max. line index=$MC_MM_NUM_R_PARAM + 1",
+          "data_type": "TYPE_DOUBLE",
+          "reference_to_assigned_machine_data": "$R[x] x = ParameterNo",
+          "module_number": null
+        },
+        "r1_native_address": {
+          "area": "C",
+          "area_no": "target(channel)",
+          "module": 21,
+          "column": 1,
+          "line": "argument_offset(index) + 1",
+          "decode": "F64_LE"
+        },
+        "address_field_comparison": {
+          "area": "一致",
+          "block": "一致（RP）",
+          "column": "一致（手册 1 = r1 1）",
+          "line": "一致（手册 \"R parameter + 1\" 与 r1 argument_offset(index)+1 逐字相符）",
+          "module": "手册未给出数值，无法比对"
+        },
+        "quoted_excerpt": "<p219> rpa rpa (C, RP) $R[x] x = ParameterNo / R variables / Units and value ranges / Physical unit: / - / Data type: / TYPE_DOUBLE / Default value: Minimum value: Maximum value: / Area / Column index: / 1 / Line index: / R parameter + 1 / Max. line index: / $MC_MM_NUM_R_PARA / M + 1 /   Read access and write access",
+        "quoted_excerpt_verbatim": [
+          {
+            "page": 219,
+            "text": "rpa rpa (C, RP) $R[x] x = ParameterNo\nR variables\nUnits and value ranges\nPhysical unit:\n-\nData type:\nTYPE_DOUBLE\nDefault value: Minimum value: Maximum value:\nArea\nColumn index:\n1\nLine index:\nR parameter + 1\nMax. line index:\n$MC_MM_NUM_R_PARA\nM + 1\n  Read access and write access"
+          }
+        ],
+        "quoted_excerpt_note": "逐字取自上述页的 pypdf 抽取文本；换行以 \" / \" 表示，跨页分段以 <pNN> 标记；脚本断言每段原文均存在于该页抽取结果中",
+        "match_conclusion": "exact_match",
+        "address_mapping_conclusion": "manual_semantic_only",
+        "notes": "本条原为 matching_older_version（07/2023 sysvar p15），本轮在 03/2025（所引来源版本）找到独立条目：Column index=1、TYPE_DOUBLE、Line index 明确写「R parameter + 1」——与 r1 的 line=argument_offset(index)+1 **逐字对应**，这是本批唯一由手册直接证实的 line 索引规则。章引言给出「100 R variables are defined by default，数量由 MD28050 (MM_NUM_R_PARAM) 设定」，与 Max. line index=$MC_MM_NUM_R_PARAM+1 自洽。注意：module=21 仍无手册依据；真机侧 module 字节为 0x15=21 且 R0/R1/R99 返回 GOOD、R425 被拒 0x03（docs/evidence/nck-live-samples-probe.txt:11-14，measurement 类别）。",
+        "is_original_source_match": true,
+        "backfill_to_r1_allowed": false,
+        "scope_note": "本条不属本次必核的 15 条（不是 not_found/pending_review），顺带核对以补全「03/2025 组 16/16」。"
+      }
     },
     {
       "variable_id": "drive.parameter.r0021",
@@ -3339,6 +4279,19 @@
       "已发布 r1.json 的任何定义内容",
       "实体 828D 的硬件验收状态",
       "生产库配置"
-    ]
+    ],
+    "follow_up_202503": {
+      "subject": "裁决 D3（13 条 not_found 需取得 03/2025 NC 变量文档）的执行结果",
+      "executed": true,
+      "document_obtained": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "pages": 1262,
+        "sha256": "1274440ed70ef00e82d5f3560e38558740139fa6337405c75df4f0bea1eb5ed1"
+      },
+      "outcome": "13 条 not_found 中 12 条在 03/2025 找到独立条目（exact_match），1 条（channel.program.name.main）仍 pending_review；2 条 pending_review（channel.program.status、spindle.speed.commanded）均在 03/2025 找到独立条目（exact_match）。",
+      "unchanged": "D3 的原文（含 07/2023 结论）保留不动；r1.json 未改动；07/2023 的 cross_reference_202307 与 entries[].match_conclusion 未改动。",
+      "new_gap": "module（Baustein）字节取值不被本手册覆盖，见 open_gaps 新增条目 module_byte_value_not_covered_by_manual_0325。"
+    }
   }
 }

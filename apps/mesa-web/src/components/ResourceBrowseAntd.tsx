@@ -1,156 +1,52 @@
-// Descriptor-driven Browse 选型（P0-2）：消费 resource_selection_methods
-// 声明的 Browse 能力。只理解 browse 节点信封（见 browseModel），不理解
-// 任何协议：下钻靠 has_children + 节点 id 回传 parent；回根即 parent=""；
-// 选用须经 selectableFromNode 判定，无 binding 的分支只能进入。
+// Descriptor 驱动的 Browse 选型（P0-2）：消费 resource_selection_methods 声明的
+// Browse 能力。
 //
-// PR-C 第三批：语义叶（nck_variable / nck_native）不再走通用“resource 回填”
-// 路径，而是：
-// - 语义叶必须带 identity（A16），否则入口关闭；
-// - `scope=identity` / 缺定义 / family 不一致 / Browse 预览为空 ⇒ 显示原因且
-//   不给“选用”（A13）；
-// - 可选用时交给父层的语义表单（服务端 Preview 仍是唯一身份来源），
-//   **绝不**把 Browse 的 preview_point_key 直接当提交 Key；
-// - 非 NCK 叶逐字保持既有行为（A44）。
+// 本组件**只**理解 browse 节点信封（见 browseModel.ts）：下钻靠 has_children +
+// 节点 id 回传 parent；回根即 parent=""。它不认识任何厂商/协议/Point Kind：
+//
+// - 通用资源叶：`selectableFromNode` → `onFill`（resource + parameters 回填）；
+// - 语义叶：由调用方注入的 `BrowseLeafPolicy` 判定（是否可选、类别标签、
+//   不可选原因、预览提示、选用载荷），本组件只负责展示与转发 → `onLeafSelect`；
+// - 载荷声明了 point kind 但没有策略接管：fail-closed，不给「选用」入口。
+//
+// 身份纪律（与驱动无关的通用要求）：节点自带的预览身份**只展示**，永不作为
+// 最终身份；提交前必须由服务端 Preview / Configure 重新确认（策略层不得放宽）。
 import { useEffect, useState } from "react";
 import { Button, Input, Space, Tag, message } from "antd";
 import {
   buildBrowseRequest,
+  declaresOpaquePointKind,
+  parseBrowseEnvelope,
   selectableFromNode,
   type BrowseNode,
-  type BrowsePointKind,
   type BrowseSelection,
 } from "../browseModel";
-import { evaluateNckSelectionAdd } from "../nckCollectability";
 import {
-  checkNckFamily,
-  type NckDefinitionLike,
-} from "../nckPointModel";
+  DEFAULT_MISSING_HANDLER_REASON,
+  NO_POLICY_FOR_POINT_KIND_REASON,
+  type BrowseLeafOwned,
+  type BrowseLeafPolicy,
+} from "../browseLeafPolicy";
 
-/** Browse 的语义准入上下文（由 Picker / Endpoint 页注入）。 */
-export interface NckSemanticBrowseConfig {
-  /** 目录定义（只读）。缺失即语义叶一律不可选（fail-closed）。 */
-  definitions?: readonly NckDefinitionLike[] | null;
-  endpointFamily?: string | null;
-  catalogFamily?: string | null;
-}
-
-interface SemanticGate {
-  ok: boolean;
-  reason?: string;
-}
-
-function findDefinition(
-  definitions: readonly NckDefinitionLike[] | null | undefined,
-  variableId: string,
-  revision: number | null,
-): NckDefinitionLike | null {
-  if (!definitions) return null;
-  for (const definition of definitions) {
-    if (definition.variable_id !== variableId) continue;
-    if (
-      revision !== null &&
-      typeof definition.revision === "number" &&
-      definition.revision !== revision
-    ) {
-      continue;
-    }
-    return definition;
-  }
-  return null;
-}
-
-/** 解析原始信封里的语义 kind（仅用于“为什么不可选”的展示）。 */
-function rawSemanticKind(node: BrowseNode): BrowsePointKind | null {
-  try {
-    const parsed = JSON.parse((node.binding_json ?? "").trim()) as { kind?: unknown };
-    return parsed?.kind === "nck_variable" || parsed?.kind === "nck_native"
-      ? parsed.kind
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-/** 旧 `variable` 原生信封（语义载荷不可用时的降级形态）。 */
-function isLegacyVariableEnvelope(node: BrowseNode): boolean {
-  try {
-    const parsed = JSON.parse((node.binding_json ?? "").trim()) as {
-      kind?: unknown;
-      resource_id?: unknown;
-    };
-    return parsed?.resource_id === "variable" && parsed?.kind === undefined;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * 语义叶准入（A13/A16）：目录、scope、family。
- *
- * 这里**不**判断 Browse 预览 Key 的权威性——它只用于展示，提交前语义表单会
- * 重新走服务端 identity-preview。
- */
-export function evaluateSemanticBrowseLeaf(
-  selection: BrowseSelection,
-  config: NckSemanticBrowseConfig | null | undefined,
-): SemanticGate {
-  if (!config) return { ok: false, reason: "未提供语义目录上下文：不可选用" };
-  if (selection.point_kind === "nck_native") {
-    return { ok: false, reason: "原生点位请使用「高级原生配置」，不要从语义 Browse 加入" };
-  }
-  if (selection.point_kind !== "nck_variable") {
-    return { ok: false, reason: "非语义叶：走通用资源回填" };
-  }
-  const variableId = selection.parameters.variable_id;
-  const revision = selection.parameters.definition_revision;
-  if (typeof variableId !== "string" || variableId === "") {
-    return { ok: false, reason: "语义叶缺少 variable_id" };
-  }
-  if (typeof revision !== "number" || !Number.isInteger(revision)) {
-    return { ok: false, reason: "语义叶缺少 definition_revision" };
-  }
-  if (!config.definitions) {
-    return { ok: false, reason: "定义目录不可用：无法确认 scope，禁止选用（fail-closed）" };
-  }
-  const definition = findDefinition(config.definitions, variableId, revision);
-  if (!definition) {
-    return {
-      ok: false,
-      reason: `定义目录中找不到 ${variableId}（rev ${revision}）：无法确认 scope`,
-    };
-  }
-  const admission = evaluateNckSelectionAdd(definition);
-  if (!admission.ok) {
-    return { ok: false, reason: `${admission.code}：${admission.message}` };
-  }
-  const family = checkNckFamily({
-    endpointFamily: config.endpointFamily,
-    definitionFamily: definition.family,
-    catalogFamily: config.catalogFamily,
-  });
-  if (!family.ok) return { ok: false, reason: `${family.code}：${family.message}` };
-  // `preview_point_key=null` 只表示该模板的 target/arguments 尚未补全（A10）：
-  // 仍允许进入语义表单补全，但**提交**必须等服务端 Preview 成功。
-  // 因此这里不拒绝，只在 UI 上显示“身份未确定”。
-  return { ok: true };
-}
-
-export function ResourceBrowseAntd({
+export function ResourceBrowseAntd<TSel>({
   endpointId,
   onFill,
-  nckSemantic,
-  onSemanticSelect,
+  leafPolicy,
+  onLeafSelect,
 }: {
   endpointId: string;
   /** 用户选用通用资源叶：父层切到手动表单并预填（resource + parameters）。 */
   onFill: (sel: BrowseSelection) => void;
-  /** 语义准入上下文；未注入时语义叶一律不可选（fail-closed）。 */
-  nckSemantic?: NckSemanticBrowseConfig | null;
   /**
-   * 用户选用语义叶：父层应打开语义表单（NckPointFields）并预填 parameters。
-   * 未提供时语义叶“选用”入口关闭（不回落到旧 resource 路径）。
+   * 叶判定策略（可选）。由驱动语义层注入；未注入时所有带语义载荷的叶
+   * 一律不可选用（fail-closed），通用资源叶行为逐字不变。
    */
-  onSemanticSelect?: (sel: BrowseSelection) => void;
+  leafPolicy?: BrowseLeafPolicy<TSel> | null;
+  /**
+   * 用户选用策略接管的叶：父层按载荷（不透明）走自己的表单。
+   * 未提供时策略叶的「选用」入口关闭（不回落到通用资源回填）。
+   */
+  onLeafSelect?: (sel: TSel) => void;
 }) {
   const [parent, setParent] = useState("");
   const [filter, setFilter] = useState("");
@@ -211,6 +107,39 @@ export function ResourceBrowseAntd({
     load(parent, filter, null, false);
   };
 
+  /**
+   * 单个节点的展示视图。
+   *
+   * 优先级：策略接管 > 通用资源叶 > 「载荷需语义层解释但未注入策略」的阻断。
+   * 三者互斥，且任何一条不成立时都不产生「选用」入口（fail-closed）。
+   */
+  const viewOf = (node: BrowseNode) => {
+    const verdict = leafPolicy?.evaluate(node) ?? { mode: "generic" as const };
+    if (verdict.mode === "owned") {
+      let owned: BrowseLeafOwned<TSel> = verdict;
+      if (owned.selectable) {
+        // 策略说可选，但缺少载荷或上层未接线 ⇒ 退化为不可选并显示原因，
+        // 绝不把「策略的乐观结论」当成可提交。
+        if (!owned.selection) {
+          owned = { ...owned, selectable: false, reason: "策略未提供可选用载荷：不可选用" };
+        } else if (!onLeafSelect) {
+          owned = {
+            ...owned,
+            selectable: false,
+            reason: leafPolicy?.missingHandlerReason ?? DEFAULT_MISSING_HANDLER_REASON,
+          };
+        }
+      }
+      return { owned, generic: null as BrowseSelection | null, unclaimedKindPayload: false };
+    }
+    const generic = selectableFromNode(node);
+    return {
+      owned: null as BrowseLeafOwned<TSel> | null,
+      generic,
+      unclaimedKindPayload: !generic && declaresOpaquePointKind(parseBrowseEnvelope(node)),
+    };
+  };
+
   return (
     <div style={{ display: "grid", gap: 12 }}>
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
@@ -237,22 +166,9 @@ export function ResourceBrowseAntd({
       ) : (
         <div style={{ display: "grid", gap: 6 }}>
           {nodes.map((n) => {
-            const sel = selectableFromNode(n);
-            const rawKind = rawSemanticKind(n);
-            const semantic = sel?.point_kind ?? rawKind;
-            // NCK 语义上下文里，旧 `variable` 原生信封是“语义载荷不可用”的
-            // 降级形态（presets.rs:195-203）：只提示改用高级原生配置，
-            // **不得**回落到旧通用 resource 回填（A22）。
-            const legacyVariable = !!nckSemantic && !semantic && isLegacyVariableEnvelope(n);
-            let gate: SemanticGate | null = null;
-            if (semantic) {
-              gate = sel
-                ? evaluateSemanticBrowseLeaf(sel, nckSemantic)
-                : { ok: false, reason: "语义叶缺少 identity 或形态非法：不可选用（A16）" };
-              if (gate.ok && !onSemanticSelect) {
-                gate = { ok: false, reason: "上层未提供语义表单入口：不可选用" };
-              }
-            }
+            const view = viewOf(n);
+            const { owned, generic } = view;
+            const selectable = !!owned?.selectable && !!owned.selection && !!onLeafSelect;
             return (
               <div
                 key={n.id}
@@ -263,37 +179,44 @@ export function ResourceBrowseAntd({
                   <span style={{ display: "block", fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11, color: "#525252", overflow: "hidden", textOverflow: "ellipsis" }}>
                     {n.id}
                   </span>
-                  {semantic ? (
+                  {owned?.badge || (owned?.tags?.length ?? 0) > 0 ? (
                     <span style={{ display: "block", fontSize: 11, color: "#525252" }}>
-                      <Tag color="blue">语义点位</Tag>
-                      {semantic === "nck_native" ? <Tag>nck_native</Tag> : null}
-                      {sel?.identity?.preview_point_key ? (
-                        <span style={{ fontFamily: "'IBM Plex Mono',monospace" }}>
-                          Browse 预览：{sel.identity.preview_point_key}（仅展示；提交前仍需服务端确认）
-                        </span>
-                      ) : semantic === "nck_variable" && sel?.identity ? (
-                        <span style={{ color: "#8c6000" }}>
-                          Browse 预览：身份未确定（target/arguments 不完整）——可选用后到语义表单补全，
-                          提交前必须由服务端 Preview 确认
+                      {owned?.badge ? <Tag color="blue">{owned.badge}</Tag> : null}
+                      {owned?.tags?.map((tag) => <Tag key={tag}>{tag}</Tag>)}
+                      {owned?.preview ? (
+                        <span
+                          style={{
+                            fontFamily: "'IBM Plex Mono',monospace",
+                            color: owned.preview.tone === "warn" ? "#8c6000" : undefined,
+                          }}
+                        >
+                          {owned.preview.text}
                         </span>
                       ) : null}
                     </span>
                   ) : null}
-                  {legacyVariable ? (
+                  {owned?.notice ? (
                     <span
-                      data-testid="browse-legacy-variable-block"
+                      data-testid={owned.notice.testId}
                       style={{ display: "block", fontSize: 11, color: "#c62828" }}
                     >
-                      语义载荷不可用（内嵌定义目录缺少该变量）：只能使用「高级原生配置」，
-                      不得走旧 variable 采集入口
+                      {owned.notice.text}
                     </span>
                   ) : null}
-                  {gate && !gate.ok ? (
+                  {owned && !owned.selectable && owned.reason ? (
                     <span
-                      data-testid="browse-semantic-block"
+                      data-testid={owned.blockTestId ?? "browse-leaf-block"}
                       style={{ display: "block", fontSize: 11, color: "#c62828" }}
                     >
-                      不可选用：{gate.reason}
+                      不可选用：{owned.reason}
+                    </span>
+                  ) : null}
+                  {view.unclaimedKindPayload ? (
+                    <span
+                      data-testid="browse-leaf-block"
+                      style={{ display: "block", fontSize: 11, color: "#c62828" }}
+                    >
+                      不可选用：{NO_POLICY_FOR_POINT_KIND_REASON}
                     </span>
                   ) : null}
                 </span>
@@ -304,18 +227,18 @@ export function ResourceBrowseAntd({
                   {n.has_children ? (
                     <Button size="small" onClick={() => enter(n.id)}>进入</Button>
                   ) : null}
-                  {semantic ? (
-                    gate?.ok && sel ? (
+                  {owned?.selectable ? (
+                    selectable ? (
                       <Button
                         size="small"
                         type="primary"
-                        onClick={() => onSemanticSelect?.(sel)}
+                        onClick={() => onLeafSelect?.(owned.selection as TSel)}
                       >
-                        选用（语义）
+                        {owned.selectLabel ?? "选用"}
                       </Button>
                     ) : null
-                  ) : sel && !legacyVariable ? (
-                    <Button size="small" type="primary" onClick={() => onFill(sel)}>选用</Button>
+                  ) : generic ? (
+                    <Button size="small" type="primary" onClick={() => onFill(generic)}>选用</Button>
                   ) : null}
                 </Space>
               </div>
