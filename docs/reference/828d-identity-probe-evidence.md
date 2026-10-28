@@ -211,11 +211,22 @@ reference 是 `docs/evidence/nck-live-identity-probe.txt`，但该文件**没有
 （`module26_unit1_object_name` / `module130_unit1_object_name`），且自述
 `module130_status = "candidate; official numeric mapping not confirmed"`。
 
-## 7. 待核实（PDF 未到位 / 无证据）
+### 6.1 三条禁令（硬性，禁止在后续任何证据/映射里违反）
+
+1. **不允许**用固定 `±1` 规则把一个入口的实例编号换算成另一个入口的编号
+   （反例：`V/4` 的 m26=`SERVO_3.3:3`、m130=`SERVO_3.3:6`，不是 ±1）。
+2. **不允许**因为某些编号恰好相同（上表 `V/5`、`V/7`、`V/8`）就认定两个入口等价。
+3. **每个映射必须绑定**：实际入口（module 26 或 module 130）、对象类型（`nc_variable` / `drive_object`）、
+   索引（`V/n`）以及验证证据出处（文件:行号）。
+
+**唯一可接受的写法**：`V/1 @ module26 = SERVO_3.3:4`（证据 `nck-live-identity-probe.txt:53`）与
+`V/1 @ module130 = SERVO_3.3:3`（证据 `nck-live-identity-probe.txt:62`）是两条不同事实，不得合并成一条“驱动对象 4”。
+
+## 7. 待核实（阶段 A 后仍缺运行时证据的项）
 
 | # | 事项 | 现状 |
 |---|---|---|
-| 1 | 8 个探针的**手册章节/页码** | **未找到**。所有探针参数来自"已冻结 catalog 中经证据核对的条目"（`identity_spec.rs:9-10`），没有任何文档节号。PDF 到位前一律 `pending` |
+| 1 | 8 个探针的**手册章节/页码** | **已补 6 条（阶段 A）**：`AXIS_NAME`=md p31（MD10000）、`AXIS_CTRLOUT_MODULE_NR`=md p364（MD30110）、`AXIS_CTRLOUT_TYPE`=md p364（MD30130）、`AXIS_ENC_MODULE_NR`=md p365（MD30220）、`CHANNEL_MACHAX_USED`=md p185（MD20070）、`AXIS_SPIND_ASSIGN`=md p451（MD35000）；`DRIVE_OBJECT_NAME`/`_M130`=s120 p136（p0199）。均为 07/2023 较早版本文档依据，**不构成真机验证**（见 `828d-manual-cross-reference.md` §7）。证据文件内部仍无文档节号 |
 | 2 | `AXIS_ENC_MODULE_NR`（col 30220）的真机读数 | **未找到**真机证据（`tests/live_identity_probe.rs` 未调用该常量，`identity.rs:6-9` 也未导入）；仅有虚拟控制器读数。**另**：该定义 `axis.encoder.module_number` 在 `r1.json` 中确实挂着 `measurement` 来源 `docs/evidence/nck-live-identity-probe.txt`，但该文件内**没有**编码器驱动号一节 ⇒ 该 `measurement` 来源**在所引文件中未找到对应记录**（见 §5） |
 | 3 | `AXIS_SPIND_ASSIGN`（col 35000）的字节级/布局测试 | **未找到**（既无 exact-bytes 断言，也无长度断言）；仅有真机读数 |
 | 4 | `AXIS_CTRLOUT_TYPE`（col 30130）的 exact-bytes 断言 | **未找到**；仅有长度/transport 断言（`identity_spec.rs:335-337`）与实测 |
@@ -224,6 +235,7 @@ reference 是 `docs/evidence/nck-live-identity-probe.txt`，但该文件**没有
 | 7 | 单项码 `0x0A` / `0x85` 的官方语义 | **未找到**官方定义。仓库内只作为"设备拒绝"处理（`identity.rs:98-107`），不解释码义 |
 | 8 | 15 s 整页预算是否覆盖 31 实例全量枚举 | **待核实**。`IDENTITY_PAGE_MAX=8` 下每页最多 8 实例 × 最多 5 次读；31 实例需多页，跨页总耗时未在任何证据文件中实测 |
 | 9 | `AXIS_NAME` 的 `line` 槽位上界 | 代码层只受 `instance_cursor` 的 1..=31 限制（`identity.rs:295-310`），但 `line` 字段本身是 `u16`（`codec.rs:54`）；真实设备的 `line` 上界**未找到**证据（证据只覆盖 1..8） |
+| 10 | `axis.encoder.module_number` 的**文档依据** | **已补（阶段 A）**：07/2023 机床数据手册 md p365 有 30220 ENC_MODULE_NR 的条目定义（说明延续至 p366）。但这**只补文档依据**，该条 `measurement` 在所引证据文件中仍不存在、`AXIS_ENC_MODULE_NR` 仍未进入真实探测执行路径 ⇒ **仍不得标记真机已验证**，须修探针或撤声明（见 `828d-manual-cross-reference.md` §9.1） |
 
 ## 8. 复核命令（只读，不触发任何设备访问）
 

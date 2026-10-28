@@ -1,0 +1,3262 @@
+{
+  "$comment": "Phase 0 阶段 A：42 条 828D 定义的 07/2023 手册来源可追溯交叉引用。本文件只新增“07/2023 交叉引用”，绝不改写 r1.json，也不把 07/2023 页码追认为现有定义的原始来源。原始 manual reference 原样照抄，不做任何版本替换。页码为实测值（pypdf 逐页抽取后检索得到），未命中的条目标 not_found，禁止猜页码或用相近条目顶替。",
+  "schema_version": 1,
+  "phase": "Phase 0 阶段 A（只新增 docs/reference 文档与校验脚本）",
+  "baseline": {
+    "branch": "docs/phase0-828d-catalog-audit",
+    "head_commit": "c3945847dcc196e8cb969f08fe71b7b397edfd8d",
+    "main_commit": "047e2064bd233eafc508ca9fe5329e93a96ee6e2",
+    "r1_path": "drivers/sinumerik-nck/definitions/828d/r1.json",
+    "r1_blob_sha1": "3c0abe67cbcb64b525cddec1584e6e1747e0f062",
+    "r1_modified_by_this_work": false
+  },
+  "pdf_set": {
+    "sysvar": {
+      "file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+      "document_number": "6FC5397-5FP40-0RA6",
+      "id": "828d-sysvar-lists-0723"
+    },
+    "md": {
+      "file": "828D_md_lists_man_0723_zh-CHS.pdf",
+      "document_number": "6FC5397-4DP40-6RA6",
+      "id": "828d-md-lists-0723"
+    },
+    "s120": {
+      "file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+      "document_number": "A5E53014702F AA",
+      "id": "sinamics-s120-para-lists-0723"
+    }
+  },
+  "method": {
+    "extraction": "pypdf 逐页 extract_text()（本机 pypdf 6.6.0），三份共 3340 页，抽取结果缓存于临时目录，不入库",
+    "identifier_selection": [
+      "机械参数类（19 条 drive.*）：golden_ref.variable 即参数号（r0021/r0035/…/p0105），可直接在 PDF 中按行首条目头匹配",
+      "NC 变量类（16 条）：golden_ref.variable 为驼峰变量名（progStatus/opMode/…），作为主标识；其中 channel.r_parameter 的 golden_ref.variable 仅为缩写 rpa，改用 label「通道 R 参数」+ §3.3 中文条目名定位",
+      "无 manual 来源的 7 条：golden_ref.variable 为机床数据符号名或参数号，配合 addressing.column 的 MD 编号/参数号定位",
+      "variable_id 本身（如 drive.parameter.r0021）从不作为检索串——它是本仓库的命名，不出现在西门子手册中"
+    ],
+    "search": "对每个标识符在三份 PDF 的全文做「行首条目头」与「任意位置命中」两轮检索；同时补做中文关键词与不区分大小写检索，避免漏检",
+    "conclusion_rule": {
+      "exact_match": "找到同名条目、语义一致，且 PDF 版本与所引来源版本一致（本轮三份 PDF 均为 07/2023，早于 03/2025 与 11/2023，故本轮 0 条）",
+      "matching_older_version": "找到同名条目、语义/类型与定义不冲突，但所在 PDF 是比所引来源更早的版本（07/2023）——只证明“较早版本中存在该条目”",
+      "version_difference": "找到条目但定义/取值语义/单位/条件与定义表述存在实质差异",
+      "not_found": "该标识符在三份 PDF 中未出现，且无名称可机械对应的条目；语义近邻只写在 notes，不计入结论",
+      "pending_review": "标识符确实出现在 PDF 正文中但不构成条目定义（或语义需人工核对），不能据此确认身份"
+    },
+    "page_kind": "全部为 PDF 页码；本套三份 PDF 实测 PDF 页 = 印刷页（偏移 0），见 .md §4"
+  },
+  "summary": {
+    "definitions_total": 42,
+    "definitions_with_manual_source": 35,
+    "definitions_without_manual_source": 7,
+    "match_conclusion_distribution": {
+      "exact_match": 0,
+      "matching_older_version": 19,
+      "version_difference": 1,
+      "not_found": 13,
+      "pending_review": 2
+    },
+    "match_conclusion_distribution_without_manual_source": {
+      "exact_match": 0,
+      "matching_older_version": 6,
+      "version_difference": 1,
+      "not_found": 0,
+      "pending_review": 0
+    },
+    "cross_reference_pdf_distribution": {
+      "828D_sysvar_lists_man_0723_zh-CHS.pdf": 1,
+      "828D_md_lists_man_0723_zh-CHS.pdf": 2,
+      "828D_S120_para_lists_man_0723_zh-CHS.pdf": 19
+    },
+    "not_found_ids": [
+      "mode_group.op_mode",
+      "channel.program.name.main",
+      "channel.program.name.active",
+      "channel.program.line_number",
+      "channel.program.block",
+      "axis.position.commanded_mcs",
+      "axis.position.actual_bcs",
+      "channel.feed.actual",
+      "channel.feed.commanded",
+      "channel.feed.override",
+      "spindle.speed.actual",
+      "spindle.speed.override",
+      "channel.tool.number_active"
+    ],
+    "pending_review_ids": [
+      "channel.program.status",
+      "spindle.speed.commanded"
+    ],
+    "version_difference_ids": [
+      "drive.parameter.r0033"
+    ]
+  },
+  "evidence_classes_stay_independent": {
+    "manual": {
+      "can_prove": "手册中如何定义该条目（名称/类型/单位/适用范围）",
+      "cannot_prove": "协议上该地址是否可访问、真机是否可读"
+    },
+    "frozen_vector": {
+      "can_prove": "冻结地址/字节行为的回归一致性",
+      "cannot_prove": "真实设备是否支持该地址"
+    },
+    "measurement": {
+      "can_prove": "当时那次测量的结果",
+      "cannot_prove": "原始证据文件是否真实存在且覆盖该定义（本轮：axis.encoder.module_number 有一条 measurement 在所引文件中不存在）"
+    },
+    "identity_probe": {
+      "can_prove": "探针返回过什么",
+      "cannot_prove": "实际调用路径与采样范围（本轮：AXIS_ENC_MODULE_NR 未进入真实探测执行路径）"
+    },
+    "rule": "四类证据互不替代；新增 07/2023 文档依据不等于任何一类运行时证据升级"
+  },
+  "open_gaps": [
+    {
+      "id": "axis.encoder.module_number",
+      "title": "measurement 来源不存在 + 探针未进入执行路径（独立缺口，文档依据不能弥补）",
+      "facts": [
+        "r1.json 中该定义挂着 measurement 来源 docs/evidence/nck-live-identity-probe.txt",
+        "该文件共 128 行，小节依次为：机床轴名 p7、通道1 位置→机床轴号 p16、轴驱动号 p25、轴输出类型 p34、主轴归属 p43、驱动对象名 module26 p52、驱动对象名 module130 p61、跨路径 r0035 p70、r0103 p79、p0105 p88、r0106 p97、r0107 p106、r0108 p115 —— 没有编码器驱动号一节",
+        "drivers/sinumerik-nck/tests/live_identity_probe.rs:16-20 的 use 清单不含 AXIS_ENC_MODULE_NR（该文件内也未调用）",
+        "drivers/sinumerik-nck/src/identity.rs:6-9 的 use 清单同样不含 AXIS_ENC_MODULE_NR（身份浏览执行路径从不读它）",
+        "本轮只在 md 07/2023 p365 找到 MD30220 的文档定义"
+      ],
+      "required_action": "需另行修复探针执行路径（把 AXIS_ENC_MODULE_NR 纳入真实探测并重跑、留存证据），或撤销这条不受证据支持的 measurement 声明；补文档依据不得被写成“真机已验证”。"
+    },
+    {
+      "id": "module26_vs_module130_instance_numbers",
+      "title": "module 26 与 module 130 的实例编号不可互相换算（三条禁令）",
+      "facts": [
+        "同一台 828D 实测（docs/evidence/nck-live-identity-probe.txt:53-69）：V/1 的 m26=SERVO_3.3:4 而 m130=SERVO_3.3:3（差 1），V/2..V/4 同样差 1，但 V/5、V/7、V/8 两者恰好同值（SERVO_3.3:7 / SERVO_3.15:3 / SERVO_3.15:4）",
+        "V/6 在 module 26 上被拒（S7_JOB_0x8201），在 module 130 上返回 SERVO_3.3:8"
+      ],
+      "prohibitions": [
+        "不允许用固定 ±1 规则换算实例编号",
+        "不允许因某些编号恰好相同就认定两个入口等价",
+        "每个映射必须绑定实际入口、对象类型、索引与验证证据"
+      ],
+      "required_action": "任何依赖驱动对象编号的映射（含 MD30110/MD30220 的“驱动器编号/测量回路编号”语义）必须写明入口 module 26 或 module 130。"
+    }
+  ],
+  "entries": [
+    {
+      "variable_id": "channel.program.status",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "通道程序状态",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 127
+        },
+        "column": 13,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "U16_LE",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "S",
+          "variable": "progStatus",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "progStatus",
+      "cross_reference_202307": {
+        "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "6FC5397-4DP40-6RA6",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 690,
+        "page": [
+          222,
+          223
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "5.2 通道专用 NC 机床数据（正文提及）",
+        "matched_identifier": "progStatus",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "pending_review",
+      "notes": "三份 PDF 中唯一出现该标识符的位置是 md p222–223 的正文（异步子程序执行时不通过 OPI 变量“progStatus”和“chanStatus”显示）。该处只以字符串提及 OPI 变量名，未给出该变量的数据类型/单位/下标/读取方式，不构成条目定义，故不能作为 42 条定义的来源页码；需人工核对是否存在独立的 NC 变量（OPI 变量）清单文档。抽取文本可读，无 CID 乱码。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "mode_group.op_mode",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "方式组运行方式",
+      "r1_addressing": {
+        "area": "B",
+        "area_no": {
+          "source": "target",
+          "kind": "mode_group"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 127
+        },
+        "column": 3,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "U16_LE",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "B",
+          "block": "S",
+          "variable": "opMode",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "opMode",
+      "cross_reference_202307": {
+        "pdf_file": null,
+        "pdf_document_number": null,
+        "pdf_version": null,
+        "pdf_total_pages": null,
+        "page": null,
+        "page_kind": null,
+        "section": null,
+        "matched_identifier": null,
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索；本条 0 命中，故不给页码（不猜页码）"
+      },
+      "match_conclusion": "not_found",
+      "notes": "标识符 opMode 在三份 PDF 中均未出现（区分大小写检索为 0 命中）。语义近邻：sysvar p265–266 的 $P_OPMODE「选择的运行方式」（$P_ 前缀编程系统变量，且说明为“通过 PLC 选择的运行方式”），但其名称、访问入口与地址形态（B/S/col 3）均与本定义不同，按纪律不得顶替为匹配。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "channel.program.name.main",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "主程序名",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 122
+        },
+        "column": 5,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "UTF8_NUL_LAST_32",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "SPARPP",
+          "variable": "progName",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "progName",
+      "cross_reference_202307": {
+        "pdf_file": null,
+        "pdf_document_number": null,
+        "pdf_version": null,
+        "pdf_total_pages": null,
+        "page": null,
+        "page_kind": null,
+        "section": null,
+        "matched_identifier": null,
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索；本条 0 命中，故不给页码（不猜页码）"
+      },
+      "match_conclusion": "not_found",
+      "notes": "progName 未出现。同页语境：md p39 出现另一个 OPI 变量名 lastBlockNoStr（功能块 SPARP/SPARPP），与本定义 golden_ref 的 progName 不是同一标识符，不顶替。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "channel.program.name.active",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "当前活动程序名",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 125
+        },
+        "column": 3,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "UTF8_NUL_LAST_32",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "SPARP",
+          "variable": "progName",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "progName",
+      "cross_reference_202307": {
+        "pdf_file": null,
+        "pdf_document_number": null,
+        "pdf_version": null,
+        "pdf_total_pages": null,
+        "page": null,
+        "page_kind": null,
+        "section": null,
+        "matched_identifier": null,
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索；本条 0 命中，故不给页码（不猜页码）"
+      },
+      "match_conclusion": "not_found",
+      "notes": "progName（block=SPARP）未出现；与上一条同因，md p39 的 lastBlockNoStr 不足以定位“当前活动程序名”。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "channel.program.line_number",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "当前程序行号",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 125
+        },
+        "column": 9,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "I32_LE",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "SPARP",
+          "variable": "actLineNumber",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "actLineNumber",
+      "cross_reference_202307": {
+        "pdf_file": null,
+        "pdf_document_number": null,
+        "pdf_version": null,
+        "pdf_total_pages": null,
+        "page": null,
+        "page_kind": null,
+        "section": null,
+        "matched_identifier": null,
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索；本条 0 命中，故不给页码（不猜页码）"
+      },
+      "match_conclusion": "not_found",
+      "notes": "actLineNumber 未出现。手册内“程序段号”语义由 lastBlockNoStr（md p39）等其它 OPI 名承载，名称不匹配，不顶替。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "channel.program.block",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "当前执行程序块",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 125
+        },
+        "column": 31,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "UTF8_NUL_FIRST_66",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "SPARP",
+          "variable": "actBlock",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "actBlock",
+      "cross_reference_202307": {
+        "pdf_file": null,
+        "pdf_document_number": null,
+        "pdf_version": null,
+        "pdf_total_pages": null,
+        "page": null,
+        "page_kind": null,
+        "section": null,
+        "matched_identifier": null,
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索；本条 0 命中，故不给页码（不猜页码）"
+      },
+      "match_conclusion": "not_found",
+      "notes": "actBlock 未出现。md p39 的 lastBlockNoStr 为不同标识符，按纪律不顶替。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "axis.position.commanded_mcs",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "轴指令位置（机床坐标系）",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 115
+        },
+        "column": 2,
+        "line": {
+          "source": "target",
+          "kind": "axis"
+        }
+      },
+      "r1_decode": "F64_LE",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "SGA",
+          "variable": "actToolBasePos",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "actToolBasePos",
+      "cross_reference_202307": {
+        "pdf_file": null,
+        "pdf_document_number": null,
+        "pdf_version": null,
+        "pdf_total_pages": null,
+        "page": null,
+        "page_kind": null,
+        "section": null,
+        "matched_identifier": null,
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索；本条 0 命中，故不给页码（不猜页码）"
+      },
+      "match_conclusion": "not_found",
+      "notes": "actToolBasePos 未出现；手册的轴位置类条目均为 $AA_/$VA_ 前缀编程系统变量，无 C/SGA 访问入口的 NC 变量名。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "axis.position.actual_bcs",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "轴实际位置（基本坐标系）",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 112
+        },
+        "column": 33,
+        "line": {
+          "source": "target",
+          "kind": "axis"
+        }
+      },
+      "r1_decode": "F64_LE",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "SEGA",
+          "variable": "actProgPosBKS",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "actProgPosBKS",
+      "cross_reference_202307": {
+        "pdf_file": null,
+        "pdf_document_number": null,
+        "pdf_version": null,
+        "pdf_total_pages": null,
+        "page": null,
+        "page_kind": null,
+        "section": null,
+        "matched_identifier": null,
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索；本条 0 命中，故不给页码（不猜页码）"
+      },
+      "match_conclusion": "not_found",
+      "notes": "actProgPosBKS 未出现（含不区分大小写检索）。不顶替。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "channel.feed.actual",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "通道实际进给率（IPO）",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 127
+        },
+        "column": 1,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F64_LE",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "S",
+          "variable": "actFeedRateIpo",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "actFeedRateIpo",
+      "cross_reference_202307": {
+        "pdf_file": null,
+        "pdf_document_number": null,
+        "pdf_version": null,
+        "pdf_total_pages": null,
+        "page": null,
+        "page_kind": null,
+        "section": null,
+        "matched_identifier": null,
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索；本条 0 命中，故不给页码（不猜页码）"
+      },
+      "match_conclusion": "not_found",
+      "notes": "actFeedRateIpo 未出现。语义近邻 $AC_FEED 类编程变量未与本定义地址对应，不顶替。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "channel.feed.commanded",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "通道指令进给率（IPO）",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 127
+        },
+        "column": 2,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F64_LE",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "S",
+          "variable": "cmdFeedRateIpo",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "cmdFeedRateIpo",
+      "cross_reference_202307": {
+        "pdf_file": null,
+        "pdf_document_number": null,
+        "pdf_version": null,
+        "pdf_total_pages": null,
+        "page": null,
+        "page_kind": null,
+        "section": null,
+        "matched_identifier": null,
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索；本条 0 命中，故不给页码（不猜页码）"
+      },
+      "match_conclusion": "not_found",
+      "notes": "cmdFeedRateIpo 未出现。手册未提供 NC 变量接口名与 C/S 地址的映射表。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "channel.feed.override",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "进给倍率（IPO）",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 127
+        },
+        "column": 3,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F64_LE",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "S",
+          "variable": "feedRateIpoOvr",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "feedRateIpoOvr",
+      "cross_reference_202307": {
+        "pdf_file": null,
+        "pdf_document_number": null,
+        "pdf_version": null,
+        "pdf_total_pages": null,
+        "page": null,
+        "page_kind": null,
+        "section": null,
+        "matched_identifier": null,
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索；本条 0 命中，故不给页码（不猜页码）"
+      },
+      "match_conclusion": "not_found",
+      "notes": "feedRateIpoOvr 未出现。语义近邻：sysvar p143 $AC_OVR「轨迹倍率」、p144 $AC_TOTAL_OVR「总轨迹倍率」；二者是该手册记录的编程系统变量，不是本定义所指 C/S/col 3 的 NC 变量接口项，按纪律不顶替。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "spindle.speed.actual",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "主轴实际转速",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 114
+        },
+        "column": 2,
+        "line": {
+          "source": "target",
+          "kind": "spindle"
+        }
+      },
+      "r1_decode": "F64_LE",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "SSP",
+          "variable": "actSpeed",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "actSpeed",
+      "cross_reference_202307": {
+        "pdf_file": null,
+        "pdf_document_number": null,
+        "pdf_version": null,
+        "pdf_total_pages": null,
+        "page": null,
+        "page_kind": null,
+        "section": null,
+        "matched_identifier": null,
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索；本条 0 命中，故不给页码（不猜页码）"
+      },
+      "match_conclusion": "not_found",
+      "notes": "actSpeed 未出现。手册的主轴转速条目为 $AA_/  $AC_ 类编程变量，非 SSP 块 NC 变量名。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "spindle.speed.commanded",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "主轴指令转速",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 114
+        },
+        "column": 3,
+        "line": {
+          "source": "target",
+          "kind": "spindle"
+        }
+      },
+      "r1_decode": "F64_LE",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "SSP",
+          "variable": "cmdSpeed",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "cmdSpeed",
+      "cross_reference_202307": {
+        "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "6FC5397-4DP40-6RA6",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 690,
+        "page": [
+          39
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 显示机床数据（正文提及）",
+        "matched_identifier": "cmdSpeed",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "pending_review",
+      "notes": "md p39 出现「该位涉及功能块 SPARPP 中的 OPI 变量 cmdSpeed」，说明该标识符确属本手册体系的 OPI 变量名，但（a）无独立条目给出类型/单位/下标，（b）手册把它归到功能块 SPARPP，而 r1 定义把 cmdSpeed 落在 block=SSP，二者归属不一致，需人工核对后方可采用。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "spindle.speed.override",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "主轴倍率",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 114
+        },
+        "column": 4,
+        "line": {
+          "source": "target",
+          "kind": "spindle"
+        }
+      },
+      "r1_decode": "F64_LE",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "SSP",
+          "variable": "speedOvr",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "speedOvr",
+      "cross_reference_202307": {
+        "pdf_file": null,
+        "pdf_document_number": null,
+        "pdf_version": null,
+        "pdf_total_pages": null,
+        "page": null,
+        "page_kind": null,
+        "section": null,
+        "matched_identifier": null,
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索；本条 0 命中，故不给页码（不猜页码）"
+      },
+      "match_conclusion": "not_found",
+      "notes": "speedOvr 未出现。语义近邻：sysvar p1143 $AA_SPEED_OVR「主轴倍率」、p989 $AA_OVR「轴的倍率」；不同访问入口，不顶替。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "channel.tool.number_active",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "当前有效刀具号",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 127
+        },
+        "column": 23,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "U16_LE",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "S",
+          "variable": "actTNumber",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable",
+      "r1_primary_identifier": "actTNumber",
+      "cross_reference_202307": {
+        "pdf_file": null,
+        "pdf_document_number": null,
+        "pdf_version": null,
+        "pdf_total_pages": null,
+        "page": null,
+        "page_kind": null,
+        "section": null,
+        "matched_identifier": null,
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索；本条 0 命中，故不给页码（不猜页码）"
+      },
+      "match_conclusion": "not_found",
+      "notes": "actTNumber 未出现；中文关键词“刀具号”在三份 PDF 的条目头中亦无命中（命中项均为刀具数据表，不含该 NC 变量名）。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "channel.r_parameter",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "通道 R 参数",
+      "r1_addressing": {
+        "area": "C",
+        "area_no": {
+          "source": "target",
+          "kind": "channel"
+        },
+        "module": {
+          "source": "fixed",
+          "value": 21
+        },
+        "column": 1,
+        "line": {
+          "source": "argument_offset",
+          "key": "index",
+          "offset": 1
+        }
+      },
+      "r1_decode": "F64_LE",
+      "r1_transport_size": 9,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "C",
+          "block": "RP",
+          "variable": "rpa",
+          "entry": "nc_variable"
+        }
+      ],
+      "original_manual_references": [
+        "Siemens 828D NC variables 03/2025 A5E53370586B AC"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "label + golden_ref.variable(rpa) + decode",
+      "r1_primary_identifier": "rpa",
+      "cross_reference_202307": {
+        "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "6FC5397-5FP40-0RA6",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1236,
+        "page": [
+          15
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "3.3 通道专用和 NC 全局计算参数（R / RG）",
+        "matched_identifier": "R[ <索引 1> ]　系统变量 Rn 或 R[n] 是 Real 类型的通道专用计算参数",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "按中文标签“通道 R 参数”＋ golden_ref.variable=rpa（R-Parameter）定位到 sysvar §3.3（p15）：手册明确 R[n] 为通道专用、Real/DOUBLE、可掉电保持、数量由 MD28050 $MC_MM_NUM_R_PARAM 定义，且“NC 变量”读取属性为 X（可通过 NC 变量/OPI 读取），与定义 decode=F64_LE（8 字节 DOUBLE）一致。但手册未给出 C/RP/col 1 的地址形态与 line=index+1 的映射，该部分仍只能由 03/2025 版 NC 变量文档支撑。本节为 07/2023 较早版本，故记为 matching_older_version。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0021",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0021（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 21,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F32_BE",
+      "r1_transport_size": 7,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0021",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0021",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0021",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          39,
+          40
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0021 CO: 已滤波的转速实际值 / 已滤波的转速实际值（SERVO_828, SERVO_COMBI）",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "数据类型 FloatingPoint32 与定义 decode=F32_BE 一致。该参数按驱动对象类型分列多条：p39 为 HLA_828（活塞速度）与 SERVO（转速），p40 为 SERVO 线性（速度 m/min）。定义只断言“参数身份”，未断言工程语义，故不构成冲突；工程语义随对象类型不同，采集侧不得假定单位。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0027",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0027（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 27,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F32_BE",
+      "r1_transport_size": 7,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0027",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0027",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0027",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          43,
+          44
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0027 CO: 已滤波的电流实际值 / 滤波 I 实际值",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "FloatingPoint32 与 F32_BE 一致。p43 覆盖 A_INF/S_INF/SERVO（单位 Arms），p44 覆盖 B_INF（单位 A，且手册注明该机型显示值无效）。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.motor.temperature",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "该驱动对象的电机温度（不表示某个机床轴）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 35,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F32_BE",
+      "r1_transport_size": 7,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0035",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0035",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023（p.71 无效值标记）"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0035",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          50
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0035 CO: 电机温度 / 电机温度",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "关键核对：手册 p50 明确写出「当 r0035 等于 -200.0 °C 时」的无效值分支，与定义 invalid_rule{-200.0, ±0.001} 一致；FloatingPoint32 与 F32_BE 一致。原 manual 来源写「11/2023 p.71 无效值标记」——07/2023 版该条目实测在 p50，说明所引 p.71 是 11/2023 版的页码，两版分页不同（20 个月版本差）。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0033",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "candidate",
+      "label_zh": "驱动参数 r0033（候选语义：轴负载；未确认）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 33,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F32_BE",
+      "r1_transport_size": 7,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0033",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0033",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0033",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          48
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0033 已滤波的转矩利用率 / 已滤波的转矩利用率",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "version_difference",
+      "notes": "定义 label 记为「候选语义：轴负载；未确认」，而 07/2023 手册 p48 明确：r0033 为“经过滤波的转矩利用率”，是所需转矩与转矩极限（按 p2196 缩放）之比，单位 %。“轴负载”与“转矩利用率(%)”不是同一表述，候选语义应据此修正或继续标 candidate；其余（FloatingPoint32 / F32_BE）一致。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0031",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "candidate",
+      "label_zh": "驱动参数 r0031（候选语义：滤波转矩实际值；访问能力 HOLD）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 31,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F32_BE",
+      "r1_transport_size": 7,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0031",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0031",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0031",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          46,
+          47
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0031 已滤波的转矩实际值 / 已滤波的转矩实际值（p46 同页另有 HLA 的推力条目）",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "定义 label 的候选语义“滤波转矩实际值”与手册一致（伺服为转矩 Nm，HLA 为推力 N）；FloatingPoint32 与 F32_BE 一致；p47 另有 SERVO 线性（推力）条目。label 提到的“访问能力 HOLD”属驱动侧访问能力分级，手册未以同名词表述，未作核对。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0062",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0062（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 62,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F32_BE",
+      "r1_transport_size": 7,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0062",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0062",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0062",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          69
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0062 CO: 已滤波的转速设定值 / 已滤波的转速设定值",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "FloatingPoint32 与 F32_BE 一致；p69 同页另有 HLA 的速度设定值条目（m/min）。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0063",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0063（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 63,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F32_BE",
+      "r1_transport_size": 7,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0063",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0063",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0063",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          69,
+          70
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0063 CO: 已滤波的转速实际值 / 已滤波的转速实际值",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "FloatingPoint32 与 F32_BE 一致；p69 为 HLA（速度），p70 为 SERVO（转速 rpm）。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0064",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0064（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 64,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F32_BE",
+      "r1_transport_size": 7,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0064",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0064",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0064",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          70,
+          71
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0064 CO: 转速控制器调节差 / n 控制器控制差异",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "FloatingPoint32 与 F32_BE 一致；p70 为 HLA，p71 为 SERVO 线性。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0077",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0077（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 77,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F32_BE",
+      "r1_transport_size": 7,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0077",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0077",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0077",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          79
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0077 CO: 转矩电流设定值 / Iq_设定",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "FloatingPoint32 与 F32_BE 一致。手册注明「在 V/f 控制中，该值没有含义」，属适用范围限制，定义未断言语义故不冲突。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0078",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0078（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 78,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F32_BE",
+      "r1_transport_size": 7,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0078",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0078",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0078",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          80
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0078[0...1] CO: 转矩电流实际值 / Iq_实际",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "FloatingPoint32 与 F32_BE 一致。手册给出双下标 [0]=未滤波、[1]=经 p0045 滤波；定义 count=1、addressing.line=1，按 r1 中 line=index+1 的用法（见 channel.r_parameter）推断读取的是下标 0（未滤波），该推断未获手册明示，标为待确认。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0079",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0079（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 79,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F32_BE",
+      "r1_transport_size": 7,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0079",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0079",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0079",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          81
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0079[0...1] CO: 总转矩设定值 / 总 M 设定值（p81 同页另有 HLA 推力条目）",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "FloatingPoint32 与 F32_BE 一致；双下标同上，count=1 对应下标 0（推断，待确认）。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0080",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0080（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 80,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F32_BE",
+      "r1_transport_size": 7,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0080",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0080",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0080",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          81,
+          82
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0080 CO: 转矩实际值 / M 实际",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "FloatingPoint32 与 F32_BE 一致；p81 为 HLA 推力（N）、p82 为 SERVO 转矩（Nm）；双下标同上，count=1 对应下标 0（推断，待确认）。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0081",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0081（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 81,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F32_BE",
+      "r1_transport_size": 7,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0081",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0081",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0081",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          82
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0081 CO: 转矩利用率 / M 利用率",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "FloatingPoint32 与 F32_BE 一致；单位为 %（定标 PERCENT），定义未断言语义故不冲突。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0082",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0082（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 82,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "F32_BE",
+      "r1_transport_size": 7,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0082",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0082",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0082",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          83,
+          84
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0082[0...1] CO: 有功功率实际值 / P 实际",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "FloatingPoint32 与 F32_BE 一致；p83 为 HLA、p84 为 A_INF/S_INF；双下标同上，count=1 对应下标 0（推断，待确认）。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0103",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0103（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 103,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "U16_BE",
+      "r1_transport_size": 6,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0103",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0103",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0103",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          91
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0103 应用专用视图 / 应用专用视图",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "手册数据类型 Unsigned16 与定义 decode=U16_BE 一致；访问等级 2；适用范围列出 A_INF/B_INF/HLA/S_INF/SERVO 全部对象。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.p0105",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 p0105（仅参数身份，非工程语义；只读）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 105,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "I16_BE",
+      "r1_transport_size": 5,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "p0105",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "p0105",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "p0105",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          91,
+          92
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "p0105 驱动对象激活/禁用 / DO 激活/禁用",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "数据类型 Integer16 与 decode=I16_BE 一致；p91 为 CU_I/CU_NX（值域 0..1），p92 为 TM54F（值域 0..2，含“2: 驱动对象禁用并且不存在”）。definition label 标注“只读”，而手册该参数写入能力为 T、U（可调试/可上传），二者不矛盾但语义侧重不同，未据此改动定义。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0106",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0106（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 106,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "I16_BE",
+      "r1_transport_size": 5,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0106",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0106",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0106",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          93
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0106 驱动对象有效/无效 / DO 有效/无效",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "数据类型 Integer16 与 decode=I16_BE 一致。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0107",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0107（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 107,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "I16_BE",
+      "r1_transport_size": 5,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0107",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0107",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0107",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          94,
+          95,
+          96,
+          97
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0107 驱动对象类型 / DO 类型",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "数据类型 Integer16 与 decode=I16_BE 一致；该参数按驱动对象类型分列多页（94 HLA=70、95 A_INF=10、96 TM120=207、97 CU_LINK=254），定义只断言参数身份，故按对象类型取值不同不构成冲突。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    },
+    {
+      "variable_id": "drive.parameter.r0108",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "parameter_identity",
+      "label_zh": "驱动参数 r0108（仅参数身份，非工程语义）",
+      "r1_addressing": {
+        "area": "V",
+        "area_no": {
+          "source": "target",
+          "kind": "drive_object"
+        },
+        "module": {
+          "source": "drive_entry_module"
+        },
+        "column": 108,
+        "line": {
+          "source": "fixed",
+          "value": 1
+        }
+      },
+      "r1_decode": "U32_BE",
+      "r1_transport_size": 6,
+      "r1_count": 1,
+      "golden_ref": [
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0108",
+          "entry": "nc_variable"
+        },
+        {
+          "area": "V",
+          "block": "M",
+          "variable": "r0108",
+          "entry": "drive_object"
+        }
+      ],
+      "original_manual_references": [
+        "SINAMICS S120/S150 参数手册 11/2023"
+      ],
+      "original_manual_references_verbatim_note": "原文照抄 r1.json 的 source[].reference，未改动；本文件不写回 r1.json。",
+      "identifier_source_field": "golden_ref.variable（= 参数号）",
+      "r1_primary_identifier": "r0108",
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          98,
+          99,
+          100,
+          101
+        ],
+        "page_kind": "PDF 页码（本套 PDF 实测：PDF 页 = 印刷页，偏移 0，见 .md §4）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "r0108 驱动对象功能模块 / 驱动对象功能模块",
+        "searched_pdfs": [
+          {
+            "pdf_file": "828D_sysvar_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-5FP40-0RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1236
+          },
+          {
+            "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "6FC5397-4DP40-6RA6",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 690
+          },
+          {
+            "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+            "pdf_document_number": "A5E53014702F AA",
+            "pdf_version": "07/2023",
+            "pdf_total_pages": 1414
+          }
+        ],
+        "search_scope": "三份 07/2023 PDF 全文逐页抽取后检索"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "数据类型 Unsigned32 与 decode=U32_BE 一致；位域含义随对象类型不同（98 HLA、99 SERVO、100 A_INF、101 S_INF_COMBI）。",
+      "is_original_source": false,
+      "must_not_backfill_to_r1": true
+    }
+  ],
+  "entries_without_manual_source": [
+    {
+      "variable_id": "drive.object.name",
+      "revision": 1,
+      "scope": "collect",
+      "semantics_status": "verified",
+      "label_zh": "该驱动对象名（25×U16BE）",
+      "existing_source_kinds": [
+        "measurement",
+        "frozen_vector"
+      ],
+      "existing_sources": [
+        {
+          "kind": "measurement",
+          "reference": "docs/evidence/nck-drive-object-readback.json",
+          "note": "module26/module130 两条入口的 p0199 抓包"
+        },
+        {
+          "kind": "frozen_vector",
+          "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json",
+          "note": "V/M/p0199 × 2（nc_variable / drive_object）"
+        }
+      ],
+      "has_manual_source_in_r1": false,
+      "cross_reference_202307": {
+        "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "A5E53014702F AA",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 1414,
+        "page": [
+          136
+        ],
+        "page_kind": "PDF 页码（PDF 页 = 印刷页，偏移 0）",
+        "section": "4 SINAMICS 参数",
+        "matched_identifier": "p0199[0...24] 驱动对象名称 / DO 名称",
+        "identifier_source_field": "golden_ref.variable（= 参数号）"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "手册 p0199 下标 [0...24] 共 25 个、数据类型 Unsigned16，与定义 count=25 + decode=UTF16_BE（25×U16BE）一致；说明为“驱动对象自由命名”。该条在 r1 中仍无 manual 来源，本次仅新增独立文档依据，不改变其来源登记。",
+      "is_original_source": false,
+      "additive_only": true,
+      "does_not_upgrade_existing_evidence": true,
+      "does_not_add_manual_source_to_r1": true
+    },
+    {
+      "variable_id": "axis.name",
+      "revision": 1,
+      "scope": "identity",
+      "semantics_status": "verified",
+      "label_zh": "机床轴名（身份探针）",
+      "existing_source_kinds": [
+        "identity_probe",
+        "measurement",
+        "frozen_vector"
+      ],
+      "existing_sources": [
+        {
+          "kind": "identity_probe",
+          "reference": "drivers/sinumerik-nck/src/identity_spec.rs",
+          "note": "AXIS_NAME"
+        },
+        {
+          "kind": "measurement",
+          "reference": "docs/evidence/nck-live-identity-probe.txt",
+          "note": null
+        },
+        {
+          "kind": "frozen_vector",
+          "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json",
+          "note": "N/M/MDSA_AXCONF_MACHAX_NAME_TAB"
+        }
+      ],
+      "has_manual_source_in_r1": false,
+      "cross_reference_202307": {
+        "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "6FC5397-4DP40-6RA6",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 690,
+        "page": [
+          31
+        ],
+        "page_kind": "PDF 页码（PDF 页 = 印刷页，偏移 0）",
+        "section": "5.1 NC 通用机床数据",
+        "matched_identifier": "10000 AXCONF_MACHAX_NAME_TAB N01, N11　机床轴名称 STRING",
+        "identifier_source_field": "golden_ref.variable（MDSA_AXCONF_MACHAX_NAME_TAB）+ addressing.column 10000"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "手册该条为“机床轴名称一览”，类型 STRING、上电生效，与定义 decode=UTF8_FIXED_16 的量纲不冲突（手册不描述线缆字节布局）。⚠ 需显式记录的观察：p31 各机型缺省值列出的轴名（me82 为 MX1, MY1, MZ1, MSP1, MA1, MB1, MC1, MQ1）与 docs/evidence/nck-live-identity-probe.txt:8-15 的真机读数值逐字相同；这既可能是“设备沿用出厂缺省名”，也可能是抽取自手册缺省值——仅凭该证据无法区分，故该 measurement 仍只作为“当时读数”，不作独立性证明。",
+      "is_original_source": false,
+      "additive_only": true,
+      "does_not_upgrade_existing_evidence": true,
+      "does_not_add_manual_source_to_r1": true
+    },
+    {
+      "variable_id": "axis.ctrlout.module_number",
+      "revision": 1,
+      "scope": "identity",
+      "semantics_status": "verified",
+      "label_zh": "轴驱动模块号（身份探针）",
+      "existing_source_kinds": [
+        "identity_probe",
+        "measurement",
+        "frozen_vector"
+      ],
+      "existing_sources": [
+        {
+          "kind": "identity_probe",
+          "reference": "drivers/sinumerik-nck/src/identity_spec.rs",
+          "note": "AXIS_CTRLOUT_MODULE_NR"
+        },
+        {
+          "kind": "measurement",
+          "reference": "docs/evidence/nck-live-identity-probe.txt",
+          "note": null
+        },
+        {
+          "kind": "frozen_vector",
+          "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json",
+          "note": "A/M/MDCA_CTRLOUT_MODULE_NR"
+        }
+      ],
+      "has_manual_source_in_r1": false,
+      "cross_reference_202307": {
+        "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "6FC5397-4DP40-6RA6",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 690,
+        "page": [
+          364
+        ],
+        "page_kind": "PDF 页码（PDF 页 = 印刷页，偏移 0）",
+        "section": "5.3 轴专用 NC 机床数据",
+        "matched_identifier": "30110 CTRLOUT_MODULE_NR A01, A11　设定值传送：模块编号",
+        "identifier_source_field": "golden_ref.variable（MDCA_CTRLOUT_MODULE_NR）+ addressing.column 30110"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "手册说明：输入总线段内的模块编号；PROFIBUS/PROFINET 轴上该下标对应 MD13050 的逻辑 I/O 地址。定义 decode=U8 与之不冲突（手册不描述线缆宽度）。",
+      "is_original_source": false,
+      "additive_only": true,
+      "does_not_upgrade_existing_evidence": true,
+      "does_not_add_manual_source_to_r1": true
+    },
+    {
+      "variable_id": "axis.encoder.module_number",
+      "revision": 1,
+      "scope": "identity",
+      "semantics_status": "verified",
+      "label_zh": "轴编码器模块号（身份探针）",
+      "existing_source_kinds": [
+        "identity_probe",
+        "measurement",
+        "frozen_vector"
+      ],
+      "existing_sources": [
+        {
+          "kind": "identity_probe",
+          "reference": "drivers/sinumerik-nck/src/identity_spec.rs",
+          "note": "AXIS_ENC_MODULE_NR"
+        },
+        {
+          "kind": "measurement",
+          "reference": "docs/evidence/nck-live-identity-probe.txt",
+          "note": null
+        },
+        {
+          "kind": "frozen_vector",
+          "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json",
+          "note": "A/M/MDCA_ENC_MODULE_NR"
+        }
+      ],
+      "has_manual_source_in_r1": false,
+      "cross_reference_202307": {
+        "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "6FC5397-4DP40-6RA6",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 690,
+        "page": [
+          365
+        ],
+        "page_kind": "PDF 页码（PDF 页 = 印刷页，偏移 0）",
+        "section": "5.3 轴专用 NC 机床数据",
+        "matched_identifier": "30220 ENC_MODULE_NR A01, A02, A11　实际值传送：驱动器编号/测量回路编号",
+        "identifier_source_field": "golden_ref.variable（MDCA_ENC_MODULE_NR）+ addressing.column 30220"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "条目标题在 p365，说明延续到 p366（PROFIBUS/PROFINET 轴上该下标对应 MD13050）。⚠ 本结论只补文档依据：不得据此把 axis.encoder.module_number 标记为“真机已验证”，见本文 §9.1 的独立缺口。",
+      "is_original_source": false,
+      "additive_only": true,
+      "does_not_upgrade_existing_evidence": true,
+      "does_not_add_manual_source_to_r1": true
+    },
+    {
+      "variable_id": "axis.ctrlout.type",
+      "revision": 1,
+      "scope": "identity",
+      "semantics_status": "verified",
+      "label_zh": "轴驱动输出类型（身份探针；0 = 无驱动输出）",
+      "existing_source_kinds": [
+        "identity_probe",
+        "measurement",
+        "frozen_vector"
+      ],
+      "existing_sources": [
+        {
+          "kind": "identity_probe",
+          "reference": "drivers/sinumerik-nck/src/identity_spec.rs",
+          "note": "AXIS_CTRLOUT_TYPE"
+        },
+        {
+          "kind": "measurement",
+          "reference": "docs/evidence/nck-live-identity-probe.txt",
+          "note": null
+        },
+        {
+          "kind": "frozen_vector",
+          "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json",
+          "note": "A/M/MDCA_CTRLOUT_TYPE"
+        }
+      ],
+      "has_manual_source_in_r1": false,
+      "cross_reference_202307": {
+        "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "6FC5397-4DP40-6RA6",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 690,
+        "page": [
+          364
+        ],
+        "page_kind": "PDF 页码（PDF 页 = 印刷页，偏移 0）",
+        "section": "5.3 轴专用 NC 机床数据",
+        "matched_identifier": "30130 CTRLOUT_TYPE A01, A11　设定值的输出类型",
+        "identifier_source_field": "golden_ref.variable（MDCA_CTRLOUT_TYPE）+ addressing.column 30130"
+      },
+      "match_conclusion": "version_difference",
+      "notes": "手册 p364 说明：0 = 仿真（无硬件要求）、1 = 设定值输出有效（通过硬件配置区分）、2 = 模拟模块上的设定值输出（16 位），并注明“必须使用 MD30132 $MA_IS_VIRTUAL_AX，而非数值 4”。定义 label 写“0 = 无驱动输出”，与手册“0 = 仿真（无硬件要求）”表述不同，需人工确认是否为同一含义（这也是唯一一处取值语义与手册措辞不一致的探针参数）。真机读数（轴 6 = 0、其余 = 1）在两种表述下的解释不同，不能自证。",
+      "is_original_source": false,
+      "additive_only": true,
+      "does_not_upgrade_existing_evidence": true,
+      "does_not_add_manual_source_to_r1": true
+    },
+    {
+      "variable_id": "channel.machine_axis_assignment",
+      "revision": 1,
+      "scope": "identity",
+      "semantics_status": "verified",
+      "label_zh": "通道位置→机床轴号（身份探针）",
+      "existing_source_kinds": [
+        "identity_probe",
+        "measurement",
+        "frozen_vector"
+      ],
+      "existing_sources": [
+        {
+          "kind": "identity_probe",
+          "reference": "drivers/sinumerik-nck/src/identity_spec.rs",
+          "note": "CHANNEL_MACHAX_USED"
+        },
+        {
+          "kind": "measurement",
+          "reference": "docs/evidence/nck-live-identity-probe.txt",
+          "note": null
+        },
+        {
+          "kind": "frozen_vector",
+          "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json",
+          "note": "C/M/AXCONF_MACHAX_USED"
+        }
+      ],
+      "has_manual_source_in_r1": false,
+      "cross_reference_202307": {
+        "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "6FC5397-4DP40-6RA6",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 690,
+        "page": [
+          185
+        ],
+        "page_kind": "PDF 页码（PDF 页 = 印刷页，偏移 0）",
+        "section": "5.2 通道专用 NC 机床数据",
+        "matched_identifier": "20070 AXCONF_MACHAX_USED C01, C10　通道轴对应的机床轴",
+        "identifier_source_field": "golden_ref.variable（AXCONF_MACHAX_USED）+ addressing.column 20070"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "手册说明：将机床轴设为通道轴/辅助轴，0 = 未分配给通道（通道轴间隙需 MD11640 $MN_ENABLE_CHAN_AX_GAP=1）。真机读数“位置 6 = 0”与“未分配”一致，可作为该取值的文档解释，但仍不构成真机对协议可访问性的证明。",
+      "is_original_source": false,
+      "additive_only": true,
+      "does_not_upgrade_existing_evidence": true,
+      "does_not_add_manual_source_to_r1": true
+    },
+    {
+      "variable_id": "axis.spindle_assignment",
+      "revision": 1,
+      "scope": "identity",
+      "semantics_status": "verified",
+      "label_zh": "轴的主轴归属（身份探针；非 0 = 该轴为第 n 主轴）",
+      "existing_source_kinds": [
+        "identity_probe",
+        "measurement",
+        "frozen_vector"
+      ],
+      "existing_sources": [
+        {
+          "kind": "identity_probe",
+          "reference": "drivers/sinumerik-nck/src/identity_spec.rs",
+          "note": "AXIS_SPIND_ASSIGN"
+        },
+        {
+          "kind": "measurement",
+          "reference": "docs/evidence/nck-live-identity-probe.txt",
+          "note": null
+        },
+        {
+          "kind": "frozen_vector",
+          "reference": "drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json",
+          "note": "A/M/SPIND_ASSIGN_TO_MACHAX"
+        }
+      ],
+      "has_manual_source_in_r1": false,
+      "cross_reference_202307": {
+        "pdf_file": "828D_md_lists_man_0723_zh-CHS.pdf",
+        "pdf_document_number": "6FC5397-4DP40-6RA6",
+        "pdf_version": "07/2023",
+        "pdf_total_pages": 690,
+        "page": [
+          451
+        ],
+        "page_kind": "PDF 页码（PDF 页 = 印刷页，偏移 0）",
+        "section": "5.3 轴专用 NC 机床数据",
+        "matched_identifier": "35000 SPIND_ASSIGN_TO_MACHAX A01, A06, A11　定义机床轴为主轴",
+        "identifier_source_field": "golden_ref.variable（SPIND_ASSIGN_TO_MACHAX）+ addressing.column 35000"
+      },
+      "match_conclusion": "matching_older_version",
+      "notes": "手册说明：在此输入主轴号以定义主轴，非 0 即该轴为第 n 主轴（与定义 label 一致）；最低主轴号 1。",
+      "is_original_source": false,
+      "additive_only": true,
+      "does_not_upgrade_existing_evidence": true,
+      "does_not_add_manual_source_to_r1": true
+    }
+  ]
+}

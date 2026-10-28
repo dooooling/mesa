@@ -1,7 +1,9 @@
 # 828D 定义来源盘查（42 条，r1.json）
 
 > 本文是 **Phase 0 子集**的只读盘点产物：只读仓库既有文件、只新增文档，**未改动**任何代码、
-> 定义、测试或配置，未连接任何设备/服务，PDF 未到位，所有依赖 PDF 的字段一律标 `pending`。
+> 定义、测试或配置，未连接任何设备/服务。
+> **阶段 A 更新**：三份 07/2023 手册 PDF 已在位并经 pypdf 实测，逐条交叉引用结果见 §6 与
+> `828d-manual-cross-reference.json` / `.md`；本文件 §1–§4 的统计数字不变，`r1.json` 仍未改动。
 
 ## 0. 基线对账（前置结论，已在 HEAD 复核）
 
@@ -852,13 +854,15 @@
 ## 5. 未找到 / 待核实
 
 - **未找到**：任何定义上的 `document_id` / `section` / `page` 结构化字段（42/42 缺失）。
-- **未找到**：仓库内三份 PDF 文件（`docs/reference/sinumerik-828d-manuals.json` 中
-  三条记录 `file_present: false`），因此 `drive.*` 与 `C/*` 等条目的手册章节/页码
-  **全部 `pending`**，本盘点不做任何章节号推测。
+- **已解决（原结论已过期，此处更正）**：三份 07/2023 PDF 已在位并经 pypdf 实测（文档号、版本、页数、SHA-256 全部核对），
+  `docs/reference/sinumerik-828d-manuals.json` 的 `file_present` 均为 `true`；本文件 §6 记录了逐条交叉引用结果。
+  注意：07/2023 与定义所引的 03/2025 / 11/2023 **版本不等同**，本盘点仍不把任何 07/2023 页码写成定义来源。
 - **待核实**：`frozen_vector` 唯一 reference `drivers/sinumerik-nck/tests/fixtures/legacy-828d-wire.json` 是**回归基线**，
   其 62 条 entries 的 `wire_hex` 与真机是否一致须真机复核（该 fixture 自身不声明硬件验证）。
-- **待核实**：`drive.motor.temperature` 的 `p.71` 指向哪份文档的哪一节，需 PDF 到位后核对；
-  `invalid_rule = {"value": -200.0, "tolerance": 0.001}` 的工程含义须与手册对照。
+- **已核对（阶段 A）**：`drive.motor.temperature` 的 `p.71` 是 **11/2023 版**页码；07/2023 版《参数描述》中
+  `r0035 CO: 电机温度` 的条目实测位于 **p50**，且 p50 明确写出「当 r0035 等于 -200.0 °C 时」的无效值分支，
+  与 `invalid_rule = {"value": -200.0, "tolerance": 0.001}` 一致（见 `828d-manual-cross-reference.md` §3.2）。
+  两版分页不同这一事实本身说明 07/2023 不能充当 11/2023 的替代来源。
 - **待核实**：`measurement` 来源 `docs/evidence/nck-drive-object-readback.json` 自述
   `environment = "Run MyVirtual Machine 1.6 / CNC-SW 6.25 SP2; not real 828D"`、
   `hardware_validated = false`，因此它**不是真机证据**。
@@ -869,6 +873,70 @@
   43、52、61、70、79、88、97、106、115 行），**没有编码器驱动号一节** ⇒
   该条 `measurement` 来源**在所引文件中未找到对应记录**（详见
   `docs/reference/828d-identity-probe-evidence.md` §5、§7）。
+
+## 6. 阶段 A 增补：07/2023 交叉引用、两条独立缺口与三条禁令
+
+本节由 Phase 0 阶段 A 增补，**不修改本文件 §1–§4 的任何统计数字**（42 / 90 / 35 / 7 / 6、24-16-2、36-6 均不变），
+也**不修改 `r1.json`**（blob SHA-1 仍为 `3c0abe67cbcb64b525cddec1584e6e1747e0f062`）。
+
+### 6.1 35 条 manual 来源 × 07/2023 手册的比对结果
+
+逐条明细见 `docs/reference/828d-manual-cross-reference.json` / `.md`（五类结论 + 实测页码 + 抽取原文依据）。分布：
+
+| 结论 | 条数 | 含义 |
+|---|---|---|
+| `exact_match` | 0 | 找到且语义一致且版本一致（三份 PDF 均为 07/2023，早于所引来源，故为 0） |
+| `matching_older_version` | 19 | 找到同名条目、语义/类型不冲突，但属较早版本 |
+| `version_difference` | 1 | 找到条目但表述存在实质差异 |
+| `not_found` | 13 | 三份 PDF 中完全没有该标识符 |
+| `pending_review` | 2 | 标识符只在正文被提及、无条目定义 |
+
+关键结论：**13 条 `not_found` 全部集中在 NC 变量（OPI 变量）组**（16 条中的 13 条）。
+它们所引的是“828D NC variables（OPI 变量清单）”类文档，而本轮到手的三份是“系统变量 / 机床数据 / 参数描述”，
+这是**文档选型问题**，不是定义错误；补齐需取得 03/2025 版 NC 变量文档（A5E53370586B AC）。
+19 条 S120 参数类定义全部在 07/2023《参数描述》的“4 SINAMICS 参数”章找到条目，且数据类型（FloatingPoint32 /
+Unsigned16 / Integer16 / Unsigned32）与定义的 `decode` 逐条一致。
+
+### 6.2 7 条无 manual 来源定义的处理（缺口未被抹平）
+
+- 7 条（`drive.object.name` + 6 条 `scope=identity`）在 07/2023 手册中**都**找到了对应条目
+  （6 条机床数据：MD10000 p31、MD20070 p185、MD30110/MD30130 p364、MD30220 p365、MD35000 p451；
+  1 条驱动参数：p0199 p136）。
+- 但按纪律**只新增独立交叉引用**，`r1.json` 的 `source` 一个字节未动 ⇒
+  **“无 manual 来源的定义”仍为 7 条**，缺口仍然成立，且每条都被显式标记为 `additive_only`。
+- 其中 `axis.ctrlout.type` 找到的条目与定义表述存在差异（手册 p364 写“0 = 仿真（无硬件要求）”，
+  定义 label 写“0 = 无驱动输出”），记为 `version_difference`，待人工确认是否同义。
+
+### 6.3 独立缺口 A：`axis.encoder.module_number` 的证据链断在运行时侧
+
+| 事实 | 位置 |
+|---|---|
+| `measurement` 来源指向 `docs/evidence/nck-live-identity-probe.txt`，但该文件 13 个小节里**没有编码器驱动号一节** | `docs/evidence/nck-live-identity-probe.txt:7,16,25,34,43,52,61,70,79,88,97,106,115`（共 128 行） |
+| `AXIS_ENC_MODULE_NR` **未进入真实探测执行路径**：测试的 use 清单不含该常量，测试体也未调用 | `drivers/sinumerik-nck/tests/live_identity_probe.rs:16-20` |
+| 身份浏览执行路径的导入清单同样不含该常量 | `drivers/sinumerik-nck/src/identity.rs:6-9` |
+| 常量存在并被 catalog 测试核对（存在 ≠ 被执行） | `drivers/sinumerik-nck/src/identity_spec.rs:135`、`tests/definition_catalog.rs:405` |
+
+**即使 07/2023 PDF 已找到对应机床数据定义（MD30220，md p365，说明延续至 p366），也只能补文档依据，
+不能据此标记真机已验证。** 该条必须二选一：**修复探针执行路径**（把 `AXIS_ENC_MODULE_NR` 纳入真实探测、重跑并留存证据），
+或**撤销这条不受证据支持的 `measurement` 声明**。
+
+### 6.4 独立缺口 B：module 26 与 module 130 的实例编号（三条禁令）
+
+同一台 828D 实测（`docs/evidence/nck-live-identity-probe.txt:53-69`）：`V/1` 的 m26=`SERVO_3.3:4` 而 m130=`SERVO_3.3:3`（差 1），
+`V/2`–`V/4` 亦不同（`V/4` 甚至不是 ±1），但 `V/5`、`V/7`、`V/8` 恰好同值；`V/6` 在 m26 上被拒（`S7_JOB_0x8201`）。
+
+1. **不允许**固定 `±1` 规则转换实例编号；
+2. **不允许**因某些编号恰好相同就认定两个入口等价；
+3. **每个映射必须绑定**实际入口、对象类型（`nc_variable` / `drive_object`）、索引与验证证据出处。
+
+> 同样适用于 MD30220 的“驱动器编号/测量回路编号”语义：写证据时必须注明“哪个入口 + 哪个编号”。
+
+### 6.5 四类证据仍然互不替代
+
+`manual` 页码只证明“手册里怎么定义”，不证明协议可访问或真机可读；`frozen_vector` 只证明回归一致性；
+`measurement` 只证明“当时那次读数”，且**须先核实原始证据是否真实存在、是否覆盖该定义**（本轮已有反例，见 §6.3）；
+`identity_probe` 只证明“探针返回过什么”，**须先确认实际调用路径与采样范围**（本轮已有反例，见 §6.3）。
+**新增 07/2023 文档依据不等于任何一类运行时证据升级。**
 
 ## 附录 A：统计脚本全文（可原样复现）
 

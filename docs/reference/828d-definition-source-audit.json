@@ -2371,5 +2371,74 @@
         }
       ]
     }
-  ]
+  ],
+  "stage_a_addendum": {
+    "$comment": "Phase 0 阶段 A 增补：07/2023 交叉引用结果、无 manual 来源定义的处置、两条独立缺口与三条禁令。本节不改变 summary 中任何统计数字，也不改变 r1.json。",
+    "cross_reference": {
+      "path_json": "docs/reference/828d-manual-cross-reference.json",
+      "path_md": "docs/reference/828d-manual-cross-reference.md",
+      "checker": "docs/reference/check-manual-metadata.py",
+      "match_conclusion_distribution": {
+        "exact_match": 0,
+        "matching_older_version": 19,
+        "version_difference": 1,
+        "not_found": 13,
+        "pending_review": 2
+      },
+      "distribution_additive_only_7": {
+        "exact_match": 0,
+        "matching_older_version": 6,
+        "version_difference": 1,
+        "not_found": 0,
+        "pending_review": 0
+      },
+      "key_finding": "13 条 not_found 全部是 NC 变量（OPI 变量）组：三份 07/2023 手册不含该接口名，属文档选型问题；19 条 S120 参数类定义全部命中，且数据类型与 decode 逐条一致。"
+    },
+    "definitions_without_manual_source": {
+      "count_still": 7,
+      "resolution": "7 条均在 07/2023 手册中找到对应条目，但只登记为独立交叉引用（additive_only=true）；r1.json 的 source 未改动，故“无 manual 来源”的缺口仍然成立，未被抹平。",
+      "ids": [
+        "drive.object.name",
+        "axis.name",
+        "axis.ctrlout.module_number",
+        "axis.encoder.module_number",
+        "axis.ctrlout.type",
+        "channel.machine_axis_assignment",
+        "axis.spindle_assignment"
+      ],
+      "note": "不为凑 42/42 覆盖率强行添加引用：新增的只是文档依据，不是来源登记。"
+    },
+    "open_gap_axis_encoder_module_number": {
+      "statement": "即使 07/2023 PDF 找到 MD30220 的定义（md p365-366），也只能补文档依据，不能据此标记真机已验证。",
+      "facts": [
+        "docs/evidence/nck-live-identity-probe.txt（128 行）没有编码器驱动号一节，measurement 来源在所引文件中不存在对应记录",
+        "drivers/sinumerik-nck/tests/live_identity_probe.rs:16-20 的 use 清单不含 AXIS_ENC_MODULE_NR（测试体也未调用）",
+        "drivers/sinumerik-nck/src/identity.rs:6-9 的导入清单同样不含该常量，身份浏览路径从不读它"
+      ],
+      "required_action": "需另行修复探针执行路径（纳入真实探测并重跑留证），或撤销该不受证据支持的 measurement 声明。"
+    },
+    "prohibitions_module26_module130": {
+      "evidence": "docs/evidence/nck-live-identity-probe.txt:53-69（同一台 828D：V/1 m26=SERVO_3.3:4 vs m130=SERVO_3.3:3；V/5、V/7、V/8 恰好同值；V/6 在 m26 被拒）",
+      "prohibitions": [
+        "不允许用固定 ±1 规则换算实例编号",
+        "不允许因某些编号恰好相同就认定两个入口等价",
+        "每个映射必须绑定实际入口（module 26 / module 130）、对象类型（nc_variable / drive_object）、索引与验证证据出处"
+      ],
+      "applies_to": [
+        "DRIVE_OBJECT_NAME / DRIVE_OBJECT_NAME_M130",
+        "MD30110 与 MD30220 的驱动编号语义"
+      ]
+    },
+    "evidence_classes_are_independent": {
+      "manual": "只证明手册中如何定义；不证明协议可访问、真机可读",
+      "frozen_vector": "只证明回归一致性；不证明真实设备支持",
+      "measurement": "只证明当时那次读数；须先核实原始证据是否真实存在且覆盖该定义",
+      "identity_probe": "只证明探针返回过什么；须先确认实际调用路径与采样范围",
+      "rule": "新增 07/2023 文档依据不等于任何一类运行时证据升级"
+    },
+    "r1_untouched": {
+      "blob_sha1": "3c0abe67cbcb64b525cddec1584e6e1747e0f062",
+      "verified_by": "python docs/reference/check-manual-metadata.py（检查项 C3 用 git hash-object 复核）"
+    }
+  }
 }
