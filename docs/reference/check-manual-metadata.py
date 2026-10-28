@@ -93,17 +93,25 @@ def git(*args):
 
 # ---------------------------------------------------------------- A 文件身份
 def check_files(manuals, verbose):
-    present = 0
+    # 两个计数必须分开，否则「干净克隆（PDF 按设计不入库）」会被误报成「在位 N 份」：
+    #   declared_present —— 清单 documents[].file_present=True 的数量：清单"记着"有几份
+    #   actual_present   —— 本地磁盘上真实存在的数量：本轮"实际能核验"几份
+    # 二者含义不同，合并成一个数字会误导（曾出现：文件全不在本地，却报"在位 3 / 4"）。
+    declared_present = 0
+    actual_present = 0
+    missing_files = []
     for doc in manuals['documents']:
         name = doc['file_name']
         path = os.path.join(MANUALS_DIR, name)
+        if doc.get('file_present') is True:
+            declared_present += 1
         if not os.path.exists(path):
-            present += doc.get('file_present') is True and 1 or 0
+            missing_files.append(name)
             warn('A1', '%s 不在本地（按设计 PDF 不入库）：如实报 missing。'
-                       'documents[].file_present=%s，本轮无法核验 sha256/size_bytes/page_count'
+                       '清单记为 file_present=%s；本轮无法核验 sha256/size_bytes/page_count'
                  % (name, doc.get('file_present')))
             continue
-        present += 1
+        actual_present += 1
         actual_size = os.path.getsize(path)
         actual_sha = sha256_of(path)
         if doc.get('file_present') is not True:
@@ -129,10 +137,14 @@ def check_files(manuals, verbose):
             fail('A6', '%s page_count 不符：清单 %s，实测 %s' % (name, expect_pages, actual_pages))
         else:
             ok('A6', '%s 页数一致：%s' % (name, actual_pages))
-    if present:
-        ok('A0', '在位 PDF：%d / %d（缺失不算失败，但要能机械发现）' % (present, len(manuals['documents'])))
-    else:
-        warn('A0', '三份 PDF 均不在本地：A2–A6 的身份核对全部跳过（只做清单内部一致性）')
+    total = len(manuals['documents'])
+    ok('A0', '本地实际在位 %d / %d；清单记录为在位 %d 份'
+             '（二者必须分开看：PDF 按设计不入库，干净克隆里实际在位可为 0，'
+             '此时 A2–A6 跳过，仅核验清单内部一致性）'
+        % (actual_present, total, declared_present))
+    if actual_present == 0 and total:
+        warn('A0b', '本地无任何 PDF：A2–A6 身份核对全部跳过。这不代表清单记录有误，'
+                    '但表示本轮未对文件内容做任何实测。缺失清单：%s' % (missing_files or '（无）'))
     # PDF 不得入库
     tracked = git('ls-files', os.path.join('docs', 'reference', 'manuals'))
     if tracked is None:
@@ -263,10 +275,11 @@ def check_statistics(manuals, src_audit, xref, verbose):
                    'identity_probe': kinds['identity_probe'], 'verified': sem['verified'],
                    'parameter_identity': sem['parameter_identity'], 'candidate': sem['candidate'],
                    'collect': scope['collect'], 'identity_scope': scope['identity']}
-    for k, want in hard.items():
-        if actual_hard[k] != want:
-            fail('C2', '任务基线口径不符：%s 应为 %r，实测 %r' % (k, want, actual_hard[k]))
-    ok('C2', '硬口径全部一致：42 定义 / 90 来源 / 35 manual / 7 无 manual / 6 identity_probe / 24-16-2 / 36-6')
+    c2_bad = [(k, want, actual_hard[k]) for k, want in hard.items() if actual_hard[k] != want]
+    for k, want, got in c2_bad:
+        fail('C2', '任务基线口径不符：%s 应为 %r，实测 %r' % (k, want, got))
+    if not c2_bad:
+        ok('C2', '硬口径全部一致：42 定义 / 90 来源 / 35 manual / 7 无 manual / 6 identity_probe / 24-16-2 / 36-6')
     # r1.json 未被改动
     blob = git('hash-object', '--', os.path.relpath(R1, REPO))
     if blob is None:
@@ -277,13 +290,16 @@ def check_statistics(manuals, src_audit, xref, verbose):
     else:
         ok('C3', 'r1.json blob SHA-1 未变：%s' % blob)
     # 交叉引用自报数字与 r1.json 一致
+    c4_bad = False
     if xref['summary']['definitions_with_manual_source'] != with_manual:
         fail('C4', '交叉引用表自报 manual 来源数 %d，与 r1.json 实测 %d 不符'
              % (xref['summary']['definitions_with_manual_source'], with_manual))
+        c4_bad = True
     if xref['summary']['definitions_without_manual_source'] != without_manual:
         fail('C4', '交叉引用表自报无 manual 来源数 %d，与 r1.json 实测 %d 不符'
              % (xref['summary']['definitions_without_manual_source'], without_manual))
-    else:
+        c4_bad = True
+    if not c4_bad:
         ok('C4', '交叉引用表自报 35/7 分组与 r1.json 一致')
 
 
@@ -309,16 +325,21 @@ def check_crossref(xref, manuals, verbose):
 
     dist = collections.Counter(e['match_conclusion'] for e in entries)
     bad = [c for c in dist if c not in CONC]
+    d2_bad = False
     if bad:
         fail('D2', '出现未定义的 match_conclusion 取值：%s（只允许 %s）' % (bad, list(CONC)))
+        d2_bad = True
     if sum(dist.values()) != len(with_manual):
         fail('D2', '五类结论合计 %d ≠ manual 来源数 %d' % (sum(dist.values()), len(with_manual)))
+        d2_bad = True
     declared = xref['summary']['match_conclusion_distribution']
     for c in CONC:
         if declared.get(c) != dist.get(c, 0):
             fail('D2', '分布自报 %s=%r，实测 %r' % (c, declared.get(c), dist.get(c, 0)))
-    ok('D2', '五类分布可复算：%s（合计 %d）'
-       % (', '.join('%s=%d' % (c, dist.get(c, 0)) for c in CONC), sum(dist.values())))
+            d2_bad = True
+    if not d2_bad:
+        ok('D2', '五类分布可复算：%s（合计 %d）'
+           % (', '.join('%s=%d' % (c, dist.get(c, 0)) for c in CONC), sum(dist.values())))
 
     # 字段完整性 + 不得把 07/2023 写成来源 + not_found 不得带页码
     manifest_files = {d['file_name']: d for d in manuals['documents']}
