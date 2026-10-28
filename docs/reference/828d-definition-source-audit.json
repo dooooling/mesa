@@ -2440,5 +2440,87 @@
       "blob_sha1": "3c0abe67cbcb64b525cddec1584e6e1747e0f062",
       "verified_by": "python docs/reference/check-manual-metadata.py（检查项 C3 用 git hash-object 复核）"
     }
+  },
+  "review_decisions": {
+    "recorded_at_phase": "phase0-A-review",
+    "scope": "评审对阶段 A 三项待确认事项的裁决。本记录只写入审计结果，不修改已发布的定义文件。",
+    "items": [
+      {
+        "id": "D1",
+        "subject": "drive.parameter.r0033 语义标签",
+        "decision": "correct_label_keep_candidate",
+        "approved_label_zh": "滤波转矩利用率（%）",
+        "evidence": {
+          "pdf_file": "828D_S120_para_lists_man_0723_zh-CHS.pdf",
+          "pdf_version": "07/2023",
+          "page": 48,
+          "manual_text_summary": "滤波后的转矩利用率，单位为百分比，按 p2196 缩放"
+        },
+        "actions": [
+          "在阶段 A 审计中记录建议标签与 07/2023 第 48 页证据",
+          "availability/semantics_status 继续保持 candidate",
+          "在核对 11/2023 来源之前，不直接修改已发布的 r1.json",
+          "不把转矩利用率擅自改写为轴负载，也不凭参数号推断其他驱动对象上的语义"
+        ],
+        "not_asserted": [
+          "该参数在所有驱动对象上的物理含义",
+          "11/2023 版本中的对应页码与措辞"
+        ],
+        "r1_json_modified": false
+      },
+      {
+        "id": "D2",
+        "subject": "axis.ctrlout.type 枚举值 0 的语义",
+        "decision": "do_not_assert_equivalence",
+        "manual_says": "0 = 仿真（无硬件要求）",
+        "definition_says": "0 = 无驱动输出",
+        "ruling": "无充分证据证明两者等价，登记为明确的语义差异，保留原始枚举值，不做语义换算。",
+        "actions": [
+          "两种解释都登记为语义差异，不做取舍",
+          "暂不把数值 0 解释成没有驱动输出",
+          "在取得对应版本官方定义或可靠设备侧证据前，不把该语义标为已确认",
+          "保留探针的原始读取证据，但不据此证明枚举含义正确"
+        ],
+        "r1_json_modified": false
+      },
+      {
+        "id": "D3",
+        "subject": "13 条 not_found 的原始来源",
+        "decision": "obtain_missing_official_document",
+        "required_document": {
+          "document_number": "A5E53370586B AC",
+          "name": "Siemens 828D NC variables",
+          "version": "03/2025"
+        },
+        "rationale": "13 条均属现有定义引用的 NC 变量（OPI）组，所提供的三份 07/2023 文档不覆盖这些条目，属文档来源不匹配，不得据此判定定义错误。",
+        "actions": [
+          "优先从西门子官方资料渠道获取对应版本",
+          "取得后实测文档号、版本、页数与 SHA-256",
+          "逐条核对这 13 条变量的原始名称、读取属性、数据类型、章节与页码",
+          "若官方文档无法取得，继续保留 not_found，不得用其他文档或推测补齐"
+        ],
+        "affected_variable_ids": [
+          "mode_group.op_mode",
+          "channel.program.name.main",
+          "channel.program.name.active",
+          "channel.program.line_number",
+          "channel.program.block",
+          "axis.position.commanded_mcs",
+          "axis.position.actual_bcs",
+          "channel.feed.actual",
+          "channel.feed.commanded",
+          "channel.feed.override",
+          "spindle.speed.actual",
+          "spindle.speed.override",
+          "channel.tool.number_active"
+        ],
+        "status": "awaiting_document"
+      }
+    ],
+    "unchanged": [
+      "已发布 r1.json 的任何定义内容",
+      "实体 828D 的硬件验收状态",
+      "生产库配置"
+    ]
   }
 }

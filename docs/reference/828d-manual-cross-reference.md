@@ -384,3 +384,67 @@ PY
 | 7 | 42/42 的结构化 document_id/section/page | 本轮按纪律**未改 r1.json**，该缺口仍在；建议在拿到正确版本文档后单独立项 |
 | 8 | 探针执行路径 | `AXIS_ENC_MODULE_NR` 需纳入真实探测或撤销其 measurement 声明（§9.1） |
 
+
+---
+
+## 10. 评审裁决记录（阶段 A 三项待确认事项）
+
+本节记录评审对阶段 A 三项待确认事项的最终裁决。**裁决只写入审计结果，不修改任何已发布定义**（`drivers/sinumerik-nck/definitions/828d/r1.json` 一字节未动）。
+
+### 10.1 `drive.parameter.r0033` — 修正候选标签，保留候选状态
+
+| 项 | 内容 |
+|---|---|
+| 裁决 | `correct_label_keep_candidate` |
+| **建议标签** | **滤波转矩利用率（%）** |
+| 证据 | `828D_S120_para_lists_man_0723_zh-CHS.pdf` 07/2023 **第 48 页**：滤波后的转矩利用率，单位为百分比，按 `p2196` 缩放 |
+| 状态 | **继续保持 `candidate`** |
+| `r1.json` | **本阶段不改** |
+
+现标签「轴负载」易被误解为**轴负载率**，与手册语义不符。但 `r1.json` 引用的是 **11/2023** 手册，**不能以较早版本替代原始来源**，故：
+
+- 在核对 11/2023 来源前，不直接修改已发布定义
+- 不把「转矩利用率」擅自改写成「轴负载」
+- **不凭参数号推断该参数在其他驱动对象上的语义**
+
+**不主张**：该参数在所有驱动对象上的物理含义；11/2023 版本中的对应页码与措辞。
+
+### 10.2 `axis.ctrlout.type` — 不认定两者同义
+
+| 来源 | 枚举值 `0` 的解释 |
+|---|---|
+| 07/2023 手册（MD30130, md p364） | **仿真（无硬件要求）** |
+| 现有定义 label | **无驱动输出** |
+
+**裁决：`do_not_assert_equivalence`。** 无充分证据证明两者等价。
+
+处理：
+- 两种解释**都登记为语义差异，不做取舍**
+- **暂不把数值 `0` 解释成"没有驱动输出"**
+- 在取得对应版本官方定义或可靠设备侧证据前，**不把该语义标为已确认**
+- **保留探针的原始读取证据，但不据此证明枚举含义正确**
+
+### 10.3 13 条 `not_found` — 需取得 03/2025 NC 变量文档
+
+| 项 | 内容 |
+|---|---|
+| 裁决 | `obtain_missing_official_document` |
+| **所需文档** | **`A5E53370586B AC`**（Siemens 828D NC variables, 03/2025） |
+| 状态 | `awaiting_document` |
+
+**理由**：13 条均属现有定义引用的 **NC 变量（OPI）组**，所提供的三份 07/2023 文档**不覆盖**这些条目 —— **属文档来源不匹配，不得据此判定定义错误**。
+
+后续：
+1. 优先从西门子官方资料渠道获取对应版本
+2. 取得后**实测**文档号、版本、页数与 SHA-256（**不得据文件名推断**）
+3. 逐条核对这 13 条的原始名称、读取属性、数据类型、章节与页码
+4. **若官方文档无法取得，继续保留 `not_found`，不得用其他文档或推测补齐**
+
+受影响的 13 条：`mode_group.op_mode`、`channel.program.name.main`、`channel.program.name.active`、`channel.program.line_number`、`channel.program.block`、`axis.position.commanded_mcs`、`axis.position.actual_bcs`、`channel.feed.actual`、`channel.feed.commanded`、`channel.feed.override`、`spindle.speed.actual`、`spindle.speed.override`、`channel.tool.number_active`。
+
+### 10.4 本裁决**不改变**的事项
+
+- 已发布 `r1.json` 的任何定义内容
+- **实体 828D 的硬件验收状态**
+- 生产库配置
+- `docs/reference/sinumerik-828d-manuals.json` 中第 4 份文档已登记为 `pending_file`，PDF 同样不入库

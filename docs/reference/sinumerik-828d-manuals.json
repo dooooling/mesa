@@ -11,11 +11,13 @@
   "file_presence_audit": {
     "checked_at_commit": "c3945847dcc196e8cb969f08fe71b7b397edfd8d",
     "manuals_dir": "docs/reference/manuals",
-    "expected_file_count": 3,
+    "expected_file_count": 4,
     "present_file_count": 3,
-    "missing_files": [],
+    "missing_files": [
+      "<待获取> Siemens 828D NC variables 03/2025 A5E53370586B AC"
+    ],
     "documents_file_present_true": 3,
-    "documents_file_present_false": 0,
+    "documents_file_present_false": 1,
     "all_documents_file_present_consistent": true,
     "git_tracked_pdf_count": 0,
     "gitignore_rule": ".gitignore:76-77 → docs/reference/manuals/*.pdf / *.PDF",
@@ -24,9 +26,10 @@
       "文件身份：Get-FileHash -Algorithm SHA256 与 Length 实测，逐字填入 documents[].sha256 / size_bytes",
       "版本与文档号：用 pypdf 抽取各 PDF 首页文本，确认文档号（6FC5397-5FP40-0RA6 / 6FC5397-4DP40-6RA6 / A5E53014702F AA）与版本（07/2023）与登记值一致",
       "页数：pypdf PdfReader.pages 实测（1236 / 690 / 1414）",
-      "可重复校验：python docs/reference/check-manual-metadata.py（校验本节与 documents[] 是否再次出现自相矛盾）"
+      "可重复校验：python docs/reference/check-manual-metadata.py（校验本节与 documents[] 是否再次出现自相矛盾）",
+      "第 4 份文档按评审裁决 D3 登记为待获取；本文件如实区分「已在位」与「待获取」，不把待获取计入在位数量。"
     ],
-    "conclusion": "三份 PDF 全部在位且身份与版本已实测确认：文件存在、SHA-256 与 size_bytes 与实测一致、首页文档号与版本号与登记一致、页数已实测（1236 / 690 / 1414）。本节所有字段均取自 commit c394584 这一轮实测，与 documents[].file_present 完全一致；历史上的“文件缺失”结论已删除，仅在下一条 historical_note 中作为教训保留。",
+    "conclusion": "已在位 3 份（6FC5397-5FP40-0RA6、6FC5397-4DP40-6RA6、A5E53014702F AA），待获取 1 份（A5E53370586B AC）。在位者文档号/版本/页数/SHA 均已实测确认；待获取者为评审裁决 D3 要求的二零二五年三月 NC 变量文档，未取得前相关 13 条定义保留 not_found，不得推测补齐。",
     "historical_note": "上一轮（HEAD 047e206 时）本节的结论是“仓库与工作区都找不到 PDF、三条记录一律标为不存在”；随后 PDF 到位，并在 commit c394584 用 pypdf 实测补入 documents[]，但本节未同步，形成文档内自相矛盾（本节说没有文件、逐条记录却说有）。本轮（同一 commit 下）重写本节，使 file_presence_audit 与逐条 documents[].file_present 取自同一轮实际检查结果；并由 docs/reference/check-manual-metadata.py 的 B 组检查项机械防回归。",
     "expected_path_policy": "PDF 统一存放于 docs/reference/manuals/（README.md 已固定该约定）；该目录内 PDF 被 gitignore 精确忽略，不入库。"
   },
@@ -170,6 +173,35 @@
         "pdf_page_equals_printed_page": true,
         "page_offset_note": "页脚页码与 PDF 页号实测一致（偏移 0），逐页验证见 828d-manual-cross-reference.md §4"
       }
+    },
+    {
+      "id": "nc-variables-032025",
+      "file_name": "<待获取> Siemens 828D NC variables 03/2025 A5E53370586B AC",
+      "document_number": "A5E53370586B AC",
+      "series": "828D",
+      "expected_version": "03/2025",
+      "language": "de/en（待确认）",
+      "file_present": false,
+      "sha256": null,
+      "size_bytes": null,
+      "expected_path": null,
+      "status": "pending_file",
+      "scope": "NC 变量（OPI 变量）组：程序状态、运行方式、进给、主轴、轴位置、刀具号等",
+      "pending_fields": [
+        "file",
+        "sha256",
+        "pages",
+        "document_number_verified_from_pdf",
+        "version_verified_from_pdf"
+      ],
+      "planned_use": "补齐 13 条 not_found 定义的原始来源追溯",
+      "notes": [
+        "该文档为现有 42 条定义中 16 条 manual 来源所引用，但尚未取得",
+        "取得后须实测文档号与版本，不得据文件名推断",
+        "PDF 同样不入库"
+      ],
+      "committed_to_git": false,
+      "requested_by_review": "D3"
     }
   ],
   "known_version_divergence": {
@@ -269,7 +301,8 @@
       "module 26 / module 130 实例编号：不得换算、不得等价、每个映射必须绑定入口（见交叉引用文档 §5.2）",
       "13 条 not_found + 2 条 pending_review：需在拿到 03/2025 NC 变量文档（或 828D OPI 变量清单）后逐条补齐",
       "r1.json 的 42 条仍无结构化 document_id/section/page —— 本轮按纪律不改 r1.json",
-      "r0033 候选语义（轴负载）与手册（转矩利用率 %）不一致，待评审确认"
+      "r0033 候选语义（轴负载）与手册（转矩利用率 %）不一致，待评审确认",
+      "nc-variables-032025 文档待获取，13 条 not_found 无法补齐原始来源"
     ],
     "source_of_truth_forbidden_until_then": "任何依赖 07/2023 PDF 的字段都只能作为“较早版本比对结果”，不得写成 r1.json 定义的来源页码"
   },

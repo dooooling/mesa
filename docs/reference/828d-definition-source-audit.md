@@ -1136,3 +1136,17 @@ python audit_sources.py drivers/sinumerik-nck/definitions/828d/r1.json audit.jso
 
 同一份逐条数据另存为 `docs/reference/828d-definition-source-audit.json`
 （`summary` + `definitions` 两个顶层键，字段与本文表格一一对应）。
+
+---
+
+## 7. 评审裁决记录（摘要）
+
+三项待确认事项的裁决详见 `828d-manual-cross-reference.md` §10，并将结构化结果写入本文件对应 JSON 的 `review_decisions`。摘要：
+
+| # | 事项 | 裁决 |
+|---|---|---|
+| **D1** | `drive.parameter.r0033` 语义 | **修正建议标签为「滤波转矩利用率（%）」，保留 `candidate`**；07/2023 s120 p48 为证；`r1.json` 本阶段不改 |
+| **D2** | `axis.ctrlout.type` 枚举 `0` | **不认定同义**（手册「仿真」vs 定义「无驱动输出」）；保留原始枚举，不换算，不标为已确认 |
+| **D3** | 13 条 `not_found` | **需取得 `A5E53370586B AC`（03/2025）**；未取得前保留 `not_found`，不得推测补齐 |
+
+**共同原则**：修正错误语义，不把候选项伪装成已验证能力；补齐原始文档来源，但不让缺失资料阻塞已完成的审计。
