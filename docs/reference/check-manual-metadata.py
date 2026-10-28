@@ -192,7 +192,7 @@ def check_audit_consistency(manuals, verbose):
     else:
         ok('B3', 'file_presence_audit.conclusion 无与 documents[] 相反的过期表述')
     if not absent and present:
-        ok('B4', '三份文档 file_present=true 且 audit 声明 present_file_count=%d' % len(present))
+        ok('B4', '%d 份文档 file_present=true 且 audit 声明 present_file_count=%d' % (len(present), len(present)))
     # checked_at_commit 只是「检查发生时的 HEAD」这一历史记录值，用于追溯。
     #
     # 不能拿它与当前 HEAD 比对来判「清单过期」：本清单本身就在这次提交里，每提交一次
