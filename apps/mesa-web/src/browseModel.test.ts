@@ -2,7 +2,7 @@
 //
 // PR #150 解耦后：通用层不认识任何 point kind。带 `kind` 的信封（语义载荷）
 // 通用层一律不猜（返回 null），identity 之类的语义块由 `parseBrowseEnvelope`
-// 原样透出给策略层（见 nckBrowsePolicy.test.ts）。
+// 原样透出给语义层（见 nckBrowseSemantic.test.ts）。
 import { describe, expect, it } from "vitest";
 import {
   buildBrowseRequest,
@@ -226,5 +226,188 @@ describe("不完整模板不绕过必填前置", () => {
     expect(
       missingRequiredParams({ fields: nckFields }, { ...sel.parameters, area_no: 6, line: 1 }),
     ).toEqual([]);
+  });
+});
+
+// IPC 1.8：wire 选择契约 → 「可选 / 阻断 / 无入口」三态。
+//
+// 这一组锁的是**消费侧**规则（不涉及任何厂商语义）：
+// - 驱动声明的模式是唯一可选性真值；
+// - 未知模式 / 载荷畸形 / 旧驱动的语义载荷一律可见阻断；
+// - 旧驱动（未声明）的通用资源浏览行为逐字不变。
+import {
+  BROWSE_CONTRACT_CODES,
+  BROWSE_SELECTION_MODE,
+  decodeBrowseSelectionMode,
+  evaluateBrowseNode,
+} from "./browseModel";
+
+describe("decodeBrowseSelectionMode", () => {
+  it("maps_known_values_and_keeps_unknown_distinct", () => {
+    expect(decodeBrowseSelectionMode({ id: "x" })).toBe("unspecified");
+    expect(decodeBrowseSelectionMode({ id: "x", selection_mode: 0 })).toBe("unspecified");
+    expect(decodeBrowseSelectionMode({ id: "x", selection_mode: 1 })).toBe("resource");
+    expect(decodeBrowseSelectionMode({ id: "x", selection_mode: 2 })).toBe("semantic");
+    expect(decodeBrowseSelectionMode({ id: "x", selection_mode: 3 })).toBe("not_selectable");
+    // 未知值**不得**被当成 unspecified（那会把未来语义当旧协议放行）。
+    expect(decodeBrowseSelectionMode({ id: "x", selection_mode: 4 })).toBe("unknown");
+    expect(decodeBrowseSelectionMode({ id: "x", selection_mode: 99 })).toBe("unknown");
+    expect(decodeBrowseSelectionMode({ id: "x", selection_mode: -1 })).toBe("unknown");
+  });
+});
+
+describe("evaluateBrowseNode：驱动声明的三种模式", () => {
+  it("resource_mode_yields_selection_from_payload", () => {
+    const v = evaluateBrowseNode({
+      id: "n1",
+      selection_mode: BROWSE_SELECTION_MODE.RESOURCE,
+      selection_payload_json: JSON.stringify({
+        resource_id: "node",
+        parameters: { node_id: "ns=1;i=1" },
+      }),
+    });
+    expect(v.mode).toBe("resource");
+    expect(v.resource).toEqual({ resource_id: "node", parameters: { node_id: "ns=1;i=1" } });
+    expect(v.semanticPayload).toBeNull();
+    expect(v.blocks).toHaveLength(0);
+  });
+
+  it("semantic_mode_exposes_opaque_payload_untouched", () => {
+    const payload = { kind: "vendor_thing", nested: { a: 1 } };
+    const v = evaluateBrowseNode({
+      id: "n2",
+      selection_mode: BROWSE_SELECTION_MODE.SEMANTIC,
+      selection_payload_json: JSON.stringify(payload),
+    });
+    expect(v.semanticPayload).toEqual(payload);
+    expect(v.resource).toBeNull();
+  });
+
+  it("not_selectable_never_yields_entry_even_with_valid_payload", () => {
+    const v = evaluateBrowseNode({
+      id: "n3",
+      selection_mode: BROWSE_SELECTION_MODE.NOT_SELECTABLE,
+      selection_payload_json: JSON.stringify({ resource_id: "node", parameters: {} }),
+    });
+    expect(v.resource).toBeNull();
+    expect(v.semanticPayload).toBeNull();
+    // 无理由的不可选 ⇒ 无阻断块（分支节点不该出现红色提示）。
+    expect(v.blocks).toHaveLength(0);
+  });
+
+  it("driver_error_diagnostics_become_visible_blocks_and_others_notes", () => {
+    const v = evaluateBrowseNode({
+      id: "n4",
+      selection_mode: BROWSE_SELECTION_MODE.NOT_SELECTABLE,
+      diagnostics: [
+        { code: "SOME_DRIVER_CODE", message: "驱动说不行", severity: 3 },
+        { code: "INFO_CODE", message: "提示", severity: 1 },
+        { code: "WARN_CODE", message: "注意", severity: 2 },
+      ],
+    });
+    expect(v.blocks.map((b) => b.code)).toEqual(["SOME_DRIVER_CODE"]);
+    expect(v.blocks[0].testId).toBe("browse-selection-block");
+    expect(v.notes.map((n) => [n.code, n.tone])).toEqual([
+      ["INFO_CODE", "muted"],
+      ["WARN_CODE", "warn"],
+    ]);
+  });
+
+  it("unknown_severity_is_treated_as_blocking_style_but_grants_nothing", () => {
+    const v = evaluateBrowseNode({
+      id: "n5",
+      selection_mode: BROWSE_SELECTION_MODE.SEMANTIC,
+      selection_payload_json: "{}",
+      diagnostics: [{ code: "X", message: "未知级别", severity: 42 }],
+    });
+    expect(v.blocks.map((b) => b.code)).toEqual(["X"]);
+    // 阻断样式只影响展示；载荷仍可交付（可选性由 mode 决定）。
+    expect(v.semanticPayload).toEqual({});
+  });
+});
+
+describe("evaluateBrowseNode：fail-closed 契约违规", () => {
+  it("unknown_mode_blocks_with_code_and_value", () => {
+    const v = evaluateBrowseNode({ id: "x", selection_mode: 77 });
+    expect(v.blocks[0].code).toBe(BROWSE_CONTRACT_CODES.MODE_UNKNOWN);
+    expect(v.blocks[0].message).toContain("77");
+    expect(v.resource).toBeNull();
+    expect(v.semanticPayload).toBeNull();
+  });
+
+  it("declared_mode_without_payload_is_blocked", () => {
+    for (const mode of [BROWSE_SELECTION_MODE.RESOURCE, BROWSE_SELECTION_MODE.SEMANTIC]) {
+      const v = evaluateBrowseNode({ id: "x", selection_mode: mode });
+      expect(v.blocks[0].code).toBe(BROWSE_CONTRACT_CODES.PAYLOAD_MISSING);
+    }
+  });
+
+  it("malformed_payload_is_blocked_and_never_falls_back", () => {
+    for (const raw of ["{oops", "[1]", '"s"', "42"]) {
+      const v = evaluateBrowseNode({
+        id: "x",
+        selection_mode: BROWSE_SELECTION_MODE.SEMANTIC,
+        selection_payload_json: raw,
+        // binding_json 合法也不得被当作回退来源
+        binding_json: JSON.stringify({ kind: "vendor", parameters: {} }),
+      });
+      expect(v.blocks[0].code).toBe(BROWSE_CONTRACT_CODES.PAYLOAD_MALFORMED);
+      expect(v.semanticPayload).toBeNull();
+    }
+  });
+
+  it("resource_payload_must_carry_resource_id_and_parameters", () => {
+    const bad = [
+      { parameters: {} },
+      { resource_id: "node" },
+      { resource_id: "  ", parameters: {} },
+      { resource_id: "node", parameters: [] },
+    ];
+    for (const p of bad) {
+      const v = evaluateBrowseNode({
+        id: "x",
+        selection_mode: BROWSE_SELECTION_MODE.RESOURCE,
+        selection_payload_json: JSON.stringify(p),
+        kind: "node", // 即便节点自身 kind 像资源，也不得据此推测
+      });
+      expect(v.blocks[0].code).toBe(BROWSE_CONTRACT_CODES.RESOURCE_PAYLOAD_INVALID);
+      expect(v.resource).toBeNull();
+    }
+  });
+
+  it("legacy_semantic_payload_without_authority_is_blocked", () => {
+    const v = evaluateBrowseNode({
+      id: "x",
+      kind: "vendor_point",
+      binding_json: JSON.stringify({ kind: "vendor_point", parameters: { a: 1 } }),
+    });
+    expect(v.blocks[0].code).toBe(BROWSE_CONTRACT_CODES.SELECTION_UNSPECIFIED);
+    expect(v.resource).toBeNull();
+    expect(v.semanticPayload).toBeNull();
+  });
+
+  it("legacy_generic_resource_leaf_still_works (向后兼容)", () => {
+    const v = evaluateBrowseNode({
+      id: "nsu=x;i=1",
+      kind: "node",
+      binding_json: JSON.stringify({ node_id: "nsu=x;i=1", data_type: "STRING" }),
+    });
+    expect(v.mode).toBe("unspecified");
+    expect(v.resource).toEqual({
+      resource_id: "node",
+      parameters: { node_id: "nsu=x;i=1", data_type: "STRING" },
+    });
+    expect(v.blocks).toHaveLength(0);
+  });
+
+  it("legacy_empty_envelope_is_silent_none (分支节点)", () => {
+    const v = evaluateBrowseNode({ id: "b", kind: "group", has_children: true, binding_json: "{}" });
+    expect(v.resource).toBeNull();
+    expect(v.blocks).toHaveLength(0);
+  });
+
+  it("legacy_malformed_binding_is_visible_block", () => {
+    const v = evaluateBrowseNode({ id: "b", kind: "node", binding_json: "{oops" });
+    expect(v.blocks[0].code).toBe(BROWSE_CONTRACT_CODES.PAYLOAD_MALFORMED);
   });
 });

@@ -9,17 +9,16 @@
 // - 旧 `variable` 原生字段入口在 NCK 上必然被驱动拒绝，因此**整体不渲染**（A22）；
 // - 默认页是 NckPointFields，身份以服务端 Preview 为唯一权威（A21）；
 // - 目录缺失 ⇒ fail-closed（不退回旧原生字段流程）；
-// - Browse 语义叶经 `createNckBrowseLeafPolicy` 准入（scope/family/identity，A13/A16）。
+// - Browse 语义叶的可选性与阻断原因由**驱动**在 wire 上给出（IPC 1.8），
+//   本组件只注入载荷解析器 `createNckSemanticHandler()`；准入（scope/family）
+//   已搬到驱动侧，前端不再推断（A13/A16 的驱动侧落点见 presets.rs）。
 import { useState } from "react";
 import { Alert, message, Tabs } from "antd";
 import { ResourceBrowseAntd } from "./ResourceBrowseAntd";
 import { NckPointFields, type NckPreviewFn } from "./NckPointFields";
 import type { NckPointSelection } from "../deviceModel";
 import type { NckDefinitionLike } from "../nckPointModel";
-import {
-  createNckBrowseLeafPolicy,
-  type NckSemanticBrowseConfig,
-} from "../nckBrowsePolicy";
+import { createNckSemanticHandler } from "../nckBrowseSemantic";
 import type { SchemaDescriptor } from "../types";
 
 /** 选型方式声明（来自 Descriptor.resource_selection_methods，缺省即 manual）。 */
@@ -107,12 +106,8 @@ export function NckSemanticPicker({
         // 语义模式下不允许回填旧 resource 表单：非语义叶不应被当成 NCK 点位。
         message.warning("请选用语义点位（旧 variable 入口在 NCK 上已被禁用）");
       }}
-      leafPolicy={createNckBrowseLeafPolicy({
-        definitions: rawDefinitions,
-        endpointFamily,
-        catalogFamily,
-      } satisfies NckSemanticBrowseConfig)}
-      onLeafSelect={
+      semanticHandler={createNckSemanticHandler()}
+      onSemanticSelect={
         onAddPoint
           ? (sel) => {
               setPreset({

@@ -1,52 +1,71 @@
 // Descriptor 驱动的 Browse 选型（P0-2）：消费 resource_selection_methods 声明的
 // Browse 能力。
 //
-// 本组件**只**理解 browse 节点信封（见 browseModel.ts）：下钻靠 has_children +
-// 节点 id 回传 parent；回根即 parent=""。它不认识任何厂商/协议/Point Kind：
+// 本组件只做三件事，且**只**理解 wire 契约（见 browseModel.ts）：
 //
-// - 通用资源叶：`selectableFromNode` → `onFill`（resource + parameters 回填）；
-// - 语义叶：由调用方注入的 `BrowseLeafPolicy` 判定（是否可选、类别标签、
-//   不可选原因、预览提示、选用载荷），本组件只负责展示与转发 → `onLeafSelect`；
-// - 载荷声明了 point kind 但没有策略接管：fail-closed，不给「选用」入口。
+// 1. 渲染状态与诊断：`evaluateBrowseNode(node)` 给出「可选（资源/语义）/
+//    阻断 / 无入口」三态 + 可见阻断原因 + 展示性提示；组件原样渲染，
+//    **不解释任何取值**（不认识厂商、协议、point kind）；
+// 2. 把**不透明载荷**派发出去：资源叶 → `onFill`；语义叶 → 注入的
+//    `BrowseSemanticHandler.parse` 解析后 → `onSemanticSelect`；
+// 3. 下钻：`has_children` + 节点 id 回传 parent；回根即 parent=""。
+//
+// 可选性与阻断原因由**驱动**在 wire 上给出（IPC 1.8 `selection_mode` /
+// `selection_payload_json` / `diagnostics`）。旧驱动（未声明）走既有通用规则，
+// 语义载荷因缺少权威准入结论而一律不可选。
+//
+// fail-closed（缺一即为回归，任何一条都必须是"可见阻断"而不是静默回退）：
+// - 未知选择模式 / 载荷缺失 / 载荷畸形 / 资源载荷不合契约 ⇒ 阻断；
+// - 语义叶但没有处理器 / 上层未接线 ⇒ 阻断（绝不回落到资源回填）；
+// - 处理器拒绝载荷 ⇒ 阻断（码与文案由语义层给出）；
+// - 驱动声明 NOT_SELECTABLE ⇒ 永不给入口，哪怕载荷看起来合法。
 //
 // 身份纪律（与驱动无关的通用要求）：节点自带的预览身份**只展示**，永不作为
-// 最终身份；提交前必须由服务端 Preview / Configure 重新确认（策略层不得放宽）。
+// 最终身份；提交前必须由服务端 Preview / Configure 重新确认。
 import { useEffect, useState } from "react";
 import { Button, Input, Space, Tag, message } from "antd";
 import {
   buildBrowseRequest,
-  declaresOpaquePointKind,
-  parseBrowseEnvelope,
-  selectableFromNode,
+  evaluateBrowseNode,
+  type BrowseBlock,
   type BrowseNode,
   type BrowseSelection,
 } from "../browseModel";
 import {
   DEFAULT_MISSING_HANDLER_REASON,
-  NO_POLICY_FOR_POINT_KIND_REASON,
-  type BrowseLeafOwned,
-  type BrowseLeafPolicy,
-} from "../browseLeafPolicy";
+  missingHandlerBlock,
+  parseRejectedBlock,
+  type BrowseSemanticHandler,
+} from "../browseSemanticHandler";
+
+/** 单个节点的渲染视图：判定结果 + 已解析的语义载荷（若有）。 */
+interface LeafView {
+  resource: BrowseSelection | null;
+  notes: readonly { code: string; message: string; tone: "muted" | "warn" }[];
+  blocks: readonly BrowseBlock[];
+  /** 语义入口是否成立（处理器解析成功且上层已接线）。 */
+  semantic: { selection: unknown; label: string } | null;
+}
 
 export function ResourceBrowseAntd<TSel>({
   endpointId,
   onFill,
-  leafPolicy,
-  onLeafSelect,
+  semanticHandler,
+  onSemanticSelect,
 }: {
   endpointId: string;
   /** 用户选用通用资源叶：父层切到手动表单并预填（resource + parameters）。 */
   onFill: (sel: BrowseSelection) => void;
   /**
-   * 叶判定策略（可选）。由驱动语义层注入；未注入时所有带语义载荷的叶
-   * 一律不可选用（fail-closed），通用资源叶行为逐字不变。
+   * 语义载荷处理器（可选）。由驱动语义层注入；未注入时所有 SEMANTIC 叶
+   * 一律不可选用（fail-closed），资源叶与旧驱动行为逐字不变。
    */
-  leafPolicy?: BrowseLeafPolicy<TSel> | null;
+  semanticHandler?: BrowseSemanticHandler<TSel> | null;
   /**
-   * 用户选用策略接管的叶：父层按载荷（不透明）走自己的表单。
-   * 未提供时策略叶的「选用」入口关闭（不回落到通用资源回填）。
+   * 用户选用语义叶：父层按载荷（不透明）走自己的表单。
+   * 未提供时语义叶的「选用」入口关闭（不回落到资源回填）。
    */
-  onLeafSelect?: (sel: TSel) => void;
+  onSemanticSelect?: (sel: TSel) => void;
 }) {
   const [parent, setParent] = useState("");
   const [filter, setFilter] = useState("");
@@ -110,34 +129,36 @@ export function ResourceBrowseAntd<TSel>({
   /**
    * 单个节点的展示视图。
    *
-   * 优先级：策略接管 > 通用资源叶 > 「载荷需语义层解释但未注入策略」的阻断。
-   * 三者互斥，且任何一条不成立时都不产生「选用」入口（fail-closed）。
+   * 判定全部来自 `evaluateBrowseNode`（wire 契约），本函数只补「语义载荷能否
+   * 交给上层」这一层：处理器缺失 / 上层未接线 / 处理器拒绝，三者都转成**可见
+   * 阻断**，绝不静默丢弃。
    */
-  const viewOf = (node: BrowseNode) => {
-    const verdict = leafPolicy?.evaluate(node) ?? { mode: "generic" as const };
-    if (verdict.mode === "owned") {
-      let owned: BrowseLeafOwned<TSel> = verdict;
-      if (owned.selectable) {
-        // 策略说可选，但缺少载荷或上层未接线 ⇒ 退化为不可选并显示原因，
-        // 绝不把「策略的乐观结论」当成可提交。
-        if (!owned.selection) {
-          owned = { ...owned, selectable: false, reason: "策略未提供可选用载荷：不可选用" };
-        } else if (!onLeafSelect) {
-          owned = {
-            ...owned,
-            selectable: false,
-            reason: leafPolicy?.missingHandlerReason ?? DEFAULT_MISSING_HANDLER_REASON,
+  const viewOf = (node: BrowseNode): LeafView => {
+    const evaluation = evaluateBrowseNode(node);
+    const blocks: BrowseBlock[] = [...evaluation.blocks];
+    let semantic: LeafView["semantic"] = null;
+
+    if (evaluation.semanticPayload) {
+      if (!semanticHandler) {
+        blocks.push(missingHandlerBlock(DEFAULT_MISSING_HANDLER_REASON));
+      } else if (!onSemanticSelect) {
+        blocks.push(
+          missingHandlerBlock(semanticHandler.notProvidedReason ?? DEFAULT_MISSING_HANDLER_REASON),
+        );
+      } else {
+        const parsed = semanticHandler.parse(evaluation.semanticPayload);
+        if (parsed.ok) {
+          semantic = {
+            selection: parsed.selection,
+            label: parsed.label ?? semanticHandler.selectLabel ?? "选用",
           };
+        } else {
+          blocks.push(parseRejectedBlock(parsed.code, parsed.message));
         }
       }
-      return { owned, generic: null as BrowseSelection | null, unclaimedKindPayload: false };
     }
-    const generic = selectableFromNode(node);
-    return {
-      owned: null as BrowseLeafOwned<TSel> | null,
-      generic,
-      unclaimedKindPayload: !generic && declaresOpaquePointKind(parseBrowseEnvelope(node)),
-    };
+
+    return { resource: evaluation.resource, notes: evaluation.notes, blocks, semantic };
   };
 
   return (
@@ -167,8 +188,6 @@ export function ResourceBrowseAntd<TSel>({
         <div style={{ display: "grid", gap: 6 }}>
           {nodes.map((n) => {
             const view = viewOf(n);
-            const { owned, generic } = view;
-            const selectable = !!owned?.selectable && !!owned.selection && !!onLeafSelect;
             return (
               <div
                 key={n.id}
@@ -179,46 +198,28 @@ export function ResourceBrowseAntd<TSel>({
                   <span style={{ display: "block", fontFamily: "'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace", fontSize: 11, color: "#525252", overflow: "hidden", textOverflow: "ellipsis" }}>
                     {n.id}
                   </span>
-                  {owned?.badge || (owned?.tags?.length ?? 0) > 0 ? (
-                    <span style={{ display: "block", fontSize: 11, color: "#525252" }}>
-                      {owned?.badge ? <Tag color="blue">{owned.badge}</Tag> : null}
-                      {owned?.tags?.map((tag) => <Tag key={tag}>{tag}</Tag>)}
-                      {owned?.preview ? (
-                        <span
-                          style={{
-                            fontFamily: "'IBM Plex Mono',monospace",
-                            color: owned.preview.tone === "warn" ? "#8c6000" : undefined,
-                          }}
-                        >
-                          {owned.preview.text}
-                        </span>
-                      ) : null}
-                    </span>
-                  ) : null}
-                  {owned?.notice ? (
+                  {view.notes.map((note) => (
                     <span
-                      data-testid={owned.notice.testId}
+                      key={`${note.code}-${note.message}`}
+                      data-testid={`browse-note-${note.code || "anonymous"}`}
+                      style={{
+                        display: "block",
+                        fontSize: 11,
+                        color: note.tone === "warn" ? "#8c6000" : "#525252",
+                      }}
+                    >
+                      {note.message}
+                    </span>
+                  ))}
+                  {view.blocks.map((b) => (
+                    <span
+                      key={`${b.code}-${b.message}`}
+                      data-testid={b.testId}
                       style={{ display: "block", fontSize: 11, color: "#c62828" }}
                     >
-                      {owned.notice.text}
+                      不可选用（{b.code}）：{b.message}
                     </span>
-                  ) : null}
-                  {owned && !owned.selectable && owned.reason ? (
-                    <span
-                      data-testid={owned.blockTestId ?? "browse-leaf-block"}
-                      style={{ display: "block", fontSize: 11, color: "#c62828" }}
-                    >
-                      不可选用：{owned.reason}
-                    </span>
-                  ) : null}
-                  {view.unclaimedKindPayload ? (
-                    <span
-                      data-testid="browse-leaf-block"
-                      style={{ display: "block", fontSize: 11, color: "#c62828" }}
-                    >
-                      不可选用：{NO_POLICY_FOR_POINT_KIND_REASON}
-                    </span>
-                  ) : null}
+                  ))}
                 </span>
                 {n.kind ? <Tag>{n.kind}</Tag> : null}
                 {n.data_type ? <Tag>{n.data_type}</Tag> : null}
@@ -227,18 +228,19 @@ export function ResourceBrowseAntd<TSel>({
                   {n.has_children ? (
                     <Button size="small" onClick={() => enter(n.id)}>进入</Button>
                   ) : null}
-                  {owned?.selectable ? (
-                    selectable ? (
-                      <Button
-                        size="small"
-                        type="primary"
-                        onClick={() => onLeafSelect?.(owned.selection as TSel)}
-                      >
-                        {owned.selectLabel ?? "选用"}
-                      </Button>
-                    ) : null
-                  ) : generic ? (
-                    <Button size="small" type="primary" onClick={() => onFill(generic)}>选用</Button>
+                  {view.resource ? (
+                    <Button size="small" type="primary" onClick={() => onFill(view.resource as BrowseSelection)}>
+                      选用
+                    </Button>
+                  ) : null}
+                  {view.semantic ? (
+                    <Button
+                      size="small"
+                      type="primary"
+                      onClick={() => onSemanticSelect?.(view.semantic?.selection as TSel)}
+                    >
+                      {view.semantic.label}
+                    </Button>
                   ) : null}
                 </Space>
               </div>

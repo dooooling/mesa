@@ -863,6 +863,29 @@ describe("PR-C 第三批：Endpoint 页 Browse → 语义表单（A1/A13/A16）"
       label: "Browse 程序状态",
       kind: "nck_variable",
       has_children: false,
+      // IPC 1.8：可选性/载荷/诊断由**驱动**给出（不再由前端查目录推断）。
+      selection_mode: 2, // SEMANTIC
+      selection_payload_json: JSON.stringify({
+        kind: "nck_variable",
+        parameters: {
+          variable_id: "syn.collect.a",
+          definition_revision: 1,
+          target: { channel: 1 },
+          arguments: {},
+        },
+        identity: {
+          template: "syn.collect.a@channel={channel}",
+          keys: [{ path: "channel", required: true }],
+          preview_point_key: "syn.collect.a@channel=1",
+        },
+      }),
+      diagnostics: [
+        {
+          code: "IDENTITY_PREVIEW",
+          message: "Browse 预览：syn.collect.a@channel=1（仅展示；提交前仍需服务端确认）",
+          severity: 1,
+        },
+      ],
       binding_json: JSON.stringify({
         kind: "nck_variable",
         parameters: {
@@ -883,6 +906,30 @@ describe("PR-C 第三批：Endpoint 页 Browse → 语义表单（A1/A13/A16）"
       label: "Browse 身份探针",
       kind: "nck_variable",
       has_children: false,
+      // 驱动已按 scope=identity 判为不可选，并把稳定码写进诊断。
+      selection_mode: 3, // NOT_SELECTABLE
+      selection_payload_json: JSON.stringify({
+        kind: "nck_variable",
+        parameters: {
+          variable_id: "syn.identity.a",
+          definition_revision: 1,
+          target: { axis: 1 },
+          arguments: {},
+        },
+        identity: {
+          template: "syn.identity.a@axis={axis}",
+          keys: [{ path: "axis", required: true }],
+          preview_point_key: "syn.identity.a@axis=1",
+        },
+      }),
+      diagnostics: [
+        {
+          code: "DEFINITION_SCOPE_NOT_COLLECTABLE",
+          message:
+            "定义 `syn.identity.a` revision=1 的 scope=`identity` 不可采集（仅 scope=`collect` 允许进入采集计划）",
+          severity: 3,
+        },
+      ],
       binding_json: JSON.stringify({
         kind: "nck_variable",
         parameters: {
@@ -932,10 +979,10 @@ describe("PR-C 第三批：Endpoint 页 Browse → 语义表单（A1/A13/A16）"
     await user.click(screen.getByTestId("nck-browse-toggle"));
     await screen.findByText("Browse 程序状态");
 
-    // A13：identity 叶必须有具体不可选原因，且没有“选用（语义）”。
+    // A13：identity 叶必须由**驱动**给出具体不可选原因，且没有“选用（语义）”。
     const identityRow = screen.getByText("Browse 身份探针").closest("div") as HTMLElement;
-    expect(within(identityRow).getByTestId("browse-semantic-block").textContent).toContain(
-      "SCOPE_IDENTITY",
+    expect(within(identityRow).getByTestId("browse-selection-block").textContent).toContain(
+      "DEFINITION_SCOPE_NOT_COLLECTABLE",
     );
     expect(within(identityRow).queryByRole("button", { name: /选用（语义）/ })).toBeNull();
 
