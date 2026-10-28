@@ -13,6 +13,7 @@
 //! - probe 诚实语义：会话可达≠身份确认（family 待 anchor，真机 PR7）。
 
 mod address;
+mod browse_selection;
 mod client;
 mod codec;
 mod compiler;

@@ -337,6 +337,53 @@ message BrowseRequest {
   uint32 limit = 5;
 }
 
+// 选择模式（IPC 1.8，纯 additive）：**驱动（catalog 拥有者）**对「该 Browse 节点
+// 能否被选用、以何种形态选用」的权威声明。
+//
+// 为什么必须由驱动给出：前端此前只能从 `kind`/`binding_json` 的形态**推断**
+// 节点是否可选、载荷属于哪一层、为何被拦，推断规则被迫写在前端（历史上还
+// 出现过厂商字面量）。准入事实只存在于驱动/定义目录一侧，Core 不解释、
+// 前端不猜。
+enum BrowseSelectionMode {
+  // 未声明：IPC < 1.8 的旧驱动（或本就不需要选择契约的驱动）的默认值。
+  //
+  // 语义与新增字段之前**完全一致**：普通资源浏览沿用既有通用规则继续可用；
+  // 语义载荷因为「没有权威准入结论」一律不可选用（fail-closed，且必须可见）。
+  // **不得**把 0 解释成「不可选」——那会让所有旧驱动的浏览树一次性失效。
+  BROWSE_SELECTION_MODE_UNSPECIFIED = 0;
+
+  // 通用资源叶：载荷是 Mesa 通用资源选择（`resource_id` + `parameters`），
+  // 任何通用前端都能回填，无需驱动语义层参与。
+  BROWSE_SELECTION_MODE_RESOURCE = 1;
+
+  // 语义载荷叶：载荷只对**该驱动自己的**语义层有意义（点位 kind、语义参数、
+  // 身份块等）。Core 与通用 UI 只透传，不解释。
+  BROWSE_SELECTION_MODE_SEMANTIC = 2;
+
+  // 明确不可选用：分支节点、诊断节点、以及**被驱动准入规则拒绝**的叶
+  //（例如定义目录 `scope` 不允许采集）。理由写在 `diagnostics` 里。
+  BROWSE_SELECTION_MODE_NOT_SELECTABLE = 3;
+}
+
+// 诊断严重级别：**只影响展示样式，永不授予选用权限**。
+// 是否可选用只由 `BrowseSelectionMode` 决定；未知级别按最保守的方式展示。
+enum BrowseDiagnosticSeverity {
+  BROWSE_DIAGNOSTIC_SEVERITY_UNSPECIFIED = 0;
+  BROWSE_DIAGNOSTIC_SEVERITY_INFO = 1;
+  BROWSE_DIAGNOSTIC_SEVERITY_WARNING = 2;
+  BROWSE_DIAGNOSTIC_SEVERITY_ERROR = 3;
+}
+
+// 结构化诊断：稳定错误码 + 可读文案（一个节点可给多条）。
+//
+// `code` 是**驱动自定义的稳定标识符**（供测试与定位使用），Core 与通用 UI
+// 只把它当不透明字符串，不做枚举映射、不做文案改写。
+message BrowseSelectionDiagnostic {
+  string code = 1;
+  string message = 2;
+  BrowseDiagnosticSeverity severity = 3;
+}
+
 message BrowseNode {
   string id = 1;
   string label = 2;
@@ -344,8 +391,25 @@ message BrowseNode {
   string data_type = 4;
   string access = 5;
   bool has_children = 6;
-  // 选中后生成 ResourceSelection 的 binding 片段（JSON 字符串），由前端透传
+  // 选中后生成 ResourceSelection 的 binding 片段（JSON 字符串），由前端透传。
+  // IPC 1.8 起：语义/资源载荷的**规范位置**是 `selection_payload_json`；本字段
+  // 保留原样供旧客户端继续消费（新驱动同时填两处，内容一致）。
   string binding_json = 7;
+
+  // IPC 1.8 additive（tag 8/9/10）：选择契约。旧驱动不填 ⇒ 0 / "" / 空，
+  // 行为与 1.7 完全一致。新字段编号一律新分配，不复用既有编号。
+  //
+  // 选择模式：见 `BrowseSelectionMode`。未声明(0)不是「不可选」。
+  BrowseSelectionMode selection_mode = 8;
+  // 不透明选择载荷（JSON 字符串，格式由驱动定义，Core 不解释）。
+  // 载荷畸形 ⇒ 消费方必须**明确阻断并可见**，不得回退到 `binding_json`。
+  //
+  // 两种模式的约定形态（只是约定，Core 不校验）：
+  // - RESOURCE：`{"resource_id": "...", "parameters": {...}}`
+  // - SEMANTIC：驱动私有语义信封
+  string selection_payload_json = 9;
+  // 结构化诊断（可多条）：不可选原因 / 与身份相关的提示。
+  repeated BrowseSelectionDiagnostic diagnostics = 10;
 }
 
 message BrowseResponse {

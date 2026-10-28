@@ -333,3 +333,198 @@ async fn browse_sinumerik_nck_catalog_tree_e2e() {
         "必须给出身份键集合: {binding}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// IPC 1.8 Browse 选择契约：资格判定归驱动，Core 只透传
+// ---------------------------------------------------------------------------
+
+/// 选择模式取值（与 `proto/driver.proto` 的 `BrowseSelectionMode` 逐字对应）。
+///
+/// 这里刻意用数值断言：Core 透传的就是数值，前端解引用同一组数值。若哪天
+/// 有人调整枚举顺序，本文件会连同 `protocol_negotiation.rs` 的枚举冻结一起红。
+const MODE_UNSPECIFIED: i64 = 0;
+const MODE_RESOURCE: i64 = 1;
+const MODE_SEMANTIC: i64 = 2;
+const MODE_NOT_SELECTABLE: i64 = 3;
+
+/// NCK 语义 Browse：**可选性、载荷、诊断全部由驱动给出**，前端不再推断。
+///
+/// 关键判据（对应 Workstream B 的验收项）：
+/// ① 分支节点 = NOT_SELECTABLE 且无理由（不该出现红色阻断）；
+/// ② `scope=identity` 的叶由驱动判为 NOT_SELECTABLE，码与 Configure 拒绝码
+///    同源（`DEFINITION_SCOPE_NOT_COLLECTABLE`）——这正是"资格判定搬到
+///    driver/catalog 拥有者"的直接证据；
+/// ③ `scope=collect` 的叶 = SEMANTIC，载荷与 `binding_json` 逐字一致，
+///    诊断只承载展示性提示（INFO/WARNING，不改变可选性）。
+#[tokio::test]
+async fn browse_selection_contract_is_owned_by_driver() {
+    let _guard = BROWSE_SERIAL.lock().await;
+    let (app, ep) = app_with_endpoint(
+        "sinumerik-nck",
+        serde_json::json!({"host":"127.0.0.1","family":"828d","local_tsap":256,"remote_tsap":258}),
+    )
+    .await;
+
+    // ① 根：模板入口 + 身份入口（828d 有探针）都是不可选分支
+    let root = browse_json(&app, &ep, r#"{"parent":"","limit":10}"#).await;
+    for node in root["nodes"].as_array().unwrap() {
+        assert_eq!(
+            node["selection_mode"].as_i64().unwrap(),
+            MODE_NOT_SELECTABLE,
+            "分支节点必须由驱动声明不可选: {node}"
+        );
+        assert_eq!(
+            node["diagnostics"].as_array().unwrap().len(),
+            0,
+            "分支节点不应带红色阻断理由: {node}"
+        );
+    }
+
+    // ② 模板列表：逐条核对「驱动给出的模式」与「定义目录的 scope」一致
+    let presets = browse_json(&app, &ep, r#"{"parent":"nck://presets","limit":50}"#).await;
+    let leaves = presets["nodes"].as_array().unwrap();
+    assert!(!leaves.is_empty(), "828d 应有模板叶");
+    let identity_leaf = leaves
+        .iter()
+        .find(|n| n["id"].as_str().unwrap().contains("MDCA_CTRLOUT_TYPE"))
+        .expect("identity 探针模板必须出现（默认可见）");
+    assert_eq!(
+        identity_leaf["selection_mode"].as_i64().unwrap(),
+        MODE_NOT_SELECTABLE,
+        "scope=identity 必须由驱动判为不可选: {identity_leaf}"
+    );
+    let diag = &identity_leaf["diagnostics"].as_array().unwrap()[0];
+    assert_eq!(
+        diag["code"], "DEFINITION_SCOPE_NOT_COLLECTABLE",
+        "诊断码必须与 Configure 拒绝码同源: {identity_leaf}"
+    );
+    assert_eq!(diag["severity"].as_i64().unwrap(), 3, "拒绝必须是 ERROR 级");
+    assert!(
+        diag["message"].as_str().unwrap().contains("scope="),
+        "诊断文案必须说清是哪条准入规则: {diag}"
+    );
+
+    let collect_leaf = leaves
+        .iter()
+        .find(|n| {
+            n["id"]
+                .as_str()
+                .unwrap()
+                .ends_with("828d.B.S.opMode.nc_variable")
+        })
+        .expect("可采集模板 opMode 必须出现");
+    assert_eq!(
+        collect_leaf["selection_mode"].as_i64().unwrap(),
+        MODE_SEMANTIC,
+        "scope=collect 的语义叶必须声明 SEMANTIC: {collect_leaf}"
+    );
+    assert_eq!(
+        collect_leaf["selection_payload_json"], collect_leaf["binding_json"],
+        "选择载荷与 binding_json 必须同内容（旧客户端继续读 binding_json）"
+    );
+    let notes = collect_leaf["diagnostics"].as_array().unwrap();
+    assert_eq!(notes.len(), 1, "可选叶只应有一条展示性提示: {collect_leaf}");
+    assert!(
+        ["IDENTITY_PREVIEW", "IDENTITY_UNRESOLVED"].contains(&notes[0]["code"].as_str().unwrap()),
+        "提示码必须是驱动定义的展示级诊断: {notes:?}"
+    );
+    assert!(
+        notes[0]["severity"].as_i64().unwrap() <= 2,
+        "提示级诊断不得是 ERROR（那会把它变成阻断）: {notes:?}"
+    );
+
+    // ③ 语义载荷本身仍是驱动私有的：Core 原样搬运，不解析、不改写
+    let payload = collect_leaf["selection_payload_json"].as_str().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed["kind"], "nck_variable");
+    assert_eq!(parsed["parameters"]["definition_revision"], 1);
+}
+
+/// OPC UA：通用资源叶由驱动声明 **RESOURCE**，载荷就是 canonical selection
+///（`resource_id` + `parameters`），通用前端无需任何语义层即可回填。
+#[tokio::test]
+async fn browse_opcua_declares_resource_selection_mode() {
+    let _guard = BROWSE_SERIAL.lock().await;
+    let (app, ep) = app_with_endpoint("opcua", fake_opcua_connection()).await;
+    let v = browse_json(&app, &ep, r#"{"parent":"","limit":5}"#).await;
+    let nodes = v["nodes"].as_array().unwrap();
+    assert!(!nodes.is_empty(), "OPC UA Fake 应能浏览出节点: {v}");
+    for node in nodes {
+        assert_eq!(
+            node["selection_mode"].as_i64().unwrap(),
+            MODE_RESOURCE,
+            "OPC UA 的浏览叶是通用资源叶: {node}"
+        );
+        assert_ne!(
+            node["selection_mode"].as_i64().unwrap(),
+            MODE_UNSPECIFIED,
+            "in-tree 驱动必须显式声明选择契约，不得留 UNSPECIFIED: {node}"
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(node["selection_payload_json"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["resource_id"], "node", "资源 id 必须显式给出");
+        assert!(
+            payload["parameters"]["node_id"].as_str().is_some(),
+            "资源参数必须显式给出: {payload}"
+        );
+        assert_eq!(
+            node["diagnostics"].as_array().unwrap().len(),
+            0,
+            "可选叶不应有阻断诊断: {node}"
+        );
+        // 旧客户端仍读 binding_json：两条通路必须同源（node_id 一致）。
+        let legacy: serde_json::Value =
+            serde_json::from_str(node["binding_json"].as_str().unwrap()).unwrap();
+        assert_eq!(legacy["node_id"], payload["parameters"]["node_id"]);
+    }
+}
+
+/// Core 的 Browse 透传层**不含任何品牌/协议判断**（AGENTS.md「Core 不懂协议」）。
+///
+/// 源码级断言：`browse_nodes_json` 只做字段搬运，一旦有人在那里加 `if` 分支，
+/// 必然要写出厂商字面量或选择模式的字符串名，本断言就会红。
+#[test]
+fn core_browse_passthrough_has_no_vendor_literals() {
+    let path = common::repo_root()
+        .join("crates")
+        .join("core-api")
+        .join("src")
+        .join("lib.rs");
+    let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    // 只看透传函数本体，避免把契约测试的注释算进来。
+    let start = src
+        .find("fn browse_nodes_json")
+        .expect("core-api 必须提供 browse_nodes_json 透传函数");
+    let body = &src[start..];
+    let end = body
+        .find("\nasync fn browse_endpoint")
+        .unwrap_or(body.len());
+    let body = &body[..end];
+    for forbidden in [
+        "sinumerik",
+        "nck_variable",
+        "nck_native",
+        "focas2",
+        "opcua",
+        "BROWSE_SELECTION_MODE_",
+        "semantic",
+        "not_selectable",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "Core 的 Browse 透传层不得出现 `{forbidden}`（Core 不懂协议）"
+        );
+    }
+}
+
+/// Browse 请求 → JSON（本文件内的薄封装，避免每处重写 Request 构造）。
+async fn browse_json(app: &axum::Router, ep_id: &str, body: &str) -> serde_json::Value {
+    let req = Request::builder()
+        .uri(format!("/api/v1/endpoints/{ep_id}/browse"))
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_browse_ok(resp, "browse").await
+}

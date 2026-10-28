@@ -16,6 +16,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let proto_root = manifest.join("../../proto");
 
+    // 必须显式声明依赖：`proto/` 不在本 crate 目录下，cargo 默认的「包内文件
+    // 变更即重跑」覆盖不到它。缺这一行时，**只改 proto 不会触发重新生成**，
+    // `pb` 模块会静默沿用旧代码（wire 字段看起来"没生效"却不报错）——这与
+    // 「旧二进制让故障注入静默失效」是同一类陷阱，只是发生在代码生成层。
+    println!(
+        "cargo:rerun-if-changed={}",
+        proto_root.join("driver.proto").display()
+    );
+    println!("cargo:rerun-if-changed=build.rs");
+
     prost_build::Config::new().compile_protos(&[proto_root.join("driver.proto")], &[proto_root])?;
     Ok(())
 }

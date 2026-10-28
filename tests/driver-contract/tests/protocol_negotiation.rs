@@ -326,7 +326,6 @@ const FROZEN_MESSAGE_FIELDS: &[&str] = &[
     "GetDescriptor:",
     "DescriptorReport: uint32 contract_major = 1 | uint32 contract_minor = 2 | string descriptor_json = 3",
     "BrowseRequest: uint32 connection_handle = 1 | string parent = 2 | string filter = 3 | string cursor = 4 | uint32 limit = 5",
-    "BrowseNode: string id = 1 | string label = 2 | string kind = 3 | string data_type = 4 | string access = 5 | bool has_children = 6 | string binding_json = 7",
     "BrowseResponse: repeated BrowseNode nodes = 1 | string next_cursor = 2 | GenericResult result = 3",
     "WriteRequest: uint32 connection_handle = 1 | string request_id = 2 | string target = 3 [deprecated = true] | ValueMsg value = 4 | optional ValueMsg expected_value = 5 | string resource_id = 6 | string parameters_json = 7 | string output = 8",
     "WriteResponse: string request_id = 1 | GenericResult result = 2 | optional ValueMsg readback = 3",
@@ -366,6 +365,54 @@ const ADDITIVE_MESSAGES: [(&str, &[&str]); 4] = [
         "PreviewIdentityReport",
         &["GenericResult result = 1", "string result_json = 2"],
     ),
+];
+
+/// `BrowseNode` 的**既有** 7 字段（IPC 1.7 及之前）逐字冻结。
+///
+/// 单独成表的原因：这是**唯一**一个被 additive 增补过的既有 message。既有字段
+/// 必须逐字不动，新字段只能**追加**在后面（编号新分配），两条口径分开断言，
+/// 避免「新字段插进中间」这类看似合法、实则改变 wire 布局的改动蒙混过关。
+const FROZEN_BROWSE_NODE_LEGACY_FIELDS: [&str; 7] = [
+    "string id = 1",
+    "string label = 2",
+    "string kind = 3",
+    "string data_type = 4",
+    "string access = 5",
+    "bool has_children = 6",
+    "string binding_json = 7",
+];
+
+/// `BrowseNode` 的 additive 增补（IPC 1.8）：字段名 / 类型 / 编号 / 顺序逐字冻结。
+const BROWSE_NODE_ADDITIVE_FIELDS: [&str; 3] = [
+    "BrowseSelectionMode selection_mode = 8",
+    "string selection_payload_json = 9",
+    "repeated BrowseSelectionDiagnostic diagnostics = 10",
+];
+
+/// IPC 1.8 新增的 message 字段形状（逐字）。
+const BROWSE_SELECTION_MESSAGES: [(&str, &[&str]); 1] = [(
+    "BrowseSelectionDiagnostic",
+    &[
+        "string code = 1",
+        "string message = 2",
+        "BrowseDiagnosticSeverity severity = 3",
+    ],
+)];
+
+/// IPC 1.8 新增枚举的**取值**逐字冻结。
+///
+/// `=_0` 的语义是向后兼容的根基：旧驱动不填 ⇒ 0 ⇒ 消费方按 1.7 行为处理。
+/// 一旦有人把 `UNSPECIFIED` 挪到 1，所有旧驱动的浏览树会一次性变成「未知
+/// 模式」——这条断言就是拦它的。
+const BROWSE_SELECTION_ENUM_LINES: [&str; 8] = [
+    "BROWSE_SELECTION_MODE_UNSPECIFIED = 0;",
+    "BROWSE_SELECTION_MODE_RESOURCE = 1;",
+    "BROWSE_SELECTION_MODE_SEMANTIC = 2;",
+    "BROWSE_SELECTION_MODE_NOT_SELECTABLE = 3;",
+    "BROWSE_DIAGNOSTIC_SEVERITY_UNSPECIFIED = 0;",
+    "BROWSE_DIAGNOSTIC_SEVERITY_INFO = 1;",
+    "BROWSE_DIAGNOSTIC_SEVERITY_WARNING = 2;",
+    "BROWSE_DIAGNOSTIC_SEVERITY_ERROR = 3;",
 ];
 
 /// proto 块栈：只区分消息 / 枚举 / oneof 三类（本文件没有嵌套消息）。
@@ -579,11 +626,20 @@ fn protocol_additive_fields_do_not_alter_existing_messages() {
         "新增 tag 集合必须恰为 {{45,46,47,48}}"
     );
 
-    // ④ 全部既有 message 的字段逐字不变 + 新增 4 个 message 形状正确
+    // ④ 全部既有 message 的字段逐字不变 + 新增 message 形状正确
+    //
+    // `BrowseNode` 是唯一被 additive 增补过的既有 message：既有 7 字段进
+    // `existing` 参与逐字比对，追加的 3 字段单独比对（见 ④b），因此这里只把
+    // 既有 7 字段拼进 `existing`，避免「新字段混进既有序列」被当成合法。
     let mut existing: Vec<String> = Vec::new();
     let mut additive: Vec<(String, Vec<String>)> = Vec::new();
+    let mut browse_node: Option<Vec<String>> = None;
     for (name, fields) in &model.messages {
-        if ADDITIVE_MESSAGES.iter().any(|(n, _)| n == name) {
+        if name == "BrowseNode" {
+            browse_node = Some(fields.clone());
+        } else if ADDITIVE_MESSAGES.iter().any(|(n, _)| n == name)
+            || BROWSE_SELECTION_MESSAGES.iter().any(|(n, _)| n == name)
+        {
             additive.push((name.clone(), fields.clone()));
         } else if fields.is_empty() {
             existing.push(format!("{name}:"));
@@ -593,9 +649,43 @@ fn protocol_additive_fields_do_not_alter_existing_messages() {
     }
     assert_eq!(
         model.messages.len(),
-        60,
-        "顶层 message 数 = 56 + 4（含 Envelope）"
+        61,
+        "顶层 message 数 = 56 + 4（I-2）+ 1（IPC 1.8 BrowseSelectionDiagnostic，含 Envelope）"
     );
+
+    // ④b `BrowseNode`：前 7 字段逐字冻结 + 追加 3 字段逐字冻结（顺序不可换）
+    let browse_node = browse_node.expect("必须存在 BrowseNode");
+    assert_eq!(
+        browse_node.len(),
+        10,
+        "BrowseNode 必须恰有 7 个既有字段 + 3 个 IPC 1.8 增补字段，实测 {browse_node:?}"
+    );
+    assert_eq!(
+        browse_node[..7].to_vec(),
+        FROZEN_BROWSE_NODE_LEGACY_FIELDS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>(),
+        "BrowseNode 既有 7 字段的编号/类型必须逐字不变"
+    );
+    assert_eq!(
+        browse_node[7..].to_vec(),
+        BROWSE_NODE_ADDITIVE_FIELDS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>(),
+        "BrowseNode 的增补字段必须追加在 7 之后，且名字/类型/编号逐字一致"
+    );
+    // 增补字段编号必须**新分配**：不得复用 1..=7，也不得出现重复 tag。
+    let mut tags: Vec<u32> = browse_node
+        .iter()
+        .map(|f| split_field(f).3)
+        .collect::<Vec<_>>();
+    tags.sort_unstable();
+    let before = tags.len();
+    tags.dedup();
+    assert_eq!(before, tags.len(), "BrowseNode 字段编号不得重复");
+    assert_eq!(tags, (1u32..=10).collect::<Vec<_>>(), "编号必须恰为 1..=10");
 
     // ⑤ `GetDefinitions` 的请求参数必须**在 wire 上有承载位置**：恰 1 个字段，
     //    名为 `request_json`、类型 `string`、编号 `1`。
@@ -651,6 +741,29 @@ fn protocol_additive_fields_do_not_alter_existing_messages() {
             found.1, expected,
             "新增 message {name} 的字段形状必须与设计逐字一致"
         );
+    }
+    // IPC 1.8：新增 1 个 message + 2 个枚举，取值逐字冻结。
+    for (name, expected) in BROWSE_SELECTION_MESSAGES {
+        let found = additive
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("缺少新增 message {name}"));
+        assert_eq!(
+            found.1, expected,
+            "新增 message {name} 的字段形状必须与设计逐字一致"
+        );
+    }
+    for line in BROWSE_SELECTION_ENUM_LINES {
+        assert!(
+            src.contains(line),
+            "proto 必须逐字包含枚举取值 `{line}`（0 = 未声明是向后兼容的根基）"
+        );
+    }
+    for decl in [
+        "enum BrowseSelectionMode {",
+        "enum BrowseDiagnosticSeverity {",
+    ] {
+        assert!(src.contains(decl), "proto 必须声明 `{decl}`");
     }
 
     // 旁证：全文件仍只有 2 个 oneof（Envelope.body + ValueMsg.kind）
@@ -948,16 +1061,25 @@ async fn negotiated_minor_semantics_unchanged() {
     assert!(negotiated >= mesa_driver_protocol::TASK_SCHEDULE_MIN_MINOR);
     assert!(negotiated >= mesa_driver_protocol::CONTROL_MODEL_MIN_MINOR);
 
-    // ④ 新增的 I-2 门在 6 上必须关闭
+    // ④ 新增的 I-2 门在 6 上必须关闭；IPC 1.8 的 Browse 选择契约门同样关闭
+    //    （旧驱动不会填 tag 8/9/10 ⇒ 消费方必须按"未声明"处理）。
     assert_eq!(
-        DEFINITIONS_RPC_MIN_MINOR, PROTOCOL_MINOR,
-        "门控常量必须等于引入该 RPC 的 Minor"
+        DEFINITIONS_RPC_MIN_MINOR, 7,
+        "I-2 门控常量必须停在引入该 RPC 的 Minor（不得随 Minor 8 bump 漂移）"
     );
     assert!(
         !definitions_query_supported(negotiated),
         "negotiated_minor=6 时 I-2 RPC 必须判为不支持"
     );
     assert!(definitions_query_supported(PROTOCOL_MINOR));
+    assert_eq!(mesa_driver_protocol::BROWSE_SELECTION_MIN_MINOR, 8);
+    assert!(
+        !mesa_driver_protocol::browse_selection_supported(negotiated),
+        "negotiated_minor=6 时不得声称对端会填选择契约字段"
+    );
+    assert!(mesa_driver_protocol::browse_selection_supported(
+        PROTOCOL_MINOR
+    ));
 
     // ⑤ 既有消息集在本会话上照常工作（Ping 往返）
     let pong = session
