@@ -198,10 +198,24 @@
       "notes": [
         "该文档为现有 42 条定义中 16 条 manual 来源所引用，但尚未取得",
         "取得后须实测文档号与版本，不得据文件名推断",
-        "PDF 同样不入库"
+        "PDF 同样不入库",
+        "已定位到西门子官方在线 PDF，且在线索引首页确认产品、软件版本、03/2025 与文档号 A5E53370586B AC；本工作分支未取得 PDF 本地字节，故 file_present 仍为 false、sha256 仍为 null，不冒称本地文件身份已核验。",
+        "官方链接：https://support.industry.siemens.com/cs/attachments/109988266/828D_ncvar_lists_man_0325_en-US.pdf"
       ],
       "committed_to_git": false,
-      "requested_by_review": "D3"
+      "requested_by_review": "D3",
+      "official_url": "https://support.industry.siemens.com/cs/attachments/109988266/828D_ncvar_lists_man_0325_en-US.pdf",
+      "online_verification": {
+        "title": "NC variables",
+        "document_type": "List Manual",
+        "product": "SINUMERIK 828D",
+        "software_version": "CNC software, version 5.25",
+        "version": "03/2025",
+        "document_number": "A5E53370586B AC",
+        "pages": 1262,
+        "source": "Siemens Industry Online Support",
+        "status": "official_online_content_verified_local_file_and_sha256_pending"
+      }
     }
   ],
   "known_version_divergence": {
