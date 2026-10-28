@@ -12,12 +12,10 @@
     "checked_at_commit": "c3945847dcc196e8cb969f08fe71b7b397edfd8d",
     "manuals_dir": "docs/reference/manuals",
     "expected_file_count": 4,
-    "present_file_count": 3,
-    "missing_files": [
-      "<待获取> Siemens 828D NC variables 03/2025 A5E53370586B AC"
-    ],
-    "documents_file_present_true": 3,
-    "documents_file_present_false": 1,
+    "present_file_count": 4,
+    "missing_files": [],
+    "documents_file_present_true": 4,
+    "documents_file_present_false": 0,
     "all_documents_file_present_consistent": true,
     "git_tracked_pdf_count": 0,
     "gitignore_rule": ".gitignore:76-77 → docs/reference/manuals/*.pdf / *.PDF",
@@ -29,7 +27,7 @@
       "可重复校验：python docs/reference/check-manual-metadata.py（校验本节与 documents[] 是否再次出现自相矛盾）",
       "第 4 份文档按评审裁决 D3 登记为待获取；本文件如实区分「已在位」与「待获取」，不把待获取计入在位数量。"
     ],
-    "conclusion": "已在位 3 份（6FC5397-5FP40-0RA6、6FC5397-4DP40-6RA6、A5E53014702F AA），待获取 1 份（A5E53370586B AC）。在位者文档号/版本/页数/SHA 均已实测确认；待获取者为评审裁决 D3 要求的二零二五年三月 NC 变量文档，未取得前相关 13 条定义保留 not_found，不得推测补齐。",
+    "conclusion": "四份文档全部在位，文档号/版本/页数/SHA-256 均已实测确认（1236 / 690 / 1414 / 1262 页）。待获取数量为 0。",
     "historical_note": "上一轮（HEAD 047e206 时）本节的结论是“仓库与工作区都找不到 PDF、三条记录一律标为不存在”；随后 PDF 到位，并在 commit c394584 用 pypdf 实测补入 documents[]，但本节未同步，形成文档内自相矛盾（本节说没有文件、逐条记录却说有）。本轮（同一 commit 下）重写本节，使 file_presence_audit 与逐条 documents[].file_present 取自同一轮实际检查结果；并由 docs/reference/check-manual-metadata.py 的 B 组检查项机械防回归。",
     "expected_path_policy": "PDF 统一存放于 docs/reference/manuals/（README.md 已固定该约定）；该目录内 PDF 被 gitignore 精确忽略，不入库。"
   },
@@ -176,31 +174,26 @@
     },
     {
       "id": "nc-variables-032025",
-      "file_name": "<待获取> Siemens 828D NC variables 03/2025 A5E53370586B AC",
+      "file_name": "828D_ncvar_lists_man_0325_en-US.pdf",
       "document_number": "A5E53370586B AC",
       "series": "828D",
       "expected_version": "03/2025",
-      "language": "de/en（待确认）",
-      "file_present": false,
-      "sha256": null,
-      "size_bytes": null,
-      "expected_path": null,
-      "status": "pending_file",
+      "language": "en-US",
+      "file_present": true,
+      "sha256": "1274440ed70ef00e82d5f3560e38558740139fa6337405c75df4f0bea1eb5ed1",
+      "size_bytes": 6502677,
+      "expected_path": "docs/reference/manuals/828D_ncvar_lists_man_0325_en-US.pdf",
+      "status": "file_present_sha_pagecount_verified",
       "scope": "NC 变量（OPI 变量）组：程序状态、运行方式、进给、主轴、轴位置、刀具号等",
-      "pending_fields": [
-        "file",
-        "sha256",
-        "pages",
-        "document_number_verified_from_pdf",
-        "version_verified_from_pdf"
-      ],
+      "pending_fields": [],
       "planned_use": "补齐 13 条 not_found 定义的原始来源追溯",
       "notes": [
-        "该文档为现有 42 条定义中 16 条 manual 来源所引用，但尚未取得",
         "取得后须实测文档号与版本，不得据文件名推断",
         "PDF 同样不入库",
         "已定位到西门子官方在线 PDF，且在线索引首页确认产品、软件版本、03/2025 与文档号 A5E53370586B AC；本工作分支未取得 PDF 本地字节，故 file_present 仍为 false、sha256 仍为 null，不冒称本地文件身份已核验。",
-        "官方链接：https://support.industry.siemens.com/cs/attachments/109988266/828D_ncvar_lists_man_0325_en-US.pdf"
+        "官方链接：https://support.industry.siemens.com/cs/attachments/109988266/828D_ncvar_lists_man_0325_en-US.pdf",
+        "已于本地到位并实测核验：文档号、版本、页数、SHA-256 均来自 PDF 首页与实际文件计算。",
+        "注意：本文件自述为 List Manual（列表手册），与三份 07/2023 的「参数手册」措辞不同，命名差异属实。"
       ],
       "committed_to_git": false,
       "requested_by_review": "D3",
@@ -215,6 +208,17 @@
         "pages": 1262,
         "source": "Siemens Industry Online Support",
         "status": "official_online_content_verified_local_file_and_sha256_pending"
+      },
+      "verified": {
+        "pages": 1262,
+        "pdf_title": "NC variables",
+        "pdf_author": "Siemens Aktiengesellschaft",
+        "pdf_subject": "SINUMERIK 828D",
+        "pdf_creation_date": "D:20250120121910+01'00'",
+        "page1_text_head": "SINUMERIK SINUMERIK 828D NC variables List Manual Valid for: Control SINUMERIK 828D Software CNC software, version 5.25 03/2025 A5E53370586B AC Introduction 1 Fundamental safety instructions 2 Overview 3 Explanations on the NC variables 4 NC variables 5 Appendix A",
+        "document_number_seen_in_pdf": true,
+        "version_seen_in_pdf": true,
+        "self_described_as": "List Manual"
       }
     }
   ],
