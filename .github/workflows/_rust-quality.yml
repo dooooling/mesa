@@ -45,6 +45,14 @@ jobs:
       - name: NCK definition lock self-test
         run: python3 tools/ci/test_nck_definition_lock.py
 
+      # NCK 原生地址证据矩阵：六条规则（出处 / 自相矛盾 / 语义越界 / 三类证据分离 /
+      # 基线完整性 / unresolved 真实性）。先跑负向自测，再校验真实矩阵。
+      - name: NCK address evidence validator self-test
+        run: python3 tools/ci/test_nck_address_evidence.py
+
+      - name: NCK address evidence matrix
+        run: python3 tools/ci/nck_address_evidence.py
+
       # 已发布 (variable_id, revision) 不可原地修改：普通 CI（重算当前文件 vs 当前
       # Lock）挡不住「同时改定义与 Lock」，因此必须对照 PR base 的 Lock 比对。
       - name: NCK definition lock vs PR base

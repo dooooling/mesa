@@ -1,12 +1,36 @@
 {
-  "schema_version": 1,
-  "purpose": "Separate NCK wire-format evidence, manual semantic evidence, and live-device observations. This matrix does not certify address mappings beyond the evidence stated per row.",
+  "schema_version": 2,
+  "purpose": "Separate NCK wire-format evidence, Siemens manual semantic evidence, and live-device observations. This matrix does not certify address mappings beyond the evidence stated per row; each row names the evidence class that carries each claim, and no manual semantic match is accepted as proof of a native module value.",
   "baseline": {
     "main_commit": "dae035ea7b7f683d7b51fffc5f1637aeac8e7bec",
+    "r1_path": "drivers/sinumerik-nck/definitions/828d/r1.json",
     "r1_blob_sha1": "3c0abe67cbcb64b525cddec1584e6e1747e0f062",
     "real_828d_test_in_this_change": false
   },
+  "evidence_classes": {
+    "protocol_layout": {
+      "definition": "Wire encoding facts (field order/width/endianness) taken from an independent protocol decoder; says where a field is, never what value a block must use.",
+      "sources": [
+        "Wireshark epan/dissectors/packet-s7comm.c: s7comm_decode_param_item / s7comm_syntaxid_nck",
+        "drivers/sinumerik-nck/src/codec.rs"
+      ]
+    },
+    "manual_semantic": {
+      "definition": "Siemens manual statements about variable meaning and column/lookup names; never a source for the native module byte.",
+      "sources": [
+        "SINUMERIK 828D NC variables List Manual A5E53370586B AC 03/2025 (local PDF, not committed)"
+      ]
+    },
+    "device_observation": {
+      "definition": "Accepted request/response bytes from one real controller recorded in a committed transcript; one device is not a universal mapping rule.",
+      "sources": [
+        "docs/evidence/nck-live-samples-probe.txt",
+        "drivers/sinumerik-nck/tests/live_samples_probe.rs"
+      ]
+    }
+  },
   "wire_layout": {
+    "evidence_class": "protocol_layout",
     "source_symbol": "Wireshark epan/dissectors/packet-s7comm.c: s7comm_decode_param_item / s7comm_syntaxid_nck",
     "repo_source": "drivers/sinumerik-nck/src/codec.rs",
     "format": {
@@ -42,6 +66,15 @@
           "offset": 3,
           "width": 1,
           "expression": "(area << 5) | unit",
+          "area_letters": {
+            "N": 0,
+            "B": 1,
+            "C": 2,
+            "A": 3,
+            "T": 4,
+            "V": 5,
+            "H": 6
+          },
           "evidence_class": "protocol_layout"
         },
         {
@@ -77,66 +110,587 @@
   "block_observations": [
     {
       "block": "S",
+      "evidence_class": "device_observation",
+      "canonical_variable_id": "channel.program.status",
+      "status": "observed",
+      "confidence_class": "single_device_observation",
       "module_decimal": 127,
       "module_hex": "0x7f",
-      "raw_request_example": "12 08 82 41 00 0d 00 01 7f 01",
+      "module_value_source": {
+        "evidence_class": "device_observation",
+        "ref": "docs/evidence/nck-live-samples-probe.txt:8",
+        "note": "模块字节只由该行真机请求字节解出；无规格/手册来源（见 unresolved module-value-authority）。"
+      },
+      "protocol_layout": {
+        "evidence_class": "protocol_layout",
+        "source_symbol": "Wireshark epan/dissectors/packet-s7comm.c: s7comm_decode_param_item / s7comm_syntaxid_nck",
+        "repo_source": "drivers/sinumerik-nck/src/codec.rs:73",
+        "note": "字段位置/宽度/字节序来自协议解码器逆序，仅说明 module 字段在哪，不说明其取值。"
+      },
+      "manual_semantic": {
+        "evidence_class": "manual_semantic",
+        "document": {
+          "title": "SINUMERIK 828D NC variables List Manual",
+          "document_number": "A5E53370586B AC",
+          "version": "03/2025",
+          "sha256": "1274440ed70ef00e82d5f3560e38558740139fa6337405c75df4f0bea1eb5ed1"
+        },
+        "page": null,
+        "lookup_status": "document_level_only",
+        "proves_module": false,
+        "note": "手册只提供变量语义与列索引；不提供 native module 字节，也不逐条记录页码（见 manual-entry-page-traceability）。"
+      },
+      "device_observation": {
+        "evidence_class": "device_observation",
+        "probe_test": "drivers/sinumerik-nck/tests/live_samples_probe.rs",
+        "golden_test": "drivers/sinumerik-nck/tests/block_wire_golden.rs",
+        "response_status": "GOOD",
+        "observation_is_historical": true,
+        "device": {
+          "model": "SINUMERIK 828D",
+          "host": "192.168.15.60",
+          "port": 102,
+          "pdu_length": 480,
+          "software_version": null
+        },
+        "decoded": {
+          "spec_type": 18,
+          "spec_length": 8,
+          "syntax_id": 130,
+          "area_index": 2,
+          "area": "C",
+          "area_no": 1,
+          "column": 13,
+          "line": 1,
+          "module": 127,
+          "line_count": 1
+        }
+      },
       "sample_ref": "docs/evidence/nck-live-samples-probe.txt",
       "sample_lines": [
-        5
+        8
       ],
-      "status": "observed",
-      "claim_scope": "Observed accepted request for channel.program.status in one real-device sample; not a universal mapping proof."
+      "raw_request_example": "12 08 82 41 00 0d 00 01 7f 01",
+      "additional_observations": [
+        {
+          "variable": "actFeedRateIpo",
+          "sample_line": 9,
+          "area": "C",
+          "area_no": 1,
+          "column": 1,
+          "line": 1,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 01 00 01 7f 01",
+          "note": "同一 block 另一列（column 1），证明 module 字节不随列变化。"
+        }
+      ],
+      "claim_scope": "Observed accepted request for channel.program.status in one real-device sample; not a universal mapping proof.",
+      "unresolved": [
+        "module-value-authority",
+        "area-no-mapping",
+        "manual-entry-page-traceability",
+        "device-software-version",
+        "hardware-validation"
+      ]
     },
     {
       "block": "RP",
+      "evidence_class": "device_observation",
+      "canonical_variable_id": "channel.r_parameter",
+      "status": "observed",
+      "confidence_class": "single_device_observation",
       "module_decimal": 21,
       "module_hex": "0x15",
-      "raw_request_example": "12 08 82 41 00 01 00 01 15 01",
+      "module_value_source": {
+        "evidence_class": "device_observation",
+        "ref": "docs/evidence/nck-live-samples-probe.txt:11",
+        "note": "模块字节只由该行真机请求字节解出；无规格/手册来源（见 unresolved module-value-authority）。"
+      },
+      "protocol_layout": {
+        "evidence_class": "protocol_layout",
+        "source_symbol": "Wireshark epan/dissectors/packet-s7comm.c: s7comm_decode_param_item / s7comm_syntaxid_nck",
+        "repo_source": "drivers/sinumerik-nck/src/codec.rs:73",
+        "note": "字段位置/宽度/字节序来自协议解码器逆序，仅说明 module 字段在哪，不说明其取值。"
+      },
+      "manual_semantic": {
+        "evidence_class": "manual_semantic",
+        "document": {
+          "title": "SINUMERIK 828D NC variables List Manual",
+          "document_number": "A5E53370586B AC",
+          "version": "03/2025",
+          "sha256": "1274440ed70ef00e82d5f3560e38558740139fa6337405c75df4f0bea1eb5ed1"
+        },
+        "page": null,
+        "lookup_status": "document_level_only",
+        "proves_module": false,
+        "note": "手册只提供变量语义与列索引；不提供 native module 字节，也不逐条记录页码（见 manual-entry-page-traceability）。"
+      },
+      "device_observation": {
+        "evidence_class": "device_observation",
+        "probe_test": "drivers/sinumerik-nck/tests/live_samples_probe.rs",
+        "golden_test": "drivers/sinumerik-nck/tests/block_wire_golden.rs",
+        "response_status": "GOOD",
+        "observation_is_historical": true,
+        "device": {
+          "model": "SINUMERIK 828D",
+          "host": "192.168.15.60",
+          "port": 102,
+          "pdu_length": 480,
+          "software_version": null
+        },
+        "decoded": {
+          "spec_type": 18,
+          "spec_length": 8,
+          "syntax_id": 130,
+          "area_index": 2,
+          "area": "C",
+          "area_no": 1,
+          "column": 1,
+          "line": 1,
+          "module": 21,
+          "line_count": 1
+        }
+      },
       "sample_ref": "docs/evidence/nck-live-samples-probe.txt",
       "sample_lines": [
-        7
+        11
       ],
-      "status": "observed",
-      "claim_scope": "Observed accepted request for R parameter in one real-device sample; not a universal mapping proof."
+      "raw_request_example": "12 08 82 41 00 01 00 01 15 01",
+      "additional_observations": [
+        {
+          "variable": "rpa (R1)",
+          "sample_line": 12,
+          "area": "C",
+          "area_no": 1,
+          "column": 1,
+          "line": 2,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 01 00 02 15 01",
+          "note": "line=2 对应 R1。"
+        },
+        {
+          "variable": "rpa (R99)",
+          "sample_line": 13,
+          "area": "C",
+          "area_no": 1,
+          "column": 1,
+          "line": 100,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 01 00 64 15 01",
+          "note": "line=100(0x64) 对应 R99，证明 line 字段按 R 号+1 编码。"
+        },
+        {
+          "variable": "rpa (R425)",
+          "sample_line": 14,
+          "area": "C",
+          "area_no": 1,
+          "column": 1,
+          "line": 426,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 01 01 aa 15 01",
+          "response_status": "ITEM_REJECTED 0x03",
+          "note": "设备回 ITEM_REJECTED 0x03：只证明请求编码（line=426=0x01aa 拆成两字节），不证明该 line 可读。"
+        }
+      ],
+      "claim_scope": "Observed accepted request for R parameters in one real-device sample; R425 was rejected, so the block read range is not established.",
+      "unresolved": [
+        "module-value-authority",
+        "area-no-mapping",
+        "manual-entry-page-traceability",
+        "device-software-version",
+        "hardware-validation"
+      ]
     },
     {
       "block": "SSP",
+      "evidence_class": "device_observation",
+      "canonical_variable_id": "spindle.speed.commanded",
+      "status": "observed",
+      "confidence_class": "single_device_observation",
       "module_decimal": 114,
       "module_hex": "0x72",
-      "raw_request_example": "12 08 82 41 00 03 00 01 72 01",
+      "module_value_source": {
+        "evidence_class": "device_observation",
+        "ref": "docs/evidence/nck-live-samples-probe.txt:34",
+        "note": "模块字节只由该行真机请求字节解出；无规格/手册来源（见 unresolved module-value-authority）。"
+      },
+      "protocol_layout": {
+        "evidence_class": "protocol_layout",
+        "source_symbol": "Wireshark epan/dissectors/packet-s7comm.c: s7comm_decode_param_item / s7comm_syntaxid_nck",
+        "repo_source": "drivers/sinumerik-nck/src/codec.rs:73",
+        "note": "字段位置/宽度/字节序来自协议解码器逆序，仅说明 module 字段在哪，不说明其取值。"
+      },
+      "manual_semantic": {
+        "evidence_class": "manual_semantic",
+        "document": {
+          "title": "SINUMERIK 828D NC variables List Manual",
+          "document_number": "A5E53370586B AC",
+          "version": "03/2025",
+          "sha256": "1274440ed70ef00e82d5f3560e38558740139fa6337405c75df4f0bea1eb5ed1"
+        },
+        "page": null,
+        "lookup_status": "document_level_only",
+        "proves_module": false,
+        "note": "手册只提供变量语义与列索引；不提供 native module 字节，也不逐条记录页码（见 manual-entry-page-traceability）。"
+      },
+      "device_observation": {
+        "evidence_class": "device_observation",
+        "probe_test": "drivers/sinumerik-nck/tests/live_samples_probe.rs",
+        "golden_test": "drivers/sinumerik-nck/tests/block_wire_golden.rs",
+        "response_status": "GOOD",
+        "observation_is_historical": true,
+        "device": {
+          "model": "SINUMERIK 828D",
+          "host": "192.168.15.60",
+          "port": 102,
+          "pdu_length": 480,
+          "software_version": null
+        },
+        "decoded": {
+          "spec_type": 18,
+          "spec_length": 8,
+          "syntax_id": 130,
+          "area_index": 2,
+          "area": "C",
+          "area_no": 1,
+          "column": 3,
+          "line": 1,
+          "module": 114,
+          "line_count": 1
+        }
+      },
       "sample_ref": "docs/evidence/nck-live-samples-probe.txt",
       "sample_lines": [
-        36
+        34
       ],
-      "status": "observed",
-      "claim_scope": "Observed accepted request for cmdSpeed in one real-device sample; not a universal mapping proof."
+      "raw_request_example": "12 08 82 41 00 03 00 01 72 01",
+      "additional_observations": [
+        {
+          "variable": "cmdSpeed (spindle 2)",
+          "sample_line": 35,
+          "area": "C",
+          "area_no": 1,
+          "column": 3,
+          "line": 2,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 03 00 02 72 01",
+          "note": "line=2 对应主轴 2。"
+        }
+      ],
+      "claim_scope": "Observed accepted request for cmdSpeed in one real-device sample; not a universal mapping proof.",
+      "unresolved": [
+        "module-value-authority",
+        "area-no-mapping",
+        "manual-entry-page-traceability",
+        "device-software-version",
+        "hardware-validation"
+      ]
     },
     {
       "block": "SGA",
+      "evidence_class": "device_observation",
+      "canonical_variable_id": "axis.position.commanded_mcs",
+      "status": "observed",
+      "confidence_class": "single_device_observation",
       "module_decimal": 115,
       "module_hex": "0x73",
-      "raw_request_example": "12 08 82 41 00 02 00 01 73 01",
+      "module_value_source": {
+        "evidence_class": "device_observation",
+        "ref": "docs/evidence/nck-live-samples-probe.txt:16",
+        "note": "模块字节只由该行真机请求字节解出；无规格/手册来源（见 unresolved module-value-authority）。"
+      },
+      "protocol_layout": {
+        "evidence_class": "protocol_layout",
+        "source_symbol": "Wireshark epan/dissectors/packet-s7comm.c: s7comm_decode_param_item / s7comm_syntaxid_nck",
+        "repo_source": "drivers/sinumerik-nck/src/codec.rs:73",
+        "note": "字段位置/宽度/字节序来自协议解码器逆序，仅说明 module 字段在哪，不说明其取值。"
+      },
+      "manual_semantic": {
+        "evidence_class": "manual_semantic",
+        "document": {
+          "title": "SINUMERIK 828D NC variables List Manual",
+          "document_number": "A5E53370586B AC",
+          "version": "03/2025",
+          "sha256": "1274440ed70ef00e82d5f3560e38558740139fa6337405c75df4f0bea1eb5ed1"
+        },
+        "page": null,
+        "lookup_status": "document_level_only",
+        "proves_module": false,
+        "note": "手册只提供变量语义与列索引；不提供 native module 字节，也不逐条记录页码（见 manual-entry-page-traceability）。"
+      },
+      "device_observation": {
+        "evidence_class": "device_observation",
+        "probe_test": "drivers/sinumerik-nck/tests/live_samples_probe.rs",
+        "golden_test": "drivers/sinumerik-nck/tests/block_wire_golden.rs",
+        "response_status": "GOOD",
+        "observation_is_historical": true,
+        "device": {
+          "model": "SINUMERIK 828D",
+          "host": "192.168.15.60",
+          "port": 102,
+          "pdu_length": 480,
+          "software_version": null
+        },
+        "decoded": {
+          "spec_type": 18,
+          "spec_length": 8,
+          "syntax_id": 130,
+          "area_index": 2,
+          "area": "C",
+          "area_no": 1,
+          "column": 2,
+          "line": 1,
+          "module": 115,
+          "line_count": 1
+        }
+      },
       "sample_ref": "docs/evidence/nck-live-samples-probe.txt",
       "sample_lines": [
-        21
+        16
       ],
-      "status": "observed",
-      "claim_scope": "Observed accepted request for actToolBasePos in one real-device sample; not a universal mapping proof."
+      "raw_request_example": "12 08 82 41 00 02 00 01 73 01",
+      "additional_observations": [
+        {
+          "variable": "actToolBasePos (axis 2)",
+          "sample_line": 17,
+          "area": "C",
+          "area_no": 1,
+          "column": 2,
+          "line": 2,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 02 00 02 73 01",
+          "note": "line=机床轴号，逐轴 1..8，module 字节恒定。"
+        },
+        {
+          "variable": "actToolBasePos (axis 3)",
+          "sample_line": 18,
+          "area": "C",
+          "area_no": 1,
+          "column": 2,
+          "line": 3,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 02 00 03 73 01",
+          "note": "line=机床轴号，逐轴 1..8，module 字节恒定。"
+        },
+        {
+          "variable": "actToolBasePos (axis 4)",
+          "sample_line": 19,
+          "area": "C",
+          "area_no": 1,
+          "column": 2,
+          "line": 4,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 02 00 04 73 01",
+          "note": "line=机床轴号，逐轴 1..8，module 字节恒定。"
+        },
+        {
+          "variable": "actToolBasePos (axis 5)",
+          "sample_line": 20,
+          "area": "C",
+          "area_no": 1,
+          "column": 2,
+          "line": 5,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 02 00 05 73 01",
+          "note": "line=机床轴号，逐轴 1..8，module 字节恒定。"
+        },
+        {
+          "variable": "actToolBasePos (axis 6)",
+          "sample_line": 21,
+          "area": "C",
+          "area_no": 1,
+          "column": 2,
+          "line": 6,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 02 00 06 73 01",
+          "note": "line=机床轴号，逐轴 1..8，module 字节恒定。"
+        },
+        {
+          "variable": "actToolBasePos (axis 7)",
+          "sample_line": 22,
+          "area": "C",
+          "area_no": 1,
+          "column": 2,
+          "line": 7,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 02 00 07 73 01",
+          "note": "line=机床轴号，逐轴 1..8，module 字节恒定。"
+        },
+        {
+          "variable": "actToolBasePos (axis 8)",
+          "sample_line": 23,
+          "area": "C",
+          "area_no": 1,
+          "column": 2,
+          "line": 8,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 02 00 08 73 01",
+          "note": "line=机床轴号，逐轴 1..8，module 字节恒定。"
+        }
+      ],
+      "claim_scope": "Observed accepted request for actToolBasePos in one real-device sample; not a universal mapping proof.",
+      "unresolved": [
+        "module-value-authority",
+        "area-no-mapping",
+        "manual-entry-page-traceability",
+        "device-software-version",
+        "hardware-validation"
+      ]
     },
     {
       "block": "SEGA",
+      "evidence_class": "device_observation",
+      "canonical_variable_id": "axis.position.actual_bcs",
+      "status": "observed",
+      "confidence_class": "single_device_observation",
       "module_decimal": 112,
       "module_hex": "0x70",
-      "raw_request_example": "12 08 82 41 00 21 00 01 70 01",
+      "module_value_source": {
+        "evidence_class": "device_observation",
+        "ref": "docs/evidence/nck-live-samples-probe.txt:25",
+        "note": "模块字节只由该行真机请求字节解出；无规格/手册来源（见 unresolved module-value-authority）。"
+      },
+      "protocol_layout": {
+        "evidence_class": "protocol_layout",
+        "source_symbol": "Wireshark epan/dissectors/packet-s7comm.c: s7comm_decode_param_item / s7comm_syntaxid_nck",
+        "repo_source": "drivers/sinumerik-nck/src/codec.rs:73",
+        "note": "字段位置/宽度/字节序来自协议解码器逆序，仅说明 module 字段在哪，不说明其取值。"
+      },
+      "manual_semantic": {
+        "evidence_class": "manual_semantic",
+        "document": {
+          "title": "SINUMERIK 828D NC variables List Manual",
+          "document_number": "A5E53370586B AC",
+          "version": "03/2025",
+          "sha256": "1274440ed70ef00e82d5f3560e38558740139fa6337405c75df4f0bea1eb5ed1"
+        },
+        "page": null,
+        "lookup_status": "document_level_only",
+        "proves_module": false,
+        "note": "手册只提供变量语义与列索引；不提供 native module 字节，也不逐条记录页码（见 manual-entry-page-traceability）。"
+      },
+      "device_observation": {
+        "evidence_class": "device_observation",
+        "probe_test": "drivers/sinumerik-nck/tests/live_samples_probe.rs",
+        "golden_test": "drivers/sinumerik-nck/tests/block_wire_golden.rs",
+        "response_status": "GOOD",
+        "observation_is_historical": true,
+        "device": {
+          "model": "SINUMERIK 828D",
+          "host": "192.168.15.60",
+          "port": 102,
+          "pdu_length": 480,
+          "software_version": null
+        },
+        "decoded": {
+          "spec_type": 18,
+          "spec_length": 8,
+          "syntax_id": 130,
+          "area_index": 2,
+          "area": "C",
+          "area_no": 1,
+          "column": 33,
+          "line": 1,
+          "module": 112,
+          "line_count": 1
+        }
+      },
       "sample_ref": "docs/evidence/nck-live-samples-probe.txt",
       "sample_lines": [
-        29
+        25
       ],
-      "status": "observed",
-      "claim_scope": "Observed accepted request for actProgPosBKS in one real-device sample; not a universal mapping proof."
+      "raw_request_example": "12 08 82 41 00 21 00 01 70 01",
+      "additional_observations": [
+        {
+          "variable": "actProgPosBKS (axis 2)",
+          "sample_line": 26,
+          "area": "C",
+          "area_no": 1,
+          "column": 33,
+          "line": 2,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 21 00 02 70 01",
+          "note": "line=机床轴号，逐轴 1..8，module 字节恒定。"
+        },
+        {
+          "variable": "actProgPosBKS (axis 3)",
+          "sample_line": 27,
+          "area": "C",
+          "area_no": 1,
+          "column": 33,
+          "line": 3,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 21 00 03 70 01",
+          "note": "line=机床轴号，逐轴 1..8，module 字节恒定。"
+        },
+        {
+          "variable": "actProgPosBKS (axis 4)",
+          "sample_line": 28,
+          "area": "C",
+          "area_no": 1,
+          "column": 33,
+          "line": 4,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 21 00 04 70 01",
+          "note": "line=机床轴号，逐轴 1..8，module 字节恒定。"
+        },
+        {
+          "variable": "actProgPosBKS (axis 5)",
+          "sample_line": 29,
+          "area": "C",
+          "area_no": 1,
+          "column": 33,
+          "line": 5,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 21 00 05 70 01",
+          "note": "line=机床轴号，逐轴 1..8，module 字节恒定。"
+        },
+        {
+          "variable": "actProgPosBKS (axis 6)",
+          "sample_line": 30,
+          "area": "C",
+          "area_no": 1,
+          "column": 33,
+          "line": 6,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 21 00 06 70 01",
+          "note": "line=机床轴号，逐轴 1..8，module 字节恒定。"
+        },
+        {
+          "variable": "actProgPosBKS (axis 7)",
+          "sample_line": 31,
+          "area": "C",
+          "area_no": 1,
+          "column": 33,
+          "line": 7,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 21 00 07 70 01",
+          "note": "line=机床轴号，逐轴 1..8，module 字节恒定。"
+        },
+        {
+          "variable": "actProgPosBKS (axis 8)",
+          "sample_line": 32,
+          "area": "C",
+          "area_no": 1,
+          "column": 33,
+          "line": 8,
+          "line_count": 1,
+          "raw_request": "12 08 82 41 00 21 00 08 70 01",
+          "note": "line=机床轴号，逐轴 1..8，module 字节恒定。"
+        }
+      ],
+      "claim_scope": "Observed accepted request for actProgPosBKS in one real-device sample; not a universal mapping proof.",
+      "unresolved": [
+        "module-value-authority",
+        "area-no-mapping",
+        "manual-entry-page-traceability",
+        "device-software-version",
+        "hardware-validation"
+      ]
     }
   ],
   "manual_mapping": {
+    "evidence_class": "manual_semantic",
     "source_document": {
       "title": "SINUMERIK 828D NC variables List Manual",
       "document_number": "A5E53370586B AC",
@@ -164,19 +718,22 @@
       "id": "module-value-authority",
       "question": "What authoritative specification maps NCK block identifiers to the module byte for the supported control/software generation?",
       "status": "open",
-      "do_not_infer": true
+      "do_not_infer": true,
+      "note": "模块字节目前只有单台 828D 的请求字节观测（block_observations），没有任何规格/手册来源。"
     },
     {
       "id": "area-no-mapping",
       "question": "What authoritative rule maps the logical target/area number to the encoded unit/area_no for each supported access path?",
       "status": "open",
-      "do_not_infer": true
+      "do_not_infer": true,
+      "note": "area_no 在观测中恒为 1（通道）或 1..4（驱动），不构成映射规则。"
     },
     {
       "id": "channel.program.name.main",
       "question": "Which official manual/version documents the expected (C, SPARPP) entry and column?",
       "status": "open",
-      "do_not_infer": true
+      "do_not_infer": true,
+      "note": "module 122/125（SPARPP/SPARP）无真机观测，不得据此写 golden 字节。"
     },
     {
       "id": "string-lengths",
@@ -197,6 +754,20 @@
       "do_not_infer": true
     },
     {
+      "id": "manual-entry-page-traceability",
+      "question": "Which page/entry of the 03/2025 NC variables manual corresponds to each observed block (S/RP/SSP/SGA/SEGA)?",
+      "status": "open",
+      "do_not_infer": true,
+      "note": "手册为本地 PDF（不入库）；逐 block 的页码/条目号未逐条记录，manual_semantic.page 因此为 null。"
+    },
+    {
+      "id": "device-software-version",
+      "question": "Which control software version / measurement date produced docs/evidence/nck-live-samples-probe.txt?",
+      "status": "open",
+      "do_not_infer": true,
+      "note": "转录文件不含时间戳与 SW 版本，device.software_version 保持 null（不得由 2026-10-14 等别处记录推定）。"
+    },
+    {
       "id": "hardware-validation",
       "question": "Validate the remaining 10 definitions with live device reads only after explicit authorization.",
       "status": "requires_explicit_authorization",
@@ -207,6 +778,7 @@
     "No r1.json address/decode/status change without row-level evidence and review.",
     "Protocol field layout, manual semantic meaning, and real-device observations are distinct evidence classes.",
     "Observed accepted values on one device are not universal mapping rules.",
-    "No live hardware probe is run by CI or without explicit authorization."
+    "No live hardware probe is run by CI or without explicit authorization.",
+    "A manual entry-name or column match never proves a native module value; module bytes come only from device observation or an authoritative specification that has not been found yet."
   ]
 }
