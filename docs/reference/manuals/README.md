@@ -14,6 +14,16 @@
 第四份（03/2025 NC variables）**正是** 16 条定义 `source[].reference` 所写的文档，与前三份 07/2023 属不同
 文档/不同版本，两者页码不可互换。
 
+## 待获取（`pending_document`）
+
+| 文档 | 版本 | 被引用条数 | 状态 | 缺它挡住的核对 |
+|---|---|---|---|---|
+| SINAMICS S120/S150 参数手册 | 11/2023 | **19 条** manual 来源 | `pending_document`（登记在 `../sinumerik-828d-manuals.json` 的 `pending_documents[]`） | 该版本的页码级溯源；这 19 条的 `exact_match` 级结论；`drive.motor.temperature` 的 `p.71` 同版本背书 |
+
+该版本**当前不在本地工作区**；本目录的 `828D_S120_para_lists_man_0723_zh-CHS.pdf` 是 07/2023，
+**不得**代替它，也不得把其页码写成该来源的页码。受影响定义清单与取得后的核对步骤见
+`../nck-source-evidence-stage4.md` §3 与 `../828d-definition-source-audit.md` §7.4。
+
 ## 放置步骤
 
 ```powershell

@@ -221,6 +221,64 @@
       }
     }
   ],
+  "pending_documents": [
+    {
+      "id": "s120-s150-param-manual-112023",
+      "document_name_expected": "SINAMICS S120/S150 参数手册",
+      "expected_version": "11/2023",
+      "series": "SINAMICS S120/S150",
+      "status": "pending_document",
+      "file_in_local_workspace": false,
+      "local_file_name": null,
+      "sha256": null,
+      "size_bytes": null,
+      "verified_pages": null,
+      "page_numbers_recorded": false,
+      "why_this_entry_exists": "r1.json 的 19 条 manual 来源引用该版本；本清单的 documents[] 只登记已在本地且身份实测过的文件，因此把它单独登记为待获取，而不是塞进 documents[] 制造“清单里有、磁盘上没有”的第二份真值。",
+      "referenced_by_manual_sources": 19,
+      "reference_strings": [
+        {
+          "reference_string": "SINAMICS S120/S150 参数手册 11/2023",
+          "entry_count": 18
+        },
+        {
+          "reference_string": "SINAMICS S120/S150 参数手册 11/2023（p.71 无效值标记）",
+          "entry_count": 1
+        }
+      ],
+      "affected_variable_ids": [
+        "drive.parameter.r0021",
+        "drive.parameter.r0027",
+        "drive.parameter.r0031",
+        "drive.parameter.r0033",
+        "drive.parameter.r0062",
+        "drive.parameter.r0063",
+        "drive.parameter.r0064",
+        "drive.parameter.r0077",
+        "drive.parameter.r0078",
+        "drive.parameter.r0079",
+        "drive.parameter.r0080",
+        "drive.parameter.r0081",
+        "drive.parameter.r0082",
+        "drive.parameter.r0103",
+        "drive.parameter.p0105",
+        "drive.parameter.r0106",
+        "drive.parameter.r0107",
+        "drive.parameter.r0108",
+        "drive.motor.temperature"
+      ],
+      "checks_blocked_while_missing": [
+        "11/2023 版页码级溯源（19 条 manual 来源里只有 drive.motor.temperature 带行内页码 p.71，其余 18 条只有自由文本文档名）",
+        "这 19 条的 exact_match 级别结论（本地只有 07/2023，版本不同，最多 matching_older_version）",
+        "drive.motor.temperature 的 -200.0±0.001 无效值标记在同版本下的背书（07/2023 实测同义处为 p50）",
+        "若后续要冻结参数默认值/最小值/最大值，其同版本条目页同样缺"
+      ],
+      "not_substitutable_by": "docs/reference/manuals/828D_S120_para_lists_man_0723_zh-CHS.pdf（07/2023，A5E53014702F AA）——版本与自述文档类型均不同，不得替代，也不得把其页码写成该来源的页码",
+      "after_acquisition_steps_ref": "docs/reference/nck-source-evidence-stage4.md §3.4（6 步可操作核对流程）",
+      "reproduce_entry_count": "python -c \"import json;d=json.load(open('drivers/sinumerik-nck/definitions/828d/r1.json',encoding='utf-8'));print(sum(1 for x in d['definitions'] for s in x['source'] if s['kind']=='manual' and '11/2023' in s['reference']))\"",
+      "note": "本条目刻意不含任何页码字段：该版本不在本地工作区，写页码只可能是捏造或用 07/2023 冒充。reference_strings[1] 里的 “p.71 无效值标记” 是 r1.json 中既有的行内注记（逐字引用，便于定位该条定义），不是本登记给出的页码，也未经核实。"
+    }
+  ],
   "known_version_divergence": {
     "severity": "high",
     "statement": "r1.json 的 manual 来源包含 03/2025 NC variables（16 条）与 11/2023 SINAMICS S120/S150 参数手册（19 条）。本清单中的三份 07/2023 PDF 仅用于较早版本交叉引用，不得被追认为 03/2025 或 11/2023 原始来源。",

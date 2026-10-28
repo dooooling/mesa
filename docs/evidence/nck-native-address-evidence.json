@@ -713,6 +713,86 @@
       ]
     }
   },
+  "string_lengths": {
+    "purpose": "Record what is and is not known about the configured text lengths (66-byte actBlock, 32-byte progName). This block deliberately carries no 'authority' field: no authoritative source for either length has been found, so unresolved 'string-lengths' must stay open.",
+    "authority_found": false,
+    "definitions": [
+      {
+        "variable_id": "channel.program.block",
+        "r1_path": "drivers/sinumerik-nck/definitions/828d/r1.json:172-173",
+        "decode": "UTF8_NUL_FIRST_66",
+        "byte_len": 66,
+        "transport_size": "0x09",
+        "count": 1
+      },
+      {
+        "variable_id": "channel.program.name.main",
+        "r1_path": "drivers/sinumerik-nck/definitions/828d/r1.json:85-86",
+        "decode": "UTF8_NUL_LAST_32",
+        "byte_len": 32,
+        "transport_size": "0x09",
+        "count": 1
+      },
+      {
+        "variable_id": "channel.program.name.active",
+        "r1_path": "drivers/sinumerik-nck/definitions/828d/r1.json:114-115",
+        "decode": "UTF8_NUL_LAST_32",
+        "byte_len": 32,
+        "transport_size": "0x09",
+        "count": 1
+      }
+    ],
+    "byte_len_source": {
+      "ref": "drivers/sinumerik-nck/src/value.rs:42-55",
+      "note": "66/32 come only from the driver's own decode vocabulary (byte_len of the NUL-projection kinds). They are a Mesa convention, not a manual statement and not a device measurement."
+    },
+    "manual_search": {
+      "evidence_class": "manual_semantic",
+      "document": {
+        "title": "SINUMERIK 828D NC variables List Manual",
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "sha256": "1274440ed70ef00e82d5f3560e38558740139fa6337405c75df4f0bea1eb5ed1"
+      },
+      "result": "no_length_authority_for_the_configured_definitions",
+      "findings": [
+        "Page 509 states a limit of 66 characters for the (C, SPARP) 'block' field (Column index 4), and page 516 repeats it for 'singleBlock' (198 characters for complete blocks). That is a different variable than actBlock (Column index 31), which the same manual lists without any length statement (page 507).",
+        "No page states a 32 character/byte limit for progName; the four progName entries (pages 515, 522, 526, 531) only say TYPE_STRING.",
+        "The stated unit is 'characters'; the configured lengths are bytes. For multi-byte UTF-8 the two are not equal.",
+        "The 07/2023 sysvar, machine-data and S120 PDFs contain no length statement for these variables either."
+      ],
+      "proves_length": false,
+      "note": "只记录检索结论，不把同族变量的 66 characters 追认为 actBlock 的长度依据；长度依据未从手册获得，见 docs/reference/nck-source-evidence-stage4.md 第 2 节。"
+    },
+    "protocol_rule": {
+      "evidence_class": "protocol_layout",
+      "ref": "crates/s7-transport/src/read_var.rs:9-11",
+      "ref_more": "crates/s7-transport/src/read_var.rs:41-46",
+      "statement": "The response length field is counted in bytes unless transport_size is 0x03/0x04/0x05 (bit-counted). 0x09 is byte-counted.",
+      "consequence": "transport_size 0x09 is consistent with 66/32-byte payloads but says nothing about how many bytes an element occupies, so it can not confirm either length."
+    },
+    "boundary_tests": {
+      "refs": [
+        "drivers/sinumerik-nck/src/value.rs:358（nul_text_projection_boundaries_at_32_and_66）",
+        "drivers/sinumerik-nck/src/lib.rs:1223（text_point_requires_exact_wire_length）"
+      ],
+      "covers": [
+        "exactly 32 / exactly 66 bytes",
+        "31 / 65 bytes are rejected by decode_value (ShortData)",
+        "33 / 67 bytes: decode_value does not truncate; the exact gate in decode_point turns them into BAD",
+        "embedded NUL: NUL_FIRST takes the first non-empty segment, NUL_LAST the last non-empty segment; segments are trimmed of spaces",
+        "all-NUL payload decodes to the empty string",
+        "multi-byte UTF-8 ending exactly at the boundary decodes; a multi-byte character cut by the boundary fails as invalid UTF-8 (no replacement character)"
+      ],
+      "note": "这些是代码层测试，不构成设备读数；真机未连接。"
+    },
+    "semantics": {
+      "utf8_nul_first_66": "前置填充语义：有效文本在前，尾部 NUL 补齐；解码取第一个非空段。",
+      "utf8_nul_last_32": "后置填充语义：前面可能有目录等成分，有效名字在后；解码取最后一个非空段。",
+      "impact": "两者都不是“遇到第一个 NUL 就截断”：前者跳过前置空段，后者跳过尾部空段；段两侧半角空格会被裁剪。超长输入由 decode_point 的 exact 校验拒绝，解码层不截断。",
+      "third_variant": "UTF8_FIXED_16 与 UTF16_BE 取字面第一段（不跳填充、不 trim），与上面两种投影不是同一规则。"
+    }
+  },
   "unresolved": [
     {
       "id": "module-value-authority",
@@ -739,19 +819,22 @@
       "id": "string-lengths",
       "question": "What source confirms the configured 66-byte actBlock and 32-byte progName decoding lengths?",
       "status": "open",
-      "do_not_infer": true
+      "do_not_infer": true,
+      "note": "第 4 步已把四份本地手册穷尽检索完毕（结果见 string_lengths.manual_search）：66 只有 (C, SPARP) block 的 66 characters（p509/p516），那是另一个变量且单位是字符；32 没有任何表述；transport_size 0x09 只说明长度按字节计。故仍无 authority，长度依据未从手册获得（docs/reference/nck-source-evidence-stage4.md 第 2 节）。"
     },
     {
       "id": "drive-parameter-manual-112023",
       "question": "Obtain and verify the exact 11/2023 SINAMICS S120/S150 source rather than substituting 07/2023.",
       "status": "open",
-      "do_not_infer": true
+      "do_not_infer": true,
+      "note": "第 4 步已在 docs/reference/sinumerik-828d-manuals.json 的 pending_documents[] 把该文档登记为 pending_document（19 条 manual 来源受影响，清单见 docs/reference/nck-source-evidence-stage4.md 第 3 节）。该文件当前不在本地工作区，本文件不写任何该版本页码。"
     },
     {
       "id": "axis.encoder.module_number",
       "question": "The cited measurement evidence does not contain this probe result; exercise the real probe path or withdraw the unsupported measurement claim.",
       "status": "open",
-      "do_not_infer": true
+      "do_not_infer": true,
+      "note": "第 4 步裁决：选“撤销声明”路线。r1.json:1207 的 measurement 已在 docs/reference/828d-definition-source-audit.md 第 7.3 节标记为 retracted_pending_evidence（r1.json 本轮不改，实际移除留给评审后的定义修订）；代码侧以 FIXME/TODO 标注（drivers/sinumerik-nck/src/identity_spec.rs:136、:147）。未接线的原因：MD30220 按编码器编号 0/1 索引（07/2023 机床数据手册 p366），而探针把 line 固定为 1，该对应关系无证据；module 字节 26 仍属 module-value-authority。本文件因此不收任何 probe_outputs。"
     },
     {
       "id": "manual-entry-page-traceability",

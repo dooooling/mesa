@@ -693,3 +693,70 @@ PY
 ```
 
 <!-- END SECTION-0325 -->
+
+<!-- BEGIN SECTION-STAGE4-SPARP -->
+
+## 13. 第 4 步：`progName` / `SPARPP` / `SPARPI` / `SPARPF` 四份本地手册穷尽检索
+
+本节是为 `channel.program.name.main`（`r1.json:65`，`column=5` / `module=122` / `block=SPARPP`）补做的
+**逐处**检索记录。检索工具与页码口径见 `nck-source-evidence-stage4.md` §0.1（`grep-manual-terms.py` +
+换页符分页缓存，页脚页码 = PDF 页号，偏移 0）。本节只记录"某词在哪一页出现"，不追认任何地址。
+
+### 13.1 03/2025 NC variables `A5E53370586B AC`（1262 页）
+
+| 词 | 出现页数 | 页码 | 性质 |
+|---|---|---|---|
+| `progName` | 4 个条目（索引页另有 1 行） | 515、522、526、531（索引 p1253） | 条目定义 |
+| `SPARPP` | 3 | 4、18、530 | 目录 / 数据块总表 / 小节标题 |
+| `SPARPI` | 15 | 4、18、324、523–534 | 目录、总表、条目与正文 |
+| `SPARPF` | 9 | 4、18、521–525、529、534 | 目录、总表、条目与正文 |
+
+`progName` 的 4 个条目逐条（原文标题 + 列号）：
+
+| 页 | 标题原文 | Column index | Data type |
+|---|---|---|---|
+| 515 | `progName progName (C, SPARP)` | 3 | `TYPE_STRING` |
+| 522 | `progName progName (C, SPARPF)` | 7 | `TYPE_STRING` |
+| 526 | `progName progName (C, SPARPI)` | 7 | `TYPE_STRING` |
+| 531 | `progName progName (C, SPARPI)` | 7 | `TYPE_STRING` |
+
+块标签精确计数（全册文本）：`(C, SPARPP)` = **0**、`(C, SPARPI)` = 30、`(C, SPARPF)` = 16、`(C, SPARP)` = 51。
+
+`SPARPP` 的 3 处上下文（逐字）：
+
+- p4（目录）：`5.3.27 SPARPP: Program pointers in the automatic mode ......... 530`
+- p18（数据块总表）：`SPARPP  Program pointers in the automatic mode   x`
+- p530（小节标题）：`5.3.27 SPARPP: Program pointers in the automatic mode`，紧随正文为
+  `SPARPI: Program pointer at interruption` / `OEM-MMC: LinkItem /Channel/InterruptionSearch/...`，
+  该页及 p531–p534 的条目全部标 `(C, SPARPI)` ⇒ **手册自身标题与正文错配**。
+
+两处 `column 5` 的同列巧合（只记录，不作为依据）：
+
+- p516 `singleBlock singleBlock (C, SPARP)`：`Column index: 5`、`TYPE_STRING`、3 个 line index。
+- SPARPI 的 line index 语义（p530）：`1 = main program level`、`2-18 = subroutine levels`；
+  对应 `(C, SPARPI) progName` 的列号是 **7**（p526/p531）。
+
+### 13.2 07/2023 机床数据 `6FC5397-4DP40-6RA6`（690 页）
+
+| 页 | 词 | 上下文 |
+|---|---|---|
+| 39 | `SPARPP`（3 次）、`SPARP`（2 次） | MD `10284 DISPLAY_FUNCTION_MASK` 位说明：位 0「在功能块 SPARP 和 SPARPP 中提供 OPI 变量 lastBlockNoStr」；位 1「涉及功能块 SPARPP 中的 OPI 变量 cmdSpeed」；位 2「涉及功能块 SPARPP 中的 OPI 变量 cmdSpeed（为恒定切削速度预留）」 |
+| 290 | `SPARPI`（1 次） | 跟踪记录位说明：「轴和 SPARPI 的不同状态」 |
+
+`progName` **0 处**、`SPARPF` **0 处** ⇒ 该手册能证明「SPARPP 是存在的功能块」，但**不提供** SPARPP 的
+变量清单，也不提供 `progName` 的列号。
+
+### 13.3 07/2023 系统变量 `6FC5397-5FP40-0RA6`（1236 页）与 07/2023 S120 参数 `A5E53014702F AA`（1414 页）
+
+`progName` / `SPARPP` / `SPARPI` / `SPARPF` **各 0 处**（前者是 `$AC_/$P_/$MC_` 系统变量手册，
+后者是驱动参数 r*/p* 清单，均不含 NC OPI 变量）。
+
+### 13.4 本节结论
+
+四份本地手册中**不存在** `(C, SPARPP)` 与 `progName` 的任何组合，`progName` 的官方列号只有 3 与 7。
+`channel.program.name.main` 的 `block=SPARPP` / `column=5` **无权威依据**，保持 `pending_review`
+（与 §12.9 结论一致，本节只是把检索粒度从"整册"细到"逐页逐条"）。
+传递链（驱动 → IPC → Core → 前端）的逐跳代码位置记在 `nck-source-evidence-stage4.md` §1.4：
+**链路跑得通不构成列号依据**。
+
+<!-- END SECTION-STAGE4-SPARP -->

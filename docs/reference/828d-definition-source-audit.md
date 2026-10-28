@@ -1260,3 +1260,65 @@ python audit_sources.py drivers/sinumerik-nck/definitions/828d/r1.json audit.jso
 3. 未把 03/2025 页码回填进 `r1.json`（逐条 `original_manual_reference_unchanged=true`、`r1_json_modified=false`）。
 4. 未把手册证据写成设备可读证据：16 条中仅 5 条另有真机读数（`progStatus`、`actFeedRateIpo`、`actToolBasePos`、`actProgPosBKS`、`cmdSpeed`）与 `rpa`，均属 `measurement` 类别，分开记录。
 <!-- END SECTION-0325-AUDIT -->
+
+<!-- BEGIN SECTION-STAGE4-AUDIT -->
+
+## 7. 第 4 步：四项来源证据补齐的审计登记
+
+本节只登记结论与状态，逐条页码/上下文与传递链见 `docs/reference/nck-source-evidence-stage4.md`。
+本轮**未改动 `r1.json`**（blob SHA-1 仍为 `3c0abe67cbcb64b525cddec1584e6e1747e0f062`，
+由 `check-manual-metadata.py` 的 C3 项机械复核），**未连接设备**，**未运行真机探针**。
+
+### 7.1 `channel.program.name.main`：`column 5` 无权威依据，保持 `pending_review`
+
+| 事实 | 位置 |
+|---|---|
+| 定义实际取值：`area=C`、`module=122`、`column=5`、`line=1`、`decode=UTF8_NUL_LAST_32`、`transport_size=9` | `r1.json:78-88` |
+| 03/2025 手册 `(C, SPARPP)` 块标签计数 = **0**；`progName` 只有 4 个条目，列号为 3（SPARP，p515）与 7（SPARPF p522、SPARPI p526/p531） | `828d-manual-cross-reference.md` §13.1 |
+| 03/2025 手册 5.3.27 标题写 `SPARPP` 但正文与条目全部是 `SPARPI`（p530） | 同上 |
+| 07/2023 机床数据手册 p39 只证明「SPARPP 是存在的功能块」（宿主 lastBlockNoStr/cmdSpeed），不给变量清单/列号 | 同上 §13.2 |
+| 07/2023 系统变量手册、07/2023 S120 参数手册：四个词 0 处 | 同上 §13.3 |
+| 传递链完整（驱动 → IPC → Core → 前端），但链路上没有任何一站校验列号 | `nck-source-evidence-stage4.md` §1.4 |
+
+状态：**`pending_review` 保持**。传递链完整 ≠ 来源已确认。
+
+### 7.2 字符串长度：`UTF8_NUL_FIRST_66`（66 B）与 `UTF8_NUL_LAST_32`（32 B）
+
+| 事实 | 位置 |
+|---|---|
+| 03/2025 手册 p509 原文：「the maximum string length of each field is limited to **66 characters**」——对象是 `(C, SPARP) block`（`Column index: 4`），**不是** actBlock（`Column index: 31`） | `828d-manual-cross-reference.md` §13 / stage4 §2.1 |
+| 03/2025 手册 p516 原文：「this variable is limited to **66 characters per string**」（`singleBlock`，另提到 198 characters） | 同上 |
+| actBlock 条目（p507）只写 `TYPE_STRING`，**无任何长度规定** | 同上 |
+| `progName` 的 4 个条目只写 `TYPE_STRING`，**32 字节/字符无任何手册表述** | 同上 |
+| `transport_size = 9`（0x09）在协议层只表示「长度按字节计」，不携带元素宽度；`0x03/0x04/0x05` 才按 bit 计 | `crates/s7-transport/src/read_var.rs:9-11`、`:41-46` |
+
+结论：**长度依据未从手册获得**（66 只有"相邻但不同变量、且单位是 characters"的表述；32 无任何表述）。
+`docs/evidence/nck-native-address-evidence.json` 的 `unresolved: string-lengths` 保持 open，
+本轮只补边界测试（`drivers/sinumerik-nck/src/value.rs:358`、`lib.rs:1223`），不补"权威依据"。
+
+### 7.3 `axis.encoder.module_number`：measurement 声明标记为 `retracted_pending_evidence`
+
+| 项 | 内容 |
+|---|---|
+| 定义 | `r1.json:1199`（`scope=identity`、`semantics_status=verified`、`column=30220`、`module=26`、`decode=U8`、`transport_size=9`） |
+| 被撤的 source 条目 | `r1.json:1207` — `{ "kind": "measurement", "reference": "docs/evidence/nck-live-identity-probe.txt" }` |
+| **标记** | **`retracted_pending_evidence`** |
+| 撤的依据 ① | 所引证据文件共 128 行 / 13 个小节（小节头在第 7、16、25、34、43、52、61、70、79、88、97、106、115 行），**没有「编码器驱动号」一节** |
+| 撤的依据 ② | 产生该文件的探针 `drivers/sinumerik-nck/tests/live_identity_probe.rs:16-20` 的 use 清单**不含** `AXIS_ENC_MODULE_NR`，探针体也不调用它 ⇒ 该文件不可能含此读数 |
+| 撤的依据 ③ | 常量 `AXIS_ENC_MODULE_NR`（`identity_spec.rs:155`）**不在任何执行路径上**：`drivers/sinumerik-nck/src/identity.rs:6-9` 的导入清单不含它，`identity.rs:152-193` 的轴身份读取序列没有它。它只被 `PROBES_828D`（`identity_spec.rs:233`）列出、被 `tests/definition_catalog.rs:404` 逐字段比对 |
+| 仍然成立的证据 | `identity_probe`（常量 + 目录契约测试）、`frozen_vector`（`A/M/MDCA_ENC_MODULE_NR`）、07/2023 机床数据手册 p365/p366 的 MD30220 文档依据（较早版本，仅文档级；索引页 p665 自证页码） |
+| 不能声称的事项 | 真机实测；native module 字节 26 对该机床数据的适用性；`line=1` 对应编码器下标 0 或 1（MD30220 按编码器编号 0/1 索引，见 p366） |
+| 对 `r1.json` 的影响 | **无**（本轮硬约束）。该 source 条目的实际移除须经评审的定义修订；代码侧以 FIXME/TODO 标注（`identity_spec.rs:136`、`:147`） |
+
+### 7.4 《SINAMICS S120/S150 参数手册 11/2023》：登记为 `pending_document`
+
+| 项 | 内容 |
+|---|---|
+| 登记位置 | `sinumerik-828d-manuals.json` 的 `pending_documents[]`（`id = s120-s150-param-manual-112023`、`status = pending_document`） |
+| 引用它的 manual 来源条数 | **19 条**（18 条引用串为 `SINAMICS S120/S150 参数手册 11/2023`；另 1 条为 `… 11/2023（p.71 无效值标记）`，即 `drive.motor.temperature`） |
+| 受影响定义 | `drive.parameter.r0021` / `r0027` / `r0031` / `r0033` / `r0062` / `r0063` / `r0064` / `r0077` / `r0078` / `r0079` / `r0080` / `r0081` / `r0082` / `r0103` / `p0105` / `r0106` / `r0107` / `r0108` / `drive.motor.temperature`（共 19 条） |
+| 缺它挡住的核对 | 11/2023 版**页码级**溯源；这 19 条的 `exact_match` 级别结论（本地只有 07/2023，只能给 `matching_older_version`）；`drive.motor.temperature` 的 `p.71` 同版本背书（07/2023 实测在同一语义处为 p50）；若后续要冻结参数默认值/极值，其同版本条目页同样缺 |
+| 获取后的核对步骤 | 见 `nck-source-evidence-stage4.md` §3.4（6 步，可操作） |
+| 纪律 | 本节与该清单**不写**任何 11/2023 版页码，也不把 07/2023 当作它的替代品 |
+
+<!-- END SECTION-STAGE4-AUDIT -->
