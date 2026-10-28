@@ -17,7 +17,7 @@
 //
 // 本文件为纯客户端逻辑：不 import React/AntD，可被 vitest 直接驱动。
 
-import { CatalogContractError, readCompleteCatalog } from "./catalogContract";
+import { CatalogContractError, readCompleteCatalog, type CompleteCatalogResult } from "./catalogContract";
 
 /** 目录条目里的一条来源声明（I-2 `source[]`）。 */
 export interface NckCatalogSourceRef {
@@ -466,7 +466,7 @@ export interface NckCatalogLoadOptions {
  */
 export async function fetchNckCatalog(options: NckCatalogLoadOptions): Promise<NckCatalog> {
   const fetchImpl = options.fetchImpl ?? fetch;
-  let result: Awaited<ReturnType<typeof readCompleteCatalog<NckDefinitionsResponse, NckCatalogDefinition>>>;
+  let result: CompleteCatalogResult<NckDefinitionsResponse, NckCatalogDefinition>;
   try {
     result = await readCompleteCatalog({
       loadPage: (cursor) =>
