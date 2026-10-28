@@ -92,10 +92,10 @@ describe("vendor-neutral catalog pagination contract", () => {
     expect((duplicate as CatalogContractError).code).toBe("CATALOG_DUPLICATE_ENTRY");
 
     const cycle = await readCompleteCatalog({
-      loadPage: async () => makePage([{ id: "a", value: 1 }], {
-        total: 2,
-        next_cursor: "loop",
-      }),
+      loadPage: async (cursor) =>
+        cursor
+          ? makePage([{ id: "b", value: 2 }], { total: 3, next_cursor: "loop" })
+          : makePage([{ id: "a", value: 1 }], { total: 3, next_cursor: "loop" }),
       getPage: pageShape,
       getEntryKey: (entry) => entry.id,
     }).catch((error: unknown) => error);
@@ -111,10 +111,10 @@ describe("vendor-neutral catalog pagination contract", () => {
 
   it("rejects page-limit exhaustion and malformed entry identities", async () => {
     const tooMany = await readCompleteCatalog({
-      loadPage: async () => makePage([{ id: "a", value: 1 }], {
-        total: 3,
-        next_cursor: "next",
-      }),
+      loadPage: async (cursor) =>
+        cursor
+          ? makePage([{ id: "b", value: 2 }], { total: 3, next_cursor: "next" })
+          : makePage([{ id: "a", value: 1 }], { total: 3, next_cursor: "next" }),
       getPage: pageShape,
       getEntryKey: (entry) => entry.id,
       maxPages: 2,
