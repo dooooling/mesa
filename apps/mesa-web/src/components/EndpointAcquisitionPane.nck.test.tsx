@@ -23,7 +23,7 @@ import {
   type NckPointSelection,
   type ResourceSelection,
 } from "../deviceModel";
-import { catalogLeafIds } from "../test/catalogTreePick";
+import { catalogLeafIds, expandAllCatalogGroups, openVariablePicker } from "../test/catalogTreePick";
 import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 
 const NCK_DRIVER = "sinumerik-nck";
@@ -259,10 +259,13 @@ describe("关键回归 6：UI 只提供 36 条 collect（scope 准入接线）",
     await waitFor(() => expect(screen.queryByTestId("nck-point-row")).toBeTruthy());
     expect(screen.queryByTestId("nck-collectable-summary")).toBeNull();
     await user.click(screen.getByTestId("add-point-entry"));
-    const summary = await screen.findByTestId("nck-collectable-summary");
-    expect(summary.textContent).toContain("36 个可配置变量");
+    // 口径：可添加（ready + candidate）与暂缓分开；hold 不计入"可添加"。
+    const count = await screen.findByTestId("nck-collectable-count");
+    expect(count.textContent).toContain("可添加 36 个 · 暂缓 0 个");
     expect(screen.queryAllByTestId("nck-collectable-def")).toHaveLength(0);
     // 树上可见叶子 = 当前可提供的变量集合（原「下拉框 option 数」的等价口径）。
+    openVariablePicker();
+    expandAllCatalogGroups();
     expect(catalogLeafIds()).toHaveLength(36);
     // 6 条 identity 定义不得出现在可采集集合里（不是"显示为禁用"，而是根本不渲染）。
     for (let i = 1; i <= 6; i += 1) {

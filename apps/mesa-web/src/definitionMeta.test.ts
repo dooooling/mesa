@@ -22,6 +22,7 @@ import {
   readDefinitionMeta,
   readManualLocationMeta,
   readUnitMeta,
+  summarizeAvailability,
 } from "./definitionMeta";
 import { parseAvailabilityMeta, parseDefinitionsResponse, parseUnitMeta } from "./nckCatalog";
 
@@ -240,6 +241,42 @@ describe("目录解析容错：sidecar 形状非法不拖垮整页", () => {
     expect(def.availability).toBeUndefined();
     expect(parseUnitMeta("mm/min")).toBeUndefined();
     expect(parseAvailabilityMeta("ready")).toBeUndefined();
+  });
+
+  it("summarize_counts_addable_and_hold_separately", () => {
+    // 口径：addable = ready + candidate；hold/reference_only/缺失都不得混进"可添加"。
+    const counts = summarizeAvailability([
+      { availability: { state: "ready", basis: [], reason_zh: null } },
+      { availability: { state: "candidate", basis: [], reason_zh: null } },
+      { availability: { state: "hold", basis: [], reason_zh: "暂缓原因" } },
+      { availability: { state: "reference_only", basis: [], reason_zh: null } },
+      { availability: undefined },
+    ]);
+    expect(counts).toEqual({
+      total: 5,
+      addable: 2,
+      ready: 1,
+      candidate: 1,
+      hold: 1,
+      referenceOnly: 1,
+      unavailable: 1,
+    });
+    expect(counts.addable + counts.hold + counts.referenceOnly + counts.unavailable).toBe(
+      counts.total,
+    );
+    // hold 明确**不**计入可添加。
+    expect(counts.addable).not.toBe(counts.total - counts.hold);
+  });
+
+  it("summarize_treats_invalid_availability_as_unavailable_not_addable", () => {
+    const counts = summarizeAvailability([
+      { availability: { state: "pending_review", basis: [], reason_zh: null } },
+      { availability: { state: 1 } },
+      {},
+    ]);
+    expect(counts.addable).toBe(0);
+    expect(counts.unavailable).toBe(3);
+    expect(counts.hold).toBe(0);
   });
 
   it("unknown_availability_state_is_preserved_so_the_gate_can_report_it", () => {

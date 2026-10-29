@@ -208,12 +208,13 @@ describe("验收 10：未实现入口不出现（声明了 import 也不渲染�
     renderPane();
     await waitAllVerified(state.fixture.points.length);
     await user.click(screen.getByTestId("add-point-entry"));
-    // 变量选择入口（语义点位）在抽屉里：唯一入口是搜索框 + 分类树。
+    // 变量选择入口（语义点位）在抽屉里：唯一入口是默认收起的树形下拉。
     await screen.findByTestId("catalog-tree");
+    expect(screen.getByTestId("nck-variable-picker-trigger")).toBeTruthy();
     expect(screen.queryByText("导入")).toBeNull();
     expect(screen.queryByRole("tab", { name: "导入" })).toBeNull();
-    // 浏览入口只由「驱动声明」+「产品实现」共同决定（NCK 已实现 browse）。
-    expect(screen.getByTestId("nck-browse-toggle")).toBeTruthy();
+    // 添加抽屉不再有独立的浏览操作入口（底层 Browse 仍供联动探测使用）。
+    expect(screen.queryByTestId("nck-browse-toggle")).toBeNull();
   });
 });
 

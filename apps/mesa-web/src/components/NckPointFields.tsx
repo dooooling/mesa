@@ -31,11 +31,12 @@
 //    摆出来；`candidate` 允许走流程但添加处必须标注"未经真机读取验证"。
 //    静态可用性（元数据）与动态对象（本机探测）**分开显示**：`ready` 不代表
 //    当前机床存在该对象。判定全部收敛在 `definitionMeta.evaluateAvailabilityGate`。
-// 5. **元数据分层**：单位、可用性状态、hold 原因、错误/阻断提示留在主视觉；
-//    手册位置、分类依据、`availability.basis`、`index_rule`、静态/动态说明等
-//    收进默认折叠的「技术详情」，不占主视觉。
+// 5. **元数据分层**：变量选择区只显示"名称 + 简短可用状态"；ID、单位、scope/rev
+//    收进默认折叠的「变量详情」；手册位置、分类依据、`availability.basis`、
+//    `index_rule`、静态/动态说明收进默认折叠的「技术详情」。hold 原因只在
+//    **选中之后**出现（不在 36 条变量列表里逐行铺开）。
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Button, Collapse, Input, Space, Tag, Tooltip } from "antd";
+import { Alert, Button, Collapse, Space, Tag, Tooltip } from "antd";
 import type { SchemaDescriptor } from "../types";
 import type { NckPointSelection } from "../deviceModel";
 import {
@@ -50,6 +51,7 @@ import {
   evaluateAvailabilityGate,
   objectDynamicState,
   readDefinitionMeta,
+  type AvailabilityCounts,
 } from "../definitionMeta";
 import { CatalogCategoryTree } from "./CatalogCategoryTree";
 import { NckObjectCascade } from "./NckObjectCascade";
@@ -71,7 +73,6 @@ import {
   buildNckPreviewParameters,
   checkNckFamily,
   emptyNckDraft,
-  nckDefinitionLabel,
   nckDraftFromParameters,
   nckPreviewFingerprint,
   shouldAcceptNckPreview,
@@ -158,6 +159,12 @@ export interface NckPointFieldsProps {
    * 因此不假装高亮（宁可只定位到行，也不指错字段）。
    */
   focusField?: string | null;
+  /**
+   * 目录可用性统计（可选；页面层传入后显示在变量选择下方）。
+   * 组件本身只拿到可采集子集，无法独立算出 hold/reference_only 的全貌，
+   * 因此统计口径必须由掌握完整目录的页面层传入。
+   */
+  variableStats?: AvailabilityCounts | null;
 }
 
 export function NckPointFields({
@@ -177,6 +184,7 @@ export function NckPointFields({
   preview,
   onDirtyChange,
   focusField,
+  variableStats,
 }: NckPointFieldsProps) {
   const previewFn = preview ?? defaultPreview;
   // native 编辑态：已有 native 点位必须直接在高级原生页打开（身份规则不同）。
@@ -188,8 +196,6 @@ export function NckPointFields({
       ? initialPoint.parameters.variable_id
       : "";
   const [selectedId, setSelectedId] = useState(initialVariableId);
-  // P1-1：36 个变量只用一个搜索框过滤（不新建分类体系）。支持中文名称与 ID。
-  const [query, setQuery] = useState("");
   const definition = useMemo(
     () => definitions.find((d) => d.variable_id === selectedId) ?? null,
     [definitions, selectedId],
@@ -200,19 +206,6 @@ export function NckPointFields({
     () => collectableDefinitions(definitions),
     [definitions],
   );
-  const filteredDefinitions = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    if (!needle) return selectableDefinitions;
-    return selectableDefinitions.filter((item) => {
-      const variableId = String(item.variable_id ?? "").toLowerCase();
-      const label = nckDefinitionLabel(item).toLowerCase();
-      const en =
-        item.label && typeof item.label === "object"
-          ? String(item.label.en ?? "").toLowerCase()
-          : "";
-      return variableId.includes(needle) || label.includes(needle) || en.includes(needle);
-    });
-  }, [selectableDefinitions, query]);
   const initialModel = useMemo(
     () =>
       buildNckFormModel(
@@ -515,9 +508,17 @@ export function NckPointFields({
   // P0-1：未选择变量时 `validateNckForm(null, …)` 会产出 FORM_MODEL_INVALID，
   // 但那是“还没选”而不是“定义坏了”。只有真正选中定义后才展示输入校验问题。
   const issues = definition ? validation.issues : [];
+  // 身份行只在"有身份 / 正在校验 / 校验失败"时出现：尚未选对象时它只是一行
+  // "尚无身份"的技术占位，不应占首屏。
+  const showIdentityRow =
+    !!currentKey ||
+    previewState.kind === "pending" ||
+    (previewState.kind === "error" && previewState.fingerprint === fingerprint);
 
-  // 两个入口**互斥**：默认停在「联动选择」（普通用户），「高级原生配置」只有用户
-  // 主动切换才渲染，且切换后联动表单整体不渲染（任何时刻只有一套表单在场）。
+  // 两个入口**互斥**且**放在最上方**：默认停在「联动选择」（普通用户），
+  // 「高级原生配置」只有用户主动切换才渲染，切换后联动表单整体不渲染
+  // （任何时刻只有一套表单在场）。这里不再写"配置入口/推荐日常使用"之类的
+  // 解释文字——模式名本身已经说明一切，首屏空间留给变量与对象选择。
   const modeSwitch = nativeSchema ? (
     <div
       data-testid="nck-editor-mode"
@@ -528,11 +529,9 @@ export function NckPointFields({
         gap: 8,
         alignItems: "center",
         flexWrap: "wrap",
-        borderTop: "1px dashed #e0e0e0",
-        paddingTop: 6,
+        minWidth: 0,
       }}
     >
-      <span style={{ fontSize: 11, color: "#8c8c8c" }}>配置入口：</span>
       <Button
         size="small"
         type={editorMode === "semantic" ? "primary" : "default"}
@@ -540,7 +539,6 @@ export function NckPointFields({
       >
         联动选择
       </Button>
-      <span style={{ fontSize: 11, color: "#8c8c8c" }}>推荐日常使用</span>
       <Button
         size="small"
         type={editorMode === "native" ? "primary" : "default"}
@@ -563,63 +561,106 @@ export function NckPointFields({
   }, [hasDraftInput, onDirtyChange]);
 
   /**
-   * 变量选择入口：搜索（跨分类）+ 分类树。
+   * 变量选择入口：**一个紧凑的树形下拉**（默认收起）。
    *
-   * 这里刻意**只有一条**选择路径（评审要求）：搜索框过滤树中的条目，用户在树上
-   * 选中变量。历史上还并列过一个平铺的 `<select>`，它与树是同一批条目的两套入口，
-   * 只会让用户面对重复选择面，已移除；`selectedId`/`handleSelect` 仍由树驱动，
-   * 选中后的定义信息、分类标签、探测、预览与添加流程保持不变。
+   * 这里刻意**只有一条**选择路径（评审要求）：搜索框在展开后的面板里过滤树中的
+   * 条目，用户在树上选中变量。历史上并列过的平铺 `<select>` 已移除；`selectedId`
+   * 仍由树驱动，选中后的定义信息、探测、预览与添加流程保持不变。
+   *
+   * 变量行只显示"名称 + 简短可用状态"：ID/单位/手册/暂缓长文收在选中后的
+   * 「变量详情」或「技术详情」里，避免 36 条目录把抽屉铺满。
    */
   const picker = (
-    <div style={{ display: "grid", gap: 6 }}>
-      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-        <span style={{ fontSize: 12 }}>变量</span>
-        <Input
-          data-testid="nck-variable-search"
-          aria-label="搜索变量"
-          placeholder="搜索变量名称或 ID（跨全部分类）"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          allowClear
-          style={{ width: 260 }}
-        />
-        {query.trim() ? (
-          <span data-testid="nck-variable-search-count" style={{ fontSize: 12, color: "#525252" }}>
-            {filteredDefinitions.length
-              ? `匹配 ${filteredDefinitions.length} 个变量`
-              : "没有匹配的变量（可改用变量 ID 搜索）"}
-          </span>
-        ) : null}
+    <div
+      data-testid="nck-variable-picker"
+      style={{ display: "grid", gap: 6, minWidth: 0, width: "100%" }}
+    >
+      <div style={{ display: "flex", gap: 8, alignItems: "center", minWidth: 0 }}>
+        <span style={{ fontSize: 12, flexShrink: 0 }}>采集变量</span>
+        <div style={{ flex: "1 1 auto", minWidth: 0 }}>
+          <CatalogCategoryTree
+            definitions={selectableDefinitions}
+            selectedId={selectedId}
+            onSelect={handleSelect}
+            placeholder="选择采集变量（可搜索）"
+            searchTestId="nck-variable-search"
+            searchCountTestId="nck-variable-search-count"
+            triggerTestId="nck-variable-picker-trigger"
+          />
+        </div>
       </div>
 
-      {/* 分类树：分类**只读**后端 `category`；搜索跨全部五个分组。 */}
-      <CatalogCategoryTree
-        definitions={selectableDefinitions}
-        query={query}
-        selectedId={selectedId}
-        onSelect={handleSelect}
-      />
+      {/*
+        目录统计：放在变量选择下方的一行小字，而不是抽屉顶部的状态墙。
+        口径由页面层传入（可添加 = ready + candidate；暂缓/仅参考单列）。
+      */}
+      {variableStats ? (
+        <div
+          data-testid="nck-collectable-count"
+          data-addable={variableStats.addable}
+          data-candidate={variableStats.candidate}
+          data-ready={variableStats.ready}
+          data-hold={variableStats.hold}
+          data-reference-only={variableStats.referenceOnly}
+          data-unavailable={variableStats.unavailable}
+          data-total={variableStats.total}
+          style={{ fontSize: 11, color: "#525252", overflowWrap: "anywhere", minWidth: 0 }}
+        >
+          可添加 {variableStats.addable} 个 · 暂缓 {variableStats.hold} 个
+          {variableStats.referenceOnly ? ` · 仅参考 ${variableStats.referenceOnly} 个` : ""}
+          {variableStats.unavailable ? ` · 可用性未知 ${variableStats.unavailable} 个` : ""}
+        </div>
+      ) : null}
 
       {definition ? (
         <div
           data-testid="nck-definition-meta-row"
-          style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}
+          style={{
+            display: "grid",
+            gap: 4,
+            minWidth: 0,
+          }}
         >
-          <Space size={4} data-testid="nck-definition-tags">
-            <Tag>{String(definition.scope ?? "scope 缺失")}</Tag>
-            <Tag>{String(definition.semantics_status ?? "状态未提供")}</Tag>
-            {typeof definition.revision === "number" ? <Tag>rev {definition.revision}</Tag> : null}
-          </Space>
           {/*
-            单位：`verified` 才显示真实取值，其余明确写"单位未核实"——
-            空白会被读成"无单位"，假单位比空白更糟（见 definitionMeta.readUnitMeta）。
-            单位留在主视觉：它直接影响"这个读数怎么理解"。
+            变量详情默认折叠：ID、单位、scope/rev 属于"要查的时候才看"的信息。
+            单位仍沿用 `verified` 才显示真实取值的口径（见 definitionMeta.readUnitMeta）；
+            空白会被读成"无单位"，假单位比空白更糟。
           */}
-          <Tooltip title={meta.unit.hint}>
-            <Tag data-testid="nck-unit" data-unit-status={meta.unit.status}>
-              {meta.unit.label}
-            </Tag>
-          </Tooltip>
+          <details data-testid="nck-variable-details" style={{ minWidth: 0 }}>
+            <summary style={{ cursor: "pointer", fontSize: 11, color: "#8c8c8c" }}>
+              变量详情（ID / 单位 / 版本）
+            </summary>
+            <div
+              style={{
+                display: "grid",
+                gap: 4,
+                paddingTop: 4,
+                minWidth: 0,
+                fontSize: 11,
+                color: "#525252",
+              }}
+            >
+              <span data-testid="nck-variable-id" style={{ overflowWrap: "anywhere" }}>
+                ID：{selectedId}
+              </span>
+              <Space size={4} wrap data-testid="nck-definition-tags">
+                <Tag>{String(definition.scope ?? "scope 缺失")}</Tag>
+                <Tag>{String(definition.semantics_status ?? "状态未提供")}</Tag>
+                {typeof definition.revision === "number" ? (
+                  <Tag>rev {definition.revision}</Tag>
+                ) : null}
+              </Space>
+              <Tooltip title={meta.unit.hint}>
+                <Tag
+                  data-testid="nck-unit"
+                  data-unit-status={meta.unit.status}
+                  style={{ whiteSpace: "normal", maxWidth: "100%", overflowWrap: "anywhere" }}
+                >
+                  {meta.unit.label}
+                </Tag>
+              </Tooltip>
+            </div>
+          </details>
         </div>
       ) : null}
     </div>
@@ -649,7 +690,11 @@ export function NckPointFields({
               <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
                 {/* 索引规则：逐字展示驱动声明，未核实如实标注（不推断索引方式）。 */}
                 <Tooltip title={meta.indexRule.hint}>
-                  <Tag data-testid="nck-index-rule" data-index-status={meta.indexRule.status ?? ""}>
+                  <Tag
+                    data-testid="nck-index-rule"
+                    data-index-status={meta.indexRule.status ?? ""}
+                    style={{ whiteSpace: "normal", maxWidth: "100%", overflowWrap: "anywhere" }}
+                  >
                     索引：{meta.indexRule.label}
                   </Tag>
                 </Tooltip>
@@ -661,7 +706,12 @@ export function NckPointFields({
                       data-page={meta.manualLocation.page ?? ""}
                       data-section={meta.manualLocation.section ?? ""}
                       data-document={meta.manualLocation.documentNumber ?? ""}
-                      style={{ fontSize: 10 }}
+                      style={{
+                        fontSize: 10,
+                        whiteSpace: "normal",
+                        maxWidth: "100%",
+                        overflowWrap: "anywhere",
+                      }}
                     >
                       手册：{meta.manualLocation.label}
                     </Tag>
@@ -670,7 +720,11 @@ export function NckPointFields({
                 {/* 分类与分类依据：一行说清"这是导航规则，不是手册事实"。 */}
                 {categoryItem ? (
                   <>
-                    <Tag data-testid="nck-category" data-category={categoryItem.bucket}>
+                    <Tag
+                      data-testid="nck-category"
+                      data-category={categoryItem.bucket}
+                      style={{ whiteSpace: "normal", maxWidth: "100%", overflowWrap: "anywhere" }}
+                    >
                       {categoryItem.categoryKnown
                         ? `分类：${categoryItem.bucket}`
                         : `分类未知（${categoryItem.bucket}）`}
@@ -679,7 +733,12 @@ export function NckPointFields({
                       <Tag
                         data-testid="nck-category-basis"
                         data-basis={categoryItem.basis.raw ?? ""}
-                        style={{ fontSize: 10 }}
+                        style={{
+                          fontSize: 10,
+                          whiteSpace: "normal",
+                          maxWidth: "100%",
+                          overflowWrap: "anywhere",
+                        }}
                       >
                         分类依据：{categoryItem.basis.label}
                       </Tag>
@@ -723,7 +782,7 @@ export function NckPointFields({
 
   if (editorMode === "native") {
     return (
-      <div style={{ display: "grid", gap: 8 }}>
+      <div style={{ display: "grid", gap: 8, minWidth: 0, width: "100%" }}>
         {modeSwitch}
         {nativeSchema ? (
           <NckNativeFields
@@ -747,21 +806,44 @@ export function NckPointFields({
     );
   }
 
-  // 还没选变量：只给**一个选择入口**——不出现空身份、禁用按钮与错误框的组合（§4.1-4）。
+  // 还没选变量：首屏只保留「模式切换 + 变量选择 + 对象选择（占位）+ 添加按钮」。
+  // 添加按钮**始终在场但禁用**——用户不需要先猜"要选完才会出现按钮"；
+  // 不出现空身份、错误框与状态墙（§4.1-4）。
   if (!hasSelection) {
     return (
-      <div style={{ display: "grid", gap: 8 }} data-testid="nck-point-fields-idle">
+      <div
+        style={{ display: "grid", gap: 8, minWidth: 0, width: "100%" }}
+        data-testid="nck-point-fields-idle"
+      >
         {modeSwitch}
         {picker}
+        {/* 首屏保留「实际对象选择」的位置：选变量后才出现真正需要的级。 */}
+        <div
+          data-testid="nck-object-placeholder"
+          style={{ display: "flex", gap: 8, alignItems: "center", minWidth: 0 }}
+        >
+          <span style={{ fontSize: 12, flexShrink: 0 }}>实际对象选择</span>
+          <span style={{ fontSize: 12, color: "#8c8c8c", minWidth: 0, overflowWrap: "anywhere" }}>
+            选择采集变量后显示需要选择的对象
+          </span>
+        </div>
         <div data-testid="nck-select-hint" style={{ fontSize: 12, color: "#525252" }}>
-          请选择可采集变量后逐级选择实际对象（参数由驱动载荷自动填入，无需手填）。
+          请选择可采集变量后逐级选择实际对象（参数自动生成，身份由服务端验证）。
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <Button type="primary" data-testid="nck-add-point" disabled>
+            {submitLabel ?? "加入点位"}
+          </Button>
         </div>
       </div>
     );
   }
 
   return (
-    <div style={{ display: "grid", gap: 8 }} data-testid="nck-point-fields">
+    <div
+      style={{ display: "grid", gap: 8, minWidth: 0, width: "100%" }}
+      data-testid="nck-point-fields"
+    >
       {modeSwitch}
       {picker}
 
@@ -773,11 +855,6 @@ export function NckPointFields({
           description={`已选择变量 "${selectedId}"，但当前目录中找不到它的定义（可能已被移除，或不在可采集范围内）。真正的定义异常仍会拦截保存；请重新选择变量，若整个目录加载失败请先恢复目录。`}
         />
       ) : null}
-
-      {/*
-        定义的「来源 / 身份模板 / 接口地址」不再常驻表单：按 §2.5 收进技术详情
-        （点位行「⋯ → 技术详情」），表单里只保留与填写直接相关的信息（scope/rev 标签）。
-      */}
 
       {definition && !admission.ok ? (
         <Alert
@@ -825,7 +902,13 @@ export function NckPointFields({
         <div
           data-testid="nck-availability"
           data-state={meta.availability.state}
-          style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}
+          style={{
+            display: "flex",
+            gap: 6,
+            alignItems: "center",
+            flexWrap: "wrap",
+            minWidth: 0,
+          }}
         >
           <Tag
             data-testid="nck-availability-tag"
@@ -838,7 +921,7 @@ export function NckPointFields({
           {meta.availability.state === "hold" ? (
             <span
               data-testid="nck-availability-hold-reason"
-              style={{ fontSize: 11, color: "#c62828" }}
+              style={{ fontSize: 11, color: "#c62828", overflowWrap: "anywhere", minWidth: 0 }}
             >
               暂缓原因：{meta.availability.reasonZh ?? "驱动未给出原因"}
             </span>
@@ -846,7 +929,7 @@ export function NckPointFields({
           {meta.availability.state === "candidate" ? (
             <span
               data-testid="nck-availability-candidate-notice"
-              style={{ fontSize: 11, color: "#8c6000" }}
+              style={{ fontSize: 11, color: "#8c6000", overflowWrap: "anywhere", minWidth: 0 }}
             >
               未经真机读取验证（可配置，但不得当作已验证）
             </span>
@@ -905,15 +988,16 @@ export function NckPointFields({
         </div>
       ) : null}
       {fillNotice ? (
-        <div data-testid="nck-fill-notice" style={{ fontSize: 11, color: "#525252" }}>
+        <div
+          data-testid="nck-fill-notice"
+          style={{ fontSize: 11, color: "#525252", overflowWrap: "anywhere", minWidth: 0 }}
+        >
           参数已按所选实际对象填入：{fillNotice.basis}
           {fillNotice.unresolved.length
             ? ` · 仍需逐级选择：${fillNotice.unresolved.join(" / ")}（前端不填默认值）`
             : ""}
         </div>
       ) : null}
-
-      {techDetails}
 
       {/*
         这里**不再有** Target / Arguments 输入区。
@@ -939,14 +1023,28 @@ export function NckPointFields({
         />
       ) : null}
 
-      {/* 未选择变量时：提交按钮保持禁用、身份区只显示占位，但**不展示任何
-          校验错误**（P0-1）；真正的定义异常仍由上方 definition-missing 拦截。 */}
-      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-        <span style={{ fontSize: 12 }}>point_key</span>
+      {/* 身份行：身份只来自服务端预览；输入一变旧 Key 立即消失。 */}
+      {showIdentityRow ? (
+        <div
+          data-testid="nck-identity-row"
+          style={{
+            display: "flex",
+            gap: 8,
+            alignItems: "center",
+            flexWrap: "wrap",
+            minWidth: 0,
+          }}
+        >
+        <span style={{ fontSize: 12, flexShrink: 0 }}>point_key</span>
         {currentKey ? (
           <code
             data-testid="nck-point-key"
-            style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 12 }}
+            style={{
+              fontFamily: "'IBM Plex Mono',monospace",
+              fontSize: 12,
+              overflowWrap: "anywhere",
+              minWidth: 0,
+            }}
           >
             {currentKey}
           </code>
@@ -966,18 +1064,37 @@ export function NckPointFields({
           </span>
         ) : null}
         {previewState.kind === "error" && previewState.fingerprint === fingerprint ? (
-          <span data-testid="nck-preview-error" style={{ fontSize: 12, color: "#c62828" }}>
+          <span
+            data-testid="nck-preview-error"
+            style={{ fontSize: 12, color: "#c62828", overflowWrap: "anywhere", minWidth: 0 }}
+          >
             预览失败：{previewState.code} · {previewState.message}
           </span>
         ) : null}
         {keyTaken ? (
-          <span data-testid="nck-key-conflict" style={{ fontSize: 12, color: "#c62828" }}>
+          <span
+            data-testid="nck-key-conflict"
+            style={{ fontSize: 12, color: "#c62828", overflowWrap: "anywhere", minWidth: 0 }}
+          >
             该 point_key 已被 Endpoint 内其它点位占用：请调整 Target/Arguments（不得自动改名/加后缀）
           </span>
         ) : null}
+        </div>
+      ) : null}
+      <div data-testid="nck-identity-note" style={{ fontSize: 11, color: "#8c8c8c" }}>
+        参数自动生成，身份由服务端验证
       </div>
 
-      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+      {/* 主操作紧跟在对象选择之后：不把「添加」压到技术细节下面。 */}
+      <div
+        style={{
+          display: "flex",
+          gap: 8,
+          alignItems: "center",
+          flexWrap: "wrap",
+          minWidth: 0,
+        }}
+      >
         <Button
           type="primary"
           data-testid="nck-add-point"
@@ -1005,6 +1122,9 @@ export function NckPointFields({
           </Button>
         ) : null}
       </div>
+
+      {/* 技术详情默认折叠，放在主操作之后：排查信息不占首屏。 */}
+      {techDetails}
     </div>
   );
 }

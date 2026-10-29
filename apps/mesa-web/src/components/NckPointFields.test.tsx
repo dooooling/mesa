@@ -14,6 +14,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NckPointFields, type NckPreviewFn } from "./NckPointFields";
 import {
   catalogLeafIds,
+  expandAllCatalogGroups,
+  openVariablePicker,
   selectVariableViaTree,
   selectedCatalogLeafIds,
 } from "../test/catalogTreePick";
@@ -171,14 +173,18 @@ describe("P0-1：未选择变量不显示虚假错误", () => {
     expect(screen.queryByTestId("nck-form-issues")).toBeNull();
     expect(screen.queryByTestId("nck-model-reject")).toBeNull();
     expect(screen.queryByText(/FORM_MODEL_INVALID/)).toBeNull();
-    // §4.1-4：未选变量时只保留**一个选择入口**——不渲染空身份、禁用按钮与错误框
-    // 的组合，因此不存在可提交按钮（也就没有可提交路径）。
-    expect(screen.queryByTestId("nck-add-point")).toBeNull();
+    // §4.1-4：未选变量时只保留**一个选择入口**——不出现空身份、错误框与技术细节；
+    // 添加按钮**在场但禁用**（首屏就能看到主操作在哪，不需要先猜流程）。
+    const add = screen.getByTestId("nck-add-point") as HTMLButtonElement;
+    expect(add.disabled).toBe(true);
     expect(screen.queryByTestId("nck-point-key-empty")).toBeNull();
-    // 唯一选择入口 = 搜索框 + 分类树（不再有并列的平铺下拉框）。
-    expect(screen.getByTestId("nck-variable-search")).toBeTruthy();
+    // 唯一选择入口 = 默认收起的树形下拉（展开前没有搜索框/叶子，不再有平铺下拉框）。
+    expect(screen.getByTestId("nck-variable-picker-trigger")).toBeTruthy();
     expect(screen.getByTestId("catalog-tree")).toBeTruthy();
+    expect(screen.queryByTestId("catalog-tree-panel")).toBeNull();
+    expect(screen.queryByTestId("nck-variable-search")).toBeNull();
     expect(screen.queryByTestId("nck-variable-select")).toBeNull();
+    expect(screen.queryByTestId("nck-tech-details")).toBeNull();
   });
 
   it("selected_variable_without_definition_still_reports_real_error", () => {
@@ -248,6 +254,9 @@ describe("P1-1：变量选择可搜索（中文名称 / 变量 ID）", () => {
   it("filters_by_chinese_label_and_variable_id", () => {
     const { preview } = installPreview();
     renderFields({ definitions: [spindle, channel], preview });
+    // 下拉默认收起：先显式打开并展开分组，才看得到全部叶子。
+    openVariablePicker();
+    expandAllCatalogGroups();
     expect(visibleLeaves()).toEqual(["spindle.speed.actual", "channel.feed.actual"]);
 
     const search = screen.getByTestId("nck-variable-search");
@@ -268,7 +277,9 @@ describe("P1-1：变量选择可搜索（中文名称 / 变量 ID）", () => {
     const { preview } = installPreview();
     renderFields({ definitions: [spindle, channel], preview });
     choose("spindle.speed.actual");
-    // 选中态由树自身标记（叶子 data-selected）。
+    // 选中态由树自身标记（叶子 data-selected）；选择后下拉自动收起。
+    openVariablePicker();
+    expandAllCatalogGroups();
     expect(selectedCatalogLeafIds()).toEqual(["spindle.speed.actual"]);
 
     fireEvent.change(screen.getByTestId("nck-variable-search"), {
@@ -444,6 +455,8 @@ describe("门禁 3：identity 不可新增（Preview 成功也不放行）", () 
     // 即使父层把 identity 定义塞进表单（绕过列表过滤/直接用初始点位注入），
     // 这里也必须拒绝；树上不再提供 identity 叶子（可选项集合里没有它），
     // 但 definition 仍能显示原因。
+    openVariablePicker();
+    expandAllCatalogGroups();
     expect(catalogLeafIds()).not.toContain("channel.feed.actual");
     expect(screen.getByTestId("nck-scope-reject").textContent).toContain("SCOPE_IDENTITY");
     expect(pending).toHaveLength(0);
@@ -753,9 +766,13 @@ describe("元数据分层：主视觉只留单位/可用性，其余进技术详
     renderFields({ definitions: [definition()], preview });
     choose("channel.feed.actual");
 
-    // 主视觉：单位与可用性状态可见。
-    expect(screen.getByTestId("nck-unit")).toBeTruthy();
+    // 主视觉：只留名称/可用状态；单位与 ID 收在默认折叠的「变量详情」里。
     expect(screen.getByTestId("nck-availability-tag")).toBeTruthy();
+    const variableDetails = screen.getByTestId("nck-variable-details") as HTMLDetailsElement;
+    expect(variableDetails.open).toBe(false);
+    expect(variableDetails.textContent).toContain("变量详情");
+    expect((variableDetails.querySelector('[data-testid="nck-unit"]') as HTMLElement).textContent)
+      .toBe("单位未核实");
     // 排查用信息默认**不渲染**（折叠，不占主视觉）。
     expect(screen.queryByTestId("nck-manual-location")).toBeNull();
     expect(screen.queryByTestId("nck-index-rule")).toBeNull();

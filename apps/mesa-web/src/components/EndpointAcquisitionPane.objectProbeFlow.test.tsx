@@ -33,6 +33,7 @@ import type { ResourceDescriptor } from "../types";
 import contract from "../test/nckIdentityProbeContract.json";
 import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 import { cascadeOptions, openCascade, pickObject } from "../test/objectCascadePick";
+import { expandAllCatalogGroups, openVariablePicker } from "../test/catalogTreePick";
 
 const EP = "ep-flow";
 const DRIVER = "sinumerik-nck";
@@ -453,10 +454,13 @@ async function waitPaneReady() {
   await screen.findByTestId("add-point-entry", undefined, { timeout: 10_000 });
 }
 
-/** 打开添加抽屉并等树渲染（抽屉是 lazy 的：未打开时内部组件不挂载）。 */
+/** 打开添加抽屉，展开变量下拉并展开全部分组（抽屉是 lazy 的：未打开时内部组件不挂载）。 */
 async function openDrawer(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByTestId("add-point-entry"));
   await screen.findByTestId("catalog-tree");
+  await user.click(screen.getByTestId("nck-variable-picker-trigger"));
+  await screen.findByTestId("catalog-tree-panel");
+  expandAllCatalogGroups();
 }
 
 beforeEach(() => {
@@ -673,16 +677,15 @@ describe("流程 3：待分类条目可见、标注未知、不得被当作四�
     const dead = screen.getByTestId("catalog-tree-leaf-channel.feed.override");
     expect(dead.getAttribute("data-category")).toBe("unclassified");
     expect(dead.getAttribute("data-category-known")).toBe("false");
-    expect(
-      screen.getByTestId("catalog-tree-leaf-badge-channel.feed.override").textContent,
-    ).toBe("分类未知（驱动 unclassified）");
-    // 旧目录（category 缺失）同样落待分类，但只说"分类未知"（不冒充失败关闭结论）。
+    // 明确 unclassified 与"category 缺失"必须可区分（不合并成一个"未知"）。
+    expect(dead.getAttribute("data-explicitly-unclassified")).toBe("true");
+    // 旧目录（category 缺失）同样落待分类，但**不是**驱动明确的 unclassified。
     const legacy = screen.getByTestId("catalog-tree-leaf-mystery.variable");
     expect(legacy.getAttribute("data-category")).toBe("unclassified");
     expect(legacy.getAttribute("data-category-known")).toBe("false");
-    expect(
-      screen.getByTestId("catalog-tree-leaf-badge-mystery.variable").textContent,
-    ).toBe("分类未知");
+    expect(legacy.getAttribute("data-explicitly-unclassified")).toBe("false");
+    // 分组标题明确标注"分类未知"（列表行只留名称 + 可用状态，不再逐行挂长角标）。
+    expect(screen.getByTestId("catalog-tree-unclassified-hint").textContent).toContain("分类未知");
     // 分类依据如实写"导航规则"（不是手册事实）。
     expect(
       screen.getByTestId("catalog-tree-basis-unclassified").textContent,
@@ -930,7 +933,8 @@ describe("补充流程：只有需要对象实例的变量才出现级联下拉"
     expect(screen.queryByTestId("nck-object-cascade")).toBeNull();
     expect(probe.count("BROWSE")).toBe(0);
 
-    // 换成声明了 targets 的条目 ⇒ 下拉才出现。
+    // 换成声明了 targets 的条目 ⇒ 下拉才出现（选择后下拉已收起，先重新打开）。
+    openVariablePicker();
     await user.click(screen.getByTestId("catalog-tree-leaf-axis.position.actual_bcs"));
     expect(await screen.findByTestId("nck-object-cascade")).toBeTruthy();
     // 但依然"不展开不探测"。

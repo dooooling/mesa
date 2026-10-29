@@ -133,10 +133,12 @@ export function NckObjectCascade({
     <div
       data-testid="nck-object-cascade"
       data-probe-status={status}
-      style={{ display: "grid", gap: 6 }}
+      data-level-count={keys.length}
+      style={{ display: "grid", gap: 6, minWidth: 0, width: "100%" }}
     >
-      <div style={{ fontSize: 12, color: "#525252" }}>
-        实际对象（逐级选择；参数由驱动返回的选择载荷自动填入，不提供手填）
+      <div style={{ display: "flex", gap: 8, alignItems: "baseline", flexWrap: "wrap" }}>
+        <span style={{ fontSize: 12 }}>实际对象选择</span>
+        <span style={{ fontSize: 11, color: "#8c8c8c" }}>只显示当前变量需要的级</span>
       </div>
 
       {/* 端点不可用：只说原因，一个请求都不发。 */}
@@ -144,7 +146,7 @@ export function NckObjectCascade({
         <div
           data-testid="nck-cascade-gate"
           data-code={gate.code}
-          style={{ fontSize: 11, color: "#c62828" }}
+          style={{ fontSize: 11, color: "#c62828", overflowWrap: "anywhere", minWidth: 0 }}
         >
           {gate.reason}
         </div>
@@ -180,19 +182,34 @@ export function NckObjectCascade({
             key={`${key.source}-${key.key}`}
             data-testid={`nck-object-level-${key.key}`}
             data-resolved={resolved ? "true" : "false"}
-            style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}
+            style={{
+              display: "grid",
+              gridTemplateColumns: "minmax(72px, 110px) minmax(0, 1fr)",
+              gap: 8,
+              alignItems: "center",
+              minWidth: 0,
+              width: "100%",
+            }}
           >
-            <span style={{ width: 140, fontSize: 12 }}>
+            <span style={{ fontSize: 12, minWidth: 0, overflowWrap: "anywhere" }}>
               {key.label}
               <span style={{ color: "#c62828" }}> *</span>
             </span>
             {resolved ? (
-              <>
+              <div
+                style={{
+                  display: "flex",
+                  gap: 6,
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  minWidth: 0,
+                }}
+              >
                 <Tag
                   color="green"
                   data-testid={`nck-object-selected-${key.key}`}
                   data-value={value}
-                  style={{ marginInlineEnd: 0 }}
+                  style={{ marginInlineEnd: 0, maxWidth: "100%", overflowWrap: "anywhere" }}
                 >
                   已选：{value}
                 </Tag>
@@ -203,9 +220,9 @@ export function NckObjectCascade({
                 >
                   重新选择
                 </Button>
-              </>
+              </div>
             ) : (
-              <>
+              <div style={{ display: "grid", gap: 2, minWidth: 0 }}>
                 <select
                   data-testid={`nck-object-select-${key.key}`}
                   aria-label={`选择${key.label}`}
@@ -220,7 +237,14 @@ export function NckObjectCascade({
                     const option = level.selectable.find((item) => item.nodeId === nodeId);
                     if (option?.fill) onFill(option.fill);
                   }}
-                  style={{ minWidth: 260, padding: "2px 4px" }}
+                  // 宽度只吃容器：长候选文案不得把抽屉撑出横向滚动条。
+                  style={{
+                    width: "100%",
+                    minWidth: 0,
+                    maxWidth: "100%",
+                    padding: "2px 4px",
+                    boxSizing: "border-box",
+                  }}
                 >
                   <option value="">{placeholderFor(key)}</option>
                   {level.selectable.map((option) => (
@@ -239,14 +263,14 @@ export function NckObjectCascade({
                   <span
                     data-testid={`nck-object-level-hint-${key.key}`}
                     data-reason={scan.incomplete ? "probe_incomplete" : "no_candidates"}
-                    style={{ fontSize: 11, color: "#c62828" }}
+                    style={{ fontSize: 11, color: "#c62828", overflowWrap: "anywhere" }}
                   >
                     {scan.incomplete
                       ? "部分分支不可达：无法确认设备上是否存在该对象"
                       : "设备没有返回能提供该参数的可用对象"}
                   </span>
                 ) : null}
-              </>
+              </div>
             )}
           </div>
         );
@@ -254,7 +278,10 @@ export function NckObjectCascade({
 
       {/* 驱动的异常/无法判定对象：不能成为候选，但必须可见（不是"不存在"）。 */}
       {scan && scan.diagnostics.length ? (
-        <div data-testid="nck-cascade-diagnostics" style={{ display: "grid", gap: 2 }}>
+        <div
+          data-testid="nck-cascade-diagnostics"
+          style={{ display: "grid", gap: 2, minWidth: 0 }}
+        >
           {scan.diagnostics.map((item) => (
             <span
               key={item.nodeId}
@@ -262,6 +289,8 @@ export function NckObjectCascade({
               style={{
                 fontSize: 11,
                 color: item.severity >= 3 ? "#c62828" : "#8c6000",
+                overflowWrap: "anywhere",
+                minWidth: 0,
               }}
             >
               {item.label}（{item.code}）：{item.message}
@@ -297,7 +326,10 @@ export function NckObjectCascade({
       ) : null}
 
       {readiness.missing.some((item) => item.reason === "not_probed") ? (
-        <span data-testid="nck-cascade-hint" style={{ fontSize: 11, color: "#525252" }}>
+        <span
+          data-testid="nck-cascade-hint"
+          style={{ fontSize: 11, color: "#525252", overflowWrap: "anywhere", minWidth: 0 }}
+        >
           {readiness.missing
             .filter((item) => item.reason === "not_probed")
             .map((item) => `请展开「${item.key.label}」下拉选择实际对象`)

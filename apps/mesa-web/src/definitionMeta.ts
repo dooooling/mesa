@@ -489,6 +489,69 @@ export function readDefinitionMeta(
 }
 
 /**
+ * 目录可用性统计（只统计**可采集集合**里的条目）。
+ *
+ * 为什么必须分开计数：`scope=collect` 只说明"这条定义允许被采集"，不代表
+ * 它的 sidecar 可用性允许添加。`hold` / `reference_only` / 缺失或非法取值
+ * 都必须从"可添加"里剔除——把它们混进"可配置变量"会让用户以为 36 条都能加，
+ * 实际点进去才被门禁拒绝。
+ *
+ * 口径固定为：
+ * - `addable = ready + candidate`（candidate 可添加，但添加处必须标注未验证）；
+ * - `hold` / `referenceOnly` / `unavailable` 各自单列，**不计入** `addable`。
+ */
+export interface AvailabilityCounts {
+  /** 参与统计的条目总数（调用方应传入已按 scope 过滤的集合）。 */
+  total: number;
+  /** 可添加 = ready + candidate。 */
+  addable: number;
+  ready: number;
+  candidate: number;
+  hold: number;
+  referenceOnly: number;
+  /** sidecar 缺失/非法（前端内部态 unavailable）。 */
+  unavailable: number;
+}
+
+export function summarizeAvailability(
+  definitions: readonly DefinitionMetaLike[] | null | undefined,
+): AvailabilityCounts {
+  const counts: AvailabilityCounts = {
+    total: 0,
+    addable: 0,
+    ready: 0,
+    candidate: 0,
+    hold: 0,
+    referenceOnly: 0,
+    unavailable: 0,
+  };
+  for (const definition of definitions ?? []) {
+    counts.total += 1;
+    const state = readAvailabilityMeta(definition.availability).state;
+    switch (state) {
+      case AVAILABILITY_STATE.READY:
+        counts.ready += 1;
+        counts.addable += 1;
+        break;
+      case AVAILABILITY_STATE.CANDIDATE:
+        counts.candidate += 1;
+        counts.addable += 1;
+        break;
+      case AVAILABILITY_STATE.HOLD:
+        counts.hold += 1;
+        break;
+      case AVAILABILITY_STATE.REFERENCE_ONLY:
+        counts.referenceOnly += 1;
+        break;
+      case AVAILABILITY_UNAVAILABLE:
+        counts.unavailable += 1;
+        break;
+    }
+  }
+  return counts;
+}
+
+/**
  * 静态可用性 × 动态对象探测的**分离展示**判据。
  *
  * `ready` 只说明"元数据层面可用"，`state` 说明"当前机床是否已确认存在该对象"：

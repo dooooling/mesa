@@ -311,8 +311,8 @@ describe("PR-D D1–D3：NCK 数据步只提供语义入口", () => {
     // 语义模式不要求原生字段：没有「缺少必填参数：area/area_no/...」这类提示。
     expect(screen.queryByText(/缺少必填参数/)).toBeNull();
     expect(screen.queryByTestId("missing-required")).toBeNull();
-    // §4.1-4：未选择变量时只保留一个选择入口（没有提交按钮，也就没有可提交路径）。
-    expect(screen.queryByTestId("nck-add-point")).toBeNull();
+    // §4.1-4：未选择变量时只保留一个选择入口；添加按钮在场但禁用（无可提交路径）。
+    expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(true);
 
     // 选中变量后：语义点位需要探测实际对象，而向导内 Endpoint 尚未创建 ⇒
     // 明确阻断并给出下一步（不要求填原生字段，也不回退手填参数）。
@@ -324,9 +324,12 @@ describe("PR-D D1–D3：NCK 数据步只提供语义入口", () => {
     await screen.findByTestId("nck-catalog-meta");
 
     expect(screen.getByTestId("nck-semantic-picker")).toBeTruthy();
-    // 变量选择入口 = 搜索框 + 分类树（平铺下拉框已按评审要求移除）。
-    expect(screen.getByTestId("nck-variable-search")).toBeTruthy();
+    // 变量选择入口 = 默认收起的树形下拉；展开后才出现搜索框与分组。
     expect(screen.getByTestId("catalog-tree")).toBeTruthy();
+    expect(screen.queryByTestId("nck-variable-search")).toBeNull();
+    fireEvent.click(screen.getByTestId("nck-variable-picker-trigger"));
+    expect(screen.getByTestId("nck-variable-search")).toBeTruthy();
+    expect(screen.getByTestId("catalog-tree-panel")).toBeTruthy();
     // 旧通用 Picker 的手动页整体不渲染：无「手动」Tab、无 output 复选框、无「无可用资源」。
     expect(screen.queryByRole("tab", { name: "手动" })).toBeNull();
     expect(screen.queryByRole("checkbox", { name: "output-value" })).toBeNull();

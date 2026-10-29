@@ -33,6 +33,7 @@ import { createRequestProbe, installProbedFetch } from "../test/requestProbe";
 import { NATIVE_RESOURCE } from "../test/acquisitionFixture238";
 import { READY_AVAILABILITY } from "../test/availabilityFixture";
 import { openCascade, pickObject, probeResponse } from "../test/objectCascadePick";
+import { expandAllCatalogGroups } from "../test/catalogTreePick";
 
 const EP = "ep-availability";
 const DRIVER = "sinumerik-nck";
@@ -261,6 +262,10 @@ async function waitPaneReady() {
 async function openDrawer(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByTestId("add-point-entry"));
   await screen.findByTestId("catalog-tree");
+  // 变量下拉默认收起：打开面板并展开分组，才能看到变量行。
+  await user.click(screen.getByTestId("nck-variable-picker-trigger"));
+  await screen.findByTestId("catalog-tree-panel");
+  expandAllCatalogGroups();
 }
 
 /** 展开「技术详情」（默认折叠：手册位置 / 索引规则 / 静态-动态说明都在里面）。 */
@@ -291,22 +296,18 @@ describe("流程 1：hold 条目可见、显示 reason_zh、且无法添加", ()
     await waitPaneReady();
     await openDrawer(user);
 
-    // ---- 树上：可见 + 可用性标记 + 原因直接可读（不靠 hover）----
+    // ---- 树上：可见 + 简短可用状态；**不铺暂缓长文/单位/手册**（避免撑乱列表）----
     const leaf = screen.getByTestId("catalog-tree-leaf-channel.feed.commanded");
     expect(leaf.getAttribute("data-availability")).toBe("hold");
     const tag = screen.getByTestId("catalog-tree-leaf-availability-channel.feed.commanded");
     expect(tag.getAttribute("data-availability")).toBe("hold");
     expect(tag.textContent).toBe("暂缓");
-    expect(
-      screen.getByTestId("catalog-tree-leaf-hold-reason-channel.feed.commanded").textContent,
-    ).toContain("驱动无真机读取证据");
-    // 手册位置（页码/章节）可查，但不占主视觉。
-    const manual = screen.getByTestId("catalog-tree-leaf-manual-channel.feed.commanded");
-    expect(manual.getAttribute("data-page")).toBe("272");
-    expect(manual.getAttribute("data-section")).toBe("5.3.16");
-    expect(manual.getAttribute("data-document")).toBe("A5E53370586B AC");
+    expect(leaf.textContent).not.toContain("驱动无真机读取证据");
+    expect(screen.queryByTestId("catalog-tree-leaf-hold-reason-channel.feed.commanded")).toBeNull();
+    expect(screen.queryByTestId("catalog-tree-leaf-manual-channel.feed.commanded")).toBeNull();
+    expect(screen.queryByTestId("catalog-tree-leaf-unit-channel.feed.commanded")).toBeNull();
 
-    // ---- 选中：表单里原因同样可见，门禁阻断 ----
+    // ---- 选中：表单里原因才可见（按需），门禁阻断 ----
     await user.click(leaf);
     expect((await screen.findByTestId("nck-availability")).getAttribute("data-state")).toBe(
       "hold",
@@ -454,11 +455,14 @@ describe("流程 4：unit 未知时显示“单位未核实”，不显示假单
     await waitPaneReady();
     await openDrawer(user);
 
-    const leafUnit = screen.getByTestId("catalog-tree-leaf-unit-channel.program.status");
-    expect(leafUnit.getAttribute("data-unit-status")).toBe("unknown");
-    expect(leafUnit.textContent).toBe("单位未核实");
+    // 变量行不显示单位细节（只显示名称 + 简短可用状态）。
+    const leaf = screen.getByTestId("catalog-tree-leaf-channel.program.status");
+    expect(leaf.textContent).not.toContain("单位");
+    expect(screen.queryByTestId("catalog-tree-leaf-unit-channel.program.status")).toBeNull();
 
-    await user.click(screen.getByTestId("catalog-tree-leaf-channel.program.status"));
+    await user.click(leaf);
+    const details = screen.getByTestId("nck-variable-details") as HTMLDetailsElement;
+    expect(details.open).toBe(false);
     const unitTag = await screen.findByTestId("nck-unit");
     expect(unitTag.getAttribute("data-unit-status")).toBe("unknown");
     expect(unitTag.textContent).toBe("单位未核实");
@@ -486,16 +490,19 @@ describe("流程 5：unit 已核实时显示真实单位值", () => {
     await waitPaneReady();
     await openDrawer(user);
 
-    const leafUnit = screen.getByTestId("catalog-tree-leaf-unit-channel.feed.actual");
-    expect(leafUnit.getAttribute("data-unit-status")).toBe("verified");
-    expect(leafUnit.textContent).toBe("mm/min, inch/min, user defined");
+    // 变量行只显示名称 + 简短可用状态，不显示单位取值（避免长单位撑乱行）。
+    const leaf = screen.getByTestId("catalog-tree-leaf-channel.feed.actual");
+    expect(leaf.textContent).not.toContain("mm/min");
+    expect(screen.queryByTestId("catalog-tree-leaf-unit-channel.feed.actual")).toBeNull();
 
-    await user.click(screen.getByTestId("catalog-tree-leaf-channel.feed.actual"));
+    await user.click(leaf);
     const unitTag = await screen.findByTestId("nck-unit");
     expect(unitTag.getAttribute("data-unit-status")).toBe("verified");
     expect(unitTag.textContent).toBe("mm/min, inch/min, user defined");
-    // 树上与表单读的是同一份 sidecar 结论（不会一处核实、一处未核实）。
-    expect(leafUnit.textContent).toBe(unitTag.textContent);
+    // 选中后的「变量详情」与门禁读的是同一份 sidecar 结论（不会一处核实、一处未核实）。
+    expect(screen.getByTestId("nck-variable-details").textContent).toContain(
+      "mm/min, inch/min, user defined",
+    );
   }, 60_000);
 });
 
