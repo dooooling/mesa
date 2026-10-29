@@ -66,8 +66,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "9e6dd477741c7e5f6f27431b3971a0c5a5d537bf49b990956dac57d1ee4dd79b"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "mode_group.op_mode",
@@ -132,8 +131,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "861be3269f8476b5a383e79c8f158f87bba785ab8d760e3229f47993735293aa"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "channel.program.name.main",
@@ -198,8 +196,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "9ceb26facf94f61a115044a921a051a8d7698cabe1ad26d0bb75af7312f4ecee"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "channel.program.name.active",
@@ -264,8 +261,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "fbf7a3bb9e9be5a8ea230c47f6b857f0db253aaa7216b97754fd7c6ae569d9ec"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "channel.program.line_number",
@@ -330,8 +326,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "e336d268752f2d811e09ed2f15316aff20b0d94d32aec59fe9c734fed7066e60"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "channel.program.block",
@@ -396,8 +391,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "49a59c982c63f1682aac4944b9949cd9549658622023bccd89b624d7a87de403"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "axis.position.commanded_mcs",
@@ -468,8 +462,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "f8e60ce1d557aa69894d604147878a03d0abb25a24ea3ac921fa537eecf2e2f2"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "axis.position.actual_bcs",
@@ -540,8 +533,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "611bf5631eda18146e194c1dc486cfc3b2d3563924a620f4c6247d52be42e7b1"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "channel.feed.actual",
@@ -606,8 +598,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "1a8b1093beb31aaefa318d7f76a39740d8a3bd37c02ef4da676d3f93a68c1155"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "channel.feed.commanded",
@@ -672,8 +663,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "5bb069a2c4179812a4449467a73ea034db8c61e5cfe27318e674bead47a1eb1b"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "channel.feed.override",
@@ -738,8 +728,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "94ac8e7b7c1d8962c37430318b2846c9adb7d4a5b3ddbe1a062e5154d98384a6"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "spindle.speed.actual",
@@ -810,8 +799,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "acb03ae78ffe59d409b3241016112264e8730cc350b8d06fac25b84979c37560"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "spindle.speed.commanded",
@@ -882,8 +870,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "eaa16f28b9ad38e855273d3075d722f2420dc20b6360d9357da9167a18366dc8"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "spindle.speed.override",
@@ -954,8 +941,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "9e0976d61ba44d3bfb2cd7e23e62dd0dd5783546cbc64ef82b38337bfd429adf"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "channel.tool.number_active",
@@ -1020,8 +1006,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "cnc_variable",
-      "digest": "83289a64e3e5779096e4722753cbcf30aafe241b7993be360ce19ca16d256095"
+      "category": "cnc_variable"
     },
     {
       "variable_id": "channel.r_parameter",
@@ -1103,8 +1088,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "system_variable",
-      "digest": "2b43741882d94e7d1ebc06cab2b45cbf3223beb301e4a113124709cb41cb4ad3"
+      "category": "system_variable"
     },
     {
       "variable_id": "drive.parameter.r0021",
@@ -1174,8 +1158,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "1d26cfb2a96c8d920c928bca2e6080a629c3156c1c813a4ff7931a51b005c83e"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0027",
@@ -1245,8 +1228,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "0a06d12836a6013ec803c172134248992dc1c5b5c68325c0bb020aa11cd993d2"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.motor.temperature",
@@ -1320,8 +1302,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "94ace52bd5f3b7ff88f1215f7a102447d02f764a55bc2dd0de2d29572f2ebfdf"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0033",
@@ -1391,8 +1372,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "f21b3682b3baac0872a5c13ac93345a2130e175325c338c9eb89e1eb8dbdd060"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0031",
@@ -1462,8 +1442,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "521a9209c245a52acf460b1c2d9db7a0ed1965e7ef6b575ecf2fea185aa5e3d0"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0062",
@@ -1533,8 +1512,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "bf0b03aa54d8f57188e42fb964389922d7395fa2e66f51f50e64fc86ae101bb0"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0063",
@@ -1604,8 +1582,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "ffe0a2c2e7da680f09acbec713de54383f688d94b714552dff1efecefcd10f7a"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0064",
@@ -1675,8 +1652,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "ef9a132a2095976df1f08ece7f56cc2c5d442c44e7ec8b59baf57c00c94f5b88"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0077",
@@ -1746,8 +1722,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "9ed6005c36d092df060e8c44986375ac4b09d28b94884796f7424e3952b3bb70"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0078",
@@ -1817,8 +1792,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "e99ce42dd70bd313bd5ecac3e75ec79db16ce6586797efe30d1682b9e3e43b08"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0079",
@@ -1888,8 +1862,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "72efb0a627c6512e7aff4a67368e092f7b245479a4f3b6f11ede7c532dbd69a7"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0080",
@@ -1959,8 +1932,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "54bcea8f0d6a4b592c791bed3e2b0f9825009af203092775c532f542b002cb58"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0081",
@@ -2030,8 +2002,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "49bf005152f987d98a8b76e6eb55734de7e20f359f0e30559e19064cd355be7d"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0082",
@@ -2101,8 +2072,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "61c659f6ff04b1e9ad54da2ba0739742e680f083caa09d55330a76ae1156c583"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0103",
@@ -2172,8 +2142,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "b0d06dac847e8f6e375b35bcb8c4117d0651a0ef07e3ba35b61bc6a2db3beb60"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.p0105",
@@ -2243,8 +2212,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "396681d0265e2e75754298c7cb5d2c95f9329cba8cea7718859de1600e8cb944"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0106",
@@ -2314,8 +2282,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "04ca88d5cf3b0da881842111dd31e3495cf039b1bca19b4b08523c96c97d3228"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0107",
@@ -2385,8 +2352,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "75e1aad483448c8720cf74a03d4c965a8e6085d71cb1236057b168a656546849"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.parameter.r0108",
@@ -2456,8 +2422,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "3d9aca163430e951ea81cabda3ea24fc2ec15c2b7cb8db2d255b5a910bd78ad6"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "drive.object.name",
@@ -2528,8 +2493,7 @@
           "entry": "drive_object"
         }
       ],
-      "category": "drive_parameter",
-      "digest": "b93281a3ed69fdb25dc3b139fc0cdad28e4f56a975732ebd933ecc845290f56c"
+      "category": "drive_parameter"
     },
     {
       "variable_id": "axis.name",
@@ -2599,8 +2563,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "machine_data",
-      "digest": "8c5f532d853f8d803ec41d8468367a43ef3f068c5af46f0b51827bc68e3e5664"
+      "category": "machine_data"
     },
     {
       "variable_id": "axis.ctrlout.module_number",
@@ -2670,8 +2633,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "machine_data",
-      "digest": "01ce269750572fd3cdf86985c5f5e997d8b6b72abacb687c9538fd0a5338be76"
+      "category": "machine_data"
     },
     {
       "variable_id": "axis.encoder.module_number",
@@ -2737,8 +2699,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "machine_data",
-      "digest": "aa1a82a60ede7406f84c63144b13c3b4d34572b49a170dc571ab086bcebef841"
+      "category": "machine_data"
     },
     {
       "variable_id": "axis.ctrlout.type",
@@ -2808,8 +2769,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "machine_data",
-      "digest": "90b8e1f7d69099aa0a7ca9d0e8f71a694ad8c3f0fae3c98f57ab340acb58e37f"
+      "category": "machine_data"
     },
     {
       "variable_id": "channel.machine_axis_assignment",
@@ -2895,8 +2855,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "machine_data",
-      "digest": "ed5dd108efca894221a6c10f5f9f21dc80ecb90df839995b42eaf8a550194d16"
+      "category": "machine_data"
     },
     {
       "variable_id": "axis.spindle_assignment",
@@ -2966,8 +2925,7 @@
           "entry": "nc_variable"
         }
       ],
-      "category": "machine_data",
-      "digest": "47b1d5c23ee6545bcc52aff72efca8757942bd625d38bac72b020670527a61f8"
+      "category": "machine_data"
     }
   ]
 }
