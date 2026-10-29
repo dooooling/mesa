@@ -1,11 +1,8 @@
-//! 目录**导航分类**：把每条定义投影到前端建树用的 5 个分类码（Driver 侧临时规则）。
+//! 历史 revision 1 的导航分类兼容器：把冻结定义投影到前端建树用的 5 个分类码。Revision 2 起以 VariableDefinition.category 为准。
 //!
 //! ## 硬边界：这是导航规则，**不是**手册分类
 //!
-//! 828D 的四份手册（NC 变量清单 / 系统变量 / 机床数据 / S120 参数手册）都**不给**
-//! 「这条变量属于哪一类」的字段，而 `r1.json` 也没有 `category` 且已冻结。因此本
-//! 模块产出的分类只有一种性质：**驱动侧为了建树而临时制定的导航规则**——它只回答
-//! 「用户能沿哪条路径找到它」，不回答「手册说它是什么」。
+//! 828D 的四份手册都不提供可直接复制为定义字段的统一分类属性。Revision 1 已冻结且没有 category；本模块只用于 revision 1 的向后兼容投影。Revision 2 的 category 是正式定义数据并参与 digest，不再由此规则决定。
 //!
 //! 由此产生的三条纪律（评审明确要求，改动本模块前先读）：
 //!
@@ -32,11 +29,10 @@
 //! **失败关闭**，而不是继续输出一个看似合理的分类。锚点只用定义里已有的字段
 //! （`source[]` / `golden_ref[]` / `addressing.column`），不额外引入真值。
 //!
-//! ## 后续（方案 B）
+//! ## Scheme B 状态
 //!
-//! TODO(方案 B)：正式分类走定义修订（`revision` + `DIGESTS.lock`）建立权威字段；
-//! 届时 `category_basis` 应变为 `"definition"`，本表的角色退化为「历史对照」，
-//! 不得再被当作分类来源。
+//! Revision 2 已将 category 纳入正式定义并进入 DIGESTS.lock。此表仅用于读取旧 revision 1，
+//! 对 revision 2 的分类不得再作为来源；API 的 category_basis 必须返回 definition。
 
 use crate::definition::{SourceKind, VariableDefinition};
 use crate::targets::DriveEntry;
