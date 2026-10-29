@@ -386,8 +386,12 @@ async fn definitions_payload_is_verbatim_projection() {
 #[tokio::test]
 async fn latest_catalog_uses_revision_two_but_exact_revision_one_remains_available() {
     let latest = catalog_json(json!({})).await;
-    let row = latest["definitions"].as_array().unwrap().iter()
-        .find(|d| d["variable_id"] == "axis.encoder.module_number").unwrap();
+    let row = latest["definitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["variable_id"] == "axis.encoder.module_number")
+        .unwrap();
     assert_eq!(row["revision"], 2);
     assert_eq!(row["category"], "machine_data");
     assert_eq!(row["category_basis"], "definition");
@@ -422,8 +426,14 @@ async fn include_history_returns_all_84_published_revisions_for_editing() {
     assert_eq!(all["total"], 84);
     let rows = all["definitions"].as_array().unwrap();
     assert_eq!(rows.len(), 84);
-    let r1 = rows.iter().find(|d| d["variable_id"] == "axis.encoder.module_number" && d["revision"] == 1).unwrap();
-    let r2 = rows.iter().find(|d| d["variable_id"] == "axis.encoder.module_number" && d["revision"] == 2).unwrap();
+    let r1 = rows
+        .iter()
+        .find(|d| d["variable_id"] == "axis.encoder.module_number" && d["revision"] == 1)
+        .unwrap();
+    let r2 = rows
+        .iter()
+        .find(|d| d["variable_id"] == "axis.encoder.module_number" && d["revision"] == 2)
+        .unwrap();
     assert_eq!(r1["category_basis"], "navigation_rule");
     assert_eq!(r2["category_basis"], "definition");
 }
