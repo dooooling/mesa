@@ -1296,7 +1296,7 @@
       "count": 1,
       "unit_mode": "current",
       "invalid_rule": {
-        "value": -200,
+        "value": -200.0,
         "tolerance": 0.001
       },
       "identity_template": "drive.motor.temperature@drive_object={drive_object}",
