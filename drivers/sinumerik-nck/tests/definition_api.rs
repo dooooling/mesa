@@ -94,6 +94,18 @@ fn lock_digests() -> BTreeMap<String, String> {
         .collect()
 }
 
+fn raw_latest_definitions() -> BTreeMap<String, Value> {
+    let doc: Value = serde_json::from_str(&read_repo_file(
+        "drivers/sinumerik-nck/definitions/828d/r2.json",
+    ))
+    .expect("r2.json 必须是合法 JSON");
+    doc["definitions"].as_array().expect("r2.json 必须含 definitions 数组")
+        .iter().map(|d| (
+            d["variable_id"].as_str().expect("variable_id").to_string(),
+            d.clone(),
+        )).collect()
+}
+
 async fn catalog_json(query: Value) -> Value {
     let raw = driver()
         .definitions(&query.to_string())
@@ -248,7 +260,7 @@ async fn definitions_returns_42_rows_with_digests() {
         v["family"], "828d",
         "省略 family ⇒ 全部已发布系列（今天只有 828d）"
     );
-    assert_eq!(v["revision"], 1);
+    assert_eq!(v["revision"], 2);
     assert_eq!(v["driver_id"], "sinumerik-nck");
     assert_eq!(v["driver_version"], env!("CARGO_PKG_VERSION"));
     assert!(v["note"].is_null(), "正常目录不得带 note");
@@ -317,7 +329,7 @@ async fn definitions_payload_is_verbatim_projection() {
 
     let v = catalog_json(json!({ "limit": 500 })).await;
     let rows = v["definitions"].as_array().expect("definitions 必须是数组");
-    let raw = raw_definitions();
+    let raw = raw_latest_definitions();
     assert_eq!(rows.len(), raw.len());
 
     for row in rows {
@@ -442,9 +454,9 @@ async fn definitions_reports_scope_and_status_verbatim() {
     }
     assert_eq!(scope.get("collect"), Some(&36));
     assert_eq!(scope.get("identity"), Some(&6));
-    assert_eq!(status.get("verified"), Some(&24));
+    assert_eq!(status.get("verified"), Some(&23));
     assert_eq!(status.get("parameter_identity"), Some(&16));
-    assert_eq!(status.get("candidate"), Some(&2));
+    assert_eq!(status.get("candidate"), Some(&3));
 }
 
 /// I44：目录**如实返回**全部 42 条，6 条 `scope="identity"` 逐条在列。
