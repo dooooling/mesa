@@ -291,7 +291,7 @@ async fn definitions_returns_42_rows_with_digests() {
     }
 }
 
-/// I2：每行是 `r1.json` 的**逐字投影**，且键集合恰为白名单（无原生字段）。
+/// I2：每行是最新 `r2.json` 定义的逐字投影，且键集合恰为白名单（无原生字段）。
 ///
 /// NOTE(导航字段)：键集合比 `r1.json` 多 `category` / `category_basis` 两个**投影期
 /// 计算**的导航字段（见 `catalog_category.rs`）。它们不是定义字段，因此只出现在
@@ -364,7 +364,33 @@ async fn definitions_payload_is_verbatim_projection() {
         ] {
             assert_eq!(row[field], src[field], "{id} 的 `{field}` 必须逐字投影");
         }
+        assert_eq!(row["category"], src["category"], "{id} 的 category 必须来自 revision 2 定义");
+        assert_eq!(row["category_basis"], "definition", "{id} 的 category_basis 必须标记为 definition");
     }
+}
+
+
+/// Revision 1 remains addressable exactly, while unqualified catalog queries expose revision 2.
+#[tokio::test]
+async fn latest_catalog_uses_revision_two_but_exact_revision_one_remains_available() {
+    let latest = catalog_json(json!({ "variable_id": "axis.encoder.module_number" })).await;
+    let row = latest["definitions"].as_array().unwrap().first().unwrap();
+    assert_eq!(row["revision"], 2);
+    assert_eq!(row["category"], "machine_data");
+    assert_eq!(row["category_basis"], "definition");
+    assert_eq!(row["semantics_status"], "candidate");
+    assert_eq!(row["source"].as_array().unwrap().iter().any(|s| {
+        s["kind"] == "measurement" && s["reference"] == "docs/evidence/nck-live-identity-probe.txt"
+    }), false);
+
+    let historical = catalog_json(json!({
+        "variable_id": "axis.encoder.module_number",
+        "revision": 1
+    })).await;
+    let old = historical["definitions"].as_array().unwrap().first().unwrap();
+    assert_eq!(old["revision"], 1);
+    assert_eq!(old["category_basis"], "navigation_rule");
+    assert_eq!(old["semantics_status"], "verified");
 }
 
 /// I3：26/130 的入口区别由 `golden_ref[].entry` 保留，且**不暴露原始 Module 数字**。
